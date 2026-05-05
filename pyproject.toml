@@ -1,0 +1,23 @@
+[project]
+name = "jav-trans"
+version = "0.1.0"
+requires-python = ">=3.10"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+addopts = [
+    "--basetemp=temp/pytest_verify",
+    "-p",
+    "no:cacheprovider",
+]
+asyncio_mode = "auto"
+
+norecursedirs = [
+    ".venv",
+    ".pytest_cache",
+    "__pycache__",
+    "agents",
+    "models",
+    "video",
+]

@@ -1,0 +1,45 @@
+# Local secrets and environments
+.env
+.env.*
+!.env.example
+.venv/
+.claude/
+
+# Python/runtime caches
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# Agent and run artifacts
+agents/
+log/
+reports/
+
+# Project temp/cache root. Keep the directory placeholder if present.
+temp/*
+!temp/.gitkeep
+
+# Local media and models. Keep model documentation.
+video/
+models/*
+!models/README.md
+
+# Build/package outputs
+build/
+dist/
+*.spec
+!packaging/*.spec
+
+# Windows/editor noise
+Thumbs.db
+Desktop.ini
+*.lnk
+
+# Agent coordination docs are local to this workspace.
+AGENTS.md
+CLAUDE.md
+GEMINI.md
+plan.md
