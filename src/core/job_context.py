@@ -40,7 +40,7 @@ class JobContext:
     keep_quality_report: bool
     keep_temp_files: bool
     run_log_enabled: bool = False
-    run_log_dir: str = "./log"
+    run_log_dir: str = "./temp/log"
     fail_on_qc_block: bool = True
     advanced: dict[str, str] = field(default_factory=dict)
 
@@ -82,7 +82,7 @@ class JobContext:
             ),
             run_log_dir=advanced.get(
                 "RUN_LOG_DIR",
-                str(getattr(spec, "run_log_dir", "./log") or "./log"),
+                str(getattr(spec, "run_log_dir", "./temp/log") or "./temp/log"),
             ),
             fail_on_qc_block=_flag(
                 advanced.get("FAIL_ON_QC_BLOCK"),
