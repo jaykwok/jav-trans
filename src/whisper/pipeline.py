@@ -146,7 +146,6 @@ _ASR_CHECKPOINT_ENABLED = os.getenv("ASR_CHECKPOINT_ENABLED", "1").strip().lower
     "no",
     "off",
 }
-_agents_RM_ROOT = Path(os.getenv("agents_RM_ROOT", Path("agents") / "rm")).resolve()
 _LAST_VAD_SIGNATURE: dict = {}
 
 from vad.ffmpeg_backend import _SILENCE_END_RE, _SILENCE_START_RE
@@ -443,14 +442,15 @@ def _remove_context_leak_fragments(text: str) -> str:
     return _collapse_repeated_noise("".join(kept_fragments))
 
 
-def _move_path_to_agents_rm(path: Path) -> None:
+def _delete_path_for_cleanup(path: Path) -> None:
     if not path.exists():
         return
 
-    _agents_RM_ROOT.mkdir(parents=True, exist_ok=True)
-    target = _agents_RM_ROOT / f"{path.name}.{uuid.uuid4().hex[:8]}"
     try:
-        shutil.move(str(path), str(target))
+        if path.is_dir():
+            shutil.rmtree(path, ignore_errors=True)
+        else:
+            path.unlink(missing_ok=True)
     except Exception:
         pass
 
@@ -626,7 +626,7 @@ def _save_asr_checkpoint(
             json.dump(payload, writer, ensure_ascii=False)
         tmp_path.replace(checkpoint_path)
     except Exception:
-        _move_path_to_agents_rm(tmp_path)
+        _delete_path_for_cleanup(tmp_path)
 
 
 def _build_quarantined_text_result(
@@ -714,7 +714,7 @@ def _quarantine_failed_chunks(
             tmp_path.replace(target)
             written.append(target)
         except Exception:
-            _move_path_to_agents_rm(tmp_path)
+            _delete_path_for_cleanup(tmp_path)
 
     return written
 
@@ -770,7 +770,7 @@ def aggregate_timeout_fragments(job_id: str) -> Path | None:
     tmp_path.replace(summary_path)
 
     for path in fragments:
-        _move_path_to_agents_rm(path)
+        _delete_path_for_cleanup(path)
 
     return summary_path
 
@@ -1246,7 +1246,7 @@ def _transcribe_asr_chunks_text_only(
             )
             final_checkpoint_saved = True
         if completed:
-            _move_path_to_agents_rm(checkpoint_path)
+            _delete_path_for_cleanup(checkpoint_path)
     finally:
         if (
             _ASR_CHECKPOINT_ENABLED
@@ -1718,7 +1718,7 @@ def _refine_chunk_with_subchunks(
                 )
     finally:
         if refine_dir.exists() and not _KEEP_ASR_CHUNKS:
-            _move_path_to_agents_rm(refine_dir)
+            _delete_path_for_cleanup(refine_dir)
 
     refine_words.sort(key=lambda item: (item["start"], item["end"]))
     return refine_words, refine_log
@@ -1861,7 +1861,7 @@ def _transcribe_asr_chunk_with_retry(
                 )
     finally:
         if retry_dir.exists() and not _KEEP_ASR_CHUNKS:
-            _move_path_to_agents_rm(retry_dir)
+            _delete_path_for_cleanup(retry_dir)
 
     retry_words.sort(key=lambda item: (item["start"], item["end"]))
     if retry_words and not _looks_like_alignment_failure(
@@ -2540,7 +2540,7 @@ def _transcribe_and_align_local(
         return segments, log, details
     finally:
         if chunk_dir is not None and chunk_dir.exists() and not _KEEP_ASR_CHUNKS:
-            _move_path_to_agents_rm(chunk_dir)
+            _delete_path_for_cleanup(chunk_dir)
 
 
 def transcribe_and_align(

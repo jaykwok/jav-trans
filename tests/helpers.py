@@ -23,7 +23,7 @@ def make_job_context(
     keep_temp_files: bool = True,
     keep_quality_report: bool = False,
     run_log_enabled: bool = False,
-    run_log_dir: Path | str = "./log",
+    run_log_dir: Path | str = "./temp/log",
     fail_on_qc_block: bool = True,
     advanced: dict[str, str] | None = None,
 ) -> JobContext:

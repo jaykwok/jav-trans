@@ -20,6 +20,7 @@ _ROOT = Path(sys.executable).resolve().parent if _FROZEN else _RESOURCE_ROOT
 
 os.environ.setdefault("JAVTRANS_RUNTIME_ROOT", str(_ROOT))
 os.environ.setdefault("JAVTRANS_RESOURCE_ROOT", str(_RESOURCE_ROOT))
+os.environ.setdefault("PYTHONIOENCODING", "utf-8")
 os.environ.setdefault("HF_HOME", str(_ROOT / "models"))
 os.environ.setdefault("HF_HUB_CACHE", str(_ROOT / "temp" / "hf-cache" / "hub"))
 os.environ.setdefault("HF_XET_CACHE", str(_ROOT / "temp" / "hf-cache" / "xet"))

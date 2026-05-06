@@ -2,17 +2,31 @@
 
 import os
 import shutil
+import importlib.util
 from pathlib import Path
 
 from PyInstaller.utils.hooks import (
     collect_data_files,
     collect_dynamic_libs,
     collect_submodules,
+    copy_metadata,
 )
 
 
 block_cipher = None
 ROOT = Path(SPECPATH).resolve().parent
+
+
+def _package_dir(name: str) -> Path:
+    spec = importlib.util.find_spec(name)
+    if spec is None or not spec.submodule_search_locations:
+        raise SystemExit(f"Python package not found: {name}")
+    return Path(next(iter(spec.submodule_search_locations))).resolve()
+
+
+NAGISA_PACKAGE_DIR = _package_dir("nagisa")
+QWEN_ASR_PACKAGE_DIR = _package_dir("qwen_asr")
+TEN_VAD_PACKAGE_DIR = _package_dir("ten_vad")
 
 
 def _require_path(path: str | Path, label: str) -> Path:
@@ -60,6 +74,9 @@ def _ffmpeg_binaries() -> list[tuple[str, str]]:
 
 
 datas = collect_data_files("webview", include_py_files=False)
+datas += copy_metadata("torchcodec")
+datas += copy_metadata("nagisa")
+datas += copy_metadata("ten_vad")
 datas += [
     (str(_require_path("src/web/static", "web static assets")), "src/web/static"),
     (str(_require_path("icon.ico", "application icon")), "."),
@@ -67,6 +84,30 @@ datas += [
     (
         str(_require_path("models/efwkjn-whisper-ja-anime-v0.3", "default ASR model")),
         "models/efwkjn-whisper-ja-anime-v0.3",
+    ),
+    (
+        str(_require_path("models/TransWithAI-Whisper-Vad-EncDec-ASMR-onnx", "default WhisperSeg VAD model")),
+        "models/TransWithAI-Whisper-Vad-EncDec-ASMR-onnx",
+    ),
+    (
+        str(_require_path("models/openai-whisper-base", "WhisperSeg feature extractor model")),
+        "models/openai-whisper-base",
+    ),
+    (
+        str(_require_path("models/Qwen-Qwen3-ForcedAligner-0.6B", "default forced aligner model")),
+        "models/Qwen-Qwen3-ForcedAligner-0.6B",
+    ),
+    (
+        str(NAGISA_PACKAGE_DIR / "data"),
+        "nagisa/data",
+    ),
+    (
+        str(QWEN_ASR_PACKAGE_DIR / "inference" / "assets"),
+        "qwen_asr/inference/assets",
+    ),
+    (
+        str(TEN_VAD_PACKAGE_DIR / "lib"),
+        "ten_vad/lib",
     ),
 ]
 
@@ -91,19 +132,37 @@ hiddenimports = [
     "onnxruntime.capi.onnxruntime_pybind11_state",
     "openai",
     "qwen_asr",
+    "mecab_system_eval",
+    "model",
+    "nagisa",
+    "nagisa_utils",
+    "prepro",
+    "tagger",
+    "ten_vad",
+    "librosa",
     "soundfile",
+    "scipy",
     "torch",
     "torchaudio",
+    "torchcodec",
     "transformers",
 ]
 hiddenimports += collect_submodules(
     "webview",
     filter=lambda name: not name.startswith("webview.platforms.android"),
 )
+hiddenimports += collect_submodules("transformers.models.whisper")
+hiddenimports += collect_submodules("transformers.generation")
+hiddenimports += collect_submodules("nagisa")
+hiddenimports += collect_submodules("qwen_asr")
+hiddenimports += collect_submodules("ten_vad")
+hiddenimports += collect_submodules("torchcodec")
+hiddenimports += collect_submodules("transformers.models.qwen2")
+hiddenimports += collect_submodules("transformers.models.qwen3")
 
 a = Analysis(
     [str(ROOT / "run_web.py")],
-    pathex=[str(ROOT / "src")],
+    pathex=[str(ROOT / "src"), str(NAGISA_PACKAGE_DIR)],
     binaries=binaries,
     datas=datas,
     hiddenimports=hiddenimports,
