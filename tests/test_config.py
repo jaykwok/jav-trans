@@ -108,3 +108,28 @@ def test_default_model_download_root_is_project_models():
     assert config.DEFAULT_SETTINGS["ASR_CONTEXT"] == ""
     assert config.DEFAULT_SETTINGS["ASR_BACKEND"] == "anime-whisper"
     assert config.DEFAULT_SETTINGS["ASR_SUBPROCESS_READY_TIMEOUT_S"] == "600"
+
+
+def test_frozen_path_defaults_resolve_to_runtime_root(monkeypatch, tmp_path):
+    monkeypatch.setattr(config, "PROJECT_ROOT", tmp_path)
+    monkeypatch.setattr(config, "PRIVATE_ENV_PATH", tmp_path / ".env")
+    monkeypatch.setattr(config, "is_frozen", lambda: True)
+    monkeypatch.setattr(
+        config,
+        "DEFAULT_SETTINGS",
+        {
+            "HF_HOME": "./models",
+            "TORCH_HOME": "./temp/torch",
+            "JOB_TEMP_DIR": "./temp/jobs",
+            "LLM_MODEL_NAME": "from_config",
+        },
+    )
+    for key in ("HF_HOME", "TORCH_HOME", "JOB_TEMP_DIR", "LLM_MODEL_NAME"):
+        monkeypatch.delenv(key, raising=False)
+
+    config.load_config()
+
+    assert os.environ["HF_HOME"] == str((tmp_path / "models").resolve())
+    assert os.environ["TORCH_HOME"] == str((tmp_path / "temp" / "torch").resolve())
+    assert os.environ["JOB_TEMP_DIR"] == str((tmp_path / "temp" / "jobs").resolve())
+    assert os.environ["LLM_MODEL_NAME"] == "from_config"

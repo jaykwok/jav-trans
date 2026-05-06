@@ -10,14 +10,36 @@ from pathlib import Path
 
 multiprocessing.freeze_support()
 
-_SRC = Path(__file__).parent / "src"
-if str(_SRC) not in sys.path:
-    sys.path.insert(0, str(_SRC))
+_FROZEN = bool(getattr(sys, "frozen", False))
+_RESOURCE_ROOT = (
+    Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent)).resolve()
+    if _FROZEN
+    else Path(__file__).resolve().parent
+)
+_ROOT = Path(sys.executable).resolve().parent if _FROZEN else _RESOURCE_ROOT
+
+os.environ.setdefault("JAVTRANS_RUNTIME_ROOT", str(_ROOT))
+os.environ.setdefault("JAVTRANS_RESOURCE_ROOT", str(_RESOURCE_ROOT))
+os.environ.setdefault("HF_HOME", str(_ROOT / "models"))
+os.environ.setdefault("HF_HUB_CACHE", str(_ROOT / "temp" / "hf-cache" / "hub"))
+os.environ.setdefault("HF_XET_CACHE", str(_ROOT / "temp" / "hf-cache" / "xet"))
+os.environ.setdefault("TORCH_HOME", str(_ROOT / "temp" / "torch"))
+
+for _SRC in (_RESOURCE_ROOT / "src", _ROOT / "src"):
+    if _SRC.exists() and str(_SRC) not in sys.path:
+        sys.path.insert(0, str(_SRC))
+
+_BIN_DIR = _RESOURCE_ROOT / "bin"
+if _BIN_DIR.exists():
+    current_path = os.environ.get("PATH", "")
+    bin_text = str(_BIN_DIR)
+    if bin_text not in current_path.split(os.pathsep):
+        os.environ["PATH"] = bin_text + (os.pathsep + current_path if current_path else "")
+
+_ICON_PATH = _RESOURCE_ROOT / "icon.ico"
 
 PORT = int(os.getenv("JAVTRANS_PORT", "17321"))
 EVENTS_PORT = int(os.getenv("JAVTRANS_EVENTS_PORT", "17322"))
-
-_ROOT = Path(__file__).parent
 
 # Dirs to keep across runs (model caches, reusable state)
 _KEEP_DIRS = {
@@ -109,7 +131,11 @@ if __name__ == "__main__":
             height=820,
             resizable=True,
         )
-        webview.start(_bind, win)
+        webview.start(
+            _bind,
+            win,
+            icon=str(_ICON_PATH) if _ICON_PATH.exists() else None,
+        )
     except ImportError:
         import webbrowser
 

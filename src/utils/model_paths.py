@@ -3,16 +3,24 @@ import os
 from pathlib import Path
 from urllib.parse import urlparse
 
+from utils.runtime_paths import is_frozen, resource_root, runtime_root
 
-PROJECT_ROOT = Path(__file__).resolve().parents[2]
+PROJECT_ROOT = runtime_root()
+RESOURCE_ROOT = resource_root()
 MODELS_ROOT = PROJECT_ROOT / "models"
+BUNDLED_MODELS_ROOT = RESOURCE_ROOT / "models"
 TEMP_ROOT = PROJECT_ROOT / "temp"
 HF_RUNTIME_CACHE_ROOT = TEMP_ROOT / "hf-cache"
 DEFAULT_HF_ENDPOINT = "https://huggingface.co"
 
-os.environ.setdefault("HF_HOME", "./models")
-os.environ.setdefault("HF_HUB_CACHE", "./temp/hf-cache/hub")
-os.environ.setdefault("HF_XET_CACHE", "./temp/hf-cache/xet")
+if is_frozen():
+    os.environ.setdefault("HF_HOME", str(MODELS_ROOT))
+    os.environ.setdefault("HF_HUB_CACHE", str(HF_RUNTIME_CACHE_ROOT / "hub"))
+    os.environ.setdefault("HF_XET_CACHE", str(HF_RUNTIME_CACHE_ROOT / "xet"))
+else:
+    os.environ.setdefault("HF_HOME", "./models")
+    os.environ.setdefault("HF_HUB_CACHE", "./temp/hf-cache/hub")
+    os.environ.setdefault("HF_XET_CACHE", "./temp/hf-cache/xet")
 os.environ.setdefault("HF_HUB_DISABLE_SYMLINKS_WARNING", "1")
 
 
@@ -37,7 +45,11 @@ def _project_relative(path: str | Path) -> str:
     candidate = Path(path)
     try:
         if candidate.is_absolute():
-            return candidate.resolve().relative_to(PROJECT_ROOT).as_posix()
+            resolved = candidate.resolve()
+            try:
+                return resolved.relative_to(PROJECT_ROOT).as_posix()
+            except ValueError:
+                return resolved.relative_to(RESOURCE_ROOT).as_posix()
     except (OSError, ValueError):
         return str(path).replace("\\", "/")
     return str(path).replace("\\", "/")
@@ -60,6 +72,14 @@ def canonical_model_dir(repo_id: str) -> Path:
 
 def _iter_local_model_candidates(repo_id: str):
     yield canonical_model_dir(repo_id)
+    if not is_frozen():
+        return
+    bundled = BUNDLED_MODELS_ROOT / model_dir_name(repo_id)
+    try:
+        if bundled.resolve() != canonical_model_dir(repo_id).resolve():
+            yield bundled
+    except OSError:
+        yield bundled
 
 
 def _indexed_safetensors_complete(path: Path) -> bool:
