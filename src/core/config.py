@@ -3,9 +3,18 @@ from pathlib import Path
 
 from dotenv import dotenv_values
 
+from utils.runtime_paths import is_frozen, runtime_root
 
-PROJECT_ROOT = Path(__file__).resolve().parents[2]
+PROJECT_ROOT = runtime_root()
 PRIVATE_ENV_PATH = PROJECT_ROOT / ".env"
+_FROZEN_PATH_KEYS = {
+    "HF_HOME",
+    "HF_HUB_CACHE",
+    "HF_XET_CACHE",
+    "TORCH_HOME",
+    "JOB_TEMP_DIR",
+    "QUALITY_REPORT_DIR",
+}
 
 
 # Runtime configuration source of truth.
@@ -276,12 +285,22 @@ DEFAULT_SETTINGS: dict[str, str] = {
 STAGE_EVENT_SINK: str = os.getenv("STAGE_EVENT_SINK", "")
 
 
+def _coerce_default_value(key: str, value: str) -> str:
+    if not is_frozen() or key not in _FROZEN_PATH_KEYS or not str(value or "").strip():
+        return value
+    path = Path(value).expanduser()
+    if path.is_absolute():
+        return str(path.resolve())
+    return str((PROJECT_ROOT / path).resolve())
+
+
 def _apply_values(values: dict[str, str], protected_keys: set[str]) -> None:
     """Copy string settings into os.environ unless a higher-priority source owns them."""
 
     for key, value in values.items():
         if key in protected_keys:
             continue
+        value = _coerce_default_value(key, value)
         if key == "HF_ENDPOINT" and not str(value or "").strip():
             os.environ.pop(key, None)
             continue

@@ -32,6 +32,12 @@ build/
 dist/
 *.spec
 !packaging/*.spec
+*.7z
+*.7z.*
+*.zip
+*.rar
+*.tar
+*.tar.*
 
 # Windows/editor noise
 Thumbs.db

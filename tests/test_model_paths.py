@@ -33,6 +33,25 @@ def test_resolve_model_spec_prefers_models_repo_name(monkeypatch, tmp_path):
     )
 
 
+def test_resolve_model_spec_uses_bundled_model_when_runtime_model_missing(monkeypatch, tmp_path):
+    runtime_root = tmp_path / "runtime"
+    resource_root = tmp_path / "resource"
+    monkeypatch.setattr(model_paths, "is_frozen", lambda: True)
+    monkeypatch.setattr(model_paths, "PROJECT_ROOT", runtime_root)
+    monkeypatch.setattr(model_paths, "MODELS_ROOT", runtime_root / "models")
+    monkeypatch.setattr(model_paths, "RESOURCE_ROOT", resource_root)
+    monkeypatch.setattr(model_paths, "BUNDLED_MODELS_ROOT", resource_root / "models")
+
+    bundled_model = resource_root / "models" / "efwkjn-whisper-ja-anime-v0.3"
+    bundled_model.mkdir(parents=True)
+    (bundled_model / "config.json").write_text("{}", encoding="utf-8")
+
+    assert (
+        model_paths.resolve_model_spec(None, "efwkjn/whisper-ja-anime-v0.3")
+        == str(bundled_model.resolve())
+    )
+
+
 def test_resolve_model_spec_downloads_to_models_repo_name(monkeypatch, tmp_path):
     monkeypatch.setattr(model_paths, "PROJECT_ROOT", tmp_path)
     monkeypatch.setattr(model_paths, "MODELS_ROOT", tmp_path / "models")
