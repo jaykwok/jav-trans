@@ -1,6 +1,7 @@
 import gc
 import os
 import re
+import traceback
 from pathlib import Path
 from typing import Any, Callable
 
@@ -114,7 +115,13 @@ class WhisperModelBackend:
             download=True,
         )
         _notify(on_stage, f"加载 {self.backend_label} 模型...")
-        from transformers import WhisperForConditionalGeneration, WhisperProcessor
+        try:
+            from transformers import WhisperForConditionalGeneration, WhisperProcessor
+        except Exception as exc:
+            detail = "".join(traceback.format_exception(exc))
+            raise RuntimeError(
+                "Failed to import transformers Whisper classes:\n" + detail
+            ) from exc
         import torch
 
         self._processor = WhisperProcessor.from_pretrained(self.model_path)
@@ -414,4 +421,3 @@ def create_whisper_model_backend(preset_name: str, device: str) -> WhisperModelB
             float(preset["forced_fail_ratio"]),
         ),
     )
-

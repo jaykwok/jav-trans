@@ -14,6 +14,10 @@ It bundles:
 - `icon.ico` for the executable and pywebview window
 - `icon.png` / `icon.ico` for the in-app header and favicon
 - the default ASR model `efwkjn/whisper-ja-anime-v0.3`
+- default workflow auxiliary models:
+  - WhisperSeg VAD `TransWithAI/Whisper-Vad-EncDec-ASMR-onnx`
+  - WhisperSeg feature extractor `openai/whisper-base`
+  - forced aligner `Qwen/Qwen3-ForcedAligner-0.6B`
 
 It does not bundle Microsoft Edge WebView2. Users still need the WebView2 runtime,
 which is already present on most supported Windows systems. If the app window
@@ -28,6 +32,13 @@ uploaded release asset to be under 2 GiB, so publish this as split archives or
 host the large model/runtime bundle externally and link it from the release
 notes. See GitHub Docs: https://docs.github.com/en/repositories/releasing-projects-on-github/about-releases#storage-and-bandwidth-quotas
 
+At runtime, writable files are created next to `JAVTrans.exe`:
+
+- `.env` for persisted settings
+- `models/` for user-downloaded non-default models
+- `temp/web/` for job state and resumable task files
+- `temp/log/` for `.run.log` diagnostics that users can attach to bug reports
+
 To create split archives with 7-Zip:
 
 ```powershell
@@ -39,6 +50,6 @@ The default output is `dist/release-assets/JAVTrans-windows-x64.7z.001`,
 The script uses all logical CPU threads by default; override with `-Threads <n>`
 if you need to keep the machine responsive while compressing.
 
-Only the default ASR model is bundled. Other ASR models and auxiliary runtime
-models, such as WhisperSeg VAD, Qwen forced aligner, and `openai/whisper-base`,
-remain download-on-demand into the executable folder's `models/` directory.
+Only the default ASR model and the default workflow auxiliary models are bundled.
+Other ASR models remain download-on-demand into the executable folder's `models/`
+directory.

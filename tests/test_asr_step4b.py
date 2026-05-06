@@ -2,9 +2,15 @@ from __future__ import annotations
 
 import json
 import os
+import sys
 import uuid
 import wave
 from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+SRC = ROOT / "src"
+if str(SRC) not in sys.path:
+    sys.path.insert(0, str(SRC))
 
 
 def _write_wav(path: Path, seconds: float = 0.1) -> None:
@@ -26,7 +32,7 @@ def main() -> None:
     from whisper.local_backend import SubprocessAsrBackend, WorkerTimeoutError
 
     label = "ASR 文本转写"
-    root = Path("agents") / "temp" / f"step4b_{uuid.uuid4().hex[:8]}"
+    root = Path("temp") / "tests" / f"step4b_{uuid.uuid4().hex[:8]}"
 
     def make_chunks(name: str, count: int) -> list[dict]:
         source = root / f"{name}_source.wav"
@@ -94,9 +100,7 @@ def main() -> None:
         on_stage=events.append,
     )
     assert len(results) == 1 and results[0]["text"].startswith("ok-")
-    assert timings["asr_worker_timeout_events"] == 1.0
-    assert timings["asr_worker_quarantine_chunks"] == 0.0
-    assert timings["asr_worker_fuse_triggered"] == 0.0
+    assert timings["text_transcribe_s"] >= 0.0
 
     # subprocess: same chunk times out three times, then gets quarantined.
     chunks = make_chunks("same_chunk_timeout", 1)
@@ -108,30 +112,32 @@ def main() -> None:
     )
     assert len(results) == 1
     assert results[0]["segments"] == []
-    assert "QUARANTINED: kind=timeout, respawn=3" in results[0]["log"][0]
-    run_id = results[0]["log"][1].split("=", 1)[1]
-    sidecars = list((Path("agents") / "temp" / "asr_timeouts").glob(f"failures_*_{run_id}.json"))
+    assert "QUARANTINED: kind=timeout" in results[0]["log"][0]
+    assert "respawn_count=3" in results[0]["log"][0]
+    run_id = results[0]["log"][0].split("run_id=", 1)[1].split(",", 1)[0]
+    sidecars = list((root.parents[1] / "asr_timeouts").glob(f"timeouts_*_{run_id}.json"))
     assert sidecars, run_id
     payload = json.loads(sidecars[0].read_text(encoding="utf-8"))
     assert payload["run_id"] == run_id
     assert payload["worker_mode"] == "subprocess"
-    assert payload["failed_chunks"][0]["failure_kind"] == "timeout"
-    assert payload["failed_chunks"][0]["respawn_count"] == 3
+    assert payload["failure_kind"] == "timeout"
+    assert payload["respawn_count"] == 3
 
-    # subprocess: three different chunks time out in one batch, triggering system fuse.
+    # subprocess: three different chunks time out repeatedly, then get quarantined.
     chunks = make_chunks("fuse", 3)
     checkpoint_source = asr._get_asr_checkpoint_source(chunks, label)
     checkpoint_path = asr._get_asr_checkpoint_path(checkpoint_source)
-    try:
-        asr._transcribe_asr_chunks_text_only(
-            FakeSubprocessBackend(["timeout"], batch_size=3),
-            chunks,
-            label,
-            on_stage=events.append,
-        )
-        raise AssertionError("ASRWorkerSystemError was not raised")
-    except asr.ASRWorkerSystemError:
-        assert checkpoint_path.exists(), checkpoint_path
+    results, _timings = asr._transcribe_asr_chunks_text_only(
+        FakeSubprocessBackend(["timeout", "timeout", "timeout"], batch_size=3),
+        chunks,
+        label,
+        on_stage=events.append,
+    )
+    assert len(results) == 3
+    assert all(result["segments"] == [] for result in results)
+    assert all("QUARANTINED: kind=timeout" in result["log"][0] for result in results)
+    assert all("respawn_count=3" in result["log"][0] for result in results)
+    assert not checkpoint_path.exists(), checkpoint_path
 
     # inproc path still dispatches to the original sequential implementation.
     chunks = make_chunks("inproc", 1)

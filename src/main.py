@@ -75,7 +75,6 @@ from subtitles.qc import compute_quality_report
 from rich.console import Console
 from rich.progress import (
     Progress,
-    SpinnerColumn,
     TextColumn,
     BarColumn,
     TimeElapsedColumn,
@@ -246,7 +245,7 @@ def _raise_if_cancelled(cancel_event) -> None:
 
 
 def _run_log_dir(ctx: JobContext) -> Path:
-    raw = (ctx.run_log_dir or "./log").strip()
+    raw = (ctx.run_log_dir or "./temp/log").strip()
     path = Path(raw).expanduser()
     if not path.is_absolute():
         path = PROJECT_ROOT / path
@@ -1167,7 +1166,6 @@ def run_asr_alignment_f0(
         asr_event_last: dict[str, dict] = {}
 
         with Progress(
-            SpinnerColumn(),
             TextColumn("{task.description}"),
             BarColumn(),
             MofNCompleteColumn(),
@@ -1725,7 +1723,6 @@ def run_translation_and_write(
     _raise_if_cancelled(cancel_event)
 
     with Progress(
-        SpinnerColumn(),
         TextColumn("{task.description}"),
         BarColumn(),
         MofNCompleteColumn(),

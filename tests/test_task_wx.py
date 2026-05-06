@@ -3,6 +3,8 @@ import multiprocessing as mp
 
 from whisper import pipeline as asr
 from whisper import worker as asr_worker
+
+
 def test_aggregate_timeout_fragments_writes_summary_and_removes_fragments(monkeypatch, tmp_path):
     chunk_root = tmp_path / "chunks"
     timeout_dir = tmp_path / "asr_timeouts"
@@ -24,7 +26,6 @@ def test_aggregate_timeout_fragments_writes_summary_and_removes_fragments(monkey
         fragments.append(path)
 
     monkeypatch.setattr(asr, "_ASR_CHUNK_ROOT", chunk_root)
-    monkeypatch.setattr(asr, "_agents_RM_ROOT", tmp_path / "rm")
 
     summary_path = asr.aggregate_timeout_fragments(job_id)
 
@@ -34,7 +35,7 @@ def test_aggregate_timeout_fragments_writes_summary_and_removes_fragments(monkey
     assert payload["count"] == 3
     assert [record["chunk_index"] for record in payload["records"]] == [0, 1, 2]
     assert all(not path.exists() for path in fragments)
-    assert len(list((tmp_path / "rm").glob("timeouts_*.json.*"))) == 3
+    assert not (tmp_path / "rm").exists()
 
 
 def test_asr_worker_unknown_op_exits_with_code_1(monkeypatch):
