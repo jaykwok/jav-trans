@@ -39,6 +39,10 @@ def test_jobs_api_crud(tmp_path, monkeypatch):
     asyncio.run(_test_jobs_api_crud(tmp_path, monkeypatch))
 
 
+def test_app_exposes_icon_assets(tmp_path, monkeypatch):
+    asyncio.run(_test_app_exposes_icon_assets(tmp_path, monkeypatch))
+
+
 def test_config_lists_recommended_asr_backend_first(monkeypatch):
     asyncio.run(_test_config_lists_recommended_asr_backend_first(monkeypatch))
 
@@ -49,6 +53,27 @@ def test_settings_hf_endpoint_updates_runtime_env(monkeypatch):
 
 def test_jobs_api_retry_cancelled_job(tmp_path, monkeypatch):
     asyncio.run(_test_jobs_api_retry_cancelled_job(tmp_path, monkeypatch))
+
+
+async def _test_app_exposes_icon_assets(tmp_path, monkeypatch):
+    (tmp_path / "icon.ico").write_bytes(b"\x00\x00\x01\x00")
+    (tmp_path / "icon.png").write_bytes(
+        b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIEND\xaeB`\x82"
+    )
+
+    import web.app as web_app
+
+    monkeypatch.setattr(web_app, "resource_root", lambda: tmp_path)
+    transport = httpx.ASGITransport(app=create_app())
+    async with httpx.AsyncClient(
+        transport=transport,
+        base_url="http://test",
+    ) as client:
+        favicon = await client.get("/favicon.ico")
+        icon = await client.get("/icon.png")
+
+    assert favicon.status_code == 200
+    assert icon.status_code == 200
 
 
 async def _test_config_lists_recommended_asr_backend_first(monkeypatch):

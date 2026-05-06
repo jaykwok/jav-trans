@@ -40,6 +40,7 @@ header {
 }
 header .logo { font-size: 18px; font-weight: 700; color: var(--accent); letter-spacing: -0.5px; }
 header .sub  { font-size: 12px; color: var(--muted); }
+header .app-mark { width: 24px; height: 24px; object-fit: contain; flex-shrink: 0; }
 header .spacer { flex: 1; }
 header .conn-dot {
   width: 8px; height: 8px; border-radius: 50%;
@@ -104,7 +105,7 @@ aside {
   border-color: var(--accent);
   background: rgba(124,106,247,.07);
 }
-.drop-zone .icon { font-size: 28px; margin-bottom: 6px; opacity: .6; }
+.drop-zone .drop-icon { width: 34px; height: 34px; object-fit: contain; margin-bottom: 8px; opacity: .72; }
 .drop-zone p { font-size: 13px; color: var(--muted); }
 .drop-zone p strong { color: var(--text); }
 
