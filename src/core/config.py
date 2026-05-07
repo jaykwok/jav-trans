@@ -191,6 +191,8 @@ DEFAULT_SETTINGS: dict[str, str] = {
     "OPENAI_COMPATIBILITY_BASE_URL": "https://api.deepseek.com",
     # Translation model name sent to the SDK client.
     "LLM_MODEL_NAME": "deepseek-v4-pro",
+    # OpenAI-compatible API surface for translation requests. Valid values: chat, responses.
+    "LLM_API_FORMAT": "chat",
     # Reasoning effort parameter for models that support it.
     "LLM_REASONING_EFFORT": "max",
     # Final subtitle language.

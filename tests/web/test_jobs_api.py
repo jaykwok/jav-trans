@@ -51,6 +51,10 @@ def test_settings_hf_endpoint_updates_runtime_env(monkeypatch):
     asyncio.run(_test_settings_hf_endpoint_updates_runtime_env(monkeypatch))
 
 
+def test_settings_llm_api_format_updates_runtime_env(monkeypatch):
+    asyncio.run(_test_settings_llm_api_format_updates_runtime_env(monkeypatch))
+
+
 def test_jobs_api_retry_cancelled_job(tmp_path, monkeypatch):
     asyncio.run(_test_jobs_api_retry_cancelled_job(tmp_path, monkeypatch))
 
@@ -124,6 +128,34 @@ async def _test_settings_hf_endpoint_updates_runtime_env(monkeypatch):
 
     assert cleared.status_code == 200
     assert "HF_ENDPOINT" not in os.environ
+
+
+async def _test_settings_llm_api_format_updates_runtime_env(monkeypatch):
+    monkeypatch.delenv("LLM_API_FORMAT", raising=False)
+    monkeypatch.setattr(config_routes, "_update_env_file", lambda _changes: None)
+
+    transport = httpx.ASGITransport(app=create_app())
+    async with httpx.AsyncClient(
+        transport=transport,
+        base_url="http://test",
+    ) as client:
+        response = await client.post(
+            "/api/settings",
+            json={"llm_api_format": "responses"},
+        )
+        assert response.status_code == 200
+        assert os.environ["LLM_API_FORMAT"] == "responses"
+
+        settings = await client.get("/api/settings")
+        assert settings.status_code == 200
+        assert settings.json()["llm_api_format"] == "responses"
+
+        invalid = await client.post(
+            "/api/settings",
+            json={"llm_api_format": "legacy"},
+        )
+
+    assert invalid.status_code == 422
 
 
 async def _test_jobs_api_crud(tmp_path, monkeypatch):

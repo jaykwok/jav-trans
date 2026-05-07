@@ -108,6 +108,7 @@ def test_default_model_download_root_is_project_models():
     assert config.DEFAULT_SETTINGS["ASR_CONTEXT"] == ""
     assert config.DEFAULT_SETTINGS["ASR_BACKEND"] == "anime-whisper"
     assert config.DEFAULT_SETTINGS["ASR_SUBPROCESS_READY_TIMEOUT_S"] == "600"
+    assert config.DEFAULT_SETTINGS["LLM_API_FORMAT"] == "chat"
 
 
 def test_frozen_path_defaults_resolve_to_runtime_root(monkeypatch, tmp_path):
