@@ -1,9 +1,11 @@
 /* JAVTrans frontend — no build tools, plain ES2022 */
 
 const $ = id => document.getElementById(id);
+const escHtml = s => String(s)
+  .replace(/&/g, '&amp;').replace(/</g, '&lt;')
+  .replace(/>/g, '&gt;').replace(/"/g, '&quot;');
 
 // ── State ────────────────────────────────────────────────────────────────────
-// file entry: { type:'path', name, path }
 const state = {
   files: [],
   jobs: {},
@@ -12,8 +14,8 @@ const state = {
 };
 
 // ── DOM refs ─────────────────────────────────────────────────────────────────
-const dropZone    = $('drop-zone');
-const fileList    = $('file-list');
+const dropZone      = $('drop-zone');
+const fileList      = $('file-list');
 const btnAddFolder  = $('btn-add-folder');
 const btnSubmit     = $('btn-submit');
 const jobArea       = $('job-area');
@@ -23,35 +25,35 @@ const logScroll     = $('log-scroll');
 const connDot       = $('conn-dot');
 const btnClearDone  = $('btn-clear-done');
 
-// ── Form memory & paste menu ─────────────────────────────────────────────────
-const FORM_MEMORY_KEY = 'javtrans.formMemory.v1';
-const FORM_MEMORY_EXCLUDED_IDS = new Set(['s-apikey']);
+// ── Form memory v2 ────────────────────────────────────────────────────────────
+const FORM_MEMORY_KEY = 'javtrans.formMemory.v2';
+const FORM_MEMORY_EXCLUDED = new Set(['api-key']);
 const FORM_MEMORY_SELECTOR = 'input[id], select[id], textarea[id]';
 const PASTEABLE_INPUT_TYPES = new Set(['', 'text', 'search', 'url', 'tel', 'email', 'password', 'number']);
 let pasteTarget = null;
 let pasteMenu = null;
 
-function formMemoryControls() {
-  return [...document.querySelectorAll(FORM_MEMORY_SELECTOR)].filter(el => {
-    const type = (el.type || '').toLowerCase();
-    return !FORM_MEMORY_EXCLUDED_IDS.has(el.id)
-      && !['button', 'submit', 'reset', 'file', 'hidden'].includes(type);
-  });
-}
-
 function loadFormMemory() {
   try {
-    return JSON.parse(localStorage.getItem(FORM_MEMORY_KEY) || '{}');
+    const raw = JSON.parse(localStorage.getItem(FORM_MEMORY_KEY) || '{}');
+    return { controls: raw.controls || {}, details: raw.details || {} };
   } catch {
-    return {};
+    return { controls: {}, details: {} };
   }
 }
 
 function saveFormMemory() {
   const data = loadFormMemory();
-  for (const el of formMemoryControls()) {
-    data[el.id] = el.type === 'checkbox' ? !!el.checked : el.value;
+  for (const el of document.querySelectorAll(FORM_MEMORY_SELECTOR)) {
+    const type = (el.type || '').toLowerCase();
+    if (FORM_MEMORY_EXCLUDED.has(el.id)) continue;
+    if (['button', 'submit', 'reset', 'file', 'hidden'].includes(type)) continue;
+    data.controls[el.id] = el.type === 'checkbox' ? !!el.checked : el.value;
   }
+  for (const det of document.querySelectorAll('details[id]')) {
+    data.details[det.id] = det.open;
+  }
+  data.activePreset = activePreset;
   try {
     localStorage.setItem(FORM_MEMORY_KEY, JSON.stringify(data));
   } catch {}
@@ -59,17 +61,24 @@ function saveFormMemory() {
 
 function applyFormMemory() {
   const data = loadFormMemory();
-  for (const el of formMemoryControls()) {
-    if (!Object.prototype.hasOwnProperty.call(data, el.id)) continue;
+  for (const el of document.querySelectorAll(FORM_MEMORY_SELECTOR)) {
+    const type = (el.type || '').toLowerCase();
+    if (FORM_MEMORY_EXCLUDED.has(el.id)) continue;
+    if (['button', 'submit', 'reset', 'file', 'hidden'].includes(type)) continue;
+    if (!Object.hasOwn(data.controls, el.id)) continue;
     if (el.type === 'checkbox') {
-      el.checked = !!data[el.id];
+      el.checked = !!data.controls[el.id];
     } else if (el.tagName === 'SELECT') {
-      const value = String(data[el.id] ?? '');
+      const value = String(data.controls[el.id] ?? '');
       if ([...el.options].some(opt => opt.value === value)) el.value = value;
     } else {
-      el.value = String(data[el.id] ?? '');
+      el.value = String(data.controls[el.id] ?? '');
     }
   }
+  for (const det of document.querySelectorAll('details[id]')) {
+    if (Object.hasOwn(data.details, det.id)) det.open = !!data.details[det.id];
+  }
+  if (data.activePreset) activePreset = data.activePreset;
 }
 
 function installFormMemory() {
@@ -79,8 +88,124 @@ function installFormMemory() {
   document.addEventListener('change', e => {
     if (e.target.closest(FORM_MEMORY_SELECTOR)) saveFormMemory();
   });
+  document.addEventListener('toggle', e => {
+    if (e.target.id && e.target.tagName === 'DETAILS') saveFormMemory();
+  }, true);
 }
 
+// ── Presets ───────────────────────────────────────────────────────────────────
+const TUNING_FIELDS = {
+  't-multi-cue-split':         true,
+  't-show-gender':             true,
+  't-asr-recovery':            false,
+  't-vad-threshold':           '0.35',
+  't-translation-batch-size':  '100',
+  't-translation-max-workers': '8',
+  't-quality-report':          false,
+  't-keep-temp':               false,
+};
+
+const PRESETS = {
+  standard: { fields: { ...TUNING_FIELDS } },
+  hq:       { fields: { ...TUNING_FIELDS,
+    't-asr-recovery':   true,
+    't-quality-report': true,
+    't-vad-threshold':  '0.30',
+  } },
+  fast:     { fields: { ...TUNING_FIELDS,
+    't-vad-threshold':           '0.40',
+    't-translation-max-workers': '16',
+    't-multi-cue-split':         false,
+    't-show-gender':             false,
+  } },
+};
+
+const CUSTOM_PRESET_KEY = 'javtrans.customPreset.v1';
+
+function saveCustomPreset() {
+  const fields = {};
+  for (const id of Object.keys(TUNING_FIELDS)) {
+    const el = $(id);
+    if (!el) continue;
+    fields[id] = el.type === 'checkbox' ? el.checked : el.value;
+  }
+  localStorage.setItem(CUSTOM_PRESET_KEY, JSON.stringify(fields));
+}
+
+function loadCustomPreset() {
+  try { return JSON.parse(localStorage.getItem(CUSTOM_PRESET_KEY) || 'null'); }
+  catch { return null; }
+}
+
+let activePreset = 'standard';
+
+function setActivePreset(name) {
+  activePreset = name;
+  document.querySelectorAll('.preset-chip').forEach(c => c.classList.remove('active'));
+  const target = document.querySelector(`.preset-chip[data-preset="${name}"]`);
+  if (target) target.classList.add('active');
+  const tuningSection = $('section-tuning');
+  if (tuningSection) tuningSection.style.display = name === 'custom' ? '' : 'none';
+}
+
+function applyPreset(name) {
+  if (name === 'custom') {
+    const saved = loadCustomPreset();
+    if (saved) {
+      for (const [id, val] of Object.entries(saved)) {
+        const el = $(id);
+        if (!el) continue;
+        if (el.type === 'checkbox') el.checked = !!val;
+        else el.value = String(val);
+      }
+    }
+    setActivePreset('custom');
+  } else {
+    const p = PRESETS[name];
+    if (!p) return;
+    for (const [id, val] of Object.entries(p.fields)) {
+      const el = $(id);
+      if (!el) continue;
+      if (el.type === 'checkbox') el.checked = !!val;
+      else el.value = String(val);
+    }
+    setActivePreset(name);
+  }
+  updateSkipTransState();
+  saveFormMemory();
+}
+
+function installPresetChips() {
+  const chips = document.querySelector('.preset-chips');
+  if (chips) {
+    chips.addEventListener('click', e => {
+      const chip = e.target.closest('.preset-chip[data-preset]');
+      if (!chip) return;
+      applyPreset(chip.dataset.preset);
+    });
+  }
+  $('btn-save-custom')?.addEventListener('click', () => {
+    saveCustomPreset();
+    // ensure saved as the active mode
+    const data = loadFormMemory();
+    data.activePreset = 'custom';
+    try { localStorage.setItem(FORM_MEMORY_KEY, JSON.stringify(data)); } catch {}
+    showToast('自定义设置已保存，下次启动将默认选中自定义模式');
+  });
+}
+
+// ── Skip-translation linkage ──────────────────────────────────────────────────
+function updateSkipTransState() {
+  const skip = $('r-skip-translation')?.checked;
+  const panel = $('panel-translation');
+  if (panel) panel.classList.toggle('disabled', !!skip);
+}
+
+function installSkipTransLink() {
+  $('r-skip-translation')?.addEventListener('change', updateSkipTransState);
+}
+
+// ── Paste menu ────────────────────────────────────────────────────────────────
 function isPasteableControl(el) {
   if (!el) return false;
   if (el.tagName === 'TEXTAREA') return true;
@@ -97,28 +222,43 @@ function createPasteMenu() {
   const menu = document.createElement('div');
   menu.className = 'paste-menu';
   menu.hidden = true;
-  menu.innerHTML = '<button type="button">粘贴</button>';
+  menu.innerHTML = `
+    <button type="button" data-action="copy">复制</button>
+    <button type="button" data-action="paste">粘贴</button>
+  `;
   document.body.appendChild(menu);
   menu.addEventListener('click', async e => {
     e.preventDefault();
+    const btn = e.target.closest('[data-action]');
+    if (!btn) return;
     const target = pasteTarget;
     hidePasteMenu();
-    if (!isPasteableControl(target)) return;
-    try {
-      const text = await navigator.clipboard.readText();
-      insertTextAtCursor(target, text);
-    } catch {
-      alert('无法读取剪贴板，请使用 Ctrl+V 粘贴');
+    if (btn.dataset.action === 'copy') {
+      try {
+        await navigator.clipboard.writeText(window.getSelection()?.toString() || '');
+      } catch {
+        document.execCommand('copy');
+      }
+    } else if (btn.dataset.action === 'paste') {
+      if (!isPasteableControl(target)) return;
+      try {
+        const text = await navigator.clipboard.readText();
+        insertTextAtCursor(target, text);
+      } catch {
+        alert('无法读取剪贴板，请使用 Ctrl+V 粘贴');
+      }
     }
   });
   return menu;
 }
 
-function showPasteMenu(x, y, target) {
+function showPasteMenu(x, y, target, { showCopy = false, showPaste = true } = {}) {
   if (!pasteMenu) pasteMenu = createPasteMenu();
   pasteTarget = target;
+  pasteMenu.querySelector('[data-action="copy"]').hidden = !showCopy;
+  pasteMenu.querySelector('[data-action="paste"]').hidden = !showPaste;
   pasteMenu.style.left = Math.min(x, window.innerWidth - 84) + 'px';
-  pasteMenu.style.top = Math.min(y, window.innerHeight - 42) + 'px';
+  pasteMenu.style.top = Math.min(y, window.innerHeight - 80) + 'px';
   pasteMenu.hidden = false;
 }
 
@@ -138,10 +278,16 @@ function insertTextAtCursor(el, text) {
 
 function installPasteMenu() {
   document.addEventListener('contextmenu', e => {
-    const target = e.target.closest('input, textarea');
-    if (!isPasteableControl(target)) return;
+    const inputTarget = e.target.closest('input, textarea');
+    const isInput = isPasteableControl(inputTarget);
+    const sel = window.getSelection();
+    const hasSelection = !!(sel && sel.toString().length);
+    const inCopyArea = !!(e.target.closest('.log-scroll, .job-error-full, .job-error'));
+    const showCopy = hasSelection && (isInput || inCopyArea);
+    const showPaste = isInput;
+    if (!showCopy && !showPaste) return;
     e.preventDefault();
-    showPasteMenu(e.clientX, e.clientY, target);
+    showPasteMenu(e.clientX, e.clientY, isInput ? inputTarget : null, { showCopy, showPaste });
   });
   document.addEventListener('pointerdown', e => {
     if (pasteMenu && !pasteMenu.hidden && !pasteMenu.contains(e.target)) hidePasteMenu();
@@ -153,7 +299,7 @@ function installPasteMenu() {
   window.addEventListener('resize', hidePasteMenu);
 }
 
-// ── File handling ────────────────────────────────────────────────────────────
+// ── File handling ─────────────────────────────────────────────────────────────
 function renderFiles() {
   fileList.innerHTML = '';
   state.files.forEach((f, i) => {
@@ -207,7 +353,6 @@ async function pickFolder() {
 
 btnAddFolder.addEventListener('click', pickFolder);
 
-// PyWebView 6.x delivers drop paths via Python DOMEventHandler → evaluate_js
 window.__pywebviewDrop = function(paths) {
   for (const p of paths) {
     const name = p.split(/[\\/]/).pop();
@@ -224,7 +369,6 @@ dropZone.addEventListener('drop', e => {
   e.preventDefault();
   dropZone.classList.remove('drag-over');
   const droppedFiles = Array.from(e.dataTransfer.files || []);
-  // pywebview <6: pywebviewFullPath is injected on File objects directly
   const paths = droppedFiles.map(f => f.pywebviewFullPath || f.path).filter(Boolean);
   if (paths.length) {
     for (const p of paths) {
@@ -234,13 +378,11 @@ dropZone.addEventListener('drop', e => {
     }
     renderFiles();
   } else if (!droppedFiles.length) {
-    // No files in the drag payload at all — open native dialog
     pickFiles();
   }
-  // pywebview 6+: files present but no path in JS — Python handler calls window.__pywebviewDrop
 });
 
-// ── Submit ───────────────────────────────────────────────────────────────────
+// ── Submit ────────────────────────────────────────────────────────────────────
 btnSubmit.addEventListener('click', async () => {
   if (!state.files.length) return;
   btnSubmit.disabled = true;
@@ -249,23 +391,24 @@ btnSubmit.addEventListener('click', async () => {
   const paths = state.files.map(f => f.path);
 
   const spec = {
-    video_paths: paths,
-    asr_backend: $('p-backend').value,
-    subtitle_mode: $('p-mode').value,
-    asr_context: $('p-asr-context').value.trim(),
-    skip_translation: $('p-skip-trans').checked,
-    multi_cue_split: $('p-multi-cue').checked,
-    show_gender: $('p-gender').checked,
-    asr_recovery: $('p-recovery').checked,
-    keep_quality_report: $('p-quality-report').checked,
-    vad_threshold: parseFloat($('p-vad').value) || 0.35,
-    translation_batch_size: parseInt($('p-batch').value) || 100,
-    translation_max_workers: parseInt($('p-max-workers').value) || 8,
-    keep_temp_files: $('p-keep-temp').checked,
+    video_paths:              paths,
+    asr_backend:              $('r-backend').value,
+    subtitle_mode:            $('r-mode').value,
+    asr_context:              $('r-asr-context').value.trim(),
+    skip_translation:         $('r-skip-translation').checked,
+    multi_cue_split:          $('t-multi-cue-split').checked,
+    show_gender:              $('t-show-gender').checked,
+    asr_recovery:             $('t-asr-recovery').checked,
+    keep_quality_report:      $('t-quality-report').checked,
+    vad_threshold:            parseFloat($('t-vad-threshold').value) || 0.35,
+    translation_batch_size:   parseInt($('t-translation-batch-size').value) || 100,
+    translation_max_workers:  parseInt($('t-translation-max-workers').value) || 8,
+    ...readTranslationSettingsFromForm(),
+    keep_temp_files:          $('t-keep-temp').checked,
   };
-  const outputDir = $('p-output-dir').value.trim();
+  const outputDir = $('f-output-dir').value.trim();
   if (outputDir) spec.output_dir = outputDir;
-  const advancedRaw = ($('p-advanced')?.value || '').trim();
+  const advancedRaw = ($('t-env-override')?.value || '').trim();
   if (advancedRaw) {
     spec.advanced = {};
     for (const line of advancedRaw.split('\n')) {
@@ -277,6 +420,7 @@ btnSubmit.addEventListener('click', async () => {
   }
 
   try {
+    await syncSettingsFromFormForSubmit();
     const r = await fetch('/api/jobs', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -302,7 +446,6 @@ const STATUS_LABEL = {
 };
 
 const STAGE_LABEL = {
-  // job status values
   queued:              '排队等待',
   asr:                 'ASR 转写',
   translating:         '翻译中',
@@ -310,7 +453,6 @@ const STAGE_LABEL = {
   done:                '完成',
   failed:              '失败',
   cancelled:           '已取消',
-  // detailed stage names from SSE events
   audio_prepare:       '音频提取',
   asr_alignment:       'ASR 转写 & 对齐',
   asr_text_transcribe: 'ASR 文本转写',
@@ -335,7 +477,6 @@ function renderJobs() {
   const ids = Object.keys(state.jobs);
   emptyState.style.display = ids.length ? 'none' : 'flex';
 
-  // "清空已完成" button visibility
   const hasClearable = ids.some(id => CLEARABLE.has(state.jobs[id].status));
   jobAreaHeader.style.display = hasClearable ? 'flex' : 'none';
 
@@ -363,18 +504,15 @@ function renderJobs() {
     }
     const fillClass = job.status === 'done' ? ' done' : job.status === 'failed' ? ' error' : '';
     const stage = STAGE_LABEL[job.current_stage] ?? STAGE_LABEL[job.status] ?? job.current_stage ?? job.status;
-    const progressInfo = translated != null
-      ? ` ${translated}/${expected ?? '?'}`
-      : '';
+    const progressInfo = translated != null ? ` ${translated}/${expected ?? '?'}` : '';
 
     const isDone = job.status === 'done';
-    const isRetryable = ['failed','cancelled'].includes(job.status);
-    const isCancellable = ['queued','asr','translating','writing'].includes(job.status);
+    const isRetryable = ['failed', 'cancelled'].includes(job.status);
+    const isCancellable = ['queued', 'asr', 'translating', 'writing'].includes(job.status);
     const retryBtn = isRetryable
       ? `<button class="btn-sm btn-retry" data-retry="${id}" title="从当前缓存阶段重试">↺ 重试</button>`
       : '';
 
-    // Artifacts: SRT files shown prominently; others in collapsible section
     const srtArtifacts = isDone ? job.artifacts.filter(p => /\.srt$/i.test(p)) : [];
     const otherArtifacts = isDone ? job.artifacts.filter(p => !/\.srt$/i.test(p)) : [];
 
@@ -404,17 +542,42 @@ function renderJobs() {
       : '';
 
     const errorMsg = job.status === 'failed' && job.error
-      ? job.error.length > 80
-        ? `<details class="job-error-wrap"><summary class="job-error">${job.error.slice(0, 80)}…</summary><div class="job-error-full">${job.error}</div></details>`
-        : `<div class="job-error">${job.error}</div>`
+      ? job.error.length > 100
+        ? `<details class="job-error-wrap">
+            <summary class="job-error-summary"><span class="job-error-short">${escHtml(job.error.slice(0, 100))}…</span></summary>
+            <pre class="job-error-full">${escHtml(job.error)}</pre>
+          </details>`
+        : `<div class="job-error">${escHtml(job.error)}</div>`
       : '';
+
+    // Model download progress row
+    const dl = job._download;
+    let progressSection = `<div class="progress-bar"><div class="progress-fill${fillClass}" style="width:${pct}%"></div></div>`;
+    if (dl) {
+      const dlPct = dl.pct ?? 0;
+      const fname = dl.file ? dl.file.split(/[\\/]/).pop().replace(/\.(safetensors|bin|pt|gguf)$/, '') : '模型';
+      const downloadedMb = dl.sizeMb ? Math.round(dlPct / 100 * dl.sizeMb) : null;
+      const sizeStr = downloadedMb != null && dl.sizeMb ? `${downloadedMb}/${dl.sizeMb}MB` : '';
+      const speedStr = dl.speedMb != null ? `${dl.speedMb.toFixed(1)}MB/s` : '';
+      const info = [sizeStr, speedStr].filter(Boolean).join(' · ');
+      const slowDur = dl.slowSince ? Date.now() - dl.slowSince : 0;
+      const mirrorOn = $('mirror-enabled')?.checked;
+      const showMirrorBtn = slowDur >= 5000 && !mirrorOn;
+      progressSection = `
+        <div class="dl-row">
+          <span class="dl-label">↓ ${fname}</span>
+          <span class="dl-info">${info}</span>
+          ${showMirrorBtn ? `<button class="btn-sm btn-enable-mirror" data-enable-mirror="${id}">启用镜像加速</button>` : ''}
+        </div>
+        <div class="dl-bar"><div class="dl-bar-fill" style="width:${dlPct}%"></div></div>`;
+    }
 
     card.innerHTML = `
       <div class="job-header">
         <span class="job-title" title="${jobTitle(job)}">${jobTitle(job)}</span>
         <span class="badge badge-${job.status}">${STATUS_LABEL[job.status] ?? job.status}</span>
       </div>
-      <div class="progress-bar"><div class="progress-fill${fillClass}" style="width:${pct}%"></div></div>
+      ${progressSection}
       <div class="job-footer">
         <span class="job-stage">${stage}${progressInfo}</span>
         ${playBtn}
@@ -430,6 +593,9 @@ function renderJobs() {
 }
 
 jobArea.addEventListener('click', async e => {
+  const mirror = e.target.closest('[data-enable-mirror]');
+  if (mirror) { await enableHfMirror(mirror.dataset.enableMirror || null); return; }
+
   const dl = e.target.closest('[data-dl]');
   if (dl) {
     const url = `/api/output/${dl.dataset.dl}/${dl.dataset.file}`;
@@ -442,17 +608,13 @@ jobArea.addEventListener('click', async e => {
     const job = state.jobs[play.dataset.play];
     const videoPath = job?.spec?.video_paths?.[0];
     if (videoPath) {
-      try {
-        await fetch(`/api/open-video?path=${encodeURIComponent(videoPath)}`);
-      } catch {}
+      try { await fetch(`/api/open-video?path=${encodeURIComponent(videoPath)}`); } catch {}
     }
     return;
   }
   const folder = e.target.closest('[data-folder]');
   if (folder) {
-    try {
-      await fetch(`/api/open-folder?path=${encodeURIComponent(folder.dataset.folder)}`);
-    } catch {}
+    try { await fetch(`/api/open-folder?path=${encodeURIComponent(folder.dataset.folder)}`); } catch {}
     return;
   }
   const retry = e.target.closest('[data-retry]');
@@ -494,13 +656,35 @@ btnClearDone.addEventListener('click', async () => {
 });
 
 // ── API helpers ───────────────────────────────────────────────────────────────
+const ACTIVE_STATUSES = new Set(['queued', 'asr', 'translating', 'writing']);
+
+async function fetchJob(id) {
+  try {
+    const r = await fetch(`/api/jobs/${id}`);
+    if (!r.ok) return;
+    const job = await r.json();
+    const prev = state.jobs[id];
+    state.jobs[id] = job;
+    if (prev?._download && ACTIVE_STATUSES.has(job.status)) {
+      state.jobs[id]._download = prev._download;
+    }
+    renderJobs();
+  } catch {}
+}
+
 async function fetchAllJobs() {
   try {
     const r = await fetch('/api/jobs');
     if (!r.ok) return;
     const jobs = await r.json();
+    const prev = state.jobs;
     state.jobs = {};
-    jobs.forEach(j => state.jobs[j.id] = j);
+    jobs.forEach(j => {
+      state.jobs[j.id] = j;
+      if (prev[j.id]?._download && ACTIVE_STATUSES.has(j.status)) {
+        state.jobs[j.id]._download = prev[j.id]._download;
+      }
+    });
     renderJobs();
   } catch {}
 }
@@ -521,13 +705,51 @@ function connectSSE() {
     }
 
     const phase = ev.phase ?? '';
+
+    // model_download: update card progress, log compactly
+    if (ev.stage === 'model_download' && ev.job_id) {
+      const job = state.jobs[ev.job_id];
+      if (job) {
+        if (phase === 'done' || phase === 'error') {
+          job._download = null;
+        } else {
+          const x = ev.extra || {};
+          const prev = job._download || {};
+          const fileChanged = x.file && x.file !== prev.file;
+          const speedMb = x.speed_mb ?? prev.speedMb ?? null;
+          let slowSince = fileChanged ? null : (prev.slowSince ?? null);
+          if (speedMb != null) {
+            if (speedMb < 1.0 && slowSince == null) slowSince = Date.now();
+            else if (speedMb >= 1.0) slowSince = null;
+          }
+          job._download = {
+            file:    x.file    || prev.file    || '',
+            sizeMb:  x.size_mb ?? prev.sizeMb  ?? null,
+            pct:     x.pct     ?? prev.pct     ?? 0,
+            speedMb,
+            slowSince,
+          };
+        }
+        renderJobs();
+      } else {
+        fetchJob(ev.job_id);
+      }
+      const x = ev.extra || {};
+      const dlInfo = phase === 'progress' && x.pct != null
+        ? ` ${Math.round(x.pct)}%${x.speed_mb != null ? ` ${x.speed_mb.toFixed(1)}MB/s` : ''}`
+        : '';
+      addLog(`[model_download] ${phase}${dlInfo}`,
+        phase === 'done' ? 'stage-done' : phase === 'error' ? 'stage-error' : 'stage-progress');
+      return;
+    }
+
     const cls = phase === 'start' ? 'stage-start'
                : phase === 'done' ? 'stage-done'
                : phase === 'error' || phase === 'blocked' ? 'stage-error'
                : 'stage-progress';
 
     const label = ev.stage ? `[${ev.stage}] ${phase}` : JSON.stringify(ev);
-    const extra = ev.extra ? ' ' + Object.entries(ev.extra).map(([k,v])=>`${k}=${v}`).join(' ') : '';
+    const extra = ev.extra ? ' ' + Object.entries(ev.extra).map(([k, v]) => `${k}=${v}`).join(' ') : '';
     addLog(label + extra, cls);
 
     if (ev.job_id && (phase === 'done' || phase === 'start' || phase === 'progress')) {
@@ -539,16 +761,6 @@ function connectSSE() {
     connDot.className = 'conn-dot err';
     setTimeout(() => { connectSSE(); fetchAllJobs(); }, 3000);
   };
-}
-
-async function fetchJob(id) {
-  try {
-    const r = await fetch(`/api/jobs/${id}`);
-    if (!r.ok) return;
-    const job = await r.json();
-    state.jobs[id] = job;
-    renderJobs();
-  } catch {}
 }
 
 // ── Log ───────────────────────────────────────────────────────────────────────
@@ -569,9 +781,29 @@ $('log-clear').addEventListener('click', () => {
   logScroll.innerHTML = '';
 });
 
-// ── Settings ──────────────────────────────────────────────────────────────────
+$('log-copy-all').addEventListener('click', async () => {
+  const lines = [...logScroll.querySelectorAll('.log-line')]
+    .map(el => el.textContent).join('\n');
+  try {
+    await navigator.clipboard.writeText(lines);
+    showToast('日志已复制');
+  } catch {
+    showToast('复制失败，请手动选择文本');
+  }
+});
+
+logScroll.addEventListener('click', e => {
+  const line = e.target.closest('.log-line');
+  if (!line) return;
+  line.classList.toggle('expanded');
+});
+
+// ── Config & Settings ─────────────────────────────────────────────────────────
 const _BACKEND_LABELS = {
   'whisper-ja-anime-v0.3': 'whisper-ja-anime-v0.3（推荐）',
+  'anime-whisper':          'AnimeWhisper',
+  'qwen3-asr-1.7b':         'Qwen3-ASR-1.7B',
+  'whisper-ja-1.5b':        'whisper-ja-1.5B',
 };
 const _SUBTITLE_MODE_LABELS = { zh: '中文字幕', bilingual: '中日双语' };
 
@@ -581,7 +813,7 @@ async function loadConfig() {
     if (!r.ok) return;
     const cfg = await r.json();
 
-    const backendSel = $('p-backend');
+    const backendSel = $('r-backend');
     backendSel.innerHTML = '';
     for (const b of (cfg.backends || [])) {
       const opt = document.createElement('option');
@@ -589,9 +821,12 @@ async function loadConfig() {
       opt.textContent = _BACKEND_LABELS[b] || b;
       backendSel.appendChild(opt);
     }
-    if (cfg.defaults?.asr_backend) backendSel.value = cfg.defaults.asr_backend;
+    // only apply API default if user has no saved preference
+    if (cfg.defaults?.asr_backend && !Object.hasOwn(loadFormMemory().controls, 'r-backend')) {
+      backendSel.value = cfg.defaults.asr_backend;
+    }
 
-    const modeSel = $('p-mode');
+    const modeSel = $('r-mode');
     modeSel.innerHTML = '';
     for (const m of (cfg.subtitle_modes || [])) {
       const opt = document.createElement('option');
@@ -602,14 +837,15 @@ async function loadConfig() {
     if (cfg.defaults?.subtitle_mode) modeSel.value = cfg.defaults.subtitle_mode;
 
     const d = cfg.defaults ?? {};
-    if (d.vad_threshold      != null) $('p-vad').value       = d.vad_threshold;
-    if (d.translation_batch_size  != null) $('p-batch').value       = d.translation_batch_size;
-    if (d.translation_max_workers != null) $('p-max-workers').value = d.translation_max_workers;
-    if (d.multi_cue_split    != null) $('p-multi-cue').checked = !!d.multi_cue_split;
-    if (d.show_gender        != null) $('p-gender').checked    = !!d.show_gender;
-    if (d.asr_recovery       != null) $('p-recovery').checked  = !!d.asr_recovery;
-    if (d.skip_translation   != null) $('p-skip-trans').checked = !!d.skip_translation;
+    if (d.vad_threshold             != null) $('t-vad-threshold').value           = d.vad_threshold;
+    if (d.translation_batch_size    != null) $('t-translation-batch-size').value  = d.translation_batch_size;
+    if (d.translation_max_workers   != null) $('t-translation-max-workers').value = d.translation_max_workers;
+    if (d.multi_cue_split           != null) $('t-multi-cue-split').checked       = !!d.multi_cue_split;
+    if (d.show_gender               != null) $('t-show-gender').checked           = !!d.show_gender;
+    if (d.asr_recovery              != null) $('t-asr-recovery').checked          = !!d.asr_recovery;
+    if (d.skip_translation          != null) $('r-skip-translation').checked      = !!d.skip_translation;
     applyFormMemory();
+    setActivePreset(activePreset);
   } catch {}
 }
 
@@ -618,42 +854,61 @@ async function loadSettings() {
     const r = await fetch('/api/settings');
     if (!r.ok) return;
     const s = await r.json();
-    $('s-key-preview').textContent = s.api_key_preview
+
+    $('api-key-preview').textContent = s.api_key_preview
       ? '当前：' + s.api_key_preview
       : '当前：未设置';
-    if (s.base_url) $('s-baseurl').value = s.base_url;
+    if (s.base_url) $('api-base-url').value = s.base_url;
     if (s.model) {
-      const sel = $('s-model');
+      const sel = $('api-model');
       sel.innerHTML = `<option value="${s.model}">${s.model}</option>`;
       sel.disabled = false;
-      $('s-model-preview').textContent = '当前：' + s.model;
+      $('api-model-preview').textContent = '当前：' + s.model;
     }
-    $('s-hf-mirror').checked = s.hf_endpoint === 'https://hf-mirror.com';
-    const effort = $('s-reasoning-effort');
+    $('mirror-enabled').checked = s.hf_endpoint === 'https://hf-mirror.com';
+
+    const effort = $('api-reasoning-effort');
     if (effort) effort.value = s.llm_reasoning_effort || 'max';
-    const apiFormat = $('s-api-format');
+    const apiFormat = $('api-format');
     if (apiFormat) apiFormat.value = s.llm_api_format || 'chat';
-    const targetLang = $('s-target-lang');
+    const targetLang = $('api-target-lang');
     if (targetLang) targetLang.value = s.target_lang || '简体中文';
-    const glossary = $('s-glossary');
+    const glossary = $('api-glossary');
     if (glossary) {
       glossary.value = (s.translation_glossary || '')
         .split(',').map(t => t.trim()).filter(Boolean).join('\n');
     }
-    applyFormMemory();
+
+    // Auto-open panel-translation if unconfigured (only if localStorage has no preference)
+    const isConfigured = !!(s.base_url && s.model && s.api_key_preview && !s.api_key_preview.includes('未设置'));
+    const saved = loadFormMemory();
+    if (!Object.hasOwn(saved.details, 'panel-translation')) {
+      const pt = $('panel-translation');
+      if (pt) pt.open = !isConfigured;
+    }
   } catch {}
 }
 
+// ── Settings UI handlers ──────────────────────────────────────────────────────
+$('btn-show-key').addEventListener('click', () => {
+  const inp = $('api-key');
+  const show = inp.type === 'password';
+  inp.type = show ? 'text' : 'password';
+  $('btn-show-key').textContent = show ? '🙈' : '👁';
+});
+
 $('btn-fetch-models').addEventListener('click', async () => {
-  // 前端预校验
-  const baseUrl = $('s-baseurl').value.trim();
+  const baseUrl     = $('api-base-url').value.trim();
+  const apiKeyInput = $('api-key').value.trim();
+  const keyPreview  = $('api-key-preview').textContent || '';
+  const hasStoredKey = keyPreview && !keyPreview.includes('未设置');
+
   if (!baseUrl) {
-    alert('请先填写 API Base URL，保存后再获取模型');
+    alert('请先填写 API Base URL');
     return;
   }
-  const keyHint = $('s-key-preview').textContent;
-  if (!keyHint || keyHint.includes('未设置')) {
-    alert('请先填写并保存 API Key，再获取模型');
+  if (!apiKeyInput && !hasStoredKey) {
+    alert('请先填写 API Key');
     return;
   }
 
@@ -661,9 +916,20 @@ $('btn-fetch-models').addEventListener('click', async () => {
   btn.textContent = '获取中…';
   btn.disabled = true;
   try {
+    // 有未保存的 key → 先自动保存，再拉列表
+    if (apiKeyInput) {
+      try {
+        await saveSettingsBody(buildSettingsBodyFromForm({ includeConnection: true }));
+      } catch (e) {
+        alert('保存 API Key 失败：' + e.message);
+        return;
+      }
+      await loadSettings();
+    }
+
     const r = await fetch('/api/models');
     if (r.status === 400) {
-      alert('配置不完整：' + await r.text() + '\n请先保存 API Key 和 Base URL');
+      alert('配置不完整：' + await r.text());
       return;
     }
     if (r.status === 401 || r.status === 403) {
@@ -671,7 +937,7 @@ $('btn-fetch-models').addEventListener('click', async () => {
       return;
     }
     if (!r.ok) {
-      alert('获取失败（' + r.status + '），请检查 Base URL 是否正确：\n' + await r.text());
+      alert('获取失败（' + r.status + '），请检查 Base URL：\n' + await r.text());
       return;
     }
     const { models } = await r.json();
@@ -679,14 +945,13 @@ $('btn-fetch-models').addEventListener('click', async () => {
       alert('API 未返回任何模型，请确认 Base URL 和 Key 填写正确');
       return;
     }
-    const sel = $('s-model');
+    const sel = $('api-model');
     const current = sel.value;
     sel.innerHTML = models.map(m =>
       `<option value="${m}"${m === current ? ' selected' : ''}>${m}</option>`
     ).join('');
     sel.disabled = false;
-    // 成功后移除 wrapper tooltip
-    const wrap = $('s-model-wrap');
+    const wrap = $('api-model-wrap');
     if (wrap) wrap.removeAttribute('title');
   } catch (e) {
     alert('获取模型出错，请检查网络或 Base URL：\n' + e.message);
@@ -703,52 +968,160 @@ function showSaveStatus(msg, type) {
   setTimeout(() => { el.textContent = ''; el.className = 'save-status'; }, 3000);
 }
 
-$('btn-eye').addEventListener('click', () => {
-  const inp = $('s-apikey');
-  const show = inp.type === 'password';
-  inp.type = show ? 'text' : 'password';
-  $('btn-eye').textContent = show ? '🙈' : '👁';
-});
+function readTranslationSettingsFromForm() {
+  return {
+    llm_reasoning_effort: $('api-reasoning-effort').value || 'max',
+    llm_api_format:       $('api-format').value || 'chat',
+    target_lang:          $('api-target-lang').value || '简体中文',
+    translation_glossary: ($('api-glossary').value || '')
+      .split('\n').map(t => t.trim()).filter(Boolean).join(', '),
+  };
+}
 
-$('btn-save-settings').addEventListener('click', async () => {
-  const apiKey    = $('s-apikey').value.trim();
-  const baseUrl   = $('s-baseurl').value.trim();
-  const model     = $('s-model').value.trim();
-  const hfMirror  = $('s-hf-mirror').checked;
-  $('btn-save-settings').disabled = true;
-  try {
-    const body = {};
-    if (apiKey)  body.api_key  = apiKey;
+function buildSettingsBodyFromForm({ includeConnection = false, includeMirror = false } = {}) {
+  const body = readTranslationSettingsFromForm();
+  if (includeConnection) {
+    const apiKey = $('api-key').value.trim();
+    const baseUrl = $('api-base-url').value.trim();
+    const model = $('api-model').value.trim();
+    if (apiKey) body.api_key = apiKey;
     if (baseUrl) body.base_url = baseUrl;
-    if (model)   body.model    = model;
-    body.hf_endpoint = hfMirror ? 'https://hf-mirror.com' : '';
-    body.llm_reasoning_effort = $('s-reasoning-effort').value || 'max';
-    body.llm_api_format = $('s-api-format').value || 'chat';
-    body.target_lang = $('s-target-lang').value || '简体中文';
-    body.translation_glossary = ($('s-glossary').value || '')
-      .split('\n').map(t => t.trim()).filter(Boolean).join(', ');
-    const r = await fetch('/api/settings', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(body),
-    });
-    if (!r.ok) throw new Error(await r.text());
-    $('s-apikey').value = '';
-    $('btn-eye').textContent = '👁';
-    $('s-apikey').type = 'password';
-    const mirrorNote = hfMirror ? '（hf-mirror 已开启，重启生效）' : '';
-    showSaveStatus('✓ 已保存' + mirrorNote, 'ok');
+    if (model) body.model = model;
+  }
+  if (includeMirror) {
+    body.hf_endpoint = $('mirror-enabled').checked ? 'https://hf-mirror.com' : '';
+  }
+  return body;
+}
+
+function clearApiKeyInputIfSaved(body) {
+  if (!body.api_key) return;
+  $('api-key').value = '';
+  $('api-key').type = 'password';
+  $('btn-show-key').textContent = '👁';
+}
+
+async function saveSettingsBody(body) {
+  const r = await fetch('/api/settings', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  });
+  if (!r.ok) throw new Error(await r.text());
+  clearApiKeyInputIfSaved(body);
+}
+
+async function syncSettingsFromFormForSubmit() {
+  const body = buildSettingsBodyFromForm({ includeConnection: true });
+  await saveSettingsBody(body);
+  saveFormMemory();
+}
+
+$('btn-save-api').addEventListener('click', async () => {
+  $('btn-save-api').disabled = true;
+  try {
+    await saveSettingsBody(
+      buildSettingsBodyFromForm({
+        includeConnection: true,
+        includeMirror: true,
+      })
+    );
+    showSaveStatus('✓ 已保存', 'ok');
     await loadSettings();
     saveFormMemory();
   } catch (e) {
     showSaveStatus('✗ 保存失败：' + e.message, 'error');
   }
-  $('btn-save-settings').disabled = false;
+  $('btn-save-api').disabled = false;
 });
 
-// ── Init ──────────────────────────────────────────────────────────────────────
-const ACTIVE_STATUSES = new Set(['queued', 'asr', 'translating', 'writing']);
+// ── hf-mirror ─────────────────────────────────────────────────────────────────
+async function _cancelAndRestartDownloadJob(jobId) {
+  if (!jobId) return;
+  const job = state.jobs[jobId];
+  if (!job || !ACTIVE_STATUSES.has(job.status)) return;
+  const spec = job.spec;
+  await fetch(`/api/jobs/${jobId}`, { method: 'DELETE' });
+  // wait for backend to cancel + clean up partial files
+  await new Promise(r => setTimeout(r, 1200));
+  // re-submit same spec so download restarts with new endpoint
+  try {
+    await fetch('/api/jobs', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(spec),
+    });
+  } catch {}
+  await fetchAllJobs();
+}
 
+async function enableHfMirror(jobId = null) {
+  try {
+    const r = await fetch('/api/settings', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ hf_endpoint: 'https://hf-mirror.com' }),
+    });
+    if (!r.ok) throw new Error(await r.text());
+    const mirrorChk = $('mirror-enabled');
+    if (mirrorChk) mirrorChk.checked = true;
+    saveFormMemory();
+
+    if (jobId && state.jobs[jobId]?._download) {
+      showToast('镜像已启用，正在取消当前下载并重新开始…');
+      await _cancelAndRestartDownloadJob(jobId);
+    } else {
+      showToast('镜像已启用，对下次模型下载生效');
+    }
+  } catch (e) {
+    showToast('启用失败：' + e.message);
+  }
+}
+
+function installMirrorChangeHandler() {
+  const chk = $('mirror-enabled');
+  if (!chk) return;
+  let _lastMirrorVal = chk.checked;
+
+  chk.addEventListener('change', async () => {
+    if (chk.checked === _lastMirrorVal) return;
+    _lastMirrorVal = chk.checked;
+
+    const endpoint = chk.checked ? 'https://hf-mirror.com' : '';
+    try {
+      const r = await fetch('/api/settings', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ hf_endpoint: endpoint }),
+      });
+      if (!r.ok) throw new Error(await r.text());
+      saveFormMemory();
+    } catch (e) {
+      showToast('保存镜像设置失败：' + e.message);
+      return;
+    }
+
+    // cancel + restart any active download
+    const activeDownload = Object.values(state.jobs)
+      .find(j => j._download && ACTIVE_STATUSES.has(j.status));
+    if (activeDownload) {
+      const label = chk.checked ? '镜像已启用' : '镜像已关闭';
+      showToast(`${label}，正在取消当前下载并重新开始…`);
+      await _cancelAndRestartDownloadJob(activeDownload.id);
+    }
+  });
+}
+
+// ── Toast ─────────────────────────────────────────────────────────────────────
+function showToast(msg) {
+  const el = document.createElement('div');
+  el.className = 'toast';
+  el.textContent = msg;
+  document.body.appendChild(el);
+  setTimeout(() => el.remove(), 3500);
+}
+
+// ── Init ──────────────────────────────────────────────────────────────────────
 setInterval(() => {
   const hasActive = Object.values(state.jobs).some(j => ACTIVE_STATUSES.has(j.status));
   if (hasActive) fetchAllJobs();
@@ -763,10 +1136,15 @@ document.addEventListener('keydown', e => {
 (async () => {
   installFormMemory();
   installPasteMenu();
+  installPresetChips();
+  installSkipTransLink();
   await loadConfig();
   await loadSettings();
   applyFormMemory();
+  setActivePreset(activePreset);
+  updateSkipTransState();
   saveFormMemory();
+  installMirrorChangeHandler(); // after applyFormMemory so initial restore doesn't fire
   await fetchAllJobs();
   connectSSE();
 })();

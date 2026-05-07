@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Any
 
 from core import events
+from core.config import DEFAULT_SETTINGS
 from core.job_context import JobContext
 import main as pipeline_main
 from main import run_asr_alignment_f0, run_translation_and_write
@@ -175,6 +176,46 @@ def _translation_cache_path(job_id: str) -> str:
     return str(Path(_job_temp_dir(job_id)) / "translation_cache.jsonl")
 
 
+def _runtime_setting(key: str, fallback: str = "") -> str:
+    if key in os.environ:
+        return os.environ.get(key, "").strip()
+    return str(DEFAULT_SETTINGS.get(key, fallback)).strip()
+
+
+def _normalize_llm_api_format(value: str) -> str:
+    normalized = (value or "chat").strip().lower()
+    return normalized if normalized in {"chat", "responses"} else "chat"
+
+
+def _normalize_llm_reasoning_effort(value: str) -> str:
+    normalized = (value or "max").strip().lower()
+    return normalized if normalized in {"low", "medium", "max"} else "max"
+
+
+def _snapshot_translation_settings(spec: JobSpec) -> JobSpec:
+    updates: dict[str, str] = {}
+
+    target_lang = getattr(spec, "target_lang", None)
+    if target_lang is None or not str(target_lang).strip():
+        updates["target_lang"] = _runtime_setting("TARGET_LANG", "简体中文") or "简体中文"
+
+    if getattr(spec, "translation_glossary", None) is None:
+        updates["translation_glossary"] = _runtime_setting("TRANSLATION_GLOSSARY", "")
+
+    if getattr(spec, "llm_api_format", None) is None:
+        updates["llm_api_format"] = _normalize_llm_api_format(
+            _runtime_setting("LLM_API_FORMAT", "chat")
+        )
+
+    reasoning_effort = getattr(spec, "llm_reasoning_effort", None)
+    if reasoning_effort is None or not str(reasoning_effort).strip():
+        updates["llm_reasoning_effort"] = _normalize_llm_reasoning_effort(
+            _runtime_setting("LLM_REASONING_EFFORT", "max")
+        )
+
+    return spec.model_copy(update=updates) if updates else spec
+
+
 def _job_context(job: JobState) -> JobContext:
     return JobContext.from_spec(
         job.spec,
@@ -186,16 +227,22 @@ def _job_context(job: JobState) -> JobContext:
 
 def _run_asr_alignment_f0(job: JobState, cancel_event=None):
     events.set_current_job_id(job.id)
-    cancel_event = cancel_event or _cancel_events.setdefault(
-        job.id,
-        _new_cancel_event(),
-    )
-    return run_asr_alignment_f0(
-        job.spec.video_paths[0],
-        ctx=_job_context(job),
-        cache_job_id=_resume_cache_job_id(job),
-        cancel_event=cancel_event,
-    )
+    from utils import hf_progress as _hf_progress
+
+    _hf_progress.set_current_job_id(job.id)
+    try:
+        cancel_event = cancel_event or _cancel_events.setdefault(
+            job.id,
+            _new_cancel_event(),
+        )
+        return run_asr_alignment_f0(
+            job.spec.video_paths[0],
+            ctx=_job_context(job),
+            cache_job_id=_resume_cache_job_id(job),
+            cancel_event=cancel_event,
+        )
+    finally:
+        _hf_progress.set_current_job_id("")
 
 
 def _run_translation_and_write(job: JobState, asr_artifacts) -> list[str]:
@@ -366,8 +413,9 @@ async def translation_worker() -> None:
 
 async def create_job(spec: JobSpec) -> list[JobState]:
     jobs: list[JobState] = []
+    parent_spec = _snapshot_translation_settings(spec)
     for video_path in spec.video_paths:
-        child_spec = spec.model_copy(update={"video_paths": [video_path]})
+        child_spec = parent_spec.model_copy(update={"video_paths": [video_path]})
         job_id = uuid.uuid4().hex
         job = JobState(
             id=job_id,

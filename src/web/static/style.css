@@ -164,12 +164,6 @@ textarea { font-family: var(--mono); font-size: 12px; resize: vertical; min-heig
 
 .form-grid { display: flex; flex-direction: column; gap: 10px; }
 
-details.advanced summary {
-  cursor: pointer; font-size: 12px; color: var(--muted);
-  padding: 4px 0; user-select: none;
-}
-details.advanced summary:hover { color: var(--text); }
-details.advanced .inner { padding-top: 10px; display: flex; flex-direction: column; gap: 10px; }
 
 .btn {
   width: 100%; padding: 9px; border-radius: var(--radius);
@@ -277,14 +271,26 @@ main {
   font-size: 11px; color: var(--error); font-family: var(--mono);
   background: rgba(224,92,92,.08); border-radius: 4px;
   padding: 4px 8px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  user-select: text;
 }
 .job-error-wrap { font-size: 11px; font-family: var(--mono); }
-.job-error-wrap summary { list-style: none; cursor: pointer; }
-.job-error-wrap summary::-webkit-details-marker { display: none; }
+.job-error-summary {
+  list-style: none; cursor: pointer;
+  display: flex; align-items: center; gap: 4px;
+  color: var(--error); background: rgba(224,92,92,.08);
+  border-radius: 4px; padding: 4px 8px;
+}
+.job-error-summary::-webkit-details-marker { display: none; }
+.job-error-summary::before { content: '▸'; font-size: 9px; color: var(--muted); flex-shrink: 0; }
+.job-error-wrap[open] .job-error-summary::before { content: '▾'; }
+.job-error-short { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.job-error-wrap[open] .job-error-short { display: none; }
+.job-error-wrap[open] .job-error-summary::after { content: '收起'; font-size: 10px; color: var(--muted); }
 .job-error-full {
   color: var(--error); background: rgba(224,92,92,.08);
-  border-radius: 0 0 4px 4px; padding: 4px 8px;
+  border-radius: 0 0 4px 4px; padding: 6px 8px;
   white-space: pre-wrap; word-break: break-all; margin-top: 2px;
+  user-select: text; cursor: text; font-size: 11px; font-family: var(--mono);
 }
 
 /* ── Event Log ── */
@@ -301,8 +307,15 @@ main {
 .log-header .spacer { flex: 1; }
 .log-clear { background: none; border: none; color: var(--muted); cursor: pointer; font-size: 11px; }
 .log-clear:hover { color: var(--text); }
+.log-copy-all { background: none; border: none; color: var(--muted); cursor: pointer; font-size: 11px; }
+.log-copy-all:hover { color: var(--text); }
 .log-scroll { flex: 1; overflow-y: auto; padding: 6px 14px; font-family: var(--mono); font-size: 11px; }
-.log-line { padding: 1px 0; color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.log-line {
+  padding: 1px 0; color: var(--muted);
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  cursor: pointer; user-select: text;
+}
+.log-line.expanded { white-space: pre-wrap; overflow: visible; text-overflow: clip; cursor: text; }
 .log-line.stage-start   { color: var(--accent2); }
 .log-line.stage-done    { color: var(--success); }
 .log-line.stage-error   { color: var(--error); }
@@ -370,6 +383,66 @@ main {
 .paste-menu button:hover {
   background: rgba(124,106,247,.16);
   color: #fff;
+}
+
+/* ── Preset chips ── */
+.preset-chips {
+  display: flex; flex-wrap: wrap; gap: 6px;
+}
+.preset-chip {
+  padding: 4px 12px; border-radius: 20px; border: 1px solid var(--border);
+  background: transparent; color: var(--muted); font-size: 12px; font-weight: 600;
+  cursor: pointer; transition: border-color .15s, color .15s, background .15s;
+  white-space: nowrap;
+}
+.preset-chip:hover { border-color: var(--accent); color: var(--accent); }
+.preset-chip.active {
+  border-color: var(--accent); background: rgba(124,106,247,.18); color: var(--accent);
+}
+.preset-chip-custom { border-style: dashed; }
+.preset-chip-custom.active { border-color: var(--warn); background: rgba(240,168,67,.12); color: var(--warn); }
+
+/* ── Disabled panel overlay (skip-translation) ── */
+.panel-collapsible.disabled > summary { opacity: 0.45; }
+.panel-collapsible.disabled .form-grid {
+  opacity: 0.35; pointer-events: none; user-select: none;
+}
+
+/* ── Model download progress row ── */
+.dl-row {
+  display: flex; align-items: center; gap: 8px;
+  font-size: 11px; font-family: var(--mono);
+  padding: 3px 0;
+}
+.dl-label { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--accent2); }
+.dl-info { color: var(--muted); white-space: nowrap; flex-shrink: 0; }
+.dl-bar {
+  height: 3px; background: var(--border); border-radius: 2px; overflow: hidden; margin-bottom: 2px;
+}
+.dl-bar-fill {
+  height: 100%; background: var(--accent2); border-radius: 2px; transition: width .5s ease;
+}
+.btn-enable-mirror {
+  background: rgba(240,168,67,.15); color: var(--warn);
+  border: 1px solid rgba(240,168,67,.3); flex-shrink: 0;
+  font-size: 10px; padding: 2px 8px;
+}
+.btn-enable-mirror:hover { background: rgba(240,168,67,.28); opacity: 1; }
+
+/* ── Toast notification ── */
+.toast {
+  position: fixed; top: 56px; left: 50%; transform: translateX(-50%);
+  z-index: 9000;
+  background: var(--surface); border: 1px solid var(--border);
+  border-radius: var(--radius); padding: 8px 18px;
+  font-size: 13px; color: var(--text);
+  box-shadow: 0 8px 24px rgba(0,0,0,.4);
+  animation: toast-in .2s ease;
+  white-space: nowrap;
+}
+@keyframes toast-in {
+  from { opacity: 0; transform: translateX(-50%) translateY(-8px); }
+  to   { opacity: 1; transform: translateX(-50%) translateY(0); }
 }
 
 /* Scrollbar */

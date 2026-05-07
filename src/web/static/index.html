@@ -20,12 +20,23 @@
   </header>
 
   <aside>
-    <!-- Submit (fixed at top, outside scroll area) -->
+    <!-- Submit (sticky) -->
     <div class="panel panel-submit">
       <button class="btn btn-primary" id="btn-submit" disabled>提交任务</button>
     </div>
 
     <div class="aside-scroll">
+
+      <!-- Preset chips -->
+      <div class="panel">
+        <div class="panel-title">预设</div>
+        <div class="preset-chips">
+          <button class="preset-chip" data-preset="standard">标准</button>
+          <button class="preset-chip" data-preset="hq">高质量</button>
+          <button class="preset-chip" data-preset="fast">快速</button>
+          <button class="preset-chip preset-chip-custom" data-preset="custom">自定义</button>
+        </div>
+      </div>
 
       <!-- File picker -->
       <div class="panel">
@@ -42,125 +53,121 @@
         </div>
         <label class="field" style="margin-top:10px">
           <span>输出目录（留空则保存到视频同目录）</span>
-          <input type="text" id="p-output-dir" placeholder="例：D:\subs\output">
+          <input type="text" id="f-output-dir" placeholder="例：D:\subs\output">
         </label>
       </div>
 
-      <!-- Params -->
+      <!-- Recognition settings -->
       <div class="panel">
-        <div class="panel-title">参数设置</div>
+        <div class="panel-title">识别设置</div>
         <div class="form-grid">
-
           <label class="field">
             <span>ASR 后端</span>
-            <select id="p-backend"></select>
+            <select id="r-backend"></select>
           </label>
-
           <div class="toggle-row">
-            <span>使用 hf-mirror.com 加速模型下载<br><span
-                style="font-size:10px;color:var(--muted)">适合中国大陆用户，重启后生效</span></span>
-            <label class="toggle"><input type="checkbox" id="s-hf-mirror"><span class="slider"></span></label>
+            <span>hf-mirror.com 加速下载<br><span style="font-size:10px;color:var(--muted)">适合中国大陆用户，下次下载生效</span></span>
+            <label class="toggle"><input type="checkbox" id="mirror-enabled"><span class="slider"></span></label>
           </div>
-
           <label class="field">
             <span>字幕模式</span>
-            <select id="p-mode"></select>
+            <select id="r-mode"></select>
           </label>
-
-          <label class="field">
-            <span>女优 / 人名提示（请填日文名，提升 ASR 识别率）</span>
-            <input type="text" id="p-asr-context" placeholder="例：小那海あや、天使もえ（日文名，可多个）">
-          </label>
-
           <div class="toggle-row">
             <span>不翻译（仅日文字幕）</span>
-            <label class="toggle"><input type="checkbox" id="p-skip-trans"><span class="slider"></span></label>
+            <label class="toggle"><input type="checkbox" id="r-skip-translation"><span class="slider"></span></label>
           </div>
-
-          <details class="advanced">
-            <summary>▸ 高级选项</summary>
-            <div class="inner">
-              <div class="toggle-row">
-                <span>gender 多 cue 切段</span>
-                <label class="toggle"><input type="checkbox" id="p-multi-cue" checked><span
-                    class="slider"></span></label>
-              </div>
-              <div class="toggle-row">
-                <span>显示性别标签</span>
-                <label class="toggle"><input type="checkbox" id="p-gender" checked><span class="slider"></span></label>
-              </div>
-              <div class="toggle-row">
-                <span>ASR Recovery</span>
-                <label class="toggle"><input type="checkbox" id="p-recovery"><span class="slider"></span></label>
-              </div>
-              <label class="field">
-                <span>VAD 阈值（0.1–0.9）</span>
-                <input type="number" id="p-vad" value="0.35" step="0.05" min="0.1" max="0.9">
-              </label>
-              <label class="field">
-                <span>翻译批次大小</span>
-                <input type="number" id="p-batch" value="100" min="10" max="500">
-              </label>
-              <label class="field">
-                <span>并行翻译 Worker 数（默认 8，API 限速时可调低）</span>
-                <input type="number" id="p-max-workers" value="8" min="1" max="32">
-              </label>
-              <div class="toggle-row">
-                <span>生成质量报告（.md）</span>
-                <label class="toggle"><input type="checkbox" id="p-quality-report"><span class="slider"></span></label>
-              </div>
-              <div class="toggle-row">
-                <span>保留临时文件（调试用）</span>
-                <label class="toggle"><input type="checkbox" id="p-keep-temp"><span class="slider"></span></label>
-              </div>
-              <label class="field">
-                <span>环境变量覆盖（每行 KEY=VALUE，优先级高于 .env）</span>
-                <textarea id="p-advanced" rows="3"
-                  placeholder="WHISPERSEG_THRESHOLD=0.4&#10;F0_THRESHOLD_HZ=180"></textarea>
-              </label>
-            </div>
-          </details>
-
+          <label class="field">
+            <span>女优 / 人名提示（请填日文名，提升 ASR 识别率）</span>
+            <input type="text" id="r-asr-context" placeholder="例：小那海あや、天使もえ（日文名，可多个）">
+          </label>
         </div>
       </div>
 
-      <!-- API Settings -->
+      <!-- Tuning (collapsible, custom mode only) -->
+      <div class="panel" id="section-tuning">
+        <details class="panel-collapsible" id="panel-tuning">
+          <summary class="panel-title">参数调优</summary>
+          <div class="form-grid">
+            <div class="toggle-row">
+              <span>gender 多 cue 切段</span>
+              <label class="toggle"><input type="checkbox" id="t-multi-cue-split" checked><span class="slider"></span></label>
+            </div>
+            <div class="toggle-row">
+              <span>显示性别标签</span>
+              <label class="toggle"><input type="checkbox" id="t-show-gender" checked><span class="slider"></span></label>
+            </div>
+            <div class="toggle-row">
+              <span>ASR Recovery</span>
+              <label class="toggle"><input type="checkbox" id="t-asr-recovery"><span class="slider"></span></label>
+            </div>
+            <label class="field">
+              <span>VAD 阈值（0.1–0.9）</span>
+              <input type="number" id="t-vad-threshold" value="0.35" step="0.05" min="0.1" max="0.9">
+            </label>
+            <label class="field">
+              <span>翻译批次大小</span>
+              <input type="number" id="t-translation-batch-size" value="100" min="10" max="500">
+            </label>
+            <label class="field">
+              <span>并行翻译 Worker 数（API 限速时可调低）</span>
+              <input type="number" id="t-translation-max-workers" value="8" min="1" max="32">
+            </label>
+            <div class="toggle-row">
+              <span>生成质量报告（.md）</span>
+              <label class="toggle"><input type="checkbox" id="t-quality-report"><span class="slider"></span></label>
+            </div>
+            <div class="toggle-row">
+              <span>保留临时文件（调试用）</span>
+              <label class="toggle"><input type="checkbox" id="t-keep-temp"><span class="slider"></span></label>
+            </div>
+            <label class="field">
+              <span>环境变量覆盖（每行 KEY=VALUE，优先级高于 .env）</span>
+              <textarea id="t-env-override" rows="3"
+                placeholder="WHISPERSEG_THRESHOLD=0.4&#10;F0_THRESHOLD_HZ=180"></textarea>
+            </label>
+            <button class="btn btn-outline" id="btn-save-custom" type="button">保存自定义设置</button>
+          </div>
+        </details>
+      </div>
+
+      <!-- Translation API (collapsible) -->
       <div class="panel">
-        <details class="panel-collapsible">
-          <summary class="panel-title">翻译设置</summary>
+        <details class="panel-collapsible" id="panel-translation">
+          <summary class="panel-title">翻译 API</summary>
           <div class="form-grid">
 
             <label class="field">
               <span>API Key</span>
               <div class="input-group">
-                <input type="password" id="s-apikey" placeholder="留空则不修改当前值" autocomplete="new-password">
-                <button class="btn-icon" id="btn-eye" type="button" title="显示 / 隐藏">👁</button>
+                <input type="password" id="api-key" placeholder="留空则不修改当前值" autocomplete="new-password">
+                <button class="btn-icon" id="btn-show-key" type="button" title="显示 / 隐藏">👁</button>
               </div>
-              <span class="key-preview" id="s-key-preview"></span>
+              <span class="key-preview" id="api-key-preview"></span>
             </label>
 
             <label class="field">
               <span>API Base URL（留空使用 .env 默认）</span>
-              <input type="text" id="s-baseurl" placeholder="https://api.deepseek.com/v1">
+              <input type="text" id="api-base-url" placeholder="https://api.deepseek.com/v1">
             </label>
 
             <label class="field">
               <span>模型</span>
               <div class="model-row">
-                <div id="s-model-wrap" class="model-select-wrap" title="请先填写并保存 API Key 和 Base URL，再点击「获取」">
-                  <select id="s-model" disabled>
+                <div id="api-model-wrap" class="model-select-wrap" title="请先填写并保存 API Key 和 Base URL，再点击「获取」">
+                  <select id="api-model" disabled>
                     <option value="">-- 填好 Key 和 URL 后点获取 --</option>
                   </select>
                 </div>
                 <button class="btn-sm btn-outline" id="btn-fetch-models" type="button"
                   title="从 API 拉取可用模型列表">获取</button>
               </div>
-              <span class="key-preview" id="s-model-preview"></span>
+              <span class="key-preview" id="api-model-preview"></span>
             </label>
 
             <label class="field">
               <span>推理强度</span>
-              <select id="s-reasoning-effort">
+              <select id="api-reasoning-effort">
                 <option value="max">max（最高质量）</option>
                 <option value="medium">medium</option>
                 <option value="low">low（最快 / 最省）</option>
@@ -169,7 +176,7 @@
 
             <label class="field">
               <span>API 格式</span>
-              <select id="s-api-format">
+              <select id="api-format">
                 <option value="chat">OpenAI Chat</option>
                 <option value="responses">OpenAI Responses</option>
               </select>
@@ -177,7 +184,7 @@
 
             <label class="field">
               <span>目标语言</span>
-              <select id="s-target-lang">
+              <select id="api-target-lang">
                 <option value="简体中文">简体中文</option>
                 <option value="繁體中文">繁體中文</option>
                 <option value="English">English</option>
@@ -186,10 +193,10 @@
 
             <label class="field">
               <span>术语表（每行一条，格式：日文→中文）</span>
-              <textarea id="s-glossary" rows="4" placeholder="ちんぽ→肉棒&#10;チンポ→肉棒"></textarea>
+              <textarea id="api-glossary" rows="4" placeholder="ちんぽ→肉棒&#10;チンポ→肉棒"></textarea>
             </label>
 
-            <button class="btn btn-outline" id="btn-save-settings" type="button">保存设置</button>
+            <button class="btn btn-outline" id="btn-save-api" type="button">保存设置</button>
             <div class="save-status" id="save-status"></div>
 
           </div>
@@ -214,6 +221,7 @@
       <div class="log-header">
         <span>事件日志</span>
         <span class="spacer"></span>
+        <button class="log-copy-all" id="log-copy-all">复制全部</button>
         <button class="log-clear" id="log-clear">清空</button>
       </div>
       <div class="log-scroll" id="log-scroll"></div>
