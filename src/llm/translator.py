@@ -75,6 +75,20 @@ _RESPONSES_REASONING_EFFORT_MAP = {
 }
 
 
+def _env_flag(name: str, default: bool = False) -> bool:
+    raw = os.getenv(name, "").strip().lower()
+    if not raw:
+        return default
+    return raw in {"1", "true", "yes", "on"}
+
+
+def _env_int(name: str, default: int) -> int:
+    try:
+        return int(float(os.getenv(name, str(default))))
+    except (TypeError, ValueError):
+        return default
+
+
 def _normalize_llm_api_format(value: str | None, fallback: str = "chat") -> str:
     normalized = (value or fallback or "chat").strip().lower()
     return normalized if normalized in {"chat", "responses"} else "chat"
@@ -85,6 +99,14 @@ def _llm_api_format(api_format: str | None = None) -> str:
         return _normalize_llm_api_format(api_format, LLM_API_FORMAT)
     value = os.getenv("LLM_API_FORMAT", LLM_API_FORMAT)
     return _normalize_llm_api_format(value)
+
+
+def _is_grok_model(model_name: str) -> bool:
+    return "grok" in (model_name or "").lower()
+
+
+def _responses_reasoning_effort(value: str) -> str:
+    return _RESPONSES_REASONING_EFFORT_MAP.get(value, value)
 
 
 def _get_client() -> OpenAI:
@@ -1231,11 +1253,18 @@ def _emit_stream_content_progress(
     )
 
 
-def _build_responses_input(messages: list[dict]) -> list[dict]:
+def _build_responses_input(
+    messages: list[dict],
+    *,
+    string_content: bool = False,
+) -> list[dict]:
     response_input: list[dict] = []
     for message in messages:
         role = str(message.get("role") or "user")
         content = message.get("content", "")
+        if string_content:
+            response_input.append({"role": role, "content": str(content)})
+            continue
         response_input.append(
             {
                 "role": role,
@@ -1418,19 +1447,37 @@ def _chat_responses(
         or os.getenv("LLM_REASONING_EFFORT", "max").strip()
         or "max"
     )
+    grok_compat = _is_grok_model(model_name)
     request = {
         "model": model_name,
-        "input": _build_responses_input(messages),
+        "input": _build_responses_input(messages, string_content=grok_compat),
         "stream": True,
-        "text": {"format": {"type": "json_object"}},
         "reasoning": {
-            "effort": _RESPONSES_REASONING_EFFORT_MAP.get(
-                effective_reasoning_effort,
-                effective_reasoning_effort,
-            )
+            "effort": _responses_reasoning_effort(effective_reasoning_effort)
         },
     }
-    if TRANSLATION_MAX_TOKENS > 0:
+    if grok_compat:
+        if _env_flag("GROK_RESPONSES_WEB_SEARCH", True):
+            request["tools"] = [
+                {
+                    "type": "web_search",
+                    "max_results": max(
+                        1,
+                        _env_int("GROK_RESPONSES_WEB_SEARCH_MAX_RESULTS", 20),
+                    ),
+                }
+            ]
+        extra_body: dict[str, object] = {
+            "include_reasoning": _env_flag("GROK_RESPONSES_INCLUDE_REASONING", True),
+        }
+        extra_body["max_tokens"] = max(
+            16000,
+            _env_int("GROK_RESPONSES_MAX_TOKENS", 16000),
+        )
+        request["extra_body"] = extra_body
+    else:
+        request["text"] = {"format": {"type": "json_object"}}
+    if TRANSLATION_MAX_TOKENS > 0 and not grok_compat:
         request["max_output_tokens"] = TRANSLATION_MAX_TOKENS
 
     response_stream = _create_response(request)
