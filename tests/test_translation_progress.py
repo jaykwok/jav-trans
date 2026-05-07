@@ -41,6 +41,7 @@ def _response_event(event_type: str, **kwargs):
 
 def test_chat_progress_reasoning_translating_done(monkeypatch):
     events: list[dict] = []
+    monkeypatch.setenv("LLM_API_FORMAT", "chat")
     monkeypatch.setattr(translator.time, "monotonic", FakeClock(0.3).monotonic)
     monkeypatch.setattr(
         translator,
@@ -67,6 +68,7 @@ def test_chat_progress_reasoning_translating_done(monkeypatch):
 
 def test_expected_zero_does_not_crash(monkeypatch):
     events: list[dict] = []
+    monkeypatch.setenv("LLM_API_FORMAT", "chat")
     monkeypatch.setattr(translator.time, "monotonic", FakeClock(0.3).monotonic)
     monkeypatch.setattr(
         translator,
@@ -88,6 +90,7 @@ def test_responses_progress_translating_done(monkeypatch):
     events: list[dict] = []
     requests: list[dict] = []
     monkeypatch.setenv("LLM_API_FORMAT", "responses")
+    monkeypatch.setenv("LLM_MODEL_NAME", "deepseek-v4-pro")
     monkeypatch.setattr(translator.time, "monotonic", FakeClock(0.3).monotonic)
 
     def fake_create_response(request):
@@ -131,8 +134,49 @@ def test_responses_progress_translating_done(monkeypatch):
     assert events[-1] == {"phase": "done", "translated": 2, "expected": 2}
 
 
+def test_grok_responses_compat_request_shape(monkeypatch):
+    requests: list[dict] = []
+    monkeypatch.setenv("LLM_API_FORMAT", "responses")
+    monkeypatch.setenv("LLM_MODEL_NAME", "grok-4.20-0309-non-reasoning")
+    monkeypatch.setenv("LLM_REASONING_EFFORT", "max")
+    monkeypatch.delenv("GROK_RESPONSES_MAX_TOKENS", raising=False)
+
+    def fake_create_response(request):
+        requests.append(request)
+        return iter(
+            [
+                _response_event(
+                    "response.output_text.delta",
+                    delta='{"translations":[]}',
+                ),
+                _response_event("response.completed", response=SimpleNamespace(output=[])),
+            ]
+        )
+
+    monkeypatch.setattr(translator, "_create_response", fake_create_response)
+
+    output = translator._chat(
+        [{"role": "user", "content": "json"}],
+        expected_count=0,
+    )
+
+    assert output == '{"translations":[]}'
+    assert requests
+    request = requests[0]
+    assert request["input"] == [{"role": "user", "content": "json"}]
+    assert "text" not in request
+    assert "max_output_tokens" not in request
+    assert request["reasoning"] == {"effort": "high"}
+    assert request["tools"] == [{"type": "web_search", "max_results": 20}]
+    assert request["extra_body"] == {
+        "include_reasoning": True,
+        "max_tokens": 16000,
+    }
+
+
 def test_debounce_limits_fast_reasoning_events(monkeypatch):
     events: list[dict] = []
+    monkeypatch.setenv("LLM_API_FORMAT", "chat")
     monkeypatch.setattr(translator.time, "monotonic", FakeClock(0.05).monotonic)
     monkeypatch.setattr(
         translator,
@@ -189,6 +233,7 @@ def test_translate_segments_emits_reset_on_retry(monkeypatch):
 
 
 def test_progress_callback_errors_do_not_break(monkeypatch):
+    monkeypatch.setenv("LLM_API_FORMAT", "chat")
     monkeypatch.setattr(translator.time, "monotonic", FakeClock(0.3).monotonic)
     monkeypatch.setattr(
         translator,
