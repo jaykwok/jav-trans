@@ -32,8 +32,6 @@
         <div class="panel-title">预设</div>
         <div class="preset-chips">
           <button class="preset-chip" data-preset="standard">标准</button>
-          <button class="preset-chip" data-preset="hq">高质量</button>
-          <button class="preset-chip" data-preset="fast">快速</button>
           <button class="preset-chip preset-chip-custom" data-preset="custom">自定义</button>
         </div>
       </div>
@@ -70,14 +68,6 @@
             <label class="toggle"><input type="checkbox" id="mirror-enabled"><span class="slider"></span></label>
           </div>
           <label class="field">
-            <span>字幕模式</span>
-            <select id="r-mode"></select>
-          </label>
-          <div class="toggle-row">
-            <span>不翻译（仅日文字幕）</span>
-            <label class="toggle"><input type="checkbox" id="r-skip-translation"><span class="slider"></span></label>
-          </div>
-          <label class="field">
             <span>女优 / 人名提示（请填日文名，提升 ASR 识别率）</span>
             <input type="text" id="r-asr-context" placeholder="例：小那海あや、天使もえ（日文名，可多个）">
           </label>
@@ -89,6 +79,14 @@
         <details class="panel-collapsible" id="panel-tuning">
           <summary class="panel-title">参数调优</summary>
           <div class="form-grid">
+            <label class="field">
+              <span>字幕模式</span>
+              <select id="r-mode"></select>
+            </label>
+            <div class="toggle-row">
+              <span>不翻译（仅日文字幕）</span>
+              <label class="toggle"><input type="checkbox" id="r-skip-translation"><span class="slider"></span></label>
+            </div>
             <div class="toggle-row">
               <span>gender 多 cue 切段</span>
               <label class="toggle"><input type="checkbox" id="t-multi-cue-split" checked><span class="slider"></span></label>

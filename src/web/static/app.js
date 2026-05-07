@@ -79,6 +79,7 @@ function applyFormMemory() {
     if (Object.hasOwn(data.details, det.id)) det.open = !!data.details[det.id];
   }
   if (data.activePreset) activePreset = data.activePreset;
+  if (!(activePreset in PRESETS) && activePreset !== 'custom') activePreset = 'standard';
 }
 
 function installFormMemory() {
@@ -95,6 +96,8 @@ function installFormMemory() {
 
 // ── Presets ───────────────────────────────────────────────────────────────────
 const TUNING_FIELDS = {
+  'r-mode':                    'zh',
+  'r-skip-translation':        false,
   't-multi-cue-split':         true,
   't-show-gender':             true,
   't-asr-recovery':            false,
@@ -107,17 +110,6 @@ const TUNING_FIELDS = {
 
 const PRESETS = {
   standard: { fields: { ...TUNING_FIELDS } },
-  hq:       { fields: { ...TUNING_FIELDS,
-    't-asr-recovery':   true,
-    't-quality-report': true,
-    't-vad-threshold':  '0.30',
-  } },
-  fast:     { fields: { ...TUNING_FIELDS,
-    't-vad-threshold':           '0.40',
-    't-translation-max-workers': '16',
-    't-multi-cue-split':         false,
-    't-show-gender':             false,
-  } },
 };
 
 const CUSTOM_PRESET_KEY = 'javtrans.customPreset.v1';
@@ -1141,7 +1133,8 @@ document.addEventListener('keydown', e => {
   await loadConfig();
   await loadSettings();
   applyFormMemory();
-  setActivePreset(activePreset);
+  if (activePreset !== 'custom') applyPreset(activePreset);
+  else setActivePreset('custom');
   updateSkipTransState();
   saveFormMemory();
   installMirrorChangeHandler(); // after applyFormMemory so initial restore doesn't fire

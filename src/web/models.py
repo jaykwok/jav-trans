@@ -14,7 +14,7 @@ class JobSpec(BaseModel):
         "whisper-ja-1.5b",
         "whisper-ja-anime-v0.3",
     ] = "whisper-ja-anime-v0.3"
-    subtitle_mode: Literal["zh", "bilingual"] = "bilingual"
+    subtitle_mode: Literal["zh", "bilingual"] = "zh"
     skip_translation: bool = False
     show_gender: bool = True
     multi_cue_split: bool = True
