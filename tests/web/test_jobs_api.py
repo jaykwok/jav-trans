@@ -55,6 +55,14 @@ def test_settings_llm_api_format_updates_runtime_env(monkeypatch):
     asyncio.run(_test_settings_llm_api_format_updates_runtime_env(monkeypatch))
 
 
+def test_settings_translation_fields_update_runtime_env(monkeypatch):
+    asyncio.run(_test_settings_translation_fields_update_runtime_env(monkeypatch))
+
+
+def test_jobs_snapshot_saved_translation_settings(tmp_path, monkeypatch):
+    asyncio.run(_test_jobs_snapshot_saved_translation_settings(tmp_path, monkeypatch))
+
+
 def test_jobs_api_retry_cancelled_job(tmp_path, monkeypatch):
     asyncio.run(_test_jobs_api_retry_cancelled_job(tmp_path, monkeypatch))
 
@@ -132,6 +140,7 @@ async def _test_settings_hf_endpoint_updates_runtime_env(monkeypatch):
 
 async def _test_settings_llm_api_format_updates_runtime_env(monkeypatch):
     monkeypatch.delenv("LLM_API_FORMAT", raising=False)
+    monkeypatch.setattr(config_routes, "_read_env_entry", lambda key: (key == "LLM_API_FORMAT", "chat"))
     monkeypatch.setattr(config_routes, "_update_env_file", lambda _changes: None)
 
     transport = httpx.ASGITransport(app=create_app())
@@ -156,6 +165,45 @@ async def _test_settings_llm_api_format_updates_runtime_env(monkeypatch):
         )
 
     assert invalid.status_code == 422
+
+
+async def _test_settings_translation_fields_update_runtime_env(monkeypatch):
+    for key in ("TRANSLATION_GLOSSARY", "TARGET_LANG", "LLM_REASONING_EFFORT"):
+        monkeypatch.delenv(key, raising=False)
+    stale_env = {
+        "TRANSLATION_GLOSSARY": "old glossary",
+        "TARGET_LANG": "简体中文",
+        "LLM_REASONING_EFFORT": "max",
+    }
+    monkeypatch.setattr(
+        config_routes,
+        "_read_env_entry",
+        lambda key: (key in stale_env, stale_env.get(key, "")),
+    )
+    monkeypatch.setattr(config_routes, "_update_env_file", lambda _changes: None)
+
+    transport = httpx.ASGITransport(app=create_app())
+    async with httpx.AsyncClient(
+        transport=transport,
+        base_url="http://test",
+    ) as client:
+        response = await client.post(
+            "/api/settings",
+            json={
+                "translation_glossary": "",
+                "target_lang": "繁體中文",
+                "llm_reasoning_effort": "medium",
+            },
+        )
+        assert response.status_code == 200
+
+        settings = await client.get("/api/settings")
+
+    assert settings.status_code == 200
+    payload = settings.json()
+    assert payload["translation_glossary"] == ""
+    assert payload["target_lang"] == "繁體中文"
+    assert payload["llm_reasoning_effort"] == "medium"
 
 
 async def _test_jobs_api_crud(tmp_path, monkeypatch):
@@ -204,6 +252,39 @@ async def _test_jobs_api_crud(tmp_path, monkeypatch):
             response = await client.delete(f"/api/jobs/{job_id}")
             assert response.status_code == 200
             assert response.json() == {"ok": True}
+    finally:
+        await _reset_pm_state()
+
+
+async def _test_jobs_snapshot_saved_translation_settings(tmp_path, monkeypatch):
+    monkeypatch.setattr(pm, "_jobs_path", tmp_path / "jobs.json")
+    monkeypatch.setenv("TRANSLATION_GLOSSARY", "ねこ→猫")
+    monkeypatch.setenv("TARGET_LANG", "繁體中文")
+    monkeypatch.setenv("LLM_API_FORMAT", "responses")
+    monkeypatch.setenv("LLM_REASONING_EFFORT", "medium")
+    await _reset_pm_state()
+
+    try:
+        transport = httpx.ASGITransport(app=create_app())
+        async with httpx.AsyncClient(
+            transport=transport,
+            base_url="http://test",
+        ) as client:
+            created = await client.post(
+                "/api/jobs",
+                json={"video_paths": ["sample.mp4"]},
+            )
+            assert created.status_code == 201
+            job_id = created.json()["ids"][0]
+
+            response = await client.get(f"/api/jobs/{job_id}")
+            assert response.status_code == 200
+            spec = response.json()["spec"]
+
+        assert spec["translation_glossary"] == "ねこ→猫"
+        assert spec["target_lang"] == "繁體中文"
+        assert spec["llm_api_format"] == "responses"
+        assert spec["llm_reasoning_effort"] == "medium"
     finally:
         await _reset_pm_state()
 

@@ -19,6 +19,40 @@ def _setting(key: str, default: str = "") -> str:
     return os.getenv(key, DEFAULT_SETTINGS.get(key, default)).strip()
 
 
+def _spec_text(spec: Any, name: str) -> str | None:
+    value = getattr(spec, name, None)
+    if value is None:
+        return None
+    return str(value).strip()
+
+
+def _translation_setting(
+    spec: Any,
+    advanced: dict[str, str],
+    env_key: str,
+    spec_name: str,
+    default: str = "",
+    *,
+    allow_empty_spec: bool = False,
+) -> str:
+    if env_key in advanced:
+        return advanced[env_key].strip()
+    spec_value = _spec_text(spec, spec_name)
+    if spec_value is not None and (spec_value or allow_empty_spec):
+        return spec_value
+    return _setting(env_key, default)
+
+
+def _llm_api_format(value: str) -> str:
+    normalized = (value or "chat").strip().lower()
+    return normalized if normalized in {"chat", "responses"} else "chat"
+
+
+def _llm_reasoning_effort(value: str) -> str:
+    normalized = (value or "max").strip().lower()
+    return normalized if normalized in {"low", "medium", "max"} else "max"
+
+
 @dataclass
 class JobContext:
     asr_backend: str
@@ -42,6 +76,8 @@ class JobContext:
     run_log_enabled: bool = False
     run_log_dir: str = "./temp/log"
     fail_on_qc_block: bool = True
+    llm_api_format: str = "chat"
+    llm_reasoning_effort: str = "max"
     advanced: dict[str, str] = field(default_factory=dict)
 
     @classmethod
@@ -66,8 +102,20 @@ class JobContext:
             asr_recovery=bool(getattr(spec, "asr_recovery", False)),
             vad_threshold=float(getattr(spec, "vad_threshold", 0.35)),
             skip_translation=bool(getattr(spec, "skip_translation", False)),
-            target_lang=advanced.get("TARGET_LANG", _setting("TARGET_LANG", "简体中文")) or "简体中文",
-            translation_glossary=advanced.get("TRANSLATION_GLOSSARY", _setting("TRANSLATION_GLOSSARY")),
+            target_lang=_translation_setting(
+                spec,
+                advanced,
+                "TARGET_LANG",
+                "target_lang",
+                "简体中文",
+            ) or "简体中文",
+            translation_glossary=_translation_setting(
+                spec,
+                advanced,
+                "TRANSLATION_GLOSSARY",
+                "translation_glossary",
+                allow_empty_spec=True,
+            ),
             translation_batch_size=int(getattr(spec, "translation_batch_size", 100)),
             translation_max_workers=max(1, int(getattr(spec, "translation_max_workers", 8))),
             translation_cache_path=str(cache_path or ""),
@@ -87,6 +135,24 @@ class JobContext:
             fail_on_qc_block=_flag(
                 advanced.get("FAIL_ON_QC_BLOCK"),
                 bool(getattr(spec, "fail_on_qc_block", True)),
+            ),
+            llm_api_format=_llm_api_format(
+                _translation_setting(
+                    spec,
+                    advanced,
+                    "LLM_API_FORMAT",
+                    "llm_api_format",
+                    "chat",
+                )
+            ),
+            llm_reasoning_effort=_llm_reasoning_effort(
+                _translation_setting(
+                    spec,
+                    advanced,
+                    "LLM_REASONING_EFFORT",
+                    "llm_reasoning_effort",
+                    "max",
+                )
             ),
             advanced=advanced,
         )

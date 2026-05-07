@@ -24,6 +24,10 @@ class JobSpec(BaseModel):
     asr_context: str = ""
     keep_quality_report: bool = False
     translation_max_workers: int = 8
+    target_lang: str | None = None
+    translation_glossary: str | None = None
+    llm_api_format: Literal["chat", "responses"] | None = None
+    llm_reasoning_effort: Literal["low", "medium", "max"] | None = None
     keep_temp_files: bool = False
     resume_from_job_id: str = ""
     advanced: dict[str, str] = Field(default_factory=dict)

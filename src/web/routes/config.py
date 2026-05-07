@@ -24,26 +24,38 @@ def _setting(key: str) -> str:
     return os.getenv(key, DEFAULT_SETTINGS.get(key, ""))
 
 
-def _read_env_value(key: str) -> str:
+def _read_env_entry(key: str) -> tuple[bool, str]:
     env_path = PROJECT_ROOT / ".env"
     if not env_path.exists():
-        return ""
+        return False, ""
     for line in env_path.read_text(encoding="utf-8").splitlines():
         s = line.strip()
         if s.startswith("#") or "=" not in s:
             continue
         k, _, v = s.partition("=")
         if k.strip() == key:
-            return v.strip()
-    return ""
+            return True, v.strip()
+    return False, ""
+
+
+def _read_env_value(key: str) -> str:
+    found, value = _read_env_entry(key)
+    return value if found else ""
 
 
 def _runtime_or_env_value(key: str) -> str:
-    return os.getenv(key, "").strip() or _read_env_value(key)
+    if key in os.environ:
+        return os.environ.get(key, "").strip()
+    return _read_env_value(key)
 
 
-def _env_file_or_setting(key: str, fallback: str = "") -> str:
-    return _read_env_value(key) or _setting(key) or fallback
+def _runtime_or_env_or_setting(key: str, fallback: str = "") -> str:
+    if key in os.environ:
+        return os.environ.get(key, "").strip()
+    found, value = _read_env_entry(key)
+    if found:
+        return value
+    return _setting(key) or fallback
 
 
 def _update_env_file(updates: dict[str, str]) -> None:
@@ -113,13 +125,13 @@ async def get_config() -> dict[str, Any]:
 @router.get("/settings", response_model=SettingsRead)
 async def get_settings() -> SettingsRead:
     api_key = _runtime_or_env_value("API_KEY")
-    base_url = _runtime_or_env_value("OPENAI_COMPATIBILITY_BASE_URL") or _setting("OPENAI_COMPATIBILITY_BASE_URL")
-    model = _runtime_or_env_value("LLM_MODEL_NAME") or _setting("LLM_MODEL_NAME")
-    hf_endpoint = _read_env_value("HF_ENDPOINT")
-    translation_glossary = _env_file_or_setting("TRANSLATION_GLOSSARY")
-    llm_api_format = _env_file_or_setting("LLM_API_FORMAT", "chat")
-    llm_reasoning_effort = _env_file_or_setting("LLM_REASONING_EFFORT", "max")
-    target_lang = _env_file_or_setting("TARGET_LANG", "简体中文")
+    base_url = _runtime_or_env_or_setting("OPENAI_COMPATIBILITY_BASE_URL")
+    model = _runtime_or_env_or_setting("LLM_MODEL_NAME")
+    hf_endpoint = _runtime_or_env_value("HF_ENDPOINT")
+    translation_glossary = _runtime_or_env_or_setting("TRANSLATION_GLOSSARY")
+    llm_api_format = _runtime_or_env_or_setting("LLM_API_FORMAT", "chat")
+    llm_reasoning_effort = _runtime_or_env_or_setting("LLM_REASONING_EFFORT", "max")
+    target_lang = _runtime_or_env_or_setting("TARGET_LANG", "简体中文")
     return SettingsRead(
         api_key_set=bool(api_key),
         api_key_preview=_mask_key(api_key),
