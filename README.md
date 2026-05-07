@@ -67,7 +67,10 @@ python -m venv .venv
 API_KEY=你的翻译_API_KEY
 OPENAI_COMPATIBILITY_BASE_URL=https://api.deepseek.com
 LLM_MODEL_NAME=deepseek-chat
+LLM_API_FORMAT=chat
 ```
+
+`LLM_API_FORMAT` 默认为 `chat`，走 OpenAI Chat Completions 兼容格式；需要使用 OpenAI Responses API 兼容格式时改为 `responses`。
 
 *(可选)* 如果国内网络下载 AI 模型速度较慢，可以在 `.env` 中加入这行来加速下载：
 ```env

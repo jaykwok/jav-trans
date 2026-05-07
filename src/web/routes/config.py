@@ -117,6 +117,7 @@ async def get_settings() -> SettingsRead:
     model = _runtime_or_env_value("LLM_MODEL_NAME") or _setting("LLM_MODEL_NAME")
     hf_endpoint = _read_env_value("HF_ENDPOINT")
     translation_glossary = _env_file_or_setting("TRANSLATION_GLOSSARY")
+    llm_api_format = _env_file_or_setting("LLM_API_FORMAT", "chat")
     llm_reasoning_effort = _env_file_or_setting("LLM_REASONING_EFFORT", "max")
     target_lang = _env_file_or_setting("TARGET_LANG", "简体中文")
     return SettingsRead(
@@ -126,6 +127,7 @@ async def get_settings() -> SettingsRead:
         model=model,
         hf_endpoint=hf_endpoint,
         translation_glossary=translation_glossary,
+        llm_api_format=llm_api_format if llm_api_format in {"chat", "responses"} else "chat",
         llm_reasoning_effort=llm_reasoning_effort,
         target_lang=target_lang,
     )
@@ -148,6 +150,9 @@ async def post_settings(update: SettingsUpdate) -> dict:
     if update.translation_glossary is not None:
         changes["TRANSLATION_GLOSSARY"] = update.translation_glossary
         os.environ["TRANSLATION_GLOSSARY"] = update.translation_glossary
+    if update.llm_api_format is not None:
+        changes["LLM_API_FORMAT"] = update.llm_api_format
+        os.environ["LLM_API_FORMAT"] = update.llm_api_format
     if update.llm_reasoning_effort is not None:
         if update.llm_reasoning_effort not in {"low", "medium", "max"}:
             raise HTTPException(

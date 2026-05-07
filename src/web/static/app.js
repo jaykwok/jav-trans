@@ -23,6 +23,136 @@ const logScroll     = $('log-scroll');
 const connDot       = $('conn-dot');
 const btnClearDone  = $('btn-clear-done');
 
+// ── Form memory & paste menu ─────────────────────────────────────────────────
+const FORM_MEMORY_KEY = 'javtrans.formMemory.v1';
+const FORM_MEMORY_EXCLUDED_IDS = new Set(['s-apikey']);
+const FORM_MEMORY_SELECTOR = 'input[id], select[id], textarea[id]';
+const PASTEABLE_INPUT_TYPES = new Set(['', 'text', 'search', 'url', 'tel', 'email', 'password', 'number']);
+let pasteTarget = null;
+let pasteMenu = null;
+
+function formMemoryControls() {
+  return [...document.querySelectorAll(FORM_MEMORY_SELECTOR)].filter(el => {
+    const type = (el.type || '').toLowerCase();
+    return !FORM_MEMORY_EXCLUDED_IDS.has(el.id)
+      && !['button', 'submit', 'reset', 'file', 'hidden'].includes(type);
+  });
+}
+
+function loadFormMemory() {
+  try {
+    return JSON.parse(localStorage.getItem(FORM_MEMORY_KEY) || '{}');
+  } catch {
+    return {};
+  }
+}
+
+function saveFormMemory() {
+  const data = loadFormMemory();
+  for (const el of formMemoryControls()) {
+    data[el.id] = el.type === 'checkbox' ? !!el.checked : el.value;
+  }
+  try {
+    localStorage.setItem(FORM_MEMORY_KEY, JSON.stringify(data));
+  } catch {}
+}
+
+function applyFormMemory() {
+  const data = loadFormMemory();
+  for (const el of formMemoryControls()) {
+    if (!Object.prototype.hasOwnProperty.call(data, el.id)) continue;
+    if (el.type === 'checkbox') {
+      el.checked = !!data[el.id];
+    } else if (el.tagName === 'SELECT') {
+      const value = String(data[el.id] ?? '');
+      if ([...el.options].some(opt => opt.value === value)) el.value = value;
+    } else {
+      el.value = String(data[el.id] ?? '');
+    }
+  }
+}
+
+function installFormMemory() {
+  document.addEventListener('input', e => {
+    if (e.target.closest(FORM_MEMORY_SELECTOR)) saveFormMemory();
+  });
+  document.addEventListener('change', e => {
+    if (e.target.closest(FORM_MEMORY_SELECTOR)) saveFormMemory();
+  });
+}
+
+function isPasteableControl(el) {
+  if (!el) return false;
+  if (el.tagName === 'TEXTAREA') return true;
+  if (el.tagName !== 'INPUT') return false;
+  return PASTEABLE_INPUT_TYPES.has((el.type || '').toLowerCase());
+}
+
+function hidePasteMenu() {
+  if (pasteMenu) pasteMenu.hidden = true;
+  pasteTarget = null;
+}
+
+function createPasteMenu() {
+  const menu = document.createElement('div');
+  menu.className = 'paste-menu';
+  menu.hidden = true;
+  menu.innerHTML = '<button type="button">粘贴</button>';
+  document.body.appendChild(menu);
+  menu.addEventListener('click', async e => {
+    e.preventDefault();
+    const target = pasteTarget;
+    hidePasteMenu();
+    if (!isPasteableControl(target)) return;
+    try {
+      const text = await navigator.clipboard.readText();
+      insertTextAtCursor(target, text);
+    } catch {
+      alert('无法读取剪贴板，请使用 Ctrl+V 粘贴');
+    }
+  });
+  return menu;
+}
+
+function showPasteMenu(x, y, target) {
+  if (!pasteMenu) pasteMenu = createPasteMenu();
+  pasteTarget = target;
+  pasteMenu.style.left = Math.min(x, window.innerWidth - 84) + 'px';
+  pasteMenu.style.top = Math.min(y, window.innerHeight - 42) + 'px';
+  pasteMenu.hidden = false;
+}
+
+function insertTextAtCursor(el, text) {
+  el.focus();
+  if (el.type === 'number') {
+    const next = String(text ?? '').trim();
+    if (next) el.value = next;
+  } else if (typeof el.setRangeText === 'function' && el.selectionStart != null) {
+    el.setRangeText(text, el.selectionStart, el.selectionEnd, 'end');
+  } else {
+    el.value += text;
+  }
+  el.dispatchEvent(new Event('input', { bubbles: true }));
+  el.dispatchEvent(new Event('change', { bubbles: true }));
+}
+
+function installPasteMenu() {
+  document.addEventListener('contextmenu', e => {
+    const target = e.target.closest('input, textarea');
+    if (!isPasteableControl(target)) return;
+    e.preventDefault();
+    showPasteMenu(e.clientX, e.clientY, target);
+  });
+  document.addEventListener('pointerdown', e => {
+    if (pasteMenu && !pasteMenu.hidden && !pasteMenu.contains(e.target)) hidePasteMenu();
+  });
+  document.addEventListener('keydown', e => {
+    if (e.key === 'Escape') hidePasteMenu();
+  });
+  window.addEventListener('scroll', hidePasteMenu, true);
+  window.addEventListener('resize', hidePasteMenu);
+}
+
 // ── File handling ────────────────────────────────────────────────────────────
 function renderFiles() {
   fileList.innerHTML = '';
@@ -479,6 +609,7 @@ async function loadConfig() {
     if (d.show_gender        != null) $('p-gender').checked    = !!d.show_gender;
     if (d.asr_recovery       != null) $('p-recovery').checked  = !!d.asr_recovery;
     if (d.skip_translation   != null) $('p-skip-trans').checked = !!d.skip_translation;
+    applyFormMemory();
   } catch {}
 }
 
@@ -500,6 +631,8 @@ async function loadSettings() {
     $('s-hf-mirror').checked = s.hf_endpoint === 'https://hf-mirror.com';
     const effort = $('s-reasoning-effort');
     if (effort) effort.value = s.llm_reasoning_effort || 'max';
+    const apiFormat = $('s-api-format');
+    if (apiFormat) apiFormat.value = s.llm_api_format || 'chat';
     const targetLang = $('s-target-lang');
     if (targetLang) targetLang.value = s.target_lang || '简体中文';
     const glossary = $('s-glossary');
@@ -507,6 +640,7 @@ async function loadSettings() {
       glossary.value = (s.translation_glossary || '')
         .split(',').map(t => t.trim()).filter(Boolean).join('\n');
     }
+    applyFormMemory();
   } catch {}
 }
 
@@ -589,6 +723,7 @@ $('btn-save-settings').addEventListener('click', async () => {
     if (model)   body.model    = model;
     body.hf_endpoint = hfMirror ? 'https://hf-mirror.com' : '';
     body.llm_reasoning_effort = $('s-reasoning-effort').value || 'max';
+    body.llm_api_format = $('s-api-format').value || 'chat';
     body.target_lang = $('s-target-lang').value || '简体中文';
     body.translation_glossary = ($('s-glossary').value || '')
       .split('\n').map(t => t.trim()).filter(Boolean).join(', ');
@@ -604,6 +739,7 @@ $('btn-save-settings').addEventListener('click', async () => {
     const mirrorNote = hfMirror ? '（hf-mirror 已开启，重启生效）' : '';
     showSaveStatus('✓ 已保存' + mirrorNote, 'ok');
     await loadSettings();
+    saveFormMemory();
   } catch (e) {
     showSaveStatus('✗ 保存失败：' + e.message, 'error');
   }
@@ -625,8 +761,12 @@ document.addEventListener('keydown', e => {
 });
 
 (async () => {
+  installFormMemory();
+  installPasteMenu();
   await loadConfig();
   await loadSettings();
+  applyFormMemory();
+  saveFormMemory();
   await fetchAllJobs();
   connectSSE();
 })();

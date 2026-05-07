@@ -35,6 +35,10 @@ def _stream(reasoning_parts: list[str], content_parts: list[str]):
         yield _chunk(content=part, finish=finish)
 
 
+def _response_event(event_type: str, **kwargs):
+    return SimpleNamespace(type=event_type, **kwargs)
+
+
 def test_chat_progress_reasoning_translating_done(monkeypatch):
     events: list[dict] = []
     monkeypatch.setattr(translator.time, "monotonic", FakeClock(0.3).monotonic)
@@ -78,6 +82,53 @@ def test_expected_zero_does_not_crash(monkeypatch):
 
     assert output == '{"translations":[]}'
     assert events[-1] == {"phase": "done", "translated": 0, "expected": 0}
+
+
+def test_responses_progress_translating_done(monkeypatch):
+    events: list[dict] = []
+    requests: list[dict] = []
+    monkeypatch.setenv("LLM_API_FORMAT", "responses")
+    monkeypatch.setattr(translator.time, "monotonic", FakeClock(0.3).monotonic)
+
+    def fake_create_response(request):
+        requests.append(request)
+        return iter(
+            [
+                _response_event(
+                    "response.reasoning_summary_text.delta",
+                    delta="思考",
+                ),
+                _response_event(
+                    "response.output_text.delta",
+                    delta='{"translations":[{"i',
+                ),
+                _response_event(
+                    "response.output_text.delta",
+                    delta='d":0,"text":"甲"},{"id":1,"text":"乙"}]}',
+                ),
+                _response_event("response.completed", response=SimpleNamespace(output=[])),
+            ]
+        )
+
+    monkeypatch.setattr(translator, "_create_response", fake_create_response)
+
+    output = translator._chat(
+        [{"role": "system", "content": "json"}, {"role": "user", "content": "translate"}],
+        expected_count=2,
+        on_progress=events.append,
+    )
+
+    assert output == '{"translations":[{"id":0,"text":"甲"},{"id":1,"text":"乙"}]}'
+    assert requests
+    assert requests[0]["stream"] is True
+    assert requests[0]["text"] == {"format": {"type": "json_object"}}
+    assert requests[0]["input"][0]["role"] == "system"
+    assert requests[0]["input"][0]["content"][0]["type"] == "input_text"
+    assert requests[0]["max_output_tokens"] == translator.TRANSLATION_MAX_TOKENS
+    phases = [event["phase"] for event in events]
+    assert phases[0] == "thinking"
+    assert "translating" in phases
+    assert events[-1] == {"phase": "done", "translated": 2, "expected": 2}
 
 
 def test_debounce_limits_fast_reasoning_events(monkeypatch):
