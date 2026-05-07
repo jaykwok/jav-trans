@@ -1,5 +1,6 @@
 import json
 import os
+import shutil
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -158,7 +159,8 @@ def _download_snapshot(
             endpoint=endpoint,
             **progress_kwargs,
         )
-    except Exception as exc:
+    except BaseException as exc:
+        shutil.rmtree(target_dir, ignore_errors=True)
         if fallback_token is not None:
             hf_progress.fallback_error(fallback_token, exc)
         raise

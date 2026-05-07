@@ -925,6 +925,110 @@ def _filter_f0_none_segments(
     return filtered, len(segments) - len(filtered)
 
 
+def _word_gender_value(word: dict) -> str | None:
+    gender = word.get("gender")
+    return gender if gender in {"M", "F"} else None
+
+
+def _word_text(word: dict) -> str:
+    return str(word.get("word") or word.get("text") or "").strip()
+
+
+def _gender_for_words(words: list[dict]) -> str | None:
+    genders = [_word_gender_value(word) for word in words]
+    genders = [gender for gender in genders if gender is not None]
+    if not genders:
+        return None
+    return max(("M", "F"), key=genders.count)
+
+
+def _segment_from_f0_words(segment: dict, words: list[dict]) -> dict | None:
+    if not words:
+        return None
+    text = "".join(_word_text(word) for word in words).strip()
+    if not text:
+        return None
+    try:
+        start = min(float(word.get("start", segment.get("start", 0.0))) for word in words)
+        end = max(float(word.get("end", segment.get("end", start))) for word in words)
+    except (TypeError, ValueError):
+        return None
+    if end <= start:
+        return None
+    rebuilt = dict(segment)
+    rebuilt.update(
+        {
+            "start": start,
+            "end": end,
+            "text": text,
+            "words": [dict(word) for word in words],
+            "gender": _gender_for_words(words),
+            "source_chunk_index": words[0].get(
+                "source_chunk_index",
+                segment.get("source_chunk_index"),
+            ),
+        }
+    )
+    return rebuilt
+
+
+def _split_segment_on_f0_gender_turns(segment: dict) -> list[dict]:
+    words = [dict(word) for word in segment.get("words") or [] if isinstance(word, dict)]
+    if len(words) < 2:
+        return [segment]
+    try:
+        words.sort(
+            key=lambda word: (
+                float(word.get("start", segment.get("start", 0.0))),
+                float(word.get("end", segment.get("end", 0.0))),
+            )
+        )
+    except (TypeError, ValueError):
+        return [segment]
+
+    groups: list[list[dict]] = []
+    current_words: list[dict] = []
+    active_gender: str | None = None
+    for word in words:
+        gender = _word_gender_value(word)
+        if (
+            current_words
+            and gender is not None
+            and active_gender is not None
+            and gender != active_gender
+        ):
+            groups.append(current_words)
+            current_words = [word]
+            active_gender = gender
+            continue
+        current_words.append(word)
+        if gender is not None:
+            active_gender = gender
+    if current_words:
+        groups.append(current_words)
+
+    if len(groups) < 2:
+        return [segment]
+
+    rebuilt_segments = [
+        rebuilt
+        for group in groups
+        for rebuilt in [_segment_from_f0_words(segment, group)]
+        if rebuilt is not None
+    ]
+    return rebuilt_segments if len(rebuilt_segments) >= 2 else [segment]
+
+
+def _split_segments_on_f0_gender_turns(segments: list[dict]) -> tuple[list[dict], int]:
+    split_segments: list[dict] = []
+    split_count = 0
+    for segment in segments:
+        pieces = _split_segment_on_f0_gender_turns(segment)
+        split_count += max(0, len(pieces) - 1)
+        split_segments.extend(pieces)
+    return split_segments, split_count
+
+
 def _try_load_aligned_segments(
     path: str,
     expected_audio_cache_key: str,
@@ -1292,6 +1396,7 @@ def run_asr_alignment_f0(
 
     f0_failed = False
     f0_filtered_count = 0
+    f0_gender_split_count = 0
     if segments and not effective_ctx.skip_translation:
         try:
             from audio.f0_gender import detect_gender_f0_word_level
@@ -1314,6 +1419,29 @@ def run_asr_alignment_f0(
                     min_span_ms=_ctx_int(effective_ctx, "F0_WORD_MIN_SPAN_MS", 500),
                     f0_threshold_hz=_ctx_float(effective_ctx, "F0_THRESHOLD_HZ", 160.0),
                 )
+                if _ctx_flag(effective_ctx, "MULTI_CUE_SPLIT_ENABLED"):
+                    f0_split_before = len(segments)
+                    segments, f0_gender_split_count = _split_segments_on_f0_gender_turns(
+                        segments
+                    )
+                    asr_details["f0_gender_split"] = {
+                        "segments_before": f0_split_before,
+                        "segments_after": len(segments),
+                        "split_count": f0_gender_split_count,
+                    }
+                    _log_stage(
+                        logger,
+                        "f0_gender_split "
+                        f"segments_before={f0_split_before} "
+                        f"segments_after={len(segments)} "
+                        f"split_count={f0_gender_split_count}",
+                    )
+                    if f0_gender_split_count:
+                        console.print(
+                            "[cyan]F0 gender split: "
+                            f"{f0_split_before} -> {len(segments)} "
+                            f"(split_count={f0_gender_split_count})[/cyan]"
+                        )
             _raise_if_cancelled(cancel_event)
             _log_stage(
                 logger,
@@ -1783,6 +1911,8 @@ def run_translation_and_write(
             character_reference=ctx.asr_context,
             batch_size=ctx.translation_batch_size,
             max_workers=ctx.translation_max_workers,
+            reasoning_effort=ctx.llm_reasoning_effort,
+            api_format=ctx.llm_api_format,
             cache_path=translation_cache_path,
             on_batch_done=_on_translation_done,
             on_progress=_on_translation_progress,

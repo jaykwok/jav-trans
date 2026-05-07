@@ -13,6 +13,13 @@ _install_lock = threading.Lock()
 _installed = False
 _original_tqdm: type | None = None
 _progress_tqdm: type | None = None
+# 模块级 fallback，跨线程可见（download 是串行的，无并发风险）
+_override_job_id: str = ""
+
+
+def set_current_job_id(job_id: str) -> None:
+    global _override_job_id
+    _override_job_id = job_id
 
 
 def _event_ts() -> str:
@@ -20,18 +27,19 @@ def _event_ts() -> str:
 
 
 def _current_job_id() -> str:
+    # 先试线程本地（主线程调用路径有效）
     try:
         from core import events
 
-        getter = getattr(events, "get_current_job_id", None)
-        if callable(getter):
-            return str(getter() or "")
         private_getter = getattr(events, "_current_job_id", None)
         if callable(private_getter):
-            return str(private_getter() or "")
+            tid = str(private_getter() or "")
+            if tid:
+                return tid
     except Exception:
         pass
-    return ""
+    # fallback：模块级变量（download worker 线程走这里）
+    return _override_job_id
 
 
 def _current_video() -> str:

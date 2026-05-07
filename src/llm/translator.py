@@ -75,9 +75,16 @@ _RESPONSES_REASONING_EFFORT_MAP = {
 }
 
 
-def _llm_api_format() -> str:
-    value = (os.getenv("LLM_API_FORMAT", LLM_API_FORMAT) or "chat").strip().lower()
-    return value if value in {"chat", "responses"} else "chat"
+def _normalize_llm_api_format(value: str | None, fallback: str = "chat") -> str:
+    normalized = (value or fallback or "chat").strip().lower()
+    return normalized if normalized in {"chat", "responses"} else "chat"
+
+
+def _llm_api_format(api_format: str | None = None) -> str:
+    if api_format is not None:
+        return _normalize_llm_api_format(api_format, LLM_API_FORMAT)
+    value = os.getenv("LLM_API_FORMAT", LLM_API_FORMAT)
+    return _normalize_llm_api_format(value)
 
 
 def _get_client() -> OpenAI:
@@ -282,7 +289,12 @@ def _global_glossary_cache_path(translation_cache_path: str) -> str:
     return str(cache_path.with_name("translation_global_glossary.json"))
 
 
-def extract_global_glossary(all_ja_texts: list[str], cache_path: str) -> list[dict]:
+def extract_global_glossary(
+    all_ja_texts: list[str],
+    cache_path: str,
+    *,
+    api_format: str | None = None,
+) -> list[dict]:
     if not cache_path:
         return []
     path = Path(cache_path)
@@ -308,7 +320,10 @@ def extract_global_glossary(all_ja_texts: list[str], cache_path: str) -> list[di
             },
             {"role": "user", "content": f"【全片日文字幕】\n{source_text}"},
         ]
-        raw_output = _chat(messages, expected_count=0, reasoning_effort="low")
+        chat_kwargs = {"expected_count": 0, "reasoning_effort": "low"}
+        if api_format is not None:
+            chat_kwargs["api_format"] = api_format
+        raw_output = _chat(messages, **chat_kwargs)
         parsed = json.loads(_strip_reasoning_artifacts(raw_output))
         terms = _filter_global_glossary_terms(parsed.get("terms") if isinstance(parsed, dict) else None)
         tmp_path = path.with_name(f"{path.name}.{threading.get_ident()}.tmp")
@@ -381,6 +396,7 @@ def translate_segments(
     glossary: str = "",
     character_reference: str | None = None,
     reasoning_effort: str | None = None,
+    api_format: str | None = None,
     on_batch_done=None,
     on_progress: Callable[[dict], None] | None = None,
 ) -> tuple[list[str], list[dict], list[dict]]:
@@ -412,6 +428,7 @@ def translate_segments(
                 glossary=effective_glossary,
                 character_reference=effective_character_reference,
                 reasoning_effort=reasoning_effort,
+                api_format=api_format,
                 on_batch_done=on_batch_done,
                 on_progress=on_progress,
             )
@@ -423,6 +440,7 @@ def translate_segments(
                 glossary=effective_glossary,
                 character_reference=effective_character_reference,
                 reasoning_effort=reasoning_effort,
+                api_format=api_format,
                 on_batch_done=on_batch_done,
                 on_progress=on_progress,
             )
@@ -440,19 +458,20 @@ def _chat_with_reasoning(
     *,
     expected_count: int,
     reasoning_effort: str | None = None,
+    api_format: str | None = None,
     on_progress: Callable[[dict], None] | None = None,
 ) -> str:
-    if reasoning_effort is None:
-        return _chat(
-            messages,
-            expected_count=expected_count,
-            on_progress=on_progress,
-        )
+    chat_kwargs = {
+        "expected_count": expected_count,
+        "on_progress": on_progress,
+    }
+    if reasoning_effort is not None:
+        chat_kwargs["reasoning_effort"] = reasoning_effort
+    if api_format is not None:
+        chat_kwargs["api_format"] = api_format
     return _chat(
         messages,
-        expected_count=expected_count,
-        reasoning_effort=reasoning_effort,
-        on_progress=on_progress,
+        **chat_kwargs,
     )
 
 
@@ -464,6 +483,7 @@ def _translate_segments_oneshot(
     glossary: str,
     character_reference: str,
     reasoning_effort: str | None = None,
+    api_format: str | None = None,
     on_batch_done=None,
     on_progress: Callable[[dict], None] | None = None,
 ) -> tuple[list[str], list[dict]]:
@@ -492,6 +512,7 @@ def _translate_segments_oneshot(
                 messages,
                 expected_count=expected_count,
                 reasoning_effort=reasoning_effort,
+                api_format=api_format,
                 on_progress=on_progress,
             )
             zh_texts = _parse_translation_output(raw_output, expected_count)
@@ -539,6 +560,7 @@ def _translate_segments_batched(
     glossary: str,
     character_reference: str,
     reasoning_effort: str | None = None,
+    api_format: str | None = None,
     on_batch_done=None,
     on_progress: Callable[[dict], None] | None = None,
 ) -> tuple[list[str], list[dict]]:
@@ -550,6 +572,7 @@ def _translate_segments_batched(
         glossary_terms = extract_global_glossary(
             [str(seg.get("text", "")) for seg in segments],
             _global_glossary_cache_path(cache_path),
+            api_format=api_format,
         )
         extra_glossary = _format_global_glossary_terms(
             glossary_terms,
@@ -643,6 +666,7 @@ def _translate_segments_batched(
                     messages,
                     expected_count=expected_count,
                     reasoning_effort=reasoning_effort,
+                    api_format=api_format,
                     on_progress=progress_callback,
                 )
                 parsed = _parse_translation_output_by_global_id(
@@ -1278,8 +1302,9 @@ def _chat(
     expected_count: int = 0,
     on_progress: Callable[[dict], None] | None = None,
     reasoning_effort: str | None = None,
+    api_format: str | None = None,
 ) -> str:
-    if _llm_api_format() == "responses":
+    if _llm_api_format(api_format) == "responses":
         return _chat_responses(
             messages,
             expected_count=expected_count,
