@@ -344,6 +344,34 @@ main {
 .btn-outline:hover:not(:disabled) { border-color: var(--accent); color: var(--accent); }
 .btn-outline:disabled { opacity: .4; cursor: default; }
 
+/* Paste menu */
+.paste-menu {
+  position: fixed;
+  z-index: 1000;
+  min-width: 78px;
+  padding: 4px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 5px;
+  box-shadow: 0 8px 24px rgba(0,0,0,.35);
+}
+.paste-menu[hidden] { display: none; }
+.paste-menu button {
+  width: 100%;
+  padding: 6px 10px;
+  background: transparent;
+  border: none;
+  border-radius: 4px;
+  color: var(--text);
+  cursor: pointer;
+  font-size: 12px;
+  text-align: left;
+}
+.paste-menu button:hover {
+  background: rgba(124,106,247,.16);
+  color: #fff;
+}
+
 /* Scrollbar */
 ::-webkit-scrollbar { width: 6px; height: 6px; }
 ::-webkit-scrollbar-track { background: transparent; }

@@ -45,6 +45,7 @@ OPENAI_COMPATIBILITY_BASE_URL = (
 )
 API_KEY = os.getenv("API_KEY", "").strip() or None
 LLM_MODEL_NAME = os.getenv("LLM_MODEL_NAME", "").strip()
+LLM_API_FORMAT = os.getenv("LLM_API_FORMAT", "chat").strip().lower() or "chat"
 LLM_REASONING_EFFORT = os.getenv("LLM_REASONING_EFFORT", "max").strip() or "max"
 CHARACTER_FULL_NAME_REFERENCE = (
     os.getenv("ASR_CONTEXT", "").strip()
@@ -66,6 +67,17 @@ TRANSLATION_API_BACKOFF_MAX_S = max(
     TRANSLATION_API_BACKOFF_BASE_S,
     float(os.getenv("TRANSLATION_API_BACKOFF_MAX_S", "20")),
 )
+
+_RESPONSES_REASONING_EFFORT_MAP = {
+    "low": "low",
+    "medium": "medium",
+    "max": "high",
+}
+
+
+def _llm_api_format() -> str:
+    value = (os.getenv("LLM_API_FORMAT", LLM_API_FORMAT) or "chat").strip().lower()
+    return value if value in {"chat", "responses"} else "chat"
 
 
 def _get_client() -> OpenAI:
@@ -1025,6 +1037,25 @@ def _create_chat_completion(request: dict):
     raise RuntimeError("chat completion failed without an exception")
 
 
+def _create_response(request: dict):
+    last_error: Exception | None = None
+
+    for attempt in range(TRANSLATION_API_RETRIES):
+        try:
+            return _get_client().responses.create(**request)
+        except Exception as exc:
+            last_error = exc
+            if not _is_retryable_api_error(exc):
+                raise
+
+            if attempt < TRANSLATION_API_RETRIES - 1:
+                _request_backoff_sleep(attempt, exc)
+
+    if last_error is not None:
+        raise last_error
+    raise RuntimeError("response creation failed without an exception")
+
+
 def _emit_progress(
     on_progress: Callable[[dict], None] | None,
     payload: dict,
@@ -1135,7 +1166,135 @@ def _make_aggregated_progress_callback(
     return [make_wrapper(batch_id) for batch_id in range(num_batches)], None
 
 
+def _count_translation_markers(
+    *,
+    piece: str,
+    id_scan_tail: str,
+    id_marker: str,
+) -> tuple[int, str]:
+    scan_text = id_scan_tail + piece
+    tail_len = len(id_scan_tail)
+    count = sum(
+        1
+        for match in re.finditer(re.escape(id_marker), scan_text)
+        if match.end() > tail_len
+    )
+    return count, scan_text[-(len(id_marker) - 1) :]
+
+
+def _emit_stream_content_progress(
+    *,
+    piece: str,
+    state: dict,
+    expected_count: int,
+    maybe_emit: Callable[[dict], None],
+) -> None:
+    state["final_content"].append(piece)
+    state["content_chars"] += len(piece)
+    count, state["id_scan_tail"] = _count_translation_markers(
+        piece=piece,
+        id_scan_tail=state["id_scan_tail"],
+        id_marker=state["id_marker"],
+    )
+    state["translated_count"] += count
+    maybe_emit(
+        {
+            "phase": "translating",
+            "translated": state["translated_count"],
+            "expected": expected_count,
+            "content_chars": state["content_chars"],
+        }
+    )
+
+
+def _build_responses_input(messages: list[dict]) -> list[dict]:
+    response_input: list[dict] = []
+    for message in messages:
+        role = str(message.get("role") or "user")
+        content = message.get("content", "")
+        response_input.append(
+            {
+                "role": role,
+                "content": [
+                    {
+                        "type": "input_text",
+                        "text": str(content),
+                    }
+                ],
+            }
+        )
+    return response_input
+
+
+def _extract_response_output_text(response) -> str:
+    output_text = getattr(response, "output_text", None)
+    if isinstance(output_text, str) and output_text.strip():
+        return output_text
+
+    parts: list[str] = []
+    for item in getattr(response, "output", []) or []:
+        for content in getattr(item, "content", []) or []:
+            text = getattr(content, "text", None)
+            if isinstance(text, str):
+                parts.append(text)
+                continue
+            if isinstance(content, dict) and isinstance(content.get("text"), str):
+                parts.append(content["text"])
+    return "".join(parts)
+
+
+def _response_event_type(event) -> str:
+    value = getattr(event, "type", "")
+    if value:
+        return str(value)
+    if isinstance(event, dict):
+        return str(event.get("type", ""))
+    return ""
+
+
+def _response_event_delta(event) -> str:
+    value = getattr(event, "delta", None)
+    if value is None and isinstance(event, dict):
+        value = event.get("delta")
+    return value if isinstance(value, str) else ""
+
+
+def _response_event_response(event):
+    value = getattr(event, "response", None)
+    if value is None and isinstance(event, dict):
+        value = event.get("response")
+    return value
+
+
+def _response_incomplete_reason(response) -> str:
+    details = getattr(response, "incomplete_details", None)
+    if isinstance(details, dict):
+        return str(details.get("reason", ""))
+    return str(getattr(details, "reason", "") or "")
+
+
 def _chat(
+    messages: list[dict],
+    expected_count: int = 0,
+    on_progress: Callable[[dict], None] | None = None,
+    reasoning_effort: str | None = None,
+) -> str:
+    if _llm_api_format() == "responses":
+        return _chat_responses(
+            messages,
+            expected_count=expected_count,
+            on_progress=on_progress,
+            reasoning_effort=reasoning_effort,
+        )
+    return _chat_completions(
+        messages,
+        expected_count=expected_count,
+        on_progress=on_progress,
+        reasoning_effort=reasoning_effort,
+    )
+
+
+def _chat_completions(
     messages: list[dict],
     expected_count: int = 0,
     on_progress: Callable[[dict], None] | None = None,
@@ -1159,15 +1318,17 @@ def _chat(
 
     response_stream = _create_chat_completion(request)
 
-    final_content = []
     finish_reason = None
     reasoning_chars = 0
-    content_chars = 0
-    translated_count = 0
-    id_scan_tail = ""
-    id_marker = '"id":'
     last_emit = 0.0
     debounce_s = 0.25
+    stream_state = {
+        "final_content": [],
+        "content_chars": 0,
+        "translated_count": 0,
+        "id_scan_tail": "",
+        "id_marker": '"id":',
+    }
 
     def maybe_emit(payload: dict, *, force: bool = False) -> None:
         nonlocal last_emit
@@ -1188,22 +1349,11 @@ def _chat(
                 {"phase": "thinking", "reasoning_chars": reasoning_chars}
             )
         if hasattr(delta, "content") and delta.content:
-            content_piece = delta.content
-            final_content.append(content_piece)
-            content_chars += len(content_piece)
-            scan_text = id_scan_tail + content_piece
-            tail_len = len(id_scan_tail)
-            translated_count += sum(
-                1 for match in re.finditer(re.escape(id_marker), scan_text) if match.end() > tail_len
-            )
-            id_scan_tail = scan_text[-(len(id_marker) - 1) :]
-            maybe_emit(
-                {
-                    "phase": "translating",
-                    "translated": translated_count,
-                    "expected": expected_count,
-                    "content_chars": content_chars,
-                }
+            _emit_stream_content_progress(
+                piece=delta.content,
+                state=stream_state,
+                expected_count=expected_count,
+                maybe_emit=maybe_emit,
             )
         if chunk.choices[0].finish_reason:
             finish_reason = chunk.choices[0].finish_reason
@@ -1214,14 +1364,137 @@ def _chat(
             "increase TRANSLATION_MAX_TOKENS."
         )
 
-    final_content_str = "".join(final_content)
+    final_content_str = "".join(stream_state["final_content"])
     if not final_content_str.strip():
         raise RetryableTranslationFormatError("DeepSeek JSON mode returned empty content.")
     _emit_progress(
         on_progress,
         {
             "phase": "done",
-            "translated": translated_count,
+            "translated": stream_state["translated_count"],
+            "expected": expected_count,
+        },
+    )
+    return final_content_str.strip()
+
+
+def _chat_responses(
+    messages: list[dict],
+    expected_count: int = 0,
+    on_progress: Callable[[dict], None] | None = None,
+    reasoning_effort: str | None = None,
+) -> str:
+    model_name = os.getenv("LLM_MODEL_NAME", LLM_MODEL_NAME).strip()
+    if not model_name:
+        raise RuntimeError("请先在「翻译设置」中获取并选择翻译模型，再提交任务")
+
+    effective_reasoning_effort = (
+        reasoning_effort
+        or os.getenv("LLM_REASONING_EFFORT", "max").strip()
+        or "max"
+    )
+    request = {
+        "model": model_name,
+        "input": _build_responses_input(messages),
+        "stream": True,
+        "text": {"format": {"type": "json_object"}},
+        "reasoning": {
+            "effort": _RESPONSES_REASONING_EFFORT_MAP.get(
+                effective_reasoning_effort,
+                effective_reasoning_effort,
+            )
+        },
+    }
+    if TRANSLATION_MAX_TOKENS > 0:
+        request["max_output_tokens"] = TRANSLATION_MAX_TOKENS
+
+    response_stream = _create_response(request)
+
+    completed_response = None
+    incomplete_response = None
+    failed_error = None
+    reasoning_chars = 0
+    last_emit = 0.0
+    debounce_s = 0.25
+    stream_state = {
+        "final_content": [],
+        "content_chars": 0,
+        "translated_count": 0,
+        "id_scan_tail": "",
+        "id_marker": '"id":',
+    }
+
+    def maybe_emit(payload: dict, *, force: bool = False) -> None:
+        nonlocal last_emit
+        now = time.monotonic()
+        if not force and now - last_emit < debounce_s:
+            return
+        last_emit = now
+        _emit_progress(on_progress, payload)
+
+    for event in response_stream:
+        event_type = _response_event_type(event)
+        if event_type == "response.output_text.delta":
+            piece = _response_event_delta(event)
+            if piece:
+                _emit_stream_content_progress(
+                    piece=piece,
+                    state=stream_state,
+                    expected_count=expected_count,
+                    maybe_emit=maybe_emit,
+                )
+            continue
+
+        if event_type in {
+            "response.reasoning_summary_text.delta",
+            "response.reasoning_text.delta",
+        }:
+            reasoning_piece = _response_event_delta(event)
+            if reasoning_piece:
+                reasoning_chars += len(reasoning_piece)
+                maybe_emit(
+                    {"phase": "thinking", "reasoning_chars": reasoning_chars}
+                )
+            continue
+
+        if event_type == "response.completed":
+            completed_response = _response_event_response(event)
+            continue
+
+        if event_type == "response.incomplete":
+            incomplete_response = _response_event_response(event)
+            continue
+
+        if event_type in {"response.failed", "response.error"}:
+            failed_error = event
+
+    if failed_error is not None:
+        raise RetryableTranslationFormatError(
+            f"OpenAI Responses API failed: {failed_error}"
+        )
+
+    if incomplete_response is not None:
+        reason = _response_incomplete_reason(incomplete_response)
+        if reason == "max_output_tokens":
+            raise RetryableTranslationFormatError(
+                "OpenAI Responses API response was cut off by max_output_tokens; "
+                "increase TRANSLATION_MAX_TOKENS."
+            )
+        raise RetryableTranslationFormatError(
+            f"OpenAI Responses API returned incomplete response: {reason or 'unknown'}"
+        )
+
+    final_content_str = "".join(stream_state["final_content"])
+    if not final_content_str.strip() and completed_response is not None:
+        final_content_str = _extract_response_output_text(completed_response)
+    if not final_content_str.strip():
+        raise RetryableTranslationFormatError("OpenAI Responses API returned empty content.")
+
+    _emit_progress(
+        on_progress,
+        {
+            "phase": "done",
+            "translated": stream_state["translated_count"],
             "expected": expected_count,
         },
     )

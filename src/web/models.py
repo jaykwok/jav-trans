@@ -55,6 +55,7 @@ class SettingsRead(BaseModel):
     model: str = ""
     hf_endpoint: str = ""
     translation_glossary: str = ""
+    llm_api_format: Literal["chat", "responses"] = "chat"
     llm_reasoning_effort: str = "max"
     target_lang: str = "简体中文"
 
@@ -65,5 +66,6 @@ class SettingsUpdate(BaseModel):
     model: str | None = None
     hf_endpoint: str | None = None
     translation_glossary: str | None = None
+    llm_api_format: Literal["chat", "responses"] | None = None
     llm_reasoning_effort: str | None = None
     target_lang: str | None = None
