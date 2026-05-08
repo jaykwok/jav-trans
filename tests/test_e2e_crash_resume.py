@@ -135,7 +135,7 @@ def test_translation_crash_resume_and_success_cleanup(monkeypatch, tmp_path, cap
     cache_path = tmp_path / "translation_cache.jsonl"
     chat_calls: list[int] = []
 
-    def fake_chat(messages, expected_count=0, on_progress=None):
+    def fake_chat(messages, expected_count=0, on_progress=None, **_kwargs):
         start = _batch_start_from_messages(messages)
         chat_calls.append(start)
         return _mock_translation_json(start, expected_count)

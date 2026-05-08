@@ -20,10 +20,10 @@ class JobSpec(BaseModel):
     multi_cue_split: bool = True
     asr_recovery: bool = False
     vad_threshold: float = 0.35
-    translation_batch_size: int = 100
+    translation_batch_size: int = 200
     asr_context: str = ""
     keep_quality_report: bool = False
-    translation_max_workers: int = 8
+    translation_max_workers: int = 4
     target_lang: str | None = None
     translation_glossary: str | None = None
     llm_api_format: Literal["chat", "responses"] | None = None

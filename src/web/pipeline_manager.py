@@ -23,7 +23,8 @@ from web.models import JobSpec, JobState
 
 gpu_queue: asyncio.Queue[JobState] = asyncio.Queue()
 trans_queue: asyncio.Queue[tuple[JobState, Any]] = asyncio.Queue()
-_executor = ThreadPoolExecutor(max_workers=4)
+_EXECUTOR_MAX_WORKERS = 4
+_executor = ThreadPoolExecutor(max_workers=_EXECUTOR_MAX_WORKERS)
 
 _jobs: dict[str, JobState] = {}
 _cancel_events: dict[str, threading.Event] = {}
@@ -37,6 +38,7 @@ _EVENT_STAGE_STATUS = {
     "translation": "translating",
     "write_output": "writing",
 }
+_TRANSLATION_RETRY_STAGES = {"translation_context", "translation", "write_output"}
 
 
 def _utc_now() -> str:
@@ -84,7 +86,6 @@ async def load_jobs() -> None:
         for job in _jobs.values():
             if job.status in _ACTIVE_STATUSES:
                 job.status = "failed"
-                job.current_stage = "failed"
                 job.error = "进程异常退出（上次运行被中断）"
                 changed = True
         if changed:
@@ -235,12 +236,15 @@ def _run_asr_alignment_f0(job: JobState, cancel_event=None):
             job.id,
             _new_cancel_event(),
         )
-        return run_asr_alignment_f0(
+        artifacts = run_asr_alignment_f0(
             job.spec.video_paths[0],
             ctx=_job_context(job),
             cache_job_id=_resume_cache_job_id(job),
             cancel_event=cancel_event,
         )
+        if isinstance(artifacts, pipeline_main.AsrArtifacts):
+            pipeline_main.write_translation_artifacts_snapshot(artifacts)
+        return artifacts
     finally:
         _hf_progress.set_current_job_id("")
 
@@ -255,6 +259,25 @@ def _run_translation_and_write(job: JobState, asr_artifacts) -> list[str]:
         job_id=job.id,
         cancel_event=cancel_event,
     )
+
+
+def _job_stage_names(job: JobState) -> set[str]:
+    stages = {str(job.current_stage or "")}
+    progress = job.progress if isinstance(job.progress, dict) else {}
+    stages.add(str(progress.get("stage") or ""))
+    extra = progress.get("extra")
+    if isinstance(extra, dict):
+        stages.add(str(extra.get("stage") or ""))
+    return {stage for stage in stages if stage}
+
+
+def _load_translation_retry_artifacts(job: JobState):
+    if not (_job_stage_names(job) & _TRANSLATION_RETRY_STAGES):
+        return None
+    try:
+        return pipeline_main.load_translation_artifacts_snapshot(_job_temp_dir(job.id))
+    except Exception:
+        return None
 
 
 def _relative_artifacts(paths: list[str], output_dir: str | None) -> list[str]:
@@ -460,10 +483,12 @@ async def cancel_job(job_id: str) -> bool:
 
 
 async def retry_job(job_id: str) -> JobState | None:
+    retry_artifacts = None
     async with _state_lock:
         job = _jobs.get(job_id)
         if job is None or job.status not in _RETRYABLE_STATUSES:
             return None
+        retry_artifacts = _load_translation_retry_artifacts(job)
         retried = job.model_copy(
             update={
                 "status": "queued",
@@ -476,7 +501,10 @@ async def retry_job(job_id: str) -> JobState | None:
         _cancel_events[job_id] = _new_cancel_event()
         _jobs[job_id] = retried
         _write_jobs_unlocked()
-    await gpu_queue.put(retried)
+    if retry_artifacts is not None:
+        await trans_queue.put((retried, retry_artifacts))
+    else:
+        await gpu_queue.put(retried)
     return retried
 
 
@@ -557,7 +585,9 @@ async def update_job_progress(job_id: str, progress: dict[str, Any]) -> None:
 
 
 async def shutdown_executor() -> None:
+    global _executor
     _executor.shutdown(wait=False, cancel_futures=True)
+    _executor = ThreadPoolExecutor(max_workers=_EXECUTOR_MAX_WORKERS)
 
 
 async def start_workers(translation_workers: int | None = None) -> list[asyncio.Task]:

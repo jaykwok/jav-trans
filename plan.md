@@ -9,7 +9,7 @@
 ## 1. 当前锁定架构
 
 - Windows 本机生产目标：NVIDIA RTX 4060 Ti 8GB，串行分时加载模型，阶段结束后卸载并清 CUDA cache。
-- 主流水线：视频 → 音频准备 → WhisperSeg VAD → ASR → Forced Alignment 词级时间轴 → F0 性别检测 → F0 后 gender turn 重切段 → DeepSeek 翻译 → SRT/quality report。
+- 主流水线：视频 → 音频准备 → WhisperSeg VAD → ASR → Forced Alignment 词级时间轴 → F0 性别检测 → F0 后 gender turn 重切段 → 翻译前 ASR 噪声过滤 → LLM 翻译 → SRT/quality report。
 - 默认 ASR 配置仍为 `ASR_BACKEND=anime-whisper`；Web UI 推荐排序把 `whisper-ja-anime-v0.3` 放在第一位。
 - 支持后端：
   - `anime-whisper`
@@ -17,7 +17,8 @@
   - `whisper-ja-1.5b`
   - `whisper-ja-anime-v0.3`
 - 默认 VAD：`ASR_VAD_BACKEND=whisperseg`，`WHISPERSEG_THRESHOLD=0.35`。
-- 默认翻译：`deepseek-v4-pro`，Reasoning + JSON Mode + Streaming；Web 任务默认 `translation_batch_size=100`，`translation_max_workers=8`。
+- 默认翻译配置示例为 OpenAI-compatible LLM 服务；翻译请求使用流式输出 + 结构化 JSON 输出，Web 任务默认 `translation_batch_size=200`，`translation_max_workers=4`。
+- 翻译提交前过滤空文本、纯引号/括号文本、纯英文 ASR 幻觉 token，避免无效片段进入 LLM 批次。
 - 字幕约束：`MAX_SUBTITLE_DURATION=8.0`，`ASR_MERGE_HARD_MAX_DURATION=9.0`，相邻短块合并受标点、speaker guard 和 gender guard 限制。
 - 默认 ASR recovery：`ASR_RECOVERY_ENABLED=0`。只在手动排查异常 ASR 文本块时打开；recovery 通过 ffmpeg VAD 二次细分 + 同 ASR backend 重转写实现（已替换旧 audio-separator），不用于解决男女混句或字幕边界问题。
 - 断点续传：ASR checkpoint、`aligned_segments.json`、translation cache。
@@ -63,6 +64,7 @@
 - **T-O** ✅ Web 表单易用性：所有可填写控件自动记忆上次填写值；文本输入控件支持右键粘贴菜单，API Key 不进入本地明文记忆。
 - **T-P** ✅ 翻译 API 格式兼容：翻译侧支持 `LLM_API_FORMAT=chat|responses`，默认 Chat Completions；Responses API 使用 `/responses`、流式 output_text delta、JSON object text format。
 - **T-Q** ✅ F0 后 gender turn 重切段：F0 标注 `words[].gender` 后按 `M/F` 转换积极拆分字幕段，避免男女同处长句时不换行（F0 相关 15 tests + ASR cache/job 7 tests）。
+- **T-R** ✅ 翻译重试与请求清理：batch 翻译失败时只重试当前失败/缺失 id；Micu+Grok Responses 特例移入 `src/llm/patch.py`；通用 JSON 错误文案改为 `LLM JSON output`；Web 标准默认改为 batch=200、worker=4；翻译提交前 ASR 噪声过滤扩展到纯英文幻觉 token。
 
 基线：子进程隔离、WhisperSeg VAD、翻译并行、断点续传、SRT 折行、quality report 等主功能均已落地；README、`.env.example`、`.gitignore` 已按 Web-first 架构收口，cohere 源码/模型/cache 已退出工作流。
 
@@ -109,10 +111,10 @@ pipeline_total=575.30s，字幕块数 150，产物 `video/HAME-052.srt`。
 
 **完成内容**：
 - 翻译侧新增 `LLM_API_FORMAT`，可选 `chat` / `responses`，默认 `chat`。
-- `chat` 保持原 `/chat/completions` 兼容路径、JSON Mode、streaming 和 DeepSeek thinking extra_body。
+- `chat` 保持 OpenAI Chat Completions 兼容路径、结构化 JSON 输出、streaming 和兼容服务的 reasoning/thinking 参数。
 - `responses` 使用 OpenAI Responses API 兼容路径：`client.responses.create(stream=True, input=..., text={"format":{"type":"json_object"}})`，并解析 `response.output_text.delta`、reasoning delta、completed / incomplete / failed 事件。
 - Web 设置 API (`/api/settings`) 支持读写 `llm_api_format`，Pydantic 限定为 `chat|responses`。
-- 当前 `/api/models` 已确认可远程获取模型列表：配置 `https://api.deepseek.com` 返回 `deepseek-v4-flash`、`deepseek-v4-pro`。
+- `/api/models` 通过当前 OpenAI-compatible Base URL 远程获取模型列表。
 
 **验收**：
 ```powershell

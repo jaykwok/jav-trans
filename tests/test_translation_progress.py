@@ -4,6 +4,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from llm import patch as llm_patch
 from llm import translator
 
 
@@ -42,6 +43,7 @@ def _response_event(event_type: str, **kwargs):
 def test_chat_progress_reasoning_translating_done(monkeypatch):
     events: list[dict] = []
     monkeypatch.setenv("LLM_API_FORMAT", "chat")
+    monkeypatch.setenv("LLM_MODEL_NAME", "deepseek-v4-pro")
     monkeypatch.setattr(translator.time, "monotonic", FakeClock(0.3).monotonic)
     monkeypatch.setattr(
         translator,
@@ -69,6 +71,7 @@ def test_chat_progress_reasoning_translating_done(monkeypatch):
 def test_expected_zero_does_not_crash(monkeypatch):
     events: list[dict] = []
     monkeypatch.setenv("LLM_API_FORMAT", "chat")
+    monkeypatch.setenv("LLM_MODEL_NAME", "deepseek-v4-pro")
     monkeypatch.setattr(translator.time, "monotonic", FakeClock(0.3).monotonic)
     monkeypatch.setattr(
         translator,
@@ -84,6 +87,37 @@ def test_expected_zero_does_not_crash(monkeypatch):
 
     assert output == '{"translations":[]}'
     assert events[-1] == {"phase": "done", "translated": 0, "expected": 0}
+
+
+def test_grok_chat_keeps_streaming_json_object(monkeypatch):
+    requests: list[dict] = []
+    monkeypatch.setenv("LLM_API_FORMAT", "chat")
+    monkeypatch.setenv("LLM_MODEL_NAME", "grok-4.20-0309-non-reasoning")
+    monkeypatch.setenv("LLM_REASONING_EFFORT", "max")
+    monkeypatch.setattr(
+        translator,
+        "_create_chat_completion",
+        lambda request: requests.append(request) or _stream(
+            [],
+            ['{"translations":[{"id":0,"text":"甲"},{"id":1,"text":"乙"}]}'],
+        ),
+    )
+
+    output = translator._chat(
+        [{"role": "user", "content": "json"}],
+        expected_count=2,
+    )
+
+    assert output == '{"translations":[{"id":0,"text":"甲"},{"id":1,"text":"乙"}]}'
+    request = requests[0]
+    assert request["stream"] is True
+    assert request["reasoning_effort"] == "max"
+    assert request["extra_body"] == {"thinking": {"type": "enabled"}}
+    assert request["response_format"] == {"type": "json_object"}
+    assert "tools" not in request
+    assert "web_search_options" not in request
+    assert "include_reasoning" not in request
+    assert request["max_tokens"] == translator.TRANSLATION_MAX_TOKENS
 
 
 def test_responses_progress_translating_done(monkeypatch):
@@ -134,12 +168,12 @@ def test_responses_progress_translating_done(monkeypatch):
     assert events[-1] == {"phase": "done", "translated": 2, "expected": 2}
 
 
-def test_grok_responses_compat_request_shape(monkeypatch):
+def test_grok_responses_uses_standard_openai_shape_without_micu_patch(monkeypatch):
     requests: list[dict] = []
     monkeypatch.setenv("LLM_API_FORMAT", "responses")
     monkeypatch.setenv("LLM_MODEL_NAME", "grok-4.20-0309-non-reasoning")
     monkeypatch.setenv("LLM_REASONING_EFFORT", "max")
-    monkeypatch.delenv("GROK_RESPONSES_MAX_TOKENS", raising=False)
+    monkeypatch.setenv("OPENAI_COMPATIBILITY_BASE_URL", "https://api.openai.example/v1")
 
     def fake_create_response(request):
         requests.append(request)
@@ -153,7 +187,49 @@ def test_grok_responses_compat_request_shape(monkeypatch):
             ]
         )
 
-    monkeypatch.setattr(translator, "_create_grok_response_raw", fake_create_response)
+    monkeypatch.setattr(translator, "_create_response", fake_create_response)
+
+    output = translator._chat(
+        [{"role": "system", "content": "json"}, {"role": "user", "content": "translate"}],
+        expected_count=0,
+    )
+
+    assert output == '{"translations":[]}'
+    request = requests[0]
+    assert request["stream"] is True
+    assert request["input"][0]["role"] == "system"
+    assert request["input"][0]["content"][0]["type"] == "input_text"
+    assert request["reasoning"] == {"effort": "high"}
+    assert request["text"] == {"format": {"type": "json_object"}}
+    assert request["max_output_tokens"] == translator.TRANSLATION_MAX_TOKENS
+    assert "max_tokens" not in request
+
+
+def test_grok_responses_stream_request_shape(monkeypatch):
+    requests: list[dict] = []
+    monkeypatch.setenv("LLM_API_FORMAT", "responses")
+    monkeypatch.setenv("LLM_MODEL_NAME", "grok-4.20-0309-non-reasoning")
+    monkeypatch.setenv("LLM_REASONING_EFFORT", "max")
+    monkeypatch.setenv("OPENAI_COMPATIBILITY_BASE_URL", "https://www.micuapi.ai/v1")
+    monkeypatch.setenv("API_KEY", "test-key")
+
+    def fake_create_response(request):
+        requests.append(request)
+        return iter(
+            [
+                _response_event(
+                    "response.output_text.delta",
+                    delta='{"translations":[]}',
+                ),
+                _response_event("response.completed", response=SimpleNamespace(output=[])),
+            ]
+        )
+
+    monkeypatch.setattr(
+        llm_patch,
+        "create_micu_grok_response_stream",
+        lambda request, **_kwargs: fake_create_response(request),
+    )
 
     output = translator._chat(
         [{"role": "user", "content": "json"}],
@@ -163,13 +239,14 @@ def test_grok_responses_compat_request_shape(monkeypatch):
     assert output == '{"translations":[]}'
     assert requests
     request = requests[0]
-    assert request["input"] == [{"role": "user", "content": "json"}]
-    assert "text" not in request
-    assert "max_output_tokens" not in request
+    assert request["input"] == [{"role": "user", "content": "USER:\njson"}]
+    assert request["stream"] is True
+    assert request["max_tokens"] == max(16000, translator.TRANSLATION_MAX_TOKENS)
     assert request["reasoning"] == {"effort": "high"}
-    assert request["tools"] == [{"type": "web_search", "max_results": 20}]
     assert request["include_reasoning"] is True
-    assert request["max_tokens"] == 16000
+    assert "text" not in request
+    assert "tools" not in request
+    assert "max_output_tokens" not in request
     assert "extra_body" not in request
 
 
@@ -184,7 +261,7 @@ def test_iter_sse_json_events_parses_responses_stream():
         "",
     ]
 
-    events = list(translator._iter_sse_json_events(lines))
+    events = list(llm_patch.iter_sse_json_events(lines))
 
     assert events == [
         {
@@ -201,6 +278,7 @@ def test_iter_sse_json_events_parses_responses_stream():
 def test_debounce_limits_fast_reasoning_events(monkeypatch):
     events: list[dict] = []
     monkeypatch.setenv("LLM_API_FORMAT", "chat")
+    monkeypatch.setenv("LLM_MODEL_NAME", "deepseek-v4-pro")
     monkeypatch.setattr(translator.time, "monotonic", FakeClock(0.05).monotonic)
     monkeypatch.setattr(
         translator,
@@ -258,6 +336,7 @@ def test_translate_segments_emits_reset_on_retry(monkeypatch):
 
 def test_progress_callback_errors_do_not_break(monkeypatch):
     monkeypatch.setenv("LLM_API_FORMAT", "chat")
+    monkeypatch.setenv("LLM_MODEL_NAME", "deepseek-v4-pro")
     monkeypatch.setattr(translator.time, "monotonic", FakeClock(0.3).monotonic)
     monkeypatch.setattr(
         translator,
