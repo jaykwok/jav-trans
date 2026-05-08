@@ -9,10 +9,10 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Callable
 
-import httpx
 from openai import OpenAI
 
 from core.config import load_config
+from llm import patch as llm_patch
 
 
 load_config()
@@ -28,6 +28,7 @@ _LEADING_SPEAKER_RE = re.compile(
     r"^\s*(?:男|女|男性|女性|男优|女优|スタッフ|撮影者|カメラマン|"
     r"[A-Za-z][A-Za-z ._-]{0,20})\s*[：:]\s*"
 )
+_JSON_OUTPUT_LABEL = "LLM JSON output"
 
 
 class RetryableTranslationFormatError(RuntimeError):
@@ -60,6 +61,10 @@ COMPACT_SYSTEM_PROMPT = os.getenv("COMPACT_SYSTEM_PROMPT", "0").strip().lower() 
     "on",
 }
 TRANSLATION_API_RETRIES = max(1, int(os.getenv("TRANSLATION_API_RETRIES", "4")))
+TRANSLATION_BATCH_REPAIR_RETRIES = max(
+    1,
+    int(os.getenv("TRANSLATION_BATCH_REPAIR_RETRIES", "2")),
+)
 TRANSLATION_API_BACKOFF_BASE_S = max(
     0.1,
     float(os.getenv("TRANSLATION_API_BACKOFF_BASE_S", "1.5")),
@@ -76,20 +81,6 @@ _RESPONSES_REASONING_EFFORT_MAP = {
 }
 
 
-def _env_flag(name: str, default: bool = False) -> bool:
-    raw = os.getenv(name, "").strip().lower()
-    if not raw:
-        return default
-    return raw in {"1", "true", "yes", "on"}
-
-
-def _env_int(name: str, default: int) -> int:
-    try:
-        return int(float(os.getenv(name, str(default))))
-    except (TypeError, ValueError):
-        return default
-
-
 def _normalize_llm_api_format(value: str | None, fallback: str = "chat") -> str:
     normalized = (value or fallback or "chat").strip().lower()
     return normalized if normalized in {"chat", "responses"} else "chat"
@@ -100,10 +91,6 @@ def _llm_api_format(api_format: str | None = None) -> str:
         return _normalize_llm_api_format(api_format, LLM_API_FORMAT)
     value = os.getenv("LLM_API_FORMAT", LLM_API_FORMAT)
     return _normalize_llm_api_format(value)
-
-
-def _is_grok_model(model_name: str) -> bool:
-    return "grok" in (model_name or "").lower()
 
 
 def _responses_reasoning_effort(value: str) -> str:
@@ -456,7 +443,7 @@ def translate_segments(
                 on_progress=on_progress,
             )
         else:
-            zh_texts, timings = _translate_segments_oneshot(
+            zh_texts, timings = _translate_segments_single_request(
                 segments,
                 global_context=global_context,
                 target_lang=effective_target_lang,
@@ -498,7 +485,7 @@ def _chat_with_reasoning(
     )
 
 
-def _translate_segments_oneshot(
+def _translate_segments_single_request(
     segments: list[dict],
     *,
     global_context: str | None = None,
@@ -519,7 +506,7 @@ def _translate_segments_oneshot(
     source_payload = _serialize_segments(segments)
     expected_count = len(segments)
 
-    messages = _build_oneshot_messages(
+    messages = _build_translation_messages(
         source_payload=source_payload,
         expected_count=expected_count,
         target_lang=target_lang,
@@ -542,7 +529,7 @@ def _translate_segments_oneshot(
             missing_indexes = _missing_indexes(zh_texts)
             if missing_indexes:
                 raise RetryableTranslationFormatError(
-                    "DeepSeek JSON mode returned incomplete translations: "
+                    f"{_JSON_OUTPUT_LABEL} returned incomplete translations: "
                     f"{len(missing_indexes)} missing of {expected_count}; "
                     f"missing ids={missing_indexes[:50]}"
                 )
@@ -552,7 +539,7 @@ def _translate_segments_oneshot(
                 _request_backoff_sleep(attempt, exc)
                 continue
             raise RuntimeError(
-                "One-shot translation returned invalid or incomplete JSON after "
+                "Single-request translation returned invalid or incomplete JSON after "
                 f"{TRANSLATION_API_RETRIES} attempts: {exc}"
             ) from exc
 
@@ -560,7 +547,7 @@ def _translate_segments_oneshot(
         "start_index": 0,
         "segment_count": expected_count,
         "elapsed_s": time.perf_counter() - started,
-        "mode": "oneshot_full_context",
+        "mode": "single_request_full_context",
         "request_count": 1,
         "source_payload_chars": len(source_payload),
         "global_context_chars": len(full_context),
@@ -681,44 +668,106 @@ def _translate_segments_batched(
         batch_results: list[str | None] = [None] * expected_total
         missing_indexes: list[int] = []
         progress_callback = progress_callbacks[batch_index]
+        request_count = 0
+        expected_ids = list(range(start_index, start_index + expected_count))
+        pending_ids = list(expected_ids)
+        pending_segments = list(batch_segments)
 
-        for attempt in range(TRANSLATION_API_RETRIES):
-            _emit_progress(progress_callback, {"phase": "reset", "attempt": attempt})
+        attempts_for_pending = 0
+        retry_limit_for_pending = TRANSLATION_API_RETRIES
+        last_retry_error: RetryableTranslationFormatError | None = None
+
+        while True:
+            if attempts_for_pending >= retry_limit_for_pending:
+                raise RuntimeError(
+                    "Batch translation returned invalid or incomplete JSON after "
+                    f"{request_count} attempts: batch={batch_index}, "
+                    f"start_index={start_index}, size={expected_count}, "
+                    f"pending_ids={pending_ids[:50]}, error={last_retry_error}"
+                ) from last_retry_error
+
+            _emit_progress(
+                progress_callback,
+                {"phase": "reset", "attempt": request_count},
+            )
+            requested_ids = list(pending_ids)
             try:
+                if request_count == 0:
+                    request_messages = messages
+                    request_expected_count = expected_count
+                    request_source_payload = source_payload
+                else:
+                    request_expected_count = len(pending_segments)
+                    request_source_payload = _serialize_segments(
+                        pending_segments,
+                        explicit_ids=pending_ids,
+                    )
+                    request_messages = _build_batch_messages(
+                        pending_segments,
+                        full_context,
+                        0,
+                        character_reference,
+                        request_expected_count,
+                        batch_index=batch_index,
+                        extra_glossary=extra_glossary,
+                        target_lang=target_lang,
+                        glossary=glossary,
+                        source_payload_override=request_source_payload,
+                    )
+                request_count += 1
                 raw_output = _chat_with_reasoning(
-                    messages,
-                    expected_count=expected_count,
+                    request_messages,
+                    expected_count=request_expected_count,
                     reasoning_effort=reasoning_effort,
                     api_format=api_format,
                     on_progress=progress_callback,
                 )
-                parsed = _parse_translation_output_by_global_id(
+                parsed = _parse_partial_translation_output_by_global_id(
                     raw_output,
-                    expected_ids=list(range(start_index, start_index + expected_count)),
+                    expected_ids=pending_ids,
                     total_count=expected_total,
                 )
-                batch_results = parsed
+                for idx in pending_ids:
+                    if parsed[idx]:
+                        batch_results[idx] = parsed[idx]
                 missing_indexes = [
                     index
-                    for index in range(start_index, start_index + expected_count)
+                    for index in expected_ids
                     if batch_results[index] is None
                 ]
-                if missing_indexes:
-                    raise RetryableTranslationFormatError(
-                        "DeepSeek JSON mode returned incomplete batch translations: "
-                        f"{len(missing_indexes)} missing of {expected_count}; "
-                        f"missing ids={missing_indexes[:50]}"
-                    )
-                break
+                if not missing_indexes:
+                    break
+
+                pending_ids = list(missing_indexes)
+                pending_segments = [
+                    batch_segments[index - start_index]
+                    for index in pending_ids
+                ]
+                last_retry_error = RetryableTranslationFormatError(
+                    f"{_JSON_OUTPUT_LABEL} returned incomplete batch translations: "
+                    f"{len(missing_indexes)} missing of {expected_count}; "
+                    f"missing ids={missing_indexes[:50]}"
+                )
+                if len(missing_indexes) < len(requested_ids):
+                    attempts_for_pending = 0
+                    retry_limit_for_pending = TRANSLATION_BATCH_REPAIR_RETRIES
+                else:
+                    attempts_for_pending += 1
             except RetryableTranslationFormatError as exc:
-                if attempt < TRANSLATION_API_RETRIES - 1:
-                    _request_backoff_sleep(attempt, exc)
-                    continue
-                raise RuntimeError(
-                    "Batch translation returned invalid or incomplete JSON after "
-                    f"{TRANSLATION_API_RETRIES} attempts: batch={batch_index}, "
-                    f"start_index={start_index}, size={expected_count}, error={exc}"
-                ) from exc
+                last_retry_error = exc
+                attempts_for_pending += 1
+
+            if attempts_for_pending < retry_limit_for_pending:
+                sleep_attempt = max(0, attempts_for_pending - 1)
+                _request_backoff_sleep(sleep_attempt, last_retry_error)
+                continue
+
+            raise RuntimeError(
+                "Batch translation returned invalid or incomplete JSON after "
+                f"{request_count} attempts: batch={batch_index}, "
+                f"start_index={start_index}, size={expected_count}, "
+                f"pending_ids={pending_ids[:50]}, error={last_retry_error}"
+            ) from last_retry_error
 
         timing = {
             "batch_index": batch_index,
@@ -726,7 +775,7 @@ def _translate_segments_batched(
             "segment_count": expected_count,
             "elapsed_s": time.perf_counter() - batch_started,
             "mode": "batched_full_context",
-            "request_count": 1,
+            "request_count": request_count,
             "source_payload_chars": len(source_payload),
             "global_context_chars": len(full_context),
             "missing_count": len(missing_indexes),
@@ -818,7 +867,12 @@ def _split_into_batches(segments: list[dict], batch_size: int) -> list[list[dict
     return [segments[index : index + batch_size] for index in range(0, len(segments), batch_size)]
 
 
-def _serialize_segments(segments: list[dict], *, start_index: int = 0) -> str:
+def _serialize_segments(
+    segments: list[dict],
+    *,
+    start_index: int = 0,
+    explicit_ids: list[int] | None = None,
+) -> str:
     payload = []
     for idx, seg in enumerate(segments):
         start = _safe_float(seg.get("start"))
@@ -829,9 +883,10 @@ def _serialize_segments(segments: list[dict], *, start_index: int = 0) -> str:
             ja_text = f"[M]{ja_text}"
         elif gender == "F":
             ja_text = f"[F]{ja_text}"
+        item_id = explicit_ids[idx] if explicit_ids is not None else start_index + idx
         payload.append(
             {
-                "id": start_index + idx,
+                "id": item_id,
                 "start": round(start, 3),
                 "end": round(end, 3),
                 "duration_sec": round(max(0.0, end - start), 3),
@@ -858,7 +913,7 @@ def _build_full_segments_summary(segments: list[dict], *, limit_chars: int = 180
 _SYSTEM_PROMPT_FULL = (
     "你是专业的日语成人视频字幕翻译，目标语言是{target_lang}。\n"
     "本片译文要体现主动撩拨的语气，露骨直接；遇到性器官性行为时优先用粗口口语（肉棒、操进来、淫穴、骚逼等），不用阴茎性交插入等书面语。\n"
-    "你会收到全片字幕的完整 JSON 数组，必须基于全局上下文一次性完成翻译。\n"
+    "你会收到当前待翻译字幕 JSON 数组，以及全片上下文；必须基于全局上下文完成当前批次翻译。\n"
     "本视频出场人物全名参考：【{character_reference}】。\n"
     "要求：\n"
     "1. 翻译要自然、口语化、适合字幕阅读，避免书面腔。\n"
@@ -871,7 +926,7 @@ _SYSTEM_PROMPT_FULL = (
     "8. 每条输入必须单独翻译，不能合并、拆分、漏译、调换顺序。\n"
     "9. 输出尽量短，贴近屏幕阅读节奏；短促呻吟和语气词也要简短自然。\n"
     "10. 如果一行里大部分是呻吟、喘息、重复语气词，只保留清晰语义核心，重复部分可以压缩；映射参考：あんっ/はあん 译 啊嗯啊，気持ちいい 译 好舒服要爽死了，イッちゃう/イク 译 要去了要射了，避免感觉很舒服即将达到高潮等翻译腔。\n"
-    "11. DeepSeek JSON Mode 要求 prompt 明确包含 json 字样；最终只输出合法 JSON 对象。\n"
+    "11. 结构化 JSON 输出要求 prompt 明确包含 json 字样；最终只输出合法 JSON 对象。\n"
     '12. 你必须只输出 JSON：{{"translations":[{{"id":0,"text":"..."}}]}}，并且恰好返回 {expected_count} 条。\n'
     "13. 最终 content 不能为空；即使开启思考模式，也必须把完整 JSON 对象写进最终 content。\n"
     "14. 不要输出 Markdown，不要解释，不要额外字段；思考过程不要写进最终 content。\n\n"
@@ -919,7 +974,7 @@ def _build_system_prompt(
     return prompt
 
 
-def _build_oneshot_messages(
+def _build_translation_messages(
     source_payload: str,
     expected_count: int,
     compact_system_prompt: bool = False,
@@ -943,9 +998,9 @@ def _build_oneshot_messages(
     )
 
     user_parts = [
-        "【任务】把下面完整 JSON 数组里的日文字幕逐条翻译成中文字幕。",
+        "【任务】把下面 JSON 数组里的日文字幕逐条翻译成中文字幕。",
         "每个元素的 `id` 必须原样保留，`text` 只能是翻译结果本身。",
-        f"【全片字幕 JSON】\n{source_payload}",
+        f"【待翻译字幕 JSON】\n{source_payload}",
     ]
 
     return [
@@ -964,14 +1019,18 @@ def _build_batch_messages(
     extra_glossary: str = "",
     target_lang: str = "简体中文",
     glossary: str = "",
+    source_payload_override: str | None = None,
 ) -> list[dict]:
     if isinstance(full_segments_summary, str):
         summary = full_segments_summary
     else:
         summary = _build_full_segments_summary(full_segments_summary)
 
-    source_payload = _serialize_segments(batch_segments, start_index=batch_offset)
-    messages = _build_oneshot_messages(
+    source_payload = source_payload_override or _serialize_segments(
+        batch_segments,
+        start_index=batch_offset,
+    )
+    messages = _build_translation_messages(
         source_payload=source_payload,
         expected_count=expected_count,
         compact_system_prompt=COMPACT_SYSTEM_PROMPT and batch_index > 0,
@@ -1101,115 +1160,6 @@ def _create_response(request: dict):
     if last_error is not None:
         raise last_error
     raise RuntimeError("response creation failed without an exception")
-
-
-def _responses_endpoint_url() -> str:
-    base_url = _required_env("OPENAI_COMPATIBILITY_BASE_URL").rstrip("/")
-    if base_url.endswith("/responses"):
-        return base_url
-    return f"{base_url}/responses"
-
-
-def _parse_sse_json_event(event_type: str, data_lines: list[str]) -> dict | None:
-    if not data_lines:
-        return None
-    data = "\n".join(data_lines).strip()
-    if not data or data == "[DONE]":
-        return {"type": "__done__"} if data == "[DONE]" else None
-
-    try:
-        payload = json.loads(data)
-    except json.JSONDecodeError:
-        return None
-    if not isinstance(payload, dict):
-        return None
-    if event_type and not payload.get("type"):
-        payload["type"] = event_type
-    return payload
-
-
-def _iter_sse_json_events(lines):
-    event_type = ""
-    data_lines: list[str] = []
-    for raw_line in lines:
-        line = raw_line.decode("utf-8", errors="replace") if isinstance(raw_line, bytes) else str(raw_line)
-        line = line.rstrip("\r\n")
-        if not line:
-            event = _parse_sse_json_event(event_type, data_lines)
-            if event and event.get("type") == "__done__":
-                return
-            if event:
-                yield event
-            event_type = ""
-            data_lines = []
-            continue
-
-        if line.startswith(":"):
-            continue
-
-        if line.startswith("{") and not data_lines:
-            event = _parse_sse_json_event("", [line])
-            if event:
-                yield event
-            continue
-
-        field, sep, value = line.partition(":")
-        if not sep:
-            continue
-        if value.startswith(" "):
-            value = value[1:]
-        if field == "event":
-            event_type = value
-        elif field == "data":
-            data_lines.append(value)
-
-    event = _parse_sse_json_event(event_type, data_lines)
-    if event and event.get("type") != "__done__":
-        yield event
-
-
-def _create_grok_response_raw(request: dict):
-    def stream_events():
-        last_error: Exception | None = None
-
-        for attempt in range(TRANSLATION_API_RETRIES):
-            emitted = False
-            try:
-                headers = {
-                    "Authorization": f"Bearer {_required_env('API_KEY')}",
-                    "Content-Type": "application/json",
-                }
-                timeout = httpx.Timeout(
-                    connect=20.0,
-                    read=None,
-                    write=60.0,
-                    pool=20.0,
-                )
-                with httpx.Client(timeout=timeout) as client:
-                    with client.stream(
-                        "POST",
-                        _responses_endpoint_url(),
-                        headers=headers,
-                        json=request,
-                    ) as response:
-                        response.raise_for_status()
-                        for event in _iter_sse_json_events(response.iter_lines()):
-                            emitted = True
-                            yield event
-                        return
-            except Exception as exc:
-                last_error = exc
-                if emitted or not _is_retryable_api_error(exc):
-                    raise
-
-                if attempt < TRANSLATION_API_RETRIES - 1:
-                    _request_backoff_sleep(attempt, exc)
-
-        if last_error is not None:
-            raise last_error
-        raise RuntimeError("raw response creation failed without an exception")
-
-    return stream_events()
 
 
 def _emit_progress(
@@ -1524,13 +1474,13 @@ def _chat_completions(
 
     if finish_reason == "length":
         raise RetryableTranslationFormatError(
-            "DeepSeek JSON mode response was cut off by max_tokens; "
+            f"{_JSON_OUTPUT_LABEL} response was cut off by max_tokens; "
             "increase TRANSLATION_MAX_TOKENS."
         )
 
     final_content_str = "".join(stream_state["final_content"])
     if not final_content_str.strip():
-        raise RetryableTranslationFormatError("DeepSeek JSON mode returned empty content.")
+        raise RetryableTranslationFormatError(f"{_JSON_OUTPUT_LABEL} returned empty content.")
     _emit_progress(
         on_progress,
         {
@@ -1557,42 +1507,41 @@ def _chat_responses(
         or os.getenv("LLM_REASONING_EFFORT", "max").strip()
         or "max"
     )
-    grok_compat = _is_grok_model(model_name)
-    request = {
-        "model": model_name,
-        "input": _build_responses_input(messages, string_content=grok_compat),
-        "stream": True,
-        "reasoning": {
-            "effort": _responses_reasoning_effort(effective_reasoning_effort)
-        },
-    }
-    if grok_compat:
-        if _env_flag("GROK_RESPONSES_WEB_SEARCH", True):
-            request["tools"] = [
-                {
-                    "type": "web_search",
-                    "max_results": max(
-                        1,
-                        _env_int("GROK_RESPONSES_WEB_SEARCH_MAX_RESULTS", 20),
-                    ),
-                }
-            ]
-        request["include_reasoning"] = _env_flag(
-            "GROK_RESPONSES_INCLUDE_REASONING",
-            True,
-        )
-        request["max_tokens"] = max(
-            16000,
-            _env_int("GROK_RESPONSES_MAX_TOKENS", 16000),
+    api_format = "responses"
+    use_micu_grok_patch = llm_patch.is_micu_grok_responses_request(
+        model_name=model_name,
+        api_format=api_format,
+    )
+    if use_micu_grok_patch:
+        request = llm_patch.build_micu_grok_responses_request(
+            messages=messages,
+            model_name=model_name,
+            max_tokens=TRANSLATION_MAX_TOKENS,
+            reasoning_effort=effective_reasoning_effort,
         )
     else:
-        request["text"] = {"format": {"type": "json_object"}}
-    if TRANSLATION_MAX_TOKENS > 0 and not grok_compat:
-        request["max_output_tokens"] = TRANSLATION_MAX_TOKENS
+        request = {
+            "model": model_name,
+            "input": _build_responses_input(messages),
+            "stream": True,
+            "reasoning": {
+                "effort": _responses_reasoning_effort(effective_reasoning_effort)
+            },
+            "text": {"format": {"type": "json_object"}},
+        }
+        if TRANSLATION_MAX_TOKENS > 0:
+            request["max_output_tokens"] = TRANSLATION_MAX_TOKENS
 
     response_stream = (
-        _create_grok_response_raw(request)
-        if grok_compat
+        llm_patch.create_micu_grok_response_stream(
+            request,
+            api_key=_required_env("API_KEY"),
+            base_url=_required_env("OPENAI_COMPATIBILITY_BASE_URL"),
+            api_retries=TRANSLATION_API_RETRIES,
+            is_retryable_api_error=_is_retryable_api_error,
+            backoff_sleep=_request_backoff_sleep,
+        )
+        if use_micu_grok_patch
         else _create_response(request)
     )
 
@@ -1703,14 +1652,14 @@ def _parse_translation_output(
     raw_output = _strip_reasoning_artifacts(raw_output)
     if not raw_output.strip():
         raise RetryableTranslationFormatError(
-            "DeepSeek JSON mode returned empty content."
+            f"{_JSON_OUTPUT_LABEL} returned empty content."
         )
 
     try:
         parsed = json.loads(raw_output)
     except json.JSONDecodeError as exc:
         raise RetryableTranslationFormatError(
-            "DeepSeek JSON mode response was not valid JSON."
+            f"{_JSON_OUTPUT_LABEL} response was not valid JSON."
         ) from exc
     return _extract_translations_from_json(parsed, expected_count)
 
@@ -1724,26 +1673,26 @@ def _parse_translation_output_by_global_id(
     raw_output = _strip_reasoning_artifacts(raw_output)
     if not raw_output.strip():
         raise RetryableTranslationFormatError(
-            "DeepSeek JSON mode returned empty content."
+            f"{_JSON_OUTPUT_LABEL} returned empty content."
         )
 
     try:
         parsed = json.loads(raw_output)
     except json.JSONDecodeError as exc:
         raise RetryableTranslationFormatError(
-            "DeepSeek JSON mode response was not valid JSON."
+            f"{_JSON_OUTPUT_LABEL} response was not valid JSON."
         ) from exc
 
     if not isinstance(parsed, dict) or not isinstance(parsed.get("translations"), list):
         raise RetryableTranslationFormatError(
-            'DeepSeek JSON mode response must be {"translations":[...]} .'
+            f'{_JSON_OUTPUT_LABEL} response must be {{"translations":[...]}} .'
         )
 
     expected_id_set = set(expected_ids)
     translations = parsed["translations"]
     if len(translations) != len(expected_ids):
         raise RetryableTranslationFormatError(
-            "DeepSeek JSON mode returned wrong batch translation count: "
+            f"{_JSON_OUTPUT_LABEL} returned wrong batch translation count: "
             f"{len(translations)} of {len(expected_ids)}."
         )
 
@@ -1752,16 +1701,16 @@ def _parse_translation_output_by_global_id(
     for item in translations:
         if not isinstance(item, dict):
             raise RetryableTranslationFormatError(
-                "DeepSeek JSON mode translations must contain objects."
+                f"{_JSON_OUTPUT_LABEL} translations must contain objects."
             )
         idx = _coerce_int(item.get("id"))
         if idx is None or idx not in expected_id_set or idx >= total_count:
             raise RetryableTranslationFormatError(
-                f"DeepSeek JSON mode returned invalid batch translation id: {item.get('id')!r}."
+                f"{_JSON_OUTPUT_LABEL} returned invalid batch translation id: {item.get('id')!r}."
             )
         if idx in seen_ids:
             raise RetryableTranslationFormatError(
-                f"DeepSeek JSON mode returned duplicate translation id: {idx}."
+                f"{_JSON_OUTPUT_LABEL} returned duplicate translation id: {idx}."
             )
         seen_ids.add(idx)
         results[idx] = _normalize_translation_text(item.get("text"))
@@ -1769,16 +1718,62 @@ def _parse_translation_output_by_global_id(
     return results
 
 
+def _parse_partial_translation_output_by_global_id(
+    raw_output: str,
+    *,
+    expected_ids: list[int],
+    total_count: int,
+) -> list[str | None]:
+    raw_output = _strip_reasoning_artifacts(raw_output)
+    if not raw_output.strip():
+        raise RetryableTranslationFormatError(
+            f"{_JSON_OUTPUT_LABEL} returned empty content."
+        )
+
+    try:
+        parsed = json.loads(raw_output)
+    except json.JSONDecodeError as exc:
+        raise RetryableTranslationFormatError(
+            f"{_JSON_OUTPUT_LABEL} response was not valid JSON."
+        ) from exc
+
+    if not isinstance(parsed, dict) or not isinstance(parsed.get("translations"), list):
+        raise RetryableTranslationFormatError(
+            f'{_JSON_OUTPUT_LABEL} response must be {{"translations":[...]}} .'
+        )
+
+    expected_id_set = set(expected_ids)
+    results: list[str | None] = [None] * total_count
+    seen_ids: set[int] = set()
+    for item in parsed["translations"]:
+        if not isinstance(item, dict):
+            continue
+        idx = _coerce_int(item.get("id"))
+        if idx is None or idx not in expected_id_set or idx >= total_count:
+            continue
+        if idx in seen_ids:
+            raise RetryableTranslationFormatError(
+                f"{_JSON_OUTPUT_LABEL} returned duplicate translation id: {idx}."
+            )
+        normalized = _normalize_translation_text(item.get("text"))
+        if normalized is None:
+            continue
+        seen_ids.add(idx)
+        results[idx] = normalized
+
+    return results
+
+
 def _extract_translations_from_json(data, expected_count: int) -> list[str | None]:
     if not isinstance(data, dict) or not isinstance(data.get("translations"), list):
         raise RetryableTranslationFormatError(
-            'DeepSeek JSON mode response must be {"translations":[...]} .'
+            f'{_JSON_OUTPUT_LABEL} response must be {{"translations":[...]}} .'
         )
 
     translations = data["translations"]
     if len(translations) != expected_count:
         raise RetryableTranslationFormatError(
-            "DeepSeek JSON mode returned wrong translation count: "
+            f"{_JSON_OUTPUT_LABEL} returned wrong translation count: "
             f"{len(translations)} of {expected_count}."
         )
 
@@ -1787,17 +1782,17 @@ def _extract_translations_from_json(data, expected_count: int) -> list[str | Non
     for item in translations:
         if not isinstance(item, dict):
             raise RetryableTranslationFormatError(
-                "DeepSeek JSON mode translations must contain objects."
+                f"{_JSON_OUTPUT_LABEL} translations must contain objects."
             )
 
         idx = _coerce_int(item.get("id"))
         if idx is None or idx < 0 or idx >= expected_count:
             raise RetryableTranslationFormatError(
-                f"DeepSeek JSON mode returned invalid translation id: {item.get('id')!r}."
+                f"{_JSON_OUTPUT_LABEL} returned invalid translation id: {item.get('id')!r}."
             )
         if idx in seen_ids:
             raise RetryableTranslationFormatError(
-                f"DeepSeek JSON mode returned duplicate translation id: {idx}."
+                f"{_JSON_OUTPUT_LABEL} returned duplicate translation id: {idx}."
             )
 
         seen_ids.add(idx)

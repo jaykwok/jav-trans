@@ -8,7 +8,7 @@ import subprocess
 import sys
 import warnings
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, fields
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -1132,6 +1132,133 @@ class AsrArtifacts:
     job_id: str
 
 
+_TRANSLATION_ARTIFACTS_SNAPSHOT = "translation_artifacts.json"
+_ASR_ARTIFACT_PATH_FIELDS = {
+    "audio_path",
+    "job_temp_dir",
+    "aligned_segments_path",
+    "transcript_path",
+    "asr_manifest_path",
+    "run_log_path",
+    "output_dir",
+    "srt_path",
+    "bilingual_json_path",
+    "quality_report_path",
+    "timings_path",
+    "translation_cache_path",
+}
+_ASR_NOISE_ONLY_RE = re.compile(r"^[\s\"'`“”‘’「」『』（）()\[\]［］【】〈〉《》<>]+$")
+_ASR_JA_OR_CJK_RE = re.compile(r"[\u3040-\u30ff\u3400-\u9fff]")
+_ASR_LONG_LATIN_RE = re.compile(r"[A-Za-z]{4,}")
+_ASR_ASCII_OR_WESTERN_PUNCT_RE = re.compile(
+    r"^[\s\x00-\x7F“”‘’…]+$"
+)
+
+
+def _is_asr_noise_text(text) -> bool:
+    cleaned = str(text or "").strip().replace("\u200b", "").replace("\ufeff", "")
+    if not cleaned:
+        return True
+    unescaped = cleaned.replace("\\", "").strip()
+    if _ASR_NOISE_ONLY_RE.fullmatch(unescaped):
+        return True
+    if (
+        _ASR_LONG_LATIN_RE.search(unescaped)
+        and not _ASR_JA_OR_CJK_RE.search(unescaped)
+        and _ASR_ASCII_OR_WESTERN_PUNCT_RE.fullmatch(unescaped)
+    ):
+        return True
+    return False
+
+
+def _filter_asr_noise_segments(segments: list[dict]) -> tuple[list[dict], int]:
+    filtered: list[dict] = []
+    for segment in segments:
+        text = segment.get("text", segment.get("ja_text", segment.get("ja", "")))
+        if _is_asr_noise_text(text):
+            continue
+        filtered.append(segment)
+    return filtered, len(segments) - len(filtered)
+
+
+def translation_artifacts_snapshot_path(job_temp_dir: str | Path) -> Path:
+    return Path(job_temp_dir) / _TRANSLATION_ARTIFACTS_SNAPSHOT
+
+
+def _serialize_asr_artifacts(artifacts: AsrArtifacts) -> dict:
+    payload: dict[str, object] = {}
+    for item in fields(AsrArtifacts):
+        name = item.name
+        if name == "logger":
+            continue
+        value = getattr(artifacts, name)
+        if isinstance(value, Path):
+            payload[name] = str(value)
+        else:
+            payload[name] = value
+    return payload
+
+
+def write_translation_artifacts_snapshot(artifacts: AsrArtifacts) -> str:
+    path = translation_artifacts_snapshot_path(artifacts.job_temp_dir)
+    _write_json_atomic(path, _serialize_asr_artifacts(artifacts))
+    return str(path)
+
+
+def _restore_snapshot_path(value) -> str:
+    if value is None:
+        return ""
+    raw = str(value)
+    if not raw:
+        return ""
+    return str(_resolve_project_runtime_path(raw))
+
+
+def load_translation_artifacts_snapshot(path: str | Path) -> AsrArtifacts | None:
+    snapshot_path = Path(path)
+    if snapshot_path.is_dir():
+        snapshot_path = translation_artifacts_snapshot_path(snapshot_path)
+    if not snapshot_path.exists():
+        return None
+    try:
+        payload = json.loads(snapshot_path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    if not isinstance(payload, dict):
+        return None
+
+    values = {item.name: payload.get(item.name) for item in fields(AsrArtifacts)}
+    for name in _ASR_ARTIFACT_PATH_FIELDS:
+        values[name] = _restore_snapshot_path(values.get(name))
+    values["segments"] = list(values.get("segments") or [])
+    values["asr_details"] = dict(values.get("asr_details") or {})
+    values["pipeline_timings"] = dict(values.get("pipeline_timings") or {})
+    values["asr_log"] = [str(item) for item in values.get("asr_log") or []]
+    values["logger"] = None
+    values["run_log_path"] = (
+        Path(values["run_log_path"]) if values.get("run_log_path") else None
+    )
+    values["audio_cached"] = bool(values.get("audio_cached"))
+    values["bilingual"] = bool(values.get("bilingual"))
+    values["f0_filtered_count"] = int(values.get("f0_filtered_count") or 0)
+    values["f0_failed"] = bool(values.get("f0_failed"))
+    values["video_duration_s"] = (
+        float(values["video_duration_s"])
+        if values.get("video_duration_s") is not None
+        else None
+    )
+    values["pipeline_started"] = time.perf_counter()
+    values["audio_cache_key"] = str(values.get("audio_cache_key") or "")
+    values["video_stem"] = str(values.get("video_stem") or snapshot_path.stem)
+    values["device"] = str(values.get("device") or "cpu")
+    values["backend_label"] = str(values.get("backend_label") or "")
+    values["job_id"] = str(values.get("job_id") or "")
+    try:
+        return AsrArtifacts(**values)
+    except Exception:
+        return None
+
+
 def run_asr_alignment_f0(
     video_path: str,
     *,
@@ -1542,7 +1669,7 @@ def run_translation_and_write(
     audio_cached = artifacts.audio_cached
     asr_details = artifacts.asr_details
     asr_log = artifacts.asr_log
-    backend_label = artifacts.backend_label
+    backend_label = artifacts.backend_label or asr_module.get_backend_label()
     device = artifacts.device
     f0_failed = artifacts.f0_failed
     f0_filtered_count = artifacts.f0_filtered_count
@@ -1572,7 +1699,7 @@ def run_translation_and_write(
     _write_json(
         asr_manifest_path,
         {
-            "backend": asr_module.get_backend_label(),
+            "backend": backend_label,
             "audio_path": audio_path,
             "job_id": job_id,
             "job_temp_dir": job_temp_dir,
@@ -1598,7 +1725,7 @@ def run_translation_and_write(
                 "job_id": job_id,
                 "job_temp_dir": job_temp_dir,
                 "device": device,
-                "backend": asr_module.get_backend_label(),
+                "backend": backend_label,
                 "counts": {
                     "transcript_chunks": len(asr_details.get("transcript_chunks", [])),
                     "segments": len(segments),
@@ -1628,6 +1755,28 @@ def run_translation_and_write(
             raise RuntimeError('ASR empty text rate too high; set QC_IGNORE_EMPTY=1 to skip')
         return output_paths
 
+    if segments and not skip_translation:
+        asr_noise_before = len(segments)
+        segments, asr_noise_filtered_count = _filter_asr_noise_segments(segments)
+        if asr_noise_filtered_count:
+            asr_details["asr_noise_filter"] = {
+                "segments_before": asr_noise_before,
+                "segments_after": len(segments),
+                "filtered_count": asr_noise_filtered_count,
+            }
+            _log_stage(
+                logger,
+                "asr_noise_filter "
+                f"segments_before={asr_noise_before} "
+                f"segments_after={len(segments)} "
+                f"filtered_count={asr_noise_filtered_count}",
+            )
+            console.print(
+                f"[yellow]ASR noise filter: removed {asr_noise_filtered_count} empty/noise segments before translation[/yellow]"
+            )
+            artifacts.segments = segments
+            artifacts.asr_details = asr_details
+
     if not segments:
         _log_stage(logger, "stage_skip translation reason=no_segments")
         pipeline_timings["translation_context_s"] = 0.0
@@ -1642,7 +1791,7 @@ def run_translation_and_write(
         _write_json(
             transcript_path,
             {
-                "backend": asr_module.get_backend_label(),
+                "backend": backend_label,
                 "audio_path": audio_path,
                 "chunks": asr_details.get("transcript_chunks", []),
             },
@@ -1693,7 +1842,7 @@ def run_translation_and_write(
                 "job_id": job_id,
                 "job_temp_dir": job_temp_dir,
                 "device": device,
-                "backend": asr_module.get_backend_label(),
+                "backend": backend_label,
                 "counts": {"segments": 0, "blocks": 0},
                 "stage_timings": pipeline_timings,
                 "asr_details": asr_details,
@@ -1738,7 +1887,7 @@ def run_translation_and_write(
         _write_json(
             transcript_path,
             {
-                "backend": asr_module.get_backend_label(),
+                "backend": backend_label,
                 "audio_path": audio_path,
                 "chunks": asr_details.get("transcript_chunks", []),
             },
@@ -1758,7 +1907,7 @@ def run_translation_and_write(
         _write_json(
             bilingual_json_path,
             {
-                "backend": asr_module.get_backend_label(),
+                "backend": backend_label,
                 "timeline_mode": subtitle_module.SUBTITLE_TIMELINE_MODE,
                 "blocks": srt_blocks,
                 "translation_skipped": True,
@@ -1793,7 +1942,7 @@ def run_translation_and_write(
                 "job_id": job_id,
                 "job_temp_dir": job_temp_dir,
                 "device": device,
-                "backend": asr_module.get_backend_label(),
+                "backend": backend_label,
                 "counts": {
                     "transcript_chunks": len(asr_details.get("transcript_chunks", [])),
                     "segments": len(segments),
@@ -1845,7 +1994,7 @@ def run_translation_and_write(
         f"stage_done translation_context elapsed={pipeline_timings['translation_context_s']:.2f}s chars={len(global_context)}",
     )
 
-    # 5. One-shot full-context translate
+    # 5. Batch-concurrent translation with full-film context
     translation_started = time.perf_counter()
     _log_stage(logger, f"stage_start translation segments={len(segments)}")
     _raise_if_cancelled(cancel_event)
@@ -1966,7 +2115,7 @@ def run_translation_and_write(
     _write_json(
         transcript_path,
         {
-            "backend": asr_module.get_backend_label(),
+            "backend": backend_label,
             "audio_path": audio_path,
             "chunks": asr_details.get("transcript_chunks", []),
         },
@@ -1987,7 +2136,7 @@ def run_translation_and_write(
     _write_json(
         bilingual_json_path,
         {
-            "backend": asr_module.get_backend_label(),
+            "backend": backend_label,
             "timeline_mode": subtitle_module.SUBTITLE_TIMELINE_MODE,
             "blocks": srt_blocks,
             "f0_filtered_count": f0_filtered_count,
@@ -2025,7 +2174,7 @@ def run_translation_and_write(
             "job_id": job_id,
             "job_temp_dir": job_temp_dir,
             "device": device,
-            "backend": asr_module.get_backend_label(),
+            "backend": backend_label,
             "counts": {
                 "transcript_chunks": len(asr_details.get("transcript_chunks", [])),
                 "segments": len(segments),
