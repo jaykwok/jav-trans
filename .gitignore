@@ -39,10 +39,8 @@ dist/
 *.tar
 *.tar.*
 
-# Windows/editor noise
-Thumbs.db
-Desktop.ini
-*.lnk
+# source iconpng
+icon.png
 
 # Agent coordination docs are local to this workspace.
 AGENTS.md
