@@ -193,8 +193,8 @@ DEFAULT_SETTINGS: dict[str, str] = {
     "LLM_MODEL_NAME": "deepseek-v4-pro",
     # OpenAI-compatible API surface for translation requests. Valid values: chat, responses.
     "LLM_API_FORMAT": "chat",
-    # Reasoning effort parameter for models that support it.
-    "LLM_REASONING_EFFORT": "max",
+    # Reasoning effort parameter for models that support it. Valid values: medium, xhigh.
+    "LLM_REASONING_EFFORT": "xhigh",
     # Final subtitle language.
     "TARGET_LANG": "简体中文",
     # Max retry count for transient translation API failures.

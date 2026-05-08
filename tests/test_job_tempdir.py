@@ -2,6 +2,7 @@ import json
 from pathlib import Path
 
 import main
+from pipeline import audio as pipeline_audio
 from helpers import make_job_context, run_pipeline
 
 
@@ -39,7 +40,7 @@ def test_job_tempdir_groups_temp_outputs_and_keeps_srt_at_output_root(monkeypatc
             {"transcript_chunks": [], "stage_timings": {}},
         )
 
-    monkeypatch.setattr(main, "extract_audio", fake_extract_audio)
+    monkeypatch.setattr(pipeline_audio, "extract_audio", fake_extract_audio)
     monkeypatch.setattr(main.asr_module, "transcribe_and_align", fake_transcribe_and_align)
     monkeypatch.setattr(
         main.translator_module,
@@ -108,7 +109,7 @@ def test_run_log_is_written_only_when_enabled(monkeypatch, tmp_path):
             {"transcript_chunks": [], "stage_timings": {}},
         )
 
-    monkeypatch.setattr(main, "extract_audio", fake_extract_audio)
+    monkeypatch.setattr(pipeline_audio, "extract_audio", fake_extract_audio)
     monkeypatch.setattr(main.asr_module, "transcribe_and_align", fake_transcribe_and_align)
     monkeypatch.setattr(
         main.translator_module,
@@ -118,7 +119,22 @@ def test_run_log_is_written_only_when_enabled(monkeypatch, tmp_path):
         ),
     )
 
-    run_pipeline(video_path, ctx)
+    artifacts = main.run_asr_alignment_f0(
+        str(video_path),
+        ctx=ctx,
+        job_id=ctx.job_id,
+    )
+    logger = artifacts.logger
+    assert logger is not None
+    main.run_translation_and_write(
+        str(video_path),
+        artifacts,
+        ctx=ctx,
+        job_id=ctx.job_id,
+    )
+    assert artifacts.logger is None
+    assert not logger.handlers
+    assert getattr(main.events._thread_local, "run_logger", None) is not logger
 
     timings = json.loads(
         (temp_root / "sample" / "sample.timings.json").read_text(encoding="utf-8")
@@ -161,7 +177,7 @@ def test_successful_run_cleans_job_temp_by_default(monkeypatch, tmp_path):
             {"transcript_chunks": [], "stage_timings": {}},
         )
 
-    monkeypatch.setattr(main, "extract_audio", fake_extract_audio)
+    monkeypatch.setattr(pipeline_audio, "extract_audio", fake_extract_audio)
     monkeypatch.setattr(main.asr_module, "transcribe_and_align", fake_transcribe_and_align)
 
     run_pipeline(video_path, ctx)
@@ -206,7 +222,7 @@ def test_advanced_asr_stage_env_is_task_scoped(monkeypatch, tmp_path):
             {"transcript_chunks": [], "stage_timings": {}},
         )
 
-    monkeypatch.setattr(main, "extract_audio", fake_extract_audio)
+    monkeypatch.setattr(pipeline_audio, "extract_audio", fake_extract_audio)
     monkeypatch.setattr(main.asr_module, "transcribe_and_align", fake_transcribe_and_align)
 
     run_pipeline(video_path, ctx)

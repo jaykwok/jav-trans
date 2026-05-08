@@ -17,7 +17,11 @@ router = APIRouter()
 BACKENDS = list(get_args(JobSpec.model_fields["asr_backend"].annotation))
 RECOMMENDED_ASR_BACKEND = "whisper-ja-anime-v0.3"
 SUBTITLE_MODES = list(get_args(JobSpec.model_fields["subtitle_mode"].annotation))
-DEFAULT_JOB_SPEC = JobSpec(video_paths=[])
+DEFAULT_JOB_DEFAULTS = {
+    name: field.default
+    for name, field in JobSpec.model_fields.items()
+    if not field.is_required()
+}
 
 
 def _setting(key: str) -> str:
@@ -102,6 +106,11 @@ def _sync_hf_endpoint(value: str) -> str:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
 
 
+def _normalize_llm_reasoning_effort(value: str) -> str:
+    normalized = (value or "xhigh").strip().lower()
+    return normalized if normalized in {"medium", "xhigh"} else "xhigh"
+
+
 @router.get("/config")
 async def get_config() -> dict[str, Any]:
     load_config()
@@ -109,15 +118,15 @@ async def get_config() -> dict[str, Any]:
         "backends": _ordered_backends(BACKENDS),
         "subtitle_modes": SUBTITLE_MODES,
         "defaults": {
-            "asr_backend": DEFAULT_JOB_SPEC.asr_backend,
-            "subtitle_mode": DEFAULT_JOB_SPEC.subtitle_mode,
-            "skip_translation": DEFAULT_JOB_SPEC.skip_translation,
-            "show_gender": DEFAULT_JOB_SPEC.show_gender,
-            "multi_cue_split": DEFAULT_JOB_SPEC.multi_cue_split,
-            "asr_recovery": DEFAULT_JOB_SPEC.asr_recovery,
-            "vad_threshold": DEFAULT_JOB_SPEC.vad_threshold,
-            "translation_batch_size": DEFAULT_JOB_SPEC.translation_batch_size,
-            "translation_max_workers": DEFAULT_JOB_SPEC.translation_max_workers,
+            "asr_backend": DEFAULT_JOB_DEFAULTS["asr_backend"],
+            "subtitle_mode": DEFAULT_JOB_DEFAULTS["subtitle_mode"],
+            "skip_translation": DEFAULT_JOB_DEFAULTS["skip_translation"],
+            "show_gender": DEFAULT_JOB_DEFAULTS["show_gender"],
+            "multi_cue_split": DEFAULT_JOB_DEFAULTS["multi_cue_split"],
+            "asr_recovery": DEFAULT_JOB_DEFAULTS["asr_recovery"],
+            "vad_threshold": DEFAULT_JOB_DEFAULTS["vad_threshold"],
+            "translation_batch_size": DEFAULT_JOB_DEFAULTS["translation_batch_size"],
+            "translation_max_workers": DEFAULT_JOB_DEFAULTS["translation_max_workers"],
         },
     }
 
@@ -130,7 +139,9 @@ async def get_settings() -> SettingsRead:
     hf_endpoint = _runtime_or_env_value("HF_ENDPOINT")
     translation_glossary = _runtime_or_env_or_setting("TRANSLATION_GLOSSARY")
     llm_api_format = _runtime_or_env_or_setting("LLM_API_FORMAT", "chat")
-    llm_reasoning_effort = _runtime_or_env_or_setting("LLM_REASONING_EFFORT", "max")
+    llm_reasoning_effort = _normalize_llm_reasoning_effort(
+        _runtime_or_env_or_setting("LLM_REASONING_EFFORT", "xhigh")
+    )
     target_lang = _runtime_or_env_or_setting("TARGET_LANG", "简体中文")
     return SettingsRead(
         api_key_set=bool(api_key),
@@ -166,10 +177,10 @@ async def post_settings(update: SettingsUpdate) -> dict:
         changes["LLM_API_FORMAT"] = update.llm_api_format
         os.environ["LLM_API_FORMAT"] = update.llm_api_format
     if update.llm_reasoning_effort is not None:
-        if update.llm_reasoning_effort not in {"low", "medium", "max"}:
+        if update.llm_reasoning_effort not in {"medium", "xhigh"}:
             raise HTTPException(
                 status_code=422,
-                detail="llm_reasoning_effort must be one of: low, medium, max",
+                detail="llm_reasoning_effort must be one of: medium, xhigh",
             )
         changes["LLM_REASONING_EFFORT"] = update.llm_reasoning_effort
         os.environ["LLM_REASONING_EFFORT"] = update.llm_reasoning_effort

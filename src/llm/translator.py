@@ -35,6 +35,10 @@ class RetryableTranslationFormatError(RuntimeError):
     pass
 
 
+def _warn_translation_cache(message: str) -> None:
+    print(f"[WARN] translation cache {message}", flush=True)
+
+
 def _required_env(name: str) -> str:
     value = os.getenv(name, "").strip()
     if not value:
@@ -48,7 +52,7 @@ OPENAI_COMPATIBILITY_BASE_URL = (
 API_KEY = os.getenv("API_KEY", "").strip() or None
 LLM_MODEL_NAME = os.getenv("LLM_MODEL_NAME", "").strip()
 LLM_API_FORMAT = os.getenv("LLM_API_FORMAT", "chat").strip().lower() or "chat"
-LLM_REASONING_EFFORT = os.getenv("LLM_REASONING_EFFORT", "max").strip() or "max"
+LLM_REASONING_EFFORT = os.getenv("LLM_REASONING_EFFORT", "xhigh").strip() or "xhigh"
 CHARACTER_FULL_NAME_REFERENCE = (
     os.getenv("ASR_CONTEXT", "").strip()
 )
@@ -74,13 +78,6 @@ TRANSLATION_API_BACKOFF_MAX_S = max(
     float(os.getenv("TRANSLATION_API_BACKOFF_MAX_S", "20")),
 )
 
-_RESPONSES_REASONING_EFFORT_MAP = {
-    "low": "low",
-    "medium": "medium",
-    "max": "high",
-}
-
-
 def _normalize_llm_api_format(value: str | None, fallback: str = "chat") -> str:
     normalized = (value or fallback or "chat").strip().lower()
     return normalized if normalized in {"chat", "responses"} else "chat"
@@ -93,8 +90,11 @@ def _llm_api_format(api_format: str | None = None) -> str:
     return _normalize_llm_api_format(value)
 
 
-def _responses_reasoning_effort(value: str) -> str:
-    return _RESPONSES_REASONING_EFFORT_MAP.get(value, value)
+def _normalize_reasoning_effort(value: str | None, fallback: str = "xhigh") -> str:
+    normalized = (value or fallback or "xhigh").strip().lower()
+    if normalized in {"medium", "xhigh"}:
+        return normalized
+    return fallback if fallback in {"medium", "xhigh"} else "xhigh"
 
 
 def _get_client() -> OpenAI:
@@ -131,7 +131,8 @@ def _load_translation_cache(path) -> dict:
                     legacy_path.unlink()
             return data
         return {}
-    except Exception:
+    except Exception as exc:
+        _warn_translation_cache(f"load failed for {path}: {exc}")
         return {}
 
 
@@ -148,7 +149,8 @@ def _read_translation_cache_json(path: Path) -> dict:
         with path.open("r", encoding="utf-8") as reader:
             data = json.load(reader)
         return data if isinstance(data, dict) else {}
-    except Exception:
+    except Exception as exc:
+        _warn_translation_cache(f"JSON load failed for {path}: {exc}")
         return {}
 
 
@@ -170,7 +172,8 @@ def _read_translation_cache_jsonl(path: Path) -> dict:
                 if isinstance(key, str) and isinstance(value, list):
                     cache[key] = value
         return cache
-    except Exception:
+    except Exception as exc:
+        _warn_translation_cache(f"JSONL load failed for {path}: {exc}")
         return {}
 
 
@@ -330,7 +333,7 @@ def extract_global_glossary(
             },
             {"role": "user", "content": f"【全片日文字幕】\n{source_text}"},
         ]
-        chat_kwargs = {"expected_count": 0, "reasoning_effort": "low"}
+        chat_kwargs = {"expected_count": 0, "reasoning_effort": "medium"}
         if api_format is not None:
             chat_kwargs["api_format"] = api_format
         raw_output = _chat(messages, **chat_kwargs)
@@ -1422,9 +1425,9 @@ def _chat_completions(
         "messages": messages,
         "stream": True,
         "response_format": {"type": "json_object"},
-        "reasoning_effort": reasoning_effort
-        or os.getenv("LLM_REASONING_EFFORT", "max").strip()
-        or "max",
+        "reasoning_effort": _normalize_reasoning_effort(
+            reasoning_effort or os.getenv("LLM_REASONING_EFFORT", LLM_REASONING_EFFORT)
+        ),
         "extra_body": {"thinking": {"type": "enabled"}},
     }
     if TRANSLATION_MAX_TOKENS > 0:
@@ -1503,9 +1506,10 @@ def _chat_responses(
         raise RuntimeError("请先在「翻译设置」中获取并选择翻译模型，再提交任务")
 
     effective_reasoning_effort = (
-        reasoning_effort
-        or os.getenv("LLM_REASONING_EFFORT", "max").strip()
-        or "max"
+        _normalize_reasoning_effort(
+            reasoning_effort
+            or os.getenv("LLM_REASONING_EFFORT", LLM_REASONING_EFFORT)
+        )
     )
     api_format = "responses"
     use_micu_grok_patch = llm_patch.is_micu_grok_responses_request(
@@ -1525,7 +1529,7 @@ def _chat_responses(
             "input": _build_responses_input(messages),
             "stream": True,
             "reasoning": {
-                "effort": _responses_reasoning_effort(effective_reasoning_effort)
+                "effort": effective_reasoning_effort
             },
             "text": {"format": {"type": "json_object"}},
         }

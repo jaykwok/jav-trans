@@ -9,6 +9,7 @@ from rich.console import Console
 
 from core import events
 import main
+from pipeline import audio as pipeline_audio
 from helpers import make_job_context, run_pipeline
 
 
@@ -49,7 +50,7 @@ def _mock_minimal_pipeline(monkeypatch, segments: list[dict]) -> None:
             },
         )
 
-    monkeypatch.setattr(main, "extract_audio", fake_extract_audio)
+    monkeypatch.setattr(pipeline_audio, "extract_audio", fake_extract_audio)
     monkeypatch.setattr(main.asr_module, "transcribe_and_align", fake_transcribe_and_align)
     monkeypatch.setattr(
         main.translator_module,

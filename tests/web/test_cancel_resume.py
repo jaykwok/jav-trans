@@ -16,6 +16,7 @@ if str(_SRC_WEB) not in _web_package.__path__:
 
 from web import pipeline_manager as pm
 from web.models import JobSpec, JobState
+from pipeline.artifacts import AsrArtifacts, write_translation_artifacts_snapshot
 
 
 async def _drain_queue(queue: asyncio.Queue) -> None:
@@ -108,7 +109,7 @@ def test_resume_cache_job_id_requires_valid_aligned_cache(tmp_path, monkeypatch)
         ),
         encoding="utf-8",
     )
-    monkeypatch.setattr(pm.pipeline_main, "_get_audio_cache_key", lambda _path: "cache-key")
+    monkeypatch.setattr(pm, "get_audio_cache_key", lambda _path: "cache-key")
 
     job = JobState(
         id=new_job_id,
@@ -164,7 +165,7 @@ def test_retry_cancelled_job_requeues_same_job_id(tmp_path, monkeypatch):
 
 
 def _sample_asr_artifacts(job: JobState, temp_dir: Path, output_dir: Path):
-    return pm.pipeline_main.AsrArtifacts(
+    return AsrArtifacts(
         segments=[{"start": 0.0, "end": 1.0, "text": "こんにちは"}],
         audio_path=str(temp_dir / "audio" / "sample.wav"),
         job_temp_dir=str(temp_dir),
@@ -259,7 +260,7 @@ async def _test_retry_translation_failed_job_requeues_translation_only(tmp_path,
     output_dir = tmp_path / "out"
     temp_dir.mkdir(parents=True)
     output_dir.mkdir()
-    pm.pipeline_main.write_translation_artifacts_snapshot(
+    write_translation_artifacts_snapshot(
         _sample_asr_artifacts(job, temp_dir, output_dir)
     )
     async with pm._state_lock:
@@ -356,6 +357,10 @@ def test_cancel_active_job_keeps_job_temp_dir_for_retry(tmp_path, monkeypatch):
     asyncio.run(_test_cancel_active_job_keeps_job_temp_dir_for_retry(tmp_path, monkeypatch))
 
 
+def test_remove_finished_jobs_deletes_temp_dirs_outside_state_lock(tmp_path, monkeypatch):
+    asyncio.run(_test_remove_finished_jobs_deletes_temp_dirs_outside_state_lock(tmp_path, monkeypatch))
+
+
 async def _test_cancel_active_job_keeps_job_temp_dir_for_retry(tmp_path, monkeypatch):
     monkeypatch.setattr(pm, "_jobs_path", tmp_path / "jobs.json")
     monkeypatch.setattr(pm, "_job_temp_dir", lambda job_id: str(tmp_path / "jobs" / job_id))
@@ -381,4 +386,33 @@ async def _test_cancel_active_job_keeps_job_temp_dir_for_retry(tmp_path, monkeyp
     current = await pm.get_job(job.id)
     assert current is not None
     assert current.status == "cancelled"
+    await _reset_pm_state()
+
+
+async def _test_remove_finished_jobs_deletes_temp_dirs_outside_state_lock(tmp_path, monkeypatch):
+    monkeypatch.setattr(pm, "_jobs_path", tmp_path / "jobs.json")
+    await _reset_pm_state()
+    removed: list[str] = []
+
+    def fake_remove_job_temp_dir(job_id: str) -> None:
+        assert not pm._state_lock.locked()
+        removed.append(job_id)
+
+    monkeypatch.setattr(pm, "_remove_job_temp_dir", fake_remove_job_temp_dir)
+
+    job = JobState(
+        id="done-outside-lock",
+        spec=JobSpec(video_paths=["sample.mp4"]),
+        created_at="2026-05-04T00:00:00.000+00:00",
+        status="done",
+        current_stage="done",
+    )
+    async with pm._state_lock:
+        pm._jobs[job.id] = job
+        pm._cancel_events[job.id] = threading.Event()
+        pm._write_jobs_unlocked()
+
+    assert await pm.remove_finished_jobs() == 1
+    assert removed == [job.id]
+    assert await pm.get_job(job.id) is None
     await _reset_pm_state()
