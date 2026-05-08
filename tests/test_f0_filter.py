@@ -49,6 +49,34 @@ def test_f0_filter_skips_when_f0_detection_failed(monkeypatch):
     assert count == 0
 
 
+def test_asr_noise_filter_removes_empty_quote_only_and_latin_hallucinations():
+    segments = [
+        _seg("", None),
+        _seg('""', None),
+        _seg('\\"\\"', None),
+        _seg("「」", None),
+        _seg("..Alright", None),
+        _seg("Andthen?", None),
+        _seg('"Iwantyou"', None),
+        _seg("ja-0", None),
+        _seg("「はい」", "F"),
+        _seg("あっ", "F"),
+        _seg("もう1回", "F"),
+        _seg("ラブ", "F"),
+    ]
+
+    filtered, count = main._filter_asr_noise_segments(segments)
+
+    assert count == 7
+    assert [segment["text"] for segment in filtered] == [
+        "ja-0",
+        "「はい」",
+        "あっ",
+        "もう1回",
+        "ラブ",
+    ]
+
+
 def test_f0_gender_turn_split_aggressive_m_to_f():
     segment = {
         "start": 0.0,

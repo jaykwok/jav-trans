@@ -123,8 +123,77 @@ def test_resume_cache_job_id_requires_valid_aligned_cache(tmp_path, monkeypatch)
     assert pm._resume_cache_job_id(job) == new_job_id
 
 
+def test_load_jobs_marks_active_failed_but_keeps_stage(tmp_path, monkeypatch):
+    asyncio.run(_test_load_jobs_marks_active_failed_but_keeps_stage(tmp_path, monkeypatch))
+
+
+async def _test_load_jobs_marks_active_failed_but_keeps_stage(tmp_path, monkeypatch):
+    jobs_path = tmp_path / "jobs.json"
+    monkeypatch.setattr(pm, "_jobs_path", jobs_path)
+    await _reset_pm_state()
+    jobs_path.parent.mkdir(parents=True, exist_ok=True)
+    jobs_path.write_text(
+        json.dumps(
+            [
+                JobState(
+                    id="interrupted",
+                    spec=JobSpec(video_paths=["sample.mp4"]),
+                    created_at="2026-05-04T00:00:00.000+00:00",
+                    status="translating",
+                    current_stage="translation",
+                    progress={"stage": "translation"},
+                ).model_dump()
+            ],
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
+    await pm.load_jobs()
+
+    current = await pm.get_job("interrupted")
+    assert current is not None
+    assert current.status == "failed"
+    assert current.current_stage == "translation"
+    assert "上次运行被中断" in (current.error or "")
+    await _reset_pm_state()
+
+
 def test_retry_cancelled_job_requeues_same_job_id(tmp_path, monkeypatch):
     asyncio.run(_test_retry_cancelled_job_requeues_same_job_id(tmp_path, monkeypatch))
+
+
+def _sample_asr_artifacts(job: JobState, temp_dir: Path, output_dir: Path):
+    return pm.pipeline_main.AsrArtifacts(
+        segments=[{"start": 0.0, "end": 1.0, "text": "こんにちは"}],
+        audio_path=str(temp_dir / "audio" / "sample.wav"),
+        job_temp_dir=str(temp_dir),
+        asr_details={"transcript_chunks": []},
+        aligned_segments_path=str(temp_dir / "sample.aligned_segments.json"),
+        transcript_path=str(temp_dir / "sample.transcript.json"),
+        asr_manifest_path=str(temp_dir / "sample.asr_manifest.json"),
+        pipeline_timings={"asr_alignment_total_s": 0.0},
+        logger=None,
+        run_log_path=None,
+        audio_cache_key="cache-key",
+        video_stem="sample",
+        output_dir=str(output_dir),
+        srt_path=str(output_dir / "sample.srt"),
+        bilingual_json_path=str(temp_dir / "sample.bilingual.json"),
+        quality_report_path="",
+        bilingual=False,
+        timings_path=str(temp_dir / "sample.timings.json"),
+        translation_cache_path=str(temp_dir / "translation_cache.jsonl"),
+        asr_log=["mock asr"],
+        audio_cached=True,
+        device="cpu",
+        backend_label=job.spec.asr_backend,
+        video_duration_s=None,
+        pipeline_started=0.0,
+        f0_filtered_count=0,
+        f0_failed=False,
+        job_id=job.id,
+    )
 
 
 async def _test_retry_cancelled_job_requeues_same_job_id(tmp_path, monkeypatch):
@@ -165,6 +234,54 @@ async def _test_retry_cancelled_job_requeues_same_job_id(tmp_path, monkeypatch):
         assert queued is retried
     finally:
         pm.gpu_queue.task_done()
+        await _reset_pm_state()
+
+
+def test_retry_translation_failed_job_requeues_translation_only(tmp_path, monkeypatch):
+    asyncio.run(_test_retry_translation_failed_job_requeues_translation_only(tmp_path, monkeypatch))
+
+
+async def _test_retry_translation_failed_job_requeues_translation_only(tmp_path, monkeypatch):
+    monkeypatch.setattr(pm, "_jobs_path", tmp_path / "jobs.json")
+    monkeypatch.setattr(pm, "_job_temp_dir", lambda job_id: str(tmp_path / "jobs" / job_id))
+    await _reset_pm_state()
+
+    job = JobState(
+        id="retry-translation",
+        spec=JobSpec(video_paths=["sample.mp4"]),
+        created_at="2026-05-04T00:00:00.000+00:00",
+        status="failed",
+        current_stage="translation",
+        progress={"stage": "translation"},
+        error="Batch translation returned invalid or incomplete JSON",
+    )
+    temp_dir = Path(pm._job_temp_dir(job.id))
+    output_dir = tmp_path / "out"
+    temp_dir.mkdir(parents=True)
+    output_dir.mkdir()
+    pm.pipeline_main.write_translation_artifacts_snapshot(
+        _sample_asr_artifacts(job, temp_dir, output_dir)
+    )
+    async with pm._state_lock:
+        pm._jobs[job.id] = job
+        pm._cancel_events[job.id] = threading.Event()
+        pm._write_jobs_unlocked()
+
+    retried = await pm.retry_job(job.id)
+
+    assert retried is not None
+    assert retried.id == job.id
+    assert retried.status == "queued"
+    with pytest.raises(asyncio.QueueEmpty):
+        pm.gpu_queue.get_nowait()
+
+    queued_job, queued_artifacts = pm.trans_queue.get_nowait()
+    try:
+        assert queued_job is retried
+        assert queued_artifacts.segments[0]["text"] == "こんにちは"
+        assert queued_artifacts.translation_cache_path.endswith("translation_cache.jsonl")
+    finally:
+        pm.trans_queue.task_done()
         await _reset_pm_state()
 
 

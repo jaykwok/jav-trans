@@ -31,7 +31,7 @@ def test_split_into_batches():
     assert len(translator._split_into_batches(_segments(450), 200)) == 3
 
 
-def test_translate_segments_one_shot_when_below_threshold(monkeypatch):
+def test_translate_segments_single_request_when_below_threshold(monkeypatch):
     calls: list[int] = []
 
     def fake_chat(messages, expected_count=0, on_progress=None):
@@ -54,7 +54,7 @@ def test_translate_segments_one_shot_when_below_threshold(monkeypatch):
     assert len(zh_texts) == 100
     assert zh_texts[0] == "zh-0"
     assert zh_texts[-1] == "zh-99"
-    assert timings[0]["mode"] == "oneshot_full_context"
+    assert timings[0]["mode"] == "single_request_full_context"
 
 
 def test_translate_segments_uses_task_character_reference(monkeypatch):
@@ -143,7 +143,7 @@ def test_translate_segments_uses_task_api_format(monkeypatch):
     assert calls == ["responses"]
     assert retry_events == []
     assert zh_texts == ["zh-0"]
-    assert timings[0]["mode"] == "oneshot_full_context"
+    assert timings[0]["mode"] == "single_request_full_context"
 
 
 def test_aggregated_progress_callback(monkeypatch):
@@ -204,4 +204,108 @@ def test_batch_retry_isolation(monkeypatch):
     assert retry_events == []
     assert zh_texts[200] == "zh-200"
     assert zh_texts[-1] == "zh-449"
+
+
+def test_batch_retry_only_requests_missing_ids(monkeypatch):
+    calls: list[tuple[list[int], int]] = []
+
+    def ids_from_messages(messages) -> list[int]:
+        content = messages[1]["content"]
+        return [
+            int(part.split('"id": ')[1].split(",", 1)[0])
+            for part in content.splitlines()
+            if '"id": ' in part
+        ]
+
+    def fake_chat(messages, expected_count=0, on_progress=None, **_kwargs):
+        ids = ids_from_messages(messages)
+        calls.append((ids, expected_count))
+        if ids == [0, 1, 2, 3, 4]:
+            returned_ids = [0, 1, 3]
+        else:
+            returned_ids = ids
+        import json
+
+        return json.dumps(
+            {
+                "translations": [
+                    {"id": idx, "text": f"zh-{idx}"}
+                    for idx in returned_ids
+                ]
+            },
+            ensure_ascii=False,
+        )
+
+    monkeypatch.setattr(translator, "TRANSLATION_API_RETRIES", 2)
+    monkeypatch.setattr(translator, "_request_backoff_sleep", lambda attempt, exc: None)
+    monkeypatch.setattr(translator, "_chat_with_reasoning", fake_chat)
+
+    zh_texts, timings, retry_events = translator.translate_segments(
+        _segments(6),
+        batch_size=5,
+        max_workers=1,
+        cache_path="",
+        target_lang="简体中文",
+        glossary="",
+    )
+
+    assert retry_events == []
+    assert zh_texts == [f"zh-{idx}" for idx in range(6)]
+    assert calls == [
+        ([0, 1, 2, 3, 4], 5),
+        ([2, 4], 2),
+        ([5], 1),
+    ]
+    assert timings[0]["request_count"] == 2
+
+
+def test_batch_retry_gets_fresh_budget_after_missing_set_shrinks(monkeypatch):
+    calls: list[list[int]] = []
+
+    def ids_from_messages(messages) -> list[int]:
+        content = messages[1]["content"]
+        return [
+            int(part.split('"id": ')[1].split(",", 1)[0])
+            for part in content.splitlines()
+            if '"id": ' in part
+        ]
+
+    def fake_chat(messages, expected_count=0, on_progress=None, **_kwargs):
+        ids = ids_from_messages(messages)
+        calls.append(ids)
+        returned_ids = ids[:-1] if len(ids) > 1 else ids
+        import json
+
+        return json.dumps(
+            {
+                "translations": [
+                    {"id": idx, "text": f"zh-{idx}"}
+                    for idx in returned_ids
+                ]
+            },
+            ensure_ascii=False,
+        )
+
+    monkeypatch.setattr(translator, "TRANSLATION_API_RETRIES", 2)
+    monkeypatch.setattr(translator, "TRANSLATION_BATCH_REPAIR_RETRIES", 2)
+    monkeypatch.setattr(translator, "_request_backoff_sleep", lambda attempt, exc: None)
+    monkeypatch.setattr(translator, "_chat_with_reasoning", fake_chat)
+
+    zh_texts, timings, retry_events = translator.translate_segments(
+        _segments(5),
+        batch_size=4,
+        max_workers=1,
+        cache_path="",
+        target_lang="简体中文",
+        glossary="",
+    )
+
+    assert retry_events == []
+    assert zh_texts == [f"zh-{idx}" for idx in range(5)]
+    assert calls == [
+        [0, 1, 2, 3],
+        [3],
+        [4],
+    ]
+    assert timings[0]["request_count"] == 2
 

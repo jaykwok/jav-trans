@@ -25,8 +25,8 @@ const logScroll     = $('log-scroll');
 const connDot       = $('conn-dot');
 const btnClearDone  = $('btn-clear-done');
 
-// ── Form memory v2 ────────────────────────────────────────────────────────────
-const FORM_MEMORY_KEY = 'javtrans.formMemory.v2';
+// ── Form memory v3 ────────────────────────────────────────────────────────────
+const FORM_MEMORY_KEY = 'javtrans.formMemory.v3';
 const FORM_MEMORY_EXCLUDED = new Set(['api-key']);
 const FORM_MEMORY_SELECTOR = 'input[id], select[id], textarea[id]';
 const PASTEABLE_INPUT_TYPES = new Set(['', 'text', 'search', 'url', 'tel', 'email', 'password', 'number']);
@@ -102,8 +102,8 @@ const TUNING_FIELDS = {
   't-show-gender':             true,
   't-asr-recovery':            false,
   't-vad-threshold':           '0.35',
-  't-translation-batch-size':  '100',
-  't-translation-max-workers': '8',
+  't-translation-batch-size':  '200',
+  't-translation-max-workers': '4',
   't-quality-report':          false,
   't-keep-temp':               false,
 };
@@ -393,8 +393,8 @@ btnSubmit.addEventListener('click', async () => {
     asr_recovery:             $('t-asr-recovery').checked,
     keep_quality_report:      $('t-quality-report').checked,
     vad_threshold:            parseFloat($('t-vad-threshold').value) || 0.35,
-    translation_batch_size:   parseInt($('t-translation-batch-size').value) || 100,
-    translation_max_workers:  parseInt($('t-translation-max-workers').value) || 8,
+    translation_batch_size:   parseInt($('t-translation-batch-size').value) || 200,
+    translation_max_workers:  parseInt($('t-translation-max-workers').value) || 4,
     ...readTranslationSettingsFromForm(),
     keep_temp_files:          $('t-keep-temp').checked,
   };

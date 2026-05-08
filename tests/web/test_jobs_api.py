@@ -102,6 +102,8 @@ async def _test_config_lists_recommended_asr_backend_first(monkeypatch):
     payload = response.json()
     assert payload["backends"][0] == config_routes.RECOMMENDED_ASR_BACKEND
     assert payload["defaults"]["asr_backend"] == config_routes.RECOMMENDED_ASR_BACKEND
+    assert payload["defaults"]["translation_batch_size"] == 200
+    assert payload["defaults"]["translation_max_workers"] == 4
     assert set(payload["backends"]) == set(config_routes.BACKENDS)
 
 
