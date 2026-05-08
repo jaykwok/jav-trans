@@ -9,6 +9,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Callable
 
+import httpx
 from openai import OpenAI
 
 from core.config import load_config
@@ -1102,6 +1103,115 @@ def _create_response(request: dict):
     raise RuntimeError("response creation failed without an exception")
 
 
+def _responses_endpoint_url() -> str:
+    base_url = _required_env("OPENAI_COMPATIBILITY_BASE_URL").rstrip("/")
+    if base_url.endswith("/responses"):
+        return base_url
+    return f"{base_url}/responses"
+
+
+def _parse_sse_json_event(event_type: str, data_lines: list[str]) -> dict | None:
+    if not data_lines:
+        return None
+    data = "\n".join(data_lines).strip()
+    if not data or data == "[DONE]":
+        return {"type": "__done__"} if data == "[DONE]" else None
+
+    try:
+        payload = json.loads(data)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(payload, dict):
+        return None
+    if event_type and not payload.get("type"):
+        payload["type"] = event_type
+    return payload
+
+
+def _iter_sse_json_events(lines):
+    event_type = ""
+    data_lines: list[str] = []
+    for raw_line in lines:
+        line = raw_line.decode("utf-8", errors="replace") if isinstance(raw_line, bytes) else str(raw_line)
+        line = line.rstrip("\r\n")
+        if not line:
+            event = _parse_sse_json_event(event_type, data_lines)
+            if event and event.get("type") == "__done__":
+                return
+            if event:
+                yield event
+            event_type = ""
+            data_lines = []
+            continue
+
+        if line.startswith(":"):
+            continue
+
+        if line.startswith("{") and not data_lines:
+            event = _parse_sse_json_event("", [line])
+            if event:
+                yield event
+            continue
+
+        field, sep, value = line.partition(":")
+        if not sep:
+            continue
+        if value.startswith(" "):
+            value = value[1:]
+        if field == "event":
+            event_type = value
+        elif field == "data":
+            data_lines.append(value)
+
+    event = _parse_sse_json_event(event_type, data_lines)
+    if event and event.get("type") != "__done__":
+        yield event
+
+
+def _create_grok_response_raw(request: dict):
+    def stream_events():
+        last_error: Exception | None = None
+
+        for attempt in range(TRANSLATION_API_RETRIES):
+            emitted = False
+            try:
+                headers = {
+                    "Authorization": f"Bearer {_required_env('API_KEY')}",
+                    "Content-Type": "application/json",
+                }
+                timeout = httpx.Timeout(
+                    connect=20.0,
+                    read=None,
+                    write=60.0,
+                    pool=20.0,
+                )
+                with httpx.Client(timeout=timeout) as client:
+                    with client.stream(
+                        "POST",
+                        _responses_endpoint_url(),
+                        headers=headers,
+                        json=request,
+                    ) as response:
+                        response.raise_for_status()
+                        for event in _iter_sse_json_events(response.iter_lines()):
+                            emitted = True
+                            yield event
+                        return
+            except Exception as exc:
+                last_error = exc
+                if emitted or not _is_retryable_api_error(exc):
+                    raise
+
+                if attempt < TRANSLATION_API_RETRIES - 1:
+                    _request_backoff_sleep(attempt, exc)
+
+        if last_error is not None:
+            raise last_error
+        raise RuntimeError("raw response creation failed without an exception")
+
+    return stream_events()
+
+
 def _emit_progress(
     on_progress: Callable[[dict], None] | None,
     payload: dict,
@@ -1467,20 +1577,24 @@ def _chat_responses(
                     ),
                 }
             ]
-        extra_body: dict[str, object] = {
-            "include_reasoning": _env_flag("GROK_RESPONSES_INCLUDE_REASONING", True),
-        }
-        extra_body["max_tokens"] = max(
+        request["include_reasoning"] = _env_flag(
+            "GROK_RESPONSES_INCLUDE_REASONING",
+            True,
+        )
+        request["max_tokens"] = max(
             16000,
             _env_int("GROK_RESPONSES_MAX_TOKENS", 16000),
         )
-        request["extra_body"] = extra_body
     else:
         request["text"] = {"format": {"type": "json_object"}}
     if TRANSLATION_MAX_TOKENS > 0 and not grok_compat:
         request["max_output_tokens"] = TRANSLATION_MAX_TOKENS
 
-    response_stream = _create_response(request)
+    response_stream = (
+        _create_grok_response_raw(request)
+        if grok_compat
+        else _create_response(request)
+    )
 
     completed_response = None
     incomplete_response = None
