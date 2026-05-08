@@ -153,7 +153,7 @@ def test_grok_responses_compat_request_shape(monkeypatch):
             ]
         )
 
-    monkeypatch.setattr(translator, "_create_response", fake_create_response)
+    monkeypatch.setattr(translator, "_create_grok_response_raw", fake_create_response)
 
     output = translator._chat(
         [{"role": "user", "content": "json"}],
@@ -168,10 +168,34 @@ def test_grok_responses_compat_request_shape(monkeypatch):
     assert "max_output_tokens" not in request
     assert request["reasoning"] == {"effort": "high"}
     assert request["tools"] == [{"type": "web_search", "max_results": 20}]
-    assert request["extra_body"] == {
-        "include_reasoning": True,
-        "max_tokens": 16000,
-    }
+    assert request["include_reasoning"] is True
+    assert request["max_tokens"] == 16000
+    assert "extra_body" not in request
+
+
+def test_iter_sse_json_events_parses_responses_stream():
+    lines = [
+        "event: response.output_text.delta",
+        'data: {"delta":"{\\"translations\\":[]}"}',
+        "",
+        'data: {"type":"response.completed","response":{"output":[]}}',
+        "",
+        "data: [DONE]",
+        "",
+    ]
+
+    events = list(translator._iter_sse_json_events(lines))
+
+    assert events == [
+        {
+            "type": "response.output_text.delta",
+            "delta": '{"translations":[]}',
+        },
+        {
+            "type": "response.completed",
+            "response": {"output": []},
+        },
+    ]
 
 
 def test_debounce_limits_fast_reasoning_events(monkeypatch):
