@@ -5,6 +5,7 @@ from pathlib import Path
 from rich.console import Console
 
 import main
+from pipeline import audio as pipeline_audio
 from helpers import make_job_context, run_pipeline
 _TIMELINE_RE = re.compile(
     r"(?P<start>\d\d:\d\d:\d\d,\d{3}) --> (?P<end>\d\d:\d\d:\d\d,\d{3})"
@@ -65,7 +66,7 @@ def test_skip_translation_writes_japanese_srt(monkeypatch, tmp_path):
     def fail_translate_segments(*_args, **_kwargs):
         raise AssertionError("translate_segments must not be called")
 
-    monkeypatch.setattr(main, "extract_audio", fake_extract_audio)
+    monkeypatch.setattr(pipeline_audio, "extract_audio", fake_extract_audio)
     monkeypatch.setattr(main.asr_module, "transcribe_and_align", fake_transcribe_and_align)
     monkeypatch.setattr(main.translator_module, "translate_segments", fail_translate_segments)
 

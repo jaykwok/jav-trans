@@ -49,8 +49,10 @@ def _llm_api_format(value: str) -> str:
 
 
 def _llm_reasoning_effort(value: str) -> str:
-    normalized = (value or "max").strip().lower()
-    return normalized if normalized in {"low", "medium", "max"} else "max"
+    normalized = (value or "xhigh").strip().lower()
+    if normalized in {"medium", "xhigh"}:
+        return normalized
+    return "xhigh"
 
 
 @dataclass
@@ -77,7 +79,7 @@ class JobContext:
     run_log_dir: str = "./temp/log"
     fail_on_qc_block: bool = True
     llm_api_format: str = "chat"
-    llm_reasoning_effort: str = "max"
+    llm_reasoning_effort: str = "xhigh"
     advanced: dict[str, str] = field(default_factory=dict)
 
     @classmethod
@@ -151,7 +153,7 @@ class JobContext:
                     advanced,
                     "LLM_REASONING_EFFORT",
                     "llm_reasoning_effort",
-                    "max",
+                    "xhigh",
                 )
             ),
             advanced=advanced,

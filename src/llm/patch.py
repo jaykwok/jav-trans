@@ -8,12 +8,11 @@ import httpx
 
 
 MICU_BASE_URL_MARKERS = ("micuapi.ai",)
-_REASONING_EFFORT_MAP = {
-    "low": "low",
-    "medium": "medium",
-    "high": "high",
-    "max": "high",
-}
+
+
+def _normalize_reasoning_effort(value: str | None) -> str:
+    normalized = (value or "xhigh").strip().lower()
+    return normalized if normalized in {"medium", "xhigh"} else "xhigh"
 
 
 def is_micu_grok_responses_request(
@@ -51,10 +50,7 @@ def build_micu_grok_responses_request(
     max_tokens: int,
     reasoning_effort: str,
 ) -> dict:
-    effort = _REASONING_EFFORT_MAP.get(
-        (reasoning_effort or "").strip().lower(),
-        "high",
-    )
+    effort = _normalize_reasoning_effort(reasoning_effort)
     return {
         "model": model_name,
         "input": build_micu_grok_responses_input(messages),

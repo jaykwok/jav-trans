@@ -67,6 +67,10 @@ def test_jobs_api_retry_cancelled_job(tmp_path, monkeypatch):
     asyncio.run(_test_jobs_api_retry_cancelled_job(tmp_path, monkeypatch))
 
 
+def test_jobs_api_rejects_invalid_job_spec(tmp_path, monkeypatch):
+    asyncio.run(_test_jobs_api_rejects_invalid_job_spec(tmp_path, monkeypatch))
+
+
 async def _test_app_exposes_icon_assets(tmp_path, monkeypatch):
     (tmp_path / "icon.ico").write_bytes(b"\x00\x00\x01\x00")
     (tmp_path / "icon.png").write_bytes(
@@ -175,7 +179,7 @@ async def _test_settings_translation_fields_update_runtime_env(monkeypatch):
     stale_env = {
         "TRANSLATION_GLOSSARY": "old glossary",
         "TARGET_LANG": "简体中文",
-        "LLM_REASONING_EFFORT": "max",
+        "LLM_REASONING_EFFORT": "xhigh",
     }
     monkeypatch.setattr(
         config_routes,
@@ -254,6 +258,31 @@ async def _test_jobs_api_crud(tmp_path, monkeypatch):
             response = await client.delete(f"/api/jobs/{job_id}")
             assert response.status_code == 200
             assert response.json() == {"ok": True}
+    finally:
+        await _reset_pm_state()
+
+
+async def _test_jobs_api_rejects_invalid_job_spec(tmp_path, monkeypatch):
+    monkeypatch.setattr(pm, "_jobs_path", tmp_path / "jobs.json")
+    await _reset_pm_state()
+
+    try:
+        transport = httpx.ASGITransport(app=create_app())
+        async with httpx.AsyncClient(
+            transport=transport,
+            base_url="http://test",
+        ) as client:
+            invalid_payloads = [
+                {"video_paths": []},
+                {"video_paths": ["sample.mp4"], "vad_threshold": 1.5},
+                {"video_paths": ["sample.mp4"], "translation_batch_size": 0},
+                {"video_paths": ["sample.mp4"], "translation_max_workers": 99},
+            ]
+            for payload in invalid_payloads:
+                response = await client.post("/api/jobs", json=payload)
+                assert response.status_code == 422
+
+        assert await pm.list_jobs() == []
     finally:
         await _reset_pm_state()
 

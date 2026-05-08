@@ -1,7 +1,17 @@
 from pathlib import Path
 
-import main
+from pipeline.cleanup import cleanup_job_temp, cleanup_runtime_ephemeral_temp
 from whisper import pipeline as asr
+
+
+def _cleanup_job_temp(job_temp_dir: Path, translation_cache_path: str = "") -> None:
+    cleanup_job_temp(
+        str(job_temp_dir),
+        translation_cache_path,
+        checkpoint_root=Path(getattr(asr, "_ASR_CHUNK_ROOT", Path("temp") / "chunks"))
+        .resolve()
+        .parent,
+    )
 def test_cleanup_job_temp_removes_wav_json_and_keeps_srt(tmp_path):
     job_dir = tmp_path / "job"
     nested = job_dir / "audio"
@@ -17,7 +27,7 @@ def test_cleanup_job_temp_removes_wav_json_and_keeps_srt(tmp_path):
     srt_path.write_text("1\n", encoding="utf-8")
     txt_path.write_text("keep", encoding="utf-8")
 
-    main._cleanup_job_temp(str(job_dir))
+    _cleanup_job_temp(job_dir)
 
     assert not wav_path.exists()
     assert not json_path.exists()
@@ -37,7 +47,7 @@ def test_keep_temp_context_skips_cleanup_call(tmp_path):
 
     keep_temp_files = True
     if not keep_temp_files:
-        main._cleanup_job_temp(str(job_dir))
+        _cleanup_job_temp(job_dir)
 
     assert wav_path.exists()
     assert json_path.exists()
@@ -58,10 +68,14 @@ def test_runtime_ephemeral_cleanup_keeps_reusable_caches(tmp_path, monkeypatch):
     monkeypatch.setenv("ASR_RECOVERY_OUTPUT_ROOT", str(recovery))
     monkeypatch.setattr(asr, "_ASR_CHUNK_ROOT", chunks)
 
-    main._cleanup_runtime_ephemeral_temp()
+    cleanup_runtime_ephemeral_temp(
+        job_temp_root=jobs,
+        asr_chunk_root=chunks,
+        recovery_output_root=recovery,
+        project_root=tmp_path,
+    )
 
     assert not jobs.exists()
     assert not chunks.exists()
     assert not recovery.exists()
     assert (hf_cache / "cache.bin").exists()
-

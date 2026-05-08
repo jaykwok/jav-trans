@@ -1,4 +1,4 @@
-import main
+from pipeline.audio import get_audio_cache_key
 def test_audio_cache_key_includes_video_content_for_same_filename(tmp_path):
     left_dir = tmp_path / "left"
     right_dir = tmp_path / "right"
@@ -11,7 +11,7 @@ def test_audio_cache_key_includes_video_content_for_same_filename(tmp_path):
     second.write_bytes(b"B" * 1024)
 
     assert first.name == second.name
-    assert main._get_audio_cache_key(str(first)) != main._get_audio_cache_key(
+    assert get_audio_cache_key(str(first)) != get_audio_cache_key(
         str(second)
     )
 
