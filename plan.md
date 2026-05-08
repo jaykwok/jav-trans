@@ -11,19 +11,13 @@
 - Windows 本机生产目标：NVIDIA RTX 4060 Ti 8GB，串行分时加载模型，阶段结束后卸载并清 CUDA cache。
 - 主流水线：视频 → 音频准备 → WhisperSeg VAD → ASR → Forced Alignment 词级时间轴 → F0 性别检测 → F0 后 gender turn 重切段 → 翻译前 ASR 噪声过滤 → LLM 翻译 → SRT/quality report。
 - 默认 ASR 配置仍为 `ASR_BACKEND=anime-whisper`；Web UI 推荐排序把 `whisper-ja-anime-v0.3` 放在第一位。
-- 支持后端：
-  - `anime-whisper`
-  - `qwen3-asr-1.7b`
-  - `whisper-ja-1.5b`
-  - `whisper-ja-anime-v0.3`
+- 支持后端：`anime-whisper`、`qwen3-asr-1.7b`、`whisper-ja-1.5b`、`whisper-ja-anime-v0.3`。
 - 默认 VAD：`ASR_VAD_BACKEND=whisperseg`，`WHISPERSEG_THRESHOLD=0.35`。
 - 默认翻译配置示例为 OpenAI-compatible LLM 服务；翻译请求使用流式输出 + 结构化 JSON 输出，Web 任务默认 `translation_batch_size=200`，`translation_max_workers=4`。
-- 翻译提交前过滤空文本、纯引号/括号文本、纯英文 ASR 幻觉 token，避免无效片段进入 LLM 批次。
 - 字幕约束：`MAX_SUBTITLE_DURATION=8.0`，`ASR_MERGE_HARD_MAX_DURATION=9.0`，相邻短块合并受标点、speaker guard 和 gender guard 限制。
-- 默认 ASR recovery：`ASR_RECOVERY_ENABLED=0`。只在手动排查异常 ASR 文本块时打开；recovery 通过 ffmpeg VAD 二次细分 + 同 ASR backend 重转写实现（已替换旧 audio-separator），不用于解决男女混句或字幕边界问题。
-- 断点续传：ASR checkpoint、`aligned_segments.json`、translation cache。
-- 主入口：`.venv/Scripts/python run_web.py`。根目录旧 `run.py` 已移除。
-- 后端调试入口：测试、诊断脚本，或直接调用 `run_asr_alignment_f0()` / `run_translation_and_write()`；旧 `src/main.py --input ...` CLI 已移除。
+- 默认 ASR recovery：`ASR_RECOVERY_ENABLED=0`。异常 ASR 文本块排查时才手动打开；男女混句边界由 F0 后 gender turn 重切段处理。
+- 断点续传：ASR checkpoint、`aligned_segments.json`、translation cache、translation artifact snapshot。
+- 主入口：`.venv/Scripts/python run_web.py`。后端调试入口是测试、诊断脚本，或直接调用 `run_asr_alignment_f0()` / `run_translation_and_write()`。
 - Web 任务参数通过 `JobSpec -> JobContext` 显式传入后端，不再依赖全局 `.env` 热覆盖 ASR、字幕、输出目录、batch/worker、临时文件保留等任务级配置。
 - `.env` 只保留跨任务持久配置：`API_KEY`、`OPENAI_COMPATIBILITY_BASE_URL`、`LLM_MODEL_NAME`、`LLM_API_FORMAT`、`LLM_REASONING_EFFORT`、`TARGET_LANG`、`HF_ENDPOINT`、`TRANSLATION_GLOSSARY`。
 
@@ -32,47 +26,152 @@
 ## 2. 当前行为约定
 
 - 普通使用入口是 `.venv/Scripts/python run_web.py`；旧 `src/main.py --input ...` CLI 已移除。
-- 需要观察后端长跑进度或收集用户反馈日志时，通过 Web 高级项启用 `RUN_LOG_ENABLED=1`；默认写入 `temp/log/`，也可用 `RUN_LOG_DIR=./temp/log` 显式指定。
-- `scripts/asr_backends_compare.py` 只有带 `--log` / `--log-dir` 才写持久日志。
-- `HF_HOME` 默认 `./models`；首次运行把 HuggingFace repo 下载到 `models/<namespace>-<repo>/`，例如 `litagin/anime-whisper` → `models/litagin-anime-whisper/`。
-- 不再兼容旧 HF cache 作为模型读取兜底；新下载目标固定为 `./models` 下的准确模型代号目录。
-- `HF_HUB_CACHE`、`HF_XET_CACHE`、`TORCH_HOME` 默认在 `./temp/` 下；ASR recovery 输出默认在 `temp/recovery`，避免 `models/` 顶层出现 cache 或非模型代号目录。
-- `HF_ENDPOINT` 必须为空或完整 URL，例如 `https://hf-mirror.com`；`hf-mirror.com` 这类缺协议值会在模型下载前被拒绝。
+- 需要观察后端长跑进度或收集用户反馈日志时，通过 Web 高级项启用 `RUN_LOG_ENABLED=1`；默认写入 `temp/log/`。
+- `HF_HOME` 默认 `./models`；首次运行把 HuggingFace repo 下载到 `models/<namespace>-<repo>/`。
+- `HF_HUB_CACHE`、`HF_XET_CACHE`、`TORCH_HOME` 默认在 `./temp/` 下；ASR recovery 输出默认在 `temp/recovery`。
+- `HF_ENDPOINT` 必须为空或完整 URL，例如 `https://hf-mirror.com`。
 - 成功运行后默认直接删除一次性 job 临时目录；保留下次可复用的运行缓存，例如 `temp/hf-cache`、`temp/web` 状态和 `models/`。
 - Web“保留临时文件”选项仅用于调试，保留当前任务临时目录；不再通过全局 `KEEP_TEMP_FILES` 控制任务行为。
 - 所有项目配置、README、agent 本地说明应使用项目相对路径，不写本机绝对路径。
 - `OPENAI_COMPATIBILITY_BASE_URL` 是 OpenAI-compatible API 配置名，保留不改。
-- `F0_THRESHOLD_HZ` 只控制男女声分类阈值；长句内男女混说话人的字幕边界由 `MULTI_CUE_SPLIT_ENABLED=1` 的 F0 后 gender turn 重切段处理。
 
 ---
 
-## 3. 已完成基线
+## 3. 已完成任务摘要
 
-- **T-A** ✅ ASR Recovery → VAD 二次细分（`src/audio/vad_refine.py`）
-- **T-B** ✅ F0 词级时间轴 + multi-cue gender 切分
-- **T-D** ✅ 后端 Stage 事件 JSON 化（`src/core/events.py`）
-- **T-C** ✅ Web 控制台全量实现（FastAPI + SSE + PyWebView）；含 Web UI 前端改进（sticky 提交、重试、取消修复等）
-- **T-E** ✅ Web UI 完善：重试断点续传、cancel_event 透传
-- **T-F** ✅ HF 镜像开关（`hf_endpoint` 前后端同步）
-- **T-G** ✅ 前端配置项扩展（输出目录、并行 worker、保留临时、推理强度、目标语言、术语表）
-- **T-H** ✅ 后端稳定性：deque 限界、I/O 防抖、SSE 心跳、VAD timeout、jobs TTL（180 tests）
-- **T-I** ✅ 代码库清理：main.py CLI 瘦身、BACKENDS 单一来源、advanced env textarea、cache 改 JSONL（179 tests）
-- **T-J** ✅ B3 全局 env 并发污染根治：JobContext dataclass、pipeline_manager 删热补丁、main.py/translator.py 显式传参（179 tests）
-- **T-K** ↩️ transformers 兼容性回滚：因 `qwen-asr` 与 `transformers>=5.x` 冲突，移除实验性第五 ASR 后端，依赖固定回 `transformers==4.57.6`
-- **T-L** ✅ GitHub 发布前收口：移除旧 `run.py`、归档本地 ad-hoc scripts、README 重写、`.env.example` 缩为持久设置模板、`.gitignore` 补 `.env.*` 保护（配置相关 16 tests）
-- **T-M** ✅ 发布前二次收口：翻译 prompt 显式接收任务级 `asr_context`，translation cache key 纳入人物参考；清理 cohere 本地模型/cache、pycache、孤儿 Web job 临时目录；README 使用说明改为运行环境安装优先（32 tests）
-- **T-O** ✅ Web 表单易用性：所有可填写控件自动记忆上次填写值；文本输入控件支持右键粘贴菜单，API Key 不进入本地明文记忆。
-- **T-P** ✅ 翻译 API 格式兼容：翻译侧支持 `LLM_API_FORMAT=chat|responses`，默认 Chat Completions；Responses API 使用 `/responses`、流式 output_text delta、JSON object text format。
-- **T-Q** ✅ F0 后 gender turn 重切段：F0 标注 `words[].gender` 后按 `M/F` 转换积极拆分字幕段，避免男女同处长句时不换行（F0 相关 15 tests + ASR cache/job 7 tests）。
-- **T-R** ✅ 翻译重试与请求清理：batch 翻译失败时只重试当前失败/缺失 id；Micu+Grok Responses 特例移入 `src/llm/patch.py`；通用 JSON 错误文案改为 `LLM JSON output`；Web 标准默认改为 batch=200、worker=4；翻译提交前 ASR 噪声过滤扩展到纯英文幻觉 token。
+| Task | 内容 | 结果 |
+|------|------|------|
+| T-S ✅ | 后端稳定性收口（JobSpec 边界、删除锁顺序、run logger 泄漏、cache 损坏容忍） | 58 passed |
+| T-U ✅ | 后端大文件拆分：`src/main.py` helper 迁入 `src/pipeline/`（8 个子模块） | 宽回归 93 passed |
+| T-V ✅ | 前端 `app.js` 拆分为 14 个 ES Module；修复日志刷新导致粘贴菜单被关闭的 bug | 语法全通，手动验证 |
 
-基线：子进程隔离、WhisperSeg VAD、翻译并行、断点续传、SRT 折行、quality report 等主功能均已落地；README、`.env.example`、`.gitignore` 已按 Web-first 架构收口，cohere 源码/模型/cache 已退出工作流。
+<details>
+<summary>T-S / T-U 详细记录</summary>
+
+**T-S 完成内容：**
+- `JobSpec` 增加输入边界，`/api/config` 避免 `video_paths` 必填校验污染默认配置读取。
+- finished job 删除流程改为锁内更新状态、锁外递归删除 temp。
+- `run_translation_and_write()` 三路径统一关闭 run logger 并清理 `events._thread_local.run_logger`。
+- translation cache JSON/JSONL 损坏时打印 warning 但不中断任务。
+
+**T-U 完成内容（`src/pipeline/` 子模块）：**
+- `audio.py`：filter chain、视频 hash、audio cache key、`extract_audio()`、时长 probe。
+- `cleanup.py`：translation cache 清理、ASR checkpoint 清理、job temp 清理。
+- `gender_split.py`：F0 None 过滤、gender turn 重切段、ASR noise 过滤。
+- `artifacts.py`：`AsrArtifacts`、snapshot 路径、序列化、atomic 写、加载恢复。
+- `ids.py`：`sanitize_job_id()`。
+- `output.py`：输出目录解析、bilingual 模式解析。
+- `aligned_cache.py`：`aligned_segments.json` cache 读取与 key 校验。
+- `quality.py`：quality report、术语表解析、quality segment 转换。
+
+当前后端大文件排行（供 B1–B3 参考）：
+- `src/whisper/pipeline.py`：2259 行。
+- `src/llm/translator.py`：1627 行。
+- `src/main.py`：1487 行。
+- `src/whisper/local_backend.py`：1209 行。
+- `src/web/pipeline_manager.py`：529 行。
+
+</details>
+
+### T-V：前端 app.js 拆分为 ES Module ✅
+
+**背景**：`src/web/static/app.js` 膨胀至 1143 行，经典脚本、无模块化、状态散落顶层。
+
+**结果**：拆为 `src/web/static/js/` 下 14 个 ES Module，`index.html` 改为 `<script type="module" src="js/main.js">`，旧 `app.js` 归档到 `agents/rm/app.js.bak`。
+
+| 文件 | 职责 | 行数 |
+|------|------|------|
+| `util.js` | `$`、`escHtml`、`showToast` | 13 |
+| `state.js` | `state` 单例、`ACTIVE_STATUSES`、`MAX_LOG` | 10 |
+| `dom.js` | 10 个 DOM ref 命名导出 | 12 |
+| `log.js` | `addLog`、日志区事件 | 36 |
+| `formMemory.js` | localStorage 表单记忆（v3） | 69 |
+| `pasteMenu.js` | 右键复制/粘贴菜单（含 scroll bug 修复） | 96 |
+| `presets.js` | 预设 chip、TUNING_FIELDS、custom 保存 | 100 |
+| `jobsRender.js` | 任务卡渲染、jobArea click 委托 | 222 |
+| `jobsApi.js` | `fetchJob`、`fetchAllJobs`、`startJobPolling` | 42 |
+| `sse.js` | SSE 实时事件、`_download` 进度写入 | 77 |
+| `settings.js` | loadConfig / loadSettings / installSettingsPanel | 238 |
+| `hfMirror.js` | HF 镜像开关 + 下载取消重提 | 79 |
+| `files.js` | 文件选择、拖拽、提交链 | 146 |
+| `main.js` | 启动序列、Ctrl+Enter 快捷键 | 43 |
+
+**关键设计决策**：
+- `activePreset` 合入 `state.activePreset`（避免 `export let` live binding 陷阱）。
+- `jobsRender ↔ jobsApi` 循环：`installJobAreaHandlers(fetchAllJobs, enableHfMirror)` 参数注入。
+- `pasteMenu.js` 无外部 import，`pasteTarget/pasteMenu` 模块私有。
+- `window.__pywebviewDrop` 桥在 `installFiles()` 内挂载，保持不变。
+
+**Bug 修复**（含在本次 commit）：日志刷新时 `logScroll.scrollTop = ...` 触发 scroll 事件，导致粘贴菜单被 `hidePasteMenu` 关闭。修复：scroll handler 跳过 `e.target.id === 'log-scroll'` 的事件。
 
 ---
 
-## 4. HAME-052 验证基线
+## 4. 当前待办 / Backlog
 
-### 四后端 skip-translation 对比
+### B1：继续拆分 `src/whisper/pipeline.py`
+
+现状：当前最大后端文件，约 2259 行。
+
+建议拆分方向：
+- backend registry / dispatch：后端列表、label、选择逻辑。
+- ASR checkpoint：读写、路径、恢复策略。
+- chunk/VAD orchestration：切块、VAD backend 调度、chunk 元数据。
+- transcribe/alignment orchestration：ASR 文本转写、forced alignment、stage details 汇总。
+- recovery：ffmpeg VAD 二次细分与重转写路径。
+
+边界：保持公开入口不变，先拆纯 helper，再拆阶段编排，避免一次性重排主流程。
+
+### B2：继续拆分 `src/llm/translator.py`
+
+现状：约 1627 行，仍是第二大后端文件。
+
+建议拆分方向：
+- cache：JSON/JSONL cache 读写、损坏 warning、cache key。
+- prompt：系统提示、用户 payload、术语表和人物参考。
+- client/chat：Chat Completions 请求和流式解析。
+- client/responses：Responses API 请求和流式解析。
+- batching/retry：batch 切分、缺失 id 重试、进度事件。
+
+边界：当前翻译 API 行为稳定，拆分时优先保留 `translate_segments()` 对外签名。
+
+### B3：压缩 `src/main.py` 主编排
+
+现状：已从约 1621 行降到约 1487 行，但仍包含 ASR stage event、timing、JSON 输出、翻译写出三段重复结构。
+
+建议拆分方向：
+- stage event / run log helper。
+- JSON/timings payload writer。
+- ASR artifact build。
+- translation write-output paths 的重复写 JSON/SRT/timings 分支。
+
+边界：`run_asr_alignment_f0()` / `run_translation_and_write()` 暂时保留为后端公开入口。
+
+---
+
+## 5. 折叠历史基线
+
+<details>
+<summary>历史完成项 T-A 到 T-R</summary>
+
+- **T-A** ✅ ASR Recovery → VAD 二次细分（`src/audio/vad_refine.py`）。
+- **T-B** ✅ F0 词级时间轴 + multi-cue gender 切分。
+- **T-C / T-D / T-E** ✅ Web 控制台、Stage 事件 JSON 化、重试断点续传和 cancel event 透传。
+- **T-F / T-G** ✅ HF 镜像开关、Web 配置项扩展。
+- **T-H / T-I / T-J** ✅ 后端稳定性、CLI 瘦身、全局 env 并发污染根治。
+- **T-K** ↩️ transformers 兼容性回滚，保留四个稳定 ASR 后端，依赖固定回 `transformers==4.57.6`。
+- **T-L / T-M** ✅ GitHub 发布前文档、配置、入口、翻译上下文与 cache key 收口。
+- **T-N** ✅ Windows Release exe 打包配置。
+- **T-O** ✅ Web 表单记忆与右键粘贴。
+- **T-P** ✅ OpenAI Responses 翻译格式兼容。
+- **T-Q** ✅ F0 后 gender turn 字幕重切段。
+- **T-R** ✅ 翻译重试与请求清理；Micu+Grok Responses 特例移入 `src/llm/patch.py`；翻译前 ASR 噪声过滤扩展到纯英文幻觉 token。
+
+</details>
+
+<details>
+<summary>HAME-052 历史验证基线</summary>
+
+四后端 skip-translation 对比：
 
 | 后端 | 状态 | ASR 转写 | Wall time | 字幕数 |
 |------|------|----------|-----------|--------|
@@ -81,160 +180,23 @@
 | `whisper-ja-1.5b` | ok | 170.74s | 464.33s | 165 |
 | `whisper-ja-anime-v0.3` | ok | 41.89s | 229.46s | 151 |
 
-### 默认全量翻译（anime-whisper + bilingual）
+默认全量翻译（anime-whisper + bilingual）：`pipeline_total=575.30s`，字幕块数 150，产物 `video/HAME-052.srt`。
 
-pipeline_total=575.30s，字幕块数 150，产物 `video/HAME-052.srt`。
+</details>
 
----
+<details>
+<summary>历史回归记录</summary>
 
-## 5. 当前 Task
+- T-B 完成后：176 tests passed。
+- T-C 完成后：178 tests passed。
+- T-H 完成后：180 tests passed。
+- T-I 完成后：179 tests passed。
+- T-J 完成后：179 tests passed。
+- T-L 完成后：配置 / 模型路径 / Web jobs API 定向回归 16 tests passed。
+- T-M 完成后：翻译上下文 / 缓存 key / 清理 / Web jobs 定向回归 32 tests passed。
+- T-Q 完成后：F0 定向 15 passed；ASR job/cache 定向 7 passed。
+- T-S 完成后：后端稳定性收口定向 58 tests passed。
+- T-U 完成后：后端拆分定向 38 passed；宽后端回归 93 passed。
 
-### T-Q：F0 后 gender turn 字幕重切段 ✅
+</details>
 
-**完成内容**：
-- `src/main.py` 在 `detect_gender_f0_word_level()` 成功标注词级 gender 后、`F0_FILTER_NONE_SEGMENTS` 前执行 `_split_segments_on_f0_gender_turns()`。
-- 重切段策略为积极拆分：相邻有效词级 gender 从 `M` 到 `F` 或从 `F` 到 `M` 变化时立即拆段，不要求静音 gap；`None` 词不触发拆分并并入当前片段。
-- 重切后的子段从对应 `words` 重建 `start` / `end` / `text` / `words` / `gender` / `source_chunk_index`，并记录 `asr_details["f0_gender_split"]`。
-- 运行日志新增 `f0_gender_split segments_before=... segments_after=... split_count=...`，便于确认是否生效。
-- ASR recovery 继续默认关闭，仅作为异常 ASR 文本救火工具；男女混句边界问题由 F0 后重切段解决。
-
-**验收**：
-```powershell
-.venv/Scripts/python -m py_compile src/main.py src/audio/f0_gender.py
-.venv/Scripts/python -m pytest tests/test_word_level_f0.py tests/test_gender_split.py tests/test_f0_filter.py -q --tb=short -p no:cacheprovider
-.venv/Scripts/python -m pytest tests/test_job_tempdir.py tests/test_aligned_segments_cache.py -q --tb=short -p no:cacheprovider
-```
-
-结果：F0 定向 15 passed；ASR job/cache 定向 7 passed。
-
-### T-P：OpenAI Responses 翻译格式兼容 ✅
-
-**完成内容**：
-- 翻译侧新增 `LLM_API_FORMAT`，可选 `chat` / `responses`，默认 `chat`。
-- `chat` 保持 OpenAI Chat Completions 兼容路径、结构化 JSON 输出、streaming 和兼容服务的 reasoning/thinking 参数。
-- `responses` 使用 OpenAI Responses API 兼容路径：`client.responses.create(stream=True, input=..., text={"format":{"type":"json_object"}})`，并解析 `response.output_text.delta`、reasoning delta、completed / incomplete / failed 事件。
-- Web 设置 API (`/api/settings`) 支持读写 `llm_api_format`，Pydantic 限定为 `chat|responses`。
-- `/api/models` 通过当前 OpenAI-compatible Base URL 远程获取模型列表。
-
-**验收**：
-```powershell
-.venv/Scripts/python -m py_compile src/llm/translator.py src/core/config.py src/web/models.py src/web/routes/config.py
-.venv/Scripts/python -m pytest tests/test_translation_progress.py tests/test_config.py tests/web/test_jobs_api.py -q --tb=short -p no:cacheprovider
-```
-
-### T-O：Web 表单记忆与右键粘贴 ✅
-
-**完成内容**：
-- Web 前端所有可填写控件（任务参数、翻译设置、开关、下拉、textarea）通过 `localStorage` 自动记忆上次填写值。
-- 文本输入控件（input / textarea，包括 API Key 输入框）支持右键弹出“粘贴”菜单并写入当前光标位置。
-- `s-apikey` 仅支持右键粘贴，不写入本地表单记忆，避免 API Key 明文持久化到浏览器存储。
-- 后端 `/api/config`、`/api/settings` 加载完成后再次应用表单记忆，保证动态下拉框和后端持久设置不会覆盖用户上次前端选择。
-
-**验收**：
-```powershell
-.venv/Scripts/python -m py_compile run_web.py src/web/app.py src/web/routes/config.py src/web/routes/jobs.py
-```
-
-### T-N：Windows Release exe 打包 ✅
-
-**完成内容**：
-- 新增 PyInstaller onedir 发布配置 `packaging/javtrans-web.spec`，产物名为 `JAVTrans.exe`。
-- 新增 `packaging/build_windows.ps1` 和 `packaging/prepare_default_model.py`，构建前确认默认 ASR 模型 `efwkjn/whisper-ja-anime-v0.3` 以及默认流程辅助模型已下载。
-- Release 包内置 Python 运行环境、当前 `.venv` 依赖、`ffmpeg.exe`、`ffprobe.exe`、ffmpeg 同目录 DLL、`icon.ico`、`icon.png`、Web 静态资源、默认 ASR 模型、WhisperSeg VAD、`openai/whisper-base` 特征提取器和 Qwen forced aligner。
-- frozen 运行时把 `.env`、`temp/`、用户后续下载的 `models/` 定位到 exe 同目录；包内默认模型作为只读 fallback。
-- exe 图标通过 PyInstaller `icon.ico` 设置；pywebview 窗口图标通过 `webview.start(icon=...)` 设置；Web 页面 favicon / header / drop-zone 使用根目录图标资产。
-- README 增加 Release 使用方式和构建命令；`packaging/README.md` 记录打包边界。
-
-**边界**：
-- 不内置 Microsoft Edge WebView2 Runtime，普通用户缺失时需安装 Microsoft 官方运行时。
-- 只内置默认 ASR 模型 `efwkjn/whisper-ja-anime-v0.3` 和默认流程辅助模型；其他 ASR 模型仍按需下载到 exe 同目录 `models/`。
-
-**验收**：
-```powershell
-.venv/Scripts/python -m py_compile run_web.py src/utils/runtime_paths.py src/utils/model_paths.py src/core/config.py src/web/app.py packaging/prepare_default_model.py
-.venv/Scripts/python -m pytest tests/test_model_paths.py tests/test_config.py tests/web/test_jobs_api.py -q --tb=short -p no:cacheprovider
-.venv/Scripts/python -m PyInstaller --noconfirm --clean packaging/javtrans-web.spec
-```
-
----
-
-### T-M：发布前二次收口 ✅
-
-**完成内容**：
-- 翻译侧 `translate_segments()` 增加显式 `character_reference`，Web 任务通过 `ctx.asr_context` 传入翻译 prompt，不再只读导入时的全局 `ASR_CONTEXT`。
-- translation cache key 纳入 `character_reference`，避免同一字幕在不同人名提示下错误命中旧缓存。
-- 本地清理 cohere 残留模型/cache、Python bytecode、pytest 临时目录、孤儿 `temp/web/jobs/*`。
-- README 使用说明前置，并把运行环境安装、官方下载链接、虚拟环境、依赖安装、Web 启动、任务提交和清理行为串成主流程。
-- README / tests 移除旧 `temp/audio-separator` 运行缓存描述；ASR recovery 当前为 ffmpeg VAD 二次细分 + 同 ASR backend 重转写。
-
-**验收**：
-```powershell
-$env:PYTHONDONTWRITEBYTECODE='1'; .venv/Scripts/python -m pytest tests/test_batch_translation.py tests/test_translation_cache.py tests/test_translation_cache_key_versioned.py tests/test_translation_progress.py tests/test_auto_cleanup.py tests/web/test_jobs_api.py tests/web/test_cancel_resume.py -q --tb=short -p no:cacheprovider
-```
-
-结果：32 passed。
-
----
-
-### T-L：GitHub 发布前文档 / 配置 / 入口收口 ✅（已归档）
-
-**完成内容**：
-- 根目录旧 `run.py` 已移除，当前主入口为 `.venv/Scripts/python run_web.py`。
-- `src/main.py --input ...` CLI 已移除；后端 smoke/debug 通过测试、诊断脚本或直接调用 `run_asr_alignment_f0()` / `run_translation_and_write()`。
-- `scripts/` 仅保留通用诊断脚本：`asr_backends_compare.py`、`benchmark_asr.py`。
-- `.env.example` 只保留 Web 设置页会持久化的跨任务配置，不再放视频路径、输出目录、ASR 后端、字幕模式、batch/worker、临时文件保留等任务级参数。
-- 真实 `.env` 已收敛为本地持久翻译服务配置；不得提交到 Git。
-- `.gitignore` 忽略 `.env.*`，但保留 `.env.example`。
-- README 已按 Web-first 架构重写，并加入 GitHub repository description 建议；使用说明以运行环境安装开头，包含官方安装链接。
-
-**验收**：
-```powershell
-.venv/Scripts/python -m pytest tests/test_config.py tests/test_model_paths.py tests/web/test_jobs_api.py -q --tb=short -p no:cacheprovider
-```
-
-结果：16 passed。
-
----
-
-### T-K：transformers 兼容性回滚 ↩️
-
-**回滚原因**：`qwen-asr` 当前依赖 `transformers==4.57.6`，实验性第五 ASR 后端需要 `transformers>=5.x`。为避免破坏现有 qwen3 后端，回到四后端架构。
-
-**当前状态**：
-- 删除实验性第五 ASR 后端源码。
-- 删除对应测试。
-- `src/whisper/pipeline.py` 只注册四个稳定 ASR 后端。
-- `src/web/models.py` 只暴露四个稳定 ASR 后端。
-- `requirements.txt` 固定 `transformers==4.57.6`。
-
-**验收**：
-```powershell
-.venv/Scripts/python -m pip install transformers==4.57.6
-.venv/Scripts/python -m pytest tests/test_asr_backend_dispatch.py tests/web/test_jobs_api.py -q --tb=short -p no:cacheprovider
-```
-
----
-
-## 6. Backlog（暂不实施）
-
-暂无待实施项。
-
----
-
-## 7. 回归验证记录
-
-全量命令：
-```powershell
-.venv/Scripts/python -m pytest -q --basetemp=temp/pytest_hame052_plan -p no:cacheprovider
-```
-
-历史关键记录：
-- T-B 完成后：176 tests passed
-- T-C 完成后（C7）：178 tests passed（含 `tests/web/test_jobs_api.py` + `test_pipeline_overlap.py`）
-- T-H 完成后：180 tests passed
-- T-I 完成后：179 tests passed（I1 删除 CLI batch 代码，对应测试随之移除）
-- T-J 完成后：179 tests passed
-- T-K 回滚后：实验性第五 ASR 后端代码/测试/注册删除，transformers 固定回 4.57.6
-- T-L 完成后：配置 / 模型路径 / Web jobs API 定向回归 16 tests passed
-- T-M 完成后：翻译上下文 / 缓存 key / 清理 / Web jobs 定向回归 32 tests passed
-- T-Q 完成后：F0 后 gender turn 重切段定向 15 tests passed；ASR job/cache 定向 7 tests passed；`py_compile src/main.py src/audio/f0_gender.py` passed
