@@ -4,7 +4,21 @@ from pathlib import Path
 import pytest
 
 import main
+from pipeline import audio as pipeline_audio
+from pipeline.cleanup import cleanup_job_temp
 from helpers import make_job_context, run_pipeline
+
+
+def _cleanup_job_temp(job_temp_dir: Path) -> None:
+    chunk_root = Path(
+        getattr(main.asr_module, "_ASR_CHUNK_ROOT", Path("temp") / "chunks")
+    )
+    cleanup_job_temp(
+        str(job_temp_dir),
+        checkpoint_root=chunk_root.resolve().parent,
+    )
+
+
 def _segments(count: int = 5) -> list[dict]:
     return [
         {"start": float(index), "end": float(index) + 0.8, "text": f"ja-{index}"}
@@ -83,7 +97,7 @@ def _patch_pipeline(
             {"transcript_chunks": [], "stage_timings": {}},
         )
 
-    monkeypatch.setattr(main, "extract_audio", fake_extract_audio)
+    monkeypatch.setattr(pipeline_audio, "extract_audio", fake_extract_audio)
     monkeypatch.setattr(main.asr_module, "transcribe_and_align", fake_transcribe_and_align)
     return ctx
 
@@ -119,7 +133,7 @@ def test_cleanup_removes_translation_cache_and_matching_asr_checkpoint(monkeypat
         raising=False,
     )
 
-    main._cleanup_job_temp(str(job_dir))
+    _cleanup_job_temp(job_dir)
 
     assert not cache_path.exists()
     assert not matching_checkpoint.exists()

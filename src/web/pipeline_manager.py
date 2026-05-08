@@ -15,6 +15,14 @@ from typing import Any
 from core import events
 from core.config import DEFAULT_SETTINGS
 from core.job_context import JobContext
+from pipeline.artifacts import (
+    AsrArtifacts,
+    load_translation_artifacts_snapshot,
+    write_translation_artifacts_snapshot,
+)
+from pipeline.aligned_cache import try_load_aligned_segments
+from pipeline.audio import get_audio_cache_key
+from pipeline.ids import sanitize_job_id
 import main as pipeline_main
 from main import run_asr_alignment_f0, run_translation_and_write
 from utils.model_paths import PROJECT_ROOT
@@ -140,7 +148,7 @@ def _resume_cache_job_id(job: JobState) -> str:
     if not resume_from:
         return job.id
     try:
-        cache_job_id = pipeline_main._sanitize_job_id(resume_from)
+        cache_job_id = sanitize_job_id(resume_from)
         video_path = job.spec.video_paths[0]
         aligned_path = (
             Path(_job_temp_dir(cache_job_id))
@@ -148,9 +156,9 @@ def _resume_cache_job_id(job: JobState) -> str:
         )
         if not aligned_path.exists():
             return job.id
-        cached = pipeline_main._try_load_aligned_segments(
+        cached = try_load_aligned_segments(
             str(aligned_path),
-            pipeline_main._get_audio_cache_key(video_path),
+            get_audio_cache_key(video_path),
             job.spec.asr_backend,
         )
         if cached is not None:
@@ -161,11 +169,11 @@ def _resume_cache_job_id(job: JobState) -> str:
 
 
 def _job_temp_dir(job_id: str) -> str:
-    return str((PROJECT_ROOT / "temp" / "web" / "jobs" / pipeline_main._sanitize_job_id(job_id)).resolve())
+    return str((PROJECT_ROOT / "temp" / "web" / "jobs" / sanitize_job_id(job_id)).resolve())
 
 
 def _remove_job_temp_dir(job_id: str) -> None:
-    safe_id = pipeline_main._sanitize_job_id(job_id)
+    safe_id = sanitize_job_id(job_id)
     path = Path(_job_temp_dir(safe_id)).resolve()
     if path.name != safe_id or not path.exists():
         return
@@ -189,8 +197,10 @@ def _normalize_llm_api_format(value: str) -> str:
 
 
 def _normalize_llm_reasoning_effort(value: str) -> str:
-    normalized = (value or "max").strip().lower()
-    return normalized if normalized in {"low", "medium", "max"} else "max"
+    normalized = (value or "xhigh").strip().lower()
+    if normalized in {"medium", "xhigh"}:
+        return normalized
+    return "xhigh"
 
 
 def _snapshot_translation_settings(spec: JobSpec) -> JobSpec:
@@ -211,7 +221,7 @@ def _snapshot_translation_settings(spec: JobSpec) -> JobSpec:
     reasoning_effort = getattr(spec, "llm_reasoning_effort", None)
     if reasoning_effort is None or not str(reasoning_effort).strip():
         updates["llm_reasoning_effort"] = _normalize_llm_reasoning_effort(
-            _runtime_setting("LLM_REASONING_EFFORT", "max")
+            _runtime_setting("LLM_REASONING_EFFORT", "xhigh")
         )
 
     return spec.model_copy(update=updates) if updates else spec
@@ -242,8 +252,8 @@ def _run_asr_alignment_f0(job: JobState, cancel_event=None):
             cache_job_id=_resume_cache_job_id(job),
             cancel_event=cancel_event,
         )
-        if isinstance(artifacts, pipeline_main.AsrArtifacts):
-            pipeline_main.write_translation_artifacts_snapshot(artifacts)
+        if isinstance(artifacts, AsrArtifacts):
+            write_translation_artifacts_snapshot(artifacts)
         return artifacts
     finally:
         _hf_progress.set_current_job_id("")
@@ -275,7 +285,7 @@ def _load_translation_retry_artifacts(job: JobState):
     if not (_job_stage_names(job) & _TRANSLATION_RETRY_STAGES):
         return None
     try:
-        return pipeline_main.load_translation_artifacts_snapshot(_job_temp_dir(job.id))
+        return load_translation_artifacts_snapshot(_job_temp_dir(job.id))
     except Exception:
         return None
 
@@ -509,6 +519,7 @@ async def retry_job(job_id: str) -> JobState | None:
 
 
 async def remove_job(job_id: str) -> bool:
+    remove_temp_for_job: str | None = None
     async with _state_lock:
         job = _jobs.get(job_id)
         if job is None:
@@ -517,13 +528,17 @@ async def remove_job(job_id: str) -> bool:
             _jobs.pop(job_id, None)
             _cancel_events.pop(job_id, None)
             _write_jobs_unlocked()
-            _remove_job_temp_dir(job_id)
-            return True
+            remove_temp_for_job = job_id
+
+    if remove_temp_for_job is not None:
+        _remove_job_temp_dir(remove_temp_for_job)
+        return True
 
     return await cancel_job(job_id)
 
 
 async def remove_finished_jobs() -> int:
+    job_ids: list[str] = []
     async with _state_lock:
         job_ids = [
             job_id
@@ -533,10 +548,11 @@ async def remove_finished_jobs() -> int:
         for job_id in job_ids:
             _jobs.pop(job_id, None)
             _cancel_events.pop(job_id, None)
-            _remove_job_temp_dir(job_id)
         if job_ids:
             _write_jobs_unlocked()
-        return len(job_ids)
+    for job_id in job_ids:
+        _remove_job_temp_dir(job_id)
+    return len(job_ids)
 
 
 async def evict_old_jobs(max_age_hours: int = 48) -> int:
@@ -544,6 +560,7 @@ async def evict_old_jobs(max_age_hours: int = 48) -> int:
 
     cutoff = datetime.now(timezone.utc) - timedelta(hours=max_age_hours)
     cutoff_str = cutoff.isoformat(timespec="milliseconds")
+    job_ids: list[str] = []
     async with _state_lock:
         job_ids = [
             job_id
@@ -553,10 +570,11 @@ async def evict_old_jobs(max_age_hours: int = 48) -> int:
         for job_id in job_ids:
             _jobs.pop(job_id, None)
             _cancel_events.pop(job_id, None)
-            _remove_job_temp_dir(job_id)
         if job_ids:
             _write_jobs_unlocked()
-        return len(job_ids)
+    for job_id in job_ids:
+        _remove_job_temp_dir(job_id)
+    return len(job_ids)
 
 
 async def _eviction_loop() -> None:

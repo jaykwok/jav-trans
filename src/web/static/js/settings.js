@@ -71,7 +71,7 @@ export async function loadSettings() {
     $('mirror-enabled').checked = s.hf_endpoint === 'https://hf-mirror.com';
 
     const effort = $('api-reasoning-effort');
-    if (effort) effort.value = s.llm_reasoning_effort || 'max';
+    if (effort) effort.value = s.llm_reasoning_effort || 'xhigh';
     const apiFormat = $('api-format');
     if (apiFormat) apiFormat.value = s.llm_api_format || 'chat';
     const targetLang = $('api-target-lang');
@@ -100,7 +100,7 @@ function showSaveStatus(msg, type) {
 
 export function readTranslationSettingsFromForm() {
   return {
-    llm_reasoning_effort: $('api-reasoning-effort').value || 'max',
+    llm_reasoning_effort: $('api-reasoning-effort').value || 'xhigh',
     llm_api_format:       $('api-format').value || 'chat',
     target_lang:          $('api-target-lang').value || '简体中文',
     translation_glossary: ($('api-glossary').value || '')

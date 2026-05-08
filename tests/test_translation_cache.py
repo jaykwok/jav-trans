@@ -115,6 +115,28 @@ def test_batched_translation_skips_cached_batches(monkeypatch, tmp_path):
     assert not cache_path.exists()
 
 
+def test_load_translation_cache_warns_on_corrupt_jsonl(tmp_path, capsys):
+    cache_path = tmp_path / "translation_cache.jsonl"
+    cache_path.write_text("{not-json}\n", encoding="utf-8")
+
+    assert translator._load_translation_cache(cache_path) == {}
+
+    captured = capsys.readouterr()
+    assert "[WARN] translation cache JSONL load failed" in captured.out
+    assert str(cache_path) in captured.out
+
+
+def test_load_translation_cache_warns_on_corrupt_legacy_json(tmp_path, capsys):
+    cache_path = tmp_path / "translation_cache.json"
+    cache_path.write_text("{not-json}", encoding="utf-8")
+
+    assert translator._load_translation_cache(cache_path) == {}
+
+    captured = capsys.readouterr()
+    assert "[WARN] translation cache JSON load failed" in captured.out
+    assert str(cache_path) in captured.out
+
+
 def test_translation_cache_key_changes_with_character_reference():
     segments = _segments(2)
 

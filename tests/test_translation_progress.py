@@ -93,7 +93,7 @@ def test_grok_chat_keeps_streaming_json_object(monkeypatch):
     requests: list[dict] = []
     monkeypatch.setenv("LLM_API_FORMAT", "chat")
     monkeypatch.setenv("LLM_MODEL_NAME", "grok-4.20-0309-non-reasoning")
-    monkeypatch.setenv("LLM_REASONING_EFFORT", "max")
+    monkeypatch.setenv("LLM_REASONING_EFFORT", "xhigh")
     monkeypatch.setattr(
         translator,
         "_create_chat_completion",
@@ -111,7 +111,7 @@ def test_grok_chat_keeps_streaming_json_object(monkeypatch):
     assert output == '{"translations":[{"id":0,"text":"甲"},{"id":1,"text":"乙"}]}'
     request = requests[0]
     assert request["stream"] is True
-    assert request["reasoning_effort"] == "max"
+    assert request["reasoning_effort"] == "xhigh"
     assert request["extra_body"] == {"thinking": {"type": "enabled"}}
     assert request["response_format"] == {"type": "json_object"}
     assert "tools" not in request
@@ -172,7 +172,7 @@ def test_grok_responses_uses_standard_openai_shape_without_micu_patch(monkeypatc
     requests: list[dict] = []
     monkeypatch.setenv("LLM_API_FORMAT", "responses")
     monkeypatch.setenv("LLM_MODEL_NAME", "grok-4.20-0309-non-reasoning")
-    monkeypatch.setenv("LLM_REASONING_EFFORT", "max")
+    monkeypatch.setenv("LLM_REASONING_EFFORT", "xhigh")
     monkeypatch.setenv("OPENAI_COMPATIBILITY_BASE_URL", "https://api.openai.example/v1")
 
     def fake_create_response(request):
@@ -199,7 +199,7 @@ def test_grok_responses_uses_standard_openai_shape_without_micu_patch(monkeypatc
     assert request["stream"] is True
     assert request["input"][0]["role"] == "system"
     assert request["input"][0]["content"][0]["type"] == "input_text"
-    assert request["reasoning"] == {"effort": "high"}
+    assert request["reasoning"] == {"effort": "xhigh"}
     assert request["text"] == {"format": {"type": "json_object"}}
     assert request["max_output_tokens"] == translator.TRANSLATION_MAX_TOKENS
     assert "max_tokens" not in request
@@ -209,7 +209,7 @@ def test_grok_responses_stream_request_shape(monkeypatch):
     requests: list[dict] = []
     monkeypatch.setenv("LLM_API_FORMAT", "responses")
     monkeypatch.setenv("LLM_MODEL_NAME", "grok-4.20-0309-non-reasoning")
-    monkeypatch.setenv("LLM_REASONING_EFFORT", "max")
+    monkeypatch.setenv("LLM_REASONING_EFFORT", "xhigh")
     monkeypatch.setenv("OPENAI_COMPATIBILITY_BASE_URL", "https://www.micuapi.ai/v1")
     monkeypatch.setenv("API_KEY", "test-key")
 
@@ -242,7 +242,7 @@ def test_grok_responses_stream_request_shape(monkeypatch):
     assert request["input"] == [{"role": "user", "content": "USER:\njson"}]
     assert request["stream"] is True
     assert request["max_tokens"] == max(16000, translator.TRANSLATION_MAX_TOKENS)
-    assert request["reasoning"] == {"effort": "high"}
+    assert request["reasoning"] == {"effort": "xhigh"}
     assert request["include_reasoning"] is True
     assert "text" not in request
     assert "tools" not in request

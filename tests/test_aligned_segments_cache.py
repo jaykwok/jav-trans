@@ -4,6 +4,8 @@ from pathlib import Path
 import pytest
 
 import main
+from pipeline import audio as pipeline_audio
+from pipeline.audio import get_audio_cache_key
 from helpers import make_job_context, run_pipeline
 
 
@@ -45,7 +47,7 @@ def test_aligned_segments_written_with_audio_cache_key(monkeypatch, tmp_path):
             {"transcript_chunks": [{"text": "こんにちは"}], "stage_timings": {}},
         )
 
-    monkeypatch.setattr(main, "extract_audio", fake_extract_audio)
+    monkeypatch.setattr(pipeline_audio, "extract_audio", fake_extract_audio)
     monkeypatch.setattr(main.asr_module, "transcribe_and_align", fake_transcribe_and_align)
 
     run_pipeline(video_path, ctx)
@@ -67,7 +69,7 @@ def test_aligned_segments_cache_hit_skips_asr(monkeypatch, tmp_path):
     temp_root = tmp_path / "jobs"
     job_dir = temp_root / "clip"
     job_dir.mkdir(parents=True)
-    audio_cache_key = main._get_audio_cache_key(str(video_path))
+    audio_cache_key = get_audio_cache_key(str(video_path))
     aligned_path = job_dir / "clip.aligned_segments.json"
     aligned_path.write_text(
         json.dumps(
@@ -93,7 +95,7 @@ def test_aligned_segments_cache_hit_skips_asr(monkeypatch, tmp_path):
         keep_temp_files=True,
     )
     monkeypatch.setattr(
-        main,
+        pipeline_audio,
         "extract_audio",
         lambda *_args, **_kwargs: (_ for _ in ()).throw(
             AssertionError("extract_audio should be skipped on aligned cache hit")
@@ -156,7 +158,7 @@ def test_aligned_segments_cache_miss_when_audio_key_changes(monkeypatch, tmp_pat
             {"transcript_chunks": [], "stage_timings": {}},
         )
 
-    monkeypatch.setattr(main, "extract_audio", fake_extract_audio)
+    monkeypatch.setattr(pipeline_audio, "extract_audio", fake_extract_audio)
     monkeypatch.setattr(main.asr_module, "transcribe_and_align", fake_transcribe_and_align)
 
     run_pipeline(video_path, ctx)

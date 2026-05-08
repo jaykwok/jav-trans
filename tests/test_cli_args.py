@@ -2,6 +2,11 @@ from pathlib import Path
 
 import main
 from helpers import make_job_context
+from pipeline.output import (
+    resolve_output_dir_for_ctx,
+    resolve_subtitle_bilingual_for_ctx,
+)
+from utils.model_paths import PROJECT_ROOT
 
 
 def test_old_cli_runtime_helpers_removed():
@@ -19,7 +24,10 @@ def test_resolve_output_dir_defaults_to_video_folder(tmp_path):
     video_path.write_bytes(b"fake")
     ctx = make_job_context(video_path, None, tmp_path / "jobs")
 
-    assert Path(main._resolve_output_dir_for_ctx(str(video_path), ctx)) == video_dir
+    assert (
+        Path(resolve_output_dir_for_ctx(str(video_path), ctx, project_root=PROJECT_ROOT))
+        == video_dir
+    )
 
 
 def test_resolve_output_dir_uses_job_context_output_dir(tmp_path):
@@ -28,7 +36,10 @@ def test_resolve_output_dir_uses_job_context_output_dir(tmp_path):
     output_dir = tmp_path / "subs"
     ctx = make_job_context(video_path, output_dir, tmp_path / "jobs")
 
-    assert Path(main._resolve_output_dir_for_ctx(str(video_path), ctx)) == output_dir
+    assert (
+        Path(resolve_output_dir_for_ctx(str(video_path), ctx, project_root=PROJECT_ROOT))
+        == output_dir
+    )
     assert output_dir.is_dir()
 
 
@@ -44,5 +55,5 @@ def test_subtitle_mode_comes_from_job_context(tmp_path):
         subtitle_mode="bilingual",
     )
 
-    assert main._resolve_subtitle_bilingual_for_ctx(zh_ctx) is False
-    assert main._resolve_subtitle_bilingual_for_ctx(bilingual_ctx) is True
+    assert resolve_subtitle_bilingual_for_ctx(zh_ctx) is False
+    assert resolve_subtitle_bilingual_for_ctx(bilingual_ctx) is True

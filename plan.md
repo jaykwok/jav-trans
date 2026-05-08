@@ -14,6 +14,7 @@
 - 支持后端：`anime-whisper`、`qwen3-asr-1.7b`、`whisper-ja-1.5b`、`whisper-ja-anime-v0.3`。
 - 默认 VAD：`ASR_VAD_BACKEND=whisperseg`，`WHISPERSEG_THRESHOLD=0.35`。
 - 默认翻译配置示例为 OpenAI-compatible LLM 服务；翻译请求使用流式输出 + 结构化 JSON 输出，Web 任务默认 `translation_batch_size=200`，`translation_max_workers=4`。
+- 翻译 reasoning effort 只保留两档：`medium` / `xhigh`。Chat Completions、标准 Responses、Micu+Grok Responses patch 均直接透传 `medium` 或 `xhigh`，不再把 `xhigh` 映射为 `high`。
 - 字幕约束：`MAX_SUBTITLE_DURATION=8.0`，`ASR_MERGE_HARD_MAX_DURATION=9.0`，相邻短块合并受标点、speaker guard 和 gender guard 限制。
 - 默认 ASR recovery：`ASR_RECOVERY_ENABLED=0`。异常 ASR 文本块排查时才手动打开；男女混句边界由 F0 后 gender turn 重切段处理。
 - 断点续传：ASR checkpoint、`aligned_segments.json`、translation cache、translation artifact snapshot。
@@ -44,9 +45,10 @@
 | T-S ✅ | 后端稳定性收口（JobSpec 边界、删除锁顺序、run logger 泄漏、cache 损坏容忍） | 58 passed |
 | T-U ✅ | 后端大文件拆分：`src/main.py` helper 迁入 `src/pipeline/`（8 个子模块） | 宽回归 93 passed |
 | T-V ✅ | 前端 `app.js` 拆分为 14 个 ES Module；修复日志刷新导致粘贴菜单被关闭的 bug | 语法全通，手动验证 |
+| T-W ✅ | 翻译 reasoning effort 收口为 `medium` / `xhigh` 两档；Responses 不做兼容降级映射 | 36 passed |
 
 <details>
-<summary>T-S / T-U 详细记录</summary>
+<summary>T-S 到 T-W 详细记录</summary>
 
 **T-S 完成内容：**
 - `JobSpec` 增加输入边界，`/api/config` 避免 `video_paths` 必填校验污染默认配置读取。
@@ -66,45 +68,25 @@
 
 当前后端大文件排行（供 B1–B3 参考）：
 - `src/whisper/pipeline.py`：2259 行。
-- `src/llm/translator.py`：1627 行。
+- `src/llm/translator.py`：1626 行。
 - `src/main.py`：1487 行。
 - `src/whisper/local_backend.py`：1209 行。
-- `src/web/pipeline_manager.py`：529 行。
+- `src/web/pipeline_manager.py`：531 行。
+
+**T-V 完成内容（折叠）：**
+- `src/web/static/app.js` 拆为 `src/web/static/js/` 下 14 个 ES Module，入口改为 `<script type="module" src="js/main.js">`。
+- 旧 `app.js` 归档到 `agents/rm/app.js.bak`。
+- 修复日志刷新滚动事件导致右键粘贴菜单关闭的问题。
+
+**T-W 完成内容：**
+- `src/llm/translator.py`：默认 `LLM_REASONING_EFFORT=xhigh`；Chat 和 Responses 均只归一化到 `medium` / `xhigh`。
+- `src/llm/patch.py`：Micu+Grok Responses 特例不再把 `xhigh` 映射成 `high`，直接发送 `{"effort":"xhigh"}`。
+- `src/core/job_context.py`、`src/web/pipeline_manager.py`、`src/web/routes/config.py`、`src/web/models.py`：Web 任务和 settings API 只接受/快照 `medium` / `xhigh`。
+- `src/web/static/index.html`、`src/web/static/js/settings.js`：前端推理强度下拉框只显示 `medium` / `xhigh`，默认 `xhigh`。
+- `.env.example` 与默认配置同步为 `LLM_REASONING_EFFORT=xhigh`；真实 `.env` 是本地私密文件，不提交。
+- 验证：`py_compile`、`node --check src/web/static/js/settings.js`、定向 pytest 36 passed。
 
 </details>
-
-### T-V：前端 app.js 拆分为 ES Module ✅
-
-**背景**：`src/web/static/app.js` 膨胀至 1143 行，经典脚本、无模块化、状态散落顶层。
-
-**结果**：拆为 `src/web/static/js/` 下 14 个 ES Module，`index.html` 改为 `<script type="module" src="js/main.js">`，旧 `app.js` 归档到 `agents/rm/app.js.bak`。
-
-| 文件 | 职责 | 行数 |
-|------|------|------|
-| `util.js` | `$`、`escHtml`、`showToast` | 13 |
-| `state.js` | `state` 单例、`ACTIVE_STATUSES`、`MAX_LOG` | 10 |
-| `dom.js` | 10 个 DOM ref 命名导出 | 12 |
-| `log.js` | `addLog`、日志区事件 | 36 |
-| `formMemory.js` | localStorage 表单记忆（v3） | 69 |
-| `pasteMenu.js` | 右键复制/粘贴菜单（含 scroll bug 修复） | 96 |
-| `presets.js` | 预设 chip、TUNING_FIELDS、custom 保存 | 100 |
-| `jobsRender.js` | 任务卡渲染、jobArea click 委托 | 222 |
-| `jobsApi.js` | `fetchJob`、`fetchAllJobs`、`startJobPolling` | 42 |
-| `sse.js` | SSE 实时事件、`_download` 进度写入 | 77 |
-| `settings.js` | loadConfig / loadSettings / installSettingsPanel | 238 |
-| `hfMirror.js` | HF 镜像开关 + 下载取消重提 | 79 |
-| `files.js` | 文件选择、拖拽、提交链 | 146 |
-| `main.js` | 启动序列、Ctrl+Enter 快捷键 | 43 |
-
-**关键设计决策**：
-- `activePreset` 合入 `state.activePreset`（避免 `export let` live binding 陷阱）。
-- `jobsRender ↔ jobsApi` 循环：`installJobAreaHandlers(fetchAllJobs, enableHfMirror)` 参数注入。
-- `pasteMenu.js` 无外部 import，`pasteTarget/pasteMenu` 模块私有。
-- `window.__pywebviewDrop` 桥在 `installFiles()` 内挂载，保持不变。
-
-**Bug 修复**（含在本次 commit）：日志刷新时 `logScroll.scrollTop = ...` 触发 scroll 事件，导致粘贴菜单被 `hidePasteMenu` 关闭。修复：scroll handler 跳过 `e.target.id === 'log-scroll'` 的事件。
-
----
 
 ## 4. 当前待办 / Backlog
 
@@ -123,7 +105,7 @@
 
 ### B2：继续拆分 `src/llm/translator.py`
 
-现状：约 1627 行，仍是第二大后端文件。
+现状：约 1626 行，仍是第二大后端文件。
 
 建议拆分方向：
 - cache：JSON/JSONL cache 读写、损坏 warning、cache key。
@@ -199,4 +181,3 @@
 - T-U 完成后：后端拆分定向 38 passed；宽后端回归 93 passed。
 
 </details>
-

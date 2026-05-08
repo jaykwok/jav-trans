@@ -7,7 +7,11 @@ from pathlib import Path
 import pytest
 
 import main
+from pipeline import audio as pipeline_audio
+from pipeline.cleanup import cleanup_job_temp
 from helpers import make_job_context, run_pipeline
+
+
 def _segments(count: int, *, empty: bool = False) -> list[dict]:
     return [
         {
@@ -48,7 +52,7 @@ def _mock_audio_and_asr(monkeypatch, segments: list[dict], *, checkpoint: bool =
             },
         )
 
-    monkeypatch.setattr(main, "extract_audio", fake_extract_audio)
+    monkeypatch.setattr(pipeline_audio, "extract_audio", fake_extract_audio)
     monkeypatch.setattr(main.asr_module, "transcribe_and_align", fake_transcribe_and_align)
 
 
@@ -67,6 +71,16 @@ def _fake_translation_json(messages, expected_count=0, on_progress=None, **_kwar
 
 def _load_cache(path: Path) -> dict:
     return main.translator_module._load_translation_cache(path)
+
+
+def _cleanup_job_temp(job_temp_dir: Path) -> None:
+    chunk_root = Path(
+        getattr(main.asr_module, "_ASR_CHUNK_ROOT", Path("temp") / "chunks")
+    )
+    cleanup_job_temp(
+        str(job_temp_dir),
+        checkpoint_root=chunk_root.resolve().parent,
+    )
 
 
 def test_s1_skip_translation_writes_japanese_srt_without_translator(monkeypatch, tmp_path):
@@ -109,7 +123,7 @@ def test_s2_cleanup_removes_entire_job_temp_dir(tmp_path):
     (job_dir / "asr_checkpoint_fake.json").write_text("{}", encoding="utf-8")
     (job_dir / "clip.srt").write_text("1\n", encoding="utf-8")
 
-    main._cleanup_job_temp(str(job_dir))
+    _cleanup_job_temp(job_dir)
 
     assert not (audio_dir / "clip.wav").exists()
     assert not (job_dir / "translation_cache.jsonl").exists()

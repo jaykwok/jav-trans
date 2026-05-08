@@ -4,6 +4,7 @@ from pathlib import Path
 
 import main
 from core.job_context import JobContext
+from pipeline.ids import sanitize_job_id
 
 
 def make_job_context(
@@ -28,7 +29,7 @@ def make_job_context(
     advanced: dict[str, str] | None = None,
 ) -> JobContext:
     video = Path(video_path)
-    effective_job_id = main._sanitize_job_id(job_id or video.stem)
+    effective_job_id = sanitize_job_id(job_id or video.stem)
     job_temp_dir = Path(job_temp_root) / effective_job_id
     return JobContext(
         asr_backend=asr_backend,
@@ -68,12 +69,9 @@ def run_pipeline(
         job_id=ctx.job_id,
         cache_job_id=cache_job_id,
     )
-    try:
-        return main.run_translation_and_write(
-            str(video_path),
-            artifacts,
-            ctx=ctx,
-            job_id=ctx.job_id,
-        )
-    finally:
-        main._close_run_logger(artifacts.logger)
+    return main.run_translation_and_write(
+        str(video_path),
+        artifacts,
+        ctx=ctx,
+        job_id=ctx.job_id,
+    )

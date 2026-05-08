@@ -1,14 +1,11 @@
 import os
 import re
-import hashlib
 import json
 import logging
 import time
-import subprocess
 import sys
 import warnings
 from contextlib import contextmanager
-from dataclasses import dataclass, fields
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -16,11 +13,17 @@ warnings.filterwarnings("ignore")
 os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
 os.environ["HF_HUB_DISABLE_SYMLINKS_WARNING"] = "1"
 
-import xxhash
-
 from core import events
 from core.config import load_config
 from core.job_context import JobContext
+from pipeline import aligned_cache as aligned_cache_module
+from pipeline import audio as audio_module
+from pipeline import cleanup as cleanup_module
+from pipeline import gender_split as gender_split_module
+from pipeline import output as output_module
+from pipeline import quality as quality_module
+from pipeline.artifacts import AsrArtifacts
+from pipeline.ids import sanitize_job_id
 from utils.model_paths import PROJECT_ROOT
 
 
@@ -70,7 +73,6 @@ from whisper import pipeline as asr_module
 from subtitles import writer as subtitle_module
 from llm import translator as translator_module
 from whisper.qc import asr_qc_gate, build_asr_manifest
-from subtitles.qc import compute_quality_report
 
 from rich.console import Console
 from rich.progress import (
@@ -94,23 +96,6 @@ _ASR_STAGE_MAP = {
     "Alignment 对齐": "alignment",
     "Alignment 局部细化": "alignment",
     "Alignment 降级重试": "alignment",
-}
-_AUDIO_SAMPLE_RATE = max(8000, int(os.getenv("AUDIO_SAMPLE_RATE", "16000")))
-_AUDIO_CHANNELS = max(1, int(os.getenv("AUDIO_CHANNELS", "1")))
-_AUDIO_BASE_FILTER = os.getenv("AUDIO_FILTER", "highpass=f=70,lowpass=f=7600").strip()
-_AUDIO_CACHE_SAMPLE_BYTES = 4 * 1024 * 1024
-_AUDIO_DYNAUDNORM_FILTER = "agate=threshold=0.01,dynaudnorm=f=250:g=15"
-_AUDIO_USE_LOUDNORM = os.getenv("AUDIO_USE_LOUDNORM", "0").strip().lower() in {
-    "1",
-    "true",
-    "yes",
-    "on",
-}
-_AUDIO_DYNAUDNORM = os.getenv("AUDIO_DYNAUDNORM", "1").strip().lower() in {
-    "1",
-    "true",
-    "yes",
-    "on",
 }
 
 
@@ -259,7 +244,7 @@ def _setup_run_logger(
 ) -> tuple[logging.Logger, Path]:
     log_dir = _run_log_dir(ctx)
     log_dir.mkdir(parents=True, exist_ok=True)
-    safe_backend = _sanitize_job_id(backend_label.replace(" ", "_"))
+    safe_backend = sanitize_job_id(backend_label.replace(" ", "_"))
     stamp = time.strftime("%Y%m%d_%H%M%S")
     log_path = log_dir / f"{stamp}_{job_id}_{safe_backend}.run.log"
     logger_name = f"javtrans.run.{job_id}.{stamp}"
@@ -280,6 +265,21 @@ def _close_run_logger(logger: logging.Logger | None) -> None:
         handler.flush()
         handler.close()
         logger.removeHandler(handler)
+
+
+def _clear_thread_run_logger(logger: logging.Logger | None) -> None:
+    if logger is not None and getattr(events._thread_local, "run_logger", None) is logger:
+        try:
+            delattr(events._thread_local, "run_logger")
+        except AttributeError:
+            pass
+
+
+def _close_artifacts_logger(artifacts: "AsrArtifacts") -> None:
+    logger = artifacts.logger if isinstance(artifacts.logger, logging.Logger) else None
+    _close_run_logger(logger)
+    _clear_thread_run_logger(logger)
+    artifacts.logger = None
 
 
 def _event_ts() -> str:
@@ -432,57 +432,6 @@ def _log_timing_snapshot(
             logger.info("timing %s=%.2fs", label, float(value))
 
 
-def _build_audio_filter_chain() -> str:
-    dynaudnorm_enabled = os.getenv(
-        "AUDIO_DYNAUDNORM",
-        "1" if _AUDIO_DYNAUDNORM else "0",
-    ).strip().lower() in {"1", "true", "yes", "on"}
-    loudnorm_enabled = os.getenv(
-        "AUDIO_USE_LOUDNORM",
-        "1" if _AUDIO_USE_LOUDNORM else "0",
-    ).strip().lower() in {"1", "true", "yes", "on"}
-
-    filters = []
-    if _AUDIO_BASE_FILTER:
-        filters.append(_AUDIO_BASE_FILTER)
-    if dynaudnorm_enabled:
-        filters.append(_AUDIO_DYNAUDNORM_FILTER)
-        if loudnorm_enabled:
-            print("[WARN] AUDIO_USE_LOUDNORM ignored when AUDIO_DYNAUDNORM=1")
-    elif loudnorm_enabled:
-        filters.append("loudnorm=I=-16:LRA=11:TP=-1.5")
-    return ",".join(filters)
-
-
-def _video_content_sample_hash(video_path: str) -> str:
-    path = Path(video_path)
-    size = path.stat().st_size
-    hasher = xxhash.xxh3_64()
-    with path.open("rb") as reader:
-        if size <= _AUDIO_CACHE_SAMPLE_BYTES * 2:
-            hasher.update(reader.read())
-        else:
-            hasher.update(reader.read(_AUDIO_CACHE_SAMPLE_BYTES))
-            reader.seek(size - _AUDIO_CACHE_SAMPLE_BYTES)
-            hasher.update(reader.read(_AUDIO_CACHE_SAMPLE_BYTES))
-    return hasher.hexdigest()
-
-
-def _get_audio_cache_key(video_path: str) -> str:
-    video_hash = _video_content_sample_hash(video_path)
-    payload = (
-        f"{_AUDIO_SAMPLE_RATE}|{_AUDIO_CHANNELS}|"
-        f"{_build_audio_filter_chain()}|{video_hash}"
-    )
-    return hashlib.sha1(payload.encode("utf-8")).hexdigest()[:8]
-
-
-def _sanitize_job_id(value: str) -> str:
-    sanitized = re.sub(r"[^0-9A-Za-z._-]+", "_", (value or "").strip())
-    sanitized = sanitized.strip("._-")
-    return sanitized or "job"
-
-
 def _resolve_job_temp_dir(job_id: str) -> str:
     root = os.getenv("JOB_TEMP_DIR", "").strip()
     if not root:
@@ -490,91 +439,16 @@ def _resolve_job_temp_dir(job_id: str) -> str:
     path = Path(root).expanduser()
     if not path.is_absolute():
         path = PROJECT_ROOT / path
-    return str((path / _sanitize_job_id(job_id)).resolve())
+    return str((path / sanitize_job_id(job_id)).resolve())
 
 
-def _unlink_for_cleanup(path: Path) -> None:
+def _asr_checkpoint_root() -> Path:
     try:
-        if path.exists() and path.is_file():
-            path.unlink()
-    except Exception as exc:
-        print(f"[WARN] cleanup failed for {path}: {exc}", file=sys.stderr)
-
-
-def _cleanup_translation_cache(cache_path: str = "") -> None:
-    raw_path = cache_path or os.getenv("TRANSLATION_CACHE_PATH", "").strip()
-    if not raw_path:
-        return
-
-    raw_cache_path = Path(raw_path)
-    cache_paths = [raw_cache_path]
-    if raw_cache_path.suffix.lower() == ".json":
-        cache_paths.append(raw_cache_path.with_suffix(".jsonl"))
-    elif raw_cache_path.suffix.lower() == ".jsonl":
-        cache_paths.append(raw_cache_path.with_suffix(".json"))
-
-    for cache_path in cache_paths:
-        _unlink_for_cleanup(cache_path)
-        for tmp_path in cache_path.parent.glob(f"{cache_path.name}.*.tmp"):
-            _unlink_for_cleanup(tmp_path)
-
-
-def _cleanup_asr_checkpoints(job_temp_dir: Path) -> None:
-    try:
-        checkpoint_root = Path(
+        return Path(
             getattr(asr_module, "_ASR_CHUNK_ROOT", Path("temp") / "chunks")
         ).resolve().parent
     except Exception:
-        checkpoint_root = Path("temp")
-
-    job_marker = str(job_temp_dir.resolve()).replace("\\", "/").lower()
-    for checkpoint_path in checkpoint_root.glob("asr_checkpoint_*.json"):
-        try:
-            payload = json.loads(checkpoint_path.read_text(encoding="utf-8"))
-            checkpoint_source = str(payload.get("audio_path", ""))
-        except Exception:
-            checkpoint_source = ""
-        normalized_source = checkpoint_source.replace("\\", "/").lower()
-        if job_marker and job_marker in normalized_source:
-            _unlink_for_cleanup(checkpoint_path)
-
-
-def _cleanup_asr_checkpoint_for_audio(audio_path: str) -> None:
-    try:
-        checkpoint_path = Path(asr_module._get_asr_checkpoint_path(audio_path))
-    except Exception as exc:
-        print(f"[WARN] cleanup failed to resolve ASR checkpoint: {exc}", file=sys.stderr)
-        return
-    _unlink_for_cleanup(checkpoint_path)
-
-
-def _cleanup_job_temp(job_temp_dir: str, translation_cache_path: str = "") -> None:
-    root = Path(job_temp_dir)
-    _cleanup_translation_cache(translation_cache_path)
-    _cleanup_asr_checkpoints(root)
-
-    if not root.exists() or not root.is_dir():
-        return
-
-    for path in sorted(root.rglob("*"), key=lambda item: len(item.parts), reverse=True):
-        try:
-            if path.is_file():
-                path.unlink()
-        except Exception as exc:
-            print(f"[WARN] cleanup failed for {path}: {exc}", file=sys.stderr)
-
-    for path in sorted(root.rglob("*"), key=lambda item: len(item.parts), reverse=True):
-        try:
-            if path.is_dir() and not any(path.iterdir()):
-                path.rmdir()
-        except Exception as exc:
-            print(f"[WARN] cleanup failed for {path}: {exc}", file=sys.stderr)
-
-    try:
-        if root.exists() and not any(root.iterdir()):
-            root.rmdir()
-    except Exception as exc:
-        print(f"[WARN] cleanup failed for {root}: {exc}", file=sys.stderr)
+        return Path("temp")
 
 
 def _resolve_project_runtime_path(raw_path: str | Path) -> Path:
@@ -584,47 +458,25 @@ def _resolve_project_runtime_path(raw_path: str | Path) -> Path:
     return path.resolve()
 
 
-def _cleanup_empty_runtime_dir_tree(root: Path) -> None:
-    try:
-        resolved = root.resolve()
-        resolved.relative_to(PROJECT_ROOT)
-    except Exception as exc:
-        print(f"[WARN] cleanup skipped for {root}: {exc}", file=sys.stderr)
-        return
-
-    if not resolved.exists() or not resolved.is_dir():
-        return
-
-    for path in sorted(resolved.rglob("*"), key=lambda item: len(item.parts), reverse=True):
-        try:
-            if path.is_dir() and not any(path.iterdir()):
-                path.rmdir()
-        except Exception as exc:
-            print(f"[WARN] cleanup failed for {path}: {exc}", file=sys.stderr)
-
-    try:
-        if resolved.exists() and not any(resolved.iterdir()):
-            resolved.rmdir()
-    except Exception as exc:
-        print(f"[WARN] cleanup failed for {resolved}: {exc}", file=sys.stderr)
-
-
-def _cleanup_runtime_ephemeral_temp() -> None:
-    roots = [
-        _resolve_project_runtime_path(os.getenv("JOB_TEMP_DIR", "temp/jobs") or "temp/jobs"),
-        Path(getattr(asr_module, "_ASR_CHUNK_ROOT", Path("temp") / "chunks")).resolve(),
-        _resolve_project_runtime_path(
-            os.getenv("ASR_RECOVERY_OUTPUT_ROOT", Path("temp") / "recovery")
-        ),
-    ]
-    for root in roots:
-        _cleanup_empty_runtime_dir_tree(root)
-
-
 def _cleanup_pipeline_temp(job_temp_dir: str, audio_path: str, translation_cache_path: str = "") -> None:
-    _cleanup_asr_checkpoint_for_audio(audio_path)
-    _cleanup_job_temp(job_temp_dir, translation_cache_path)
-    _cleanup_runtime_ephemeral_temp()
+    cleanup_module.cleanup_asr_checkpoint_for_audio(
+        audio_path,
+        asr_module._get_asr_checkpoint_path,
+    )
+    cleanup_module.cleanup_job_temp(
+        job_temp_dir,
+        translation_cache_path,
+        checkpoint_root=_asr_checkpoint_root(),
+    )
+    cleanup_module.cleanup_runtime_ephemeral_temp(
+        job_temp_root=os.getenv("JOB_TEMP_DIR", "temp/jobs") or "temp/jobs",
+        asr_chunk_root=getattr(asr_module, "_ASR_CHUNK_ROOT", Path("temp") / "chunks"),
+        recovery_output_root=os.getenv(
+            "ASR_RECOVERY_OUTPUT_ROOT",
+            str(Path("temp") / "recovery"),
+        ),
+        project_root=PROJECT_ROOT,
+    )
 
 
 def _format_asr_stage_label(raw_label: str) -> str:
@@ -636,71 +488,6 @@ def _format_asr_stage_label(raw_label: str) -> str:
         "Alignment 降级重试": "Alignment 降级重试",
     }
     return mapping.get(raw_label, raw_label)
-
-
-def _resolve_output_dir_for_ctx(video_path: str, ctx: JobContext) -> str:
-    if ctx.output_dir:
-        output_path = Path(ctx.output_dir).expanduser()
-        if not output_path.is_absolute():
-            output_path = PROJECT_ROOT / output_path
-    else:
-        output_path = Path(video_path).expanduser()
-        if not output_path.is_absolute():
-            output_path = PROJECT_ROOT / output_path
-        output_path = output_path.resolve().parent
-    output_path.mkdir(parents=True, exist_ok=True)
-    return str(output_path.resolve())
-
-
-def _resolve_subtitle_bilingual_for_ctx(ctx: JobContext) -> bool:
-    return ctx.subtitle_mode.strip().lower() in {"bilingual", "dual", "ja_zh", "ja-zh", "2"}
-
-
-def extract_audio(video_path: str, out_path: str):
-    command = [
-        "ffmpeg",
-        "-y",
-        "-i",
-        video_path,
-        "-vn",
-        "-acodec",
-        "pcm_s16le",
-        "-ar",
-        str(_AUDIO_SAMPLE_RATE),
-        "-ac",
-        str(_AUDIO_CHANNELS),
-    ]
-    filter_chain = _build_audio_filter_chain()
-    if filter_chain:
-        command.extend(["-af", filter_chain])
-    command.extend([out_path, "-loglevel", "error"])
-    subprocess.run(command, check=True)
-
-
-def _probe_video_duration_s(video_path: str) -> float | None:
-    command = [
-        "ffprobe",
-        "-v",
-        "error",
-        "-show_entries",
-        "format=duration",
-        "-of",
-        "default=noprint_wrappers=1:nokey=1",
-        video_path,
-    ]
-    try:
-        completed = subprocess.run(
-            command,
-            check=True,
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-        )
-        duration = float(completed.stdout.strip())
-    except (OSError, subprocess.CalledProcessError, TypeError, ValueError):
-        return None
-    return duration if duration > 0 else None
 
 
 def _write_json(path: str, payload: dict) -> None:
@@ -768,89 +555,7 @@ def _timings_payload(
     return payload
 
 
-def _parse_glossary_pairs_from_text(text: str) -> list[tuple[str, str]]:
-    pairs: list[tuple[str, str]] = []
-    for part in re.split(r"[,，\n]+", text or ""):
-        item = part.strip()
-        if not item:
-            continue
-        if "→" in item:
-            ja, zh = item.split("→", 1)
-        elif "->" in item:
-            ja, zh = item.split("->", 1)
-        else:
-            continue
-        ja = ja.strip()
-        zh = zh.strip()
-        if ja and zh:
-            pairs.append((ja, zh))
-    return pairs
-
-
-def _load_global_glossary_pairs(job_temp_dir: str, video_stem: str) -> list[tuple[str, str]]:
-    pairs: list[tuple[str, str]] = []
-    root = Path(job_temp_dir)
-    candidates = [
-        root / f"{video_stem}.translation_global_glossary.json",
-        root / "translation_global_glossary.json",
-    ]
-    for path in candidates:
-        if not path.exists():
-            continue
-        try:
-            payload = json.loads(path.read_text(encoding="utf-8"))
-            terms = payload.get("terms") if isinstance(payload, dict) else payload
-            if not isinstance(terms, list):
-                continue
-            for item in terms:
-                if not isinstance(item, dict):
-                    continue
-                ja = str(item.get("ja", "")).strip()
-                zh = str(item.get("zh", "")).strip()
-                if ja and zh:
-                    pairs.append((ja, zh))
-        except Exception as exc:
-            console.print(f"[yellow]WARNING: 读取全局术语表失败 {path}: {exc}[/yellow]")
-    return pairs
-
-
-def _collect_glossary_pairs(
-    job_temp_dir: str,
-    video_stem: str,
-    glossary: str | None = None,
-) -> list[tuple[str, str]]:
-    source_glossary = os.getenv("TRANSLATION_GLOSSARY", "") if glossary is None else glossary
-    pairs = _parse_glossary_pairs_from_text(source_glossary)
-    pairs.extend(_load_global_glossary_pairs(job_temp_dir, video_stem))
-
-    merged: list[tuple[str, str]] = []
-    seen: set[tuple[str, str]] = set()
-    for ja, zh in pairs:
-        key = (ja, zh)
-        if key in seen:
-            continue
-        seen.add(key)
-        merged.append(key)
-    return merged
-
-
-def _quality_segments_from_blocks(blocks: list[dict]) -> list[dict]:
-    quality_segments: list[dict] = []
-    for block in blocks:
-        segment = {
-            "start": float(block.get("start", 0.0)),
-            "end": float(block.get("end", 0.0)),
-            "text": str(block.get("ja_text") or block.get("text") or block.get("ja") or ""),
-            "ja": str(block.get("ja_text") or block.get("text") or block.get("ja") or ""),
-            "zh": str(block.get("zh_text") or block.get("zh") or ""),
-        }
-        if "gender" in block:
-            segment["gender"] = block.get("gender")
-        quality_segments.append(segment)
-    return quality_segments
-
-
-def _write_quality_report(
+def _write_quality_report_for_ctx(
     *,
     video_stem: str,
     job_temp_dir: str,
@@ -862,198 +567,36 @@ def _write_quality_report(
     enabled: bool | None = None,
     glossary: str | None = None,
 ) -> str | None:
-    if enabled is None:
-        enabled = _env_flag("QUALITY_REPORT_ENABLED")
-    if not enabled:
-        return None
-
-    try:
-        glossary_pairs = _collect_glossary_pairs(job_temp_dir, video_stem, glossary)
-        fallback_count = int((asr_details or {}).get("fallback_count", 0))
-        if video_duration_s is None:
-            video_duration_s = float(
-                (asr_details or {}).get("audio_duration_s", len(aligned_segments) * 2.0)
-            )
-        report = compute_quality_report(
-            aligned_segments,
-            video_duration_s,
-            glossary_pairs,
-            fallback_count,
-            len(aligned_segments),
-            f0_filtered_count=f0_filtered_count,
-            f0_failure=f0_failure,
-        )
-        report_dir = Path(os.getenv("QUALITY_REPORT_DIR", "./reports")).expanduser()
-        if not report_dir.is_absolute():
-            report_dir = PROJECT_ROOT / report_dir
-        report_path = report_dir.resolve() / f"{video_stem}.quality_report.json"
-        _write_json_atomic(report_path, report)
-
-        warnings_list = report.get("warnings") or []
-        if warnings_list:
-            console.print("[yellow]WARNING: 字幕质量报告发现以下问题：[/yellow]")
-            for warning in warnings_list:
-                console.print(f"[yellow]- {warning}[/yellow]")
-        if os.getenv("QC_HARD_FAIL", "0").strip() == "1" and warnings_list:
-            raise RuntimeError(
-                f"QC_HARD_FAIL=1 and quality warnings present: {warnings_list}"
-            )
-        return str(report_path)
-    except RuntimeError:
-        raise
-    except Exception as exc:
-        console.print(f"[yellow]WARNING: 生成字幕质量报告失败：{exc}[/yellow]")
-        return None
+    return quality_module.write_quality_report(
+        video_stem=video_stem,
+        job_temp_dir=job_temp_dir,
+        aligned_segments=aligned_segments,
+        asr_details=asr_details,
+        project_root=PROJECT_ROOT,
+        console=console,
+        write_json_atomic=_write_json_atomic,
+        env_flag=_env_flag,
+        video_duration_s=video_duration_s,
+        f0_filtered_count=f0_filtered_count,
+        f0_failure=f0_failure,
+        enabled=enabled,
+        glossary=glossary,
+    )
 
 
-def _filter_f0_none_segments(
+def _filter_f0_none_segments_for_ctx(
     segments: list[dict],
     *,
     f0_failed: bool = False,
     enabled: bool | None = None,
 ) -> tuple[list[dict], int]:
-    if enabled is None:
-        enabled = _env_flag("F0_FILTER_NONE_SEGMENTS")
-    if not enabled:
-        return segments, 0
-    if f0_failed:
-        console.print(
-            "[yellow]F0 detection failed; skipping non-voice filter to preserve all segments[/yellow]"
-        )
-        return segments, 0
-    filtered = [segment for segment in segments if segment.get("gender") is not None]
-    return filtered, len(segments) - len(filtered)
-
-
-def _word_gender_value(word: dict) -> str | None:
-    gender = word.get("gender")
-    return gender if gender in {"M", "F"} else None
-
-
-def _word_text(word: dict) -> str:
-    return str(word.get("word") or word.get("text") or "").strip()
-
-
-def _gender_for_words(words: list[dict]) -> str | None:
-    genders = [_word_gender_value(word) for word in words]
-    genders = [gender for gender in genders if gender is not None]
-    if not genders:
-        return None
-    return max(("M", "F"), key=genders.count)
-
-
-def _segment_from_f0_words(segment: dict, words: list[dict]) -> dict | None:
-    if not words:
-        return None
-    text = "".join(_word_text(word) for word in words).strip()
-    if not text:
-        return None
-    try:
-        start = min(float(word.get("start", segment.get("start", 0.0))) for word in words)
-        end = max(float(word.get("end", segment.get("end", start))) for word in words)
-    except (TypeError, ValueError):
-        return None
-    if end <= start:
-        return None
-    rebuilt = dict(segment)
-    rebuilt.update(
-        {
-            "start": start,
-            "end": end,
-            "text": text,
-            "words": [dict(word) for word in words],
-            "gender": _gender_for_words(words),
-            "source_chunk_index": words[0].get(
-                "source_chunk_index",
-                segment.get("source_chunk_index"),
-            ),
-        }
+    return gender_split_module.filter_f0_none_segments(
+        segments,
+        f0_failed=f0_failed,
+        enabled=enabled,
+        default_enabled=lambda: _env_flag("F0_FILTER_NONE_SEGMENTS"),
+        warn=lambda message: console.print(f"[yellow]{message}[/yellow]"),
     )
-    return rebuilt
-
-
-def _split_segment_on_f0_gender_turns(segment: dict) -> list[dict]:
-    words = [dict(word) for word in segment.get("words") or [] if isinstance(word, dict)]
-    if len(words) < 2:
-        return [segment]
-    try:
-        words.sort(
-            key=lambda word: (
-                float(word.get("start", segment.get("start", 0.0))),
-                float(word.get("end", segment.get("end", 0.0))),
-            )
-        )
-    except (TypeError, ValueError):
-        return [segment]
-
-    groups: list[list[dict]] = []
-    current_words: list[dict] = []
-    active_gender: str | None = None
-    for word in words:
-        gender = _word_gender_value(word)
-        if (
-            current_words
-            and gender is not None
-            and active_gender is not None
-            and gender != active_gender
-        ):
-            groups.append(current_words)
-            current_words = [word]
-            active_gender = gender
-            continue
-        current_words.append(word)
-        if gender is not None:
-            active_gender = gender
-    if current_words:
-        groups.append(current_words)
-
-    if len(groups) < 2:
-        return [segment]
-
-    rebuilt_segments = [
-        rebuilt
-        for group in groups
-        for rebuilt in [_segment_from_f0_words(segment, group)]
-        if rebuilt is not None
-    ]
-    return rebuilt_segments if len(rebuilt_segments) >= 2 else [segment]
-
-
-def _split_segments_on_f0_gender_turns(segments: list[dict]) -> tuple[list[dict], int]:
-    split_segments: list[dict] = []
-    split_count = 0
-    for segment in segments:
-        pieces = _split_segment_on_f0_gender_turns(segment)
-        split_count += max(0, len(pieces) - 1)
-        split_segments.extend(pieces)
-    return split_segments, split_count
-
-
-def _try_load_aligned_segments(
-    path: str,
-    expected_audio_cache_key: str,
-    expected_backend: str,
-) -> dict | None:
-    try:
-        cache_path = Path(path)
-        if not cache_path.exists():
-            return None
-        payload = json.loads(cache_path.read_text(encoding="utf-8"))
-        if not isinstance(payload, dict):
-            return None
-        if payload.get("audio_cache_key") != expected_audio_cache_key:
-            return None
-        if payload.get("backend") != expected_backend:
-            return None
-        segments = payload.get("segments")
-        if not isinstance(segments, list):
-            return None
-        payload["segments"] = [dict(segment) for segment in segments if isinstance(segment, dict)]
-        payload["asr_details"] = payload.get("asr_details") if isinstance(payload.get("asr_details"), dict) else {}
-        payload["asr_log"] = payload.get("asr_log") if isinstance(payload.get("asr_log"), list) else []
-        return payload
-    except Exception:
-        return None
 
 
 def _build_japanese_srt_blocks(segments: list[dict]) -> list[dict]:
@@ -1100,165 +643,6 @@ def _print_timing_summary(stage_timings: dict, asr_details: dict) -> None:
     console.print(table)
 
 
-@dataclass
-class AsrArtifacts:
-    segments: list[dict]
-    audio_path: str
-    job_temp_dir: str
-    asr_details: dict
-    aligned_segments_path: str
-    transcript_path: str
-    asr_manifest_path: str
-    pipeline_timings: dict
-    logger: object  # logging.Logger | None
-    run_log_path: object  # Path | None
-    audio_cache_key: str
-    video_stem: str
-    output_dir: str
-    srt_path: str
-    bilingual_json_path: str
-    quality_report_path: str
-    bilingual: bool
-    timings_path: str
-    translation_cache_path: str
-    asr_log: list[str]
-    audio_cached: bool
-    device: str
-    backend_label: str
-    video_duration_s: float | None
-    pipeline_started: float
-    f0_filtered_count: int
-    f0_failed: bool
-    job_id: str
-
-
-_TRANSLATION_ARTIFACTS_SNAPSHOT = "translation_artifacts.json"
-_ASR_ARTIFACT_PATH_FIELDS = {
-    "audio_path",
-    "job_temp_dir",
-    "aligned_segments_path",
-    "transcript_path",
-    "asr_manifest_path",
-    "run_log_path",
-    "output_dir",
-    "srt_path",
-    "bilingual_json_path",
-    "quality_report_path",
-    "timings_path",
-    "translation_cache_path",
-}
-_ASR_NOISE_ONLY_RE = re.compile(r"^[\s\"'`“”‘’「」『』（）()\[\]［］【】〈〉《》<>]+$")
-_ASR_JA_OR_CJK_RE = re.compile(r"[\u3040-\u30ff\u3400-\u9fff]")
-_ASR_LONG_LATIN_RE = re.compile(r"[A-Za-z]{4,}")
-_ASR_ASCII_OR_WESTERN_PUNCT_RE = re.compile(
-    r"^[\s\x00-\x7F“”‘’…]+$"
-)
-
-
-def _is_asr_noise_text(text) -> bool:
-    cleaned = str(text or "").strip().replace("\u200b", "").replace("\ufeff", "")
-    if not cleaned:
-        return True
-    unescaped = cleaned.replace("\\", "").strip()
-    if _ASR_NOISE_ONLY_RE.fullmatch(unescaped):
-        return True
-    if (
-        _ASR_LONG_LATIN_RE.search(unescaped)
-        and not _ASR_JA_OR_CJK_RE.search(unescaped)
-        and _ASR_ASCII_OR_WESTERN_PUNCT_RE.fullmatch(unescaped)
-    ):
-        return True
-    return False
-
-
-def _filter_asr_noise_segments(segments: list[dict]) -> tuple[list[dict], int]:
-    filtered: list[dict] = []
-    for segment in segments:
-        text = segment.get("text", segment.get("ja_text", segment.get("ja", "")))
-        if _is_asr_noise_text(text):
-            continue
-        filtered.append(segment)
-    return filtered, len(segments) - len(filtered)
-
-
-def translation_artifacts_snapshot_path(job_temp_dir: str | Path) -> Path:
-    return Path(job_temp_dir) / _TRANSLATION_ARTIFACTS_SNAPSHOT
-
-
-def _serialize_asr_artifacts(artifacts: AsrArtifacts) -> dict:
-    payload: dict[str, object] = {}
-    for item in fields(AsrArtifacts):
-        name = item.name
-        if name == "logger":
-            continue
-        value = getattr(artifacts, name)
-        if isinstance(value, Path):
-            payload[name] = str(value)
-        else:
-            payload[name] = value
-    return payload
-
-
-def write_translation_artifacts_snapshot(artifacts: AsrArtifacts) -> str:
-    path = translation_artifacts_snapshot_path(artifacts.job_temp_dir)
-    _write_json_atomic(path, _serialize_asr_artifacts(artifacts))
-    return str(path)
-
-
-def _restore_snapshot_path(value) -> str:
-    if value is None:
-        return ""
-    raw = str(value)
-    if not raw:
-        return ""
-    return str(_resolve_project_runtime_path(raw))
-
-
-def load_translation_artifacts_snapshot(path: str | Path) -> AsrArtifacts | None:
-    snapshot_path = Path(path)
-    if snapshot_path.is_dir():
-        snapshot_path = translation_artifacts_snapshot_path(snapshot_path)
-    if not snapshot_path.exists():
-        return None
-    try:
-        payload = json.loads(snapshot_path.read_text(encoding="utf-8"))
-    except Exception:
-        return None
-    if not isinstance(payload, dict):
-        return None
-
-    values = {item.name: payload.get(item.name) for item in fields(AsrArtifacts)}
-    for name in _ASR_ARTIFACT_PATH_FIELDS:
-        values[name] = _restore_snapshot_path(values.get(name))
-    values["segments"] = list(values.get("segments") or [])
-    values["asr_details"] = dict(values.get("asr_details") or {})
-    values["pipeline_timings"] = dict(values.get("pipeline_timings") or {})
-    values["asr_log"] = [str(item) for item in values.get("asr_log") or []]
-    values["logger"] = None
-    values["run_log_path"] = (
-        Path(values["run_log_path"]) if values.get("run_log_path") else None
-    )
-    values["audio_cached"] = bool(values.get("audio_cached"))
-    values["bilingual"] = bool(values.get("bilingual"))
-    values["f0_filtered_count"] = int(values.get("f0_filtered_count") or 0)
-    values["f0_failed"] = bool(values.get("f0_failed"))
-    values["video_duration_s"] = (
-        float(values["video_duration_s"])
-        if values.get("video_duration_s") is not None
-        else None
-    )
-    values["pipeline_started"] = time.perf_counter()
-    values["audio_cache_key"] = str(values.get("audio_cache_key") or "")
-    values["video_stem"] = str(values.get("video_stem") or snapshot_path.stem)
-    values["device"] = str(values.get("device") or "cpu")
-    values["backend_label"] = str(values.get("backend_label") or "")
-    values["job_id"] = str(values.get("job_id") or "")
-    try:
-        return AsrArtifacts(**values)
-    except Exception:
-        return None
-
-
 def run_asr_alignment_f0(
     video_path: str,
     *,
@@ -1274,13 +658,13 @@ def run_asr_alignment_f0(
 
     video_name = os.path.splitext(os.path.basename(video_path))[0]
     video_filename = video_name
-    job_id = _sanitize_job_id(job_id or ctx.job_id or video_name)
-    cache_job_id = _sanitize_job_id(cache_job_id or job_id)
+    job_id = sanitize_job_id(job_id or ctx.job_id or video_name)
+    cache_job_id = sanitize_job_id(cache_job_id or job_id)
     effective_ctx = ctx
     events._thread_local.video = os.path.basename(video_path)
     events.set_current_job_id(job_id)
     _raise_if_cancelled(cancel_event)
-    video_duration_s = _probe_video_duration_s(video_path)
+    video_duration_s = audio_module.probe_video_duration_s(video_path)
     previous_asr_backend = getattr(asr_module, "ASR_BACKEND", None)
     previous_asr_context = getattr(asr_module, "_ASR_CONTEXT", None)
     previous_asr_recovery = getattr(asr_module, "ASR_RECOVERY_ENABLED", None)
@@ -1330,12 +714,12 @@ def run_asr_alignment_f0(
         _log_stage(logger, f"resume_from_job_id={cache_job_id}")
     audio_dir = os.path.join(job_temp_dir, "audio")
     os.makedirs(audio_dir, exist_ok=True)
-    audio_cache_key = _get_audio_cache_key(video_path)
+    audio_cache_key = audio_module.get_audio_cache_key(video_path)
     audio_path = os.path.join(audio_dir, f"{video_name}.{audio_cache_key}.wav")
     aligned_segments_path = os.path.join(
         job_temp_dir, f"{video_filename}.aligned_segments.json"
     )
-    aligned_cache = _try_load_aligned_segments(
+    aligned_cache = aligned_cache_module.try_load_aligned_segments(
         aligned_segments_path,
         audio_cache_key,
         backend_label,
@@ -1371,7 +755,7 @@ def run_asr_alignment_f0(
         )
         with console.status("[cyan]提取音频中...[/cyan]"):
             _raise_if_cancelled(cancel_event)
-            extract_audio(video_path, audio_path)
+            audio_module.extract_audio(video_path, audio_path)
             _raise_if_cancelled(cancel_event)
         _log_stage(logger, f"extract_audio_done output={_project_relative(audio_path)}")
     pipeline_timings["audio_prepare_s"] = time.perf_counter() - audio_prepare_started
@@ -1548,8 +932,10 @@ def run_asr_alignment_f0(
                 )
                 if _ctx_flag(effective_ctx, "MULTI_CUE_SPLIT_ENABLED"):
                     f0_split_before = len(segments)
-                    segments, f0_gender_split_count = _split_segments_on_f0_gender_turns(
-                        segments
+                    segments, f0_gender_split_count = (
+                        gender_split_module.split_segments_on_f0_gender_turns(
+                            segments
+                        )
                     )
                     asr_details["f0_gender_split"] = {
                         "segments_before": f0_split_before,
@@ -1583,7 +969,7 @@ def run_asr_alignment_f0(
                 "[yellow]F0 detection degraded; translating without acoustic context[/yellow]"
             )
             segments = [dict(seg, gender=None) for seg in segments]
-        segments, f0_filtered_count = _filter_f0_none_segments(
+        segments, f0_filtered_count = _filter_f0_none_segments_for_ctx(
             segments,
             f0_failed=f0_failed,
             enabled=_ctx_flag(effective_ctx, "F0_FILTER_NONE_SEGMENTS"),
@@ -1597,9 +983,13 @@ def run_asr_alignment_f0(
     if skip_translation:
         bilingual = False
     else:
-        bilingual = _resolve_subtitle_bilingual_for_ctx(effective_ctx)
+        bilingual = output_module.resolve_subtitle_bilingual_for_ctx(effective_ctx)
 
-    output_dir = _resolve_output_dir_for_ctx(video_path, effective_ctx)
+    output_dir = output_module.resolve_output_dir_for_ctx(
+        video_path,
+        effective_ctx,
+        project_root=PROJECT_ROOT,
+    )
     srt_filename = f"{video_filename}.ja.srt" if skip_translation else f"{video_filename}.srt"
     srt_path = os.path.join(output_dir, srt_filename)
     transcript_path = os.path.join(job_temp_dir, f"{video_filename}.transcript.json")
@@ -1659,6 +1049,26 @@ def run_translation_and_write(
     job_id: str = "",
     cancel_event=None,
 ) -> list[str]:
+    try:
+        return _run_translation_and_write_impl(
+            video_path,
+            artifacts,
+            ctx=ctx,
+            job_id=job_id,
+            cancel_event=cancel_event,
+        )
+    finally:
+        _close_artifacts_logger(artifacts)
+
+
+def _run_translation_and_write_impl(
+    video_path: str,
+    artifacts: AsrArtifacts,
+    *,
+    ctx: JobContext,
+    job_id: str = "",
+    cancel_event=None,
+) -> list[str]:
     output_paths: list[str] = []
     events._thread_local.video = os.path.basename(video_path)
     _raise_if_cancelled(cancel_event)
@@ -1673,7 +1083,7 @@ def run_translation_and_write(
     device = artifacts.device
     f0_failed = artifacts.f0_failed
     f0_filtered_count = artifacts.f0_filtered_count
-    job_id = _sanitize_job_id(job_id or ctx.job_id or artifacts.job_id)
+    job_id = sanitize_job_id(job_id or ctx.job_id or artifacts.job_id)
     if job_id:
         events.set_current_job_id(job_id)
     job_temp_dir = artifacts.job_temp_dir
@@ -1757,7 +1167,9 @@ def run_translation_and_write(
 
     if segments and not skip_translation:
         asr_noise_before = len(segments)
-        segments, asr_noise_filtered_count = _filter_asr_noise_segments(segments)
+        segments, asr_noise_filtered_count = gender_split_module.filter_asr_noise_segments(
+            segments
+        )
         if asr_noise_filtered_count:
             asr_details["asr_noise_filter"] = {
                 "segments_before": asr_noise_before,
@@ -1824,7 +1236,7 @@ def run_translation_and_write(
             f"stage_done write_output elapsed={pipeline_timings['write_output_s']:.2f}s",
         )
         _log_timing_snapshot(logger, pipeline_timings, asr_details)
-        quality_report_path = _write_quality_report(
+        quality_report_path = _write_quality_report_for_ctx(
             video_stem=video_filename,
             job_temp_dir=job_temp_dir,
             aligned_segments=[],
@@ -1924,10 +1336,10 @@ def run_translation_and_write(
             logger,
             f"stage_done write_output elapsed={pipeline_timings['write_output_s']:.2f}s blocks={len(srt_blocks)}",
         )
-        quality_report_path = _write_quality_report(
+        quality_report_path = _write_quality_report_for_ctx(
             video_stem=video_filename,
             job_temp_dir=job_temp_dir,
-            aligned_segments=_quality_segments_from_blocks(srt_blocks),
+            aligned_segments=quality_module.quality_segments_from_blocks(srt_blocks),
             asr_details=asr_details,
             video_duration_s=video_duration_s,
             enabled=_ctx_flag(ctx, "QUALITY_REPORT_ENABLED"),
@@ -2153,10 +1565,10 @@ def run_translation_and_write(
         logger,
         f"stage_done write_output elapsed={pipeline_timings['write_output_s']:.2f}s",
     )
-    quality_report_path = _write_quality_report(
+    quality_report_path = _write_quality_report_for_ctx(
         video_stem=video_filename,
         job_temp_dir=job_temp_dir,
-        aligned_segments=_quality_segments_from_blocks(srt_blocks),
+        aligned_segments=quality_module.quality_segments_from_blocks(srt_blocks),
         asr_details=asr_details,
         video_duration_s=video_duration_s,
         f0_filtered_count=f0_filtered_count,

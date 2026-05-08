@@ -1,4 +1,8 @@
-import main
+from pipeline.gender_split import (
+    filter_asr_noise_segments,
+    filter_f0_none_segments,
+    split_segments_on_f0_gender_turns,
+)
 
 
 def _seg(text: str, gender):
@@ -13,7 +17,7 @@ def test_f0_filter_off_keeps_all_segments(monkeypatch):
     monkeypatch.delenv("F0_FILTER_NONE_SEGMENTS", raising=False)
     segments = [_seg("a", None), _seg("b", "F")]
 
-    filtered, count = main._filter_f0_none_segments(segments)
+    filtered, count = filter_f0_none_segments(segments)
 
     assert filtered == segments
     assert count == 0
@@ -23,7 +27,10 @@ def test_f0_filter_on_removes_none_gender_segments(monkeypatch):
     monkeypatch.setenv("F0_FILTER_NONE_SEGMENTS", "1")
     segments = [_seg("a", None), _seg("b", "F"), _seg("c", "M")]
 
-    filtered, count = main._filter_f0_none_segments(segments)
+    filtered, count = filter_f0_none_segments(
+        segments,
+        default_enabled=lambda: True,
+    )
 
     assert filtered == [_seg("b", "F"), _seg("c", "M")]
     assert count == 1
@@ -33,7 +40,10 @@ def test_f0_filter_on_all_none_returns_empty(monkeypatch):
     monkeypatch.setenv("F0_FILTER_NONE_SEGMENTS", "1")
     segments = [_seg("a", None), _seg("b", None)]
 
-    filtered, count = main._filter_f0_none_segments(segments)
+    filtered, count = filter_f0_none_segments(
+        segments,
+        default_enabled=lambda: True,
+    )
 
     assert filtered == []
     assert count == 2
@@ -43,7 +53,11 @@ def test_f0_filter_skips_when_f0_detection_failed(monkeypatch):
     monkeypatch.setenv("F0_FILTER_NONE_SEGMENTS", "1")
     segments = [_seg("a", None), _seg("b", None)]
 
-    filtered, count = main._filter_f0_none_segments(segments, f0_failed=True)
+    filtered, count = filter_f0_none_segments(
+        segments,
+        f0_failed=True,
+        default_enabled=lambda: True,
+    )
 
     assert filtered == segments
     assert count == 0
@@ -65,7 +79,7 @@ def test_asr_noise_filter_removes_empty_quote_only_and_latin_hallucinations():
         _seg("ラブ", "F"),
     ]
 
-    filtered, count = main._filter_asr_noise_segments(segments)
+    filtered, count = filter_asr_noise_segments(segments)
 
     assert count == 7
     assert [segment["text"] for segment in filtered] == [
@@ -91,7 +105,7 @@ def test_f0_gender_turn_split_aggressive_m_to_f():
         ],
     }
 
-    split, count = main._split_segments_on_f0_gender_turns([segment])
+    split, count = split_segments_on_f0_gender_turns([segment])
 
     assert count == 1
     assert [item["text"] for item in split] == ["男声", "女声"]
@@ -112,8 +126,8 @@ def test_f0_gender_turn_split_none_word_joins_previous_group():
         ],
     }
 
-    split, count = main._split_segments_on_f0_gender_turns([segment])
-    filtered, filtered_count = main._filter_f0_none_segments(split, enabled=True)
+    split, count = split_segments_on_f0_gender_turns([segment])
+    filtered, filtered_count = filter_f0_none_segments(split, enabled=True)
 
     assert count == 1
     assert [item["text"] for item in split] == ["男無", "女"]
@@ -135,7 +149,7 @@ def test_f0_gender_turn_split_keeps_all_none_or_missing_words():
     }
     no_words = {"start": 2.0, "end": 3.0, "text": "なし", "gender": "M"}
 
-    split, count = main._split_segments_on_f0_gender_turns([all_none, no_words])
+    split, count = split_segments_on_f0_gender_turns([all_none, no_words])
 
     assert split == [all_none, no_words]
     assert count == 0
@@ -153,7 +167,7 @@ def test_f0_gender_turn_split_same_gender_stays_one_segment():
         ],
     }
 
-    split, count = main._split_segments_on_f0_gender_turns([segment])
+    split, count = split_segments_on_f0_gender_turns([segment])
 
     assert split == [segment]
     assert count == 0
