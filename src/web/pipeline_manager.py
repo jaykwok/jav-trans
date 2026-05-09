@@ -206,6 +206,10 @@ def _normalize_llm_reasoning_effort(value: str) -> str:
 def _snapshot_translation_settings(spec: JobSpec) -> JobSpec:
     updates: dict[str, str] = {}
 
+    asr_context = getattr(spec, "asr_context", None)
+    if asr_context is None or not str(asr_context).strip():
+        updates["asr_context"] = _runtime_setting("ASR_CONTEXT", "")
+
     target_lang = getattr(spec, "target_lang", None)
     if target_lang is None or not str(target_lang).strip():
         updates["target_lang"] = _runtime_setting("TARGET_LANG", "简体中文") or "简体中文"

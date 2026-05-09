@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+import re
 from types import SimpleNamespace
 
 import pytest
@@ -36,8 +38,18 @@ def _stream(reasoning_parts: list[str], content_parts: list[str]):
         yield _chunk(content=part, finish=finish)
 
 
+def _usage_chunk(**usage_fields):
+    return SimpleNamespace(choices=[], usage=SimpleNamespace(**usage_fields))
+
+
 def _response_event(event_type: str, **kwargs):
     return SimpleNamespace(type=event_type, **kwargs)
+
+
+def _requested_ids_from_messages(messages) -> list[int]:
+    match = re.search(r"requested_ids\s*=\s*(\[[^\]]*\])", messages[1]["content"])
+    assert match is not None, messages[1]["content"]
+    return json.loads(match.group(1))
 
 
 def test_chat_progress_reasoning_translating_done(monkeypatch):
@@ -118,6 +130,66 @@ def test_grok_chat_keeps_streaming_json_object(monkeypatch):
     assert "web_search_options" not in request
     assert "include_reasoning" not in request
     assert request["max_tokens"] == translator.TRANSLATION_MAX_TOKENS
+
+
+def test_chat_reports_openai_and_deepseek_cache_usage(monkeypatch):
+    usage_events: list[dict] = []
+    requests: list[dict] = []
+    monkeypatch.setenv("LLM_API_FORMAT", "chat")
+    monkeypatch.setenv("LLM_MODEL_NAME", "deepseek-v4-pro")
+    monkeypatch.setattr(
+        translator,
+        "_create_chat_completion",
+        lambda request: requests.append(request) or iter(
+            [
+                _chunk(content='{"translations":[]}'),
+                _usage_chunk(
+                    prompt_tokens_details=SimpleNamespace(cached_tokens=128),
+                    prompt_cache_hit_tokens=96,
+                    prompt_cache_miss_tokens=32,
+                ),
+            ]
+        ),
+    )
+
+    output = translator._chat(
+        [{"role": "user", "content": "json"}],
+        expected_count=0,
+        on_usage=usage_events.append,
+    )
+
+    assert output == '{"translations":[]}'
+    assert requests[0]["stream_options"] == {"include_usage": True}
+    assert usage_events == [
+        {
+            "cached_tokens": 128,
+            "cache_hit_tokens": 96,
+            "cache_miss_tokens": 32,
+        }
+    ]
+
+
+def test_chat_retries_without_stream_options_when_provider_rejects_usage(monkeypatch):
+    requests: list[dict] = []
+    monkeypatch.setenv("LLM_API_FORMAT", "chat")
+    monkeypatch.setenv("LLM_MODEL_NAME", "deepseek-v4-pro")
+
+    def fake_create_chat_completion(request):
+        requests.append(dict(request))
+        if "stream_options" in request:
+            raise ValueError("unknown field stream_options")
+        return _stream([], ['{"translations":[]}'])
+
+    monkeypatch.setattr(translator, "_create_chat_completion", fake_create_chat_completion)
+
+    output = translator._chat(
+        [{"role": "user", "content": "json"}],
+        expected_count=0,
+    )
+
+    assert output == '{"translations":[]}'
+    assert "stream_options" in requests[0]
+    assert "stream_options" not in requests[1]
 
 
 def test_responses_progress_translating_done(monkeypatch):
@@ -303,7 +375,7 @@ def test_translate_segments_emits_reset_on_retry(monkeypatch):
     events: list[dict] = []
     calls = {"count": 0}
 
-    def fake_chat(messages, expected_count=0, on_progress=None):
+    def fake_chat(messages, expected_count=0, on_progress=None, **_kwargs):
         calls["count"] += 1
         assert expected_count == 1
         if calls["count"] == 1:
@@ -361,13 +433,9 @@ def test_batched_progress_reaches_done_only_after_all_batches(monkeypatch):
     events: list[dict] = []
 
     def fake_chat(messages, expected_count=0, on_progress=None, **_kwargs):
-        content = messages[1]["content"]
-        ids = [
-            int(line.split('"id": ')[1].split(",", 1)[0])
-            for line in content.splitlines()
-            if '"id": ' in line
-        ]
-        start = min(ids)
+        ids = _requested_ids_from_messages(messages)
+        if expected_count == 0:
+            return '{"translations":[]}'
         if on_progress:
             on_progress(
                 {
@@ -380,7 +448,7 @@ def test_batched_progress_reaches_done_only_after_all_batches(monkeypatch):
             '{"translations":['
             + ",".join(
                 f'{{"id":{idx},"text":"zh-{idx}"}}'
-                for idx in range(start, start + expected_count)
+                for idx in ids
             )
             + "]}"
         )

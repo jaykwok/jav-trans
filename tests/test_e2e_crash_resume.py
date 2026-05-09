@@ -1,4 +1,5 @@
 import json
+import re
 from pathlib import Path
 
 import pytest
@@ -27,12 +28,10 @@ def _segments(count: int = 5) -> list[dict]:
 
 
 def _batch_start_from_messages(messages) -> int:
-    content = messages[1]["content"]
-    ids = []
-    for line in content.splitlines():
-        if '"id": ' in line:
-            ids.append(int(line.split('"id": ')[1].split(",", 1)[0]))
-    return min(ids)
+    match = re.search(r"requested_ids\s*=\s*(\[[^\]]*\])", messages[1]["content"])
+    assert match is not None, messages[1]["content"]
+    ids = json.loads(match.group(1))
+    return min(ids) if ids else 0
 
 
 def _mock_translation_json(start: int, count: int) -> str:
@@ -151,6 +150,8 @@ def test_translation_crash_resume_and_success_cleanup(monkeypatch, tmp_path, cap
 
     def fake_chat(messages, expected_count=0, on_progress=None, **_kwargs):
         start = _batch_start_from_messages(messages)
+        if expected_count == 0:
+            return json.dumps({"translations": []}, ensure_ascii=False)
         chat_calls.append(start)
         return _mock_translation_json(start, expected_count)
 

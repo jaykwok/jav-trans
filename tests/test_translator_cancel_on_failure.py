@@ -1,4 +1,5 @@
 import json
+import re
 import time
 
 import pytest
@@ -12,18 +13,19 @@ def _segments(count: int) -> list[dict]:
 
 
 def _batch_start_from_messages(messages: list[dict]) -> int:
-    ids = []
-    for line in messages[1]["content"].splitlines():
-        if '"id": ' in line:
-            ids.append(int(line.split('"id": ')[1].split(",", 1)[0]))
-    return min(ids)
+    match = re.search(r"requested_ids\s*=\s*(\[[^\]]*\])", messages[1]["content"])
+    assert match is not None, messages[1]["content"]
+    ids = json.loads(match.group(1))
+    return min(ids) if ids else 0
 
 
 def test_batched_translation_cancels_pending_futures_on_failure(monkeypatch):
     calls: list[int] = []
 
-    def fake_chat(messages, expected_count=0, on_progress=None):
+    def fake_chat(messages, expected_count=0, on_progress=None, **_kwargs):
         start = _batch_start_from_messages(messages)
+        if expected_count == 0:
+            return json.dumps({"translations": []}, ensure_ascii=False)
         calls.append(start)
         if start == 0:
             raise RuntimeError("boom")

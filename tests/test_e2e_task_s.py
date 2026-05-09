@@ -57,9 +57,9 @@ def _mock_audio_and_asr(monkeypatch, segments: list[dict], *, checkpoint: bool =
 
 
 def _fake_translation_json(messages, expected_count=0, on_progress=None, **_kwargs):
-    content = messages[1]["content"]
-    ids = [int(value) for value in re.findall(r'"id":\s*(\d+)', content)]
-    ids = ids[:expected_count]
+    match = re.search(r"requested_ids\s*=\s*(\[[^\]]*\])", messages[1]["content"])
+    assert match is not None, messages[1]["content"]
+    ids = json.loads(match.group(1))
     if on_progress:
         on_progress({"phase": "translating", "translated": len(ids), "expected": expected_count})
         on_progress({"phase": "done", "translated": len(ids), "expected": expected_count})
@@ -167,7 +167,8 @@ def test_s3_s4_translation_resume_then_auto_cleanup(monkeypatch, tmp_path, capsy
     calls: list[int] = []
 
     def fake_chat_counting(messages, expected_count=0, on_progress=None, **_kwargs):
-        calls.append(expected_count)
+        if expected_count > 0:
+            calls.append(expected_count)
         return _fake_translation_json(messages, expected_count, on_progress, **_kwargs)
 
     monkeypatch.delenv("_TEST_CRASH_TRANSLATION_BATCH", raising=False)
