@@ -59,6 +59,10 @@ def test_settings_translation_fields_update_runtime_env(monkeypatch):
     asyncio.run(_test_settings_translation_fields_update_runtime_env(monkeypatch))
 
 
+def test_settings_asr_context_updates_runtime_env(monkeypatch):
+    asyncio.run(_test_settings_asr_context_updates_runtime_env(monkeypatch))
+
+
 def test_jobs_snapshot_saved_translation_settings(tmp_path, monkeypatch):
     asyncio.run(_test_jobs_snapshot_saved_translation_settings(tmp_path, monkeypatch))
 
@@ -212,6 +216,33 @@ async def _test_settings_translation_fields_update_runtime_env(monkeypatch):
     assert payload["llm_reasoning_effort"] == "medium"
 
 
+async def _test_settings_asr_context_updates_runtime_env(monkeypatch):
+    monkeypatch.delenv("ASR_CONTEXT", raising=False)
+    monkeypatch.setattr(
+        config_routes,
+        "_read_env_entry",
+        lambda key: (key == "ASR_CONTEXT", "旧演员"),
+    )
+    monkeypatch.setattr(config_routes, "_update_env_file", lambda _changes: None)
+
+    transport = httpx.ASGITransport(app=create_app())
+    async with httpx.AsyncClient(
+        transport=transport,
+        base_url="http://test",
+    ) as client:
+        response = await client.post(
+            "/api/settings",
+            json={"asr_context": "小那海"},
+        )
+        assert response.status_code == 200
+
+        settings = await client.get("/api/settings")
+
+    assert os.environ["ASR_CONTEXT"] == "小那海"
+    assert settings.status_code == 200
+    assert settings.json()["asr_context"] == "小那海"
+
+
 async def _test_jobs_api_crud(tmp_path, monkeypatch):
     monkeypatch.setattr(pm, "_jobs_path", tmp_path / "jobs.json")
     await _reset_pm_state()
@@ -289,6 +320,7 @@ async def _test_jobs_api_rejects_invalid_job_spec(tmp_path, monkeypatch):
 
 async def _test_jobs_snapshot_saved_translation_settings(tmp_path, monkeypatch):
     monkeypatch.setattr(pm, "_jobs_path", tmp_path / "jobs.json")
+    monkeypatch.setenv("ASR_CONTEXT", "小那海")
     monkeypatch.setenv("TRANSLATION_GLOSSARY", "ねこ→猫")
     monkeypatch.setenv("TARGET_LANG", "繁體中文")
     monkeypatch.setenv("LLM_API_FORMAT", "responses")
@@ -312,6 +344,7 @@ async def _test_jobs_snapshot_saved_translation_settings(tmp_path, monkeypatch):
             assert response.status_code == 200
             spec = response.json()["spec"]
 
+        assert spec["asr_context"] == "小那海"
         assert spec["translation_glossary"] == "ねこ→猫"
         assert spec["target_lang"] == "繁體中文"
         assert spec["llm_api_format"] == "responses"

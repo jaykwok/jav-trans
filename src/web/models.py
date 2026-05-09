@@ -58,6 +58,7 @@ class SettingsRead(BaseModel):
     base_url: str
     model: str = ""
     hf_endpoint: str = ""
+    asr_context: str = ""
     translation_glossary: str = ""
     llm_api_format: Literal["chat", "responses"] = "chat"
     llm_reasoning_effort: Literal["medium", "xhigh"] = "xhigh"
@@ -69,6 +70,7 @@ class SettingsUpdate(BaseModel):
     base_url: str | None = None
     model: str | None = None
     hf_endpoint: str | None = None
+    asr_context: str | None = Field(default=None, max_length=4000)
     translation_glossary: str | None = None
     llm_api_format: Literal["chat", "responses"] | None = None
     llm_reasoning_effort: Literal["medium", "xhigh"] | None = None

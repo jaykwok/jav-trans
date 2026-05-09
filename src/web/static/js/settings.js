@@ -69,6 +69,8 @@ export async function loadSettings() {
       $('api-model-preview').textContent = '当前：' + s.model;
     }
     $('mirror-enabled').checked = s.hf_endpoint === 'https://hf-mirror.com';
+    const asrContext = $('r-asr-context');
+    if (asrContext) asrContext.value = s.asr_context || '';
 
     const effort = $('api-reasoning-effort');
     if (effort) effort.value = s.llm_reasoning_effort || 'xhigh';
@@ -91,13 +93,6 @@ export async function loadSettings() {
   } catch {}
 }
 
-function showSaveStatus(msg, type) {
-  const el = $('save-status');
-  el.textContent = msg;
-  el.className = 'save-status ' + type;
-  setTimeout(() => { el.textContent = ''; el.className = 'save-status'; }, 3000);
-}
-
 export function readTranslationSettingsFromForm() {
   return {
     llm_reasoning_effort: $('api-reasoning-effort').value || 'xhigh',
@@ -110,6 +105,7 @@ export function readTranslationSettingsFromForm() {
 
 function buildSettingsBodyFromForm({ includeConnection = false, includeMirror = false } = {}) {
   const body = readTranslationSettingsFromForm();
+  body.asr_context = $('r-asr-context')?.value.trim() || '';
   if (includeConnection) {
     const apiKey = $('api-key').value.trim();
     const baseUrl = $('api-base-url').value.trim();
@@ -142,7 +138,10 @@ export async function saveSettingsBody(body) {
 }
 
 export async function syncSettingsFromFormForSubmit() {
-  const body = buildSettingsBodyFromForm({ includeConnection: true });
+  const body = buildSettingsBodyFromForm({
+    includeConnection: true,
+    includeMirror: true,
+  });
   await saveSettingsBody(body);
   saveFormMemory();
 }
@@ -218,21 +217,4 @@ export function installSettingsPanel() {
     }
   });
 
-  $('btn-save-api').addEventListener('click', async () => {
-    $('btn-save-api').disabled = true;
-    try {
-      await saveSettingsBody(
-        buildSettingsBodyFromForm({
-          includeConnection: true,
-          includeMirror: true,
-        })
-      );
-      showSaveStatus('✓ 已保存', 'ok');
-      await loadSettings();
-      saveFormMemory();
-    } catch (e) {
-      showSaveStatus('✗ 保存失败：' + e.message, 'error');
-    }
-    $('btn-save-api').disabled = false;
-  });
 }

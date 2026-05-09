@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 import threading
 from concurrent.futures import ThreadPoolExecutor
 
@@ -31,12 +32,10 @@ def _mock_json(start: int, count: int) -> str:
 
 
 def _batch_start_from_messages(messages) -> int:
-    content = messages[1]["content"]
-    return min(
-        int(part.split('"id": ')[1].split(",", 1)[0])
-        for part in content.splitlines()
-        if '"id": ' in part
-    )
+    match = re.search(r"requested_ids\s*=\s*(\[[^\]]*\])", messages[1]["content"])
+    assert match is not None, messages[1]["content"]
+    ids = json.loads(match.group(1))
+    return min(ids) if ids else 0
 
 
 def test_save_cache_entry_concurrent_jsonl_intact(tmp_path):
@@ -78,8 +77,10 @@ def test_batched_translation_skips_cached_batches(monkeypatch, tmp_path):
     )
     calls: list[tuple[int, int]] = []
 
-    def fake_chat(messages, expected_count=0, on_progress=None):
+    def fake_chat(messages, expected_count=0, on_progress=None, **_kwargs):
         start = _batch_start_from_messages(messages)
+        if expected_count == 0:
+            return json.dumps({"translations": []}, ensure_ascii=False)
         calls.append((start, expected_count))
         return _mock_json(start, expected_count)
 
@@ -97,8 +98,8 @@ def test_batched_translation_skips_cached_batches(monkeypatch, tmp_path):
     assert calls == [(2, 2)]
     assert retry_events == []
     assert zh_texts == ["cached-0", "cached-1", "zh-2", "zh-3"]
-    assert timings[0]["mode"] == "translation_cache_hit"
-    assert timings[1]["mode"] == "batched_full_context"
+    assert any(item["mode"] == "translation_cache_hit" for item in timings)
+    assert any(item["mode"] == "batched_full_context" for item in timings)
     assert timings[-1]["cache_hit_count"] == 1
 
     saved = _read_cache_jsonl(migrated_path)

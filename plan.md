@@ -14,13 +14,18 @@
 - 支持后端：`anime-whisper`、`qwen3-asr-1.7b`、`whisper-ja-1.5b`、`whisper-ja-anime-v0.3`。
 - 默认 VAD：`ASR_VAD_BACKEND=whisperseg`，`WHISPERSEG_THRESHOLD=0.35`。
 - 默认翻译配置示例为 OpenAI-compatible LLM 服务；翻译请求使用流式输出 + 结构化 JSON 输出，Web 任务默认 `translation_batch_size=200`，`translation_max_workers=4`。
+- 翻译批处理采用 fixed full-JSON prefix + `requested_ids` 策略：全片字幕 JSON 作为稳定前缀，本地计算每个 batch 的全局 id 区间，LLM 只翻译指定 id；`batch_size` 表示每次翻译编号区间长度。前缀预热默认开启，超过 `TRANSLATION_FULL_JSON_PREFIX_MAX_CHARS` 时回退全片摘要上下文。
+- 翻译进度日志包含并发诊断事件：`batch_start`、`batch_first_token`、`batch_finish`，记录 wall-clock ts、worker thread、requested ids、耗时、cache hit/miss token，便于判断 API 请求是否真实并行。
+- 翻译前 ASR 噪声过滤在本地剔除空白/引号类噪声、纯英文幻觉 token、纯特殊符号段（如 `◆◆◆`、`♪♪♪`、`！？！？`）；含日文/CJK/字母或数字的短语义段（如 `えっ！？`、`もう1回`）保留。
 - 翻译 reasoning effort 只保留两档：`medium` / `xhigh`。Chat Completions、标准 Responses、Micu+Grok Responses patch 均直接透传 `medium` 或 `xhigh`，不再把 `xhigh` 映射为 `high`。
+- 翻译风格：性器官优先统一为“肉棒”“小穴”，不固定“菊花”；人名默认按日语读音罗马音化，ASR 同音纠错必须保守，不能把不同汉字姓氏或不同读音的称呼强行合并。
+- 翻译后默认执行轻量 repair pass：代码侧选择高风险 id，repair prompt 只使用抽象原因类别和相邻上下文，不把片内错例硬编码进静态 prompt。
 - 字幕约束：`MAX_SUBTITLE_DURATION=8.0`，`ASR_MERGE_HARD_MAX_DURATION=9.0`，相邻短块合并受标点、speaker guard 和 gender guard 限制。
 - 默认 ASR recovery：`ASR_RECOVERY_ENABLED=0`。异常 ASR 文本块排查时才手动打开；男女混句边界由 F0 后 gender turn 重切段处理。
 - 断点续传：ASR checkpoint、`aligned_segments.json`、translation cache、translation artifact snapshot。
 - 主入口：`.venv/Scripts/python run_web.py`。后端调试入口是测试、诊断脚本，或直接调用 `run_asr_alignment_f0()` / `run_translation_and_write()`。
 - Web 任务参数通过 `JobSpec -> JobContext` 显式传入后端，不再依赖全局 `.env` 热覆盖 ASR、字幕、输出目录、batch/worker、临时文件保留等任务级配置。
-- `.env` 只保留跨任务持久配置：`API_KEY`、`OPENAI_COMPATIBILITY_BASE_URL`、`LLM_MODEL_NAME`、`LLM_API_FORMAT`、`LLM_REASONING_EFFORT`、`TARGET_LANG`、`HF_ENDPOINT`、`TRANSLATION_GLOSSARY`。
+- `.env` 只保留跨任务持久配置：`API_KEY`、`OPENAI_COMPATIBILITY_BASE_URL`、`LLM_MODEL_NAME`、`LLM_API_FORMAT`、`LLM_REASONING_EFFORT`、`TARGET_LANG`、`HF_ENDPOINT`、`TRANSLATION_GLOSSARY`、`ASR_CONTEXT`。
 
 ---
 
@@ -33,8 +38,10 @@
 - `HF_ENDPOINT` 必须为空或完整 URL，例如 `https://hf-mirror.com`。
 - 成功运行后默认直接删除一次性 job 临时目录；保留下次可复用的运行缓存，例如 `temp/hf-cache`、`temp/web` 状态和 `models/`。
 - Web“保留临时文件”选项仅用于调试，保留当前任务临时目录；不再通过全局 `KEEP_TEMP_FILES` 控制任务行为。
+- Web 演员名 / 人名提示（`ASR_CONTEXT`）是持久设置：打开页面时从 `/api/settings` 恢复，提交任务时自动保存；用户手动清空后提交会清空持久值。前端不再提供单独“保存设置”按钮，提交任务即保存当前表单配置。
 - 所有项目配置、README、agent 本地说明应使用项目相对路径，不写本机绝对路径。
 - `OPENAI_COMPATIBILITY_BASE_URL` 是 OpenAI-compatible API 配置名，保留不改。
+- 翻译 cache key 由 prompt version、目标语言、术语表、人物参考、模型名和 batch source 共同决定；当前 prompt version 为 `v2.5`，用于隔离 fixed-prefix、repair 和人名策略变更后的旧缓存。
 
 ---
 
@@ -46,9 +53,12 @@
 | T-U ✅ | 后端大文件拆分：`src/main.py` helper 迁入 `src/pipeline/`（8 个子模块） | 宽回归 93 passed |
 | T-V ✅ | 前端 `app.js` 拆分为 14 个 ES Module；修复日志刷新导致粘贴菜单被关闭的 bug | 语法全通，手动验证 |
 | T-W ✅ | 翻译 reasoning effort 收口为 `medium` / `xhigh` 两档；Responses 不做兼容降级映射 | 36 passed |
+| T-X ✅ | 翻译 fixed-prefix 批处理、并发诊断、术语/人名规则、局部 repair pass | 229 passed |
+| T-Y ✅ | Web 演员名持久化、提交自动保存设置、移除手动保存按钮 | 定向 10 passed + JS check |
+| T-Z ✅ | 翻译前 ASR 噪声过滤扩展到纯特殊符号段 | 定向 56 passed |
 
 <details>
-<summary>T-S 到 T-W 详细记录</summary>
+<summary>T-S 到 T-Z 详细记录</summary>
 
 **T-S 完成内容：**
 - `JobSpec` 增加输入边界，`/api/config` 避免 `video_paths` 必填校验污染默认配置读取。
@@ -67,8 +77,8 @@
 - `quality.py`：quality report、术语表解析、quality segment 转换。
 
 当前后端大文件排行（供 B1–B3 参考）：
+- `src/llm/translator.py`：2270 行。
 - `src/whisper/pipeline.py`：2259 行。
-- `src/llm/translator.py`：1626 行。
 - `src/main.py`：1487 行。
 - `src/whisper/local_backend.py`：1209 行。
 - `src/web/pipeline_manager.py`：531 行。
@@ -85,6 +95,29 @@
 - `src/web/static/index.html`、`src/web/static/js/settings.js`：前端推理强度下拉框只显示 `medium` / `xhigh`，默认 `xhigh`。
 - `.env.example` 与默认配置同步为 `LLM_REASONING_EFFORT=xhigh`；真实 `.env` 是本地私密文件，不提交。
 - 验证：`py_compile`、`node --check src/web/static/js/settings.js`、定向 pytest 36 passed。
+
+**T-X 完成内容：**
+- `src/llm/translator.py`：批量翻译改为 full JSON stable prefix + `requested_ids`；本地按 batch 区间计算需要翻译的全局 id，模型只返回指定 id。`TRANSLATION_PREFIX_WARMUP=1` 默认预热前缀，`TRANSLATION_FULL_JSON_PREFIX_MAX_CHARS` 控制 full-prefix 上限，超限回退 summary。
+- 翻译并发诊断写入 progress JSONL：`batch_start`、`batch_first_token`、`batch_finish`，附带 `started_ts`、`first_token_ts`、`finished_ts`、worker thread、requested ids、request count、missing ids、cache hit/miss token。
+- 翻译风格规则收口：男性器官统一“肉棒”，女性器官统一“小穴”，去掉“菊花”固定译法；人名按日语读音罗马音化，ASR 同音纠错只在明显同一称呼时进行，禁止把不同汉字姓氏或不同读音强行合并。
+- 翻译后 repair pass 默认开启：只修复代码侧选中的高风险 id；候选覆盖女性器官术语漂移、明显 ASR 同音/上下文漂移、半句断裂。repair prompt 只暴露抽象 reason（如 `asr_homophone_or_context_drift`），不在静态 prompt 中堆片内错例。
+- `PROMPT_VERSION=v2.5`，确保 fixed-prefix、repair、人名策略调整后不复用旧缓存。
+- NAMH-055 验证：repair 修复“小穴/阴道/芒果/香肠/半句断裂”等问题，术语残留清零。
+- NMSL-036 验证：576 条，fixed-prefix 并发 3 batch；人名从过度合并 `高松` 修正为保守罗马音化；repair 修复 #85/#446/#515/#576 等 ASR 同音导致的上下文漂移。最终验证：`.venv/Scripts/python -m pytest` 229 passed。
+
+**T-Y 完成内容：**
+- `src/web/models.py`、`src/web/routes/config.py`：`SettingsRead/SettingsUpdate` 支持 `asr_context`，`/api/settings` 读写 `ASR_CONTEXT` 并同步运行时环境和 `.env`。
+- `src/web/pipeline_manager.py`：创建任务时如果 spec 未显式提供演员名，则从持久 `ASR_CONTEXT` 快照到任务 spec，保证队列中的任务不受后续修改污染。
+- `src/web/static/js/settings.js`：加载 settings 时回填 `r-asr-context`；提交任务前自动保存演员名、HF 镜像、翻译设置和 API 连接配置。
+- `src/web/static/js/formMemory.js`：`r-asr-context` 不再进入 localStorage 表单记忆，避免和持久 settings 双源冲突。
+- `src/web/static/index.html`：移除“保存设置”按钮；用户提交任务即保存配置，手动清空演员名并提交会清空持久值。
+- 验证：`tests/web/test_jobs_api.py` 10 passed；`node --check src/web/static/js/settings.js` / `files.js` / `formMemory.js` 通过。
+
+**T-Z 完成内容：**
+- `src/pipeline/gender_split.py`：翻译前 ASR 噪声过滤新增纯特殊符号判断。去空白后若整段没有 Unicode 字母或数字，则视为无语言信息噪声，过滤 `◆◆◆`、`♪♪♪`、`！？！？` 等 ASR 特殊符号段。
+- 过滤规则保持保守：`えっ！？`、`もう1回`、`ラブ` 等含日文/字母/数字的语义段保留，不交给 LLM 判断。
+- SORA-575 `whisper-ja-1.5b` 离线验证：应用新规则后，`aligned_segments.json` 中 947 段会在翻译前删除 2 条 `◆◆◆`。
+- 验证：`tests/test_f0_filter.py` 9 passed；`tests/test_e2e_task_s.py` + `tests/test_e2e_crash_resume.py` 7 passed；翻译/cache/progress 定向 40 passed。
 
 </details>
 
@@ -105,14 +138,15 @@
 
 ### B2：继续拆分 `src/llm/translator.py`
 
-现状：约 1626 行，仍是第二大后端文件。
+现状：约 2270 行，当前已超过 `src/whisper/pipeline.py`，是最大后端文件。
 
 建议拆分方向：
 - cache：JSON/JSONL cache 读写、损坏 warning、cache key。
-- prompt：系统提示、用户 payload、术语表和人物参考。
+- prompt：系统提示、用户 payload、fixed-prefix payload、术语表和人物参考。
 - client/chat：Chat Completions 请求和流式解析。
 - client/responses：Responses API 请求和流式解析。
-- batching/retry：batch 切分、缺失 id 重试、进度事件。
+- batching/retry：batch 切分、requested ids、prefix warmup、缺失 id 重试、进度/并发诊断事件。
+- repair：候选 id 选择、抽象 reason 映射、局部上下文构造、repair pass 请求。
 
 边界：当前翻译 API 行为稳定，拆分时优先保留 `translate_segments()` 对外签名。
 
@@ -179,5 +213,8 @@
 - T-Q 完成后：F0 定向 15 passed；ASR job/cache 定向 7 passed。
 - T-S 完成后：后端稳定性收口定向 58 tests passed。
 - T-U 完成后：后端拆分定向 38 passed；宽后端回归 93 passed。
+- T-X 完成后：翻译 fixed-prefix / repair / 人名策略定向通过；全量 229 passed。
+- T-Y 完成后：Web settings/jobs 定向 10 passed；前端相关 JS check 通过。
+- T-Z 完成后：ASR 噪声过滤、E2E、翻译/cache/progress 定向 56 passed。
 
 </details>
