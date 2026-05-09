@@ -137,6 +137,7 @@ async def get_settings() -> SettingsRead:
     base_url = _runtime_or_env_or_setting("OPENAI_COMPATIBILITY_BASE_URL")
     model = _runtime_or_env_or_setting("LLM_MODEL_NAME")
     hf_endpoint = _runtime_or_env_value("HF_ENDPOINT")
+    asr_context = _runtime_or_env_or_setting("ASR_CONTEXT")
     translation_glossary = _runtime_or_env_or_setting("TRANSLATION_GLOSSARY")
     llm_api_format = _runtime_or_env_or_setting("LLM_API_FORMAT", "chat")
     llm_reasoning_effort = _normalize_llm_reasoning_effort(
@@ -149,6 +150,7 @@ async def get_settings() -> SettingsRead:
         base_url=base_url,
         model=model,
         hf_endpoint=hf_endpoint,
+        asr_context=asr_context,
         translation_glossary=translation_glossary,
         llm_api_format=llm_api_format if llm_api_format in {"chat", "responses"} else "chat",
         llm_reasoning_effort=llm_reasoning_effort,
@@ -170,6 +172,9 @@ async def post_settings(update: SettingsUpdate) -> dict:
         os.environ["LLM_MODEL_NAME"] = update.model
     if update.hf_endpoint is not None:
         changes["HF_ENDPOINT"] = _sync_hf_endpoint(update.hf_endpoint)
+    if update.asr_context is not None:
+        changes["ASR_CONTEXT"] = update.asr_context
+        os.environ["ASR_CONTEXT"] = update.asr_context
     if update.translation_glossary is not None:
         changes["TRANSLATION_GLOSSARY"] = update.translation_glossary
         os.environ["TRANSLATION_GLOSSARY"] = update.translation_glossary

@@ -69,23 +69,28 @@ def test_asr_noise_filter_removes_empty_quote_only_and_latin_hallucinations():
         _seg('""', None),
         _seg('\\"\\"', None),
         _seg("「」", None),
+        _seg("◆◆◆", None),
+        _seg("♪♪♪", None),
+        _seg("！？！？", None),
         _seg("..Alright", None),
         _seg("Andthen?", None),
         _seg('"Iwantyou"', None),
         _seg("ja-0", None),
         _seg("「はい」", "F"),
         _seg("あっ", "F"),
+        _seg("えっ！？", "F"),
         _seg("もう1回", "F"),
         _seg("ラブ", "F"),
     ]
 
     filtered, count = filter_asr_noise_segments(segments)
 
-    assert count == 7
+    assert count == 10
     assert [segment["text"] for segment in filtered] == [
         "ja-0",
         "「はい」",
         "あっ",
+        "えっ！？",
         "もう1回",
         "ラブ",
     ]

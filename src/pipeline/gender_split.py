@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+import unicodedata
 from typing import Callable
 
 
@@ -8,6 +9,15 @@ _ASR_NOISE_ONLY_RE = re.compile(r"^[\s\"'`“”‘’「」『』（）()\[\]�
 _ASR_JA_OR_CJK_RE = re.compile(r"[\u3040-\u30ff\u3400-\u9fff]")
 _ASR_LONG_LATIN_RE = re.compile(r"[A-Za-z]{4,}")
 _ASR_ASCII_OR_WESTERN_PUNCT_RE = re.compile(r"^[\s\x00-\x7F“”‘’…]+$")
+
+
+def _has_language_or_number_signal(text: str) -> bool:
+    return any(unicodedata.category(char)[0] in {"L", "N"} for char in text)
+
+
+def _is_symbol_only_noise(text: str) -> bool:
+    compact = "".join(char for char in text if not char.isspace())
+    return bool(compact) and not _has_language_or_number_signal(compact)
 
 
 def filter_f0_none_segments(
@@ -141,6 +151,8 @@ def is_asr_noise_text(text) -> bool:
     unescaped = cleaned.replace("\\", "").strip()
     if _ASR_NOISE_ONLY_RE.fullmatch(unescaped):
         return True
+    if _is_symbol_only_noise(unescaped):
+        return True
     if (
         _ASR_LONG_LATIN_RE.search(unescaped)
         and not _ASR_JA_OR_CJK_RE.search(unescaped)
@@ -158,4 +170,3 @@ def filter_asr_noise_segments(segments: list[dict]) -> tuple[list[dict], int]:
             continue
         filtered.append(segment)
     return filtered, len(segments) - len(filtered)
-

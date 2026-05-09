@@ -23,7 +23,7 @@ _CLIENT_KEY: tuple[str, str] = ("", "")
 _CLIENT_LOCK = threading.Lock()
 _RETRY_CONTEXT = threading.local()
 _cache_lock = threading.Lock()
-PROMPT_VERSION = "v2.1"
+PROMPT_VERSION = "v2.5"
 _LEADING_SPEAKER_RE = re.compile(
     r"^\s*(?:男|女|男性|女性|男优|女优|スタッフ|撮影者|カメラマン|"
     r"[A-Za-z][A-Za-z ._-]{0,20})\s*[：:]\s*"
@@ -76,6 +76,24 @@ TRANSLATION_API_BACKOFF_BASE_S = max(
 TRANSLATION_API_BACKOFF_MAX_S = max(
     TRANSLATION_API_BACKOFF_BASE_S,
     float(os.getenv("TRANSLATION_API_BACKOFF_MAX_S", "20")),
+)
+TRANSLATION_PREFIX_WARMUP = os.getenv(
+    "TRANSLATION_PREFIX_WARMUP", "1"
+).strip().lower() in {"1", "true", "yes", "on"}
+TRANSLATION_FULL_JSON_PREFIX_MAX_CHARS = max(
+    0,
+    int(os.getenv("TRANSLATION_FULL_JSON_PREFIX_MAX_CHARS", "180000")),
+)
+TRANSLATION_REPAIR_ENABLED = os.getenv(
+    "TRANSLATION_REPAIR_ENABLED", "1"
+).strip().lower() in {"1", "true", "yes", "on"}
+TRANSLATION_REPAIR_MAX_IDS = max(
+    0,
+    int(os.getenv("TRANSLATION_REPAIR_MAX_IDS", "12")),
+)
+TRANSLATION_REPAIR_CONTEXT_RADIUS = max(
+    1,
+    int(os.getenv("TRANSLATION_REPAIR_CONTEXT_RADIUS", "1")),
 )
 
 def _normalize_llm_api_format(value: str | None, fallback: str = "chat") -> str:
@@ -254,6 +272,75 @@ def _translation_cache_key(
         character_reference=character_reference,
     )
     return f"{prompt_sig}::{batch_index}::{source_sig}"
+
+
+def _get_nested_value(value, *path: str):
+    current = value
+    for key in path:
+        if current is None:
+            return None
+        if isinstance(current, dict):
+            current = current.get(key)
+        else:
+            current = getattr(current, key, None)
+    return current
+
+
+def _coerce_optional_int(value) -> int | None:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float) and value.is_integer():
+        return int(value)
+    if isinstance(value, str) and value.strip().isdigit():
+        return int(value.strip())
+    return None
+
+
+def _extract_usage_metrics(usage) -> dict:
+    cached_tokens = _coerce_optional_int(
+        _get_nested_value(usage, "prompt_tokens_details", "cached_tokens")
+    )
+    cache_hit_tokens = _coerce_optional_int(
+        _get_nested_value(usage, "prompt_cache_hit_tokens")
+    )
+    cache_miss_tokens = _coerce_optional_int(
+        _get_nested_value(usage, "prompt_cache_miss_tokens")
+    )
+    metrics = {
+        "cached_tokens": cached_tokens,
+        "cache_hit_tokens": cache_hit_tokens,
+        "cache_miss_tokens": cache_miss_tokens,
+    }
+    return metrics
+
+
+def _emit_usage(on_usage: Callable[[dict], None] | None, usage) -> None:
+    if on_usage is None or usage is None:
+        return
+    metrics = _extract_usage_metrics(usage)
+    if not any(value is not None for value in metrics.values()):
+        return
+    try:
+        on_usage(metrics)
+    except Exception:
+        return
+
+
+def _merge_usage_metrics(usages: list[dict]) -> dict:
+    merged = {
+        "cached_tokens": None,
+        "cache_hit_tokens": None,
+        "cache_miss_tokens": None,
+    }
+    for usage in usages:
+        for key in merged:
+            value = _coerce_optional_int(usage.get(key))
+            if value is None:
+                continue
+            merged[key] = value if merged[key] is None else merged[key] + value
+    return merged
 
 
 def _filter_global_glossary_terms(raw_terms) -> list[dict]:
@@ -457,6 +544,18 @@ def translate_segments(
                 on_batch_done=on_batch_done,
                 on_progress=on_progress,
             )
+        zh_texts, repair_timing = _apply_translation_repair_pass(
+            segments,
+            zh_texts,
+            target_lang=effective_target_lang,
+            glossary=effective_glossary,
+            character_reference=effective_character_reference,
+            reasoning_effort=reasoning_effort,
+            api_format=api_format,
+            on_progress=on_progress,
+        )
+        if repair_timing is not None:
+            timings.append(repair_timing)
         return zh_texts, timings, list(retry_events)
     finally:
         if previous_retry_events is None:
@@ -473,6 +572,7 @@ def _chat_with_reasoning(
     reasoning_effort: str | None = None,
     api_format: str | None = None,
     on_progress: Callable[[dict], None] | None = None,
+    on_usage: Callable[[dict], None] | None = None,
 ) -> str:
     chat_kwargs = {
         "expected_count": expected_count,
@@ -482,6 +582,8 @@ def _chat_with_reasoning(
         chat_kwargs["reasoning_effort"] = reasoning_effort
     if api_format is not None:
         chat_kwargs["api_format"] = api_format
+    if on_usage is not None:
+        chat_kwargs["on_usage"] = on_usage
     return _chat(
         messages,
         **chat_kwargs,
@@ -508,6 +610,7 @@ def _translate_segments_single_request(
     )
     source_payload = _serialize_segments(segments)
     expected_count = len(segments)
+    request_usages: list[dict] = []
 
     messages = _build_translation_messages(
         source_payload=source_payload,
@@ -527,6 +630,7 @@ def _translate_segments_single_request(
                 reasoning_effort=reasoning_effort,
                 api_format=api_format,
                 on_progress=on_progress,
+                on_usage=request_usages.append,
             )
             zh_texts = _parse_translation_output(raw_output, expected_count)
             missing_indexes = _missing_indexes(zh_texts)
@@ -556,6 +660,7 @@ def _translate_segments_single_request(
         "global_context_chars": len(full_context),
         "missing_count": 0,
         "missing_indexes": [],
+        **_merge_usage_metrics(request_usages),
     }
     if on_batch_done:
         on_batch_done(timing)
@@ -596,11 +701,25 @@ def _translate_segments_batched(
         if global_context is not None
         else generate_global_context(segments)
     )
+    full_source_payload = _serialize_segments(segments, compact=True)
+    use_full_json_prefix = (
+        TRANSLATION_FULL_JSON_PREFIX_MAX_CHARS <= 0
+        or len(full_source_payload) <= TRANSLATION_FULL_JSON_PREFIX_MAX_CHARS
+    )
+    prefix_mode = "full_json_prefix" if use_full_json_prefix else "summary_fallback"
     progress_callbacks, _ = _make_aggregated_progress_callback(
         len(batches),
         expected_total,
         on_progress,
     )
+    diagnostic_progress_lock = threading.Lock()
+
+    def emit_batch_diagnostic(payload: dict) -> None:
+        if on_progress is None:
+            return
+        with diagnostic_progress_lock:
+            _emit_progress(on_progress, payload)
+
     zh_texts: list[str | None] = [None] * expected_total
     timings_by_batch: dict[int, dict] = {}
     translation_cache = (
@@ -609,6 +728,7 @@ def _translate_segments_batched(
         else {}
     )
     pending_batches: list[tuple[int, list[dict]]] = []
+    warmup_timing: dict | None = None
 
     for batch_index, batch_segments in enumerate(batches):
         batch_key = _translation_cache_key(
@@ -634,6 +754,10 @@ def _translate_segments_batched(
                 "request_count": 0,
                 "source_payload_chars": 0,
                 "global_context_chars": len(full_context),
+                "prefix_mode": prefix_mode,
+                "requested_ids": list(range(start_index, start_index + len(batch_segments))),
+                "is_warmup": False,
+                **_merge_usage_metrics([]),
                 "missing_count": 0,
                 "missing_indexes": [],
                 "cache_hit": True,
@@ -652,11 +776,88 @@ def _translate_segments_batched(
         else:
             pending_batches.append((batch_index, batch_segments))
 
+    if pending_batches and use_full_json_prefix and TRANSLATION_PREFIX_WARMUP:
+        warmup_started = time.perf_counter()
+        warmup_usages: list[dict] = []
+        warmup_messages = _build_batch_messages(
+            [],
+            full_context,
+            0,
+            character_reference,
+            0,
+            batch_index=0,
+            extra_glossary=extra_glossary,
+            target_lang=target_lang,
+            glossary=glossary,
+            full_source_payload=full_source_payload,
+            requested_ids=[],
+            warmup=True,
+        )
+        try:
+            _chat_with_reasoning(
+                warmup_messages,
+                expected_count=0,
+                reasoning_effort=reasoning_effort,
+                api_format=api_format,
+                on_usage=warmup_usages.append,
+            )
+            warmup_timing = {
+                "batch_index": None,
+                "start_index": 0,
+                "segment_count": 0,
+                "elapsed_s": time.perf_counter() - warmup_started,
+                "mode": "translation_prefix_warmup",
+                "request_count": 1,
+                "source_payload_chars": 0,
+                "global_context_chars": len(full_source_payload),
+                "prefix_mode": prefix_mode,
+                "requested_ids": [],
+                "is_warmup": True,
+                "missing_count": 0,
+                "missing_indexes": [],
+                **_merge_usage_metrics(warmup_usages),
+            }
+        except Exception as exc:
+            warmup_timing = {
+                "batch_index": None,
+                "start_index": 0,
+                "segment_count": 0,
+                "elapsed_s": time.perf_counter() - warmup_started,
+                "mode": "translation_prefix_warmup_failed",
+                "request_count": 1,
+                "source_payload_chars": 0,
+                "global_context_chars": len(full_source_payload),
+                "prefix_mode": prefix_mode,
+                "requested_ids": [],
+                "is_warmup": True,
+                "missing_count": 0,
+                "missing_indexes": [],
+                "error": str(exc)[:500],
+                **_merge_usage_metrics(warmup_usages),
+            }
+            print(f"[WARN] translation prefix warmup failed: {exc}", flush=True)
+
     def run_batch(batch_index: int, batch_segments: list[dict]) -> tuple[int, list[str | None], dict]:
         batch_started = time.perf_counter()
+        batch_started_ts = time.time()
+        worker_thread = threading.current_thread()
+        worker_thread_id = threading.get_ident()
+        worker_thread_name = worker_thread.name
         start_index = batch_index * batch_size
         expected_count = len(batch_segments)
         source_payload = _serialize_segments(batch_segments, start_index=start_index)
+        expected_ids = list(range(start_index, start_index + expected_count))
+        trace_base = {
+            "diagnostic": True,
+            "batch_index": batch_index,
+            "start_index": start_index,
+            "segment_count": expected_count,
+            "thread_id": worker_thread_id,
+            "thread_name": worker_thread_name,
+            "started_ts": batch_started_ts,
+            "requested_ids": expected_ids,
+        }
+        emit_batch_diagnostic({"phase": "batch_start", **trace_base})
         messages = _build_batch_messages(
             batch_segments,
             full_context,
@@ -667,14 +868,37 @@ def _translate_segments_batched(
             extra_glossary=extra_glossary,
             target_lang=target_lang,
             glossary=glossary,
+            full_source_payload=full_source_payload if use_full_json_prefix else None,
+            requested_ids=expected_ids,
         )
         batch_results: list[str | None] = [None] * expected_total
         missing_indexes: list[int] = []
         progress_callback = progress_callbacks[batch_index]
         request_count = 0
-        expected_ids = list(range(start_index, start_index + expected_count))
         pending_ids = list(expected_ids)
         pending_segments = list(batch_segments)
+        request_usages: list[dict] = []
+        first_token_ts: float | None = None
+        active_request_index = 0
+        active_requested_ids = list(expected_ids)
+
+        def trace_progress(evt: dict) -> None:
+            nonlocal first_token_ts
+            payload = dict(evt)
+            phase = payload.get("phase")
+            if phase in {"thinking", "translating", "done"} and first_token_ts is None:
+                first_token_ts = time.time()
+                emit_batch_diagnostic(
+                    {
+                        "phase": "batch_first_token",
+                        **trace_base,
+                        "first_token_ts": first_token_ts,
+                        "source_phase": phase,
+                        "request_index": active_request_index,
+                        "requested_ids": list(active_requested_ids),
+                    }
+                )
+            _emit_progress(progress_callback, payload)
 
         attempts_for_pending = 0
         retry_limit_for_pending = TRANSLATION_API_RETRIES
@@ -689,11 +913,10 @@ def _translate_segments_batched(
                     f"pending_ids={pending_ids[:50]}, error={last_retry_error}"
                 ) from last_retry_error
 
-            _emit_progress(
-                progress_callback,
-                {"phase": "reset", "attempt": request_count},
-            )
             requested_ids = list(pending_ids)
+            active_request_index = request_count
+            active_requested_ids = list(requested_ids)
+            trace_progress({"phase": "reset", "attempt": request_count})
             try:
                 if request_count == 0:
                     request_messages = messages
@@ -716,6 +939,8 @@ def _translate_segments_batched(
                         target_lang=target_lang,
                         glossary=glossary,
                         source_payload_override=request_source_payload,
+                        full_source_payload=full_source_payload if use_full_json_prefix else None,
+                        requested_ids=pending_ids,
                     )
                 request_count += 1
                 raw_output = _chat_with_reasoning(
@@ -723,7 +948,8 @@ def _translate_segments_batched(
                     expected_count=request_expected_count,
                     reasoning_effort=reasoning_effort,
                     api_format=api_format,
-                    on_progress=progress_callback,
+                    on_progress=trace_progress,
+                    on_usage=request_usages.append,
                 )
                 parsed = _parse_partial_translation_output_by_global_id(
                     raw_output,
@@ -772,15 +998,41 @@ def _translate_segments_batched(
                 f"pending_ids={pending_ids[:50]}, error={last_retry_error}"
             ) from last_retry_error
 
+        batch_elapsed_s = time.perf_counter() - batch_started
+        batch_finished_ts = time.time()
+        if first_token_ts is None:
+            first_token_ts = batch_finished_ts
+        emit_batch_diagnostic(
+            {
+                "phase": "batch_finish",
+                **trace_base,
+                "first_token_ts": first_token_ts,
+                "finished_ts": batch_finished_ts,
+                "elapsed_s": batch_elapsed_s,
+                "request_count": request_count,
+                "missing_count": len(missing_indexes),
+                "missing_indexes": missing_indexes,
+            }
+        )
+
         timing = {
             "batch_index": batch_index,
             "start_index": start_index,
             "segment_count": expected_count,
-            "elapsed_s": time.perf_counter() - batch_started,
+            "elapsed_s": batch_elapsed_s,
             "mode": "batched_full_context",
             "request_count": request_count,
             "source_payload_chars": len(source_payload),
-            "global_context_chars": len(full_context),
+            "global_context_chars": len(full_source_payload) if use_full_json_prefix else len(full_context),
+            "prefix_mode": prefix_mode,
+            "requested_ids": expected_ids,
+            "is_warmup": False,
+            "started_ts": batch_started_ts,
+            "first_token_ts": first_token_ts,
+            "finished_ts": batch_finished_ts,
+            "worker_thread_id": worker_thread_id,
+            "worker_thread_name": worker_thread_name,
+            **_merge_usage_metrics(request_usages),
             "missing_count": len(missing_indexes),
             "missing_indexes": missing_indexes,
         }
@@ -844,7 +1096,10 @@ def _translate_segments_batched(
             f"{len(missing)} missing; ids={missing[:50]}"
         )
 
-    timings = [timings_by_batch[index] for index in sorted(timings_by_batch)]
+    timings = []
+    if warmup_timing is not None:
+        timings.append(warmup_timing)
+    timings.extend(timings_by_batch[index] for index in sorted(timings_by_batch))
     timings.append(
         {
             "start_index": 0,
@@ -855,11 +1110,369 @@ def _translate_segments_batched(
             "batch_size": batch_size,
             "max_workers": max_workers,
             "cache_hit_count": len(batches) - len(pending_batches),
+            "prefix_mode": prefix_mode,
+            "is_warmup": False,
+            "requested_ids": [],
             "missing_count": 0,
             "missing_indexes": [],
         }
     )
     return [text or "" for text in zh_texts], timings
+
+
+_FEMALE_SOURCE_TERMS = ("まんこ", "マンコ", "おまんこ")
+_SUSPICIOUS_ASR_TERMS = (
+    "マンゴー",
+    "ウィンナー",
+    "おまけ",
+    "私の国",
+    "国に",
+    "こよく",
+    "きゅうしてください",
+)
+_FORBIDDEN_FEMALE_TRANSLATIONS = ("阴道", "陰道", "肉棒", "芒果", "香肠", "香腸")
+_FRAGMENT_REPAIR_SOURCE_MARKERS = (
+    "精子",
+    "まんこ",
+    "マンコ",
+    "おまんこ",
+    "マンゴー",
+    "ウィンナー",
+    "おまけ",
+    "私の国",
+    "国に",
+    "こよく",
+    "きゅうしてください",
+    "ちん",
+    "チン",
+)
+
+
+def _apply_translation_repair_pass(
+    segments: list[dict],
+    zh_texts: list[str],
+    *,
+    target_lang: str,
+    glossary: str,
+    character_reference: str,
+    reasoning_effort: str | None = None,
+    api_format: str | None = None,
+    on_progress: Callable[[dict], None] | None = None,
+) -> tuple[list[str], dict | None]:
+    repair_ids, reasons = _select_translation_repair_ids(segments, zh_texts)
+    if not TRANSLATION_REPAIR_ENABLED or not repair_ids:
+        return zh_texts, None
+
+    if TRANSLATION_REPAIR_MAX_IDS <= 0:
+        return zh_texts, None
+    repair_ids = repair_ids[:TRANSLATION_REPAIR_MAX_IDS]
+    started = time.perf_counter()
+    request_usages: list[dict] = []
+    _emit_progress(
+        on_progress,
+        {
+            "phase": "repair_start",
+            "repair_ids": repair_ids,
+            "candidate_count": len(repair_ids),
+        },
+    )
+    try:
+        messages = _build_repair_messages(
+            segments,
+            zh_texts,
+            repair_ids,
+            reasons,
+            target_lang=target_lang,
+            glossary=glossary,
+            character_reference=character_reference,
+        )
+        raw_output = _chat_with_reasoning(
+            messages,
+            expected_count=len(repair_ids),
+            reasoning_effort=reasoning_effort,
+            api_format=api_format,
+            on_usage=request_usages.append,
+        )
+        parsed = _parse_translation_output_by_global_id(
+            raw_output,
+            expected_ids=repair_ids,
+            total_count=len(segments),
+        )
+        repaired_texts = list(zh_texts)
+        repaired_count = 0
+        for idx in repair_ids:
+            if parsed[idx]:
+                repaired_texts[idx] = parsed[idx] or repaired_texts[idx]
+                repaired_count += 1
+        timing = {
+            "mode": "translation_repair_pass",
+            "start_index": min(repair_ids),
+            "segment_count": repaired_count,
+            "elapsed_s": time.perf_counter() - started,
+            "request_count": 1,
+            "repair_ids": repair_ids,
+            "candidate_count": len(repair_ids),
+            "missing_count": len(repair_ids) - repaired_count,
+            "missing_indexes": [
+                idx for idx in repair_ids if parsed[idx] is None
+            ],
+            **_merge_usage_metrics(request_usages),
+        }
+        _emit_progress(
+            on_progress,
+            {
+                "phase": "repair_done",
+                "repair_ids": repair_ids,
+                "repaired": repaired_count,
+                "expected": len(repair_ids),
+            },
+        )
+        return repaired_texts, timing
+    except Exception as exc:
+        timing = {
+            "mode": "translation_repair_failed",
+            "start_index": min(repair_ids),
+            "segment_count": 0,
+            "elapsed_s": time.perf_counter() - started,
+            "request_count": 1,
+            "repair_ids": repair_ids,
+            "candidate_count": len(repair_ids),
+            "missing_count": len(repair_ids),
+            "missing_indexes": repair_ids,
+            "error": str(exc)[:500],
+            **_merge_usage_metrics(request_usages),
+        }
+        print(f"[WARN] translation repair failed: {exc}", flush=True)
+        _emit_progress(
+            on_progress,
+            {
+                "phase": "repair_failed",
+                "repair_ids": repair_ids,
+                "error": str(exc)[:200],
+            },
+        )
+        return zh_texts, timing
+
+
+def _select_translation_repair_ids(
+    segments: list[dict],
+    zh_texts: list[str],
+) -> tuple[list[int], dict[int, list[str]]]:
+    repair_ids: list[int] = []
+    reasons: dict[int, list[str]] = {}
+    for idx, seg in enumerate(segments):
+        source = _normalize_source_text(seg.get("text", ""))
+        target = str(zh_texts[idx] if idx < len(zh_texts) else "")
+        local_reasons = _translation_repair_reasons(
+            segments,
+            zh_texts,
+            idx,
+            source,
+            target,
+        )
+        if not local_reasons:
+            continue
+        repair_ids.append(idx)
+        reasons[idx] = local_reasons
+    return repair_ids, reasons
+
+
+def _translation_repair_reasons(
+    segments: list[dict],
+    zh_texts: list[str],
+    idx: int,
+    source: str,
+    target: str,
+) -> list[str]:
+    del zh_texts
+
+    reasons: list[str] = []
+    has_female_source = any(term in source for term in _FEMALE_SOURCE_TERMS)
+    if has_female_source and any(term in target for term in _FORBIDDEN_FEMALE_TRANSLATIONS):
+        reasons.append("female_term_drift")
+
+    has_mango = "マンゴー" in source
+    if has_mango and _looks_like_sexual_asr_context(segments, idx):
+        if "小穴" not in target or _looks_like_fragment_translation(target):
+            reasons.append("suspicious_mango_asr")
+
+    has_wiener = "ウィンナー" in source
+    if has_wiener and (
+        "広げ" in source
+        or "肉棒" in target
+        or "香肠" in target
+        or "香腸" in target
+    ):
+        reasons.append("suspicious_wiener_asr")
+
+    if (
+        "おまけ" in source
+        and ("さらけ" in source or _looks_like_sexual_asr_context(segments, idx))
+        and ("露" in target or "赠" in target or _looks_like_fragment_translation(target))
+    ):
+        reasons.append("suspicious_omake_asr")
+
+    if (
+        ("私の国" in source or "国に" in source)
+        and _looks_like_sexual_asr_context(segments, idx)
+        and any(term in target for term in ("国家", "国", "我国"))
+    ):
+        reasons.append("suspicious_kuni_asr")
+
+    if (
+        "こよく" in source
+        and _looks_like_sexual_asr_context(segments, idx)
+        and ("说" in target or "説" in target or _looks_like_fragment_translation(target))
+    ):
+        reasons.append("suspicious_koyoku_asr")
+
+    if (
+        "きゅう" in source
+        and "してください" in source
+        and any(term in target for term in ("吸", "吮"))
+    ):
+        reasons.append("suspicious_kyuu_asr")
+
+    if (
+        any(marker in source for marker in _FRAGMENT_REPAIR_SOURCE_MARKERS)
+        and _looks_like_fragment_source(source)
+        and _looks_like_fragment_translation(target)
+    ):
+        reasons.append("fragment_translation")
+
+    return reasons
+
+
+def _looks_like_sexual_asr_context(segments: list[dict], idx: int) -> bool:
+    start = max(0, idx - 1)
+    end = min(len(segments), idx + 2)
+    joined = "\n".join(
+        _normalize_source_text(seg.get("text", ""))
+        for seg in segments[start:end]
+    )
+    return any(
+        marker in joined
+        for marker in (
+            "精子",
+            "射",
+            "入れ",
+            "入っ",
+            "気持ち",
+            "イク",
+            "イッ",
+            "行く",
+            "エロ",
+            "まんこ",
+            "マンコ",
+            "おまんこ",
+        )
+    )
+
+
+def _looks_like_fragment_source(source: str) -> bool:
+    stripped = source.strip()
+    if not stripped or re.search(r"[。！？!?]$", stripped):
+        return False
+    return bool(re.search(r"(さ|に|を|で|て|が|の|へ)$", stripped))
+
+
+def _looks_like_fragment_translation(target: str) -> bool:
+    stripped = target.strip()
+    if not stripped:
+        return True
+    if re.search(r"[。！？!?]$", stripped):
+        return False
+    if len(stripped) <= 10:
+        return True
+    return bool(re.search(r"[，、,]\s*[^，、,。！？!?]{1,6}$", stripped))
+
+
+def _build_repair_messages(
+    segments: list[dict],
+    zh_texts: list[str],
+    repair_ids: list[int],
+    reasons: dict[int, list[str]],
+    *,
+    target_lang: str,
+    glossary: str,
+    character_reference: str,
+) -> list[dict]:
+    system_prompt = _build_system_prompt(
+        len(repair_ids),
+        character_reference,
+        target_lang=target_lang,
+        glossary=glossary,
+    )
+    system_prompt += (
+        "\n\n这是翻译后局部修复任务。只修复 requested_ids 中的译文；"
+        "必须利用 reason 字段、相邻字幕和 current_zh 修复明显 ASR 同音误听、上下文漂移、术语漂移和被切断的半句。"
+        "reason 只是问题类别提示，不是固定译文；最终译文必须服从原文、上下文和既定术语。"
+        "性器官术语继续统一为肉棒/小穴，不要漂移成其他书面或错误译法。"
+    )
+    context_items = _build_repair_context_items(
+        segments,
+        zh_texts,
+        repair_ids,
+        reasons,
+    )
+    user_content = "\n\n".join(
+        [
+            "【翻译修复任务】",
+            f"requested_ids = {_format_requested_ids(repair_ids)}",
+            "只返回 requested_ids 中列出的 id，恰好返回这些 id，不要返回 context_only 项。",
+            "每个 text 只能是修复后的中文字幕；不要解释原因。",
+            "【局部上下文 JSON】",
+            json.dumps(context_items, ensure_ascii=False, indent=2),
+            '输出 JSON：{"translations":[{"id":0,"text":"..."}]}',
+        ]
+    )
+    return [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": user_content},
+    ]
+
+
+def _build_repair_context_items(
+    segments: list[dict],
+    zh_texts: list[str],
+    repair_ids: list[int],
+    reasons: dict[int, list[str]],
+) -> list[dict]:
+    indexes: set[int] = set()
+    radius = TRANSLATION_REPAIR_CONTEXT_RADIUS
+    for idx in repair_ids:
+        indexes.update(range(max(0, idx - radius), min(len(segments), idx + radius + 1)))
+
+    items = []
+    repair_id_set = set(repair_ids)
+    for idx in sorted(indexes):
+        seg = segments[idx]
+        items.append(
+            {
+                "id": idx,
+                "role": "repair" if idx in repair_id_set else "context_only",
+                "reason": _public_repair_reasons(reasons.get(idx, [])),
+                "start": _safe_float(seg.get("start")),
+                "end": _safe_float(seg.get("end")),
+                "ja": _normalize_source_text(seg.get("text", "")),
+                "current_zh": str(zh_texts[idx] if idx < len(zh_texts) else ""),
+            }
+        )
+    return items
+
+
+def _public_repair_reasons(local_reasons: list[str]) -> list[str]:
+    public: list[str] = []
+    for reason in local_reasons:
+        if reason == "female_term_drift":
+            public.append("female_term_drift")
+        elif reason == "fragment_translation":
+            public.append("fragment_translation")
+        elif reason.startswith("suspicious_"):
+            public.append("asr_homophone_or_context_drift")
+        else:
+            public.append("translation_drift")
+    return list(dict.fromkeys(public))
 
 
 def _split_into_batches(segments: list[dict], batch_size: int) -> list[list[dict]]:
@@ -875,6 +1488,7 @@ def _serialize_segments(
     *,
     start_index: int = 0,
     explicit_ids: list[int] | None = None,
+    compact: bool = False,
 ) -> str:
     payload = []
     for idx, seg in enumerate(segments):
@@ -896,6 +1510,8 @@ def _serialize_segments(
                 "ja": ja_text,
             }
         )
+    if compact:
+        return json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
     return json.dumps(payload, ensure_ascii=False, indent=2)
 
 
@@ -915,13 +1531,14 @@ def _build_full_segments_summary(segments: list[dict], *, limit_chars: int = 180
 
 _SYSTEM_PROMPT_FULL = (
     "你是专业的日语成人视频字幕翻译，目标语言是{target_lang}。\n"
-    "本片译文要体现主动撩拨的语气，露骨直接；遇到性器官性行为时优先用粗口口语（肉棒、操进来、淫穴、骚逼等），不用阴茎性交插入等书面语。\n"
-    "你会收到当前待翻译字幕 JSON 数组，以及全片上下文；必须基于全局上下文完成当前批次翻译。\n"
+    "本片译文要体现主动撩拨的语气，露骨直接；遇到性器官性行为时优先用粗口口语，不用阴茎性交插入等书面语。\n"
+    "性器官相关词汇优先统一使用：男性器官用“肉棒”，女性器官用“小穴”；避免其他漂移译法。\n"
+    "你会收到全片字幕 JSON，以及本次需要翻译的 requested_ids；必须基于全局上下文完成指定 id 翻译。\n"
     "本视频出场人物全名参考：【{character_reference}】。\n"
     "要求：\n"
     "1. 翻译要自然、口语化、适合字幕阅读，避免书面腔。\n"
     "2. 成人、暧昧、调情、呻吟、下流语气要保留原本强度，不要净化、弱化或说教。\n"
-    "3. 人名不要翻译成中文；如果原文出现人物姓名，直接输出罗马音，格式用 Title Case，并用空格分隔名和姓，例如 Aya Onami。\n"
+    "3. 人名不要翻译成中文；如果原文出现人物姓名，直接输出罗马音，格式用 Title Case，并用空格分隔名和姓，例如 Aya Onami。原文是汉字姓名时也必须按日语读音罗马音化，不要输出中文汉字或中文读法。\n"
     "4. {name_boundary}\n"
     "5. {name_homophone}\n"
     "6. 允许根据前后文修正明显 ASR 误听，但不要编造未出现的信息。\n"
@@ -930,7 +1547,7 @@ _SYSTEM_PROMPT_FULL = (
     "9. 输出尽量短，贴近屏幕阅读节奏；短促呻吟和语气词也要简短自然。\n"
     "10. 如果一行里大部分是呻吟、喘息、重复语气词，只保留清晰语义核心，重复部分可以压缩；映射参考：あんっ/はあん 译 啊嗯啊，気持ちいい 译 好舒服要爽死了，イッちゃう/イク 译 要去了要射了，避免感觉很舒服即将达到高潮等翻译腔。\n"
     "11. 结构化 JSON 输出要求 prompt 明确包含 json 字样；最终只输出合法 JSON 对象。\n"
-    '12. 你必须只输出 JSON：{{"translations":[{{"id":0,"text":"..."}}]}}，并且恰好返回 {expected_count} 条。\n'
+    '12. 你必须只输出 JSON：{{"translations":[{{"id":0,"text":"..."}}]}}，条数必须严格匹配本次任务要求。\n'
     "13. 最终 content 不能为空；即使开启思考模式，也必须把完整 JSON 对象写进最终 content。\n"
     "14. 不要输出 Markdown，不要解释，不要额外字段；思考过程不要写进最终 content。\n\n"
     "EXAMPLE JSON OUTPUT:\n"
@@ -939,8 +1556,9 @@ _SYSTEM_PROMPT_FULL = (
 
 _SYSTEM_PROMPT_COMPACT = (
     "你是日语成人视频字幕译者，目标语言是{target_lang}。保持口语、露骨语气和人名罗马音；"
-    "可修正明显ASR误听；每条独立翻译，不合并、不漏译、不调序。"
-    '只输出合法 JSON：{{"translations":[{{"id":0,"text":"..."}}]}}，恰好 {expected_count} 条。'
+    "汉字人名也要按日语读音罗马音化，不输出中文汉字名；"
+    "性器官相关词汇优先统一使用肉棒/小穴；可修正明显ASR误听；每条独立翻译，不合并、不漏译、不调序。"
+    '只输出合法 JSON：{{"translations":[{{"id":0,"text":"..."}}]}}。'
 )
 
 
@@ -961,7 +1579,6 @@ def _build_system_prompt(
         character_reference=character_reference,
         name_boundary=name_guidance["boundary"],
         name_homophone=name_guidance["homophone"],
-        expected_count=expected_count,
     )
     effective_glossary = (glossary or "").strip()
     if effective_glossary:
@@ -1003,6 +1620,7 @@ def _build_translation_messages(
     user_parts = [
         "【任务】把下面 JSON 数组里的日文字幕逐条翻译成中文字幕。",
         "每个元素的 `id` 必须原样保留，`text` 只能是翻译结果本身。",
+        f"必须恰好返回 {expected_count} 条翻译，不要多也不要少。",
         f"【待翻译字幕 JSON】\n{source_payload}",
     ]
 
@@ -1010,6 +1628,41 @@ def _build_translation_messages(
         {"role": "system", "content": system_prompt},
         {"role": "user", "content": "\n\n".join(user_parts)},
     ]
+
+
+def _format_requested_ids(requested_ids: list[int]) -> str:
+    return json.dumps([int(idx) for idx in requested_ids], ensure_ascii=False)
+
+
+def _build_requested_ids_task(
+    requested_ids: list[int],
+    *,
+    extra_glossary: str = "",
+    warmup: bool = False,
+) -> str:
+    expected_count = len(requested_ids)
+    task = [
+        "【本次任务】",
+        f"requested_ids = {_format_requested_ids(requested_ids)}",
+    ]
+    if warmup:
+        task.extend(
+            [
+                "这是缓存预热请求，不要翻译任何字幕。",
+                '只输出合法 JSON：{"translations":[]}',
+            ]
+        )
+    else:
+        task.extend(
+            [
+                "只翻译 requested_ids 中列出的字幕。",
+                f"必须只返回这些 id，恰好 {expected_count} 条，不要返回其他 id。",
+                '每个 `text` 只能是翻译结果本身，输出 JSON：{"translations":[{"id":0,"text":"..."}]}',
+            ]
+        )
+    if extra_glossary.strip():
+        task.append("注意：必须严格使用 System Prompt 中 <glossary> 标签内的术语表翻译。")
+    return "\n".join(task)
 
 
 def _build_batch_messages(
@@ -1023,11 +1676,12 @@ def _build_batch_messages(
     target_lang: str = "简体中文",
     glossary: str = "",
     source_payload_override: str | None = None,
+    full_source_payload: str | None = None,
+    requested_ids: list[int] | None = None,
+    warmup: bool = False,
 ) -> list[dict]:
-    if isinstance(full_segments_summary, str):
-        summary = full_segments_summary
-    else:
-        summary = _build_full_segments_summary(full_segments_summary)
+    if requested_ids is None:
+        requested_ids = list(range(batch_offset, batch_offset + expected_count))
 
     source_payload = source_payload_override or _serialize_segments(
         batch_segments,
@@ -1036,26 +1690,49 @@ def _build_batch_messages(
     messages = _build_translation_messages(
         source_payload=source_payload,
         expected_count=expected_count,
-        compact_system_prompt=COMPACT_SYSTEM_PROMPT and batch_index > 0,
+        compact_system_prompt=(
+            COMPACT_SYSTEM_PROMPT and batch_index > 0 and full_source_payload is None
+        ),
         extra_glossary=extra_glossary,
         target_lang=target_lang,
         glossary=glossary,
         character_reference=character_reference,
     )
+    if full_source_payload is not None:
+        messages[1]["content"] = "\n\n".join(
+            [
+                "【全片字幕 JSON】",
+                full_source_payload,
+                _build_requested_ids_task(
+                    requested_ids,
+                    extra_glossary=extra_glossary,
+                    warmup=warmup,
+                ),
+            ]
+        )
+        return messages
+
+    if isinstance(full_segments_summary, str):
+        summary = full_segments_summary
+    else:
+        summary = _build_full_segments_summary(full_segments_summary)
+
     messages[0]["content"] = (
         messages[0]["content"]
         + "\n\n全片字幕概览（仅作上下文连贯参考，不要翻译，原 id 不在本批的不要返回）：\n"
         + summary
     )
-    user_content = (
+    messages[1]["content"] = (
         "【任务】把下面当前批次 JSON 数组里的日文字幕逐条翻译成中文字幕。\n"
         "每个元素的 `id` 是全片全局 id，必须原样保留；只返回本批 id，不要返回概览里的其他 id。\n"
         "每个 `text` 只能是翻译结果本身。\n"
-        f"【当前批次字幕 JSON】\n{source_payload}"
+        f"【当前批次字幕 JSON】\n{source_payload}\n\n"
+        + _build_requested_ids_task(
+            requested_ids,
+            extra_glossary=extra_glossary,
+            warmup=warmup,
+        )
     )
-    if extra_glossary.strip():
-        user_content += "\n\n注意：必须严格使用 System Prompt 中 <glossary> 标签内的术语表翻译。"
-    messages[1]["content"] = user_content
     return messages
 
 
@@ -1069,7 +1746,9 @@ def _build_character_name_guidance(character_reference: str) -> dict[str, str]:
         ),
         "homophone": (
             "ASR 同音纠错：源日文文本由语音识别生成，可能把人物姓名识别成同音字、谐音字或近音词。"
-            f"请结合全片上下文，将明显的人名称呼纠正为参考名“{normalized}”对应的罗马音；"
+            f"只有当原文称呼的读音明显接近参考名“{normalized}”时，才纠正为该参考名对应的罗马音；"
+            "不要为了统一人物而把不同汉字姓氏或不同读音的称呼强行合并。"
+            "除非同一局部上下文有明确证据表明 ASR 把同一个名字写错。"
             "纠错只限明显人名称呼，不要把普通名词误改成人名。"
         ),
     }
@@ -1395,6 +2074,7 @@ def _chat(
     on_progress: Callable[[dict], None] | None = None,
     reasoning_effort: str | None = None,
     api_format: str | None = None,
+    on_usage: Callable[[dict], None] | None = None,
 ) -> str:
     if _llm_api_format(api_format) == "responses":
         return _chat_responses(
@@ -1402,12 +2082,14 @@ def _chat(
             expected_count=expected_count,
             on_progress=on_progress,
             reasoning_effort=reasoning_effort,
+            on_usage=on_usage,
         )
     return _chat_completions(
         messages,
         expected_count=expected_count,
         on_progress=on_progress,
         reasoning_effort=reasoning_effort,
+        on_usage=on_usage,
     )
 
 
@@ -1416,6 +2098,7 @@ def _chat_completions(
     expected_count: int = 0,
     on_progress: Callable[[dict], None] | None = None,
     reasoning_effort: str | None = None,
+    on_usage: Callable[[dict], None] | None = None,
 ) -> str:
     model_name = os.getenv("LLM_MODEL_NAME", LLM_MODEL_NAME).strip()
     if not model_name:
@@ -1429,11 +2112,19 @@ def _chat_completions(
             reasoning_effort or os.getenv("LLM_REASONING_EFFORT", LLM_REASONING_EFFORT)
         ),
         "extra_body": {"thinking": {"type": "enabled"}},
+        "stream_options": {"include_usage": True},
     }
     if TRANSLATION_MAX_TOKENS > 0:
         request["max_tokens"] = TRANSLATION_MAX_TOKENS
 
-    response_stream = _create_chat_completion(request)
+    try:
+        response_stream = _create_chat_completion(request)
+    except Exception as exc:
+        if "stream_options" not in request or "stream_options" not in str(exc):
+            raise
+        request = dict(request)
+        request.pop("stream_options", None)
+        response_stream = _create_chat_completion(request)
 
     finish_reason = None
     reasoning_chars = 0
@@ -1456,6 +2147,7 @@ def _chat_completions(
         _emit_progress(on_progress, payload)
 
     for chunk in response_stream:
+        _emit_usage(on_usage, getattr(chunk, "usage", None))
         if not chunk.choices:
             continue
         delta = chunk.choices[0].delta
@@ -1500,6 +2192,7 @@ def _chat_responses(
     expected_count: int = 0,
     on_progress: Callable[[dict], None] | None = None,
     reasoning_effort: str | None = None,
+    on_usage: Callable[[dict], None] | None = None,
 ) -> str:
     model_name = os.getenv("LLM_MODEL_NAME", LLM_MODEL_NAME).strip()
     if not model_name:
@@ -1598,6 +2291,7 @@ def _chat_responses(
 
         if event_type == "response.completed":
             completed_response = _response_event_response(event)
+            _emit_usage(on_usage, _get_nested_value(completed_response, "usage"))
             continue
 
         if event_type == "response.incomplete":
@@ -1754,7 +2448,9 @@ def _parse_partial_translation_output_by_global_id(
             continue
         idx = _coerce_int(item.get("id"))
         if idx is None or idx not in expected_id_set or idx >= total_count:
-            continue
+            raise RetryableTranslationFormatError(
+                f"{_JSON_OUTPUT_LABEL} returned invalid batch translation id: {item.get('id')!r}."
+            )
         if idx in seen_ids:
             raise RetryableTranslationFormatError(
                 f"{_JSON_OUTPUT_LABEL} returned duplicate translation id: {idx}."
