@@ -56,6 +56,13 @@
 | T-X ✅ | 翻译 fixed-prefix 批处理、并发诊断、术语/人名规则、局部 repair pass | 229 passed |
 | T-Y ✅ | Web 演员名持久化、提交自动保存设置、移除手动保存按钮 | 定向 10 passed + JS check |
 | T-Z ✅ | 翻译前 ASR 噪声过滤扩展到纯特殊符号段 | 定向 56 passed |
+| B1 ✅ | 拆分 `src/whisper/pipeline.py` → `backends/registry.py` + `checkpoint.py` + 3 新模块 | 241 passed |
+| B2 ✅ | 拆分 `src/llm/translator.py` → `cache.py` + `prompt.py` | 241 passed |
+| B3 ✅ | 压缩 `src/main.py`（-228 行）→ `stage_log.py` + `output_writer.py` | 241 passed |
+| B4 ✅ | ASR 滑动上下文注入（`initial_prompts`，gender/gap 重置） | 241 passed |
+| B5 ✅ | VAD 微短段预合并（`_merge_short_vad_chunks`，`merged_from` 元数据） | 241 passed |
+| B6 ✅ | 字幕软切分点（`soft_split_long_segments`，6s 阈值，标点/助词词边界） | 241 passed |
+| B7 ✅ | Repair Pass 长度错配强制候选（ratio [0.25, 4.0]，reason `length_mismatch`） | 237 passed |
 
 <details>
 <summary>T-S 到 T-Z 详细记录</summary>
@@ -123,44 +130,47 @@
 
 ## 4. 当前待办 / Backlog
 
-### B1：继续拆分 `src/whisper/pipeline.py`
+> **Backlog 已清空。** B1–B7 全部完成，全量回归 241 passed。
 
-现状：当前最大后端文件，约 2259 行。
+<details>
+<summary>B1–B7 已完成记录</summary>
 
-建议拆分方向：
-- backend registry / dispatch：后端列表、label、选择逻辑。
-- ASR checkpoint：读写、路径、恢复策略。
-- chunk/VAD orchestration：切块、VAD backend 调度、chunk 元数据。
-- transcribe/alignment orchestration：ASR 文本转写、forced alignment、stage details 汇总。
-- recovery：ffmpeg VAD 二次细分与重转写路径。
+### B1 ✅：拆分 `src/whisper/pipeline.py`
 
-边界：保持公开入口不变，先拆纯 helper，再拆阶段编排，避免一次性重排主流程。
+完成：新增 `src/whisper/backends/registry.py`（后端选择/dispatch）和 `src/whisper/checkpoint.py`（checkpoint 路径/读写），pipeline.py 通过 import 保持所有原名可访问。241 tests passed。
 
-### B2：继续拆分 `src/llm/translator.py`
+### B2 ✅：拆分 `src/llm/translator.py`
 
-现状：约 2270 行，当前已超过 `src/whisper/pipeline.py`，是最大后端文件。
+完成：新增 `src/llm/cache.py`（translation cache 读写、cache key）和 `src/llm/prompt.py`（系统提示、payload 构建、PROMPT_VERSION）；translator.py 通过 `prompt_module` / `translation_cache` 代理保持原名可访问。241 tests passed。
 
-建议拆分方向：
-- cache：JSON/JSONL cache 读写、损坏 warning、cache key。
-- prompt：系统提示、用户 payload、fixed-prefix payload、术语表和人物参考。
-- client/chat：Chat Completions 请求和流式解析。
-- client/responses：Responses API 请求和流式解析。
-- batching/retry：batch 切分、requested ids、prefix warmup、缺失 id 重试、进度/并发诊断事件。
-- repair：候选 id 选择、抽象 reason 映射、局部上下文构造、repair pass 请求。
+### B3 ✅：压缩 `src/main.py` 主编排
 
-边界：当前翻译 API 行为稳定，拆分时优先保留 `translate_segments()` 对外签名。
+完成：新增 `src/pipeline/stage_log.py`（stage event / run log helper）和 `src/pipeline/output_writer.py`（JSON/timings/SRT 写出路径）；main.py 净减 228 行。241 tests passed。
 
-### B3：压缩 `src/main.py` 主编排
+### B4 ✅：ASR 滑动上下文注入
 
-现状：已从约 1621 行降到约 1487 行，但仍包含 ASR stage event、timing、JSON 输出、翻译写出三段重复结构。
+完成：`WhisperModelBackend.transcribe_texts()` 增加 `initial_prompts` 参数；`pipeline.py` 维护滑动窗口（`ASR_SLIDING_CONTEXT_SEGS=2`），间隔 > 0.5s 或 gender turn 切换时重置。241 tests passed。
 
-建议拆分方向：
-- stage event / run log helper。
-- JSON/timings payload writer。
-- ASR artifact build。
-- translation write-output paths 的重复写 JSON/SRT/timings 分支。
+### B5 ✅：VAD 微短段预合并
 
-边界：`run_asr_alignment_f0()` / `run_translation_and_write()` 暂时保留为后端公开入口。
+完成：`pipeline.py` 新增 `_merge_short_vad_chunks()`，相邻双段均 < `VAD_MERGE_SHORT_MAX_S=0.8s` 且间隔 < `VAD_MERGE_GAP_MAX_S=0.3s` 时物理拼接；保留 `merged_from` 元数据供对齐回溯。241 tests passed。
+
+### B6 ✅：字幕软切分点
+
+完成：`src/subtitles/writer.py` 新增 `soft_split_long_segments()`，对 end-start > `SUBTITLE_SOFT_MAX_S`（默认 6.0s）且有 words 的 segment，优先在中文句末标点（。！？）或日文助词（は/が/を/に 等）词边界处拆分；`src/main.py` 在 segments→srt_blocks 转换前调用。fallback 模式（无 words）不受影响。241 tests passed。
+
+### B7 ✅：Repair Pass 增强——长度错配强制候选
+
+完成：`_select_translation_repair_ids()` 增加长度比率检测，len(zh)/max(len(ja),1) 超出 [TRANSLATION_REPAIR_LENGTH_RATIO_MIN=0.25, TRANSLATION_REPAIR_LENGTH_RATIO_MAX=4.0] 窗口时强制入候选，reason=`length_mismatch`，优先于低置信度候选。237 tests passed。
+
+</details>
+
+---
+
+### 暂缓（低优先级，待验证后再决定）
+
+- **温度回退/压缩率监控**：当前 `do_sample=False` + beams 模式收益有限，待实际幻觉统计后再决定。
+- **自适应 VAD 阈值**：当前 0.35 表现稳定，复杂度与收益比待评估。
 
 ---
 

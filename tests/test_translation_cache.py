@@ -70,6 +70,7 @@ def test_batched_translation_skips_cached_batches(monkeypatch, tmp_path):
         segments[:2],
         glossary="",
         target_lang="简体中文",
+        character_reference="",
     )
     cache_path.write_text(
         json.dumps({cache_key: ["cached-0", "cached-1"]}, ensure_ascii=False),
@@ -93,6 +94,7 @@ def test_batched_translation_skips_cached_batches(monkeypatch, tmp_path):
         cache_path=str(cache_path),
         target_lang="简体中文",
         glossary="",
+        character_reference="",
     )
 
     assert calls == [(2, 2)]
@@ -110,6 +112,7 @@ def test_batched_translation_skips_cached_batches(monkeypatch, tmp_path):
             segments[2:],
             glossary="",
             target_lang="简体中文",
+            character_reference="",
         )
     ] == ["zh-2", "zh-3"]
     assert migrated_path.exists()

@@ -1,6 +1,16 @@
 import re
 
 from subtitles import writer as subtitle
+
+
+def _word(text: str, start: float, end: float) -> dict:
+    return {"word": text, "start": start, "end": end}
+
+
+def _cue_count(content: str) -> int:
+    return len(re.findall(r"^\d+$", content, flags=re.MULTILINE))
+
+
 def test_bilingual_srt_uses_placeholder_for_empty_translation(tmp_path, caplog):
     path = tmp_path / "out.srt"
 
@@ -42,7 +52,7 @@ def test_merge_adjacent_short_blocks(tmp_path):
     subtitle.write_bilingual_srt(blocks, str(path))
 
     content = path.read_text(encoding="utf-8")
-    assert len(re.findall(r"^\d+$", content, flags=re.MULTILINE)) == 1
+    assert _cue_count(content) == 1
     assert "いい もっと" in content
     assert "好，更多" in content
 
@@ -57,7 +67,103 @@ def test_merge_adjacent_short_blocks_stops_after_sentence_punctuation(tmp_path):
     subtitle.write_bilingual_srt(blocks, str(path))
 
     content = path.read_text(encoding="utf-8")
-    assert len(re.findall(r"^\d+$", content, flags=re.MULTILINE)) == 2
+    assert _cue_count(content) == 2
+
+
+def test_soft_split_prefers_translated_sentence_punctuation(monkeypatch, tmp_path):
+    monkeypatch.setattr(subtitle, "SUBTITLE_SOFT_SPLIT_ENABLED", True)
+    monkeypatch.setattr(subtitle, "SUBTITLE_SOFT_MAX_S", 6.0)
+    path = tmp_path / "soft_zh.srt"
+    blocks = [
+        {
+            "start": 0.0,
+            "end": 7.0,
+            "ja_text": "これはいい次が来る",
+            "zh_text": "这是第一句。然后继续",
+            "words": [
+                _word("これは", 0.0, 1.5),
+                _word("いい", 1.5, 3.0),
+                _word("次が", 3.0, 5.0),
+                _word("来る", 5.0, 7.0),
+            ],
+        }
+    ]
+
+    subtitle.write_bilingual_srt(blocks, str(path))
+
+    content = path.read_text(encoding="utf-8")
+    assert _cue_count(content) == 2
+    assert "これはいい" in content
+    assert "次が来る" in content
+    assert "这是第一句。" in content
+    assert "然后继续" in content
+    assert "00:00:03,000" in content
+
+
+def test_soft_split_falls_back_to_japanese_particle_boundary(monkeypatch, tmp_path):
+    monkeypatch.setattr(subtitle, "SUBTITLE_SOFT_SPLIT_ENABLED", True)
+    monkeypatch.setattr(subtitle, "SUBTITLE_SOFT_MAX_S", 6.0)
+    path = tmp_path / "soft_particle.srt"
+    blocks = [
+        {
+            "start": 0.0,
+            "end": 7.2,
+            "ja_text": "私もあなたに近づきたい今すぐ",
+            "zh_text": "我也想要靠近你现在就继续",
+            "words": [
+                _word("私も", 0.0, 2.0),
+                _word("あなたに", 2.0, 4.0),
+                _word("近づきたい", 4.0, 5.6),
+                _word("今すぐ", 5.6, 7.2),
+            ],
+        }
+    ]
+
+    subtitle.write_bilingual_srt(blocks, str(path))
+
+    content = path.read_text(encoding="utf-8")
+    assert _cue_count(content) == 2
+    assert "私もあなたに" in content
+    assert "近づきたい今すぐ" in content
+
+
+def test_soft_split_does_not_change_blocks_without_words(monkeypatch, tmp_path):
+    monkeypatch.setattr(subtitle, "SUBTITLE_SOFT_SPLIT_ENABLED", True)
+    monkeypatch.setattr(subtitle, "SUBTITLE_SOFT_MAX_S", 6.0)
+    path = tmp_path / "fallback_no_words.srt"
+    blocks = [
+        {
+            "start": 0.0,
+            "end": 7.0,
+            "ja_text": "これはいい。次が来る",
+            "zh_text": "这是第一句。然后继续",
+        }
+    ]
+
+    subtitle.write_bilingual_srt(blocks, str(path))
+
+    content = path.read_text(encoding="utf-8")
+    assert _cue_count(content) == 1
+    assert "这是第一句。然后继续" in content
+
+
+def test_soft_split_recurses_until_hard_duration_is_respected(monkeypatch):
+    monkeypatch.setattr(subtitle, "SUBTITLE_SOFT_SPLIT_ENABLED", True)
+    monkeypatch.setattr(subtitle, "SUBTITLE_SOFT_MAX_S", 6.0)
+    monkeypatch.setattr(subtitle, "MAX_SUBTITLE_DURATION", 8.0)
+    words = [_word(f"語{index}", index * 2.0, (index + 1) * 2.0) for index in range(9)]
+    block = {
+        "start": 0.0,
+        "end": 18.0,
+        "ja_text": "".join(word["word"] for word in words),
+        "zh_text": "第一句。后续内容没有更多句末标点但仍然很长",
+        "words": words,
+    }
+
+    split = subtitle._soft_split_subtitle_blocks([block])
+
+    assert len(split) == 3
+    assert all(part["end"] - part["start"] <= 8.0 for part in split)
 
 
 def test_gender_same_adjacent_short_blocks_merge():
