@@ -70,6 +70,20 @@ def _env_float(name: str, default: float) -> float:
         return default
 
 
+def _normalize_generation_config_for_deterministic_asr(model: Any) -> None:
+    generation_config = getattr(model, "generation_config", None)
+    if generation_config is None:
+        return
+
+    if getattr(generation_config, "temperature", None) not in {None, 1.0}:
+        generation_config.temperature = None
+
+    if getattr(generation_config, "pad_token_id", None) is None:
+        eos_token_id = getattr(generation_config, "eos_token_id", None)
+        if eos_token_id is not None:
+            generation_config.pad_token_id = eos_token_id
+
+
 class WhisperModelBackend:
     is_subprocess = False
     accepts_contexts = False
@@ -130,6 +144,7 @@ class WhisperModelBackend:
             dtype=torch.float16,
             device_map="cuda",
         )
+        _normalize_generation_config_for_deterministic_asr(self._model)
 
     def unload_model(self, on_stage: Callable[[str], None] | None = None) -> None:
         if self._model is None and self._processor is None:
@@ -175,12 +190,17 @@ class WhisperModelBackend:
         self,
         audio_paths: list[str],
         contexts: list[str] | None = None,
+        initial_prompts: list[str | None] | None = None,
         on_stage: Callable[[str], None] | None = None,
     ) -> list[dict[str, Any]]:
         if contexts and any(contexts):
             if not getattr(self, "_warned_contexts", False):
                 _notify(on_stage, f"[WARN] {self.preset_name} ignores contexts")
                 self._warned_contexts = True
+        if initial_prompts is not None and len(initial_prompts) != len(audio_paths):
+            raise ValueError(
+                f"initial_prompt count mismatch: audio_paths={len(audio_paths)}, initial_prompts={len(initial_prompts)}"
+            )
 
         self.load(on_stage=on_stage)
 
@@ -193,6 +213,11 @@ class WhisperModelBackend:
         for idx, audio_path in enumerate(audio_paths):
             normalized_path = str(Path(audio_path).resolve())
             duration = _get_wav_duration(normalized_path)
+            initial_prompt = (
+                str(initial_prompts[idx] or "").strip()
+                if initial_prompts is not None
+                else ""
+            )
 
             try:
                 audio, _sample_rate = load_audio_16k_mono(normalized_path)
@@ -212,6 +237,20 @@ class WhisperModelBackend:
                             task="transcribe",
                         )
                     )
+                    prompt_token_count = 0
+                    prompt_warning = ""
+                    if initial_prompt:
+                        try:
+                            prompt_ids = self._processor.get_prompt_ids(
+                                initial_prompt,
+                                return_tensors="pt",
+                            ).to("cuda")
+                            generate_kwargs["prompt_ids"] = prompt_ids
+                            prompt_token_count = int(prompt_ids.numel())
+                        except Exception as prompt_exc:
+                            prompt_warning = (
+                                f"{self.backend_label} initial_prompt skipped: {prompt_exc}"
+                            )
                     predicted_ids = self._model.generate(
                         input_features,
                         do_sample=False,
@@ -232,7 +271,17 @@ class WhisperModelBackend:
                         "duration": duration,
                         "language": "Japanese",
                         "normalized_path": normalized_path,
-                        "log": [f"{self.backend_label} ASR 输出模式: text_only"],
+                        "log": [
+                            f"{self.backend_label} ASR 输出模式: text_only",
+                            *(
+                                [
+                                    f"{self.backend_label} initial_prompt tokens: {prompt_token_count}"
+                                ]
+                                if prompt_token_count
+                                else []
+                            ),
+                            *([prompt_warning] if prompt_warning else []),
+                        ],
                     }
                 )
             except Exception as e:

@@ -1,12 +1,10 @@
 import os
-import re
 import json
 import logging
 import time
 import sys
 import warnings
 from contextlib import contextmanager
-from datetime import datetime, timezone
 from pathlib import Path
 
 warnings.filterwarnings("ignore")
@@ -21,7 +19,9 @@ from pipeline import audio as audio_module
 from pipeline import cleanup as cleanup_module
 from pipeline import gender_split as gender_split_module
 from pipeline import output as output_module
+from pipeline import output_writer as output_writer_module
 from pipeline import quality as quality_module
+from pipeline import stage_log as stage_log_module
 from pipeline.artifacts import AsrArtifacts
 from pipeline.ids import sanitize_job_id
 from utils.model_paths import PROJECT_ROOT
@@ -82,21 +82,9 @@ from rich.progress import (
     TimeElapsedColumn,
     MofNCompleteColumn,
 )
-from rich.table import Table
 
 console = Console(force_terminal=False, emoji=False)
-_ASR_PROGRESS_RE = re.compile(
-    r"(?P<label>音频切块|ASR 文本转写|Alignment 对齐|Alignment 局部细化|Alignment 降级重试)\s+(?P<current>\d+)/(?P<total>\d+)"
-)
-_STAGE_LOG_RE = re.compile(
-    r"^stage_(?P<phase>start|done|skip|blocked|degraded)\s+(?P<stage>[A-Za-z0-9_]+)(?:\s+(?P<extra>.*))?$"
-)
-_ASR_STAGE_MAP = {
-    "ASR 文本转写": "asr_text_transcribe",
-    "Alignment 对齐": "alignment",
-    "Alignment 局部细化": "alignment",
-    "Alignment 降级重试": "alignment",
-}
+_ASR_PROGRESS_RE = stage_log_module._ASR_PROGRESS_RE
 
 
 def _env_flag(name: str) -> bool:
@@ -282,154 +270,24 @@ def _close_artifacts_logger(artifacts: "AsrArtifacts") -> None:
     artifacts.logger = None
 
 
-def _event_ts() -> str:
-    return datetime.now(timezone.utc).isoformat(timespec="milliseconds")
-
-
-def _coerce_event_value(value: str) -> object:
-    stripped = value.strip().rstrip(",")
-    if stripped.lower() == "true":
-        return True
-    if stripped.lower() == "false":
-        return False
-    try:
-        if any(marker in stripped for marker in (".", "e", "E")):
-            return float(stripped.rstrip("s"))
-        return int(stripped)
-    except ValueError:
-        return stripped
-
-
-def _parse_stage_extra(raw_extra: str | None) -> dict:
-    extra: dict[str, object] = {}
-    if not raw_extra:
-        return extra
-    for token in raw_extra.split():
-        if "=" not in token:
-            continue
-        key, value = token.split("=", 1)
-        if not key:
-            continue
-        extra[key] = _coerce_event_value(value)
-    return extra
-
-
-def _emit_stage_event(
-    video_path: str | None,
-    stage: str,
-    phase: str,
-    extra: dict | None = None,
-) -> None:
-    if phase not in {"start", "done", "skip", "blocked", "degraded", "progress"}:
-        return
-    video = (
-        os.path.basename(video_path)
-        if video_path
-        else str(getattr(events._thread_local, "video", "") or "")
-    )
-    events.emit(
-        {
-            "ts": _event_ts(),
-            "job_id": events._current_job_id(),
-            "video": video,
-            "stage": stage,
-            "phase": phase,
-            "extra": dict(extra or {}),
-        }
-    )
-
-
-def _emit_stage_log_event(video_path: str | None, message: str) -> None:
-    match = _STAGE_LOG_RE.match(message)
-    if not match:
-        return
-    phase = match.group("phase")
-    if phase == "blocked":
-        phase = "blocked"
-    _emit_stage_event(
-        video_path,
-        match.group("stage"),
-        phase,
-        _parse_stage_extra(match.group("extra")),
-    )
-
-
-def _parse_asr_stage_event(message: str) -> tuple[str, dict] | None:
-    match = _ASR_PROGRESS_RE.search(message)
-    if not match:
-        return None
-    raw_label = match.group("label")
-    stage = _ASR_STAGE_MAP.get(raw_label)
-    if stage is None:
-        return None
-    current = int(match.group("current"))
-    total = int(match.group("total"))
-    extra = {
-        "label": raw_label,
-        "current": current,
-        "total": total,
-    }
-    return stage, extra
-
-
-def _log_stage(logger: logging.Logger | None, message: str) -> None:
-    if logger is not None:
-        logger.info(message)
-    _emit_stage_log_event(None, message)
+_event_ts = stage_log_module._event_ts
+_coerce_event_value = stage_log_module._coerce_event_value
+_parse_stage_extra = stage_log_module._parse_stage_extra
+_emit_stage_event = stage_log_module._emit_stage_event
+_emit_stage_log_event = stage_log_module._emit_stage_log_event
+_parse_asr_stage_event = stage_log_module._parse_asr_stage_event
+_log_stage = stage_log_module._log_stage
 
 
 def _project_relative(path: str | Path | None) -> str | None:
-    if path is None:
-        return None
-    raw = str(path)
-    if not raw:
-        return raw
-    project_root_text = PROJECT_ROOT.resolve().as_posix()
-    normalized = raw.replace("\\", "/")
-    root_pattern = re.compile(re.escape(project_root_text) + r"/?", re.IGNORECASE)
-    normalized = root_pattern.sub("", normalized)
-    if normalized != raw.replace("\\", "/"):
-        return normalized or "."
-    candidate = Path(raw)
-    try:
-        if candidate.is_absolute():
-            return candidate.resolve().relative_to(PROJECT_ROOT).as_posix()
-    except (OSError, ValueError):
-        return raw.replace("\\", "/")
-    return raw.replace("\\", "/")
+    return output_writer_module.project_relative(path, project_root=PROJECT_ROOT)
 
 
 def _project_relative_required(path: str | Path) -> str:
     return _project_relative(path) or ""
 
 
-def _log_timing_snapshot(
-    logger: logging.Logger | None,
-    stage_timings: dict,
-    asr_details: dict,
-) -> None:
-    if logger is None:
-        return
-    asr_stage_timings = asr_details.get("stage_timings", {}) if asr_details else {}
-    labels = (
-        ("audio_prepare_s", "audio_prepare"),
-        ("audio_extract_s", "audio_extract"),
-        ("asr_model_load_s", "asr_model_load"),
-        ("asr_text_transcribe_s", "asr_text_transcribe"),
-        ("asr_model_unload_s", "asr_model_unload"),
-        ("alignment_s", "alignment"),
-        ("alignment_model_unload_s", "alignment_model_unload"),
-        ("subtitle_merge_s", "subtitle_merge"),
-        ("asr_alignment_total_s", "asr_alignment_total"),
-        ("translation_context_s", "translation_context"),
-        ("translation_s", "translation"),
-        ("write_output_s", "write_output"),
-        ("pipeline_total_s", "pipeline_total"),
-    )
-    for key, label in labels:
-        value = stage_timings.get(key, asr_stage_timings.get(key))
-        if value is not None:
-            logger.info("timing %s=%.2fs", label, float(value))
+_log_timing_snapshot = stage_log_module._log_timing_snapshot
 
 
 def _resolve_job_temp_dir(job_id: str) -> str:
@@ -479,41 +337,22 @@ def _cleanup_pipeline_temp(job_temp_dir: str, audio_path: str, translation_cache
     )
 
 
-def _format_asr_stage_label(raw_label: str) -> str:
-    mapping = {
-        "音频切块": "音频切块",
-        "ASR 文本转写": "ASR 转写",
-        "Alignment 对齐": "Alignment 对齐",
-        "Alignment 局部细化": "Alignment 局部细化",
-        "Alignment 降级重试": "Alignment 降级重试",
-    }
-    return mapping.get(raw_label, raw_label)
+_format_asr_stage_label = stage_log_module._format_asr_stage_label
 
 
 def _write_json(path: str, payload: dict) -> None:
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(_relativize_payload_paths(payload), f, ensure_ascii=False, indent=2)
+    output_writer_module.write_json(path, payload, project_root=PROJECT_ROOT)
 
 
 def _write_json_atomic(path: str | Path, payload: dict) -> None:
-    target = Path(path)
-    target.parent.mkdir(parents=True, exist_ok=True)
-    tmp_path = target.with_name(f"{target.name}.{os.getpid()}.tmp")
-    tmp_path.write_text(
-        json.dumps(_relativize_payload_paths(payload), ensure_ascii=False, indent=2),
-        encoding="utf-8",
-    )
-    tmp_path.replace(target)
+    output_writer_module.write_json_atomic(path, payload, project_root=PROJECT_ROOT)
 
 
 def _relativize_payload_paths(value):
-    if isinstance(value, dict):
-        return {key: _relativize_payload_paths(item) for key, item in value.items()}
-    if isinstance(value, list):
-        return [_relativize_payload_paths(item) for item in value]
-    if isinstance(value, str):
-        return _project_relative(value)
-    return value
+    return output_writer_module.relativize_payload_paths(
+        value,
+        project_root=PROJECT_ROOT,
+    )
 
 
 def _timings_payload(
@@ -534,25 +373,23 @@ def _timings_payload(
     asr_log: list[str],
     asr_qc_blocked: bool | None = None,
 ) -> dict:
-    payload = {
-        "video_path": video_path,
-        "audio_path": audio_path,
-        "audio_cached": audio_cached,
-        "job_id": job_id,
-        "job_temp_dir": job_temp_dir,
-        "device": device,
-        "backend": backend,
-        "counts": counts,
-        "stage_timings": stage_timings,
-        "asr_details": asr_details,
-        "translation_request_timings": translation_request_timings,
-        "translation_api_retry_events": translation_api_retry_events,
-        "outputs": outputs,
-        "asr_log": asr_log,
-    }
-    if asr_qc_blocked is not None:
-        payload["asr_qc_blocked"] = asr_qc_blocked
-    return payload
+    return output_writer_module.timings_payload(
+        video_path=video_path,
+        audio_path=audio_path,
+        audio_cached=audio_cached,
+        job_id=job_id,
+        job_temp_dir=job_temp_dir,
+        device=device,
+        backend=backend,
+        counts=counts,
+        stage_timings=stage_timings,
+        asr_details=asr_details,
+        translation_request_timings=translation_request_timings,
+        translation_api_retry_events=translation_api_retry_events,
+        outputs=outputs,
+        asr_log=asr_log,
+        asr_qc_blocked=asr_qc_blocked,
+    )
 
 
 def _write_quality_report_for_ctx(
@@ -606,41 +443,14 @@ def _build_japanese_srt_blocks(segments: list[dict]) -> list[dict]:
             "end": float(seg["end"]),
             "ja_text": str(seg.get("text", "")),
             "zh_text": str(seg.get("text", "")),
+            "words": list(seg.get("words") or []),
         }
         for seg in segments
     ]
 
 
-def _add_timing_row(table: Table, label: str, seconds: float | None) -> None:
-    if seconds is None:
-        return
-    table.add_row(label, f"{seconds:.2f}s")
-
-
 def _print_timing_summary(stage_timings: dict, asr_details: dict) -> None:
-    table = Table(title="阶段耗时", show_lines=False)
-    table.add_column("阶段")
-    table.add_column("耗时", justify="right")
-
-    asr_stage_timings = asr_details.get("stage_timings", {}) if asr_details else {}
-    for label, key in (
-        ("音频准备", "audio_prepare_s"),
-        ("ASR 模型加载", "asr_model_load_s"),
-        ("ASR 文本转写", "asr_text_transcribe_s"),
-        ("ASR 模型卸载", "asr_model_unload_s"),
-        ("Alignment 对齐", "alignment_s"),
-        ("Alignment 模型卸载", "alignment_model_unload_s"),
-        ("字幕合并", "subtitle_merge_s"),
-        ("ASR+Alignment", "asr_alignment_total_s"),
-        ("翻译上下文", "translation_context_s"),
-        ("翻译", "translation_s"),
-        ("输出写入", "write_output_s"),
-        ("总计", "pipeline_total_s"),
-    ):
-        seconds = stage_timings.get(key, asr_stage_timings.get(key))
-        _add_timing_row(table, label, seconds)
-
-    console.print(table)
+    stage_log_module._print_timing_summary(console, stage_timings, asr_details)
 
 
 def run_asr_alignment_f0(
@@ -1506,6 +1316,7 @@ def _run_translation_and_write_impl(
             "ja_text": seg.get("text", ""),
             "speaker": seg.get("speaker"),
             "gender": seg.get("gender"),
+            "words": list(seg.get("words") or []),
         }
         for seg, zh_text in zip(segments, zh_texts)
     ]
