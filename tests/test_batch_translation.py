@@ -688,6 +688,74 @@ def test_translation_repair_selects_suspicious_asr_homophones_in_sexual_context(
     assert reasons[10] == ["suspicious_kyuu_asr"]
 
 
+def test_translation_repair_selects_length_mismatch_candidates():
+    segments = [
+        {"start": 0.0, "end": 1.0, "text": "これは普通の文です。"},
+        {"start": 1.0, "end": 2.0, "text": "短い"},
+        {"start": 2.0, "end": 3.0, "text": "これはかなり長い日本語の原文です。"},
+    ]
+    zh_texts = [
+        "这是普通句子。",
+        "这是一个明显被过度展开的中文翻译，长度远远超过原文。",
+        "嗯",
+    ]
+
+    repair_ids, reasons = translator._select_translation_repair_ids(segments, zh_texts)
+
+    assert repair_ids == [1, 2]
+    assert reasons[1] == ["length_mismatch"]
+    assert reasons[2] == ["length_mismatch"]
+
+
+def test_translation_repair_length_mismatch_uses_source_translation_fields():
+    segments = [
+        {
+            "start": 0.0,
+            "end": 1.0,
+            "source": "短い",
+            "translation": "这是一个明显被过度展开的中文翻译，长度远远超过原文。",
+        }
+    ]
+
+    repair_ids, reasons = translator._select_translation_repair_ids(segments, [])
+    context_items = translator._build_repair_context_items(
+        segments,
+        [],
+        repair_ids,
+        reasons,
+    )
+
+    assert repair_ids == [0]
+    assert reasons[0] == ["length_mismatch"]
+    assert context_items[0]["reason"] == ["length_mismatch"]
+    assert context_items[0]["ja"] == "短い"
+    assert context_items[0]["current_zh"] == "这是一个明显被过度展开的中文翻译，长度远远超过原文。"
+
+
+def test_translation_repair_prioritizes_length_mismatch_before_low_confidence(monkeypatch):
+    def fake_repair_reasons(segments, zh_texts, idx, source, target):
+        del segments, zh_texts, source, target
+        return ["low_confidence"] if idx in {0, 1} else []
+
+    monkeypatch.setattr(translator, "_translation_repair_reasons", fake_repair_reasons)
+    segments = [
+        {"start": 0.0, "end": 1.0, "text": "これは普通の文です。"},
+        {"start": 1.0, "end": 2.0, "text": "これも普通の文です。"},
+        {"start": 2.0, "end": 3.0, "text": "短い"},
+    ]
+    zh_texts = [
+        "这是普通句子。",
+        "这也是普通句子。",
+        "这是一个明显被过度展开的中文翻译，长度远远超过原文。",
+    ]
+
+    repair_ids, reasons = translator._select_translation_repair_ids(segments, zh_texts)
+
+    assert repair_ids == [2, 0, 1]
+    assert repair_ids[:2] == [2, 0]
+    assert reasons[2] == ["length_mismatch"]
+
+
 def test_translation_repair_does_not_flag_literal_country_outside_sex_context():
     segments = [
         {"start": 0.0, "end": 1.0, "text": "私の国にできた会社です。"},
