@@ -45,6 +45,12 @@ _ASR_CHUNK_PACK_GAP_MERGE_S = float(
 )
 _ASR_CHUNK_PACK_PADDING_S = float(os.getenv("ASR_CHUNK_PACK_PADDING_S", "2.0"))
 
+_ASR_CHUNK_DROP_ENABLED = os.getenv(
+    "ASR_CHUNK_DROP_ENABLED", "0"
+).strip().lower() in {"1", "true", "yes", "on"}
+_ASR_CHUNK_DROP_MIN_DURATION_S = float(os.getenv("ASR_CHUNK_DROP_MIN_DURATION_S", "0.20"))
+_ASR_CHUNK_DROP_RMS_DBFS = float(os.getenv("ASR_CHUNK_DROP_RMS_DBFS", "-40.0"))
+
 get_backend_label = _registry_module.get_backend_label
 _create_whisper_backend = _registry_module._create_whisper_backend
 _resolve_asr_backend = _registry_module._resolve_asr_backend
@@ -185,6 +191,38 @@ def aggregate_timeout_fragments(job_id: str) -> Path | None:
     return _checkpoint_module.aggregate_timeout_fragments(job_id)
 
 
+import logging as _logging
+_pipeline_logger = _logging.getLogger(__name__)
+
+
+def _drop_short_low_energy_spans(
+    audio_path: str,
+    spans: list,
+) -> list:
+    """Drop spans where duration < threshold AND RMS energy < threshold (both must hold)."""
+    from audio.audio_metrics import compute_rms_dbfs
+
+    kept = []
+    dropped = 0
+    for span in spans:
+        start = span.start if hasattr(span, "start") else span[0]
+        end = span.end if hasattr(span, "end") else span[1]
+        dur = end - start
+        if dur < _ASR_CHUNK_DROP_MIN_DURATION_S:
+            rms = compute_rms_dbfs(audio_path, start, end)
+            if rms < _ASR_CHUNK_DROP_RMS_DBFS:
+                _pipeline_logger.info(
+                    "[chunk-drop] start=%.3f end=%.3f dur=%.3f rms=%.1f dBFS",
+                    start, end, dur, rms,
+                )
+                dropped += 1
+                continue
+        kept.append(span)
+    if dropped:
+        _pipeline_logger.info("[chunk-drop] dropped %d/%d spans", dropped, dropped + len(kept))
+    return kept
+
+
 def _build_processing_spans(
     audio_path: str,
 ) -> list[tuple[float, float]] | list[PackedChunk]:
@@ -205,8 +243,11 @@ def _build_processing_spans(
         }
         _chunking_module._LAST_VAD_SIGNATURE = _LAST_VAD_SIGNATURE
         _sync_checkpoint_state()
+        segments = result.segments
+        if _ASR_CHUNK_DROP_ENABLED:
+            segments = _drop_short_low_energy_spans(audio_path, segments)
         packed = pack_vad_segments(
-            result.segments,
+            segments,
             max_s=_ASR_CHUNK_PACK_MAX_S,
             gap_merge_s=_ASR_CHUNK_PACK_GAP_MERGE_S,
             padding_s=_ASR_CHUNK_PACK_PADDING_S,
@@ -216,6 +257,8 @@ def _build_processing_spans(
     spans = _chunking_module._build_processing_spans(audio_path)
     _LAST_VAD_SIGNATURE = _chunking_module._LAST_VAD_SIGNATURE
     _sync_checkpoint_state()
+    if _ASR_CHUNK_DROP_ENABLED:
+        spans = _drop_short_low_energy_spans(audio_path, spans)
     return spans
 
 

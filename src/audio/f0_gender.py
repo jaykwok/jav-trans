@@ -16,9 +16,9 @@ F0_NAN_RATIO_THRESHOLD = float(os.getenv("F0_NAN_RATIO_THRESHOLD", "0.6"))
 F0_GENDER_CARRYOVER_ENABLED = os.getenv(
     "F0_GENDER_CARRYOVER_ENABLED", "1"
 ).strip().lower() in {"1", "true", "yes", "on"}
-F0_GENDER_CARRYOVER_MAX_GAP_S = float(os.getenv("F0_GENDER_CARRYOVER_MAX_GAP_S", "10.0"))
+F0_GENDER_CARRYOVER_MAX_GAP_S = float(os.getenv("F0_GENDER_CARRYOVER_MAX_GAP_S", "15.0"))
 F0_GENDER_CARRYOVER_MAX_SEGMENT_S = float(
-    os.getenv("F0_GENDER_CARRYOVER_MAX_SEGMENT_S", "8.0")
+    os.getenv("F0_GENDER_CARRYOVER_MAX_SEGMENT_S", "12.0")
 )
 
 
@@ -117,6 +117,7 @@ def _word_gender(
     times,
     *,
     threshold_hz: float,
+    nan_ratio_threshold: float = F0_NAN_RATIO_THRESHOLD,
 ) -> str | None:
     try:
         word_start = max(0.0, float(word.get("start", segment_start)) - segment_start)
@@ -126,6 +127,7 @@ def _word_gender(
     return _classify_f0(
         _f0_for_time_range(f0, times, word_start, word_end),
         threshold_hz=threshold_hz,
+        nan_ratio_threshold=nan_ratio_threshold,
     )
 
 
@@ -253,6 +255,7 @@ def detect_gender_f0_word_level(
     median_filter_frames=9,
     min_span_ms=500,
     f0_threshold_hz=160.0,
+    nan_ratio_threshold: float | None = None,
     _load_fn=None,
     _pyin_fn=None,
 ) -> list[dict]:
@@ -260,6 +263,7 @@ def detect_gender_f0_word_level(
 
     _ = min_span_ms
     threshold_hz = float(f0_threshold_hz if f0_threshold_hz is not None else F0_THRESHOLD_HZ)
+    nan_thr = nan_ratio_threshold if nan_ratio_threshold is not None else F0_NAN_RATIO_THRESHOLD
     pyin_fn = _pyin_fn if _pyin_fn is not None else librosa.pyin
 
     try:
@@ -343,6 +347,7 @@ def detect_gender_f0_word_level(
                 s["gender"] = _classify_f0(
                     _f0_for_time_range(f0, times, 0.0, end - start, fallback_to_all=True),
                     threshold_hz=threshold_hz,
+                    nan_ratio_threshold=nan_thr,
                 )
             else:
                 for word in words:
@@ -352,6 +357,7 @@ def detect_gender_f0_word_level(
                         f0,
                         times,
                         threshold_hz=threshold_hz,
+                        nan_ratio_threshold=nan_thr,
                     )
                 s["words"] = words
                 s["gender"] = _majority_gender(words)
@@ -378,11 +384,11 @@ def detect_gender_f0(
     _load_fn=None,
     _pyin_fn=None,
 ) -> list[dict]:
-    _ = nan_ratio_threshold
     return detect_gender_f0_word_level(
         audio_path,
         segments,
         f0_threshold_hz=threshold_hz if threshold_hz is not None else F0_THRESHOLD_HZ,
+        nan_ratio_threshold=nan_ratio_threshold,
         _load_fn=_load_fn,
         _pyin_fn=_pyin_fn,
     )
