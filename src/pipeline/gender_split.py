@@ -150,7 +150,7 @@ def split_segment_on_f0_gender_turns(segment: dict) -> list[dict]:
     current_words: list[dict] = []
     pending_nones: list[dict] = []
     active_gender: str | None = None
-    none_tolerance = max(1, _env_int("F0_GENDER_NONE_TOLERANCE", 2))
+    none_tolerance = max(1, _env_int("F0_GENDER_NONE_TOLERANCE", 3))
 
     for word in words:
         gender = word_gender_value(word)
@@ -191,6 +191,11 @@ def split_segment_on_f0_gender_turns(segment: dict) -> list[dict]:
             if _known_gender_word_count(current_words, active_gender) >= none_tolerance:
                 _flush_group(groups, current_words)
                 _flush_group(groups, pending_nones, force=True)
+            elif none_tolerance >= 3 and len(pending_nones) == none_tolerance - 1:
+                current_words.extend(pending_nones)
+                current_words.append(word)
+                pending_nones = []
+                continue
             else:
                 current_words.extend(pending_nones)
                 _flush_group(groups, current_words)

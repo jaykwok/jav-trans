@@ -781,6 +781,33 @@ def run_asr_alignment_f0(
                             f"{f0_split_before} -> {len(segments)} "
                             f"(split_count={f0_gender_split_count})[/cyan]"
                         )
+                    from audio.f0_gender import (
+                        F0_GENDER_CARRYOVER_ENABLED,
+                        F0_GENDER_CARRYOVER_MAX_GAP_S,
+                        F0_GENDER_CARRYOVER_MAX_SEGMENT_S,
+                        _apply_gender_carry_over,
+                    )
+
+                    if F0_GENDER_CARRYOVER_ENABLED:
+                        _none_before = sum(
+                            1 for s in segments if s.get("gender") is None
+                        )
+                        segments = _apply_gender_carry_over(
+                            segments,
+                            enabled=True,
+                            max_gap_s=F0_GENDER_CARRYOVER_MAX_GAP_S,
+                            max_segment_s=F0_GENDER_CARRYOVER_MAX_SEGMENT_S,
+                        )
+                        _none_after = sum(
+                            1 for s in segments if s.get("gender") is None
+                        )
+                        _log_stage(
+                            logger,
+                            "f0_post_split_carry_over "
+                            f"none_before={_none_before} "
+                            f"none_after={_none_after} "
+                            f"rescued={_none_before - _none_after}",
+                        )
             _raise_if_cancelled(cancel_event)
             _log_stage(
                 logger,
