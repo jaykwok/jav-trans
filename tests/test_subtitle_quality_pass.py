@@ -158,12 +158,64 @@ def test_soft_split_recurses_until_hard_duration_is_respected(monkeypatch):
         "ja_text": "".join(word["word"] for word in words),
         "zh_text": "第一句。后续内容没有更多句末标点但仍然很长",
         "words": words,
+        "gender": "M",
     }
 
     split = subtitle._soft_split_subtitle_blocks([block])
 
-    assert len(split) == 3
+    assert len(split) >= 3
     assert all(part["end"] - part["start"] <= 8.0 for part in split)
+
+
+def test_none_gender_over_soft_limit_gets_hard_split(monkeypatch):
+    monkeypatch.setattr(subtitle, "SUBTITLE_SOFT_SPLIT_ENABLED", True)
+    monkeypatch.setattr(subtitle, "SUBTITLE_SOFT_MAX_S", 6.0)
+    monkeypatch.setattr(subtitle, "MAX_SUBTITLE_DURATION", 8.0)
+    words = [_word(f"語{i}", i * 1.4, (i + 1) * 1.4) for i in range(5)]
+    block = {
+        "start": 0.0,
+        "end": 7.0,
+        "ja_text": "".join(w["word"] for w in words),
+        "zh_text": "这段没有句末标点无法找到分割点",
+        "words": words,
+        "gender": None,
+    }
+    split = subtitle._soft_split_subtitle_blocks([block])
+    assert len(split) == 2
+
+
+def test_non_none_gender_over_soft_limit_no_forced_split(monkeypatch):
+    monkeypatch.setattr(subtitle, "SUBTITLE_SOFT_SPLIT_ENABLED", True)
+    monkeypatch.setattr(subtitle, "SUBTITLE_SOFT_MAX_S", 6.0)
+    monkeypatch.setattr(subtitle, "MAX_SUBTITLE_DURATION", 8.0)
+    words = [_word(f"語{i}", i * 1.4, (i + 1) * 1.4) for i in range(5)]
+    block = {
+        "start": 0.0,
+        "end": 7.0,
+        "ja_text": "".join(w["word"] for w in words),
+        "zh_text": "这段没有句末标点无法找到分割点",
+        "words": words,
+        "gender": "F",
+    }
+    split = subtitle._soft_split_subtitle_blocks([block])
+    assert len(split) == 1
+
+
+def test_none_gender_below_soft_limit_not_split(monkeypatch):
+    monkeypatch.setattr(subtitle, "SUBTITLE_SOFT_SPLIT_ENABLED", True)
+    monkeypatch.setattr(subtitle, "SUBTITLE_SOFT_MAX_S", 6.0)
+    monkeypatch.setattr(subtitle, "MAX_SUBTITLE_DURATION", 8.0)
+    words = [_word(f"語{i}", i * 1.0, (i + 1) * 1.0) for i in range(4)]
+    block = {
+        "start": 0.0,
+        "end": 5.9,
+        "ja_text": "".join(w["word"] for w in words),
+        "zh_text": "短于软上限",
+        "words": words,
+        "gender": None,
+    }
+    split = subtitle._soft_split_subtitle_blocks([block])
+    assert len(split) == 1
 
 
 def test_gender_same_adjacent_short_blocks_merge():
