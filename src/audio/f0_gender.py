@@ -71,8 +71,11 @@ def _run_pyin(clip, *, pyin_fn, sr: int, frame_length: int, hop_length: int):
             frame_length=frame_length,
             hop_length=hop_length,
         )
-    except TypeError:
-        return pyin_fn(clip, fmin=50, fmax=500, sr=sr)
+    except Exception:
+        try:
+            return pyin_fn(clip, fmin=50, fmax=500, sr=sr)
+        except TypeError:
+            return pyin_fn(clip, 50, 500)
 
 
 def _frame_times(frame_count: int, *, hop_length: int, sr: int) -> np.ndarray:
