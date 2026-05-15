@@ -13,7 +13,7 @@ def refine_chunks_via_vad(
     chunks: list[dict],
     *,
     vad_backend: VadBackend,
-    threshold_override: float = 0.25,
+    threshold_override: float | None = None,
     min_silence_ms: int = 200,
     min_speech_ms: int = 250,
     timeout_per_chunk_s: float = 30.0,
@@ -25,9 +25,8 @@ def refine_chunks_via_vad(
     merge text results.
 
     On VAD returning <=1 segment or timeout/exception the original chunk is
-    returned unchanged (with '_vad_parent_index' added).  threshold_override,
-    min_silence_ms, min_speech_ms are API parameters; the vad_backend uses its
-    own configured thresholds internally.
+    returned unchanged (with '_vad_parent_index' added).  threshold_override is
+    passed through to VAD backends that support per-call threshold overrides.
     """
     result: list[dict] = []
     executor = ThreadPoolExecutor(max_workers=1)
@@ -35,7 +34,11 @@ def refine_chunks_via_vad(
         for chunk in chunks:
             original_index = int(chunk.get("index", 0))
             try:
-                future = executor.submit(vad_backend.segment, chunk["path"])
+                future = executor.submit(
+                    vad_backend.segment,
+                    chunk["path"],
+                    threshold_override=threshold_override,
+                )
                 seg_result = future.result(timeout=timeout_per_chunk_s)
             except FuturesTimeoutError:
                 executor.shutdown(wait=False, cancel_futures=True)
