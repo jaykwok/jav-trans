@@ -13,6 +13,13 @@ logger = logging.getLogger(__name__)
 
 F0_THRESHOLD_HZ = float(os.getenv("F0_THRESHOLD_HZ", "160.0"))
 F0_NAN_RATIO_THRESHOLD = float(os.getenv("F0_NAN_RATIO_THRESHOLD", "0.6"))
+F0_GENDER_CARRYOVER_ENABLED = os.getenv(
+    "F0_GENDER_CARRYOVER_ENABLED", "1"
+).strip().lower() in {"1", "true", "yes", "on"}
+F0_GENDER_CARRYOVER_MAX_GAP_S = float(os.getenv("F0_GENDER_CARRYOVER_MAX_GAP_S", "10.0"))
+F0_GENDER_CARRYOVER_MAX_SEGMENT_S = float(
+    os.getenv("F0_GENDER_CARRYOVER_MAX_SEGMENT_S", "8.0")
+)
 
 
 def _classify_f0(
@@ -151,6 +158,91 @@ def _fallback_words_for_segment(segment: dict) -> list[dict]:
     return words
 
 
+def _segment_time(segment: dict, key: str, default: float = 0.0) -> float:
+    try:
+        return float(segment.get(key, default))
+    except (TypeError, ValueError):
+        return default
+
+
+def _segment_duration(segment: dict) -> float:
+    start = _segment_time(segment, "start")
+    end = _segment_time(segment, "end", start)
+    return max(0.0, end - start)
+
+
+def _nearest_gender_anchor(
+    segments: list[dict],
+    original_genders: list,
+    start_index: int,
+    step: int,
+) -> tuple[int, str] | None:
+    index = start_index
+    while 0 <= index < len(segments):
+        gender = original_genders[index]
+        if gender in {"M", "F"}:
+            return index, str(gender)
+        index += step
+    return None
+
+
+def _anchor_gap_s(
+    segments: list[dict],
+    index: int,
+    left_index: int,
+    right_index: int,
+) -> float:
+    left_end = _segment_time(segments[left_index], "end")
+    right_start = _segment_time(segments[right_index], "start")
+    if right_start >= left_end:
+        return right_start - left_end
+
+    segment = segments[index]
+    left_segment_gap = max(
+        0.0,
+        _segment_time(segment, "start") - _segment_time(segments[left_index], "end"),
+    )
+    right_segment_gap = max(
+        0.0,
+        _segment_time(segments[right_index], "start") - _segment_time(segment, "end"),
+    )
+    return max(left_segment_gap, right_segment_gap)
+
+
+def _apply_gender_carry_over(
+    segments,
+    *,
+    enabled: bool,
+    max_gap_s: float,
+    max_segment_s: float,
+):
+    if not enabled:
+        return segments
+
+    result = [dict(segment) for segment in segments]
+    original_genders = [segment.get("gender") for segment in result]
+    for index, gender in enumerate(original_genders):
+        if gender is not None:
+            continue
+        segment = result[index]
+        if _segment_duration(segment) > max_segment_s:
+            continue
+
+        left_anchor = _nearest_gender_anchor(result, original_genders, index - 1, -1)
+        right_anchor = _nearest_gender_anchor(result, original_genders, index + 1, 1)
+        if left_anchor is None or right_anchor is None:
+            continue
+
+        left_index, left_gender = left_anchor
+        right_index, right_gender = right_anchor
+        if left_gender != right_gender:
+            continue
+        if _anchor_gap_s(result, index, left_index, right_index) > max_gap_s:
+            continue
+        segment["gender"] = left_gender
+    return result
+
+
 def detect_gender_f0_word_level(
     audio_path,
     segments,
@@ -269,7 +361,12 @@ def detect_gender_f0_word_level(
             if s.get("words"):
                 s["words"] = [dict(word, gender=None) for word in s.get("words") or []]
         result.append(s)
-    return result
+    return _apply_gender_carry_over(
+        result,
+        enabled=F0_GENDER_CARRYOVER_ENABLED,
+        max_gap_s=F0_GENDER_CARRYOVER_MAX_GAP_S,
+        max_segment_s=F0_GENDER_CARRYOVER_MAX_SEGMENT_S,
+    )
 
 
 def detect_gender_f0(

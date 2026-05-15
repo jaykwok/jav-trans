@@ -279,6 +279,12 @@ DEFAULT_SETTINGS: dict[str, str] = {
     "F0_GENDER_POST_ALIGNMENT": "0",
     # Consecutive unknown-gender words needed to form a separate None group.
     "F0_GENDER_NONE_TOLERANCE": "2",
+    # 1 lets short unknown-gender segments inherit gender from matching nearby anchors.
+    "F0_GENDER_CARRYOVER_ENABLED": "1",
+    # Max left-anchor-end to right-anchor-start gap for None segment carry-over.
+    "F0_GENDER_CARRYOVER_MAX_GAP_S": "10.0",
+    # Max duration of a None segment eligible for gender carry-over.
+    "F0_GENDER_CARRYOVER_MAX_SEGMENT_S": "8.0",
     # Minimum duration for gender-turn split pieces.
     "SUBTITLE_MIN_DURATION_GENDER_TURN": "0.4",
     # 1 preserves word timestamps in final output artifacts.
