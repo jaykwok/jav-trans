@@ -119,7 +119,8 @@ def test_f0_gender_turn_split_aggressive_m_to_f():
     assert all(item["source_chunk_index"] == 7 for item in split)
 
 
-def test_f0_gender_turn_split_none_word_joins_previous_group():
+def test_f0_gender_turn_split_none_word_joins_previous_group(monkeypatch):
+    monkeypatch.setenv("F0_GENDER_NONE_TOLERANCE", "2")
     segment = {
         "start": 0.0,
         "end": 3.0,
@@ -176,4 +177,3 @@ def test_f0_gender_turn_split_same_gender_stays_one_segment():
 
     assert split == [segment]
     assert count == 0
-
