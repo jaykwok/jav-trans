@@ -225,24 +225,37 @@
 
 **背景**：T-AC HAME-052 PoC 结果明确（gender split +69%、混合段 -60%），切默认。同步修 ASR overflow bug：`_build_initial_prompt_for_chunk` 无 token 上限，导致 ~34% 的 chunk 触发 `decoder_input_ids exceeds max_target_positions` 后静默返回 `text=""`。
 
-**Step 序列（codex 每步完成打印 `[Step AD-X] DONE.` 然后 stop）**：
+- **AD-1** ✅：`src/core/config.py` + `.env.example` 切默认；全量 253 passed
+- **AD-2** ✅：双层截断：`transcribe.py` 字符截断（末尾 240 chars，词边界），`model_backend.py` token cap（末尾 180 tokens）+ overflow retry；新增 `tests/test_initial_prompt_truncation.py` 3 tests；全量 256 passed
+- **AD-3** ✅：commit `1610843`；`load_config()` 后 `ASR_CHUNK_PACKING_ENABLED=1 F0_GENDER_POST_ALIGNMENT=1`
 
-- **AD-1**：切默认：`src/core/config.py:123` `ASR_LONG_CHUNK_PROFILE` off→on；`.env.example` 同步；受影响测试加 monkeypatch fix；全量回归 ≥253 passed
-- **AD-2**：ASR initial_prompt 双层截断：
-  - `src/whisper/transcribe.py` `_build_initial_prompt_for_chunk()` 末尾追加字符级截断（保留末尾 240 chars），`ASR_INITIAL_PROMPT_MAX_CHARS=240` env
-  - `src/whisper/model_backend.py` `WhisperModelBackend` 在 `get_prompt_ids()` 后精确截 token（保留末尾 ≤ `ASR_INITIAL_PROMPT_MAX_TOKENS=180`，env 常量）；`model.generate()` 捕获 `RuntimeError` 且消息同时含 `decoder_input_ids` 和 `exceeds`/`max_length` 时重试一次去掉 `prompt_ids`，截断/重试都要 warn log
-  - 新增 `tests/test_initial_prompt_truncation.py`（长 prompt 截到末尾；overflow retry 成功）；全量 ≥253 passed + 新增测试
-- **AD-3**：回归 + commit：验证 `load_config()` 后 `ASR_CHUNK_PACKING_ENABLED=1 F0_GENDER_POST_ALIGNMENT=1`；一次 commit 全部
-
-**关键文件**：`src/core/config.py`、`.env.example`、`src/whisper/transcribe.py`、`src/whisper/model_backend.py`；可能调整测试文件
-
-**验收基线**：全量回归 ≥253 passed（含 AD-2 新增测试）；default-on 可启动 web；overflow 不再静默吞掉 chunk
+**验收基线**：256 passed, 5 skipped
 
 ---
 
-### T-AE Backlog（待后续）
+### T-AE：None 段 speaker carry-over
 
-- None 段 speaker carry-over：纯 None 段前后段同性别 → 继承 gender
+**目标**：F0 检测后 post-process——纯 gender=None 的 segment，若两侧最近非 None segment 性别一致且时间距离在阈值内，则继承该性别，降低字幕 None 标记比例。
+
+**新增 env（默认 on）**：
+- `F0_GENDER_CARRYOVER_ENABLED=1`
+- `F0_GENDER_CARRYOVER_MAX_GAP_S=10.0`（左右锚点 segment 起止时间 gap 超出此值则保留 None）
+- `F0_GENDER_CARRYOVER_MAX_SEGMENT_S=8.0`（None segment 本身超过此时长则不 carry-over）
+
+**实现要点**（Codex review 确认）：
+- 新增 `_apply_gender_carry_over(segments)` 于 `src/audio/f0_gender.py`，在 `detect_gender_f0_word_level()` 末尾调用
+- 用原始 gender 快照找左右锚点，不让刚 carry 的值成为后续锚点（避免顺序依赖）
+- 只改 segment.gender，不改 word.gender（word gender 是 split 的依据，不应填假值）
+
+**Step 序列（codex 每步完成打印 `[Step AE-X] DONE.` 然后 stop）**：
+- **AE-1**：实现 `_apply_gender_carry_over()` + env gate；在 `detect_gender_f0_word_level()` 末尾调用；新增 `tests/test_gender_carryover.py`（≥5 case：双侧 F 继承、双侧不一致保留 None、超 max_gap 保留 None、超 max_segment_s 保留 None、disabled 不生效）；全量回归 ≥256 passed
+
+**关键文件**：`src/audio/f0_gender.py`、`src/core/config.py`（新增 env 常量）、`.env.example`
+
+---
+
+### Backlog（待后续）
+
 - soft_split 扩展 None 长段：`_soft_split_subtitle_block` 中 gender=None 且 >6s 落 hard_word_split
 - Windows 生产环境 default-on 验证
 
