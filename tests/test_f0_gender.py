@@ -148,3 +148,44 @@ def test_default_audio_loader_does_not_use_librosa_load(monkeypatch):
     )
 
     assert result[0]["gender"] == "M"
+
+
+# --- Bug fix: nan_ratio_threshold must be propagated through detect_gender_f0 ---
+
+def _fake_pyin_mixed_nan(nan_ratio: float, f0_val: float = 120.0):
+    """Return a pyin that produces the requested fraction of NaN frames."""
+    def fn(clip, fmin, fmax, sr, **kwargs):
+        n = 20
+        n_nan = int(n * nan_ratio)
+        f0 = np.full(n, f0_val, dtype=np.float32)
+        f0[:n_nan] = np.nan
+        voiced_flag = np.isfinite(f0)
+        return f0, voiced_flag, np.ones(n)
+    return fn
+
+
+def test_nan_ratio_threshold_propagates_strict():
+    """With threshold=0.50, nan_ratio=0.55 → None (stricter than default 0.6)."""
+    segs = [{"start": 0.0, "end": 2.0}]
+    result = detect_gender_f0(
+        "x.wav",
+        segs,
+        nan_ratio_threshold=0.50,
+        _load_fn=_fake_load(_tone(120.0)),
+        _pyin_fn=_fake_pyin_mixed_nan(0.55),
+    )
+    assert result[0]["gender"] is None
+
+
+def test_nan_ratio_threshold_propagates_lenient():
+    """With threshold=0.75, nan_ratio=0.55 → classified (lenient, 0.55 < 0.75)."""
+    segs = [{"start": 0.0, "end": 2.0}]
+    result = detect_gender_f0(
+        "x.wav",
+        segs,
+        nan_ratio_threshold=0.75,
+        _load_fn=_fake_load(_tone(120.0)),
+        _pyin_fn=_fake_pyin_mixed_nan(0.55),
+    )
+    # 45% of frames are valid and all at 120 Hz → should classify as "M"
+    assert result[0]["gender"] == "M"

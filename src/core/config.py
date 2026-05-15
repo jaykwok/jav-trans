@@ -129,6 +129,13 @@ DEFAULT_SETTINGS: dict[str, str] = {
     "ASR_CHUNK_PACK_PADDING_S": "2.0",
     # ffmpeg silence threshold for fallback chunking.
     "SEGMENT_SILENCE_DB": "-32dB",
+    # 1 enables dropping very short low-energy spans before ASR (opt-in).
+    "ASR_CHUNK_DROP_ENABLED": "0",
+    # Spans shorter than this value (seconds) are candidates for dropping.
+    "ASR_CHUNK_DROP_MIN_DURATION_S": "0.20",
+    # Spans with RMS energy below this dBFS level are candidates for dropping.
+    # Both duration and energy thresholds must be met (AND logic).
+    "ASR_CHUNK_DROP_RMS_DBFS": "-40.0",
 
     # --- WhisperSeg VAD Settings ---
     # Speech probability threshold; lower catches more speech and more noise.
