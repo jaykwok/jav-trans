@@ -1,4 +1,5 @@
 import inspect
+import logging
 import os
 import re
 import time
@@ -31,6 +32,8 @@ from whisper.local_backend import (
 )
 from whisper.timestamp_fallback import build_word_timestamps_fallback
 
+
+logger = logging.getLogger(__name__)
 
 _GRAY_MAX_DURATION_S = float(os.getenv("ASR_GRAY_MAX_DURATION", "2.5"))
 _SEGMENT_CUT_MIN_SILENCE_S = float(os.getenv("SEGMENT_CUT_MIN_SILENCE", "0.5"))
@@ -92,6 +95,18 @@ _ASR_CHECKPOINT_ENABLED = os.getenv("ASR_CHECKPOINT_ENABLED", "1").strip().lower
     "no",
     "off",
 }
+_ASR_TEMPERATURE_FALLBACK = os.getenv("ASR_TEMPERATURE_FALLBACK", "").strip().lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+    "enabled",
+}
+_ASR_FALLBACK_TEMPERATURES = [
+    float(t.strip())
+    for t in os.getenv("ASR_FALLBACK_TEMPERATURES", "0.2,0.4,0.6").split(",")
+    if t.strip()
+]
 
 _TRIVIAL_SEGMENT = re.compile(
     r"^[あっんーっ。！？\s…、ぁぃぅぇぉアイウエオ]{1,5}$"
@@ -543,6 +558,60 @@ def _transcribe_asr_chunks_text_only(
             ]
         return backend.transcribe_texts(audio_paths, **kwargs)
 
+    def _apply_temperature_fallback(
+        batch_chunks: list[dict], batch_results: list[dict]
+    ) -> list[dict]:
+        if not _ASR_TEMPERATURE_FALLBACK or is_subprocess_backend:
+            return batch_results
+        if not _ASR_FALLBACK_TEMPERATURES:
+            return batch_results
+        sig_params = inspect.signature(backend.transcribe_texts).parameters
+        if "temperature" not in sig_params:
+            return batch_results
+        from whisper.qc import check_logprob_quality
+        updated = list(batch_results)
+        for i, (chunk, text_result) in enumerate(zip(batch_chunks, batch_results)):
+            if check_logprob_quality(text_result)["verdict"] != "reject":
+                continue
+            chunk_index = chunk.get("index")
+            audio_path = chunk["path"]
+            context = _build_ASR_CONTEXT_for_chunk(chunk)
+            initial_prompt = (
+                _build_initial_prompt_for_chunk(
+                    chunk, chunks, text_results_by_index, chunk_positions
+                )
+                if supports_initial_prompts
+                else None
+            )
+            for temperature in _ASR_FALLBACK_TEMPERATURES:
+                try:
+                    kw: dict = {"contexts": [context], "on_stage": on_stage}
+                    if supports_initial_prompts:
+                        kw["initial_prompts"] = [initial_prompt]
+                    retry_results = backend.transcribe_texts(
+                        [audio_path], temperature=temperature, **kw
+                    )
+                    retry_result = retry_results[0]
+                    verdict = check_logprob_quality(retry_result)["verdict"]
+                    logger.debug(
+                        "[asr-temp-fallback] chunk=%s temperature=%s verdict=%s",
+                        chunk_index,
+                        temperature,
+                        verdict,
+                    )
+                    if verdict != "reject":
+                        updated[i] = retry_result
+                        break
+                except Exception as exc:
+                    logger.warning(
+                        "[asr-temp-fallback] chunk=%s temperature=%s error: %s",
+                        chunk_index,
+                        temperature,
+                        exc,
+                    )
+                    break
+        return updated
+
     try:
         if not is_subprocess_backend:
             for batch_start in range(0, len(chunks), request_batch_size):
@@ -559,6 +628,7 @@ def _transcribe_asr_chunks_text_only(
                     continue
 
                 batch_text_results = _transcribe_batch(pending_chunks)
+                batch_text_results = _apply_temperature_fallback(pending_chunks, batch_text_results)
                 _store_text_results(pending_chunks, batch_text_results)
         else:
             pending_chunks = [

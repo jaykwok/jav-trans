@@ -354,6 +354,7 @@ class WhisperModelBackend:
         contexts: list[str] | None = None,
         initial_prompts: list[str | None] | None = None,
         on_stage: Callable[[str], None] | None = None,
+        temperature: float = 0.0,
     ) -> list[dict[str, Any]]:
         if contexts and any(contexts):
             if not getattr(self, "_warned_contexts", False):
@@ -425,6 +426,7 @@ class WhisperModelBackend:
                         self._processor,
                         input_features,
                         generate_kwargs,
+                        temperature=temperature,
                     )
                     if retry_reason == "prompt_overflow_retry_without_prompt_ids":
                         prompt_warning = (
