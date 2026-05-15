@@ -334,11 +334,14 @@ def _hard_word_split_candidate(
     words: list[dict],
     block_start: float,
     block_end: float,
+    *,
+    threshold: float | None = None,
 ) -> tuple[int, None] | None:
-    if MAX_SUBTITLE_DURATION <= 0 or block_end - block_start <= MAX_SUBTITLE_DURATION:
+    effective = MAX_SUBTITLE_DURATION if threshold is None else threshold
+    if effective <= 0 or block_end - block_start <= effective:
         return None
 
-    target_time = block_start + min(MAX_SUBTITLE_DURATION, (block_end - block_start) / 2)
+    target_time = block_start + min(effective, (block_end - block_start) / 2)
     scored: list[tuple[float, int]] = []
     for split_index in range(1, len(words)):
         timing = _split_candidate_timing(words, split_index, block_start, block_end)
@@ -346,7 +349,7 @@ def _hard_word_split_candidate(
             continue
         left_end, _right_start, left_duration, right_duration = timing
         score = abs(left_end - target_time)
-        if left_duration > MAX_SUBTITLE_DURATION:
+        if left_duration > effective:
             score += 1000 + left_duration
         if right_duration < SUBTITLE_MIN_DURATION:
             score += 500 + right_duration
@@ -469,6 +472,10 @@ def _soft_split_subtitle_block(block: dict, *, depth: int = 0) -> list[dict]:
         )
     if candidate is None and exceeds_hard_limit:
         candidate = _hard_word_split_candidate(words, block_start, block_end)
+    if candidate is None and exceeds_soft_limit and block.get("gender") is None:
+        candidate = _hard_word_split_candidate(
+            words, block_start, block_end, threshold=SUBTITLE_SOFT_MAX_S
+        )
     if candidate is None:
         return [block]
 

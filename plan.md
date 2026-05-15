@@ -63,6 +63,11 @@
 | B5 ✅  | VAD 微短段预合并（`_merge_short_vad_chunks`，`merged_from` 元数据）                         | 241 passed              |
 | B6 ✅  | 字幕软切分点（`soft_split_long_segments`，6s 阈值，标点/助词词边界）                               | 241 passed              |
 | B7 ✅  | Repair Pass 长度错配强制候选（ratio [0.25, 4.0]，reason `length_mismatch`）                | 237 passed              |
+| T-AC ✅ | VAD chunk packing + 词时间戳后置 F0 gender split；default-on                          | 253 passed              |
+| T-AD ✅ | T-AC 切默认 + ASR overflow initial_prompt 双层截断                                     | 256 passed              |
+| T-AE ✅ | None 段 gender carry-over（_apply_gender_carry_over）                               | 262 passed              |
+| T-AA ✅ | ASR 质量信号（avg_logprob/no_speech_prob/compression_ratio）+ temperature fallback     | 277 passed              |
+| T-AB ✅ | WhisperSeg 默认阈值 0.35 + SpeechSegment.score + neg_offset env + adaptive VAD        | 299 passed              |
 
 <details>
 <summary>T-S 到 T-Z 详细记录</summary>
@@ -247,16 +252,55 @@
 - 用原始 gender 快照找左右锚点，不让刚 carry 的值成为后续锚点（避免顺序依赖）
 - 只改 segment.gender，不改 word.gender（word gender 是 split 的依据，不应填假值）
 
-**Step 序列（codex 每步完成打印 `[Step AE-X] DONE.` 然后 stop）**：
-- **AE-1**：实现 `_apply_gender_carry_over()` + env gate；在 `detect_gender_f0_word_level()` 末尾调用；新增 `tests/test_gender_carryover.py`（≥5 case：双侧 F 继承、双侧不一致保留 None、超 max_gap 保留 None、超 max_segment_s 保留 None、disabled 不生效）；全量回归 ≥256 passed
-
-**关键文件**：`src/audio/f0_gender.py`、`src/core/config.py`（新增 env 常量）、`.env.example`
+- **AE-1** ✅：`_apply_gender_carry_over()` 实现于 `src/audio/f0_gender.py`；env gate 三项；新增 `tests/test_gender_carryover.py` 6 tests；全量 262 passed；commit `0c8957c`
 
 ---
 
-### Backlog（待后续）
+---
 
-- soft_split 扩展 None 长段：`_soft_split_subtitle_block` 中 gender=None 且 >6s 落 hard_word_split
+### T-AA ✅：ASR 质量信号 + 温度回退
+
+**已完成**（277 passed）：
+- AA-1+2 ✅：`_generate_with_overflow_retry()` helper；result dict 含 `avg_logprob/no_speech_prob/compression_ratio`；commit 1176403
+- AA-3 ✅：`check_logprob_quality()` in qc.py（动态阈值，warn-log only）；接入 `evaluate_asr_chunk_qc()`；7 tests；commit d7b6a38
+- AA-4 ✅：`_apply_temperature_fallback()` closure in `_transcribe_asr_chunks_text_only`；`ASR_TEMPERATURE_FALLBACK=0` 默认关；`WhisperModelBackend.transcribe_texts(temperature=)` 支持；commit d7b6a38
+
+---
+
+### SORA-575 基准测试 ✅（T-AA 完成后）
+
+运行于 2026-05-15，commit 6500fc8。报告：`agents/temp/sora575-baseline-report.md`
+
+| 指标 | 值 |
+|------|-----|
+| 总耗时 | 491.5s（8.2 min） |
+| ASR chunks | 493 |
+| 最终字幕段数 | 365（对齐后 329 → F0 切分 +36） |
+| F/M/None | 117 / 124 / 124（34% None） |
+| Mixed 段 | 13 |
+
+T-AB 目标：降低 None 占比（当前 34%）、维持 mixed 段 ≤13。
+
+---
+
+### T-AB ✅：自适应 VAD 阈值
+
+**已完成**（299 passed）：
+- AB-1 ✅：默认阈值 0.25→0.35；commit 1102a6d
+- AB-2 ✅：`SpeechSegment.score`（avg_prob）；`audio_stats={mean_prob, speech_ratio}`；commit 1102a6d
+- AB-3 ✅：`WHISPERSEG_NEG_THRESHOLD_OFFSET=0.15` env；`threshold_override` 全链路真传；日志含 mean_score/speech_ratio/neg_offset；commit ed9c60c
+- AB-4 ✅：`ASR_VAD_ADAPTIVE=0` 默认关；`speech_ratio>0.85` +0.10 / `<0.05` -0.05 重跑分段；`parameters.adaptive` 记录决策轨迹；commit ed9c60c
+
+---
+
+### T-AF ✅：soft_split 扩展 None 长段
+
+`_hard_word_split_candidate` 增加 `threshold` 参数；`_soft_split_subtitle_block` 在 gender=None 且超过软上限（6s）时强制调用 hard_word_split；3 tests（None>6s→split, F>6s→不切, None<6s→不切）；302 passed。
+
+---
+
+### Backlog（低优先级）
+
 - Windows 生产环境 default-on 验证
 
 <details>
