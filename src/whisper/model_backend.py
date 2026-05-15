@@ -3,6 +3,7 @@ import logging
 import os
 import re
 import traceback
+import zlib
 from pathlib import Path
 from typing import Any, Callable
 
@@ -76,6 +77,11 @@ _ASR_INITIAL_PROMPT_MAX_TOKENS = max(
     0,
     _env_int("ASR_INITIAL_PROMPT_MAX_TOKENS", 180),
 )
+_QUALITY_SIGNAL_FIELDS = (
+    "avg_logprob",
+    "no_speech_prob",
+    "compression_ratio",
+)
 
 
 def _cap_initial_prompt_ids(prompt_ids):
@@ -98,6 +104,132 @@ def _is_prompt_overflow_error(exc: RuntimeError) -> bool:
     return "decoder_input_ids" in message and (
         "exceeds" in message or "max_length" in message
     )
+
+
+def _generation_sequences(output: Any) -> Any:
+    return getattr(output, "sequences", output)
+
+
+def _generate_with_overflow_retry(
+    model: Any,
+    processor: Any,
+    input_features: Any,
+    generate_kwargs: dict[str, Any],
+    temperature: float = 0.0,
+) -> tuple[Any, bool, str | None]:
+    del processor
+    kwargs = dict(generate_kwargs)
+    kwargs["return_dict_in_generate"] = True
+    kwargs["output_scores"] = True
+    if temperature > 0:
+        do_sample = True
+        kwargs["temperature"] = float(temperature)
+    else:
+        do_sample = False
+        kwargs.pop("temperature", None)
+
+    try:
+        output = model.generate(input_features, do_sample=do_sample, **kwargs)
+        return output, "prompt_ids" in kwargs, None
+    except RuntimeError as generate_exc:
+        if "prompt_ids" not in kwargs or not _is_prompt_overflow_error(generate_exc):
+            raise
+
+    logger.warning("[ASR] prompt overflow, retrying without prompt_ids")
+    kwargs_no_prompt = {
+        key: value for key, value in kwargs.items() if key != "prompt_ids"
+    }
+    output = model.generate(input_features, do_sample=do_sample, **kwargs_no_prompt)
+    return output, False, "prompt_overflow_retry_without_prompt_ids"
+
+
+def _no_speech_token_id(model: Any, processor: Any) -> int | None:
+    tokenizer = getattr(processor, "tokenizer", None)
+    convert = getattr(tokenizer, "convert_tokens_to_ids", None)
+    if callable(convert):
+        try:
+            token_id = convert("<|nospeech|>")
+            if isinstance(token_id, int) and token_id >= 0:
+                return token_id
+        except Exception:
+            pass
+
+    generation_config = getattr(model, "generation_config", None)
+    token_id = getattr(generation_config, "no_speech_token_id", None)
+    if isinstance(token_id, int) and token_id >= 0:
+        return token_id
+    return None
+
+
+def _extract_generation_quality_signals(
+    model: Any,
+    processor: Any,
+    output: Any,
+    raw_text: str,
+) -> dict[str, float | None]:
+    scores = getattr(output, "scores", None)
+    try:
+        has_scores = scores is not None and len(scores) > 0
+    except TypeError:
+        has_scores = scores is not None
+    if not has_scores:
+        return {field: None for field in _QUALITY_SIGNAL_FIELDS}
+
+    return {
+        "avg_logprob": _extract_avg_logprob(model, output),
+        "no_speech_prob": _extract_no_speech_prob(model, processor, scores),
+        "compression_ratio": _compression_ratio(raw_text),
+    }
+
+
+def _extract_avg_logprob(model: Any, output: Any) -> float | None:
+    try:
+        import torch
+
+        transition_scores = model.compute_transition_scores(
+            _generation_sequences(output),
+            output.scores,
+            beam_indices=getattr(output, "beam_indices", None),
+            normalize_logits=True,
+        )
+        finite = transition_scores[torch.isfinite(transition_scores)]
+        if finite.numel() == 0:
+            return None
+        return float(finite.mean().item())
+    except Exception:
+        return None
+
+
+def _extract_no_speech_prob(model: Any, processor: Any, scores: Any) -> float | None:
+    try:
+        import torch
+
+        token_id = _no_speech_token_id(model, processor)
+        if token_id is None:
+            return None
+        first_step = scores[0]
+        if token_id >= int(first_step.shape[-1]):
+            return None
+        probs = torch.softmax(first_step, dim=-1)
+        return float(probs[0, token_id].item())
+    except Exception:
+        return None
+
+
+def _compression_ratio(raw_text: str) -> float | None:
+    try:
+        raw_bytes = str(raw_text or "").encode("utf-8", "ignore")
+        compressed_len = len(zlib.compress(raw_bytes))
+        return float(compressed_len / max(len(raw_bytes), 1))
+    except Exception:
+        return None
+
+
+def _copy_quality_signals(source: dict[str, Any], target: dict[str, Any]) -> dict[str, Any]:
+    for field in _QUALITY_SIGNAL_FIELDS:
+        if field in source:
+            target[field] = source.get(field)
+    return target
 
 
 def _normalize_generation_config_for_deterministic_asr(model: Any) -> None:
@@ -288,36 +420,28 @@ class WhisperModelBackend:
                             prompt_warning = (
                                 f"{self.backend_label} initial_prompt skipped: {prompt_exc}"
                             )
-                    try:
-                        predicted_ids = self._model.generate(
-                            input_features,
-                            do_sample=False,
-                            **generate_kwargs,
-                        )
-                    except RuntimeError as generate_exc:
-                        if "prompt_ids" not in generate_kwargs or not _is_prompt_overflow_error(
-                            generate_exc
-                        ):
-                            raise
-                        logger.warning("[ASR] prompt overflow, retrying without prompt_ids")
+                    output, _used_prompt_ids, retry_reason = _generate_with_overflow_retry(
+                        self._model,
+                        self._processor,
+                        input_features,
+                        generate_kwargs,
+                    )
+                    if retry_reason == "prompt_overflow_retry_without_prompt_ids":
                         prompt_warning = (
                             f"{self.backend_label} prompt overflow, retried without initial_prompt"
                         )
-                        kwargs_no_prompt = {
-                            key: value
-                            for key, value in generate_kwargs.items()
-                            if key != "prompt_ids"
-                        }
-                        predicted_ids = self._model.generate(
-                            input_features,
-                            do_sample=False,
-                            **kwargs_no_prompt,
-                        )
+                    predicted_ids = _generation_sequences(output)
                     text = self._processor.batch_decode(
                         predicted_ids,
                         skip_special_tokens=True,
                     )[0]
                     text = self.post_clean_fn(text)
+                    quality_signals = _extract_generation_quality_signals(
+                        self._model,
+                        self._processor,
+                        output,
+                        text,
+                    )
 
                 master_text = _clean_master_text(text)
 
@@ -328,6 +452,7 @@ class WhisperModelBackend:
                         "duration": duration,
                         "language": "Japanese",
                         "normalized_path": normalized_path,
+                        **quality_signals,
                         "log": [
                             f"{self.backend_label} ASR 输出模式: text_only",
                             *(
@@ -350,6 +475,9 @@ class WhisperModelBackend:
                         "duration": duration,
                         "language": "Japanese",
                         "normalized_path": normalized_path,
+                        "avg_logprob": None,
+                        "no_speech_prob": None,
+                        "compression_ratio": None,
                         "log": [f"{self.backend_label} 转录异常: {e}"],
                     }
                 )
@@ -406,14 +534,17 @@ class WhisperModelBackend:
                         results_forced.append(None)
                     else:
                         results_forced.append(
-                            {
+                            _copy_quality_signals(
+                                res,
+                                {
                                 "words": word_dicts,
                                 "text": master_text,
                                 "raw_text": raw_text,
                                 "alignment_mode": "forced_aligner",
                                 "duration": duration,
                                 "language": language,
-                            }
+                                },
+                            )
                         )
                 except Exception:
                     forced_fail_count += 1
@@ -442,14 +573,17 @@ class WhisperModelBackend:
             if not master_text:
                 final_results.append(
                     (
-                        {
+                        _copy_quality_signals(
+                            res,
+                            {
                             "words": [],
                             "text": "",
                             "raw_text": raw_text,
                             "alignment_mode": "empty",
                             "duration": duration,
                             "language": language,
-                        },
+                            },
+                        ),
                         log,
                     )
                 )
@@ -477,14 +611,17 @@ class WhisperModelBackend:
 
                 final_results.append(
                     (
-                        {
+                        _copy_quality_signals(
+                            res,
+                            {
                             "words": normalized,
                             "text": master_text,
                             "raw_text": raw_text,
                             "alignment_mode": alignment_mode,
                             "duration": duration,
                             "language": language,
-                        },
+                            },
+                        ),
                         log,
                     )
                 )
