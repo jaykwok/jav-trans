@@ -75,7 +75,7 @@ class WhisperSegSpeechSegmenter:
         model_path: str | None = None,
     ) -> None:
         self.threshold = float(
-            threshold if threshold is not None else _env_float("WHISPERSEG_THRESHOLD", "0.25")
+            threshold if threshold is not None else _env_float("WHISPERSEG_THRESHOLD", "0.35")
         )
         self.min_speech_duration_ms = int(
             min_speech_duration_ms
@@ -386,7 +386,13 @@ class WhisperSegSpeechSegmenter:
             start_sec = seg["start"] * frame_ms / 1000.0
             end_sec = min(seg["end"] * frame_ms / 1000.0, audio_duration_sec)
             if end_sec > start_sec:
-                results.append(SpeechSegment(start=start_sec, end=end_sec))
+                results.append(
+                    SpeechSegment(
+                        start=start_sec,
+                        end=end_sec,
+                        score=float(seg["avg_prob"]) if "avg_prob" in seg else None,
+                    )
+                )
         return results
 
     def segment(
@@ -424,12 +430,21 @@ class WhisperSegSpeechSegmenter:
             chunk_threshold_s=self.chunk_threshold_s,
         )
 
+        scores = [s.score for s in segments if s.score is not None]
+        speech_dur = sum(s.end - s.start for s in segments)
+        audio_stats = {
+            "mean_prob": float(sum(scores) / len(scores)) if scores else None,
+            "speech_ratio": float(speech_dur / duration_sec) if duration_sec > 0 else 0.0,
+        }
+        params = self._get_parameters()
+        params["audio_stats"] = audio_stats
+
         return SegmentationResult(
             segments=segments,
             groups=groups,
             method=self.name,
             audio_duration_sec=duration_sec,
-            parameters=self._get_parameters(),
+            parameters=params,
             processing_time_sec=time.time() - start_time,
         )
 

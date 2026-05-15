@@ -35,7 +35,7 @@ class WhisperSegVadBackend:
         from vad.whisperseg.whisperseg_core import WhisperSegSpeechSegmenter
 
         self._segmenter = WhisperSegSpeechSegmenter(
-            threshold=float(os.getenv("WHISPERSEG_THRESHOLD", "0.25")),
+            threshold=float(os.getenv("WHISPERSEG_THRESHOLD", "0.35")),
             min_speech_duration_ms=int(os.getenv("WHISPERSEG_MIN_SPEECH_MS", "80")),
             min_silence_duration_ms=int(os.getenv("WHISPERSEG_MIN_SILENCE_MS", "80")),
             speech_pad_ms=int(os.getenv("WHISPERSEG_PAD_MS", "400")),
@@ -49,7 +49,7 @@ class WhisperSegVadBackend:
         return {
             "backend": self.name,
             "revision": _REVISION,
-            "threshold": float(os.getenv("WHISPERSEG_THRESHOLD", "0.25")),
+            "threshold": float(os.getenv("WHISPERSEG_THRESHOLD", "0.35")),
             "min_speech_ms": int(os.getenv("WHISPERSEG_MIN_SPEECH_MS", "80")),
             "min_silence_ms": int(os.getenv("WHISPERSEG_MIN_SILENCE_MS", "80")),
             "pad_ms": int(os.getenv("WHISPERSEG_PAD_MS", "400")),
@@ -74,7 +74,10 @@ class WhisperSegVadBackend:
         elapsed = time.monotonic() - t0
 
         groups = [
-            [SpeechSegment(start=segment.start, end=segment.end) for segment in group]
+            [
+                SpeechSegment(start=segment.start, end=segment.end, score=segment.score)
+                for segment in group
+            ]
             for group in raw.groups
         ]
         segments = [segment for group in groups for segment in group]
@@ -95,12 +98,15 @@ class WhisperSegVadBackend:
             mean_dur,
         )
 
+        params = self.signature()
+        params["audio_stats"] = raw.parameters.get("audio_stats")
+
         return SegmentationResult(
             segments=segments,
             groups=groups,
             method=self.name,
             audio_duration_sec=raw.audio_duration_sec,
-            parameters=self.signature(),
+            parameters=params,
             processing_time_sec=elapsed,
         )
 

@@ -10,6 +10,7 @@ class SpeechSegment:
 
     start: float
     end: float
+    score: float | None = None
 
 
 @dataclass
