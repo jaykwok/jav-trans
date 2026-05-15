@@ -35,6 +35,7 @@ from whisper.timestamp_fallback import build_word_timestamps_fallback
 _GRAY_MAX_DURATION_S = float(os.getenv("ASR_GRAY_MAX_DURATION", "2.5"))
 _SEGMENT_CUT_MIN_SILENCE_S = float(os.getenv("SEGMENT_CUT_MIN_SILENCE", "0.5"))
 _ASR_SLIDING_CONTEXT_SEGS = max(0, int(os.getenv("ASR_SLIDING_CONTEXT_SEGS", "2")))
+_ASR_INITIAL_PROMPT_MAX_CHARS = int(os.getenv("ASR_INITIAL_PROMPT_MAX_CHARS", "240"))
 _ALIGNMENT_STEP_DOWN_CHUNK_S = float(os.getenv("ALIGNMENT_STEP_DOWN_CHUNK", "6.0"))
 _ALIGNMENT_COARSE_REFINE_CHUNK_S = float(os.getenv("ALIGNMENT_COARSE_REFINE_CHUNK", "18.0"))
 _ALIGNMENT_MAX_REFINE_DEPTH = max(0, int(os.getenv("ALIGNMENT_MAX_REFINE_DEPTH", "2")))
@@ -936,6 +937,22 @@ def _sliding_context_result_text(text_result: dict) -> str:
     return text
 
 
+def _truncate_initial_prompt(prompt: str) -> str:
+    if _ASR_INITIAL_PROMPT_MAX_CHARS <= 0:
+        return ""
+    if len(prompt) <= _ASR_INITIAL_PROMPT_MAX_CHARS:
+        return prompt
+
+    cut_pos = len(prompt) - _ASR_INITIAL_PROMPT_MAX_CHARS
+    truncated = prompt[cut_pos:]
+    # only advance to next word boundary when we cut mid-word
+    if cut_pos > 0 and not prompt[cut_pos - 1].isspace():
+        first_space = truncated.find(" ")
+        if first_space > 0 and first_space + 1 < len(truncated):
+            truncated = truncated[first_space + 1 :]
+    return truncated
+
+
 def _build_initial_prompt_for_chunk(
     chunk: dict,
     chunks: list[dict],
@@ -970,7 +987,7 @@ def _build_initial_prompt_for_chunk(
 
     if not prompt_parts:
         return None
-    return "\n".join(reversed(prompt_parts))
+    return _truncate_initial_prompt("\n".join(reversed(prompt_parts)))
 
 
 def _should_skip_alignment_retry(text: str) -> bool:

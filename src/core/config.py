@@ -120,7 +120,7 @@ DEFAULT_SETTINGS: dict[str, str] = {
     # 1 packs nearby VAD speech segments into longer Whisper-friendly ASR chunks.
     "ASR_CHUNK_PACKING_ENABLED": "0",
     # on enables the long-chunk profile by forcing chunk packing and post-alignment F0.
-    "ASR_LONG_CHUNK_PROFILE": "off",
+    "ASR_LONG_CHUNK_PROFILE": "on",
     # Maximum packed ASR chunk duration in seconds.
     "ASR_CHUNK_PACK_MAX_S": "28.0",
     # Maximum silence gap between VAD segments that can share one packed chunk.

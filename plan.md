@@ -1,6 +1,6 @@
 # JAVTrans 工程计划
 
-> **For agentic workers:** 执行前重新读取本文件、`.env` 和涉及源文件。Python 统一使用 `.venv/Scripts/python`，pip 统一使用 `.venv/Scripts/pip`。项目运行临时/cache 文件放 `./temp/`；需要归档删除时移动到 `agents/rm/`。普通回复不要使用 cc-connect relay；session 输出会自动回灌。
+> **For agentic workers:** 执行前重新读取本文件、`.env` 和涉及源文件。Python 统一使用 `.venv/bin/python`，pip 统一使用 `.venv/bin/pip`。项目运行临时/cache 文件放 `./temp/`；需要归档删除时移动到 `agents/rm/`。
 
 **工作目录：** 项目根目录
 
@@ -23,7 +23,7 @@
 - 字幕约束：`MAX_SUBTITLE_DURATION=8.0`，`ASR_MERGE_HARD_MAX_DURATION=9.0`，相邻短块合并受标点、speaker guard 和 gender guard 限制。
 - 默认 ASR recovery：`ASR_RECOVERY_ENABLED=0`。异常 ASR 文本块排查时才手动打开；男女混句边界由 F0 后 gender turn 重切段处理。
 - 断点续传：ASR checkpoint、`aligned_segments.json`、translation cache、translation artifact snapshot。
-- 主入口：`.venv/Scripts/python run_web.py`。后端调试入口是测试、诊断脚本，或直接调用 `run_asr_alignment_f0()` / `run_translation_and_write()`。
+- 主入口：`.venv/bin/python run_web.py`。后端调试入口是测试、诊断脚本，或直接调用 `run_asr_alignment_f0()` / `run_translation_and_write()`。
 - Web 任务参数通过 `JobSpec -> JobContext` 显式传入后端，不再依赖全局 `.env` 热覆盖 ASR、字幕、输出目录、batch/worker、临时文件保留等任务级配置。
 - `.env` 只保留跨任务持久配置：`API_KEY`、`OPENAI_COMPATIBILITY_BASE_URL`、`LLM_MODEL_NAME`、`LLM_API_FORMAT`、`LLM_REASONING_EFFORT`、`TARGET_LANG`、`HF_ENDPOINT`、`TRANSLATION_GLOSSARY`、`ASR_CONTEXT`。
 
@@ -31,7 +31,7 @@
 
 ## 2. 当前行为约定
 
-- 普通使用入口是 `.venv/Scripts/python run_web.py`；旧 `src/main.py --input ...` CLI 已移除。
+- 普通使用入口是 `.venv/bin/python run_web.py`；旧 `src/main.py --input ...` CLI 已移除。
 - 需要观察后端长跑进度或收集用户反馈日志时，通过 Web 高级项启用 `RUN_LOG_ENABLED=1`；默认写入 `temp/log/`。
 - `HF_HOME` 默认 `./models`；首次运行把 HuggingFace repo 下载到 `models/<namespace>-<repo>/`。
 - `HF_HUB_CACHE`、`HF_XET_CACHE`、`TORCH_HOME` 默认在 `./temp/` 下；ASR recovery 输出默认在 `temp/recovery`。
@@ -47,33 +47,35 @@
 
 ## 3. 已完成任务摘要
 
-| Task | 内容 | 结果 |
-|------|------|------|
-| T-S ✅ | 后端稳定性收口（JobSpec 边界、删除锁顺序、run logger 泄漏、cache 损坏容忍） | 58 passed |
-| T-U ✅ | 后端大文件拆分：`src/main.py` helper 迁入 `src/pipeline/`（8 个子模块） | 宽回归 93 passed |
-| T-V ✅ | 前端 `app.js` 拆分为 14 个 ES Module；修复日志刷新导致粘贴菜单被关闭的 bug | 语法全通，手动验证 |
-| T-W ✅ | 翻译 reasoning effort 收口为 `medium` / `xhigh` 两档；Responses 不做兼容降级映射 | 36 passed |
-| T-X ✅ | 翻译 fixed-prefix 批处理、并发诊断、术语/人名规则、局部 repair pass | 229 passed |
-| T-Y ✅ | Web 演员名持久化、提交自动保存设置、移除手动保存按钮 | 定向 10 passed + JS check |
-| T-Z ✅ | 翻译前 ASR 噪声过滤扩展到纯特殊符号段 | 定向 56 passed |
-| B1 ✅ | 拆分 `src/whisper/pipeline.py` → `backends/registry.py` + `checkpoint.py` + 3 新模块 | 241 passed |
-| B2 ✅ | 拆分 `src/llm/translator.py` → `cache.py` + `prompt.py` | 241 passed |
-| B3 ✅ | 压缩 `src/main.py`（-228 行）→ `stage_log.py` + `output_writer.py` | 241 passed |
-| B4 ✅ | ASR 滑动上下文注入（`initial_prompts`，gender/gap 重置） | 241 passed |
-| B5 ✅ | VAD 微短段预合并（`_merge_short_vad_chunks`，`merged_from` 元数据） | 241 passed |
-| B6 ✅ | 字幕软切分点（`soft_split_long_segments`，6s 阈值，标点/助词词边界） | 241 passed |
-| B7 ✅ | Repair Pass 长度错配强制候选（ratio [0.25, 4.0]，reason `length_mismatch`） | 237 passed |
+| Task  | 内容                                                                              | 结果                      |
+| ----- | ------------------------------------------------------------------------------- | ----------------------- |
+| T-S ✅ | 后端稳定性收口（JobSpec 边界、删除锁顺序、run logger 泄漏、cache 损坏容忍）                              | 58 passed               |
+| T-U ✅ | 后端大文件拆分：`src/main.py` helper 迁入 `src/pipeline/`（8 个子模块）                         | 宽回归 93 passed           |
+| T-V ✅ | 前端 `app.js` 拆分为 14 个 ES Module；修复日志刷新导致粘贴菜单被关闭的 bug                             | 语法全通，手动验证               |
+| T-W ✅ | 翻译 reasoning effort 收口为 `medium` / `xhigh` 两档；Responses 不做兼容降级映射                | 36 passed               |
+| T-X ✅ | 翻译 fixed-prefix 批处理、并发诊断、术语/人名规则、局部 repair pass                                 | 229 passed              |
+| T-Y ✅ | Web 演员名持久化、提交自动保存设置、移除手动保存按钮                                                    | 定向 10 passed + JS check |
+| T-Z ✅ | 翻译前 ASR 噪声过滤扩展到纯特殊符号段                                                           | 定向 56 passed            |
+| B1 ✅  | 拆分 `src/whisper/pipeline.py` → `backends/registry.py` + `checkpoint.py` + 3 新模块 | 241 passed              |
+| B2 ✅  | 拆分 `src/llm/translator.py` → `cache.py` + `prompt.py`                           | 241 passed              |
+| B3 ✅  | 压缩 `src/main.py`（-228 行）→ `stage_log.py` + `output_writer.py`                   | 241 passed              |
+| B4 ✅  | ASR 滑动上下文注入（`initial_prompts`，gender/gap 重置）                                    | 241 passed              |
+| B5 ✅  | VAD 微短段预合并（`_merge_short_vad_chunks`，`merged_from` 元数据）                         | 241 passed              |
+| B6 ✅  | 字幕软切分点（`soft_split_long_segments`，6s 阈值，标点/助词词边界）                               | 241 passed              |
+| B7 ✅  | Repair Pass 长度错配强制候选（ratio [0.25, 4.0]，reason `length_mismatch`）                | 237 passed              |
 
 <details>
 <summary>T-S 到 T-Z 详细记录</summary>
 
 **T-S 完成内容：**
+
 - `JobSpec` 增加输入边界，`/api/config` 避免 `video_paths` 必填校验污染默认配置读取。
 - finished job 删除流程改为锁内更新状态、锁外递归删除 temp。
 - `run_translation_and_write()` 三路径统一关闭 run logger 并清理 `events._thread_local.run_logger`。
 - translation cache JSON/JSONL 损坏时打印 warning 但不中断任务。
 
 **T-U 完成内容（`src/pipeline/` 子模块）：**
+
 - `audio.py`：filter chain、视频 hash、audio cache key、`extract_audio()`、时长 probe。
 - `cleanup.py`：translation cache 清理、ASR checkpoint 清理、job temp 清理。
 - `gender_split.py`：F0 None 过滤、gender turn 重切段、ASR noise 过滤。
@@ -84,6 +86,7 @@
 - `quality.py`：quality report、术语表解析、quality segment 转换。
 
 当前后端大文件排行（供 B1–B3 参考）：
+
 - `src/llm/translator.py`：2270 行。
 - `src/whisper/pipeline.py`：2259 行。
 - `src/main.py`：1487 行。
@@ -91,11 +94,13 @@
 - `src/web/pipeline_manager.py`：531 行。
 
 **T-V 完成内容（折叠）：**
+
 - `src/web/static/app.js` 拆为 `src/web/static/js/` 下 14 个 ES Module，入口改为 `<script type="module" src="js/main.js">`。
 - 旧 `app.js` 归档到 `agents/rm/app.js.bak`。
 - 修复日志刷新滚动事件导致右键粘贴菜单关闭的问题。
 
 **T-W 完成内容：**
+
 - `src/llm/translator.py`：默认 `LLM_REASONING_EFFORT=xhigh`；Chat 和 Responses 均只归一化到 `medium` / `xhigh`。
 - `src/llm/patch.py`：Micu+Grok Responses 特例不再把 `xhigh` 映射成 `high`，直接发送 `{"effort":"xhigh"}`。
 - `src/core/job_context.py`、`src/web/pipeline_manager.py`、`src/web/routes/config.py`、`src/web/models.py`：Web 任务和 settings API 只接受/快照 `medium` / `xhigh`。
@@ -104,15 +109,17 @@
 - 验证：`py_compile`、`node --check src/web/static/js/settings.js`、定向 pytest 36 passed。
 
 **T-X 完成内容：**
+
 - `src/llm/translator.py`：批量翻译改为 full JSON stable prefix + `requested_ids`；本地按 batch 区间计算需要翻译的全局 id，模型只返回指定 id。`TRANSLATION_PREFIX_WARMUP=1` 默认预热前缀，`TRANSLATION_FULL_JSON_PREFIX_MAX_CHARS` 控制 full-prefix 上限，超限回退 summary。
 - 翻译并发诊断写入 progress JSONL：`batch_start`、`batch_first_token`、`batch_finish`，附带 `started_ts`、`first_token_ts`、`finished_ts`、worker thread、requested ids、request count、missing ids、cache hit/miss token。
 - 翻译风格规则收口：男性器官统一“肉棒”，女性器官统一“小穴”，去掉“菊花”固定译法；人名按日语读音罗马音化，ASR 同音纠错只在明显同一称呼时进行，禁止把不同汉字姓氏或不同读音强行合并。
 - 翻译后 repair pass 默认开启：只修复代码侧选中的高风险 id；候选覆盖女性器官术语漂移、明显 ASR 同音/上下文漂移、半句断裂。repair prompt 只暴露抽象 reason（如 `asr_homophone_or_context_drift`），不在静态 prompt 中堆片内错例。
 - `PROMPT_VERSION=v2.5`，确保 fixed-prefix、repair、人名策略调整后不复用旧缓存。
 - NAMH-055 验证：repair 修复“小穴/阴道/芒果/香肠/半句断裂”等问题，术语残留清零。
-- NMSL-036 验证：576 条，fixed-prefix 并发 3 batch；人名从过度合并 `高松` 修正为保守罗马音化；repair 修复 #85/#446/#515/#576 等 ASR 同音导致的上下文漂移。最终验证：`.venv/Scripts/python -m pytest` 229 passed。
+- NMSL-036 验证：576 条，fixed-prefix 并发 3 batch；人名从过度合并 `高松` 修正为保守罗马音化；repair 修复 #85/#446/#515/#576 等 ASR 同音导致的上下文漂移。最终验证：`.venv/bin/python -m pytest` 229 passed。
 
 **T-Y 完成内容：**
+
 - `src/web/models.py`、`src/web/routes/config.py`：`SettingsRead/SettingsUpdate` 支持 `asr_context`，`/api/settings` 读写 `ASR_CONTEXT` 并同步运行时环境和 `.env`。
 - `src/web/pipeline_manager.py`：创建任务时如果 spec 未显式提供演员名，则从持久 `ASR_CONTEXT` 快照到任务 spec，保证队列中的任务不受后续修改污染。
 - `src/web/static/js/settings.js`：加载 settings 时回填 `r-asr-context`；提交任务前自动保存演员名、HF 镜像、翻译设置和 API 连接配置。
@@ -121,6 +128,7 @@
 - 验证：`tests/web/test_jobs_api.py` 10 passed；`node --check src/web/static/js/settings.js` / `files.js` / `formMemory.js` 通过。
 
 **T-Z 完成内容：**
+
 - `src/pipeline/gender_split.py`：翻译前 ASR 噪声过滤新增纯特殊符号判断。去空白后若整段没有 Unicode 字母或数字，则视为无语言信息噪声，过滤 `◆◆◆`、`♪♪♪`、`！？！？` 等 ASR 特殊符号段。
 - 过滤规则保持保守：`えっ！？`、`もう1回`、`ラブ` 等含日文/字母/数字的语义段保留，不交给 LLM 判断。
 - SORA-575 `whisper-ja-1.5b` 离线验证：应用新规则后，`aligned_segments.json` 中 947 段会在翻译前删除 2 条 `◆◆◆`。
@@ -130,7 +138,113 @@
 
 ## 4. 当前待办 / Backlog
 
-> **Backlog 已清空。** B1–B7 全部完成，全量回归 241 passed。
+### T-AC：VAD chunk packing + 词时间戳后置 F0
+
+**背景**：多人对话（含男女）被合并成一条长字幕，根因已定位：
+
+1. `src/pipeline/gender_split.py:split_segment_on_f0_gender_turns` L107-123 **None 处理漏洞**——词 gender None 时 active_gender 不重置，短词大量 None → 整段几乎不切
+2. VAD 切 1–3s 小段违背 Whisper 30s 训练分布，造成幻觉
+3. 我们的 forced aligner `Qwen3-ForcedAligner-0.6B` 上限 **300s**，不是瓶颈；Whisper 自身 30s 才是上限
+
+**目标**：WhisperX 风格 chunk packing（语音段 pack ≤28s 喂模型）+ F0/gender split 基于词级时间戳后置。
+
+**新增 env（全部默认关闭，PoC 阶段）**：
+
+- `ASR_CHUNK_PACKING_ENABLED=0`、`ASR_CHUNK_PACK_MAX_S=28.0`、`ASR_CHUNK_PACK_GAP_MERGE_S=1.5`、`ASR_CHUNK_PACK_PADDING_S=2.0`
+- `F0_GENDER_POST_ALIGNMENT=0`、`F0_GENDER_NONE_TOLERANCE=2`、`SUBTITLE_MIN_DURATION_GENDER_TURN=0.4`
+- `ASR_LONG_CHUNK_PROFILE=off`（统一开关，`on` 时翻转 enabled 类）
+
+**Step 序列（codex 每步完成打印 `[Step AC-X] DONE.` 然后 stop）**：
+
+- **AC-1** ✅：新增 `src/audio/chunk_packer.py`，`PackedChunk` dataclass + `pack_vad_segments()` 贪心算法；`tests/test_chunk_packer.py` 7 passed
+- **AC-2** ✅：`src/whisper/pipeline.py` VAD refine 后接入 packing（env gate）；`tests/test_pipeline_chunk_packing.py`；全量 250 passed
+- **AC-3** ✅：`local_backend.py` forced align 日志 `[align] chunk_dur=.. word_count=..`；`ALIGN_LONG_CHUNK_BATCH_SIZE=1`；全量 252 passed
+- **AC-4** ✅：`src/main.py` F0 post-alignment gate 日志；修复 `gender_split.py` L107-123 None 漏洞（pending_nones 缓冲 + tolerance）；`tests/test_gender_split_none_handling.py` 5 case；全量 258 passed
+- **AC-5** ✅（NMSL-036 PoC 完成）：WSL2 上对 NMSL-036 完成 baseline vs PoC 双跑；顺带发现并修复预存 bug `_run_pyin ParameterError` → commit `6cacbdd7`；结论见下方 PoC 报告。
+- **AC-6** ✅（HAME-052 PoC 完成，建议切默认）：WSL2 上对 HAME-052（真实男女密集对话，76 分钟）完成 baseline vs PoC 双跑；结论见下方报告。
+
+**关键文件**：新增 `src/audio/chunk_packer.py`；改 `src/whisper/pipeline.py`、`src/whisper/local_backend.py`、`src/main.py`、`src/pipeline/gender_split.py`、`src/core/config.py`、`src/audio/f0_gender.py`、`.env.example`；新增 3 个测试文件
+
+**验收基线**：全量回归 253 passed, 5 skipped；env 关闭 bit-exact ✅
+
+---
+
+#### T-AC PoC 报告（NMSL-036，anime-whisper，WSL2 RTX 4060 Ti）
+
+| 指标 | Baseline (off) | PoC (on) | 变化 |
+|------|---------------|----------|------|
+| ASR 处理块数 | 756 | 429 | **-43%** |
+| 输出 segment 数 | 272 | 266 | -2% |
+| avg segment dur | 2.46s | 4.63s | +88% |
+| max segment dur | 5.98s | 12.32s | +106% |
+| M segs（F0修复后）| 70（25.7%）| 50（18.8%）| -29% |
+| F segs（F0修复后）| 109（40.1%）| 98（36.8%）| -10% |
+| None segs（F0修复后）| 93（34.2%）| 118（44.4%）| +27% |
+| 段内 M+F 混合数 | 4 | 7 | **+75%** |
+| gender split 数 | +13 | **+22** | **+69%** |
+| ASR 溢出错误数 | 218 | 148 | -32% |
+| 总耗时 | 630s | 407s | **-35%** |
+
+**附加修复**：发现 `src/audio/f0_gender.py:_run_pyin` 预存 bug（`librosa.ParameterError` 被外层 `except Exception` 静默吞掉，导致 F0 全 None）；修复为 fallback 到 librosa 默认参数；commit `6cacbdd7`。
+
+**正向**：chunk packing 减少 ASR 块数 43%、加速 35%；F0 后置模式使段内 gender split +69%（13→22）、混合段 +75%（4→7）。
+
+**待观察**：None 段比例上升（34%→44%）；较长的 packed segment 有时把男女合并导致整体 M 标签减少；max_dur 12.32s 超 8s 软切分阈值（实际 pipeline 会由 soft_split 处理）；ASR 上下文溢出错误（148/429）需后续处理。
+
+**决策：暂缓切默认。** 结果积极但不决定性：gender split 改善，但 None 比例上升，且混合段反而增加（+75%）；HAME-052 PoC 见下节。
+
+---
+
+#### T-AC PoC 报告（HAME-052，anime-whisper，WSL2 RTX 4060 Ti）
+
+| 指标 | Baseline (off) | PoC (on) | 变化 |
+|------|---------------|----------|------|
+| 总耗时 | 262s | 280s | +7% |
+| 输出 segment 数 | 126 | 157 | **+25%** |
+| avg segment dur | 1.97s | 3.27s | +67% |
+| max segment dur | 5.44s | 16.18s | +197% |
+| F segs | 89（70.6%）| 93（59.2%）| +4 abs |
+| M segs | 10（7.9%）| 11（7.0%）| +1 abs |
+| None segs | 27（21.4%）| 53（33.8%）| **+26 abs / +96%** |
+| 段内 M+F 混合数 | 5 | 2 | **-60%** |
+| gender split 数 | 16 | 27 | **+69%** |
+
+**正向**：gender split +69%（16→27）；混合段 **-60%**（5→2）——与 NMSL-036 混合段上升相反，HAME-052 真实男女对话场景下 chunk packing 有效减少了混合段。
+
+**待观察**：None 段比例上升（21%→34%），主要来自呻吟/过渡片段（F0 本身无法可靠分类）；max_dur 16.18s 超 8s 阈值，soft_split 会处理；耗时轻微上升 +7%（无 ASR 块数缩减效果，因 HAME-052 baseline VAD 分布不同）。
+
+**综合两轮 PoC 决策：建议切默认前先处理 None 段比例上升问题，或直接切默认并观察实际产出字幕质量。** HAME-052 混合段改善信号明确；Windows GPU 生产环境下尚未验证仍是主要风险。
+
+---
+
+> **原 Backlog 已清空。** B1–B7 全部完成，全量回归 241 passed。
+
+---
+
+### T-AD：T-AC 切默认 + ASR 上下文溢出修复
+
+**背景**：T-AC HAME-052 PoC 结果明确（gender split +69%、混合段 -60%），切默认。同步修 ASR overflow bug：`_build_initial_prompt_for_chunk` 无 token 上限，导致 ~34% 的 chunk 触发 `decoder_input_ids exceeds max_target_positions` 后静默返回 `text=""`。
+
+**Step 序列（codex 每步完成打印 `[Step AD-X] DONE.` 然后 stop）**：
+
+- **AD-1**：切默认：`src/core/config.py:123` `ASR_LONG_CHUNK_PROFILE` off→on；`.env.example` 同步；受影响测试加 monkeypatch fix；全量回归 ≥253 passed
+- **AD-2**：ASR initial_prompt 双层截断：
+  - `src/whisper/transcribe.py` `_build_initial_prompt_for_chunk()` 末尾追加字符级截断（保留末尾 240 chars），`ASR_INITIAL_PROMPT_MAX_CHARS=240` env
+  - `src/whisper/model_backend.py` `WhisperModelBackend` 在 `get_prompt_ids()` 后精确截 token（保留末尾 ≤ `ASR_INITIAL_PROMPT_MAX_TOKENS=180`，env 常量）；`model.generate()` 捕获 `RuntimeError` 且消息同时含 `decoder_input_ids` 和 `exceeds`/`max_length` 时重试一次去掉 `prompt_ids`，截断/重试都要 warn log
+  - 新增 `tests/test_initial_prompt_truncation.py`（长 prompt 截到末尾；overflow retry 成功）；全量 ≥253 passed + 新增测试
+- **AD-3**：回归 + commit：验证 `load_config()` 后 `ASR_CHUNK_PACKING_ENABLED=1 F0_GENDER_POST_ALIGNMENT=1`；一次 commit 全部
+
+**关键文件**：`src/core/config.py`、`.env.example`、`src/whisper/transcribe.py`、`src/whisper/model_backend.py`；可能调整测试文件
+
+**验收基线**：全量回归 ≥253 passed（含 AD-2 新增测试）；default-on 可启动 web；overflow 不再静默吞掉 chunk
+
+---
+
+### T-AE Backlog（待后续）
+
+- None 段 speaker carry-over：纯 None 段前后段同性别 → 继承 gender
+- soft_split 扩展 None 长段：`_soft_split_subtitle_block` 中 gender=None 且 >6s 落 hard_word_split
+- Windows 生产环境 default-on 验证
 
 <details>
 <summary>B1–B7 已完成记录</summary>
@@ -199,12 +313,12 @@
 
 四后端 skip-translation 对比：
 
-| 后端 | 状态 | ASR 转写 | Wall time | 字幕数 |
-|------|------|----------|-----------|--------|
-| `anime-whisper` | ok | 48.52s | 336.88s | 150 |
-| `qwen3-asr-1.7b` | ok | 251.71s | 578.15s | 164 |
-| `whisper-ja-1.5b` | ok | 170.74s | 464.33s | 165 |
-| `whisper-ja-anime-v0.3` | ok | 41.89s | 229.46s | 151 |
+| 后端                      | 状态  | ASR 转写  | Wall time | 字幕数 |
+| ----------------------- | --- | ------- | --------- | --- |
+| `anime-whisper`         | ok  | 48.52s  | 336.88s   | 150 |
+| `qwen3-asr-1.7b`        | ok  | 251.71s | 578.15s   | 164 |
+| `whisper-ja-1.5b`       | ok  | 170.74s | 464.33s   | 165 |
+| `whisper-ja-anime-v0.3` | ok  | 41.89s  | 229.46s   | 151 |
 
 默认全量翻译（anime-whisper + bilingual）：`pipeline_total=575.30s`，字幕块数 150，产物 `video/HAME-052.srt`。
 

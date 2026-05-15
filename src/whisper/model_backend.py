@@ -1,4 +1,5 @@
 import gc
+import logging
 import os
 import re
 import traceback
@@ -11,6 +12,7 @@ from utils.model_paths import WHISPER_MODEL_PATH, resolve_model_spec
 
 
 hf_progress.install()
+logger = logging.getLogger(__name__)
 
 
 WHISPER_PRESETS: dict[str, dict[str, Any]] = {
@@ -68,6 +70,34 @@ def _env_float(name: str, default: float) -> float:
         return float(os.getenv(name, "").strip() or default)
     except (TypeError, ValueError):
         return default
+
+
+_ASR_INITIAL_PROMPT_MAX_TOKENS = max(
+    0,
+    _env_int("ASR_INITIAL_PROMPT_MAX_TOKENS", 180),
+)
+
+
+def _cap_initial_prompt_ids(prompt_ids):
+    original_count = int(prompt_ids.numel())
+    if _ASR_INITIAL_PROMPT_MAX_TOKENS <= 0 or original_count <= _ASR_INITIAL_PROMPT_MAX_TOKENS:
+        return prompt_ids, original_count, original_count
+
+    capped = prompt_ids[..., -_ASR_INITIAL_PROMPT_MAX_TOKENS:]
+    kept_count = int(capped.numel())
+    logger.warning(
+        "[ASR] initial_prompt token cap: original=%d, kept=%d",
+        original_count,
+        kept_count,
+    )
+    return capped, original_count, kept_count
+
+
+def _is_prompt_overflow_error(exc: RuntimeError) -> bool:
+    message = str(exc)
+    return "decoder_input_ids" in message and (
+        "exceeds" in message or "max_length" in message
+    )
 
 
 def _normalize_generation_config_for_deterministic_asr(model: Any) -> None:
@@ -245,17 +275,44 @@ class WhisperModelBackend:
                                 initial_prompt,
                                 return_tensors="pt",
                             ).to("cuda")
+                            prompt_ids, original_count, prompt_token_count = (
+                                _cap_initial_prompt_ids(prompt_ids)
+                            )
                             generate_kwargs["prompt_ids"] = prompt_ids
-                            prompt_token_count = int(prompt_ids.numel())
+                            if original_count != prompt_token_count:
+                                prompt_warning = (
+                                    f"{self.backend_label} initial_prompt token cap: "
+                                    f"original={original_count}, kept={prompt_token_count}"
+                                )
                         except Exception as prompt_exc:
                             prompt_warning = (
                                 f"{self.backend_label} initial_prompt skipped: {prompt_exc}"
                             )
-                    predicted_ids = self._model.generate(
-                        input_features,
-                        do_sample=False,
-                        **generate_kwargs,
-                    )
+                    try:
+                        predicted_ids = self._model.generate(
+                            input_features,
+                            do_sample=False,
+                            **generate_kwargs,
+                        )
+                    except RuntimeError as generate_exc:
+                        if "prompt_ids" not in generate_kwargs or not _is_prompt_overflow_error(
+                            generate_exc
+                        ):
+                            raise
+                        logger.warning("[ASR] prompt overflow, retrying without prompt_ids")
+                        prompt_warning = (
+                            f"{self.backend_label} prompt overflow, retried without initial_prompt"
+                        )
+                        kwargs_no_prompt = {
+                            key: value
+                            for key, value in generate_kwargs.items()
+                            if key != "prompt_ids"
+                        }
+                        predicted_ids = self._model.generate(
+                            input_features,
+                            do_sample=False,
+                            **kwargs_no_prompt,
+                        )
                     text = self._processor.batch_decode(
                         predicted_ids,
                         skip_special_tokens=True,
