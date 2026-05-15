@@ -73,6 +73,7 @@ class WhisperSegSpeechSegmenter:
         force_cpu: bool | None = None,
         num_threads: int = 1,
         model_path: str | None = None,
+        neg_threshold_offset: float | None = None,
     ) -> None:
         self.threshold = float(
             threshold if threshold is not None else _env_float("WHISPERSEG_THRESHOLD", "0.35")
@@ -92,6 +93,11 @@ class WhisperSegSpeechSegmenter:
         )
         self.force_cpu = bool(
             force_cpu if force_cpu is not None else _env_bool("WHISPERSEG_FORCE_CPU", "0")
+        )
+        self.neg_threshold_offset = float(
+            neg_threshold_offset
+            if neg_threshold_offset is not None
+            else _env_float("WHISPERSEG_NEG_THRESHOLD_OFFSET", "0.15")
         )
         self.num_threads = int(num_threads)
         self.model_path = model_path
@@ -302,7 +308,7 @@ class WhisperSegSpeechSegmenter:
 
         frame_ms = float(self._frame_duration_ms)
         threshold = float(self.threshold)
-        neg_threshold = max(threshold - 0.15, 0.01)
+        neg_threshold = max(threshold - float(self.neg_threshold_offset), 0.01)
 
         min_speech_frames = max(1, int(self.min_speech_duration_ms / frame_ms))
         min_silence_frames = max(1, int(self.min_silence_duration_ms / frame_ms))
@@ -431,9 +437,9 @@ class WhisperSegSpeechSegmenter:
         )
 
         scores = [s.score for s in segments if s.score is not None]
-        speech_dur = sum(s.end - s.start for s in segments)
+        speech_dur = sum(max(0.0, s.end - s.start) for s in segments)
         audio_stats = {
-            "mean_prob": float(sum(scores) / len(scores)) if scores else None,
+            "mean_prob": float(sum(scores) / len(scores)) if scores else 0.0,
             "speech_ratio": float(speech_dur / duration_sec) if duration_sec > 0 else 0.0,
         }
         params = self._get_parameters()
@@ -486,6 +492,7 @@ class WhisperSegSpeechSegmenter:
             "max_speech_duration_s": self.max_speech_duration_s,
             "chunk_threshold_s": self.chunk_threshold_s,
             "max_group_duration_s": self.max_group_duration_s,
+            "neg_offset": self.neg_threshold_offset,
             "force_cpu": self.force_cpu,
             "num_threads": self.num_threads,
             "device": self._actual_device,
@@ -504,4 +511,3 @@ class WhisperSegSpeechSegmenter:
 
     def __repr__(self) -> str:
         return f"WhisperSegSpeechSegmenter(threshold={self.threshold}, device={self._actual_device})"
-

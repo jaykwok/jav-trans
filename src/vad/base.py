@@ -35,7 +35,12 @@ class VadBackend(Protocol):
 
     name: str
 
-    def segment(self, audio_path: str, *, target_sr: int = 16000) -> SegmentationResult: ...
+    def segment(
+        self,
+        audio_path: str,
+        *,
+        target_sr: int = 16000,
+        threshold_override: float | None = None,
+    ) -> SegmentationResult: ...
 
     def signature(self) -> dict: ...
-
