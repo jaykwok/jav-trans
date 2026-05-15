@@ -244,6 +244,8 @@ def _build_processing_spans(
         _chunking_module._LAST_VAD_SIGNATURE = _LAST_VAD_SIGNATURE
         _sync_checkpoint_state()
         segments = result.segments
+        if not segments:
+            return [(0.0, result.audio_duration_sec)]
         if _ASR_CHUNK_DROP_ENABLED:
             segments = _drop_short_low_energy_spans(audio_path, segments)
         packed = pack_vad_segments(
@@ -252,7 +254,7 @@ def _build_processing_spans(
             gap_merge_s=_ASR_CHUNK_PACK_GAP_MERGE_S,
             padding_s=_ASR_CHUNK_PACK_PADDING_S,
         )
-        return packed or [(0.0, result.audio_duration_sec)]
+        return packed
 
     spans = _chunking_module._build_processing_spans(audio_path)
     _LAST_VAD_SIGNATURE = _chunking_module._LAST_VAD_SIGNATURE

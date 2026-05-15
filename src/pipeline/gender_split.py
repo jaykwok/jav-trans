@@ -195,6 +195,7 @@ def split_segment_on_f0_gender_turns(segment: dict) -> list[dict]:
                 current_words.extend(pending_nones)
                 current_words.append(word)
                 pending_nones = []
+                active_gender = gender
                 continue
             else:
                 current_words.extend(pending_nones)
