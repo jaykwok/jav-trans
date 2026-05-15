@@ -39,6 +39,13 @@ ALIGNER_BATCH_SIZE = max(
     1,
     int(os.getenv("ALIGNER_BATCH_SIZE", str(ASR_BATCH_SIZE))),
 )
+ALIGN_LONG_CHUNK_BATCH_SIZE = max(
+    1,
+    int(os.getenv("ALIGN_LONG_CHUNK_BATCH_SIZE", "1")),
+)
+ASR_CHUNK_PACKING_ENABLED = os.getenv(
+    "ASR_CHUNK_PACKING_ENABLED", "0"
+).strip().lower() in {"1", "true", "yes", "on"}
 ASR_NATIVE_MIN_SPAN_MS = float(os.getenv("ASR_NATIVE_MIN_SPAN_MS", "80"))
 ASR_NATIVE_MAX_ZERO_RATIO = float(os.getenv("ASR_NATIVE_MAX_ZERO_RATIO", "0.55"))
 ASR_NATIVE_MAX_REPEAT_RATIO = float(os.getenv("ASR_NATIVE_MAX_REPEAT_RATIO", "0.65"))
@@ -84,6 +91,13 @@ def _get_wav_duration(audio_path: str) -> float:
         frames = wav_file.getnframes()
         rate = wav_file.getframerate()
     return frames / rate if rate else 0.0
+
+
+def _get_wav_duration_or_zero(audio_path: str) -> float:
+    try:
+        return _get_wav_duration(audio_path)
+    except Exception:
+        return 0.0
 
 
 def _notify(on_stage: Callable[[str], None] | None, message: str) -> None:
@@ -314,6 +328,27 @@ def normalize_word_dicts(words: list[dict]) -> list[dict]:
         normalized.append({"start": start, "end": end, "word": token})
     normalized.sort(key=lambda item: (item["start"], item["end"]))
     return normalized
+
+
+def _log_forced_alignment_stats(
+    word_dicts: list[dict],
+    *,
+    chunk_dur: float = 0.0,
+) -> None:
+    if not word_dicts:
+        return
+
+    durations_ms = [
+        max(0.0, float(word["end"]) - float(word["start"])) * 1000.0
+        for word in word_dicts
+    ]
+    word_count = len(word_dicts)
+    avg_word_dur = sum(durations_ms) / word_count
+    min_dur = min(durations_ms)
+    print(
+        f"[align] chunk_dur={chunk_dur:.1f}s word_count={word_count} "
+        f"avg_word_dur={avg_word_dur:.0f}ms min_dur={min_dur:.0f}ms"
+    )
 
 
 def looks_like_word_timing_failure(
@@ -561,6 +596,10 @@ class LocalAsrBackend:
                     cleaned,
                     word_dicts,
                 )
+            _log_forced_alignment_stats(
+                word_dicts,
+                chunk_dur=_get_wav_duration_or_zero(normalized_path),
+            )
             return word_dicts, alignment_mode
         finally:
             _clear_cuda_cache(self.device)
@@ -575,9 +614,14 @@ class LocalAsrBackend:
 
         forced_aligner = self._ensure_forced_aligner(on_stage=on_stage)
         results: list[list[dict]] = []
+        batch_size = (
+            ALIGN_LONG_CHUNK_BATCH_SIZE
+            if ASR_CHUNK_PACKING_ENABLED
+            else self.align_batch_size
+        )
 
-        for batch_start in range(0, len(items), self.align_batch_size):
-            batch_items = items[batch_start : batch_start + self.align_batch_size]
+        for batch_start in range(0, len(items), batch_size):
+            batch_items = items[batch_start : batch_start + batch_size]
             _notify(on_stage, "Alignment 强制对齐中...")
             align_results = None
             try:
@@ -628,6 +672,10 @@ class LocalAsrBackend:
                             restored_words,
                         )
                     batch_outputs[local_idx] = normalize_word_dicts(restored_words)
+                    _log_forced_alignment_stats(
+                        batch_outputs[local_idx] or [],
+                        chunk_dur=_get_wav_duration_or_zero(_normalized_path),
+                    )
                 if len(align_result_items) < len(aligner_jobs):
                     for local_idx, *_rest in aligner_jobs[len(align_result_items) :]:
                         batch_outputs[local_idx] = []

@@ -81,6 +81,8 @@ DEFAULT_SETTINGS: dict[str, str] = {
     "ASR_BATCH_SIZE": "1",
     # Forced-alignment batch size.
     "ALIGNER_BATCH_SIZE": "4",
+    # Forced-alignment batch size used when ASR chunk packing is enabled.
+    "ALIGN_LONG_CHUNK_BATCH_SIZE": "1",
     # Max generated tokens per ASR chunk.
     "ASR_MAX_NEW_TOKENS": "128",
     # Subprocess transcription token cap; usually matches ASR_MAX_NEW_TOKENS.
@@ -115,6 +117,16 @@ DEFAULT_SETTINGS: dict[str, str] = {
     "SEGMENT_MIN_SPEECH": "0.25",
     # Padding, in seconds, added around each ASR chunk.
     "SEGMENT_PAD": "0.15",
+    # 1 packs nearby VAD speech segments into longer Whisper-friendly ASR chunks.
+    "ASR_CHUNK_PACKING_ENABLED": "0",
+    # on enables the long-chunk profile by forcing chunk packing and post-alignment F0.
+    "ASR_LONG_CHUNK_PROFILE": "off",
+    # Maximum packed ASR chunk duration in seconds.
+    "ASR_CHUNK_PACK_MAX_S": "28.0",
+    # Maximum silence gap between VAD segments that can share one packed chunk.
+    "ASR_CHUNK_PACK_GAP_MERGE_S": "1.5",
+    # Padding, in seconds, added around packed VAD chunks.
+    "ASR_CHUNK_PACK_PADDING_S": "2.0",
     # ffmpeg silence threshold for fallback chunking.
     "SEGMENT_SILENCE_DB": "-32dB",
 
@@ -263,6 +275,12 @@ DEFAULT_SETTINGS: dict[str, str] = {
     # --- F0 Gender Detection ---
     # 1 enables gender-aware word-level cue splitting; 0 disables gender splitting.
     "MULTI_CUE_SPLIT_ENABLED": "1",
+    # 1 documents/enables F0 processing after forced alignment word timestamps.
+    "F0_GENDER_POST_ALIGNMENT": "0",
+    # Consecutive unknown-gender words needed to form a separate None group.
+    "F0_GENDER_NONE_TOLERANCE": "2",
+    # Minimum duration for gender-turn split pieces.
+    "SUBTITLE_MIN_DURATION_GENDER_TURN": "0.4",
     # 1 preserves word timestamps in final output artifacts.
     "KEEP_WORD_TIMESTAMPS": "0",
     # Median F0 threshold; below is treated as male, above/equal as female.
@@ -324,6 +342,12 @@ def _load_private_env(path: Path, protected_keys: set[str]) -> None:
         os.environ[key] = "" if value is None else value
 
 
+def _apply_profiles() -> None:
+    if os.environ.get("ASR_LONG_CHUNK_PROFILE", "off").strip().lower() == "on":
+        os.environ["ASR_CHUNK_PACKING_ENABLED"] = "1"
+        os.environ["F0_GENDER_POST_ALIGNMENT"] = "1"
+
+
 def load_config(*, override_existing_env: bool = False) -> None:
     """Load shared defaults, then private local overrides.
 
@@ -335,3 +359,4 @@ def load_config(*, override_existing_env: bool = False) -> None:
     protected_keys = set() if override_existing_env else set(os.environ)
     _apply_values(DEFAULT_SETTINGS, protected_keys)
     _load_private_env(PRIVATE_ENV_PATH, protected_keys)
+    _apply_profiles()
