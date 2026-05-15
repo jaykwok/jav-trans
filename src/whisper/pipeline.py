@@ -1,9 +1,11 @@
 import importlib
+import os
 import time
 import warnings
 from pathlib import Path
 from typing import Callable
 
+from audio.chunk_packer import PackedChunk, pack_vad_segments
 from whisper import checkpoint as _checkpoint_module
 from whisper import chunking as _chunking_module
 from whisper import recovery as _recovery_module
@@ -33,6 +35,15 @@ _KEEP_ASR_CHUNKS = _chunking_module._KEEP_ASR_CHUNKS
 _LAST_VAD_SIGNATURE: dict = _chunking_module._LAST_VAD_SIGNATURE
 _ASR_SLIDING_CONTEXT_SEGS = _transcribe_module._ASR_SLIDING_CONTEXT_SEGS
 _ASR_CHECKPOINT_ENABLED = _transcribe_module._ASR_CHECKPOINT_ENABLED
+
+_ASR_CHUNK_PACKING_ENABLED = os.getenv(
+    "ASR_CHUNK_PACKING_ENABLED", "0"
+).strip().lower() in {"1", "true", "yes", "on"}
+_ASR_CHUNK_PACK_MAX_S = float(os.getenv("ASR_CHUNK_PACK_MAX_S", "28.0"))
+_ASR_CHUNK_PACK_GAP_MERGE_S = float(
+    os.getenv("ASR_CHUNK_PACK_GAP_MERGE_S", "1.5")
+)
+_ASR_CHUNK_PACK_PADDING_S = float(os.getenv("ASR_CHUNK_PACK_PADDING_S", "2.0"))
 
 get_backend_label = _registry_module.get_backend_label
 _create_whisper_backend = _registry_module._create_whisper_backend
@@ -174,12 +185,67 @@ def aggregate_timeout_fragments(job_id: str) -> Path | None:
     return _checkpoint_module.aggregate_timeout_fragments(job_id)
 
 
-def _build_processing_spans(audio_path: str) -> list[tuple[float, float]]:
+def _build_processing_spans(
+    audio_path: str,
+) -> list[tuple[float, float]] | list[PackedChunk]:
     global _LAST_VAD_SIGNATURE
+    if _ASR_CHUNK_PACKING_ENABLED:
+        from vad import get_vad_backend
+
+        vad = get_vad_backend()
+        result = vad.segment(audio_path)
+        _LAST_VAD_SIGNATURE = {
+            **result.parameters,
+            "chunk_packing": {
+                "enabled": True,
+                "max_s": _ASR_CHUNK_PACK_MAX_S,
+                "gap_merge_s": _ASR_CHUNK_PACK_GAP_MERGE_S,
+                "padding_s": _ASR_CHUNK_PACK_PADDING_S,
+            },
+        }
+        _chunking_module._LAST_VAD_SIGNATURE = _LAST_VAD_SIGNATURE
+        _sync_checkpoint_state()
+        packed = pack_vad_segments(
+            result.segments,
+            max_s=_ASR_CHUNK_PACK_MAX_S,
+            gap_merge_s=_ASR_CHUNK_PACK_GAP_MERGE_S,
+            padding_s=_ASR_CHUNK_PACK_PADDING_S,
+        )
+        return packed or [(0.0, result.audio_duration_sec)]
+
     spans = _chunking_module._build_processing_spans(audio_path)
     _LAST_VAD_SIGNATURE = _chunking_module._LAST_VAD_SIGNATURE
     _sync_checkpoint_state()
     return spans
+
+
+def _span_boundaries(
+    spans: list[tuple[float, float]] | list[PackedChunk],
+) -> list[tuple[float, float]]:
+    return [
+        (span.start, span.end) if isinstance(span, PackedChunk) else span
+        for span in spans
+    ]
+
+
+def _annotate_packed_chunks(
+    chunk_infos: list[dict],
+    spans: list[tuple[float, float]] | list[PackedChunk],
+    log: list[str],
+) -> None:
+    if not _ASR_CHUNK_PACKING_ENABLED:
+        return
+
+    packed_spans = [span for span in spans if isinstance(span, PackedChunk)]
+    for idx, (chunk, packed) in enumerate(zip(chunk_infos, packed_spans)):
+        chunk["vad_seg_count"] = len(packed.vad_segments)
+        log.append(
+            "[chunk] idx={idx} dur={duration:.1f} vad_seg_count={count}".format(
+                idx=idx,
+                duration=packed.duration,
+                count=len(packed.vad_segments),
+            )
+        )
 
 
 def _record_stage_timing(
@@ -213,13 +279,15 @@ def _transcribe_and_align_local(
         split_started = time.perf_counter()
         chunk_spans = _build_processing_spans(audio_path)
         chunk_dir, chunk_infos = _extract_wav_chunks(
-            audio_path, chunk_spans, on_stage=on_stage
+            audio_path, _span_boundaries(chunk_spans), on_stage=on_stage
         )
-        chunk_infos = _merge_short_vad_chunks(
-            chunk_dir,
-            chunk_infos,
-            on_stage=on_stage,
-        )
+        _annotate_packed_chunks(chunk_infos, chunk_spans, log)
+        if not _ASR_CHUNK_PACKING_ENABLED:
+            chunk_infos = _merge_short_vad_chunks(
+                chunk_dir,
+                chunk_infos,
+                on_stage=on_stage,
+            )
         split_elapsed = time.perf_counter() - split_started
         log.append(f"切分完成：共 {len(chunk_infos)} 个处理块")
         _record_stage_timing(log, timings, "split_s", "静音分析与切块", split_elapsed)

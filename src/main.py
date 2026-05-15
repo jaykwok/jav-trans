@@ -725,6 +725,22 @@ def run_asr_alignment_f0(
             console.print("[cyan]F0 gender detection...[/cyan]")
             f0_started = time.perf_counter()
             _log_stage(logger, "stage_start f0_gender_detection")
+            # F0 already runs after ASR forced alignment; this gate documents and
+            # logs that word-level timestamps from alignment are available here.
+            if _ctx_flag(
+                effective_ctx,
+                "F0_GENDER_POST_ALIGNMENT",
+                _env_flag("F0_GENDER_POST_ALIGNMENT"),
+            ):
+                words_available = sum(len(seg.get("words") or []) for seg in segments)
+                _log_stage(
+                    logger,
+                    f"[f0] post_alignment_mode=1 words_available={words_available}",
+                )
+                console.print(
+                    "[cyan][f0] post_alignment_mode=1 "
+                    f"words_available={words_available}[/cyan]"
+                )
             _raise_if_cancelled(cancel_event)
             with _temporary_env(_asr_stage_env_overrides(effective_ctx)):
                 segments = detect_gender_f0_word_level(
