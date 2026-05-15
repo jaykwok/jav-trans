@@ -1,8 +1,11 @@
+import logging
 import os
 import re
 from typing import Callable
 
 
+# check_logprob_quality returns {"verdict": "ok|warn|reject", "reason": str|None, "metrics": dict}.
+# Callers that persist it on text results should use an asr_qc_ prefix.
 _FALSE_VALUES = {"0", "false", "no", "off", "disabled"}
 _TRUE_VALUES = {"1", "true", "yes", "on", "enabled"}
 
@@ -40,12 +43,70 @@ _LONG_LOW_VALUE_DURATION_S = float(
     os.getenv("ASR_QC_LONG_LOW_VALUE_DURATION", "6.0")
 )
 
+_logger = logging.getLogger(__name__)
+
 
 def _env_float(name: str, default: float) -> float:
     try:
         return float(os.getenv(name, str(default)))
     except (TypeError, ValueError):
         return default
+
+
+def _optional_float(value) -> float | None:
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def check_logprob_quality(result: dict) -> dict:
+    """
+    Returns {'verdict': 'ok'/'warn'/'reject', 'reason': str|None, 'metrics': dict}.
+    Skips any check where the signal is None.
+    Reads thresholds dynamically so tests can override via monkeypatch.setenv.
+    """
+    nospeech_threshold = _env_float("ASR_QC_NOSPEECH_THRESHOLD", 0.6)
+    logprob_threshold = _env_float("ASR_QC_LOGPROB_THRESHOLD", -1.0)
+    compression_threshold = _env_float("ASR_QC_COMPRESSION_THRESHOLD", 2.4)
+
+    no_speech_prob = _optional_float(result.get("no_speech_prob"))
+    avg_logprob = _optional_float(result.get("avg_logprob"))
+    compression_ratio = _optional_float(result.get("compression_ratio"))
+
+    reject_reasons: list[str] = []
+    warn_reasons: list[str] = []
+    if no_speech_prob is not None and no_speech_prob > nospeech_threshold:
+        reject_reasons.append("high_no_speech")
+    if compression_ratio is not None and compression_ratio > compression_threshold:
+        reject_reasons.append("high_compression")
+    if avg_logprob is not None and avg_logprob < logprob_threshold:
+        warn_reasons.append("low_logprob")
+
+    if reject_reasons:
+        verdict = "reject"
+        reason = ",".join(reject_reasons + warn_reasons)
+    elif warn_reasons:
+        verdict = "warn"
+        reason = ",".join(warn_reasons)
+    else:
+        verdict = "ok"
+        reason = None
+
+    return {
+        "verdict": verdict,
+        "reason": reason,
+        "metrics": {
+            "avg_logprob": avg_logprob,
+            "compression_ratio": compression_ratio,
+            "no_speech_prob": no_speech_prob,
+            "logprob_threshold": logprob_threshold,
+            "compression_threshold": compression_threshold,
+            "nospeech_threshold": nospeech_threshold,
+        },
+    }
 
 
 def build_asr_manifest(segments: list[dict]) -> dict:
@@ -237,6 +298,18 @@ def evaluate_asr_chunk_qc(
         if severity == "ok":
             severity = "warn"
 
+    signal_qc = check_logprob_quality(text_result)
+    if signal_qc["verdict"] != "ok":
+        reasons.append(str(signal_qc.get("reason") or signal_qc["verdict"]))
+        if severity == "ok":
+            severity = "warn"
+        _logger.warning(
+            "[asr-qc] signal_verdict=%s reason=%s text=%s",
+            signal_qc["verdict"],
+            signal_qc["reason"],
+            _preview(text),
+        )
+
     return {
         "ok": severity == "ok",
         "severity": severity,
@@ -249,8 +322,10 @@ def evaluate_asr_chunk_qc(
             "context_leak": context_leak,
             "mojibake": mojibake,
             "max_repeat": repeat,
+            "signal_quality": signal_qc,
         },
         "text_preview": _preview(text),
+        "signal_qc": signal_qc,
     }
 
 
@@ -351,5 +426,3 @@ def format_qc_log_items(report: dict, limit: int = 8) -> list[str]:
         lines.append(f"ASR QC: {remaining} additional flagged chunks omitted from log")
 
     return lines
-
-
