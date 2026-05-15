@@ -86,6 +86,14 @@ def test_two_nones_below_tol3_do_not_split(monkeypatch):
     assert [word["gender"] for word in split[0]["words"]] == ["M", None, None, "F"]
 
 
+def test_two_nones_below_tol3_continued_f_stays_one_group(monkeypatch):
+    """After absorbing 2 Nones at M→F, subsequent F words stay in the same group."""
+    split = _split_genders_tol3(["M", None, None, "F", "F"], monkeypatch)
+
+    assert len(split) == 1
+    assert [word["gender"] for word in split[0]["words"]] == ["M", None, None, "F", "F"]
+
+
 def test_three_nones_at_tol3_form_none_group(monkeypatch):
     split = _split_genders_tol3(["M", None, None, None, "F"], monkeypatch)
 
