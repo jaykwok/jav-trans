@@ -30,6 +30,8 @@ def _is_oom_error(exc: BaseException, torch_module: Any | None) -> bool:
 
 
 class _MockAsrBackend:
+    supports_temperature = False
+
     def __init__(self, device: str):
         self.device = device
 
@@ -39,7 +41,15 @@ class _MockAsrBackend:
     def unload_model(self) -> None:
         return
 
-    def transcribe_texts(self, audio_paths, contexts=None, on_stage=None):
+    def transcribe_texts(
+        self,
+        audio_paths,
+        contexts=None,
+        initial_prompts=None,
+        on_stage=None,
+        temperature=0.0,
+    ):
+        del initial_prompts, on_stage, temperature
         contexts = contexts or [""] * len(audio_paths)
         return [
             {

@@ -218,6 +218,8 @@ DEFAULT_SETTINGS: dict[str, str] = {
     "TARGET_LANG": "简体中文",
     # Max retry count for transient translation API failures.
     "TRANSLATION_API_RETRIES": "4",
+    # Finite read timeout for streaming translation responses.
+    "TRANSLATION_STREAM_READ_TIMEOUT_S": "120",
     # Initial retry backoff in seconds.
     "TRANSLATION_API_BACKOFF_BASE_S": "1.5",
     # Maximum retry backoff in seconds.

@@ -145,6 +145,35 @@
 
 </details>
 
+---
+
+### T-AK：第二轮全量后端审计整改
+
+**背景**：T-AJ 后 Codex 复审发现 8 个后端问题，核心风险集中在 ASR/对齐缓存签名过宽、任务级字幕参数仍不完整、Web retry/cancel 执行层竞态、Micu/Grok stream read 无限阻塞，以及协议/默认配置漂移。
+
+**目标**：在不改写既有 plan 内容的前提下，追加修复第二轮审计点。修复应优先做结构化配置/签名/接口收口，避免临时猴子补丁；全量 pytest 不降。
+
+| Step | 审计点 | 验收标准 |
+|------|--------|----------|
+| AK-1 | ASR checkpoint key 缺少 ASR context / Qwen 生成 / 语言 / temperature fallback 等文本相关输入 | 改任一关键 ASR 输入会生成不同 checkpoint key；旧 key 不误复用 |
+| AK-2 | `aligned_segments.json` cache 只校验 audio key + backend，可能复用过期 ASR/F0/timeline 结果 | cache 写入并校验结构化 signature；缺失或不匹配时 miss |
+| AK-3 | `.env.example` 与 `DEFAULT_SETTINGS`/profile 默认冲突 | 模板同步当前默认行为，复制后不回退 chunk packing / F0 默认值 |
+| AK-4 | 字幕策略仍有 import-time 全局参数未纳入 `SubtitleOptions` | timeline/reading/gap/merge 等字幕参数通过 `SubtitleOptions` per-job 生效 |
+| AK-5 | Web ASR worker 获取 cancel_event 后 executor 未显式传入，retry 边界弱 | executor 调用携带同一个 event；旧 worker 不使用新 retry event |
+| AK-6 | Web 默认 ASR backend 与全局默认存在认知漂移 | 后端配置/API 明确区分 engine default 与 Web recommended default，避免隐藏漂移 |
+| AK-7 | 翻译取消无法打断 Micu/Grok patch 无限 read | stream read timeout 可配置且有限；取消/backoff 仍可中断 |
+| AK-8 | `BaseAsrBackend` Protocol 落后于实际接口 | Protocol 声明 `initial_prompts` / `temperature`，测试覆盖接口契约 |
+
+**T-AK 完成内容：**
+
+- AK-1/AK-2：ASR checkpoint 改为结构化 runtime signature，覆盖 ASR context/head context、语言、模型路径、Qwen/Whisper 生成参数、worker/timestamp/VAD；`aligned_segments.json` 写入并校验 `cache_signature`，旧 cache 或签名不匹配会 miss。
+- AK-3：`.env.example` 同步当前 long-chunk profile 默认，避免复制后回退 chunk packing / post-alignment F0 / carry-over 调优值，并新增 `TRANSLATION_STREAM_READ_TIMEOUT_S`。
+- AK-4：`SubtitleOptions` 补齐 timeline、reading、gap、merge、权重等任务级参数；writer 行为改为使用 options，避免 import-time 全局值污染 per-job 字幕策略。
+- AK-5/AK-6：Web ASR executor 显式传入已捕获 cancel_event；resume cache 使用同一套 aligned cache expectation；`/api/config` 明确返回 `engine_defaults.asr_backend` 与 `recommended_asr_backend`。
+- AK-7/AK-8：Micu/Grok Responses stream read timeout 改为有限可配置；`BaseAsrBackend` Protocol 补齐 `initial_prompts` / `temperature` / `supports_temperature`，Qwen backend 明确不支持温度 fallback。
+- 验证：定向回归 56 passed；宽后端回归 48 passed；`agents/temp/t-ak-full-pytest.run.log` 全量 `343 passed, 5 skipped`。
+
+
 ## 4. 当前待办 / Backlog
 
 <details>

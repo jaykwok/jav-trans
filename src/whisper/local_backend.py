@@ -492,6 +492,7 @@ class WorkerError(RuntimeError):
 class LocalAsrBackend:
     is_subprocess = False
     accepts_contexts = True
+    supports_temperature = False
 
     def __init__(self, device: str):
         self.device = device if device.startswith("cuda") else "cpu"
@@ -789,12 +790,19 @@ class LocalAsrBackend:
         self,
         audio_paths: list[str],
         contexts: list[str] | None = None,
+        initial_prompts: list[str | None] | None = None,
         on_stage: Callable[[str], None] | None = None,
+        temperature: float = 0.0,
     ) -> list[dict]:
+        del temperature
         if self.model is None:
             self.load(on_stage=on_stage)
         if not audio_paths:
             return []
+        if initial_prompts is not None and len(initial_prompts) != len(audio_paths):
+            raise ValueError(
+                f"initial_prompt count mismatch: audio_paths={len(audio_paths)}, initial_prompts={len(initial_prompts)}"
+            )
 
         normalized_paths = [str(Path(audio_path).resolve()) for audio_path in audio_paths]
         language_hint = ASR_LANGUAGE if ASR_FORCE_LANGUAGE else None
@@ -1101,6 +1109,7 @@ class SubprocessAsrBackend:
 
     is_subprocess = True
     accepts_contexts = True
+    supports_temperature = False
 
     def __init__(self, device: str):
         self.device = device if device.startswith("cuda") else "cpu"
@@ -1277,10 +1286,17 @@ class SubprocessAsrBackend:
         self,
         audio_paths: list[str],
         contexts: list[str] | None = None,
+        initial_prompts: list[str | None] | None = None,
         on_stage: Callable[[str], None] | None = None,
+        temperature: float = 0.0,
     ) -> list[dict]:
+        del temperature
         if not audio_paths:
             return []
+        if initial_prompts is not None and len(initial_prompts) != len(audio_paths):
+            raise ValueError(
+                f"initial_prompt count mismatch: audio_paths={len(audio_paths)}, initial_prompts={len(initial_prompts)}"
+            )
 
         self._ensure_worker(on_stage=on_stage)
         assert self._conn is not None

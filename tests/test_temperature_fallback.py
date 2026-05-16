@@ -51,3 +51,25 @@ def test_model_backend_transcribe_texts_accepts_temperature():
     sig = inspect.signature(WhisperModelBackend.transcribe_texts)
     assert "temperature" in sig.parameters
     assert sig.parameters["temperature"].default == 0.0
+
+
+def test_base_asr_backend_protocol_declares_prompt_and_temperature():
+    import inspect
+    from whisper.backends.base import BaseAsrBackend
+
+    sig = inspect.signature(BaseAsrBackend.transcribe_texts)
+
+    assert "supports_temperature" in BaseAsrBackend.__annotations__
+    assert "initial_prompts" in sig.parameters
+    assert "temperature" in sig.parameters
+    assert sig.parameters["initial_prompts"].default is None
+    assert sig.parameters["temperature"].default == 0.0
+
+
+def test_temperature_support_is_explicit_on_backends():
+    from whisper.local_backend import LocalAsrBackend, SubprocessAsrBackend
+    from whisper.model_backend import WhisperModelBackend
+
+    assert WhisperModelBackend.supports_temperature is True
+    assert LocalAsrBackend.supports_temperature is False
+    assert SubprocessAsrBackend.supports_temperature is False

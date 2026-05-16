@@ -47,6 +47,7 @@ def test_sliding_initial_prompts_reset_on_gap_and_gender(monkeypatch, tmp_path):
 
     class FakeBackend:
         is_subprocess = False
+        supports_temperature = False
         request_batch_size = 1
         prompts: list[str | None] = []
         texts = ["固有名詞A", "続きB", "続きC", "リセットD", "女性E", "男性F"]

@@ -68,6 +68,15 @@ def _responses_endpoint_url(base_url: str) -> str:
     return f"{normalized_base_url}/responses"
 
 
+def _stream_read_timeout_s() -> float:
+    raw = os.getenv("TRANSLATION_STREAM_READ_TIMEOUT_S", "120").strip()
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return 120.0
+    return max(1.0, value)
+
+
 def _parse_sse_json_event(event_type: str, data_lines: list[str]) -> dict | None:
     if not data_lines:
         return None
@@ -151,7 +160,7 @@ def create_micu_grok_response_stream(
                 }
                 timeout = httpx.Timeout(
                     connect=20.0,
-                    read=None,
+                    read=_stream_read_timeout_s(),
                     write=60.0,
                     pool=20.0,
                 )

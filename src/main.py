@@ -143,6 +143,13 @@ def _ctx_flag(ctx: JobContext, name: str, default: bool = False) -> bool:
     return default
 
 
+def _ctx_env_flag(ctx: JobContext, name: str, default: bool = False) -> bool:
+    raw = ctx.advanced.get(name)
+    if raw is None:
+        raw = os.getenv(name, "1" if default else "0")
+    return str(raw).strip().lower() in {"1", "true", "yes", "on"}
+
+
 _ASR_STAGE_ADVANCED_PREFIXES = (
     "WHISPERSEG_",
     "SEGMENT_",
@@ -153,14 +160,35 @@ _ASR_STAGE_ADVANCED_PREFIXES = (
     "ASR_CONTEXT_LEAK_",
     "ASR_FRAGMENT_",
     "ASR_NATIVE_",
+    "ASR_CHUNK_",
     "ALIGNMENT_",
     "F0_",
     "TIMESTAMP_VAD_",
     "TEN_VAD_",
 )
 _ASR_STAGE_ADVANCED_KEYS = {
+    "ALIGN_LONG_CHUNK_BATCH_SIZE",
     "ASR_VAD_BACKEND",
+    "ASR_LANGUAGE",
+    "ASR_FORCE_LANGUAGE",
+    "ASR_MODEL_PATH",
+    "ASR_MODEL_ID",
+    "ASR_DTYPE",
+    "ASR_ATTENTION",
+    "ASR_HEAD_CONTEXT",
+    "ASR_HEAD_CONTEXT_MAX_START_S",
+    "ASR_MAX_NEW_TOKENS",
+    "ASR_REPETITION_PENALTY",
+    "ASR_TEMPERATURE_FALLBACK",
+    "ASR_FALLBACK_TEMPERATURES",
+    "ASR_WORKER_MODE",
+    "ASR_SLIDING_CONTEXT_SEGS",
     "WHISPER_TIMESTAMP_MODE",
+    "WHISPER_MODEL_PATH",
+    "WHISPER_BEAMS",
+    "WHISPER_NO_REPEAT_NGRAM",
+    "WHISPER_MAX_NEW_TOKENS",
+    "WHISPER_FORCED_FAIL_RATIO",
     "TRANSCRIPTION_TIMEOUT_S",
     "TRANSCRIPTION_MAX_NEW_TOKENS",
     "ASR_BATCH_SIZE",
@@ -195,7 +223,18 @@ _SUBTITLE_OPTION_KEYS = {
     "MAX_SUBTITLE_DURATION",
     "SUBTITLE_SOFT_MAX_S",
     "SUBTITLE_SOFT_SPLIT_ENABLED",
+    "MIN_SUBTITLE_DURATION",
+    "SUBTITLE_MIN_DURATION",
+    "SUBTITLE_READING_CPS",
+    "SUBTITLE_READING_BASE",
+    "SUBTITLE_DURATION_RATIO_CAP",
+    "SUBTITLE_DURATION_GRACE",
+    "SUBTITLE_GAP_PADDING",
+    "SUBTITLE_TIMELINE_MODE",
+    "SUBTITLE_BILINGUAL_SECONDARY_WEIGHT",
+    "SUBTITLE_ASCII_CHAR_WEIGHT",
     "SRT_LINE_MAX_CHARS",
+    "SUBTITLE_MERGE_ADJACENT",
     "SUBTITLE_SHOW_SPEAKER",
     "SUBTITLE_SHOW_GENDER",
 }
@@ -214,6 +253,126 @@ def _subtitle_env_overrides(ctx: JobContext) -> dict[str, str]:
 def _subtitle_options_for_ctx(ctx: JobContext):
     with _temporary_env(_subtitle_env_overrides(ctx)):
         return subtitle_module.SubtitleOptions.from_env()
+
+
+def _asr_runtime_signature_for_env() -> dict:
+    try:
+        return dict(asr_module._get_asr_runtime_signature(last_vad_signature={}))
+    except Exception:
+        return {}
+
+
+def _asr_stage_config_signature_for_env() -> dict:
+    names = {
+        name
+        for name in os.environ
+        if _is_asr_stage_advanced_key(name)
+        or name
+        in {
+            "ASR_BACKEND",
+            "ASR_CONTEXT",
+            "ASR_WORKER_MODE",
+            "ASR_CHUNK_PACKING_ENABLED",
+            "ASR_LONG_CHUNK_PROFILE",
+        }
+    }
+    return {name: os.getenv(name, "") for name in sorted(names)}
+
+
+def _f0_signature_for_ctx(ctx: JobContext) -> dict:
+    return {
+        "skip_translation": bool(ctx.skip_translation),
+        "multi_cue_split_enabled": _ctx_flag(ctx, "MULTI_CUE_SPLIT_ENABLED"),
+        "filter_none_segments": _ctx_env_flag(ctx, "F0_FILTER_NONE_SEGMENTS"),
+        "post_alignment": _ctx_flag(
+            ctx,
+            "F0_GENDER_POST_ALIGNMENT",
+            _env_flag("F0_GENDER_POST_ALIGNMENT"),
+        ),
+        "word_window_ms": _ctx_int(ctx, "F0_WORD_WINDOW_MS", 300),
+        "hop_ms": _ctx_int(ctx, "F0_HOP_MS", 100),
+        "median_filter_frames": _ctx_int(ctx, "F0_MEDIAN_FILTER_FRAMES", 9),
+        "word_min_span_ms": _ctx_int(ctx, "F0_WORD_MIN_SPAN_MS", 500),
+        "threshold_hz": _ctx_float(ctx, "F0_THRESHOLD_HZ", 160.0),
+        "nan_ratio_threshold": _ctx_value(
+            ctx,
+            "F0_NAN_RATIO_THRESHOLD",
+            os.getenv("F0_NAN_RATIO_THRESHOLD", "0.6"),
+        ),
+        "none_tolerance": _ctx_int(ctx, "F0_GENDER_NONE_TOLERANCE", 3),
+        "carryover_enabled": _ctx_env_flag(ctx, "F0_GENDER_CARRYOVER_ENABLED", True),
+        "carryover_max_gap_s": _ctx_float(ctx, "F0_GENDER_CARRYOVER_MAX_GAP_S", 15.0),
+        "carryover_max_segment_s": _ctx_float(ctx, "F0_GENDER_CARRYOVER_MAX_SEGMENT_S", 12.0),
+        "gender_turn_min_duration": _ctx_float(
+            ctx,
+            "SUBTITLE_MIN_DURATION_GENDER_TURN",
+            0.4,
+        ),
+    }
+
+
+def _aligned_cache_signature_for_ctx(
+    ctx: JobContext,
+    *,
+    backend_label: str,
+    subtitle_options=None,
+) -> dict:
+    options = subtitle_options or _subtitle_options_for_ctx(ctx)
+    asr_signature = _asr_runtime_signature_for_env()
+    return {
+        "version": 2,
+        "backend_label": backend_label,
+        "asr": asr_signature,
+        "asr_stage_config": _asr_stage_config_signature_for_env(),
+        "f0": _f0_signature_for_ctx(ctx),
+        "subtitle": {"timeline_mode": options.timeline_mode},
+    }
+
+
+def aligned_cache_expectations_for_ctx(
+    ctx: JobContext,
+    *,
+    backend_label: str | None = None,
+) -> tuple[str, dict]:
+    with _temporary_env(_asr_stage_env_overrides(ctx)):
+        resolved_backend_label = backend_label or asr_module.get_backend_label()
+        subtitle_options = _subtitle_options_for_ctx(ctx)
+        signature = _aligned_cache_signature_for_ctx(
+            ctx,
+            backend_label=resolved_backend_label,
+            subtitle_options=subtitle_options,
+        )
+    return resolved_backend_label, signature
+
+
+def _aligned_segments_payload(
+    *,
+    backend_label: str,
+    audio_path: str,
+    audio_cache_key: str,
+    segments: list[dict],
+    asr_details: dict,
+    asr_log: list[str],
+    cache_signature: dict | None,
+    subtitle_options,
+    f0_filtered_count: int | None = None,
+    cache_stage: str = "ready",
+) -> dict:
+    payload = {
+        "backend": backend_label,
+        "audio_path": audio_path,
+        "audio_cache_key": audio_cache_key,
+        "segments": segments,
+        "asr_details": asr_details,
+        "asr_log": asr_log,
+        "timeline_mode": subtitle_options.timeline_mode,
+        "cache_stage": cache_stage,
+    }
+    if cache_signature is not None:
+        payload["cache_signature"] = cache_signature
+    if f0_filtered_count is not None:
+        payload["f0_filtered_count"] = f0_filtered_count
+    return payload
 
 
 def _quality_report_dir_for_ctx(ctx: JobContext) -> Path | None:
@@ -553,6 +712,12 @@ def run_asr_alignment_f0(
         _log_stage(logger, f"job_temp_dir={_project_relative(job_temp_dir)}")
         if cache_job_id != job_id:
             _log_stage(logger, f"resume_from_job_id={cache_job_id}")
+        subtitle_options = _subtitle_options_for_ctx(effective_ctx)
+        aligned_cache_signature = _aligned_cache_signature_for_ctx(
+            effective_ctx,
+            backend_label=backend_label,
+            subtitle_options=subtitle_options,
+        )
         audio_dir = os.path.join(job_temp_dir, "audio")
         os.makedirs(audio_dir, exist_ok=True)
         audio_cache_key = audio_module.get_audio_cache_key(video_path)
@@ -564,6 +729,7 @@ def run_asr_alignment_f0(
             aligned_segments_path,
             audio_cache_key,
             backend_label,
+            aligned_cache_signature,
         )
         segments: list[dict] = []
         asr_log: list[str] = []
@@ -715,15 +881,17 @@ def run_asr_alignment_f0(
             )
             _write_json(
                 aligned_segments_path,
-                {
-                    "backend": backend_label,
-                    "audio_path": audio_path,
-                    "audio_cache_key": audio_cache_key,
-                    "segments": segments,
-                    "asr_details": asr_details,
-                    "asr_log": asr_log,
-                    "timeline_mode": subtitle_module.SUBTITLE_TIMELINE_MODE,
-                },
+                _aligned_segments_payload(
+                    backend_label=backend_label,
+                    audio_path=audio_path,
+                    audio_cache_key=audio_cache_key,
+                    segments=segments,
+                    asr_details=asr_details,
+                    asr_log=asr_log,
+                    cache_signature=None,
+                    subtitle_options=subtitle_options,
+                    cache_stage="asr_alignment",
+                ),
             )
             _log_stage(
                 logger,
@@ -920,6 +1088,7 @@ def run_asr_alignment_f0(
         f0_filtered_count=f0_filtered_count,
         f0_failed=f0_failed,
         job_id=job_id,
+        aligned_cache_signature=aligned_cache_signature,
     )
 
 
@@ -986,6 +1155,13 @@ def _run_translation_and_write_impl(
     translation_cache_path = artifacts.translation_cache_path
     bilingual = artifacts.bilingual
     skip_translation = ctx.skip_translation
+    subtitle_options = _subtitle_options_for_ctx(ctx)
+    aligned_cache_signature = artifacts.aligned_cache_signature
+    if aligned_cache_signature is None:
+        _, aligned_cache_signature = aligned_cache_expectations_for_ctx(
+            ctx,
+            backend_label=backend_label,
+        )
     _raise_if_cancelled(cancel_event)
 
     _write_json(
@@ -1078,7 +1254,6 @@ def _run_translation_and_write_impl(
         write_started = time.perf_counter()
         _log_stage(logger, "stage_start write_output")
         _raise_if_cancelled(cancel_event)
-        subtitle_options = _subtitle_options_for_ctx(ctx)
         if bilingual:
             subtitle_module.write_bilingual_srt([], srt_path, options=subtitle_options)
         else:
@@ -1093,20 +1268,23 @@ def _run_translation_and_write_impl(
         )
         _write_json(
             aligned_segments_path,
-            {
-                "backend": backend_label,
-                "audio_path": audio_path,
-                "audio_cache_key": audio_cache_key,
-                "segments": [],
-                "asr_details": asr_details,
-                "asr_log": asr_log,
-            },
+            _aligned_segments_payload(
+                backend_label=backend_label,
+                audio_path=audio_path,
+                audio_cache_key=audio_cache_key,
+                segments=[],
+                asr_details=asr_details,
+                asr_log=asr_log,
+                cache_signature=aligned_cache_signature,
+                subtitle_options=subtitle_options,
+                f0_filtered_count=f0_filtered_count,
+            ),
         )
         _write_json(
             bilingual_json_path,
             {
                 "blocks": [],
-                "timeline_mode": subtitle_module.SUBTITLE_TIMELINE_MODE,
+                "timeline_mode": subtitle_options.timeline_mode,
             },
         )
         output_paths.extend(
@@ -1179,7 +1357,6 @@ def _run_translation_and_write_impl(
         write_started = time.perf_counter()
         _log_stage(logger, "stage_start write_output")
         _raise_if_cancelled(cancel_event)
-        subtitle_options = _subtitle_options_for_ctx(ctx)
         subtitle_module.write_srt(srt_blocks, srt_path, options=subtitle_options)
         _write_json(
             transcript_path,
@@ -1191,21 +1368,23 @@ def _run_translation_and_write_impl(
         )
         _write_json(
             aligned_segments_path,
-            {
-                "backend": backend_label,
-                "audio_path": audio_path,
-                "audio_cache_key": audio_cache_key,
-                "segments": segments,
-                "asr_details": asr_details,
-                "asr_log": asr_log,
-                "timeline_mode": subtitle_module.SUBTITLE_TIMELINE_MODE,
-            },
+            _aligned_segments_payload(
+                backend_label=backend_label,
+                audio_path=audio_path,
+                audio_cache_key=audio_cache_key,
+                segments=segments,
+                asr_details=asr_details,
+                asr_log=asr_log,
+                cache_signature=aligned_cache_signature,
+                subtitle_options=subtitle_options,
+                f0_filtered_count=f0_filtered_count,
+            ),
         )
         _write_json(
             bilingual_json_path,
             {
                 "backend": backend_label,
-                "timeline_mode": subtitle_module.SUBTITLE_TIMELINE_MODE,
+                "timeline_mode": subtitle_options.timeline_mode,
                 "blocks": srt_blocks,
                 "translation_skipped": True,
                 "translation_request_timings": translation_request_timings,
@@ -1407,7 +1586,6 @@ def _run_translation_and_write_impl(
     write_started = time.perf_counter()
     _log_stage(logger, "stage_start write_output")
     _raise_if_cancelled(cancel_event)
-    subtitle_options = _subtitle_options_for_ctx(ctx)
     if bilingual:
         subtitle_module.write_bilingual_srt(
             srt_blocks,
@@ -1427,22 +1605,23 @@ def _run_translation_and_write_impl(
     )
     _write_json(
         aligned_segments_path,
-        {
-            "backend": backend_label,
-            "audio_path": audio_path,
-            "audio_cache_key": audio_cache_key,
-            "segments": segments,
-            "asr_details": asr_details,
-            "asr_log": asr_log,
-            "timeline_mode": subtitle_module.SUBTITLE_TIMELINE_MODE,
-            "f0_filtered_count": f0_filtered_count,
-        },
+        _aligned_segments_payload(
+            backend_label=backend_label,
+            audio_path=audio_path,
+            audio_cache_key=audio_cache_key,
+            segments=segments,
+            asr_details=asr_details,
+            asr_log=asr_log,
+            cache_signature=aligned_cache_signature,
+            subtitle_options=subtitle_options,
+            f0_filtered_count=f0_filtered_count,
+        ),
     )
     _write_json(
         bilingual_json_path,
         {
             "backend": backend_label,
-            "timeline_mode": subtitle_module.SUBTITLE_TIMELINE_MODE,
+            "timeline_mode": subtitle_options.timeline_mode,
             "blocks": srt_blocks,
             "f0_filtered_count": f0_filtered_count,
             "translation_request_timings": translation_request_timings,
