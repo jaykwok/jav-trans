@@ -182,8 +182,52 @@ def _asr_stage_env_overrides(ctx: JobContext) -> dict[str, str]:
         for key, value in (ctx.advanced or {}).items()
         if str(key).strip() and _is_asr_stage_advanced_key(str(key).strip())
     }
+    asr_backend = str(ctx.asr_backend or "").strip().lower()
+    if asr_backend:
+        overrides["ASR_BACKEND"] = asr_backend
+    overrides["ASR_CONTEXT"] = str(ctx.asr_context or "")
+    overrides["ASR_RECOVERY_ENABLED"] = "1" if bool(ctx.asr_recovery) else "0"
     overrides.setdefault("WHISPERSEG_THRESHOLD", str(ctx.vad_threshold))
     return overrides
+
+
+_SUBTITLE_OPTION_KEYS = {
+    "MAX_SUBTITLE_DURATION",
+    "SUBTITLE_SOFT_MAX_S",
+    "SUBTITLE_SOFT_SPLIT_ENABLED",
+    "SRT_LINE_MAX_CHARS",
+    "SUBTITLE_SHOW_SPEAKER",
+    "SUBTITLE_SHOW_GENDER",
+}
+
+
+def _subtitle_env_overrides(ctx: JobContext) -> dict[str, str]:
+    overrides = {
+        str(key).strip(): str(value)
+        for key, value in (ctx.advanced or {}).items()
+        if str(key).strip() in _SUBTITLE_OPTION_KEYS
+    }
+    overrides.setdefault("SUBTITLE_SHOW_GENDER", "1" if ctx.show_gender else "0")
+    return overrides
+
+
+def _subtitle_options_for_ctx(ctx: JobContext):
+    with _temporary_env(_subtitle_env_overrides(ctx)):
+        return subtitle_module.SubtitleOptions.from_env()
+
+
+def _quality_report_dir_for_ctx(ctx: JobContext) -> Path | None:
+    report_dir_raw = (ctx.advanced or {}).get("QUALITY_REPORT_DIR")
+    if report_dir_raw is None or not str(report_dir_raw).strip():
+        return None
+    return Path(str(report_dir_raw).strip())
+
+
+def _quality_hard_fail_for_ctx(ctx: JobContext) -> bool | None:
+    hard_fail_raw = (ctx.advanced or {}).get("QC_HARD_FAIL")
+    if hard_fail_raw is None:
+        return None
+    return str(hard_fail_raw).strip() == "1"
 
 
 @contextmanager
@@ -394,6 +438,7 @@ def _timings_payload(
 
 def _write_quality_report_for_ctx(
     *,
+    ctx: JobContext,
     video_stem: str,
     job_temp_dir: str,
     aligned_segments: list[dict],
@@ -418,6 +463,8 @@ def _write_quality_report_for_ctx(
         f0_failure=f0_failure,
         enabled=enabled,
         glossary=glossary,
+        report_dir=_quality_report_dir_for_ctx(ctx),
+        hard_fail=_quality_hard_fail_for_ctx(ctx),
     )
 
 
@@ -475,237 +522,216 @@ def run_asr_alignment_f0(
     events.set_current_job_id(job_id)
     _raise_if_cancelled(cancel_event)
     video_duration_s = audio_module.probe_video_duration_s(video_path)
-    previous_asr_backend = getattr(asr_module, "ASR_BACKEND", None)
-    previous_asr_context = getattr(asr_module, "_ASR_CONTEXT", None)
-    previous_asr_recovery = getattr(asr_module, "ASR_RECOVERY_ENABLED", None)
-    if hasattr(asr_module, "ASR_BACKEND"):
-        asr_module.ASR_BACKEND = effective_ctx.asr_backend.strip().lower()
-    if hasattr(asr_module, "_ASR_CONTEXT"):
-        asr_module._ASR_CONTEXT = effective_ctx.asr_context
-    if hasattr(asr_module, "ASR_RECOVERY_ENABLED"):
-        asr_module.ASR_RECOVERY_ENABLED = bool(effective_ctx.asr_recovery)
-    backend_label = asr_module.get_backend_label()
+    with _temporary_env(_asr_stage_env_overrides(effective_ctx)):
+        backend_label = asr_module.get_backend_label()
+        if effective_ctx.run_log_enabled:
+            logger, run_log_path = _setup_run_logger(job_id, backend_label, effective_ctx)
+            events._thread_local.run_logger = logger
 
-    def _restore_asr_globals() -> None:
-        if previous_asr_backend is not None and hasattr(asr_module, "ASR_BACKEND"):
-            asr_module.ASR_BACKEND = previous_asr_backend
-        if previous_asr_context is not None and hasattr(asr_module, "_ASR_CONTEXT"):
-            asr_module._ASR_CONTEXT = previous_asr_context
-        if previous_asr_recovery is not None and hasattr(asr_module, "ASR_RECOVERY_ENABLED"):
-            asr_module.ASR_RECOVERY_ENABLED = previous_asr_recovery
-    if effective_ctx.run_log_enabled:
-        logger, run_log_path = _setup_run_logger(job_id, backend_label, effective_ctx)
-        events._thread_local.run_logger = logger
-
-    _log_stage(logger, f"run_start video={_project_relative(video_path)}")
-    _log_stage(logger, f"backend={backend_label}")
-    _log_stage(
-        logger,
-        f"skip_translation={effective_ctx.skip_translation}",
-    )
-    _log_stage(
-        logger,
-        f"cuda_available={torch.cuda.is_available()} device_count={torch.cuda.device_count()}",
-    )
-    if torch.cuda.is_available():
-        _log_stage(logger, f"cuda_device={torch.cuda.get_device_name(0)}")
-    if run_log_path is not None:
-        console.print(f"[dim]运行日志：{_project_relative(run_log_path)}[/dim]")
-
-    if cache_job_id != job_id:
-        job_temp_dir = _resolve_job_temp_dir(cache_job_id)
-    elif effective_ctx.job_temp_dir:
-        job_temp_dir = str(Path(effective_ctx.job_temp_dir).expanduser().resolve())
-    else:
-        job_temp_dir = _resolve_job_temp_dir(job_id)
-    os.makedirs(job_temp_dir, exist_ok=True)
-    _log_stage(logger, f"job_temp_dir={_project_relative(job_temp_dir)}")
-    if cache_job_id != job_id:
-        _log_stage(logger, f"resume_from_job_id={cache_job_id}")
-    audio_dir = os.path.join(job_temp_dir, "audio")
-    os.makedirs(audio_dir, exist_ok=True)
-    audio_cache_key = audio_module.get_audio_cache_key(video_path)
-    audio_path = os.path.join(audio_dir, f"{video_name}.{audio_cache_key}.wav")
-    aligned_segments_path = os.path.join(
-        job_temp_dir, f"{video_filename}.aligned_segments.json"
-    )
-    aligned_cache = aligned_cache_module.try_load_aligned_segments(
-        aligned_segments_path,
-        audio_cache_key,
-        backend_label,
-    )
-    segments: list[dict] = []
-    asr_log: list[str] = []
-    asr_details: dict = {}
-
-    # 1. Extract audio (skipped if cached)
-    audio_prepare_started = time.perf_counter()
-    audio_cached = os.path.exists(audio_path)
-    _log_stage(logger, "stage_start audio_prepare")
-    _raise_if_cancelled(cancel_event)
-    if aligned_cache is not None:
-        segments = aligned_cache["segments"]
-        asr_log = [str(item) for item in aligned_cache.get("asr_log", [])]
-        asr_details = dict(aligned_cache.get("asr_details", {}))
-        audio_cached = True
+        _log_stage(logger, f"run_start video={_project_relative(video_path)}")
+        _log_stage(logger, f"backend={backend_label}")
         _log_stage(
             logger,
-            f"aligned_cache_hit path={_project_relative(aligned_segments_path)}",
+            f"skip_translation={effective_ctx.skip_translation}",
         )
-        console.print(
-            f"[green]命中 aligned_segments cache，跳过音频提取与 ASR：{_project_relative(aligned_segments_path)}[/green]"
-        )
-    elif os.path.exists(audio_path):
-        _log_stage(logger, f"audio_cache_hit path={_project_relative(audio_path)}")
-        console.print(f"[dim]跳过提取：使用已缓存音频 {_project_relative(audio_path)}[/dim]")
-    else:
         _log_stage(
             logger,
-            f"extract_audio_start output={_project_relative(audio_path)}",
+            f"cuda_available={torch.cuda.is_available()} device_count={torch.cuda.device_count()}",
         )
-        with console.status("[cyan]提取音频中...[/cyan]"):
-            _raise_if_cancelled(cancel_event)
-            audio_module.extract_audio(video_path, audio_path)
-            _raise_if_cancelled(cancel_event)
-        _log_stage(logger, f"extract_audio_done output={_project_relative(audio_path)}")
-    pipeline_timings["audio_prepare_s"] = time.perf_counter() - audio_prepare_started
-    pipeline_timings["audio_extract_s"] = (
-        0.0 if audio_cached else pipeline_timings["audio_prepare_s"]
-    )
-    _log_stage(
-        logger,
-        f"stage_done audio_prepare elapsed={pipeline_timings['audio_prepare_s']:.2f}s cached={audio_cached}",
-    )
+        if torch.cuda.is_available():
+            _log_stage(logger, f"cuda_device={torch.cuda.get_device_name(0)}")
+        if run_log_path is not None:
+            console.print(f"[dim]运行日志：{_project_relative(run_log_path)}[/dim]")
 
-    # 2. ASR text-only transcription, model unload, then alignment
-    device = "cuda:0" if torch.cuda.is_available() else "cpu"
-    _log_stage(logger, f"device={device}")
-    _raise_if_cancelled(cancel_event)
+        if cache_job_id != job_id:
+            job_temp_dir = _resolve_job_temp_dir(cache_job_id)
+        elif effective_ctx.job_temp_dir:
+            job_temp_dir = str(Path(effective_ctx.job_temp_dir).expanduser().resolve())
+        else:
+            job_temp_dir = _resolve_job_temp_dir(job_id)
+        os.makedirs(job_temp_dir, exist_ok=True)
+        _log_stage(logger, f"job_temp_dir={_project_relative(job_temp_dir)}")
+        if cache_job_id != job_id:
+            _log_stage(logger, f"resume_from_job_id={cache_job_id}")
+        audio_dir = os.path.join(job_temp_dir, "audio")
+        os.makedirs(audio_dir, exist_ok=True)
+        audio_cache_key = audio_module.get_audio_cache_key(video_path)
+        audio_path = os.path.join(audio_dir, f"{video_name}.{audio_cache_key}.wav")
+        aligned_segments_path = os.path.join(
+            job_temp_dir, f"{video_filename}.aligned_segments.json"
+        )
+        aligned_cache = aligned_cache_module.try_load_aligned_segments(
+            aligned_segments_path,
+            audio_cache_key,
+            backend_label,
+        )
+        segments: list[dict] = []
+        asr_log: list[str] = []
+        asr_details: dict = {}
 
-    if aligned_cache is None:
-        asr_start = time.time()
-        asr_pipeline_started = time.perf_counter()
-        _log_stage(logger, "stage_start asr_alignment")
-        asr_event_started: set[str] = set()
-        asr_event_done: set[str] = set()
-        asr_event_last: dict[str, dict] = {}
-
-        with Progress(
-            TextColumn("{task.description}"),
-            BarColumn(),
-            MofNCompleteColumn(),
-            TimeElapsedColumn(),
-            console=console,
-        ) as asr_progress:
-            asr_task_id = asr_progress.add_task(
-                "[magenta]ASR 初始化中...[/magenta]", total=None
+        # 1. Extract audio (skipped if cached)
+        audio_prepare_started = time.perf_counter()
+        audio_cached = os.path.exists(audio_path)
+        _log_stage(logger, "stage_start audio_prepare")
+        _raise_if_cancelled(cancel_event)
+        if aligned_cache is not None:
+            segments = aligned_cache["segments"]
+            asr_log = [str(item) for item in aligned_cache.get("asr_log", [])]
+            asr_details = dict(aligned_cache.get("asr_details", {}))
+            audio_cached = True
+            _log_stage(
+                logger,
+                f"aligned_cache_hit path={_project_relative(aligned_segments_path)}",
             )
-            asr_state = {"label": None, "total": None}
-
-            def _on_stage(msg: str):
+            console.print(
+                f"[green]命中 aligned_segments cache，跳过音频提取与 ASR：{_project_relative(aligned_segments_path)}[/green]"
+            )
+        elif os.path.exists(audio_path):
+            _log_stage(logger, f"audio_cache_hit path={_project_relative(audio_path)}")
+            console.print(f"[dim]跳过提取：使用已缓存音频 {_project_relative(audio_path)}[/dim]")
+        else:
+            _log_stage(
+                logger,
+                f"extract_audio_start output={_project_relative(audio_path)}",
+            )
+            with console.status("[cyan]提取音频中...[/cyan]"):
                 _raise_if_cancelled(cancel_event)
-                elapsed = time.time() - asr_start
-                _log_stage(logger, f"asr_stage elapsed={elapsed:.1f}s message={msg}")
-                parsed_event = _parse_asr_stage_event(msg)
-                if parsed_event is not None:
-                    event_stage, event_extra = parsed_event
-                    event_extra["elapsed_s"] = round(elapsed, 1)
-                    asr_event_last[event_stage] = dict(event_extra)
-                    if event_stage not in asr_event_started:
+                audio_module.extract_audio(video_path, audio_path)
+                _raise_if_cancelled(cancel_event)
+            _log_stage(logger, f"extract_audio_done output={_project_relative(audio_path)}")
+        pipeline_timings["audio_prepare_s"] = time.perf_counter() - audio_prepare_started
+        pipeline_timings["audio_extract_s"] = (
+            0.0 if audio_cached else pipeline_timings["audio_prepare_s"]
+        )
+        _log_stage(
+            logger,
+            f"stage_done audio_prepare elapsed={pipeline_timings['audio_prepare_s']:.2f}s cached={audio_cached}",
+        )
+
+        # 2. ASR text-only transcription, model unload, then alignment
+        device = "cuda:0" if torch.cuda.is_available() else "cpu"
+        _log_stage(logger, f"device={device}")
+        _raise_if_cancelled(cancel_event)
+
+        if aligned_cache is None:
+            asr_start = time.time()
+            asr_pipeline_started = time.perf_counter()
+            _log_stage(logger, "stage_start asr_alignment")
+            asr_event_started: set[str] = set()
+            asr_event_done: set[str] = set()
+            asr_event_last: dict[str, dict] = {}
+
+            with Progress(
+                TextColumn("{task.description}"),
+                BarColumn(),
+                MofNCompleteColumn(),
+                TimeElapsedColumn(),
+                console=console,
+            ) as asr_progress:
+                asr_task_id = asr_progress.add_task(
+                    "[magenta]ASR 初始化中...[/magenta]", total=None
+                )
+                asr_state = {"label": None, "total": None}
+
+                def _on_stage(msg: str):
+                    _raise_if_cancelled(cancel_event)
+                    elapsed = time.time() - asr_start
+                    _log_stage(logger, f"asr_stage elapsed={elapsed:.1f}s message={msg}")
+                    parsed_event = _parse_asr_stage_event(msg)
+                    if parsed_event is not None:
+                        event_stage, event_extra = parsed_event
+                        event_extra["elapsed_s"] = round(elapsed, 1)
+                        asr_event_last[event_stage] = dict(event_extra)
+                        if event_stage not in asr_event_started:
+                            _emit_stage_event(
+                                video_path,
+                                event_stage,
+                                "start",
+                                event_extra,
+                            )
+                            asr_event_started.add(event_stage)
                         _emit_stage_event(
                             video_path,
                             event_stage,
-                            "start",
+                            "progress",
                             event_extra,
                         )
-                        asr_event_started.add(event_stage)
-                    _emit_stage_event(
-                        video_path,
-                        event_stage,
-                        "progress",
-                        event_extra,
-                    )
-                match = _ASR_PROGRESS_RE.search(msg)
-                if match:
-                    raw_label = match.group("label")
-                    label = _format_asr_stage_label(raw_label)
-                    current = int(match.group("current"))
-                    total = int(match.group("total"))
-                    description = (
-                        f"[magenta]{label}[/magenta] [dim]{elapsed:.0f}s[/dim]"
-                    )
-                    if asr_state["label"] != label or asr_state["total"] != total:
-                        asr_progress.reset(
-                            asr_task_id,
-                            total=total,
-                            completed=current,
-                            description=description,
+                    match = _ASR_PROGRESS_RE.search(msg)
+                    if match:
+                        raw_label = match.group("label")
+                        label = _format_asr_stage_label(raw_label)
+                        current = int(match.group("current"))
+                        total = int(match.group("total"))
+                        description = (
+                            f"[magenta]{label}[/magenta] [dim]{elapsed:.0f}s[/dim]"
                         )
-                        asr_state["label"] = label
-                        asr_state["total"] = total
-                    else:
-                        asr_progress.update(
-                            asr_task_id,
-                            completed=current,
-                            total=total,
-                            description=description,
-                        )
-                    return
+                        if asr_state["label"] != label or asr_state["total"] != total:
+                            asr_progress.reset(
+                                asr_task_id,
+                                total=total,
+                                completed=current,
+                                description=description,
+                            )
+                            asr_state["label"] = label
+                            asr_state["total"] = total
+                        else:
+                            asr_progress.update(
+                                asr_task_id,
+                                completed=current,
+                                total=total,
+                                description=description,
+                            )
+                        return
 
-                asr_progress.update(
-                    asr_task_id,
-                    description=f"[magenta]{msg}[/magenta] [dim]{elapsed:.0f}s[/dim]",
+                    asr_progress.update(
+                        asr_task_id,
+                        description=f"[magenta]{msg}[/magenta] [dim]{elapsed:.0f}s[/dim]",
+                    )
+
+                segments, asr_log, asr_details = asr_module.transcribe_and_align(
+                    audio_path,
+                    device,
+                    on_stage=_on_stage,
+                    include_details=True,
                 )
-
-            try:
-                with _temporary_env(_asr_stage_env_overrides(effective_ctx)):
-                    segments, asr_log, asr_details = asr_module.transcribe_and_align(
-                        audio_path,
-                        device,
-                        on_stage=_on_stage,
-                        include_details=True,
-                    )
-            finally:
-                _restore_asr_globals()
-            _raise_if_cancelled(cancel_event)
-            for event_stage in ("asr_text_transcribe", "alignment"):
-                if event_stage in asr_event_started and event_stage not in asr_event_done:
-                    _emit_stage_event(
-                        video_path,
-                        event_stage,
-                        "done",
-                        asr_event_last.get(event_stage, {}),
-                    )
-                    asr_event_done.add(event_stage)
-            if asr_state["total"]:
-                asr_progress.update(asr_task_id, completed=asr_state["total"])
-        pipeline_timings["asr_alignment_total_s"] = (
-            time.perf_counter() - asr_pipeline_started
-        )
-        _log_stage(
-            logger,
-            f"stage_done asr_alignment elapsed={pipeline_timings['asr_alignment_total_s']:.2f}s segments={len(segments)}",
-        )
-        _write_json(
-            aligned_segments_path,
-            {
-                "backend": backend_label,
-                "audio_path": audio_path,
-                "audio_cache_key": audio_cache_key,
-                "segments": segments,
-                "asr_details": asr_details,
-                "asr_log": asr_log,
-                "timeline_mode": subtitle_module.SUBTITLE_TIMELINE_MODE,
-            },
-        )
-        _log_stage(
-            logger,
-            f"aligned_segments_written path={_project_relative(aligned_segments_path)}",
-        )
-    else:
-        pipeline_timings["asr_alignment_total_s"] = 0.0
-        _log_stage(logger, "stage_skip asr_alignment reason=aligned_cache")
-        _restore_asr_globals()
+                _raise_if_cancelled(cancel_event)
+                for event_stage in ("asr_text_transcribe", "alignment"):
+                    if event_stage in asr_event_started and event_stage not in asr_event_done:
+                        _emit_stage_event(
+                            video_path,
+                            event_stage,
+                            "done",
+                            asr_event_last.get(event_stage, {}),
+                        )
+                        asr_event_done.add(event_stage)
+                if asr_state["total"]:
+                    asr_progress.update(asr_task_id, completed=asr_state["total"])
+            pipeline_timings["asr_alignment_total_s"] = (
+                time.perf_counter() - asr_pipeline_started
+            )
+            _log_stage(
+                logger,
+                f"stage_done asr_alignment elapsed={pipeline_timings['asr_alignment_total_s']:.2f}s segments={len(segments)}",
+            )
+            _write_json(
+                aligned_segments_path,
+                {
+                    "backend": backend_label,
+                    "audio_path": audio_path,
+                    "audio_cache_key": audio_cache_key,
+                    "segments": segments,
+                    "asr_details": asr_details,
+                    "asr_log": asr_log,
+                    "timeline_mode": subtitle_module.SUBTITLE_TIMELINE_MODE,
+                },
+            )
+            _log_stage(
+                logger,
+                f"aligned_segments_written path={_project_relative(aligned_segments_path)}",
+            )
+        else:
+            pipeline_timings["asr_alignment_total_s"] = 0.0
+            _log_stage(logger, "stage_skip asr_alignment reason=aligned_cache")
 
     _raise_if_cancelled(cancel_event)
     console.print(f"[dim]ASR backend: {backend_label}[/dim]")
@@ -782,21 +808,24 @@ def run_asr_alignment_f0(
                             f"(split_count={f0_gender_split_count})[/cyan]"
                         )
                     from audio.f0_gender import (
-                        F0_GENDER_CARRYOVER_ENABLED,
-                        F0_GENDER_CARRYOVER_MAX_GAP_S,
-                        F0_GENDER_CARRYOVER_MAX_SEGMENT_S,
                         _apply_gender_carry_over,
+                        _carryover_config,
                     )
 
-                    if F0_GENDER_CARRYOVER_ENABLED:
+                    (
+                        carry_enabled,
+                        carry_max_gap_s,
+                        carry_max_segment_s,
+                    ) = _carryover_config()
+                    if carry_enabled:
                         _none_before = sum(
                             1 for s in segments if s.get("gender") is None
                         )
                         segments = _apply_gender_carry_over(
                             segments,
                             enabled=True,
-                            max_gap_s=F0_GENDER_CARRYOVER_MAX_GAP_S,
-                            max_segment_s=F0_GENDER_CARRYOVER_MAX_SEGMENT_S,
+                            max_gap_s=carry_max_gap_s,
+                            max_segment_s=carry_max_segment_s,
                         )
                         _none_after = sum(
                             1 for s in segments if s.get("gender") is None
@@ -1049,10 +1078,11 @@ def _run_translation_and_write_impl(
         write_started = time.perf_counter()
         _log_stage(logger, "stage_start write_output")
         _raise_if_cancelled(cancel_event)
+        subtitle_options = _subtitle_options_for_ctx(ctx)
         if bilingual:
-            subtitle_module.write_bilingual_srt([], srt_path, show_gender=ctx.show_gender)
+            subtitle_module.write_bilingual_srt([], srt_path, options=subtitle_options)
         else:
-            subtitle_module.write_srt([], srt_path, show_gender=ctx.show_gender)
+            subtitle_module.write_srt([], srt_path, options=subtitle_options)
         _write_json(
             transcript_path,
             {
@@ -1090,6 +1120,7 @@ def _run_translation_and_write_impl(
         )
         _log_timing_snapshot(logger, pipeline_timings, asr_details)
         quality_report_path = _write_quality_report_for_ctx(
+            ctx=ctx,
             video_stem=video_filename,
             job_temp_dir=job_temp_dir,
             aligned_segments=[],
@@ -1148,7 +1179,8 @@ def _run_translation_and_write_impl(
         write_started = time.perf_counter()
         _log_stage(logger, "stage_start write_output")
         _raise_if_cancelled(cancel_event)
-        subtitle_module.write_srt(srt_blocks, srt_path, show_gender=ctx.show_gender)
+        subtitle_options = _subtitle_options_for_ctx(ctx)
+        subtitle_module.write_srt(srt_blocks, srt_path, options=subtitle_options)
         _write_json(
             transcript_path,
             {
@@ -1190,6 +1222,7 @@ def _run_translation_and_write_impl(
             f"stage_done write_output elapsed={pipeline_timings['write_output_s']:.2f}s blocks={len(srt_blocks)}",
         )
         quality_report_path = _write_quality_report_for_ctx(
+            ctx=ctx,
             video_stem=video_filename,
             job_temp_dir=job_temp_dir,
             aligned_segments=quality_module.quality_segments_from_blocks(srt_blocks),
@@ -1330,6 +1363,7 @@ def _run_translation_and_write_impl(
             cache_path=translation_cache_path,
             on_batch_done=_on_translation_done,
             on_progress=_on_translation_progress,
+            cancel_event=cancel_event,
         )
         _raise_if_cancelled(cancel_event)
 
@@ -1373,10 +1407,15 @@ def _run_translation_and_write_impl(
     write_started = time.perf_counter()
     _log_stage(logger, "stage_start write_output")
     _raise_if_cancelled(cancel_event)
+    subtitle_options = _subtitle_options_for_ctx(ctx)
     if bilingual:
-        subtitle_module.write_bilingual_srt(srt_blocks, srt_path, show_gender=ctx.show_gender)
+        subtitle_module.write_bilingual_srt(
+            srt_blocks,
+            srt_path,
+            options=subtitle_options,
+        )
     else:
-        subtitle_module.write_srt(srt_blocks, srt_path, show_gender=ctx.show_gender)
+        subtitle_module.write_srt(srt_blocks, srt_path, options=subtitle_options)
 
     _write_json(
         transcript_path,
@@ -1420,6 +1459,7 @@ def _run_translation_and_write_impl(
         f"stage_done write_output elapsed={pipeline_timings['write_output_s']:.2f}s",
     )
     quality_report_path = _write_quality_report_for_ctx(
+        ctx=ctx,
         video_stem=video_filename,
         job_temp_dir=job_temp_dir,
         aligned_segments=quality_module.quality_segments_from_blocks(srt_blocks),

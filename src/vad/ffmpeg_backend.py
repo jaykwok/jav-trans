@@ -194,8 +194,14 @@ class FfmpegSilencedetectBackend:
             "cut_min_silence": _SEGMENT_CUT_MIN_SILENCE_S,
         }
 
-    def segment(self, audio_path: str, *, target_sr: int = 16000) -> SegmentationResult:
-        _ = target_sr
+    def segment(
+        self,
+        audio_path: str,
+        *,
+        target_sr: int = 16000,
+        threshold_override: float | None = None,
+    ) -> SegmentationResult:
+        _ = target_sr, threshold_override
         t0 = time.monotonic()
         duration = _get_wav_duration(audio_path)
         silences = _run_silence_detect(audio_path)

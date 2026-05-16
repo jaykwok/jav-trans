@@ -51,6 +51,7 @@ def diarize_segments(
     _threshold = cluster_threshold if cluster_threshold is not None else _env_val("SPEAKER_CLUSTER_THRESHOLD", 0.5)
     _max_clusters = max_clusters if max_clusters is not None else _env_val("SPEAKER_MAX_CLUSTERS", 5)
 
+    classifier = None
     try:
         device = "cuda" if torch.cuda.is_available() else "cpu"
         source = _env_val("SPEAKER_MODEL", "speechbrain/spkrec-ecapa-voxceleb")
@@ -105,11 +106,6 @@ def diarize_segments(
                 emb_np = emb_np / norm
             embeddings.append(emb_np)
             valid_indices.append(i)
-
-        del classifier
-        gc.collect()
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
 
         result = [dict(s) for s in segments]
 
@@ -166,6 +162,12 @@ def diarize_segments(
     except Exception as exc:
         logger.warning("Speaker diarization failed, skipping: %s", exc)
         return segments
+    finally:
+        if classifier is not None:
+            del classifier
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
 
 def build_speakers_report(segments: list[dict]) -> dict:

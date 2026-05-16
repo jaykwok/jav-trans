@@ -104,7 +104,7 @@ HF_ENDPOINT=https://hf-mirror.com
 ## 💡 给开发者的说明
 
 如果您是开发者并希望深入了解或修改项目：
-- 核心后端逻辑主要位于 `src/main.py` 和 `src/core/` 目录。
+- 核心后端逻辑位于 `src/main.py`、`src/core/`、`src/pipeline/`、`src/whisper/`、`src/llm/`、`src/audio/` 等子模块。
 - Web 接口和页面由 `src/web/` 提供，采用 FastAPI。
 - 本项目引入的部分第三方代码（例如 `src/vad/whisperseg`）保留了其原始的许可证，请遵循相应协议。
 

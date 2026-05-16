@@ -29,16 +29,13 @@ def _setting(key: str) -> str:
 
 
 def _read_env_entry(key: str) -> tuple[bool, str]:
+    from dotenv import dotenv_values
     env_path = PROJECT_ROOT / ".env"
     if not env_path.exists():
         return False, ""
-    for line in env_path.read_text(encoding="utf-8").splitlines():
-        s = line.strip()
-        if s.startswith("#") or "=" not in s:
-            continue
-        k, _, v = s.partition("=")
-        if k.strip() == key:
-            return True, v.strip()
+    values = dotenv_values(str(env_path))
+    if key in values:
+        return True, values[key] or ""
     return False, ""
 
 

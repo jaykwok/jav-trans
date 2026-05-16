@@ -6,8 +6,8 @@ from typing import Callable
 from whisper.backends.base import BaseAsrBackend
 from whisper.local_backend import LocalAsrBackend
 from whisper.qc import (
-    ASR_QC_ENABLED,
-    ASR_RECOVERY_ENABLED,
+    asr_qc_enabled,
+    asr_recovery_enabled,
     evaluate_asr_text_results_qc,
     format_qc_log_items,
 )
@@ -25,7 +25,7 @@ def _run_TRANSCRIPTION_qc(
     log: list[str],
     on_stage: Callable[[str], None] | None = None,
 ) -> tuple[dict, dict[str, float]]:
-    if not ASR_QC_ENABLED:
+    if not asr_qc_enabled():
         return {
             "enabled": False,
             "chunk_count": len(chunks),
@@ -63,7 +63,7 @@ def _run_TRANSCRIPTION_qc(
         )
     )
     log.extend(format_qc_log_items(qc_report))
-    if qc_report["recoverable_count"] and not ASR_RECOVERY_ENABLED:
+    if qc_report["recoverable_count"] and not asr_recovery_enabled():
         log.append(
             "ASR Recovery Path: disabled; QC-only prototype keeps original ASR text"
         )
@@ -80,7 +80,7 @@ def _recover_TRANSCRIPTION_results_if_needed(
     on_stage: Callable[[str], None] | None = None,
 ) -> tuple[list[dict], dict[str, float]]:
     recoverable_indices = list(qc_report.get('recoverable_indices', []))
-    if not ASR_RECOVERY_ENABLED or not recoverable_indices:
+    if not asr_recovery_enabled() or not recoverable_indices:
         return text_results, {'asr_recovery_s': 0.0, 'asr_recovered_chunks': 0.0}
 
     recovery_started = time.perf_counter()

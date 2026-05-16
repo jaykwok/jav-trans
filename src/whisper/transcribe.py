@@ -42,8 +42,6 @@ _ASR_INITIAL_PROMPT_MAX_CHARS = int(os.getenv("ASR_INITIAL_PROMPT_MAX_CHARS", "2
 _ALIGNMENT_STEP_DOWN_CHUNK_S = float(os.getenv("ALIGNMENT_STEP_DOWN_CHUNK", "6.0"))
 _ALIGNMENT_COARSE_REFINE_CHUNK_S = float(os.getenv("ALIGNMENT_COARSE_REFINE_CHUNK", "18.0"))
 _ALIGNMENT_MAX_REFINE_DEPTH = max(0, int(os.getenv("ALIGNMENT_MAX_REFINE_DEPTH", "2")))
-_ASR_CONTEXT = os.getenv("ASR_CONTEXT", "").strip()
-_ASR_HEAD_CONTEXT = os.getenv("ASR_HEAD_CONTEXT", "").strip()
 _ASR_HEAD_CONTEXT_MAX_START_S = float(os.getenv("ASR_HEAD_CONTEXT_MAX_START_S", "0"))
 _ALIGNMENT_MIN_SPAN_MS = float(os.getenv("ALIGNMENT_MIN_SPAN_MS", "120"))
 _ALIGNMENT_MAX_ZERO_RATIO = float(os.getenv("ALIGNMENT_MAX_ZERO_RATIO", "0.55"))
@@ -118,6 +116,14 @@ _STRIP_PUNCT_RE = re.compile(r"[。！？…、,.!?・「」『』（）()【】
 _CONTEXT_COMPACT_RE = re.compile(r"[^0-9A-Za-zぁ-ゖァ-ヺ一-龯々〆ヵヶ]+")
 _CONTEXT_TOKEN_SPLIT_RE = re.compile(r"[。！？…、,.!?・「」『』（）()【】\[\]\s~〜ー\-；;：:\n\r\t]+")
 _SENTENCE_TERMINAL_RE = re.compile(r"[。！？!?…」』）)\]]$")
+
+
+def _asr_context() -> str:
+    return os.getenv("ASR_CONTEXT", "").strip()
+
+
+def _asr_head_context() -> str:
+    return os.getenv("ASR_HEAD_CONTEXT", "").strip()
 _SENTENCE_FRAGMENT_RE = re.compile(r"[^。！？!?…]+[。！？!?…]?")
 _FRAGMENT_CONTINUATION_START_RE = re.compile(
     r"^(?:ます|ました|ません|です|でした|でしょう|ながら|ので|けど|から|たり|"
@@ -207,7 +213,7 @@ def _is_context_leak(text: str) -> bool:
     if len(compact) < 3:
         return False
 
-    for context in (_ASR_CONTEXT, _ASR_HEAD_CONTEXT):
+    for context in (_asr_context(), _asr_head_context()):
         context_compact = _compact_context_text(context)
         if len(context_compact) < 3:
             continue
@@ -266,8 +272,9 @@ def _is_low_value_text(text: str) -> bool:
     if compact in _LOW_VALUE_KEEP_WORDS:
         return False
 
-    if _ASR_CONTEXT:
-        context_compact = _strip_punctuation(_ASR_CONTEXT)
+    context = _asr_context()
+    if context:
+        context_compact = _strip_punctuation(context)
         if context_compact and context_compact in compact and len(compact) <= len(context_compact) + 3:
             return True
 
@@ -289,13 +296,14 @@ def _clean_segment_text(text: str) -> str:
 
 
 def _remove_context_leak_fragments(text: str) -> str:
-    if not (_ASR_CONTEXT or _ASR_HEAD_CONTEXT):
+    contexts = (_asr_context(), _asr_head_context())
+    if not any(contexts):
         return text
 
     context_tokens = sorted(
         {
             token
-            for context in (_ASR_CONTEXT, _ASR_HEAD_CONTEXT)
+            for context in contexts
             for token in _context_tokens(context)
             if len(token) >= 2
         },
@@ -966,10 +974,12 @@ def _build_transcript_chunks(
 def _build_ASR_CONTEXT_for_chunk(chunk: dict) -> str:
     parts: list[str] = []
     chunk_start = float(chunk.get("start", 0.0))
-    if _ASR_HEAD_CONTEXT and chunk_start <= _ASR_HEAD_CONTEXT_MAX_START_S:
-        parts.append(_ASR_HEAD_CONTEXT)
-    if _ASR_CONTEXT:
-        parts.append(_ASR_CONTEXT)
+    head_context = _asr_head_context()
+    context = _asr_context()
+    if head_context and chunk_start <= _ASR_HEAD_CONTEXT_MAX_START_S:
+        parts.append(head_context)
+    if context:
+        parts.append(context)
     return "\n".join(part for part in parts if part)
 
 

@@ -1,9 +1,21 @@
 from __future__ import annotations
 
 import numpy as np
+import pytest
 from scipy.io import wavfile
 
 from whisper import timestamp_fallback
+
+
+def _torchcodec_loadable() -> bool:
+    try:
+        import torchcodec  # noqa: F401
+        return True
+    except (ImportError, OSError, RuntimeError):
+        return False
+
+
+@pytest.mark.skipif(not _torchcodec_loadable(), reason="torchcodec/libavutil not available in this environment")
 def test_detect_speech_spans_ten_vad_silent_wav(tmp_path):
     wav_path = tmp_path / "silent.wav"
     wavfile.write(wav_path, 16000, np.zeros(16000, dtype=np.int16))

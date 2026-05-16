@@ -68,6 +68,10 @@
 | T-AE ✅ | None 段 gender carry-over（_apply_gender_carry_over）                               | 262 passed              |
 | T-AA ✅ | ASR 质量信号（avg_logprob/no_speech_prob/compression_ratio）+ temperature fallback     | 277 passed              |
 | T-AB ✅ | WhisperSeg 默认阈值 0.35 + SpeechSegment.score + neg_offset env + adaptive VAD        | 299 passed              |
+| T-AF ✅ | soft_split 扩展 None 长段（gender=None + dur>6s 强制 hard_word_split）                 | 302 passed              |
+| T-AG ✅ | 短段丢弃 gate（ASR_CHUNK_DROP_ENABLED，duration+RMS AND 双条件，env opt-in）              | 312 passed              |
+| T-AH ✅ | F0 carry-over 默认放宽（GAP 10→15s / SEG 8→12s）+ nan_ratio_threshold 透传 bug 修复     | 312 passed              |
+| T-AI ✅ | F0_GENDER_NONE_TOLERANCE 2→3 + post-split second carry-over pass                     | 315 passed              |
 
 <details>
 <summary>T-S 到 T-Z 详细记录</summary>
@@ -143,159 +147,76 @@
 
 ## 4. 当前待办 / Backlog
 
-### T-AC：VAD chunk packing + 词时间戳后置 F0
+<details>
+<summary>T-AC 到 T-AI 已完成记录</summary>
 
-**背景**：多人对话（含男女）被合并成一条长字幕，根因已定位：
+### T-AC ✅：VAD chunk packing + 词时间戳后置 F0（253 passed）
 
-1. `src/pipeline/gender_split.py:split_segment_on_f0_gender_turns` L107-123 **None 处理漏洞**——词 gender None 时 active_gender 不重置，短词大量 None → 整段几乎不切
-2. VAD 切 1–3s 小段违背 Whisper 30s 训练分布，造成幻觉
-3. 我们的 forced aligner `Qwen3-ForcedAligner-0.6B` 上限 **300s**，不是瓶颈；Whisper 自身 30s 才是上限
+AC-1~4 全 ✅，新增 `chunk_packer.py`，pipeline 接入 packing，`gender_split.py` None 漏洞修复。
+**NMSL-036 PoC 结论**：ASR 块数 -43%，加速 35%，gender split +69%，但混合段 +75% / None 段 44%（↑）。暂缓切默认。
+**HAME-052 PoC 结论**：gender split +69%，混合段 **-60%**（5→2），None 段 34%（↑），整体正向。切默认决策见 T-AD。
 
-**目标**：WhisperX 风格 chunk packing（语音段 pack ≤28s 喂模型）+ F0/gender split 基于词级时间戳后置。
+### T-AD ✅：T-AC 切默认 + ASR 上下文溢出修复（256 passed）
 
-**新增 env（全部默认关闭，PoC 阶段）**：
+`config.py` 切默认；双层截断（240 chars 字符截断 + 180 tokens model cap + overflow retry）；commit `1610843`。
 
-- `ASR_CHUNK_PACKING_ENABLED=0`、`ASR_CHUNK_PACK_MAX_S=28.0`、`ASR_CHUNK_PACK_GAP_MERGE_S=1.5`、`ASR_CHUNK_PACK_PADDING_S=2.0`
-- `F0_GENDER_POST_ALIGNMENT=0`、`F0_GENDER_NONE_TOLERANCE=2`、`SUBTITLE_MIN_DURATION_GENDER_TURN=0.4`
-- `ASR_LONG_CHUNK_PROFILE=off`（统一开关，`on` 时翻转 enabled 类）
+### T-AE ✅：None 段 gender carry-over（262 passed）
 
-**Step 序列（codex 每步完成打印 `[Step AC-X] DONE.` 然后 stop）**：
+`_apply_gender_carry_over()` 于 `f0_gender.py`；三项 env gate；`tests/test_gender_carryover.py` 6 tests；commit `0c8957c`。
 
-- **AC-1** ✅：新增 `src/audio/chunk_packer.py`，`PackedChunk` dataclass + `pack_vad_segments()` 贪心算法；`tests/test_chunk_packer.py` 7 passed
-- **AC-2** ✅：`src/whisper/pipeline.py` VAD refine 后接入 packing（env gate）；`tests/test_pipeline_chunk_packing.py`；全量 250 passed
-- **AC-3** ✅：`local_backend.py` forced align 日志 `[align] chunk_dur=.. word_count=..`；`ALIGN_LONG_CHUNK_BATCH_SIZE=1`；全量 252 passed
-- **AC-4** ✅：`src/main.py` F0 post-alignment gate 日志；修复 `gender_split.py` L107-123 None 漏洞（pending_nones 缓冲 + tolerance）；`tests/test_gender_split_none_handling.py` 5 case；全量 258 passed
-- **AC-5** ✅（NMSL-036 PoC 完成）：WSL2 上对 NMSL-036 完成 baseline vs PoC 双跑；顺带发现并修复预存 bug `_run_pyin ParameterError` → commit `6cacbdd7`；结论见下方 PoC 报告。
-- **AC-6** ✅（HAME-052 PoC 完成，建议切默认）：WSL2 上对 HAME-052（真实男女密集对话，76 分钟）完成 baseline vs PoC 双跑；结论见下方报告。
+### T-AA ✅：ASR 质量信号 + 温度回退（277 passed）
 
-**关键文件**：新增 `src/audio/chunk_packer.py`；改 `src/whisper/pipeline.py`、`src/whisper/local_backend.py`、`src/main.py`、`src/pipeline/gender_split.py`、`src/core/config.py`、`src/audio/f0_gender.py`、`.env.example`；新增 3 个测试文件
+`avg_logprob/no_speech_prob/compression_ratio`；`check_logprob_quality()` warn-log；`_apply_temperature_fallback()` 默认关；commits 1176403, d7b6a38。
 
-**验收基线**：全量回归 253 passed, 5 skipped；env 关闭 bit-exact ✅
+### SORA-575 基准（2026-05-15，commit 6500fc8）
 
----
+491.5s，493 ASR chunks，字幕 365 段，F/M/None=117/124/124（34% None），Mixed=13。
 
-#### T-AC PoC 报告（NMSL-036，anime-whisper，WSL2 RTX 4060 Ti）
+### T-AB ✅：自适应 VAD 阈值（299 passed）
 
-| 指标 | Baseline (off) | PoC (on) | 变化 |
-|------|---------------|----------|------|
-| ASR 处理块数 | 756 | 429 | **-43%** |
-| 输出 segment 数 | 272 | 266 | -2% |
-| avg segment dur | 2.46s | 4.63s | +88% |
-| max segment dur | 5.98s | 12.32s | +106% |
-| M segs（F0修复后）| 70（25.7%）| 50（18.8%）| -29% |
-| F segs（F0修复后）| 109（40.1%）| 98（36.8%）| -10% |
-| None segs（F0修复后）| 93（34.2%）| 118（44.4%）| +27% |
-| 段内 M+F 混合数 | 4 | 7 | **+75%** |
-| gender split 数 | +13 | **+22** | **+69%** |
-| ASR 溢出错误数 | 218 | 148 | -32% |
-| 总耗时 | 630s | 407s | **-35%** |
+默认阈值 0.25→0.35；`SpeechSegment.score`；`WHISPERSEG_NEG_THRESHOLD_OFFSET=0.15`；`ASR_VAD_ADAPTIVE=0` 默认关；commits 1102a6d, ed9c60c。
 
-**附加修复**：发现 `src/audio/f0_gender.py:_run_pyin` 预存 bug（`librosa.ParameterError` 被外层 `except Exception` 静默吞掉，导致 F0 全 None）；修复为 fallback 到 librosa 默认参数；commit `6cacbdd7`。
+### T-AF ✅：soft_split 扩展 None 长段（302 passed）
 
-**正向**：chunk packing 减少 ASR 块数 43%、加速 35%；F0 后置模式使段内 gender split +69%（13→22）、混合段 +75%（4→7）。
+`gender=None` 且 `dur>6s` 强制 hard_word_split；3 tests。
 
-**待观察**：None 段比例上升（34%→44%）；较长的 packed segment 有时把男女合并导致整体 M 标签减少；max_dur 12.32s 超 8s 软切分阈值（实际 pipeline 会由 soft_split 处理）；ASR 上下文溢出错误（148/429）需后续处理。
+### T-AI ✅：post-split carry-over + None 碎片减少（315 passed）
 
-**决策：暂缓切默认。** 结果积极但不决定性：gender split 改善，但 None 比例上升，且混合段反而增加（+75%）；HAME-052 PoC 见下节。
+`F0_GENDER_NONE_TOLERANCE` 2→3；post-split 第二次 carry-over pass；3 tests。
+
+</details>
 
 ---
 
-#### T-AC PoC 报告（HAME-052，anime-whisper，WSL2 RTX 4060 Ti）
+### T-AJ：全量审计修复整改
 
-| 指标 | Baseline (off) | PoC (on) | 变化 |
-|------|---------------|----------|------|
-| 总耗时 | 262s | 280s | +7% |
-| 输出 segment 数 | 126 | 157 | **+25%** |
-| avg segment dur | 1.97s | 3.27s | +67% |
-| max segment dur | 5.44s | 16.18s | +197% |
-| F segs | 89（70.6%）| 93（59.2%）| +4 abs |
-| M segs | 10（7.9%）| 11（7.0%）| +1 abs |
-| None segs | 27（21.4%）| 53（33.8%）| **+26 abs / +96%** |
-| 段内 M+F 混合数 | 5 | 2 | **-60%** |
-| gender split 数 | 16 | 27 | **+69%** |
+**背景**：Codex 全量后端审计发现 17 个问题（高 5、中 8、低 4），核心缺陷：Web JobContext 任务级配置无法真正抵达后端（被 import-time 冻结常量 / from-import 本地绑定 / os.getenv 绕开）；aligned cache key 在 env 覆盖窗口外计算；翻译链路无 cancel_event。
 
-**正向**：gender split +69%（16→27）；混合段 **-60%**（5→2）——与 NMSL-036 混合段上升相反，HAME-052 真实男女对话场景下 chunk packing 有效减少了混合段。
+**目标**：改为运行时读 env、参数化配置、扩大覆盖窗口、加 cancel_event 透传，全量回归不降（≥ 315 passed）。
 
-**待观察**：None 段比例上升（21%→34%），主要来自呻吟/过渡片段（F0 本身无法可靠分类）；max_dur 16.18s 超 8s 阈值，soft_split 会处理；耗时轻微上升 +7%（无 ASR 块数缩减效果，因 HAME-052 baseline VAD 分布不同）。
+**详细规范**：`~/.claude/plans/bubbly-swimming-liskov.md`（每个 Step 含行号、验收用例、风险说明）
 
-**综合两轮 PoC 决策：建议切默认前先处理 None 段比例上升问题，或直接切默认并观察实际产出字幕质量。** HAME-052 混合段改善信号明确；Windows GPU 生产环境下尚未验证仍是主要风险。
+| Step | 内容 | 状态 |
+|------|------|------|
+| AJ-1 | main.py ASR 任务级 env 注入 + aligned cache scope + 顶层 try/finally | ✅ 318 passed |
+| AJ-2 | transcribe.py ASR_CONTEXT 运行时读取 | ✅ 320 passed |
+| AJ-3 | qc / recovery ASR_RECOVERY_ENABLED 运行时读取 | ✅ 322 passed |
+| AJ-4 | pipeline.py chunk packing/drop 运行时读 env | ✅ 324 passed |
+| AJ-5 | f0_gender carry-over 运行时读 env | ✅ 326 passed |
+| AJ-6 | 字幕策略 SubtitleOptions 参数化 | ✅ 329 passed |
+| AJ-7 | translate_segments 接收 cancel_event | ✅ 334 passed |
+| AJ-8 | 可中断退避 sleep（与 AJ-7 合 commit）| ✅ 334 passed |
+| AJ-9 | vad_refine 死参数移除 | ✅ |
+| AJ-10 | quality.py 用 JobContext 参数化 | ✅ |
+| AJ-11 | DEFAULT_SETTINGS 默认值统一（config.py 冲突）| ✅ |
+| AJ-12 | TEN VAD 路径文档修正 + README 开发者路径更新 | ✅ |
+| AJ-13 | subtitle prefix `[SS0]` bug 修复 | ✅ 324 passed |
+| AJ-14 | speaker_diarization 异常路径资源释放 | ✅ |
+| AJ-15 | dotenv_values 解析 .env（web/routes/config.py）| ✅ |
+| AJ-16 | plan.md 清理过时段落 | ✅ |
+| AJ-17 | 移除 plan-claude-4.7-opus规划.md | ✅ |
 
----
-
-> **原 Backlog 已清空。** B1–B7 全部完成，全量回归 241 passed。
-
----
-
-### T-AD：T-AC 切默认 + ASR 上下文溢出修复
-
-**背景**：T-AC HAME-052 PoC 结果明确（gender split +69%、混合段 -60%），切默认。同步修 ASR overflow bug：`_build_initial_prompt_for_chunk` 无 token 上限，导致 ~34% 的 chunk 触发 `decoder_input_ids exceeds max_target_positions` 后静默返回 `text=""`。
-
-- **AD-1** ✅：`src/core/config.py` + `.env.example` 切默认；全量 253 passed
-- **AD-2** ✅：双层截断：`transcribe.py` 字符截断（末尾 240 chars，词边界），`model_backend.py` token cap（末尾 180 tokens）+ overflow retry；新增 `tests/test_initial_prompt_truncation.py` 3 tests；全量 256 passed
-- **AD-3** ✅：commit `1610843`；`load_config()` 后 `ASR_CHUNK_PACKING_ENABLED=1 F0_GENDER_POST_ALIGNMENT=1`
-
-**验收基线**：256 passed, 5 skipped
-
----
-
-### T-AE：None 段 speaker carry-over
-
-**目标**：F0 检测后 post-process——纯 gender=None 的 segment，若两侧最近非 None segment 性别一致且时间距离在阈值内，则继承该性别，降低字幕 None 标记比例。
-
-**新增 env（默认 on）**：
-- `F0_GENDER_CARRYOVER_ENABLED=1`
-- `F0_GENDER_CARRYOVER_MAX_GAP_S=10.0`（左右锚点 segment 起止时间 gap 超出此值则保留 None）
-- `F0_GENDER_CARRYOVER_MAX_SEGMENT_S=8.0`（None segment 本身超过此时长则不 carry-over）
-
-**实现要点**（Codex review 确认）：
-- 新增 `_apply_gender_carry_over(segments)` 于 `src/audio/f0_gender.py`，在 `detect_gender_f0_word_level()` 末尾调用
-- 用原始 gender 快照找左右锚点，不让刚 carry 的值成为后续锚点（避免顺序依赖）
-- 只改 segment.gender，不改 word.gender（word gender 是 split 的依据，不应填假值）
-
-- **AE-1** ✅：`_apply_gender_carry_over()` 实现于 `src/audio/f0_gender.py`；env gate 三项；新增 `tests/test_gender_carryover.py` 6 tests；全量 262 passed；commit `0c8957c`
-
----
-
----
-
-### T-AA ✅：ASR 质量信号 + 温度回退
-
-**已完成**（277 passed）：
-- AA-1+2 ✅：`_generate_with_overflow_retry()` helper；result dict 含 `avg_logprob/no_speech_prob/compression_ratio`；commit 1176403
-- AA-3 ✅：`check_logprob_quality()` in qc.py（动态阈值，warn-log only）；接入 `evaluate_asr_chunk_qc()`；7 tests；commit d7b6a38
-- AA-4 ✅：`_apply_temperature_fallback()` closure in `_transcribe_asr_chunks_text_only`；`ASR_TEMPERATURE_FALLBACK=0` 默认关；`WhisperModelBackend.transcribe_texts(temperature=)` 支持；commit d7b6a38
-
----
-
-### SORA-575 基准测试 ✅（T-AA 完成后）
-
-运行于 2026-05-15，commit 6500fc8。报告：`agents/temp/sora575-baseline-report.md`
-
-| 指标 | 值 |
-|------|-----|
-| 总耗时 | 491.5s（8.2 min） |
-| ASR chunks | 493 |
-| 最终字幕段数 | 365（对齐后 329 → F0 切分 +36） |
-| F/M/None | 117 / 124 / 124（34% None） |
-| Mixed 段 | 13 |
-
-T-AB 目标：降低 None 占比（当前 34%）、维持 mixed 段 ≤13。
-
----
-
-### T-AB ✅：自适应 VAD 阈值
-
-**已完成**（299 passed）：
-- AB-1 ✅：默认阈值 0.25→0.35；commit 1102a6d
-- AB-2 ✅：`SpeechSegment.score`（avg_prob）；`audio_stats={mean_prob, speech_ratio}`；commit 1102a6d
-- AB-3 ✅：`WHISPERSEG_NEG_THRESHOLD_OFFSET=0.15` env；`threshold_override` 全链路真传；日志含 mean_score/speech_ratio/neg_offset；commit ed9c60c
-- AB-4 ✅：`ASR_VAD_ADAPTIVE=0` 默认关；`speech_ratio>0.85` +0.10 / `<0.05` -0.05 重跑分段；`parameters.adaptive` 记录决策轨迹；commit ed9c60c
-
----
-
-### T-AF ✅：soft_split 扩展 None 长段
-
-`_hard_word_split_candidate` 增加 `threshold` 参数；`_soft_split_subtitle_block` 在 gender=None 且超过软上限（6s）时强制调用 hard_word_split；3 tests（None>6s→split, F>6s→不切, None<6s→不切）；302 passed。
+**全量回归基线**：315 passed, 5 skipped
 
 ---
 
@@ -335,13 +256,6 @@ T-AB 目标：降低 None 占比（当前 34%）、维持 mixed 段 ≤13。
 完成：`_select_translation_repair_ids()` 增加长度比率检测，len(zh)/max(len(ja),1) 超出 [TRANSLATION_REPAIR_LENGTH_RATIO_MIN=0.25, TRANSLATION_REPAIR_LENGTH_RATIO_MAX=4.0] 窗口时强制入候选，reason=`length_mismatch`，优先于低置信度候选。237 tests passed。
 
 </details>
-
----
-
-### 暂缓（低优先级，待验证后再决定）
-
-- **温度回退/压缩率监控**：当前 `do_sample=False` + beams 模式收益有限，待实际幻觉统计后再决定。
-- **自适应 VAD 阈值**：当前 0.35 表现稳定，复杂度与收益比待评估。
 
 ---
 
