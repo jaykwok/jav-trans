@@ -140,6 +140,36 @@ def test_ab3_neg_offset_defaults_to_015(monkeypatch):
     assert WhisperSegVadBackend().signature()["neg_offset"] == pytest.approx(0.15)
 
 
+def test_whisperseg_cuda_provider_requires_gpu_device():
+    from vad.whisperseg import whisperseg_core
+
+    class FakeOrt:
+        @staticmethod
+        def get_available_providers():
+            return ["CUDAExecutionProvider", "CPUExecutionProvider"]
+
+        @staticmethod
+        def get_device():
+            return "CPU"
+
+    assert whisperseg_core._cuda_provider_usable(FakeOrt) is False
+
+
+def test_whisperseg_preloads_onnx_cuda_runtime():
+    from vad.whisperseg import whisperseg_core
+
+    calls: list[dict] = []
+
+    class FakeOrt:
+        @staticmethod
+        def preload_dlls(**kwargs):
+            calls.append(kwargs)
+
+    whisperseg_core._preload_onnx_cuda_runtime(FakeOrt)
+
+    assert calls == [{"cuda": True, "cudnn": True, "msvc": False, "directory": ""}]
+
+
 def test_ab3_neg_offset_env_override(monkeypatch):
     monkeypatch.setenv("WHISPERSEG_NEG_THRESHOLD_OFFSET", "0.22")
 

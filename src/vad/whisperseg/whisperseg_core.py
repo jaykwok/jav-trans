@@ -54,6 +54,26 @@ def _env_bool(name: str, default: str = "0") -> bool:
     return value in {"1", "true", "yes", "on"}
 
 
+def _cuda_provider_usable(ort: Any) -> bool:
+    try:
+        providers = ort.get_available_providers()
+    except Exception:
+        return False
+    if "CUDAExecutionProvider" not in providers:
+        return False
+    try:
+        device = ort.get_device()
+    except Exception:
+        return True
+    return str(device).strip().upper() == "GPU"
+
+
+def _preload_onnx_cuda_runtime(ort: Any) -> None:
+    preload = getattr(ort, "preload_dlls", None)
+    if callable(preload):
+        preload(cuda=True, cudnn=True, msvc=False, directory="")
+
+
 def _hf_cache_dir() -> str:
     return str(MODELS_ROOT)
 
@@ -221,6 +241,12 @@ class WhisperSegSpeechSegmenter:
             except ImportError as exc:
                 raise ImportError("WhisperSeg requires onnxruntime or onnxruntime-gpu.") from exc
 
+            if not self.force_cpu:
+                try:
+                    _preload_onnx_cuda_runtime(ort)
+                except Exception as exc:
+                    log.warning("WhisperSeg CUDA runtime preload failed: %s", exc)
+
             model_path, metadata_path = self._download_model()
             self._metadata = self._load_metadata(metadata_path)
 
@@ -230,7 +256,7 @@ class WhisperSegSpeechSegmenter:
 
             opts = ort.SessionOptions()
             available_providers = ort.get_available_providers()
-            use_gpu = not self.force_cpu and "CUDAExecutionProvider" in available_providers
+            use_gpu = not self.force_cpu and _cuda_provider_usable(ort)
             if use_gpu:
                 providers = ["CUDAExecutionProvider", "CPUExecutionProvider"]
                 self._actual_device = "GPU (CUDA)"
@@ -247,7 +273,41 @@ class WhisperSegSpeechSegmenter:
                     opts.inter_op_num_threads = self.num_threads
                     opts.intra_op_num_threads = self.num_threads
 
-            self._session = ort.InferenceSession(model_path, providers=providers, sess_options=opts)
+            try:
+                self._session = ort.InferenceSession(
+                    model_path,
+                    providers=providers,
+                    sess_options=opts,
+                )
+            except Exception as exc:
+                if providers == ["CPUExecutionProvider"]:
+                    raise
+                log.warning(
+                    "WhisperSeg CUDA provider failed (%s); falling back to CPUExecutionProvider",
+                    exc,
+                )
+                providers = ["CPUExecutionProvider"]
+                self._actual_device = "CPU"
+                opts = ort.SessionOptions()
+                if self.num_threads == 1:
+                    optimal = max(1, multiprocessing.cpu_count() // 2)
+                    opts.inter_op_num_threads = optimal
+                    opts.intra_op_num_threads = optimal
+                else:
+                    opts.inter_op_num_threads = self.num_threads
+                    opts.intra_op_num_threads = self.num_threads
+                self._session = ort.InferenceSession(
+                    model_path,
+                    providers=providers,
+                    sess_options=opts,
+                )
+            actual_providers = []
+            try:
+                actual_providers = list(self._session.get_providers())
+            except Exception:
+                actual_providers = providers
+            if "CUDAExecutionProvider" not in actual_providers:
+                self._actual_device = "CPU"
             self._input_name = self._session.get_inputs()[0].name
             self._output_names = [output.name for output in self._session.get_outputs()]
 
@@ -255,6 +315,7 @@ class WhisperSegSpeechSegmenter:
 
             log.info(
                 f"WhisperSeg ready: device={self._actual_device}, "
+                f"providers={actual_providers}, "
                 f"chunk={self._chunk_duration_ms}ms, frame={self._frame_duration_ms}ms"
             )
 

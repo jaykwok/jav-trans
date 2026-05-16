@@ -149,6 +149,7 @@ def write_quality_report(
             len(aligned_segments),
             f0_filtered_count=f0_filtered_count,
             f0_failure=f0_failure,
+            asr_qc=(asr_details or {}).get("asr_qc") or {},
         )
         effective_report_dir = (
             Path(report_dir)

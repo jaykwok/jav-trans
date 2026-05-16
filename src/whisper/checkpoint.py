@@ -15,6 +15,17 @@ from whisper.backends.registry import (
 from whisper.local_backend import ASR_DTYPE, ASR_MODEL_ID, ALIGNMENT_TIMESTAMP_MODE
 
 
+def _asr_generation_error_kind(kind: str) -> str:
+    normalized = str(kind or "").strip().lower()
+    if normalized in {"timeout", "oom"}:
+        return normalized
+    if normalized in {"crash", "protocol_error"}:
+        return "worker_error"
+    if normalized:
+        return "quarantined"
+    return "quarantined"
+
+
 _LAST_VAD_SIGNATURE: dict = {}
 _ASR_CHUNK_ROOT = Path(
     os.getenv("ASR_CHUNK_ROOT", Path("temp") / "chunks")
@@ -83,6 +94,7 @@ def _get_whisper_generation_checkpoint_signature(
         return ""
     try:
         from whisper.model_backend import WHISPER_PRESETS
+        from whisper.generation_budget import generation_budget_policy_version
 
         preset = WHISPER_PRESETS.get(backend_name, {})
         beams = os.getenv("WHISPER_BEAMS", "").strip() or str(preset.get("beams", ""))
@@ -112,6 +124,21 @@ def _get_whisper_generation_checkpoint_signature(
                 "forced_fail_ratio": forced_fail_ratio,
                 "model_path": model_path,
                 "sliding_context_segs": sliding_context_segs,
+                "initial_prompt_max_chars": _env_text(
+                    "ASR_INITIAL_PROMPT_MAX_CHARS",
+                    "240",
+                ),
+                "initial_prompt_max_tokens": _env_text(
+                    "ASR_INITIAL_PROMPT_MAX_TOKENS",
+                    "180",
+                ),
+                "min_effective_new_tokens": _env_text(
+                    "ASR_MIN_EFFECTIVE_NEW_TOKENS",
+                    "64",
+                ),
+                "generation_budget_policy_version": str(
+                    generation_budget_policy_version()
+                ),
             },
             sort_keys=True,
         )
@@ -386,6 +413,21 @@ def _build_quarantined_text_result(
         "language": "Japanese",
         "normalized_path": normalized_path,
         "segments": [],
+        "asr_generation": {
+            "backend": current_asr_backend(),
+            "configured_max_new_tokens": _env_text(
+                "TRANSCRIPTION_MAX_NEW_TOKENS",
+                _env_text("ASR_MAX_NEW_TOKENS", "128"),
+            ),
+            "model_max_target_positions": None,
+            "policy": "quarantined_result",
+            "worker_mode": current_asr_worker_mode(),
+            "error_kind": _asr_generation_error_kind(kind),
+            "failure_kind": str(kind or "").strip().lower(),
+            "error_detail": str(detail or ""),
+            "respawn_count": int(respawn_count),
+            "run_id": run_id or "",
+        },
         "log": [
             (
                 "QUARANTINED: "

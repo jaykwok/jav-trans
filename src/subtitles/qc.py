@@ -9,6 +9,22 @@ def _env_float(key: str, default: float) -> float:
         return default
 
 
+def _append_asr_generation_warnings(
+    warnings: list[str],
+    *,
+    asr_generation_error_count: int,
+    asr_generation_overflow_count: int,
+) -> None:
+    if asr_generation_error_count > _env_float("QC_MAX_ASR_GENERATION_ERRORS", 0.0):
+        warnings.append(
+            f"asr_generation_error_count={asr_generation_error_count} > QC_MAX_ASR_GENERATION_ERRORS={_env_float('QC_MAX_ASR_GENERATION_ERRORS', 0.0):.0f}"
+        )
+    if asr_generation_overflow_count > _env_float("QC_MAX_ASR_GENERATION_OVERFLOWS", 0.0):
+        warnings.append(
+            f"asr_generation_overflow_count={asr_generation_overflow_count} > QC_MAX_ASR_GENERATION_OVERFLOWS={_env_float('QC_MAX_ASR_GENERATION_OVERFLOWS', 0.0):.0f}"
+        )
+
+
 _KANA_ONLY_RE = re.compile(r"^[ぁ-ゟァ-ヿ\s、。！？…ー～「」『』・\(\)（）]+$")
 
 
@@ -20,10 +36,24 @@ def compute_quality_report(
     total_segments: int,
     f0_filtered_count: int = 0,
     f0_failure: bool = False,
+    asr_qc: dict | None = None,
 ) -> dict:
     """Compute SRT quality metrics and flag threshold violations."""
+    asr_qc = asr_qc or {}
+    asr_generation_error_count = int(asr_qc.get("generation_error_count") or 0)
+    asr_generation_overflow_count = int(asr_qc.get("generation_overflow_count") or 0)
+    asr_timeout_count = int(asr_qc.get("timeout_count") or 0)
+    asr_quarantined_count = int(asr_qc.get("quarantined_count") or 0)
+    asr_empty_text_for_speech_count = int(asr_qc.get("empty_text_for_speech_count") or 0)
+
     n = len(segments)
     if n == 0:
+        warnings: list[str] = []
+        _append_asr_generation_warnings(
+            warnings,
+            asr_generation_error_count=asr_generation_error_count,
+            asr_generation_overflow_count=asr_generation_overflow_count,
+        )
         return {
             "empty_zh_ratio": 0.0,
             "repetition_ratio": 0.0,
@@ -34,7 +64,12 @@ def compute_quality_report(
             "alignment_fallback_ratio": 0.0,
             "f0_filtered_count": f0_filtered_count,
             "f0_failure": f0_failure,
-            "warnings": [],
+            "asr_generation_error_count": asr_generation_error_count,
+            "asr_generation_overflow_count": asr_generation_overflow_count,
+            "asr_timeout_count": asr_timeout_count,
+            "asr_quarantined_count": asr_quarantined_count,
+            "asr_empty_text_for_speech_count": asr_empty_text_for_speech_count,
+            "warnings": warnings,
         }
 
     # 1. empty_zh_ratio
@@ -126,6 +161,11 @@ def compute_quality_report(
         warnings.append(
             f"alignment_fallback_ratio={alignment_fallback_ratio:.3f} > QC_MAX_ALIGN_FALLBACK={_env_float('QC_MAX_ALIGN_FALLBACK', 0.20)}"
         )
+    _append_asr_generation_warnings(
+        warnings,
+        asr_generation_error_count=asr_generation_error_count,
+        asr_generation_overflow_count=asr_generation_overflow_count,
+    )
 
     report = {
         "empty_zh_ratio": empty_zh_ratio,
@@ -137,6 +177,11 @@ def compute_quality_report(
         "alignment_fallback_ratio": alignment_fallback_ratio,
         "f0_filtered_count": f0_filtered_count,
         "f0_failure": f0_failure,
+        "asr_generation_error_count": asr_generation_error_count,
+        "asr_generation_overflow_count": asr_generation_overflow_count,
+        "asr_timeout_count": asr_timeout_count,
+        "asr_quarantined_count": asr_quarantined_count,
+        "asr_empty_text_for_speech_count": asr_empty_text_for_speech_count,
         "warnings": warnings,
     }
     if male_ratio is not None:

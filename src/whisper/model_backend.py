@@ -10,6 +10,7 @@ from typing import Any, Callable
 from audio.loading import load_audio_16k_mono
 from utils import hf_progress
 from utils.model_paths import WHISPER_MODEL_PATH, resolve_model_spec
+from whisper.generation_budget import apply_generation_budget
 
 
 hf_progress.install()
@@ -77,6 +78,10 @@ _ASR_INITIAL_PROMPT_MAX_TOKENS = max(
     0,
     _env_int("ASR_INITIAL_PROMPT_MAX_TOKENS", 180),
 )
+_ASR_MIN_EFFECTIVE_NEW_TOKENS = max(
+    1,
+    _env_int("ASR_MIN_EFFECTIVE_NEW_TOKENS", 64),
+)
 _QUALITY_SIGNAL_FIELDS = (
     "avg_logprob",
     "no_speech_prob",
@@ -86,10 +91,11 @@ _QUALITY_SIGNAL_FIELDS = (
 
 def _cap_initial_prompt_ids(prompt_ids):
     original_count = int(prompt_ids.numel())
-    if _ASR_INITIAL_PROMPT_MAX_TOKENS <= 0 or original_count <= _ASR_INITIAL_PROMPT_MAX_TOKENS:
+    max_prompt_tokens = _asr_initial_prompt_max_tokens()
+    if max_prompt_tokens <= 0 or original_count <= max_prompt_tokens:
         return prompt_ids, original_count, original_count
 
-    capped = prompt_ids[..., -_ASR_INITIAL_PROMPT_MAX_TOKENS:]
+    capped = prompt_ids[..., -max_prompt_tokens:]
     kept_count = int(capped.numel())
     logger.warning(
         "[ASR] initial_prompt token cap: original=%d, kept=%d",
@@ -97,6 +103,20 @@ def _cap_initial_prompt_ids(prompt_ids):
         kept_count,
     )
     return capped, original_count, kept_count
+
+
+def _asr_initial_prompt_max_tokens() -> int:
+    return max(
+        0,
+        _env_int("ASR_INITIAL_PROMPT_MAX_TOKENS", _ASR_INITIAL_PROMPT_MAX_TOKENS),
+    )
+
+
+def _asr_min_effective_new_tokens() -> int:
+    return max(
+        1,
+        _env_int("ASR_MIN_EFFECTIVE_NEW_TOKENS", _ASR_MIN_EFFECTIVE_NEW_TOKENS),
+    )
 
 
 def _is_prompt_overflow_error(exc: RuntimeError) -> bool:
@@ -139,7 +159,23 @@ def _generate_with_overflow_retry(
     kwargs_no_prompt = {
         key: value for key, value in kwargs.items() if key != "prompt_ids"
     }
-    output = model.generate(input_features, do_sample=do_sample, **kwargs_no_prompt)
+    try:
+        output = model.generate(input_features, do_sample=do_sample, **kwargs_no_prompt)
+    except RuntimeError as retry_exc:
+        if not _is_prompt_overflow_error(retry_exc):
+            raise
+        max_new_tokens = kwargs_no_prompt.get("max_new_tokens")
+        if isinstance(max_new_tokens, int) and max_new_tokens > 1:
+            reduced = max(1, max_new_tokens // 2)
+            logger.warning(
+                "[ASR] prompt overflow after prompt drop, retrying with max_new_tokens=%d",
+                reduced,
+            )
+            kwargs_reduced = dict(kwargs_no_prompt)
+            kwargs_reduced["max_new_tokens"] = reduced
+            output = model.generate(input_features, do_sample=do_sample, **kwargs_reduced)
+            return output, False, "overflow_retry_reduced_max_new_tokens"
+        raise
     return output, False, "prompt_overflow_retry_without_prompt_ids"
 
 
@@ -377,6 +413,7 @@ class WhisperModelBackend:
         for idx, audio_path in enumerate(audio_paths):
             normalized_path = str(Path(audio_path).resolve())
             duration = _get_wav_duration(normalized_path)
+            budget = None
             initial_prompt = (
                 str(initial_prompts[idx] or "").strip()
                 if initial_prompts is not None
@@ -403,6 +440,7 @@ class WhisperModelBackend:
                     )
                     prompt_token_count = 0
                     prompt_warning = ""
+                    prompt_ids = None
                     if initial_prompt:
                         try:
                             prompt_ids = self._processor.get_prompt_ids(
@@ -412,7 +450,6 @@ class WhisperModelBackend:
                             prompt_ids, original_count, prompt_token_count = (
                                 _cap_initial_prompt_ids(prompt_ids)
                             )
-                            generate_kwargs["prompt_ids"] = prompt_ids
                             if original_count != prompt_token_count:
                                 prompt_warning = (
                                     f"{self.backend_label} initial_prompt token cap: "
@@ -422,6 +459,35 @@ class WhisperModelBackend:
                             prompt_warning = (
                                 f"{self.backend_label} initial_prompt skipped: {prompt_exc}"
                             )
+                    generate_kwargs, prompt_ids, budget = apply_generation_budget(
+                        model=self._model,
+                        generate_kwargs=generate_kwargs,
+                        prompt_ids=prompt_ids,
+                        min_effective_new_tokens=_asr_min_effective_new_tokens(),
+                    )
+                    prompt_token_count = int(budget.prompt_tokens_kept)
+                    if budget.clipped_prompt_tokens:
+                        prompt_budget_warning = (
+                            f"{self.backend_label} generation budget clipped initial_prompt: "
+                            f"original={budget.prompt_tokens_original}, kept={budget.prompt_tokens_kept}"
+                        )
+                        prompt_warning = (
+                            f"{prompt_warning}; {prompt_budget_warning}"
+                            if prompt_warning
+                            else prompt_budget_warning
+                        )
+                    if budget.clipped_max_new_tokens:
+                        token_budget_warning = (
+                            f"{self.backend_label} generation budget clipped max_new_tokens: "
+                            f"configured={budget.configured_max_new_tokens}, "
+                            f"effective={budget.effective_max_new_tokens}, "
+                            f"limit={budget.model_max_target_positions}"
+                        )
+                        prompt_warning = (
+                            f"{prompt_warning}; {token_budget_warning}"
+                            if prompt_warning
+                            else token_budget_warning
+                        )
                     output, _used_prompt_ids, retry_reason = _generate_with_overflow_retry(
                         self._model,
                         self._processor,
@@ -432,6 +498,10 @@ class WhisperModelBackend:
                     if retry_reason == "prompt_overflow_retry_without_prompt_ids":
                         prompt_warning = (
                             f"{self.backend_label} prompt overflow, retried without initial_prompt"
+                        )
+                    elif retry_reason == "overflow_retry_reduced_max_new_tokens":
+                        prompt_warning = (
+                            f"{self.backend_label} prompt overflow, retried with reduced max_new_tokens"
                         )
                     predicted_ids = _generation_sequences(output)
                     text = self._processor.batch_decode(
@@ -456,8 +526,21 @@ class WhisperModelBackend:
                         "language": "Japanese",
                         "normalized_path": normalized_path,
                         **quality_signals,
+                        "asr_generation": {
+                            "backend": self.preset_name,
+                            "budget": budget.as_dict() if budget else {},
+                            "error_kind": None,
+                            "error_detail": "",
+                            "retry_reason": retry_reason,
+                        },
                         "log": [
                             f"{self.backend_label} ASR 输出模式: text_only",
+                            (
+                                f"{self.backend_label} max_new_tokens: "
+                                f"{budget.effective_max_new_tokens}/{budget.configured_max_new_tokens}"
+                                if budget
+                                else ""
+                            ),
                             *(
                                 [
                                     f"{self.backend_label} initial_prompt tokens: {prompt_token_count}"
@@ -471,6 +554,11 @@ class WhisperModelBackend:
                 )
             except Exception as e:
                 _notify(on_stage, f"[ERROR] {self.backend_label} 转录异常 {audio_path}: {e}")
+                error_kind = (
+                    "overflow"
+                    if isinstance(e, RuntimeError) and _is_prompt_overflow_error(e)
+                    else "generation_error"
+                )
                 results.append(
                     {
                         "text": "",
@@ -481,6 +569,13 @@ class WhisperModelBackend:
                         "avg_logprob": None,
                         "no_speech_prob": None,
                         "compression_ratio": None,
+                        "asr_generation": {
+                            "backend": self.preset_name,
+                            "budget": budget.as_dict() if budget else {},
+                            "error_kind": error_kind,
+                            "error_detail": str(e),
+                            "retry_reason": None,
+                        },
                         "log": [f"{self.backend_label} 转录异常: {e}"],
                     }
                 )

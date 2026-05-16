@@ -10,6 +10,11 @@ soundfile
 openai
 python-dotenv
 onnxruntime-gpu>=1.16
+nvidia-cublas-cu12; sys_platform == "linux"
+nvidia-cuda-runtime-cu12; sys_platform == "linux"
+nvidia-curand-cu12; sys_platform == "linux"
+nvidia-cufft-cu12; sys_platform == "linux"
+nvidia-cudnn-cu12; sys_platform == "linux"
 huggingface_hub>=0.25
 fastapi
 uvicorn[standard]

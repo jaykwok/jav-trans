@@ -31,6 +31,11 @@ def _run_TRANSCRIPTION_qc(
             "chunk_count": len(chunks),
             "recoverable_count": 0,
             "warning_count": 0,
+            "generation_error_count": 0,
+            "generation_overflow_count": 0,
+            "timeout_count": 0,
+            "quarantined_count": 0,
+            "empty_text_for_speech_count": 0,
             "items": [],
             "recoverable_indices": [],
         }, {"asr_qc_s": 0.0}

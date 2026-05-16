@@ -253,6 +253,34 @@ AC-1~4 全 ✅，新增 `chunk_packer.py`，pipeline 接入 packing，`gender_sp
 
 - Windows 生产环境 default-on 验证
 
+### T-AL：ASR generation budget + ONNX CUDA runtime 改进
+
+**背景**：SORA-575 中日双语全量测试显示 220 个 AnimeWhisper chunk 触发 `max_new_tokens=444` 超过 Whisper `max_target_positions=448` 的生成错误，同时 WhisperSeg VAD 阶段耗时 310.99s，日志提示 ONNX CUDA provider 缺 `libcublasLt.so.12` 等 CUDA 12 运行库。
+
+**目标**：把 Whisper 系列的 decoder 预算做成共享能力，避免三个 Whisper 后端复用旧的固定 token 上限；Qwen 不套 Whisper 448 公式，但统一输出 ASR generation metadata。质量报告必须暴露 ASR 生成异常，ONNX CUDA provider 必须能明确预加载依赖并在失败时可观测 fallback。
+
+| Step | 内容 | 状态 |
+|------|------|------|
+| AL-1 | 新增 Whisper generation budget 层，按 `max_target_positions`、forced decoder ids、prompt ids、`WHISPER_MAX_NEW_TOKENS` 动态裁剪 | ✅ |
+| AL-2 | 三个 Whisper 后端统一接入 budget；优先裁 prompt，再保证 `ASR_MIN_EFFECTIVE_NEW_TOKENS`，最后裁 `max_new_tokens` | ✅ |
+| AL-3 | Qwen 成功/timeout/worker quarantine 结果统一写入 `asr_generation` metadata，不套 Whisper 448 窗口 | ✅ |
+| AL-4 | ASR QC / quality report 增加 generation error、overflow、timeout、quarantine、empty speech text 计数和 warning | ✅ |
+| AL-5 | cache/checkpoint signature 纳入 `ASR_INITIAL_PROMPT_MAX_CHARS`、`ASR_INITIAL_PROMPT_MAX_TOKENS`、`ASR_MIN_EFFECTIVE_NEW_TOKENS`、budget policy version | ✅ |
+| AL-6 | WhisperSeg ONNX CUDA provider 增加 CUDA/cuDNN 预加载、实际 provider 记录和 CUDA→CPU fallback | ✅ |
+| AL-7 | WSL venv 安装 ONNXRuntime CUDA 12 运行库：`nvidia-cublas/cu12`、`cuda-runtime/cu12`、`curand/cu12`、`cufft/cu12`、`cudnn/cu12` | ✅ |
+
+**T-AL 验证记录：**
+
+- ONNX CUDA smoke 已通过：WhisperSeg `model.onnx` 可创建 `CUDAExecutionProvider` session，日志显示 `device=GPU (CUDA)`、`providers=['CUDAExecutionProvider', 'CPUExecutionProvider']`。
+- 全量回归已通过：`.venv/bin/python -m compileall -q src tests`；`.venv/bin/python -m pytest` 为 `359 passed, 5 skipped`。
+- 性能收益仍需 SORA-575 复测确认：ONNX GPU 可用性已解决，但 VAD 阶段是否从 310.99s 明显下降需要全片或长片段复测。
+
+**T-AL 剩余验证 / Backlog：**
+
+- SORA-575 使用 `anime-whisper` 全量中日双语复测，验收标准：ASR overflow error 为 0，质量报告中 `asr_generation_overflow_count=0`。
+- `whisper-ja-anime-v0.3`、`whisper-ja-1.5b`、`qwen3-asr-1.7b` 各跑短片段 smoke，确认 Whisper 系列 0 overflow，Qwen metadata/QC 计数正常。
+- 继续评估 VAD/chunk cache：只改 ASR prompt/token 参数时可复用 VAD 切分，避免重复 300s 级 VAD 成本。
+
 <details>
 <summary>B1–B7 已完成记录</summary>
 
