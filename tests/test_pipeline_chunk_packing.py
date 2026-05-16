@@ -32,8 +32,14 @@ def _segments() -> list[SpeechSegment]:
 class _StubVadBackend:
     name = "stub"
 
-    def segment(self, audio_path: str, *, target_sr: int = 16000) -> SegmentationResult:
-        del audio_path, target_sr
+    def segment(
+        self,
+        audio_path: str,
+        *,
+        target_sr: int = 16000,
+        threshold_override: float | None = None,
+    ) -> SegmentationResult:
+        del audio_path, target_sr, threshold_override
         segments = _segments()
         return SegmentationResult(
             segments=segments,

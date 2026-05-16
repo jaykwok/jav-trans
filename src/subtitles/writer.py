@@ -2,6 +2,8 @@ import os
 import re
 import logging
 
+from subtitles.options import SubtitleOptions
+
 logger = logging.getLogger(__name__)
 
 
@@ -76,7 +78,16 @@ def _count_text_units(text: str) -> float:
     return units
 
 
-def _estimate_reading_duration(block: dict) -> float:
+def _coerce_options(options: SubtitleOptions | None = None) -> SubtitleOptions:
+    return options if options is not None else SubtitleOptions.from_env()
+
+
+def _estimate_reading_duration(
+    block: dict,
+    *,
+    options: SubtitleOptions | None = None,
+) -> float:
+    options = _coerce_options(options)
     ja_units = _count_text_units(block.get("ja_text", ""))
     zh_units = _count_text_units(block.get("zh_text", ""))
     primary_units = max(ja_units, zh_units)
@@ -88,12 +99,18 @@ def _estimate_reading_duration(block: dict) -> float:
 
     reading_duration = SUBTITLE_READING_BASE + total_units / SUBTITLE_READING_CPS
     reading_duration = max(MIN_SUBTITLE_DURATION, reading_duration)
-    if MAX_SUBTITLE_DURATION > 0:
-        reading_duration = min(reading_duration, MAX_SUBTITLE_DURATION)
+    if options.max_duration > 0:
+        reading_duration = min(reading_duration, options.max_duration)
     return reading_duration
 
 
-def _resolve_subtitle_window(blocks: list[dict], idx: int) -> tuple[float, float]:
+def _resolve_subtitle_window(
+    blocks: list[dict],
+    idx: int,
+    *,
+    options: SubtitleOptions | None = None,
+) -> tuple[float, float]:
+    options = _coerce_options(options)
     block = blocks[idx - 1]
     start = float(block["start"])
     raw_end = max(start, float(block["end"]))
@@ -102,8 +119,8 @@ def _resolve_subtitle_window(blocks: list[dict], idx: int) -> tuple[float, float
         if idx < len(blocks):
             next_start = max(start + 0.05, float(blocks[idx]["start"]))
             end = min(end, max(start + 0.05, next_start - SUBTITLE_GAP_PADDING))
-        if MAX_SUBTITLE_DURATION > 0:
-            end = min(end, start + MAX_SUBTITLE_DURATION)
+        if options.max_duration > 0:
+            end = min(end, start + options.max_duration)
         end = max(end, start + SUBTITLE_MIN_DURATION)
         if idx < len(blocks):
             next_start = float(blocks[idx]["start"])
@@ -112,14 +129,14 @@ def _resolve_subtitle_window(blocks: list[dict], idx: int) -> tuple[float, float
             end = start + 0.05
         return start, end
 
-    target_duration = _estimate_reading_duration(block)
+    target_duration = _estimate_reading_duration(block, options=options)
     trim_cap_duration = max(
         target_duration * SUBTITLE_DURATION_RATIO_CAP,
         target_duration + SUBTITLE_DURATION_GRACE,
         MIN_SUBTITLE_DURATION,
     )
-    if MAX_SUBTITLE_DURATION > 0:
-        trim_cap_duration = min(trim_cap_duration, MAX_SUBTITLE_DURATION)
+    if options.max_duration > 0:
+        trim_cap_duration = min(trim_cap_duration, options.max_duration)
 
     end = raw_end
 
@@ -128,8 +145,8 @@ def _resolve_subtitle_window(blocks: list[dict], idx: int) -> tuple[float, float
         next_limit = max(start + 0.05, float(blocks[idx]["start"]) - SUBTITLE_GAP_PADDING)
         end = min(end, next_limit)
 
-    if MAX_SUBTITLE_DURATION > 0:
-        end = min(end, start + MAX_SUBTITLE_DURATION)
+    if options.max_duration > 0:
+        end = min(end, start + options.max_duration)
 
     end = min(end, start + trim_cap_duration)
 
@@ -176,27 +193,35 @@ def _wrap_subtitle_line(text: str, max_chars: int = 25) -> str:
     return "\n".join(line for line in lines if line)
 
 
-def _wrap_subtitle_text(text: str) -> str:
+def _wrap_subtitle_text(
+    text: str,
+    *,
+    options: SubtitleOptions | None = None,
+) -> str:
+    options = _coerce_options(options)
     lines = str(text or "").replace("\\n", "\n").split("\n")
     return "\n".join(
         wrapped
         for line in lines
-        for wrapped in [_wrap_subtitle_line(line.strip(), SRT_LINE_MAX_CHARS)]
+        for wrapped in [_wrap_subtitle_line(line.strip(), options.line_max_chars)]
         if wrapped.strip()
     )
 
 
-def _subtitle_prefix(block: dict, *, show_gender_override: bool | None = None) -> str:
-    show_speaker = os.getenv("SUBTITLE_SHOW_SPEAKER", "0") == "1"
-    show_gender = (
-        os.getenv("SUBTITLE_SHOW_GENDER", "0") == "1"
-        if show_gender_override is None
-        else show_gender_override
-    )
+def _subtitle_prefix(
+    block: dict,
+    *,
+    show_gender_override: bool | None = None,
+    options: SubtitleOptions | None = None,
+) -> str:
+    options = _coerce_options(options)
+    show_speaker = options.show_speaker
+    show_gender = options.show_gender if show_gender_override is None else show_gender_override
     speaker = block.get("speaker")
     gender = block.get("gender")
     if show_speaker and speaker is not None:
-        return f"[S{speaker}] "
+        s = str(speaker)
+        return f"[{s}] " if s.upper().startswith("S") else f"[S{s}] "
     if show_gender and gender in ("M", "F"):
         return f"[{gender}] "
     return ""
@@ -246,7 +271,10 @@ def _split_candidate_timing(
     split_index: int,
     block_start: float,
     block_end: float,
+    *,
+    options: SubtitleOptions | None = None,
 ) -> tuple[float, float, float, float] | None:
+    options = _coerce_options(options)
     if split_index <= 0 or split_index >= len(words):
         return None
 
@@ -268,12 +296,15 @@ def _best_split_candidate(
     words: list[dict],
     block_start: float,
     block_end: float,
+    *,
+    options: SubtitleOptions | None = None,
 ) -> tuple[int, int | None] | None:
+    options = _coerce_options(options)
     if not candidates:
         return None
 
     duration = block_end - block_start
-    target_offset = min(max(SUBTITLE_MIN_DURATION, duration / 2), SUBTITLE_SOFT_MAX_S)
+    target_offset = min(max(SUBTITLE_MIN_DURATION, duration / 2), options.soft_max)
     target_time = block_start + target_offset
     scored: list[tuple[float, int, int | None]] = []
     seen: set[tuple[int, int | None]] = set()
@@ -283,14 +314,20 @@ def _best_split_candidate(
         if key in seen:
             continue
         seen.add(key)
-        timing = _split_candidate_timing(words, split_index, block_start, block_end)
+        timing = _split_candidate_timing(
+            words,
+            split_index,
+            block_start,
+            block_end,
+            options=options,
+        )
         if timing is None:
             continue
         left_end, _right_start, left_duration, right_duration = timing
         score = abs(left_end - target_time)
-        if MAX_SUBTITLE_DURATION > 0 and left_duration > MAX_SUBTITLE_DURATION:
+        if options.max_duration > 0 and left_duration > options.max_duration:
             score += 1000 + left_duration
-        if MAX_SUBTITLE_DURATION > 0 and right_duration > MAX_SUBTITLE_DURATION:
+        if options.max_duration > 0 and right_duration > options.max_duration:
             score += 50 + right_duration
         scored.append((score, split_index, zh_split_at))
 
@@ -336,15 +373,23 @@ def _hard_word_split_candidate(
     block_end: float,
     *,
     threshold: float | None = None,
+    options: SubtitleOptions | None = None,
 ) -> tuple[int, None] | None:
-    effective = MAX_SUBTITLE_DURATION if threshold is None else threshold
+    options = _coerce_options(options)
+    effective = options.max_duration if threshold is None else threshold
     if effective <= 0 or block_end - block_start <= effective:
         return None
 
     target_time = block_start + min(effective, (block_end - block_start) / 2)
     scored: list[tuple[float, int]] = []
     for split_index in range(1, len(words)):
-        timing = _split_candidate_timing(words, split_index, block_start, block_end)
+        timing = _split_candidate_timing(
+            words,
+            split_index,
+            block_start,
+            block_end,
+            options=options,
+        )
         if timing is None:
             continue
         left_end, _right_start, left_duration, right_duration = timing
@@ -388,9 +433,17 @@ def _split_block_at_word_boundary(
     words: list[dict],
     split_index: int,
     zh_split_at: int | None,
+    *,
+    options: SubtitleOptions | None = None,
 ) -> tuple[dict, dict] | None:
     block_start, block_end = _subtitle_block_window(block, words)
-    timing = _split_candidate_timing(words, split_index, block_start, block_end)
+    timing = _split_candidate_timing(
+        words,
+        split_index,
+        block_start,
+        block_end,
+        options=options,
+    )
     if timing is None:
         return None
 
@@ -442,8 +495,14 @@ def _split_block_at_word_boundary(
     return left, right
 
 
-def _soft_split_subtitle_block(block: dict, *, depth: int = 0) -> list[dict]:
-    if not SUBTITLE_SOFT_SPLIT_ENABLED:
+def _soft_split_subtitle_block(
+    block: dict,
+    *,
+    depth: int = 0,
+    options: SubtitleOptions | None = None,
+) -> list[dict]:
+    options = _coerce_options(options)
+    if not options.soft_split_enabled:
         return [block]
 
     words = _timed_words(block)
@@ -452,8 +511,8 @@ def _soft_split_subtitle_block(block: dict, *, depth: int = 0) -> list[dict]:
 
     block_start, block_end = _subtitle_block_window(block, words)
     duration = block_end - block_start
-    exceeds_soft_limit = SUBTITLE_SOFT_MAX_S > 0 and duration > SUBTITLE_SOFT_MAX_S
-    exceeds_hard_limit = MAX_SUBTITLE_DURATION > 0 and duration > MAX_SUBTITLE_DURATION
+    exceeds_soft_limit = options.soft_max > 0 and duration > options.soft_max
+    exceeds_hard_limit = options.max_duration > 0 and duration > options.max_duration
     if not exceeds_soft_limit and not exceeds_hard_limit:
         return [block]
 
@@ -462,6 +521,7 @@ def _soft_split_subtitle_block(block: dict, *, depth: int = 0) -> list[dict]:
         words,
         block_start,
         block_end,
+        options=options,
     )
     if candidate is None:
         candidate = _best_split_candidate(
@@ -469,59 +529,98 @@ def _soft_split_subtitle_block(block: dict, *, depth: int = 0) -> list[dict]:
             words,
             block_start,
             block_end,
+            options=options,
         )
     if candidate is None and exceeds_hard_limit:
-        candidate = _hard_word_split_candidate(words, block_start, block_end)
+        candidate = _hard_word_split_candidate(
+            words,
+            block_start,
+            block_end,
+            options=options,
+        )
     if candidate is None and exceeds_soft_limit and block.get("gender") is None:
         candidate = _hard_word_split_candidate(
-            words, block_start, block_end, threshold=SUBTITLE_SOFT_MAX_S
+            words,
+            block_start,
+            block_end,
+            threshold=options.soft_max,
+            options=options,
         )
     if candidate is None:
         return [block]
 
-    split_result = _split_block_at_word_boundary(block, words, candidate[0], candidate[1])
+    split_result = _split_block_at_word_boundary(
+        block,
+        words,
+        candidate[0],
+        candidate[1],
+        options=options,
+    )
     if split_result is None:
         return [block]
 
     left, right = split_result
     return (
-        _soft_split_subtitle_block(left, depth=depth + 1)
-        + _soft_split_subtitle_block(right, depth=depth + 1)
+        _soft_split_subtitle_block(left, depth=depth + 1, options=options)
+        + _soft_split_subtitle_block(right, depth=depth + 1, options=options)
     )
 
 
-def _soft_split_subtitle_blocks(blocks: list[dict]) -> list[dict]:
+def _soft_split_subtitle_blocks(
+    blocks: list[dict],
+    *,
+    options: SubtitleOptions | None = None,
+) -> list[dict]:
+    options = _coerce_options(options)
     split_blocks: list[dict] = []
     for block in blocks:
-        split_blocks.extend(_soft_split_subtitle_block(dict(block)))
+        split_blocks.extend(_soft_split_subtitle_block(dict(block), options=options))
     return split_blocks
 
 
-def write_srt(blocks: list[dict], path: str, *, show_gender: bool | None = None):
+def write_srt(
+    blocks: list[dict],
+    path: str,
+    *,
+    show_gender: bool | None = None,
+    options: SubtitleOptions | None = None,
+):
     """
     blocks: [{start, end, zh_text}]
     zh_text may contain \\n to separate multiple speakers within one subtitle block.
     """
-    blocks = _soft_split_subtitle_blocks(blocks)
+    options = _coerce_options(options)
+    blocks = _soft_split_subtitle_blocks(blocks, options=options)
     with open(path, "w", encoding="utf-8") as f:
         for idx, block in enumerate(blocks, 1):
-            start, end = _resolve_subtitle_window(blocks, idx)
+            start, end = _resolve_subtitle_window(blocks, idx, options=options)
 
             start_str = format_timestamp(start)
             end_str   = format_timestamp(end)
             wrapped = _wrap_subtitle_text(
-                _subtitle_prefix(block, show_gender_override=show_gender) + block.get("zh_text", "")
+                _subtitle_prefix(
+                    block,
+                    show_gender_override=show_gender,
+                    options=options,
+                )
+                + block.get("zh_text", ""),
+                options=options,
             )
             f.write(f"{idx}\n{start_str} --> {end_str}\n{wrapped}\n\n")
 
 
-def _merge_adjacent_short_blocks(blocks: list[dict]) -> list[dict]:
+def _merge_adjacent_short_blocks(
+    blocks: list[dict],
+    *,
+    options: SubtitleOptions | None = None,
+) -> list[dict]:
+    options = _coerce_options(options)
     if not SUBTITLE_MERGE_ADJACENT or len(blocks) < 2:
         return list(blocks)
 
     merged: list[dict] = []
     index = 0
-    max_chars = SRT_LINE_MAX_CHARS if SRT_LINE_MAX_CHARS > 0 else 25
+    max_chars = options.line_max_chars if options.line_max_chars > 0 else 25
     while index < len(blocks):
         current = dict(blocks[index])
         while index + 1 < len(blocks):
@@ -586,25 +685,35 @@ def _merge_adjacent_short_blocks(blocks: list[dict]) -> list[dict]:
     return merged
 
 
-def write_bilingual_srt(blocks: list[dict], path: str, *, show_gender: bool | None = None):
+def write_bilingual_srt(
+    blocks: list[dict],
+    path: str,
+    *,
+    show_gender: bool | None = None,
+    options: SubtitleOptions | None = None,
+):
     """blocks: [{start, end, ja_text, zh_text}] — Japanese line above Chinese."""
-    blocks = _merge_adjacent_short_blocks(blocks)
-    blocks = _soft_split_subtitle_blocks(blocks)
+    options = _coerce_options(options)
+    blocks = _merge_adjacent_short_blocks(blocks, options=options)
+    blocks = _soft_split_subtitle_blocks(blocks, options=options)
     with open(path, "w", encoding="utf-8") as f:
         for idx, block in enumerate(blocks, 1):
-            start, end = _resolve_subtitle_window(blocks, idx)
+            start, end = _resolve_subtitle_window(blocks, idx, options=options)
 
             start_str = format_timestamp(start)
             end_str   = format_timestamp(end)
-            prefix = _subtitle_prefix(block, show_gender_override=show_gender)
-            ja_line = _wrap_subtitle_text(prefix + block.get("ja_text", ""))
+            prefix = _subtitle_prefix(
+                block,
+                show_gender_override=show_gender,
+                options=options,
+            )
+            ja_line = _wrap_subtitle_text(prefix + block.get("ja_text", ""), options=options)
             zh_text = str(block.get("zh_text", "")).strip()
             if not zh_text:
                 logger.warning("Empty translated subtitle at index %s; using placeholder", idx)
                 zh_text = "「未翻译」"
-            zh_line = _wrap_subtitle_text(prefix + zh_text)
+            zh_line = _wrap_subtitle_text(prefix + zh_text, options=options)
             content = "\n".join(
                 line for line in (ja_line + "\n" + zh_line).split("\n") if line.strip()
             )
             f.write(f"{idx}\n{start_str} --> {end_str}\n{content}\n\n")
-

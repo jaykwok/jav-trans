@@ -4,7 +4,7 @@ import os
 import re
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from pathlib import Path
 from typing import Callable
 
@@ -35,6 +35,22 @@ _warn_translation_cache = translation_cache._warn_translation_cache
 
 class RetryableTranslationFormatError(RuntimeError):
     pass
+
+
+class TranslationCancelledError(RuntimeError):
+    pass
+
+
+def _cancel_requested(cancel_event: threading.Event | None) -> bool:
+    try:
+        return bool(cancel_event is not None and cancel_event.is_set())
+    except Exception:
+        return False
+
+
+def _raise_if_cancelled(cancel_event: threading.Event | None) -> None:
+    if _cancel_requested(cancel_event):
+        raise TranslationCancelledError("任务已取消")
 
 
 def _required_env(name: str) -> str:
@@ -307,7 +323,9 @@ def extract_global_glossary(
     cache_path: str,
     *,
     api_format: str | None = None,
+    cancel_event: threading.Event | None = None,
 ) -> list[dict]:
+    _raise_if_cancelled(cancel_event)
     if not cache_path:
         return []
     path = Path(cache_path)
@@ -336,7 +354,8 @@ def extract_global_glossary(
         chat_kwargs = {"expected_count": 0, "reasoning_effort": "medium"}
         if api_format is not None:
             chat_kwargs["api_format"] = api_format
-        raw_output = _chat(messages, **chat_kwargs)
+        raw_output = _chat(messages, cancel_event=cancel_event, **chat_kwargs)
+        _raise_if_cancelled(cancel_event)
         parsed = json.loads(_strip_reasoning_artifacts(raw_output))
         terms = _filter_global_glossary_terms(parsed.get("terms") if isinstance(parsed, dict) else None)
         tmp_path = path.with_name(f"{path.name}.{threading.get_ident()}.tmp")
@@ -347,6 +366,8 @@ def extract_global_glossary(
         tmp_path.replace(path)
         return terms
     except Exception as exc:
+        if isinstance(exc, TranslationCancelledError):
+            raise
         print(f"[WARN] failed to extract translation global glossary: {exc}")
         return []
 
@@ -404,7 +425,9 @@ def translate_segments(
     api_format: str | None = None,
     on_batch_done=None,
     on_progress: Callable[[dict], None] | None = None,
+    cancel_event: threading.Event | None = None,
 ) -> tuple[list[str], list[dict], list[dict]]:
+    _raise_if_cancelled(cancel_event)
     if not segments:
         return [], [], []
 
@@ -422,6 +445,7 @@ def translate_segments(
     retry_events: list[dict] = []
     _RETRY_CONTEXT.events = retry_events
     try:
+        _raise_if_cancelled(cancel_event)
         if effective_batch_size > 0 and len(segments) > effective_batch_size:
             zh_texts, timings = _translate_segments_batched(
                 segments,
@@ -436,6 +460,7 @@ def translate_segments(
                 api_format=api_format,
                 on_batch_done=on_batch_done,
                 on_progress=on_progress,
+                cancel_event=cancel_event,
             )
         else:
             zh_texts, timings = _translate_segments_single_request(
@@ -448,7 +473,9 @@ def translate_segments(
                 api_format=api_format,
                 on_batch_done=on_batch_done,
                 on_progress=on_progress,
+                cancel_event=cancel_event,
             )
+        _raise_if_cancelled(cancel_event)
         zh_texts, repair_timing = _apply_translation_repair_pass(
             segments,
             zh_texts,
@@ -458,7 +485,9 @@ def translate_segments(
             reasoning_effort=reasoning_effort,
             api_format=api_format,
             on_progress=on_progress,
+            cancel_event=cancel_event,
         )
+        _raise_if_cancelled(cancel_event)
         if repair_timing is not None:
             timings.append(repair_timing)
         return zh_texts, timings, list(retry_events)
@@ -478,10 +507,13 @@ def _chat_with_reasoning(
     api_format: str | None = None,
     on_progress: Callable[[dict], None] | None = None,
     on_usage: Callable[[dict], None] | None = None,
+    cancel_event: threading.Event | None = None,
 ) -> str:
+    _raise_if_cancelled(cancel_event)
     chat_kwargs = {
         "expected_count": expected_count,
         "on_progress": on_progress,
+        "cancel_event": cancel_event,
     }
     if reasoning_effort is not None:
         chat_kwargs["reasoning_effort"] = reasoning_effort
@@ -506,7 +538,9 @@ def _translate_segments_single_request(
     api_format: str | None = None,
     on_batch_done=None,
     on_progress: Callable[[dict], None] | None = None,
+    cancel_event: threading.Event | None = None,
 ) -> tuple[list[str], list[dict]]:
+    _raise_if_cancelled(cancel_event)
     started = time.perf_counter()
     full_context = (
         global_context
@@ -527,6 +561,7 @@ def _translate_segments_single_request(
     missing_indexes: list[int] = []
     zh_texts: list[str | None] = [None] * expected_count
     for attempt in range(TRANSLATION_API_RETRIES):
+        _raise_if_cancelled(cancel_event)
         _emit_progress(on_progress, {"phase": "reset", "attempt": attempt})
         try:
             raw_output = _chat_with_reasoning(
@@ -536,7 +571,9 @@ def _translate_segments_single_request(
                 api_format=api_format,
                 on_progress=on_progress,
                 on_usage=request_usages.append,
+                cancel_event=cancel_event,
             )
+            _raise_if_cancelled(cancel_event)
             zh_texts = _parse_translation_output(raw_output, expected_count)
             missing_indexes = _missing_indexes(zh_texts)
             if missing_indexes:
@@ -548,7 +585,7 @@ def _translate_segments_single_request(
             break
         except RetryableTranslationFormatError as exc:
             if attempt < TRANSLATION_API_RETRIES - 1:
-                _request_backoff_sleep(attempt, exc)
+                _call_request_backoff_sleep(attempt, exc, cancel_event=cancel_event)
                 continue
             raise RuntimeError(
                 "Single-request translation returned invalid or incomplete JSON after "
@@ -568,6 +605,7 @@ def _translate_segments_single_request(
         **_merge_usage_metrics(request_usages),
     }
     if on_batch_done:
+        _raise_if_cancelled(cancel_event)
         on_batch_done(timing)
     return [text or "" for text in zh_texts], [timing]
 
@@ -586,7 +624,9 @@ def _translate_segments_batched(
     api_format: str | None = None,
     on_batch_done=None,
     on_progress: Callable[[dict], None] | None = None,
+    cancel_event: threading.Event | None = None,
 ) -> tuple[list[str], list[dict]]:
+    _raise_if_cancelled(cancel_event)
     started = time.perf_counter()
     batches = _split_into_batches(segments, batch_size)
     expected_total = len(segments)
@@ -596,6 +636,7 @@ def _translate_segments_batched(
             [str(seg.get("text", "")) for seg in segments],
             _global_glossary_cache_path(cache_path),
             api_format=api_format,
+            cancel_event=cancel_event,
         )
         extra_glossary = _format_global_glossary_terms(
             glossary_terms,
@@ -636,6 +677,7 @@ def _translate_segments_batched(
     warmup_timing: dict | None = None
 
     for batch_index, batch_segments in enumerate(batches):
+        _raise_if_cancelled(cancel_event)
         batch_key = _translation_cache_key(
             batch_index,
             batch_segments,
@@ -677,10 +719,12 @@ def _translate_segments_batched(
                 },
             )
             if on_batch_done:
+                _raise_if_cancelled(cancel_event)
                 on_batch_done(timing)
         else:
             pending_batches.append((batch_index, batch_segments))
 
+    _raise_if_cancelled(cancel_event)
     if pending_batches and use_full_json_prefix and TRANSLATION_PREFIX_WARMUP:
         warmup_started = time.perf_counter()
         warmup_usages: list[dict] = []
@@ -699,12 +743,14 @@ def _translate_segments_batched(
             warmup=True,
         )
         try:
+            _raise_if_cancelled(cancel_event)
             _chat_with_reasoning(
                 warmup_messages,
                 expected_count=0,
                 reasoning_effort=reasoning_effort,
                 api_format=api_format,
                 on_usage=warmup_usages.append,
+                cancel_event=cancel_event,
             )
             warmup_timing = {
                 "batch_index": None,
@@ -723,6 +769,8 @@ def _translate_segments_batched(
                 **_merge_usage_metrics(warmup_usages),
             }
         except Exception as exc:
+            if isinstance(exc, TranslationCancelledError):
+                raise
             warmup_timing = {
                 "batch_index": None,
                 "start_index": 0,
@@ -743,6 +791,7 @@ def _translate_segments_batched(
             print(f"[WARN] translation prefix warmup failed: {exc}", flush=True)
 
     def run_batch(batch_index: int, batch_segments: list[dict]) -> tuple[int, list[str | None], dict]:
+        _raise_if_cancelled(cancel_event)
         batch_started = time.perf_counter()
         batch_started_ts = time.time()
         worker_thread = threading.current_thread()
@@ -810,6 +859,7 @@ def _translate_segments_batched(
         last_retry_error: RetryableTranslationFormatError | None = None
 
         while True:
+            _raise_if_cancelled(cancel_event)
             if attempts_for_pending >= retry_limit_for_pending:
                 raise RuntimeError(
                     "Batch translation returned invalid or incomplete JSON after "
@@ -823,6 +873,7 @@ def _translate_segments_batched(
             active_requested_ids = list(requested_ids)
             trace_progress({"phase": "reset", "attempt": request_count})
             try:
+                _raise_if_cancelled(cancel_event)
                 if request_count == 0:
                     request_messages = messages
                     request_expected_count = expected_count
@@ -855,7 +906,9 @@ def _translate_segments_batched(
                     api_format=api_format,
                     on_progress=trace_progress,
                     on_usage=request_usages.append,
+                    cancel_event=cancel_event,
                 )
+                _raise_if_cancelled(cancel_event)
                 parsed = _parse_partial_translation_output_by_global_id(
                     raw_output,
                     expected_ids=pending_ids,
@@ -893,7 +946,11 @@ def _translate_segments_batched(
 
             if attempts_for_pending < retry_limit_for_pending:
                 sleep_attempt = max(0, attempts_for_pending - 1)
-                _request_backoff_sleep(sleep_attempt, last_retry_error)
+                _call_request_backoff_sleep(
+                    sleep_attempt,
+                    last_retry_error,
+                    cancel_event=cancel_event,
+                )
                 continue
 
             raise RuntimeError(
@@ -945,6 +1002,7 @@ def _translate_segments_batched(
 
     if pending_batches:
         with ThreadPoolExecutor(max_workers=min(max_workers, len(pending_batches))) as executor:
+            _raise_if_cancelled(cancel_event)
             pending_by_index = {
                 batch_index: batch for batch_index, batch in pending_batches
             }
@@ -953,47 +1011,60 @@ def _translate_segments_batched(
                 for batch_index, batch in pending_batches
             }
             try:
-                for future in as_completed(futures):
-                    batch_index, batch_results, timing = future.result()
-                    timings_by_batch[batch_index] = timing
-                    start_index = int(timing["start_index"])
-                    segment_count = int(timing["segment_count"])
-                    local_texts: list[str] = []
-                    for offset in range(segment_count):
-                        global_index = start_index + offset
-                        text = batch_results[global_index] or ""
-                        zh_texts[global_index] = text
-                        local_texts.append(text)
-                    if cache_path:
-                        batch_key = _translation_cache_key(
-                            batch_index,
-                            pending_by_index[batch_index],
-                            extra_glossary=extra_glossary,
-                            glossary=glossary,
-                            target_lang=target_lang,
-                            character_reference=character_reference,
-                        )
-                        _save_cache_entry(
-                            cache_path,
-                            batch_key,
-                            local_texts,
-                            _cache_lock,
-                        )
-                        print(f"[translation-cache] saved batch {batch_index} cache_key={batch_key}")
-                        if _test_crash_translation_batch() == batch_index + 1:
-                            for pending_future in futures:
-                                if pending_future is not future:
-                                    pending_future.cancel()
-                            executor.shutdown(wait=False, cancel_futures=True)
-                            raise SystemExit(1)
-                    if on_batch_done:
-                        on_batch_done(timing)
+                remaining = set(futures)
+                while remaining:
+                    _raise_if_cancelled(cancel_event)
+                    done, remaining = wait(
+                        remaining,
+                        timeout=0.1,
+                        return_when=FIRST_COMPLETED,
+                    )
+                    if not done:
+                        continue
+                    for future in sorted(done, key=lambda item: futures[item]):
+                        _raise_if_cancelled(cancel_event)
+                        batch_index, batch_results, timing = future.result()
+                        timings_by_batch[batch_index] = timing
+                        start_index = int(timing["start_index"])
+                        segment_count = int(timing["segment_count"])
+                        local_texts: list[str] = []
+                        for offset in range(segment_count):
+                            global_index = start_index + offset
+                            text = batch_results[global_index] or ""
+                            zh_texts[global_index] = text
+                            local_texts.append(text)
+                        if cache_path:
+                            batch_key = _translation_cache_key(
+                                batch_index,
+                                pending_by_index[batch_index],
+                                extra_glossary=extra_glossary,
+                                glossary=glossary,
+                                target_lang=target_lang,
+                                character_reference=character_reference,
+                            )
+                            _save_cache_entry(
+                                cache_path,
+                                batch_key,
+                                local_texts,
+                                _cache_lock,
+                            )
+                            print(f"[translation-cache] saved batch {batch_index} cache_key={batch_key}")
+                            if _test_crash_translation_batch() == batch_index + 1:
+                                for pending_future in futures:
+                                    if pending_future is not future:
+                                        pending_future.cancel()
+                                executor.shutdown(wait=False, cancel_futures=True)
+                                raise SystemExit(1)
+                        if on_batch_done:
+                            _raise_if_cancelled(cancel_event)
+                            on_batch_done(timing)
             except Exception:
                 for pending_future in futures:
                     pending_future.cancel()
                 executor.shutdown(wait=False, cancel_futures=True)
                 raise
 
+    _raise_if_cancelled(cancel_event)
     missing = _missing_indexes(zh_texts)
     if missing:
         raise RuntimeError(
@@ -1067,7 +1138,9 @@ def _apply_translation_repair_pass(
     reasoning_effort: str | None = None,
     api_format: str | None = None,
     on_progress: Callable[[dict], None] | None = None,
+    cancel_event: threading.Event | None = None,
 ) -> tuple[list[str], dict | None]:
+    _raise_if_cancelled(cancel_event)
     repair_ids, reasons = _select_translation_repair_ids(segments, zh_texts)
     if not TRANSLATION_REPAIR_ENABLED or not repair_ids:
         return zh_texts, None
@@ -1086,6 +1159,7 @@ def _apply_translation_repair_pass(
         },
     )
     try:
+        _raise_if_cancelled(cancel_event)
         messages = _build_repair_messages(
             segments,
             zh_texts,
@@ -1101,7 +1175,9 @@ def _apply_translation_repair_pass(
             reasoning_effort=reasoning_effort,
             api_format=api_format,
             on_usage=request_usages.append,
+            cancel_event=cancel_event,
         )
+        _raise_if_cancelled(cancel_event)
         parsed = _parse_translation_output_by_global_id(
             raw_output,
             expected_ids=repair_ids,
@@ -1110,6 +1186,7 @@ def _apply_translation_repair_pass(
         repaired_texts = list(zh_texts)
         repaired_count = 0
         for idx in repair_ids:
+            _raise_if_cancelled(cancel_event)
             if parsed[idx]:
                 repaired_texts[idx] = parsed[idx] or repaired_texts[idx]
                 repaired_count += 1
@@ -1138,6 +1215,8 @@ def _apply_translation_repair_pass(
         )
         return repaired_texts, timing
     except Exception as exc:
+        if isinstance(exc, TranslationCancelledError):
+            raise
         timing = {
             "mode": "translation_repair_failed",
             "start_index": min(repair_ids),
@@ -1574,16 +1653,53 @@ def _record_api_retry_event(exc: Exception, attempt: int, delay_s: float) -> Non
         local_events.append(event)
 
 
-def _request_backoff_sleep(attempt: int, exc: Exception) -> None:
+def _interruptible_sleep(
+    total_s: float,
+    cancel_event: threading.Event | None = None,
+) -> None:
+    remaining = max(0.0, float(total_s))
+    while remaining > 0:
+        if _cancel_requested(cancel_event):
+            return
+        sleep_for = min(0.1, remaining)
+        time.sleep(sleep_for)
+        remaining -= sleep_for
+
+
+def _request_backoff_sleep(
+    attempt: int, exc: Exception, cancel_event: threading.Event | None = None
+) -> None:
     delay = _request_backoff_delay(attempt)
     _record_api_retry_event(exc, attempt, delay)
-    time.sleep(delay)
+    _interruptible_sleep(delay, cancel_event)
+    _raise_if_cancelled(cancel_event)
 
 
-def _create_chat_completion(request: dict):
+def _call_request_backoff_sleep(
+    attempt: int,
+    exc: Exception,
+    *,
+    cancel_event: threading.Event | None = None,
+) -> None:
+    if cancel_event is None:
+        _request_backoff_sleep(attempt, exc)
+        return
+    try:
+        _request_backoff_sleep(attempt, exc, cancel_event=cancel_event)
+    except TypeError as type_error:
+        if "cancel_event" not in str(type_error):
+            raise
+        _request_backoff_sleep(attempt, exc)
+
+
+def _create_chat_completion(
+    request: dict,
+    cancel_event: threading.Event | None = None,
+):
     last_error: Exception | None = None
 
     for attempt in range(TRANSLATION_API_RETRIES):
+        _raise_if_cancelled(cancel_event)
         try:
             return _get_client().chat.completions.create(**request)
         except Exception as exc:
@@ -1592,17 +1708,21 @@ def _create_chat_completion(request: dict):
                 raise
 
             if attempt < TRANSLATION_API_RETRIES - 1:
-                _request_backoff_sleep(attempt, exc)
+                _call_request_backoff_sleep(attempt, exc, cancel_event=cancel_event)
 
     if last_error is not None:
         raise last_error
     raise RuntimeError("chat completion failed without an exception")
 
 
-def _create_response(request: dict):
+def _create_response(
+    request: dict,
+    cancel_event: threading.Event | None = None,
+):
     last_error: Exception | None = None
 
     for attempt in range(TRANSLATION_API_RETRIES):
+        _raise_if_cancelled(cancel_event)
         try:
             return _get_client().responses.create(**request)
         except Exception as exc:
@@ -1611,11 +1731,39 @@ def _create_response(request: dict):
                 raise
 
             if attempt < TRANSLATION_API_RETRIES - 1:
-                _request_backoff_sleep(attempt, exc)
+                _call_request_backoff_sleep(attempt, exc, cancel_event=cancel_event)
 
     if last_error is not None:
         raise last_error
     raise RuntimeError("response creation failed without an exception")
+
+
+def _call_create_chat_completion(
+    request: dict,
+    cancel_event: threading.Event | None = None,
+):
+    if cancel_event is None:
+        return _create_chat_completion(request)
+    try:
+        return _create_chat_completion(request, cancel_event=cancel_event)
+    except TypeError as exc:
+        if "cancel_event" not in str(exc):
+            raise
+        return _create_chat_completion(request)
+
+
+def _call_create_response(
+    request: dict,
+    cancel_event: threading.Event | None = None,
+):
+    if cancel_event is None:
+        return _create_response(request)
+    try:
+        return _create_response(request, cancel_event=cancel_event)
+    except TypeError as exc:
+        if "cancel_event" not in str(exc):
+            raise
+        return _create_response(request)
 
 
 def _emit_progress(
@@ -1849,7 +1997,9 @@ def _chat(
     reasoning_effort: str | None = None,
     api_format: str | None = None,
     on_usage: Callable[[dict], None] | None = None,
+    cancel_event: threading.Event | None = None,
 ) -> str:
+    _raise_if_cancelled(cancel_event)
     if _llm_api_format(api_format) == "responses":
         return _chat_responses(
             messages,
@@ -1857,6 +2007,7 @@ def _chat(
             on_progress=on_progress,
             reasoning_effort=reasoning_effort,
             on_usage=on_usage,
+            cancel_event=cancel_event,
         )
     return _chat_completions(
         messages,
@@ -1864,6 +2015,7 @@ def _chat(
         on_progress=on_progress,
         reasoning_effort=reasoning_effort,
         on_usage=on_usage,
+        cancel_event=cancel_event,
     )
 
 
@@ -1873,7 +2025,9 @@ def _chat_completions(
     on_progress: Callable[[dict], None] | None = None,
     reasoning_effort: str | None = None,
     on_usage: Callable[[dict], None] | None = None,
+    cancel_event: threading.Event | None = None,
 ) -> str:
+    _raise_if_cancelled(cancel_event)
     model_name = os.getenv("LLM_MODEL_NAME", LLM_MODEL_NAME).strip()
     if not model_name:
         raise RuntimeError("请先在「翻译设置」中获取并选择翻译模型，再提交任务")
@@ -1892,13 +2046,13 @@ def _chat_completions(
         request["max_tokens"] = TRANSLATION_MAX_TOKENS
 
     try:
-        response_stream = _create_chat_completion(request)
+        response_stream = _call_create_chat_completion(request, cancel_event=cancel_event)
     except Exception as exc:
         if "stream_options" not in request or "stream_options" not in str(exc):
             raise
         request = dict(request)
         request.pop("stream_options", None)
-        response_stream = _create_chat_completion(request)
+        response_stream = _call_create_chat_completion(request, cancel_event=cancel_event)
 
     finish_reason = None
     reasoning_chars = 0
@@ -1921,6 +2075,7 @@ def _chat_completions(
         _emit_progress(on_progress, payload)
 
     for chunk in response_stream:
+        _raise_if_cancelled(cancel_event)
         _emit_usage(on_usage, getattr(chunk, "usage", None))
         if not chunk.choices:
             continue
@@ -1940,7 +2095,9 @@ def _chat_completions(
             )
         if chunk.choices[0].finish_reason:
             finish_reason = chunk.choices[0].finish_reason
+        _raise_if_cancelled(cancel_event)
 
+    _raise_if_cancelled(cancel_event)
     if finish_reason == "length":
         raise RetryableTranslationFormatError(
             f"{_JSON_OUTPUT_LABEL} response was cut off by max_tokens; "
@@ -1967,7 +2124,9 @@ def _chat_responses(
     on_progress: Callable[[dict], None] | None = None,
     reasoning_effort: str | None = None,
     on_usage: Callable[[dict], None] | None = None,
+    cancel_event: threading.Event | None = None,
 ) -> str:
+    _raise_if_cancelled(cancel_event)
     model_name = os.getenv("LLM_MODEL_NAME", LLM_MODEL_NAME).strip()
     if not model_name:
         raise RuntimeError("请先在「翻译设置」中获取并选择翻译模型，再提交任务")
@@ -2010,10 +2169,14 @@ def _chat_responses(
             base_url=_required_env("OPENAI_COMPATIBILITY_BASE_URL"),
             api_retries=TRANSLATION_API_RETRIES,
             is_retryable_api_error=_is_retryable_api_error,
-            backoff_sleep=_request_backoff_sleep,
+            backoff_sleep=lambda attempt, exc: _call_request_backoff_sleep(
+                attempt,
+                exc,
+                cancel_event=cancel_event,
+            ),
         )
         if use_micu_grok_patch
-        else _create_response(request)
+        else _call_create_response(request, cancel_event=cancel_event)
     )
 
     completed_response = None
@@ -2039,6 +2202,7 @@ def _chat_responses(
         _emit_progress(on_progress, payload)
 
     for event in response_stream:
+        _raise_if_cancelled(cancel_event)
         event_type = _response_event_type(event)
         if event_type == "response.output_text.delta":
             piece = _response_event_delta(event)
@@ -2074,7 +2238,9 @@ def _chat_responses(
 
         if event_type in {"response.failed", "response.error"}:
             failed_error = event
+        _raise_if_cancelled(cancel_event)
 
+    _raise_if_cancelled(cancel_event)
     if failed_error is not None:
         raise RetryableTranslationFormatError(
             f"OpenAI Responses API failed: {failed_error}"

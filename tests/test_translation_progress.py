@@ -383,7 +383,7 @@ def test_translate_segments_emits_reset_on_retry(monkeypatch):
         return '{"translations":[{"id":0,"text":"好"}]}'
 
     monkeypatch.setattr(translator, "TRANSLATION_API_RETRIES", 2)
-    monkeypatch.setattr(translator, "_request_backoff_sleep", lambda attempt, exc: None)
+    monkeypatch.setattr(translator, "_request_backoff_sleep", lambda attempt, exc, **_kw: None)
     monkeypatch.setattr(translator, "_chat", fake_chat)
 
     zh_texts, timings, retry_events = translator.translate_segments(

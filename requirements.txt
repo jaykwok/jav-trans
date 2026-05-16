@@ -16,3 +16,4 @@ uvicorn[standard]
 pywebview
 python-multipart
 httpx
+xxhash

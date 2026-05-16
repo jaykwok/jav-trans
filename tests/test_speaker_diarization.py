@@ -1,10 +1,31 @@
 import numpy as np
 import pytest
 import torch
-import torchaudio
 from pathlib import Path
+from scipy.io import wavfile
 
 from audio import speaker_diarization as sd
+
+
+def _torchaudio_backend_available() -> bool:
+    """Return True only if torchaudio can actually load audio (requires torchcodec/FFmpeg)."""
+    try:
+        import torchaudio
+        import io, struct
+        # Minimal valid WAV header (44 bytes, 1ch 16kHz 16-bit, 0 samples)
+        header = struct.pack('<4sI4s4sIHHIIHH4sI',
+            b'RIFF', 36, b'WAVE', b'fmt ', 16, 1, 1, 16000, 32000, 2, 16, b'data', 0)
+        torchaudio.load(io.BytesIO(header))
+        return True
+    except Exception:
+        return False
+
+
+_AUDIO_BACKEND_AVAILABLE = _torchaudio_backend_available()
+_skip_no_backend = pytest.mark.skipif(
+    not _AUDIO_BACKEND_AVAILABLE,
+    reason="torchaudio audio backend (torchcodec/FFmpeg) not available in this environment",
+)
 def _seg(ja: str, zh: str, start: float, end: float) -> dict:
     return {"text": ja, "zh": zh, "start": start, "end": end}
 
@@ -27,10 +48,11 @@ def _make_mock_classifier(embeddings_by_call: list[np.ndarray]):
 
 def _write_wav(path: Path, duration_s: float = 5.0, sr: int = 16000) -> Path:
     samples = int(duration_s * sr)
-    torchaudio.save(str(path), torch.zeros(1, samples), sr)
+    wavfile.write(str(path), sr, np.zeros(samples, dtype=np.int16))
     return path
 
 
+@_skip_no_backend
 def test_two_speaker_clustering(monkeypatch, tmp_path):
     wav = _write_wav(tmp_path / "test.wav")
     segs = [
@@ -60,6 +82,7 @@ def test_disabled_returns_original(monkeypatch, tmp_path):
     assert result is segs
 
 
+@_skip_no_backend
 def test_short_segment_backfilled(monkeypatch, tmp_path):
     wav = _write_wav(tmp_path / "test.wav")
     segs = [
@@ -77,6 +100,7 @@ def test_short_segment_backfilled(monkeypatch, tmp_path):
     assert result[1]["speaker"] == result[0]["speaker"]
 
 
+@_skip_no_backend
 def test_kana_only_bgm_stays_none(monkeypatch, tmp_path):
     wav = _write_wav(tmp_path / "test.wav")
     segs = [
@@ -116,6 +140,7 @@ def test_build_speakers_report():
     assert report["unassigned"]["bgm"] == 1
 
 
+@_skip_no_backend
 def test_max_clusters_capped(monkeypatch, tmp_path):
     wav = _write_wav(tmp_path / "test.wav", duration_s=10.0)
     # 6 segments with 6 distinct embeddings (unit vectors on each axis)

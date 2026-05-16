@@ -121,6 +121,8 @@ def write_quality_report(
     f0_failure: bool = False,
     enabled: bool | None = None,
     glossary: str | None = None,
+    report_dir: Path | str | None = None,
+    hard_fail: bool | None = None,
 ) -> str | None:
     if enabled is None:
         enabled = env_flag("QUALITY_REPORT_ENABLED")
@@ -148,10 +150,14 @@ def write_quality_report(
             f0_filtered_count=f0_filtered_count,
             f0_failure=f0_failure,
         )
-        report_dir = Path(os.getenv("QUALITY_REPORT_DIR", "./reports")).expanduser()
-        if not report_dir.is_absolute():
-            report_dir = project_root / report_dir
-        report_path = report_dir.resolve() / f"{video_stem}.quality_report.json"
+        effective_report_dir = (
+            Path(report_dir)
+            if report_dir is not None
+            else Path(os.getenv("QUALITY_REPORT_DIR", "./reports"))
+        ).expanduser()
+        if not effective_report_dir.is_absolute():
+            effective_report_dir = project_root / effective_report_dir
+        report_path = effective_report_dir.resolve() / f"{video_stem}.quality_report.json"
         write_json_atomic(report_path, report)
 
         warnings_list = report.get("warnings") or []
@@ -159,7 +165,12 @@ def write_quality_report(
             console.print("[yellow]WARNING: 字幕质量报告发现以下问题：[/yellow]")
             for warning in warnings_list:
                 console.print(f"[yellow]- {warning}[/yellow]")
-        if os.getenv("QC_HARD_FAIL", "0").strip() == "1" and warnings_list:
+        effective_hard_fail = (
+            bool(hard_fail)
+            if hard_fail is not None
+            else os.getenv("QC_HARD_FAIL", "0").strip() == "1"
+        )
+        if effective_hard_fail and warnings_list:
             raise RuntimeError(
                 f"QC_HARD_FAIL=1 and quality warnings present: {warnings_list}"
             )

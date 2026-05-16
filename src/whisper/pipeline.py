@@ -51,6 +51,26 @@ _ASR_CHUNK_DROP_ENABLED = os.getenv(
 _ASR_CHUNK_DROP_MIN_DURATION_S = float(os.getenv("ASR_CHUNK_DROP_MIN_DURATION_S", "0.20"))
 _ASR_CHUNK_DROP_RMS_DBFS = float(os.getenv("ASR_CHUNK_DROP_RMS_DBFS", "-40.0"))
 
+
+def _env_bool(name: str, default: str) -> bool:
+    return os.getenv(name, default).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _env_float(name: str, default: str) -> float:
+    return float(os.getenv(name, default))
+
+
+def _chunk_config() -> dict:
+    return {
+        "packing_enabled": _env_bool("ASR_CHUNK_PACKING_ENABLED", "0"),
+        "pack_max_s": _env_float("ASR_CHUNK_PACK_MAX_S", "28.0"),
+        "pack_gap_merge_s": _env_float("ASR_CHUNK_PACK_GAP_MERGE_S", "1.5"),
+        "pack_padding_s": _env_float("ASR_CHUNK_PACK_PADDING_S", "2.0"),
+        "drop_enabled": _env_bool("ASR_CHUNK_DROP_ENABLED", "0"),
+        "drop_min_duration_s": _env_float("ASR_CHUNK_DROP_MIN_DURATION_S", "0.20"),
+        "drop_rms_dbfs": _env_float("ASR_CHUNK_DROP_RMS_DBFS", "-40.0"),
+    }
+
 get_backend_label = _registry_module.get_backend_label
 _create_whisper_backend = _registry_module._create_whisper_backend
 _resolve_asr_backend = _registry_module._resolve_asr_backend
@@ -202,15 +222,16 @@ def _drop_short_low_energy_spans(
     """Drop spans where duration < threshold AND RMS energy < threshold (both must hold)."""
     from audio.audio_metrics import compute_rms_dbfs
 
+    cfg = _chunk_config()
     kept = []
     dropped = 0
     for span in spans:
         start = span.start if hasattr(span, "start") else span[0]
         end = span.end if hasattr(span, "end") else span[1]
         dur = end - start
-        if dur < _ASR_CHUNK_DROP_MIN_DURATION_S:
+        if dur < cfg["drop_min_duration_s"]:
             rms = compute_rms_dbfs(audio_path, start, end)
-            if rms < _ASR_CHUNK_DROP_RMS_DBFS:
+            if rms < cfg["drop_rms_dbfs"]:
                 _pipeline_logger.info(
                     "[chunk-drop] start=%.3f end=%.3f dur=%.3f rms=%.1f dBFS",
                     start, end, dur, rms,
@@ -227,7 +248,8 @@ def _build_processing_spans(
     audio_path: str,
 ) -> list[tuple[float, float]] | list[PackedChunk]:
     global _LAST_VAD_SIGNATURE
-    if _ASR_CHUNK_PACKING_ENABLED:
+    cfg = _chunk_config()
+    if cfg["packing_enabled"]:
         from vad import get_vad_backend
 
         vad = get_vad_backend()
@@ -236,9 +258,9 @@ def _build_processing_spans(
             **result.parameters,
             "chunk_packing": {
                 "enabled": True,
-                "max_s": _ASR_CHUNK_PACK_MAX_S,
-                "gap_merge_s": _ASR_CHUNK_PACK_GAP_MERGE_S,
-                "padding_s": _ASR_CHUNK_PACK_PADDING_S,
+                "max_s": cfg["pack_max_s"],
+                "gap_merge_s": cfg["pack_gap_merge_s"],
+                "padding_s": cfg["pack_padding_s"],
             },
         }
         _chunking_module._LAST_VAD_SIGNATURE = _LAST_VAD_SIGNATURE
@@ -246,20 +268,20 @@ def _build_processing_spans(
         segments = result.segments
         if not segments:
             return [(0.0, result.audio_duration_sec)]
-        if _ASR_CHUNK_DROP_ENABLED:
+        if cfg["drop_enabled"]:
             segments = _drop_short_low_energy_spans(audio_path, segments)
         packed = pack_vad_segments(
             segments,
-            max_s=_ASR_CHUNK_PACK_MAX_S,
-            gap_merge_s=_ASR_CHUNK_PACK_GAP_MERGE_S,
-            padding_s=_ASR_CHUNK_PACK_PADDING_S,
+            max_s=cfg["pack_max_s"],
+            gap_merge_s=cfg["pack_gap_merge_s"],
+            padding_s=cfg["pack_padding_s"],
         )
         return packed
 
     spans = _chunking_module._build_processing_spans(audio_path)
     _LAST_VAD_SIGNATURE = _chunking_module._LAST_VAD_SIGNATURE
     _sync_checkpoint_state()
-    if _ASR_CHUNK_DROP_ENABLED:
+    if cfg["drop_enabled"]:
         spans = _drop_short_low_energy_spans(audio_path, spans)
     return spans
 
@@ -278,7 +300,7 @@ def _annotate_packed_chunks(
     spans: list[tuple[float, float]] | list[PackedChunk],
     log: list[str],
 ) -> None:
-    if not _ASR_CHUNK_PACKING_ENABLED:
+    if not _chunk_config()["packing_enabled"]:
         return
 
     packed_spans = [span for span in spans if isinstance(span, PackedChunk)]
@@ -327,7 +349,7 @@ def _transcribe_and_align_local(
             audio_path, _span_boundaries(chunk_spans), on_stage=on_stage
         )
         _annotate_packed_chunks(chunk_infos, chunk_spans, log)
-        if not _ASR_CHUNK_PACKING_ENABLED:
+        if not _chunk_config()["packing_enabled"]:
             chunk_infos = _merge_short_vad_chunks(
                 chunk_dir,
                 chunk_infos,

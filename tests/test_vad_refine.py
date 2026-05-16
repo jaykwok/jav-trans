@@ -19,7 +19,14 @@ def _write_wav(path: Path, duration_s: float, sample_rate: int = 16000) -> None:
 class _SplitVadBackend:
     name = "split_test"
 
-    def segment(self, audio_path: str, *, target_sr: int = 16000) -> SegmentationResult:
+    def segment(
+        self,
+        audio_path: str,
+        *,
+        target_sr: int = 16000,
+        threshold_override: float | None = None,
+    ) -> SegmentationResult:
+        del threshold_override
         segs = [SpeechSegment(start=0.0, end=0.8), SpeechSegment(start=1.0, end=2.0)]
         return SegmentationResult(
             segments=segs,
@@ -37,7 +44,14 @@ class _SplitVadBackend:
 class _TimeoutVadBackend:
     name = "timeout_test"
 
-    def segment(self, audio_path: str, *, target_sr: int = 16000) -> SegmentationResult:
+    def segment(
+        self,
+        audio_path: str,
+        *,
+        target_sr: int = 16000,
+        threshold_override: float | None = None,
+    ) -> SegmentationResult:
+        del threshold_override
         import time
 
         time.sleep(10)
@@ -89,3 +103,43 @@ def test_vad_timeout_returns_original_chunk(tmp_path):
     assert result[0]["index"] == 3
     assert result[0]["path"] == str(wav_path)
     assert result[0]["_vad_parent_index"] == 3
+
+
+def test_vad_refine_passes_threshold_override(tmp_path):
+    class RecordingVadBackend(_SplitVadBackend):
+        def __init__(self) -> None:
+            self.seen_thresholds: list[float | None] = []
+
+        def segment(
+            self,
+            audio_path: str,
+            *,
+            target_sr: int = 16000,
+            threshold_override: float | None = None,
+        ) -> SegmentationResult:
+            self.seen_thresholds.append(threshold_override)
+            return super().segment(
+                audio_path,
+                target_sr=target_sr,
+                threshold_override=threshold_override,
+            )
+
+    wav_path = tmp_path / "chunk_0000.wav"
+    _write_wav(wav_path, duration_s=2.0)
+    backend = RecordingVadBackend()
+
+    refine_chunks_via_vad(
+        [
+            {
+                "index": 0,
+                "start": 5.0,
+                "end": 7.0,
+                "path": str(wav_path),
+                "source_audio_path": "audio.wav",
+            }
+        ],
+        vad_backend=backend,
+        threshold_override=0.42,
+    )
+
+    assert backend.seen_thresholds == [0.42]

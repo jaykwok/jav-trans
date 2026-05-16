@@ -319,7 +319,7 @@ def test_batch_retry_isolation(monkeypatch):
         return _mock_json(start, expected_count)
 
     monkeypatch.setattr(translator, "TRANSLATION_API_RETRIES", 2)
-    monkeypatch.setattr(translator, "_request_backoff_sleep", lambda attempt, exc: None)
+    monkeypatch.setattr(translator, "_request_backoff_sleep", lambda attempt, exc, **_kw: None)
     monkeypatch.setattr(translator, "_chat", fake_chat)
 
     zh_texts, _timings, retry_events = translator.translate_segments(
@@ -367,7 +367,7 @@ def test_batch_retry_only_requests_missing_ids(monkeypatch):
         )
 
     monkeypatch.setattr(translator, "TRANSLATION_API_RETRIES", 2)
-    monkeypatch.setattr(translator, "_request_backoff_sleep", lambda attempt, exc: None)
+    monkeypatch.setattr(translator, "_request_backoff_sleep", lambda attempt, exc, **_kw: None)
     monkeypatch.setattr(translator, "_chat_with_reasoning", fake_chat)
 
     zh_texts, timings, retry_events = translator.translate_segments(
@@ -415,7 +415,7 @@ def test_batch_retry_gets_fresh_budget_after_missing_set_shrinks(monkeypatch):
 
     monkeypatch.setattr(translator, "TRANSLATION_API_RETRIES", 2)
     monkeypatch.setattr(translator, "TRANSLATION_BATCH_REPAIR_RETRIES", 2)
-    monkeypatch.setattr(translator, "_request_backoff_sleep", lambda attempt, exc: None)
+    monkeypatch.setattr(translator, "_request_backoff_sleep", lambda attempt, exc, **_kw: None)
     monkeypatch.setattr(translator, "_chat_with_reasoning", fake_chat)
 
     zh_texts, timings, retry_events = translator.translate_segments(

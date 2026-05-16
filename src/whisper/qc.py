@@ -21,8 +21,16 @@ def _env_bool(name: str, default: bool) -> bool:
     return default
 
 
-ASR_QC_ENABLED = _env_bool("ASR_QC_ENABLED", True)
-ASR_RECOVERY_ENABLED = _env_bool("ASR_RECOVERY_ENABLED", False)
+def asr_qc_enabled() -> bool:
+    return _env_bool("ASR_QC_ENABLED", True)
+
+
+def asr_recovery_enabled() -> bool:
+    return _env_bool("ASR_RECOVERY_ENABLED", False)
+
+
+ASR_QC_ENABLED = asr_qc_enabled()
+ASR_RECOVERY_ENABLED = asr_recovery_enabled()
 ASR_QC_REPETITION_THRESHOLD = max(
     1,
     int(os.getenv("ASR_QC_REPETITION_THRESHOLD", "10")),
@@ -346,7 +354,7 @@ def evaluate_asr_text_results_qc(
         "repetition_threshold": ASR_QC_REPETITION_THRESHOLD,
     }
 
-    if not ASR_QC_ENABLED:
+    if not asr_qc_enabled():
         return {
             "enabled": False,
             "chunk_count": len(chunks),

@@ -14,8 +14,6 @@ def refine_chunks_via_vad(
     *,
     vad_backend: VadBackend,
     threshold_override: float | None = None,
-    min_silence_ms: int = 200,
-    min_speech_ms: int = 250,
     timeout_per_chunk_s: float = 30.0,
 ) -> list[dict]:
     """VAD-subdivide QC-failed chunks for re-transcription.

@@ -22,6 +22,18 @@ F0_GENDER_CARRYOVER_MAX_SEGMENT_S = float(
 )
 
 
+def _carryover_config() -> tuple[bool, float, float]:
+    enabled = os.getenv("F0_GENDER_CARRYOVER_ENABLED", "1").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+    max_gap_s = float(os.getenv("F0_GENDER_CARRYOVER_MAX_GAP_S", "15.0"))
+    max_segment_s = float(os.getenv("F0_GENDER_CARRYOVER_MAX_SEGMENT_S", "12.0"))
+    return enabled, max_gap_s, max_segment_s
+
+
 def _classify_f0(
     values,
     *,
@@ -367,11 +379,12 @@ def detect_gender_f0_word_level(
             if s.get("words"):
                 s["words"] = [dict(word, gender=None) for word in s.get("words") or []]
         result.append(s)
+    carry_enabled, carry_max_gap_s, carry_max_segment_s = _carryover_config()
     return _apply_gender_carry_over(
         result,
-        enabled=F0_GENDER_CARRYOVER_ENABLED,
-        max_gap_s=F0_GENDER_CARRYOVER_MAX_GAP_S,
-        max_segment_s=F0_GENDER_CARRYOVER_MAX_SEGMENT_S,
+        enabled=carry_enabled,
+        max_gap_s=carry_max_gap_s,
+        max_segment_s=carry_max_segment_s,
     )
 
 
