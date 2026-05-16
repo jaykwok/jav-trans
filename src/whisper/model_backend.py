@@ -249,6 +249,7 @@ def _normalize_generation_config_for_deterministic_asr(model: Any) -> None:
 class WhisperModelBackend:
     is_subprocess = False
     accepts_contexts = False
+    supports_temperature = True
 
     def __init__(
         self,

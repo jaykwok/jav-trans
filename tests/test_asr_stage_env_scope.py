@@ -36,8 +36,14 @@ def test_asr_stage_env_scope_reaches_cache_and_transcribe(monkeypatch, tmp_path)
         }
         return f"backend:{main.os.environ['ASR_BACKEND']}"
 
-    def fake_try_load_aligned_segments(_path, _audio_key, expected_backend):
+    def fake_try_load_aligned_segments(
+        _path,
+        _audio_key,
+        expected_backend,
+        expected_signature=None,
+    ):
         seen["cache_backend"] = expected_backend
+        seen["cache_signature"] = expected_signature
         seen["cache_env"] = {
             "ASR_BACKEND": main.os.environ.get("ASR_BACKEND"),
             "ASR_CONTEXT": main.os.environ.get("ASR_CONTEXT"),
@@ -86,6 +92,7 @@ def test_asr_stage_env_scope_reaches_cache_and_transcribe(monkeypatch, tmp_path)
     assert seen["cache_env"] == expected_env
     assert seen["transcribe_env"] == expected_env
     assert seen["cache_backend"] == "backend:qwen3-asr-1.7b"
+    assert seen["cache_signature"]["backend_label"] == "backend:qwen3-asr-1.7b"
     assert artifacts.backend_label == "backend:qwen3-asr-1.7b"
     assert main.os.environ["ASR_BACKEND"] == "anime-whisper"
     assert main.os.environ["ASR_CONTEXT"] == "process actor"

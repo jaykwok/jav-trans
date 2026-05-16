@@ -119,6 +119,88 @@ def _get_whisper_generation_checkpoint_signature(
         return ""
 
 
+def _env_text(name: str, default: str = "") -> str:
+    return os.getenv(name, default).strip()
+
+
+def _env_lower(name: str, default: str = "") -> str:
+    return _env_text(name, default).lower()
+
+
+def _signature_json(payload: dict) -> str:
+    return json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+
+def _json_or_text(value: str) -> dict | str:
+    if not value:
+        return ""
+    try:
+        parsed = json.loads(value)
+    except Exception:
+        return value
+    return parsed if isinstance(parsed, dict) else value
+
+
+def _get_asr_runtime_signature(
+    *,
+    last_vad_signature: dict | None = None,
+    sliding_context_segs: int | None = None,
+) -> dict:
+    if sliding_context_segs is None:
+        try:
+            sliding_context_segs = max(0, int(os.getenv("ASR_SLIDING_CONTEXT_SEGS", "2")))
+        except (TypeError, ValueError):
+            sliding_context_segs = 2
+    whisper_generation_signature = _get_whisper_generation_checkpoint_signature(
+        sliding_context_segs=sliding_context_segs,
+    )
+    vad_signature = _LAST_VAD_SIGNATURE if last_vad_signature is None else last_vad_signature
+    return {
+        "version": 2,
+        "backend": current_asr_backend(),
+        "worker_mode": current_asr_worker_mode(),
+        "timestamp": {
+            "alignment_mode": _env_lower("ALIGNMENT_TIMESTAMP_MODE", ALIGNMENT_TIMESTAMP_MODE),
+            "whisper_mode": _env_lower("WHISPER_TIMESTAMP_MODE", "forced"),
+        },
+        "model": {
+            "asr_model_id": _env_text("ASR_MODEL_ID", ASR_MODEL_ID),
+            "asr_model_path": _env_text("ASR_MODEL_PATH", ""),
+            "asr_dtype": _env_lower("ASR_DTYPE", ASR_DTYPE),
+            "asr_attention": _env_lower("ASR_ATTENTION", "auto"),
+            "whisper_model_path": _env_text("WHISPER_MODEL_PATH", ""),
+        },
+        "language": {
+            "asr_language": _env_text("ASR_LANGUAGE", "Japanese") or "Japanese",
+            "asr_force_language": _env_lower("ASR_FORCE_LANGUAGE", "1"),
+        },
+        "context": {
+            "asr_context": _env_text("ASR_CONTEXT", ""),
+            "asr_head_context": _env_text("ASR_HEAD_CONTEXT", ""),
+            "asr_head_context_max_start_s": _env_text(
+                "ASR_HEAD_CONTEXT_MAX_START_S",
+                "16",
+            ),
+            "sliding_context_segs": sliding_context_segs,
+        },
+        "generation": {
+            "asr_max_new_tokens": _env_text("ASR_MAX_NEW_TOKENS", "128"),
+            "transcription_max_new_tokens": _env_text(
+                "TRANSCRIPTION_MAX_NEW_TOKENS",
+                _env_text("ASR_MAX_NEW_TOKENS", "128"),
+            ),
+            "asr_repetition_penalty": _env_text("ASR_REPETITION_PENALTY", "1.05"),
+            "asr_temperature_fallback": _env_lower("ASR_TEMPERATURE_FALLBACK", ""),
+            "asr_fallback_temperatures": _env_text(
+                "ASR_FALLBACK_TEMPERATURES",
+                "0.2,0.4,0.6",
+            ),
+            "whisper": _json_or_text(whisper_generation_signature),
+        },
+        "vad": vad_signature if isinstance(vad_signature, dict) else {},
+    }
+
+
 def _get_asr_checkpoint_path(
     audio_path: str,
     *,
@@ -126,20 +208,16 @@ def _get_asr_checkpoint_path(
     chunk_root: Path | str | None = None,
     sliding_context_segs: int | None = None,
 ) -> Path:
-    vad_signature = json.dumps(
-        _LAST_VAD_SIGNATURE if last_vad_signature is None else last_vad_signature,
-        sort_keys=True,
-    )
-    whisper_generation_signature = _get_whisper_generation_checkpoint_signature(
+    runtime_signature = _get_asr_runtime_signature(
+        last_vad_signature=last_vad_signature,
         sliding_context_segs=sliding_context_segs,
     )
     key = hashlib.sha1(
-        (
-            f"{audio_path}|{ASR_MODEL_ID}|{ASR_DTYPE}|"
-            f"{current_asr_worker_mode()}|{ALIGNMENT_TIMESTAMP_MODE}|{vad_signature}|"
-            f"{current_asr_backend()}|"
-            f"{os.getenv('WHISPER_TIMESTAMP_MODE', 'forced').strip().lower()}|"
-            f"{whisper_generation_signature}"
+        _signature_json(
+            {
+                "audio_path": audio_path,
+                "runtime": runtime_signature,
+            }
         ).encode()
     ).hexdigest()[:10]
     return _current_chunk_root(chunk_root).parent / f"asr_checkpoint_{key}.json"

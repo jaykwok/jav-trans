@@ -156,10 +156,20 @@ def _resume_cache_job_id(job: JobState) -> str:
         )
         if not aligned_path.exists():
             return job.id
+        cache_ctx = JobContext.from_spec(
+            job.spec,
+            cache_job_id,
+            _job_temp_dir(cache_job_id),
+            _translation_cache_path(cache_job_id),
+        )
+        backend_label, cache_signature = pipeline_main.aligned_cache_expectations_for_ctx(
+            cache_ctx,
+        )
         cached = try_load_aligned_segments(
             str(aligned_path),
             get_audio_cache_key(video_path),
-            job.spec.asr_backend,
+            backend_label,
+            cache_signature,
         )
         if cached is not None:
             return cache_job_id
@@ -341,6 +351,7 @@ async def gpu_worker() -> None:
                 _executor,
                 _run_asr_alignment_f0,
                 job,
+                cancel_event,
             )
             if cancel_event.is_set():
                 await _set_job(

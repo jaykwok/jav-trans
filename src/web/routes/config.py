@@ -114,6 +114,10 @@ async def get_config() -> dict[str, Any]:
     return {
         "backends": _ordered_backends(BACKENDS),
         "subtitle_modes": SUBTITLE_MODES,
+        "engine_defaults": {
+            "asr_backend": DEFAULT_SETTINGS.get("ASR_BACKEND", ""),
+        },
+        "recommended_asr_backend": RECOMMENDED_ASR_BACKEND,
         "defaults": {
             "asr_backend": DEFAULT_JOB_DEFAULTS["asr_backend"],
             "subtitle_mode": DEFAULT_JOB_DEFAULTS["subtitle_mode"],

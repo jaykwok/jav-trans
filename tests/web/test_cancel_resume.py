@@ -86,6 +86,11 @@ async def _test_cancel_event_reaches_asr_thread(tmp_path, monkeypatch):
 
 def test_resume_cache_job_id_requires_valid_aligned_cache(tmp_path, monkeypatch):
     monkeypatch.setattr(pm, "_job_temp_dir", lambda job_id: str(tmp_path / job_id))
+    monkeypatch.setattr(
+        pm,
+        "_translation_cache_path",
+        lambda job_id: str(tmp_path / job_id / "translation_cache.jsonl"),
+    )
 
     video_path = tmp_path / "sample.mp4"
     video_path.write_bytes(b"sample")
@@ -98,12 +103,19 @@ def test_resume_cache_job_id_requires_valid_aligned_cache(tmp_path, monkeypatch)
         video_paths=[str(video_path)],
         resume_from_job_id=old_job_id,
     )
+    cache_signature = {"sig": "ok"}
+    monkeypatch.setattr(
+        pm.pipeline_main,
+        "aligned_cache_expectations_for_ctx",
+        lambda _ctx: ("backend-label", cache_signature),
+    )
     aligned_path.write_text(
         json.dumps(
             {
-                "backend": spec.asr_backend,
+                "backend": "backend-label",
                 "audio_cache_key": "cache-key",
                 "segments": [{"start": 0.0, "end": 1.0, "text": "x"}],
+                "cache_signature": cache_signature,
             },
             ensure_ascii=False,
         ),
@@ -122,6 +134,44 @@ def test_resume_cache_job_id_requires_valid_aligned_cache(tmp_path, monkeypatch)
 
     aligned_path.write_text("{}", encoding="utf-8")
     assert pm._resume_cache_job_id(job) == new_job_id
+
+
+def test_gpu_worker_passes_captured_cancel_event_to_executor(tmp_path, monkeypatch):
+    asyncio.run(_test_gpu_worker_passes_captured_cancel_event_to_executor(tmp_path, monkeypatch))
+
+
+async def _test_gpu_worker_passes_captured_cancel_event_to_executor(tmp_path, monkeypatch):
+    monkeypatch.setattr(pm, "_jobs_path", tmp_path / "jobs.json")
+    await _reset_pm_state()
+
+    observed: list[threading.Event] = []
+    entered = asyncio.Event()
+
+    class InlineLoop:
+        async def run_in_executor(self, _executor, func, *args):
+            observed.append(args[1])
+            entered.set()
+            pm._cancel_events[args[0].id] = threading.Event()
+            raise pm.pipeline_main.PipelineCancelledError("cancelled")
+
+    monkeypatch.setattr(asyncio, "get_running_loop", lambda: InlineLoop())
+
+    worker = asyncio.create_task(pm.gpu_worker())
+    try:
+        job = (await pm.create_job(JobSpec(video_paths=["sample.mp4"])))[0]
+        old_event = pm._cancel_events[job.id]
+
+        await asyncio.wait_for(entered.wait(), timeout=2.0)
+        current = await pm.get_job(job.id)
+
+        assert observed == [old_event]
+        assert pm._cancel_events[job.id] is not old_event
+        assert current is not None
+        assert current.status == "asr"
+    finally:
+        worker.cancel()
+        await asyncio.gather(worker, return_exceptions=True)
+        await _reset_pm_state()
 
 
 def test_load_jobs_marks_active_failed_but_keeps_stage(tmp_path, monkeypatch):

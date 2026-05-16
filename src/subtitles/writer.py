@@ -62,7 +62,7 @@ _JA_PARTICLE_SPLIT_SUFFIXES = (
 _JA_BOUNDARY_STRIP_CHARS = " \t\r\n、。！？!?…"
 
 
-def _count_text_units(text: str) -> float:
+def _count_text_units(text: str, *, ascii_char_weight: float = SUBTITLE_ASCII_CHAR_WEIGHT) -> float:
     compact = _COMPACT_SPACE_RE.sub("", (text or "").strip())
     if not compact:
         return 0.0
@@ -70,7 +70,7 @@ def _count_text_units(text: str) -> float:
     units = 0.0
     for char in compact:
         if char.isascii() and char.isalnum():
-            units += SUBTITLE_ASCII_CHAR_WEIGHT
+            units += ascii_char_weight
         elif char.isascii():
             units += 0.35
         else:
@@ -88,17 +88,23 @@ def _estimate_reading_duration(
     options: SubtitleOptions | None = None,
 ) -> float:
     options = _coerce_options(options)
-    ja_units = _count_text_units(block.get("ja_text", ""))
-    zh_units = _count_text_units(block.get("zh_text", ""))
+    ja_units = _count_text_units(
+        block.get("ja_text", ""),
+        ascii_char_weight=options.ascii_char_weight,
+    )
+    zh_units = _count_text_units(
+        block.get("zh_text", ""),
+        ascii_char_weight=options.ascii_char_weight,
+    )
     primary_units = max(ja_units, zh_units)
     secondary_units = min(ja_units, zh_units)
-    total_units = primary_units + secondary_units * SUBTITLE_BILINGUAL_SECONDARY_WEIGHT
+    total_units = primary_units + secondary_units * options.bilingual_secondary_weight
 
     if total_units <= 0:
-        return MIN_SUBTITLE_DURATION
+        return options.min_duration
 
-    reading_duration = SUBTITLE_READING_BASE + total_units / SUBTITLE_READING_CPS
-    reading_duration = max(MIN_SUBTITLE_DURATION, reading_duration)
+    reading_duration = options.reading_base + total_units / options.reading_cps
+    reading_duration = max(options.min_duration, reading_duration)
     if options.max_duration > 0:
         reading_duration = min(reading_duration, options.max_duration)
     return reading_duration
@@ -114,26 +120,26 @@ def _resolve_subtitle_window(
     block = blocks[idx - 1]
     start = float(block["start"])
     raw_end = max(start, float(block["end"]))
-    if SUBTITLE_TIMELINE_MODE in {"alignment", "aligned", "raw"}:
+    if options.timeline_mode in {"alignment", "aligned", "raw"}:
         end = raw_end
         if idx < len(blocks):
             next_start = max(start + 0.05, float(blocks[idx]["start"]))
-            end = min(end, max(start + 0.05, next_start - SUBTITLE_GAP_PADDING))
+            end = min(end, max(start + 0.05, next_start - options.gap_padding))
         if options.max_duration > 0:
             end = min(end, start + options.max_duration)
-        end = max(end, start + SUBTITLE_MIN_DURATION)
+        end = max(end, start + options.min_duration)
         if idx < len(blocks):
             next_start = float(blocks[idx]["start"])
-            end = min(end, max(start + 0.05, next_start - SUBTITLE_GAP_PADDING))
+            end = min(end, max(start + 0.05, next_start - options.gap_padding))
         if end <= start:
             end = start + 0.05
         return start, end
 
     target_duration = _estimate_reading_duration(block, options=options)
     trim_cap_duration = max(
-        target_duration * SUBTITLE_DURATION_RATIO_CAP,
-        target_duration + SUBTITLE_DURATION_GRACE,
-        MIN_SUBTITLE_DURATION,
+        target_duration * options.duration_ratio_cap,
+        target_duration + options.duration_grace,
+        options.min_duration,
     )
     if options.max_duration > 0:
         trim_cap_duration = min(trim_cap_duration, options.max_duration)
@@ -142,7 +148,7 @@ def _resolve_subtitle_window(
 
     next_limit = None
     if idx < len(blocks):
-        next_limit = max(start + 0.05, float(blocks[idx]["start"]) - SUBTITLE_GAP_PADDING)
+        next_limit = max(start + 0.05, float(blocks[idx]["start"]) - options.gap_padding)
         end = min(end, next_limit)
 
     if options.max_duration > 0:
@@ -285,7 +291,7 @@ def _split_candidate_timing(
 
     left_duration = left_end - block_start
     right_duration = block_end - right_start
-    if left_duration < SUBTITLE_MIN_DURATION or right_duration < SUBTITLE_MIN_DURATION:
+    if left_duration < options.min_duration or right_duration < options.min_duration:
         return None
 
     return left_end, right_start, left_duration, right_duration
@@ -304,7 +310,7 @@ def _best_split_candidate(
         return None
 
     duration = block_end - block_start
-    target_offset = min(max(SUBTITLE_MIN_DURATION, duration / 2), options.soft_max)
+    target_offset = min(max(options.min_duration, duration / 2), options.soft_max)
     target_time = block_start + target_offset
     scored: list[tuple[float, int, int | None]] = []
     seen: set[tuple[int, int | None]] = set()
@@ -396,7 +402,7 @@ def _hard_word_split_candidate(
         score = abs(left_end - target_time)
         if left_duration > effective:
             score += 1000 + left_duration
-        if right_duration < SUBTITLE_MIN_DURATION:
+        if right_duration < options.min_duration:
             score += 500 + right_duration
         scored.append((score, split_index))
 
@@ -615,7 +621,7 @@ def _merge_adjacent_short_blocks(
     options: SubtitleOptions | None = None,
 ) -> list[dict]:
     options = _coerce_options(options)
-    if not SUBTITLE_MERGE_ADJACENT or len(blocks) < 2:
+    if not options.merge_adjacent or len(blocks) < 2:
         return list(blocks)
 
     merged: list[dict] = []

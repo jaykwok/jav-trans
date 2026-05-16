@@ -42,7 +42,7 @@ _ASR_INITIAL_PROMPT_MAX_CHARS = int(os.getenv("ASR_INITIAL_PROMPT_MAX_CHARS", "2
 _ALIGNMENT_STEP_DOWN_CHUNK_S = float(os.getenv("ALIGNMENT_STEP_DOWN_CHUNK", "6.0"))
 _ALIGNMENT_COARSE_REFINE_CHUNK_S = float(os.getenv("ALIGNMENT_COARSE_REFINE_CHUNK", "18.0"))
 _ALIGNMENT_MAX_REFINE_DEPTH = max(0, int(os.getenv("ALIGNMENT_MAX_REFINE_DEPTH", "2")))
-_ASR_HEAD_CONTEXT_MAX_START_S = float(os.getenv("ASR_HEAD_CONTEXT_MAX_START_S", "0"))
+_ASR_HEAD_CONTEXT_MAX_START_S = float(os.getenv("ASR_HEAD_CONTEXT_MAX_START_S", "16"))
 _ALIGNMENT_MIN_SPAN_MS = float(os.getenv("ALIGNMENT_MIN_SPAN_MS", "120"))
 _ALIGNMENT_MAX_ZERO_RATIO = float(os.getenv("ALIGNMENT_MAX_ZERO_RATIO", "0.55"))
 _ALIGNMENT_MAX_REPEAT_RATIO = float(os.getenv("ALIGNMENT_MAX_REPEAT_RATIO", "0.65"))
@@ -573,6 +573,8 @@ def _transcribe_asr_chunks_text_only(
             return batch_results
         if not _ASR_FALLBACK_TEMPERATURES:
             return batch_results
+        if not bool(getattr(backend, "supports_temperature", False)):
+            return batch_results
         sig_params = inspect.signature(backend.transcribe_texts).parameters
         if "temperature" not in sig_params:
             return batch_results
@@ -976,7 +978,11 @@ def _build_ASR_CONTEXT_for_chunk(chunk: dict) -> str:
     chunk_start = float(chunk.get("start", 0.0))
     head_context = _asr_head_context()
     context = _asr_context()
-    if head_context and chunk_start <= _ASR_HEAD_CONTEXT_MAX_START_S:
+    try:
+        head_context_max_start_s = float(os.getenv("ASR_HEAD_CONTEXT_MAX_START_S", "16"))
+    except (TypeError, ValueError):
+        head_context_max_start_s = _ASR_HEAD_CONTEXT_MAX_START_S
+    if head_context and chunk_start <= head_context_max_start_s:
         parts.append(head_context)
     if context:
         parts.append(context)

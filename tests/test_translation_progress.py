@@ -347,6 +347,17 @@ def test_iter_sse_json_events_parses_responses_stream():
     ]
 
 
+def test_micu_grok_stream_read_timeout_is_finite(monkeypatch):
+    monkeypatch.setenv("TRANSLATION_STREAM_READ_TIMEOUT_S", "45")
+    assert llm_patch._stream_read_timeout_s() == 45.0
+
+    monkeypatch.setenv("TRANSLATION_STREAM_READ_TIMEOUT_S", "0")
+    assert llm_patch._stream_read_timeout_s() == 1.0
+
+    monkeypatch.setenv("TRANSLATION_STREAM_READ_TIMEOUT_S", "bad")
+    assert llm_patch._stream_read_timeout_s() == 120.0
+
+
 def test_debounce_limits_fast_reasoning_events(monkeypatch):
     events: list[dict] = []
     monkeypatch.setenv("LLM_API_FORMAT", "chat")
@@ -473,4 +484,3 @@ def test_batched_progress_reaches_done_only_after_all_batches(monkeypatch):
     assert done_events == [
         {"phase": "done", "translated": 5, "expected": 5},
     ]
-

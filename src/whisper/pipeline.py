@@ -152,6 +152,14 @@ def _get_whisper_generation_checkpoint_signature() -> str:
     )
 
 
+def _get_asr_runtime_signature(last_vad_signature: dict | None = None) -> dict:
+    _sync_checkpoint_state()
+    return _checkpoint_module._get_asr_runtime_signature(
+        last_vad_signature=_LAST_VAD_SIGNATURE if last_vad_signature is None else last_vad_signature,
+        sliding_context_segs=_ASR_SLIDING_CONTEXT_SEGS,
+    )
+
+
 def _get_asr_checkpoint_path(audio_path: str) -> Path:
     _sync_checkpoint_state()
     return _checkpoint_module._get_asr_checkpoint_path(

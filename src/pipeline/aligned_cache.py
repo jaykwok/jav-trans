@@ -4,10 +4,17 @@ import json
 from pathlib import Path
 
 
+def _stable_signature(value: dict | None) -> str:
+    if not isinstance(value, dict):
+        return ""
+    return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+
 def try_load_aligned_segments(
     path: str,
     expected_audio_cache_key: str,
     expected_backend: str,
+    expected_signature: dict | None = None,
 ) -> dict | None:
     try:
         cache_path = Path(path)
@@ -20,6 +27,12 @@ def try_load_aligned_segments(
             return None
         if payload.get("backend") != expected_backend:
             return None
+        if expected_signature is not None:
+            saved_signature = payload.get("cache_signature", payload.get("signature"))
+            if not isinstance(saved_signature, dict):
+                return None
+            if _stable_signature(saved_signature) != _stable_signature(expected_signature):
+                return None
         segments = payload.get("segments")
         if not isinstance(segments, list):
             return None

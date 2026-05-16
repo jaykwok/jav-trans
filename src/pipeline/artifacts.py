@@ -41,6 +41,7 @@ class AsrArtifacts:
     f0_filtered_count: int
     f0_failed: bool
     job_id: str
+    aligned_cache_signature: dict | None = None
 
 
 TRANSLATION_ARTIFACTS_SNAPSHOT = "translation_artifacts.json"
@@ -199,6 +200,11 @@ def load_translation_artifacts_snapshot(
     values["device"] = str(values.get("device") or "cpu")
     values["backend_label"] = str(values.get("backend_label") or "")
     values["job_id"] = str(values.get("job_id") or "")
+    values["aligned_cache_signature"] = (
+        dict(values.get("aligned_cache_signature"))
+        if isinstance(values.get("aligned_cache_signature"), dict)
+        else None
+    )
     try:
         return AsrArtifacts(**values)
     except Exception:
