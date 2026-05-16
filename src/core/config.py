@@ -47,6 +47,12 @@ DEFAULT_SETTINGS: dict[str, str] = {
     "WHISPER_BEAMS": "1",
     "WHISPER_NO_REPEAT_NGRAM": "0",
     "WHISPER_MAX_NEW_TOKENS": "444",
+    # Character cap for sliding ASR prompt before tokenizer-level prompt budgeting.
+    "ASR_INITIAL_PROMPT_MAX_CHARS": "240",
+    # Max prompt tokens kept before Whisper-family generation budgeting.
+    "ASR_INITIAL_PROMPT_MAX_TOKENS": "180",
+    # Minimum output budget preserved when prompt tokens compete with Whisper's 448-token decoder window.
+    "ASR_MIN_EFFECTIVE_NEW_TOKENS": "64",
     "WHISPER_FORCED_FAIL_RATIO": "0.3",
     "WHISPER_UNLOAD_EVERY": "200",
     # Voice activity detection backend used before ASR chunking.
@@ -266,6 +272,10 @@ DEFAULT_SETTINGS: dict[str, str] = {
     "QC_MIN_GLOSSARY_HIT": "0.80",
     # Maximum allowed forced-alignment fallback ratio.
     "QC_MAX_ALIGN_FALLBACK": "0.20",
+    # Maximum ASR generation failures before quality report warning.
+    "QC_MAX_ASR_GENERATION_ERRORS": "0",
+    # Maximum Whisper decoder overflow failures before quality report warning.
+    "QC_MAX_ASR_GENERATION_OVERFLOWS": "0",
 
     # --- Speaker Diarization ---
     # 1 enables experimental speaker clustering.

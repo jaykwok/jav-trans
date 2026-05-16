@@ -58,6 +58,29 @@ def test_align_TRANSCRIPTION_results_empty_segments_placeholder():
     assert any(entry.startswith("QUARANTINED:") for entry in chunk_log)
 
 
+def test_quarantined_text_result_has_generation_error_metadata(tmp_path):
+    audio_path = tmp_path / "chunk.wav"
+    audio_path.write_bytes(b"not a real wav")
+
+    result = asr._build_quarantined_text_result(
+        {
+            "path": str(audio_path),
+            "start": 2.0,
+            "end": 5.0,
+        },
+        kind="timeout",
+        detail="worker timeout",
+        respawn_count=3,
+        run_id="run123",
+    )
+
+    assert result["duration"] == 3.0
+    assert result["asr_generation"]["error_kind"] == "timeout"
+    assert result["asr_generation"]["failure_kind"] == "timeout"
+    assert result["asr_generation"]["respawn_count"] == 3
+    assert result["asr_generation"]["run_id"] == "run123"
+
+
 def test_align_text_to_words_with_empty_aligner_result():
     words, mode = align_text_to_words(
         "missing.wav",

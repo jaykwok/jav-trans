@@ -262,10 +262,19 @@ def evaluate_asr_chunk_qc(
 
     reasons: list[str] = []
     severity = "ok"
+    asr_generation = text_result.get("asr_generation")
+    generation_error_kind = ""
+    if isinstance(asr_generation, dict):
+        generation_error_kind = str(asr_generation.get("error_kind") or "").strip()
+
+    if generation_error_kind:
+        reasons.append(f"generation_{generation_error_kind}")
+        severity = "recover" if generation_error_kind in {"timeout", "worker_error"} else "warn"
 
     if not compact and duration >= _EMPTY_DURATION_S:
         reasons.append("empty_text_for_speech_chunk")
-        severity = "warn"
+        if severity == "ok":
+            severity = "warn"
 
     if mojibake:
         reasons.append("mojibake")
@@ -331,6 +340,7 @@ def evaluate_asr_chunk_qc(
             "mojibake": mojibake,
             "max_repeat": repeat,
             "signal_quality": signal_qc,
+            "generation": asr_generation if isinstance(asr_generation, dict) else {},
         },
         "text_preview": _preview(text),
         "signal_qc": signal_qc,
@@ -360,6 +370,11 @@ def evaluate_asr_text_results_qc(
             "chunk_count": len(chunks),
             "recoverable_count": 0,
             "warning_count": 0,
+            "generation_error_count": 0,
+            "generation_overflow_count": 0,
+            "timeout_count": 0,
+            "quarantined_count": 0,
+            "empty_text_for_speech_count": 0,
             "items": [],
             "recoverable_indices": [],
             **qc_policy,
@@ -368,6 +383,11 @@ def evaluate_asr_text_results_qc(
     items: list[dict] = []
     recoverable_indices: list[int] = []
     warning_count = 0
+    generation_error_count = 0
+    generation_overflow_count = 0
+    timeout_count = 0
+    quarantined_count = 0
+    empty_text_for_speech_count = 0
 
     for index, (chunk, text_result) in enumerate(zip(chunks, text_results)):
         qc = evaluate_asr_chunk_qc(
@@ -384,7 +404,25 @@ def evaluate_asr_text_results_qc(
             **qc,
         }
         items.append(item)
-
+        reasons = set(qc.get("reasons") or [])
+        if "empty_text_for_speech_chunk" in reasons:
+            empty_text_for_speech_count += 1
+        asr_generation = text_result.get("asr_generation")
+        error_kind = ""
+        if isinstance(asr_generation, dict):
+            error_kind = str(asr_generation.get("error_kind") or "").strip()
+        if error_kind:
+            generation_error_count += 1
+            if error_kind == "overflow":
+                generation_overflow_count += 1
+            if error_kind == "timeout":
+                timeout_count += 1
+            if error_kind in {"quarantined", "timeout", "oom", "worker_error"}:
+                failure_kind = ""
+                if isinstance(asr_generation, dict):
+                    failure_kind = str(asr_generation.get("failure_kind") or "").strip()
+                if error_kind == "quarantined" or failure_kind:
+                    quarantined_count += 1
         if qc["severity"] == "recover":
             recoverable_indices.append(index)
         elif qc["severity"] == "warn":
@@ -395,6 +433,11 @@ def evaluate_asr_text_results_qc(
         "chunk_count": len(chunks),
         "recoverable_count": len(recoverable_indices),
         "warning_count": warning_count,
+        "generation_error_count": generation_error_count,
+        "generation_overflow_count": generation_overflow_count,
+        "timeout_count": timeout_count,
+        "quarantined_count": quarantined_count,
+        "empty_text_for_speech_count": empty_text_for_speech_count,
         "items": items,
         "recoverable_indices": recoverable_indices,
         **qc_policy,
@@ -413,10 +456,14 @@ def format_qc_log_items(report: dict, limit: int = 8) -> list[str]:
         metrics = item.get("metrics", {})
         repeat = metrics.get("max_repeat", {})
         reasons = ",".join(item.get("reasons", [])) or "none"
+        generation = metrics.get("generation") or {}
+        generation_suffix = ""
+        if generation.get("error_kind"):
+            generation_suffix = f", generation_error={generation.get('error_kind')}"
         lines.append(
             "ASR QC chunk {chunk_index}: severity={severity}, reasons={reasons}, "
             "duration={duration_s}s, chars={compact_chars}, cps={chars_per_sec}, "
-            "repeat={unit}x{run}, text={text_preview}".format(
+            "repeat={unit}x{run}{generation_suffix}, text={text_preview}".format(
                 chunk_index=item.get("chunk_index"),
                 severity=item.get("severity"),
                 reasons=reasons,
@@ -425,6 +472,7 @@ def format_qc_log_items(report: dict, limit: int = 8) -> list[str]:
                 chars_per_sec=metrics.get("chars_per_sec", 0.0),
                 unit=repeat.get("unit", ""),
                 run=repeat.get("run", 0),
+                generation_suffix=generation_suffix,
                 text_preview=item.get("text_preview", ""),
             )
         )

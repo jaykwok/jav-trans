@@ -44,6 +44,7 @@ class FakeOutput:
 
 
 class FakeModel:
+    config = SimpleNamespace(max_target_positions=None)
     generation_config = SimpleNamespace(no_speech_token_id=2)
 
     def __init__(self, outputs):

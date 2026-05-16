@@ -103,3 +103,45 @@ def test_f0_filtered_count_is_reported():
     report = compute_quality_report(segs, 60.0, [], 0, 2, f0_filtered_count=3)
     assert report["f0_filtered_count"] == 3
 
+
+def test_asr_generation_errors_are_reported_and_warned():
+    segs = [_seg("テスト", "测试")]
+    report = compute_quality_report(
+        segs,
+        60.0,
+        [],
+        0,
+        1,
+        asr_qc={
+            "generation_error_count": 2,
+            "generation_overflow_count": 1,
+            "timeout_count": 1,
+            "quarantined_count": 1,
+            "empty_text_for_speech_count": 1,
+        },
+    )
+
+    assert report["asr_generation_error_count"] == 2
+    assert report["asr_generation_overflow_count"] == 1
+    assert report["asr_timeout_count"] == 1
+    assert report["asr_quarantined_count"] == 1
+    assert report["asr_empty_text_for_speech_count"] == 1
+    assert any("asr_generation_error_count" in warning for warning in report["warnings"])
+    assert any("asr_generation_overflow_count" in warning for warning in report["warnings"])
+
+
+def test_empty_segments_keep_asr_qc_counts():
+    report = compute_quality_report(
+        [],
+        60.0,
+        [],
+        0,
+        0,
+        asr_qc={"generation_error_count": 1, "generation_overflow_count": 1},
+    )
+
+    assert report["asr_generation_error_count"] == 1
+    assert report["asr_generation_overflow_count"] == 1
+    assert any("asr_generation_error_count" in warning for warning in report["warnings"])
+    assert any("asr_generation_overflow_count" in warning for warning in report["warnings"])
+

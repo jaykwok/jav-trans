@@ -1024,12 +1024,21 @@ def _sliding_context_result_text(text_result: dict) -> str:
 
 
 def _truncate_initial_prompt(prompt: str) -> str:
-    if _ASR_INITIAL_PROMPT_MAX_CHARS <= 0:
+    try:
+        max_chars = int(
+            os.getenv(
+                "ASR_INITIAL_PROMPT_MAX_CHARS",
+                str(_ASR_INITIAL_PROMPT_MAX_CHARS),
+            )
+        )
+    except (TypeError, ValueError):
+        max_chars = _ASR_INITIAL_PROMPT_MAX_CHARS
+    if max_chars <= 0:
         return ""
-    if len(prompt) <= _ASR_INITIAL_PROMPT_MAX_CHARS:
+    if len(prompt) <= max_chars:
         return prompt
 
-    cut_pos = len(prompt) - _ASR_INITIAL_PROMPT_MAX_CHARS
+    cut_pos = len(prompt) - max_chars
     truncated = prompt[cut_pos:]
     # only advance to next word boundary when we cut mid-word
     if cut_pos > 0 and not prompt[cut_pos - 1].isspace():

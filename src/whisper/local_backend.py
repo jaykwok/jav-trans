@@ -263,6 +263,62 @@ def _callable_accepts_kwarg(func, name: str) -> bool:
     )
 
 
+def _asr_max_new_tokens() -> int:
+    try:
+        return max(64, int(os.getenv("ASR_MAX_NEW_TOKENS", str(ASR_MAX_NEW_TOKENS))))
+    except (TypeError, ValueError):
+        return ASR_MAX_NEW_TOKENS
+
+
+def _transcription_max_new_tokens() -> int:
+    try:
+        fallback = str(_asr_max_new_tokens())
+        return max(32, int(os.getenv("TRANSCRIPTION_MAX_NEW_TOKENS", fallback)))
+    except (TypeError, ValueError):
+        return TRANSCRIPTION_MAX_NEW_TOKENS
+
+
+def _transcription_timeout_s() -> float:
+    try:
+        return float(os.getenv("TRANSCRIPTION_TIMEOUT_S", str(TRANSCRIPTION_TIMEOUT_S)))
+    except (TypeError, ValueError):
+        return TRANSCRIPTION_TIMEOUT_S
+
+
+def _asr_language() -> str:
+    return os.getenv("ASR_LANGUAGE", ASR_LANGUAGE).strip() or "Japanese"
+
+
+def _asr_force_language() -> bool:
+    return os.getenv("ASR_FORCE_LANGUAGE", "1").strip().lower() not in {
+        "0",
+        "false",
+        "no",
+        "off",
+    }
+
+
+def _asr_context() -> str:
+    return os.getenv("ASR_CONTEXT", ASR_CONTEXT).strip()
+
+
+def _qwen_generation_metadata(
+    *,
+    error_kind: str | None = None,
+    error_detail: str = "",
+    worker_mode: str = "inproc",
+) -> dict:
+    return {
+        "backend": "qwen3-asr-1.7b",
+        "configured_max_new_tokens": _transcription_max_new_tokens(),
+        "model_max_target_positions": None,
+        "policy": "qwen_transcribe_limit",
+        "worker_mode": worker_mode,
+        "error_kind": error_kind,
+        "error_detail": error_detail,
+    }
+
+
 def merge_master_with_timestamps(master_text: str, timestamps) -> list[dict]:
     if not master_text or not master_text.strip():
         return []
@@ -516,7 +572,7 @@ class LocalAsrBackend:
             "dtype": self.dtype,
             "device_map": self.device,
             "max_inference_batch_size": ASR_BATCH_SIZE,
-            "max_new_tokens": ASR_MAX_NEW_TOKENS,
+            "max_new_tokens": _asr_max_new_tokens(),
         }
 
         if self.attention and self.attention != "sdpa":
@@ -784,6 +840,7 @@ class LocalAsrBackend:
             "duration": duration,
             "language": detected_language,
             "normalized_path": normalized_path,
+            "asr_generation": _qwen_generation_metadata(),
         }, log
 
     def transcribe_texts(
@@ -805,8 +862,8 @@ class LocalAsrBackend:
             )
 
         normalized_paths = [str(Path(audio_path).resolve()) for audio_path in audio_paths]
-        language_hint = ASR_LANGUAGE if ASR_FORCE_LANGUAGE else None
-        request_contexts = contexts if contexts is not None else [ASR_CONTEXT] * len(normalized_paths)
+        language_hint = _asr_language() if _asr_force_language() else None
+        request_contexts = contexts if contexts is not None else [_asr_context()] * len(normalized_paths)
         if len(request_contexts) != len(normalized_paths):
             raise ValueError(
                 f"context count mismatch: audio_paths={len(normalized_paths)}, contexts={len(request_contexts)}"
@@ -819,7 +876,7 @@ class LocalAsrBackend:
             "return_time_stamps": False,
         }
         if _callable_accepts_kwarg(self.model.transcribe, "max_new_tokens"):
-            transcribe_kwargs["max_new_tokens"] = TRANSCRIPTION_MAX_NEW_TOKENS
+            transcribe_kwargs["max_new_tokens"] = _transcription_max_new_tokens()
 
         asr_results = None
         executor = None
@@ -832,13 +889,14 @@ class LocalAsrBackend:
                 **transcribe_kwargs,
             )
             try:
-                asr_results = future.result(timeout=TRANSCRIPTION_TIMEOUT_S)
+                timeout_s = _transcription_timeout_s()
+                asr_results = future.result(timeout=timeout_s)
             except concurrent.futures.TimeoutError:
                 timed_out = True
                 future.cancel()
                 _notify(
                     on_stage,
-                    f"[WARN] ASR 超时 ({TRANSCRIPTION_TIMEOUT_S}s)，跳过当前批次",
+                    f"[WARN] ASR 超时 ({_transcription_timeout_s()}s)，跳过当前批次",
                 )
                 return [
                     {
@@ -847,8 +905,12 @@ class LocalAsrBackend:
                         "duration": _get_wav_duration(path),
                         "language": language_hint or "Japanese",
                         "normalized_path": path,
+                        "asr_generation": _qwen_generation_metadata(
+                            error_kind="timeout",
+                            error_detail=f"skipped after {_transcription_timeout_s()}s",
+                        ),
                         "log": [
-                            f"TIMEOUT: skipped after {TRANSCRIPTION_TIMEOUT_S}s"
+                            f"TIMEOUT: skipped after {_transcription_timeout_s()}s"
                         ],
                     }
                     for path in normalized_paths
@@ -861,7 +923,7 @@ class LocalAsrBackend:
                     asr_result,
                     language_hint,
                 )
-                payload_log.append(f"ASR 文本生成上限: {TRANSCRIPTION_MAX_NEW_TOKENS}")
+                payload_log.append(f"ASR 文本生成上限: {_transcription_max_new_tokens()}")
                 payload["log"] = payload_log
                 payloads.append(payload)
         finally:
@@ -1302,7 +1364,7 @@ class SubprocessAsrBackend:
         assert self._conn is not None
 
         if contexts is None:
-            request_contexts = [ASR_CONTEXT] * len(audio_paths)
+            request_contexts = [_asr_context()] * len(audio_paths)
         elif len(contexts) != len(audio_paths):
             raise ValueError(
                 f"context count mismatch: audio_paths={len(audio_paths)}, contexts={len(contexts)}"
@@ -1331,12 +1393,13 @@ class SubprocessAsrBackend:
                 f"worker send failed exitcode={exitcode}: {exc!r}",
             )
             self._raise_after_worker_restart(failure, cause=exc, on_stage=on_stage)
-        deadline = time.monotonic() + TRANSCRIPTION_TIMEOUT_S
+        timeout_s = _transcription_timeout_s()
+        deadline = time.monotonic() + timeout_s
 
         while True:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
-                detail = f"worker timeout after {TRANSCRIPTION_TIMEOUT_S}s"
+                detail = f"worker timeout after {timeout_s}s"
                 self._raise_after_worker_restart(
                     WorkerTimeoutError(detail),
                     on_stage=on_stage,
@@ -1391,6 +1454,12 @@ class SubprocessAsrBackend:
                         WorkerTimeoutError("worker returned TIMEOUT payload"),
                         on_stage=on_stage,
                     )
+                for result in results:
+                    if isinstance(result, dict) and isinstance(
+                        result.get("asr_generation"),
+                        dict,
+                    ):
+                        result["asr_generation"]["worker_mode"] = "subprocess"
                 return results
 
             if op == "error":
