@@ -142,6 +142,10 @@ DEFAULT_SETTINGS: dict[str, str] = {
     # Spans with RMS energy below this dBFS level are candidates for dropping.
     # Both duration and energy thresholds must be met (AND logic).
     "ASR_CHUNK_DROP_RMS_DBFS": "-40.0",
+    # 1 caches VAD/chunk boundaries separately from ASR generation settings.
+    "VAD_CHUNK_CACHE_ENABLED": "1",
+    # Persistent VAD/chunk boundary cache directory.
+    "VAD_CHUNK_CACHE_DIR": "./temp/vad-cache",
 
     # --- WhisperSeg VAD Settings ---
     # Speech probability threshold; lower catches more speech and more noise.

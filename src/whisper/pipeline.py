@@ -10,6 +10,7 @@ from whisper import checkpoint as _checkpoint_module
 from whisper import chunking as _chunking_module
 from whisper import recovery as _recovery_module
 from whisper import transcribe as _transcribe_module
+from whisper import vad_chunk_cache as _vad_chunk_cache_module
 from whisper.backends import registry as _registry_module
 
 warnings.filterwarnings("ignore")
@@ -19,6 +20,7 @@ _chunking_module = importlib.reload(_chunking_module)
 _checkpoint_module = importlib.reload(_checkpoint_module)
 _transcribe_module = importlib.reload(_transcribe_module)
 _recovery_module = importlib.reload(_recovery_module)
+_vad_chunk_cache_module = importlib.reload(_vad_chunk_cache_module)
 
 ASR_BACKEND = _registry_module.current_asr_backend()
 WHISPER_TIMESTAMP_MODE = _checkpoint_module.os.getenv(
@@ -33,6 +35,7 @@ _VALID_ASR_WORKER_MODES = _registry_module._VALID_ASR_WORKER_MODES
 _ASR_CHUNK_ROOT = _chunking_module._ASR_CHUNK_ROOT
 _KEEP_ASR_CHUNKS = _chunking_module._KEEP_ASR_CHUNKS
 _LAST_VAD_SIGNATURE: dict = _chunking_module._LAST_VAD_SIGNATURE
+_LAST_VAD_CACHE_EVENT: dict | None = None
 _ASR_SLIDING_CONTEXT_SEGS = _transcribe_module._ASR_SLIDING_CONTEXT_SEGS
 _ASR_CHECKPOINT_ENABLED = _transcribe_module._ASR_CHECKPOINT_ENABLED
 
@@ -252,17 +255,66 @@ def _drop_short_low_energy_spans(
     return kept
 
 
+def _set_last_vad_signature(signature: dict) -> None:
+    global _LAST_VAD_SIGNATURE
+    _LAST_VAD_SIGNATURE = dict(signature)
+    _chunking_module._LAST_VAD_SIGNATURE = _LAST_VAD_SIGNATURE
+    _sync_checkpoint_state()
+
+
+def _set_last_vad_cache_event(event: dict | None) -> None:
+    global _LAST_VAD_CACHE_EVENT
+    _LAST_VAD_CACHE_EVENT = dict(event) if isinstance(event, dict) else None
+
+
+def _display_cache_path(path: str) -> str:
+    try:
+        return str(Path(path).resolve().relative_to(Path.cwd().resolve()))
+    except Exception:
+        return str(path)
+
+
+def _vad_cache_log_entry(event: dict | None) -> str | None:
+    if not event:
+        return None
+    status = str(event.get("status") or "")
+    path = _display_cache_path(str(event.get("path") or ""))
+    digest = str(event.get("digest") or "")
+    if status == "hit":
+        return f"VAD chunk cache hit: path={path} digest={digest}"
+    if status == "miss":
+        return f"VAD chunk cache saved: path={path} digest={digest}"
+    return None
+
+
 def _build_processing_spans(
     audio_path: str,
 ) -> list[tuple[float, float]] | list[PackedChunk]:
-    global _LAST_VAD_SIGNATURE
     cfg = _chunk_config()
-    if cfg["packing_enabled"]:
-        from vad import get_vad_backend
+    from vad import get_vad_backend
 
-        vad = get_vad_backend()
+    _set_last_vad_cache_event(None)
+    vad = get_vad_backend()
+    vad_signature = vad.signature()
+    cached = _vad_chunk_cache_module.load_processing_spans(
+        audio_path,
+        vad_signature=vad_signature,
+        chunk_config=cfg,
+    )
+    if cached is not None:
+        spans, runtime_vad_signature, event = cached
+        _set_last_vad_signature(runtime_vad_signature)
+        _pipeline_logger.info(
+            "[vad-cache] hit path=%s digest=%s",
+            event["path"],
+            event["digest"],
+        )
+        _set_last_vad_cache_event(event)
+        return spans
+
+    if cfg["packing_enabled"]:
         result = vad.segment(audio_path)
-        _LAST_VAD_SIGNATURE = {
+        runtime_vad_signature = {
             **result.parameters,
             "chunk_packing": {
                 "enabled": True,
@@ -271,11 +323,27 @@ def _build_processing_spans(
                 "padding_s": cfg["pack_padding_s"],
             },
         }
-        _chunking_module._LAST_VAD_SIGNATURE = _LAST_VAD_SIGNATURE
-        _sync_checkpoint_state()
+        _set_last_vad_signature(runtime_vad_signature)
         segments = result.segments
         if not segments:
-            return [(0.0, result.audio_duration_sec)]
+            spans = [(0.0, result.audio_duration_sec)]
+            event = _vad_chunk_cache_module.save_processing_spans(
+                audio_path,
+                vad_signature=vad_signature,
+                chunk_config=cfg,
+                processing_spans=spans,
+                runtime_vad_signature=runtime_vad_signature,
+                vad_segments=result.segments,
+                vad_groups=result.groups,
+            )
+            if event is not None:
+                _pipeline_logger.info(
+                    "[vad-cache] saved path=%s digest=%s",
+                    event["path"],
+                    event["digest"],
+                )
+                _set_last_vad_cache_event(event)
+            return spans
         if cfg["drop_enabled"]:
             segments = _drop_short_low_energy_spans(audio_path, segments)
         packed = pack_vad_segments(
@@ -284,13 +352,46 @@ def _build_processing_spans(
             gap_merge_s=cfg["pack_gap_merge_s"],
             padding_s=cfg["pack_padding_s"],
         )
+        event = _vad_chunk_cache_module.save_processing_spans(
+            audio_path,
+            vad_signature=vad_signature,
+            chunk_config=cfg,
+            processing_spans=packed,
+            runtime_vad_signature=runtime_vad_signature,
+            vad_segments=result.segments,
+            vad_groups=result.groups,
+        )
+        if event is not None:
+            _pipeline_logger.info(
+                "[vad-cache] saved path=%s digest=%s",
+                event["path"],
+                event["digest"],
+            )
+            _set_last_vad_cache_event(event)
         return packed
 
-    spans = _chunking_module._build_processing_spans(audio_path)
-    _LAST_VAD_SIGNATURE = _chunking_module._LAST_VAD_SIGNATURE
-    _sync_checkpoint_state()
+    result = vad.segment(audio_path)
+    runtime_vad_signature = dict(result.parameters)
+    _set_last_vad_signature(runtime_vad_signature)
+    spans = [(group[0].start, group[-1].end) for group in result.groups]
+    if not spans:
+        spans = [(0.0, result.audio_duration_sec)]
     if cfg["drop_enabled"]:
         spans = _drop_short_low_energy_spans(audio_path, spans)
+    event = _vad_chunk_cache_module.save_processing_spans(
+        audio_path,
+        vad_signature=vad_signature,
+        chunk_config=cfg,
+        processing_spans=spans,
+        runtime_vad_signature=runtime_vad_signature,
+    )
+    if event is not None:
+        _pipeline_logger.info(
+            "[vad-cache] saved path=%s digest=%s",
+            event["path"],
+            event["digest"],
+        )
+        _set_last_vad_cache_event(event)
     return spans
 
 
@@ -353,6 +454,9 @@ def _transcribe_and_align_local(
         _notify("分析静音并切分音频...")
         split_started = time.perf_counter()
         chunk_spans = _build_processing_spans(audio_path)
+        cache_log_entry = _vad_cache_log_entry(_LAST_VAD_CACHE_EVENT)
+        if cache_log_entry:
+            log.append(cache_log_entry)
         chunk_dir, chunk_infos = _extract_wav_chunks(
             audio_path, _span_boundaries(chunk_spans), on_stage=on_stage
         )

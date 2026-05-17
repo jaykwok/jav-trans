@@ -197,6 +197,12 @@ _ASR_STAGE_ADVANCED_KEYS = {
     "ASR_BATCH_SIZE",
     "ALIGNER_BATCH_SIZE",
     "KEEP_ASR_CHUNKS",
+    "VAD_CHUNK_CACHE_DIR",
+    "VAD_CHUNK_CACHE_ENABLED",
+}
+_ASR_STAGE_CACHE_NEUTRAL_KEYS = {
+    "VAD_CHUNK_CACHE_DIR",
+    "VAD_CHUNK_CACHE_ENABLED",
 }
 
 
@@ -279,7 +285,11 @@ def _asr_stage_config_signature_for_env() -> dict:
             "ASR_LONG_CHUNK_PROFILE",
         }
     }
-    return {name: os.getenv(name, "") for name in sorted(names)}
+    return {
+        name: os.getenv(name, "")
+        for name in sorted(names)
+        if name not in _ASR_STAGE_CACHE_NEUTRAL_KEYS
+    }
 
 
 def _f0_signature_for_ctx(ctx: JobContext) -> dict:
