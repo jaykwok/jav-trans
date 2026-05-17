@@ -68,9 +68,12 @@ API_KEY=你的翻译_API_KEY
 OPENAI_COMPATIBILITY_BASE_URL=https://api.deepseek.com
 LLM_MODEL_NAME=deepseek-chat
 LLM_API_FORMAT=chat
+LLM_REASONING_EFFORT=xhigh
+TARGET_LANG=简体中文
 ```
 
 `LLM_API_FORMAT` 默认为 `chat`，走 OpenAI Chat Completions 兼容格式；需要使用 OpenAI Responses API 兼容格式时改为 `responses`。
+`.env` 主要保存跨任务持久配置，例如 API、模型名、HF 镜像、术语表和演员名提示。视频路径、输出目录、ASR 后端、字幕模式、batch/worker、是否保留临时文件等任务级参数由网页表单传入，不建议写进 `.env`。
 
 *(可选)* 如果国内网络下载 AI 模型速度较慢，可以在 `.env` 中加入这行来加速下载：
 ```env
@@ -95,17 +98,37 @@ HF_ENDPOINT=https://hf-mirror.com
 ## 🛠️ 主要功能特点
 
 - **小白友好的网页界面**：所有的模型选择、字幕格式、并发设置都可以通过网页轻松配置。
-- **断点续传与缓存**：支持任务意外中断后的恢复，长视频处理不再担惊受怕。
-- **懂二次元的识别模型**：内置了多种针对日语/动漫优化的语音识别模型（推荐默认首选的 `whisper-ja-anime-v0.3`）。
-- **翻译前噪声过滤**：在提交给 LLM 前过滤空字幕、纯引号片段和纯英文 ASR 幻觉 token，减少无效翻译请求。
-- **智能性别区分**：能根据声音特征分辨男女角色，让对话翻译更加生动准确。
+- **断点续传与多层缓存**：支持音频缓存、ASR checkpoint、`aligned_segments.json` 复用、翻译 cache，以及独立的 VAD/chunk 边界缓存；只改 ASR prompt/token 参数时可复用 VAD 切分结果。
+- **懂二次元的识别模型**：支持 `anime-whisper`、`whisper-ja-anime-v0.3`、`whisper-ja-1.5b`、`qwen3-asr-1.7b`。引擎默认仍是 `anime-whisper`，Web 推荐首选 `whisper-ja-anime-v0.3`。
+- **WhisperSeg VAD + 长 chunk 流程**：默认使用 WhisperSeg，阈值 `0.35`；开启 VAD chunk packing，将相邻语音段打包成更适合 Whisper/forced alignment 的长 chunk。
+- **ASR generation budget 防溢出**：Whisper 系列会根据 decoder 窗口、forced decoder ids、prompt tokens 动态裁剪 prompt 和 `max_new_tokens`，质量报告会统计 overflow/error/timeout/quarantine。
+- **翻译前噪声过滤**：在提交给 LLM 前过滤空字幕、纯引号片段、纯英文幻觉 token 和纯特殊符号片段，减少无效翻译请求。
+- **智能性别区分**：forced alignment 后执行词级 F0 性别检测，并根据 gender turn 重新切分字幕，让对话翻译更加稳定。
 - **高自由度翻译**：支持接入任何兼容 OpenAI 接口的大语言模型，甚至可以设置特定词汇的“术语表”。
+- **质量报告与运行日志**：可在网页中开启运行日志和质量报告，便于复测 ASR generation 计数、字幕质量 warning 和性能耗时。
+
+## ⚙️ 当前默认流程
+
+当前主流水线为：
+
+```text
+视频 -> 音频准备 -> WhisperSeg VAD -> VAD chunk packing -> ASR -> Forced Alignment
+-> 词级 F0 性别检测 -> gender turn 重切段 -> 翻译前 ASR 噪声过滤
+-> LLM 翻译 -> SRT / quality report
+```
+
+常用缓存位置：
+
+- `temp/vad-cache/`：VAD/chunk 边界缓存，只绑定音频指纹、VAD 参数和 chunk/drop/merge 参数，不绑定 ASR prompt/token 参数。
+- 当前任务临时目录：音频缓存、ASR checkpoint、`aligned_segments.json`、翻译 cache、质量报告和运行日志。
+- `models/`：HuggingFace 模型缓存。
 
 ## 💡 给开发者的说明
 
 如果您是开发者并希望深入了解或修改项目：
 - 核心后端逻辑位于 `src/main.py`、`src/core/`、`src/pipeline/`、`src/whisper/`、`src/llm/`、`src/audio/` 等子模块。
 - Web 接口和页面由 `src/web/` 提供，采用 FastAPI。
+- 默认配置集中在 `src/core/config.py`，本地 `.env` 只覆盖跨任务持久配置；Web 任务级参数通过 `JobSpec -> JobContext` 显式传入后端。
 - 本项目引入的部分第三方代码（例如 `src/vad/whisperseg`）保留了其原始的许可证，请遵循相应协议。
 
 ### 构建 Windows Release
