@@ -1,4 +1,5 @@
 import contextlib
+import ctypes.util
 import io
 import os
 import re
@@ -108,30 +109,25 @@ def _load_silero_vad():
 
 
 def _load_audio_for_vad(audio_path: str):
-    import torchaudio
+    import torch
 
-    waveform, sample_rate = torchaudio.load(audio_path)
-    if waveform.ndim > 1:
-        waveform = waveform.mean(dim=0)
-    waveform = waveform.contiguous()
-    if sample_rate not in {8000, 16000}:
-        waveform = torchaudio.functional.resample(waveform, sample_rate, 16000)
-        sample_rate = 16000
+    from audio.loading import load_audio_16k_mono
+
+    audio, sample_rate = load_audio_16k_mono(audio_path)
+    waveform = torch.from_numpy(audio).contiguous()
     return waveform, sample_rate
 
 
 def _detect_speech_spans_ten_vad(audio_path: str) -> tuple[list[tuple[float, float]], str]:
     try:
         import numpy as np
-        import torchaudio
+        if ctypes.util.find_library("c++") is None:
+            return [], "libc++.so.1 not available for TEN VAD"
         from ten_vad import TenVad
 
         waveform, sample_rate = _load_audio_for_vad(audio_path)
         if waveform.numel() == 0:
             return [], "empty audio"
-        if sample_rate != 16000:
-            waveform = torchaudio.functional.resample(waveform, sample_rate, 16000)
-            sample_rate = 16000
 
         samples = waveform.detach().cpu().numpy()
         samples = np.squeeze(samples)
