@@ -273,7 +273,6 @@ AC-1~4 全 ✅，新增 `chunk_packer.py`，pipeline 接入 packing，`gender_sp
 
 - ONNX CUDA smoke 已通过：WhisperSeg `model.onnx` 可创建 `CUDAExecutionProvider` session，日志显示 `device=GPU (CUDA)`、`providers=['CUDAExecutionProvider', 'CPUExecutionProvider']`。
 - 全量回归已通过：`.venv/bin/python -m compileall -q src tests`；`.venv/bin/python -m pytest` 为 `359 passed, 5 skipped`。
-- 性能收益仍需 SORA-575 复测确认：ONNX GPU 可用性已解决，但 VAD 阶段是否从 310.99s 明显下降需要全片或长片段复测。
 - SORA-575 `anime-whisper` 全量中日双语复测通过：总耗时 649.54s；WhisperSeg 使用 `CUDAExecutionProvider`，VAD/切块 9.32s；ASR+Alignment 266.00s；输出 578 条字幕。
 - 质量报告确认：`asr_generation_overflow_count=0`、`asr_generation_error_count=0`、`asr_timeout_count=0`、`asr_quarantined_count=0`。
 - 对比 T-AK：总耗时 729.36s → 649.40s；ASR+Alignment 430.61s → 266.00s；F0 split 后字幕 396 → 578。
@@ -282,11 +281,14 @@ AC-1~4 全 ✅，新增 `chunk_packer.py`，pipeline 接入 packing，`gender_sp
 - TEN VAD 增加 `libc++.so.1` 预检；缺失时返回简短 `vad_error`，避免 `TenVad.__del__` 析构异常刷屏。
 - 新增回归测试：`tests/test_ten_vad_backend.py` 覆盖 libc++ 缺失路径。
 - 噪声修复验证：compileall 通过；F0/TEN/timestamp 相关定向回归 18 passed, 1 skipped；ASR/VAD 相关定向回归 18 passed。
+- `whisper-ja-anime-v0.3`、`whisper-ja-1.5b`、`qwen3-asr-1.7b` 短片段与 SORA-575 前 5 分钟 smoke 均通过，Whisper 系列 generation overflow/error 为 0，Qwen generation metadata/QC 正常。
+- VAD/chunk cache 已实现：新增 `src/whisper/vad_chunk_cache.py`，缓存 VAD 边界与 chunk packing 结果到 `VAD_CHUNK_CACHE_DIR`，不缓存 chunk wav；cache signature 只覆盖 audio fingerprint、VAD 参数与 chunk/drop/merge 参数，不包含 ASR prompt/token/generation 参数。
+- VAD/chunk cache 验证：SORA-575 前 5 分钟 `whisper-ja-anime-v0.3` baseline 写入 cache，改 `ASR_INITIAL_PROMPT_MAX_CHARS=160` 后 aligned cache miss、ASR 继续重跑，但 VAD chunk cache hit，静音分析与切块 2.34s → 0.01s；日志 `agents/temp/tal-vad-cache-smoke-v3.run.log`，汇总 `agents/temp/tal-vad-cache-smoke/summary.json`。
+- VAD/chunk cache 回归：compileall 通过；`tests/test_vad_chunk_cache.py` 等 ASR/VAD/cache 定向 31 passed。
 
 **T-AL 剩余验证 / Backlog：**
 
-- `whisper-ja-anime-v0.3`、`whisper-ja-1.5b`、`qwen3-asr-1.7b` 各跑短片段 smoke，确认 Whisper 系列 0 overflow，Qwen metadata/QC 计数正常。
-- 继续评估 VAD/chunk cache：只改 ASR prompt/token 参数时可复用 VAD 切分，避免重复 300s 级 VAD 成本。
+- 低优先级：Windows 生产环境 default-on 验证（RTX 4060 Ti 8GB，确认 CUDA、模型串行加载、cache 和输出行为）。
 
 <details>
 <summary>B1–B7 已完成记录</summary>
