@@ -26,6 +26,15 @@ def test_detect_speech_spans_ten_vad_silent_wav(tmp_path):
     assert error == ""
 
 
+def test_detect_speech_spans_ten_vad_skips_when_libcxx_missing(monkeypatch):
+    monkeypatch.setattr(timestamp_fallback.ctypes.util, "find_library", lambda _name: None)
+
+    spans, error = timestamp_fallback._detect_speech_spans_ten_vad("audio.wav")
+
+    assert spans == []
+    assert error == "libc++.so.1 not available for TEN VAD"
+
+
 def test_detect_speech_spans_uses_ten_vad_when_enabled(monkeypatch):
     calls = {"ten": 0, "silero": 0}
 
@@ -78,4 +87,3 @@ def test_detect_speech_spans_uses_silero_when_ten_disabled(monkeypatch):
 
     assert spans == [(0.1, 0.4)]
     assert error == ""
-

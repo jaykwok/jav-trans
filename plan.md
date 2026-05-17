@@ -274,10 +274,17 @@ AC-1~4 全 ✅，新增 `chunk_packer.py`，pipeline 接入 packing，`gender_sp
 - ONNX CUDA smoke 已通过：WhisperSeg `model.onnx` 可创建 `CUDAExecutionProvider` session，日志显示 `device=GPU (CUDA)`、`providers=['CUDAExecutionProvider', 'CPUExecutionProvider']`。
 - 全量回归已通过：`.venv/bin/python -m compileall -q src tests`；`.venv/bin/python -m pytest` 为 `359 passed, 5 skipped`。
 - 性能收益仍需 SORA-575 复测确认：ONNX GPU 可用性已解决，但 VAD 阶段是否从 310.99s 明显下降需要全片或长片段复测。
+- SORA-575 `anime-whisper` 全量中日双语复测通过：总耗时 649.54s；WhisperSeg 使用 `CUDAExecutionProvider`，VAD/切块 9.32s；ASR+Alignment 266.00s；输出 578 条字幕。
+- 质量报告确认：`asr_generation_overflow_count=0`、`asr_generation_error_count=0`、`asr_timeout_count=0`、`asr_quarantined_count=0`。
+- 对比 T-AK：总耗时 729.36s → 649.40s；ASR+Alignment 430.61s → 266.00s；F0 split 后字幕 396 → 578。
+- 已生成逐句字幕对比报告：`reports/SORA-575.subtitle_compare.html`，包含 T-AL 当前字幕、T-AK 时间重叠对照、词级时间轴。
+- 修复 TorchCodec/libavutil 噪声：`src/whisper/timestamp_fallback.py` 的 `_load_audio_for_vad()` 改用 `soundfile` 路径 `load_audio_16k_mono()`，不再触发 `torchaudio.load()` / TorchCodec FFmpeg 探测栈。
+- TEN VAD 增加 `libc++.so.1` 预检；缺失时返回简短 `vad_error`，避免 `TenVad.__del__` 析构异常刷屏。
+- 新增回归测试：`tests/test_ten_vad_backend.py` 覆盖 libc++ 缺失路径。
+- 噪声修复验证：compileall 通过；F0/TEN/timestamp 相关定向回归 18 passed, 1 skipped；ASR/VAD 相关定向回归 18 passed。
 
 **T-AL 剩余验证 / Backlog：**
 
-- SORA-575 使用 `anime-whisper` 全量中日双语复测，验收标准：ASR overflow error 为 0，质量报告中 `asr_generation_overflow_count=0`。
 - `whisper-ja-anime-v0.3`、`whisper-ja-1.5b`、`qwen3-asr-1.7b` 各跑短片段 smoke，确认 Whisper 系列 0 overflow，Qwen metadata/QC 计数正常。
 - 继续评估 VAD/chunk cache：只改 ASR prompt/token 参数时可复用 VAD 切分，避免重复 300s 级 VAD 成本。
 
