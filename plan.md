@@ -59,7 +59,7 @@
 
 ## 2. 配置边界
 
-### 2.1 `.env` 只保留跨任务持久配置
+### 2.1 `.env` 只保留跨任务持久配置和默认偏好
 
 - `API_KEY`
 - `OPENAI_COMPATIBILITY_BASE_URL`
@@ -70,8 +70,18 @@
 - `HF_ENDPOINT`
 - `TRANSLATION_GLOSSARY`
 - `ASR_CONTEXT`
+- `ASR_BACKEND`
+- `ASR_VAD_BACKEND`
+- `ASR_LONG_CHUNK_PROFILE`
+- `ASR_CHUNK_PACK*`
+- `WHISPERSEG_*`
+- `VAD_CHUNK_CACHE_*`
+- `ASR_QC_ADAPTIVE_*`
+- `F0_GENDER_*`
 
-视频路径、输出目录、ASR 后端、字幕模式、batch/worker、是否保留临时文件等任务级参数由 `JobSpec -> JobContext` 显式传入后端，不再依赖全局 `.env` 热覆盖。
+`.env` 按翻译服务、翻译偏好、模型下载、ASR 默认后端、VAD/chunk/cache、adaptive ASR QC、F0/gender 和质量报告分组注释。旧 `ASR_PRECISION_MODE`、`ASR_DROP_UNCERTAIN_ENABLED`、`ASR_QC_STRICT_*` 不再使用。
+
+视频路径、输出目录、字幕模式、batch/worker、是否保留临时文件等任务级参数由 `JobSpec -> JobContext` 显式传入后端，不再依赖全局 `.env` 热覆盖；Web 表单可按任务覆盖 `.env` 中的默认 ASR 偏好。
 
 ### 2.2 路径与缓存
 
@@ -109,6 +119,7 @@
 | T-AM | 删除 ASR recovery / temperature fallback / prompt overflow retry，并清理前端旧 ASR Recovery 控件；早期固定阈值 precision 方案后续被 adaptive-only 替换 | 后端全量 `365 passed, 5 skipped`；前端/Web 定向 `13 passed` |
 | T-AN | adaptive precision ASR 默认化：保留硬幻觉拒绝，低风险低 `avg_logprob` 对白自适应放宽 | 定向回归 `68 passed`；Oni Chichi BDRIP 5min smoke：adaptive drops 2，overflow/error/timeout/quarantine 为 0 |
 | T-AO | 默认 ASR 切为 `whisper-ja-anime-v0.3`；新增 `video/test` 通用测试集评测工具；删除 strict/normal ASR 精度模式，只保留 adaptive precision | 全量 `.venv/bin/python -m pytest -q` 为 `373 passed, 5 skipped` |
+| T-AP | 本地 `.env` 适配当前默认流程并按同类参数归类注释；README/plan 同步 `.env` 边界 | dotenv 解析通过；关键 adaptive/default ASR 配置齐全；旧 strict 配置不存在 |
 
 ### T-AL 关键验证记录
 
@@ -145,6 +156,13 @@
 - 删除 ASR 精度模式开关：不再读取 `ASR_PRECISION_MODE`，不再保留 strict/normal 分支；`ASR_QC_STRICT_*` 和旧通用 `ASR_QC_*_THRESHOLD` 配置已从默认配置、`.env.example`、checkpoint signature 和测试中移除。
 - 当前唯一 ASR 丢弃策略为 adaptive precision：`ASR_QC_ADAPTIVE_*` 控制硬拒绝和自适应 `avg_logprob` 阈值；丢弃项写入 `asr_dropped_uncertain_items`，pipeline 计时使用 `asr_adaptive_dropped_chunks`。
 - 验证：定向回归 `65 passed`；compileall 通过；`git diff --check` 通过；全量 `.venv/bin/python -m pytest -q` 为 `373 passed, 5 skipped`。
+
+### T-AP 关键验证记录
+
+- `.env` 已按翻译服务、翻译偏好、模型下载、ASR 默认后端、VAD/chunk/cache、adaptive ASR QC、F0/gender 和质量报告分组并补充注释。
+- `.env` 保留本地真实 API/模型/术语表/ASR_CONTEXT 等值，同时显式补齐 `ASR_BACKEND=whisper-ja-anime-v0.3`、WhisperSeg、VAD chunk cache 和 `ASR_QC_ADAPTIVE_*` 默认项。
+- `.env` 不再包含 `ASR_PRECISION_MODE`、`ASR_DROP_UNCERTAIN_ENABLED`、`ASR_QC_STRICT_*` 等过时配置。
+- 验证：`dotenv_values(".env")` 解析通过；关键配置齐全；旧 strict 配置不存在。
 
 ---
 
