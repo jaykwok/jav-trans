@@ -45,6 +45,12 @@ def compute_quality_report(
     asr_timeout_count = int(asr_qc.get("timeout_count") or 0)
     asr_quarantined_count = int(asr_qc.get("quarantined_count") or 0)
     asr_empty_text_for_speech_count = int(asr_qc.get("empty_text_for_speech_count") or 0)
+    asr_dropped_uncertain_count = int(asr_qc.get("dropped_uncertain_count") or 0)
+    asr_dropped_uncertain_items = (
+        list(asr_qc.get("dropped_uncertain_items") or [])
+        if isinstance(asr_qc.get("dropped_uncertain_items"), list)
+        else []
+    )
 
     n = len(segments)
     if n == 0:
@@ -69,6 +75,8 @@ def compute_quality_report(
             "asr_timeout_count": asr_timeout_count,
             "asr_quarantined_count": asr_quarantined_count,
             "asr_empty_text_for_speech_count": asr_empty_text_for_speech_count,
+            "asr_dropped_uncertain_count": asr_dropped_uncertain_count,
+            "asr_dropped_uncertain_items": asr_dropped_uncertain_items,
             "warnings": warnings,
         }
 
@@ -182,6 +190,8 @@ def compute_quality_report(
         "asr_timeout_count": asr_timeout_count,
         "asr_quarantined_count": asr_quarantined_count,
         "asr_empty_text_for_speech_count": asr_empty_text_for_speech_count,
+        "asr_dropped_uncertain_count": asr_dropped_uncertain_count,
+        "asr_dropped_uncertain_items": asr_dropped_uncertain_items,
         "warnings": warnings,
     }
     if male_ratio is not None:

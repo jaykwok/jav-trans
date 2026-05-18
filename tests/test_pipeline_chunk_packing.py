@@ -64,6 +64,7 @@ class _RecordingBackend:
 
     def __init__(self) -> None:
         self.audio_paths: list[str] = []
+        self.finalized_texts: list[str] = []
 
     def load(self, on_stage=None) -> None:
         return None
@@ -80,20 +81,27 @@ class _RecordingBackend:
     def transcribe_texts(self, audio_paths, contexts=None, on_stage=None):
         del contexts, on_stage
         self.audio_paths.extend(audio_paths)
-        return [
-            {
-                "text": "東京",
-                "raw_text": "東京",
-                "duration": 0.5,
-                "language": "Japanese",
-                "normalized_path": str(Path(path).resolve()),
-                "log": ["fake"],
-            }
-            for path in audio_paths
-        ]
+        results = []
+        for index, path in enumerate(audio_paths):
+            text = "怪しい怪しい怪しい怪しい怪しい" if index == 0 else "東京"
+            results.append(
+                {
+                    "text": text,
+                    "raw_text": text,
+                    "avg_logprob": -0.3,
+                    "no_speech_prob": 0.1,
+                    "compression_ratio": 1.2,
+                    "duration": 0.5,
+                    "language": "Japanese",
+                    "normalized_path": str(Path(path).resolve()),
+                    "log": ["fake"],
+                }
+            )
+        return results
 
     def finalize_text_results(self, text_results, on_stage=None):
         del on_stage
+        self.finalized_texts.extend(result["text"] for result in text_results)
         return [
             (
                 {
@@ -107,6 +115,26 @@ class _RecordingBackend:
                 ["Alignment 模式: fake"],
             )
             for result in text_results
+        ]
+
+
+class _LowLogprobBackend(_RecordingBackend):
+    def transcribe_texts(self, audio_paths, contexts=None, on_stage=None):
+        del contexts, on_stage
+        self.audio_paths.extend(audio_paths)
+        return [
+            {
+                "text": "低信頼テキスト",
+                "raw_text": "低信頼テキスト",
+                "avg_logprob": -1.5,
+                "no_speech_prob": 0.1,
+                "compression_ratio": 1.2,
+                "duration": 0.5,
+                "language": "Japanese",
+                "normalized_path": str(Path(path).resolve()),
+                "log": ["fake"],
+            }
+            for path in audio_paths
         ]
 
 
@@ -140,6 +168,26 @@ def _run_transcription(monkeypatch, tmp_path: Path, *, packing_enabled: str):
     return backend, segments, log, details
 
 
+def _run_transcription_with_backend(
+    monkeypatch,
+    tmp_path: Path,
+    *,
+    backend,
+    packing_enabled: str = "1",
+):
+    asr = _reload_pipeline(monkeypatch, tmp_path, packing_enabled=packing_enabled)
+    source = tmp_path / f"source_strict_{packing_enabled}.wav"
+    _write_wav(source, seconds=12.0)
+
+    import vad
+
+    monkeypatch.setattr(vad, "get_vad_backend", lambda: _StubVadBackend())
+    monkeypatch.setattr(asr, "_resolve_asr_backend", lambda _device: backend)
+
+    segments, log, details = asr._transcribe_and_align_local(str(source), "cpu")
+    return backend, segments, log, details
+
+
 def test_chunk_packing_enabled_packs_vad_segments_before_transcribe(monkeypatch, tmp_path):
     backend, _segments, log, details = _run_transcription(
         monkeypatch,
@@ -162,3 +210,20 @@ def test_chunk_packing_disabled_keeps_original_vad_chunk_count(monkeypatch, tmp_
     assert len(backend.audio_paths) == 10
     assert details["chunk_count"] == 10
     assert not any(entry.startswith("[chunk]") for entry in log)
+
+
+def test_strict_precision_drops_low_logprob_before_alignment(monkeypatch, tmp_path):
+    monkeypatch.setenv("ASR_PRECISION_MODE", "strict")
+    monkeypatch.setenv("ASR_QC_LOGPROB_THRESHOLD", "-1.0")
+    backend, segments, log, details = _run_transcription_with_backend(
+        monkeypatch,
+        tmp_path,
+        backend=_LowLogprobBackend(),
+    )
+
+    assert segments == []
+    assert backend.finalized_texts == []
+    assert details["asr_qc"]["dropped_uncertain_count"] == len(backend.audio_paths)
+    assert details["stage_timings"]["asr_strict_dropped_chunks"] == len(backend.audio_paths)
+    assert any(entry.startswith("ASR Strict Precision: dropped_uncertain=") for entry in log)
+    assert all(chunk["text"] == "" for chunk in details["transcript_chunks"])

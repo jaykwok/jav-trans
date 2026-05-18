@@ -571,6 +571,9 @@ def _transcribe_asr_chunks_text_only(
     ) -> list[dict]:
         if not _ASR_TEMPERATURE_FALLBACK or is_subprocess_backend:
             return batch_results
+        from whisper.qc import asr_drop_uncertain_enabled
+        if asr_drop_uncertain_enabled():
+            return batch_results
         if not _ASR_FALLBACK_TEMPERATURES:
             return batch_results
         if not bool(getattr(backend, "supports_temperature", False)):

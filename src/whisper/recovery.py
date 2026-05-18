@@ -6,6 +6,7 @@ from typing import Callable
 from whisper.backends.base import BaseAsrBackend
 from whisper.local_backend import LocalAsrBackend
 from whisper.qc import (
+    asr_drop_uncertain_enabled,
     asr_qc_enabled,
     asr_recovery_enabled,
     evaluate_asr_text_results_qc,
@@ -86,6 +87,11 @@ def _recover_TRANSCRIPTION_results_if_needed(
 ) -> tuple[list[dict], dict[str, float]]:
     recoverable_indices = list(qc_report.get('recoverable_indices', []))
     if not asr_recovery_enabled() or not recoverable_indices:
+        return text_results, {'asr_recovery_s': 0.0, 'asr_recovered_chunks': 0.0}
+    if asr_drop_uncertain_enabled():
+        log.append(
+            "ASR Recovery Path: skipped because strict precision/drop-uncertain mode is enabled"
+        )
         return text_results, {'asr_recovery_s': 0.0, 'asr_recovered_chunks': 0.0}
 
     recovery_started = time.perf_counter()

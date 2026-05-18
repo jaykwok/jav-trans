@@ -29,6 +29,20 @@ def asr_recovery_enabled() -> bool:
     return _env_bool("ASR_RECOVERY_ENABLED", False)
 
 
+def asr_precision_mode() -> str:
+    value = os.getenv("ASR_PRECISION_MODE", "normal").strip().lower()
+    if value in {"strict", "precision", "conservative"}:
+        return "strict"
+    return "normal"
+
+
+def asr_drop_uncertain_enabled() -> bool:
+    return asr_precision_mode() == "strict" or _env_bool(
+        "ASR_DROP_UNCERTAIN_ENABLED",
+        False,
+    )
+
+
 ASR_QC_ENABLED = asr_qc_enabled()
 ASR_RECOVERY_ENABLED = asr_recovery_enabled()
 ASR_QC_REPETITION_THRESHOLD = max(
@@ -76,9 +90,23 @@ def check_logprob_quality(result: dict) -> dict:
     Skips any check where the signal is None.
     Reads thresholds dynamically so tests can override via monkeypatch.setenv.
     """
+    strict_drop = asr_drop_uncertain_enabled()
     nospeech_threshold = _env_float("ASR_QC_NOSPEECH_THRESHOLD", 0.6)
     logprob_threshold = _env_float("ASR_QC_LOGPROB_THRESHOLD", -1.0)
     compression_threshold = _env_float("ASR_QC_COMPRESSION_THRESHOLD", 2.4)
+    if strict_drop:
+        nospeech_threshold = _env_float(
+            "ASR_QC_STRICT_NOSPEECH_THRESHOLD",
+            0.5,
+        )
+        logprob_threshold = _env_float(
+            "ASR_QC_STRICT_LOGPROB_THRESHOLD",
+            -0.7,
+        )
+        compression_threshold = _env_float(
+            "ASR_QC_STRICT_COMPRESSION_THRESHOLD",
+            2.0,
+        )
 
     no_speech_prob = _optional_float(result.get("no_speech_prob"))
     avg_logprob = _optional_float(result.get("avg_logprob"))
@@ -91,7 +119,10 @@ def check_logprob_quality(result: dict) -> dict:
     if compression_ratio is not None and compression_ratio > compression_threshold:
         reject_reasons.append("high_compression")
     if avg_logprob is not None and avg_logprob < logprob_threshold:
-        warn_reasons.append("low_logprob")
+        if strict_drop:
+            reject_reasons.append("low_logprob")
+        else:
+            warn_reasons.append("low_logprob")
 
     if reject_reasons:
         verdict = "reject"
@@ -113,6 +144,7 @@ def check_logprob_quality(result: dict) -> dict:
             "logprob_threshold": logprob_threshold,
             "compression_threshold": compression_threshold,
             "nospeech_threshold": nospeech_threshold,
+            "drop_uncertain_enabled": strict_drop,
         },
     }
 
@@ -362,6 +394,8 @@ def evaluate_asr_text_results_qc(
         "context_leak_check": context_leak_check,
         "repetition_check": "on",
         "repetition_threshold": ASR_QC_REPETITION_THRESHOLD,
+        "precision_mode": asr_precision_mode(),
+        "drop_uncertain_enabled": asr_drop_uncertain_enabled(),
     }
 
     if not asr_qc_enabled():
@@ -375,6 +409,8 @@ def evaluate_asr_text_results_qc(
             "timeout_count": 0,
             "quarantined_count": 0,
             "empty_text_for_speech_count": 0,
+            "dropped_uncertain_count": 0,
+            "dropped_uncertain_items": [],
             "items": [],
             "recoverable_indices": [],
             **qc_policy,
@@ -438,10 +474,122 @@ def evaluate_asr_text_results_qc(
         "timeout_count": timeout_count,
         "quarantined_count": quarantined_count,
         "empty_text_for_speech_count": empty_text_for_speech_count,
+        "dropped_uncertain_count": 0,
+        "dropped_uncertain_items": [],
         "items": items,
         "recoverable_indices": recoverable_indices,
         **qc_policy,
     }
+
+
+def _drop_reasons_for_qc_item(item: dict) -> list[str]:
+    severity = str(item.get("severity") or "").strip().lower()
+    reasons = [str(reason) for reason in (item.get("reasons") or []) if reason]
+    signal_qc = item.get("signal_qc")
+    signal_verdict = ""
+    if isinstance(signal_qc, dict):
+        signal_verdict = str(signal_qc.get("verdict") or "").strip().lower()
+
+    drop_reasons: list[str] = []
+    if signal_verdict == "reject":
+        drop_reasons.append("signal_reject")
+    if severity == "recover":
+        drop_reasons.append("recoverable_qc")
+    for reason in reasons:
+        if reason.startswith("generation_"):
+            drop_reasons.append(reason)
+        elif reason in {"long_low_information_chunk", "long_low_value_text"}:
+            drop_reasons.append(reason)
+    return list(dict.fromkeys(drop_reasons))
+
+
+def _dropped_text_result(text_result: dict, item: dict, drop_reasons: list[str]) -> dict:
+    dropped = dict(text_result)
+    original_text = str(text_result.get("text") or "")
+    original_raw_text = str(text_result.get("raw_text") or original_text)
+    dropped["text"] = ""
+    dropped["raw_text"] = ""
+    dropped["segments"] = []
+    dropped["asr_dropped"] = {
+        "policy": "strict_precision",
+        "reasons": drop_reasons,
+        "original_text": original_text,
+        "original_raw_text": original_raw_text,
+        "qc": item,
+    }
+    log = list(text_result.get("log", []))
+    log.append(
+        "ASR strict precision drop: reasons={reasons}, text={text}".format(
+            reasons=",".join(drop_reasons),
+            text=_preview(original_text or original_raw_text),
+        )
+    )
+    dropped["log"] = log
+    return dropped
+
+
+def apply_strict_precision_filter(
+    chunks: list[dict],
+    text_results: list[dict],
+    qc_report: dict,
+) -> tuple[list[dict], dict, list[str]]:
+    if not asr_drop_uncertain_enabled() or not asr_qc_enabled():
+        return text_results, qc_report, []
+
+    items = list(qc_report.get("items") or [])
+    if not items:
+        return text_results, qc_report, []
+
+    items_by_position = {
+        int(item.get("position", index)): item
+        for index, item in enumerate(items)
+        if isinstance(item, dict)
+    }
+    updated_results = list(text_results)
+    dropped_items: list[dict] = []
+    log_lines: list[str] = []
+
+    for index, text_result in enumerate(text_results):
+        item = items_by_position.get(index)
+        if item is None:
+            continue
+        drop_reasons = _drop_reasons_for_qc_item(item)
+        if not drop_reasons:
+            continue
+        updated_results[index] = _dropped_text_result(text_result, item, drop_reasons)
+        chunk = chunks[index] if index < len(chunks) else {}
+        dropped_item = {
+            "position": index,
+            "chunk_index": item.get("chunk_index", chunk.get("index", index + 1)),
+            "start": item.get("start", chunk.get("start", 0.0)),
+            "end": item.get("end", chunk.get("end", 0.0)),
+            "reasons": drop_reasons,
+            "original_text": str(text_result.get("text") or ""),
+            "original_raw_text": str(
+                text_result.get("raw_text") or text_result.get("text") or ""
+            ),
+            "text_preview": item.get("text_preview", ""),
+            "metrics": item.get("metrics") or {},
+        }
+        dropped_items.append(dropped_item)
+        log_lines.append(
+            "ASR Strict Precision drop chunk {chunk_index}: reasons={reasons}, text={text}".format(
+                chunk_index=dropped_item["chunk_index"],
+                reasons=",".join(drop_reasons),
+                text=dropped_item["text_preview"],
+            )
+        )
+
+    if not dropped_items:
+        return text_results, qc_report, []
+
+    updated_report = dict(qc_report)
+    existing = list(updated_report.get("dropped_uncertain_items") or [])
+    updated_report["dropped_uncertain_items"] = existing + dropped_items
+    updated_report["dropped_uncertain_count"] = len(updated_report["dropped_uncertain_items"])
+    updated_report["drop_uncertain_enabled"] = True
+    updated_report["precision_mode"] = asr_precision_mode()
+    return updated_results, updated_report, log_lines
 
 
 def format_qc_log_items(report: dict, limit: int = 8) -> list[str]:

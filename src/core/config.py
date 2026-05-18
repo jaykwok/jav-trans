@@ -190,6 +190,18 @@ DEFAULT_SETTINGS: dict[str, str] = {
     # --- ASR QC Recovery Path ---
     # 1 enables ASR text quality checks before translation.
     "ASR_QC_ENABLED": "1",
+    # normal keeps uncertain ASR as warnings; strict drops uncertain chunks before alignment.
+    "ASR_PRECISION_MODE": "normal",
+    # 1 drops QC-rejected/recoverable ASR chunks even when ASR_PRECISION_MODE is normal.
+    "ASR_DROP_UNCERTAIN_ENABLED": "0",
+    # ASR confidence thresholds used by QC and strict precision filtering.
+    "ASR_QC_NOSPEECH_THRESHOLD": "0.6",
+    "ASR_QC_LOGPROB_THRESHOLD": "-1.0",
+    "ASR_QC_COMPRESSION_THRESHOLD": "2.4",
+    # Stricter confidence thresholds used only when ASR_PRECISION_MODE=strict.
+    "ASR_QC_STRICT_NOSPEECH_THRESHOLD": "0.5",
+    "ASR_QC_STRICT_LOGPROB_THRESHOLD": "-0.7",
+    "ASR_QC_STRICT_COMPRESSION_THRESHOLD": "2.0",
     # 1 enables VAD refine recovery for low-quality ASR chunks. Off by default.
     "ASR_RECOVERY_ENABLED": "0",
     # Recovery VAD threshold; lower catches more speech and more noise.

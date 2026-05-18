@@ -139,6 +139,35 @@ def _get_whisper_generation_checkpoint_signature(
                 "generation_budget_policy_version": str(
                     generation_budget_policy_version()
                 ),
+                "precision_mode": _env_lower("ASR_PRECISION_MODE", "normal"),
+                "drop_uncertain_enabled": _env_lower(
+                    "ASR_DROP_UNCERTAIN_ENABLED",
+                    "0",
+                ),
+                "qc_nospeech_threshold": _env_text(
+                    "ASR_QC_NOSPEECH_THRESHOLD",
+                    "0.6",
+                ),
+                "qc_logprob_threshold": _env_text(
+                    "ASR_QC_LOGPROB_THRESHOLD",
+                    "-1.0",
+                ),
+                "qc_compression_threshold": _env_text(
+                    "ASR_QC_COMPRESSION_THRESHOLD",
+                    "2.4",
+                ),
+                "qc_strict_nospeech_threshold": _env_text(
+                    "ASR_QC_STRICT_NOSPEECH_THRESHOLD",
+                    "0.5",
+                ),
+                "qc_strict_logprob_threshold": _env_text(
+                    "ASR_QC_STRICT_LOGPROB_THRESHOLD",
+                    "-0.7",
+                ),
+                "qc_strict_compression_threshold": _env_text(
+                    "ASR_QC_STRICT_COMPRESSION_THRESHOLD",
+                    "2.0",
+                ),
             },
             sort_keys=True,
         )
@@ -221,6 +250,23 @@ def _get_asr_runtime_signature(
             "asr_fallback_temperatures": _env_text(
                 "ASR_FALLBACK_TEMPERATURES",
                 "0.2,0.4,0.6",
+            ),
+            "precision_mode": _env_lower("ASR_PRECISION_MODE", "normal"),
+            "drop_uncertain_enabled": _env_lower("ASR_DROP_UNCERTAIN_ENABLED", "0"),
+            "qc_nospeech_threshold": _env_text("ASR_QC_NOSPEECH_THRESHOLD", "0.6"),
+            "qc_logprob_threshold": _env_text("ASR_QC_LOGPROB_THRESHOLD", "-1.0"),
+            "qc_compression_threshold": _env_text("ASR_QC_COMPRESSION_THRESHOLD", "2.4"),
+            "qc_strict_nospeech_threshold": _env_text(
+                "ASR_QC_STRICT_NOSPEECH_THRESHOLD",
+                "0.5",
+            ),
+            "qc_strict_logprob_threshold": _env_text(
+                "ASR_QC_STRICT_LOGPROB_THRESHOLD",
+                "-0.7",
+            ),
+            "qc_strict_compression_threshold": _env_text(
+                "ASR_QC_STRICT_COMPRESSION_THRESHOLD",
+                "2.0",
             ),
             "whisper": _json_or_text(whisper_generation_signature),
         },

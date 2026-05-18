@@ -118,6 +118,8 @@ def test_asr_generation_errors_are_reported_and_warned():
             "timeout_count": 1,
             "quarantined_count": 1,
             "empty_text_for_speech_count": 1,
+            "dropped_uncertain_count": 3,
+            "dropped_uncertain_items": [{"chunk_index": 7, "original_text": "怪しい"}],
         },
     )
 
@@ -126,6 +128,8 @@ def test_asr_generation_errors_are_reported_and_warned():
     assert report["asr_timeout_count"] == 1
     assert report["asr_quarantined_count"] == 1
     assert report["asr_empty_text_for_speech_count"] == 1
+    assert report["asr_dropped_uncertain_count"] == 3
+    assert report["asr_dropped_uncertain_items"][0]["original_text"] == "怪しい"
     assert any("asr_generation_error_count" in warning for warning in report["warnings"])
     assert any("asr_generation_overflow_count" in warning for warning in report["warnings"])
 
