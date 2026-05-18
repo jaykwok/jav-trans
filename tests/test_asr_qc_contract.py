@@ -8,8 +8,8 @@ if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
 
-def test_check_logprob_drives_strict_drop_decision():
-    """Reject verdicts are used for strict precision drops, not ASR retries."""
+def test_check_logprob_drives_adaptive_drop_decision():
+    """Reject verdicts are used for adaptive precision drops, not ASR retries."""
     from whisper.qc import check_logprob_quality
     reject = {"avg_logprob": -2.0, "no_speech_prob": 0.9, "compression_ratio": 1.0}
     ok = {"avg_logprob": -0.2, "no_speech_prob": 0.05, "compression_ratio": 1.0}

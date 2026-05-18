@@ -111,7 +111,7 @@ async def _test_config_lists_recommended_asr_backend_first(monkeypatch):
     assert payload["backends"][0] == config_routes.RECOMMENDED_ASR_BACKEND
     assert payload["defaults"]["asr_backend"] == config_routes.RECOMMENDED_ASR_BACKEND
     assert payload["recommended_asr_backend"] == config_routes.RECOMMENDED_ASR_BACKEND
-    assert payload["engine_defaults"]["asr_backend"] == "anime-whisper"
+    assert payload["engine_defaults"]["asr_backend"] == "whisper-ja-anime-v0.3"
     assert payload["defaults"]["translation_batch_size"] == 200
     assert payload["defaults"]["translation_max_workers"] == 4
     assert set(payload["backends"]) == set(config_routes.BACKENDS)

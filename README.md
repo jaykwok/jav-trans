@@ -99,9 +99,9 @@ HF_ENDPOINT=https://hf-mirror.com
 
 - **小白友好的网页界面**：所有的模型选择、字幕格式、并发设置都可以通过网页轻松配置。
 - **断点续传与多层缓存**：支持音频缓存、ASR checkpoint、`aligned_segments.json` 复用、翻译 cache，以及独立的 VAD/chunk 边界缓存；只改 ASR prompt/token 参数时可复用 VAD 切分结果。
-- **懂二次元的识别模型**：支持 `anime-whisper`、`whisper-ja-anime-v0.3`、`whisper-ja-1.5b`、`qwen3-asr-1.7b`。引擎默认仍是 `anime-whisper`，Web 推荐首选 `whisper-ja-anime-v0.3`。
+- **懂二次元的识别模型**：支持 `anime-whisper`、`whisper-ja-anime-v0.3`、`whisper-ja-1.5b`、`qwen3-asr-1.7b`。引擎默认与 Web 推荐首选均为 `whisper-ja-anime-v0.3`。
 - **WhisperSeg VAD + 长 chunk 流程**：默认使用 WhisperSeg，阈值 `0.35`；开启 VAD chunk packing，将相邻语音段打包成更适合 Whisper/forced alignment 的长 chunk。
-- **严格优先的 ASR 策略**：默认 `ASR_PRECISION_MODE=strict`。低置信、疑似重复幻觉、上下文泄漏、乱码和生成异常的文本会在 alignment / F0 / 翻译前直接丢弃，并写入 quality report 审计。
+- **自适应低幻觉 ASR 策略**：ASR QC 默认且唯一使用 adaptive precision。高 `no_speech_prob`、高压缩率、异常字符密度、重复循环、上下文泄漏、乱码和生成异常会硬丢弃；低风险真实对白的低 `avg_logprob` 会自适应放宽，并写入 quality report 审计。
 - **ASR generation budget 防溢出**：Whisper 系列会根据 decoder 窗口、forced decoder ids、prompt tokens 动态裁剪 prompt 和 `max_new_tokens`，质量报告会统计 overflow/error/timeout/quarantine；生成失败不再通过温度重试或 recovery 补写内容。
 - **翻译前噪声过滤**：在提交给 LLM 前过滤空字幕、纯引号片段、纯英文幻觉 token 和纯特殊符号片段，减少无效翻译请求。
 - **智能性别区分**：forced alignment 后执行词级 F0 性别检测，并根据 gender turn 重新切分字幕，让对话翻译更加稳定。
@@ -113,7 +113,7 @@ HF_ENDPOINT=https://hf-mirror.com
 当前主流水线为：
 
 ```text
-视频 -> 音频准备 -> WhisperSeg VAD -> VAD chunk packing -> ASR -> Strict Precision QC -> Forced Alignment
+视频 -> 音频准备 -> WhisperSeg VAD -> VAD chunk packing -> ASR -> Adaptive Precision QC -> Forced Alignment
 -> 词级 F0 性别检测 -> gender turn 重切段 -> 翻译前 ASR 噪声过滤
 -> LLM 翻译 -> SRT / quality report
 ```

@@ -10,7 +10,7 @@ from whisper import checkpoint as _checkpoint_module
 from whisper import chunking as _chunking_module
 from whisper import qc_stage as _qc_stage_module
 from whisper import transcribe as _transcribe_module
-from whisper.qc import apply_strict_precision_filter
+from whisper.qc import apply_adaptive_precision_filter
 from whisper import vad_chunk_cache as _vad_chunk_cache_module
 from whisper.backends import registry as _registry_module
 
@@ -514,23 +514,24 @@ def _transcribe_and_align_local(
                 qc_timings["asr_qc_s"],
             )
 
-            text_results, qc_report, strict_drop_log = apply_strict_precision_filter(
+            text_results, qc_report, adaptive_drop_log = apply_adaptive_precision_filter(
                 chunk_infos,
                 text_results,
                 qc_report,
             )
-            if strict_drop_log:
-                timings["asr_strict_dropped_chunks"] = len(strict_drop_log)
+            if adaptive_drop_log:
+                timings["asr_adaptive_dropped_chunks"] = len(adaptive_drop_log)
                 log.append(
-                    "ASR Strict Precision: dropped_uncertain={count}".format(
-                        count=len(strict_drop_log)
+                    "ASR Adaptive Precision: dropped_uncertain={count}".format(
+                        count=len(adaptive_drop_log)
                     )
                 )
-                log.extend(strict_drop_log[:8])
-                remaining = len(strict_drop_log) - 8
+                log.extend(adaptive_drop_log[:8])
+                remaining = len(adaptive_drop_log) - 8
                 if remaining > 0:
                     log.append(
-                        f"ASR Strict Precision: {remaining} additional dropped chunks omitted from log"
+                        "ASR Adaptive Precision: "
+                        f"{remaining} additional dropped chunks omitted from log"
                     )
 
             transcript_chunks = _build_transcript_chunks(chunk_infos, text_results)

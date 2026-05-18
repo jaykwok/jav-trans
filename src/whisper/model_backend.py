@@ -228,7 +228,7 @@ def _compression_ratio(raw_text: str) -> float | None:
     try:
         raw_bytes = str(raw_text or "").encode("utf-8", "ignore")
         compressed_len = len(zlib.compress(raw_bytes))
-        return float(compressed_len / max(len(raw_bytes), 1))
+        return float(len(raw_bytes) / max(compressed_len, 1))
     except Exception:
         return None
 

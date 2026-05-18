@@ -110,6 +110,16 @@ def test_signals_extracted_on_success(monkeypatch, tmp_path):
     assert model.calls[0]["output_scores"] is True
 
 
+def test_compression_ratio_increases_for_repeated_text():
+    repeated = model_backend._compression_ratio("あ" * 120)
+    varied = model_backend._compression_ratio("今日はいい天気ですね少し歩きましょう")
+
+    assert repeated is not None
+    assert varied is not None
+    assert repeated > varied
+    assert repeated > 2.0
+
+
 def test_signals_none_on_missing_scores(monkeypatch, tmp_path):
     audio_path = tmp_path / "chunk.wav"
     audio_path.write_bytes(b"not used")

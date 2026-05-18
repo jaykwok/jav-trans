@@ -17,13 +17,13 @@
 
 ### 1.2 ASR / VAD / 对齐
 
-- Engine 默认 ASR：`ASR_BACKEND=anime-whisper`。
+- Engine 默认 ASR：`ASR_BACKEND=whisper-ja-anime-v0.3`。
 - Web 推荐默认 ASR：`whisper-ja-anime-v0.3`，`/api/config` 同时暴露 `engine_defaults.asr_backend` 与 `recommended_asr_backend`。
 - 支持 ASR 后端：`anime-whisper`、`qwen3-asr-1.7b`、`whisper-ja-1.5b`、`whisper-ja-anime-v0.3`。
 - 默认 VAD：`ASR_VAD_BACKEND=whisperseg`，`WHISPERSEG_THRESHOLD=0.35`。
 - `ASR_LONG_CHUNK_PROFILE=on` 时强制开启 VAD chunk packing 与 post-alignment F0：`ASR_CHUNK_PACKING_ENABLED=1`、`F0_GENDER_POST_ALIGNMENT=1`。
 - Whisper generation budget 由共享层按 `max_target_positions`、forced decoder ids、prompt ids 和 `WHISPER_MAX_NEW_TOKENS` 动态裁剪；Qwen 不套 Whisper 448 decoder 窗口。
-- 默认 ASR 精度策略：`ASR_PRECISION_MODE=strict`。低置信、疑似重复幻觉、上下文泄漏、乱码和生成异常的文本在 alignment 前直接丢弃，进入 quality report 审计，不进入 F0、翻译和最终字幕。
+- ASR 精度策略固定为 adaptive precision，不再提供 `ASR_PRECISION_MODE` 模式开关。高 `no_speech_prob`、高压缩率、异常字符密度、重复循环、上下文泄漏、乱码和生成异常在 alignment 前硬丢弃；低风险真实对白可按自适应 `avg_logprob` 阈值保留，所有判定进入 quality report 审计。
 - ASR recovery、temperature fallback、prompt overflow retry 已移除；文本生成失败或不确定时不做“补救式重写”。timestamp/alignment fallback 只允许补时间轴，不允许改写或新增 ASR 文本。
 - ASR checkpoint / `aligned_segments.json` cache 均校验结构化 signature；ASR context、语言、生成参数、VAD/chunk/F0/timeline 关键输入变化时不得误复用旧 cache。
 - VAD/chunk cache 单独缓存 VAD 边界与 chunk packing 结果，不缓存 chunk wav；signature 覆盖 audio fingerprint、VAD 参数和 chunk/drop/merge 参数，不包含 ASR prompt/token/generation 参数。
@@ -53,7 +53,7 @@
 - 翻译风格：性器官优先统一为“肉棒”“小穴”，不固定“菊花”。
 - 人名默认按日语读音罗马音化；ASR 同音纠错必须保守，不能把不同汉字姓氏或不同读音称呼强行合并。
 - 翻译后默认执行轻量 repair pass：代码侧选择高风险 id，repair prompt 只使用抽象原因类别和相邻上下文，不把片内错例硬编码进静态 prompt。
-- quality report 需要暴露 ASR generation error、overflow、timeout、quarantine、empty speech text、strict precision dropped uncertain items 等风险信号。
+- quality report 需要暴露 ASR generation error、overflow、timeout、quarantine、empty speech text、adaptive precision dropped uncertain items 等风险信号。
 
 ---
 
@@ -106,7 +106,9 @@
 | T-AJ | 全量审计修复：任务级 env 覆盖、aligned cache scope、ASR/字幕/quality 参数运行时化、翻译 cancel_event 透传 | 基线 315 passed, 5 skipped；完成后逐步增至 334+ passed |
 | T-AK | 第二轮后端审计：ASR/aligned cache signature、`.env.example` 默认、SubtitleOptions、Web retry/cancel、stream timeout、Protocol 补齐 | `343 passed, 5 skipped` |
 | T-AL | ASR generation budget + ONNX CUDA runtime + VAD/chunk cache | `359 passed, 5 skipped`；SORA-575 anime-whisper 全量中日双语 649.54s，WhisperSeg CUDA VAD/切块 9.32s，ASR generation overflow/error 为 0 |
-| T-AM | strict precision ASR 默认化并删除 ASR recovery / temperature fallback / prompt overflow retry，并清理前端旧 ASR Recovery 控件 | 后端全量 `365 passed, 5 skipped`；前端/Web 定向 `13 passed` |
+| T-AM | 删除 ASR recovery / temperature fallback / prompt overflow retry，并清理前端旧 ASR Recovery 控件；早期固定阈值 precision 方案后续被 adaptive-only 替换 | 后端全量 `365 passed, 5 skipped`；前端/Web 定向 `13 passed` |
+| T-AN | adaptive precision ASR 默认化：保留硬幻觉拒绝，低风险低 `avg_logprob` 对白自适应放宽 | 定向回归 `68 passed`；Oni Chichi BDRIP 5min smoke：adaptive drops 2，overflow/error/timeout/quarantine 为 0 |
+| T-AO | 默认 ASR 切为 `whisper-ja-anime-v0.3`；新增 `video/test` 通用测试集评测工具；删除 strict/normal ASR 精度模式，只保留 adaptive precision | 全量 `.venv/bin/python -m pytest -q` 为 `373 passed, 5 skipped` |
 
 ### T-AL 关键验证记录
 
@@ -121,11 +123,28 @@
 
 ### T-AM 关键验证记录
 
-- strict precision ASR 成为默认策略：`ASR_PRECISION_MODE=strict`，可疑/低置信文本在 alignment 前清空并写入 quality report。
+- 早期固定阈值 precision 方案曾作为默认策略；后续 T-AN/T-AO 已替换为 adaptive-only。
 - 后端已删除 ASR recovery、temperature fallback、prompt overflow retry；生成失败或不确定时不再重写补救。timestamp/alignment fallback 仅用于时间轴，不新增 ASR 文本。
 - 后端 `JobSpec` / `JobContext` / `/api/config` 不再暴露 `asr_recovery`；前端已移除 `ASR Recovery` 开关、preset 字段、配置回填和提交 payload。
-- 验证：compileall 通过；strict/QC/cache/ASR 定向 `66 passed`；全量 `.venv/bin/python -m pytest -q` 为 `365 passed, 5 skipped`。
+- 验证：compileall 通过；precision/QC/cache/ASR 定向 `66 passed`；全量 `.venv/bin/python -m pytest -q` 为 `365 passed, 5 skipped`。
 - 前端验证：`node --check` 覆盖 `settings.js` / `files.js` / `presets.js` / `main.js`；Web/API 与 ASR env 定向 `13 passed`。
+
+### T-AN 关键验证记录
+
+- 默认 ASR 精度策略更新为 adaptive precision：硬拒绝高 `no_speech_prob`、高压缩率、异常字符密度、重复循环、上下文泄漏、乱码和生成异常；仅对低风险真实对白放宽低 `avg_logprob`。
+- adaptive 阈值写入 ASR checkpoint / aligned cache signature，`ASR_QC_ADAPTIVE_*` 变化会触发重算。
+- Oni Chichi BDRIP 旧固定阈值 drops 离线重判：24 条 -> adaptive reject 8 条，预计恢复 16 条；579 字/7.84s 重复幻觉仍由 `abnormal_char_density` 硬拒绝。
+- 5 分钟 BDRIP smoke：`whisper-ja-anime-v0.3`，ASR+Alignment 16.96s，输出 82 段，`asr_dropped_uncertain_count=2`，generation overflow/error/timeout/quarantine 均为 0。
+- 验证：compileall 通过；QC/cache/ASR/testset 定向 `68 passed`；`git diff --check` 通过。
+
+### T-AO 关键验证记录
+
+- Engine 默认 ASR 改为 `whisper-ja-anime-v0.3`，与 Web 推荐默认一致；`src/core/config.py`、`src/core/job_context.py`、`src/whisper/backends/registry.py`、README 和 Web/API 测试已同步。
+- 新增通用测试集评测工具：`tests/testset_quality_eval.py`，支持 `video/test/index.json` 中任意视频 + `.ass`/`.srt` 参考字幕，输出转写覆盖、无参考重叠、翻译 CER/F1 和 ASR drop 代理指标。
+- `video/test` 测试集已去重为一集一份参考字幕，优先保留 BDRIP；重复和无配套字幕文件移动到 `agents/rm/`。
+- 删除 ASR 精度模式开关：不再读取 `ASR_PRECISION_MODE`，不再保留 strict/normal 分支；`ASR_QC_STRICT_*` 和旧通用 `ASR_QC_*_THRESHOLD` 配置已从默认配置、`.env.example`、checkpoint signature 和测试中移除。
+- 当前唯一 ASR 丢弃策略为 adaptive precision：`ASR_QC_ADAPTIVE_*` 控制硬拒绝和自适应 `avg_logprob` 阈值；丢弃项写入 `asr_dropped_uncertain_items`，pipeline 计时使用 `asr_adaptive_dropped_chunks`。
+- 验证：定向回归 `65 passed`；compileall 通过；`git diff --check` 通过；全量 `.venv/bin/python -m pytest -q` 为 `373 passed, 5 skipped`。
 
 ---
 

@@ -175,7 +175,7 @@ def _run_transcription_with_backend(
     packing_enabled: str = "1",
 ):
     asr = _reload_pipeline(monkeypatch, tmp_path, packing_enabled=packing_enabled)
-    source = tmp_path / f"source_strict_{packing_enabled}.wav"
+    source = tmp_path / f"source_adaptive_{packing_enabled}.wav"
     _write_wav(source, seconds=12.0)
 
     import vad
@@ -211,9 +211,8 @@ def test_chunk_packing_disabled_keeps_original_vad_chunk_count(monkeypatch, tmp_
     assert not any(entry.startswith("[chunk]") for entry in log)
 
 
-def test_strict_precision_drops_low_logprob_before_alignment(monkeypatch, tmp_path):
-    monkeypatch.setenv("ASR_PRECISION_MODE", "strict")
-    monkeypatch.setenv("ASR_QC_LOGPROB_THRESHOLD", "-1.0")
+def test_adaptive_precision_drops_low_logprob_before_alignment(monkeypatch, tmp_path):
+    monkeypatch.setenv("ASR_QC_ADAPTIVE_BASE_LOGPROB", "-1.0")
     backend, segments, log, details = _run_transcription_with_backend(
         monkeypatch,
         tmp_path,
@@ -223,6 +222,6 @@ def test_strict_precision_drops_low_logprob_before_alignment(monkeypatch, tmp_pa
     assert segments == []
     assert backend.finalized_texts == []
     assert details["asr_qc"]["dropped_uncertain_count"] == len(backend.audio_paths)
-    assert details["stage_timings"]["asr_strict_dropped_chunks"] == len(backend.audio_paths)
-    assert any(entry.startswith("ASR Strict Precision: dropped_uncertain=") for entry in log)
+    assert details["stage_timings"]["asr_adaptive_dropped_chunks"] == len(backend.audio_paths)
+    assert any(entry.startswith("ASR Adaptive Precision: dropped_uncertain=") for entry in log)
     assert all(chunk["text"] == "" for chunk in details["transcript_chunks"])

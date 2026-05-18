@@ -106,7 +106,7 @@ def test_default_model_download_root_is_project_models():
     assert config.DEFAULT_SETTINGS["JOB_TEMP_DIR"] == "./temp/jobs"
     assert "KEEP_TEMP_FILES" not in config.DEFAULT_SETTINGS
     assert config.DEFAULT_SETTINGS["ASR_CONTEXT"] == ""
-    assert config.DEFAULT_SETTINGS["ASR_BACKEND"] == "anime-whisper"
+    assert config.DEFAULT_SETTINGS["ASR_BACKEND"] == "whisper-ja-anime-v0.3"
     assert config.DEFAULT_SETTINGS["ASR_SUBPROCESS_READY_TIMEOUT_S"] == "600"
     assert config.DEFAULT_SETTINGS["LLM_API_FORMAT"] == "chat"
 
