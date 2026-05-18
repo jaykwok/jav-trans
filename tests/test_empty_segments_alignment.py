@@ -6,7 +6,6 @@ from whisper.local_backend import align_text_to_words
 class _NoFinalizeBackend:
     is_subprocess = False
     accepts_contexts = True
-    supports_temperature = False
     timestamp_mode = "forced"
     request_batch_size = 1
     align_batch_size = 1

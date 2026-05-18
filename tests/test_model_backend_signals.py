@@ -124,13 +124,12 @@ def test_signals_none_on_missing_scores(monkeypatch, tmp_path):
     assert result["compression_ratio"] is None
 
 
-def test_overflow_retry_signals_from_retry_output(monkeypatch, tmp_path):
+def test_overflow_result_is_dropped_without_retry(monkeypatch, tmp_path):
     audio_path = tmp_path / "chunk.wav"
     audio_path.write_bytes(b"not used")
     model = FakeModel(
         [
             RuntimeError("decoder_input_ids exceeds max_target_positions"),
-            FakeOutput(token=3),
         ]
     )
     backend = _backend_with(model, FakeProcessor("リトライ後テキスト"))
@@ -141,10 +140,11 @@ def test_overflow_retry_signals_from_retry_output(monkeypatch, tmp_path):
         initial_prompts=["previous context"],
     )[0]
 
-    assert result["text"] == "リトライ後テキスト"
-    assert result["avg_logprob"] == -0.25
-    assert isinstance(result["no_speech_prob"], float)
-    assert isinstance(result["compression_ratio"], float)
-    assert len(model.calls) == 2
+    assert result["text"] == ""
+    assert result["raw_text"] == ""
+    assert result["avg_logprob"] is None
+    assert result["no_speech_prob"] is None
+    assert result["compression_ratio"] is None
+    assert result["asr_generation"]["error_kind"] == "overflow"
+    assert len(model.calls) == 1
     assert "prompt_ids" in model.calls[0]
-    assert "prompt_ids" not in model.calls[1]

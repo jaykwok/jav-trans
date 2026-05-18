@@ -121,13 +121,11 @@ def cleanup_runtime_ephemeral_temp(
     *,
     job_temp_root: str | Path,
     asr_chunk_root: str | Path,
-    recovery_output_root: str | Path,
     project_root: Path,
 ) -> None:
     roots = [
         Path(job_temp_root).expanduser(),
         Path(asr_chunk_root).expanduser(),
-        Path(recovery_output_root).expanduser(),
     ]
     resolved_project_root = project_root.resolve()
     for root in roots:

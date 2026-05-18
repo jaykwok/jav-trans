@@ -10,7 +10,6 @@ from whisper.backends.base import BaseAsrBackend
 class FakeWhisperModelBackend:
     is_subprocess = False
     accepts_contexts = False
-    supports_temperature = True
     timestamp_mode = "forced"
     request_batch_size = 1
     align_batch_size = 1

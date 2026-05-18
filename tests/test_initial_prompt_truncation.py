@@ -31,7 +31,7 @@ def test_prompt_ids_token_cap(monkeypatch):
     assert torch.equal(capped, prompt_ids[..., -180:])
 
 
-def test_overflow_retry(monkeypatch, tmp_path):
+def test_prompt_overflow_is_not_retried(monkeypatch, tmp_path):
     audio_path = tmp_path / "chunk.wav"
     audio_path.write_bytes(b"not used")
     generate_calls: list[dict] = []
@@ -59,9 +59,7 @@ def test_overflow_retry(monkeypatch, tmp_path):
         def generate(self, input_features, do_sample=False, **kwargs):
             del input_features, do_sample
             generate_calls.append(dict(kwargs))
-            if len(generate_calls) == 1:
-                raise RuntimeError("decoder_input_ids exceeds max_target_positions")
-            return torch.tensor([[1, 2, 3]])
+            raise RuntimeError("decoder_input_ids exceeds max_target_positions")
 
     backend = model_backend.WhisperModelBackend(
         preset_name="anime-whisper",
@@ -93,10 +91,10 @@ def test_overflow_retry(monkeypatch, tmp_path):
         initial_prompts=["previous context"],
     )
 
-    assert result[0]["text"] == "正常テキスト"
-    assert len(generate_calls) == 2
+    assert result[0]["text"] == ""
+    assert result[0]["asr_generation"]["error_kind"] == "overflow"
+    assert len(generate_calls) == 1
     assert "prompt_ids" in generate_calls[0]
-    assert "prompt_ids" not in generate_calls[1]
 
 
 def test_dynamic_budget_prevents_whisper_decoder_overflow(monkeypatch, tmp_path):

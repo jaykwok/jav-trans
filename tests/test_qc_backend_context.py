@@ -114,7 +114,7 @@ def test_quarantined_timeout_counts_as_timeout_and_quarantine():
     assert report["generation_error_count"] == 1
     assert report["timeout_count"] == 1
     assert report["quarantined_count"] == 1
-    assert report["recoverable_count"] == 1
+    assert report["reject_count"] == 1
 
 
 def test_strict_precision_filter_drops_signal_reject(monkeypatch):
@@ -155,7 +155,6 @@ def test_strict_precision_filter_drops_signal_reject(monkeypatch):
 
 def test_strict_precision_filter_keeps_warn_in_normal_mode(monkeypatch):
     monkeypatch.setenv("ASR_PRECISION_MODE", "normal")
-    monkeypatch.delenv("ASR_DROP_UNCERTAIN_ENABLED", raising=False)
     chunks = [{"index": 1, "start": 0.0, "end": 2.0}]
     text_results = [
         {
@@ -182,26 +181,5 @@ def test_strict_precision_filter_keeps_warn_in_normal_mode(monkeypatch):
     assert filtered == text_results
     assert updated_report["dropped_uncertain_count"] == 0
     assert log == []
-
-
-def test_recovery_skips_when_strict_precision_enabled(monkeypatch):
-    monkeypatch.setenv("ASR_PRECISION_MODE", "strict")
-    monkeypatch.setenv("ASR_RECOVERY_ENABLED", "1")
-    from whisper.recovery import _recover_TRANSCRIPTION_results_if_needed
-
-    text_results = [{"text": "怪しい", "raw_text": "怪しい"}]
-    log: list[str] = []
-
-    filtered, timings = _recover_TRANSCRIPTION_results_if_needed(
-        SimpleNamespace(),
-        [{"index": 1, "start": 0.0, "end": 2.0}],
-        text_results,
-        {"recoverable_indices": [0]},
-        log,
-    )
-
-    assert filtered is text_results
-    assert timings["asr_recovery_s"] == 0.0
-    assert any("strict precision" in entry for entry in log)
 
 

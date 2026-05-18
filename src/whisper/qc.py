@@ -25,26 +25,18 @@ def asr_qc_enabled() -> bool:
     return _env_bool("ASR_QC_ENABLED", True)
 
 
-def asr_recovery_enabled() -> bool:
-    return _env_bool("ASR_RECOVERY_ENABLED", False)
-
-
 def asr_precision_mode() -> str:
-    value = os.getenv("ASR_PRECISION_MODE", "normal").strip().lower()
+    value = os.getenv("ASR_PRECISION_MODE", "strict").strip().lower()
     if value in {"strict", "precision", "conservative"}:
         return "strict"
     return "normal"
 
 
 def asr_drop_uncertain_enabled() -> bool:
-    return asr_precision_mode() == "strict" or _env_bool(
-        "ASR_DROP_UNCERTAIN_ENABLED",
-        False,
-    )
+    return asr_precision_mode() == "strict"
 
 
 ASR_QC_ENABLED = asr_qc_enabled()
-ASR_RECOVERY_ENABLED = asr_recovery_enabled()
 ASR_QC_REPETITION_THRESHOLD = max(
     1,
     int(os.getenv("ASR_QC_REPETITION_THRESHOLD", "10")),
@@ -59,7 +51,6 @@ _MAX_CHARS_PER_SEC = float(os.getenv("ASR_QC_MAX_CHARS_PER_SEC", "8.0"))
 _DENSITY_MIN_CHARS = max(1, int(os.getenv("ASR_QC_DENSITY_MIN_CHARS", "30")))
 _LOW_INFO_DURATION_S = float(os.getenv("ASR_QC_LOW_INFO_DURATION", "6.0"))
 _LOW_INFO_MAX_CHARS = max(0, int(os.getenv("ASR_QC_LOW_INFO_MAX_CHARS", "5")))
-_LOW_INFO_RECOVERY_ENABLED = _env_bool("ASR_QC_LOW_INFO_RECOVERY", False)
 _EMPTY_DURATION_S = float(os.getenv("ASR_QC_EMPTY_DURATION", "1.0"))
 _LONG_LOW_VALUE_DURATION_S = float(
     os.getenv("ASR_QC_LONG_LOW_VALUE_DURATION", "6.0")
@@ -91,9 +82,9 @@ def check_logprob_quality(result: dict) -> dict:
     Reads thresholds dynamically so tests can override via monkeypatch.setenv.
     """
     strict_drop = asr_drop_uncertain_enabled()
-    nospeech_threshold = _env_float("ASR_QC_NOSPEECH_THRESHOLD", 0.6)
-    logprob_threshold = _env_float("ASR_QC_LOGPROB_THRESHOLD", -1.0)
-    compression_threshold = _env_float("ASR_QC_COMPRESSION_THRESHOLD", 2.4)
+    nospeech_threshold = _env_float("ASR_QC_NOSPEECH_THRESHOLD", 0.5)
+    logprob_threshold = _env_float("ASR_QC_LOGPROB_THRESHOLD", -0.7)
+    compression_threshold = _env_float("ASR_QC_COMPRESSION_THRESHOLD", 2.0)
     if strict_drop:
         nospeech_threshold = _env_float(
             "ASR_QC_STRICT_NOSPEECH_THRESHOLD",
@@ -301,7 +292,7 @@ def evaluate_asr_chunk_qc(
 
     if generation_error_kind:
         reasons.append(f"generation_{generation_error_kind}")
-        severity = "recover" if generation_error_kind in {"timeout", "worker_error"} else "warn"
+        severity = "reject" if generation_error_kind in {"timeout", "worker_error"} else "warn"
 
     if not compact and duration >= _EMPTY_DURATION_S:
         reasons.append("empty_text_for_speech_chunk")
@@ -310,11 +301,11 @@ def evaluate_asr_chunk_qc(
 
     if mojibake:
         reasons.append("mojibake")
-        severity = "recover"
+        severity = "reject"
 
     if context_leak:
         reasons.append("context_leak")
-        severity = "recover"
+        severity = "reject"
 
     repeat_run = int(repeat["run"])
     repeat_ratio = float(repeat["ratio"])
@@ -326,21 +317,19 @@ def evaluate_asr_chunk_qc(
     )
     if repeated_loop:
         reasons.append("repeat_ngram_loop")
-        severity = "recover"
+        severity = "reject"
 
     if len(compact) >= _HALLUCINATION_MIN_CHARS and repeat_ratio >= _REPEAT_MIN_RATIO:
         reasons.append("hallucination_cap_like")
-        severity = "recover"
+        severity = "reject"
 
     if len(compact) >= _DENSITY_MIN_CHARS and chars_per_sec > _MAX_CHARS_PER_SEC:
         reasons.append("abnormal_char_density")
-        severity = "recover"
+        severity = "reject"
 
     if duration >= _LOW_INFO_DURATION_S and len(compact) <= _LOW_INFO_MAX_CHARS and low_value:
         reasons.append("long_low_information_chunk")
-        if _LOW_INFO_RECOVERY_ENABLED:
-            severity = "recover"
-        elif severity == "ok":
+        if severity == "ok":
             severity = "warn"
     elif duration >= _LONG_LOW_VALUE_DURATION_S and low_value:
         reasons.append("long_low_value_text")
@@ -350,7 +339,9 @@ def evaluate_asr_chunk_qc(
     signal_qc = check_logprob_quality(text_result)
     if signal_qc["verdict"] != "ok":
         reasons.append(str(signal_qc.get("reason") or signal_qc["verdict"]))
-        if severity == "ok":
+        if signal_qc["verdict"] == "reject":
+            severity = "reject"
+        elif severity == "ok":
             severity = "warn"
         _logger.warning(
             "[asr-qc] signal_verdict=%s reason=%s text=%s",
@@ -402,7 +393,7 @@ def evaluate_asr_text_results_qc(
         return {
             "enabled": False,
             "chunk_count": len(chunks),
-            "recoverable_count": 0,
+            "reject_count": 0,
             "warning_count": 0,
             "generation_error_count": 0,
             "generation_overflow_count": 0,
@@ -412,12 +403,12 @@ def evaluate_asr_text_results_qc(
             "dropped_uncertain_count": 0,
             "dropped_uncertain_items": [],
             "items": [],
-            "recoverable_indices": [],
+            "rejected_indices": [],
             **qc_policy,
         }
 
     items: list[dict] = []
-    recoverable_indices: list[int] = []
+    rejected_indices: list[int] = []
     warning_count = 0
     generation_error_count = 0
     generation_overflow_count = 0
@@ -459,15 +450,15 @@ def evaluate_asr_text_results_qc(
                     failure_kind = str(asr_generation.get("failure_kind") or "").strip()
                 if error_kind == "quarantined" or failure_kind:
                     quarantined_count += 1
-        if qc["severity"] == "recover":
-            recoverable_indices.append(index)
+        if qc["severity"] == "reject":
+            rejected_indices.append(index)
         elif qc["severity"] == "warn":
             warning_count += 1
 
     return {
         "enabled": True,
         "chunk_count": len(chunks),
-        "recoverable_count": len(recoverable_indices),
+        "reject_count": len(rejected_indices),
         "warning_count": warning_count,
         "generation_error_count": generation_error_count,
         "generation_overflow_count": generation_overflow_count,
@@ -477,7 +468,7 @@ def evaluate_asr_text_results_qc(
         "dropped_uncertain_count": 0,
         "dropped_uncertain_items": [],
         "items": items,
-        "recoverable_indices": recoverable_indices,
+        "rejected_indices": rejected_indices,
         **qc_policy,
     }
 
@@ -493,8 +484,8 @@ def _drop_reasons_for_qc_item(item: dict) -> list[str]:
     drop_reasons: list[str] = []
     if signal_verdict == "reject":
         drop_reasons.append("signal_reject")
-    if severity == "recover":
-        drop_reasons.append("recoverable_qc")
+    elif severity == "reject":
+        drop_reasons.append("qc_reject")
     for reason in reasons:
         if reason.startswith("generation_"):
             drop_reasons.append(reason)
@@ -597,7 +588,7 @@ def format_qc_log_items(report: dict, limit: int = 8) -> list[str]:
     interesting = [
         item
         for item in report.get("items", [])
-        if item.get("severity") in {"recover", "warn"}
+        if item.get("severity") in {"reject", "warn"}
     ]
 
     for item in interesting[:limit]:

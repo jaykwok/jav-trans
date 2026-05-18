@@ -16,7 +16,6 @@ class BaseAsrBackend(Protocol):
     timestamp_mode: str
     request_batch_size: int
     align_batch_size: int
-    supports_temperature: bool
 
     def load(self, on_stage: Callable[[str], None] | None = None) -> None: ...
 
@@ -32,7 +31,6 @@ class BaseAsrBackend(Protocol):
         contexts: list[str] | None = None,
         initial_prompts: list[str | None] | None = None,
         on_stage: Callable[[str], None] | None = None,
-        temperature: float = 0.0,
     ) -> list[dict[str, Any]]: ...
 
     def finalize_text_results(

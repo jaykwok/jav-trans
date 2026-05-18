@@ -101,7 +101,8 @@ HF_ENDPOINT=https://hf-mirror.com
 - **断点续传与多层缓存**：支持音频缓存、ASR checkpoint、`aligned_segments.json` 复用、翻译 cache，以及独立的 VAD/chunk 边界缓存；只改 ASR prompt/token 参数时可复用 VAD 切分结果。
 - **懂二次元的识别模型**：支持 `anime-whisper`、`whisper-ja-anime-v0.3`、`whisper-ja-1.5b`、`qwen3-asr-1.7b`。引擎默认仍是 `anime-whisper`，Web 推荐首选 `whisper-ja-anime-v0.3`。
 - **WhisperSeg VAD + 长 chunk 流程**：默认使用 WhisperSeg，阈值 `0.35`；开启 VAD chunk packing，将相邻语音段打包成更适合 Whisper/forced alignment 的长 chunk。
-- **ASR generation budget 防溢出**：Whisper 系列会根据 decoder 窗口、forced decoder ids、prompt tokens 动态裁剪 prompt 和 `max_new_tokens`，质量报告会统计 overflow/error/timeout/quarantine。
+- **严格优先的 ASR 策略**：默认 `ASR_PRECISION_MODE=strict`。低置信、疑似重复幻觉、上下文泄漏、乱码和生成异常的文本会在 alignment / F0 / 翻译前直接丢弃，并写入 quality report 审计。
+- **ASR generation budget 防溢出**：Whisper 系列会根据 decoder 窗口、forced decoder ids、prompt tokens 动态裁剪 prompt 和 `max_new_tokens`，质量报告会统计 overflow/error/timeout/quarantine；生成失败不再通过温度重试或 recovery 补写内容。
 - **翻译前噪声过滤**：在提交给 LLM 前过滤空字幕、纯引号片段、纯英文幻觉 token 和纯特殊符号片段，减少无效翻译请求。
 - **智能性别区分**：forced alignment 后执行词级 F0 性别检测，并根据 gender turn 重新切分字幕，让对话翻译更加稳定。
 - **高自由度翻译**：支持接入任何兼容 OpenAI 接口的大语言模型，甚至可以设置特定词汇的“术语表”。
@@ -112,10 +113,12 @@ HF_ENDPOINT=https://hf-mirror.com
 当前主流水线为：
 
 ```text
-视频 -> 音频准备 -> WhisperSeg VAD -> VAD chunk packing -> ASR -> Forced Alignment
+视频 -> 音频准备 -> WhisperSeg VAD -> VAD chunk packing -> ASR -> Strict Precision QC -> Forced Alignment
 -> 词级 F0 性别检测 -> gender turn 重切段 -> 翻译前 ASR 噪声过滤
 -> LLM 翻译 -> SRT / quality report
 ```
+
+当前 ASR 以“少但准”为默认目标：不确定的内容宁可不出现在字幕里，也不把疑似幻觉交给后续对齐和翻译。旧的 ASR recovery、温度 fallback、prompt overflow retry 已从后端移除；保留的 timestamp/alignment fallback 只用于给已确认文本补时间轴，不会改写或新增 ASR 文本。
 
 常用缓存位置：
 
