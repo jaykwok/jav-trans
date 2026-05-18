@@ -4,7 +4,9 @@ from whisper.backends.base import BaseAsrBackend
 from whisper.local_backend import LocalAsrBackend, SubprocessAsrBackend
 
 
-ASR_BACKEND = os.getenv("ASR_BACKEND", "anime-whisper").strip().lower()
+DEFAULT_ASR_BACKEND = "whisper-ja-anime-v0.3"
+
+ASR_BACKEND = os.getenv("ASR_BACKEND", DEFAULT_ASR_BACKEND).strip().lower()
 _ASR_WORKER_MODE = os.getenv("ASR_WORKER_MODE", "subprocess").strip().lower()
 
 _WHISPER_BACKENDS = {
@@ -18,7 +20,7 @@ _VALID_ASR_WORKER_MODES = {"inproc", "subprocess"}
 
 
 def current_asr_backend() -> str:
-    return os.getenv("ASR_BACKEND", "anime-whisper").strip().lower()
+    return os.getenv("ASR_BACKEND", DEFAULT_ASR_BACKEND).strip().lower()
 
 
 def current_asr_worker_mode() -> str:

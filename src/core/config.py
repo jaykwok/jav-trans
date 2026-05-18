@@ -36,14 +36,14 @@ DEFAULT_SETTINGS: dict[str, str] = {
     # --- ASR & Alignment Model Settings ---
     # Transcription backend. Valid values:
     # whisper-ja-anime-v0.3 / anime-whisper / qwen3-asr-1.7b / whisper-ja-1.5b.
-    "ASR_BACKEND": "anime-whisper",
+    "ASR_BACKEND": "whisper-ja-anime-v0.3",
     # Whisper-family timestamp mode; forced uses forced alignment for better subtitle timing.
     "WHISPER_TIMESTAMP_MODE": "forced",
     # Local/Qwen ASR timestamp mode. Valid values: forced, native, hybrid.
     "ALIGNMENT_TIMESTAMP_MODE": "forced",
     # Optional override for the active Whisper-family model path; empty uses the preset repo/local cache.
     "WHISPER_MODEL_PATH": "",
-    # Whisper generation defaults for anime-whisper; other presets provide their own defaults when unset.
+    # Whisper generation fallback defaults; presets can override these when env values are unset.
     "WHISPER_BEAMS": "1",
     "WHISPER_NO_REPEAT_NGRAM": "0",
     "WHISPER_MAX_NEW_TOKENS": "444",
@@ -190,16 +190,16 @@ DEFAULT_SETTINGS: dict[str, str] = {
     # --- ASR QC / Conservative Filtering ---
     # 1 enables ASR text quality checks before translation.
     "ASR_QC_ENABLED": "1",
-    # strict drops uncertain ASR chunks before alignment.
-    "ASR_PRECISION_MODE": "strict",
-    # ASR confidence thresholds used by QC and strict precision filtering.
-    "ASR_QC_NOSPEECH_THRESHOLD": "0.5",
-    "ASR_QC_LOGPROB_THRESHOLD": "-0.7",
-    "ASR_QC_COMPRESSION_THRESHOLD": "2.0",
-    # Stricter confidence thresholds used only when ASR_PRECISION_MODE=strict.
-    "ASR_QC_STRICT_NOSPEECH_THRESHOLD": "0.5",
-    "ASR_QC_STRICT_LOGPROB_THRESHOLD": "-0.7",
-    "ASR_QC_STRICT_COMPRESSION_THRESHOLD": "2.0",
+    # Adaptive precision drops high-risk ASR chunks while relaxing low-logprob true dialogue.
+    "ASR_QC_ADAPTIVE_BASE_LOGPROB": "-0.7",
+    "ASR_QC_ADAPTIVE_MIN_LOGPROB": "-0.95",
+    "ASR_QC_ADAPTIVE_MAX_LOGPROB": "-0.55",
+    "ASR_QC_ADAPTIVE_VIDEO_MAD_MULTIPLIER": "1.8",
+    "ASR_QC_ADAPTIVE_VIDEO_MAX_LOGPROB": "-0.70",
+    "ASR_QC_ADAPTIVE_HARD_NOSPEECH_THRESHOLD": "0.5",
+    "ASR_QC_ADAPTIVE_HARD_COMPRESSION_THRESHOLD": "2.0",
+    "ASR_QC_ADAPTIVE_HARD_MAX_CHARS_PER_SEC": "14.0",
+    "ASR_QC_ADAPTIVE_HARD_REPEAT_RATIO": "0.45",
     # --- Subtitle Timings ---
     # Minimum displayed subtitle duration in seconds.
     "MIN_SUBTITLE_DURATION": "0.6",

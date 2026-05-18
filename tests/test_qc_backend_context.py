@@ -4,7 +4,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from whisper.qc import apply_strict_precision_filter, evaluate_asr_text_results_qc
+from whisper.qc import apply_adaptive_precision_filter, evaluate_asr_text_results_qc
 
 
 def test_context_leak_skipped_when_backend_ignores_contexts():
@@ -117,8 +117,7 @@ def test_quarantined_timeout_counts_as_timeout_and_quarantine():
     assert report["reject_count"] == 1
 
 
-def test_strict_precision_filter_drops_signal_reject(monkeypatch):
-    monkeypatch.setenv("ASR_PRECISION_MODE", "strict")
+def test_adaptive_precision_filter_drops_signal_reject():
     chunks = [{"index": 1, "start": 0.0, "end": 2.0}]
     text_results = [
         {
@@ -137,7 +136,7 @@ def test_strict_precision_filter_drops_signal_reject(monkeypatch):
         backend=SimpleNamespace(accepts_contexts=True),
     )
 
-    filtered, updated_report, log = apply_strict_precision_filter(
+    filtered, updated_report, log = apply_adaptive_precision_filter(
         chunks,
         text_results,
         report,
@@ -150,20 +149,53 @@ def test_strict_precision_filter_drops_signal_reject(monkeypatch):
     assert updated_report["dropped_uncertain_count"] == 1
     assert updated_report["dropped_uncertain_items"][0]["text_preview"] == "幻覚テキスト"
     assert updated_report["dropped_uncertain_items"][0]["original_text"] == "幻覚テキスト"
-    assert "ASR Strict Precision drop chunk 1" in log[0]
+    assert filtered[0]["asr_dropped"]["policy"] == "adaptive_precision"
+    assert "ASR Adaptive Precision drop chunk 1" in log[0]
 
 
-def test_strict_precision_filter_keeps_warn_in_normal_mode(monkeypatch):
-    monkeypatch.setenv("ASR_PRECISION_MODE", "normal")
-    chunks = [{"index": 1, "start": 0.0, "end": 2.0}]
+def test_adaptive_precision_filter_keeps_low_risk_low_logprob():
+    chunks = [{"index": 1, "start": 0.0, "end": 10.0}]
     text_results = [
         {
-            "text": "低信頼だけど通常モード",
-            "raw_text": "低信頼だけど通常モード",
-            "duration": 2.0,
-            "avg_logprob": -1.5,
-            "no_speech_prob": 0.1,
-            "compression_ratio": 1.2,
+            "text": "ふふ……そんなこと、恥ずかしいこと……",
+            "raw_text": "ふふ……そんなこと、恥ずかしいこと……",
+            "duration": 10.0,
+            "avg_logprob": -0.84,
+            "no_speech_prob": 0.00001,
+            "compression_ratio": 0.8,
+        }
+    ]
+    report = evaluate_asr_text_results_qc(
+        chunks,
+        text_results,
+        is_low_value_text=lambda _text: False,
+        backend=SimpleNamespace(accepts_contexts=True),
+    )
+
+    filtered, updated_report, log = apply_adaptive_precision_filter(
+        chunks,
+        text_results,
+        report,
+    )
+
+    assert report["precision_policy"] == "adaptive"
+    assert report["reject_count"] == 0
+    assert filtered == text_results
+    assert updated_report["dropped_uncertain_count"] == 0
+    assert log == []
+
+
+def test_adaptive_precision_filter_drops_hard_density_reject():
+    text = "もしも" * 120
+    chunks = [{"index": 1, "start": 0.0, "end": 7.84}]
+    text_results = [
+        {
+            "text": text,
+            "raw_text": text,
+            "duration": 7.84,
+            "avg_logprob": -0.75,
+            "no_speech_prob": 0.00001,
+            "compression_ratio": 0.8,
         }
     ]
     report = evaluate_asr_text_results_qc(
@@ -172,14 +204,17 @@ def test_strict_precision_filter_keeps_warn_in_normal_mode(monkeypatch):
         backend=SimpleNamespace(accepts_contexts=True),
     )
 
-    filtered, updated_report, log = apply_strict_precision_filter(
+    filtered, updated_report, log = apply_adaptive_precision_filter(
         chunks,
         text_results,
         report,
     )
 
-    assert filtered == text_results
-    assert updated_report["dropped_uncertain_count"] == 0
-    assert log == []
+    assert report["reject_count"] == 1
+    assert "abnormal_char_density" in report["items"][0]["reasons"]
+    assert filtered[0]["text"] == ""
+    assert updated_report["dropped_uncertain_count"] == 1
+    assert log
+    assert "ASR Adaptive Precision drop chunk 1" in log[0]
 
 

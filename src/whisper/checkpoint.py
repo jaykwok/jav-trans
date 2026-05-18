@@ -139,30 +139,41 @@ def _get_whisper_generation_checkpoint_signature(
                 "generation_budget_policy_version": str(
                     generation_budget_policy_version()
                 ),
-                "precision_mode": _env_lower("ASR_PRECISION_MODE", "strict"),
-                "qc_nospeech_threshold": _env_text(
-                    "ASR_QC_NOSPEECH_THRESHOLD",
-                    "0.5",
-                ),
-                "qc_logprob_threshold": _env_text(
-                    "ASR_QC_LOGPROB_THRESHOLD",
+                "qc_adaptive_base_logprob": _env_text(
+                    "ASR_QC_ADAPTIVE_BASE_LOGPROB",
                     "-0.7",
                 ),
-                "qc_compression_threshold": _env_text(
-                    "ASR_QC_COMPRESSION_THRESHOLD",
-                    "2.0",
+                "qc_adaptive_min_logprob": _env_text(
+                    "ASR_QC_ADAPTIVE_MIN_LOGPROB",
+                    "-0.95",
                 ),
-                "qc_strict_nospeech_threshold": _env_text(
-                    "ASR_QC_STRICT_NOSPEECH_THRESHOLD",
+                "qc_adaptive_max_logprob": _env_text(
+                    "ASR_QC_ADAPTIVE_MAX_LOGPROB",
+                    "-0.55",
+                ),
+                "qc_adaptive_video_mad_multiplier": _env_text(
+                    "ASR_QC_ADAPTIVE_VIDEO_MAD_MULTIPLIER",
+                    "1.8",
+                ),
+                "qc_adaptive_video_max_logprob": _env_text(
+                    "ASR_QC_ADAPTIVE_VIDEO_MAX_LOGPROB",
+                    "-0.70",
+                ),
+                "qc_adaptive_hard_nospeech_threshold": _env_text(
+                    "ASR_QC_ADAPTIVE_HARD_NOSPEECH_THRESHOLD",
                     "0.5",
                 ),
-                "qc_strict_logprob_threshold": _env_text(
-                    "ASR_QC_STRICT_LOGPROB_THRESHOLD",
-                    "-0.7",
-                ),
-                "qc_strict_compression_threshold": _env_text(
-                    "ASR_QC_STRICT_COMPRESSION_THRESHOLD",
+                "qc_adaptive_hard_compression_threshold": _env_text(
+                    "ASR_QC_ADAPTIVE_HARD_COMPRESSION_THRESHOLD",
                     "2.0",
+                ),
+                "qc_adaptive_hard_max_chars_per_sec": _env_text(
+                    "ASR_QC_ADAPTIVE_HARD_MAX_CHARS_PER_SEC",
+                    "14.0",
+                ),
+                "qc_adaptive_hard_repeat_ratio": _env_text(
+                    "ASR_QC_ADAPTIVE_HARD_REPEAT_RATIO",
+                    "0.45",
                 ),
             },
             sort_keys=True,
@@ -242,21 +253,41 @@ def _get_asr_runtime_signature(
                 _env_text("ASR_MAX_NEW_TOKENS", "128"),
             ),
             "asr_repetition_penalty": _env_text("ASR_REPETITION_PENALTY", "1.05"),
-            "precision_mode": _env_lower("ASR_PRECISION_MODE", "strict"),
-            "qc_nospeech_threshold": _env_text("ASR_QC_NOSPEECH_THRESHOLD", "0.5"),
-            "qc_logprob_threshold": _env_text("ASR_QC_LOGPROB_THRESHOLD", "-0.7"),
-            "qc_compression_threshold": _env_text("ASR_QC_COMPRESSION_THRESHOLD", "2.0"),
-            "qc_strict_nospeech_threshold": _env_text(
-                "ASR_QC_STRICT_NOSPEECH_THRESHOLD",
-                "0.5",
-            ),
-            "qc_strict_logprob_threshold": _env_text(
-                "ASR_QC_STRICT_LOGPROB_THRESHOLD",
+            "qc_adaptive_base_logprob": _env_text(
+                "ASR_QC_ADAPTIVE_BASE_LOGPROB",
                 "-0.7",
             ),
-            "qc_strict_compression_threshold": _env_text(
-                "ASR_QC_STRICT_COMPRESSION_THRESHOLD",
+            "qc_adaptive_min_logprob": _env_text(
+                "ASR_QC_ADAPTIVE_MIN_LOGPROB",
+                "-0.95",
+            ),
+            "qc_adaptive_max_logprob": _env_text(
+                "ASR_QC_ADAPTIVE_MAX_LOGPROB",
+                "-0.55",
+            ),
+            "qc_adaptive_video_mad_multiplier": _env_text(
+                "ASR_QC_ADAPTIVE_VIDEO_MAD_MULTIPLIER",
+                "1.8",
+            ),
+            "qc_adaptive_video_max_logprob": _env_text(
+                "ASR_QC_ADAPTIVE_VIDEO_MAX_LOGPROB",
+                "-0.70",
+            ),
+            "qc_adaptive_hard_nospeech_threshold": _env_text(
+                "ASR_QC_ADAPTIVE_HARD_NOSPEECH_THRESHOLD",
+                "0.5",
+            ),
+            "qc_adaptive_hard_compression_threshold": _env_text(
+                "ASR_QC_ADAPTIVE_HARD_COMPRESSION_THRESHOLD",
                 "2.0",
+            ),
+            "qc_adaptive_hard_max_chars_per_sec": _env_text(
+                "ASR_QC_ADAPTIVE_HARD_MAX_CHARS_PER_SEC",
+                "14.0",
+            ),
+            "qc_adaptive_hard_repeat_ratio": _env_text(
+                "ASR_QC_ADAPTIVE_HARD_REPEAT_RATIO",
+                "0.45",
             ),
             "whisper": _json_or_text(whisper_generation_signature),
         },

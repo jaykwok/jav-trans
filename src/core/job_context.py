@@ -95,7 +95,10 @@ class JobContext:
             if key
         }
         return cls(
-            asr_backend=str(getattr(spec, "asr_backend", "anime-whisper") or "anime-whisper"),
+            asr_backend=str(
+                getattr(spec, "asr_backend", "whisper-ja-anime-v0.3")
+                or "whisper-ja-anime-v0.3"
+            ),
             asr_context=str(getattr(spec, "asr_context", "") or ""),
             subtitle_mode=str(getattr(spec, "subtitle_mode", "bilingual") or "bilingual"),
             show_gender=bool(getattr(spec, "show_gender", True)),

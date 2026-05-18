@@ -13,7 +13,7 @@ def make_job_context(
     job_temp_root: Path | str,
     *,
     job_id: str | None = None,
-    asr_backend: str = "anime-whisper",
+    asr_backend: str = "whisper-ja-anime-v0.3",
     asr_context: str = "",
     subtitle_mode: str = "zh",
     skip_translation: bool = False,
