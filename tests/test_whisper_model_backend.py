@@ -27,7 +27,7 @@ def test_whisper_preset_names_are_public_backend_names():
     }
 
 
-def test_generation_config_normalized_for_deterministic_asr():
+def test_generation_config_clears_sampling_temperature_for_deterministic_asr():
     model = SimpleNamespace(
         generation_config=SimpleNamespace(
             temperature=0.0,
@@ -42,7 +42,7 @@ def test_generation_config_normalized_for_deterministic_asr():
     assert model.generation_config.pad_token_id == 151645
 
 
-def test_generation_config_keeps_default_temperature():
+def test_generation_config_keeps_transformers_default_temperature():
     model = SimpleNamespace(
         generation_config=SimpleNamespace(
             temperature=1.0,

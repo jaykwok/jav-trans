@@ -130,53 +130,25 @@ def _generation_sequences(output: Any) -> Any:
     return getattr(output, "sequences", output)
 
 
-def _generate_with_overflow_retry(
+def _generate_deterministic(
     model: Any,
     processor: Any,
     input_features: Any,
     generate_kwargs: dict[str, Any],
-    temperature: float = 0.0,
-) -> tuple[Any, bool, str | None]:
+) -> tuple[Any, bool]:
     del processor
     kwargs = dict(generate_kwargs)
     kwargs["return_dict_in_generate"] = True
     kwargs["output_scores"] = True
-    if temperature > 0:
-        do_sample = True
-        kwargs["temperature"] = float(temperature)
-    else:
-        do_sample = False
-        kwargs.pop("temperature", None)
+    kwargs.pop("temperature", None)
 
     try:
-        output = model.generate(input_features, do_sample=do_sample, **kwargs)
-        return output, "prompt_ids" in kwargs, None
+        output = model.generate(input_features, do_sample=False, **kwargs)
+        return output, "prompt_ids" in kwargs
     except RuntimeError as generate_exc:
-        if "prompt_ids" not in kwargs or not _is_prompt_overflow_error(generate_exc):
-            raise
-
-    logger.warning("[ASR] prompt overflow, retrying without prompt_ids")
-    kwargs_no_prompt = {
-        key: value for key, value in kwargs.items() if key != "prompt_ids"
-    }
-    try:
-        output = model.generate(input_features, do_sample=do_sample, **kwargs_no_prompt)
-    except RuntimeError as retry_exc:
-        if not _is_prompt_overflow_error(retry_exc):
-            raise
-        max_new_tokens = kwargs_no_prompt.get("max_new_tokens")
-        if isinstance(max_new_tokens, int) and max_new_tokens > 1:
-            reduced = max(1, max_new_tokens // 2)
-            logger.warning(
-                "[ASR] prompt overflow after prompt drop, retrying with max_new_tokens=%d",
-                reduced,
-            )
-            kwargs_reduced = dict(kwargs_no_prompt)
-            kwargs_reduced["max_new_tokens"] = reduced
-            output = model.generate(input_features, do_sample=do_sample, **kwargs_reduced)
-            return output, False, "overflow_retry_reduced_max_new_tokens"
+        if _is_prompt_overflow_error(generate_exc):
+            logger.warning("[ASR] prompt overflow; dropping this chunk")
         raise
-    return output, False, "prompt_overflow_retry_without_prompt_ids"
 
 
 def _no_speech_token_id(model: Any, processor: Any) -> int | None:
@@ -285,8 +257,6 @@ def _normalize_generation_config_for_deterministic_asr(model: Any) -> None:
 class WhisperModelBackend:
     is_subprocess = False
     accepts_contexts = False
-    supports_temperature = True
-
     def __init__(
         self,
         *,
@@ -391,7 +361,6 @@ class WhisperModelBackend:
         contexts: list[str] | None = None,
         initial_prompts: list[str | None] | None = None,
         on_stage: Callable[[str], None] | None = None,
-        temperature: float = 0.0,
     ) -> list[dict[str, Any]]:
         if contexts and any(contexts):
             if not getattr(self, "_warned_contexts", False):
@@ -488,21 +457,12 @@ class WhisperModelBackend:
                             if prompt_warning
                             else token_budget_warning
                         )
-                    output, _used_prompt_ids, retry_reason = _generate_with_overflow_retry(
+                    output, _used_prompt_ids = _generate_deterministic(
                         self._model,
                         self._processor,
                         input_features,
                         generate_kwargs,
-                        temperature=temperature,
                     )
-                    if retry_reason == "prompt_overflow_retry_without_prompt_ids":
-                        prompt_warning = (
-                            f"{self.backend_label} prompt overflow, retried without initial_prompt"
-                        )
-                    elif retry_reason == "overflow_retry_reduced_max_new_tokens":
-                        prompt_warning = (
-                            f"{self.backend_label} prompt overflow, retried with reduced max_new_tokens"
-                        )
                     predicted_ids = _generation_sequences(output)
                     text = self._processor.batch_decode(
                         predicted_ids,
@@ -531,7 +491,6 @@ class WhisperModelBackend:
                             "budget": budget.as_dict() if budget else {},
                             "error_kind": None,
                             "error_detail": "",
-                            "retry_reason": retry_reason,
                         },
                         "log": [
                             f"{self.backend_label} ASR 输出模式: text_only",
@@ -574,7 +533,6 @@ class WhisperModelBackend:
                             "budget": budget.as_dict() if budget else {},
                             "error_kind": error_kind,
                             "error_detail": str(e),
-                            "retry_reason": None,
                         },
                         "log": [f"{self.backend_label} 转录异常: {e}"],
                     }

@@ -139,22 +139,18 @@ def _get_whisper_generation_checkpoint_signature(
                 "generation_budget_policy_version": str(
                     generation_budget_policy_version()
                 ),
-                "precision_mode": _env_lower("ASR_PRECISION_MODE", "normal"),
-                "drop_uncertain_enabled": _env_lower(
-                    "ASR_DROP_UNCERTAIN_ENABLED",
-                    "0",
-                ),
+                "precision_mode": _env_lower("ASR_PRECISION_MODE", "strict"),
                 "qc_nospeech_threshold": _env_text(
                     "ASR_QC_NOSPEECH_THRESHOLD",
-                    "0.6",
+                    "0.5",
                 ),
                 "qc_logprob_threshold": _env_text(
                     "ASR_QC_LOGPROB_THRESHOLD",
-                    "-1.0",
+                    "-0.7",
                 ),
                 "qc_compression_threshold": _env_text(
                     "ASR_QC_COMPRESSION_THRESHOLD",
-                    "2.4",
+                    "2.0",
                 ),
                 "qc_strict_nospeech_threshold": _env_text(
                     "ASR_QC_STRICT_NOSPEECH_THRESHOLD",
@@ -246,16 +242,10 @@ def _get_asr_runtime_signature(
                 _env_text("ASR_MAX_NEW_TOKENS", "128"),
             ),
             "asr_repetition_penalty": _env_text("ASR_REPETITION_PENALTY", "1.05"),
-            "asr_temperature_fallback": _env_lower("ASR_TEMPERATURE_FALLBACK", ""),
-            "asr_fallback_temperatures": _env_text(
-                "ASR_FALLBACK_TEMPERATURES",
-                "0.2,0.4,0.6",
-            ),
-            "precision_mode": _env_lower("ASR_PRECISION_MODE", "normal"),
-            "drop_uncertain_enabled": _env_lower("ASR_DROP_UNCERTAIN_ENABLED", "0"),
-            "qc_nospeech_threshold": _env_text("ASR_QC_NOSPEECH_THRESHOLD", "0.6"),
-            "qc_logprob_threshold": _env_text("ASR_QC_LOGPROB_THRESHOLD", "-1.0"),
-            "qc_compression_threshold": _env_text("ASR_QC_COMPRESSION_THRESHOLD", "2.4"),
+            "precision_mode": _env_lower("ASR_PRECISION_MODE", "strict"),
+            "qc_nospeech_threshold": _env_text("ASR_QC_NOSPEECH_THRESHOLD", "0.5"),
+            "qc_logprob_threshold": _env_text("ASR_QC_LOGPROB_THRESHOLD", "-0.7"),
+            "qc_compression_threshold": _env_text("ASR_QC_COMPRESSION_THRESHOLD", "2.0"),
             "qc_strict_nospeech_threshold": _env_text(
                 "ASR_QC_STRICT_NOSPEECH_THRESHOLD",
                 "0.5",

@@ -136,8 +136,6 @@ def _ctx_flag(ctx: JobContext, name: str, default: bool = False) -> bool:
         return ctx.show_gender
     if name == "MULTI_CUE_SPLIT_ENABLED":
         return ctx.multi_cue_split
-    if name == "ASR_RECOVERY_ENABLED":
-        return ctx.asr_recovery
     if name == "QUALITY_REPORT_ENABLED":
         return ctx.keep_quality_report
     return default
@@ -155,7 +153,6 @@ _ASR_STAGE_ADVANCED_PREFIXES = (
     "SEGMENT_",
     "VAD_",
     "ASR_QC_",
-    "ASR_RECOVERY_",
     "ASR_GRAY_",
     "ASR_CONTEXT_LEAK_",
     "ASR_FRAGMENT_",
@@ -178,11 +175,8 @@ _ASR_STAGE_ADVANCED_KEYS = {
     "ASR_HEAD_CONTEXT",
     "ASR_HEAD_CONTEXT_MAX_START_S",
     "ASR_PRECISION_MODE",
-    "ASR_DROP_UNCERTAIN_ENABLED",
     "ASR_MAX_NEW_TOKENS",
     "ASR_REPETITION_PENALTY",
-    "ASR_TEMPERATURE_FALLBACK",
-    "ASR_FALLBACK_TEMPERATURES",
     "ASR_WORKER_MODE",
     "ASR_SLIDING_CONTEXT_SEGS",
     "WHISPER_TIMESTAMP_MODE",
@@ -225,7 +219,6 @@ def _asr_stage_env_overrides(ctx: JobContext) -> dict[str, str]:
     if asr_backend:
         overrides["ASR_BACKEND"] = asr_backend
     overrides["ASR_CONTEXT"] = str(ctx.asr_context or "")
-    overrides["ASR_RECOVERY_ENABLED"] = "1" if bool(ctx.asr_recovery) else "0"
     overrides.setdefault("WHISPERSEG_THRESHOLD", str(ctx.vad_threshold))
     return overrides
 
@@ -547,10 +540,6 @@ def _cleanup_pipeline_temp(job_temp_dir: str, audio_path: str, translation_cache
     cleanup_module.cleanup_runtime_ephemeral_temp(
         job_temp_root=os.getenv("JOB_TEMP_DIR", "temp/jobs") or "temp/jobs",
         asr_chunk_root=getattr(asr_module, "_ASR_CHUNK_ROOT", Path("temp") / "chunks"),
-        recovery_output_root=os.getenv(
-            "ASR_RECOVERY_OUTPUT_ROOT",
-            str(Path("temp") / "recovery"),
-        ),
         project_root=PROJECT_ROOT,
     )
 

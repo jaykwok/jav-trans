@@ -37,7 +37,6 @@ def make_job_context(
         subtitle_mode=subtitle_mode,
         show_gender=True,
         multi_cue_split=True,
-        asr_recovery=False,
         vad_threshold=vad_threshold,
         skip_translation=skip_translation,
         target_lang="简体中文",

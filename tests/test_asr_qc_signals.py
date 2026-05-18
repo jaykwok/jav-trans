@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-import pytest
-
 from whisper.qc import check_logprob_quality
 
 
@@ -20,14 +18,13 @@ def test_reject_on_high_no_speech_prob(monkeypatch):
     assert "no_speech" in qc["reason"]
 
 
-def test_warn_on_low_avg_logprob(monkeypatch):
+def test_default_strict_rejects_low_avg_logprob(monkeypatch):
     monkeypatch.setenv("ASR_QC_LOGPROB_THRESHOLD", "-1.0")
     monkeypatch.delenv("ASR_PRECISION_MODE", raising=False)
-    monkeypatch.delenv("ASR_DROP_UNCERTAIN_ENABLED", raising=False)
-    # compression_ratio within threshold so only logprob fires
+    # strict precision is the default, so low logprob is rejected.
     result = {"avg_logprob": -1.5, "no_speech_prob": 0.1, "compression_ratio": 1.2}
     qc = check_logprob_quality(result)
-    assert qc["verdict"] == "warn"
+    assert qc["verdict"] == "reject"
     assert "logprob" in qc["reason"]
 
 
@@ -67,8 +64,8 @@ def test_reject_takes_priority_over_warn():
 
 
 def test_partial_none_signals_checked():
-    # no_speech_prob is None but avg_logprob is bad → warn
+    # no_speech_prob is None but avg_logprob is bad.
     result = {"avg_logprob": -2.0, "no_speech_prob": None, "compression_ratio": None}
     qc = check_logprob_quality(result)
-    assert qc["verdict"] == "warn"
+    assert qc["verdict"] == "reject"
     assert "logprob" in qc["reason"]

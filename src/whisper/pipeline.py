@@ -8,7 +8,7 @@ from typing import Callable
 from audio.chunk_packer import PackedChunk, pack_vad_segments
 from whisper import checkpoint as _checkpoint_module
 from whisper import chunking as _chunking_module
-from whisper import recovery as _recovery_module
+from whisper import qc_stage as _qc_stage_module
 from whisper import transcribe as _transcribe_module
 from whisper.qc import apply_strict_precision_filter
 from whisper import vad_chunk_cache as _vad_chunk_cache_module
@@ -20,7 +20,7 @@ _registry_module = importlib.reload(_registry_module)
 _chunking_module = importlib.reload(_chunking_module)
 _checkpoint_module = importlib.reload(_checkpoint_module)
 _transcribe_module = importlib.reload(_transcribe_module)
-_recovery_module = importlib.reload(_recovery_module)
+_qc_stage_module = importlib.reload(_qc_stage_module)
 _vad_chunk_cache_module = importlib.reload(_vad_chunk_cache_module)
 
 ASR_BACKEND = _registry_module.current_asr_backend()
@@ -140,8 +140,7 @@ _repair_postprocessed_segment_windows = _transcribe_module._repair_postprocessed
 _should_split_on_gender = _transcribe_module._should_split_on_gender
 _merge_words_to_segments = _transcribe_module._merge_words_to_segments
 
-_run_TRANSCRIPTION_qc = _recovery_module._run_TRANSCRIPTION_qc
-_recover_TRANSCRIPTION_results_if_needed = _recovery_module._recover_TRANSCRIPTION_results_if_needed
+_run_TRANSCRIPTION_qc = _qc_stage_module._run_TRANSCRIPTION_qc
 
 
 def _sync_checkpoint_state() -> None:
@@ -514,39 +513,6 @@ def _transcribe_and_align_local(
                 "ASR质检",
                 qc_timings["asr_qc_s"],
             )
-
-            text_results, recovery_timings = _recover_TRANSCRIPTION_results_if_needed(
-                backend,
-                chunk_infos,
-                text_results,
-                qc_report,
-                log,
-                on_stage=on_stage,
-            )
-            if recovery_timings["asr_recovery_s"] > 0:
-                _record_stage_timing(
-                    log,
-                    timings,
-                    "asr_recovery_s",
-                    "ASR局部修复",
-                    recovery_timings["asr_recovery_s"],
-                )
-                timings["asr_recovered_chunks"] = recovery_timings[
-                    "asr_recovered_chunks"
-                ]
-                for timing_key, timing_label in (
-                    ("asr_recovery_separator_s", "ASR人声分离"),
-                    ("asr_recovery_retranscribe_s", "ASR修复重转写"),
-                    ("asr_recovery_model_unload_s", "ASR修复模型卸载"),
-                ):
-                    if recovery_timings.get(timing_key, 0.0) > 0:
-                        _record_stage_timing(
-                            log,
-                            timings,
-                            timing_key,
-                            timing_label,
-                            recovery_timings[timing_key],
-                        )
 
             text_results, qc_report, strict_drop_log = apply_strict_precision_filter(
                 chunk_infos,

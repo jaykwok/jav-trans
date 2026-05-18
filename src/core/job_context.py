@@ -62,7 +62,6 @@ class JobContext:
     subtitle_mode: str
     show_gender: bool
     multi_cue_split: bool
-    asr_recovery: bool
     vad_threshold: float
     skip_translation: bool
     target_lang: str
@@ -101,7 +100,6 @@ class JobContext:
             subtitle_mode=str(getattr(spec, "subtitle_mode", "bilingual") or "bilingual"),
             show_gender=bool(getattr(spec, "show_gender", True)),
             multi_cue_split=bool(getattr(spec, "multi_cue_split", True)),
-            asr_recovery=bool(getattr(spec, "asr_recovery", False)),
             vad_threshold=float(getattr(spec, "vad_threshold", 0.35)),
             skip_translation=bool(getattr(spec, "skip_translation", False)),
             target_lang=_translation_setting(

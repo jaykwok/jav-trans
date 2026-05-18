@@ -124,7 +124,6 @@ async def get_config() -> dict[str, Any]:
             "skip_translation": DEFAULT_JOB_DEFAULTS["skip_translation"],
             "show_gender": DEFAULT_JOB_DEFAULTS["show_gender"],
             "multi_cue_split": DEFAULT_JOB_DEFAULTS["multi_cue_split"],
-            "asr_recovery": DEFAULT_JOB_DEFAULTS["asr_recovery"],
             "vad_threshold": DEFAULT_JOB_DEFAULTS["vad_threshold"],
             "translation_batch_size": DEFAULT_JOB_DEFAULTS["translation_batch_size"],
             "translation_max_workers": DEFAULT_JOB_DEFAULTS["translation_max_workers"],

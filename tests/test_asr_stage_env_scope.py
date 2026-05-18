@@ -19,11 +19,8 @@ def test_asr_stage_env_scope_reaches_cache_and_transcribe(monkeypatch, tmp_path)
         skip_translation=True,
         keep_temp_files=True,
     )
-    ctx.asr_recovery = True
-
     monkeypatch.setenv("ASR_BACKEND", "anime-whisper")
     monkeypatch.setenv("ASR_CONTEXT", "process actor")
-    monkeypatch.setenv("ASR_RECOVERY_ENABLED", "0")
     monkeypatch.setattr(main.torch.cuda, "is_available", lambda: False)
 
     seen = {}
@@ -32,7 +29,6 @@ def test_asr_stage_env_scope_reaches_cache_and_transcribe(monkeypatch, tmp_path)
         seen["backend_label_env"] = {
             "ASR_BACKEND": main.os.environ.get("ASR_BACKEND"),
             "ASR_CONTEXT": main.os.environ.get("ASR_CONTEXT"),
-            "ASR_RECOVERY_ENABLED": main.os.environ.get("ASR_RECOVERY_ENABLED"),
         }
         return f"backend:{main.os.environ['ASR_BACKEND']}"
 
@@ -47,7 +43,6 @@ def test_asr_stage_env_scope_reaches_cache_and_transcribe(monkeypatch, tmp_path)
         seen["cache_env"] = {
             "ASR_BACKEND": main.os.environ.get("ASR_BACKEND"),
             "ASR_CONTEXT": main.os.environ.get("ASR_CONTEXT"),
-            "ASR_RECOVERY_ENABLED": main.os.environ.get("ASR_RECOVERY_ENABLED"),
         }
         return None
 
@@ -59,7 +54,6 @@ def test_asr_stage_env_scope_reaches_cache_and_transcribe(monkeypatch, tmp_path)
         seen["transcribe_env"] = {
             "ASR_BACKEND": main.os.environ.get("ASR_BACKEND"),
             "ASR_CONTEXT": main.os.environ.get("ASR_CONTEXT"),
-            "ASR_RECOVERY_ENABLED": main.os.environ.get("ASR_RECOVERY_ENABLED"),
         }
         assert include_details is True
         return (
@@ -86,7 +80,6 @@ def test_asr_stage_env_scope_reaches_cache_and_transcribe(monkeypatch, tmp_path)
     expected_env = {
         "ASR_BACKEND": "qwen3-asr-1.7b",
         "ASR_CONTEXT": "task actor",
-        "ASR_RECOVERY_ENABLED": "1",
     }
     assert seen["backend_label_env"] == expected_env
     assert seen["cache_env"] == expected_env
@@ -96,7 +89,6 @@ def test_asr_stage_env_scope_reaches_cache_and_transcribe(monkeypatch, tmp_path)
     assert artifacts.backend_label == "backend:qwen3-asr-1.7b"
     assert main.os.environ["ASR_BACKEND"] == "anime-whisper"
     assert main.os.environ["ASR_CONTEXT"] == "process actor"
-    assert main.os.environ["ASR_RECOVERY_ENABLED"] == "0"
 
 
 def test_vad_chunk_cache_dir_reaches_transcribe_but_not_aligned_signature(

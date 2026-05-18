@@ -103,6 +103,7 @@ def test_checkpoint_key_changes_with_whisper_prompt_char_cap(monkeypatch):
 
 
 def test_checkpoint_key_changes_with_strict_precision_mode(monkeypatch):
+    monkeypatch.setenv("ASR_PRECISION_MODE", "normal")
     default_key = _checkpoint_name(
         monkeypatch,
         asr_backend="anime-whisper",

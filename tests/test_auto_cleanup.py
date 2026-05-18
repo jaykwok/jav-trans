@@ -57,25 +57,21 @@ def test_runtime_ephemeral_cleanup_keeps_reusable_caches(tmp_path, monkeypatch):
     temp_root = tmp_path / "temp"
     jobs = temp_root / "jobs"
     chunks = temp_root / "chunks"
-    recovery = temp_root / "recovery"
     hf_cache = temp_root / "hf-cache"
 
-    for path in [jobs, chunks, recovery, hf_cache]:
+    for path in [jobs, chunks, hf_cache]:
         path.mkdir(parents=True)
     (hf_cache / "cache.bin").write_bytes(b"cache")
 
     monkeypatch.setenv("JOB_TEMP_DIR", str(jobs))
-    monkeypatch.setenv("ASR_RECOVERY_OUTPUT_ROOT", str(recovery))
     monkeypatch.setattr(asr, "_ASR_CHUNK_ROOT", chunks)
 
     cleanup_runtime_ephemeral_temp(
         job_temp_root=jobs,
         asr_chunk_root=chunks,
-        recovery_output_root=recovery,
         project_root=tmp_path,
     )
 
     assert not jobs.exists()
     assert not chunks.exists()
-    assert not recovery.exists()
     assert (hf_cache / "cache.bin").exists()
