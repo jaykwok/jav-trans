@@ -103,7 +103,6 @@ export function installFiles() {
       skip_translation:         $('r-skip-translation').checked,
       multi_cue_split:          $('t-multi-cue-split').checked,
       show_gender:              $('t-show-gender').checked,
-      asr_recovery:             $('t-asr-recovery').checked,
       keep_quality_report:      $('t-quality-report').checked,
       vad_threshold:            parseFloat($('t-vad-threshold').value) || 0.35,
       translation_batch_size:   parseInt($('t-translation-batch-size').value) || 200,

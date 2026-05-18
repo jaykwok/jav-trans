@@ -106,7 +106,7 @@
 | T-AJ | 全量审计修复：任务级 env 覆盖、aligned cache scope、ASR/字幕/quality 参数运行时化、翻译 cancel_event 透传 | 基线 315 passed, 5 skipped；完成后逐步增至 334+ passed |
 | T-AK | 第二轮后端审计：ASR/aligned cache signature、`.env.example` 默认、SubtitleOptions、Web retry/cancel、stream timeout、Protocol 补齐 | `343 passed, 5 skipped` |
 | T-AL | ASR generation budget + ONNX CUDA runtime + VAD/chunk cache | `359 passed, 5 skipped`；SORA-575 anime-whisper 全量中日双语 649.54s，WhisperSeg CUDA VAD/切块 9.32s，ASR generation overflow/error 为 0 |
-| T-AM | strict precision ASR 默认化并删除 ASR recovery / temperature fallback / prompt overflow retry | `365 passed, 5 skipped` |
+| T-AM | strict precision ASR 默认化并删除 ASR recovery / temperature fallback / prompt overflow retry，并清理前端旧 ASR Recovery 控件 | 后端全量 `365 passed, 5 skipped`；前端/Web 定向 `13 passed` |
 
 ### T-AL 关键验证记录
 
@@ -123,8 +123,9 @@
 
 - strict precision ASR 成为默认策略：`ASR_PRECISION_MODE=strict`，可疑/低置信文本在 alignment 前清空并写入 quality report。
 - 后端已删除 ASR recovery、temperature fallback、prompt overflow retry；生成失败或不确定时不再重写补救。timestamp/alignment fallback 仅用于时间轴，不新增 ASR 文本。
-- 后端 `JobSpec` / `JobContext` / `/api/config` 不再暴露 `asr_recovery`；旧前端字段即使提交也由后端忽略。
+- 后端 `JobSpec` / `JobContext` / `/api/config` 不再暴露 `asr_recovery`；前端已移除 `ASR Recovery` 开关、preset 字段、配置回填和提交 payload。
 - 验证：compileall 通过；strict/QC/cache/ASR 定向 `66 passed`；全量 `.venv/bin/python -m pytest -q` 为 `365 passed, 5 skipped`。
+- 前端验证：`node --check` 覆盖 `settings.js` / `files.js` / `presets.js` / `main.js`；Web/API 与 ASR env 定向 `13 passed`。
 
 ---
 
