@@ -102,6 +102,23 @@ def test_checkpoint_key_changes_with_whisper_prompt_char_cap(monkeypatch):
     assert default_key != tuned_key
 
 
+def test_checkpoint_key_changes_with_strict_precision_mode(monkeypatch):
+    default_key = _checkpoint_name(
+        monkeypatch,
+        asr_backend="anime-whisper",
+        whisper_mode="forced",
+    )
+
+    monkeypatch.setenv("ASR_PRECISION_MODE", "strict")
+    tuned_key = _checkpoint_name(
+        monkeypatch,
+        asr_backend="anime-whisper",
+        whisper_mode="forced",
+    )
+
+    assert default_key != tuned_key
+
+
 def test_checkpoint_key_changes_with_asr_context(monkeypatch):
     actor_a_key = _checkpoint_name(
         monkeypatch,

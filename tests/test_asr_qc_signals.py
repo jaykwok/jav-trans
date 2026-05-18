@@ -22,11 +22,25 @@ def test_reject_on_high_no_speech_prob(monkeypatch):
 
 def test_warn_on_low_avg_logprob(monkeypatch):
     monkeypatch.setenv("ASR_QC_LOGPROB_THRESHOLD", "-1.0")
+    monkeypatch.delenv("ASR_PRECISION_MODE", raising=False)
+    monkeypatch.delenv("ASR_DROP_UNCERTAIN_ENABLED", raising=False)
     # compression_ratio within threshold so only logprob fires
     result = {"avg_logprob": -1.5, "no_speech_prob": 0.1, "compression_ratio": 1.2}
     qc = check_logprob_quality(result)
     assert qc["verdict"] == "warn"
     assert "logprob" in qc["reason"]
+
+
+def test_strict_mode_rejects_low_avg_logprob(monkeypatch):
+    monkeypatch.setenv("ASR_PRECISION_MODE", "strict")
+    result = {"avg_logprob": -0.8, "no_speech_prob": 0.1, "compression_ratio": 1.2}
+
+    qc = check_logprob_quality(result)
+
+    assert qc["verdict"] == "reject"
+    assert "low_logprob" in qc["reason"]
+    assert qc["metrics"]["drop_uncertain_enabled"] is True
+    assert qc["metrics"]["logprob_threshold"] == -0.7
 
 
 def test_reject_on_high_compression_ratio(monkeypatch):

@@ -73,3 +73,56 @@ def test_temperature_support_is_explicit_on_backends():
     assert WhisperModelBackend.supports_temperature is True
     assert LocalAsrBackend.supports_temperature is False
     assert SubprocessAsrBackend.supports_temperature is False
+
+
+def test_strict_precision_disables_temperature_fallback(monkeypatch, tmp_path):
+    monkeypatch.setenv("ASR_TEMPERATURE_FALLBACK", "1")
+    monkeypatch.setenv("ASR_PRECISION_MODE", "strict")
+
+    import importlib
+    import whisper.transcribe as transcribe_mod
+
+    transcribe_mod = importlib.reload(transcribe_mod)
+
+    class Backend:
+        is_subprocess = False
+        accepts_contexts = False
+        supports_temperature = True
+        request_batch_size = 1
+
+        def __init__(self):
+            self.calls = []
+
+        def transcribe_texts(self, audio_paths, contexts=None, on_stage=None, temperature=0.0):
+            del contexts, on_stage
+            self.calls.append({"paths": list(audio_paths), "temperature": temperature})
+            return [
+                {
+                    "text": "低信頼",
+                    "raw_text": "低信頼",
+                    "duration": 1.0,
+                    "avg_logprob": -2.0,
+                    "no_speech_prob": 0.1,
+                    "compression_ratio": 1.0,
+                }
+            ]
+
+    audio_path = tmp_path / "chunk.wav"
+    audio_path.write_bytes(b"fake")
+    chunk = {
+        "index": 0,
+        "path": str(audio_path),
+        "start": 0.0,
+        "end": 1.0,
+        "source_audio_path": str(audio_path),
+    }
+    backend = Backend()
+
+    results, _timings = transcribe_mod._transcribe_asr_chunks_text_only(
+        backend,
+        [chunk],
+        "ASR text",
+    )
+
+    assert results[0]["text"] == "低信頼"
+    assert [call["temperature"] for call in backend.calls] == [0.0]
