@@ -73,7 +73,7 @@ TARGET_LANG=简体中文
 ```
 
 `LLM_API_FORMAT` 默认为 `chat`，走 OpenAI Chat Completions 兼容格式；需要使用 OpenAI Responses API 兼容格式时改为 `responses`。
-`.env` 主要保存跨任务持久配置，例如 API、模型名、HF 镜像、术语表和演员名提示。视频路径、输出目录、ASR 后端、字幕模式、batch/worker、是否保留临时文件等任务级参数由网页表单传入，不建议写进 `.env`。
+`.env` 主要保存跨任务持久配置，例如 API、模型名、HF 镜像、术语表、演员名提示、默认 ASR 偏好、VAD/chunk cache 和 adaptive ASR QC 阈值。当前 `.env.example` 已按同类参数分组并附带注释；旧的 `ASR_PRECISION_MODE`、`ASR_DROP_UNCERTAIN_ENABLED`、`ASR_QC_STRICT_*` 不再使用。视频路径、输出目录、字幕模式、batch/worker、是否保留临时文件等任务级参数由网页表单传入，不建议写进 `.env`。
 
 *(可选)* 如果国内网络下载 AI 模型速度较慢，可以在 `.env` 中加入这行来加速下载：
 ```env
@@ -131,7 +131,7 @@ HF_ENDPOINT=https://hf-mirror.com
 如果您是开发者并希望深入了解或修改项目：
 - 核心后端逻辑位于 `src/main.py`、`src/core/`、`src/pipeline/`、`src/whisper/`、`src/llm/`、`src/audio/` 等子模块。
 - Web 接口和页面由 `src/web/` 提供，采用 FastAPI。
-- 默认配置集中在 `src/core/config.py`，本地 `.env` 只覆盖跨任务持久配置；Web 任务级参数通过 `JobSpec -> JobContext` 显式传入后端。
+- 默认配置集中在 `src/core/config.py`，本地 `.env` 只覆盖跨任务持久配置和默认偏好；Web 任务级参数通过 `JobSpec -> JobContext` 显式传入后端并可覆盖默认值。
 - 本项目引入的部分第三方代码（例如 `src/vad/whisperseg`）保留了其原始的许可证，请遵循相应协议。
 
 ### 构建 Windows Release
