@@ -57,6 +57,11 @@ DEFAULT_SETTINGS: dict[str, str] = {
     "WHISPER_UNLOAD_EVERY": "200",
     # Voice activity detection backend used before ASR chunking.
     "ASR_VAD_BACKEND": "whisperseg",
+    # 1 lets WhisperSeg adjust its threshold once from whole-audio speech density.
+    "ASR_VAD_ADAPTIVE": "1",
+    # Primary/gate components used when ASR_VAD_BACKEND=fusion_lite.
+    "ASR_VAD_PRIMARY": "whisperseg",
+    "ASR_VAD_GATE": "silero",
     # Remote HuggingFace model id used when ASR_MODEL_PATH is empty or missing.
     "ASR_MODEL_ID": "Qwen/Qwen3-ASR-1.7B",
     # Optional local ASR model directory override. Empty uses models/<namespace>-<repo>.
@@ -165,6 +170,35 @@ DEFAULT_SETTINGS: dict[str, str] = {
     # 1 forces WhisperSeg to CPU, useful when GPU memory is tight.
     "WHISPERSEG_FORCE_CPU": "0",
 
+    # --- Fusion-lite Internal Silero Gate Settings ---
+    # Silero is not a user-facing VAD mode; fusion_lite uses it as one speech prior.
+    "SILERO_VAD_THRESHOLD": "0.35",
+    "SILERO_VAD_MIN_SPEECH_MS": "80",
+    "SILERO_VAD_MIN_SILENCE_MS": "80",
+    "SILERO_VAD_PAD_MS": "300",
+    "SILERO_VAD_MAX_SPEECH_S": "30.0",
+    "SILERO_VAD_MAX_GROUP_S": "6.0",
+    "SILERO_VAD_CHUNK_THRESHOLD_S": "1.0",
+    "SILERO_VAD_ONNX": "1",
+    # Fusion-lite VAD keeps WhisperSeg as the candidate generator and combines
+    # Silero overlap with lightweight acoustic features. Experimental only.
+    "FUSION_VAD_PRIMARY_WEIGHT": "0.45",
+    "FUSION_VAD_GATE_WEIGHT": "0.25",
+    "FUSION_VAD_RMS_WEIGHT": "0.15",
+    "FUSION_VAD_SPECTRAL_FLUX_WEIGHT": "0.10",
+    "FUSION_VAD_DURATION_WEIGHT": "0.05",
+    "FUSION_VAD_MIN_SCORE": "0.45",
+    "FUSION_VAD_MIN_GATE_OVERLAP_RATIO": "0.05",
+    "FUSION_VAD_GATE_PAD_S": "0.30",
+    "FUSION_VAD_DEFAULT_PRIMARY_SCORE": "0.50",
+    "FUSION_VAD_RMS_FLOOR_DBFS": "-50.0",
+    "FUSION_VAD_RMS_FULL_DBFS": "-24.0",
+    "FUSION_VAD_SPECTRAL_FLUX_FLOOR": "0.0002",
+    "FUSION_VAD_SPECTRAL_FLUX_FULL": "0.0060",
+    "FUSION_VAD_DURATION_MIN_S": "0.20",
+    "FUSION_VAD_DURATION_FULL_S": "0.50",
+    "FUSION_VAD_DURATION_MAX_S": "12.0",
+
     # --- Alignment Retry & Refine ---
     # Max chunk length that hybrid alignment can force-align directly.
     "ALIGNMENT_HYBRID_FORCE_MAX_CHUNK": "24.0",
@@ -201,6 +235,12 @@ DEFAULT_SETTINGS: dict[str, str] = {
     "ASR_QC_ADAPTIVE_HARD_MAX_CHARS_PER_SEC": "14.0",
     "ASR_QC_ADAPTIVE_HARD_REPEAT_RATIO": "0.45",
     # --- Subtitle Timings ---
+    # Industry hard maximum for one subtitle cue; Netflix uses 7s as the upper bound.
+    "MAX_SUBTITLE_DURATION": "7.0",
+    # Soft split target before the hard cap.
+    "SUBTITLE_SOFT_MAX_S": "6.0",
+    # 1 enables word/punctuation based soft splitting before SRT output.
+    "SUBTITLE_SOFT_SPLIT_ENABLED": "1",
     # Minimum displayed subtitle duration in seconds.
     "MIN_SUBTITLE_DURATION": "0.6",
     # Estimated Chinese reading speed in characters per second.

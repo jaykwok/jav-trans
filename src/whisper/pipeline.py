@@ -314,6 +314,7 @@ def _build_processing_spans(
 
     if cfg["packing_enabled"]:
         result = vad.segment(audio_path)
+        allow_empty_vad = bool(result.parameters.get("allow_empty"))
         runtime_vad_signature = {
             **result.parameters,
             "chunk_packing": {
@@ -326,6 +327,24 @@ def _build_processing_spans(
         _set_last_vad_signature(runtime_vad_signature)
         segments = result.segments
         if not segments:
+            if allow_empty_vad:
+                event = _vad_chunk_cache_module.save_processing_spans(
+                    audio_path,
+                    vad_signature=vad_signature,
+                    chunk_config=cfg,
+                    processing_spans=[],
+                    runtime_vad_signature=runtime_vad_signature,
+                    vad_segments=result.segments,
+                    vad_groups=result.groups,
+                )
+                if event is not None:
+                    _pipeline_logger.info(
+                        "[vad-cache] saved path=%s digest=%s",
+                        event["path"],
+                        event["digest"],
+                    )
+                    _set_last_vad_cache_event(event)
+                return []
             spans = [(0.0, result.audio_duration_sec)]
             event = _vad_chunk_cache_module.save_processing_spans(
                 audio_path,
@@ -371,10 +390,11 @@ def _build_processing_spans(
         return packed
 
     result = vad.segment(audio_path)
+    allow_empty_vad = bool(result.parameters.get("allow_empty"))
     runtime_vad_signature = dict(result.parameters)
     _set_last_vad_signature(runtime_vad_signature)
     spans = [(group[0].start, group[-1].end) for group in result.groups]
-    if not spans:
+    if not spans and not allow_empty_vad:
         spans = [(0.0, result.audio_duration_sec)]
     if cfg["drop_enabled"]:
         spans = _drop_short_low_energy_spans(audio_path, spans)

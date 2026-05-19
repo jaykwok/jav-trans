@@ -150,6 +150,8 @@ def _ctx_env_flag(ctx: JobContext, name: str, default: bool = False) -> bool:
 
 _ASR_STAGE_ADVANCED_PREFIXES = (
     "WHISPERSEG_",
+    "SILERO_VAD_",
+    "FUSION_VAD_",
     "SEGMENT_",
     "VAD_",
     "ASR_QC_",
@@ -166,6 +168,9 @@ _ASR_STAGE_ADVANCED_PREFIXES = (
 _ASR_STAGE_ADVANCED_KEYS = {
     "ALIGN_LONG_CHUNK_BATCH_SIZE",
     "ASR_VAD_BACKEND",
+    "ASR_VAD_ADAPTIVE",
+    "ASR_VAD_PRIMARY",
+    "ASR_VAD_GATE",
     "ASR_LANGUAGE",
     "ASR_FORCE_LANGUAGE",
     "ASR_MODEL_PATH",

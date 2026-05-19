@@ -15,7 +15,7 @@ def format_timestamp(seconds: float) -> str:
     return f"{hours:02d}:{minutes:02d}:{secs:02d},{millis:03d}"
 
 
-MAX_SUBTITLE_DURATION = float(os.getenv("MAX_SUBTITLE_DURATION", "8.0"))
+MAX_SUBTITLE_DURATION = float(os.getenv("MAX_SUBTITLE_DURATION", "7.0"))
 SUBTITLE_SOFT_MAX_S = float(os.getenv("SUBTITLE_SOFT_MAX_S", "6.0"))
 SUBTITLE_SOFT_SPLIT_ENABLED = os.getenv(
     "SUBTITLE_SOFT_SPLIT_ENABLED", "1"
