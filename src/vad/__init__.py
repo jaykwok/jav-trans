@@ -7,8 +7,8 @@ from vad.ffmpeg_backend import FfmpegSilencedetectBackend
 
 
 def get_vad_backend(name: str | None = None) -> VadBackend:
-    name = (name or os.getenv("ASR_VAD_BACKEND", "whisperseg")).lower()
-    if name == "whisperseg":
+    name = (name or os.getenv("ASR_VAD_BACKEND", "whisperseg-adaptive")).lower()
+    if name in {"whisperseg", "whisperseg-adaptive", "whisperseg_adaptive"}:
         from vad.whisperseg_backend import WhisperSegVadBackend
 
         return WhisperSegVadBackend()
@@ -17,7 +17,7 @@ def get_vad_backend(name: str | None = None) -> VadBackend:
 
         return FusionLiteVadBackend()
     raise ValueError(
-        f"Unknown VAD backend: {name!r}. Choose: whisperseg, fusion_lite"
+        f"Unknown VAD backend: {name!r}. Choose: whisperseg-adaptive, fusion_lite"
     )
 
 
