@@ -22,11 +22,11 @@ def test_vad_registry_exposes_only_current_user_modes(monkeypatch):
 
     adaptive = vad.get_vad_backend("whisperseg-adaptive")
     assert adaptive.name == "whisperseg_v1"
-    legacy = vad.get_vad_backend("whisperseg")
-    assert legacy.name == "whisperseg_v1"
     fusion = vad.get_vad_backend("fusion_lite")
     assert fusion.name == "fusion_lite_v1"
 
+    with pytest.raises(ValueError, match="whisperseg"):
+        vad.get_vad_backend("whisperseg")
     with pytest.raises(ValueError, match="hybrid_precision"):
         vad.get_vad_backend("hybrid_precision")
     with pytest.raises(ValueError, match="silero"):
