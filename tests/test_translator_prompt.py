@@ -1,8 +1,8 @@
 import json
 
 from llm import translator
-def test_prompt_version_is_v25():
-    assert translator.PROMPT_VERSION == "v2.5"
+def test_prompt_version_is_v26():
+    assert translator.PROMPT_VERSION == "v2.6"
 
 
 def test_system_prompt_no_male_prefix_example():
@@ -11,6 +11,22 @@ def test_system_prompt_no_male_prefix_example():
 
 def test_system_prompt_mentions_acoustic_tags():
     assert "[M]" in translator._SYSTEM_PROMPT_FULL
+
+
+def test_system_prompt_does_not_authorize_asr_rewrites():
+    prompt = translator._build_system_prompt(
+        expected_count=2,
+        character_reference="小那海あや",
+        target_lang="简体中文",
+        glossary="",
+    )
+
+    assert "允许根据前后文修正明显 ASR 误听" not in prompt
+    assert "可修正明显ASR误听" not in prompt
+    assert "ASR 同音纠错" not in prompt
+    assert "同音误听" not in prompt
+    assert "上下文漂移" not in prompt
+    assert "不要根据参考名推测、补全或替换其他词" in prompt
 
 
 def test_system_prompt_fixes_requested_genital_terms_without_kikuka():

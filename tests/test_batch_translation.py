@@ -112,7 +112,7 @@ def test_character_name_guidance_is_conservative_for_unrelated_surnames():
     assert "Takahashi/Takaoka/Takano" not in prompt
 
 
-def test_repair_prompt_keeps_asr_special_cases_out_of_static_prompt():
+def test_repair_prompt_does_not_authorize_asr_or_context_rewrites():
     messages = translator._build_repair_messages(
         [
             {"start": 0.0, "end": 1.0, "text": "おまけ、さらけないでください!"},
@@ -121,8 +121,8 @@ def test_repair_prompt_keeps_asr_special_cases_out_of_static_prompt():
         ["不要露出来！", "请吸，请用力吸。"],
         [0, 1],
         {
-            0: ["suspicious_omake_asr"],
-            1: ["suspicious_kyuu_asr"],
+            0: ["length_mismatch"],
+            1: ["length_mismatch"],
         },
         target_lang="简体中文",
         glossary="",
@@ -132,8 +132,13 @@ def test_repair_prompt_keeps_asr_special_cases_out_of_static_prompt():
     system_prompt = messages[0]["content"]
     assert "おまけ" not in system_prompt
     assert "きゅうしてください" not in system_prompt
-    assert "asr_homophone_or_context_drift" in messages[1]["content"]
-    assert "suspicious_omake_asr" not in messages[1]["content"]
+    combined = messages[0]["content"] + messages[1]["content"]
+    assert "明显 ASR 同音误听" not in combined
+    assert "上下文漂移" not in combined
+    assert "术语漂移" not in combined
+    assert "被切断的半句" not in combined
+    assert "asr_homophone_or_context_drift" not in combined
+    assert "suspicious_omake_asr" not in combined
 
 
 def test_translate_segments_batched(monkeypatch):
@@ -524,7 +529,7 @@ def test_batch_warmup_runs_before_pending_batches(monkeypatch):
     assert timings[0]["mode"] == "translation_prefix_warmup"
 
 
-def test_translation_repair_pass_uses_neighbor_context_for_asr_fragment(monkeypatch):
+def test_translation_repair_pass_does_not_fix_asr_fragments(monkeypatch):
     calls: list[dict] = []
     segments = [
         {"start": 0.0, "end": 1.0, "text": "半分出ちゃった外に半分外出した"},
@@ -544,15 +549,6 @@ def test_translation_repair_pass_uses_neighbor_context_for_asr_fragment(monkeypa
         )
         if expected_count == 0:
             return json.dumps({"translations": []}, ensure_ascii=False)
-        if "【翻译修复任务】" in content:
-            return json.dumps(
-                {
-                    "translations": [
-                        {"id": 1, "text": "用手指把精液弄进小穴里"}
-                    ]
-                },
-                ensure_ascii=False,
-            )
         initial_texts = {
             0: "一半射出来，一半射外面了",
             1: "用这个手指，精液",
@@ -582,18 +578,15 @@ def test_translation_repair_pass_uses_neighbor_context_for_asr_fragment(monkeypa
     assert retry_events == []
     assert zh_texts == [
         "一半射出来，一半射外面了",
-        "用手指把精液弄进小穴里",
+        "用这个手指，精液",
         "让人塞进去。",
     ]
     repair_calls = [call for call in calls if call["repair"]]
-    assert len(repair_calls) == 1
-    assert repair_calls[0]["requested_ids"] == [1]
-    assert "入れてもらう。" in repair_calls[0]["content"]
-    assert "用这个手指，精液" in repair_calls[0]["content"]
-    assert any(item.get("mode") == "translation_repair_pass" for item in timings)
+    assert repair_calls == []
+    assert not any(item.get("mode") == "translation_repair_pass" for item in timings)
 
 
-def test_translation_repair_pass_fixes_forbidden_genital_term(monkeypatch):
+def test_translation_repair_pass_does_not_fix_term_drift(monkeypatch):
     calls: list[dict] = []
     segments = [
         {
@@ -610,15 +603,6 @@ def test_translation_repair_pass_fixes_forbidden_genital_term(monkeypatch):
         calls.append({"repair": "【翻译修复任务】" in content, "content": content})
         if expected_count == 0:
             return json.dumps({"translations": []}, ensure_ascii=False)
-        if "【翻译修复任务】" in content:
-            return json.dumps(
-                {
-                    "translations": [
-                        {"id": 0, "text": "不得了，三个选手都插进小穴了。"}
-                    ]
-                },
-                ensure_ascii=False,
-            )
         return json.dumps(
             {
                 "translations": [
@@ -644,14 +628,12 @@ def test_translation_repair_pass_fixes_forbidden_genital_term(monkeypatch):
     )
 
     assert retry_events == []
-    assert zh_texts[0] == "不得了，三个选手都插进小穴了。"
-    repair_call = next(call for call in calls if call["repair"])
-    assert "まんこ" in repair_call["content"]
-    assert "阴道" in repair_call["content"]
-    assert any(item.get("mode") == "translation_repair_pass" for item in timings)
+    assert zh_texts[0] == "不得了，三个选手都插进阴道了。"
+    assert [call for call in calls if call["repair"]] == []
+    assert not any(item.get("mode") == "translation_repair_pass" for item in timings)
 
 
-def test_translation_repair_selects_suspicious_asr_homophones_in_sexual_context():
+def test_translation_repair_does_not_select_suspicious_asr_homophones():
     segments = [
         {"start": 0.0, "end": 1.0, "text": "あっ、気持ちいい"},
         {"start": 1.0, "end": 2.0, "text": "おまけ、さらけないでください!"},
@@ -681,11 +663,8 @@ def test_translation_repair_selects_suspicious_asr_homophones_in_sexual_context(
 
     repair_ids, reasons = translator._select_translation_repair_ids(segments, zh_texts)
 
-    assert repair_ids == [1, 4, 7, 10]
-    assert reasons[1] == ["suspicious_omake_asr"]
-    assert reasons[4] == ["suspicious_kuni_asr"]
-    assert reasons[7] == ["suspicious_koyoku_asr"]
-    assert reasons[10] == ["suspicious_kyuu_asr"]
+    assert repair_ids == []
+    assert reasons == {}
 
 
 def test_translation_repair_selects_length_mismatch_candidates():
@@ -732,12 +711,7 @@ def test_translation_repair_length_mismatch_uses_source_translation_fields():
     assert context_items[0]["current_zh"] == "这是一个明显被过度展开的中文翻译，长度远远超过原文。"
 
 
-def test_translation_repair_prioritizes_length_mismatch_before_low_confidence(monkeypatch):
-    def fake_repair_reasons(segments, zh_texts, idx, source, target):
-        del segments, zh_texts, source, target
-        return ["low_confidence"] if idx in {0, 1} else []
-
-    monkeypatch.setattr(translator, "_translation_repair_reasons", fake_repair_reasons)
+def test_translation_repair_selects_only_length_mismatch_candidates():
     segments = [
         {"start": 0.0, "end": 1.0, "text": "これは普通の文です。"},
         {"start": 1.0, "end": 2.0, "text": "これも普通の文です。"},
@@ -751,8 +725,7 @@ def test_translation_repair_prioritizes_length_mismatch_before_low_confidence(mo
 
     repair_ids, reasons = translator._select_translation_repair_ids(segments, zh_texts)
 
-    assert repair_ids == [2, 0, 1]
-    assert repair_ids[:2] == [2, 0]
+    assert repair_ids == [2]
     assert reasons[2] == ["length_mismatch"]
 
 

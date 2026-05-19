@@ -25,6 +25,47 @@ def _append_asr_generation_warnings(
         )
 
 
+def _subtitle_overlap_stats(segments: list[dict]) -> dict:
+    ordered: list[dict] = []
+    for segment in segments:
+        try:
+            start = float(segment.get("start", 0.0))
+            end = float(segment.get("end", start))
+        except (TypeError, ValueError):
+            continue
+        ordered.append({"start": start, "end": max(start, end)})
+    ordered.sort(key=lambda item: (item["start"], item["end"]))
+
+    count = 0
+    total_s = 0.0
+    max_s = 0.0
+    examples: list[dict] = []
+    for previous, current in zip(ordered, ordered[1:]):
+        overlap_s = previous["end"] - current["start"]
+        if overlap_s <= 0:
+            continue
+        count += 1
+        total_s += overlap_s
+        max_s = max(max_s, overlap_s)
+        if len(examples) < 5:
+            examples.append(
+                {
+                    "previous_start": round(previous["start"], 3),
+                    "previous_end": round(previous["end"], 3),
+                    "current_start": round(current["start"], 3),
+                    "current_end": round(current["end"], 3),
+                    "overlap_s": round(overlap_s, 3),
+                }
+            )
+
+    return {
+        "subtitle_overlap_count": count,
+        "subtitle_overlap_total_s": round(total_s, 3),
+        "subtitle_overlap_max_s": round(max_s, 3),
+        "subtitle_overlap_examples": examples,
+    }
+
+
 _KANA_ONLY_RE = re.compile(r"^[ぁ-ゟァ-ヿ\s、。！？…ー～「」『』・\(\)（）]+$")
 
 
@@ -51,6 +92,7 @@ def compute_quality_report(
         if isinstance(asr_qc.get("dropped_uncertain_items"), list)
         else []
     )
+    overlap_stats = _subtitle_overlap_stats(segments)
 
     n = len(segments)
     if n == 0:
@@ -77,6 +119,7 @@ def compute_quality_report(
             "asr_empty_text_for_speech_count": asr_empty_text_for_speech_count,
             "asr_dropped_uncertain_count": asr_dropped_uncertain_count,
             "asr_dropped_uncertain_items": asr_dropped_uncertain_items,
+            **overlap_stats,
             "warnings": warnings,
         }
 
@@ -169,6 +212,10 @@ def compute_quality_report(
         warnings.append(
             f"alignment_fallback_ratio={alignment_fallback_ratio:.3f} > QC_MAX_ALIGN_FALLBACK={_env_float('QC_MAX_ALIGN_FALLBACK', 0.20)}"
         )
+    if overlap_stats["subtitle_overlap_count"] > 0:
+        warnings.append(
+            f"subtitle_overlap_count={overlap_stats['subtitle_overlap_count']} after timeline normalization"
+        )
     _append_asr_generation_warnings(
         warnings,
         asr_generation_error_count=asr_generation_error_count,
@@ -192,6 +239,7 @@ def compute_quality_report(
         "asr_empty_text_for_speech_count": asr_empty_text_for_speech_count,
         "asr_dropped_uncertain_count": asr_dropped_uncertain_count,
         "asr_dropped_uncertain_items": asr_dropped_uncertain_items,
+        **overlap_stats,
         "warnings": warnings,
     }
     if male_ratio is not None:

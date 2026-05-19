@@ -257,6 +257,7 @@ def _sample_asr_artifacts(job: JobState, temp_dir: Path, output_dir: Path):
         device="cpu",
         backend_label=job.spec.asr_backend,
         video_duration_s=None,
+        video_fps=None,
         pipeline_started=0.0,
         f0_filtered_count=0,
         f0_failed=False,

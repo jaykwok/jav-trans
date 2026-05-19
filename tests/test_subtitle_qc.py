@@ -74,6 +74,7 @@ def test_empty_segments_returns_zeros():
     report = compute_quality_report([], 60.0, [], 0, 0)
     assert report["empty_zh_ratio"] == 0.0
     assert report["f0_filtered_count"] == 0
+    assert report["subtitle_overlap_count"] == 0
     assert report["warnings"] == []
 
 
@@ -148,4 +149,23 @@ def test_empty_segments_keep_asr_qc_counts():
     assert report["asr_generation_overflow_count"] == 1
     assert any("asr_generation_error_count" in warning for warning in report["warnings"])
     assert any("asr_generation_overflow_count" in warning for warning in report["warnings"])
+
+
+def test_subtitle_overlap_stats_warn_when_present():
+    report = compute_quality_report(
+        [
+            _seg("ア", "甲", 0.0, 1.0),
+            _seg("イ", "乙", 0.8, 2.0),
+        ],
+        60.0,
+        [],
+        0,
+        2,
+    )
+
+    assert report["subtitle_overlap_count"] == 1
+    assert report["subtitle_overlap_total_s"] == pytest.approx(0.2)
+    assert report["subtitle_overlap_max_s"] == pytest.approx(0.2)
+    assert report["subtitle_overlap_examples"][0]["overlap_s"] == pytest.approx(0.2)
+    assert any("subtitle_overlap_count" in warning for warning in report["warnings"])
 

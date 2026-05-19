@@ -11,7 +11,7 @@
 ### 1.1 主流程
 
 - Windows 本机生产目标：NVIDIA RTX 4060 Ti 8GB，串行分时加载模型，阶段结束后卸载并清 CUDA cache。
-- 主流水线：视频 -> 音频准备 -> WhisperSeg VAD/chunk packing -> ASR -> Forced Alignment 词级时间轴 -> F0 性别检测 -> F0 后 gender turn 重切段 -> 翻译前 ASR 噪声过滤 -> LLM 翻译 -> SRT/quality report。
+- 主流水线：视频 -> 音频准备 -> WhisperSeg VAD/chunk packing -> ASR -> Forced Alignment 词级时间轴 -> F0 性别检测 -> F0 后 gender turn 重切段 -> 翻译前 ASR 噪声过滤 -> 翻译前 cue plan 时间轴归一化 -> LLM 逐 cue 翻译 -> SRT/quality report。
 - 普通入口：`.venv/bin/python run_web.py`。旧 `src/main.py --input ...` CLI 已移除。
 - 后端调试入口：测试、诊断脚本，或直接调用 `run_asr_alignment_f0()` / `run_translation_and_write()`。
 
@@ -20,7 +20,7 @@
 - Engine 默认 ASR：`ASR_BACKEND=whisper-ja-anime-v0.3`。
 - Web 推荐默认 ASR：`whisper-ja-anime-v0.3`，`/api/config` 同时暴露 `engine_defaults.asr_backend` 与 `recommended_asr_backend`。
 - 支持 ASR 后端：`anime-whisper`、`qwen3-asr-1.7b`、`whisper-ja-1.5b`、`whisper-ja-anime-v0.3`。
-- 默认 VAD：`ASR_VAD_BACKEND=whisperseg-adaptive`，`ASR_VAD_ADAPTIVE=1`，`WHISPERSEG_THRESHOLD=0.35`。当前保留的用户可选 VAD 路线只有 `whisperseg-adaptive` 和实验 `fusion_lite` 模式；旧 `whisperseg` 名称不再作为公开兼容别名；Silero 只作为 `fusion_lite` 内部 speech prior，不作为独立主 VAD 暴露；ffmpeg silencedetect VAD fallback 已移除。
+- 默认 VAD：`ASR_VAD_BACKEND=whisperseg-adaptive`，`ASR_VAD_ADAPTIVE=1`，`WHISPERSEG_THRESHOLD=0.35`。当前保留的用户可选 VAD 路线是 `whisperseg-adaptive` 和实验 `fusion_lite` / `fusion_lite_boost` / `fusion_lite_sigmoid`；旧 `whisperseg` 名称不再作为公开兼容别名，但可作为 fusion 内部 primary；Silero 只作为 fusion-lite 系列内部 speech prior，不作为独立主 VAD 暴露；ffmpeg silencedetect VAD fallback 已移除。
 - `fusion_lite` 受 FusionVAD 特征融合思想启发，但不引入 pyannote 或训练流程；公式为 `speech_score = 0.45 * whisperseg_score + 0.25 * silero_overlap_ratio + 0.15 * rms_score + 0.10 * spectral_flux_score + 0.05 * duration_score`，仅当 `speech_score < 0.45` 且 `silero_overlap_ratio < 0.05` 时丢弃候选。权重理由：WhisperSeg 作为候选主信号占最大权重，Silero 只提供 speech prior 而不一票否决，RMS/spectral flux/duration 补充传统声学特征。
 - 主 VAD 初始化或推理失败时直接抛错并进入 Web 日志；主 VAD 返回空结果时直接跳过 ASR，不再整段音频 fallback，也不先转写再丢弃。
 - WhisperSeg 空结果是合法“无语音”结果，不能因空 groups 统计除零而升级为 VAD 异常；旧 chunking helper 也不得再把空 VAD 回退成整段音频。
@@ -34,6 +34,7 @@
 ### 1.3 F0 / 字幕策略
 
 - 字幕约束：`MAX_SUBTITLE_DURATION=6.5`，`SUBTITLE_SOFT_MAX_S=5.5`，`ASR_MERGE_HARD_MAX_DURATION=9.0`。7s 参考 Netflix Timed Text 单条字幕行业上限；BBC/眼动研究支持根据阅读速度弹性处理，因此 5.5s 作为软拆分目标，6.5s 作为保守硬上限，避免短文本长时间挂屏。
+- LLM 翻译前必须先生成稳定 cue plan：`ffprobe` 读取真实 `avg_frame_rate`/`r_frame_rate`，失败时按 `30000/1001`（29.97fps）兜底；基于 forced alignment 词级时间轴完成排序、双语短句合并、软拆、overlap 裁剪/合并，字幕间隔固定为 2 帧，禁止保留 overlap。LLM 只翻译该 cue plan；SRT writer 只负责换行和格式化，不得再改变 cue 时间轴或 cue 数量。规范化后的同一份 blocks 必须写入 SRT、`bilingual.json` 和 quality report。
 - 相邻短块合并受标点、speaker guard 和 gender guard 限制。
 - `SubtitleOptions` 是字幕策略的任务级配置入口；timeline、reading、gap、merge、权重等参数不得依赖 import-time 全局常量。
 - F0 None carry-over 默认开启：`F0_GENDER_NONE_TOLERANCE=3`，`F0_GENDER_CARRYOVER_MAX_GAP_S=15.0`，`F0_GENDER_CARRYOVER_MAX_SEGMENT_S=12.0`。
@@ -43,19 +44,19 @@
 
 - 默认翻译配置为 OpenAI-compatible LLM 服务；翻译请求使用流式输出 + 结构化 JSON 输出。
 - Web 任务默认 `translation_batch_size=200`、`translation_max_workers=4`。
-- 翻译批处理采用 fixed full-JSON prefix + `requested_ids` 策略：全片字幕 JSON 作为稳定前缀，本地计算每个 batch 的全局 id 区间，LLM 只翻译指定 id。
+- 翻译批处理采用 fixed full-JSON prefix + `requested_ids` 策略：全片 cue plan JSON 作为稳定前缀，本地计算每个 batch 的全局 cue id 区间，LLM 只翻译指定 id。
 - 前缀预热默认开启；超过 `TRANSLATION_FULL_JSON_PREFIX_MAX_CHARS` 时回退全片摘要上下文。
 - 翻译进度日志包含并发诊断事件：`batch_start`、`batch_first_token`、`batch_finish`，记录 wall-clock ts、worker thread、requested ids、耗时、cache hit/miss token。
 - 翻译 reasoning effort 只保留两档：`medium` / `xhigh`。Chat Completions、标准 Responses、Micu+Grok Responses patch 均直接透传，不把 `xhigh` 映射为 `high`。
 - Micu/Grok Responses streaming read timeout 使用 `TRANSLATION_STREAM_READ_TIMEOUT_S`，必须有限且可配置，保证取消/backoff 可中断。
-- 当前翻译 prompt version：`v2.5`。
+- 当前翻译 prompt version：`v2.6`。
 
 ### 1.5 文本与质量规则
 
 - 翻译前 ASR 噪声过滤本地剔除空白/引号类噪声、纯英文幻觉 token、纯特殊符号段；含日文/CJK/字母或数字的短语义段保留。
 - 翻译风格：性器官优先统一为“肉棒”“小穴”，不固定“菊花”。
-- 人名默认按日语读音罗马音化；ASR 同音纠错必须保守，不能把不同汉字姓氏或不同读音称呼强行合并。
-- 翻译后默认执行轻量 repair pass：代码侧选择高风险 id，repair prompt 只使用抽象原因类别和相邻上下文，不把片内错例硬编码进静态 prompt。
+- 人名默认按日语读音罗马音化；人物参考只用于识别字幕文本中已经明确出现的人名，LLM 不得根据参考名推测、补全或替换源文。
+- LLM 不再承担 ASR 误听、同音词、上下文漂移、术语漂移或被切断半句修复；没有画面信息时这些推断容易改错源文。翻译后 repair pass 仅保留译文长度异常这类纯译文质量候选。
 - quality report 需要暴露 ASR generation error、overflow、timeout、quarantine、empty speech text、adaptive precision dropped uncertain items、alignment fallback count/ratio 等风险信号。
 
 ---
@@ -129,6 +130,7 @@
 | T-AQ | 新增 Silero / hybrid VAD 实验并完成取舍：hard/soft gate 过度依赖 Silero，后续从当前代码与公开配置中移除 | NAMH-055 前 5 分钟历史 smoke：hybrid hard 漏太多，hybrid soft 改善但仍不作为保留路线 |
 | T-AR | 新增 `fusion_lite` VAD 实验后端，只保留 `whisperseg-adaptive` 与 `fusion_lite` 两条公开路线；字幕默认软目标/硬上限收紧为 5.5s/6.5s | NAMH-055 前 5 分钟：WhisperSeg 14 字幕/11 drops；fusion_lite 15 字幕/7 drops；HAME-052/NMSL-036 全片 VAD 对比 generation overflow/error 均为 0；字幕定向 23 passed，全量 383 passed, 5 skipped |
 | T-AS | 全量审计修复：WhisperSeg 空结果除零、旧 chunking 整段 fallback、timestamp fallback 参数运行时化、alignment fallback 统计、字幕 writer/Web/pipeline 过时路径清理 | 定向回归通过，后续以全量 pytest 基线更新 |
+| T-AT | Fusion-lite 后缀实验 + SORA-575 对比 + 帧率驱动 SRT overlap 归一化 | SORA-575 四模式对比完成；`fusion_lite_boost` 最接近 whisperseg-adaptive；新增逐句 HTML 报告；字幕/fps/主流程定向 `73 passed` |
 
 ### T-AL 关键验证记录
 
@@ -184,6 +186,17 @@
 - HAME-052 / NMSL-036 全片三模式历史对比显示 fusion_lite 输出接近 WhisperSeg，但 drops 少于 WhisperSeg；逐句报告：`reports/HAME-052_NMSL-036.full_vad_modes_line_compare.html`。
 - 字幕时长策略更新：Grok 检索 Netflix Timed Text、BBC 字幕指南和眼动研究后，将默认 `MAX_SUBTITLE_DURATION` 从 8.0 先收紧到 7.0，随后按观看体验要求进一步收紧到 6.5；`SUBTITLE_SOFT_MAX_S` 从 6.0 收紧到 5.5；长字幕后续应继续做词时间轴驱动的强制重分段。
 - 证据：`agents/temp/t-ar-fusion-lite-namh055/summary.json`、`agents/temp/t-ar-fusion-lite-namh055-asr/summary.json`、`agents/temp/t-as-full-vad-compare/summary.json`、`reports/NAMH-055.5min.vad_modes_fusion_lite_line_compare.html`。
+
+### T-AT 关键验证记录
+
+- 按“简单配置、方便删除实验模式”的原则新增 `fusion_lite_boost` 和 `fusion_lite_sigmoid` 后缀后端，不新增 `FUSION_VAD_SCORING_MODE` 这类模式参数；`fusion_lite` 保留为线性基线。
+- 修复 fusion 内部 `ASR_VAD_PRIMARY=whisperseg` 加载路径：公开 registry 仍不接受裸 `whisperseg`，但 fusion primary 可直接加载 `WhisperSegVadBackend`。
+- SORA-575 使用 `whisper-ja-anime-v0.3`、跳过翻译进行 VAD/ASR 对比。CUDA ONNX 在 sandbox 内失败，原因是 GPU 被操作系统/sandbox 阻断；外部执行确认 RTX 4060 Ti、Torch CUDA 和 ONNXRuntime CUDA provider 可用。
+- SORA-575 汇总：`whisperseg-adaptive` 700 SRT / 210 ASR drops；`fusion_lite` 683 SRT / 167 drops；`fusion_lite_boost` 688 SRT / 185 drops；`fusion_lite_sigmoid` 677 SRT / 148 drops。逐句对齐以 `whisperseg-adaptive` 为基准，`fusion_lite_boost` 最接近：SAME 564、MISSING 41、平均相似度 0.9560。
+- 逐句报告产物：`agents/temp/sora575-vad-variant-compare/sora575_sentence_report.html`、`sora575_sentence_report.md`、`sora575_sentence_diffs_only.md`、`sora575_sentence_report.csv`、`sora575_sentence_report_summary.json`。
+- SRT overlap 处理重构：新增 `probe_video_fps()`，优先读 `avg_frame_rate`，再读 `r_frame_rate`；读不到 fps 时按 `30000/1001`。`SubtitleOptions` 持有 `video_fps`，SRT writer 在写出前排序、软拆、合并/裁剪重叠，并强制保留 2 帧 gap。旧 `SUBTITLE_GAP_PADDING` 已移除，不再保留兼容配置。
+- quality report 新增 `subtitle_overlap_count`、`subtitle_overlap_total_s`、`subtitle_overlap_max_s` 和前 5 个 overlap examples；正常写出后这些值应为 0。
+- 验证：`.venv/bin/python -m pytest tests/test_subtitle_options.py tests/test_subtitle_quality_pass.py tests/test_subtitle_qc.py tests/test_srt_wrap.py tests/test_video_fps_probe.py tests/test_skip_translation.py tests/test_job_tempdir.py tests/test_aligned_segments_cache.py tests/web/test_cancel_resume.py -q` -> `73 passed`。
 
 ---
 

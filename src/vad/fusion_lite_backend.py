@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import math
 import os
 import time
 from dataclasses import replace
@@ -15,6 +16,43 @@ from vad.whisperseg.postprocess import group_segments
 log = logging.getLogger(__name__)
 
 _REVISION = "1"
+_FUSION_BACKEND_NAMES = {"fusion", "fusion_lite", "fusion_lite_boost", "fusion_lite_sigmoid"}
+
+
+_BOOST_RECIPE = {
+    "scoring_variant": "boost",
+    "dynamic_gate_pad": True,
+    "primary_weight": 0.50,
+    "gate_weight": 0.25,
+    "rms_weight": 0.15,
+    "spectral_flux_weight": 0.08,
+    "duration_weight": 0.02,
+    "min_score": 0.45,
+    "min_gate_overlap_ratio": 0.08,
+    "boost_overlap_scale": 0.30,
+    "boost_rms_scale": 0.20,
+    "boost_keep_min_rms_score": 0.60,
+}
+
+_SIGMOID_RECIPE = {
+    "scoring_variant": "sigmoid",
+    "dynamic_gate_pad": True,
+    "primary_weight": 0.40,
+    "gate_weight": 0.30,
+    "rms_weight": 0.15,
+    "spectral_flux_weight": 0.10,
+    "duration_weight": 0.05,
+    "min_score": 0.42,
+    "min_gate_overlap_ratio": 0.12,
+    "sigmoid_keep_min_primary_score": 0.55,
+    "sigmoid_midpoint": 0.50,
+    "sigmoid_steepness": 8.0,
+    "duration_curve": "window",
+    "duration_sigmoid_mid_s": 0.60,
+    "duration_sigmoid_steepness": 6.0,
+    "duration_long_mid_s": 8.0,
+    "duration_long_steepness": 1.4,
+}
 
 
 def _env_float(name: str, default: str) -> float:
@@ -22,6 +60,10 @@ def _env_float(name: str, default: str) -> float:
 
 
 def _load_component_backend(name: str):
+    if name == "whisperseg":
+        from vad.whisperseg_backend import WhisperSegVadBackend
+
+        return WhisperSegVadBackend()
     if name == "silero":
         from vad.silero_backend import SileroVadBackend
 
@@ -59,6 +101,14 @@ def _score_linear(value: float, *, floor: float, full: float) -> float:
     if full <= floor:
         return 0.0
     return _clamp((value - floor) / (full - floor))
+
+
+def _sigmoid(value: float) -> float:
+    if value >= 0:
+        z = math.exp(-value)
+        return 1.0 / (1.0 + z)
+    z = math.exp(value)
+    return z / (1.0 + z)
 
 
 def _rms_dbfs(samples: np.ndarray) -> float:
@@ -112,6 +162,21 @@ def _duration_score(duration_s: float, *, min_s: float, full_s: float, max_s: fl
     return max(0.25, 1.0 - ((duration_s - max_s) / max(max_s, 1e-6)))
 
 
+def _duration_window_score(
+    duration_s: float,
+    *,
+    short_mid_s: float,
+    short_steepness: float,
+    long_mid_s: float,
+    long_steepness: float,
+) -> float:
+    if duration_s <= 0:
+        return 0.0
+    short_gate = _sigmoid(short_steepness * (duration_s - short_mid_s))
+    long_gate = _sigmoid(long_steepness * (long_mid_s - duration_s))
+    return _clamp(short_gate * long_gate)
+
+
 def _extract_segment_features(
     audio: np.ndarray,
     sample_rate: int,
@@ -124,12 +189,32 @@ def _extract_segment_features(
     duration_min_s: float,
     duration_full_s: float,
     duration_max_s: float,
+    duration_curve: str = "linear",
+    duration_sigmoid_mid_s: float = 0.60,
+    duration_sigmoid_steepness: float = 6.0,
+    duration_long_mid_s: float = 8.0,
+    duration_long_steepness: float = 1.4,
 ) -> dict[str, float]:
     start = max(0, int(segment.start * sample_rate))
     end = min(len(audio), int(segment.end * sample_rate))
     samples = audio[start:end]
     duration = _segment_duration(segment)
     rms = _rms_dbfs(samples)
+    if duration_curve == "window":
+        duration_score = _duration_window_score(
+            duration,
+            short_mid_s=duration_sigmoid_mid_s,
+            short_steepness=duration_sigmoid_steepness,
+            long_mid_s=duration_long_mid_s,
+            long_steepness=duration_long_steepness,
+        )
+    else:
+        duration_score = _duration_score(
+            duration,
+            min_s=duration_min_s,
+            full_s=duration_full_s,
+            max_s=duration_max_s,
+        )
     return {
         "rms_dbfs": rms,
         "rms_score": _score_linear(rms, floor=rms_floor_dbfs, full=rms_full_dbfs),
@@ -139,27 +224,32 @@ def _extract_segment_features(
             floor=flux_floor,
             full=flux_full,
         ),
-        "duration_score": _duration_score(
-            duration,
-            min_s=duration_min_s,
-            full_s=duration_full_s,
-            max_s=duration_max_s,
-        ),
+        "duration_score": duration_score,
     }
 
 
 def _neutral_features(segment: SpeechSegment, params: dict) -> dict[str, float]:
     duration = _segment_duration(segment)
-    return {
-        "rms_dbfs": 0.0,
-        "rms_score": 0.5,
-        "spectral_flux_score": 0.5,
-        "duration_score": _duration_score(
+    if params.get("duration_curve") == "window":
+        duration_score = _duration_window_score(
+            duration,
+            short_mid_s=float(params["duration_sigmoid_mid_s"]),
+            short_steepness=float(params["duration_sigmoid_steepness"]),
+            long_mid_s=float(params["duration_long_mid_s"]),
+            long_steepness=float(params["duration_long_steepness"]),
+        )
+    else:
+        duration_score = _duration_score(
             duration,
             min_s=float(params["duration_min_s"]),
             full_s=float(params["duration_full_s"]),
             max_s=float(params["duration_max_s"]),
-        ),
+        )
+    return {
+        "rms_dbfs": 0.0,
+        "rms_score": 0.5,
+        "spectral_flux_score": 0.5,
+        "duration_score": duration_score,
     }
 
 
@@ -185,7 +275,21 @@ def _build_feature_lookup(
         duration_min_s=float(params["duration_min_s"]),
         duration_full_s=float(params["duration_full_s"]),
         duration_max_s=float(params["duration_max_s"]),
+        duration_curve=str(params.get("duration_curve", "linear")),
+        duration_sigmoid_mid_s=float(params.get("duration_sigmoid_mid_s", 0.60)),
+        duration_sigmoid_steepness=float(params.get("duration_sigmoid_steepness", 6.0)),
+        duration_long_mid_s=float(params.get("duration_long_mid_s", 8.0)),
+        duration_long_steepness=float(params.get("duration_long_steepness", 1.4)),
     )
+
+
+def _effective_gate_pad_s(duration_s: float, *, params: dict) -> float:
+    base_pad_s = float(params["gate_pad_s"])
+    if not bool(params.get("dynamic_gate_pad")):
+        return base_pad_s
+    if duration_s <= 0:
+        return 0.0
+    return min(base_pad_s, max(0.05, duration_s * 0.35))
 
 
 def _score_segment(
@@ -196,10 +300,11 @@ def _score_segment(
     params: dict,
 ) -> dict[str, float | bool]:
     duration = _segment_duration(segment)
+    gate_pad_s = _effective_gate_pad_s(duration, params=params)
     overlap = _segment_gate_overlap(
         segment,
         gate_segments,
-        pad_s=float(params["gate_pad_s"]),
+        pad_s=gate_pad_s,
     )
     overlap_ratio = _clamp(overlap / duration) if duration > 0 else 0.0
     primary_score = _clamp(
@@ -208,21 +313,53 @@ def _score_segment(
         else float(params["default_primary_score"])
     )
     features = feature_lookup(segment)
-    speech_score = (
+    raw_score = (
         float(params["primary_weight"]) * primary_score
         + float(params["gate_weight"]) * overlap_ratio
         + float(params["rms_weight"]) * float(features["rms_score"])
         + float(params["spectral_flux_weight"]) * float(features["spectral_flux_score"])
         + float(params["duration_weight"]) * float(features["duration_score"])
     )
-    keep = not (
-        speech_score < float(params["min_score"])
-        and overlap_ratio < float(params["min_gate_overlap_ratio"])
-    )
+    variant = str(params.get("scoring_variant", "linear"))
+    enhancement = 1.0
+    if variant == "boost":
+        enhancement = (
+            1.0 + float(params["boost_overlap_scale"]) * overlap_ratio
+        ) * (
+            1.0 + float(params["boost_rms_scale"]) * float(features["rms_score"])
+        )
+        speech_score = min(1.0, raw_score * enhancement)
+        keep = (
+            speech_score > float(params["min_score"])
+            or (
+                overlap_ratio > float(params["min_gate_overlap_ratio"])
+                and float(features["rms_score"]) > float(params["boost_keep_min_rms_score"])
+            )
+        )
+    elif variant == "sigmoid":
+        speech_score = _sigmoid(
+            float(params["sigmoid_steepness"]) * (raw_score - float(params["sigmoid_midpoint"]))
+        )
+        keep = (
+            speech_score > float(params["min_score"])
+            or (
+                overlap_ratio > float(params["min_gate_overlap_ratio"])
+                and primary_score > float(params["sigmoid_keep_min_primary_score"])
+            )
+        )
+    else:
+        speech_score = raw_score
+        keep = not (
+            speech_score < float(params["min_score"])
+            and overlap_ratio < float(params["min_gate_overlap_ratio"])
+        )
     return {
         "keep": keep,
         "speech_score": speech_score,
+        "raw_score": raw_score,
+        "score_enhancement": enhancement,
         "primary_score": primary_score,
+        "gate_pad_s": gate_pad_s,
         "gate_overlap_s": overlap,
         "gate_overlap_ratio": overlap_ratio,
         **features,
@@ -255,7 +392,10 @@ def _filter_grouped_segments(
                 "duration_s": _segment_duration(segment),
                 "kept": bool(decision["keep"]),
                 "speech_score": round(float(decision["speech_score"]), 6),
+                "raw_score": round(float(decision["raw_score"]), 6),
+                "score_enhancement": round(float(decision["score_enhancement"]), 6),
                 "primary_score": round(float(decision["primary_score"]), 6),
+                "gate_pad_s": round(float(decision["gate_pad_s"]), 6),
                 "gate_overlap_ratio": round(float(decision["gate_overlap_ratio"]), 6),
                 "rms_dbfs": round(float(decision["rms_dbfs"]), 3),
                 "rms_score": round(float(decision["rms_score"]), 6),
@@ -273,23 +413,63 @@ def _filter_grouped_segments(
     return kept_groups, kept, dropped, decisions
 
 
+def _score_distribution(decisions: list[dict]) -> dict:
+    scores = [float(row["speech_score"]) for row in decisions]
+    if not scores:
+        return {
+            "count": 0,
+            "min": None,
+            "max": None,
+            "mean": None,
+            "p10": None,
+            "p50": None,
+            "p90": None,
+            "bins": ["0.0-0.2", "0.2-0.4", "0.4-0.6", "0.6-0.8", "0.8-1.0"],
+            "histogram": [0, 0, 0, 0, 0],
+        }
+    arr = np.asarray(scores, dtype=np.float64)
+    histogram = [0, 0, 0, 0, 0]
+    for score in scores:
+        idx = min(4, max(0, int(_clamp(score) / 0.2)))
+        histogram[idx] += 1
+    return {
+        "count": len(scores),
+        "min": round(float(np.min(arr)), 6),
+        "max": round(float(np.max(arr)), 6),
+        "mean": round(float(np.mean(arr)), 6),
+        "p10": round(float(np.percentile(arr, 10)), 6),
+        "p50": round(float(np.percentile(arr, 50)), 6),
+        "p90": round(float(np.percentile(arr, 90)), 6),
+        "bins": ["0.0-0.2", "0.2-0.4", "0.4-0.6", "0.6-0.8", "0.8-1.0"],
+        "histogram": histogram,
+    }
+
+
 class FusionLiteVadBackend:
     name = "fusion_lite_v1"
+    scoring_variant = "linear"
 
     def __init__(self) -> None:
         primary_name = os.getenv("ASR_VAD_PRIMARY", "whisperseg").strip().lower()
         gate_name = os.getenv("ASR_VAD_GATE", "silero").strip().lower()
-        if primary_name in {"fusion_lite", "fusion"}:
+        if primary_name in _FUSION_BACKEND_NAMES:
             raise ValueError("ASR_VAD_PRIMARY cannot be fusion_lite")
-        if gate_name in {"fusion_lite", "fusion"}:
+        if gate_name in _FUSION_BACKEND_NAMES:
             raise ValueError("ASR_VAD_GATE cannot be fusion_lite")
         self.primary_name = primary_name
         self.gate_name = gate_name
         self.primary = _load_component_backend(primary_name)
         self.gate = _load_component_backend(gate_name)
 
+    def _variant_overrides(self) -> dict:
+        if self.scoring_variant == "boost":
+            return dict(_BOOST_RECIPE)
+        if self.scoring_variant == "sigmoid":
+            return dict(_SIGMOID_RECIPE)
+        return {"scoring_variant": "linear", "dynamic_gate_pad": False}
+
     def signature(self) -> dict:
-        return {
+        sig = {
             "backend": self.name,
             "revision": _REVISION,
             "primary": self.primary.signature(),
@@ -312,6 +492,8 @@ class FusionLiteVadBackend:
             "duration_max_s": _env_float("FUSION_VAD_DURATION_MAX_S", "12.0"),
             "allow_empty": True,
         }
+        sig.update(self._variant_overrides())
+        return sig
 
     def segment(
         self,
@@ -366,15 +548,17 @@ class FusionLiteVadBackend:
                 "kept_duration_s": kept_duration,
                 "dropped_duration_s": dropped_duration,
                 "kept_speech_ratio": kept_duration / audio_duration if audio_duration > 0 else 0.0,
+                "score_distribution": _score_distribution(decisions),
             },
             "dropped_examples": [row for row in decisions if not row["kept"]][:20],
             "kept_examples": [row for row in decisions if row["kept"]][:20],
         }
         log.info(
             (
-                "[vad] backend=fusion_lite primary=%s gate=%s "
+                "[vad] backend=%s primary=%s gate=%s "
                 "kept=%d dropped=%d"
             ),
+            self.name,
             self.primary_name,
             self.gate_name,
             len(kept),
@@ -388,3 +572,13 @@ class FusionLiteVadBackend:
             parameters=params,
             processing_time_sec=time.monotonic() - started,
         )
+
+
+class FusionLiteBoostVadBackend(FusionLiteVadBackend):
+    name = "fusion_lite_boost_v1"
+    scoring_variant = "boost"
+
+
+class FusionLiteSigmoidVadBackend(FusionLiteVadBackend):
+    name = "fusion_lite_sigmoid_v1"
+    scoring_variant = "sigmoid"

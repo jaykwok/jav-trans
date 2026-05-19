@@ -15,8 +15,18 @@ def get_vad_backend(name: str | None = None) -> VadBackend:
         from vad.fusion_lite_backend import FusionLiteVadBackend
 
         return FusionLiteVadBackend()
+    if name == "fusion_lite_boost":
+        from vad.fusion_lite_backend import FusionLiteBoostVadBackend
+
+        return FusionLiteBoostVadBackend()
+    if name == "fusion_lite_sigmoid":
+        from vad.fusion_lite_backend import FusionLiteSigmoidVadBackend
+
+        return FusionLiteSigmoidVadBackend()
     raise ValueError(
-        f"Unknown VAD backend: {name!r}. Choose: whisperseg-adaptive, fusion_lite"
+        "Unknown VAD backend: "
+        f"{name!r}. Choose: whisperseg-adaptive, fusion_lite, "
+        "fusion_lite_boost, fusion_lite_sigmoid"
     )
 
 

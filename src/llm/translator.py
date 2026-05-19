@@ -1096,38 +1096,6 @@ def _translate_segments_batched(
     return [text or "" for text in zh_texts], timings
 
 
-_FEMALE_SOURCE_TERMS = ("まんこ", "マンコ", "おまんこ")
-_SUSPICIOUS_ASR_TERMS = (
-    "マンゴー",
-    "ウィンナー",
-    "おまけ",
-    "私の国",
-    "国に",
-    "こよく",
-    "きゅうしてください",
-)
-_FORBIDDEN_FEMALE_TRANSLATIONS = ("阴道", "陰道", "肉棒", "芒果", "香肠", "香腸")
-_FRAGMENT_REPAIR_SOURCE_MARKERS = (
-    "精子",
-    "まんこ",
-    "マンコ",
-    "おまんこ",
-    "マンゴー",
-    "ウィンナー",
-    "おまけ",
-    "私の国",
-    "国に",
-    "こよく",
-    "きゅうしてください",
-    "ちん",
-    "チン",
-)
-_LOW_CONFIDENCE_REPAIR_REASONS = {
-    "low_confidence",
-    "low_translation_confidence",
-}
-
-
 def _apply_translation_repair_pass(
     segments: list[dict],
     zh_texts: list[str],
@@ -1251,13 +1219,7 @@ def _select_translation_repair_ids(
     for idx, seg in enumerate(segments):
         source = _repair_source_text(seg)
         target = _repair_translation_text(seg, zh_texts, idx)
-        local_reasons = _translation_repair_reasons(
-            segments,
-            zh_texts,
-            idx,
-            source,
-            target,
-        )
+        local_reasons: list[str] = []
         if _has_translation_length_mismatch(source, target):
             local_reasons.append("length_mismatch")
         if not local_reasons:
@@ -1295,119 +1257,7 @@ def _has_translation_length_mismatch(source: str, target: str) -> bool:
 def _repair_candidate_priority(local_reasons: list[str]) -> int:
     if "length_mismatch" in local_reasons:
         return 0
-    if any(reason in _LOW_CONFIDENCE_REPAIR_REASONS for reason in local_reasons):
-        return 1
     return 0
-
-
-def _translation_repair_reasons(
-    segments: list[dict],
-    zh_texts: list[str],
-    idx: int,
-    source: str,
-    target: str,
-) -> list[str]:
-    del zh_texts
-
-    reasons: list[str] = []
-    has_female_source = any(term in source for term in _FEMALE_SOURCE_TERMS)
-    if has_female_source and any(term in target for term in _FORBIDDEN_FEMALE_TRANSLATIONS):
-        reasons.append("female_term_drift")
-
-    has_mango = "マンゴー" in source
-    if has_mango and _looks_like_sexual_asr_context(segments, idx):
-        if "小穴" not in target or _looks_like_fragment_translation(target):
-            reasons.append("suspicious_mango_asr")
-
-    has_wiener = "ウィンナー" in source
-    if has_wiener and (
-        "広げ" in source
-        or "肉棒" in target
-        or "香肠" in target
-        or "香腸" in target
-    ):
-        reasons.append("suspicious_wiener_asr")
-
-    if (
-        "おまけ" in source
-        and ("さらけ" in source or _looks_like_sexual_asr_context(segments, idx))
-        and ("露" in target or "赠" in target or _looks_like_fragment_translation(target))
-    ):
-        reasons.append("suspicious_omake_asr")
-
-    if (
-        ("私の国" in source or "国に" in source)
-        and _looks_like_sexual_asr_context(segments, idx)
-        and any(term in target for term in ("国家", "国", "我国"))
-    ):
-        reasons.append("suspicious_kuni_asr")
-
-    if (
-        "こよく" in source
-        and _looks_like_sexual_asr_context(segments, idx)
-        and ("说" in target or "説" in target or _looks_like_fragment_translation(target))
-    ):
-        reasons.append("suspicious_koyoku_asr")
-
-    if (
-        "きゅう" in source
-        and "してください" in source
-        and any(term in target for term in ("吸", "吮"))
-    ):
-        reasons.append("suspicious_kyuu_asr")
-
-    if (
-        any(marker in source for marker in _FRAGMENT_REPAIR_SOURCE_MARKERS)
-        and _looks_like_fragment_source(source)
-        and _looks_like_fragment_translation(target)
-    ):
-        reasons.append("fragment_translation")
-
-    return reasons
-
-
-def _looks_like_sexual_asr_context(segments: list[dict], idx: int) -> bool:
-    start = max(0, idx - 1)
-    end = min(len(segments), idx + 2)
-    joined = "\n".join(
-        _normalize_source_text(seg.get("text", ""))
-        for seg in segments[start:end]
-    )
-    return any(
-        marker in joined
-        for marker in (
-            "精子",
-            "射",
-            "入れ",
-            "入っ",
-            "気持ち",
-            "イク",
-            "イッ",
-            "行く",
-            "エロ",
-            "まんこ",
-            "マンコ",
-            "おまんこ",
-        )
-    )
-
-
-def _looks_like_fragment_source(source: str) -> bool:
-    stripped = source.strip()
-    if not stripped or re.search(r"[。！？!?]$", stripped):
-        return False
-    return bool(re.search(r"(さ|に|を|で|て|が|の|へ)$", stripped))
-
-
-def _looks_like_fragment_translation(target: str) -> bool:
-    stripped = target.strip()
-    if not stripped:
-        return True
-    if re.search(r"[。！？!?]$", stripped):
-        return False
-    if len(stripped) <= 10:
-        return True
-    return bool(re.search(r"[，、,]\s*[^，、,。！？!?]{1,6}$", stripped))
 
 
 def _build_repair_messages(
@@ -1428,8 +1278,8 @@ def _build_repair_messages(
     )
     system_prompt += (
         "\n\n这是翻译后局部修复任务。只修复 requested_ids 中的译文；"
-        "必须利用 reason 字段、相邻字幕和 current_zh 修复明显 ASR 同音误听、上下文漂移、术语漂移和被切断的半句。"
-        "reason 只是问题类别提示，不是固定译文；最终译文必须服从原文、上下文和既定术语。"
+        "只处理 reason 字段指出的译文长度异常，保持原字幕文本含义，不要根据上下文推测或改写源文。"
+        "reason 只是问题类别提示，不是固定译文；最终译文必须服从原文和既定术语。"
         "性器官术语继续统一为肉棒/小穴，不要漂移成其他书面或错误译法。"
     )
     context_items = _build_repair_context_items(
@@ -1487,16 +1337,10 @@ def _build_repair_context_items(
 def _public_repair_reasons(local_reasons: list[str]) -> list[str]:
     public: list[str] = []
     for reason in local_reasons:
-        if reason == "female_term_drift":
-            public.append("female_term_drift")
-        elif reason == "fragment_translation":
-            public.append("fragment_translation")
-        elif reason == "length_mismatch":
+        if reason == "length_mismatch":
             public.append("length_mismatch")
-        elif reason.startswith("suspicious_"):
-            public.append("asr_homophone_or_context_drift")
         else:
-            public.append("translation_drift")
+            public.append("translation_quality")
     return list(dict.fromkeys(public))
 
 
