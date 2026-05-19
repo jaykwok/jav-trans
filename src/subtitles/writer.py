@@ -400,6 +400,8 @@ def _prepare_subtitle_blocks(
         start, end = _resolve_subtitle_window(prepared, idx, options=options)
         prepared[idx - 1]["start"] = start
         prepared[idx - 1]["end"] = end
+    # Reading-duration expansion can push a cue back into the next cue window.
+    # Keep this final pass as the hard no-overlap, frame-gap guard for the cue plan.
     prepared = _normalize_subtitle_timeline(prepared, options=options)
     return prepared
 
