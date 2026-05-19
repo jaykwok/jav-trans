@@ -102,6 +102,7 @@ HF_ENDPOINT=https://hf-mirror.com
 - **懂二次元的识别模型**：支持 `anime-whisper`、`whisper-ja-anime-v0.3`、`whisper-ja-1.5b`、`qwen3-asr-1.7b`。引擎默认与 Web 推荐首选均为 `whisper-ja-anime-v0.3`。
 - **WhisperSeg VAD + 长 chunk 流程**：默认使用 WhisperSeg 自适应阈值，基础阈值 `0.35`；开启 VAD chunk packing，将相邻语音段打包成更适合 Whisper/forced alignment 的长 chunk。当前保留的用户可选 VAD 路线是 `whisperseg` 和实验后端 `fusion_lite`。
 - **Fusion-lite VAD 实验模式**：`fusion_lite` 不引入 pyannote 或训练流程，受 FusionVAD “简单特征融合”思路启发，把 WhisperSeg 分数、Silero speech overlap、RMS、spectral flux 和时长分数组合为 `0.45 * whisperseg_score + 0.25 * silero_overlap_ratio + 0.15 * rms_score + 0.10 * spectral_flux_score + 0.05 * duration_score`；只有总分低且 Silero 重叠也低的候选才丢弃。
+- **VAD fallback 边界**：ffmpeg silencedetect 不作为用户可选主 VAD 模式，只在 WhisperSeg/Silero 初始化失败、推理异常或异常空结果时作为内部灾难恢复 fallback，日志和 quality report 中会保留 fallback 线索，便于复测时区分低质量保底输出。
 - **自适应低幻觉 ASR 策略**：ASR QC 默认且唯一使用 adaptive precision。高 `no_speech_prob`、高压缩率、异常字符密度、重复循环、上下文泄漏、乱码和生成异常会硬丢弃；低风险真实对白的低 `avg_logprob` 会自适应放宽，并写入 quality report 审计。
 - **ASR generation budget 防溢出**：Whisper 系列会根据 decoder 窗口、forced decoder ids、prompt tokens 动态裁剪 prompt 和 `max_new_tokens`，质量报告会统计 overflow/error/timeout/quarantine；生成失败不再通过温度重试或 recovery 补写内容。
 - **翻译前噪声过滤**：在提交给 LLM 前过滤空字幕、纯引号片段、纯英文幻觉 token 和纯特殊符号片段，减少无效翻译请求。
