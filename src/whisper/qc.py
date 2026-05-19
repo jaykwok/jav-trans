@@ -660,15 +660,16 @@ def _drop_reasons_for_qc_item(item: dict) -> list[str]:
         signal_verdict = str(signal_qc.get("verdict") or "").strip().lower()
 
     drop_reasons: list[str] = []
-    if signal_verdict == "reject":
-        drop_reasons.append("signal_reject")
-    elif severity == "reject":
-        drop_reasons.append("qc_reject")
     for reason in reasons:
         if reason.startswith("generation_"):
             drop_reasons.append(reason)
         elif reason in {"long_low_information_chunk", "long_low_value_text"}:
             drop_reasons.append(reason)
+    if not drop_reasons:
+        if signal_verdict == "reject":
+            drop_reasons.append("signal_reject")
+        elif severity == "reject":
+            drop_reasons.append("qc_reject")
     return list(dict.fromkeys(drop_reasons))
 
 

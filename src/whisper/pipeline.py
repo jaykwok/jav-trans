@@ -324,9 +324,9 @@ def _build_processing_spans(
                 "padding_s": cfg["pack_padding_s"],
             },
         }
-        _set_last_vad_signature(runtime_vad_signature)
         segments = result.segments
         if not segments:
+            _set_last_vad_signature(runtime_vad_signature)
             if allow_empty_vad:
                 event = _vad_chunk_cache_module.save_processing_spans(
                     audio_path,
@@ -345,12 +345,11 @@ def _build_processing_spans(
                     )
                     _set_last_vad_cache_event(event)
                 return []
-            spans = [(0.0, result.audio_duration_sec)]
             event = _vad_chunk_cache_module.save_processing_spans(
                 audio_path,
                 vad_signature=vad_signature,
                 chunk_config=cfg,
-                processing_spans=spans,
+                processing_spans=[],
                 runtime_vad_signature=runtime_vad_signature,
                 vad_segments=result.segments,
                 vad_groups=result.groups,
@@ -362,7 +361,8 @@ def _build_processing_spans(
                     event["digest"],
                 )
                 _set_last_vad_cache_event(event)
-            return spans
+            return []
+        _set_last_vad_signature(runtime_vad_signature)
         if cfg["drop_enabled"]:
             segments = _drop_short_low_energy_spans(audio_path, segments)
         packed = pack_vad_segments(
@@ -392,10 +392,24 @@ def _build_processing_spans(
     result = vad.segment(audio_path)
     allow_empty_vad = bool(result.parameters.get("allow_empty"))
     runtime_vad_signature = dict(result.parameters)
-    _set_last_vad_signature(runtime_vad_signature)
     spans = [(group[0].start, group[-1].end) for group in result.groups]
+    _set_last_vad_signature(runtime_vad_signature)
     if not spans and not allow_empty_vad:
-        spans = [(0.0, result.audio_duration_sec)]
+        event = _vad_chunk_cache_module.save_processing_spans(
+            audio_path,
+            vad_signature=vad_signature,
+            chunk_config=cfg,
+            processing_spans=[],
+            runtime_vad_signature=runtime_vad_signature,
+        )
+        if event is not None:
+            _pipeline_logger.info(
+                "[vad-cache] saved path=%s digest=%s",
+                event["path"],
+                event["digest"],
+            )
+            _set_last_vad_cache_event(event)
+        return []
     if cfg["drop_enabled"]:
         spans = _drop_short_low_energy_spans(audio_path, spans)
     event = _vad_chunk_cache_module.save_processing_spans(
@@ -490,6 +504,56 @@ def _transcribe_and_align_local(
         split_elapsed = time.perf_counter() - split_started
         log.append(f"切分完成：共 {len(chunk_infos)} 个处理块")
         _record_stage_timing(log, timings, "split_s", "静音分析与切块", split_elapsed)
+
+        if not chunk_infos:
+            timings.update(
+                {
+                    "asr_model_load_s": 0.0,
+                    "asr_text_transcribe_s": 0.0,
+                    "asr_qc_s": 0.0,
+                    "asr_model_unload_s": 0.0,
+                    "alignment_s": 0.0,
+                    "alignment_model_unload_s": 0.0,
+                    "subtitle_merge_s": 0.0,
+                }
+            )
+            total_elapsed = time.perf_counter() - total_started
+            _record_stage_timing(
+                log,
+                timings,
+                "asr_alignment_total_s",
+                "ASR与Alignment总计",
+                total_elapsed,
+            )
+            log.append("VAD 未检测到可处理语音块，跳过 ASR")
+            details = {
+                "backend": get_backend_label(),
+                "audio_path": audio_path,
+                "device": device,
+                "chunk_count": 0,
+                "transcript_chunks": [],
+                "asr_qc": {
+                    "enabled": True,
+                    "chunk_count": 0,
+                    "reject_count": 0,
+                    "warning_count": 0,
+                    "generation_error_count": 0,
+                    "generation_overflow_count": 0,
+                    "timeout_count": 0,
+                    "quarantined_count": 0,
+                    "empty_text_for_speech_count": 0,
+                    "dropped_uncertain_count": 0,
+                    "dropped_uncertain_items": [],
+                    "items": [],
+                    "rejected_indices": [],
+                },
+                "stage_timings": timings,
+                "word_count": 0,
+                "segment_count": 0,
+                "vad_no_speech": True,
+                "vad_signature": dict(_LAST_VAD_SIGNATURE),
+            }
+            return [], log, details
 
         backend = _resolve_asr_backend(device)
         word_dicts: list[dict] = []

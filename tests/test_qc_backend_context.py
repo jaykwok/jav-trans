@@ -217,4 +217,3 @@ def test_adaptive_precision_filter_drops_hard_density_reject():
     assert log
     assert "ASR Adaptive Precision drop chunk 1" in log[0]
 
-

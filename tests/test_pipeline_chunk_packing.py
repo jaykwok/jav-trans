@@ -78,6 +78,30 @@ class _EmptyAllowedVadBackend:
         return {"backend": self.name, "allow_empty": True}
 
 
+class _EmptyDisallowedVadBackend:
+    name = "empty_disallowed"
+
+    def segment(
+        self,
+        audio_path: str,
+        *,
+        target_sr: int = 16000,
+        threshold_override: float | None = None,
+    ) -> SegmentationResult:
+        del audio_path, target_sr, threshold_override
+        return SegmentationResult(
+            segments=[],
+            groups=[],
+            method=self.name,
+            audio_duration_sec=10.0,
+            parameters={"backend": self.name},
+            processing_time_sec=0.0,
+        )
+
+    def signature(self) -> dict:
+        return {"backend": self.name}
+
+
 class _RecordingBackend:
     is_subprocess = False
     accepts_contexts = True
@@ -251,6 +275,28 @@ def test_empty_allowed_vad_does_not_fallback_to_full_audio(monkeypatch, tmp_path
     assert backend.audio_paths == []
     assert segments == []
     assert details["chunk_count"] == 0
+    assert any("切分完成：共 0 个处理块" in entry for entry in log)
+
+
+def test_empty_disallowed_vad_skips_asr_without_full_audio_fallback(monkeypatch, tmp_path):
+    asr = _reload_pipeline(monkeypatch, tmp_path, packing_enabled="1")
+    source = tmp_path / "source_empty_disallowed.wav"
+    _write_wav(source, seconds=12.0)
+
+    import vad
+
+    monkeypatch.setattr(vad, "get_vad_backend", lambda: _EmptyDisallowedVadBackend())
+    backend = _RecordingBackend()
+    monkeypatch.setattr(asr, "_resolve_asr_backend", lambda _device: backend)
+
+    segments, log, details = asr._transcribe_and_align_local(str(source), "cpu")
+
+    assert segments == []
+    assert backend.audio_paths == []
+    assert backend.finalized_texts == []
+    assert details["chunk_count"] == 0
+    assert details["transcript_chunks"] == []
+    assert details["asr_qc"]["dropped_uncertain_count"] == 0
     assert any("切分完成：共 0 个处理块" in entry for entry in log)
 
 

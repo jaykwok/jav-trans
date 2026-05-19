@@ -17,7 +17,6 @@ _SEGMENT_MIN_SPEECH_S = float(os.getenv("SEGMENT_MIN_SPEECH", "0.25"))
 _SEGMENT_PAD_S = float(os.getenv("SEGMENT_PAD", "0.15"))
 _VAD_MERGE_SHORT_MAX_S = float(os.getenv("VAD_MERGE_SHORT_MAX_S", "0.8"))
 _VAD_MERGE_GAP_MAX_S = float(os.getenv("VAD_MERGE_GAP_MAX_S", "0.3"))
-_SEGMENT_SILENCE_DB = os.getenv("SEGMENT_SILENCE_DB", "-32dB").strip()
 _KEEP_ASR_CHUNKS = os.getenv("KEEP_ASR_CHUNKS", "").strip().lower() in {
     "1",
     "true",

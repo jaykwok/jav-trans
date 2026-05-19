@@ -114,9 +114,9 @@ DEFAULT_SETTINGS: dict[str, str] = {
     "ASR_NATIVE_MAX_CHARS_PER_ITEM": "12.0",
 
     # --- VAD & Audio Chunking ---
-    # Minimum silence/off interval used by ffmpeg fallback VAD paths.
+    # Minimum silence/off interval used by timestamp fallback VAD paths.
     "VAD_MIN_OFF": "0.1",
-    # Padding, in seconds, added around detected speech by ffmpeg fallback VAD paths.
+    # Padding, in seconds, added around detected speech by timestamp fallback VAD paths.
     "VAD_PAD": "0.15",
     # Minimum silence length used to split chunks.
     "SEGMENT_MIN_SILENCE": "0.35",
@@ -138,8 +138,6 @@ DEFAULT_SETTINGS: dict[str, str] = {
     "ASR_CHUNK_PACK_GAP_MERGE_S": "1.5",
     # Padding, in seconds, added around packed VAD chunks.
     "ASR_CHUNK_PACK_PADDING_S": "2.0",
-    # ffmpeg silence threshold for fallback chunking.
-    "SEGMENT_SILENCE_DB": "-32dB",
     # 1 enables dropping very short low-energy spans before ASR (opt-in).
     "ASR_CHUNK_DROP_ENABLED": "0",
     # Spans shorter than this value (seconds) are candidates for dropping.
