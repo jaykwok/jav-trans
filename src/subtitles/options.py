@@ -16,8 +16,8 @@ def _env_bool(name: str, default: bool) -> bool:
 
 @dataclass(frozen=True)
 class SubtitleOptions:
-    max_duration: float = 7.0
-    soft_max: float = 6.0
+    max_duration: float = 6.5
+    soft_max: float = 5.5
     soft_split_enabled: bool = True
     min_duration: float = 0.6
     reading_cps: float = 7.0
@@ -36,8 +36,8 @@ class SubtitleOptions:
     @classmethod
     def from_env(cls) -> "SubtitleOptions":
         return cls(
-            max_duration=float(os.getenv("MAX_SUBTITLE_DURATION", "7.0")),
-            soft_max=float(os.getenv("SUBTITLE_SOFT_MAX_S", "6.0")),
+            max_duration=float(os.getenv("MAX_SUBTITLE_DURATION", "6.5")),
+            soft_max=float(os.getenv("SUBTITLE_SOFT_MAX_S", "5.5")),
             soft_split_enabled=_env_bool("SUBTITLE_SOFT_SPLIT_ENABLED", True),
             min_duration=float(
                 os.getenv(

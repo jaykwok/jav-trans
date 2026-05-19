@@ -28,6 +28,16 @@ def test_subtitle_options_from_env(monkeypatch):
     assert options.show_gender is True
 
 
+def test_subtitle_options_defaults_are_conservative(monkeypatch):
+    monkeypatch.delenv("MAX_SUBTITLE_DURATION", raising=False)
+    monkeypatch.delenv("SUBTITLE_SOFT_MAX_S", raising=False)
+
+    options = SubtitleOptions.from_env()
+
+    assert options.max_duration == 6.5
+    assert options.soft_max == 5.5
+
+
 def test_write_srt_explicit_options_override_env(monkeypatch, tmp_path):
     monkeypatch.setenv("SUBTITLE_SHOW_SPEAKER", "0")
     monkeypatch.setenv("SUBTITLE_SHOW_GENDER", "0")
