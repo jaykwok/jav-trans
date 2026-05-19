@@ -56,7 +56,7 @@ DEFAULT_SETTINGS: dict[str, str] = {
     "WHISPER_FORCED_FAIL_RATIO": "0.3",
     "WHISPER_UNLOAD_EVERY": "200",
     # Voice activity detection backend used before ASR chunking.
-    "ASR_VAD_BACKEND": "whisperseg",
+    "ASR_VAD_BACKEND": "whisperseg-adaptive",
     # 1 lets WhisperSeg adjust its threshold once from whole-audio speech density.
     "ASR_VAD_ADAPTIVE": "1",
     # Primary/gate components used when ASR_VAD_BACKEND=fusion_lite.
