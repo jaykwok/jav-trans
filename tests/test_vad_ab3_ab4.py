@@ -147,3 +147,36 @@ def test_ab4_adaptive_enabled_reruns_with_high_ratio(monkeypatch):
         assert result.parameters["adaptive"]["threshold_adjusted"] is True
     finally:
         os.unlink(wav_path)
+
+
+def test_whisperseg_empty_groups_are_valid_skip_result(monkeypatch):
+    from vad.base import SegmentationResult
+    from vad.whisperseg_backend import WhisperSegVadBackend
+
+    class EmptySegmenter:
+        threshold = 0.35
+
+        def segment(self, audio_path, sample_rate=16000):
+            del audio_path, sample_rate
+            return SegmentationResult(
+                segments=[],
+                groups=[],
+                method="test",
+                audio_duration_sec=1.0,
+                parameters={
+                    "audio_stats": {"mean_prob": 0.0, "speech_ratio": 0.0},
+                    "neg_offset": 0.15,
+                    "threshold": self.threshold,
+                },
+                processing_time_sec=0.0,
+            )
+
+    monkeypatch.setenv("ASR_VAD_ADAPTIVE", "0")
+    backend = WhisperSegVadBackend()
+    backend._segmenter = EmptySegmenter()
+
+    result = backend.segment("silent.wav")
+
+    assert result.groups == []
+    assert result.segments == []
+    assert result.parameters["audio_stats"]["speech_ratio"] == 0.0

@@ -43,7 +43,7 @@ DEFAULT_SETTINGS: dict[str, str] = {
     "ALIGNMENT_TIMESTAMP_MODE": "forced",
     # Optional override for the active Whisper-family model path; empty uses the preset repo/local cache.
     "WHISPER_MODEL_PATH": "",
-    # Whisper generation fallback defaults; presets can override these when env values are unset.
+    # Whisper generation defaults; presets can override these when env values are unset.
     "WHISPER_BEAMS": "1",
     "WHISPER_NO_REPEAT_NGRAM": "0",
     "WHISPER_MAX_NEW_TOKENS": "444",

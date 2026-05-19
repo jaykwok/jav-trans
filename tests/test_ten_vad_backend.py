@@ -70,7 +70,6 @@ def test_detect_speech_spans_uses_ten_vad_when_enabled(monkeypatch):
         raise AssertionError("silero should not be used when TEN succeeds")
 
     monkeypatch.setenv("TEN_VAD_BACKEND", "1")
-    monkeypatch.setattr(timestamp_fallback, "_TEN_VAD_ENABLED", True)
     monkeypatch.setattr(timestamp_fallback, "_detect_speech_spans_ten_vad", fake_ten)
     monkeypatch.setattr(timestamp_fallback, "_load_silero_vad", fail_silero)
 
@@ -90,7 +89,6 @@ def test_detect_speech_spans_falls_back_to_silero_when_ten_errors(monkeypatch):
         return [{"start": 0.2, "end": 0.6}]
 
     monkeypatch.setenv("TEN_VAD_BACKEND", "1")
-    monkeypatch.setattr(timestamp_fallback, "_TEN_VAD_ENABLED", True)
     monkeypatch.setattr(
         timestamp_fallback,
         "_detect_speech_spans_ten_vad",
@@ -118,7 +116,6 @@ def test_detect_speech_spans_keeps_empty_ten_result_without_silero(monkeypatch):
         raise AssertionError("Silero should not be used when TEN returns a valid empty result")
 
     monkeypatch.setenv("TEN_VAD_BACKEND", "1")
-    monkeypatch.setattr(timestamp_fallback, "_TEN_VAD_ENABLED", True)
     monkeypatch.setattr(
         timestamp_fallback,
         "_detect_speech_spans_ten_vad",
@@ -134,7 +131,6 @@ def test_detect_speech_spans_keeps_empty_ten_result_without_silero(monkeypatch):
 
 def test_detect_speech_spans_reports_ten_and_silero_errors(monkeypatch):
     monkeypatch.setenv("TEN_VAD_BACKEND", "1")
-    monkeypatch.setattr(timestamp_fallback, "_TEN_VAD_ENABLED", True)
     monkeypatch.setattr(
         timestamp_fallback,
         "_detect_speech_spans_ten_vad",
@@ -167,7 +163,6 @@ def test_detect_speech_spans_uses_silero_when_ten_disabled(monkeypatch):
         raise AssertionError("TEN should not be used when disabled")
 
     monkeypatch.setenv("TEN_VAD_BACKEND", "0")
-    monkeypatch.setattr(timestamp_fallback, "_TEN_VAD_ENABLED", False)
     monkeypatch.setattr(timestamp_fallback, "_detect_speech_spans_ten_vad", fail_ten)
     monkeypatch.setattr(
         timestamp_fallback,
@@ -180,3 +175,66 @@ def test_detect_speech_spans_uses_silero_when_ten_disabled(monkeypatch):
 
     assert spans == [(0.1, 0.4)]
     assert error == ""
+
+
+def test_detect_speech_spans_reads_ten_vad_enabled_at_runtime(monkeypatch):
+    calls = {"ten": 0, "silero": 0}
+
+    def fake_ten(_audio_path):
+        calls["ten"] += 1
+        return [(0.0, 0.5)], ""
+
+    def fake_silero(_audio_path):
+        calls["silero"] += 1
+        return [(0.1, 0.4)], ""
+
+    monkeypatch.setattr(timestamp_fallback, "_detect_speech_spans_ten_vad", fake_ten)
+    monkeypatch.setattr(timestamp_fallback, "_detect_speech_spans_silero_vad", fake_silero)
+
+    monkeypatch.setenv("TEN_VAD_BACKEND", "0")
+    spans, error = timestamp_fallback.detect_speech_spans("audio.wav")
+    assert spans == [(0.1, 0.4)]
+    assert error == ""
+
+    monkeypatch.setenv("TEN_VAD_BACKEND", "1")
+    spans, error = timestamp_fallback.detect_speech_spans("audio.wav")
+    assert spans == [(0.0, 0.5)]
+    assert error == ""
+    assert calls == {"ten": 1, "silero": 1}
+
+
+def test_silero_timestamp_vad_parameters_read_env_at_runtime(monkeypatch):
+    class FakeWaveform:
+        def numel(self):
+            return 16000
+
+    captured = {}
+
+    def fake_get_speech_timestamps(*_args, **kwargs):
+        captured.update(kwargs)
+        return [{"start": 0.2, "end": 0.6}]
+
+    monkeypatch.setenv("TEN_VAD_BACKEND", "0")
+    monkeypatch.setenv("TIMESTAMP_VAD_ONSET", "0.42")
+    monkeypatch.setenv("TIMESTAMP_VAD_MIN_SPEECH", "0.33")
+    monkeypatch.setenv("VAD_MIN_OFF", "0.21")
+    monkeypatch.setenv("VAD_PAD", "0.17")
+    monkeypatch.setattr(
+        timestamp_fallback,
+        "_load_audio_for_vad",
+        lambda _audio_path: (FakeWaveform(), 16000),
+    )
+    monkeypatch.setattr(
+        timestamp_fallback,
+        "_load_silero_vad",
+        lambda: (object(), fake_get_speech_timestamps),
+    )
+
+    spans, error = timestamp_fallback.detect_speech_spans("audio.wav")
+
+    assert spans == [(0.2, 0.6)]
+    assert error == ""
+    assert captured["threshold"] == pytest.approx(0.42)
+    assert captured["min_speech_duration_ms"] == 330
+    assert captured["min_silence_duration_ms"] == 210
+    assert captured["speech_pad_ms"] == 170

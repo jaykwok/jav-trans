@@ -72,8 +72,6 @@ def test_merge_adjacent_short_blocks_stops_after_sentence_punctuation(tmp_path):
 
 
 def test_soft_split_prefers_translated_sentence_punctuation(monkeypatch, tmp_path):
-    monkeypatch.setattr(subtitle, "SUBTITLE_SOFT_SPLIT_ENABLED", True)
-    monkeypatch.setattr(subtitle, "SUBTITLE_SOFT_MAX_S", 6.0)
     path = tmp_path / "soft_zh.srt"
     blocks = [
         {
@@ -90,7 +88,11 @@ def test_soft_split_prefers_translated_sentence_punctuation(monkeypatch, tmp_pat
         }
     ]
 
-    subtitle.write_bilingual_srt(blocks, str(path))
+    subtitle.write_bilingual_srt(
+        blocks,
+        str(path),
+        options=SubtitleOptions(soft_split_enabled=True, soft_max=6.0),
+    )
 
     content = path.read_text(encoding="utf-8")
     assert _cue_count(content) == 2
@@ -102,8 +104,6 @@ def test_soft_split_prefers_translated_sentence_punctuation(monkeypatch, tmp_pat
 
 
 def test_soft_split_falls_back_to_japanese_particle_boundary(monkeypatch, tmp_path):
-    monkeypatch.setattr(subtitle, "SUBTITLE_SOFT_SPLIT_ENABLED", True)
-    monkeypatch.setattr(subtitle, "SUBTITLE_SOFT_MAX_S", 6.0)
     path = tmp_path / "soft_particle.srt"
     blocks = [
         {
@@ -120,7 +120,11 @@ def test_soft_split_falls_back_to_japanese_particle_boundary(monkeypatch, tmp_pa
         }
     ]
 
-    subtitle.write_bilingual_srt(blocks, str(path))
+    subtitle.write_bilingual_srt(
+        blocks,
+        str(path),
+        options=SubtitleOptions(soft_split_enabled=True, soft_max=6.0),
+    )
 
     content = path.read_text(encoding="utf-8")
     assert _cue_count(content) == 2
@@ -129,8 +133,6 @@ def test_soft_split_falls_back_to_japanese_particle_boundary(monkeypatch, tmp_pa
 
 
 def test_soft_split_does_not_change_blocks_without_words(monkeypatch, tmp_path):
-    monkeypatch.setattr(subtitle, "SUBTITLE_SOFT_SPLIT_ENABLED", True)
-    monkeypatch.setattr(subtitle, "SUBTITLE_SOFT_MAX_S", 6.0)
     path = tmp_path / "fallback_no_words.srt"
     blocks = [
         {
@@ -141,7 +143,11 @@ def test_soft_split_does_not_change_blocks_without_words(monkeypatch, tmp_path):
         }
     ]
 
-    subtitle.write_bilingual_srt(blocks, str(path))
+    subtitle.write_bilingual_srt(
+        blocks,
+        str(path),
+        options=SubtitleOptions(soft_split_enabled=True, soft_max=6.0),
+    )
 
     content = path.read_text(encoding="utf-8")
     assert _cue_count(content) == 1

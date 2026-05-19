@@ -72,8 +72,8 @@ def test_drop_disabled_keeps_all_spans(audio_file, monkeypatch, tmp_path):
     # main path. We verify the helper behaviour directly: even short silent spans
     # are NOT dropped when we temporarily force it with small thresholds,
     # but here we just confirm the env flag is respected in _build_processing_spans
-    # by checking the module-level bool.
-    assert not pl._ASR_CHUNK_DROP_ENABLED
+    # by checking the runtime config reader.
+    assert not pl._chunk_config()["drop_enabled"]
 
 
 # --- Case B: short silent span is dropped ---
