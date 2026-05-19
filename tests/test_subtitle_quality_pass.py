@@ -84,6 +84,27 @@ def test_prepare_srt_blocks_sorts_and_removes_overlap_with_frame_gap():
     assert prepared[0]["end"] + options.frame_gap_s <= prepared[1]["start"]
 
 
+def test_prepare_srt_blocks_final_normalize_guards_reading_window_overlap(monkeypatch):
+    blocks = [
+        {"start": 0.0, "end": 1.0, "ja_text": "あ", "zh_text": "甲"},
+        {"start": 1.2, "end": 2.0, "ja_text": "い", "zh_text": "乙"},
+    ]
+    options = SubtitleOptions(video_fps=25.0, merge_adjacent=False)
+    original_resolve = subtitle._resolve_subtitle_window
+
+    def expand_first_window(blocks, idx, *, options=None):
+        if idx == 1:
+            return 0.0, 1.25
+        return original_resolve(blocks, idx, options=options)
+
+    monkeypatch.setattr(subtitle, "_resolve_subtitle_window", expand_first_window)
+
+    prepared = subtitle.prepare_srt_blocks(blocks, options=options, mode="bilingual")
+
+    assert prepared[0]["end"] == pytest.approx(1.12)
+    assert prepared[0]["end"] + options.frame_gap_s <= prepared[1]["start"]
+
+
 def test_prepare_srt_blocks_merges_same_speaker_overlap_when_too_tight():
     blocks = [
         {
