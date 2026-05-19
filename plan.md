@@ -20,7 +20,8 @@
 - Engine 默认 ASR：`ASR_BACKEND=whisper-ja-anime-v0.3`。
 - Web 推荐默认 ASR：`whisper-ja-anime-v0.3`，`/api/config` 同时暴露 `engine_defaults.asr_backend` 与 `recommended_asr_backend`。
 - 支持 ASR 后端：`anime-whisper`、`qwen3-asr-1.7b`、`whisper-ja-1.5b`、`whisper-ja-anime-v0.3`。
-- 默认 VAD：`ASR_VAD_BACKEND=whisperseg`，`WHISPERSEG_THRESHOLD=0.35`。
+- 默认 VAD：`ASR_VAD_BACKEND=whisperseg`，`ASR_VAD_ADAPTIVE=1`，`WHISPERSEG_THRESHOLD=0.35`。当前保留的用户可选 VAD 路线只有 `whisperseg` 自适应阈值模式和实验 `fusion_lite` 模式；Silero 只作为 `fusion_lite` 内部 speech prior，不作为独立主 VAD 暴露。
+- `fusion_lite` 受 FusionVAD 特征融合思想启发，但不引入 pyannote 或训练流程；公式为 `speech_score = 0.45 * whisperseg_score + 0.25 * silero_overlap_ratio + 0.15 * rms_score + 0.10 * spectral_flux_score + 0.05 * duration_score`，仅当 `speech_score < 0.45` 且 `silero_overlap_ratio < 0.05` 时丢弃候选。权重理由：WhisperSeg 作为候选主信号占最大权重，Silero 只提供 speech prior 而不一票否决，RMS/spectral flux/duration 补充传统声学特征。
 - `ASR_LONG_CHUNK_PROFILE=on` 时强制开启 VAD chunk packing 与 post-alignment F0：`ASR_CHUNK_PACKING_ENABLED=1`、`F0_GENDER_POST_ALIGNMENT=1`。
 - Whisper generation budget 由共享层按 `max_target_positions`、forced decoder ids、prompt ids 和 `WHISPER_MAX_NEW_TOKENS` 动态裁剪；Qwen 不套 Whisper 448 decoder 窗口。
 - ASR 精度策略固定为 adaptive precision，不再提供 `ASR_PRECISION_MODE` 模式开关。高 `no_speech_prob`、高压缩率、异常字符密度、重复循环、上下文泄漏、乱码和生成异常在 alignment 前硬丢弃；低风险真实对白可按自适应 `avg_logprob` 阈值保留，所有判定进入 quality report 审计。
@@ -30,7 +31,7 @@
 
 ### 1.3 F0 / 字幕策略
 
-- 字幕约束：`MAX_SUBTITLE_DURATION=8.0`，`ASR_MERGE_HARD_MAX_DURATION=9.0`。
+- 字幕约束：`MAX_SUBTITLE_DURATION=7.0`，`SUBTITLE_SOFT_MAX_S=6.0`，`ASR_MERGE_HARD_MAX_DURATION=9.0`。7s 参考 Netflix Timed Text 单条字幕最大时长；BBC/眼动研究支持根据阅读速度弹性处理，因此 6s 作为软拆分目标，7s 作为硬上限，避免短文本长时间挂屏。
 - 相邻短块合并受标点、speaker guard 和 gender guard 限制。
 - `SubtitleOptions` 是字幕策略的任务级配置入口；timeline、reading、gap、merge、权重等参数不得依赖 import-time 全局常量。
 - F0 None carry-over 默认开启：`F0_GENDER_NONE_TOLERANCE=3`，`F0_GENDER_CARRYOVER_MAX_GAP_S=15.0`，`F0_GENDER_CARRYOVER_MAX_SEGMENT_S=12.0`。
@@ -72,9 +73,12 @@
 - `ASR_CONTEXT`
 - `ASR_BACKEND`
 - `ASR_VAD_BACKEND`
+- `ASR_VAD_ADAPTIVE`
 - `ASR_LONG_CHUNK_PROFILE`
 - `ASR_CHUNK_PACK*`
 - `WHISPERSEG_*`
+- `SILERO_VAD_*`
+- `FUSION_VAD_*`
 - `VAD_CHUNK_CACHE_*`
 - `ASR_QC_ADAPTIVE_*`
 - `F0_GENDER_*`
@@ -120,6 +124,8 @@
 | T-AN | adaptive precision ASR 默认化：保留硬幻觉拒绝，低风险低 `avg_logprob` 对白自适应放宽 | 定向回归 `68 passed`；Oni Chichi BDRIP 5min smoke：adaptive drops 2，overflow/error/timeout/quarantine 为 0 |
 | T-AO | 默认 ASR 切为 `whisper-ja-anime-v0.3`；新增 `video/test` 通用测试集评测工具；删除 strict/normal ASR 精度模式，只保留 adaptive precision | 全量 `.venv/bin/python -m pytest -q` 为 `373 passed, 5 skipped` |
 | T-AP | 本地 `.env` 适配当前默认流程并按同类参数归类注释；README/plan 同步 `.env` 边界 | dotenv 解析通过；关键 adaptive/default ASR 配置齐全；旧 strict 配置不存在 |
+| T-AQ | 新增 Silero / hybrid VAD 实验并完成取舍：hard/soft gate 过度依赖 Silero，后续从当前代码与公开配置中移除 | NAMH-055 前 5 分钟历史 smoke：hybrid hard 漏太多，hybrid soft 改善但仍不作为保留路线 |
+| T-AR | 新增 `fusion_lite` VAD 实验后端，只保留 `whisperseg` 自适应阈值与 `fusion_lite` 两条路线；字幕默认硬上限改为 7s | NAMH-055 前 5 分钟：WhisperSeg 14 字幕/11 drops；fusion_lite 15 字幕/7 drops；HAME-052/NMSL-036 全片 VAD 对比 generation overflow/error 均为 0 |
 
 ### T-AL 关键验证记录
 
@@ -163,6 +169,18 @@
 - `.env` 保留本地真实 API/模型/术语表/ASR_CONTEXT 等值，同时显式补齐 `ASR_BACKEND=whisper-ja-anime-v0.3`、WhisperSeg、VAD chunk cache 和 `ASR_QC_ADAPTIVE_*` 默认项。
 - `.env` 不再包含 `ASR_PRECISION_MODE`、`ASR_DROP_UNCERTAIN_ENABLED`、`ASR_QC_STRICT_*` 等过时配置。
 - 验证：`dotenv_values(".env")` 解析通过；关键配置齐全；旧 strict 配置不存在。
+
+### T-AQ / T-AR 关键验证记录
+
+- Silero / `hybrid_precision` 曾作为低幻觉 VAD 方案验证；hard gate 漏掉大量真实对白，soft gate 有改善但仍过度依赖 Silero，因此当前代码和公开配置不再暴露 `silero` / `hybrid_precision` 主 VAD 模式。
+- 当前保留 VAD 路线：默认 `whisperseg` + `ASR_VAD_ADAPTIVE=1`，以及实验 `fusion_lite`。
+- `fusion_lite` 受 FusionVAD 论文的“MFCC/手工声学特征 + PTM 特征简单融合”思想启发，但本项目不引入 pyannote、不训练模型；用可解释公式融合 WhisperSeg 分数、Silero 重叠、RMS、spectral flux 和时长分数。
+- `fusion_lite` 公式：`speech_score = 0.45 * whisperseg_score + 0.25 * silero_overlap_ratio + 0.15 * rms_score + 0.10 * spectral_flux_score + 0.05 * duration_score`；丢弃条件：`speech_score < 0.45 and silero_overlap_ratio < 0.05`。这样 Silero 只提供辅助证据，不再一票否决 WhisperSeg 高置信候选。
+- `SILERO_VAD_*`、`FUSION_VAD_*`、`ASR_VAD_PRIMARY`、`ASR_VAD_GATE` 已纳入 ASR stage advanced env 和 VAD/chunk cache signature；Silero 的 `allow_empty` 语义保留给 fusion gate，避免 gate 失败时把全段噪声强行送入 ASR。
+- NAMH-055 前 5 分钟：WhisperSeg 48 VAD segments / 129.22s speech / 14 字幕 / 11 drops；fusion_lite 23 VAD segments / 89.34s speech / 15 字幕 / 7 drops；generation overflow/error/timeout/quarantine 均为 0。
+- HAME-052 / NMSL-036 全片三模式历史对比显示 fusion_lite 输出接近 WhisperSeg，但 drops 少于 WhisperSeg；逐句报告：`reports/HAME-052_NMSL-036.full_vad_modes_line_compare.html`。
+- 字幕时长策略更新：Grok 检索 Netflix Timed Text、BBC 字幕指南和眼动研究后，将默认 `MAX_SUBTITLE_DURATION` 从 8.0 收紧到 7.0，`SUBTITLE_SOFT_MAX_S` 保持 6.0；长字幕后续应继续做词时间轴驱动的强制重分段。
+- 证据：`agents/temp/t-ar-fusion-lite-namh055/summary.json`、`agents/temp/t-ar-fusion-lite-namh055-asr/summary.json`、`agents/temp/t-as-full-vad-compare/summary.json`、`reports/NAMH-055.5min.vad_modes_fusion_lite_line_compare.html`。
 
 ---
 

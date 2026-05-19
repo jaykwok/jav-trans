@@ -100,7 +100,8 @@ HF_ENDPOINT=https://hf-mirror.com
 - **小白友好的网页界面**：所有的模型选择、字幕格式、并发设置都可以通过网页轻松配置。
 - **断点续传与多层缓存**：支持音频缓存、ASR checkpoint、`aligned_segments.json` 复用、翻译 cache，以及独立的 VAD/chunk 边界缓存；只改 ASR prompt/token 参数时可复用 VAD 切分结果。
 - **懂二次元的识别模型**：支持 `anime-whisper`、`whisper-ja-anime-v0.3`、`whisper-ja-1.5b`、`qwen3-asr-1.7b`。引擎默认与 Web 推荐首选均为 `whisper-ja-anime-v0.3`。
-- **WhisperSeg VAD + 长 chunk 流程**：默认使用 WhisperSeg，阈值 `0.35`；开启 VAD chunk packing，将相邻语音段打包成更适合 Whisper/forced alignment 的长 chunk。
+- **WhisperSeg VAD + 长 chunk 流程**：默认使用 WhisperSeg 自适应阈值，基础阈值 `0.35`；开启 VAD chunk packing，将相邻语音段打包成更适合 Whisper/forced alignment 的长 chunk。当前保留的用户可选 VAD 路线是 `whisperseg` 和实验后端 `fusion_lite`。
+- **Fusion-lite VAD 实验模式**：`fusion_lite` 不引入 pyannote 或训练流程，受 FusionVAD “简单特征融合”思路启发，把 WhisperSeg 分数、Silero speech overlap、RMS、spectral flux 和时长分数组合为 `0.45 * whisperseg_score + 0.25 * silero_overlap_ratio + 0.15 * rms_score + 0.10 * spectral_flux_score + 0.05 * duration_score`；只有总分低且 Silero 重叠也低的候选才丢弃。
 - **自适应低幻觉 ASR 策略**：ASR QC 默认且唯一使用 adaptive precision。高 `no_speech_prob`、高压缩率、异常字符密度、重复循环、上下文泄漏、乱码和生成异常会硬丢弃；低风险真实对白的低 `avg_logprob` 会自适应放宽，并写入 quality report 审计。
 - **ASR generation budget 防溢出**：Whisper 系列会根据 decoder 窗口、forced decoder ids、prompt tokens 动态裁剪 prompt 和 `max_new_tokens`，质量报告会统计 overflow/error/timeout/quarantine；生成失败不再通过温度重试或 recovery 补写内容。
 - **翻译前噪声过滤**：在提交给 LLM 前过滤空字幕、纯引号片段、纯英文幻觉 token 和纯特殊符号片段，减少无效翻译请求。
@@ -119,6 +120,8 @@ HF_ENDPOINT=https://hf-mirror.com
 ```
 
 当前 ASR 以“少但准”为默认目标：不确定的内容宁可不出现在字幕里，也不把疑似幻觉交给后续对齐和翻译。旧的 ASR recovery、温度 fallback、prompt overflow retry 已从后端移除；保留的 timestamp/alignment fallback 只用于给已确认文本补时间轴，不会改写或新增 ASR 文本。
+
+字幕写出默认使用 `MAX_SUBTITLE_DURATION=7.0` 作为单条字幕硬上限，`SUBTITLE_SOFT_MAX_S=6.0` 作为软拆分目标。这个上限参考 Netflix Timed Text 的 7 秒规则，同时结合 BBC/眼动研究对阅读速度的弹性结论，避免短文本长时间挂屏；后续更细的长句拆分应优先按词时间轴、词间 gap 和标点边界完成。
 
 常用缓存位置：
 

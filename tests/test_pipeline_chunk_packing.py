@@ -54,6 +54,30 @@ class _StubVadBackend:
         return {"backend": self.name}
 
 
+class _EmptyAllowedVadBackend:
+    name = "empty_allowed"
+
+    def segment(
+        self,
+        audio_path: str,
+        *,
+        target_sr: int = 16000,
+        threshold_override: float | None = None,
+    ) -> SegmentationResult:
+        del audio_path, target_sr, threshold_override
+        return SegmentationResult(
+            segments=[],
+            groups=[],
+            method=self.name,
+            audio_duration_sec=10.0,
+            parameters={"backend": self.name, "allow_empty": True},
+            processing_time_sec=0.0,
+        )
+
+    def signature(self) -> dict:
+        return {"backend": self.name, "allow_empty": True}
+
+
 class _RecordingBackend:
     is_subprocess = False
     accepts_contexts = True
@@ -209,6 +233,25 @@ def test_chunk_packing_disabled_keeps_original_vad_chunk_count(monkeypatch, tmp_
     assert len(backend.audio_paths) == 10
     assert details["chunk_count"] == 10
     assert not any(entry.startswith("[chunk]") for entry in log)
+
+
+def test_empty_allowed_vad_does_not_fallback_to_full_audio(monkeypatch, tmp_path):
+    asr = _reload_pipeline(monkeypatch, tmp_path, packing_enabled="1")
+    source = tmp_path / "source_empty_allowed.wav"
+    _write_wav(source, seconds=12.0)
+
+    import vad
+
+    monkeypatch.setattr(vad, "get_vad_backend", lambda: _EmptyAllowedVadBackend())
+    backend = _RecordingBackend()
+    monkeypatch.setattr(asr, "_resolve_asr_backend", lambda _device: backend)
+
+    segments, log, details = asr._transcribe_and_align_local(str(source), "cpu")
+
+    assert backend.audio_paths == []
+    assert segments == []
+    assert details["chunk_count"] == 0
+    assert any("切分完成：共 0 个处理块" in entry for entry in log)
 
 
 def test_adaptive_precision_drops_low_logprob_before_alignment(monkeypatch, tmp_path):
