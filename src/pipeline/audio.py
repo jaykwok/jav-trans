@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import hashlib
 import os
+import json
+import math
 import subprocess
 from pathlib import Path
 
@@ -117,3 +119,56 @@ def probe_video_duration_s(video_path: str) -> float | None:
         return None
     return duration if duration > 0 else None
 
+
+def _parse_frame_rate(raw: str | None) -> float | None:
+    value = str(raw or "").strip()
+    if not value or value in {"0/0", "N/A"}:
+        return None
+    try:
+        if "/" in value:
+            numerator, denominator = value.split("/", 1)
+            fps = float(numerator) / float(denominator)
+        else:
+            fps = float(value)
+    except (TypeError, ValueError, ZeroDivisionError):
+        return None
+    if not math.isfinite(fps) or fps <= 0:
+        return None
+    return fps
+
+
+def probe_video_fps(video_path: str) -> float | None:
+    command = [
+        "ffprobe",
+        "-v",
+        "error",
+        "-select_streams",
+        "v:0",
+        "-show_entries",
+        "stream=avg_frame_rate,r_frame_rate",
+        "-of",
+        "json",
+        video_path,
+    ]
+    try:
+        completed = subprocess.run(
+            command,
+            check=True,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+        )
+        payload = json.loads(completed.stdout or "{}")
+    except (OSError, subprocess.CalledProcessError, json.JSONDecodeError):
+        return None
+
+    streams = payload.get("streams")
+    if not isinstance(streams, list) or not streams:
+        return None
+    stream = streams[0] if isinstance(streams[0], dict) else {}
+    for key in ("avg_frame_rate", "r_frame_rate"):
+        fps = _parse_frame_rate(stream.get(key))
+        if fps is not None:
+            return fps
+    return None

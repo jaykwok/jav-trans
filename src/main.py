@@ -237,7 +237,6 @@ _SUBTITLE_OPTION_KEYS = {
     "SUBTITLE_READING_BASE",
     "SUBTITLE_DURATION_RATIO_CAP",
     "SUBTITLE_DURATION_GRACE",
-    "SUBTITLE_GAP_PADDING",
     "SUBTITLE_TIMELINE_MODE",
     "SUBTITLE_BILINGUAL_SECONDARY_WEIGHT",
     "SUBTITLE_ASCII_CHAR_WEIGHT",
@@ -261,6 +260,10 @@ def _subtitle_env_overrides(ctx: JobContext) -> dict[str, str]:
 def _subtitle_options_for_ctx(ctx: JobContext):
     with _temporary_env(_subtitle_env_overrides(ctx)):
         return subtitle_module.SubtitleOptions.from_env()
+
+
+def _subtitle_options_for_video(ctx: JobContext, video_fps: float | None):
+    return _subtitle_options_for_ctx(ctx).with_video_fps(video_fps)
 
 
 def _asr_runtime_signature_for_env() -> dict:
@@ -658,9 +661,40 @@ def _build_japanese_srt_blocks(segments: list[dict]) -> list[dict]:
             "ja_text": str(seg.get("text", "")),
             "zh_text": str(seg.get("text", "")),
             "words": list(seg.get("words") or []),
+            "speaker": seg.get("speaker"),
+            "gender": seg.get("gender"),
+            "source_segment_ids": list(seg.get("source_segment_ids") or [idx]),
         }
-        for seg in segments
+        for idx, seg in enumerate(segments)
     ]
+
+
+def _prepare_translation_cues(
+    segments: list[dict],
+    *,
+    subtitle_options,
+    bilingual: bool,
+) -> list[dict]:
+    source_blocks = _build_japanese_srt_blocks(segments)
+    mode = "bilingual" if bilingual else "srt"
+    cues = subtitle_module.prepare_srt_blocks(
+        source_blocks,
+        options=subtitle_options,
+        mode=mode,
+    )
+    normalized: list[dict] = []
+    for cue_id, cue in enumerate(cues):
+        item = dict(cue)
+        ja_text = str(item.get("ja_text") or item.get("text") or "").strip()
+        item["cue_id"] = cue_id
+        item["text"] = ja_text
+        item["ja_text"] = ja_text
+        item["zh_text"] = str(item.get("zh_text") or ja_text)
+        item["words"] = list(item.get("words") or [])
+        if "source_segment_ids" not in item:
+            item["source_segment_ids"] = [cue_id]
+        normalized.append(item)
+    return normalized
 
 
 def _print_timing_summary(stage_timings: dict, asr_details: dict) -> None:
@@ -689,6 +723,7 @@ def run_asr_alignment_f0(
     events.set_current_job_id(job_id)
     _raise_if_cancelled(cancel_event)
     video_duration_s = audio_module.probe_video_duration_s(video_path)
+    video_fps = audio_module.probe_video_fps(video_path)
     with _temporary_env(_asr_stage_env_overrides(effective_ctx)):
         backend_label = asr_module.get_backend_label()
         if effective_ctx.run_log_enabled:
@@ -710,6 +745,12 @@ def run_asr_alignment_f0(
         if run_log_path is not None:
             console.print(f"[dim]运行日志：{_project_relative(run_log_path)}[/dim]")
 
+        subtitle_options = _subtitle_options_for_video(effective_ctx, video_fps)
+        _log_stage(
+            logger,
+            f"video_fps={subtitle_options.effective_video_fps:.6f}"
+            f"{' fallback=29.97' if video_fps is None else ''}",
+        )
         if cache_job_id != job_id:
             job_temp_dir = _resolve_job_temp_dir(cache_job_id)
         elif effective_ctx.job_temp_dir:
@@ -720,7 +761,6 @@ def run_asr_alignment_f0(
         _log_stage(logger, f"job_temp_dir={_project_relative(job_temp_dir)}")
         if cache_job_id != job_id:
             _log_stage(logger, f"resume_from_job_id={cache_job_id}")
-        subtitle_options = _subtitle_options_for_ctx(effective_ctx)
         aligned_cache_signature = _aligned_cache_signature_for_ctx(
             effective_ctx,
             backend_label=backend_label,
@@ -1092,6 +1132,7 @@ def run_asr_alignment_f0(
         device=device,
         backend_label=backend_label,
         video_duration_s=video_duration_s,
+        video_fps=video_fps,
         pipeline_started=pipeline_started,
         f0_filtered_count=f0_filtered_count,
         f0_failed=f0_failed,
@@ -1150,6 +1191,7 @@ def _run_translation_and_write_impl(
     pipeline_started = artifacts.pipeline_started
     pipeline_timings = artifacts.pipeline_timings
     video_duration_s = artifacts.video_duration_s
+    video_fps = artifacts.video_fps
     video_filename = artifacts.video_stem
     aligned_segments_path = artifacts.aligned_segments_path
     logger = artifacts.logger
@@ -1163,7 +1205,7 @@ def _run_translation_and_write_impl(
     translation_cache_path = artifacts.translation_cache_path
     bilingual = artifacts.bilingual
     skip_translation = ctx.skip_translation
-    subtitle_options = _subtitle_options_for_ctx(ctx)
+    subtitle_options = _subtitle_options_for_video(ctx, video_fps)
     aligned_cache_signature = artifacts.aligned_cache_signature
     if aligned_cache_signature is None:
         _, aligned_cache_signature = aligned_cache_expectations_for_ctx(
@@ -1212,6 +1254,11 @@ def _run_translation_and_write_impl(
                 "translation_request_timings": [],
                 "translation_api_retry_events": [],
                 "asr_qc_blocked": True,
+                "video_fps": {
+                    "detected": video_fps,
+                    "effective": subtitle_options.effective_video_fps,
+                    "fallback": video_fps is None,
+                },
                 "outputs": {
                     "job_temp_dir": job_temp_dir,
                     "asr_manifest": asr_manifest_path,
@@ -1263,9 +1310,17 @@ def _run_translation_and_write_impl(
         _log_stage(logger, "stage_start write_output")
         _raise_if_cancelled(cancel_event)
         if bilingual:
-            subtitle_module.write_bilingual_srt([], srt_path, options=subtitle_options)
+            srt_blocks = subtitle_module.write_bilingual_srt(
+                [],
+                srt_path,
+                options=subtitle_options,
+            )
         else:
-            subtitle_module.write_srt([], srt_path, options=subtitle_options)
+            srt_blocks = subtitle_module.write_srt(
+                [],
+                srt_path,
+                options=subtitle_options,
+            )
         _write_json(
             transcript_path,
             {
@@ -1291,8 +1346,13 @@ def _run_translation_and_write_impl(
         _write_json(
             bilingual_json_path,
             {
-                "blocks": [],
+                "blocks": srt_blocks,
                 "timeline_mode": subtitle_options.timeline_mode,
+                "video_fps": {
+                    "detected": video_fps,
+                    "effective": subtitle_options.effective_video_fps,
+                    "fallback": video_fps is None,
+                },
             },
         )
         output_paths.extend(
@@ -1329,6 +1389,11 @@ def _run_translation_and_write_impl(
                 "stage_timings": pipeline_timings,
                 "asr_details": asr_details,
                 "translation_request_timings": [],
+                "video_fps": {
+                    "detected": video_fps,
+                    "effective": subtitle_options.effective_video_fps,
+                    "fallback": video_fps is None,
+                },
                 "outputs": {
                     "job_temp_dir": job_temp_dir,
                     "srt": srt_path,
@@ -1354,18 +1419,50 @@ def _run_translation_and_write_impl(
             _cleanup_pipeline_temp(job_temp_dir, audio_path, translation_cache_path)
         return output_paths
 
+    # --- Speaker Diarization (experimental, off by default) ---
+    try:
+        from audio.speaker_diarization import diarize_segments, build_speakers_report
+
+        if os.getenv("EXPERIMENTAL_SPEAKER_DIARIZATION", "0") == "1":
+            console.print("[cyan]Speaker diarization (experimental)...[/cyan]")
+            segments = diarize_segments(segments, audio_path)
+            _spk_report = build_speakers_report(segments)
+            _spk_path = Path(output_dir) / f"{video_filename}.speakers.json"
+            _spk_path.write_text(
+                json.dumps(_spk_report, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+            output_paths.append(str(_spk_path))
+            console.print(f"[cyan]Speakers: {_spk_report['n_speakers']} detected[/cyan]")
+    except Exception as _spk_exc:
+        console.print(f"[yellow]Speaker diarization skipped: {_spk_exc}[/yellow]")
+
     if skip_translation:
         console.print("[yellow]SKIP_TRANSLATION=1，跳过翻译并输出日文 SRT。[/yellow]")
         _log_stage(logger, "stage_skip translation reason=SKIP_TRANSLATION")
         pipeline_timings["translation_context_s"] = 0.0
         pipeline_timings["translation_s"] = 0.0
         translation_request_timings: list[dict] = []
-        srt_blocks = _build_japanese_srt_blocks(segments)
+        srt_blocks = _prepare_translation_cues(
+            segments,
+            subtitle_options=subtitle_options,
+            bilingual=False,
+        )
+        asr_details["subtitle_cue_plan"] = {
+            "segments_before": len(segments),
+            "cues_after": len(srt_blocks),
+            "mode": "srt",
+            "stage": "pre_translation",
+        }
 
         write_started = time.perf_counter()
         _log_stage(logger, "stage_start write_output")
         _raise_if_cancelled(cancel_event)
-        subtitle_module.write_srt(srt_blocks, srt_path, options=subtitle_options)
+        srt_blocks = subtitle_module.write_srt(
+            srt_blocks,
+            srt_path,
+            options=subtitle_options,
+        )
         _write_json(
             transcript_path,
             {
@@ -1395,6 +1492,11 @@ def _run_translation_and_write_impl(
                 "timeline_mode": subtitle_options.timeline_mode,
                 "blocks": srt_blocks,
                 "translation_skipped": True,
+                "video_fps": {
+                    "detected": video_fps,
+                    "effective": subtitle_options.effective_video_fps,
+                    "fallback": video_fps is None,
+                },
                 "translation_request_timings": translation_request_timings,
                 "translation_api_retry_events": [],
             },
@@ -1431,6 +1533,7 @@ def _run_translation_and_write_impl(
                 "counts": {
                     "transcript_chunks": len(asr_details.get("transcript_chunks", [])),
                     "segments": len(segments),
+                    "translation_cues": len(srt_blocks),
                     "blocks": len(srt_blocks),
                 },
                 "stage_timings": pipeline_timings,
@@ -1438,6 +1541,11 @@ def _run_translation_and_write_impl(
                 "translation_request_timings": translation_request_timings,
                 "translation_api_retry_events": [],
                 "translation_skipped": True,
+                "video_fps": {
+                    "detected": video_fps,
+                    "effective": subtitle_options.effective_video_fps,
+                    "fallback": video_fps is None,
+                },
                 "outputs": {
                     "job_temp_dir": job_temp_dir,
                     "srt": srt_path,
@@ -1468,10 +1576,31 @@ def _run_translation_and_write_impl(
         return output_paths
 
     # 4. Global context for LLM
+    translation_segments = _prepare_translation_cues(
+        segments,
+        subtitle_options=subtitle_options,
+        bilingual=bilingual,
+    )
+    asr_details["subtitle_cue_plan"] = {
+        "segments_before": len(segments),
+        "cues_after": len(translation_segments),
+        "mode": "bilingual" if bilingual else "srt",
+        "stage": "pre_translation",
+    }
+    _log_stage(
+        logger,
+        "subtitle_cue_plan "
+        f"segments_before={len(segments)} "
+        f"cues_after={len(translation_segments)} "
+        f"mode={'bilingual' if bilingual else 'srt'}",
+    )
+    artifacts.asr_details = asr_details
+    _raise_if_cancelled(cancel_event)
+
     context_started = time.perf_counter()
     _log_stage(logger, "stage_start translation_context")
     _raise_if_cancelled(cancel_event)
-    global_context = translator_module.generate_global_context(segments)
+    global_context = translator_module.generate_global_context(translation_segments)
     _raise_if_cancelled(cancel_event)
     pipeline_timings["translation_context_s"] = time.perf_counter() - context_started
     _log_stage(
@@ -1481,7 +1610,7 @@ def _run_translation_and_write_impl(
 
     # 5. Batch-concurrent translation with full-film context
     translation_started = time.perf_counter()
-    _log_stage(logger, f"stage_start translation segments={len(segments)}")
+    _log_stage(logger, f"stage_start translation cues={len(translation_segments)}")
     _raise_if_cancelled(cancel_event)
 
     with Progress(
@@ -1491,14 +1620,14 @@ def _run_translation_and_write_impl(
         TimeElapsedColumn(),
         console=console,
     ) as progress:
-        task_id = progress.add_task("[yellow]翻译中...", total=len(segments))
+        task_id = progress.add_task("[yellow]翻译中...", total=len(translation_segments))
         completed_segments = 0
 
         def _on_translation_done(_timing: dict) -> None:
             nonlocal completed_segments
             _raise_if_cancelled(cancel_event)
             completed_segments = min(
-                len(segments),
+                len(translation_segments),
                 completed_segments + int(_timing.get("segment_count", 0) or 0),
             )
             progress.update(task_id, completed=completed_segments)
@@ -1530,7 +1659,7 @@ def _run_translation_and_write_impl(
                 progress.update(
                     task_id,
                     description="[green]翻译完成",
-                    completed=int(evt.get("expected", len(segments))),
+                    completed=int(evt.get("expected", len(translation_segments))),
                 )
 
         (
@@ -1538,7 +1667,7 @@ def _run_translation_and_write_impl(
             translation_request_timings,
             translation_api_retry_events,
         ) = translator_module.translate_segments(
-            segments,
+            translation_segments,
             global_context=global_context,
             target_lang=ctx.target_lang,
             glossary=ctx.translation_glossary,
@@ -1554,35 +1683,19 @@ def _run_translation_and_write_impl(
         )
         _raise_if_cancelled(cancel_event)
 
-    # --- Speaker Diarization (experimental, off by default) ---
-    try:
-        from audio.speaker_diarization import diarize_segments, build_speakers_report
-
-        if os.getenv("EXPERIMENTAL_SPEAKER_DIARIZATION", "0") == "1":
-            console.print("[cyan]Speaker diarization (experimental)...[/cyan]")
-            segments = diarize_segments(segments, audio_path)
-            _spk_report = build_speakers_report(segments)
-            _spk_path = Path(output_dir) / f"{video_filename}.speakers.json"
-            _spk_path.write_text(
-                json.dumps(_spk_report, ensure_ascii=False, indent=2),
-                encoding="utf-8",
-            )
-            output_paths.append(str(_spk_path))
-            console.print(f"[cyan]Speakers: {_spk_report['n_speakers']} detected[/cyan]")
-    except Exception as _spk_exc:
-        console.print(f"[yellow]Speaker diarization skipped: {_spk_exc}[/yellow]")
-
     srt_blocks = [
         {
             "start": seg["start"],
             "end": seg["end"],
             "zh_text": zh_text,
-            "ja_text": seg.get("text", ""),
+            "ja_text": seg.get("ja_text") or seg.get("text", ""),
             "speaker": seg.get("speaker"),
             "gender": seg.get("gender"),
             "words": list(seg.get("words") or []),
+            "cue_id": seg.get("cue_id"),
+            "source_segment_ids": list(seg.get("source_segment_ids") or []),
         }
-        for seg, zh_text in zip(segments, zh_texts)
+        for seg, zh_text in zip(translation_segments, zh_texts)
     ]
     pipeline_timings["translation_s"] = time.perf_counter() - translation_started
     _log_stage(
@@ -1595,13 +1708,17 @@ def _run_translation_and_write_impl(
     _log_stage(logger, "stage_start write_output")
     _raise_if_cancelled(cancel_event)
     if bilingual:
-        subtitle_module.write_bilingual_srt(
+        srt_blocks = subtitle_module.write_bilingual_srt(
             srt_blocks,
             srt_path,
             options=subtitle_options,
         )
     else:
-        subtitle_module.write_srt(srt_blocks, srt_path, options=subtitle_options)
+        srt_blocks = subtitle_module.write_srt(
+            srt_blocks,
+            srt_path,
+            options=subtitle_options,
+        )
 
     _write_json(
         transcript_path,
@@ -1632,6 +1749,11 @@ def _run_translation_and_write_impl(
             "timeline_mode": subtitle_options.timeline_mode,
             "blocks": srt_blocks,
             "f0_filtered_count": f0_filtered_count,
+            "video_fps": {
+                "detected": video_fps,
+                "effective": subtitle_options.effective_video_fps,
+                "fallback": video_fps is None,
+            },
             "translation_request_timings": translation_request_timings,
             "translation_api_retry_events": translation_api_retry_events,
         },
@@ -1671,6 +1793,7 @@ def _run_translation_and_write_impl(
             "counts": {
                 "transcript_chunks": len(asr_details.get("transcript_chunks", [])),
                 "segments": len(segments),
+                "translation_cues": len(translation_segments),
                 "blocks": len(srt_blocks),
                 "f0_filtered": f0_filtered_count,
             },
@@ -1678,6 +1801,11 @@ def _run_translation_and_write_impl(
             "asr_details": asr_details,
             "translation_request_timings": translation_request_timings,
             "translation_api_retry_events": translation_api_retry_events,
+            "video_fps": {
+                "detected": video_fps,
+                "effective": subtitle_options.effective_video_fps,
+                "fallback": video_fps is None,
+            },
             "outputs": {
                 "job_temp_dir": job_temp_dir,
                 "srt": srt_path,

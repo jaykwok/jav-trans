@@ -1,6 +1,7 @@
 import os
 import re
 import logging
+from typing import Literal
 
 from subtitles.options import SubtitleOptions
 
@@ -86,6 +87,10 @@ def _estimate_reading_duration(
     return reading_duration
 
 
+def _subtitle_gap_s(options: SubtitleOptions) -> float:
+    return max(float(options.frame_gap_s), 0.0)
+
+
 def _resolve_subtitle_window(
     blocks: list[dict],
     idx: int,
@@ -93,6 +98,7 @@ def _resolve_subtitle_window(
     options: SubtitleOptions | None = None,
 ) -> tuple[float, float]:
     options = _coerce_options(options)
+    gap_s = _subtitle_gap_s(options)
     block = blocks[idx - 1]
     start = float(block["start"])
     raw_end = max(start, float(block["end"]))
@@ -100,13 +106,13 @@ def _resolve_subtitle_window(
         end = raw_end
         if idx < len(blocks):
             next_start = max(start + 0.05, float(blocks[idx]["start"]))
-            end = min(end, max(start + 0.05, next_start - options.gap_padding))
+            end = min(end, max(start + 0.05, next_start - gap_s))
         if options.max_duration > 0:
             end = min(end, start + options.max_duration)
         end = max(end, start + options.min_duration)
         if idx < len(blocks):
             next_start = float(blocks[idx]["start"])
-            end = min(end, max(start + 0.05, next_start - options.gap_padding))
+            end = min(end, max(start + 0.05, next_start - gap_s))
         if end <= start:
             end = start + 0.05
         return start, end
@@ -124,7 +130,7 @@ def _resolve_subtitle_window(
 
     next_limit = None
     if idx < len(blocks):
-        next_limit = max(start + 0.05, float(blocks[idx]["start"]) - options.gap_padding)
+        next_limit = max(start + 0.05, float(blocks[idx]["start"]) - gap_s)
         end = min(end, next_limit)
 
     if options.max_duration > 0:
@@ -246,6 +252,170 @@ def _subtitle_block_window(block: dict, words: list[dict]) -> tuple[float, float
         end = fallback_end
 
     return start, max(start, end)
+
+
+def _copy_sorted_blocks(blocks: list[dict]) -> list[dict]:
+    sortable: list[tuple[float, float, int, dict]] = []
+    for index, block in enumerate(blocks):
+        copied = dict(block)
+        start, end = _subtitle_block_window(copied, _timed_words(copied))
+        copied["start"] = start
+        copied["end"] = end
+        sortable.append((start, end, index, copied))
+    sortable.sort(key=lambda item: (item[0], item[1], item[2]))
+    return [item[3] for item in sortable]
+
+
+def _block_text_units(block: dict) -> float:
+    return _count_text_units(
+        str(block.get("ja_text") or block.get("text") or "")
+        + str(block.get("zh_text") or block.get("zh") or ""),
+    )
+
+
+def _same_speaker_or_unknown(left: dict, right: dict) -> bool:
+    left_speaker = left.get("speaker")
+    right_speaker = right.get("speaker")
+    return left_speaker is None or right_speaker is None or left_speaker == right_speaker
+
+
+def _can_merge_overlapping_blocks(
+    left: dict,
+    right: dict,
+    *,
+    options: SubtitleOptions,
+) -> bool:
+    start = min(float(left["start"]), float(right["start"]))
+    end = max(float(left["end"]), float(right["end"]))
+    max_duration = options.max_duration if options.max_duration > 0 else end - start
+    max_chars = options.line_max_chars if options.line_max_chars > 0 else 25
+    return (
+        _same_speaker_or_unknown(left, right)
+        and end - start <= max_duration
+        and _block_text_units(left) + _block_text_units(right) <= max_chars * 2.4
+    )
+
+
+def _merge_overlapping_blocks(left: dict, right: dict) -> dict:
+    merged = dict(left)
+    merged["start"] = min(float(left["start"]), float(right["start"]))
+    merged["end"] = max(float(left["end"]), float(right["end"]))
+    for key in ("ja_text", "zh_text", "text", "zh"):
+        parts = [
+            str(block.get(key) or "").strip()
+            for block in (left, right)
+            if str(block.get(key) or "").strip()
+        ]
+        if not parts:
+            continue
+        separator = "，" if key in {"zh_text", "zh"} else " "
+        merged[key] = separator.join(parts)
+    merged["words"] = sorted(
+        list(left.get("words") or []) + list(right.get("words") or []),
+        key=lambda word: (
+            float(word.get("start", 0.0)) if isinstance(word, dict) else 0.0,
+            float(word.get("end", 0.0)) if isinstance(word, dict) else 0.0,
+        ),
+    )
+    source_ids = []
+    for block in (left, right):
+        for source_id in block.get("source_segment_ids") or []:
+            if source_id not in source_ids:
+                source_ids.append(source_id)
+    if source_ids:
+        merged["source_segment_ids"] = source_ids
+    if left.get("speaker") != right.get("speaker"):
+        merged.pop("speaker", None)
+    if left.get("gender") != right.get("gender"):
+        merged["gender"] = None
+    return merged
+
+
+def _normalize_subtitle_timeline(
+    blocks: list[dict],
+    *,
+    options: SubtitleOptions | None = None,
+) -> list[dict]:
+    options = _coerce_options(options)
+    normalized = _copy_sorted_blocks(blocks)
+    if len(normalized) < 2:
+        return normalized
+
+    gap_s = _subtitle_gap_s(options)
+    min_abs_s = min(0.20, max(0.05, options.frame_min_duration_s))
+    index = 0
+    while index + 1 < len(normalized):
+        current = normalized[index]
+        nxt = normalized[index + 1]
+        current_start = float(current["start"])
+        current_end = max(current_start, float(current["end"]))
+        next_start = float(nxt["start"])
+        next_end = max(next_start, float(nxt["end"]))
+        current["end"] = current_end
+        nxt["end"] = next_end
+
+        if current_end + gap_s <= next_start:
+            index += 1
+            continue
+
+        limit_end = max(current_start, next_start - gap_s)
+        if limit_end - current_start >= min_abs_s:
+            current["end"] = limit_end
+            index += 1
+            continue
+
+        if _can_merge_overlapping_blocks(current, nxt, options=options):
+            normalized[index] = _merge_overlapping_blocks(current, nxt)
+            del normalized[index + 1]
+            if index:
+                index -= 1
+            continue
+
+        if limit_end > current_start:
+            current["end"] = max(current_start + 0.001, limit_end)
+        else:
+            current["end"] = current_start + 0.05
+            shifted_next_start = current["end"] + gap_s
+            nxt["start"] = max(next_start, shifted_next_start)
+            nxt["end"] = max(next_end, float(nxt["start"]) + 0.05)
+        index += 1
+
+    return normalized
+
+
+def _prepare_subtitle_blocks(
+    blocks: list[dict],
+    *,
+    options: SubtitleOptions | None = None,
+    merge_adjacent: bool,
+) -> list[dict]:
+    options = _coerce_options(options)
+    prepared = _copy_sorted_blocks(blocks)
+    if merge_adjacent:
+        prepared = _merge_adjacent_short_blocks(prepared, options=options)
+        prepared = _copy_sorted_blocks(prepared)
+    prepared = _soft_split_subtitle_blocks(prepared, options=options)
+    prepared = _normalize_subtitle_timeline(prepared, options=options)
+    for idx in range(1, len(prepared) + 1):
+        start, end = _resolve_subtitle_window(prepared, idx, options=options)
+        prepared[idx - 1]["start"] = start
+        prepared[idx - 1]["end"] = end
+    prepared = _normalize_subtitle_timeline(prepared, options=options)
+    return prepared
+
+
+def prepare_srt_blocks(
+    blocks: list[dict],
+    *,
+    options: SubtitleOptions | None = None,
+    mode: Literal["srt", "bilingual"] = "srt",
+) -> list[dict]:
+    """Return the stable cue plan to translate and write as SRT."""
+    return _prepare_subtitle_blocks(
+        blocks,
+        options=options,
+        merge_adjacent=(mode == "bilingual"),
+    )
 
 
 def _split_candidate_timing(
@@ -572,10 +742,11 @@ def write_srt(
     zh_text may contain \\n to separate multiple speakers within one subtitle block.
     """
     options = _coerce_options(options)
-    blocks = _soft_split_subtitle_blocks(blocks, options=options)
+    blocks = [dict(block) for block in blocks]
     with open(path, "w", encoding="utf-8") as f:
         for idx, block in enumerate(blocks, 1):
-            start, end = _resolve_subtitle_window(blocks, idx, options=options)
+            start = float(block.get("start", 0.0))
+            end = max(start + 0.05, float(block.get("end", start)))
 
             start_str = format_timestamp(start)
             end_str   = format_timestamp(end)
@@ -589,6 +760,7 @@ def write_srt(
                 options=options,
             )
             f.write(f"{idx}\n{start_str} --> {end_str}\n{wrapped}\n\n")
+    return blocks
 
 
 def _merge_adjacent_short_blocks(
@@ -656,9 +828,18 @@ def _merge_adjacent_short_blocks(
                 current["end"] = nxt.get("end", current.get("end"))
                 current["ja_text"] = combined_ja
                 current["zh_text"] = combined_zh
+                if "text" in current or "text" in nxt:
+                    current["text"] = combined_ja
                 current["words"] = list(current.get("words") or []) + list(
                     nxt.get("words") or []
                 )
+                source_ids = []
+                for block in (current, nxt):
+                    for source_id in block.get("source_segment_ids") or []:
+                        if source_id not in source_ids:
+                            source_ids.append(source_id)
+                if source_ids:
+                    current["source_segment_ids"] = source_ids
                 index += 1
                 continue
             break
@@ -676,11 +857,11 @@ def write_bilingual_srt(
 ):
     """blocks: [{start, end, ja_text, zh_text}] — Japanese line above Chinese."""
     options = _coerce_options(options)
-    blocks = _merge_adjacent_short_blocks(blocks, options=options)
-    blocks = _soft_split_subtitle_blocks(blocks, options=options)
+    blocks = [dict(block) for block in blocks]
     with open(path, "w", encoding="utf-8") as f:
         for idx, block in enumerate(blocks, 1):
-            start, end = _resolve_subtitle_window(blocks, idx, options=options)
+            start = float(block.get("start", 0.0))
+            end = max(start + 0.05, float(block.get("end", start)))
 
             start_str = format_timestamp(start)
             end_str   = format_timestamp(end)
@@ -699,3 +880,4 @@ def write_bilingual_srt(
                 line for line in (ja_line + "\n" + zh_line).split("\n") if line.strip()
             )
             f.write(f"{idx}\n{start_str} --> {end_str}\n{content}\n\n")
+    return blocks

@@ -59,7 +59,7 @@ DEFAULT_SETTINGS: dict[str, str] = {
     "ASR_VAD_BACKEND": "whisperseg-adaptive",
     # 1 lets WhisperSeg adjust its threshold once from whole-audio speech density.
     "ASR_VAD_ADAPTIVE": "1",
-    # Primary/gate components used when ASR_VAD_BACKEND=fusion_lite.
+    # Primary/gate components used by fusion_lite* VAD backends.
     "ASR_VAD_PRIMARY": "whisperseg",
     "ASR_VAD_GATE": "silero",
     # Remote HuggingFace model id used when ASR_MODEL_PATH is empty or missing.
@@ -169,7 +169,7 @@ DEFAULT_SETTINGS: dict[str, str] = {
     "WHISPERSEG_FORCE_CPU": "0",
 
     # --- Fusion-lite Internal Silero Gate Settings ---
-    # Silero is not a user-facing VAD mode; fusion_lite uses it as one speech prior.
+    # Silero is not a user-facing VAD mode; fusion_lite* uses it as one speech prior.
     "SILERO_VAD_THRESHOLD": "0.35",
     "SILERO_VAD_MIN_SPEECH_MS": "80",
     "SILERO_VAD_MIN_SILENCE_MS": "80",
@@ -180,6 +180,8 @@ DEFAULT_SETTINGS: dict[str, str] = {
     "SILERO_VAD_ONNX": "1",
     # Fusion-lite VAD keeps WhisperSeg as the candidate generator and combines
     # Silero overlap with lightweight acoustic features. Experimental only.
+    # Suffix backends like fusion_lite_boost and fusion_lite_sigmoid use fixed
+    # recipe overrides in code, so operators can compare by backend name only.
     "FUSION_VAD_PRIMARY_WEIGHT": "0.45",
     "FUSION_VAD_GATE_WEIGHT": "0.25",
     "FUSION_VAD_RMS_WEIGHT": "0.15",
@@ -249,8 +251,6 @@ DEFAULT_SETTINGS: dict[str, str] = {
     "SUBTITLE_DURATION_RATIO_CAP": "1.65",
     # Extra seconds allowed when extending short subtitles.
     "SUBTITLE_DURATION_GRACE": "0.9",
-    # Gap kept between adjacent subtitle entries.
-    "SUBTITLE_GAP_PADDING": "0.05",
     # Extra reading-time weight for the Japanese line in bilingual mode.
     "SUBTITLE_BILINGUAL_SECONDARY_WEIGHT": "0.4",
 

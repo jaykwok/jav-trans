@@ -1,5 +1,7 @@
 import re
 
+import pytest
+
 from subtitles.options import SubtitleOptions
 from subtitles import writer as subtitle
 
@@ -25,6 +27,19 @@ def test_bilingual_srt_uses_placeholder_for_empty_translation(tmp_path, caplog):
     assert "Empty translated subtitle" in caplog.text
 
 
+def test_write_bilingual_srt_does_not_normalize_unprepared_blocks(tmp_path):
+    path = tmp_path / "raw.srt"
+    blocks = [
+        {"start": 0.0, "end": 1.2, "ja_text": "あ", "zh_text": "甲"},
+        {"start": 1.0, "end": 2.0, "ja_text": "い", "zh_text": "乙"},
+    ]
+
+    written = subtitle.write_bilingual_srt(blocks, str(path), options=SubtitleOptions(video_fps=25.0))
+
+    assert written[0]["end"] == pytest.approx(1.2)
+    assert "00:00:00,000 --> 00:00:01,199" in path.read_text(encoding="utf-8")
+
+
 def test_wrap_subtitle_line_uses_hiragana_kanji_boundary():
     assert subtitle._wrap_subtitle_line("あいうえ漢字テスト", max_chars=5) == (
         "あいうえ\n漢字テスト"
@@ -43,6 +58,76 @@ def test_alignment_window_extends_min_duration_without_overlapping_next():
     assert end == 0.6
 
 
+def test_alignment_window_uses_two_frame_gap_from_video_fps():
+    blocks = [
+        {"start": 0.0, "end": 1.0, "ja_text": "あ", "zh_text": "啊"},
+        {"start": 1.0, "end": 2.0, "ja_text": "い", "zh_text": "咿"},
+    ]
+    options = SubtitleOptions(video_fps=25.0)
+
+    _start, end = subtitle._resolve_subtitle_window(blocks, 1, options=options)
+
+    assert end == pytest.approx(0.92)
+
+
+def test_prepare_srt_blocks_sorts_and_removes_overlap_with_frame_gap():
+    blocks = [
+        {"start": 1.0, "end": 2.0, "ja_text": "い", "zh_text": "乙"},
+        {"start": 0.0, "end": 1.2, "ja_text": "あ", "zh_text": "甲"},
+    ]
+    options = SubtitleOptions(video_fps=25.0, merge_adjacent=False)
+
+    prepared = subtitle.prepare_srt_blocks(blocks, options=options, mode="bilingual")
+
+    assert [block["ja_text"] for block in prepared] == ["あ", "い"]
+    assert prepared[0]["end"] == pytest.approx(0.92)
+    assert prepared[0]["end"] + options.frame_gap_s <= prepared[1]["start"]
+
+
+def test_prepare_srt_blocks_merges_same_speaker_overlap_when_too_tight():
+    blocks = [
+        {
+            "start": 1.0,
+            "end": 1.2,
+            "ja_text": "あ",
+            "zh_text": "甲",
+            "speaker": "S0",
+        },
+        {
+            "start": 1.05,
+            "end": 1.4,
+            "ja_text": "い",
+            "zh_text": "乙",
+            "speaker": "S0",
+        },
+    ]
+
+    prepared = subtitle.prepare_srt_blocks(
+        blocks,
+        options=SubtitleOptions(video_fps=29.97, merge_adjacent=False),
+        mode="bilingual",
+    )
+
+    assert len(prepared) == 1
+    assert prepared[0]["ja_text"] == "あ い"
+    assert prepared[0]["zh_text"] == "甲，乙"
+
+
+def test_write_bilingual_srt_returns_normalized_blocks(tmp_path):
+    path = tmp_path / "normalized.srt"
+    blocks = [
+        {"start": 0.0, "end": 1.2, "ja_text": "あ", "zh_text": "甲"},
+        {"start": 1.0, "end": 2.0, "ja_text": "い", "zh_text": "乙"},
+    ]
+    options = SubtitleOptions(video_fps=25.0, merge_adjacent=False)
+
+    prepared = subtitle.prepare_srt_blocks(blocks, options=options, mode="bilingual")
+    written = subtitle.write_bilingual_srt(prepared, str(path), options=options)
+
+    assert written[0]["end"] == pytest.approx(0.92)
+    assert "00:00:00,000 --> 00:00:00,920" in path.read_text(encoding="utf-8")
+
+
 def test_merge_adjacent_short_blocks(tmp_path):
     path = tmp_path / "merged.srt"
     blocks = [
@@ -50,7 +135,8 @@ def test_merge_adjacent_short_blocks(tmp_path):
         {"start": 1.1, "end": 2.0, "ja_text": "もっと", "zh_text": "更多"},
     ]
 
-    subtitle.write_bilingual_srt(blocks, str(path))
+    prepared = subtitle.prepare_srt_blocks(blocks, mode="bilingual")
+    subtitle.write_bilingual_srt(prepared, str(path))
 
     content = path.read_text(encoding="utf-8")
     assert _cue_count(content) == 1
@@ -65,7 +151,8 @@ def test_merge_adjacent_short_blocks_stops_after_sentence_punctuation(tmp_path):
         {"start": 1.05, "end": 2.0, "ja_text": "次", "zh_text": "下一句"},
     ]
 
-    subtitle.write_bilingual_srt(blocks, str(path))
+    prepared = subtitle.prepare_srt_blocks(blocks, mode="bilingual")
+    subtitle.write_bilingual_srt(prepared, str(path))
 
     content = path.read_text(encoding="utf-8")
     assert _cue_count(content) == 2
@@ -88,8 +175,13 @@ def test_soft_split_prefers_translated_sentence_punctuation(monkeypatch, tmp_pat
         }
     ]
 
-    subtitle.write_bilingual_srt(
+    prepared = subtitle.prepare_srt_blocks(
         blocks,
+        options=SubtitleOptions(soft_split_enabled=True, soft_max=6.0),
+        mode="bilingual",
+    )
+    subtitle.write_bilingual_srt(
+        prepared,
         str(path),
         options=SubtitleOptions(soft_split_enabled=True, soft_max=6.0),
     )
@@ -120,8 +212,13 @@ def test_soft_split_falls_back_to_japanese_particle_boundary(monkeypatch, tmp_pa
         }
     ]
 
-    subtitle.write_bilingual_srt(
+    prepared = subtitle.prepare_srt_blocks(
         blocks,
+        options=SubtitleOptions(soft_split_enabled=True, soft_max=6.0),
+        mode="bilingual",
+    )
+    subtitle.write_bilingual_srt(
+        prepared,
         str(path),
         options=SubtitleOptions(soft_split_enabled=True, soft_max=6.0),
     )
@@ -143,8 +240,13 @@ def test_soft_split_does_not_change_blocks_without_words(monkeypatch, tmp_path):
         }
     ]
 
-    subtitle.write_bilingual_srt(
+    prepared = subtitle.prepare_srt_blocks(
         blocks,
+        options=SubtitleOptions(soft_split_enabled=True, soft_max=6.0),
+        mode="bilingual",
+    )
+    subtitle.write_bilingual_srt(
+        prepared,
         str(path),
         options=SubtitleOptions(soft_split_enabled=True, soft_max=6.0),
     )

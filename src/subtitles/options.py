@@ -1,8 +1,12 @@
 from __future__ import annotations
 
+import math
 import os
 from dataclasses import dataclass
 from dataclasses import asdict
+
+
+FALLBACK_VIDEO_FPS = 30000 / 1001
 
 
 def _env_bool(name: str, default: bool) -> bool:
@@ -24,7 +28,6 @@ class SubtitleOptions:
     reading_base: float = 0.35
     duration_ratio_cap: float = 1.65
     duration_grace: float = 0.9
-    gap_padding: float = 0.05
     timeline_mode: str = "alignment"
     bilingual_secondary_weight: float = 0.4
     ascii_char_weight: float = 0.55
@@ -32,6 +35,39 @@ class SubtitleOptions:
     merge_adjacent: bool = True
     show_speaker: bool = False
     show_gender: bool = False
+    video_fps: float = FALLBACK_VIDEO_FPS
+
+    @property
+    def effective_video_fps(self) -> float:
+        try:
+            fps = float(self.video_fps)
+        except (TypeError, ValueError):
+            return FALLBACK_VIDEO_FPS
+        return fps if math.isfinite(fps) and fps > 0 else FALLBACK_VIDEO_FPS
+
+    @property
+    def frame_duration_s(self) -> float:
+        return 1.0 / self.effective_video_fps
+
+    @property
+    def frame_gap_s(self) -> float:
+        return 2.0 * self.frame_duration_s
+
+    @property
+    def frame_min_duration_s(self) -> float:
+        return 20.0 * self.frame_duration_s
+
+    def with_video_fps(self, video_fps: float | None) -> "SubtitleOptions":
+        values = asdict(self)
+        if video_fps is None:
+            values["video_fps"] = FALLBACK_VIDEO_FPS
+        else:
+            try:
+                fps = float(video_fps)
+            except (TypeError, ValueError):
+                fps = FALLBACK_VIDEO_FPS
+            values["video_fps"] = fps if math.isfinite(fps) and fps > 0 else FALLBACK_VIDEO_FPS
+        return type(self)(**values)
 
     @classmethod
     def from_env(cls) -> "SubtitleOptions":
@@ -52,7 +88,6 @@ class SubtitleOptions:
                 float(os.getenv("SUBTITLE_DURATION_RATIO_CAP", "1.65")),
             ),
             duration_grace=float(os.getenv("SUBTITLE_DURATION_GRACE", "0.9")),
-            gap_padding=float(os.getenv("SUBTITLE_GAP_PADDING", "0.05")),
             timeline_mode=os.getenv("SUBTITLE_TIMELINE_MODE", "alignment").strip().lower(),
             bilingual_secondary_weight=float(
                 os.getenv("SUBTITLE_BILINGUAL_SECONDARY_WEIGHT", "0.4")

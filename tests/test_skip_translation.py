@@ -92,4 +92,6 @@ def test_skip_translation_writes_japanese_srt(monkeypatch, tmp_path):
     timings_path = job_temp_root / "sample" / "sample.timings.json"
     timings = timings_path.read_text(encoding="utf-8")
     assert '"translation_skipped": true' in timings
+    assert '"translation_cues": 2' in timings
+    assert '"subtitle_cue_plan"' in timings
 
