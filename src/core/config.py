@@ -235,10 +235,10 @@ DEFAULT_SETTINGS: dict[str, str] = {
     "ASR_QC_ADAPTIVE_HARD_MAX_CHARS_PER_SEC": "14.0",
     "ASR_QC_ADAPTIVE_HARD_REPEAT_RATIO": "0.45",
     # --- Subtitle Timings ---
-    # Industry hard maximum for one subtitle cue; Netflix uses 7s as the upper bound.
-    "MAX_SUBTITLE_DURATION": "7.0",
+    # Conservative hard maximum for one subtitle cue; 7s is the industry ceiling, 6.5s avoids hanging text.
+    "MAX_SUBTITLE_DURATION": "6.5",
     # Soft split target before the hard cap.
-    "SUBTITLE_SOFT_MAX_S": "6.0",
+    "SUBTITLE_SOFT_MAX_S": "5.5",
     # 1 enables word/punctuation based soft splitting before SRT output.
     "SUBTITLE_SOFT_SPLIT_ENABLED": "1",
     # Minimum displayed subtitle duration in seconds.

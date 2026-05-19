@@ -121,7 +121,7 @@ HF_ENDPOINT=https://hf-mirror.com
 
 当前 ASR 以“少但准”为默认目标：不确定的内容宁可不出现在字幕里，也不把疑似幻觉交给后续对齐和翻译。旧的 ASR recovery、温度 fallback、prompt overflow retry 已从后端移除；保留的 timestamp/alignment fallback 只用于给已确认文本补时间轴，不会改写或新增 ASR 文本。
 
-字幕写出默认使用 `MAX_SUBTITLE_DURATION=7.0` 作为单条字幕硬上限，`SUBTITLE_SOFT_MAX_S=6.0` 作为软拆分目标。这个上限参考 Netflix Timed Text 的 7 秒规则，同时结合 BBC/眼动研究对阅读速度的弹性结论，避免短文本长时间挂屏；后续更细的长句拆分应优先按词时间轴、词间 gap 和标点边界完成。
+字幕写出默认使用 `SUBTITLE_SOFT_MAX_S=5.5` 作为软拆分目标，`MAX_SUBTITLE_DURATION=6.5` 作为单条字幕硬上限。这个上限参考 Netflix Timed Text 的 7 秒规则，同时结合 BBC/眼动研究对阅读速度的弹性结论，避免短文本长时间挂屏；后续更细的长句拆分应优先按词时间轴、词间 gap 和标点边界完成。
 
 常用缓存位置：
 

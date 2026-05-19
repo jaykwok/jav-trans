@@ -1,5 +1,6 @@
 import re
 
+from subtitles.options import SubtitleOptions
 from subtitles import writer as subtitle
 
 
@@ -148,9 +149,6 @@ def test_soft_split_does_not_change_blocks_without_words(monkeypatch, tmp_path):
 
 
 def test_soft_split_recurses_until_hard_duration_is_respected(monkeypatch):
-    monkeypatch.setattr(subtitle, "SUBTITLE_SOFT_SPLIT_ENABLED", True)
-    monkeypatch.setattr(subtitle, "SUBTITLE_SOFT_MAX_S", 6.0)
-    monkeypatch.setattr(subtitle, "MAX_SUBTITLE_DURATION", 8.0)
     words = [_word(f"語{index}", index * 2.0, (index + 1) * 2.0) for index in range(9)]
     block = {
         "start": 0.0,
@@ -161,16 +159,14 @@ def test_soft_split_recurses_until_hard_duration_is_respected(monkeypatch):
         "gender": "M",
     }
 
-    split = subtitle._soft_split_subtitle_blocks([block])
+    options = SubtitleOptions(soft_split_enabled=True, soft_max=5.5, max_duration=6.5)
+    split = subtitle._soft_split_subtitle_blocks([block], options=options)
 
     assert len(split) >= 3
-    assert all(part["end"] - part["start"] <= 8.0 for part in split)
+    assert all(part["end"] - part["start"] <= 6.5 for part in split)
 
 
 def test_none_gender_over_soft_limit_gets_hard_split(monkeypatch):
-    monkeypatch.setattr(subtitle, "SUBTITLE_SOFT_SPLIT_ENABLED", True)
-    monkeypatch.setattr(subtitle, "SUBTITLE_SOFT_MAX_S", 6.0)
-    monkeypatch.setattr(subtitle, "MAX_SUBTITLE_DURATION", 8.0)
     words = [_word(f"語{i}", i * 1.4, (i + 1) * 1.4) for i in range(5)]
     block = {
         "start": 0.0,
@@ -180,41 +176,38 @@ def test_none_gender_over_soft_limit_gets_hard_split(monkeypatch):
         "words": words,
         "gender": None,
     }
-    split = subtitle._soft_split_subtitle_blocks([block])
+    options = SubtitleOptions(soft_split_enabled=True, soft_max=5.5, max_duration=6.5)
+    split = subtitle._soft_split_subtitle_blocks([block], options=options)
     assert len(split) == 2
 
 
-def test_non_none_gender_over_soft_limit_no_forced_split(monkeypatch):
-    monkeypatch.setattr(subtitle, "SUBTITLE_SOFT_SPLIT_ENABLED", True)
-    monkeypatch.setattr(subtitle, "SUBTITLE_SOFT_MAX_S", 6.0)
-    monkeypatch.setattr(subtitle, "MAX_SUBTITLE_DURATION", 8.0)
+def test_non_none_gender_over_soft_limit_below_hard_limit_no_forced_split(monkeypatch):
     words = [_word(f"語{i}", i * 1.4, (i + 1) * 1.4) for i in range(5)]
     block = {
         "start": 0.0,
-        "end": 7.0,
+        "end": 6.2,
         "ja_text": "".join(w["word"] for w in words),
         "zh_text": "这段没有句末标点无法找到分割点",
         "words": words,
         "gender": "F",
     }
-    split = subtitle._soft_split_subtitle_blocks([block])
+    options = SubtitleOptions(soft_split_enabled=True, soft_max=5.5, max_duration=6.5)
+    split = subtitle._soft_split_subtitle_blocks([block], options=options)
     assert len(split) == 1
 
 
 def test_none_gender_below_soft_limit_not_split(monkeypatch):
-    monkeypatch.setattr(subtitle, "SUBTITLE_SOFT_SPLIT_ENABLED", True)
-    monkeypatch.setattr(subtitle, "SUBTITLE_SOFT_MAX_S", 6.0)
-    monkeypatch.setattr(subtitle, "MAX_SUBTITLE_DURATION", 8.0)
     words = [_word(f"語{i}", i * 1.0, (i + 1) * 1.0) for i in range(4)]
     block = {
         "start": 0.0,
-        "end": 5.9,
+        "end": 5.4,
         "ja_text": "".join(w["word"] for w in words),
         "zh_text": "短于软上限",
         "words": words,
         "gender": None,
     }
-    split = subtitle._soft_split_subtitle_blocks([block])
+    options = SubtitleOptions(soft_split_enabled=True, soft_max=5.5, max_duration=6.5)
+    split = subtitle._soft_split_subtitle_blocks([block], options=options)
     assert len(split) == 1
 
 
@@ -288,4 +281,3 @@ def test_write_srt_hides_gender_prefix_by_default(monkeypatch, tmp_path):
     content = path.read_text(encoding="utf-8")
     assert "[M]" not in content
     assert "过来" in content
-
