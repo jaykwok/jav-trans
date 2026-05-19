@@ -39,9 +39,10 @@ def test_aggregate_timeout_fragments_writes_summary_and_removes_fragments(monkey
 
 
 def test_asr_worker_unknown_op_exits_with_code_1(monkeypatch):
-    parent_conn, child_conn = mp.Pipe()
+    ctx = mp.get_context("fork")
+    parent_conn, child_conn = ctx.Pipe()
     monkeypatch.setenv("ASR_WORKER_MOCK", "1")
-    process = mp.Process(
+    process = ctx.Process(
         target=asr_worker.main,
         args=(child_conn, {"device": "cpu"}),
     )

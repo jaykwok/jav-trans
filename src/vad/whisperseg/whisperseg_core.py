@@ -101,15 +101,15 @@ class WhisperSegSpeechSegmenter:
         self.min_speech_duration_ms = int(
             min_speech_duration_ms
             if min_speech_duration_ms is not None
-            else _env_int("WHISPERSEG_MIN_SPEECH_MS", "80")
+            else _env_int("WHISPERSEG_MIN_SPEECH_MS", "100")
         )
         self.min_silence_duration_ms = int(
             min_silence_duration_ms
             if min_silence_duration_ms is not None
-            else _env_int("WHISPERSEG_MIN_SILENCE_MS", "80")
+            else _env_int("WHISPERSEG_MIN_SILENCE_MS", "100")
         )
         self.speech_pad_ms = int(
-            speech_pad_ms if speech_pad_ms is not None else _env_int("WHISPERSEG_PAD_MS", "400")
+            speech_pad_ms if speech_pad_ms is not None else _env_int("WHISPERSEG_PAD_MS", "300")
         )
         self.force_cpu = bool(
             force_cpu if force_cpu is not None else _env_bool("WHISPERSEG_FORCE_CPU", "0")
@@ -131,13 +131,13 @@ class WhisperSegSpeechSegmenter:
         self.max_group_duration_s = float(
             max_group_duration_s
             if max_group_duration_s is not None
-            else _env_float("WHISPERSEG_MAX_GROUP_S", "5.0")
+            else _env_float("WHISPERSEG_MAX_GROUP_S", "6.0")
         )
 
         self.max_speech_duration_s = float(
             max_speech_duration_s
             if max_speech_duration_s is not None
-            else _env_float("WHISPERSEG_MAX_SPEECH_S", "4.0")
+            else _env_float("WHISPERSEG_MAX_SPEECH_S", "5.0")
         )
 
         self._session = None

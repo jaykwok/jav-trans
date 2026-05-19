@@ -33,6 +33,34 @@ def test_ab1_threshold_env_override(monkeypatch):
     assert sig["threshold"] == pytest.approx(0.5)
 
 
+def test_whisperseg_backend_defaults_match_runtime_config(monkeypatch):
+    for key in (
+        "WHISPERSEG_MIN_SPEECH_MS",
+        "WHISPERSEG_MIN_SILENCE_MS",
+        "WHISPERSEG_PAD_MS",
+        "WHISPERSEG_MAX_SPEECH_S",
+        "WHISPERSEG_MAX_GROUP_S",
+    ):
+        monkeypatch.delenv(key, raising=False)
+
+    from vad.whisperseg.whisperseg_core import WhisperSegSpeechSegmenter
+    from vad.whisperseg_backend import WhisperSegVadBackend
+
+    segmenter = WhisperSegSpeechSegmenter()
+    signature = WhisperSegVadBackend().signature()
+
+    assert segmenter.min_speech_duration_ms == 100
+    assert segmenter.min_silence_duration_ms == 100
+    assert segmenter.speech_pad_ms == 300
+    assert segmenter.max_speech_duration_s == pytest.approx(5.0)
+    assert segmenter.max_group_duration_s == pytest.approx(6.0)
+    assert signature["min_speech_ms"] == 100
+    assert signature["min_silence_ms"] == 100
+    assert signature["pad_ms"] == 300
+    assert signature["max_speech_s"] == pytest.approx(5.0)
+    assert signature["max_group_s"] == pytest.approx(6.0)
+
+
 def test_ab2_speech_segment_has_score_field():
     """AB-2: SpeechSegment has score: float | None = None."""
     from vad.base import SpeechSegment

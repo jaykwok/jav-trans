@@ -44,7 +44,7 @@ def _build_processing_spans(audio_path: str) -> list[tuple[float, float]]:
     result = vad.segment(audio_path)
     _LAST_VAD_SIGNATURE = result.parameters
     spans = [(g[0].start, g[-1].end) for g in result.groups]
-    return spans or [(0.0, result.audio_duration_sec)]
+    return spans
 
 
 def _extract_wav_chunks(

@@ -178,6 +178,10 @@ def test_load_jobs_marks_active_failed_but_keeps_stage(tmp_path, monkeypatch):
     asyncio.run(_test_load_jobs_marks_active_failed_but_keeps_stage(tmp_path, monkeypatch))
 
 
+def test_create_job_recreates_missing_jobs_parent(tmp_path, monkeypatch):
+    asyncio.run(_test_create_job_recreates_missing_jobs_parent(tmp_path, monkeypatch))
+
+
 async def _test_load_jobs_marks_active_failed_but_keeps_stage(tmp_path, monkeypatch):
     jobs_path = tmp_path / "jobs.json"
     monkeypatch.setattr(pm, "_jobs_path", jobs_path)
@@ -208,6 +212,19 @@ async def _test_load_jobs_marks_active_failed_but_keeps_stage(tmp_path, monkeypa
     assert current.current_stage == "translation"
     assert "上次运行被中断" in (current.error or "")
     await _reset_pm_state()
+
+
+async def _test_create_job_recreates_missing_jobs_parent(tmp_path, monkeypatch):
+    monkeypatch.setattr(pm, "_jobs_path", tmp_path / "missing" / "jobs.json")
+    await _reset_pm_state()
+
+    try:
+        jobs = await pm.create_job(JobSpec(video_paths=["sample.mp4"]))
+
+        assert len(jobs) == 1
+        assert pm._jobs_path.exists()
+    finally:
+        await _reset_pm_state()
 
 
 def test_retry_cancelled_job_requeues_same_job_id(tmp_path, monkeypatch):

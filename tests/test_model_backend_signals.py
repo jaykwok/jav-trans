@@ -13,6 +13,22 @@ class FakeTensor:
         return self
 
 
+class FakePromptIds(FakeTensor):
+    def __init__(self, count: int):
+        self.count = count
+
+    def numel(self):
+        return self.count
+
+    def __getitem__(self, key):
+        if not isinstance(key, tuple) or not isinstance(key[-1], slice):
+            return self
+        start = key[-1].start
+        if start is None or start >= 0:
+            return self
+        return FakePromptIds(min(self.count, abs(start)))
+
+
 class FakeProcessor:
     tokenizer = SimpleNamespace(convert_tokens_to_ids=lambda _token: 2)
 
@@ -26,7 +42,7 @@ class FakeProcessor:
         return [(1, 2)]
 
     def get_prompt_ids(self, *_args, **_kwargs):
-        return torch.arange(8).reshape(1, 8)
+        return FakePromptIds(8)
 
     def batch_decode(self, *_args, **_kwargs):
         return [self.decoded_text]

@@ -8,6 +8,25 @@ import torch
 from whisper import model_backend, transcribe
 
 
+class FakePromptIds:
+    def __init__(self, count: int):
+        self.count = count
+
+    def to(self, *_args, **_kwargs):
+        return self
+
+    def numel(self):
+        return self.count
+
+    def __getitem__(self, key):
+        if not isinstance(key, tuple) or not isinstance(key[-1], slice):
+            return self
+        start = key[-1].start
+        if start is None or start >= 0:
+            return self
+        return FakePromptIds(min(self.count, abs(start)))
+
+
 def test_long_prompt_is_char_truncated(monkeypatch):
     monkeypatch.setenv("ASR_INITIAL_PROMPT_MAX_CHARS", "24")
 
@@ -48,7 +67,7 @@ def test_prompt_overflow_is_not_retried(monkeypatch, tmp_path):
             return [(1, 2)]
 
         def get_prompt_ids(self, *_args, **_kwargs):
-            return torch.arange(8).reshape(1, 8)
+            return FakePromptIds(8)
 
         def batch_decode(self, *_args, **_kwargs):
             return ["正常テキスト"]
@@ -114,7 +133,7 @@ def test_dynamic_budget_prevents_whisper_decoder_overflow(monkeypatch, tmp_path)
             return [(1, 2), (2, 3)]
 
         def get_prompt_ids(self, *_args, **_kwargs):
-            return torch.arange(18).reshape(1, 18)
+            return FakePromptIds(18)
 
         def batch_decode(self, *_args, **_kwargs):
             return ["予算内テキスト"]

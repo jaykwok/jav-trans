@@ -55,6 +55,7 @@ def _utc_now() -> str:
 
 def _write_jobs_unlocked() -> None:
     payload = [job.model_dump() for job in _jobs.values()]
+    _jobs_path.parent.mkdir(parents=True, exist_ok=True)
     tmp_path = _jobs_path.with_name(f"{_jobs_path.name}.{os.getpid()}.tmp")
     tmp_path.write_text(
         json.dumps(payload, ensure_ascii=False, indent=2),

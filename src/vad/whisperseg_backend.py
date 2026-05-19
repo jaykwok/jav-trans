@@ -39,11 +39,11 @@ class WhisperSegVadBackend:
 
         self._segmenter = WhisperSegSpeechSegmenter(
             threshold=float(os.getenv("WHISPERSEG_THRESHOLD", "0.35")),
-            min_speech_duration_ms=int(os.getenv("WHISPERSEG_MIN_SPEECH_MS", "80")),
-            min_silence_duration_ms=int(os.getenv("WHISPERSEG_MIN_SILENCE_MS", "80")),
-            speech_pad_ms=int(os.getenv("WHISPERSEG_PAD_MS", "400")),
-            max_speech_duration_s=float(os.getenv("WHISPERSEG_MAX_SPEECH_S", "4.0")),
-            max_group_duration_s=float(os.getenv("WHISPERSEG_MAX_GROUP_S", "5.0")),
+            min_speech_duration_ms=int(os.getenv("WHISPERSEG_MIN_SPEECH_MS", "100")),
+            min_silence_duration_ms=int(os.getenv("WHISPERSEG_MIN_SILENCE_MS", "100")),
+            speech_pad_ms=int(os.getenv("WHISPERSEG_PAD_MS", "300")),
+            max_speech_duration_s=float(os.getenv("WHISPERSEG_MAX_SPEECH_S", "5.0")),
+            max_group_duration_s=float(os.getenv("WHISPERSEG_MAX_GROUP_S", "6.0")),
             chunk_threshold_s=float(os.getenv("WHISPERSEG_CHUNK_THRESHOLD_S", "1.0")),
             force_cpu=_env_bool("WHISPERSEG_FORCE_CPU", "0"),
             neg_threshold_offset=_env_float("WHISPERSEG_NEG_THRESHOLD_OFFSET", "0.15"),
@@ -54,11 +54,11 @@ class WhisperSegVadBackend:
             "backend": self.name,
             "revision": _REVISION,
             "threshold": float(os.getenv("WHISPERSEG_THRESHOLD", "0.35")),
-            "min_speech_ms": int(os.getenv("WHISPERSEG_MIN_SPEECH_MS", "80")),
-            "min_silence_ms": int(os.getenv("WHISPERSEG_MIN_SILENCE_MS", "80")),
-            "pad_ms": int(os.getenv("WHISPERSEG_PAD_MS", "400")),
-            "max_speech_s": float(os.getenv("WHISPERSEG_MAX_SPEECH_S", "4.0")),
-            "max_group_s": float(os.getenv("WHISPERSEG_MAX_GROUP_S", "5.0")),
+            "min_speech_ms": int(os.getenv("WHISPERSEG_MIN_SPEECH_MS", "100")),
+            "min_silence_ms": int(os.getenv("WHISPERSEG_MIN_SILENCE_MS", "100")),
+            "pad_ms": int(os.getenv("WHISPERSEG_PAD_MS", "300")),
+            "max_speech_s": float(os.getenv("WHISPERSEG_MAX_SPEECH_S", "5.0")),
+            "max_group_s": float(os.getenv("WHISPERSEG_MAX_GROUP_S", "6.0")),
             "chunk_threshold_s": float(os.getenv("WHISPERSEG_CHUNK_THRESHOLD_S", "1.0")),
             "neg_offset": _env_float("WHISPERSEG_NEG_THRESHOLD_OFFSET", "0.15"),
         }
@@ -117,7 +117,11 @@ class WhisperSegVadBackend:
             if _env_bool("WHISPERSEG_FORCE_CPU", "0")
             else "CUDAExecutionProvider"
         )
-        mean_dur = sum(group[-1].end - group[0].start for group in groups) / len(groups)
+        mean_dur = (
+            sum(group[-1].end - group[0].start for group in groups) / len(groups)
+            if groups
+            else 0.0
+        )
         raw_params = raw.parameters if isinstance(raw.parameters, dict) else {}
         stats = _audio_stats(raw)
         mean_score = stats.get("mean_prob", 0.0)

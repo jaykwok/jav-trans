@@ -15,31 +15,7 @@ def format_timestamp(seconds: float) -> str:
     return f"{hours:02d}:{minutes:02d}:{secs:02d},{millis:03d}"
 
 
-MAX_SUBTITLE_DURATION = float(os.getenv("MAX_SUBTITLE_DURATION", "6.5"))
-SUBTITLE_SOFT_MAX_S = float(os.getenv("SUBTITLE_SOFT_MAX_S", "5.5"))
-SUBTITLE_SOFT_SPLIT_ENABLED = os.getenv(
-    "SUBTITLE_SOFT_SPLIT_ENABLED", "1"
-).strip().lower() in {"1", "true", "yes", "on"}
-MIN_SUBTITLE_DURATION = float(os.getenv("MIN_SUBTITLE_DURATION", "0.6"))
-SUBTITLE_READING_CPS = max(1.0, float(os.getenv("SUBTITLE_READING_CPS", "7.0")))
-SUBTITLE_READING_BASE = float(os.getenv("SUBTITLE_READING_BASE", "0.35"))
-SUBTITLE_DURATION_RATIO_CAP = max(1.0, float(os.getenv("SUBTITLE_DURATION_RATIO_CAP", "1.65")))
-SUBTITLE_DURATION_GRACE = float(os.getenv("SUBTITLE_DURATION_GRACE", "0.9"))
-SUBTITLE_GAP_PADDING = float(os.getenv("SUBTITLE_GAP_PADDING", "0.05"))
-SUBTITLE_MIN_DURATION = float(os.getenv("SUBTITLE_MIN_DURATION", "0.6"))
-SUBTITLE_TIMELINE_MODE = os.getenv("SUBTITLE_TIMELINE_MODE", "alignment").strip().lower()
-SUBTITLE_BILINGUAL_SECONDARY_WEIGHT = float(
-    os.getenv("SUBTITLE_BILINGUAL_SECONDARY_WEIGHT", "0.4")
-)
-SUBTITLE_ASCII_CHAR_WEIGHT = float(os.getenv("SUBTITLE_ASCII_CHAR_WEIGHT", "0.55"))
-SRT_LINE_MAX_CHARS = max(0, int(os.getenv("SRT_LINE_MAX_CHARS", "25")))
 _MIN_DUR_FOR_GENDER_GUARD = 0.5
-SUBTITLE_MERGE_ADJACENT = os.getenv("SUBTITLE_MERGE_ADJACENT", "1").strip().lower() in {
-    "1",
-    "true",
-    "yes",
-    "on",
-}
 _COMPACT_SPACE_RE = re.compile(r"\s+")
 _WRAP_PUNCTUATION = "，、。！？…"
 _SENTENCE_END_PUNCTUATION = "。！？…"
@@ -62,7 +38,7 @@ _JA_PARTICLE_SPLIT_SUFFIXES = (
 _JA_BOUNDARY_STRIP_CHARS = " \t\r\n、。！？!?…"
 
 
-def _count_text_units(text: str, *, ascii_char_weight: float = SUBTITLE_ASCII_CHAR_WEIGHT) -> float:
+def _count_text_units(text: str, *, ascii_char_weight: float = 0.55) -> float:
     compact = _COMPACT_SPACE_RE.sub("", (text or "").strip())
     if not compact:
         return 0.0

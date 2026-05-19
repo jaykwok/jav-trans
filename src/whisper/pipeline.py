@@ -40,22 +40,6 @@ _LAST_VAD_CACHE_EVENT: dict | None = None
 _ASR_SLIDING_CONTEXT_SEGS = _transcribe_module._ASR_SLIDING_CONTEXT_SEGS
 _ASR_CHECKPOINT_ENABLED = _transcribe_module._ASR_CHECKPOINT_ENABLED
 
-_ASR_CHUNK_PACKING_ENABLED = os.getenv(
-    "ASR_CHUNK_PACKING_ENABLED", "0"
-).strip().lower() in {"1", "true", "yes", "on"}
-_ASR_CHUNK_PACK_MAX_S = float(os.getenv("ASR_CHUNK_PACK_MAX_S", "28.0"))
-_ASR_CHUNK_PACK_GAP_MERGE_S = float(
-    os.getenv("ASR_CHUNK_PACK_GAP_MERGE_S", "1.5")
-)
-_ASR_CHUNK_PACK_PADDING_S = float(os.getenv("ASR_CHUNK_PACK_PADDING_S", "2.0"))
-
-_ASR_CHUNK_DROP_ENABLED = os.getenv(
-    "ASR_CHUNK_DROP_ENABLED", "0"
-).strip().lower() in {"1", "true", "yes", "on"}
-_ASR_CHUNK_DROP_MIN_DURATION_S = float(os.getenv("ASR_CHUNK_DROP_MIN_DURATION_S", "0.20"))
-_ASR_CHUNK_DROP_RMS_DBFS = float(os.getenv("ASR_CHUNK_DROP_RMS_DBFS", "-40.0"))
-
-
 def _env_bool(name: str, default: str) -> bool:
     return os.getenv(name, default).strip().lower() in {"1", "true", "yes", "on"}
 
@@ -469,6 +453,31 @@ def _record_stage_timing(
     log.append(f"ASR 阶段耗时: {label}={elapsed_s:.2f}s")
 
 
+def _alignment_fallback_count_from_log(log: list[str]) -> int:
+    markers = (
+        "aligner_vad_fallback",
+        "even_fallback",
+        "Alignment 回退",
+        "Alignment 快速回退",
+        "Alignment 降级失败",
+        "Alignment 降级后仍异常",
+        "VAD 回退",
+        "等比分配时间戳",
+    )
+    chunk_ids: set[str] = set()
+    unscoped_count = 0
+    for entry in log:
+        if not any(marker in entry for marker in markers):
+            continue
+        if entry.startswith("chunk ") and ":" in entry:
+            chunk_id = entry.split(":", 1)[0].replace("chunk", "", 1).strip()
+            if chunk_id:
+                chunk_ids.add(chunk_id)
+                continue
+        unscoped_count += 1
+    return len(chunk_ids) + unscoped_count
+
+
 def _transcribe_and_align_local(
     audio_path: str,
     device: str,
@@ -726,6 +735,7 @@ def _transcribe_and_align_local(
             "stage_timings": timings,
             "word_count": len(word_dicts),
             "segment_count": len(segments),
+            "fallback_count": _alignment_fallback_count_from_log(log),
         }
         return segments, log, details
     finally:

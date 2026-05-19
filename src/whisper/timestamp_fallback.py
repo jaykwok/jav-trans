@@ -7,18 +7,41 @@ import re
 from pathlib import Path
 from threading import Lock
 
-_VAD_MIN_OFF_S = float(os.getenv("VAD_MIN_OFF", "0.1"))
-_VAD_PAD_S = float(os.getenv("VAD_PAD", "0.15"))
-_TIMESTAMP_VAD_ONSET = float(os.getenv("TIMESTAMP_VAD_ONSET", "0.5"))
-_TIMESTAMP_VAD_MIN_SPEECH_S = float(os.getenv("TIMESTAMP_VAD_MIN_SPEECH", "0.25"))
 _SILERO_MODEL_CACHE = None
 _SILERO_MODEL_LOCK = Lock()
-_TEN_VAD_ENABLED = os.getenv("TEN_VAD_BACKEND", "1").strip().lower() not in {
-    "0",
-    "false",
-    "no",
-    "off",
-}
+
+
+def _env_bool(name: str, default: str) -> bool:
+    return os.getenv(name, default).strip().lower() not in {
+        "0",
+        "false",
+        "no",
+        "off",
+    }
+
+
+def _env_float(name: str, default: str) -> float:
+    return float(os.getenv(name, default))
+
+
+def _vad_min_off_s() -> float:
+    return _env_float("VAD_MIN_OFF", "0.1")
+
+
+def _vad_pad_s() -> float:
+    return _env_float("VAD_PAD", "0.15")
+
+
+def _timestamp_vad_onset() -> float:
+    return _env_float("TIMESTAMP_VAD_ONSET", "0.5")
+
+
+def _timestamp_vad_min_speech_s() -> float:
+    return _env_float("TIMESTAMP_VAD_MIN_SPEECH", "0.25")
+
+
+def _ten_vad_enabled() -> bool:
+    return _env_bool("TEN_VAD_BACKEND", "1")
 
 
 def _clean_text(text: str) -> str:
@@ -152,7 +175,7 @@ def _detect_speech_spans_ten_vad(audio_path: str) -> tuple[list[tuple[float, flo
         samples = np.ascontiguousarray(samples)
 
         hop_size = 256
-        vad = TenVad(hop_size, _TIMESTAMP_VAD_ONSET)
+        vad = TenVad(hop_size, _timestamp_vad_onset())
         spans: list[tuple[float, float]] = []
         active_start: int | None = None
         frame_count = int(len(samples) // hop_size)
@@ -182,9 +205,9 @@ def _detect_speech_spans_ten_vad(audio_path: str) -> tuple[list[tuple[float, flo
             )
 
         duration_s = len(samples) / sample_rate
-        spans = _merge_close_spans(spans, _VAD_MIN_OFF_S)
-        spans = _pad_spans(spans, _VAD_PAD_S, duration_s)
-        spans = _merge_close_spans(spans, _VAD_MIN_OFF_S)
+        spans = _merge_close_spans(spans, _vad_min_off_s())
+        spans = _pad_spans(spans, _vad_pad_s(), duration_s)
+        spans = _merge_close_spans(spans, _vad_min_off_s())
         return spans, ""
     except Exception as exc:
         return [], str(exc)
@@ -201,10 +224,10 @@ def _detect_speech_spans_silero_vad(audio_path: str) -> tuple[list[tuple[float, 
             waveform,
             model=vad_model,
             sampling_rate=sample_rate,
-            threshold=_TIMESTAMP_VAD_ONSET,
-            min_speech_duration_ms=max(1, int(_TIMESTAMP_VAD_MIN_SPEECH_S * 1000)),
-            min_silence_duration_ms=max(0, int(_VAD_MIN_OFF_S * 1000)),
-            speech_pad_ms=max(0, int(_VAD_PAD_S * 1000)),
+            threshold=_timestamp_vad_onset(),
+            min_speech_duration_ms=max(1, int(_timestamp_vad_min_speech_s() * 1000)),
+            min_silence_duration_ms=max(0, int(_vad_min_off_s() * 1000)),
+            speech_pad_ms=max(0, int(_vad_pad_s() * 1000)),
             return_seconds=True,
         )
 
@@ -221,7 +244,7 @@ def _detect_speech_spans_silero_vad(audio_path: str) -> tuple[list[tuple[float, 
 
 def detect_speech_spans(audio_path: str) -> tuple[list[tuple[float, float]], str]:
     errors: list[str] = []
-    if _TEN_VAD_ENABLED:
+    if _ten_vad_enabled():
         spans, error = _detect_speech_spans_ten_vad(audio_path)
         if spans or not error:
             return spans, error

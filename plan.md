@@ -23,6 +23,7 @@
 - 默认 VAD：`ASR_VAD_BACKEND=whisperseg-adaptive`，`ASR_VAD_ADAPTIVE=1`，`WHISPERSEG_THRESHOLD=0.35`。当前保留的用户可选 VAD 路线只有 `whisperseg-adaptive` 和实验 `fusion_lite` 模式；旧 `whisperseg` 名称不再作为公开兼容别名；Silero 只作为 `fusion_lite` 内部 speech prior，不作为独立主 VAD 暴露；ffmpeg silencedetect VAD fallback 已移除。
 - `fusion_lite` 受 FusionVAD 特征融合思想启发，但不引入 pyannote 或训练流程；公式为 `speech_score = 0.45 * whisperseg_score + 0.25 * silero_overlap_ratio + 0.15 * rms_score + 0.10 * spectral_flux_score + 0.05 * duration_score`，仅当 `speech_score < 0.45` 且 `silero_overlap_ratio < 0.05` 时丢弃候选。权重理由：WhisperSeg 作为候选主信号占最大权重，Silero 只提供 speech prior 而不一票否决，RMS/spectral flux/duration 补充传统声学特征。
 - 主 VAD 初始化或推理失败时直接抛错并进入 Web 日志；主 VAD 返回空结果时直接跳过 ASR，不再整段音频 fallback，也不先转写再丢弃。
+- WhisperSeg 空结果是合法“无语音”结果，不能因空 groups 统计除零而升级为 VAD 异常；旧 chunking helper 也不得再把空 VAD 回退成整段音频。
 - `ASR_LONG_CHUNK_PROFILE=on` 时强制开启 VAD chunk packing 与 post-alignment F0：`ASR_CHUNK_PACKING_ENABLED=1`、`F0_GENDER_POST_ALIGNMENT=1`。
 - Whisper generation budget 由共享层按 `max_target_positions`、forced decoder ids、prompt ids 和 `WHISPER_MAX_NEW_TOKENS` 动态裁剪；Qwen 不套 Whisper 448 decoder 窗口。
 - ASR 精度策略固定为 adaptive precision，不再提供 `ASR_PRECISION_MODE` 模式开关。高 `no_speech_prob`、高压缩率、异常字符密度、重复循环、上下文泄漏、乱码和生成异常在 alignment 前硬丢弃；低风险真实对白可按自适应 `avg_logprob` 阈值保留，所有判定进入 quality report 审计。
@@ -55,7 +56,7 @@
 - 翻译风格：性器官优先统一为“肉棒”“小穴”，不固定“菊花”。
 - 人名默认按日语读音罗马音化；ASR 同音纠错必须保守，不能把不同汉字姓氏或不同读音称呼强行合并。
 - 翻译后默认执行轻量 repair pass：代码侧选择高风险 id，repair prompt 只使用抽象原因类别和相邻上下文，不把片内错例硬编码进静态 prompt。
-- quality report 需要暴露 ASR generation error、overflow、timeout、quarantine、empty speech text、adaptive precision dropped uncertain items 等风险信号。
+- quality report 需要暴露 ASR generation error、overflow、timeout、quarantine、empty speech text、adaptive precision dropped uncertain items、alignment fallback count/ratio 等风险信号。
 
 ---
 
@@ -127,6 +128,7 @@
 | T-AP | 本地 `.env` 适配当前默认流程并按同类参数归类注释；README/plan 同步 `.env` 边界 | dotenv 解析通过；关键 adaptive/default ASR 配置齐全；旧 strict 配置不存在 |
 | T-AQ | 新增 Silero / hybrid VAD 实验并完成取舍：hard/soft gate 过度依赖 Silero，后续从当前代码与公开配置中移除 | NAMH-055 前 5 分钟历史 smoke：hybrid hard 漏太多，hybrid soft 改善但仍不作为保留路线 |
 | T-AR | 新增 `fusion_lite` VAD 实验后端，只保留 `whisperseg-adaptive` 与 `fusion_lite` 两条公开路线；字幕默认软目标/硬上限收紧为 5.5s/6.5s | NAMH-055 前 5 分钟：WhisperSeg 14 字幕/11 drops；fusion_lite 15 字幕/7 drops；HAME-052/NMSL-036 全片 VAD 对比 generation overflow/error 均为 0；字幕定向 23 passed，全量 383 passed, 5 skipped |
+| T-AS | 全量审计修复：WhisperSeg 空结果除零、旧 chunking 整段 fallback、timestamp fallback 参数运行时化、alignment fallback 统计、字幕 writer/Web/pipeline 过时路径清理 | 定向回归通过，后续以全量 pytest 基线更新 |
 
 ### T-AL 关键验证记录
 

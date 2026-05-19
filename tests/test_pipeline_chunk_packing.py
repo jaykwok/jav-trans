@@ -102,6 +102,30 @@ class _EmptyDisallowedVadBackend:
         return {"backend": self.name}
 
 
+class _RawEmptyVadBackend:
+    name = "raw_empty"
+
+    def segment(
+        self,
+        audio_path: str,
+        *,
+        target_sr: int = 16000,
+        threshold_override: float | None = None,
+    ) -> SegmentationResult:
+        del audio_path, target_sr, threshold_override
+        return SegmentationResult(
+            segments=[],
+            groups=[],
+            method=self.name,
+            audio_duration_sec=10.0,
+            parameters={"backend": self.name},
+            processing_time_sec=0.0,
+        )
+
+    def signature(self) -> dict:
+        return {"backend": self.name}
+
+
 class _RecordingBackend:
     is_subprocess = False
     accepts_contexts = True
@@ -298,6 +322,32 @@ def test_empty_disallowed_vad_skips_asr_without_full_audio_fallback(monkeypatch,
     assert details["transcript_chunks"] == []
     assert details["asr_qc"]["dropped_uncertain_count"] == 0
     assert any("切分完成：共 0 个处理块" in entry for entry in log)
+
+
+def test_legacy_chunking_helper_does_not_full_audio_fallback(monkeypatch, tmp_path):
+    from whisper import chunking
+
+    source = tmp_path / "legacy_empty.wav"
+    _write_wav(source, seconds=12.0)
+
+    import vad
+
+    monkeypatch.setattr(vad, "get_vad_backend", lambda: _RawEmptyVadBackend())
+
+    assert chunking._build_processing_spans(str(source)) == []
+
+
+def test_alignment_fallback_count_deduplicates_chunk_log_markers():
+    from whisper import pipeline as asr
+
+    log = [
+        "chunk 1: Alignment 回退: 使用 VAD 约束比例时间戳",
+        "chunk 1: Alignment VAD 回退语音区间: 2",
+        "chunk 2: Alignment 降级后仍异常: 改用等比分配时间戳",
+        "chunk 2: Alignment VAD 回退异常: ten_vad failed",
+    ]
+
+    assert asr._alignment_fallback_count_from_log(log) == 2
 
 
 def test_adaptive_precision_drops_low_logprob_before_alignment(monkeypatch, tmp_path):
