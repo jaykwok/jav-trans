@@ -102,7 +102,8 @@ HF_ENDPOINT=https://hf-mirror.com
 - **懂二次元的识别模型**：支持 `anime-whisper`、`whisper-ja-anime-v0.3`、`whisper-ja-1.5b`、`qwen3-asr-1.7b`。引擎默认与 Web 推荐首选均为 `whisper-ja-anime-v0.3`。
 - **WhisperSeg VAD + 长 chunk 流程**：默认使用 `whisperseg-adaptive`，基础阈值 `0.35`，会根据整段 speech ratio 自适应调一次阈值；开启 VAD chunk packing，将相邻语音段打包成更适合 Whisper/forced alignment 的长 chunk。当前保留的用户可选 VAD 路线是 `whisperseg-adaptive` 和实验后端 `fusion_lite`。
 - **Fusion-lite VAD 实验模式**：`fusion_lite` 不引入 pyannote 或训练流程，受 FusionVAD “简单特征融合”思路启发，把 WhisperSeg 分数、Silero speech overlap、RMS、spectral flux 和时长分数组合为 `0.45 * whisperseg_score + 0.25 * silero_overlap_ratio + 0.15 * rms_score + 0.10 * spectral_flux_score + 0.05 * duration_score`；只有总分低且 Silero 重叠也低的候选才丢弃。
-- **VAD fallback 边界**：ffmpeg silencedetect 不作为用户可选主 VAD 模式，只在 WhisperSeg/Silero 初始化失败、推理异常或异常空结果时作为内部灾难恢复 fallback，日志和 quality report 中会保留 fallback 线索，便于复测时区分低质量保底输出。
+- **主 VAD 失败边界**：已移除 ffmpeg silencedetect VAD fallback。WhisperSeg/Silero 初始化或推理失败会直接报错并进入 Web 日志；主 VAD 未检测到可处理语音块时直接跳过 ASR，不再把整段音频送入转写。
+- **Timestamp fallback 边界**：timestamp/alignment fallback 只用于给已确认 ASR 文本补时间轴，不新增或改写文本；链条为 TEN VAD -> Silero -> even interpolation，其中 TEN VAD 在 Linux 下预检 `libc++.so.1`，Windows 下不做该 Linux 依赖检查。
 - **自适应低幻觉 ASR 策略**：ASR QC 默认且唯一使用 adaptive precision。高 `no_speech_prob`、高压缩率、异常字符密度、重复循环、上下文泄漏、乱码和生成异常会硬丢弃；低风险真实对白的低 `avg_logprob` 会自适应放宽，并写入 quality report 审计。
 - **ASR generation budget 防溢出**：Whisper 系列会根据 decoder 窗口、forced decoder ids、prompt tokens 动态裁剪 prompt 和 `max_new_tokens`，质量报告会统计 overflow/error/timeout/quarantine；生成失败不再通过温度重试或 recovery 补写内容。
 - **翻译前噪声过滤**：在提交给 LLM 前过滤空字幕、纯引号片段、纯英文幻觉 token 和纯特殊符号片段，减少无效翻译请求。
@@ -120,7 +121,7 @@ HF_ENDPOINT=https://hf-mirror.com
 -> LLM 翻译 -> SRT / quality report
 ```
 
-当前 ASR 以“少但准”为默认目标：不确定的内容宁可不出现在字幕里，也不把疑似幻觉交给后续对齐和翻译。旧的 ASR recovery、温度 fallback、prompt overflow retry 已从后端移除；保留的 timestamp/alignment fallback 只用于给已确认文本补时间轴，不会改写或新增 ASR 文本。
+当前 ASR 以“少但准”为默认目标：不确定的内容宁可不出现在字幕里，也不把疑似幻觉交给后续对齐和翻译。旧的 ASR recovery、温度 fallback、prompt overflow retry 已从后端移除；主 VAD 空结果会直接跳过 ASR；保留的 timestamp/alignment fallback 只用于给已确认文本补时间轴，不会改写或新增 ASR 文本。
 
 字幕写出默认使用 `SUBTITLE_SOFT_MAX_S=5.5` 作为软拆分目标，`MAX_SUBTITLE_DURATION=6.5` 作为单条字幕硬上限。这个上限参考 Netflix Timed Text 的 7 秒规则，同时结合 BBC/眼动研究对阅读速度的弹性结论，避免短文本长时间挂屏；后续更细的长句拆分应优先按词时间轴、词间 gap 和标点边界完成。
 

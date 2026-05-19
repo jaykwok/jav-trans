@@ -31,7 +31,7 @@ class SegmentationResult:
 
 @runtime_checkable
 class VadBackend(Protocol):
-    """Common contract for ffmpeg, WhisperSeg, and future VAD backends."""
+    """Common contract for WhisperSeg and other VAD backends."""
 
     name: str
 

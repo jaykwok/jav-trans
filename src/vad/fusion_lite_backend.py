@@ -327,8 +327,7 @@ class FusionLiteVadBackend:
             threshold_override=threshold_override,
         )
         gate = self.gate.segment(audio_path, target_sr=target_sr)
-        gate_fallback = bool(gate.parameters.get("fallback"))
-        gate_segments = [] if gate_fallback else list(gate.segments)
+        gate_segments = list(gate.segments)
         sig = self.signature()
         feature_lookup = _build_feature_lookup(audio_path, params=sig)
         primary_groups = primary.groups or [[segment] for segment in primary.segments]
@@ -359,7 +358,6 @@ class FusionLiteVadBackend:
             **sig,
             "primary_runtime": primary.parameters,
             "gate_runtime": gate.parameters,
-            "gate_failed_open": gate_fallback,
             "stats": {
                 "primary_segments": len(primary.segments),
                 "gate_segments": len(gate.segments),
@@ -375,13 +373,12 @@ class FusionLiteVadBackend:
         log.info(
             (
                 "[vad] backend=fusion_lite primary=%s gate=%s "
-                "kept=%d dropped=%d gate_failed_open=%s"
+                "kept=%d dropped=%d"
             ),
             self.primary_name,
             self.gate_name,
             len(kept),
             len(dropped),
-            gate_fallback,
         )
         return SegmentationResult(
             segments=[replace(segment) for segment in kept],

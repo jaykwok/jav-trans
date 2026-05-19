@@ -2,6 +2,7 @@ import contextlib
 import ctypes.util
 import io
 import os
+import platform
 import re
 from pathlib import Path
 from threading import Lock
@@ -118,11 +119,20 @@ def _load_audio_for_vad(audio_path: str):
     return waveform, sample_rate
 
 
+def _ten_vad_preflight_error() -> str:
+    if platform.system() == "Linux" and ctypes.util.find_library("c++") is None:
+        return "libc++.so.1 not available for TEN VAD"
+    return ""
+
+
 def _detect_speech_spans_ten_vad(audio_path: str) -> tuple[list[tuple[float, float]], str]:
     try:
         import numpy as np
-        if ctypes.util.find_library("c++") is None:
-            return [], "libc++.so.1 not available for TEN VAD"
+
+        preflight_error = _ten_vad_preflight_error()
+        if preflight_error:
+            return [], preflight_error
+
         from ten_vad import TenVad
 
         waveform, sample_rate = _load_audio_for_vad(audio_path)
@@ -180,10 +190,7 @@ def _detect_speech_spans_ten_vad(audio_path: str) -> tuple[list[tuple[float, flo
         return [], str(exc)
 
 
-def detect_speech_spans(audio_path: str) -> tuple[list[tuple[float, float]], str]:
-    if _TEN_VAD_ENABLED:
-        return _detect_speech_spans_ten_vad(audio_path)
-
+def _detect_speech_spans_silero_vad(audio_path: str) -> tuple[list[tuple[float, float]], str]:
     try:
         waveform, sample_rate = _load_audio_for_vad(audio_path)
         if waveform.numel() == 0:
@@ -210,6 +217,22 @@ def detect_speech_spans(audio_path: str) -> tuple[list[tuple[float, float]], str
         return _merge_spans(spans), ""
     except Exception as exc:
         return [], str(exc)
+
+
+def detect_speech_spans(audio_path: str) -> tuple[list[tuple[float, float]], str]:
+    errors: list[str] = []
+    if _TEN_VAD_ENABLED:
+        spans, error = _detect_speech_spans_ten_vad(audio_path)
+        if spans or not error:
+            return spans, error
+        errors.append(f"ten_vad: {error}")
+
+    spans, error = _detect_speech_spans_silero_vad(audio_path)
+    if spans:
+        return spans, "; ".join([*errors, "fallback=silero_vad"]) if errors else ""
+    if error:
+        errors.append(f"silero_vad: {error}")
+    return spans, "; ".join(errors)
 
 
 def _project_offset_to_time(offset: float, spans: list[tuple[float, float]]) -> float:

@@ -15,7 +15,7 @@ from vad.base import SpeechSegment
 
 log = logging.getLogger(__name__)
 
-_VERSION = 1
+_VERSION = 2
 _AUDIO_SAMPLE_BYTES = 2 * 1024 * 1024
 _AUDIO_KEY_RE = re.compile(r"^[0-9a-fA-F]{8,40}$")
 
@@ -65,8 +65,6 @@ _VAD_ENV_KEYS = (
     "SEGMENT_TARGET_CHUNK",
     "SEGMENT_MIN_SPEECH",
     "SEGMENT_PAD",
-    "SEGMENT_CUT_MIN_SILENCE",
-    "SEGMENT_SILENCE_DB",
 )
 _CHUNK_ENV_KEYS = (
     "ASR_CHUNK_PACKING_ENABLED",

@@ -11,7 +11,6 @@ from typing import Any
 
 from audio.loading import load_audio_16k_mono
 from vad.base import SegmentationResult, SpeechSegment
-from vad.ffmpeg_backend import FfmpegSilencedetectBackend
 from vad.whisperseg.postprocess import group_segments
 
 log = logging.getLogger(__name__)
@@ -165,16 +164,7 @@ class SileroVadBackend:
                 kwargs.pop("max_speech_duration_s", None)
                 timestamps = get_speech_timestamps(waveform, **kwargs)
         except Exception as exc:
-            log.warning("[vad] Silero VAD failed (%s), falling back to ffmpeg", exc)
-            fallback = FfmpegSilencedetectBackend().segment(audio_path)
-            fallback.parameters = {
-                **fallback.parameters,
-                "backend": self.name,
-                "fallback": "ffmpeg",
-                "error": str(exc),
-                "allow_empty": False,
-            }
-            return fallback
+            raise RuntimeError(f"Silero VAD failed: {exc}") from exc
 
         segments = _timestamps_to_segments(list(timestamps or []))
         spans = _merge_spans([(segment.start, segment.end) for segment in segments])

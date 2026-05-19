@@ -5,7 +5,6 @@ import os
 import time
 
 from vad.base import SegmentationResult, SpeechSegment
-from vad.ffmpeg_backend import FfmpegSilencedetectBackend
 
 log = logging.getLogger(__name__)
 if not log.handlers:
@@ -74,8 +73,7 @@ class WhisperSegVadBackend:
         try:
             self._ensure()
         except Exception as exc:
-            log.warning("[vad] WhisperSeg init failed (%s), falling back to ffmpeg", exc)
-            return FfmpegSilencedetectBackend().segment(audio_path, target_sr=target_sr)
+            raise RuntimeError(f"WhisperSeg init failed: {exc}") from exc
 
         t0 = time.monotonic()
         original_threshold = float(getattr(self._segmenter, "threshold"))
@@ -98,8 +96,7 @@ class WhisperSegVadBackend:
                 self._segmenter.threshold = adjusted_threshold
                 raw = self._segmenter.segment(audio_path, sample_rate=target_sr)
         except Exception as exc:
-            log.warning("[vad] WhisperSeg segment failed (%s), falling back to ffmpeg", exc)
-            return FfmpegSilencedetectBackend().segment(audio_path, target_sr=target_sr)
+            raise RuntimeError(f"WhisperSeg segment failed: {exc}") from exc
         finally:
             self._segmenter.threshold = original_threshold
         elapsed = time.monotonic() - t0
@@ -113,8 +110,7 @@ class WhisperSegVadBackend:
         ]
         segments = [segment for group in groups for segment in group]
         if not groups:
-            log.warning("[vad] WhisperSeg returned 0 groups, falling back to ffmpeg")
-            return FfmpegSilencedetectBackend().segment(audio_path, target_sr=target_sr)
+            log.warning("[vad] WhisperSeg returned 0 groups; ASR will skip this audio")
 
         provider = (
             "CPUExecutionProvider"

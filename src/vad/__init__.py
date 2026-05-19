@@ -3,7 +3,6 @@ from __future__ import annotations
 import os
 
 from vad.base import SegmentationResult, SpeechSegment, VadBackend
-from vad.ffmpeg_backend import FfmpegSilencedetectBackend
 
 
 def get_vad_backend(name: str | None = None) -> VadBackend:
@@ -22,7 +21,6 @@ def get_vad_backend(name: str | None = None) -> VadBackend:
 
 
 __all__ = [
-    "FfmpegSilencedetectBackend",
     "SegmentationResult",
     "SpeechSegment",
     "VadBackend",
