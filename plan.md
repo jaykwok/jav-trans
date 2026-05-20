@@ -35,7 +35,7 @@
 
 - 字幕约束：`MAX_SUBTITLE_DURATION=6.5`，`SUBTITLE_SOFT_MAX_S=5.5`，`ASR_MERGE_HARD_MAX_DURATION=9.0`。7s 参考 Netflix Timed Text 单条字幕行业上限；BBC/眼动研究支持根据阅读速度弹性处理，因此 5.5s 作为软拆分目标，6.5s 作为保守硬上限，避免短文本长时间挂屏。
 - LLM 翻译前必须先生成稳定 cue plan：`ffprobe` 读取真实 `avg_frame_rate`/`r_frame_rate`，失败时按 `30000/1001`（29.97fps）兜底；基于 forced alignment 词级时间轴完成排序、双语短句合并、软拆、overlap 裁剪/合并，字幕间隔固定为 2 帧，禁止保留 overlap。LLM 只翻译该 cue plan；SRT writer 只负责换行和格式化，不得再改变 cue 时间轴或 cue 数量。规范化后的同一份 blocks 必须写入 SRT、`bilingual.json` 和 quality report。
-- 相邻短块合并受标点、speaker guard 和 gender guard 限制。
+- 相邻短块合并受标点、speaker guard 和 gender guard 限制；短 gap / 短尾判断使用视频 fps 换算帧数而不是硬编码秒数。普通短块合并默认允许 `gap <= 6 frames` 且合并后 `duration <= 120 frames`；若 F0 gender guard 冲突，仅当后一 cue 是 `<= 20.5 frames` 的极短尾巴、gap `<= 2.5 frames`、且日文边界存在文本重叠时才允许合并并把合并后 `gender` 置为 `None`。speaker guard 仍为硬边界。
 - `SubtitleOptions` 是字幕策略的任务级配置入口；timeline、reading、gap、merge、权重等参数不得依赖 import-time 全局常量。
 - F0 None carry-over 默认开启：`F0_GENDER_NONE_TOLERANCE=3`，`F0_GENDER_CARRYOVER_MAX_GAP_S=15.0`，`F0_GENDER_CARRYOVER_MAX_SEGMENT_S=12.0`。
 - `gender=None` 且时长超过软切分阈值的长段必须能被 hard word split 拆开，避免 None 长字幕穿透。
@@ -131,6 +131,7 @@
 | T-AR | 新增 `fusion_lite` VAD 实验后端，只保留 `whisperseg-adaptive` 与 `fusion_lite` 两条公开路线；字幕默认软目标/硬上限收紧为 5.5s/6.5s | NAMH-055 前 5 分钟：WhisperSeg 14 字幕/11 drops；fusion_lite 15 字幕/7 drops；HAME-052/NMSL-036 全片 VAD 对比 generation overflow/error 均为 0；字幕定向 23 passed，全量 383 passed, 5 skipped |
 | T-AS | 全量审计修复：WhisperSeg 空结果除零、旧 chunking 整段 fallback、timestamp fallback 参数运行时化、alignment fallback 统计、字幕 writer/Web/pipeline 过时路径清理 | 定向回归通过，后续以全量 pytest 基线更新 |
 | T-AT | Fusion-lite 后缀实验 + SORA-575 对比 + 帧率驱动 SRT overlap 归一化 | SORA-575 四模式对比完成；`fusion_lite_boost` 最接近 whisperseg-adaptive；新增逐句 HTML 报告；字幕/fps/主流程定向 `73 passed` |
+| T-AU | HAME-052 四模式双语对比 + frame-based 短尾 cue 合并 | HAME-052 四模式全流程双语输出完成；新增 frame-based overlapping tail merge，修复 `受け` / `受けて` 这类极短 gap 被 F0 gender 抖动切成两条的问题；字幕定向 `50 passed` |
 
 ### T-AL 关键验证记录
 
@@ -197,6 +198,14 @@
 - SRT overlap 处理重构：新增 `probe_video_fps()`，优先读 `avg_frame_rate`，再读 `r_frame_rate`；读不到 fps 时按 `30000/1001`。`SubtitleOptions` 持有 `video_fps`，SRT writer 在写出前排序、软拆、合并/裁剪重叠，并强制保留 2 帧 gap。旧 `SUBTITLE_GAP_PADDING` 已移除，不再保留兼容配置。
 - quality report 新增 `subtitle_overlap_count`、`subtitle_overlap_total_s`、`subtitle_overlap_max_s` 和前 5 个 overlap examples；正常写出后这些值应为 0。
 - 验证：`.venv/bin/python -m pytest tests/test_subtitle_options.py tests/test_subtitle_quality_pass.py tests/test_subtitle_qc.py tests/test_srt_wrap.py tests/test_video_fps_probe.py tests/test_skip_translation.py tests/test_job_tempdir.py tests/test_aligned_segments_cache.py tests/web/test_cancel_resume.py -q` -> `73 passed`。
+
+### T-AU 关键验证记录
+
+- HAME-052 四模式完整双语对比已输出到 `video/HAME-052.*.srt`，逐句 HTML 报告为 `video/HAME-052.vad_bilingual_compare.html`；四模式 ASR generation error / overflow / timeout 均为 0，最终 SRT 未包含可见 `[M]` / `[F]` 性别标签。
+- HAME-052 汇总：`whisperseg_adaptive` 230 SRT / 96 ASR drops；`fusion_lite` 231 SRT / 63 drops；`fusion_lite_boost` 230 SRT / 84 drops；`fusion_lite_sigmoid` 230 SRT / 50 drops。逐句报告以 `whisperseg_adaptive` 为基准，`fusion_lite` 平均相似度最高。
+- cue plan 短尾合并改为 frame-based 规则：普通短块合并 `gap <= 6 frames`、合并后 `duration <= 120 frames`；跨 F0 gender guard 只允许日文边界存在文本重叠的极短尾巴，要求 `gap <= 2.5 frames` 且尾块 `<= 20.5 frames`，合并后 gender 置为 `None`。speaker guard 继续硬阻断。
+- HAME-052 离线验证：`00:02:56,839 --> 00:02:59,160` 合并为 `アルマリスト 室で イラックス ステイマンを受けて`，避免 `受け` / `受けて` 被拆成两条造成语义断裂。
+- 验证：`.venv/bin/python -m pytest tests/test_subtitle_quality_pass.py tests/test_subtitle_options.py tests/test_srt_wrap.py tests/test_subtitle_qc.py -q` -> `50 passed`。
 
 ---
 

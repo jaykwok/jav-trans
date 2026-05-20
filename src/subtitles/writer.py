@@ -37,6 +37,10 @@ _JA_PARTICLE_SPLIT_SUFFIXES = (
     "より",
 )
 _JA_BOUNDARY_STRIP_CHARS = " \t\r\n、。！？!?…"
+_ADJACENT_SHORT_MERGE_MAX_GAP_FRAMES = 6.0
+_ADJACENT_SHORT_MERGE_MAX_DURATION_FRAMES = 120.0
+_OVERLAPPING_TAIL_MAX_GAP_FRAMES = 2.5
+_OVERLAPPING_TAIL_MAX_DURATION_FRAMES = 20.5
 
 
 def _count_text_units(text: str, *, ascii_char_weight: float = 0.55) -> float:
@@ -89,6 +93,10 @@ def _estimate_reading_duration(
 
 def _subtitle_gap_s(options: SubtitleOptions) -> float:
     return max(float(options.frame_gap_s), 0.0)
+
+
+def _frames_to_seconds(frames: float, options: SubtitleOptions) -> float:
+    return max(0.0, float(frames)) * options.frame_duration_s
 
 
 def _resolve_subtitle_window(
@@ -277,6 +285,64 @@ def _same_speaker_or_unknown(left: dict, right: dict) -> bool:
     left_speaker = left.get("speaker")
     right_speaker = right.get("speaker")
     return left_speaker is None or right_speaker is None or left_speaker == right_speaker
+
+
+def _text_overlap_len(left: str, right: str, *, min_overlap: int = 2) -> int:
+    left_compact = _COMPACT_SPACE_RE.sub("", left or "")
+    right_compact = _COMPACT_SPACE_RE.sub("", right or "")
+    max_overlap = min(len(left_compact), len(right_compact))
+    for size in range(max_overlap, min_overlap - 1, -1):
+        if left_compact[-size:] == right_compact[:size]:
+            return size
+    return 0
+
+
+def _drop_compact_prefix(text: str, compact_len: int) -> str:
+    if compact_len <= 0:
+        return text
+
+    consumed = 0
+    for index, char in enumerate(text):
+        if char.isspace():
+            continue
+        consumed += 1
+        if consumed >= compact_len:
+            return text[index + 1 :].lstrip()
+    return ""
+
+
+def _merge_text_with_overlap(left: str, right: str, *, separator: str) -> str:
+    left = (left or "").strip()
+    right = (right or "").strip()
+    if not left:
+        return right
+    if not right:
+        return left
+    overlap = _text_overlap_len(left, right)
+    if overlap:
+        return left + _drop_compact_prefix(right, overlap)
+    return separator.join((left, right))
+
+
+def _looks_like_short_overlapping_tail(
+    current_ja: str,
+    next_ja: str,
+    *,
+    gap: float,
+    next_duration: float,
+    options: SubtitleOptions,
+) -> bool:
+    current_compact = _COMPACT_SPACE_RE.sub("", current_ja or "").strip()
+    next_compact = _COMPACT_SPACE_RE.sub("", next_ja or "").strip()
+    if not current_compact or not next_compact:
+        return False
+    if current_compact.endswith(tuple(_SENTENCE_END_PUNCTUATION)):
+        return False
+    if gap > _frames_to_seconds(_OVERLAPPING_TAIL_MAX_GAP_FRAMES, options):
+        return False
+    if next_duration > _frames_to_seconds(_OVERLAPPING_TAIL_MAX_DURATION_FRAMES, options):
+        return False
+    return _text_overlap_len(current_compact, next_compact) > 0
 
 
 def _can_merge_overlapping_blocks(
@@ -785,22 +851,30 @@ def _merge_adjacent_short_blocks(
             next_start = float(nxt.get("start", 0.0))
             gap = next_start - current_end
             ja_text = str(current.get("ja_text", "")).strip()
-            combined_ja = " ".join(
-                part
-                for part in (ja_text, str(nxt.get("ja_text", "")).strip())
-                if part
+            next_ja_text = str(nxt.get("ja_text", "")).strip()
+            current_zh_text = str(current.get("zh_text", "")).strip()
+            next_zh_text = str(nxt.get("zh_text", "")).strip()
+            combined_ja = _merge_text_with_overlap(
+                ja_text,
+                next_ja_text,
+                separator=" ",
             )
-            combined_zh = "，".join(
-                part
-                for part in (
-                    str(current.get("zh_text", "")).strip(),
-                    str(nxt.get("zh_text", "")).strip(),
-                )
-                if part
+            combined_zh = _merge_text_with_overlap(
+                current_zh_text,
+                next_zh_text,
+                separator="，",
             )
             combined_chars = len(_COMPACT_SPACE_RE.sub("", combined_ja + combined_zh))
             combined_duration = float(nxt.get("end", next_start)) - float(
                 current.get("start", 0.0)
+            )
+            next_duration = float(nxt.get("end", next_start)) - next_start
+            continuation_tail = _looks_like_short_overlapping_tail(
+                ja_text,
+                next_ja_text,
+                gap=gap,
+                next_duration=next_duration,
+                options=options,
             )
 
             # Speaker-aware merge guard: never merge across speaker boundaries
@@ -818,20 +892,25 @@ def _merge_adjacent_short_blocks(
                 and current.get("gender") != nxt.get("gender")
                 and (current.get("end", 0) - current.get("start", 0)) >= _MIN_DUR_FOR_GENDER_GUARD
                 and (nxt.get("end", 0) - nxt.get("start", 0)) >= _MIN_DUR_FOR_GENDER_GUARD
+                and not continuation_tail
             ):
                 break
 
             if (
-                gap < 0.2
+                gap <= _frames_to_seconds(_ADJACENT_SHORT_MERGE_MAX_GAP_FRAMES, options)
                 and combined_chars <= max_chars * 2
-                and combined_duration <= 4.0
+                and combined_duration
+                <= _frames_to_seconds(
+                    _ADJACENT_SHORT_MERGE_MAX_DURATION_FRAMES,
+                    options,
+                )
                 and not ja_text.endswith(tuple(_SENTENCE_END_PUNCTUATION))
             ):
                 current["end"] = nxt.get("end", current.get("end"))
                 current["ja_text"] = combined_ja
                 current["zh_text"] = combined_zh
                 if "text" in current or "text" in nxt:
-                    current["text"] = combined_ja
+                    current["text"] = current["ja_text"]
                 current["words"] = list(current.get("words") or []) + list(
                     nxt.get("words") or []
                 )
@@ -842,6 +921,10 @@ def _merge_adjacent_short_blocks(
                             source_ids.append(source_id)
                 if source_ids:
                     current["source_segment_ids"] = source_ids
+                if current.get("speaker") != nxt.get("speaker"):
+                    current.pop("speaker", None)
+                if current.get("gender") != nxt.get("gender"):
+                    current["gender"] = None
                 index += 1
                 continue
             break
