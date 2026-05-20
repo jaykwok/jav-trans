@@ -1,0 +1,47 @@
+{
+  "video": "video/MKMP-577.mp4",
+  "outputs": {
+    "japanese_transcript_compare": "japanese_transcript_compare.html",
+    "japanese_wordline_report": "japanese_wordline_report.html",
+    "translation_compare": "translation_compare.html",
+    "review_index": "review_index.html",
+    "review_items": "review_items.json"
+  },
+  "clip_generation": {
+    "make_clips": false,
+    "make_compilation": false,
+    "ffmpeg_available": true
+  },
+  "base_mode": "whisperseg_adaptive",
+  "modes": [
+    "whisperseg_adaptive",
+    "fusion_lite",
+    "fusion_lite_boost",
+    "fusion_lite_sigmoid"
+  ],
+  "counts": {
+    "whisperseg_adaptive": 471,
+    "fusion_lite": 483,
+    "fusion_lite_boost": 485,
+    "fusion_lite_sigmoid": 482
+  },
+  "review_item_count": 160,
+  "history_subtitle_compare": {
+    "base_source": "MKMP-577.whisperseg_adaptive",
+    "sources": [
+      "MKMP-577.whisperseg_adaptive",
+      "MKMP-577.fusion_lite",
+      "MKMP-577.whisperseg_adaptive.bilingual"
+    ],
+    "counts": {
+      "MKMP-577.whisperseg_adaptive": 471,
+      "MKMP-577.fusion_lite": 483,
+      "MKMP-577.whisperseg_adaptive.bilingual": 471
+    },
+    "review_item_count": 132,
+    "outputs": {
+      "history_japanese_compare": "history_japanese_compare.html",
+      "history_review_items": "history_review_items.json"
+    }
+  }
+}
