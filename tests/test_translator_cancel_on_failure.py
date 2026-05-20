@@ -41,12 +41,12 @@ def test_batched_translation_cancels_pending_futures_on_failure(monkeypatch):
         )
 
     monkeypatch.setattr(translator, "_chat", fake_chat)
+    monkeypatch.setattr(translator, "_auto_translation_batch_size", lambda *_args: 2)
 
     started = time.perf_counter()
     with pytest.raises(RuntimeError, match="boom"):
         translator.translate_segments(
             _segments(8),
-            batch_size=2,
             max_workers=1,
             cache_path="",
             target_lang="简体中文",

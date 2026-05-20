@@ -1,67 +1,55 @@
 # JAVTrans
 
-Windows 本地视频字幕生成工具。一键将视频转化为中日双语/中文字幕。
-项目提供直观的网页控制台，集成音频提取、语音识别（ASR）、强制对齐、音高性别检测、翻译前 ASR 噪声过滤及大语言模型（LLM）翻译流水线，核心视频与音频处理均在本地显卡进行。
+JAVTrans 是一个面向 Windows + NVIDIA 显卡的本地字幕生成工具。它把视频处理成中文字幕或中日双语字幕，提供网页控制台，并把音频准备、VAD 分段、ASR、强制对齐、F0 性别检测、字幕时间轴归一化、LLM 翻译和质量报告串成一条流水线。
 
-**💖 致谢与来源提示：**
-本项目在核心设计思路和部分代码实现（特别是 VAD 分段处理部分）上，参考并借鉴了优秀的开源项目 **[WhisperJAV](https://github.com/a63n/WhisperJAV)**。特此对 WhisperJAV 作者及其贡献表示衷心感谢！
+项目目标很明确：本地完成视频/音频/ASR 相关重计算，LLM 只负责翻译，不承担 ASR 误听修复、画面脑补或剧情改写。
+
+本项目在核心设计思路和部分代码实现，尤其是 VAD 分段处理上，参考并借鉴了 [WhisperJAV](https://github.com/a63n/WhisperJAV)。感谢 WhisperJAV 作者及其贡献。
 
 ---
 
-## 🚀 快速开始
+## 快速开始
 
-本项目主要为 **Windows 搭配 NVIDIA 独立显卡**的用户设计，以确保生成速度和质量。
+### 方式 A：使用 Release 版
 
-### 方式 A：下载 Release 版
-
-如果你只是想直接使用，优先下载 GitHub Releases 中的 Windows 压缩包。解压后运行：
+如果只是直接使用，优先下载 GitHub Releases 中的 Windows 压缩包。解压后运行：
 
 ```text
 JAVTrans.exe
 ```
 
-Release 版已包含 Python 运行环境、FFmpeg、默认 ASR 模型 `efwkjn/whisper-ja-anime-v0.3`，以及默认流程需要的 WhisperSeg VAD、`openai/whisper-base` 特征提取器和 Qwen forced aligner。首次使用仍需要在页面的“翻译设置”中填写 API Key / Base URL / 模型名。其他 ASR 模型会在需要时下载到 exe 同目录的 `models/`。
-如果任务启用了运行日志，日志会写到 exe 同目录的 `temp/log/`，反馈问题时可以一并提交这个目录下的 `.run.log` 文件。
+Release 版已包含 Python 运行环境、FFmpeg、默认 ASR 模型 `efwkjn/whisper-ja-anime-v0.3`，以及默认流程需要的 WhisperSeg VAD、`openai/whisper-base` 特征提取器和 Qwen forced aligner。首次使用仍需要在页面的“翻译设置”中填写 API Key、Base URL 和模型名。其他 ASR 模型会在需要时下载到 exe 同目录的 `models/`。
 
-注意：Release 版不内置 Microsoft Edge WebView2 Runtime。大多数 Windows 10/11 已自带；如果无法打开窗口，请到 [Microsoft Edge WebView2 官方下载页](https://developer.microsoft.com/en-us/microsoft-edge/webview2/) 安装 Evergreen Runtime。联网环境可选 Evergreen Bootstrapper；离线环境可下载 Evergreen Standalone Installer 的 x64 版本。
+Release 版不内置 Microsoft Edge WebView2 Runtime。大多数 Windows 10/11 已自带；如果无法打开窗口，请安装 [Microsoft Edge WebView2 Evergreen Runtime](https://developer.microsoft.com/en-us/microsoft-edge/webview2/)。
+
+任务启用运行日志后，日志会写入 exe 同目录的 `temp/log/`。反馈问题时可以一并提交对应 `.run.log`。
 
 ### 方式 B：源码运行
 
-### 1. 准备环境
+源码运行适合开发、调参和验证。推荐环境：
 
-开始之前，请确保您的电脑已准备好以下基础环境：
+- Windows 10/11
+- NVIDIA 独立显卡和较新的驱动
+- Python 3.10 - 3.13
+- FFmpeg，并确保命令行能直接执行 `ffmpeg`
+- Git，可选
 
-- **NVIDIA 显卡驱动**：请确保驱动为较新版本。
-- **Python**：推荐安装 [Python 3.10 - 3.13](https://www.python.org/downloads/windows/)（安装时请务必勾选 "Add python.exe to PATH"）。
-- **FFmpeg**：视频处理必需工具。请 [下载 FFmpeg](https://ffmpeg.org/download.html) 并配置到系统环境变量，确保在命令行中输入 `ffmpeg` 不会报错。
-- **Git**（可选）：用于下载本项目，如果没有 Git，您也可以直接在 GitHub 页面点击 "Download ZIP" 下载后解压。
-
-### 2. 下载并安装
-
-打开命令行终端（如 PowerShell），逐行输入以下命令：
+安装步骤：
 
 ```powershell
-# 1. 下载项目（如果下载了 ZIP 文件，请解压后 cd 进入项目文件夹）
 git clone https://github.com/jaykwok/jav-trans.git
 cd jav-trans
 
-# 2. 创建并激活独立的 Python 虚拟环境
 python -m venv .venv
 .venv\Scripts\python -m pip install --upgrade pip
 
-# 3. 安装带有 CUDA (显卡) 支持的 PyTorch
-# 注意：以下命令适用于常见的 CUDA 12.1，如果您的环境不同，请去 https://pytorch.org/get-started/locally/ 获取对应命令
+# 以 CUDA 12.1 为例；其他 CUDA 环境请以 PyTorch 官网命令为准。
 .venv\Scripts\python -m pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
 
-# 4. 安装项目的其他依赖
 .venv\Scripts\python -m pip install -r requirements.txt
 ```
 
-### 3. 配置翻译服务
-
-本项目使用各大平台的 AI 接口来进行高质量字幕翻译。请在项目目录下找到 `.env.example` 文件，将其复制一份并重命名为 `.env`。
-
-用记事本打开 `.env` 文件，填入你的翻译 API 信息，例如：
+复制 `.env.example` 为 `.env`，填写翻译服务配置：
 
 ```env
 API_KEY=你的翻译_API_KEY
@@ -72,86 +60,373 @@ LLM_REASONING_EFFORT=xhigh
 TARGET_LANG=简体中文
 ```
 
-`LLM_API_FORMAT` 默认为 `chat`，走 OpenAI Chat Completions 兼容格式；需要使用 OpenAI Responses API 兼容格式时改为 `responses`。
-`.env` 主要保存跨任务持久配置，例如 API、模型名、HF 镜像、术语表、演员名提示、默认 ASR 偏好、VAD/chunk cache 和 adaptive ASR QC 阈值。当前 `.env.example` 已按同类参数分组并附带注释；旧的 `ASR_PRECISION_MODE`、`ASR_DROP_UNCERTAIN_ENABLED`、`ASR_QC_STRICT_*` 不再使用。视频路径、输出目录、字幕模式、batch/worker、是否保留临时文件等任务级参数由网页表单传入，不建议写进 `.env`。
+术语表使用 `原文-译文` 格式，支持逗号或换行分隔。原文和译文两侧空格会被自动清理：
 
-*(可选)* 如果国内网络下载 AI 模型速度较慢，可以在 `.env` 中加入这行来加速下载：
+```env
+TRANSLATION_GLOSSARY=ちんぽ-肉棒, チンポ-肉棒
+```
+
+国内网络下载模型较慢时可设置：
+
 ```env
 HF_ENDPOINT=https://hf-mirror.com
 ```
 
-### 4. 运行工具
-
-所有准备工作完成后，在项目目录下运行以下命令启动工具：
+启动网页控制台：
 
 ```powershell
 .venv\Scripts\python run_web.py
 ```
-启动后，程序会自动打开网页（默认地址为 `http://127.0.0.1:17321`）。
-在页面上，您只需：
-1. **选择视频文件**
-2. **确认翻译和输出设置**
-3. **点击提交**，即可坐和放宽，等待字幕生成完毕！
+
+默认地址为 `http://127.0.0.1:17321`。页面中选择视频、确认翻译和输出设置，然后提交任务即可。
 
 ---
 
-## 🛠️ 主要功能特点
+## 功能概览
 
-- **小白友好的网页界面**：所有的模型选择、字幕格式、并发设置都可以通过网页轻松配置。
-- **断点续传与多层缓存**：支持音频缓存、ASR checkpoint、`aligned_segments.json` 复用、翻译 cache，以及独立的 VAD/chunk 边界缓存；只改 ASR prompt/token 参数时可复用 VAD 切分结果。
-- **懂二次元的识别模型**：支持 `anime-whisper`、`whisper-ja-anime-v0.3`、`whisper-ja-1.5b`、`qwen3-asr-1.7b`。引擎默认与 Web 推荐首选均为 `whisper-ja-anime-v0.3`。
-- **WhisperSeg VAD + 长 chunk 流程**：默认使用 `whisperseg-adaptive`，基础阈值 `0.35`，会根据整段 speech ratio 自适应调一次阈值；开启 VAD chunk packing，将相邻语音段打包成更适合 Whisper/forced alignment 的长 chunk。当前保留的用户可选 VAD 路线是 `whisperseg-adaptive` 和实验后端 `fusion_lite`、`fusion_lite_boost`、`fusion_lite_sigmoid`。
-- **Fusion-lite VAD 实验模式**：`fusion_lite` 不引入 pyannote 或训练流程，受 FusionVAD “简单特征融合”思路启发，把 WhisperSeg 分数、Silero speech overlap、RMS、spectral flux 和时长分数组合为 `0.45 * whisperseg_score + 0.25 * silero_overlap_ratio + 0.15 * rms_score + 0.10 * spectral_flux_score + 0.05 * duration_score`；只有总分低且 Silero 重叠也低的候选才丢弃。后缀实验后端用固定配方方便对比和后续删除：`fusion_lite_boost` 是加权和 + 小幅乘性增强，`fusion_lite_sigmoid` 是 sigmoid 激活 + 短升长降的 duration window。
-- **主 VAD 失败边界**：已移除 ffmpeg silencedetect VAD fallback。WhisperSeg/Silero 初始化或推理失败会直接报错并进入 Web 日志；主 VAD 未检测到可处理语音块时直接跳过 ASR，不再把整段音频送入转写。
-- **Timestamp fallback 边界**：timestamp/alignment fallback 只用于给已确认 ASR 文本补时间轴，不新增或改写文本；链条为 TEN VAD -> Silero -> even interpolation，其中 TEN VAD 在 Linux 下预检 `libc++.so.1`，Windows 下不做该 Linux 依赖检查。`TEN_VAD_BACKEND`、`TIMESTAMP_VAD_ONSET`、`TIMESTAMP_VAD_MIN_SPEECH`、`VAD_MIN_OFF`、`VAD_PAD` 按任务运行时读取，alignment fallback 次数会进入 quality report。
-- **自适应低幻觉 ASR 策略**：ASR QC 默认且唯一使用 adaptive precision。高 `no_speech_prob`、高压缩率、异常字符密度、重复循环、上下文泄漏、乱码和生成异常会硬丢弃；低风险真实对白的低 `avg_logprob` 会自适应放宽，并写入 quality report 审计。
-- **ASR generation budget 防溢出**：Whisper 系列会根据 decoder 窗口、forced decoder ids、prompt tokens 动态裁剪 prompt 和 `max_new_tokens`，质量报告会统计 overflow/error/timeout/quarantine；生成失败不再通过温度重试或 recovery 补写内容。
-- **翻译前字幕时间轴归一化**：LLM 翻译前先基于 forced alignment 词时间轴生成稳定 cue plan，按 `ffprobe` 探测到的视频 fps 保留 2 帧字幕间隔，并完成排序、软拆、短句合并、overlap 裁剪/合并；探测失败时按 NTSC 常见的 `29.97fps` 兜底。短 gap / 短尾合并按帧数判断：普通相邻短块默认允许 `gap <= 6 frames` 且合并后不超过 `120 frames`；跨 F0 gender guard 只允许边界日文文本重叠的极短尾巴，并在合并后清空 gender。LLM 只翻译这份固定 cue，SRT writer 只负责换行和格式化，不再改变时间轴。
-- **翻译前噪声过滤**：在提交给 LLM 前过滤空字幕、纯引号片段、纯英文幻觉 token 和纯特殊符号片段，减少无效翻译请求。
-- **智能性别区分**：forced alignment 后执行词级 F0 性别检测，并根据 gender turn 重新切分字幕，让对话翻译更加稳定。
-- **高自由度翻译**：支持接入任何兼容 OpenAI 接口的大语言模型，甚至可以设置特定词汇的“术语表”。
-- **质量报告与运行日志**：可在网页中开启运行日志和质量报告，便于复测 ASR generation 计数、字幕质量 warning 和性能耗时。
+- 网页控制台：文件选择、ASR 后端、字幕模式、翻译设置、并发 worker、质量报告和临时文件保留都可以在页面里操作。
+- 多层缓存：支持音频缓存、ASR checkpoint、`aligned_segments.json`、翻译 cache，以及独立的 VAD/chunk 边界缓存。
+- 默认 ASR：引擎默认和 Web 推荐均为 `whisper-ja-anime-v0.3`。
+- 支持 ASR 后端：`anime-whisper`、`qwen3-asr-1.7b`、`whisper-ja-1.5b`、`whisper-ja-anime-v0.3`。
+- 默认 VAD：`whisperseg-adaptive`，基础阈值 `0.35`，会根据整段 speech ratio 自适应调一次阈值。
+- 实验 VAD：`fusion_lite`、`fusion_lite_boost`、`fusion_lite_sigmoid`，用于对比 WhisperSeg 与简单特征融合策略。
+- Adaptive Precision ASR QC：硬拒绝明显幻觉，低风险真实对白可自适应放宽低 `avg_logprob`。
+- Forced alignment + F0：ASR 后进行词级强制对齐，再做 F0 性别检测和 gender turn 重切段。
+- 翻译前 cue plan：LLM 翻译前先固定字幕时间轴和 cue 数量，SRT writer 不再改变时间轴。
+- LLM 翻译：支持 OpenAI-compatible Chat Completions 和 Responses API，保留 reasoning effort、API 格式、目标语言、术语表、worker 数这些可手动配置项。
+- 质量报告：默认输出 Markdown，同时保留 JSON sidecar 方便自动化评测。
 
-## ⚙️ 当前默认流程
+---
 
-当前主流水线为：
+## 当前默认流程
+
+主流水线：
 
 ```text
-视频 -> 音频准备 -> WhisperSeg VAD -> VAD chunk packing -> ASR -> Adaptive Precision QC -> Forced Alignment
--> 词级 F0 性别检测 -> gender turn 重切段 -> 翻译前 ASR 噪声过滤
--> 翻译前 cue plan 时间轴归一化 -> LLM 逐 cue 翻译 -> SRT / quality report
+视频 -> 音频准备 -> WhisperSeg VAD -> VAD chunk packing -> ASR -> Adaptive Precision QC
+-> Forced Alignment -> 词级 F0 性别检测 -> gender turn 重切段
+-> 翻译前 ASR 噪声过滤 -> 翻译前 cue plan 时间轴归一化
+-> LLM 逐 cue 翻译 -> SRT / quality report
 ```
 
-当前 ASR 以“少但准”为默认目标：不确定的内容宁可不出现在字幕里，也不把疑似幻觉交给后续对齐和翻译。旧的 ASR recovery、温度 fallback、prompt overflow retry 已从后端移除；主 VAD 空结果会直接跳过 ASR；保留的 timestamp/alignment fallback 只用于给已确认文本补时间轴，不会改写或新增 ASR 文本。
+当前 ASR 以“少但准”为默认目标。不确定内容宁可不出现在字幕里，也不把疑似幻觉交给后续对齐和翻译。旧的 ASR recovery、temperature fallback、prompt overflow retry 已移除；主 VAD 空结果会直接跳过 ASR；timestamp/alignment fallback 只用于给已确认文本补时间轴，不改写或新增 ASR 文本。
 
-字幕 cue plan 默认使用 `SUBTITLE_SOFT_MAX_S=5.5` 作为软拆分目标，`MAX_SUBTITLE_DURATION=6.5` 作为单条字幕硬上限。这个上限参考 Netflix Timed Text 的 7 秒规则，同时结合 BBC/眼动研究对阅读速度的弹性结论，避免短文本长时间挂屏；翻译前会按视频真实 fps 保留 2 帧间隔并移除 overlap，读不到 fps 时按 `30000/1001` 兜底。相邻短块合并也统一走 fps 换算帧数，避免 24fps/29.97fps/30fps 视频下用固定秒数造成不同观感；F0 gender 抖动造成的 `受け` / `受けて` 这类极短重叠尾巴会被合并，但 speaker guard 仍然是硬边界。最终写入 SRT、`bilingual.json` 和 quality report 的都是同一份已归一化 cue。
+### ASR 与 VAD
 
-当前翻译 prompt 版本为 `v2.6`。LLM 只负责逐 cue 翻译、遵守术语表和人名罗马音规则；不再授权根据上下文修正 ASR 误听、同音词、上下文漂移、术语漂移或被切断半句，避免在没有画面信息的情况下改错源文。LLM 输入中仍会保留 `[M]` / `[F]` 声学标签帮助判断语气和对话切换，但去除可见性别标签由本地规则完成，最终 SRT 不输出 `[M]` / `[F]`。
+默认 VAD 是 `whisperseg-adaptive`。公开可选的 VAD 路线只保留 `whisperseg-adaptive` 和实验 `fusion_lite*` 系列。旧 `whisperseg` 名称不再作为公开兼容别名，但可作为 fusion 内部 primary；Silero 只作为 fusion-lite 系列内部 speech prior，不作为独立主 VAD 暴露；ffmpeg silencedetect fallback 已移除。
 
-Grok 搜索到的字幕翻译质量实践与当前路线一致：尽量给 LLM 全片或多行上下文、固定术语表、结构化 JSON 输出，并只对明确的译文质量异常做二次修复。因此默认保留 fixed full-JSON prefix、prefix warmup、全片 glossary 预抽取和翻译后长度异常 repair；超过 prefix 长度上限时才回退摘要上下文。暂不加入让 LLM 改写 ASR 文本、猜测画面信息或做大范围语义重写的步骤。
+主 VAD 初始化或推理失败会直接抛错并进入 Web 日志。主 VAD 返回空结果是合法“无语音”结果，不会 fallback 成整段音频转写。
 
-常用缓存位置：
+`ASR_LONG_CHUNK_PROFILE=on` 时强制开启 VAD chunk packing 与 post-alignment F0：
 
+```env
+ASR_CHUNK_PACKING_ENABLED=1
+F0_GENDER_POST_ALIGNMENT=1
+```
+
+Whisper 系列 generation budget 会根据 decoder 窗口、forced decoder ids、prompt ids 和 `WHISPER_MAX_NEW_TOKENS` 动态裁剪；Qwen 不套 Whisper 448 decoder 窗口。
+
+### Fusion-lite VAD
+
+`fusion_lite` 受 FusionVAD 的简单特征融合思路启发，但不引入 pyannote，也不训练模型。它以 WhisperSeg 作为候选主信号，Silero 只提供辅助 speech prior，再叠加 RMS、spectral flux 和 duration。
+
+线性基线公式：
+
+```text
+speech_score =
+  0.45 * whisperseg_score
++ 0.25 * silero_overlap_ratio
++ 0.15 * rms_score
++ 0.10 * spectral_flux_score
++ 0.05 * duration_score
+```
+
+仅当 `speech_score < 0.45` 且 `silero_overlap_ratio < 0.05` 时丢弃候选。`fusion_lite_boost` 和 `fusion_lite_sigmoid` 是固定配方后缀后端，不新增模式配置，便于后续确定保留项后删除其他实验模式。
+
+### 字幕时间轴
+
+LLM 翻译前必须先生成稳定 cue plan。流程会通过 `ffprobe` 读取真实 `avg_frame_rate` / `r_frame_rate`，失败时按 `30000/1001`，即 29.97fps 兜底。
+
+cue plan 负责：
+
+- 基于 forced alignment 词级时间轴排序。
+- 合并双语短句。
+- 软拆长字幕。
+- 裁剪或合并 overlap。
+- 固定保留 2 帧字幕 gap。
+
+默认字幕约束：
+
+```env
+SUBTITLE_SOFT_MAX_S=5.5
+MAX_SUBTITLE_DURATION=6.5
+ASR_MERGE_HARD_MAX_DURATION=9.0
+```
+
+相邻短块合并按帧数判断，而不是硬编码秒数。普通短块合并默认允许 `gap <= 6 frames` 且合并后 `duration <= 120 frames`。跨 F0 gender guard 时，只允许边界日文文本重叠的极短尾巴：后一 cue `<= 20.5 frames`、gap `<= 2.5 frames`，合并后 `gender=None`。speaker guard 仍然是硬边界。
+
+最终写入 SRT、`bilingual.json` 和 quality report 的都是同一份已归一化 cue。
+
+### 翻译策略
+
+当前翻译 prompt version：`v2.7`。
+
+LLM 只负责逐 cue 翻译、遵守术语表和人名罗马音规则。全片上下文只用于翻译连贯、指代判断、口吻一致和术语一致，不授权根据上下文修正 ASR 误听、同音词、上下文漂移、术语漂移或被切断半句。
+
+LLM 输入中仍会保留 `[M]` / `[F]` 声学标签，帮助判断语气和对话切换；可见性别标签由本地规则在输出前移除，最终 SRT 不输出 `[M]` / `[F]`。
+
+2026 年检索到的字幕翻译质量实践与当前路线一致：全片或多行上下文、术语表或术语记忆、结构化输出、窄范围后编辑能带来主要收益。表达强度不是 temperature，而是 prompt 层面的风格约束：保留粗俗程度、调情/命令/羞耻语气、情绪强弱和短促呻吟，不净化成书面弱表达。
+
+当前固定内部采样：
+
+```text
+temperature=0.2
+top_p=0.9
+```
+
+它们用于降低随机性和术语漂移，不作为“表达强度”控制项。
+
+翻译默认保留：
+
+- fixed full-JSON prefix
+- prefix warmup
+- 全片 glossary 预抽取
+- 翻译后长度异常 repair
+
+repair pass 只处理译文长度异常，不做 ASR/剧情修复。
+
+翻译 batch 大小不作为前端/API/env 配置项。后端按 cue 数和 worker 数自动计算：
+
+```text
+batch = min(cue_count, clamp(25 + (25 - 10) * worker_count * 3, 25, 200))
+```
+
+主流程仍优先使用 full-JSON prefix，而不是退回纯滑窗。
+
+---
+
+## 配置边界
+
+`.env` 只保存跨任务持久配置和默认偏好，例如：
+
+- `API_KEY`
+- `OPENAI_COMPATIBILITY_BASE_URL`
+- `LLM_MODEL_NAME`
+- `LLM_API_FORMAT`
+- `LLM_REASONING_EFFORT`
+- `TARGET_LANG`
+- `TRANSLATION_GLOSSARY`
+- `HF_ENDPOINT`
+- `ASR_CONTEXT`
+- `ASR_BACKEND`
+- `ASR_VAD_BACKEND`
+- `ASR_VAD_ADAPTIVE`
+- `ASR_LONG_CHUNK_PROFILE`
+- `ASR_CHUNK_PACK*`
+- `WHISPERSEG_*`
+- `SILERO_VAD_*`
+- `FUSION_VAD_*`
+- `VAD_CHUNK_CACHE_*`
+- `ASR_QC_ADAPTIVE_*`
+- `F0_GENDER_*`
+
+视频路径、输出目录、字幕模式、worker、是否保留临时文件等任务级参数由 `JobSpec -> JobContext` 显式传入后端，不再依赖全局 `.env` 热覆盖。翻译 batch 大小由后端运行时公式自动计算，不是配置项。
+
+Web 设置行为：
+
+- 演员名/人名提示 `ASR_CONTEXT` 是持久设置，打开页面时从 `/api/settings` 恢复。
+- 用户手动清空后提交会清空持久值。
+- 前端不提供单独“保存设置”按钮，提交任务即保存当前表单配置。
+- `OPENAI_COMPATIBILITY_BASE_URL` 是 OpenAI-compatible API 配置名，保留不改。
+
+---
+
+## 路径与缓存
+
+- `models/`：HuggingFace 模型缓存。首次运行把 repo 下载到 `models/<namespace>-<repo>/`。
 - `temp/vad-cache/`：VAD/chunk 边界缓存，只绑定音频指纹、VAD 参数和 chunk/drop/merge 参数，不绑定 ASR prompt/token 参数。
-- 当前任务临时目录：音频缓存、ASR checkpoint、`aligned_segments.json`、翻译 cache 和运行日志。
-- `reports/`：质量报告与测试/对比报告默认输出目录；质量报告以 `.md` 为主产物，同时保留 `.json` 旁路便于自动化读取。
-- `models/`：HuggingFace 模型缓存。
+- `temp/jobs/`：Web 任务临时目录，包含音频缓存、ASR checkpoint、`aligned_segments.json`、翻译 cache 等。
+- `temp/log/`：高级项启用 `RUN_LOG_ENABLED=1` 后写入运行日志。
+- `reports/`：质量报告与测试/对比报告默认输出目录；质量报告以 `.md` 为主产物，同时保留 `.json` sidecar。
 
-## 💡 给开发者的说明
+成功运行后默认删除一次性 job 临时目录；保留下次可复用的运行缓存，例如 `models/`、`temp/vad-cache/` 和 `temp/web` 状态。Web“保留临时文件”仅用于调试当前任务。
 
-如果您是开发者并希望深入了解或修改项目：
-- 核心后端逻辑位于 `src/main.py`、`src/core/`、`src/pipeline/`、`src/whisper/`、`src/llm/`、`src/audio/` 等子模块。
-- Web 接口和页面由 `src/web/` 提供，采用 FastAPI。
-- 默认配置集中在 `src/core/config.py`，本地 `.env` 只覆盖跨任务持久配置和默认偏好；Web 任务级参数通过 `JobSpec -> JobContext` 显式传入后端并可覆盖默认值。
-- 本项目引入的部分第三方代码（例如 `src/vad/whisperseg`）保留了其原始的许可证，请遵循相应协议。
+---
 
-### 构建 Windows Release
+## 开发说明
 
-在已安装依赖的 `.venv` 环境下运行：
+后端调试入口：
+
+- 运行测试。
+- 使用诊断脚本。
+- 直接调用 `run_asr_alignment_f0()` / `run_translation_and_write()`。
+
+主要代码位置：
+
+- `src/main.py`：主流程编排。
+- `src/core/`：配置和任务上下文。
+- `src/pipeline/`：音频、缓存、输出、质量报告和阶段日志。
+- `src/whisper/`：ASR 后端和转写流程。
+- `src/vad/`：VAD 后端。
+- `src/llm/`：翻译 prompt、cache、glossary、API patch 和 translator。
+- `src/subtitles/`：SRT writer、字幕选项和字幕 QC。
+- `src/web/`：FastAPI 接口和静态前端。
+
+开发环境约定：
+
+- Windows 生产目标：RTX 4060 Ti 8GB，模型串行分时加载，阶段结束后卸载并清 CUDA cache。
+- WSL/Linux 开发和测试时统一使用当前工作目录下的 `.venv`。
+- Python 命令使用 `.venv/bin/python`；pip 使用 `.venv/bin/pip`。
+- 临时运行产物放在 `temp/` 或 `agents/temp/`，正式报告放在 `reports/`。
+- 删除或归档本地文件时移动到 `agents/rm/`。
+
+构建 Windows Release：
 
 ```powershell
 .\packaging\build_windows.ps1 -Clean
 ```
 
-构建产物位于 `dist\JAVTrans\JAVTrans.exe`。打包细节见 `packaging/README.md`。
-由于包内包含 PyTorch/CUDA 运行库、默认 ASR 模型和默认流程辅助模型，发布目录会达到数 GB；上传 GitHub Release 时通常需要分卷压缩或改用外部大文件分发。
+构建产物位于 `dist\JAVTrans\JAVTrans.exe`。打包细节见 `packaging/README.md`。由于包内包含 PyTorch/CUDA 运行库、默认 ASR 模型和默认流程辅助模型，发布目录会达到数 GB；上传 GitHub Release 时通常需要分卷压缩或改用外部大文件分发。
+
+本项目引入的部分第三方代码，例如 `src/vad/whisperseg`，保留其原始许可证，请遵循相应协议。
+
+---
+
+## 当前 Backlog
+
+| 优先级 | 项目 | 验收标准 |
+|--------|------|----------|
+| P2 | Windows 生产环境 default-on 验证 | RTX 4060 Ti 8GB 下确认 CUDA/ONNXRuntime provider、模型串行加载、cache 命中/失效、输出目录和临时目录清理行为；至少完成一个代表视频的 Web 全流程 smoke。 |
+
+---
+
+## 任务历史与验证记录
+
+### 最近完成基线
+
+| Task | 内容 | 验收 |
+|------|------|------|
+| T-AJ | 全量审计修复：任务级 env 覆盖、aligned cache scope、ASR/字幕/quality 参数运行时化、翻译 cancel_event 透传 | 基线 315 passed, 5 skipped；完成后逐步增至 334+ passed |
+| T-AK | 第二轮后端审计：ASR/aligned cache signature、`.env.example` 默认、SubtitleOptions、Web retry/cancel、stream timeout、Protocol 补齐 | 343 passed, 5 skipped |
+| T-AL | ASR generation budget + ONNX CUDA runtime + VAD/chunk cache | 359 passed, 5 skipped；SORA-575 anime-whisper 全量中日双语 649.54s，WhisperSeg CUDA VAD/切块 9.32s，ASR generation overflow/error 为 0 |
+| T-AM | 删除 ASR recovery / temperature fallback / prompt overflow retry，并清理前端旧 ASR Recovery 控件；早期固定阈值 precision 方案后续被 adaptive-only 替换 | 后端全量 365 passed, 5 skipped；前端/Web 定向 13 passed |
+| T-AN | adaptive precision ASR 默认化：保留硬幻觉拒绝，低风险低 `avg_logprob` 对白自适应放宽 | 定向回归 68 passed；Oni Chichi BDRIP 5min smoke：adaptive drops 2，overflow/error/timeout/quarantine 为 0 |
+| T-AO | 默认 ASR 切为 `whisper-ja-anime-v0.3`；新增 `video/test` 通用测试集评测工具；删除 strict/normal ASR 精度模式，只保留 adaptive precision | 全量 373 passed, 5 skipped |
+| T-AP | 本地 `.env` 适配当前默认流程并按同类参数归类注释；文档同步 `.env` 边界 | dotenv 解析通过；关键 adaptive/default ASR 配置齐全；旧 strict 配置不存在 |
+| T-AQ | 新增 Silero / hybrid VAD 实验并完成取舍：hard/soft gate 过度依赖 Silero，后续从当前代码与公开配置中移除 | NAMH-055 前 5 分钟历史 smoke：hybrid hard 漏太多，hybrid soft 改善但仍不作为保留路线 |
+| T-AR | 新增 `fusion_lite` VAD 实验后端，只保留 `whisperseg-adaptive` 与 `fusion_lite` 两条公开路线；字幕默认软目标/硬上限收紧为 5.5s/6.5s | NAMH-055 前 5 分钟：WhisperSeg 14 字幕/11 drops；fusion_lite 15 字幕/7 drops；HAME-052/NMSL-036 全片 VAD 对比 generation overflow/error 均为 0；字幕定向 23 passed，全量 383 passed, 5 skipped |
+| T-AS | 全量审计修复：WhisperSeg 空结果除零、旧 chunking 整段 fallback、timestamp fallback 参数运行时化、alignment fallback 统计、字幕 writer/Web/pipeline 过时路径清理 | 定向回归通过，后续以全量 pytest 基线更新 |
+| T-AT | Fusion-lite 后缀实验 + SORA-575 对比 + 帧率驱动 SRT overlap 归一化 | SORA-575 四模式对比完成；`fusion_lite_boost` 最接近 whisperseg-adaptive；新增逐句 HTML 报告；字幕/fps/主流程定向 73 passed |
+| T-AU | HAME-052 四模式双语对比 + frame-based 短尾 cue 合并 | HAME-052 四模式全流程双语输出完成；新增 frame-based overlapping tail merge，修复 `受け` / `受けて` 这类极短 gap 被 F0 gender 抖动切成两条的问题；字幕定向 50 passed |
+
+### 关键验证记录
+
+T-AL：
+
+- ONNX CUDA smoke 通过：WhisperSeg `model.onnx` 可创建 `CUDAExecutionProvider` session，provider 为 `['CUDAExecutionProvider', 'CPUExecutionProvider']`。
+- SORA-575 复测：ASR+Alignment 266.00s，输出 578 条字幕。
+- 对比 T-AK：总耗时 729.36s -> 649.40s；ASR+Alignment 430.61s -> 266.00s。
+- 逐句字幕对比报告：`reports/SORA-575.subtitle_compare.html`。
+- VAD/chunk cache smoke：修改 ASR prompt 上限后 aligned cache miss、ASR 重跑，但 VAD chunk cache hit；静音分析与切块 2.34s -> 0.01s。
+
+T-AM：
+
+- 后端已删除 ASR recovery、temperature fallback、prompt overflow retry；生成失败或不确定时不再重写补救。
+- timestamp/alignment fallback 仅用于时间轴，不新增 ASR 文本。
+- 后端 `JobSpec` / `JobContext` / `/api/config` 不再暴露 `asr_recovery`。
+- 验证：compileall 通过；precision/QC/cache/ASR 定向 66 passed；全量 365 passed, 5 skipped。
+
+T-AN / T-AO：
+
+- 默认 ASR 精度策略更新为 adaptive precision。
+- adaptive 阈值写入 ASR checkpoint / aligned cache signature，`ASR_QC_ADAPTIVE_*` 变化会触发重算。
+- 5 分钟 BDRIP smoke：`whisper-ja-anime-v0.3`，ASR+Alignment 16.96s，输出 82 段，`asr_dropped_uncertain_count=2`，generation overflow/error/timeout/quarantine 均为 0。
+- Engine 默认 ASR 改为 `whisper-ja-anime-v0.3`，与 Web 推荐默认一致。
+- 新增通用测试集评测工具：`tests/testset_quality_eval.py`。
+- 全量 pytest 基线：373 passed, 5 skipped。
+
+T-AQ / T-AR：
+
+- Silero / `hybrid_precision` 曾作为低幻觉 VAD 方案验证；hard gate 漏掉大量真实对白，soft gate 有改善但仍过度依赖 Silero。
+- 当前保留 VAD 路线：默认 `whisperseg-adaptive`，以及实验 `fusion_lite*`。
+- `fusion_lite` 使用可解释公式融合 WhisperSeg 分数、Silero 重叠、RMS、spectral flux 和时长分数。
+- NAMH-055 前 5 分钟：WhisperSeg 48 VAD segments / 129.22s speech / 14 字幕 / 11 drops；fusion_lite 23 VAD segments / 89.34s speech / 15 字幕 / 7 drops；generation overflow/error/timeout/quarantine 均为 0。
+- HAME-052 / NMSL-036 全片三模式历史对比显示 fusion_lite 输出接近 WhisperSeg，但 drops 少于 WhisperSeg。
+- 逐句报告：`reports/HAME-052_NMSL-036.full_vad_modes_line_compare.html`。
+
+T-AT：
+
+- 新增 `fusion_lite_boost` 和 `fusion_lite_sigmoid` 后缀后端，不新增 `FUSION_VAD_SCORING_MODE`。
+- SORA-575 使用 `whisper-ja-anime-v0.3`、跳过翻译进行 VAD/ASR 对比。
+- CUDA ONNX 在 sandbox 内失败，原因是 GPU 被操作系统/sandbox 阻断；外部执行确认 RTX 4060 Ti、Torch CUDA 和 ONNXRuntime CUDA provider 可用。
+- SORA-575 汇总：`whisperseg-adaptive` 700 SRT / 210 ASR drops；`fusion_lite` 683 SRT / 167 drops；`fusion_lite_boost` 688 SRT / 185 drops；`fusion_lite_sigmoid` 677 SRT / 148 drops。
+- SRT overlap 处理重构：新增 `probe_video_fps()`，SRT writer 在写出前排序、软拆、合并/裁剪重叠，并强制保留 2 帧 gap。
+- quality report 新增 subtitle overlap 统计。
+- 验证：字幕/fps/主流程定向 73 passed。
+
+T-AU：
+
+- HAME-052 四模式完整双语对比已输出到 `video/HAME-052.*.srt`，逐句 HTML 报告为 `video/HAME-052.vad_bilingual_compare.html`。
+- 四模式 ASR generation error / overflow / timeout 均为 0，最终 SRT 未包含可见 `[M]` / `[F]` 性别标签。
+- HAME-052 汇总：`whisperseg_adaptive` 230 SRT / 96 ASR drops；`fusion_lite` 231 SRT / 63 drops；`fusion_lite_boost` 230 SRT / 84 drops；`fusion_lite_sigmoid` 230 SRT / 50 drops。
+- cue plan 短尾合并改为 frame-based 规则。
+- HAME-052 离线验证：`00:02:56,839 --> 00:02:59,160` 合并为 `アルマリスト 室で イラックス ステイマンを受けて`。
+- 验证：字幕定向 50 passed。
+
+### 历史任务摘要
+
+| Task | 大致内容 | 验收 / 备注 |
+|------|----------|-------------|
+| T-A | ASR Recovery 接入 VAD 二次细分，改善异常 ASR 文本块的重跑路径。 | 历史功能，T-AM 已从后端移除 |
+| T-B | 建立 F0 词级时间轴与 multi-cue gender 切分。 | 已完成 |
+| T-C ~ T-E | Web 控制台、Stage 事件 JSON 化、重试断点续传和 cancel event 透传。 | 已完成 |
+| T-F ~ T-G | HF 镜像开关、Web 配置项扩展。 | 已完成 |
+| T-H ~ T-J | 后端稳定性、CLI 瘦身、全局 env 并发污染治理。 | T-J 后 179 passed |
+| T-K | `transformers` 兼容性回滚，保留四个稳定 ASR 后端。 | 依赖固定回 `transformers==4.57.6` |
+| T-L ~ T-M | GitHub 发布前文档/配置/入口收口；翻译上下文和 cache key 收口。 | T-M 后定向 32 passed |
+| T-N | Windows Release exe 打包配置。 | 已完成 |
+| T-O | Web 表单记忆与右键粘贴体验。 | 已完成 |
+| T-P | OpenAI Responses 翻译格式兼容。 | 已完成 |
+| T-Q | F0 后 gender turn 字幕重切段。 | F0 定向 15 passed；ASR job/cache 定向 7 passed |
+| T-R | 翻译重试与请求清理；Micu+Grok Responses 特例移入 `src/llm/patch.py`；翻译前 ASR 噪声过滤扩展到纯英文幻觉 token。 | 已完成 |
+| T-S | 后端稳定性收口：`JobSpec` 边界、finished job 删除锁顺序、run logger 泄漏、translation cache 损坏容忍。 | 58 passed |
+| T-U | 后端大文件拆分：`src/main.py` helper 迁入 `src/pipeline/` 多个子模块。 | 宽后端回归 93 passed |
+| T-V | 前端 `app.js` 拆分为 ES Module，并修复日志刷新导致粘贴菜单关闭的问题。 | 语法检查和手动验证通过 |
+| T-W | 翻译 reasoning effort 收口为 `medium` / `xhigh`，Responses 不做兼容降级映射。 | 定向 36 passed |
+| T-X | 翻译 fixed-prefix 批处理、并发诊断、术语/人名规则、局部 repair pass。 | 229 passed |
+| T-Y | Web 演员名持久化、提交自动保存设置、移除手动保存按钮。 | Web 定向 10 passed + JS check |
+| T-Z | 翻译前 ASR 噪声过滤扩展到纯特殊符号段。 | 定向 56 passed |
+| B1 | 拆分 `src/whisper/pipeline.py`：后端 registry、checkpoint 等职责外移。 | 241 passed |
+| B2 | 拆分 `src/llm/translator.py`：translation cache 和 prompt 构建外移。 | 241 passed |
+| B3 | 压缩 `src/main.py`：stage log、output writer 等职责外移。 | 241 passed |
+| B4 | ASR 滑动上下文注入：`initial_prompts`、gender/gap 重置。 | 241 passed |
+| B5 | VAD 微短段预合并：短 speech chunk 物理拼接并保留 `merged_from` 元数据。 | 241 passed |
+| B6 | 字幕软切分点：长段优先按中文标点/日文助词词边界拆分。 | 241 passed |
+| B7 | Repair Pass 增强：长度错配强制纳入 repair 候选。 | 237 passed |
+| T-AA | ASR 质量信号：`avg_logprob`、`no_speech_prob`、`compression_ratio`；历史 temperature fallback 已在 T-AM 移除。 | 277 passed |
+| T-AB | WhisperSeg 默认阈值 0.35；`SpeechSegment.score`；negative offset env；adaptive VAD。 | 299 passed |
+| T-AC | VAD chunk packing + 词时间戳后置 F0 gender split。 | 253 passed |
+| T-AD | T-AC 默认开启；ASR overflow initial prompt 双层截断。 | 256 passed |
+| T-AE | None 段 gender carry-over。 | 262 passed |
+| T-AF | soft split 扩展 None 长段，`gender=None` 且长段强制 hard word split。 | 302 passed |
+| T-AG | 短段丢弃 gate：duration + RMS AND 双条件，env opt-in。 | 312 passed |
+| T-AH | F0 carry-over 默认放宽；修复 `nan_ratio_threshold` 透传问题。 | 312 passed |
+| T-AI | `F0_GENDER_NONE_TOLERANCE` 2 -> 3；post-split 第二次 carry-over pass。 | 315 passed |
+
+### 历史验证基线
+
+HAME-052 四后端 skip-translation 对比：
+
+| 后端 | 状态 | ASR 转写 | Wall time | 字幕数 |
+|------|------|----------|-----------|--------|
+| `anime-whisper` | ok | 48.52s | 336.88s | 150 |
+| `qwen3-asr-1.7b` | ok | 251.71s | 578.15s | 164 |
+| `whisper-ja-1.5b` | ok | 170.74s | 464.33s | 165 |
+| `whisper-ja-anime-v0.3` | ok | 41.89s | 229.46s | 151 |
+
+默认全量翻译 anime-whisper + bilingual：`pipeline_total=575.30s`，字幕块数 150，产物 `video/HAME-052.srt`。
+
+SORA-575 历史基准：
+
+- T-AA 前后基线：491.5s，493 ASR chunks，字幕 365 段，F/M/None=117/124/124，Mixed=13。
+- T-AL 当前基线：总耗时 649.54s；WhisperSeg CUDA VAD/切块 9.32s；ASR+Alignment 266.00s；输出 578 条字幕；ASR generation overflow/error 为 0。

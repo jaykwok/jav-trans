@@ -265,31 +265,8 @@ DEFAULT_SETTINGS: dict[str, str] = {
     "LLM_REASONING_EFFORT": "xhigh",
     # Final subtitle language.
     "TARGET_LANG": "简体中文",
-    # Max retry count for transient translation API failures.
-    "TRANSLATION_API_RETRIES": "4",
-    # Finite read timeout for streaming translation responses.
-    "TRANSLATION_STREAM_READ_TIMEOUT_S": "120",
-    # Initial retry backoff in seconds.
-    "TRANSLATION_API_BACKOFF_BASE_S": "1.5",
-    # Maximum retry backoff in seconds.
-    "TRANSLATION_API_BACKOFF_MAX_S": "20",
-    # Max output token budget for translation requests.
-    "TRANSLATION_MAX_TOKENS": "384000",
-    # 1 sends a warmup request for the stable full-JSON prefix before batch translation.
-    "TRANSLATION_PREFIX_WARMUP": "1",
-    # Max full cue-plan JSON size used as stable prefix; larger inputs fall back to summary context.
-    "TRANSLATION_FULL_JSON_PREFIX_MAX_CHARS": "180000",
-    # 1 enables a narrow post-translation repair pass for translation-length outliers only.
-    "TRANSLATION_REPAIR_ENABLED": "1",
-    # Maximum cue ids repaired in one post-translation repair request.
-    "TRANSLATION_REPAIR_MAX_IDS": "12",
-    # Neighboring cue radius included as context for repair candidates.
-    "TRANSLATION_REPAIR_CONTEXT_RADIUS": "1",
-    # Translation/source length ratio bounds used to select repair candidates.
-    "TRANSLATION_REPAIR_LENGTH_RATIO_MIN": "0.25",
-    "TRANSLATION_REPAIR_LENGTH_RATIO_MAX": "4.0",
     # Comma-separated Japanese-to-Chinese term mapping injected into translation prompts.
-    "TRANSLATION_GLOSSARY": "ちんぽ→肉棒, チンポ→肉棒, おちんちん→肉棒, チンポコ→肉棒",
+    "TRANSLATION_GLOSSARY": "ちんぽ-肉棒, チンポ-肉棒, おちんちん-肉棒, チンポコ-肉棒",
 
     # --- Output & Cache ---
     # Root directory for per-video temporary files.

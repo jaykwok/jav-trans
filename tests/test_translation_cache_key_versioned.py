@@ -13,9 +13,16 @@ def test_translation_cache_key_same_input_same_glossary():
     assert first == second
 
 
+def test_translation_cache_key_normalizes_glossary_spacing():
+    first = translator._translation_cache_key(0, _segments(), glossary=" 健太 - 男主 ")
+    second = translator._translation_cache_key(0, _segments(), glossary="健太-男主")
+
+    assert first == second
+
+
 def test_translation_cache_key_changes_with_glossary():
-    first = translator._translation_cache_key(0, _segments(), glossary="健太（男主）")
-    second = translator._translation_cache_key(0, _segments(), glossary="小那海（女主）")
+    first = translator._translation_cache_key(0, _segments(), glossary="健太-男主")
+    second = translator._translation_cache_key(0, _segments(), glossary="小那海-女主")
 
     assert first != second
 
@@ -40,7 +47,7 @@ def test_translation_cache_key_changes_with_target_lang():
 def test_translation_cache_key_changes_with_prompt_version(monkeypatch):
     first = translator._translation_cache_key(0, _segments(), glossary="健太（男主）")
 
-    monkeypatch.setattr(translator, "PROMPT_VERSION", "v2.7")
+    monkeypatch.setattr(translator, "PROMPT_VERSION", "v2.8")
     second = translator._translation_cache_key(0, _segments(), glossary="健太（男主）")
 
     assert first != second

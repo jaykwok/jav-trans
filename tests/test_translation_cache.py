@@ -86,10 +86,10 @@ def test_batched_translation_skips_cached_batches(monkeypatch, tmp_path):
         return _mock_json(start, expected_count)
 
     monkeypatch.setattr(translator, "_chat", fake_chat)
+    monkeypatch.setattr(translator, "_auto_translation_batch_size", lambda *_args: 2)
 
     zh_texts, timings, retry_events = translator.translate_segments(
         segments,
-        batch_size=2,
         max_workers=2,
         cache_path=str(cache_path),
         target_lang="简体中文",

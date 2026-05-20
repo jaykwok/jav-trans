@@ -9,10 +9,10 @@ def test_extra_glossary_injected_into_system_prompt_and_batch_user_message():
         character_reference="",
         target_lang="简体中文",
         glossary="",
-        extra_glossary="あなた \u2192 你\n肉棒 \u2192 肉棒",
+        extra_glossary="あなた-你\n肉棒-肉棒",
     )
     assert "<glossary>" in prompt
-    assert "あなた \u2192 你" in prompt
+    assert "あなた-你" in prompt
 
     messages = translator._build_batch_messages(
         [{"start": 0.0, "end": 1.0, "text": "あなた"}],
@@ -22,7 +22,7 @@ def test_extra_glossary_injected_into_system_prompt_and_batch_user_message():
         1,
         target_lang="简体中文",
         glossary="",
-        extra_glossary="あなた \u2192 你",
+        extra_glossary="あなた-你",
     )
     assert "<glossary>" in messages[0]["content"]
     assert "注意：必须严格使用 System Prompt 中 <glossary> 标签内的术语表翻译。" in messages[1]["content"]
@@ -73,8 +73,8 @@ def test_glossary_preextract_failure_returns_empty(monkeypatch, tmp_path):
 
 
 def test_prompt_signature_changes_with_extra_glossary():
-    first = translator._compute_prompt_signature(extra_glossary="あなた \u2192 你")
-    second = translator._compute_prompt_signature(extra_glossary="あなた \u2192 您")
+    first = translator._compute_prompt_signature(extra_glossary="あなた-你")
+    second = translator._compute_prompt_signature(extra_glossary="あなた-您")
 
     assert first != second
 

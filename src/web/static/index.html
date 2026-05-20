@@ -96,10 +96,6 @@
               <input type="number" id="t-vad-threshold" value="0.35" step="0.05" min="0.1" max="0.9">
             </label>
             <label class="field">
-              <span>翻译批次大小</span>
-              <input type="number" id="t-translation-batch-size" value="200" min="10" max="500">
-            </label>
-            <label class="field">
               <span>并行翻译 Worker 数（API 限速时可调低）</span>
               <input type="number" id="t-translation-max-workers" value="4" min="1" max="32">
             </label>
@@ -181,8 +177,8 @@
             </label>
 
             <label class="field">
-              <span>术语表（每行一条，格式：日文→中文）</span>
-              <textarea id="api-glossary" rows="4" placeholder="ちんぽ→肉棒&#10;チンポ→肉棒"></textarea>
+              <span>术语表（每行一条，格式：日文-中文）</span>
+              <textarea id="api-glossary" rows="4" placeholder="ちんぽ-肉棒&#10;チンポ-肉棒"></textarea>
             </label>
 
           </div>

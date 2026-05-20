@@ -4,6 +4,8 @@ import json
 import threading
 from pathlib import Path
 
+from llm.glossary import normalize_glossary_text
+
 
 def _warn_translation_cache(message: str) -> None:
     print(f"[WARN] translation cache {message}", flush=True)
@@ -122,9 +124,11 @@ def _compute_prompt_signature(
     compact_system_prompt: bool,
 ) -> str:
     compact = "1" if compact_system_prompt else "0"
+    normalized_glossary = normalize_glossary_text(glossary)
+    normalized_extra_glossary = normalize_glossary_text(extra_glossary)
     payload = (
-        f"{prompt_version}\n{target_lang.strip()}\n{glossary.strip()}\n"
-        f"{extra_glossary.strip()}\n{(character_reference or '').strip()}\n"
+        f"{prompt_version}\n{target_lang.strip()}\n{normalized_glossary}\n"
+        f"{normalized_extra_glossary}\n{(character_reference or '').strip()}\n"
         f"{model_name.strip()}\ncompact={compact}"
     )
     return hashlib.sha1(payload.encode("utf-8")).hexdigest()[:12]

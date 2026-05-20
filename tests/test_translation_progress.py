@@ -130,6 +130,8 @@ def test_grok_chat_keeps_streaming_json_object(monkeypatch):
     assert "web_search_options" not in request
     assert "include_reasoning" not in request
     assert request["max_tokens"] == translator.TRANSLATION_MAX_TOKENS
+    assert request["temperature"] == translator.TRANSLATION_TEMPERATURE
+    assert request["top_p"] == translator.TRANSLATION_TOP_P
 
 
 def test_chat_reports_openai_and_deepseek_cache_usage(monkeypatch):
@@ -274,6 +276,8 @@ def test_grok_responses_uses_standard_openai_shape_without_micu_patch(monkeypatc
     assert request["reasoning"] == {"effort": "xhigh"}
     assert request["text"] == {"format": {"type": "json_object"}}
     assert request["max_output_tokens"] == translator.TRANSLATION_MAX_TOKENS
+    assert request["temperature"] == translator.TRANSLATION_TEMPERATURE
+    assert request["top_p"] == translator.TRANSLATION_TOP_P
     assert "max_tokens" not in request
 
 
@@ -316,6 +320,8 @@ def test_grok_responses_stream_request_shape(monkeypatch):
     assert request["max_tokens"] == max(16000, translator.TRANSLATION_MAX_TOKENS)
     assert request["reasoning"] == {"effort": "xhigh"}
     assert request["include_reasoning"] is True
+    assert request["temperature"] == translator.TRANSLATION_TEMPERATURE
+    assert request["top_p"] == translator.TRANSLATION_TOP_P
     assert "text" not in request
     assert "tools" not in request
     assert "max_output_tokens" not in request
@@ -349,10 +355,10 @@ def test_iter_sse_json_events_parses_responses_stream():
 
 def test_micu_grok_stream_read_timeout_is_finite(monkeypatch):
     monkeypatch.setenv("TRANSLATION_STREAM_READ_TIMEOUT_S", "45")
-    assert llm_patch._stream_read_timeout_s() == 45.0
+    assert llm_patch._stream_read_timeout_s() == 120.0
 
     monkeypatch.setenv("TRANSLATION_STREAM_READ_TIMEOUT_S", "0")
-    assert llm_patch._stream_read_timeout_s() == 1.0
+    assert llm_patch._stream_read_timeout_s() == 120.0
 
     monkeypatch.setenv("TRANSLATION_STREAM_READ_TIMEOUT_S", "bad")
     assert llm_patch._stream_read_timeout_s() == 120.0
@@ -399,7 +405,6 @@ def test_translate_segments_emits_reset_on_retry(monkeypatch):
 
     zh_texts, timings, retry_events = translator.translate_segments(
         [{"start": 0.0, "end": 1.0, "text": "いい"}],
-        batch_size=100,
         max_workers=1,
         cache_path="",
         target_lang="简体中文",
@@ -465,13 +470,13 @@ def test_batched_progress_reaches_done_only_after_all_batches(monkeypatch):
         )
 
     monkeypatch.setattr(translator, "_chat_with_reasoning", fake_chat)
+    monkeypatch.setattr(translator, "_auto_translation_batch_size", lambda *_args: 2)
 
     zh_texts, _timings, _retry_events = translator.translate_segments(
         [
             {"start": float(index), "end": float(index) + 0.5, "text": f"ja-{index}"}
             for index in range(5)
         ],
-        batch_size=2,
         max_workers=1,
         cache_path="",
         target_lang="简体中文",
