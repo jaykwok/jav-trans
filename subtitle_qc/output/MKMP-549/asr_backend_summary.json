@@ -1,0 +1,19 @@
+{
+  "video": "video/MKMP-549.mp4",
+  "base_source": "whisperseg",
+  "sources": [
+    "whisperseg",
+    "fusion",
+    "boost"
+  ],
+  "counts": {
+    "whisperseg": 1102,
+    "fusion": 1113,
+    "boost": 1116
+  },
+  "review_item_count": 200,
+  "outputs": {
+    "asr_backend_japanese_compare": "asr_backend_japanese_compare.html",
+    "asr_backend_review_items": "asr_backend_review_items.json"
+  }
+}

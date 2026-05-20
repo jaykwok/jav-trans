@@ -55,6 +55,24 @@ It writes:
 - `history_japanese_compare.html`: aligned Japanese subtitle differences.
 - `history_review_items.json`: machine-readable likely-different cue list.
 
+Compare Japanese transcripts from different ASR backends:
+
+```bash
+.venv/bin/python subtitle_qc/compare_asr_backends.py \
+  --video video/MKMP-577.mp4 \
+  --input anime=video/MKMP-577.whisperseg_adaptive.srt \
+  --input qwen=video/MKMP-577.fusion_lite.srt \
+  --input whisper15=video/MKMP-577.fusion_lite_boost.srt \
+  --base anime
+```
+
+The ASR backend comparison accepts `.srt` and `.json`, aligns cues by time
+overlap plus Japanese text similarity, and writes:
+
+- `asr_backend_japanese_compare.html`: sentence-by-sentence Japanese transcript comparison.
+- `asr_backend_review_items.json`: likely-different ASR cue list.
+- `asr_backend_summary.json`: input counts and output paths.
+
 Optional clip generation:
 
 ```bash

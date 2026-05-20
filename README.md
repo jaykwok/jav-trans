@@ -262,7 +262,7 @@ Web 设置行为：
 - `temp/jobs/`：Web 任务临时目录，包含音频缓存、ASR checkpoint、`aligned_segments.json`、翻译 cache 等。
 - `temp/log/`：高级项启用 `RUN_LOG_ENABLED=1` 后写入运行日志。
 - `reports/`：质量报告与测试/对比报告默认输出目录；质量报告以 `.md` 为主产物，同时保留 `.json` sidecar。
-- `subtitle_qc/`：独立字幕人工质检工具，按视频名输出纯日文转写对比、逐词时间戳报告、翻译对比和原视频 seek 式 review index。
+- `subtitle_qc/`：独立字幕人工质检工具，按视频名输出纯日文转写对比、逐词时间戳报告、翻译对比、不同 ASR 后端逐句对比，以及原视频 seek 式 review index。具体命令见 `subtitle_qc/README.md`。
 
 成功运行后默认删除一次性 job 临时目录；保留下次可复用的运行缓存，例如 `models/`、`temp/vad-cache/` 和 `temp/web` 状态。Web“保留临时文件”仅用于调试当前任务。
 
