@@ -207,19 +207,14 @@ def _wrap_subtitle_text(
 def _subtitle_prefix(
     block: dict,
     *,
-    show_gender_override: bool | None = None,
     options: SubtitleOptions | None = None,
 ) -> str:
     options = _coerce_options(options)
     show_speaker = options.show_speaker
-    show_gender = options.show_gender if show_gender_override is None else show_gender_override
     speaker = block.get("speaker")
-    gender = block.get("gender")
     if show_speaker and speaker is not None:
         s = str(speaker)
         return f"[{s}] " if s.upper().startswith("S") else f"[S{s}] "
-    if show_gender and gender in ("M", "F"):
-        return f"[{gender}] "
     return ""
 
 
@@ -802,7 +797,6 @@ def write_srt(
     blocks: list[dict],
     path: str,
     *,
-    show_gender: bool | None = None,
     options: SubtitleOptions | None = None,
 ):
     """
@@ -821,7 +815,6 @@ def write_srt(
             wrapped = _wrap_subtitle_text(
                 _subtitle_prefix(
                     block,
-                    show_gender_override=show_gender,
                     options=options,
                 )
                 + block.get("zh_text", ""),
@@ -937,7 +930,6 @@ def write_bilingual_srt(
     blocks: list[dict],
     path: str,
     *,
-    show_gender: bool | None = None,
     options: SubtitleOptions | None = None,
 ):
     """blocks: [{start, end, ja_text, zh_text}] — Japanese line above Chinese."""
@@ -952,7 +944,6 @@ def write_bilingual_srt(
             end_str   = format_timestamp(end)
             prefix = _subtitle_prefix(
                 block,
-                show_gender_override=show_gender,
                 options=options,
             )
             ja_line = _wrap_subtitle_text(prefix + block.get("ja_text", ""), options=options)

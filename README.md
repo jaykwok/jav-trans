@@ -126,12 +126,15 @@ HF_ENDPOINT=https://hf-mirror.com
 
 字幕 cue plan 默认使用 `SUBTITLE_SOFT_MAX_S=5.5` 作为软拆分目标，`MAX_SUBTITLE_DURATION=6.5` 作为单条字幕硬上限。这个上限参考 Netflix Timed Text 的 7 秒规则，同时结合 BBC/眼动研究对阅读速度的弹性结论，避免短文本长时间挂屏；翻译前会按视频真实 fps 保留 2 帧间隔并移除 overlap，读不到 fps 时按 `30000/1001` 兜底。相邻短块合并也统一走 fps 换算帧数，避免 24fps/29.97fps/30fps 视频下用固定秒数造成不同观感；F0 gender 抖动造成的 `受け` / `受けて` 这类极短重叠尾巴会被合并，但 speaker guard 仍然是硬边界。最终写入 SRT、`bilingual.json` 和 quality report 的都是同一份已归一化 cue。
 
-当前翻译 prompt 版本为 `v2.6`。LLM 只负责逐 cue 翻译、遵守术语表和人名罗马音规则；不再授权根据上下文修正 ASR 误听、同音词、上下文漂移、术语漂移或被切断半句，避免在没有画面信息的情况下改错源文。
+当前翻译 prompt 版本为 `v2.6`。LLM 只负责逐 cue 翻译、遵守术语表和人名罗马音规则；不再授权根据上下文修正 ASR 误听、同音词、上下文漂移、术语漂移或被切断半句，避免在没有画面信息的情况下改错源文。LLM 输入中仍会保留 `[M]` / `[F]` 声学标签帮助判断语气和对话切换，但去除可见性别标签由本地规则完成，最终 SRT 不输出 `[M]` / `[F]`。
+
+Grok 搜索到的字幕翻译质量实践与当前路线一致：尽量给 LLM 全片或多行上下文、固定术语表、结构化 JSON 输出，并只对明确的译文质量异常做二次修复。因此默认保留 fixed full-JSON prefix、prefix warmup、全片 glossary 预抽取和翻译后长度异常 repair；超过 prefix 长度上限时才回退摘要上下文。暂不加入让 LLM 改写 ASR 文本、猜测画面信息或做大范围语义重写的步骤。
 
 常用缓存位置：
 
 - `temp/vad-cache/`：VAD/chunk 边界缓存，只绑定音频指纹、VAD 参数和 chunk/drop/merge 参数，不绑定 ASR prompt/token 参数。
-- 当前任务临时目录：音频缓存、ASR checkpoint、`aligned_segments.json`、翻译 cache、质量报告和运行日志。
+- 当前任务临时目录：音频缓存、ASR checkpoint、`aligned_segments.json`、翻译 cache 和运行日志。
+- `reports/`：质量报告与测试/对比报告默认输出目录；质量报告以 `.md` 为主产物，同时保留 `.json` 旁路便于自动化读取。
 - `models/`：HuggingFace 模型缓存。
 
 ## 💡 给开发者的说明

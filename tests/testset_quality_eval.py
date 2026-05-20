@@ -693,6 +693,7 @@ def find_existing_prediction_paths(case: DatasetCase, predictions_root: Path | s
         "bilingual_json": list(root.rglob(f"{stem}.bilingual.json")),
         "srt": list(root.rglob(f"{stem}.srt")) + list(root.rglob(f"{stem}.ja.srt")),
         "quality_report": list(root.rglob(f"{stem}.quality_report.json")),
+        "quality_report_md": list(root.rglob(f"{stem}.quality_report.md")),
         "timings": list(root.rglob(f"{stem}.timings.json")),
     }
     return {
@@ -828,7 +829,6 @@ def run_pipeline_for_case(
         asr_backend=backend,
         asr_context="",
         subtitle_mode="zh",
-        show_gender=False,
         multi_cue_split=True,
         vad_threshold=0.35,
         skip_translation=skip_translation,

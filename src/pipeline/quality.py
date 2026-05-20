@@ -106,6 +106,79 @@ def quality_segments_from_blocks(blocks: list[dict]) -> list[dict]:
     return quality_segments
 
 
+def _format_report_value(value) -> str:
+    if value is None:
+        return "-"
+    if isinstance(value, float):
+        return f"{value:.3f}".rstrip("0").rstrip(".")
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    return str(value)
+
+
+def _quality_report_markdown(video_stem: str, report: dict) -> str:
+    metric_keys = [
+        "empty_zh_ratio",
+        "repetition_ratio",
+        "kana_only_ratio",
+        "short_segment_ratio",
+        "per_min_subtitle_count",
+        "glossary_hit_rate",
+        "alignment_fallback_ratio",
+        "subtitle_overlap_count",
+        "subtitle_overlap_total_s",
+        "subtitle_overlap_max_s",
+        "f0_filtered_count",
+        "f0_failure",
+        "asr_generation_error_count",
+        "asr_generation_overflow_count",
+        "asr_timeout_count",
+        "asr_quarantined_count",
+        "asr_empty_text_for_speech_count",
+        "asr_dropped_uncertain_count",
+    ]
+    lines = [
+        f"# Quality Report: {video_stem}",
+        "",
+        "## Summary",
+        "",
+        "| Metric | Value |",
+        "| --- | ---: |",
+    ]
+    for key in metric_keys:
+        if key in report:
+            lines.append(f"| `{key}` | {_format_report_value(report.get(key))} |")
+
+    warnings = list(report.get("warnings") or [])
+    lines.extend(["", "## Warnings", ""])
+    if warnings:
+        lines.extend(f"- {warning}" for warning in warnings)
+    else:
+        lines.append("- None")
+
+    examples = list(report.get("subtitle_overlap_examples") or [])
+    if examples:
+        lines.extend(["", "## Overlap Examples", ""])
+        for item in examples:
+            lines.append(
+                "- "
+                f"{_format_report_value(item.get('previous_start'))}-"
+                f"{_format_report_value(item.get('previous_end'))} overlaps "
+                f"{_format_report_value(item.get('current_start'))}-"
+                f"{_format_report_value(item.get('current_end'))} by "
+                f"{_format_report_value(item.get('overlap_s'))}s"
+            )
+
+    dropped = report.get("asr_dropped_uncertain_items")
+    if isinstance(dropped, list) and dropped:
+        lines.extend(["", "## ASR Dropped Uncertain Items", ""])
+        for item in dropped[:20]:
+            lines.append(f"- `{json.dumps(item, ensure_ascii=False)}`")
+
+    lines.append("")
+    return "\n".join(lines)
+
+
 def write_quality_report(
     *,
     video_stem: str,
@@ -158,8 +231,15 @@ def write_quality_report(
         ).expanduser()
         if not effective_report_dir.is_absolute():
             effective_report_dir = project_root / effective_report_dir
-        report_path = effective_report_dir.resolve() / f"{video_stem}.quality_report.json"
-        write_json_atomic(report_path, report)
+        report_dir_path = effective_report_dir.resolve()
+        json_path = report_dir_path / f"{video_stem}.quality_report.json"
+        markdown_path = report_dir_path / f"{video_stem}.quality_report.md"
+        write_json_atomic(json_path, report)
+        markdown_path.parent.mkdir(parents=True, exist_ok=True)
+        markdown_path.write_text(
+            _quality_report_markdown(video_stem, report),
+            encoding="utf-8",
+        )
 
         warnings_list = report.get("warnings") or []
         if warnings_list:
@@ -175,7 +255,7 @@ def write_quality_report(
             raise RuntimeError(
                 f"QC_HARD_FAIL=1 and quality warnings present: {warnings_list}"
             )
-        return str(report_path)
+        return str(markdown_path)
     except RuntimeError:
         raise
     except Exception as exc:

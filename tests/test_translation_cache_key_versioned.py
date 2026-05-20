@@ -45,3 +45,25 @@ def test_translation_cache_key_changes_with_prompt_version(monkeypatch):
 
     assert first != second
 
+
+def test_translation_cache_key_changes_with_timing():
+    first = translator._translation_cache_key(0, _segments(), glossary="")
+    changed = [
+        {"start": 0.0, "end": 1.5, "text": "いい"},
+        {"start": 1.5, "end": 2.0, "text": "もっと"},
+    ]
+    second = translator._translation_cache_key(0, changed, glossary="")
+
+    assert first != second
+
+
+def test_translation_cache_key_changes_with_gender():
+    first = translator._translation_cache_key(0, _segments(), glossary="")
+    changed = [
+        {"start": 0.0, "end": 1.0, "text": "いい", "gender": "F"},
+        {"start": 1.0, "end": 2.0, "text": "もっと"},
+    ]
+    second = translator._translation_cache_key(0, changed, glossary="")
+
+    assert first != second
+

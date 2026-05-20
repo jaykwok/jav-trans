@@ -6,6 +6,7 @@ import sys
 
 
 PROMPT_VERSION = "v2.6"
+_GENDER_TAG_RE = re.compile(r"^\s*\[(?:M|F)\]\s*")
 _LEADING_SPEAKER_RE = re.compile(
     r"^\s*(?:男|女|男性|女性|男优|女优|スタッフ|撮影者|カメラマン|"
     r"[A-Za-z][A-Za-z ._-]{0,20})\s*[：:]\s*"
@@ -54,11 +55,22 @@ def _translation_cache_key(
     target_lang: str = "简体中文",
     character_reference: str = "",
 ) -> str:
-    source_text = "|".join(
-        str(seg.get("ja_text") or seg.get("text") or seg.get("ja") or "")
-        for seg in batch_segments
-    )
-    source_sig = hashlib.sha1(source_text.encode("utf-8")).hexdigest()[:8]
+    source_payload = []
+    for seg in batch_segments:
+        start = _safe_float(seg.get("start"))
+        end = _safe_float(seg.get("end"))
+        source_payload.append(
+            {
+                "start": round(start, 3),
+                "end": round(end, 3),
+                "duration_sec": round(max(0.0, end - start), 3),
+                "gender": seg.get("gender"),
+                "ja": str(seg.get("ja_text") or seg.get("text") or seg.get("ja") or ""),
+            }
+        )
+    source_sig = hashlib.sha1(
+        json.dumps(source_payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()[:12]
     prompt_sig = _compute_prompt_signature(
         extra_glossary,
         glossary=glossary,
@@ -74,6 +86,15 @@ def _normalize_source_text(text: str) -> str:
     cleaned = "\n".join(line.strip() for line in cleaned.split("\n") if line.strip())
     cleaned = re.sub(r"(.)\1{4,}", r"\1\1\1", cleaned)
     return cleaned.strip()
+
+
+def strip_gender_tags(text: str) -> str:
+    cleaned = str(text or "").strip()
+    previous = None
+    while cleaned and previous != cleaned:
+        previous = cleaned
+        cleaned = _GENDER_TAG_RE.sub("", cleaned, count=1).strip()
+    return cleaned
 
 
 def _safe_float(value, default: float = 0.0) -> float:
@@ -141,7 +162,7 @@ _SYSTEM_PROMPT_FULL = (
     "3. 人名不要翻译成中文；如果原文出现人物姓名，直接输出罗马音，格式用 Title Case，并用空格分隔名和姓，例如 Aya Onami。原文是汉字姓名时也必须按日语读音罗马音化，不要输出中文汉字或中文读法。\n"
     "4. {name_boundary}\n"
     "5. {name_homophone}\n"
-    "6. 输入中部分日文前可能带 [M]（男声）或 [F]（女声）声学标签，请利用此信息理解对话切换、调整语气和人称（例如男声用更直白的命令式，女声用更贴合的女性口吻）。**译文中绝对不要保留或输出任何说话人前缀**——[M]/[F] 仅作为输入提示，输出时只给纯净的中文翻译。\n"
+    "6. 输入中部分日文前可能带 [M]（男声）或 [F]（女声）声学标签；这些标签只用于理解对话切换、语气和人称。\n"
     "7. 每条输入必须单独翻译，不能合并、拆分、漏译、调换顺序。\n"
     "8. 输出尽量短，贴近屏幕阅读节奏；短促呻吟和语气词也要简短自然。\n"
     "9. 如果一行里大部分是呻吟、喘息、重复语气词，只保留清晰语义核心，重复部分可以压缩；映射参考：あんっ/はあん 译 啊嗯啊，気持ちいい 译 好舒服要爽死了，イッちゃう/イク 译 要去了要射了，避免感觉很舒服即将达到高潮等翻译腔。\n"

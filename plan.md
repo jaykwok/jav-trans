@@ -46,6 +46,7 @@
 - Web 任务默认 `translation_batch_size=200`、`translation_max_workers=4`。
 - 翻译批处理采用 fixed full-JSON prefix + `requested_ids` 策略：全片 cue plan JSON 作为稳定前缀，本地计算每个 batch 的全局 cue id 区间，LLM 只翻译指定 id。
 - 前缀预热默认开启；超过 `TRANSLATION_FULL_JSON_PREFIX_MAX_CHARS` 时回退全片摘要上下文。
+- Grok 搜索结论支持保留 full/multi-line context、术语表、结构化 JSON 输出和窄范围 post-edit；当前默认继续保留 prefix warmup、全片 glossary 预抽取和 translation repair pass，但 repair 只处理译文长度异常，不扩展成 ASR/剧情修复。
 - 翻译进度日志包含并发诊断事件：`batch_start`、`batch_first_token`、`batch_finish`，记录 wall-clock ts、worker thread、requested ids、耗时、cache hit/miss token。
 - 翻译 reasoning effort 只保留两档：`medium` / `xhigh`。Chat Completions、标准 Responses、Micu+Grok Responses patch 均直接透传，不把 `xhigh` 映射为 `high`。
 - Micu/Grok Responses streaming read timeout 使用 `TRANSLATION_STREAM_READ_TIMEOUT_S`，必须有限且可配置，保证取消/backoff 可中断。
@@ -57,7 +58,7 @@
 - 翻译风格：性器官优先统一为“肉棒”“小穴”，不固定“菊花”。
 - 人名默认按日语读音罗马音化；人物参考只用于识别字幕文本中已经明确出现的人名，LLM 不得根据参考名推测、补全或替换源文。
 - LLM 不再承担 ASR 误听、同音词、上下文漂移、术语漂移或被切断半句修复；没有画面信息时这些推断容易改错源文。翻译后 repair pass 仅保留译文长度异常这类纯译文质量候选。
-- quality report 需要暴露 ASR generation error、overflow、timeout、quarantine、empty speech text、adaptive precision dropped uncertain items、alignment fallback count/ratio 等风险信号。
+- quality report 需要暴露 ASR generation error、overflow、timeout、quarantine、empty speech text、adaptive precision dropped uncertain items、alignment fallback count/ratio 等风险信号；默认写入 `reports/`，主产物为 Markdown，同时保留 JSON sidecar 供测试脚本读取。
 
 ---
 
@@ -194,7 +195,7 @@
 - 修复 fusion 内部 `ASR_VAD_PRIMARY=whisperseg` 加载路径：公开 registry 仍不接受裸 `whisperseg`，但 fusion primary 可直接加载 `WhisperSegVadBackend`。
 - SORA-575 使用 `whisper-ja-anime-v0.3`、跳过翻译进行 VAD/ASR 对比。CUDA ONNX 在 sandbox 内失败，原因是 GPU 被操作系统/sandbox 阻断；外部执行确认 RTX 4060 Ti、Torch CUDA 和 ONNXRuntime CUDA provider 可用。
 - SORA-575 汇总：`whisperseg-adaptive` 700 SRT / 210 ASR drops；`fusion_lite` 683 SRT / 167 drops；`fusion_lite_boost` 688 SRT / 185 drops；`fusion_lite_sigmoid` 677 SRT / 148 drops。逐句对齐以 `whisperseg-adaptive` 为基准，`fusion_lite_boost` 最接近：SAME 564、MISSING 41、平均相似度 0.9560。
-- 逐句报告产物：`agents/temp/sora575-vad-variant-compare/sora575_sentence_report.html`、`sora575_sentence_report.md`、`sora575_sentence_diffs_only.md`、`sora575_sentence_report.csv`、`sora575_sentence_report_summary.json`。
+- 逐句报告产物默认写入 `reports/`；历史 SORA-575 报告包含 `sora575_sentence_report.html`、`sora575_sentence_report.md`、`sora575_sentence_diffs_only.md`、`sora575_sentence_report.csv`、`sora575_sentence_report_summary.json`。
 - SRT overlap 处理重构：新增 `probe_video_fps()`，优先读 `avg_frame_rate`，再读 `r_frame_rate`；读不到 fps 时按 `30000/1001`。`SubtitleOptions` 持有 `video_fps`，SRT writer 在写出前排序、软拆、合并/裁剪重叠，并强制保留 2 帧 gap。旧 `SUBTITLE_GAP_PADDING` 已移除，不再保留兼容配置。
 - quality report 新增 `subtitle_overlap_count`、`subtitle_overlap_total_s`、`subtitle_overlap_max_s` 和前 5 个 overlap examples；正常写出后这些值应为 0。
 - 验证：`.venv/bin/python -m pytest tests/test_subtitle_options.py tests/test_subtitle_quality_pass.py tests/test_subtitle_qc.py tests/test_srt_wrap.py tests/test_video_fps_probe.py tests/test_skip_translation.py tests/test_job_tempdir.py tests/test_aligned_segments_cache.py tests/web/test_cancel_resume.py -q` -> `73 passed`。

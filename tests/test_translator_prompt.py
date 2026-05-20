@@ -11,6 +11,8 @@ def test_system_prompt_no_male_prefix_example():
 
 def test_system_prompt_mentions_acoustic_tags():
     assert "[M]" in translator._SYSTEM_PROMPT_FULL
+    assert "绝对不要保留" not in translator._SYSTEM_PROMPT_FULL
+    assert "输出任何说话人前缀" not in translator._SYSTEM_PROMPT_FULL
 
 
 def test_system_prompt_does_not_authorize_asr_rewrites():
@@ -83,4 +85,9 @@ def test_serialize_segments_omits_prefix_for_none_gender():
     ja = _serialized_ja({"start": 0.0, "end": 1.0, "text": "いい", "gender": None})
     assert not ja.startswith("[M]")
     assert not ja.startswith("[F]")
+
+
+def test_normalize_translation_text_strips_gender_tags():
+    assert translator._normalize_translation_text("[M] 过来") == "过来"
+    assert translator._normalize_translation_text("[F][M] 过来") == "过来"
 

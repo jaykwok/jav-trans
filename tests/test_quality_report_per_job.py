@@ -65,8 +65,10 @@ def test_quality_report_explicit_report_dir_is_per_job(monkeypatch, tmp_path):
         report_dir=second_dir,
     )
 
-    assert Path(first_path) == first_dir / "sample-a.quality_report.json"
-    assert Path(second_path) == second_dir / "sample-b.quality_report.json"
+    assert Path(first_path) == first_dir / "sample-a.quality_report.md"
+    assert Path(second_path) == second_dir / "sample-b.quality_report.md"
+    assert (first_dir / "sample-a.quality_report.md").exists()
+    assert (second_dir / "sample-b.quality_report.md").exists()
     assert (first_dir / "sample-a.quality_report.json").exists()
     assert (second_dir / "sample-b.quality_report.json").exists()
     assert not (tmp_path / "env-reports").exists()
@@ -91,4 +93,5 @@ def test_quality_report_explicit_hard_fail_overrides_env(monkeypatch, tmp_path):
         hard_fail=False,
     )
 
-    assert Path(path) == report_dir / "warnings-allowed.quality_report.json"
+    assert Path(path) == report_dir / "warnings-allowed.quality_report.md"
+    assert (report_dir / "warnings-allowed.quality_report.json").exists()

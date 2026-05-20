@@ -30,6 +30,7 @@ _SYSTEM_PROMPT_FULL = prompt_module._SYSTEM_PROMPT_FULL
 _SYSTEM_PROMPT_COMPACT = prompt_module._SYSTEM_PROMPT_COMPACT
 _JSON_OUTPUT_LABEL = prompt_module._JSON_OUTPUT_LABEL
 _normalize_source_text = prompt_module._normalize_source_text
+_strip_gender_tags = prompt_module.strip_gender_tags
 _warn_translation_cache = translation_cache._warn_translation_cache
 
 
@@ -691,7 +692,7 @@ def _translate_segments_batched(
             print(f"[translation-cache] restored batch {batch_index} cache_key={batch_key}")
             start_index = batch_index * batch_size
             for offset, text in enumerate(cached_texts):
-                zh_texts[start_index + offset] = str(text or "")
+                zh_texts[start_index + offset] = _normalize_translation_text(text) or ""
             timing = {
                 "batch_index": batch_index,
                 "start_index": start_index,
@@ -2307,7 +2308,9 @@ def _normalize_translation_text(text) -> str | None:
     cleaned = re.sub(r"^['\"“”‘’]+|['\"“”‘’]+$", "", cleaned)
     cleaned = "\n".join(line.strip() for line in cleaned.split("\n") if line.strip())
     cleaned = re.sub(r"[ \t]+", " ", cleaned).strip()
+    cleaned = _strip_gender_tags(cleaned)
     cleaned = _LEADING_SPEAKER_RE.sub("", cleaned, count=1)
+    cleaned = _strip_gender_tags(cleaned)
     if "\n" in cleaned:
         cleaned = cleaned.replace("\n", "\\n")
     return cleaned or None
