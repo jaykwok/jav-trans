@@ -106,7 +106,7 @@ HF_ENDPOINT=https://hf-mirror.com
 - **Timestamp fallback 边界**：timestamp/alignment fallback 只用于给已确认 ASR 文本补时间轴，不新增或改写文本；链条为 TEN VAD -> Silero -> even interpolation，其中 TEN VAD 在 Linux 下预检 `libc++.so.1`，Windows 下不做该 Linux 依赖检查。`TEN_VAD_BACKEND`、`TIMESTAMP_VAD_ONSET`、`TIMESTAMP_VAD_MIN_SPEECH`、`VAD_MIN_OFF`、`VAD_PAD` 按任务运行时读取，alignment fallback 次数会进入 quality report。
 - **自适应低幻觉 ASR 策略**：ASR QC 默认且唯一使用 adaptive precision。高 `no_speech_prob`、高压缩率、异常字符密度、重复循环、上下文泄漏、乱码和生成异常会硬丢弃；低风险真实对白的低 `avg_logprob` 会自适应放宽，并写入 quality report 审计。
 - **ASR generation budget 防溢出**：Whisper 系列会根据 decoder 窗口、forced decoder ids、prompt tokens 动态裁剪 prompt 和 `max_new_tokens`，质量报告会统计 overflow/error/timeout/quarantine；生成失败不再通过温度重试或 recovery 补写内容。
-- **翻译前字幕时间轴归一化**：LLM 翻译前先基于 forced alignment 词时间轴生成稳定 cue plan，按 `ffprobe` 探测到的视频 fps 保留 2 帧字幕间隔，并完成排序、软拆、短句合并、overlap 裁剪/合并；探测失败时按 NTSC 常见的 `29.97fps` 兜底。LLM 只翻译这份固定 cue，SRT writer 只负责换行和格式化，不再改变时间轴。
+- **翻译前字幕时间轴归一化**：LLM 翻译前先基于 forced alignment 词时间轴生成稳定 cue plan，按 `ffprobe` 探测到的视频 fps 保留 2 帧字幕间隔，并完成排序、软拆、短句合并、overlap 裁剪/合并；探测失败时按 NTSC 常见的 `29.97fps` 兜底。短 gap / 短尾合并按帧数判断：普通相邻短块默认允许 `gap <= 6 frames` 且合并后不超过 `120 frames`；跨 F0 gender guard 只允许边界日文文本重叠的极短尾巴，并在合并后清空 gender。LLM 只翻译这份固定 cue，SRT writer 只负责换行和格式化，不再改变时间轴。
 - **翻译前噪声过滤**：在提交给 LLM 前过滤空字幕、纯引号片段、纯英文幻觉 token 和纯特殊符号片段，减少无效翻译请求。
 - **智能性别区分**：forced alignment 后执行词级 F0 性别检测，并根据 gender turn 重新切分字幕，让对话翻译更加稳定。
 - **高自由度翻译**：支持接入任何兼容 OpenAI 接口的大语言模型，甚至可以设置特定词汇的“术语表”。
@@ -124,7 +124,7 @@ HF_ENDPOINT=https://hf-mirror.com
 
 当前 ASR 以“少但准”为默认目标：不确定的内容宁可不出现在字幕里，也不把疑似幻觉交给后续对齐和翻译。旧的 ASR recovery、温度 fallback、prompt overflow retry 已从后端移除；主 VAD 空结果会直接跳过 ASR；保留的 timestamp/alignment fallback 只用于给已确认文本补时间轴，不会改写或新增 ASR 文本。
 
-字幕 cue plan 默认使用 `SUBTITLE_SOFT_MAX_S=5.5` 作为软拆分目标，`MAX_SUBTITLE_DURATION=6.5` 作为单条字幕硬上限。这个上限参考 Netflix Timed Text 的 7 秒规则，同时结合 BBC/眼动研究对阅读速度的弹性结论，避免短文本长时间挂屏；翻译前会按视频真实 fps 保留 2 帧间隔并移除 overlap，读不到 fps 时按 `30000/1001` 兜底。最终写入 SRT、`bilingual.json` 和 quality report 的都是同一份已归一化 cue。
+字幕 cue plan 默认使用 `SUBTITLE_SOFT_MAX_S=5.5` 作为软拆分目标，`MAX_SUBTITLE_DURATION=6.5` 作为单条字幕硬上限。这个上限参考 Netflix Timed Text 的 7 秒规则，同时结合 BBC/眼动研究对阅读速度的弹性结论，避免短文本长时间挂屏；翻译前会按视频真实 fps 保留 2 帧间隔并移除 overlap，读不到 fps 时按 `30000/1001` 兜底。相邻短块合并也统一走 fps 换算帧数，避免 24fps/29.97fps/30fps 视频下用固定秒数造成不同观感；F0 gender 抖动造成的 `受け` / `受けて` 这类极短重叠尾巴会被合并，但 speaker guard 仍然是硬边界。最终写入 SRT、`bilingual.json` 和 quality report 的都是同一份已归一化 cue。
 
 当前翻译 prompt 版本为 `v2.6`。LLM 只负责逐 cue 翻译、遵守术语表和人名罗马音规则；不再授权根据上下文修正 ASR 误听、同音词、上下文漂移、术语漂移或被切断半句，避免在没有画面信息的情况下改错源文。
 

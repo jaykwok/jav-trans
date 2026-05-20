@@ -364,6 +364,108 @@ def test_gender_different_long_enough_blocks_do_not_merge():
     assert len(merged) == 2
 
 
+def test_short_overlapping_tail_merges_across_gender_guard():
+    blocks = [
+        {
+            "start": 176.84,
+            "end": 178.493,
+            "ja_text": "アルマリスト 室で イラックス ステイマンを受け",
+            "zh_text": "在芳香蒸汽室接受放松",
+            "gender": "F",
+        },
+        {
+            "start": 178.56,
+            "end": 179.16,
+            "ja_text": "受けて",
+            "zh_text": "接受",
+            "gender": "M",
+        },
+    ]
+
+    merged = subtitle._merge_adjacent_short_blocks(
+        blocks,
+        options=SubtitleOptions(video_fps=29.97),
+    )
+
+    assert len(merged) == 1
+    assert merged[0]["ja_text"] == "アルマリスト 室で イラックス ステイマンを受けて"
+    assert merged[0]["zh_text"] == "在芳香蒸汽室接受放松，接受"
+    assert merged[0]["gender"] is None
+
+
+def test_short_overlapping_tail_merges_compacted_text_without_duplicate():
+    blocks = [
+        {
+            "start": 0.0,
+            "end": 1.0,
+            "ja_text": "受け",
+            "zh_text": "接受",
+            "gender": "F",
+        },
+        {
+            "start": 1.06,
+            "end": 1.5,
+            "ja_text": "受 けて",
+            "zh_text": "接受",
+            "gender": "M",
+        },
+    ]
+
+    merged = subtitle._merge_adjacent_short_blocks(
+        blocks,
+        options=SubtitleOptions(video_fps=29.97),
+    )
+
+    assert len(merged) == 1
+    assert merged[0]["ja_text"] == "受けて"
+
+
+def test_short_tail_without_text_overlap_keeps_gender_guard():
+    blocks = [
+        {"start": 0.0, "end": 1.0, "ja_text": "来て", "zh_text": "过来", "gender": "M"},
+        {"start": 1.06, "end": 1.6, "ja_text": "いや", "zh_text": "不要", "gender": "F"},
+    ]
+
+    merged = subtitle._merge_adjacent_short_blocks(
+        blocks,
+        options=SubtitleOptions(video_fps=29.97),
+    )
+
+    assert len(merged) == 2
+
+
+def test_frame_rate_controls_short_tail_merge_gap():
+    blocks = [
+        {
+            "start": 0.0,
+            "end": 1.0,
+            "ja_text": "受け",
+            "zh_text": "接受",
+            "gender": "F",
+        },
+        {
+            "start": 1.1,
+            "end": 1.9,
+            "ja_text": "受けて",
+            "zh_text": "接受",
+            "gender": "M",
+        },
+    ]
+
+    assert len(
+        subtitle._merge_adjacent_short_blocks(
+            blocks,
+            options=SubtitleOptions(video_fps=24.0),
+        )
+    ) == 1
+    assert len(
+        subtitle._merge_adjacent_short_blocks(
+            blocks,
+            options=SubtitleOptions(video_fps=30.0),
+        )
+    ) == 2
+
+
 def test_gender_different_short_fragment_still_merges():
     blocks = [
         {"start": 0.0, "end": 0.4, "ja_text": "ん", "zh_text": "嗯", "gender": "M"},
