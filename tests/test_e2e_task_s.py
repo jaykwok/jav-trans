@@ -145,11 +145,11 @@ def test_s3_s4_translation_resume_then_auto_cleanup(monkeypatch, tmp_path, capsy
         output_dir,
         temp_root,
         subtitle_mode="zh",
-        translation_batch_size=2,
         translation_max_workers=1,
         keep_temp_files=False,
     )
     monkeypatch.setattr(main.translator_module, "_chat", _fake_translation_json)
+    monkeypatch.setattr(main.translator_module, "_auto_translation_batch_size", lambda *_args: 2)
     _mock_audio_and_asr(monkeypatch, _segments(5), checkpoint=True)
 
     monkeypatch.setenv("_TEST_CRASH_TRANSLATION_BATCH", "2")

@@ -808,7 +808,6 @@ def run_pipeline_for_case(
     output_dir: Path,
     job_temp_root: Path,
     skip_translation: bool,
-    translation_batch_size: int,
     translation_max_workers: int,
     run_log_enabled: bool,
 ) -> dict[str, str]:
@@ -834,7 +833,6 @@ def run_pipeline_for_case(
         skip_translation=skip_translation,
         target_lang="简体中文",
         translation_glossary="",
-        translation_batch_size=translation_batch_size,
         translation_max_workers=translation_max_workers,
         translation_cache_path=str(job_temp_dir / "translation_cache.jsonl"),
         job_id=case.case_id,
@@ -952,7 +950,6 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--limit", type=int, default=0)
     parser.add_argument("--case-contains", default="")
     parser.add_argument("--min-overlap-s", type=float, default=0.10)
-    parser.add_argument("--translation-batch-size", type=int, default=200)
     parser.add_argument("--translation-max-workers", type=int, default=4)
     parser.add_argument("--run-log", action="store_true")
     parser.add_argument("--list", action="store_true", help="Only write manifest and exit.")
@@ -1010,7 +1007,6 @@ def main(argv: list[str] | None = None) -> int:
                 output_dir=output_root,
                 job_temp_root=job_temp_root,
                 skip_translation=args.skip_translation,
-                translation_batch_size=args.translation_batch_size,
                 translation_max_workers=args.translation_max_workers,
                 run_log_enabled=args.run_log,
             )

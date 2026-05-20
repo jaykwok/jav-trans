@@ -4,20 +4,17 @@ import os
 import re
 import sys
 
+from llm.glossary import normalize_glossary_text
 
-PROMPT_VERSION = "v2.6"
+
+PROMPT_VERSION = "v2.7"
 _GENDER_TAG_RE = re.compile(r"^\s*\[(?:M|F)\]\s*")
 _LEADING_SPEAKER_RE = re.compile(
     r"^\s*(?:男|女|男性|女性|男优|女优|スタッフ|撮影者|カメラマン|"
     r"[A-Za-z][A-Za-z ._-]{0,20})\s*[：:]\s*"
 )
 _JSON_OUTPUT_LABEL = "LLM JSON output"
-COMPACT_SYSTEM_PROMPT = os.getenv("COMPACT_SYSTEM_PROMPT", "0").strip().lower() in {
-    "1",
-    "true",
-    "yes",
-    "on",
-}
+COMPACT_SYSTEM_PROMPT = False
 
 
 def _translator_global(name: str, default):
@@ -38,9 +35,11 @@ def _compute_prompt_signature(
     model_name_default = _translator_global("LLM_MODEL_NAME", "")
     model_name = os.getenv("LLM_MODEL_NAME", model_name_default).strip()
     compact = "1" if _translator_global("COMPACT_SYSTEM_PROMPT", COMPACT_SYSTEM_PROMPT) else "0"
+    normalized_glossary = normalize_glossary_text(glossary)
+    normalized_extra_glossary = normalize_glossary_text(extra_glossary)
     payload = (
-        f"{prompt_version}\n{target_lang.strip()}\n{glossary.strip()}\n"
-        f"{extra_glossary.strip()}\n{(character_reference or '').strip()}\n"
+        f"{prompt_version}\n{target_lang.strip()}\n{normalized_glossary}\n"
+        f"{normalized_extra_glossary}\n{(character_reference or '').strip()}\n"
         f"{model_name}\ncompact={compact}"
     )
     return hashlib.sha1(payload.encode("utf-8")).hexdigest()[:12]
@@ -163,13 +162,14 @@ _SYSTEM_PROMPT_FULL = (
     "4. {name_boundary}\n"
     "5. {name_homophone}\n"
     "6. 输入中部分日文前可能带 [M]（男声）或 [F]（女声）声学标签；这些标签只用于理解对话切换、语气和人称。\n"
-    "7. 每条输入必须单独翻译，不能合并、拆分、漏译、调换顺序。\n"
-    "8. 输出尽量短，贴近屏幕阅读节奏；短促呻吟和语气词也要简短自然。\n"
-    "9. 如果一行里大部分是呻吟、喘息、重复语气词，只保留清晰语义核心，重复部分可以压缩；映射参考：あんっ/はあん 译 啊嗯啊，気持ちいい 译 好舒服要爽死了，イッちゃう/イク 译 要去了要射了，避免感觉很舒服即将达到高潮等翻译腔。\n"
-    "10. 结构化 JSON 输出要求 prompt 明确包含 json 字样；最终只输出合法 JSON 对象。\n"
-    '11. 你必须只输出 JSON：{{"translations":[{{"id":0,"text":"..."}}]}}，条数必须严格匹配本次任务要求。\n'
-    "12. 最终 content 不能为空；即使开启思考模式，也必须把完整 JSON 对象写进最终 content。\n"
-    "13. 不要输出 Markdown，不要解释，不要额外字段；思考过程不要写进最终 content。\n\n"
+    "7. 全片上下文只用于翻译连贯、指代判断、口吻一致和术语一致；不要修改、补全或纠正日文原文。\n"
+    "8. 每条输入必须单独翻译，不能合并、拆分、漏译、调换顺序。\n"
+    "9. 输出尽量短，贴近屏幕阅读节奏；短促呻吟和语气词也要简短自然。\n"
+    "10. 如果一行里大部分是呻吟、喘息、重复语气词，只保留清晰语义核心，重复部分可以压缩；映射参考：あんっ/はあん 译 啊嗯啊，気持ちいい 译 好舒服要爽死了，イッちゃう/イク 译 要去了要射了，避免感觉很舒服即将达到高潮等翻译腔。\n"
+    "11. 结构化 JSON 输出要求 prompt 明确包含 json 字样；最终只输出合法 JSON 对象。\n"
+    '12. 你必须只输出 JSON：{{"translations":[{{"id":0,"text":"..."}}]}}，条数必须严格匹配本次任务要求。\n'
+    "13. 最终 content 不能为空；即使开启思考模式，也必须把完整 JSON 对象写进最终 content。\n"
+    "14. 不要输出 Markdown，不要解释，不要额外字段；思考过程不要写进最终 content。\n\n"
     "EXAMPLE JSON OUTPUT:\n"
     '{{"translations":[{{"id":0,"text":"第一句中文翻译"}},{{"id":1,"text":"第二句中文翻译"}}]}}'
 )
@@ -207,15 +207,15 @@ def _build_system_prompt(
         name_boundary=name_guidance["boundary"],
         name_homophone=name_guidance["homophone"],
     )
-    effective_glossary = (glossary or "").strip()
+    effective_glossary = normalize_glossary_text(glossary)
     if effective_glossary:
         prompt += f"\n\n以下词汇表必须严格遵守，不得自行创造译名：\n{effective_glossary}"
-    extra_glossary = (extra_glossary or "").strip()
-    if extra_glossary:
+    effective_extra_glossary = normalize_glossary_text(extra_glossary)
+    if effective_extra_glossary:
         prompt += (
             "\n\n<glossary>\n"
             "本片已确定译法（必须沿用）：\n"
-            f"{extra_glossary}\n"
+            f"{effective_extra_glossary}\n"
             "</glossary>"
         )
     return prompt

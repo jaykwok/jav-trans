@@ -65,7 +65,6 @@ def _patch_pipeline(
         output_dir,
         job_temp_root,
         subtitle_mode="zh",
-        translation_batch_size=2,
         translation_max_workers=1,
         translation_cache_path=cache_path,
         keep_temp_files=True,
@@ -81,6 +80,7 @@ def _patch_pipeline(
     monkeypatch.setattr(main.asr_module, "get_backend_label", lambda: "mock_asr")
 
     monkeypatch.setattr(main.translator_module, "_request_backoff_sleep", lambda *_args: None)
+    monkeypatch.setattr(main.translator_module, "_auto_translation_batch_size", lambda *_args: 2)
 
     def fake_extract_audio(_video_path: str, out_path: str) -> None:
         Path(out_path).parent.mkdir(parents=True, exist_ok=True)

@@ -18,7 +18,6 @@ class JobSpec(BaseModel):
     skip_translation: bool = False
     multi_cue_split: bool = True
     vad_threshold: float = Field(default=0.35, ge=0.0, le=1.0)
-    translation_batch_size: int = Field(default=200, ge=1, le=500)
     asr_context: str = Field(default="", max_length=4000)
     keep_quality_report: bool = False
     translation_max_workers: int = Field(default=4, ge=1, le=8)

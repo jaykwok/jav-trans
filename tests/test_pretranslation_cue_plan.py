@@ -68,7 +68,6 @@ def test_translation_uses_pre_normalized_cues(monkeypatch, tmp_path):
         tmp_path / "out",
         tmp_path / "jobs",
         subtitle_mode="zh",
-        translation_batch_size=10,
         translation_max_workers=1,
         keep_temp_files=True,
     )

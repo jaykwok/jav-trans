@@ -9,7 +9,6 @@ export const TUNING_FIELDS = {
   'r-skip-translation':        false,
   't-multi-cue-split':         true,
   't-vad-threshold':           '0.35',
-  't-translation-batch-size':  '200',
   't-translation-max-workers': '4',
   't-quality-report':          false,
   't-keep-temp':               false,

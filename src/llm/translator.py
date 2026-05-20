@@ -12,6 +12,7 @@ from openai import OpenAI
 
 from core.config import load_config
 from llm import cache as translation_cache
+from llm.glossary import normalize_glossary_text
 from llm import patch as llm_patch
 from llm import prompt as prompt_module
 
@@ -72,52 +73,21 @@ CHARACTER_FULL_NAME_REFERENCE = (
     os.getenv("ASR_CONTEXT", "").strip()
 )
 
-TRANSLATION_MAX_TOKENS = max(0, int(os.getenv("TRANSLATION_MAX_TOKENS", "384000")))
-COMPACT_SYSTEM_PROMPT = os.getenv("COMPACT_SYSTEM_PROMPT", "0").strip().lower() in {
-    "1",
-    "true",
-    "yes",
-    "on",
-}
-TRANSLATION_API_RETRIES = max(1, int(os.getenv("TRANSLATION_API_RETRIES", "4")))
-TRANSLATION_BATCH_REPAIR_RETRIES = max(
-    1,
-    int(os.getenv("TRANSLATION_BATCH_REPAIR_RETRIES", "2")),
-)
-TRANSLATION_API_BACKOFF_BASE_S = max(
-    0.1,
-    float(os.getenv("TRANSLATION_API_BACKOFF_BASE_S", "1.5")),
-)
-TRANSLATION_API_BACKOFF_MAX_S = max(
-    TRANSLATION_API_BACKOFF_BASE_S,
-    float(os.getenv("TRANSLATION_API_BACKOFF_MAX_S", "20")),
-)
-TRANSLATION_PREFIX_WARMUP = os.getenv(
-    "TRANSLATION_PREFIX_WARMUP", "1"
-).strip().lower() in {"1", "true", "yes", "on"}
-TRANSLATION_FULL_JSON_PREFIX_MAX_CHARS = max(
-    0,
-    int(os.getenv("TRANSLATION_FULL_JSON_PREFIX_MAX_CHARS", "180000")),
-)
-TRANSLATION_REPAIR_ENABLED = os.getenv(
-    "TRANSLATION_REPAIR_ENABLED", "1"
-).strip().lower() in {"1", "true", "yes", "on"}
-TRANSLATION_REPAIR_MAX_IDS = max(
-    0,
-    int(os.getenv("TRANSLATION_REPAIR_MAX_IDS", "12")),
-)
-TRANSLATION_REPAIR_CONTEXT_RADIUS = max(
-    1,
-    int(os.getenv("TRANSLATION_REPAIR_CONTEXT_RADIUS", "1")),
-)
-TRANSLATION_REPAIR_LENGTH_RATIO_MIN = max(
-    0.0,
-    float(os.getenv("TRANSLATION_REPAIR_LENGTH_RATIO_MIN", "0.25")),
-)
-TRANSLATION_REPAIR_LENGTH_RATIO_MAX = max(
-    TRANSLATION_REPAIR_LENGTH_RATIO_MIN,
-    float(os.getenv("TRANSLATION_REPAIR_LENGTH_RATIO_MAX", "4.0")),
-)
+DEFAULT_TARGET_LANG = "简体中文"
+TRANSLATION_MAX_TOKENS = 384000
+TRANSLATION_TEMPERATURE = 0.2
+TRANSLATION_TOP_P = 0.9
+COMPACT_SYSTEM_PROMPT = False
+TRANSLATION_API_RETRIES = 4
+TRANSLATION_BATCH_REPAIR_RETRIES = 2
+TRANSLATION_API_BACKOFF_BASE_S = 1.5
+TRANSLATION_API_BACKOFF_MAX_S = 20.0
+TRANSLATION_PREFIX_WARMUP = True
+TRANSLATION_FULL_JSON_PREFIX_MAX_CHARS = 180000
+TRANSLATION_REPAIR_MAX_IDS = 12
+TRANSLATION_REPAIR_CONTEXT_RADIUS = 1
+TRANSLATION_REPAIR_LENGTH_RATIO_MIN = 0.25
+TRANSLATION_REPAIR_LENGTH_RATIO_MAX = 4.0
 
 def _normalize_llm_api_format(value: str | None, fallback: str = "chat") -> str:
     normalized = (value or fallback or "chat").strip().lower()
@@ -302,15 +272,16 @@ def _format_global_glossary_terms(
 ) -> str:
     lines = []
     seen: set[str] = set()
+    normalized_glossary = normalize_glossary_text(glossary)
     for item in terms:
         ja = str(item.get("ja", "")).strip()
         zh = str(item.get("zh", "")).strip()
         if not ja or not zh or ja in seen:
             continue
-        if glossary and ja in glossary:
+        if normalized_glossary and ja in normalized_glossary:
             continue
         seen.add(ja)
-        lines.append(f"{ja} \u2192 {zh}")
+        lines.append(f"{ja}-{zh}")
     return "\n".join(lines)
 
 
@@ -392,12 +363,8 @@ def _safe_float(value, default: float = 0.0) -> float:
 
 def generate_global_context(
     segments: list[dict],
-    current_index: int | None = None,
-    batch_size: int = 0,
     max_chars: int | None = None,
 ) -> str:
-    del current_index, batch_size
-
     lines = []
     for idx, seg in enumerate(segments):
         text = _normalize_source_text(seg.get("text", ""))
@@ -415,7 +382,6 @@ def generate_global_context(
 
 def translate_segments(
     segments: list[dict],
-    batch_size: int = 100,
     global_context: str | None = None,
     max_workers: int = 1,
     cache_path: str = "",
@@ -432,11 +398,14 @@ def translate_segments(
     if not segments:
         return [], [], []
 
-    effective_batch_size = max(0, int(batch_size))
     effective_max_workers = max(1, int(max_workers))
+    effective_batch_size = _auto_translation_batch_size(
+        len(segments),
+        effective_max_workers,
+    )
     effective_cache_path = cache_path or ""
-    effective_target_lang = (target_lang or "简体中文").strip() or "简体中文"
-    effective_glossary = (glossary or "").strip()
+    effective_target_lang = (target_lang or DEFAULT_TARGET_LANG).strip() or DEFAULT_TARGET_LANG
+    effective_glossary = normalize_glossary_text(glossary)
     effective_character_reference = (
         CHARACTER_FULL_NAME_REFERENCE
         if character_reference is None
@@ -1111,7 +1080,7 @@ def _apply_translation_repair_pass(
 ) -> tuple[list[str], dict | None]:
     _raise_if_cancelled(cancel_event)
     repair_ids, reasons = _select_translation_repair_ids(segments, zh_texts)
-    if not TRANSLATION_REPAIR_ENABLED or not repair_ids:
+    if not repair_ids:
         return zh_texts, None
 
     if TRANSLATION_REPAIR_MAX_IDS <= 0:
@@ -1351,6 +1320,18 @@ def _split_into_batches(segments: list[dict], batch_size: int) -> list[list[dict
     if batch_size <= 0:
         return [segments]
     return [segments[index : index + batch_size] for index in range(0, len(segments), batch_size)]
+
+
+def _auto_translation_batch_size(segment_count: int, max_workers: int) -> int:
+    count = max(0, int(segment_count))
+    if count <= 0:
+        return 0
+    workers = max(1, int(max_workers))
+    context_window_cues = 25
+    context_overlap_cues = 10
+    stride_cues = max(1, context_window_cues - context_overlap_cues)
+    batch_size = context_window_cues + stride_cues * workers * 3
+    return min(count, max(context_window_cues, min(200, batch_size)))
 
 
 _serialize_segments = prompt_module._serialize_segments
@@ -1886,6 +1867,8 @@ def _chat_completions(
         ),
         "extra_body": {"thinking": {"type": "enabled"}},
         "stream_options": {"include_usage": True},
+        "temperature": TRANSLATION_TEMPERATURE,
+        "top_p": TRANSLATION_TOP_P,
     }
     if TRANSLATION_MAX_TOKENS > 0:
         request["max_tokens"] = TRANSLATION_MAX_TOKENS
@@ -1993,6 +1976,8 @@ def _chat_responses(
             model_name=model_name,
             max_tokens=TRANSLATION_MAX_TOKENS,
             reasoning_effort=effective_reasoning_effort,
+            temperature=TRANSLATION_TEMPERATURE,
+            top_p=TRANSLATION_TOP_P,
         )
     else:
         request = {
@@ -2003,6 +1988,8 @@ def _chat_responses(
                 "effort": effective_reasoning_effort
             },
             "text": {"format": {"type": "json_object"}},
+            "temperature": TRANSLATION_TEMPERATURE,
+            "top_p": TRANSLATION_TOP_P,
         }
         if TRANSLATION_MAX_TOKENS > 0:
             request["max_output_tokens"] = TRANSLATION_MAX_TOKENS

@@ -47,6 +47,16 @@ def test_split_into_batches():
     assert len(translator._split_into_batches(_segments(450), 200)) == 3
 
 
+def test_auto_translation_batch_size_uses_window_overlap_and_workers():
+    assert translator._auto_translation_batch_size(0, 4) == 0
+    assert translator._auto_translation_batch_size(10, 4) == 10
+    assert translator._auto_translation_batch_size(100, 1) == 70
+    assert translator._auto_translation_batch_size(100, 4) == 100
+    assert translator._auto_translation_batch_size(450, 1) == 70
+    assert translator._auto_translation_batch_size(450, 4) == 200
+    assert translator._auto_translation_batch_size(5000, 8) == 200
+
+
 def test_translate_segments_single_request_when_below_threshold(monkeypatch):
     calls: list[int] = []
 
@@ -57,19 +67,18 @@ def test_translate_segments_single_request_when_below_threshold(monkeypatch):
     monkeypatch.setattr(translator, "_chat", fake_chat)
 
     zh_texts, timings, retry_events = translator.translate_segments(
-        _segments(100),
-        batch_size=200,
+        _segments(60),
         max_workers=1,
         cache_path="",
         target_lang="简体中文",
         glossary="",
     )
 
-    assert calls == [100]
+    assert calls == [60]
     assert retry_events == []
-    assert len(zh_texts) == 100
+    assert len(zh_texts) == 60
     assert zh_texts[0] == "zh-0"
-    assert zh_texts[-1] == "zh-99"
+    assert zh_texts[-1] == "zh-59"
     assert timings[0]["mode"] == "single_request_full_context"
 
 
@@ -85,7 +94,6 @@ def test_translate_segments_uses_task_character_reference(monkeypatch):
 
     translator.translate_segments(
         _segments(1),
-        batch_size=10,
         max_workers=1,
         cache_path="",
         target_lang="简体中文",
@@ -155,10 +163,10 @@ def test_translate_segments_batched(monkeypatch):
         return _mock_json(start, expected_count)
 
     monkeypatch.setattr(translator, "_chat_with_reasoning", fake_chat)
+    monkeypatch.setattr(translator, "_auto_translation_batch_size", lambda *_args: 200)
 
     zh_texts, timings, retry_events = translator.translate_segments(
         _segments(450),
-        batch_size=200,
         max_workers=3,
         cache_path="",
         target_lang="简体中文",
@@ -197,10 +205,10 @@ def test_batched_translation_emits_worker_timeline_diagnostics(monkeypatch):
         )
 
     monkeypatch.setattr(translator, "_chat_with_reasoning", fake_chat)
+    monkeypatch.setattr(translator, "_auto_translation_batch_size", lambda *_args: 2)
 
     zh_texts, timings, retry_events = translator.translate_segments(
         _segments(4),
-        batch_size=2,
         max_workers=2,
         cache_path="",
         target_lang="简体中文",
@@ -268,7 +276,6 @@ def test_translate_segments_uses_task_api_format(monkeypatch):
 
     zh_texts, timings, retry_events = translator.translate_segments(
         _segments(1),
-        batch_size=10,
         max_workers=1,
         cache_path="",
         target_lang="簡体中文",
@@ -326,10 +333,10 @@ def test_batch_retry_isolation(monkeypatch):
     monkeypatch.setattr(translator, "TRANSLATION_API_RETRIES", 2)
     monkeypatch.setattr(translator, "_request_backoff_sleep", lambda attempt, exc, **_kw: None)
     monkeypatch.setattr(translator, "_chat", fake_chat)
+    monkeypatch.setattr(translator, "_auto_translation_batch_size", lambda *_args: 200)
 
     zh_texts, _timings, retry_events = translator.translate_segments(
         _segments(450),
-        batch_size=200,
         max_workers=3,
         cache_path="",
         target_lang="简体中文",
@@ -374,10 +381,10 @@ def test_batch_retry_only_requests_missing_ids(monkeypatch):
     monkeypatch.setattr(translator, "TRANSLATION_API_RETRIES", 2)
     monkeypatch.setattr(translator, "_request_backoff_sleep", lambda attempt, exc, **_kw: None)
     monkeypatch.setattr(translator, "_chat_with_reasoning", fake_chat)
+    monkeypatch.setattr(translator, "_auto_translation_batch_size", lambda *_args: 5)
 
     zh_texts, timings, retry_events = translator.translate_segments(
         _segments(6),
-        batch_size=5,
         max_workers=1,
         cache_path="",
         target_lang="简体中文",
@@ -422,10 +429,10 @@ def test_batch_retry_gets_fresh_budget_after_missing_set_shrinks(monkeypatch):
     monkeypatch.setattr(translator, "TRANSLATION_BATCH_REPAIR_RETRIES", 2)
     monkeypatch.setattr(translator, "_request_backoff_sleep", lambda attempt, exc, **_kw: None)
     monkeypatch.setattr(translator, "_chat_with_reasoning", fake_chat)
+    monkeypatch.setattr(translator, "_auto_translation_batch_size", lambda *_args: 4)
 
     zh_texts, timings, retry_events = translator.translate_segments(
         _segments(5),
-        batch_size=4,
         max_workers=1,
         cache_path="",
         target_lang="简体中文",
@@ -469,10 +476,10 @@ def test_batched_translation_uses_stable_full_json_prefix_and_requested_ids(monk
         )
 
     monkeypatch.setattr(translator, "_chat_with_reasoning", fake_chat)
+    monkeypatch.setattr(translator, "_auto_translation_batch_size", lambda *_args: 3)
 
     zh_texts, timings, retry_events = translator.translate_segments(
         _segments(6),
-        batch_size=3,
         max_workers=1,
         cache_path="",
         target_lang="简体中文",
@@ -511,10 +518,10 @@ def test_batch_warmup_runs_before_pending_batches(monkeypatch):
         )
 
     monkeypatch.setattr(translator, "_chat_with_reasoning", fake_chat)
+    monkeypatch.setattr(translator, "_auto_translation_batch_size", lambda *_args: 2)
 
     zh_texts, timings, retry_events = translator.translate_segments(
         _segments(4),
-        batch_size=2,
         max_workers=1,
         cache_path="",
         target_lang="简体中文",
@@ -565,10 +572,10 @@ def test_translation_repair_pass_does_not_fix_asr_fragments(monkeypatch):
         )
 
     monkeypatch.setattr(translator, "_chat_with_reasoning", fake_chat)
+    monkeypatch.setattr(translator, "_auto_translation_batch_size", lambda *_args: 2)
 
     zh_texts, timings, retry_events = translator.translate_segments(
         segments,
-        batch_size=2,
         max_workers=1,
         cache_path="",
         target_lang="简体中文",
@@ -617,10 +624,10 @@ def test_translation_repair_pass_does_not_fix_term_drift(monkeypatch):
         )
 
     monkeypatch.setattr(translator, "_chat_with_reasoning", fake_chat)
+    monkeypatch.setattr(translator, "_auto_translation_batch_size", lambda *_args: 1)
 
     zh_texts, timings, retry_events = translator.translate_segments(
         segments,
-        batch_size=1,
         max_workers=1,
         cache_path="",
         target_lang="简体中文",

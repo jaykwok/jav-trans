@@ -65,7 +65,6 @@ class JobContext:
     skip_translation: bool
     target_lang: str
     translation_glossary: str
-    translation_batch_size: int
     translation_max_workers: int
     translation_cache_path: str
     job_id: str
@@ -117,7 +116,6 @@ class JobContext:
                 "translation_glossary",
                 allow_empty_spec=True,
             ),
-            translation_batch_size=int(getattr(spec, "translation_batch_size", 200)),
             translation_max_workers=max(1, int(getattr(spec, "translation_max_workers", 4))),
             translation_cache_path=str(cache_path or ""),
             job_id=str(job_id or ""),

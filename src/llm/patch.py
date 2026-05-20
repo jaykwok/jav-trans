@@ -49,9 +49,11 @@ def build_micu_grok_responses_request(
     model_name: str,
     max_tokens: int,
     reasoning_effort: str,
+    temperature: float | None = None,
+    top_p: float | None = None,
 ) -> dict:
     effort = _normalize_reasoning_effort(reasoning_effort)
-    return {
+    request = {
         "model": model_name,
         "input": build_micu_grok_responses_input(messages),
         "stream": True,
@@ -59,6 +61,11 @@ def build_micu_grok_responses_request(
         "include_reasoning": True,
         "max_tokens": max(16000, max_tokens or 0),
     }
+    if temperature is not None:
+        request["temperature"] = temperature
+    if top_p is not None:
+        request["top_p"] = top_p
+    return request
 
 
 def _responses_endpoint_url(base_url: str) -> str:
@@ -69,12 +76,7 @@ def _responses_endpoint_url(base_url: str) -> str:
 
 
 def _stream_read_timeout_s() -> float:
-    raw = os.getenv("TRANSLATION_STREAM_READ_TIMEOUT_S", "120").strip()
-    try:
-        value = float(raw)
-    except (TypeError, ValueError):
-        return 120.0
-    return max(1.0, value)
+    return 120.0
 
 
 def _parse_sse_json_event(event_type: str, data_lines: list[str]) -> dict | None:

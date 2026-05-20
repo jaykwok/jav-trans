@@ -2,32 +2,17 @@ from __future__ import annotations
 
 import json
 import os
-import re
 from pathlib import Path
 from typing import Callable
 
 from rich.console import Console
 
+from llm.glossary import parse_glossary_pairs
 from subtitles.qc import compute_quality_report
 
 
 def parse_glossary_pairs_from_text(text: str) -> list[tuple[str, str]]:
-    pairs: list[tuple[str, str]] = []
-    for part in re.split(r"[,，\n]+", text or ""):
-        item = part.strip()
-        if not item:
-            continue
-        if "→" in item:
-            ja, zh = item.split("→", 1)
-        elif "->" in item:
-            ja, zh = item.split("->", 1)
-        else:
-            continue
-        ja = ja.strip()
-        zh = zh.strip()
-        if ja and zh:
-            pairs.append((ja, zh))
-    return pairs
+    return parse_glossary_pairs(text)
 
 
 def load_global_glossary_pairs(

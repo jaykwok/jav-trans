@@ -112,7 +112,7 @@ async def _test_config_lists_recommended_asr_backend_first(monkeypatch):
     assert payload["defaults"]["asr_backend"] == config_routes.RECOMMENDED_ASR_BACKEND
     assert payload["recommended_asr_backend"] == config_routes.RECOMMENDED_ASR_BACKEND
     assert payload["engine_defaults"]["asr_backend"] == "whisper-ja-anime-v0.3"
-    assert payload["defaults"]["translation_batch_size"] == 200
+    assert "translation_batch_size" not in payload["defaults"]
     assert payload["defaults"]["translation_max_workers"] == 4
     assert "show_gender" not in payload["defaults"]
     assert set(payload["backends"]) == set(config_routes.BACKENDS)
@@ -309,7 +309,6 @@ async def _test_jobs_api_rejects_invalid_job_spec(tmp_path, monkeypatch):
             invalid_payloads = [
                 {"video_paths": []},
                 {"video_paths": ["sample.mp4"], "vad_threshold": 1.5},
-                {"video_paths": ["sample.mp4"], "translation_batch_size": 0},
                 {"video_paths": ["sample.mp4"], "translation_max_workers": 99},
             ]
             for payload in invalid_payloads:
@@ -324,7 +323,7 @@ async def _test_jobs_api_rejects_invalid_job_spec(tmp_path, monkeypatch):
 async def _test_jobs_snapshot_saved_translation_settings(tmp_path, monkeypatch):
     monkeypatch.setattr(pm, "_jobs_path", tmp_path / "jobs.json")
     monkeypatch.setenv("ASR_CONTEXT", "小那海")
-    monkeypatch.setenv("TRANSLATION_GLOSSARY", "ねこ→猫")
+    monkeypatch.setenv("TRANSLATION_GLOSSARY", "ねこ-猫")
     monkeypatch.setenv("TARGET_LANG", "繁體中文")
     monkeypatch.setenv("LLM_API_FORMAT", "responses")
     monkeypatch.setenv("LLM_REASONING_EFFORT", "medium")
@@ -348,7 +347,7 @@ async def _test_jobs_snapshot_saved_translation_settings(tmp_path, monkeypatch):
             spec = response.json()["spec"]
 
         assert spec["asr_context"] == "小那海"
-        assert spec["translation_glossary"] == "ねこ→猫"
+        assert spec["translation_glossary"] == "ねこ-猫"
         assert spec["target_lang"] == "繁體中文"
         assert spec["llm_api_format"] == "responses"
         assert spec["llm_reasoning_effort"] == "medium"

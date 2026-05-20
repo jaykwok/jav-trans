@@ -41,7 +41,6 @@ export async function loadConfig() {
 
     const d = cfg.defaults ?? {};
     if (d.vad_threshold             != null) $('t-vad-threshold').value           = d.vad_threshold;
-    if (d.translation_batch_size    != null) $('t-translation-batch-size').value  = d.translation_batch_size;
     if (d.translation_max_workers   != null) $('t-translation-max-workers').value = d.translation_max_workers;
     if (d.multi_cue_split           != null) $('t-multi-cue-split').checked       = !!d.multi_cue_split;
     if (d.skip_translation          != null) $('r-skip-translation').checked      = !!d.skip_translation;
@@ -92,12 +91,21 @@ export async function loadSettings() {
 }
 
 export function readTranslationSettingsFromForm() {
+  const normalizeGlossaryLine = line => {
+    const trimmed = line.trim();
+    if (!trimmed || trimmed.includes('→') || trimmed.includes('->') || !trimmed.includes('-')) return '';
+    const [source, ...rest] = trimmed.split('-');
+    const target = rest.join('-').trim();
+    const normalizedSource = source.trim();
+    return normalizedSource && target ? `${normalizedSource}-${target}` : '';
+  };
+
   return {
     llm_reasoning_effort: $('api-reasoning-effort').value || 'xhigh',
     llm_api_format:       $('api-format').value || 'chat',
     target_lang:          $('api-target-lang').value || '简体中文',
     translation_glossary: ($('api-glossary').value || '')
-      .split('\n').map(t => t.trim()).filter(Boolean).join(', '),
+      .split('\n').map(normalizeGlossaryLine).filter(Boolean).join(', '),
   };
 }
 
