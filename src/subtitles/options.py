@@ -34,7 +34,6 @@ class SubtitleOptions:
     line_max_chars: int = 25
     merge_adjacent: bool = True
     show_speaker: bool = False
-    show_gender: bool = False
     video_fps: float = FALLBACK_VIDEO_FPS
 
     @property
@@ -96,7 +95,6 @@ class SubtitleOptions:
             line_max_chars=max(0, int(os.getenv("SRT_LINE_MAX_CHARS", "25"))),
             merge_adjacent=_env_bool("SUBTITLE_MERGE_ADJACENT", True),
             show_speaker=_env_bool("SUBTITLE_SHOW_SPEAKER", False),
-            show_gender=_env_bool("SUBTITLE_SHOW_GENDER", False),
         )
 
     def signature(self) -> dict:

@@ -488,21 +488,8 @@ def test_gender_none_does_not_block_merge():
     assert len(merged) == 1
 
 
-def test_write_srt_can_show_gender_prefix(monkeypatch, tmp_path):
-    monkeypatch.setenv("SUBTITLE_SHOW_GENDER", "1")
-    path = tmp_path / "gender_on.srt"
-
-    subtitle.write_srt(
-        [{"start": 0.0, "end": 1.0, "zh_text": "过来", "gender": "M"}],
-        str(path),
-    )
-
-    assert "[M] 过来" in path.read_text(encoding="utf-8")
-
-
-def test_write_srt_hides_gender_prefix_by_default(monkeypatch, tmp_path):
-    monkeypatch.setenv("SUBTITLE_SHOW_GENDER", "0")
-    path = tmp_path / "gender_off.srt"
+def test_write_srt_never_shows_gender_prefix(tmp_path):
+    path = tmp_path / "gender_never.srt"
 
     subtitle.write_srt(
         [{"start": 0.0, "end": 1.0, "zh_text": "过来", "gender": "M"}],
@@ -510,5 +497,19 @@ def test_write_srt_hides_gender_prefix_by_default(monkeypatch, tmp_path):
     )
 
     content = path.read_text(encoding="utf-8")
+    assert "[M]" not in content
+    assert "过来" in content
+
+
+def test_write_bilingual_srt_never_shows_gender_prefix(tmp_path):
+    path = tmp_path / "gender_bilingual.srt"
+
+    subtitle.write_bilingual_srt(
+        [{"start": 0.0, "end": 1.0, "ja_text": "来て", "zh_text": "过来", "gender": "F"}],
+        str(path),
+    )
+
+    content = path.read_text(encoding="utf-8")
+    assert "[F]" not in content
     assert "[M]" not in content
     assert "过来" in content

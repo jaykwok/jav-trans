@@ -142,11 +142,33 @@ def _translation_cache_key(
     model_name: str,
     compact_system_prompt: bool,
 ) -> str:
-    source_text = "|".join(
-        str(seg.get("ja_text") or seg.get("text") or seg.get("ja") or "")
-        for seg in batch_segments
-    )
-    source_sig = hashlib.sha1(source_text.encode("utf-8")).hexdigest()[:8]
+    source_payload = []
+    for seg in batch_segments:
+        try:
+            start = float(seg.get("start", 0.0))
+        except (TypeError, ValueError):
+            start = 0.0
+        try:
+            end = float(seg.get("end", start))
+        except (TypeError, ValueError):
+            end = start
+        source_payload.append(
+            {
+                "start": round(start, 3),
+                "end": round(end, 3),
+                "duration_sec": round(max(0.0, end - start), 3),
+                "gender": seg.get("gender"),
+                "ja": str(seg.get("ja_text") or seg.get("text") or seg.get("ja") or ""),
+            }
+        )
+    source_sig = hashlib.sha1(
+        json.dumps(
+            source_payload,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()[:12]
     prompt_sig = _compute_prompt_signature(
         extra_glossary,
         glossary=glossary,

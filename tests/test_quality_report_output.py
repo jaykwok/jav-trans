@@ -68,9 +68,12 @@ def test_quality_report_enabled_writes_to_project_reports(monkeypatch, tmp_path)
         video_duration_s=60.0,
     )
 
-    expected = report_dir / "sample.quality_report.json"
+    expected = report_dir / "sample.quality_report.md"
+    json_sidecar = report_dir / "sample.quality_report.json"
     assert path == str(expected)
-    payload = json.loads(expected.read_text(encoding="utf-8"))
+    assert expected.exists()
+    assert "Quality Report: sample" in expected.read_text(encoding="utf-8")
+    payload = json.loads(json_sidecar.read_text(encoding="utf-8"))
     assert payload["per_min_subtitle_count"] == 1.0
     assert "warnings" in payload
 
@@ -91,4 +94,5 @@ def test_quality_report_relative_dir_resolves_from_project_root(monkeypatch, tmp
         video_duration_s=60.0,
     )
 
-    assert Path(path) == tmp_path / "reports" / "relative.quality_report.json"
+    assert Path(path) == tmp_path / "reports" / "relative.quality_report.md"
+    assert (tmp_path / "reports" / "relative.quality_report.json").exists()

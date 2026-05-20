@@ -60,7 +60,6 @@ class JobContext:
     asr_backend: str
     asr_context: str
     subtitle_mode: str
-    show_gender: bool
     multi_cue_split: bool
     vad_threshold: float
     skip_translation: bool
@@ -101,7 +100,6 @@ class JobContext:
             ),
             asr_context=str(getattr(spec, "asr_context", "") or ""),
             subtitle_mode=str(getattr(spec, "subtitle_mode", "bilingual") or "bilingual"),
-            show_gender=bool(getattr(spec, "show_gender", True)),
             multi_cue_split=bool(getattr(spec, "multi_cue_split", True)),
             vad_threshold=float(getattr(spec, "vad_threshold", 0.35)),
             skip_translation=bool(getattr(spec, "skip_translation", False)),

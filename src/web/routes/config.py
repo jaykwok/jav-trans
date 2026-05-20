@@ -122,7 +122,6 @@ async def get_config() -> dict[str, Any]:
             "asr_backend": DEFAULT_JOB_DEFAULTS["asr_backend"],
             "subtitle_mode": DEFAULT_JOB_DEFAULTS["subtitle_mode"],
             "skip_translation": DEFAULT_JOB_DEFAULTS["skip_translation"],
-            "show_gender": DEFAULT_JOB_DEFAULTS["show_gender"],
             "multi_cue_split": DEFAULT_JOB_DEFAULTS["multi_cue_split"],
             "vad_threshold": DEFAULT_JOB_DEFAULTS["vad_threshold"],
             "translation_batch_size": DEFAULT_JOB_DEFAULTS["translation_batch_size"],

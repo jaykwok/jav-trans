@@ -132,8 +132,6 @@ def _ctx_flag(ctx: JobContext, name: str, default: bool = False) -> bool:
         return raw.strip().lower() in {"1", "true", "yes", "on"}
     if name == "SKIP_TRANSLATION":
         return ctx.skip_translation
-    if name == "SUBTITLE_SHOW_GENDER":
-        return ctx.show_gender
     if name == "MULTI_CUE_SPLIT_ENABLED":
         return ctx.multi_cue_split
     if name == "QUALITY_REPORT_ENABLED":
@@ -243,18 +241,15 @@ _SUBTITLE_OPTION_KEYS = {
     "SRT_LINE_MAX_CHARS",
     "SUBTITLE_MERGE_ADJACENT",
     "SUBTITLE_SHOW_SPEAKER",
-    "SUBTITLE_SHOW_GENDER",
 }
 
 
 def _subtitle_env_overrides(ctx: JobContext) -> dict[str, str]:
-    overrides = {
+    return {
         str(key).strip(): str(value)
         for key, value in (ctx.advanced or {}).items()
         if str(key).strip() in _SUBTITLE_OPTION_KEYS
     }
-    overrides.setdefault("SUBTITLE_SHOW_GENDER", "1" if ctx.show_gender else "0")
-    return overrides
 
 
 def _subtitle_options_for_ctx(ctx: JobContext):
