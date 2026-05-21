@@ -161,7 +161,7 @@ hiddenimports += collect_submodules("transformers.models.qwen2")
 hiddenimports += collect_submodules("transformers.models.qwen3")
 
 a = Analysis(
-    [str(ROOT / "run_web.py")],
+    [str(ROOT / "launcher.py")],
     pathex=[str(ROOT / "src"), str(NAGISA_PACKAGE_DIR)],
     binaries=binaries,
     datas=datas,

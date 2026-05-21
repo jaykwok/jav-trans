@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 from pathlib import Path
 from typing import Any, get_args
@@ -108,6 +109,42 @@ def _normalize_llm_reasoning_effort(value: str) -> str:
     return normalized if normalized in {"medium", "xhigh"} else "xhigh"
 
 
+def _strip_llm_endpoint_path(base_url: str) -> str:
+    normalized = (base_url or "").strip().rstrip("/")
+    lower = normalized.lower()
+    for suffix in ("/chat/completions", "/responses", "/completions"):
+        if lower.endswith(suffix):
+            return normalized[: -len(suffix)].rstrip("/")
+    return normalized
+
+
+def _model_endpoint_candidates(base_url: str) -> list[str]:
+    normalized = _strip_llm_endpoint_path(base_url)
+    if not normalized:
+        return []
+    if normalized.lower().endswith("/models"):
+        return [normalized]
+
+    candidates = [f"{normalized}/models"]
+    if not normalized.lower().endswith("/v1"):
+        candidates.append(f"{normalized}/v1/models")
+
+    deduped: list[str] = []
+    for candidate in candidates:
+        if candidate not in deduped:
+            deduped.append(candidate)
+    return deduped
+
+
+def _extract_model_ids(payload: Any) -> list[str]:
+    data = payload.get("data", []) if isinstance(payload, dict) else []
+    return sorted(
+        str(item["id"])
+        for item in data
+        if isinstance(item, dict) and item.get("id")
+    )
+
+
 @router.get("/config")
 async def get_config() -> dict[str, Any]:
     load_config()
@@ -198,31 +235,48 @@ async def post_settings(update: SettingsUpdate) -> dict:
 @router.get("/models")
 async def get_models() -> dict[str, list[str]]:
     api_key = _runtime_or_env_value("API_KEY")
-    base_url = _runtime_or_env_value("OPENAI_COMPATIBILITY_BASE_URL").rstrip("/")
+    base_url = _runtime_or_env_value("OPENAI_COMPATIBILITY_BASE_URL")
     if not api_key or not base_url:
         raise HTTPException(
             status_code=400,
             detail="API_KEY and OPENAI_COMPATIBILITY_BASE_URL are required",
         )
 
-    try:
-        async with httpx.AsyncClient(timeout=20.0) as client:
-            response = await client.get(
-                f"{base_url}/models",
-                headers={"Authorization": f"Bearer {api_key}"},
-            )
-            response.raise_for_status()
-            payload = response.json()
-    except Exception as exc:
-        raise HTTPException(status_code=502, detail=str(exc)) from exc
+    errors: list[str] = []
+    async with httpx.AsyncClient(timeout=20.0, follow_redirects=True) as client:
+        for url in _model_endpoint_candidates(base_url):
+            try:
+                response = await client.get(
+                    url,
+                    headers={"Authorization": f"Bearer {api_key}"},
+                )
+            except httpx.HTTPError as exc:
+                errors.append(f"{url}: {exc}")
+                continue
 
-    try:
-        data = payload.get("data", [])
-        models = sorted(
-            str(item["id"])
-            for item in data
-            if isinstance(item, dict) and item.get("id")
-        )
-    except Exception as exc:
-        raise HTTPException(status_code=502, detail=f"Invalid models response: {exc}") from exc
-    return {"models": models}
+            content_type = response.headers.get("content-type", "")
+            if response.status_code >= 400:
+                errors.append(
+                    f"{url}: HTTP {response.status_code}"
+                    + (f" ({content_type})" if content_type else "")
+                )
+                continue
+
+            try:
+                payload = response.json()
+            except json.JSONDecodeError:
+                errors.append(
+                    f"{url}: HTTP {response.status_code} returned non-JSON"
+                    + (f" ({content_type})" if content_type else "")
+                )
+                continue
+
+            models = _extract_model_ids(payload)
+            if models:
+                return {"models": models}
+            errors.append(f"{url}: JSON response did not contain data[].id")
+
+    detail = "Failed to fetch models"
+    if errors:
+        detail += ": " + "; ".join(errors)
+    raise HTTPException(status_code=502, detail=detail)
