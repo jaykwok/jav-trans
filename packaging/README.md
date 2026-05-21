@@ -1,6 +1,7 @@
 # Windows release packaging
 
-Build from the repository root with the project virtual environment:
+Build from the repository root after creating the project virtual environment
+with `uv venv` and installing dependencies:
 
 ```powershell
 .\packaging\build_windows.ps1 -Clean
@@ -9,7 +10,7 @@ Build from the repository root with the project virtual environment:
 The build creates `dist/JAVTrans/JAVTrans.exe` as an onedir PyInstaller package.
 It bundles:
 
-- the Python runtime and installed Python dependencies from `.venv`
+- the Python runtime and installed Python dependencies from the active uv-managed environment
 - `ffmpeg.exe` and `ffprobe.exe` from `PATH`, or from `-FfmpegExe` / `-FfprobeExe`
 - `icon.ico` for the executable and pywebview window
 - `icon.png` / `icon.ico` for the in-app header and favicon

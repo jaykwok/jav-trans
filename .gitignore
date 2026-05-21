@@ -17,6 +17,7 @@ __pycache__/
 agents/
 log/
 reports/
+subtitle_qc/output/
 
 # Project temp/cache root. Keep the directory placeholder if present.
 temp/*
