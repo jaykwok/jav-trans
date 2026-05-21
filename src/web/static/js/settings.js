@@ -179,13 +179,13 @@ export function installSettingsPanel() {
     btn.textContent = '获取中…';
     btn.disabled = true;
     try {
+      try {
+        await saveSettingsBody(buildSettingsBodyFromForm({ includeConnection: true }));
+      } catch (e) {
+        alert('保存 API 设置失败：' + e.message);
+        return;
+      }
       if (apiKeyInput) {
-        try {
-          await saveSettingsBody(buildSettingsBodyFromForm({ includeConnection: true }));
-        } catch (e) {
-          alert('保存 API Key 失败：' + e.message);
-          return;
-        }
         await loadSettings();
       }
 
