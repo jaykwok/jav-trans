@@ -89,7 +89,7 @@ HF_ENDPOINT=https://hf-mirror.com
 启动网页控制台：
 
 ```powershell
-uv run --no-sync python run_web.py
+uv run --no-sync python launcher.py
 ```
 
 默认地址为 `http://127.0.0.1:17321`。页面中选择视频、确认翻译和输出设置，然后提交任务即可。

@@ -63,6 +63,10 @@ def test_settings_asr_context_updates_runtime_env(monkeypatch):
     asyncio.run(_test_settings_asr_context_updates_runtime_env(monkeypatch))
 
 
+def test_models_api_falls_back_to_v1_models(monkeypatch):
+    asyncio.run(_test_models_api_falls_back_to_v1_models(monkeypatch))
+
+
 def test_jobs_snapshot_saved_translation_settings(tmp_path, monkeypatch):
     asyncio.run(_test_jobs_snapshot_saved_translation_settings(tmp_path, monkeypatch))
 
@@ -244,6 +248,54 @@ async def _test_settings_asr_context_updates_runtime_env(monkeypatch):
     assert os.environ["ASR_CONTEXT"] == "小那海"
     assert settings.status_code == 200
     assert settings.json()["asr_context"] == "小那海"
+
+
+async def _test_models_api_falls_back_to_v1_models(monkeypatch):
+    monkeypatch.setenv("API_KEY", "test-key")
+    monkeypatch.setenv("OPENAI_COMPATIBILITY_BASE_URL", "https://api.example.test")
+
+    requests: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(str(request.url))
+        if str(request.url) == "https://api.example.test/models":
+            return httpx.Response(
+                200,
+                text="<html></html>",
+                headers={"content-type": "text/html"},
+            )
+        return httpx.Response(
+            200,
+            json={
+                "data": [
+                    {"id": "gpt-5.4-mini"},
+                    {"id": "gpt-5.5"},
+                ],
+            },
+        )
+
+    transport = httpx.MockTransport(handler)
+    original_async_client = httpx.AsyncClient
+
+    def mock_async_client(*args, **kwargs):
+        kwargs["transport"] = transport
+        return original_async_client(*args, **kwargs)
+
+    monkeypatch.setattr(config_routes.httpx, "AsyncClient", mock_async_client)
+
+    app_transport = httpx.ASGITransport(app=create_app())
+    async with original_async_client(
+        transport=app_transport,
+        base_url="http://test",
+    ) as client:
+        response = await client.get("/api/models")
+
+    assert response.status_code == 200
+    assert response.json() == {"models": ["gpt-5.4-mini", "gpt-5.5"]}
+    assert requests == [
+        "https://api.example.test/models",
+        "https://api.example.test/v1/models",
+    ]
 
 
 async def _test_jobs_api_crud(tmp_path, monkeypatch):
