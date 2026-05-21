@@ -327,25 +327,25 @@ Web 设置行为：
 |------|------|------|
 | R01 | 全量审计修复：任务级 env 覆盖、aligned cache scope、ASR/字幕/quality 参数运行时化、翻译 cancel_event 透传 | 基线 315 passed, 5 skipped；完成后逐步增至 334+ passed |
 | R02 | 第二轮后端审计：ASR/aligned cache signature、`.env.example` 默认、SubtitleOptions、Web retry/cancel、stream timeout、Protocol 补齐 | 343 passed, 5 skipped |
-| R03 | ASR generation budget + ONNX CUDA runtime + VAD/chunk cache | 359 passed, 5 skipped；SORA-575 anime-whisper 全量中日双语 649.54s，whisperseg CUDA VAD/切块 9.32s，ASR generation overflow/error 为 0 |
+| R03 | ASR generation budget + ONNX CUDA runtime + VAD/chunk cache | 359 passed, 5 skipped；匿名样片 A anime-whisper 全量中日双语 649.54s，whisperseg CUDA VAD/切块 9.32s，ASR generation overflow/error 为 0 |
 | R04 | 删除 ASR recovery / temperature fallback / prompt overflow retry，并清理前端旧 ASR Recovery 控件；早期固定阈值 precision 方案后续被 adaptive-only 替换 | 后端全量 365 passed, 5 skipped；前端/Web 定向 13 passed |
-| R05 | adaptive precision ASR 默认化：保留硬幻觉拒绝，低风险低 `avg_logprob` 对白自适应放宽 | 定向回归 68 passed；Oni Chichi BDRIP 5min smoke：adaptive drops 2，overflow/error/timeout/quarantine 为 0 |
+| R05 | adaptive precision ASR 默认化：保留硬幻觉拒绝，低风险低 `avg_logprob` 对白自适应放宽 | 定向回归 68 passed；匿名 5min smoke：adaptive drops 2，overflow/error/timeout/quarantine 为 0 |
 | R06 | 默认 ASR 切为 `whisper-ja-anime-v0.3`；新增 `video/test` 通用测试集评测工具；删除 strict/normal ASR 精度模式，只保留 adaptive precision | 全量 373 passed, 5 skipped |
 | R07 | 本地 `.env` 适配当前默认流程并按同类参数归类注释；文档同步 `.env` 边界 | dotenv 解析通过；关键 adaptive/default ASR 配置齐全；旧 strict 配置不存在 |
-| R08 | 新增 Silero / hybrid VAD 实验并完成取舍：hard/soft gate 过度依赖 Silero，后续从当前代码与公开配置中移除 | NAMH-055 前 5 分钟历史 smoke：hybrid hard 漏太多，hybrid soft 改善但仍不作为保留路线 |
-| R09 | 新增 `fusion_lite` VAD 实验后端，只保留 `whisperseg-adaptive` 与 `fusion_lite` 两条公开路线；字幕默认软目标/硬上限收紧为 5.5s/6.5s | NAMH-055 前 5 分钟：whisperseg 14 字幕/11 drops；fusion_lite 15 字幕/7 drops；HAME-052/NMSL-036 全片 VAD 对比 generation overflow/error 均为 0；字幕定向 23 passed，全量 383 passed, 5 skipped |
+| R08 | 新增 Silero / hybrid VAD 实验并完成取舍：hard/soft gate 过度依赖 Silero，后续从当前代码与公开配置中移除 | 匿名样片 B 前 5 分钟历史 smoke：hybrid hard 漏太多，hybrid soft 改善但仍不作为保留路线 |
+| R09 | 新增 `fusion_lite` VAD 实验后端，只保留 `whisperseg-adaptive` 与 `fusion_lite` 两条公开路线；字幕默认软目标/硬上限收紧为 5.5s/6.5s | 匿名样片 B 前 5 分钟：whisperseg 14 字幕/11 drops；fusion_lite 15 字幕/7 drops；匿名样片 C/D 全片 VAD 对比 generation overflow/error 均为 0；字幕定向 23 passed，全量 383 passed, 5 skipped |
 | R10 | 全量审计修复：whisperseg 空结果除零、旧 chunking 整段 fallback、timestamp fallback 参数运行时化、alignment fallback 统计、字幕 writer/Web/pipeline 过时路径清理 | 定向回归通过，后续以全量 pytest 基线更新 |
-| R11 | Fusion-lite 后缀实验 + SORA-575 对比 + 帧率驱动 SRT overlap 归一化 | SORA-575 四模式对比完成；`fusion_lite_boost` 最接近 whisperseg-adaptive；新增逐句 HTML 报告；字幕/fps/主流程定向 73 passed |
-| R12 | HAME-052 四模式双语对比 + frame-based 短尾 cue 合并 | HAME-052 四模式全流程双语输出完成；新增 frame-based overlapping tail merge，修复 `受け` / `受けて` 这类极短 gap 被 F0 gender 抖动切成两条的问题；字幕定向 50 passed |
+| R11 | Fusion-lite 后缀实验 + 匿名样片 A 对比 + 帧率驱动 SRT overlap 归一化 | 匿名样片 A 四模式对比完成；`fusion_lite_boost` 最接近 whisperseg-adaptive；新增逐句 HTML 报告；字幕/fps/主流程定向 73 passed |
+| R12 | 匿名样片 C 四模式双语对比 + frame-based 短尾 cue 合并 | 匿名样片 C 四模式全流程双语输出完成；新增 frame-based overlapping tail merge，修复 `受け` / `受けて` 这类极短 gap 被 F0 gender 抖动切成两条的问题；字幕定向 50 passed |
 
 ### 关键验证记录
 
 #### V01 · ASR generation budget / VAD cache（R03）
 
 - ONNX CUDA smoke 通过：whisperseg `model.onnx` 可创建 `CUDAExecutionProvider` session，provider 为 `['CUDAExecutionProvider', 'CPUExecutionProvider']`。
-- SORA-575 复测：ASR+Alignment 266.00s，输出 578 条字幕。
+- 匿名样片 A 复测：ASR+Alignment 266.00s，输出 578 条字幕。
 - 对比 R02：总耗时 729.36s -> 649.40s；ASR+Alignment 430.61s -> 266.00s。
-- 逐句字幕对比报告：`video/SORA-575/SORA-575.subtitle_compare.html`。
+- 逐句字幕对比报告：`video/<video-stem>/<video-stem>.subtitle_compare.html`。
 - VAD/chunk cache smoke：修改 ASR prompt 上限后 aligned cache miss、ASR 重跑，但 VAD chunk cache hit；静音分析与切块 2.34s -> 0.01s。
 
 #### V02 · 删除 ASR recovery 和 fallback 重写路径（R04）
@@ -359,7 +359,7 @@ Web 设置行为：
 
 - 默认 ASR 精度策略更新为 adaptive precision。
 - adaptive 阈值写入 ASR checkpoint / aligned cache signature，`ASR_QC_ADAPTIVE_*` 变化会触发重算。
-- 5 分钟 BDRIP smoke：`whisper-ja-anime-v0.3`，ASR+Alignment 16.96s，输出 82 段，`asr_dropped_uncertain_count=2`，generation overflow/error/timeout/quarantine 均为 0。
+- 匿名 5 分钟 smoke：`whisper-ja-anime-v0.3`，ASR+Alignment 16.96s，输出 82 段，`asr_dropped_uncertain_count=2`，generation overflow/error/timeout/quarantine 均为 0。
 - Engine 默认 ASR 改为 `whisper-ja-anime-v0.3`，与 Web 推荐默认一致。
 - 新增通用测试集评测工具：`tests/testset_quality_eval.py`。
 - 全量 pytest 基线：373 passed, 5 skipped。
@@ -369,27 +369,27 @@ Web 设置行为：
 - Silero / `hybrid_precision` 曾作为低幻觉 VAD 方案验证；hard gate 漏掉大量真实对白，soft gate 有改善但仍过度依赖 Silero。
 - 当前保留 VAD 路线：默认 `whisperseg-adaptive`，以及实验 `fusion_lite*`。
 - `fusion_lite` 使用可解释公式融合 whisperseg 分数、Silero 重叠、RMS、spectral flux 和时长分数。
-- NAMH-055 前 5 分钟：whisperseg 48 VAD segments / 129.22s speech / 14 字幕 / 11 drops；fusion_lite 23 VAD segments / 89.34s speech / 15 字幕 / 7 drops；generation overflow/error/timeout/quarantine 均为 0。
-- HAME-052 / NMSL-036 全片三模式历史对比显示 fusion_lite 输出接近 whisperseg，但 drops 少于 whisperseg。
-- 逐句报告：`video/HAME-052/HAME-052_NMSL-036.full_vad_modes_line_compare.html`，同一报告也归档到 `video/NMSL-036/`。
+- 匿名样片 B 前 5 分钟：whisperseg 48 VAD segments / 129.22s speech / 14 字幕 / 11 drops；fusion_lite 23 VAD segments / 89.34s speech / 15 字幕 / 7 drops；generation overflow/error/timeout/quarantine 均为 0。
+- 匿名样片 C / D 全片三模式历史对比显示 fusion_lite 输出接近 whisperseg，但 drops 少于 whisperseg。
+- 逐句报告：`video/<video-a>/<video-a>_<video-b>.full_vad_modes_line_compare.html`，同一报告也归档到 `video/<video-b>/`。
 
 #### V05 · fusion-lite 后缀实验和帧率驱动 SRT 归一化（R11）
 
 - 新增 `fusion_lite_boost` 和 `fusion_lite_sigmoid` 后缀后端，不新增 `FUSION_VAD_SCORING_MODE`。
-- SORA-575 使用 `whisper-ja-anime-v0.3`、跳过翻译进行 VAD/ASR 对比。
+- 匿名样片 A 使用 `whisper-ja-anime-v0.3`、跳过翻译进行 VAD/ASR 对比。
 - CUDA ONNX 在 sandbox 内失败，原因是 GPU 被操作系统/sandbox 阻断；外部执行确认 RTX 4060 Ti、Torch CUDA 和 ONNXRuntime CUDA provider 可用。
-- SORA-575 汇总：`whisperseg-adaptive` 700 SRT / 210 ASR drops；`fusion_lite` 683 SRT / 167 drops；`fusion_lite_boost` 688 SRT / 185 drops；`fusion_lite_sigmoid` 677 SRT / 148 drops。
+- 匿名样片 A 汇总：`whisperseg-adaptive` 700 SRT / 210 ASR drops；`fusion_lite` 683 SRT / 167 drops；`fusion_lite_boost` 688 SRT / 185 drops；`fusion_lite_sigmoid` 677 SRT / 148 drops。
 - SRT overlap 处理重构：新增 `probe_video_fps()`，SRT writer 在写出前排序、软拆、合并/裁剪重叠，并强制保留 2 帧 gap。
 - quality report 新增 subtitle overlap 统计。
 - 验证：字幕/fps/主流程定向 73 passed。
 
-#### V06 · HAME-052 四模式双语对比和短尾合并（R12）
+#### V06 · 四模式双语对比和短尾合并（R12）
 
-- HAME-052 四模式完整双语对比已输出到 `video/HAME-052.*.srt`，逐句 HTML 报告为 `video/HAME-052.vad_bilingual_compare.html`。
+- 匿名样片 C 四模式完整双语对比已输出到 `video/<video-stem>/<video-stem>.*.srt`，逐句 HTML 报告为 `video/<video-stem>/<video-stem>.vad_bilingual_compare.html`。
 - 四模式 ASR generation error / overflow / timeout 均为 0，最终 SRT 未包含可见 `[M]` / `[F]` 性别标签。
-- HAME-052 汇总：`whisperseg_adaptive` 230 SRT / 96 ASR drops；`fusion_lite` 231 SRT / 63 drops；`fusion_lite_boost` 230 SRT / 84 drops；`fusion_lite_sigmoid` 230 SRT / 50 drops。
+- 匿名样片 C 汇总：`whisperseg_adaptive` 230 SRT / 96 ASR drops；`fusion_lite` 231 SRT / 63 drops；`fusion_lite_boost` 230 SRT / 84 drops；`fusion_lite_sigmoid` 230 SRT / 50 drops。
 - cue plan 短尾合并改为 frame-based 规则。
-- HAME-052 离线验证：`00:02:56,839 --> 00:02:59,160` 合并为 `アルマリスト 室で イラックス ステイマンを受けて`。
+- 匿名样片 C 离线验证：`00:02:56,839 --> 00:02:59,160` 合并为 `アルマリスト 室で イラックス ステイマンを受けて`。
 - 验证：字幕定向 50 passed。
 
 ### 历史任务摘要
@@ -434,7 +434,7 @@ Web 设置行为：
 
 ### 历史验证基线
 
-HAME-052 四后端 skip-translation 对比：
+匿名样片四后端 skip-translation 对比：
 
 | 后端 | 状态 | ASR 转写 | Wall time | 字幕数 |
 |------|------|----------|-----------|--------|
@@ -443,9 +443,9 @@ HAME-052 四后端 skip-translation 对比：
 | `whisper-ja-1.5b` | ok | 170.74s | 464.33s | 165 |
 | `whisper-ja-anime-v0.3` | ok | 41.89s | 229.46s | 151 |
 
-默认全量翻译 anime-whisper + bilingual：`pipeline_total=575.30s`，字幕块数 150，产物 `video/HAME-052.srt`。
+默认全量翻译 anime-whisper + bilingual：`pipeline_total=575.30s`，字幕块数 150，产物 `video/<video-stem>/<video-stem>.srt`。
 
-SORA-575 历史基准：
+匿名样片历史基准：
 
 - H27 前后基线：491.5s，493 ASR chunks，字幕 365 段，F/M/None=117/124/124，Mixed=13。
 - R03 当前基线：总耗时 649.54s；whisperseg CUDA VAD/切块 9.32s；ASR+Alignment 266.00s；输出 578 条字幕；ASR generation overflow/error 为 0。

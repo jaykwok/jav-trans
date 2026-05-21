@@ -15,7 +15,7 @@ video/<video-stem>/subtitle_qc/
 为一个视频生成全部字幕质检报告：
 
 ```bash
-uv run --no-sync python subtitle_qc/generate.py --video video/MKMP-577.mp4
+uv run --no-sync python subtitle_qc/generate.py --video video/<video-stem>.mp4
 ```
 
 生成文件：
@@ -35,11 +35,11 @@ uv run --no-sync python subtitle_qc/generate.py --video video/MKMP-577.mp4
 
 ```bash
 uv run --no-sync python subtitle_qc/generate.py \
-  --video video/MKMP-577.mp4 \
+  --video video/<video-stem>.mp4 \
   --history-subtitles \
-  video/MKMP-577/MKMP-577.whisperseg_adaptive.srt \
-  video/MKMP-577/MKMP-577.fusion_lite.srt \
-  video/MKMP-577/MKMP-577.whisperseg_adaptive.bilingual.json
+  video/<video-stem>/<video-stem>.whisperseg_adaptive.srt \
+  video/<video-stem>/<video-stem>.fusion_lite.srt \
+  video/<video-stem>/<video-stem>.whisperseg_adaptive.bilingual.json
 ```
 
 只比较历史字幕、不重新生成 VAD/翻译对比报告时，加 `--history-only`。
@@ -57,10 +57,10 @@ uv run --no-sync python subtitle_qc/generate.py \
 
 ```bash
 uv run --no-sync python subtitle_qc/compare_asr_backends.py \
-  --video video/MKMP-577.mp4 \
-  --input anime=video/MKMP-577/MKMP-577.whisperseg_adaptive.srt \
-  --input qwen=video/MKMP-577/MKMP-577.fusion_lite.srt \
-  --input whisper15=video/MKMP-577/MKMP-577.fusion_lite_boost.srt \
+  --video video/<video-stem>.mp4 \
+  --input anime=video/<video-stem>/<video-stem>.whisperseg_adaptive.srt \
+  --input qwen=video/<video-stem>/<video-stem>.fusion_lite.srt \
+  --input whisper15=video/<video-stem>/<video-stem>.fusion_lite_boost.srt \
   --base anime
 ```
 
@@ -114,7 +114,7 @@ video/subtitle_qc/<task-name>/
 ```bash
 uv run --no-sync python subtitle_qc/compare_vad.py \
   --asr-backend whisper-ja-anime-v0.3 \
-  --video MKMP-577
+  --video <video-stem>
 ```
 
 自定义 VAD 子集，参数可写后端名或 `label=backend`：
@@ -144,7 +144,7 @@ uv run --no-sync python subtitle_qc/compare_vad.py \
 用外部日文参考字幕评测候选字幕：
 
 ```bash
-uv run --no-sync python subtitle_qc/evaluate_reference.py --video video/MKMP-577.mp4
+uv run --no-sync python subtitle_qc/evaluate_reference.py --video video/<video-stem>.mp4
 ```
 
 参考字幕放在：
@@ -159,10 +159,10 @@ video/reference/
 
 ```bash
 uv run --no-sync python subtitle_qc/evaluate_reference.py \
-  --video video/MKMP-577.mp4 \
-  --reference video/reference/weak/subtitlecat/MKMP-577.subtitlecat.ja.srt \
-  --candidate adaptive=video/MKMP-577/MKMP-577.whisperseg_adaptive.srt \
-  --candidate boost=video/MKMP-577/MKMP-577.fusion_lite_boost.srt
+  --video video/<video-stem>.mp4 \
+  --reference video/reference/weak/subtitlecat/<video-stem>.subtitlecat.ja.srt \
+  --candidate adaptive=video/<video-stem>/<video-stem>.whisperseg_adaptive.srt \
+  --candidate boost=video/<video-stem>/<video-stem>.fusion_lite_boost.srt
 ```
 
 评测按每条参考 cue 的时间窗口聚合候选日文文本再打分，比一对一 cue 匹配更适合外部字幕，因为下载字幕经常把多句对白合成一个长 cue。输出文件：
@@ -177,8 +177,8 @@ uv run --no-sync python subtitle_qc/evaluate_reference.py \
 切出每个 review item 的短视频片段：
 
 ```bash
-uv run --no-sync python subtitle_qc/generate.py --video video/MKMP-577.mp4 --make-clips
-uv run --no-sync python subtitle_qc/generate.py --video video/MKMP-577.mp4 --make-compilation
+uv run --no-sync python subtitle_qc/generate.py --video video/<video-stem>.mp4 --make-clips
+uv run --no-sync python subtitle_qc/generate.py --video video/<video-stem>.mp4 --make-compilation
 ```
 
 切片默认关闭，因为它会变慢并占用较多磁盘空间。
