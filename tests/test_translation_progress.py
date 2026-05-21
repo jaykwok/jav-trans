@@ -38,6 +38,11 @@ def _stream(reasoning_parts: list[str], content_parts: list[str]):
         yield _chunk(content=part, finish=finish)
 
 
+def _broken_stream(exc: Exception):
+    raise exc
+    yield
+
+
 def _usage_chunk(**usage_fields):
     return SimpleNamespace(choices=[], usage=SimpleNamespace(**usage_fields))
 
@@ -101,10 +106,10 @@ def test_expected_zero_does_not_crash(monkeypatch):
     assert events[-1] == {"phase": "done", "translated": 0, "expected": 0}
 
 
-def test_grok_chat_keeps_streaming_json_object(monkeypatch):
+def test_chat_uses_openai_json_schema(monkeypatch):
     requests: list[dict] = []
     monkeypatch.setenv("LLM_API_FORMAT", "chat")
-    monkeypatch.setenv("LLM_MODEL_NAME", "grok-4.20-0309-non-reasoning")
+    monkeypatch.setenv("LLM_MODEL_NAME", "gpt-5.5")
     monkeypatch.setenv("LLM_REASONING_EFFORT", "xhigh")
     monkeypatch.setattr(
         translator,
@@ -125,7 +130,13 @@ def test_grok_chat_keeps_streaming_json_object(monkeypatch):
     assert request["stream"] is True
     assert request["reasoning_effort"] == "xhigh"
     assert request["extra_body"] == {"thinking": {"type": "enabled"}}
-    assert request["response_format"] == {"type": "json_object"}
+    response_format = request["response_format"]
+    assert response_format["type"] == "json_schema"
+    assert response_format["json_schema"]["name"] == "subtitle_translations"
+    assert response_format["json_schema"]["strict"] is True
+    schema = response_format["json_schema"]["schema"]
+    assert schema["required"] == ["translations"]
+    assert schema["properties"]["translations"]["items"]["required"] == ["id", "text"]
     assert "tools" not in request
     assert "web_search_options" not in request
     assert "include_reasoning" not in request
@@ -134,11 +145,54 @@ def test_grok_chat_keeps_streaming_json_object(monkeypatch):
     assert request["top_p"] == translator.TRANSLATION_TOP_P
 
 
+def test_chat_uses_json_object_for_deepseek(monkeypatch):
+    requests: list[dict] = []
+    monkeypatch.setenv("LLM_API_FORMAT", "chat")
+    monkeypatch.setenv("LLM_MODEL_NAME", "DeepSeek-V4-Pro")
+    monkeypatch.setattr(
+        translator,
+        "_create_chat_completion",
+        lambda request: requests.append(request) or _stream(
+            [],
+            ['{"translations":[]}'],
+        ),
+    )
+
+    output = translator._chat(
+        [{"role": "user", "content": "json"}],
+        expected_count=0,
+    )
+
+    assert output == '{"translations":[]}'
+    assert requests[0]["response_format"] == {"type": "json_object"}
+
+
+def test_openai_compat_base_url_defaults_to_v1():
+    assert (
+        translator._normalize_openai_compat_base_url("https://api.ticketpro.cc")
+        == "https://api.ticketpro.cc/v1"
+    )
+    assert (
+        translator._normalize_openai_compat_base_url("https://api.deepseek.com/")
+        == "https://api.deepseek.com/v1"
+    )
+    assert (
+        translator._normalize_openai_compat_base_url("https://api.ticketpro.cc/v1")
+        == "https://api.ticketpro.cc/v1"
+    )
+    assert (
+        translator._normalize_openai_compat_base_url(
+            "https://api.ticketpro.cc/v1/chat/completions"
+        )
+        == "https://api.ticketpro.cc/v1"
+    )
+
+
 def test_chat_reports_openai_and_deepseek_cache_usage(monkeypatch):
     usage_events: list[dict] = []
     requests: list[dict] = []
     monkeypatch.setenv("LLM_API_FORMAT", "chat")
-    monkeypatch.setenv("LLM_MODEL_NAME", "deepseek-v4-pro")
+    monkeypatch.setenv("LLM_MODEL_NAME", "DeepSeek-V4-Pro")
     monkeypatch.setattr(
         translator,
         "_create_chat_completion",
@@ -162,6 +216,7 @@ def test_chat_reports_openai_and_deepseek_cache_usage(monkeypatch):
 
     assert output == '{"translations":[]}'
     assert requests[0]["stream_options"] == {"include_usage": True}
+    assert requests[0]["response_format"] == {"type": "json_object"}
     assert usage_events == [
         {
             "cached_tokens": 128,
@@ -194,11 +249,53 @@ def test_chat_retries_without_stream_options_when_provider_rejects_usage(monkeyp
     assert "stream_options" not in requests[1]
 
 
+def test_xhigh_stream_protocol_error_falls_back_to_medium(monkeypatch):
+    requests: list[dict] = []
+    retry_events: list[dict] = []
+    monkeypatch.setenv("LLM_API_FORMAT", "chat")
+    monkeypatch.setenv("LLM_MODEL_NAME", "gpt-5.5")
+    monkeypatch.setenv("LLM_REASONING_EFFORT", "xhigh")
+
+    class RemoteProtocolError(RuntimeError):
+        pass
+
+    def fake_create_chat_completion(request):
+        requests.append(dict(request))
+        if request["reasoning_effort"] == "xhigh":
+            return _broken_stream(
+                RemoteProtocolError(
+                    "peer closed connection without sending complete message body "
+                    "(incomplete chunked read)"
+                )
+            )
+        return _stream([], ['{"translations":[{"id":0,"text":"好"}]}'])
+
+    monkeypatch.setattr(translator, "_create_chat_completion", fake_create_chat_completion)
+    previous_retry_events = getattr(translator._RETRY_CONTEXT, "events", None)
+    translator._RETRY_CONTEXT.events = retry_events
+    try:
+        output = translator._chat_with_reasoning(
+            [{"role": "user", "content": "json"}],
+            expected_count=1,
+            reasoning_effort="xhigh",
+        )
+    finally:
+        if previous_retry_events is None:
+            delattr(translator._RETRY_CONTEXT, "events")
+        else:
+            translator._RETRY_CONTEXT.events = previous_retry_events
+
+    assert output == '{"translations":[{"id":0,"text":"好"}]}'
+    assert [request["reasoning_effort"] for request in requests] == ["xhigh", "medium"]
+    assert retry_events
+    assert retry_events[0]["note"] == "fallback_reasoning_effort_medium"
+
+
 def test_responses_progress_translating_done(monkeypatch):
     events: list[dict] = []
     requests: list[dict] = []
     monkeypatch.setenv("LLM_API_FORMAT", "responses")
-    monkeypatch.setenv("LLM_MODEL_NAME", "deepseek-v4-pro")
+    monkeypatch.setenv("LLM_MODEL_NAME", "DeepSeek-V4-Pro")
     monkeypatch.setattr(translator.time, "monotonic", FakeClock(0.3).monotonic)
 
     def fake_create_response(request):
@@ -274,7 +371,15 @@ def test_grok_responses_uses_standard_openai_shape_without_micu_patch(monkeypatc
     assert request["input"][0]["role"] == "system"
     assert request["input"][0]["content"][0]["type"] == "input_text"
     assert request["reasoning"] == {"effort": "xhigh"}
-    assert request["text"] == {"format": {"type": "json_object"}}
+    text_format = request["text"]["format"]
+    assert text_format["type"] == "json_schema"
+    assert text_format["name"] == "subtitle_translations"
+    assert text_format["strict"] is True
+    assert text_format["schema"]["required"] == ["translations"]
+    assert (
+        text_format["schema"]["properties"]["translations"]["items"]["required"]
+        == ["id", "text"]
+    )
     assert request["max_output_tokens"] == translator.TRANSLATION_MAX_TOKENS
     assert request["temperature"] == translator.TRANSLATION_TEMPERATURE
     assert request["top_p"] == translator.TRANSLATION_TOP_P
