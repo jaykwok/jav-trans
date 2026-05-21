@@ -8,7 +8,7 @@
 video/<video-stem>/subtitle_qc/
 ```
 
-批量 VAD 矩阵仍把运行日志、临时中间件和聚合评测放在 `agents/temp/subtitle_qc/<task-name>/`，最终 SRT/JSON 会按视频归档到 `video/<video-stem>/`。
+批量 VAD 矩阵只把运行日志和中间件放在 `agents/temp/subtitle_qc/<task-name>/`。最终 SRT/JSON、质量报告和 reference eval 都按视频归档到 `video/<video-stem>/`；跨视频 summary 写到 `video/subtitle_qc/<task-name>/`。
 
 ## 单视频报告
 
@@ -91,10 +91,22 @@ video/<video-stem>/<video-stem>.<asr-label>_<vad-label>.srt
 - `fusion_lite_boost=fusion_lite_boost`
 - `fusion_lite_sigmoid=fusion_lite_sigmoid`
 
-运行日志、质量报告副本和聚合评测文件保存在：
+运行日志和中间件保存在：
 
 ```text
 agents/temp/subtitle_qc/<task-name>/
+```
+
+每个视频的质量报告和 reference eval 保存在：
+
+```text
+video/<video-stem>/subtitle_qc/<task-name>/
+```
+
+跨视频聚合 summary 保存在：
+
+```text
+video/subtitle_qc/<task-name>/
 ```
 
 限制到一个或多个视频：

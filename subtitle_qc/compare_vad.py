@@ -52,9 +52,8 @@ class TaskPaths:
     job_root: Path
     run_log_dir: Path
     generated_root: Path
-    quality_dir: Path
-    eval_root: Path
     backup_root: Path
+    summary_root: Path
     summary_json: Path
     summary_md: Path
     summary_metrics_csv: Path
@@ -90,6 +89,10 @@ def video_artifact_output_path(video: Path, filename: str, *, group_by_video: bo
     if not group_by_video:
         return video.parent / filename
     return video_artifact_dir(video) / filename
+
+
+def subtitle_qc_task_dir(video: Path, task_name: str) -> Path:
+    return video_artifact_dir(video) / "subtitle_qc" / safe_label(task_name)
 
 
 def safe_label(value: str) -> str:
@@ -229,17 +232,17 @@ def selected_cases(args: argparse.Namespace) -> list[VideoCase]:
 
 def make_task_paths(task_name: str) -> TaskPaths:
     root = PROJECT_ROOT / "agents" / "temp" / "subtitle_qc" / safe_label(task_name)
+    summary_root = PROJECT_ROOT / "video" / "subtitle_qc" / safe_label(task_name)
     return TaskPaths(
         root=root,
         job_root=root / "jobs",
         run_log_dir=root / "run-logs",
         generated_root=root / "generated",
-        quality_dir=root / "quality_reports",
-        eval_root=root / "reference_eval",
         backup_root=PROJECT_ROOT / "agents" / "rm" / "subtitle_qc" / safe_label(task_name),
-        summary_json=root / "summary.json",
-        summary_md=root / "summary.md",
-        summary_metrics_csv=root / "summary_metrics.csv",
+        summary_root=summary_root,
+        summary_json=summary_root / "summary.json",
+        summary_md=summary_root / "summary.md",
+        summary_metrics_csv=summary_root / "summary_metrics.csv",
     )
 
 
@@ -249,9 +252,8 @@ def ensure_dirs(paths: TaskPaths) -> None:
         paths.job_root,
         paths.run_log_dir,
         paths.generated_root,
-        paths.quality_dir,
-        paths.eval_root,
         paths.backup_root,
+        paths.summary_root,
     ):
         path.mkdir(parents=True, exist_ok=True)
 
@@ -359,6 +361,7 @@ def build_ctx(
     job_id = sanitize_job_id(f"{video.stem}_{label}")
     job_temp_dir = paths.job_root / job_id
     output_dir = paths.generated_root / job_id
+    quality_dir = subtitle_qc_task_dir(video, args.task_name) / "quality_reports"
     spec = SimpleNamespace(
         asr_backend=args.asr_backend,
         asr_context=args.asr_context,
@@ -385,7 +388,7 @@ def build_ctx(
             "ASR_CONTEXT": args.asr_context,
             "TRANSCRIPTION_TIMEOUT_S": str(args.transcription_timeout),
             "QUALITY_REPORT_ENABLED": "1",
-            "QUALITY_REPORT_DIR": str(paths.quality_dir),
+            "QUALITY_REPORT_DIR": str(quality_dir),
             "QC_HARD_FAIL": "0",
             "RUN_LOG_ENABLED": "1",
             "RUN_LOG_DIR": str(paths.run_log_dir),
@@ -473,14 +476,14 @@ def preserve_outputs(
     preserved["quality_report_md"] = copy_or_replace(
         paths,
         quality_md,
-        paths.quality_dir / f"{stem}.{label}.quality_report.md",
+        subtitle_qc_task_dir(video, paths.summary_root.name) / "quality_reports" / f"{stem}.{label}.quality_report.md",
         force=force,
     )
     quality_json = Path(quality_md).with_suffix(".json") if quality_md else None
     preserved["quality_report_json"] = copy_or_replace(
         paths,
         quality_json if quality_json and quality_json.exists() else "",
-        paths.quality_dir / f"{stem}.{label}.quality_report.json",
+        subtitle_qc_task_dir(video, paths.summary_root.name) / "quality_reports" / f"{stem}.{label}.quality_report.json",
         force=force,
     )
     return {key: value for key, value in preserved.items() if value}
@@ -498,7 +501,7 @@ def existing_result(
     if not srt_path.exists() or srt_path.stat().st_size <= 0:
         return None
     timings_path = paths.root / f"{video.stem}.{label}.timings.json"
-    quality_path = paths.quality_dir / f"{video.stem}.{label}.quality_report.json"
+    quality_path = subtitle_qc_task_dir(video, args.task_name) / "quality_reports" / f"{video.stem}.{label}.quality_report.json"
     timings = read_json(timings_path)
     quality = read_json(quality_path)
     return {
@@ -595,7 +598,7 @@ def evaluate_video(
 ) -> dict[str, Any]:
     if case.reference is None:
         raise RuntimeError(f"missing reference for {project_rel(case.video)}")
-    output_dir = paths.eval_root / case.video.stem
+    output_dir = subtitle_qc_task_dir(case.video, paths.summary_root.name) / "reference_eval"
     output_dir.mkdir(parents=True, exist_ok=True)
     reference_cues = ref_eval.load_subtitle(case.reference, "reference")
     reference_chars = ref_eval.japanese_char_count(reference_cues)
@@ -774,7 +777,8 @@ def write_summary(
         "# VAD Compare",
         "",
         f"- ASR backend: `{args.asr_backend}`",
-        f"- Outputs: `{project_rel(paths.root)}`",
+        f"- Summary: `{project_rel(paths.summary_root)}`",
+        f"- Runtime temp: `{project_rel(paths.root)}`",
         f"- Translation: `{'on' if args.translate else 'off'}`",
         "",
         "## Overall",
