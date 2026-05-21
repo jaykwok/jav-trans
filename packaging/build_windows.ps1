@@ -9,9 +9,9 @@ $ErrorActionPreference = "Stop"
 $Root = Resolve-Path (Join-Path $PSScriptRoot "..")
 Set-Location $Root
 
-$Python = Join-Path $Root ".venv/Scripts/python.exe"
-if (-not (Test-Path $Python)) {
-    throw "Missing project venv: .venv/Scripts/python.exe"
+$Uv = Get-Command uv -ErrorAction SilentlyContinue
+if (-not $Uv) {
+    throw "Missing uv. Install uv, run 'uv venv', then install dependencies with 'uv pip install -r requirements.txt'."
 }
 
 if ($FfmpegExe) {
@@ -21,15 +21,15 @@ if ($FfprobeExe) {
     $env:JAVTRANS_FFPROBE_EXE = (Resolve-Path $FfprobeExe).Path
 }
 
-& $Python "packaging/prepare_default_model.py"
+& uv run --no-sync python "packaging/prepare_default_model.py"
 if ($LASTEXITCODE -ne 0) {
     exit $LASTEXITCODE
 }
 
 if ($Clean) {
-    & $Python -m PyInstaller --noconfirm --clean $SpecPath
+    & uv run --no-sync python -m PyInstaller --noconfirm --clean $SpecPath
 } else {
-    & $Python -m PyInstaller --noconfirm $SpecPath
+    & uv run --no-sync python -m PyInstaller --noconfirm $SpecPath
 }
 if ($LASTEXITCODE -ne 0) {
     exit $LASTEXITCODE

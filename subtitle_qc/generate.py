@@ -92,6 +92,28 @@ def project_rel(path: Path) -> str:
     return path.resolve().relative_to(PROJECT_ROOT.resolve()).as_posix()
 
 
+def video_artifact_path(video_stem: str, filename: str) -> Path:
+    nested = PROJECT_ROOT / "video" / video_stem / filename
+    if nested.exists():
+        return nested
+    return PROJECT_ROOT / "video" / filename
+
+
+def iter_video_artifacts(video_stem: str, pattern: str) -> list[Path]:
+    nested_dir = PROJECT_ROOT / "video" / video_stem
+    paths = list(nested_dir.glob(pattern)) if nested_dir.exists() else []
+    paths.extend((PROJECT_ROOT / "video").glob(pattern))
+    unique: list[Path] = []
+    seen: set[Path] = set()
+    for path in sorted(paths):
+        resolved = path.resolve()
+        if resolved in seen:
+            continue
+        seen.add(resolved)
+        unique.append(path)
+    return unique
+
+
 def fmt_time(seconds: float) -> str:
     total_ms = max(0, int(round(seconds * 1000)))
     ms = total_ms % 1000
@@ -198,7 +220,7 @@ def cue_from_mapping(index: int, source_name: str, item: dict[str, Any]) -> Cue 
 
 
 def load_cues(video_stem: str, mode: str) -> list[Cue]:
-    path = PROJECT_ROOT / "video" / f"{video_stem}.{mode}.bilingual.json"
+    path = video_artifact_path(video_stem, f"{video_stem}.{mode}.bilingual.json")
     payload = json.loads(path.read_text(encoding="utf-8"))
     cues: list[Cue] = []
     for index, block in enumerate(payload.get("blocks") or []):
@@ -307,10 +329,10 @@ def discover_modes(video_stem: str, requested: list[str] | None) -> list[str]:
         return requested
     found = []
     for mode in DEFAULT_MODES:
-        if (PROJECT_ROOT / "video" / f"{video_stem}.{mode}.bilingual.json").exists():
+        if video_artifact_path(video_stem, f"{video_stem}.{mode}.bilingual.json").exists():
             found.append(mode)
     if not found:
-        for path in sorted((PROJECT_ROOT / "video").glob(f"{video_stem}.*.bilingual.json")):
+        for path in iter_video_artifacts(video_stem, f"{video_stem}.*.bilingual.json"):
             suffix = path.name.removeprefix(f"{video_stem}.").removesuffix(".bilingual.json")
             found.append(suffix)
     return found
@@ -1162,7 +1184,7 @@ def main() -> None:
     missing = [
         mode
         for mode in modes
-        if not (PROJECT_ROOT / "video" / f"{video_stem}.{mode}.bilingual.json").exists()
+        if not video_artifact_path(video_stem, f"{video_stem}.{mode}.bilingual.json").exists()
     ]
     if missing:
         raise SystemExit(f"missing bilingual json for modes: {missing}")
