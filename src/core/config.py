@@ -287,10 +287,10 @@ DEFAULT_SETTINGS: dict[str, str] = {
     # --- Quality Report ---
     # 1 stops the pipeline when quality_report warnings are present.
     "QC_HARD_FAIL": "0",
-    # 1 writes {video}.quality_report.md plus a machine-readable JSON sidecar to QUALITY_REPORT_DIR.
+    # 1 writes {video}.quality_report.md plus a machine-readable JSON sidecar.
     "QUALITY_REPORT_ENABLED": "0",
-    # Directory for optional quality reports. Relative paths resolve from project root.
-    "QUALITY_REPORT_DIR": "./reports",
+    # Optional override for quality reports. Empty means video/<video-stem>/.
+    "QUALITY_REPORT_DIR": "",
     # Maximum allowed empty Chinese translation ratio.
     "QC_MAX_EMPTY_ZH": "0.02",
     # Maximum allowed repeated-translation ratio.

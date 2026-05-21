@@ -43,10 +43,9 @@ def test_quality_report_default_disabled(monkeypatch, tmp_path):
     assert not (tmp_path / "reports").exists()
 
 
-def test_quality_report_enabled_writes_to_project_reports(monkeypatch, tmp_path):
-    report_dir = tmp_path / "reports"
+def test_quality_report_enabled_defaults_to_video_folder(monkeypatch, tmp_path):
     monkeypatch.setenv("QUALITY_REPORT_ENABLED", "1")
-    monkeypatch.setenv("QUALITY_REPORT_DIR", str(report_dir))
+    monkeypatch.delenv("QUALITY_REPORT_DIR", raising=False)
 
     path = write_quality_report(
         video_stem="sample",
@@ -68,8 +67,8 @@ def test_quality_report_enabled_writes_to_project_reports(monkeypatch, tmp_path)
         video_duration_s=60.0,
     )
 
-    expected = report_dir / "sample.quality_report.md"
-    json_sidecar = report_dir / "sample.quality_report.json"
+    expected = tmp_path / "video" / "sample" / "sample.quality_report.md"
+    json_sidecar = tmp_path / "video" / "sample" / "sample.quality_report.json"
     assert path == str(expected)
     assert expected.exists()
     assert "Quality Report: sample" in expected.read_text(encoding="utf-8")
@@ -78,7 +77,7 @@ def test_quality_report_enabled_writes_to_project_reports(monkeypatch, tmp_path)
     assert "warnings" in payload
 
 
-def test_quality_report_relative_dir_resolves_from_project_root(monkeypatch, tmp_path):
+def test_quality_report_relative_dir_override_resolves_from_project_root(monkeypatch, tmp_path):
     monkeypatch.setenv("QUALITY_REPORT_ENABLED", "1")
     monkeypatch.setenv("QUALITY_REPORT_DIR", "reports")
 
