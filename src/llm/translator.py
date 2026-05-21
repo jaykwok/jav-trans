@@ -89,6 +89,61 @@ TRANSLATION_REPAIR_CONTEXT_RADIUS = 1
 TRANSLATION_REPAIR_LENGTH_RATIO_MIN = 0.25
 TRANSLATION_REPAIR_LENGTH_RATIO_MAX = 4.0
 
+_TRANSLATION_OUTPUT_SCHEMA = {
+    "type": "object",
+    "additionalProperties": False,
+    "properties": {
+        "translations": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    "id": {"type": "integer"},
+                    "text": {"type": "string"},
+                },
+                "required": ["id", "text"],
+            },
+        },
+    },
+    "required": ["translations"],
+}
+
+
+def _translation_output_schema() -> dict:
+    return json.loads(json.dumps(_TRANSLATION_OUTPUT_SCHEMA))
+
+
+def _is_deepseek_model(model_name: str | None) -> bool:
+    return "deepseek" in (model_name or "").lower()
+
+
+def _chat_response_format(model_name: str | None = None) -> dict:
+    if _is_deepseek_model(model_name):
+        return {"type": "json_object"}
+    return {
+        "type": "json_schema",
+        "json_schema": {
+            "name": "subtitle_translations",
+            "strict": True,
+            "schema": _translation_output_schema(),
+        },
+    }
+
+
+def _responses_text_format(model_name: str | None = None) -> dict:
+    if _is_deepseek_model(model_name):
+        return {"format": {"type": "json_object"}}
+    return {
+        "format": {
+            "type": "json_schema",
+            "name": "subtitle_translations",
+            "strict": True,
+            "schema": _translation_output_schema(),
+        }
+    }
+
+
 def _normalize_llm_api_format(value: str | None, fallback: str = "chat") -> str:
     normalized = (value or fallback or "chat").strip().lower()
     return normalized if normalized in {"chat", "responses"} else "chat"
@@ -108,10 +163,27 @@ def _normalize_reasoning_effort(value: str | None, fallback: str = "xhigh") -> s
     return fallback if fallback in {"medium", "xhigh"} else "xhigh"
 
 
+def _normalize_openai_compat_base_url(base_url: str | None) -> str | None:
+    normalized = (base_url or "").strip().rstrip("/")
+    if not normalized:
+        return None
+    lower = normalized.lower()
+    for suffix in ("/chat/completions", "/responses", "/completions", "/models"):
+        if lower.endswith(suffix):
+            normalized = normalized[: -len(suffix)].rstrip("/")
+            lower = normalized.lower()
+            break
+    if lower.endswith("/v1") or "/v1/" in lower:
+        return normalized
+    return f"{normalized}/v1"
+
+
 def _get_client() -> OpenAI:
     global _CLIENT, _CLIENT_KEY
     current_key = os.getenv("API_KEY", "").strip() or None
-    current_url = os.getenv("OPENAI_COMPATIBILITY_BASE_URL", "").strip() or None
+    current_url = _normalize_openai_compat_base_url(
+        os.getenv("OPENAI_COMPATIBILITY_BASE_URL", "").strip()
+    )
     key_tuple = (current_key or "", current_url or "")
     with _CLIENT_LOCK:
         if _CLIENT is None or key_tuple != _CLIENT_KEY:
@@ -480,21 +552,31 @@ def _chat_with_reasoning(
     cancel_event: threading.Event | None = None,
 ) -> str:
     _raise_if_cancelled(cancel_event)
+    effective_effort = _normalize_reasoning_effort(
+        reasoning_effort or os.getenv("LLM_REASONING_EFFORT", LLM_REASONING_EFFORT)
+    )
     chat_kwargs = {
         "expected_count": expected_count,
         "on_progress": on_progress,
         "cancel_event": cancel_event,
+        "reasoning_effort": effective_effort,
     }
-    if reasoning_effort is not None:
-        chat_kwargs["reasoning_effort"] = reasoning_effort
     if api_format is not None:
         chat_kwargs["api_format"] = api_format
     if on_usage is not None:
         chat_kwargs["on_usage"] = on_usage
-    return _chat(
-        messages,
-        **chat_kwargs,
-    )
+    try:
+        return _chat(
+            messages,
+            **chat_kwargs,
+        )
+    except RetryableTranslationFormatError as exc:
+        if effective_effort != "xhigh" or not _is_stream_interrupted_error(exc):
+            raise
+        _record_api_retry_event(exc, 0, 0.0, note="fallback_reasoning_effort_medium")
+        fallback_kwargs = dict(chat_kwargs)
+        fallback_kwargs["reasoning_effort"] = "medium"
+        return _chat(messages, **fallback_kwargs)
 
 
 def _translate_segments_single_request(
@@ -1450,7 +1532,26 @@ def _is_retryable_api_error(exc: Exception) -> bool:
             "connection",
             "serviceunavailable",
             "internalserver",
+            "protocol",
         )
+    )
+
+
+def _is_stream_interrupted_error(exc: Exception) -> bool:
+    message = str(exc).lower()
+    name = type(exc).__name__.lower()
+    return (
+        "protocol" in name
+        or "incomplete chunked read" in message
+        or "peer closed connection" in message
+        or "incomplete message body" in message
+    )
+
+
+def _stream_interrupted_format_error(exc: Exception) -> RetryableTranslationFormatError:
+    return RetryableTranslationFormatError(
+        "LLM stream interrupted before complete JSON content: "
+        f"{type(exc).__name__}: {exc}"
     )
 
 
@@ -1461,7 +1562,13 @@ def _request_backoff_delay(attempt: int) -> float:
     )
 
 
-def _record_api_retry_event(exc: Exception, attempt: int, delay_s: float) -> None:
+def _record_api_retry_event(
+    exc: Exception,
+    attempt: int,
+    delay_s: float,
+    *,
+    note: str = "",
+) -> None:
     status_code = getattr(exc, "status_code", None)
     if status_code is None:
         response = getattr(exc, "response", None)
@@ -1474,6 +1581,8 @@ def _record_api_retry_event(exc: Exception, attempt: int, delay_s: float) -> Non
         "error_type": type(exc).__name__,
         "message": str(exc)[:500],
     }
+    if note:
+        event["note"] = note
     local_events = _current_retry_events()
     if local_events is not None:
         local_events.append(event)
@@ -1861,7 +1970,7 @@ def _chat_completions(
         "model": model_name,
         "messages": messages,
         "stream": True,
-        "response_format": {"type": "json_object"},
+        "response_format": _chat_response_format(model_name),
         "reasoning_effort": _normalize_reasoning_effort(
             reasoning_effort or os.getenv("LLM_REASONING_EFFORT", LLM_REASONING_EFFORT)
         ),
@@ -1902,28 +2011,33 @@ def _chat_completions(
         last_emit = now
         _emit_progress(on_progress, payload)
 
-    for chunk in response_stream:
-        _raise_if_cancelled(cancel_event)
-        _emit_usage(on_usage, getattr(chunk, "usage", None))
-        if not chunk.choices:
-            continue
-        delta = chunk.choices[0].delta
-        reasoning_content = getattr(delta, "reasoning_content", None)
-        if reasoning_content:
-            reasoning_chars += len(reasoning_content)
-            maybe_emit(
-                {"phase": "thinking", "reasoning_chars": reasoning_chars}
-            )
-        if hasattr(delta, "content") and delta.content:
-            _emit_stream_content_progress(
-                piece=delta.content,
-                state=stream_state,
-                expected_count=expected_count,
-                maybe_emit=maybe_emit,
-            )
-        if chunk.choices[0].finish_reason:
-            finish_reason = chunk.choices[0].finish_reason
-        _raise_if_cancelled(cancel_event)
+    try:
+        for chunk in response_stream:
+            _raise_if_cancelled(cancel_event)
+            _emit_usage(on_usage, getattr(chunk, "usage", None))
+            if not chunk.choices:
+                continue
+            delta = chunk.choices[0].delta
+            reasoning_content = getattr(delta, "reasoning_content", None)
+            if reasoning_content:
+                reasoning_chars += len(reasoning_content)
+                maybe_emit(
+                    {"phase": "thinking", "reasoning_chars": reasoning_chars}
+                )
+            if hasattr(delta, "content") and delta.content:
+                _emit_stream_content_progress(
+                    piece=delta.content,
+                    state=stream_state,
+                    expected_count=expected_count,
+                    maybe_emit=maybe_emit,
+                )
+            if chunk.choices[0].finish_reason:
+                finish_reason = chunk.choices[0].finish_reason
+            _raise_if_cancelled(cancel_event)
+    except Exception as exc:
+        if _is_retryable_api_error(exc):
+            raise _stream_interrupted_format_error(exc) from exc
+        raise
 
     _raise_if_cancelled(cancel_event)
     if finish_reason == "length":
@@ -1987,7 +2101,7 @@ def _chat_responses(
             "reasoning": {
                 "effort": effective_reasoning_effort
             },
-            "text": {"format": {"type": "json_object"}},
+            "text": _responses_text_format(model_name),
             "temperature": TRANSLATION_TEMPERATURE,
             "top_p": TRANSLATION_TOP_P,
         }
@@ -2033,44 +2147,49 @@ def _chat_responses(
         last_emit = now
         _emit_progress(on_progress, payload)
 
-    for event in response_stream:
-        _raise_if_cancelled(cancel_event)
-        event_type = _response_event_type(event)
-        if event_type == "response.output_text.delta":
-            piece = _response_event_delta(event)
-            if piece:
-                _emit_stream_content_progress(
-                    piece=piece,
-                    state=stream_state,
-                    expected_count=expected_count,
-                    maybe_emit=maybe_emit,
-                )
-            continue
+    try:
+        for event in response_stream:
+            _raise_if_cancelled(cancel_event)
+            event_type = _response_event_type(event)
+            if event_type == "response.output_text.delta":
+                piece = _response_event_delta(event)
+                if piece:
+                    _emit_stream_content_progress(
+                        piece=piece,
+                        state=stream_state,
+                        expected_count=expected_count,
+                        maybe_emit=maybe_emit,
+                    )
+                continue
 
-        if event_type in {
-            "response.reasoning_summary_text.delta",
-            "response.reasoning_text.delta",
-        }:
-            reasoning_piece = _response_event_delta(event)
-            if reasoning_piece:
-                reasoning_chars += len(reasoning_piece)
-                maybe_emit(
-                    {"phase": "thinking", "reasoning_chars": reasoning_chars}
-                )
-            continue
+            if event_type in {
+                "response.reasoning_summary_text.delta",
+                "response.reasoning_text.delta",
+            }:
+                reasoning_piece = _response_event_delta(event)
+                if reasoning_piece:
+                    reasoning_chars += len(reasoning_piece)
+                    maybe_emit(
+                        {"phase": "thinking", "reasoning_chars": reasoning_chars}
+                    )
+                continue
 
-        if event_type == "response.completed":
-            completed_response = _response_event_response(event)
-            _emit_usage(on_usage, _get_nested_value(completed_response, "usage"))
-            continue
+            if event_type == "response.completed":
+                completed_response = _response_event_response(event)
+                _emit_usage(on_usage, _get_nested_value(completed_response, "usage"))
+                continue
 
-        if event_type == "response.incomplete":
-            incomplete_response = _response_event_response(event)
-            continue
+            if event_type == "response.incomplete":
+                incomplete_response = _response_event_response(event)
+                continue
 
-        if event_type in {"response.failed", "response.error"}:
-            failed_error = event
-        _raise_if_cancelled(cancel_event)
+            if event_type in {"response.failed", "response.error"}:
+                failed_error = event
+            _raise_if_cancelled(cancel_event)
+    except Exception as exc:
+        if _is_retryable_api_error(exc):
+            raise _stream_interrupted_format_error(exc) from exc
+        raise
 
     _raise_if_cancelled(cancel_event)
     if failed_error is not None:
