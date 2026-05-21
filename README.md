@@ -261,8 +261,8 @@ Web 设置行为：
 - `temp/vad-cache/`：VAD/chunk 边界缓存，只绑定音频指纹、VAD 参数和 chunk/drop/merge 参数，不绑定 ASR prompt/token 参数。
 - `temp/jobs/`：Web 任务临时目录，包含音频缓存、ASR checkpoint、`aligned_segments.json`、翻译 cache 等。
 - `temp/log/`：高级项启用 `RUN_LOG_ENABLED=1` 后写入运行日志。
-- `reports/`：质量报告与测试/对比报告默认输出目录；质量报告以 `.md` 为主产物，同时保留 `.json` sidecar。
-- `subtitle_qc/`：独立字幕人工质检工具，按视频名输出纯日文转写对比、逐词时间戳报告、翻译对比、不同 ASR 后端逐句对比，以及原视频 seek 式 review index。具体命令见 `subtitle_qc/README.md`。
+- `video/<视频名>/`：对应视频的字幕、质量报告、历史对比报告和人工质检报告目录。质量报告以 `.md` 为主产物，同时保留 `.json` sidecar；Web 勾选质量报告时默认写到这里。
+- `subtitle_qc/`：独立字幕人工质检工具，默认把单视频 HTML/JSON 报告写到 `video/<视频名>/subtitle_qc/`，并提供纯日文转写对比、逐词时间戳报告、翻译对比、不同 ASR 后端逐句对比，以及原视频 seek 式 review index。具体命令见 `subtitle_qc/README.md`。
 
 成功运行后默认删除一次性 job 临时目录；保留下次可复用的运行缓存，例如 `models/`、`temp/vad-cache/` 和 `temp/web` 状态。Web“保留临时文件”仅用于调试当前任务。
 
@@ -292,7 +292,7 @@ Web 设置行为：
 - Windows 生产目标：RTX 4060 Ti 8GB，模型串行分时加载，阶段结束后卸载并清 CUDA cache。
 - 开发和测试时统一使用当前工作目录下由 `uv venv` 创建的 `.venv`。
 - Python 命令写成 `uv run --no-sync python ...`；pip 命令写成 `uv pip ...`，避免区分 Windows 和 Linux 虚拟环境路径。
-- 临时运行产物放在 `temp/` 或 `agents/temp/`，正式报告放在 `reports/`。
+- 临时运行产物放在 `temp/` 或 `agents/temp/`，正式报告放在对应的 `video/<视频名>/` 目录。
 - 删除或归档本地文件时移动到 `agents/rm/`。
 
 构建 Windows Release：
@@ -345,7 +345,7 @@ Web 设置行为：
 - ONNX CUDA smoke 通过：whisperseg `model.onnx` 可创建 `CUDAExecutionProvider` session，provider 为 `['CUDAExecutionProvider', 'CPUExecutionProvider']`。
 - SORA-575 复测：ASR+Alignment 266.00s，输出 578 条字幕。
 - 对比 R02：总耗时 729.36s -> 649.40s；ASR+Alignment 430.61s -> 266.00s。
-- 逐句字幕对比报告：`reports/SORA-575.subtitle_compare.html`。
+- 逐句字幕对比报告：`video/SORA-575/SORA-575.subtitle_compare.html`。
 - VAD/chunk cache smoke：修改 ASR prompt 上限后 aligned cache miss、ASR 重跑，但 VAD chunk cache hit；静音分析与切块 2.34s -> 0.01s。
 
 #### V02 · 删除 ASR recovery 和 fallback 重写路径（R04）
@@ -371,7 +371,7 @@ Web 设置行为：
 - `fusion_lite` 使用可解释公式融合 whisperseg 分数、Silero 重叠、RMS、spectral flux 和时长分数。
 - NAMH-055 前 5 分钟：whisperseg 48 VAD segments / 129.22s speech / 14 字幕 / 11 drops；fusion_lite 23 VAD segments / 89.34s speech / 15 字幕 / 7 drops；generation overflow/error/timeout/quarantine 均为 0。
 - HAME-052 / NMSL-036 全片三模式历史对比显示 fusion_lite 输出接近 whisperseg，但 drops 少于 whisperseg。
-- 逐句报告：`reports/HAME-052_NMSL-036.full_vad_modes_line_compare.html`。
+- 逐句报告：`video/HAME-052/HAME-052_NMSL-036.full_vad_modes_line_compare.html`，同一报告也归档到 `video/NMSL-036/`。
 
 #### V05 · fusion-lite 后缀实验和帧率驱动 SRT 归一化（R11）
 

@@ -164,6 +164,10 @@ def _quality_report_markdown(video_stem: str, report: dict) -> str:
     return "\n".join(lines)
 
 
+def _default_quality_report_dir(project_root: Path, video_stem: str) -> Path:
+    return project_root / "video" / video_stem
+
+
 def write_quality_report(
     *,
     video_stem: str,
@@ -209,11 +213,13 @@ def write_quality_report(
             f0_failure=f0_failure,
             asr_qc=(asr_details or {}).get("asr_qc") or {},
         )
+        explicit_report_dir = str(report_dir).strip() if report_dir is not None else ""
+        env_report_dir = os.getenv("QUALITY_REPORT_DIR", "").strip()
         effective_report_dir = (
-            Path(report_dir)
-            if report_dir is not None
-            else Path(os.getenv("QUALITY_REPORT_DIR", "./reports"))
-        ).expanduser()
+            Path(explicit_report_dir or env_report_dir).expanduser()
+            if explicit_report_dir or env_report_dir
+            else _default_quality_report_dir(project_root, video_stem)
+        )
         if not effective_report_dir.is_absolute():
             effective_report_dir = project_root / effective_report_dir
         report_dir_path = effective_report_dir.resolve()

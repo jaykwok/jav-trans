@@ -1,38 +1,37 @@
-# Subtitle QC
+# Subtitle QC / 字幕质检
 
-Local subtitle review tools for comparing ASR transcripts, translation output, and subtitle timing across VAD variants.
+`subtitle_qc` 是本地字幕人工质检工具，用来比较不同 VAD、ASR 后端、历史字幕和外部参考字幕。默认不会切视频，而是生成可直接 seek 原视频的 HTML 报告，方便快速检查 ASR 幻觉、转写错误、时间轴切分、翻译问题、漏语音和多余语音。
 
-The default workflow does not cut video. It generates HTML reports that seek into the original video so a reviewer can quickly inspect likely hallucinations, transcription mistakes, timing splits, and translation issues.
+单视频报告默认写到对应视频目录：
 
-## Usage
+```text
+video/<video-stem>/subtitle_qc/
+```
 
-Generate all reports for one video stem:
+批量 VAD 矩阵仍把运行日志、临时中间件和聚合评测放在 `agents/temp/subtitle_qc/<task-name>/`，最终 SRT/JSON 会按视频归档到 `video/<video-stem>/`。
+
+## 单视频报告
+
+为一个视频生成全部字幕质检报告：
 
 ```bash
 uv run --no-sync python subtitle_qc/generate.py --video video/MKMP-577.mp4
 ```
 
-Outputs are written under:
+生成文件：
 
-```text
-subtitle_qc/output/<video-stem>/
-```
+- `japanese_transcript_compare.html`：不同 VAD 模式的日文转写对比。
+- `japanese_wordline_report.html`：逐 cue 日文报告，包含可用的词级时间戳。
+- `translation_compare.html`：不同 VAD 模式的日文/中文翻译对比。
+- `review_index.html`：人工 review 入口，内置原视频播放器、标签和 JSON 导出。
+- `review_items.json`：机器可读的 review 候选项和标签。
+- `summary.json`：输入路径和高层计数。
 
-Generated files:
+`review_index.html` 会把标签保存在浏览器 `localStorage`，并可导出为 `<video-stem>.subtitle_qc_labels.json`。内置问题标签包括 ASR 幻觉、转写错误、翻译错误、时间轴错误、VAD 边界错误、漏语音和多余语音。
 
-- `japanese_transcript_compare.html`: Japanese transcript comparison across VAD modes.
-- `japanese_wordline_report.html`: cue-by-cue Japanese report with available word timestamps.
-- `translation_compare.html`: Japanese and Chinese translation comparison across VAD modes.
-- `review_index.html`: prioritized human review page with one seekable video player, local labels, and JSON export.
-- `review_items.json`: machine-readable review candidates and labels.
-- `summary.json`: input paths and high-level counts.
+## 历史字幕对比
 
-`review_index.html` stores labels in browser `localStorage` and can export them as
-`<video-stem>.subtitle_qc_labels.json`. The built-in issue tags are focused on
-human supervision: ASR hallucination, transcription error, translation error,
-timing error, VAD boundary error, missing speech, and extra speech.
-
-Compare historical Japanese subtitle files for the same video:
+比较同一视频的历史日文字幕文件：
 
 ```bash
 uv run --no-sync python subtitle_qc/generate.py \
@@ -43,19 +42,18 @@ uv run --no-sync python subtitle_qc/generate.py \
   video/MKMP-577/MKMP-577.whisperseg_adaptive.bilingual.json
 ```
 
-Use `--history-only` when you only want to compare historical subtitle files and
-do not want to regenerate the VAD/translation comparison reports.
+只比较历史字幕、不重新生成 VAD/翻译对比报告时，加 `--history-only`。
 
-Historical comparison accepts `.srt` and `.json`. SRT input keeps Japanese lines
-when kana is present and treats the remaining lines as translation/context.
-JSON input supports common cue arrays such as `blocks`, `segments`, `cues`,
-`subtitles`, and fields like `start`, `end`, `ja_text`, `text`, and `zh_text`.
-It writes:
+历史对比支持 `.srt` 和 `.json`。SRT 会保留含假名的日文行，其余行作为翻译/上下文；JSON 支持常见 cue 数组字段，如 `blocks`、`segments`、`cues`、`subtitles`，以及 `start`、`end`、`ja_text`、`text`、`zh_text` 等字段。
 
-- `history_japanese_compare.html`: aligned Japanese subtitle differences.
-- `history_review_items.json`: machine-readable likely-different cue list.
+输出文件：
 
-Compare Japanese transcripts from different ASR backends:
+- `history_japanese_compare.html`：对齐后的日文字幕差异。
+- `history_review_items.json`：机器可读的疑似差异 cue 列表。
+
+## ASR 后端对比
+
+比较不同 ASR 后端生成的日文转写：
 
 ```bash
 uv run --no-sync python subtitle_qc/compare_asr_backends.py \
@@ -66,35 +64,40 @@ uv run --no-sync python subtitle_qc/compare_asr_backends.py \
   --base anime
 ```
 
-The ASR backend comparison accepts `.srt` and `.json`, aligns cues by time
-overlap plus Japanese text similarity, and writes:
+ASR 后端对比接受 `.srt` 和 `.json`，按时间重叠和日文文本相似度对齐 cue，输出到 `video/<video-stem>/subtitle_qc/`：
 
-- `asr_backend_japanese_compare.html`: sentence-by-sentence Japanese transcript comparison.
-- `asr_backend_review_items.json`: likely-different ASR cue list.
-- `asr_backend_summary.json`: input counts and output paths.
+- `asr_backend_japanese_compare.html`：逐句日文转写对比。
+- `asr_backend_review_items.json`：疑似不同的 ASR cue 列表。
+- `asr_backend_summary.json`：输入计数和输出路径。
 
-Run a VAD matrix with a selected ASR backend:
+## VAD 矩阵
+
+使用指定 ASR 后端跑 VAD 矩阵：
 
 ```bash
 uv run --no-sync python subtitle_qc/compare_vad.py --asr-backend qwen3-asr-1.7b
 ```
 
-By default this auto-discovers videos that have references under
-`video/reference/`, runs four VAD backends, and writes Japanese-only SRTs to
-`video/<video-stem>/<video-stem>.<asr-label>_<vad-label>.srt`. The default VAD set is:
+默认会发现 `video/reference/` 下有参考字幕的视频，跑四个 VAD 后端，并把日文 SRT 写到：
+
+```text
+video/<video-stem>/<video-stem>.<asr-label>_<vad-label>.srt
+```
+
+默认 VAD 集合：
 
 - `whisperseg_adaptive=whisperseg-adaptive`
 - `fusion_lite=fusion_lite`
 - `fusion_lite_boost=fusion_lite_boost`
 - `fusion_lite_sigmoid=fusion_lite_sigmoid`
 
-Outputs and aggregate evaluation files are kept under:
+运行日志、质量报告副本和聚合评测文件保存在：
 
 ```text
 agents/temp/subtitle_qc/<task-name>/
 ```
 
-Use one or more `--video` arguments to limit the run:
+限制到一个或多个视频：
 
 ```bash
 uv run --no-sync python subtitle_qc/compare_vad.py \
@@ -102,8 +105,7 @@ uv run --no-sync python subtitle_qc/compare_vad.py \
   --video MKMP-577
 ```
 
-Use repeatable `--vad` arguments to compare a custom VAD subset. Each value can
-be a backend name or `label=backend`:
+自定义 VAD 子集，参数可写后端名或 `label=backend`：
 
 ```bash
 uv run --no-sync python subtitle_qc/compare_vad.py \
@@ -112,10 +114,9 @@ uv run --no-sync python subtitle_qc/compare_vad.py \
   --vad boost=fusion_lite_boost
 ```
 
-The script skips existing output SRTs unless `--force` is passed. It can still
-read older flat outputs such as `video/<video-stem>.<label>.srt`; pass
-`--flat-video-output` only if you need to keep writing that older layout. To
-score already generated subtitles without running ASR again:
+脚本默认跳过已存在的输出 SRT；传 `--force` 可强制重跑。旧的平铺输出 `video/<video-stem>.<label>.srt` 仍可读取；只有确实需要继续写旧布局时才传 `--flat-video-output`。
+
+只评测已有字幕、不重新跑 ASR：
 
 ```bash
 uv run --no-sync python subtitle_qc/compare_vad.py \
@@ -124,34 +125,25 @@ uv run --no-sync python subtitle_qc/compare_vad.py \
   --evaluate-only
 ```
 
-When it is going to run ASR, the script checks that WhisperSeg ONNX is using
-CUDA before starting, because CPU fallback can make full-video VAD comparisons
-take hours. Pass `--allow-whisperseg-cpu` only for small smoke tests.
+脚本在跑 ASR 前会检查 WhisperSeg ONNX 是否使用 CUDA，避免 CPU fallback 跑完整视频耗时数小时。只有小型 smoke test 才建议传 `--allow-whisperseg-cpu`。
 
-Evaluate generated Japanese subtitles against an external Japanese reference:
+## 外部参考字幕评测
+
+用外部日文参考字幕评测候选字幕：
 
 ```bash
 uv run --no-sync python subtitle_qc/evaluate_reference.py --video video/MKMP-577.mp4
 ```
 
-Reference subtitles live under:
+参考字幕放在：
 
 ```text
 video/reference/
 ```
 
-Treat downloaded references as weak external references unless their source is
-known. SubtitleCat files are user-uploaded or machine-translated assets and are
-not assumed to be official production subtitles. By default the evaluator
-auto-discovers `video/reference/**/<video-stem>*` and compares it with known VAD
-outputs such as `video/<video-stem>/<video-stem>.fusion_lite.srt` and
-`video/<video-stem>/<video-stem>.whisperseg_adaptive.srt`. It reuses the SRT/JSON cue
-parsers, timestamp helpers, Japanese line splitting, and text-similarity logic
-from `generate.py`. ASS reference input is also supported for downloaded anime
-subtitle files, but non-Japanese ASS files should not be placed in
-`video/reference/`.
+下载参考字幕默认视为弱参考，除非来源明确可靠。SubtitleCat 文件是用户上传或机器翻译资产，不应当默认视为官方制作字幕。评测器会自动发现 `video/reference/**/<video-stem>*`，并与 `video/<video-stem>/` 下的候选 SRT/JSON 对比。ASS 参考输入也支持，但非日文 ASS 不应放进 `video/reference/`。
 
-You can pass explicit candidates:
+显式指定参考和候选：
 
 ```bash
 uv run --no-sync python subtitle_qc/evaluate_reference.py \
@@ -161,21 +153,20 @@ uv run --no-sync python subtitle_qc/evaluate_reference.py \
   --candidate boost=video/MKMP-577/MKMP-577.fusion_lite_boost.srt
 ```
 
-The reference evaluator aligns by each reference cue's time window and joins all
-candidate Japanese text inside that window before scoring. This is more useful
-for external subtitles than one-to-one cue matching because downloaded
-references often merge several spoken lines into one long cue. It writes:
+评测按每条参考 cue 的时间窗口聚合候选日文文本再打分，比一对一 cue 匹配更适合外部字幕，因为下载字幕经常把多句对白合成一个长 cue。输出文件：
 
-- `reference_eval_summary.md`: compact ranking table.
-- `reference_eval_metrics.csv`: per-candidate aggregate metrics.
-- `reference_eval_worst_cues.csv`: lowest-similarity reference windows for manual review.
-- `reference_eval.json`: full machine-readable metrics and worst cue payload.
+- `reference_eval_summary.md`：紧凑排名表。
+- `reference_eval_metrics.csv`：每个候选的聚合指标。
+- `reference_eval_worst_cues.csv`：相似度最低的参考窗口，供人工复核。
+- `reference_eval.json`：完整机器可读指标和 worst cue payload。
 
-Optional clip generation:
+## 可选切片
+
+切出每个 review item 的短视频片段：
 
 ```bash
 uv run --no-sync python subtitle_qc/generate.py --video video/MKMP-577.mp4 --make-clips
 uv run --no-sync python subtitle_qc/generate.py --video video/MKMP-577.mp4 --make-compilation
 ```
 
-Clip generation is intentionally opt-in because it can be slow and can consume substantial disk space.
+切片默认关闭，因为它会变慢并占用较多磁盘空间。

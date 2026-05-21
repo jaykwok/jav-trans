@@ -24,7 +24,7 @@ VIDEO_EXTS = {".mp4", ".mkv", ".mov", ".avi", ".webm"}
 REFERENCE_EXTS = {".ass", ".srt"}
 DEFAULT_DATASET_ROOT = "video/test"
 DEFAULT_INDEX = "video/test/index.json"
-DEFAULT_OUTPUT_ROOT = "reports/testset-quality-eval"
+DEFAULT_OUTPUT_ROOT = "agents/temp/testset-quality-eval"
 
 _ASS_TAG_RE = re.compile(r"\{[^{}]*\}")
 _ASS_TIME_RE = re.compile(

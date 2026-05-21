@@ -16,7 +16,6 @@ from typing import Any
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 TOOL_ROOT = Path(__file__).resolve().parent
-OUTPUT_ROOT = TOOL_ROOT / "output"
 DEFAULT_MODES = (
     "whisperseg_adaptive",
     "fusion_lite",
@@ -90,6 +89,10 @@ class ReviewItem:
 
 def project_rel(path: Path) -> str:
     return path.resolve().relative_to(PROJECT_ROOT.resolve()).as_posix()
+
+
+def subtitle_qc_output_dir(video_path: Path) -> Path:
+    return video_path.resolve().parent / video_path.stem / "subtitle_qc"
 
 
 def video_artifact_path(video_stem: str, filename: str) -> Path:
@@ -1191,7 +1194,7 @@ def main() -> None:
     if not run_variant_compare and not args.history_subtitles:
         raise SystemExit(f"no bilingual json found for {video_stem}; pass --history-subtitles for history-only comparison")
 
-    output_dir = OUTPUT_ROOT / video_stem
+    output_dir = subtitle_qc_output_dir(video_path)
     output_dir.mkdir(parents=True, exist_ok=True)
 
     cues_by_mode: dict[str, list[Cue]] = {}

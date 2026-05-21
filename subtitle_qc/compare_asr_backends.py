@@ -14,7 +14,6 @@ if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
 from generate import (  # noqa: E402
-    OUTPUT_ROOT,
     PROJECT_ROOT,
     Cue,
     Match,
@@ -26,6 +25,7 @@ from generate import (  # noqa: E402
     load_srt_file,
     project_rel,
     safe_delta,
+    subtitle_qc_output_dir,
     write_json,
 )
 
@@ -266,7 +266,7 @@ def main() -> None:
     rows = align_modes(cues_by_source, base_source)
     review_items = build_review_items(rows, sources, base_source, args.review_limit)
 
-    output_dir = OUTPUT_ROOT / video_path.stem
+    output_dir = subtitle_qc_output_dir(video_path)
     output_dir.mkdir(parents=True, exist_ok=True)
     report_name = f"{args.output_prefix}_japanese_compare.html"
     review_name = f"{args.output_prefix}_review_items.json"

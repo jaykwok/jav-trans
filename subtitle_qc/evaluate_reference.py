@@ -18,7 +18,6 @@ if str(SCRIPT_DIR) not in sys.path:
 
 from generate import (  # noqa: E402
     DEFAULT_MODES,
-    OUTPUT_ROOT,
     PROJECT_ROOT,
     Cue,
     fmt_time,
@@ -29,6 +28,7 @@ from generate import (  # noqa: E402
     parse_timecode,
     project_rel,
     split_subtitle_lines,
+    subtitle_qc_output_dir,
     text_similarity,
     write_json,
 )
@@ -427,7 +427,7 @@ def main() -> None:
             "pass --allow-non-japanese-reference to override"
         )
 
-    output_dir = OUTPUT_ROOT / video_path.stem
+    output_dir = subtitle_qc_output_dir(video_path)
     output_dir.mkdir(parents=True, exist_ok=True)
 
     all_metrics: list[CandidateMetrics] = []
