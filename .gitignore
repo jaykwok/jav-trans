@@ -18,13 +18,34 @@ agents/
 log/
 reports/
 subtitle_qc/output/
+video/*/subtitle_qc/
+video/subtitle_qc/
+*.quality_report.json
+*.quality_report.md
+*.bilingual.json
+*.timings.json
+*.transcript.json
+*.aligned_segments.json
+*.asr_manifest.json
+*.subtitle_compare.html
+*.vad_bilingual_compare.html
+*.line_compare.html
+*.japanese_transcript_vad_compare.html
 
 # Project temp/cache root. Keep the directory placeholder if present.
 temp/*
 !temp/.gitkeep
 
-# Local media and models. Keep model documentation.
+# Local media, generated video outputs, and models. Keep model documentation.
 video/
+*.mp4
+*.mkv
+*.mov
+*.avi
+*.m4v
+*.webm
+*.srt
+*.ass
 models/*
 !models/README.md
 
