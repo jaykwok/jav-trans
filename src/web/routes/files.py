@@ -12,6 +12,7 @@ from starlette.responses import FileResponse
 
 from utils.model_paths import PROJECT_ROOT
 from web.pipeline_manager import get_job
+from web.models import JobState
 
 
 router = APIRouter()
@@ -67,6 +68,55 @@ def _scan_video_folder(raw_folder: str) -> list[str]:
     except OSError:
         return paths
     return sorted(paths)
+
+
+def _artifact_path_candidates(job: JobState, raw_path: str) -> list[Path]:
+    raw_text = str(raw_path or "").strip()
+    if not raw_text:
+        return []
+    requested_name = Path(raw_text).name
+    output_base = _resolve_output_base(job.spec.output_dir)
+    candidates: list[Path] = []
+    for artifact in job.artifacts:
+        artifact_text = str(artifact)
+        artifact_path = Path(artifact_text)
+        if raw_text not in {artifact_text, artifact_path.name}:
+            continue
+        if artifact_path.is_absolute():
+            candidates.append(artifact_path)
+        else:
+            candidates.append(output_base / artifact_path)
+            candidates.append(PROJECT_ROOT / artifact_path)
+    if requested_name:
+        for artifact in job.artifacts:
+            artifact_path = Path(str(artifact))
+            if artifact_path.name != requested_name:
+                continue
+            if artifact_path.is_absolute():
+                candidates.append(artifact_path)
+            else:
+                candidates.append(output_base / artifact_path)
+                candidates.append(PROJECT_ROOT / artifact_path)
+    return candidates
+
+
+def _resolve_authorized_artifact_path(job: JobState, raw_path: str) -> Path | None:
+    for candidate in _artifact_path_candidates(job, raw_path):
+        try:
+            resolved = candidate.expanduser().resolve()
+        except (OSError, RuntimeError):
+            continue
+        if resolved.exists():
+            return resolved
+    return None
+
+
+def _is_job_video_path(job: JobState, path: Path) -> bool:
+    for raw_video_path in job.spec.video_paths:
+        video_path = _resolve_existing_video_path(raw_video_path)
+        if video_path is not None and video_path == path:
+            return True
+    return False
 
 
 def _pick_files_windows() -> list[str]:
@@ -254,10 +304,15 @@ async def pick_folder() -> dict[str, list[str]]:
 
 
 @router.get("/open-video")
-async def open_video(path: str) -> dict[str, bool]:
+async def open_video(job_id: str, path: str) -> dict[str, bool]:
+    job = await get_job(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="Job not found")
     resolved = _resolve_existing_video_path(path)
     if resolved is None:
         raise HTTPException(status_code=404, detail="Video file not found")
+    if not _is_job_video_path(job, resolved):
+        raise HTTPException(status_code=403, detail="Video path is not part of this job")
     if os.name == "nt":
         os.startfile(str(resolved))  # type: ignore[attr-defined]
     else:
@@ -266,11 +321,17 @@ async def open_video(path: str) -> dict[str, bool]:
 
 
 @router.get("/open-folder")
-async def open_folder(path: str) -> dict[str, bool]:
-    try:
-        target = Path(path).expanduser().resolve()
-    except (OSError, RuntimeError):
-        raise HTTPException(status_code=400, detail="Invalid path")
+async def open_folder(job_id: str, path: str) -> dict[str, bool]:
+    job = await get_job(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="Job not found")
+    target = _resolve_authorized_artifact_path(job, path)
+    if target is None:
+        video_path = _resolve_existing_video_path(path)
+        if video_path is not None and _is_job_video_path(job, video_path):
+            target = video_path
+    if target is None:
+        raise HTTPException(status_code=403, detail="Path is not part of this job")
     folder = target if target.is_dir() else target.parent
     if not folder.is_dir():
         raise HTTPException(status_code=404, detail="Folder not found")
@@ -294,13 +355,12 @@ async def get_output_file(job_id: str, filename: str) -> FileResponse:
     candidates: list[Path] = []
     for artifact in job.artifacts:
         artifact_path = Path(str(artifact))
-        if artifact_path.name != requested_name:
-            continue
-        if artifact_path.is_absolute():
-            candidates.append(artifact_path)
-        else:
-            candidates.append(output_base / artifact_path)
-            candidates.append(PROJECT_ROOT / artifact_path)
+        if artifact_path.name == requested_name:
+            if artifact_path.is_absolute():
+                candidates.append(artifact_path)
+            else:
+                candidates.append(output_base / artifact_path)
+                candidates.append(PROJECT_ROOT / artifact_path)
 
     for candidate in candidates:
         try:

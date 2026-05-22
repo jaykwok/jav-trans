@@ -312,16 +312,22 @@ def _relative_artifacts(paths: list[str], output_dir: str | None) -> list[str]:
     base = base.resolve()
     result: list[str] = []
     for raw_path in paths:
-        path = Path(str(raw_path))
+        path = Path(str(raw_path)).expanduser()
         if not path.is_absolute():
             path = PROJECT_ROOT / path
         try:
-            result.append(path.resolve().relative_to(base).as_posix())
+            resolved = path.resolve()
+        except (OSError, RuntimeError):
+            continue
+        if not resolved.is_file():
+            continue
+        try:
+            result.append(resolved.relative_to(base).as_posix())
         except ValueError:
             try:
-                result.append(path.resolve().relative_to(PROJECT_ROOT).as_posix())
+                result.append(resolved.relative_to(PROJECT_ROOT).as_posix())
             except ValueError:
-                result.append(str(path))
+                result.append(str(resolved))
     return result
 
 

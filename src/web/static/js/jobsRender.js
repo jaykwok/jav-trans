@@ -29,6 +29,12 @@ const STAGE_LABEL = {
 
 const PROGRESS_PCT = { queued: 0, asr: 20, translating: 60, writing: 90, done: 100, failed: 100, cancelled: 0 };
 
+function clampPct(value) {
+  const n = Number(value);
+  if (!Number.isFinite(n)) return 0;
+  return Math.min(100, Math.max(0, n));
+}
+
 export const CLEARABLE = new Set(['done', 'failed', 'cancelled']);
 
 function jobTitle(job) {
@@ -66,6 +72,7 @@ export function renderJobs() {
     if (job.progress?.stage === 'translation' && translatedRatio != null) {
       pct = Math.round(60 + translatedRatio * 30);
     }
+    pct = clampPct(pct);
     const fillClass = job.status === 'done' ? ' done' : job.status === 'failed' ? ' error' : '';
     const stage = STAGE_LABEL[job.current_stage] ?? STAGE_LABEL[job.status] ?? job.current_stage ?? job.status;
     const progressInfo = translated != null ? ` ${translated}/${expected ?? '?'}` : '';
@@ -74,23 +81,23 @@ export function renderJobs() {
     const isRetryable = ['failed', 'cancelled'].includes(job.status);
     const isCancellable = ['queued', 'asr', 'translating', 'writing'].includes(job.status);
     const retryBtn = isRetryable
-      ? `<button class="btn-sm btn-retry" data-retry="${id}" title="从当前缓存阶段重试">↺ 重试</button>`
+      ? `<button class="btn-sm btn-retry" data-retry="${escHtml(id)}" title="从当前缓存阶段重试">↺ 重试</button>`
       : '';
 
     const srtArtifacts = isDone ? job.artifacts.filter(p => /\.srt$/i.test(p)) : [];
     const otherArtifacts = isDone ? job.artifacts.filter(p => !/\.srt$/i.test(p)) : [];
 
     const srtBtns = srtArtifacts.map(p => {
-      const name = p.split(/[\\/]/).pop();
-      return `<button class="btn-sm btn-dl" data-dl="${id}" data-file="${name}" title="${name}">⬇ ${name}</button>`;
+      const name = p.split(/[\\/]/).pop() || '';
+      return `<button class="btn-sm btn-dl" data-dl="${escHtml(id)}" data-file="${escHtml(name)}" title="${escHtml(name)}">⬇ ${escHtml(name)}</button>`;
     }).join('');
 
     const otherSection = otherArtifacts.length ? `
       <details class="other-files">
         <summary>其他文件 (${otherArtifacts.length})</summary>
         ${otherArtifacts.map(p => {
-          const name = p.split(/[\\/]/).pop();
-          return `<button class="btn-sm btn-dl btn-dl-other" data-dl="${id}" data-file="${name}" title="${name}">⬇ ${name}</button>`;
+          const name = p.split(/[\\/]/).pop() || '';
+          return `<button class="btn-sm btn-dl btn-dl-other" data-dl="${escHtml(id)}" data-file="${escHtml(name)}" title="${escHtml(name)}">⬇ ${escHtml(name)}</button>`;
         }).join('')}
       </details>` : '';
 
@@ -102,7 +109,7 @@ export function renderJobs() {
       ? (srtArtifacts[0] || job.artifacts[0] || job.spec?.video_paths?.[0] || '')
       : '';
     const openFolderBtn = folderPath
-      ? `<button class="btn-sm btn-folder" data-folder="${folderPath}" title="打开输出文件夹">📂 文件夹</button>`
+      ? `<button class="btn-sm btn-folder" data-folder="${escHtml(folderPath)}" title="打开输出文件夹">📂 文件夹</button>`
       : '';
 
     const errorMsg = job.status === 'failed' && job.error
@@ -117,7 +124,7 @@ export function renderJobs() {
     const dl = job._download;
     let progressSection = `<div class="progress-bar"><div class="progress-fill${fillClass}" style="width:${pct}%"></div></div>`;
     if (dl) {
-      const dlPct = dl.pct ?? 0;
+      const dlPct = clampPct(dl.pct ?? 0);
       const fname = dl.file ? dl.file.split(/[\\/]/).pop().replace(/\.(safetensors|bin|pt|gguf)$/, '') : '模型';
       const downloadedMb = dl.sizeMb ? Math.round(dlPct / 100 * dl.sizeMb) : null;
       const sizeStr = downloadedMb != null && dl.sizeMb ? `${downloadedMb}/${dl.sizeMb}MB` : '';
@@ -128,28 +135,29 @@ export function renderJobs() {
       const showMirrorBtn = slowDur >= 5000 && !mirrorOn;
       progressSection = `
         <div class="dl-row">
-          <span class="dl-label">↓ ${fname}</span>
-          <span class="dl-info">${info}</span>
-          ${showMirrorBtn ? `<button class="btn-sm btn-enable-mirror" data-enable-mirror="${id}">启用镜像加速</button>` : ''}
+          <span class="dl-label">↓ ${escHtml(fname)}</span>
+          <span class="dl-info">${escHtml(info)}</span>
+          ${showMirrorBtn ? `<button class="btn-sm btn-enable-mirror" data-enable-mirror="${escHtml(id)}">启用镜像加速</button>` : ''}
         </div>
         <div class="dl-bar"><div class="dl-bar-fill" style="width:${dlPct}%"></div></div>`;
     }
+    const title = jobTitle(job);
 
     card.innerHTML = `
       <div class="job-header">
-        <span class="job-title" title="${jobTitle(job)}">${jobTitle(job)}</span>
-        <span class="badge badge-${job.status}">${STATUS_LABEL[job.status] ?? job.status}</span>
+        <span class="job-title" title="${escHtml(title)}">${escHtml(title)}</span>
+        <span class="badge badge-${escHtml(job.status)}">${escHtml(STATUS_LABEL[job.status] ?? job.status)}</span>
       </div>
       ${progressSection}
       <div class="job-footer">
-        <span class="job-stage">${stage}${progressInfo}</span>
+        <span class="job-stage">${escHtml(stage)}${escHtml(progressInfo)}</span>
         ${playBtn}
         ${openFolderBtn}
         ${srtBtns}
         ${otherSection}
         ${retryBtn}
-        ${isCancellable ? `<button class="btn-sm btn-del" data-cancel="${id}">取消</button>` : ''}
-        ${CLEARABLE.has(job.status) ? `<button class="btn-sm btn-remove" data-remove="${id}" title="从列表删除">✕ 删除</button>` : ''}
+        ${isCancellable ? `<button class="btn-sm btn-del" data-cancel="${escHtml(id)}">取消</button>` : ''}
+        ${CLEARABLE.has(job.status) ? `<button class="btn-sm btn-remove" data-remove="${escHtml(id)}" title="从列表删除">✕ 删除</button>` : ''}
       </div>
       ${errorMsg}`;
   });
@@ -163,7 +171,7 @@ export function installJobAreaHandlers(fetchAllJobs, enableHfMirror) {
 
     const dl = e.target.closest('[data-dl]');
     if (dl) {
-      const url = `/api/output/${dl.dataset.dl}/${dl.dataset.file}`;
+      const url = `/api/output/${encodeURIComponent(dl.dataset.dl)}/${encodeURIComponent(dl.dataset.file)}`;
       const a = document.createElement('a');
       a.href = url; a.download = dl.dataset.file; a.click();
       return;
@@ -173,13 +181,19 @@ export function installJobAreaHandlers(fetchAllJobs, enableHfMirror) {
       const job = state.jobs[play.dataset.play];
       const videoPath = job?.spec?.video_paths?.[0];
       if (videoPath) {
-        try { await fetch(`/api/open-video?path=${encodeURIComponent(videoPath)}`); } catch {}
+        try {
+          await fetch(`/api/open-video?job_id=${encodeURIComponent(play.dataset.play)}&path=${encodeURIComponent(videoPath)}`);
+        } catch {}
       }
       return;
     }
     const folder = e.target.closest('[data-folder]');
     if (folder) {
-      try { await fetch(`/api/open-folder?path=${encodeURIComponent(folder.dataset.folder)}`); } catch {}
+      const card = folder.closest('.job-card');
+      const jobId = card?.dataset?.id || '';
+      try {
+        await fetch(`/api/open-folder?job_id=${encodeURIComponent(jobId)}&path=${encodeURIComponent(folder.dataset.folder)}`);
+      } catch {}
       return;
     }
     const retry = e.target.closest('[data-retry]');

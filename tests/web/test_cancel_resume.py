@@ -231,6 +231,31 @@ def test_retry_cancelled_job_requeues_same_job_id(tmp_path, monkeypatch):
     asyncio.run(_test_retry_cancelled_job_requeues_same_job_id(tmp_path, monkeypatch))
 
 
+def test_relative_artifacts_filters_deleted_temp_files(tmp_path, monkeypatch):
+    output_dir = tmp_path / "out"
+    output_dir.mkdir()
+    srt_path = output_dir / "sample.srt"
+    srt_path.write_text("1\n", encoding="utf-8")
+    temp_dir = tmp_path / "jobs" / "job-id"
+    temp_dir.mkdir(parents=True)
+    deleted_timings = temp_dir / "sample.timings.json"
+    existing_report = output_dir / "sample.quality.md"
+    existing_report.write_text("# report\n", encoding="utf-8")
+    monkeypatch.setattr(pm, "PROJECT_ROOT", tmp_path)
+
+    artifacts = pm._relative_artifacts(
+        [
+            str(srt_path),
+            str(deleted_timings),
+            str(existing_report.relative_to(tmp_path)),
+            str(output_dir),
+        ],
+        str(output_dir),
+    )
+
+    assert artifacts == ["sample.srt", "sample.quality.md"]
+
+
 def _sample_asr_artifacts(job: JobState, temp_dir: Path, output_dir: Path):
     return AsrArtifacts(
         segments=[{"start": 0.0, "end": 1.0, "text": "こんにちは"}],
