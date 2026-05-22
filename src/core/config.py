@@ -56,7 +56,7 @@ DEFAULT_SETTINGS: dict[str, str] = {
     "WHISPER_FORCED_FAIL_RATIO": "0.3",
     "WHISPER_UNLOAD_EVERY": "200",
     # Voice activity detection backend used before ASR chunking.
-    "ASR_VAD_BACKEND": "whisperseg-adaptive",
+    "ASR_VAD_BACKEND": "fusion_lite",
     # 1 lets WhisperSeg adjust its threshold once from whole-audio speech density.
     "ASR_VAD_ADAPTIVE": "1",
     # Primary/gate components used by fusion_lite* VAD backends.
@@ -169,7 +169,7 @@ DEFAULT_SETTINGS: dict[str, str] = {
     "WHISPERSEG_FORCE_CPU": "0",
 
     # --- Fusion-lite Internal Silero Gate Settings ---
-    # Silero is not a user-facing VAD mode; fusion_lite* uses it as one speech prior.
+    # Silero is not a user-facing VAD mode; fusion_lite variants use it as one speech prior.
     "SILERO_VAD_THRESHOLD": "0.35",
     "SILERO_VAD_MIN_SPEECH_MS": "80",
     "SILERO_VAD_MIN_SILENCE_MS": "80",
@@ -179,9 +179,7 @@ DEFAULT_SETTINGS: dict[str, str] = {
     "SILERO_VAD_CHUNK_THRESHOLD_S": "1.0",
     "SILERO_VAD_ONNX": "1",
     # Fusion-lite VAD keeps WhisperSeg as the candidate generator and combines
-    # Silero overlap with lightweight acoustic features. Experimental only.
-    # Suffix backends like fusion_lite_boost and fusion_lite_sigmoid use fixed
-    # recipe overrides in code, so operators can compare by backend name only.
+    # Silero overlap with lightweight acoustic features.
     "FUSION_VAD_PRIMARY_WEIGHT": "0.45",
     "FUSION_VAD_GATE_WEIGHT": "0.25",
     "FUSION_VAD_RMS_WEIGHT": "0.15",
