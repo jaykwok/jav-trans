@@ -19,10 +19,14 @@ TOOL_ROOT = Path(__file__).resolve().parent
 DEFAULT_MODES = (
     "whisperseg_adaptive",
     "fusion_lite",
-    "fusion_lite_boost",
-    "fusion_lite_sigmoid",
 )
 DEFAULT_BASE_MODE = "whisperseg_adaptive"
+MODE_ALIASES = {
+    "whisperseg-adaptive": "whisperseg_adaptive",
+    "whisperseg_adaptive": "whisperseg_adaptive",
+    "fusion-lite": "fusion_lite",
+    "fusion_lite": "fusion_lite",
+}
 LABEL_STATUSES = ("unreviewed", "ok", "needs_fix", "unsure")
 LABEL_ISSUES = (
     "asr_hallucination",
@@ -130,6 +134,40 @@ def fmt_time(seconds: float) -> str:
 
 def normalize_text(value: str) -> str:
     return "".join(str(value or "").split())
+
+
+def normalize_mode_suffix(value: str) -> str:
+    clean = re.sub(r"[^A-Za-z0-9_.-]+", "_", value.strip())
+    return clean.replace("-", "_").strip("_")
+
+
+def canonical_mode_label(value: str) -> str:
+    normalized = normalize_mode_suffix(value)
+    lowered = normalized.lower()
+    direct = MODE_ALIASES.get(value.strip()) or MODE_ALIASES.get(normalized) or MODE_ALIASES.get(lowered)
+    if direct is not None:
+        return direct
+    matches = []
+    for label in DEFAULT_MODES:
+        normalized_label = normalize_mode_suffix(label).lower()
+        if lowered == normalized_label or lowered.endswith(f"_{normalized_label}"):
+            matches.append(label)
+    allowed = ", ".join(DEFAULT_MODES)
+    if len(matches) == 1:
+        return matches[0]
+    if matches:
+        raise SystemExit(f"ambiguous subtitle_qc VAD mode {value!r}; allowed: {allowed}")
+    raise SystemExit(f"unknown subtitle_qc VAD mode {value!r}; allowed: {allowed}")
+
+
+def bilingual_mode_suffix(video_stem: str, path: Path) -> str:
+    prefix = f"{video_stem}."
+    suffix = path.name
+    if suffix.lower().startswith(prefix.lower()):
+        suffix = suffix[len(prefix) :]
+    if suffix.lower().endswith(".bilingual.json"):
+        suffix = suffix[: -len(".bilingual.json")]
+    return normalize_mode_suffix(suffix)
 
 
 def text_similarity(left: str, right: str) -> float:
@@ -329,16 +367,40 @@ def load_subtitle_file(path: Path) -> list[Cue]:
 
 def discover_modes(video_stem: str, requested: list[str] | None) -> list[str]:
     if requested:
-        return requested
-    found = []
-    for mode in DEFAULT_MODES:
-        if video_artifact_path(video_stem, f"{video_stem}.{mode}.bilingual.json").exists():
-            found.append(mode)
-    if not found:
-        for path in iter_video_artifacts(video_stem, f"{video_stem}.*.bilingual.json"):
-            suffix = path.name.removeprefix(f"{video_stem}.").removesuffix(".bilingual.json")
-            found.append(suffix)
-    return found
+        modes: list[str] = []
+        seen: set[str] = set()
+        for item in requested:
+            canonical_mode_label(item)
+            mode = normalize_mode_suffix(item)
+            if mode not in seen:
+                seen.add(mode)
+                modes.append(mode)
+        return modes
+
+    found_by_label: dict[str, str] = {}
+    for path in iter_video_artifacts(video_stem, f"{video_stem}.*.bilingual.json"):
+        suffix = bilingual_mode_suffix(video_stem, path)
+        label = canonical_mode_label(suffix)
+        current = found_by_label.get(label)
+        if current is None or suffix == label:
+            found_by_label[label] = suffix
+    return [found_by_label[label] for label in DEFAULT_MODES if label in found_by_label]
+
+
+def resolve_base_mode(requested_base: str, modes: list[str]) -> str:
+    normalized_base = normalize_mode_suffix(requested_base)
+    if normalized_base in modes:
+        return normalized_base
+    try:
+        base_label = canonical_mode_label(normalized_base)
+    except SystemExit as exc:
+        raise SystemExit(f"base mode {requested_base!r} is not allowed: {exc}") from exc
+    matches = [mode for mode in modes if canonical_mode_label(mode) == base_label]
+    if len(matches) == 1:
+        return matches[0]
+    if matches:
+        raise SystemExit(f"base mode {requested_base!r} is ambiguous in modes: {modes}")
+    raise SystemExit(f"base mode {requested_base!r} not in modes: {modes}")
 
 
 def find_best_match(base: Cue, candidates: list[Cue], cursor: int) -> tuple[Cue | None, int, float, float, float]:
@@ -1182,8 +1244,7 @@ def main() -> None:
         raise SystemExit("--history-only requires --history-subtitles")
     modes = [] if args.history_only else discover_modes(video_stem, args.modes)
     run_variant_compare = bool(modes) and not args.history_only
-    if run_variant_compare and args.base_mode not in modes:
-        raise SystemExit(f"base mode {args.base_mode!r} not in modes: {modes}")
+    base_mode = resolve_base_mode(args.base_mode, modes) if run_variant_compare else args.base_mode
     missing = [
         mode
         for mode in modes
@@ -1214,13 +1275,13 @@ def main() -> None:
 
     if run_variant_compare:
         cues_by_mode = {mode: load_cues(video_stem, mode) for mode in modes}
-        rows = align_modes(cues_by_mode, args.base_mode)
-        items = build_review_items(rows, modes, args.base_mode, args.review_limit)
+        rows = align_modes(cues_by_mode, base_mode)
+        items = build_review_items(rows, modes, base_mode, args.review_limit)
         (output_dir / "japanese_transcript_compare.html").write_text(
             build_compare_report(
                 video_stem=video_stem,
                 modes=modes,
-                base_mode=args.base_mode,
+                base_mode=base_mode,
                 rows=rows,
                 include_translation=False,
             ),
@@ -1230,7 +1291,7 @@ def main() -> None:
             build_wordline_report(
                 video_stem=video_stem,
                 modes=modes,
-                base_mode=args.base_mode,
+                base_mode=base_mode,
                 rows=rows,
             ),
             encoding="utf-8",
@@ -1239,7 +1300,7 @@ def main() -> None:
             build_compare_report(
                 video_stem=video_stem,
                 modes=modes,
-                base_mode=args.base_mode,
+                base_mode=base_mode,
                 rows=rows,
                 include_translation=True,
             ),
@@ -1253,7 +1314,7 @@ def main() -> None:
         write_json(output_dir / "review_items.json", [asdict(item) for item in items])
         summary_payload.update(
             {
-                "base_mode": args.base_mode,
+                "base_mode": base_mode,
                 "modes": modes,
                 "counts": {mode: len(cues) for mode, cues in cues_by_mode.items()},
                 "review_item_count": len(items),

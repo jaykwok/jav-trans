@@ -19,26 +19,12 @@ def test_vad_registry_exposes_only_current_user_modes(monkeypatch):
         lambda self: None,
         raising=False,
     )
-    monkeypatch.setattr(
-        "vad.fusion_lite_backend.FusionLiteBoostVadBackend.__init__",
-        lambda self: None,
-        raising=False,
-    )
-    monkeypatch.setattr(
-        "vad.fusion_lite_backend.FusionLiteSigmoidVadBackend.__init__",
-        lambda self: None,
-        raising=False,
-    )
-
     adaptive = vad.get_vad_backend("whisperseg-adaptive")
     assert adaptive.name == "whisperseg_v1"
     fusion = vad.get_vad_backend("fusion_lite")
     assert fusion.name == "fusion_lite_v1"
-    fusion_boost = vad.get_vad_backend("fusion_lite_boost")
-    assert fusion_boost.name == "fusion_lite_boost_v1"
-    fusion_sigmoid = vad.get_vad_backend("fusion_lite_sigmoid")
-    assert fusion_sigmoid.name == "fusion_lite_sigmoid_v1"
-
+    with pytest.raises(ValueError, match="fusion_lite_boost"):
+        vad.get_vad_backend("fusion_lite_boost")
     with pytest.raises(ValueError, match="whisperseg"):
         vad.get_vad_backend("whisperseg")
     with pytest.raises(ValueError, match="hybrid_precision"):
@@ -109,118 +95,9 @@ def test_fusion_lite_scoring_keeps_acoustic_speech_without_gate_overlap():
     assert decisions[0]["score_enhancement"] == pytest.approx(1.0)
 
 
-def test_fusion_lite_boost_scoring_keeps_variant_separate():
-    from vad.base import SpeechSegment
-    from vad.fusion_lite_backend import _filter_grouped_segments
-
-    candidate = SpeechSegment(0.0, 1.0, 0.40)
-    gate = SpeechSegment(0.2, 0.5, 0.9)
-    params = {
-        "scoring_variant": "boost",
-        "dynamic_gate_pad": True,
-        "primary_weight": 0.50,
-        "gate_weight": 0.25,
-        "rms_weight": 0.15,
-        "spectral_flux_weight": 0.08,
-        "duration_weight": 0.02,
-        "min_score": 0.45,
-        "min_gate_overlap_ratio": 0.08,
-        "gate_pad_s": 0.30,
-        "default_primary_score": 0.50,
-        "boost_overlap_scale": 0.30,
-        "boost_rms_scale": 0.20,
-        "boost_keep_min_rms_score": 0.60,
-    }
-
-    groups, kept, dropped, decisions = _filter_grouped_segments(
-        [[candidate]],
-        [gate],
-        feature_lookup=lambda _: {
-            "rms_dbfs": -24.0,
-            "rms_score": 0.80,
-            "spectral_flux_score": 0.30,
-            "duration_score": 1.0,
-        },
-        params=params,
-    )
-
-    assert groups == [[candidate]]
-    assert kept == [candidate]
-    assert dropped == []
-    assert decisions[0]["speech_score"] > decisions[0]["raw_score"]
-    assert decisions[0]["score_enhancement"] > 1.0
-    assert decisions[0]["gate_pad_s"] == pytest.approx(0.30)
-
-
-def test_fusion_lite_sigmoid_uses_window_duration_score():
-    from vad.base import SpeechSegment
-    from vad.fusion_lite_backend import _duration_window_score, _filter_grouped_segments
-
-    short = SpeechSegment(0.0, 0.2, 0.50)
-    mid = SpeechSegment(1.0, 2.0, 0.60)
-    long = SpeechSegment(3.0, 14.0, 0.50)
-
-    assert _duration_window_score(
-        1.0,
-        short_mid_s=0.6,
-        short_steepness=6.0,
-        long_mid_s=8.0,
-        long_steepness=1.4,
-    ) > _duration_window_score(
-        14.0,
-        short_mid_s=0.6,
-        short_steepness=6.0,
-        long_mid_s=8.0,
-        long_steepness=1.4,
-    )
-
-    params = {
-        "scoring_variant": "sigmoid",
-        "dynamic_gate_pad": True,
-        "primary_weight": 0.40,
-        "gate_weight": 0.30,
-        "rms_weight": 0.15,
-        "spectral_flux_weight": 0.10,
-        "duration_weight": 0.05,
-        "min_score": 0.42,
-        "min_gate_overlap_ratio": 0.12,
-        "gate_pad_s": 0.30,
-        "default_primary_score": 0.50,
-        "sigmoid_keep_min_primary_score": 0.55,
-        "sigmoid_midpoint": 0.50,
-        "sigmoid_steepness": 8.0,
-    }
-
-    def features(segment):
-        duration_score = 0.95 if segment is mid else 0.10 if segment is short else 0.01
-        return {
-            "rms_dbfs": -24.0,
-            "rms_score": 0.90,
-            "spectral_flux_score": 0.70,
-            "duration_score": duration_score,
-        }
-
-    _, kept, dropped, decisions = _filter_grouped_segments(
-        [[short, mid, long]],
-        [],
-        feature_lookup=features,
-        params=params,
-    )
-
-    assert mid in kept
-    assert short in dropped
-    assert long in dropped
-    assert all(0.0 <= row["speech_score"] <= 1.0 for row in decisions)
-    assert decisions[1]["speech_score"] != pytest.approx(decisions[1]["raw_score"])
-
-
 def test_fusion_lite_signature_contains_weights_and_feature_thresholds(monkeypatch):
     from vad.base import SegmentationResult, SpeechSegment
-    from vad.fusion_lite_backend import (
-        FusionLiteBoostVadBackend,
-        FusionLiteSigmoidVadBackend,
-        FusionLiteVadBackend,
-    )
+    from vad.fusion_lite_backend import FusionLiteVadBackend
 
     class StubBackend:
         def __init__(self, name: str):
@@ -257,19 +134,6 @@ def test_fusion_lite_signature_contains_weights_and_feature_thresholds(monkeypat
     assert sig["scoring_variant"] == "linear"
     assert sig["dynamic_gate_pad"] is False
 
-    boost_sig = FusionLiteBoostVadBackend().signature()
-    assert boost_sig["backend"] == "fusion_lite_boost_v1"
-    assert boost_sig["scoring_variant"] == "boost"
-    assert boost_sig["primary_weight"] == pytest.approx(0.50)
-    assert boost_sig["boost_overlap_scale"] == pytest.approx(0.30)
-    assert boost_sig["dynamic_gate_pad"] is True
-
-    sigmoid_sig = FusionLiteSigmoidVadBackend().signature()
-    assert sigmoid_sig["backend"] == "fusion_lite_sigmoid_v1"
-    assert sigmoid_sig["scoring_variant"] == "sigmoid"
-    assert sigmoid_sig["duration_curve"] == "window"
-    assert sigmoid_sig["duration_long_mid_s"] == pytest.approx(8.0)
-
 
 def test_vad_cache_key_changes_with_fusion_weight(monkeypatch, tmp_path):
     import wave
@@ -299,32 +163,3 @@ def test_vad_cache_key_changes_with_fusion_weight(monkeypatch, tmp_path):
     )
 
     assert first["digest"] != second["digest"]
-
-
-def test_vad_cache_key_changes_with_fusion_variant(monkeypatch, tmp_path):
-    import wave
-
-    from whisper import vad_chunk_cache
-
-    wav_path = tmp_path / "audio.wav"
-    with wave.open(str(wav_path), "wb") as writer:
-        writer.setnchannels(1)
-        writer.setsampwidth(2)
-        writer.setframerate(16000)
-        writer.writeframes(b"\x00\x00" * 16000)
-
-    monkeypatch.setenv("VAD_CHUNK_CACHE_DIR", str(tmp_path / "cache"))
-    monkeypatch.setenv("ASR_VAD_BACKEND", "fusion_lite")
-    linear = vad_chunk_cache.build_cache_lookup(
-        str(wav_path),
-        vad_signature={"backend": "fusion_lite_v1", "scoring_variant": "linear"},
-        chunk_config={},
-    )
-    monkeypatch.setenv("ASR_VAD_BACKEND", "fusion_lite_boost")
-    boost = vad_chunk_cache.build_cache_lookup(
-        str(wav_path),
-        vad_signature={"backend": "fusion_lite_boost_v1", "scoring_variant": "boost"},
-        chunk_config={},
-    )
-
-    assert linear["digest"] != boost["digest"]

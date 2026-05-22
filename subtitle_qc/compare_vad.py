@@ -30,8 +30,6 @@ import evaluate_reference as ref_eval  # noqa: E402
 DEFAULT_VADS: tuple[tuple[str, str], ...] = (
     ("whisperseg_adaptive", "whisperseg-adaptive"),
     ("fusion_lite", "fusion_lite"),
-    ("fusion_lite_boost", "fusion_lite_boost"),
-    ("fusion_lite_sigmoid", "fusion_lite_sigmoid"),
 )
 VIDEO_EXTS = (".mp4", ".mkv", ".mov", ".avi", ".m4v", ".webm")
 
@@ -362,6 +360,8 @@ def build_ctx(
     job_temp_dir = paths.job_root / job_id
     output_dir = paths.generated_root / job_id
     quality_dir = subtitle_qc_task_dir(video, args.task_name) / "quality_reports"
+    trial_overrides = dict(getattr(args, "env_overrides", {}) or {})
+    trial_overrides.update(dict((getattr(args, "trial_env_by_label", {}) or {}).get(label, {}) or {}))
     spec = SimpleNamespace(
         asr_backend=args.asr_backend,
         asr_context=args.asr_context,
@@ -394,6 +394,7 @@ def build_ctx(
             "RUN_LOG_DIR": str(paths.run_log_dir),
             "VAD_CHUNK_CACHE_ENABLED": os.getenv("VAD_CHUNK_CACHE_ENABLED", "1"),
             "VAD_CHUNK_CACHE_DIR": os.getenv("VAD_CHUNK_CACHE_DIR", "./temp/vad-cache"),
+            **trial_overrides,
         },
     )
     return job_context_cls.from_spec(
@@ -873,7 +874,7 @@ def parse_args() -> argparse.Namespace:
         "--mode",
         dest="vad",
         action="append",
-        help="VAD backend or label=backend. Repeatable. Defaults to whisperseg-adaptive and fusion_lite variants.",
+        help="VAD backend or label=backend. Repeatable. Defaults to whisperseg-adaptive and fusion_lite.",
     )
     parser.add_argument("--video", action="append", help="Video path, name, or stem. Repeatable.")
     parser.add_argument("--reference", action="append", help="Reference path paired with --video. Repeatable.")
