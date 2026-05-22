@@ -10,9 +10,15 @@ function renderFiles() {
   state.files.forEach((f, i) => {
     const chip = document.createElement('div');
     chip.className = 'file-chip';
-    chip.innerHTML = `
-      <span class="fname" title="${f.path}">${f.name}</span>
-      <span class="rm" data-i="${i}">✕</span>`;
+    const name = document.createElement('span');
+    name.className = 'fname';
+    name.title = f.path || '';
+    name.textContent = f.name || f.path || '';
+    const remove = document.createElement('span');
+    remove.className = 'rm';
+    remove.dataset.i = String(i);
+    remove.textContent = '✕';
+    chip.append(name, remove);
     fileList.appendChild(chip);
   });
   btnSubmit.disabled = state.files.length === 0;

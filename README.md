@@ -337,6 +337,7 @@ Web 设置行为：
 | R10 | 全量审计修复：whisperseg 空结果除零、旧 chunking 整段 fallback、timestamp fallback 参数运行时化、alignment fallback 统计、字幕 writer/Web/pipeline 过时路径清理 | 定向回归通过，后续以全量 pytest 基线更新 |
 | R11 | Fusion-lite 后缀实验 + 匿名样片 A 对比 + 帧率驱动 SRT overlap 归一化 | 匿名样片 A 四模式对比完成；`fusion_lite_boost` 在当时历史四模式里最接近 whisperseg-adaptive；当前已移除，不再作为公开模式；新增逐句 HTML 报告；字幕/fps/主流程定向 73 passed |
 | R12 | 匿名样片 C 四模式双语对比 + frame-based 短尾 cue 合并 | 匿名样片 C 四模式全流程双语输出完成；新增 frame-based overlapping tail merge，修复 `受け` / `受けて` 这类极短 gap 被 F0 gender 抖动切成两条的问题；字幕定向 50 passed |
+| R13 | 全量代码审计修复：Web 设置 `.env` 安全写入、本地打开接口绑定 job 授权、前端动态渲染转义、完成态 artifact 过滤已清理临时文件、pytest 配置清理 | Web 定向 25 passed；全量 440 passed, 5 skipped；前端 JS `node --check` 通过 |
 
 ### 关键验证记录
 
@@ -391,6 +392,14 @@ Web 设置行为：
 - cue plan 短尾合并改为 frame-based 规则。
 - 匿名样片 C 离线验证：`00:02:56,839 --> 00:02:59,160` 合并为 `アルマリスト 室で イラックス ステイマンを受けて`。
 - 验证：字幕定向 50 passed。
+
+#### V07 · 全量代码审计和 Web 安全收口（R13）
+
+- `/api/settings` 写 `.env` 时对值做 dotenv-safe quoting，并校验 key 名，避免换行值注入额外配置项。
+- `/api/open-video` 与 `/api/open-folder` 改为必须携带 `job_id`，只允许打开该 job 的视频路径或已登记 artifact，避免任意本地路径被页面请求触发打开。
+- Web 任务列表、文件 chip、模型选项等动态文本统一转义或使用 `textContent`，并对进度百分比和下载 URL 做边界处理。
+- Web 完成态 artifact 列表只保留真实存在的文件，避免 `keep_temp_files=false` 清理后继续暴露已删除的临时 JSON。
+- 验证：`tests/web/test_jobs_api.py tests/web/test_cancel_resume.py` 25 passed；全量 pytest 440 passed, 5 skipped；Torch CUDA NVML 初始化 warning 仍为环境 warning。
 
 ### 历史任务摘要
 

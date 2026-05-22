@@ -63,6 +63,10 @@ def test_settings_asr_context_updates_runtime_env(monkeypatch):
     asyncio.run(_test_settings_asr_context_updates_runtime_env(monkeypatch))
 
 
+def test_settings_env_file_quotes_multiline_values(tmp_path, monkeypatch):
+    asyncio.run(_test_settings_env_file_quotes_multiline_values(tmp_path, monkeypatch))
+
+
 def test_models_api_falls_back_to_v1_models(monkeypatch):
     asyncio.run(_test_models_api_falls_back_to_v1_models(monkeypatch))
 
@@ -77,6 +81,10 @@ def test_jobs_api_retry_cancelled_job(tmp_path, monkeypatch):
 
 def test_jobs_api_rejects_invalid_job_spec(tmp_path, monkeypatch):
     asyncio.run(_test_jobs_api_rejects_invalid_job_spec(tmp_path, monkeypatch))
+
+
+def test_open_routes_are_limited_to_job_paths(tmp_path, monkeypatch):
+    asyncio.run(_test_open_routes_are_limited_to_job_paths(tmp_path, monkeypatch))
 
 
 async def _test_app_exposes_icon_assets(tmp_path, monkeypatch):
@@ -248,6 +256,32 @@ async def _test_settings_asr_context_updates_runtime_env(monkeypatch):
     assert os.environ["ASR_CONTEXT"] == "小那海"
     assert settings.status_code == 200
     assert settings.json()["asr_context"] == "小那海"
+
+
+async def _test_settings_env_file_quotes_multiline_values(tmp_path, monkeypatch):
+    from dotenv import dotenv_values
+
+    env_path = tmp_path / ".env"
+    env_path.write_text("API_KEY=old\nTARGET_LANG=简体中文\n", encoding="utf-8")
+    monkeypatch.setattr(config_routes, "PROJECT_ROOT", tmp_path)
+    monkeypatch.delenv("API_KEY", raising=False)
+    malicious_value = "safe\nOPENAI_COMPATIBILITY_BASE_URL=https://evil.example"
+
+    transport = httpx.ASGITransport(app=create_app())
+    async with httpx.AsyncClient(
+        transport=transport,
+        base_url="http://test",
+    ) as client:
+        response = await client.post(
+            "/api/settings",
+            json={"api_key": malicious_value},
+        )
+
+    assert response.status_code == 200
+    values = dotenv_values(env_path)
+    assert values["API_KEY"] == malicious_value
+    assert values.get("OPENAI_COMPATIBILITY_BASE_URL") is None
+    assert os.environ["API_KEY"] == malicious_value
 
 
 async def _test_models_api_falls_back_to_v1_models(monkeypatch):
@@ -438,5 +472,74 @@ async def _test_jobs_api_retry_cancelled_job(tmp_path, monkeypatch):
 
             conflict = await client.post(f"/api/jobs/{job_id}/retry")
             assert conflict.status_code == 409
+    finally:
+        await _reset_pm_state()
+
+
+async def _test_open_routes_are_limited_to_job_paths(tmp_path, monkeypatch):
+    from web.routes import files as files_routes
+
+    monkeypatch.setattr(pm, "_jobs_path", tmp_path / "jobs.json")
+    await _reset_pm_state()
+    video_path = tmp_path / "sample.mp4"
+    video_path.write_bytes(b"video")
+    other_video = tmp_path / "other.mp4"
+    other_video.write_bytes(b"other")
+    output_dir = tmp_path / "out"
+    output_dir.mkdir()
+    artifact_path = output_dir / "sample.srt"
+    artifact_path.write_text("1\n", encoding="utf-8")
+    unrelated_path = tmp_path / "secret.txt"
+    unrelated_path.write_text("secret", encoding="utf-8")
+    opened: list[tuple[str, str]] = []
+
+    class DummyPopen:
+        def __init__(self, args):
+            opened.append(("popen", str(args[-1])))
+
+    monkeypatch.setattr(files_routes.os, "name", "posix")
+    monkeypatch.setattr(files_routes.subprocess, "Popen", DummyPopen)
+
+    try:
+        jobs = await pm.create_job(
+            pm.JobSpec(
+                video_paths=[str(video_path)],
+                output_dir=str(output_dir),
+            )
+        )
+        job = jobs[0]
+        async with pm._state_lock:
+            job.status = "done"
+            job.artifacts = ["sample.srt"]
+            pm._jobs[job.id] = job
+
+        transport = httpx.ASGITransport(app=create_app())
+        async with httpx.AsyncClient(
+            transport=transport,
+            base_url="http://test",
+        ) as client:
+            allowed_video = await client.get(
+                "/api/open-video",
+                params={"job_id": job.id, "path": str(video_path)},
+            )
+            blocked_video = await client.get(
+                "/api/open-video",
+                params={"job_id": job.id, "path": str(other_video)},
+            )
+            allowed_folder = await client.get(
+                "/api/open-folder",
+                params={"job_id": job.id, "path": "sample.srt"},
+            )
+            blocked_folder = await client.get(
+                "/api/open-folder",
+                params={"job_id": job.id, "path": str(unrelated_path)},
+            )
+
+        assert allowed_video.status_code == 200
+        assert blocked_video.status_code == 403
+        assert allowed_folder.status_code == 200
+        assert blocked_folder.status_code == 403
+        assert ("popen", str(video_path.resolve())) in opened
+        assert ("popen", str(output_dir.resolve())) in opened
     finally:
         await _reset_pm_state()

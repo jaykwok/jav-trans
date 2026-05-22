@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from pathlib import Path
 from typing import Any, get_args
 
@@ -23,6 +24,13 @@ DEFAULT_JOB_DEFAULTS = {
     for name, field in JobSpec.model_fields.items()
     if not field.is_required()
 }
+_ENV_KEY_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+
+def _format_env_line(key: str, value: str) -> str:
+    if not _ENV_KEY_RE.fullmatch(key):
+        raise ValueError(f"Invalid .env key: {key!r}")
+    return f"{key}={json.dumps(str(value), ensure_ascii=False)}\n"
 
 
 def _setting(key: str) -> str:
@@ -74,11 +82,11 @@ def _update_env_file(updates: dict[str, str]) -> None:
         if "=" in stripped and not stripped.startswith("#"):
             k = stripped.split("=", 1)[0].strip()
             if k in pending:
-                new_lines.append(f"{k}={pending.pop(k)}\n")
+                new_lines.append(_format_env_line(k, pending.pop(k)))
                 continue
         new_lines.append(line if line.endswith("\n") else line + "\n")
     for k, v in pending.items():
-        new_lines.append(f"{k}={v}\n")
+        new_lines.append(_format_env_line(k, v))
     env_path.write_text("".join(new_lines), encoding="utf-8")
 
 

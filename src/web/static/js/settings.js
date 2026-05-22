@@ -1,5 +1,5 @@
 import { state } from './state.js';
-import { $ } from './util.js';
+import { $, escHtml } from './util.js';
 import { loadFormMemory, saveFormMemory, applyFormMemory } from './formMemory.js';
 import { setActivePreset } from './presets.js';
 
@@ -61,7 +61,11 @@ export async function loadSettings() {
     if (s.base_url) $('api-base-url').value = s.base_url;
     if (s.model) {
       const sel = $('api-model');
-      sel.innerHTML = `<option value="${s.model}">${s.model}</option>`;
+      sel.innerHTML = '';
+      const opt = document.createElement('option');
+      opt.value = s.model;
+      opt.textContent = s.model;
+      sel.appendChild(opt);
       sel.disabled = false;
       $('api-model-preview').textContent = '当前：' + s.model;
     }
@@ -210,7 +214,7 @@ export function installSettingsPanel() {
       const sel = $('api-model');
       const current = sel.value;
       sel.innerHTML = models.map(m =>
-        `<option value="${m}"${m === current ? ' selected' : ''}>${m}</option>`
+        `<option value="${escHtml(m)}"${m === current ? ' selected' : ''}>${escHtml(m)}</option>`
       ).join('');
       sel.disabled = false;
       const wrap = $('api-model-wrap');
