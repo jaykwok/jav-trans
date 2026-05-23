@@ -309,7 +309,9 @@ Web 设置行为：
 
 ## 当前 Backlog
 
-暂无
+- 从 Hugging Face 单独下载并模块化评测 `cam++` speaker embedding/聚类能力，确认是否可作为 Whisper/anime 工作流的 speaker sidecar。
+- 评测 `efwkjn/cohere-asr-ja-v0.1`，确认其与当前 ASR 流程及 `transformers` 版本约束的兼容性，再决定是否纳入候选后端。
+- 增加本地/厂商翻译 API 适配层，允许在现有 OpenAI-compatible 翻译之外接入专用翻译服务，例如腾讯 `hy-mt2`。
 
 ---
 
