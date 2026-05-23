@@ -4,6 +4,8 @@
 !.env.example
 .venv/
 .claude/
+.codex/
+.agents/
 
 # Python/runtime caches
 __pycache__/
