@@ -2262,6 +2262,39 @@ def test_prepare_qwen_asr_sft_dataset_merges_sources_and_hard_negatives(tmp_path
     assert any(row["metadata"].get("cls") == "3" for row in train_manifest)
 
 
+def test_prepare_qwen_asr_sft_dataset_can_store_hf_ogg_bytes(tmp_path):
+    import importlib.util
+    import io
+
+    import soundfile as sf
+
+    script_path = (
+        __import__("pathlib").Path(__file__).resolve().parents[1]
+        / "tools"
+        / "fusionvad_ja"
+        / "prepare_qwen_asr_sft_dataset.py"
+    )
+    spec = importlib.util.spec_from_file_location("fusionvad_ja_prepare_qwen_asr_sft_ogg", script_path)
+    assert spec and spec.loader
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    buffer = io.BytesIO()
+    sf.write(buffer, np.zeros(1600, dtype=np.float32), 16000, format="WAV")
+    audio_path, duration_s, sample_rate, error = module.write_hf_audio(
+        row={"ogg": buffer.getvalue()},
+        target_audio_dir=tmp_path,
+        audio_id="sample",
+        audio_format="ogg",
+    )
+
+    assert error is None
+    assert audio_path == str(tmp_path / "sample.ogg")
+    assert (tmp_path / "sample.ogg").read_bytes() == buffer.getvalue()
+    assert duration_s == 0.1
+    assert sample_rate == 16000
+
+
 def test_prepare_qwen_asr_sft_dataset_cli_defaults_are_cloud_safe():
     import importlib.util
 
@@ -2281,6 +2314,7 @@ def test_prepare_qwen_asr_sft_dataset_cli_defaults_are_cloud_safe():
     assert args.shuffle_buffer_size == 128
     assert args.asr_train_limit == 40
     assert args.ser_train_limit == 10
+    assert args.hf_audio_format == "wav"
     assert args.hf_xet_high_performance is True
 
     args = module.parse_args(["--mode", "full"])
@@ -2315,6 +2349,9 @@ def test_prepare_qwen_asr_cloud_assets_script_downloads_model_and_data():
     assert ".venv/bin/huggingface-cli download" in content
     assert "prepare_qwen_asr_sft_dataset.py" in content
     assert "HF_XET_HIGH_PERFORMANCE" in content
+    assert "SFT_HF_AUDIO_FORMAT=\"${SFT_HF_AUDIO_FORMAT:-ogg}\"" in content
+    assert "SFT_ASR_TRAIN_LIMIT=\"${SFT_ASR_TRAIN_LIMIT:-200000}\"" in content
+    assert "--no-ser" in content
 
 
 def test_export_manual_audit_asr_sft_candidates_splits_empty_and_review(tmp_path):

@@ -2,6 +2,7 @@
 
 import argparse
 import hashlib
+import io
 import json
 import os
 import shutil
@@ -205,7 +206,20 @@ def write_hf_audio(
     row: Mapping[str, Any],
     target_audio_dir: Path,
     audio_id: str,
+    audio_format: str,
 ) -> tuple[str | None, float, int | None, str | None]:
+    if audio_format == "ogg":
+        ogg = row.get("ogg")
+        if isinstance(ogg, (bytes, bytearray)):
+            target_path = target_audio_dir / f"{source_slug(audio_id)}.ogg"
+            if not target_path.exists():
+                target_path.write_bytes(bytes(ogg))
+            try:
+                info = sf.info(io.BytesIO(bytes(ogg)))
+                duration_s = float(info.frames) / float(info.samplerate) if info.samplerate else 0.0
+                return str(target_path), duration_s, int(info.samplerate), None
+            except Exception:
+                return str(target_path), 0.0, None, None
     try:
         audio, sample_rate = sample_hf_audio_16k_mono(row)
     except Exception as exc:
@@ -259,6 +273,7 @@ def process_rows(
                 row=row,
                 target_audio_dir=target_audio_dir,
                 audio_id=audio_id,
+                audio_format=args.hf_audio_format,
             )
         else:
             audio_path, duration_s, sample_rate, error = write_local_audio(
@@ -503,6 +518,7 @@ def run(args: argparse.Namespace) -> None:
         "revision": args.revision,
         "hf_cache_dir": args.hf_cache_dir,
         "hf_endpoint": args.hf_endpoint,
+        "hf_audio_format": args.hf_audio_format,
         "metadata_dataset": args.metadata_dataset,
         "qwen_text_format": "language <language><asr_text><transcript>",
     }
@@ -542,6 +558,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--hf-cache-dir")
     parser.add_argument("--hf-endpoint")
     parser.add_argument("--hf-xet-high-performance", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--hf-audio-format", choices=["wav", "ogg"], default="wav")
     parser.add_argument("--copy-audio", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--min-duration-s", type=float, default=0.2)
     parser.add_argument("--max-duration-s", type=float, default=30.0)

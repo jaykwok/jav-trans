@@ -17,7 +17,7 @@ HF_CACHE_DIR="${HF_CACHE_DIR:-$PROJECT_ROOT/datasets/hf-cache}"
 HF_ENDPOINT_VALUE="${HF_ENDPOINT_VALUE:-${HF_ENDPOINT:-}}"
 HF_XET_HIGH_PERFORMANCE="${HF_XET_HIGH_PERFORMANCE:-1}"
 
-SFT_OUTPUT_ROOT="${SFT_OUTPUT_ROOT:-$PROJECT_ROOT/datasets/train/qwen3-asr-ja-galgame/v1-full}"
+SFT_OUTPUT_ROOT="${SFT_OUTPUT_ROOT:-$PROJECT_ROOT/datasets/train/qwen3-asr-ja-galgame/v1-pilot-asr200k}"
 TRAIN_FILE="${TRAIN_FILE:-$SFT_OUTPUT_ROOT/qwen-sft/train.jsonl}"
 EVAL_FILE="${EVAL_FILE:-$SFT_OUTPUT_ROOT/qwen-sft/val.jsonl}"
 
