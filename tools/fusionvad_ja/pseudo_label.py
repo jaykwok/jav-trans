@@ -19,7 +19,12 @@ if str(SRC_ROOT) not in sys.path:
 from audio.loading import load_audio_16k_mono
 from pipeline.audio import extract_audio
 from vad.base import SpeechSegment
-from vad.fusionvad_lite import build_teacher_record, write_jsonl
+from vad.fusionvad_ja import (
+    build_teacher_record,
+    get_research_vad_backend,
+    sample_hf_audio_16k_mono,
+    write_jsonl,
+)
 
 
 AUDIO_SUFFIXES = {".wav", ".flac", ".ogg", ".mp3", ".m4a"}
@@ -49,16 +54,10 @@ def load_hf_dataset(*, name: str, split: str):
 
 
 def sample_audio(example: dict[str, Any]) -> tuple[np.ndarray, int, str, str]:
-    audio_obj = example.get("ogg") or example.get("audio")
-    if not isinstance(audio_obj, dict):
-        raise ValueError("expected an 'ogg' or 'audio' field decoded by datasets")
-    array = audio_obj.get("array")
-    if array is None:
-        raise ValueError("audio sample has no array")
-    sample_rate = int(audio_obj.get("sampling_rate") or 16000)
+    audio, sample_rate = sample_hf_audio_16k_mono(example)
     text = str(example.get("txt") or example.get("text") or "")
     audio_id = str(example.get("__key__") or example.get("id") or "")
-    return np.asarray(array, dtype=np.float32), sample_rate, text, audio_id
+    return audio, sample_rate, text, audio_id
 
 
 def prepared_audio_path(path: Path, *, output_dir: Path) -> Path:
@@ -75,26 +74,10 @@ def prepared_audio_path(path: Path, *, output_dir: Path) -> Path:
 
 
 def run_teacher(name: str, audio_path: Path) -> list[SpeechSegment]:
-    if name == "whisperseg-adaptive":
-        from vad.whisperseg_backend import WhisperSegVadBackend
-
-        return WhisperSegVadBackend().segment(str(audio_path)).segments
-    if name == "fusion_lite":
-        from vad.fusion_lite_backend import FusionLiteVadBackend
-
-        return FusionLiteVadBackend().segment(str(audio_path)).segments
-    if name == "silero":
-        from vad.silero_backend import SileroVadBackend
-
-        return SileroVadBackend().segment(str(audio_path)).segments
-    if name == "ten_silero":
-        from whisper.timestamp_fallback import detect_speech_spans
-
-        spans, error = detect_speech_spans(str(audio_path))
-        if error:
-            print(f"[WARN] ten_silero {audio_path}: {error}", file=sys.stderr)
-        return [SpeechSegment(start=start, end=end) for start, end in spans]
-    raise SystemExit(f"unknown teacher: {name}")
+    try:
+        return get_research_vad_backend(name).segment(str(audio_path)).segments
+    except ValueError as exc:
+        raise SystemExit(str(exc)) from exc
 
 
 def label_audio_file(
@@ -193,6 +176,7 @@ def run(args: argparse.Namespace) -> None:
                 )
                 records.append(record)
                 manifest_row["input"] = f"{args.hf_dataset}:{index}"
+                manifest_row["audio_id"] = audio_id
                 manifest_rows.append(manifest_row)
             except Exception as exc:
                 manifest_rows.append(
@@ -215,7 +199,7 @@ def run(args: argparse.Namespace) -> None:
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Generate weak FusionVAD-Lite frame labels from VAD teachers.")
+    parser = argparse.ArgumentParser(description="Generate weak FusionVAD-JA frame labels from VAD teachers.")
     parser.add_argument("--input", action="append", help="Audio/video file or directory. Repeatable.")
     parser.add_argument("--hf-dataset", help="Optional Hugging Face streaming dataset, e.g. litagin/Galgame_Speech_ASR_16kHz.")
     parser.add_argument("--hf-split", default="train")
@@ -224,7 +208,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--source", default="local")
     parser.add_argument("--frame-hop-s", type=float, default=0.02)
     parser.add_argument("--min-speech-teachers", type=int, default=2)
-    parser.add_argument("--output-dir", default=str(PROJECT_ROOT / "agents" / "temp" / "fusionvad-lite" / "pseudo-labels"))
+    parser.add_argument("--output-dir", default=str(PROJECT_ROOT / "agents" / "temp" / "fusionvad-ja" / "pseudo-labels"))
     parser.add_argument("--output-jsonl", default="pseudo_labels.jsonl")
     args = parser.parse_args(argv)
     if not args.input and not args.hf_dataset:

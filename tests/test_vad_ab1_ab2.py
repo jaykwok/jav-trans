@@ -195,6 +195,29 @@ def test_whisperseg_preloads_onnx_cuda_runtime():
 
     whisperseg_core._preload_onnx_cuda_runtime(FakeOrt)
 
+    directories = {call["directory"] for call in calls}
+    assert any(call["cuda"] is True and call["cudnn"] is False for call in calls)
+    assert any(call["cuda"] is False and call["cudnn"] is True for call in calls)
+    assert any(directory.endswith("/nvidia/cu13/lib") for directory in directories)
+    assert any(directory.endswith("/nvidia/cudnn/lib") for directory in directories)
+
+
+def test_whisperseg_preload_falls_back_when_no_explicit_dirs(monkeypatch):
+    from pathlib import Path
+
+    from vad.whisperseg import whisperseg_core
+
+    calls: list[dict] = []
+
+    class FakeOrt:
+        @staticmethod
+        def preload_dlls(**kwargs):
+            calls.append(kwargs)
+
+    monkeypatch.setenv("ORT_CUDA_PRELOAD_DIRS", str(Path("/missing/cuda")) + ":" + str(Path("/missing/cudnn")))
+
+    whisperseg_core._preload_onnx_cuda_runtime(FakeOrt)
+
     assert calls == [{"cuda": True, "cudnn": True, "msvc": False, "directory": ""}]
 
 
