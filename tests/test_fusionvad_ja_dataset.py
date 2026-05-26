@@ -2150,6 +2150,173 @@ def test_export_qwen_asr_sft_filters_and_copies_audio(tmp_path):
     assert [row["reason"] for row in skipped] == ["missing_text", "duration_too_long"]
 
 
+def test_prepare_qwen_asr_sft_dataset_merges_sources_and_hard_negatives(tmp_path):
+    import importlib.util
+    import json
+
+    script_path = (
+        __import__("pathlib").Path(__file__).resolve().parents[1]
+        / "tools"
+        / "fusionvad_ja"
+        / "prepare_qwen_asr_sft_dataset.py"
+    )
+    spec = importlib.util.spec_from_file_location("fusionvad_ja_prepare_qwen_asr_sft", script_path)
+    assert spec and spec.loader
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    audio_path = tmp_path / "clip.wav"
+    audio_path.write_bytes(b"RIFF")
+    asr_manifest = tmp_path / "asr.json"
+    asr_manifest.write_text(
+        json.dumps(
+            [
+                {"audio_id": "asr-val", "audio": str(audio_path), "txt": " 検証 ", "duration_s": 1.0},
+                {"audio_id": "asr-test", "audio": str(audio_path), "txt": "テスト", "duration_s": 1.0},
+                {"audio_id": "asr-train", "audio": str(audio_path), "txt": "こんにちは\n世界", "duration_s": 1.0},
+            ],
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    ser_manifest = tmp_path / "ser.json"
+    ser_manifest.write_text(
+        json.dumps(
+            [
+                {"audio_id": "ser-train", "audio": str(audio_path), "text": "感情", "duration_s": 1.0, "cls": "3"},
+            ],
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    hard_negative = tmp_path / "hard.jsonl"
+    hard_negative.write_text(
+        json.dumps({"audio_id": "neg", "audio": str(audio_path), "text": "", "duration_s": 1.0}) + "\n",
+        encoding="utf-8",
+    )
+
+    assert module.qwen_asr_sft_text(transcript=" こんにちは\n世界 ", language="Japanese") == (
+        "language Japanese<asr_text>こんにちは 世界"
+    )
+    args = module.parse_args(
+        [
+            "--mode",
+            "smoke",
+            "--asr-manifest",
+            str(asr_manifest),
+            "--ser-manifest",
+            str(ser_manifest),
+            "--asr-train-limit",
+            "1",
+            "--asr-val-limit",
+            "1",
+            "--asr-test-limit",
+            "1",
+            "--ser-train-limit",
+            "1",
+            "--ser-val-limit",
+            "0",
+            "--ser-test-limit",
+            "0",
+            "--hard-negative-jsonl",
+            str(hard_negative),
+            "--hard-negative-limit",
+            "1",
+            "--output-root",
+            str(tmp_path / "out"),
+        ]
+    )
+    module.run(args)
+
+    train_rows = [
+        json.loads(line)
+        for line in (tmp_path / "out" / "qwen-sft" / "train.jsonl").read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    val_rows = [
+        json.loads(line)
+        for line in (tmp_path / "out" / "qwen-sft" / "val.jsonl").read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    test_rows = [
+        json.loads(line)
+        for line in (tmp_path / "out" / "qwen-sft" / "test.jsonl").read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    summary = json.loads((tmp_path / "out" / "qwen_sft_dataset_summary.json").read_text(encoding="utf-8"))
+    train_manifest = [
+        json.loads(line)
+        for line in (tmp_path / "out" / "manifest" / "train.manifest.jsonl").read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+
+    assert summary["split_counts"] == {"test": 1, "train": 3, "val": 1}
+    assert val_rows == [{"audio": str(tmp_path / "out" / "audio" / "galgame-asr" / "galgame-asr-asr-val.wav"), "text": "language Japanese<asr_text>検証"}]
+    assert test_rows[0]["text"] == "language Japanese<asr_text>テスト"
+    assert [row["text"] for row in train_rows] == [
+        "language Japanese<asr_text>こんにちは 世界",
+        "language Japanese<asr_text>感情",
+        "language Japanese<asr_text>",
+    ]
+    assert {row["source_key"] for row in train_manifest} == {"galgame-asr", "galgame-ser", "hard-negative"}
+    assert any(row["metadata"].get("cls") == "3" for row in train_manifest)
+
+
+def test_prepare_qwen_asr_sft_dataset_cli_defaults_are_cloud_safe():
+    import importlib.util
+
+    script_path = (
+        __import__("pathlib").Path(__file__).resolve().parents[1]
+        / "tools"
+        / "fusionvad_ja"
+        / "prepare_qwen_asr_sft_dataset.py"
+    )
+    spec = importlib.util.spec_from_file_location("fusionvad_ja_prepare_qwen_asr_sft_args", script_path)
+    assert spec and spec.loader
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    args = module.parse_args([])
+    assert args.mode == "smoke"
+    assert args.shuffle_buffer_size == 128
+    assert args.asr_train_limit == 40
+    assert args.ser_train_limit == 10
+    assert args.hf_xet_high_performance is True
+
+    args = module.parse_args(["--mode", "full"])
+    assert args.output_root.endswith("datasets/train/qwen3-asr-ja-galgame/v1-full")
+    assert args.asr_train_limit == 0
+    assert args.ser_train_limit == 0
+    assert args.asr_val_limit == 1000
+    assert args.ser_val_limit == 500
+    full_plan = module.SourcePlan(
+        source_key="asr",
+        dataset="dataset",
+        manifest=None,
+        enabled=True,
+        train_limit=0,
+        val_limit=1,
+        test_limit=1,
+    )
+    assert module.source_is_complete({"val": 1, "test": 1}, plan=full_plan) is False
+
+
+def test_prepare_qwen_asr_cloud_assets_script_downloads_model_and_data():
+    script_path = (
+        __import__("pathlib").Path(__file__).resolve().parents[1]
+        / "tools"
+        / "fusionvad_ja"
+        / "prepare_qwen_asr_cloud_assets.sh"
+    )
+    content = script_path.read_text(encoding="utf-8")
+
+    assert "Qwen/Qwen3-ASR-1.7B" in content
+    assert "models/Qwen-Qwen3-ASR-1.7B" in content
+    assert ".venv/bin/huggingface-cli download" in content
+    assert "prepare_qwen_asr_sft_dataset.py" in content
+    assert "HF_XET_HIGH_PERFORMANCE" in content
+
+
 def test_export_manual_audit_asr_sft_candidates_splits_empty_and_review(tmp_path):
     import importlib.util
     import json
