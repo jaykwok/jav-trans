@@ -28,15 +28,34 @@ def padded_predictions(predictions: list[int], *, pad_frames: int) -> list[int]:
     return result
 
 
-def run(args: argparse.Namespace) -> None:
-    labels = load_label_records(Path(args.labels))
+def count_missed_speech_segments(labels: list[int], predictions: list[int]) -> int:
+    segments = 0
+    in_missed_segment = False
+    for label, prediction in zip(labels, predictions):
+        missed = int(label) > 0 and int(prediction) <= 0
+        if missed and not in_missed_segment:
+            segments += 1
+        in_missed_segment = missed
+    return segments
+
+
+def compute_recall_metrics(
+    *,
+    labels_path: Path,
+    predictions_path: Path,
+    output_path: Path,
+    pad_s: float = 0.0,
+    frame_hop_s: float = 0.02,
+    prediction_threshold: float | None = None,
+) -> dict:
+    labels = load_label_records(labels_path)
     prediction_rows = [
         json.loads(line)
-        for line in Path(args.predictions).read_text(encoding="utf-8").splitlines()
+        for line in predictions_path.read_text(encoding="utf-8").splitlines()
         if line.strip()
     ]
     by_audio_id = {str(row.get("audio_id")): row for row in prediction_rows}
-    pad_frames = max(0, int(round(args.pad_s / args.frame_hop_s)))
+    pad_frames = max(0, int(round(pad_s / frame_hop_s)))
     total_counts = {
         "frames": 0,
         "correct": 0,
@@ -48,6 +67,7 @@ def run(args: argparse.Namespace) -> None:
     }
     missed_speech_frames = 0
     extra_audio_frames = 0
+    missed_speech_segments = 0
     evaluated = 0
     skipped = []
     for record in labels:
@@ -68,32 +88,54 @@ def run(args: argparse.Namespace) -> None:
         for key, value in counts.items():
             total_counts[key] += int(value)
         missed_speech_frames += int(counts["false_negative"])
+        missed_speech_segments += count_missed_speech_segments(
+            labels=[int(value) for value in record.speech_frames[:frame_total]],
+            predictions=[int(value) for value in predictions[:frame_total]],
+        )
         extra_audio_frames += int(counts["false_positive"])
         evaluated += 1
 
-    metrics = metrics_from_frame_counts(counts=total_counts, windows=evaluated)
+    metrics = metrics_from_frame_counts(
+        counts=total_counts,
+        windows=evaluated,
+        threshold=float(prediction_threshold if prediction_threshold is not None else 0.5),
+    )
     summary = {
         **asdict(metrics),
-        "labels": args.labels,
-        "predictions": args.predictions,
+        "labels": str(labels_path),
+        "predictions": str(predictions_path),
+        "prediction_threshold": prediction_threshold,
         "evaluated": evaluated,
         "skipped": len(skipped),
-        "pad_s": args.pad_s,
-        "frame_hop_s": args.frame_hop_s,
-        "missed_speech_seconds": missed_speech_frames * args.frame_hop_s,
-        "extra_audio_seconds": extra_audio_frames * args.frame_hop_s,
+        "pad_s": pad_s,
+        "frame_hop_s": frame_hop_s,
+        "missed_speech_seconds": missed_speech_frames * frame_hop_s,
+        "missed_speech_segments": missed_speech_segments,
+        "extra_audio_seconds": extra_audio_frames * frame_hop_s,
         "extra_audio_ratio": (
             total_counts["predicted_positives"] / max(total_counts["positives"], 1)
         ),
         "counts": total_counts,
         "skipped_rows": skipped,
     }
-    output_path = Path(args.output)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     output_path.write_text(
         json.dumps(summary, ensure_ascii=False, indent=2, sort_keys=True),
         encoding="utf-8",
     )
+    return summary
+
+
+def run(args: argparse.Namespace) -> None:
+    summary = compute_recall_metrics(
+        labels_path=Path(args.labels),
+        predictions_path=Path(args.predictions),
+        output_path=Path(args.output),
+        pad_s=args.pad_s,
+        frame_hop_s=args.frame_hop_s,
+        prediction_threshold=args.prediction_threshold,
+    )
+    output_path = Path(args.output)
     print(f"summary={output_path}")
     print(
         f"recall={summary['recall']:.4f} missed_speech_seconds={summary['missed_speech_seconds']:.2f} "
@@ -107,6 +149,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--predictions", required=True, help="JSONL rows with audio_id and speech_frames/predictions.")
     parser.add_argument("--pad-s", type=float, default=0.0)
     parser.add_argument("--frame-hop-s", type=float, default=0.02)
+    parser.add_argument("--prediction-threshold", type=float)
     parser.add_argument("--output", required=True)
     return parser.parse_args(argv)
 
