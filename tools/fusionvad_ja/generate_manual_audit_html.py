@@ -113,11 +113,35 @@ def normalize_candidate(row: Mapping[str, Any], *, output_dir: Path, copy_audio:
     }
 
 
+def has_teacher_segments(candidates: list[dict[str, Any]]) -> bool:
+    for candidate in candidates:
+        teacher_segments = candidate.get("teacher_segments")
+        if not isinstance(teacher_segments, Mapping):
+            continue
+        for segments in teacher_segments.values():
+            if not isinstance(segments, list):
+                continue
+            for segment in segments:
+                if not isinstance(segment, Mapping):
+                    continue
+                try:
+                    if float(segment.get("end", 0.0)) > float(segment.get("start", 0.0)):
+                        return True
+                except (TypeError, ValueError):
+                    continue
+    return False
+
+
 def html_template(*, title: str, dataset_id: str, output_jsonl_name: str, candidates: list[dict[str, Any]]) -> str:
     data_json = json.dumps(candidates, ensure_ascii=False, sort_keys=True).replace("</", "<\\/")
     title_json = json.dumps(title, ensure_ascii=False)
     dataset_json = json.dumps(dataset_id, ensure_ascii=False)
     output_name_json = json.dumps(output_jsonl_name, ensure_ascii=False)
+    teacher_buttons = ""
+    if has_teacher_segments(candidates):
+        teacher_buttons = """
+          <button id="teacherUnionBtn">Teacher 并集</button>
+          <button id="teacherIntersectionBtn">Teacher 交集</button>"""
     return f"""<!doctype html>
 <html lang="zh-CN">
 <head>
@@ -322,13 +346,11 @@ textarea {{
           <button id="endBtn">设终点 ]</button>
           <button id="allSpeechBtn">全段语音</button>
           <button id="startToHereBtn">开头到当前点</button>
-          <button id="hereToEndBtn">当前点到末尾</button>
-          <button id="teacherUnionBtn">Teacher 并集</button>
-          <button id="teacherIntersectionBtn">Teacher 交集</button>
+          <button id="hereToEndBtn">当前点到末尾</button>{teacher_buttons}
           <button class="danger" id="nonSpeechBtn">非语音</button>
           <button id="reviewedBtn">标记已审</button>
         </div>
-        <p class="hint">快捷键：空格播放/暂停，[ 设起点，] 设终点，A 全段语音，N 非语音，B 开头到当前点，E 当前点到末尾，J/K 上一条/下一条。快速审计优先使用四类结果：全段语音、非语音、开头到当前点、当前点到末尾；少数多段对白再用片段表格精修。只设起点时默认到音频末尾，只设终点时默认从音频开头开始。修改会自动缓存在当前浏览器。标注口径：Galgame 片段通常已经按对白裁切，若整段基本都是可辨识词句/音节的日语对白，优先点“全段语音”；背景音乐、底噪或环境声垫在对白下面时仍按对白区间标为语音，不必扣掉。纯呻吟、喘息、笑声、哭声、尖叫等非语言人声建议标为非语音，或在跳过原因写 moan_only / human_nonverbal；对白夹杂非语言人声时只圈对白片段。</p>
+        <p class="hint">快捷键：空格播放/暂停，[ 设起点，] 设终点，A 全段语音，N 非语音，B 开头到当前点，E 当前点到末尾，J/K 上一条/下一条。快速审计优先使用四类结果：全段语音、非语音、开头到当前点、当前点到末尾；少数多段对白再用片段表格精修。只设起点时默认到音频末尾，只设终点时默认从音频开头开始。修改会自动缓存在当前浏览器。标注口径：凡是希望送入 ASR 并可能生成字幕的人声、拟声、短促发声都可标为语音；纯 BGM、静音、环境/机械声和无字幕价值残留标为非语音。背景音乐、底噪或环境声垫在对白下面时仍按可字幕化人声区间标为语音。</p>
       </section>
 
       <aside class="panel">
@@ -569,10 +591,14 @@ function renderMetrics(candidate) {{
     ["ignore 比例", candidate.ignored_frame_ratio],
     ["冲突比例", candidate.conflict_frame_ratio],
     ["加权语音", candidate.weighted_speech_frame_ratio],
-    ["加权非语音", candidate.weighted_negative_frame_ratio],
-    ["teacher 片段数", JSON.stringify(candidate.teacher_segment_counts || {{}})],
-    ["teacher 语音占比", JSON.stringify(candidate.teacher_speech_ratios || {{}})]
+    ["加权非语音", candidate.weighted_negative_frame_ratio]
   ];
+  if (hasTeacherData(candidate)) {{
+    entries.push(
+      ["teacher 片段数", JSON.stringify(candidate.teacher_segment_counts || {{}})],
+      ["teacher 语音占比", JSON.stringify(candidate.teacher_speech_ratios || {{}})]
+    );
+  }}
   document.getElementById("metrics").innerHTML = entries
     .map(([key, value]) => `<div>${{escapeHtml(key)}}</div><div>${{escapeHtml(typeof value === "number" ? fmt(value) : value)}}</div>`)
     .join("");
@@ -626,6 +652,10 @@ function teacherSegments(candidate) {{
     }}
   }}
   return out;
+}}
+
+function hasTeacherData(candidate) {{
+  return teacherSegments(candidate).length > 0;
 }}
 
 function teacherIntersection(candidate) {{
@@ -706,7 +736,9 @@ function drawWaveform() {{
     ctx.fillText("波形会在音频解码后显示；如果这里为空，播放和标注仍可正常使用。", 16, 26);
   }}
 
-  drawSegmentBands(teacherSegments(candidate), "rgba(154,101,0,0.24)", 0.0, 0.34);
+  if (hasTeacherData(candidate)) {{
+    drawSegmentBands(teacherSegments(candidate), "rgba(154,101,0,0.24)", 0.0, 0.34);
+  }}
   drawSegmentBands(item.speech_segments, "rgba(15,118,110,0.38)", 0.34, 1.0);
   const cursor = audio.currentTime || 0;
   if (candidate.duration_s > 0) {{
@@ -852,8 +884,14 @@ document.getElementById("hereToEndBtn").addEventListener("click", () => {{
   pendingStart = null;
   setSegments([{{start, end: CANDIDATES[currentIndex].duration_s}}], true);
 }});
-document.getElementById("teacherUnionBtn").addEventListener("click", () => setSegments(teacherSegments(CANDIDATES[currentIndex]), true));
-document.getElementById("teacherIntersectionBtn").addEventListener("click", () => setSegments(teacherIntersection(CANDIDATES[currentIndex]), true));
+const teacherUnionBtn = document.getElementById("teacherUnionBtn");
+if (teacherUnionBtn) {{
+  teacherUnionBtn.addEventListener("click", () => setSegments(teacherSegments(CANDIDATES[currentIndex]), true));
+}}
+const teacherIntersectionBtn = document.getElementById("teacherIntersectionBtn");
+if (teacherIntersectionBtn) {{
+  teacherIntersectionBtn.addEventListener("click", () => setSegments(teacherIntersection(CANDIDATES[currentIndex]), true));
+}}
 document.getElementById("nonSpeechBtn").addEventListener("click", () => {{
   const item = ann();
   item.speech_segments = [];
