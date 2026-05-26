@@ -157,6 +157,243 @@ speech_score =
 
 仅当 `speech_score < 0.45` 且 `silero_overlap_ratio < 0.05` 时丢弃候选。`fusion_lite_boost` 已从公开模式和代码路径移除。
 
+### FusionVAD-JA 研究计划
+
+FusionVAD-JA 是训练型 VAD 研究线，用于复现 FusionVAD 论文的“PTM 特征 + MFCC + 简单 addition fusion”思路，并面向日语/JAV/galgame 近域数据做适配。它不替换当前默认 `fusion_lite`，不接入 Web，也不改变 `.env` 默认 VAD；研究代码在 `src/vad/fusionvad_ja/`，临时 smoke 输出写入 `agents/temp/fusionvad-ja/`。下载后的数据、feature cache 和 checkpoint 按 split 归档到 `datasets/train/fusionvad-ja/`、`datasets/val/fusionvad-ja/`、`datasets/test/fusionvad-ja/`；`datasets/` 整体不进入 Git 跟踪。
+
+首轮数据混合：
+
+- `litagin/Galgame_Speech_ASR_16kHz`：核心近域弱正样本，无 VAD 时间戳，作为 `teacher_agree` / weak-positive 使用。
+- AVA-Speech：电影语音活动标注，作为 supervised seed。
+- VoxConverse：带 speaker/timestamp 的 diarization 数据，作为多说话人 speech span seed。
+- MUSAN、DNS Challenge、本地视频和合成负样本：提供音乐、噪声、非语音 negative。
+- ReazonSpeech、JSUT、JVS：暂列可选日语正样本，不进入首轮默认混合。
+
+标签 schema 使用 JSONL，字段包含 `audio_id`、`source`、`duration_s`、`text`、`teacher_segments`、`frame_hop_s`、`speech_frames` 和 `label_quality`。默认可训练质量为 `supervised`、`teacher_agree`、`negative`；`teacher_conflict` 保留审计但默认不进训练。
+
+训练 v1 计划：
+
+- 冻结 ja whisper 1.5B / `whisper-ja-anime` 生态的 encoder 作为默认 PTM feature extractor；`whisper-large-v3` 作为后续 ablation，不影响现有 ASR。
+- 同步提取 16k mono MFCC，默认 `n_mfcc=40`，约 20ms hop，并与 VAD frame 对齐。
+- 先离线缓存 frozen encoder feature，再训练轻量头，避免训练时反复跑大模型。
+- addition fusion：`whisper_feat -> 256`，`mfcc -> 256`，两路 projection 后相加。
+- 分类器使用 2 层 BiLSTM + 轻量 frame head，目标可训练参数小于 2M。
+
+正式训练启动口径：
+
+- v0 只用于链路 smoke，不能作为正式模型结论；Galgame weak-positive + synthetic negative 的 val/test 太容易，会产生虚高 F1。
+- v1-mini 可以开始训练的前置条件：AVA/VoxConverse 至少一个 supervised seed split 能同时产出 label JSONL 和本地 16k mono 音频；MUSAN/DNS/本地素材至少一个 real-negative split 可用；train/val/test 按音频 ID 去重且互斥；feature cache `errors=0` 或错误样本有明确跳过报告。
+- v1-mini 训练后只报告研究指标，不替换默认 VAD；必须同时给出 supervised val/test 的 frame-level precision、recall、F1、speech positive ratio 和 predicted positive ratio。
+- 泛化判断至少需要三类 held-out：AVA/VoxConverse supervised、JAV/galgame 近域样本、MUSAN/DNS/本地非语音负样本；同一来源内不得用相邻切片同时进入 train 和 val/test。
+- 晋级到默认 VAD 候选前，必须在同一 held-out 上与 `fusion_lite`、`whisperseg-adaptive` 做对比，并确认长静音、音乐、多人重叠、呻吟/短促日语对白不会明显退化。
+- 本机已安装 FFmpeg shared libraries，`torchcodec` import 与本地 WAV decode 已验证；PATH 中的 `ffmpeg` 命令仍优先命中 static build，但不影响 torchcodec 动态链接。FusionVAD-JA 数据物化默认优先使用 Hugging Face `Audio` / torchcodec decode；仅当默认 decode 加载或采样失败时 fallback 到 `Audio(decode=False)` bytes 路径。
+
+v1 执行顺序：
+
+1. 先用小样本探测 AVA/VoxConverse schema，确认 timestamp 与音频字段可读取。
+2. 将可用 supervised 音频物化到 `datasets/train|val|test/fusionvad-ja/v1-supervised/`，同时写入 label JSONL、audio manifest 和 split summary。
+3. 将 MUSAN/DNS/本地 negative 物化到 `datasets/train|val|test/fusionvad-ja/v1-negative/`；没有真实 negative 时只允许继续做 smoke，不标记为正式训练。
+4. 构建 v1 feature cache，默认 PTM 为 `whisper-ja-1.5b`，并保留 `whisper-large-v3` ablation hook。
+5. 训练 addition-fusion BiLSTM v1-mini checkpoint，评估 supervised val/test 与近域 smoke split；checkpoint 只归档到 `datasets/train/fusionvad-ja/`。
+6. 跑 `fusion_lite` / `whisperseg-adaptive` 同集 baseline 后，再决定是否扩大数据或改 teacher/pseudo-label 策略。
+
+当前研究实现拆分：
+
+- `src/vad/fusionvad_ja/dataset.py`：审计、伪标签 schema、frame label、supervised / weak-positive / negative record 构造。
+- `src/vad/fusionvad_ja/manifest.py`：把 label JSONL 与音频 manifest 对齐，过滤不可训练质量和缺失音频。
+- `src/vad/fusionvad_ja/features.py`：读取 16k mono 音频，提取 frozen Whisper encoder feature 与 MFCC，并写 `.npz` feature cache。cache key 绑定音频路径、大小、mtime 和 `FeatureConfig`。
+- `src/vad/fusionvad_ja/model.py`：`AdditionFusionBiLSTM`，默认 `1280 -> 256` 的 Whisper projection、`40 -> 256` 的 MFCC projection，addition 后进入 2 层 BiLSTM 和 frame head。
+- `src/vad/fusionvad_ja/train.py`：保留 tiny waveform smoke，同时新增 cached feature 训练；训练顺序按 seed 确定性 shuffle，checkpoint 记录 `window_order`、输入维度和可训练参数量。
+- `tools/fusionvad_ja/evaluate_addition_bilstm.py`：读取 cached feature split 和 checkpoint，输出 frame-level loss、accuracy、precision、recall、F1、正帧比例和预测正帧比例。
+- `tools/fusionvad_ja/calibrate_addition_threshold.py`：在 validation split 上扫阈值，按 F1 / precision / recall 约束选择研究阈值。
+- `tools/fusionvad_ja/evaluate_vad_baselines.py`：在同一 label/manifest 上评估现有 `fusion_lite` 与 `whisperseg-adaptive`，用于和训练型头对比。
+- `tools/fusionvad_ja/materialize_hf_audio.py`：物化 Hugging Face 音频；默认使用 torchcodec decode，再写本地 16k mono WAV；失败时 fallback 到 `Audio(decode=False)` bytes 路径。
+- `tools/fusionvad_ja/slice_labeled_audio.py`：把长 supervised 音频按 frame label 切成短 clip，并同步裁剪 `teacher_segments`。
+- `tools/fusionvad_ja/build_local_video_audit_candidates.py`：从本地视频确定性抽取 16k mono WAV 短片段，生成 manual audit candidates / manifest，用于真实近域 held-out 人工标注。
+
+v1-mini full 结果：
+
+- split 仍然是 VoxConverse supervised speech spans + MUSAN music/noise real-negative，train/val/test 分别为 302/252/98 条，其中 train 为 151 supervised + 151 negative，val 为 126 + 126，test 为 49 + 49；feature cache 使用 `whisper-ja-1.5b` CUDA half precision，`frame_hop_s=0.02`、`n_mfcc=40`，三组 cache 均 `errors=0`、`skipped=0`。
+- 训练命令使用 cached features，不回传 frozen encoder：`max_steps=2048`、`batch_size=8`、`learning_rate=0.001`、`device=cuda`；checkpoint 写入 `datasets/train/fusionvad-ja/v1-mini/addition-bilstm-2048-batch8/fusionvad_ja_addition_bilstm.pt`。
+- 训练指标：loss `0.0640`、frame accuracy `0.9770`、positive ratio `0.4731`，可训练参数 `1,942,145`。
+- validation 阈值 0.5：frame accuracy `0.9878`、precision `0.9811`、recall `0.9934`、F1 `0.9872`、positive ratio `0.4753`、predicted positive ratio `0.4812`。
+- validation 阈值扫描最佳为 `0.6`：F1 `0.9875`、precision `0.9836`、recall `0.9915`、predicted positive ratio `0.4791`。
+- test 阈值 0.5：frame accuracy `0.9901`、precision `0.9834`、recall `0.9960`、F1 `0.9897`、positive ratio `0.4754`、predicted positive ratio `0.4816`。
+- test 阈值 0.6：frame accuracy `0.9907`、precision `0.9855`、recall `0.9952`、F1 `0.9903`、predicted positive ratio `0.4801`。
+- 同集 baseline：`whisperseg-adaptive` 98/98 成功，WhisperSeg 主模型走 `CUDAExecutionProvider`，test F1 `0.9163`、precision `0.8479`、recall `0.9966`、predicted positive ratio `0.5588`；`fusion_lite` 98/98 成功，WhisperSeg 主信号走 `CUDAExecutionProvider`，test F1 `0.9246`、precision `0.8624`、recall `0.9966`、predicted positive ratio `0.5494`。
+- 结论：addition-fusion BiLSTM 在这个 v1-mini split 上明显提高 precision，并保持接近 baseline 的 recall；但该 split 仍主要覆盖 VoxConverse 英语/多人 speech span 与 MUSAN 音乐负样本，不代表 JAV/galgame 泛化结论，也不能替换默认 VAD。下一步应加入 Galgame / 本地 JAV near-domain teacher labels、DNS/noise 负样本，并按来源隔离扩大 held-out。
+
+v1.1 Galgame weak-positive 混合结果：
+
+- 数据准备：`litagin/Galgame_Speech_ASR_16kHz` 使用 Hugging Face streaming shuffle，`shuffle_buffer_size=4096`、`shuffle_seed=20260524`；物化 train/val/test 为 512/128/128 条本地 16k mono WAV，全部经 torchcodec decode，错误 0，总时长分别约 `2734.0s`、`623.0s`、`673.2s`。Galgame 只有文本和整段音频，没有 VAD 时间戳，因此本轮用 `trim_head_s=0.04`、`trim_tail_s=0.04` 生成 weak-positive `teacher_agree` 标签，speech ratio 约 `0.984-0.985`。
+- 训练集：v1-mini train 302 条加 Galgame train 512 条，得到 814 条 mixed train，其中 `supervised=151`、`negative=151`、`teacher_agree=512`，总时长 `8702.9s`；feature cache 使用 `whisper-ja-1.5b` CUDA half precision，train/val/test cache 分别为 814/128/128 条，`errors=0`、`skipped=0`。
+- 训练命令使用 cached features，不回传 frozen encoder：`max_steps=2048`、`batch_size=16`、`learning_rate=0.001`、`device=cuda`；checkpoint 写入 `datasets/train/fusionvad-ja/v1-1/addition-bilstm-2048-batch16/fusionvad_ja_addition_bilstm.pt`。
+- 训练指标：loss `0.0534`、frame accuracy `0.9806`、positive ratio `0.6342`，可训练参数 `1,942,145`。batch size 16 在 RTX 4060 Ti 8GB 上可跑；Codex sandbox 中 CUDA 可能不可见，feature cache / training 长跑需提权执行。
+- 阈值校准仍使用 v1-mini supervised+negative validation，不使用 Galgame weak-positive validation 选阈值；最佳阈值为 `0.25`，validation F1 `0.9773`、precision `0.9723`、recall `0.9823`、positive ratio `0.4753`、predicted positive ratio `0.4802`。
+- v1-mini supervised+negative test：阈值 `0.25` 时 F1 `0.9842`、precision `0.9818`、recall `0.9867`、predicted positive ratio `0.4778`；阈值 `0.5` 时 F1 `0.9770`、precision `0.9868`、recall `0.9675`、predicted positive ratio `0.4662`。相比 v1-mini-only checkpoint 的 test F1 `0.9903` 有回退，但仍明显高于同集 `fusion_lite` F1 `0.9246` 和 `whisperseg-adaptive` F1 `0.9163`。
+- Galgame weak-positive held-out test 只作为近域 recall smoke，不是真实 VAD 泛化指标：v1.1 阈值 `0.25` 时 F1 `0.9137`、precision `0.9845`、recall `0.8524`、predicted positive ratio `0.8527`；阈值 `0.5` 时 F1 `0.8458`、recall `0.7380`。同一弱标签下 `whisperseg-adaptive` F1 `0.9617`、recall `0.9396`，`fusion_lite` F1 `0.9540`、recall `0.9244`，二者的 WhisperSeg 主路径日志均确认 `CUDAExecutionProvider`。
+- 结论：直接混入整段 Galgame weak-positive 会把训练集正帧比例推高，但模型仍会主动切掉 Galgame clip 内部低语音置信区域；这对真实 VAD 可能是合理行为，却会被 weak-positive 标签当作 false negative。下一步不应简单扩大 full-clip weak-positive，而应引入 teacher segment pseudo-label、teacher conflict 审计、DNS/本地非语音负样本，以及少量人工/强监督的 JAV/galgame held-out，再重新比较 v1.1 与默认 `fusion_lite`。
+
+v1.2 teacher-student 伪标签计划：
+
+- 目标：把 Galgame / JAV 近域音频从 full-clip weak-positive 改成 teacher segment pseudo-label，用作 domain adaptation，而不是把现有 VAD teacher 当成最终评价标准。最终是否超过 `fusion_lite` / `whisperseg-adaptive` 必须依赖独立强标注或人工审计 held-out。
+- Teacher：首轮使用 `whisperseg-adaptive` 与 `fusion_lite`。二者不是训练目标本身，只作为噪声标注器；默认只采纳重叠一致的高置信 speech span。`teacher_conflict` 和边界不确定区域写入审计文件，默认不进训练。
+- 标签策略：新增可选 `frame_weights` / ignore mask。`speech_frames=1, frame_weights>0` 表示高置信 speech；`speech_frames=0, frame_weights>0` 表示高置信 non-speech；`frame_weights=0` 表示 ignore，不参与 BCE。老 JSONL 无 `frame_weights` 时按全 1 兼容。
+- 默认伪标签规则：两个 teacher 都判 speech 的帧为 positive，两个 teacher 都不判 speech 且形成足够长 gap 的区域为 negative，任一 teacher 单独判 speech、positive 边界附近、短间隙都设为 ignore。`teacher_agree` 训练权重低于 supervised / real-negative，首轮建议 `0.3-0.6`。
+- 训练策略：优先从 v1-mini checkpoint 低学习率 fine-tune，而不是从头混入 Galgame；v1-mini supervised+negative validation 继续作为阈值校准集，Galgame weak split 只作为 recall smoke。
+- 验收顺序：
+  1. 实现 `tools/fusionvad_ja/build_teacher_pseudo_labels.py`，输入 materialized manifest，输出 pseudo-label JSONL、summary、per-clip teacher audit 和 conflict audit。
+  2. 扩展 `LabelRecord` 与 cached-feature 训练，使 `frame_weights=0` 的帧不参与 loss / accuracy，teacher pseudo-label 可低权重训练。
+  3. 用 Galgame train 小样本先跑 64 条 teacher pseudo-label smoke，确认 `teacher_agree`、`teacher_conflict`、ignored frame ratio、positive/negative/weighted frame ratio 可解释。
+  4. 构建 v1.2 Galgame pseudo-label feature cache，使用 v1-mini checkpoint fine-tune，并在 v1-mini val/test、Galgame pseudo-label smoke、现有 baseline 上对比。
+  5. 再制作少量人工/强审计 JAV/galgame held-out，否则不宣称真实泛化超过 teacher 或默认 VAD。
+
+v1.2 首轮执行记录：
+
+- 已扩展标签 schema：`frame_weights` 为可选字段，旧 label JSONL 不带该字段时按全 1 兼容；`frame_weights=0` 的帧在 addition-fusion train/eval 和 baseline eval 中会被忽略。
+- 已新增 `tools/fusionvad_ja/build_teacher_pseudo_labels.py`：输入 materialized manifest，运行 `whisperseg-adaptive` / `fusion_lite`，输出 `teacher_pseudo_labels.jsonl`、`teacher_pseudo_manifest.json`、`teacher_pseudo_audit.jsonl`、`teacher_conflicts.jsonl`、error report 和 summary。
+- Galgame train 64 条 smoke：输入 `datasets/train/fusionvad-ja/v1-galgame/galgame-materialized-512/hf_audio_manifest.json`，输出到 `datasets/train/fusionvad-ja/v1-2/teacher-pseudo-galgame-train64/`；WhisperSeg 主路径日志确认 `CUDAExecutionProvider`，records `64`、errors `0`、`teacher_agree=58`、`teacher_conflict=6`。
+- 64 条 smoke 的 frame 统计：frames `14208`、active frame ratio `0.8590`、ignored frame ratio `0.1410`、conflict frame ratio `0.0516`、weighted speech frame ratio `0.8427`、weighted negative frame ratio `0.0163`。这说明新策略不再把整段 Galgame 硬标为 speech，而是把 teacher 分歧和边界留给 ignore。
+- training manifest dry-run：64 条 pseudo labels 中 58 条 `teacher_agree` 进入训练候选，6 条 `teacher_conflict` 默认过滤，skipped `0`；summary 写入 `datasets/train/fusionvad-ja/v1-2/teacher-pseudo-galgame-train64/training-manifest/training_manifest_summary.json`。
+- Galgame train 512 条 teacher pseudo-label 全量生成完成：输出到 `datasets/train/fusionvad-ja/v1-2/teacher-pseudo-galgame-train512/`，日志 `agents/temp/fusionvad-ja-v1-2-teacher-pseudo-galgame-train512.run.log`；WhisperSeg / `fusion_lite` 主路径日志确认 `onnx_provider=CUDAExecutionProvider`，records `512`、errors `0`、`teacher_agree=477`、`teacher_conflict=35`。
+- 512 条 frame 统计：frames `136944`、active frame ratio `0.9117`、ignored frame ratio `0.0883`、conflict frame ratio `0.0316`、weighted speech frame ratio `0.8709`、weighted negative frame ratio `0.0408`。`teacher_conflict` 保留到 audit/conflict JSONL，但默认不进训练。
+- train512 training manifest 和 feature cache 完成：477 条 `teacher_agree` 可训练样本，skipped `0`；`whisper-ja-1.5b` + MFCC CUDA half precision feature cache `cached=477`、errors `0`，输出 `datasets/train/fusionvad-ja/v1-2/teacher-pseudo-galgame-train512/feature-cache-full/`。
+- 已给 cached-feature 训练补 `--init-checkpoint`，并允许 `train_addition_bilstm.py` 重复传入多组 `--labels` / `--feature-manifest`。v1.2 fine-tune 使用 v1-mini checkpoint 初始化，训练混合 v1-mini 强监督/真实负样本 302 条 + Galgame teacher pseudo 477 条，共 779 条 cached examples。
+- v1.2 fine-tune 命令口径：`max_steps=1024`、`batch_size=16`、`learning_rate=0.0002`、`device=cuda`、init checkpoint `datasets/train/fusionvad-ja/v1-mini/addition-bilstm-2048-batch8/fusionvad_ja_addition_bilstm.pt`；checkpoint 写入 `datasets/train/fusionvad-ja/v1-2/addition-bilstm-ft-v1mini-mixed779-batch16-lr2e-4-steps1024/fusionvad_ja_addition_bilstm.pt`。
+- v1.2 训练指标：loss `0.0302`、frame accuracy `0.9891`、positive ratio `0.5565`、可训练参数 `1,942,145`。Torch CUDA probe 写入 `agents/temp/fusionvad-ja-v1-2-torch-cuda-probe.run.log`，提权环境确认 `torch_cuda_available=True`、设备 `NVIDIA GeForce RTX 4060 Ti`。
+- 阈值校准继续使用 v1-mini supervised+negative validation，CUDA 运行，summary `datasets/val/fusionvad-ja/v1-2/addition-bilstm-ft-v1mini-mixed779-batch16-lr2e-4-steps1024-threshold-calibration-cuda/threshold_calibration.json`；最佳阈值 `0.5`，validation F1 `0.9853`、precision `0.9803`、recall `0.9904`、positive ratio `0.4753`、predicted positive ratio `0.4802`。
+- v1-mini held-out test 回归：阈值 `0.5` 时 F1 `0.9909`、precision `0.9892`、recall `0.9926`、positive ratio `0.4754`、predicted positive ratio `0.4771`。相对 v1-mini 2048-step checkpoint 的 test F1 `0.9903`、precision `0.9855`、recall `0.9952`，v1.2 主要换来更高 precision，recall 小幅下降。
+- Galgame weak-positive held-out 仍只作为近域 smoke，不是真实 VAD 指标：阈值 `0.5` 时 F1 `0.9383`、precision `0.9865`、recall `0.8946`、predicted positive ratio `0.8930`；阈值 `0.25` 时 F1 `0.9530`、precision `0.9851`、recall `0.9230`、predicted positive ratio `0.9228`。该结果说明 v1.2 比 v1.1 更愿意保留 Galgame speech-like 区域，但仍会切掉一部分 full-clip weak 标签中的低置信区域。
+- 当前 teacher 组合仍高度相关：`fusion_lite` 以 WhisperSeg 候选为主，和 `whisperseg-adaptive` 不是完全独立 teacher；v1.2 可以作为第一版 domain adaptation，但不能证明已经超过 teacher。下一步应加入更独立的 Silero/TEN/人工审计 held-out，或抽样人工修正 Galgame/JAV 边界后再做真实泛化结论。
+- 本轮验收：`.venv/bin/python -m pytest tests/test_fusionvad_ja_dataset.py tests/test_fusion_lite_vad_backend.py tests/test_vad_ab1_ab2.py tests/test_vad_ab3_ab4.py -q` 结果 `82 passed`；`git diff --check` 通过。
+
+v1.3 方向与首轮审计准备：
+
+- Grok / 外部依据：FusionVAD 论文与 ISCA 版本确认“MFCC + PTM feature + simple addition fusion + BiLSTM”是合理主线，addition 通常比 cross-attention 更稳且更省；论文还指出 MFCC 与 PTM 错误类型互补。Teacher-student VAD 论文显示 pseudo-label 可提升 noisy / real-world VAD 泛化，但最终判断必须依赖独立 held-out。TEN VAD / Silero 官方项目均是轻量独立 VAD，可作为 teacher diversity 来源；FireRedVAD 也值得后续评估，但首轮不引入新依赖。
+- 方向取舍：暂不继续盲目扩大 `whisperseg-adaptive + fusion_lite` 同源 teacher 数据；优先做两件事：一是引入 research-only 独立 teacher 对比，二是从现有 Galgame pseudo-label 里抽小规模人工审计候选，先建立能判断“是否超过 teacher”的近域 held-out。
+- 已新增 research-only backend resolver：`src/vad/fusionvad_ja/research_backends.py` 支持 `whisperseg-adaptive`、`fusion_lite`、`silero`、`ten_vad`、`ten_silero`，仅供 `tools/fusionvad_ja/` 研究脚本使用；`src/vad/__init__.py` 仍只公开 `fusion_lite` 和 `whisperseg-adaptive`，默认 VAD / Web / `.env` 不变。
+- 已新增 `tools/fusionvad_ja/select_audit_candidates.py`：读取 `teacher_pseudo_audit.jsonl` 和 labels，按 `teacher_conflict_high`、`text_but_low_active`、`ignored_ratio_high`、`negative_gap_high`、`clean_teacher_agree`、`long_clip` 六类抽样，输出人工审计候选 JSONL/CSV。
+- Galgame train512 审计候选已生成：`datasets/train/fusionvad-ja/v1-3/audit-candidates-galgame-train512/`，共 `72` 条，每类 `12` 条；其中 `teacher_conflict=35`、`teacher_agree=37`。这批候选适合优先人工标注 speech boundary，用作近域 validation/test 或 teacher 校准集。
+- 已新增 `tools/fusionvad_ja/generate_manual_audit_html.py`：把候选 JSONL/CSV 生成 standalone HTML 标注页，可听音频、标 speech segments、用 teacher union/intersection 初始化、浏览器本地缓存进度，并导出/保存 `manual_labels.jsonl`。不接入主 Web，不修改 `src/web/static/`。
+- Galgame v1.3 人工标注页已生成：`datasets/val/fusionvad-ja/v1-3/manual-audit-galgame/manual_audit.html`，同目录 `audio/` 已复制 72 条候选音频，便于浏览器本地播放。页面 UI 为中文；打开 HTML 后标注，最终保存/下载 `manual_labels.jsonl`；后续工具会把其中 `speech_segments` 转成 frame labels。人工口径暂定为：Galgame 片段通常已经按对白裁切，若整段基本都是可辨识词句/音节的日语对白，优先标为全段 speech；背景音乐、底噪或环境声垫在对白下面时仍按对白区间标为 speech，不必扣掉；纯呻吟、喘息、笑声、哭声、尖叫等非语言人声标为 non-speech，或在不确定/不纳入训练时填 `skip_reason=moan_only` / `human_nonverbal` 跳过；纯 BGM / 无对白样本可填 `skip_reason=pure_bgm` / `no_dialogue`；对白夹杂非语言人声时只圈对白片段。
+- 已新增 `tools/fusionvad_ja/convert_manual_audit_labels.py`，把浏览器导出的 `manual_labels.jsonl` 转成标准 `labels.jsonl` + `manifest.json`。本轮 72 条人工审计全部已审，转换后 `supervised=36`、`negative=36`、skipped `0`，总时长 `560.14s`，人工 speech frame ratio `0.6973`；输出在 `datasets/val/fusionvad-ja/v1-3/manual-audit-galgame/strong-labels/`。
+- 人工 held-out feature cache 已完成：`whisper-ja-1.5b` CUDA half precision，cached `72`、errors `0`、skipped `0`，输出 `datasets/val/fusionvad-ja/v1-3/manual-audit-galgame/feature-cache-strong/`。普通 sandbox 后台 job 可能让 Torch/ORT 初始化异常落 CPU；feature cache 使用前台 CUDA 跑通。
+- 人工 held-out 首轮对比：v1-mini threshold 0.5 F1 `0.6516`、precision `0.9209`、recall `0.5041`；v1.2 threshold 0.5 F1 `0.8262`、precision `0.8923`、recall `0.7693`；v1.2 在该人工集上阈值扫描最佳 threshold `0.15`，F1 `0.8471`、precision `0.8307`、recall `0.8643`。提权 CUDA baseline 输出 `datasets/val/fusionvad-ja/v1-3/manual-audit-galgame/baseline-vads-cuda/`：`fusion_lite` F1 `0.8862`、precision `0.9236`、recall `0.8518`；`whisperseg-adaptive` F1 `0.8548`、precision `0.8219`、recall `0.8906`；`ten_vad` F1 `0.7802`、precision `0.7085`、recall `0.8681`；`silero` F1 `0.6163`、precision `0.9805`、recall `0.4494`。结论：v1.2 已明显优于 v1-mini，但还没有超过当前 `fusion_lite`；v1.3 训练应继续提高 Galgame/JAV 近域 recall，同时控制 TEN 带来的 false positive。
+- `whisperseg-adaptive + silero` 32 条 smoke：输出 `datasets/train/fusionvad-ja/v1-3/teacher-pseudo-galgame-train32-whisperseg-silero/`，errors `0`、`teacher_agree=27`、`teacher_conflict=5`、active frame ratio `0.6008`、ignored frame ratio `0.3992`、conflict frame ratio `0.3485`。Silero 与 WhisperSeg 分歧很大，首轮不适合 strict 2/2 agreement 直接扩大训练，更适合作为 hard audit / uncertain sampler。
+- `ten_vad` direct 8 条 smoke：输出 `datasets/train/fusionvad-ja/v1-3/teacher-pseudo-galgame-train8-ten-vad/`，errors `0`、`teacher_agree=8`、active frame ratio `0.8687`。TEN 本机可用，可作为低成本独立 teacher。
+- `whisperseg-adaptive + ten_vad` 32 条 smoke：输出 `datasets/train/fusionvad-ja/v1-3/teacher-pseudo-galgame-train32-whisperseg-ten/`，WhisperSeg 主路径日志确认 `CUDAExecutionProvider`，errors `0`、`teacher_agree=32`、conflict frame ratio `0.0943`、active frame ratio `0.8490`、weighted speech frame ratio `0.8331`、weighted negative frame ratio `0.0159`。相比 Silero，TEN 更适合作为 v1.3 strict-agreement teacher 候选。
+- v1.3 建议执行顺序：先人工审计 40-80 条候选，形成小型 Galgame/JAV 强标注 held-out；再用 `whisperseg-adaptive + ten_vad` 生成 train512/train1k pseudo-label，保留 Silero 分歧样本为 ignore 或审计集；最后在 v1-mini strong test、人工近域 held-out、MUSAN/DNS/local negative 三类集合上同时比较 v1.2/v1.3、`fusion_lite`、`whisperseg-adaptive`、TEN/Silero baseline。
+- v1.3 `whisperseg-adaptive + ten_vad` train512 pseudo-label 已完成：输出 `datasets/train/fusionvad-ja/v1-3/teacher-pseudo-galgame-train512-whisperseg-ten/`，records `512`、errors `0`、`teacher_agree=507`、`teacher_conflict=5`；frames `136944`、active frame ratio `0.7977`、ignored frame ratio `0.2023`、conflict frame ratio `0.1392`、weighted speech frame ratio `0.7889`、weighted negative frame ratio `0.0088`。注意 `teacher_conflicts.jsonl` 记录局部分歧帧，行数会大于最终 `teacher_conflict` 样本数。
+- v1.3 training manifest 和 feature cache 已完成：507 条 `teacher_agree` 可训练样本，skipped `0`；`whisper-ja-1.5b` + MFCC CUDA half precision feature cache `cached=507`、errors `0`，输出 `datasets/train/fusionvad-ja/v1-3/teacher-pseudo-galgame-train512-whisperseg-ten/feature-cache-full/`。
+- v1.3 fine-tune 使用 v1-mini checkpoint 初始化，训练混合 v1-mini 强监督/真实负样本 302 条 + Galgame `whisperseg-adaptive + ten_vad` strict-agreement pseudo 507 条，共 809 条 cached examples。命令口径：`max_steps=1024`、`batch_size=16`、`learning_rate=0.0002`、`device=cuda`、init checkpoint `datasets/train/fusionvad-ja/v1-mini/addition-bilstm-2048-batch8/fusionvad_ja_addition_bilstm.pt`；checkpoint 写入 `datasets/train/fusionvad-ja/v1-3/addition-bilstm-ft-v1mini-whisperseg-ten809-batch16-lr2e-4-steps1024/fusionvad_ja_addition_bilstm.pt`。
+- v1.3 训练指标：loss `0.0208`、frame accuracy `0.9926`、positive ratio `0.5524`、可训练参数 `1,942,145`。`nvidia-smi` 训练中确认 Torch 进程走 GPU，显存约 `2.3GB`。
+- v1.3 人工 Galgame held-out 结果不达预期：threshold `0.5` 时 F1 `0.7926`、precision `0.7914`、recall `0.7938`、predicted positive ratio `0.6994`；人工集阈值扫描最佳 threshold `0.05`，F1 `0.8306`、precision `0.7567`、recall `0.9205`。这低于 v1.2 人工最佳 F1 `0.8471`，也低于 `fusion_lite` baseline F1 `0.8862`。
+- v1.3 v1-mini strong test 回归通过：threshold `0.5` 时 F1 `0.9912`、precision `0.9916`、recall `0.9908`、positive ratio `0.4754`、predicted positive ratio `0.4751`，略高于 v1.2 test F1 `0.9909`。v1-mini validation threshold `0.5` 为 F1 `0.9871`、precision `0.9884`、recall `0.9858`。
+- v1.3 Galgame weak-positive held-out 仍只作为近域 smoke，不是真实 VAD 指标：threshold `0.5` 时 F1 `0.9282`、precision `0.9885`、recall `0.8749`；threshold `0.25` 时 F1 `0.9444`、precision `0.9849`、recall `0.9071`；threshold `0.05` 时 F1 `0.9646`、precision `0.9844`、recall `0.9456`。低阈值能保留更多 Galgame weak speech-like 区域，但人工强标注显示 false positive 风险同步上升。
+- v1.3 结论：`whisperseg-adaptive + ten_vad` strict agreement 不是当前可推广的提升路线。TEN 提高了近域 recall 倾向，但伪标签负帧过少、冲突帧比例更高，训练后在人工 held-out 上 precision 明显下降。该 checkpoint 只作为研究产物保留，不替换默认 VAD，也不作为当前最佳 FusionVAD-JA 候选。
+- 下一步计划：优先把人工 held-out 扩到至少 200-300 条，并覆盖 Galgame/JAV 对白、纯呻吟/喘息、BGM、人声非语言和真实静音；训练侧回到高 precision teacher 或人工强标注混合，考虑 `fusion_lite` / `whisperseg` 作为主 teacher，TEN/Silero 只用于 hard-negative/uncertain sampler；同时补充 MUSAN/DNS/local video negative 与 human-nonverbal negative，减少“全段都是 speech”的伪标签偏置；所有候选继续在 v1-mini strong test、人工近域 held-out、Galgame weak smoke 三类集合上并排比较。
+- 本轮验收：`.venv/bin/python -m pytest tests/test_fusionvad_ja_dataset.py -q` 结果 `55 passed`；`.venv/bin/python -m pytest tests/test_fusion_lite_vad_backend.py tests/test_vad_ab1_ab2.py tests/test_vad_ab3_ab4.py -q` 结果 `31 passed`；`git diff --check` 通过。
+
+v1.4 Qwen3-ASR / high-recall VAD 计划：
+
+- 目标修正：如果主 ASR 计划转向 finetune `Qwen3-ASR-1.7B`，VAD 不再优先追最高 frame F1 或最高 precision，而应定位为 high-recall proposal generator。工程目标是“不漏对白”，允许多送一部分非语音给 ASR，再由 ASR / forced aligner / 字幕文本约束做后处理。
+- 本轮执行决策：本地后端 ASR 暂时继续使用 `Qwen3-ASR-1.7B`，不把 `Qwen3-ASR-0.6B` 注册成主 ASR 后端；`Qwen3-ASR-0.6B` 只作为 FusionVAD-JA 的 frozen PTM feature extractor 和低成本 ASR probe。1.7B 的 finetune 放到租用 GPU 服务器，本机只负责数据整理、评测、feature cache、轻量 VAD 头训练和对比。
+- 评估指标同步调整：除 precision / recall / F1 外，必须新增 `missed_speech_seconds`、`missed_speech_segments`、`extra_audio_ratio`、segment padding 后的 recall，以及 downstream ASR CER/WER。候选阈值选择先以 recall 约束为主，例如人工 near-domain held-out recall 目标先设 `>=0.95`，再限制 extra audio ratio。
+- Qwen3-ASR 外部依据：官方 README / model card 显示 `Qwen3-ASR-1.7B` 和 `Qwen3-ASR-0.6B` 均支持日语，并提供 transformers / vLLM 推理、forced aligner 和 JSONL audio-text fine-tuning；技术报告称 1.7B 是开源 SOTA 取向，0.6B 是 accuracy-efficiency trade-off，0.6B 在高并发下有很高吞吐。该定位与“0.6B 轻量特征提取 + 1.7B 精修 ASR”的分工一致。
+- Qwen3-ASR-0.6B 决策：值得作为下一轮重点 probe，但先不 finetune。先跑两条实验线：一是 direct ASR，对比 0.6B / 1.7B / 当前 ASR 在 Galgame/JAV 样本上的 CER、漏字、幻觉、速度和显存；二是 frozen feature VAD，把当前 `whisper-ja-1.5b` feature extractor 替换为 Qwen3-ASR-0.6B 的 frozen audio features，保持 MFCC + addition-fusion BiLSTM 思路不变，比较 recall、missed speech 和 extra audio ratio。
+- Qwen3-ASR feature cache 口径：`tools/fusionvad_ja/build_feature_cache.py --ptm qwen3-asr-0.6b` 读取 `Qwen/Qwen3-ASR-0.6B` 或本地 `models/Qwen-Qwen3-ASR-0.6B`，调用 `model.thinker.get_audio_features()` 只取 audio tower 输出，不跑文本生成；Qwen audio token 帧率低于 20ms MFCC，cache 阶段线性上采样到 MFCC 帧数后继续写入兼容的 `whisper` feature key。本地已下载 `models/Qwen-Qwen3-ASR-0.6B`，目录约 `1.8G`，`config.json` 显示 0.6B audio feature `output_dim=1024`。
+- Qwen3-ASR VAD 头部参数：0.6B audio feature 维度为 `1024`，可沿用默认 `fusion_dim=256`、`hidden_dim=192` 并保持可训练参数小于 2M；若后续切到 1.7B audio feature 等更大维度，再改用 `fusion_dim=160`、`hidden_dim=160`。由于输入特征分布不同，不建议从 `whisper-ja-1.5b` feature checkpoint 直接 `--init-checkpoint` fine-tune，Qwen feature 线首轮从头训练更清晰。
+- Qwen3-ASR-0.6B finetune 触发条件：只有当 0.6B direct ASR 已接近 1.7B 且速度/显存优势明显，或 0.6B frozen feature VAD 明显优于 Whisper 特征，或 1.7B 训练/推理成本不可接受时，再考虑 0.6B LoRA / full SFT。否则 0.6B 优先作为轻量 frozen feature extractor 和低成本 ASR baseline。
+- Qwen3-ASR-1.7B 显存判断：RTX 4060 Ti 8GB 对 1.7B 推理大概率可做小 batch / bf16 或 fp16，官方示例也允许通过较小 `max_inference_batch_size` 避免 OOM；但 8GB 不适合直接跑官方 full SFT 口径。原因是 full fine-tuning 除模型权重外还需要梯度、Adam optimizer state 和音频/文本 activation，显存远高于推理。官方 finetuning 示例默认 `batch_size=32`、`grad_acc=4`，未提供 LoRA / QLoRA 参数，这个默认口径不能直接套到 8GB 单卡。
+- 1.7B 可尝试路线：先只做 inference / eval；若要本机训练，优先自建 LoRA / QLoRA 或 decoder-only LoRA 方案，micro-batch 从 `1` 开始，短音频切片，开启 gradient checkpointing / FlashAttention 2，必要时冻结 audio encoder 或只训练文本侧/少量 adapter。即便如此，8GB 仍属高风险实验，必须先用 10-50 条 Galgame 小样本 smoke 测峰值显存，再决定是否扩大；full SFT 建议放到更大显存机器或云 GPU。
+- v1.4 执行顺序：先实现 Qwen3-ASR direct-ASR eval JSONL 和人工 held-out CER 计算；再实现 Qwen3-ASR-0.6B frozen feature cache adapter；随后用同一 v1-mini strong test、人工 Galgame held-out、Galgame weak smoke 比较 `whisper-ja-1.5b feature` 与 `qwen3-asr-0.6b feature`；阈值选择按 recall 优先，目标先看人工 near-domain recall `>=0.95` 时的 `missed_speech_seconds` 和 `extra_audio_ratio`；最后再决定是否做 1.7B LoRA smoke。
+- v1.4 已新增 research-only 工具：`tools/fusionvad_ja/export_qwen_asr_sft.py` 可把 Galgame manifest 导出成 Qwen SFT JSONL 包；`tools/fusionvad_ja/probe_qwen_asr.py` 可用本地 `Qwen3-ASR-1.7B` 跑 direct ASR probe，并输出 CER/RTF；`tools/fusionvad_ja/export_addition_predictions.py` 可从 addition-BiLSTM checkpoint 导出 frame prediction / probability JSONL；`tools/fusionvad_ja/vad_recall_metrics.py` 可从 frame prediction JSONL 计算 high-recall 指标与 padding trade-off；`tools/fusionvad_ja/build_galgame_synthetic_timeline.py` 可把已裁切 Galgame speech clip 与确定长度 silence / white-noise / hum gap 拼成精确时间轴 supervised VAD 样本。以上均不接入默认 VAD / Web。
+- v1.4 Qwen feature v1-mini-only 首轮：`Qwen3-ASR-0.6B` feature cache 已完成 v1-mini train/val/test/manual Galgame，cached 分别 `302/252/98/72`、errors `0`，feature dim `1024`、MFCC dim `40`。从头训练 `addition-bilstm-v1mini-2048-batch16`，可训练参数 `1,876,609`；v1-mini validation threshold `0.5` F1 `0.9861`、precision `0.9817`、recall `0.9905`，test F1 `0.9869`、precision `0.9785`、recall `0.9954`。但人工 Galgame threshold `0.5` F1 只有 `0.4444`、precision `0.9839`、recall `0.2870`，说明该头对 Galgame 近域 speech 概率极保守，不能只靠常规阈值迁移。
+- Galgame synthetic timeline 方案：由于 `litagin/Galgame_Speech_ASR_16kHz` 多数音频本身已按语音裁切，可以把 Galgame clip 当作 speech island，再拼接确定长度的 silence / low-noise / hum island 形成强时间轴 supervised 样本。v1.4 已生成 train/val/test `256/64/64` 条，speech frame ratio `0.8635/0.8584/0.8672`，training manifest skipped `0`；Qwen feature cache cached `256/64/64`、errors `0`。这类样本适合教模型边界和 gap，不等同真实 JAV 泛化集。
+- Qwen synthetic fine-tune：用 Qwen v1-mini checkpoint 初始化，混合 v1-mini strong/negative `302` 条 + Galgame synthetic timeline `256` 条，共 `558` 条，`max_steps=1024`、`batch_size=16`、`learning_rate=0.0002`，checkpoint `datasets/train/fusionvad-ja/v1-4/qwen3-asr-0.6b/addition-bilstm-ft-v1mini-galgame-synth558-batch16-lr2e-4-steps1024/`。训练 loss `0.0499`、frame accuracy `0.9818`、positive ratio `0.5688`。v1-mini regression 基本保留：validation threshold `0.5` F1 `0.9880`、precision `0.9879`、recall `0.9882`；test F1 `0.9865`、precision `0.9784`、recall `0.9948`。
+- v1.4 synthetic fine-tune 近域结果：synthetic Galgame threshold `0.5` 仍偏保守，validation F1 `0.7508`、precision `0.9891`、recall `0.6050`，test F1 `0.7489`、precision `0.9942`、recall `0.6006`；人工 Galgame threshold `0.5` F1 `0.6918`、precision `0.8654`、recall `0.5761`，较 v1-mini-only 的 recall `0.2870` 明显改善但还不是可用默认阈值。人工 held-out high-recall 口径下，threshold `0.00005` + `0.2s` padding 可达 recall `0.9553`、missed speech `17.48s`、extra audio ratio `1.3811`；threshold `0.00002` + `0.2s` padding 可达 recall `0.9666`、missed speech `13.06s`、extra audio ratio `1.4001`。结论：该 checkpoint 可以作为 high-recall proposal generator 研究候选，但阈值极低且 extra audio 明显，不替换默认 VAD。
+- v1.4 下一步：synthetic timeline 应增加更长/更多 gap、MUSAN/DNS/local video negative、human-nonverbal negative，并把人工 Galgame held-out 扩到 `200-300` 条；训练侧可尝试对 Galgame synthetic 样本过采样或 focal/positive-recall loss，但必须同时守住 v1-mini strong test 和人工 non-speech precision。Qwen 0.6B frozen feature 线暂不 finetune 0.6B 本体；1.7B 仍作为本地 ASR 推理/未来云端 SFT 目标。
+- v1.5 synthetic timeline v2 实现：`tools/fusionvad_ja/build_galgame_synthetic_timeline.py` 增加 `--negative-manifest`、`--negative-gap-prob`、`--background-manifest`、`--background-mix-prob`、SNR 配置和 `--speech-label-pad-s`。默认不开启这些新选项，旧 v1.4 行为不变。v2 用 MUSAN 真实 negative gap 替代一部分 synthetic gap，并按 5-20dB 随机混背景；`speech_label_pad_s=0.08` 只扩训练标签，不改音频本体，用于高 recall 边界训练。
+- v1.5 数据：Galgame synthetic timeline v2 train/val/test 分别为 `256/64/64` 条，`min_speech_s=0.05` 以保留极短近域声音，skipped 均为 `0`。speech frame ratio 为 `0.7966/0.7970/0.8037`，比 v1.4 的约 `0.86` 更接近真实有 gap 的时间轴；real MUSAN negative gap 数为 `533/143/124`，background mix 数为 `139/30/39`。Qwen3-ASR-0.6B feature cache 使用 CUDA bfloat16、batch size 16，cached `256/64/64`、errors `0`。
+- v1.5 训练：继续从 Qwen v1-mini-only checkpoint 初始化，训练混合 v1-mini strong/negative `302` 条 + Galgame synthetic v2 `256` 条，共 `558` 条，`max_steps=1024`、`batch_size=16`、`learning_rate=0.0002`。新增 `train_addition_bilstm.py --positive-loss-weight`，默认 `1.0`；本轮训练 BCE baseline 和 `positive_loss_weight=2.0` 两个变体。BCE checkpoint `datasets/train/fusionvad-ja/v1-5/qwen3-asr-0.6b/addition-bilstm-ft-v1mini-galgame-synthv2-bce558-batch16-lr2e-4-steps1024/`，train loss `0.0656`、frame accuracy `0.9750`。posw2 checkpoint `datasets/train/fusionvad-ja/v1-5/qwen3-asr-0.6b/addition-bilstm-ft-v1mini-galgame-synthv2-posw2-558-batch16-lr2e-4-steps1024/`，train loss `0.0963`、frame accuracy `0.9703`。
+- v1.5 评估：BCE threshold `0.5` 在 v1-mini test F1 `0.9906`、recall `0.9933`，但 manual Galgame recall 只有 `0.5474`。posw2 threshold `0.5` 在 v1-mini test F1 `0.9892`、recall `0.9960`，manual Galgame F1 `0.7572`、precision `0.8251`、recall `0.6996`，说明正类加权更符合高 recall 目标。v2 synthetic test threshold `0.5` 仍偏保守，posw2 recall `0.4190`；低阈值是当前必要的 proposal 模式。
+- v1.5 推荐 operating points：posw2 + threshold `0.001` + pad `0.2s` 在人工 Galgame 上 precision `0.7310`、recall `0.9501`、F1 `0.8263`、missed speech `19.52s`、extra audio ratio `1.2997`。更激进的 threshold `0.0001` + pad `0.2s` 达到 recall `0.9838`、missed speech `6.32s`、extra audio ratio `1.3809`。对比 v1.4 threshold `0.00005` + pad `0.2s` 的 recall `0.9553`、extra audio ratio `1.3811`，v1.5 posw2 在几乎相同 extra audio ratio 下把人工 Galgame recall 提升到 `0.9838`。
+- v1.5 结论：当前最佳 FusionVAD-JA 候选是 Qwen3-ASR-0.6B frozen feature + MFCC addition BiLSTM posw2 checkpoint，使用低阈值 + padding 作为高 recall proposal generator；仍不替换默认 `fusion_lite`，也不接入 Web。下一步应补本地 JAV/manual negative、human-nonverbal negative、BGM/长静音 held-out，并用 Qwen3-ASR-1.7B downstream ASR 评估“多切一点”是否真的提升字幕召回且不显著增加幻觉。
+- v1.6 real-heldout 启动：已从 `video/` 顶层 10 个本地视频各抽 8 条、每条 8s 的 16k mono WAV，避开片头/片尾 60s，共 80 条，输出 `datasets/val/fusionvad-ja/v1-6/real-heldout-local-video-audit-80/`。候选文件 `audit_candidates.jsonl`，manifest `manifest.json`，中文人工标注页面 `manual_audit.html`，浏览器导出文件名固定为 `manual_labels.jsonl`。本轮先不训练，先把真实本地 held-out 做出来。
+- v1.6 标注口径：可转写日语对白、呻吟声/喘息声如果希望 Qwen3-ASR-1.7B 后续尝试识别或保留上下文，就标为 speech；纯 BGM、机械/环境噪声、静音、无法作为 ASR 输入的非语音人声标为 non-speech；不确定样本可先跳过或标注备注，避免污染强标签。
+- v1.6 人工审计工具更新：`tools/fusionvad_ja/generate_manual_audit_html.py` 的主流程改为四类快速标注优先：全段语音、非语音、开头到当前点、当前点到末尾；多段表格仍保留给少数中间有长空洞或多段对白的样本。网页里只设起点会默认生成 `start -> duration`，只设终点会默认生成 `0 -> end`；`tools/fusionvad_ja/convert_manual_audit_labels.py` 也支持单侧边界 JSONL，保证导出和转换语义一致。
+- v1.6 人工标注已完成：浏览器导出 `manual_labels.jsonl` 为 `79` 条，候选原始数为 `80` 条；本轮直接用已审 `79` 条继续评估。转强标签输出 `datasets/val/fusionvad-ja/v1-6/real-heldout-local-video-audit-80/strong-labels/`，records `79`、skipped `0`、`supervised=55`、`negative=24`，总时长 `632.0s`，人工 speech frame ratio `0.6138`。
+- v1.6 Qwen3-ASR-0.6B feature cache 已完成：输出 `datasets/val/fusionvad-ja/v1-6/qwen3-asr-0.6b/real-heldout-local-video-audit-80-feature-cache/`，配置为 `device=cuda`、`dtype=bfloat16`、batch size `16`，cached `79`、errors `0`、skipped `0`。
+- v1.6 现有 VAD baseline：输出 `datasets/val/fusionvad-ja/v1-6/real-heldout-local-video-audit-80/baseline-vads-cuda/`，`fusion_lite` 79/79 成功，F1 `0.7969`、precision `0.8534`、recall `0.7475`、predicted positive ratio `0.5377`；`whisperseg-adaptive` 79/79 成功，F1 `0.7697`、precision `0.7404`、recall `0.8015`、predicted positive ratio `0.6645`。WhisperSeg 日志确认 `CUDAExecutionProvider`。
+- v1.6 v1.5 posw2 raw frame 对比：threshold `0` 等价于全帧 speech，precision `0.6141`、recall `1.0000`、F1 `0.7609`、predicted positive ratio `1.0000`，只能作为“不做 VAD 裁剪”的上限对照；threshold `0.0001` raw F1 `0.8046`、precision `0.7023`、recall `0.9418`；threshold `0.001` raw F1 `0.7975`、precision `0.7808`、recall `0.8150`。
+- v1.6 high-recall padding 对比：统一 `pad=0.2s` 后，threshold `0.0001` precision `0.6825`、recall `0.9631`、F1 `0.7988`、missed speech `14.32s`、extra audio ratio `1.4112`；threshold `0.00015` precision `0.6941`、recall `0.9551`、F1 `0.8039`、missed speech `17.40s`、extra audio ratio `1.3761`；threshold `0.0002` precision `0.7033`、recall `0.9482`、F1 `0.8076`、extra audio ratio `1.3484`；threshold `0.001` recall 只有 `0.8729`。threshold `0` + pad 仍是全帧 speech，extra audio ratio `1.6283`。
+- v1.6 结论：当前本地 real-heldout 推荐 operating point 暂定为 v1.5 posw2 + threshold `0.00015` + pad `0.2s`，它刚好满足 recall `>=0.95`，extra audio ratio `1.3761` 接近 manual Galgame 目标上沿。threshold `0.0001` 更稳召回但额外音频偏多；threshold `0.0002` 额外音频更低但已经略低于 recall 目标。下一步可以进入 Qwen3-ASR-1.7B downstream ASR 对比，重点验证额外音频是否导致幻觉；如果 false positive 主要来自 BGM/呻吟/非语音人声，下一轮优先补 hard negative / human-nonverbal negative，而不是继续扩大 Galgame full-speech 数据。
+- v1.6 AnimeWhisper 下游 ASR proxy 对比已完成：新增 `tools/fusionvad_ja/evaluate_vad_asr_downstream.py`，在同一 79 条 real-heldout 强标签上比较 `whisperseg-adaptive`、`fusion_lite`、FusionVAD-JA v1.5 posw2 operating point，并把 VAD 切片送入 `anime-whisper`。输出目录为 `datasets/val/fusionvad-ja/v1-6/real-heldout-local-video-audit-80/downstream-asr-anime-whisper-vad-compare/`，总表为 `downstream_asr_summary.json`。该集没有人工参考转写，因此结果只能作为“漏语音/额外音频/幻觉倾向”代理指标，不是 CER/WER。
+- v1.6 下游结果：`fusion_lite` recall `0.7474`、precision `0.8534`、F1 `0.7969`、missed speech `98.00s`、extra audio ratio `0.8758`、ASR chunks `80`、predicted audio `339.76s`、negative-record text chars `41`、no-overlap text chars `66`；`whisperseg-adaptive` recall `0.8014`、precision `0.7403`、F1 `0.7696`、missed speech `77.06s`、extra audio ratio `1.0824`、chunks `112`、predicted audio `419.91s`、negative chars `75`、no-overlap chars `107`；`fusionvad` recall `0.9551`、precision `0.6941`、F1 `0.8039`、missed speech `17.40s`、extra audio ratio `1.3762`、chunks `134`、predicted audio `533.86s`、negative chars `182`、no-overlap chars `201`。
+- v1.6 下游结论：FusionVAD-JA 达成高 recall 目标，漏语音秒数相比 `fusion_lite` 明显下降，但会把更多 negative / no-overlap 音频交给 ASR；AnimeWhisper 对所有 VAD 的切片几乎都会产出非空文本，negative/no-overlap 中常见 `ん`、喘息/亲吻拟声等短文本，说明“多切一点”确实增加 hallucination proxy。下一轮优先方向是补 human-nonverbal、BGM、真实 hard negative 训练和/或 ASR 后处理过滤，而不是直接把当前 FusionVAD-JA 晋级为默认 VAD。
+- v1.6 策略修正：Galgame 训练集本身包含大量呻吟、喘息、亲吻声等字幕转写，因此 FusionVAD-JA 的正类不应等同传统 speech benchmark 的“清晰词句”。当前研究口径改为：凡是希望送入 ASR 并可能生成字幕的人声、拟声、短促发声都可标为 speech；negative 只指纯 BGM、静音、环境/机械声和无字幕价值残留。所以上述 `negative/no-overlap text chars` 不能自动视为坏样本，必须人工区分“目标域可接受非语言人声”和“真实幻觉”。
+- v1.6 hard-negative/目标非语言人声审计：新增 `tools/fusionvad_ja/select_asr_hard_negative_candidates.py`，从 downstream ASR JSONL 中挑出人工 negative 但 ASR 有有效文本、或与人工 speech 无重叠但 ASR 有有效文本的 chunk。已对 `fusionvad` 输出生成 18 条审计候选，输出 `datasets/val/fusionvad-ja/v1-6/real-heldout-local-video-audit-80/asr-hard-negative-audit-fusionvad/`；其中 `manual_negative_asr_text=14`、`no_overlap_asr_text=4`，中文审计页为 `manual_audit.html`。人工标注口径：真实可字幕化呻吟/喘息/拟声标为全段语音；纯 BGM/噪声/静音中的 ASR 文本标为非语音，后续作为 Qwen3-ASR hard-negative 空输出或幻觉过滤样本。
+- 当前待办：等待人工审计 `datasets/val/fusionvad-ja/v1-6/real-heldout-local-video-audit-80/asr-hard-negative-audit-fusionvad/manual_audit.html` 导出的 `manual_labels.jsonl`。审计完成后先用 `tools/fusionvad_ja/convert_manual_audit_labels.py` 转成强标签并统计 speech/negative 占比；再把标为 speech 的样本作为“目标非语言人声/短促发声”保留给 VAD 正类或后续人工转写，把标为 negative 的样本作为 VAD hard-negative 和 Qwen3-ASR 空输出/幻觉过滤样本。
+- v1.6 hard-negative 审计已回收并转换：`manual_labels.jsonl` 已保存并转成 `strong-labels/labels.jsonl` 与 `strong-labels/manifest.json`，records `18`、skipped `0`、`supervised=14`、`negative=4`，manual speech ratio `0.9056`。这说明首批 ASR hard-negative 候选多数其实是目标域可字幕化人声/拟声，不应当一概压成 VAD negative；后续更适合把 14 条 speech 作为目标非语言人声正例保留，把 4 条 negative 作为真实 hard-negative。
+- 审计页说明：`Teacher 并集` / `Teacher 交集` 只用于 teacher pseudo-label 审计时快速用 teacher segment 初始化人工边界；ASR hard-negative 审计没有 teacher segments，因此这两个按钮没有意义。`tools/fusionvad_ja/generate_manual_audit_html.py` 已改为仅在候选实际包含 teacher segments 时显示这两个按钮，并把页面标注口径改成“可字幕化人声/拟声/短促发声标为语音，纯 BGM/静音/噪声标为非语音”。
+- v1.6 ASR SFT 候选导出：新增 `tools/fusionvad_ja/export_manual_audit_asr_sft_candidates.py`，专门处理人工审计强标签，不信任 ASR 候选文本为正例真值。已从 `strong-labels/manifest.json` 导出到 `asr-sft-candidates/`：`v1-6-fusionvad-audit_empty_hard_negative.jsonl` 含 4 条 `text=""` 空输出 hard-negative，可用于 Qwen3-ASR 幻觉抑制 smoke；`v1-6-fusionvad-audit_speech_review.jsonl/csv` 含 14 条目标非语言人声 review 候选，保留 `candidate_asr_text` 但 `text=""`，必须人工确认转写后才能进 ASR 正样本 SFT。该包位于 `datasets/val/` 下，只作为 held-out 审计产物和后续数据设计依据，直接拿来训练会污染 v1.6 real-heldout。
+- 下一轮计划：基于审计结果启动 v1.7。若 18 条里多数是目标域可字幕化人声，保持当前 v1.5 posw2 `threshold=0.00015 + pad=0.2s` 高 recall operating point，并优先推进 ASR finetune / post-filter；若纯 BGM/噪声/静音占比高，则先扩充本地 hard-negative、重新训练 FusionVAD-JA 头并在 v1.6 real-heldout 上复测 recall、missed speech seconds、extra audio ratio 和 AnimeWhisper/Qwen3-ASR downstream proxy。ASR SFT 正样本不能直接使用 AnimeWhisper 原始文本当真值，除非人工在 notes 或后续转写文件中确认。
+- Sources：Qwen3-ASR GitHub `https://github.com/QwenLM/Qwen3-ASR`，Qwen3-ASR finetuning `https://github.com/QwenLM/Qwen3-ASR/tree/main/finetuning`，Qwen3-ASR technical report `https://arxiv.org/abs/2601.21337`，Qwen3-ASR-0.6B model card `https://huggingface.co/Qwen/Qwen3-ASR-0.6B`，Qwen3-ASR-1.7B model card `https://huggingface.co/Qwen/Qwen3-ASR-1.7B`。
+- Sources：FusionVAD arXiv `https://arxiv.org/abs/2506.01365`，ISCA Archive `https://www.isca-archive.org/interspeech_2025/tripathi25_interspeech.html`，teacher-student VAD `https://dl.acm.org/doi/abs/10.1109/TASLP.2021.3073596`，TEN VAD `https://github.com/ten-framework/ten-vad`，Silero VAD `https://github.com/snakers4/silero-vad`，FireRedVAD `https://github.com/FireRedTeam/FireRedVAD`。
+
+ONNXRuntime CUDA 诊断：
+
+- 当前 `.venv` 中 `torch 2.12.0+cu130`、`torch.cuda.is_available=True`、`onnxruntime-gpu 1.27.0.dev20260511001`，可用 providers 包含 `CUDAExecutionProvider`。
+- `onnxruntime-gpu` 预发行包依赖的 CUDA 13 / cuDNN 9 shared libraries 位于 `.venv/lib/python3.14/site-packages/nvidia/cu13/lib` 与 `.venv/lib/python3.14/site-packages/nvidia/cudnn/lib`。`src/vad/whisperseg/whisperseg_core.py` 会优先从 `ORT_CUDA_PRELOAD_DIRS` 读取 preload 目录；未设置时自动尝试上述 `.venv` 目录。
+- Codex sandbox 内可能仍报 `CUDA failure 35` 并回落 CPU；跑 WhisperSeg / fusion_lite 大样本对比时应使用非 sandbox / 提权执行，日志中必须看到 `onnx_provider=CUDAExecutionProvider` 或 `providers=['CUDAExecutionProvider', 'CPUExecutionProvider']`。
+- `fusion_lite` 的 Silero gate 当前仍可能先尝试 Silero ONNX 并打印一次 `libcudnn.so.9` 警告；本轮同集 baseline 没有失败，WhisperSeg 主信号已确认走 CUDA。
+
+v1-mini-balanced-32 历史结果：
+
+- VoxConverse 使用 Hugging Face `Audio` / torchcodec 物化，train/val/test 分别取 dev index `0-11`、`12-15`、`16-19`，音频和父音频 ID 均互斥；torchcodec decode rows 分别为 12/4/4，error 0。
+- VoxConverse supervised 20s clip：train 151、val 126、test 49，skipped 0、errors 0；speech ratio 均值约 0.95，只能提供 supervised speech span，不能单独覆盖 non-speech。
+- MUSAN 已下载到 `datasets/raw/musan/` 并解出 `music=660`、`noise=930`、`speech=426` 个 wav。下载包因断点续传尾部有 trailing garbage，但有效 `musan/` 目录已解出，当前 v1-mini 只使用 `music` / `noise` real-negative。
+- MUSAN negative 20s clip：train 151、val 126、test 49，skipped 0、errors 0，speech ratio 0。
+- v1-mini-balanced-32 从每个 split 中固定取 16 条 VoxConverse supervised + 16 条 MUSAN negative；feature cache 全部使用 `whisper-ja-1.5b` CUDA half precision，`whisper_dim=1280`、`mfcc_dim=40`、cached 32、errors 0、skipped 0。
+- GPU 诊断：`WhisperEncoderFeatureExtractor(ptm='whisper-ja-1.5b', device='cuda')` 的参数位于 `cuda:0`，加载后 CUDA allocated 约 3.09GB；20s clip encoder feature 提取约 0.8s/条，首条约 1.7-2.1s。`build_feature_cache.py` 已打印实际 model path、device、dtype、CUDA memory 和逐条进度，避免误判为 CPU 路径。
+- 256-step 训练过短，模型非常保守：val F1 0.0566、precision 0.9763、recall 0.0291；test F1 0.0442、precision 1.0、recall 0.0226。
+- 2048-step addition-fusion BiLSTM：trainable params 1,942,145，train loss 0.1212、frame accuracy 0.9501、positive ratio 0.4883。Held-out val `frame_accuracy=0.9513`、`precision=0.9855`、`recall=0.9132`、`F1=0.9480`、`positive_ratio=0.4859`、`predicted_positive_ratio=0.4503`；held-out test `frame_accuracy=0.9885`、`precision=0.9817`、`recall=0.9948`、`F1=0.9882`、`positive_ratio=0.4837`、`predicted_positive_ratio=0.4901`。
+- 该结果是首个 real-negative supervised mini 结果，但数据仍小，且 positive 主要来自 VoxConverse、negative 主要来自 MUSAN music；不能视为 JAV/galgame 泛化结论。下一步需要扩大 balanced split，并加入 Galgame / 本地 JAV near-domain teacher labels 与 `fusion_lite`、`whisperseg-adaptive` 同集 baseline。
+
+v1-probe 结果：
+
+- AVA-Speech HF 源 `nccratliri/vad-human-ava-speech` 小样本可生成 supervised timestamp label，但该数据集只含 VAD 标注字段，不含原始音频；未另行取得 AVA 音频前不能直接进入 feature cache。
+- VoxConverse HF 源 `diarizers-community/voxconverse` 小样本可用 `Audio(decode=False)` 物化 WAV：3 条 dev 音频、总时长 1116.65s、error 0；label/audio manifest 对齐得到 3 条 supervised example，AVA 3 条因缺音频被跳过。
+- VoxConverse 3 条样本按 20s 非重叠切窗得到 56 条 supervised clip、总时长 1105.48s、error 0；但全部 `speech_ratio > 0.78`，平均 `0.9701`，只能作为 supervised-positive smoke，不能替代真实 negative。
+- v1-mini-smoke 已完成“VoxConverse supervised-positive + synthetic negative”闭环：56 条 VoxConverse supervised clip + 56 条 synthetic negative，feature cache 112、errors 0、skipped 0；256-step addition-fusion BiLSTM smoke `loss=0.3769`、`frame_accuracy=0.8328`、`positive_ratio=0.4901`，可训练参数 1,942,145；同集 sanity eval `frame_accuracy=0.9859`、`precision=0.9719`、`recall=0.9997`、`F1=0.9856`。该结果只验证新数据/切窗/训练/eval 闭环，不是泛化指标。
+
+MUSAN 本地下载建议：
+
+```bash
+mkdir -p datasets/raw/musan
+curl -L https://openslr.magicdatatech.com/resources/17/musan.tar.gz -o datasets/raw/musan/musan.tar.gz
+tar -xzf datasets/raw/musan/musan.tar.gz -C datasets/raw/musan
+```
+
+当前 smoke 结果：
+
+- 真实 ja whisper 1.5B feature cache 已验证：`whisper_dim=1280`、`mfcc_dim=40`、`frame_hop_s=0.02`。
+- 2 正 + 2 负真实 feature cache：cached 4、errors 0、skipped 0。
+- 4 正 + 8 负真实 feature cache：cached 12、errors 0、skipped 0；48-step addition-fusion BiLSTM smoke 写出 checkpoint，`positive_ratio=0.2071`，`trainable_parameters=1,942,145`。
+- v0 训练批次：物化 Galgame 64 条，选 32 条短 weak-positive + 64 条 synthetic negative，真实 feature cache 96 条、errors 0、skipped 0；256-step addition-fusion BiLSTM smoke `loss=0.3196`、`frame_accuracy=0.8574`、`positive_ratio=0.3503`。
+- v0 validation / test 归档：各 8 条 Galgame weak-positive + 16 条 synthetic negative，feature cache 各 24 条、errors 0、skipped 0；使用 v0 checkpoint 评估时 val/test `frame_accuracy=1.0`、`F1=1.0`，该结果主要说明链路可执行和 split 可归档，不能视为正式泛化精度。
+- addition-fusion BiLSTM 默认结构可训练参数为 1,942,145，低于 2M；早期 smoke checkpoint 写入 `agents/temp/fusionvad-ja/`，正式研究 checkpoint 写入 ignored `datasets/train/fusionvad-ja/`。
+- 该结果仅证明训练链路和 shape 对齐可用，不代表正式 VAD 精度结论。
+
+参考来源：
+
+- FusionVAD paper: <https://arxiv.org/abs/2506.01365>
+- Hugging Face paper page: <https://huggingface.co/papers/2506.01365>
+- AVA-Speech VAD: <https://huggingface.co/datasets/nccratliri/vad-human-ava-speech>
+- VoxConverse: <https://huggingface.co/datasets/diarizers-community/voxconverse>
+- MUSAN: <https://www.openslr.org/17/>
+- DNS Challenge: <https://github.com/microsoft/DNS-Challenge>
+
 ### 字幕时间轴
 
 LLM 翻译前必须先生成稳定 cue plan。流程会通过 `ffprobe` 读取真实 `avg_frame_rate` / `r_frame_rate`，失败时按 `30000/1001`，即 29.97fps 兜底。
@@ -312,6 +549,7 @@ Web 设置行为：
 - 从 Hugging Face 单独下载并模块化评测 `cam++` speaker embedding/聚类能力，确认是否可作为 Whisper/anime 工作流的 speaker sidecar。
 - 评测 `efwkjn/cohere-asr-ja-v0.1`，确认其与当前 ASR 流程及 `transformers` 版本约束的兼容性，再决定是否纳入候选后端。
 - 增加本地/厂商翻译 API 适配层，允许在现有 OpenAI-compatible 翻译之外接入专用翻译服务，例如腾讯 `hy-mt2`。
+- 实现 FusionVAD-JA feature cache 与 addition-fusion BiLSTM 训练闭环，先做 smoke / ablation，不接入默认 VAD。
 
 ---
 
