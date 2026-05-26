@@ -557,6 +557,7 @@ Web 设置行为：
 - 评测 `efwkjn/cohere-asr-ja-v0.1`，确认其与当前 ASR 流程及 `transformers` 版本约束的兼容性，再决定是否纳入候选后端。
 - 增加本地/厂商翻译 API 适配层，允许在现有 OpenAI-compatible 翻译之外接入专用翻译服务，例如腾讯 `hy-mt2`。
 - 实现 FusionVAD-JA feature cache 与 addition-fusion BiLSTM 训练闭环，先做 smoke / ablation，不接入默认 VAD。
+- 二期 probe `joujiboi/Galgame-VisualNovel-Reupload` 的 streaming parquet 字段、样本质量、去重、下载速度和 license 边界；只作为 Qwen3-ASR / FusionVAD-JA 候选数据源，不进入第一轮默认数据混合。
 
 ---
 
