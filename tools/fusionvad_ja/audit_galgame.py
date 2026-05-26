@@ -15,26 +15,49 @@ if str(SRC_ROOT) not in sys.path:
 
 import numpy as np
 
-from vad.fusionvad_lite import audit_audio
+from vad.fusionvad_ja import audit_audio, sample_hf_audio_16k_mono
 
 
 def _load_dataset(*, name: str, split: str):
     try:
+        from datasets import Features, Value
         from datasets import load_dataset
     except ImportError as exc:
         raise SystemExit("datasets is required for HF streaming audit: uv pip install datasets") from exc
-    return load_dataset(name, split=split, streaming=True)
+    features = Features(
+        {
+            "ogg": Value("binary"),
+            "txt": Value("string"),
+            "__key__": Value("string"),
+            "__url__": Value("string"),
+        }
+    )
+    return load_dataset(name, split=split, streaming=True, features=features)
 
 
 def _sample_audio(example: dict[str, Any]) -> tuple[np.ndarray, int]:
-    audio_obj = example.get("ogg") or example.get("audio")
-    if isinstance(audio_obj, dict):
-        array = audio_obj.get("array")
-        sample_rate = int(audio_obj.get("sampling_rate") or 16000)
-        if array is None:
-            raise ValueError("audio sample has no array")
-        return np.asarray(array, dtype=np.float32), sample_rate
-    raise ValueError("expected an 'ogg' or 'audio' field decoded by datasets")
+    return sample_hf_audio_16k_mono(example)
+
+
+def _mean(values: list[float]) -> float | None:
+    return sum(values) / len(values) if values else None
+
+
+def _percentile(values: list[float], q: float) -> float | None:
+    if not values:
+        return None
+    return float(np.percentile(np.asarray(values, dtype=np.float64), q))
+
+
+def _bucket_counts(values: list[float], *, thresholds: list[float]) -> dict[str, int]:
+    buckets: dict[str, int] = {}
+    lower = 0.0
+    for threshold in thresholds:
+        key = f"{lower:g}-{threshold:g}"
+        buckets[key] = sum(1 for value in values if lower <= value < threshold)
+        lower = threshold
+    buckets[f">={lower:g}"] = sum(1 for value in values if value >= lower)
+    return buckets
 
 
 def run(args: argparse.Namespace) -> None:
@@ -73,6 +96,10 @@ def run(args: argparse.Namespace) -> None:
 
     valid = [row for row in rows if "error" not in row]
     durations = [float(row["duration_s"]) for row in valid]
+    text_chars = [int(row["text_chars"]) for row in valid]
+    rms_values = [float(row["rms_dbfs"]) for row in valid]
+    head_silence_values = [float(row["head_silence_s"]) for row in valid]
+    tail_silence_values = [float(row["tail_silence_s"]) for row in valid]
     summary = {
         "dataset": args.dataset,
         "split": args.split,
@@ -82,10 +109,23 @@ def run(args: argparse.Namespace) -> None:
         "error_rows": len(rows) - len(valid),
         "duration_s_total": sum(durations),
         "duration_s_min": min(durations) if durations else None,
+        "duration_s_p50": _percentile(durations, 50),
+        "duration_s_p90": _percentile(durations, 90),
+        "duration_s_p99": _percentile(durations, 99),
         "duration_s_max": max(durations) if durations else None,
-        "duration_s_mean": sum(durations) / len(durations) if durations else None,
+        "duration_s_mean": _mean(durations),
         "short_under_0_3s": sum(1 for value in durations if value < 0.3),
+        "short_under_1s": sum(1 for value in durations if value < 1.0),
         "long_over_20s": sum(1 for value in durations if value > 20.0),
+        "duration_buckets_s": _bucket_counts(durations, thresholds=[0.3, 1.0, 3.0, 10.0, 20.0]),
+        "rms_dbfs_mean": _mean(rms_values),
+        "rms_dbfs_p10": _percentile(rms_values, 10),
+        "rms_dbfs_p50": _percentile(rms_values, 50),
+        "head_silence_s_mean": _mean(head_silence_values),
+        "tail_silence_s_mean": _mean(tail_silence_values),
+        "text_chars_mean": _mean([float(value) for value in text_chars]),
+        "text_chars_p50": _percentile([float(value) for value in text_chars], 50),
+        "empty_text_rows": sum(1 for value in text_chars if value == 0),
     }
     summary_path = output_dir / "audit_summary.json"
     summary_path.write_text(json.dumps(summary, ensure_ascii=False, indent=2, sort_keys=True), encoding="utf-8")
@@ -94,11 +134,11 @@ def run(args: argparse.Namespace) -> None:
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Audit Galgame ASR samples for FusionVAD-Lite research.")
+    parser = argparse.ArgumentParser(description="Audit Galgame ASR samples for FusionVAD-JA research.")
     parser.add_argument("--dataset", default="litagin/Galgame_Speech_ASR_16kHz")
     parser.add_argument("--split", default="train")
     parser.add_argument("--limit", type=int, default=1000)
-    parser.add_argument("--output-dir", default=str(PROJECT_ROOT / "agents" / "temp" / "fusionvad-lite" / "galgame-audit"))
+    parser.add_argument("--output-dir", default=str(PROJECT_ROOT / "agents" / "temp" / "fusionvad-ja" / "galgame-audit"))
     return parser.parse_args(argv)
 
 
