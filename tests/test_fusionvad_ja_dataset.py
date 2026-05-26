@@ -2338,11 +2338,35 @@ def test_generate_manual_audit_html_embeds_candidates(tmp_path):
     assert "快速审计优先使用四类结果" in html
     assert "startToHereBtn" in html
     assert "hereToEndBtn" in html
+    assert "Teacher 并集" in html
+    assert "function hasTeacherData" in html
     assert "只设起点时默认到音频末尾" in html
     assert "function hasTimeValue" in html
     assert "function commitPendingStart" in html
     assert "addSegment(0, end)" in html
     assert (tmp_path / "audit" / "audio" / "clip.wav").exists()
+
+    no_teacher_html = module.html_template(
+        title="无 teacher 审计",
+        dataset_id="unit-no-teacher",
+        output_jsonl_name="manual_labels.jsonl",
+        candidates=[
+            {
+                "audio_id": "clip",
+                "audio": str(audio_path),
+                "audio_url": "audio/clip.wav",
+                "duration_s": 0.1,
+                "source": "unit",
+                "text": "ASR: んっ",
+                "reason": "manual_negative_asr_text",
+                "label_quality": "negative",
+                "teacher_segments": {},
+            }
+        ],
+    )
+    assert "Teacher 并集" not in no_teacher_html
+    assert "Teacher 交集" not in no_teacher_html
+    assert "凡是希望送入 ASR" in no_teacher_html
 
 
 def test_convert_manual_audit_labels_builds_strong_labels(tmp_path):
