@@ -2075,6 +2075,89 @@ def test_export_qwen_asr_sft_filters_and_copies_audio(tmp_path):
     assert [row["reason"] for row in skipped] == ["missing_text", "duration_too_long"]
 
 
+def test_export_manual_audit_asr_sft_candidates_splits_empty_and_review(tmp_path):
+    import importlib.util
+    import json
+
+    script_path = (
+        __import__("pathlib").Path(__file__).resolve().parents[1]
+        / "tools"
+        / "fusionvad_ja"
+        / "export_manual_audit_asr_sft_candidates.py"
+    )
+    spec = importlib.util.spec_from_file_location("fusionvad_ja_export_manual_audit_asr_sft_candidates", script_path)
+    assert spec and spec.loader
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    audio_path = tmp_path / "clip.wav"
+    audio_path.write_bytes(b"RIFF")
+    manifest_path = tmp_path / "manifest.json"
+    manifest_path.write_text(
+        json.dumps(
+            [
+                {
+                    "audio_id": "neg",
+                    "audio": str(audio_path),
+                    "duration_s": 1.0,
+                    "source": "unit",
+                    "manual_reason": "manual_negative_asr_text",
+                    "label_quality": "negative",
+                    "text": "ASR: んっ…\nraw: んっ…",
+                },
+                {
+                    "audio_id": "speech",
+                    "audio": str(audio_path),
+                    "duration_s": 2.0,
+                    "source": "unit",
+                    "manual_reason": "no_overlap_asr_text",
+                    "label_quality": "supervised",
+                    "text": "ASR: 逃げて\nraw: …逃げて",
+                },
+            ],
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
+    assert module.parse_candidate_asr_text("ASR: んっ…\nraw: x") == "んっ…"
+    module.run(
+        module.parse_args(
+            [
+                "--manifest",
+                str(manifest_path),
+                "--split",
+                "train",
+                "--copy-audio",
+                "--output-dir",
+                str(tmp_path / "out"),
+            ]
+        )
+    )
+
+    empty_rows = [
+        json.loads(line)
+        for line in (tmp_path / "out" / "train_empty_hard_negative.jsonl").read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    review_rows = [
+        json.loads(line)
+        for line in (tmp_path / "out" / "train_speech_review.jsonl").read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    summary = json.loads((tmp_path / "out" / "train_summary.json").read_text(encoding="utf-8"))
+
+    assert empty_rows[0]["audio_id"] == "neg"
+    assert empty_rows[0]["text"] == ""
+    assert empty_rows[0]["label_type"] == "empty_hard_negative"
+    assert review_rows[0]["candidate_asr_text"] == "逃げて"
+    assert review_rows[0]["text"] == ""
+    assert review_rows[0]["label_type"] == "needs_manual_transcript"
+    assert summary["empty_hard_negative_records"] == 1
+    assert summary["speech_review_records"] == 1
+    assert (tmp_path / "out" / "audio" / "neg.wav").exists()
+
+
 def test_probe_qwen_asr_text_distance_and_selection(tmp_path):
     import importlib.util
 
