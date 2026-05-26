@@ -1450,6 +1450,81 @@ def test_export_addition_predictions_cli_requires_inputs():
     assert args.threshold == 0.05
 
 
+def test_export_fusionvad_operating_point_wraps_predictions_and_recall(tmp_path):
+    import importlib.util
+    import json
+
+    script_path = (
+        __import__("pathlib").Path(__file__).resolve().parents[1]
+        / "tools"
+        / "fusionvad_ja"
+        / "export_fusionvad_operating_point.py"
+    )
+    spec = importlib.util.spec_from_file_location("fusionvad_ja_export_operating_point", script_path)
+    assert spec and spec.loader
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    feature_path = tmp_path / "feature.npz"
+    np.savez_compressed(
+        feature_path,
+        whisper=np.ones((4, 8), dtype=np.float32),
+        mfcc=np.ones((4, 4), dtype=np.float32),
+    )
+    labels_path = tmp_path / "labels.jsonl"
+    record = build_supervised_record(
+        audio_id="clip",
+        source="unit",
+        duration_s=0.08,
+        speech_segments=[(0.02, 0.06)],
+        frame_hop_s=0.02,
+    )
+    write_jsonl(labels_path, [record])
+    feature_manifest_path = tmp_path / "feature_manifest.json"
+    feature_rows = [{"audio_id": "clip", "feature_path": str(feature_path), "label_index": 0}]
+    feature_manifest_path.write_text(json.dumps(feature_rows, ensure_ascii=False), encoding="utf-8")
+    train_metrics = train_addition_fusion_classifier(
+        records=[record],
+        feature_manifest_rows=feature_rows,
+        output_dir=tmp_path / "train",
+        config=FeatureTrainConfig(
+            max_steps=1,
+            fusion_dim=8,
+            hidden_dim=4,
+            layers=1,
+            max_trainable_parameters=10_000,
+        ),
+    )
+
+    args = module.parse_args(
+        [
+            "--labels",
+            str(labels_path),
+            "--feature-manifest",
+            str(feature_manifest_path),
+            "--checkpoint",
+            train_metrics.checkpoint,
+            "--threshold",
+            "0.0",
+            "--pad-s",
+            "0.02",
+            "--output-dir",
+            str(tmp_path / "op"),
+        ]
+    )
+    assert args.operating_point == "fusionvad-ja-v1.5-posw2"
+    module.run(args)
+
+    summary = json.loads((tmp_path / "op" / "operating_point_summary.json").read_text(encoding="utf-8"))
+    recall = json.loads((tmp_path / "op" / "high_recall_metrics.json").read_text(encoding="utf-8"))
+    assert summary["threshold"] == 0.0
+    assert summary["pad_s"] == 0.02
+    assert summary["padded"]["recall"] == recall["recall"]
+    assert recall["prediction_threshold"] == 0.0
+    assert recall["threshold"] == 0.0
+    assert (tmp_path / "op" / "frame-predictions" / "predictions.jsonl").exists()
+
+
 def test_calibrate_addition_threshold_cli_requires_inputs():
     import importlib.util
 
@@ -2232,6 +2307,7 @@ def test_vad_recall_metrics_reports_padding_tradeoff(tmp_path):
     )
 
     assert module.padded_predictions([0, 1, 0, 0], pad_frames=1) == [1, 1, 1, 0]
+    assert module.count_missed_speech_segments([1, 1, 0, 1], [0, 1, 0, 0]) == 2
     module.run(
         module.parse_args(
             [
