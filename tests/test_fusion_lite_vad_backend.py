@@ -11,7 +11,7 @@ if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
 
-def test_vad_registry_exposes_only_current_user_modes(monkeypatch):
+def test_vad_registry_exposes_current_modes(monkeypatch):
     import vad
 
     monkeypatch.setattr(
@@ -23,6 +23,13 @@ def test_vad_registry_exposes_only_current_user_modes(monkeypatch):
     assert adaptive.name == "whisperseg_v1"
     fusion = vad.get_vad_backend("fusion_lite")
     assert fusion.name == "fusion_lite_v1"
+    monkeypatch.setattr(
+        "vad.fusionvad_ja.backend.FusionVadJaBackend.__init__",
+        lambda self: None,
+        raising=False,
+    )
+    fusionvad_ja = vad.get_vad_backend("fusionvad_ja")
+    assert fusionvad_ja.name == "fusionvad_ja_v1_5_posw2"
     with pytest.raises(ValueError, match="fusion_lite_boost"):
         vad.get_vad_backend("fusion_lite_boost")
     with pytest.raises(ValueError, match="whisperseg"):
@@ -31,6 +38,46 @@ def test_vad_registry_exposes_only_current_user_modes(monkeypatch):
         vad.get_vad_backend("hybrid_precision")
     with pytest.raises(ValueError, match="silero"):
         vad.get_vad_backend("silero")
+
+
+def test_vad_registry_default_is_research_fusionvad_ja(monkeypatch):
+    import vad
+
+    monkeypatch.delenv("ASR_VAD_BACKEND", raising=False)
+    monkeypatch.setattr(
+        "vad.fusionvad_ja.backend.FusionVadJaBackend.__init__",
+        lambda self: None,
+        raising=False,
+    )
+
+    backend = vad.get_vad_backend()
+
+    assert backend.name == "fusionvad_ja_v1_5_posw2"
+
+
+def test_fusionvad_ja_frames_to_segments_pads_and_scores():
+    from vad.fusionvad_ja.backend import _padded_frames, frames_to_segments, merge_segments
+
+    padded = _padded_frames([0, 1, 0, 0], pad_frames=1)
+    assert padded.tolist() == [1, 1, 1, 0]
+
+    segments = frames_to_segments(
+        [0, 1, 1, 0, 1],
+        frame_hop_s=0.1,
+        duration_s=0.45,
+    )
+    assert [(round(seg.start, 2), round(seg.end, 2)) for seg in segments] == [
+        (0.1, 0.3),
+        (0.4, 0.45),
+    ]
+
+    merged = merge_segments(
+        segments,
+        duration_s=0.45,
+        merge_gap_s=0.11,
+        min_segment_s=0.01,
+    )
+    assert [(round(seg.start, 2), round(seg.end, 2)) for seg in merged] == [(0.1, 0.45)]
 
 
 def test_silero_timestamps_to_segments_skips_invalid_items():

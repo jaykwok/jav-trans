@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import numpy as np
+import pytest
 
 from vad.base import SpeechSegment
 from vad.fusionvad_ja import (
@@ -980,6 +981,37 @@ def test_frame_metrics_helpers_ignore_zero_weight_frames():
         "false_positive": 0,
         "false_negative": 0,
     }
+
+
+def test_threshold_sweep_helpers_parse_video_frame_padding():
+    from tools.fusionvad_ja.sweep_addition_thresholds import parse_fps
+
+    assert parse_fps("30000/1001") == pytest.approx(29.97002997)
+    assert parse_fps("29.97") == pytest.approx(29.97)
+
+
+def test_threshold_sweep_helpers_choose_lowest_extra_audio_for_recall():
+    from tools.fusionvad_ja.sweep_addition_thresholds import choose_best
+
+    rows = [
+        {
+            "threshold": 0.0001,
+            "padded": {"recall": 0.99, "extra_audio_ratio": 1.4, "f1": 0.8, "precision": 0.7},
+        },
+        {
+            "threshold": 0.0002,
+            "padded": {"recall": 0.98, "extra_audio_ratio": 1.3, "f1": 0.79, "precision": 0.72},
+        },
+        {
+            "threshold": 0.001,
+            "padded": {"recall": 0.95, "extra_audio_ratio": 1.1, "f1": 0.81, "precision": 0.8},
+        },
+    ]
+
+    best = choose_best(rows, min_recall=0.98, max_extra_audio_ratio=None)
+
+    assert best is not None
+    assert best["threshold"] == pytest.approx(0.0002)
 
 
 def test_shuffled_window_order_is_seeded_and_complete():

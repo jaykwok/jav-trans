@@ -11,6 +11,11 @@ from pathlib import Path
 from typing import Callable
 
 from utils.model_paths import resolve_model_spec
+from whisper.prealign import (
+    clean_text_for_aligner,
+    normalize_display_text,
+    strip_alignment_punctuation,
+)
 from whisper.timestamp_fallback import build_word_timestamps_fallback
 
 ASR_MODEL_ID = os.getenv("ASR_MODEL_ID", "Qwen/Qwen3-ASR-1.7B")
@@ -63,13 +68,6 @@ _ASR_SUBPROCESS_KILL_GRACE_S = float(os.getenv("ASR_SUBPROCESS_KILL_GRACE_S", "5
 _ASR_SUBPROCESS_READY_TIMEOUT_S = float(
     os.getenv("ASR_SUBPROCESS_READY_TIMEOUT_S", "600")
 )
-_REPEATED_PHRASE_RE = re.compile(r"([ぁ-ゖァ-ヺ一-龯]{1,8})(?:[、。！？…\s]*\1){2,}")
-_STRIP_PUNCT_RE = re.compile(r"[。！？…、,.!?・「」『』（）()【】\[\]\s~〜ー-]+")
-_ALIGNER_DECORATION_RE = re.compile(r"[♡♥❤💕💖💗💘♪♫♬★☆※]+")
-_ALIGNER_LAUGH_RE = re.compile(r"[wWｗＷ]+")
-_ALIGNER_PUNCT_RE = re.compile(r"[。！？…、,.!?・「」『』（）()【】\[\]~〜～]+")
-_ALIGNER_KANA_REPEAT_RE = re.compile(r"([ぁ-ゖァ-ヺ])\1{2,}")
-_ALIGNER_LONG_VOWEL_RE = re.compile(r"([ーｰ])\1+")
 
 
 def _resolve_timestamp_mode() -> str:
@@ -153,37 +151,7 @@ def _detect_attention(device: str) -> str:
 
 
 def _clean_master_text(text: str) -> str:
-    cleaned = (text or "").replace("\r", " ").replace("\n", " ").strip()
-    cleaned = re.sub(r"[ \t]+", " ", cleaned)
-    cleaned = re.sub(r"(.)\1{4,}", r"\1\1", cleaned)
-
-    for _ in range(2):
-        updated = _REPEATED_PHRASE_RE.sub(r"\1、\1", cleaned)
-        if updated == cleaned:
-            break
-        cleaned = updated
-
-    return cleaned.strip()
-
-
-def clean_text_for_aligner(text: str) -> str:
-    cleaned = (text or "").replace("\r", " ").replace("\n", " ").strip()
-    cleaned = re.sub(r"[ \t]+", " ", cleaned)
-    if not cleaned:
-        return ""
-
-    cleaned = _ALIGNER_DECORATION_RE.sub("", cleaned)
-    cleaned = _ALIGNER_LAUGH_RE.sub("", cleaned)
-    cleaned = _ALIGNER_PUNCT_RE.sub("", cleaned)
-    cleaned = _ALIGNER_KANA_REPEAT_RE.sub(r"\1\1", cleaned)
-    cleaned = _ALIGNER_LONG_VOWEL_RE.sub(r"\1", cleaned)
-    cleaned = re.sub(r"[ \t]+", " ", cleaned).strip()
-
-    if not _strip_punctuation(
-        _ALIGNER_DECORATION_RE.sub("", _ALIGNER_LAUGH_RE.sub("", cleaned))
-    ):
-        return ""
-    return cleaned
+    return normalize_display_text(text)
 
 
 def restore_timestamps_to_original(
@@ -227,7 +195,7 @@ def restore_timestamps_to_original(
 
 
 def _strip_punctuation(text: str) -> str:
-    return _STRIP_PUNCT_RE.sub("", text or "")
+    return strip_alignment_punctuation(text)
 
 
 def _compact_text_len(text: str) -> int:
