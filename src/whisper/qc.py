@@ -26,6 +26,10 @@ def asr_qc_enabled() -> bool:
     return _env_bool("ASR_QC_ENABLED", True)
 
 
+def asr_qc_drop_uncertain_enabled() -> bool:
+    return _env_bool("ASR_QC_DROP_UNCERTAIN", False)
+
+
 ASR_QC_ENABLED = asr_qc_enabled()
 ASR_QC_REPETITION_THRESHOLD = max(
     1,
@@ -218,7 +222,7 @@ def check_logprob_quality(result: dict) -> dict:
             "logprob_threshold": logprob_threshold,
             "compression_threshold": compression_threshold,
             "nospeech_threshold": nospeech_threshold,
-            "drop_uncertain_enabled": True,
+            "drop_uncertain_enabled": asr_qc_drop_uncertain_enabled(),
             "precision_policy": "adaptive",
             "adaptive": adaptive,
         },
@@ -542,7 +546,7 @@ def evaluate_asr_text_results_qc(
         "repetition_check": "on",
         "repetition_threshold": ASR_QC_REPETITION_THRESHOLD,
         "precision_policy": "adaptive",
-        "drop_uncertain_enabled": True,
+        "drop_uncertain_enabled": asr_qc_drop_uncertain_enabled(),
     }
 
     if not asr_qc_enabled():
@@ -705,6 +709,10 @@ def apply_adaptive_precision_filter(
 ) -> tuple[list[dict], dict, list[str]]:
     if not asr_qc_enabled():
         return text_results, qc_report, []
+    if not asr_qc_drop_uncertain_enabled():
+        updated_report = dict(qc_report)
+        updated_report["drop_uncertain_enabled"] = False
+        return text_results, updated_report, []
 
     items = list(qc_report.get("items") or [])
     if not items:

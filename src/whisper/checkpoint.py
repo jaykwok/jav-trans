@@ -175,6 +175,7 @@ def _get_whisper_generation_checkpoint_signature(
                     "ASR_QC_ADAPTIVE_HARD_REPEAT_RATIO",
                     "0.45",
                 ),
+                "qc_drop_uncertain": _env_lower("ASR_QC_DROP_UNCERTAIN", "0"),
             },
             sort_keys=True,
         )
@@ -289,6 +290,7 @@ def _get_asr_runtime_signature(
                 "ASR_QC_ADAPTIVE_HARD_REPEAT_RATIO",
                 "0.45",
             ),
+            "qc_drop_uncertain": _env_lower("ASR_QC_DROP_UNCERTAIN", "0"),
             "whisper": _json_or_text(whisper_generation_signature),
         },
         "vad": vad_signature if isinstance(vad_signature, dict) else {},

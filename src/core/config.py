@@ -208,8 +208,6 @@ DEFAULT_SETTINGS: dict[str, str] = {
     "ALIGNMENT_STEP_DOWN_CHUNK": "6.0",
 
     # --- ASR Post-Processing ---
-    # Short gray/noise-like chunks under this duration can be filtered.
-    "ASR_GRAY_MAX_DURATION": "2.5",
     # Similarity threshold for removing prompt/context leakage from ASR output.
     "ASR_CONTEXT_LEAK_SIMILARITY": "0.88",
     # Max gap, in seconds, for merging adjacent ASR fragments.
@@ -222,6 +220,8 @@ DEFAULT_SETTINGS: dict[str, str] = {
     # --- ASR QC / Conservative Filtering ---
     # 1 enables ASR text quality checks before translation.
     "ASR_QC_ENABLED": "1",
+    # 1 allows QC to clear high-risk ASR text. Default 0 keeps QC diagnostic-only.
+    "ASR_QC_DROP_UNCERTAIN": "0",
     # Adaptive precision drops high-risk ASR chunks while relaxing low-logprob true dialogue.
     "ASR_QC_ADAPTIVE_BASE_LOGPROB": "-0.7",
     "ASR_QC_ADAPTIVE_MIN_LOGPROB": "-0.95",

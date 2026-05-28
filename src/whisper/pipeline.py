@@ -86,7 +86,6 @@ _compact_context_text = _transcribe_module._compact_context_text
 _context_tokens = _transcribe_module._context_tokens
 _is_context_leak = _transcribe_module._is_context_leak
 _collapse_repeated_noise = _transcribe_module._collapse_repeated_noise
-_is_noise_token = _transcribe_module._is_noise_token
 _is_low_value_text = _transcribe_module._is_low_value_text
 _clean_segment_text = _transcribe_module._clean_segment_text
 _remove_context_leak_fragments = _transcribe_module._remove_context_leak_fragments

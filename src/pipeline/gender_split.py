@@ -7,9 +7,6 @@ from typing import Callable
 
 
 _ASR_NOISE_ONLY_RE = re.compile(r"^[\s\"'`“”‘’「」『』（）()\[\]［］【】〈〉《》<>]+$")
-_ASR_JA_OR_CJK_RE = re.compile(r"[\u3040-\u30ff\u3400-\u9fff]")
-_ASR_LONG_LATIN_RE = re.compile(r"[A-Za-z]{4,}")
-_ASR_ASCII_OR_WESTERN_PUNCT_RE = re.compile(r"^[\s\x00-\x7F“”‘’…]+$")
 
 
 def _env_int(name: str, default: int) -> int:
@@ -243,12 +240,6 @@ def is_asr_noise_text(text) -> bool:
     if _ASR_NOISE_ONLY_RE.fullmatch(unescaped):
         return True
     if _is_symbol_only_noise(unescaped):
-        return True
-    if (
-        _ASR_LONG_LATIN_RE.search(unescaped)
-        and not _ASR_JA_OR_CJK_RE.search(unescaped)
-        and _ASR_ASCII_OR_WESTERN_PUNCT_RE.fullmatch(unescaped)
-    ):
         return True
     return False
 

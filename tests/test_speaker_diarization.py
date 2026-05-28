@@ -101,20 +101,20 @@ def test_short_segment_backfilled(monkeypatch, tmp_path):
 
 
 @_skip_no_backend
-def test_kana_only_bgm_stays_none(monkeypatch, tmp_path):
+def test_kana_only_vocalization_gets_speaker_embedding(monkeypatch, tmp_path):
     wav = _write_wav(tmp_path / "test.wav")
     segs = [
-        _seg("あああ", "啊", 0.0, 1.0),    # kana-only -> BGM -> None
+        _seg("あああ", "啊", 0.0, 1.0),
         _seg("テスト", "测试", 1.0, 2.0),
     ]
     emb = np.array([1.0, 0.0, 0.0], dtype=np.float32)
-    mock = _make_mock_classifier([emb])
+    mock = _make_mock_classifier([emb, emb])
 
     monkeypatch.setenv("EXPERIMENTAL_SPEAKER_DIARIZATION", "1")
     monkeypatch.setattr(sd, "_import_classifier", lambda source, savedir, run_opts: mock)
 
     result = sd.diarize_segments(segs, wav)
-    assert result[0]["speaker"] is None
+    assert result[0]["speaker"] == "S0"
     assert result[1]["speaker"] == "S0"
 
 
@@ -131,13 +131,15 @@ def test_build_speakers_report():
     segs = [
         {"text": "テスト", "zh": "测试", "start": 0.0, "end": 1.0, "speaker": "S0"},
         {"text": "テスト", "zh": "测试", "start": 1.0, "end": 2.0, "speaker": "S1"},
-        {"text": "あああ", "zh": "啊",   "start": 2.0, "end": 3.0, "speaker": None},
+        {"text": "。。。", "zh": "", "start": 2.0, "end": 3.0, "speaker": None},
+        {"text": "あああ", "zh": "啊", "start": 3.0, "end": 4.0, "speaker": None},
     ]
     report = sd.build_speakers_report(segs)
     assert report["n_speakers"] == 2
     assert "S0" in report["speakers"]
     assert "S1" in report["speakers"]
-    assert report["unassigned"]["bgm"] == 1
+    assert report["unassigned"]["textless"] == 1
+    assert report["unassigned"]["other_short"] == 1
 
 
 @_skip_no_backend
@@ -154,4 +156,3 @@ def test_max_clusters_capped(monkeypatch, tmp_path):
     result = sd.diarize_segments(segs, wav, cluster_threshold=0.01, max_clusters=3)
     unique_speakers = {r["speaker"] for r in result if r.get("speaker") is not None}
     assert len(unique_speakers) <= 3
-

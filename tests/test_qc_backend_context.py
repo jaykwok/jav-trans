@@ -117,7 +117,40 @@ def test_quarantined_timeout_counts_as_timeout_and_quarantine():
     assert report["reject_count"] == 1
 
 
-def test_adaptive_precision_filter_drops_signal_reject():
+def test_adaptive_precision_filter_keeps_signal_reject_when_drop_disabled(monkeypatch):
+    monkeypatch.setenv("ASR_QC_DROP_UNCERTAIN", "0")
+    chunks = [{"index": 1, "start": 0.0, "end": 2.0}]
+    text_results = [
+        {
+            "text": "幻覚テキスト",
+            "raw_text": "幻覚テキスト",
+            "duration": 2.0,
+            "avg_logprob": -1.5,
+            "no_speech_prob": 0.1,
+            "compression_ratio": 1.2,
+            "log": [],
+        }
+    ]
+    report = evaluate_asr_text_results_qc(
+        chunks,
+        text_results,
+        backend=SimpleNamespace(accepts_contexts=True),
+    )
+
+    filtered, updated_report, log = apply_adaptive_precision_filter(
+        chunks,
+        text_results,
+        report,
+    )
+
+    assert filtered == text_results
+    assert updated_report["drop_uncertain_enabled"] is False
+    assert updated_report["dropped_uncertain_count"] == 0
+    assert log == []
+
+
+def test_adaptive_precision_filter_drops_signal_reject_when_enabled(monkeypatch):
+    monkeypatch.setenv("ASR_QC_DROP_UNCERTAIN", "1")
     chunks = [{"index": 1, "start": 0.0, "end": 2.0}]
     text_results = [
         {
@@ -185,7 +218,8 @@ def test_adaptive_precision_filter_keeps_low_risk_low_logprob():
     assert log == []
 
 
-def test_adaptive_precision_filter_drops_hard_density_reject():
+def test_adaptive_precision_filter_drops_hard_density_reject(monkeypatch):
+    monkeypatch.setenv("ASR_QC_DROP_UNCERTAIN", "1")
     text = "もしも" * 120
     chunks = [{"index": 1, "start": 0.0, "end": 7.84}]
     text_results = [
