@@ -17,6 +17,7 @@ def test_diagnose_case_marks_alignment_and_asr_drop_candidates(tmp_path):
     _write_json(
         aligned_path,
         {
+            "audio_path": str(tmp_path / "audio.wav"),
             "segments": [
                 {
                     "start": 0.0,
@@ -140,6 +141,8 @@ def test_diagnose_case_marks_alignment_and_asr_drop_candidates(tmp_path):
     ]
     assert by_chunk[0]["alignment_quality"] == "vad_coarse"
     assert by_chunk[0]["fallback_type"] == "vad_coarse"
+    assert by_chunk[0]["aligned_path"].endswith("sample.aligned_segments.json")
+    assert by_chunk[0]["source_audio_path"].endswith("audio.wav")
     assert by_chunk[0]["failure_candidate"] is True
     assert by_chunk[0]["failure_bucket"] == "vad_coarse_alignment"
     assert "asr_dropped_uncertain" in by_chunk[1]["failure_reasons"]
