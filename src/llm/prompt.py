@@ -7,7 +7,7 @@ import sys
 from llm.glossary import normalize_glossary_text
 
 
-PROMPT_VERSION = "v2.7"
+PROMPT_VERSION = "v2.8"
 _GENDER_TAG_RE = re.compile(r"^\s*\[(?:M|F)\]\s*")
 _LEADING_SPEAKER_RE = re.compile(
     r"^\s*(?:男|女|男性|女性|男优|女优|スタッフ|撮影者|カメラマン|"
@@ -83,7 +83,6 @@ def _normalize_source_text(text: str) -> str:
     cleaned = re.sub(r"[ \t]+", " ", (text or "").strip())
     cleaned = cleaned.replace("\r\n", "\n").replace("\r", "\n")
     cleaned = "\n".join(line.strip() for line in cleaned.split("\n") if line.strip())
-    cleaned = re.sub(r"(.)\1{4,}", r"\1\1\1", cleaned)
     return cleaned.strip()
 
 
@@ -165,7 +164,7 @@ _SYSTEM_PROMPT_FULL = (
     "7. 全片上下文只用于翻译连贯、指代判断、口吻一致和术语一致；不要修改、补全或纠正日文原文。\n"
     "8. 每条输入必须单独翻译，不能合并、拆分、漏译、调换顺序。\n"
     "9. 输出尽量短，贴近屏幕阅读节奏；短促呻吟和语气词也要简短自然。\n"
-    "10. 如果一行里大部分是呻吟、喘息、重复语气词，只保留清晰语义核心，重复部分可以压缩；映射参考：あんっ/はあん 译 啊嗯啊，気持ちいい 译 好舒服要爽死了，イッちゃう/イク 译 要去了要射了，避免感觉很舒服即将达到高潮等翻译腔。\n"
+    "10. 对呻吟、喘息和短促语气词保持原本情绪强度，译成适合字幕阅读的自然短句；不要按固定词表替换、删除或净化，只有明显机器循环才可在译文中适度概括。\n"
     "11. 结构化 JSON 输出要求 prompt 明确包含 json 字样；最终只输出合法 JSON 对象。\n"
     '12. 你必须只输出 JSON：{{"translations":[{{"id":0,"text":"..."}}]}}，条数必须严格匹配本次任务要求。\n'
     "13. 最终 content 不能为空；即使开启思考模式，也必须把完整 JSON 对象写进最终 content。\n"

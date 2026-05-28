@@ -153,7 +153,6 @@ _ASR_STAGE_ADVANCED_PREFIXES = (
     "SEGMENT_",
     "VAD_",
     "ASR_QC_",
-    "ASR_GRAY_",
     "ASR_CONTEXT_LEAK_",
     "ASR_FRAGMENT_",
     "ASR_NATIVE_",

@@ -35,7 +35,6 @@ from whisper.timestamp_fallback import build_word_timestamps_fallback
 
 logger = logging.getLogger(__name__)
 
-_GRAY_MAX_DURATION_S = float(os.getenv("ASR_GRAY_MAX_DURATION", "2.5"))
 _SEGMENT_CUT_MIN_SILENCE_S = float(os.getenv("SEGMENT_CUT_MIN_SILENCE", "0.5"))
 _ASR_SLIDING_CONTEXT_SEGS = max(0, int(os.getenv("ASR_SLIDING_CONTEXT_SEGS", "2")))
 _ASR_INITIAL_PROMPT_MAX_CHARS = int(os.getenv("ASR_INITIAL_PROMPT_MAX_CHARS", "240"))
@@ -94,11 +93,8 @@ _ASR_CHECKPOINT_ENABLED = os.getenv("ASR_CHECKPOINT_ENABLED", "1").strip().lower
     "off",
 }
 _TRIVIAL_SEGMENT = re.compile(
-    r"^[あっんーっ。！？\s…、ぁぃぅぇぉアイウエオ]{1,5}$"
-    r"|^[。！？…、\s,.!?・「」（）【】；：\-—–]+$"
-    r"|^[あいうえおぁぃぅぇぉんっーはふへほ]+$"
+    r"^[。！？…、\s,.!?・「」（）【】；：\-—–]+$"
 )
-_TOOL_SIGNATURE_RE = re.compile(r"whisperjav\s+\d", re.I)
 _STRIP_PUNCT_RE = re.compile(r"[。！？…、,.!?・「」『』（）()【】\[\]\s~〜ー-]+")
 _CONTEXT_COMPACT_RE = re.compile(r"[^0-9A-Za-zぁ-ゖァ-ヺ一-龯々〆ヵヶ]+")
 _CONTEXT_TOKEN_SPLIT_RE = re.compile(r"[。！？…、,.!?・「」『』（）()【】\[\]\s~〜ー\-；;：:\n\r\t]+")
@@ -115,58 +111,6 @@ _SENTENCE_FRAGMENT_RE = re.compile(r"[^。！？!?…]+[。！？!?…]?")
 _FRAGMENT_CONTINUATION_START_RE = re.compile(
     r"^(?:ます|ました|ません|です|でした|でしょう|ながら|ので|けど|から|たり|"
     r"程度|ところ|いる|いき|して|され|なり|効果|で[、,]?|に|を|が|は|も)"
-)
-_MOAN_CHAR_RE = re.compile(
-    r"^[ぁ-ゖァ-ヺー〜～っッんンあいうえおアイウエオはひふへほハヒフヘホ]+$"
-)
-_RHYTHMIC_HALLUCINATION_RE = re.compile(
-    r"^.+(?:ささ|まま|だだ|なな|たた|かか|やや|ばば|ぱぱ|ちゃちゃ|じゃじゃ|べべ|ぺぺ)$"
-    r"|^(.{2,5})\1+$"
-)
-
-_DEFAULT_NOISE_WORDS = (
-    "あ,い,う,え,お,ん,"
-    "あっ,うん,えっ,おっ,"
-    "あー,えー,うー,おー,んー,"
-    "ねえ,ねー,はい,もう,ふぁ,はぁ,くっ,あぁ,うぅ,おぉ"
-)
-_NOISE_WORDS = frozenset(
-    w.strip()
-    for w in os.getenv("ASR_NOISE_WORDS", _DEFAULT_NOISE_WORDS).split(",")
-    if w.strip()
-)
-
-_GRAY_WORDS = frozenset(
-    {
-        "気持ち",
-        "好き",
-        "すごい",
-        "すご",
-        "いい",
-        "だめ",
-        "やばい",
-        "ちょっと",
-        "あかん",
-    }
-)
-_LOW_VALUE_KEEP_WORDS = frozenset(
-    {
-        "だめ",
-        "ダメ",
-        "いや",
-        "イヤ",
-        "やめ",
-        "やめて",
-        "もっと",
-        "まだ",
-        "好き",
-        "気持ちいい",
-        "すごい",
-        "お久しぶり",
-        "出てきた",
-        "奥",
-        "本当に",
-    }
 )
 
 
@@ -225,30 +169,7 @@ def _is_context_leak(text: str) -> bool:
 
 def _collapse_repeated_noise(text: str) -> str:
     cleaned = re.sub(r"[ \t]+", " ", (text or "").strip())
-    cleaned = re.sub(r"(.)\1{3,}", r"\1\1", cleaned)
-
-    for _ in range(2):
-        updated = re.sub(
-            r"([ぁ-ゖァ-ヺ一-龯]{1,8})(?:[、。！？…\s]*\1){2,}",
-            r"\1、\1",
-            cleaned,
-        )
-        if updated == cleaned:
-            break
-        cleaned = updated
-
     return cleaned.strip()
-
-
-def _is_noise_token(text: str) -> bool:
-    token = _strip_punctuation(text)
-    if not token:
-        return True
-    if token in _LOW_VALUE_KEEP_WORDS:
-        return False
-    if token in _NOISE_WORDS:
-        return True
-    return len(token) <= 4 and bool(_MOAN_CHAR_RE.fullmatch(token))
 
 
 def _is_low_value_text(text: str) -> bool:
@@ -256,8 +177,6 @@ def _is_low_value_text(text: str) -> bool:
     compact = _strip_punctuation(normalized)
     if not compact:
         return True
-    if compact in _LOW_VALUE_KEEP_WORDS:
-        return False
 
     context = _asr_context()
     if context:
@@ -268,14 +187,7 @@ def _is_low_value_text(text: str) -> bool:
     if _TRIVIAL_SEGMENT.match(normalized):
         return True
         
-    if _RHYTHMIC_HALLUCINATION_RE.fullmatch(compact):
-        return True
-
-    parts = [part for part in re.split(r"[、。！？…,.!?・\s]+", normalized) if part]
-    if parts and all(_is_noise_token(part) for part in parts):
-        return True
-
-    return _is_noise_token(normalized)
+    return False
 
 
 def _clean_segment_text(text: str) -> str:
@@ -1313,7 +1225,7 @@ def _postprocess_segments(segments: list[dict]) -> list[dict]:
 
     for segment in segments:
         text = _clean_segment_text(segment.get("text", ""))
-        if not text or _TOOL_SIGNATURE_RE.search(text):
+        if not text:
             continue
         text = _remove_context_leak_fragments(text)
         if not text:
@@ -1661,11 +1573,7 @@ def _merge_words_to_segments(words: list[dict]) -> list[dict]:
                 flush(word_list[:split_idx])
                 flush(word_list[split_idx:])
                 return
-        if text in _NOISE_WORDS:
-            return
         if _TRIVIAL_SEGMENT.match(text):
-            return
-        if text in _GRAY_WORDS and segment_duration > _GRAY_MAX_DURATION_S:
             return
         segments.append(
             {

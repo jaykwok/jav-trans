@@ -119,11 +119,11 @@ uv run --no-sync python launcher.py
 ```text
 视频 -> 音频准备 -> fusion_lite VAD -> VAD chunk packing -> ASR -> Adaptive Precision QC
 -> Forced Alignment -> 词级 F0 性别检测 -> gender turn 重切段
--> 翻译前 ASR 噪声过滤 -> 翻译前 cue plan 时间轴归一化
+-> 翻译前空/纯符号段过滤 -> 翻译前 cue plan 时间轴归一化
 -> LLM 逐 cue 翻译 -> SRT / quality report
 ```
 
-当前 ASR 以“少但准”为默认目标。不确定内容宁可不出现在字幕里，也不把疑似幻觉交给后续对齐和翻译。旧的 ASR recovery、temperature fallback、prompt overflow retry 已移除；主 VAD 空结果会直接跳过 ASR；timestamp/alignment fallback 只用于给已确认文本补时间轴，不改写或新增 ASR 文本。
+当前 ASR 以高召回、可诊断为默认目标。旧的 ASR recovery、temperature fallback、prompt overflow retry 已移除；主 VAD 空结果会直接跳过 ASR；timestamp/alignment fallback 只用于给已确认文本补时间轴，不改写或新增 ASR 文本。Adaptive Precision QC 默认只记录低置信、重复、异常密度等风险信号；只有显式设置 `ASR_QC_DROP_UNCERTAIN=1` 时才会清空高风险 ASR 文本。
 
 ### ASR 与 VAD
 
@@ -179,7 +179,10 @@ v1.9 ASR / forced alignment 文本策略：
 
 - `display_text` 是最终字幕显示文本，只做展示安全处理：Unicode NFKC、换行归一为空格、连续空白折叠和首尾 trim。不得在 `display_text` 上压缩重复假名、重复短语、拟声或低信息短文本，因为这些在目标域里可能是字幕语义。
 - `align_text` 是 forced aligner 专用文本，可以删除标点、emoji / 装饰符、音乐符号和明显不可发音标记，也可以压缩极端重复假名、长音符和重复短语；这些操作必须记录 flags，并保留从 `align_text` 字符到 `display_text` 覆盖范围的映射。
-- 不使用按具体字样维护的黑名单，不直接删除 `ん`、`あ`、喘息/呻吟拟声或常见台词。过滤和审计只看结构特征：文本/音频时长比例、重复率、align-text-empty、forced-aligner fallback、ASR dropped uncertain、低置信和人工 hard-negative 结果。
+- 不使用按具体字样维护的黑名单，不直接删除 `ん`、`あ`、喘息/呻吟拟声、常见台词、历史工具签名或纯英文长词。ASR 后处理已删除噪声词表、灰区词表、假名/呻吟特例 direct drop、工具签名 direct drop、AnimeWhisper 后置括号/重复清洗、最终字幕文本重复压缩和翻译前纯英文幻觉 direct drop；当前只因空文本、纯标点/纯符号和上下文泄漏这类明确非字幕内容而删除。
+- 翻译 prompt 的源文序列化同样不再压缩重复发声，也不使用固定拟声词映射表；重复循环只作为 QC / 诊断信号，译文是否概括交给 LLM 在上下文中判断。
+- speaker diarization 不再把假名-only 文本当作 BGM 跳过；只跳过空文本或纯符号/纯标点这类没有语言/数字信号的片段，避免把目标域可字幕化人声排除在 speaker embedding 之外。
+- 重复循环、低置信、文本/音频比例异常、align-text-empty、forced-aligner fallback、ASR dropped uncertain 和人工 hard-negative 结果默认只作为 QC / 诊断 / 样本池信号；`ASR_QC_DROP_UNCERTAIN=0` 是默认值，是否删除交给后续可解释 QC 策略，不再用词表兜底。
 - forced aligner 失败时不伪造精确时间轴。后续输出质量标签分为 `forced`、`partial`、`vad_coarse`、`proportional`、`drop_or_review`；失败样本进入 VAD / ASR / aligner 后处理样本池。
 - 实现口径：`src/whisper/prealign.py` 负责 `raw_text -> display_text -> align_text` 和 char-span mapping；`src/whisper/local_backend.py` 只把 `align_text` 送入 forced aligner，拿到词级时间后再映射回 `display_text`。
 
@@ -572,7 +575,10 @@ v1.9 ASR / forced alignment 文本策略：
 
 - `display_text` 是最终字幕显示文本，只做展示安全处理：Unicode NFKC、换行归一为空格、连续空白折叠和首尾 trim。不得在 `display_text` 上压缩重复假名、重复短语、拟声或低信息短文本，因为这些在目标域里可能是字幕语义。
 - `align_text` 是 forced aligner 专用文本，可以删除标点、emoji / 装饰符、音乐符号和明显不可发音标记，也可以压缩极端重复假名、长音符和重复短语；这些操作必须记录 flags，并保留从 `align_text` 字符到 `display_text` 覆盖范围的映射。
-- 不使用按具体字样维护的黑名单，不直接删除 `ん`、`あ`、喘息/呻吟拟声或常见台词。过滤和审计只看结构特征：文本/音频时长比例、重复率、align-text-empty、forced-aligner fallback、ASR dropped uncertain、低置信和人工 hard-negative 结果。
+- 不使用按具体字样维护的黑名单，不直接删除 `ん`、`あ`、喘息/呻吟拟声、常见台词、历史工具签名或纯英文长词。ASR 后处理已删除噪声词表、灰区词表、假名/呻吟特例 direct drop、工具签名 direct drop、AnimeWhisper 后置括号/重复清洗、最终字幕文本重复压缩和翻译前纯英文幻觉 direct drop；当前只因空文本、纯标点/纯符号和上下文泄漏这类明确非字幕内容而删除。
+- 翻译 prompt 的源文序列化同样不再压缩重复发声，也不使用固定拟声词映射表；重复循环只作为 QC / 诊断信号，译文是否概括交给 LLM 在上下文中判断。
+- speaker diarization 不再把假名-only 文本当作 BGM 跳过；只跳过空文本或纯符号/纯标点这类没有语言/数字信号的片段，避免把目标域可字幕化人声排除在 speaker embedding 之外。
+- 重复循环、低置信、文本/音频比例异常、align-text-empty、forced-aligner fallback、ASR dropped uncertain 和人工 hard-negative 结果默认只作为 QC / 诊断 / 样本池信号；`ASR_QC_DROP_UNCERTAIN=0` 是默认值，是否删除交给后续可解释 QC 策略，不再用词表兜底。
 - forced aligner 失败时不伪造精确时间轴。后续输出质量标签分为 `forced`、`partial`、`vad_coarse`、`proportional`、`drop_or_review`；失败样本进入 VAD / ASR / aligner 后处理样本池。
 - 实现口径：`src/whisper/prealign.py` 负责 `raw_text -> display_text -> align_text` 和 char-span mapping；`src/whisper/local_backend.py` 只把 `align_text` 送入 forced aligner，拿到词级时间后再映射回 `display_text`。
 
@@ -724,6 +730,7 @@ v1.4 Qwen3-ASR / high-recall VAD 计划：
 - v1.8 ASR/alignment 诊断结果：四组匿名样片 A 共 `1348` 个 chunks，失败候选 `1000`，fallback chunks `414`（`30.7%`），ASR dropped uncertain `421`，align-text-empty `18`。分组看，base fallback `27.6%`、dropped `101`、segments `453`；200k fallback `31.5%`、dropped `105`、align_empty `5`、segments `383`；5000 fallback `30.3%`、dropped `102`、align_empty `7`、segments `381`；6000 fallback `33.5%`、dropped `113`、align_empty `6`、segments `380`。额外用 qwen5000 跑匿名样片 B 时 fallback `38.2%`、dropped `110`、segments `794`，说明长 chunk、低信息人声文本和 forced aligner fallback 是当前主要瓶颈。
 - v1.8 当前结论：FusionVAD-JA 暂时继续保持 high-recall proposal generator 定位，不再本轮追求 precision 或立即重训 VAD；forced aligner 也暂不 finetune，因为现有 Galgame ASR 数据没有字符/词级时间轴真值，直接训练 aligner 风险高。下一步优先做三件事：给输出增加 alignment 质量标签 `forced|partial|vad_coarse|proportional|drop_or_review`；把长 chunk、低信息人声、重复循环、align-text-empty 和 dropped uncertain 汇入失败样本池；等 Qwen3-ASR-1.7B full SFT checkpoint 稳定后，用同一批 held-out 统计漏对白、多送音频、空输出、hallucination、低置信和 fallback，再决定是否训练下一版 VAD / 后处理 / aligner。
 - v1.8 产物路径：为避免 README 和提交历史暴露真实片名，公开记录只使用“匿名样片 A / 匿名样片 B”这类别名，不再写入真实视频 stem 或含真实 stem 的 `agents/temp/` 路径；本地原始诊断产物仍保留在 `agents/temp/fusionvad-ja/` 下，仅用于个人复查。后续所有报告、测试 fixture、文档示例、commit message 和可跟踪文件都应使用匿名样片名。
+- v1.9 ASR 后处理清理：全量审计后删除词表驱动的 ASR direct drop，包括 `ASR_NOISE_WORDS`、噪声词表、灰区词表、假名/呻吟短句特例、历史工具签名特例和对应白名单；同时取消 AnimeWhisper 后置括号/重复清洗、最终字幕文本重复压缩、翻译 prompt 源文重复压缩、固定拟声词映射表和翻译前纯英文幻觉 direct drop。Adaptive Precision 的清空文本行为改为 `ASR_QC_DROP_UNCERTAIN=1` opt-in，默认只诊断；speaker diarization 也不再把假名-only 文本当成 BGM 跳过。`はぁ`、`うん`、`気持ち`、`好き`、重复短促发声等目标域文本不再因为具体字样、假名集合、重复形态、低置信或英文字符形态被直接删除/改写。空文本、纯标点/纯符号和上下文泄漏仍会过滤；重复循环、低置信、异常密度等保留为 QC/诊断信号。
 - Sources：Qwen3-ASR GitHub `https://github.com/QwenLM/Qwen3-ASR`，Qwen3-ASR finetuning `https://github.com/QwenLM/Qwen3-ASR/tree/main/finetuning`，Qwen3-ASR technical report `https://arxiv.org/abs/2601.21337`，Qwen3-ASR-0.6B model card `https://huggingface.co/Qwen/Qwen3-ASR-0.6B`，Qwen3-ASR-1.7B model card `https://huggingface.co/Qwen/Qwen3-ASR-1.7B`。
 - Sources：FusionVAD arXiv `https://arxiv.org/abs/2506.01365`，ISCA Archive `https://www.isca-archive.org/interspeech_2025/tripathi25_interspeech.html`，teacher-student VAD `https://dl.acm.org/doi/abs/10.1109/TASLP.2021.3073596`，TEN VAD `https://github.com/ten-framework/ten-vad`，Silero VAD `https://github.com/snakers4/silero-vad`，FireRedVAD `https://github.com/FireRedTeam/FireRedVAD`。
 
