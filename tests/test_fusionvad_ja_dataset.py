@@ -1544,7 +1544,7 @@ def test_export_fusionvad_operating_point_wraps_predictions_and_recall(tmp_path)
             str(tmp_path / "op"),
         ]
     )
-    assert args.operating_point == "fusionvad-ja-v1.5-posw2"
+    assert args.operating_point == "fusionvad-ja-v1.11-synthv5-longgap-posw2"
     module.run(args)
 
     summary = json.loads((tmp_path / "op" / "operating_point_summary.json").read_text(encoding="utf-8"))
