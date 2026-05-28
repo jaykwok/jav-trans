@@ -15,6 +15,7 @@ SRC_ROOT = PROJECT_ROOT / "src"
 if str(SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(SRC_ROOT))
 
+from whisper.alignment_quality import classify_alignment_quality  # noqa: E402
 from whisper.prealign import prepare_text_for_alignment, strip_alignment_punctuation  # noqa: E402
 
 
@@ -338,6 +339,8 @@ def diagnose_case(
     rows: list[dict[str, Any]] = []
     reason_counts: Counter = Counter()
     alignment_modes: Counter = Counter()
+    alignment_quality_counts: Counter = Counter()
+    fallback_type_counts: Counter = Counter()
     fallback_chunks = 0
     align_text_empty = 0
     dropped_chunks = 0
@@ -388,16 +391,29 @@ def diagnose_case(
             aligned_segment_count=aligned_segment_count,
             word_stats=stats,
         )
+        quality = classify_alignment_quality(
+            text=analysis_text,
+            duration_s=duration,
+            align_text_empty=prealign.empty_after_cleaning,
+            asr_dropped_uncertain=bool(dropped),
+            asr_qc_severity=str((qc_item or {}).get("severity") or ""),
+            alignment_mode=alignment_mode,
+            align_error=str(chunk_log.get("align_error") or ""),
+            fallback_lines=fallback_lines,
+            sentinel_lines=sentinel_lines,
+            aligned_segment_count=aligned_segment_count,
+            word_stats=stats,
+        )
         reason_counts.update(reasons)
+        alignment_quality_counts[str(quality["alignment_quality"])] += 1
+        fallback_type_counts[str(quality["fallback_type"])] += 1
         if prealign.empty_after_cleaning and analysis_text.strip():
             align_text_empty += 1
         if analysis_text.strip():
             nonempty_chunks += 1
         if dropped:
             dropped_chunks += 1
-        if "alignment_fallback" in reasons or any(
-            reason.startswith("alignment_mode_") for reason in reasons
-        ):
+        if quality["fallback_type"] != "none":
             fallback_chunks += 1
 
         row = {
@@ -420,6 +436,9 @@ def diagnose_case(
             "compact_chars": compact_chars,
             "chars_per_sec": round(chars_per_sec, 3),
             "alignment_mode": alignment_mode,
+            "alignment_quality": quality["alignment_quality"],
+            "fallback_type": quality["fallback_type"],
+            "alignment_quality_reasons": quality["alignment_quality_reasons"],
             "alignment_word_count": chunk_log.get("alignment_word_count"),
             "align_error": chunk_log.get("align_error") or "",
             "fallback_lines": fallback_lines,
@@ -451,6 +470,8 @@ def diagnose_case(
         "asr_dropped_uncertain_count": dropped_chunks,
         "reason_counts": dict(reason_counts.most_common()),
         "alignment_mode_counts": dict(alignment_modes.most_common()),
+        "alignment_quality_counts": dict(alignment_quality_counts.most_common()),
+        "fallback_type_counts": dict(fallback_type_counts.most_common()),
         "quality_alignment_fallback_ratio": quality.get("alignment_fallback_ratio"),
         "quality_asr_dropped_uncertain_count": quality.get("asr_dropped_uncertain_count"),
         "asr_details_fallback_count": asr_details.get("fallback_count"),
@@ -472,9 +493,33 @@ def build_markdown(summary: dict[str, Any]) -> str:
         f"- align-text-empty chunks: {summary['align_text_empty_count']}",
         f"- failure candidates: {summary['failure_candidate_count']}",
         "",
-        "## Top Reasons",
+        "## Alignment Quality",
         "",
     ]
+    if summary.get("alignment_quality_counts"):
+        for quality, count in summary["alignment_quality_counts"].items():
+            lines.append(f"- `{quality}`: {count}")
+    else:
+        lines.append("- None")
+    lines.extend(
+        [
+            "",
+            "## Fallback Type",
+            "",
+        ]
+    )
+    if summary.get("fallback_type_counts"):
+        for fallback_type, count in summary["fallback_type_counts"].items():
+            lines.append(f"- `{fallback_type}`: {count}")
+    else:
+        lines.append("- None")
+    lines.extend(
+        [
+            "",
+            "## Top Reasons",
+            "",
+        ]
+    )
     if summary["reason_counts"]:
         for reason, count in list(summary["reason_counts"].items())[:20]:
             lines.append(f"- `{reason}`: {count}")
@@ -484,7 +529,8 @@ def build_markdown(summary: dict[str, Any]) -> str:
     for item in summary["cases"]:
         lines.append(
             "- {label}/{video}: chunks={chunks}, fallback={fallback} ({ratio:.1%}), "
-            "dropped={dropped}, align_empty={align_empty}, segments={segments}".format(
+            "dropped={dropped}, align_empty={align_empty}, segments={segments}, "
+            "quality={quality}".format(
                 label=item.get("case_label") or "case",
                 video=item["video"],
                 chunks=item["chunk_count"],
@@ -493,6 +539,7 @@ def build_markdown(summary: dict[str, Any]) -> str:
                 dropped=item["asr_dropped_uncertain_count"],
                 align_empty=item["align_text_empty_count"],
                 segments=item["output_segment_count"],
+                quality=item.get("alignment_quality_counts", {}),
             )
         )
     lines.append("")
@@ -502,18 +549,26 @@ def build_markdown(summary: dict[str, Any]) -> str:
 def summarize(rows: list[dict[str, Any]], case_summaries: list[dict[str, Any]]) -> dict[str, Any]:
     reason_counts: Counter = Counter()
     mode_counts: Counter = Counter()
+    quality_counts: Counter = Counter()
+    fallback_type_counts: Counter = Counter()
     for row in rows:
         reason_counts.update(row.get("failure_reasons") or [])
         mode = str(row.get("alignment_mode") or "")
         if mode:
             mode_counts[mode] += 1
+        quality = str(row.get("alignment_quality") or "")
+        if quality:
+            quality_counts[quality] += 1
+        fallback_type = str(row.get("fallback_type") or "")
+        if fallback_type:
+            fallback_type_counts[fallback_type] += 1
 
     chunk_count = len(rows)
-    fallback_count = sum(
+    fallback_count = sum(1 for row in rows if row.get("fallback_type") not in {"", "none", None})
+    failure_candidate_count = sum(
         1
         for row in rows
-        if "alignment_fallback" in row.get("failure_reasons", [])
-        or any(str(reason).startswith("alignment_mode_") for reason in row.get("failure_reasons", []))
+        if row.get("failure_reasons") or row.get("alignment_quality") != "forced"
     )
     return {
         "case_count": len(case_summaries),
@@ -524,9 +579,11 @@ def summarize(rows: list[dict[str, Any]], case_summaries: list[dict[str, Any]]) 
         "fallback_chunk_count": fallback_count,
         "fallback_chunk_ratio": fallback_count / max(1, chunk_count),
         "asr_dropped_uncertain_count": sum(1 for row in rows if row.get("asr_dropped_uncertain")),
-        "failure_candidate_count": sum(1 for row in rows if row.get("failure_reasons")),
+        "failure_candidate_count": failure_candidate_count,
         "reason_counts": dict(reason_counts.most_common()),
         "alignment_mode_counts": dict(mode_counts.most_common()),
+        "alignment_quality_counts": dict(quality_counts.most_common()),
+        "fallback_type_counts": dict(fallback_type_counts.most_common()),
         "cases": case_summaries,
     }
 
