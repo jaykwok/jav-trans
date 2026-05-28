@@ -14,6 +14,7 @@ from utils.model_paths import resolve_model_spec
 from whisper.prealign import (
     clean_text_for_aligner,
     normalize_display_text,
+    prepare_text_for_alignment,
     strip_alignment_punctuation,
 )
 from whisper.timestamp_fallback import build_word_timestamps_fallback
@@ -167,6 +168,54 @@ def restore_timestamps_to_original(
         cleaned = cleaned_text.strip()
         if not original or not cleaned:
             return word_dicts
+
+        prealign = prepare_text_for_alignment(original)
+        if prealign.align_text == cleaned and prealign.align_to_display_spans:
+            restored: list[dict] = []
+            cursor = 0
+            spans = prealign.align_to_display_spans
+            display_text = prealign.display_text
+            mapped_items: list[tuple[dict, int, int]] = []
+            for word in word_dicts:
+                token = str(word.get("word", ""))
+                if not token:
+                    mapped_items.append((dict(word), 0, 0))
+                    continue
+
+                clean_start = cleaned.find(token, cursor)
+                if clean_start < 0:
+                    clean_start = min(cursor, len(cleaned))
+                clean_end = min(len(cleaned), max(clean_start + 1, clean_start + len(token)))
+                cursor = clean_end
+
+                covered = [
+                    span
+                    for span in spans
+                    if span.align_start < clean_end and span.align_end > clean_start
+                ]
+                restored_word = dict(word)
+                if covered:
+                    display_start = min(span.display_start for span in covered)
+                    display_end = max(span.display_end for span in covered)
+                    mapped_items.append((restored_word, display_start, display_end))
+                else:
+                    mapped_items.append((restored_word, 0, 0))
+            valid_indices = [i for i, (_word, start, end) in enumerate(mapped_items) if end > start]
+            for ordinal, (word, display_start, display_end) in enumerate(mapped_items):
+                if display_end <= display_start:
+                    word["word"] = str(word.get("word", ""))
+                    restored.append(word)
+                    continue
+                if valid_indices and ordinal == valid_indices[0]:
+                    display_start = 0
+                next_valid = next((i for i in valid_indices if i > ordinal), None)
+                if next_valid is not None:
+                    display_end = mapped_items[next_valid][1]
+                elif valid_indices and ordinal == valid_indices[-1]:
+                    display_end = len(display_text)
+                word["word"] = display_text[display_start:display_end] or str(word.get("word", ""))
+                restored.append(word)
+            return restored
 
         ratio = len(original) / max(1, len(cleaned))
         restored: list[dict] = []
