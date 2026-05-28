@@ -31,5 +31,16 @@ def test_prepare_text_for_alignment_marks_empty_after_cleaning():
 def test_prepare_text_for_alignment_compacts_repeated_phrase_for_display():
     result = prepare_text_for_alignment("いやいやいやいやいや")
 
-    assert result.display_text == "いや、いや"
+    assert result.display_text == "いやいやいやいやいや"
     assert result.align_text == "いやいや"
+    assert result.flags == ["compacted_repeated_phrase"]
+
+
+def test_prepare_text_for_alignment_exposes_align_to_display_mapping():
+    result = prepare_text_for_alignment("あっっっ♡www気持ちいい~")
+
+    assert result.display_text == "あっっっ♡www気持ちいい~"
+    assert result.align_text == "あっっ気持ちいい"
+    assert result.align_to_display_spans
+    assert result.align_to_display_spans[0].display_start == 0
+    assert result.align_to_display_spans[-1].display_end == len(result.display_text) - 1

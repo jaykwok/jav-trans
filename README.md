@@ -159,7 +159,7 @@ speech_score =
 
 ### FusionVAD-JA 研究计划
 
-FusionVAD-JA 是训练型 VAD 研究线，用于复现 FusionVAD 论文的“PTM 特征 + MFCC + 简单 addition fusion”思路，并面向日语/JAV/galgame 近域数据做适配。它不替换当前默认 `fusion_lite`，不接入 Web，也不改变 `.env` 默认 VAD；研究代码在 `src/vad/fusionvad_ja/`，临时 smoke 输出写入 `agents/temp/fusionvad-ja/`。下载后的数据、feature cache 和 checkpoint 按 split 归档到 `datasets/train/fusionvad-ja/`、`datasets/val/fusionvad-ja/`、`datasets/test/fusionvad-ja/`；`datasets/` 整体不进入 Git 跟踪。
+FusionVAD-JA 是训练型 VAD 研究线，用于复现 FusionVAD 论文的“PTM 特征 + MFCC + 简单 addition fusion”思路，并面向日语/JAV/galgame 近域数据做适配。研究代码在 `src/vad/fusionvad_ja/`，临时 smoke 输出写入 `agents/temp/fusionvad-ja/`。下载后的数据、feature cache 和 checkpoint 按 split 归档到 `datasets/train/fusionvad-ja/`、`datasets/val/fusionvad-ja/`、`datasets/test/fusionvad-ja/`；`datasets/` 整体不进入 Git 跟踪。当前研究分支允许临时把默认 VAD 切到 `fusionvad_ja` 做整链路实验，但合入 main / Web 前必须重新决策默认值。
 
 首轮数据混合：
 
@@ -210,6 +210,25 @@ v1 执行顺序：
 - `tools/fusionvad_ja/materialize_hf_audio.py`：物化 Hugging Face 音频；默认使用 torchcodec decode，再写本地 16k mono WAV；失败时 fallback 到 `Audio(decode=False)` bytes 路径。
 - `tools/fusionvad_ja/slice_labeled_audio.py`：把长 supervised 音频按 frame label 切成短 clip，并同步裁剪 `teacher_segments`。
 - `tools/fusionvad_ja/build_local_video_audit_candidates.py`：从本地视频确定性抽取 16k mono WAV 短片段，生成 manual audit candidates / manifest，用于真实近域 held-out 人工标注。
+
+当前可见结论：
+
+- FusionVAD-JA 在本研究分支暂时作为 high-recall proposal generator 使用，重点是不漏对白、呻吟、喘息、短促人声；precision 和 hard-negative 过滤留给后续 ASR/aligner 失败样本闭环。
+- 研究分支可临时把 `ASR_VAD_BACKEND` 切到 `fusionvad_ja` 做整链路实验；这不等价于 main / Web 正式默认 VAD 切换。
+- Qwen3-ASR-1.7B full SFT 仍是目标域 ASR 主线；Qwen3-ASR-0.6B 暂时作为 FusionVAD-JA frozen feature extractor 和后续轻量 ASR probe。
+- Forced aligner 先不 finetune。当前优先级是把 ASR 文本拆成 `display_text` / `align_text` 两层、记录 fallback 质量标签、汇总真实失败样本池。
+- README / 测试 fixture / 可跟踪报告一律使用匿名样片名，不写真实视频 stem 或含真实 stem 的 `agents/temp/` 路径。
+
+v1.9 ASR / forced alignment 文本策略：
+
+- `display_text` 是最终字幕显示文本，只做展示安全处理：Unicode NFKC、换行归一为空格、连续空白折叠和首尾 trim。不得在 `display_text` 上压缩重复假名、重复短语、拟声或低信息短文本，因为这些在目标域里可能是字幕语义。
+- `align_text` 是 forced aligner 专用文本，可以删除标点、emoji / 装饰符、音乐符号和明显不可发音标记，也可以压缩极端重复假名、长音符和重复短语；这些操作必须记录 flags，并保留从 `align_text` 字符到 `display_text` 覆盖范围的映射。
+- 不使用按具体字样维护的黑名单，不直接删除 `ん`、`あ`、喘息/呻吟拟声或常见台词。过滤和审计只看结构特征：文本/音频时长比例、重复率、align-text-empty、forced-aligner fallback、ASR dropped uncertain、低置信和人工 hard-negative 结果。
+- forced aligner 失败时不伪造精确时间轴。后续输出质量标签分为 `forced`、`partial`、`vad_coarse`、`proportional`、`drop_or_review`；失败样本进入 VAD / ASR / aligner 后处理样本池。
+- 实现口径：`src/whisper/prealign.py` 负责 `raw_text -> display_text -> align_text` 和 char-span mapping；`src/whisper/local_backend.py` 只把 `align_text` 送入 forced aligner，拿到词级时间后再映射回 `display_text`。
+
+<details>
+<summary>历史实验记录 v1-mini 至 v1.6</summary>
 
 v1-mini full 结果：
 
@@ -338,6 +357,9 @@ v1.4 Qwen3-ASR / high-recall VAD 计划：
 - 审计页说明：`Teacher 并集` / `Teacher 交集` 只用于 teacher pseudo-label 审计时快速用 teacher segment 初始化人工边界；ASR hard-negative 审计没有 teacher segments，因此这两个按钮没有意义。`tools/fusionvad_ja/generate_manual_audit_html.py` 已改为仅在候选实际包含 teacher segments 时显示这两个按钮，并把页面标注口径改成“可字幕化人声/拟声/短促发声标为语音，纯 BGM/静音/噪声标为非语音”。
 - v1.6 ASR SFT 候选导出：新增 `tools/fusionvad_ja/export_manual_audit_asr_sft_candidates.py`，专门处理人工审计强标签，不信任 ASR 候选文本为正例真值。已从 `strong-labels/manifest.json` 导出到 `asr-sft-candidates/`：`v1-6-fusionvad-audit_empty_hard_negative.jsonl` 含 4 条 `text=""` 空输出 hard-negative，可用于 Qwen3-ASR 幻觉抑制 smoke；`v1-6-fusionvad-audit_speech_review.jsonl/csv` 含 14 条目标非语言人声 review 候选，保留 `candidate_asr_text` 但 `text=""`，必须人工确认转写后才能进 ASR 正样本 SFT。该包位于 `datasets/val/` 下，只作为 held-out 审计产物和后续数据设计依据，直接拿来训练会污染 v1.6 real-heldout。
 - 下一轮计划：基于审计结果启动 v1.7。若 18 条里多数是目标域可字幕化人声，保持当前 v1.5 posw2 `threshold=0.00015 + pad=0.2s` 高 recall operating point，并优先推进 ASR finetune / post-filter；若纯 BGM/噪声/静音占比高，则先扩充本地 hard-negative、重新训练 FusionVAD-JA 头并在 v1.6 real-heldout 上复测 recall、missed speech seconds、extra audio ratio 和 AnimeWhisper/Qwen3-ASR downstream proxy。ASR SFT 正样本不能直接使用 AnimeWhisper 原始文本当真值，除非人工在 notes 或后续转写文件中确认。
+
+</details>
+
 - v1.7 本机 VAD operating point 固化：新增 `tools/fusionvad_ja/export_fusionvad_operating_point.py`，把 `export_addition_predictions.py` 与 `vad_recall_metrics.py` 串成一键复现入口；默认 operating point 为 `fusionvad-ja-v1.5-posw2`、threshold `0.00015`、pad `0.2s`、frame hop `0.02s`。`vad_recall_metrics.py` 同步抽出可复用 `compute_recall_metrics()`，并把 `missed_speech_segments` 修正为连续 false-negative frame run 数，避免误读成“有漏帧样本数”。该工具只导出研究评测，不训练模型、不替换默认 VAD、不接入 Web。
 - v1.7 real-heldout 复现输出：在 `datasets/val/fusionvad-ja/v1-6/real-heldout-local-video-audit-80/fusionvad-operating-point-v1-5-posw2/` 已生成 `operating_point_summary.json`、`high_recall_metrics.json` 和 `frame-predictions/predictions.jsonl`。同一 79 条 v1.6 real-heldout 上 raw recall `0.9210`；`pad=0.2s` 后 recall `0.9556`、precision `0.6942`、F1 `0.8042`、missed speech `17.24s`、missed speech segments `17`、extra audio ratio `1.3765`。该结果与此前 v1.6 high-recall 结论同口径，后续可作为 Qwen3-ASR finetune 前后的固定 VAD 对照。
 - v1.7 当前下一步：不急于重训 VAD。先保持 v1.5 posw2 高召回 operating point，继续收集真实 hard-negative / human-nonverbal / BGM / 长静音样本，并推进 Qwen3-ASR SFT 数据准备与小样本 smoke；等 Qwen3-ASR-1.7B 云端 finetune 后，再用 finetuned ASR 的真实失败样本反哺下一版 FusionVAD-JA。
