@@ -113,8 +113,27 @@ def test_diagnose_case_marks_alignment_and_asr_drop_candidates(tmp_path):
         "alignment_sentinel",
         "word_timing_zero_heavy",
     ]
+    assert rows[0]["alignment_quality"] == "vad_coarse"
+    assert rows[0]["fallback_type"] == "vad_coarse"
     assert "asr_dropped_uncertain" in rows[1]["failure_reasons"]
+    assert rows[1]["alignment_quality"] == "drop_or_review"
+    assert rows[1]["fallback_type"] == "none"
     assert rows[2]["align_text_empty"] is True
+    assert rows[2]["alignment_quality"] == "drop_or_review"
+    assert rows[2]["fallback_type"] == "proportional"
     assert "alignment_mode_even_fallback" in rows[2]["failure_reasons"]
     assert case_summary["quality_alignment_fallback_ratio"] == 0.5
+    assert case_summary["alignment_quality_counts"] == {
+        "drop_or_review": 2,
+        "vad_coarse": 1,
+    }
+    assert case_summary["fallback_type_counts"] == {
+        "none": 1,
+        "proportional": 1,
+        "vad_coarse": 1,
+    }
     assert summary["failure_candidate_count"] == 3
+    assert summary["alignment_quality_counts"] == {
+        "drop_or_review": 2,
+        "vad_coarse": 1,
+    }
