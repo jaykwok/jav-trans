@@ -351,7 +351,7 @@ Web 设置行为：
 - 评测 `efwkjn/cohere-asr-ja-v0.1`，确认其与当前 ASR 流程及 `transformers` 版本约束的兼容性，再决定是否纳入候选后端。
 - 增加本地/厂商翻译 API 适配层，允许在现有 OpenAI-compatible 翻译之外接入专用翻译服务，例如腾讯 `hy-mt2`。
 - 把 ASR / forced alignment 质量标签从离线诊断导出继续接入 held-out 复测汇总：按 `forced|partial|vad_coarse|proportional|drop_or_review` 和 `fallback_type` 对比不同 ASR checkpoint。
-- 建立失败样本池：长 chunk、低信息人声、重复循环、`align_text` 为空、ASR dropped uncertain、人工确认 hard-negative。
+- 扩展失败样本池：当前 ASR/alignment 诊断已按 `failure_bucket` 导出候选；下一步把人工确认 hard-negative、ASR 空输出和 held-out 复测失败样本合并成可训练/可审计 manifest。
 - 等 Qwen3-ASR-1.7B full SFT checkpoint 稳定后，用同一批 held-out 复测漏对白、多送音频、空输出、hallucination、低置信和 forced-aligner fallback。
 - 二期 probe `joujiboi/Galgame-VisualNovel-Reupload` 的 streaming parquet 字段、样本质量、去重、下载速度和 license 边界；只作为 Qwen3-ASR / FusionVAD-JA 候选数据源，不进入第一轮默认数据混合。
 
@@ -732,6 +732,7 @@ v1.4 Qwen3-ASR / high-recall VAD 计划：
 - v1.8 产物路径：为避免 README 和提交历史暴露真实片名，公开记录只使用“匿名样片 A / 匿名样片 B”这类别名，不再写入真实视频 stem 或含真实 stem 的 `agents/temp/` 路径；本地原始诊断产物仍保留在 `agents/temp/fusionvad-ja/` 下，仅用于个人复查。后续所有报告、测试 fixture、文档示例、commit message 和可跟踪文件都应使用匿名样片名。
 - v1.9 ASR 后处理清理：全量审计后删除词表驱动的 ASR direct drop，包括 `ASR_NOISE_WORDS`、噪声词表、灰区词表、假名/呻吟短句特例、历史工具签名特例和对应白名单；同时取消 AnimeWhisper 后置括号/重复清洗、最终字幕文本重复压缩、翻译 prompt 源文重复压缩、固定拟声词映射表和翻译前纯英文幻觉 direct drop。Adaptive Precision 的清空文本行为改为 `ASR_QC_DROP_UNCERTAIN=1` opt-in，默认只诊断；speaker diarization 也不再把假名-only 文本当成 BGM 跳过。`はぁ`、`うん`、`気持ち`、`好き`、重复短促发声等目标域文本不再因为具体字样、假名集合、重复形态、低置信或英文字符形态被直接删除/改写。空文本、纯标点/纯符号和上下文泄漏仍会过滤；重复循环、低置信、异常密度等保留为 QC/诊断信号。
 - v1.9 alignment 诊断收敛：新增可复用 `alignment_quality` 分类口径，离线诊断 JSONL 每个 chunk 显式输出 `alignment_quality` 和 `fallback_type`，summary 聚合质量标签与 fallback 类型计数。`forced` 只表示 forced aligner 正常产出；`partial` 表示 forced 对齐存在哨兵、异常或时间轴重叠风险；`vad_coarse` / `proportional` 是可解释粗时间轴；`drop_or_review` 表示文本为空、`align_text` 为空、ASR dropped uncertain 或无输出片段等需要审计。该标签默认只用于闭环比较和失败样本池，不直接删除 ASR 文本。
+- v1.9 失败样本池导出口径：`tools/fusionvad_ja/diagnose_asr_alignment.py` 的 `failure_candidates.jsonl` 现在使用统一 `failure_candidate` 布尔字段，而不是只看旧 `failure_reasons`；只要 `alignment_quality != forced` 或存在 QC/ASR/alignment 失败原因就会进入候选。每条候选额外写入 `failure_bucket`，当前 buckets 包括 `asr_dropped_uncertain`、`align_text_empty`、`empty_text_for_chunk`、`text_without_output_segment`、`partial_alignment`、`vad_coarse_alignment`、`proportional_alignment`、`unknown_alignment_fallback`、`long_low_information_text`、`abnormal_char_density`、`asr_qc_reject`、`asr_qc_warn` 和 `diagnostic_warning`。后续 held-out 复测可直接按 bucket 观察 full SFT 是否减少 fallback / review 样本。
 - Sources：Qwen3-ASR GitHub `https://github.com/QwenLM/Qwen3-ASR`，Qwen3-ASR finetuning `https://github.com/QwenLM/Qwen3-ASR/tree/main/finetuning`，Qwen3-ASR technical report `https://arxiv.org/abs/2601.21337`，Qwen3-ASR-0.6B model card `https://huggingface.co/Qwen/Qwen3-ASR-0.6B`，Qwen3-ASR-1.7B model card `https://huggingface.co/Qwen/Qwen3-ASR-1.7B`。
 - Sources：FusionVAD arXiv `https://arxiv.org/abs/2506.01365`，ISCA Archive `https://www.isca-archive.org/interspeech_2025/tripathi25_interspeech.html`，teacher-student VAD `https://dl.acm.org/doi/abs/10.1109/TASLP.2021.3073596`，TEN VAD `https://github.com/ten-framework/ten-vad`，Silero VAD `https://github.com/snakers4/silero-vad`，FireRedVAD `https://github.com/FireRedTeam/FireRedVAD`。
 

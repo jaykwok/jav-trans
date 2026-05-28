@@ -32,6 +32,21 @@ _FALLBACK_MARKERS = (
     "VAD 回退",
     "等比分配时间戳",
 )
+_CANDIDATE_BUCKET_ORDER = (
+    "asr_dropped_uncertain",
+    "align_text_empty",
+    "empty_text_for_chunk",
+    "text_without_output_segment",
+    "partial_alignment",
+    "vad_coarse_alignment",
+    "proportional_alignment",
+    "unknown_alignment_fallback",
+    "long_low_information_text",
+    "abnormal_char_density",
+    "asr_qc_reject",
+    "asr_qc_warn",
+    "diagnostic_warning",
+)
 
 
 def project_path(value: str | Path) -> Path:
@@ -307,6 +322,37 @@ def chunk_failure_reasons(
     return list(dict.fromkeys(reasons))
 
 
+def is_failure_candidate(row: dict[str, Any]) -> bool:
+    return bool(row.get("failure_reasons")) or str(row.get("alignment_quality") or "") != "forced"
+
+
+def failure_candidate_bucket(row: dict[str, Any]) -> str:
+    reasons = set(str(reason) for reason in (row.get("failure_reasons") or []))
+    quality = str(row.get("alignment_quality") or "")
+    fallback_type = str(row.get("fallback_type") or "")
+
+    bucket_flags = {
+        "asr_dropped_uncertain": bool(row.get("asr_dropped_uncertain"))
+        or "asr_dropped_uncertain" in reasons,
+        "align_text_empty": bool(row.get("align_text_empty")) and bool(str(row.get("analysis_text") or "").strip()),
+        "empty_text_for_chunk": "empty_text_for_chunk" in reasons,
+        "text_without_output_segment": "text_without_output_segment" in reasons,
+        "partial_alignment": quality == "partial",
+        "vad_coarse_alignment": quality == "vad_coarse" or fallback_type == "vad_coarse",
+        "proportional_alignment": quality == "proportional" or fallback_type == "proportional",
+        "unknown_alignment_fallback": fallback_type == "unknown",
+        "long_low_information_text": "long_low_information_text" in reasons,
+        "abnormal_char_density": "abnormal_char_density" in reasons,
+        "asr_qc_reject": "asr_qc_reject" in reasons,
+        "asr_qc_warn": "asr_qc_warn" in reasons,
+        "diagnostic_warning": bool(reasons),
+    }
+    for bucket in _CANDIDATE_BUCKET_ORDER:
+        if bucket_flags.get(bucket):
+            return bucket
+    return ""
+
+
 def diagnose_case(
     *,
     aligned_path: Path,
@@ -341,6 +387,7 @@ def diagnose_case(
     alignment_modes: Counter = Counter()
     alignment_quality_counts: Counter = Counter()
     fallback_type_counts: Counter = Counter()
+    failure_bucket_counts: Counter = Counter()
     fallback_chunks = 0
     align_text_empty = 0
     dropped_chunks = 0
@@ -451,6 +498,10 @@ def diagnose_case(
             "dropped_reasons": (dropped or {}).get("reasons", []),
             "failure_reasons": reasons,
         }
+        row["failure_candidate"] = is_failure_candidate(row)
+        row["failure_bucket"] = failure_candidate_bucket(row) if row["failure_candidate"] else ""
+        if row["failure_bucket"]:
+            failure_bucket_counts[str(row["failure_bucket"])] += 1
         rows.append(row)
 
     quality = read_json(quality_path) if quality_path is not None else {}
@@ -472,6 +523,7 @@ def diagnose_case(
         "alignment_mode_counts": dict(alignment_modes.most_common()),
         "alignment_quality_counts": dict(alignment_quality_counts.most_common()),
         "fallback_type_counts": dict(fallback_type_counts.most_common()),
+        "failure_bucket_counts": dict(failure_bucket_counts.most_common()),
         "quality_alignment_fallback_ratio": quality.get("alignment_fallback_ratio"),
         "quality_asr_dropped_uncertain_count": quality.get("asr_dropped_uncertain_count"),
         "asr_details_fallback_count": asr_details.get("fallback_count"),
@@ -525,6 +577,12 @@ def build_markdown(summary: dict[str, Any]) -> str:
             lines.append(f"- `{reason}`: {count}")
     else:
         lines.append("- None")
+    lines.extend(["", "## Failure Buckets", ""])
+    if summary.get("failure_bucket_counts"):
+        for bucket, count in summary["failure_bucket_counts"].items():
+            lines.append(f"- `{bucket}`: {count}")
+    else:
+        lines.append("- None")
     lines.extend(["", "## Per Video", ""])
     for item in summary["cases"]:
         lines.append(
@@ -551,6 +609,7 @@ def summarize(rows: list[dict[str, Any]], case_summaries: list[dict[str, Any]]) 
     mode_counts: Counter = Counter()
     quality_counts: Counter = Counter()
     fallback_type_counts: Counter = Counter()
+    failure_bucket_counts: Counter = Counter()
     for row in rows:
         reason_counts.update(row.get("failure_reasons") or [])
         mode = str(row.get("alignment_mode") or "")
@@ -562,14 +621,13 @@ def summarize(rows: list[dict[str, Any]], case_summaries: list[dict[str, Any]]) 
         fallback_type = str(row.get("fallback_type") or "")
         if fallback_type:
             fallback_type_counts[fallback_type] += 1
+        failure_bucket = str(row.get("failure_bucket") or "")
+        if failure_bucket:
+            failure_bucket_counts[failure_bucket] += 1
 
     chunk_count = len(rows)
     fallback_count = sum(1 for row in rows if row.get("fallback_type") not in {"", "none", None})
-    failure_candidate_count = sum(
-        1
-        for row in rows
-        if row.get("failure_reasons") or row.get("alignment_quality") != "forced"
-    )
+    failure_candidate_count = sum(1 for row in rows if row.get("failure_candidate"))
     return {
         "case_count": len(case_summaries),
         "chunk_count": chunk_count,
@@ -584,6 +642,7 @@ def summarize(rows: list[dict[str, Any]], case_summaries: list[dict[str, Any]]) 
         "alignment_mode_counts": dict(mode_counts.most_common()),
         "alignment_quality_counts": dict(quality_counts.most_common()),
         "fallback_type_counts": dict(fallback_type_counts.most_common()),
+        "failure_bucket_counts": dict(failure_bucket_counts.most_common()),
         "cases": case_summaries,
     }
 
@@ -646,7 +705,7 @@ def main() -> int:
     summary_path = output_dir / "summary.json"
     markdown_path = output_dir / "summary.md"
 
-    candidates = [row for row in all_rows if row.get("failure_reasons")]
+    candidates = [row for row in all_rows if row.get("failure_candidate")]
     append_jsonl(diagnostics_path, all_rows)
     append_jsonl(candidates_path, candidates)
     write_json(summary_path, summary)
