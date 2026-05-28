@@ -164,10 +164,11 @@ FusionVAD-JA 是训练型 VAD 研究线，用于复现 FusionVAD 论文的“PTM
 当前定位：
 
 - 当前研究分支允许临时把 `ASR_VAD_BACKEND` 切到 `fusionvad_ja` 做整链路实验；这不等价于 main / Web 正式默认 VAD 切换，合入 main 前必须重新决策默认值。
-- 当前 operating point 是 FusionVAD-JA v1.5 posw2：Qwen3-ASR-0.6B frozen audio feature + MFCC addition BiLSTM，threshold `0.00015`，pad `0.2s`，定位是 high-recall proposal generator。
+- 当前研究分支 operating point 已切到 FusionVAD-JA v1.11 long-gap：Qwen3-ASR-0.6B frozen audio feature + MFCC addition BiLSTM，threshold `0.02`，pad `0.2s`，定位仍是 high-recall proposal generator。v1.5 posw2 只保留为历史对照。
 - VAD 目标是不漏对白、呻吟、喘息、短促人声；precision、hard-negative 过滤和幻觉控制先交给 ASR / aligner / 后处理失败样本闭环。
 - Qwen3-ASR-1.7B full SFT 是目标域 ASR 主线；Qwen3-ASR-0.6B 暂时作为 FusionVAD-JA frozen feature extractor 和后续轻量 ASR probe。
 - Forced aligner 暂不 finetune。当前优先级是文本预处理、fallback 质量标签、失败样本池和同口径 held-out 复测。
+- Galgame ASR 数据多数已经按语音裁切，因此可把原 clip 当作 speech island，在前后和中间拼接随机长度静音、白噪声、hum、MUSAN/DNS/BGM 或本地 hard-negative，构造精确 `actual_speech_segments`。这条 synthetic timeline 不再只是早期 VAD smoke，而是下一轮 VAD / boundary refiner / aligner bench 的公共数据底座。
 
 当前数据和约束：
 
@@ -180,6 +181,18 @@ FusionVAD-JA 是训练型 VAD 研究线，用于复现 FusionVAD 论文的“PTM
 - 匿名样片 A 已用当前 v1.9 文本/后处理规则、同一 FusionVAD-JA operating point 复测 base / 200k / full v5 checkpoint-15500。旧 v1.8 对照包含历史黑名单和 direct drop，不再作为主参考。
 - 当前规则下三组都处理同一 `337` 个 VAD chunks。base 输出 `806` 段、`829` cues、`8085` 字；200k 输出 `794` 段、`843` cues、`13846` 字；checkpoint-15500 输出 `802` 段、`870` cues、`15203` 字。
 - 结论是 full SFT 方向仍然成立：segments 数接近，但 200k / 15500 的目标域文本覆盖明显高于 base；同时 forced aligner fallback 仍高，分别约 base `51.0%`、200k `49.3%`、15500 `50.4%`，说明当前主要瓶颈已经转向 alignment / fallback / QC，而不是 ASR 是否能输出。
+
+synthetic timeline / boundary refiner 计划：
+
+- 由来：人工复听确认 `litagin/Galgame_Speech_ASR_16kHz` 多数 clip 本身已经裁成语音片段；在 clip 前后拼接随机空白或噪声后，前置 gap 长度就是 speech start，`start + clip_duration` 就是 speech end。多段拼接时每个 speech island 都有可计算真值。
+- 适用范围：该数据天然适合训练和评测 frame-level VAD、speech boundary refiner、VAD-constrained alignment fallback，以及 forced aligner 的 start/end 鲁棒性 bench。它只提供片段级边界，不天然提供字/词级时间轴，所以不能直接等价为 Qwen forced aligner finetune 数据。
+- 数据形态：`tools/fusionvad_ja/build_galgame_synthetic_timeline.py` 负责生成 16k mono WAV、标准 VAD label JSONL、兼容训练的 `manifest.json`、详细 `synthetic_timeline_details.jsonl`，以及公共 `boundary_manifest.jsonl`。`boundary_manifest.jsonl` 同时保留 `actual_speech_segments` 和带训练 pad 的 `speech_segments`，后续 bench 默认用 actual span 做边界误差真值；`transition_regions` 记录 crossfade 模糊区，`augmentation` 记录背景、overlap、gain、filter 和 codec 处理。
+- v5 long-gap 口径：脚本默认使用 `5-30ms` equal-power crossfade、随机 gain `-3~3dB`、轻量 lowpass/bandpass 概率 `0.25`、codec 模拟概率 `0.05`、overlap speech 概率 `0.12`、背景混合概率 `0.5`；speech 最长裁到 `8s`，speech 最短保留到 `0.05s`，middle gap 默认 `1-6s`，首尾 gap 默认 `0.5-4s`，real negative gap 默认概率 `0.75`。无 negative manifest 时仍会退回 silence / white_noise / hum / fade_noise；旧硬拼接行为仅用于显式传 `--crossfade-ms-min 0 --crossfade-ms-max 0 --gain-db-min 0 --gain-db-max 0 --filter-prob 0 --codec-prob 0 --overlap-speech-prob 0 --background-mix-prob 0 --speech-label-pad-s 0` 的单测。
+- 当前执行：v5 long-gap split 已生成到 ignored `datasets/*/fusionvad-ja/v1-11/`，train/val/test 分别 `256/64/64` 条，skipped 均为 `0`。speech frame ratio 为 `0.574/0.551/0.568`，总时长 p50 约 `17.04/16.95/17.67s`、p90 约 `22.70/21.95/22.45s`、max 约 `26.98/24.56/24.98s`。train/val/test 的 real negative gap 为 `554/146/149`，background mix 为 `118/34/34`，overlap speech 为 `26/12/7`，filter 为 `69/11/14`，codec 为 `15/7/1`，每个 split 均已写出 `boundary_manifest.jsonl`。
+- 当前 benchmark：v1.11 long-gap 头在 v5 test 上 threshold `0.02` + pad `0.2s` raw recall `0.9910`、precision `0.8124`、F1 `0.8929`；padded recall `0.9934`、missed speech `4.18s`、extra audio ratio `1.3240`。`boundary_manifest.jsonl` 边界评测 test split speech-duration recall `0.9940`、missed speech `3.65s`、extra audio ratio `1.3741`、overlap speech recall `0.9877`；start/end p50 误差约 `0.675s/0.814s`，p90 约 `2.45s/1.88s`。结论：v1.11 比短 gap 版本更适合真实长静音 / BGM / hard-negative 场景，仍作为 high-recall proposal generator，不作为精确切轴最终模型。
+- 模型路线：先继续当前 `Qwen3-ASR-0.6B frozen feature + MFCC addition BiLSTM` 高召回线；并行增加一个 frozen SSL baseline，优先 probe `reazon-research/japanese-hubert-base-k2`，其次 `rinna/japanese-hubert-base`，再看 `rinna/japanese-wav2vec2-base`。Grok 检索显示这些是更贴近日语语音表征的候选；旧 XLSR large 日语 ASR fine-tune 不作为主线。
+- 评测顺序：先用 synthetic timeline 测 start/end 误差、recall、extra audio ratio 和 inference cost；再回到 v1.6 真实 held-out 与匿名样片 A 同口径测 downstream ASR / alignment fallback。只有 synthetic 和真实 held-out 都有收益，才考虑替换 FusionVAD-JA feature extractor 或训练 boundary refiner。
+- Forced aligner 路线：Qwen3-ForcedAligner-0.6B 仍是主线。官方模型卡确认其支持日语、最长约 5 分钟、词/字级 timestamp，并与 Qwen3-ASR 配套；但目前没有找到公开 forced-aligner finetune recipe。MFA Japanese 更适合规范文本和词典化发音，不作为当前主线。
 
 v1.9 ASR / forced alignment 文本策略：
 
@@ -196,11 +209,12 @@ v1.9 ASR / forced alignment 文本策略：
 下一步：
 
 1. 保持当前 FusionVAD-JA high-recall operating point，不急着追 precision 或替换正式默认 VAD。
-2. 等 Qwen3-ASR-1.7B full SFT 后续 checkpoint 稳定后，用同一批 held-out 统计漏对白、多送音频、空输出、hallucination、低置信和 forced-aligner fallback。
-3. 把长 chunk、低信息人声、重复循环、align-text-empty、ASR dropped uncertain 和人工 hard-negative 汇入失败样本池。
-4. 再决定下一版工作重心是 VAD hard-negative、ASR 后处理、forced aligner fallback，还是补充少量时间轴真值。
+2. 用 synthetic timeline v5 long-gap 的 `boundary_manifest.jsonl`，作为 VAD / HuBERT-wav2vec baseline / forced-aligner bench 的共同输入。
+3. 等 Qwen3-ASR-1.7B full SFT 后续 checkpoint 稳定后，用同一批 held-out 统计漏对白、多送音频、空输出、hallucination、低置信和 forced-aligner fallback。
+4. 把长 chunk、低信息人声、重复循环、align-text-empty、ASR dropped uncertain 和人工 hard-negative 汇入失败样本池。
+5. 再决定下一版工作重心是 VAD hard-negative、ASR 后处理、forced aligner fallback、boundary refiner，还是补充少量时间轴真值。
 
-参考来源：FusionVAD arXiv `https://arxiv.org/abs/2506.01365`，Qwen3-ASR `https://github.com/QwenLM/Qwen3-ASR`，Qwen3-ASR finetuning `https://github.com/QwenLM/Qwen3-ASR/tree/main/finetuning`，Qwen3-ASR-0.6B `https://huggingface.co/Qwen/Qwen3-ASR-0.6B`，Qwen3-ASR-1.7B `https://huggingface.co/Qwen/Qwen3-ASR-1.7B`。
+参考来源：FusionVAD arXiv `https://arxiv.org/abs/2506.01365`，Qwen3-ASR `https://github.com/QwenLM/Qwen3-ASR`，Qwen3-ASR finetuning `https://github.com/QwenLM/Qwen3-ASR/tree/main/finetuning`，Qwen3-ASR-0.6B `https://huggingface.co/Qwen/Qwen3-ASR-0.6B`，Qwen3-ASR-1.7B `https://huggingface.co/Qwen/Qwen3-ASR-1.7B`，Qwen3-ForcedAligner-0.6B `https://huggingface.co/Qwen/Qwen3-ForcedAligner-0.6B`，Reazon Japanese HuBERT `https://huggingface.co/reazon-research/japanese-hubert-base-k2`，rinna Japanese HuBERT `https://huggingface.co/rinna/japanese-hubert-base`，rinna Japanese wav2vec2 `https://huggingface.co/rinna/japanese-wav2vec2-base`。
 
 ### 字幕时间轴
 
@@ -358,6 +372,8 @@ Web 设置行为：
 - 评测 `efwkjn/cohere-asr-ja-v0.1`，确认其与当前 ASR 流程及 `transformers` 版本约束的兼容性，再决定是否纳入候选后端。
 - 增加本地/厂商翻译 API 适配层，允许在现有 OpenAI-compatible 翻译之外接入专用翻译服务，例如腾讯 `hy-mt2`。
 - 当前规则下 base / 200k / full checkpoint-15500 本地闭环复测已完成；下一步可把 checkpoint-16000 或更晚 checkpoint 纳入同一 `tools/fusionvad_ja/compare_alignment_diagnostics.py` 汇总，继续观察 `forced|partial|vad_coarse|proportional|drop_or_review`、`fallback_type` 和 `failure_bucket` 差异。
+- synthetic timeline v5 long-gap 的 `boundary_manifest.jsonl` benchmark 已接入；v1.11 long-gap FusionVAD-JA 头已训练并作为研究分支当前候选。下一步是在真实 held-out / 匿名样片同口径比较 v1.11 与 v1.5 posw2，并观察 recall、missed speech、extra audio ratio、start/end error、transition 模糊区、overlap speech 和 downstream ASR/alignment fallback。
+- 增加 frozen SSL boundary baseline：优先 `reazon-research/japanese-hubert-base-k2`，其次 `rinna/japanese-hubert-base` / `rinna/japanese-wav2vec2-base`，和当前 Qwen3-ASR-0.6B frozen feature 线比较 recall、start/end error、extra audio ratio、速度和显存。
 - 扩展失败样本池：当前 ASR/alignment 诊断已按 `failure_bucket` 导出候选，可用 `tools/fusionvad_ja/export_alignment_failure_manifest.py` 转成人工审计 manifest，再用 `tools/fusionvad_ja/materialize_alignment_failure_audio.py` 切出审计 WAV；下一步把人工确认 hard-negative、ASR 空输出和 held-out 复测失败样本合并成可训练/可审计数据包。
 - 等 Qwen3-ASR-1.7B full SFT checkpoint 稳定后，用同一批 held-out 复测漏对白、多送音频、空输出、hallucination、低置信和 forced-aligner fallback。
 - 二期 probe `joujiboi/Galgame-VisualNovel-Reupload` 的 streaming parquet 字段、样本质量、去重、下载速度和 license 边界；只作为 Qwen3-ASR / FusionVAD-JA 候选数据源，不进入第一轮默认数据混合。
@@ -745,6 +761,9 @@ v1.4 Qwen3-ASR / high-recall VAD 计划：
 - v1.9 失败音频物化：新增 `tools/fusionvad_ja/materialize_alignment_failure_audio.py`，消费 `alignment_failure_manifest.jsonl`，按 `source_audio_path + start/end` 可选 padding 切出 16k mono WAV，并导出 `alignment_failure_audio_manifest.jsonl/csv`、错误列表和 summary。该工具用于本地人工复听、hard-negative 汇总和后续 checkpoint 闭环对比，不改变字幕输出。
 - v1.9 当前规则匿名样片 A 复测：在删除词表黑名单和 direct drop 后，重新用同一 FusionVAD-JA operating point 跑 base、200k 和 full v5 checkpoint-15500。三组均为 `337` chunks 且 `ASR_QC_DROP_UNCERTAIN=0`。base 输出 `806` 段、`829` cues、`8085` 字、ASR+align `889.3s`、fallback `172/337`（`51.0%`）、failure candidates `200`、QC reject `36`；200k 输出 `794` 段、`843` cues、`13846` 字、`1047.0s`、fallback `166/337`（`49.3%`）、failure candidates `177`、QC reject `18`；15500 输出 `802` 段、`870` cues、`15203` 字、`879.5s`、fallback `170/337`（`50.4%`）、failure candidates `177`、QC reject `18`。
 - v1.9 当前规则结论：full SFT 方向仍成立，但判断口径从“segments 是否更多”改为“同一 high-recall chunks 下目标域文本覆盖、重复循环和 alignment fallback”。base 在当前规则下也会保留大量短促人声，因此 segments 数不再能说明召回；200k / 15500 的字符数和近域拟声覆盖明显高于 base。15500 当前文本覆盖最高、速度也接近 base，但 align-text-empty 从 200k 的 `5` 增到 `10`，forced aligner fallback 仍约半数 chunks，下一步应优先做 alignment/fallback/QC 归因，而不是用旧黑名单重新压低输出。
+- v1.10 synthetic timeline v4 作为短 gap 过渡版：它证明 crossfade、背景混合、overlap speech 和 `boundary_manifest.jsonl` bench 能工作，但 speech frame ratio 约 `0.83-0.84`，gap 太短，不适合作为后续当前基线。相关 ignored 生成物已移入 `agents/rm/`，只保留历史结论。
+- v1.11 synthetic timeline v5 long-gap 已成为默认生成口径：`tools/fusionvad_ja/build_galgame_synthetic_timeline.py` 默认启用长 gap、`speech_label_pad_s=0.08`、real negative gap 概率 `0.75` 和背景混合概率 `0.5`。v5 train/val/test 已生成到 ignored `datasets/*/fusionvad-ja/v1-11/`，分别 `256/64/64` 条，skipped `0`，speech frame ratio `0.574/0.551/0.568`，总时长 p50 约 `17s`、p90 约 `22s`，更接近真实视频里“短语音 + 长非语音”的压力测试。
+- v1.11 Qwen3-ASR-0.6B feature cache、训练和边界 benchmark：v5 train/val/test feature cache 均完成，使用 CUDA bfloat16；训练混合 v1-mini strong/negative `302` 条 + v5 long-gap synthetic `256` 条，共 `558` 条，checkpoint 位于 `datasets/train/fusionvad-ja/v1-11/qwen3-asr-0.6b/addition-bilstm-ft-v1mini-galgame-synthv5-longgap-posw2-558-batch16-lr2e-4-steps1024/`。val sweep 选 threshold `0.02`；test padded recall `0.9934`、missed speech `4.18s`、extra audio ratio `1.3240`，boundary recall `0.9940`、missed speech `3.65s`、extra audio ratio `1.3741`、overlap speech recall `0.9877`。研究分支后端默认已切到该 v1.11 long-gap operating point，仍不代表 main 正式默认。
 - Sources：Qwen3-ASR GitHub `https://github.com/QwenLM/Qwen3-ASR`，Qwen3-ASR finetuning `https://github.com/QwenLM/Qwen3-ASR/tree/main/finetuning`，Qwen3-ASR technical report `https://arxiv.org/abs/2601.21337`，Qwen3-ASR-0.6B model card `https://huggingface.co/Qwen/Qwen3-ASR-0.6B`，Qwen3-ASR-1.7B model card `https://huggingface.co/Qwen/Qwen3-ASR-1.7B`。
 - Sources：FusionVAD arXiv `https://arxiv.org/abs/2506.01365`，ISCA Archive `https://www.isca-archive.org/interspeech_2025/tripathi25_interspeech.html`，teacher-student VAD `https://dl.acm.org/doi/abs/10.1109/TASLP.2021.3073596`，TEN VAD `https://github.com/ten-framework/ten-vad`，Silero VAD `https://github.com/snakers4/silero-vad`，FireRedVAD `https://github.com/FireRedTeam/FireRedVAD`。
 
