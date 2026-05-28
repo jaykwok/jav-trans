@@ -18,8 +18,8 @@ from export_addition_predictions import export_predictions  # noqa: E402
 from vad_recall_metrics import compute_recall_metrics  # noqa: E402
 
 
-DEFAULT_OPERATING_POINT = "fusionvad-ja-v1.5-posw2"
-DEFAULT_THRESHOLD = 0.00015
+DEFAULT_OPERATING_POINT = "fusionvad-ja-v1.11-synthv5-longgap-posw2"
+DEFAULT_THRESHOLD = 0.02
 DEFAULT_PAD_S = 0.2
 DEFAULT_FRAME_HOP_S = 0.02
 
