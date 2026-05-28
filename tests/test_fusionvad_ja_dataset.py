@@ -1557,6 +1557,154 @@ def test_export_fusionvad_operating_point_wraps_predictions_and_recall(tmp_path)
     assert (tmp_path / "op" / "frame-predictions" / "predictions.jsonl").exists()
 
 
+def test_benchmark_boundary_predictions_computes_boundary_errors(tmp_path):
+    import importlib.util
+    import json
+
+    script_path = (
+        __import__("pathlib").Path(__file__).resolve().parents[1]
+        / "tools"
+        / "fusionvad_ja"
+        / "benchmark_boundary_predictions.py"
+    )
+    spec = importlib.util.spec_from_file_location("fusionvad_ja_benchmark_boundary_predictions", script_path)
+    assert spec and spec.loader
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    boundary_manifest = tmp_path / "boundary_manifest.jsonl"
+    boundary_manifest.write_text(
+        json.dumps(
+            {
+                "audio_id": "a",
+                "duration_s": 1.0,
+                "frame_hop_s": 0.1,
+                "actual_speech_segments": [{"start": 0.2, "end": 0.5}],
+                "transition_regions": [{"start_s": 0.2, "end_s": 0.25}],
+                "overlap_segments": [{"start": 0.35, "end": 0.45}],
+            },
+            ensure_ascii=False,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    predictions = tmp_path / "predictions.jsonl"
+    predictions.write_text(
+        json.dumps(
+            {
+                "audio_id": "a",
+                "speech_frames": [0, 1, 1, 1, 1, 1, 0, 0, 0, 0],
+            },
+            ensure_ascii=False,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    summary = module.benchmark_boundary_predictions(
+        boundary_manifest=boundary_manifest,
+        predictions=predictions,
+        output_dir=tmp_path / "out",
+        pad_s=0.0,
+        merge_gap_s=0.0,
+        min_segment_s=0.0,
+        min_overlap_ratio=0.1,
+    )
+
+    assert summary["evaluated"] == 1
+    assert summary["matched_segment_count"] == 1
+    assert summary["missed_segment_count"] == 0
+    assert round(summary["start_error"]["signed_mean_s"], 3) == -0.1
+    assert round(summary["end_error"]["signed_mean_s"], 3) == 0.1
+    assert round(summary["speech_duration_recall"], 3) == 1.0
+    assert round(summary["extra_audio_ratio"], 3) == 1.667
+    assert round(summary["transition_predicted_ratio"], 3) == 1.0
+    assert round(summary["overlap_speech_recall"], 3) == 1.0
+
+    args = module.parse_args(
+        [
+            "--boundary-manifest",
+            "boundary.jsonl",
+            "--predictions",
+            "predictions.jsonl",
+            "--pad-s",
+            "0.1",
+            "--output-dir",
+            "out",
+        ]
+    )
+    assert args.boundary_manifest == "boundary.jsonl"
+    assert args.predictions == "predictions.jsonl"
+    assert args.pad_s == 0.1
+    assert args.output_dir == "out"
+
+
+def test_benchmark_boundary_predictions_uses_union_speech_duration(tmp_path):
+    import importlib.util
+    import json
+
+    script_path = (
+        __import__("pathlib").Path(__file__).resolve().parents[1]
+        / "tools"
+        / "fusionvad_ja"
+        / "benchmark_boundary_predictions.py"
+    )
+    spec = importlib.util.spec_from_file_location("fusionvad_ja_benchmark_boundary_predictions_union", script_path)
+    assert spec and spec.loader
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    boundary_manifest = tmp_path / "boundary_manifest.jsonl"
+    boundary_manifest.write_text(
+        json.dumps(
+            {
+                "audio_id": "a",
+                "duration_s": 1.0,
+                "frame_hop_s": 0.1,
+                "actual_speech_segments": [
+                    {"start": 0.2, "end": 0.6},
+                    {"start": 0.4, "end": 0.8},
+                ],
+            },
+            ensure_ascii=False,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    predictions = tmp_path / "predictions.jsonl"
+    predictions.write_text(
+        json.dumps(
+            {
+                "audio_id": "a",
+                "speech_frames": [0, 0, 1, 1, 1, 1, 1, 1, 0, 0],
+            },
+            ensure_ascii=False,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    summary = module.benchmark_boundary_predictions(
+        boundary_manifest=boundary_manifest,
+        predictions=predictions,
+        output_dir=tmp_path / "out",
+        pad_s=0.0,
+        merge_gap_s=0.0,
+        min_segment_s=0.0,
+        min_overlap_ratio=0.1,
+    )
+
+    assert round(summary["speech_duration_s"], 3) == 0.6
+    assert round(summary["overlap_duration_s"], 3) == 0.6
+    assert round(summary["speech_duration_recall"], 3) == 1.0
+    details = [
+        json.loads(line)
+        for line in (tmp_path / "out" / "boundary_benchmark_details.jsonl").read_text(encoding="utf-8").splitlines()
+    ]
+    assert details[0]["actual_segment_count"] == 2
+    assert details[0]["actual_union_segment_count"] == 1
+
+
 def test_calibrate_addition_threshold_cli_requires_inputs():
     import importlib.util
 
@@ -1732,6 +1880,24 @@ def test_build_galgame_synthetic_timeline_writes_exact_labels(tmp_path):
                 "0.1",
                 "--trailing-gap-max-s",
                 "0.1",
+                "--background-mix-prob",
+                "0",
+                "--crossfade-ms-min",
+                "0",
+                "--crossfade-ms-max",
+                "0",
+                "--gain-db-min",
+                "0",
+                "--gain-db-max",
+                "0",
+                "--filter-prob",
+                "0",
+                "--codec-prob",
+                "0",
+                "--overlap-speech-prob",
+                "0",
+                "--speech-label-pad-s",
+                "0",
                 "--output-dir",
                 str(tmp_path / "synthetic"),
             ]
@@ -1740,14 +1906,25 @@ def test_build_galgame_synthetic_timeline_writes_exact_labels(tmp_path):
 
     records = read_jsonl(tmp_path / "synthetic" / "labels.jsonl")
     manifest = json.loads((tmp_path / "synthetic" / "manifest.json").read_text(encoding="utf-8"))
+    boundary_rows = [
+        json.loads(line)
+        for line in (tmp_path / "synthetic" / "boundary_manifest.jsonl").read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
     summary = json.loads((tmp_path / "synthetic" / "synthetic_timeline_summary.json").read_text(encoding="utf-8"))
-    audio, sample_rate = sf.read(str(tmp_path / "synthetic" / "audio" / "galgame-synth-000000.wav"), dtype="float32")
+    audio, sample_rate = sf.read(str(tmp_path / "synthetic" / "audio" / "galgame-synthv5-lg-000000.wav"), dtype="float32")
 
     assert len(records) == 1
     assert records[0].label_quality == "supervised"
     assert records[0].speech_frames == [0, 1, 1, 0, 1, 1, 0]
     assert records[0].text == "a b"
     assert manifest[0]["source_audio_ids"] == ["first", "second"]
+    assert boundary_rows[0]["audio"] == manifest[0]["audio"]
+    assert boundary_rows[0]["text"] == "a b"
+    assert boundary_rows[0]["speech_frames"] == [0, 1, 1, 0, 1, 1, 0]
+    assert boundary_rows[0]["speech_segments"] == manifest[0]["speech_segments"]
+    assert boundary_rows[0]["actual_speech_segments"] == manifest[0]["actual_speech_segments"]
+    assert summary["boundary_manifest"].endswith("boundary_manifest.jsonl")
     assert sample_rate == 16000
     assert audio.shape[0] == 11200
     assert summary["records"] == 1
@@ -1834,6 +2011,22 @@ def test_build_galgame_synthetic_timeline_uses_real_negative_gap_and_background(
                 "10",
                 "--background-snr-db-max",
                 "10",
+                "--crossfade-ms-min",
+                "0",
+                "--crossfade-ms-max",
+                "0",
+                "--gain-db-min",
+                "0",
+                "--gain-db-max",
+                "0",
+                "--filter-prob",
+                "0",
+                "--codec-prob",
+                "0",
+                "--overlap-speech-prob",
+                "0",
+                "--speech-label-pad-s",
+                "0",
                 "--output-dir",
                 str(tmp_path / "synthetic"),
             ]
@@ -1859,6 +2052,158 @@ def test_build_galgame_synthetic_timeline_uses_real_negative_gap_and_background(
         "middle-0",
         "trailing",
     ]
+
+
+def test_build_galgame_synthetic_timeline_v5_records_crossfade_and_augmentations(tmp_path):
+    import importlib.util
+    import json
+
+    import soundfile as sf
+
+    script_path = (
+        __import__("pathlib").Path(__file__).resolve().parents[1]
+        / "tools"
+        / "fusionvad_ja"
+        / "build_galgame_synthetic_timeline.py"
+    )
+    spec = importlib.util.spec_from_file_location("fusionvad_ja_galgame_synthetic_timeline_v5", script_path)
+    assert spec and spec.loader
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    first_audio = tmp_path / "first.wav"
+    second_audio = tmp_path / "second.wav"
+    third_audio = tmp_path / "third.wav"
+    negative_audio = tmp_path / "negative.wav"
+    sf.write(str(first_audio), np.linspace(-0.1, 0.1, 3200, dtype=np.float32), 16000)
+    sf.write(str(second_audio), np.linspace(0.1, -0.1, 3200, dtype=np.float32), 16000)
+    sf.write(str(third_audio), np.ones(3200, dtype=np.float32) * 0.05, 16000)
+    sf.write(str(negative_audio), np.ones(16000, dtype=np.float32) * -0.05, 16000)
+    source_manifest = tmp_path / "hf_audio_manifest.json"
+    source_manifest.write_text(
+        json.dumps(
+            [
+                {"audio_id": "first", "audio": str(first_audio), "text": "a", "input": "src:0"},
+                {"audio_id": "second", "audio": str(second_audio), "text": "b", "input": "src:1"},
+                {"audio_id": "third", "audio": str(third_audio), "text": "c", "input": "src:2"},
+            ],
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    negative_manifest = tmp_path / "negative_manifest.json"
+    negative_manifest.write_text(
+        json.dumps(
+            [{"audio_id": "neg", "audio": str(negative_audio), "source": "unit-negative"}],
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
+    module.build_synthetic_timeline(
+        module.parse_args(
+            [
+                "--manifest",
+                str(source_manifest),
+                "--count",
+                "1",
+                "--speech-clips-per-example",
+                "2",
+                "--frame-hop-s",
+                "0.05",
+                "--max-speech-s",
+                "0.2",
+                "--gap-min-s",
+                "0.1",
+                "--gap-max-s",
+                "0.1",
+                "--leading-gap-min-s",
+                "0.1",
+                "--leading-gap-max-s",
+                "0.1",
+                "--trailing-gap-min-s",
+                "0.1",
+                "--trailing-gap-max-s",
+                "0.1",
+                "--negative-manifest",
+                str(negative_manifest),
+                "--negative-gap-prob",
+                "1.0",
+                "--background-manifest",
+                str(negative_manifest),
+                "--background-mix-prob",
+                "1.0",
+                "--background-snr-db-min",
+                "10",
+                "--background-snr-db-max",
+                "10",
+                "--crossfade-ms-min",
+                "10",
+                "--crossfade-ms-max",
+                "10",
+                "--gain-db-min",
+                "-1",
+                "--gain-db-max",
+                "-1",
+                "--filter-prob",
+                "1.0",
+                "--filter-mode",
+                "lowpass",
+                "--lowpass-min-hz",
+                "3000",
+                "--lowpass-max-hz",
+                "3000",
+                "--codec-prob",
+                "1.0",
+                "--codec-aug",
+                "pcm16",
+                "--overlap-speech-prob",
+                "1.0",
+                "--overlap-snr-db-min",
+                "6",
+                "--overlap-snr-db-max",
+                "6",
+                "--overlap-max-speech-s",
+                "0.1",
+                "--speech-label-pad-s",
+                "0",
+                "--output-dir",
+                str(tmp_path / "synthetic"),
+            ]
+        )
+    )
+
+    manifest = json.loads((tmp_path / "synthetic" / "manifest.json").read_text(encoding="utf-8"))
+    boundary_rows = [
+        json.loads(line)
+        for line in (tmp_path / "synthetic" / "boundary_manifest.jsonl").read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    summary = json.loads((tmp_path / "synthetic" / "synthetic_timeline_summary.json").read_text(encoding="utf-8"))
+    audio, sample_rate = sf.read(str(tmp_path / "synthetic" / "audio" / "galgame-synthv5-lg-000000.wav"), dtype="float32")
+
+    row = manifest[0]
+    boundary = boundary_rows[0]
+    assert sample_rate == 16000
+    assert audio.shape[0] == 10560
+    assert len(row["transition_regions"]) == 4
+    assert {item["crossfade_ms"] for item in row["transition_regions"]} == {10.0}
+    assert row["actual_speech_segments"][0]["start"] == 0.09
+    assert row["actual_speech_segments"][0]["end"] == 0.29
+    assert row["actual_speech_segments"][1]["start"] == 0.37
+    assert row["actual_speech_segments"][1]["end"] == 0.57
+    assert len(row["actual_speech_segments"]) == 3
+    assert row["augmentation"]["background_mix"]["snr_db"] == 10
+    assert row["augmentation"]["overlap_speech"]["enabled"] is True
+    assert row["augmentation"]["gain"]["enabled"] is True
+    assert row["augmentation"]["filter"]["mode"] == "lowpass"
+    assert row["augmentation"]["codec_aug"]["mode"] == "pcm16"
+    assert boundary["overlap_segments"] == row["overlap_segments"]
+    assert any(item["gap_type"] == "real_negative" for item in boundary["sources"])
+    assert summary["overlap_mix_count"] == 1
+    assert summary["gain_aug_count"] == 1
+    assert summary["filter_aug_count"] == 1
+    assert summary["codec_aug_count"] == 1
 
 
 def test_build_galgame_synthetic_timeline_speech_label_pad_expands_labels(tmp_path):
@@ -1911,6 +2256,22 @@ def test_build_galgame_synthetic_timeline_speech_label_pad_expands_labels(tmp_pa
                 "0.1",
                 "--trailing-gap-max-s",
                 "0.1",
+                "--background-mix-prob",
+                "0",
+                "--crossfade-ms-min",
+                "0",
+                "--crossfade-ms-max",
+                "0",
+                "--gain-db-min",
+                "0",
+                "--gain-db-max",
+                "0",
+                "--filter-prob",
+                "0",
+                "--codec-prob",
+                "0",
+                "--overlap-speech-prob",
+                "0",
                 "--speech-label-pad-s",
                 "0.05",
                 "--output-dir",
@@ -1951,10 +2312,30 @@ def test_build_galgame_synthetic_timeline_cli_requires_manifest():
     args = module.parse_args(["--manifest", "hf_audio_manifest.json", "--count", "3"])
     assert args.manifest == "hf_audio_manifest.json"
     assert args.count == 3
+    assert args.source == "galgame-synthetic-timeline-v5-long-gap"
+    assert args.audio_id_prefix == "galgame-synthv5-lg"
     assert args.speech_clips_per_example == 2
-    assert args.negative_gap_prob == 0.0
-    assert args.background_mix_prob == 0.0
-    assert args.speech_label_pad_s == 0.0
+    assert args.max_speech_s == 8.0
+    assert args.min_speech_s == 0.05
+    assert args.gap_min_s == 1.0
+    assert args.gap_max_s == 6.0
+    assert args.leading_gap_min_s == 0.5
+    assert args.leading_gap_max_s == 4.0
+    assert args.trailing_gap_min_s == 0.5
+    assert args.trailing_gap_max_s == 4.0
+    assert args.negative_gap_prob == 0.75
+    assert args.background_mix_prob == 0.5
+    assert args.crossfade_ms_min == 5.0
+    assert args.crossfade_ms_max == 30.0
+    assert args.crossfade_curve == "equal_power"
+    assert args.gain_db_min == -3.0
+    assert args.gain_db_max == 3.0
+    assert args.filter_prob == 0.25
+    assert args.filter_mode == "random"
+    assert args.codec_prob == 0.05
+    assert args.codec_aug == "random"
+    assert args.speech_label_pad_s == 0.08
+    assert args.overlap_speech_prob == 0.12
 
 
 def test_build_local_video_audit_candidates_writes_manifest(tmp_path, monkeypatch):

@@ -23,8 +23,8 @@ from vad.whisperseg.postprocess import group_segments
 
 
 DEFAULT_CHECKPOINT = (
-    "datasets/train/fusionvad-ja/v1-5/qwen3-asr-0.6b/"
-    "addition-bilstm-ft-v1mini-galgame-synthv2-posw2-558-batch16-lr2e-4-steps1024/"
+    "datasets/train/fusionvad-ja/v1-11/qwen3-asr-0.6b/"
+    "addition-bilstm-ft-v1mini-galgame-synthv5-longgap-posw2-558-batch16-lr2e-4-steps1024/"
     "fusionvad_ja_addition_bilstm.pt"
 )
 
@@ -157,7 +157,7 @@ def merge_segments(
 @dataclass(frozen=True)
 class FusionVadJaConfig:
     checkpoint: Path
-    threshold: float = 0.00015
+    threshold: float = 0.02
     pad_s: float = 0.2
     frame_hop_s: float = 0.02
     ptm: str = "qwen3-asr-0.6b"
@@ -180,7 +180,7 @@ class FusionVadJaConfig:
                 os.getenv("FUSIONVAD_JA_CHECKPOINT", DEFAULT_CHECKPOINT).strip()
                 or DEFAULT_CHECKPOINT
             ),
-            threshold=_env_float("FUSIONVAD_JA_THRESHOLD", "0.00015"),
+            threshold=_env_float("FUSIONVAD_JA_THRESHOLD", "0.02"),
             pad_s=_env_float("FUSIONVAD_JA_PAD_S", "0.2"),
             frame_hop_s=_env_float("FUSIONVAD_JA_FRAME_HOP_S", "0.02"),
             ptm=os.getenv("FUSIONVAD_JA_PTM", "qwen3-asr-0.6b").strip()
@@ -202,7 +202,7 @@ class FusionVadJaConfig:
 
 
 class FusionVadJaBackend:
-    name = "fusionvad_ja_v1_5_posw2"
+    name = "fusionvad_ja_v1_11_synthv5_longgap"
 
     def __init__(self, config: FusionVadJaConfig | None = None) -> None:
         self.config = config or FusionVadJaConfig.from_env()
@@ -226,7 +226,7 @@ class FusionVadJaBackend:
             "merge_gap_s": float(cfg.merge_gap_s),
             "max_group_s": float(cfg.max_group_s),
             "chunk_threshold_s": float(cfg.chunk_threshold_s),
-            "operating_point": "v1.5-posw2-threshold-0.00015-pad-0.2",
+            "operating_point": "v1.11-synthv5-longgap-posw2-threshold-0.02-pad-0.2",
             "allow_empty": True,
         }
 
@@ -381,4 +381,3 @@ class FusionVadJaBackend:
             del addition_model
             if device.type == "cuda":
                 torch.cuda.empty_cache()
-
