@@ -37,7 +37,21 @@ def test_diagnose_case_marks_alignment_and_asr_drop_candidates(tmp_path):
                             "source_chunk_index": 0,
                         },
                     ],
-                }
+                },
+                {
+                    "start": 6.0,
+                    "end": 7.0,
+                    "text": "こんにちは",
+                    "source_chunk_index": 3,
+                    "words": [
+                        {
+                            "start": 6.0,
+                            "end": 6.4,
+                            "word": "こん",
+                            "source_chunk_index": 3,
+                        }
+                    ],
+                },
             ],
             "asr_details": {
                 "fallback_count": 1,
@@ -66,6 +80,14 @@ def test_diagnose_case_marks_alignment_and_asr_drop_candidates(tmp_path):
                         "text": "~~~♡ｗｗｗ!!!",
                         "raw_text": "~~~♡ｗｗｗ!!!",
                     },
+                    {
+                        "index": 3,
+                        "start": 6.0,
+                        "end": 7.0,
+                        "duration": 1.0,
+                        "text": "こんにちは",
+                        "raw_text": "こんにちは",
+                    },
                 ],
                 "asr_qc": {
                     "items": [
@@ -93,6 +115,8 @@ def test_diagnose_case_marks_alignment_and_asr_drop_candidates(tmp_path):
                 "chunk 1: Alignment 回退: 使用 VAD 约束比例时间戳",
                 "chunk 3: Alignment 异常: forced aligner returned empty words",
                 "chunk 3: Alignment 模式: even_fallback",
+                "chunk 4: Alignment 词数: 1",
+                "chunk 4: Alignment 模式: forced_aligner",
             ],
         },
     )
@@ -107,33 +131,53 @@ def test_diagnose_case_marks_alignment_and_asr_drop_candidates(tmp_path):
     rows, case_summary = diagnose_case(aligned_path=aligned_path, workflow_root=tmp_path)
     summary = summarize(rows, [case_summary])
 
-    assert len(rows) == 3
-    assert rows[0]["failure_reasons"] == [
+    assert len(rows) == 4
+    by_chunk = {row["chunk_index"]: row for row in rows}
+    assert by_chunk[0]["failure_reasons"] == [
         "alignment_fallback",
         "alignment_sentinel",
         "word_timing_zero_heavy",
     ]
-    assert rows[0]["alignment_quality"] == "vad_coarse"
-    assert rows[0]["fallback_type"] == "vad_coarse"
-    assert "asr_dropped_uncertain" in rows[1]["failure_reasons"]
-    assert rows[1]["alignment_quality"] == "drop_or_review"
-    assert rows[1]["fallback_type"] == "none"
-    assert rows[2]["align_text_empty"] is True
-    assert rows[2]["alignment_quality"] == "drop_or_review"
-    assert rows[2]["fallback_type"] == "proportional"
-    assert "alignment_mode_even_fallback" in rows[2]["failure_reasons"]
+    assert by_chunk[0]["alignment_quality"] == "vad_coarse"
+    assert by_chunk[0]["fallback_type"] == "vad_coarse"
+    assert by_chunk[0]["failure_candidate"] is True
+    assert by_chunk[0]["failure_bucket"] == "vad_coarse_alignment"
+    assert "asr_dropped_uncertain" in by_chunk[1]["failure_reasons"]
+    assert by_chunk[1]["alignment_quality"] == "drop_or_review"
+    assert by_chunk[1]["fallback_type"] == "none"
+    assert by_chunk[1]["failure_bucket"] == "asr_dropped_uncertain"
+    assert by_chunk[2]["align_text_empty"] is True
+    assert by_chunk[2]["alignment_quality"] == "drop_or_review"
+    assert by_chunk[2]["fallback_type"] == "proportional"
+    assert by_chunk[2]["failure_bucket"] == "align_text_empty"
+    assert "alignment_mode_even_fallback" in by_chunk[2]["failure_reasons"]
+    assert by_chunk[3]["alignment_quality"] == "forced"
+    assert by_chunk[3]["failure_candidate"] is False
+    assert by_chunk[3]["failure_bucket"] == ""
     assert case_summary["quality_alignment_fallback_ratio"] == 0.5
     assert case_summary["alignment_quality_counts"] == {
+        "forced": 1,
         "drop_or_review": 2,
         "vad_coarse": 1,
     }
     assert case_summary["fallback_type_counts"] == {
-        "none": 1,
+        "none": 2,
         "proportional": 1,
         "vad_coarse": 1,
     }
+    assert case_summary["failure_bucket_counts"] == {
+        "align_text_empty": 1,
+        "asr_dropped_uncertain": 1,
+        "vad_coarse_alignment": 1,
+    }
     assert summary["failure_candidate_count"] == 3
     assert summary["alignment_quality_counts"] == {
+        "forced": 1,
         "drop_or_review": 2,
         "vad_coarse": 1,
+    }
+    assert summary["failure_bucket_counts"] == {
+        "align_text_empty": 1,
+        "asr_dropped_uncertain": 1,
+        "vad_coarse_alignment": 1,
     }
