@@ -367,6 +367,7 @@ def diagnose_case(
     label = case_label or infer_case_label(aligned_path, workflow_root)
     transcript_path = sibling_path(aligned_path, "transcript.json")
     quality_path = find_quality_json(aligned_path, workflow_root)
+    source_audio_path = str(aligned.get("audio_path") or "")
     asr_details = aligned.get("asr_details") if isinstance(aligned.get("asr_details"), dict) else {}
     asr_qc = asr_details.get("asr_qc") if isinstance(asr_details.get("asr_qc"), dict) else {}
     chunks = list(asr_details.get("transcript_chunks") or [])
@@ -466,6 +467,8 @@ def diagnose_case(
         row = {
             "case_label": label,
             "video": video_stem,
+            "aligned_path": project_rel(aligned_path),
+            "source_audio_path": project_rel(source_audio_path),
             "chunk_index": chunk_index,
             "log_chunk_number": chunk_index + 1,
             "position": position,
