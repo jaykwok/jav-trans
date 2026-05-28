@@ -184,6 +184,7 @@ v1.9 ASR / forced alignment 文本策略：
 - speaker diarization 不再把假名-only 文本当作 BGM 跳过；只跳过空文本或纯符号/纯标点这类没有语言/数字信号的片段，避免把目标域可字幕化人声排除在 speaker embedding 之外。
 - 重复循环、低置信、文本/音频比例异常、align-text-empty、forced-aligner fallback、ASR dropped uncertain 和人工 hard-negative 结果默认只作为 QC / 诊断 / 样本池信号；`ASR_QC_DROP_UNCERTAIN=0` 是默认值，是否删除交给后续可解释 QC 策略，不再用词表兜底。
 - forced aligner 失败时不伪造精确时间轴。诊断导出已使用 `forced`、`partial`、`vad_coarse`、`proportional`、`drop_or_review` 五类质量标签，并单独记录 `fallback_type=none|vad_coarse|proportional|unknown`；失败样本进入 VAD / ASR / aligner 后处理样本池。
+- 失败样本池闭环分三步：`diagnose_asr_alignment.py` 生成 `failure_candidates.jsonl`，`export_alignment_failure_manifest.py` 转成人工审计 manifest，`materialize_alignment_failure_audio.py` 再按 `source_audio_path + start/end` 切出 WAV 片段，避免依赖中间 chunk 文件路径。
 - 实现口径：`src/whisper/prealign.py` 负责 `raw_text -> display_text -> align_text` 和 char-span mapping；`src/whisper/local_backend.py` 只把 `align_text` 送入 forced aligner，拿到词级时间后再映射回 `display_text`。
 
 下一步：
@@ -351,7 +352,7 @@ Web 设置行为：
 - 评测 `efwkjn/cohere-asr-ja-v0.1`，确认其与当前 ASR 流程及 `transformers` 版本约束的兼容性，再决定是否纳入候选后端。
 - 增加本地/厂商翻译 API 适配层，允许在现有 OpenAI-compatible 翻译之外接入专用翻译服务，例如腾讯 `hy-mt2`。
 - 等 `checkpoint-15000` 本地闭环复测完成后，用 `tools/fusionvad_ja/compare_alignment_diagnostics.py` 汇总 base / 200k / full checkpoint 的 `forced|partial|vad_coarse|proportional|drop_or_review`、`fallback_type` 和 `failure_bucket` 差异。
-- 扩展失败样本池：当前 ASR/alignment 诊断已按 `failure_bucket` 导出候选，并可用 `tools/fusionvad_ja/export_alignment_failure_manifest.py` 转成可人工审计 manifest；下一步把人工确认 hard-negative、ASR 空输出和 held-out 复测失败样本合并成可训练/可审计数据包。
+- 扩展失败样本池：当前 ASR/alignment 诊断已按 `failure_bucket` 导出候选，可用 `tools/fusionvad_ja/export_alignment_failure_manifest.py` 转成人工审计 manifest，再用 `tools/fusionvad_ja/materialize_alignment_failure_audio.py` 切出审计 WAV；下一步把人工确认 hard-negative、ASR 空输出和 held-out 复测失败样本合并成可训练/可审计数据包。
 - 等 Qwen3-ASR-1.7B full SFT checkpoint 稳定后，用同一批 held-out 复测漏对白、多送音频、空输出、hallucination、低置信和 forced-aligner fallback。
 - 二期 probe `joujiboi/Galgame-VisualNovel-Reupload` 的 streaming parquet 字段、样本质量、去重、下载速度和 license 边界；只作为 Qwen3-ASR / FusionVAD-JA 候选数据源，不进入第一轮默认数据混合。
 
@@ -735,6 +736,7 @@ v1.4 Qwen3-ASR / high-recall VAD 计划：
 - v1.9 失败样本池导出口径：`tools/fusionvad_ja/diagnose_asr_alignment.py` 的 `failure_candidates.jsonl` 现在使用统一 `failure_candidate` 布尔字段，而不是只看旧 `failure_reasons`；只要 `alignment_quality != forced` 或存在 QC/ASR/alignment 失败原因就会进入候选。每条候选额外写入 `failure_bucket`，当前 buckets 包括 `asr_dropped_uncertain`、`align_text_empty`、`empty_text_for_chunk`、`text_without_output_segment`、`partial_alignment`、`vad_coarse_alignment`、`proportional_alignment`、`unknown_alignment_fallback`、`long_low_information_text`、`abnormal_char_density`、`asr_qc_reject`、`asr_qc_warn` 和 `diagnostic_warning`。后续 held-out 复测可直接按 bucket 观察 full SFT 是否减少 fallback / review 样本。
 - v1.9 checkpoint 对比汇总：新增 `tools/fusionvad_ja/compare_alignment_diagnostics.py`，输入多个 `diagnose_asr_alignment.py` 输出目录，生成 `checkpoint_comparison.json`、`checkpoint_comparison_rows.jsonl` 和 `checkpoint_comparison.md`。该工具只消费诊断产物，不跑模型；本地拿到 full SFT checkpoint 后，先跑同一 held-out，再用它比较不同 checkpoint 的 forced 比例、fallback 比例、failure candidate 比例和 failure bucket 分布。
 - v1.9 失败 manifest 导出：新增 `tools/fusionvad_ja/export_alignment_failure_manifest.py`，把 `failure_candidates.jsonl` 转成 `alignment_failure_manifest.jsonl/csv`。导出行保留匿名 case label、源音频路径、aligned JSON 引用、chunk 起止、`alignment_quality`、`fallback_type`、`failure_bucket`、候选显示文本和空白 `manual_label/manual_text/notes` 字段；当前不复制/切分音频，避免误判 chunk 文件位置，后续审计页面或切片脚本再按 `source_audio_path + start/end` 生成音频片段。
+- v1.9 失败音频物化：新增 `tools/fusionvad_ja/materialize_alignment_failure_audio.py`，消费 `alignment_failure_manifest.jsonl`，按 `source_audio_path + start/end` 可选 padding 切出 16k mono WAV，并导出 `alignment_failure_audio_manifest.jsonl/csv`、错误列表和 summary。该工具用于本地人工复听、hard-negative 汇总和后续 checkpoint 闭环对比，不改变字幕输出。
 - Sources：Qwen3-ASR GitHub `https://github.com/QwenLM/Qwen3-ASR`，Qwen3-ASR finetuning `https://github.com/QwenLM/Qwen3-ASR/tree/main/finetuning`，Qwen3-ASR technical report `https://arxiv.org/abs/2601.21337`，Qwen3-ASR-0.6B model card `https://huggingface.co/Qwen/Qwen3-ASR-0.6B`，Qwen3-ASR-1.7B model card `https://huggingface.co/Qwen/Qwen3-ASR-1.7B`。
 - Sources：FusionVAD arXiv `https://arxiv.org/abs/2506.01365`，ISCA Archive `https://www.isca-archive.org/interspeech_2025/tripathi25_interspeech.html`，teacher-student VAD `https://dl.acm.org/doi/abs/10.1109/TASLP.2021.3073596`，TEN VAD `https://github.com/ten-framework/ten-vad`，Silero VAD `https://github.com/snakers4/silero-vad`，FireRedVAD `https://github.com/FireRedTeam/FireRedVAD`。
 
