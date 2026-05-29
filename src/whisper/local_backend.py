@@ -434,10 +434,33 @@ def looks_like_word_timing_failure(
     max_coverage_ratio: float = _ALIGNMENT_MAX_COVERAGE_RATIO,
     max_cps: float = _ALIGNMENT_MAX_CPS,
 ) -> bool:
+    return bool(
+        word_timing_failure_reasons(
+            words,
+            min_span_ms=min_span_ms,
+            max_zero_ratio=max_zero_ratio,
+            max_repeat_ratio=max_repeat_ratio,
+            scene_duration_sec=scene_duration_sec,
+            max_coverage_ratio=max_coverage_ratio,
+            max_cps=max_cps,
+        )
+    )
+
+
+def word_timing_failure_reasons(
+    words: list[dict],
+    *,
+    min_span_ms: float = ASR_NATIVE_MIN_SPAN_MS,
+    max_zero_ratio: float = ASR_NATIVE_MAX_ZERO_RATIO,
+    max_repeat_ratio: float = ASR_NATIVE_MAX_REPEAT_RATIO,
+    scene_duration_sec: float | None = None,
+    max_coverage_ratio: float = _ALIGNMENT_MAX_COVERAGE_RATIO,
+    max_cps: float = _ALIGNMENT_MAX_CPS,
+) -> list[str]:
     if not words:
-        return False
+        return []
     if len(words) < 2 and scene_duration_sec is None:
-        return False
+        return []
 
     tiny_span_count = 0
     zero_or_negative_count = 0
@@ -465,22 +488,23 @@ def looks_like_word_timing_failure(
             prev_word = token
 
     total = len(words)
-    if (
-        tiny_span_count / total >= max_zero_ratio
-        or zero_or_negative_count / total >= max_zero_ratio
-        or repeated_count / max(1, total - 1) >= max_repeat_ratio
-    ):
-        return True
+    reasons: list[str] = []
+    if tiny_span_count / total >= max_zero_ratio:
+        reasons.append("word_timing_tiny_span_heavy")
+    if zero_or_negative_count / total >= max_zero_ratio:
+        reasons.append("word_timing_zero_heavy")
+    if repeated_count / max(1, total - 1) >= max_repeat_ratio:
+        reasons.append("word_timing_repeat_heavy")
 
     if scene_duration_sec is not None and scene_duration_sec > 0:
         word_span = max(0.0, max_end - min_start)
         if word_span > 0:
             if word_span / scene_duration_sec < max_coverage_ratio:
-                return True
+                reasons.append("word_timing_low_coverage")
             if char_count > 0 and char_count / word_span > max_cps:
-                return True
+                reasons.append("word_timing_high_cps")
 
-    return False
+    return reasons
 
 
 def _native_timestamp_issue(words: list[dict], text: str) -> str:

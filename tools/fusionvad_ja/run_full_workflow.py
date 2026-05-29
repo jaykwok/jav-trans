@@ -119,9 +119,15 @@ def configure_env(args: argparse.Namespace) -> None:
     os.environ.setdefault("TRANSCRIPTION_MAX_NEW_TOKENS", str(args.transcription_max_new_tokens))
     os.environ.setdefault("ASR_MAX_NEW_TOKENS", str(args.asr_max_new_tokens))
     os.environ.setdefault("ASR_CHUNK_PACKING_ENABLED", "1")
-    os.environ.setdefault("ASR_CHUNK_PACK_MAX_S", str(args.chunk_pack_max_s))
-    os.environ.setdefault("ASR_CHUNK_PACK_GAP_MERGE_S", str(args.chunk_pack_gap_merge_s))
-    os.environ.setdefault("ASR_CHUNK_PACK_PADDING_S", str(args.chunk_pack_padding_s))
+    if args.chunk_pack_frame_hop_s is not None:
+        os.environ.setdefault("ASR_CHUNK_PACK_FRAME_HOP_S", str(args.chunk_pack_frame_hop_s))
+    os.environ.setdefault("ASR_CHUNK_PACK_WINDOW_FRAMES", str(args.chunk_pack_window_frames))
+    os.environ.setdefault("ASR_CHUNK_PACK_RESERVE_FRAMES", str(args.chunk_pack_reserve_frames))
+    os.environ.setdefault(
+        "ASR_CHUNK_PACK_TARGET_PADDING_FRAMES",
+        str(args.chunk_pack_target_padding_frames),
+    )
+    os.environ.setdefault("ASR_CHUNK_PACK_GAP_MERGE_FRAMES", str(args.chunk_pack_gap_merge_frames))
     os.environ.setdefault("KEEP_ASR_CHUNKS", "1" if args.keep_asr_chunks else "0")
     os.environ.setdefault("VAD_CHUNK_CACHE_ENABLED", "1" if args.vad_chunk_cache else "0")
     os.environ["FUSIONVAD_JA_CHECKPOINT"] = str(project_path(args.fusionvad_checkpoint))
@@ -157,6 +163,11 @@ def build_context(*, args: argparse.Namespace, paths: RunPaths, video: Path):
         "ASR_BATCH_SIZE": str(args.asr_batch_size),
         "ALIGNER_BATCH_SIZE": str(args.aligner_batch_size),
         "ALIGN_LONG_CHUNK_BATCH_SIZE": str(args.align_long_chunk_batch_size),
+        "ASR_CHUNK_PACKING_ENABLED": "1",
+        "ASR_CHUNK_PACK_WINDOW_FRAMES": str(args.chunk_pack_window_frames),
+        "ASR_CHUNK_PACK_RESERVE_FRAMES": str(args.chunk_pack_reserve_frames),
+        "ASR_CHUNK_PACK_TARGET_PADDING_FRAMES": str(args.chunk_pack_target_padding_frames),
+        "ASR_CHUNK_PACK_GAP_MERGE_FRAMES": str(args.chunk_pack_gap_merge_frames),
         "QUALITY_REPORT_ENABLED": "1",
         "QUALITY_REPORT_DIR": str(paths.root / "quality_reports"),
         "QC_HARD_FAIL": "0",
@@ -198,6 +209,8 @@ def build_context(*, args: argparse.Namespace, paths: RunPaths, video: Path):
         llm_reasoning_effort=os.getenv("LLM_REASONING_EFFORT", "xhigh"),
         advanced=advanced,
     )
+    if args.chunk_pack_frame_hop_s is not None:
+        advanced["ASR_CHUNK_PACK_FRAME_HOP_S"] = str(args.chunk_pack_frame_hop_s)
     ctx = JobContext.from_spec(
         spec,
         job_id=job_id,
@@ -288,6 +301,13 @@ def write_summary(paths: RunPaths, args: argparse.Namespace, results: list[dict[
         "fusionvad_checkpoint": project_rel(project_path(args.fusionvad_checkpoint)),
         "fusionvad_threshold": args.fusionvad_threshold,
         "fusionvad_pad_s": args.fusionvad_pad_s,
+        "chunk_packing": {
+            "frame_hop_s": args.chunk_pack_frame_hop_s,
+            "window_frames": args.chunk_pack_window_frames,
+            "reserve_frames": args.chunk_pack_reserve_frames,
+            "target_padding_frames": args.chunk_pack_target_padding_frames,
+            "gap_merge_frames": args.chunk_pack_gap_merge_frames,
+        },
         "translate": bool(args.translate),
         "results": results,
     }
@@ -347,20 +367,30 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--translate", action="store_true", help="Run LLM translation too. Default outputs Japanese SRT.")
     parser.add_argument("--target-lang", default=os.getenv("TARGET_LANG", "简体中文"))
     parser.add_argument("--translation-max-workers", type=int, default=1)
-    parser.add_argument("--chunk-pack-max-s", type=float, default=28.0)
-    parser.add_argument("--chunk-pack-gap-merge-s", type=float, default=1.5)
-    parser.add_argument("--chunk-pack-padding-s", type=float, default=2.0)
+    parser.add_argument(
+        "--chunk-pack-frame-hop-s",
+        type=float,
+        default=None,
+        help=(
+            "Override ASR chunk frame duration in seconds. Default leaves it unset so "
+            "the pipeline probes each video's FPS and uses 1/fps, with 29.97 fallback."
+        ),
+    )
+    parser.add_argument("--chunk-pack-window-frames", type=int, default=899)
+    parser.add_argument("--chunk-pack-reserve-frames", type=int, default=45)
+    parser.add_argument("--chunk-pack-target-padding-frames", type=int, default=60)
+    parser.add_argument("--chunk-pack-gap-merge-frames", type=int, default=45)
     parser.add_argument("--keep-asr-chunks", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--vad-chunk-cache", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument(
         "--fusionvad-checkpoint",
         default=(
-            "datasets/train/fusionvad-ja/v1-5/qwen3-asr-0.6b/"
-            "addition-bilstm-ft-v1mini-galgame-synthv2-posw2-558-batch16-lr2e-4-steps1024/"
+            "datasets/train/fusionvad-ja/v1-11/qwen3-asr-0.6b/"
+            "addition-bilstm-ft-v1mini-galgame-synthv5-longgap-posw2-558-batch16-lr2e-4-steps1024/"
             "fusionvad_ja_addition_bilstm.pt"
         ),
     )
-    parser.add_argument("--fusionvad-threshold", type=float, default=0.00015)
+    parser.add_argument("--fusionvad-threshold", type=float, default=0.02)
     parser.add_argument("--fusionvad-pad-s", type=float, default=0.2)
     parser.add_argument("--fusionvad-ptm", default="qwen3-asr-0.6b")
     parser.add_argument("--fusionvad-model-path", default="models/Qwen-Qwen3-ASR-0.6B")
@@ -420,4 +450,3 @@ def main(argv: list[str] | None = None) -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

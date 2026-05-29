@@ -48,12 +48,18 @@ def _env_float(name: str, default: str) -> float:
     return float(os.getenv(name, default))
 
 
+def _env_int(name: str, default: str) -> int:
+    return int(float(os.getenv(name, default)))
+
+
 def _chunk_config() -> dict:
     return {
         "packing_enabled": _env_bool("ASR_CHUNK_PACKING_ENABLED", "0"),
-        "pack_max_s": _env_float("ASR_CHUNK_PACK_MAX_S", "28.0"),
-        "pack_gap_merge_s": _env_float("ASR_CHUNK_PACK_GAP_MERGE_S", "1.5"),
-        "pack_padding_s": _env_float("ASR_CHUNK_PACK_PADDING_S", "2.0"),
+        "pack_frame_hop_s": _env_float("ASR_CHUNK_PACK_FRAME_HOP_S", str(1.0 / 29.97)),
+        "pack_window_frames": _env_int("ASR_CHUNK_PACK_WINDOW_FRAMES", "899"),
+        "pack_reserve_frames": _env_int("ASR_CHUNK_PACK_RESERVE_FRAMES", "45"),
+        "pack_target_padding_frames": _env_int("ASR_CHUNK_PACK_TARGET_PADDING_FRAMES", "60"),
+        "pack_gap_merge_frames": _env_int("ASR_CHUNK_PACK_GAP_MERGE_FRAMES", "45"),
         "drop_enabled": _env_bool("ASR_CHUNK_DROP_ENABLED", "0"),
         "drop_min_duration_s": _env_float("ASR_CHUNK_DROP_MIN_DURATION_S", "0.20"),
         "drop_rms_dbfs": _env_float("ASR_CHUNK_DROP_RMS_DBFS", "-40.0"),
@@ -91,6 +97,7 @@ _clean_segment_text = _transcribe_module._clean_segment_text
 _remove_context_leak_fragments = _transcribe_module._remove_context_leak_fragments
 _build_timestamp_fallback = _transcribe_module._build_timestamp_fallback
 _looks_like_alignment_failure = _transcribe_module._looks_like_alignment_failure
+_alignment_failure_reasons = _transcribe_module._alignment_failure_reasons
 _split_span_evenly = _transcribe_module._split_span_evenly
 _prepare_asr_chunk_results = _transcribe_module._prepare_asr_chunk_results
 _transcribe_asr_chunks_text_only = _transcribe_module._transcribe_asr_chunks_text_only
@@ -302,9 +309,11 @@ def _build_processing_spans(
             **result.parameters,
             "chunk_packing": {
                 "enabled": True,
-                "max_s": cfg["pack_max_s"],
-                "gap_merge_s": cfg["pack_gap_merge_s"],
-                "padding_s": cfg["pack_padding_s"],
+                "frame_hop_s": cfg["pack_frame_hop_s"],
+                "window_frames": cfg["pack_window_frames"],
+                "reserve_frames": cfg["pack_reserve_frames"],
+                "target_padding_frames": cfg["pack_target_padding_frames"],
+                "gap_merge_frames": cfg["pack_gap_merge_frames"],
             },
         }
         segments = result.segments
@@ -350,9 +359,11 @@ def _build_processing_spans(
             segments = _drop_short_low_energy_spans(audio_path, segments)
         packed = pack_vad_segments(
             segments,
-            max_s=cfg["pack_max_s"],
-            gap_merge_s=cfg["pack_gap_merge_s"],
-            padding_s=cfg["pack_padding_s"],
+            frame_hop_s=cfg["pack_frame_hop_s"],
+            window_frames=cfg["pack_window_frames"],
+            reserve_frames=cfg["pack_reserve_frames"],
+            target_padding_frames=cfg["pack_target_padding_frames"],
+            gap_merge_frames=cfg["pack_gap_merge_frames"],
         )
         event = _vad_chunk_cache_module.save_processing_spans(
             audio_path,
@@ -432,11 +443,18 @@ def _annotate_packed_chunks(
     packed_spans = [span for span in spans if isinstance(span, PackedChunk)]
     for idx, (chunk, packed) in enumerate(zip(chunk_infos, packed_spans)):
         chunk["vad_seg_count"] = len(packed.vad_segments)
+        chunk["vad_left_padding_s"] = packed.left_padding_s
+        chunk["vad_right_padding_s"] = packed.right_padding_s
+        chunk["vad_split_reason"] = packed.split_reason
         log.append(
-            "[chunk] idx={idx} dur={duration:.1f} vad_seg_count={count}".format(
+            "[chunk] idx={idx} dur={duration:.1f} vad_seg_count={count} "
+            "pad=({left:.2f},{right:.2f}) reason={reason}".format(
                 idx=idx,
                 duration=packed.duration,
                 count=len(packed.vad_segments),
+                left=packed.left_padding_s,
+                right=packed.right_padding_s,
+                reason=packed.split_reason,
             )
         )
 

@@ -29,6 +29,7 @@ from whisper.local_backend import (
     WorkerError,
     WorkerTimeoutError,
     looks_like_word_timing_failure,
+    word_timing_failure_reasons,
 )
 from whisper.timestamp_fallback import build_word_timestamps_fallback
 
@@ -279,6 +280,21 @@ def _looks_like_alignment_failure(
     scene_duration_sec: float | None = None,
 ) -> bool:
     return looks_like_word_timing_failure(
+        words,
+        min_span_ms=_ALIGNMENT_MIN_SPAN_MS,
+        max_zero_ratio=_ALIGNMENT_MAX_ZERO_RATIO,
+        max_repeat_ratio=_ALIGNMENT_MAX_REPEAT_RATIO,
+        scene_duration_sec=scene_duration_sec,
+        max_coverage_ratio=_ALIGNMENT_MAX_COVERAGE_RATIO,
+        max_cps=_ALIGNMENT_MAX_CPS,
+    )
+
+
+def _alignment_failure_reasons(
+    words: list[dict],
+    scene_duration_sec: float | None = None,
+) -> list[str]:
+    return word_timing_failure_reasons(
         words,
         min_span_ms=_ALIGNMENT_MIN_SPAN_MS,
         max_zero_ratio=_ALIGNMENT_MAX_ZERO_RATIO,

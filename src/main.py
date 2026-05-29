@@ -225,6 +225,13 @@ def _asr_stage_env_overrides(ctx: JobContext) -> dict[str, str]:
     return overrides
 
 
+def _asr_stage_env_for_video(ctx: JobContext, video_fps: float | None) -> dict[str, str]:
+    overrides = _asr_stage_env_overrides(ctx)
+    subtitle_options = _subtitle_options_for_ctx(ctx).with_video_fps(video_fps)
+    overrides["ASR_CHUNK_PACK_FRAME_HOP_S"] = f"{subtitle_options.frame_duration_s:.12g}"
+    return overrides
+
+
 _SUBTITLE_OPTION_KEYS = {
     "MAX_SUBTITLE_DURATION",
     "SUBTITLE_SOFT_MAX_S",
@@ -343,10 +350,11 @@ def aligned_cache_expectations_for_ctx(
     ctx: JobContext,
     *,
     backend_label: str | None = None,
+    video_fps: float | None = None,
 ) -> tuple[str, dict]:
-    with _temporary_env(_asr_stage_env_overrides(ctx)):
+    with _temporary_env(_asr_stage_env_for_video(ctx, video_fps)):
         resolved_backend_label = backend_label or asr_module.get_backend_label()
-        subtitle_options = _subtitle_options_for_ctx(ctx)
+        subtitle_options = _subtitle_options_for_video(ctx, video_fps)
         signature = _aligned_cache_signature_for_ctx(
             ctx,
             backend_label=resolved_backend_label,
@@ -719,7 +727,7 @@ def run_asr_alignment_f0(
     _raise_if_cancelled(cancel_event)
     video_duration_s = audio_module.probe_video_duration_s(video_path)
     video_fps = audio_module.probe_video_fps(video_path)
-    with _temporary_env(_asr_stage_env_overrides(effective_ctx)):
+    with _temporary_env(_asr_stage_env_for_video(effective_ctx, video_fps)):
         backend_label = asr_module.get_backend_label()
         if effective_ctx.run_log_enabled:
             logger, run_log_path = _setup_run_logger(job_id, backend_label, effective_ctx)
@@ -745,6 +753,11 @@ def run_asr_alignment_f0(
             logger,
             f"video_fps={subtitle_options.effective_video_fps:.6f}"
             f"{' fallback=29.97' if video_fps is None else ''}",
+        )
+        _log_stage(
+            logger,
+            "asr_chunk_pack_frame_hop_s="
+            f"{os.environ.get('ASR_CHUNK_PACK_FRAME_HOP_S', '')}",
         )
         if cache_job_id != job_id:
             job_temp_dir = _resolve_job_temp_dir(cache_job_id)
@@ -979,7 +992,7 @@ def run_asr_alignment_f0(
                     f"words_available={words_available}[/cyan]"
                 )
             _raise_if_cancelled(cancel_event)
-            with _temporary_env(_asr_stage_env_overrides(effective_ctx)):
+            with _temporary_env(_asr_stage_env_for_video(effective_ctx, video_fps)):
                 segments = detect_gender_f0_word_level(
                     audio_path,
                     segments,
@@ -1206,6 +1219,7 @@ def _run_translation_and_write_impl(
         _, aligned_cache_signature = aligned_cache_expectations_for_ctx(
             ctx,
             backend_label=backend_label,
+            video_fps=video_fps,
         )
     _raise_if_cancelled(cancel_event)
 

@@ -17,6 +17,8 @@ if str(SRC_ROOT) not in sys.path:
 
 from whisper.alignment_quality import classify_alignment_quality  # noqa: E402
 from whisper.prealign import prepare_text_for_alignment, strip_alignment_punctuation  # noqa: E402
+from whisper.qc import evaluate_asr_chunk_qc  # noqa: E402
+from whisper.transcribe import _alignment_failure_reasons  # noqa: E402
 
 
 _CHUNK_LOG_RE = re.compile(r"^chunk\s+(\d+):\s*(.*)$")
@@ -34,19 +36,23 @@ _FALLBACK_MARKERS = (
 )
 _CANDIDATE_BUCKET_ORDER = (
     "asr_dropped_uncertain",
+    "nonlexical_text",
     "align_text_empty",
     "empty_text_for_chunk",
+    "repeat_repair_suggested",
+    "long_low_information_text",
+    "low_information_text",
     "text_without_output_segment",
     "partial_alignment",
     "vad_coarse_alignment",
     "proportional_alignment",
     "unknown_alignment_fallback",
-    "long_low_information_text",
     "abnormal_char_density",
     "asr_qc_reject",
     "asr_qc_warn",
     "diagnostic_warning",
 )
+_NONLEXICAL_TEXT_RE = re.compile(r"^[.。…、,!?！？\s]+$")
 
 
 def project_path(value: str | Path) -> Path:
@@ -276,6 +282,7 @@ def chunk_failure_reasons(
     duration_s: float,
     compact_chars: int,
     prealign_empty: bool,
+    nonlexical_text: bool,
     dropped: dict[str, Any] | None,
     qc_item: dict[str, Any] | None,
     alignment_mode: str,
@@ -290,8 +297,10 @@ def chunk_failure_reasons(
         reasons.append("asr_dropped_uncertain")
     if not text.strip() and duration_s >= 1.0:
         reasons.append("empty_text_for_chunk")
-    if text.strip() and prealign_empty:
+    if text.strip() and prealign_empty and not nonlexical_text:
         reasons.append("align_text_empty")
+    if text.strip() and prealign_empty and nonlexical_text:
+        reasons.append("nonlexical_text")
     if alignment_mode and alignment_mode not in {"forced_aligner", "empty"}:
         reasons.append(f"alignment_mode_{alignment_mode}")
     if align_error:
@@ -308,6 +317,27 @@ def chunk_failure_reasons(
             reasons.append(f"asr_qc_{severity}")
         for reason in qc_item.get("reasons") or []:
             reasons.append(f"asr_qc_reason_{reason}")
+        metrics = qc_item.get("metrics") if isinstance(qc_item.get("metrics"), dict) else {}
+        repetition_repair = (
+            metrics.get("repetition_repair")
+            if isinstance(metrics.get("repetition_repair"), dict)
+            else {}
+        )
+        if (
+            repetition_repair.get("action") == "truncate_repetition"
+            and repetition_repair.get("changed")
+        ):
+            reasons.append("repeat_repair_suggested")
+        low_information = (
+            metrics.get("low_information")
+            if isinstance(metrics.get("low_information"), dict)
+            else {}
+        )
+        low_info_level = str(low_information.get("level") or "")
+        if low_info_level == "long_sparse":
+            reasons.append("long_low_information_text")
+        elif low_info_level == "repeated_nonlexical" and duration_s >= 2.0:
+            reasons.append("low_information_text")
     if duration_s >= 6.0 and compact_chars <= 5 and text.strip():
         reasons.append("long_low_information_text")
     if compact_chars >= 30 and duration_s > 0 and compact_chars / duration_s > 14.0:
@@ -322,6 +352,51 @@ def chunk_failure_reasons(
     return list(dict.fromkeys(reasons))
 
 
+def diagnostic_qc_metrics(
+    *,
+    chunk: dict[str, Any],
+    analysis_text: str,
+    raw_text: str,
+    qc_item: dict[str, Any] | None,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    existing_metrics = (
+        dict(qc_item.get("metrics") or {})
+        if isinstance((qc_item or {}).get("metrics"), dict)
+        else {}
+    )
+    if "repetition_repair" in existing_metrics and "low_information" in existing_metrics:
+        return existing_metrics, qc_item or {}
+
+    offline_qc = evaluate_asr_chunk_qc(
+        chunk,
+        {
+            "text": analysis_text,
+            "raw_text": raw_text or analysis_text,
+            "duration": chunk.get("duration"),
+        },
+    )
+    offline_metrics = offline_qc.get("metrics") if isinstance(offline_qc.get("metrics"), dict) else {}
+    merged_metrics = {
+        **existing_metrics,
+        "repetition_repair": offline_metrics.get("repetition_repair") or {},
+        "low_information": offline_metrics.get("low_information") or {},
+        "diagnostic_offline_text_qc": {
+            "severity": offline_qc.get("severity", ""),
+            "reasons": list(offline_qc.get("reasons") or []),
+        },
+    }
+    if qc_item:
+        merged_item = dict(qc_item)
+        merged_item["metrics"] = merged_metrics
+    else:
+        merged_item = {
+            "severity": "",
+            "reasons": [],
+            "metrics": merged_metrics,
+        }
+    return merged_metrics, merged_item
+
+
 def is_failure_candidate(row: dict[str, Any]) -> bool:
     return bool(row.get("failure_reasons")) or str(row.get("alignment_quality") or "") != "forced"
 
@@ -334,14 +409,17 @@ def failure_candidate_bucket(row: dict[str, Any]) -> str:
     bucket_flags = {
         "asr_dropped_uncertain": bool(row.get("asr_dropped_uncertain"))
         or "asr_dropped_uncertain" in reasons,
+        "nonlexical_text": bool(row.get("nonlexical_text")) or "nonlexical_text" in reasons,
         "align_text_empty": bool(row.get("align_text_empty")) and bool(str(row.get("analysis_text") or "").strip()),
         "empty_text_for_chunk": "empty_text_for_chunk" in reasons,
         "text_without_output_segment": "text_without_output_segment" in reasons,
+        "repeat_repair_suggested": "repeat_repair_suggested" in reasons,
         "partial_alignment": quality == "partial",
         "vad_coarse_alignment": quality == "vad_coarse" or fallback_type == "vad_coarse",
         "proportional_alignment": quality == "proportional" or fallback_type == "proportional",
         "unknown_alignment_fallback": fallback_type == "unknown",
         "long_low_information_text": "long_low_information_text" in reasons,
+        "low_information_text": "low_information_text" in reasons,
         "abnormal_char_density": "abnormal_char_density" in reasons,
         "asr_qc_reject": "asr_qc_reject" in reasons,
         "asr_qc_warn": "asr_qc_warn" in reasons,
@@ -388,7 +466,10 @@ def diagnose_case(
     alignment_modes: Counter = Counter()
     alignment_quality_counts: Counter = Counter()
     fallback_type_counts: Counter = Counter()
+    fallback_subtype_counts: Counter = Counter()
     failure_bucket_counts: Counter = Counter()
+    prealign_flag_counts: Counter = Counter()
+    low_information_counts: Counter = Counter()
     fallback_chunks = 0
     align_text_empty = 0
     dropped_chunks = 0
@@ -414,6 +495,7 @@ def diagnose_case(
             )
         analysis_text = original_dropped_text or text or raw_text
         prealign = prepare_text_for_alignment(analysis_text)
+        nonlexical_text = bool(analysis_text.strip() and _NONLEXICAL_TEXT_RE.fullmatch(analysis_text.strip()))
         compact_chars = len(strip_alignment_punctuation(prealign.display_text))
         chars_per_sec = compact_chars / duration if duration > 0 else 0.0
         chunk_log = logs.get(chunk_index, {})
@@ -424,14 +506,39 @@ def diagnose_case(
         sentinel_lines = list(chunk_log.get("sentinel_lines") or [])
         aligned_segment_count = int(output_counts.get(chunk_index, 0))
         stats = word_timing_stats(words.get(chunk_index, []))
+        word_failure_reasons = _alignment_failure_reasons(
+            words.get(chunk_index, []),
+            scene_duration_sec=duration,
+        )
         qc_item = qc_by_position.get(position) or qc_by_chunk.get(chunk_index)
+        qc_metrics, qc_item_for_diagnostics = diagnostic_qc_metrics(
+            chunk=chunk,
+            analysis_text=analysis_text,
+            raw_text=raw_text,
+            qc_item=qc_item,
+        )
+        repetition_repair = (
+            qc_metrics.get("repetition_repair")
+            if isinstance(qc_metrics.get("repetition_repair"), dict)
+            else {}
+        )
+        low_information = (
+            qc_metrics.get("low_information")
+            if isinstance(qc_metrics.get("low_information"), dict)
+            else {}
+        )
+        low_info_level = str(low_information.get("level") or "")
+        if low_info_level:
+            low_information_counts[low_info_level] += 1
+        prealign_flag_counts.update(prealign.flags)
         reasons = chunk_failure_reasons(
             text=analysis_text,
             duration_s=duration,
             compact_chars=compact_chars,
             prealign_empty=prealign.empty_after_cleaning,
+            nonlexical_text=nonlexical_text,
             dropped=dropped,
-            qc_item=qc_item,
+            qc_item=qc_item_for_diagnostics,
             alignment_mode=alignment_mode,
             align_error=str(chunk_log.get("align_error") or ""),
             fallback_lines=fallback_lines,
@@ -443,18 +550,21 @@ def diagnose_case(
             text=analysis_text,
             duration_s=duration,
             align_text_empty=prealign.empty_after_cleaning,
+            nonlexical_text=nonlexical_text,
             asr_dropped_uncertain=bool(dropped),
-            asr_qc_severity=str((qc_item or {}).get("severity") or ""),
+            asr_qc_severity=str((qc_item_for_diagnostics or {}).get("severity") or ""),
             alignment_mode=alignment_mode,
             align_error=str(chunk_log.get("align_error") or ""),
             fallback_lines=fallback_lines,
             sentinel_lines=sentinel_lines,
             aligned_segment_count=aligned_segment_count,
             word_stats=stats,
+            word_failure_reasons=word_failure_reasons,
         )
         reason_counts.update(reasons)
         alignment_quality_counts[str(quality["alignment_quality"])] += 1
         fallback_type_counts[str(quality["fallback_type"])] += 1
+        fallback_subtype_counts[str(quality["fallback_subtype"])] += 1
         if prealign.empty_after_cleaning and analysis_text.strip():
             align_text_empty += 1
         if analysis_text.strip():
@@ -482,12 +592,29 @@ def diagnose_case(
             "display_text": prealign.display_text,
             "align_text": prealign.align_text,
             "prealign_flags": prealign.flags,
+            "prealign_display_len": prealign.display_len,
+            "prealign_align_len": prealign.align_len,
+            "prealign_removed_ratio": round(
+                max(0, prealign.display_len - prealign.align_len)
+                / max(1, prealign.display_len),
+                6,
+            ),
             "align_text_empty": prealign.empty_after_cleaning,
+            "nonlexical_text": nonlexical_text,
             "compact_chars": compact_chars,
             "chars_per_sec": round(chars_per_sec, 3),
+            "low_information": low_information,
+            "low_information_level": low_info_level,
+            "repetition_repair": repetition_repair,
+            "repetition_suggested_text": str(
+                repetition_repair.get("suggested_text") or ""
+            )
+            if repetition_repair.get("changed")
+            else "",
             "alignment_mode": alignment_mode,
             "alignment_quality": quality["alignment_quality"],
             "fallback_type": quality["fallback_type"],
+            "fallback_subtype": quality["fallback_subtype"],
             "alignment_quality_reasons": quality["alignment_quality_reasons"],
             "alignment_word_count": chunk_log.get("alignment_word_count"),
             "align_error": chunk_log.get("align_error") or "",
@@ -495,8 +622,9 @@ def diagnose_case(
             "sentinel_lines": sentinel_lines,
             "aligned_segment_count": aligned_segment_count,
             "word_timing": stats,
-            "asr_qc_severity": (qc_item or {}).get("severity", ""),
-            "asr_qc_reasons": (qc_item or {}).get("reasons", []),
+            "word_timing_failure_reasons": word_failure_reasons,
+            "asr_qc_severity": (qc_item_for_diagnostics or {}).get("severity", ""),
+            "asr_qc_reasons": (qc_item_for_diagnostics or {}).get("reasons", []),
             "asr_dropped_uncertain": bool(dropped),
             "dropped_reasons": (dropped or {}).get("reasons", []),
             "failure_reasons": reasons,
@@ -526,7 +654,15 @@ def diagnose_case(
         "alignment_mode_counts": dict(alignment_modes.most_common()),
         "alignment_quality_counts": dict(alignment_quality_counts.most_common()),
         "fallback_type_counts": dict(fallback_type_counts.most_common()),
+        "fallback_subtype_counts": dict(fallback_subtype_counts.most_common()),
         "failure_bucket_counts": dict(failure_bucket_counts.most_common()),
+        "prealign_flag_counts": dict(prealign_flag_counts.most_common()),
+        "low_information_counts": dict(low_information_counts.most_common()),
+        "repeat_repair_suggested_count": sum(
+            1
+            for row in rows
+            if (row.get("repetition_repair") or {}).get("changed")
+        ),
         "quality_alignment_fallback_ratio": quality.get("alignment_fallback_ratio"),
         "quality_asr_dropped_uncertain_count": quality.get("asr_dropped_uncertain_count"),
         "asr_details_fallback_count": asr_details.get("fallback_count"),
@@ -566,6 +702,18 @@ def build_markdown(summary: dict[str, Any]) -> str:
     if summary.get("fallback_type_counts"):
         for fallback_type, count in summary["fallback_type_counts"].items():
             lines.append(f"- `{fallback_type}`: {count}")
+    else:
+        lines.append("- None")
+    lines.extend(
+        [
+            "",
+            "## Fallback Subtype",
+            "",
+        ]
+    )
+    if summary.get("fallback_subtype_counts"):
+        for subtype, count in summary["fallback_subtype_counts"].items():
+            lines.append(f"- `{subtype}`: {count}")
     else:
         lines.append("- None")
     lines.extend(
@@ -612,7 +760,11 @@ def summarize(rows: list[dict[str, Any]], case_summaries: list[dict[str, Any]]) 
     mode_counts: Counter = Counter()
     quality_counts: Counter = Counter()
     fallback_type_counts: Counter = Counter()
+    fallback_subtype_counts: Counter = Counter()
     failure_bucket_counts: Counter = Counter()
+    prealign_flag_counts: Counter = Counter()
+    low_information_counts: Counter = Counter()
+    repeat_repair_suggested_count = 0
     for row in rows:
         reason_counts.update(row.get("failure_reasons") or [])
         mode = str(row.get("alignment_mode") or "")
@@ -624,9 +776,18 @@ def summarize(rows: list[dict[str, Any]], case_summaries: list[dict[str, Any]]) 
         fallback_type = str(row.get("fallback_type") or "")
         if fallback_type:
             fallback_type_counts[fallback_type] += 1
+        fallback_subtype = str(row.get("fallback_subtype") or "")
+        if fallback_subtype:
+            fallback_subtype_counts[fallback_subtype] += 1
         failure_bucket = str(row.get("failure_bucket") or "")
         if failure_bucket:
             failure_bucket_counts[failure_bucket] += 1
+        prealign_flag_counts.update(row.get("prealign_flags") or [])
+        low_info_level = str(row.get("low_information_level") or "")
+        if low_info_level and low_info_level != "unknown":
+            low_information_counts[low_info_level] += 1
+        if (row.get("repetition_repair") or {}).get("changed"):
+            repeat_repair_suggested_count += 1
 
     chunk_count = len(rows)
     fallback_count = sum(1 for row in rows if row.get("fallback_type") not in {"", "none", None})
@@ -645,7 +806,11 @@ def summarize(rows: list[dict[str, Any]], case_summaries: list[dict[str, Any]]) 
         "alignment_mode_counts": dict(mode_counts.most_common()),
         "alignment_quality_counts": dict(quality_counts.most_common()),
         "fallback_type_counts": dict(fallback_type_counts.most_common()),
+        "fallback_subtype_counts": dict(fallback_subtype_counts.most_common()),
         "failure_bucket_counts": dict(failure_bucket_counts.most_common()),
+        "prealign_flag_counts": dict(prealign_flag_counts.most_common()),
+        "low_information_counts": dict(low_information_counts.most_common()),
+        "repeat_repair_suggested_count": repeat_repair_suggested_count,
         "cases": case_summaries,
     }
 
