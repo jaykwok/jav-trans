@@ -83,6 +83,19 @@ def _load_addition_model(checkpoint_path: Path, *, device):
     return model, checkpoint, config
 
 
+def _first_parameter_device_dtype(model) -> tuple[str, str]:
+    parameters = getattr(model, "parameters", None)
+    if not callable(parameters):
+        return "unknown", "unknown"
+    try:
+        parameter = next(parameters())
+    except StopIteration:
+        return "none", "none"
+    except Exception as exc:  # pragma: no cover - defensive logging only
+        return "error", type(exc).__name__
+    return str(parameter.device), str(parameter.dtype)
+
+
 def _padded_frames(values: np.ndarray, *, pad_frames: int) -> np.ndarray:
     mask = np.asarray(values, dtype=bool)
     if pad_frames <= 0 or mask.size == 0:
@@ -270,6 +283,30 @@ class FusionVadJaBackend:
             device=device,
         )
         ptm_extractor = build_ptm_feature_extractor(feature_config)
+        ptm_param_device, ptm_param_dtype = _first_parameter_device_dtype(
+            getattr(ptm_extractor, "model", None)
+        )
+        model_param_device, model_param_dtype = _first_parameter_device_dtype(addition_model)
+        runtime_device = {
+            "requested_device": cfg.device,
+            "actual_device": str(device),
+            "dtype": cfg.dtype,
+            "ptm_param_device": ptm_param_device,
+            "ptm_param_dtype": ptm_param_dtype,
+            "model_param_device": model_param_device,
+            "model_param_dtype": model_param_dtype,
+        }
+        print(
+            "[vad] fusionvad_ja device "
+            f"requested_device={runtime_device['requested_device']} "
+            f"actual_device={runtime_device['actual_device']} "
+            f"dtype={runtime_device['dtype']} "
+            f"ptm_param_device={runtime_device['ptm_param_device']} "
+            f"ptm_param_dtype={runtime_device['ptm_param_dtype']} "
+            f"model_param_device={runtime_device['model_param_device']} "
+            f"model_param_dtype={runtime_device['model_param_dtype']}",
+            flush=True,
+        )
         try:
             audio, sample_rate = load_audio_16k_mono(audio_path)
             duration_s = float(len(audio) / sample_rate) if sample_rate else 0.0
@@ -364,6 +401,7 @@ class FusionVadJaBackend:
                     },
                     "checkpoint_config": model_config,
                     "checkpoint_ptm": checkpoint.get("ptm"),
+                    "runtime_device": runtime_device,
                 }
             )
             return SegmentationResult(

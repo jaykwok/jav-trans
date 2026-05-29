@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import pytest
+
 from audio.chunk_packer import pack_vad_segments
 from vad.base import SpeechSegment
 
@@ -8,79 +10,115 @@ def _seg(start: float, end: float) -> SpeechSegment:
     return SpeechSegment(start=start, end=end)
 
 
-def test_dense_segments_pack_into_one_chunk():
-    chunks = pack_vad_segments(
-        [_seg(1.0, 3.0), _seg(3.5, 5.0), _seg(5.4, 6.0)],
-        max_s=10.0,
-        gap_merge_s=1.5,
-        padding_s=1.0,
+def _pack(segments):
+    return pack_vad_segments(
+        segments,
+        frame_hop_s=1.0,
+        window_frames=30,
+        reserve_frames=2,
+        target_padding_frames=4,
+        gap_merge_frames=3,
     )
 
-    assert len(chunks) == 1
-    assert chunks[0].start == 0.0
-    assert chunks[0].end == 7.0
-    assert chunks[0].duration == 7.0
-    assert chunks[0].vad_segments == [_seg(1.0, 3.0), _seg(3.5, 5.0), _seg(5.4, 6.0)]
 
-
-def test_large_gap_starts_new_chunk():
-    chunks = pack_vad_segments(
-        [_seg(5.0, 6.0), _seg(8.0, 9.0)],
-        max_s=20.0,
-        gap_merge_s=1.5,
-        padding_s=1.0,
-    )
-
-    assert [(chunk.start, chunk.end) for chunk in chunks] == [(4.0, 7.0), (7.0, 10.0)]
-    assert [len(chunk.vad_segments) for chunk in chunks] == [1, 1]
-
-
-def test_near_max_duration_keeps_chunk_within_limit():
-    chunks = pack_vad_segments(
-        [_seg(2.0, 12.0), _seg(13.0, 28.0)],
-        max_s=28.0,
-        gap_merge_s=1.5,
-        padding_s=1.0,
-    )
+def test_dense_segments_pack_into_one_chunk_with_dynamic_padding():
+    chunks = _pack([_seg(5.0, 7.0), _seg(8.0, 9.0), _seg(10.0, 11.0)])
 
     assert len(chunks) == 1
     assert chunks[0].start == 1.0
-    assert chunks[0].end == 29.0
+    assert chunks[0].end == 15.0
+    assert chunks[0].duration == 14.0
+    assert chunks[0].left_padding_s == 4.0
+    assert chunks[0].right_padding_s == 4.0
+    assert chunks[0].vad_segments == [_seg(5.0, 7.0), _seg(8.0, 9.0), _seg(10.0, 11.0)]
+
+
+def test_gap_larger_than_frame_threshold_starts_new_chunk_and_splits_gap_padding():
+    chunks = _pack([_seg(10.0, 11.0), _seg(16.0, 17.0)])
+
+    assert [(chunk.start, chunk.end) for chunk in chunks] == [(6.0, 13.5), (13.5, 21.0)]
+    assert [(chunk.left_padding_s, chunk.right_padding_s) for chunk in chunks] == [
+        (4.0, 2.5),
+        (2.5, 4.0),
+    ]
+
+
+def test_near_capacity_segment_reduces_padding_to_fit_window_reserve():
+    chunks = _pack([_seg(2.0, 28.0)])
+
+    assert len(chunks) == 1
     assert chunks[0].duration == 28.0
+    assert chunks[0].start == 1.0
+    assert chunks[0].end == 29.0
+    assert chunks[0].left_padding_s == 1.0
+    assert chunks[0].right_padding_s == 1.0
 
 
-def test_single_overlong_segment_is_independent_chunk():
+def test_single_overlong_segment_is_split_by_frame_capacity_before_packing():
+    chunks = _pack([_seg(10.0, 75.0)])
+
+    assert [(chunk.start, chunk.end, chunk.duration) for chunk in chunks] == [
+        (6.0, 34.0, 28.0),
+        (26.0, 54.0, 28.0),
+        (48.5, 76.5, 28.0),
+    ]
+    assert [[(seg.start, seg.end) for seg in chunk.vad_segments] for chunk in chunks] == [
+        [(10.0, 30.0)],
+        [(30.0, 50.0)],
+        [(50.0, 70.0), (70.0, 75.0)],
+    ]
+
+
+def test_overlong_segment_split_preserves_score():
+    segment = SpeechSegment(start=0.0, end=30.0, score=0.75)
     chunks = pack_vad_segments(
-        [_seg(10.0, 45.0), _seg(46.0, 47.0)],
-        max_s=28.0,
-        gap_merge_s=1.5,
-        padding_s=1.0,
+        [segment],
+        frame_hop_s=1.0,
+        window_frames=12,
+        reserve_frames=2,
+        target_padding_frames=1,
+        gap_merge_frames=0,
     )
 
     assert [(chunk.start, chunk.end, chunk.duration) for chunk in chunks] == [
-        (9.0, 46.0, 37.0),
-        (45.0, 48.0, 3.0),
+        (0.0, 9.0, 9.0),
+        (7.0, 17.0, 10.0),
+        (15.0, 25.0, 10.0),
+        (23.0, 31.0, 8.0),
     ]
-    assert [len(chunk.vad_segments) for chunk in chunks] == [1, 1]
+    assert [chunk.vad_segments[0].score for chunk in chunks] == [0.75, 0.75, 0.75, 0.75]
+
+
+def test_adjacent_overlong_tail_can_pack_with_following_segment_when_gap_allowed():
+    chunks = pack_vad_segments(
+        [_seg(10.0, 45.0), _seg(46.0, 47.0)],
+        frame_hop_s=1.0,
+        window_frames=30,
+        reserve_frames=2,
+        target_padding_frames=1,
+        gap_merge_frames=1,
+    )
+
+    assert [[(seg.start, seg.end) for seg in chunk.vad_segments] for chunk in chunks] == [
+        [(10.0, 36.0)],
+        [(36.0, 45.0), (46.0, 47.0)],
+    ]
+    assert all(chunk.duration <= 28.0 for chunk in chunks)
 
 
 def test_empty_segments_return_empty_list():
     assert pack_vad_segments([]) == []
 
 
-def test_single_segment_gets_padding():
-    chunks = pack_vad_segments([_seg(5.0, 8.0)], padding_s=2.0)
-
-    assert len(chunks) == 1
-    assert chunks[0].start == 3.0
-    assert chunks[0].end == 10.0
-    assert chunks[0].duration == 7.0
-    assert chunks[0].vad_segments == [_seg(5.0, 8.0)]
-
-
-def test_padding_start_is_clamped_to_zero():
-    chunks = pack_vad_segments([_seg(0.4, 1.0)], padding_s=2.0)
+def test_single_segment_at_audio_start_clamps_left_padding_to_zero():
+    chunks = _pack([_seg(0.4, 1.0)])
 
     assert chunks[0].start == 0.0
-    assert chunks[0].end == 3.0
-    assert chunks[0].duration == 3.0
+    assert chunks[0].end == 5.0
+    assert chunks[0].left_padding_s == 0.4
+    assert chunks[0].right_padding_s == 4.0
+
+
+def test_invalid_frame_config_raises():
+    with pytest.raises(ValueError, match="reserve_frames must be smaller"):
+        pack_vad_segments([_seg(0.0, 1.0)], window_frames=10, reserve_frames=10)

@@ -141,6 +141,8 @@ def test_diagnose_case_marks_alignment_and_asr_drop_candidates(tmp_path):
     ]
     assert by_chunk[0]["alignment_quality"] == "vad_coarse"
     assert by_chunk[0]["fallback_type"] == "vad_coarse"
+    assert by_chunk[0]["fallback_subtype"] == "vad_coarse_after_sentinel"
+    assert "word_timing_zero_heavy" in by_chunk[0]["word_timing_failure_reasons"]
     assert by_chunk[0]["aligned_path"].endswith("sample.aligned_segments.json")
     assert by_chunk[0]["source_audio_path"].endswith("audio.wav")
     assert by_chunk[0]["failure_candidate"] is True
@@ -148,10 +150,12 @@ def test_diagnose_case_marks_alignment_and_asr_drop_candidates(tmp_path):
     assert "asr_dropped_uncertain" in by_chunk[1]["failure_reasons"]
     assert by_chunk[1]["alignment_quality"] == "drop_or_review"
     assert by_chunk[1]["fallback_type"] == "none"
+    assert by_chunk[1]["fallback_subtype"] == "asr_dropped_uncertain"
     assert by_chunk[1]["failure_bucket"] == "asr_dropped_uncertain"
     assert by_chunk[2]["align_text_empty"] is True
     assert by_chunk[2]["alignment_quality"] == "drop_or_review"
     assert by_chunk[2]["fallback_type"] == "proportional"
+    assert by_chunk[2]["fallback_subtype"] == "align_text_empty"
     assert by_chunk[2]["failure_bucket"] == "align_text_empty"
     assert "alignment_mode_even_fallback" in by_chunk[2]["failure_reasons"]
     assert by_chunk[3]["alignment_quality"] == "forced"
@@ -168,6 +172,12 @@ def test_diagnose_case_marks_alignment_and_asr_drop_candidates(tmp_path):
         "proportional": 1,
         "vad_coarse": 1,
     }
+    assert case_summary["fallback_subtype_counts"] == {
+        "align_text_empty": 1,
+        "asr_dropped_uncertain": 1,
+        "none": 1,
+        "vad_coarse_after_sentinel": 1,
+    }
     assert case_summary["failure_bucket_counts"] == {
         "align_text_empty": 1,
         "asr_dropped_uncertain": 1,
@@ -183,4 +193,150 @@ def test_diagnose_case_marks_alignment_and_asr_drop_candidates(tmp_path):
         "align_text_empty": 1,
         "asr_dropped_uncertain": 1,
         "vad_coarse_alignment": 1,
+    }
+    assert summary["fallback_subtype_counts"] == {
+        "align_text_empty": 1,
+        "asr_dropped_uncertain": 1,
+        "none": 1,
+        "vad_coarse_after_sentinel": 1,
+    }
+
+
+def test_diagnose_case_separates_punctuation_only_nonlexical_text(tmp_path):
+    aligned_path = tmp_path / "archived" / "sample" / "sample.aligned_segments.json"
+    _write_json(
+        aligned_path,
+        {
+            "audio_path": str(tmp_path / "audio.wav"),
+            "segments": [
+                {
+                    "start": 1.0,
+                    "end": 2.0,
+                    "text": "...",
+                    "source_chunk_index": 0,
+                    "words": [],
+                }
+            ],
+            "asr_details": {
+                "transcript_chunks": [
+                    {
+                        "index": 0,
+                        "start": 1.0,
+                        "end": 2.0,
+                        "duration": 1.0,
+                        "text": "...、...",
+                        "raw_text": "…、…",
+                    }
+                ],
+                "asr_qc": {"items": [], "dropped_uncertain_items": []},
+            },
+            "asr_log": [
+                "chunk 1: Alignment 词数: 0",
+                "chunk 1: Alignment 模式: empty",
+            ],
+        },
+    )
+
+    rows, case_summary = diagnose_case(aligned_path=aligned_path, workflow_root=tmp_path)
+
+    assert len(rows) == 1
+    assert rows[0]["align_text_empty"] is True
+    assert rows[0]["nonlexical_text"] is True
+    assert rows[0]["alignment_quality"] == "nonlexical"
+    assert rows[0]["fallback_subtype"] == "nonlexical_text"
+    assert rows[0]["failure_bucket"] == "nonlexical_text"
+    assert rows[0]["failure_reasons"] == ["nonlexical_text"]
+    assert case_summary["alignment_quality_counts"] == {"nonlexical": 1}
+    assert case_summary["failure_bucket_counts"] == {"nonlexical_text": 1}
+
+
+def test_diagnose_case_exports_repetition_and_low_information_review_fields(tmp_path):
+    aligned_path = tmp_path / "archived" / "sample" / "sample.aligned_segments.json"
+    _write_json(
+        aligned_path,
+        {
+            "audio_path": str(tmp_path / "audio.wav"),
+            "segments": [],
+            "asr_details": {
+                "transcript_chunks": [
+                    {
+                        "index": 0,
+                        "start": 0.0,
+                        "end": 4.0,
+                        "duration": 4.0,
+                        "text": "あっ、あっ、あっ、あっ、あっ、あっ、",
+                        "raw_text": "あっ、あっ、あっ、あっ、あっ、あっ、",
+                    },
+                    {
+                        "index": 1,
+                        "start": 4.0,
+                        "end": 8.0,
+                        "duration": 4.0,
+                        "text": "んんんん",
+                        "raw_text": "んんんん",
+                    },
+                ],
+                "asr_qc": {
+                    "items": [
+                        {
+                            "position": 0,
+                            "chunk_index": 0,
+                            "severity": "reject",
+                            "reasons": ["repeat_ngram_loop"],
+                            "metrics": {
+                                "repetition_repair": {
+                                    "action": "truncate_repetition",
+                                    "reason": "repeat_ngram_loop",
+                                    "unit": "あっ",
+                                    "run": 6,
+                                    "keep_runs": 3,
+                                    "suggested_text": "あっあっあっ",
+                                    "changed": True,
+                                },
+                                "low_information": {
+                                    "level": "not_low_information",
+                                    "action": "preserve",
+                                },
+                            },
+                        },
+                        {
+                            "position": 1,
+                            "chunk_index": 1,
+                            "severity": "ok",
+                            "reasons": [],
+                            "metrics": {
+                                "repetition_repair": {"action": "none", "changed": False},
+                                "low_information": {
+                                    "level": "repeated_nonlexical",
+                                    "action": "preserve_with_review",
+                                },
+                            },
+                        },
+                    ],
+                    "dropped_uncertain_items": [],
+                },
+            },
+            "asr_log": [
+                "chunk 1: Alignment 模式: forced_aligner",
+                "chunk 2: Alignment 模式: forced_aligner",
+            ],
+        },
+    )
+
+    rows, case_summary = diagnose_case(aligned_path=aligned_path, workflow_root=tmp_path)
+    summary = summarize(rows, [case_summary])
+
+    by_chunk = {row["chunk_index"]: row for row in rows}
+    assert by_chunk[0]["failure_bucket"] == "repeat_repair_suggested"
+    assert by_chunk[0]["repetition_suggested_text"] == "あっあっあっ"
+    assert by_chunk[1]["failure_bucket"] == "low_information_text"
+    assert by_chunk[1]["low_information_level"] == "repeated_nonlexical"
+    assert case_summary["failure_bucket_counts"] == {
+        "low_information_text": 1,
+        "repeat_repair_suggested": 1,
+    }
+    assert case_summary["repeat_repair_suggested_count"] == 1
+    assert summary["low_information_counts"] == {
+        "not_low_information": 1,
+        "repeated_nonlexical": 1,
     }

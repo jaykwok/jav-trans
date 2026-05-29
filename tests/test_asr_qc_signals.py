@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from whisper.qc import check_logprob_quality
+from whisper.qc import check_logprob_quality, evaluate_asr_chunk_qc
 
 
 def test_ok_when_all_signals_good():
@@ -140,3 +140,37 @@ def test_partial_none_signals_checked():
     qc = check_logprob_quality(result)
     assert qc["verdict"] == "reject"
     assert "logprob" in qc["reason"]
+
+
+def test_chunk_qc_exports_repetition_repair_suggestion():
+    qc = evaluate_asr_chunk_qc(
+        {"index": 0, "start": 0.0, "end": 6.0, "duration": 6.0},
+        {
+            "text": "あっ、あっ、あっ、あっ、あっ、あっ、あっ、あっ、",
+            "raw_text": "あっ、あっ、あっ、あっ、あっ、あっ、あっ、あっ、",
+            "duration": 6.0,
+        },
+    )
+
+    assert qc["severity"] == "reject"
+    assert "repeat_ngram_loop" in qc["reasons"]
+    repair = qc["metrics"]["repetition_repair"]
+    assert repair["action"] == "truncate_repetition"
+    assert repair["changed"] is True
+    assert repair["run"] >= 4
+    assert len(repair["suggested_text"]) < len(qc["text_preview"])
+
+
+def test_chunk_qc_exports_low_information_profile_without_dropping():
+    qc = evaluate_asr_chunk_qc(
+        {"index": 0, "start": 0.0, "end": 8.0, "duration": 8.0},
+        {
+            "text": "んー",
+            "raw_text": "んー",
+            "duration": 8.0,
+        },
+    )
+
+    assert qc["metrics"]["low_information"]["level"] == "long_sparse"
+    assert qc["metrics"]["low_information"]["action"] == "preserve_with_review"
+    assert qc["ok"] is True

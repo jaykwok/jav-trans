@@ -132,12 +132,16 @@ DEFAULT_SETTINGS: dict[str, str] = {
     "ASR_CHUNK_PACKING_ENABLED": "1",
     # on enables the long-chunk profile by forcing chunk packing and post-alignment F0.
     "ASR_LONG_CHUNK_PROFILE": "on",
-    # Maximum packed ASR chunk duration in seconds.
-    "ASR_CHUNK_PACK_MAX_S": "28.0",
-    # Maximum silence gap between VAD segments that can share one packed chunk.
-    "ASR_CHUNK_PACK_GAP_MERGE_S": "1.5",
-    # Padding, in seconds, added around packed VAD chunks.
-    "ASR_CHUNK_PACK_PADDING_S": "2.0",
+    # Fallback frame duration used by packed ASR chunker when a task has no video FPS.
+    "ASR_CHUNK_PACK_FRAME_HOP_S": "0.033366700033366704",
+    # Forced-aligner feature window, in video/audio frames.
+    "ASR_CHUNK_PACK_WINDOW_FRAMES": "899",
+    # Safety reserve inside the feature window, in frames.
+    "ASR_CHUNK_PACK_RESERVE_FRAMES": "45",
+    # Target dynamic padding around VAD speech, in frames.
+    "ASR_CHUNK_PACK_TARGET_PADDING_FRAMES": "60",
+    # Maximum silence gap between VAD segments that can share one packed chunk, in frames.
+    "ASR_CHUNK_PACK_GAP_MERGE_FRAMES": "45",
     # 1 enables dropping very short low-energy spans before ASR (opt-in).
     "ASR_CHUNK_DROP_ENABLED": "0",
     # Spans shorter than this value (seconds) are candidates for dropping.

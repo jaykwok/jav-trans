@@ -15,7 +15,7 @@ from vad.base import SpeechSegment
 
 log = logging.getLogger(__name__)
 
-_VERSION = 2
+_VERSION = 4
 _AUDIO_SAMPLE_BYTES = 2 * 1024 * 1024
 _AUDIO_KEY_RE = re.compile(r"^[0-9a-fA-F]{8,40}$")
 
@@ -68,9 +68,11 @@ _VAD_ENV_KEYS = (
 )
 _CHUNK_ENV_KEYS = (
     "ASR_CHUNK_PACKING_ENABLED",
-    "ASR_CHUNK_PACK_MAX_S",
-    "ASR_CHUNK_PACK_GAP_MERGE_S",
-    "ASR_CHUNK_PACK_PADDING_S",
+    "ASR_CHUNK_PACK_FRAME_HOP_S",
+    "ASR_CHUNK_PACK_WINDOW_FRAMES",
+    "ASR_CHUNK_PACK_RESERVE_FRAMES",
+    "ASR_CHUNK_PACK_TARGET_PADDING_FRAMES",
+    "ASR_CHUNK_PACK_GAP_MERGE_FRAMES",
     "ASR_CHUNK_DROP_ENABLED",
     "ASR_CHUNK_DROP_MIN_DURATION_S",
     "ASR_CHUNK_DROP_RMS_DBFS",
@@ -308,6 +310,9 @@ def _packed_chunk_to_dict(chunk: PackedChunk) -> dict:
         "start": float(chunk.start),
         "end": float(chunk.end),
         "duration": float(chunk.duration),
+        "left_padding_s": float(chunk.left_padding_s),
+        "right_padding_s": float(chunk.right_padding_s),
+        "split_reason": chunk.split_reason,
         "vad_segments": _segments_to_payload(chunk.vad_segments),
     }
 
@@ -321,6 +326,9 @@ def _packed_chunk_from_dict(item: Any) -> PackedChunk:
         end=float(item["end"]),
         duration=float(item.get("duration", float(item["end"]) - float(item["start"]))),
         vad_segments=segments,
+        left_padding_s=float(item.get("left_padding_s", 0.0)),
+        right_padding_s=float(item.get("right_padding_s", 0.0)),
+        split_reason=str(item.get("split_reason") or "unknown"),
     )
 
 

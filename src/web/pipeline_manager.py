@@ -21,7 +21,7 @@ from pipeline.artifacts import (
     write_translation_artifacts_snapshot,
 )
 from pipeline.aligned_cache import try_load_aligned_segments
-from pipeline.audio import get_audio_cache_key
+from pipeline.audio import get_audio_cache_key, probe_video_fps
 from pipeline.ids import sanitize_job_id
 import main as pipeline_main
 from main import run_asr_alignment_f0, run_translation_and_write
@@ -165,6 +165,7 @@ def _resume_cache_job_id(job: JobState) -> str:
         )
         backend_label, cache_signature = pipeline_main.aligned_cache_expectations_for_ctx(
             cache_ctx,
+            video_fps=probe_video_fps(video_path),
         )
         cached = try_load_aligned_segments(
             str(aligned_path),
