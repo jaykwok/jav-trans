@@ -97,7 +97,8 @@ def test_nonlexical_empty_align_text_is_coarse_not_review():
         align_text_empty=True,
         nonlexical_text=True,
         asr_dropped_uncertain=False,
-        alignment_mode="empty",
+        alignment_mode="nonlexical",
+        fallback_lines=["Alignment VAD 回退语音区间: 1"],
         aligned_segment_count=1,
     )
 

@@ -232,7 +232,8 @@ def test_diagnose_case_separates_punctuation_only_nonlexical_text(tmp_path):
             },
             "asr_log": [
                 "chunk 1: Alignment 词数: 0",
-                "chunk 1: Alignment 模式: empty",
+                "chunk 1: Alignment VAD 回退语音区间: 1",
+                "chunk 1: Alignment 模式: nonlexical",
             ],
         },
     )
@@ -243,6 +244,7 @@ def test_diagnose_case_separates_punctuation_only_nonlexical_text(tmp_path):
     assert rows[0]["align_text_empty"] is True
     assert rows[0]["nonlexical_text"] is True
     assert rows[0]["alignment_quality"] == "nonlexical"
+    assert rows[0]["fallback_type"] == "none"
     assert rows[0]["fallback_subtype"] == "nonlexical_text"
     assert rows[0]["failure_bucket"] == "nonlexical_text"
     assert rows[0]["failure_reasons"] == ["nonlexical_text"]

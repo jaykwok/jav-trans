@@ -132,3 +132,44 @@ def test_qwen_finalize_empty_forced_words_falls_back(monkeypatch):
     assert any("forced aligner returned empty words" in entry for entry in chunk_log)
 
 
+def test_qwen_finalize_nonlexical_text_skips_forced_aligner(monkeypatch):
+    backend = local_backend.LocalAsrBackend("cpu")
+    backend.align_batch_size = 1
+
+    def fail_forced_batch(items, on_stage=None):
+        raise AssertionError("nonlexical text should not call forced aligner")
+
+    def fake_fallback(text, start, end, audio_path=None):
+        return (
+            [{"word": text, "start": 0.0, "end": end}],
+            "even_fallback",
+            {"speech_span_count": 0, "vad_error": ""},
+        )
+
+    monkeypatch.setattr(backend, "_forced_align_words_batch", fail_forced_batch)
+    monkeypatch.setattr(
+        local_backend,
+        "build_word_timestamps_fallback",
+        fake_fallback,
+    )
+
+    prepared = backend.finalize_text_results(
+        [
+            {
+                "text": "...。",
+                "raw_text": "...。",
+                "duration": 1.5,
+                "language": "Japanese",
+                "normalized_path": "missing.wav",
+                "log": [],
+            }
+        ]
+    )
+
+    chunk_result, chunk_log = prepared[0]
+    assert chunk_result["words"] == [{"word": "...。", "start": 0.0, "end": 1.5}]
+    assert chunk_result["alignment_mode"] == "nonlexical"
+    assert any("Alignment 策略: nonlexical_fallback" in entry for entry in chunk_log)
+    assert any("Alignment 非词文本" in entry for entry in chunk_log)
+
+

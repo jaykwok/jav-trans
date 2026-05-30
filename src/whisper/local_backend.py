@@ -841,10 +841,18 @@ class LocalAsrBackend:
         if align_error:
             log.append(f"Alignment 异常: {align_error}")
         if fallback_meta is not None:
+            coarse_label = {
+                "nonlexical": "Alignment 非词粗时间轴语音区间",
+                "align_text_empty": "Alignment align_text 为空粗时间轴语音区间",
+            }.get(alignment_mode, "Alignment VAD 回退语音区间")
+            error_label = {
+                "nonlexical": "Alignment 非词粗时间轴异常",
+                "align_text_empty": "Alignment align_text 为空粗时间轴异常",
+            }.get(alignment_mode, "Alignment VAD 回退异常")
             if fallback_meta.get("speech_span_count", 0):
-                log.append(f"Alignment VAD 回退语音区间: {fallback_meta['speech_span_count']}")
+                log.append(f"{coarse_label}: {fallback_meta['speech_span_count']}")
             elif fallback_meta.get("vad_error"):
-                log.append(f"Alignment VAD 回退异常: {fallback_meta['vad_error']}")
+                log.append(f"{error_label}: {fallback_meta['vad_error']}")
         log.append(f"Alignment 模式: {alignment_mode}")
         return {
             "words": word_dicts,
@@ -976,8 +984,26 @@ class LocalAsrBackend:
         return payloads
 
     def _should_force_align_text(self, master_text: str, raw_master_text: str, log: list[str]) -> bool:
+        prealign = prepare_text_for_alignment(raw_master_text or master_text)
+        if prealign.empty_after_cleaning:
+            compact_display_len = _compact_text_len(prealign.display_text)
+            if compact_display_len <= 0:
+                log.append("Alignment 策略: nonlexical_fallback")
+                log.append("Alignment 非词文本: 跳过 forced aligner，保留显示文本并使用粗时间轴")
+            else:
+                log.append("Alignment 策略: align_text_empty_fallback")
+                log.append("Alignment align_text 为空: 跳过 forced aligner，保留显示文本并使用粗时间轴")
+            return False
         log.append("Alignment 策略: forced_aligner")
         return True
+
+    def _fallback_alignment_mode_for_text(self, master_text: str, raw_master_text: str) -> str:
+        prealign = prepare_text_for_alignment(raw_master_text or master_text)
+        if prealign.empty_after_cleaning and _compact_text_len(prealign.display_text) <= 0:
+            return "nonlexical"
+        if prealign.empty_after_cleaning:
+            return "align_text_empty"
+        return ""
 
     def _build_finalize_output(
         self,
@@ -1063,6 +1089,9 @@ class LocalAsrBackend:
                 duration,
                 audio_path=normalized_path,
             )
+            explicit_mode = self._fallback_alignment_mode_for_text(master_text, raw_master_text)
+            if explicit_mode:
+                alignment_mode = explicit_mode
             word_dicts = normalize_word_dicts(word_dicts)
             finalized[idx] = self._build_finalize_output(
                 word_dicts=word_dicts,

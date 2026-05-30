@@ -43,6 +43,42 @@ def test_gap_larger_than_frame_threshold_starts_new_chunk_and_splits_gap_padding
     ]
 
 
+def _pack_capped(segments, max_core_frames):
+    return pack_vad_segments(
+        segments,
+        frame_hop_s=1.0,
+        window_frames=30,
+        reserve_frames=2,
+        target_padding_frames=4,
+        gap_merge_frames=3,
+        max_core_frames=max_core_frames,
+    )
+
+
+def test_max_core_cap_splits_accumulated_islands_at_mergeable_gap():
+    # gaps (2s) are below gap_merge (3s) so without a cap all three islands merge
+    # into one core=13s chunk; the soft cap forces a split at the island gap.
+    segments = [_seg(0.0, 3.0), _seg(5.0, 8.0), _seg(10.0, 13.0)]
+
+    assert len(_pack_capped(segments, 0)) == 1  # disabled == legacy behaviour
+
+    capped = _pack_capped(segments, 8)
+    assert [(c.vad_segments[0].start, c.vad_segments[-1].end) for c in capped] == [
+        (0.0, 8.0),
+        (10.0, 13.0),
+    ]
+    assert capped[0].split_reason == "soft_cap"
+    assert capped[1].split_reason == "tail"
+
+
+def test_max_core_cap_does_not_split_single_island_without_gap():
+    # A single long VAD segment has no internal gap to split on, so the soft cap
+    # leaves it intact (handled by overlong splitting / left as-is by design).
+    capped = _pack_capped([_seg(2.0, 12.0)], 8)
+    assert len(capped) == 1
+    assert capped[0].vad_segments == [_seg(2.0, 12.0)]
+
+
 def test_near_capacity_segment_reduces_padding_to_fit_window_reserve():
     chunks = _pack([_seg(2.0, 28.0)])
 

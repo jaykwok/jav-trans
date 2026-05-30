@@ -60,6 +60,7 @@ def _chunk_config() -> dict:
         "pack_reserve_frames": _env_int("ASR_CHUNK_PACK_RESERVE_FRAMES", "45"),
         "pack_target_padding_frames": _env_int("ASR_CHUNK_PACK_TARGET_PADDING_FRAMES", "60"),
         "pack_gap_merge_frames": _env_int("ASR_CHUNK_PACK_GAP_MERGE_FRAMES", "45"),
+        "pack_max_core_frames": _env_int("ASR_CHUNK_PACK_MAX_CORE_FRAMES", "0"),
         "drop_enabled": _env_bool("ASR_CHUNK_DROP_ENABLED", "0"),
         "drop_min_duration_s": _env_float("ASR_CHUNK_DROP_MIN_DURATION_S", "0.20"),
         "drop_rms_dbfs": _env_float("ASR_CHUNK_DROP_RMS_DBFS", "-40.0"),
@@ -364,6 +365,7 @@ def _build_processing_spans(
             reserve_frames=cfg["pack_reserve_frames"],
             target_padding_frames=cfg["pack_target_padding_frames"],
             gap_merge_frames=cfg["pack_gap_merge_frames"],
+            max_core_frames=cfg["pack_max_core_frames"],
         )
         event = _vad_chunk_cache_module.save_processing_spans(
             audio_path,

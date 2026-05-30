@@ -200,6 +200,8 @@ synthetic timeline / boundary refiner 计划：
 - 当前 benchmark：v1.11 long-gap 头在 v5 test 上 threshold `0.02` + pad `0.2s` raw recall `0.9910`、precision `0.8124`、F1 `0.8929`；padded recall `0.9934`、missed speech `4.18s`、extra audio ratio `1.3240`。`boundary_manifest.jsonl` 边界评测 test split speech-duration recall `0.9940`、missed speech `3.65s`、extra audio ratio `1.3741`、overlap speech recall `0.9877`；start/end p50 误差约 `0.675s/0.814s`，p90 约 `2.45s/1.88s`。结论：v1.11 比短 gap 版本更适合真实长静音 / BGM / hard-negative 场景，仍作为 high-recall proposal generator，不作为精确切轴最终模型。
 - 真实 held-out 复测：同一 v1.6 real-heldout `79` 条上，v1.5 posw2 + threshold `0.00015` + pad `0.2s` 为 recall `0.9556`、missed speech `17.24s`、extra audio ratio `1.3765`；v1.11 long-gap + threshold `0.02` + pad `0.2s` 为 recall `0.9809`、missed speech `7.42s`、extra audio ratio `1.5021`。结论：v1.11 明显更贴近“宁可多送、不漏人声”的策略，但会多送约 `38.9s` 额外音频，必须继续用 downstream ASR / alignment fallback 判断这部分代价是否可接受。
 - downstream caveat：v1.11 默认 `merge_gap=0` 仍可能输出少量超长 chunk，导致 Qwen ASR 空输出和 forced aligner sentinel 增多。当前已把 downstream chunk packing 改成“固定帧数 + 任务级真实 FPS”：`window_frames=899`、`reserve_frames=45`、`target_padding_frames=60`、`gap_merge_frames=45`，每个视频用 `1/fps` 换算这些帧对应的秒数，只有 FPS 探测失败才回退 29.97。在匿名样片 A 旧 raw VAD segments 上离线重算，processing spans 从旧 split28 的 `255` 降到 `240`，最长 `28.50s`，平均 `25.05s`，最大左右 padding 均约 `2.002s`，split reason 为 `overlong=216`、`capacity=13`、`gap=11`。后续 v1.11 评估必须同时报告 `transcript_chunks`、chunk duration 分布、ASR empty count、`nonlexical_text`、`drop_or_review`、`vad_coarse` fallback、`fallback_subtype` 和 SRT cues，不能只看 VAD recall。
+- R14 Phase 1a GPU 结论：`ASR_CHUNK_PACK_MAX_CORE_FRAMES=419` 在 synthetic64 上跑通 64/64 且全程 CUDA，但**未通过验收**。chunks `137→148`（+8%，可控），forced `77→84`，fallback `60→64`，`vad_coarse_after_sentinel` `25→28`，cue-level `vad_coarse` p90 max-boundary error `4.51s→4.01s` 仍为 `FAIL_PHASE_1_2`。这说明“只在长 gap 处拆超长 chunk”只能改善一部分粗时间轴误差，不能解决 sentinel；sample A 旁证暂缓，避免把失败 lever 带到真实样片长跑。
+- R14 Phase 1b 结论：`nonlexical` / `align_text_empty` 已显式分流，纯省略号/符号保留 display_text 并走粗时间轴，但不再计入真正 `vad_coarse` fallback。清洗后 synthetic64 为 `forced=84`、`nonlexical=32`、true fallback `vad_coarse=28`、`drop_or_review=4`；gate 仍 `FAIL_PHASE_1_2`，剩余瓶颈集中在 `vad_coarse_after_sentinel` 非空文本块。
 - 模型路线：先继续当前 `Qwen3-ASR-0.6B frozen feature + MFCC addition BiLSTM` 高召回线；并行增加一个 frozen SSL baseline，优先 probe `reazon-research/japanese-hubert-base-k2`，其次 `rinna/japanese-hubert-base`，再看 `rinna/japanese-wav2vec2-base`。Grok 检索显示这些是更贴近日语语音表征的候选；旧 XLSR large 日语 ASR fine-tune 不作为主线。
 - 评测顺序：先用 synthetic timeline 测 start/end 误差、recall、extra audio ratio 和 inference cost；再回到 v1.6 真实 held-out 与匿名样片 A 同口径测 downstream ASR / alignment fallback。只有 synthetic 和真实 held-out 都有收益，才考虑替换 FusionVAD-JA feature extractor 或训练 boundary refiner。
 - Forced aligner 路线：Qwen3-ForcedAligner-0.6B 仍是主线。官方模型卡确认其支持日语、最长约 5 分钟、词/字级 timestamp，并与 Qwen3-ASR 配套；但目前没有找到公开 forced-aligner finetune recipe。MFA Japanese 更适合规范文本和词典化发音，不作为当前主线。
@@ -212,17 +214,18 @@ v1.9 ASR / forced alignment 文本策略：
 - 翻译 prompt 的源文序列化同样不再压缩重复发声，也不使用固定拟声词映射表；重复循环只作为 QC / 诊断信号，译文是否概括交给 LLM 在上下文中判断。
 - speaker diarization 不再把假名-only 文本当作 BGM 跳过；只跳过空文本或纯符号/纯标点这类没有语言/数字信号的片段，避免把目标域可字幕化人声排除在 speaker embedding 之外。
 - 重复循环、低置信、文本/音频比例异常、align-text-empty、forced-aligner fallback、ASR dropped uncertain 和人工 hard-negative 结果默认只作为 QC / 诊断 / 样本池信号；`ASR_QC_DROP_UNCERTAIN=0` 是默认值，是否删除交给后续可解释 QC 策略，不再用词表兜底。
-- forced aligner 失败时不伪造精确时间轴。诊断导出已使用 `forced`、`partial`、`vad_coarse`、`proportional`、`drop_or_review` 五类质量标签，并单独记录 `fallback_type=none|vad_coarse|proportional|unknown` 与更细的 `fallback_subtype`；subtype 用于区分 `asr_empty_text`、`align_text_empty`、`text_without_output_segment`、`vad_coarse_after_sentinel`、`proportional_after_align_error`、`word_timing_low_coverage` 等原因。失败样本进入 VAD / ASR / aligner 后处理样本池。
+- forced aligner 失败时不伪造精确时间轴。诊断导出已使用 `forced`、`partial`、`nonlexical`、`vad_coarse`、`proportional`、`drop_or_review` 六类质量标签，并单独记录 `fallback_type=none|vad_coarse|proportional|unknown` 与更细的 `fallback_subtype`；subtype 用于区分 `asr_empty_text`、`align_text_empty`、`nonlexical_text`、`text_without_output_segment`、`vad_coarse_after_sentinel`、`proportional_after_align_error`、`word_timing_low_coverage` 等原因。失败样本进入 VAD / ASR / aligner 后处理样本池。
 - 失败样本池闭环分三步：`diagnose_asr_alignment.py` 生成 `failure_candidates.jsonl`，`export_alignment_failure_manifest.py` 转成人工审计 manifest，`materialize_alignment_failure_audio.py` 再按 `source_audio_path + start/end` 切出 WAV 片段，避免依赖中间 chunk 文件路径。
 - 实现口径：`src/whisper/prealign.py` 负责 `raw_text -> display_text -> align_text` 和 char-span mapping；`src/whisper/local_backend.py` 只把 `align_text` 送入 forced aligner，拿到词级时间后再映射回 `display_text`。
 
 下一步：
 
 1. 保持当前 FusionVAD-JA high-recall operating point，不急着追 precision 或替换正式默认 VAD。
-2. 用 synthetic timeline v5 long-gap 的 `boundary_manifest.jsonl`，作为 VAD / HuBERT-wav2vec baseline / forced-aligner bench 的共同输入。
-3. 等 Qwen3-ASR-1.7B / 0.6B full SFT 后续 checkpoint 稳定后，用同一批 held-out 统计漏对白、多送音频、空输出、hallucination、低置信和 forced-aligner fallback。
-4. 把长 chunk、低信息人声、重复循环、align-text-empty、ASR dropped uncertain 和人工 hard-negative 汇入失败样本池。
-5. 再决定下一版工作重心是 VAD hard-negative、ASR 后处理、forced aligner fallback、boundary refiner，还是补充少量时间轴真值。
+2. R14 下一步转为 Phase 1c：只针对 `vad_coarse_after_sentinel` 的非空文本块做 aligner-local speech-island splitting，优先按 VAD island / 长 gap 在 chunk 内拆给 forced aligner；`nonlexical_text` 和 `align_text_empty` 已显式分流，不再作为主要 fallback 瓶颈。
+3. 用 synthetic timeline v5 long-gap 的 `boundary_manifest.jsonl`，作为 VAD / HuBERT-wav2vec baseline / forced-aligner bench 的共同输入。
+4. 等 Qwen3-ASR-1.7B / 0.6B full SFT 后续 checkpoint 稳定后，用同一批 held-out 统计漏对白、多送音频、空输出、hallucination、低置信和 forced-aligner fallback。
+5. 把长 chunk、低信息人声、重复循环、align-text-empty、ASR dropped uncertain 和人工 hard-negative 汇入失败样本池。
+6. 再决定下一版工作重心是 VAD hard-negative、ASR 后处理、forced aligner fallback、boundary refiner，还是补充少量时间轴真值。
 
 参考来源：FusionVAD arXiv `https://arxiv.org/abs/2506.01365`，Qwen3-ASR `https://github.com/QwenLM/Qwen3-ASR`，Qwen3-ASR finetuning `https://github.com/QwenLM/Qwen3-ASR/tree/main/finetuning`，Qwen3-ASR-0.6B `https://huggingface.co/Qwen/Qwen3-ASR-0.6B`，Qwen3-ASR-1.7B `https://huggingface.co/Qwen/Qwen3-ASR-1.7B`，Qwen3-ForcedAligner-0.6B `https://huggingface.co/Qwen/Qwen3-ForcedAligner-0.6B`，Reazon Japanese HuBERT `https://huggingface.co/reazon-research/japanese-hubert-base-k2`，rinna Japanese HuBERT `https://huggingface.co/rinna/japanese-hubert-base`，rinna Japanese wav2vec2 `https://huggingface.co/rinna/japanese-wav2vec2-base`。
 
@@ -381,11 +384,9 @@ Web 设置行为：
 - 从 Hugging Face 单独下载并模块化评测 `cam++` speaker embedding/聚类能力，确认是否可作为 Whisper/anime 工作流的 speaker sidecar。
 - 评测 `efwkjn/cohere-asr-ja-v0.1`，确认其与当前 ASR 流程及 `transformers` 版本约束的兼容性，再决定是否纳入候选后端。
 - 增加本地/厂商翻译 API 适配层，允许在现有 OpenAI-compatible 翻译之外接入专用翻译服务，例如腾讯 `hy-mt2`。
-- 当前规则下 base / 200k / full checkpoint-15500 的 v1.5 VAD 本地闭环复测已完成；checkpoint-21000 + v1.11 long-gap VAD 也已跑通，但属于不同 VAD 口径。下一步做 v1.11 内部消融：固定 checkpoint-21000，扫 `merge_gap`、chunk packing 和 max chunk 时长，目标是在保持 high recall 的同时降低空输出、`drop_or_review` 和 `vad_coarse` fallback。
-- synthetic timeline v5 long-gap 的 `boundary_manifest.jsonl` benchmark 已接入；v1.11 long-gap FusionVAD-JA 头已训练并作为研究分支当前候选。v1.6 real-heldout 对比显示 v1.11 召回更高但 extra audio ratio 也更高；匿名样片 A downstream 初测显示 v1.11 会产生更少但更长的 VAD chunks，需继续做 chunk 边界/打包策略，而不是只调 ASR。
+- **[→R14]** forced-alignment fallback 层专项：全量 ASR 后端对比确认 `vad_coarse_alignment` 是单一最大失败桶（qwen full SFT 57%、base 49%）。Phase 0 已确认 fallback 显著伤时间轴；Phase 1a 的长 gap 定向切短未通过 GPU gate；Phase 1b 已把 `nonlexical` / `align_text_empty` 从真正 aligner fallback 中拆出，但 `vad_coarse_after_sentinel` 仍未解决。下一步优先做 aligner-local speech-island splitting 或 CTC/secondary aligner 备援，而不是继续盲目扩大 chunk packing。详见 R14 / V09-V11。
 - ASR chunk packing 固定帧数参数暂定为 `899/45/60/45`，每个新视频任务必须重新读取真实 FPS 后换算帧时长；60fps 等高帧率视频会自然得到更短秒级窗口。该策略源自字幕 cue plan 的按帧 gap 口径和 Netflix timed text 的 2-frame gap 思路，但 ASR packing 服务的是 30s 模型窗口保护，不直接复用字幕最终 2-frame gap。
-- 继续优化 pre-align / fallback：保持 `display_text` 与 `align_text` 分离，不恢复具体字样黑名单；`diagnose_asr_alignment.py` 已新增 `fallback_subtype`，下一步按 subtype 统计 forced-aligner 失败主因，再决定是调文本规范化、chunk packing、fallback 分段，还是补人工审计样本。
-- 增加 frozen SSL boundary baseline：优先 `reazon-research/japanese-hubert-base-k2`，其次 `rinna/japanese-hubert-base` / `rinna/japanese-wav2vec2-base`，和当前 Qwen3-ASR-0.6B frozen feature 线比较 recall、start/end error、extra audio ratio、速度和显存。
+- 增加 frozen SSL boundary baseline（R14 Phase 2 候选）：优先 `reazon-research/japanese-hubert-base-k2`，其次 `rinna/japanese-hubert-base` / `rinna/japanese-wav2vec2-base`，和当前 Qwen3-ASR-0.6B frozen feature 线比较；该模型若接入 CTC aligner 则与 VAD frozen feature 复用同一份下载。
 - 轻量 VAD 路线列入二期 backlog：FunASR FSMN / Silero / TEN 只作为 teacher、baseline、hard-negative miner 或最终蒸馏目标，不在当前阶段替换 Qwen3-ASR-0.6B frozen feature。若未来蒸馏，验收指标必须同时守住 recall、missed speech seconds、extra audio ratio、downstream ASR 空输出和 forced-aligner fallback。
 - 扩展失败样本池：当前 ASR/alignment 诊断已按 `failure_bucket` 导出候选，可用 `tools/fusionvad_ja/export_alignment_failure_manifest.py` 转成人工审计 manifest，再用 `tools/fusionvad_ja/materialize_alignment_failure_audio.py` 切出审计 WAV；审计页和稳定入口统一写入 ignored `agents/audits/fusionvad-ja/`，下一步把人工确认 hard-negative、ASR 空输出和 held-out 复测失败样本合并成可训练/可审计数据包。
 - 等 Qwen3-ASR-1.7B / 0.6B full SFT checkpoint 稳定后，用同一批 held-out 复测漏对白、多送音频、空输出、hallucination、低置信和 forced-aligner fallback。
@@ -418,6 +419,7 @@ Web 设置行为：
 | R11 | Fusion-lite 后缀实验 + 匿名样片 A 对比 + 帧率驱动 SRT overlap 归一化 | 匿名样片 A 四模式对比完成；`fusion_lite_boost` 在当时历史四模式里最接近 whisperseg-adaptive；当前已移除，不再作为公开模式；新增逐句 HTML 报告；字幕/fps/主流程定向 73 passed |
 | R12 | 匿名样片 C 四模式双语对比 + frame-based 短尾 cue 合并 | 匿名样片 C 四模式全流程双语输出完成；新增 frame-based overlapping tail merge，修复 `受け` / `受けて` 这类极短 gap 被 F0 gender 抖动切成两条的问题；字幕定向 50 passed |
 | R13 | 全量代码审计修复：Web 设置 `.env` 安全写入、本地打开接口绑定 job 授权、前端动态渲染转义、完成态 artifact 过滤已清理临时文件、pytest 配置清理 | Web 定向 25 passed；全量 440 passed, 5 skipped；前端 JS `node --check` 通过 |
+| R14 | **forced-alignment fallback 层专项（measure-first）**：全量代码/训练审计确认瓶颈已转移到 alignment fallback（`vad_coarse_alignment` ~55%，更好 ASR 无效）。**Phase 0**：`tools/fusionvad_ja/measure_fallback_timing_error.py` 在 synthetic timeline 64 条 test clip 上量化 forced/vad_coarse/proportional 的 per-cue start/end 误差，确认 vad_coarse p90 比 forced 差 >250ms，进入 Phase 1/2。**Phase 1a**：`ASR_CHUNK_PACK_MAX_CORE_FRAMES=419` 按长 gap 定向切短，chunks `137→148`（+8%）但 sentinel 不降，GPU gate 未过。**Phase 1b**：显式区分 `nonlexical` / `align_text_empty`，不可强对齐的纯符号/省略号保留 display_text 并走粗时间轴，但不再污染真正 `vad_coarse` fallback；`vad_coarse_after_sentinel` 仍为 28 个，gate 仍 `FAIL_PHASE_1_2`。**下一步**：不继续盲目加大 chunk packing；优先验证 aligner-local speech-island splitting（只在 sentinel chunk 内按 VAD island/gap 拆给 aligner）或 Phase 2 CTC/secondary aligner 备援。**前端快速修复（已完成）**：worker 上限 `max` 改 `8`，SSE 健康时停轮询，文件路径入队去重逻辑抽取；JS `node --check` 通过。 | Phase 0/1a/1b 产物分别在 `agents/temp/fusionvad-ja/fallback-timing-error*`、`diagnostics-fallback-timing-error-*`；当前 R14 定向回归 48 passed（NVML warning 仅环境） |
 
 ### 关键验证记录
 
@@ -480,6 +482,48 @@ Web 设置行为：
 - Web 任务列表、文件 chip、模型选项等动态文本统一转义或使用 `textContent`，并对进度百分比和下载 URL 做边界处理。
 - Web 完成态 artifact 列表只保留真实存在的文件，避免 `keep_temp_files=false` 清理后继续暴露已删除的临时 JSON。
 - 验证：`tests/web/test_jobs_api.py tests/web/test_cancel_resume.py` 25 passed；全量 pytest 440 passed, 5 skipped；Torch CUDA NVML 初始化 warning 仍为环境 warning。
+
+#### V08 · 前端快速修复（R14 快速修复部分，已完成）
+
+审计发现的三处前端独立问题已直接修复，不依赖 Phase 0/1/2 进展：
+
+- `src/web/static/index.html` `t-translation-max-workers` `max` 从 `32` 改为 `8`，消除用户提交 9–32 被后端 422 拒的静默失败。
+- `src/web/static/js/jobsApi.js::startJobPolling` 增加 SSE 健康判断（`state.sse?.readyState === 1`），SSE 正常时跳过 3s 轮询，仅在 SSE 断连时作为 fallback，消除高频冗余请求。
+- `src/web/static/js/files.js` 4 处重复的路径入队逻辑抽为 `addPathsToState(paths)`（`pickFiles`/`pickFolder`/`__pywebviewDrop`/`drop` handler），行为等价纯重构。
+- 验证：全部 14 个前端 JS 文件 `node --check` 通过。
+
+#### V09 · R14 Phase 0 量化 + 根因定位（gate=进 Phase 1/2）
+
+GPU 真实流水线在 synthetic v5 long-gap test64 上跑通 64/64（FusionVAD-JA `actual_device=cuda`，失败 0），用新工具 `tools/fusionvad_ja/measure_fallback_timing_error.py` 量化 forced vs vad_coarse 的 per-cue 边界误差，结论：
+
+- **gate = 进 Phase 1/2**：vad_coarse 比 forced p90 max-boundary 差 `~2158ms`，远超 250ms 门槛。fallback 确实显著伤时间轴，方向成立。
+- **度量口径 caveat（重要）**：forced 自身 p90 也有 `~2347ms`，但**不是 forced 对齐质量差**。深挖确认：cue 覆盖≥80% island 子集 p90=2347ms ≈ 切碎子集 2505ms（切碎不是主因），真正来源是 synthetic v5 真值边界本身有 ~2s 级模糊（crossfade + speech-label-pad + transition_regions）叠加 VAD 0.2s pad，与 boundary 评测 start/end p90 `2.45s/1.88s` 量级吻合。**故成功判据改为「vad_coarse 向 forced 收敛」，不追绝对 ms**；真实样片 A 旁证（无 synthetic 边界模糊）作为更干净复核。
+- **根因链锁定**：vad_coarse 的 `fallback_subtype` 全部为 `vad_coarse_after_sentinel`（51/51），即 ASR 有文本、forced aligner 吐 sentinel（对齐失败）→ 降级。vad_coarse 的 pred cue 时长 p50 `5.5s`/p90 `11.1s`/max `19.4s`，远超 8s 真值 island；forced 仅 p50 `4.1s`/max `9.8s`。即 **high-recall VAD 把多 speech island + 中间长 gap 打包成 11–19s 超长 chunk → Qwen aligner(NAR) 在长 chunk + 大段非语音上 sentinel**。
+- **杠杆重排（数据驱动）**：(1) `max_new_tokens` **不适用**——Qwen3-ForcedAligner 是 NAR（`logits.argmax`，无 `generate`/`max_new_tokens`），ASR 文本也未被截；该官方杠杆只对 ASR transcribe 有效且已设。(2) **首选：chunk packing 切短**——收紧 max-chunk 时长 / 按长 gap 强制切分，别把多 island 合进 19s 超长 chunk，直击 sentinel；对应原 Backlog "v1.11 内部消融扫 merge_gap/max chunk"。(3) **CTC aligner 备援**（Phase 2，对长 chunk/噪声更鲁棒）。(4) chunk overlap 降级为次要（边界词截断非主因）。
+- 验证：`tests/test_fallback_timing_error.py tests/test_asr_alignment_diagnostics.py tests/test_alignment_quality.py` 9 passed。产物：`agents/temp/fusionvad-ja/fallback-timing-error/summary.md`、GPU 流水线 `agents/temp/fusionvad-ja/fallback-timing-error-phase0-qwen29239-synth64-gpu/`。
+
+#### V10 · R14 Phase 1a chunk packing 长 gap 定向切分（未通过 GPU 闭环）
+
+根因（V09）= high-recall VAD 把多 island + 长 gap 合并成超长 chunk → aligner sentinel。按"最小幅度、只拆跨 gap 超长 chunk"策略实现：
+
+- 新增 env-gated `ASR_CHUNK_PACK_MAX_CORE_FRAMES`（默认 `0`=OFF，不改正式默认）：core 超软上限时在下一个 island gap 处切，`split_reason="soft_cap"`；单 island / 单长 VAD 段（无内部 gap）不动，由现有 overlong 兜底。改动文件：`src/audio/chunk_packer.py`（`FramePackingConfig.max_core_frames` + `max_core_s` + 主循环）、`src/whisper/pipeline.py`（cfg 读取 + 调用）、`src/core/config.py`（默认 0）、`src/whisper/vad_chunk_cache.py`（纳入 cache signature）。
+- **离线重算**（64 case 的 vad-cache 原始 VAD 段，frame_hop=1/29.97）：>14s 超长 chunk 中 21/23 是多段累积（可切，最大内部 gap 0.84–1.5s），仅 2 个单长段。`cap=14s`（419 帧）把 core>14 chunk 从 `13→3`（剩 3 为无 gap 单长段），chunk 数 `137→148`（**+8%**，远低于 +20–30% 上限），core_p90 `13.94→10.83s`，soft_cap 切 11 点；15s/16s 增幅更小（+7%/+4%）。实验起点定 **419 帧**。
+- 单测：`tests/test_chunk_packer.py` +2（soft_cap 在 gap 切 / 单段不切 / `max_core=0` 回归）。回归：chunk_packer + pipeline_chunk_packing + vad_chunk_cache + asr_stage_env_scope + aligned_segments_cache 共 30 passed。
+- **GPU 闭环结论**：开 `ASR_CHUNK_PACK_MAX_CORE_FRAMES=419` 重跑 synthetic64，64/64 完成且 FusionVAD-JA `actual_device=cuda`。chunks `137→148`（+8%）、forced `77→84`，但 fallback `60→64`、`vad_coarse_after_sentinel` `25→28`，cue-level `vad_coarse` p90 max-boundary error 仅 `4.51s→4.01s`，gate 仍 `FAIL_PHASE_1_2`。结论：最小幅度长 gap 切分不足以解决 sentinel；sample A GPU 旁证暂缓，避免把失败 lever 带到真实样片长跑。
+- 新增诊断对比：`tools/fusionvad_ja/compare_alignment_diagnostics.py` 现在输出 `fallback_subtype_counts` 和相对第一组的 delta；Phase 1a 对比产物在 `agents/temp/fusionvad-ja/diagnostics-fallback-timing-error-phase1a-compare/`。
+
+#### V11 · R14 Phase 1b subtype 分流与非词 fallback 显式化
+
+Phase 1a 后不继续盲目加大 chunk packing 幅度，先按 subtype 拆解失败：
+
+- 新增 `tools/fusionvad_ja/analyze_alignment_failure_subtypes.py`：输入 `diagnostics.jsonl`，输出 subtype 路线、时长/文本长度分布、典型样本和建议动作。Phase 1a 分析显示 `nonlexical_text=32`、`vad_coarse_after_sentinel=28`、`align_text_empty=4`、`long_low_information_text=1`。其中 nonlexical 多数是纯省略号/符号，应该走显式非词时间策略；sentinel 才是 aligner 鲁棒性问题，p50/p90/max 时长约 `7.34/11.42/12.90s`。
+- `src/whisper/local_backend.py` 的 Qwen finalize 阶段增加显式分流：`align_text` 为空且 display compact 长度为 0 时，跳过 forced aligner，记录 `Alignment 策略: nonlexical_fallback`，使用粗时间轴但 `alignment_mode="nonlexical"`；`align_text` 为空但 display 仍有语言/数字信号时，记录 `align_text_empty_fallback` 并用 `alignment_mode="align_text_empty"`。这不会删除 ASR 文本，只避免把不可对齐文本污染为 forced aligner 失败。
+- 统计口径同步收口：`src/whisper/alignment_quality.py` 把 `nonlexical` / `align_text_empty` 纳入正常可诊断模式，显式模式即使旧日志里含 `VAD 回退语音区间` 也不再计为 `fallback_type=vad_coarse`；`tools/fusionvad_ja/diagnose_asr_alignment.py` 的 reason 层同样不再把这两类显式模式计入 `alignment_fallback`。`local_backend.py` 后续日志改为 `Alignment 非词粗时间轴语音区间` / `Alignment align_text 为空粗时间轴语音区间`，避免新产物继续污染 fallback ratio。
+- **GPU 闭环**：沿用 Phase 1a 的 `ASR_CHUNK_PACK_MAX_CORE_FRAMES=419`，synthetic64 全部完成。清洗后诊断为 chunks `148`、output segments `180`、`forced=84`、`nonlexical=32`、真正 fallback `vad_coarse=28`（`18.9%`）、`drop_or_review=4`；对比第一组，true fallback `60→28` 是统计口径变干净，不代表 sentinel 消失。`vad_coarse_after_sentinel` 仍 `25→28`，说明真问题未解。
+- **Timing gate 仍失败**：Phase 1b cue-level forced p90 max-boundary `2338.7ms`，`vad_coarse` p90 `4006.6ms`，delta `1667.9ms`，仍 `FAIL_PHASE_1_2`。nonlexical 显式化解决“诊断混淆”，不解决 `Qwen3-ForcedAligner` 对非空文本长块/噪声块 sentinel。
+- 产物：GPU 流水线 `agents/temp/fusionvad-ja/fallback-timing-error-phase1b-nonlexical-maxcore419-qwen29239-synth64-gpu/`；计时 `agents/temp/fusionvad-ja/fallback-timing-error-phase1b-nonlexical-maxcore419/`；诊断 `agents/temp/fusionvad-ja/diagnostics-fallback-timing-error-phase1b-nonlexical-maxcore419/`；三阶段对比 `agents/temp/fusionvad-ja/diagnostics-fallback-timing-error-phase1b-compare/`。
+- 验证：`tests/test_empty_segments_alignment.py tests/test_alignment_quality.py tests/test_asr_alignment_diagnostics.py tests/test_alignment_failure_subtype_analysis.py tests/test_alignment_diagnostics_compare.py tests/test_fallback_timing_error.py tests/test_chunk_packer.py tests/test_pipeline_chunk_packing.py tests/test_vad_chunk_cache.py tests/test_asr_stage_env_scope.py tests/test_aligned_segments_cache.py` 共 48 passed（6 个 NVML warning 为本机环境 warning）。
+- 下一步建议：Phase 1c 只针对 `vad_coarse_after_sentinel` 非空文本块做 aligner-local speech-island splitting；若仍无效，再进 Phase 2 CTC/secondary aligner。`nonlexical_text` 走显式粗时间轴并保留 display_text，`align_text_empty` 进入 prealign/review 小修，不应再作为主要 fallback 瓶颈。
 
 
 ### 历史任务摘要

@@ -14,7 +14,7 @@ AlignmentQuality = Literal[
 FallbackType = Literal["none", "vad_coarse", "proportional", "unknown"]
 
 
-_NORMAL_MODES = {"", "empty", "forced_aligner"}
+_NORMAL_MODES = {"", "empty", "forced_aligner", "nonlexical", "align_text_empty"}
 _VAD_FALLBACK_MARKERS = (
     "aligner_vad_fallback",
     "vad fallback",
@@ -104,6 +104,8 @@ def infer_alignment_fallback_type(
     fallback_lines: list[str] | tuple[str, ...] | None = None,
 ) -> FallbackType:
     mode = (alignment_mode or "").strip()
+    if mode in {"nonlexical", "align_text_empty"}:
+        return "none"
     lines = "\n".join(str(line) for line in (fallback_lines or []))
     haystack = f"{mode}\n{lines}".lower()
 
