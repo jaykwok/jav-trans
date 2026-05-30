@@ -24,10 +24,19 @@ class FramePackingConfig:
     reserve_frames: int = 45
     target_padding_frames: int = 60
     gap_merge_frames: int = 45
+    # Soft cap on packed core duration. 0 = disabled (only the hard chunk_cap
+    # applies). When > 0, accumulation stops at the next inter-island gap once
+    # the proposed core would exceed it, so high-recall VAD does not merge many
+    # speech islands into one aligner-hostile super-chunk. See R14 Phase 1a.
+    max_core_frames: int = 0
 
     @property
     def chunk_cap_s(self) -> float:
         return max(1, self.window_frames - self.reserve_frames) * self.frame_hop_s
+
+    @property
+    def max_core_s(self) -> float:
+        return max(0, self.max_core_frames) * self.frame_hop_s
 
     @property
     def target_padding_s(self) -> float:
@@ -58,6 +67,7 @@ def pack_vad_segments(
     reserve_frames: int = 45,
     target_padding_frames: int = 60,
     gap_merge_frames: int = 45,
+    max_core_frames: int = 0,
 ) -> list[PackedChunk]:
     """Pack VAD speech into frame-derived ASR chunks with dynamic gap-aware padding."""
     config = FramePackingConfig(
@@ -66,6 +76,7 @@ def pack_vad_segments(
         reserve_frames=reserve_frames,
         target_padding_frames=target_padding_frames,
         gap_merge_frames=gap_merge_frames,
+        max_core_frames=max_core_frames,
     )
     _validate_config(config)
 
@@ -83,9 +94,21 @@ def pack_vad_segments(
 
         gap_s = segment.start - current[-1].end
         proposed = [*current, segment]
-        if gap_s <= config.gap_merge_s and _core_duration(proposed) <= config.chunk_cap_s:
+        proposed_core = _core_duration(proposed)
+        within_hard_cap = proposed_core <= config.chunk_cap_s
+        within_soft_cap = config.max_core_s <= 0.0 or proposed_core <= config.max_core_s
+        if gap_s <= config.gap_merge_s and within_hard_cap and within_soft_cap:
             current = proposed
             continue
+
+        if gap_s > config.gap_merge_s:
+            split_reason = "gap"
+        elif not within_hard_cap:
+            split_reason = "capacity"
+        else:
+            # Soft cap tripped at a mergeable gap: split here so multiple speech
+            # islands do not accumulate into one aligner-hostile super-chunk.
+            split_reason = "soft_cap"
 
         next_start = segment.start
         chunks.append(
@@ -94,7 +117,7 @@ def pack_vad_segments(
                 config=config,
                 previous_end=chunks[-1].vad_segments[-1].end if chunks else None,
                 next_start=next_start,
-                split_reason="gap" if gap_s > config.gap_merge_s else "capacity",
+                split_reason=split_reason,
             )
         )
         current = [segment]

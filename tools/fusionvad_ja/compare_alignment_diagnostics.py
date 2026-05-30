@@ -110,6 +110,10 @@ def summarize_diagnostics(label: str, diagnostics_dir: Path) -> dict[str, Any]:
         str(key): int(value or 0)
         for key, value in (summary.get("fallback_type_counts") or {}).items()
     }
+    fallback_subtype_counts = {
+        str(key): int(value or 0)
+        for key, value in (summary.get("fallback_subtype_counts") or {}).items()
+    }
     failure_bucket_counts = {
         str(key): int(value or 0)
         for key, value in (summary.get("failure_bucket_counts") or {}).items()
@@ -118,6 +122,8 @@ def summarize_diagnostics(label: str, diagnostics_dir: Path) -> dict[str, Any]:
         quality_counts = dict(Counter(str(row.get("alignment_quality") or "") for row in diagnostics if row.get("alignment_quality")))
     if diagnostics and not fallback_type_counts:
         fallback_type_counts = dict(Counter(str(row.get("fallback_type") or "") for row in diagnostics if row.get("fallback_type")))
+    if diagnostics and not fallback_subtype_counts:
+        fallback_subtype_counts = dict(Counter(str(row.get("fallback_subtype") or "") for row in diagnostics if row.get("fallback_subtype")))
     if candidates and not failure_bucket_counts:
         failure_bucket_counts = dict(Counter(str(row.get("failure_bucket") or "") for row in candidates if row.get("failure_bucket")))
 
@@ -149,6 +155,7 @@ def summarize_diagnostics(label: str, diagnostics_dir: Path) -> dict[str, Any]:
         "output_segments_per_chunk": round(ratio(output_segment_count, chunk_count), 6),
         "alignment_quality_counts": compact_counts(quality_counts, total=chunk_count),
         "fallback_type_counts": compact_counts(fallback_type_counts, total=chunk_count),
+        "fallback_subtype_counts": compact_counts(fallback_subtype_counts, total=chunk_count),
         "failure_bucket_counts": compact_counts(failure_bucket_counts, total=chunk_count),
         "cases": summary.get("cases") or [],
     }
@@ -156,6 +163,44 @@ def summarize_diagnostics(label: str, diagnostics_dir: Path) -> dict[str, Any]:
 
 def sorted_runs(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return sorted(rows, key=lambda row: str(row.get("label") or ""))
+
+
+def count_at(row: dict[str, Any], group: str, key: str) -> int:
+    payload = (row.get(group) or {}).get(key) or {}
+    return int(payload.get("count") or 0)
+
+
+def build_delta_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    if not rows:
+        return []
+    baseline = rows[0]
+    baseline_chunks = int(baseline.get("chunk_count") or 0)
+    out: list[dict[str, Any]] = []
+    for row in rows[1:]:
+        chunk_count = int(row.get("chunk_count") or 0)
+        out.append(
+            {
+                "label": row["label"],
+                "baseline_label": baseline["label"],
+                "chunk_count_delta": chunk_count - baseline_chunks,
+                "forced_count_delta": int(row.get("forced_count") or 0) - int(baseline.get("forced_count") or 0),
+                "fallback_chunk_count_delta": int(row.get("fallback_chunk_count") or 0)
+                - int(baseline.get("fallback_chunk_count") or 0),
+                "failure_candidate_count_delta": int(row.get("failure_candidate_count") or 0)
+                - int(baseline.get("failure_candidate_count") or 0),
+                "vad_coarse_after_sentinel_delta": count_at(
+                    row,
+                    "fallback_subtype_counts",
+                    "vad_coarse_after_sentinel",
+                )
+                - count_at(baseline, "fallback_subtype_counts", "vad_coarse_after_sentinel"),
+                "nonlexical_text_delta": count_at(row, "fallback_subtype_counts", "nonlexical_text")
+                - count_at(baseline, "fallback_subtype_counts", "nonlexical_text"),
+                "align_text_empty_delta": count_at(row, "fallback_subtype_counts", "align_text_empty")
+                - count_at(baseline, "fallback_subtype_counts", "align_text_empty"),
+            }
+        )
+    return out
 
 
 def build_markdown(rows: list[dict[str, Any]]) -> str:
@@ -185,6 +230,31 @@ def build_markdown(rows: list[dict[str, Any]]) -> str:
                 coarse=row["coarse_alignment_count"],
             )
         )
+    delta_rows = build_delta_rows(rows)
+    if delta_rows:
+        lines.extend(
+            [
+                "",
+                "## Delta vs First Run",
+                "",
+                "| label | chunks | forced | fallback | candidates | sentinel subtype | nonlexical | align-empty |",
+                "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
+            ]
+        )
+        for row in delta_rows:
+            lines.append(
+                "| `{label}` | {chunks:+d} | {forced:+d} | {fallback:+d} | {candidates:+d} | "
+                "{sentinel:+d} | {nonlexical:+d} | {align_empty:+d} |".format(
+                    label=row["label"],
+                    chunks=row["chunk_count_delta"],
+                    forced=row["forced_count_delta"],
+                    fallback=row["fallback_chunk_count_delta"],
+                    candidates=row["failure_candidate_count_delta"],
+                    sentinel=row["vad_coarse_after_sentinel_delta"],
+                    nonlexical=row["nonlexical_text_delta"],
+                    align_empty=row["align_text_empty_delta"],
+                )
+            )
     lines.extend(["", "## Failure Buckets", ""])
     for row in sorted_runs(rows):
         lines.append(f"### {row['label']}")
@@ -196,6 +266,21 @@ def build_markdown(rows: list[dict[str, Any]]) -> str:
             lines.append(
                 "- `{bucket}`: {count} ({ratio:.1%})".format(
                     bucket=bucket,
+                    count=int(payload.get("count") or 0),
+                    ratio=float(payload.get("ratio") or 0.0),
+                )
+            )
+    lines.extend(["", "## Fallback Subtypes", ""])
+    for row in sorted_runs(rows):
+        lines.append(f"### {row['label']}")
+        subtypes = row.get("fallback_subtype_counts") or {}
+        if not subtypes:
+            lines.append("- None")
+            continue
+        for subtype, payload in sorted(subtypes.items(), key=lambda item: (-int(item[1].get("count") or 0), item[0])):
+            lines.append(
+                "- `{subtype}`: {count} ({ratio:.1%})".format(
+                    subtype=subtype,
                     count=int(payload.get("count") or 0),
                     ratio=float(payload.get("ratio") or 0.0),
                 )
@@ -240,6 +325,7 @@ def main(argv: list[str] | None = None) -> int:
         {
             "run_count": len(rows),
             "runs": sorted_runs(rows),
+            "delta_vs_first": build_delta_rows(rows),
             "rows_jsonl": project_rel(rows_path),
             "summary_md": project_rel(markdown_path),
         },

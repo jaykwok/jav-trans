@@ -32,6 +32,7 @@ def test_summarize_diagnostics_builds_checkpoint_row(tmp_path):
             "failure_candidate_count": 2,
             "alignment_quality_counts": {"forced": 2, "vad_coarse": 1, "drop_or_review": 1},
             "fallback_type_counts": {"none": 3, "vad_coarse": 1},
+            "fallback_subtype_counts": {"none": 2, "vad_coarse_after_sentinel": 1, "align_text_empty": 1},
             "failure_bucket_counts": {"vad_coarse_alignment": 1, "align_text_empty": 1},
         },
     )
@@ -52,14 +53,29 @@ def test_summarize_diagnostics_builds_checkpoint_row(tmp_path):
     assert row["failure_candidate_ratio"] == 0.5
     assert row["coarse_alignment_count"] == 1
     assert row["drop_or_review_count"] == 1
+    assert row["fallback_subtype_counts"]["vad_coarse_after_sentinel"] == {"count": 1, "ratio": 0.25}
     assert row["failure_bucket_counts"]["align_text_empty"] == {"count": 1, "ratio": 0.25}
 
 
 def test_compare_alignment_diagnostics_cli_writes_summary(tmp_path):
     first = tmp_path / "first"
     second = tmp_path / "second"
-    _write_json(first / "summary.json", {"chunk_count": 2, "alignment_quality_counts": {"forced": 2}})
-    _write_json(second / "summary.json", {"chunk_count": 2, "alignment_quality_counts": {"drop_or_review": 1, "forced": 1}})
+    _write_json(
+        first / "summary.json",
+        {
+            "chunk_count": 2,
+            "alignment_quality_counts": {"forced": 2},
+            "fallback_subtype_counts": {"none": 2},
+        },
+    )
+    _write_json(
+        second / "summary.json",
+        {
+            "chunk_count": 2,
+            "alignment_quality_counts": {"drop_or_review": 1, "forced": 1},
+            "fallback_subtype_counts": {"none": 1, "vad_coarse_after_sentinel": 1},
+        },
+    )
     output_dir = tmp_path / "out"
 
     assert main(
@@ -82,6 +98,9 @@ def test_compare_alignment_diagnostics_cli_writes_summary(tmp_path):
     markdown = (output_dir / "checkpoint_comparison.md").read_text(encoding="utf-8")
 
     assert summary["run_count"] == 2
+    assert summary["delta_vs_first"][0]["vad_coarse_after_sentinel_delta"] == 1
     assert {row["label"] for row in rows} == {"base", "full15000"}
     assert "| `base` |" in markdown
     assert "| `full15000` |" in markdown
+    assert "## Delta vs First Run" in markdown
+    assert "## Fallback Subtypes" in markdown

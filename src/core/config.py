@@ -142,6 +142,10 @@ DEFAULT_SETTINGS: dict[str, str] = {
     "ASR_CHUNK_PACK_TARGET_PADDING_FRAMES": "60",
     # Maximum silence gap between VAD segments that can share one packed chunk, in frames.
     "ASR_CHUNK_PACK_GAP_MERGE_FRAMES": "45",
+    # Soft cap on packed core duration, in frames. 0 = disabled. When > 0, island
+    # accumulation stops at the next gap once core would exceed it, so high-recall VAD
+    # does not merge many islands into one aligner-hostile super-chunk (R14 Phase 1a).
+    "ASR_CHUNK_PACK_MAX_CORE_FRAMES": "0",
     # 1 enables dropping very short low-energy spans before ASR (opt-in).
     "ASR_CHUNK_DROP_ENABLED": "0",
     # Spans shorter than this value (seconds) are candidates for dropping.

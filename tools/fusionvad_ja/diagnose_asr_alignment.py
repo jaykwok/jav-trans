@@ -301,11 +301,16 @@ def chunk_failure_reasons(
         reasons.append("align_text_empty")
     if text.strip() and prealign_empty and nonlexical_text:
         reasons.append("nonlexical_text")
-    if alignment_mode and alignment_mode not in {"forced_aligner", "empty"}:
+    if alignment_mode and alignment_mode not in {
+        "forced_aligner",
+        "empty",
+        "nonlexical",
+        "align_text_empty",
+    }:
         reasons.append(f"alignment_mode_{alignment_mode}")
     if align_error:
         reasons.append("alignment_error")
-    if fallback_lines:
+    if fallback_lines and alignment_mode not in {"nonlexical", "align_text_empty"}:
         reasons.append("alignment_fallback")
     if sentinel_lines:
         reasons.append("alignment_sentinel")
