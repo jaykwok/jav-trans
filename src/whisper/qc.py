@@ -26,6 +26,10 @@ def asr_qc_enabled() -> bool:
     return _env_bool("ASR_QC_ENABLED", True)
 
 
+def asr_qc_drop_uncertain_enabled() -> bool:
+    return _env_bool("ASR_QC_DROP_UNCERTAIN", False)
+
+
 ASR_QC_ENABLED = asr_qc_enabled()
 ASR_QC_REPETITION_THRESHOLD = max(
     1,
@@ -43,6 +47,10 @@ _LOW_INFO_MAX_CHARS = max(0, int(os.getenv("ASR_QC_LOW_INFO_MAX_CHARS", "5")))
 _EMPTY_DURATION_S = float(os.getenv("ASR_QC_EMPTY_DURATION", "1.0"))
 _LONG_LOW_VALUE_DURATION_S = float(
     os.getenv("ASR_QC_LONG_LOW_VALUE_DURATION", "6.0")
+)
+_REPETITION_TRUNCATE_KEEP_RUNS = max(
+    1,
+    int(os.getenv("ASR_QC_REPETITION_TRUNCATE_KEEP_RUNS", "3")),
 )
 _DIALOGUE_MARKER_RE = re.compile(
     r"[\u3040-\u30ff\u3400-\u9fff]|[!?！？。…「」『』、]"
@@ -218,7 +226,7 @@ def check_logprob_quality(result: dict) -> dict:
             "logprob_threshold": logprob_threshold,
             "compression_threshold": compression_threshold,
             "nospeech_threshold": nospeech_threshold,
-            "drop_uncertain_enabled": True,
+            "drop_uncertain_enabled": asr_qc_drop_uncertain_enabled(),
             "precision_policy": "adaptive",
             "adaptive": adaptive,
         },
@@ -290,6 +298,11 @@ def _preview(text: str, limit: int = 80) -> str:
     return normalized[: limit - 3] + "..."
 
 
+def _collapse_repeated_noise(text: str) -> str:
+    cleaned = re.sub(r"[ \t]+", " ", (text or "").strip())
+    return cleaned.strip()
+
+
 def _find_max_repeat(compact: str) -> dict:
     if not compact:
         return {
@@ -337,6 +350,133 @@ def _find_max_repeat(compact: str) -> dict:
             i += max(1, repeated_chars if run > 1 else 1)
 
     return best
+
+
+def _find_repeated_span(text: str) -> dict:
+    compact_to_text: list[int] = []
+    compact_chars: list[str] = []
+    for index, char in enumerate(text or ""):
+        if _COMPACT_RE.fullmatch(char):
+            continue
+        compact_to_text.append(index)
+        compact_chars.append(char)
+
+    compact = "".join(compact_chars)
+    repeat = _find_max_repeat(compact)
+    unit = str(repeat.get("unit") or "")
+    run = int(repeat.get("run") or 0)
+    if not unit or run <= 1:
+        return {
+            "unit": "",
+            "run": 0,
+            "compact_start": 0,
+            "compact_end": 0,
+            "text_start": 0,
+            "text_end": 0,
+        }
+
+    best_start = compact.find(unit * run)
+    if best_start < 0:
+        return {
+            "unit": unit,
+            "run": run,
+            "compact_start": 0,
+            "compact_end": 0,
+            "text_start": 0,
+            "text_end": 0,
+        }
+    compact_end = best_start + len(unit) * run
+    text_start = compact_to_text[best_start] if best_start < len(compact_to_text) else 0
+    text_end_index = compact_end - 1
+    text_end = (
+        compact_to_text[text_end_index] + 1
+        if 0 <= text_end_index < len(compact_to_text)
+        else len(text or "")
+    )
+    return {
+        "unit": unit,
+        "run": run,
+        "compact_start": best_start,
+        "compact_end": compact_end,
+        "text_start": text_start,
+        "text_end": text_end,
+    }
+
+
+def _repetition_repair_suggestion(text: str, repeat: dict) -> dict:
+    unit = str(repeat.get("unit") or "")
+    run = int(repeat.get("run") or 0)
+    unit_len = int(repeat.get("unit_len") or 0)
+    ratio = float(repeat.get("ratio") or 0.0)
+    repeated_loop = (
+        unit
+        and run >= _REPEAT_MIN_RUN
+        and ratio >= _REPEAT_MIN_RATIO
+        and (unit_len > 1 or run >= _REPEAT_MIN_RUN * 2)
+    )
+    if not repeated_loop:
+        return {
+            "action": "none",
+            "reason": "",
+            "unit": unit,
+            "run": run,
+            "keep_runs": 0,
+            "suggested_text": text or "",
+            "changed": False,
+        }
+
+    keep_runs = min(run, _REPETITION_TRUNCATE_KEEP_RUNS)
+    span = _find_repeated_span(text or "")
+    start = int(span.get("text_start") or 0)
+    end = int(span.get("text_end") or 0)
+    if end <= start:
+        suggested = text or ""
+    else:
+        suggested = (text or "")[:start] + unit * keep_runs + (text or "")[end:]
+        suggested = re.sub(r"\s+", " ", suggested).strip()
+    return {
+        "action": "truncate_repetition",
+        "reason": "repeat_ngram_loop",
+        "unit": unit,
+        "run": run,
+        "keep_runs": keep_runs,
+        "text_start": start,
+        "text_end": end,
+        "suggested_text": suggested,
+        "changed": suggested != (text or ""),
+    }
+
+
+def _low_information_profile(text: str, *, duration_s: float) -> dict:
+    normalized = _collapse_repeated_noise(text)
+    compact = _strip_punctuation(normalized)
+    unique_chars = len(set(compact))
+    kana_chars = sum(1 for char in compact if "\u3040" <= char <= "\u30ff")
+    has_kanji = any("\u3400" <= char <= "\u9fff" for char in compact)
+    has_latin = any("A" <= char <= "Z" or "a" <= char <= "z" for char in compact)
+    if not compact:
+        level = "empty"
+    elif has_latin:
+        level = "not_low_information"
+    elif duration_s >= _LOW_INFO_DURATION_S and len(compact) <= _LOW_INFO_MAX_CHARS:
+        level = "long_sparse"
+    elif len(compact) <= 2:
+        level = "short_nonlexical"
+    elif unique_chars <= 2 and len(compact) >= 4 and not has_kanji:
+        level = "repeated_nonlexical"
+    elif kana_chars == len(compact) and len(compact) <= 5 and not has_kanji:
+        level = "short_kana"
+    else:
+        level = "not_low_information"
+    return {
+        "level": level,
+        "compact_chars": len(compact),
+        "unique_chars": unique_chars,
+        "duration_s": round(duration_s, 3),
+        "has_kanji": has_kanji,
+        "has_latin": has_latin,
+        "action": "preserve_with_review" if level != "not_low_information" else "preserve",
+    }
 
 
 def _duration_for(chunk: dict, text_result: dict) -> float:
@@ -456,6 +596,8 @@ def evaluate_asr_chunk_qc(
     repeat_run = int(repeat["run"])
     repeat_ratio = float(repeat["ratio"])
     repeat_unit_len = int(repeat["unit_len"])
+    repetition_repair = _repetition_repair_suggestion(text, repeat)
+    low_information = _low_information_profile(text, duration_s=duration)
     repeated_loop = (
         repeat_run >= _REPEAT_MIN_RUN
         and repeat_ratio >= _REPEAT_MIN_RATIO
@@ -518,6 +660,8 @@ def evaluate_asr_chunk_qc(
             "context_leak": context_leak,
             "mojibake": mojibake,
             "max_repeat": repeat,
+            "repetition_repair": repetition_repair,
+            "low_information": low_information,
             "signal_quality": signal_qc,
             "generation": asr_generation if isinstance(asr_generation, dict) else {},
         },
@@ -542,7 +686,7 @@ def evaluate_asr_text_results_qc(
         "repetition_check": "on",
         "repetition_threshold": ASR_QC_REPETITION_THRESHOLD,
         "precision_policy": "adaptive",
-        "drop_uncertain_enabled": True,
+        "drop_uncertain_enabled": asr_qc_drop_uncertain_enabled(),
     }
 
     if not asr_qc_enabled():
@@ -705,6 +849,10 @@ def apply_adaptive_precision_filter(
 ) -> tuple[list[dict], dict, list[str]]:
     if not asr_qc_enabled():
         return text_results, qc_report, []
+    if not asr_qc_drop_uncertain_enabled():
+        updated_report = dict(qc_report)
+        updated_report["drop_uncertain_enabled"] = False
+        return text_results, updated_report, []
 
     items = list(qc_report.get("items") or [])
     if not items:

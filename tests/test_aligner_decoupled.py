@@ -5,6 +5,7 @@ from types import SimpleNamespace
 from whisper.local_backend import (
     align_text_to_words,
     looks_like_word_timing_failure,
+    word_timing_failure_reasons,
 )
 
 
@@ -43,5 +44,9 @@ def test_sentinel_coverage():
     words = [{"word": "あ", "start": 0.0, "end": 0.2} for _ in range(5)]
 
     assert looks_like_word_timing_failure(words, scene_duration_sec=10.0) is True
+    assert "word_timing_low_coverage" in word_timing_failure_reasons(
+        words,
+        scene_duration_sec=10.0,
+    )
 
 

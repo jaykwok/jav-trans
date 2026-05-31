@@ -11,9 +11,15 @@ from pathlib import Path
 from typing import Callable
 
 from utils.model_paths import resolve_model_spec
+from whisper.prealign import (
+    clean_text_for_aligner,
+    normalize_display_text,
+    prepare_text_for_alignment,
+    strip_alignment_punctuation,
+)
 from whisper.timestamp_fallback import build_word_timestamps_fallback
 
-ASR_MODEL_ID = os.getenv("ASR_MODEL_ID", "Qwen/Qwen3-ASR-1.7B")
+ASR_MODEL_ID = os.getenv("ASR_MODEL_ID", "jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame")
 ALIGNER_MODEL_ID = os.getenv("ALIGNER_MODEL_ID", "Qwen/Qwen3-ForcedAligner-0.6B")
 ASR_MODEL_PATH = os.getenv("ASR_MODEL_PATH", "").strip()
 ALIGNER_MODEL_PATH = os.getenv("ALIGNER_MODEL_PATH", "").strip()
@@ -63,13 +69,6 @@ _ASR_SUBPROCESS_KILL_GRACE_S = float(os.getenv("ASR_SUBPROCESS_KILL_GRACE_S", "5
 _ASR_SUBPROCESS_READY_TIMEOUT_S = float(
     os.getenv("ASR_SUBPROCESS_READY_TIMEOUT_S", "600")
 )
-_REPEATED_PHRASE_RE = re.compile(r"([ぁ-ゖァ-ヺ一-龯]{1,8})(?:[、。！？…\s]*\1){2,}")
-_STRIP_PUNCT_RE = re.compile(r"[。！？…、,.!?・「」『』（）()【】\[\]\s~〜ー-]+")
-_ALIGNER_DECORATION_RE = re.compile(r"[♡♥❤💕💖💗💘♪♫♬★☆※]+")
-_ALIGNER_LAUGH_RE = re.compile(r"[wWｗＷ]+")
-_ALIGNER_PUNCT_RE = re.compile(r"[。！？…、,.!?・「」『』（）()【】\[\]~〜～]+")
-_ALIGNER_KANA_REPEAT_RE = re.compile(r"([ぁ-ゖァ-ヺ])\1{2,}")
-_ALIGNER_LONG_VOWEL_RE = re.compile(r"([ーｰ])\1+")
 
 
 def _resolve_timestamp_mode() -> str:
@@ -153,37 +152,7 @@ def _detect_attention(device: str) -> str:
 
 
 def _clean_master_text(text: str) -> str:
-    cleaned = (text or "").replace("\r", " ").replace("\n", " ").strip()
-    cleaned = re.sub(r"[ \t]+", " ", cleaned)
-    cleaned = re.sub(r"(.)\1{4,}", r"\1\1", cleaned)
-
-    for _ in range(2):
-        updated = _REPEATED_PHRASE_RE.sub(r"\1、\1", cleaned)
-        if updated == cleaned:
-            break
-        cleaned = updated
-
-    return cleaned.strip()
-
-
-def clean_text_for_aligner(text: str) -> str:
-    cleaned = (text or "").replace("\r", " ").replace("\n", " ").strip()
-    cleaned = re.sub(r"[ \t]+", " ", cleaned)
-    if not cleaned:
-        return ""
-
-    cleaned = _ALIGNER_DECORATION_RE.sub("", cleaned)
-    cleaned = _ALIGNER_LAUGH_RE.sub("", cleaned)
-    cleaned = _ALIGNER_PUNCT_RE.sub("", cleaned)
-    cleaned = _ALIGNER_KANA_REPEAT_RE.sub(r"\1\1", cleaned)
-    cleaned = _ALIGNER_LONG_VOWEL_RE.sub(r"\1", cleaned)
-    cleaned = re.sub(r"[ \t]+", " ", cleaned).strip()
-
-    if not _strip_punctuation(
-        _ALIGNER_DECORATION_RE.sub("", _ALIGNER_LAUGH_RE.sub("", cleaned))
-    ):
-        return ""
-    return cleaned
+    return normalize_display_text(text)
 
 
 def restore_timestamps_to_original(
@@ -199,6 +168,54 @@ def restore_timestamps_to_original(
         cleaned = cleaned_text.strip()
         if not original or not cleaned:
             return word_dicts
+
+        prealign = prepare_text_for_alignment(original)
+        if prealign.align_text == cleaned and prealign.align_to_display_spans:
+            restored: list[dict] = []
+            cursor = 0
+            spans = prealign.align_to_display_spans
+            display_text = prealign.display_text
+            mapped_items: list[tuple[dict, int, int]] = []
+            for word in word_dicts:
+                token = str(word.get("word", ""))
+                if not token:
+                    mapped_items.append((dict(word), 0, 0))
+                    continue
+
+                clean_start = cleaned.find(token, cursor)
+                if clean_start < 0:
+                    clean_start = min(cursor, len(cleaned))
+                clean_end = min(len(cleaned), max(clean_start + 1, clean_start + len(token)))
+                cursor = clean_end
+
+                covered = [
+                    span
+                    for span in spans
+                    if span.align_start < clean_end and span.align_end > clean_start
+                ]
+                restored_word = dict(word)
+                if covered:
+                    display_start = min(span.display_start for span in covered)
+                    display_end = max(span.display_end for span in covered)
+                    mapped_items.append((restored_word, display_start, display_end))
+                else:
+                    mapped_items.append((restored_word, 0, 0))
+            valid_indices = [i for i, (_word, start, end) in enumerate(mapped_items) if end > start]
+            for ordinal, (word, display_start, display_end) in enumerate(mapped_items):
+                if display_end <= display_start:
+                    word["word"] = str(word.get("word", ""))
+                    restored.append(word)
+                    continue
+                if valid_indices and ordinal == valid_indices[0]:
+                    display_start = 0
+                next_valid = next((i for i in valid_indices if i > ordinal), None)
+                if next_valid is not None:
+                    display_end = mapped_items[next_valid][1]
+                elif valid_indices and ordinal == valid_indices[-1]:
+                    display_end = len(display_text)
+                word["word"] = display_text[display_start:display_end] or str(word.get("word", ""))
+                restored.append(word)
+            return restored
 
         ratio = len(original) / max(1, len(cleaned))
         restored: list[dict] = []
@@ -227,14 +244,52 @@ def restore_timestamps_to_original(
 
 
 def _strip_punctuation(text: str) -> str:
-    return _STRIP_PUNCT_RE.sub("", text or "")
+    return strip_alignment_punctuation(text)
 
 
 def _compact_text_len(text: str) -> int:
     return len(_strip_punctuation(text))
 
 
+def _first_token_id(value) -> int | None:
+    if isinstance(value, int):
+        return value
+    if isinstance(value, (list, tuple)):
+        for item in value:
+            token_id = _first_token_id(item)
+            if token_id is not None:
+                return token_id
+    return None
+
+
+def _iter_generation_configs(model) -> list:
+    configs = []
+    for candidate in (
+        model,
+        getattr(model, "model", None),
+        getattr(getattr(model, "model", None), "thinker", None),
+    ):
+        generation_config = getattr(candidate, "generation_config", None)
+        if generation_config is not None and generation_config not in configs:
+            configs.append(generation_config)
+    return configs
+
+
+def _normalize_deterministic_generation_config(model) -> None:
+    for generation_config in _iter_generation_configs(model):
+        if getattr(generation_config, "temperature", None) not in {None, 1.0}:
+            generation_config.temperature = None
+
+        if getattr(generation_config, "pad_token_id", None) is None:
+            eos_token_id = _first_token_id(
+                getattr(generation_config, "eos_token_id", None)
+            )
+            if eos_token_id is not None:
+                generation_config.pad_token_id = eos_token_id
+
+
 def _apply_generation_safety(model) -> None:
+    _normalize_deterministic_generation_config(model)
     if ASR_REPETITION_PENALTY <= 1.0:
         return
     try:
@@ -417,10 +472,33 @@ def looks_like_word_timing_failure(
     max_coverage_ratio: float = _ALIGNMENT_MAX_COVERAGE_RATIO,
     max_cps: float = _ALIGNMENT_MAX_CPS,
 ) -> bool:
+    return bool(
+        word_timing_failure_reasons(
+            words,
+            min_span_ms=min_span_ms,
+            max_zero_ratio=max_zero_ratio,
+            max_repeat_ratio=max_repeat_ratio,
+            scene_duration_sec=scene_duration_sec,
+            max_coverage_ratio=max_coverage_ratio,
+            max_cps=max_cps,
+        )
+    )
+
+
+def word_timing_failure_reasons(
+    words: list[dict],
+    *,
+    min_span_ms: float = ASR_NATIVE_MIN_SPAN_MS,
+    max_zero_ratio: float = ASR_NATIVE_MAX_ZERO_RATIO,
+    max_repeat_ratio: float = ASR_NATIVE_MAX_REPEAT_RATIO,
+    scene_duration_sec: float | None = None,
+    max_coverage_ratio: float = _ALIGNMENT_MAX_COVERAGE_RATIO,
+    max_cps: float = _ALIGNMENT_MAX_CPS,
+) -> list[str]:
     if not words:
-        return False
+        return []
     if len(words) < 2 and scene_duration_sec is None:
-        return False
+        return []
 
     tiny_span_count = 0
     zero_or_negative_count = 0
@@ -448,22 +526,23 @@ def looks_like_word_timing_failure(
             prev_word = token
 
     total = len(words)
-    if (
-        tiny_span_count / total >= max_zero_ratio
-        or zero_or_negative_count / total >= max_zero_ratio
-        or repeated_count / max(1, total - 1) >= max_repeat_ratio
-    ):
-        return True
+    reasons: list[str] = []
+    if tiny_span_count / total >= max_zero_ratio:
+        reasons.append("word_timing_tiny_span_heavy")
+    if zero_or_negative_count / total >= max_zero_ratio:
+        reasons.append("word_timing_zero_heavy")
+    if repeated_count / max(1, total - 1) >= max_repeat_ratio:
+        reasons.append("word_timing_repeat_heavy")
 
     if scene_duration_sec is not None and scene_duration_sec > 0:
         word_span = max(0.0, max_end - min_start)
         if word_span > 0:
             if word_span / scene_duration_sec < max_coverage_ratio:
-                return True
+                reasons.append("word_timing_low_coverage")
             if char_count > 0 and char_count / word_span > max_cps:
-                return True
+                reasons.append("word_timing_high_cps")
 
-    return False
+    return reasons
 
 
 def _native_timestamp_issue(words: list[dict], text: str) -> str:
@@ -599,6 +678,7 @@ class LocalAsrBackend:
         if self.attention and self.attention != "sdpa":
             model_kwargs["attn_implementation"] = self.attention
         self.forced_aligner = Qwen3ForcedAligner.from_pretrained(aligner_spec, **model_kwargs)
+        _normalize_deterministic_generation_config(self.forced_aligner)
         return self.forced_aligner
 
     def unload_model(self, on_stage: Callable[[str], None] | None = None) -> None:
@@ -800,10 +880,18 @@ class LocalAsrBackend:
         if align_error:
             log.append(f"Alignment 异常: {align_error}")
         if fallback_meta is not None:
+            coarse_label = {
+                "nonlexical": "Alignment 非词粗时间轴语音区间",
+                "align_text_empty": "Alignment align_text 为空粗时间轴语音区间",
+            }.get(alignment_mode, "Alignment VAD 回退语音区间")
+            error_label = {
+                "nonlexical": "Alignment 非词粗时间轴异常",
+                "align_text_empty": "Alignment align_text 为空粗时间轴异常",
+            }.get(alignment_mode, "Alignment VAD 回退异常")
             if fallback_meta.get("speech_span_count", 0):
-                log.append(f"Alignment VAD 回退语音区间: {fallback_meta['speech_span_count']}")
+                log.append(f"{coarse_label}: {fallback_meta['speech_span_count']}")
             elif fallback_meta.get("vad_error"):
-                log.append(f"Alignment VAD 回退异常: {fallback_meta['vad_error']}")
+                log.append(f"{error_label}: {fallback_meta['vad_error']}")
         log.append(f"Alignment 模式: {alignment_mode}")
         return {
             "words": word_dicts,
@@ -935,8 +1023,26 @@ class LocalAsrBackend:
         return payloads
 
     def _should_force_align_text(self, master_text: str, raw_master_text: str, log: list[str]) -> bool:
+        prealign = prepare_text_for_alignment(raw_master_text or master_text)
+        if prealign.empty_after_cleaning:
+            compact_display_len = _compact_text_len(prealign.display_text)
+            if compact_display_len <= 0:
+                log.append("Alignment 策略: nonlexical_fallback")
+                log.append("Alignment 非词文本: 跳过 forced aligner，保留显示文本并使用粗时间轴")
+            else:
+                log.append("Alignment 策略: align_text_empty_fallback")
+                log.append("Alignment align_text 为空: 跳过 forced aligner，保留显示文本并使用粗时间轴")
+            return False
         log.append("Alignment 策略: forced_aligner")
         return True
+
+    def _fallback_alignment_mode_for_text(self, master_text: str, raw_master_text: str) -> str:
+        prealign = prepare_text_for_alignment(raw_master_text or master_text)
+        if prealign.empty_after_cleaning and _compact_text_len(prealign.display_text) <= 0:
+            return "nonlexical"
+        if prealign.empty_after_cleaning:
+            return "align_text_empty"
+        return ""
 
     def _build_finalize_output(
         self,
@@ -1022,6 +1128,9 @@ class LocalAsrBackend:
                 duration,
                 audio_path=normalized_path,
             )
+            explicit_mode = self._fallback_alignment_mode_for_text(master_text, raw_master_text)
+            if explicit_mode:
+                alignment_mode = explicit_mode
             word_dicts = normalize_word_dicts(word_dicts)
             finalized[idx] = self._build_finalize_output(
                 word_dicts=word_dicts,

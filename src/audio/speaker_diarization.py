@@ -2,6 +2,7 @@ import os
 import gc
 import logging
 import re
+import unicodedata
 import numpy as np
 import torch
 import torchaudio
@@ -12,7 +13,18 @@ from collections import Counter, defaultdict
 from utils.model_paths import MODELS_ROOT, model_dir_name
 
 logger = logging.getLogger(__name__)
-_SPEAKER_BGM_RE = re.compile(r"^[ぁ-ゟ\s、。！？…ー～「」『』・\(\)（）]+$")
+_SPEAKER_TEXTLESS_RE = re.compile(r"^[\s\"'`“”‘’「」『』（）()\[\]［］【】〈〉《》<>、。！？…・~〜～\-—–]+$")
+
+
+def _has_language_or_number_signal(text: str) -> bool:
+    return any(unicodedata.category(char)[0] in {"L", "N"} for char in text)
+
+
+def _is_textless_for_speaker_embedding(text: str) -> bool:
+    compact = str(text or "").strip().replace("\u200b", "").replace("\ufeff", "")
+    if not compact:
+        return True
+    return bool(_SPEAKER_TEXTLESS_RE.fullmatch(compact)) or not _has_language_or_number_signal(compact)
 
 
 def _env_val(key: str, default):
@@ -84,8 +96,8 @@ def diarize_segments(
             if dur < _min_dur:
                 skipped[i] = "short"
                 continue
-            if ja_text and _SPEAKER_BGM_RE.fullmatch(ja_text):
-                skipped[i] = "bgm"
+            if _is_textless_for_speaker_embedding(ja_text):
+                skipped[i] = "textless"
                 continue
 
             start_s = int(seg.get("start", 0.0) * sr)
@@ -173,7 +185,7 @@ def diarize_segments(
 def build_speakers_report(segments: list[dict]) -> dict:
     """Build speakers.json summary from diarized segments."""
     speaker_stats: dict[str, dict] = defaultdict(lambda: {"n_segments": 0, "total_duration_s": 0.0})
-    bgm_count = 0
+    textless_count = 0
     other_short = 0
 
     for s in segments:
@@ -181,8 +193,8 @@ def build_speakers_report(segments: list[dict]) -> dict:
         dur = s.get("end", 0.0) - s.get("start", 0.0)
         if spk is None:
             ja = (s.get("text") or s.get("ja") or "").strip()
-            if ja and _SPEAKER_BGM_RE.fullmatch(ja):
-                bgm_count += 1
+            if _is_textless_for_speaker_embedding(ja):
+                textless_count += 1
             else:
                 other_short += 1
         else:
@@ -201,6 +213,5 @@ def build_speakers_report(segments: list[dict]) -> dict:
             "may cause same-speaker fragmentation into multiple S* labels"
         ),
         "speakers": dict(speaker_stats),
-        "unassigned": {"bgm": bgm_count, "other_short": other_short},
+        "unassigned": {"textless": textless_count, "other_short": other_short},
     }
-

@@ -5,6 +5,15 @@ import { fileList, btnAddFolder, btnSubmit, dropZone } from './dom.js';
 import { fetchAllJobs } from './jobsApi.js';
 import { readTranslationSettingsFromForm, syncSettingsFromFormForSubmit } from './settings.js';
 
+function addPathsToState(paths) {
+  for (const p of paths) {
+    const name = p.split(/[\\/]/).pop();
+    if (!state.files.find(x => x.path === p))
+      state.files.push({ type: 'path', name, size: -1, path: p });
+  }
+  renderFiles();
+}
+
 function renderFiles() {
   fileList.innerHTML = '';
   state.files.forEach((f, i) => {
@@ -29,12 +38,7 @@ async function pickFiles() {
     const r = await fetch('/api/pick-files', { method: 'POST' });
     if (!r.ok) { alert('文件选择失败：' + await r.text()); return; }
     const { paths } = await r.json();
-    for (const p of paths) {
-      const name = p.split(/[\\/]/).pop();
-      if (!state.files.find(x => x.path === p))
-        state.files.push({ type: 'path', name, size: -1, path: p });
-    }
-    renderFiles();
+    addPathsToState(paths);
   } catch (e) {
     alert('文件选择出错：' + e.message);
   }
@@ -46,12 +50,7 @@ async function pickFolder() {
     if (!r.ok) { alert('文件夹选择失败：' + await r.text()); return; }
     const { paths } = await r.json();
     if (!paths.length) return;
-    for (const p of paths) {
-      const name = p.split(/[\\/]/).pop();
-      if (!state.files.find(x => x.path === p))
-        state.files.push({ type: 'path', name, size: -1, path: p });
-    }
-    renderFiles();
+    addPathsToState(paths);
   } catch (e) {
     alert('文件夹选择出错：' + e.message);
   }
@@ -66,12 +65,7 @@ export function installFiles() {
   btnAddFolder.addEventListener('click', pickFolder);
 
   window.__pywebviewDrop = function(paths) {
-    for (const p of paths) {
-      const name = p.split(/[\\/]/).pop();
-      if (!state.files.find(x => x.path === p))
-        state.files.push({ type: 'path', name, size: -1, path: p });
-    }
-    renderFiles();
+    addPathsToState(paths);
   };
 
   dropZone.addEventListener('click', pickFiles);
@@ -83,12 +77,7 @@ export function installFiles() {
     const droppedFiles = Array.from(e.dataTransfer.files || []);
     const paths = droppedFiles.map(f => f.pywebviewFullPath || f.path).filter(Boolean);
     if (paths.length) {
-      for (const p of paths) {
-        const name = p.split(/[\\/]/).pop();
-        if (!state.files.find(x => x.path === p))
-          state.files.push({ type: 'path', name, size: -1, path: p });
-      }
-      renderFiles();
+      addPathsToState(paths);
     } else if (!droppedFiles.length) {
       pickFiles();
     }

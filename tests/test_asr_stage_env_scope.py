@@ -22,6 +22,7 @@ def test_asr_stage_env_scope_reaches_cache_and_transcribe(monkeypatch, tmp_path)
     monkeypatch.setenv("ASR_BACKEND", "anime-whisper")
     monkeypatch.setenv("ASR_CONTEXT", "process actor")
     monkeypatch.setattr(main.torch.cuda, "is_available", lambda: False)
+    monkeypatch.setattr(pipeline_audio, "probe_video_fps", lambda _path: 60.0)
 
     seen = {}
 
@@ -29,6 +30,7 @@ def test_asr_stage_env_scope_reaches_cache_and_transcribe(monkeypatch, tmp_path)
         seen["backend_label_env"] = {
             "ASR_BACKEND": main.os.environ.get("ASR_BACKEND"),
             "ASR_CONTEXT": main.os.environ.get("ASR_CONTEXT"),
+            "ASR_CHUNK_PACK_FRAME_HOP_S": main.os.environ.get("ASR_CHUNK_PACK_FRAME_HOP_S"),
         }
         return f"backend:{main.os.environ['ASR_BACKEND']}"
 
@@ -43,6 +45,7 @@ def test_asr_stage_env_scope_reaches_cache_and_transcribe(monkeypatch, tmp_path)
         seen["cache_env"] = {
             "ASR_BACKEND": main.os.environ.get("ASR_BACKEND"),
             "ASR_CONTEXT": main.os.environ.get("ASR_CONTEXT"),
+            "ASR_CHUNK_PACK_FRAME_HOP_S": main.os.environ.get("ASR_CHUNK_PACK_FRAME_HOP_S"),
         }
         return None
 
@@ -54,6 +57,7 @@ def test_asr_stage_env_scope_reaches_cache_and_transcribe(monkeypatch, tmp_path)
         seen["transcribe_env"] = {
             "ASR_BACKEND": main.os.environ.get("ASR_BACKEND"),
             "ASR_CONTEXT": main.os.environ.get("ASR_CONTEXT"),
+            "ASR_CHUNK_PACK_FRAME_HOP_S": main.os.environ.get("ASR_CHUNK_PACK_FRAME_HOP_S"),
         }
         assert include_details is True
         return (
@@ -80,12 +84,17 @@ def test_asr_stage_env_scope_reaches_cache_and_transcribe(monkeypatch, tmp_path)
     expected_env = {
         "ASR_BACKEND": "qwen3-asr-1.7b",
         "ASR_CONTEXT": "task actor",
+        "ASR_CHUNK_PACK_FRAME_HOP_S": "0.0166666666667",
     }
     assert seen["backend_label_env"] == expected_env
     assert seen["cache_env"] == expected_env
     assert seen["transcribe_env"] == expected_env
     assert seen["cache_backend"] == "backend:qwen3-asr-1.7b"
     assert seen["cache_signature"]["backend_label"] == "backend:qwen3-asr-1.7b"
+    assert (
+        seen["cache_signature"]["asr_stage_config"]["ASR_CHUNK_PACK_FRAME_HOP_S"]
+        == "0.0166666666667"
+    )
     assert artifacts.backend_label == "backend:qwen3-asr-1.7b"
     assert main.os.environ["ASR_BACKEND"] == "anime-whisper"
     assert main.os.environ["ASR_CONTEXT"] == "process actor"

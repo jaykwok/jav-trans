@@ -54,10 +54,7 @@ def _notify(on_stage: Callable[[str], None] | None, message: str) -> None:
 
 
 def _post_clean_whisper_text(text: str) -> str:
-    cleaned = re.sub(r"\([^)]{1,10}\)", "", str(text or ""))
-    cleaned = re.sub(r"【[^】]+?】", "", cleaned)
-    cleaned = re.sub(r"(.)\1{6,}", lambda match: match.group(1) * 6, cleaned)
-    return cleaned.strip()
+    return str(text or "").strip()
 
 
 def _env_int(name: str, default: int) -> int:

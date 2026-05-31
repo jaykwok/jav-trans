@@ -27,6 +27,29 @@ def _cache_signature(ctx) -> dict:
     return main.aligned_cache_expectations_for_ctx(ctx, backend_label="mock_asr")[1]
 
 
+def test_aligned_cache_signature_uses_task_video_fps(monkeypatch, tmp_path):
+    video_path = tmp_path / "clip.mp4"
+    video_path.write_bytes(b"fake-video")
+    ctx = make_job_context(
+        video_path,
+        tmp_path / "out",
+        tmp_path / "jobs",
+        skip_translation=True,
+        keep_temp_files=True,
+    )
+    _configure(monkeypatch)
+    monkeypatch.setattr(pipeline_audio, "probe_video_fps", lambda _path: 25.0)
+
+    expected = main.aligned_cache_expectations_for_ctx(
+        ctx,
+        backend_label="mock_asr",
+        video_fps=pipeline_audio.probe_video_fps(str(video_path)),
+    )[1]
+
+    assert expected["asr_stage_config"]["ASR_CHUNK_PACK_FRAME_HOP_S"] == "0.04"
+    assert expected["subtitle"]["timeline_mode"] == "alignment"
+
+
 def test_aligned_segments_written_with_audio_cache_key(monkeypatch, tmp_path):
     video_path = tmp_path / "clip.mp4"
     video_path.write_bytes(b"fake-video")
