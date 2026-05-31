@@ -46,6 +46,7 @@ def test_restore_timestamps_to_original_keeps_dirty_original_text():
     assert all(item["word"] for item in restored)
     assert restored[0]["start"] == 0.0
     assert restored[-1]["end"] == 1.2
+    assert "".join(item["word"] for item in restored) == original
 
 
 def test_forced_align_words_sends_cleaned_text_and_restores(monkeypatch):
@@ -64,5 +65,19 @@ def test_forced_align_words_sends_cleaned_text_and_restores(monkeypatch):
     assert mode == "forced_aligner"
     assert aligner.texts == ["あっっ気持ちいい"]
     assert "".join(item["word"] for item in words) == "あっっっ♡www気持ちいい~"
+
+
+def test_restore_timestamps_to_original_uses_mapping_for_repeated_phrases():
+    original = "いやいやいやいやいや"
+    cleaned = clean_text_for_aligner(original)
+
+    restored = restore_timestamps_to_original(
+        original,
+        cleaned,
+        [{"word": cleaned, "start": 0.0, "end": 1.0}],
+    )
+
+    assert cleaned == "いやいや"
+    assert restored == [{"word": original, "start": 0.0, "end": 1.0}]
 
 

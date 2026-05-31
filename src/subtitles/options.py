@@ -35,6 +35,9 @@ class SubtitleOptions:
     merge_adjacent: bool = True
     show_speaker: bool = False
     video_fps: float = FALLBACK_VIDEO_FPS
+    timing_polish_enabled: bool = True
+    short_gap_collapse_s: float = 0.5
+    linger_s: float = 0.45
 
     @property
     def effective_video_fps(self) -> float:
@@ -95,6 +98,12 @@ class SubtitleOptions:
             line_max_chars=max(0, int(os.getenv("SRT_LINE_MAX_CHARS", "25"))),
             merge_adjacent=_env_bool("SUBTITLE_MERGE_ADJACENT", True),
             show_speaker=_env_bool("SUBTITLE_SHOW_SPEAKER", False),
+            timing_polish_enabled=_env_bool("SUBTITLE_TIMING_POLISH_ENABLED", True),
+            short_gap_collapse_s=max(
+                0.0,
+                float(os.getenv("SUBTITLE_SHORT_GAP_COLLAPSE_S", "0.5")),
+            ),
+            linger_s=max(0.0, float(os.getenv("SUBTITLE_LINGER_S", "0.45"))),
         )
 
     def signature(self) -> dict:

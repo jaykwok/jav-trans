@@ -63,7 +63,7 @@ def test_f0_filter_skips_when_f0_detection_failed(monkeypatch):
     assert count == 0
 
 
-def test_asr_noise_filter_removes_empty_quote_only_and_latin_hallucinations():
+def test_asr_noise_filter_removes_only_empty_and_symbol_segments():
     segments = [
         _seg("", None),
         _seg('""', None),
@@ -72,10 +72,9 @@ def test_asr_noise_filter_removes_empty_quote_only_and_latin_hallucinations():
         _seg("◆◆◆", None),
         _seg("♪♪♪", None),
         _seg("！？！？", None),
-        _seg("..Alright", None),
+        _seg("ja-0", None),
         _seg("Andthen?", None),
         _seg('"Iwantyou"', None),
-        _seg("ja-0", None),
         _seg("「はい」", "F"),
         _seg("あっ", "F"),
         _seg("えっ！？", "F"),
@@ -85,9 +84,11 @@ def test_asr_noise_filter_removes_empty_quote_only_and_latin_hallucinations():
 
     filtered, count = filter_asr_noise_segments(segments)
 
-    assert count == 10
+    assert count == 7
     assert [segment["text"] for segment in filtered] == [
         "ja-0",
+        "Andthen?",
+        '"Iwantyou"',
         "「はい」",
         "あっ",
         "えっ！？",

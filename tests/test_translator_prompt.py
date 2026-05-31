@@ -1,8 +1,8 @@
 import json
 
 from llm import translator
-def test_prompt_version_is_v27():
-    assert translator.PROMPT_VERSION == "v2.7"
+def test_prompt_version_is_v28():
+    assert translator.PROMPT_VERSION == "v2.8"
 
 
 def test_system_prompt_no_male_prefix_example():
@@ -85,6 +85,11 @@ def test_serialize_segments_omits_prefix_for_none_gender():
     ja = _serialized_ja({"start": 0.0, "end": 1.0, "text": "いい", "gender": None})
     assert not ja.startswith("[M]")
     assert not ja.startswith("[F]")
+
+
+def test_serialize_segments_preserves_repeated_vocalizations():
+    ja = _serialized_ja({"start": 0.0, "end": 1.0, "text": "ああああああ", "gender": None})
+    assert ja == "ああああああ"
 
 
 def test_normalize_translation_text_strips_gender_tags():

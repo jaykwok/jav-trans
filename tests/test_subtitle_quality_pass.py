@@ -105,6 +105,75 @@ def test_prepare_srt_blocks_final_normalize_guards_reading_window_overlap(monkey
     assert prepared[0]["end"] + options.frame_gap_s <= prepared[1]["start"]
 
 
+def test_timing_polish_collapses_short_gap_to_two_frames():
+    blocks = [
+        {"start": 0.0, "end": 1.0, "ja_text": "あ", "zh_text": "甲"},
+        {"start": 1.2, "end": 2.0, "ja_text": "い", "zh_text": "乙"},
+    ]
+    options = SubtitleOptions(
+        video_fps=25.0,
+        merge_adjacent=False,
+        timing_polish_enabled=True,
+        short_gap_collapse_s=0.5,
+        linger_s=0.45,
+    )
+
+    prepared = subtitle.prepare_srt_blocks(blocks, options=options, mode="bilingual")
+
+    assert prepared[0]["end"] == pytest.approx(1.12)
+    assert prepared[0]["end"] + options.frame_gap_s <= prepared[1]["start"]
+
+
+def test_timing_polish_preserves_natural_pause():
+    blocks = [
+        {"start": 0.0, "end": 1.0, "ja_text": "あ", "zh_text": "甲"},
+        {"start": 1.8, "end": 2.5, "ja_text": "い", "zh_text": "乙"},
+    ]
+    options = SubtitleOptions(
+        video_fps=25.0,
+        merge_adjacent=False,
+        timing_polish_enabled=True,
+        short_gap_collapse_s=0.5,
+        linger_s=0.45,
+    )
+
+    prepared = subtitle.prepare_srt_blocks(blocks, options=options, mode="bilingual")
+
+    assert prepared[0]["end"] == pytest.approx(1.3)
+    assert prepared[1]["start"] - prepared[0]["end"] == pytest.approx(0.5)
+
+
+def test_timing_polish_disabled_keeps_existing_alignment_end():
+    blocks = [
+        {"start": 0.0, "end": 1.0, "ja_text": "あ", "zh_text": "甲"},
+        {"start": 1.2, "end": 2.0, "ja_text": "い", "zh_text": "乙"},
+    ]
+    options = SubtitleOptions(
+        video_fps=25.0,
+        merge_adjacent=False,
+        timing_polish_enabled=False,
+        short_gap_collapse_s=0.5,
+        linger_s=0.45,
+    )
+
+    prepared = subtitle.prepare_srt_blocks(blocks, options=options, mode="bilingual")
+
+    assert prepared[0]["end"] == pytest.approx(1.0)
+
+
+def test_timing_polish_respects_max_duration():
+    blocks = [{"start": 0.0, "end": 6.4, "ja_text": "あ", "zh_text": "甲"}]
+    options = SubtitleOptions(
+        max_duration=6.5,
+        timing_polish_enabled=True,
+        linger_s=0.45,
+    )
+
+    prepared = subtitle.prepare_srt_blocks(blocks, options=options, mode="bilingual")
+
+    assert prepared[0]["end"] == pytest.approx(6.5)
+
+
 def test_prepare_srt_blocks_merges_same_speaker_overlap_when_too_tight():
     blocks = [
         {

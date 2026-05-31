@@ -70,7 +70,30 @@ def _cuda_provider_usable(ort: Any) -> bool:
 
 def _preload_onnx_cuda_runtime(ort: Any) -> None:
     preload = getattr(ort, "preload_dlls", None)
-    if callable(preload):
+    if not callable(preload):
+        return
+    explicit_dirs = [
+        value
+        for value in os.getenv("ORT_CUDA_PRELOAD_DIRS", "").split(os.pathsep)
+        if value.strip()
+    ]
+    if not explicit_dirs:
+        project_root = Path(__file__).resolve().parents[3]
+        site_packages = project_root / ".venv" / "lib" / "python3.14" / "site-packages"
+        explicit_dirs = [
+            str(site_packages / "nvidia" / "cu13" / "lib"),
+            str(site_packages / "nvidia" / "cudnn" / "lib"),
+        ]
+    preloaded = False
+    for directory in explicit_dirs:
+        path = Path(directory).expanduser()
+        if not path.exists():
+            continue
+        path_text = str(path.resolve())
+        preload(cuda=True, cudnn=False, msvc=False, directory=path_text)
+        preload(cuda=False, cudnn=True, msvc=False, directory=path_text)
+        preloaded = True
+    if not preloaded:
         preload(cuda=True, cudnn=True, msvc=False, directory="")
 
 

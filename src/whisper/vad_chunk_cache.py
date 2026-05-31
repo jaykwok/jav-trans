@@ -15,7 +15,7 @@ from vad.base import SpeechSegment
 
 log = logging.getLogger(__name__)
 
-_VERSION = 2
+_VERSION = 5
 _AUDIO_SAMPLE_BYTES = 2 * 1024 * 1024
 _AUDIO_KEY_RE = re.compile(r"^[0-9a-fA-F]{8,40}$")
 
@@ -65,12 +65,44 @@ _VAD_ENV_KEYS = (
     "SEGMENT_TARGET_CHUNK",
     "SEGMENT_MIN_SPEECH",
     "SEGMENT_PAD",
+    "FUSIONVAD_JA_EXPORT_FRAME_SCORES",
+    "FUSIONVAD_JA_CHECKPOINT",
+    "FUSIONVAD_JA_THRESHOLD",
+    "FUSIONVAD_JA_PAD_S",
+    "FUSIONVAD_JA_PTM",
+    "FUSIONVAD_JA_MODEL_PATH",
+    "FUSIONVAD_JA_DEVICE",
+    "FUSIONVAD_JA_DTYPE",
+    "FUSIONVAD_JA_ATTENTION",
+    "FUSIONVAD_JA_WINDOW_S",
+    "FUSIONVAD_JA_OVERLAP_S",
+    "FUSIONVAD_JA_MIN_SEGMENT_S",
+    "FUSIONVAD_JA_MERGE_GAP_S",
+    "FUSIONVAD_JA_MAX_GROUP_S",
+    "FUSIONVAD_JA_CHUNK_THRESHOLD_S",
+    "FUSIONVAD_JA_CUT_THRESHOLD",
+    "FUSIONVAD_JA_APPLY_CUT_TO_SPEECH",
 )
 _CHUNK_ENV_KEYS = (
     "ASR_CHUNK_PACKING_ENABLED",
-    "ASR_CHUNK_PACK_MAX_S",
-    "ASR_CHUNK_PACK_GAP_MERGE_S",
-    "ASR_CHUNK_PACK_PADDING_S",
+    "ASR_CHUNK_PACK_FRAME_HOP_S",
+    "ASR_CHUNK_PACK_WINDOW_FRAMES",
+    "ASR_CHUNK_PACK_RESERVE_FRAMES",
+    "ASR_CHUNK_PACK_TARGET_PADDING_FRAMES",
+    "ASR_CHUNK_PACK_GAP_MERGE_FRAMES",
+    "ASR_CHUNK_PACK_MAX_CORE_FRAMES",
+    "ASR_PRE_ASR_ISLAND_SPLIT_ENABLED",
+    "ASR_PRE_ASR_ISLAND_SPLIT_MIN_CORE_FRAMES",
+    "ASR_PRE_ASR_ISLAND_SPLIT_MIN_GAP_FRAMES",
+    "ASR_PRE_ASR_ISLAND_SPLIT_MIN_ISLAND_FRAMES",
+    "ASR_PRE_ASR_ISLAND_SPLIT_MAX_CHILDREN",
+    "ASR_PRE_ASR_VALLEY_SPLIT_ENABLED",
+    "ASR_PRE_ASR_VALLEY_SPLIT_MIN_CORE_FRAMES",
+    "ASR_PRE_ASR_VALLEY_SPLIT_TARGET_CORE_FRAMES",
+    "ASR_PRE_ASR_VALLEY_SPLIT_MIN_VALLEY_FRAMES",
+    "ASR_PRE_ASR_VALLEY_SPLIT_MIN_CHILD_FRAMES",
+    "ASR_PRE_ASR_VALLEY_SPLIT_MAX_CHILDREN",
+    "ASR_PRE_ASR_VALLEY_SPLIT_THRESHOLD",
     "ASR_CHUNK_DROP_ENABLED",
     "ASR_CHUNK_DROP_MIN_DURATION_S",
     "ASR_CHUNK_DROP_RMS_DBFS",
@@ -308,6 +340,21 @@ def _packed_chunk_to_dict(chunk: PackedChunk) -> dict:
         "start": float(chunk.start),
         "end": float(chunk.end),
         "duration": float(chunk.duration),
+        "left_padding_s": float(chunk.left_padding_s),
+        "right_padding_s": float(chunk.right_padding_s),
+        "split_reason": chunk.split_reason,
+        "parent_chunk_id": chunk.parent_chunk_id,
+        "island_id": chunk.island_id,
+        "island_count": chunk.island_count,
+        "core_start": chunk.core_start,
+        "core_end": chunk.core_end,
+        "internal_gap_count": int(chunk.internal_gap_count),
+        "internal_gap_max_s": float(chunk.internal_gap_max_s),
+        "split_policy": chunk.split_policy,
+        "valley_split_count": int(chunk.valley_split_count),
+        "valley_score_min": (
+            None if chunk.valley_score_min is None else float(chunk.valley_score_min)
+        ),
         "vad_segments": _segments_to_payload(chunk.vad_segments),
     }
 
@@ -321,6 +368,29 @@ def _packed_chunk_from_dict(item: Any) -> PackedChunk:
         end=float(item["end"]),
         duration=float(item.get("duration", float(item["end"]) - float(item["start"]))),
         vad_segments=segments,
+        left_padding_s=float(item.get("left_padding_s", 0.0)),
+        right_padding_s=float(item.get("right_padding_s", 0.0)),
+        split_reason=str(item.get("split_reason") or "unknown"),
+        parent_chunk_id=(
+            None
+            if item.get("parent_chunk_id") is None
+            else int(item.get("parent_chunk_id"))
+        ),
+        island_id=None if item.get("island_id") is None else int(item.get("island_id")),
+        island_count=(
+            None if item.get("island_count") is None else int(item.get("island_count"))
+        ),
+        core_start=None if item.get("core_start") is None else float(item.get("core_start")),
+        core_end=None if item.get("core_end") is None else float(item.get("core_end")),
+        internal_gap_count=int(item.get("internal_gap_count") or 0),
+        internal_gap_max_s=float(item.get("internal_gap_max_s") or 0.0),
+        split_policy=str(item.get("split_policy") or ""),
+        valley_split_count=int(item.get("valley_split_count") or 0),
+        valley_score_min=(
+            None
+            if item.get("valley_score_min") is None
+            else float(item.get("valley_score_min"))
+        ),
     )
 
 

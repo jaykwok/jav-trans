@@ -39,3 +39,20 @@ def test_postprocess_keeps_same_chunk_fragments_mergeable():
     postprocessed = asr._postprocess_segments(segments)
 
     assert [segment["text"] for segment in postprocessed] == ["本日はありがとうございます。"]
+
+
+def test_postprocess_keeps_short_domain_vocalizations():
+    segments = [
+        {"start": 0.0, "end": 0.4, "text": "はぁ", "source_chunk_index": 1},
+        {"start": 0.5, "end": 0.9, "text": "うん", "source_chunk_index": 1},
+        {"start": 1.0, "end": 1.4, "text": "気持ち", "source_chunk_index": 1},
+        {"start": 1.5, "end": 1.9, "text": "好き", "source_chunk_index": 1},
+        {"start": 2.0, "end": 2.4, "text": "たたたた", "source_chunk_index": 1},
+        {"start": 2.0, "end": 2.4, "text": "。！？", "source_chunk_index": 1},
+    ]
+
+    postprocessed = asr._postprocess_segments(segments)
+
+    assert [segment["text"] for segment in postprocessed] == [
+        "はぁうん気持ち好きたたたた",
+    ]

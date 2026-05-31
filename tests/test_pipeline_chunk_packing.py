@@ -211,9 +211,11 @@ class _LowLogprobBackend(_RecordingBackend):
 
 def _reload_pipeline(monkeypatch, tmp_path: Path, *, packing_enabled: str):
     monkeypatch.setenv("ASR_CHUNK_PACKING_ENABLED", packing_enabled)
-    monkeypatch.setenv("ASR_CHUNK_PACK_MAX_S", "28.0")
-    monkeypatch.setenv("ASR_CHUNK_PACK_GAP_MERGE_S", "1.5")
-    monkeypatch.setenv("ASR_CHUNK_PACK_PADDING_S", "0.0")
+    monkeypatch.setenv("ASR_CHUNK_PACK_FRAME_HOP_S", str(1.0 / 29.97))
+    monkeypatch.setenv("ASR_CHUNK_PACK_WINDOW_FRAMES", "899")
+    monkeypatch.setenv("ASR_CHUNK_PACK_RESERVE_FRAMES", "45")
+    monkeypatch.setenv("ASR_CHUNK_PACK_TARGET_PADDING_FRAMES", "0")
+    monkeypatch.setenv("ASR_CHUNK_PACK_GAP_MERGE_FRAMES", "45")
     monkeypatch.setenv("ASR_CHUNK_ROOT", str(tmp_path / "chunks"))
     monkeypatch.setenv("VAD_MERGE_SHORT_MAX_S", "0")
     monkeypatch.setenv("VAD_MERGE_GAP_MAX_S", "0")
@@ -352,6 +354,7 @@ def test_alignment_fallback_count_deduplicates_chunk_log_markers():
 
 def test_adaptive_precision_drops_low_logprob_before_alignment(monkeypatch, tmp_path):
     monkeypatch.setenv("ASR_QC_ADAPTIVE_BASE_LOGPROB", "-1.0")
+    monkeypatch.setenv("ASR_QC_DROP_UNCERTAIN", "1")
     backend, segments, log, details = _run_transcription_with_backend(
         monkeypatch,
         tmp_path,
