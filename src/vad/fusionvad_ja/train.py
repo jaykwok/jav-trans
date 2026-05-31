@@ -4,7 +4,7 @@ import json
 import math
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any, Iterable, Mapping
+from typing import Any, Iterable, Mapping, Sequence
 
 import numpy as np
 
@@ -13,7 +13,7 @@ from vad.fusionvad_ja.dataset import LabelRecord
 from vad.fusionvad_ja.dataset import effective_frame_weights
 from vad.fusionvad_ja.features import load_cached_feature
 from vad.fusionvad_ja.manifest import TrainingExample
-from vad.fusionvad_ja.model import AdditionFusionBiLSTM, count_trainable_parameters
+from vad.fusionvad_ja.model import AdditionFusionBiLSTM, AdditionFusionEndpointBiLSTM, count_trainable_parameters
 
 
 @dataclass(frozen=True)
@@ -65,6 +65,33 @@ class FeatureTrainConfig:
     batch_size: int = 1
     init_checkpoint: str | None = None
     positive_loss_weight: float = 1.0
+    boundary_loss_weight: float = 0.0
+    gap_loss_weight: float = 0.0
+
+
+@dataclass(frozen=True)
+class EndpointRefinerTrainConfig:
+    max_steps: int = 20
+    learning_rate: float = 1e-3
+    seed: int = 13
+    device: str = "cpu"
+    fusion_dim: int = 256
+    hidden_dim: int = 192
+    layers: int = 2
+    dropout: float = 0.1
+    max_trainable_parameters: int = 2_000_000
+    log_interval_steps: int = 0
+    batch_size: int = 1
+    positive_loss_weight: float = 1.0
+    speech_loss_weight: float = 1.0
+    boundary_loss_weight: float = 0.5
+    internal_gap_loss_weight: float = 0.5
+    cut_loss_weight: float = 0.5
+    start_positive_loss_weight: float = 1.0
+    end_positive_loss_weight: float = 1.0
+    cut_positive_loss_weight: float = 1.0
+    boundary_radius_frames: int = 1
+    cut_min_gap_s: float = 0.5
 
 
 def train_tiny_frame_classifier(
@@ -353,6 +380,10 @@ def train_addition_fusion_classifier(
         )
     if config.positive_loss_weight <= 0.0:
         raise ValueError("positive_loss_weight must be positive")
+    if config.boundary_loss_weight < 0.0:
+        raise ValueError("boundary_loss_weight must be non-negative")
+    if config.gap_loss_weight < 0.0:
+        raise ValueError("gap_loss_weight must be non-negative")
     device = torch.device(config.device)
     model = model.to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=config.learning_rate)
@@ -387,7 +418,23 @@ def train_addition_fusion_classifier(
             np.stack([_frame_mask(item[2].shape[0], max_frames) for item in batch_windows])
         ).to(device) * weight_tensor
         logits = model(whisper_tensor, mfcc_tensor)
-        loss = (criterion(logits, label_tensor) * mask_tensor).sum() / mask_tensor.sum().clamp_min(1.0)
+        frame_loss = (criterion(logits, label_tensor) * mask_tensor).sum() / mask_tensor.sum().clamp_min(1.0)
+        probability = torch.sigmoid(logits)
+        boundary_loss = boundary_transition_loss(
+            probability,
+            label_tensor,
+            mask_tensor,
+        )
+        gap_loss = internal_gap_probability_loss(
+            probability,
+            label_tensor,
+            mask_tensor,
+        )
+        loss = (
+            frame_loss
+            + float(config.boundary_loss_weight) * boundary_loss
+            + float(config.gap_loss_weight) * gap_loss
+        )
         optimizer.zero_grad(set_to_none=True)
         loss.backward()
         optimizer.step()
@@ -446,6 +493,233 @@ def train_addition_fusion_classifier(
     return metrics
 
 
+def train_endpoint_refiner_classifier(
+    *,
+    records: list[LabelRecord],
+    feature_manifest_rows: list[Mapping[str, Any]],
+    output_dir: Path,
+    config: EndpointRefinerTrainConfig,
+) -> TrainMetrics:
+    import torch
+    from torch import nn
+
+    if not feature_manifest_rows:
+        raise ValueError("at least one cached feature row is required")
+    if config.positive_loss_weight <= 0.0:
+        raise ValueError("positive_loss_weight must be positive")
+    if config.speech_loss_weight < 0.0:
+        raise ValueError("speech_loss_weight must be non-negative")
+    if config.boundary_loss_weight < 0.0:
+        raise ValueError("boundary_loss_weight must be non-negative")
+    if config.internal_gap_loss_weight < 0.0:
+        raise ValueError("internal_gap_loss_weight must be non-negative")
+    if config.cut_loss_weight < 0.0:
+        raise ValueError("cut_loss_weight must be non-negative")
+    if config.start_positive_loss_weight <= 0.0:
+        raise ValueError("start_positive_loss_weight must be positive")
+    if config.end_positive_loss_weight <= 0.0:
+        raise ValueError("end_positive_loss_weight must be positive")
+    if config.cut_positive_loss_weight <= 0.0:
+        raise ValueError("cut_positive_loss_weight must be positive")
+    if config.boundary_radius_frames < 0:
+        raise ValueError("boundary_radius_frames must be non-negative")
+    if config.cut_min_gap_s < 0.0:
+        raise ValueError("cut_min_gap_s must be non-negative")
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    torch.manual_seed(config.seed)
+    windows = build_lazy_endpoint_feature_windows(
+        records=records,
+        feature_manifest_rows=feature_manifest_rows,
+        boundary_radius_frames=config.boundary_radius_frames,
+        cut_min_gap_s=config.cut_min_gap_s,
+    )
+    if not windows:
+        raise ValueError("no endpoint feature windows could be built")
+    whisper_dim = int(windows[0].whisper_dim)
+    mfcc_dim = int(windows[0].mfcc_dim)
+    model = AdditionFusionEndpointBiLSTM(
+        whisper_dim=whisper_dim,
+        mfcc_dim=mfcc_dim,
+        fusion_dim=config.fusion_dim,
+        hidden_dim=config.hidden_dim,
+        layers=config.layers,
+        dropout=config.dropout,
+    )
+    trainable_parameters = count_trainable_parameters(model)
+    if trainable_parameters > config.max_trainable_parameters:
+        raise ValueError(
+            f"trainable parameters {trainable_parameters} exceed limit {config.max_trainable_parameters}"
+        )
+
+    device = torch.device(config.device)
+    model = model.to(device)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=config.learning_rate)
+    speech_pos_weight = torch.tensor(float(config.positive_loss_weight), dtype=torch.float32, device=device)
+    start_pos_weight = torch.tensor(float(config.start_positive_loss_weight), dtype=torch.float32, device=device)
+    end_pos_weight = torch.tensor(float(config.end_positive_loss_weight), dtype=torch.float32, device=device)
+    cut_pos_weight = torch.tensor(float(config.cut_positive_loss_weight), dtype=torch.float32, device=device)
+    speech_criterion = nn.BCEWithLogitsLoss(reduction="none", pos_weight=speech_pos_weight)
+    start_criterion = nn.BCEWithLogitsLoss(reduction="none", pos_weight=start_pos_weight)
+    end_criterion = nn.BCEWithLogitsLoss(reduction="none", pos_weight=end_pos_weight)
+    cut_criterion = nn.BCEWithLogitsLoss(reduction="none", pos_weight=cut_pos_weight)
+    window_order = shuffled_window_order(len(windows), seed=config.seed)
+    losses: list[float] = []
+    total_correct = 0.0
+    total_frames = 0.0
+    total_positive = 0.0
+    batch_size = max(1, int(config.batch_size))
+
+    for step in range(config.max_steps):
+        batch_indexes = [
+            window_order[(step * batch_size + offset) % len(window_order)]
+            for offset in range(batch_size)
+        ]
+        batch_windows = [load_endpoint_feature_window(windows[index]) for index in batch_indexes]
+        max_frames = max(item[2].shape[0] for item in batch_windows)
+        whisper_tensor = torch.from_numpy(
+            np.stack([_pad_or_trim_2d(item[0], max_frames) for item in batch_windows])
+        ).to(device)
+        mfcc_tensor = torch.from_numpy(
+            np.stack([_pad_or_trim_2d(item[1], max_frames) for item in batch_windows])
+        ).to(device)
+        speech_tensor = torch.from_numpy(
+            np.stack([_pad_or_trim_1d(item[2], max_frames) for item in batch_windows])
+        ).to(device)
+        weight_tensor = torch.from_numpy(
+            np.stack([_pad_or_trim_1d(item[3], max_frames) for item in batch_windows])
+        ).to(device)
+        start_tensor = torch.from_numpy(
+            np.stack([_pad_or_trim_1d(item[4], max_frames) for item in batch_windows])
+        ).to(device)
+        end_tensor = torch.from_numpy(
+            np.stack([_pad_or_trim_1d(item[5], max_frames) for item in batch_windows])
+        ).to(device)
+        cut_tensor = torch.from_numpy(
+            np.stack([_pad_or_trim_1d(item[6], max_frames) for item in batch_windows])
+        ).to(device)
+        mask_tensor = torch.from_numpy(
+            np.stack([_frame_mask(item[2].shape[0], max_frames) for item in batch_windows])
+        ).to(device) * weight_tensor
+        logits = model(whisper_tensor, mfcc_tensor)
+        speech_loss = (
+            speech_criterion(logits["speech"], speech_tensor) * mask_tensor
+        ).sum() / mask_tensor.sum().clamp_min(1.0)
+        start_loss = (
+            start_criterion(logits["start"], start_tensor) * mask_tensor
+        ).sum() / mask_tensor.sum().clamp_min(1.0)
+        end_loss = (
+            end_criterion(logits["end"], end_tensor) * mask_tensor
+        ).sum() / mask_tensor.sum().clamp_min(1.0)
+        cut_loss = (
+            cut_criterion(logits["cut"], cut_tensor) * mask_tensor
+        ).sum() / mask_tensor.sum().clamp_min(1.0)
+        gap_loss = internal_gap_probability_loss(
+            torch.sigmoid(logits["speech"]),
+            speech_tensor,
+            mask_tensor,
+        )
+        loss = (
+            float(config.speech_loss_weight) * speech_loss
+            + float(config.boundary_loss_weight) * (start_loss + end_loss)
+            + float(config.internal_gap_loss_weight) * gap_loss
+            + float(config.cut_loss_weight) * cut_loss
+        )
+        optimizer.zero_grad(set_to_none=True)
+        loss.backward()
+        optimizer.step()
+        losses.append(float(loss.detach().cpu()))
+        with torch.no_grad():
+            pred = (torch.sigmoid(logits["speech"]) >= 0.5).float()
+            total_correct += float(((pred == speech_tensor).float() * mask_tensor).sum().item())
+            total_frames += float(mask_tensor.sum().item())
+            total_positive += float((speech_tensor * mask_tensor).sum().item())
+        if config.log_interval_steps > 0 and (
+            (step + 1) == 1
+            or (step + 1) % config.log_interval_steps == 0
+            or (step + 1) == config.max_steps
+        ):
+            running_loss = float(np.mean(losses)) if losses else 0.0
+            running_accuracy = (total_correct / total_frames) if total_frames else 0.0
+            print(
+                f"train_step={step + 1}/{config.max_steps} "
+                f"loss={running_loss:.4f} frame_accuracy={running_accuracy:.4f}",
+                flush=True,
+            )
+
+    checkpoint_path = output_dir / "fusionvad_ja_endpoint_refiner.pt"
+    metrics_path = output_dir / "train_metrics.json"
+    torch.save(
+        {
+            "model_state_dict": model.state_dict(),
+            "model_type": "addition_endpoint_bilstm",
+            "config": asdict(config),
+            "features": len(feature_manifest_rows),
+            "windows": len(windows),
+            "window_order": window_order,
+            "trainable_parameters": trainable_parameters,
+            "whisper_dim": whisper_dim,
+            "mfcc_dim": mfcc_dim,
+            "outputs": ["speech", "start", "end", "cut"],
+        },
+        checkpoint_path,
+    )
+    metrics = TrainMetrics(
+        steps=config.max_steps,
+        loss=float(np.mean(losses)) if losses else 0.0,
+        frame_accuracy=(total_correct / total_frames) if total_frames else 0.0,
+        positive_ratio=(total_positive / total_frames) if total_frames else 0.0,
+        checkpoint=str(checkpoint_path),
+        metrics_path=str(metrics_path),
+    )
+    metrics_payload = asdict(metrics)
+    metrics_payload["trainable_parameters"] = trainable_parameters
+    metrics_payload["whisper_dim"] = whisper_dim
+    metrics_payload["mfcc_dim"] = mfcc_dim
+    metrics_payload["model_type"] = "addition_endpoint_bilstm"
+    metrics_path.write_text(
+        json.dumps(metrics_payload, ensure_ascii=False, indent=2, sort_keys=True),
+        encoding="utf-8",
+    )
+    return metrics
+
+
+def boundary_transition_loss(probability, labels, mask):
+    """Penalize delayed probability transitions at speech/non-speech boundaries."""
+    import torch
+
+    if probability.shape[-1] < 2:
+        return probability.new_tensor(0.0)
+    active = (mask[..., 1:] > 0.0) & (mask[..., :-1] > 0.0)
+    transitions = (labels[..., 1:] - labels[..., :-1]).abs() * active.float()
+    if torch.count_nonzero(transitions).item() <= 0:
+        return probability.new_tensor(0.0)
+    probability_delta = probability[..., 1:] - probability[..., :-1]
+    return ((probability_delta - (labels[..., 1:] - labels[..., :-1])).abs() * transitions).sum() / transitions.sum().clamp_min(1.0)
+
+
+def internal_gap_probability_loss(probability, labels, mask):
+    """Suppress high speech probability inside non-speech gaps between speech islands."""
+    import torch
+
+    gap_mask = labels.new_zeros(labels.shape)
+    for batch_index in range(labels.shape[0]):
+        active_indices = torch.nonzero(mask[batch_index] > 0.0, as_tuple=False).reshape(-1)
+        if active_indices.numel() <= 0:
+            continue
+        active_labels = labels[batch_index, active_indices]
+        speech_indices = torch.nonzero(active_labels > 0.5, as_tuple=False).reshape(-1)
+        if speech_indices.numel() < 2:
+            continue
+        start = int(active_indices[int(speech_indices[0])].item())
+        end = int(active_indices[int(speech_indices[-1])].item()) + 1
+        between = (labels[batch_index, start:end] <= 0.5) & (mask[batch_index, start:end] > 0.0)
+        gap_mask[batch_index, start:end] = between.float()
+    if torch.count_nonzero(gap_mask).item() <= 0:
+        return probability.new_tensor(0.0)
+    return (probability * gap_mask).sum() / gap_mask.sum().clamp_min(1.0)
+
+
 def build_feature_windows(
     *,
     records: list[LabelRecord],
@@ -469,6 +743,179 @@ def build_feature_windows(
             )
         )
     return windows
+
+
+def build_endpoint_feature_windows(
+    *,
+    records: list[LabelRecord],
+    feature_manifest_rows: Iterable[Mapping[str, Any]],
+    boundary_radius_frames: int = 1,
+    cut_min_gap_s: float = 0.5,
+) -> list[tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]]:
+    windows: list[tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]] = []
+    for row in feature_manifest_rows:
+        label_index = int(row["label_index"])
+        record = records[label_index]
+        whisper, mfcc = load_cached_feature(Path(str(row["feature_path"])))
+        weights = effective_frame_weights(record)
+        frame_count = min(whisper.shape[0], mfcc.shape[0], len(record.speech_frames), len(weights))
+        if frame_count <= 0:
+            continue
+        speech = np.asarray(record.speech_frames[:frame_count], dtype=np.float32)
+        start_targets, end_targets, cut_targets = endpoint_targets_from_record(
+            record,
+            frame_count=frame_count,
+            boundary_radius_frames=boundary_radius_frames,
+            cut_min_gap_s=cut_min_gap_s,
+        )
+        windows.append(
+            (
+                np.ascontiguousarray(whisper[:frame_count], dtype=np.float32),
+                np.ascontiguousarray(mfcc[:frame_count], dtype=np.float32),
+                speech,
+                np.asarray(weights[:frame_count], dtype=np.float32),
+                start_targets,
+                end_targets,
+                cut_targets,
+            )
+        )
+    return windows
+
+
+@dataclass(frozen=True)
+class LazyEndpointFeatureWindow:
+    feature_path: str
+    label_index: int
+    frame_count: int
+    whisper_dim: int
+    mfcc_dim: int
+    speech: np.ndarray
+    weights: np.ndarray
+    starts: np.ndarray
+    ends: np.ndarray
+    cuts: np.ndarray
+
+
+def build_lazy_endpoint_feature_windows(
+    *,
+    records: list[LabelRecord],
+    feature_manifest_rows: Iterable[Mapping[str, Any]],
+    boundary_radius_frames: int = 1,
+    cut_min_gap_s: float = 0.5,
+) -> list[LazyEndpointFeatureWindow]:
+    windows: list[LazyEndpointFeatureWindow] = []
+    for row in feature_manifest_rows:
+        label_index = int(row["label_index"])
+        record = records[label_index]
+        feature_path = str(row["feature_path"])
+        whisper_dim = int(row.get("whisper_dim") or 0)
+        mfcc_dim = int(row.get("mfcc_dim") or 0)
+        manifest_frame_count = int(row.get("frame_count") or 0)
+        if whisper_dim <= 0 or mfcc_dim <= 0 or manifest_frame_count <= 0:
+            whisper, mfcc = load_cached_feature(Path(feature_path))
+            whisper_dim = int(whisper.shape[-1])
+            mfcc_dim = int(mfcc.shape[-1])
+            manifest_frame_count = int(min(whisper.shape[0], mfcc.shape[0]))
+        weights = effective_frame_weights(record)
+        frame_count = min(manifest_frame_count, len(record.speech_frames), len(weights))
+        if frame_count <= 0:
+            continue
+        speech = np.asarray(record.speech_frames[:frame_count], dtype=np.float32)
+        start_targets, end_targets, cut_targets = endpoint_targets_from_record(
+            record,
+            frame_count=frame_count,
+            boundary_radius_frames=boundary_radius_frames,
+            cut_min_gap_s=cut_min_gap_s,
+        )
+        windows.append(
+            LazyEndpointFeatureWindow(
+                feature_path=feature_path,
+                label_index=label_index,
+                frame_count=frame_count,
+                whisper_dim=whisper_dim,
+                mfcc_dim=mfcc_dim,
+                speech=speech,
+                weights=np.asarray(weights[:frame_count], dtype=np.float32),
+                starts=start_targets,
+                ends=end_targets,
+                cuts=cut_targets,
+            )
+        )
+    return windows
+
+
+def load_endpoint_feature_window(
+    window: LazyEndpointFeatureWindow,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    whisper, mfcc = load_cached_feature(Path(window.feature_path))
+    frame_count = min(window.frame_count, whisper.shape[0], mfcc.shape[0])
+    if frame_count <= 0:
+        raise ValueError(f"empty endpoint feature window: {window.feature_path}")
+    return (
+        np.ascontiguousarray(whisper[:frame_count], dtype=np.float32),
+        np.ascontiguousarray(mfcc[:frame_count], dtype=np.float32),
+        np.asarray(window.speech[:frame_count], dtype=np.float32),
+        np.asarray(window.weights[:frame_count], dtype=np.float32),
+        np.asarray(window.starts[:frame_count], dtype=np.float32),
+        np.asarray(window.ends[:frame_count], dtype=np.float32),
+        np.asarray(window.cuts[:frame_count], dtype=np.float32),
+    )
+
+
+def endpoint_targets_from_record(
+    record: LabelRecord,
+    *,
+    frame_count: int,
+    boundary_radius_frames: int = 1,
+    cut_min_gap_s: float = 0.5,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    frame_count = max(0, int(frame_count))
+    starts = np.zeros(frame_count, dtype=np.float32)
+    ends = np.zeros(frame_count, dtype=np.float32)
+    cuts = np.zeros(frame_count, dtype=np.float32)
+    if frame_count <= 0:
+        return starts, ends, cuts
+    segments = supervised_segments_for_record(record)
+    radius = max(0, int(boundary_radius_frames))
+    for segment in segments:
+        start_index = max(0, min(frame_count - 1, int(round(segment.start / record.frame_hop_s))))
+        end_index = max(0, min(frame_count - 1, int(round(segment.end / record.frame_hop_s)) - 1))
+        starts[max(0, start_index - radius) : min(frame_count, start_index + radius + 1)] = 1.0
+        ends[max(0, end_index - radius) : min(frame_count, end_index + radius + 1)] = 1.0
+    min_gap = max(0.0, float(cut_min_gap_s))
+    for previous, current in zip(segments, segments[1:]):
+        gap_start = previous.end
+        gap_end = current.start
+        if gap_end - gap_start < min_gap:
+            continue
+        start_index = max(0, min(frame_count, int(math.ceil(gap_start / record.frame_hop_s))))
+        end_index = max(0, min(frame_count, int(math.floor(gap_end / record.frame_hop_s))))
+        if end_index > start_index:
+            cuts[start_index:end_index] = 1.0
+    return starts, ends, cuts
+
+
+def supervised_segments_for_record(record: LabelRecord) -> list[TeacherSegment]:
+    segments = list(record.teacher_segments.get("supervised") or [])
+    if not segments:
+        segments = segments_from_speech_frames(record)
+    return sorted(segments, key=lambda item: (item.start, item.end))
+
+
+def segments_from_speech_frames(record: LabelRecord) -> list[TeacherSegment]:
+    segments: list[TeacherSegment] = []
+    start_index: int | None = None
+    values = [1 if int(value) else 0 for value in record.speech_frames]
+    for index, value in enumerate(values + [0]):
+        if value and start_index is None:
+            start_index = index
+        if not value and start_index is not None:
+            start = max(0.0, min(start_index * record.frame_hop_s, record.duration_s))
+            end = max(0.0, min(index * record.frame_hop_s, record.duration_s))
+            if end > start:
+                segments.append(TeacherSegment(start=start, end=end, score=1.0))
+            start_index = None
+    return segments
 
 
 def shuffled_window_order(count: int, *, seed: int) -> list[int]:

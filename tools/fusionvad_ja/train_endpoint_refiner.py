@@ -11,10 +11,10 @@ SRC_ROOT = PROJECT_ROOT / "src"
 if str(SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(SRC_ROOT))
 
-from vad.fusionvad_ja import (
-    FeatureTrainConfig,
+from vad.fusionvad_ja import (  # noqa: E402
+    EndpointRefinerTrainConfig,
     load_label_records,
-    train_addition_fusion_classifier,
+    train_endpoint_refiner_classifier,
 )
 
 
@@ -48,11 +48,11 @@ def run(args: argparse.Namespace) -> None:
         labels_paths=args.labels,
         feature_manifest_paths=args.feature_manifest,
     )
-    metrics = train_addition_fusion_classifier(
+    metrics = train_endpoint_refiner_classifier(
         records=records,
         feature_manifest_rows=feature_rows,
         output_dir=output_dir,
-        config=FeatureTrainConfig(
+        config=EndpointRefinerTrainConfig(
             max_steps=args.max_steps,
             learning_rate=args.learning_rate,
             seed=args.seed,
@@ -64,10 +64,16 @@ def run(args: argparse.Namespace) -> None:
             max_trainable_parameters=args.max_trainable_parameters,
             log_interval_steps=args.log_interval_steps,
             batch_size=args.batch_size,
-            init_checkpoint=args.init_checkpoint,
             positive_loss_weight=args.positive_loss_weight,
+            speech_loss_weight=args.speech_loss_weight,
             boundary_loss_weight=args.boundary_loss_weight,
-            gap_loss_weight=args.gap_loss_weight,
+            internal_gap_loss_weight=args.internal_gap_loss_weight,
+            cut_loss_weight=args.cut_loss_weight,
+            start_positive_loss_weight=args.start_positive_loss_weight,
+            end_positive_loss_weight=args.end_positive_loss_weight,
+            cut_positive_loss_weight=args.cut_positive_loss_weight,
+            boundary_radius_frames=args.boundary_radius_frames,
+            cut_min_gap_s=args.cut_min_gap_s,
         ),
     )
     print(f"checkpoint={metrics.checkpoint}")
@@ -75,7 +81,9 @@ def run(args: argparse.Namespace) -> None:
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Train FusionVAD-JA addition-fusion BiLSTM from cached features.")
+    parser = argparse.ArgumentParser(
+        description="Train FusionVAD-JA v1.15 endpoint/boundary refiner from cached features."
+    )
     parser.add_argument("--labels", action="append", required=True, help="FusionVAD-JA label JSONL. Repeatable.")
     parser.add_argument(
         "--feature-manifest",
@@ -94,33 +102,37 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--max-trainable-parameters", type=int, default=2_000_000)
     parser.add_argument("--log-interval-steps", type=int, default=0)
     parser.add_argument("--batch-size", type=int, default=1)
-    parser.add_argument("--init-checkpoint", help="Optional checkpoint used to initialize model weights.")
+    parser.add_argument("--positive-loss-weight", type=float, default=1.0)
+    parser.add_argument("--speech-loss-weight", type=float, default=1.0)
+    parser.add_argument("--boundary-loss-weight", type=float, default=0.5)
+    parser.add_argument("--internal-gap-loss-weight", type=float, default=0.5)
+    parser.add_argument("--cut-loss-weight", type=float, default=0.5)
+    parser.add_argument("--start-positive-loss-weight", type=float, default=1.0)
+    parser.add_argument("--end-positive-loss-weight", type=float, default=1.0)
+    parser.add_argument("--cut-positive-loss-weight", type=float, default=1.0)
+    parser.add_argument("--boundary-radius-frames", type=int, default=1)
+    parser.add_argument("--cut-min-gap-s", type=float, default=0.5)
     parser.add_argument(
-        "--positive-loss-weight",
-        type=float,
-        default=1.0,
-        help="BCE positive-class loss weight. Values >1 bias training toward recall.",
+        "--output-dir",
+        default=str(PROJECT_ROOT / "agents" / "temp" / "fusionvad-ja" / "endpoint-refiner-train"),
     )
-    parser.add_argument(
-        "--boundary-loss-weight",
-        type=float,
-        default=0.0,
-        help="Opt-in boundary transition loss weight for speech-island endpoint training.",
-    )
-    parser.add_argument(
-        "--gap-loss-weight",
-        type=float,
-        default=0.0,
-        help="Opt-in loss weight that suppresses speech probability inside internal non-speech gaps.",
-    )
-    parser.add_argument("--output-dir", default=str(PROJECT_ROOT / "agents" / "temp" / "fusionvad-ja" / "addition-bilstm-train"))
     args = parser.parse_args(argv)
+    if args.max_steps <= 0:
+        parser.error("--max-steps must be positive")
+    if args.learning_rate <= 0.0:
+        parser.error("--learning-rate must be positive")
     if args.positive_loss_weight <= 0.0:
         parser.error("--positive-loss-weight must be positive")
-    if args.boundary_loss_weight < 0.0:
-        parser.error("--boundary-loss-weight must be non-negative")
-    if args.gap_loss_weight < 0.0:
-        parser.error("--gap-loss-weight must be non-negative")
+    for name in ("start_positive_loss_weight", "end_positive_loss_weight", "cut_positive_loss_weight"):
+        if getattr(args, name) <= 0.0:
+            parser.error(f"--{name.replace('_', '-')} must be positive")
+    for name in ("speech_loss_weight", "boundary_loss_weight", "internal_gap_loss_weight", "cut_loss_weight"):
+        if getattr(args, name) < 0.0:
+            parser.error(f"--{name.replace('_', '-')} must be non-negative")
+    if args.boundary_radius_frames < 0:
+        parser.error("--boundary-radius-frames must be non-negative")
+    if args.cut_min_gap_s < 0.0:
+        parser.error("--cut-min-gap-s must be non-negative")
     return args
 
 

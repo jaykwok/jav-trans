@@ -63,7 +63,7 @@ DEFAULT_SETTINGS: dict[str, str] = {
     "ASR_VAD_PRIMARY": "whisperseg",
     "ASR_VAD_GATE": "silero",
     # Remote HuggingFace model id used when ASR_MODEL_PATH is empty or missing.
-    "ASR_MODEL_ID": "Qwen/Qwen3-ASR-1.7B",
+    "ASR_MODEL_ID": "jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame",
     # Optional local ASR model directory override. Empty uses models/<namespace>-<repo>.
     "ASR_MODEL_PATH": "",
     # Remote HuggingFace forced-aligner model id used as fallback.
@@ -130,7 +130,7 @@ DEFAULT_SETTINGS: dict[str, str] = {
     "SEGMENT_PAD": "0.15",
     # 1 packs nearby VAD speech segments into longer Whisper-friendly ASR chunks.
     "ASR_CHUNK_PACKING_ENABLED": "1",
-    # on enables the long-chunk profile by forcing chunk packing and post-alignment F0.
+    # on enables the long-chunk profile by forcing chunk packing.
     "ASR_LONG_CHUNK_PROFILE": "on",
     # Fallback frame duration used by packed ASR chunker when a task has no video FPS.
     "ASR_CHUNK_PACK_FRAME_HOP_S": "0.033366700033366704",
@@ -146,6 +146,32 @@ DEFAULT_SETTINGS: dict[str, str] = {
     # accumulation stops at the next gap once core would exceed it, so high-recall VAD
     # does not merge many islands into one aligner-hostile super-chunk (R14 Phase 1a).
     "ASR_CHUNK_PACK_MAX_CORE_FRAMES": "0",
+    # R15/R16 opt-in: split high-risk packed chunks into speech islands before ASR.
+    "ASR_PRE_ASR_ISLAND_SPLIT_ENABLED": "0",
+    # Only chunks whose packed core is at least this many frames are considered.
+    "ASR_PRE_ASR_ISLAND_SPLIT_MIN_CORE_FRAMES": "420",
+    # Internal gap needed to split a packed chunk into speech islands.
+    "ASR_PRE_ASR_ISLAND_SPLIT_MIN_GAP_FRAMES": "18",
+    # Tiny islands shorter than this many frames are merged into a neighbor.
+    "ASR_PRE_ASR_ISLAND_SPLIT_MIN_ISLAND_FRAMES": "3",
+    # Safety cap on child chunks created from one packed chunk.
+    "ASR_PRE_ASR_ISLAND_SPLIT_MAX_CHILDREN": "8",
+    # R16 opt-in: split long continuous VAD islands at low frame-score valleys.
+    "ASR_PRE_ASR_VALLEY_SPLIT_ENABLED": "0",
+    # Only continuous VAD islands at least this many frames are considered.
+    "ASR_PRE_ASR_VALLEY_SPLIT_MIN_CORE_FRAMES": "420",
+    # Target child core length after valley splitting, in frames.
+    "ASR_PRE_ASR_VALLEY_SPLIT_TARGET_CORE_FRAMES": "270",
+    # Minimum consecutive low-score frames needed to accept a valley.
+    "ASR_PRE_ASR_VALLEY_SPLIT_MIN_VALLEY_FRAMES": "6",
+    # Minimum child length around a valley split.
+    "ASR_PRE_ASR_VALLEY_SPLIT_MIN_CHILD_FRAMES": "45",
+    # Safety cap on child chunks created from one continuous island.
+    "ASR_PRE_ASR_VALLEY_SPLIT_MAX_CHILDREN": "8",
+    # FusionVAD frame-score threshold that defines a low valley.
+    "ASR_PRE_ASR_VALLEY_SPLIT_THRESHOLD": "0.20",
+    # 1 stores FusionVAD frame scores in the VAD cache for R16 diagnostics.
+    "FUSIONVAD_JA_EXPORT_FRAME_SCORES": "0",
     # 1 enables dropping very short low-energy spans before ASR (opt-in).
     "ASR_CHUNK_DROP_ENABLED": "0",
     # Spans shorter than this value (seconds) are candidates for dropping.
@@ -409,7 +435,6 @@ def _load_private_env(path: Path, protected_keys: set[str]) -> None:
 def _apply_profiles() -> None:
     if os.environ.get("ASR_LONG_CHUNK_PROFILE", "off").strip().lower() == "on":
         os.environ["ASR_CHUNK_PACKING_ENABLED"] = "1"
-        os.environ["F0_GENDER_POST_ALIGNMENT"] = "1"
 
 
 def load_config(*, override_existing_env: bool = False) -> None:

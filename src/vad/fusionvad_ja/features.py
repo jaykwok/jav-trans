@@ -13,8 +13,10 @@ from utils.model_paths import WHISPER_MODEL_PATH, resolve_model_spec
 from whisper.model_backend import WHISPER_PRESETS
 
 QWEN3_ASR_PRESETS = {
-    "qwen3-asr-0.6b": "Qwen/Qwen3-ASR-0.6B",
-    "qwen3-asr-1.7b": "Qwen/Qwen3-ASR-1.7B",
+    "qwen3-asr-0.6b": "jaykwok/Qwen3-ASR-0.6B-JA-Anime-Galgame",
+    "qwen3-asr-1.7b": "jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame",
+    "qwen3-asr-0.6b-base": "Qwen/Qwen3-ASR-0.6B",
+    "qwen3-asr-1.7b-base": "Qwen/Qwen3-ASR-1.7B",
 }
 
 
@@ -163,7 +165,11 @@ def normalize_ptm_name(ptm: str) -> str:
 def is_qwen3_asr_ptm(ptm: str) -> bool:
     normalized = normalize_ptm_name(ptm)
     lowered = normalized.lower()
-    return lowered in QWEN3_ASR_PRESETS or lowered.startswith("qwen/qwen3-asr-")
+    return (
+        lowered in QWEN3_ASR_PRESETS
+        or lowered.startswith("qwen/qwen3-asr-")
+        or lowered.startswith("jaykwok/qwen3-asr-")
+    )
 
 
 def is_low_frame_rate_ptm(ptm: str) -> bool:

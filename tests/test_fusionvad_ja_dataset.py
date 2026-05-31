@@ -6,7 +6,9 @@ import pytest
 from vad.base import SpeechSegment
 from vad.fusionvad_ja import (
     AdditionFusionBiLSTM,
+    AdditionFusionEndpointBiLSTM,
     DEFAULT_TRAINABLE_LABEL_QUALITIES,
+    EndpointRefinerTrainConfig,
     FeatureConfig,
     FeatureTrainConfig,
     TeacherSegment,
@@ -21,10 +23,12 @@ from vad.fusionvad_ja import (
     build_weak_positive_record,
     build_training_examples,
     build_training_windows,
+    boundary_transition_loss,
     count_trainable_parameters,
     default_trainable_records,
     dry_run_batches,
     effective_frame_weights,
+    endpoint_targets_from_record,
     evaluate_addition_fusion_classifier,
     frame_classification_counts,
     frame_count,
@@ -32,6 +36,7 @@ from vad.fusionvad_ja import (
     is_default_trainable,
     is_low_frame_rate_ptm,
     is_qwen3_asr_ptm,
+    internal_gap_probability_loss,
     load_manifest_audio_map,
     metrics_from_frame_counts,
     normalize_audio_16k_mono,
@@ -44,6 +49,7 @@ from vad.fusionvad_ja import (
     shuffled_window_order,
     stable_hf_audio_id,
     train_addition_fusion_classifier,
+    train_endpoint_refiner_classifier,
     with_frame_weights,
     write_jsonl,
     train_tiny_frame_classifier,
@@ -674,8 +680,10 @@ def test_align_feature_frames_crops_to_shortest_length():
 def test_qwen3_asr_ptm_helpers_and_low_rate_resize():
     assert is_qwen3_asr_ptm("qwen3-asr-0.6b")
     assert is_qwen3_asr_ptm("Qwen/Qwen3-ASR-1.7B")
+    assert is_qwen3_asr_ptm("jaykwok/Qwen3-ASR-0.6B-JA-Anime-Galgame")
     assert is_low_frame_rate_ptm("qwen3-asr-0.6b")
-    assert qwen3_asr_repo_id("qwen3-asr-0.6b") == "Qwen/Qwen3-ASR-0.6B"
+    assert qwen3_asr_repo_id("qwen3-asr-0.6b") == "jaykwok/Qwen3-ASR-0.6B-JA-Anime-Galgame"
+    assert qwen3_asr_repo_id("qwen3-asr-0.6b-base") == "Qwen/Qwen3-ASR-0.6B"
     assert qwen3_asr_audio_output_lengths(100) == 13
 
     ptm = np.asarray([[0.0], [10.0]], dtype=np.float32)
@@ -702,6 +710,45 @@ def test_qwen3_asr_feature_head_can_stay_under_budget():
     )
 
     assert count_trainable_parameters(model) < 2_000_000
+
+
+def test_endpoint_refiner_head_outputs_speech_boundaries_and_cut():
+    torch = __import__("torch")
+    model = AdditionFusionEndpointBiLSTM(
+        whisper_dim=8,
+        mfcc_dim=4,
+        fusion_dim=8,
+        hidden_dim=4,
+        layers=1,
+    )
+
+    outputs = model(torch.ones(2, 5, 8), torch.ones(2, 5, 4))
+
+    assert set(outputs) == {"speech", "start", "end", "cut"}
+    assert outputs["speech"].shape == (2, 5)
+    assert outputs["start"].shape == (2, 5)
+    assert count_trainable_parameters(model) < 10_000
+
+
+def test_endpoint_targets_mark_starts_ends_and_long_internal_gap():
+    record = build_supervised_record(
+        audio_id="clip",
+        source="unit",
+        duration_s=1.0,
+        speech_segments=[(0.2, 0.4), (0.8, 0.9)],
+        frame_hop_s=0.1,
+    )
+
+    starts, ends, cuts = endpoint_targets_from_record(
+        record,
+        frame_count=10,
+        boundary_radius_frames=0,
+        cut_min_gap_s=0.2,
+    )
+
+    assert starts.tolist() == [0, 0, 1, 0, 0, 0, 0, 0, 1, 0]
+    assert ends.tolist() == [0, 0, 0, 1, 0, 0, 0, 0, 1, 0]
+    assert cuts.tolist() == [0, 0, 0, 0, 1, 1, 1, 1, 0, 0]
 
 
 def test_addition_fusion_training_uses_cached_features(tmp_path):
@@ -741,6 +788,112 @@ def test_addition_fusion_training_uses_cached_features(tmp_path):
     assert metrics.steps == 2
     assert __import__("pathlib").Path(metrics.checkpoint).exists()
     assert __import__("pathlib").Path(metrics.metrics_path).exists()
+
+
+def test_endpoint_refiner_training_uses_cached_features(tmp_path):
+    feature_path = tmp_path / "feature.npz"
+    np.savez_compressed(
+        feature_path,
+        whisper=np.ones((10, 8), dtype=np.float32),
+        mfcc=np.ones((10, 4), dtype=np.float32),
+    )
+    record = build_supervised_record(
+        audio_id="clip",
+        source="unit",
+        duration_s=0.2,
+        speech_segments=[(0.04, 0.08), (0.14, 0.18)],
+        frame_hop_s=0.02,
+    )
+
+    metrics = train_endpoint_refiner_classifier(
+        records=[record],
+        feature_manifest_rows=[
+            {
+                "audio_id": "clip",
+                "feature_path": str(feature_path),
+                "label_index": 0,
+            }
+        ],
+        output_dir=tmp_path / "endpoint-train",
+        config=EndpointRefinerTrainConfig(
+            max_steps=2,
+            fusion_dim=8,
+            hidden_dim=4,
+            layers=1,
+            max_trainable_parameters=10_000,
+            boundary_radius_frames=0,
+            cut_min_gap_s=0.02,
+            start_positive_loss_weight=8.0,
+            end_positive_loss_weight=9.0,
+            cut_positive_loss_weight=3.0,
+        ),
+    )
+
+    checkpoint = __import__("pathlib").Path(metrics.checkpoint)
+    checkpoint_payload = __import__("torch").load(checkpoint, map_location="cpu", weights_only=False)
+    assert metrics.steps == 2
+    assert checkpoint.exists()
+    assert checkpoint.name == "fusionvad_ja_endpoint_refiner.pt"
+    assert __import__("pathlib").Path(metrics.metrics_path).exists()
+    assert checkpoint_payload["config"]["start_positive_loss_weight"] == 8.0
+    assert checkpoint_payload["config"]["end_positive_loss_weight"] == 9.0
+    assert checkpoint_payload["config"]["cut_positive_loss_weight"] == 3.0
+
+
+def test_boundary_aware_losses_focus_transitions_and_internal_gaps():
+    torch = __import__("torch")
+    labels = torch.tensor([[0.0, 1.0, 1.0, 0.0, 0.0, 1.0]])
+    mask = torch.ones_like(labels)
+    good_probability = torch.tensor([[0.05, 0.95, 0.90, 0.05, 0.02, 0.92]])
+    bad_probability = torch.tensor([[0.80, 0.20, 0.20, 0.90, 0.85, 0.30]])
+
+    assert boundary_transition_loss(good_probability, labels, mask).item() < boundary_transition_loss(
+        bad_probability, labels, mask
+    ).item()
+    assert internal_gap_probability_loss(good_probability, labels, mask).item() < internal_gap_probability_loss(
+        bad_probability, labels, mask
+    ).item()
+
+
+def test_addition_fusion_training_accepts_boundary_aware_weights(tmp_path):
+    feature_path = tmp_path / "feature.npz"
+    np.savez_compressed(
+        feature_path,
+        whisper=np.ones((8, 8), dtype=np.float32),
+        mfcc=np.ones((8, 4), dtype=np.float32),
+    )
+    record = build_supervised_record(
+        audio_id="clip",
+        source="unit",
+        duration_s=0.16,
+        speech_segments=[(0.02, 0.06), (0.12, 0.16)],
+        frame_hop_s=0.02,
+    )
+
+    metrics = train_addition_fusion_classifier(
+        records=[record],
+        feature_manifest_rows=[
+            {
+                "audio_id": "clip",
+                "feature_path": str(feature_path),
+                "label_index": 0,
+            }
+        ],
+        output_dir=tmp_path / "train-boundary-aware",
+        config=FeatureTrainConfig(
+            max_steps=2,
+            fusion_dim=8,
+            hidden_dim=4,
+            layers=1,
+            max_trainable_parameters=10_000,
+            boundary_loss_weight=0.5,
+            gap_loss_weight=0.25,
+        ),
+    )
+
+    checkpoint = __import__("torch").load(metrics.checkpoint, map_location="cpu", weights_only=False)
+    assert checkpoint["config"]["boundary_loss_weight"] == 0.5
+    assert checkpoint["config"]["gap_loss_weight"] == 0.25
 
 
 def test_addition_fusion_training_initializes_from_checkpoint(tmp_path):
@@ -1289,6 +1442,8 @@ def test_train_addition_bilstm_cli_requires_inputs():
     assert args.log_interval_steps == 0
     assert args.batch_size == 1
     assert args.positive_loss_weight == 1.0
+    assert args.boundary_loss_weight == 0.0
+    assert args.gap_loss_weight == 0.0
 
     args = module.parse_args(
         [
@@ -1298,9 +1453,71 @@ def test_train_addition_bilstm_cli_requires_inputs():
             "feature_manifest.json",
             "--positive-loss-weight",
             "2.0",
+            "--boundary-loss-weight",
+            "0.5",
+            "--gap-loss-weight",
+            "0.25",
         ]
     )
     assert args.positive_loss_weight == 2.0
+    assert args.boundary_loss_weight == 0.5
+    assert args.gap_loss_weight == 0.25
+
+
+def test_train_endpoint_refiner_cli_accepts_aux_positive_weights():
+    import importlib.util
+
+    script_path = (
+        __import__("pathlib").Path(__file__).resolve().parents[1]
+        / "tools"
+        / "fusionvad_ja"
+        / "train_endpoint_refiner.py"
+    )
+    spec = importlib.util.spec_from_file_location("fusionvad_ja_train_endpoint_args", script_path)
+    assert spec and spec.loader
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    try:
+        module.parse_args([])
+    except SystemExit as exc:
+        assert exc.code == 2
+    else:
+        raise AssertionError("parse_args should require inputs")
+
+    args = module.parse_args(
+        [
+            "--labels",
+            "labels.jsonl",
+            "--feature-manifest",
+            "feature_manifest.json",
+            "--start-positive-loss-weight",
+            "120",
+            "--end-positive-loss-weight",
+            "130",
+            "--cut-positive-loss-weight",
+            "8",
+        ]
+    )
+    assert args.start_positive_loss_weight == 120.0
+    assert args.end_positive_loss_weight == 130.0
+    assert args.cut_positive_loss_weight == 8.0
+
+    try:
+        module.parse_args(
+            [
+                "--labels",
+                "labels.jsonl",
+                "--feature-manifest",
+                "feature_manifest.json",
+                "--start-positive-loss-weight",
+                "0",
+            ]
+        )
+    except SystemExit as exc:
+        assert exc.code == 2
+    else:
+        raise AssertionError("parse_args should reject non-positive aux positive weights")
 
 
 def test_evaluate_addition_bilstm_cli_requires_inputs():
@@ -1482,6 +1699,135 @@ def test_export_addition_predictions_cli_requires_inputs():
     assert args.threshold == 0.05
 
 
+def test_export_endpoint_refiner_predictions_cli_writes_jsonl(tmp_path):
+    import importlib.util
+    import json
+
+    script_path = (
+        __import__("pathlib").Path(__file__).resolve().parents[1]
+        / "tools"
+        / "fusionvad_ja"
+        / "export_endpoint_refiner_predictions.py"
+    )
+    spec = importlib.util.spec_from_file_location("fusionvad_ja_export_endpoint_refiner_predictions", script_path)
+    assert spec and spec.loader
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    feature_path = tmp_path / "feature.npz"
+    np.savez_compressed(
+        feature_path,
+        whisper=np.ones((6, 8), dtype=np.float32),
+        mfcc=np.ones((6, 4), dtype=np.float32),
+    )
+    labels_path = tmp_path / "labels.jsonl"
+    record = build_supervised_record(
+        audio_id="clip",
+        source="unit",
+        duration_s=0.12,
+        speech_segments=[(0.0, 0.04), (0.08, 0.12)],
+        frame_hop_s=0.02,
+    )
+    write_jsonl(labels_path, [record])
+    feature_rows = [{"audio_id": "clip", "feature_path": str(feature_path), "label_index": 0}]
+    feature_manifest_path = tmp_path / "feature_manifest.json"
+    feature_manifest_path.write_text(json.dumps(feature_rows, ensure_ascii=False), encoding="utf-8")
+    train_metrics = train_endpoint_refiner_classifier(
+        records=[record],
+        feature_manifest_rows=feature_rows,
+        output_dir=tmp_path / "train",
+        config=EndpointRefinerTrainConfig(
+            max_steps=1,
+            fusion_dim=8,
+            hidden_dim=4,
+            layers=1,
+            max_trainable_parameters=10_000,
+            cut_min_gap_s=0.02,
+        ),
+    )
+
+    module.run(
+        module.parse_args(
+            [
+                "--labels",
+                str(labels_path),
+                "--feature-manifest",
+                str(feature_manifest_path),
+                "--checkpoint",
+                train_metrics.checkpoint,
+                "--speech-threshold",
+                "0.0",
+                "--start-threshold",
+                "0.0",
+                "--end-threshold",
+                "0.0",
+                "--cut-threshold",
+                "0.0",
+                "--include-probabilities",
+                "--output-dir",
+                str(tmp_path / "predictions"),
+            ]
+        )
+    )
+
+    rows = [
+        json.loads(line)
+        for line in (tmp_path / "predictions" / "predictions.jsonl").read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    summary = json.loads((tmp_path / "predictions" / "prediction_metrics.json").read_text(encoding="utf-8"))
+    assert len(rows) == 1
+    assert rows[0]["audio_id"] == "clip"
+    assert rows[0]["speech_frames"] == [1, 1, 1, 1, 1, 1]
+    assert rows[0]["start_frames"] == [1, 1, 1, 1, 1, 1]
+    assert rows[0]["end_frames"] == [1, 1, 1, 1, 1, 1]
+    assert rows[0]["cut_frames"] == [1, 1, 1, 1, 1, 1]
+    assert rows[0]["probability_summary"]["speech"]["count"] == 6.0
+    assert "probabilities" in rows[0]
+    assert summary["rows"] == 1
+    assert summary["output_metrics"]["speech"]["predicted_positive_ratio"] == 1.0
+    assert summary["output_metrics"]["cut"]["predicted_positive_ratio"] == 1.0
+
+
+def test_export_endpoint_refiner_predictions_cli_requires_inputs():
+    import importlib.util
+
+    script_path = (
+        __import__("pathlib").Path(__file__).resolve().parents[1]
+        / "tools"
+        / "fusionvad_ja"
+        / "export_endpoint_refiner_predictions.py"
+    )
+    spec = importlib.util.spec_from_file_location("fusionvad_ja_export_endpoint_args", script_path)
+    assert spec and spec.loader
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    try:
+        module.parse_args([])
+    except SystemExit as exc:
+        assert exc.code == 2
+    else:
+        raise AssertionError("parse_args should require inputs")
+
+    args = module.parse_args(
+        [
+            "--labels",
+            "labels.jsonl",
+            "--feature-manifest",
+            "feature_manifest.json",
+            "--checkpoint",
+            "model.pt",
+            "--speech-threshold",
+            "0.05",
+            "--cut-threshold",
+            "0.9",
+        ]
+    )
+    assert args.speech_threshold == 0.05
+    assert args.cut_threshold == 0.9
+
+
 def test_export_fusionvad_operating_point_wraps_predictions_and_recall(tmp_path):
     import importlib.util
     import json
@@ -1544,17 +1890,95 @@ def test_export_fusionvad_operating_point_wraps_predictions_and_recall(tmp_path)
             str(tmp_path / "op"),
         ]
     )
-    assert args.operating_point == "fusionvad-ja-v1.11-synthv5-longgap-posw2"
+    assert args.operating_point == "fusionvad-ja-v1.16-endpoint-refiner-boundary4096"
     module.run(args)
 
     summary = json.loads((tmp_path / "op" / "operating_point_summary.json").read_text(encoding="utf-8"))
     recall = json.loads((tmp_path / "op" / "high_recall_metrics.json").read_text(encoding="utf-8"))
     assert summary["threshold"] == 0.0
+    assert summary["checkpoint_model_type"] == "addition_bilstm"
+    assert summary["apply_cut_to_speech"] is True
     assert summary["pad_s"] == 0.02
     assert summary["padded"]["recall"] == recall["recall"]
     assert recall["prediction_threshold"] == 0.0
     assert recall["threshold"] == 0.0
     assert (tmp_path / "op" / "frame-predictions" / "predictions.jsonl").exists()
+
+
+def test_export_fusionvad_operating_point_supports_endpoint_refiner(tmp_path):
+    import importlib.util
+    import json
+
+    script_path = (
+        __import__("pathlib").Path(__file__).resolve().parents[1]
+        / "tools"
+        / "fusionvad_ja"
+        / "export_fusionvad_operating_point.py"
+    )
+    spec = importlib.util.spec_from_file_location("fusionvad_ja_export_operating_point_endpoint", script_path)
+    assert spec and spec.loader
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    feature_path = tmp_path / "endpoint_feature.npz"
+    np.savez_compressed(
+        feature_path,
+        whisper=np.ones((6, 8), dtype=np.float32),
+        mfcc=np.ones((6, 4), dtype=np.float32),
+    )
+    labels_path = tmp_path / "endpoint_labels.jsonl"
+    record = build_supervised_record(
+        audio_id="clip",
+        source="unit",
+        duration_s=0.12,
+        speech_segments=[(0.0, 0.04), (0.08, 0.12)],
+        frame_hop_s=0.02,
+    )
+    write_jsonl(labels_path, [record])
+    feature_rows = [{"audio_id": "clip", "feature_path": str(feature_path), "label_index": 0}]
+    feature_manifest_path = tmp_path / "endpoint_feature_manifest.json"
+    feature_manifest_path.write_text(json.dumps(feature_rows, ensure_ascii=False), encoding="utf-8")
+    train_metrics = train_endpoint_refiner_classifier(
+        records=[record],
+        feature_manifest_rows=feature_rows,
+        output_dir=tmp_path / "endpoint_train",
+        config=EndpointRefinerTrainConfig(
+            max_steps=1,
+            fusion_dim=8,
+            hidden_dim=4,
+            layers=1,
+            max_trainable_parameters=10_000,
+            cut_min_gap_s=0.02,
+        ),
+    )
+
+    module.run(
+        module.parse_args(
+            [
+                "--labels",
+                str(labels_path),
+                "--feature-manifest",
+                str(feature_manifest_path),
+                "--checkpoint",
+                train_metrics.checkpoint,
+                "--threshold",
+                "0.0",
+                "--cut-threshold",
+                "0.0",
+                "--apply-cut-to-speech",
+                "--pad-s",
+                "0.02",
+                "--output-dir",
+                str(tmp_path / "endpoint_op"),
+            ]
+        )
+    )
+
+    summary = json.loads((tmp_path / "endpoint_op" / "operating_point_summary.json").read_text(encoding="utf-8"))
+    assert summary["checkpoint_model_type"] == "addition_endpoint_bilstm"
+    assert summary["cut_threshold"] == 0.0
+    assert summary["apply_cut_to_speech"] is True
+    assert (tmp_path / "endpoint_op" / "frame-predictions" / "predictions.jsonl").exists()
 
 
 def test_benchmark_boundary_predictions_computes_boundary_errors(tmp_path):
@@ -1703,6 +2127,124 @@ def test_benchmark_boundary_predictions_uses_union_speech_duration(tmp_path):
     ]
     assert details[0]["actual_segment_count"] == 2
     assert details[0]["actual_union_segment_count"] == 1
+
+
+def test_benchmark_boundary_predictions_reports_cut_gap_coverage(tmp_path):
+    import importlib.util
+    import json
+
+    script_path = (
+        __import__("pathlib").Path(__file__).resolve().parents[1]
+        / "tools"
+        / "fusionvad_ja"
+        / "benchmark_boundary_predictions.py"
+    )
+    spec = importlib.util.spec_from_file_location("fusionvad_ja_benchmark_boundary_predictions_cut", script_path)
+    assert spec and spec.loader
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    boundary_manifest = tmp_path / "boundary_manifest.jsonl"
+    boundary_manifest.write_text(
+        json.dumps(
+            {
+                "audio_id": "a",
+                "duration_s": 1.0,
+                "frame_hop_s": 0.1,
+                "actual_speech_segments": [
+                    {"start": 0.1, "end": 0.3},
+                    {"start": 0.7, "end": 0.9},
+                ],
+            },
+            ensure_ascii=False,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    predictions = tmp_path / "predictions.jsonl"
+    predictions.write_text(
+        json.dumps(
+            {
+                "audio_id": "a",
+                "speech_frames": [0, 1, 1, 0, 0, 0, 0, 1, 1, 0],
+                "cut_frames": [0, 0, 0, 1, 1, 1, 0, 0, 0, 0],
+            },
+            ensure_ascii=False,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    summary = module.benchmark_boundary_predictions(
+        boundary_manifest=boundary_manifest,
+        predictions=predictions,
+        output_dir=tmp_path / "out",
+        pad_s=0.0,
+        merge_gap_s=0.0,
+        min_segment_s=0.0,
+        min_overlap_ratio=0.1,
+        cut_min_gap_s=0.2,
+    )
+
+    assert summary["cut_gap_count"] == 1
+    assert summary["cut_gap_covered_count"] == 1
+    assert summary["cut_gap_coverage_ratio"] == 1.0
+    assert summary["cut_predicted_segment_count"] == 1
+    assert summary["cut_supported_segment_count"] == 1
+    details = [
+        json.loads(line)
+        for line in (tmp_path / "out" / "boundary_benchmark_details.jsonl").read_text(encoding="utf-8").splitlines()
+    ]
+    assert details[0]["actual_gap_count"] == 1
+    assert details[0]["cut_gap_covered_count"] == 1
+
+
+def test_build_exact_island_labels_uses_actual_speech_segments(tmp_path):
+    import importlib.util
+    import json
+
+    script_path = (
+        __import__("pathlib").Path(__file__).resolve().parents[1]
+        / "tools"
+        / "fusionvad_ja"
+        / "build_exact_island_labels.py"
+    )
+    spec = importlib.util.spec_from_file_location("fusionvad_ja_build_exact_island_labels", script_path)
+    assert spec and spec.loader
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    boundary_manifest = tmp_path / "boundary_manifest.jsonl"
+    boundary_manifest.write_text(
+        json.dumps(
+            {
+                "audio_id": "clip",
+                "source": "unit-synth",
+                "duration_s": 1.0,
+                "text": "a b",
+                "frame_hop_s": 0.1,
+                "speech_segments": [{"start": 0.1, "end": 0.5}],
+                "actual_speech_segments": [{"start": 0.2, "end": 0.4}],
+            },
+            ensure_ascii=False,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    output_jsonl = tmp_path / "exact_labels.jsonl"
+
+    summary = module.build_exact_island_labels(
+        boundary_manifest=boundary_manifest,
+        output_jsonl=output_jsonl,
+    )
+
+    records = read_jsonl(output_jsonl)
+    assert summary["records"] == 1
+    assert summary["speech_frame_count"] == 2
+    assert records[0].audio_id == "clip"
+    assert records[0].source == "unit-synth-exact-island"
+    assert records[0].teacher_segments["supervised"] == [TeacherSegment(0.2, 0.4, score=1.0)]
+    assert records[0].speech_frames == [0, 0, 1, 1, 0, 0, 0, 0, 0, 0]
 
 
 def test_calibrate_addition_threshold_cli_requires_inputs():

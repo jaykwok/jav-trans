@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+from tools.fusionvad_ja import diagnose_asr_alignment
 from tools.fusionvad_ja.diagnose_asr_alignment import diagnose_case, summarize
 
 
@@ -342,3 +343,50 @@ def test_diagnose_case_exports_repetition_and_low_information_review_fields(tmp_
         "not_low_information": 1,
         "repeated_nonlexical": 1,
     }
+
+
+def test_cli_broadcasts_single_case_label_for_multiple_aligned_jsons(tmp_path, monkeypatch):
+    workflow_root = tmp_path / "workflow"
+    for stem in ("sample-a", "sample-b"):
+        _write_json(
+            workflow_root / "archived" / stem / f"{stem}.aligned_segments.json",
+            {
+                "audio_path": str(tmp_path / f"{stem}.wav"),
+                "segments": [],
+                "asr_details": {
+                    "transcript_chunks": [
+                        {
+                            "index": 0,
+                            "start": 0.0,
+                            "end": 1.0,
+                            "duration": 1.0,
+                            "text": "こんにちは",
+                            "raw_text": "こんにちは",
+                        }
+                    ],
+                    "asr_qc": {"items": [], "dropped_uncertain_items": []},
+                },
+                "asr_log": ["chunk 1: Alignment 模式: forced_aligner"],
+            },
+        )
+
+    output_dir = tmp_path / "diag"
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "diagnose_asr_alignment.py",
+            "--workflow-root",
+            str(workflow_root),
+            "--case-label",
+            "shared_label",
+            "--output-dir",
+            str(output_dir),
+        ],
+    )
+
+    assert diagnose_asr_alignment.main() == 0
+    summary = json.loads((output_dir / "summary.json").read_text(encoding="utf-8"))
+    labels = {item["case_label"] for item in summary["cases"]}
+
+    assert summary["case_count"] == 2
+    assert labels == {"shared_label"}

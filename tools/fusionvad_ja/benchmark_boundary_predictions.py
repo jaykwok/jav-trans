@@ -160,6 +160,17 @@ def total_duration(segments: Iterable[SpeechSegment]) -> float:
     return sum(max(0.0, segment.end - segment.start) for segment in segments)
 
 
+def gap_segments(segments: Iterable[SpeechSegment], *, min_gap_s: float) -> list[SpeechSegment]:
+    gaps: list[SpeechSegment] = []
+    ordered = sorted(segments, key=lambda item: (item.start, item.end))
+    for previous, current in zip(ordered, ordered[1:]):
+        gap_start = previous.end
+        gap_end = current.start
+        if gap_end - gap_start >= min_gap_s:
+            gaps.append(SpeechSegment(start=gap_start, end=gap_end))
+    return gaps
+
+
 def intersection_duration(left: Iterable[SpeechSegment], right: Iterable[SpeechSegment]) -> float:
     right_values = list(right)
     return sum(overlap_s(left_segment, right_segment) for left_segment in left for right_segment in right_values)
@@ -218,6 +229,7 @@ def benchmark_boundary_predictions(
     merge_gap_s: float,
     min_segment_s: float,
     min_overlap_ratio: float,
+    cut_min_gap_s: float = 0.5,
 ) -> dict[str, Any]:
     output_dir.mkdir(parents=True, exist_ok=True)
     boundary_rows = load_boundary_rows(boundary_manifest)
@@ -237,6 +249,10 @@ def benchmark_boundary_predictions(
     transition_duration = 0.0
     overlap_speech_duration = 0.0
     overlap_speech_predicted_duration = 0.0
+    cut_gap_count = 0
+    cut_gap_covered_count = 0
+    cut_predicted_segments = 0
+    cut_supported_segments = 0
     skipped = []
 
     for audio_id, boundary in boundary_rows.items():
@@ -259,6 +275,7 @@ def benchmark_boundary_predictions(
         )
         actual_segments = boundary.actual_speech_segments
         actual_union_segments = union_segments(actual_segments, duration_s=boundary.duration_s)
+        actual_gap_segments = gap_segments(actual_segments, min_gap_s=cut_min_gap_s)
         audio_speech_duration = total_duration(actual_union_segments)
         audio_predicted_duration = total_duration(pred_segments)
         audio_overlap_duration = intersection_duration(pred_segments, actual_union_segments)
@@ -266,6 +283,34 @@ def benchmark_boundary_predictions(
         audio_transition_predicted = intersection_duration(pred_segments, boundary.transition_regions)
         audio_overlap_speech_duration = total_duration(boundary.overlap_segments)
         audio_overlap_speech_predicted = intersection_duration(pred_segments, boundary.overlap_segments)
+        cut_frames_raw = prediction.get("cut_frames")
+        if isinstance(cut_frames_raw, list):
+            cut_segments = merge_segments(
+                frames_to_segments(
+                    [int(value) for value in cut_frames_raw],
+                    frame_hop_s=boundary.frame_hop_s,
+                    duration_s=boundary.duration_s,
+                ),
+                duration_s=boundary.duration_s,
+                merge_gap_s=boundary.frame_hop_s,
+                min_segment_s=0.0,
+            )
+        else:
+            cut_segments = []
+        cut_gap_count += len(actual_gap_segments)
+        audio_cut_gap_covered = sum(
+            1
+            for gap in actual_gap_segments
+            if any(overlap_s(gap, cut_segment) > 0.0 for cut_segment in cut_segments)
+        )
+        cut_gap_covered_count += audio_cut_gap_covered
+        cut_predicted_segments += len(cut_segments)
+        audio_cut_supported = sum(
+            1
+            for cut_segment in cut_segments
+            if any(overlap_s(cut_segment, gap) > 0.0 for gap in actual_gap_segments)
+        )
+        cut_supported_segments += audio_cut_supported
 
         speech_duration += audio_speech_duration
         predicted_duration += audio_predicted_duration
@@ -299,10 +344,16 @@ def benchmark_boundary_predictions(
                 "duration_s": boundary.duration_s,
                 "actual_segments": [{"start": item.start, "end": item.end} for item in actual_segments],
                 "actual_union_segments": [{"start": item.start, "end": item.end} for item in actual_union_segments],
+                "actual_gap_segments": [{"start": item.start, "end": item.end} for item in actual_gap_segments],
                 "predicted_segments": [{"start": item.start, "end": item.end} for item in pred_segments],
+                "cut_segments": [{"start": item.start, "end": item.end} for item in cut_segments],
                 "actual_segment_count": len(actual_segments),
                 "actual_union_segment_count": len(actual_union_segments),
+                "actual_gap_count": len(actual_gap_segments),
                 "predicted_segment_count": len(pred_segments),
+                "cut_segment_count": len(cut_segments),
+                "cut_gap_covered_count": audio_cut_gap_covered,
+                "cut_supported_segment_count": audio_cut_supported,
                 "matched_segment_count": matched_for_audio,
                 "missed_segment_count": missed_for_audio,
                 "speech_duration_s": audio_speech_duration,
@@ -328,6 +379,7 @@ def benchmark_boundary_predictions(
         "merge_gap_s": merge_gap_s,
         "min_segment_s": min_segment_s,
         "min_overlap_ratio": min_overlap_ratio,
+        "cut_min_gap_s": cut_min_gap_s,
         "actual_segment_count": sum(len(row.actual_speech_segments) for row in boundary_rows.values()),
         "predicted_segment_count": predicted_segments,
         "matched_segment_count": matched_segments,
@@ -350,6 +402,14 @@ def benchmark_boundary_predictions(
         "overlap_speech_predicted_s": overlap_speech_predicted_duration,
         "overlap_speech_recall": (
             overlap_speech_predicted_duration / overlap_speech_duration if overlap_speech_duration > 0.0 else 0.0
+        ),
+        "cut_gap_count": cut_gap_count,
+        "cut_gap_covered_count": cut_gap_covered_count,
+        "cut_gap_coverage_ratio": cut_gap_covered_count / cut_gap_count if cut_gap_count > 0 else 0.0,
+        "cut_predicted_segment_count": cut_predicted_segments,
+        "cut_supported_segment_count": cut_supported_segments,
+        "cut_supported_ratio": (
+            cut_supported_segments / cut_predicted_segments if cut_predicted_segments > 0 else 0.0
         ),
         "start_error": summarize_errors(start_errors),
         "end_error": summarize_errors(end_errors),
@@ -380,6 +440,7 @@ def run(args: argparse.Namespace) -> None:
         merge_gap_s=args.merge_gap_s,
         min_segment_s=args.min_segment_s,
         min_overlap_ratio=args.min_overlap_ratio,
+        cut_min_gap_s=args.cut_min_gap_s,
     )
 
 
@@ -391,6 +452,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--merge-gap-s", type=float, default=0.15)
     parser.add_argument("--min-segment-s", type=float, default=0.05)
     parser.add_argument("--min-overlap-ratio", type=float, default=0.1)
+    parser.add_argument("--cut-min-gap-s", type=float, default=0.5)
     parser.add_argument(
         "--output-dir",
         default=str(PROJECT_ROOT / "agents" / "temp" / "fusionvad-ja" / "boundary-benchmark"),
@@ -404,6 +466,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         parser.error("--min-segment-s must be non-negative")
     if not 0.0 <= args.min_overlap_ratio <= 1.0:
         parser.error("--min-overlap-ratio must be in [0, 1]")
+    if args.cut_min_gap_s < 0.0:
+        parser.error("--cut-min-gap-s must be non-negative")
     return args
 
 

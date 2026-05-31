@@ -18,15 +18,17 @@ from vad.fusionvad_ja.features import (
     extract_mfcc,
     is_low_frame_rate_ptm,
 )
-from vad.fusionvad_ja.model import AdditionFusionBiLSTM
+from vad.fusionvad_ja.model import AdditionFusionBiLSTM, AdditionFusionEndpointBiLSTM
 from vad.whisperseg.postprocess import group_segments
 
 
 DEFAULT_CHECKPOINT = (
-    "datasets/train/fusionvad-ja/v1-11/qwen3-asr-0.6b/"
-    "addition-bilstm-ft-v1mini-galgame-synthv5-longgap-posw2-558-batch16-lr2e-4-steps1024/"
-    "fusionvad_ja_addition_bilstm.pt"
+    "datasets/train/fusionvad-ja/v1-16/qwen3-asr-0.6b-full29239/"
+    "endpoint-refiner-boundary4096-v1mini-batch16-lr2e-4-steps2048-posaux120-cut8/"
+    "fusionvad_ja_endpoint_refiner.pt"
 )
+DEFAULT_MODEL_PATH = "models/jaykwok-Qwen3-ASR-0.6B-JA-Anime-Galgame"
+DEFAULT_OPERATING_POINT = "v1.16-endpoint-refiner-boundary4096-speech0.020-cut0.960-pad0.2"
 
 
 def _env_float(name: str, default: str) -> float:
@@ -70,17 +72,59 @@ def _load_addition_model(checkpoint_path: Path, *, device):
 
     checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
     config = dict(checkpoint.get("config") or {})
-    model = AdditionFusionBiLSTM(
-        whisper_dim=int(checkpoint["whisper_dim"]),
-        mfcc_dim=int(checkpoint["mfcc_dim"]),
-        fusion_dim=int(config.get("fusion_dim", 256)),
-        hidden_dim=int(config.get("hidden_dim", 192)),
-        layers=int(config.get("layers", 2)),
-        dropout=float(config.get("dropout", 0.1)),
-    ).to(device)
+    model_type = str(checkpoint.get("model_type") or "addition_bilstm")
+    if model_type == "addition_endpoint_bilstm":
+        model = AdditionFusionEndpointBiLSTM(
+            whisper_dim=int(checkpoint["whisper_dim"]),
+            mfcc_dim=int(checkpoint["mfcc_dim"]),
+            fusion_dim=int(config.get("fusion_dim", 256)),
+            hidden_dim=int(config.get("hidden_dim", 192)),
+            layers=int(config.get("layers", 2)),
+            dropout=float(config.get("dropout", 0.1)),
+        ).to(device)
+    elif model_type in {"addition_bilstm", ""}:
+        model = AdditionFusionBiLSTM(
+            whisper_dim=int(checkpoint["whisper_dim"]),
+            mfcc_dim=int(checkpoint["mfcc_dim"]),
+            fusion_dim=int(config.get("fusion_dim", 256)),
+            hidden_dim=int(config.get("hidden_dim", 192)),
+            layers=int(config.get("layers", 2)),
+            dropout=float(config.get("dropout", 0.1)),
+        ).to(device)
+    else:
+        raise ValueError(f"unsupported FusionVAD-JA checkpoint model_type={model_type!r}")
     model.load_state_dict(checkpoint["model_state_dict"])
     model.eval()
-    return model, checkpoint, config
+    return model, checkpoint, config, model_type
+
+
+def _sigmoid_outputs(logits):
+    import torch
+
+    if isinstance(logits, dict):
+        return {
+            name: torch.sigmoid(value).detach().float().cpu().numpy().reshape(-1)
+            for name, value in logits.items()
+        }
+    return {"speech": torch.sigmoid(logits).detach().float().cpu().numpy().reshape(-1)}
+
+
+def _apply_cut_gate(
+    speech_probs: np.ndarray,
+    cut_probs: np.ndarray | None,
+    *,
+    cut_threshold: float,
+    apply_cut: bool,
+) -> np.ndarray:
+    if not apply_cut or cut_probs is None:
+        return speech_probs
+    frame_total = min(int(speech_probs.size), int(cut_probs.size))
+    if frame_total <= 0:
+        return speech_probs
+    gated = speech_probs.copy()
+    active = gated[:frame_total]
+    active[cut_probs[:frame_total] >= cut_threshold] = 0.0
+    return gated
 
 
 def _first_parameter_device_dtype(model) -> tuple[str, str]:
@@ -170,11 +214,11 @@ def merge_segments(
 @dataclass(frozen=True)
 class FusionVadJaConfig:
     checkpoint: Path
-    threshold: float = 0.02
+    threshold: float = 0.020
     pad_s: float = 0.2
     frame_hop_s: float = 0.02
     ptm: str = "qwen3-asr-0.6b"
-    model_path: str = "models/Qwen-Qwen3-ASR-0.6B"
+    model_path: str = DEFAULT_MODEL_PATH
     device: str = "auto"
     dtype: str = "bfloat16"
     attention: str = "sdpa"
@@ -184,7 +228,9 @@ class FusionVadJaConfig:
     merge_gap_s: float = 0.0
     max_group_s: float = 6.0
     chunk_threshold_s: float = 1.0
-    no_download: bool = True
+    cut_threshold: float = 0.960
+    apply_cut_to_speech: bool = True
+    no_download: bool = False
 
     @classmethod
     def from_env(cls) -> "FusionVadJaConfig":
@@ -193,14 +239,12 @@ class FusionVadJaConfig:
                 os.getenv("FUSIONVAD_JA_CHECKPOINT", DEFAULT_CHECKPOINT).strip()
                 or DEFAULT_CHECKPOINT
             ),
-            threshold=_env_float("FUSIONVAD_JA_THRESHOLD", "0.02"),
+            threshold=_env_float("FUSIONVAD_JA_THRESHOLD", "0.020"),
             pad_s=_env_float("FUSIONVAD_JA_PAD_S", "0.2"),
             frame_hop_s=_env_float("FUSIONVAD_JA_FRAME_HOP_S", "0.02"),
             ptm=os.getenv("FUSIONVAD_JA_PTM", "qwen3-asr-0.6b").strip()
             or "qwen3-asr-0.6b",
-            model_path=os.getenv(
-                "FUSIONVAD_JA_MODEL_PATH", "models/Qwen-Qwen3-ASR-0.6B"
-            ).strip(),
+            model_path=os.getenv("FUSIONVAD_JA_MODEL_PATH", DEFAULT_MODEL_PATH).strip(),
             device=os.getenv("FUSIONVAD_JA_DEVICE", "auto").strip() or "auto",
             dtype=os.getenv("FUSIONVAD_JA_DTYPE", "bfloat16").strip() or "bfloat16",
             attention=os.getenv("FUSIONVAD_JA_ATTENTION", "sdpa").strip() or "sdpa",
@@ -210,12 +254,14 @@ class FusionVadJaConfig:
             merge_gap_s=_env_float("FUSIONVAD_JA_MERGE_GAP_S", "0.0"),
             max_group_s=_env_float("FUSIONVAD_JA_MAX_GROUP_S", "6.0"),
             chunk_threshold_s=_env_float("FUSIONVAD_JA_CHUNK_THRESHOLD_S", "1.0"),
-            no_download=_env_bool("FUSIONVAD_JA_NO_DOWNLOAD", "1"),
+            cut_threshold=_env_float("FUSIONVAD_JA_CUT_THRESHOLD", "0.960"),
+            apply_cut_to_speech=_env_bool("FUSIONVAD_JA_APPLY_CUT_TO_SPEECH", "1"),
+            no_download=_env_bool("FUSIONVAD_JA_NO_DOWNLOAD", "0"),
         )
 
 
 class FusionVadJaBackend:
-    name = "fusionvad_ja_v1_11_synthv5_longgap"
+    name = "fusionvad_ja_v1_16_endpoint_refiner"
 
     def __init__(self, config: FusionVadJaConfig | None = None) -> None:
         self.config = config or FusionVadJaConfig.from_env()
@@ -239,7 +285,9 @@ class FusionVadJaBackend:
             "merge_gap_s": float(cfg.merge_gap_s),
             "max_group_s": float(cfg.max_group_s),
             "chunk_threshold_s": float(cfg.chunk_threshold_s),
-            "operating_point": "v1.11-synthv5-longgap-posw2-threshold-0.02-pad-0.2",
+            "cut_threshold": float(cfg.cut_threshold),
+            "apply_cut_to_speech": bool(cfg.apply_cut_to_speech),
+            "operating_point": DEFAULT_OPERATING_POINT,
             "allow_empty": True,
         }
 
@@ -278,7 +326,7 @@ class FusionVadJaBackend:
             attention=cfg.attention,
             language="Japanese",
         )
-        addition_model, checkpoint, model_config = _load_addition_model(
+        addition_model, checkpoint, model_config, model_type = _load_addition_model(
             cfg.checkpoint,
             device=device,
         )
@@ -313,6 +361,8 @@ class FusionVadJaBackend:
             total_frames = frame_count(duration_s, cfg.frame_hop_s)
             probability_sum = np.zeros(total_frames, dtype=np.float64)
             probability_count = np.zeros(total_frames, dtype=np.float32)
+            cut_probability_sum = np.zeros(total_frames, dtype=np.float64)
+            cut_probability_count = np.zeros(total_frames, dtype=np.float32)
             window_samples = max(1, int(round(cfg.window_s * sample_rate)))
             stride_samples = max(1, int(round((cfg.window_s - cfg.overlap_s) * sample_rate)))
             starts = list(range(0, max(1, len(audio)), stride_samples))
@@ -340,7 +390,9 @@ class FusionVadJaBackend:
                         np.ascontiguousarray(mfcc[:frame_total], dtype=np.float32)
                     ).to(device).unsqueeze(0)
                     logits = addition_model(whisper_tensor, mfcc_tensor)
-                    probs = torch.sigmoid(logits).detach().float().cpu().numpy().reshape(-1)
+                    output_probs = _sigmoid_outputs(logits)
+                    probs = output_probs["speech"]
+                    cut_probs = output_probs.get("cut")
                     window_start_s = start_sample / sample_rate
                     global_start = max(0, int(round(window_start_s / cfg.frame_hop_s)))
                     global_end = min(total_frames, global_start + probs.size)
@@ -349,6 +401,12 @@ class FusionVadJaBackend:
                         continue
                     probability_sum[global_start:global_end] += probs[:local_end]
                     probability_count[global_start:global_end] += 1.0
+                    if cut_probs is not None:
+                        cut_local_end = min(local_end, cut_probs.size)
+                        cut_probability_sum[global_start : global_start + cut_local_end] += cut_probs[
+                            :cut_local_end
+                        ]
+                        cut_probability_count[global_start : global_start + cut_local_end] += 1.0
                     print(
                         "[vad] fusionvad_ja window "
                         f"{window_index + 1}/{len(starts)} start={window_start_s:.1f}s "
@@ -362,7 +420,21 @@ class FusionVadJaBackend:
                 out=np.zeros_like(probability_sum, dtype=np.float64),
                 where=probability_count > 0,
             ).astype(np.float32)
-            raw_frames = probabilities >= threshold
+            cut_probabilities: np.ndarray | None = None
+            if np.any(cut_probability_count > 0):
+                cut_probabilities = np.divide(
+                    cut_probability_sum,
+                    np.maximum(cut_probability_count, 1.0),
+                    out=np.zeros_like(cut_probability_sum, dtype=np.float64),
+                    where=cut_probability_count > 0,
+                ).astype(np.float32)
+            effective_probabilities = _apply_cut_gate(
+                probabilities,
+                cut_probabilities,
+                cut_threshold=cfg.cut_threshold,
+                apply_cut=cfg.apply_cut_to_speech,
+            )
+            raw_frames = effective_probabilities >= threshold
             padded = _padded_frames(
                 raw_frames,
                 pad_frames=max(0, int(round(cfg.pad_s / cfg.frame_hop_s))),
@@ -393,6 +465,18 @@ class FusionVadJaBackend:
                         "windows": len(starts),
                         "probability_mean": float(probabilities.mean()) if probabilities.size else 0.0,
                         "probability_max": float(probabilities.max()) if probabilities.size else 0.0,
+                        "effective_probability_mean": (
+                            float(effective_probabilities.mean()) if effective_probabilities.size else 0.0
+                        ),
+                        "effective_probability_max": (
+                            float(effective_probabilities.max()) if effective_probabilities.size else 0.0
+                        ),
+                        "cut_probability_mean": (
+                            float(cut_probabilities.mean()) if cut_probabilities is not None and cut_probabilities.size else 0.0
+                        ),
+                        "cut_probability_max": (
+                            float(cut_probabilities.max()) if cut_probabilities is not None and cut_probabilities.size else 0.0
+                        ),
                         "raw_speech_ratio": float(raw_frames.mean()) if raw_frames.size else 0.0,
                         "padded_speech_ratio": float(padded.mean()) if padded.size else 0.0,
                         "uncovered_frame_ratio": float((probability_count <= 0).mean())
@@ -400,10 +484,17 @@ class FusionVadJaBackend:
                         else 0.0,
                     },
                     "checkpoint_config": model_config,
+                    "checkpoint_model_type": model_type,
                     "checkpoint_ptm": checkpoint.get("ptm"),
                     "runtime_device": runtime_device,
                 }
             )
+            if _env_bool("FUSIONVAD_JA_EXPORT_FRAME_SCORES", "0") or _env_bool(
+                "ASR_PRE_ASR_VALLEY_SPLIT_ENABLED", "0"
+            ):
+                params["frame_scores"] = [float(value) for value in probabilities]
+                if cut_probabilities is not None:
+                    params["cut_frame_scores"] = [float(value) for value in cut_probabilities]
             return SegmentationResult(
                 segments=segments,
                 groups=groups,

@@ -444,6 +444,46 @@ def _normalize_subtitle_timeline(
     return normalized
 
 
+def _polish_subtitle_timeline(
+    blocks: list[dict],
+    *,
+    options: SubtitleOptions | None = None,
+) -> list[dict]:
+    options = _coerce_options(options)
+    polished = _copy_sorted_blocks(blocks)
+    if not options.timing_polish_enabled or not polished:
+        return polished
+
+    gap_s = _subtitle_gap_s(options)
+    short_gap_s = max(gap_s, float(options.short_gap_collapse_s))
+    linger_s = max(0.0, float(options.linger_s))
+
+    for index, block in enumerate(polished):
+        start = float(block["start"])
+        end = max(start + 0.05, float(block["end"]))
+        if options.max_duration > 0:
+            end = min(end, start + options.max_duration)
+
+        if index + 1 < len(polished):
+            next_start = float(polished[index + 1]["start"])
+            current_gap = max(0.0, next_start - end)
+            max_end = max(start + 0.05, next_start - gap_s)
+            if current_gap < short_gap_s:
+                target_end = max_end
+            else:
+                preserve_pause_end = max(start + 0.05, next_start - short_gap_s)
+                target_end = min(end + linger_s, preserve_pause_end)
+            end = min(max(end, target_end), max_end)
+        elif linger_s > 0:
+            end += linger_s
+
+        if options.max_duration > 0:
+            end = min(end, start + options.max_duration)
+        block["end"] = max(start + 0.05, end)
+
+    return polished
+
+
 def _prepare_subtitle_blocks(
     blocks: list[dict],
     *,
@@ -461,6 +501,7 @@ def _prepare_subtitle_blocks(
         start, end = _resolve_subtitle_window(prepared, idx, options=options)
         prepared[idx - 1]["start"] = start
         prepared[idx - 1]["end"] = end
+    prepared = _polish_subtitle_timeline(prepared, options=options)
     # Reading-duration expansion can push a cue back into the next cue window.
     # Keep this final pass as the hard no-overlap, frame-gap guard for the cue plan.
     prepared = _normalize_subtitle_timeline(prepared, options=options)

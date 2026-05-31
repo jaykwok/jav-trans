@@ -61,6 +61,38 @@ def _chunk_config() -> dict:
         "pack_target_padding_frames": _env_int("ASR_CHUNK_PACK_TARGET_PADDING_FRAMES", "60"),
         "pack_gap_merge_frames": _env_int("ASR_CHUNK_PACK_GAP_MERGE_FRAMES", "45"),
         "pack_max_core_frames": _env_int("ASR_CHUNK_PACK_MAX_CORE_FRAMES", "0"),
+        "pre_asr_island_split_enabled": _env_bool("ASR_PRE_ASR_ISLAND_SPLIT_ENABLED", "0"),
+        "pre_asr_island_split_min_core_frames": _env_int(
+            "ASR_PRE_ASR_ISLAND_SPLIT_MIN_CORE_FRAMES", "420"
+        ),
+        "pre_asr_island_split_min_gap_frames": _env_int(
+            "ASR_PRE_ASR_ISLAND_SPLIT_MIN_GAP_FRAMES", "18"
+        ),
+        "pre_asr_island_split_min_island_frames": _env_int(
+            "ASR_PRE_ASR_ISLAND_SPLIT_MIN_ISLAND_FRAMES", "3"
+        ),
+        "pre_asr_island_split_max_children": _env_int(
+            "ASR_PRE_ASR_ISLAND_SPLIT_MAX_CHILDREN", "8"
+        ),
+        "pre_asr_valley_split_enabled": _env_bool("ASR_PRE_ASR_VALLEY_SPLIT_ENABLED", "0"),
+        "pre_asr_valley_split_min_core_frames": _env_int(
+            "ASR_PRE_ASR_VALLEY_SPLIT_MIN_CORE_FRAMES", "420"
+        ),
+        "pre_asr_valley_split_target_core_frames": _env_int(
+            "ASR_PRE_ASR_VALLEY_SPLIT_TARGET_CORE_FRAMES", "270"
+        ),
+        "pre_asr_valley_split_min_valley_frames": _env_int(
+            "ASR_PRE_ASR_VALLEY_SPLIT_MIN_VALLEY_FRAMES", "6"
+        ),
+        "pre_asr_valley_split_min_child_frames": _env_int(
+            "ASR_PRE_ASR_VALLEY_SPLIT_MIN_CHILD_FRAMES", "45"
+        ),
+        "pre_asr_valley_split_max_children": _env_int(
+            "ASR_PRE_ASR_VALLEY_SPLIT_MAX_CHILDREN", "8"
+        ),
+        "pre_asr_valley_split_threshold": _env_float(
+            "ASR_PRE_ASR_VALLEY_SPLIT_THRESHOLD", "0.20"
+        ),
         "drop_enabled": _env_bool("ASR_CHUNK_DROP_ENABLED", "0"),
         "drop_min_duration_s": _env_float("ASR_CHUNK_DROP_MIN_DURATION_S", "0.20"),
         "drop_rms_dbfs": _env_float("ASR_CHUNK_DROP_RMS_DBFS", "-40.0"),
@@ -115,6 +147,12 @@ _sliding_context_result_text = _transcribe_module._sliding_context_result_text
 _build_initial_prompt_for_chunk = _transcribe_module._build_initial_prompt_for_chunk
 _should_skip_alignment_retry = _transcribe_module._should_skip_alignment_retry
 _needs_alignment_fallback = _transcribe_module._needs_alignment_fallback
+_split_alignment_sentinel_with_speech_islands = (
+    _transcribe_module._split_alignment_sentinel_with_speech_islands
+)
+_split_alignment_sentinels_with_speech_islands_batch = (
+    _transcribe_module._split_alignment_sentinels_with_speech_islands_batch
+)
 _finalize_aligned_chunk_without_asr_retry = _transcribe_module._finalize_aligned_chunk_without_asr_retry
 _refine_chunk_with_subchunks = _transcribe_module._refine_chunk_with_subchunks
 _transcribe_asr_chunk_with_retry = _transcribe_module._transcribe_asr_chunk_with_retry
@@ -306,8 +344,12 @@ def _build_processing_spans(
     if cfg["packing_enabled"]:
         result = vad.segment(audio_path)
         allow_empty_vad = bool(result.parameters.get("allow_empty"))
+        frame_scores = result.parameters.get("frame_scores")
+        result_parameters = {
+            key: value for key, value in result.parameters.items() if key != "frame_scores"
+        }
         runtime_vad_signature = {
-            **result.parameters,
+            **result_parameters,
             "chunk_packing": {
                 "enabled": True,
                 "frame_hop_s": cfg["pack_frame_hop_s"],
@@ -315,6 +357,31 @@ def _build_processing_spans(
                 "reserve_frames": cfg["pack_reserve_frames"],
                 "target_padding_frames": cfg["pack_target_padding_frames"],
                 "gap_merge_frames": cfg["pack_gap_merge_frames"],
+                "max_core_frames": cfg["pack_max_core_frames"],
+                "pre_asr_island_split": {
+                    "enabled": cfg["pre_asr_island_split_enabled"],
+                    "policy": "r15_pre_asr_island_v1",
+                    "min_core_frames": cfg["pre_asr_island_split_min_core_frames"],
+                    "min_gap_frames": cfg["pre_asr_island_split_min_gap_frames"],
+                    "min_island_frames": cfg["pre_asr_island_split_min_island_frames"],
+                    "max_children": cfg["pre_asr_island_split_max_children"],
+                },
+                "pre_asr_valley_split": {
+                    "enabled": cfg["pre_asr_valley_split_enabled"],
+                    "policy": "r16_pre_asr_valley_v1",
+                    "min_core_frames": cfg["pre_asr_valley_split_min_core_frames"],
+                    "target_core_frames": cfg[
+                        "pre_asr_valley_split_target_core_frames"
+                    ],
+                    "min_valley_frames": cfg[
+                        "pre_asr_valley_split_min_valley_frames"
+                    ],
+                    "min_child_frames": cfg[
+                        "pre_asr_valley_split_min_child_frames"
+                    ],
+                    "max_children": cfg["pre_asr_valley_split_max_children"],
+                    "threshold": cfg["pre_asr_valley_split_threshold"],
+                },
             },
         }
         segments = result.segments
@@ -366,6 +433,37 @@ def _build_processing_spans(
             target_padding_frames=cfg["pack_target_padding_frames"],
             gap_merge_frames=cfg["pack_gap_merge_frames"],
             max_core_frames=cfg["pack_max_core_frames"],
+            pre_asr_island_split_enabled=cfg["pre_asr_island_split_enabled"],
+            pre_asr_island_split_min_core_frames=cfg[
+                "pre_asr_island_split_min_core_frames"
+            ],
+            pre_asr_island_split_min_gap_frames=cfg[
+                "pre_asr_island_split_min_gap_frames"
+            ],
+            pre_asr_island_split_min_island_frames=cfg[
+                "pre_asr_island_split_min_island_frames"
+            ],
+            pre_asr_island_split_max_children=cfg[
+                "pre_asr_island_split_max_children"
+            ],
+            pre_asr_valley_split_enabled=cfg["pre_asr_valley_split_enabled"],
+            pre_asr_valley_split_min_core_frames=cfg[
+                "pre_asr_valley_split_min_core_frames"
+            ],
+            pre_asr_valley_split_target_core_frames=cfg[
+                "pre_asr_valley_split_target_core_frames"
+            ],
+            pre_asr_valley_split_min_valley_frames=cfg[
+                "pre_asr_valley_split_min_valley_frames"
+            ],
+            pre_asr_valley_split_min_child_frames=cfg[
+                "pre_asr_valley_split_min_child_frames"
+            ],
+            pre_asr_valley_split_max_children=cfg[
+                "pre_asr_valley_split_max_children"
+            ],
+            pre_asr_valley_split_threshold=cfg["pre_asr_valley_split_threshold"],
+            frame_scores=frame_scores,
         )
         event = _vad_chunk_cache_module.save_processing_spans(
             audio_path,
@@ -387,7 +485,9 @@ def _build_processing_spans(
 
     result = vad.segment(audio_path)
     allow_empty_vad = bool(result.parameters.get("allow_empty"))
-    runtime_vad_signature = dict(result.parameters)
+    runtime_vad_signature = {
+        key: value for key, value in result.parameters.items() if key != "frame_scores"
+    }
     spans = [(group[0].start, group[-1].end) for group in result.groups]
     _set_last_vad_signature(runtime_vad_signature)
     if not spans and not allow_empty_vad:
@@ -448,15 +548,30 @@ def _annotate_packed_chunks(
         chunk["vad_left_padding_s"] = packed.left_padding_s
         chunk["vad_right_padding_s"] = packed.right_padding_s
         chunk["vad_split_reason"] = packed.split_reason
+        chunk["vad_parent_chunk_id"] = packed.parent_chunk_id
+        chunk["vad_island_id"] = packed.island_id
+        chunk["vad_island_count"] = packed.island_count
+        chunk["vad_internal_gap_count"] = packed.internal_gap_count
+        chunk["vad_internal_gap_max_s"] = packed.internal_gap_max_s
+        chunk["vad_split_policy"] = packed.split_policy
+        chunk["vad_valley_split_count"] = packed.valley_split_count
+        chunk["vad_valley_score_min"] = packed.valley_score_min
         log.append(
             "[chunk] idx={idx} dur={duration:.1f} vad_seg_count={count} "
-            "pad=({left:.2f},{right:.2f}) reason={reason}".format(
+            "pad=({left:.2f},{right:.2f}) reason={reason} "
+            "parent={parent} island={island}/{islands} gap_max={gap:.2f} "
+            "valley_splits={valley_splits}".format(
                 idx=idx,
                 duration=packed.duration,
                 count=len(packed.vad_segments),
                 left=packed.left_padding_s,
                 right=packed.right_padding_s,
                 reason=packed.split_reason,
+                parent=packed.parent_chunk_id,
+                island=packed.island_id,
+                islands=packed.island_count,
+                gap=packed.internal_gap_max_s,
+                valley_splits=packed.valley_split_count,
             )
         )
 
@@ -683,16 +798,42 @@ def _transcribe_and_align_local(
                 aligner_unload_elapsed,
             )
 
+            island_split_words, island_split_logs, island_split_attempted = (
+                _split_alignment_sentinels_with_speech_islands_batch(
+                    backend,
+                    audio_path,
+                    chunk_infos,
+                    prepared_results,
+                    on_stage=on_stage,
+                )
+            )
+            if island_split_attempted:
+                log.append(
+                    "Alignment speech-island split batch: "
+                    f"success_chunks={len(island_split_words)} "
+                    f"candidate_chunks={len(island_split_logs)}"
+                )
+
             for idx, chunk, (chunk_result, chunk_log) in zip(
                 range(1, len(chunk_infos) + 1),
                 chunk_infos,
                 prepared_results,
             ):
-                chunk_words, chunk_log = _finalize_aligned_chunk_without_asr_retry(
-                    chunk,
-                    chunk_result,
-                    list(chunk_log),
-                )
+                chunk_index = int(chunk.get("index", idx - 1))
+                chunk_log = list(chunk_log)
+                if chunk_index in island_split_logs:
+                    chunk_log.extend(island_split_logs[chunk_index])
+                if chunk_index in island_split_words:
+                    chunk_words = island_split_words[chunk_index]
+                else:
+                    chunk_words, chunk_log = _finalize_aligned_chunk_without_asr_retry(
+                        chunk,
+                        chunk_result,
+                        chunk_log,
+                        backend=None if island_split_attempted else backend,
+                        source_audio_path=None if island_split_attempted else audio_path,
+                        on_stage=on_stage,
+                    )
                 for entry in chunk_log:
                     if entry.startswith(
                         (
@@ -706,6 +847,8 @@ def _transcribe_and_align_local(
                             "Alignment 模式",
                             "Alignment 异常",
                             "Alignment VAD 回退",
+                            "Alignment speech-island",
+                            "speech-island",
                             "AnimeWhisper 对齐模式",
                             "AnimeWhisper VAD 回退",
                         )

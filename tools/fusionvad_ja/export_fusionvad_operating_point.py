@@ -14,14 +14,23 @@ for path in (SRC_ROOT, TOOLS_ROOT):
     if str(path) not in sys.path:
         sys.path.insert(0, str(path))
 
-from export_addition_predictions import export_predictions  # noqa: E402
+from export_addition_predictions import export_predictions as export_addition_predictions  # noqa: E402
+from export_endpoint_refiner_predictions import export_predictions as export_endpoint_predictions  # noqa: E402
 from vad_recall_metrics import compute_recall_metrics  # noqa: E402
 
 
-DEFAULT_OPERATING_POINT = "fusionvad-ja-v1.11-synthv5-longgap-posw2"
-DEFAULT_THRESHOLD = 0.02
+DEFAULT_OPERATING_POINT = "fusionvad-ja-v1.16-endpoint-refiner-boundary4096"
+DEFAULT_THRESHOLD = 0.020
+DEFAULT_CUT_THRESHOLD = 0.960
 DEFAULT_PAD_S = 0.2
 DEFAULT_FRAME_HOP_S = 0.02
+
+
+def checkpoint_model_type(checkpoint_path: Path) -> str:
+    import torch
+
+    checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+    return str(checkpoint.get("model_type") or "addition_bilstm")
 
 
 def export_operating_point(
@@ -32,6 +41,8 @@ def export_operating_point(
     output_dir: Path,
     device: str,
     threshold: float,
+    cut_threshold: float,
+    apply_cut_to_speech: bool,
     pad_s: float,
     frame_hop_s: float,
     operating_point: str,
@@ -39,15 +50,31 @@ def export_operating_point(
 ) -> dict[str, Any]:
     output_dir.mkdir(parents=True, exist_ok=True)
     predictions_dir = output_dir / "frame-predictions"
-    prediction_summary = export_predictions(
-        labels_path=labels_path,
-        feature_manifest_path=feature_manifest_path,
-        checkpoint_path=checkpoint_path,
-        output_dir=predictions_dir,
-        device=device,
-        threshold=threshold,
-        include_probabilities=include_probabilities,
-    )
+    model_type = checkpoint_model_type(checkpoint_path)
+    if model_type == "addition_endpoint_bilstm":
+        prediction_summary = export_endpoint_predictions(
+            labels_path=labels_path,
+            feature_manifest_path=feature_manifest_path,
+            checkpoint_path=checkpoint_path,
+            output_dir=predictions_dir,
+            device=device,
+            speech_threshold=threshold,
+            start_threshold=0.5,
+            end_threshold=0.5,
+            cut_threshold=cut_threshold,
+            apply_cut_to_speech=apply_cut_to_speech,
+            include_probabilities=include_probabilities,
+        )
+    else:
+        prediction_summary = export_addition_predictions(
+            labels_path=labels_path,
+            feature_manifest_path=feature_manifest_path,
+            checkpoint_path=checkpoint_path,
+            output_dir=predictions_dir,
+            device=device,
+            threshold=threshold,
+            include_probabilities=include_probabilities,
+        )
     recall_metrics_path = output_dir / "high_recall_metrics.json"
     recall_summary = compute_recall_metrics(
         labels_path=labels_path,
@@ -64,6 +91,9 @@ def export_operating_point(
         "checkpoint": str(checkpoint_path),
         "device": device,
         "threshold": float(threshold),
+        "cut_threshold": float(cut_threshold),
+        "apply_cut_to_speech": bool(apply_cut_to_speech),
+        "checkpoint_model_type": model_type,
         "pad_s": float(pad_s),
         "frame_hop_s": float(frame_hop_s),
         "predictions": prediction_summary["predictions"],
@@ -107,6 +137,8 @@ def run(args: argparse.Namespace) -> None:
         output_dir=Path(args.output_dir),
         device=args.device,
         threshold=args.threshold,
+        cut_threshold=args.cut_threshold,
+        apply_cut_to_speech=args.apply_cut_to_speech,
         pad_s=args.pad_s,
         frame_hop_s=args.frame_hop_s,
         operating_point=args.operating_point,
@@ -123,6 +155,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--checkpoint", required=True, help="FusionVAD-JA addition BiLSTM checkpoint.")
     parser.add_argument("--device", default="cpu")
     parser.add_argument("--threshold", type=float, default=DEFAULT_THRESHOLD)
+    parser.add_argument("--cut-threshold", type=float, default=DEFAULT_CUT_THRESHOLD)
+    parser.add_argument("--apply-cut-to-speech", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--pad-s", type=float, default=DEFAULT_PAD_S)
     parser.add_argument("--frame-hop-s", type=float, default=DEFAULT_FRAME_HOP_S)
     parser.add_argument("--operating-point", default=DEFAULT_OPERATING_POINT)
@@ -134,6 +168,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     args = parser.parse_args(argv)
     if args.threshold < 0.0:
         parser.error("--threshold must be non-negative")
+    if args.cut_threshold < 0.0:
+        parser.error("--cut-threshold must be non-negative")
     if args.pad_s < 0.0:
         parser.error("--pad-s must be non-negative")
     if args.frame_hop_s <= 0.0:
