@@ -31,7 +31,7 @@ from whisper.local_backend import (
     looks_like_word_timing_failure,
     word_timing_failure_reasons,
 )
-from whisper.timestamp_fallback import build_word_timestamps_fallback
+from whisper.timestamp_fallback import build_word_timestamps_fallback, detect_speech_spans
 
 
 logger = logging.getLogger(__name__)
@@ -51,6 +51,21 @@ _ALIGNMENT_MAX_CPS = float(os.getenv("ALIGNMENT_MAX_CPS", "50.0"))
 _ALIGNMENT_RETRY_SKIP_MAX_TEXT_LEN = max(
     1,
     int(os.getenv("ALIGNMENT_RETRY_SKIP_MAX_TEXT_LEN", "10")),
+)
+_ALIGNMENT_SENTINEL_ISLAND_MIN_S = float(
+    os.getenv("ALIGNMENT_SENTINEL_ISLAND_MIN_S", "0.25")
+)
+_ALIGNMENT_SENTINEL_ISLAND_PAD_FRAMES = max(
+    0,
+    int(os.getenv("ALIGNMENT_SENTINEL_ISLAND_PAD_FRAMES", "6")),
+)
+_ALIGNMENT_SENTINEL_ISLAND_MERGE_GAP_FRAMES = max(
+    0,
+    int(os.getenv("ALIGNMENT_SENTINEL_ISLAND_MERGE_GAP_FRAMES", "6")),
+)
+_ALIGNMENT_SENTINEL_ISLAND_MAX_SPLITS = max(
+    1,
+    int(os.getenv("ALIGNMENT_SENTINEL_ISLAND_MAX_SPLITS", "8")),
 )
 _ASR_CONTEXT_LEAK_SIMILARITY = float(os.getenv("ASR_CONTEXT_LEAK_SIMILARITY", "0.88"))
 _ASR_FRAGMENT_MERGE_MAX_GAP_S = float(os.getenv("ASR_FRAGMENT_MERGE_MAX_GAP", "1.0"))
@@ -273,6 +288,64 @@ def _build_timestamp_fallback(
         end,
         audio_path=audio_path,
     )
+
+
+def _env_bool(name: str, default: str = "0") -> bool:
+    return os.getenv(name, default).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _sentinel_island_split_enabled() -> bool:
+    return _env_bool("ALIGNMENT_SENTINEL_ISLAND_SPLIT", "0")
+
+
+def _alignment_pack_frame_hop_s() -> float:
+    try:
+        value = float(os.getenv("ASR_CHUNK_PACK_FRAME_HOP_S", str(1.0 / 29.97)))
+    except (TypeError, ValueError):
+        value = 1.0 / 29.97
+    return value if value > 0 else 1.0 / 29.97
+
+
+def _alignment_sentinel_island_pad_s() -> float:
+    return _ALIGNMENT_SENTINEL_ISLAND_PAD_FRAMES * _alignment_pack_frame_hop_s()
+
+
+def _alignment_sentinel_island_merge_gap_s() -> float:
+    return _ALIGNMENT_SENTINEL_ISLAND_MERGE_GAP_FRAMES * _alignment_pack_frame_hop_s()
+
+
+def _clamp_alignment_islands(
+    spans: list[tuple[float, float]],
+    *,
+    duration: float,
+    pad_s: float,
+    merge_gap_s: float,
+    min_s: float,
+) -> list[tuple[float, float]]:
+    prepared: list[tuple[float, float]] = []
+    for raw_start, raw_end in spans:
+        try:
+            start = float(raw_start)
+            end = float(raw_end)
+        except (TypeError, ValueError):
+            continue
+        start = max(0.0, min(duration, start - pad_s))
+        end = max(start, min(duration, end + pad_s))
+        if end - start >= min_s:
+            prepared.append((start, end))
+
+    if not prepared:
+        return []
+    prepared.sort(key=lambda item: (item[0], item[1]))
+
+    merged: list[tuple[float, float]] = []
+    for start, end in prepared:
+        if not merged or start - merged[-1][1] > merge_gap_s:
+            merged.append((start, end))
+            continue
+        prev_start, prev_end = merged[-1]
+        merged[-1] = (prev_start, max(prev_end, end))
+    return merged
 
 
 def _looks_like_alignment_failure(
@@ -969,6 +1042,9 @@ def _finalize_aligned_chunk_without_asr_retry(
     chunk: dict,
     chunk_result: dict,
     chunk_log: list[str],
+    backend: BaseAsrBackend | None = None,
+    source_audio_path: str | None = None,
+    on_stage: Callable[[str], None] | None = None,
 ) -> tuple[list[dict], list[str]]:
     chunk_words = list(chunk_result.get("words", []))
     text = chunk_result.get("text", "")
@@ -978,6 +1054,18 @@ def _finalize_aligned_chunk_without_asr_retry(
 
     if not _needs_alignment_fallback(chunk_words, text, scene_duration_sec=duration):
         return chunk_words, chunk_log
+
+    if backend is not None and source_audio_path:
+        split_words, split_log = _split_alignment_sentinel_with_speech_islands(
+            backend,
+            source_audio_path,
+            chunk,
+            chunk_result,
+            on_stage=on_stage,
+        )
+        chunk_log.extend(split_log)
+        if split_words:
+            return split_words, chunk_log
 
     chunk_log.append(
         "Alignment 哨兵触发: 时间轴异常，不重新调用 ASR，改用 VAD/比例回退"
@@ -1071,6 +1159,335 @@ def _refine_chunk_with_subchunks(
     return refine_words, refine_log
 
 
+def _split_alignment_sentinel_with_speech_islands(
+    backend: BaseAsrBackend,
+    source_audio_path: str,
+    chunk: dict,
+    chunk_result: dict,
+    *,
+    retry_depth: int = 0,
+    on_stage: Callable[[str], None] | None = None,
+) -> tuple[list[dict], list[str]]:
+    plan = _build_alignment_sentinel_island_plan(
+        source_audio_path,
+        chunk,
+        chunk_result,
+        retry_depth=retry_depth,
+    )
+    if plan is None:
+        return [], []
+    if not plan["island_spans"]:
+        return [], list(plan["log"])
+
+    source_path = str(plan["source_path"])
+    chunk_start = float(plan["chunk_start"])
+    duration = float(plan["duration"])
+    split_log = list(plan["log"])
+    split_dir, split_infos = _extract_wav_chunks(source_path, list(plan["island_spans"]))
+    try:
+        backend.unload_forced_aligner(on_stage=on_stage)
+        prepared_results, _stage_timings = _prepare_asr_chunk_results(
+            backend,
+            split_infos,
+            "Alignment speech-island split",
+            on_stage=on_stage,
+        )
+        backend.unload_forced_aligner(on_stage=on_stage)
+        return _collect_alignment_island_split_words(
+            split_infos,
+            prepared_results,
+            split_log,
+            parent_start=chunk_start,
+            parent_duration=duration,
+        )
+    finally:
+        backend.unload_forced_aligner(on_stage=on_stage)
+        if split_dir.exists() and not _KEEP_ASR_CHUNKS:
+            _delete_path_for_cleanup(split_dir)
+
+
+def _build_alignment_sentinel_island_plan(
+    source_audio_path: str | None,
+    chunk: dict,
+    chunk_result: dict,
+    *,
+    retry_depth: int = 0,
+) -> dict | None:
+    if not _sentinel_island_split_enabled() or retry_depth > 0:
+        return None
+
+    alignment_mode = str(chunk_result.get("alignment_mode") or "").strip()
+    if alignment_mode in {"empty", "nonlexical", "align_text_empty"}:
+        return None
+
+    text = str(chunk_result.get("text") or chunk_result.get("raw_text") or "")
+    if not _strip_punctuation(_clean_segment_text(text)):
+        return None
+
+    try:
+        chunk_start = float(chunk["start"])
+        chunk_end = float(chunk["end"])
+        duration = max(0.0, chunk_end - chunk_start)
+    except (KeyError, TypeError, ValueError):
+        return None
+
+    if duration <= 0:
+        return None
+
+    source_path = str(source_audio_path or chunk.get("source_audio_path") or "")
+    if not source_path or not Path(source_path).exists():
+        return {
+            "source_path": source_path,
+            "chunk_start": chunk_start,
+            "duration": duration,
+            "island_spans": [],
+            "log": ["Alignment speech-island split 跳过: source_audio_path missing"],
+        }
+
+    speech_spans, vad_error = detect_speech_spans(str(chunk["path"]))
+    pad_s = _alignment_sentinel_island_pad_s()
+    merge_gap_s = _alignment_sentinel_island_merge_gap_s()
+    islands = _clamp_alignment_islands(
+        speech_spans,
+        duration=duration,
+        pad_s=pad_s,
+        merge_gap_s=merge_gap_s,
+        min_s=_ALIGNMENT_SENTINEL_ISLAND_MIN_S,
+    )
+
+    split_log = [
+        (
+            "Alignment speech-island split: "
+            f"islands={len(islands)} raw_islands={len(speech_spans)} "
+            f"pad_frames={_ALIGNMENT_SENTINEL_ISLAND_PAD_FRAMES} "
+            f"merge_gap_frames={_ALIGNMENT_SENTINEL_ISLAND_MERGE_GAP_FRAMES}"
+        )
+    ]
+    if vad_error:
+        split_log.append(f"Alignment speech-island split VAD warning: {vad_error}")
+
+    if len(islands) <= 1:
+        split_log.append("Alignment speech-island split 跳过: island_count<=1")
+        return {
+            "source_path": source_path,
+            "chunk_start": chunk_start,
+            "duration": duration,
+            "island_spans": [],
+            "log": split_log,
+        }
+    if len(islands) > _ALIGNMENT_SENTINEL_ISLAND_MAX_SPLITS:
+        split_log.append(
+            "Alignment speech-island split 跳过: "
+            f"island_count={len(islands)} > max={_ALIGNMENT_SENTINEL_ISLAND_MAX_SPLITS}"
+        )
+        return {
+            "source_path": source_path,
+            "chunk_start": chunk_start,
+            "duration": duration,
+            "island_spans": [],
+            "log": split_log,
+        }
+
+    island_spans = [
+        (chunk_start + local_start, chunk_start + local_end)
+        for local_start, local_end in islands
+        if local_end > local_start
+    ]
+    if len(island_spans) <= 1:
+        split_log.append("Alignment speech-island split 跳过: valid_island_count<=1")
+        return {
+            "source_path": source_path,
+            "chunk_start": chunk_start,
+            "duration": duration,
+            "island_spans": [],
+            "log": split_log,
+        }
+
+    return {
+        "source_path": source_path,
+        "chunk_start": chunk_start,
+        "duration": duration,
+        "island_spans": island_spans,
+        "log": split_log,
+    }
+
+
+def _collect_alignment_island_split_words(
+    split_infos: list[dict],
+    prepared_results: list[tuple[dict, list[str]]],
+    split_log: list[str],
+    *,
+    parent_start: float,
+    parent_duration: float,
+) -> tuple[list[dict], list[str]]:
+    split_words: list[dict] = []
+    forced_chunks = 0
+    empty_chunks = 0
+    failed_chunks = 0
+    for split_idx, split_chunk, (split_result, split_result_log) in zip(
+        range(1, len(split_infos) + 1),
+        split_infos,
+        prepared_results,
+    ):
+        split_mode = str(split_result.get("alignment_mode", "")).strip()
+        split_text = str(split_result.get("text") or split_result.get("raw_text") or "")
+        words = list(split_result.get("words") or [])
+        if not split_text.strip():
+            empty_chunks += 1
+            continue
+        if split_mode != "forced_aligner":
+            failed_chunks += 1
+            split_log.extend(
+                f"speech-island {split_idx}: {line}"
+                for line in split_result_log
+                if line.startswith(("Alignment 模式", "Alignment 异常", "Alignment VAD 回退"))
+            )
+            continue
+        if not words or _looks_like_alignment_failure(words):
+            failed_chunks += 1
+            reasons = _alignment_failure_reasons(words)
+            split_log.append(
+                "Alignment speech-island split 子片段异常: "
+                f"idx={split_idx} reasons={','.join(reasons) or 'empty_or_unknown'}"
+            )
+            continue
+
+        forced_chunks += 1
+        offset = float(split_chunk["start"]) - parent_start
+        for word in words:
+            try:
+                word_start = float(word["start"]) + offset
+                word_end = float(word["end"]) + offset
+            except (KeyError, TypeError, ValueError):
+                continue
+            word_start = max(0.0, min(parent_duration, word_start))
+            word_end = max(word_start, min(parent_duration, word_end))
+            split_words.append(
+                {
+                    "start": word_start,
+                    "end": word_end,
+                    "word": word.get("word", ""),
+                }
+            )
+
+    split_words.sort(key=lambda item: (item["start"], item["end"]))
+    if split_words and not _looks_like_alignment_failure(split_words):
+        split_log.append(
+            "Alignment speech-island split 成功: "
+            f"islands={len(split_infos)} forced_chunks={forced_chunks} "
+            f"empty_chunks={empty_chunks} failed_chunks={failed_chunks} words={len(split_words)}"
+        )
+        return split_words, split_log
+
+    split_log.append(
+        "Alignment speech-island split 失败: "
+        f"forced_chunks={forced_chunks} empty_chunks={empty_chunks} "
+        f"failed_chunks={failed_chunks} words={len(split_words)}"
+    )
+    return [], split_log
+
+
+def _split_alignment_sentinels_with_speech_islands_batch(
+    backend: BaseAsrBackend,
+    source_audio_path: str,
+    chunks: list[dict],
+    prepared_results: list[tuple[dict, list[str]]],
+    *,
+    on_stage: Callable[[str], None] | None = None,
+) -> tuple[dict[int, list[dict]], dict[int, list[str]], bool]:
+    if not _sentinel_island_split_enabled():
+        return {}, {}, False
+
+    words_by_index: dict[int, list[dict]] = {}
+    logs_by_index: dict[int, list[str]] = {}
+    split_dirs: list[Path] = []
+    split_infos: list[dict] = []
+    parent_groups: dict[int, list[dict]] = {}
+    parent_meta: dict[int, tuple[float, float]] = {}
+
+    for chunk, (chunk_result, _chunk_log) in zip(chunks, prepared_results):
+        try:
+            chunk_index = int(chunk["index"])
+            chunk_start = float(chunk["start"])
+            chunk_end = float(chunk["end"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        duration = max(0.0, chunk_end - chunk_start)
+        if not _needs_alignment_fallback(
+            list(chunk_result.get("words", [])),
+            str(chunk_result.get("text") or ""),
+            scene_duration_sec=duration,
+        ):
+            continue
+
+        plan = _build_alignment_sentinel_island_plan(
+            source_audio_path,
+            chunk,
+            chunk_result,
+        )
+        if plan is None:
+            continue
+        logs_by_index.setdefault(chunk_index, []).extend(list(plan["log"]))
+        if not plan["island_spans"]:
+            continue
+
+        split_dir, parent_split_infos = _extract_wav_chunks(
+            str(plan["source_path"]),
+            list(plan["island_spans"]),
+        )
+        split_dirs.append(split_dir)
+        parent_meta[chunk_index] = (float(plan["chunk_start"]), float(plan["duration"]))
+        for split_info in parent_split_infos:
+            copied_info = dict(split_info)
+            copied_info["index"] = len(split_infos)
+            copied_info["_parent_chunk_index"] = chunk_index
+            parent_groups.setdefault(chunk_index, []).append(copied_info)
+            split_infos.append(copied_info)
+
+    if not split_infos:
+        return words_by_index, logs_by_index, True
+
+    try:
+        backend.unload_forced_aligner(on_stage=on_stage)
+        prepared_split_results, _stage_timings = _prepare_asr_chunk_results(
+            backend,
+            split_infos,
+            "Alignment speech-island split batch",
+            on_stage=on_stage,
+        )
+        backend.unload_forced_aligner(on_stage=on_stage)
+
+        results_by_split_index = {
+            int(split_info["index"]): prepared
+            for split_info, prepared in zip(split_infos, prepared_split_results)
+        }
+        for chunk_index, group_infos in parent_groups.items():
+            parent_start, parent_duration = parent_meta[chunk_index]
+            group_results = [
+                results_by_split_index[int(split_info["index"])]
+                for split_info in group_infos
+                if int(split_info["index"]) in results_by_split_index
+            ]
+            split_words, split_log = _collect_alignment_island_split_words(
+                group_infos,
+                group_results,
+                list(logs_by_index.get(chunk_index, [])),
+                parent_start=parent_start,
+                parent_duration=parent_duration,
+            )
+            logs_by_index[chunk_index] = split_log
+            if split_words:
+                words_by_index[chunk_index] = split_words
+    finally:
+        backend.unload_forced_aligner(on_stage=on_stage)
+        if not _KEEP_ASR_CHUNKS:
+            for split_dir in split_dirs:
+                if split_dir.exists():
+                    _delete_path_for_cleanup(split_dir)
+
+    return words_by_index, logs_by_index, True
+
+
 def _transcribe_asr_chunk_with_retry(
     backend: LocalAsrBackend,
     source_audio_path: str,
@@ -1117,6 +1534,17 @@ def _transcribe_asr_chunk_with_retry(
         return chunk_words, chunk_log
 
     if chunk_mode == "forced_aligner":
+        split_words, split_log = _split_alignment_sentinel_with_speech_islands(
+            backend,
+            source_audio_path,
+            chunk,
+            chunk_result,
+            retry_depth=retry_depth,
+            on_stage=on_stage,
+        )
+        chunk_log.extend(split_log)
+        if split_words:
+            return split_words, chunk_log
         chunk_log.append("Alignment 哨兵触发: forced 模式保留原文，不再对子片段重转写")
         return chunk_words, chunk_log
 

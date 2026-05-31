@@ -36,3 +36,41 @@ def test_qwen_generation_metadata_records_timeout_kind():
     assert metadata["worker_mode"] == "subprocess"
     assert metadata["error_kind"] == "timeout"
     assert metadata["error_detail"] == "worker timeout"
+
+
+def test_qwen_generation_safety_normalizes_inner_generation_config(monkeypatch):
+    generation_config = SimpleNamespace(
+        temperature=0.0,
+        pad_token_id=None,
+        eos_token_id=[151645, 151643],
+        repetition_penalty=1.0,
+    )
+    model = SimpleNamespace(
+        model=SimpleNamespace(
+            thinker=SimpleNamespace(generation_config=generation_config)
+        )
+    )
+    monkeypatch.setattr(local_backend, "ASR_REPETITION_PENALTY", 1.05)
+
+    local_backend._apply_generation_safety(model)
+
+    assert generation_config.temperature is None
+    assert generation_config.pad_token_id == 151645
+    assert generation_config.repetition_penalty == 1.05
+
+
+def test_qwen_generation_safety_handles_direct_generation_config(monkeypatch):
+    generation_config = SimpleNamespace(
+        temperature=0.0,
+        pad_token_id=None,
+        eos_token_id=151645,
+        repetition_penalty=1.0,
+    )
+    model = SimpleNamespace(generation_config=generation_config)
+    monkeypatch.setattr(local_backend, "ASR_REPETITION_PENALTY", 1.0)
+
+    local_backend._apply_generation_safety(model)
+
+    assert generation_config.temperature is None
+    assert generation_config.pad_token_id == 151645
+    assert generation_config.repetition_penalty == 1.0

@@ -79,6 +79,173 @@ def test_max_core_cap_does_not_split_single_island_without_gap():
     assert capped[0].vad_segments == [_seg(2.0, 12.0)]
 
 
+def test_pre_asr_island_split_disabled_keeps_packed_chunk():
+    segments = [_seg(0.0, 2.0), _seg(4.0, 6.0), _seg(8.0, 10.0)]
+
+    chunks = pack_vad_segments(
+        segments,
+        frame_hop_s=1.0,
+        window_frames=30,
+        reserve_frames=2,
+        target_padding_frames=1,
+        gap_merge_frames=3,
+        pre_asr_island_split_enabled=False,
+        pre_asr_island_split_min_core_frames=8,
+        pre_asr_island_split_min_gap_frames=2,
+    )
+
+    assert len(chunks) == 1
+    assert chunks[0].split_reason == "tail"
+    assert chunks[0].internal_gap_count == 2
+    assert chunks[0].internal_gap_max_s == 2.0
+
+
+def test_pre_asr_island_split_cuts_high_risk_multi_island_chunk():
+    segments = [_seg(0.0, 2.0), _seg(4.0, 6.0), _seg(8.0, 10.0)]
+
+    chunks = pack_vad_segments(
+        segments,
+        frame_hop_s=1.0,
+        window_frames=30,
+        reserve_frames=2,
+        target_padding_frames=1,
+        gap_merge_frames=3,
+        pre_asr_island_split_enabled=True,
+        pre_asr_island_split_min_core_frames=8,
+        pre_asr_island_split_min_gap_frames=2,
+        pre_asr_island_split_min_island_frames=1,
+    )
+
+    assert [[(seg.start, seg.end) for seg in chunk.vad_segments] for chunk in chunks] == [
+        [(0.0, 2.0)],
+        [(4.0, 6.0)],
+        [(8.0, 10.0)],
+    ]
+    assert [chunk.split_reason for chunk in chunks] == [
+        "pre_asr_island_split",
+        "pre_asr_island_split",
+        "pre_asr_island_split",
+    ]
+    assert [chunk.parent_chunk_id for chunk in chunks] == [0, 0, 0]
+    assert [chunk.island_id for chunk in chunks] == [0, 1, 2]
+    assert [chunk.island_count for chunk in chunks] == [3, 3, 3]
+    assert {chunk.split_policy for chunk in chunks} == {"r15_pre_asr_island_v1"}
+    assert chunks[0].end <= chunks[1].start
+
+
+def test_pre_asr_island_split_ignores_short_multi_island_chunk():
+    chunks = pack_vad_segments(
+        [_seg(0.0, 1.0), _seg(3.0, 4.0)],
+        frame_hop_s=1.0,
+        window_frames=30,
+        reserve_frames=2,
+        target_padding_frames=1,
+        gap_merge_frames=3,
+        pre_asr_island_split_enabled=True,
+        pre_asr_island_split_min_core_frames=8,
+        pre_asr_island_split_min_gap_frames=2,
+    )
+
+    assert len(chunks) == 1
+    assert chunks[0].split_reason == "tail"
+    assert chunks[0].parent_chunk_id is None
+
+
+def test_pre_asr_island_split_merges_tiny_island_into_neighbor():
+    chunks = pack_vad_segments(
+        [_seg(0.0, 2.0), _seg(4.0, 4.2), _seg(6.0, 8.0)],
+        frame_hop_s=1.0,
+        window_frames=30,
+        reserve_frames=2,
+        target_padding_frames=1,
+        gap_merge_frames=3,
+        pre_asr_island_split_enabled=True,
+        pre_asr_island_split_min_core_frames=6,
+        pre_asr_island_split_min_gap_frames=1,
+        pre_asr_island_split_min_island_frames=1,
+    )
+
+    assert [[(seg.start, seg.end) for seg in chunk.vad_segments] for chunk in chunks] == [
+        [(0.0, 2.0), (4.0, 4.2)],
+        [(6.0, 8.0)],
+    ]
+
+
+def test_pre_asr_valley_split_disabled_keeps_long_continuous_segment():
+    segment = _seg(0.0, 12.0)
+    scores = [0.9] * 5 + [0.05] * 2 + [0.9] * 5
+
+    chunks = pack_vad_segments(
+        [segment],
+        frame_hop_s=1.0,
+        window_frames=30,
+        reserve_frames=2,
+        target_padding_frames=1,
+        gap_merge_frames=0,
+        pre_asr_valley_split_enabled=False,
+        pre_asr_valley_split_min_core_frames=8,
+        pre_asr_valley_split_target_core_frames=5,
+        pre_asr_valley_split_min_valley_frames=2,
+        pre_asr_valley_split_min_child_frames=3,
+        frame_scores=scores,
+    )
+
+    assert len(chunks) == 1
+    assert chunks[0].vad_segments == [segment]
+    assert chunks[0].valley_split_count == 0
+
+
+def test_pre_asr_valley_split_cuts_long_continuous_segment_at_low_scores():
+    scores = [0.9] * 5 + [0.05] * 2 + [0.9] * 5
+
+    chunks = pack_vad_segments(
+        [_seg(0.0, 12.0)],
+        frame_hop_s=1.0,
+        window_frames=30,
+        reserve_frames=2,
+        target_padding_frames=1,
+        gap_merge_frames=0,
+        pre_asr_valley_split_enabled=True,
+        pre_asr_valley_split_min_core_frames=8,
+        pre_asr_valley_split_target_core_frames=5,
+        pre_asr_valley_split_min_valley_frames=2,
+        pre_asr_valley_split_min_child_frames=3,
+        pre_asr_valley_split_threshold=0.2,
+        frame_scores=scores,
+    )
+
+    assert len(chunks) == 2
+    assert chunks[0].split_reason == "pre_asr_valley_split"
+    assert chunks[1].split_reason == "pre_asr_valley_split"
+    assert chunks[0].vad_segments[0].end == pytest.approx(6.0)
+    assert chunks[1].vad_segments[0].start == pytest.approx(6.0)
+    assert {chunk.split_policy for chunk in chunks} == {"r16_pre_asr_valley_v1"}
+    assert chunks[0].valley_score_min == pytest.approx(0.05)
+
+
+def test_pre_asr_valley_split_requires_sustained_low_score_run():
+    scores = [0.9] * 5 + [0.05] + [0.9] * 6
+
+    chunks = pack_vad_segments(
+        [_seg(0.0, 12.0)],
+        frame_hop_s=1.0,
+        window_frames=30,
+        reserve_frames=2,
+        target_padding_frames=1,
+        gap_merge_frames=0,
+        pre_asr_valley_split_enabled=True,
+        pre_asr_valley_split_min_core_frames=8,
+        pre_asr_valley_split_target_core_frames=5,
+        pre_asr_valley_split_min_valley_frames=2,
+        pre_asr_valley_split_min_child_frames=3,
+        pre_asr_valley_split_threshold=0.2,
+        frame_scores=scores,
+    )
+
+    assert len(chunks) == 1
+    assert chunks[0].split_policy == ""
+
+
 def test_near_capacity_segment_reduces_padding_to_fit_window_reserve():
     chunks = _pack([_seg(2.0, 28.0)])
 

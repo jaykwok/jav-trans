@@ -14,6 +14,9 @@ def test_subtitle_options_from_env(monkeypatch):
     monkeypatch.setenv("SUBTITLE_READING_CPS", "10")
     monkeypatch.setenv("SUBTITLE_MERGE_ADJACENT", "0")
     monkeypatch.setenv("SUBTITLE_SHOW_SPEAKER", "1")
+    monkeypatch.setenv("SUBTITLE_TIMING_POLISH_ENABLED", "0")
+    monkeypatch.setenv("SUBTITLE_SHORT_GAP_COLLAPSE_S", "0.4")
+    monkeypatch.setenv("SUBTITLE_LINGER_S", "0.3")
 
     options = SubtitleOptions.from_env()
 
@@ -25,6 +28,9 @@ def test_subtitle_options_from_env(monkeypatch):
     assert options.merge_adjacent is False
     assert options.line_max_chars == 18
     assert options.show_speaker is True
+    assert options.timing_polish_enabled is False
+    assert options.short_gap_collapse_s == 0.4
+    assert options.linger_s == 0.3
 
 
 def test_subtitle_options_defaults_are_conservative(monkeypatch):
@@ -37,6 +43,9 @@ def test_subtitle_options_defaults_are_conservative(monkeypatch):
     assert options.soft_max == 5.5
     assert options.effective_video_fps == FALLBACK_VIDEO_FPS
     assert options.frame_gap_s == 2 / FALLBACK_VIDEO_FPS
+    assert options.timing_polish_enabled is True
+    assert options.short_gap_collapse_s == 0.5
+    assert options.linger_s == 0.45
 
 
 def test_subtitle_options_video_fps_falls_back_to_ntsc():
@@ -87,7 +96,7 @@ def test_prepare_srt_blocks_timeline_mode_is_per_options(monkeypatch, tmp_path):
     )
 
     content = path.read_text(encoding="utf-8")
-    assert "00:00:00,000 --> 00:00:00,600" in content
+    assert "00:00:00,000 --> 00:00:01,050" in content
 
 
 def test_prepare_bilingual_merge_adjacent_is_per_options(monkeypatch, tmp_path):

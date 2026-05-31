@@ -19,7 +19,7 @@ from whisper.prealign import (
 )
 from whisper.timestamp_fallback import build_word_timestamps_fallback
 
-ASR_MODEL_ID = os.getenv("ASR_MODEL_ID", "Qwen/Qwen3-ASR-1.7B")
+ASR_MODEL_ID = os.getenv("ASR_MODEL_ID", "jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame")
 ALIGNER_MODEL_ID = os.getenv("ALIGNER_MODEL_ID", "Qwen/Qwen3-ForcedAligner-0.6B")
 ASR_MODEL_PATH = os.getenv("ASR_MODEL_PATH", "").strip()
 ALIGNER_MODEL_PATH = os.getenv("ALIGNER_MODEL_PATH", "").strip()
@@ -251,7 +251,45 @@ def _compact_text_len(text: str) -> int:
     return len(_strip_punctuation(text))
 
 
+def _first_token_id(value) -> int | None:
+    if isinstance(value, int):
+        return value
+    if isinstance(value, (list, tuple)):
+        for item in value:
+            token_id = _first_token_id(item)
+            if token_id is not None:
+                return token_id
+    return None
+
+
+def _iter_generation_configs(model) -> list:
+    configs = []
+    for candidate in (
+        model,
+        getattr(model, "model", None),
+        getattr(getattr(model, "model", None), "thinker", None),
+    ):
+        generation_config = getattr(candidate, "generation_config", None)
+        if generation_config is not None and generation_config not in configs:
+            configs.append(generation_config)
+    return configs
+
+
+def _normalize_deterministic_generation_config(model) -> None:
+    for generation_config in _iter_generation_configs(model):
+        if getattr(generation_config, "temperature", None) not in {None, 1.0}:
+            generation_config.temperature = None
+
+        if getattr(generation_config, "pad_token_id", None) is None:
+            eos_token_id = _first_token_id(
+                getattr(generation_config, "eos_token_id", None)
+            )
+            if eos_token_id is not None:
+                generation_config.pad_token_id = eos_token_id
+
+
 def _apply_generation_safety(model) -> None:
+    _normalize_deterministic_generation_config(model)
     if ASR_REPETITION_PENALTY <= 1.0:
         return
     try:
@@ -640,6 +678,7 @@ class LocalAsrBackend:
         if self.attention and self.attention != "sdpa":
             model_kwargs["attn_implementation"] = self.attention
         self.forced_aligner = Qwen3ForcedAligner.from_pretrained(aligner_spec, **model_kwargs)
+        _normalize_deterministic_generation_config(self.forced_aligner)
         return self.forced_aligner
 
     def unload_model(self, on_stage: Callable[[str], None] | None = None) -> None:

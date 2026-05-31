@@ -11,6 +11,10 @@ from utils import model_paths
 
 def test_model_dir_name_uses_huggingface_repo_name():
     assert model_paths.model_dir_name("Qwen/Qwen3-ASR-1.7B") == "Qwen-Qwen3-ASR-1.7B"
+    assert (
+        model_paths.model_dir_name("jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame")
+        == "jaykwok-Qwen3-ASR-1.7B-JA-Anime-Galgame"
+    )
     assert model_paths.model_dir_name("litagin/anime-whisper") == "litagin-anime-whisper"
     assert model_paths.model_dir_name("efwkjn/whisper-ja-1.5B") == "efwkjn-whisper-ja-1.5B"
     assert (

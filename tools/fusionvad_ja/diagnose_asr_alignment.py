@@ -856,8 +856,15 @@ def main() -> int:
     aligned_paths = discover_aligned_jsons(workflow_root, explicit)
     if not aligned_paths:
         raise SystemExit("No aligned_segments JSON files found.")
-    if args.case_label and len(args.case_label) != len(aligned_paths):
-        raise SystemExit("--case-label count must match discovered aligned JSON count.")
+    if args.case_label and len(args.case_label) not in {1, len(aligned_paths)}:
+        raise SystemExit(
+            "--case-label count must be 1 or match discovered aligned JSON count."
+        )
+    case_labels = (
+        args.case_label * len(aligned_paths)
+        if len(args.case_label) == 1 and len(aligned_paths) > 1
+        else args.case_label
+    )
 
     all_rows: list[dict[str, Any]] = []
     case_summaries: list[dict[str, Any]] = []
@@ -865,7 +872,7 @@ def main() -> int:
         rows, case_summary = diagnose_case(
             aligned_path=aligned_path,
             workflow_root=workflow_root,
-            case_label=args.case_label[idx] if args.case_label else None,
+            case_label=case_labels[idx] if case_labels else None,
         )
         all_rows.extend(rows)
         case_summaries.append(case_summary)

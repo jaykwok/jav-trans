@@ -106,7 +106,7 @@ def configure_env(args: argparse.Namespace) -> None:
     os.environ["ASR_BACKEND"] = args.asr_backend
     os.environ["ASR_VAD_BACKEND"] = "fusionvad_ja"
     os.environ["ASR_MODEL_PATH"] = str(project_path(args.asr_model_path))
-    os.environ.setdefault("ASR_MODEL_ID", "Qwen/Qwen3-ASR-1.7B")
+    os.environ.setdefault("ASR_MODEL_ID", "jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame")
     os.environ.setdefault("ALIGNER_MODEL_PATH", str(project_path(args.aligner_model_path)))
     os.environ.setdefault("ALIGNER_MODEL_ID", "Qwen/Qwen3-ForcedAligner-0.6B")
     os.environ.setdefault("ASR_WORKER_MODE", args.asr_worker_mode)
@@ -141,6 +141,8 @@ def configure_env(args: argparse.Namespace) -> None:
     os.environ["FUSIONVAD_JA_OVERLAP_S"] = str(args.fusionvad_overlap_s)
     os.environ["FUSIONVAD_JA_MIN_SEGMENT_S"] = str(args.fusionvad_min_segment_s)
     os.environ["FUSIONVAD_JA_MERGE_GAP_S"] = str(args.fusionvad_merge_gap_s)
+    os.environ["FUSIONVAD_JA_CUT_THRESHOLD"] = str(args.fusionvad_cut_threshold)
+    os.environ["FUSIONVAD_JA_APPLY_CUT_TO_SPEECH"] = "1" if args.fusionvad_apply_cut_to_speech else "0"
     os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
 
@@ -186,6 +188,8 @@ def build_context(*, args: argparse.Namespace, paths: RunPaths, video: Path):
         "FUSIONVAD_JA_OVERLAP_S": str(args.fusionvad_overlap_s),
         "FUSIONVAD_JA_MIN_SEGMENT_S": str(args.fusionvad_min_segment_s),
         "FUSIONVAD_JA_MERGE_GAP_S": str(args.fusionvad_merge_gap_s),
+        "FUSIONVAD_JA_CUT_THRESHOLD": str(args.fusionvad_cut_threshold),
+        "FUSIONVAD_JA_APPLY_CUT_TO_SPEECH": "1" if args.fusionvad_apply_cut_to_speech else "0",
         "KEEP_ASR_CHUNKS": "1" if args.keep_asr_chunks else "0",
         "FAIL_ON_QC_BLOCK": "0",
     }
@@ -350,7 +354,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--asr-backend", default="qwen3-asr-1.7b")
     parser.add_argument(
         "--asr-model-path",
-        default="models/Qwen-Qwen3-ASR-1.7B-galgame-asr200k-bs4/checkpoint-6250",
+        default="models/jaykwok-Qwen3-ASR-1.7B-JA-Anime-Galgame",
     )
     parser.add_argument("--aligner-model-path", default="models/Qwen-Qwen3-ForcedAligner-0.6B")
     parser.add_argument("--asr-worker-mode", default="subprocess")
@@ -385,21 +389,30 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--fusionvad-checkpoint",
         default=(
-            "datasets/train/fusionvad-ja/v1-11/qwen3-asr-0.6b/"
-            "addition-bilstm-ft-v1mini-galgame-synthv5-longgap-posw2-558-batch16-lr2e-4-steps1024/"
-            "fusionvad_ja_addition_bilstm.pt"
+            "datasets/train/fusionvad-ja/v1-16/qwen3-asr-0.6b-full29239/"
+            "endpoint-refiner-boundary4096-v1mini-batch16-lr2e-4-steps2048-posaux120-cut8/"
+            "fusionvad_ja_endpoint_refiner.pt"
         ),
     )
-    parser.add_argument("--fusionvad-threshold", type=float, default=0.02)
+    parser.add_argument("--fusionvad-threshold", type=float, default=0.020)
     parser.add_argument("--fusionvad-pad-s", type=float, default=0.2)
     parser.add_argument("--fusionvad-ptm", default="qwen3-asr-0.6b")
-    parser.add_argument("--fusionvad-model-path", default="models/Qwen-Qwen3-ASR-0.6B")
+    parser.add_argument(
+        "--fusionvad-model-path",
+        default="models/jaykwok-Qwen3-ASR-0.6B-JA-Anime-Galgame",
+    )
     parser.add_argument("--fusionvad-device", default="auto")
     parser.add_argument("--fusionvad-dtype", default="bfloat16")
     parser.add_argument("--fusionvad-window-s", type=float, default=30.0)
     parser.add_argument("--fusionvad-overlap-s", type=float, default=1.0)
     parser.add_argument("--fusionvad-min-segment-s", type=float, default=0.05)
     parser.add_argument("--fusionvad-merge-gap-s", type=float, default=0.0)
+    parser.add_argument("--fusionvad-cut-threshold", type=float, default=0.960)
+    parser.add_argument(
+        "--fusionvad-apply-cut-to-speech",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
     args = parser.parse_args(argv)
     if args.fusionvad_threshold < 0:
         parser.error("--fusionvad-threshold must be non-negative")
@@ -409,6 +422,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         parser.error("--fusionvad-window-s must be positive")
     if args.fusionvad_overlap_s < 0 or args.fusionvad_overlap_s >= args.fusionvad_window_s:
         parser.error("--fusionvad-overlap-s must be non-negative and smaller than window")
+    if args.fusionvad_cut_threshold < 0:
+        parser.error("--fusionvad-cut-threshold must be non-negative")
     return args
 
 

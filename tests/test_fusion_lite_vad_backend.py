@@ -29,7 +29,7 @@ def test_vad_registry_exposes_current_modes(monkeypatch):
         raising=False,
     )
     fusionvad_ja = vad.get_vad_backend("fusionvad_ja")
-    assert fusionvad_ja.name == "fusionvad_ja_v1_11_synthv5_longgap"
+    assert fusionvad_ja.name == "fusionvad_ja_v1_16_endpoint_refiner"
     with pytest.raises(ValueError, match="fusion_lite_boost"):
         vad.get_vad_backend("fusion_lite_boost")
     with pytest.raises(ValueError, match="whisperseg"):
@@ -52,14 +52,24 @@ def test_vad_registry_default_is_research_fusionvad_ja(monkeypatch):
 
     backend = vad.get_vad_backend()
 
-    assert backend.name == "fusionvad_ja_v1_11_synthv5_longgap"
+    assert backend.name == "fusionvad_ja_v1_16_endpoint_refiner"
 
 
 def test_fusionvad_ja_frames_to_segments_pads_and_scores():
-    from vad.fusionvad_ja.backend import _padded_frames, frames_to_segments, merge_segments
+    import numpy as np
+
+    from vad.fusionvad_ja.backend import _apply_cut_gate, _padded_frames, frames_to_segments, merge_segments
 
     padded = _padded_frames([0, 1, 0, 0], pad_frames=1)
     assert padded.tolist() == [1, 1, 1, 0]
+
+    gated = _apply_cut_gate(
+        np.array([0.9, 0.8, 0.7], dtype=np.float32),
+        np.array([0.1, 0.97, 0.2], dtype=np.float32),
+        cut_threshold=0.96,
+        apply_cut=True,
+    )
+    assert gated.tolist() == pytest.approx([0.9, 0.0, 0.7])
 
     segments = frames_to_segments(
         [0, 1, 1, 0, 1],
