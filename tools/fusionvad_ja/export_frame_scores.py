@@ -50,13 +50,16 @@ def export_frame_scores(*, audio_path: Path, output_path: Path) -> dict[str, Any
             os.environ["FUSIONVAD_JA_EXPORT_FRAME_SCORES"] = previous
 
     scores = result.parameters.get("frame_scores") or []
+    cut_scores = result.parameters.get("cut_frame_scores") or []
     payload = {
         "audio_path": project_rel(audio_path),
         "backend": result.method,
         "duration_s": float(result.audio_duration_sec),
         "frame_hop_s": float(result.parameters.get("frame_hop_s") or 0.02),
         "frame_count": len(scores),
+        "cut_frame_count": len(cut_scores),
         "threshold": float(result.parameters.get("threshold") or 0.0),
+        "cut_threshold": float(result.parameters.get("cut_threshold") or 0.0),
         "segments": [
             {"start": float(segment.start), "end": float(segment.end), "score": segment.score}
             for segment in result.segments
@@ -64,6 +67,7 @@ def export_frame_scores(*, audio_path: Path, output_path: Path) -> dict[str, Any
         "audio_stats": result.parameters.get("audio_stats") or {},
         "runtime_device": result.parameters.get("runtime_device") or {},
         "scores": [float(value) for value in scores],
+        "cut_scores": [float(value) for value in cut_scores],
     }
     write_json(output_path, payload)
     return payload

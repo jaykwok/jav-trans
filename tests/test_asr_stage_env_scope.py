@@ -100,6 +100,56 @@ def test_asr_stage_env_scope_reaches_cache_and_transcribe(monkeypatch, tmp_path)
     assert main.os.environ["ASR_CONTEXT"] == "process actor"
 
 
+def test_asr_stage_env_scope_passes_pre_asr_split_flags(monkeypatch, tmp_path):
+    video_path = tmp_path / "sample.mp4"
+    video_path.write_bytes(b"fake-video")
+    output_dir = tmp_path / "out"
+    temp_root = tmp_path / "jobs"
+    ctx = make_job_context(
+        video_path,
+        output_dir,
+        temp_root,
+        asr_backend="qwen3-asr-1.7b",
+        skip_translation=True,
+        keep_temp_files=True,
+        advanced={
+            "ASR_PRE_ASR_CUT_SPLIT_ENABLED": "1",
+            "ASR_PRE_ASR_CUT_SPLIT_THRESHOLD": "0.92",
+        },
+    )
+    monkeypatch.setattr(main.torch.cuda, "is_available", lambda: False)
+    monkeypatch.setattr(pipeline_audio, "probe_video_fps", lambda _path: 30.0)
+
+    seen = {}
+
+    monkeypatch.setattr(main.asr_module, "get_backend_label", lambda: "mock_asr")
+    monkeypatch.setattr(main.aligned_cache_module, "try_load_aligned_segments", lambda *a, **k: None)
+
+    def fake_extract_audio(_video_path: str, out_path: str) -> None:
+        Path(out_path).parent.mkdir(parents=True, exist_ok=True)
+        Path(out_path).write_bytes(b"wav")
+
+    def fake_transcribe_and_align(_audio_path, _device, on_stage=None, include_details=False):
+        seen["cut_enabled"] = main.os.environ.get("ASR_PRE_ASR_CUT_SPLIT_ENABLED")
+        seen["cut_threshold"] = main.os.environ.get("ASR_PRE_ASR_CUT_SPLIT_THRESHOLD")
+        return (
+            [{"start": 0.0, "end": 1.0, "text": "こんにちは"}],
+            ["mock asr"],
+            {"transcript_chunks": [], "stage_timings": {}},
+        )
+
+    monkeypatch.setattr(pipeline_audio, "extract_audio", fake_extract_audio)
+    monkeypatch.setattr(main.asr_module, "transcribe_and_align", fake_transcribe_and_align)
+
+    main.run_asr_alignment_f0(
+        str(video_path),
+        ctx=ctx,
+        job_id=ctx.job_id,
+    )
+
+    assert seen == {"cut_enabled": "1", "cut_threshold": "0.92"}
+
+
 def test_vad_chunk_cache_dir_reaches_transcribe_but_not_aligned_signature(
     monkeypatch,
     tmp_path,

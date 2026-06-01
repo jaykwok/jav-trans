@@ -93,6 +93,25 @@ def _chunk_config() -> dict:
         "pre_asr_valley_split_threshold": _env_float(
             "ASR_PRE_ASR_VALLEY_SPLIT_THRESHOLD", "0.20"
         ),
+        "pre_asr_cut_split_enabled": _env_bool("ASR_PRE_ASR_CUT_SPLIT_ENABLED", "0"),
+        "pre_asr_cut_split_min_core_frames": _env_int(
+            "ASR_PRE_ASR_CUT_SPLIT_MIN_CORE_FRAMES", "420"
+        ),
+        "pre_asr_cut_split_target_core_frames": _env_int(
+            "ASR_PRE_ASR_CUT_SPLIT_TARGET_CORE_FRAMES", "270"
+        ),
+        "pre_asr_cut_split_min_cut_frames": _env_int(
+            "ASR_PRE_ASR_CUT_SPLIT_MIN_CUT_FRAMES", "3"
+        ),
+        "pre_asr_cut_split_min_child_frames": _env_int(
+            "ASR_PRE_ASR_CUT_SPLIT_MIN_CHILD_FRAMES", "45"
+        ),
+        "pre_asr_cut_split_max_children": _env_int(
+            "ASR_PRE_ASR_CUT_SPLIT_MAX_CHILDREN", "8"
+        ),
+        "pre_asr_cut_split_threshold": _env_float(
+            "ASR_PRE_ASR_CUT_SPLIT_THRESHOLD", "0.94"
+        ),
         "drop_enabled": _env_bool("ASR_CHUNK_DROP_ENABLED", "0"),
         "drop_min_duration_s": _env_float("ASR_CHUNK_DROP_MIN_DURATION_S", "0.20"),
         "drop_rms_dbfs": _env_float("ASR_CHUNK_DROP_RMS_DBFS", "-40.0"),
@@ -345,14 +364,19 @@ def _build_processing_spans(
         result = vad.segment(audio_path)
         allow_empty_vad = bool(result.parameters.get("allow_empty"))
         frame_scores = result.parameters.get("frame_scores")
+        cut_frame_scores = result.parameters.get("cut_frame_scores")
+        score_frame_hop_s = result.parameters.get("frame_hop_s")
         result_parameters = {
-            key: value for key, value in result.parameters.items() if key != "frame_scores"
+            key: value
+            for key, value in result.parameters.items()
+            if key not in {"frame_scores", "cut_frame_scores"}
         }
         runtime_vad_signature = {
             **result_parameters,
             "chunk_packing": {
                 "enabled": True,
                 "frame_hop_s": cfg["pack_frame_hop_s"],
+                "score_frame_hop_s": score_frame_hop_s,
                 "window_frames": cfg["pack_window_frames"],
                 "reserve_frames": cfg["pack_reserve_frames"],
                 "target_padding_frames": cfg["pack_target_padding_frames"],
@@ -381,6 +405,16 @@ def _build_processing_spans(
                     ],
                     "max_children": cfg["pre_asr_valley_split_max_children"],
                     "threshold": cfg["pre_asr_valley_split_threshold"],
+                },
+                "pre_asr_cut_split": {
+                    "enabled": cfg["pre_asr_cut_split_enabled"],
+                    "policy": "r17_pre_asr_cut_v1",
+                    "min_core_frames": cfg["pre_asr_cut_split_min_core_frames"],
+                    "target_core_frames": cfg["pre_asr_cut_split_target_core_frames"],
+                    "min_cut_frames": cfg["pre_asr_cut_split_min_cut_frames"],
+                    "min_child_frames": cfg["pre_asr_cut_split_min_child_frames"],
+                    "max_children": cfg["pre_asr_cut_split_max_children"],
+                    "threshold": cfg["pre_asr_cut_split_threshold"],
                 },
             },
         }
@@ -464,6 +498,25 @@ def _build_processing_spans(
             ],
             pre_asr_valley_split_threshold=cfg["pre_asr_valley_split_threshold"],
             frame_scores=frame_scores,
+            score_frame_hop_s=score_frame_hop_s,
+            pre_asr_cut_split_enabled=cfg["pre_asr_cut_split_enabled"],
+            pre_asr_cut_split_min_core_frames=cfg[
+                "pre_asr_cut_split_min_core_frames"
+            ],
+            pre_asr_cut_split_target_core_frames=cfg[
+                "pre_asr_cut_split_target_core_frames"
+            ],
+            pre_asr_cut_split_min_cut_frames=cfg[
+                "pre_asr_cut_split_min_cut_frames"
+            ],
+            pre_asr_cut_split_min_child_frames=cfg[
+                "pre_asr_cut_split_min_child_frames"
+            ],
+            pre_asr_cut_split_max_children=cfg[
+                "pre_asr_cut_split_max_children"
+            ],
+            pre_asr_cut_split_threshold=cfg["pre_asr_cut_split_threshold"],
+            cut_frame_scores=cut_frame_scores,
         )
         event = _vad_chunk_cache_module.save_processing_spans(
             audio_path,
@@ -486,7 +539,9 @@ def _build_processing_spans(
     result = vad.segment(audio_path)
     allow_empty_vad = bool(result.parameters.get("allow_empty"))
     runtime_vad_signature = {
-        key: value for key, value in result.parameters.items() if key != "frame_scores"
+        key: value
+        for key, value in result.parameters.items()
+        if key not in {"frame_scores", "cut_frame_scores"}
     }
     spans = [(group[0].start, group[-1].end) for group in result.groups]
     _set_last_vad_signature(runtime_vad_signature)
@@ -556,11 +611,13 @@ def _annotate_packed_chunks(
         chunk["vad_split_policy"] = packed.split_policy
         chunk["vad_valley_split_count"] = packed.valley_split_count
         chunk["vad_valley_score_min"] = packed.valley_score_min
+        chunk["vad_cut_split_count"] = packed.cut_split_count
+        chunk["vad_cut_score_max"] = packed.cut_score_max
         log.append(
             "[chunk] idx={idx} dur={duration:.1f} vad_seg_count={count} "
             "pad=({left:.2f},{right:.2f}) reason={reason} "
             "parent={parent} island={island}/{islands} gap_max={gap:.2f} "
-            "valley_splits={valley_splits}".format(
+            "valley_splits={valley_splits} cut_splits={cut_splits}".format(
                 idx=idx,
                 duration=packed.duration,
                 count=len(packed.vad_segments),
@@ -572,6 +629,7 @@ def _annotate_packed_chunks(
                 islands=packed.island_count,
                 gap=packed.internal_gap_max_s,
                 valley_splits=packed.valley_split_count,
+                cut_splits=packed.cut_split_count,
             )
         )
 

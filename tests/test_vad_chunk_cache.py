@@ -34,6 +34,13 @@ def _chunk_config() -> dict:
         "pre_asr_valley_split_min_child_frames": 45,
         "pre_asr_valley_split_max_children": 8,
         "pre_asr_valley_split_threshold": 0.20,
+        "pre_asr_cut_split_enabled": False,
+        "pre_asr_cut_split_min_core_frames": 420,
+        "pre_asr_cut_split_target_core_frames": 270,
+        "pre_asr_cut_split_min_cut_frames": 3,
+        "pre_asr_cut_split_min_child_frames": 45,
+        "pre_asr_cut_split_max_children": 8,
+        "pre_asr_cut_split_threshold": 0.94,
     }
 
 
@@ -119,6 +126,8 @@ def test_vad_chunk_cache_round_trips_packed_chunks(monkeypatch, tmp_path):
             split_policy="r15_pre_asr_island_v1",
             valley_split_count=1,
             valley_score_min=0.05,
+            cut_split_count=1,
+            cut_score_max=0.97,
             vad_segments=[SpeechSegment(0.2, 0.4, 0.9)],
         )
     ]
@@ -154,6 +163,8 @@ def test_vad_chunk_cache_round_trips_packed_chunks(monkeypatch, tmp_path):
     assert loaded_chunks[0].split_policy == "r15_pre_asr_island_v1"
     assert loaded_chunks[0].valley_split_count == 1
     assert loaded_chunks[0].valley_score_min == 0.05
+    assert loaded_chunks[0].cut_split_count == 1
+    assert loaded_chunks[0].cut_score_max == 0.97
     assert loaded_chunks[0].vad_segments[0].score == 0.9
 
 
@@ -194,6 +205,29 @@ def test_vad_chunk_cache_key_changes_with_pre_asr_valley_split(monkeypatch, tmp_
     )
     cfg = _chunk_config()
     cfg["pre_asr_valley_split_enabled"] = True
+    lookup_b = vad_chunk_cache.build_cache_lookup(
+        str(audio),
+        vad_signature={"backend": "fusionvad_ja", "threshold": 0.10},
+        chunk_config=cfg,
+    )
+
+    assert lookup_a["digest"] != lookup_b["digest"]
+
+
+def test_vad_chunk_cache_key_changes_with_pre_asr_cut_split(monkeypatch, tmp_path):
+    from whisper import vad_chunk_cache
+
+    monkeypatch.setenv("VAD_CHUNK_CACHE_DIR", str(tmp_path / "vad-cache"))
+    audio = tmp_path / "sample.cf3671a5.wav"
+    _write_wav(audio)
+
+    lookup_a = vad_chunk_cache.build_cache_lookup(
+        str(audio),
+        vad_signature={"backend": "fusionvad_ja", "threshold": 0.10},
+        chunk_config=_chunk_config(),
+    )
+    cfg = _chunk_config()
+    cfg["pre_asr_cut_split_enabled"] = True
     lookup_b = vad_chunk_cache.build_cache_lookup(
         str(audio),
         vad_signature={"backend": "fusionvad_ja", "threshold": 0.10},
@@ -255,6 +289,34 @@ class _ScoredVadBackend(_CountingVadBackend):
                 "backend": self.name,
                 "threshold": 0.10,
                 "frame_scores": [0.9] * 5 + [0.05] * 2 + [0.9] * 5,
+                "frame_hop_s": 1.0,
+            },
+            processing_time_sec=0.0,
+        )
+
+
+class _CutScoredVadBackend(_CountingVadBackend):
+    def segment(
+        self,
+        audio_path: str,
+        *,
+        target_sr: int = 16000,
+        threshold_override: float | None = None,
+    ) -> SegmentationResult:
+        del audio_path, target_sr, threshold_override
+        self.calls += 1
+        segments = [SpeechSegment(0.0, 12.0, 0.9)]
+        return SegmentationResult(
+            segments=segments,
+            groups=[segments],
+            method=self.name,
+            audio_duration_sec=12.0,
+            parameters={
+                "backend": self.name,
+                "threshold": 0.10,
+                "frame_scores": [0.9] * 12,
+                "cut_frame_scores": [0.05] * 5 + [0.98] * 2 + [0.05] * 5,
+                "frame_hop_s": 1.0,
             },
             processing_time_sec=0.0,
         )
@@ -291,10 +353,51 @@ def test_pipeline_uses_frame_scores_for_valley_split_but_does_not_cache_scores(m
     assert len(spans) == 2
     assert all(isinstance(span, PackedChunk) for span in spans)
     assert {span.split_policy for span in spans} == {"r16_pre_asr_valley_v1"}
+    assert asr._LAST_VAD_SIGNATURE["chunk_packing"]["score_frame_hop_s"] == 1.0
     cached_files = list((tmp_path / "vad-cache").glob("*.json"))
     assert len(cached_files) == 1
     payload = cached_files[0].read_text(encoding="utf-8")
     assert "frame_scores" not in payload
+
+
+def test_pipeline_uses_cut_scores_for_cut_split_but_does_not_cache_scores(monkeypatch, tmp_path):
+    monkeypatch.setenv("VAD_CHUNK_CACHE_DIR", str(tmp_path / "vad-cache"))
+    monkeypatch.setenv("ASR_CHUNK_PACKING_ENABLED", "1")
+    monkeypatch.setenv("ASR_CHUNK_PACK_FRAME_HOP_S", "1.0")
+    monkeypatch.setenv("ASR_CHUNK_PACK_WINDOW_FRAMES", "30")
+    monkeypatch.setenv("ASR_CHUNK_PACK_RESERVE_FRAMES", "2")
+    monkeypatch.setenv("ASR_CHUNK_PACK_TARGET_PADDING_FRAMES", "1")
+    monkeypatch.setenv("ASR_CHUNK_PACK_GAP_MERGE_FRAMES", "0")
+    monkeypatch.setenv("ASR_PRE_ASR_CUT_SPLIT_ENABLED", "1")
+    monkeypatch.setenv("ASR_PRE_ASR_CUT_SPLIT_MIN_CORE_FRAMES", "8")
+    monkeypatch.setenv("ASR_PRE_ASR_CUT_SPLIT_TARGET_CORE_FRAMES", "5")
+    monkeypatch.setenv("ASR_PRE_ASR_CUT_SPLIT_MIN_CUT_FRAMES", "2")
+    monkeypatch.setenv("ASR_PRE_ASR_CUT_SPLIT_MIN_CHILD_FRAMES", "3")
+    monkeypatch.setenv("ASR_PRE_ASR_CUT_SPLIT_THRESHOLD", "0.94")
+
+    from whisper import pipeline as asr
+    asr = importlib.reload(asr)
+    audio = tmp_path / "sample.cf3671a5.wav"
+    _write_wav(audio, seconds=12.0)
+
+    backend = _CutScoredVadBackend()
+    import vad
+
+    monkeypatch.setattr(vad, "get_vad_backend", lambda: backend)
+
+    spans = asr._build_processing_spans(str(audio))
+
+    assert backend.calls == 1
+    assert len(spans) == 2
+    assert all(isinstance(span, PackedChunk) for span in spans)
+    assert {span.split_policy for span in spans} == {"r17_pre_asr_cut_v1"}
+    assert {span.cut_score_max for span in spans} == {0.98}
+    assert asr._LAST_VAD_SIGNATURE["chunk_packing"]["score_frame_hop_s"] == 1.0
+    cached_files = list((tmp_path / "vad-cache").glob("*.json"))
+    assert len(cached_files) == 1
+    payload = cached_files[0].read_text(encoding="utf-8")
+    assert "frame_scores" not in payload
+    assert "cut_frame_scores" not in payload
 
 
 def test_pipeline_uses_vad_chunk_cache_for_prompt_budget_change(monkeypatch, tmp_path):
