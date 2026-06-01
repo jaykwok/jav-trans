@@ -6,6 +6,7 @@ import json
 import sys
 import time
 from collections import Counter
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import asdict
 from pathlib import Path
 
@@ -26,6 +27,48 @@ from vad.fusionvad_ja import (
     write_feature_cache,
 )
 from audio.loading import load_audio_16k_mono
+
+
+def _prepare_batch(
+    *,
+    batch_start: int,
+    batch_examples: list,
+    selected_count: int,
+    config: FeatureConfig,
+) -> tuple[list[dict], list[dict], float]:
+    prepared = []
+    errors = []
+    prepare_start = time.perf_counter()
+    for offset, example in enumerate(batch_examples):
+        item_index = batch_start + offset
+        try:
+            audio_path = Path(example.audio_path)
+            audio, sample_rate = load_audio_16k_mono(str(audio_path))
+            mfcc = extract_mfcc(audio, sample_rate=sample_rate, config=config)
+            duration_s = len(audio) / sample_rate if sample_rate else 0.0
+            prepared.append(
+                {
+                    "index": item_index,
+                    "example": example,
+                    "audio_path": audio_path,
+                    "audio": audio,
+                    "sample_rate": sample_rate,
+                    "mfcc": mfcc,
+                    "duration_s": duration_s,
+                }
+            )
+        except Exception as exc:
+            errors.append(
+                {
+                    "audio_id": example.audio_id,
+                    "audio_path": example.audio_path,
+                    "label_index": example.label_index,
+                    "error": str(exc),
+                    "index": item_index,
+                    "selected_count": selected_count,
+                }
+            )
+    return prepared, errors, time.perf_counter() - prepare_start
 
 
 def run(args: argparse.Namespace) -> None:
@@ -59,7 +102,8 @@ def run(args: argparse.Namespace) -> None:
     selected_examples = examples[: args.limit] if args.limit is not None else examples
     print(
         f"feature_cache_start selected={len(selected_examples)} examples={len(examples)} "
-        f"device={args.device} dtype={args.dtype} ptm={args.ptm}",
+        f"device={args.device} dtype={args.dtype} ptm={args.ptm} "
+        f"batch_size={args.batch_size} prepare_workers={args.prepare_workers}",
         flush=True,
     )
     ptm_extractor = build_ptm_feature_extractor(config)
@@ -87,108 +131,140 @@ def run(args: argparse.Namespace) -> None:
             except Exception as exc:
                 print(f"cuda_memory_check_error={exc}", flush=True)
         batch_size = max(1, int(args.batch_size))
-        for batch_start in range(0, len(selected_examples), batch_size):
-            batch_examples = selected_examples[batch_start : batch_start + batch_size]
-            batch_time = time.perf_counter()
-            prepared = []
-            for offset, example in enumerate(batch_examples):
-                item_index = batch_start + offset
+        prepare_workers = max(0, int(args.prepare_workers))
+        batch_starts = list(range(0, len(selected_examples), batch_size))
+
+        executor: ThreadPoolExecutor | None = None
+        future: Future | None = None
+
+        def submit_prepare(start: int) -> Future:
+            batch_examples = selected_examples[start : start + batch_size]
+            if executor is None:
+                inline_future: Future = Future()
+                inline_future.set_result(
+                    _prepare_batch(
+                        batch_start=start,
+                        batch_examples=batch_examples,
+                        selected_count=len(selected_examples),
+                        config=config,
+                    )
+                )
+                return inline_future
+            return executor.submit(
+                _prepare_batch,
+                batch_start=start,
+                batch_examples=batch_examples,
+                selected_count=len(selected_examples),
+                config=config,
+            )
+
+        if prepare_workers > 0:
+            executor = ThreadPoolExecutor(max_workers=prepare_workers)
+        try:
+            if batch_starts:
+                future = submit_prepare(batch_starts[0])
+            for batch_index, batch_start in enumerate(batch_starts):
+                if future is None:
+                    break
+                batch_examples = selected_examples[batch_start : batch_start + batch_size]
+                prepared, prepare_errors, prepare_elapsed_s = future.result()
+                errors.extend(prepare_errors)
+                next_index = batch_index + 1
+                next_future: Future | None = None
+                if next_index < len(batch_starts):
+                    next_future = submit_prepare(batch_starts[next_index])
+                print(
+                    f"prepared_batch {batch_start + 1}-{batch_start + len(batch_examples)}/"
+                    f"{len(selected_examples)} prepared={len(prepared)} errors={len(prepare_errors)} "
+                    f"elapsed_s={prepare_elapsed_s:.2f}",
+                    flush=True,
+                )
+                for error in prepare_errors:
+                    print(
+                        f"error {int(error['index']) + 1}/{int(error['selected_count'])} "
+                        f"audio_id={error['audio_id']} error={error['error']}",
+                        flush=True,
+                    )
+                batch_time = time.perf_counter()
+                if not prepared:
+                    future = next_future
+                    continue
                 try:
-                    audio_path = Path(example.audio_path)
-                    audio, sample_rate = load_audio_16k_mono(str(audio_path))
-                    mfcc = extract_mfcc(audio, sample_rate=sample_rate, config=config)
-                    duration_s = len(audio) / sample_rate if sample_rate else 0.0
-                    prepared.append(
-                        {
-                            "index": item_index,
-                            "example": example,
-                            "audio_path": audio_path,
-                            "audio": audio,
-                            "sample_rate": sample_rate,
-                            "mfcc": mfcc,
-                            "duration_s": duration_s,
+                    sample_rates = {int(item["sample_rate"]) for item in prepared}
+                    if len(sample_rates) != 1:
+                        raise ValueError(f"mixed sample rates in batch: {sorted(sample_rates)}")
+                    ptm_start = time.perf_counter()
+                    ptm_features = ptm_extractor.extract_batch(
+                        [item["audio"] for item in prepared],
+                        sample_rate=int(prepared[0]["sample_rate"]),
+                    )
+                    ptm_elapsed_s = time.perf_counter() - ptm_start
+                    write_elapsed_s = 0.0
+                    for item, ptm in zip(prepared, ptm_features, strict=True):
+                        example = item["example"]
+                        aligned_ptm, aligned_mfcc = align_feature_frames(
+                            ptm,
+                            item["mfcc"],
+                            resize_ptm=is_low_frame_rate_ptm(config.ptm),
+                        )
+                        bundle = {
+                            "whisper": aligned_ptm,
+                            "mfcc": aligned_mfcc,
+                            "duration_s": float(item["duration_s"]),
+                            "sample_rate": int(item["sample_rate"]),
                         }
+                        write_start = time.perf_counter()
+                        cached = write_feature_cache(
+                            output_dir=feature_dir,
+                            audio_id=example.audio_id,
+                            source=example.source,
+                            audio_path=item["audio_path"],
+                            config=config,
+                            bundle=bundle,
+                            compressed=not args.no_compress,
+                        )
+                        write_elapsed_s += time.perf_counter() - write_start
+                        rows.append(
+                            {
+                                **asdict(cached),
+                                "label_index": example.label_index,
+                                "label_quality": example.label_quality,
+                                "speech_frame_count": example.speech_frame_count,
+                            }
+                        )
+                        print(
+                            f"cached {item['index'] + 1}/{len(selected_examples)} audio_id={example.audio_id} "
+                            f"source={example.source} frames={cached.frame_count}",
+                            flush=True,
+                        )
+                    print(
+                        f"cached_batch {batch_start + 1}-{batch_start + len(batch_examples)}/"
+                        f"{len(selected_examples)} batch_size={len(prepared)} "
+                        f"elapsed_s={time.perf_counter() - batch_time:.2f} "
+                        f"ptm_elapsed_s={ptm_elapsed_s:.2f} write_elapsed_s={write_elapsed_s:.2f} "
+                        f"compressed={not args.no_compress}",
+                        flush=True,
                     )
                 except Exception as exc:
-                    errors.append(
-                        {
-                            "audio_id": example.audio_id,
-                            "audio_path": example.audio_path,
-                            "label_index": example.label_index,
-                            "error": str(exc),
-                        }
-                    )
+                    for item in prepared:
+                        example = item["example"]
+                        errors.append(
+                            {
+                                "audio_id": example.audio_id,
+                                "audio_path": example.audio_path,
+                                "label_index": example.label_index,
+                                "error": str(exc),
+                            }
+                        )
                     print(
-                        f"error {item_index + 1}/{len(selected_examples)} audio_id={example.audio_id} "
-                        f"error={exc}",
+                        f"error_batch {batch_start + 1}-{batch_start + len(batch_examples)}/"
+                        f"{len(selected_examples)} error={exc}",
                         flush=True,
                     )
-            if not prepared:
-                continue
-            try:
-                sample_rates = {int(item["sample_rate"]) for item in prepared}
-                if len(sample_rates) != 1:
-                    raise ValueError(f"mixed sample rates in batch: {sorted(sample_rates)}")
-                ptm_features = ptm_extractor.extract_batch(
-                    [item["audio"] for item in prepared],
-                    sample_rate=int(prepared[0]["sample_rate"]),
-                )
-                for item, ptm in zip(prepared, ptm_features, strict=True):
-                    example = item["example"]
-                    aligned_ptm, aligned_mfcc = align_feature_frames(
-                        ptm,
-                        item["mfcc"],
-                        resize_ptm=is_low_frame_rate_ptm(config.ptm),
-                    )
-                    bundle = {
-                        "whisper": aligned_ptm,
-                        "mfcc": aligned_mfcc,
-                        "duration_s": float(item["duration_s"]),
-                        "sample_rate": int(item["sample_rate"]),
-                    }
-                    cached = write_feature_cache(
-                        output_dir=feature_dir,
-                        audio_id=example.audio_id,
-                        source=example.source,
-                        audio_path=item["audio_path"],
-                        config=config,
-                        bundle=bundle,
-                    )
-                    rows.append(
-                        {
-                            **asdict(cached),
-                            "label_index": example.label_index,
-                            "label_quality": example.label_quality,
-                            "speech_frame_count": example.speech_frame_count,
-                        }
-                    )
-                    print(
-                        f"cached {item['index'] + 1}/{len(selected_examples)} audio_id={example.audio_id} "
-                        f"source={example.source} frames={cached.frame_count}",
-                        flush=True,
-                    )
-                print(
-                    f"cached_batch {batch_start + 1}-{batch_start + len(batch_examples)}/"
-                    f"{len(selected_examples)} batch_size={len(prepared)} "
-                    f"elapsed_s={time.perf_counter() - batch_time:.2f}",
-                    flush=True,
-                )
-            except Exception as exc:
-                for item in prepared:
-                    example = item["example"]
-                    errors.append(
-                        {
-                            "audio_id": example.audio_id,
-                            "audio_path": example.audio_path,
-                            "label_index": example.label_index,
-                            "error": str(exc),
-                        }
-                    )
-                print(
-                    f"error_batch {batch_start + 1}-{batch_start + len(batch_examples)}/"
-                    f"{len(selected_examples)} error={exc}",
-                    flush=True,
-                )
+                future = next_future
+        finally:
+            if executor is not None:
+                executor.shutdown(wait=True)
     finally:
         ptm_extractor.close()
 
@@ -220,6 +296,7 @@ def run(args: argparse.Namespace) -> None:
         "errors": len(errors),
         "label_quality_counts": dict(sorted(Counter(row["label_quality"] for row in rows).items())),
         "ptm": args.ptm,
+        "compressed": not args.no_compress,
         "config": asdict(config),
     }
     summary_path.write_text(
@@ -247,6 +324,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--dtype", choices=["float16", "float32", "bfloat16"], default="float16")
     parser.add_argument("--batch-size", type=int, default=1)
+    parser.add_argument(
+        "--prepare-workers",
+        type=int,
+        default=0,
+        help="Background workers for audio loading + MFCC preparation. 0 keeps inline preparation.",
+    )
+    parser.add_argument("--no-compress", action="store_true", help="Use np.savez instead of np.savez_compressed.")
     parser.add_argument("--revision")
     parser.add_argument("--model-path", default="", help="Optional local PTM model path for Qwen/Whisper feature extraction.")
     parser.add_argument("--no-download", action="store_true", help="Require the PTM model to already exist locally.")

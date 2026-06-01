@@ -169,13 +169,13 @@ FusionVAD-JA 是训练型 VAD 研究线，用于复现 FusionVAD 论文的“PTM
 
 当前定位：
 
-- 默认 VAD 已切到 `fusionvad_ja`，当前 operating point 为 FusionVAD-JA v1.16 endpoint refiner：`jaykwok/Qwen3-ASR-0.6B-JA-Anime-Galgame` frozen audio feature + MFCC/energy addition BiLSTM，多头输出 speech/start/end/cut，默认 `speech_threshold=0.020`、`cut_threshold=0.960`、pad `0.2s`。本地缓存目录按 Hugging Face repo 规则为 `models/jaykwok-Qwen3-ASR-0.6B-JA-Anime-Galgame`；base Qwen3-ASR-0.6B 不再作为默认特征源，如需做 ablation 可显式改 `FUSIONVAD_JA_PTM=qwen3-asr-0.6b-base` 或 `FUSIONVAD_JA_MODEL_PATH`。
+- 默认 VAD 已切到 `fusionvad_ja`，当前 operating point 为 FusionVAD-JA v1.17 endpoint refiner：`jaykwok/Qwen3-ASR-0.6B-JA-Anime-Galgame` frozen audio feature + MFCC/energy addition BiLSTM，多头输出 speech/start/end/cut，默认 `speech_threshold=0.020`、`cut_threshold=0.960`、pad `0.2s`。v1.17 head 只有约 `7.4MB`，随仓库放在 `src/vad/fusionvad_ja/checkpoints/fusionvad_ja_v1_17_endpoint_refiner.pt`；新 clone 不需要本地 `datasets/train/...` 才能启动 VAD。本地 Qwen 0.6B full SFT 缓存目录按 Hugging Face repo 规则为 `models/jaykwok-Qwen3-ASR-0.6B-JA-Anime-Galgame`，缺失时由模型解析逻辑从 HF 下载。base Qwen3-ASR-0.6B 不再作为默认特征源，如需做 ablation 可显式改 `FUSIONVAD_JA_PTM=qwen3-asr-0.6b-base` 或 `FUSIONVAD_JA_MODEL_PATH`。
 - VAD 目标从“直接喂 ASR 的高召回大块 proposal”调整为两级结构：第一级 FusionVAD-JA 输出高召回 frame-level speech mask，不漏对白、呻吟、喘息、短促人声；第二级 speech-island / endpoint packer 把 mask 切成更接近一句台词的 ASR chunk，避免多句话、长 gap、噪音或多人交替被揉成一坨。
 - 新增 fallback-safe boundary gate：forced aligner 成功率不是唯一目标；如果 forced alignment 失败并回退到 `vad_coarse`，该 chunk 的粗时间轴也必须足够短，默认用 `<=8s` 作为可审计/可接受上限。否则即使 ASR 文本正确，字幕也会出现几十秒级长 cue 或 fallback 片段，后置 timing polish 只能压缩 cue end，不能修复 chunk 边界本身。
 - 8 分钟附近这类“没明显说话却出现台词”的瑕疵，优先按 non-speech/gap 诱发 ASR hallucination 与 chunk 粒度过粗处理，不再单纯归因到字幕 end 偏长。字幕 timing polish 可以压缩显示 end，但不能阻止 ASR 在多送音频上生成文本。
 - F0 gender 标签不再作为当前主线切分或翻译提示。原因是当 VAD chunk 本身过大、包含多 speech island 或男女交替时，F0/gender 会被混合 chunk 稀释，反而给 cue 合并、翻译 prompt 和 speaker 判断引入噪声。相关代码和历史测试暂保留为 legacy/ablation，后续清理另开任务。
 - CAM++ / 3D-Speaker / WeSpeaker 的定位改为二阶段 speaker sidecar：只在 speech-island 边界足够细之后，用于判断相邻 island 是否跨 speaker、辅助“不要跨 speaker 合并”。它们不直接替代 VAD，也不做 speech/non-speech hard gate。pyannote 仅作为强 baseline 参考，不进默认依赖。
-- Qwen3-ASR-1.7B full SFT 是目标域 ASR 主线，默认 Hugging Face 来源为 `jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame`，本地缓存目录为 `models/jaykwok-Qwen3-ASR-1.7B-JA-Anime-Galgame`；Qwen3-ASR-0.6B full SFT 默认来源为 `jaykwok/Qwen3-ASR-0.6B-JA-Anime-Galgame`，既可作为轻量 ASR probe，也作为 FusionVAD-JA frozen feature extractor，避免用户同时下载 base 0.6B 和 fine-tuned 0.6B。
+- Qwen3-ASR-1.7B full SFT 是目标域 ASR 主线，默认 Hugging Face 来源为 `jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame`，本地缓存目录为 `models/jaykwok-Qwen3-ASR-1.7B-JA-Anime-Galgame`；Qwen3-ASR-0.6B full SFT 默认来源为 `jaykwok/Qwen3-ASR-0.6B-JA-Anime-Galgame`，既可作为轻量 ASR probe，也作为 FusionVAD-JA frozen feature extractor，避免用户同时下载 base 0.6B 和 fine-tuned 0.6B。注意：项目默认 ASR backend 仍是 `whisper-ja-anime-v0.3`，但只要选择 `qwen3-asr-1.7b` 后端，就默认使用上述 1.7B full SFT repo，而不是 `Qwen/Qwen3-ASR-1.7B` base。
 - Forced aligner 暂不 finetune。当前优先级是文本预处理、fallback 质量标签、失败样本池和同口径 held-out 复测。
 - Galgame ASR 数据多数已经按语音裁切，因此可把原 clip 当作 speech island，在前后和中间拼接随机长度静音、白噪声、hum、MUSAN/DNS/BGM 或本地 hard-negative，构造精确 `actual_speech_segments`。这条 synthetic timeline 不再只是早期 VAD smoke，而是下一轮 VAD / boundary refiner / aligner bench 的公共数据底座。
 
@@ -238,10 +238,10 @@ v1.9 ASR / forced alignment 文本策略：
 
 下一步：
 
-1. 保持 v1.16 endpoint refiner 作为默认 FusionVAD-JA feature/head；不恢复 base 0.6B 默认。
+1. 保持 v1.17 endpoint refiner 作为默认 FusionVAD-JA feature/head；不恢复 base 0.6B 默认。v1.17 相比 v1.16 在 synthetic64 和 v1.6 real-heldout recall 上更稳，但匿名样片 A downstream 的 forced-aligner sentinel / unsafe fallback 未明显改善，因此它是默认 head 升级，不是 R15/R16 边界问题的最终解。
 2. R16/R17 下一步继续从 rule-based valley / 全局 max-core 切短，转向 endpoint / boundary refiner：训练一个能把长连续 positive island 切成自然 speech island 的边界层；验收看 fallback_safe_ratio、unsafe fallback 数、fallback duration p90/max、synthetic truth start/end p50/p90、sample A fallback 是否跨大段无声、ASR empty 和人工字幕观感。
 3. R14 Phase 1d staged batch island retry 仍作为 opt-in repair 和质量上限参考；只有 pre-ASR splitter 无法覆盖时才启用。
-4. 用 v1.16 输出继续扩展失败样本池：优先收集 `vad_coarse_after_sentinel`、ASR empty、long low-information、repeat/hallucination proxy 和人工 hard-negative。
+4. 用 v1.17 输出继续扩展失败样本池：优先收集 `vad_coarse_after_sentinel`、ASR empty、long low-information、repeat/hallucination proxy 和人工 hard-negative。
 5. 用 synthetic timeline v5 `boundary_manifest.jsonl` 继续作为 VAD / boundary refiner / frozen SSL baseline / forced-aligner bench 的共同输入。
 
 参考来源：Whisper hallucination on non-speech `https://arxiv.org/abs/2501.11378`，Calm-Whisper `https://www.isca-archive.org/interspeech_2025/wang25b_interspeech.pdf`，Dynamic Speech Endpoint Detection `https://arxiv.org/abs/2210.14252`，Semantic VAD `https://arxiv.org/abs/2305.12450`，WhisperX `https://arxiv.org/html/2303.00747v2` / `https://github.com/m-bain/whisperX`，stable-ts `https://github.com/jianfch/stable-ts`，FusionVAD arXiv `https://arxiv.org/abs/2506.01365`，Interspeech 2024 transformer VAD `https://www.isca-archive.org/interspeech_2024/karan24_interspeech.pdf`，Qwen3-ASR `https://github.com/QwenLM/Qwen3-ASR`，Qwen3-ASR finetuning `https://github.com/QwenLM/Qwen3-ASR/tree/main/finetuning`，Qwen3-ASR-0.6B base `https://huggingface.co/Qwen/Qwen3-ASR-0.6B`，Qwen3-ASR-1.7B base `https://huggingface.co/Qwen/Qwen3-ASR-1.7B`，本项目 0.6B full SFT `https://huggingface.co/jaykwok/Qwen3-ASR-0.6B-JA-Anime-Galgame`，本项目 1.7B full SFT `https://huggingface.co/jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame`，Qwen3-ForcedAligner-0.6B `https://huggingface.co/Qwen/Qwen3-ForcedAligner-0.6B`，pyannote speaker diarization `https://huggingface.co/pyannote/speaker-diarization-3.1`，3D-Speaker `https://github.com/modelscope/3D-Speaker`，WeSpeaker `https://github.com/wenet-e2e/wespeaker`，Reazon Japanese HuBERT `https://huggingface.co/reazon-research/japanese-hubert-base-k2`，rinna Japanese HuBERT `https://huggingface.co/rinna/japanese-hubert-base`，rinna Japanese wav2vec2 `https://huggingface.co/rinna/japanese-wav2vec2-base`，Hugging Face VAD model index `https://huggingface.co/models?pipeline_tag=voice-activity-detection`。
@@ -395,6 +395,8 @@ Web 设置行为：
 - Codex 默认 sandbox 可能隔离 GPU 或驱动能力。需要跑全片 VAD/ASR/ForcedAligner、ONNXRuntime CUDA、Torch CUDA、feature cache、训练、`nvidia-smi` 或任何“必须确认 GPU 占用”的命令时，应提权执行；否则可能看不到 CUDA、回落 CPU，或者日志里出现 `CUDA failure 35` / `CPUExecutionProvider`。验收时必须看实际日志：Torch 路径看 `actual_device=cuda` / `model_param_device=cuda:*`，ONNX 路径看 `CUDAExecutionProvider`，必要时配合 `nvidia-smi`。
 - 联网默认受限。Hugging Face / ModelScope 下载、`uv pip` / `npm install` / `curl` / `git fetch` / Grok 或外部 API 探测等网络操作，若出现 DNS、连接、证书、超时或 403/429 之外的网络层错误，优先按“需要提权或代理环境”处理，不要把它误判成代码逻辑失败。
 - 长跑命令不要在一次性 exec 里直接用 `cmd > log 2>&1 &` 后立即退出 shell。当前工具的 shell 退出后，后台子进程可能被收走，表现为空日志、无产物、无 Python traceback。本地全片 workflow / 训练 / 大规模评测要么让 exec session 前台持有进程并把 stdout/stderr 重定向到日志，要么用脚本在同一个 shell 内启动后台进程、循环 `tail` 日志并 `wait` 子进程。日志统一放 `agents/temp/.../*.run.log`。
+- CUDA feature cache / 训练在 WSL2 下不要静默后台跑自动降级脚本。2026-06-01 的 v1.17 feature-cache 扩 batch 实测中，`batch_size=512` 只打印 `feature_cache_start` 后消失，`batch_size=256` 只到 `prepared_batch 1-256` 后无 Python traceback；`free -h` 显示本机 WSL 仅约 `7.7GiB` RAM + `2GiB` swap，journal / dmesg 显示 WSL 非干净重启和 `hv_balloon Max dynamic memory size: 8154 MB`。这类现象更像宿主/WSL 内存 kill 或重启，不是常规 CUDA OOM。遇到“日志中断但没有 traceback”时先查 `free -h`、`dmesg` / `journalctl`、进程是否还在、feature cache 产物数量，不要只盯显存。
+- v1.17 本机 RTX 4060 Ti 8GB + WSL 8GB RAM 的安全口径：优先 `batch_size=64` 或 `128`、`--prepare-workers 2`、`--no-compress`、前台提权运行；`batch_size=256/512` 即使显存还有余量，也可能因为 CPU 侧音频解码、batch prepare、NumPy 写盘缓冲和模型输入 staging 把 WSL 内存打满。`--prepare-workers` 当前主要是预取/隐藏下一批 prepare 时间，不等同无限并行队列；worker 数随 batch 放大也会增加主机内存峰值。
 - 发现 CUDA 任务异常慢、GPU 占用为 0、日志没有 provider/device 信息、或后台长跑日志一直为空时，先停下确认执行权限和进程托管方式，再重跑；不要让 CPU fallback 跑完整片。
 
 构建 Windows Release：
@@ -735,9 +737,9 @@ v1.15-b 结果：
 
 下一步执行顺序：
 
-1. 优先评估 v1.16 endpoint refiner；只有 synthetic64 + v1.6 参考都过线后，再接匿名样片 A downstream 小闭环。
-2. 若 sample A 的 unsafe fallback 和幻觉 proxy 有实质改善，再扩大 failure-driven 数据构造；若未改善，v1.16 仍作为 endpoint/cut teacher 和默认高召回边界候选继续迭代。
-3. 默认 FusionVAD-JA 已切到 v1.16 endpoint refiner；v1.13 full29239 exact-island 仅保留为历史 baseline / ablation。
+1. v1.17 endpoint refiner 已完成 synthetic64、v1.6 real-heldout 和匿名样片 A downstream 小闭环，并切为默认 FusionVAD-JA head。
+2. sample A 的 unsafe fallback 和 `vad_coarse_after_sentinel` 没有随 v1.17 明显改善；后续 failure-driven 数据构造仍围绕 R15/R16 pre-ASR speech-island / boundary packing，而不是继续只扩大 synthetic 样本数。
+3. 默认 FusionVAD-JA 已切到仓库内 v1.17 endpoint refiner；v1.16/v1.13 full29239 exact-island 仅保留为历史 baseline / ablation。
 
 v1.16 结果（4096 条 Galgame multi-island synthetic）：
 
@@ -749,6 +751,18 @@ v1.16 结果（4096 条 Galgame multi-island synthetic）：
 - synthetic64 gate：从 `agents/temp/fusionvad-ja/v1-16-endpoint-refiner-synth64-probabilities/predictions.jsonl` 做阈值 sweep。推荐候选 `speech_threshold=0.020` + `cut_threshold=0.960` + `apply_cut_to_speech`，recall `0.9998`、missed speech `0.14s`、extra audio ratio `1.3425`、predicted segments `212`、cut-gap coverage `0.968`、cut-supported ratio `0.923`、start/end p50 `0.399s/0.601s`。相比 v1.15-b 的 missed `1.80s`、extra `1.5147`、start/end p50 `0.968s/0.926s` 明显改善。
 - v1.6 real-heldout 参考：同一真实本地人工审计 `79` 条，`speech=0.020/cut=0.960` + pad `0.2s` 为 recall `0.9927`、missed speech `2.82s`、missed segments `4`、extra audio ratio `1.5919`。对比 v1.11 的 recall `0.9809`、missed `7.42s` 更稳，但 extra 仍偏高；由于 v1.6 边界人工标注不够精确，只作为“是否明显漏人声”的参考。
 - 当前结论：v1.16 已过 synthetic boundary gate，并已作为默认 FusionVAD-JA operating point；下一步重点看 sample A 的 chunk 增幅、ASR empty、forced/fallback、unsafe fallback duration、无声/gap 幻觉字幕是否下降。
+
+v1.17 结果（32768 条 Galgame multi-island synthetic）：
+
+- 数据动机：v1.16 的 4096 条 synthetic 已证明“精确 speech island + 长 gap/白噪/BGM/overlap”能显著改善 synthetic boundary gate；v1.17 直接把同类 exact-island 样本扩大到 `32768`，目标是让 endpoint/cut 头更稳定，而不是继续追求单纯 speech recall。
+- 训练数据：`datasets/train/fusionvad-ja/v1-17/galgame-synthetic-timeline-v7-boundary32768-train/`，exact labels 为 `datasets/train/fusionvad-ja/v1-17/galgame-synthetic-timeline-v7-boundary32768-exact-island-train/labels.jsonl`，records `32768`，seed `1717`，每条由多条 Galgame speech clip 与 silence/white_noise/hum/real negative/BGM/overlap 等拼接。
+- 特征缓存：冻结特征使用 `jaykwok/Qwen3-ASR-0.6B-JA-Anime-Galgame`（本地缓存 `models/jaykwok-Qwen3-ASR-0.6B-JA-Anime-Galgame`），输出 `datasets/train/fusionvad-ja/v1-17/qwen3-asr-0.6b-full29239/galgame-synthetic-timeline-v7-boundary32768-feature-cache/`，CUDA bfloat16，`batch_size=128`、`--prepare-workers 2`、`--no-compress`，cached `32768`、errors `0`、skipped `0`。
+- 执行坑：`batch_size=512` / `256` 在本机 WSL2 8GB RAM 下无 Python traceback 消失，结合 `free -h`、journal / dmesg 判断更像 WSL/宿主内存 kill 或重启，而不是常规 CUDA OOM；README “常见坑 / 执行权限”已记录。最终稳定档位为 `batch_size=128`，说明本阶段瓶颈是主机内存和 batch prepare staging，不是 8GB 显存。
+- 训练配置：混合 v1-mini strong/negative `302` 条 + v1.17 exact-island `32768` 条，`batch_size=16`、`lr=2e-4`、`steps=4096`、`positive_loss_weight=2.0`、`boundary_loss_weight=1.0`、`internal_gap_loss_weight=0.5`、`cut_loss_weight=0.75`、`start/end pos_weight=120`、`cut pos_weight=8`。checkpoint `datasets/train/fusionvad-ja/v1-17/qwen3-asr-0.6b-full29239/endpoint-refiner-boundary32768-v1mini-batch16-lr2e-4-steps4096-posaux120-cut8/fusionvad_ja_endpoint_refiner.pt`，trainable params `1,889,252`，final loss `1.2107`，frame_accuracy `0.9547`。
+- synthetic64 gate：推荐候选 `speech_threshold=0.020` + `cut_threshold=0.960` + `apply_cut_to_speech`，recall `1.0000`、missed speech `0.00s`、extra audio ratio `1.2545`、predicted segments `192`、start/end p50 `0.305s/0.298s`。相比 v1.16 的 recall `0.9998`、missed `0.14s`、extra `1.3425`、predicted segments `212`、start/end p50 `0.399s/0.601s` 明显更稳。
+- v1.6 real-heldout 参考：同一真实本地人工审计 `79` 条，`speech=0.020/cut=0.960` + pad `0.2s` 为 recall `0.9965`、missed speech `1.34s`、extra audio ratio `1.5979`；对比 v1.16 的 recall `0.9927`、missed `2.82s`、extra `1.5919`，v1.17 主要减少漏检，extra 基本持平。
+- 匿名样片 A downstream：同一 Qwen3-ASR-1.7B full SFT + Qwen3-ForcedAligner，v1.17 输出 `241` chunks、`896` segments、`959` cues，ASR+Alignment `1078.5s`，QC reject `16`，empty-text-for-speech `6`，generation error/overflow/timeout 均为 `0`。诊断为 forced `105`、`vad_coarse=114`、`drop_or_review=16`、`nonlexical=6`、fallback chunks `126/241`，`vad_coarse_after_sentinel=114`。fallback-safe 仍未过：coarse fallback `114`、unsafe `114`、safe ratio `0.0`，fallback duration p50/p90/max `28.47s/28.47s/28.47s`，crossing long silence `10`。
+- 当前结论：v1.17 已替换默认 operating point，因为它在 synthetic exact-island 和 real-heldout recall 上优于 v1.16，且 7.4MB head 可随仓库分发。但它没有解决匿名样片 A 的 long fallback / sentinel 粗时间轴问题；R15/R16 的 pre-ASR speech-island / boundary packing 仍是下一步主线。
 
 
 ### 历史任务摘要
