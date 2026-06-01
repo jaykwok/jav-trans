@@ -170,6 +170,20 @@ DEFAULT_SETTINGS: dict[str, str] = {
     "ASR_PRE_ASR_VALLEY_SPLIT_MAX_CHILDREN": "8",
     # FusionVAD frame-score threshold that defines a low valley.
     "ASR_PRE_ASR_VALLEY_SPLIT_THRESHOLD": "0.20",
+    # R17 opt-in: split long continuous VAD islands at high endpoint-refiner cut scores.
+    "ASR_PRE_ASR_CUT_SPLIT_ENABLED": "0",
+    # Only continuous VAD islands at least this many frames are considered.
+    "ASR_PRE_ASR_CUT_SPLIT_MIN_CORE_FRAMES": "420",
+    # Target child core length after cut splitting, in frames.
+    "ASR_PRE_ASR_CUT_SPLIT_TARGET_CORE_FRAMES": "270",
+    # Minimum consecutive high-cut frames needed to accept a boundary.
+    "ASR_PRE_ASR_CUT_SPLIT_MIN_CUT_FRAMES": "3",
+    # Minimum child length around a cut split.
+    "ASR_PRE_ASR_CUT_SPLIT_MIN_CHILD_FRAMES": "45",
+    # Safety cap on child chunks created from one continuous island.
+    "ASR_PRE_ASR_CUT_SPLIT_MAX_CHILDREN": "8",
+    # FusionVAD endpoint-refiner cut threshold used by pre-ASR boundary packing.
+    "ASR_PRE_ASR_CUT_SPLIT_THRESHOLD": "0.94",
     # 1 stores FusionVAD frame scores in the VAD cache for R16 diagnostics.
     "FUSIONVAD_JA_EXPORT_FRAME_SCORES": "0",
     # 1 enables dropping very short low-energy spans before ASR (opt-in).

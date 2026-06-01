@@ -157,6 +157,7 @@ _ASR_STAGE_ADVANCED_PREFIXES = (
     "ASR_FRAGMENT_",
     "ASR_NATIVE_",
     "ASR_CHUNK_",
+    "ASR_PRE_ASR_",
     "FUSIONVAD_JA_",
     "ALIGNMENT_",
     "F0_",

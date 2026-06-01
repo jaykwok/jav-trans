@@ -25,11 +25,14 @@ class PackedChunk:
     split_policy: str = ""
     valley_split_count: int = 0
     valley_score_min: float | None = None
+    cut_split_count: int = 0
+    cut_score_max: float | None = None
 
 
 @dataclass(frozen=True)
 class FramePackingConfig:
     frame_hop_s: float = 1.0 / 29.97
+    score_frame_hop_s: float | None = None
     window_frames: int = 899
     reserve_frames: int = 45
     target_padding_frames: int = 60
@@ -56,6 +59,15 @@ class FramePackingConfig:
     pre_asr_valley_split_min_child_frames: int = 45
     pre_asr_valley_split_max_children: int = 8
     pre_asr_valley_split_threshold: float = 0.20
+    # R17 opt-in: split a long continuous positive island at high endpoint
+    # refiner cut scores. This is boundary packing, not recall tuning.
+    pre_asr_cut_split_enabled: bool = False
+    pre_asr_cut_split_min_core_frames: int = 420
+    pre_asr_cut_split_target_core_frames: int = 270
+    pre_asr_cut_split_min_cut_frames: int = 3
+    pre_asr_cut_split_min_child_frames: int = 45
+    pre_asr_cut_split_max_children: int = 8
+    pre_asr_cut_split_threshold: float = 0.94
 
     @property
     def chunk_cap_s(self) -> float:
@@ -89,6 +101,14 @@ class FramePackingConfig:
     def pre_asr_valley_split_min_core_s(self) -> float:
         return max(0, self.pre_asr_valley_split_min_core_frames) * self.frame_hop_s
 
+    @property
+    def pre_asr_cut_split_min_core_s(self) -> float:
+        return max(0, self.pre_asr_cut_split_min_core_frames) * self.frame_hop_s
+
+    @property
+    def effective_score_frame_hop_s(self) -> float:
+        return self.score_frame_hop_s if self.score_frame_hop_s is not None else self.frame_hop_s
+
 
 @dataclass(frozen=True)
 class _PackSegment:
@@ -100,6 +120,7 @@ class _PackSegment:
     force_break_before: bool = False
     split_policy: str = ""
     valley_score_min: float | None = None
+    cut_score_max: float | None = None
 
     def to_speech_segment(self) -> SpeechSegment:
         return SpeechSegment(start=self.start, end=self.end, score=self.score)
@@ -127,10 +148,20 @@ def pack_vad_segments(
     pre_asr_valley_split_max_children: int = 8,
     pre_asr_valley_split_threshold: float = 0.20,
     frame_scores: Sequence[float] | None = None,
+    score_frame_hop_s: float | None = None,
+    pre_asr_cut_split_enabled: bool = False,
+    pre_asr_cut_split_min_core_frames: int = 420,
+    pre_asr_cut_split_target_core_frames: int = 270,
+    pre_asr_cut_split_min_cut_frames: int = 3,
+    pre_asr_cut_split_min_child_frames: int = 45,
+    pre_asr_cut_split_max_children: int = 8,
+    pre_asr_cut_split_threshold: float = 0.94,
+    cut_frame_scores: Sequence[float] | None = None,
 ) -> list[PackedChunk]:
     """Pack VAD speech into frame-derived ASR chunks with dynamic gap-aware padding."""
     config = FramePackingConfig(
         frame_hop_s=frame_hop_s,
+        score_frame_hop_s=score_frame_hop_s,
         window_frames=window_frames,
         reserve_frames=reserve_frames,
         target_padding_frames=target_padding_frames,
@@ -148,12 +179,24 @@ def pack_vad_segments(
         pre_asr_valley_split_min_child_frames=pre_asr_valley_split_min_child_frames,
         pre_asr_valley_split_max_children=pre_asr_valley_split_max_children,
         pre_asr_valley_split_threshold=pre_asr_valley_split_threshold,
+        pre_asr_cut_split_enabled=pre_asr_cut_split_enabled,
+        pre_asr_cut_split_min_core_frames=pre_asr_cut_split_min_core_frames,
+        pre_asr_cut_split_target_core_frames=pre_asr_cut_split_target_core_frames,
+        pre_asr_cut_split_min_cut_frames=pre_asr_cut_split_min_cut_frames,
+        pre_asr_cut_split_min_child_frames=pre_asr_cut_split_min_child_frames,
+        pre_asr_cut_split_max_children=pre_asr_cut_split_max_children,
+        pre_asr_cut_split_threshold=pre_asr_cut_split_threshold,
     )
     _validate_config(config)
 
     ordered_speech_segments = sorted(segments, key=lambda segment: (segment.start, segment.end))
     _validate_segments(ordered_speech_segments)
     ordered_segments = _segments_to_pack_segments(ordered_speech_segments)
+    ordered_segments = _split_segments_on_cut_scores(
+        ordered_segments,
+        config=config,
+        cut_frame_scores=cut_frame_scores,
+    )
     ordered_segments = _split_segments_on_score_valleys(
         ordered_segments,
         config=config,
@@ -229,6 +272,8 @@ def pack_vad_segments(
 def _validate_config(config: FramePackingConfig) -> None:
     if config.frame_hop_s <= 0:
         raise ValueError("frame_hop_s must be positive")
+    if config.score_frame_hop_s is not None and config.score_frame_hop_s <= 0:
+        raise ValueError("score_frame_hop_s must be positive")
     if config.window_frames <= 0:
         raise ValueError("window_frames must be positive")
     if config.reserve_frames < 0:
@@ -259,6 +304,18 @@ def _validate_config(config: FramePackingConfig) -> None:
         raise ValueError("pre_asr_valley_split_max_children must be positive")
     if config.pre_asr_valley_split_threshold < 0.0:
         raise ValueError("pre_asr_valley_split_threshold must be non-negative")
+    if config.pre_asr_cut_split_min_core_frames < 0:
+        raise ValueError("pre_asr_cut_split_min_core_frames must be non-negative")
+    if config.pre_asr_cut_split_target_core_frames < 0:
+        raise ValueError("pre_asr_cut_split_target_core_frames must be non-negative")
+    if config.pre_asr_cut_split_min_cut_frames < 0:
+        raise ValueError("pre_asr_cut_split_min_cut_frames must be non-negative")
+    if config.pre_asr_cut_split_min_child_frames < 0:
+        raise ValueError("pre_asr_cut_split_min_child_frames must be non-negative")
+    if config.pre_asr_cut_split_max_children <= 0:
+        raise ValueError("pre_asr_cut_split_max_children must be positive")
+    if config.pre_asr_cut_split_threshold < 0.0:
+        raise ValueError("pre_asr_cut_split_threshold must be non-negative")
 
 
 def _validate_segments(segments: Sequence[SpeechSegment]) -> None:
@@ -303,11 +360,173 @@ def _split_overlong_segments(
                     force_break_before=segment.force_break_before if first else False,
                     split_policy=segment.split_policy,
                     valley_score_min=segment.valley_score_min,
+                    cut_score_max=segment.cut_score_max,
                 )
             )
             cursor = next_end
             first = False
     return split
+
+
+def _split_segments_on_cut_scores(
+    segments: Sequence[_PackSegment],
+    *,
+    config: FramePackingConfig,
+    cut_frame_scores: Sequence[float] | None,
+) -> list[_PackSegment]:
+    if not config.pre_asr_cut_split_enabled or cut_frame_scores is None:
+        return list(segments)
+    scores = (
+        cut_frame_scores
+        if isinstance(cut_frame_scores, list)
+        else [float(value) for value in cut_frame_scores]
+    )
+    if not scores:
+        return list(segments)
+
+    result: list[_PackSegment] = []
+    for segment in segments:
+        split_frames = _plan_cut_split_frames_for_segment(
+            segment,
+            scores=scores,
+            config=config,
+        )
+        if not split_frames:
+            result.append(segment)
+            continue
+        score_hop = config.effective_score_frame_hop_s
+        boundaries = [segment.start, *[frame * score_hop for frame in split_frames], segment.end]
+        for child_index, (start, end) in enumerate(zip(boundaries, boundaries[1:])):
+            if end <= start:
+                continue
+            start_frame = max(0, int(start / score_hop))
+            end_frame = min(len(scores), max(start_frame + 1, int(end / score_hop)))
+            cut_max = max(scores[start_frame:end_frame]) if end_frame > start_frame else None
+            result.append(
+                _PackSegment(
+                    start=start,
+                    end=end,
+                    score=segment.score,
+                    split_left=child_index > 0,
+                    split_right=child_index < len(boundaries) - 2,
+                    force_break_before=child_index > 0,
+                    split_policy="r17_pre_asr_cut_v1",
+                    cut_score_max=cut_max,
+                )
+            )
+    return result
+
+
+def _plan_cut_split_frames_for_segment(
+    segment: _PackSegment,
+    *,
+    scores: Sequence[float],
+    config: FramePackingConfig,
+) -> list[int]:
+    if config.pre_asr_cut_split_min_core_s > 0.0:
+        if segment.end - segment.start < config.pre_asr_cut_split_min_core_s:
+            return []
+    score_hop = config.effective_score_frame_hop_s
+    start_frame = max(0, int(round(segment.start / score_hop)))
+    end_frame = min(len(scores), int(round(segment.end / score_hop)))
+    min_core_score_frames = max(1, int(round(config.pre_asr_cut_split_min_core_s / score_hop)))
+    if end_frame - start_frame < min_core_score_frames:
+        return []
+
+    min_child_score_frames = max(
+        1,
+        int(round(max(0, config.pre_asr_cut_split_min_child_frames) * config.frame_hop_s / score_hop)),
+    )
+    target_score_frames = max(
+        1,
+        int(round(max(0, config.pre_asr_cut_split_target_core_frames) * config.frame_hop_s / score_hop)),
+    )
+    min_cut_score_frames = max(
+        1,
+        int(round(max(0, config.pre_asr_cut_split_min_cut_frames) * config.frame_hop_s / score_hop)),
+    )
+    target_frames = max(
+        min_child_score_frames * 2,
+        target_score_frames,
+    )
+    if target_frames <= 0:
+        target_frames = min_core_score_frames
+
+    groups: list[tuple[int, int]] = [(start_frame, end_frame)]
+    split_frames: list[int] = []
+    while len(groups) < config.pre_asr_cut_split_max_children:
+        candidates = [
+            (index, group)
+            for index, group in enumerate(groups)
+            if group[1] - group[0] > target_frames
+        ]
+        if not candidates:
+            break
+        group_index, (group_start, group_end) = max(
+            candidates,
+            key=lambda item: item[1][1] - item[1][0],
+        )
+        split_frame = _pick_cut_split_frame(
+            scores,
+            start_frame=group_start,
+            end_frame=group_end,
+            config=config,
+            min_child_frames=min_child_score_frames,
+            min_cut_frames=min_cut_score_frames,
+            target_core_frames=target_score_frames,
+        )
+        if split_frame is None:
+            break
+        left = (group_start, split_frame)
+        right = (split_frame, group_end)
+        groups[group_index : group_index + 1] = [left, right]
+        split_frames.append(split_frame)
+
+    return sorted(set(split_frames))
+
+
+def _pick_cut_split_frame(
+    scores: Sequence[float],
+    *,
+    start_frame: int,
+    end_frame: int,
+    config: FramePackingConfig,
+    min_child_frames: int | None = None,
+    min_cut_frames: int | None = None,
+    target_core_frames: int | None = None,
+) -> int | None:
+    min_child = max(1, min_child_frames or config.pre_asr_cut_split_min_child_frames)
+    min_cut = max(1, min_cut_frames or config.pre_asr_cut_split_min_cut_frames)
+    lower = start_frame + min_child
+    upper = end_frame - min_child
+    if upper <= lower:
+        return None
+
+    runs: list[tuple[int, int, float]] = []
+    run_start: int | None = None
+    threshold = float(config.pre_asr_cut_split_threshold)
+    for frame in range(lower, upper):
+        if float(scores[frame]) >= threshold:
+            if run_start is None:
+                run_start = frame
+            continue
+        if run_start is not None and frame - run_start >= min_cut:
+            run = scores[run_start:frame]
+            runs.append((run_start, frame, max(float(value) for value in run)))
+        run_start = None
+    if run_start is not None and upper - run_start >= min_cut:
+        run = scores[run_start:upper]
+        runs.append((run_start, upper, max(float(value) for value in run)))
+    if not runs:
+        return None
+
+    target = target_core_frames if target_core_frames is not None else config.pre_asr_cut_split_target_core_frames
+    ideal = min(end_frame - min_child, start_frame + max(min_child, target))
+    run_start, run_end, _max_score = min(
+        runs,
+        key=lambda item: (abs(((item[0] + item[1]) / 2.0) - ideal), -item[2]),
+    )
+    return int(round((run_start + run_end) / 2.0))
 
 
 def _split_segments_on_score_valleys(
@@ -332,12 +551,13 @@ def _split_segments_on_score_valleys(
         if not split_frames:
             result.append(segment)
             continue
-        boundaries = [segment.start, *[frame * config.frame_hop_s for frame in split_frames], segment.end]
+        score_hop = config.effective_score_frame_hop_s
+        boundaries = [segment.start, *[frame * score_hop for frame in split_frames], segment.end]
         for child_index, (start, end) in enumerate(zip(boundaries, boundaries[1:])):
             if end <= start:
                 continue
-            start_frame = max(0, int(start / config.frame_hop_s))
-            end_frame = min(len(scores), max(start_frame + 1, int(end / config.frame_hop_s)))
+            start_frame = max(0, int(start / score_hop))
+            end_frame = min(len(scores), max(start_frame + 1, int(end / score_hop)))
             valley_min = min(scores[start_frame:end_frame]) if end_frame > start_frame else None
             result.append(
                 _PackSegment(
@@ -363,17 +583,31 @@ def _plan_valley_split_frames_for_segment(
     if config.pre_asr_valley_split_min_core_s > 0.0:
         if segment.end - segment.start < config.pre_asr_valley_split_min_core_s:
             return []
-    start_frame = max(0, int(round(segment.start / config.frame_hop_s)))
-    end_frame = min(len(scores), int(round(segment.end / config.frame_hop_s)))
-    if end_frame - start_frame < max(1, config.pre_asr_valley_split_min_core_frames):
+    score_hop = config.effective_score_frame_hop_s
+    start_frame = max(0, int(round(segment.start / score_hop)))
+    end_frame = min(len(scores), int(round(segment.end / score_hop)))
+    min_core_score_frames = max(1, int(round(config.pre_asr_valley_split_min_core_s / score_hop)))
+    if end_frame - start_frame < min_core_score_frames:
         return []
 
+    min_child_score_frames = max(
+        1,
+        int(round(max(0, config.pre_asr_valley_split_min_child_frames) * config.frame_hop_s / score_hop)),
+    )
+    target_score_frames = max(
+        1,
+        int(round(max(0, config.pre_asr_valley_split_target_core_frames) * config.frame_hop_s / score_hop)),
+    )
+    min_valley_score_frames = max(
+        1,
+        int(round(max(0, config.pre_asr_valley_split_min_valley_frames) * config.frame_hop_s / score_hop)),
+    )
     target_frames = max(
-        config.pre_asr_valley_split_min_child_frames * 2,
-        config.pre_asr_valley_split_target_core_frames,
+        min_child_score_frames * 2,
+        target_score_frames,
     )
     if target_frames <= 0:
-        target_frames = max(1, config.pre_asr_valley_split_min_core_frames)
+        target_frames = min_core_score_frames
 
     groups: list[tuple[int, int]] = [(start_frame, end_frame)]
     split_frames: list[int] = []
@@ -394,6 +628,9 @@ def _plan_valley_split_frames_for_segment(
             start_frame=group_start,
             end_frame=group_end,
             config=config,
+            min_child_frames=min_child_score_frames,
+            min_valley_frames=min_valley_score_frames,
+            target_core_frames=target_score_frames,
         )
         if split_frame is None:
             break
@@ -411,9 +648,12 @@ def _pick_valley_split_frame(
     start_frame: int,
     end_frame: int,
     config: FramePackingConfig,
+    min_child_frames: int | None = None,
+    min_valley_frames: int | None = None,
+    target_core_frames: int | None = None,
 ) -> int | None:
-    min_child = max(1, config.pre_asr_valley_split_min_child_frames)
-    min_valley = max(1, config.pre_asr_valley_split_min_valley_frames)
+    min_child = max(1, min_child_frames or config.pre_asr_valley_split_min_child_frames)
+    min_valley = max(1, min_valley_frames or config.pre_asr_valley_split_min_valley_frames)
     lower = start_frame + min_child
     upper = end_frame - min_child
     if upper <= lower:
@@ -437,7 +677,8 @@ def _pick_valley_split_frame(
     if not runs:
         return None
 
-    ideal = min(end_frame - min_child, start_frame + max(min_child, config.pre_asr_valley_split_target_core_frames))
+    target = target_core_frames if target_core_frames is not None else config.pre_asr_valley_split_target_core_frames
+    ideal = min(end_frame - min_child, start_frame + max(min_child, target))
     run_start, run_end, _mean_score = min(
         runs,
         key=lambda item: (abs(((item[0] + item[1]) / 2.0) - ideal), item[2]),
@@ -494,7 +735,9 @@ def _make_chunk(
     start = max(0.0, core_start - left_padding)
     end = core_end + right_padding
     if any(segment.split_left or segment.split_right for segment in segments):
-        if any(segment.split_policy == "r16_pre_asr_valley_v1" for segment in segments):
+        if any(segment.split_policy == "r17_pre_asr_cut_v1" for segment in segments):
+            split_reason = "pre_asr_cut_split"
+        elif any(segment.split_policy == "r16_pre_asr_valley_v1" for segment in segments):
             split_reason = "pre_asr_valley_split"
         else:
             split_reason = "overlong"
@@ -503,6 +746,11 @@ def _make_chunk(
         float(segment.valley_score_min)
         for segment in segments
         if segment.valley_score_min is not None
+    ]
+    cut_scores = [
+        float(segment.cut_score_max)
+        for segment in segments
+        if segment.cut_score_max is not None
     ]
     return PackedChunk(
         start=start,
@@ -521,6 +769,10 @@ def _make_chunk(
             1 for segment in segments if segment.split_policy == "r16_pre_asr_valley_v1"
         ),
         valley_score_min=min(valley_scores) if valley_scores else None,
+        cut_split_count=sum(
+            1 for segment in segments if segment.split_policy == "r17_pre_asr_cut_v1"
+        ),
+        cut_score_max=max(cut_scores) if cut_scores else None,
     )
 
 
@@ -663,6 +915,8 @@ def _clamp_child_to_parent(
         split_policy="r15_pre_asr_island_v1",
         valley_split_count=child.valley_split_count,
         valley_score_min=child.valley_score_min,
+        cut_split_count=child.cut_split_count,
+        cut_score_max=child.cut_score_max,
     )
 
 

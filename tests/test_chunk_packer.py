@@ -246,6 +246,107 @@ def test_pre_asr_valley_split_requires_sustained_low_score_run():
     assert chunks[0].split_policy == ""
 
 
+def test_pre_asr_cut_split_disabled_keeps_long_continuous_segment():
+    segment = _seg(0.0, 12.0)
+    cut_scores = [0.05] * 5 + [0.98] * 2 + [0.05] * 5
+
+    chunks = pack_vad_segments(
+        [segment],
+        frame_hop_s=1.0,
+        window_frames=30,
+        reserve_frames=2,
+        target_padding_frames=1,
+        gap_merge_frames=0,
+        pre_asr_cut_split_enabled=False,
+        pre_asr_cut_split_min_core_frames=8,
+        pre_asr_cut_split_target_core_frames=5,
+        pre_asr_cut_split_min_cut_frames=2,
+        pre_asr_cut_split_min_child_frames=3,
+        cut_frame_scores=cut_scores,
+    )
+
+    assert len(chunks) == 1
+    assert chunks[0].vad_segments == [segment]
+    assert chunks[0].cut_split_count == 0
+
+
+def test_pre_asr_cut_split_cuts_long_continuous_segment_at_cut_scores():
+    cut_scores = [0.05] * 5 + [0.98] * 2 + [0.05] * 5
+
+    chunks = pack_vad_segments(
+        [_seg(0.0, 12.0)],
+        frame_hop_s=1.0,
+        window_frames=30,
+        reserve_frames=2,
+        target_padding_frames=1,
+        gap_merge_frames=0,
+        pre_asr_cut_split_enabled=True,
+        pre_asr_cut_split_min_core_frames=8,
+        pre_asr_cut_split_target_core_frames=5,
+        pre_asr_cut_split_min_cut_frames=2,
+        pre_asr_cut_split_min_child_frames=3,
+        pre_asr_cut_split_threshold=0.94,
+        cut_frame_scores=cut_scores,
+    )
+
+    assert len(chunks) == 2
+    assert chunks[0].split_reason == "pre_asr_cut_split"
+    assert chunks[1].split_reason == "pre_asr_cut_split"
+    assert chunks[0].vad_segments[0].end == pytest.approx(6.0)
+    assert chunks[1].vad_segments[0].start == pytest.approx(6.0)
+    assert {chunk.split_policy for chunk in chunks} == {"r17_pre_asr_cut_v1"}
+    assert chunks[0].cut_score_max == pytest.approx(0.98)
+    assert chunks[0].cut_split_count == 1
+
+
+def test_pre_asr_cut_split_requires_sustained_cut_run():
+    cut_scores = [0.05] * 5 + [0.98] + [0.05] * 6
+
+    chunks = pack_vad_segments(
+        [_seg(0.0, 12.0)],
+        frame_hop_s=1.0,
+        window_frames=30,
+        reserve_frames=2,
+        target_padding_frames=1,
+        gap_merge_frames=0,
+        pre_asr_cut_split_enabled=True,
+        pre_asr_cut_split_min_core_frames=8,
+        pre_asr_cut_split_target_core_frames=5,
+        pre_asr_cut_split_min_cut_frames=2,
+        pre_asr_cut_split_min_child_frames=3,
+        pre_asr_cut_split_threshold=0.94,
+        cut_frame_scores=cut_scores,
+    )
+
+    assert len(chunks) == 1
+    assert chunks[0].split_policy == ""
+
+
+def test_pre_asr_cut_split_uses_score_frame_hop_independent_of_pack_frames():
+    cut_scores = [0.05] * 10 + [0.98] * 4 + [0.05] * 46
+
+    chunks = pack_vad_segments(
+        [_seg(0.0, 12.0)],
+        frame_hop_s=1.0,
+        window_frames=30,
+        reserve_frames=2,
+        target_padding_frames=1,
+        gap_merge_frames=0,
+        pre_asr_cut_split_enabled=True,
+        pre_asr_cut_split_min_core_frames=8,
+        pre_asr_cut_split_target_core_frames=5,
+        pre_asr_cut_split_min_cut_frames=2,
+        pre_asr_cut_split_min_child_frames=3,
+        pre_asr_cut_split_threshold=0.94,
+        cut_frame_scores=cut_scores,
+        score_frame_hop_s=0.5,
+    )
+
+    assert len(chunks) == 2
+    assert chunks[0].vad_segments[0].end == pytest.approx(6.0)
+    assert chunks[1].vad_segments[0].start == pytest.approx(6.0)
+
+
 def test_near_capacity_segment_reduces_padding_to_fit_window_reserve():
     chunks = _pack([_seg(2.0, 28.0)])
 

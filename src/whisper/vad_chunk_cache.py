@@ -103,6 +103,13 @@ _CHUNK_ENV_KEYS = (
     "ASR_PRE_ASR_VALLEY_SPLIT_MIN_CHILD_FRAMES",
     "ASR_PRE_ASR_VALLEY_SPLIT_MAX_CHILDREN",
     "ASR_PRE_ASR_VALLEY_SPLIT_THRESHOLD",
+    "ASR_PRE_ASR_CUT_SPLIT_ENABLED",
+    "ASR_PRE_ASR_CUT_SPLIT_MIN_CORE_FRAMES",
+    "ASR_PRE_ASR_CUT_SPLIT_TARGET_CORE_FRAMES",
+    "ASR_PRE_ASR_CUT_SPLIT_MIN_CUT_FRAMES",
+    "ASR_PRE_ASR_CUT_SPLIT_MIN_CHILD_FRAMES",
+    "ASR_PRE_ASR_CUT_SPLIT_MAX_CHILDREN",
+    "ASR_PRE_ASR_CUT_SPLIT_THRESHOLD",
     "ASR_CHUNK_DROP_ENABLED",
     "ASR_CHUNK_DROP_MIN_DURATION_S",
     "ASR_CHUNK_DROP_RMS_DBFS",
@@ -355,6 +362,10 @@ def _packed_chunk_to_dict(chunk: PackedChunk) -> dict:
         "valley_score_min": (
             None if chunk.valley_score_min is None else float(chunk.valley_score_min)
         ),
+        "cut_split_count": int(chunk.cut_split_count),
+        "cut_score_max": (
+            None if chunk.cut_score_max is None else float(chunk.cut_score_max)
+        ),
         "vad_segments": _segments_to_payload(chunk.vad_segments),
     }
 
@@ -390,6 +401,12 @@ def _packed_chunk_from_dict(item: Any) -> PackedChunk:
             None
             if item.get("valley_score_min") is None
             else float(item.get("valley_score_min"))
+        ),
+        cut_split_count=int(item.get("cut_split_count") or 0),
+        cut_score_max=(
+            None
+            if item.get("cut_score_max") is None
+            else float(item.get("cut_score_max"))
         ),
     )
 

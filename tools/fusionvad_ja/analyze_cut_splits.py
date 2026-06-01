@@ -136,7 +136,16 @@ def risk_indices_from_diagnostics(diagnostics: list[dict[str, Any]]) -> set[int]
     return risky
 
 
-def analyze_valley_splits(
+def cut_scores_from_payload(payload: dict[str, Any]) -> list[float]:
+    raw_scores = payload.get("cut_scores")
+    if raw_scores is None:
+        raw_scores = payload.get("cut_frame_scores")
+    if raw_scores is None:
+        raw_scores = payload.get("scores")
+    return [float(value) for value in (raw_scores or [])]
+
+
+def analyze_cut_splits(
     *,
     vad_cache: Path,
     frame_scores_path: Path,
@@ -144,15 +153,15 @@ def analyze_valley_splits(
     diagnostics_path: Path | None,
     min_core_frames: int,
     target_core_frames: int,
-    min_valley_frames: int,
+    min_cut_frames: int,
     min_child_frames: int,
     max_children: int,
-    valley_threshold: float,
+    cut_threshold: float,
 ) -> dict[str, Any]:
     output_dir.mkdir(parents=True, exist_ok=True)
     cache_payload = read_json(vad_cache)
     scores_payload = read_json(frame_scores_path)
-    scores = [float(value) for value in (scores_payload.get("scores") or [])]
+    cut_scores = cut_scores_from_payload(scores_payload)
     frame_hop_s = float(
         cache_payload.get("signature", {}).get("chunk", {}).get("pack_frame_hop_s")
         or cache_payload.get("runtime_vad_signature", {}).get("chunk_packing", {}).get("frame_hop_s")
@@ -186,18 +195,18 @@ def analyze_valley_splits(
             reserve_frames=45,
             target_padding_frames=60,
             gap_merge_frames=45,
-            pre_asr_valley_split_enabled=True,
-            pre_asr_valley_split_min_core_frames=min_core_frames,
-            pre_asr_valley_split_target_core_frames=target_core_frames,
-            pre_asr_valley_split_min_valley_frames=min_valley_frames,
-            pre_asr_valley_split_min_child_frames=min_child_frames,
-            pre_asr_valley_split_max_children=max_children,
-            pre_asr_valley_split_threshold=valley_threshold,
-            frame_scores=scores,
+            pre_asr_cut_split_enabled=True,
+            pre_asr_cut_split_min_core_frames=min_core_frames,
+            pre_asr_cut_split_target_core_frames=target_core_frames,
+            pre_asr_cut_split_min_cut_frames=min_cut_frames,
+            pre_asr_cut_split_min_child_frames=min_child_frames,
+            pre_asr_cut_split_max_children=max_children,
+            pre_asr_cut_split_threshold=cut_threshold,
+            cut_frame_scores=cut_scores,
             score_frame_hop_s=score_frame_hop_s,
         )
         child_count = max(0, len(simulated))
-        split = child_count > 1 or any(chunk.valley_split_count for chunk in simulated)
+        split = child_count > 1 or any(chunk.cut_split_count for chunk in simulated)
         if split:
             split_chunk_count += 1
             if index in risky_indices:
@@ -213,7 +222,7 @@ def analyze_valley_splits(
                 "vad_seg_count": len(segments),
                 "risk_vad_coarse_after_sentinel": index in risky_indices,
                 "child_count": child_count,
-                "valley_split": split,
+                "cut_split": split,
                 "children": [
                     {
                         "start": round(chunk.start, 3),
@@ -223,8 +232,8 @@ def analyze_valley_splits(
                         "core_end": None if chunk.core_end is None else round(chunk.core_end, 3),
                         "split_reason": chunk.split_reason,
                         "split_policy": chunk.split_policy,
-                        "valley_split_count": chunk.valley_split_count,
-                        "valley_score_min": chunk.valley_score_min,
+                        "cut_split_count": chunk.cut_split_count,
+                        "cut_score_max": chunk.cut_score_max,
                     }
                     for chunk in simulated
                 ],
@@ -235,8 +244,8 @@ def analyze_valley_splits(
     for row in rows:
         if row["risk_vad_coarse_after_sentinel"]:
             reason_counts["vad_coarse_after_sentinel"] += 1
-        if row["valley_split"]:
-            reason_counts["valley_split"] += 1
+        if row["cut_split"]:
+            reason_counts["cut_split"] += 1
         if row["vad_seg_count"] <= 1 and row["duration_s"] >= min_core_frames * frame_hop_s:
             reason_counts["long_continuous_island"] += 1
 
@@ -249,10 +258,10 @@ def analyze_valley_splits(
         "config": {
             "min_core_frames": min_core_frames,
             "target_core_frames": target_core_frames,
-            "min_valley_frames": min_valley_frames,
+            "min_cut_frames": min_cut_frames,
             "min_child_frames": min_child_frames,
             "max_children": max_children,
-            "valley_threshold": valley_threshold,
+            "cut_threshold": cut_threshold,
         },
         "original_chunk_count": len(rows),
         "new_chunk_count": new_chunk_count,
@@ -266,7 +275,7 @@ def analyze_valley_splits(
         "reason_counts": dict(reason_counts.most_common()),
     }
     write_json(output_dir / "summary.json", summary)
-    write_jsonl(output_dir / "valley_split_plan.jsonl", rows)
+    write_jsonl(output_dir / "cut_split_plan.jsonl", rows)
     (output_dir / "summary.md").write_text(
         build_markdown(summary),
         encoding="utf-8",
@@ -276,7 +285,7 @@ def analyze_valley_splits(
 
 def build_markdown(summary: dict[str, Any]) -> str:
     lines = [
-        "# R16 Valley Split Offline Analysis",
+        "# R17 Cut Split Offline Analysis",
         "",
         f"- vad cache: `{summary['vad_cache']}`",
         f"- frame scores: `{summary['frame_scores']}`",
@@ -303,17 +312,17 @@ def build_markdown(summary: dict[str, Any]) -> str:
 
 
 def run(args: argparse.Namespace) -> None:
-    summary = analyze_valley_splits(
+    summary = analyze_cut_splits(
         vad_cache=project_path(args.vad_cache),
         frame_scores_path=project_path(args.frame_scores),
         output_dir=project_path(args.output_dir),
         diagnostics_path=project_path(args.diagnostics) if args.diagnostics else None,
         min_core_frames=args.min_core_frames,
         target_core_frames=args.target_core_frames,
-        min_valley_frames=args.min_valley_frames,
+        min_cut_frames=args.min_cut_frames,
         min_child_frames=args.min_child_frames,
         max_children=args.max_children,
-        valley_threshold=args.valley_threshold,
+        cut_threshold=args.cut_threshold,
     )
     print(f"summary={project_rel(Path(args.output_dir) / 'summary.json')}")
     print(
@@ -329,34 +338,34 @@ def run(args: argparse.Namespace) -> None:
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Offline R16 analysis: simulate frame-score valley splitting on packed VAD chunks."
+        description="Offline R17 analysis: simulate endpoint cut-score splitting on packed VAD chunks."
     )
     parser.add_argument("--vad-cache", required=True)
     parser.add_argument("--frame-scores", required=True)
     parser.add_argument("--diagnostics", default="")
     parser.add_argument(
         "--output-dir",
-        default=str(PROJECT_ROOT / "agents" / "temp" / "fusionvad-ja" / "r16-valley-analysis"),
+        default=str(PROJECT_ROOT / "agents" / "temp" / "fusionvad-ja" / "r17-cut-analysis"),
     )
     parser.add_argument("--min-core-frames", type=int, default=420)
     parser.add_argument("--target-core-frames", type=int, default=270)
-    parser.add_argument("--min-valley-frames", type=int, default=6)
+    parser.add_argument("--min-cut-frames", type=int, default=3)
     parser.add_argument("--min-child-frames", type=int, default=45)
     parser.add_argument("--max-children", type=int, default=8)
-    parser.add_argument("--valley-threshold", type=float, default=0.20)
+    parser.add_argument("--cut-threshold", type=float, default=0.94)
     args = parser.parse_args(argv)
     if args.min_core_frames < 0:
         parser.error("--min-core-frames must be non-negative")
     if args.target_core_frames < 0:
         parser.error("--target-core-frames must be non-negative")
-    if args.min_valley_frames < 0:
-        parser.error("--min-valley-frames must be non-negative")
+    if args.min_cut_frames < 0:
+        parser.error("--min-cut-frames must be non-negative")
     if args.min_child_frames < 0:
         parser.error("--min-child-frames must be non-negative")
     if args.max_children <= 0:
         parser.error("--max-children must be positive")
-    if args.valley_threshold < 0.0:
-        parser.error("--valley-threshold must be non-negative")
+    if args.cut_threshold < 0.0:
+        parser.error("--cut-threshold must be non-negative")
     return args
 
 

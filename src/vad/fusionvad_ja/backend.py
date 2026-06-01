@@ -491,6 +491,8 @@ class FusionVadJaBackend:
             )
             if _env_bool("FUSIONVAD_JA_EXPORT_FRAME_SCORES", "0") or _env_bool(
                 "ASR_PRE_ASR_VALLEY_SPLIT_ENABLED", "0"
+            ) or _env_bool(
+                "ASR_PRE_ASR_CUT_SPLIT_ENABLED", "0"
             ):
                 params["frame_scores"] = [float(value) for value in probabilities]
                 if cut_probabilities is not None:

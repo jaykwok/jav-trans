@@ -57,3 +57,23 @@ def test_chunk_config_reads_pre_asr_valley_split_env_at_runtime(monkeypatch):
     assert cfg["pre_asr_valley_split_min_child_frames"] == 30
     assert cfg["pre_asr_valley_split_max_children"] == 6
     assert cfg["pre_asr_valley_split_threshold"] == 0.15
+
+
+def test_chunk_config_reads_pre_asr_cut_split_env_at_runtime(monkeypatch):
+    monkeypatch.setenv("ASR_PRE_ASR_CUT_SPLIT_ENABLED", "1")
+    monkeypatch.setenv("ASR_PRE_ASR_CUT_SPLIT_MIN_CORE_FRAMES", "360")
+    monkeypatch.setenv("ASR_PRE_ASR_CUT_SPLIT_TARGET_CORE_FRAMES", "240")
+    monkeypatch.setenv("ASR_PRE_ASR_CUT_SPLIT_MIN_CUT_FRAMES", "4")
+    monkeypatch.setenv("ASR_PRE_ASR_CUT_SPLIT_MIN_CHILD_FRAMES", "30")
+    monkeypatch.setenv("ASR_PRE_ASR_CUT_SPLIT_MAX_CHILDREN", "6")
+    monkeypatch.setenv("ASR_PRE_ASR_CUT_SPLIT_THRESHOLD", "0.92")
+
+    cfg = pipeline._chunk_config()
+
+    assert cfg["pre_asr_cut_split_enabled"] is True
+    assert cfg["pre_asr_cut_split_min_core_frames"] == 360
+    assert cfg["pre_asr_cut_split_target_core_frames"] == 240
+    assert cfg["pre_asr_cut_split_min_cut_frames"] == 4
+    assert cfg["pre_asr_cut_split_min_child_frames"] == 30
+    assert cfg["pre_asr_cut_split_max_children"] == 6
+    assert cfg["pre_asr_cut_split_threshold"] == 0.92
