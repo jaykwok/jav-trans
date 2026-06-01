@@ -377,11 +377,13 @@ def write_feature_cache(
     audio_path: Path,
     config: FeatureConfig,
     bundle: dict[str, Any],
+    compressed: bool = True,
 ) -> CachedFeature:
     output_dir.mkdir(parents=True, exist_ok=True)
     key = cache_key_for_audio(audio_path=audio_path, config=config)
     feature_path = output_dir / f"{audio_id}-{key}.npz"
-    np.savez_compressed(
+    save_func = np.savez_compressed if compressed else np.savez
+    save_func(
         feature_path,
         whisper=bundle["whisper"],
         mfcc=bundle["mfcc"],

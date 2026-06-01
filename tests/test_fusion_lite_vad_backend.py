@@ -29,7 +29,7 @@ def test_vad_registry_exposes_current_modes(monkeypatch):
         raising=False,
     )
     fusionvad_ja = vad.get_vad_backend("fusionvad_ja")
-    assert fusionvad_ja.name == "fusionvad_ja_v1_16_endpoint_refiner"
+    assert fusionvad_ja.name == "fusionvad_ja_v1_17_endpoint_refiner"
     with pytest.raises(ValueError, match="fusion_lite_boost"):
         vad.get_vad_backend("fusion_lite_boost")
     with pytest.raises(ValueError, match="whisperseg"):
@@ -52,7 +52,7 @@ def test_vad_registry_default_is_research_fusionvad_ja(monkeypatch):
 
     backend = vad.get_vad_backend()
 
-    assert backend.name == "fusionvad_ja_v1_16_endpoint_refiner"
+    assert backend.name == "fusionvad_ja_v1_17_endpoint_refiner"
 
 
 def test_fusionvad_ja_frames_to_segments_pads_and_scores():

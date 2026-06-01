@@ -389,9 +389,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--fusionvad-checkpoint",
         default=(
-            "datasets/train/fusionvad-ja/v1-16/qwen3-asr-0.6b-full29239/"
-            "endpoint-refiner-boundary4096-v1mini-batch16-lr2e-4-steps2048-posaux120-cut8/"
-            "fusionvad_ja_endpoint_refiner.pt"
+            "src/vad/fusionvad_ja/checkpoints/"
+            "fusionvad_ja_v1_17_endpoint_refiner.pt"
         ),
     )
     parser.add_argument("--fusionvad-threshold", type=float, default=0.020)

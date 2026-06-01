@@ -683,6 +683,7 @@ def test_qwen3_asr_ptm_helpers_and_low_rate_resize():
     assert is_qwen3_asr_ptm("jaykwok/Qwen3-ASR-0.6B-JA-Anime-Galgame")
     assert is_low_frame_rate_ptm("qwen3-asr-0.6b")
     assert qwen3_asr_repo_id("qwen3-asr-0.6b") == "jaykwok/Qwen3-ASR-0.6B-JA-Anime-Galgame"
+    assert qwen3_asr_repo_id("qwen3-asr-1.7b") == "jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame"
     assert qwen3_asr_repo_id("qwen3-asr-0.6b-base") == "Qwen/Qwen3-ASR-0.6B"
     assert qwen3_asr_audio_output_lengths(100) == 13
 
@@ -698,6 +699,20 @@ def test_qwen3_asr_ptm_helpers_and_low_rate_resize():
     )
     assert aligned_ptm.shape == (5, 1)
     assert aligned_mfcc.shape == (5, 4)
+
+
+def test_fusionvad_ja_default_checkpoint_is_bundled_for_distribution():
+    from pathlib import Path
+
+    from vad.fusionvad_ja.backend import DEFAULT_CHECKPOINT, DEFAULT_MODEL_PATH, DEFAULT_OPERATING_POINT
+
+    checkpoint = Path(DEFAULT_CHECKPOINT)
+    assert checkpoint.exists()
+    assert checkpoint.name == "fusionvad_ja_v1_17_endpoint_refiner.pt"
+    assert "src/vad/fusionvad_ja/checkpoints" in checkpoint.as_posix()
+    assert "datasets/" not in checkpoint.as_posix()
+    assert DEFAULT_OPERATING_POINT.startswith("v1.17-endpoint-refiner-boundary32768")
+    assert DEFAULT_MODEL_PATH == "models/jaykwok-Qwen3-ASR-0.6B-JA-Anime-Galgame"
 
 
 def test_qwen3_asr_feature_head_can_stay_under_budget():
@@ -1320,6 +1335,20 @@ def test_build_feature_cache_cli_requires_labels():
     assert args.no_download is True
     assert args.dtype == "bfloat16"
 
+    args = module.parse_args(
+        [
+            "--labels",
+            "labels.jsonl",
+            "--ptm",
+            "qwen3-asr-0.6b",
+            "--prepare-workers",
+            "2",
+            "--no-compress",
+        ]
+    )
+    assert args.prepare_workers == 2
+    assert args.no_compress is True
+
 
 def test_build_feature_cache_run_supports_qwen_low_rate_features(tmp_path, monkeypatch):
     import importlib.util
@@ -1390,6 +1419,11 @@ def test_build_feature_cache_run_supports_qwen_low_rate_features(tmp_path, monke
                 "qwen3-asr-0.6b",
                 "--device",
                 "cpu",
+                "--batch-size",
+                "1",
+                "--prepare-workers",
+                "1",
+                "--no-compress",
                 "--output-dir",
                 str(tmp_path / "cache"),
             ]
@@ -1397,6 +1431,8 @@ def test_build_feature_cache_run_supports_qwen_low_rate_features(tmp_path, monke
     )
 
     rows = json.loads((tmp_path / "cache" / "feature_manifest.json").read_text(encoding="utf-8"))
+    summary = json.loads((tmp_path / "cache" / "feature_summary.json").read_text(encoding="utf-8"))
+    assert summary["compressed"] is False
     assert rows[0]["frame_count"] == 5
     assert rows[0]["whisper_dim"] == 3
     assert rows[0]["mfcc_dim"] == 4
@@ -1890,7 +1926,7 @@ def test_export_fusionvad_operating_point_wraps_predictions_and_recall(tmp_path)
             str(tmp_path / "op"),
         ]
     )
-    assert args.operating_point == "fusionvad-ja-v1.16-endpoint-refiner-boundary4096"
+    assert args.operating_point == "fusionvad-ja-v1.17-endpoint-refiner-boundary32768"
     module.run(args)
 
     summary = json.loads((tmp_path / "op" / "operating_point_summary.json").read_text(encoding="utf-8"))

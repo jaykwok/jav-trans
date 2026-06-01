@@ -22,13 +22,13 @@ from vad.fusionvad_ja.model import AdditionFusionBiLSTM, AdditionFusionEndpointB
 from vad.whisperseg.postprocess import group_segments
 
 
-DEFAULT_CHECKPOINT = (
-    "datasets/train/fusionvad-ja/v1-16/qwen3-asr-0.6b-full29239/"
-    "endpoint-refiner-boundary4096-v1mini-batch16-lr2e-4-steps2048-posaux120-cut8/"
-    "fusionvad_ja_endpoint_refiner.pt"
+DEFAULT_CHECKPOINT = str(
+    Path(__file__).resolve().parent
+    / "checkpoints"
+    / "fusionvad_ja_v1_17_endpoint_refiner.pt"
 )
 DEFAULT_MODEL_PATH = "models/jaykwok-Qwen3-ASR-0.6B-JA-Anime-Galgame"
-DEFAULT_OPERATING_POINT = "v1.16-endpoint-refiner-boundary4096-speech0.020-cut0.960-pad0.2"
+DEFAULT_OPERATING_POINT = "v1.17-endpoint-refiner-boundary32768-speech0.020-cut0.960-pad0.2"
 
 
 def _env_float(name: str, default: str) -> float:
@@ -261,7 +261,7 @@ class FusionVadJaConfig:
 
 
 class FusionVadJaBackend:
-    name = "fusionvad_ja_v1_16_endpoint_refiner"
+    name = "fusionvad_ja_v1_17_endpoint_refiner"
 
     def __init__(self, config: FusionVadJaConfig | None = None) -> None:
         self.config = config or FusionVadJaConfig.from_env()

@@ -19,7 +19,7 @@ from export_endpoint_refiner_predictions import export_predictions as export_end
 from vad_recall_metrics import compute_recall_metrics  # noqa: E402
 
 
-DEFAULT_OPERATING_POINT = "fusionvad-ja-v1.16-endpoint-refiner-boundary4096"
+DEFAULT_OPERATING_POINT = "fusionvad-ja-v1.17-endpoint-refiner-boundary32768"
 DEFAULT_THRESHOLD = 0.020
 DEFAULT_CUT_THRESHOLD = 0.960
 DEFAULT_PAD_S = 0.2
