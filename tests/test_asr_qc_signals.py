@@ -142,7 +142,7 @@ def test_partial_none_signals_checked():
     assert "logprob" in qc["reason"]
 
 
-def test_chunk_qc_exports_repetition_repair_suggestion():
+def test_chunk_qc_preserves_repeated_nonlexical_vocalization():
     qc = evaluate_asr_chunk_qc(
         {"index": 0, "start": 0.0, "end": 6.0, "duration": 6.0},
         {
@@ -152,13 +152,46 @@ def test_chunk_qc_exports_repetition_repair_suggestion():
         },
     )
 
-    assert qc["severity"] == "reject"
-    assert "repeat_ngram_loop" in qc["reasons"]
+    assert qc["severity"] == "warn"
+    assert "repeated_nonlexical_vocalization" in qc["reasons"]
+    assert "repeat_ngram_loop" not in qc["reasons"]
+    assert qc["metrics"]["vocalization_repetition"]["policy"] == "preserve_with_review"
     repair = qc["metrics"]["repetition_repair"]
     assert repair["action"] == "truncate_repetition"
     assert repair["changed"] is True
     assert repair["run"] >= 4
     assert len(repair["suggested_text"]) < len(qc["text_preview"])
+
+
+def test_chunk_qc_rejects_lexical_repeat_loop():
+    qc = evaluate_asr_chunk_qc(
+        {"index": 0, "start": 0.0, "end": 6.0, "duration": 6.0},
+        {
+            "text": "多謝ごちそうさま" * 8,
+            "raw_text": "多謝ごちそうさま" * 8,
+            "duration": 6.0,
+        },
+    )
+
+    assert qc["severity"] == "reject"
+    assert "repeat_ngram_loop" in qc["reasons"]
+    assert qc["metrics"]["vocalization_repetition"]["policy"] == "standard_repeat_qc"
+
+
+def test_longer_nonlexical_repeat_does_not_trigger_cap_like_reject():
+    text = "あっ" * 30
+    qc = evaluate_asr_chunk_qc(
+        {"index": 0, "start": 0.0, "end": 10.0, "duration": 10.0},
+        {
+            "text": text,
+            "raw_text": text,
+            "duration": 10.0,
+        },
+    )
+
+    assert qc["severity"] == "warn"
+    assert "repeated_nonlexical_vocalization" in qc["reasons"]
+    assert "hallucination_cap_like" not in qc["reasons"]
 
 
 def test_chunk_qc_exports_low_information_profile_without_dropping():

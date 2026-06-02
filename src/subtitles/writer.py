@@ -392,6 +392,80 @@ def _merge_overlapping_blocks(left: dict, right: dict) -> dict:
     return merged
 
 
+def _can_dense_merge_blocks(
+    left: dict,
+    right: dict,
+    *,
+    options: SubtitleOptions,
+) -> bool:
+    if not options.dense_cue_merge_enabled:
+        return False
+    if not _same_speaker_or_unknown(left, right):
+        return False
+
+    left_start = float(left.get("start", 0.0))
+    left_end = max(left_start, float(left.get("end", left_start)))
+    right_start = float(right.get("start", left_end))
+    right_end = max(right_start, float(right.get("end", right_start)))
+    left_duration = left_end - left_start
+    right_duration = right_end - right_start
+    combined_duration = right_end - left_start
+    gap = right_start - left_end
+
+    if gap < -_subtitle_gap_s(options):
+        return False
+    if gap > _frames_to_seconds(options.dense_cue_merge_max_gap_frames, options):
+        return False
+    max_single = _frames_to_seconds(options.dense_cue_merge_max_single_frames, options)
+    if max(left_duration, right_duration) > max_single:
+        return False
+    if combined_duration > _frames_to_seconds(
+        options.dense_cue_merge_max_combined_frames,
+        options,
+    ):
+        return False
+
+    combined_units = _block_text_units(left) + _block_text_units(right)
+    if combined_units > options.dense_cue_merge_max_text_units:
+        return False
+
+    left_ja = str(left.get("ja_text") or left.get("text") or "").strip()
+    left_zh = str(left.get("zh_text") or left.get("zh") or "").strip()
+    if left_ja.endswith(tuple(_SENTENCE_END_PUNCTUATION)):
+        return False
+    if left_zh.endswith(tuple(_ZH_SOFT_SPLIT_PUNCTUATION)):
+        return False
+
+    return True
+
+
+def _merge_dense_short_cues(
+    blocks: list[dict],
+    *,
+    options: SubtitleOptions | None = None,
+) -> list[dict]:
+    options = _coerce_options(options)
+    if not options.dense_cue_merge_enabled or len(blocks) < 2:
+        return list(blocks)
+
+    merged: list[dict] = []
+    index = 0
+    while index < len(blocks):
+        current = dict(blocks[index])
+        while index + 1 < len(blocks):
+            nxt = blocks[index + 1]
+            if not _can_dense_merge_blocks(current, nxt, options=options):
+                break
+            current = _merge_overlapping_blocks(current, nxt)
+            current["dense_cue_merge_count"] = (
+                int(current.get("dense_cue_merge_count") or 0) + 1
+            )
+            index += 1
+        merged.append(current)
+        index += 1
+    return merged
+
+
 def _normalize_subtitle_timeline(
     blocks: list[dict],
     *,
@@ -496,6 +570,7 @@ def _prepare_subtitle_blocks(
         prepared = _merge_adjacent_short_blocks(prepared, options=options)
         prepared = _copy_sorted_blocks(prepared)
     prepared = _soft_split_subtitle_blocks(prepared, options=options)
+    prepared = _merge_dense_short_cues(prepared, options=options)
     prepared = _normalize_subtitle_timeline(prepared, options=options)
     for idx in range(1, len(prepared) + 1):
         start, end = _resolve_subtitle_window(prepared, idx, options=options)

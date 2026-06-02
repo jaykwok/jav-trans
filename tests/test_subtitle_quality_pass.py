@@ -174,6 +174,46 @@ def test_timing_polish_respects_max_duration():
     assert prepared[0]["end"] == pytest.approx(6.5)
 
 
+def test_dense_short_cue_merge_reduces_micro_cues():
+    blocks = [
+        {"start": 0.0, "end": 0.35, "ja_text": "あ", "zh_text": "啊"},
+        {"start": 0.42, "end": 0.80, "ja_text": "ん", "zh_text": "嗯"},
+        {"start": 1.40, "end": 1.80, "ja_text": "いい", "zh_text": "舒服"},
+    ]
+    options = SubtitleOptions(
+        video_fps=29.97,
+        merge_adjacent=False,
+        dense_cue_merge_enabled=True,
+        dense_cue_merge_max_gap_frames=4,
+        dense_cue_merge_max_single_frames=24,
+        dense_cue_merge_max_combined_frames=90,
+        dense_cue_merge_max_text_units=12,
+    )
+
+    prepared = subtitle.prepare_srt_blocks(blocks, options=options, mode="bilingual")
+
+    assert len(prepared) == 2
+    assert prepared[0]["ja_text"] == "あ ん"
+    assert prepared[0]["zh_text"] == "啊，嗯"
+    assert prepared[0]["end"] + options.frame_gap_s <= prepared[1]["start"]
+
+
+def test_dense_short_cue_merge_respects_known_speaker_change():
+    blocks = [
+        {"start": 0.0, "end": 0.35, "ja_text": "あ", "zh_text": "啊", "speaker": "S0"},
+        {"start": 0.42, "end": 0.80, "ja_text": "ん", "zh_text": "嗯", "speaker": "S1"},
+    ]
+    options = SubtitleOptions(
+        video_fps=29.97,
+        merge_adjacent=False,
+        dense_cue_merge_enabled=True,
+    )
+
+    prepared = subtitle.prepare_srt_blocks(blocks, options=options, mode="bilingual")
+
+    assert len(prepared) == 2
+
+
 def test_prepare_srt_blocks_merges_same_speaker_overlap_when_too_tight():
     blocks = [
         {

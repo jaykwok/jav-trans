@@ -38,6 +38,11 @@ class SubtitleOptions:
     timing_polish_enabled: bool = True
     short_gap_collapse_s: float = 0.5
     linger_s: float = 0.45
+    dense_cue_merge_enabled: bool = True
+    dense_cue_merge_max_gap_frames: float = 4.0
+    dense_cue_merge_max_single_frames: float = 24.0
+    dense_cue_merge_max_combined_frames: float = 90.0
+    dense_cue_merge_max_text_units: float = 12.0
 
     @property
     def effective_video_fps(self) -> float:
@@ -104,6 +109,23 @@ class SubtitleOptions:
                 float(os.getenv("SUBTITLE_SHORT_GAP_COLLAPSE_S", "0.5")),
             ),
             linger_s=max(0.0, float(os.getenv("SUBTITLE_LINGER_S", "0.45"))),
+            dense_cue_merge_enabled=_env_bool("SUBTITLE_DENSE_CUE_MERGE_ENABLED", True),
+            dense_cue_merge_max_gap_frames=max(
+                0.0,
+                float(os.getenv("SUBTITLE_DENSE_CUE_MERGE_MAX_GAP_FRAMES", "4.0")),
+            ),
+            dense_cue_merge_max_single_frames=max(
+                0.0,
+                float(os.getenv("SUBTITLE_DENSE_CUE_MERGE_MAX_SINGLE_FRAMES", "24.0")),
+            ),
+            dense_cue_merge_max_combined_frames=max(
+                0.0,
+                float(os.getenv("SUBTITLE_DENSE_CUE_MERGE_MAX_COMBINED_FRAMES", "90.0")),
+            ),
+            dense_cue_merge_max_text_units=max(
+                0.0,
+                float(os.getenv("SUBTITLE_DENSE_CUE_MERGE_MAX_TEXT_UNITS", "12.0")),
+            ),
         )
 
     def signature(self) -> dict:
