@@ -82,6 +82,8 @@ _VAD_ENV_KEYS = (
     "FUSIONVAD_JA_CHUNK_THRESHOLD_S",
     "FUSIONVAD_JA_CUT_THRESHOLD",
     "FUSIONVAD_JA_APPLY_CUT_TO_SPEECH",
+    "FUSIONVAD_JA_EXPORT_DROP_GAP_SCORES",
+    "FUSIONVAD_JA_IMITATION_CHECKPOINT",
 )
 _CHUNK_ENV_KEYS = (
     "ASR_CHUNK_PACKING_ENABLED",
@@ -110,6 +112,24 @@ _CHUNK_ENV_KEYS = (
     "ASR_PRE_ASR_CUT_SPLIT_MIN_CHILD_FRAMES",
     "ASR_PRE_ASR_CUT_SPLIT_MAX_CHILDREN",
     "ASR_PRE_ASR_CUT_SPLIT_THRESHOLD",
+    "ASR_PRE_ASR_DROP_GAP_SPLIT_ENABLED",
+    "ASR_PRE_ASR_DROP_GAP_SPLIT_MIN_PARENT_FRAMES",
+    "ASR_PRE_ASR_DROP_GAP_SPLIT_MIN_GAP_FRAMES",
+    "ASR_PRE_ASR_DROP_GAP_SPLIT_MIN_GAP_S",
+    "ASR_PRE_ASR_DROP_GAP_SPLIT_MIN_CHILD_FRAMES",
+    "ASR_PRE_ASR_DROP_GAP_SPLIT_MAX_CHILDREN",
+    "ASR_PRE_ASR_DROP_GAP_SPLIT_THRESHOLD",
+    "ASR_PRE_ASR_RISK_SPLIT_ENABLED",
+    "ASR_PRE_ASR_RISK_SPLIT_MIN_CORE_FRAMES",
+    "ASR_PRE_ASR_RISK_SPLIT_TARGET_CORE_FRAMES",
+    "ASR_PRE_ASR_RISK_SPLIT_SAFE_CORE_FRAMES",
+    "ASR_PRE_ASR_RISK_SPLIT_MIN_GAP_FRAMES",
+    "ASR_PRE_ASR_RISK_SPLIT_MIN_CHILD_FRAMES",
+    "ASR_PRE_ASR_RISK_SPLIT_MAX_CHILDREN",
+    "ASR_PRE_ASR_RISK_SPLIT_THRESHOLD",
+    "ASR_PRE_ASR_RISK_SPLIT_CONTINUOUS_THRESHOLD",
+    "ASR_PRE_ASR_RISK_SPLIT_VALLEY_THRESHOLD",
+    "ASR_PRE_ASR_RISK_SPLIT_CUT_THRESHOLD",
     "ASR_CHUNK_DROP_ENABLED",
     "ASR_CHUNK_DROP_MIN_DURATION_S",
     "ASR_CHUNK_DROP_RMS_DBFS",
@@ -366,6 +386,11 @@ def _packed_chunk_to_dict(chunk: PackedChunk) -> dict:
         "cut_score_max": (
             None if chunk.cut_score_max is None else float(chunk.cut_score_max)
         ),
+        "risk_split_count": int(chunk.risk_split_count),
+        "risk_score": (
+            None if chunk.risk_score is None else float(chunk.risk_score)
+        ),
+        "risk_reasons": list(chunk.risk_reasons),
         "vad_segments": _segments_to_payload(chunk.vad_segments),
     }
 
@@ -408,6 +433,13 @@ def _packed_chunk_from_dict(item: Any) -> PackedChunk:
             if item.get("cut_score_max") is None
             else float(item.get("cut_score_max"))
         ),
+        risk_split_count=int(item.get("risk_split_count") or 0),
+        risk_score=(
+            None
+            if item.get("risk_score") is None
+            else float(item.get("risk_score"))
+        ),
+        risk_reasons=tuple(str(value) for value in (item.get("risk_reasons") or [])),
     )
 
 

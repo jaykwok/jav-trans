@@ -74,6 +74,27 @@ def build_exact_island_labels(
             speech_segments=segments,
             frame_hop_s=frame_hop_s,
         )
+        boundary_metadata = {
+            "source_audio_ids": list(payload.get("source_audio_ids") or []),
+            "speaker_proxy_ids": list(payload.get("speaker_proxy_ids") or []),
+            "speaker_turn_boundaries": list(payload.get("speaker_turn_boundaries") or []),
+            "cut_point_segments": list(payload.get("cut_point_segments") or []),
+            "cut_drop_zones": list(payload.get("cut_drop_zones") or []),
+            "actual_speech_segments": list(payload.get("actual_speech_segments") or []),
+            "speech_label_pad_s": payload.get("speech_label_pad_s"),
+        }
+        record = type(record)(
+            audio_id=record.audio_id,
+            source=record.source,
+            duration_s=record.duration_s,
+            text=record.text,
+            teacher_segments=record.teacher_segments,
+            frame_hop_s=record.frame_hop_s,
+            speech_frames=record.speech_frames,
+            label_quality=record.label_quality,
+            frame_weights=record.frame_weights,
+            boundary_metadata=boundary_metadata,
+        )
         records.append(record)
         segment_counts[len(segments)] += 1
         frame_total += len(record.speech_frames)

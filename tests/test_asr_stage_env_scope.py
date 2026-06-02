@@ -115,6 +115,11 @@ def test_asr_stage_env_scope_passes_pre_asr_split_flags(monkeypatch, tmp_path):
         advanced={
             "ASR_PRE_ASR_CUT_SPLIT_ENABLED": "1",
             "ASR_PRE_ASR_CUT_SPLIT_THRESHOLD": "0.92",
+            "ASR_PRE_ASR_DROP_GAP_SPLIT_ENABLED": "1",
+            "ASR_PRE_ASR_DROP_GAP_SPLIT_THRESHOLD": "0.82",
+            "ASR_PRE_ASR_RISK_SPLIT_ENABLED": "1",
+            "ASR_PRE_ASR_RISK_SPLIT_THRESHOLD": "1.25",
+            "ASR_PRE_ASR_RISK_SPLIT_CONTINUOUS_THRESHOLD": "2.25",
         },
     )
     monkeypatch.setattr(main.torch.cuda, "is_available", lambda: False)
@@ -132,6 +137,13 @@ def test_asr_stage_env_scope_passes_pre_asr_split_flags(monkeypatch, tmp_path):
     def fake_transcribe_and_align(_audio_path, _device, on_stage=None, include_details=False):
         seen["cut_enabled"] = main.os.environ.get("ASR_PRE_ASR_CUT_SPLIT_ENABLED")
         seen["cut_threshold"] = main.os.environ.get("ASR_PRE_ASR_CUT_SPLIT_THRESHOLD")
+        seen["drop_gap_enabled"] = main.os.environ.get("ASR_PRE_ASR_DROP_GAP_SPLIT_ENABLED")
+        seen["drop_gap_threshold"] = main.os.environ.get("ASR_PRE_ASR_DROP_GAP_SPLIT_THRESHOLD")
+        seen["risk_enabled"] = main.os.environ.get("ASR_PRE_ASR_RISK_SPLIT_ENABLED")
+        seen["risk_threshold"] = main.os.environ.get("ASR_PRE_ASR_RISK_SPLIT_THRESHOLD")
+        seen["risk_continuous_threshold"] = main.os.environ.get(
+            "ASR_PRE_ASR_RISK_SPLIT_CONTINUOUS_THRESHOLD"
+        )
         return (
             [{"start": 0.0, "end": 1.0, "text": "こんにちは"}],
             ["mock asr"],
@@ -147,7 +159,15 @@ def test_asr_stage_env_scope_passes_pre_asr_split_flags(monkeypatch, tmp_path):
         job_id=ctx.job_id,
     )
 
-    assert seen == {"cut_enabled": "1", "cut_threshold": "0.92"}
+    assert seen == {
+        "cut_enabled": "1",
+        "cut_threshold": "0.92",
+        "drop_gap_enabled": "1",
+        "drop_gap_threshold": "0.82",
+        "risk_enabled": "1",
+        "risk_threshold": "1.25",
+        "risk_continuous_threshold": "2.25",
+    }
 
 
 def test_vad_chunk_cache_dir_reaches_transcribe_but_not_aligned_signature(

@@ -26,7 +26,7 @@ from vad.fusionvad_ja import (  # noqa: E402
     metrics_from_frame_counts,
 )
 
-OUTPUT_NAMES = ("speech", "start", "end", "cut")
+OUTPUT_NAMES = ("speech", "start", "end", "cut_drop", "cut_point")
 
 
 def probability_summary(values: Iterable[float]) -> dict[str, float]:
@@ -126,12 +126,14 @@ def export_predictions(
         "speech": float(speech_threshold),
         "start": float(start_threshold),
         "end": float(end_threshold),
-        "cut": float(cut_threshold),
+        "cut_drop": float(cut_threshold),
+        "cut_point": float(cut_threshold),
     }
     model, checkpoint = load_endpoint_model(checkpoint_path=checkpoint_path, device=device)
     checkpoint_config = dict(checkpoint.get("config") or {})
     boundary_radius_frames = int(checkpoint_config.get("boundary_radius_frames", 1))
     cut_min_gap_s = float(checkpoint_config.get("cut_min_gap_s", 0.5))
+    cut_boundary_radius_frames = int(checkpoint_config.get("cut_boundary_radius_frames", 0))
 
     prediction_path = output_dir / "predictions.jsonl"
     skipped = []
@@ -183,23 +185,26 @@ def export_predictions(
             predictions = {name: thresholded(probabilities[name], threshold=thresholds[name]) for name in OUTPUT_NAMES}
             raw_speech_predictions = predictions["speech"].copy()
             if apply_cut_to_speech:
+                cut_union = np.maximum(predictions["cut_drop"], predictions["cut_point"])
                 predictions["speech"] = np.logical_and(
                     predictions["speech"] > 0,
-                    predictions["cut"] <= 0,
+                    cut_union <= 0,
                 ).astype(np.int32)
 
             labels = np.asarray(record.speech_frames[:frame_count], dtype=np.int32)
-            start_targets, end_targets, cut_targets = endpoint_targets_from_record(
+            start_targets, end_targets, cut_drop_targets, cut_point_targets = endpoint_targets_from_record(
                 record,
                 frame_count=frame_count,
                 boundary_radius_frames=boundary_radius_frames,
                 cut_min_gap_s=cut_min_gap_s,
+                cut_boundary_radius_frames=cut_boundary_radius_frames,
             )
             targets = {
                 "speech": labels,
                 "start": start_targets.astype(np.int32),
                 "end": end_targets.astype(np.int32),
-                "cut": cut_targets.astype(np.int32),
+                "cut_drop": cut_drop_targets.astype(np.int32),
+                "cut_point": cut_point_targets.astype(np.int32),
             }
             active_weights = np.asarray(weights[:frame_count], dtype=np.float32)
             active = active_weights > 0.0
@@ -232,7 +237,9 @@ def export_predictions(
                 "speech_frames": predictions["speech"].astype(int).tolist(),
                 "start_frames": predictions["start"].astype(int).tolist(),
                 "end_frames": predictions["end"].astype(int).tolist(),
-                "cut_frames": predictions["cut"].astype(int).tolist(),
+                "cut_drop_frames": predictions["cut_drop"].astype(int).tolist(),
+                "cut_point_frames": predictions["cut_point"].astype(int).tolist(),
+                "cut_frames": np.maximum(predictions["cut_drop"], predictions["cut_point"]).astype(int).tolist(),
                 "probability_summary": {
                     name: probability_summary(probabilities[name][active].tolist()) for name in OUTPUT_NAMES
                 },
@@ -295,13 +302,15 @@ def export_predictions(
         encoding="utf-8",
     )
     speech_metrics = output_metrics["speech"]
-    cut_metrics = output_metrics["cut"]
+    cut_drop_metrics = output_metrics["cut_drop"]
+    cut_point_metrics = output_metrics["cut_point"]
     print(f"predictions={prediction_path}")
     print(f"metrics={metrics_path}")
     print(
         f"rows={rows} speech_f1={speech_metrics['f1']:.4f} "
         f"speech_precision={speech_metrics['precision']:.4f} speech_recall={speech_metrics['recall']:.4f} "
-        f"cut_f1={cut_metrics['f1']:.4f} cut_recall={cut_metrics['recall']:.4f}"
+        f"cut_drop_f1={cut_drop_metrics['f1']:.4f} cut_drop_recall={cut_drop_metrics['recall']:.4f} "
+        f"cut_point_f1={cut_point_metrics['f1']:.4f} cut_point_recall={cut_point_metrics['recall']:.4f}"
     )
     return summary
 

@@ -77,3 +77,51 @@ def test_chunk_config_reads_pre_asr_cut_split_env_at_runtime(monkeypatch):
     assert cfg["pre_asr_cut_split_min_child_frames"] == 30
     assert cfg["pre_asr_cut_split_max_children"] == 6
     assert cfg["pre_asr_cut_split_threshold"] == 0.92
+
+
+def test_chunk_config_reads_pre_asr_drop_gap_split_env_at_runtime(monkeypatch):
+    monkeypatch.setenv("ASR_PRE_ASR_DROP_GAP_SPLIT_ENABLED", "1")
+    monkeypatch.setenv("ASR_PRE_ASR_DROP_GAP_SPLIT_MIN_PARENT_FRAMES", "360")
+    monkeypatch.setenv("ASR_PRE_ASR_DROP_GAP_SPLIT_MIN_GAP_FRAMES", "4")
+    monkeypatch.setenv("ASR_PRE_ASR_DROP_GAP_SPLIT_MIN_GAP_S", "0.55")
+    monkeypatch.setenv("ASR_PRE_ASR_DROP_GAP_SPLIT_MIN_CHILD_FRAMES", "30")
+    monkeypatch.setenv("ASR_PRE_ASR_DROP_GAP_SPLIT_MAX_CHILDREN", "6")
+    monkeypatch.setenv("ASR_PRE_ASR_DROP_GAP_SPLIT_THRESHOLD", "0.82")
+
+    cfg = pipeline._chunk_config()
+
+    assert cfg["pre_asr_drop_gap_split_enabled"] is True
+    assert cfg["pre_asr_drop_gap_split_min_parent_frames"] == 360
+    assert cfg["pre_asr_drop_gap_split_min_gap_frames"] == 4
+    assert cfg["pre_asr_drop_gap_split_min_gap_s"] == 0.55
+    assert cfg["pre_asr_drop_gap_split_min_child_frames"] == 30
+    assert cfg["pre_asr_drop_gap_split_max_children"] == 6
+    assert cfg["pre_asr_drop_gap_split_threshold"] == 0.82
+
+
+def test_chunk_config_reads_pre_asr_risk_split_env_at_runtime(monkeypatch):
+    monkeypatch.setenv("ASR_PRE_ASR_RISK_SPLIT_ENABLED", "1")
+    monkeypatch.setenv("ASR_PRE_ASR_RISK_SPLIT_MIN_CORE_FRAMES", "360")
+    monkeypatch.setenv("ASR_PRE_ASR_RISK_SPLIT_TARGET_CORE_FRAMES", "240")
+    monkeypatch.setenv("ASR_PRE_ASR_RISK_SPLIT_SAFE_CORE_FRAMES", "300")
+    monkeypatch.setenv("ASR_PRE_ASR_RISK_SPLIT_MIN_GAP_FRAMES", "4")
+    monkeypatch.setenv("ASR_PRE_ASR_RISK_SPLIT_MIN_CHILD_FRAMES", "30")
+    monkeypatch.setenv("ASR_PRE_ASR_RISK_SPLIT_MAX_CHILDREN", "6")
+    monkeypatch.setenv("ASR_PRE_ASR_RISK_SPLIT_THRESHOLD", "1.2")
+    monkeypatch.setenv("ASR_PRE_ASR_RISK_SPLIT_CONTINUOUS_THRESHOLD", "2.4")
+    monkeypatch.setenv("ASR_PRE_ASR_RISK_SPLIT_VALLEY_THRESHOLD", "0.15")
+    monkeypatch.setenv("ASR_PRE_ASR_RISK_SPLIT_CUT_THRESHOLD", "0.97")
+
+    cfg = pipeline._chunk_config()
+
+    assert cfg["pre_asr_risk_split_enabled"] is True
+    assert cfg["pre_asr_risk_split_min_core_frames"] == 360
+    assert cfg["pre_asr_risk_split_target_core_frames"] == 240
+    assert cfg["pre_asr_risk_split_safe_core_frames"] == 300
+    assert cfg["pre_asr_risk_split_min_gap_frames"] == 4
+    assert cfg["pre_asr_risk_split_min_child_frames"] == 30
+    assert cfg["pre_asr_risk_split_max_children"] == 6
+    assert cfg["pre_asr_risk_split_threshold"] == 1.2
+    assert cfg["pre_asr_risk_split_continuous_threshold"] == 2.4
+    assert cfg["pre_asr_risk_split_valley_threshold"] == 0.15
+    assert cfg["pre_asr_risk_split_cut_threshold"] == 0.97
