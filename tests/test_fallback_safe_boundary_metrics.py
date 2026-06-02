@@ -4,6 +4,7 @@ import json
 from pathlib import Path
 
 from tools.fusionvad_ja.measure_fallback_safe_boundaries import main
+from tools.fusionvad_ja.analyze_fallback_cut_signal import analyze
 
 
 def _write_json(path: Path, payload: dict) -> None:
@@ -208,3 +209,154 @@ def test_fallback_safe_boundary_metrics_adds_truth_and_silence_stats(tmp_path):
     assert summary["fallback_long_silence_count"] == 1
     assert row["longest_silence_s"] >= 0.9
     assert "fallback_crosses_long_silence" in row["risk_reasons"]
+
+
+def test_fallback_cut_signal_analysis_reports_feasible_candidates(tmp_path):
+    unsafe = tmp_path / "unsafe.jsonl"
+    _write_jsonl(
+        unsafe,
+        [
+            {
+                "chunk_index": 3,
+                "start": 0.0,
+                "end": 24.0,
+                "duration_s": 24.0,
+                "core_start": 0.0,
+                "core_end": 24.0,
+                "split_reason": "overlong",
+                "fallback_subtype": "vad_coarse_after_sentinel",
+                "display_text": "omitted by output",
+            },
+        ],
+    )
+    frame_scores = tmp_path / "frame_scores.json"
+    _write_json(
+        frame_scores,
+        {
+            "frame_hop_s": 1.0,
+            "scores": [0.9] * 24,
+            "cut_scores": [0.0] * 8 + [0.99] + [0.0] * 7 + [0.99] + [0.0] * 7,
+        },
+    )
+
+    summary = analyze(
+        unsafe_fallback_chunks=unsafe,
+        frame_scores_path=frame_scores,
+        output_dir=tmp_path / "out",
+        cut_threshold=0.94,
+        valley_threshold=0.2,
+        target_child_s=9.0,
+        min_child_s=1.5,
+    )
+
+    rows = [
+        json.loads(line)
+        for line in (tmp_path / "out" / "cut_signal_details.jsonl").read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    assert summary["rows_feasible_to_target"] == 1
+    assert rows[0]["cut_candidate_count"] == 2
+    assert rows[0]["can_reach_target_child"] is True
+    assert "display_text" not in rows[0]
+    assert rows[0]["text_chars"] == len("omitted by output")
+
+
+def test_fallback_cut_signal_analysis_reports_missing_candidates(tmp_path):
+    unsafe = tmp_path / "unsafe.jsonl"
+    _write_jsonl(
+        unsafe,
+        [
+            {
+                "chunk_index": 4,
+                "start": 0.0,
+                "end": 24.0,
+                "duration_s": 24.0,
+                "core_start": 0.0,
+                "core_end": 24.0,
+                "split_reason": "overlong",
+                "fallback_subtype": "vad_coarse_after_sentinel",
+            },
+        ],
+    )
+    frame_scores = tmp_path / "frame_scores.json"
+    _write_json(
+        frame_scores,
+        {
+            "frame_hop_s": 1.0,
+            "scores": [0.9] * 24,
+            "cut_scores": [0.0] * 24,
+        },
+    )
+
+    summary = analyze(
+        unsafe_fallback_chunks=unsafe,
+        frame_scores_path=frame_scores,
+        output_dir=tmp_path / "out",
+        cut_threshold=0.94,
+        valley_threshold=0.2,
+        target_child_s=9.0,
+        min_child_s=1.5,
+    )
+
+    assert summary["rows_with_any_candidate"] == 0
+    assert summary["rows_feasible_to_target"] == 0
+
+
+def test_fallback_cut_signal_analysis_filters_chunk_metrics_input(tmp_path):
+    metrics = tmp_path / "chunk_metrics.jsonl"
+    _write_jsonl(
+        metrics,
+        [
+            {
+                "chunk_index": 1,
+                "start": 0.0,
+                "end": 24.0,
+                "duration_s": 24.0,
+                "core_start": 0.0,
+                "core_end": 24.0,
+                "fallback_reason": "vad_coarse_after_sentinel",
+                "fallback_safe": False,
+            },
+            {
+                "chunk_index": 2,
+                "start": 30.0,
+                "end": 34.0,
+                "duration_s": 4.0,
+                "core_start": 30.0,
+                "core_end": 34.0,
+                "fallback_reason": "",
+                "fallback_safe": True,
+            },
+            {
+                "chunk_index": 3,
+                "start": 40.0,
+                "end": 44.0,
+                "duration_s": 4.0,
+                "core_start": 40.0,
+                "core_end": 44.0,
+                "fallback_reason": "vad_coarse_after_sentinel",
+                "fallback_safe": True,
+            },
+        ],
+    )
+    frame_scores = tmp_path / "frame_scores.json"
+    _write_json(frame_scores, {"frame_hop_s": 1.0, "scores": [0.9] * 48, "cut_scores": [0.0] * 48})
+
+    summary = analyze(
+        unsafe_fallback_chunks=metrics,
+        frame_scores_path=frame_scores,
+        output_dir=tmp_path / "out",
+        cut_threshold=0.94,
+        valley_threshold=0.2,
+        target_child_s=9.0,
+        min_child_s=1.5,
+    )
+
+    rows = [
+        json.loads(line)
+        for line in (tmp_path / "out" / "cut_signal_details.jsonl").read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    assert summary["input_row_count"] == 3
+    assert summary["row_count"] == 1
+    assert rows[0]["chunk_index"] == 1

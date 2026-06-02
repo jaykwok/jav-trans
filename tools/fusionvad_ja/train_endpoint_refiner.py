@@ -67,13 +67,20 @@ def run(args: argparse.Namespace) -> None:
             positive_loss_weight=args.positive_loss_weight,
             speech_loss_weight=args.speech_loss_weight,
             boundary_loss_weight=args.boundary_loss_weight,
+            start_loss_weight=args.start_loss_weight,
+            end_loss_weight=args.end_loss_weight,
             internal_gap_loss_weight=args.internal_gap_loss_weight,
-            cut_loss_weight=args.cut_loss_weight,
+            cut_drop_loss_weight=args.cut_drop_loss_weight,
+            cut_point_loss_weight=args.cut_point_loss_weight,
             start_positive_loss_weight=args.start_positive_loss_weight,
             end_positive_loss_weight=args.end_positive_loss_weight,
-            cut_positive_loss_weight=args.cut_positive_loss_weight,
+            cut_drop_positive_loss_weight=args.cut_drop_positive_loss_weight,
+            cut_point_positive_loss_weight=args.cut_point_positive_loss_weight,
             boundary_radius_frames=args.boundary_radius_frames,
             cut_min_gap_s=args.cut_min_gap_s,
+            cut_boundary_radius_frames=args.cut_boundary_radius_frames,
+            save_interval_steps=args.save_interval_steps,
+            init_checkpoint=args.init_checkpoint,
         ),
     )
     print(f"checkpoint={metrics.checkpoint}")
@@ -103,15 +110,43 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--log-interval-steps", type=int, default=0)
     parser.add_argument("--batch-size", type=int, default=1)
     parser.add_argument("--positive-loss-weight", type=float, default=1.0)
-    parser.add_argument("--speech-loss-weight", type=float, default=1.0)
-    parser.add_argument("--boundary-loss-weight", type=float, default=0.5)
-    parser.add_argument("--internal-gap-loss-weight", type=float, default=0.5)
-    parser.add_argument("--cut-loss-weight", type=float, default=0.5)
+    parser.add_argument("--speech-loss-weight", type=float, default=0.5)
+    parser.add_argument(
+        "--boundary-loss-weight",
+        type=float,
+        default=0.0,
+        help="Legacy shared start/end loss weight. v1.20 prefers --start-loss-weight/--end-loss-weight.",
+    )
+    parser.add_argument("--start-loss-weight", type=float, default=2.0)
+    parser.add_argument("--end-loss-weight", type=float, default=1.5)
+    parser.add_argument("--internal-gap-loss-weight", type=float, default=1.0)
+    parser.add_argument("--cut-drop-loss-weight", type=float, default=1.0)
+    parser.add_argument("--cut-point-loss-weight", type=float, default=1.0)
     parser.add_argument("--start-positive-loss-weight", type=float, default=1.0)
     parser.add_argument("--end-positive-loss-weight", type=float, default=1.0)
-    parser.add_argument("--cut-positive-loss-weight", type=float, default=1.0)
+    parser.add_argument("--cut-drop-positive-loss-weight", type=float, default=1.0)
+    parser.add_argument("--cut-point-positive-loss-weight", type=float, default=1.0)
     parser.add_argument("--boundary-radius-frames", type=int, default=1)
     parser.add_argument("--cut-min-gap-s", type=float, default=0.5)
+    parser.add_argument(
+        "--cut-boundary-radius-frames",
+        type=int,
+        default=0,
+        help=(
+            "Also mark short-gap speech island boundaries as cut positives within "
+            "this frame radius. 0 preserves legacy gap-only cut targets."
+        ),
+    )
+    parser.add_argument(
+        "--save-interval-steps",
+        type=int,
+        default=0,
+        help="Write checkpoint-step-N.pt every N steps. 0 only writes the final checkpoint.",
+    )
+    parser.add_argument(
+        "--init-checkpoint",
+        help="Optional endpoint refiner checkpoint to initialize from before fine-tuning.",
+    )
     parser.add_argument(
         "--output-dir",
         default=str(PROJECT_ROOT / "agents" / "temp" / "fusionvad-ja" / "endpoint-refiner-train"),
@@ -123,16 +158,33 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         parser.error("--learning-rate must be positive")
     if args.positive_loss_weight <= 0.0:
         parser.error("--positive-loss-weight must be positive")
-    for name in ("start_positive_loss_weight", "end_positive_loss_weight", "cut_positive_loss_weight"):
+    for name in (
+        "start_positive_loss_weight",
+        "end_positive_loss_weight",
+        "cut_drop_positive_loss_weight",
+        "cut_point_positive_loss_weight",
+    ):
         if getattr(args, name) <= 0.0:
             parser.error(f"--{name.replace('_', '-')} must be positive")
-    for name in ("speech_loss_weight", "boundary_loss_weight", "internal_gap_loss_weight", "cut_loss_weight"):
+    for name in (
+        "speech_loss_weight",
+        "boundary_loss_weight",
+        "start_loss_weight",
+        "end_loss_weight",
+        "internal_gap_loss_weight",
+        "cut_drop_loss_weight",
+        "cut_point_loss_weight",
+    ):
         if getattr(args, name) < 0.0:
             parser.error(f"--{name.replace('_', '-')} must be non-negative")
     if args.boundary_radius_frames < 0:
         parser.error("--boundary-radius-frames must be non-negative")
     if args.cut_min_gap_s < 0.0:
         parser.error("--cut-min-gap-s must be non-negative")
+    if args.cut_boundary_radius_frames < 0:
+        parser.error("--cut-boundary-radius-frames must be non-negative")
+    if args.save_interval_steps < 0:
+        parser.error("--save-interval-steps must be non-negative")
     return args
 
 

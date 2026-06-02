@@ -143,6 +143,9 @@ def configure_env(args: argparse.Namespace) -> None:
     os.environ["FUSIONVAD_JA_MERGE_GAP_S"] = str(args.fusionvad_merge_gap_s)
     os.environ["FUSIONVAD_JA_CUT_THRESHOLD"] = str(args.fusionvad_cut_threshold)
     os.environ["FUSIONVAD_JA_APPLY_CUT_TO_SPEECH"] = "1" if args.fusionvad_apply_cut_to_speech else "0"
+    os.environ["FUSIONVAD_JA_IMITATION_CHECKPOINT"] = str(
+        project_path(args.fusionvad_imitation_checkpoint)
+    )
     os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
 
@@ -170,6 +173,117 @@ def build_context(*, args: argparse.Namespace, paths: RunPaths, video: Path):
         "ASR_CHUNK_PACK_RESERVE_FRAMES": str(args.chunk_pack_reserve_frames),
         "ASR_CHUNK_PACK_TARGET_PADDING_FRAMES": str(args.chunk_pack_target_padding_frames),
         "ASR_CHUNK_PACK_GAP_MERGE_FRAMES": str(args.chunk_pack_gap_merge_frames),
+        "ASR_PRE_ASR_ISLAND_SPLIT_ENABLED": os.getenv(
+            "ASR_PRE_ASR_ISLAND_SPLIT_ENABLED", "0"
+        ),
+        "ASR_PRE_ASR_ISLAND_SPLIT_MIN_CORE_FRAMES": os.getenv(
+            "ASR_PRE_ASR_ISLAND_SPLIT_MIN_CORE_FRAMES", "420"
+        ),
+        "ASR_PRE_ASR_ISLAND_SPLIT_MIN_GAP_FRAMES": os.getenv(
+            "ASR_PRE_ASR_ISLAND_SPLIT_MIN_GAP_FRAMES", "18"
+        ),
+        "ASR_PRE_ASR_ISLAND_SPLIT_MIN_ISLAND_FRAMES": os.getenv(
+            "ASR_PRE_ASR_ISLAND_SPLIT_MIN_ISLAND_FRAMES", "3"
+        ),
+        "ASR_PRE_ASR_ISLAND_SPLIT_MAX_CHILDREN": os.getenv(
+            "ASR_PRE_ASR_ISLAND_SPLIT_MAX_CHILDREN", "8"
+        ),
+        "ASR_PRE_ASR_VALLEY_SPLIT_ENABLED": os.getenv(
+            "ASR_PRE_ASR_VALLEY_SPLIT_ENABLED", "0"
+        ),
+        "ASR_PRE_ASR_VALLEY_SPLIT_MIN_CORE_FRAMES": os.getenv(
+            "ASR_PRE_ASR_VALLEY_SPLIT_MIN_CORE_FRAMES", "420"
+        ),
+        "ASR_PRE_ASR_VALLEY_SPLIT_TARGET_CORE_FRAMES": os.getenv(
+            "ASR_PRE_ASR_VALLEY_SPLIT_TARGET_CORE_FRAMES", "270"
+        ),
+        "ASR_PRE_ASR_VALLEY_SPLIT_MIN_VALLEY_FRAMES": os.getenv(
+            "ASR_PRE_ASR_VALLEY_SPLIT_MIN_VALLEY_FRAMES", "6"
+        ),
+        "ASR_PRE_ASR_VALLEY_SPLIT_MIN_CHILD_FRAMES": os.getenv(
+            "ASR_PRE_ASR_VALLEY_SPLIT_MIN_CHILD_FRAMES", "45"
+        ),
+        "ASR_PRE_ASR_VALLEY_SPLIT_MAX_CHILDREN": os.getenv(
+            "ASR_PRE_ASR_VALLEY_SPLIT_MAX_CHILDREN", "8"
+        ),
+        "ASR_PRE_ASR_VALLEY_SPLIT_THRESHOLD": os.getenv(
+            "ASR_PRE_ASR_VALLEY_SPLIT_THRESHOLD", "0.20"
+        ),
+        "ASR_PRE_ASR_CUT_SPLIT_ENABLED": os.getenv(
+            "ASR_PRE_ASR_CUT_SPLIT_ENABLED", "0"
+        ),
+        "ASR_PRE_ASR_CUT_SPLIT_MIN_CORE_FRAMES": os.getenv(
+            "ASR_PRE_ASR_CUT_SPLIT_MIN_CORE_FRAMES", "420"
+        ),
+        "ASR_PRE_ASR_CUT_SPLIT_TARGET_CORE_FRAMES": os.getenv(
+            "ASR_PRE_ASR_CUT_SPLIT_TARGET_CORE_FRAMES", "270"
+        ),
+        "ASR_PRE_ASR_CUT_SPLIT_MIN_CUT_FRAMES": os.getenv(
+            "ASR_PRE_ASR_CUT_SPLIT_MIN_CUT_FRAMES", "3"
+        ),
+        "ASR_PRE_ASR_CUT_SPLIT_MIN_CHILD_FRAMES": os.getenv(
+            "ASR_PRE_ASR_CUT_SPLIT_MIN_CHILD_FRAMES", "45"
+        ),
+        "ASR_PRE_ASR_CUT_SPLIT_MAX_CHILDREN": os.getenv(
+            "ASR_PRE_ASR_CUT_SPLIT_MAX_CHILDREN", "8"
+        ),
+        "ASR_PRE_ASR_CUT_SPLIT_THRESHOLD": os.getenv(
+            "ASR_PRE_ASR_CUT_SPLIT_THRESHOLD", "0.94"
+        ),
+        "ASR_PRE_ASR_DROP_GAP_SPLIT_ENABLED": os.getenv(
+            "ASR_PRE_ASR_DROP_GAP_SPLIT_ENABLED", "0"
+        ),
+        "ASR_PRE_ASR_DROP_GAP_SPLIT_MIN_PARENT_FRAMES": os.getenv(
+            "ASR_PRE_ASR_DROP_GAP_SPLIT_MIN_PARENT_FRAMES", "400"
+        ),
+        "ASR_PRE_ASR_DROP_GAP_SPLIT_MIN_GAP_FRAMES": os.getenv(
+            "ASR_PRE_ASR_DROP_GAP_SPLIT_MIN_GAP_FRAMES", "3"
+        ),
+        "ASR_PRE_ASR_DROP_GAP_SPLIT_MIN_GAP_S": os.getenv(
+            "ASR_PRE_ASR_DROP_GAP_SPLIT_MIN_GAP_S", "0.60"
+        ),
+        "ASR_PRE_ASR_DROP_GAP_SPLIT_MIN_CHILD_FRAMES": os.getenv(
+            "ASR_PRE_ASR_DROP_GAP_SPLIT_MIN_CHILD_FRAMES", "25"
+        ),
+        "ASR_PRE_ASR_DROP_GAP_SPLIT_MAX_CHILDREN": os.getenv(
+            "ASR_PRE_ASR_DROP_GAP_SPLIT_MAX_CHILDREN", "8"
+        ),
+        "ASR_PRE_ASR_DROP_GAP_SPLIT_THRESHOLD": os.getenv(
+            "ASR_PRE_ASR_DROP_GAP_SPLIT_THRESHOLD", "0.80"
+        ),
+        "ASR_PRE_ASR_RISK_SPLIT_ENABLED": os.getenv(
+            "ASR_PRE_ASR_RISK_SPLIT_ENABLED", "0"
+        ),
+        "ASR_PRE_ASR_RISK_SPLIT_MIN_CORE_FRAMES": os.getenv(
+            "ASR_PRE_ASR_RISK_SPLIT_MIN_CORE_FRAMES", "420"
+        ),
+        "ASR_PRE_ASR_RISK_SPLIT_TARGET_CORE_FRAMES": os.getenv(
+            "ASR_PRE_ASR_RISK_SPLIT_TARGET_CORE_FRAMES", "270"
+        ),
+        "ASR_PRE_ASR_RISK_SPLIT_SAFE_CORE_FRAMES": os.getenv(
+            "ASR_PRE_ASR_RISK_SPLIT_SAFE_CORE_FRAMES", "360"
+        ),
+        "ASR_PRE_ASR_RISK_SPLIT_MIN_GAP_FRAMES": os.getenv(
+            "ASR_PRE_ASR_RISK_SPLIT_MIN_GAP_FRAMES", "6"
+        ),
+        "ASR_PRE_ASR_RISK_SPLIT_MIN_CHILD_FRAMES": os.getenv(
+            "ASR_PRE_ASR_RISK_SPLIT_MIN_CHILD_FRAMES", "45"
+        ),
+        "ASR_PRE_ASR_RISK_SPLIT_MAX_CHILDREN": os.getenv(
+            "ASR_PRE_ASR_RISK_SPLIT_MAX_CHILDREN", "8"
+        ),
+        "ASR_PRE_ASR_RISK_SPLIT_THRESHOLD": os.getenv(
+            "ASR_PRE_ASR_RISK_SPLIT_THRESHOLD", "1.0"
+        ),
+        "ASR_PRE_ASR_RISK_SPLIT_CONTINUOUS_THRESHOLD": os.getenv(
+            "ASR_PRE_ASR_RISK_SPLIT_CONTINUOUS_THRESHOLD", "2.0"
+        ),
+        "ASR_PRE_ASR_RISK_SPLIT_VALLEY_THRESHOLD": os.getenv(
+            "ASR_PRE_ASR_RISK_SPLIT_VALLEY_THRESHOLD", "0.20"
+        ),
+        "ASR_PRE_ASR_RISK_SPLIT_CUT_THRESHOLD": os.getenv(
+            "ASR_PRE_ASR_RISK_SPLIT_CUT_THRESHOLD", "0.94"
+        ),
         "QUALITY_REPORT_ENABLED": "1",
         "QUALITY_REPORT_DIR": str(paths.root / "quality_reports"),
         "QC_HARD_FAIL": "0",
@@ -190,6 +304,7 @@ def build_context(*, args: argparse.Namespace, paths: RunPaths, video: Path):
         "FUSIONVAD_JA_MERGE_GAP_S": str(args.fusionvad_merge_gap_s),
         "FUSIONVAD_JA_CUT_THRESHOLD": str(args.fusionvad_cut_threshold),
         "FUSIONVAD_JA_APPLY_CUT_TO_SPEECH": "1" if args.fusionvad_apply_cut_to_speech else "0",
+        "FUSIONVAD_JA_IMITATION_CHECKPOINT": str(project_path(args.fusionvad_imitation_checkpoint)),
         "KEEP_ASR_CHUNKS": "1" if args.keep_asr_chunks else "0",
         "FAIL_ON_QC_BLOCK": "0",
     }
@@ -303,6 +418,9 @@ def write_summary(paths: RunPaths, args: argparse.Namespace, results: list[dict[
         "asr_model_path": project_rel(project_path(args.asr_model_path)),
         "vad_backend": "fusionvad_ja",
         "fusionvad_checkpoint": project_rel(project_path(args.fusionvad_checkpoint)),
+        "fusionvad_imitation_checkpoint": project_rel(
+            project_path(args.fusionvad_imitation_checkpoint)
+        ),
         "fusionvad_threshold": args.fusionvad_threshold,
         "fusionvad_pad_s": args.fusionvad_pad_s,
         "chunk_packing": {
@@ -390,10 +508,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--fusionvad-checkpoint",
         default=(
             "src/vad/fusionvad_ja/checkpoints/"
-            "fusionvad_ja_v1_17_endpoint_refiner.pt"
+            "fusionvad_ja_v1_19b_splitcut_touch4096_endpoint_refiner.pt"
         ),
     )
-    parser.add_argument("--fusionvad-threshold", type=float, default=0.020)
+    parser.add_argument("--fusionvad-threshold", type=float, default=0.200)
     parser.add_argument("--fusionvad-pad-s", type=float, default=0.2)
     parser.add_argument("--fusionvad-ptm", default="qwen3-asr-0.6b")
     parser.add_argument(
@@ -406,7 +524,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--fusionvad-overlap-s", type=float, default=1.0)
     parser.add_argument("--fusionvad-min-segment-s", type=float, default=0.05)
     parser.add_argument("--fusionvad-merge-gap-s", type=float, default=0.0)
-    parser.add_argument("--fusionvad-cut-threshold", type=float, default=0.960)
+    parser.add_argument("--fusionvad-cut-threshold", type=float, default=0.500)
+    parser.add_argument(
+        "--fusionvad-imitation-checkpoint",
+        default=(
+            "datasets/train/fusionvad-ja/v1-21/qwen3-asr-0.6b-full29239/"
+            "imitation-head-dropgaponly-poswin128-balanced-resizedtarget-batch8-lr2e-4-steps512/"
+            "fusionvad_ja_imitation_head.pt"
+        ),
+    )
     parser.add_argument(
         "--fusionvad-apply-cut-to-speech",
         action=argparse.BooleanOptionalAction,

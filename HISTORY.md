@@ -1,0 +1,1037 @@
+# JAVTrans History
+
+本文件记录实验过程、idea 来源、调试坑、失败路线、指标和参考来源。README 只保留新用户使用说明、当前工作流和当前状态。
+
+公开记录统一使用匿名样片名，不写真实视频 stem。
+
+---
+
+## 当前结论
+
+- 默认 VAD 已切到 `fusionvad_ja`，当前 head 是 FusionVAD-JA v1.19b split-cut endpoint refiner。
+- 默认 ASR 仍是 `whisper-ja-anime-v0.3`；选择 `qwen3-asr-1.7b` 时默认使用 `jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame`。
+- FusionVAD-JA frozen feature 默认使用 `jaykwok/Qwen3-ASR-0.6B-JA-Anime-Galgame`，不再默认下载 base 0.6B。
+- 当前主线不再是 high-recall proposal VAD，而是 speech-island boundary VAD：ASR 前 chunk 要尽量接近一句台词，避免长连续 chunk、内部 gap、多 speech island 和非语音多送诱发 ASR 空输出、非语音幻觉和 forced aligner sentinel。
+- 边界优先级：`start` 略高于 `end`，但两者都要进 gate；允许为了切准 speech island 牺牲少量 frame recall，但不能漏掉完整台词 island。
+- 下一步应训练 v1.20 boundary-first endpoint/refiner：显式优化 start/end error、fallback chunk duration、gap crossing、单 chunk 台词数，并把 recall 从硬主目标降为 guardrail。
+
+---
+
+## 设计来源
+
+### FusionVAD 复现路线
+
+最初目标是复现 FusionVAD 的轻量结构，而不是直接把 WhisperSeg / FSMN / Silero 作为最终 VAD。核心思路：
+
+```text
+frozen PTM audio feature
++ MFCC / energy
+-> addition fusion
+-> 2-layer BiLSTM
+-> lightweight heads
+```
+
+早期设想使用 Whisper-large-v3 encoder 冻结特征，后续为了体积、速度和分发体验，改为 Qwen3-ASR-0.6B full SFT 作为 frozen feature。这样用户后续只需要下载 fine-tuned 0.6B，不必同时保留 base 0.6B。
+
+### Galgame 数据集的启发
+
+人工复听后确认 `litagin/Galgame_Speech_ASR_16kHz` 多数 clip 本身已经按语音裁切。于是可以把原 clip 当作精确 speech island：
+
+```text
+random gap + speech clip + random gap + speech clip + ...
+```
+
+前置 gap 长度就是 speech start，`start + clip_duration` 就是 speech end。这个性质把 Galgame ASR 数据从弱监督正样本升级成了 synthetic timeline / boundary refiner 的核心数据底座。
+
+### 目标域标注口径
+
+Galgame / JAV 目标域里，喘息、呻吟、亲吻声、短促拟声可能本身就是字幕内容。因此当前 speech 定义不是传统 benchmark 的“清晰词句”，而是：
+
+- 可字幕化对白、人声、喘息、呻吟、短促拟声：speech。
+- 纯 BGM、静音、机械声、环境噪声、无字幕价值残留：non-speech。
+
+这也是为什么当前 operating point 仍偏高召回：后端 ASR 和后处理可以过滤一部分多送音频，但漏掉真实目标域人声更难补救。
+
+---
+
+## 数据源与角色
+
+- `litagin/Galgame_Speech_ASR_16kHz`：核心近域 ASR / VAD 来源，适合构造 synthetic speech island。
+- `litagin/Galgame_Speech_SER_16kHz`：早期作为候选，后续放弃进入默认 full SFT；避免重复或衍生风险。
+- `litagin/VisualNovel_Dataset_Metadata`：元数据候选，只作数据理解和去重参考。
+- AVA-Speech：电影 speech activity 标注，首轮 supervised seed。
+- VoxConverse：speaker/timestamp diarization 数据，多说话人 speech span seed。
+- MUSAN / DNS Challenge：音乐、噪声、非语音负样本和增强素材。
+- 本地视频 hard-negative：真实 BGM、静音、非语音人声、ASR 幻觉样本来源。
+- `joujiboi/Galgame-VisualNovel-Reupload` 等视觉小说数据集：二期 backlog；进入训练前必须审计 license、字段、文本质量、去重和下载速度。
+
+标签 schema 使用 JSONL：
+
+```json
+{
+  "audio_id": "...",
+  "source": "...",
+  "duration_s": 0.0,
+  "text": "...",
+  "teacher_segments": [],
+  "frame_hop_s": 0.02,
+  "speech_frames": [],
+  "label_quality": "supervised | teacher_agree | teacher_conflict | negative"
+}
+```
+
+---
+
+## Qwen3-ASR SFT 路线
+
+### 1.7B full SFT
+
+目标：让 ASR 能覆盖目标域中的对白、喘息、呻吟和短促拟声，降低“VAD 送进去了但 ASR 不认”的问题。
+
+云端训练结论：
+
+- 数据：`litagin/Galgame_Speech_ASR_16kHz` full ASR-only。
+- 初始学习率：`2e-5`。
+- effective batch：`128`。
+- RTX 5090 32GB 曾用于 0.6B full SFT；RTX PRO 6000 96GB 用于 1.7B full SFT。
+- 最终模型上传到 `jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame`。
+
+### 0.6B full SFT
+
+目标：
+
+- 替代 ja-whisper-anime 做更快的日语 ASR probe。
+- 作为 FusionVAD-JA frozen feature extractor。
+- 降低分发时的模型数量和空间成本。
+
+结果：
+
+- Galgame 16 clip direct probe 中，CER 从 base `0.2348` 降到 full `0.1288`。
+- RTF 约 `0.232`。
+- 最终模型上传到 `jaykwok/Qwen3-ASR-0.6B-JA-Anime-Galgame`。
+- 该模型成为 v1.13+ FusionVAD-JA 默认 frozen feature。
+
+### 云端训练坑
+
+- 数据集几十 GB，用户本地上传到云服务器太慢；更合理方式是在云端脚本直连 Hugging Face 下载并生成训练集。
+- `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` 可缓解显存碎片，但不能弥补真实峰值不足。
+- 5090 32GB 上 0.6B `batch_size=16`、`grad_acc=8` 曾在 step 36 OOM；稳定配置为 `batch_size=8`、`grad_acc=16`、effective batch `128`。
+- 大 batch feature cache 在 WSL2 8GB RAM 下可能被系统 kill，没有 Python traceback；需要查内存和系统日志，不能只看显存。
+
+---
+
+## FusionVAD-JA 版本记录
+
+### v0 / v1-mini
+
+目的：验证数据、feature cache、addition-fusion BiLSTM 训练链路能跑通。
+
+- 真实 ja whisper 1.5B feature cache 验证：`whisper_dim=1280`、`mfcc_dim=40`、`frame_hop_s=0.02`。
+- 早期 addition-fusion BiLSTM 可训练参数约 `1.94M`。
+- v1-mini 使用 VoxConverse supervised-positive + MUSAN / synthetic negative，只能证明训练闭环可行，不能代表目标域泛化。
+
+### v1.5
+
+目的：引入 Galgame synthetic timeline v2、MUSAN negative gap、背景混合和 positive loss weight。
+
+结果：
+
+- posw2 + threshold `0.001` + pad `0.2s` 在人工 Galgame 上 precision `0.7310`、recall `0.9501`、F1 `0.8263`。
+- threshold `0.0001` + pad `0.2s` 达到 recall `0.9838`、extra audio ratio `1.3809`。
+- 结论：低阈值 + padding 是当前 high-recall proposal 模式的必要选择。
+
+### v1.6 real-heldout
+
+目的：从本地视频抽真实 held-out，人工标注 VAD 片段，验证 Galgame synthetic 是否泛化。
+
+数据：
+
+- 10 个本地视频各抽 8 条、每条 8s。
+- 候选 80 条，人工导出 79 条。
+- 强标签：`supervised=55`、`negative=24`，总时长 `632.0s`，speech frame ratio `0.6138`。
+
+基线：
+
+- `fusion_lite`：F1 `0.7969`、precision `0.8534`、recall `0.7475`。
+- `whisperseg-adaptive`：F1 `0.7697`、precision `0.7404`、recall `0.8015`。
+- FusionVAD-JA v1.5 posw2 threshold `0.00015` + pad `0.2s`：recall `0.9551`、precision `0.6941`、F1 `0.8039`、extra audio ratio `1.3761`。
+
+结论：FusionVAD-JA 达成高召回目标，但会把更多 negative / no-overlap 音频送给 ASR；后续必须用 ASR / alignment downstream 验证多送代价。
+
+### v1.8 / v1.9 ASR 与 alignment 清理
+
+问题暴露：
+
+- 旧规则里存在具体词黑名单、假名/呻吟短句 direct drop、工具签名特例、AnimeWhisper 后置括号/重复清洗、翻译前重复压缩等非泛化策略。
+- 这些规则会误伤目标域真实文本，例如 `はぁ`、`うん`、喘息、呻吟和短促发声。
+
+处理：
+
+- 删除词表驱动 direct drop。
+- `ASR_QC_DROP_UNCERTAIN=0` 作为默认，只诊断不清空文本。
+- 建立 `display_text` / `align_text` 双文本策略。
+- alignment 诊断增加 `forced`、`partial`、`nonlexical`、`vad_coarse`、`proportional`、`drop_or_review`。
+- 失败样本池统一用 `failure_candidate` 和 `failure_bucket`。
+
+匿名样片 A 当前规则复测：
+
+- base：`806` segments、`829` cues、`8085` chars、fallback `172/337`。
+- 200k SFT：`794` segments、`843` cues、`13846` chars、fallback `166/337`。
+- full checkpoint-15500：`802` segments、`870` cues、`15203` chars、fallback `170/337`。
+
+结论：full SFT 方向成立，但主要瓶颈已经转向 alignment / fallback / QC，而不是 ASR 是否能输出文本。
+
+### v1.10 / v1.11 synthetic timeline
+
+v4 证明 crossfade、背景混合、overlap speech 和 `boundary_manifest.jsonl` bench 可用，但 gap 太短，speech frame ratio 约 `0.83-0.84`，不适合作为长期基线。
+
+v5 long-gap 成为默认生成口径：
+
+- train/val/test：`256/64/64` 条。
+- speech frame ratio：`0.574/0.551/0.568`。
+- 总时长 p50 约 `17s`，p90 约 `22s`。
+- 默认启用长 gap、`speech_label_pad_s=0.08`、real negative gap 概率 `0.75`、背景混合概率 `0.5`。
+- 支持 5-30ms equal-power crossfade、随机 gain、轻量 filter、低概率 codec、overlap speech。
+
+v1.11 训练结果：
+
+- 混合 v1-mini strong/negative `302` 条 + synthetic v5 `256` 条。
+- val sweep 选 threshold `0.02`。
+- test padded recall `0.9934`、missed speech `4.18s`、extra audio ratio `1.3240`。
+- real-heldout recall 从 v1.5 的 `0.9556` 提升到 `0.9809`，missed speech 从 `17.24s` 降到 `7.42s`，extra audio ratio 升到 `1.5021`。
+
+下游问题：
+
+- 匿名样片 A 使用 v1.11 + Qwen3-ASR-1.7B full SFT checkpoint-21000，未做长段保护时只切出 `89` 个更长 VAD chunks。
+- forced 仅 `14/89`，fallback `38/89`，failure candidates `76/89`。
+- 主要 bucket 是 `empty_text_for_chunk` 和 `vad_coarse_alignment`。
+- 结论：召回收益成立，但 chunk 边界/合并策略成为新瓶颈。
+
+### v1.13
+
+变化：切到 Qwen3-ASR-0.6B full SFT frozen feature，并把 synthetic v5 标签改为 exact speech-island。
+
+synthetic exact-island test64：
+
+- threshold `0.10` + pad `0.2s`：recall `0.9935`、missed `1.82s`、extra audio ratio `1.6012`。
+- start/end p50 约 `0.628s/2.002s`。
+- 主要收益是 start 边界更接近真实 speech island。
+
+匿名样片 A downstream：
+
+- 对比 v1.11 framepack baseline，chunks `240 -> 227`。
+- fallback chunks `137 -> 114`。
+- `vad_coarse_after_sentinel 122 -> 104`。
+- forced `101 -> 106`。
+
+结论：方向改善，但还不能替代后续 alignment repair。
+
+### v1.14
+
+变化：在 v1.13 上做 boundary-aware fine-tune，加入 `boundary_loss_weight=0.25` 和 `gap_loss_weight=0.10`。
+
+结果：
+
+- synthetic 上有信号。
+- 真实 held-out 和匿名样片 A downstream 未过 gate。
+- 匿名样片 A：chunks `222`、segments `986`、fallback chunks `115`、`vad_coarse_after_sentinel=103`、forced `101`。
+
+结论：boundary-aware loss 方向保留，但 v1.14 不替换默认。
+
+### v1.15
+
+变化：明确改成 endpoint / boundary refiner，不再只是单头 speech VAD。
+
+输出头：
+
+- `speech`
+- `start`
+- `end`
+- `cut`
+
+训练目标：
+
+- `speech` 继续服务 recall。
+- `start/end` 学 speech island 边界。
+- `cut` 学长 gap / 内部非语音可切点。
+- 允许 end 偏长一点，但禁止 fallback chunk 长到 20-30s。
+
+558-row checkpoint 未过 gate，但证明四头训练入口可行。
+
+### v1.16
+
+变化：扩大到 4096 条 Galgame multi-island synthetic。
+
+结论：
+
+- synthetic boundary gate 明显改善。
+- 说明 synthetic exact-island 数据规模对 boundary refiner 有直接收益。
+
+### v1.17
+
+变化：使用 32768 条 synthetic 训练 endpoint refiner，并提交小型 checkpoint 到仓库。
+
+当前默认：
+
+```env
+FUSIONVAD_JA_CHECKPOINT=src/vad/fusionvad_ja/checkpoints/fusionvad_ja_v1_17_endpoint_refiner.pt
+FUSIONVAD_JA_MODEL_PATH=models/jaykwok-Qwen3-ASR-0.6B-JA-Anime-Galgame
+FUSIONVAD_JA_THRESHOLD=0.020
+FUSIONVAD_JA_CUT_THRESHOLD=0.960
+FUSIONVAD_JA_PAD_S=0.2
+```
+
+结论：
+
+- v1.17 是默认 head 升级，能改善 synthetic boundary gate。
+- 但匿名样片 A downstream 的 forced-aligner sentinel / unsafe fallback 未被根治。
+- 后续重点不是继续提高 frame recall，而是 pre-ASR speech-island / boundary packing。
+
+---
+
+## Forced Alignment 与 Chunk Packing 记录
+
+### R14 Phase 0
+
+目标：确认 fallback 是否真的影响时间轴。
+
+发现：
+
+- `vad_coarse` 比 `forced` 时间轴差约 `2.16s p90`，超过门槛。
+- forced 自身 p90 也约 `2.3s`，但主要来自 synthetic 真值边界模糊、crossfade/pad/transition 和 VAD pad，不代表 aligner 必然差。
+- 根因链收敛为：high-recall VAD 把多 island + 长 gap 合成超长 chunk，Qwen forced aligner 在长 chunk + 大段非语音上吐 sentinel。
+
+### R14 Phase 1a
+
+尝试：`ASR_CHUNK_PACK_MAX_CORE_FRAMES=419`，只在长 gap 处拆超长 chunk。
+
+结果：
+
+- chunks `137 -> 148`，增长 `+8%`。
+- forced `77 -> 84`。
+- fallback `60 -> 64`。
+- `vad_coarse_after_sentinel 25 -> 28`。
+- 未过 gate。
+
+结论：只在长 gap 处拆超长 chunk只能改善一部分粗时间轴误差，不能解决 sentinel。
+
+### R14 Phase 1b
+
+处理：`nonlexical` / `align_text_empty` 显式分流。
+
+结果：
+
+- 纯省略号/符号保留 display_text 并走粗时间轴。
+- 不再计入真正 `vad_coarse` fallback。
+- 剩余瓶颈集中在 `vad_coarse_after_sentinel` 非空文本块。
+
+### R14 Phase 1c
+
+尝试：`ALIGNMENT_SENTINEL_ISLAND_SPLIT=1`，只对 `vad_coarse_after_sentinel` 的非空文本 chunk 做 aligner-local speech-island splitting。
+
+synthetic64：
+
+- fallback `28 -> 11`。
+- `vad_coarse_after_sentinel=11`。
+- gate `PASS_RECLASSIFICATION_CLEANUP`。
+
+匿名样片 A：
+
+- chunks `240 -> 267`。
+- forced `101 -> 154`。
+- fallback `137 -> 48`。
+- `vad_coarse_after_sentinel 122 -> 42`。
+
+问题：
+
+- 初版每个失败 chunk 串行卸载/重载 ASR 与 aligner。
+- 耗时约 `1053.5s -> 3150.4s`。
+
+### R14 Phase 1d
+
+优化：staged batch island retry。
+
+流程：
+
+```text
+收集全部 sentinel chunk
+-> 一次性物化 island clips
+-> 批量 ASR
+-> 卸载 ASR
+-> 批量 forced align
+-> merge 回原 chunk
+```
+
+结果：
+
+- synthetic64 指标与 Phase 1c 对齐。
+- 匿名样片 A：forced `154`、fallback `48`、`vad_coarse_after_sentinel=42`。
+- ASR+Alignment `1613.1s`、总计 `1641.7s`。
+
+结论：适合作为 opt-in repair / 质量上限参考，不宜默认开启。
+
+### R15 / R16
+
+路线改为 pre-ASR speech-island / boundary-aware chunking：
+
+- 不回到 FSMN。
+- 不默认引入 pyannote。
+- CAM++ / 3D-Speaker / WeSpeaker 只作为 speaker sidecar，在 speech-island 足够细后辅助判断相邻 island 是否跨 speaker。
+- rule-based valley split 覆盖风险高，chunk 增幅过大，不进默认。
+- 验收指标不只看 forced 数，还看 ASR empty、unsafe fallback、fallback duration、SRT 观感。
+
+### R17
+
+尝试：使用 v1.17 endpoint refiner 的 `cut` score 做 opt-in pre-ASR cut split。
+
+离线样片 A：
+
+- threshold `0.96`：chunks `241 -> 267`，增长 `1.11x`。
+- threshold `0.95`：chunks `241 -> 287`，增长 `1.19x`。
+- threshold `0.94`：chunks `241 -> 313`，增长 `1.30x`。
+
+GPU 闭环 threshold `0.95`：
+
+- chunks `241 -> 258`，增长 `+7.1%`。
+- forced `105 -> 123`。
+- `vad_coarse_after_sentinel 114 -> 113`。
+- unsafe fallback `114 -> 109`。
+- fallback safe ratio `0.0 -> 0.035`。
+- fallback duration p90 仍为 `28.47s`。
+
+结论：
+
+- cut score 能改善少量 forced alignment。
+- 它没有解决长连续 chunk 的粗 fallback。
+- 不默认启用，不继续只扫 cut threshold。
+- 下一步应转向更强的 pre-ASR boundary packing / endpoint refiner。
+
+### R18
+
+动机：R17 证明局部 cut score 有信号，但不能解决 sentinel / unsafe fallback。根因更像全局 packing 问题：长 chunk、多个 speech island、内部 gap、连续长人声、cut/valley 信号和 fallback 风险需要一起决策。
+
+参考思路：
+
+- WhisperX 的 VAD Cut & Merge 证明长音频 ASR 前需要显式切分和合并策略。
+- Semantic VAD / endpoint detection 说明 endpoint 应作为独立目标，而不是只做 speech/non-speech。
+- streaming ASR endpoint detection 的辅助 SAD / endpoint loss 思路适合迁移为 start/end/cut/risk 多头。
+
+已落地的最小版本：
+
+- 新增 env-gated `ASR_PRE_ASR_RISK_SPLIT_*`，默认关闭，不改变正式默认。
+- 新增 `r18_pre_asr_risk_v1` policy：先计算 chunk fallback 风险，再选择边界。
+- 风险因子：long core、unsafe duration、multi island、internal gap。
+- 切点优先级：明确 internal gap -> endpoint cut score -> low VAD valley。
+- 输出 metadata：`risk_split_count`、`risk_score`、`risk_reasons`，并进入 transcript chunk annotation 和 VAD chunk cache。
+- `run_full_workflow.py` 已透传 R18 env，避免 GPU 闭环时参数只存在于父进程。
+
+当前状态：
+
+- 单测覆盖默认关闭、多 island 长 chunk 切分、连续长 chunk 使用 cut score、cache key 变化、cache round-trip、ASR stage env 透传和 full workflow env 透传。
+- 这仍是 rule / cost packer 的第一版，不是最终模型。GPU 小闭环已经证明 R18 gap-first 没有显著解决 `vad_coarse_after_sentinel`、unsafe fallback 和 fallback p90。
+
+实施验收记录：
+
+- 代码范围：`src/audio/chunk_packer.py`、`src/whisper/pipeline.py`、`src/whisper/vad_chunk_cache.py`、`src/core/config.py`、`.env.example`、`tools/fusionvad_ja/run_full_workflow.py`。
+- 测试范围：`tests/test_chunk_packer.py`、`tests/test_vad_chunk_cache.py`、`tests/test_asr_stage_env_scope.py`、`tests/test_pipeline_chunk_config_runtime.py`、`tests/test_run_full_workflow_env.py`。
+- 验收命令：`.venv/bin/python -m pytest tests/test_chunk_packer.py tests/test_vad_chunk_cache.py tests/test_run_full_workflow_env.py tests/test_asr_stage_env_scope.py tests/test_pipeline_chunk_config_runtime.py -q`。
+- 结果：`44 passed`，仅有 Codex sandbox 内 NVML 初始化 warning；不影响 packing / cache / env 透传结论。
+- README 决策：不更新。R18 仍是 opt-in 实验路线，默认关闭，不改变新用户安装、默认工作流或分发说明。
+
+离线复算：
+
+- 工具：`tools/fusionvad_ja/analyze_r18_risk_splits.py`。
+- 输入：匿名样片 A v1.17 endpoint-refiner 的 VAD cache、diagnostics、R17 frame/cut score。
+- 输出：`agents/temp/fusionvad-ja/r18-risk-split-offline-sample-a*/summary.json`、`summary.md`、`risk_split_plan.jsonl`、`simulated_chunks.jsonl`。
+- 口径限制：离线复算只重打 cached VAD segments，并用 core overlap 把旧 diagnostics 映射到新 chunk；不跑 ASR / forced aligner，因此只能评估 chunk 分布和风险覆盖，不能替代 GPU 闭环。
+
+| 参数 | chunks | 增幅 | sentinel 风险旧 chunk 被拆 | duration p50/p90 | 结论 |
+|------|--------|------|-----------------------------|------------------|------|
+| 默认 R18 `risk=1.0,gap=6` | `241 -> 372` | `1.544x` | `56/114` | `16.34/28.47s` | 覆盖较多，但 chunk +54%，过激，不适合作为默认 GPU 闭环起点。 |
+| 保守 `risk=2.0,gap=6/12/18` | `241 -> 268-269` | `1.112-1.116x` | `11/114` | `27.00/28.47s` | 成本可控，但只覆盖少数 sentinel 风险。 |
+| 更保守 `risk=2.5,gap=6/12/18` | `241 -> 253-258` | `1.050-1.071x` | `2-6/114` | `27.29/28.47s` | 太保守，对粗 fallback 基本无杠杆。 |
+
+结论：
+
+- 只靠 R18 的 rule/cost packing 不能十拿九稳解决 p90 粗 fallback；一旦控制 chunk 增幅，能处理的主要是少量多 island / internal gap chunk。
+- 剩余瓶颈主要落在连续长 island / overlong chunk：旧 cache 中大量 chunk 本身已被 hard-cap overlong 切到接近 `28.47s`，即使重新 packing，fallback duration p90 仍不动。
+- 下一步不建议直接用默认 R18 跑 GPU；更合理路线是继续 endpoint/boundary refiner，让模型在连续长 island 内提供更可靠 cut/valley 信号，或把 R18 改成更明确的 fallback-risk objective 后再做小闭环。
+- 当前 R18 保持 opt-in、默认关闭。
+
+Netflix / WhisperX 复核后的策略修正：
+
+- Netflix timed text 规则强调 cue 需要贴近对白起点、保持可读时长、字幕间保留最小 gap；通用字幕 event 通常不应长期接近 `20-30s`。日语规则还有更严格的行长和读速限制。
+- WhisperX 类长音频 ASR 路线允许 ASR chunk 接近 `30s`，但那依赖后续 word-level forced alignment。当前项目在 forced aligner sentinel 时只能退回 chunk 粗时间轴，所以 ASR chunk 过长会直接污染 fallback 字幕。
+- 因此 R18 不应简单照搬“30s ASR chunk 合法”或“7s 字幕 cue 最大”任何一边，而应先把明显多句、多 island、内部 gap 的 chunk 拆开；连续长语音则保守处理。
+- 已新增 `ASR_PRE_ASR_RISK_SPLIT_CONTINUOUS_THRESHOLD=2.0`：`risk=1.0,gap=6` 时仍会积极切明确内部 gap，但没有内部 gap 的连续长 island 需要更高风险分才允许使用 endpoint cut / VAD valley 切。
+- 该改动保持 R18 默认关闭，但改变 R18 opt-in 行为和 VAD chunk cache signature。
+
+gap-first 离线复算：
+
+| 参数 | chunks | 增幅 | sentinel 风险旧 chunk 被拆 | duration p50/p90 | 结论 |
+|------|--------|------|-----------------------------|------------------|------|
+| `risk=1.0,continuous=2.0,gap=6` | `241 -> 269` | `1.116x` | `11/114` | `27.00/28.47s` | 新默认实验档，主要只切明确 gap；成本可控。 |
+| `risk=1.0,continuous=1.5,gap=6` | `241 -> 372` | `1.544x` | `56/114` | `16.34/28.47s` | 连续长 island 也被 cut score 大量切，回到旧激进行为。 |
+| `risk=1.0,continuous=2.5,gap=6` | `241 -> 258` | `1.071x` | `6/114` | `27.29/28.47s` | 太保守，收益更小。 |
+
+GPU 闭环：
+
+- 命令脚本：`agents/temp/run_r18_gapfirst_sample_a_gpu.sh`。
+- 工作流输出：`agents/temp/fusionvad-ja/full-workflow-qwen29239-sample-a-v1-17-r18-gapfirst/`。
+- 诊断输出：`agents/temp/fusionvad-ja/diagnostics-sample-a-v1-17-r18-gapfirst/`。
+- fallback-safe 指标：`agents/temp/fusionvad-ja/fallback-safe-boundary-metrics-sample-a-v1-17-r18-gapfirst/`。
+- 对比表：`agents/temp/fusionvad-ja/r18-gapfirst-gpu-compare/summary.md`。
+- VAD 日志确认使用 CUDA：`requested_device=cuda actual_device=cuda`。
+- 全片匿名样片 A 耗时 `1116.54s`，ASR chunks `250`，输出 segments `899`。
+
+| 版本 | chunks | forced | `vad_coarse_after_sentinel` | unsafe fallback | fallback p50/p90/max | ASR empty warn | QC reject |
+|------|--------|--------|-----------------------------|-----------------|----------------------|----------------|-----------|
+| baseline v1.17 | `241` | `105` | `114` | `114` | `28.47 / 28.47 / 28.47s` | `6` | `16` |
+| R17 cut th0.95 | `258` | `123` | `113` | `109` | `27.41 / 28.47 / 28.47s` | `5` | `17` |
+| R18 gap-first | `250` | `109` | `117` | `114` | `28.47 / 28.47 / 28.47s` | `8` | `16` |
+
+结论：
+
+- `risk=1.0,continuous=2.0,gap=6` 的 chunk 增幅可控，但真实 GPU 闭环没有过 gate：forced 只从 baseline `105 -> 109`，sentinel `114 -> 117`，unsafe fallback 不变，fallback p90 不变。
+- R18 规则没有触达核心瓶颈。多数粗 fallback 仍是接近 hard-cap 的长连续 chunk / overlong chunk；只切明确 gap 的收益太小，而无差别切连续长 island 又依赖当前还不够可靠的 cut/valley 信号。
+- R18 保持 opt-in、默认关闭。不建议继续围绕 `risk/gap/continuous` 做大规模扫参；下一步应训练更强的 endpoint / boundary refiner，或设计 fallback-risk objective，让模型直接学习“哪里适合切成一句台词”。
+
+R18 后续 cut-signal 离线审计：
+
+- 工具：`tools/fusionvad_ja/analyze_fallback_cut_signal.py`。
+- 输入：全量 `chunk_metrics.jsonl`，不是 `unsafe_fallback_chunks.jsonl` top-N；后者只保留最长 20 条审计样本。
+- 目的：确认现有 v1.17 的 `speech/cut` 概率在 unsafe fallback chunk 内是否已经包含足够切点。如果已有信号足够，说明 packer 阈值还有空间；如果信号不够，说明必须改训练目标。
+- 输出：
+  - `agents/temp/fusionvad-ja/fallback-cut-signal-sample-a-v1-17-baseline-full/`
+  - `agents/temp/fusionvad-ja/fallback-cut-signal-sample-a-v1-17-r17-full/`
+  - `agents/temp/fusionvad-ja/fallback-cut-signal-sample-a-v1-17-r18-full/`
+
+| 版本 | unsafe rows | 有 cut/valley 候选 | 可贪心拆到 9s 子 chunk | greedy 后 max-child p90 |
+|------|-------------|--------------------|-------------------------|-------------------------|
+| baseline v1.17 | `114` | `69` | `7` | `24.47s` |
+| R17 cut th0.95 | `109` | `55` | `9` | `24.47s` |
+| R18 gap-first | `114` | `67` | `8` | `24.47s` |
+
+结论：现有 v1.17 cut/valley 信号只能覆盖约 `6-8%` 的 unsafe fallback，且 p90 子 chunk 时长不动。继续扫 R17/R18 规则阈值不是主杠杆；下一步应训练新的 boundary/cut head，使目标直接服务 fallback-safe “一句台词边界”，尤其是连续长 island 内的可切点。
+
+### R19 / v1.18 训练目标调整
+
+动机：R18 后的全量 cut-signal 审计证明，现有 v1.17 cut head 在 unsafe fallback chunk 内缺少足够可用切点。继续调 packer 只是在不存在的信号上扫阈值。
+
+最小实现：
+
+- 新增 `EndpointRefinerTrainConfig.cut_boundary_radius_frames`，默认 `0`，不改变 v1.17 旧行为。
+- `endpoint_targets_from_record()` 仍保留原逻辑：长 gap（`gap >= cut_min_gap_s`）整段标为 cut。
+- 当 `gap < cut_min_gap_s` 且 `cut_boundary_radius_frames > 0` 时，把相邻 speech island 的 `previous.end` / `current.start` 附近若干帧也标为 cut 正样本。
+- CLI 新增 `tools/fusionvad_ja/train_endpoint_refiner.py --cut-boundary-radius-frames`。
+
+目的：
+
+- v1.18 训练不再只让 cut 学“大段静音 gap”，还要让 cut/head 学“相邻台词边界附近可以切”。
+- 这直接服务 fallback-safe chunk packing：即使 VAD high-recall 把连续人声或短 gap 合成一坨，也希望 cut head 能提供更密集、可解释的句子边界候选。
+- 默认仍关闭，直到新 checkpoint 通过 synthetic boundary gate 与匿名样片 A GPU downstream gate。
+
+验收：
+
+- `tests/test_fusionvad_ja_dataset.py` 覆盖短 gap boundary cut target 与 CLI 参数校验。
+- smoke：`agents/temp/fusionvad-ja/v1-18-cut-boundary-radius-smoke/`，1 step 训练成功，checkpoint config 写入 `cut_boundary_radius_frames=1`。
+
+训练与 test64 阈值扫描：
+
+- 训练脚本：`agents/temp/run_v1_18_cutboundary2_train.sh`。
+- checkpoint：`datasets/train/fusionvad-ja/v1-18/qwen3-asr-0.6b-full29239/endpoint-refiner-boundary32768-cutboundary2-batch16-lr2e-4-steps2048-posaux120-cut8-nogap/fusionvad_ja_endpoint_refiner.pt`。
+- 训练集：32768 条 Galgame synthetic exact-island / long-gap 样本，使用 Qwen3-ASR-0.6B full SFT frozen feature。
+- 训练参数：batch 16，lr `2e-4`，2048 steps，`cut_boundary_radius_frames=2`，`positive_aux_weight=120`，`internal_gap_loss_weight=0`。
+- 训练结果：final loss `0.8426`，frame accuracy `0.9378`，trainable params `1889252`。
+- 预测导出：
+  - v1.18：`agents/temp/fusionvad-ja/v1-18-cutboundary2-test64-predictions-th002-cut05/`
+  - v1.17 对照：`agents/temp/fusionvad-ja/v1-17-test64-predictions-th002-cut05/`
+- 阈值扫描：
+  - v1.18 no-cut：`agents/temp/fusionvad-ja/v1-18-cutboundary2-threshold-sweep/`
+  - v1.18 cut-applied：`agents/temp/fusionvad-ja/v1-18-cutboundary2-threshold-sweep-cut-applied/`
+
+关键对比：
+
+| 版本 / operating point | recall | missed speech | extra audio ratio | segments | start p50 | end p50 | cut gap coverage |
+|------------------------|--------|---------------|-------------------|----------|-----------|---------|------------------|
+| v1.17 `speech=0.020,cut=0.960,cut-applied` | `0.999992` | `0.005s` | `1.2545` | `192` | `0.305s` | `0.298s` | `0.984` |
+| v1.18 no-cut best recall-safe `speech=0.030` | `1.000000` | `0.000s` | `1.3674` | `190` | `0.552s` | `0.776s` | `1.000` |
+| v1.18 cut-applied best recall-safe `speech=0.030,cut=0.960` | `1.000000` | `0.000s` | `1.3329` | `193` | `0.484s` | `0.632s` | `0.905` |
+| v1.18 cut-applied `recall>=0.999` best | `0.999623` | `0.229s` | `1.3152` | `195` | `0.411s` | `0.572s` | `0.937` |
+
+结论：
+
+- v1.18 的 cut-boundary 目标确实让 cut 更积极，但在 synthetic boundary gate 上没有超过 v1.17。
+- 即使放宽到 `recall>=0.999`，v1.18 仍比 v1.17 多送音频、边界更粗。
+- 不替换默认 head，不进入匿名样片 A GPU downstream 闭环。
+- 失败原因更像训练目标仍不够直接：短 gap boundary 正样本会增加 cut 密度，但没有明确约束“fallback-safe 子 chunk 时长 / 一句台词边界 / 避免长连续 island 粗 fallback”。
+- 下一步应设计 v1.19：显式 fallback-risk / max-child-duration / sentence-island objective，或做一个 post-VAD boundary proposal 模型，而不是继续在 v1.18 上扫阈值。
+
+补充 fallback-safe synthetic gate：
+
+- `tools/fusionvad_ja/benchmark_boundary_predictions.py` 新增预测段级指标：
+  - `fallback_target_duration_s`，默认 `8.0s`。
+  - `fallback_gap_overlap_s`，默认 `0.5s`。
+  - `long_predicted_segment_count / ratio`。
+  - `predicted_gap_crossing_segment_count / ratio`。
+  - `predicted_segment_duration` p50/p90/p95/max。
+  - `predicted_gap_overlap` p50/p90/p95/max。
+- 目的：模拟 forced aligner sentinel 时的最坏情况。如果某个 VAD/packing operating point fallback 后会生成过长 cue 或跨大段 truth gap，即使 frame recall 高也不能算过 gate。
+- 新 sweep 产物：
+  - v1.17：`agents/temp/fusionvad-ja/v1-17-endpoint-refiner-threshold-sweep-cut-applied-fallbacksafe/`
+  - v1.18 no-cut：`agents/temp/fusionvad-ja/v1-18-cutboundary2-threshold-sweep-fallbacksafe/`
+  - v1.18 cut-applied：`agents/temp/fusionvad-ja/v1-18-cutboundary2-threshold-sweep-cut-applied-fallbacksafe/`
+
+fallback-safe 对比（`recall>=0.9999`）：
+
+| 版本 / operating point | recall | extra | segments | long segments | gap crossing | pred dur p90/max | start/end p50 |
+|------------------------|--------|-------|----------|---------------|--------------|------------------|---------------|
+| v1.17 `speech=0.040,cut=0.960,cut-applied` | `0.999992` | `1.2063` | `171` | `29` | `13` | `8.620/12.225s` | `0.300/0.281s` |
+| v1.18 no-cut `speech=0.030` | `1.000000` | `1.3674` | `190` | `40` | `67` | `9.222/17.940s` | `0.552/0.776s` |
+| v1.18 cut-applied `speech=0.030,cut=0.960` | `1.000000` | `1.3329` | `193` | `37` | `48` | `8.996/17.940s` | `0.484/0.632s` |
+
+结论：
+
+- v1.18 的问题不是单纯阈值；在 fallback-safe 指标下也明显劣于 v1.17。
+- v1.17 的 `speech=0.04,cut=0.96` synthetic gate 甚至优于早期 `speech=0.02,cut=0.96`，但是否替换默认 operating point 需要真实样片 GPU 闭环验证，不能只凭 synthetic gate。
+- v1.19 训练目标应直接减少 `long_predicted_segment_count` 和 `predicted_gap_crossing_segment_count`，同时守住 near-1 recall。
+
+匿名样片 A GPU 验证 `v1.17 speech=0.04,cut=0.96`：
+
+- 脚本：`agents/temp/run_v1_17_th04_sample_a_gpu.sh`。
+- workflow：`agents/temp/fusionvad-ja/full-workflow-qwen29239-sample-a-v1-17-th04-cut096/`。
+- diagnostics：`agents/temp/fusionvad-ja/diagnostics-sample-a-v1-17-th04-cut096/`。
+- fallback-safe metrics：`agents/temp/fusionvad-ja/fallback-safe-boundary-metrics-sample-a-v1-17-th04-cut096/`。
+- 日志确认 VAD 使用 CUDA：`requested_device=cuda actual_device=cuda`。
+- 全片耗时 `1056.7s`，ASR chunks `241`，字幕 segments `884`。
+
+| 版本 | chunks | forced | partial | nonlexical | `vad_coarse_after_sentinel` | unsafe fallback | fallback p50/p90/max | ASR empty warn | QC reject |
+|------|--------|--------|---------|------------|-----------------------------|-----------------|----------------------|----------------|-----------|
+| baseline v1.17 `0.02/0.96` | `241` | `105` | `0` | `6` | `114` | `114` | `28.47 / 28.47 / 28.47s` | `6` | `16` |
+| v1.17 `0.04/0.96` | `241` | `108` | `1` | `6` | `113` | `113` | `28.47 / 28.47 / 28.47s` | `6` | `13` |
+| R17 cut th0.95 | `258` | `123` | `0` | `5` | `113` | `109` | `27.41 / 28.47 / 28.47s` | `5` | `17` |
+| R18 gap-first | `250` | `109` | `0` | `8` | `117` | `114` | `28.47 / 28.47 / 28.47s` | `8` | `16` |
+
+结论：
+
+- `0.04/0.96` 在 synthetic gate 上更漂亮，但真实样片只带来很小变化：forced `105 -> 108`、sentinel/unsafe `114 -> 113`、fallback p90 不变。
+- 不替换默认 operating point；继续保持 v1.17 默认，并把 `0.04/0.96` 记录为 synthetic 优但真实闭环收益不足的负例。
+- 这进一步确认主瓶颈不是全局 speech threshold，而是 long overlong chunk / continuous island 内缺少可靠句边界。
+
+---
+
+## ASR / Alignment 文本策略
+
+当前策略来自 v1.8 / v1.9 的清理。
+
+原则：
+
+- `display_text` 是最终字幕显示文本，只做展示安全处理。
+- `align_text` 是 forced aligner 专用文本，可删除标点、emoji、装饰符、音乐符号和不可发音标记。
+- 不使用具体字样黑名单。
+- 不直接删除目标域常见短促发声、喘息、呻吟、拟声和低信息短句。
+- 重复循环、低置信、文本/音频比例异常、align-text-empty、forced-aligner fallback、ASR dropped uncertain 默认只作为 QC / 诊断 / 样本池信号。
+- forced aligner 失败时不伪造精确时间轴，保留 fallback quality label。
+
+失败样本池闭环：
+
+```text
+diagnose_asr_alignment.py
+-> failure_candidates.jsonl
+-> export_alignment_failure_manifest.py
+-> materialize_alignment_failure_audio.py
+-> 人工审计 / hard-negative / 下轮 VAD 或 ASR 数据
+```
+
+---
+
+## 字幕时间轴
+
+时间轴策略来自 Netflix / 字幕行业实践的简化适配：
+
+- 每个任务用 `ffprobe` 读取真实 FPS。
+- 失败时按 `30000/1001` 兜底。
+- cue plan 在 LLM 翻译前固定。
+- 最小字幕 gap 为 2 帧。
+- 短尴尬 gap 可折叠为 2 帧。
+- 真实停顿保留。
+- 前一条 cue 可适度 linger，但必须受最大时长约束。
+
+关键结论：
+
+- ASR 输出文本时，start 边界比 end 更重要。
+- end 偏长可以在 cue timing polish 中压缩，尤其是两条字幕相邻时可以压缩前者 end 来保留 gap。
+- 但如果 VAD / chunk 本身跨了大段无声，后置 timing polish 无法修复 ASR 幻觉或 forced aligner coarse fallback。
+
+### R19 · Reward-shaped speech-island segmentation
+
+用户提出：能否用强化学习做 speech-island 划分，把“时间轴太粗”和“多个 speech island 中间夹 gap / 白噪声 / BGM / 空白却被合成一段”作为强惩罚；切点越接近 speech start 越加分，end 也加分但权重低于 start。
+
+检索与判断：
+
+- 方向成立。已有类似“用 RL 学 speech boundary”的研究，例如 REBORN（Reinforcement-Learned Boundary Segmentation with Iterative Training for Unsupervised ASR，NeurIPS 2024）用 RL 优化语音边界，使无监督 ASR 的 phoneme perplexity 更好。
+- 但 REBORN 的 reward 服务于无监督 ASR，不直接服务本项目的 fallback-safe subtitle boundary。我们当前目标更具体：forced aligner 失败时，fallback chunk 不能是 20-30s 的粗时间轴，也不能跨大段 truth gap。
+- 因为 Galgame synthetic exact-island 已提供精确 speech-island 真值，第一版不应直接上 REINFORCE/PPO。直接 RL 会引入稀疏 reward、训练不稳定、reward hacking 和 GPU 闭环成本高的问题。
+
+决策：
+
+- v1.19 先做 **reward-shaped structured segmentation**，借用 RL 的 reward 设计，但用确定性 DP / beam search 或离线 cost planner 选择 cut。
+- 先离线验证 reward 是否抓住当前瓶颈；只有 synthetic fallback-safe gate 和匿名样片 A GPU 小闭环都证明有效，才考虑接入主 pipeline 或进一步训练 boundary/refiner。
+
+v1.19 reward 初稿：
+
+- 强惩罚：预测段跨 `>=0.5s` truth gap。
+- 强惩罚：fallback 子段超过 `8-9s`。
+- 中惩罚：chunk 数暴涨、切得太碎、子段短于最小可读/可识别时长。
+- 奖励：切点靠近真实 speech start/end；start 权重大于 end。
+- 保护项：不漏掉完整台词 island。frame recall 不再是主优化目标，允许为切准 start/end 和减少长 fallback chunk 牺牲少量 recall。
+
+实施顺序：
+
+1. 新增离线 planner / evaluator：读取 `boundary_manifest.jsonl` + endpoint prediction probabilities，在候选 cut 上用 reward/cost 选切分，输出 fallback-safe 指标。
+2. 在 test64 上对比 v1.17 baseline / R17 / R18 / v1.18，先判断 reward 是否能显著降低 `long_predicted_segment_count` 和 `predicted_gap_crossing_segment_count`。
+3. 若离线成立，再把 planner 的候选生成逻辑迁移到 `chunk_packer.py` 的 opt-in R19 开关；默认仍关闭。
+4. 若真实样片仍缺可用 cut 信号，再训练 boundary/refiner：目标不再只是 speech mask，而是直接优化 fallback-safe 子段、truth-gap crossing、单句台词 chunk 和 start-biased boundary。
+
+首轮离线实现：
+
+- 新增 `tools/fusionvad_ja/plan_reward_boundary_segments.py`。
+- 输入：synthetic `boundary_manifest.jsonl` + endpoint prediction probabilities。
+- 输出：`summary.json`、`plan_details.jsonl`。
+- 支持三种 candidate source：
+  - `probability`：当前模型的 cut / endpoint / valley 概率。
+  - `oracle`：synthetic truth gap，仅用于上限分析。
+  - `hybrid`：两者合并，用于确认 reward 方向。
+- 关键修正：R19 不能只选“切点”。对大 gap / cut / valley，应支持删除一个 cut zone；但 endpoint/start/end 只能做切点，不能删除音频，否则会误切 speech。这个约束来自单测暴露的问题。
+
+test64 结果（v1.17 predictions，baseline 为 `speech=0.02`、pad `0.2s`、merge gap `0.15s`）：
+
+| 方案 | recall | missed speech | segments | long segments | gap crossing | dur p90/max | extra |
+|------|--------|---------------|----------|---------------|--------------|-------------|-------|
+| baseline | `1.000000` | `0.000s` | `190` | `31` | `27` | `8.826/17.140s` | `1.2809` |
+| R19 probability v2 | `0.999234` | `0.465s` | `223` | `21` | `28` | `7.996/9.760s` | `1.2709` |
+| R19 oracle truth-cost | `1.000000` | `0.000s` | `195` | `29` | `22` | `8.544/12.285s` | `1.2595` |
+| R19 hybrid truth-cost | `0.999506` | `0.300s` | `223` | `21` | `22` | 见产物 | `1.2587` |
+
+产物：
+
+- `agents/temp/fusionvad-ja/r19-reward-boundary-plan-v1-17-probability-test64-v2/`
+- `agents/temp/fusionvad-ja/r19-reward-boundary-plan-v1-17-oracle-test64-v2/`
+- `agents/temp/fusionvad-ja/r19-reward-boundary-plan-v1-17-hybrid-truthcost-test64/`
+
+结论：
+
+- reward-shaped planner 的目标函数方向成立：可以明显压低 long predicted segment，并在有 truth gap/cut zone 信号时降低 gap crossing。
+- 但当前 v1.17 概率候选不能稳健上线：它能把 long segment `31 -> 21`，但 gap crossing 没降，且会带来少量 missed speech。
+- 因此下一步不是把 R19 planner 直接接主 pipeline，而是用它生成/评估 v1.19 训练目标：让 boundary/refiner 学到“可删除的 gap/cut zone”和“只可切不可删的 endpoint”，并显式优化 fallback-safe metrics。
+
+### R19 数据升级：speaker-random synthetic timeline
+
+用户提出：除了在 speech island 中间拼接 gap / 白噪声 / BGM，还应把不同人的 Galgame 语音随机串联在一起，训练模型识别“换人/换声线的 speech boundary”。如果有性别、角色或声优标注，优先让相邻 island 来自不同性别/角色/声优。
+
+检索与判断：
+
+- speaker change detection 领域已有类似做法：把不同说话人的短语音拼成 synthetic conversation，用来训练 speaker-change boundary。这个和 Galgame exact-island 构造天然匹配。
+- 但本项目不应把目标写成“识别男女/角色”，否则会回到已降级的 F0/gender 路线；目标应是 speaker-turn / utterance boundary，即“可切，不一定可删”。
+- `VisualNovel_Dataset_Metadata` 可能提供角色/声优元数据，但 `Galgame_Speech_ASR_16kHz` 当前本地 materialized manifest 不一定能直接映射到角色。因此 v1.19 第一版先用 `speaker_proxy_id` 占位：默认从 manifest 字段读取；没有字段时退化为 audio/hash 级 proxy。后续可接 CAM++ / 3D-Speaker / WeSpeaker 聚类填充 proxy。
+
+设计：
+
+- `cut_drop_zone`：中间是 silence / white noise / hum / BGM / real negative gap，可删除。
+- `cut_point`：相邻 speech island 几乎无 gap 或短 gap，但换 speaker proxy / source audio，只能切分，不能删除音频。
+- synthetic timeline 内部 speech island 应支持随机采样，而不是只按 manifest 顺序取连续样本。
+- 每条输出显式记录：
+  - `speaker_proxy_ids`
+  - `speaker_turn_boundaries`
+  - `cut_point_segments`
+  - `cut_drop_zones`
+  - `source_audio_ids`
+
+执行策略：
+
+1. 先给 `build_galgame_synthetic_timeline.py` 增加 opt-in 随机 speech island 采样和 speaker proxy 元数据。
+2. 小样本 smoke 确认 manifest / boundary_manifest 能记录 speaker turn 和 gap zone。
+3. 后续再把这些 targets 接到 v1.19 训练：增加 `cut_point` / `cut_drop_zone` 双头或在现有 cut head 上拆 target。
+
+实施进展：
+
+- `build_galgame_synthetic_timeline.py` 已新增 opt-in `--randomize-speech-order`、`--speaker-proxy-mode`、`--speaker-proxy-retry-count`、`--cut-point-max-gap-s`、`--cut-drop-min-gap-s`。
+- 输出 manifest / boundary manifest / labels 均记录 `speaker_proxy_ids`、`speaker_turn_boundaries`、`cut_point_segments`、`cut_drop_zones`。其中 labels 通过 `boundary_metadata` 保存这些训练目标，避免只在旁路 manifest 中可见。
+- `endpoint_targets_from_record()` 已读取 `boundary_metadata`：`cut_drop_zones` 标整段可删除 gap，`cut_point_segments` 标短半径切点；暂时复用现有 `cut` head，不马上拆模型结构，减少 v1.17 checkpoint 兼容风险。
+- 小样本 smoke 已覆盖随机 speaker boundary：`test_build_galgame_synthetic_timeline_records_speaker_random_boundaries`；目标读取覆盖：`test_endpoint_targets_use_explicit_cut_metadata`。
+- 设计坑：不能把 speaker turn 当作可删除区域。gap/noise/BGM/silence 是 `cut_drop_zone`，可从 fallback chunk 中删；换人/换 source 的连续 utterance 是 `cut_point`，只能切分，不能删音频。
+
+连续 speech-island 修正：
+
+- 第一版 v8 4096 数据虽然 `--gap-min-s 0`，但连续/短 gap 样本比例太低：8192 个内部边界里 `gap <= 0.12s` 只有 244 个，实际训练会偏向长 gap 删除。
+- 新增显式分布控制：
+  - `--touch-gap-prob`：内部 speech island 之间完全 0-sample 贴连。
+  - `--short-gap-prob` + `--short-gap-max-s`：内部 speech island 之间采样 0 到短 gap 上限。
+- 重新生成 `galgame-synthetic-timeline-v8-speaker-random-touch4096-train`：4096 条、8192 个内部边界；`touch=2109`、`short=2104`、`regular=3979`；`cut_point_segments=4213`、`cut_drop_zones=3965`、`ambiguous_gap=14`。这版才真正覆盖“连续多 speech island 拼接，中间没有 gap 或只有极短 gap”的训练目标。
+- `build_exact_island_labels.py` 已保留 boundary metadata；否则 exact-island 转换会丢掉 `cut_point_segments` / `cut_drop_zones`，导致 v1.19 训练实际没有学到新目标。
+
+v1.19 touch4096 smoke：
+
+- 生成 feature cache：`datasets/train/fusionvad-ja/v1-19/qwen3-asr-0.6b-full29239/galgame-synthetic-timeline-v8-speaker-random-touch4096-feature-cache/feature_manifest.json`，CUDA + bf16，4096/4096 cached，0 errors。
+- 训练：`endpoint-refiner-touch4096-batch16-lr2e-4-steps1024-posaux120-cut8`，1024 steps，loss `1.5212`，frame accuracy `0.9133`，trainable params `1,889,252`。
+- test64 直接 speech mask（speech=0.02, cut=0.5）不达标：recall `0.9974`，missed `1.48s`，extra ratio `1.4919`，long segments `41`，gap-crossing `80`。相比 v1.17 baseline（recall `1.0`、extra `1.2809`、long `31`、gap-crossing `27`），speech mask 明显更宽，不能默认替换。
+- 但 cut signal 对 R19 planner 有用：probability planner 把 long `41 -> 7`，gap-crossing `80 -> 71`，extra `1.4919 -> 1.4129`，但 recall 掉到 `0.9648`；hybrid truth-cost 把 gap-crossing 降到 `67`，recall `0.9707`。结论：贴连/短 gap 数据方向成立，但 `cut` 和 `speech` 仍相互污染，复用单一 cut head 不够稳定。
+- 下一步 v1.19b：拆 `cut_drop` / `cut_point` 双目标或至少在 loss 上分权；同时加 recall guard / speech mask regularization，避免为了学 cut 牺牲 frame recall 和扩大 extra audio。
+
+v1.19b split-cut 默认候选：
+
+- 按“直接替换默认，不保留旧 4-head 兼容”的方向重构 endpoint refiner：输出从 `speech/start/end/cut` 改为 `speech/start/end/cut_drop/cut_point`。
+- `cut_drop` 表示 silence / white noise / hum / BGM / real negative gap，可从 fallback chunk 中删除；`cut_point` 表示贴连台词、短 gap 或换 speaker/source 的 utterance boundary，只能切分不能删除音频。
+- 训练：`datasets/train/fusionvad-ja/v1-19/qwen3-asr-0.6b-full29239/endpoint-refiner-splitcut-touch4096-batch16-lr2e-4-steps1024-posaux120-cut16/`，CUDA，1024 steps，batch 16，lr `2e-4`，trainable params `1,889,349`，loss `1.6056`，frame accuracy `0.9138`。
+- 导出：`agents/temp/fusionvad-ja/v1-19b-splitcut-touch4096-step1024-predictions-th002-cut05/`，speech F1 `0.9282`，precision `0.8687`，recall `0.9963`；`cut_drop` F1 `0.6049` / recall `0.9679`，`cut_point` F1 `0.0519` / recall `0.2229`。
+- Synthetic boundary benchmark at speech threshold `0.02`：`agents/temp/fusionvad-ja/v1-19b-splitcut-touch4096-step1024-boundary-benchmark/`，speech-duration recall `0.99794`，missed speech `121.59s`，extra audio ratio `1.2199`，predicted segments `12560`，long segments `4216`，gap-crossing segments `3639`，p50/p90 predicted segment duration `4.12s/14.96s`。
+- Threshold sweep：`agents/temp/fusionvad-ja/v1-19b-threshold-sweep/threshold_sweep_summary.json`。`speech=0.02` 和 `speech=0.10` 都会让 1 秒纯静音末尾触发短段，默认不采用；`speech=0.20` 保留 synthetic recall `0.98937`，extra audio ratio 降到 `1.08859`，gap-crossing 降到 `1409`，作为 v1.19b 默认 operating point。后续用真实 held-out 再决定是否向 `0.15` 或 `0.10` 回调。
+- R19 planner 仍不默认开启：`agents/temp/fusionvad-ja/r19-reward-boundary-plan-v1-19b-step1024-probability/` 把 segments `12560 -> 19558`、long `4216 -> 1252`、gap-cross `3639 -> 3233`，但 recall 降到 `0.943963`，且切分数量暴涨；按新的 boundary-first 主线，它是有用的离线 teacher / 上限分析，不是可直接上线的默认策略。
+- 默认 checkpoint 已切到 `src/vad/fusionvad_ja/checkpoints/fusionvad_ja_v1_19b_splitcut_touch4096_endpoint_refiner.pt`，默认阈值 `speech=0.20`、`cut_drop/cut_point=0.50`；旧 v1.17 checkpoint 暂留在目录中作为历史产物，不作为默认。
+
+### 主线切换：boundary-first VAD
+
+用户明确调整目标：不一定非要保持高召回主线。当前 VAD 主目标改为 speech-island 边界切准，尽量“一句台词一个 chunk”。`start` 边界比 `end` 略重要，但两者都重要。`end` 偏长可以被字幕 timing polish 适度压缩；`start` 偏晚会直接漏掉台词开头，`start` 偏早则更容易把静音/BGM/噪声送进 ASR 诱发幻觉。
+
+新的验收优先级：
+
+1. start/end boundary error，start 权重略高。
+2. fallback chunk duration p50/p90/max，禁止 20-30s 粗 fallback。
+3. predicted gap crossing 与 gap overlap。
+4. 单 chunk 台词数 / speech island 数，目标是一句台词一个 chunk。
+5. ASR empty / hallucination proxy。
+6. frame recall 只作为 guardrail：不能漏完整台词 island，但允许为边界质量牺牲少量帧级 recall。
+
+v1.20 训练方向：
+
+- 数据继续使用 Galgame exact-island synthetic timeline，但提高连续/短 gap、多 speaker/source 拼接、BGM/噪声贯穿、真实 negative gap 的比例。
+- loss 从 “speech BCE + boundary/cut auxiliary” 改成 boundary-first：start/end loss 加权，start 权重大于 end；internal gap / cut_drop loss 继续强约束；cut_point 独立优化贴连 speech island；speech mask 作为 guardrail 而非唯一主目标。
+- evaluation 不再用 `recall>=0.999` 做 hard gate，改用 boundary score：`start_p50/p90`、`end_p50/p90`、`long_predicted_segment_count`、`predicted_gap_crossing_segment_count`、`predicted_segment_duration p90/max` 和 chunk 数增幅。
+
+### v1.20-v1.22 执行路线：先监督，再 imitation，最后候选切点 RL
+
+用户提出：因为 synthetic timeline 已经可以随机拼接不同 Galgame speech island、gap、BGM、白噪声、短 gap 和贴连边界，是否可以直接用强化学习训练 speech-island 划分。
+
+结论：
+
+- RL 现在比早期更合理，因为我们已有可控环境、明确 reward 和 exact-island 真值。
+- 但第一步不应直接上 REINFORCE/PPO。当前数据有精确 start/end、cut_drop、cut_point 标签，监督学习的样本效率和稳定性更高，能先把明显可学的边界打牢。
+- 真 RL 只适合后置到候选切点层：动作空间限制为 keep / split / drop-gap，并只在 VAD valley、cut_drop、cut_point、start/end 这类候选上决策。禁止逐帧任意动作，否则容易 reward hacking、segment explosion 或漏完整台词。
+
+执行顺序：
+
+1. **v1.20 boundary-first supervised refiner**
+   - 训练入口支持独立 `start_loss_weight` / `end_loss_weight`，默认 `start > end`。
+   - `speech_loss_weight` 降为 guardrail；`internal_gap`、`cut_drop`、`cut_point` 提权。
+   - metrics 记录 component loss 和 boundary-first 权重，方便横向比较。
+2. **v1.21 reward planner teacher / imitation**
+   - 用 R19 planner 在 offline synthetic 上生成 keep / split / drop-gap teacher。
+   - 训练模型模仿 planner 决策，而不是把 planner 直接作为 runtime 默认。
+   - gate 重点看 fallback chunk duration、gap crossing、单 chunk 台词数、complete island miss。
+3. **v1.22 optional RL fine-tune**
+   - 只在 v1.21 已稳定后尝试。
+   - reward：start 接近真值权重大于 end；跨大 gap、20-30s fallback chunk、segment explosion、漏完整 island 强惩罚；ASR empty / hallucination proxy 可作为下游奖励。
+   - RL 成功条件不是 synthetic reward 变高，而是匿名样片 A / held-out 的字幕观感和 fallback-safe metrics 同步改善。
+
+本轮代码落地：
+
+- `EndpointRefinerTrainConfig` 新增 `start_loss_weight` / `end_loss_weight`。
+- `tools/fusionvad_ja/train_endpoint_refiner.py` 默认改成 boundary-first：`speech=0.5`、`start=2.0`、`end=1.5`、`internal_gap=1.0`、`cut_drop=1.0`、`cut_point=1.0`、legacy `boundary_loss=0.0`。
+- `train_metrics.json` 新增 `mean_component_losses` 与 `boundary_first` 权重记录。
+
+v1.20 first-pass 执行：
+
+- CPU smoke：`agents/temp/fusionvad-ja/v1-20-boundary-first-smoke-cpu/`，4 steps 跑通真实 4096 labels + Qwen3-ASR-0.6B full feature cache，`train_metrics.json` 正确写入 `boundary_first` 和 `mean_component_losses`。
+- GPU first-pass：`datasets/train/fusionvad-ja/v1-20/qwen3-asr-0.6b-full29239/endpoint-refiner-boundary-first-touch4096-batch8-lr2e-4-steps256/`，CUDA，batch 8，256 steps，loss `8.3672 -> 5.6199`，显存约 `2.3GB`，checkpoint-step-128 / 256 和 final checkpoint 均保存。
+- `speech_threshold=0.20` 导出：`agents/temp/fusionvad-ja/v1-20-boundary-first-touch4096-step256-predictions-th020-cut05/`，speech F1 `0.8874`，precision `0.8486`，recall `0.9299`；cut_drop F1 `0.4445` / recall `0.9567`；cut_point F1 `0.0000`。
+- Boundary benchmark at `speech=0.20`：`agents/temp/fusionvad-ja/v1-20-boundary-first-touch4096-step256-boundary-benchmark/`，speech-duration recall `0.9652`，missed speech `2056.50s`，extra ratio `1.1903`，start p50 `1.350s`，end p50 `1.203s`，long segments `3554`，gap-crossing `2486`。
+- `speech_threshold=0.10` 对照：speech recall 提升到 `0.9750`；boundary benchmark recall `0.9891`，但 extra ratio `1.3083`，start/end p50 都约 `2.41s`，chunk 明显变粗。
+
+结论：
+
+- v1.20 训练链路和新 loss 记录已跑通，但 256-step first-pass **不能替换默认 v1.19b**。
+- 失败不是单纯 operating point 问题。降低 speech threshold 能补 recall，但会扩大 extra audio 和 start/end error；cut_point 仍未学出，说明贴连/换人边界需要更强 supervision 或 teacher。
+- 下一步不应靠调低阈值，而应：
+ 1. 训练更久（回到 1024+ steps）并适度提高 `cut_point_positive_loss_weight` / `cut_point_loss_weight`。
+ 2. 单独 sweep cut_point threshold，看是否 target/nontarget 分布有可用分界；若没有，进入 v1.21 planner teacher / imitation。
+ 3. 用 boundary-first gate 选 checkpoint，不用 frame recall 单指标选模型。
+
+cut_point 强化与 v1.21 teacher 启动：
+
+- 先修正一个评测坑：`export_endpoint_refiner_predictions.py` 原先只读取 checkpoint 的 `boundary_radius_frames` / `cut_min_gap_s`，没有读取 `cut_boundary_radius_frames`，导致 cut_point target 用默认半径 `0` 评估，和训练半径不一致。已修正并加单测。
+- v1.20 cutpoint64 训练：`datasets/train/fusionvad-ja/v1-20/qwen3-asr-0.6b-full29239/endpoint-refiner-boundary-first-cutpoint64-touch4096-batch8-lr2e-4-steps1024/`，CUDA，batch 8，1024 steps，lr `2e-4`，`cut_point_loss_weight=3.0`，`cut_point_positive_loss_weight=64`，`cut_boundary_radius_frames=2`。
+- 训练曲线：loss `10.4787 -> 5.9876`，frame accuracy `0.6385 -> 0.8168`；显存约 `2.3-3.1GB`。
+- 导出 at `speech=0.20`：`agents/temp/fusionvad-ja/v1-20-cutpoint64-touch4096-step1024-predictions-th020-cut05/`，speech F1 `0.9395` / precision `0.9761` / recall `0.9055`；cut_drop F1 `0.4812` / recall `0.9682`；cut_point F1 `0.1073` / recall `0.6057`。
+- Boundary at `speech=0.20`：`agents/temp/fusionvad-ja/v1-20-cutpoint64-touch4096-step1024-th020-boundary-benchmark/`，recall `0.9450`，extra ratio `1.0069`，start/end p50 约 `0.36s`，long segments `2795`，gap-crossing `561`。
+- 导出 at `speech=0.10`：speech recall `0.9352`；boundary recall `0.9622`，extra ratio `1.0480`，long segments `3126`，gap-crossing `924`。这说明 cut_point 强化明显提升边界精度，但 speech mask recall 还不够，不能直接替换默认 v1.19b。
+- v1.21 planner teacher：
+  - probability planner：`agents/temp/fusionvad-ja/v1-21-teacher-plan-cutpoint64-probability-th010/`，segments `9979 -> 23056`，long `3126 -> 614`，gap-crossing `924 -> 814`，recall `0.9125`。
+  - hybrid truth-cost teacher：`agents/temp/fusionvad-ja/v1-21-teacher-plan-cutpoint64-hybrid-truthcost-th010/`，segments `9979 -> 22924`，long `3126 -> 614`，gap-crossing `924 -> 651`，recall `0.9109`。
+  - 结论：planner 作为 runtime 仍会过切且掉 recall；但作为 teacher 可以提供“高价值 split/drop-gap”训练信号。
+- 新增 `tools/fusionvad_ja/export_boundary_imitation_targets.py`，把 planner `plan_details.jsonl` 转成 v1.21 imitation targets：`split_frames`、`drop_gap_frames`、`split_points`、`drop_gap_zones`。
+- v1.21 imitation targets：`agents/temp/fusionvad-ja/v1-21-imitation-targets-cutpoint64-hybrid-truthcost-th010/`，4096 rows，`split_point=14534`，`drop_gap=3612`，split positive frame ratio `0.01654`，drop-gap positive frame ratio `0.03691`。
+- 下一步：训练 imitation head / policy head 时不能照单全收 planner。应把 teacher 当候选监督，加入 recall guard 和 segment-count penalty，优先学习“减少 long/gap-crossing 但不漏完整 island”的子集。
+
+v1.21 imitation head 执行记录：
+
+- 新增 `AdditionFusionImitationBiLSTM`，输出 `split` / `drop_gap` 两个 logits；新增 `tools/fusionvad_ja/train_imitation_head.py` 和 `tools/fusionvad_ja/export_imitation_head_predictions.py`。
+- 先跑 multitask plain BCE 1024 steps：`datasets/train/fusionvad-ja/v1-21/qwen3-asr-0.6b-full29239/imitation-head-cutpoint64-hybrid-truthcost-batch8-lr2e-4-steps1024/`。结果退化为常数策略：split best F1 `0.0330`，drop_gap best F1 `0.0774`，target/non-target p50 几乎相同。
+- 改成 positive-window sampling 后，multitask 仍不能学出可用 split/drop_gap：`imitation-head-poswin128-cutpoint64-hybrid-truthcost-batch8-lr2e-4-steps1024/`，drop_gap target/non-target p50 仍几乎一致。
+- 发现关键评测/训练坑：v1.21 imitation targets 按真实视频帧率 `29.97fps` 生成，`frame_hop_s=0.0333667`；Qwen feature cache 是 `frame_hop_s=0.02`。早期训练和导出都直接 `min(feature_frames, target_frames)` 截断，导致 target 时间轴错贴到 feature 前半段。已新增 `resize_binary_frames()`，训练与导出统一把 binary targets 重采样到 feature frame count，并加单测覆盖。
+- balanced frame loss + 重采样 target 的 multitask 512 steps：`imitation-head-poswin128-balanced-resizedtarget-cutpoint64-hybrid-truthcost-batch8-lr2e-4-steps512/`。修复后有弱分离但仍不可直接用：split best F1 `0.0371`，drop_gap best F1 `0.0910`。
+- drop_gap-only 512 steps：`imitation-head-dropgaponly-poswin128-balanced-resizedtarget-batch8-lr2e-4-steps512/`。这是第一版真正有用的候选：drop_gap best F1 `0.2366`，precision `0.1767`，recall `0.3581`，target/non-target p50 `0.8686 / 0.5078`。
+- drop_gap-only 2048 steps：`imitation-head-dropgaponly-poswin128-balanced-resizedtarget-batch8-lr2e-4-steps2048/`。训练窗口 F1 提升到 `0.7268`，全量分离度更强但更保守：drop_gap best F1 `0.1870`，precision `0.1309`，recall `0.3269`，target/non-target p50 `0.7986 / 0.2506`。
+- 结论：v1.21 不应把 split/drop_gap 放进同一个 imitation head 直接模仿 planner。split teacher 太稀疏且容易与全局先验混淆；drop_gap-only 可以作为“可删除内部 gap scorer”进入 offline packer 消融。512 版更偏 F1，2048 版更偏高分离/高置信，二者都暂不替换默认 VAD。
+- offline packer 实现：新增 `tools/fusionvad_ja/apply_drop_gap_packer.py`，输入 baseline `speech_frames` 和 drop_gap 逐帧概率，只在长父段内部删除高置信 drop_gap run；不进入主 pipeline，不改默认 VAD。实现坑：不能把 baseline segment 重建成新 frame mask，否则无应用区间时也会误删极短片段；已改为只在原始 `speech_frames` 上把实际应用的 drop_gap 区间置零。
+- CUDA 导出：按“能 CUDA 就提权 CUDA”重跑 512/2048 逐帧概率，输出 `agents/temp/fusionvad-ja/v1-21-dropgaponly-step512-probabilities-cuda/` 和 `agents/temp/fusionvad-ja/v1-21-dropgaponly-step2048-probabilities-cuda/`，均 4096 rows。CPU 版本已移入 `agents/rm/fusionvad-ja-cpu-dropgap-probabilities-20260602/`。
+- offline packer 消融（boundary benchmark 参数同 baseline：pad `0.2s`、merge gap `0.15s`、fallback target `8s`）：
+
+| run | recall | missed_s | extra_ratio | pred_segments | long | gap_cross | dur_p90 | applied | removed_s |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| baseline | `0.9622` | `2230.7` | `1.0480` | `9979` | `3126` | `924` | `12.94s` | `0` | `0.0` |
+| 512-th085 | `0.9444` | `3280.3` | `1.0295` | `12324` | `2182` | `877` | `9.27s` | `2345` | `2028.4` |
+| 512-th090 | `0.9556` | `2622.7` | `1.0410` | `11018` | `2725` | `891` | `11.10s` | `1039` | `829.2` |
+| 2048-th090 | `0.9593` | `2403.1` | `1.0448` | `10509` | `2904` | `900` | `11.84s` | `530` | `397.4` |
+| 2048-th095 | `0.9619` | `2252.2` | `1.0476` | `10067` | `3094` | `920` | `12.72s` | `88` | `58.8` |
+
+- 口径修正：用户明确当前目标不是整段 frame recall 最大化，而是 `start` 边界和 speech-island 分块准确。只要 recall `>=0.93`，可以牺牲一部分整段 recall 来换更短、更可 fallback 的 chunk。按这个口径补扫 512-th080/th082/th084 和 2048-th085/th088：
+
+| run | recall | missed_s | extra_ratio | long | gap_cross | dur_p90 | start_p90 | start_p95 | end_p90 | applied | removed_s |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| baseline | `0.9622` | `2230.7` | `1.0480` | `3126` | `924` | `12.94s` | `7.857s` | `9.174s` | `7.808s` | `0` | `0.0` |
+| 512-th080 | `0.9333` | `3939.0` | `1.0181` | `1763` | `874` | `8.44s` | `4.540s` | `6.396s` | `4.694s` | `3434` | `3136.6` |
+| 512-th082 | `0.9378` | `3671.3` | `1.0227` | `1940` | `870` | `8.72s` | `4.853s` | `6.764s` | `4.928s` | `2994` | `2688.0` |
+| 512-th084 | `0.9422` | `3411.1` | `1.0272` | `2097` | `875` | `9.02s` | `5.108s` | `7.197s` | `5.215s` | `2562` | `2249.8` |
+| 2048-th085 | `0.9563` | `2578.6` | `1.0417` | `2707` | `890` | `11.04s` | `6.528s` | `8.321s` | `6.476s` | `994` | `766.1` |
+
+- 新结论：在边界优先口径下，`512-th080` 是当前最强离线候选：recall 仍有 `0.9333`，但 start p90 `7.857s -> 4.540s`，start p95 `9.174s -> 6.396s`，long chunk `3126 -> 1763`，dur p90 `12.94s -> 8.44s`。这比 2048 系列更符合“粗时间轴先切准”的目标。仍不直接替换默认；下一步应该用 512-th080 做匿名样片 A GPU 闭环，审计 ASR 空输出、字幕观感和 fallback 是否真的改善。
+
+v1.21 512-th080 匿名样片 A GPU 闭环：
+
+- 执行脚本：`agents/temp/run_v1_21_dropgap512_th080_sample_a_gpu.sh`，CUDA 提权运行。首次中断后通过 `temp/asr_checkpoint_48102ec6a4.json` 恢复 `300/410` ASR chunk，续跑完成。
+- 运行产物：
+  - workflow：`agents/temp/fusionvad-ja/full-workflow-anon-a-v1-21-dropgap512-th080/`
+  - diagnostics：`agents/temp/fusionvad-ja/diagnostics-anon-a-v1-21-dropgap512-th080/`
+  - fallback-safe metrics：`agents/temp/fusionvad-ja/fallback-safe-boundary-metrics-anon-a-v1-21-dropgap512-th080/`
+- runtime：ASR+alignment `366.80s`，总计 `368.44s`；输出日文字幕 `874` segments / `963` blocks。
+- alignment diagnostics：chunks `410`，forced `222`，partial `1`，nonlexical `9`，drop_or_review `19`，vad_coarse `159`；fallback chunks `173/410`，其中 `vad_coarse_after_sentinel=159`，ASR QC reject `19`，align-text-empty `9`。
+- fallback-safe：coarse fallback chunks `160`，unsafe fallback chunks `115`，fallback safe ratio `0.281`，fallback duration p50/p90/max `13.06 / 25.71 / 28.47s`，fallback crossing long silence `12`。
+- 结论：512-th080 在离线 synthetic 指标上明显改善 start / long chunk，但真实样片 A 下没有过 fallback-safe gate。forced 数提升，但粗 fallback 仍集中在 20-30s 长 chunk，说明 drop-gap imitation 只处理了部分内部 gap，不能解决连续长 speech island / overlong chunk。v1.21 继续保持非默认；下一步需要更强 candidate policy 或直接训练 boundary objective，而不是把 512-th080 打开为默认。
+
+v1.22 / v1.23 计划修正：
+
+- Grok 查询失败后用内置搜索补查 endpointing、subtitle segmentation、RL speech boundary。结论：VAD / endpoint / subtitle cutpoint 不是同一个任务；只看 speech/silence 不足以判断“短暂停顿”和“真的该切字幕”。Netflix timing 规则也支持“in-time 尽量贴 speech start，out-time 可适当延后/压缩”的思路。
+- RL 不适合现在直接逐帧训练整套 VAD。逐帧 action 容易 reward hacking、segment explosion、漏完整台词。更稳路线是：先做 supervised cutpoint head，再把 RL 限制在候选切点 planner 上。
+- v1.22 目标：构造更干净的 exact-island cutpoint 数据集。用 Galgame clip 随机拼接多条 speech island，覆盖：
+  - touch gap：无 gap 贴连，边界只能是 `cut_point`；
+  - short gap：0-0.35s 短停顿，仍作为 `cut_point`；
+  - regular gap：>=0.60s gap/noise/BGM，作为 `cut_drop`；
+  - 随机 source / speaker proxy 顺序，避免模型只记住数据集原顺序；
+  - BGM / noise / crossfade / gain / filter / codec / overlap 轻量增强。
+- v1.22 首个实现：新增 `tools/fusionvad_ja/build_v1_22_cutpoint_dataset.py`，它是 `build_galgame_synthetic_timeline.py` 的稳定 preset wrapper。底层仍输出 `labels.jsonl`、`manifest.json`、`boundary_manifest.jsonl` 和 `boundary_metadata`，因此可以直接复用现有 feature cache、endpoint-refiner 训练和 boundary benchmark。
+- v1.22 smoke：`agents/temp/fusionvad-ja/v1-22-cutpoint-dataset-smoke16/`，16 records，`cut_point=52`，`cut_drop=11`，gap policy `regular=12 / short=33 / touch=19`。说明 wrapper 能稳定构造贴连、短 gap 和可删除 gap 三类监督。
+- 单测：`test_build_v1_22_cutpoint_dataset_wrapper_records_cutpoint_and_drop_zones` 覆盖 wrapper 输出 summary、`boundary_manifest.jsonl`、`LabelRecord.boundary_metadata`；相关 synthetic timeline 回归 4 passed。
+- 长 chunk 审计页已生成：`agents/audits/fusionvad-ja/long-fallback-r21-dropgap512-th080/index.html`。内容为 R21 dropgap512-th080 的 20 条 unsafe long fallback chunk，使用匿名样片 A 原视频 + 日文 VTT overlay + chunk ASR 文本 / 重叠字幕 / 指标，便于人工判断长 chunk 是真实长台词、噪声幻觉、还是多 speech island 被合并。
+- v1.22 正式 4096 数据集已生成：`datasets/train/fusionvad-ja/v1-22/galgame-cutpoint-supervised-4096/`。统计：`records=4096`，`duration_s_total=161520.35`，`cut_point_segment_count=12256`，`cut_drop_zone_count=4092`，`speaker_turn_boundary_count=16384`，gap policy `regular=4128 / short=7432 / touch=4824`。构造特点：每条样本随机串联 5 条 Galgame speech island，覆盖贴连、短 gap、regular 可删 gap、随机 source/speaker proxy、背景混合、crossfade、filter、codec 和 overlap。
+- v1.22 CUDA feature cache 已完成：`datasets/train/fusionvad-ja/v1-22/qwen3-asr-0.6b-full29239/galgame-cutpoint-supervised-4096-feature-cache/`。Qwen3-ASR-0.6B full SFT frozen feature，`device=cuda`，`dtype=bfloat16`，`cached=4096`，`errors=0`，产物约 `33G`。日志：`agents/temp/v1-22-feature-cache-4096-bs64-cuda.run.log`，确认 `param_device=cuda:0` / `param_dtype=torch.bfloat16`。
+- v1.22 supervised cutpoint head first-pass 已训练：`datasets/train/fusionvad-ja/v1-22/qwen3-asr-0.6b-full29239/endpoint-refiner-cutpoint-supervised4096-batch8-lr2e-4-steps1024-boundaryfirst/`。训练参数：batch 8，lr `2e-4`，1024 steps，trainable params `1,889,349`，boundary-first 权重 `speech=0.35 / start=3.0 / end=2.0 / internal_gap=1.5 / cut_drop=2.0 / cut_point=3.0`。loss `13.6723 -> 9.5304`，final frame_accuracy `0.5269`，positive_ratio `0.8958`。
+- v1.22 first-pass 导出 at `speech_threshold=0.20 / cut=0.50`：`agents/temp/fusionvad-ja/v1-22-cutpoint-supervised4096-step1024-predictions-th020-cut050/`。frame metrics：speech F1 `0.7946`，precision `0.9527`，recall `0.6814`；cut_drop F1 `0.2402` / recall `0.9244`；cut_point F1 `0.1135` / recall `0.5602`。注意：本次为分析写入了 `--include-probabilities`，目录约 `965M`；后续除非要阈值重算，不应默认写概率全量 JSONL。
+- v1.22 first-pass boundary benchmark：`th020` synthetic speech-duration recall `0.6853`，missed speech `45106.10s`，extra ratio `0.7245`，start p50/p90 `1.449s/4.842s`，end p50/p90 `1.638s/4.794s`，predicted segment duration p90/max `7.08s/35.90s`，long `2007`，gap-crossing `435`。低阈值扫也救不回 recall：
+
+| speech th | recall | missed_s | extra_ratio | start p90 | end p90 | dur p90 | long | gap_cross |
+|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| `0.05` | `0.8144` | `26596.9` | `0.8857` | `7.589s` | `7.133s` | `10.72s` | `5102` | `1436` |
+| `0.08` | `0.7673` | `33353.6` | `0.8272` | `6.138s` | `5.658s` | `8.96s` | `3985` | `886` |
+| `0.10` | `0.7475` | `36186.2` | `0.8025` | `5.611s` | `5.360s` | `8.50s` | `3548` | `713` |
+| `0.15` | `0.7118` | `41313.1` | `0.7574` | `5.062s` | `4.942s` | `7.58s` | `2648` | `533` |
+| `0.20` | `0.6853` | `45106.1` | `0.7245` | `4.842s` | `4.794s` | `7.08s` | `2007` | `435` |
+
+- v1.22 first-pass 结论：数据构造方向成立，cut_drop/cut_point 信号能学到一部分，但当前 loss 把 speech mask 压坏，最高低阈值 recall 也只有 `0.8144`，远低于 `>=0.93` guardrail。不要直接把同一训练目标放大到 32768；下一版应先修正目标：提高 speech guardrail / 两阶段训练（先保住 speech mask，再训 boundary/cut）/ 或从 v1.19b 稳定 head 初始化，只训练新增 cutpoint/boundary 头。
+- recall 口径修正：旧 `speech_duration_recall` 是线性时长重叠，覆盖 speech island 后半段和覆盖前半段会拿到同样分数；这不符合当前“start 更重要”的字幕边界目标。`tools/fusionvad_ja/benchmark_boundary_predictions.py` 新增 `start_weighted_speech_recall`，对每个 truth speech island 按 `w(x)=(1-x)^gamma` 积分，`x=0` 为 island 起点，默认 `gamma=2.0`。单测覆盖：只覆盖前半段得分 `0.875`，只覆盖后半段得分 `0.125`，线性 recall 都是 `0.5`。
+- 用新口径重算 v1.22 4096 first-pass，`speech_threshold=0.05/0.08/0.10/0.15/0.20` 的 `start_weighted_speech_recall` 分别为 `0.8204 / 0.7747 / 0.7555 / 0.7207 / 0.6945`。它只比线性 duration recall 高 `0.006-0.009`，说明这版模型并非单纯“漏开头被旧指标误伤”，而是总体 speech 覆盖不足；不改变“不直接放大到 32768”的结论。
+- v1.22b speechguard：复用 4096 feature cache，把 `speech_loss_weight` 拉高到 `2.0`，boundary/cut 降为辅助，CUDA 训练 1024 steps：`datasets/train/fusionvad-ja/v1-22/qwen3-asr-0.6b-full29239/endpoint-refiner-cutpoint-supervised4096-batch8-lr2e-4-steps1024-speechguard/`。frame speech recall 回到 `0.9841`，但 cut/start/end 头在 `0.5` 阈值下全为 0；boundary benchmark recall `0.9848` / start-weighted `0.9789`，但 start p50/p90 `10.30s/28.66s`、duration p90/max `38.78s/46.02s`、long `5061`，说明单纯保 speech 会退化为大段保守 mask。
+- v1.22c init-v1.19b：训练工具新增 `--init-checkpoint`，从默认 v1.19b head 初始化，低学习率 `5e-5` CUDA 微调 512 steps：`datasets/train/fusionvad-ja/v1-22/qwen3-asr-0.6b-full29239/endpoint-refiner-cutpoint-supervised4096-initv119b-batch8-lr5e-5-steps512/`。frame metrics at `speech=0.20/cut=0.50`：speech F1 `0.9514`，precision `0.9134`，recall `0.9927`；cut_drop F1 `0.3029` / recall `0.9272`；cut_point F1 `0.1293` / recall `0.3780`。说明从稳定 head 初始化能同时保 speech 和保留 cut 信号。
+- v1.22c raw speech boundary：recall `0.9930` / start-weighted `0.9887`，但 start p50/p90 `14.39s/29.66s`，duration p90/max `40.40s/46.20s`，long `4557`。根因是 raw speech mask 会把多个 island 合成超长段，cut 信号没有参与 split。
+- v1.22c apply-cut-to-speech：把 cut 直接从 speech 中删除，start p50/p90 改善到 `1.12s/4.30s`，duration p90 `6.96s`，但 speech recall 下降到 `0.7328` / start-weighted `0.7243`。结论：cut 不能作为删除 speech 的 hard gate。
+- v1.22c cut-split offline：`benchmark_boundary_predictions.py` 新增 `--cut-split-mode split`，用 cut run 的中点拆分 predicted speech segment，不删除 speech。结果：recall `0.9930` / start-weighted `0.9887` 保持不变，start p50/p90 `1.19s/3.51s`，duration p90/max `6.98s/22.28s`。但 naive cut-split 把 segment count `5435 -> 49008`，gap-crossing `3005 -> 6027`，说明 cut 信号有价值但不能无约束全切。
+- v1.22 当前结论：正确方向不是“再把 speech loss 拉高”或“直接 apply cut 删除音频”，而是 **cut-as-boundary constrained planner**：只对超过目标时长/跨大 gap 的高风险长段切，限制最小子段时长、最大目标时长、候选 cut run 数和 segment count 增幅；cut_drop 可优先切 regular gap，cut_point 只能切分贴连/换人边界。通过 synthetic gate 后再接匿名样片 A GPU 闭环。
+- v1.22c 匿名样片 A GPU 闭环已完成。脚本：`agents/temp/run_v1_22c_cut_boundary_sample_a_gpu.sh`；日志：`agents/temp/v1-22c-cutboundary-anon-a-gpu.run.log`；workflow：`agents/temp/fusionvad-ja/full-workflow-anon-a-v1-22c-cutboundary/`；diagnostics：`agents/temp/fusionvad-ja/diagnostics-anon-a-v1-22c-cutboundary/`；fallback-safe metrics：`agents/temp/fusionvad-ja/fallback-safe-boundary-metrics-anon-a-v1-22c-cutboundary/`。本次配置：v1.22c head，`speech=0.20`，`cut=0.50`，`--no-fusionvad-apply-cut-to-speech`，`ASR_PRE_ASR_CUT_SPLIT_ENABLED=1`，R18 risk split 作为二阶段 safety net。
+- v1.22c GPU 结果未过 gate：`chunks=236`，`segments=1018`，`forced=108`，`vad_coarse=108`，`fallback=120`，`vad_coarse_after_sentinel=108`，`unsafe=108`，fallback duration p90/max 仍是 `28.47s/28.47s`，总耗时 `1176.5s`。对比：R18 gap-first `chunks=250 / forced=109 / unsafe=114 / unsafe p90=28.47s`；R21 dropgap512-th080 `chunks=410 / forced=222 / unsafe=115 / unsafe p90=26.91s`。v1.22c 没有 chunk 数爆炸，但大量 fallback 仍是 28.47s single-island long chunk，说明当前 cut signal 对“连续长语音内部切点”不足。
+- v1.22c 结论修正：cut-as-boundary 思路在 synthetic/offline 上成立，但真实样片 A 的瓶颈已经从“多 island + gap 被合并”转向“单个 VAD-positive 连续长 island 缺可靠内部切点”。下一步不应把 v1.22c 直接替换默认，也不应继续只扫 `cut_threshold`；应改为训练/规划更强的连续长 island boundary objective，例如句级 endpoint/cutpoint teacher、ASR/aligner sentinel 反向 hard negative、候选切点 constrained RL 或更明确的 pause/energy/phoneme evidence。
+- 审计页刷新 bug：`agents/audits/fusionvad-ja/latest-audit.html` 原先使用 `meta refresh content=0` 自动跳转到最新审计页，live-server 打开后会反复刷新，影响人工审计。已移除自动跳转，改为静态入口链接；`rg` 未再发现 `http-equiv="refresh"` / `location.reload` / `window.location` 类自动刷新逻辑。
+- v1.23 才考虑 constrained RL：动作空间只允许在候选点上做 keep / split / drop-gap；reward 以 start 准、fallback chunk <= 8-9s、不跨长 gap、不漏完整 island、segment count 可控、ASR empty / hallucination / aligner sentinel 下降为准。
+
+v1.23 residual cut split 离线归因：
+
+- 目的：确认 v1.22c 的 28.47s unsafe fallback 是“模型没有切点信号”，还是“切点信号存在但 packing 策略没用上”。
+- 先提权 CUDA 导出匿名样片 A 的 v1.22c 逐帧分数：`agents/temp/fusionvad-ja/v1-23-anon-a-v1-22c-frame-scores.json`，`frame_count=269833`，`frame_hop=0.02s`，日志 `agents/temp/v1-23-export-frame-scores-anon-a-cuda.run.log`。
+- 用 `tools/fusionvad_ja/analyze_fallback_cut_signal.py` 分析 `fallback-safe-boundary-metrics-anon-a-v1-22c-cutboundary/unsafe_fallback_chunks.jsonl`：
+  - 20/20 unsafe 都是 `vad_coarse_after_sentinel`。
+  - 20/20 都是 `speech_island_count=1`、`internal_gap_count=0`、`split_reason=pre_asr_cut_split`。
+  - 20/20 都有 cut 候选；按 `target_child_s=9.0`，17/20 用离线贪心可切到目标内。
+  - 真实 `_plan_cut_split_frames_for_segment` 复算：20/20 都能找到 split frame，16/20 子段 max <= 9s。说明瓶颈不是 cut head 完全无信号。
+- 更细根因：v1.22c 先在超长连续段上跑 `pre_asr_cut_split`，但 `max_children=8` 被父段消耗后，仍留下 24.47s residual child；随后 R18 risk splitter 因为 single-island continuous risk score 只有 `1.5`，低于 `continuous_threshold=2.0`，没有继续切这些 residual child。
+- 代码补丁：`src/audio/chunk_packer.py` 在 risk split 阶段保留 chunk 的 `split_policy`，并给 “`r17_pre_asr_cut_v1` 产生后仍超过 target 的 single residual child” 增加 `residual_cut_child` 风险理由。单测 `test_pre_asr_risk_split_revisits_long_residual_cut_child` 覆盖：普通 long continuous chunk 仍受 `continuous_threshold=2.0` 保护，但 residual cut child 可继续切。
+- 新增工具：`tools/fusionvad_ja/analyze_residual_cut_split.py`，直接从已有 `processing_spans` 模拟 residual risk split；它比 `analyze_r18_risk_splits.py` 更贴近 v1.22c 的真实失败链路，因为后者会从 raw VAD segments 重新 pack。
+- residual 模拟结果：
+
+| config | target split | chunk growth | target max child p90 | target max child max | 结论 |
+|---|---:|---:|---:|---:|---|
+| target 14s / max children 4 | `20/20` | `2.347x` | `17.853s` | `17.909s` | 能切掉 unsafe，但 ASR 调用明显增加 |
+| target 9s / max children 8 | `20/20` | `3.653x` | `14.210s` | `17.442s` | 更接近 fallback-safe，但 chunk 爆炸风险更高 |
+
+- 当前结论：v1.22c 失败的下一层根因是 **cut 信号没有二次用于 residual long child**，不是完全无可切点。直接把 residual cut split 打开为默认会让全片 chunk 数约 `2.35-3.65x`，不适合默认。下一步应做 v1.23 受限策略：只对真实 `vad_coarse_after_sentinel` 高风险形态或接近 hard cap 的 residual child 应用，限制每个父 chunk 的新增 child 数、目标时长和全片 chunk growth，再跑匿名样片 A GPU 闭环。
+- 2026-06-03 路线修正：`chunk growth` 不再作为主要否决 gate，只保留为成本和极端爆炸观察指标。用户确认 90 分钟片子几百个 ASR chunk 是正常的；当前质量主 gate 改为 `start` 边界优先、`end` 边界次优先、fallback chunk 不能粗到 `20-30s`、ASR empty / hallucination 不能明显恶化、字幕观感不能变差。按 Netflix Timed Text Timing Guidelines，subtitle in-time 应尽量贴近第一帧音频，out-time 可在无冲突时略延后，并保留 2-frame gap；这支持“start 比 end 更关键，end 可由 subtitle polish 压缩”的工程取舍。
+- v1.23 执行口径：先跑 residual cut split 闭环，不再因为 chunk 数增加 `2.35-3.65x` 直接否决；只有出现极端爆炸、ASR empty/hallucination 明显恶化或字幕观感变差时才回退。验收重点是 unsafe fallback p90/max、`vad_coarse_after_sentinel`、start 边界、长 continuous residual 是否被切成更接近一句台词的 island。
+- speaker sidecar 路线：CAM++ 不替代 VAD，只作为 speaker-change 辅助；优先升级为 ERes2NetV2 / 3D-Speaker。流程是 FusionVAD / cutpoint 先给 speech island，再对相邻 island 提 speaker embedding，计算 cosine / speaker-change score；speaker-change 高时增强 cut、避免跨人合并，speaker 相似且 gap 极短时允许合并。它只影响 pre-align / cue-stage packing，不负责 speech/non-speech。
+- 参考依据：Netflix Timed Text Timing Guidelines <https://partnerhelp.netflixstudios.com/hc/en-us/articles/360051554394-Timed-Text-Style-Guide-Subtitle-Timing-Guidelines>；Two-pass Endpoint Detection <https://arxiv.org/abs/2401.08916>；Joint Segmenting and Decoding for Long-Form ASR <https://arxiv.org/abs/2204.10749>；Phoenix-VAD <https://arxiv.org/abs/2509.20410>；3D-Speaker <https://github.com/modelscope/3D-Speaker>；ERes2NetV2 <https://www.isca-archive.org/interspeech_2024/chen24l_interspeech.pdf>；CAM++ <https://arxiv.org/abs/2303.00332>。
+
+---
+
+## 已降级路线
+
+- `fusion_lite`：保留为 baseline / fallback 思路，不再是当前默认 VAD。
+- FSMN / Silero / TEN：保留为 teacher、baseline、hard-negative miner 或未来小模型蒸馏候选，不作为当前主切分路线。
+- F0 / gender：不再作为主线切分或翻译提示。原因是大 chunk 混合多 speech island 或男女交替时，F0/gender 会被稀释并引入噪声。
+- pyannote：强 baseline 可参考，但官方预训练 diarization 模型通常需要 HF token / 条款接受，不进默认依赖。
+- forced aligner finetune：暂不做。当前没有公开可复用的 Qwen3-ForcedAligner finetune recipe，也没有字/词级时间轴真值。
+
+---
+
+## 常见坑
+
+- Codex sandbox 可能隔离 GPU；全片 VAD/ASR/ForcedAligner、ONNXRuntime CUDA、Torch CUDA、feature cache 或训练需要提权，并确认 `actual_device=cuda` / `model_param_device=cuda:*` / `CUDAExecutionProvider`。
+- FusionVAD-JA 的 feature cache、训练、逐帧概率导出和全片 workflow 不再用 CPU 跑大规模任务；能 CUDA 就提权 CUDA。2026-06-02 曾用 CPU 导出 v1.21 drop_gap 逐帧概率，虽然跑完但效率差且产物已移入 `agents/rm/fusionvad-ja-cpu-dropgap-probabilities-20260602/`，后续重跑走 CUDA。
+- 联网默认受限；Hugging Face / ModelScope 下载、`uv pip`、`npm install`、`curl`、`git fetch`、外部搜索或 API 探测遇到网络错误时，先按“需要提权或代理环境”处理。
+- 长跑命令不要静默后台化后直接退出 shell；全片 workflow / 训练 / 大规模评测要么前台持有进程，要么在同一 shell 内循环 tail 日志并 `wait`。
+- WSL2 8GB RAM 下，大 batch feature cache 可能因主机内存被 kill 而没有 Python traceback。
+- Qwen 后端曾频繁输出 temperature / pad token warning；根因是 greedy generation 下 sampling-only 参数被忽略，以及底层 generation_config 缺 pad token。修复方向是在加载后归一化 generation_config，不改变 greedy 解码语义。
+
+---
+
+## 参考来源
+
+- WhisperJAV: <https://github.com/a63n/WhisperJAV>
+- FusionVAD: <https://arxiv.org/abs/2506.01365>
+- Whisper hallucination on non-speech: <https://arxiv.org/abs/2501.11378>
+- Dynamic Speech Endpoint Detection: <https://arxiv.org/abs/2210.14252>
+- Semantic VAD: <https://arxiv.org/abs/2305.12450>
+- WhisperX: <https://github.com/m-bain/whisperX>
+- stable-ts: <https://github.com/jianfch/stable-ts>
+- Qwen3-ASR: <https://github.com/QwenLM/Qwen3-ASR>
+- Qwen3-ASR finetuning: <https://github.com/QwenLM/Qwen3-ASR/tree/main/finetuning>
+- Qwen3-ASR-0.6B: <https://huggingface.co/Qwen/Qwen3-ASR-0.6B>
+- Qwen3-ASR-1.7B: <https://huggingface.co/Qwen/Qwen3-ASR-1.7B>
+- Qwen3-ForcedAligner-0.6B: <https://huggingface.co/Qwen/Qwen3-ForcedAligner-0.6B>
+- 本项目 Qwen3-ASR-0.6B SFT: <https://huggingface.co/jaykwok/Qwen3-ASR-0.6B-JA-Anime-Galgame>
+- 本项目 Qwen3-ASR-1.7B SFT: <https://huggingface.co/jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame>
+- AVA-Speech VAD: <https://huggingface.co/datasets/nccratliri/vad-human-ava-speech>
+- VoxConverse: <https://huggingface.co/datasets/diarizers-community/voxconverse>
+- MUSAN: <https://www.openslr.org/17/>
+- DNS Challenge: <https://github.com/microsoft/DNS-Challenge>
+- pyannote speaker diarization: <https://huggingface.co/pyannote/speaker-diarization-3.1>
+- 3D-Speaker: <https://github.com/modelscope/3D-Speaker>
+- WeSpeaker / CAM++: <https://github.com/wenet-e2e/wespeaker>
+- Reazon Japanese HuBERT: <https://huggingface.co/reazon-research/japanese-hubert-base-k2>
+- rinna Japanese HuBERT: <https://huggingface.co/rinna/japanese-hubert-base>
+- rinna Japanese wav2vec2: <https://huggingface.co/rinna/japanese-wav2vec2-base>

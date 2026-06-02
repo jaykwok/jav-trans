@@ -55,7 +55,12 @@ from vad.fusionvad_ja.manifest import (
     write_dry_run,
     write_training_manifest,
 )
-from vad.fusionvad_ja.model import AdditionFusionBiLSTM, AdditionFusionEndpointBiLSTM, count_trainable_parameters
+from vad.fusionvad_ja.model import (
+    AdditionFusionBiLSTM,
+    AdditionFusionEndpointBiLSTM,
+    AdditionFusionImitationBiLSTM,
+    count_trainable_parameters,
+)
 from vad.fusionvad_ja.research_backends import (
     TimestampSpanVadBackend,
     get_research_vad_backend,
@@ -64,6 +69,7 @@ from vad.fusionvad_ja.train import (
     EvalMetrics,
     EndpointRefinerTrainConfig,
     FeatureTrainConfig,
+    ImitationTrainConfig,
     TrainConfig,
     TrainMetrics,
     build_endpoint_feature_windows,
@@ -78,12 +84,14 @@ from vad.fusionvad_ja.train import (
     shuffled_window_order,
     train_addition_fusion_classifier,
     train_endpoint_refiner_classifier,
+    train_imitation_classifier,
     train_tiny_frame_classifier,
 )
 
 __all__ = [
     "AdditionFusionBiLSTM",
     "AdditionFusionEndpointBiLSTM",
+    "AdditionFusionImitationBiLSTM",
     "align_feature_frames",
     "AudioAudit",
     "CachedFeature",
@@ -119,6 +127,7 @@ __all__ = [
     "endpoint_targets_from_record",
     "FeatureConfig",
     "FeatureTrainConfig",
+    "ImitationTrainConfig",
     "frame_classification_counts",
     "frame_count",
     "get_research_vad_backend",
@@ -148,6 +157,7 @@ __all__ = [
     "shuffled_window_order",
     "train_addition_fusion_classifier",
     "train_endpoint_refiner_classifier",
+    "train_imitation_classifier",
     "train_tiny_frame_classifier",
     "write_dry_run",
     "write_feature_cache",

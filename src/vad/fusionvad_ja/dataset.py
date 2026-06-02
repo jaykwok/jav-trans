@@ -28,6 +28,7 @@ class LabelRecord:
     speech_frames: list[int]
     label_quality: str
     frame_weights: list[float] | None = None
+    boundary_metadata: dict[str, Any] | None = None
 
 
 DEFAULT_TRAINABLE_LABEL_QUALITIES = frozenset({"supervised", "teacher_agree", "negative"})
@@ -317,6 +318,7 @@ def with_frame_weights(
         speech_frames=record.speech_frames,
         label_quality=record.label_quality,
         frame_weights=weights,
+        boundary_metadata=record.boundary_metadata,
     )
 
 
@@ -444,6 +446,8 @@ def label_record_to_dict(record: LabelRecord) -> dict[str, Any]:
     }
     if record.frame_weights is None:
         payload.pop("frame_weights", None)
+    if record.boundary_metadata is None:
+        payload.pop("boundary_metadata", None)
     return payload
 
 
@@ -472,6 +476,11 @@ def label_record_from_dict(payload: Mapping[str, Any]) -> LabelRecord:
             None
             if payload.get("frame_weights") is None
             else [float(value) for value in list(payload.get("frame_weights") or [])]
+        ),
+        boundary_metadata=(
+            None
+            if payload.get("boundary_metadata") is None
+            else dict(payload.get("boundary_metadata") or {})
         ),
     )
 

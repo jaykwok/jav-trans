@@ -112,6 +112,56 @@ def _chunk_config() -> dict:
         "pre_asr_cut_split_threshold": _env_float(
             "ASR_PRE_ASR_CUT_SPLIT_THRESHOLD", "0.94"
         ),
+        "pre_asr_drop_gap_split_enabled": _env_bool("ASR_PRE_ASR_DROP_GAP_SPLIT_ENABLED", "0"),
+        "pre_asr_drop_gap_split_min_parent_frames": _env_int(
+            "ASR_PRE_ASR_DROP_GAP_SPLIT_MIN_PARENT_FRAMES", "400"
+        ),
+        "pre_asr_drop_gap_split_min_gap_frames": _env_int(
+            "ASR_PRE_ASR_DROP_GAP_SPLIT_MIN_GAP_FRAMES", "3"
+        ),
+        "pre_asr_drop_gap_split_min_gap_s": _env_float(
+            "ASR_PRE_ASR_DROP_GAP_SPLIT_MIN_GAP_S", "0.60"
+        ),
+        "pre_asr_drop_gap_split_min_child_frames": _env_int(
+            "ASR_PRE_ASR_DROP_GAP_SPLIT_MIN_CHILD_FRAMES", "25"
+        ),
+        "pre_asr_drop_gap_split_max_children": _env_int(
+            "ASR_PRE_ASR_DROP_GAP_SPLIT_MAX_CHILDREN", "8"
+        ),
+        "pre_asr_drop_gap_split_threshold": _env_float(
+            "ASR_PRE_ASR_DROP_GAP_SPLIT_THRESHOLD", "0.80"
+        ),
+        "pre_asr_risk_split_enabled": _env_bool("ASR_PRE_ASR_RISK_SPLIT_ENABLED", "0"),
+        "pre_asr_risk_split_min_core_frames": _env_int(
+            "ASR_PRE_ASR_RISK_SPLIT_MIN_CORE_FRAMES", "420"
+        ),
+        "pre_asr_risk_split_target_core_frames": _env_int(
+            "ASR_PRE_ASR_RISK_SPLIT_TARGET_CORE_FRAMES", "270"
+        ),
+        "pre_asr_risk_split_safe_core_frames": _env_int(
+            "ASR_PRE_ASR_RISK_SPLIT_SAFE_CORE_FRAMES", "360"
+        ),
+        "pre_asr_risk_split_min_gap_frames": _env_int(
+            "ASR_PRE_ASR_RISK_SPLIT_MIN_GAP_FRAMES", "6"
+        ),
+        "pre_asr_risk_split_min_child_frames": _env_int(
+            "ASR_PRE_ASR_RISK_SPLIT_MIN_CHILD_FRAMES", "45"
+        ),
+        "pre_asr_risk_split_max_children": _env_int(
+            "ASR_PRE_ASR_RISK_SPLIT_MAX_CHILDREN", "8"
+        ),
+        "pre_asr_risk_split_threshold": _env_float(
+            "ASR_PRE_ASR_RISK_SPLIT_THRESHOLD", "1.0"
+        ),
+        "pre_asr_risk_split_continuous_threshold": _env_float(
+            "ASR_PRE_ASR_RISK_SPLIT_CONTINUOUS_THRESHOLD", "2.0"
+        ),
+        "pre_asr_risk_split_valley_threshold": _env_float(
+            "ASR_PRE_ASR_RISK_SPLIT_VALLEY_THRESHOLD", "0.20"
+        ),
+        "pre_asr_risk_split_cut_threshold": _env_float(
+            "ASR_PRE_ASR_RISK_SPLIT_CUT_THRESHOLD", "0.94"
+        ),
         "drop_enabled": _env_bool("ASR_CHUNK_DROP_ENABLED", "0"),
         "drop_min_duration_s": _env_float("ASR_CHUNK_DROP_MIN_DURATION_S", "0.20"),
         "drop_rms_dbfs": _env_float("ASR_CHUNK_DROP_RMS_DBFS", "-40.0"),
@@ -365,11 +415,12 @@ def _build_processing_spans(
         allow_empty_vad = bool(result.parameters.get("allow_empty"))
         frame_scores = result.parameters.get("frame_scores")
         cut_frame_scores = result.parameters.get("cut_frame_scores")
+        drop_gap_frame_scores = result.parameters.get("drop_gap_frame_scores")
         score_frame_hop_s = result.parameters.get("frame_hop_s")
         result_parameters = {
             key: value
             for key, value in result.parameters.items()
-            if key not in {"frame_scores", "cut_frame_scores"}
+            if key not in {"frame_scores", "cut_frame_scores", "drop_gap_frame_scores"}
         }
         runtime_vad_signature = {
             **result_parameters,
@@ -415,6 +466,42 @@ def _build_processing_spans(
                     "min_child_frames": cfg["pre_asr_cut_split_min_child_frames"],
                     "max_children": cfg["pre_asr_cut_split_max_children"],
                     "threshold": cfg["pre_asr_cut_split_threshold"],
+                },
+                "pre_asr_drop_gap_split": {
+                    "enabled": cfg["pre_asr_drop_gap_split_enabled"],
+                    "policy": "r21_pre_asr_drop_gap_v1",
+                    "min_parent_frames": cfg[
+                        "pre_asr_drop_gap_split_min_parent_frames"
+                    ],
+                    "min_gap_frames": cfg[
+                        "pre_asr_drop_gap_split_min_gap_frames"
+                    ],
+                    "min_gap_s": cfg["pre_asr_drop_gap_split_min_gap_s"],
+                    "min_child_frames": cfg[
+                        "pre_asr_drop_gap_split_min_child_frames"
+                    ],
+                    "max_children": cfg["pre_asr_drop_gap_split_max_children"],
+                    "threshold": cfg["pre_asr_drop_gap_split_threshold"],
+                },
+                "pre_asr_risk_split": {
+                    "enabled": cfg["pre_asr_risk_split_enabled"],
+                    "policy": "r18_pre_asr_risk_v1",
+                    "min_core_frames": cfg["pre_asr_risk_split_min_core_frames"],
+                    "target_core_frames": cfg[
+                        "pre_asr_risk_split_target_core_frames"
+                    ],
+                    "safe_core_frames": cfg["pre_asr_risk_split_safe_core_frames"],
+                    "min_gap_frames": cfg["pre_asr_risk_split_min_gap_frames"],
+                    "min_child_frames": cfg["pre_asr_risk_split_min_child_frames"],
+                    "max_children": cfg["pre_asr_risk_split_max_children"],
+                    "risk_threshold": cfg["pre_asr_risk_split_threshold"],
+                    "continuous_threshold": cfg[
+                        "pre_asr_risk_split_continuous_threshold"
+                    ],
+                    "valley_threshold": cfg[
+                        "pre_asr_risk_split_valley_threshold"
+                    ],
+                    "cut_threshold": cfg["pre_asr_risk_split_cut_threshold"],
                 },
             },
         }
@@ -517,6 +604,55 @@ def _build_processing_spans(
             ],
             pre_asr_cut_split_threshold=cfg["pre_asr_cut_split_threshold"],
             cut_frame_scores=cut_frame_scores,
+            pre_asr_drop_gap_split_enabled=cfg["pre_asr_drop_gap_split_enabled"],
+            pre_asr_drop_gap_split_min_parent_frames=cfg[
+                "pre_asr_drop_gap_split_min_parent_frames"
+            ],
+            pre_asr_drop_gap_split_min_gap_frames=cfg[
+                "pre_asr_drop_gap_split_min_gap_frames"
+            ],
+            pre_asr_drop_gap_split_min_gap_s=cfg[
+                "pre_asr_drop_gap_split_min_gap_s"
+            ],
+            pre_asr_drop_gap_split_min_child_frames=cfg[
+                "pre_asr_drop_gap_split_min_child_frames"
+            ],
+            pre_asr_drop_gap_split_max_children=cfg[
+                "pre_asr_drop_gap_split_max_children"
+            ],
+            pre_asr_drop_gap_split_threshold=cfg[
+                "pre_asr_drop_gap_split_threshold"
+            ],
+            drop_gap_frame_scores=drop_gap_frame_scores,
+            pre_asr_risk_split_enabled=cfg["pre_asr_risk_split_enabled"],
+            pre_asr_risk_split_min_core_frames=cfg[
+                "pre_asr_risk_split_min_core_frames"
+            ],
+            pre_asr_risk_split_target_core_frames=cfg[
+                "pre_asr_risk_split_target_core_frames"
+            ],
+            pre_asr_risk_split_safe_core_frames=cfg[
+                "pre_asr_risk_split_safe_core_frames"
+            ],
+            pre_asr_risk_split_min_gap_frames=cfg[
+                "pre_asr_risk_split_min_gap_frames"
+            ],
+            pre_asr_risk_split_min_child_frames=cfg[
+                "pre_asr_risk_split_min_child_frames"
+            ],
+            pre_asr_risk_split_max_children=cfg[
+                "pre_asr_risk_split_max_children"
+            ],
+            pre_asr_risk_split_threshold=cfg["pre_asr_risk_split_threshold"],
+            pre_asr_risk_split_continuous_threshold=cfg[
+                "pre_asr_risk_split_continuous_threshold"
+            ],
+            pre_asr_risk_split_valley_threshold=cfg[
+                "pre_asr_risk_split_valley_threshold"
+            ],
+            pre_asr_risk_split_cut_threshold=cfg[
+                "pre_asr_risk_split_cut_threshold"
+            ],
         )
         event = _vad_chunk_cache_module.save_processing_spans(
             audio_path,
@@ -541,7 +677,7 @@ def _build_processing_spans(
     runtime_vad_signature = {
         key: value
         for key, value in result.parameters.items()
-        if key not in {"frame_scores", "cut_frame_scores"}
+        if key not in {"frame_scores", "cut_frame_scores", "drop_gap_frame_scores"}
     }
     spans = [(group[0].start, group[-1].end) for group in result.groups]
     _set_last_vad_signature(runtime_vad_signature)
@@ -613,11 +749,18 @@ def _annotate_packed_chunks(
         chunk["vad_valley_score_min"] = packed.valley_score_min
         chunk["vad_cut_split_count"] = packed.cut_split_count
         chunk["vad_cut_score_max"] = packed.cut_score_max
+        chunk["vad_drop_gap_split_count"] = packed.drop_gap_split_count
+        chunk["vad_drop_gap_score_max"] = packed.drop_gap_score_max
+        chunk["vad_risk_split_count"] = packed.risk_split_count
+        chunk["vad_risk_score"] = packed.risk_score
+        chunk["vad_risk_reasons"] = list(packed.risk_reasons)
         log.append(
             "[chunk] idx={idx} dur={duration:.1f} vad_seg_count={count} "
             "pad=({left:.2f},{right:.2f}) reason={reason} "
             "parent={parent} island={island}/{islands} gap_max={gap:.2f} "
-            "valley_splits={valley_splits} cut_splits={cut_splits}".format(
+            "valley_splits={valley_splits} cut_splits={cut_splits} "
+            "drop_gap_splits={drop_gap_splits} risk_splits={risk_splits} "
+            "risk={risk_score}".format(
                 idx=idx,
                 duration=packed.duration,
                 count=len(packed.vad_segments),
@@ -630,6 +773,9 @@ def _annotate_packed_chunks(
                 gap=packed.internal_gap_max_s,
                 valley_splits=packed.valley_split_count,
                 cut_splits=packed.cut_split_count,
+                drop_gap_splits=packed.drop_gap_split_count,
+                risk_splits=packed.risk_split_count,
+                risk_score=packed.risk_score,
             )
         )
 

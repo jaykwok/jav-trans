@@ -19,16 +19,22 @@ from vad.fusionvad_ja.features import (
     is_low_frame_rate_ptm,
 )
 from vad.fusionvad_ja.model import AdditionFusionBiLSTM, AdditionFusionEndpointBiLSTM
+from vad.fusionvad_ja.model import AdditionFusionImitationBiLSTM
 from vad.whisperseg.postprocess import group_segments
 
 
 DEFAULT_CHECKPOINT = str(
     Path(__file__).resolve().parent
     / "checkpoints"
-    / "fusionvad_ja_v1_17_endpoint_refiner.pt"
+    / "fusionvad_ja_v1_19b_splitcut_touch4096_endpoint_refiner.pt"
+)
+DEFAULT_IMITATION_CHECKPOINT = (
+    "datasets/train/fusionvad-ja/v1-21/qwen3-asr-0.6b-full29239/"
+    "imitation-head-dropgaponly-poswin128-balanced-resizedtarget-batch8-lr2e-4-steps512/"
+    "fusionvad_ja_imitation_head.pt"
 )
 DEFAULT_MODEL_PATH = "models/jaykwok-Qwen3-ASR-0.6B-JA-Anime-Galgame"
-DEFAULT_OPERATING_POINT = "v1.17-endpoint-refiner-boundary32768-speech0.020-cut0.960-pad0.2"
+DEFAULT_OPERATING_POINT = "v1.19b-splitcut-touch4096-speech0.200-cut0.500-pad0.2"
 
 
 def _env_float(name: str, default: str) -> float:
@@ -96,6 +102,27 @@ def _load_addition_model(checkpoint_path: Path, *, device):
     model.load_state_dict(checkpoint["model_state_dict"])
     model.eval()
     return model, checkpoint, config, model_type
+
+
+def _load_imitation_model(checkpoint_path: Path, *, device):
+    import torch
+
+    checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
+    config = dict(checkpoint.get("config") or {})
+    model_type = str(checkpoint.get("model_type") or "")
+    if model_type and model_type != "addition_imitation_bilstm":
+        raise ValueError(f"unsupported FusionVAD-JA imitation checkpoint model_type={model_type!r}")
+    model = AdditionFusionImitationBiLSTM(
+        whisper_dim=int(checkpoint["whisper_dim"]),
+        mfcc_dim=int(checkpoint["mfcc_dim"]),
+        fusion_dim=int(config.get("fusion_dim", 256)),
+        hidden_dim=int(config.get("hidden_dim", 192)),
+        layers=int(config.get("layers", 2)),
+        dropout=float(config.get("dropout", 0.1)),
+    ).to(device)
+    model.load_state_dict(checkpoint["model_state_dict"])
+    model.eval()
+    return model, checkpoint, config, model_type or "addition_imitation_bilstm"
 
 
 def _sigmoid_outputs(logits):
@@ -214,7 +241,7 @@ def merge_segments(
 @dataclass(frozen=True)
 class FusionVadJaConfig:
     checkpoint: Path
-    threshold: float = 0.020
+    threshold: float = 0.200
     pad_s: float = 0.2
     frame_hop_s: float = 0.02
     ptm: str = "qwen3-asr-0.6b"
@@ -228,8 +255,9 @@ class FusionVadJaConfig:
     merge_gap_s: float = 0.0
     max_group_s: float = 6.0
     chunk_threshold_s: float = 1.0
-    cut_threshold: float = 0.960
+    cut_threshold: float = 0.500
     apply_cut_to_speech: bool = True
+    imitation_checkpoint: Path = Path(DEFAULT_IMITATION_CHECKPOINT)
     no_download: bool = False
 
     @classmethod
@@ -239,7 +267,7 @@ class FusionVadJaConfig:
                 os.getenv("FUSIONVAD_JA_CHECKPOINT", DEFAULT_CHECKPOINT).strip()
                 or DEFAULT_CHECKPOINT
             ),
-            threshold=_env_float("FUSIONVAD_JA_THRESHOLD", "0.020"),
+            threshold=_env_float("FUSIONVAD_JA_THRESHOLD", "0.200"),
             pad_s=_env_float("FUSIONVAD_JA_PAD_S", "0.2"),
             frame_hop_s=_env_float("FUSIONVAD_JA_FRAME_HOP_S", "0.02"),
             ptm=os.getenv("FUSIONVAD_JA_PTM", "qwen3-asr-0.6b").strip()
@@ -254,14 +282,18 @@ class FusionVadJaConfig:
             merge_gap_s=_env_float("FUSIONVAD_JA_MERGE_GAP_S", "0.0"),
             max_group_s=_env_float("FUSIONVAD_JA_MAX_GROUP_S", "6.0"),
             chunk_threshold_s=_env_float("FUSIONVAD_JA_CHUNK_THRESHOLD_S", "1.0"),
-            cut_threshold=_env_float("FUSIONVAD_JA_CUT_THRESHOLD", "0.960"),
+            cut_threshold=_env_float("FUSIONVAD_JA_CUT_THRESHOLD", "0.500"),
             apply_cut_to_speech=_env_bool("FUSIONVAD_JA_APPLY_CUT_TO_SPEECH", "1"),
+            imitation_checkpoint=_resolve_project_path(
+                os.getenv("FUSIONVAD_JA_IMITATION_CHECKPOINT", DEFAULT_IMITATION_CHECKPOINT).strip()
+                or DEFAULT_IMITATION_CHECKPOINT
+            ),
             no_download=_env_bool("FUSIONVAD_JA_NO_DOWNLOAD", "0"),
         )
 
 
 class FusionVadJaBackend:
-    name = "fusionvad_ja_v1_17_endpoint_refiner"
+    name = "fusionvad_ja_v1_19b_splitcut_endpoint_refiner"
 
     def __init__(self, config: FusionVadJaConfig | None = None) -> None:
         self.config = config or FusionVadJaConfig.from_env()
@@ -287,6 +319,7 @@ class FusionVadJaBackend:
             "chunk_threshold_s": float(cfg.chunk_threshold_s),
             "cut_threshold": float(cfg.cut_threshold),
             "apply_cut_to_speech": bool(cfg.apply_cut_to_speech),
+            "imitation_checkpoint": str(cfg.imitation_checkpoint),
             "operating_point": DEFAULT_OPERATING_POINT,
             "allow_empty": True,
         }
@@ -303,6 +336,13 @@ class FusionVadJaBackend:
         cfg = self.config
         if not cfg.checkpoint.exists():
             raise FileNotFoundError(f"FusionVAD-JA checkpoint not found: {cfg.checkpoint}")
+        need_drop_gap_scores = _env_bool("FUSIONVAD_JA_EXPORT_DROP_GAP_SCORES", "0") or _env_bool(
+            "ASR_PRE_ASR_DROP_GAP_SPLIT_ENABLED", "0"
+        )
+        if need_drop_gap_scores and not cfg.imitation_checkpoint.exists():
+            raise FileNotFoundError(
+                f"FusionVAD-JA imitation checkpoint not found: {cfg.imitation_checkpoint}"
+            )
         if cfg.window_s <= 0.0:
             raise ValueError("FUSIONVAD_JA_WINDOW_S must be positive")
         if cfg.overlap_s < 0.0:
@@ -326,10 +366,24 @@ class FusionVadJaBackend:
             attention=cfg.attention,
             language="Japanese",
         )
+        imitation_model = None
+        imitation_checkpoint = None
+        imitation_model_config: dict | None = None
+        imitation_model_type: str | None = None
         addition_model, checkpoint, model_config, model_type = _load_addition_model(
             cfg.checkpoint,
             device=device,
         )
+        if need_drop_gap_scores:
+            (
+                imitation_model,
+                imitation_checkpoint,
+                imitation_model_config,
+                imitation_model_type,
+            ) = _load_imitation_model(
+                cfg.imitation_checkpoint,
+                device=device,
+            )
         ptm_extractor = build_ptm_feature_extractor(feature_config)
         ptm_param_device, ptm_param_dtype = _first_parameter_device_dtype(
             getattr(ptm_extractor, "model", None)
@@ -363,6 +417,8 @@ class FusionVadJaBackend:
             probability_count = np.zeros(total_frames, dtype=np.float32)
             cut_probability_sum = np.zeros(total_frames, dtype=np.float64)
             cut_probability_count = np.zeros(total_frames, dtype=np.float32)
+            drop_gap_probability_sum = np.zeros(total_frames, dtype=np.float64)
+            drop_gap_probability_count = np.zeros(total_frames, dtype=np.float32)
             window_samples = max(1, int(round(cfg.window_s * sample_rate)))
             stride_samples = max(1, int(round((cfg.window_s - cfg.overlap_s) * sample_rate)))
             starts = list(range(0, max(1, len(audio)), stride_samples))
@@ -393,6 +449,20 @@ class FusionVadJaBackend:
                     output_probs = _sigmoid_outputs(logits)
                     probs = output_probs["speech"]
                     cut_probs = output_probs.get("cut")
+                    if cut_probs is None:
+                        cut_drop_probs = output_probs.get("cut_drop")
+                        cut_point_probs = output_probs.get("cut_point")
+                        if cut_drop_probs is not None and cut_point_probs is not None:
+                            cut_probs = np.maximum(cut_drop_probs, cut_point_probs)
+                        elif cut_drop_probs is not None:
+                            cut_probs = cut_drop_probs
+                        elif cut_point_probs is not None:
+                            cut_probs = cut_point_probs
+                    drop_gap_probs = None
+                    if imitation_model is not None:
+                        imitation_logits = imitation_model(whisper_tensor, mfcc_tensor)
+                        imitation_probs = _sigmoid_outputs(imitation_logits)
+                        drop_gap_probs = imitation_probs.get("drop_gap")
                     window_start_s = start_sample / sample_rate
                     global_start = max(0, int(round(window_start_s / cfg.frame_hop_s)))
                     global_end = min(total_frames, global_start + probs.size)
@@ -407,6 +477,14 @@ class FusionVadJaBackend:
                             :cut_local_end
                         ]
                         cut_probability_count[global_start : global_start + cut_local_end] += 1.0
+                    if drop_gap_probs is not None:
+                        drop_gap_local_end = min(local_end, drop_gap_probs.size)
+                        drop_gap_probability_sum[
+                            global_start : global_start + drop_gap_local_end
+                        ] += drop_gap_probs[:drop_gap_local_end]
+                        drop_gap_probability_count[
+                            global_start : global_start + drop_gap_local_end
+                        ] += 1.0
                     print(
                         "[vad] fusionvad_ja window "
                         f"{window_index + 1}/{len(starts)} start={window_start_s:.1f}s "
@@ -427,6 +505,14 @@ class FusionVadJaBackend:
                     np.maximum(cut_probability_count, 1.0),
                     out=np.zeros_like(cut_probability_sum, dtype=np.float64),
                     where=cut_probability_count > 0,
+                ).astype(np.float32)
+            drop_gap_probabilities: np.ndarray | None = None
+            if np.any(drop_gap_probability_count > 0):
+                drop_gap_probabilities = np.divide(
+                    drop_gap_probability_sum,
+                    np.maximum(drop_gap_probability_count, 1.0),
+                    out=np.zeros_like(drop_gap_probability_sum, dtype=np.float64),
+                    where=drop_gap_probability_count > 0,
                 ).astype(np.float32)
             effective_probabilities = _apply_cut_gate(
                 probabilities,
@@ -477,6 +563,16 @@ class FusionVadJaBackend:
                         "cut_probability_max": (
                             float(cut_probabilities.max()) if cut_probabilities is not None and cut_probabilities.size else 0.0
                         ),
+                        "drop_gap_probability_mean": (
+                            float(drop_gap_probabilities.mean())
+                            if drop_gap_probabilities is not None and drop_gap_probabilities.size
+                            else 0.0
+                        ),
+                        "drop_gap_probability_max": (
+                            float(drop_gap_probabilities.max())
+                            if drop_gap_probabilities is not None and drop_gap_probabilities.size
+                            else 0.0
+                        ),
                         "raw_speech_ratio": float(raw_frames.mean()) if raw_frames.size else 0.0,
                         "padded_speech_ratio": float(padded.mean()) if padded.size else 0.0,
                         "uncovered_frame_ratio": float((probability_count <= 0).mean())
@@ -486,6 +582,11 @@ class FusionVadJaBackend:
                     "checkpoint_config": model_config,
                     "checkpoint_model_type": model_type,
                     "checkpoint_ptm": checkpoint.get("ptm"),
+                    "imitation_checkpoint_config": imitation_model_config,
+                    "imitation_checkpoint_model_type": imitation_model_type,
+                    "imitation_checkpoint_ptm": (
+                        imitation_checkpoint.get("ptm") if imitation_checkpoint is not None else None
+                    ),
                     "runtime_device": runtime_device,
                 }
             )
@@ -493,10 +594,16 @@ class FusionVadJaBackend:
                 "ASR_PRE_ASR_VALLEY_SPLIT_ENABLED", "0"
             ) or _env_bool(
                 "ASR_PRE_ASR_CUT_SPLIT_ENABLED", "0"
+            ) or _env_bool(
+                "ASR_PRE_ASR_DROP_GAP_SPLIT_ENABLED", "0"
             ):
                 params["frame_scores"] = [float(value) for value in probabilities]
                 if cut_probabilities is not None:
                     params["cut_frame_scores"] = [float(value) for value in cut_probabilities]
+                if drop_gap_probabilities is not None:
+                    params["drop_gap_frame_scores"] = [
+                        float(value) for value in drop_gap_probabilities
+                    ]
             return SegmentationResult(
                 segments=segments,
                 groups=groups,
@@ -510,5 +617,7 @@ class FusionVadJaBackend:
             if callable(close):
                 close()
             del addition_model
+            if imitation_model is not None:
+                del imitation_model
             if device.type == "cuda":
                 torch.cuda.empty_cache()

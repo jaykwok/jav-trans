@@ -184,6 +184,28 @@ DEFAULT_SETTINGS: dict[str, str] = {
     "ASR_PRE_ASR_CUT_SPLIT_MAX_CHILDREN": "8",
     # FusionVAD endpoint-refiner cut threshold used by pre-ASR boundary packing.
     "ASR_PRE_ASR_CUT_SPLIT_THRESHOLD": "0.94",
+    # R18 opt-in: fallback-risk-aware pre-ASR boundary packing.
+    "ASR_PRE_ASR_RISK_SPLIT_ENABLED": "0",
+    # Only packed chunks whose core is at least this many frames are considered.
+    "ASR_PRE_ASR_RISK_SPLIT_MIN_CORE_FRAMES": "420",
+    # Target child core length after risk-aware packing, in frames.
+    "ASR_PRE_ASR_RISK_SPLIT_TARGET_CORE_FRAMES": "270",
+    # Duration above this frame count contributes unsafe-fallback risk.
+    "ASR_PRE_ASR_RISK_SPLIT_SAFE_CORE_FRAMES": "360",
+    # Internal gap that counts as a strong split candidate.
+    "ASR_PRE_ASR_RISK_SPLIT_MIN_GAP_FRAMES": "6",
+    # Minimum child length around a risk-aware split.
+    "ASR_PRE_ASR_RISK_SPLIT_MIN_CHILD_FRAMES": "45",
+    # Safety cap on child chunks created from one packed chunk.
+    "ASR_PRE_ASR_RISK_SPLIT_MAX_CHILDREN": "8",
+    # Risk score needed before the R18 splitter acts.
+    "ASR_PRE_ASR_RISK_SPLIT_THRESHOLD": "1.0",
+    # Higher risk score required before cutting continuous chunks without gaps.
+    "ASR_PRE_ASR_RISK_SPLIT_CONTINUOUS_THRESHOLD": "2.0",
+    # Optional low frame-score valley threshold for continuous chunks.
+    "ASR_PRE_ASR_RISK_SPLIT_VALLEY_THRESHOLD": "0.20",
+    # Optional high endpoint-refiner cut threshold for continuous chunks.
+    "ASR_PRE_ASR_RISK_SPLIT_CUT_THRESHOLD": "0.94",
     # 1 stores FusionVAD frame scores in the VAD cache for R16 diagnostics.
     "FUSIONVAD_JA_EXPORT_FRAME_SCORES": "0",
     # 1 enables dropping very short low-energy spans before ASR (opt-in).

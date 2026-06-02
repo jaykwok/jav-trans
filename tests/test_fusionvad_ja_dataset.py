@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+
 import numpy as np
 import pytest
 
@@ -7,10 +9,12 @@ from vad.base import SpeechSegment
 from vad.fusionvad_ja import (
     AdditionFusionBiLSTM,
     AdditionFusionEndpointBiLSTM,
+    AdditionFusionImitationBiLSTM,
     DEFAULT_TRAINABLE_LABEL_QUALITIES,
     EndpointRefinerTrainConfig,
     FeatureConfig,
     FeatureTrainConfig,
+    ImitationTrainConfig,
     TeacherSegment,
     TimestampSpanVadBackend,
     TrainConfig,
@@ -50,11 +54,13 @@ from vad.fusionvad_ja import (
     stable_hf_audio_id,
     train_addition_fusion_classifier,
     train_endpoint_refiner_classifier,
+    train_imitation_classifier,
     with_frame_weights,
     write_jsonl,
     train_tiny_frame_classifier,
     write_training_manifest,
 )
+from vad.fusionvad_ja.train import build_lazy_imitation_feature_windows
 
 
 def test_pseudo_label_discovers_supported_inputs(tmp_path):
@@ -708,10 +714,10 @@ def test_fusionvad_ja_default_checkpoint_is_bundled_for_distribution():
 
     checkpoint = Path(DEFAULT_CHECKPOINT)
     assert checkpoint.exists()
-    assert checkpoint.name == "fusionvad_ja_v1_17_endpoint_refiner.pt"
+    assert checkpoint.name == "fusionvad_ja_v1_19b_splitcut_touch4096_endpoint_refiner.pt"
     assert "src/vad/fusionvad_ja/checkpoints" in checkpoint.as_posix()
     assert "datasets/" not in checkpoint.as_posix()
-    assert DEFAULT_OPERATING_POINT.startswith("v1.17-endpoint-refiner-boundary32768")
+    assert DEFAULT_OPERATING_POINT.startswith("v1.19b-splitcut-touch4096")
     assert DEFAULT_MODEL_PATH == "models/jaykwok-Qwen3-ASR-0.6B-JA-Anime-Galgame"
 
 
@@ -727,7 +733,7 @@ def test_qwen3_asr_feature_head_can_stay_under_budget():
     assert count_trainable_parameters(model) < 2_000_000
 
 
-def test_endpoint_refiner_head_outputs_speech_boundaries_and_cut():
+def test_endpoint_refiner_head_outputs_speech_boundaries_and_split_cut_targets():
     torch = __import__("torch")
     model = AdditionFusionEndpointBiLSTM(
         whisper_dim=8,
@@ -739,9 +745,29 @@ def test_endpoint_refiner_head_outputs_speech_boundaries_and_cut():
 
     outputs = model(torch.ones(2, 5, 8), torch.ones(2, 5, 4))
 
-    assert set(outputs) == {"speech", "start", "end", "cut"}
+    assert set(outputs) == {"speech", "start", "end", "cut_drop", "cut_point"}
     assert outputs["speech"].shape == (2, 5)
     assert outputs["start"].shape == (2, 5)
+    assert outputs["cut_drop"].shape == (2, 5)
+    assert outputs["cut_point"].shape == (2, 5)
+    assert count_trainable_parameters(model) < 10_000
+
+
+def test_imitation_head_outputs_split_and_drop_gap_targets():
+    torch = __import__("torch")
+    model = AdditionFusionImitationBiLSTM(
+        whisper_dim=8,
+        mfcc_dim=4,
+        fusion_dim=8,
+        hidden_dim=4,
+        layers=1,
+    )
+
+    outputs = model(torch.ones(2, 5, 8), torch.ones(2, 5, 4))
+
+    assert set(outputs) == {"split", "drop_gap"}
+    assert outputs["split"].shape == (2, 5)
+    assert outputs["drop_gap"].shape == (2, 5)
     assert count_trainable_parameters(model) < 10_000
 
 
@@ -754,7 +780,7 @@ def test_endpoint_targets_mark_starts_ends_and_long_internal_gap():
         frame_hop_s=0.1,
     )
 
-    starts, ends, cuts = endpoint_targets_from_record(
+    starts, ends, cut_drops, cut_points = endpoint_targets_from_record(
         record,
         frame_count=10,
         boundary_radius_frames=0,
@@ -763,7 +789,73 @@ def test_endpoint_targets_mark_starts_ends_and_long_internal_gap():
 
     assert starts.tolist() == [0, 0, 1, 0, 0, 0, 0, 0, 1, 0]
     assert ends.tolist() == [0, 0, 0, 1, 0, 0, 0, 0, 1, 0]
-    assert cuts.tolist() == [0, 0, 0, 0, 1, 1, 1, 1, 0, 0]
+    assert cut_drops.tolist() == [0, 0, 0, 0, 1, 1, 1, 1, 0, 0]
+    assert cut_points.tolist() == [0] * 10
+
+
+def test_endpoint_targets_can_mark_short_gap_boundaries_as_cut():
+    record = build_supervised_record(
+        audio_id="clip",
+        source="unit",
+        duration_s=1.0,
+        speech_segments=[(0.2, 0.4), (0.5, 0.7)],
+        frame_hop_s=0.1,
+    )
+
+    _starts, _ends, legacy_cut_drops, legacy_cut_points = endpoint_targets_from_record(
+        record,
+        frame_count=10,
+        boundary_radius_frames=0,
+        cut_min_gap_s=0.2,
+    )
+    _starts, _ends, boundary_cut_drops, boundary_cut_points = endpoint_targets_from_record(
+        record,
+        frame_count=10,
+        boundary_radius_frames=0,
+        cut_min_gap_s=0.2,
+        cut_boundary_radius_frames=1,
+    )
+
+    assert legacy_cut_drops.tolist() == [0] * 10
+    assert legacy_cut_points.tolist() == [0] * 10
+    assert boundary_cut_drops.tolist() == [0] * 10
+    assert boundary_cut_points.tolist() == [0, 0, 0, 1, 1, 1, 1, 0, 0, 0]
+
+
+def test_endpoint_targets_use_explicit_cut_metadata():
+    record = build_supervised_record(
+        audio_id="clip",
+        source="unit",
+        duration_s=1.0,
+        speech_segments=[(0.1, 0.9)],
+        frame_hop_s=0.1,
+    )
+    record = type(record)(
+        audio_id=record.audio_id,
+        source=record.source,
+        duration_s=record.duration_s,
+        text=record.text,
+        teacher_segments=record.teacher_segments,
+        frame_hop_s=record.frame_hop_s,
+        speech_frames=record.speech_frames,
+        label_quality=record.label_quality,
+        frame_weights=record.frame_weights,
+        boundary_metadata={
+            "cut_drop_zones": [{"start": 0.3, "end": 0.7}],
+            "cut_point_segments": [{"time_s": 0.5}],
+        },
+    )
+
+    _starts, _ends, cut_drops, cut_points = endpoint_targets_from_record(
+        record,
+        frame_count=10,
+        boundary_radius_frames=0,
+        cut_min_gap_s=999.0,
+        cut_boundary_radius_frames=1,
+    )
+
+    assert cut_drops.tolist() == [0, 0, 0, 1, 1, 1, 1, 0, 0, 0]
+    assert cut_points.tolist() == [0, 0, 0, 0, 1, 1, 1, 0, 0, 0]
 
 
 def test_addition_fusion_training_uses_cached_features(tmp_path):
@@ -838,9 +930,13 @@ def test_endpoint_refiner_training_uses_cached_features(tmp_path):
             max_trainable_parameters=10_000,
             boundary_radius_frames=0,
             cut_min_gap_s=0.02,
+            speech_loss_weight=0.25,
+            start_loss_weight=3.0,
+            end_loss_weight=2.0,
             start_positive_loss_weight=8.0,
             end_positive_loss_weight=9.0,
-            cut_positive_loss_weight=3.0,
+            cut_drop_positive_loss_weight=3.0,
+            cut_point_positive_loss_weight=4.0,
         ),
     )
 
@@ -850,9 +946,500 @@ def test_endpoint_refiner_training_uses_cached_features(tmp_path):
     assert checkpoint.exists()
     assert checkpoint.name == "fusionvad_ja_endpoint_refiner.pt"
     assert __import__("pathlib").Path(metrics.metrics_path).exists()
+    assert checkpoint_payload["config"]["speech_loss_weight"] == 0.25
+    assert checkpoint_payload["config"]["start_loss_weight"] == 3.0
+    assert checkpoint_payload["config"]["end_loss_weight"] == 2.0
     assert checkpoint_payload["config"]["start_positive_loss_weight"] == 8.0
     assert checkpoint_payload["config"]["end_positive_loss_weight"] == 9.0
-    assert checkpoint_payload["config"]["cut_positive_loss_weight"] == 3.0
+    assert checkpoint_payload["config"]["cut_drop_positive_loss_weight"] == 3.0
+    assert checkpoint_payload["config"]["cut_point_positive_loss_weight"] == 4.0
+    metrics_payload = json.loads(__import__("pathlib").Path(metrics.metrics_path).read_text(encoding="utf-8"))
+    assert metrics_payload["boundary_first"]["start_loss_weight"] == 3.0
+    assert metrics_payload["boundary_first"]["end_loss_weight"] == 2.0
+    assert set(metrics_payload["mean_component_losses"]) == {
+        "speech",
+        "start",
+        "end",
+        "internal_gap",
+        "cut_drop",
+        "cut_point",
+    }
+
+
+def test_endpoint_refiner_training_initializes_from_checkpoint(tmp_path):
+    feature_path = tmp_path / "feature.npz"
+    np.savez_compressed(
+        feature_path,
+        whisper=np.ones((10, 8), dtype=np.float32),
+        mfcc=np.ones((10, 4), dtype=np.float32),
+    )
+    record = build_supervised_record(
+        audio_id="clip",
+        source="unit",
+        duration_s=0.2,
+        speech_segments=[(0.04, 0.08), (0.14, 0.18)],
+        frame_hop_s=0.02,
+    )
+    feature_rows = [
+        {
+            "audio_id": "clip",
+            "feature_path": str(feature_path),
+            "label_index": 0,
+        }
+    ]
+    base_metrics = train_endpoint_refiner_classifier(
+        records=[record],
+        feature_manifest_rows=feature_rows,
+        output_dir=tmp_path / "endpoint-base",
+        config=EndpointRefinerTrainConfig(
+            max_steps=1,
+            fusion_dim=8,
+            hidden_dim=4,
+            layers=1,
+            max_trainable_parameters=10_000,
+        ),
+    )
+
+    fine_tune_metrics = train_endpoint_refiner_classifier(
+        records=[record],
+        feature_manifest_rows=feature_rows,
+        output_dir=tmp_path / "endpoint-fine-tune",
+        config=EndpointRefinerTrainConfig(
+            max_steps=1,
+            fusion_dim=8,
+            hidden_dim=4,
+            layers=1,
+            max_trainable_parameters=10_000,
+            init_checkpoint=base_metrics.checkpoint,
+        ),
+    )
+
+    checkpoint = __import__("torch").load(fine_tune_metrics.checkpoint, map_location="cpu", weights_only=False)
+    metrics_payload = json.loads(__import__("pathlib").Path(fine_tune_metrics.metrics_path).read_text(encoding="utf-8"))
+    assert checkpoint["init_checkpoint"] == base_metrics.checkpoint
+    assert checkpoint["config"]["init_checkpoint"] == base_metrics.checkpoint
+    assert metrics_payload["init_checkpoint"] == base_metrics.checkpoint
+
+
+def test_imitation_head_training_uses_planner_targets(tmp_path):
+    feature_path = tmp_path / "feature.npz"
+    np.savez_compressed(
+        feature_path,
+        whisper=np.ones((10, 8), dtype=np.float32),
+        mfcc=np.ones((10, 4), dtype=np.float32),
+    )
+    feature_rows = [
+        {
+            "audio_id": "clip",
+            "feature_path": str(feature_path),
+            "frame_count": 10,
+            "whisper_dim": 8,
+            "mfcc_dim": 4,
+        }
+    ]
+    imitation_rows = [
+        {
+            "audio_id": "clip",
+            "split_frames": [0, 1, 0, 0, 1],
+            "drop_gap_frames": [0, 0, 1, 1, 0],
+        }
+    ]
+
+    metrics = train_imitation_classifier(
+        feature_manifest_rows=feature_rows,
+        imitation_rows=imitation_rows,
+        output_dir=tmp_path / "imitation-train",
+        config=ImitationTrainConfig(
+            max_steps=2,
+            fusion_dim=8,
+            hidden_dim=4,
+            layers=1,
+            max_trainable_parameters=10_000,
+            split_positive_loss_weight=8.0,
+            drop_gap_positive_loss_weight=4.0,
+            save_interval_steps=1,
+            window_frames=6,
+            positive_window_ratio=1.0,
+            positive_jitter_frames=0,
+        ),
+    )
+
+    checkpoint = __import__("pathlib").Path(metrics.checkpoint)
+    checkpoint_payload = __import__("torch").load(checkpoint, map_location="cpu", weights_only=False)
+    metrics_payload = json.loads(__import__("pathlib").Path(metrics.metrics_path).read_text(encoding="utf-8"))
+    assert metrics.steps == 2
+    assert checkpoint.exists()
+    assert checkpoint.name == "fusionvad_ja_imitation_head.pt"
+    assert (tmp_path / "imitation-train" / "checkpoint-step-1.pt").exists()
+    assert checkpoint_payload["model_type"] == "addition_imitation_bilstm"
+    assert checkpoint_payload["outputs"] == ["split", "drop_gap"]
+    assert checkpoint_payload["config"]["split_positive_loss_weight"] == 8.0
+    assert checkpoint_payload["config"]["drop_gap_positive_loss_weight"] == 4.0
+    assert metrics_payload["model_type"] == "addition_imitation_bilstm"
+    assert metrics_payload["sampling"]["window_frames"] == 6
+    assert metrics_payload["sampling"]["positive_window_ratio"] == 1.0
+    assert metrics_payload["sampling"]["positive_jitter_frames"] == 0
+    assert metrics_payload["sampling"]["balanced_frame_loss"] is True
+    assert metrics_payload["sampling"]["split_positive_windows"] == 1
+    assert metrics_payload["sampling"]["drop_gap_positive_windows"] == 1
+    assert set(metrics_payload["mean_component_losses"]) == {"split", "drop_gap"}
+    assert set(metrics_payload["output_metrics"]) == {"split", "drop_gap", "combined"}
+    assert metrics_payload["output_metrics"]["split"]["positive_ratio"] > 0.0
+    assert metrics_payload["output_metrics"]["drop_gap"]["positive_ratio"] > 0.0
+
+
+def test_imitation_feature_windows_resize_targets_to_feature_frames(tmp_path):
+    feature_path = tmp_path / "feature.npz"
+    np.savez_compressed(
+        feature_path,
+        whisper=np.ones((10, 8), dtype=np.float32),
+        mfcc=np.ones((10, 4), dtype=np.float32),
+    )
+
+    windows = build_lazy_imitation_feature_windows(
+        feature_manifest_rows=[
+            {
+                "audio_id": "clip",
+                "feature_path": str(feature_path),
+                "frame_count": 10,
+                "whisper_dim": 8,
+                "mfcc_dim": 4,
+            }
+        ],
+        imitation_rows=[
+            {
+                "audio_id": "clip",
+                "split_frames": [0, 1, 0, 0, 1],
+                "drop_gap_frames": [0, 0, 1, 1, 0],
+            }
+        ],
+    )
+
+    assert len(windows) == 1
+    assert windows[0].frame_count == 10
+    assert len(windows[0].split_frames) == 10
+    assert len(windows[0].drop_gap_frames) == 10
+    assert int(windows[0].split_frames.sum()) >= 2
+    assert int(windows[0].drop_gap_frames.sum()) >= 2
+
+
+def test_train_imitation_head_cli_requires_inputs():
+    import importlib.util
+
+    script_path = (
+        __import__("pathlib").Path(__file__).resolve().parents[1]
+        / "tools"
+        / "fusionvad_ja"
+        / "train_imitation_head.py"
+    )
+    spec = importlib.util.spec_from_file_location("fusionvad_ja_train_imitation_head_args", script_path)
+    assert spec and spec.loader
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    try:
+        module.parse_args([])
+    except SystemExit as exc:
+        assert exc.code == 2
+    else:
+        raise AssertionError("parse_args should require inputs")
+
+    args = module.parse_args(
+        [
+            "--feature-manifest",
+            "feature_manifest.json",
+            "--imitation-targets",
+            "imitation_targets.jsonl",
+            "--max-steps",
+            "2",
+            "--split-positive-loss-weight",
+            "12",
+            "--drop-gap-positive-loss-weight",
+            "6",
+            "--window-frames",
+            "64",
+            "--positive-window-ratio",
+            "0.75",
+            "--positive-jitter-frames",
+            "4",
+            "--no-balanced-frame-loss",
+        ]
+    )
+    assert args.feature_manifest == "feature_manifest.json"
+    assert args.imitation_targets == "imitation_targets.jsonl"
+    assert args.max_steps == 2
+    assert args.split_positive_loss_weight == 12.0
+    assert args.drop_gap_positive_loss_weight == 6.0
+    assert args.window_frames == 64
+    assert args.positive_window_ratio == 0.75
+    assert args.positive_jitter_frames == 4
+    assert args.no_balanced_frame_loss is True
+
+
+def test_export_imitation_head_predictions_cli_writes_metrics(tmp_path):
+    import importlib.util
+    import json
+
+    script_path = (
+        __import__("pathlib").Path(__file__).resolve().parents[1]
+        / "tools"
+        / "fusionvad_ja"
+        / "export_imitation_head_predictions.py"
+    )
+    spec = importlib.util.spec_from_file_location("fusionvad_ja_export_imitation_predictions", script_path)
+    assert spec and spec.loader
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    feature_path = tmp_path / "feature.npz"
+    np.savez_compressed(
+        feature_path,
+        whisper=np.ones((10, 8), dtype=np.float32),
+        mfcc=np.ones((10, 4), dtype=np.float32),
+    )
+    feature_rows = [
+        {
+            "audio_id": "clip",
+            "feature_path": str(feature_path),
+            "frame_count": 10,
+            "whisper_dim": 8,
+            "mfcc_dim": 4,
+        }
+    ]
+    feature_manifest_path = tmp_path / "feature_manifest.json"
+    feature_manifest_path.write_text(json.dumps(feature_rows, ensure_ascii=False), encoding="utf-8")
+    imitation_rows = [
+        {
+            "audio_id": "clip",
+            "split_frames": [0, 0, 1, 0, 0, 0, 1, 0, 0, 0],
+            "drop_gap_frames": [0, 0, 0, 1, 1, 0, 0, 0, 0, 0],
+        }
+    ]
+    imitation_targets_path = tmp_path / "imitation_targets.jsonl"
+    imitation_targets_path.write_text(
+        "\n".join(json.dumps(row, ensure_ascii=False) for row in imitation_rows) + "\n",
+        encoding="utf-8",
+    )
+    train_metrics = train_imitation_classifier(
+        feature_manifest_rows=feature_rows,
+        imitation_rows=imitation_rows,
+        output_dir=tmp_path / "imitation-train",
+        config=ImitationTrainConfig(
+            max_steps=1,
+            fusion_dim=8,
+            hidden_dim=4,
+            layers=1,
+            max_trainable_parameters=10_000,
+        ),
+    )
+
+    module.run(
+        module.parse_args(
+            [
+                "--feature-manifest",
+                str(feature_manifest_path),
+                "--imitation-targets",
+                str(imitation_targets_path),
+                "--checkpoint",
+                train_metrics.checkpoint,
+                "--threshold",
+                "0.0,0.5",
+                "--output-dir",
+                str(tmp_path / "predictions"),
+            ]
+        )
+    )
+
+    rows = [
+        json.loads(line)
+        for line in (tmp_path / "predictions" / "predictions.jsonl").read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    summary = json.loads((tmp_path / "predictions" / "prediction_metrics.json").read_text(encoding="utf-8"))
+    assert len(rows) == 1
+    assert rows[0]["audio_id"] == "clip"
+    assert rows[0]["frame_count"] == 10
+    assert rows[0]["positive_frames"]["split"] >= 2
+    assert rows[0]["positive_frames"]["drop_gap"] >= 2
+    assert summary["rows"] == 1
+    assert summary["checkpoint_model_type"] == "addition_imitation_bilstm"
+    assert set(summary["output_metrics"]) == {"split", "drop_gap"}
+    assert summary["output_metrics"]["split"]["0.0000"]["recall"] == 1.0
+    assert summary["output_metrics"]["drop_gap"]["0.0000"]["recall"] == 1.0
+
+
+def test_export_imitation_head_predictions_cli_requires_inputs():
+    import importlib.util
+
+    script_path = (
+        __import__("pathlib").Path(__file__).resolve().parents[1]
+        / "tools"
+        / "fusionvad_ja"
+        / "export_imitation_head_predictions.py"
+    )
+    spec = importlib.util.spec_from_file_location("fusionvad_ja_export_imitation_args", script_path)
+    assert spec and spec.loader
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    try:
+        module.parse_args([])
+    except SystemExit as exc:
+        assert exc.code == 2
+    else:
+        raise AssertionError("parse_args should require inputs")
+
+    args = module.parse_args(
+        [
+            "--feature-manifest",
+            "feature_manifest.json",
+            "--imitation-targets",
+            "imitation_targets.jsonl",
+            "--checkpoint",
+            "model.pt",
+            "--threshold",
+            "0.1,0.2",
+        ]
+    )
+    assert args.feature_manifest == "feature_manifest.json"
+    assert args.imitation_targets == "imitation_targets.jsonl"
+    assert args.checkpoint == "model.pt"
+    assert module.parse_thresholds(args.threshold) == [0.02, 0.05, 0.08, 0.1, 0.12, 0.15, 0.2, 0.3, 0.4, 0.5]
+
+
+def test_apply_drop_gap_packer_splits_internal_gap(tmp_path):
+    import importlib.util
+
+    script_path = (
+        __import__("pathlib").Path(__file__).resolve().parents[1]
+        / "tools"
+        / "fusionvad_ja"
+        / "apply_drop_gap_packer.py"
+    )
+    spec = importlib.util.spec_from_file_location("fusionvad_ja_apply_drop_gap_packer", script_path)
+    assert spec and spec.loader
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    boundary_path = tmp_path / "boundary_manifest.jsonl"
+    boundary_path.write_text(
+        json.dumps(
+            {
+                "audio_id": "clip",
+                "duration_s": 2.0,
+                "frame_hop_s": 0.1,
+                "actual_speech_segments": [{"start": 0.1, "end": 0.5}, {"start": 1.3, "end": 1.7}],
+                "transition_regions": [],
+                "overlap_segments": [],
+            },
+            ensure_ascii=False,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    baseline_frames = [0] * 20
+    for index in range(1, 17):
+        baseline_frames[index] = 1
+    baseline_path = tmp_path / "baseline.jsonl"
+    baseline_path.write_text(
+        json.dumps({"audio_id": "clip", "speech_frames": baseline_frames}, ensure_ascii=False) + "\n",
+        encoding="utf-8",
+    )
+    drop_gap_probabilities = [0.1] * 20
+    for index in range(5, 13):
+        drop_gap_probabilities[index] = 0.95
+    drop_gap_path = tmp_path / "drop_gap.jsonl"
+    drop_gap_path.write_text(
+        json.dumps(
+            {
+                "audio_id": "clip",
+                "frame_count": 20,
+                "probabilities": {"drop_gap": drop_gap_probabilities},
+            },
+            ensure_ascii=False,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    summary = module.apply_drop_gap_packer(
+        boundary_manifest=boundary_path,
+        baseline_predictions=baseline_path,
+        drop_gap_predictions=drop_gap_path,
+        output_dir=tmp_path / "packed",
+        drop_gap_threshold=0.9,
+        min_drop_gap_frames=2,
+        min_drop_gap_s=0.0,
+        min_child_s=0.2,
+        min_parent_s=0.5,
+        baseline_merge_gap_s=0.0,
+        min_segment_s=0.05,
+    )
+
+    rows = [
+        json.loads(line)
+        for line in (tmp_path / "packed" / "predictions.jsonl").read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    assert summary["rows"] == 1
+    assert summary["applied_zone_count"] == 1
+    assert summary["segments_before"] == 1
+    assert summary["segments_after"] == 2
+    assert rows[0]["speech_frames"] == [0, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 0, 0, 0]
+    assert rows[0]["drop_gap_frames"][5:13] == [1] * 8
+    assert rows[0]["applied_drop_gap_zones"][0]["start"] == pytest.approx(0.5)
+    assert rows[0]["applied_drop_gap_zones"][0]["end"] == pytest.approx(1.3)
+
+
+def test_apply_drop_gap_packer_cli_requires_inputs():
+    import importlib.util
+
+    script_path = (
+        __import__("pathlib").Path(__file__).resolve().parents[1]
+        / "tools"
+        / "fusionvad_ja"
+        / "apply_drop_gap_packer.py"
+    )
+    spec = importlib.util.spec_from_file_location("fusionvad_ja_apply_drop_gap_packer_args", script_path)
+    assert spec and spec.loader
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    try:
+        module.parse_args([])
+    except SystemExit as exc:
+        assert exc.code == 2
+    else:
+        raise AssertionError("parse_args should require inputs")
+
+    args = module.parse_args(
+        [
+            "--boundary-manifest",
+            "boundary.jsonl",
+            "--baseline-predictions",
+            "baseline.jsonl",
+            "--drop-gap-predictions",
+            "drop.jsonl",
+            "--drop-gap-threshold",
+            "0.85",
+            "--min-drop-gap-frames",
+            "4",
+            "--min-drop-gap-s",
+            "0.3",
+            "--min-child-s",
+            "0.5",
+            "--min-parent-s",
+            "8.0",
+        ]
+    )
+    assert args.boundary_manifest == "boundary.jsonl"
+    assert args.baseline_predictions == "baseline.jsonl"
+    assert args.drop_gap_predictions == "drop.jsonl"
+    assert args.drop_gap_threshold == 0.85
+    assert args.min_drop_gap_frames == 4
+    assert args.min_drop_gap_s == 0.3
+    assert args.min_child_s == 0.5
+    assert args.min_parent_s == 8.0
 
 
 def test_boundary_aware_losses_focus_transitions_and_internal_gaps():
@@ -1531,13 +2118,28 @@ def test_train_endpoint_refiner_cli_accepts_aux_positive_weights():
             "120",
             "--end-positive-loss-weight",
             "130",
-            "--cut-positive-loss-weight",
+            "--start-loss-weight",
+            "3",
+            "--end-loss-weight",
+            "2",
+            "--cut-drop-positive-loss-weight",
             "8",
+            "--cut-point-positive-loss-weight",
+            "9",
+            "--cut-boundary-radius-frames",
+            "2",
+            "--save-interval-steps",
+            "64",
         ]
     )
     assert args.start_positive_loss_weight == 120.0
     assert args.end_positive_loss_weight == 130.0
-    assert args.cut_positive_loss_weight == 8.0
+    assert args.start_loss_weight == 3.0
+    assert args.end_loss_weight == 2.0
+    assert args.cut_drop_positive_loss_weight == 8.0
+    assert args.cut_point_positive_loss_weight == 9.0
+    assert args.cut_boundary_radius_frames == 2
+    assert args.save_interval_steps == 64
 
     try:
         module.parse_args(
@@ -1554,6 +2156,54 @@ def test_train_endpoint_refiner_cli_accepts_aux_positive_weights():
         assert exc.code == 2
     else:
         raise AssertionError("parse_args should reject non-positive aux positive weights")
+
+    try:
+        module.parse_args(
+            [
+                "--labels",
+                "labels.jsonl",
+                "--feature-manifest",
+                "feature_manifest.json",
+                "--start-loss-weight",
+                "-1",
+            ]
+        )
+    except SystemExit as exc:
+        assert exc.code == 2
+    else:
+        raise AssertionError("parse_args should reject negative start loss weight")
+
+    try:
+        module.parse_args(
+            [
+                "--labels",
+                "labels.jsonl",
+                "--feature-manifest",
+                "feature_manifest.json",
+                "--cut-boundary-radius-frames",
+                "-1",
+            ]
+        )
+    except SystemExit as exc:
+        assert exc.code == 2
+    else:
+        raise AssertionError("parse_args should reject negative cut boundary radius")
+
+    try:
+        module.parse_args(
+            [
+                "--labels",
+                "labels.jsonl",
+                "--feature-manifest",
+                "feature_manifest.json",
+                "--save-interval-steps",
+                "-1",
+            ]
+        )
+    except SystemExit as exc:
+        assert exc.code == 2
+    else:
+        raise AssertionError("parse_args should reject negative save interval")
 
 
 def test_evaluate_addition_bilstm_cli_requires_inputs():
@@ -1778,9 +2428,12 @@ def test_export_endpoint_refiner_predictions_cli_writes_jsonl(tmp_path):
             hidden_dim=4,
             layers=1,
             max_trainable_parameters=10_000,
-            cut_min_gap_s=0.02,
+            cut_min_gap_s=0.05,
+            cut_boundary_radius_frames=1,
+            save_interval_steps=1,
         ),
     )
+    assert (tmp_path / "train" / "checkpoint-step-1.pt").exists()
 
     module.run(
         module.parse_args(
@@ -1818,11 +2471,15 @@ def test_export_endpoint_refiner_predictions_cli_writes_jsonl(tmp_path):
     assert rows[0]["start_frames"] == [1, 1, 1, 1, 1, 1]
     assert rows[0]["end_frames"] == [1, 1, 1, 1, 1, 1]
     assert rows[0]["cut_frames"] == [1, 1, 1, 1, 1, 1]
+    assert rows[0]["cut_drop_frames"] == [1, 1, 1, 1, 1, 1]
+    assert rows[0]["cut_point_frames"] == [1, 1, 1, 1, 1, 1]
     assert rows[0]["probability_summary"]["speech"]["count"] == 6.0
     assert "probabilities" in rows[0]
     assert summary["rows"] == 1
     assert summary["output_metrics"]["speech"]["predicted_positive_ratio"] == 1.0
-    assert summary["output_metrics"]["cut"]["predicted_positive_ratio"] == 1.0
+    assert summary["output_metrics"]["cut_drop"]["predicted_positive_ratio"] == 1.0
+    assert summary["output_metrics"]["cut_point"]["predicted_positive_ratio"] == 1.0
+    assert summary["output_metrics"]["cut_point"]["positive_ratio"] > 0.0
 
 
 def test_export_endpoint_refiner_predictions_cli_requires_inputs():
@@ -2165,6 +2822,96 @@ def test_benchmark_boundary_predictions_uses_union_speech_duration(tmp_path):
     assert details[0]["actual_union_segment_count"] == 1
 
 
+def test_benchmark_boundary_predictions_reports_start_weighted_recall(tmp_path):
+    import importlib.util
+    import json
+
+    script_path = (
+        __import__("pathlib").Path(__file__).resolve().parents[1]
+        / "tools"
+        / "fusionvad_ja"
+        / "benchmark_boundary_predictions.py"
+    )
+    spec = importlib.util.spec_from_file_location("fusionvad_ja_benchmark_boundary_predictions_weighted", script_path)
+    assert spec and spec.loader
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    boundary_manifest = tmp_path / "boundary_manifest.jsonl"
+    boundary_manifest.write_text(
+        "\n".join(
+            [
+                json.dumps(
+                    {
+                        "audio_id": "early",
+                        "duration_s": 1.0,
+                        "frame_hop_s": 0.1,
+                        "actual_speech_segments": [{"start": 0.0, "end": 1.0}],
+                    },
+                    ensure_ascii=False,
+                ),
+                json.dumps(
+                    {
+                        "audio_id": "late",
+                        "duration_s": 1.0,
+                        "frame_hop_s": 0.1,
+                        "actual_speech_segments": [{"start": 0.0, "end": 1.0}],
+                    },
+                    ensure_ascii=False,
+                ),
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    predictions = tmp_path / "predictions.jsonl"
+    predictions.write_text(
+        "\n".join(
+            [
+                json.dumps(
+                    {
+                        "audio_id": "early",
+                        "speech_frames": [1, 1, 1, 1, 1, 0, 0, 0, 0, 0],
+                    },
+                    ensure_ascii=False,
+                ),
+                json.dumps(
+                    {
+                        "audio_id": "late",
+                        "speech_frames": [0, 0, 0, 0, 0, 1, 1, 1, 1, 1],
+                    },
+                    ensure_ascii=False,
+                ),
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    summary = module.benchmark_boundary_predictions(
+        boundary_manifest=boundary_manifest,
+        predictions=predictions,
+        output_dir=tmp_path / "out",
+        pad_s=0.0,
+        merge_gap_s=0.0,
+        min_segment_s=0.0,
+        min_overlap_ratio=0.1,
+        start_weighted_recall_exponent=2.0,
+    )
+
+    assert round(summary["speech_duration_recall"], 3) == 0.5
+    # Linear recall gives the early and late half equal credit. Start-weighted
+    # recall scores the early half much higher and the late half much lower.
+    assert round(summary["start_weighted_speech_recall"], 3) == 0.5
+    details = [
+        json.loads(line)
+        for line in (tmp_path / "out" / "boundary_benchmark_details.jsonl").read_text(encoding="utf-8").splitlines()
+    ]
+    by_id = {row["audio_id"]: row for row in details}
+    assert round(by_id["early"]["start_weighted_speech_recall"], 3) == 0.875
+    assert round(by_id["late"]["start_weighted_speech_recall"], 3) == 0.125
+
+
 def test_benchmark_boundary_predictions_reports_cut_gap_coverage(tmp_path):
     import importlib.util
     import json
@@ -2235,6 +2982,217 @@ def test_benchmark_boundary_predictions_reports_cut_gap_coverage(tmp_path):
     assert details[0]["cut_gap_covered_count"] == 1
 
 
+def test_benchmark_boundary_predictions_can_use_cut_as_split_boundary(tmp_path):
+    import importlib.util
+    import json
+
+    script_path = (
+        __import__("pathlib").Path(__file__).resolve().parents[1]
+        / "tools"
+        / "fusionvad_ja"
+        / "benchmark_boundary_predictions.py"
+    )
+    spec = importlib.util.spec_from_file_location("fusionvad_ja_benchmark_boundary_predictions_split", script_path)
+    assert spec and spec.loader
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    boundary_manifest = tmp_path / "boundary_manifest.jsonl"
+    boundary_manifest.write_text(
+        json.dumps(
+            {
+                "audio_id": "a",
+                "duration_s": 2.0,
+                "frame_hop_s": 0.1,
+                "actual_speech_segments": [
+                    {"start": 0.1, "end": 0.8},
+                    {"start": 0.8, "end": 1.6},
+                ],
+            },
+            ensure_ascii=False,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    predictions = tmp_path / "predictions.jsonl"
+    predictions.write_text(
+        json.dumps(
+            {
+                "audio_id": "a",
+                "speech_frames": [0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0],
+                "cut_frames": [0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+            },
+            ensure_ascii=False,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    summary = module.benchmark_boundary_predictions(
+        boundary_manifest=boundary_manifest,
+        predictions=predictions,
+        output_dir=tmp_path / "out",
+        pad_s=0.0,
+        merge_gap_s=0.0,
+        min_segment_s=0.05,
+        min_overlap_ratio=0.1,
+        cut_split_mode="split",
+    )
+
+    assert round(summary["speech_duration_recall"], 3) == 1.0
+    assert summary["predicted_segment_count"] == 2
+    details = [
+        json.loads(line)
+        for line in (tmp_path / "out" / "boundary_benchmark_details.jsonl").read_text(encoding="utf-8").splitlines()
+    ]
+    assert details[0]["raw_predicted_segment_count"] == 1
+    assert details[0]["predicted_segment_count"] == 2
+
+
+def test_benchmark_boundary_predictions_constrained_cut_split_limits_segments(tmp_path):
+    import importlib.util
+    import json
+
+    script_path = (
+        __import__("pathlib").Path(__file__).resolve().parents[1]
+        / "tools"
+        / "fusionvad_ja"
+        / "benchmark_boundary_predictions.py"
+    )
+    spec = importlib.util.spec_from_file_location(
+        "fusionvad_ja_benchmark_boundary_predictions_constrained_split",
+        script_path,
+    )
+    assert spec and spec.loader
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    boundary_manifest = tmp_path / "boundary_manifest.jsonl"
+    boundary_manifest.write_text(
+        json.dumps(
+            {
+                "audio_id": "a",
+                "duration_s": 12.0,
+                "frame_hop_s": 1.0,
+                "actual_speech_segments": [{"start": 0.0, "end": 12.0}],
+            },
+            ensure_ascii=False,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    predictions = tmp_path / "predictions.jsonl"
+    predictions.write_text(
+        json.dumps(
+                {
+                    "audio_id": "a",
+                    "speech_frames": [1] * 12,
+                    "cut_frames": [0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 0],
+                },
+                ensure_ascii=False,
+            )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    summary = module.benchmark_boundary_predictions(
+        boundary_manifest=boundary_manifest,
+        predictions=predictions,
+        output_dir=tmp_path / "out",
+        pad_s=0.0,
+        merge_gap_s=0.0,
+        min_segment_s=0.05,
+        min_overlap_ratio=0.1,
+        fallback_target_duration_s=4.0,
+        cut_split_mode="constrained",
+        cut_split_target_s=4.0,
+        cut_split_min_child_s=1.0,
+        cut_split_max_splits_per_segment=2,
+    )
+
+    assert round(summary["speech_duration_recall"], 3) == 1.0
+    assert summary["predicted_segment_count"] == 3
+    details = [
+        json.loads(line)
+        for line in (tmp_path / "out" / "boundary_benchmark_details.jsonl").read_text(encoding="utf-8").splitlines()
+    ]
+    assert details[0]["raw_predicted_segment_count"] == 1
+    assert details[0]["predicted_segment_count"] == 3
+
+
+def test_benchmark_boundary_predictions_reports_fallback_safe_segment_risk(tmp_path):
+    import importlib.util
+    import json
+
+    script_path = (
+        __import__("pathlib").Path(__file__).resolve().parents[1]
+        / "tools"
+        / "fusionvad_ja"
+        / "benchmark_boundary_predictions.py"
+    )
+    spec = importlib.util.spec_from_file_location("fusionvad_ja_benchmark_boundary_predictions_fallback", script_path)
+    assert spec and spec.loader
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    boundary_manifest = tmp_path / "boundary_manifest.jsonl"
+    boundary_manifest.write_text(
+        json.dumps(
+            {
+                "audio_id": "a",
+                "duration_s": 2.0,
+                "frame_hop_s": 0.1,
+                "actual_speech_segments": [
+                    {"start": 0.1, "end": 0.3},
+                    {"start": 1.4, "end": 1.6},
+                ],
+            },
+            ensure_ascii=False,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    predictions = tmp_path / "predictions.jsonl"
+    predictions.write_text(
+        json.dumps(
+            {
+                "audio_id": "a",
+                "speech_frames": [0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0],
+            },
+            ensure_ascii=False,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    summary = module.benchmark_boundary_predictions(
+        boundary_manifest=boundary_manifest,
+        predictions=predictions,
+        output_dir=tmp_path / "out",
+        pad_s=0.0,
+        merge_gap_s=0.0,
+        min_segment_s=0.0,
+        min_overlap_ratio=0.1,
+        cut_min_gap_s=0.5,
+        fallback_target_duration_s=0.8,
+        fallback_gap_overlap_s=0.5,
+    )
+
+    assert summary["predicted_segment_count"] == 1
+    assert summary["long_predicted_segment_count"] == 1
+    assert summary["predicted_gap_crossing_segment_count"] == 1
+    assert summary["predicted_segment_duration"]["p50_s"] == 1.5
+    assert round(summary["predicted_gap_overlap"]["max_s"], 3) == 1.1
+    details = [
+        json.loads(line)
+        for line in (tmp_path / "out" / "boundary_benchmark_details.jsonl").read_text(encoding="utf-8").splitlines()
+    ]
+    predicted_segment = details[0]["predicted_segments"][0]
+    assert predicted_segment["duration_s"] == 1.5
+    assert predicted_segment["crosses_truth_gap"] is True
+    assert predicted_segment["fallback_safe"] is False
+
+
 def test_build_exact_island_labels_uses_actual_speech_segments(tmp_path):
     import importlib.util
     import json
@@ -2261,6 +3219,9 @@ def test_build_exact_island_labels_uses_actual_speech_segments(tmp_path):
                 "frame_hop_s": 0.1,
                 "speech_segments": [{"start": 0.1, "end": 0.5}],
                 "actual_speech_segments": [{"start": 0.2, "end": 0.4}],
+                "cut_point_segments": [{"time_s": 0.4}],
+                "cut_drop_zones": [{"start": 0.5, "end": 0.8}],
+                "speaker_proxy_ids": ["speaker-a", "speaker-b"],
             },
             ensure_ascii=False,
         )
@@ -2281,6 +3242,10 @@ def test_build_exact_island_labels_uses_actual_speech_segments(tmp_path):
     assert records[0].source == "unit-synth-exact-island"
     assert records[0].teacher_segments["supervised"] == [TeacherSegment(0.2, 0.4, score=1.0)]
     assert records[0].speech_frames == [0, 0, 1, 1, 0, 0, 0, 0, 0, 0]
+    assert records[0].boundary_metadata is not None
+    assert records[0].boundary_metadata["speaker_proxy_ids"] == ["speaker-a", "speaker-b"]
+    assert records[0].boundary_metadata["cut_point_segments"] == [{"time_s": 0.4}]
+    assert records[0].boundary_metadata["cut_drop_zones"] == [{"start": 0.5, "end": 0.8}]
 
 
 def test_calibrate_addition_threshold_cli_requires_inputs():
@@ -2630,6 +3595,361 @@ def test_build_galgame_synthetic_timeline_uses_real_negative_gap_and_background(
         "middle-0",
         "trailing",
     ]
+
+
+def test_build_galgame_synthetic_timeline_records_speaker_random_boundaries(tmp_path):
+    import importlib.util
+    import json
+
+    import soundfile as sf
+
+    script_path = (
+        __import__("pathlib").Path(__file__).resolve().parents[1]
+        / "tools"
+        / "fusionvad_ja"
+        / "build_galgame_synthetic_timeline.py"
+    )
+    spec = importlib.util.spec_from_file_location("fusionvad_ja_galgame_synthetic_timeline_speaker_random", script_path)
+    assert spec and spec.loader
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    first_audio = tmp_path / "first.wav"
+    second_audio = tmp_path / "second.wav"
+    sf.write(str(first_audio), np.ones(3200, dtype=np.float32) * 0.1, 16000)
+    sf.write(str(second_audio), np.ones(3200, dtype=np.float32) * 0.2, 16000)
+    source_manifest = tmp_path / "hf_audio_manifest.json"
+    source_manifest.write_text(
+        json.dumps(
+            [
+                {
+                    "audio_id": "first",
+                    "audio": str(first_audio),
+                    "text": "a",
+                    "input": "src:0",
+                    "speaker_proxy_id": "speaker-a",
+                },
+                {
+                    "audio_id": "second",
+                    "audio": str(second_audio),
+                    "text": "b",
+                    "input": "src:1",
+                    "speaker_proxy_id": "speaker-b",
+                },
+            ],
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
+    module.build_synthetic_timeline(
+        module.parse_args(
+            [
+                "--manifest",
+                str(source_manifest),
+                "--count",
+                "1",
+                "--speech-clips-per-example",
+                "2",
+                "--randomize-speech-order",
+                "--reuse-sources",
+                "--speaker-proxy-mode",
+                "auto",
+                "--speaker-proxy-retry-count",
+                "16",
+                "--frame-hop-s",
+                "0.1",
+                "--max-speech-s",
+                "0.2",
+                "--gap-min-s",
+                "0",
+                "--gap-max-s",
+                "0",
+                "--leading-gap-min-s",
+                "0",
+                "--leading-gap-max-s",
+                "0",
+                "--trailing-gap-min-s",
+                "0",
+                "--trailing-gap-max-s",
+                "0",
+                "--cut-point-max-gap-s",
+                "0.01",
+                "--cut-drop-min-gap-s",
+                "0.5",
+                "--background-mix-prob",
+                "0",
+                "--crossfade-ms-min",
+                "0",
+                "--crossfade-ms-max",
+                "0",
+                "--gain-db-min",
+                "0",
+                "--gain-db-max",
+                "0",
+                "--filter-prob",
+                "0",
+                "--codec-prob",
+                "0",
+                "--overlap-speech-prob",
+                "0",
+                "--speech-label-pad-s",
+                "0",
+                "--output-dir",
+                str(tmp_path / "synthetic"),
+            ]
+        )
+    )
+
+    manifest = json.loads((tmp_path / "synthetic" / "manifest.json").read_text(encoding="utf-8"))
+    boundary_rows = [
+        json.loads(line)
+        for line in (tmp_path / "synthetic" / "boundary_manifest.jsonl").read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    summary = json.loads((tmp_path / "synthetic" / "synthetic_timeline_summary.json").read_text(encoding="utf-8"))
+
+    row = manifest[0]
+    boundary = boundary_rows[0]
+    assert summary["speaker_random_enabled"] is True
+    assert summary["config"]["speaker_proxy_mode"] == "auto"
+    assert summary["speaker_turn_boundary_count"] == 1
+    assert summary["cut_point_segment_count"] == 1
+    assert summary["cut_drop_zone_count"] == 0
+    assert len(row["speaker_proxy_ids"]) == 2
+    assert len(set(row["speaker_proxy_ids"])) == 2
+    assert row["speaker_turn_boundaries"][0]["boundary_type"] == "speaker_turn"
+    assert row["speaker_turn_boundaries"][0]["speaker_changed"] is True
+    assert len(row["cut_point_segments"]) == 1
+    assert row["cut_drop_zones"] == []
+    records = read_jsonl(tmp_path / "synthetic" / "labels.jsonl")
+    assert records[0].boundary_metadata is not None
+    assert len(records[0].boundary_metadata["cut_point_segments"]) == 1
+    assert boundary["speaker_turn_boundaries"] == row["speaker_turn_boundaries"]
+    assert boundary["cut_point_segments"] == row["cut_point_segments"]
+
+
+def test_build_galgame_synthetic_timeline_can_force_touching_speech_islands(tmp_path):
+    import importlib.util
+    import json
+
+    import soundfile as sf
+
+    script_path = (
+        __import__("pathlib").Path(__file__).resolve().parents[1]
+        / "tools"
+        / "fusionvad_ja"
+        / "build_galgame_synthetic_timeline.py"
+    )
+    spec = importlib.util.spec_from_file_location("fusionvad_ja_synth_timeline_touch", script_path)
+    assert spec and spec.loader
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    audio_dir = tmp_path / "source"
+    audio_dir.mkdir()
+    first = audio_dir / "speaker-a.wav"
+    second = audio_dir / "speaker-b.wav"
+    sf.write(first, np.ones(1600, dtype=np.float32) * 0.1, 16000)
+    sf.write(second, np.ones(1600, dtype=np.float32) * 0.2, 16000)
+    manifest_path = tmp_path / "manifest.json"
+    manifest_path.write_text(
+        json.dumps(
+            [
+                {
+                    "audio_id": "speaker-a",
+                    "audio": str(first),
+                    "source_text": "a",
+                    "speaker_proxy_id": "speaker-a",
+                },
+                {
+                    "audio_id": "speaker-b",
+                    "audio": str(second),
+                    "source_text": "b",
+                    "speaker_proxy_id": "speaker-b",
+                },
+            ],
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
+    module.build_synthetic_timeline(
+        module.parse_args(
+            [
+                "--manifest",
+                str(manifest_path),
+                "--count",
+                "1",
+                "--speech-clips-per-example",
+                "2",
+                "--randomize-speech-order",
+                "--speaker-proxy-mode",
+                "auto",
+                "--gap-min-s",
+                "1.0",
+                "--gap-max-s",
+                "2.0",
+                "--touch-gap-prob",
+                "1.0",
+                "--crossfade-ms-min",
+                "0",
+                "--crossfade-ms-max",
+                "0",
+                "--leading-gap-min-s",
+                "0",
+                "--leading-gap-max-s",
+                "0",
+                "--trailing-gap-min-s",
+                "0",
+                "--trailing-gap-max-s",
+                "0",
+                "--background-mix-prob",
+                "0",
+                "--gain-db-min",
+                "0",
+                "--gain-db-max",
+                "0",
+                "--filter-prob",
+                "0",
+                "--codec-prob",
+                "0",
+                "--overlap-speech-prob",
+                "0",
+                "--speech-label-pad-s",
+                "0",
+                "--output-dir",
+                str(tmp_path / "synthetic"),
+            ]
+        )
+    )
+
+    summary = json.loads((tmp_path / "synthetic" / "synthetic_timeline_summary.json").read_text(encoding="utf-8"))
+    boundary_rows = [
+        json.loads(line)
+        for line in (tmp_path / "synthetic" / "boundary_manifest.jsonl").read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+
+    assert summary["internal_gap_policy_counts"] == {"touch": 1}
+    assert boundary_rows[0]["speaker_turn_boundaries"][0]["gap_s"] == 0.0
+    assert len(boundary_rows[0]["cut_point_segments"]) == 1
+    assert boundary_rows[0]["cut_drop_zones"] == []
+
+
+def test_build_v1_22_cutpoint_dataset_wrapper_records_cutpoint_and_drop_zones(tmp_path):
+    import importlib.util
+    import json
+
+    import soundfile as sf
+
+    script_path = (
+        __import__("pathlib").Path(__file__).resolve().parents[1]
+        / "tools"
+        / "fusionvad_ja"
+        / "build_v1_22_cutpoint_dataset.py"
+    )
+    spec = importlib.util.spec_from_file_location("fusionvad_ja_v122_cutpoint_dataset", script_path)
+    assert spec and spec.loader
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    audio_dir = tmp_path / "source"
+    audio_dir.mkdir()
+    manifest_rows = []
+    for index in range(8):
+        audio_path = audio_dir / f"speaker-{index}.wav"
+        sf.write(audio_path, np.ones(1600, dtype=np.float32) * (0.05 + index * 0.01), 16000)
+        manifest_rows.append(
+            {
+                "audio_id": f"speaker-{index}",
+                "audio": str(audio_path),
+                "text": f"text-{index}",
+                "speaker_proxy_id": f"speaker-{index}",
+            }
+        )
+    manifest_path = tmp_path / "manifest.json"
+    manifest_path.write_text(json.dumps(manifest_rows, ensure_ascii=False), encoding="utf-8")
+
+    module.run(
+        module.parse_args(
+            [
+                "--manifest",
+                str(manifest_path),
+                "--negative-manifest",
+                str(manifest_path),
+                "--background-manifest",
+                str(manifest_path),
+                "--count",
+                "2",
+                "--speech-clips-per-example",
+                "3",
+                "--touch-gap-prob",
+                "0.5",
+                "--short-gap-prob",
+                "0.0",
+                "--gap-min-s",
+                "0.6",
+                "--gap-max-s",
+                "0.6",
+                "--cut-point-max-gap-s",
+                "0.35",
+                "--cut-drop-min-gap-s",
+                "0.6",
+                "--leading-gap-min-s",
+                "0",
+                "--leading-gap-max-s",
+                "0",
+                "--trailing-gap-min-s",
+                "0",
+                "--trailing-gap-max-s",
+                "0",
+                "--background-mix-prob",
+                "0",
+                "--negative-gap-prob",
+                "0",
+                "--crossfade-ms-min",
+                "0",
+                "--crossfade-ms-max",
+                "0",
+                "--gain-db-min",
+                "0",
+                "--gain-db-max",
+                "0",
+                "--filter-prob",
+                "0",
+                "--codec-prob",
+                "0",
+                "--overlap-speech-prob",
+                "0",
+                "--speech-label-pad-s",
+                "0",
+                "--output-dir",
+                str(tmp_path / "v122"),
+            ]
+        )
+    )
+
+    wrapper_summary = json.loads(
+        (tmp_path / "v122" / "v1_22_cutpoint_dataset_summary.json").read_text(encoding="utf-8")
+    )
+    boundary_rows = [
+        json.loads(line)
+        for line in (tmp_path / "v122" / "boundary_manifest.jsonl").read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    records = read_jsonl(tmp_path / "v122" / "labels.jsonl")
+
+    assert wrapper_summary["version"] == "v1.22"
+    assert wrapper_summary["records"] == 2
+    assert wrapper_summary["cut_point_segment_count"] >= 1
+    assert wrapper_summary["cut_drop_zone_count"] >= 1
+    assert set(wrapper_summary["internal_gap_policy_counts"]) == {"regular", "touch"}
+    assert any(row["cut_point_segments"] for row in boundary_rows)
+    assert any(row["cut_drop_zones"] for row in boundary_rows)
+    assert records[0].boundary_metadata is not None
+    assert "cut_point_segments" in records[0].boundary_metadata
+    assert "cut_drop_zones" in records[0].boundary_metadata
 
 
 def test_build_galgame_synthetic_timeline_v5_records_crossfade_and_augmentations(tmp_path):
