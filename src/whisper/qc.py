@@ -48,6 +48,16 @@ _EMPTY_DURATION_S = float(os.getenv("ASR_QC_EMPTY_DURATION", "1.0"))
 _LONG_LOW_VALUE_DURATION_S = float(
     os.getenv("ASR_QC_LONG_LOW_VALUE_DURATION", "6.0")
 )
+_NONLEXICAL_REPEAT_MAX_DURATION_S = float(
+    os.getenv("ASR_QC_NONLEXICAL_REPEAT_MAX_DURATION", "12.0")
+)
+_NONLEXICAL_REPEAT_MAX_UNIT_LEN = max(
+    1,
+    int(os.getenv("ASR_QC_NONLEXICAL_REPEAT_MAX_UNIT_LEN", "4")),
+)
+_NONLEXICAL_REPEAT_MAX_CPS = float(
+    os.getenv("ASR_QC_NONLEXICAL_REPEAT_MAX_CPS", "8.0")
+)
 _REPETITION_TRUNCATE_KEEP_RUNS = max(
     1,
     int(os.getenv("ASR_QC_REPETITION_TRUNCATE_KEEP_RUNS", "3")),
@@ -55,6 +65,7 @@ _REPETITION_TRUNCATE_KEEP_RUNS = max(
 _DIALOGUE_MARKER_RE = re.compile(
     r"[\u3040-\u30ff\u3400-\u9fff]|[!?！？。…「」『』、]"
 )
+_KANA_RE = re.compile(r"^[\u3040-\u30ff]+$")
 
 _logger = logging.getLogger(__name__)
 
@@ -94,6 +105,7 @@ def _adaptive_logprob_threshold(result: dict, base_threshold: float) -> dict:
     repeat = result.get("max_repeat") if isinstance(result.get("max_repeat"), dict) else {}
     repeat_run = int(_optional_float(repeat.get("run")) or 0)
     repeat_ratio = float(_optional_float(repeat.get("ratio")) or 0.0)
+    nonlexical_repetition = bool(result.get("nonlexical_repetition"))
 
     min_threshold = _env_float("ASR_QC_ADAPTIVE_MIN_LOGPROB", -0.95)
     max_threshold = _env_float("ASR_QC_ADAPTIVE_MAX_LOGPROB", -0.55)
@@ -116,9 +128,13 @@ def _adaptive_logprob_threshold(result: dict, base_threshold: float) -> dict:
         14.0,
     ):
         hard_reasons.append("abnormal_char_density")
-    if repeat_run >= _REPEAT_MIN_RUN and repeat_ratio >= _env_float(
-        "ASR_QC_ADAPTIVE_HARD_REPEAT_RATIO",
-        0.45,
+    if (
+        not nonlexical_repetition
+        and repeat_run >= _REPEAT_MIN_RUN
+        and repeat_ratio >= _env_float(
+            "ASR_QC_ADAPTIVE_HARD_REPEAT_RATIO",
+            0.45,
+        )
     ):
         hard_reasons.append("repeat_ngram_loop")
 
@@ -142,7 +158,7 @@ def _adaptive_logprob_threshold(result: dict, base_threshold: float) -> dict:
     hallucination_risk_penalty = 0.0
     if low_value and (duration_s or 0.0) >= _LONG_LOW_VALUE_DURATION_S:
         hallucination_risk_penalty += 0.12
-    if repeat_run >= 3:
+    if repeat_run >= 3 and not nonlexical_repetition:
         hallucination_risk_penalty += 0.10
     if compression_ratio is not None and compression_ratio >= 1.70:
         hallucination_risk_penalty += 0.08
@@ -447,6 +463,52 @@ def _repetition_repair_suggestion(text: str, repeat: dict) -> dict:
     }
 
 
+def _repeated_vocalization_profile(
+    text: str,
+    repeat: dict,
+    *,
+    duration_s: float,
+    chars_per_sec: float,
+) -> dict:
+    compact = _strip_punctuation(text)
+    unit = str(repeat.get("unit") or "")
+    unit_len = int(repeat.get("unit_len") or 0)
+    run = int(repeat.get("run") or 0)
+    ratio = float(repeat.get("ratio") or 0.0)
+    has_kanji = any("\u3400" <= char <= "\u9fff" for char in compact)
+    has_latin_or_digit = any(char.isascii() and char.isalnum() for char in compact)
+    kana_only = bool(compact) and bool(_KANA_RE.fullmatch(compact))
+    unit_kana_only = bool(unit) and bool(_KANA_RE.fullmatch(unit))
+    unique_chars = len(set(compact))
+    preserve_candidate = (
+        kana_only
+        and unit_kana_only
+        and not has_kanji
+        and not has_latin_or_digit
+        and unit_len <= _NONLEXICAL_REPEAT_MAX_UNIT_LEN
+        and unique_chars <= max(4, unit_len + 2)
+        and duration_s <= _NONLEXICAL_REPEAT_MAX_DURATION_S
+        and chars_per_sec <= _NONLEXICAL_REPEAT_MAX_CPS
+        and run >= _REPEAT_MIN_RUN
+        and ratio >= _REPEAT_MIN_RATIO
+    )
+    return {
+        "preserve_candidate": preserve_candidate,
+        "compact_chars": len(compact),
+        "unique_chars": unique_chars,
+        "kana_only": kana_only,
+        "unit_kana_only": unit_kana_only,
+        "has_kanji": has_kanji,
+        "has_latin_or_digit": has_latin_or_digit,
+        "unit_len": unit_len,
+        "run": run,
+        "ratio": round(ratio, 4),
+        "duration_s": round(duration_s, 3),
+        "chars_per_sec": round(chars_per_sec, 3),
+        "policy": "preserve_with_review" if preserve_candidate else "standard_repeat_qc",
+    }
+
+
 def _low_information_profile(text: str, *, duration_s: float) -> dict:
     normalized = _collapse_repeated_noise(text)
     compact = _strip_punctuation(normalized)
@@ -515,13 +577,23 @@ def _adaptive_video_logprob_threshold(enriched_results: list[dict]) -> float | N
         repeat = result.get("max_repeat") if isinstance(result.get("max_repeat"), dict) else {}
         repeat_run = int(_optional_float(repeat.get("run")) or 0)
         repeat_ratio = float(_optional_float(repeat.get("ratio")) or 0.0)
+        vocalization_repetition = _repeated_vocalization_profile(
+            str(result.get("text") or result.get("raw_text") or ""),
+            repeat,
+            duration_s=float(result.get("duration_s") or 0.0),
+            chars_per_sec=chars_per_sec,
+        )
         if no_speech_prob is not None and no_speech_prob >= hard_nospeech:
             continue
         if compression_ratio is not None and compression_ratio >= hard_compression:
             continue
         if compact_chars >= _DENSITY_MIN_CHARS and chars_per_sec >= hard_cps:
             continue
-        if repeat_run >= _REPEAT_MIN_RUN and repeat_ratio >= 0.45:
+        if (
+            not vocalization_repetition["preserve_candidate"]
+            and repeat_run >= _REPEAT_MIN_RUN
+            and repeat_ratio >= 0.45
+        ):
             continue
         values.append(avg_logprob)
 
@@ -598,16 +670,34 @@ def evaluate_asr_chunk_qc(
     repeat_unit_len = int(repeat["unit_len"])
     repetition_repair = _repetition_repair_suggestion(text, repeat)
     low_information = _low_information_profile(text, duration_s=duration)
+    vocalization_repetition = _repeated_vocalization_profile(
+        text,
+        repeat,
+        duration_s=duration,
+        chars_per_sec=chars_per_sec,
+    )
+    enriched_result["nonlexical_repetition"] = bool(
+        vocalization_repetition["preserve_candidate"]
+    )
     repeated_loop = (
         repeat_run >= _REPEAT_MIN_RUN
         and repeat_ratio >= _REPEAT_MIN_RATIO
         and (repeat_unit_len > 1 or repeat_run >= _REPEAT_MIN_RUN * 2)
     )
     if repeated_loop:
-        reasons.append("repeat_ngram_loop")
-        severity = "reject"
+        if vocalization_repetition["preserve_candidate"]:
+            reasons.append("repeated_nonlexical_vocalization")
+            if severity == "ok":
+                severity = "warn"
+        else:
+            reasons.append("repeat_ngram_loop")
+            severity = "reject"
 
-    if len(compact) >= _HALLUCINATION_MIN_CHARS and repeat_ratio >= _REPEAT_MIN_RATIO:
+    if (
+        not vocalization_repetition["preserve_candidate"]
+        and len(compact) >= _HALLUCINATION_MIN_CHARS
+        and repeat_ratio >= _REPEAT_MIN_RATIO
+    ):
         reasons.append("hallucination_cap_like")
         severity = "reject"
 
@@ -662,6 +752,7 @@ def evaluate_asr_chunk_qc(
             "max_repeat": repeat,
             "repetition_repair": repetition_repair,
             "low_information": low_information,
+            "vocalization_repetition": vocalization_repetition,
             "signal_quality": signal_qc,
             "generation": asr_generation if isinstance(asr_generation, dict) else {},
         },

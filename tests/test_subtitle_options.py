@@ -17,6 +17,11 @@ def test_subtitle_options_from_env(monkeypatch):
     monkeypatch.setenv("SUBTITLE_TIMING_POLISH_ENABLED", "0")
     monkeypatch.setenv("SUBTITLE_SHORT_GAP_COLLAPSE_S", "0.4")
     monkeypatch.setenv("SUBTITLE_LINGER_S", "0.3")
+    monkeypatch.setenv("SUBTITLE_DENSE_CUE_MERGE_ENABLED", "0")
+    monkeypatch.setenv("SUBTITLE_DENSE_CUE_MERGE_MAX_GAP_FRAMES", "5")
+    monkeypatch.setenv("SUBTITLE_DENSE_CUE_MERGE_MAX_SINGLE_FRAMES", "30")
+    monkeypatch.setenv("SUBTITLE_DENSE_CUE_MERGE_MAX_COMBINED_FRAMES", "100")
+    monkeypatch.setenv("SUBTITLE_DENSE_CUE_MERGE_MAX_TEXT_UNITS", "14")
 
     options = SubtitleOptions.from_env()
 
@@ -31,6 +36,11 @@ def test_subtitle_options_from_env(monkeypatch):
     assert options.timing_polish_enabled is False
     assert options.short_gap_collapse_s == 0.4
     assert options.linger_s == 0.3
+    assert options.dense_cue_merge_enabled is False
+    assert options.dense_cue_merge_max_gap_frames == 5
+    assert options.dense_cue_merge_max_single_frames == 30
+    assert options.dense_cue_merge_max_combined_frames == 100
+    assert options.dense_cue_merge_max_text_units == 14
 
 
 def test_subtitle_options_defaults_are_conservative(monkeypatch):
@@ -46,6 +56,8 @@ def test_subtitle_options_defaults_are_conservative(monkeypatch):
     assert options.timing_polish_enabled is True
     assert options.short_gap_collapse_s == 0.5
     assert options.linger_s == 0.45
+    assert options.dense_cue_merge_enabled is True
+    assert options.dense_cue_merge_max_gap_frames == 4.0
 
 
 def test_subtitle_options_video_fps_falls_back_to_ntsc():

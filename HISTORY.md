@@ -990,6 +990,16 @@ v1.23 residual cut split 离线归因：
 - v1.23 fallback-safe：coarse fallback `337`，unsafe `263`，safe ratio `0.220`，fallback duration p50/p90/max `10.82 / 12.91 / 28.47s`，unsafe p50/p90/max `11.22 / 12.95 / 28.47s`，long-silence crossing `15`。对比 v1.22c：chunks `236`，forced `108`，unsafe `108`，fallback p50/p90/max `28.47 / 28.47 / 28.47s`。对比 v1.21 dropgap512-th080：chunks `410`，forced `222`，unsafe `115`，fallback p50/p90/max `13.06 / 25.71 / 28.47s`。结论：v1.23 实质性打掉 28s 粗 fallback p90，但不是免费收益。
 - v1.23 当前判断：方向有效，但不直接默认。下一步应保持 boundary-first 目标，同时补三件事：(1) subtitle timing polish，把过密短 cue 合理合并/压 end、保证 2-frame gap；(2) ASR repeat-loop / 低信息输出后处理，避免切短后幻觉和语气词循环放大；(3) ERes2NetV2 speaker sidecar offline probe，用 speaker-change score 辅助 cue-stage 合并/切分，优先解决多人/男女对话 cue 是否跨 speaker 的判断。
 
+v1.23 后置修正 first-pass：
+
+- 背景：v1.23 residual cut split 把粗 fallback p90 打下来，但短字幕密度、重复语气词和跨 speaker cue 合并成为新的瓶颈。用户确认 chunk growth 不是硬 gate，质量 gate 应转向 start 边界、fallback duration、ASR empty / hallucination 和字幕观感。
+- 检索依据：ASR hallucination 文献指出非语音/模糊人声会诱发重复循环幻觉，但目标域中的 disfluency、喘息、呻吟、短促 kana 也可能是真实内容，不能用“低信息文本”本身作为删除依据；Netflix timing guideline 支持 in-time/start 优先、out-time/end 可后处理压缩并保留 2-frame gap；ERes2NetV2 / 3D-Speaker / CAM++ 更适合作为 speaker embedding sidecar，不替代 VAD。
+- `src/subtitles/options.py` / `src/subtitles/writer.py`：新增 `SUBTITLE_DENSE_CUE_MERGE_*` 和 `_merge_dense_short_cues`。它只合并短、近、文本量小、同 speaker 或未知 speaker 的 micro cues；不移动下一条 start，后续仍由 normalize/polish 保证 2-frame gap。默认阈值保守：4 frames gap、24 frames 单 cue、90 frames 合并后总长、12 text units。
+- `src/whisper/qc.py`：新增 `vocalization_repetition` profile。kana-only、短 unit、低字符密度、时长不长的重复语气词/呻吟从 `repeat_ngram_loop reject` 改为 `repeated_nonlexical_vocalization warn` + `preserve_with_review`；lexical phrase loop、高密度文本和 signal reject 仍会 reject。没有引入具体词黑名单。
+- `tools/fusionvad_ja/probe_speaker_sidecar.py`：新增离线 adjacent speaker-change probe。输入预计算的 ERes2NetV2 / 3D-Speaker / CAM++ embedding JSONL，输出相邻 segment 的 cosine、`speaker_change_score=1-cosine` 和阈值判断。先保证 sidecar 指标链路，不把真实模型下载和依赖接进默认 pipeline。
+- 测试：`.venv/bin/python -m py_compile src/subtitles/options.py src/subtitles/writer.py src/whisper/qc.py tools/fusionvad_ja/probe_speaker_sidecar.py`；`.venv/bin/python -m pytest tests/test_subtitle_options.py tests/test_subtitle_quality_pass.py tests/test_asr_qc_signals.py tests/test_qc_backend_context.py tests/test_speaker_sidecar_probe.py`，结果 `68 passed`。
+- 下一步：用 v1.23 产物离线重放 subtitle writer，比较 dense cue merge 前后 `per_min_subtitle_count`、`short_segment_ratio` 和字幕观感；用 diagnostics 统计 `repeated_nonlexical_vocalization` 与旧 `repeat_ngram_loop` 差异；接 ERes2NetV2 / 3D-Speaker extractor 对匿名样片 A islands 做 sidecar probe。
+
 ---
 
 ## 已降级路线
