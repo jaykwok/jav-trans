@@ -224,7 +224,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--manifest", required=True, help="alignment_failure_manifest.jsonl")
     parser.add_argument(
         "--output-dir",
-        default="agents/audits/fusionvad-ja/alignment-failure-audio",
+        default="agents/audits/alignment-failure-audio",
     )
     parser.add_argument("--pad-s", type=float, default=0.0)
     parser.add_argument("--limit", type=int)

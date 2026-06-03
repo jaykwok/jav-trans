@@ -831,7 +831,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--video", required=True, help="Original video path")
     parser.add_argument(
         "--output-dir",
-        default="agents/audits/fusionvad-ja/fallback-full-subtitle-review",
+        default="agents/audits/fallback-full-subtitle-review",
     )
     parser.add_argument("--title", default="FusionVAD-JA fallback 完整日语字幕审计")
     parser.add_argument("--pad-s", type=float, default=1.0)
