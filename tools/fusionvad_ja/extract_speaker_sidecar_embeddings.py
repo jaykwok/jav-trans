@@ -6,7 +6,7 @@ import json
 import math
 import sys
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 import numpy as np
 
@@ -20,6 +20,11 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from audio.loading import load_audio_16k_mono
 from tools.fusionvad_ja.probe_speaker_sidecar import build_adjacent_speaker_change_rows
+
+
+DEFAULT_ERES2NETV2_MODEL_ID = "iic/speech_eres2netv2_sv_zh-cn_16k-common"
+DEFAULT_MODELSCOPE_CACHE_DIR = PROJECT_ROOT / "models" / "modelscope"
+SUPPORTED_BACKENDS = {"energy_mfcc", "modelscope_eres2netv2"}
 
 
 def project_path(value: str | Path) -> Path:
@@ -121,6 +126,116 @@ def energy_mfcc_embedding(clip: np.ndarray, sample_rate: int) -> np.ndarray:
     )
 
 
+class ModelScopeEres2NetV2Embedder:
+    def __init__(
+        self,
+        *,
+        model_id: str,
+        device: str,
+        model_cache_dir: Path | None,
+        pipeline_factory: Callable[[str, str], Any] | None = None,
+    ) -> None:
+        self.model_id = model_id
+        self.device = device
+        self.model_cache_dir = model_cache_dir
+        try:
+            self.pipeline = (
+                pipeline_factory(model_id, device)
+                if pipeline_factory is not None
+                else self._build_pipeline(model_id, device, model_cache_dir)
+            )
+        except ModuleNotFoundError as exc:
+            raise RuntimeError(
+                "modelscope_eres2netv2 backend requires optional ModelScope audio "
+                "dependencies. Install them in .venv first, for example: "
+                "uv pip install addict sortedcontainers simplejson datasets oss2 "
+                "modelscope. Missing module: "
+                f"{exc.name or exc}"
+            ) from exc
+        except Exception as exc:
+            raise RuntimeError(
+                "failed to initialize modelscope_eres2netv2 speaker sidecar backend. "
+                "Check ModelScope dependencies, model availability, network/proxy, and "
+                f"CUDA device settings. Cause: {type(exc).__name__}: {exc}"
+            ) from exc
+
+    @staticmethod
+    def _build_pipeline(model_id: str, device: str, model_cache_dir: Path | None) -> Any:
+        # Importing this module registers the ERes2NetV2 speaker verification pipeline
+        # in ModelScope. The public audio lazy import table does not expose it directly.
+        import modelscope.pipelines.audio.speaker_verification_eres2netv2_pipeline  # noqa: F401
+        from modelscope.hub.snapshot_download import snapshot_download
+        from modelscope.metainfo import Pipelines
+        from modelscope.pipelines import pipeline
+        from modelscope.utils.constant import Tasks
+
+        model_path = snapshot_download(
+            model_id,
+            cache_dir=str(model_cache_dir) if model_cache_dir is not None else None,
+        )
+        return pipeline(
+            task=Tasks.speaker_verification,
+            model=model_path,
+            pipeline_name=Pipelines.speaker_verification_eres2netv2,
+            device=device,
+        )
+
+    def embed_batch(self, clips: list[np.ndarray]) -> list[np.ndarray]:
+        if not clips:
+            return []
+        try:
+            import torch
+
+            with torch.inference_mode():
+                payload = self.pipeline(clips, output_emb=True)
+        except Exception as exc:
+            raise RuntimeError(
+                "modelscope_eres2netv2 embedding extraction failed. "
+                f"Check clip duration, audio shape, device, and model files. Cause: {type(exc).__name__}: {exc}"
+            ) from exc
+        if not isinstance(payload, dict) or "embs" not in payload:
+            raise RuntimeError("modelscope_eres2netv2 pipeline did not return an 'embs' array")
+        embs = np.asarray(payload["embs"], dtype=np.float32)
+        if embs.ndim == 1:
+            embs = embs.reshape(1, -1)
+        if embs.ndim != 2 or embs.shape[0] != len(clips):
+            raise RuntimeError(
+                "modelscope_eres2netv2 embedding shape mismatch: "
+                f"expected {len(clips)} rows, got {tuple(embs.shape)}"
+            )
+        return [np.asarray(row, dtype=np.float32) for row in embs]
+
+
+def _embedding_row(
+    *,
+    block: dict[str, Any],
+    index: int,
+    start: float,
+    end: float,
+    duration: float,
+    backend: str,
+    embedding: np.ndarray,
+    model_id: str | None,
+) -> dict[str, Any]:
+    row: dict[str, Any] = {
+        "segment_id": str(block.get("cue_id", index)),
+        "cue_id": block.get("cue_id", index),
+        "index": index,
+        "start": round(start, 6),
+        "end": round(end, 6),
+        "duration_s": round(duration, 6),
+        "text": _text(block)[:160],
+        "backend": backend,
+        "embedding": _normalize_embedding(embedding),
+    }
+    if model_id:
+        row["model_id"] = model_id
+    source_ids = block.get("source_segment_ids")
+    if isinstance(source_ids, list):
+        row["source_segment_ids"] = source_ids
+    return row
+
+
 def build_embedding_rows(
     blocks: list[dict[str, Any]],
     audio: np.ndarray,
@@ -129,21 +244,53 @@ def build_embedding_rows(
     backend: str,
     min_duration_s: float,
     max_segments: int,
+    batch_size: int,
+    model_id: str,
+    device: str,
+    model_cache_dir: Path | None,
+    pipeline_factory: Callable[[str, str], Any] | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     rows: list[dict[str, Any]] = []
-    skipped: dict[str, int] = {"short": 0, "empty_audio": 0, "backend_unsupported": 0}
-    if backend not in {"energy_mfcc", "modelscope_eres2netv2"}:
+    skipped: dict[str, int] = {"short": 0, "empty_audio": 0}
+    if backend not in SUPPORTED_BACKENDS:
         raise ValueError(f"unsupported backend: {backend}")
-    if backend == "modelscope_eres2netv2":
-        skipped["backend_unsupported"] = len(blocks)
-        raise RuntimeError(
-            "modelscope_eres2netv2 extraction needs the 3D-Speaker speakerlab package. "
-            "Use --backend energy_mfcc for smoke, or provide external embeddings to "
-            "probe_speaker_sidecar.py until speakerlab is installed."
+    embedder = (
+        ModelScopeEres2NetV2Embedder(
+            model_id=model_id,
+            device=device,
+            model_cache_dir=model_cache_dir,
+            pipeline_factory=pipeline_factory,
         )
+        if backend == "modelscope_eres2netv2"
+        else None
+    )
+    pending: list[tuple[int, dict[str, Any], float, float, float, np.ndarray]] = []
+    effective_batch_size = max(1, int(batch_size))
+
+    def flush_pending() -> None:
+        if not pending:
+            return
+        if embedder is None:
+            raise RuntimeError("internal error: pending model clips without embedder")
+        clips = [item[5] for item in pending]
+        embeddings = embedder.embed_batch(clips)
+        for (index, block, start, end, duration, _clip), embedding in zip(pending, embeddings, strict=True):
+            rows.append(
+                _embedding_row(
+                    block=block,
+                    index=index,
+                    start=start,
+                    end=end,
+                    duration=duration,
+                    backend=backend,
+                    embedding=embedding,
+                    model_id=model_id,
+                )
+            )
+        pending.clear()
 
     for index, block in enumerate(blocks):
-        if max_segments > 0 and len(rows) >= max_segments:
+        if max_segments > 0 and len(rows) + len(pending) >= max_segments:
             break
         start = _float(block.get("start"))
         end = max(start, _float(block.get("end"), start))
@@ -155,22 +302,24 @@ def build_embedding_rows(
         if clip.size == 0:
             skipped["empty_audio"] += 1
             continue
-        embedding = energy_mfcc_embedding(clip, sample_rate)
-        row = {
-            "segment_id": str(block.get("cue_id", index)),
-            "cue_id": block.get("cue_id", index),
-            "index": index,
-            "start": round(start, 6),
-            "end": round(end, 6),
-            "duration_s": round(duration, 6),
-            "text": _text(block)[:160],
-            "backend": backend,
-            "embedding": _normalize_embedding(embedding),
-        }
-        source_ids = block.get("source_segment_ids")
-        if isinstance(source_ids, list):
-            row["source_segment_ids"] = source_ids
-        rows.append(row)
+        if backend == "energy_mfcc":
+            rows.append(
+                _embedding_row(
+                    block=block,
+                    index=index,
+                    start=start,
+                    end=end,
+                    duration=duration,
+                    backend=backend,
+                    embedding=energy_mfcc_embedding(clip, sample_rate),
+                    model_id=None,
+                )
+            )
+            continue
+        pending.append((index, block, start, end, duration, clip))
+        if len(pending) >= effective_batch_size:
+            flush_pending()
+    flush_pending()
     return rows, skipped
 
 
@@ -183,6 +332,11 @@ def build_summary(
     min_duration_s: float,
     speaker_threshold: float,
     max_segments: int,
+    batch_size: int = 16,
+    model_id: str = DEFAULT_ERES2NETV2_MODEL_ID,
+    device: str = "gpu",
+    model_cache_dir: Path | None = DEFAULT_MODELSCOPE_CACHE_DIR,
+    pipeline_factory: Callable[[str, str], Any] | None = None,
 ) -> dict[str, Any]:
     blocks = load_blocks(bilingual_path)
     audio, sample_rate = load_audio_16k_mono(str(audio_path))
@@ -193,6 +347,11 @@ def build_summary(
         backend=backend,
         min_duration_s=min_duration_s,
         max_segments=max_segments,
+        batch_size=batch_size,
+        model_id=model_id,
+        device=device,
+        model_cache_dir=model_cache_dir,
+        pipeline_factory=pipeline_factory,
     )
     pairs = build_adjacent_speaker_change_rows(rows, threshold=speaker_threshold)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -205,9 +364,14 @@ def build_summary(
         "source_bilingual": project_rel(bilingual_path),
         "source_audio": project_rel(audio_path),
         "backend": backend,
+        "model_id": model_id if backend == "modelscope_eres2netv2" else "",
+        "device": device if backend == "modelscope_eres2netv2" else "",
+        "model_cache_dir": project_rel(model_cache_dir) if backend == "modelscope_eres2netv2" else "",
+        "batch_size": batch_size if backend == "modelscope_eres2netv2" else 0,
         "sample_rate": sample_rate,
         "block_count": len(blocks),
         "embedding_count": len(rows),
+        "embedding_dim": len(rows[0]["embedding"]) if rows else 0,
         "pair_count": len(pairs),
         "speaker_change_count": sum(1 for row in pairs if row.get("speaker_change")),
         "speaker_threshold": speaker_threshold,
@@ -231,7 +395,12 @@ def build_markdown(summary: dict[str, Any]) -> str:
             f"- source: `{summary['source_bilingual']}`",
             f"- audio: `{summary['source_audio']}`",
             f"- backend: `{summary['backend']}`",
+            f"- model_id: `{summary['model_id']}`",
+            f"- device: `{summary['device']}`",
+            f"- model_cache_dir: `{summary['model_cache_dir']}`",
+            f"- batch_size: {summary['batch_size']}",
             f"- embedding_count: {summary['embedding_count']} / {summary['block_count']}",
+            f"- embedding_dim: {summary['embedding_dim']}",
             f"- pair_count: {summary['pair_count']}",
             f"- speaker_change_count: {summary['speaker_change_count']}",
             f"- score p50/max: {summary['score_p50']} / {summary['score_max']}",
@@ -261,20 +430,44 @@ def main(argv: list[str] | None = None) -> int:
         choices=("energy_mfcc", "modelscope_eres2netv2"),
         default="energy_mfcc",
     )
+    parser.add_argument(
+        "--model-id",
+        default=DEFAULT_ERES2NETV2_MODEL_ID,
+        help="ModelScope speaker verification model id for --backend modelscope_eres2netv2.",
+    )
+    parser.add_argument(
+        "--device",
+        default="gpu",
+        help="ModelScope device string for --backend modelscope_eres2netv2, e.g. gpu or cpu.",
+    )
+    parser.add_argument(
+        "--model-cache-dir",
+        default=project_rel(DEFAULT_MODELSCOPE_CACHE_DIR),
+        help="Project-local ModelScope cache dir for --backend modelscope_eres2netv2.",
+    )
+    parser.add_argument("--batch-size", type=int, default=16)
     parser.add_argument("--min-duration-s", type=float, default=0.45)
     parser.add_argument("--speaker-threshold", type=float, default=0.35)
     parser.add_argument("--max-segments", type=int, default=0)
     args = parser.parse_args(argv)
 
-    summary = build_summary(
-        bilingual_path=project_path(args.bilingual),
-        audio_path=project_path(args.audio),
-        output_dir=project_path(args.output_dir),
-        backend=args.backend,
-        min_duration_s=float(args.min_duration_s),
-        speaker_threshold=float(args.speaker_threshold),
-        max_segments=int(args.max_segments),
-    )
+    try:
+        summary = build_summary(
+            bilingual_path=project_path(args.bilingual),
+            audio_path=project_path(args.audio),
+            output_dir=project_path(args.output_dir),
+            backend=args.backend,
+            min_duration_s=float(args.min_duration_s),
+            speaker_threshold=float(args.speaker_threshold),
+            max_segments=int(args.max_segments),
+            batch_size=int(args.batch_size),
+            model_id=str(args.model_id),
+            device=str(args.device),
+            model_cache_dir=project_path(args.model_cache_dir) if args.model_cache_dir else None,
+        )
+    except (RuntimeError, ValueError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
     print(
         "summary={summary} embeddings={embeddings} pairs={pairs} changes={changes}".format(
             summary=project_rel(project_path(args.output_dir) / "summary.json"),
