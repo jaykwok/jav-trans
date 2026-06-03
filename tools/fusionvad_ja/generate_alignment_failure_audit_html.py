@@ -4,11 +4,16 @@ from __future__ import annotations
 import argparse
 import html
 import json
+import sys
 from pathlib import Path
 from typing import Any, Mapping
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+from tools.fusionvad_ja.audit_nav import update_audit_entrypoints
 
 
 def project_path(value: str | Path) -> Path:
@@ -1392,6 +1397,7 @@ def write_html(
     }
     summary_path = output_html.with_suffix(".summary.json")
     summary_path.write_text(json.dumps(summary, ensure_ascii=False, indent=2, sort_keys=True), encoding="utf-8")
+    update_audit_entrypoints(latest_html=output_html, title=title)
     return summary
 
 
