@@ -50,12 +50,85 @@ def write_json(path: Path, payload: Any) -> None:
     )
 
 
+def read_jsonl(path: Path | None) -> list[dict[str, Any]]:
+    if path is None or not path.exists():
+        return []
+    rows: list[dict[str, Any]] = []
+    with path.open("r", encoding="utf-8") as fh:
+        for line_no, line in enumerate(fh, 1):
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                row = json.loads(line)
+            except json.JSONDecodeError as exc:
+                raise ValueError(f"{path}:{line_no}: invalid JSONL: {exc}") from exc
+            if not isinstance(row, dict):
+                raise ValueError(f"{path}:{line_no}: row must be an object")
+            rows.append(row)
+    return rows
+
+
 def load_blocks(path: Path) -> list[dict[str, Any]]:
     payload = read_json(path)
     blocks = payload.get("blocks")
     if not isinstance(blocks, list):
         raise ValueError(f"missing blocks list in {path}")
     return [dict(block) for block in blocks if isinstance(block, dict)]
+
+
+def _as_int(value: Any) -> int | None:
+    try:
+        if value is None or value == "":
+            return None
+        number = int(value)
+    except (TypeError, ValueError):
+        return None
+    return number
+
+
+def _as_bool(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "on"}
+    return False
+
+
+def load_diagnostics(path: Path | None) -> dict[int, dict[str, Any]]:
+    diagnostics: dict[int, dict[str, Any]] = {}
+    for row in read_jsonl(path):
+        chunk_index = _as_int(row.get("chunk_index"))
+        if chunk_index is None:
+            continue
+        failure_reasons = [
+            str(reason)
+            for reason in row.get("failure_reasons") or []
+            if str(reason).strip()
+        ]
+        fallback_subtype = str(row.get("fallback_subtype") or "none")
+        alignment_quality = str(row.get("alignment_quality") or "")
+        asr_qc_severity = str(row.get("asr_qc_severity") or "").lower()
+        hard_risk = (
+            fallback_subtype not in {"", "none"}
+            or alignment_quality in {"vad_coarse", "drop_or_review"}
+            or asr_qc_severity == "reject"
+            or "alignment_sentinel" in failure_reasons
+            or "asr_qc_reject" in failure_reasons
+        )
+        warn_risk = bool(hard_risk or row.get("failure_candidate") or asr_qc_severity == "warn")
+        diagnostics[chunk_index] = {
+            "chunk_index": chunk_index,
+            "hard_risk": hard_risk,
+            "warn_risk": warn_risk,
+            "fallback_subtype": fallback_subtype,
+            "alignment_quality": alignment_quality,
+            "asr_qc_severity": asr_qc_severity,
+            "failure_reasons": failure_reasons,
+        }
+    return diagnostics
 
 
 def load_asr_qc(path: Path | None) -> dict[str, Any]:
@@ -131,6 +204,135 @@ def _frames(seconds: float, options: SubtitleOptions) -> float:
     return seconds / max(0.001, options.frame_duration_s)
 
 
+def block_chunk_indices(block: dict[str, Any]) -> set[int]:
+    indices: set[int] = set()
+    for key in ("source_chunk_index", "chunk_index"):
+        value = _as_int(block.get(key))
+        if value is not None:
+            indices.add(value)
+    for key in ("source_chunk_indices", "chunk_indices"):
+        values = block.get(key)
+        if isinstance(values, list):
+            for value in values:
+                number = _as_int(value)
+                if number is not None:
+                    indices.add(number)
+    for word in block.get("words") or []:
+        if not isinstance(word, dict):
+            continue
+        value = _as_int(word.get("source_chunk_index"))
+        if value is not None:
+            indices.add(value)
+    return indices
+
+
+def block_ids(index: int, block: dict[str, Any]) -> set[str]:
+    ids = {str(index), f"index:{index}", f"cue_index:{index}"}
+    cue_id = block.get("cue_id")
+    if cue_id is not None:
+        ids.update({str(cue_id), f"cue:{cue_id}", f"cue_id:{cue_id}"})
+    for source_id in block.get("source_segment_ids") or []:
+        ids.update({str(source_id), f"segment:{source_id}", f"source_segment:{source_id}"})
+    for chunk_index in block_chunk_indices(block):
+        ids.update({f"chunk:{chunk_index}", f"source_chunk:{chunk_index}"})
+    return {item for item in ids if item.strip()}
+
+
+def load_speaker_pairs(path: Path | None) -> dict[tuple[str, str], dict[str, Any]]:
+    pairs: dict[tuple[str, str], dict[str, Any]] = {}
+    for row in read_jsonl(path):
+        left_values: list[str] = []
+        right_values: list[str] = []
+        for key in ("left_segment_id", "left_id", "left_index", "left_cue_id"):
+            if row.get(key) is not None:
+                left_values.append(str(row[key]))
+        for key in ("right_segment_id", "right_id", "right_index", "right_cue_id"):
+            if row.get(key) is not None:
+                right_values.append(str(row[key]))
+        if row.get("left_index") is not None:
+            left_values.extend([f"index:{row['left_index']}", f"cue_index:{row['left_index']}"])
+        if row.get("right_index") is not None:
+            right_values.extend([f"index:{row['right_index']}", f"cue_index:{row['right_index']}"])
+        if row.get("left_cue_id") is not None:
+            left_values.extend([f"cue:{row['left_cue_id']}", f"cue_id:{row['left_cue_id']}"])
+        if row.get("right_cue_id") is not None:
+            right_values.extend([f"cue:{row['right_cue_id']}", f"cue_id:{row['right_cue_id']}"])
+        for left in left_values:
+            for right in right_values:
+                pairs[(left, right)] = row
+    return pairs
+
+
+def speaker_pair_for(
+    left_index: int,
+    left: dict[str, Any],
+    right_index: int,
+    right: dict[str, Any],
+    speaker_pairs: dict[tuple[str, str], dict[str, Any]],
+) -> dict[str, Any] | None:
+    if not speaker_pairs:
+        return None
+    for left_id in block_ids(left_index, left):
+        for right_id in block_ids(right_index, right):
+            pair = speaker_pairs.get((left_id, right_id))
+            if pair is not None:
+                return pair
+    return None
+
+
+def pair_constraints(
+    left_index: int,
+    left: dict[str, Any],
+    right_index: int,
+    right: dict[str, Any],
+    *,
+    speaker_pairs: dict[tuple[str, str], dict[str, Any]],
+    diagnostics: dict[int, dict[str, Any]],
+    speaker_change_policy: str,
+    fallback_risk_policy: str,
+) -> tuple[list[str], list[tuple[str, float]], dict[str, Any]]:
+    blockers: list[str] = []
+    penalties: list[tuple[str, float]] = []
+    annotations: dict[str, Any] = {}
+
+    speaker_pair = speaker_pair_for(left_index, left, right_index, right, speaker_pairs)
+    if speaker_pair is not None:
+        annotations["speaker_pair"] = {
+            "speaker_change": _as_bool(speaker_pair.get("speaker_change")),
+            "speaker_change_score": speaker_pair.get("speaker_change_score"),
+            "threshold": speaker_pair.get("threshold"),
+        }
+        if _as_bool(speaker_pair.get("speaker_change")):
+            if speaker_change_policy == "block":
+                blockers.append("speaker_change_sidecar")
+            elif speaker_change_policy == "penalize":
+                penalties.append(("speaker_change_sidecar", 0.35))
+
+    left_chunks = block_chunk_indices(left)
+    right_chunks = block_chunk_indices(right)
+    all_chunks = sorted(left_chunks | right_chunks)
+    risky_chunks = [chunk for chunk in all_chunks if diagnostics.get(chunk, {}).get("hard_risk")]
+    warn_chunks = [chunk for chunk in all_chunks if diagnostics.get(chunk, {}).get("warn_risk")]
+    crosses_chunk = bool(left_chunks and right_chunks and left_chunks.isdisjoint(right_chunks))
+    if risky_chunks or warn_chunks:
+        annotations["diagnostics"] = {
+            "left_chunks": sorted(left_chunks),
+            "right_chunks": sorted(right_chunks),
+            "risky_chunks": risky_chunks,
+            "warn_chunks": warn_chunks,
+            "crosses_chunk": crosses_chunk,
+        }
+    if risky_chunks:
+        if fallback_risk_policy == "block" and crosses_chunk:
+            blockers.append("fallback_risk_boundary")
+        elif fallback_risk_policy == "penalize":
+            penalties.append(("fallback_risk_boundary" if crosses_chunk else "fallback_risk", 0.22 if crosses_chunk else 0.12))
+    elif warn_chunks and fallback_risk_policy == "penalize":
+        penalties.append(("fallback_warn", 0.05))
+
+    return blockers, penalties, annotations
+
+
 def dense_merge_blockers(
     left: dict[str, Any],
     right: dict[str, Any],
@@ -164,14 +366,22 @@ def dense_merge_blockers(
 
 
 def planner_merge_score(
+    left_index: int,
     left: dict[str, Any],
+    right_index: int,
     right: dict[str, Any],
     *,
     options: SubtitleOptions,
     max_gap_s: float,
     max_combined_s: float,
     max_text_units: float,
+    speaker_pairs: dict[tuple[str, str], dict[str, Any]] | None = None,
+    diagnostics: dict[int, dict[str, Any]] | None = None,
+    speaker_change_policy: str = "block",
+    fallback_risk_policy: str = "penalize",
 ) -> tuple[float, list[str]]:
+    speaker_pairs = speaker_pairs or {}
+    diagnostics = diagnostics or {}
     gap_s = _gap(left, right)
     left_duration = _duration(left)
     right_duration = _duration(right)
@@ -181,6 +391,18 @@ def planner_merge_score(
 
     if not _same_speaker_or_unknown(left, right):
         return 0.0, ["speaker_change"]
+    constraint_blockers, penalties, _annotations = pair_constraints(
+        left_index,
+        left,
+        right_index,
+        right,
+        speaker_pairs=speaker_pairs,
+        diagnostics=diagnostics,
+        speaker_change_policy=speaker_change_policy,
+        fallback_risk_policy=fallback_risk_policy,
+    )
+    if constraint_blockers:
+        return 0.0, constraint_blockers
     if gap_s < -options.frame_gap_s:
         return 0.0, ["negative_overlap"]
     if gap_s > max_gap_s:
@@ -208,7 +430,10 @@ def planner_merge_score(
     score += max(0.0, 1.0 - combined_duration / max(max_combined_s, 0.001)) * 0.25
     score += max(0.0, 1.0 - combined_units / max(max_text_units, 0.001)) * 0.25
     score += (1.0 if min(left_duration, right_duration) < 0.8 else 0.0) * 0.15
-    return round(min(score, 1.0), 6), reasons
+    for reason, penalty in penalties:
+        reasons.append(reason)
+        score -= penalty
+    return round(max(0.0, min(score, 1.0)), 6), reasons
 
 
 def merge_blocks(left: dict[str, Any], right: dict[str, Any]) -> dict[str, Any]:
@@ -232,7 +457,13 @@ def apply_planner_candidates(
     max_gap_s: float,
     max_combined_s: float,
     max_text_units: float,
+    speaker_pairs: dict[tuple[str, str], dict[str, Any]] | None = None,
+    diagnostics: dict[int, dict[str, Any]] | None = None,
+    speaker_change_policy: str = "block",
+    fallback_risk_policy: str = "penalize",
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    speaker_pairs = speaker_pairs or {}
+    diagnostics = diagnostics or {}
     merged: list[dict[str, Any]] = []
     actions: list[dict[str, Any]] = []
     index = 0
@@ -241,15 +472,31 @@ def apply_planner_candidates(
         while index + 1 < len(blocks):
             nxt = blocks[index + 1]
             score, reasons = planner_merge_score(
+                index,
                 current,
+                index + 1,
                 nxt,
                 options=options,
                 max_gap_s=max_gap_s,
                 max_combined_s=max_combined_s,
                 max_text_units=max_text_units,
+                speaker_pairs=speaker_pairs,
+                diagnostics=diagnostics,
+                speaker_change_policy=speaker_change_policy,
+                fallback_risk_policy=fallback_risk_policy,
             )
             if score < min_score:
                 break
+            _blockers, _penalties, annotations = pair_constraints(
+                index,
+                current,
+                index + 1,
+                nxt,
+                speaker_pairs=speaker_pairs,
+                diagnostics=diagnostics,
+                speaker_change_policy=speaker_change_policy,
+                fallback_risk_policy=fallback_risk_policy,
+            )
             actions.append(
                 {
                     "left_index": index,
@@ -263,6 +510,7 @@ def apply_planner_candidates(
                         6,
                     ),
                     "combined_text_units": round(_text_units(current) + _text_units(nxt), 3),
+                    "annotations": annotations,
                 }
             )
             current = merge_blocks(current, nxt)
@@ -280,9 +528,17 @@ def summarize_pairs(
     max_gap_s: float,
     max_combined_s: float,
     max_text_units: float,
+    speaker_pairs: dict[tuple[str, str], dict[str, Any]] | None = None,
+    diagnostics: dict[int, dict[str, Any]] | None = None,
+    speaker_change_policy: str = "block",
+    fallback_risk_policy: str = "penalize",
 ) -> dict[str, Any]:
+    speaker_pairs = speaker_pairs or {}
+    diagnostics = diagnostics or {}
     blocker_counts: Counter[str] = Counter()
+    planner_blocker_counts: Counter[str] = Counter()
     candidate_counts: Counter[str] = Counter()
+    constraint_counts: Counter[str] = Counter()
     candidate_examples: list[dict[str, Any]] = []
     pair_count = max(0, len(blocks) - 1)
 
@@ -293,13 +549,40 @@ def summarize_pairs(
         else:
             blocker_counts.update(["dense_merge_allowed"])
         score, reasons = planner_merge_score(
+            index,
             left,
+            index + 1,
             right,
             options=options,
             max_gap_s=max_gap_s,
             max_combined_s=max_combined_s,
             max_text_units=max_text_units,
+            speaker_pairs=speaker_pairs,
+            diagnostics=diagnostics,
+            speaker_change_policy=speaker_change_policy,
+            fallback_risk_policy=fallback_risk_policy,
         )
+        _blockers, penalties, annotations = pair_constraints(
+            index,
+            left,
+            index + 1,
+            right,
+            speaker_pairs=speaker_pairs,
+            diagnostics=diagnostics,
+            speaker_change_policy=speaker_change_policy,
+            fallback_risk_policy=fallback_risk_policy,
+        )
+        if annotations.get("speaker_pair", {}).get("speaker_change"):
+            constraint_counts.update(["speaker_change_sidecar"])
+        diag = annotations.get("diagnostics") if isinstance(annotations.get("diagnostics"), dict) else {}
+        if diag.get("risky_chunks"):
+            constraint_counts.update(["fallback_risk_pair"])
+            if diag.get("crosses_chunk"):
+                constraint_counts.update(["fallback_risk_boundary"])
+        elif diag.get("warn_chunks"):
+            constraint_counts.update(["fallback_warn_pair"])
+        for reason, _penalty in penalties:
+            constraint_counts.update([f"penalized_{reason}"])
         if score >= min_score:
             candidate_counts.update(reasons or ["candidate"])
             if len(candidate_examples) < 25:
@@ -320,13 +603,32 @@ def summarize_pairs(
                         "combined_text_units": round(_text_units(left) + _text_units(right), 3),
                         "left_text": str(left.get("ja_text") or left.get("text") or "")[:80],
                         "right_text": str(right.get("ja_text") or right.get("text") or "")[:80],
+                        "constraints": annotations,
                     }
                 )
+        else:
+            hard_blockers = {
+                "speaker_change",
+                "speaker_change_sidecar",
+                "negative_overlap",
+                "gap_too_large",
+                "combined_duration_too_long",
+                "text_units_too_large",
+                "sentence_boundary",
+                "fallback_risk_boundary",
+            }
+            hard_reasons = [reason for reason in reasons if reason in hard_blockers]
+            if hard_reasons:
+                planner_blocker_counts.update(hard_reasons)
+            else:
+                planner_blocker_counts.update(["below_threshold"])
 
     return {
         "pair_count": pair_count,
         "dense_blocker_counts": dict(blocker_counts.most_common()),
+        "planner_blocker_counts": dict(planner_blocker_counts.most_common()),
         "planner_candidate_reason_counts": dict(candidate_counts.most_common()),
+        "constraint_counts": dict(constraint_counts.most_common()),
         "planner_candidate_examples": candidate_examples,
     }
 
@@ -371,6 +673,21 @@ def build_markdown(summary: dict[str, Any]) -> str:
     lines.extend(
         f"- {key}: {value}" for key, value in pair["dense_blocker_counts"].items()
     )
+    lines.extend(["", "## Planner Blockers", ""])
+    if pair["planner_blocker_counts"]:
+        lines.extend(
+            f"- {key}: {value}"
+            for key, value in pair["planner_blocker_counts"].items()
+        )
+    else:
+        lines.append("- none")
+    lines.extend(["", "## Constraints", ""])
+    if pair["constraint_counts"]:
+        lines.extend(
+            f"- {key}: {value}" for key, value in pair["constraint_counts"].items()
+        )
+    else:
+        lines.append("- none")
     lines.extend(["", "## Planner Candidate Reasons", ""])
     if pair["planner_candidate_reason_counts"]:
         lines.extend(
@@ -392,11 +709,17 @@ def build_summary(
     max_gap_s: float,
     max_combined_s: float,
     max_text_units: float,
+    diagnostics_path: Path | None = None,
+    speaker_pairs_path: Path | None = None,
+    speaker_change_policy: str = "block",
+    fallback_risk_policy: str = "penalize",
 ) -> dict[str, Any]:
     source_blocks = load_blocks(bilingual_path)
     options = SubtitleOptions.from_env().with_video_fps(video_fps)
     prepared = subtitle_writer.prepare_srt_blocks(source_blocks, options=options, mode="bilingual")
     asr_qc = load_asr_qc(timings_path)
+    diagnostics = load_diagnostics(diagnostics_path)
+    speaker_pairs = load_speaker_pairs(speaker_pairs_path)
     video_duration_s = estimate_duration(prepared)
     pair_analysis = summarize_pairs(
         prepared,
@@ -405,6 +728,10 @@ def build_summary(
         max_gap_s=max_gap_s,
         max_combined_s=max_combined_s,
         max_text_units=max_text_units,
+        speaker_pairs=speaker_pairs,
+        diagnostics=diagnostics,
+        speaker_change_policy=speaker_change_policy,
+        fallback_risk_policy=fallback_risk_policy,
     )
     planner_blocks, actions = apply_planner_candidates(
         prepared,
@@ -413,6 +740,10 @@ def build_summary(
         max_gap_s=max_gap_s,
         max_combined_s=max_combined_s,
         max_text_units=max_text_units,
+        speaker_pairs=speaker_pairs,
+        diagnostics=diagnostics,
+        speaker_change_policy=speaker_change_policy,
+        fallback_risk_policy=fallback_risk_policy,
     )
     planner_blocks = subtitle_writer.prepare_srt_blocks(
         planner_blocks,
@@ -436,6 +767,8 @@ def build_summary(
     summary = {
         "source_bilingual": project_rel(bilingual_path),
         "source_timings": project_rel(timings_path),
+        "source_diagnostics": project_rel(diagnostics_path),
+        "source_speaker_pairs": project_rel(speaker_pairs_path),
         "video_duration_s": video_duration_s,
         "video_fps": video_fps,
         "planner": {
@@ -443,6 +776,10 @@ def build_summary(
             "max_gap_s": max_gap_s,
             "max_combined_s": max_combined_s,
             "max_text_units": max_text_units,
+            "speaker_change_policy": speaker_change_policy,
+            "fallback_risk_policy": fallback_risk_policy,
+            "diagnostic_chunk_count": len(diagnostics),
+            "speaker_pair_count": len(speaker_pairs),
         },
         "pair_analysis": pair_analysis,
         "before": before,
@@ -488,6 +825,12 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument("--bilingual", required=True, help="bilingual.json path")
     parser.add_argument("--timings", default="", help="timings.json path with asr_qc")
+    parser.add_argument("--diagnostics", default="", help="alignment diagnostics JSONL path")
+    parser.add_argument(
+        "--speaker-pairs",
+        default="",
+        help="optional adjacent speaker-change pair JSONL path",
+    )
     parser.add_argument(
         "--output-dir",
         default="agents/temp/fusionvad-ja/subtitle-cue-merge-candidates",
@@ -497,6 +840,16 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--max-gap-s", type=float, default=0.45)
     parser.add_argument("--max-combined-s", type=float, default=4.8)
     parser.add_argument("--max-text-units", type=float, default=34.0)
+    parser.add_argument(
+        "--speaker-change-policy",
+        choices=("block", "penalize", "ignore"),
+        default="block",
+    )
+    parser.add_argument(
+        "--fallback-risk-policy",
+        choices=("block", "penalize", "ignore"),
+        default="penalize",
+    )
     args = parser.parse_args(argv)
 
     output_dir = project_path(args.output_dir)
@@ -510,6 +863,10 @@ def main(argv: list[str] | None = None) -> int:
         max_gap_s=float(args.max_gap_s),
         max_combined_s=float(args.max_combined_s),
         max_text_units=float(args.max_text_units),
+        diagnostics_path=project_path(args.diagnostics) if args.diagnostics else None,
+        speaker_pairs_path=project_path(args.speaker_pairs) if args.speaker_pairs else None,
+        speaker_change_policy=args.speaker_change_policy,
+        fallback_risk_policy=args.fallback_risk_policy,
     )
     print(
         "summary={path} merges={merges} blocks={before}->{after}".format(
