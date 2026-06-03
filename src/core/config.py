@@ -223,6 +223,8 @@ DEFAULT_SETTINGS: dict[str, str] = {
     "ASR_FRAGMENT_MERGE_MAX_CHARS": "72",
     # Max combined duration after fragment merging.
     "ASR_FRAGMENT_MERGE_MAX_DURATION": "12.5",
+    # Hard cap for merging ASR fragments into one subtitle candidate.
+    "ASR_MERGE_HARD_MAX_DURATION": "9.0",
 
     # --- ASR QC / Conservative Filtering ---
     # 1 enables ASR text quality checks before translation.
@@ -282,6 +284,8 @@ DEFAULT_SETTINGS: dict[str, str] = {
     "STAGE_EVENT_SINK": "",
     # Internal TCP port used by the web console to receive StageEvent lines.
     "JAVTRANS_EVENTS_PORT": "17322",
+    # Web console HTTP port used by launcher.py.
+    "JAVTRANS_PORT": "17321",
 
     # --- Audio ---
     # 1 applies dynamic normalization before ASR.
