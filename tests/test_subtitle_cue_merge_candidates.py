@@ -65,6 +65,12 @@ def test_cue_merge_candidate_analysis_keeps_speaker_change(tmp_path: Path, monke
     assert summary["before"]["block_count"] == 3
     assert summary["after"]["planner_merge_count"] == 1
     assert summary["after"]["block_count"] == 2
+    assert summary["outputs"]["before_srt"].endswith("before.bilingual.srt")
+    assert summary["outputs"]["planner_vtt"].endswith("planner.bilingual.vtt")
+    assert (out_dir / "before.bilingual.srt").exists()
+    assert (out_dir / "planner.bilingual.srt").exists()
+    assert (out_dir / "before.bilingual.vtt").read_text(encoding="utf-8").startswith("WEBVTT")
+    assert (out_dir / "planner.bilingual.vtt").exists()
     assert "speaker_change" in summary["pair_analysis"]["dense_blocker_counts"]
     actions = json.loads((out_dir / "planner_actions.json").read_text(encoding="utf-8"))
     assert len(actions) == 1

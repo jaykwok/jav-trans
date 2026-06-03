@@ -192,6 +192,74 @@ def _reading_units_per_s(units: float, duration_s: float) -> float:
     return units / max(0.05, duration_s)
 
 
+def _vtt_timestamp(seconds: float) -> str:
+    seconds = max(0.0, float(seconds))
+    hours = int(seconds // 3600)
+    minutes = int((seconds % 3600) // 60)
+    secs = int(seconds % 60)
+    millis = int((seconds - int(seconds)) * 1000)
+    return f"{hours:02d}:{minutes:02d}:{secs:02d}.{millis:03d}"
+
+
+def _bilingual_cue_text(block: dict[str, Any], *, options: SubtitleOptions) -> str:
+    prefix = subtitle_writer._subtitle_prefix(block, options=options)
+    ja_line = subtitle_writer._wrap_subtitle_text(
+        prefix + str(block.get("ja_text") or block.get("text") or ""),
+        options=options,
+    )
+    zh_text = str(block.get("zh_text") or block.get("zh") or "").strip()
+    if not zh_text:
+        zh_text = "「未翻译」"
+    zh_line = subtitle_writer._wrap_subtitle_text(prefix + zh_text, options=options)
+    return "\n".join(line for line in (ja_line + "\n" + zh_line).splitlines() if line.strip())
+
+
+def write_bilingual_vtt(
+    path: Path,
+    blocks: list[dict[str, Any]],
+    *,
+    options: SubtitleOptions,
+) -> None:
+    lines = ["WEBVTT", ""]
+    for index, block in enumerate(blocks, 1):
+        start = _float(block, "start")
+        end = max(start + 0.05, _float(block, "end", start))
+        lines.extend(
+            [
+                str(index),
+                f"{_vtt_timestamp(start)} --> {_vtt_timestamp(end)}",
+                _bilingual_cue_text(block, options=options),
+                "",
+            ]
+        )
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("\n".join(lines), encoding="utf-8")
+
+
+def write_subtitle_exports(
+    output_dir: Path,
+    *,
+    before_blocks: list[dict[str, Any]],
+    planner_blocks: list[dict[str, Any]],
+    options: SubtitleOptions,
+) -> dict[str, str]:
+    output_dir.mkdir(parents=True, exist_ok=True)
+    before_srt = output_dir / "before.bilingual.srt"
+    planner_srt = output_dir / "planner.bilingual.srt"
+    before_vtt = output_dir / "before.bilingual.vtt"
+    planner_vtt = output_dir / "planner.bilingual.vtt"
+    subtitle_writer.write_bilingual_srt(before_blocks, str(before_srt), options=options)
+    subtitle_writer.write_bilingual_srt(planner_blocks, str(planner_srt), options=options)
+    write_bilingual_vtt(before_vtt, before_blocks, options=options)
+    write_bilingual_vtt(planner_vtt, planner_blocks, options=options)
+    return {
+        "before_srt": project_rel(before_srt),
+        "planner_srt": project_rel(planner_srt),
+        "before_vtt": project_rel(before_vtt),
+        "planner_vtt": project_rel(planner_vtt),
+    }
+
+
 def _same_speaker_or_unknown(left: dict[str, Any], right: dict[str, Any]) -> bool:
     return bool(subtitle_writer._same_speaker_or_unknown(left, right))
 
@@ -777,6 +845,12 @@ def build_summary(
         options=options,
         mode="bilingual",
     )
+    subtitle_exports = write_subtitle_exports(
+        output_dir,
+        before_blocks=prepared,
+        planner_blocks=planner_blocks,
+        options=options,
+    )
     before_quality = quality(prepared, video_duration_s=video_duration_s, asr_qc=asr_qc)
     after_quality = quality(planner_blocks, video_duration_s=video_duration_s, asr_qc=asr_qc)
     before = {
@@ -796,6 +870,7 @@ def build_summary(
         "source_timings": project_rel(timings_path),
         "source_diagnostics": project_rel(diagnostics_path),
         "source_speaker_pairs": project_rel(speaker_pairs_path),
+        "outputs": subtitle_exports,
         "video_duration_s": video_duration_s,
         "video_fps": video_fps,
         "planner": {
