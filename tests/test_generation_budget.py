@@ -4,10 +4,10 @@ from types import SimpleNamespace
 
 import torch
 
-from whisper.generation_budget import apply_generation_budget
+from asr.generation_budget import apply_generation_budget
 
 
-def test_whisper_budget_preserves_decoder_window_with_prompt():
+def test_generation_budget_preserves_decoder_window_with_prompt():
     model = SimpleNamespace(config=SimpleNamespace(max_target_positions=448))
     prompt_ids = torch.arange(180).reshape(1, 180)
     kwargs = {
@@ -37,7 +37,7 @@ def test_whisper_budget_preserves_decoder_window_with_prompt():
     )
 
 
-def test_whisper_budget_clips_prompt_before_min_generation_space():
+def test_generation_budget_clips_prompt_before_min_generation_space():
     model = SimpleNamespace(config=SimpleNamespace(max_target_positions=448))
     prompt_ids = torch.arange(500).reshape(1, 500)
 

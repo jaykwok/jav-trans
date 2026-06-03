@@ -3,15 +3,17 @@ from __future__ import annotations
 import json
 import os
 
+from helpers import ASR_17B_BACKEND
+
 
 def main() -> None:
-    os.environ["ASR_BACKEND"] = "qwen3-asr-1.7b"
+    os.environ["ASR_BACKEND"] = ASR_17B_BACKEND
     os.environ["ASR_WORKER_MODE"] = "subprocess"
     os.environ["ASR_WORKER_MOCK"] = "1"
     os.environ.setdefault("ASR_SUBPROCESS_READY_TIMEOUT_S", "10")
 
-    from whisper import pipeline as asr
-    from whisper.local_backend import SubprocessAsrBackend
+    from asr import pipeline as asr
+    from asr.local_backend import SubprocessAsrBackend
 
     events: list[str] = []
     backend = asr._create_asr_backend("cpu")

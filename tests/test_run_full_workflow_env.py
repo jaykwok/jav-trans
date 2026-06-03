@@ -1,6 +1,6 @@
 from pathlib import Path
 
-from tools.fusionvad_ja import run_full_workflow
+from tools.vad.fusionvad_ja import run_full_workflow
 
 
 def test_run_full_workflow_context_carries_pre_asr_env(monkeypatch, tmp_path):

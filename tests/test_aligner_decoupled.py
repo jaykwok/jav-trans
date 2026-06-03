@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
-from whisper.local_backend import (
+from asr.local_backend import (
     align_text_to_words,
     looks_like_word_timing_failure,
     word_timing_failure_reasons,

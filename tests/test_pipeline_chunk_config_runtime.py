@@ -1,4 +1,4 @@
-from whisper import pipeline
+from asr import pipeline
 
 
 def test_chunk_config_reads_packing_env_at_runtime(monkeypatch):

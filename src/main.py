@@ -32,8 +32,6 @@ _ENV_OVERRIDE_KEYS = (
     "ASR_BACKEND",
     "ASR_VAD_BACKEND",
     "ASR_WORKER_MODE",
-    "WHISPER_TIMESTAMP_MODE",
-    "WHISPER_MODEL_PATH",
     "ASR_MODEL_PATH",
     "ASR_MODEL_ID",
     "ALIGNER_MODEL_PATH",
@@ -69,10 +67,10 @@ if os.getenv("HF_ENDPOINT"):
 
 import torch
 
-from whisper import pipeline as asr_module
+from asr import pipeline as asr_module
 from subtitles import writer as subtitle_module
 from llm import translator as translator_module
-from whisper.qc import asr_qc_gate, build_asr_manifest
+from asr.qc import asr_qc_gate, build_asr_manifest
 
 from rich.console import Console
 from rich.progress import (
@@ -147,9 +145,6 @@ def _ctx_env_flag(ctx: JobContext, name: str, default: bool = False) -> bool:
 
 
 _ASR_STAGE_ADVANCED_PREFIXES = (
-    "WHISPERSEG_",
-    "SILERO_VAD_",
-    "FUSION_VAD_",
     "SEGMENT_",
     "VAD_",
     "ASR_QC_",
@@ -161,15 +156,10 @@ _ASR_STAGE_ADVANCED_PREFIXES = (
     "FUSIONVAD_JA_",
     "ALIGNMENT_",
     "F0_",
-    "TIMESTAMP_VAD_",
-    "TEN_VAD_",
 )
 _ASR_STAGE_ADVANCED_KEYS = {
     "ALIGN_LONG_CHUNK_BATCH_SIZE",
     "ASR_VAD_BACKEND",
-    "ASR_VAD_ADAPTIVE",
-    "ASR_VAD_PRIMARY",
-    "ASR_VAD_GATE",
     "ASR_LANGUAGE",
     "ASR_FORCE_LANGUAGE",
     "ASR_MODEL_PATH",
@@ -182,12 +172,6 @@ _ASR_STAGE_ADVANCED_KEYS = {
     "ASR_REPETITION_PENALTY",
     "ASR_WORKER_MODE",
     "ASR_SLIDING_CONTEXT_SEGS",
-    "WHISPER_TIMESTAMP_MODE",
-    "WHISPER_MODEL_PATH",
-    "WHISPER_BEAMS",
-    "WHISPER_NO_REPEAT_NGRAM",
-    "WHISPER_MAX_NEW_TOKENS",
-    "WHISPER_FORCED_FAIL_RATIO",
     "ASR_INITIAL_PROMPT_MAX_CHARS",
     "ASR_INITIAL_PROMPT_MAX_TOKENS",
     "ASR_MIN_EFFECTIVE_NEW_TOKENS",
@@ -218,11 +202,10 @@ def _asr_stage_env_overrides(ctx: JobContext) -> dict[str, str]:
         for key, value in (ctx.advanced or {}).items()
         if str(key).strip() and _is_asr_stage_advanced_key(str(key).strip())
     }
-    asr_backend = str(ctx.asr_backend or "").strip().lower()
+    asr_backend = str(ctx.asr_backend or "").strip()
     if asr_backend:
         overrides["ASR_BACKEND"] = asr_backend
     overrides["ASR_CONTEXT"] = str(ctx.asr_context or "")
-    overrides.setdefault("WHISPERSEG_THRESHOLD", str(ctx.vad_threshold))
     return overrides
 
 

@@ -14,10 +14,9 @@ It bundles:
 - `ffmpeg.exe` and `ffprobe.exe` from `PATH`, or from `-FfmpegExe` / `-FfprobeExe`
 - `icon.ico` for the executable and pywebview window
 - `icon.png` / `icon.ico` for the in-app header and favicon
-- the default ASR model `efwkjn/whisper-ja-anime-v0.3`
+- the default ASR model `jaykwok/Qwen3-ASR-0.6B-JA-Anime-Galgame`
 - default workflow auxiliary models:
-  - WhisperSeg VAD `TransWithAI/Whisper-Vad-EncDec-ASMR-onnx`
-  - WhisperSeg feature extractor `openai/whisper-base`
+  - FusionVAD-JA checkpoint heads from `src/vad/fusionvad_ja/checkpoints/`
   - forced aligner `Qwen/Qwen3-ForcedAligner-0.6B`
 
 It does not bundle Microsoft Edge WebView2. Users still need the WebView2 runtime,

@@ -1,7 +1,7 @@
 from pathlib import Path
 
 import main
-from helpers import make_job_context
+from helpers import ASR_06B_BACKEND, ASR_17B_BACKEND, make_job_context
 from pipeline import audio as pipeline_audio
 
 
@@ -14,12 +14,12 @@ def test_asr_stage_env_scope_reaches_cache_and_transcribe(monkeypatch, tmp_path)
         video_path,
         output_dir,
         temp_root,
-        asr_backend="qwen3-asr-1.7b",
+        asr_backend=ASR_17B_BACKEND,
         asr_context="task actor",
         skip_translation=True,
         keep_temp_files=True,
     )
-    monkeypatch.setenv("ASR_BACKEND", "anime-whisper")
+    monkeypatch.setenv("ASR_BACKEND", ASR_06B_BACKEND)
     monkeypatch.setenv("ASR_CONTEXT", "process actor")
     monkeypatch.setattr(main.torch.cuda, "is_available", lambda: False)
     monkeypatch.setattr(pipeline_audio, "probe_video_fps", lambda _path: 60.0)
@@ -82,21 +82,21 @@ def test_asr_stage_env_scope_reaches_cache_and_transcribe(monkeypatch, tmp_path)
     )
 
     expected_env = {
-        "ASR_BACKEND": "qwen3-asr-1.7b",
+        "ASR_BACKEND": ASR_17B_BACKEND,
         "ASR_CONTEXT": "task actor",
         "ASR_CHUNK_PACK_FRAME_HOP_S": "0.0166666666667",
     }
     assert seen["backend_label_env"] == expected_env
     assert seen["cache_env"] == expected_env
     assert seen["transcribe_env"] == expected_env
-    assert seen["cache_backend"] == "backend:qwen3-asr-1.7b"
-    assert seen["cache_signature"]["backend_label"] == "backend:qwen3-asr-1.7b"
+    assert seen["cache_backend"] == f"backend:{ASR_17B_BACKEND}"
+    assert seen["cache_signature"]["backend_label"] == f"backend:{ASR_17B_BACKEND}"
     assert (
         seen["cache_signature"]["asr_stage_config"]["ASR_CHUNK_PACK_FRAME_HOP_S"]
         == "0.0166666666667"
     )
-    assert artifacts.backend_label == "backend:qwen3-asr-1.7b"
-    assert main.os.environ["ASR_BACKEND"] == "anime-whisper"
+    assert artifacts.backend_label == f"backend:{ASR_17B_BACKEND}"
+    assert main.os.environ["ASR_BACKEND"] == ASR_06B_BACKEND
     assert main.os.environ["ASR_CONTEXT"] == "process actor"
 
 
@@ -109,7 +109,7 @@ def test_asr_stage_env_scope_passes_pre_asr_split_flags(monkeypatch, tmp_path):
         video_path,
         output_dir,
         temp_root,
-        asr_backend="qwen3-asr-1.7b",
+        asr_backend=ASR_17B_BACKEND,
         skip_translation=True,
         keep_temp_files=True,
         advanced={
@@ -182,7 +182,7 @@ def test_vad_chunk_cache_dir_reaches_transcribe_but_not_aligned_signature(
         video_path,
         output_dir,
         temp_root,
-        asr_backend="anime-whisper",
+        asr_backend=ASR_06B_BACKEND,
         skip_translation=True,
         keep_temp_files=True,
         advanced={"VAD_CHUNK_CACHE_DIR": str(tmp_path / "vad-cache-a")},

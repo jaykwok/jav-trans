@@ -1,6 +1,6 @@
 from dataclasses import dataclass
 
-from whisper import local_backend
+from asr import local_backend
 
 
 @dataclass

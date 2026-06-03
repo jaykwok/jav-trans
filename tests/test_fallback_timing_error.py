@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from tools.fusionvad_ja.measure_fallback_timing_error import run_measurement
+from tools.asr.diagnostics.measure_fallback_timing_error import run_measurement
 
 
 def _write_json(path: Path, payload: dict) -> None:

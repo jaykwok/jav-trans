@@ -1,4 +1,4 @@
-from whisper import pipeline as asr
+from asr import pipeline as asr
 
 
 def test_word_merge_does_not_cross_source_chunk_boundary():

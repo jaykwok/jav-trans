@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from tools.fusionvad_ja.analyze_subtitle_cue_merge_candidates import build_summary
+from tools.subtitles.analyze_subtitle_cue_merge_candidates import build_summary
 
 
 def _write_json(path: Path, payload: dict) -> Path:
@@ -229,3 +229,62 @@ def test_cue_merge_candidate_analysis_blocks_high_reading_density(
     assert summary["after"]["planner_merge_count"] == 0
     assert summary["pair_analysis"]["planner_blocker_counts"]["reading_density_too_high"] == 1
     assert summary["planner"]["max_reading_units_per_s"] == 12.0
+
+
+def test_cue_merge_candidate_analysis_penalizes_high_speaker_score(
+    tmp_path: Path,
+    monkeypatch,
+):
+    monkeypatch.setenv("SUBTITLE_MERGE_ADJACENT", "0")
+    bilingual = _write_json(
+        tmp_path / "sample.bilingual.json",
+        {
+            "blocks": [
+                {
+                    "start": 0.0,
+                    "end": 0.7,
+                    "ja_text": "あ",
+                    "zh_text": "啊",
+                    "cue_id": 0,
+                },
+                {
+                    "start": 0.9,
+                    "end": 1.4,
+                    "ja_text": "ん",
+                    "zh_text": "嗯",
+                    "cue_id": 1,
+                },
+            ]
+        },
+    )
+    speaker_pairs = _write_jsonl(
+        tmp_path / "speaker_pairs.jsonl",
+        [
+            {
+                "left_cue_id": 0,
+                "right_cue_id": 1,
+                "speaker_change": False,
+                "speaker_change_score": 0.88,
+                "threshold": 0.95,
+            }
+        ],
+    )
+
+    summary = build_summary(
+        bilingual_path=bilingual,
+        timings_path=None,
+        output_dir=tmp_path / "out-speaker-score",
+        video_fps=29.97,
+        min_score=0.5,
+        max_gap_s=0.45,
+        max_combined_s=4.8,
+        max_text_units=34.0,
+        speaker_pairs_path=speaker_pairs,
+        speaker_change_policy="block",
+        speaker_score_penalty_threshold=0.85,
+        speaker_score_penalty=0.4,
+    )
+
+    assert summary["after"]["planner_merge_count"] == 0
+    assert summary["pair_analysis"]["constraint_counts"]["penalized_high_speaker_score_sidecar"] == 1
+    assert summary["planner"]["speaker_score_penalty_threshold"] == 0.85

@@ -829,7 +829,6 @@ def run_pipeline_for_case(
         asr_context="",
         subtitle_mode="zh",
         multi_cue_split=True,
-        vad_threshold=0.35,
         skip_translation=skip_translation,
         target_lang="简体中文",
         translation_glossary="",
@@ -934,6 +933,8 @@ def _manifest_payload(cases: list[DatasetCase], dataset_root: str | Path, index_
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
+    from asr.backends.qwen import QWEN_ASR_06B_REPO_ID
+
     parser = argparse.ArgumentParser(
         description=(
             "Evaluate arbitrary video + reference subtitle pairs from video/test. "
@@ -946,7 +947,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--predictions-root", default="")
     parser.add_argument("--run-pipeline", action="store_true")
     parser.add_argument("--skip-translation", action="store_true")
-    parser.add_argument("--backend", default="whisper-ja-anime-v0.3")
+    parser.add_argument("--backend", default=QWEN_ASR_06B_REPO_ID)
     parser.add_argument("--limit", type=int, default=0)
     parser.add_argument("--case-contains", default="")
     parser.add_argument("--min-overlap-s", type=float, default=0.10)

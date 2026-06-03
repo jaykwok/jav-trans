@@ -4,7 +4,7 @@ from dataclasses import dataclass
 import wave
 from pathlib import Path
 
-from whisper import local_backend
+from asr import local_backend
 
 
 @dataclass

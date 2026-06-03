@@ -4,6 +4,9 @@ import os
 from dataclasses import dataclass, field
 from typing import Any
 
+
+_DEFAULT_ASR_BACKEND = "jaykwok/Qwen3-ASR-0.6B-JA-Anime-Galgame"
+
 from core.config import DEFAULT_SETTINGS
 
 
@@ -61,7 +64,6 @@ class JobContext:
     asr_context: str
     subtitle_mode: str
     multi_cue_split: bool
-    vad_threshold: float
     skip_translation: bool
     target_lang: str
     translation_glossary: str
@@ -94,13 +96,12 @@ class JobContext:
         }
         return cls(
             asr_backend=str(
-                getattr(spec, "asr_backend", "whisper-ja-anime-v0.3")
-                or "whisper-ja-anime-v0.3"
+                getattr(spec, "asr_backend", _DEFAULT_ASR_BACKEND)
+                or _DEFAULT_ASR_BACKEND
             ),
             asr_context=str(getattr(spec, "asr_context", "") or ""),
             subtitle_mode=str(getattr(spec, "subtitle_mode", "bilingual") or "bilingual"),
             multi_cue_split=bool(getattr(spec, "multi_cue_split", True)),
-            vad_threshold=float(getattr(spec, "vad_threshold", 0.35)),
             skip_translation=bool(getattr(spec, "skip_translation", False)),
             target_lang=_translation_setting(
                 spec,

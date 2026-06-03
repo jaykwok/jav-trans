@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from whisper.qc import check_logprob_quality, evaluate_asr_chunk_qc
+from asr.qc import check_logprob_quality, evaluate_asr_chunk_qc
 
 
 def test_ok_when_all_signals_good():
@@ -104,7 +104,7 @@ def test_adaptive_density_uses_adaptive_threshold_env(monkeypatch):
 def test_legacy_density_threshold_removed_from_source():
     root = Path(__file__).resolve().parents[1]
     checked = [
-        root / "src/whisper/qc.py",
+        root / "src/asr/qc.py",
         root / "src/core/config.py",
         root / ".env.example",
     ]

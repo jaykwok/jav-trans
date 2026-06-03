@@ -9,8 +9,6 @@ scipy
 soundfile
 openai
 python-dotenv
-onnxruntime-gpu>=1.16
-ten-vad
 huggingface_hub>=0.25
 fastapi
 uvicorn[standard]

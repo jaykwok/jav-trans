@@ -14,25 +14,8 @@ from utils.model_paths import resolve_model_spec
 
 REQUIRED_MODEL_SPECS = [
     {
-        "label": "default ASR model",
-        "repo_id": "efwkjn/whisper-ja-anime-v0.3",
-    },
-    {
-        "label": "default WhisperSeg VAD model",
-        "repo_id": "TransWithAI/Whisper-Vad-EncDec-ASMR-onnx",
-        "revision": "6ac29e2cbf2f4f8e9b639861766a8639dd666e9c",
-        "allow_patterns": ["model.onnx", "model_metadata.json"],
-    },
-    {
-        "label": "WhisperSeg feature extractor model",
-        "repo_id": "openai/whisper-base",
-        "allow_patterns": [
-            "preprocessor_config.json",
-            "tokenizer_config.json",
-            "vocab.json",
-            "merges.txt",
-            "normalizer.json",
-        ],
+        "label": "default ASR model (jaykwok/Qwen3-ASR-0.6B-JA-Anime-Galgame)",
+        "repo_id": "jaykwok/Qwen3-ASR-0.6B-JA-Anime-Galgame",
     },
     {
         "label": "default forced aligner model",

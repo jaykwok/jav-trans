@@ -6,7 +6,7 @@ from pathlib import Path
 import numpy as np
 import soundfile as sf
 
-from tools.fusionvad_ja.extract_speaker_sidecar_embeddings import build_summary
+from tools.subtitles.extract_speaker_sidecar_embeddings import build_summary
 
 
 def _write_json(path: Path, payload: dict) -> Path:

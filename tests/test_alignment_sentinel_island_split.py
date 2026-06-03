@@ -4,7 +4,7 @@ from pathlib import Path
 
 import pytest
 
-from whisper import transcribe
+from asr import transcribe
 
 
 class _SplitBackend:
@@ -51,14 +51,8 @@ def _sentinel_result() -> dict:
 
 def test_sentinel_island_split_default_off(monkeypatch, tmp_path):
     chunk, source = _chunk(tmp_path)
-    calls: list[str] = []
 
     monkeypatch.delenv("ALIGNMENT_SENTINEL_ISLAND_SPLIT", raising=False)
-    monkeypatch.setattr(
-        transcribe,
-        "detect_speech_spans",
-        lambda _path: calls.append("vad") or ([(1.0, 2.0), (5.0, 6.0)], ""),
-    )
 
     backend = _SplitBackend()
     words, log = transcribe._split_alignment_sentinel_with_speech_islands(
@@ -70,7 +64,6 @@ def test_sentinel_island_split_default_off(monkeypatch, tmp_path):
 
     assert words == []
     assert log == []
-    assert calls == []
 
 
 def test_sentinel_island_split_success_offsets_words(monkeypatch, tmp_path):
@@ -82,8 +75,14 @@ def test_sentinel_island_split_success_offsets_words(monkeypatch, tmp_path):
     monkeypatch.setenv("ASR_CHUNK_PACK_FRAME_HOP_S", "0.02")
     monkeypatch.setattr(
         transcribe,
-        "detect_speech_spans",
-        lambda _path: ([(1.0, 2.0), (5.0, 6.0)], ""),
+        "_build_alignment_sentinel_island_plan",
+        lambda *_args, **_kwargs: {
+            "source_path": str(source),
+            "chunk_start": 10.0,
+            "duration": 10.0,
+            "island_spans": [(10.88, 12.12), (14.88, 16.12)],
+            "log": [],
+        },
     )
 
     def fake_extract(_source_path, spans):
@@ -221,8 +220,17 @@ def test_batch_sentinel_island_split_uses_single_prepare_call(monkeypatch, tmp_p
     monkeypatch.setenv("ASR_CHUNK_PACK_FRAME_HOP_S", "0.02")
     monkeypatch.setattr(
         transcribe,
-        "detect_speech_spans",
-        lambda _path: ([(1.0, 2.0), (5.0, 6.0)], ""),
+        "_build_alignment_sentinel_island_plan",
+        lambda _source_audio_path, chunk, *_args, **_kwargs: {
+            "source_path": str(source),
+            "chunk_start": float(chunk["start"]),
+            "duration": float(chunk["end"]) - float(chunk["start"]),
+            "island_spans": [
+                (float(chunk["start"]) + 0.88, float(chunk["start"]) + 2.12),
+                (float(chunk["start"]) + 4.88, float(chunk["start"]) + 6.12),
+            ],
+            "log": [],
+        },
     )
 
     def fake_extract(_source_path, spans):
@@ -282,8 +290,14 @@ def test_batch_sentinel_island_split_reports_skipped_candidates(monkeypatch, tmp
     monkeypatch.setenv("ALIGNMENT_SENTINEL_ISLAND_SPLIT", "1")
     monkeypatch.setattr(
         transcribe,
-        "detect_speech_spans",
-        lambda _path: ([(1.0, 2.0)], ""),
+        "_build_alignment_sentinel_island_plan",
+        lambda *_args, **_kwargs: {
+            "source_path": str(source),
+            "chunk_start": 10.0,
+            "duration": 10.0,
+            "island_spans": [],
+            "log": ["Alignment speech-island split 跳过: island_count<=1"],
+        },
     )
     monkeypatch.setattr(
         transcribe,

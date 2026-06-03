@@ -7,7 +7,6 @@ from pathlib import Path
 
 from PyInstaller.utils.hooks import (
     collect_data_files,
-    collect_dynamic_libs,
     collect_submodules,
     copy_metadata,
 )
@@ -26,7 +25,6 @@ def _package_dir(name: str) -> Path:
 
 NAGISA_PACKAGE_DIR = _package_dir("nagisa")
 QWEN_ASR_PACKAGE_DIR = _package_dir("qwen_asr")
-TEN_VAD_PACKAGE_DIR = _package_dir("ten_vad")
 
 
 def _require_path(path: str | Path, label: str) -> Path:
@@ -76,22 +74,17 @@ def _ffmpeg_binaries() -> list[tuple[str, str]]:
 datas = collect_data_files("webview", include_py_files=False)
 datas += copy_metadata("torchcodec")
 datas += copy_metadata("nagisa")
-datas += copy_metadata("ten_vad")
 datas += [
     (str(_require_path("src/web/static", "web static assets")), "src/web/static"),
+    (
+        str(_require_path("src/vad/fusionvad_ja/checkpoints", "FusionVAD-JA checkpoints")),
+        "src/vad/fusionvad_ja/checkpoints",
+    ),
     (str(_require_path("icon.ico", "application icon")), "."),
     (str(_require_path("icon.png", "application png icon")), "."),
     (
-        str(_require_path("models/efwkjn-whisper-ja-anime-v0.3", "default ASR model")),
-        "models/efwkjn-whisper-ja-anime-v0.3",
-    ),
-    (
-        str(_require_path("models/TransWithAI-Whisper-Vad-EncDec-ASMR-onnx", "default WhisperSeg VAD model")),
-        "models/TransWithAI-Whisper-Vad-EncDec-ASMR-onnx",
-    ),
-    (
-        str(_require_path("models/openai-whisper-base", "WhisperSeg feature extractor model")),
-        "models/openai-whisper-base",
+        str(_require_path("models/jaykwok-Qwen3-ASR-0.6B-JA-Anime-Galgame", "default ASR model")),
+        "models/jaykwok-Qwen3-ASR-0.6B-JA-Anime-Galgame",
     ),
     (
         str(_require_path("models/Qwen-Qwen3-ForcedAligner-0.6B", "default forced aligner model")),
@@ -105,14 +98,9 @@ datas += [
         str(QWEN_ASR_PACKAGE_DIR / "inference" / "assets"),
         "qwen_asr/inference/assets",
     ),
-    (
-        str(TEN_VAD_PACKAGE_DIR / "lib"),
-        "ten_vad/lib",
-    ),
 ]
 
 binaries = _ffmpeg_binaries()
-binaries += collect_dynamic_libs("onnxruntime")
 
 hiddenimports = [
     "uvicorn.lifespan.on",
@@ -128,8 +116,6 @@ hiddenimports = [
     "dotenv",
     "httpx",
     "huggingface_hub",
-    "onnxruntime",
-    "onnxruntime.capi.onnxruntime_pybind11_state",
     "openai",
     "qwen_asr",
     "mecab_system_eval",
@@ -138,7 +124,6 @@ hiddenimports = [
     "nagisa_utils",
     "prepro",
     "tagger",
-    "ten_vad",
     "librosa",
     "soundfile",
     "scipy",
@@ -151,11 +136,9 @@ hiddenimports += collect_submodules(
     "webview",
     filter=lambda name: not name.startswith("webview.platforms.android"),
 )
-hiddenimports += collect_submodules("transformers.models.whisper")
 hiddenimports += collect_submodules("transformers.generation")
 hiddenimports += collect_submodules("nagisa")
 hiddenimports += collect_submodules("qwen_asr")
-hiddenimports += collect_submodules("ten_vad")
 hiddenimports += collect_submodules("torchcodec")
 hiddenimports += collect_submodules("transformers.models.qwen2")
 hiddenimports += collect_submodules("transformers.models.qwen3")

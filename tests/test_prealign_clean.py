@@ -1,6 +1,6 @@
 from dataclasses import dataclass
 
-from whisper.local_backend import (
+from asr.local_backend import (
     clean_text_for_aligner,
     restore_timestamps_to_original,
 )
@@ -51,7 +51,7 @@ def test_restore_timestamps_to_original_keeps_dirty_original_text():
 
 def test_forced_align_words_sends_cleaned_text_and_restores(monkeypatch):
     aligner = _RecordingAligner()
-    from whisper.local_backend import LocalAsrBackend
+    from asr.local_backend import LocalAsrBackend
 
     backend = LocalAsrBackend("cpu")
     monkeypatch.setattr(backend, "_ensure_forced_aligner", lambda on_stage=None: aligner)

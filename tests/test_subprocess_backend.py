@@ -7,7 +7,7 @@ import os
 def main() -> None:
     os.environ["ASR_WORKER_MOCK"] = "1"
     os.environ.setdefault("ASR_SUBPROCESS_READY_TIMEOUT_S", "10")
-    from whisper.local_backend import SubprocessAsrBackend
+    from asr.local_backend import SubprocessAsrBackend
 
     events: list[str] = []
     backend = SubprocessAsrBackend("cpu")

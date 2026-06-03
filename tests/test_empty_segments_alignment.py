@@ -1,6 +1,6 @@
-from whisper import pipeline as asr
-from whisper import local_backend
-from whisper.local_backend import align_text_to_words
+from asr import pipeline as asr
+from asr import local_backend
+from asr.local_backend import align_text_to_words
 
 
 class _NoFinalizeBackend:

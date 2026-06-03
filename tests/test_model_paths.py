@@ -15,11 +15,9 @@ def test_model_dir_name_uses_huggingface_repo_name():
         model_paths.model_dir_name("jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame")
         == "jaykwok-Qwen3-ASR-1.7B-JA-Anime-Galgame"
     )
-    assert model_paths.model_dir_name("litagin/anime-whisper") == "litagin-anime-whisper"
-    assert model_paths.model_dir_name("efwkjn/whisper-ja-1.5B") == "efwkjn-whisper-ja-1.5B"
     assert (
-        model_paths.model_dir_name("efwkjn/whisper-ja-anime-v0.3")
-        == "efwkjn-whisper-ja-anime-v0.3"
+        model_paths.model_dir_name("jaykwok/Qwen3-ASR-0.6B-JA-Anime-Galgame")
+        == "jaykwok-Qwen3-ASR-0.6B-JA-Anime-Galgame"
     )
 
 
@@ -27,12 +25,12 @@ def test_resolve_model_spec_prefers_models_repo_name(monkeypatch, tmp_path):
     monkeypatch.setattr(model_paths, "PROJECT_ROOT", tmp_path)
     monkeypatch.setattr(model_paths, "MODELS_ROOT", tmp_path / "models")
 
-    local_model = tmp_path / "models" / "litagin-anime-whisper"
+    local_model = tmp_path / "models" / "jaykwok-Qwen3-ASR-0.6B-JA-Anime-Galgame"
     local_model.mkdir(parents=True)
     (local_model / "config.json").write_text("{}", encoding="utf-8")
 
     assert (
-        model_paths.resolve_model_spec(None, "litagin/anime-whisper")
+        model_paths.resolve_model_spec(None, "jaykwok/Qwen3-ASR-0.6B-JA-Anime-Galgame")
         == str(local_model.resolve())
     )
 
@@ -46,12 +44,12 @@ def test_resolve_model_spec_uses_bundled_model_when_runtime_model_missing(monkey
     monkeypatch.setattr(model_paths, "RESOURCE_ROOT", resource_root)
     monkeypatch.setattr(model_paths, "BUNDLED_MODELS_ROOT", resource_root / "models")
 
-    bundled_model = resource_root / "models" / "efwkjn-whisper-ja-anime-v0.3"
+    bundled_model = resource_root / "models" / "jaykwok-Qwen3-ASR-0.6B-JA-Anime-Galgame"
     bundled_model.mkdir(parents=True)
     (bundled_model / "config.json").write_text("{}", encoding="utf-8")
 
     assert (
-        model_paths.resolve_model_spec(None, "efwkjn/whisper-ja-anime-v0.3")
+        model_paths.resolve_model_spec(None, "jaykwok/Qwen3-ASR-0.6B-JA-Anime-Galgame")
         == str(bundled_model.resolve())
     )
 

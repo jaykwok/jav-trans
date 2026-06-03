@@ -72,7 +72,7 @@ def _write_wav(path: Path, seconds: float = 2.0, sample_rate: int = 8000) -> Non
 
 
 def test_vad_chunk_cache_key_ignores_asr_prompt_budget(monkeypatch, tmp_path):
-    from whisper import vad_chunk_cache
+    from asr import vad_chunk_cache
 
     monkeypatch.setenv("VAD_CHUNK_CACHE_DIR", str(tmp_path / "vad-cache"))
     audio = tmp_path / "sample.cf3671a5.wav"
@@ -80,7 +80,7 @@ def test_vad_chunk_cache_key_ignores_asr_prompt_budget(monkeypatch, tmp_path):
 
     lookup_a = vad_chunk_cache.build_cache_lookup(
         str(audio),
-        vad_signature={"backend": "whisperseg_v1", "threshold": 0.35},
+        vad_signature={"backend": "fusionvad_ja", "threshold": 0.35},
         chunk_config=_chunk_config(),
     )
     monkeypatch.setenv("ASR_INITIAL_PROMPT_MAX_CHARS", "160")
@@ -88,7 +88,7 @@ def test_vad_chunk_cache_key_ignores_asr_prompt_budget(monkeypatch, tmp_path):
     monkeypatch.setenv("ASR_MIN_EFFECTIVE_NEW_TOKENS", "96")
     lookup_b = vad_chunk_cache.build_cache_lookup(
         str(audio),
-        vad_signature={"backend": "whisperseg_v1", "threshold": 0.35},
+        vad_signature={"backend": "fusionvad_ja", "threshold": 0.35},
         chunk_config=_chunk_config(),
     )
 
@@ -97,7 +97,7 @@ def test_vad_chunk_cache_key_ignores_asr_prompt_budget(monkeypatch, tmp_path):
 
 
 def test_vad_chunk_cache_key_changes_with_vad_threshold(monkeypatch, tmp_path):
-    from whisper import vad_chunk_cache
+    from asr import vad_chunk_cache
 
     monkeypatch.setenv("VAD_CHUNK_CACHE_DIR", str(tmp_path / "vad-cache"))
     audio = tmp_path / "sample.cf3671a5.wav"
@@ -105,12 +105,12 @@ def test_vad_chunk_cache_key_changes_with_vad_threshold(monkeypatch, tmp_path):
 
     lookup_a = vad_chunk_cache.build_cache_lookup(
         str(audio),
-        vad_signature={"backend": "whisperseg_v1", "threshold": 0.35},
+        vad_signature={"backend": "fusionvad_ja", "threshold": 0.35},
         chunk_config=_chunk_config(),
     )
     lookup_b = vad_chunk_cache.build_cache_lookup(
         str(audio),
-        vad_signature={"backend": "whisperseg_v1", "threshold": 0.45},
+        vad_signature={"backend": "fusionvad_ja", "threshold": 0.45},
         chunk_config=_chunk_config(),
     )
 
@@ -119,7 +119,7 @@ def test_vad_chunk_cache_key_changes_with_vad_threshold(monkeypatch, tmp_path):
 
 
 def test_vad_chunk_cache_round_trips_packed_chunks(monkeypatch, tmp_path):
-    from whisper import vad_chunk_cache
+    from asr import vad_chunk_cache
 
     monkeypatch.setenv("VAD_CHUNK_CACHE_DIR", str(tmp_path / "vad-cache"))
     audio = tmp_path / "sample.cf3671a5.wav"
@@ -193,7 +193,7 @@ def test_vad_chunk_cache_round_trips_packed_chunks(monkeypatch, tmp_path):
 
 
 def test_vad_chunk_cache_key_changes_with_pre_asr_island_split(monkeypatch, tmp_path):
-    from whisper import vad_chunk_cache
+    from asr import vad_chunk_cache
 
     monkeypatch.setenv("VAD_CHUNK_CACHE_DIR", str(tmp_path / "vad-cache"))
     audio = tmp_path / "sample.cf3671a5.wav"
@@ -201,14 +201,14 @@ def test_vad_chunk_cache_key_changes_with_pre_asr_island_split(monkeypatch, tmp_
 
     lookup_a = vad_chunk_cache.build_cache_lookup(
         str(audio),
-        vad_signature={"backend": "whisperseg_v1", "threshold": 0.35},
+        vad_signature={"backend": "fusionvad_ja", "threshold": 0.35},
         chunk_config=_chunk_config(),
     )
     cfg = _chunk_config()
     cfg["pre_asr_island_split_enabled"] = True
     lookup_b = vad_chunk_cache.build_cache_lookup(
         str(audio),
-        vad_signature={"backend": "whisperseg_v1", "threshold": 0.35},
+        vad_signature={"backend": "fusionvad_ja", "threshold": 0.35},
         chunk_config=cfg,
     )
 
@@ -216,7 +216,7 @@ def test_vad_chunk_cache_key_changes_with_pre_asr_island_split(monkeypatch, tmp_
 
 
 def test_vad_chunk_cache_key_changes_with_pre_asr_valley_split(monkeypatch, tmp_path):
-    from whisper import vad_chunk_cache
+    from asr import vad_chunk_cache
 
     monkeypatch.setenv("VAD_CHUNK_CACHE_DIR", str(tmp_path / "vad-cache"))
     audio = tmp_path / "sample.cf3671a5.wav"
@@ -239,7 +239,7 @@ def test_vad_chunk_cache_key_changes_with_pre_asr_valley_split(monkeypatch, tmp_
 
 
 def test_vad_chunk_cache_key_changes_with_pre_asr_cut_split(monkeypatch, tmp_path):
-    from whisper import vad_chunk_cache
+    from asr import vad_chunk_cache
 
     monkeypatch.setenv("VAD_CHUNK_CACHE_DIR", str(tmp_path / "vad-cache"))
     audio = tmp_path / "sample.cf3671a5.wav"
@@ -262,7 +262,7 @@ def test_vad_chunk_cache_key_changes_with_pre_asr_cut_split(monkeypatch, tmp_pat
 
 
 def test_vad_chunk_cache_key_changes_with_pre_asr_risk_split(monkeypatch, tmp_path):
-    from whisper import vad_chunk_cache
+    from asr import vad_chunk_cache
 
     monkeypatch.setenv("VAD_CHUNK_CACHE_DIR", str(tmp_path / "vad-cache"))
     audio = tmp_path / "sample.cf3671a5.wav"
@@ -411,7 +411,7 @@ def test_pipeline_uses_frame_scores_for_valley_split_but_does_not_cache_scores(m
     monkeypatch.setenv("ASR_PRE_ASR_VALLEY_SPLIT_MIN_CHILD_FRAMES", "3")
     monkeypatch.setenv("ASR_PRE_ASR_VALLEY_SPLIT_THRESHOLD", "0.2")
 
-    from whisper import pipeline as asr
+    from asr import pipeline as asr
     asr = importlib.reload(asr)
     audio = tmp_path / "sample.cf3671a5.wav"
     _write_wav(audio, seconds=12.0)
@@ -449,7 +449,7 @@ def test_pipeline_uses_cut_scores_for_cut_split_but_does_not_cache_scores(monkey
     monkeypatch.setenv("ASR_PRE_ASR_CUT_SPLIT_MIN_CHILD_FRAMES", "3")
     monkeypatch.setenv("ASR_PRE_ASR_CUT_SPLIT_THRESHOLD", "0.94")
 
-    from whisper import pipeline as asr
+    from asr import pipeline as asr
     asr = importlib.reload(asr)
     audio = tmp_path / "sample.cf3671a5.wav"
     _write_wav(audio, seconds=12.0)
@@ -489,7 +489,7 @@ def test_pipeline_uses_drop_gap_scores_for_drop_gap_split_but_does_not_cache_sco
     monkeypatch.setenv("ASR_PRE_ASR_DROP_GAP_SPLIT_MIN_CHILD_FRAMES", "3")
     monkeypatch.setenv("ASR_PRE_ASR_DROP_GAP_SPLIT_THRESHOLD", "0.80")
 
-    from whisper import pipeline as asr
+    from asr import pipeline as asr
     asr = importlib.reload(asr)
     audio = tmp_path / "sample.cf3671a5.wav"
     _write_wav(audio, seconds=15.0)
@@ -523,7 +523,7 @@ def test_pipeline_uses_vad_chunk_cache_for_prompt_budget_change(monkeypatch, tmp
     monkeypatch.setenv("ASR_CHUNK_PACK_TARGET_PADDING_FRAMES", "0")
     monkeypatch.setenv("ASR_CHUNK_PACK_GAP_MERGE_FRAMES", "45")
 
-    from whisper import pipeline as asr
+    from asr import pipeline as asr
     asr = importlib.reload(asr)
     audio = tmp_path / "sample.cf3671a5.wav"
     _write_wav(audio)

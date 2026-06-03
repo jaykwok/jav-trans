@@ -209,6 +209,3 @@ def resolve_model_spec(
 
     return repo_id
 
-
-WHISPER_MODEL_PATH = os.getenv("WHISPER_MODEL_PATH", "").strip()
-

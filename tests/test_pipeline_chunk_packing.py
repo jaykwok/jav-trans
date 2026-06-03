@@ -221,7 +221,7 @@ def _reload_pipeline(monkeypatch, tmp_path: Path, *, packing_enabled: str):
     monkeypatch.setenv("VAD_MERGE_GAP_MAX_S", "0")
     monkeypatch.setenv("ASR_CHECKPOINT_ENABLED", "0")
 
-    from whisper import pipeline as asr
+    from asr import pipeline as asr
 
     return importlib.reload(asr)
 
@@ -327,7 +327,7 @@ def test_empty_disallowed_vad_skips_asr_without_full_audio_fallback(monkeypatch,
 
 
 def test_legacy_chunking_helper_does_not_full_audio_fallback(monkeypatch, tmp_path):
-    from whisper import chunking
+    from asr import chunking
 
     source = tmp_path / "legacy_empty.wav"
     _write_wav(source, seconds=12.0)
@@ -340,13 +340,13 @@ def test_legacy_chunking_helper_does_not_full_audio_fallback(monkeypatch, tmp_pa
 
 
 def test_alignment_fallback_count_deduplicates_chunk_log_markers():
-    from whisper import pipeline as asr
+    from asr import pipeline as asr
 
     log = [
         "chunk 1: Alignment 回退: 使用 VAD 约束比例时间戳",
         "chunk 1: Alignment VAD 回退语音区间: 2",
         "chunk 2: Alignment 降级后仍异常: 改用等比分配时间戳",
-        "chunk 2: Alignment VAD 回退异常: ten_vad failed",
+        "chunk 2: Alignment VAD 回退异常: fallback_vad failed",
     ]
 
     assert asr._alignment_fallback_count_from_log(log) == 2

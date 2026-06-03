@@ -1,6 +1,6 @@
 import builtins
 
-from whisper import qc as asr_qc
+from asr import qc as asr_qc
 def _segments(total: int, empty: int = 0) -> list[dict]:
     return [
         {"text": "" if index < empty else f"text-{index}"}

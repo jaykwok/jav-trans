@@ -3,8 +3,8 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from tools.fusionvad_ja.plan_reward_boundary_segments import main
-from tools.fusionvad_ja.export_boundary_imitation_targets import export_boundary_imitation_targets
+from tools.vad.fusionvad_ja.plan_reward_boundary_segments import main
+from tools.vad.fusionvad_ja.export_boundary_imitation_targets import export_boundary_imitation_targets
 
 
 def _write_jsonl(path: Path, rows: list[dict]) -> None:

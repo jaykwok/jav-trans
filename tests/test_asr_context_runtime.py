@@ -1,4 +1,4 @@
-from whisper import transcribe
+from asr import transcribe
 
 
 def test_asr_context_is_read_at_runtime(monkeypatch):

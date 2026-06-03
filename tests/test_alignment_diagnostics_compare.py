@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from tools.fusionvad_ja.compare_alignment_diagnostics import main, summarize_diagnostics
+from tools.asr.diagnostics.compare_alignment_diagnostics import main, summarize_diagnostics
 
 
 def _write_json(path: Path, payload: dict) -> None:

@@ -3,8 +3,8 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from tools.fusionvad_ja.measure_fallback_safe_boundaries import main
-from tools.fusionvad_ja.analyze_fallback_cut_signal import analyze
+from tools.asr.diagnostics.measure_fallback_safe_boundaries import main
+from tools.vad.fusionvad_ja.analyze_fallback_cut_signal import analyze
 
 
 def _write_json(path: Path, payload: dict) -> None:

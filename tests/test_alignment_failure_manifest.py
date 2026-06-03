@@ -3,9 +3,9 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from tools.fusionvad_ja.export_alignment_failure_manifest import main, manifest_row
-from tools.fusionvad_ja.generate_alignment_failure_audit_html import write_html
-from tools.fusionvad_ja.select_alignment_failure_audit_subset import main as subset_main
+from tools.asr.diagnostics.export_alignment_failure_manifest import main, manifest_row
+from tools.audits.generate_alignment_failure_audit_html import write_html
+from tools.asr.diagnostics.select_alignment_failure_audit_subset import main as subset_main
 
 
 def _write_jsonl(path: Path, rows: list[dict]) -> None:
@@ -277,6 +277,28 @@ def test_alignment_failure_audio_audit_has_sync_caption_preview(tmp_path):
     assert "syncCaption" in html
     assert '"left_ja": "あ"' in html
     assert '"right_ja": "い"' in html
+    assert "manual_labels" in html
+    assert "时间轴准确" in html
+    assert "采用去重建议" in html
+    assert "删除/无字幕价值" in html
+    assert "低信息人声/呻吟" in html
+    assert "上句可用" in html
+    assert "下句可用" in html
+    assert "上句文本错" in html
+    assert "下句文本错" in html
+    assert "上句无字幕价值" in html
+    assert "下句无字幕价值" in html
+    assert "上句低信息" in html
+    assert "下句低信息" in html
+    assert "非语音/无字幕" not in html
+    assert "ASR 显示文本（去重前）" in html
+    assert "去重建议文本（去重后）" in html
+    assert "去重后建议" in html
+    assert "sync-compare" in html
+    assert "button:disabled" in html
+    assert "仅作人工审计参考" in html
+    assert "重复修复建议" not in html
+    assert "当前条目没有系统去重建议" in html
     assert "captionOverlay" not in html
 
 
@@ -315,4 +337,16 @@ def test_alignment_failure_video_audit_keeps_video_overlay(tmp_path):
     html = (tmp_path / "audit" / "index.html").read_text(encoding="utf-8")
     assert "captionOverlay" in html
     assert "字幕会叠加在原视频上" in html
+    assert "manual_labels" in html
+    assert "时间轴准确" in html
+    assert "删除/无字幕价值" in html
+    assert "低信息人声/呻吟" in html
+    assert "上句可用" in html
+    assert "下句可用" in html
+    assert "上句文本错" in html
+    assert "下句文本错" in html
+    assert "非语音/无字幕" not in html
+    assert "ASR 显示文本（去重前）" in html
+    assert "去重建议文本（去重后）" in html
+    assert "button:disabled" in html
     assert "同步字幕预览" not in html

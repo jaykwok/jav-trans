@@ -1,0 +1,528 @@
+import hashlib
+import json
+import os
+import re
+import sys
+import uuid
+import wave
+from pathlib import Path
+
+from asr.backends.registry import (
+    current_asr_backend,
+    current_asr_worker_mode,
+)
+from asr.backends.qwen import active_qwen_asr_model_id
+from asr.local_backend import ASR_DTYPE, ALIGNMENT_TIMESTAMP_MODE
+
+
+def _asr_generation_error_kind(kind: str) -> str:
+    normalized = str(kind or "").strip().lower()
+    if normalized in {"timeout", "oom"}:
+        return normalized
+    if normalized in {"crash", "protocol_error"}:
+        return "worker_error"
+    if normalized:
+        return "quarantined"
+    return "quarantined"
+
+
+_LAST_VAD_SIGNATURE: dict = {}
+_ASR_CHUNK_ROOT = Path(
+    os.getenv("ASR_CHUNK_ROOT", Path("temp") / "chunks")
+).resolve()
+
+
+def _checkpoint_enabled(enabled: bool | None = None) -> bool:
+    if enabled is not None:
+        return bool(enabled)
+    return os.getenv("ASR_CHECKPOINT_ENABLED", "1").strip().lower() not in {
+        "0",
+        "false",
+        "no",
+        "off",
+    }
+
+
+def _current_chunk_root(chunk_root: Path | str | None = None) -> Path:
+    if chunk_root is not None:
+        return Path(chunk_root).resolve()
+    return Path(os.getenv("ASR_CHUNK_ROOT", _ASR_CHUNK_ROOT)).resolve()
+
+
+def _is_timed_out_result(result: dict) -> bool:
+    return any("TIMEOUT:" in entry for entry in result.get("log", []))
+
+
+def _checkpointable_text_results(
+    text_results_by_index: dict[int, dict],
+) -> dict[int, dict]:
+    return {
+        index: result
+        for index, result in text_results_by_index.items()
+        if not _is_timed_out_result(result)
+    }
+
+
+def _delete_path_for_cleanup(path: Path) -> None:
+    if not path.exists():
+        return
+
+    try:
+        if path.is_dir():
+            import shutil
+
+            shutil.rmtree(path, ignore_errors=True)
+        else:
+            path.unlink(missing_ok=True)
+    except Exception:
+        pass
+
+
+def _get_wav_duration(audio_path: str) -> float:
+    with wave.open(audio_path, "rb") as wav_file:
+        frames = wav_file.getnframes()
+        rate = wav_file.getframerate()
+    return frames / rate if rate else 0.0
+
+
+def _env_text(name: str, default: str = "") -> str:
+    return os.getenv(name, default).strip()
+
+
+def _env_lower(name: str, default: str = "") -> str:
+    return _env_text(name, default).lower()
+
+
+def _signature_json(payload: dict) -> str:
+    return json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+
+def _json_or_text(value: str) -> dict | str:
+    if not value:
+        return ""
+    try:
+        parsed = json.loads(value)
+    except Exception:
+        return value
+    return parsed if isinstance(parsed, dict) else value
+
+
+def _get_asr_runtime_signature(
+    *,
+    last_vad_signature: dict | None = None,
+    sliding_context_segs: int | None = None,
+) -> dict:
+    if sliding_context_segs is None:
+        try:
+            sliding_context_segs = max(0, int(os.getenv("ASR_SLIDING_CONTEXT_SEGS", "2")))
+        except (TypeError, ValueError):
+            sliding_context_segs = 2
+    vad_signature = _LAST_VAD_SIGNATURE if last_vad_signature is None else last_vad_signature
+    return {
+        "version": 2,
+        "backend": current_asr_backend(),
+        "worker_mode": current_asr_worker_mode(),
+        "timestamp": {
+            "alignment_mode": _env_lower("ALIGNMENT_TIMESTAMP_MODE", ALIGNMENT_TIMESTAMP_MODE),
+        },
+        "model": {
+            "asr_model_id": _env_text("ASR_MODEL_ID", ""),
+            "resolved_asr_model_id": active_qwen_asr_model_id(),
+            "asr_model_path": _env_text("ASR_MODEL_PATH", ""),
+            "asr_dtype": _env_lower("ASR_DTYPE", ASR_DTYPE),
+            "asr_attention": _env_lower("ASR_ATTENTION", "auto"),
+        },
+        "language": {
+            "asr_language": _env_text("ASR_LANGUAGE", "Japanese") or "Japanese",
+            "asr_force_language": _env_lower("ASR_FORCE_LANGUAGE", "1"),
+        },
+        "context": {
+            "asr_context": _env_text("ASR_CONTEXT", ""),
+            "asr_head_context": _env_text("ASR_HEAD_CONTEXT", ""),
+            "asr_head_context_max_start_s": _env_text(
+                "ASR_HEAD_CONTEXT_MAX_START_S",
+                "16",
+            ),
+            "sliding_context_segs": sliding_context_segs,
+        },
+        "generation": {
+            "asr_max_new_tokens": _env_text("ASR_MAX_NEW_TOKENS", "128"),
+            "transcription_max_new_tokens": _env_text(
+                "TRANSCRIPTION_MAX_NEW_TOKENS",
+                _env_text("ASR_MAX_NEW_TOKENS", "128"),
+            ),
+            "asr_initial_prompt_max_chars": _env_text(
+                "ASR_INITIAL_PROMPT_MAX_CHARS",
+                "240",
+            ),
+            "asr_initial_prompt_max_tokens": _env_text(
+                "ASR_INITIAL_PROMPT_MAX_TOKENS",
+                "180",
+            ),
+            "asr_min_effective_new_tokens": _env_text(
+                "ASR_MIN_EFFECTIVE_NEW_TOKENS",
+                "64",
+            ),
+            "asr_repetition_penalty": _env_text("ASR_REPETITION_PENALTY", "1.05"),
+            "qc_adaptive_base_logprob": _env_text(
+                "ASR_QC_ADAPTIVE_BASE_LOGPROB",
+                "-0.7",
+            ),
+            "qc_adaptive_min_logprob": _env_text(
+                "ASR_QC_ADAPTIVE_MIN_LOGPROB",
+                "-0.95",
+            ),
+            "qc_adaptive_max_logprob": _env_text(
+                "ASR_QC_ADAPTIVE_MAX_LOGPROB",
+                "-0.55",
+            ),
+            "qc_adaptive_video_mad_multiplier": _env_text(
+                "ASR_QC_ADAPTIVE_VIDEO_MAD_MULTIPLIER",
+                "1.8",
+            ),
+            "qc_adaptive_video_max_logprob": _env_text(
+                "ASR_QC_ADAPTIVE_VIDEO_MAX_LOGPROB",
+                "-0.70",
+            ),
+            "qc_adaptive_hard_nospeech_threshold": _env_text(
+                "ASR_QC_ADAPTIVE_HARD_NOSPEECH_THRESHOLD",
+                "0.5",
+            ),
+            "qc_adaptive_hard_compression_threshold": _env_text(
+                "ASR_QC_ADAPTIVE_HARD_COMPRESSION_THRESHOLD",
+                "2.0",
+            ),
+            "qc_adaptive_hard_max_chars_per_sec": _env_text(
+                "ASR_QC_ADAPTIVE_HARD_MAX_CHARS_PER_SEC",
+                "14.0",
+            ),
+            "qc_adaptive_hard_repeat_ratio": _env_text(
+                "ASR_QC_ADAPTIVE_HARD_REPEAT_RATIO",
+                "0.45",
+            ),
+            "qc_drop_uncertain": _env_lower("ASR_QC_DROP_UNCERTAIN", "0"),
+        },
+        "vad": vad_signature if isinstance(vad_signature, dict) else {},
+    }
+
+
+def _get_asr_checkpoint_path(
+    audio_path: str,
+    *,
+    last_vad_signature: dict | None = None,
+    chunk_root: Path | str | None = None,
+    sliding_context_segs: int | None = None,
+) -> Path:
+    runtime_signature = _get_asr_runtime_signature(
+        last_vad_signature=last_vad_signature,
+        sliding_context_segs=sliding_context_segs,
+    )
+    key = hashlib.sha1(
+        _signature_json(
+            {
+                "audio_path": audio_path,
+                "runtime": runtime_signature,
+            }
+        ).encode()
+    ).hexdigest()[:10]
+    return _current_chunk_root(chunk_root).parent / f"asr_checkpoint_{key}.json"
+
+
+def _get_asr_checkpoint_source(chunks: list[dict], text_stage_label: str) -> str:
+    source = str(chunks[0].get("source_audio_path") or chunks[0].get("path", ""))
+    return f"{source}|{text_stage_label}"
+
+
+def _chunk_checkpoint_signature(
+    chunks: list[dict],
+    *,
+    last_vad_signature: dict | None = None,
+) -> dict[str, dict[str, float | str]]:
+    vad_signature = _LAST_VAD_SIGNATURE if last_vad_signature is None else last_vad_signature
+    return {
+        str(int(chunk["index"])): {
+            "start": round(float(chunk.get("start", 0.0)), 3),
+            "end": round(float(chunk.get("end", 0.0)), 3),
+            "vad_method": vad_signature.get("backend", "unknown"),
+        }
+        for chunk in chunks
+    }
+
+
+def _load_asr_checkpoint(
+    checkpoint_path: Path,
+    checkpoint_source: str,
+    chunks: list[dict],
+    run_id: str | None = None,
+    *,
+    last_vad_signature: dict | None = None,
+    checkpoint_enabled: bool | None = None,
+) -> dict[int, dict]:
+    if not _checkpoint_enabled(checkpoint_enabled) or not checkpoint_path.exists():
+        return {}
+
+    try:
+        with open(checkpoint_path, "r", encoding="utf-8") as reader:
+            payload = json.load(reader)
+    except Exception:
+        return {}
+
+    if payload.get("audio_path") != checkpoint_source:
+        return {}
+
+    raw_results = payload.get("results", {})
+    if not isinstance(raw_results, dict):
+        return {}
+
+    chunk_by_index = {int(chunk["index"]): chunk for chunk in chunks}
+    expected_signature = _chunk_checkpoint_signature(
+        chunks,
+        last_vad_signature=last_vad_signature,
+    )
+    saved_signature = payload.get("chunks", {})
+    restored: dict[int, dict] = {}
+
+    for key, value in raw_results.items():
+        try:
+            chunk_index = int(key)
+        except (TypeError, ValueError):
+            continue
+        if chunk_index not in chunk_by_index or not isinstance(value, dict):
+            continue
+        if _is_timed_out_result(value):
+            continue
+        saved_chunk_signature = (
+            saved_signature.get(str(chunk_index))
+            if isinstance(saved_signature, dict)
+            else None
+        )
+        if isinstance(saved_chunk_signature, dict) and "vad_method" not in saved_chunk_signature:
+            print(
+                f"[WARN] ASR checkpoint resume: chunk {chunk_index} missing vad_method; skip stale checkpoint entry",
+                file=sys.stderr,
+            )
+            continue
+        if (
+            isinstance(saved_signature, dict)
+            and saved_signature
+            and saved_chunk_signature != expected_signature.get(str(chunk_index))
+        ):
+            continue
+
+        chunk = chunk_by_index[chunk_index]
+        result = dict(value)
+        current_path = str(Path(chunk["path"]).resolve())
+        result["normalized_path"] = current_path
+        try:
+            result["duration"] = _get_wav_duration(current_path)
+        except Exception:
+            result["duration"] = float(result.get("duration", 0.0))
+        result.setdefault("language", "Japanese")
+        result.setdefault("text", "")
+        result.setdefault("raw_text", result.get("text", ""))
+        result_log = list(result.get("log", []))
+        result_log.append("ASR checkpoint resume: restored chunk text")
+        saved_run_id = payload.get("run_id")
+        if run_id and saved_run_id and saved_run_id != run_id:
+            result_log.append(
+                f"ASR checkpoint resume: saved_run_id={saved_run_id}, current_run_id={run_id}"
+            )
+        result["log"] = result_log
+        restored[chunk_index] = result
+
+    return restored
+
+
+def _save_asr_checkpoint(
+    checkpoint_path: Path,
+    checkpoint_source: str,
+    chunks: list[dict],
+    results_by_index: dict[int, dict],
+    run_id: str | None = None,
+    *,
+    last_vad_signature: dict | None = None,
+    checkpoint_enabled: bool | None = None,
+) -> None:
+    if not _checkpoint_enabled(checkpoint_enabled):
+        return
+    checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "audio_path": checkpoint_source,
+        "chunks": _chunk_checkpoint_signature(
+            chunks,
+            last_vad_signature=last_vad_signature,
+        ),
+        "results": {str(key): value for key, value in sorted(results_by_index.items())},
+    }
+    if run_id:
+        payload["run_id"] = run_id
+    tmp_path = checkpoint_path.with_name(
+        f"{checkpoint_path.name}.{uuid.uuid4().hex[:8]}.tmp"
+    )
+    try:
+        with open(tmp_path, "w", encoding="utf-8") as writer:
+            json.dump(payload, writer, ensure_ascii=False)
+        tmp_path.replace(checkpoint_path)
+    finally:
+        _delete_path_for_cleanup(tmp_path)
+
+
+def _build_quarantined_text_result(
+    chunk: dict,
+    *,
+    kind: str,
+    detail: str,
+    respawn_count: int,
+    run_id: str | None = None,
+) -> dict:
+    normalized_path = str(Path(chunk["path"]).resolve())
+    try:
+        duration = _get_wav_duration(normalized_path)
+    except Exception:
+        duration = max(
+            0.0,
+            float(chunk.get("end", 0.0)) - float(chunk.get("start", 0.0)),
+        )
+
+    return {
+        "text": "",
+        "raw_text": "",
+        "duration": duration,
+        "language": "Japanese",
+        "normalized_path": normalized_path,
+        "segments": [],
+        "asr_generation": {
+            "backend": current_asr_backend(),
+            "configured_max_new_tokens": _env_text(
+                "TRANSCRIPTION_MAX_NEW_TOKENS",
+                _env_text("ASR_MAX_NEW_TOKENS", "128"),
+            ),
+            "model_max_target_positions": None,
+            "policy": "quarantined_result",
+            "worker_mode": current_asr_worker_mode(),
+            "error_kind": _asr_generation_error_kind(kind),
+            "failure_kind": str(kind or "").strip().lower(),
+            "error_detail": str(detail or ""),
+            "respawn_count": int(respawn_count),
+            "run_id": run_id or "",
+        },
+        "log": [
+            (
+                "QUARANTINED: "
+                f"kind={kind}, respawn_count={respawn_count}, "
+                f"run_id={run_id or ''}, detail={detail}"
+            )
+        ],
+    }
+
+
+def _quarantine_failed_chunks(
+    checkpoint_source: str,
+    chunks: list[dict],
+    failure_records: list[dict],
+    *,
+    run_id: str | None = None,
+    worker_mode: str | None = None,
+) -> list[Path]:
+    if not failure_records:
+        return []
+
+    chunk_by_index = {int(chunk["index"]): chunk for chunk in chunks}
+    out_dir = _ASR_CHUNK_ROOT.parent / "asr_timeouts"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    written: list[Path] = []
+
+    for record in failure_records:
+        try:
+            chunk_index = int(record["index"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        chunk = chunk_by_index.get(chunk_index)
+        if chunk is None:
+            continue
+
+        record_run_id = str(record.get("run_id") or run_id or "unknown")
+        chunk_key = hashlib.sha1(
+            f"{checkpoint_source}|{chunk_index}".encode()
+        ).hexdigest()[:10]
+        target = out_dir / f"timeouts_{chunk_key}_{record_run_id}.json"
+        tmp_path = target.with_name(f"{target.name}.{uuid.uuid4().hex[:8]}.tmp")
+        payload = {
+            "run_id": record_run_id,
+            "audio_path": checkpoint_source,
+            "chunk_index": chunk_index,
+            "start": float(chunk.get("start", 0.0)),
+            "end": float(chunk.get("end", 0.0)),
+            "model": active_qwen_asr_model_id(),
+            "dtype": ASR_DTYPE,
+            "timeout_s": float(os.getenv("TRANSCRIPTION_TIMEOUT_S", "180")),
+            "respawn_count": int(record.get("respawn_count", 0)),
+            "failure_kind": str(record.get("kind") or "crash"),
+            "last_error": str(record.get("detail", "")),
+            "worker_mode": str(record.get("worker_mode") or worker_mode or current_asr_worker_mode()),
+        }
+        try:
+            with open(tmp_path, "w", encoding="utf-8") as writer:
+                json.dump(payload, writer, ensure_ascii=False, indent=2)
+            tmp_path.replace(target)
+            written.append(target)
+        except Exception:
+            _delete_path_for_cleanup(tmp_path)
+
+    return written
+
+
+def aggregate_timeout_fragments(job_id: str) -> Path | None:
+    normalized_job_id = re.sub(r"[^0-9A-Za-z._-]+", "_", (job_id or "").strip())
+    normalized_job_id = normalized_job_id.strip("._-")
+    if not normalized_job_id:
+        return None
+
+    out_dir = _ASR_CHUNK_ROOT.parent / "asr_timeouts"
+    if not out_dir.exists() or not out_dir.is_dir():
+        return None
+
+    fragments: list[Path] = []
+    for path in out_dir.glob("timeouts_*.json"):
+        if path.name.startswith("timeouts_summary_"):
+            continue
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        candidates = {
+            str(payload.get("job_id") or ""),
+            str(payload.get("video_name") or ""),
+            str(payload.get("video_stem") or ""),
+            str(payload.get("source_job_id") or ""),
+        }
+        audio_path = str(payload.get("audio_path") or "")
+        if normalized_job_id in candidates or f"/{normalized_job_id}/" in audio_path.replace("\\", "/"):
+            fragments.append(path)
+
+    if not fragments:
+        return None
+
+    records: list[dict] = []
+    for path in sorted(fragments, key=lambda item: item.name):
+        try:
+            records.append(json.loads(path.read_text(encoding="utf-8")))
+        except Exception as exc:
+            records.append({"source_file": path.name, "parse_error": repr(exc)})
+
+    summary_path = out_dir / f"timeouts_summary_{normalized_job_id}.json"
+    tmp_path = summary_path.with_name(f"{summary_path.name}.{uuid.uuid4().hex[:8]}.tmp")
+    payload = {
+        "job_id": normalized_job_id,
+        "count": len(records),
+        "fragments": [path.name for path in sorted(fragments, key=lambda item: item.name)],
+        "records": records,
+    }
+    with open(tmp_path, "w", encoding="utf-8") as writer:
+        json.dump(payload, writer, ensure_ascii=False, indent=2)
+    tmp_path.replace(summary_path)
+
+    for path in fragments:
+        _delete_path_for_cleanup(path)
+
+    return summary_path
