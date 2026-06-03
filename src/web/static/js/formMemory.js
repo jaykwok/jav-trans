@@ -7,9 +7,13 @@ const FORM_MEMORY_SELECTOR = 'input[id], select[id], textarea[id]';
 export function loadFormMemory() {
   try {
     const raw = JSON.parse(localStorage.getItem(FORM_MEMORY_KEY) || '{}');
-    return { controls: raw.controls || {}, details: raw.details || {} };
+    return {
+      controls: raw.controls || {},
+      details: raw.details || {},
+      activePreset: raw.activePreset || 'standard',
+    };
   } catch {
-    return { controls: {}, details: {} };
+    return { controls: {}, details: {}, activePreset: 'standard' };
   }
 }
 
