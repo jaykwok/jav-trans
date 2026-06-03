@@ -188,6 +188,10 @@ def _text_units(block: dict[str, Any]) -> float:
     return float(subtitle_writer._block_text_units(block))
 
 
+def _reading_units_per_s(units: float, duration_s: float) -> float:
+    return units / max(0.05, duration_s)
+
+
 def _same_speaker_or_unknown(left: dict[str, Any], right: dict[str, Any]) -> bool:
     return bool(subtitle_writer._same_speaker_or_unknown(left, right))
 
@@ -375,6 +379,7 @@ def planner_merge_score(
     max_gap_s: float,
     max_combined_s: float,
     max_text_units: float,
+    max_reading_units_per_s: float = 0.0,
     speaker_pairs: dict[tuple[str, str], dict[str, Any]] | None = None,
     diagnostics: dict[int, dict[str, Any]] | None = None,
     speaker_change_policy: str = "block",
@@ -411,6 +416,9 @@ def planner_merge_score(
         return 0.0, ["combined_duration_too_long"]
     if combined_units > max_text_units:
         return 0.0, ["text_units_too_large"]
+    reading_units_per_s = _reading_units_per_s(combined_units, combined_duration)
+    if max_reading_units_per_s > 0 and reading_units_per_s > max_reading_units_per_s:
+        return 0.0, ["reading_density_too_high"]
     if _ends_sentence(left):
         return 0.0, ["sentence_boundary"]
 
@@ -430,6 +438,9 @@ def planner_merge_score(
     score += max(0.0, 1.0 - combined_duration / max(max_combined_s, 0.001)) * 0.25
     score += max(0.0, 1.0 - combined_units / max(max_text_units, 0.001)) * 0.25
     score += (1.0 if min(left_duration, right_duration) < 0.8 else 0.0) * 0.15
+    if max_reading_units_per_s > 0:
+        density_ratio = reading_units_per_s / max(max_reading_units_per_s, 0.001)
+        score -= max(0.0, density_ratio - 0.75) * 0.12
     for reason, penalty in penalties:
         reasons.append(reason)
         score -= penalty
@@ -457,6 +468,7 @@ def apply_planner_candidates(
     max_gap_s: float,
     max_combined_s: float,
     max_text_units: float,
+    max_reading_units_per_s: float = 0.0,
     speaker_pairs: dict[tuple[str, str], dict[str, Any]] | None = None,
     diagnostics: dict[int, dict[str, Any]] | None = None,
     speaker_change_policy: str = "block",
@@ -480,6 +492,7 @@ def apply_planner_candidates(
                 max_gap_s=max_gap_s,
                 max_combined_s=max_combined_s,
                 max_text_units=max_text_units,
+                max_reading_units_per_s=max_reading_units_per_s,
                 speaker_pairs=speaker_pairs,
                 diagnostics=diagnostics,
                 speaker_change_policy=speaker_change_policy,
@@ -528,6 +541,7 @@ def summarize_pairs(
     max_gap_s: float,
     max_combined_s: float,
     max_text_units: float,
+    max_reading_units_per_s: float = 0.0,
     speaker_pairs: dict[tuple[str, str], dict[str, Any]] | None = None,
     diagnostics: dict[int, dict[str, Any]] | None = None,
     speaker_change_policy: str = "block",
@@ -557,6 +571,7 @@ def summarize_pairs(
             max_gap_s=max_gap_s,
             max_combined_s=max_combined_s,
             max_text_units=max_text_units,
+            max_reading_units_per_s=max_reading_units_per_s,
             speaker_pairs=speaker_pairs,
             diagnostics=diagnostics,
             speaker_change_policy=speaker_change_policy,
@@ -601,6 +616,14 @@ def summarize_pairs(
                             6,
                         ),
                         "combined_text_units": round(_text_units(left) + _text_units(right), 3),
+                        "combined_reading_units_per_s": round(
+                            _reading_units_per_s(
+                                _text_units(left) + _text_units(right),
+                                max(_float(left, "end"), _float(right, "end"))
+                                - _float(left, "start"),
+                            ),
+                            3,
+                        ),
                         "left_text": str(left.get("ja_text") or left.get("text") or "")[:80],
                         "right_text": str(right.get("ja_text") or right.get("text") or "")[:80],
                         "constraints": annotations,
@@ -614,6 +637,7 @@ def summarize_pairs(
                 "gap_too_large",
                 "combined_duration_too_long",
                 "text_units_too_large",
+                "reading_density_too_high",
                 "sentence_boundary",
                 "fallback_risk_boundary",
             }
@@ -709,6 +733,7 @@ def build_summary(
     max_gap_s: float,
     max_combined_s: float,
     max_text_units: float,
+    max_reading_units_per_s: float = 0.0,
     diagnostics_path: Path | None = None,
     speaker_pairs_path: Path | None = None,
     speaker_change_policy: str = "block",
@@ -728,6 +753,7 @@ def build_summary(
         max_gap_s=max_gap_s,
         max_combined_s=max_combined_s,
         max_text_units=max_text_units,
+        max_reading_units_per_s=max_reading_units_per_s,
         speaker_pairs=speaker_pairs,
         diagnostics=diagnostics,
         speaker_change_policy=speaker_change_policy,
@@ -740,6 +766,7 @@ def build_summary(
         max_gap_s=max_gap_s,
         max_combined_s=max_combined_s,
         max_text_units=max_text_units,
+        max_reading_units_per_s=max_reading_units_per_s,
         speaker_pairs=speaker_pairs,
         diagnostics=diagnostics,
         speaker_change_policy=speaker_change_policy,
@@ -776,6 +803,7 @@ def build_summary(
             "max_gap_s": max_gap_s,
             "max_combined_s": max_combined_s,
             "max_text_units": max_text_units,
+            "max_reading_units_per_s": max_reading_units_per_s,
             "speaker_change_policy": speaker_change_policy,
             "fallback_risk_policy": fallback_risk_policy,
             "diagnostic_chunk_count": len(diagnostics),
@@ -841,6 +869,12 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--max-combined-s", type=float, default=4.8)
     parser.add_argument("--max-text-units", type=float, default=34.0)
     parser.add_argument(
+        "--max-reading-units-per-s",
+        type=float,
+        default=0.0,
+        help="Optional reading-density gate; 0 disables this diagnostic constraint.",
+    )
+    parser.add_argument(
         "--speaker-change-policy",
         choices=("block", "penalize", "ignore"),
         default="block",
@@ -863,6 +897,7 @@ def main(argv: list[str] | None = None) -> int:
         max_gap_s=float(args.max_gap_s),
         max_combined_s=float(args.max_combined_s),
         max_text_units=float(args.max_text_units),
+        max_reading_units_per_s=float(args.max_reading_units_per_s),
         diagnostics_path=project_path(args.diagnostics) if args.diagnostics else None,
         speaker_pairs_path=project_path(args.speaker_pairs) if args.speaker_pairs else None,
         speaker_change_policy=args.speaker_change_policy,
