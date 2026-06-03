@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from tools.fusionvad_ja.replay_subtitle_postprocess import build_summary
+from tools.subtitles.replay_subtitle_postprocess import build_summary
 
 
 def _write_json(path: Path, payload: dict) -> Path:

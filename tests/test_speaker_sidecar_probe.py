@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from tools.fusionvad_ja.probe_speaker_sidecar import build_adjacent_speaker_change_rows
+from tools.subtitles.probe_speaker_sidecar import build_adjacent_speaker_change_rows
 
 
 def test_adjacent_speaker_change_scores_from_embeddings():
@@ -24,7 +24,7 @@ def test_adjacent_speaker_change_scores_from_embeddings():
 
 
 def test_speaker_sidecar_cli_writes_pairs(monkeypatch, tmp_path: Path):
-    from tools.fusionvad_ja import probe_speaker_sidecar
+    from tools.subtitles import probe_speaker_sidecar
 
     segments = tmp_path / "segments.jsonl"
     output = tmp_path / "pairs.jsonl"

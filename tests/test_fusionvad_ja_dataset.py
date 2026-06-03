@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
 
 import numpy as np
 import pytest
 
+from asr.backends.qwen import QWEN_ASR_06B_REPO_ID, QWEN_ASR_17B_REPO_ID
 from vad.base import SpeechSegment
 from vad.fusionvad_ja import (
     AdditionFusionBiLSTM,
@@ -16,7 +18,6 @@ from vad.fusionvad_ja import (
     FeatureTrainConfig,
     ImitationTrainConfig,
     TeacherSegment,
-    TimestampSpanVadBackend,
     TrainConfig,
     align_feature_frames,
     audit_audio,
@@ -36,7 +37,6 @@ from vad.fusionvad_ja import (
     evaluate_addition_fusion_classifier,
     frame_classification_counts,
     frame_count,
-    get_research_vad_backend,
     is_default_trainable,
     is_low_frame_rate_ptm,
     is_qwen3_asr_ptm,
@@ -63,55 +63,22 @@ from vad.fusionvad_ja import (
 from vad.fusionvad_ja.train import build_lazy_imitation_feature_windows
 
 
-def test_pseudo_label_discovers_supported_inputs(tmp_path):
-    import importlib.util
-
-    script_path = (
-        __import__("pathlib").Path(__file__).resolve().parents[1]
-        / "tools"
-        / "fusionvad_ja"
-        / "pseudo_label.py"
-    )
-    spec = importlib.util.spec_from_file_location("fusionvad_ja_pseudo_label", script_path)
-    assert spec and spec.loader
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-
-    (tmp_path / "a.wav").write_bytes(b"")
-    (tmp_path / "b.mp4").write_bytes(b"")
-    (tmp_path / "ignore.txt").write_text("", encoding="utf-8")
-
-    paths = module.discover_inputs([str(tmp_path)])
-
-    assert [path.name for path in paths] == ["a.wav", "b.mp4"]
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+TOOL_SCRIPT_ROOTS = (
+    PROJECT_ROOT / "tools" / "vad" / "fusionvad_ja",
+    PROJECT_ROOT / "tools" / "asr" / "diagnostics",
+    PROJECT_ROOT / "tools" / "asr" / "qwen",
+    PROJECT_ROOT / "tools" / "audits",
+    PROJECT_ROOT / "tools" / "subtitles",
+)
 
 
-def test_pseudo_label_sample_audio_reads_hf_ogg_shape():
-    import importlib.util
-
-    script_path = (
-        __import__("pathlib").Path(__file__).resolve().parents[1]
-        / "tools"
-        / "fusionvad_ja"
-        / "pseudo_label.py"
-    )
-    spec = importlib.util.spec_from_file_location("fusionvad_ja_pseudo_label_sample", script_path)
-    assert spec and spec.loader
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-
-    audio, sample_rate, text, audio_id = module.sample_audio(
-        {
-            "__key__": "abc",
-            "ogg": {"array": np.array([0.0, 0.1], dtype=np.float32), "sampling_rate": 16000},
-            "txt": "テスト",
-        }
-    )
-
-    assert np.allclose(audio, [0.0, 0.1])
-    assert sample_rate == 16000
-    assert text == "テスト"
-    assert audio_id == "abc"
+def _tool_script(name: str) -> Path:
+    for root in TOOL_SCRIPT_ROOTS:
+        candidate = root / name
+        if candidate.exists():
+            return candidate
+    raise AssertionError(f"tool script not found: {name}")
 
 
 def test_hf_audio_sample_normalizes_to_16k_mono():
@@ -179,41 +146,10 @@ def test_stable_hf_audio_id_sanitizes_dataset_and_split():
     )
 
 
-def test_pseudo_label_requires_input_or_hf_dataset():
-    import importlib.util
-
-    script_path = (
-        __import__("pathlib").Path(__file__).resolve().parents[1]
-        / "tools"
-        / "fusionvad_ja"
-        / "pseudo_label.py"
-    )
-    spec = importlib.util.spec_from_file_location("fusionvad_ja_pseudo_label_args", script_path)
-    assert spec and spec.loader
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-
-    try:
-        module.parse_args([])
-    except SystemExit as exc:
-        assert exc.code == 2
-    else:
-        raise AssertionError("parse_args should require --input or --hf-dataset")
-
-    args = module.parse_args(["--hf-dataset", "litagin/Galgame_Speech_ASR_16kHz", "--hf-limit", "1"])
-    assert args.hf_dataset == "litagin/Galgame_Speech_ASR_16kHz"
-    assert args.input is None
-
-
 def test_seed_label_cli_builds_supervised_records_from_timestamp_datasets():
     import importlib.util
 
-    script_path = (
-        __import__("pathlib").Path(__file__).resolve().parents[1]
-        / "tools"
-        / "fusionvad_ja"
-        / "build_seed_labels.py"
-    )
+    script_path = _tool_script("build_seed_labels.py")
     spec = importlib.util.spec_from_file_location("fusionvad_ja_seed_labels", script_path)
     assert spec and spec.loader
     module = importlib.util.module_from_spec(spec)
@@ -254,30 +190,10 @@ def test_seed_label_cli_builds_supervised_records_from_timestamp_datasets():
     assert vox.speech_frames == [0, 1, 0, 1, 1]
 
 
-def test_research_vad_backend_exposes_extra_teachers_without_public_registration():
-    import pytest
-    import vad
-
-    with pytest.raises(ValueError, match="silero"):
-        vad.get_vad_backend("silero")
-
-    assert get_research_vad_backend("fusion_lite").name == "fusion_lite_v1"
-    assert get_research_vad_backend("whisperseg-adaptive").name == "whisperseg_v1"
-    assert get_research_vad_backend("silero").name == "silero_vad"
-    ten = get_research_vad_backend("ten_vad")
-    assert isinstance(ten, TimestampSpanVadBackend)
-    assert ten.signature()["backend"] == "ten_vad"
-
-
 def test_seed_label_cli_requires_at_least_one_source():
     import importlib.util
 
-    script_path = (
-        __import__("pathlib").Path(__file__).resolve().parents[1]
-        / "tools"
-        / "fusionvad_ja"
-        / "build_seed_labels.py"
-    )
+    script_path = _tool_script("build_seed_labels.py")
     spec = importlib.util.spec_from_file_location("fusionvad_ja_seed_labels_args", script_path)
     assert spec and spec.loader
     module = importlib.util.module_from_spec(spec)
@@ -315,12 +231,7 @@ def test_seed_label_cli_requires_at_least_one_source():
 def test_slice_labeled_audio_cli_adjusts_segments():
     import importlib.util
 
-    script_path = (
-        __import__("pathlib").Path(__file__).resolve().parents[1]
-        / "tools"
-        / "fusionvad_ja"
-        / "slice_labeled_audio.py"
-    )
+    script_path = _tool_script("slice_labeled_audio.py")
     spec = importlib.util.spec_from_file_location("fusionvad_ja_slice_labeled_audio", script_path)
     assert spec and spec.loader
     module = importlib.util.module_from_spec(spec)
@@ -350,12 +261,7 @@ def test_combine_manifest_cli_loads_manifest_rows(tmp_path):
     import importlib.util
     import json
 
-    script_path = (
-        __import__("pathlib").Path(__file__).resolve().parents[1]
-        / "tools"
-        / "fusionvad_ja"
-        / "combine_manifests.py"
-    )
+    script_path = _tool_script("combine_manifests.py")
     spec = importlib.util.spec_from_file_location("fusionvad_ja_combine_manifests", script_path)
     assert spec and spec.loader
     module = importlib.util.module_from_spec(spec)
@@ -512,8 +418,8 @@ def test_build_weighted_teacher_record_ignores_conflicts_and_boundaries():
         source="unit",
         duration_s=2.0,
         teacher_segments={
-            "whisperseg-adaptive": [(0.2, 0.8), (1.4, 1.8)],
-            "fusion_lite": [(0.3, 0.9)],
+            "teacher_a": [(0.2, 0.8), (1.4, 1.8)],
+            "teacher_b": [(0.3, 0.9)],
         },
         frame_hop_s=0.1,
         min_speech_teachers=2,
@@ -540,7 +446,7 @@ def test_build_weighted_teacher_record_keeps_text_clip_without_teacher_agreement
         source="unit",
         duration_s=0.5,
         text="こんにちは",
-        teacher_segments={"whisperseg-adaptive": [], "fusion_lite": []},
+        teacher_segments={"teacher_a": [], "teacher_b": []},
         frame_hop_s=0.25,
     )
 
@@ -684,13 +590,13 @@ def test_align_feature_frames_crops_to_shortest_length():
 
 
 def test_qwen3_asr_ptm_helpers_and_low_rate_resize():
-    assert is_qwen3_asr_ptm("qwen3-asr-0.6b")
-    assert is_qwen3_asr_ptm("Qwen/Qwen3-ASR-1.7B")
-    assert is_qwen3_asr_ptm("jaykwok/Qwen3-ASR-0.6B-JA-Anime-Galgame")
-    assert is_low_frame_rate_ptm("qwen3-asr-0.6b")
-    assert qwen3_asr_repo_id("qwen3-asr-0.6b") == "jaykwok/Qwen3-ASR-0.6B-JA-Anime-Galgame"
-    assert qwen3_asr_repo_id("qwen3-asr-1.7b") == "jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame"
-    assert qwen3_asr_repo_id("qwen3-asr-0.6b-base") == "Qwen/Qwen3-ASR-0.6B"
+    assert is_qwen3_asr_ptm(QWEN_ASR_06B_REPO_ID)
+    assert is_qwen3_asr_ptm(QWEN_ASR_17B_REPO_ID)
+    assert not is_qwen3_asr_ptm("qwen3-asr-0.6b")
+    assert not is_qwen3_asr_ptm("Qwen/Qwen3-ASR-1.7B")
+    assert is_low_frame_rate_ptm(QWEN_ASR_06B_REPO_ID)
+    assert qwen3_asr_repo_id(QWEN_ASR_06B_REPO_ID) == QWEN_ASR_06B_REPO_ID
+    assert qwen3_asr_repo_id(QWEN_ASR_17B_REPO_ID) == QWEN_ASR_17B_REPO_ID
     assert qwen3_asr_audio_output_lengths(100) == 13
 
     ptm = np.asarray([[0.0], [10.0]], dtype=np.float32)
@@ -707,16 +613,26 @@ def test_qwen3_asr_ptm_helpers_and_low_rate_resize():
     assert aligned_mfcc.shape == (5, 4)
 
 
-def test_fusionvad_ja_default_checkpoint_is_bundled_for_distribution():
+def test_fusionvad_ja_default_checkpoints_are_bundled_for_distribution():
     from pathlib import Path
 
-    from vad.fusionvad_ja.backend import DEFAULT_CHECKPOINT, DEFAULT_MODEL_PATH, DEFAULT_OPERATING_POINT
+    from vad.fusionvad_ja.backend import (
+        DEFAULT_CHECKPOINT,
+        DEFAULT_IMITATION_CHECKPOINT,
+        DEFAULT_MODEL_PATH,
+        DEFAULT_OPERATING_POINT,
+    )
 
     checkpoint = Path(DEFAULT_CHECKPOINT)
+    imitation_checkpoint = Path(DEFAULT_IMITATION_CHECKPOINT)
     assert checkpoint.exists()
+    assert imitation_checkpoint.exists()
     assert checkpoint.name == "fusionvad_ja_v1_19b_splitcut_touch4096_endpoint_refiner.pt"
+    assert imitation_checkpoint.name == "fusionvad_ja_v1_21_dropgap_imitation_head.pt"
     assert "src/vad/fusionvad_ja/checkpoints" in checkpoint.as_posix()
+    assert "src/vad/fusionvad_ja/checkpoints" in imitation_checkpoint.as_posix()
     assert "datasets/" not in checkpoint.as_posix()
+    assert "datasets/" not in imitation_checkpoint.as_posix()
     assert DEFAULT_OPERATING_POINT.startswith("v1.19b-splitcut-touch4096")
     assert DEFAULT_MODEL_PATH == "models/jaykwok-Qwen3-ASR-0.6B-JA-Anime-Galgame"
 
@@ -1126,12 +1042,7 @@ def test_imitation_feature_windows_resize_targets_to_feature_frames(tmp_path):
 def test_train_imitation_head_cli_requires_inputs():
     import importlib.util
 
-    script_path = (
-        __import__("pathlib").Path(__file__).resolve().parents[1]
-        / "tools"
-        / "fusionvad_ja"
-        / "train_imitation_head.py"
-    )
+    script_path = _tool_script("train_imitation_head.py")
     spec = importlib.util.spec_from_file_location("fusionvad_ja_train_imitation_head_args", script_path)
     assert spec and spec.loader
     module = importlib.util.module_from_spec(spec)
@@ -1180,12 +1091,7 @@ def test_export_imitation_head_predictions_cli_writes_metrics(tmp_path):
     import importlib.util
     import json
 
-    script_path = (
-        __import__("pathlib").Path(__file__).resolve().parents[1]
-        / "tools"
-        / "fusionvad_ja"
-        / "export_imitation_head_predictions.py"
-    )
+    script_path = _tool_script("export_imitation_head_predictions.py")
     spec = importlib.util.spec_from_file_location("fusionvad_ja_export_imitation_predictions", script_path)
     assert spec and spec.loader
     module = importlib.util.module_from_spec(spec)
@@ -1271,12 +1177,7 @@ def test_export_imitation_head_predictions_cli_writes_metrics(tmp_path):
 def test_export_imitation_head_predictions_cli_requires_inputs():
     import importlib.util
 
-    script_path = (
-        __import__("pathlib").Path(__file__).resolve().parents[1]
-        / "tools"
-        / "fusionvad_ja"
-        / "export_imitation_head_predictions.py"
-    )
+    script_path = _tool_script("export_imitation_head_predictions.py")
     spec = importlib.util.spec_from_file_location("fusionvad_ja_export_imitation_args", script_path)
     assert spec and spec.loader
     module = importlib.util.module_from_spec(spec)
@@ -1310,12 +1211,7 @@ def test_export_imitation_head_predictions_cli_requires_inputs():
 def test_apply_drop_gap_packer_splits_internal_gap(tmp_path):
     import importlib.util
 
-    script_path = (
-        __import__("pathlib").Path(__file__).resolve().parents[1]
-        / "tools"
-        / "fusionvad_ja"
-        / "apply_drop_gap_packer.py"
-    )
+    script_path = _tool_script("apply_drop_gap_packer.py")
     spec = importlib.util.spec_from_file_location("fusionvad_ja_apply_drop_gap_packer", script_path)
     assert spec and spec.loader
     module = importlib.util.module_from_spec(spec)
@@ -1394,12 +1290,7 @@ def test_apply_drop_gap_packer_splits_internal_gap(tmp_path):
 def test_apply_drop_gap_packer_cli_requires_inputs():
     import importlib.util
 
-    script_path = (
-        __import__("pathlib").Path(__file__).resolve().parents[1]
-        / "tools"
-        / "fusionvad_ja"
-        / "apply_drop_gap_packer.py"
-    )
+    script_path = _tool_script("apply_drop_gap_packer.py")
     spec = importlib.util.spec_from_file_location("fusionvad_ja_apply_drop_gap_packer_args", script_path)
     assert spec and spec.loader
     module = importlib.util.module_from_spec(spec)
@@ -1606,12 +1497,7 @@ def test_train_addition_bilstm_cli_offsets_repeated_feature_manifests(tmp_path):
     import importlib.util
     import json
 
-    script_path = (
-        __import__("pathlib").Path(__file__).resolve().parents[1]
-        / "tools"
-        / "fusionvad_ja"
-        / "train_addition_bilstm.py"
-    )
+    script_path = _tool_script("train_addition_bilstm.py")
     spec = importlib.util.spec_from_file_location("fusionvad_ja_train_addition_bilstm", script_path)
     assert spec and spec.loader
     module = importlib.util.module_from_spec(spec)
@@ -1739,14 +1625,14 @@ def test_frame_metrics_helpers_ignore_zero_weight_frames():
 
 
 def test_threshold_sweep_helpers_parse_video_frame_padding():
-    from tools.fusionvad_ja.sweep_addition_thresholds import parse_fps
+    from tools.vad.fusionvad_ja.sweep_addition_thresholds import parse_fps
 
     assert parse_fps("30000/1001") == pytest.approx(29.97002997)
     assert parse_fps("29.97") == pytest.approx(29.97)
 
 
 def test_threshold_sweep_helpers_choose_lowest_extra_audio_for_recall():
-    from tools.fusionvad_ja.sweep_addition_thresholds import choose_best
+    from tools.vad.fusionvad_ja.sweep_addition_thresholds import choose_best
 
     rows = [
         {
@@ -1830,12 +1716,7 @@ def test_training_manifest_skips_missing_audio_and_frame_mismatch(tmp_path):
 def test_prepare_training_manifest_cli_requires_labels():
     import importlib.util
 
-    script_path = (
-        __import__("pathlib").Path(__file__).resolve().parents[1]
-        / "tools"
-        / "fusionvad_ja"
-        / "prepare_training_manifest.py"
-    )
+    script_path = _tool_script("prepare_training_manifest.py")
     spec = importlib.util.spec_from_file_location("fusionvad_ja_prepare_manifest_args", script_path)
     assert spec and spec.loader
     module = importlib.util.module_from_spec(spec)
@@ -1856,12 +1737,7 @@ def test_prepare_training_manifest_cli_requires_labels():
 def test_train_tiny_cli_requires_labels():
     import importlib.util
 
-    script_path = (
-        __import__("pathlib").Path(__file__).resolve().parents[1]
-        / "tools"
-        / "fusionvad_ja"
-        / "train_tiny.py"
-    )
+    script_path = _tool_script("train_tiny.py")
     spec = importlib.util.spec_from_file_location("fusionvad_ja_train_tiny_args", script_path)
     assert spec and spec.loader
     module = importlib.util.module_from_spec(spec)
@@ -1882,12 +1758,7 @@ def test_train_tiny_cli_requires_labels():
 def test_build_feature_cache_cli_requires_labels():
     import importlib.util
 
-    script_path = (
-        __import__("pathlib").Path(__file__).resolve().parents[1]
-        / "tools"
-        / "fusionvad_ja"
-        / "build_feature_cache.py"
-    )
+    script_path = _tool_script("build_feature_cache.py")
     spec = importlib.util.spec_from_file_location("fusionvad_ja_build_feature_cache_args", script_path)
     assert spec and spec.loader
     module = importlib.util.module_from_spec(spec)
@@ -1900,25 +1771,25 @@ def test_build_feature_cache_cli_requires_labels():
     else:
         raise AssertionError("parse_args should require --labels")
 
-    args = module.parse_args(["--labels", "labels.jsonl", "--ptm", "whisper-ja-1.5b"])
+    args = module.parse_args(["--labels", "labels.jsonl"])
     assert args.labels == "labels.jsonl"
-    assert args.ptm == "whisper-ja-1.5b"
+    assert args.ptm == QWEN_ASR_06B_REPO_ID
 
     args = module.parse_args(
         [
             "--labels",
             "labels.jsonl",
             "--ptm",
-            "qwen3-asr-0.6b",
+            QWEN_ASR_17B_REPO_ID,
             "--model-path",
-            "models/Qwen-Qwen3-ASR-0.6B",
+            "models/jaykwok-Qwen3-ASR-1.7B-JA-Anime-Galgame",
             "--no-download",
             "--dtype",
             "bfloat16",
         ]
     )
-    assert args.ptm == "qwen3-asr-0.6b"
-    assert args.model_path == "models/Qwen-Qwen3-ASR-0.6B"
+    assert args.ptm == QWEN_ASR_17B_REPO_ID
+    assert args.model_path == "models/jaykwok-Qwen3-ASR-1.7B-JA-Anime-Galgame"
     assert args.no_download is True
     assert args.dtype == "bfloat16"
 
@@ -1927,7 +1798,7 @@ def test_build_feature_cache_cli_requires_labels():
             "--labels",
             "labels.jsonl",
             "--ptm",
-            "qwen3-asr-0.6b",
+            QWEN_ASR_06B_REPO_ID,
             "--prepare-workers",
             "2",
             "--no-compress",
@@ -1944,12 +1815,7 @@ def test_build_feature_cache_run_supports_qwen_low_rate_features(tmp_path, monke
     import soundfile as sf
     import torch
 
-    script_path = (
-        __import__("pathlib").Path(__file__).resolve().parents[1]
-        / "tools"
-        / "fusionvad_ja"
-        / "build_feature_cache.py"
-    )
+    script_path = _tool_script("build_feature_cache.py")
     spec = importlib.util.spec_from_file_location("fusionvad_ja_build_feature_cache_run", script_path)
     assert spec and spec.loader
     module = importlib.util.module_from_spec(spec)
@@ -2003,7 +1869,7 @@ def test_build_feature_cache_run_supports_qwen_low_rate_features(tmp_path, monke
                 "--manifest",
                 str(manifest_path),
                 "--ptm",
-                "qwen3-asr-0.6b",
+                QWEN_ASR_06B_REPO_ID,
                 "--device",
                 "cpu",
                 "--batch-size",
@@ -2031,12 +1897,7 @@ def test_build_feature_cache_run_supports_qwen_low_rate_features(tmp_path, monke
 def test_train_addition_bilstm_cli_requires_inputs():
     import importlib.util
 
-    script_path = (
-        __import__("pathlib").Path(__file__).resolve().parents[1]
-        / "tools"
-        / "fusionvad_ja"
-        / "train_addition_bilstm.py"
-    )
+    script_path = _tool_script("train_addition_bilstm.py")
     spec = importlib.util.spec_from_file_location("fusionvad_ja_train_addition_args", script_path)
     assert spec and spec.loader
     module = importlib.util.module_from_spec(spec)
@@ -2090,12 +1951,7 @@ def test_train_addition_bilstm_cli_requires_inputs():
 def test_train_endpoint_refiner_cli_accepts_aux_positive_weights():
     import importlib.util
 
-    script_path = (
-        __import__("pathlib").Path(__file__).resolve().parents[1]
-        / "tools"
-        / "fusionvad_ja"
-        / "train_endpoint_refiner.py"
-    )
+    script_path = _tool_script("train_endpoint_refiner.py")
     spec = importlib.util.spec_from_file_location("fusionvad_ja_train_endpoint_args", script_path)
     assert spec and spec.loader
     module = importlib.util.module_from_spec(spec)
@@ -2209,12 +2065,7 @@ def test_train_endpoint_refiner_cli_accepts_aux_positive_weights():
 def test_evaluate_addition_bilstm_cli_requires_inputs():
     import importlib.util
 
-    script_path = (
-        __import__("pathlib").Path(__file__).resolve().parents[1]
-        / "tools"
-        / "fusionvad_ja"
-        / "evaluate_addition_bilstm.py"
-    )
+    script_path = _tool_script("evaluate_addition_bilstm.py")
     spec = importlib.util.spec_from_file_location("fusionvad_ja_eval_addition_args", script_path)
     assert spec and spec.loader
     module = importlib.util.module_from_spec(spec)
@@ -2259,12 +2110,7 @@ def test_export_addition_predictions_cli_writes_jsonl(tmp_path):
     import importlib.util
     import json
 
-    script_path = (
-        __import__("pathlib").Path(__file__).resolve().parents[1]
-        / "tools"
-        / "fusionvad_ja"
-        / "export_addition_predictions.py"
-    )
+    script_path = _tool_script("export_addition_predictions.py")
     spec = importlib.util.spec_from_file_location("fusionvad_ja_export_addition_predictions", script_path)
     assert spec and spec.loader
     module = importlib.util.module_from_spec(spec)
@@ -2352,12 +2198,7 @@ def test_export_addition_predictions_cli_writes_jsonl(tmp_path):
 def test_export_addition_predictions_cli_requires_inputs():
     import importlib.util
 
-    script_path = (
-        __import__("pathlib").Path(__file__).resolve().parents[1]
-        / "tools"
-        / "fusionvad_ja"
-        / "export_addition_predictions.py"
-    )
+    script_path = _tool_script("export_addition_predictions.py")
     spec = importlib.util.spec_from_file_location("fusionvad_ja_export_addition_args", script_path)
     assert spec and spec.loader
     module = importlib.util.module_from_spec(spec)
@@ -2389,12 +2230,7 @@ def test_export_endpoint_refiner_predictions_cli_writes_jsonl(tmp_path):
     import importlib.util
     import json
 
-    script_path = (
-        __import__("pathlib").Path(__file__).resolve().parents[1]
-        / "tools"
-        / "fusionvad_ja"
-        / "export_endpoint_refiner_predictions.py"
-    )
+    script_path = _tool_script("export_endpoint_refiner_predictions.py")
     spec = importlib.util.spec_from_file_location("fusionvad_ja_export_endpoint_refiner_predictions", script_path)
     assert spec and spec.loader
     module = importlib.util.module_from_spec(spec)
@@ -2485,12 +2321,7 @@ def test_export_endpoint_refiner_predictions_cli_writes_jsonl(tmp_path):
 def test_export_endpoint_refiner_predictions_cli_requires_inputs():
     import importlib.util
 
-    script_path = (
-        __import__("pathlib").Path(__file__).resolve().parents[1]
-        / "tools"
-        / "fusionvad_ja"
-        / "export_endpoint_refiner_predictions.py"
-    )
+    script_path = _tool_script("export_endpoint_refiner_predictions.py")
     spec = importlib.util.spec_from_file_location("fusionvad_ja_export_endpoint_args", script_path)
     assert spec and spec.loader
     module = importlib.util.module_from_spec(spec)
@@ -2525,12 +2356,7 @@ def test_export_fusionvad_operating_point_wraps_predictions_and_recall(tmp_path)
     import importlib.util
     import json
 
-    script_path = (
-        __import__("pathlib").Path(__file__).resolve().parents[1]
-        / "tools"
-        / "fusionvad_ja"
-        / "export_fusionvad_operating_point.py"
-    )
+    script_path = _tool_script("export_fusionvad_operating_point.py")
     spec = importlib.util.spec_from_file_location("fusionvad_ja_export_operating_point", script_path)
     assert spec and spec.loader
     module = importlib.util.module_from_spec(spec)
@@ -2602,12 +2428,7 @@ def test_export_fusionvad_operating_point_supports_endpoint_refiner(tmp_path):
     import importlib.util
     import json
 
-    script_path = (
-        __import__("pathlib").Path(__file__).resolve().parents[1]
-        / "tools"
-        / "fusionvad_ja"
-        / "export_fusionvad_operating_point.py"
-    )
+    script_path = _tool_script("export_fusionvad_operating_point.py")
     spec = importlib.util.spec_from_file_location("fusionvad_ja_export_operating_point_endpoint", script_path)
     assert spec and spec.loader
     module = importlib.util.module_from_spec(spec)
@@ -2678,12 +2499,7 @@ def test_benchmark_boundary_predictions_computes_boundary_errors(tmp_path):
     import importlib.util
     import json
 
-    script_path = (
-        __import__("pathlib").Path(__file__).resolve().parents[1]
-        / "tools"
-        / "fusionvad_ja"
-        / "benchmark_boundary_predictions.py"
-    )
+    script_path = _tool_script("benchmark_boundary_predictions.py")
     spec = importlib.util.spec_from_file_location("fusionvad_ja_benchmark_boundary_predictions", script_path)
     assert spec and spec.loader
     module = importlib.util.module_from_spec(spec)
@@ -2760,12 +2576,7 @@ def test_benchmark_boundary_predictions_uses_union_speech_duration(tmp_path):
     import importlib.util
     import json
 
-    script_path = (
-        __import__("pathlib").Path(__file__).resolve().parents[1]
-        / "tools"
-        / "fusionvad_ja"
-        / "benchmark_boundary_predictions.py"
-    )
+    script_path = _tool_script("benchmark_boundary_predictions.py")
     spec = importlib.util.spec_from_file_location("fusionvad_ja_benchmark_boundary_predictions_union", script_path)
     assert spec and spec.loader
     module = importlib.util.module_from_spec(spec)
@@ -2826,12 +2637,7 @@ def test_benchmark_boundary_predictions_reports_start_weighted_recall(tmp_path):
     import importlib.util
     import json
 
-    script_path = (
-        __import__("pathlib").Path(__file__).resolve().parents[1]
-        / "tools"
-        / "fusionvad_ja"
-        / "benchmark_boundary_predictions.py"
-    )
+    script_path = _tool_script("benchmark_boundary_predictions.py")
     spec = importlib.util.spec_from_file_location("fusionvad_ja_benchmark_boundary_predictions_weighted", script_path)
     assert spec and spec.loader
     module = importlib.util.module_from_spec(spec)
@@ -2916,12 +2722,7 @@ def test_benchmark_boundary_predictions_reports_cut_gap_coverage(tmp_path):
     import importlib.util
     import json
 
-    script_path = (
-        __import__("pathlib").Path(__file__).resolve().parents[1]
-        / "tools"
-        / "fusionvad_ja"
-        / "benchmark_boundary_predictions.py"
-    )
+    script_path = _tool_script("benchmark_boundary_predictions.py")
     spec = importlib.util.spec_from_file_location("fusionvad_ja_benchmark_boundary_predictions_cut", script_path)
     assert spec and spec.loader
     module = importlib.util.module_from_spec(spec)
@@ -2986,12 +2787,7 @@ def test_benchmark_boundary_predictions_can_use_cut_as_split_boundary(tmp_path):
     import importlib.util
     import json
 
-    script_path = (
-        __import__("pathlib").Path(__file__).resolve().parents[1]
-        / "tools"
-        / "fusionvad_ja"
-        / "benchmark_boundary_predictions.py"
-    )
+    script_path = _tool_script("benchmark_boundary_predictions.py")
     spec = importlib.util.spec_from_file_location("fusionvad_ja_benchmark_boundary_predictions_split", script_path)
     assert spec and spec.loader
     module = importlib.util.module_from_spec(spec)
@@ -3053,12 +2849,7 @@ def test_benchmark_boundary_predictions_constrained_cut_split_limits_segments(tm
     import importlib.util
     import json
 
-    script_path = (
-        __import__("pathlib").Path(__file__).resolve().parents[1]
-        / "tools"
-        / "fusionvad_ja"
-        / "benchmark_boundary_predictions.py"
-    )
+    script_path = _tool_script("benchmark_boundary_predictions.py")
     spec = importlib.util.spec_from_file_location(
         "fusionvad_ja_benchmark_boundary_predictions_constrained_split",
         script_path,
@@ -3124,12 +2915,7 @@ def test_benchmark_boundary_predictions_reports_fallback_safe_segment_risk(tmp_p
     import importlib.util
     import json
 
-    script_path = (
-        __import__("pathlib").Path(__file__).resolve().parents[1]
-        / "tools"
-        / "fusionvad_ja"
-        / "benchmark_boundary_predictions.py"
-    )
+    script_path = _tool_script("benchmark_boundary_predictions.py")
     spec = importlib.util.spec_from_file_location("fusionvad_ja_benchmark_boundary_predictions_fallback", script_path)
     assert spec and spec.loader
     module = importlib.util.module_from_spec(spec)
@@ -3197,12 +2983,7 @@ def test_build_exact_island_labels_uses_actual_speech_segments(tmp_path):
     import importlib.util
     import json
 
-    script_path = (
-        __import__("pathlib").Path(__file__).resolve().parents[1]
-        / "tools"
-        / "fusionvad_ja"
-        / "build_exact_island_labels.py"
-    )
+    script_path = _tool_script("build_exact_island_labels.py")
     spec = importlib.util.spec_from_file_location("fusionvad_ja_build_exact_island_labels", script_path)
     assert spec and spec.loader
     module = importlib.util.module_from_spec(spec)
@@ -3251,12 +3032,7 @@ def test_build_exact_island_labels_uses_actual_speech_segments(tmp_path):
 def test_calibrate_addition_threshold_cli_requires_inputs():
     import importlib.util
 
-    script_path = (
-        __import__("pathlib").Path(__file__).resolve().parents[1]
-        / "tools"
-        / "fusionvad_ja"
-        / "calibrate_addition_threshold.py"
-    )
+    script_path = _tool_script("calibrate_addition_threshold.py")
     spec = importlib.util.spec_from_file_location("fusionvad_ja_calibrate_addition_args", script_path)
     assert spec and spec.loader
     module = importlib.util.module_from_spec(spec)
@@ -3284,40 +3060,10 @@ def test_calibrate_addition_threshold_cli_requires_inputs():
     assert args.step == 0.1
 
 
-def test_evaluate_vad_baselines_cli_defaults_to_current_backends():
-    import importlib.util
-
-    script_path = (
-        __import__("pathlib").Path(__file__).resolve().parents[1]
-        / "tools"
-        / "fusionvad_ja"
-        / "evaluate_vad_baselines.py"
-    )
-    spec = importlib.util.spec_from_file_location("fusionvad_ja_eval_baselines_args", script_path)
-    assert spec and spec.loader
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-
-    try:
-        module.parse_args([])
-    except SystemExit as exc:
-        assert exc.code == 2
-    else:
-        raise AssertionError("parse_args should require --labels")
-
-    args = module.parse_args(["--labels", "labels.jsonl", "--backend", "fusion_lite"])
-    assert args.backend == ["fusion_lite"]
-
-
 def test_materialize_hf_audio_cli_defaults_to_galgame():
     import importlib.util
 
-    script_path = (
-        __import__("pathlib").Path(__file__).resolve().parents[1]
-        / "tools"
-        / "fusionvad_ja"
-        / "materialize_hf_audio.py"
-    )
+    script_path = _tool_script("materialize_hf_audio.py")
     spec = importlib.util.spec_from_file_location("fusionvad_ja_materialize_hf_args", script_path)
     assert spec and spec.loader
     module = importlib.util.module_from_spec(spec)
@@ -3342,12 +3088,7 @@ def test_materialize_hf_audio_cli_defaults_to_galgame():
 def test_build_galgame_weak_labels_cli_requires_manifest():
     import importlib.util
 
-    script_path = (
-        __import__("pathlib").Path(__file__).resolve().parents[1]
-        / "tools"
-        / "fusionvad_ja"
-        / "build_galgame_weak_labels.py"
-    )
+    script_path = _tool_script("build_galgame_weak_labels.py")
     spec = importlib.util.spec_from_file_location("fusionvad_ja_galgame_weak_args", script_path)
     assert spec and spec.loader
     module = importlib.util.module_from_spec(spec)
@@ -3371,12 +3112,7 @@ def test_build_galgame_synthetic_timeline_writes_exact_labels(tmp_path):
 
     import soundfile as sf
 
-    script_path = (
-        __import__("pathlib").Path(__file__).resolve().parents[1]
-        / "tools"
-        / "fusionvad_ja"
-        / "build_galgame_synthetic_timeline.py"
-    )
+    script_path = _tool_script("build_galgame_synthetic_timeline.py")
     spec = importlib.util.spec_from_file_location("fusionvad_ja_galgame_synthetic_timeline", script_path)
     assert spec and spec.loader
     module = importlib.util.module_from_spec(spec)
@@ -3480,12 +3216,7 @@ def test_build_galgame_synthetic_timeline_uses_real_negative_gap_and_background(
 
     import soundfile as sf
 
-    script_path = (
-        __import__("pathlib").Path(__file__).resolve().parents[1]
-        / "tools"
-        / "fusionvad_ja"
-        / "build_galgame_synthetic_timeline.py"
-    )
+    script_path = _tool_script("build_galgame_synthetic_timeline.py")
     spec = importlib.util.spec_from_file_location("fusionvad_ja_galgame_synthetic_timeline_real_gap", script_path)
     assert spec and spec.loader
     module = importlib.util.module_from_spec(spec)
@@ -3603,12 +3334,7 @@ def test_build_galgame_synthetic_timeline_records_speaker_random_boundaries(tmp_
 
     import soundfile as sf
 
-    script_path = (
-        __import__("pathlib").Path(__file__).resolve().parents[1]
-        / "tools"
-        / "fusionvad_ja"
-        / "build_galgame_synthetic_timeline.py"
-    )
+    script_path = _tool_script("build_galgame_synthetic_timeline.py")
     spec = importlib.util.spec_from_file_location("fusionvad_ja_galgame_synthetic_timeline_speaker_random", script_path)
     assert spec and spec.loader
     module = importlib.util.module_from_spec(spec)
@@ -3735,12 +3461,7 @@ def test_build_galgame_synthetic_timeline_can_force_touching_speech_islands(tmp_
 
     import soundfile as sf
 
-    script_path = (
-        __import__("pathlib").Path(__file__).resolve().parents[1]
-        / "tools"
-        / "fusionvad_ja"
-        / "build_galgame_synthetic_timeline.py"
-    )
+    script_path = _tool_script("build_galgame_synthetic_timeline.py")
     spec = importlib.util.spec_from_file_location("fusionvad_ja_synth_timeline_touch", script_path)
     assert spec and spec.loader
     module = importlib.util.module_from_spec(spec)
@@ -3843,12 +3564,7 @@ def test_build_v1_22_cutpoint_dataset_wrapper_records_cutpoint_and_drop_zones(tm
 
     import soundfile as sf
 
-    script_path = (
-        __import__("pathlib").Path(__file__).resolve().parents[1]
-        / "tools"
-        / "fusionvad_ja"
-        / "build_v1_22_cutpoint_dataset.py"
-    )
+    script_path = _tool_script("build_v1_22_cutpoint_dataset.py")
     spec = importlib.util.spec_from_file_location("fusionvad_ja_v122_cutpoint_dataset", script_path)
     assert spec and spec.loader
     module = importlib.util.module_from_spec(spec)
@@ -3958,12 +3674,7 @@ def test_build_galgame_synthetic_timeline_v5_records_crossfade_and_augmentations
 
     import soundfile as sf
 
-    script_path = (
-        __import__("pathlib").Path(__file__).resolve().parents[1]
-        / "tools"
-        / "fusionvad_ja"
-        / "build_galgame_synthetic_timeline.py"
-    )
+    script_path = _tool_script("build_galgame_synthetic_timeline.py")
     spec = importlib.util.spec_from_file_location("fusionvad_ja_galgame_synthetic_timeline_v5", script_path)
     assert spec and spec.loader
     module = importlib.util.module_from_spec(spec)
@@ -4110,12 +3821,7 @@ def test_build_galgame_synthetic_timeline_speech_label_pad_expands_labels(tmp_pa
 
     import soundfile as sf
 
-    script_path = (
-        __import__("pathlib").Path(__file__).resolve().parents[1]
-        / "tools"
-        / "fusionvad_ja"
-        / "build_galgame_synthetic_timeline.py"
-    )
+    script_path = _tool_script("build_galgame_synthetic_timeline.py")
     spec = importlib.util.spec_from_file_location("fusionvad_ja_galgame_synthetic_timeline_label_pad", script_path)
     assert spec and spec.loader
     module = importlib.util.module_from_spec(spec)
@@ -4189,12 +3895,7 @@ def test_build_galgame_synthetic_timeline_speech_label_pad_expands_labels(tmp_pa
 def test_build_galgame_synthetic_timeline_cli_requires_manifest():
     import importlib.util
 
-    script_path = (
-        __import__("pathlib").Path(__file__).resolve().parents[1]
-        / "tools"
-        / "fusionvad_ja"
-        / "build_galgame_synthetic_timeline.py"
-    )
+    script_path = _tool_script("build_galgame_synthetic_timeline.py")
     spec = importlib.util.spec_from_file_location("fusionvad_ja_galgame_synthetic_timeline_args", script_path)
     assert spec and spec.loader
     module = importlib.util.module_from_spec(spec)
@@ -4241,12 +3942,7 @@ def test_build_local_video_audit_candidates_writes_manifest(tmp_path, monkeypatc
     import json
     from types import SimpleNamespace
 
-    script_path = (
-        __import__("pathlib").Path(__file__).resolve().parents[1]
-        / "tools"
-        / "fusionvad_ja"
-        / "build_local_video_audit_candidates.py"
-    )
+    script_path = _tool_script("build_local_video_audit_candidates.py")
     spec = importlib.util.spec_from_file_location("fusionvad_ja_local_video_audit", script_path)
     assert spec and spec.loader
     module = importlib.util.module_from_spec(spec)
@@ -4317,12 +4013,7 @@ def test_build_local_video_audit_candidates_writes_manifest(tmp_path, monkeypatc
 def test_build_local_video_audit_candidates_cli_requires_input():
     import importlib.util
 
-    script_path = (
-        __import__("pathlib").Path(__file__).resolve().parents[1]
-        / "tools"
-        / "fusionvad_ja"
-        / "build_local_video_audit_candidates.py"
-    )
+    script_path = _tool_script("build_local_video_audit_candidates.py")
     spec = importlib.util.spec_from_file_location("fusionvad_ja_local_video_audit_args", script_path)
     assert spec and spec.loader
     module = importlib.util.module_from_spec(spec)
@@ -4341,57 +4032,11 @@ def test_build_local_video_audit_candidates_cli_requires_input():
     assert args.source == "local-video-heldout"
 
 
-def test_build_teacher_pseudo_labels_cli_requires_manifest():
-    import importlib.util
-
-    script_path = (
-        __import__("pathlib").Path(__file__).resolve().parents[1]
-        / "tools"
-        / "fusionvad_ja"
-        / "build_teacher_pseudo_labels.py"
-    )
-    spec = importlib.util.spec_from_file_location("fusionvad_ja_teacher_pseudo_args", script_path)
-    assert spec and spec.loader
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-
-    try:
-        module.parse_args([])
-    except SystemExit as exc:
-        assert exc.code == 2
-    else:
-        raise AssertionError("parse_args should require --manifest")
-
-    args = module.parse_args(
-        [
-            "--manifest",
-            "hf_audio_manifest.json",
-            "--backend",
-            "whisperseg-adaptive",
-            "--backend",
-            "fusion_lite",
-            "--limit",
-            "8",
-            "--teacher-weight",
-            "0.4",
-        ]
-    )
-    assert args.manifest == "hf_audio_manifest.json"
-    assert args.backend == ["whisperseg-adaptive", "fusion_lite"]
-    assert args.limit == 8
-    assert args.teacher_weight == 0.4
-
-
 def test_export_qwen_asr_sft_filters_and_copies_audio(tmp_path):
     import importlib.util
     import json
 
-    script_path = (
-        __import__("pathlib").Path(__file__).resolve().parents[1]
-        / "tools"
-        / "fusionvad_ja"
-        / "export_qwen_asr_sft.py"
-    )
+    script_path = _tool_script("export_qwen_asr_sft.py")
     spec = importlib.util.spec_from_file_location("fusionvad_ja_export_qwen_asr_sft", script_path)
     assert spec and spec.loader
     module = importlib.util.module_from_spec(spec)
@@ -4465,12 +4110,7 @@ def test_prepare_qwen_asr_sft_dataset_merges_sources_and_hard_negatives(tmp_path
     import importlib.util
     import json
 
-    script_path = (
-        __import__("pathlib").Path(__file__).resolve().parents[1]
-        / "tools"
-        / "fusionvad_ja"
-        / "prepare_qwen_asr_sft_dataset.py"
-    )
+    script_path = _tool_script("prepare_qwen_asr_sft_dataset.py")
     spec = importlib.util.spec_from_file_location("fusionvad_ja_prepare_qwen_asr_sft", script_path)
     assert spec and spec.loader
     module = importlib.util.module_from_spec(spec)
@@ -4579,12 +4219,7 @@ def test_prepare_qwen_asr_sft_dataset_can_store_hf_ogg_bytes(tmp_path):
 
     import soundfile as sf
 
-    script_path = (
-        __import__("pathlib").Path(__file__).resolve().parents[1]
-        / "tools"
-        / "fusionvad_ja"
-        / "prepare_qwen_asr_sft_dataset.py"
-    )
+    script_path = _tool_script("prepare_qwen_asr_sft_dataset.py")
     spec = importlib.util.spec_from_file_location("fusionvad_ja_prepare_qwen_asr_sft_ogg", script_path)
     assert spec and spec.loader
     module = importlib.util.module_from_spec(spec)
@@ -4609,12 +4244,7 @@ def test_prepare_qwen_asr_sft_dataset_can_store_hf_ogg_bytes(tmp_path):
 def test_prepare_qwen_asr_sft_dataset_cli_defaults_are_cloud_safe():
     import importlib.util
 
-    script_path = (
-        __import__("pathlib").Path(__file__).resolve().parents[1]
-        / "tools"
-        / "fusionvad_ja"
-        / "prepare_qwen_asr_sft_dataset.py"
-    )
+    script_path = _tool_script("prepare_qwen_asr_sft_dataset.py")
     spec = importlib.util.spec_from_file_location("fusionvad_ja_prepare_qwen_asr_sft_args", script_path)
     assert spec and spec.loader
     module = importlib.util.module_from_spec(spec)
@@ -4647,12 +4277,7 @@ def test_prepare_qwen_asr_sft_dataset_cli_defaults_are_cloud_safe():
 
 
 def test_prepare_qwen_asr_cloud_assets_script_downloads_model_and_data():
-    script_path = (
-        __import__("pathlib").Path(__file__).resolve().parents[1]
-        / "tools"
-        / "fusionvad_ja"
-        / "prepare_qwen_asr_cloud_assets.sh"
-    )
+    script_path = _tool_script("prepare_qwen_asr_cloud_assets.sh")
     content = script_path.read_text(encoding="utf-8")
 
     assert "Qwen/Qwen3-ASR-1.7B" in content
@@ -4669,12 +4294,7 @@ def test_export_manual_audit_asr_sft_candidates_splits_empty_and_review(tmp_path
     import importlib.util
     import json
 
-    script_path = (
-        __import__("pathlib").Path(__file__).resolve().parents[1]
-        / "tools"
-        / "fusionvad_ja"
-        / "export_manual_audit_asr_sft_candidates.py"
-    )
+    script_path = _tool_script("export_manual_audit_asr_sft_candidates.py")
     spec = importlib.util.spec_from_file_location("fusionvad_ja_export_manual_audit_asr_sft_candidates", script_path)
     assert spec and spec.loader
     module = importlib.util.module_from_spec(spec)
@@ -4751,12 +4371,7 @@ def test_export_manual_audit_asr_sft_candidates_splits_empty_and_review(tmp_path
 def test_probe_qwen_asr_text_distance_and_selection(tmp_path):
     import importlib.util
 
-    script_path = (
-        __import__("pathlib").Path(__file__).resolve().parents[1]
-        / "tools"
-        / "fusionvad_ja"
-        / "probe_qwen_asr.py"
-    )
+    script_path = _tool_script("probe_qwen_asr.py")
     spec = importlib.util.spec_from_file_location("fusionvad_ja_probe_qwen_asr", script_path)
     assert spec and spec.loader
     module = importlib.util.module_from_spec(spec)
@@ -4791,12 +4406,7 @@ def test_vad_recall_metrics_reports_padding_tradeoff(tmp_path):
     import importlib.util
     import json
 
-    script_path = (
-        __import__("pathlib").Path(__file__).resolve().parents[1]
-        / "tools"
-        / "fusionvad_ja"
-        / "vad_recall_metrics.py"
-    )
+    script_path = _tool_script("vad_recall_metrics.py")
     spec = importlib.util.spec_from_file_location("fusionvad_ja_vad_recall_metrics", script_path)
     assert spec and spec.loader
     module = importlib.util.module_from_spec(spec)
@@ -4852,12 +4462,7 @@ def test_select_audit_candidates_outputs_stratified_rows(tmp_path):
     import importlib.util
     import json
 
-    script_path = (
-        __import__("pathlib").Path(__file__).resolve().parents[1]
-        / "tools"
-        / "fusionvad_ja"
-        / "select_audit_candidates.py"
-    )
+    script_path = _tool_script("select_audit_candidates.py")
     spec = importlib.util.spec_from_file_location("fusionvad_ja_select_audit_candidates", script_path)
     assert spec and spec.loader
     module = importlib.util.module_from_spec(spec)
@@ -4953,12 +4558,7 @@ def test_generate_manual_audit_html_embeds_candidates(tmp_path):
     import json
     import wave
 
-    script_path = (
-        __import__("pathlib").Path(__file__).resolve().parents[1]
-        / "tools"
-        / "fusionvad_ja"
-        / "generate_manual_audit_html.py"
-    )
+    script_path = _tool_script("generate_manual_audit_html.py")
     spec = importlib.util.spec_from_file_location("fusionvad_ja_generate_manual_audit_html", script_path)
     assert spec and spec.loader
     module = importlib.util.module_from_spec(spec)
@@ -5048,12 +4648,7 @@ def test_convert_manual_audit_labels_builds_strong_labels(tmp_path):
     import json
     import wave
 
-    script_path = (
-        __import__("pathlib").Path(__file__).resolve().parents[1]
-        / "tools"
-        / "fusionvad_ja"
-        / "convert_manual_audit_labels.py"
-    )
+    script_path = _tool_script("convert_manual_audit_labels.py")
     spec = importlib.util.spec_from_file_location("fusionvad_ja_convert_manual_audit_labels", script_path)
     assert spec and spec.loader
     module = importlib.util.module_from_spec(spec)
@@ -5141,12 +4736,7 @@ def test_convert_manual_audit_labels_builds_strong_labels(tmp_path):
 def test_build_synthetic_negatives_cli_validates_count():
     import importlib.util
 
-    script_path = (
-        __import__("pathlib").Path(__file__).resolve().parents[1]
-        / "tools"
-        / "fusionvad_ja"
-        / "build_synthetic_negatives.py"
-    )
+    script_path = _tool_script("build_synthetic_negatives.py")
     spec = importlib.util.spec_from_file_location("fusionvad_ja_synthetic_negative_args", script_path)
     assert spec and spec.loader
     module = importlib.util.module_from_spec(spec)
@@ -5222,69 +4812,11 @@ def test_label_jsonl_round_trip_preserves_frame_weights(tmp_path):
     assert effective_frame_weights(rows[0]) == [0.0, 0.5]
 
 
-def test_evaluate_vad_asr_downstream_helpers():
-    import importlib.util
-
-    script_path = (
-        __import__("pathlib").Path(__file__).resolve().parents[1]
-        / "tools"
-        / "fusionvad_ja"
-        / "evaluate_vad_asr_downstream.py"
-    )
-    spec = importlib.util.spec_from_file_location("fusionvad_ja_evaluate_vad_asr_downstream", script_path)
-    assert spec and spec.loader
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-
-    assert module.clean_vad_name("whisperseg-adaptive") == "whisperseg_adaptive"
-    assert module.padded_frames([0, 1, 0, 0], pad_frames=1) == [1, 1, 1, 0]
-    segments = module.frames_to_segments([0, 1, 1, 0, 1], frame_hop_s=0.1, duration_s=0.45)
-    assert [(round(seg.start, 2), round(seg.end, 2)) for seg in segments] == [(0.1, 0.3), (0.4, 0.45)]
-
-    merged = module.merge_segments(
-        [SpeechSegment(0.0, 0.2), SpeechSegment(0.3, 0.4), SpeechSegment(0.8, 0.82)],
-        duration_s=1.0,
-        merge_gap_s=0.15,
-        min_segment_s=0.05,
-    )
-    assert [(round(seg.start, 2), round(seg.end, 2)) for seg in merged] == [(0.0, 0.4)]
-
-    summary = module.summarize_text_rows(
-        [
-            {"text": "abc", "raw_text": "abcd", "manual_overlap_s": 0.0, "manual_overlap_ratio": 0.0, "label_quality": "negative", "asr_generation": {"error_kind": None}},
-            {"text": "", "raw_text": "", "manual_overlap_s": 0.2, "manual_overlap_ratio": 0.5, "label_quality": "supervised", "asr_generation": {"error_kind": "timeout"}},
-        ]
-    )
-    assert summary["chunk_count"] == 2
-    assert summary["nonempty_chunk_count"] == 1
-    assert summary["negative_record_text_chars"] == 3
-    assert summary["no_speech_overlap_text_chars"] == 3
-    assert summary["asr_error_counts"] == {"": 1, "timeout": 1}
-
-    args = module.parse_args(
-        [
-            "--labels",
-            "labels.jsonl",
-            "--manifest",
-            "manifest.json",
-            "--fusionvad-predictions",
-            "predictions.jsonl",
-        ]
-    )
-    assert args.vad == ["whisperseg-adaptive", "fusion_lite", "fusionvad"]
-    assert args.asr_backend == "anime-whisper"
-
-
 def test_select_asr_hard_negative_candidates_outputs_review_rows(tmp_path):
     import importlib.util
     import json
 
-    script_path = (
-        __import__("pathlib").Path(__file__).resolve().parents[1]
-        / "tools"
-        / "fusionvad_ja"
-        / "select_asr_hard_negative_candidates.py"
-    )
+    script_path = _tool_script("select_asr_hard_negative_candidates.py")
     spec = importlib.util.spec_from_file_location("fusionvad_ja_select_asr_hard_negative_candidates", script_path)
     assert spec and spec.loader
     module = importlib.util.module_from_spec(spec)

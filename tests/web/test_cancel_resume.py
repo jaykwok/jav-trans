@@ -107,7 +107,7 @@ def test_resume_cache_job_id_requires_valid_aligned_cache(tmp_path, monkeypatch)
     monkeypatch.setattr(
         pm.pipeline_main,
         "aligned_cache_expectations_for_ctx",
-        lambda _ctx: ("backend-label", cache_signature),
+        lambda _ctx, **_kwargs: ("backend-label", cache_signature),
     )
     aligned_path.write_text(
         json.dumps(

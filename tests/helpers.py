@@ -6,6 +6,9 @@ import main
 from core.job_context import JobContext
 from pipeline.ids import sanitize_job_id
 
+ASR_06B_BACKEND = "jaykwok/Qwen3-ASR-0.6B-JA-Anime-Galgame"
+ASR_17B_BACKEND = "jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame"
+
 
 def make_job_context(
     video_path: Path | str,
@@ -13,11 +16,10 @@ def make_job_context(
     job_temp_root: Path | str,
     *,
     job_id: str | None = None,
-    asr_backend: str = "whisper-ja-anime-v0.3",
+    asr_backend: str = ASR_06B_BACKEND,
     asr_context: str = "",
     subtitle_mode: str = "zh",
     skip_translation: bool = False,
-    vad_threshold: float = 0.35,
     translation_max_workers: int = 4,
     translation_cache_path: Path | str | None = None,
     keep_temp_files: bool = True,
@@ -35,7 +37,6 @@ def make_job_context(
         asr_context=asr_context,
         subtitle_mode=subtitle_mode,
         multi_cue_split=True,
-        vad_threshold=vad_threshold,
         skip_translation=skip_translation,
         target_lang="简体中文",
         translation_glossary="",

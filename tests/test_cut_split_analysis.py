@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from tools.fusionvad_ja.analyze_cut_splits import main
+from tools.vad.fusionvad_ja.analyze_cut_splits import main
 
 
 def _write_json(path: Path, payload: dict) -> None:

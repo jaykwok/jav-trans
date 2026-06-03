@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from whisper.alignment_quality import classify_alignment_quality
+from asr.alignment_quality import classify_alignment_quality
 
 
 def test_classifies_clean_forced_alignment():

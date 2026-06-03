@@ -1,4 +1,4 @@
-from whisper.pipeline import _should_split_on_gender
+from asr.pipeline import _should_split_on_gender
 
 
 def test_same_gender_no_split():

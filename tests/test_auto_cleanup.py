@@ -1,7 +1,7 @@
 from pathlib import Path
 
 from pipeline.cleanup import cleanup_job_temp, cleanup_runtime_ephemeral_temp
-from whisper import pipeline as asr
+from asr import pipeline as asr
 
 
 def _cleanup_job_temp(job_temp_dir: Path, translation_cache_path: str = "") -> None:

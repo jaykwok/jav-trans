@@ -1,8 +1,8 @@
 import json
 import multiprocessing as mp
 
-from whisper import pipeline as asr
-from whisper import worker as asr_worker
+from asr import pipeline as asr
+from asr import worker as asr_worker
 
 
 def test_aggregate_timeout_fragments_writes_summary_and_removes_fragments(monkeypatch, tmp_path):

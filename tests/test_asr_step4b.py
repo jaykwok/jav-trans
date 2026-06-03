@@ -28,8 +28,8 @@ def main() -> None:
     os.environ.setdefault("ASR_SUBPROCESS_RESPAWN_MAX", "2")
     os.environ.setdefault("ASR_SUBPROCESS_CONSECUTIVE_TIMEOUT_LIMIT", "3")
 
-    from whisper import pipeline as asr
-    from whisper.local_backend import SubprocessAsrBackend, WorkerTimeoutError
+    from asr import pipeline as asr
+    from asr.local_backend import SubprocessAsrBackend, WorkerTimeoutError
 
     label = "ASR 文本转写"
     root = Path("temp") / "tests" / f"step4b_{uuid.uuid4().hex[:8]}"

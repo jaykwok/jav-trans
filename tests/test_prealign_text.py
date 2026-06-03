@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from whisper.prealign import clean_text_for_aligner, prepare_text_for_alignment
+from asr.prealign import clean_text_for_aligner, prepare_text_for_alignment
 
 
 def test_prepare_text_for_alignment_keeps_display_and_cleans_aligner_text():

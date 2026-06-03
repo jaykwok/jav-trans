@@ -191,18 +191,16 @@ def test_advanced_asr_stage_env_is_task_scoped(monkeypatch, tmp_path):
     temp_root = tmp_path / "jobs"
     video_path = tmp_path / "sample.mp4"
     video_path.write_bytes(b"fake-video")
-    monkeypatch.setenv("WHISPERSEG_CHUNK_THRESHOLD_S", "1.0")
+    monkeypatch.setenv("ASR_PRE_ASR_RISK_SPLIT_THRESHOLD", "1.0")
     original_f0_threshold = main.os.environ.get("F0_THRESHOLD_HZ")
-    monkeypatch.delenv("WHISPERSEG_THRESHOLD", raising=False)
     ctx = make_job_context(
         video_path,
         output_dir,
         temp_root,
         skip_translation=True,
         keep_temp_files=True,
-        vad_threshold=0.42,
         advanced={
-            "WHISPERSEG_CHUNK_THRESHOLD_S": "1.5",
+            "ASR_PRE_ASR_RISK_SPLIT_THRESHOLD": "1.5",
             "F0_THRESHOLD_HZ": "180",
         },
     )
@@ -213,9 +211,8 @@ def test_advanced_asr_stage_env_is_task_scoped(monkeypatch, tmp_path):
         Path(out_path).write_bytes(b"")
 
     def fake_transcribe_and_align(_audio_path, _device, on_stage=None, include_details=False):
-        assert main.os.environ["WHISPERSEG_CHUNK_THRESHOLD_S"] == "1.5"
+        assert main.os.environ["ASR_PRE_ASR_RISK_SPLIT_THRESHOLD"] == "1.5"
         assert main.os.environ["F0_THRESHOLD_HZ"] == "180"
-        assert main.os.environ["WHISPERSEG_THRESHOLD"] == "0.42"
         return (
             [{"start": 0.0, "end": 1.0, "text": "こんにちは"}],
             [],
@@ -227,7 +224,6 @@ def test_advanced_asr_stage_env_is_task_scoped(monkeypatch, tmp_path):
 
     run_pipeline(video_path, ctx)
 
-    assert main.os.environ["WHISPERSEG_CHUNK_THRESHOLD_S"] == "1.0"
+    assert main.os.environ["ASR_PRE_ASR_RISK_SPLIT_THRESHOLD"] == "1.0"
     assert main.os.environ.get("F0_THRESHOLD_HZ") == original_f0_threshold
-    assert "WHISPERSEG_THRESHOLD" not in main.os.environ
 

@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from tools.fusionvad_ja.audit_nav import write_audit_index, write_latest_audit_entry
+from tools.audits.audit_nav import write_audit_index, write_latest_audit_entry
 
 
 def _write_text(path: Path, text: str) -> Path:

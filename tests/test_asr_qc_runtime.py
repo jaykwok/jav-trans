@@ -1,4 +1,4 @@
-from whisper.qc import asr_qc_drop_uncertain_enabled, asr_qc_enabled
+from asr.qc import asr_qc_drop_uncertain_enabled, asr_qc_enabled
 
 
 def test_asr_qc_enabled_reads_env_at_runtime(monkeypatch):

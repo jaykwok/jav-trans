@@ -4,7 +4,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from whisper.qc import apply_adaptive_precision_filter, evaluate_asr_text_results_qc
+from asr.qc import apply_adaptive_precision_filter, evaluate_asr_text_results_qc
 
 
 def test_context_leak_skipped_when_backend_ignores_contexts():
@@ -62,7 +62,7 @@ def test_generation_error_metadata_is_counted():
                 "text": "",
                 "duration": 2.0,
                 "asr_generation": {
-                    "backend": "anime-whisper",
+                    "backend": "jaykwok/Qwen3-ASR-0.6B-JA-Anime-Galgame",
                     "error_kind": "overflow",
                     "error_detail": "decoder_input_ids exceeds max_target_positions",
                 },

@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from tools.fusionvad_ja.export_cue_planner_merge_review import build_review
+from tools.subtitles.export_cue_planner_merge_review import build_review
 
 
 def _write_json(path: Path, payload: object) -> Path:

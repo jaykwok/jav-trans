@@ -6,7 +6,7 @@ from pathlib import Path
 import numpy as np
 import soundfile as sf
 
-from tools.fusionvad_ja.materialize_alignment_failure_audio import main
+from tools.audits.materialize_alignment_failure_audio import main
 
 
 def _write_jsonl(path: Path, rows: list[dict]) -> None:

@@ -50,11 +50,11 @@ def _run_drop(audio_path, spans, *, enabled="1", min_duration="0.20", rms_dbfs="
     monkeypatch.setenv("ASR_CHUNK_DROP_RMS_DBFS", rms_dbfs)
 
     import importlib
-    import whisper.pipeline as pipeline
+    import asr.pipeline as pipeline
     importlib.reload(pipeline)
 
     # Access the internal helper directly
-    from whisper import pipeline as pl
+    from asr import pipeline as pl
     importlib.reload(pl)
     return pl._drop_short_low_energy_spans(audio_path, spans)
 
@@ -65,7 +65,7 @@ def test_drop_disabled_keeps_all_spans(audio_file, monkeypatch, tmp_path):
     monkeypatch.setenv("ASR_CHUNK_DROP_ENABLED", "0")
 
     import importlib
-    import whisper.pipeline as pl
+    import asr.pipeline as pl
     importlib.reload(pl)
 
     # With gate disabled, _drop_short_low_energy_spans is never called in the
@@ -84,7 +84,7 @@ def test_drop_short_silent_span_is_dropped(audio_file, monkeypatch):
     monkeypatch.setenv("ASR_CHUNK_DROP_RMS_DBFS", "-40.0")
 
     import importlib
-    from whisper import pipeline as pl
+    from asr import pipeline as pl
     importlib.reload(pl)
 
     # span covering silent part of the audio (0.0–0.5s is silence)
@@ -101,7 +101,7 @@ def test_drop_short_span_with_signal_is_kept(audio_file, monkeypatch):
     monkeypatch.setenv("ASR_CHUNK_DROP_RMS_DBFS", "-40.0")
 
     import importlib
-    from whisper import pipeline as pl
+    from asr import pipeline as pl
     importlib.reload(pl)
 
     # span covering the tone part (0.5–0.65s has the 440 Hz tone)
@@ -118,7 +118,7 @@ def test_drop_long_silent_span_is_kept(audio_file, monkeypatch):
     monkeypatch.setenv("ASR_CHUNK_DROP_RMS_DBFS", "-40.0")
 
     import importlib
-    from whisper import pipeline as pl
+    from asr import pipeline as pl
     importlib.reload(pl)
 
     # 0.0–0.5s is silence but 0.5s > 0.20s so duration criterion fails

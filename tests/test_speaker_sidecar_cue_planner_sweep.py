@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from tools.fusionvad_ja.sweep_speaker_sidecar_cue_planner import build_sweep
+from tools.subtitles.sweep_speaker_sidecar_cue_planner import build_sweep
 
 
 def _write_json(path: Path, payload: dict) -> Path:

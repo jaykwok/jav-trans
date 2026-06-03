@@ -9,20 +9,15 @@ from typing import Any
 import numpy as np
 
 from audio.loading import load_audio_16k_mono
-from utils.model_paths import WHISPER_MODEL_PATH, resolve_model_spec
-from whisper.model_backend import WHISPER_PRESETS
+from asr.backends.qwen import QWEN_ASR_06B_REPO_ID, QWEN_ASR_17B_REPO_ID
+from utils.model_paths import resolve_model_spec
 
-QWEN3_ASR_PRESETS = {
-    "qwen3-asr-0.6b": "jaykwok/Qwen3-ASR-0.6B-JA-Anime-Galgame",
-    "qwen3-asr-1.7b": "jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame",
-    "qwen3-asr-0.6b-base": "Qwen/Qwen3-ASR-0.6B",
-    "qwen3-asr-1.7b-base": "Qwen/Qwen3-ASR-1.7B",
-}
+QWEN3_ASR_REPO_IDS = {QWEN_ASR_06B_REPO_ID, QWEN_ASR_17B_REPO_ID}
 
 
 @dataclass(frozen=True)
 class FeatureConfig:
-    ptm: str = "whisper-ja-1.5b"
+    ptm: str = QWEN_ASR_06B_REPO_ID
     frame_hop_s: float = 0.02
     n_mfcc: int = 40
     n_fft: int = 400
@@ -100,76 +95,13 @@ def torch_dtype_from_config(dtype: str):
     return torch.float16
 
 
-class WhisperEncoderFeatureExtractor:
-    def __init__(self, config: FeatureConfig) -> None:
-        import torch
-        from transformers import WhisperForConditionalGeneration, WhisperProcessor
-
-        if config.ptm not in WHISPER_PRESETS:
-            raise ValueError(f"unsupported whisper PTM preset: {config.ptm}")
-        self.config = config
-        preset = WHISPER_PRESETS[config.ptm]
-        self.model_path = resolve_model_spec(
-            config.model_path or WHISPER_MODEL_PATH or None,
-            str(preset["repo_id"]),
-            download=config.download,
-            revision=config.revision,
-        )
-        if not config.download and self.model_path == str(preset["repo_id"]):
-            raise FileNotFoundError(
-                f"{config.ptm} is not available locally. Put the model under "
-                f"models/{str(preset['repo_id']).replace('/', '-')} or pass --model-path, "
-                "or rerun without --no-download."
-            )
-        self.processor = WhisperProcessor.from_pretrained(self.model_path)
-        self.torch_dtype = torch_dtype_from_config(config.dtype)
-        self.device = torch.device(config.device if config.device == "cpu" or torch.cuda.is_available() else "cpu")
-        self.model = WhisperForConditionalGeneration.from_pretrained(
-            self.model_path,
-            dtype=self.torch_dtype,
-        ).to(self.device)
-        self.model.eval()
-
-    def extract(self, audio: np.ndarray, *, sample_rate: int) -> np.ndarray:
-        return self.extract_batch([audio], sample_rate=sample_rate)[0]
-
-    def extract_batch(self, audios: list[np.ndarray], *, sample_rate: int) -> list[np.ndarray]:
-        import torch
-
-        if not audios:
-            return []
-        inputs = self.processor(
-            [np.asarray(audio, dtype=np.float32) for audio in audios],
-            sampling_rate=sample_rate,
-            return_tensors="pt",
-        )
-        input_features = inputs.input_features.to(device=self.device, dtype=self.torch_dtype)
-        with torch.inference_mode():
-            encoder_output = self.model.model.encoder(input_features=input_features)
-            hidden = encoder_output.last_hidden_state.detach().float().cpu().numpy()
-        return [np.asarray(item, dtype=np.float32) for item in hidden]
-
-    def close(self) -> None:
-        import torch
-
-        self.model = None
-        self.processor = None
-        if self.device.type == "cuda":
-            torch.cuda.empty_cache()
-
-
 def normalize_ptm_name(ptm: str) -> str:
     return (ptm or "").strip()
 
 
 def is_qwen3_asr_ptm(ptm: str) -> bool:
     normalized = normalize_ptm_name(ptm)
-    lowered = normalized.lower()
-    return (
-        lowered in QWEN3_ASR_PRESETS
-        or lowered.startswith("qwen/qwen3-asr-")
-        or lowered.startswith("jaykwok/qwen3-asr-")
-    )
+    return normalized in QWEN3_ASR_REPO_IDS
 
 
 def is_low_frame_rate_ptm(ptm: str) -> bool:
@@ -178,7 +110,7 @@ def is_low_frame_rate_ptm(ptm: str) -> bool:
 
 def qwen3_asr_repo_id(ptm: str) -> str:
     normalized = normalize_ptm_name(ptm)
-    return QWEN3_ASR_PRESETS.get(normalized.lower(), normalized)
+    return normalized
 
 
 def qwen3_asr_audio_output_lengths(input_lengths: Any) -> Any:
@@ -274,13 +206,11 @@ class Qwen3AsrFeatureExtractor:
 
 
 def build_ptm_feature_extractor(config: FeatureConfig) -> Any:
-    if config.ptm in WHISPER_PRESETS:
-        return WhisperEncoderFeatureExtractor(config)
     if is_qwen3_asr_ptm(config.ptm):
         return Qwen3AsrFeatureExtractor(config)
     raise ValueError(
         f"unsupported PTM feature extractor: {config.ptm}. "
-        f"Whisper presets={sorted(WHISPER_PRESETS)} qwen presets={sorted(QWEN3_ASR_PRESETS)}"
+        f"qwen repos={sorted(QWEN3_ASR_REPO_IDS)}"
     )
 
 
@@ -303,19 +233,6 @@ def extract_mfcc(
         hop_length=hop_length,
     )
     return np.asarray(mfcc.T, dtype=np.float32)
-
-
-def extract_whisper_encoder_features(
-    audio: np.ndarray,
-    *,
-    sample_rate: int,
-    config: FeatureConfig,
-) -> np.ndarray:
-    extractor = WhisperEncoderFeatureExtractor(config)
-    try:
-        return extractor.extract(audio, sample_rate=sample_rate)
-    finally:
-        extractor.close()
 
 
 def extract_ptm_features(

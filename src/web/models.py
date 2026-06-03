@@ -2,22 +2,21 @@ from __future__ import annotations
 
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 
 class JobSpec(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     video_paths: list[str] = Field(min_length=1, max_length=200)
     output_dir: str | None = None
     asr_backend: Literal[
-        "anime-whisper",
-        "qwen3-asr-1.7b",
-        "whisper-ja-1.5b",
-        "whisper-ja-anime-v0.3",
-    ] = "whisper-ja-anime-v0.3"
+        "jaykwok/Qwen3-ASR-0.6B-JA-Anime-Galgame",
+        "jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame",
+    ] = "jaykwok/Qwen3-ASR-0.6B-JA-Anime-Galgame"
     subtitle_mode: Literal["zh", "bilingual"] = "zh"
     skip_translation: bool = False
     multi_cue_split: bool = True
-    vad_threshold: float = Field(default=0.35, ge=0.0, le=1.0)
     asr_context: str = Field(default="", max_length=4000)
     keep_quality_report: bool = False
     translation_max_workers: int = Field(default=4, ge=1, le=8)

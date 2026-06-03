@@ -4,10 +4,8 @@ import { loadFormMemory, saveFormMemory, applyFormMemory } from './formMemory.js
 import { setActivePreset } from './presets.js';
 
 const _BACKEND_LABELS = {
-  'whisper-ja-anime-v0.3': 'whisper-ja-anime-v0.3（推荐）',
-  'anime-whisper':          'AnimeWhisper',
-  'qwen3-asr-1.7b':         'Qwen3-ASR-1.7B',
-  'whisper-ja-1.5b':        'whisper-ja-1.5B',
+  'jaykwok/Qwen3-ASR-0.6B-JA-Anime-Galgame': 'jaykwok/Qwen3-ASR-0.6B-JA-Anime-Galgame（推荐）',
+  'jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame': 'jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame',
 };
 const _SUBTITLE_MODE_LABELS = { zh: '中文字幕', bilingual: '中日双语' };
 
@@ -40,7 +38,6 @@ export async function loadConfig() {
     if (cfg.defaults?.subtitle_mode) modeSel.value = cfg.defaults.subtitle_mode;
 
     const d = cfg.defaults ?? {};
-    if (d.vad_threshold             != null) $('t-vad-threshold').value           = d.vad_threshold;
     if (d.translation_max_workers   != null) $('t-translation-max-workers').value = d.translation_max_workers;
     if (d.multi_cue_split           != null) $('t-multi-cue-split').checked       = !!d.multi_cue_split;
     if (d.skip_translation          != null) $('r-skip-translation').checked      = !!d.skip_translation;

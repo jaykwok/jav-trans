@@ -17,7 +17,7 @@ def _reload_pipeline(monkeypatch, tmp_path: Path):
     monkeypatch.setenv("ASR_SLIDING_CONTEXT_SEGS", "2")
     monkeypatch.setenv("VAD_MERGE_SHORT_MAX_S", "0.8")
     monkeypatch.setenv("VAD_MERGE_GAP_MAX_S", "0.3")
-    from whisper import pipeline as asr
+    from asr import pipeline as asr
 
     return importlib.reload(asr)
 

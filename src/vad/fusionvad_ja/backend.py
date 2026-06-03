@@ -20,7 +20,7 @@ from vad.fusionvad_ja.features import (
 )
 from vad.fusionvad_ja.model import AdditionFusionBiLSTM, AdditionFusionEndpointBiLSTM
 from vad.fusionvad_ja.model import AdditionFusionImitationBiLSTM
-from vad.whisperseg.postprocess import group_segments
+from vad.fusionvad_ja.postprocess import group_segments
 
 
 DEFAULT_CHECKPOINT = str(
@@ -29,9 +29,7 @@ DEFAULT_CHECKPOINT = str(
     / "fusionvad_ja_v1_19b_splitcut_touch4096_endpoint_refiner.pt"
 )
 DEFAULT_IMITATION_CHECKPOINT = (
-    "datasets/train/fusionvad-ja/v1-21/qwen3-asr-0.6b-full29239/"
-    "imitation-head-dropgaponly-poswin128-balanced-resizedtarget-batch8-lr2e-4-steps512/"
-    "fusionvad_ja_imitation_head.pt"
+    "src/vad/fusionvad_ja/checkpoints/fusionvad_ja_v1_21_dropgap_imitation_head.pt"
 )
 DEFAULT_MODEL_PATH = "models/jaykwok-Qwen3-ASR-0.6B-JA-Anime-Galgame"
 DEFAULT_OPERATING_POINT = "v1.19b-splitcut-touch4096-speech0.200-cut0.500-pad0.2"
@@ -244,7 +242,7 @@ class FusionVadJaConfig:
     threshold: float = 0.200
     pad_s: float = 0.2
     frame_hop_s: float = 0.02
-    ptm: str = "qwen3-asr-0.6b"
+    ptm: str = "jaykwok/Qwen3-ASR-0.6B-JA-Anime-Galgame"
     model_path: str = DEFAULT_MODEL_PATH
     device: str = "auto"
     dtype: str = "bfloat16"
@@ -270,8 +268,11 @@ class FusionVadJaConfig:
             threshold=_env_float("FUSIONVAD_JA_THRESHOLD", "0.200"),
             pad_s=_env_float("FUSIONVAD_JA_PAD_S", "0.2"),
             frame_hop_s=_env_float("FUSIONVAD_JA_FRAME_HOP_S", "0.02"),
-            ptm=os.getenv("FUSIONVAD_JA_PTM", "qwen3-asr-0.6b").strip()
-            or "qwen3-asr-0.6b",
+            ptm=os.getenv(
+                "FUSIONVAD_JA_PTM",
+                "jaykwok/Qwen3-ASR-0.6B-JA-Anime-Galgame",
+            ).strip()
+            or "jaykwok/Qwen3-ASR-0.6B-JA-Anime-Galgame",
             model_path=os.getenv("FUSIONVAD_JA_MODEL_PATH", DEFAULT_MODEL_PATH).strip(),
             device=os.getenv("FUSIONVAD_JA_DEVICE", "auto").strip() or "auto",
             dtype=os.getenv("FUSIONVAD_JA_DTYPE", "bfloat16").strip() or "bfloat16",

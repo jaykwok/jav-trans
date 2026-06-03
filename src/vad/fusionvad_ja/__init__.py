@@ -27,9 +27,8 @@ from vad.fusionvad_ja.dataset import (
 from vad.fusionvad_ja.features import (
     CachedFeature,
     FeatureConfig,
-    QWEN3_ASR_PRESETS,
+    QWEN3_ASR_REPO_IDS,
     Qwen3AsrFeatureExtractor,
-    WhisperEncoderFeatureExtractor,
     align_feature_frames,
     build_ptm_feature_extractor,
     cache_key_for_audio,
@@ -60,10 +59,6 @@ from vad.fusionvad_ja.model import (
     AdditionFusionEndpointBiLSTM,
     AdditionFusionImitationBiLSTM,
     count_trainable_parameters,
-)
-from vad.fusionvad_ja.research_backends import (
-    TimestampSpanVadBackend,
-    get_research_vad_backend,
 )
 from vad.fusionvad_ja.train import (
     EvalMetrics,
@@ -100,7 +95,6 @@ __all__ = [
     "DEFAULT_TRAINABLE_LABEL_QUALITIES",
     "LabelRecord",
     "TeacherSegment",
-    "TimestampSpanVadBackend",
     "TrainingExample",
     "TrainConfig",
     "TrainMetrics",
@@ -130,7 +124,6 @@ __all__ = [
     "ImitationTrainConfig",
     "frame_classification_counts",
     "frame_count",
-    "get_research_vad_backend",
     "build_ptm_feature_extractor",
     "extract_ptm_features",
     "is_default_trainable",
@@ -142,7 +135,7 @@ __all__ = [
     "load_manifest_audio_map",
     "metrics_from_frame_counts",
     "normalize_audio_16k_mono",
-    "QWEN3_ASR_PRESETS",
+    "QWEN3_ASR_REPO_IDS",
     "Qwen3AsrFeatureExtractor",
     "qwen3_asr_audio_output_lengths",
     "qwen3_asr_repo_id",
@@ -163,5 +156,4 @@ __all__ = [
     "write_feature_cache",
     "write_jsonl",
     "write_training_manifest",
-    "WhisperEncoderFeatureExtractor",
 ]

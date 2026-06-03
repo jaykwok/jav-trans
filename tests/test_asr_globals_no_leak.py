@@ -3,7 +3,7 @@ from pathlib import Path
 import pytest
 
 import main
-from helpers import make_job_context
+from helpers import ASR_06B_BACKEND, ASR_17B_BACKEND, make_job_context
 from pipeline import audio as pipeline_audio
 
 
@@ -16,12 +16,12 @@ def test_asr_stage_env_restored_when_transcribe_raises(monkeypatch, tmp_path):
         video_path,
         output_dir,
         temp_root,
-        asr_backend="qwen3-asr-1.7b",
+        asr_backend=ASR_17B_BACKEND,
         asr_context="task context",
         skip_translation=True,
         keep_temp_files=True,
     )
-    monkeypatch.setenv("ASR_BACKEND", "anime-whisper")
+    monkeypatch.setenv("ASR_BACKEND", ASR_06B_BACKEND)
     monkeypatch.setenv("ASR_CONTEXT", "process context")
     monkeypatch.setattr(main.torch.cuda, "is_available", lambda: False)
     monkeypatch.setattr(
@@ -35,7 +35,7 @@ def test_asr_stage_env_restored_when_transcribe_raises(monkeypatch, tmp_path):
         Path(out_path).write_bytes(b"wav")
 
     def fake_transcribe_and_align(_audio_path, _device, on_stage=None, include_details=False):
-        assert main.os.environ["ASR_BACKEND"] == "qwen3-asr-1.7b"
+        assert main.os.environ["ASR_BACKEND"] == ASR_17B_BACKEND
         assert main.os.environ["ASR_CONTEXT"] == "task context"
         raise RuntimeError("forced ASR failure")
 
@@ -49,5 +49,5 @@ def test_asr_stage_env_restored_when_transcribe_raises(monkeypatch, tmp_path):
             job_id=ctx.job_id,
         )
 
-    assert main.os.environ["ASR_BACKEND"] == "anime-whisper"
+    assert main.os.environ["ASR_BACKEND"] == ASR_06B_BACKEND
     assert main.os.environ["ASR_CONTEXT"] == "process context"

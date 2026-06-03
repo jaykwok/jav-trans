@@ -17,7 +17,7 @@ from web.models import JobSpec, SettingsRead, SettingsUpdate
 router = APIRouter()
 
 BACKENDS = list(get_args(JobSpec.model_fields["asr_backend"].annotation))
-RECOMMENDED_ASR_BACKEND = "whisper-ja-anime-v0.3"
+RECOMMENDED_ASR_BACKEND = "jaykwok/Qwen3-ASR-0.6B-JA-Anime-Galgame"
 SUBTITLE_MODES = list(get_args(JobSpec.model_fields["subtitle_mode"].annotation))
 DEFAULT_JOB_DEFAULTS = {
     name: field.default
@@ -168,7 +168,6 @@ async def get_config() -> dict[str, Any]:
             "subtitle_mode": DEFAULT_JOB_DEFAULTS["subtitle_mode"],
             "skip_translation": DEFAULT_JOB_DEFAULTS["skip_translation"],
             "multi_cue_split": DEFAULT_JOB_DEFAULTS["multi_cue_split"],
-            "vad_threshold": DEFAULT_JOB_DEFAULTS["vad_threshold"],
             "translation_max_workers": DEFAULT_JOB_DEFAULTS["translation_max_workers"],
         },
     }

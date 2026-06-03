@@ -34,37 +34,21 @@ DEFAULT_SETTINGS: dict[str, str] = {
     "HF_ENDPOINT": "",
 
     # --- ASR & Alignment Model Settings ---
-    # Transcription backend. Valid values:
-    # whisper-ja-anime-v0.3 / anime-whisper / qwen3-asr-1.7b / whisper-ja-1.5b.
-    "ASR_BACKEND": "whisper-ja-anime-v0.3",
-    # Whisper-family timestamp mode; forced uses forced alignment for better subtitle timing.
-    "WHISPER_TIMESTAMP_MODE": "forced",
+    # Transcription backend. Use the Hugging Face repo id as the stable key.
+    "ASR_BACKEND": "jaykwok/Qwen3-ASR-0.6B-JA-Anime-Galgame",
     # Local/Qwen ASR timestamp mode. Valid values: forced, native, hybrid.
     "ALIGNMENT_TIMESTAMP_MODE": "forced",
-    # Optional override for the active Whisper-family model path; empty uses the preset repo/local cache.
-    "WHISPER_MODEL_PATH": "",
-    # Whisper generation defaults; presets can override these when env values are unset.
-    "WHISPER_BEAMS": "1",
-    "WHISPER_NO_REPEAT_NGRAM": "0",
-    "WHISPER_MAX_NEW_TOKENS": "444",
-    # Character cap for sliding ASR prompt before tokenizer-level prompt budgeting.
+    # Character cap for sliding ASR context prompt before tokenizer-level budgeting.
     "ASR_INITIAL_PROMPT_MAX_CHARS": "240",
-    # Max prompt tokens kept before Whisper-family generation budgeting.
+    # Max prompt tokens kept before generation budgeting.
     "ASR_INITIAL_PROMPT_MAX_TOKENS": "180",
-    # Minimum output budget preserved when prompt tokens compete with Whisper's 448-token decoder window.
+    # Minimum output budget preserved when prompt tokens compete with decoder context.
     "ASR_MIN_EFFECTIVE_NEW_TOKENS": "64",
-    "WHISPER_FORCED_FAIL_RATIO": "0.3",
-    "WHISPER_UNLOAD_EVERY": "200",
     # Voice activity detection backend used before ASR chunking.
     "ASR_VAD_BACKEND": "fusionvad_ja",
-    # 1 lets WhisperSeg adjust its threshold once from whole-audio speech density.
-    "ASR_VAD_ADAPTIVE": "1",
-    # Primary/gate components used by fusion_lite* VAD backends.
-    "ASR_VAD_PRIMARY": "whisperseg",
-    "ASR_VAD_GATE": "silero",
-    # Remote HuggingFace model id used when ASR_MODEL_PATH is empty or missing.
-    "ASR_MODEL_ID": "jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame",
-    # Optional local ASR model directory override. Empty uses models/<namespace>-<repo>.
+    # Optional explicit HuggingFace model id override. Empty auto-selects by ASR_BACKEND.
+    "ASR_MODEL_ID": "",
+    # Optional local ASR model directory override. Empty uses models/<namespace>-<repo> for the selected backend.
     "ASR_MODEL_PATH": "",
     # Remote HuggingFace forced-aligner model id used as fallback.
     "ALIGNER_MODEL_ID": "Qwen/Qwen3-ForcedAligner-0.6B",
@@ -128,7 +112,7 @@ DEFAULT_SETTINGS: dict[str, str] = {
     "SEGMENT_MIN_SPEECH": "0.25",
     # Padding, in seconds, added around each ASR chunk.
     "SEGMENT_PAD": "0.15",
-    # 1 packs nearby VAD speech segments into longer Whisper-friendly ASR chunks.
+    # 1 packs nearby VAD speech segments into longer ASR chunks.
     "ASR_CHUNK_PACKING_ENABLED": "1",
     # on enables the long-chunk profile by forcing chunk packing.
     "ASR_LONG_CHUNK_PROFILE": "on",
@@ -219,53 +203,6 @@ DEFAULT_SETTINGS: dict[str, str] = {
     "VAD_CHUNK_CACHE_ENABLED": "1",
     # Persistent VAD/chunk boundary cache directory.
     "VAD_CHUNK_CACHE_DIR": "./temp/vad-cache",
-
-    # --- WhisperSeg VAD Settings ---
-    # Speech probability threshold; lower catches more speech and more noise.
-    "WHISPERSEG_THRESHOLD": "0.35",
-    # Discard speech regions shorter than this many milliseconds.
-    "WHISPERSEG_MIN_SPEECH_MS": "100",
-    # Merge speech regions separated by shorter silences.
-    "WHISPERSEG_MIN_SILENCE_MS": "100",
-    # Padding added around WhisperSeg speech regions.
-    "WHISPERSEG_PAD_MS": "300",
-    # Maximum single speech region before splitting.
-    "WHISPERSEG_MAX_SPEECH_S": "5.0",
-    # Maximum grouped chunk duration passed to ASR.
-    "WHISPERSEG_MAX_GROUP_S": "6.0",
-    # Minimum duration that triggers WhisperSeg chunk grouping behavior.
-    "WHISPERSEG_CHUNK_THRESHOLD_S": "1.0",
-    # 1 forces WhisperSeg to CPU, useful when GPU memory is tight.
-    "WHISPERSEG_FORCE_CPU": "0",
-
-    # --- Fusion-lite Internal Silero Gate Settings ---
-    # Silero is not a user-facing VAD mode; fusion_lite variants use it as one speech prior.
-    "SILERO_VAD_THRESHOLD": "0.35",
-    "SILERO_VAD_MIN_SPEECH_MS": "80",
-    "SILERO_VAD_MIN_SILENCE_MS": "80",
-    "SILERO_VAD_PAD_MS": "300",
-    "SILERO_VAD_MAX_SPEECH_S": "30.0",
-    "SILERO_VAD_MAX_GROUP_S": "6.0",
-    "SILERO_VAD_CHUNK_THRESHOLD_S": "1.0",
-    "SILERO_VAD_ONNX": "1",
-    # Fusion-lite VAD keeps WhisperSeg as the candidate generator and combines
-    # Silero overlap with lightweight acoustic features.
-    "FUSION_VAD_PRIMARY_WEIGHT": "0.45",
-    "FUSION_VAD_GATE_WEIGHT": "0.25",
-    "FUSION_VAD_RMS_WEIGHT": "0.15",
-    "FUSION_VAD_SPECTRAL_FLUX_WEIGHT": "0.10",
-    "FUSION_VAD_DURATION_WEIGHT": "0.05",
-    "FUSION_VAD_MIN_SCORE": "0.45",
-    "FUSION_VAD_MIN_GATE_OVERLAP_RATIO": "0.05",
-    "FUSION_VAD_GATE_PAD_S": "0.30",
-    "FUSION_VAD_DEFAULT_PRIMARY_SCORE": "0.50",
-    "FUSION_VAD_RMS_FLOOR_DBFS": "-50.0",
-    "FUSION_VAD_RMS_FULL_DBFS": "-24.0",
-    "FUSION_VAD_SPECTRAL_FLUX_FLOOR": "0.0002",
-    "FUSION_VAD_SPECTRAL_FLUX_FULL": "0.0060",
-    "FUSION_VAD_DURATION_MIN_S": "0.20",
-    "FUSION_VAD_DURATION_FULL_S": "0.50",
-    "FUSION_VAD_DURATION_MAX_S": "12.0",
 
     # --- Alignment Retry & Refine ---
     # Max chunk length that hybrid alignment can force-align directly.
@@ -375,7 +312,7 @@ DEFAULT_SETTINGS: dict[str, str] = {
     "QC_MAX_ALIGN_FALLBACK": "0.20",
     # Maximum ASR generation failures before quality report warning.
     "QC_MAX_ASR_GENERATION_ERRORS": "0",
-    # Maximum Whisper decoder overflow failures before quality report warning.
+    # Maximum ASR generation overflow failures before quality report warning.
     "QC_MAX_ASR_GENERATION_OVERFLOWS": "0",
 
     # --- Speaker Diarization ---

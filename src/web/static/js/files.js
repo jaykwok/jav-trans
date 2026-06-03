@@ -98,7 +98,6 @@ export function installFiles() {
       skip_translation:         $('r-skip-translation').checked,
       multi_cue_split:          $('t-multi-cue-split').checked,
       keep_quality_report:      $('t-quality-report').checked,
-      vad_threshold:            parseFloat($('t-vad-threshold').value) || 0.35,
       translation_max_workers:  parseInt($('t-translation-max-workers').value) || 4,
       ...readTranslationSettingsFromForm(),
       keep_temp_files:          $('t-keep-temp').checked,

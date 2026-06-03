@@ -9,11 +9,14 @@
 ## 当前结论
 
 - 默认 VAD 已切到 `fusionvad_ja`，当前 head 是 FusionVAD-JA v1.19b split-cut endpoint refiner。
-- 默认 ASR 仍是 `whisper-ja-anime-v0.3`；选择 `qwen3-asr-1.7b` 时默认使用 `jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame`。
+- 默认 ASR backend key 已切到 Hugging Face repo ID 本身：`jaykwok/Qwen3-ASR-0.6B-JA-Anime-Galgame`；可选 `jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame`。短 key 不再进入主线，避免 Web/API/cache/download 出现两套命名。
 - FusionVAD-JA frozen feature 默认使用 `jaykwok/Qwen3-ASR-0.6B-JA-Anime-Galgame`，不再默认下载 base 0.6B。
+- FusionVAD-JA 默认运行依赖已收束到仓库内小 checkpoint：v1.19b endpoint refiner 和 v1.21 drop-gap imitation head 都放在 `src/vad/fusionvad_ja/checkpoints/`；默认不再指向 `datasets/train/...` 实验目录。
+- 破坏式维护重构：`src/whisper/` 改为 `src/asr/`，`tools/fusionvad_ja/` 按职责拆到 `tools/asr/`、`tools/vad/`、`tools/subtitles/`、`tools/audits/`；Whisper/WhisperSeg/TEN/Silero/FusionLite 当前主线代码和测试移入 `agents/rm/obsolete-mainline-cleanup-20260603/`。
 - 当前主线不再是 high-recall proposal VAD，而是 speech-island boundary VAD：ASR 前 chunk 要尽量接近一句台词，避免长连续 chunk、内部 gap、多 speech island 和非语音多送诱发 ASR 空输出、非语音幻觉和 forced aligner sentinel。
 - 边界优先级：`start` 略高于 `end`，但两者都要进 gate；允许为了切准 speech island 牺牲少量 frame recall，但不能漏掉完整台词 island。
 - 下一步应训练 v1.20 boundary-first endpoint/refiner：显式优化 start/end error、fallback chunk duration、gap crossing、单 chunk 台词数，并把 recall 从硬主目标降为 guardrail。
+- 现行 `tools/` 已按职责重构：`tools/asr/qwen/` 放 Qwen SFT，`tools/asr/diagnostics/` 放 ASR/alignment 诊断，`tools/vad/fusionvad_ja/` 放 VAD 训练评测，`tools/subtitles/` 放 cue planner / speaker sidecar，`tools/audits/` 放审计页与人工审计工具。旧历史段落里的 `tools/fusionvad_ja/...` 路径保留为当时记录。
 
 ---
 
@@ -432,7 +435,7 @@ GPU 闭环 threshold `0.95`：
 
 实施验收记录：
 
-- 代码范围：`src/audio/chunk_packer.py`、`src/whisper/pipeline.py`、`src/whisper/vad_chunk_cache.py`、`src/core/config.py`、`.env.example`、`tools/fusionvad_ja/run_full_workflow.py`。
+- 代码范围：`src/audio/chunk_packer.py`、`src/whisper/pipeline.py`、`src/whisper/vad_chunk_cache.py`、`src/core/config.py`、`.env.example`、`tools/vad/fusionvad_ja/run_full_workflow.py`。
 - 测试范围：`tests/test_chunk_packer.py`、`tests/test_vad_chunk_cache.py`、`tests/test_asr_stage_env_scope.py`、`tests/test_pipeline_chunk_config_runtime.py`、`tests/test_run_full_workflow_env.py`。
 - 验收命令：`.venv/bin/python -m pytest tests/test_chunk_packer.py tests/test_vad_chunk_cache.py tests/test_run_full_workflow_env.py tests/test_asr_stage_env_scope.py tests/test_pipeline_chunk_config_runtime.py -q`。
 - 结果：`44 passed`，仅有 Codex sandbox 内 NVML 初始化 warning；不影响 packing / cache / env 透传结论。
@@ -440,7 +443,7 @@ GPU 闭环 threshold `0.95`：
 
 离线复算：
 
-- 工具：`tools/fusionvad_ja/analyze_r18_risk_splits.py`。
+- 工具：`tools/vad/fusionvad_ja/analyze_r18_risk_splits.py`。
 - 输入：匿名样片 A v1.17 endpoint-refiner 的 VAD cache、diagnostics、R17 frame/cut score。
 - 输出：`agents/temp/fusionvad-ja/r18-risk-split-offline-sample-a*/summary.json`、`summary.md`、`risk_split_plan.jsonl`、`simulated_chunks.jsonl`。
 - 口径限制：离线复算只重打 cached VAD segments，并用 core overlap 把旧 diagnostics 映射到新 chunk；不跑 ASR / forced aligner，因此只能评估 chunk 分布和风险覆盖，不能替代 GPU 闭环。
@@ -498,7 +501,7 @@ GPU 闭环：
 
 R18 后续 cut-signal 离线审计：
 
-- 工具：`tools/fusionvad_ja/analyze_fallback_cut_signal.py`。
+- 工具：`tools/vad/fusionvad_ja/analyze_fallback_cut_signal.py`。
 - 输入：全量 `chunk_metrics.jsonl`，不是 `unsafe_fallback_chunks.jsonl` top-N；后者只保留最长 20 条审计样本。
 - 目的：确认现有 v1.17 的 `speech/cut` 概率在 unsafe fallback chunk 内是否已经包含足够切点。如果已有信号足够，说明 packer 阈值还有空间；如果信号不够，说明必须改训练目标。
 - 输出：
@@ -523,7 +526,7 @@ R18 后续 cut-signal 离线审计：
 - 新增 `EndpointRefinerTrainConfig.cut_boundary_radius_frames`，默认 `0`，不改变 v1.17 旧行为。
 - `endpoint_targets_from_record()` 仍保留原逻辑：长 gap（`gap >= cut_min_gap_s`）整段标为 cut。
 - 当 `gap < cut_min_gap_s` 且 `cut_boundary_radius_frames > 0` 时，把相邻 speech island 的 `previous.end` / `current.start` 附近若干帧也标为 cut 正样本。
-- CLI 新增 `tools/fusionvad_ja/train_endpoint_refiner.py --cut-boundary-radius-frames`。
+- CLI 新增 `tools/vad/fusionvad_ja/train_endpoint_refiner.py --cut-boundary-radius-frames`。
 
 目的：
 
@@ -569,7 +572,7 @@ R18 后续 cut-signal 离线审计：
 
 补充 fallback-safe synthetic gate：
 
-- `tools/fusionvad_ja/benchmark_boundary_predictions.py` 新增预测段级指标：
+- `tools/vad/fusionvad_ja/benchmark_boundary_predictions.py` 新增预测段级指标：
   - `fallback_target_duration_s`，默认 `8.0s`。
   - `fallback_gap_overlap_s`，默认 `0.5s`。
   - `long_predicted_segment_count / ratio`。
@@ -695,7 +698,7 @@ v1.19 reward 初稿：
 
 首轮离线实现：
 
-- 新增 `tools/fusionvad_ja/plan_reward_boundary_segments.py`。
+- 新增 `tools/vad/fusionvad_ja/plan_reward_boundary_segments.py`。
 - 输入：synthetic `boundary_manifest.jsonl` + endpoint prediction probabilities。
 - 输出：`summary.json`、`plan_details.jsonl`。
 - 支持三种 candidate source：
@@ -836,7 +839,7 @@ v1.20 训练方向：
 本轮代码落地：
 
 - `EndpointRefinerTrainConfig` 新增 `start_loss_weight` / `end_loss_weight`。
-- `tools/fusionvad_ja/train_endpoint_refiner.py` 默认改成 boundary-first：`speech=0.5`、`start=2.0`、`end=1.5`、`internal_gap=1.0`、`cut_drop=1.0`、`cut_point=1.0`、legacy `boundary_loss=0.0`。
+- `tools/vad/fusionvad_ja/train_endpoint_refiner.py` 默认改成 boundary-first：`speech=0.5`、`start=2.0`、`end=1.5`、`internal_gap=1.0`、`cut_drop=1.0`、`cut_point=1.0`、legacy `boundary_loss=0.0`。
 - `train_metrics.json` 新增 `mean_component_losses` 与 `boundary_first` 权重记录。
 
 v1.20 first-pass 执行：
@@ -868,13 +871,13 @@ cut_point 强化与 v1.21 teacher 启动：
   - probability planner：`agents/temp/fusionvad-ja/v1-21-teacher-plan-cutpoint64-probability-th010/`，segments `9979 -> 23056`，long `3126 -> 614`，gap-crossing `924 -> 814`，recall `0.9125`。
   - hybrid truth-cost teacher：`agents/temp/fusionvad-ja/v1-21-teacher-plan-cutpoint64-hybrid-truthcost-th010/`，segments `9979 -> 22924`，long `3126 -> 614`，gap-crossing `924 -> 651`，recall `0.9109`。
   - 结论：planner 作为 runtime 仍会过切且掉 recall；但作为 teacher 可以提供“高价值 split/drop-gap”训练信号。
-- 新增 `tools/fusionvad_ja/export_boundary_imitation_targets.py`，把 planner `plan_details.jsonl` 转成 v1.21 imitation targets：`split_frames`、`drop_gap_frames`、`split_points`、`drop_gap_zones`。
+- 新增 `tools/vad/fusionvad_ja/export_boundary_imitation_targets.py`，把 planner `plan_details.jsonl` 转成 v1.21 imitation targets：`split_frames`、`drop_gap_frames`、`split_points`、`drop_gap_zones`。
 - v1.21 imitation targets：`agents/temp/fusionvad-ja/v1-21-imitation-targets-cutpoint64-hybrid-truthcost-th010/`，4096 rows，`split_point=14534`，`drop_gap=3612`，split positive frame ratio `0.01654`，drop-gap positive frame ratio `0.03691`。
 - 下一步：训练 imitation head / policy head 时不能照单全收 planner。应把 teacher 当候选监督，加入 recall guard 和 segment-count penalty，优先学习“减少 long/gap-crossing 但不漏完整 island”的子集。
 
 v1.21 imitation head 执行记录：
 
-- 新增 `AdditionFusionImitationBiLSTM`，输出 `split` / `drop_gap` 两个 logits；新增 `tools/fusionvad_ja/train_imitation_head.py` 和 `tools/fusionvad_ja/export_imitation_head_predictions.py`。
+- 新增 `AdditionFusionImitationBiLSTM`，输出 `split` / `drop_gap` 两个 logits；新增 `tools/vad/fusionvad_ja/train_imitation_head.py` 和 `tools/vad/fusionvad_ja/export_imitation_head_predictions.py`。
 - 先跑 multitask plain BCE 1024 steps：`datasets/train/fusionvad-ja/v1-21/qwen3-asr-0.6b-full29239/imitation-head-cutpoint64-hybrid-truthcost-batch8-lr2e-4-steps1024/`。结果退化为常数策略：split best F1 `0.0330`，drop_gap best F1 `0.0774`，target/non-target p50 几乎相同。
 - 改成 positive-window sampling 后，multitask 仍不能学出可用 split/drop_gap：`imitation-head-poswin128-cutpoint64-hybrid-truthcost-batch8-lr2e-4-steps1024/`，drop_gap target/non-target p50 仍几乎一致。
 - 发现关键评测/训练坑：v1.21 imitation targets 按真实视频帧率 `29.97fps` 生成，`frame_hop_s=0.0333667`；Qwen feature cache 是 `frame_hop_s=0.02`。早期训练和导出都直接 `min(feature_frames, target_frames)` 截断，导致 target 时间轴错贴到 feature 前半段。已新增 `resize_binary_frames()`，训练与导出统一把 binary targets 重采样到 feature frame count，并加单测覆盖。
@@ -882,7 +885,7 @@ v1.21 imitation head 执行记录：
 - drop_gap-only 512 steps：`imitation-head-dropgaponly-poswin128-balanced-resizedtarget-batch8-lr2e-4-steps512/`。这是第一版真正有用的候选：drop_gap best F1 `0.2366`，precision `0.1767`，recall `0.3581`，target/non-target p50 `0.8686 / 0.5078`。
 - drop_gap-only 2048 steps：`imitation-head-dropgaponly-poswin128-balanced-resizedtarget-batch8-lr2e-4-steps2048/`。训练窗口 F1 提升到 `0.7268`，全量分离度更强但更保守：drop_gap best F1 `0.1870`，precision `0.1309`，recall `0.3269`，target/non-target p50 `0.7986 / 0.2506`。
 - 结论：v1.21 不应把 split/drop_gap 放进同一个 imitation head 直接模仿 planner。split teacher 太稀疏且容易与全局先验混淆；drop_gap-only 可以作为“可删除内部 gap scorer”进入 offline packer 消融。512 版更偏 F1，2048 版更偏高分离/高置信，二者都暂不替换默认 VAD。
-- offline packer 实现：新增 `tools/fusionvad_ja/apply_drop_gap_packer.py`，输入 baseline `speech_frames` 和 drop_gap 逐帧概率，只在长父段内部删除高置信 drop_gap run；不进入主 pipeline，不改默认 VAD。实现坑：不能把 baseline segment 重建成新 frame mask，否则无应用区间时也会误删极短片段；已改为只在原始 `speech_frames` 上把实际应用的 drop_gap 区间置零。
+- offline packer 实现：新增 `tools/vad/fusionvad_ja/apply_drop_gap_packer.py`，输入 baseline `speech_frames` 和 drop_gap 逐帧概率，只在长父段内部删除高置信 drop_gap run；不进入主 pipeline，不改默认 VAD。实现坑：不能把 baseline segment 重建成新 frame mask，否则无应用区间时也会误删极短片段；已改为只在原始 `speech_frames` 上把实际应用的 drop_gap 区间置零。
 - CUDA 导出：按“能 CUDA 就提权 CUDA”重跑 512/2048 逐帧概率，输出 `agents/temp/fusionvad-ja/v1-21-dropgaponly-step512-probabilities-cuda/` 和 `agents/temp/fusionvad-ja/v1-21-dropgaponly-step2048-probabilities-cuda/`，均 4096 rows。CPU 版本已移入 `agents/rm/fusionvad-ja-cpu-dropgap-probabilities-20260602/`。
 - offline packer 消融（boundary benchmark 参数同 baseline：pad `0.2s`、merge gap `0.15s`、fallback target `8s`）：
 
@@ -928,7 +931,7 @@ v1.22 / v1.23 计划修正：
   - regular gap：>=0.60s gap/noise/BGM，作为 `cut_drop`；
   - 随机 source / speaker proxy 顺序，避免模型只记住数据集原顺序；
   - BGM / noise / crossfade / gain / filter / codec / overlap 轻量增强。
-- v1.22 首个实现：新增 `tools/fusionvad_ja/build_v1_22_cutpoint_dataset.py`，它是 `build_galgame_synthetic_timeline.py` 的稳定 preset wrapper。底层仍输出 `labels.jsonl`、`manifest.json`、`boundary_manifest.jsonl` 和 `boundary_metadata`，因此可以直接复用现有 feature cache、endpoint-refiner 训练和 boundary benchmark。
+- v1.22 首个实现：新增 `tools/vad/fusionvad_ja/build_v1_22_cutpoint_dataset.py`，它是 `build_galgame_synthetic_timeline.py` 的稳定 preset wrapper。底层仍输出 `labels.jsonl`、`manifest.json`、`boundary_manifest.jsonl` 和 `boundary_metadata`，因此可以直接复用现有 feature cache、endpoint-refiner 训练和 boundary benchmark。
 - v1.22 smoke：`agents/temp/fusionvad-ja/v1-22-cutpoint-dataset-smoke16/`，16 records，`cut_point=52`，`cut_drop=11`，gap policy `regular=12 / short=33 / touch=19`。说明 wrapper 能稳定构造贴连、短 gap 和可删除 gap 三类监督。
 - 单测：`test_build_v1_22_cutpoint_dataset_wrapper_records_cutpoint_and_drop_zones` 覆盖 wrapper 输出 summary、`boundary_manifest.jsonl`、`LabelRecord.boundary_metadata`；相关 synthetic timeline 回归 4 passed。
 - 长 chunk 审计页已生成：`agents/audits/fusionvad-ja/long-fallback-r21-dropgap512-th080/index.html`。内容为 R21 dropgap512-th080 的 20 条 unsafe long fallback chunk，使用匿名样片 A 原视频 + 日文 VTT overlay + chunk ASR 文本 / 重叠字幕 / 指标，便于人工判断长 chunk 是真实长台词、噪声幻觉、还是多 speech island 被合并。
@@ -947,7 +950,7 @@ v1.22 / v1.23 计划修正：
 | `0.20` | `0.6853` | `45106.1` | `0.7245` | `4.842s` | `4.794s` | `7.08s` | `2007` | `435` |
 
 - v1.22 first-pass 结论：数据构造方向成立，cut_drop/cut_point 信号能学到一部分，但当前 loss 把 speech mask 压坏，最高低阈值 recall 也只有 `0.8144`，远低于 `>=0.93` guardrail。不要直接把同一训练目标放大到 32768；下一版应先修正目标：提高 speech guardrail / 两阶段训练（先保住 speech mask，再训 boundary/cut）/ 或从 v1.19b 稳定 head 初始化，只训练新增 cutpoint/boundary 头。
-- recall 口径修正：旧 `speech_duration_recall` 是线性时长重叠，覆盖 speech island 后半段和覆盖前半段会拿到同样分数；这不符合当前“start 更重要”的字幕边界目标。`tools/fusionvad_ja/benchmark_boundary_predictions.py` 新增 `start_weighted_speech_recall`，对每个 truth speech island 按 `w(x)=(1-x)^gamma` 积分，`x=0` 为 island 起点，默认 `gamma=2.0`。单测覆盖：只覆盖前半段得分 `0.875`，只覆盖后半段得分 `0.125`，线性 recall 都是 `0.5`。
+- recall 口径修正：旧 `speech_duration_recall` 是线性时长重叠，覆盖 speech island 后半段和覆盖前半段会拿到同样分数；这不符合当前“start 更重要”的字幕边界目标。`tools/vad/fusionvad_ja/benchmark_boundary_predictions.py` 新增 `start_weighted_speech_recall`，对每个 truth speech island 按 `w(x)=(1-x)^gamma` 积分，`x=0` 为 island 起点，默认 `gamma=2.0`。单测覆盖：只覆盖前半段得分 `0.875`，只覆盖后半段得分 `0.125`，线性 recall 都是 `0.5`。
 - 用新口径重算 v1.22 4096 first-pass，`speech_threshold=0.05/0.08/0.10/0.15/0.20` 的 `start_weighted_speech_recall` 分别为 `0.8204 / 0.7747 / 0.7555 / 0.7207 / 0.6945`。它只比线性 duration recall 高 `0.006-0.009`，说明这版模型并非单纯“漏开头被旧指标误伤”，而是总体 speech 覆盖不足；不改变“不直接放大到 32768”的结论。
 - v1.22b speechguard：复用 4096 feature cache，把 `speech_loss_weight` 拉高到 `2.0`，boundary/cut 降为辅助，CUDA 训练 1024 steps：`datasets/train/fusionvad-ja/v1-22/qwen3-asr-0.6b-full29239/endpoint-refiner-cutpoint-supervised4096-batch8-lr2e-4-steps1024-speechguard/`。frame speech recall 回到 `0.9841`，但 cut/start/end 头在 `0.5` 阈值下全为 0；boundary benchmark recall `0.9848` / start-weighted `0.9789`，但 start p50/p90 `10.30s/28.66s`、duration p90/max `38.78s/46.02s`、long `5061`，说明单纯保 speech 会退化为大段保守 mask。
 - v1.22c init-v1.19b：训练工具新增 `--init-checkpoint`，从默认 v1.19b head 初始化，低学习率 `5e-5` CUDA 微调 512 steps：`datasets/train/fusionvad-ja/v1-22/qwen3-asr-0.6b-full29239/endpoint-refiner-cutpoint-supervised4096-initv119b-batch8-lr5e-5-steps512/`。frame metrics at `speech=0.20/cut=0.50`：speech F1 `0.9514`，precision `0.9134`，recall `0.9927`；cut_drop F1 `0.3029` / recall `0.9272`；cut_point F1 `0.1293` / recall `0.3780`。说明从稳定 head 初始化能同时保 speech 和保留 cut 信号。
@@ -965,14 +968,14 @@ v1.23 residual cut split 离线归因：
 
 - 目的：确认 v1.22c 的 28.47s unsafe fallback 是“模型没有切点信号”，还是“切点信号存在但 packing 策略没用上”。
 - 先提权 CUDA 导出匿名样片 A 的 v1.22c 逐帧分数：`agents/temp/fusionvad-ja/v1-23-anon-a-v1-22c-frame-scores.json`，`frame_count=269833`，`frame_hop=0.02s`，日志 `agents/temp/v1-23-export-frame-scores-anon-a-cuda.run.log`。
-- 用 `tools/fusionvad_ja/analyze_fallback_cut_signal.py` 分析 `fallback-safe-boundary-metrics-anon-a-v1-22c-cutboundary/unsafe_fallback_chunks.jsonl`：
+- 用 `tools/vad/fusionvad_ja/analyze_fallback_cut_signal.py` 分析 `fallback-safe-boundary-metrics-anon-a-v1-22c-cutboundary/unsafe_fallback_chunks.jsonl`：
   - 20/20 unsafe 都是 `vad_coarse_after_sentinel`。
   - 20/20 都是 `speech_island_count=1`、`internal_gap_count=0`、`split_reason=pre_asr_cut_split`。
   - 20/20 都有 cut 候选；按 `target_child_s=9.0`，17/20 用离线贪心可切到目标内。
   - 真实 `_plan_cut_split_frames_for_segment` 复算：20/20 都能找到 split frame，16/20 子段 max <= 9s。说明瓶颈不是 cut head 完全无信号。
 - 更细根因：v1.22c 先在超长连续段上跑 `pre_asr_cut_split`，但 `max_children=8` 被父段消耗后，仍留下 24.47s residual child；随后 R18 risk splitter 因为 single-island continuous risk score 只有 `1.5`，低于 `continuous_threshold=2.0`，没有继续切这些 residual child。
 - 代码补丁：`src/audio/chunk_packer.py` 在 risk split 阶段保留 chunk 的 `split_policy`，并给 “`r17_pre_asr_cut_v1` 产生后仍超过 target 的 single residual child” 增加 `residual_cut_child` 风险理由。单测 `test_pre_asr_risk_split_revisits_long_residual_cut_child` 覆盖：普通 long continuous chunk 仍受 `continuous_threshold=2.0` 保护，但 residual cut child 可继续切。
-- 新增工具：`tools/fusionvad_ja/analyze_residual_cut_split.py`，直接从已有 `processing_spans` 模拟 residual risk split；它比 `analyze_r18_risk_splits.py` 更贴近 v1.22c 的真实失败链路，因为后者会从 raw VAD segments 重新 pack。
+- 新增工具：`tools/vad/fusionvad_ja/analyze_residual_cut_split.py`，直接从已有 `processing_spans` 模拟 residual risk split；它比 `analyze_r18_risk_splits.py` 更贴近 v1.22c 的真实失败链路，因为后者会从 raw VAD segments 重新 pack。
 - residual 模拟结果：
 
 | config | target split | chunk growth | target max child p90 | target max child max | 结论 |
@@ -996,28 +999,37 @@ v1.23 后置修正 first-pass：
 - 检索依据：ASR hallucination 文献指出非语音/模糊人声会诱发重复循环幻觉，但目标域中的 disfluency、喘息、呻吟、短促 kana 也可能是真实内容，不能用“低信息文本”本身作为删除依据；Netflix timing guideline 支持 in-time/start 优先、out-time/end 可后处理压缩并保留 2-frame gap；ERes2NetV2 / 3D-Speaker / CAM++ 更适合作为 speaker embedding sidecar，不替代 VAD。
 - `src/subtitles/options.py` / `src/subtitles/writer.py`：新增 `SUBTITLE_DENSE_CUE_MERGE_*` 和 `_merge_dense_short_cues`。它只合并短、近、文本量小、同 speaker 或未知 speaker 的 micro cues；不移动下一条 start，后续仍由 normalize/polish 保证 2-frame gap。默认阈值保守：4 frames gap、24 frames 单 cue、90 frames 合并后总长、12 text units。
 - `src/whisper/qc.py`：新增 `vocalization_repetition` profile。kana-only、短 unit、低字符密度、时长不长的重复语气词/呻吟从 `repeat_ngram_loop reject` 改为 `repeated_nonlexical_vocalization warn` + `preserve_with_review`；lexical phrase loop、高密度文本和 signal reject 仍会 reject。没有引入具体词黑名单。
-- `tools/fusionvad_ja/probe_speaker_sidecar.py`：新增离线 adjacent speaker-change probe。输入预计算的 ERes2NetV2 / 3D-Speaker / CAM++ embedding JSONL，输出相邻 segment 的 cosine、`speaker_change_score=1-cosine` 和阈值判断。先保证 sidecar 指标链路，不把真实模型下载和依赖接进默认 pipeline。
-- 测试：`.venv/bin/python -m py_compile src/subtitles/options.py src/subtitles/writer.py src/whisper/qc.py tools/fusionvad_ja/probe_speaker_sidecar.py`；`.venv/bin/python -m pytest tests/test_subtitle_options.py tests/test_subtitle_quality_pass.py tests/test_asr_qc_signals.py tests/test_qc_backend_context.py tests/test_speaker_sidecar_probe.py`，结果 `68 passed`。
+- `tools/subtitles/probe_speaker_sidecar.py`：新增离线 adjacent speaker-change probe。输入预计算的 ERes2NetV2 / 3D-Speaker / CAM++ embedding JSONL，输出相邻 segment 的 cosine、`speaker_change_score=1-cosine` 和阈值判断。先保证 sidecar 指标链路，不把真实模型下载和依赖接进默认 pipeline。
+- 测试：`.venv/bin/python -m py_compile src/subtitles/options.py src/subtitles/writer.py src/whisper/qc.py tools/subtitles/probe_speaker_sidecar.py`；`.venv/bin/python -m pytest tests/test_subtitle_options.py tests/test_subtitle_quality_pass.py tests/test_asr_qc_signals.py tests/test_qc_backend_context.py tests/test_speaker_sidecar_probe.py`，结果 `68 passed`。
 - 下一步：用 v1.23 产物离线重放 subtitle writer，比较 dense cue merge 前后 `per_min_subtitle_count`、`short_segment_ratio` 和字幕观感；用 diagnostics 统计 `repeated_nonlexical_vocalization` 与旧 `repeat_ngram_loop` 差异；接 ERes2NetV2 / 3D-Speaker extractor 对匿名样片 A islands 做 sidecar probe。
-- 2026-06-03 v1.23 subtitle postprocess replay 已补工具和实测：`tools/fusionvad_ja/replay_subtitle_postprocess.py` 读取既有 `bilingual.json` / `aligned_segments.json` / `timings.json`，分别以 dense cue merge OFF/ON 重放 `prepare_srt_blocks()`，输出 `before_blocks.json`、`after_blocks.json`、`summary.json`、`summary.md`。测试：`.venv/bin/python -m pytest tests/test_replay_subtitle_postprocess.py tests/test_subtitle_quality_pass.py tests/test_asr_qc_signals.py tests/test_speaker_sidecar_probe.py`，结果 `53 passed`。
+- 2026-06-03 v1.23 subtitle postprocess replay 已补工具和实测：`tools/subtitles/replay_subtitle_postprocess.py` 读取既有 `bilingual.json` / `aligned_segments.json` / `timings.json`，分别以 dense cue merge OFF/ON 重放 `prepare_srt_blocks()`，输出 `before_blocks.json`、`after_blocks.json`、`summary.json`、`summary.md`。测试：`.venv/bin/python -m pytest tests/test_replay_subtitle_postprocess.py tests/test_subtitle_quality_pass.py tests/test_asr_qc_signals.py tests/test_speaker_sidecar_probe.py`，结果 `53 passed`。
 - 匿名样片 A replay 产物：`agents/temp/fusionvad-ja/subtitle-postprocess-replay-v1-23-anon-a/summary.md`。结果：blocks `1543 -> 1543`，dense merges `0 -> 0`，short segment ratio `0.205 -> 0.205`，per-min subtitle count `17.11 -> 17.11`，nonlexical repetition count `17 -> 17`。结论：当前 dense short cue merge 太保守，对 v1.23 真实输出没有实际缓解；后续不应盲目放宽阈值，而应做 cue-stage planner：结合 start/end、最小 2-frame gap、读速、speaker-change、非词汇重复和 fallback 质量做局部 merge/polish。
 - repeat-loop 策略复核：Galgame SFT 后大量喘息、呻吟、短 kana 重复是真实目标域内容的可能性很高，因此不能把 `repeat_ngram_loop` 一刀切成幻觉。当前 `repeated_nonlexical_vocalization` 只把短、低密度、非词汇 profile 标为 `preserve_with_review`；夹杂语义词、异常字符密度或长串 lexical loop 仍保留 reject / warning。这符合“先保留可审计内容，再用后处理和人工样本反哺”的路线。
 - RL 位置再次收敛：不做逐帧 RL、不直接用 RL 改 VAD layers。下一版 RL 只做 constrained candidate-cut policy，动作限定为 `keep` / `split` / `drop-gap`，候选点来自 VAD valley、cut_drop、cut_point、endpoint、speaker-change 或 subtitle cue 风险点。reward 以 start 准、fallback chunk 不粗、不过长跨 gap、不明显增加 ASR empty / hallucination、字幕观感可接受为主；synthetic reward 不能单独作为上线 gate。
-- 2026-06-03 cue-stage planner 离线诊断补充：新增 `tools/fusionvad_ja/analyze_subtitle_cue_merge_candidates.py`，只做诊断和模拟，不改正式 writer 默认。它读取 v1.23 `bilingual.json`，解释相邻 cue 为什么没有被 dense merge，并用更宽的候选规则模拟局部合并，输出 `before_blocks.json`、`planner_blocks.json`、`planner_actions.json`、`summary.json`、`summary.md`。测试：`.venv/bin/python -m pytest tests/test_subtitle_cue_merge_candidates.py tests/test_replay_subtitle_postprocess.py tests/test_subtitle_quality_pass.py tests/test_subtitle_options.py`，结果 `42 passed`。
+- 2026-06-03 cue-stage planner 离线诊断补充：新增 `tools/subtitles/analyze_subtitle_cue_merge_candidates.py`，只做诊断和模拟，不改正式 writer 默认。它读取 v1.23 `bilingual.json`，解释相邻 cue 为什么没有被 dense merge，并用更宽的候选规则模拟局部合并，输出 `before_blocks.json`、`planner_blocks.json`、`planner_actions.json`、`summary.json`、`summary.md`。测试：`.venv/bin/python -m pytest tests/test_subtitle_cue_merge_candidates.py tests/test_replay_subtitle_postprocess.py tests/test_subtitle_quality_pass.py tests/test_subtitle_options.py`，结果 `42 passed`。
 - 匿名样片 A blocker 分布：相邻 pair `1542`，dense merge 基本被 `text_units_too_large=1540`、`single_duration_too_long=1494`、`combined_duration_too_long=1301`、`gap_too_large=459`、`sentence_boundary=161` 挡住。这说明 v1.23 的短字幕密度不是 micro-cue 小规则能解决，而是 cue-stage 需要在更长但仍可读的范围内做规划。
 - 离线扫描：保守参数 `min_score=0.72/max_gap=0.45s/max_combined=4.8s/max_text_units=34` 合并 `0`。`wide1` (`0.55/0.8s/6.5s/48`) 合并 `70`，blocks `1543 -> 1475`，short ratio `0.205 -> 0.161`，per-min `17.11 -> 16.35`，overlap `0`。`wide2` (`0.45/1.2s/6.5s/56`) 合并 `166`，blocks `1543 -> 1386`，short ratio `0.205 -> 0.124`，per-min `17.11 -> 15.37`，kana-only `0.093 -> 0.072`，overlap `0`。wide2 仍不满足 `QC_MAX_PER_MIN=8`，但证明“cue-stage planner”有实际杠杆；下一步应引入 speaker sidecar / 读速 / fallback 风险和人工审计，而不是直接把 wide2 作为默认。
 - 2026-06-03 cue planner 约束接入：`analyze_subtitle_cue_merge_candidates.py` 增加 `--diagnostics`、`--speaker-pairs`、`--speaker-change-policy`、`--fallback-risk-policy`。speaker sidecar 可按 cue id / index / source segment / chunk id 匹配相邻 pair，`speaker_change` 默认 block；alignment diagnostics 通过 `source_chunk_index` 关联 cue，fallback / sentinel / ASR reject 默认 penalize，也可 block。测试扩大到 `44 passed`。
 - 匿名样片 A + diagnostics 结果：`wide2` + fallback risk penalize 合并 `144`，blocks `1543 -> 1407`，short ratio `0.205 -> 0.134`，per-min `17.11 -> 15.60`，overlap `0`；fallback risk block 合并 `141`，short ratio `0.140`。约束统计显示 `fallback_risk_pair=713`、`fallback_risk_boundary=592`，但仍保留足够合并空间。结论：fallback 风险不应一刀切禁止 cue merge，适合作为 penalty / review signal；真正需要下一步补的是 ERes2NetV2/3D-Speaker speaker-pair 实测，防止把换人对话误合并。
-- 2026-06-03 speaker sidecar extractor first-pass：新增 `tools/fusionvad_ja/extract_speaker_sidecar_embeddings.py`。它从 `bilingual.json` + 原始音频切 cue，输出 `speaker_embeddings.jsonl` 与 adjacent `speaker_pairs.jsonl`，并可直接喂给 cue planner。当前 backend：`energy_mfcc` 仅用于 smoke / schema 验证；`modelscope_eres2netv2` 已预留但会明确提示需要 3D-Speaker `speakerlab` 包，不静默假跑。测试：`.venv/bin/python -m pytest tests/test_speaker_sidecar_embeddings.py tests/test_speaker_sidecar_probe.py tests/test_subtitle_cue_merge_candidates.py`，结果 `6 passed`。
+- 2026-06-03 speaker sidecar extractor first-pass：新增 `tools/subtitles/extract_speaker_sidecar_embeddings.py`。它从 `bilingual.json` + 原始音频切 cue，输出 `speaker_embeddings.jsonl` 与 adjacent `speaker_pairs.jsonl`，并可直接喂给 cue planner。当前 backend：`energy_mfcc` 仅用于 smoke / schema 验证；`modelscope_eres2netv2` 已预留但会明确提示需要 3D-Speaker `speakerlab` 包，不静默假跑。测试：`.venv/bin/python -m pytest tests/test_speaker_sidecar_embeddings.py tests/test_speaker_sidecar_probe.py tests/test_subtitle_cue_merge_candidates.py`，结果 `6 passed`。
 - 匿名样片 A energy_mfcc smoke：`2545/2694` cues 生成 embedding，`2544` pairs，`speaker_change_count=14`，接入 cue planner 后只阻断 `4` 个候选，合并数仍为 `144`，short ratio `0.134`。结论：链路完整，但 energy/MFCC 不是可靠换人模型；它只能证明 sidecar schema 与 planner 约束能跑通。下一步若要真正判断男女/多人 cue，应安装 3D-Speaker / speakerlab 并用 `iic/speech_eres2netv2_sv_zh-cn_16k-common` 或 `iic/speech_eres2netv2w24s4ep4_sv_zh-cn_16k-common` 重跑。
 - 2026-06-03 speaker sidecar extractor second-pass：`modelscope_eres2netv2` 从占位报错改为真实 ModelScope speaker-verification pipeline backend，默认 model id `iic/speech_eres2netv2_sv_zh-cn_16k-common`，支持 `--device`、`--batch-size`、`--model-id`，并在缺依赖 / 缺模型 / 网络或 CUDA 问题时明确失败，不回退到 `energy_mfcc`。本地探测发现 `modelscope` 已装但缺 `addict` 等可选依赖，真实匿名样片 A 还需提权安装依赖和下载模型后再跑。测试：`.venv/bin/python -m pytest tests/test_speaker_sidecar_embeddings.py tests/test_speaker_sidecar_probe.py tests/test_subtitle_cue_merge_candidates.py`，结果 `7 passed`。
 - 2026-06-03 ERes2NetV2 真实 sidecar probe：用 `uv pip install addict sortedcontainers simplejson datasets oss2` 补齐 ModelScope 可选依赖，模型下载到项目内 `models/modelscope/iic/speech_eres2netv2_sv_zh-cn_16k-common`（约 `71M`，ignored）。`--backend modelscope_eres2netv2 --device gpu --batch-size 32` 跑匿名样片 A v1.23：`embedding_count=2545/2694`，`pair_count=2544`，embedding dim `192`，skip `short=126 / empty_audio=23`。原始阈值 `0.35` 过敏感：score p50 `0.6826`，th75 `919` changes，th85 `423`，th95 `111`。cue planner wide2 + diagnostics + fallback penalize 对比：ERes2NetV2 th65 block `85` merges / short ratio `0.1647`；th75 block `100` / `0.1567`；th85 block `130` / `0.1429`；th85 penalize `123` / `0.1444`。结论：真实 speaker sidecar 有实用约束力，但分数需校准；当前更适合作为 cue-stage penalty/review 信号或高阈值 block，不应直接默认硬 block。
-- 2026-06-03 speaker sidecar cue-planner sweep 工具：新增 `tools/fusionvad_ja/sweep_speaker_sidecar_cue_planner.py`，输入 `speaker_embeddings.jsonl` 后自动生成多阈值 adjacent speaker pairs，并调用 cue planner 扫 `block/penalize` policy，输出 `sweep_summary.json/md`。匿名样片 A 标准化 sweep：产物 `agents/temp/fusionvad-ja/speaker-sidecar-cue-planner-sweep-v1-23-anon-a-eres2netv2/`；th75 changes `919`、merges `104`、short ratio `0.1577`；th85 changes `423`、merges `127`、short ratio `0.1441`；th95 changes `111`、merges `139`、short ratio `0.1367`；block 与 penalize 在本轮最终 merge 数相同，但 blocker 分布不同。该结果支持“speaker sidecar 是 cue-stage review/penalty/高阈值 block 信号，不直接作为低阈值硬规则”。测试：`.venv/bin/python -m pytest tests/test_speaker_sidecar_cue_planner_sweep.py tests/test_speaker_sidecar_embeddings.py tests/test_speaker_sidecar_probe.py tests/test_subtitle_cue_merge_candidates.py`，结果 `8 passed`。
+- 2026-06-03 speaker sidecar cue-planner sweep 工具：新增 `tools/subtitles/sweep_speaker_sidecar_cue_planner.py`，输入 `speaker_embeddings.jsonl` 后自动生成多阈值 adjacent speaker pairs，并调用 cue planner 扫 `block/penalize` policy，输出 `sweep_summary.json/md`。匿名样片 A 标准化 sweep：产物 `agents/temp/fusionvad-ja/speaker-sidecar-cue-planner-sweep-v1-23-anon-a-eres2netv2/`；th75 changes `919`、merges `104`、short ratio `0.1577`；th85 changes `423`、merges `127`、short ratio `0.1441`；th95 changes `111`、merges `139`、short ratio `0.1367`；block 与 penalize 在本轮最终 merge 数相同，但 blocker 分布不同。该结果支持“speaker sidecar 是 cue-stage review/penalty/高阈值 block 信号，不直接作为低阈值硬规则”。测试：`.venv/bin/python -m pytest tests/test_speaker_sidecar_cue_planner_sweep.py tests/test_speaker_sidecar_embeddings.py tests/test_speaker_sidecar_probe.py tests/test_subtitle_cue_merge_candidates.py`，结果 `8 passed`。
 - 2026-06-03 cue planner reading-density gate：`analyze_subtitle_cue_merge_candidates.py` / `sweep_speaker_sidecar_cue_planner.py` 新增可选 `--max-reading-units-per-s`，默认 `0` 关闭。它阻止合并后 `text_units / duration` 过高的 cue，记录 `reading_density_too_high` blocker，只用于离线诊断。匿名样片 A ERes2NetV2 sweep 对比：无 reading gate 时 th85/th95 penalize 分别 `127/139` merges、short ratio `0.1441/0.1367`；reading12 变为 `49/57` merges、`0.1879/0.1834`；reading16 为 `74/84`、`0.1783/0.1738`；reading20 为 `86/98`、`0.1729/0.1693`。结论：读速 gate 是有用的保护/审计信号，但会明显砍掉合并空间，当前不应作为主优化目标或默认开启。
 - 2026-06-03 cue planner 字幕对照导出：`analyze_subtitle_cue_merge_candidates.py` 现在随 `before_blocks.json` / `planner_blocks.json` 同步导出 `before.bilingual.srt/vtt` 与 `planner.bilingual.srt/vtt`，并把路径写入 `summary.outputs`。标准 ERes2NetV2 sweep 已刷新并包含字幕文件：`agents/temp/fusionvad-ja/speaker-sidecar-cue-planner-sweep-v1-23-anon-a-eres2netv2/`；当前默认口径为 `min_score=0.45/max_gap=1.2s/max_combined=6.5s/max_text_units=56`，本轮 th75/th85/th95 merges 为 `95/121/137`，short ratio 为 `0.1604/0.1478/0.1379`。另生成 reading16 诊断 sweep：`agents/temp/fusionvad-ja/speaker-sidecar-cue-planner-sweep-v1-23-anon-a-eres2netv2-reading16/`，th85/th95 merges `77/85`，short ratio `0.1777/0.1739`。结论不变：读速 gate 是保护/审计信号，标准候选仍优先看 th85/th95 的实际字幕观感。
-- 2026-06-03 cue planner merge review 清单：新增 `tools/fusionvad_ja/export_cue_planner_merge_review.py`，把 `planner_actions.json` + `before_blocks.json` 导出为风险优先的 `merge_review_items.jsonl/csv` 和 `summary.md`。字段包含合并前后文本、时间、score、gap、combined duration/text units、speaker-change score、fallback/cross-chunk/读速风险标签。匿名样片 A 产物：th85 `agents/temp/fusionvad-ja/cue-planner-merge-review-v1-23-anon-a-eres2netv2-th85/`，121 items，风险标签 reading_density_high `53`、near_speaker_threshold `20`、fallback_risk/crosses_chunk `7`；th95 `agents/temp/fusionvad-ja/cue-planner-merge-review-v1-23-anon-a-eres2netv2-th95/`，137 items，reading_density_high `60`、near_speaker_threshold `15`、high_speaker_score `14`、fallback_risk/crosses_chunk `9`。结论：后续人工审计不必通读全片，可先看 high-priority merge items 判断 th85/th95 是否合并跨 speaker、fallback 粗时间轴或高读速片段。
+- 2026-06-03 cue planner merge review 清单：新增 `tools/subtitles/export_cue_planner_merge_review.py`，把 `planner_actions.json` + `before_blocks.json` 导出为风险优先的 `merge_review_items.jsonl/csv` 和 `summary.md`。字段包含合并前后文本、时间、score、gap、combined duration/text units、speaker-change score、fallback/cross-chunk/读速风险标签。匿名样片 A 产物：th85 `agents/temp/fusionvad-ja/cue-planner-merge-review-v1-23-anon-a-eres2netv2-th85/`，121 items，风险标签 reading_density_high `53`、near_speaker_threshold `20`、fallback_risk/crosses_chunk `7`；th95 `agents/temp/fusionvad-ja/cue-planner-merge-review-v1-23-anon-a-eres2netv2-th95/`，137 items，reading_density_high `60`、near_speaker_threshold `15`、high_speaker_score `14`、fallback_risk/crosses_chunk `9`。结论：后续人工审计不必通读全片，可先看 high-priority merge items 判断 th85/th95 是否合并跨 speaker、fallback 粗时间轴或高读速片段。
 - 2026-06-03 th85 vs th95 merge review 只读对比：th95 比 th85 多 `18` 个合并，extra 风险标签为 near_speaker_threshold `15`、reading_density_high `9`、loose_gap `3`、fallback_risk/crosses_chunk `2`。这说明 th95 的新增收益主要来自放过更接近 speaker-change 阈值的相邻 cue，而不是大量低风险短 cue。下一步人工审计应优先看 th95-extra 18 条；若跨 speaker / 高读速观感可接受，可把 th95 作为 cue-stage 候选，否则退回 th85。
-- 2026-06-03 审计页导航统一：新增 `tools/fusionvad_ja/audit_nav.py`，后续审计页统一刷新 `agents/audits/index.html` 和 `agents/audits/latest-audit.html`；`latest-audit.html` 只提供静态链接，不再自动跳转。旧审计产物已移入 `agents/rm/audits-old-20260603/`，`agents/audits/` 当前只保留最新的 `cue-planner-th95-extra-audio-audit/` 和全局导航；审计产物直接放在 `agents/audits/` 下，不再套 `fusionvad-ja/` 子目录。以后从 `agents/audits/index.html` 进入最新审计。
+- 2026-06-03 审计页导航统一：新增 `tools/audits/audit_nav.py`，后续审计页统一刷新 `agents/audits/index.html` 和 `agents/audits/latest-audit.html`；`latest-audit.html` 只提供静态链接，不再自动跳转。审计产物直接放在 `agents/audits/` 下，不再套 `fusionvad-ja/` 子目录。以后从 `agents/audits/index.html` 进入最新审计。早期 th95-extra 审计页后续因标签语义拆分作废；当前活跃审计页见后续 v3-side-labels 记录。
+- 2026-06-03 cue planner 人工审计校准闭环：新增 `tools/subtitles/calibrate_cue_planner_from_manual_audit.py`，把审计 JSONL + source manifest 合并成可复用统计，输出 label/risk tag/speaker score/planner score/reading density 分桶与参数建议。用户标注的 th95-extra 18 条结果：`keep_text=5`、`needs_realign=7`、`bad_asr=4`、`drop_non_speech=1`、`needs_split=1`，整体 problem rate `0.722`。风险结论：`loose_gap` 3/3 问题、`high_speaker_score` 2/2 问题；`near_speaker_threshold` 15 条里 5 条 keep，不能硬 block；`reading_density_high` 9 条里 4 条 keep，只适合作 review/protection 信号。`bad_asr/drop_non_speech` 应回流 ASR QC / hard-negative，不应全算作 merge policy 失败。产物：`agents/temp/fusionvad-ja/cue-planner-manual-calibration-th95-extra-20260603/summary.md`。
+- 2026-06-03 th95-constrained 实验：`analyze_subtitle_cue_merge_candidates.py` 增加可选 `--speaker-score-penalty-threshold` / `--speaker-score-penalty` / `--speaker-score-block-threshold`，默认全部关闭，不改正式默认。按人工校准建议重放匿名样片 A：`speaker_threshold=0.95`、`max_gap_s=0.5`、`speaker_score_penalty_threshold=0.85`、`speaker_score_penalty=0.12`、fallback risk 继续 penalize。结果：blocks `1543 -> 1429`，merges `119`，short ratio `0.2048 -> 0.1421`，per-min `17.11 -> 15.84`，kana-only `0.0927 -> 0.0791`，overlap `0`。相比 th85 baseline 的 121 merges，th95-constrained 更保守但仍有不同合并集合。
+- 2026-06-03 cue planner 差集与二次审计：新增 `tools/subtitles/compare_cue_planner_merge_reviews.py` 和 `tools/subtitles/export_cue_planner_audio_audit_manifest.py`。th95-constrained vs th85：candidate `119`、baseline `121`、extra `19`、dropped `21`；extra 风险标签 reading_density_high `12`、near_speaker_threshold `4`、fallback_risk/crosses_chunk `2`、long_combined_duration `1`。已生成新审计页 `agents/audits/cue-planner-th95-constrained-extra-audio-audit/index.html`，导航 `agents/audits/index.html` 已指向该页。下一步由人工审计这 19 条，判断 th95-constrained 是否真的优于 th85，不能仅凭 short ratio 默认上线。
+- 2026-06-03 th95-constrained extra 人工审计完成（旧标签口径，后续作废）：用户标注 `manual_cue_planner_th95_constrained_extra_labels.jsonl` 共 `19/19` 条。校准产物曾为 `agents/temp/cue-planner-th95-constrained-extra-calibration/summary.md`，后续因 `drop_non_speech` 语义混淆已删除，不作为当前决策依据。旧多选标签统计：`bad_asr=13`、`needs_split=8`、`timing_accurate=7`、`needs_realign=7`、`drop_non_speech=6`、`keep_text=3`；按旧问题优先归类后 overall problem rate `0.947`。这批结果只保留为“旧标签过严”的历史证据。
+- 2026-06-03 th85 high-risk 基线审计准备：按“先确认安全基线”的新计划，从 `agents/temp/fusionvad-ja/cue-planner-merge-review-v1-23-anon-a-eres2netv2-th85/merge_review_items.jsonl` 取风险优先前 `40` 条，生成 `agents/temp/fusionvad-ja/cue-planner-th85-high-risk-audit-manifest/cue_planner_audio_audit_manifest.jsonl`，再从匿名样片 A v1.23 源音频切片到 `agents/audits/cue-planner-th85-high-risk-audio-audit/`，`pad_s=1.2`，`materialized_rows=40`、`errors=0`。风险组成包括 `reading_density_high` 12 条、`near_speaker_threshold,reading_density_high` 9 条、`near_speaker_threshold` 8 条，以及 fallback/cross-chunk/loose-gap/long-duration 组合。审计页：`agents/audits/cue-planner-th85-high-risk-audio-audit/index.html`；导航 `agents/audits/index.html` 已指向该最新页。目标：先评估 th85 baseline 自身问题率，再决定 v1.24 cue-stage planner 是否应继续保守、引入 reading density 保护，或只把 speaker sidecar 当 review/penalty 信号。
+- 2026-06-03 审计标签语义修正：Grok 检索到 ASR/语料标注通常把 laughter / breath / sigh / groan / grunt 等 nonverbal vocalization 与纯噪声、BGM、静音区分处理；Galgame 目标域里的呻吟、喘息、短促拟声可能可转写且时间轴有效，不能和 hard drop 共用 `drop_non_speech`。审计页因此把旧 `非语音/无字幕` 改成 `删除/无字幕价值`（纯噪声、BGM、静音、机械声等硬丢弃），新增 `low_info_vocal` / `低信息人声/呻吟`，允许它和 `文本可用`、`时间轴准确` 多选共存；快捷键 `4` 对应该新标签。校准脚本新增 `low_info_keep` / `low_info_review` bucket，并兼容旧数据中 `drop_non_speech + keep/timing` 的混选，避免把目标域真实低信息人声误计为 ASR/QC hard problem。th95-constrained 19 条旧统计因此应视为“旧标签过严”的历史口径，后续以新标签重新审计 th85-high-risk 40 条。
+- 2026-06-03 th95-constrained 旧标签重算：曾用新校准口径重跑旧 `manual_cue_planner_th95_constrained_extra_labels.jsonl`，reviewed `19/19`，overall problem rate 从旧口径 `0.947` 降到 `0.842`；bucket 为 `asr_qc=15`、`merge_timing=1`、`keep=1`、`low_info_keep=2`。这验证旧 `drop_non_speech` 确实混入了“低信息但文本/时间轴可用”的语义，但 reading-density 和 near-speaker-threshold 风险仍偏高，th95-constrained 仍不应直接默认。旧重算产物和旧人工 JSONL 后续已删除，不作为当前决策依据。
+- 2026-06-03 旧审计结果作废删除：由于 `drop_non_speech` 旧标签混淆了 hard drop 与低信息人声，原 th95-extra / th95-constrained 人工 JSONL 和对应校准产物已删除，需要按新标签重新审计。活跃 `agents/audits/` 只保留 `cue-planner-th85-high-risk-audio-audit/`；该页重生为 `dataset_id=cue-planner-th85-high-risk-audio-audit-v3-side-labels`，输出文件名改为 `manual_cue_planner_th85_high_risk_labels_v3_side_labels.jsonl`，避免浏览器 localStorage 和旧文件名继续复用旧标签。
+- 2026-06-03 v3 侧向审计标签：为解决“上/下两条 cue 一好一坏”的长期标注问题，审计页新增 `left_*` / `right_*` 标签：`上句/下句可用`、`上句/下句文本错`、`上句/下句无字幕价值`、`上句/下句低信息`。人工导出继续保留 `manual_label` 兼容字段，同时新增 `manual_labels` 多选数组；校准脚本新增 `side_mixed` bucket 和左右侧 label counts，用于把“需要拆分但只有一侧坏”的样本单独统计，不再误判为整条字幕失败。当前最需要审计的是 th85 high-risk 基线 40 条，对应 `agents/audits/cue-planner-th85-high-risk-audio-audit/index.html`。
 
 ---
 
@@ -1068,3 +1080,6 @@ v1.23 后置修正 first-pass：
 - Reazon Japanese HuBERT: <https://huggingface.co/reazon-research/japanese-hubert-base-k2>
 - rinna Japanese HuBERT: <https://huggingface.co/rinna/japanese-hubert-base>
 - rinna Japanese wav2vec2: <https://huggingface.co/rinna/japanese-wav2vec2-base>
+- NonverbalTTS: <https://arxiv.org/abs/2507.13155>
+- Rochester non-word transcription notes: <https://www.cs.rochester.edu/research/speech/nonwords.html>
+- Switchboard transcription guidelines: <https://isip.piconepress.com/projects/switchboard/doc/transcription_guidelines/transcription_guidelines.pdf>

@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from tools.fusionvad_ja.analyze_alignment_failure_subtypes import (
+from tools.asr.diagnostics.analyze_alignment_failure_subtypes import (
     analyze_rows,
     main,
 )

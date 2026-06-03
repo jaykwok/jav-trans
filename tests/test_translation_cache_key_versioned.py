@@ -47,7 +47,7 @@ def test_translation_cache_key_changes_with_target_lang():
 def test_translation_cache_key_changes_with_prompt_version(monkeypatch):
     first = translator._translation_cache_key(0, _segments(), glossary="健太（男主）")
 
-    monkeypatch.setattr(translator, "PROMPT_VERSION", "v2.8")
+    monkeypatch.setattr(translator, "PROMPT_VERSION", "v-test-next")
     second = translator._translation_cache_key(0, _segments(), glossary="健太（男主）")
 
     assert first != second
