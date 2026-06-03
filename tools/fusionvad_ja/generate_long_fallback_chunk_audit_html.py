@@ -6,11 +6,17 @@ import html
 import json
 import os
 import re
+import sys
 from pathlib import Path
 from typing import Any, Iterable, Mapping
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+from tools.fusionvad_ja.audit_nav import update_audit_entrypoints
+
 TIME_RE = re.compile(
     r"(?P<start>\d{1,2}:\d{2}:\d{2}[,.]\d{1,3})\s*-->\s*"
     r"(?P<end>\d{1,2}:\d{2}:\d{2}[,.]\d{1,3})"
@@ -249,11 +255,11 @@ def write_latest_audit_redirect(*, audit_root: Path, latest_html: Path, title: s
 <html lang="zh-CN">
 <head>
 <meta charset="utf-8">
-<meta http-equiv="refresh" content="0; url={html.escape(latest_rel)}">
-<title>跳转到最新审计页</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>最新审计页入口</title>
 </head>
 <body>
-<p>正在跳转到 <a href="{html.escape(latest_rel)}">{html.escape(title)}</a>。</p>
+<p>自动跳转已关闭。打开 <a href="{html.escape(latest_rel)}">{html.escape(title)}</a>。</p>
 </body>
 </html>
 """,
@@ -347,13 +353,7 @@ code {{ font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
 
 
 def maybe_update_audit_entrypoints(*, output_dir: Path, title: str, summary: Mapping[str, Any]) -> None:
-    audit_root = PROJECT_ROOT / "agents" / "audits" / "fusionvad-ja"
-    try:
-        output_dir.resolve().relative_to(audit_root.resolve())
-    except ValueError:
-        return
-    write_latest_audit_redirect(audit_root=audit_root, latest_html=output_dir / "index.html", title=title)
-    write_audit_index(audit_root=audit_root, latest_html=output_dir / "index.html", title=title, summary=summary)
+    update_audit_entrypoints(latest_html=output_dir / "index.html", title=title)
 
 
 def page_template(
