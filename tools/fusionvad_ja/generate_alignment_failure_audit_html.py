@@ -151,6 +151,9 @@ def normalize_row(
         "display_text": str(row.get("display_text") or row.get("text") or ""),
         "align_text": str(row.get("align_text") or ""),
         "raw_text": str(row.get("raw_text") or ""),
+        "left_ja": str(row.get("left_ja") or ""),
+        "right_ja": str(row.get("right_ja") or ""),
+        "merged_ja": str(row.get("merged_ja") or ""),
         "repetition_suggested_text": str(row.get("repetition_suggested_text") or ""),
         "low_information_level": str(row.get("low_information_level") or ""),
         "audit_reason": str(row.get("audit_reason") or ""),
@@ -311,6 +314,40 @@ audio {{ width: 100%; margin-bottom: 10px; }}
   min-height: 44px;
 }}
 .text-box.suggested {{ border-color: #c9b27a; background: #fffaf0; }}
+.sync-caption {{
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: #101614;
+  color: #d6dfdc;
+  padding: 12px;
+  min-height: 104px;
+}}
+.sync-line {{
+  padding: 7px 9px;
+  border-radius: 6px;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  font-size: 18px;
+  line-height: 1.4;
+}}
+.sync-line.active {{
+  background: var(--accent-soft);
+  color: #072f2b;
+  font-weight: 700;
+}}
+.sync-line.dim {{ opacity: 0.58; }}
+.sync-progress {{
+  height: 4px;
+  margin-top: 10px;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.18);
+  overflow: hidden;
+}}
+.sync-progress > div {{
+  height: 100%;
+  width: 0%;
+  background: var(--accent);
+}}
 .kv {{ display: grid; grid-template-columns: 138px minmax(0, 1fr); gap: 6px 10px; font-size: 13px; }}
 .kv div:nth-child(odd) {{ color: var(--muted); }}
 textarea, input[type="text"] {{
@@ -395,6 +432,12 @@ textarea {{ min-height: 84px; resize: vertical; }}
         <button id="markReviewedBtn">仅标记已审</button>
         <button class="danger" id="clearLabelBtn">清除本条标注</button>
       </div>
+    </section>
+
+    <section class="panel">
+      <h3>同步字幕预览</h3>
+      <div class="sync-caption" id="syncCaption"></div>
+      <p class="hint">无词级时间轴时按有效区间和文本长度近似推进，只用于听感审计。</p>
     </section>
 
     <section class="panel">
@@ -596,6 +639,56 @@ function renderLabels() {{
   }}
 }}
 
+function syncLines(row) {{
+  const left = (row.left_ja || "").trim();
+  const right = (row.right_ja || "").trim();
+  if (left || right) {{
+    return [left, right].filter(Boolean);
+  }}
+  const merged = (row.merged_ja || row.raw_text || row.align_text || "").trim();
+  if (merged) return [merged];
+  return String(row.display_text || "")
+    .split(/\\n+/)
+    .map(line => line.trim())
+    .filter(line => line && !line.startsWith("TH95 extra") && !line.startsWith("risk:") && !line.startsWith("left:") && !line.startsWith("right:") && !line.startsWith("merged:"));
+}}
+
+function activeSyncIndex(row, currentTime) {{
+  const lines = syncLines(row);
+  if (!lines.length) return -1;
+  const start = Number(row.chunk_start_s) || 0;
+  const end = Math.max(start + 0.001, Number(row.chunk_end_s) || start + 0.001);
+  const ratio = Math.max(0, Math.min(0.999, (currentTime - start) / (end - start)));
+  const weights = lines.map(line => Math.max(1, line.length));
+  const total = weights.reduce((sum, value) => sum + value, 0);
+  let acc = 0;
+  for (let index = 0; index < weights.length; index += 1) {{
+    acc += weights[index] / total;
+    if (ratio < acc) return index;
+  }}
+  return lines.length - 1;
+}}
+
+function updateSyncCaption() {{
+  const row = CANDIDATES[currentIndex];
+  const root = document.getElementById("syncCaption");
+  if (!root) return;
+  const lines = syncLines(row);
+  const active = activeSyncIndex(row, audio.currentTime || 0);
+  const start = Number(row.chunk_start_s) || 0;
+  const end = Math.max(start + 0.001, Number(row.chunk_end_s) || start + 0.001);
+  const progress = Math.max(0, Math.min(100, ((audio.currentTime || 0) - start) / (end - start) * 100));
+  if (!lines.length) {{
+    root.innerHTML = '<div class="sync-line dim">(空文本)</div><div class="sync-progress"><div></div></div>';
+  }} else {{
+    const body = lines.map((line, index) => {{
+      const klass = index === active ? "sync-line active" : "sync-line dim";
+      return `<div class="${{klass}}">${{escapeHtml(line)}}</div>`;
+    }}).join("");
+    root.innerHTML = `${{body}}<div class="sync-progress"><div style="width:${{progress}}%"></div></div>`;
+  }}
+}}
+
 function updateTimeline() {{
   const row = CANDIDATES[currentIndex];
   const duration = Math.max(Number(row.duration_s) || audio.duration || 0, 0.001);
@@ -609,6 +702,7 @@ function updateTimeline() {{
   document.getElementById("rangeStart").textContent = `有效起点 ${{fmt(row.chunk_start_s)}}s`;
   document.getElementById("rangeEnd").textContent = `有效终点 ${{fmt(row.chunk_end_s)}}s`;
   document.getElementById("nowText").textContent = `当前 ${{fmt(audio.currentTime || 0)}}s`;
+  updateSyncCaption();
 }}
 
 function playRange() {{
@@ -637,6 +731,7 @@ function loadCandidate(index, autoplay = false) {{
   renderLabels();
   renderList();
   updateTimeline();
+  updateSyncCaption();
   if (autoplay) {{
     audio.addEventListener("loadedmetadata", playRange, {{ once: true }});
     audio.load();
