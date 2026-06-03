@@ -138,6 +138,7 @@ def run_case(
     max_gap_s: float,
     max_combined_s: float,
     max_text_units: float,
+    max_reading_units_per_s: float,
 ) -> dict[str, Any]:
     case_name = f"th{int(round(threshold * 100)):02d}-{speaker_policy}"
     case_dir = output_dir / case_name
@@ -153,6 +154,7 @@ def run_case(
         max_gap_s=max_gap_s,
         max_combined_s=max_combined_s,
         max_text_units=max_text_units,
+        max_reading_units_per_s=max_reading_units_per_s,
         diagnostics_path=diagnostics_path,
         speaker_pairs_path=pairs_path,
         speaker_change_policy=speaker_policy,
@@ -231,6 +233,7 @@ def build_sweep(
     max_gap_s: float,
     max_combined_s: float,
     max_text_units: float,
+    max_reading_units_per_s: float,
 ) -> dict[str, Any]:
     embeddings = read_jsonl(embeddings_path)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -252,6 +255,7 @@ def build_sweep(
                     max_gap_s=max_gap_s,
                     max_combined_s=max_combined_s,
                     max_text_units=max_text_units,
+                    max_reading_units_per_s=max_reading_units_per_s,
                 )
             )
     summary = {
@@ -269,6 +273,7 @@ def build_sweep(
             "max_gap_s": max_gap_s,
             "max_combined_s": max_combined_s,
             "max_text_units": max_text_units,
+            "max_reading_units_per_s": max_reading_units_per_s,
         },
         "embedding_count": len(embeddings),
         "results": results,
@@ -305,6 +310,12 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--max-gap-s", type=float, default=1.2)
     parser.add_argument("--max-combined-s", type=float, default=6.5)
     parser.add_argument("--max-text-units", type=float, default=56.0)
+    parser.add_argument(
+        "--max-reading-units-per-s",
+        type=float,
+        default=0.0,
+        help="Optional reading-density gate passed to the cue planner; 0 disables.",
+    )
     args = parser.parse_args(argv)
 
     summary = build_sweep(
@@ -321,6 +332,7 @@ def main(argv: list[str] | None = None) -> int:
         max_gap_s=float(args.max_gap_s),
         max_combined_s=float(args.max_combined_s),
         max_text_units=float(args.max_text_units),
+        max_reading_units_per_s=float(args.max_reading_units_per_s),
     )
     print(
         "summary={path} cases={cases}".format(

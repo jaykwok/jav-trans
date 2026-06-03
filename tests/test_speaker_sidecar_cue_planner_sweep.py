@@ -54,10 +54,12 @@ def test_speaker_sidecar_cue_planner_sweep(tmp_path: Path, monkeypatch):
         max_gap_s=0.45,
         max_combined_s=4.8,
         max_text_units=34.0,
+        max_reading_units_per_s=0.0,
     )
 
     assert len(summary["results"]) == 4
     assert summary["results"][0]["speaker_pairs"]["pair_count"] == 2
+    assert summary["planner"]["max_reading_units_per_s"] == 0.0
     assert (tmp_path / "out" / "sweep_summary.json").exists()
     assert (tmp_path / "out" / "sweep_summary.md").exists()
     assert any(row["case"] == "th20-block" for row in summary["results"])
