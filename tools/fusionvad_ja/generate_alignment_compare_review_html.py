@@ -828,7 +828,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--video", required=True)
     parser.add_argument(
         "--output-dir",
-        default="agents/audits/fusionvad-ja/alignment-compare-review",
+        default="agents/audits/alignment-compare-review",
     )
     parser.add_argument("--title", default="FusionVAD-JA fallback 对比审计")
     parser.add_argument("--pad-s", type=float, default=1.0)

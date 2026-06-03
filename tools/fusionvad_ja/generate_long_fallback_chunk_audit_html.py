@@ -833,7 +833,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--video", required=True, help="Original video path")
     parser.add_argument(
         "--output-dir",
-        default="agents/audits/fusionvad-ja/long-fallback-r21-dropgap512-th080",
+        default="agents/audits/long-fallback-r21-dropgap512-th080",
     )
     parser.add_argument("--title", default="FusionVAD-JA 长 chunk 审计 · R21")
     parser.add_argument("--context-pad-s", type=float, default=2.0)

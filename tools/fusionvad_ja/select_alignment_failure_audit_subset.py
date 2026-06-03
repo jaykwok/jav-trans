@@ -242,7 +242,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--manifest", required=True, help="alignment_failure_manifest.jsonl")
     parser.add_argument(
         "--output-dir",
-        default="agents/audits/fusionvad-ja/alignment-failure-audit-subset",
+        default="agents/audits/alignment-failure-audit-subset",
     )
     parser.add_argument(
         "--include-review-type",

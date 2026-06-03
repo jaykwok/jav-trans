@@ -1406,7 +1406,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--manifest", required=True, help="alignment_failure_audio_manifest.jsonl")
     parser.add_argument(
         "--output-html",
-        default="agents/audits/fusionvad-ja/alignment-failure-audit.html",
+        default="agents/audits/alignment-failure-audit.html",
     )
     parser.add_argument("--title", default="FusionVAD-JA Alignment Failure 人工审计")
     parser.add_argument("--dataset-id", default="")

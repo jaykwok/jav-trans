@@ -187,7 +187,7 @@ v1.23: optional constrained RL over candidate cuts
 - `temp/log/`：启用运行日志后的任务日志。
 - `datasets/`：本地训练、验证、测试数据归档，默认 ignored。
 - `agents/temp/`：研究脚本、smoke、临时日志和中间产物。
-- `agents/audits/`：可长期复查的本地审计页。统一从 `agents/audits/index.html` 进入；该导航页始终指向最新审计，不使用自动跳转。旧审计产物清理时移入 `agents/rm/`。
+- `agents/audits/`：可长期复查的本地审计页。统一从 `agents/audits/index.html` 进入；审计产物直接放在该目录下，不再套 `fusionvad-ja/` 子目录；导航页始终指向最新审计且不使用自动跳转。旧审计产物清理时移入 `agents/rm/`。
 
 成功运行后默认删除一次性 job 临时目录；保留可复用缓存，例如 `models/`、`temp/vad-cache/` 和 Web 状态。
 
