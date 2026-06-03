@@ -314,6 +314,8 @@ audio {{ width: 100%; margin-bottom: 10px; }}
   min-height: 44px;
 }}
 .text-box.suggested {{ border-color: #c9b27a; background: #fffaf0; }}
+.sync-block {{ margin-top: 12px; }}
+.sync-block h3 {{ margin-bottom: 8px; }}
 .sync-caption {{
   border: 1px solid var(--line);
   border-radius: 8px;
@@ -416,7 +418,12 @@ textarea {{ min-height: 84px; resize: vertical; }}
           <button id="pauseBtn">暂停</button>
           <button id="replayBtn">重播</button>
         </div>
+        <div class="sync-block">
+          <h3>同步字幕预览</h3>
+          <div class="sync-caption" id="syncCaption"></div>
+        </div>
         <p class="hint">点击左侧条目会自动从有效区间起点播放，并在有效区间终点暂停；音频前后各含少量 padding，便于判断边界。</p>
+        <p class="hint">无词级时间轴时按有效区间和文本长度近似推进，只用于听感审计。</p>
       </section>
 
       <aside class="panel">
@@ -432,12 +439,6 @@ textarea {{ min-height: 84px; resize: vertical; }}
         <button id="markReviewedBtn">仅标记已审</button>
         <button class="danger" id="clearLabelBtn">清除本条标注</button>
       </div>
-    </section>
-
-    <section class="panel">
-      <h3>同步字幕预览</h3>
-      <div class="sync-caption" id="syncCaption"></div>
-      <p class="hint">无词级时间轴时按有效区间和文本长度近似推进，只用于听感审计。</p>
     </section>
 
     <section class="panel">
