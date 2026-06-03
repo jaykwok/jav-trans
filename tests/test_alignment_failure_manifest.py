@@ -4,6 +4,7 @@ import json
 from pathlib import Path
 
 from tools.fusionvad_ja.export_alignment_failure_manifest import main, manifest_row
+from tools.fusionvad_ja.generate_alignment_failure_audit_html import write_html
 from tools.fusionvad_ja.select_alignment_failure_audit_subset import main as subset_main
 
 
@@ -238,3 +239,80 @@ def test_select_alignment_failure_audit_subset_cli(tmp_path):
         "review_low_information_text": 1,
         "review_repetition_repair": 1,
     }
+
+
+def test_alignment_failure_audio_audit_has_sync_caption_preview(tmp_path):
+    manifest = tmp_path / "manifest.jsonl"
+    audio = tmp_path / "clip.wav"
+    audio.write_bytes(b"")
+    _write_jsonl(
+        manifest,
+        [
+            {
+                "sample_id": "merge-1",
+                "audio": str(audio),
+                "duration_s": 4.0,
+                "chunk_start_s": 1.0,
+                "chunk_end_s": 3.0,
+                "review_type": "cue_planner_merge_extra",
+                "display_text": "left: あ\nright: い\nmerged: あ い",
+                "left_ja": "あ",
+                "right_ja": "い",
+                "merged_ja": "あ い",
+            }
+        ],
+    )
+
+    summary = write_html(
+        manifest=manifest,
+        output_html=tmp_path / "audit" / "index.html",
+        title="audit",
+        dataset_id="audit",
+        output_jsonl_name="labels.jsonl",
+    )
+
+    html = (tmp_path / "audit" / "index.html").read_text(encoding="utf-8")
+    assert summary["rows"] == 1
+    assert "同步字幕预览" in html
+    assert "syncCaption" in html
+    assert '"left_ja": "あ"' in html
+    assert '"right_ja": "い"' in html
+    assert "captionOverlay" not in html
+
+
+def test_alignment_failure_video_audit_keeps_video_overlay(tmp_path):
+    manifest = tmp_path / "manifest.jsonl"
+    audio = tmp_path / "clip.wav"
+    video = tmp_path / "sample.mp4"
+    audio.write_bytes(b"")
+    video.write_bytes(b"")
+    _write_jsonl(
+        manifest,
+        [
+            {
+                "sample_id": "video-1",
+                "audio": str(audio),
+                "video": "sample",
+                "duration_s": 4.0,
+                "chunk_start_s": 1.0,
+                "chunk_end_s": 3.0,
+                "source_start_s": 10.0,
+                "source_end_s": 12.0,
+                "display_text": "あ",
+            }
+        ],
+    )
+
+    write_html(
+        manifest=manifest,
+        output_html=tmp_path / "audit" / "index.html",
+        title="audit",
+        dataset_id="audit",
+        output_jsonl_name="labels.jsonl",
+        video_paths=[video],
+    )
+
+    html = (tmp_path / "audit" / "index.html").read_text(encoding="utf-8")
+    assert "captionOverlay" in html
+    assert "字幕会叠加在原视频上" in html
+    assert "同步字幕预览" not in html
