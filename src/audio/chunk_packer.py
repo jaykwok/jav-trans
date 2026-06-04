@@ -4,8 +4,14 @@ from dataclasses import dataclass
 from typing import Sequence
 
 from boundary.features import make_feature_bundle
-from boundary.planner import BoundaryPlannerConfig, PlannedChunk, PlannedIsland, plan_boundary_chunks
-from boundary.refiner import BoundaryDecision, BoundaryRefiner
+from boundary.planner import (
+    BoundaryPlannerConfig,
+    GapSequenceFeatureProvider,
+    PlannedChunk,
+    PlannedIsland,
+    plan_boundary_chunks,
+)
+from boundary.refiner import BoundaryDecision, BoundaryRefiner, SequenceBoundaryRefiner
 from boundary.base import SpeechSegment
 
 
@@ -28,6 +34,11 @@ class PackedChunk:
     boundary_score: float | None = None
     boundary_reason: str = ""
     boundary_source: str = ""
+    boundary_decision_merge: bool | None = None
+    boundary_merge_prob: float | None = None
+    boundary_split_prob: float | None = None
+    boundary_refine_delta_s: float | None = None
+    boundary_decision_source: str = ""
 
 
 @dataclass(frozen=True)
@@ -49,7 +60,10 @@ def pack_speech_segments(
     score_frame_hop_s: float | None = None,
     cut_frame_scores: Sequence[float] | None = None,
     boundary_refiner: BoundaryRefiner | None = None,
+    sequence_boundary_refiner: SequenceBoundaryRefiner | None = None,
+    sequence_feature_provider: GapSequenceFeatureProvider | None = None,
     max_splits_per_segment: int = 16,
+    sequence_batch_size: int = 256,
 ) -> list[PackedChunk]:
     """Convert Boundary Planner output into padded ASR chunks.
 
@@ -72,12 +86,15 @@ def pack_speech_segments(
         start_weight=start_weight,
         target_padding_s=target_padding_s,
         max_splits_per_segment=max_splits_per_segment,
+        sequence_batch_size=sequence_batch_size,
     )
     planned = plan_boundary_chunks(
         segments,
         features=features,
         config=planner_config,
         refiner=boundary_refiner,
+        sequence_refiner=sequence_boundary_refiner,
+        sequence_feature_provider=sequence_feature_provider,
     )
     layout = PackingLayoutConfig(
         max_chunk_s=max_chunk_s,
@@ -194,6 +211,21 @@ def _make_chunk(
             else ",".join(sorted(set(boundary_reasons)))
         ),
         boundary_source=",".join(sorted(set(boundary_sources))),
+        boundary_decision_merge=(
+            boundary_decision.merge if boundary_decision is not None else None
+        ),
+        boundary_merge_prob=(
+            boundary_decision.score if boundary_decision is not None else None
+        ),
+        boundary_split_prob=(
+            1.0 - boundary_decision.score if boundary_decision is not None else None
+        ),
+        boundary_refine_delta_s=(
+            boundary_decision.refine_delta_s if boundary_decision is not None else None
+        ),
+        boundary_decision_source=(
+            boundary_decision.source if boundary_decision is not None else ""
+        ),
     )
 
 

@@ -27,6 +27,67 @@ class _AllowGapRefiner:
         return {"type": "allow_gap"}
 
 
+class _SequenceDenyRefiner:
+    def decide_sequence(self, features: list[list[float]]) -> list[BoundaryDecision]:
+        assert features == [[42.0]]
+        return [
+            BoundaryDecision(
+                False,
+                0.08,
+                "learned_sequence_split",
+                source="frame_sequence_refiner",
+            )
+        ]
+
+    def signature(self) -> dict:
+        return {"type": "sequence_deny"}
+
+
+class _StaticSequenceFeatureProvider:
+    def features_for_gap(
+        self,
+        *,
+        left_start_s: float,
+        left_end_s: float,
+        right_start_s: float,
+        right_end_s: float,
+    ) -> list[float]:
+        assert (left_start_s, left_end_s, right_start_s, right_end_s) == (0.0, 2.0, 3.0, 5.0)
+        return [42.0]
+
+
+class _BatchSequenceRefiner:
+    def __init__(self) -> None:
+        self.calls: list[list[list[float]]] = []
+
+    def decide_sequence(self, features: list[list[float]]) -> list[BoundaryDecision]:
+        self.calls.append(features)
+        assert features == [[1.0], [2.0]]
+        return [
+            BoundaryDecision(True, 0.91, "learned_sequence_merge", source="frame_sequence_refiner"),
+            BoundaryDecision(False, 0.07, "learned_sequence_split", source="frame_sequence_refiner"),
+        ]
+
+    def signature(self) -> dict:
+        return {"type": "batch_sequence"}
+
+
+class _IndexSequenceFeatureProvider:
+    def features_for_gap(
+        self,
+        *,
+        left_start_s: float,
+        left_end_s: float,
+        right_start_s: float,
+        right_end_s: float,
+    ) -> list[float]:
+        if (left_start_s, left_end_s, right_start_s, right_end_s) == (0.0, 1.0, 1.2, 2.0):
+            return [1.0]
+        if (left_start_s, left_end_s, right_start_s, right_end_s) == (1.2, 2.0, 2.4, 3.0):
+            return [2.0]
+        raise AssertionError((left_start_s, left_end_s, right_start_s, right_end_s))
+
+
 def test_dense_segments_pack_into_one_chunk_with_dynamic_padding():
     chunks = pack_speech_segments(
         [_seg(5.0, 7.0), _seg(8.0, 9.0), _seg(10.0, 11.0)],
@@ -59,6 +120,46 @@ def test_gap_refiner_can_block_mergeable_gap():
     assert chunks[0].split_reason == "boundary_refiner:speaker_change"
     assert chunks[0].boundary_score == pytest.approx(0.12)
     assert chunks[0].boundary_reason == "speaker_change"
+    assert chunks[0].boundary_decision_merge is False
+    assert chunks[0].boundary_merge_prob == pytest.approx(0.12)
+    assert chunks[0].boundary_split_prob == pytest.approx(0.88)
+
+
+def test_sequence_refiner_can_block_mergeable_gap():
+    chunks = pack_speech_segments(
+        [_seg(0.0, 2.0), _seg(3.0, 5.0)],
+        frame_hop_s=1.0,
+        max_chunk_s=30.0,
+        target_chunk_s=9.0,
+        target_padding_s=1.0,
+        boundary_refiner=_AllowGapRefiner(),
+        sequence_boundary_refiner=_SequenceDenyRefiner(),
+        sequence_feature_provider=_StaticSequenceFeatureProvider(),
+    )
+
+    assert [(chunk.core_start, chunk.core_end) for chunk in chunks] == [(0.0, 2.0), (3.0, 5.0)]
+    assert chunks[0].split_reason == "boundary_refiner:learned_sequence_split"
+    assert chunks[0].boundary_score == pytest.approx(0.08)
+    assert chunks[0].boundary_decision_source == "frame_sequence_refiner"
+
+
+def test_sequence_refiner_scores_all_gaps_in_one_batch():
+    refiner = _BatchSequenceRefiner()
+
+    chunks = pack_speech_segments(
+        [_seg(0.0, 1.0), _seg(1.2, 2.0), _seg(2.4, 3.0)],
+        frame_hop_s=1.0,
+        max_chunk_s=30.0,
+        target_chunk_s=9.0,
+        target_padding_s=1.0,
+        sequence_boundary_refiner=refiner,
+        sequence_feature_provider=_IndexSequenceFeatureProvider(),
+    )
+
+    assert len(refiner.calls) == 1
+    assert [(chunk.core_start, chunk.core_end) for chunk in chunks] == [(0.0, 2.0), (2.4, 3.0)]
+    assert chunks[0].boundary_decision_merge is False
+    assert chunks[0].boundary_decision_source == "frame_sequence_refiner"
 
 
 def test_planner_max_splits_even_when_refiner_allows_gap():

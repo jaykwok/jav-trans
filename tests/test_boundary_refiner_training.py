@@ -6,9 +6,14 @@ from pathlib import Path
 import pytest
 
 from tools.boundary.build_refiner_gap_dataset import GapDatasetConfig, build_gap_dataset
+from tools.boundary.build_refiner_frame_sequence_dataset import (
+    FrameSequenceConfig,
+    build_frame_sequence_dataset,
+)
 from tools.boundary.build_weighted_source_manifest import build_weighted_manifest
 from tools.boundary.train_refiner import TrainRefinerConfig, train_refiner
 from boundary.ja import write_jsonl
+from boundary.sequence_features import FRAME_SEQUENCE_FEATURE_SCHEMA
 
 
 def test_build_refiner_gap_dataset_from_boundary_metadata(tmp_path):
@@ -71,11 +76,13 @@ def test_build_refiner_gap_dataset_from_boundary_metadata(tmp_path):
         encoding="utf-8",
     )
     output_jsonl = tmp_path / "gaps.jsonl"
+    output_sequence_jsonl = tmp_path / "sequences.jsonl"
 
     summary = build_gap_dataset(
         labels_paths=[labels_path],
         feature_manifest_paths=[feature_manifest],
         output_jsonl=output_jsonl,
+        output_sequence_jsonl=output_sequence_jsonl,
         config=GapDatasetConfig(
             synthetic_merge_positives_per_record=1,
             synthetic_merge_min_segment_s=0.8,
@@ -90,6 +97,13 @@ def test_build_refiner_gap_dataset_from_boundary_metadata(tmp_path):
         "merge_synthetic_intra_island",
     }
     assert all(row["metadata"]["ptm_dim"] == 1024 for row in rows)
+    sequence_rows = [
+        json.loads(line)
+        for line in output_sequence_jsonl.read_text(encoding="utf-8").splitlines()
+    ]
+    assert summary["sequence_counts"] == {"sequences": 1, "sequence_items": 3}
+    assert sequence_rows[0]["schema"] == "boundary_refiner_sequence_dataset_v1"
+    assert sorted(sequence_rows[0]["sequence_labels"]) == [0, 0, 1]
 
 
 def test_build_refiner_gap_dataset_requires_ptm_dim(tmp_path):
@@ -221,6 +235,203 @@ def test_train_refiner_checkpoint_round_trip_from_gap_dataset(tmp_path):
     assert checkpoint.exists()
     assert metrics["loader_smoke"]["signature"]["schema"] == "boundary_refiner_v1"
     assert metrics["loader_smoke"]["signature"]["backbone"] == "transformers.Mamba2Model"
+
+
+def test_train_refiner_accepts_sequence_dataset(tmp_path):
+    pytest.importorskip("torch")
+    transformers = pytest.importorskip("transformers")
+    if not hasattr(transformers, "Mamba2Model"):
+        pytest.skip("transformers.Mamba2Model is unavailable")
+
+    feature_names = [
+        "gap_s",
+        "left_duration_s",
+        "right_duration_s",
+        "current_core_s",
+        "proposed_core_s",
+        "gap_merge_s",
+        "gap_ratio",
+        "proposed_over_target_s",
+        "left_score",
+        "right_score",
+        "valley_score_min",
+        "cut_score_max",
+        "gap_boundary_score",
+    ]
+    dataset = tmp_path / "sequence.jsonl"
+    rows = []
+    for row_index in range(4):
+        sequence = []
+        labels = []
+        for step_index in range(3):
+            merge = (row_index + step_index) % 2 == 0
+            gap_s = 0.04 if merge else 0.9
+            sequence.append(
+                [
+                    gap_s,
+                    1.0,
+                    1.0,
+                    1.0 + step_index,
+                    2.0 + gap_s + step_index,
+                    1.5,
+                    min(1.0, gap_s / 1.5),
+                    1.0 + gap_s,
+                    1.0,
+                    1.0,
+                    1.0,
+                    0.0,
+                    min(1.0, gap_s / 1.5),
+                ]
+            )
+            labels.append(1 if merge else 0)
+        rows.append(
+            {
+                "schema": "boundary_refiner_sequence_dataset_v1",
+                "audio_id": f"seq-{row_index}",
+                "feature_names": feature_names,
+                "sequence_features": sequence,
+                "sequence_labels": labels,
+            }
+        )
+    dataset.write_text(
+        "\n".join(json.dumps(row, ensure_ascii=False, sort_keys=True) for row in rows) + "\n",
+        encoding="utf-8",
+    )
+
+    metrics = train_refiner(
+        dataset_paths=[dataset],
+        output_dir=tmp_path / "sequence-train",
+        config=TrainRefinerConfig(
+            max_steps=2,
+            batch_size=2,
+            device="cpu",
+            hidden_size=8,
+            num_layers=1,
+            state_size=4,
+            num_heads=4,
+            n_groups=2,
+            chunk_size=4,
+            log_interval_steps=0,
+        ),
+    )
+
+    assert Path(metrics["checkpoint"]).exists()
+    assert metrics["train_items"] + metrics["val_items"] == 12
+    assert metrics["class_counts"] == {"merge_positive": 6, "split_negative": 6}
+
+
+def test_build_frame_sequence_dataset_trains_with_cached_features(tmp_path):
+    pytest.importorskip("numpy")
+    torch = pytest.importorskip("torch")
+    transformers = pytest.importorskip("transformers")
+    if not hasattr(transformers, "Mamba2Model"):
+        pytest.skip("transformers.Mamba2Model is unavailable")
+
+    import numpy as np
+
+    labels_path = tmp_path / "labels.jsonl"
+    feature_manifest = tmp_path / "feature_manifest.json"
+    feature_path = tmp_path / "sample-features.npz"
+    ptm = np.arange(24, dtype=np.float32).reshape(6, 4) / 24.0
+    mfcc = np.arange(12, dtype=np.float32).reshape(6, 2) / 12.0
+    np.savez(feature_path, ptm=ptm, mfcc=mfcc)
+    write_jsonl(
+        labels_path,
+        [
+            {
+                "audio_id": "sample-1",
+                "source": "unit",
+                "duration_s": 0.6,
+                "text": "",
+                "teacher_segments": {"supervised": [{"start": 0.0, "end": 0.6, "score": 1.0}]},
+                "frame_hop_s": 0.1,
+                "speech_frames": [1] * 6,
+                "label_quality": "supervised",
+                "boundary_metadata": {
+                    "actual_speech_segments": [
+                        {"start": 0.0, "end": 0.2},
+                        {"start": 0.24, "end": 0.4},
+                        {"start": 0.5, "end": 0.6},
+                    ],
+                    "speaker_turn_boundaries": [
+                        {
+                            "index": 1,
+                            "boundary_type": "gap_zone",
+                            "gap_s": 0.1,
+                            "speaker_changed": True,
+                        },
+                    ],
+                    "source_audio_ids": ["a", "a", "b"],
+                    "speaker_proxy_ids": ["a", "a", "b"],
+                },
+            }
+        ],
+    )
+    feature_manifest.write_text(
+        json.dumps(
+            [
+                {
+                    "audio_id": "sample-1",
+                    "feature_path": str(feature_path),
+                    "label_index": 0,
+                    "frame_count": 6,
+                    "frame_hop_s": 0.1,
+                    "ptm_dim": 4,
+                    "mfcc_dim": 2,
+                    "ptm": "qwen",
+                }
+            ],
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    output_jsonl = tmp_path / "frame-sequences.jsonl"
+
+    summary = build_frame_sequence_dataset(
+        labels_paths=[labels_path],
+        feature_manifest_paths=[feature_manifest],
+        output_jsonl=output_jsonl,
+        config=FrameSequenceConfig(
+            left_context_s=0.2,
+            right_context_s=0.2,
+            max_ptm_dims=3,
+            synthetic_merge_positives_per_record=1,
+            synthetic_merge_min_segment_s=0.15,
+        ),
+    )
+    rows = [json.loads(line) for line in output_jsonl.read_text(encoding="utf-8").splitlines()]
+
+    assert summary["class_balance"] == {"merge_positive": 2, "split_negative": 1}
+    assert rows[0]["schema"] == "boundary_refiner_frame_sequence_dataset_v1"
+    assert len(rows[0]["feature_names"]) == 36
+    assert len(rows[0]["sequence_features"]) == 3
+
+    metrics = train_refiner(
+        dataset_paths=[output_jsonl],
+        output_dir=tmp_path / "frame-sequence-train",
+        config=TrainRefinerConfig(
+            max_steps=2,
+            batch_size=1,
+            device="cpu",
+            hidden_size=8,
+            num_layers=1,
+            state_size=4,
+            num_heads=4,
+            n_groups=2,
+            chunk_size=4,
+            log_interval_steps=0,
+        ),
+    )
+    assert Path(metrics["checkpoint"]).exists()
+    assert metrics["train_items"] + metrics["val_items"] == 3
+    assert metrics["loader_smoke"]["decision"] is None
+    assert metrics["loader_smoke"]["signature"]["metadata"]["runtime_adapter"] == "frame_sequence_v1"
+    assert metrics["loader_smoke"]["signature"]["metadata"]["feature_schema"] == FRAME_SEQUENCE_FEATURE_SCHEMA
+    assert metrics["loader_smoke"]["signature"]["metadata"]["feature_schema_hash"]
+    assert rows[0]["feature_schema"] == FRAME_SEQUENCE_FEATURE_SCHEMA
+    assert rows[0]["feature_schema_hash"]
+    assert rows[0]["feature_signature"]["feature_schema"] == FRAME_SEQUENCE_FEATURE_SCHEMA
+    assert torch.cuda.is_available() in {True, False}
 
 
 def test_build_weighted_source_manifest_samples_requested_mix(tmp_path):

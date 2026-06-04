@@ -9,8 +9,16 @@ from audio.chunk_packer import PackedChunk, pack_speech_segments
 from boundary import load_boundary_refiner
 from boundary import cache as _boundary_cache_module
 from boundary.candidates import CANDIDATE_EXTRACTOR_VERSION
+from boundary.sequence_features import (
+    FRAME_SEQUENCE_FRAMES_SCHEMA,
+    FrameSequenceFeatureConfig,
+    FrameSequenceFeatureProvider,
+)
 from boundary.backbones import normalize_boundary_backbone
-from boundary.refiner import file_sha1 as _boundary_refiner_file_sha1
+from boundary.refiner import (
+    file_sha1 as _boundary_refiner_file_sha1,
+    load_frame_sequence_refiner_checkpoint,
+)
 from asr import checkpoint as _checkpoint_module
 from asr import chunking as _chunking_module
 from asr import qc_stage as _qc_stage_module
@@ -55,6 +63,7 @@ def _env_int(name: str, default: str) -> int:
 def _boundary_config() -> dict:
     refiner_path = os.getenv("BOUNDARY_REFINER_MODEL_PATH", "").strip()
     refiner_path_obj = Path(refiner_path).expanduser() if refiner_path else None
+    runtime_adapter = _boundary_refiner_runtime_adapter(refiner_path_obj)
     return {
         "feature_frame_hop_s": _env_float("BOUNDARY_FEATURE_FRAME_HOP_S", "0.02"),
         "boundary_refiner_enabled": _env_bool("BOUNDARY_REFINER_ENABLED", "1"),
@@ -64,6 +73,7 @@ def _boundary_config() -> dict:
             if refiner_path_obj is not None and refiner_path_obj.exists()
             else ""
         ),
+        "boundary_refiner_runtime_adapter": runtime_adapter,
         "boundary_refiner_backbone": normalize_boundary_backbone(
             os.getenv("BOUNDARY_REFINER_BACKBONE", "transformers.Mamba2Model")
         ),
@@ -77,10 +87,84 @@ def _boundary_config() -> dict:
         "boundary_planner_max_splits_per_segment": _env_int(
             "BOUNDARY_PLANNER_MAX_SPLITS_PER_SEGMENT", "16"
         ),
+        "boundary_planner_sequence_batch_size": _env_int(
+            "BOUNDARY_PLANNER_SEQUENCE_BATCH_SIZE", "256"
+        ),
         "drop_enabled": _env_bool("BOUNDARY_DROP_LOW_ENERGY_ENABLED", "0"),
         "drop_min_duration_s": _env_float("BOUNDARY_DROP_LOW_ENERGY_MIN_DURATION_S", "0.20"),
         "drop_rms_dbfs": _env_float("BOUNDARY_DROP_LOW_ENERGY_RMS_DBFS", "-40.0"),
     }
+
+
+def _boundary_refiner_runtime_adapter(path: Path | None) -> str:
+    if path is None or not path.exists():
+        return "refiner_input_v1"
+    import torch
+
+    payload = torch.load(path, map_location="cpu")
+    if not isinstance(payload, dict):
+        raise ValueError("Boundary refiner checkpoint must be a dict")
+    metadata = payload.get("metadata")
+    if isinstance(metadata, dict):
+        adapter = str(metadata.get("runtime_adapter") or "").strip()
+        if adapter:
+            return adapter
+    return "refiner_input_v1"
+
+
+def _sequence_feature_provider_from_result(
+    payload,
+    *,
+    duration_s: float,
+    target_chunk_s: float,
+) -> FrameSequenceFeatureProvider | None:
+    if not isinstance(payload, dict):
+        return None
+    if payload.get("schema") != FRAME_SEQUENCE_FRAMES_SCHEMA:
+        return None
+    ptm = payload.get("ptm")
+    mfcc = payload.get("mfcc")
+    frame_hop_s = payload.get("frame_hop_s")
+    if not isinstance(ptm, list) or not isinstance(mfcc, list):
+        return None
+    try:
+        hop = float(frame_hop_s)
+    except (TypeError, ValueError):
+        return None
+    if hop <= 0.0:
+        return None
+    return FrameSequenceFeatureProvider(
+        duration_s=float(duration_s),
+        frame_hop_s=hop,
+        ptm=ptm,
+        mfcc=mfcc,
+        config=FrameSequenceFeatureConfig(
+            left_context_s=_env_float("BOUNDARY_FRAME_SEQUENCE_LEFT_CONTEXT_S", "0.60"),
+            right_context_s=_env_float("BOUNDARY_FRAME_SEQUENCE_RIGHT_CONTEXT_S", "0.60"),
+            max_ptm_dims=_env_int("BOUNDARY_FRAME_SEQUENCE_MAX_PTM_DIMS", "64"),
+            include_mfcc=_env_bool("BOUNDARY_FRAME_SEQUENCE_INCLUDE_MFCC", "1"),
+        ),
+        target_chunk_s=target_chunk_s,
+    )
+
+
+def _required_sequence_feature_provider_from_result(
+    payload,
+    *,
+    duration_s: float,
+    target_chunk_s: float,
+) -> FrameSequenceFeatureProvider:
+    provider = _sequence_feature_provider_from_result(
+        payload,
+        duration_s=duration_s,
+        target_chunk_s=target_chunk_s,
+    )
+    if provider is None:
+        raise ValueError(
+            "frame_sequence_v1 Boundary Refiner requires "
+            f"{FRAME_SEQUENCE_FRAMES_SCHEMA} in SpeechBoundary-JA output"
+        )
+    return provider
 
 
 get_backend_label = _registry_module.get_backend_label
@@ -302,48 +386,83 @@ def _build_processing_spans(
     audio_path: str,
 ) -> list[tuple[float, float]] | list[PackedChunk]:
     cfg = _boundary_config()
-    from boundary import get_boundary_backend
-
     _set_last_boundary_cache_event(None)
-    boundary_backend = get_boundary_backend()
-    boundary_signature = boundary_backend.signature()
-    cached = _boundary_cache_module.load_processing_spans(
-        audio_path,
-        boundary_signature=boundary_signature,
-        boundary_config=cfg,
-    )
-    if cached is not None:
-        spans, runtime_boundary_signature, event = cached
-        _set_last_boundary_signature(runtime_boundary_signature)
-        _pipeline_logger.info(
-            "[boundary-cache] hit path=%s digest=%s",
-            event["path"],
-            event["digest"],
-        )
-        _set_last_boundary_cache_event(event)
-        return spans
 
-    result = boundary_backend.segment(audio_path)
+    needs_sequence_features = cfg["boundary_refiner_runtime_adapter"] == "frame_sequence_v1"
+    restore_sequence_export = (
+        os.environ.get("SPEECH_BOUNDARY_JA_EXPORT_SEQUENCE_FEATURES")
+        if needs_sequence_features
+        else None
+    )
+    if needs_sequence_features:
+        os.environ["SPEECH_BOUNDARY_JA_EXPORT_SEQUENCE_FEATURES"] = "1"
+    try:
+        from boundary import get_boundary_backend
+
+        boundary_backend = get_boundary_backend()
+        boundary_signature = boundary_backend.signature()
+        cached = _boundary_cache_module.load_processing_spans(
+            audio_path,
+            boundary_signature=boundary_signature,
+            boundary_config=cfg,
+        )
+        if cached is not None:
+            spans, runtime_boundary_signature, event = cached
+            _set_last_boundary_signature(runtime_boundary_signature)
+            _pipeline_logger.info(
+                "[boundary-cache] hit path=%s digest=%s",
+                event["path"],
+                event["digest"],
+            )
+            _set_last_boundary_cache_event(event)
+            return spans
+
+        result = boundary_backend.segment(audio_path)
+    finally:
+        if restore_sequence_export is not None:
+            os.environ["SPEECH_BOUNDARY_JA_EXPORT_SEQUENCE_FEATURES"] = restore_sequence_export
+        elif needs_sequence_features:
+            os.environ.pop("SPEECH_BOUNDARY_JA_EXPORT_SEQUENCE_FEATURES", None)
     frame_scores = result.parameters.get("frame_scores")
     cut_frame_scores = result.parameters.get("cut_frame_scores")
     score_frame_hop_s = result.parameters.get("frame_hop_s")
-    boundary_refiner = load_boundary_refiner(
-        enabled=cfg["boundary_refiner_enabled"],
-        model_path=cfg["boundary_refiner_model_path"],
-        backbone=cfg["boundary_refiner_backbone"],
-        merge_threshold=cfg["boundary_refiner_threshold"],
-        max_merge_gap_s=None,
-        target_core_s=cfg["boundary_planner_target_chunk_s"],
-    )
+    sequence_feature_frames = result.parameters.get("sequence_feature_frames")
+    if cfg["boundary_refiner_runtime_adapter"] == "frame_sequence_v1":
+        boundary_refiner = None
+        sequence_boundary_refiner = load_frame_sequence_refiner_checkpoint(
+            Path(cfg["boundary_refiner_model_path"]),
+            threshold=cfg["boundary_refiner_threshold"],
+            backbone_override=cfg["boundary_refiner_backbone"],
+        )
+        sequence_feature_provider = _required_sequence_feature_provider_from_result(
+            sequence_feature_frames,
+            duration_s=result.audio_duration_sec,
+            target_chunk_s=cfg["boundary_planner_target_chunk_s"],
+        )
+        sequence_feature_provider.validate_for_checkpoint(
+            sequence_boundary_refiner.feature_names,
+            sequence_boundary_refiner.feature_schema_hash,
+        )
+    else:
+        boundary_refiner = load_boundary_refiner(
+            enabled=cfg["boundary_refiner_enabled"],
+            model_path=cfg["boundary_refiner_model_path"],
+            backbone=cfg["boundary_refiner_backbone"],
+            merge_threshold=cfg["boundary_refiner_threshold"],
+            max_merge_gap_s=None,
+            target_core_s=cfg["boundary_planner_target_chunk_s"],
+        )
+        sequence_boundary_refiner = None
+        sequence_feature_provider = None
     result_parameters = {
         key: value
         for key, value in result.parameters.items()
-        if key not in {"frame_scores", "cut_frame_scores"}
+        if key not in {"frame_scores", "cut_frame_scores", "sequence_feature_frames"}
     }
     runtime_boundary_signature = {
         **result_parameters,
         "boundary_pipeline": {
-            "version": 1,
+            "version": 2,
             "feature_frame_hop_s": cfg["feature_frame_hop_s"],
             "score_frame_hop_s": score_frame_hop_s,
             "feature_sources": {
@@ -352,6 +471,16 @@ def _build_processing_spans(
             },
             "boundary_refiner": (
                 boundary_refiner.signature() if boundary_refiner is not None else None
+            ),
+            "sequence_boundary_refiner": (
+                sequence_boundary_refiner.signature()
+                if sequence_boundary_refiner is not None
+                else None
+            ),
+            "sequence_feature_provider": (
+                sequence_feature_provider.signature()
+                if sequence_feature_provider is not None
+                else None
             ),
             "boundary_planner": {
                 "candidate_extractor_version": cfg[
@@ -363,6 +492,7 @@ def _build_processing_spans(
                 "start_weight": cfg["boundary_planner_start_weight"],
                 "target_padding_s": cfg["boundary_planner_target_padding_s"],
                 "max_splits_per_segment": cfg["boundary_planner_max_splits_per_segment"],
+                "sequence_batch_size": cfg["boundary_planner_sequence_batch_size"],
             },
         },
     }
@@ -400,7 +530,10 @@ def _build_processing_spans(
         score_frame_hop_s=score_frame_hop_s,
         cut_frame_scores=cut_frame_scores,
         boundary_refiner=boundary_refiner,
+        sequence_boundary_refiner=sequence_boundary_refiner,
+        sequence_feature_provider=sequence_feature_provider,
         max_splits_per_segment=cfg["boundary_planner_max_splits_per_segment"],
+        sequence_batch_size=cfg["boundary_planner_sequence_batch_size"],
     )
     event = _boundary_cache_module.save_processing_spans(
         audio_path,
@@ -455,11 +588,17 @@ def _annotate_packed_chunks(
         chunk["boundary_score"] = packed.boundary_score
         chunk["boundary_reason"] = packed.boundary_reason
         chunk["boundary_source"] = packed.boundary_source
+        chunk["boundary_decision_merge"] = packed.boundary_decision_merge
+        chunk["boundary_merge_prob"] = packed.boundary_merge_prob
+        chunk["boundary_split_prob"] = packed.boundary_split_prob
+        chunk["boundary_refine_delta_s"] = packed.boundary_refine_delta_s
+        chunk["boundary_decision_source"] = packed.boundary_decision_source
         log.append(
             "[chunk] idx={idx} dur={duration:.1f} speech_segment_count={count} "
             "pad=({left:.2f},{right:.2f}) reason={reason} "
             "parent={parent} island={island}/{islands} gap_max={gap:.2f} "
-            "boundary={boundary_reason} source={boundary_source} score={boundary_score}".format(
+            "boundary={boundary_reason} source={boundary_source} score={boundary_score} "
+            "decision_source={decision_source} merge={decision_merge}".format(
                 idx=idx,
                 duration=packed.duration,
                 count=len(packed.speech_segments),
@@ -473,6 +612,8 @@ def _annotate_packed_chunks(
                 boundary_reason=packed.boundary_reason,
                 boundary_source=packed.boundary_source,
                 boundary_score=packed.boundary_score,
+                decision_source=packed.boundary_decision_source,
+                decision_merge=packed.boundary_decision_merge,
             )
         )
 

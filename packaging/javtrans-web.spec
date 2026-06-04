@@ -71,6 +71,16 @@ def _ffmpeg_binaries() -> list[tuple[str, str]]:
     return bundled
 
 
+def _optional_data_dir(path: str | Path, target: str) -> list[tuple[str, str]]:
+    candidate = Path(path).expanduser()
+    if not candidate.is_absolute():
+        candidate = ROOT / candidate
+    candidate = candidate.resolve()
+    if not candidate.exists():
+        return []
+    return [(str(candidate), target)]
+
+
 datas = collect_data_files("webview", include_py_files=False)
 datas += copy_metadata("torchcodec")
 datas += copy_metadata("nagisa")
@@ -95,6 +105,10 @@ datas += [
         "qwen_asr/inference/assets",
     ),
 ]
+datas += _optional_data_dir(
+    "src/boundary/checkpoints",
+    "src/boundary/checkpoints",
+)
 
 binaries = _ffmpeg_binaries()
 

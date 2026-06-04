@@ -52,6 +52,7 @@ def build_gap_dataset(
     feature_manifest_paths: Sequence[Path],
     output_jsonl: Path,
     summary_json: Path | None = None,
+    output_sequence_jsonl: Path | None = None,
     config: GapDatasetConfig = GapDatasetConfig(),
     limit: int | None = None,
 ) -> dict[str, Any]:
@@ -99,9 +100,13 @@ def build_gap_dataset(
             break
 
     _write_jsonl(output_jsonl, rows)
+    sequence_rows = _sequence_rows(rows)
+    if output_sequence_jsonl is not None:
+        _write_jsonl(output_sequence_jsonl, sequence_rows)
     summary = {
         "schema": DATASET_SCHEMA,
         "output_jsonl": str(output_jsonl),
+        "output_sequence_jsonl": str(output_sequence_jsonl) if output_sequence_jsonl else "",
         "summary_json": str(summary_json),
         "labels": [str(path) for path in labels_paths],
         "feature_manifests": [str(path) for path in feature_manifest_paths],
@@ -113,6 +118,10 @@ def build_gap_dataset(
         "class_balance": {
             "merge_positive": int(counters["merge_positive"]),
             "split_negative": int(counters["split_negative"]),
+        },
+        "sequence_counts": {
+            "sequences": len(sequence_rows),
+            "sequence_items": sum(len(row["sequence_labels"]) for row in sequence_rows),
         },
     }
     summary_json.parent.mkdir(parents=True, exist_ok=True)
@@ -389,6 +398,41 @@ def _write_jsonl(path: Path, rows: Iterable[Mapping[str, Any]]) -> None:
             handle.write(json.dumps(dict(row), ensure_ascii=False, sort_keys=True) + "\n")
 
 
+def _sequence_rows(rows: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
+    grouped: dict[tuple[str, int, str], list[Mapping[str, Any]]] = {}
+    for row in rows:
+        key = (
+            str(row.get("audio_id") or ""),
+            int(row.get("label_index") or 0),
+            str(row.get("metadata", {}).get("feature_path") or ""),
+        )
+        grouped.setdefault(key, []).append(row)
+
+    sequence_rows: list[dict[str, Any]] = []
+    for (audio_id, label_index, feature_path), group in sorted(grouped.items()):
+        sorted_group = sorted(group, key=lambda item: int(item.get("gap_index") or 0))
+        feature_names = list(sorted_group[0].get("feature_names") or DEFAULT_REFINER_FEATURES)
+        sequence_rows.append(
+            {
+                "schema": "boundary_refiner_sequence_dataset_v1",
+                "audio_id": audio_id,
+                "source": str(sorted_group[0].get("source") or ""),
+                "label_index": label_index,
+                "feature_names": feature_names,
+                "sequence_features": [list(item["features"]) for item in sorted_group],
+                "sequence_labels": [int(item.get("label", item.get("merge_target", 0))) for item in sorted_group],
+                "sequence_reasons": [str(item.get("label_reason") or "") for item in sorted_group],
+                "gap_indexes": [int(item.get("gap_index") or 0) for item in sorted_group],
+                "metadata": {
+                    "feature_path": feature_path,
+                    "item_count": len(sorted_group),
+                    "source_schema": DATASET_SCHEMA,
+                },
+            }
+        )
+    return sequence_rows
+
+
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Build supervised gap samples for the Boundary Refiner."
@@ -401,6 +445,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="feature_manifest.json. Repeatable; order must match --labels.",
     )
     parser.add_argument("--output-jsonl", required=True)
+    parser.add_argument("--output-sequence-jsonl", default="")
     parser.add_argument("--summary-json", default="")
     parser.add_argument("--limit", type=int, default=None, help="Limit selected feature rows for smoke runs.")
     parser.add_argument("--target-chunk-s", type=float, default=9.0)
@@ -441,6 +486,7 @@ def main(argv: list[str] | None = None) -> None:
         feature_manifest_paths=[Path(path) for path in args.feature_manifest],
         output_jsonl=Path(args.output_jsonl),
         summary_json=Path(args.summary_json) if args.summary_json else None,
+        output_sequence_jsonl=Path(args.output_sequence_jsonl) if args.output_sequence_jsonl else None,
         limit=args.limit,
         config=GapDatasetConfig(
             target_chunk_s=args.target_chunk_s,
