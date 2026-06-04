@@ -242,6 +242,8 @@ class SpeechBoundaryJaConfig:
     chunk_threshold_s: float = 1.0
     cut_threshold: float = 0.500
     apply_cut_to_speech: bool = True
+    export_sequence_features: bool = False
+    sequence_feature_max_ptm_dims: int = 64
     no_download: bool = False
 
     @classmethod
@@ -263,6 +265,11 @@ class SpeechBoundaryJaConfig:
             chunk_threshold_s=_env_float("SPEECH_BOUNDARY_JA_CHUNK_THRESHOLD_S", "1.0"),
             cut_threshold=_env_float("SPEECH_BOUNDARY_JA_CUT_THRESHOLD", "0.500"),
             apply_cut_to_speech=_env_bool("SPEECH_BOUNDARY_JA_APPLY_CUT_TO_SPEECH", "1"),
+            export_sequence_features=_env_bool("SPEECH_BOUNDARY_JA_EXPORT_SEQUENCE_FEATURES", "0"),
+            sequence_feature_max_ptm_dims=max(
+                1,
+                int(_env_float("BOUNDARY_FRAME_SEQUENCE_MAX_PTM_DIMS", "64")),
+            ),
             no_download=_env_bool("SPEECH_BOUNDARY_JA_NO_DOWNLOAD", "0"),
         )
 
@@ -293,6 +300,8 @@ class SpeechBoundaryJaBackend:
             "chunk_threshold_s": float(cfg.chunk_threshold_s),
             "cut_threshold": float(cfg.cut_threshold),
             "apply_cut_to_speech": bool(cfg.apply_cut_to_speech),
+            "export_sequence_features": bool(cfg.export_sequence_features),
+            "sequence_feature_max_ptm_dims": int(cfg.sequence_feature_max_ptm_dims),
             "operating_point": DEFAULT_OPERATING_POINT,
             "allow_empty": True,
         }
@@ -360,6 +369,9 @@ class SpeechBoundaryJaBackend:
             probability_count = np.zeros(total_frames, dtype=np.float32)
             cut_probability_sum = np.zeros(total_frames, dtype=np.float64)
             cut_probability_count = np.zeros(total_frames, dtype=np.float32)
+            sequence_ptm_sum: np.ndarray | None = None
+            sequence_mfcc_sum: np.ndarray | None = None
+            sequence_feature_count: np.ndarray | None = None
             window_samples = max(1, int(round(cfg.window_s * sample_rate)))
             stride_samples = max(1, int(round((cfg.window_s - cfg.overlap_s) * sample_rate)))
             starts = list(range(0, max(1, len(audio)), stride_samples))
@@ -393,6 +405,16 @@ class SpeechBoundaryJaBackend:
                 probability_count[global_start:global_end] += 1.0
                 cut_probability_sum[global_start:global_end] += cut_probs[:local_end]
                 cut_probability_count[global_start:global_end] += 1.0
+                if cfg.export_sequence_features:
+                    ptm_dim = min(int(ptm.shape[1]), int(cfg.sequence_feature_max_ptm_dims))
+                    mfcc_dim = int(mfcc.shape[1])
+                    if sequence_ptm_sum is None:
+                        sequence_ptm_sum = np.zeros((total_frames, ptm_dim), dtype=np.float64)
+                        sequence_mfcc_sum = np.zeros((total_frames, mfcc_dim), dtype=np.float64)
+                        sequence_feature_count = np.zeros(total_frames, dtype=np.float32)
+                    sequence_ptm_sum[global_start:global_end] += ptm[:local_end, :ptm_dim]
+                    sequence_mfcc_sum[global_start:global_end] += mfcc[:local_end, :mfcc_dim]
+                    sequence_feature_count[global_start:global_end] += 1.0
                 print(
                     "[boundary] speech_boundary_ja window "
                     f"{window_index + 1}/{len(starts)} start={window_start_s:.1f}s "
@@ -474,6 +496,23 @@ class SpeechBoundaryJaBackend:
                     "runtime_device": runtime_device,
                 }
             )
+            if (
+                cfg.export_sequence_features
+                and sequence_ptm_sum is not None
+                and sequence_mfcc_sum is not None
+                and sequence_feature_count is not None
+            ):
+                counts = np.maximum(sequence_feature_count.reshape(-1, 1), 1.0)
+                sequence_ptm = (sequence_ptm_sum / counts).astype(np.float32)
+                sequence_mfcc = (sequence_mfcc_sum / counts).astype(np.float32)
+                params["sequence_feature_frames"] = {
+                    "schema": "speech_boundary_ja_sequence_feature_frames_v1",
+                    "frame_hop_s": float(cfg.frame_hop_s),
+                    "ptm": sequence_ptm.tolist(),
+                    "mfcc": sequence_mfcc.tolist(),
+                    "ptm_dim": int(sequence_ptm.shape[1]),
+                    "mfcc_dim": int(sequence_mfcc.shape[1]),
+                }
             if _env_bool("SPEECH_BOUNDARY_JA_EXPORT_FRAME_SCORES", "0") or _env_bool(
                 "BOUNDARY_REFINER_ENABLED", "0"
             ):

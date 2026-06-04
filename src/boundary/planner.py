@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Sequence
+from typing import Protocol, Sequence
 
 from boundary.candidates import (
     BoundaryCandidate,
@@ -11,7 +11,7 @@ from boundary.candidates import (
     gap_midpoint_candidate,
 )
 from boundary.features import BoundaryFeatureBundle, summarize_gap_features
-from boundary.refiner import BoundaryDecision, BoundaryRefiner, RefinerInput
+from boundary.refiner import BoundaryDecision, BoundaryRefiner, RefinerInput, SequenceBoundaryRefiner
 from boundary.base import SpeechSegment
 
 
@@ -24,10 +24,11 @@ class BoundaryPlannerConfig:
     start_weight: float = 1.5
     target_padding_s: float = 2.0
     max_splits_per_segment: int = 16
+    sequence_batch_size: int = 256
 
     def signature(self) -> dict:
         return {
-            "planner": "constrained_boundary_planner_v1",
+            "planner": "constrained_sequence_dp_planner_v2",
             "frame_hop_s": self.frame_hop_s,
             "max_chunk_s": self.max_chunk_s,
             "target_chunk_s": self.target_chunk_s,
@@ -35,6 +36,7 @@ class BoundaryPlannerConfig:
             "start_weight": self.start_weight,
             "target_padding_s": self.target_padding_s,
             "max_splits_per_segment": self.max_splits_per_segment,
+            "sequence_batch_size": self.sequence_batch_size,
         }
 
 
@@ -61,12 +63,31 @@ class PlannedChunk:
     boundary_decision: BoundaryDecision | None = None
 
 
+@dataclass(frozen=True)
+class _ForcedRun:
+    islands: list[PlannedIsland]
+    terminal_reason: str
+
+
+class GapSequenceFeatureProvider(Protocol):
+    def features_for_gap(
+        self,
+        *,
+        left_start_s: float,
+        left_end_s: float,
+        right_start_s: float,
+        right_end_s: float,
+    ) -> list[float]: ...
+
+
 def plan_boundary_chunks(
     segments: Sequence[SpeechSegment],
     *,
     features: BoundaryFeatureBundle,
     config: BoundaryPlannerConfig,
     refiner: BoundaryRefiner | None = None,
+    sequence_refiner: SequenceBoundaryRefiner | None = None,
+    sequence_feature_provider: GapSequenceFeatureProvider | None = None,
 ) -> list[PlannedChunk]:
     _validate_config(config)
     ordered = sorted(segments, key=lambda item: (item.start, item.end))
@@ -74,7 +95,14 @@ def plan_boundary_chunks(
     islands = [_island_from_segment(segment) for segment in ordered]
     islands = _split_on_boundary_candidates(islands, features=features, config=config)
     islands = _split_overlong_islands(islands, config=config)
-    return _pack_islands(islands, features=features, config=config, refiner=refiner)
+    return _pack_islands(
+        islands,
+        features=features,
+        config=config,
+        refiner=refiner,
+        sequence_refiner=sequence_refiner,
+        sequence_feature_provider=sequence_feature_provider,
+    )
 
 
 def _validate_config(config: BoundaryPlannerConfig) -> None:
@@ -92,6 +120,8 @@ def _validate_config(config: BoundaryPlannerConfig) -> None:
         raise ValueError("target_padding_s must be non-negative")
     if config.max_splits_per_segment < 0:
         raise ValueError("max_splits_per_segment must be non-negative")
+    if config.sequence_batch_size <= 0:
+        raise ValueError("sequence_batch_size must be positive")
 
 
 def _validate_segments(segments: Sequence[SpeechSegment]) -> None:
@@ -252,12 +282,28 @@ def _pack_islands(
     features: BoundaryFeatureBundle,
     config: BoundaryPlannerConfig,
     refiner: BoundaryRefiner | None,
+    sequence_refiner: SequenceBoundaryRefiner | None,
+    sequence_feature_provider: GapSequenceFeatureProvider | None,
 ) -> list[PlannedChunk]:
+    sequence_decisions = _precompute_sequence_decisions(
+        islands,
+        sequence_refiner=sequence_refiner,
+        sequence_feature_provider=sequence_feature_provider,
+        sequence_batch_size=config.sequence_batch_size,
+    )
+    if sequence_refiner is not None and sequence_feature_provider is not None:
+        return _pack_islands_with_dp(
+            islands,
+            config=config,
+            refiner=refiner,
+            sequence_decisions=sequence_decisions,
+        )
+
     chunks: list[PlannedChunk] = []
     current: list[PlannedIsland] = []
     current_decision: BoundaryDecision | None = None
 
-    for island in islands:
+    for index, island in enumerate(islands):
         if not current:
             current = [island]
             current_decision = None
@@ -285,6 +331,7 @@ def _pack_islands(
             features=features,
             config=config,
             refiner=refiner,
+            sequence_decision=sequence_decisions[index - 1] if index > 0 else None,
             gap_s=gap_s,
             proposed_core_s=proposed_core_s,
         )
@@ -322,6 +369,234 @@ def _pack_islands(
     return chunks
 
 
+def _pack_islands_with_dp(
+    islands: Sequence[PlannedIsland],
+    *,
+    config: BoundaryPlannerConfig,
+    refiner: BoundaryRefiner | None,
+    sequence_decisions: Sequence[BoundaryDecision | None],
+) -> list[PlannedChunk]:
+    chunks: list[PlannedChunk] = []
+    cursor = 0
+    for run in _forced_runs(islands):
+        run_decisions = list(sequence_decisions[cursor : cursor + max(0, len(run.islands) - 1)])
+        chunks.extend(
+            _dp_pack_run(
+                run.islands,
+                terminal_reason=run.terminal_reason,
+                config=config,
+                refiner=refiner,
+                gap_decisions=run_decisions,
+            )
+        )
+        cursor += len(run.islands)
+    return chunks
+
+
+def _forced_runs(islands: Sequence[PlannedIsland]) -> list[_ForcedRun]:
+    if not islands:
+        return []
+    runs: list[_ForcedRun] = []
+    current: list[PlannedIsland] = []
+    for island in islands:
+        if island.force_break_before and current:
+            runs.append(
+                _ForcedRun(
+                    islands=current,
+                    terminal_reason=island.boundary_reason or "boundary_candidate",
+                )
+            )
+            current = [island]
+            continue
+        current.append(island)
+    if current:
+        runs.append(_ForcedRun(islands=current, terminal_reason="tail"))
+    return runs
+
+
+def _dp_pack_run(
+    islands: Sequence[PlannedIsland],
+    *,
+    terminal_reason: str,
+    config: BoundaryPlannerConfig,
+    refiner: BoundaryRefiner | None,
+    gap_decisions: Sequence[BoundaryDecision | None],
+) -> list[PlannedChunk]:
+    if not islands:
+        return []
+    if len(islands) == 1:
+        return [PlannedChunk(islands=list(islands), split_reason=terminal_reason)]
+
+    gap_infos = [
+        _gap_decision_for_dp(
+            islands[index],
+            islands[index + 1],
+            decision=gap_decisions[index] if index < len(gap_decisions) else None,
+            config=config,
+            refiner=refiner,
+        )
+        for index in range(len(islands) - 1)
+    ]
+
+    count = len(islands)
+    inf = 1e18
+    costs = [inf] * (count + 1)
+    previous = [-1] * (count + 1)
+    costs[0] = 0.0
+    for end in range(1, count + 1):
+        for start in range(end - 1, -1, -1):
+            core_s = islands[end - 1].end - islands[start].start
+            if core_s > config.max_chunk_s and start < end - 1:
+                continue
+            candidate_cost = costs[start] + _chunk_dp_cost(
+                islands,
+                start=start,
+                end=end,
+                gap_infos=gap_infos,
+                config=config,
+            )
+            if start > 0:
+                candidate_cost += _split_gap_cost(gap_infos[start - 1])
+            if candidate_cost < costs[end]:
+                costs[end] = candidate_cost
+                previous[end] = start
+
+    if previous[count] < 0:
+        return [
+            PlannedChunk(
+                islands=[island],
+                split_reason=terminal_reason if index == count - 1 else "planner_dp",
+                boundary_decision=gap_infos[index].decision if index < len(gap_infos) else None,
+            )
+            for index, island in enumerate(islands)
+        ]
+
+    spans: list[tuple[int, int]] = []
+    cursor = count
+    while cursor > 0:
+        start = previous[cursor]
+        if start < 0:
+            break
+        spans.append((start, cursor))
+        cursor = start
+    spans.reverse()
+
+    planned: list[PlannedChunk] = []
+    for start, end in spans:
+        if end < count:
+            boundary_decision = gap_infos[end - 1].decision
+            split_reason = _dp_split_reason(boundary_decision)
+        else:
+            boundary_decision = None
+            split_reason = terminal_reason
+        planned.append(
+            PlannedChunk(
+                islands=list(islands[start:end]),
+                split_reason=split_reason,
+                boundary_decision=_dp_boundary_decision(boundary_decision, gap_infos[end - 1]) if end < count else None,
+            )
+        )
+    return planned
+
+
+@dataclass(frozen=True)
+class _GapInfo:
+    gap_s: float
+    merge_score: float
+    decision: BoundaryDecision | None
+
+
+def _gap_decision_for_dp(
+    left: PlannedIsland,
+    right: PlannedIsland,
+    *,
+    decision: BoundaryDecision | None,
+    config: BoundaryPlannerConfig,
+    refiner: BoundaryRefiner | None,
+) -> _GapInfo:
+    gap_s = right.start - left.end
+    if decision is not None:
+        return _GapInfo(gap_s=gap_s, merge_score=_clamp01(decision.score), decision=decision)
+    if gap_s < 0.0:
+        return _GapInfo(gap_s=gap_s, merge_score=1.0, decision=None)
+    if refiner is not None:
+        item = RefinerInput(
+            gap_s=gap_s,
+            left_start=left.start,
+            left_end=left.end,
+            right_start=right.start,
+            right_end=right.end,
+            current_core_s=max(0.0, left.end - left.start),
+            proposed_core_s=max(0.0, right.end - left.start),
+            gap_merge_s=_bootstrap_gap_scale_s(config),
+            left_score=left.score,
+            right_score=right.score,
+        )
+        refiner_decision = refiner.decide_gap(item)
+        return _GapInfo(
+            gap_s=gap_s,
+            merge_score=_clamp01(refiner_decision.score),
+            decision=refiner_decision,
+        )
+    score = max(0.0, 1.0 - gap_s / max(_bootstrap_gap_scale_s(config), 1e-6))
+    return _GapInfo(gap_s=gap_s, merge_score=_clamp01(score), decision=None)
+
+
+def _chunk_dp_cost(
+    islands: Sequence[PlannedIsland],
+    *,
+    start: int,
+    end: int,
+    gap_infos: Sequence[_GapInfo],
+    config: BoundaryPlannerConfig,
+) -> float:
+    core_s = max(0.0, islands[end - 1].end - islands[start].start)
+    cost = 0.04
+    target = max(config.target_chunk_s, 1e-6)
+    if core_s > config.target_chunk_s:
+        cost += 0.30 * ((core_s - config.target_chunk_s) / target) ** 2
+    if core_s > 2.0 * config.target_chunk_s:
+        cost += 1.50 * ((core_s - 2.0 * config.target_chunk_s) / target) ** 2
+    if core_s < config.min_chunk_s:
+        cost += 0.20 * ((config.min_chunk_s - core_s) / max(config.min_chunk_s, 1e-6)) ** 2
+    for index in range(start, end - 1):
+        cost += _merge_gap_cost(gap_infos[index], config=config)
+    return cost
+
+
+def _merge_gap_cost(info: _GapInfo, *, config: BoundaryPlannerConfig) -> float:
+    score = _clamp01(info.merge_score)
+    cost = config.start_weight * (1.0 - score)
+    if info.gap_s > _bootstrap_gap_scale_s(config):
+        cost += 0.35 * min(4.0, (info.gap_s - _bootstrap_gap_scale_s(config)) / max(config.target_chunk_s, 1e-6))
+    return cost
+
+
+def _split_gap_cost(info: _GapInfo) -> float:
+    score = _clamp01(info.merge_score)
+    return 0.35 * score * score
+
+
+def _dp_split_reason(decision: BoundaryDecision | None) -> str:
+    if decision is not None and not decision.merge:
+        return f"boundary_refiner:{decision.reason}"
+    return "planner_dp"
+
+
+def _dp_boundary_decision(
+    decision: BoundaryDecision | None,
+    info: _GapInfo,
+) -> BoundaryDecision:
+    if decision is not None and not decision.merge:
+        return decision
+    return BoundaryDecision(
+        False,
+        _clamp01(info.merge_score),
+        "planner_dp",
+        source="boundary_planner",
+    )
+
+
 def _score_gap(
     current: Sequence[PlannedIsland],
     island: PlannedIsland,
@@ -329,10 +604,15 @@ def _score_gap(
     features: BoundaryFeatureBundle,
     config: BoundaryPlannerConfig,
     refiner: BoundaryRefiner | None,
+    sequence_decision: BoundaryDecision | None,
     gap_s: float,
     proposed_core_s: float,
 ) -> BoundaryDecision | None:
-    if refiner is None or gap_s < 0.0:
+    if gap_s < 0.0:
+        return None
+    if sequence_decision is not None:
+        return sequence_decision
+    if refiner is None:
         return None
     left = current[-1]
     gap_features = summarize_gap_features(features, start_s=left.end, end_s=island.start)
@@ -364,8 +644,52 @@ def _score_gap(
     return refiner.decide_gap(item)
 
 
+def _precompute_sequence_decisions(
+    islands: Sequence[PlannedIsland],
+    *,
+    sequence_refiner: SequenceBoundaryRefiner | None,
+    sequence_feature_provider: GapSequenceFeatureProvider | None,
+    sequence_batch_size: int,
+) -> list[BoundaryDecision | None]:
+    if len(islands) < 2:
+        return []
+    if sequence_refiner is None or sequence_feature_provider is None:
+        return [None] * (len(islands) - 1)
+
+    features_by_gap: list[list[float]] = []
+    gap_indexes: list[int] = []
+    for index, (left, right) in enumerate(zip(islands, islands[1:])):
+        if right.force_break_before or right.start - left.end < 0.0:
+            continue
+        features_by_gap.append(
+            sequence_feature_provider.features_for_gap(
+                left_start_s=left.start,
+                left_end_s=left.end,
+                right_start_s=right.start,
+                right_end_s=right.end,
+            )
+        )
+        gap_indexes.append(index)
+
+    decisions: list[BoundaryDecision | None] = [None] * (len(islands) - 1)
+    if not features_by_gap:
+        return decisions
+    for start in range(0, len(features_by_gap), sequence_batch_size):
+        end = min(len(features_by_gap), start + sequence_batch_size)
+        sequence_decisions = sequence_refiner.decide_sequence(features_by_gap[start:end])
+        if len(sequence_decisions) != end - start:
+            raise ValueError("sequence boundary refiner returned a decision count mismatch")
+        for index, decision in zip(gap_indexes[start:end], sequence_decisions):
+            decisions[index] = decision
+    return decisions
+
+
 def _bootstrap_gap_scale_s(config: BoundaryPlannerConfig) -> float:
     return max(0.2, min(1.5, config.target_chunk_s / 6.0))
+
+
+def _clamp01(value: float) -> float:
+    return max(0.0, min(1.0, float(value)))
 
 
 def max_optional(left: float | None, right: float | None) -> float | None:

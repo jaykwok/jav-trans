@@ -136,6 +136,10 @@ def configure_env(args: argparse.Namespace) -> None:
         "BOUNDARY_PLANNER_MAX_SPLITS_PER_SEGMENT",
         str(args.boundary_planner_max_splits_per_segment),
     )
+    os.environ.setdefault(
+        "BOUNDARY_PLANNER_SEQUENCE_BATCH_SIZE",
+        str(args.boundary_planner_sequence_batch_size),
+    )
     os.environ.setdefault("KEEP_ASR_CHUNKS", "1" if args.keep_asr_chunks else "0")
     os.environ.setdefault("BOUNDARY_CACHE_ENABLED", "1" if args.boundary_cache else "0")
     os.environ["SPEECH_BOUNDARY_JA_THRESHOLD"] = str(args.speech_boundary_threshold)
@@ -185,6 +189,7 @@ def build_context(*, args: argparse.Namespace, paths: RunPaths, video: Path):
         "BOUNDARY_PLANNER_START_WEIGHT": os.getenv("BOUNDARY_PLANNER_START_WEIGHT", "1.5"),
         "BOUNDARY_PLANNER_TARGET_PADDING_S": os.getenv("BOUNDARY_PLANNER_TARGET_PADDING_S", "2.0"),
         "BOUNDARY_PLANNER_MAX_SPLITS_PER_SEGMENT": os.getenv("BOUNDARY_PLANNER_MAX_SPLITS_PER_SEGMENT", "16"),
+        "BOUNDARY_PLANNER_SEQUENCE_BATCH_SIZE": os.getenv("BOUNDARY_PLANNER_SEQUENCE_BATCH_SIZE", "256"),
         "QUALITY_REPORT_ENABLED": "1",
         "QUALITY_REPORT_DIR": str(paths.root / "quality_reports"),
         "QC_HARD_FAIL": "0",
@@ -326,6 +331,7 @@ def write_summary(paths: RunPaths, args: argparse.Namespace, results: list[dict[
             "start_weight": args.boundary_planner_start_weight,
             "target_padding_s": args.boundary_planner_target_padding_s,
             "max_splits_per_segment": args.boundary_planner_max_splits_per_segment,
+            "sequence_batch_size": args.boundary_planner_sequence_batch_size,
         },
         "translate": bool(args.translate),
         "results": results,
@@ -409,6 +415,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--boundary-planner-start-weight", type=float, default=1.5)
     parser.add_argument("--boundary-planner-target-padding-s", type=float, default=2.0)
     parser.add_argument("--boundary-planner-max-splits-per-segment", type=int, default=16)
+    parser.add_argument("--boundary-planner-sequence-batch-size", type=int, default=256)
     parser.add_argument("--keep-asr-chunks", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--boundary-cache", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--speech-boundary-threshold", dest="speech_boundary_threshold", type=float, default=0.200)
@@ -443,6 +450,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         parser.error("--speech-boundary-overlap-s must be non-negative and smaller than window")
     if args.speech_boundary_cut_threshold < 0:
         parser.error("--speech-boundary-cut-threshold must be non-negative")
+    if args.boundary_planner_sequence_batch_size <= 0:
+        parser.error("--boundary-planner-sequence-batch-size must be positive")
     return args
 
 

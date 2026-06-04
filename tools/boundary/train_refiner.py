@@ -27,6 +27,11 @@ from boundary.refiner import (
     load_boundary_refiner,
     refiner_input_to_features,
 )
+from boundary.sequence_features import (
+    FRAME_SEQUENCE_FEATURE_SCHEMA,
+    feature_extraction_hash,
+    validate_sequence_features,
+)
 
 
 @dataclass(frozen=True)
@@ -61,11 +66,11 @@ def train_refiner(
     if not rows:
         raise ValueError("boundary refiner dataset is empty")
     feature_names = _feature_names(rows)
-    features = torch.tensor([_row_features(row, feature_names) for row in rows], dtype=torch.float32)
-    labels = torch.tensor([float(row.get("label", row.get("merge_target", 0))) for row in rows], dtype=torch.float32)
+    features, labels, mask = _rows_to_padded_tensors(rows, feature_names)
+    feature_metadata = _feature_metadata(rows, feature_names)
     class_counts = {
-        "merge_positive": int(labels.sum().item()),
-        "split_negative": int(labels.numel() - labels.sum().item()),
+        "merge_positive": int(labels[mask].sum().item()),
+        "split_negative": int(mask.sum().item() - labels[mask].sum().item()),
     }
     if not config.allow_single_class and (class_counts["merge_positive"] == 0 or class_counts["split_negative"] == 0):
         raise ValueError(
@@ -76,8 +81,10 @@ def train_refiner(
     train_idx, val_idx = _split_indexes(len(rows), val_ratio=config.val_ratio, seed=config.seed)
     train_features = features[train_idx]
     train_labels = labels[train_idx]
-    feature_mean = train_features.mean(dim=0)
-    feature_std = train_features.std(dim=0, unbiased=False).clamp_min(1e-6)
+    train_mask = mask[train_idx]
+    active_train_features = train_features[train_mask]
+    feature_mean = active_train_features.mean(dim=0)
+    feature_std = active_train_features.std(dim=0, unbiased=False).clamp_min(1e-6)
     features = (features - feature_mean) / feature_std
 
     device = _resolve_device(config.device)
@@ -95,15 +102,15 @@ def train_refiner(
         bidirectional=config.bidirectional,
     ).to(device)
 
-    train_dataset = TensorDataset(features[train_idx].unsqueeze(1), labels[train_idx].unsqueeze(1))
+    train_dataset = TensorDataset(features[train_idx], labels[train_idx], mask[train_idx])
     train_loader = DataLoader(
         train_dataset,
         batch_size=min(config.batch_size, len(train_dataset)),
         shuffle=True,
         drop_last=False,
     )
-    positives = max(1.0, float(train_labels.sum().item()))
-    negatives = max(1.0, float(train_labels.numel() - train_labels.sum().item()))
+    positives = max(1.0, float(train_labels[train_mask].sum().item()))
+    negatives = max(1.0, float(train_mask.sum().item() - train_labels[train_mask].sum().item()))
     criterion = nn.BCEWithLogitsLoss(pos_weight=torch.tensor([negatives / positives], device=device))
     optimizer = torch.optim.AdamW(
         model.parameters(),
@@ -114,11 +121,12 @@ def train_refiner(
     step = 0
     last_loss = math.nan
     while step < config.max_steps:
-        for batch_features, batch_labels in train_loader:
+        for batch_features, batch_labels, batch_mask in train_loader:
             step += 1
             optimizer.zero_grad(set_to_none=True)
-            logits = model(batch_features.to(device))
-            loss = criterion(logits, batch_labels.to(device))
+            batch_mask = batch_mask.to(device)
+            logits = model(batch_features.to(device), attention_mask=batch_mask.long())
+            loss = criterion(logits[batch_mask], batch_labels.to(device)[batch_mask])
             loss.backward()
             optimizer.step()
             last_loss = float(loss.detach().cpu())
@@ -133,12 +141,29 @@ def train_refiner(
         "output_dir": str(output_dir),
         "config": asdict(config),
         "feature_names": list(feature_names),
+        "feature_metadata": feature_metadata,
         "class_counts": class_counts,
         "train_size": len(train_idx),
         "val_size": len(val_idx),
+        "train_items": int(mask[train_idx].sum().item()),
+        "val_items": int(mask[val_idx].sum().item()) if val_idx else 0,
         "last_train_loss": last_loss,
-        "train": _evaluate(model, features[train_idx], labels[train_idx], device=device, threshold=config.threshold),
-        "val": _evaluate(model, features[val_idx], labels[val_idx], device=device, threshold=config.threshold)
+        "train": _evaluate(
+            model,
+            features[train_idx],
+            labels[train_idx],
+            mask[train_idx],
+            device=device,
+            threshold=config.threshold,
+        ),
+        "val": _evaluate(
+            model,
+            features[val_idx],
+            labels[val_idx],
+            mask[val_idx],
+            device=device,
+            threshold=config.threshold,
+        )
         if val_idx
         else {},
     }
@@ -154,7 +179,9 @@ def train_refiner(
             "trainer": "tools/boundary/train_refiner.py",
             "dataset_paths": [str(path) for path in dataset_paths],
             "class_counts": class_counts,
-            "train_schema": "boundary_refiner_supervised_gap_v1",
+            "train_schema": _train_schema(rows),
+            "runtime_adapter": _runtime_adapter_name(feature_names),
+            **feature_metadata,
         },
     )
     checkpoint_path = output_dir / "boundary_refiner.pt"
@@ -167,16 +194,23 @@ def train_refiner(
         backbone=TRANSFORMERS_MAMBA2_BACKBONE,
         merge_threshold=config.threshold,
     )
-    smoke_input = _row_refiner_input(rows[0])
-    smoke_decision = refiner.decide_gap(smoke_input)
     metrics["loader_smoke"] = {
         "signature": refiner.signature(),
-        "decision": {
+        "decision": None,
+        "decision_skipped_reason": "",
+    }
+    if _supports_refiner_input_decision(feature_names):
+        smoke_input = _row_smoke_input(rows[0], feature_names)
+        smoke_decision = refiner.decide_gap(smoke_input)
+        metrics["loader_smoke"]["decision"] = {
             "merge": smoke_decision.merge,
             "score": smoke_decision.score,
             "reason": smoke_decision.reason,
-        },
-    }
+        }
+    else:
+        metrics["loader_smoke"]["decision_skipped_reason"] = (
+            "feature_names require frame/window runtime adapter"
+        )
 
     metrics_path = output_dir / "metrics.json"
     metrics_path.write_text(
@@ -211,6 +245,118 @@ def _feature_names(rows: Sequence[Mapping[str, Any]]) -> tuple[str, ...]:
     return names
 
 
+def _train_schema(rows: Sequence[Mapping[str, Any]]) -> str:
+    schemas = {str(row.get("schema") or "") for row in rows}
+    return schemas.pop() if len(schemas) == 1 else "mixed_boundary_refiner_dataset"
+
+
+def _feature_metadata(
+    rows: Sequence[Mapping[str, Any]],
+    feature_names: tuple[str, ...],
+) -> dict[str, Any]:
+    schema_values = {str(row.get("feature_schema") or "") for row in rows if row.get("feature_schema")}
+    hash_values = {str(row.get("feature_schema_hash") or "") for row in rows if row.get("feature_schema_hash")}
+    signature_values = [
+        dict(row["feature_signature"])
+        for row in rows
+        if isinstance(row.get("feature_signature"), Mapping)
+    ]
+    if schema_values and schema_values != {FRAME_SEQUENCE_FEATURE_SCHEMA}:
+        raise ValueError(f"unsupported sequence feature schema: {sorted(schema_values)}")
+    if len(hash_values) > 1:
+        raise ValueError("mixed feature_schema_hash values are not allowed")
+    if signature_values:
+        expected_signature = signature_values[0]
+        for index, signature in enumerate(signature_values):
+            if signature != expected_signature:
+                raise ValueError(f"feature_signature mismatch at row {index}")
+        feature_schema_hash = hash_values.pop() if hash_values else _hash_from_signature(expected_signature)
+        return {
+            "feature_schema": str(expected_signature.get("feature_schema") or FRAME_SEQUENCE_FEATURE_SCHEMA),
+            "feature_schema_hash": feature_schema_hash,
+            "feature_signature": expected_signature,
+            "feature_dim": len(feature_names),
+        }
+    if schema_values or hash_values:
+        raise ValueError("sequence feature rows require feature_signature metadata")
+    return {
+        "feature_dim": len(feature_names),
+    }
+
+
+def _hash_from_signature(signature: Mapping[str, Any]) -> str:
+    feature_config = signature.get("feature_config")
+    feature_names = signature.get("feature_names")
+    if not isinstance(feature_config, Mapping) or not isinstance(feature_names, list):
+        raise ValueError("feature_signature must contain feature_config and feature_names")
+    from boundary.sequence_features import FrameSequenceFeatureConfig
+
+    config = FrameSequenceFeatureConfig(
+        left_context_s=float(feature_config["left_context_s"]),
+        right_context_s=float(feature_config["right_context_s"]),
+        max_ptm_dims=int(feature_config["max_ptm_dims"]),
+        include_mfcc=bool(feature_config["include_mfcc"]),
+    )
+    return feature_extraction_hash(
+        config=config,
+        feature_names=[str(name) for name in feature_names],
+    )
+
+
+def _supports_refiner_input_decision(feature_names: Sequence[str]) -> bool:
+    return set(str(name) for name in feature_names).issubset(set(DEFAULT_REFINER_FEATURES))
+
+
+def _runtime_adapter_name(feature_names: Sequence[str]) -> str:
+    return "refiner_input_v1" if _supports_refiner_input_decision(feature_names) else "frame_sequence_v1"
+
+
+def _rows_to_padded_tensors(
+    rows: Sequence[Mapping[str, Any]],
+    feature_names: tuple[str, ...],
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    sequences = [_row_sequence(row, feature_names) for row in rows]
+    label_sequences = [_row_label_sequence(row, expected_len=len(sequence)) for row, sequence in zip(rows, sequences)]
+    max_len = max(len(sequence) for sequence in sequences)
+    feature_dim = len(feature_names)
+    features = torch.zeros((len(rows), max_len, feature_dim), dtype=torch.float32)
+    labels = torch.zeros((len(rows), max_len), dtype=torch.float32)
+    mask = torch.zeros((len(rows), max_len), dtype=torch.bool)
+    for row_index, (sequence, label_sequence) in enumerate(zip(sequences, label_sequences)):
+        length = len(sequence)
+        features[row_index, :length] = torch.tensor(sequence, dtype=torch.float32)
+        labels[row_index, :length] = torch.tensor(label_sequence, dtype=torch.float32)
+        mask[row_index, :length] = True
+    return features, labels, mask
+
+
+def _row_sequence(row: Mapping[str, Any], feature_names: tuple[str, ...]) -> list[list[float]]:
+    raw_sequence = row.get("sequence_features")
+    if isinstance(raw_sequence, list) and raw_sequence:
+        return validate_sequence_features(
+            raw_sequence,
+            feature_names=feature_names,
+            expected_feature_names=row.get("feature_names") or feature_names,
+        ).astype(float).tolist()
+    features = _row_features(row, feature_names)
+    validate_sequence_features([features], feature_names=feature_names)
+    return [features]
+
+
+def _row_label_sequence(row: Mapping[str, Any], *, expected_len: int) -> list[float]:
+    raw = row.get("sequence_labels")
+    if isinstance(raw, list) and raw:
+        if len(raw) != expected_len:
+            raise ValueError("sequence_labels length must match sequence_features length")
+        labels = [float(value) for value in raw]
+        if any(not math.isfinite(value) for value in labels):
+            raise ValueError("sequence_labels must not contain NaN or inf")
+        return labels
+    if expected_len != 1:
+        raise ValueError("sequence row requires sequence_labels")
+    return [float(row.get("label", row.get("merge_target", 0)))]
+
+
 def _row_features(row: Mapping[str, Any], feature_names: tuple[str, ...]) -> list[float]:
     raw = row.get("features")
     if isinstance(raw, list) and len(raw) == len(feature_names):
@@ -239,6 +385,35 @@ def _row_refiner_input(row: Mapping[str, Any]) -> RefinerInput:
     )
 
 
+def _row_smoke_input(row: Mapping[str, Any], feature_names: tuple[str, ...]) -> RefinerInput:
+    if isinstance(row.get("refiner_input"), Mapping):
+        return _row_refiner_input(row)
+    sequence = _row_sequence(row, feature_names)
+    values = {name: float(value) for name, value in zip(feature_names, sequence[0])}
+    gap_s = values.get("gap_s", 0.0)
+    left_duration_s = max(0.0, values.get("left_duration_s", 1.0))
+    right_duration_s = max(0.0, values.get("right_duration_s", 1.0))
+    left_start = 0.0
+    left_end = left_duration_s
+    right_start = left_end + gap_s
+    right_end = right_start + right_duration_s
+    return RefinerInput(
+        gap_s=gap_s,
+        left_start=left_start,
+        left_end=left_end,
+        right_start=right_start,
+        right_end=right_end,
+        current_core_s=values.get("current_core_s", left_duration_s),
+        proposed_core_s=values.get("proposed_core_s", right_end - left_start),
+        gap_merge_s=max(1e-6, values.get("gap_merge_s", 1.5)),
+        left_score=values.get("left_score"),
+        right_score=values.get("right_score"),
+        valley_score_min=values.get("valley_score_min"),
+        cut_score_max=values.get("cut_score_max"),
+        gap_boundary_score=values.get("gap_boundary_score"),
+    )
+
+
 def _optional_float(value: Any) -> float | None:
     return None if value is None else float(value)
 
@@ -256,18 +431,21 @@ def _evaluate(
     model: BoundarySequenceClassifier,
     features: torch.Tensor,
     labels: torch.Tensor,
+    mask: torch.Tensor,
     *,
     device: torch.device,
     threshold: float,
 ) -> dict[str, Any]:
-    if features.numel() == 0:
+    if features.numel() == 0 or not bool(mask.any().item()):
         return {}
     model.eval()
     with torch.inference_mode():
-        logits = model(features.unsqueeze(1).to(device)).reshape(-1).detach().cpu()
+        mask_device = mask.to(device)
+        logits = model(features.to(device), attention_mask=mask_device.long()).detach().cpu()
+        logits = logits[mask]
         probs = torch.sigmoid(logits)
     preds = probs >= threshold
-    truth = labels.reshape(-1) >= 0.5
+    truth = labels[mask] >= 0.5
     tp = int(torch.logical_and(preds, truth).sum().item())
     tn = int(torch.logical_and(~preds, ~truth).sum().item())
     fp = int(torch.logical_and(preds, ~truth).sum().item())

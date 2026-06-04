@@ -60,6 +60,7 @@ def test_chunk_config_reads_boundary_planner_env_at_runtime(monkeypatch):
     monkeypatch.setenv("BOUNDARY_PLANNER_START_WEIGHT", "1.7")
     monkeypatch.setenv("BOUNDARY_PLANNER_TARGET_PADDING_S", "1.5")
     monkeypatch.setenv("BOUNDARY_PLANNER_MAX_SPLITS_PER_SEGMENT", "12")
+    monkeypatch.setenv("BOUNDARY_PLANNER_SEQUENCE_BATCH_SIZE", "128")
 
     cfg = pipeline._boundary_config()
 
@@ -70,3 +71,4 @@ def test_chunk_config_reads_boundary_planner_env_at_runtime(monkeypatch):
     assert cfg["boundary_planner_start_weight"] == 1.7
     assert cfg["boundary_planner_target_padding_s"] == 1.5
     assert cfg["boundary_planner_max_splits_per_segment"] == 12
+    assert cfg["boundary_planner_sequence_batch_size"] == 128

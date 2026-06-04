@@ -170,6 +170,11 @@ def test_boundary_cache_round_trips_packed_chunks(monkeypatch, tmp_path):
             boundary_score=0.87,
             boundary_reason="speaker_change",
             boundary_source="cut",
+            boundary_decision_merge=False,
+            boundary_merge_prob=0.13,
+            boundary_split_prob=0.87,
+            boundary_refine_delta_s=None,
+            boundary_decision_source="frame_sequence_refiner",
             speech_segments=[SpeechSegment(0.2, 0.4, 0.9)],
         )
     ]
@@ -207,6 +212,10 @@ def test_boundary_cache_round_trips_packed_chunks(monkeypatch, tmp_path):
     assert loaded_chunks[0].boundary_score == 0.87
     assert loaded_chunks[0].boundary_reason == "speaker_change"
     assert loaded_chunks[0].boundary_source == "cut"
+    assert loaded_chunks[0].boundary_decision_merge is False
+    assert loaded_chunks[0].boundary_merge_prob == 0.13
+    assert loaded_chunks[0].boundary_split_prob == 0.87
+    assert loaded_chunks[0].boundary_decision_source == "frame_sequence_refiner"
     assert loaded_chunks[0].speech_segments[0].score == 0.9
 
 

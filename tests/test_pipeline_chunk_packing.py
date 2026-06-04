@@ -316,6 +316,10 @@ def test_packed_chunk_metadata_uses_source_span_index_after_short_chunk_drop():
         boundary_score=0.87,
         boundary_reason="speaker_change",
         boundary_source="cut",
+        boundary_decision_merge=False,
+        boundary_merge_prob=0.13,
+        boundary_split_prob=0.87,
+        boundary_decision_source="frame_sequence_refiner",
     )
     chunk_infos = [
         {
@@ -334,6 +338,10 @@ def test_packed_chunk_metadata_uses_source_span_index_after_short_chunk_drop():
     assert chunk_infos[0]["boundary_reason"] == "speaker_change"
     assert chunk_infos[0]["boundary_source"] == "cut"
     assert chunk_infos[0]["boundary_score"] == 0.87
+    assert chunk_infos[0]["boundary_decision_merge"] is False
+    assert chunk_infos[0]["boundary_merge_prob"] == 0.13
+    assert chunk_infos[0]["boundary_split_prob"] == 0.87
+    assert chunk_infos[0]["boundary_decision_source"] == "frame_sequence_refiner"
     assert any("speech_segment_count=2" in entry and "source=cut" in entry for entry in log)
 
 

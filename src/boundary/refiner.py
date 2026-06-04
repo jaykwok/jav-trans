@@ -12,8 +12,13 @@ from boundary.backbones import (
     BoundarySequenceClassifier,
     normalize_boundary_backbone,
 )
+from boundary.sequence_features import (
+    FRAME_SEQUENCE_FEATURE_SCHEMA,
+    validate_sequence_features,
+)
 
 LEARNED_REFINER_SCHEMA = "boundary_refiner_v1"
+DEFAULT_REFINER_CHECKPOINT_PATH = Path("src/boundary/checkpoints/boundary_refiner.pt")
 
 DEFAULT_REFINER_FEATURES = (
     "gap_s",
@@ -54,10 +59,18 @@ class BoundaryDecision:
     merge: bool
     score: float
     reason: str
+    source: str = ""
+    refine_delta_s: float | None = None
 
 
 class BoundaryRefiner(Protocol):
     def decide_gap(self, item: RefinerInput) -> BoundaryDecision: ...
+
+    def signature(self) -> dict: ...
+
+
+class SequenceBoundaryRefiner(Protocol):
+    def decide_sequence(self, features: Sequence[Sequence[float]]) -> list[BoundaryDecision]: ...
 
     def signature(self) -> dict: ...
 
@@ -92,18 +105,23 @@ class HeuristicBoundaryRefiner:
 
     def decide_gap(self, item: RefinerInput) -> BoundaryDecision:
         if item.gap_s < 0.0:
-            return BoundaryDecision(False, 0.0, "overlap_gap")
+            return BoundaryDecision(False, 0.0, "overlap_gap", source="heuristic_refiner")
         if self.max_merge_gap_s is not None and item.gap_s > self.max_merge_gap_s:
-            return BoundaryDecision(False, 0.0, "gap_above_refiner_limit")
+            return BoundaryDecision(False, 0.0, "gap_above_refiner_limit", source="heuristic_refiner")
         if item.cut_score_max is not None and item.cut_score_max >= self.cut_score_threshold:
-            return BoundaryDecision(False, 0.0, "cut_score_high")
+            return BoundaryDecision(False, 0.0, "cut_score_high", source="heuristic_refiner")
         if item.valley_score_min is not None and item.valley_score_min <= self.valley_score_threshold:
-            return BoundaryDecision(False, 0.0, "valley_low")
+            return BoundaryDecision(False, 0.0, "valley_low", source="heuristic_refiner")
 
         base = 1.0 - min(1.0, item.gap_s / max(item.gap_merge_s, 1e-6))
         length_penalty = min(0.35, max(0.0, item.proposed_core_s - self.target_core_s) / 30.0)
         score = max(0.0, min(1.0, base - length_penalty))
-        return BoundaryDecision(score >= self.merge_threshold, score, "heuristic_score")
+        return BoundaryDecision(
+            score >= self.merge_threshold,
+            score,
+            "heuristic_score",
+            source="heuristic_refiner",
+        )
 
 
 class LearnedBoundaryRefiner:
@@ -151,7 +169,7 @@ class LearnedBoundaryRefiner:
 
     def decide_gap(self, item: RefinerInput) -> BoundaryDecision:
         if item.gap_s < 0.0:
-            return BoundaryDecision(False, 0.0, "overlap_gap")
+            return BoundaryDecision(False, 0.0, "overlap_gap", source="learned_refiner")
         vector = torch.tensor(
             [_feature_value(item, name) for name in self.feature_names],
             dtype=torch.float32,
@@ -167,7 +185,67 @@ class LearnedBoundaryRefiner:
             score >= self.threshold,
             score,
             "learned_merge" if score >= self.threshold else "learned_split",
+            source="learned_refiner",
         )
+
+
+class FrameSequenceBoundaryRefiner:
+    """Learned refiner adapter for precomputed candidate/window feature sequences."""
+
+    def __init__(self, learned: LearnedBoundaryRefiner) -> None:
+        runtime_adapter = str(learned.metadata.get("runtime_adapter") or "")
+        if runtime_adapter != "frame_sequence_v1":
+            raise ValueError(
+                "frame sequence refiner checkpoint metadata.runtime_adapter must be "
+                "'frame_sequence_v1'"
+            )
+        feature_schema = str(learned.metadata.get("feature_schema") or "")
+        if feature_schema != FRAME_SEQUENCE_FEATURE_SCHEMA:
+            raise ValueError(
+                "frame sequence refiner checkpoint metadata.feature_schema must be "
+                f"{FRAME_SEQUENCE_FEATURE_SCHEMA!r}"
+            )
+        if not str(learned.metadata.get("feature_schema_hash") or ""):
+            raise ValueError("frame sequence refiner checkpoint missing feature_schema_hash")
+        self.learned = learned
+
+    def signature(self) -> dict:
+        signature = self.learned.signature()
+        signature["runtime_adapter"] = "frame_sequence_v1"
+        return signature
+
+    @property
+    def feature_names(self) -> tuple[str, ...]:
+        return self.learned.feature_names
+
+    @property
+    def feature_schema_hash(self) -> str:
+        return str(self.learned.metadata["feature_schema_hash"])
+
+    def decide_sequence(self, features: Sequence[Sequence[float]]) -> list[BoundaryDecision]:
+        if not features:
+            return []
+        array = validate_sequence_features(
+            features,
+            feature_names=self.learned.feature_names,
+        )
+        tensor = torch.tensor(array, dtype=torch.float32)
+        mean = torch.tensor(self.learned.feature_mean, dtype=torch.float32)
+        std = torch.tensor(self.learned.feature_std, dtype=torch.float32).clamp_min(1e-6)
+        tensor = ((tensor - mean) / std).unsqueeze(0)
+        device = next(self.learned.model.parameters()).device
+        with torch.inference_mode():
+            logits = self.learned.model(tensor.to(device)).reshape(-1)
+            scores = torch.sigmoid(logits).detach().cpu().tolist()
+        return [
+            BoundaryDecision(
+                float(score) >= self.learned.threshold,
+                float(score),
+                "learned_sequence_merge" if float(score) >= self.learned.threshold else "learned_sequence_split",
+                source="frame_sequence_refiner",
+            )
+            for score in scores
+        ]
 
 
 def load_learned_refiner_checkpoint(
@@ -219,6 +297,21 @@ def load_learned_refiner_checkpoint(
     )
 
 
+def load_frame_sequence_refiner_checkpoint(
+    checkpoint_path: Path,
+    *,
+    threshold: float,
+    backbone_override: str | None = None,
+) -> FrameSequenceBoundaryRefiner:
+    return FrameSequenceBoundaryRefiner(
+        load_learned_refiner_checkpoint(
+            checkpoint_path,
+            threshold=threshold,
+            backbone_override=backbone_override,
+        )
+    )
+
+
 def build_learned_refiner_checkpoint(
     *,
     model: BoundarySequenceClassifier,
@@ -260,6 +353,14 @@ def load_boundary_refiner(
     backbone = normalize_boundary_backbone(backbone)
     path = Path(model_path).expanduser() if model_path else None
     if path is not None and str(path) and not path.exists():
+        if _is_default_refiner_checkpoint_path(Path(model_path)):
+            return HeuristicBoundaryRefiner(
+                merge_threshold=merge_threshold,
+                max_merge_gap_s=max_merge_gap_s,
+                target_core_s=target_core_s,
+                cut_score_threshold=cut_score_threshold,
+                valley_score_threshold=valley_score_threshold,
+            )
         raise FileNotFoundError(f"Boundary refiner checkpoint not found: {path}")
     if path is not None and path.exists():
         return load_learned_refiner_checkpoint(
@@ -274,6 +375,13 @@ def load_boundary_refiner(
         cut_score_threshold=cut_score_threshold,
         valley_score_threshold=valley_score_threshold,
     )
+
+
+def _is_default_refiner_checkpoint_path(path: Path) -> bool:
+    try:
+        return path.expanduser().resolve(strict=False) == DEFAULT_REFINER_CHECKPOINT_PATH.resolve(strict=False)
+    except Exception:
+        return str(path).replace("\\", "/").lstrip("./") == str(DEFAULT_REFINER_CHECKPOINT_PATH).replace("\\", "/")
 
 
 def refiner_input_to_features(

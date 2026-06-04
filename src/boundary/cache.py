@@ -38,6 +38,7 @@ _BOUNDARY_BACKEND_ENV_KEYS = (
     "SPEECH_BOUNDARY_JA_CHUNK_THRESHOLD_S",
     "SPEECH_BOUNDARY_JA_CUT_THRESHOLD",
     "SPEECH_BOUNDARY_JA_APPLY_CUT_TO_SPEECH",
+    "SPEECH_BOUNDARY_JA_EXPORT_SEQUENCE_FEATURES",
 )
 _BOUNDARY_ENV_KEYS = (
     "BOUNDARY_FEATURE_FRAME_HOP_S",
@@ -45,12 +46,17 @@ _BOUNDARY_ENV_KEYS = (
     "BOUNDARY_REFINER_MODEL_PATH",
     "BOUNDARY_REFINER_BACKBONE",
     "BOUNDARY_REFINER_THRESHOLD",
+    "BOUNDARY_FRAME_SEQUENCE_LEFT_CONTEXT_S",
+    "BOUNDARY_FRAME_SEQUENCE_RIGHT_CONTEXT_S",
+    "BOUNDARY_FRAME_SEQUENCE_MAX_PTM_DIMS",
+    "BOUNDARY_FRAME_SEQUENCE_INCLUDE_MFCC",
     "BOUNDARY_PLANNER_MAX_CHUNK_S",
     "BOUNDARY_PLANNER_TARGET_CHUNK_S",
     "BOUNDARY_PLANNER_MIN_CHUNK_S",
     "BOUNDARY_PLANNER_START_WEIGHT",
     "BOUNDARY_PLANNER_TARGET_PADDING_S",
     "BOUNDARY_PLANNER_MAX_SPLITS_PER_SEGMENT",
+    "BOUNDARY_PLANNER_SEQUENCE_BATCH_SIZE",
     "BOUNDARY_DROP_LOW_ENERGY_ENABLED",
     "BOUNDARY_DROP_LOW_ENERGY_MIN_DURATION_S",
     "BOUNDARY_DROP_LOW_ENERGY_RMS_DBFS",
@@ -301,6 +307,17 @@ def _packed_chunk_to_dict(chunk: PackedChunk) -> dict:
         ),
         "boundary_reason": chunk.boundary_reason,
         "boundary_source": chunk.boundary_source,
+        "boundary_decision_merge": chunk.boundary_decision_merge,
+        "boundary_merge_prob": (
+            None if chunk.boundary_merge_prob is None else float(chunk.boundary_merge_prob)
+        ),
+        "boundary_split_prob": (
+            None if chunk.boundary_split_prob is None else float(chunk.boundary_split_prob)
+        ),
+        "boundary_refine_delta_s": (
+            None if chunk.boundary_refine_delta_s is None else float(chunk.boundary_refine_delta_s)
+        ),
+        "boundary_decision_source": chunk.boundary_decision_source,
         "speech_segments": _segments_to_payload(chunk.speech_segments),
     }
 
@@ -337,6 +354,27 @@ def _packed_chunk_from_dict(item: Any) -> PackedChunk:
         ),
         boundary_reason=str(item.get("boundary_reason") or ""),
         boundary_source=str(item.get("boundary_source") or ""),
+        boundary_decision_merge=(
+            None
+            if item.get("boundary_decision_merge") is None
+            else bool(item.get("boundary_decision_merge"))
+        ),
+        boundary_merge_prob=(
+            None
+            if item.get("boundary_merge_prob") is None
+            else float(item.get("boundary_merge_prob"))
+        ),
+        boundary_split_prob=(
+            None
+            if item.get("boundary_split_prob") is None
+            else float(item.get("boundary_split_prob"))
+        ),
+        boundary_refine_delta_s=(
+            None
+            if item.get("boundary_refine_delta_s") is None
+            else float(item.get("boundary_refine_delta_s"))
+        ),
+        boundary_decision_source=str(item.get("boundary_decision_source") or ""),
     )
 
 

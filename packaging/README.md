@@ -17,8 +17,8 @@ It bundles:
 - the default ASR model `jaykwok/Qwen3-ASR-0.6B-JA-Anime-Galgame`
 - default workflow auxiliary models:
   - forced aligner `Qwen/Qwen3-ForcedAligner-0.6B`
-  - no extra SpeechBoundary-JA checkpoint by default; the default boundary path
-    uses the Qwen 0.6B SFT model as the frozen PTM feature source plus the
+  - `src/boundary/checkpoints/boundary_refiner.pt` if it exists; when this small
+    learned Boundary Refiner checkpoint is absent, the app falls back to the
     deterministic bootstrap refiner
 
 It does not bundle Microsoft Edge WebView2. Users still need the WebView2 runtime,
@@ -52,8 +52,9 @@ The default output is `dist/release-assets/JAVTrans-windows-x64.7z.001`,
 The script uses all logical CPU threads by default; override with `-Threads <n>`
 if you need to keep the machine responsive while compressing.
 
-Only the default ASR model, forced aligner, and runtime assets are bundled. Other
-ASR models remain download-on-demand into the executable folder's `models/`
-directory. If a learned Boundary Refiner checkpoint becomes the default later,
-publish it as a GitHub Release or Hugging Face artifact and document
-`BOUNDARY_REFINER_MODEL_PATH`; do not restore a source-tree checkpoint path.
+Only the default ASR model, forced aligner, runtime assets, and the optional
+small `src/boundary/checkpoints/boundary_refiner.pt` are bundled. Other ASR
+models remain download-on-demand into the executable folder's `models/`
+directory. Do not restore old `src/vad` checkpoint paths; if the Boundary Refiner
+checkpoint grows too large for source distribution, publish it as a GitHub
+Release or Hugging Face artifact instead.
