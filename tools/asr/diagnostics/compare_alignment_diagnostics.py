@@ -157,6 +157,15 @@ def summarize_diagnostics(label: str, diagnostics_dir: Path) -> dict[str, Any]:
         "fallback_type_counts": compact_counts(fallback_type_counts, total=chunk_count),
         "fallback_subtype_counts": compact_counts(fallback_subtype_counts, total=chunk_count),
         "failure_bucket_counts": compact_counts(failure_bucket_counts, total=chunk_count),
+        "sentinel_fallback_count": int(
+            summary.get("sentinel_fallback_count")
+            or sum(
+                1
+                for row in diagnostics
+                if str(row.get("fallback_type") or "").strip() not in {"", "none"}
+                and bool(row.get("sentinel_lines") or [])
+            )
+        ),
         "cases": summary.get("cases") or [],
     }
 
@@ -188,12 +197,8 @@ def build_delta_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 - int(baseline.get("fallback_chunk_count") or 0),
                 "failure_candidate_count_delta": int(row.get("failure_candidate_count") or 0)
                 - int(baseline.get("failure_candidate_count") or 0),
-                "vad_coarse_after_sentinel_delta": count_at(
-                    row,
-                    "fallback_subtype_counts",
-                    "vad_coarse_after_sentinel",
-                )
-                - count_at(baseline, "fallback_subtype_counts", "vad_coarse_after_sentinel"),
+                "sentinel_fallback_delta": int(row.get("sentinel_fallback_count") or 0)
+                - int(baseline.get("sentinel_fallback_count") or 0),
                 "nonlexical_text_delta": count_at(row, "fallback_subtype_counts", "nonlexical_text")
                 - count_at(baseline, "fallback_subtype_counts", "nonlexical_text"),
                 "align_text_empty_delta": count_at(row, "fallback_subtype_counts", "align_text_empty")
@@ -237,7 +242,7 @@ def build_markdown(rows: list[dict[str, Any]]) -> str:
                 "",
                 "## Delta vs First Run",
                 "",
-                "| label | chunks | forced | fallback | candidates | sentinel subtype | nonlexical | align-empty |",
+                "| label | chunks | forced | fallback | candidates | sentinel fallback | nonlexical | align-empty |",
                 "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
             ]
         )
@@ -250,7 +255,7 @@ def build_markdown(rows: list[dict[str, Any]]) -> str:
                     forced=row["forced_count_delta"],
                     fallback=row["fallback_chunk_count_delta"],
                     candidates=row["failure_candidate_count_delta"],
-                    sentinel=row["vad_coarse_after_sentinel_delta"],
+                    sentinel=row["sentinel_fallback_delta"],
                     nonlexical=row["nonlexical_text_delta"],
                     align_empty=row["align_text_empty_delta"],
                 )
@@ -301,7 +306,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--output-dir",
-        default="agents/temp/fusionvad-ja/asr-alignment-checkpoint-compare",
+        default="agents/temp/speech-boundary-ja/asr-alignment-checkpoint-compare",
         help="Output directory for checkpoint_comparison.json/jsonl/md.",
     )
     return parser.parse_args(argv)

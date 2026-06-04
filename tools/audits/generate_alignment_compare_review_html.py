@@ -157,7 +157,7 @@ def write_audit_index(*, audit_root: Path, latest_html: Path, title: str, summar
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>FusionVAD-JA 审计入口</title>
+<title>SpeechBoundary-JA 审计入口</title>
 <style>
 body {{
   margin: 0;
@@ -200,7 +200,7 @@ code {{
 </head>
 <body>
 <main>
-  <h1>FusionVAD-JA 审计入口</h1>
+  <h1>SpeechBoundary-JA 审计入口</h1>
 {entries_html}
   <p class="muted">
     {html.escape(latest_meta)}
@@ -240,10 +240,8 @@ def interval_overlap(a_start: float, a_end: float, b_start: float, b_end: float)
 
 
 def is_baseline_fallback_target(row: Mapping[str, Any]) -> bool:
-    return (
-        str(row.get("fallback_subtype") or "") == "vad_coarse_after_sentinel"
-        or str(row.get("failure_bucket") or "") == "vad_coarse_alignment"
-    )
+    fallback_type = str(row.get("fallback_type") or "")
+    return fallback_type not in {"", "none"}
 
 
 def normalized_row(row: Mapping[str, Any]) -> dict[str, Any]:
@@ -276,15 +274,15 @@ def outcome_for(candidate_rows: list[dict[str, Any]]) -> str:
     if not candidate_rows:
         return "no_match"
     qualities = {str(row.get("alignment_quality") or "") for row in candidate_rows}
-    subtypes = {str(row.get("fallback_subtype") or "") for row in candidate_rows}
+    fallback_types = {str(row.get("fallback_type") or "") for row in candidate_rows}
     has_forced = "forced" in qualities or "partial" in qualities
-    has_coarse = "vad_coarse" in qualities or "vad_coarse_after_sentinel" in subtypes
+    has_fallback = bool(fallback_types - {"", "none"})
     has_review = "drop_or_review" in qualities
-    if has_forced and not has_coarse:
+    if has_forced and not has_fallback:
         return "resolved"
-    if has_forced and has_coarse:
+    if has_forced and has_fallback:
         return "mixed"
-    if has_coarse:
+    if has_fallback:
         return "still_fallback"
     if has_review:
         return "review"
@@ -589,7 +587,7 @@ const ITEMS = {data_json};
 const BASELINE_SEGMENTS = {baseline_json};
 const CANDIDATE_SEGMENTS = {candidate_json};
 const SUMMARY = {summary_json};
-const STORAGE_KEY = "fusionvad-ja-alignment-compare-review:" + SUMMARY.dataset_id;
+const STORAGE_KEY = "speech-boundary-ja-alignment-compare-review:" + SUMMARY.dataset_id;
 const LABELS = [
   ["opt_in_better", "Opt-in 更好"],
   ["same", "差不多"],
@@ -830,7 +828,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--output-dir",
         default="agents/audits/alignment-compare-review",
     )
-    parser.add_argument("--title", default="FusionVAD-JA fallback 对比审计")
+    parser.add_argument("--title", default="SpeechBoundary-JA fallback 对比审计")
     parser.add_argument("--pad-s", type=float, default=1.0)
     parser.add_argument("--max-items", type=int)
     args = parser.parse_args(argv)

@@ -45,9 +45,9 @@ def audio_file(tmp_path):
 
 
 def _run_drop(audio_path, spans, *, enabled="1", min_duration="0.20", rms_dbfs="-40.0", monkeypatch):
-    monkeypatch.setenv("ASR_CHUNK_DROP_ENABLED", enabled)
-    monkeypatch.setenv("ASR_CHUNK_DROP_MIN_DURATION_S", min_duration)
-    monkeypatch.setenv("ASR_CHUNK_DROP_RMS_DBFS", rms_dbfs)
+    monkeypatch.setenv("BOUNDARY_DROP_LOW_ENERGY_ENABLED", enabled)
+    monkeypatch.setenv("BOUNDARY_DROP_LOW_ENERGY_MIN_DURATION_S", min_duration)
+    monkeypatch.setenv("BOUNDARY_DROP_LOW_ENERGY_RMS_DBFS", rms_dbfs)
 
     import importlib
     import asr.pipeline as pipeline
@@ -62,7 +62,7 @@ def _run_drop(audio_path, spans, *, enabled="1", min_duration="0.20", rms_dbfs="
 # --- Case A: gate disabled → all spans preserved ---
 def test_drop_disabled_keeps_all_spans(audio_file, monkeypatch, tmp_path):
     spans = [(0.0, 0.1), (0.1, 0.5), (0.5, 1.0)]
-    monkeypatch.setenv("ASR_CHUNK_DROP_ENABLED", "0")
+    monkeypatch.setenv("BOUNDARY_DROP_LOW_ENERGY_ENABLED", "0")
 
     import importlib
     import asr.pipeline as pl
@@ -73,15 +73,15 @@ def test_drop_disabled_keeps_all_spans(audio_file, monkeypatch, tmp_path):
     # are NOT dropped when we temporarily force it with small thresholds,
     # but here we just confirm the env flag is respected in _build_processing_spans
     # by checking the runtime config reader.
-    assert not pl._chunk_config()["drop_enabled"]
+    assert not pl._boundary_config()["drop_enabled"]
 
 
 # --- Case B: short silent span is dropped ---
 def test_drop_short_silent_span_is_dropped(audio_file, monkeypatch):
     """0.1s silence region → duration < 0.20 AND rms < -40 dBFS → dropped."""
-    monkeypatch.setenv("ASR_CHUNK_DROP_ENABLED", "1")
-    monkeypatch.setenv("ASR_CHUNK_DROP_MIN_DURATION_S", "0.20")
-    monkeypatch.setenv("ASR_CHUNK_DROP_RMS_DBFS", "-40.0")
+    monkeypatch.setenv("BOUNDARY_DROP_LOW_ENERGY_ENABLED", "1")
+    monkeypatch.setenv("BOUNDARY_DROP_LOW_ENERGY_MIN_DURATION_S", "0.20")
+    monkeypatch.setenv("BOUNDARY_DROP_LOW_ENERGY_RMS_DBFS", "-40.0")
 
     import importlib
     from asr import pipeline as pl
@@ -96,9 +96,9 @@ def test_drop_short_silent_span_is_dropped(audio_file, monkeypatch):
 # --- Case C: short span with signal is kept (AND logic) ---
 def test_drop_short_span_with_signal_is_kept(audio_file, monkeypatch):
     """0.15s of 440 Hz tone → duration < 0.20 but rms > -40 dBFS → kept."""
-    monkeypatch.setenv("ASR_CHUNK_DROP_ENABLED", "1")
-    monkeypatch.setenv("ASR_CHUNK_DROP_MIN_DURATION_S", "0.20")
-    monkeypatch.setenv("ASR_CHUNK_DROP_RMS_DBFS", "-40.0")
+    monkeypatch.setenv("BOUNDARY_DROP_LOW_ENERGY_ENABLED", "1")
+    monkeypatch.setenv("BOUNDARY_DROP_LOW_ENERGY_MIN_DURATION_S", "0.20")
+    monkeypatch.setenv("BOUNDARY_DROP_LOW_ENERGY_RMS_DBFS", "-40.0")
 
     import importlib
     from asr import pipeline as pl
@@ -113,9 +113,9 @@ def test_drop_short_span_with_signal_is_kept(audio_file, monkeypatch):
 # --- Case D: long silent span is kept (duration criterion not met) ---
 def test_drop_long_silent_span_is_kept(audio_file, monkeypatch):
     """0.5s silence → duration > 0.20 threshold → AND fails → kept."""
-    monkeypatch.setenv("ASR_CHUNK_DROP_ENABLED", "1")
-    monkeypatch.setenv("ASR_CHUNK_DROP_MIN_DURATION_S", "0.20")
-    monkeypatch.setenv("ASR_CHUNK_DROP_RMS_DBFS", "-40.0")
+    monkeypatch.setenv("BOUNDARY_DROP_LOW_ENERGY_ENABLED", "1")
+    monkeypatch.setenv("BOUNDARY_DROP_LOW_ENERGY_MIN_DURATION_S", "0.20")
+    monkeypatch.setenv("BOUNDARY_DROP_LOW_ENERGY_RMS_DBFS", "-40.0")
 
     import importlib
     from asr import pipeline as pl

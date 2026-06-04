@@ -5,13 +5,17 @@ import warnings
 from pathlib import Path
 from typing import Callable
 
-from audio.chunk_packer import PackedChunk, pack_vad_segments
+from audio.chunk_packer import PackedChunk, pack_speech_segments
+from boundary import load_boundary_refiner
+from boundary import cache as _boundary_cache_module
+from boundary.candidates import CANDIDATE_EXTRACTOR_VERSION
+from boundary.backbones import normalize_boundary_backbone
+from boundary.refiner import file_sha1 as _boundary_refiner_file_sha1
 from asr import checkpoint as _checkpoint_module
 from asr import chunking as _chunking_module
 from asr import qc_stage as _qc_stage_module
 from asr import transcribe as _transcribe_module
 from asr.qc import apply_adaptive_precision_filter
-from asr import vad_chunk_cache as _vad_chunk_cache_module
 from asr.backends import registry as _registry_module
 
 warnings.filterwarnings("ignore")
@@ -21,7 +25,7 @@ _chunking_module = importlib.reload(_chunking_module)
 _checkpoint_module = importlib.reload(_checkpoint_module)
 _transcribe_module = importlib.reload(_transcribe_module)
 _qc_stage_module = importlib.reload(_qc_stage_module)
-_vad_chunk_cache_module = importlib.reload(_vad_chunk_cache_module)
+_boundary_cache_module = importlib.reload(_boundary_cache_module)
 
 ASR_BACKEND = _registry_module.current_asr_backend()
 _ASR_WORKER_MODE = _registry_module.current_asr_worker_mode()
@@ -31,8 +35,8 @@ _VALID_ASR_WORKER_MODES = _registry_module._VALID_ASR_WORKER_MODES
 
 _ASR_CHUNK_ROOT = _chunking_module._ASR_CHUNK_ROOT
 _KEEP_ASR_CHUNKS = _chunking_module._KEEP_ASR_CHUNKS
-_LAST_VAD_SIGNATURE: dict = _chunking_module._LAST_VAD_SIGNATURE
-_LAST_VAD_CACHE_EVENT: dict | None = None
+_LAST_BOUNDARY_SIGNATURE: dict = _chunking_module._LAST_BOUNDARY_SIGNATURE
+_LAST_BOUNDARY_CACHE_EVENT: dict | None = None
 _ASR_SLIDING_CONTEXT_SEGS = _transcribe_module._ASR_SLIDING_CONTEXT_SEGS
 _ASR_CHECKPOINT_ENABLED = _transcribe_module._ASR_CHECKPOINT_ENABLED
 
@@ -48,120 +52,36 @@ def _env_int(name: str, default: str) -> int:
     return int(float(os.getenv(name, default)))
 
 
-def _chunk_config() -> dict:
+def _boundary_config() -> dict:
+    refiner_path = os.getenv("BOUNDARY_REFINER_MODEL_PATH", "").strip()
+    refiner_path_obj = Path(refiner_path).expanduser() if refiner_path else None
     return {
-        "packing_enabled": _env_bool("ASR_CHUNK_PACKING_ENABLED", "0"),
-        "pack_frame_hop_s": _env_float("ASR_CHUNK_PACK_FRAME_HOP_S", str(1.0 / 29.97)),
-        "pack_window_frames": _env_int("ASR_CHUNK_PACK_WINDOW_FRAMES", "899"),
-        "pack_reserve_frames": _env_int("ASR_CHUNK_PACK_RESERVE_FRAMES", "45"),
-        "pack_target_padding_frames": _env_int("ASR_CHUNK_PACK_TARGET_PADDING_FRAMES", "60"),
-        "pack_gap_merge_frames": _env_int("ASR_CHUNK_PACK_GAP_MERGE_FRAMES", "45"),
-        "pack_max_core_frames": _env_int("ASR_CHUNK_PACK_MAX_CORE_FRAMES", "0"),
-        "pre_asr_island_split_enabled": _env_bool("ASR_PRE_ASR_ISLAND_SPLIT_ENABLED", "0"),
-        "pre_asr_island_split_min_core_frames": _env_int(
-            "ASR_PRE_ASR_ISLAND_SPLIT_MIN_CORE_FRAMES", "420"
+        "feature_frame_hop_s": _env_float("BOUNDARY_FEATURE_FRAME_HOP_S", "0.02"),
+        "boundary_refiner_enabled": _env_bool("BOUNDARY_REFINER_ENABLED", "1"),
+        "boundary_refiner_model_path": refiner_path,
+        "boundary_refiner_model_sha1": (
+            _boundary_refiner_file_sha1(refiner_path_obj)
+            if refiner_path_obj is not None and refiner_path_obj.exists()
+            else ""
         ),
-        "pre_asr_island_split_min_gap_frames": _env_int(
-            "ASR_PRE_ASR_ISLAND_SPLIT_MIN_GAP_FRAMES", "18"
+        "boundary_refiner_backbone": normalize_boundary_backbone(
+            os.getenv("BOUNDARY_REFINER_BACKBONE", "transformers.Mamba2Model")
         ),
-        "pre_asr_island_split_min_island_frames": _env_int(
-            "ASR_PRE_ASR_ISLAND_SPLIT_MIN_ISLAND_FRAMES", "3"
+        "boundary_refiner_threshold": _env_float("BOUNDARY_REFINER_THRESHOLD", "0.5"),
+        "boundary_candidate_extractor_version": CANDIDATE_EXTRACTOR_VERSION,
+        "boundary_planner_max_chunk_s": _env_float("BOUNDARY_PLANNER_MAX_CHUNK_S", "30.0"),
+        "boundary_planner_target_chunk_s": _env_float("BOUNDARY_PLANNER_TARGET_CHUNK_S", "9.0"),
+        "boundary_planner_min_chunk_s": _env_float("BOUNDARY_PLANNER_MIN_CHUNK_S", "0.4"),
+        "boundary_planner_start_weight": _env_float("BOUNDARY_PLANNER_START_WEIGHT", "1.5"),
+        "boundary_planner_target_padding_s": _env_float("BOUNDARY_PLANNER_TARGET_PADDING_S", "2.0"),
+        "boundary_planner_max_splits_per_segment": _env_int(
+            "BOUNDARY_PLANNER_MAX_SPLITS_PER_SEGMENT", "16"
         ),
-        "pre_asr_island_split_max_children": _env_int(
-            "ASR_PRE_ASR_ISLAND_SPLIT_MAX_CHILDREN", "8"
-        ),
-        "pre_asr_valley_split_enabled": _env_bool("ASR_PRE_ASR_VALLEY_SPLIT_ENABLED", "0"),
-        "pre_asr_valley_split_min_core_frames": _env_int(
-            "ASR_PRE_ASR_VALLEY_SPLIT_MIN_CORE_FRAMES", "420"
-        ),
-        "pre_asr_valley_split_target_core_frames": _env_int(
-            "ASR_PRE_ASR_VALLEY_SPLIT_TARGET_CORE_FRAMES", "270"
-        ),
-        "pre_asr_valley_split_min_valley_frames": _env_int(
-            "ASR_PRE_ASR_VALLEY_SPLIT_MIN_VALLEY_FRAMES", "6"
-        ),
-        "pre_asr_valley_split_min_child_frames": _env_int(
-            "ASR_PRE_ASR_VALLEY_SPLIT_MIN_CHILD_FRAMES", "45"
-        ),
-        "pre_asr_valley_split_max_children": _env_int(
-            "ASR_PRE_ASR_VALLEY_SPLIT_MAX_CHILDREN", "8"
-        ),
-        "pre_asr_valley_split_threshold": _env_float(
-            "ASR_PRE_ASR_VALLEY_SPLIT_THRESHOLD", "0.20"
-        ),
-        "pre_asr_cut_split_enabled": _env_bool("ASR_PRE_ASR_CUT_SPLIT_ENABLED", "0"),
-        "pre_asr_cut_split_min_core_frames": _env_int(
-            "ASR_PRE_ASR_CUT_SPLIT_MIN_CORE_FRAMES", "420"
-        ),
-        "pre_asr_cut_split_target_core_frames": _env_int(
-            "ASR_PRE_ASR_CUT_SPLIT_TARGET_CORE_FRAMES", "270"
-        ),
-        "pre_asr_cut_split_min_cut_frames": _env_int(
-            "ASR_PRE_ASR_CUT_SPLIT_MIN_CUT_FRAMES", "3"
-        ),
-        "pre_asr_cut_split_min_child_frames": _env_int(
-            "ASR_PRE_ASR_CUT_SPLIT_MIN_CHILD_FRAMES", "45"
-        ),
-        "pre_asr_cut_split_max_children": _env_int(
-            "ASR_PRE_ASR_CUT_SPLIT_MAX_CHILDREN", "8"
-        ),
-        "pre_asr_cut_split_threshold": _env_float(
-            "ASR_PRE_ASR_CUT_SPLIT_THRESHOLD", "0.94"
-        ),
-        "pre_asr_drop_gap_split_enabled": _env_bool("ASR_PRE_ASR_DROP_GAP_SPLIT_ENABLED", "0"),
-        "pre_asr_drop_gap_split_min_parent_frames": _env_int(
-            "ASR_PRE_ASR_DROP_GAP_SPLIT_MIN_PARENT_FRAMES", "400"
-        ),
-        "pre_asr_drop_gap_split_min_gap_frames": _env_int(
-            "ASR_PRE_ASR_DROP_GAP_SPLIT_MIN_GAP_FRAMES", "3"
-        ),
-        "pre_asr_drop_gap_split_min_gap_s": _env_float(
-            "ASR_PRE_ASR_DROP_GAP_SPLIT_MIN_GAP_S", "0.60"
-        ),
-        "pre_asr_drop_gap_split_min_child_frames": _env_int(
-            "ASR_PRE_ASR_DROP_GAP_SPLIT_MIN_CHILD_FRAMES", "25"
-        ),
-        "pre_asr_drop_gap_split_max_children": _env_int(
-            "ASR_PRE_ASR_DROP_GAP_SPLIT_MAX_CHILDREN", "8"
-        ),
-        "pre_asr_drop_gap_split_threshold": _env_float(
-            "ASR_PRE_ASR_DROP_GAP_SPLIT_THRESHOLD", "0.80"
-        ),
-        "pre_asr_risk_split_enabled": _env_bool("ASR_PRE_ASR_RISK_SPLIT_ENABLED", "0"),
-        "pre_asr_risk_split_min_core_frames": _env_int(
-            "ASR_PRE_ASR_RISK_SPLIT_MIN_CORE_FRAMES", "420"
-        ),
-        "pre_asr_risk_split_target_core_frames": _env_int(
-            "ASR_PRE_ASR_RISK_SPLIT_TARGET_CORE_FRAMES", "270"
-        ),
-        "pre_asr_risk_split_safe_core_frames": _env_int(
-            "ASR_PRE_ASR_RISK_SPLIT_SAFE_CORE_FRAMES", "360"
-        ),
-        "pre_asr_risk_split_min_gap_frames": _env_int(
-            "ASR_PRE_ASR_RISK_SPLIT_MIN_GAP_FRAMES", "6"
-        ),
-        "pre_asr_risk_split_min_child_frames": _env_int(
-            "ASR_PRE_ASR_RISK_SPLIT_MIN_CHILD_FRAMES", "45"
-        ),
-        "pre_asr_risk_split_max_children": _env_int(
-            "ASR_PRE_ASR_RISK_SPLIT_MAX_CHILDREN", "8"
-        ),
-        "pre_asr_risk_split_threshold": _env_float(
-            "ASR_PRE_ASR_RISK_SPLIT_THRESHOLD", "1.0"
-        ),
-        "pre_asr_risk_split_continuous_threshold": _env_float(
-            "ASR_PRE_ASR_RISK_SPLIT_CONTINUOUS_THRESHOLD", "2.0"
-        ),
-        "pre_asr_risk_split_valley_threshold": _env_float(
-            "ASR_PRE_ASR_RISK_SPLIT_VALLEY_THRESHOLD", "0.20"
-        ),
-        "pre_asr_risk_split_cut_threshold": _env_float(
-            "ASR_PRE_ASR_RISK_SPLIT_CUT_THRESHOLD", "0.94"
-        ),
-        "drop_enabled": _env_bool("ASR_CHUNK_DROP_ENABLED", "0"),
-        "drop_min_duration_s": _env_float("ASR_CHUNK_DROP_MIN_DURATION_S", "0.20"),
-        "drop_rms_dbfs": _env_float("ASR_CHUNK_DROP_RMS_DBFS", "-40.0"),
+        "drop_enabled": _env_bool("BOUNDARY_DROP_LOW_ENERGY_ENABLED", "0"),
+        "drop_min_duration_s": _env_float("BOUNDARY_DROP_LOW_ENERGY_MIN_DURATION_S", "0.20"),
+        "drop_rms_dbfs": _env_float("BOUNDARY_DROP_LOW_ENERGY_RMS_DBFS", "-40.0"),
     }
+
 
 get_backend_label = _registry_module.get_backend_label
 _resolve_asr_backend = _registry_module._resolve_asr_backend
@@ -179,9 +99,6 @@ _get_wav_duration = _chunking_module._get_wav_duration
 _extract_wav_chunks = _chunking_module._extract_wav_chunks
 _chunk_duration = _chunking_module._chunk_duration
 _chunk_original_boundaries = _chunking_module._chunk_original_boundaries
-_can_merge_short_vad_chunks = _chunking_module._can_merge_short_vad_chunks
-_write_merged_vad_chunk = _chunking_module._write_merged_vad_chunk
-_merge_short_vad_chunks = _chunking_module._merge_short_vad_chunks
 
 ASRWorkerSystemError = _transcribe_module.ASRWorkerSystemError
 _strip_punctuation = _transcribe_module._strip_punctuation
@@ -238,21 +155,21 @@ _run_TRANSCRIPTION_qc = _qc_stage_module._run_TRANSCRIPTION_qc
 
 def _sync_checkpoint_state() -> None:
     _checkpoint_module._ASR_CHUNK_ROOT = _ASR_CHUNK_ROOT
-    _checkpoint_module._LAST_VAD_SIGNATURE = _LAST_VAD_SIGNATURE
+    _checkpoint_module._LAST_BOUNDARY_SIGNATURE = _LAST_BOUNDARY_SIGNATURE
 
 
 def _get_asr_generation_checkpoint_signature() -> dict:
     _sync_checkpoint_state()
     return _checkpoint_module._get_asr_runtime_signature(
-        last_vad_signature=_LAST_VAD_SIGNATURE,
+        last_boundary_signature=_LAST_BOUNDARY_SIGNATURE,
         sliding_context_segs=_ASR_SLIDING_CONTEXT_SEGS
     )
 
 
-def _get_asr_runtime_signature(last_vad_signature: dict | None = None) -> dict:
+def _get_asr_runtime_signature(last_boundary_signature: dict | None = None) -> dict:
     _sync_checkpoint_state()
     return _checkpoint_module._get_asr_runtime_signature(
-        last_vad_signature=_LAST_VAD_SIGNATURE if last_vad_signature is None else last_vad_signature,
+        last_boundary_signature=_LAST_BOUNDARY_SIGNATURE if last_boundary_signature is None else last_boundary_signature,
         sliding_context_segs=_ASR_SLIDING_CONTEXT_SEGS,
     )
 
@@ -261,7 +178,7 @@ def _get_asr_checkpoint_path(audio_path: str) -> Path:
     _sync_checkpoint_state()
     return _checkpoint_module._get_asr_checkpoint_path(
         audio_path,
-        last_vad_signature=_LAST_VAD_SIGNATURE,
+        last_boundary_signature=_LAST_BOUNDARY_SIGNATURE,
         chunk_root=_ASR_CHUNK_ROOT,
         sliding_context_segs=_ASR_SLIDING_CONTEXT_SEGS,
     )
@@ -271,7 +188,7 @@ def _chunk_checkpoint_signature(chunks: list[dict]) -> dict[str, dict[str, float
     _sync_checkpoint_state()
     return _checkpoint_module._chunk_checkpoint_signature(
         chunks,
-        last_vad_signature=_LAST_VAD_SIGNATURE,
+        last_boundary_signature=_LAST_BOUNDARY_SIGNATURE,
     )
 
 
@@ -287,7 +204,7 @@ def _load_asr_checkpoint(
         checkpoint_source,
         chunks,
         run_id=run_id,
-        last_vad_signature=_LAST_VAD_SIGNATURE,
+        last_boundary_signature=_LAST_BOUNDARY_SIGNATURE,
         checkpoint_enabled=_ASR_CHECKPOINT_ENABLED,
     )
 
@@ -306,7 +223,7 @@ def _save_asr_checkpoint(
         chunks,
         text_results_by_index,
         run_id=run_id,
-        last_vad_signature=_LAST_VAD_SIGNATURE,
+        last_boundary_signature=_LAST_BOUNDARY_SIGNATURE,
         checkpoint_enabled=_ASR_CHECKPOINT_ENABLED,
     )
 
@@ -327,7 +244,7 @@ def _drop_short_low_energy_spans(
     """Drop spans where duration < threshold AND RMS energy < threshold (both must hold)."""
     from audio.audio_metrics import compute_rms_dbfs
 
-    cfg = _chunk_config()
+    cfg = _boundary_config()
     kept = []
     dropped = 0
     for span in spans:
@@ -349,16 +266,16 @@ def _drop_short_low_energy_spans(
     return kept
 
 
-def _set_last_vad_signature(signature: dict) -> None:
-    global _LAST_VAD_SIGNATURE
-    _LAST_VAD_SIGNATURE = dict(signature)
-    _chunking_module._LAST_VAD_SIGNATURE = _LAST_VAD_SIGNATURE
+def _set_last_boundary_signature(signature: dict) -> None:
+    global _LAST_BOUNDARY_SIGNATURE
+    _LAST_BOUNDARY_SIGNATURE = dict(signature)
+    _chunking_module._LAST_BOUNDARY_SIGNATURE = _LAST_BOUNDARY_SIGNATURE
     _sync_checkpoint_state()
 
 
-def _set_last_vad_cache_event(event: dict | None) -> None:
-    global _LAST_VAD_CACHE_EVENT
-    _LAST_VAD_CACHE_EVENT = dict(event) if isinstance(event, dict) else None
+def _set_last_boundary_cache_event(event: dict | None) -> None:
+    global _LAST_BOUNDARY_CACHE_EVENT
+    _LAST_BOUNDARY_CACHE_EVENT = dict(event) if isinstance(event, dict) else None
 
 
 def _display_cache_path(path: str) -> str:
@@ -368,348 +285,140 @@ def _display_cache_path(path: str) -> str:
         return str(path)
 
 
-def _vad_cache_log_entry(event: dict | None) -> str | None:
+def _boundary_cache_log_entry(event: dict | None) -> str | None:
     if not event:
         return None
     status = str(event.get("status") or "")
     path = _display_cache_path(str(event.get("path") or ""))
     digest = str(event.get("digest") or "")
     if status == "hit":
-        return f"VAD chunk cache hit: path={path} digest={digest}"
+        return f"Boundary cache hit: path={path} digest={digest}"
     if status == "miss":
-        return f"VAD chunk cache saved: path={path} digest={digest}"
+        return f"Boundary cache saved: path={path} digest={digest}"
     return None
 
 
 def _build_processing_spans(
     audio_path: str,
 ) -> list[tuple[float, float]] | list[PackedChunk]:
-    cfg = _chunk_config()
-    from vad import get_vad_backend
+    cfg = _boundary_config()
+    from boundary import get_boundary_backend
 
-    _set_last_vad_cache_event(None)
-    vad = get_vad_backend()
-    vad_signature = vad.signature()
-    cached = _vad_chunk_cache_module.load_processing_spans(
+    _set_last_boundary_cache_event(None)
+    boundary_backend = get_boundary_backend()
+    boundary_signature = boundary_backend.signature()
+    cached = _boundary_cache_module.load_processing_spans(
         audio_path,
-        vad_signature=vad_signature,
-        chunk_config=cfg,
+        boundary_signature=boundary_signature,
+        boundary_config=cfg,
     )
     if cached is not None:
-        spans, runtime_vad_signature, event = cached
-        _set_last_vad_signature(runtime_vad_signature)
+        spans, runtime_boundary_signature, event = cached
+        _set_last_boundary_signature(runtime_boundary_signature)
         _pipeline_logger.info(
-            "[vad-cache] hit path=%s digest=%s",
+            "[boundary-cache] hit path=%s digest=%s",
             event["path"],
             event["digest"],
         )
-        _set_last_vad_cache_event(event)
+        _set_last_boundary_cache_event(event)
         return spans
 
-    if cfg["packing_enabled"]:
-        result = vad.segment(audio_path)
-        allow_empty_vad = bool(result.parameters.get("allow_empty"))
-        frame_scores = result.parameters.get("frame_scores")
-        cut_frame_scores = result.parameters.get("cut_frame_scores")
-        drop_gap_frame_scores = result.parameters.get("drop_gap_frame_scores")
-        score_frame_hop_s = result.parameters.get("frame_hop_s")
-        result_parameters = {
-            key: value
-            for key, value in result.parameters.items()
-            if key not in {"frame_scores", "cut_frame_scores", "drop_gap_frame_scores"}
-        }
-        runtime_vad_signature = {
-            **result_parameters,
-            "chunk_packing": {
-                "enabled": True,
-                "frame_hop_s": cfg["pack_frame_hop_s"],
-                "score_frame_hop_s": score_frame_hop_s,
-                "window_frames": cfg["pack_window_frames"],
-                "reserve_frames": cfg["pack_reserve_frames"],
-                "target_padding_frames": cfg["pack_target_padding_frames"],
-                "gap_merge_frames": cfg["pack_gap_merge_frames"],
-                "max_core_frames": cfg["pack_max_core_frames"],
-                "pre_asr_island_split": {
-                    "enabled": cfg["pre_asr_island_split_enabled"],
-                    "policy": "r15_pre_asr_island_v1",
-                    "min_core_frames": cfg["pre_asr_island_split_min_core_frames"],
-                    "min_gap_frames": cfg["pre_asr_island_split_min_gap_frames"],
-                    "min_island_frames": cfg["pre_asr_island_split_min_island_frames"],
-                    "max_children": cfg["pre_asr_island_split_max_children"],
-                },
-                "pre_asr_valley_split": {
-                    "enabled": cfg["pre_asr_valley_split_enabled"],
-                    "policy": "r16_pre_asr_valley_v1",
-                    "min_core_frames": cfg["pre_asr_valley_split_min_core_frames"],
-                    "target_core_frames": cfg[
-                        "pre_asr_valley_split_target_core_frames"
-                    ],
-                    "min_valley_frames": cfg[
-                        "pre_asr_valley_split_min_valley_frames"
-                    ],
-                    "min_child_frames": cfg[
-                        "pre_asr_valley_split_min_child_frames"
-                    ],
-                    "max_children": cfg["pre_asr_valley_split_max_children"],
-                    "threshold": cfg["pre_asr_valley_split_threshold"],
-                },
-                "pre_asr_cut_split": {
-                    "enabled": cfg["pre_asr_cut_split_enabled"],
-                    "policy": "r17_pre_asr_cut_v1",
-                    "min_core_frames": cfg["pre_asr_cut_split_min_core_frames"],
-                    "target_core_frames": cfg["pre_asr_cut_split_target_core_frames"],
-                    "min_cut_frames": cfg["pre_asr_cut_split_min_cut_frames"],
-                    "min_child_frames": cfg["pre_asr_cut_split_min_child_frames"],
-                    "max_children": cfg["pre_asr_cut_split_max_children"],
-                    "threshold": cfg["pre_asr_cut_split_threshold"],
-                },
-                "pre_asr_drop_gap_split": {
-                    "enabled": cfg["pre_asr_drop_gap_split_enabled"],
-                    "policy": "r21_pre_asr_drop_gap_v1",
-                    "min_parent_frames": cfg[
-                        "pre_asr_drop_gap_split_min_parent_frames"
-                    ],
-                    "min_gap_frames": cfg[
-                        "pre_asr_drop_gap_split_min_gap_frames"
-                    ],
-                    "min_gap_s": cfg["pre_asr_drop_gap_split_min_gap_s"],
-                    "min_child_frames": cfg[
-                        "pre_asr_drop_gap_split_min_child_frames"
-                    ],
-                    "max_children": cfg["pre_asr_drop_gap_split_max_children"],
-                    "threshold": cfg["pre_asr_drop_gap_split_threshold"],
-                },
-                "pre_asr_risk_split": {
-                    "enabled": cfg["pre_asr_risk_split_enabled"],
-                    "policy": "r18_pre_asr_risk_v1",
-                    "min_core_frames": cfg["pre_asr_risk_split_min_core_frames"],
-                    "target_core_frames": cfg[
-                        "pre_asr_risk_split_target_core_frames"
-                    ],
-                    "safe_core_frames": cfg["pre_asr_risk_split_safe_core_frames"],
-                    "min_gap_frames": cfg["pre_asr_risk_split_min_gap_frames"],
-                    "min_child_frames": cfg["pre_asr_risk_split_min_child_frames"],
-                    "max_children": cfg["pre_asr_risk_split_max_children"],
-                    "risk_threshold": cfg["pre_asr_risk_split_threshold"],
-                    "continuous_threshold": cfg[
-                        "pre_asr_risk_split_continuous_threshold"
-                    ],
-                    "valley_threshold": cfg[
-                        "pre_asr_risk_split_valley_threshold"
-                    ],
-                    "cut_threshold": cfg["pre_asr_risk_split_cut_threshold"],
-                },
-            },
-        }
-        segments = result.segments
-        if not segments:
-            _set_last_vad_signature(runtime_vad_signature)
-            if allow_empty_vad:
-                event = _vad_chunk_cache_module.save_processing_spans(
-                    audio_path,
-                    vad_signature=vad_signature,
-                    chunk_config=cfg,
-                    processing_spans=[],
-                    runtime_vad_signature=runtime_vad_signature,
-                    vad_segments=result.segments,
-                    vad_groups=result.groups,
-                )
-                if event is not None:
-                    _pipeline_logger.info(
-                        "[vad-cache] saved path=%s digest=%s",
-                        event["path"],
-                        event["digest"],
-                    )
-                    _set_last_vad_cache_event(event)
-                return []
-            event = _vad_chunk_cache_module.save_processing_spans(
-                audio_path,
-                vad_signature=vad_signature,
-                chunk_config=cfg,
-                processing_spans=[],
-                runtime_vad_signature=runtime_vad_signature,
-                vad_segments=result.segments,
-                vad_groups=result.groups,
-            )
-            if event is not None:
-                _pipeline_logger.info(
-                    "[vad-cache] saved path=%s digest=%s",
-                    event["path"],
-                    event["digest"],
-                )
-                _set_last_vad_cache_event(event)
-            return []
-        _set_last_vad_signature(runtime_vad_signature)
-        if cfg["drop_enabled"]:
-            segments = _drop_short_low_energy_spans(audio_path, segments)
-        packed = pack_vad_segments(
-            segments,
-            frame_hop_s=cfg["pack_frame_hop_s"],
-            window_frames=cfg["pack_window_frames"],
-            reserve_frames=cfg["pack_reserve_frames"],
-            target_padding_frames=cfg["pack_target_padding_frames"],
-            gap_merge_frames=cfg["pack_gap_merge_frames"],
-            max_core_frames=cfg["pack_max_core_frames"],
-            pre_asr_island_split_enabled=cfg["pre_asr_island_split_enabled"],
-            pre_asr_island_split_min_core_frames=cfg[
-                "pre_asr_island_split_min_core_frames"
-            ],
-            pre_asr_island_split_min_gap_frames=cfg[
-                "pre_asr_island_split_min_gap_frames"
-            ],
-            pre_asr_island_split_min_island_frames=cfg[
-                "pre_asr_island_split_min_island_frames"
-            ],
-            pre_asr_island_split_max_children=cfg[
-                "pre_asr_island_split_max_children"
-            ],
-            pre_asr_valley_split_enabled=cfg["pre_asr_valley_split_enabled"],
-            pre_asr_valley_split_min_core_frames=cfg[
-                "pre_asr_valley_split_min_core_frames"
-            ],
-            pre_asr_valley_split_target_core_frames=cfg[
-                "pre_asr_valley_split_target_core_frames"
-            ],
-            pre_asr_valley_split_min_valley_frames=cfg[
-                "pre_asr_valley_split_min_valley_frames"
-            ],
-            pre_asr_valley_split_min_child_frames=cfg[
-                "pre_asr_valley_split_min_child_frames"
-            ],
-            pre_asr_valley_split_max_children=cfg[
-                "pre_asr_valley_split_max_children"
-            ],
-            pre_asr_valley_split_threshold=cfg["pre_asr_valley_split_threshold"],
-            frame_scores=frame_scores,
-            score_frame_hop_s=score_frame_hop_s,
-            pre_asr_cut_split_enabled=cfg["pre_asr_cut_split_enabled"],
-            pre_asr_cut_split_min_core_frames=cfg[
-                "pre_asr_cut_split_min_core_frames"
-            ],
-            pre_asr_cut_split_target_core_frames=cfg[
-                "pre_asr_cut_split_target_core_frames"
-            ],
-            pre_asr_cut_split_min_cut_frames=cfg[
-                "pre_asr_cut_split_min_cut_frames"
-            ],
-            pre_asr_cut_split_min_child_frames=cfg[
-                "pre_asr_cut_split_min_child_frames"
-            ],
-            pre_asr_cut_split_max_children=cfg[
-                "pre_asr_cut_split_max_children"
-            ],
-            pre_asr_cut_split_threshold=cfg["pre_asr_cut_split_threshold"],
-            cut_frame_scores=cut_frame_scores,
-            pre_asr_drop_gap_split_enabled=cfg["pre_asr_drop_gap_split_enabled"],
-            pre_asr_drop_gap_split_min_parent_frames=cfg[
-                "pre_asr_drop_gap_split_min_parent_frames"
-            ],
-            pre_asr_drop_gap_split_min_gap_frames=cfg[
-                "pre_asr_drop_gap_split_min_gap_frames"
-            ],
-            pre_asr_drop_gap_split_min_gap_s=cfg[
-                "pre_asr_drop_gap_split_min_gap_s"
-            ],
-            pre_asr_drop_gap_split_min_child_frames=cfg[
-                "pre_asr_drop_gap_split_min_child_frames"
-            ],
-            pre_asr_drop_gap_split_max_children=cfg[
-                "pre_asr_drop_gap_split_max_children"
-            ],
-            pre_asr_drop_gap_split_threshold=cfg[
-                "pre_asr_drop_gap_split_threshold"
-            ],
-            drop_gap_frame_scores=drop_gap_frame_scores,
-            pre_asr_risk_split_enabled=cfg["pre_asr_risk_split_enabled"],
-            pre_asr_risk_split_min_core_frames=cfg[
-                "pre_asr_risk_split_min_core_frames"
-            ],
-            pre_asr_risk_split_target_core_frames=cfg[
-                "pre_asr_risk_split_target_core_frames"
-            ],
-            pre_asr_risk_split_safe_core_frames=cfg[
-                "pre_asr_risk_split_safe_core_frames"
-            ],
-            pre_asr_risk_split_min_gap_frames=cfg[
-                "pre_asr_risk_split_min_gap_frames"
-            ],
-            pre_asr_risk_split_min_child_frames=cfg[
-                "pre_asr_risk_split_min_child_frames"
-            ],
-            pre_asr_risk_split_max_children=cfg[
-                "pre_asr_risk_split_max_children"
-            ],
-            pre_asr_risk_split_threshold=cfg["pre_asr_risk_split_threshold"],
-            pre_asr_risk_split_continuous_threshold=cfg[
-                "pre_asr_risk_split_continuous_threshold"
-            ],
-            pre_asr_risk_split_valley_threshold=cfg[
-                "pre_asr_risk_split_valley_threshold"
-            ],
-            pre_asr_risk_split_cut_threshold=cfg[
-                "pre_asr_risk_split_cut_threshold"
-            ],
-        )
-        event = _vad_chunk_cache_module.save_processing_spans(
-            audio_path,
-            vad_signature=vad_signature,
-            chunk_config=cfg,
-            processing_spans=packed,
-            runtime_vad_signature=runtime_vad_signature,
-            vad_segments=result.segments,
-            vad_groups=result.groups,
-        )
-        if event is not None:
-            _pipeline_logger.info(
-                "[vad-cache] saved path=%s digest=%s",
-                event["path"],
-                event["digest"],
-            )
-            _set_last_vad_cache_event(event)
-        return packed
-
-    result = vad.segment(audio_path)
-    allow_empty_vad = bool(result.parameters.get("allow_empty"))
-    runtime_vad_signature = {
+    result = boundary_backend.segment(audio_path)
+    frame_scores = result.parameters.get("frame_scores")
+    cut_frame_scores = result.parameters.get("cut_frame_scores")
+    score_frame_hop_s = result.parameters.get("frame_hop_s")
+    boundary_refiner = load_boundary_refiner(
+        enabled=cfg["boundary_refiner_enabled"],
+        model_path=cfg["boundary_refiner_model_path"],
+        backbone=cfg["boundary_refiner_backbone"],
+        merge_threshold=cfg["boundary_refiner_threshold"],
+        max_merge_gap_s=None,
+        target_core_s=cfg["boundary_planner_target_chunk_s"],
+    )
+    result_parameters = {
         key: value
         for key, value in result.parameters.items()
-        if key not in {"frame_scores", "cut_frame_scores", "drop_gap_frame_scores"}
+        if key not in {"frame_scores", "cut_frame_scores"}
     }
-    spans = [(group[0].start, group[-1].end) for group in result.groups]
-    _set_last_vad_signature(runtime_vad_signature)
-    if not spans and not allow_empty_vad:
-        event = _vad_chunk_cache_module.save_processing_spans(
+    runtime_boundary_signature = {
+        **result_parameters,
+        "boundary_pipeline": {
+            "version": 1,
+            "feature_frame_hop_s": cfg["feature_frame_hop_s"],
+            "score_frame_hop_s": score_frame_hop_s,
+            "feature_sources": {
+                "speech_scores": frame_scores is not None,
+                "cut_scores": cut_frame_scores is not None,
+            },
+            "boundary_refiner": (
+                boundary_refiner.signature() if boundary_refiner is not None else None
+            ),
+            "boundary_planner": {
+                "candidate_extractor_version": cfg[
+                    "boundary_candidate_extractor_version"
+                ],
+                "max_chunk_s": cfg["boundary_planner_max_chunk_s"],
+                "target_chunk_s": cfg["boundary_planner_target_chunk_s"],
+                "min_chunk_s": cfg["boundary_planner_min_chunk_s"],
+                "start_weight": cfg["boundary_planner_start_weight"],
+                "target_padding_s": cfg["boundary_planner_target_padding_s"],
+                "max_splits_per_segment": cfg["boundary_planner_max_splits_per_segment"],
+            },
+        },
+    }
+    segments = result.segments
+    _set_last_boundary_signature(runtime_boundary_signature)
+    if not segments:
+        event = _boundary_cache_module.save_processing_spans(
             audio_path,
-            vad_signature=vad_signature,
-            chunk_config=cfg,
+            boundary_signature=boundary_signature,
+            boundary_config=cfg,
             processing_spans=[],
-            runtime_vad_signature=runtime_vad_signature,
+            runtime_boundary_signature=runtime_boundary_signature,
+            speech_segments=result.segments,
+            speech_groups=result.groups,
         )
         if event is not None:
             _pipeline_logger.info(
-                "[vad-cache] saved path=%s digest=%s",
+                "[boundary-cache] saved path=%s digest=%s",
                 event["path"],
                 event["digest"],
             )
-            _set_last_vad_cache_event(event)
+            _set_last_boundary_cache_event(event)
         return []
     if cfg["drop_enabled"]:
-        spans = _drop_short_low_energy_spans(audio_path, spans)
-    event = _vad_chunk_cache_module.save_processing_spans(
+        segments = _drop_short_low_energy_spans(audio_path, segments)
+    packed = pack_speech_segments(
+        segments,
+        frame_hop_s=cfg["feature_frame_hop_s"],
+        max_chunk_s=cfg["boundary_planner_max_chunk_s"],
+        target_chunk_s=cfg["boundary_planner_target_chunk_s"],
+        min_chunk_s=cfg["boundary_planner_min_chunk_s"],
+        target_padding_s=cfg["boundary_planner_target_padding_s"],
+        start_weight=cfg["boundary_planner_start_weight"],
+        frame_scores=frame_scores,
+        score_frame_hop_s=score_frame_hop_s,
+        cut_frame_scores=cut_frame_scores,
+        boundary_refiner=boundary_refiner,
+        max_splits_per_segment=cfg["boundary_planner_max_splits_per_segment"],
+    )
+    event = _boundary_cache_module.save_processing_spans(
         audio_path,
-        vad_signature=vad_signature,
-        chunk_config=cfg,
-        processing_spans=spans,
-        runtime_vad_signature=runtime_vad_signature,
+        boundary_signature=boundary_signature,
+        boundary_config=cfg,
+        processing_spans=packed,
+        runtime_boundary_signature=runtime_boundary_signature,
+        speech_segments=result.segments,
+        speech_groups=result.groups,
     )
     if event is not None:
         _pipeline_logger.info(
-            "[vad-cache] saved path=%s digest=%s",
+            "[boundary-cache] saved path=%s digest=%s",
             event["path"],
             event["digest"],
         )
-        _set_last_vad_cache_event(event)
-    return spans
+        _set_last_boundary_cache_event(event)
+    return packed
 
 
 def _span_boundaries(
@@ -726,40 +435,34 @@ def _annotate_packed_chunks(
     spans: list[tuple[float, float]] | list[PackedChunk],
     log: list[str],
 ) -> None:
-    if not _chunk_config()["packing_enabled"]:
-        return
-
     packed_spans = [span for span in spans if isinstance(span, PackedChunk)]
-    for idx, (chunk, packed) in enumerate(zip(chunk_infos, packed_spans)):
-        chunk["vad_seg_count"] = len(packed.vad_segments)
-        chunk["vad_left_padding_s"] = packed.left_padding_s
-        chunk["vad_right_padding_s"] = packed.right_padding_s
-        chunk["vad_split_reason"] = packed.split_reason
-        chunk["vad_parent_chunk_id"] = packed.parent_chunk_id
-        chunk["vad_island_id"] = packed.island_id
-        chunk["vad_island_count"] = packed.island_count
-        chunk["vad_internal_gap_count"] = packed.internal_gap_count
-        chunk["vad_internal_gap_max_s"] = packed.internal_gap_max_s
-        chunk["vad_split_policy"] = packed.split_policy
-        chunk["vad_valley_split_count"] = packed.valley_split_count
-        chunk["vad_valley_score_min"] = packed.valley_score_min
-        chunk["vad_cut_split_count"] = packed.cut_split_count
-        chunk["vad_cut_score_max"] = packed.cut_score_max
-        chunk["vad_drop_gap_split_count"] = packed.drop_gap_split_count
-        chunk["vad_drop_gap_score_max"] = packed.drop_gap_score_max
-        chunk["vad_risk_split_count"] = packed.risk_split_count
-        chunk["vad_risk_score"] = packed.risk_score
-        chunk["vad_risk_reasons"] = list(packed.risk_reasons)
+    if not packed_spans:
+        return
+    for idx, chunk in enumerate(chunk_infos):
+        span_index = int(chunk.get("source_span_index", idx))
+        if span_index < 0 or span_index >= len(packed_spans):
+            continue
+        packed = packed_spans[span_index]
+        chunk["speech_segment_count"] = len(packed.speech_segments)
+        chunk["speech_left_padding_s"] = packed.left_padding_s
+        chunk["speech_right_padding_s"] = packed.right_padding_s
+        chunk["boundary_split_reason"] = packed.split_reason
+        chunk["boundary_parent_chunk_id"] = packed.parent_chunk_id
+        chunk["speech_island_id"] = packed.island_id
+        chunk["speech_island_count"] = packed.island_count
+        chunk["speech_internal_gap_count"] = packed.internal_gap_count
+        chunk["speech_internal_gap_max_s"] = packed.internal_gap_max_s
+        chunk["boundary_score"] = packed.boundary_score
+        chunk["boundary_reason"] = packed.boundary_reason
+        chunk["boundary_source"] = packed.boundary_source
         log.append(
-            "[chunk] idx={idx} dur={duration:.1f} vad_seg_count={count} "
+            "[chunk] idx={idx} dur={duration:.1f} speech_segment_count={count} "
             "pad=({left:.2f},{right:.2f}) reason={reason} "
             "parent={parent} island={island}/{islands} gap_max={gap:.2f} "
-            "valley_splits={valley_splits} cut_splits={cut_splits} "
-            "drop_gap_splits={drop_gap_splits} risk_splits={risk_splits} "
-            "risk={risk_score}".format(
+            "boundary={boundary_reason} source={boundary_source} score={boundary_score}".format(
                 idx=idx,
                 duration=packed.duration,
-                count=len(packed.vad_segments),
+                count=len(packed.speech_segments),
                 left=packed.left_padding_s,
                 right=packed.right_padding_s,
                 reason=packed.split_reason,
@@ -767,11 +470,9 @@ def _annotate_packed_chunks(
                 island=packed.island_id,
                 islands=packed.island_count,
                 gap=packed.internal_gap_max_s,
-                valley_splits=packed.valley_split_count,
-                cut_splits=packed.cut_split_count,
-                drop_gap_splits=packed.drop_gap_split_count,
-                risk_splits=packed.risk_split_count,
-                risk_score=packed.risk_score,
+                boundary_reason=packed.boundary_reason,
+                boundary_source=packed.boundary_source,
+                boundary_score=packed.boundary_score,
             )
         )
 
@@ -795,7 +496,7 @@ def _alignment_fallback_count_from_log(log: list[str]) -> int:
         "Alignment 快速回退",
         "Alignment 降级失败",
         "Alignment 降级后仍异常",
-        "VAD 回退",
+        "边界回退",
         "等比分配时间戳",
     )
     chunk_ids: set[str] = set()
@@ -831,19 +532,13 @@ def _transcribe_and_align_local(
         _notify("分析静音并切分音频...")
         split_started = time.perf_counter()
         chunk_spans = _build_processing_spans(audio_path)
-        cache_log_entry = _vad_cache_log_entry(_LAST_VAD_CACHE_EVENT)
+        cache_log_entry = _boundary_cache_log_entry(_LAST_BOUNDARY_CACHE_EVENT)
         if cache_log_entry:
             log.append(cache_log_entry)
         chunk_dir, chunk_infos = _extract_wav_chunks(
             audio_path, _span_boundaries(chunk_spans), on_stage=on_stage
         )
         _annotate_packed_chunks(chunk_infos, chunk_spans, log)
-        if not _chunk_config()["packing_enabled"]:
-            chunk_infos = _merge_short_vad_chunks(
-                chunk_dir,
-                chunk_infos,
-                on_stage=on_stage,
-            )
         split_elapsed = time.perf_counter() - split_started
         log.append(f"切分完成：共 {len(chunk_infos)} 个处理块")
         _record_stage_timing(log, timings, "split_s", "静音分析与切块", split_elapsed)
@@ -868,7 +563,7 @@ def _transcribe_and_align_local(
                 "ASR与Alignment总计",
                 total_elapsed,
             )
-            log.append("VAD 未检测到可处理语音块，跳过 ASR")
+            log.append("边界系统未检测到可处理语音块，跳过 ASR")
             details = {
                 "backend": get_backend_label(),
                 "audio_path": audio_path,
@@ -893,8 +588,8 @@ def _transcribe_and_align_local(
                 "stage_timings": timings,
                 "word_count": 0,
                 "segment_count": 0,
-                "vad_no_speech": True,
-                "vad_signature": dict(_LAST_VAD_SIGNATURE),
+                "boundary_no_speech": True,
+                "boundary_signature": dict(_LAST_BOUNDARY_SIGNATURE),
             }
             return [], log, details
 
@@ -1046,7 +741,7 @@ def _transcribe_and_align_local(
                             "ASR 原始文本长度",
                             "Alignment 模式",
                             "Alignment 异常",
-                            "Alignment VAD 回退",
+                            "Alignment 边界回退",
                             "Alignment speech-island",
                             "speech-island",
                         )

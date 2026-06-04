@@ -350,7 +350,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--timings", default="", help="timings.json path with asr_qc")
     parser.add_argument(
         "--output-dir",
-        default="agents/temp/fusionvad-ja/subtitle-postprocess-replay",
+        default="agents/temp/speech-boundary-ja/subtitle-postprocess-replay",
     )
     parser.add_argument("--video-fps", type=float, default=30000 / 1001)
     args = parser.parse_args(argv)

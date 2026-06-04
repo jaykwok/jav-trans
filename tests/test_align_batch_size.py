@@ -23,10 +23,11 @@ class _RecordingAligner:
         ]
 
 
-def test_forced_align_words_batch_uses_align_batch_size(monkeypatch):
+def test_forced_align_words_batch_uses_long_chunk_batch_size(monkeypatch):
     aligner = _RecordingAligner()
     backend = local_backend.LocalAsrBackend("cpu")
     backend.align_batch_size = 2
+    monkeypatch.setattr(local_backend, "ALIGN_LONG_CHUNK_BATCH_SIZE", 2)
     monkeypatch.setattr(backend, "_ensure_forced_aligner", lambda on_stage=None: aligner)
     monkeypatch.setattr(local_backend, "_clear_cuda_cache", lambda _device: None)
 
@@ -49,11 +50,10 @@ def test_forced_align_words_batch_uses_align_batch_size(monkeypatch):
     ]
 
 
-def test_chunk_packing_forces_long_chunk_align_batch_size(monkeypatch):
+def test_forced_align_words_batch_can_force_single_item_batches(monkeypatch):
     aligner = _RecordingAligner()
     backend = local_backend.LocalAsrBackend("cpu")
     backend.align_batch_size = 4
-    monkeypatch.setattr(local_backend, "ASR_CHUNK_PACKING_ENABLED", True)
     monkeypatch.setattr(local_backend, "ALIGN_LONG_CHUNK_BATCH_SIZE", 1)
     monkeypatch.setattr(backend, "_ensure_forced_aligner", lambda on_stage=None: aligner)
     monkeypatch.setattr(local_backend, "_clear_cuda_cache", lambda _device: None)

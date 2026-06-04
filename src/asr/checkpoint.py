@@ -26,7 +26,7 @@ def _asr_generation_error_kind(kind: str) -> str:
     return "quarantined"
 
 
-_LAST_VAD_SIGNATURE: dict = {}
+_LAST_BOUNDARY_SIGNATURE: dict = {}
 _ASR_CHUNK_ROOT = Path(
     os.getenv("ASR_CHUNK_ROOT", Path("temp") / "chunks")
 ).resolve()
@@ -109,7 +109,7 @@ def _json_or_text(value: str) -> dict | str:
 
 def _get_asr_runtime_signature(
     *,
-    last_vad_signature: dict | None = None,
+    last_boundary_signature: dict | None = None,
     sliding_context_segs: int | None = None,
 ) -> dict:
     if sliding_context_segs is None:
@@ -117,7 +117,7 @@ def _get_asr_runtime_signature(
             sliding_context_segs = max(0, int(os.getenv("ASR_SLIDING_CONTEXT_SEGS", "2")))
         except (TypeError, ValueError):
             sliding_context_segs = 2
-    vad_signature = _LAST_VAD_SIGNATURE if last_vad_signature is None else last_vad_signature
+    boundary_signature = _LAST_BOUNDARY_SIGNATURE if last_boundary_signature is None else last_boundary_signature
     return {
         "version": 2,
         "backend": current_asr_backend(),
@@ -202,19 +202,19 @@ def _get_asr_runtime_signature(
             ),
             "qc_drop_uncertain": _env_lower("ASR_QC_DROP_UNCERTAIN", "0"),
         },
-        "vad": vad_signature if isinstance(vad_signature, dict) else {},
+        "boundary": boundary_signature if isinstance(boundary_signature, dict) else {},
     }
 
 
 def _get_asr_checkpoint_path(
     audio_path: str,
     *,
-    last_vad_signature: dict | None = None,
+    last_boundary_signature: dict | None = None,
     chunk_root: Path | str | None = None,
     sliding_context_segs: int | None = None,
 ) -> Path:
     runtime_signature = _get_asr_runtime_signature(
-        last_vad_signature=last_vad_signature,
+        last_boundary_signature=last_boundary_signature,
         sliding_context_segs=sliding_context_segs,
     )
     key = hashlib.sha1(
@@ -236,14 +236,14 @@ def _get_asr_checkpoint_source(chunks: list[dict], text_stage_label: str) -> str
 def _chunk_checkpoint_signature(
     chunks: list[dict],
     *,
-    last_vad_signature: dict | None = None,
+    last_boundary_signature: dict | None = None,
 ) -> dict[str, dict[str, float | str]]:
-    vad_signature = _LAST_VAD_SIGNATURE if last_vad_signature is None else last_vad_signature
+    boundary_signature = _LAST_BOUNDARY_SIGNATURE if last_boundary_signature is None else last_boundary_signature
     return {
         str(int(chunk["index"])): {
             "start": round(float(chunk.get("start", 0.0)), 3),
             "end": round(float(chunk.get("end", 0.0)), 3),
-            "vad_method": vad_signature.get("backend", "unknown"),
+            "boundary_method": boundary_signature.get("backend", "unknown"),
         }
         for chunk in chunks
     }
@@ -255,7 +255,7 @@ def _load_asr_checkpoint(
     chunks: list[dict],
     run_id: str | None = None,
     *,
-    last_vad_signature: dict | None = None,
+    last_boundary_signature: dict | None = None,
     checkpoint_enabled: bool | None = None,
 ) -> dict[int, dict]:
     if not _checkpoint_enabled(checkpoint_enabled) or not checkpoint_path.exists():
@@ -277,7 +277,7 @@ def _load_asr_checkpoint(
     chunk_by_index = {int(chunk["index"]): chunk for chunk in chunks}
     expected_signature = _chunk_checkpoint_signature(
         chunks,
-        last_vad_signature=last_vad_signature,
+        last_boundary_signature=last_boundary_signature,
     )
     saved_signature = payload.get("chunks", {})
     restored: dict[int, dict] = {}
@@ -296,9 +296,9 @@ def _load_asr_checkpoint(
             if isinstance(saved_signature, dict)
             else None
         )
-        if isinstance(saved_chunk_signature, dict) and "vad_method" not in saved_chunk_signature:
+        if isinstance(saved_chunk_signature, dict) and "boundary_method" not in saved_chunk_signature:
             print(
-                f"[WARN] ASR checkpoint resume: chunk {chunk_index} missing vad_method; skip stale checkpoint entry",
+                f"[WARN] ASR checkpoint resume: chunk {chunk_index} missing boundary_method; skip stale checkpoint entry",
                 file=sys.stderr,
             )
             continue
@@ -340,7 +340,7 @@ def _save_asr_checkpoint(
     results_by_index: dict[int, dict],
     run_id: str | None = None,
     *,
-    last_vad_signature: dict | None = None,
+    last_boundary_signature: dict | None = None,
     checkpoint_enabled: bool | None = None,
 ) -> None:
     if not _checkpoint_enabled(checkpoint_enabled):
@@ -350,7 +350,7 @@ def _save_asr_checkpoint(
         "audio_path": checkpoint_source,
         "chunks": _chunk_checkpoint_signature(
             chunks,
-            last_vad_signature=last_vad_signature,
+            last_boundary_signature=last_boundary_signature,
         ),
         "results": {str(key): value for key, value in sorted(results_by_index.items())},
     }

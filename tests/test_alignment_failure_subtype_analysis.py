@@ -21,10 +21,11 @@ def test_analyze_rows_groups_subtypes_and_recommends_routes():
     rows = [
         {
             "failure_candidate": True,
-            "fallback_subtype": "vad_coarse_after_sentinel",
-            "alignment_quality": "vad_coarse",
-            "fallback_type": "vad_coarse",
-            "failure_bucket": "vad_coarse_alignment",
+            "fallback_subtype": "proportional_after_sentinel",
+            "alignment_quality": "proportional",
+            "fallback_type": "proportional",
+            "sentinel_lines": ["sentinel"],
+            "failure_bucket": "proportional_alignment",
             "duration_s": 12.0,
             "compact_chars": 30,
             "prealign_align_len": 30,
@@ -56,10 +57,10 @@ def test_analyze_rows_groups_subtypes_and_recommends_routes():
     by_subtype = {item["subtype_group"]: item for item in summary["subtypes"]}
 
     assert summary["failure_rows"] == 2
-    assert by_subtype["vad_coarse_after_sentinel"]["route"] == "aligner_robustness"
+    assert by_subtype["proportional_after_sentinel"]["route"] == "aligner_robustness"
     assert by_subtype["nonlexical_text"]["route"] == "nonlexical_time_policy"
     assert {row["subtype_group"] for row in examples} == {
-        "vad_coarse_after_sentinel",
+        "proportional_after_sentinel",
         "nonlexical_text",
     }
 
@@ -98,3 +99,24 @@ def test_subtype_analysis_cli_writes_outputs(tmp_path):
     assert summary["subtypes"][0]["route"] == "prealign_policy"
     assert examples[0]["subtype_group"] == "align_text_empty"
     assert "## Subtype Routes" in markdown
+
+
+def test_subtype_analysis_does_not_route_sentinel_from_subtype_suffix_only():
+    rows = [
+        {
+            "failure_candidate": True,
+            "fallback_subtype": "proportional_after_sentinel",
+            "alignment_quality": "partial",
+            "fallback_type": "none",
+            "sentinel_lines": ["sentinel"],
+            "duration_s": 12.0,
+            "compact_chars": 20,
+            "prealign_align_len": 20,
+            "aligned_segment_count": 1,
+        }
+    ]
+
+    summary, _examples = analyze_rows(rows, examples_per_subtype=1)
+
+    assert summary["subtypes"][0]["subtype_group"] == "proportional_after_sentinel"
+    assert summary["subtypes"][0]["route"] == "manual_triage"

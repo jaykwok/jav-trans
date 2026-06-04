@@ -230,7 +230,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--max-candidates", type=int)
     parser.add_argument(
         "--output-dir",
-        default=str(PROJECT_ROOT / "agents" / "temp" / "fusionvad-ja" / "asr-hard-negative-audit"),
+        default=str(PROJECT_ROOT / "agents" / "temp" / "speech-boundary-ja" / "asr-hard-negative-audit"),
     )
     args = parser.parse_args(argv)
     if args.no_overlap_s < 0.0:

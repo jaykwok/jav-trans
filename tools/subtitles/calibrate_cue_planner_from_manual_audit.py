@@ -428,7 +428,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--manifest", required=True, help="audit/source manifest JSONL")
     parser.add_argument(
         "--output-dir",
-        default="agents/temp/fusionvad-ja/cue-planner-manual-calibration",
+        default="agents/temp/speech-boundary-ja/cue-planner-manual-calibration",
     )
     args = parser.parse_args(argv)
     summary = build_calibration(

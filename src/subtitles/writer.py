@@ -1,6 +1,7 @@
 import os
 import re
 import logging
+from pathlib import Path
 from typing import Literal
 
 from subtitles.options import SubtitleOptions
@@ -921,7 +922,9 @@ def write_srt(
     """
     options = _coerce_options(options)
     blocks = [dict(block) for block in blocks]
-    with open(path, "w", encoding="utf-8") as f:
+    path_obj = Path(path)
+    path_obj.parent.mkdir(parents=True, exist_ok=True)
+    with path_obj.open("w", encoding="utf-8") as f:
         for idx, block in enumerate(blocks, 1):
             start = float(block.get("start", 0.0))
             end = max(start + 0.05, float(block.get("end", start)))

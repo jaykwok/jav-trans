@@ -72,7 +72,7 @@ def test_sentinel_island_split_success_offsets_words(monkeypatch, tmp_path):
     prepared_chunks: list[dict] = []
 
     monkeypatch.setenv("ALIGNMENT_SENTINEL_ISLAND_SPLIT", "1")
-    monkeypatch.setenv("ASR_CHUNK_PACK_FRAME_HOP_S", "0.02")
+    monkeypatch.setenv("BOUNDARY_FEATURE_FRAME_HOP_S", "0.02")
     monkeypatch.setattr(
         transcribe,
         "_build_alignment_sentinel_island_plan",
@@ -217,7 +217,7 @@ def test_batch_sentinel_island_split_uses_single_prepare_call(monkeypatch, tmp_p
     prepare_calls: list[list[dict]] = []
 
     monkeypatch.setenv("ALIGNMENT_SENTINEL_ISLAND_SPLIT", "1")
-    monkeypatch.setenv("ASR_CHUNK_PACK_FRAME_HOP_S", "0.02")
+    monkeypatch.setenv("BOUNDARY_FEATURE_FRAME_HOP_S", "0.02")
     monkeypatch.setattr(
         transcribe,
         "_build_alignment_sentinel_island_plan",

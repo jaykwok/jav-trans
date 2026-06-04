@@ -176,7 +176,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--candidate-label", default="candidate")
     parser.add_argument(
         "--output-dir",
-        default="agents/temp/fusionvad-ja/cue-planner-merge-review-compare",
+        default="agents/temp/speech-boundary-ja/cue-planner-merge-review-compare",
     )
     args = parser.parse_args(argv)
     summary = compare_reviews(

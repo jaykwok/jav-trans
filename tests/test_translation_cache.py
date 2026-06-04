@@ -62,8 +62,7 @@ def test_save_cache_entry_concurrent_jsonl_intact(tmp_path):
 
 
 def test_batched_translation_skips_cached_batches(monkeypatch, tmp_path):
-    cache_path = tmp_path / "translation_cache.json"
-    migrated_path = cache_path.with_suffix(".jsonl")
+    cache_path = tmp_path / "translation_cache.jsonl"
     segments = _segments(4)
     cache_key = translator._translation_cache_key(
         0,
@@ -73,7 +72,7 @@ def test_batched_translation_skips_cached_batches(monkeypatch, tmp_path):
         character_reference="",
     )
     cache_path.write_text(
-        json.dumps({cache_key: ["cached-0", "cached-1"]}, ensure_ascii=False),
+        json.dumps({"key": cache_key, "value": ["cached-0", "cached-1"]}, ensure_ascii=False) + "\n",
         encoding="utf-8",
     )
     calls: list[tuple[int, int]] = []
@@ -104,7 +103,7 @@ def test_batched_translation_skips_cached_batches(monkeypatch, tmp_path):
     assert any(item["mode"] == "batched_full_context" for item in timings)
     assert timings[-1]["cache_hit_count"] == 1
 
-    saved = _read_cache_jsonl(migrated_path)
+    saved = _read_cache_jsonl(cache_path)
     assert saved[cache_key] == ["cached-0", "cached-1"]
     assert saved[
         translator._translation_cache_key(
@@ -115,8 +114,7 @@ def test_batched_translation_skips_cached_batches(monkeypatch, tmp_path):
             character_reference="",
         )
     ] == ["zh-2", "zh-3"]
-    assert migrated_path.exists()
-    assert not cache_path.exists()
+    assert cache_path.exists()
 
 
 def test_load_translation_cache_warns_on_corrupt_jsonl(tmp_path, capsys):
@@ -127,17 +125,6 @@ def test_load_translation_cache_warns_on_corrupt_jsonl(tmp_path, capsys):
 
     captured = capsys.readouterr()
     assert "[WARN] translation cache JSONL load failed" in captured.out
-    assert str(cache_path) in captured.out
-
-
-def test_load_translation_cache_warns_on_corrupt_legacy_json(tmp_path, capsys):
-    cache_path = tmp_path / "translation_cache.json"
-    cache_path.write_text("{not-json}", encoding="utf-8")
-
-    assert translator._load_translation_cache(cache_path) == {}
-
-    captured = capsys.readouterr()
-    assert "[WARN] translation cache JSON load failed" in captured.out
     assert str(cache_path) in captured.out
 
 

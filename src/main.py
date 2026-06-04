@@ -30,7 +30,7 @@ from utils.model_paths import PROJECT_ROOT
 _ENV_OVERRIDE_KEYS = (
     "JOB_TEMP_DIR",
     "ASR_BACKEND",
-    "ASR_VAD_BACKEND",
+    "ASR_BOUNDARY_BACKEND",
     "ASR_WORKER_MODE",
     "ASR_MODEL_PATH",
     "ASR_MODEL_ID",
@@ -145,21 +145,18 @@ def _ctx_env_flag(ctx: JobContext, name: str, default: bool = False) -> bool:
 
 
 _ASR_STAGE_ADVANCED_PREFIXES = (
-    "SEGMENT_",
-    "VAD_",
     "ASR_QC_",
     "ASR_CONTEXT_LEAK_",
     "ASR_FRAGMENT_",
     "ASR_NATIVE_",
-    "ASR_CHUNK_",
-    "ASR_PRE_ASR_",
-    "FUSIONVAD_JA_",
+    "BOUNDARY_",
+    "SPEECH_BOUNDARY_JA_",
     "ALIGNMENT_",
     "F0_",
 )
 _ASR_STAGE_ADVANCED_KEYS = {
     "ALIGN_LONG_CHUNK_BATCH_SIZE",
-    "ASR_VAD_BACKEND",
+    "ASR_BOUNDARY_BACKEND",
     "ASR_LANGUAGE",
     "ASR_FORCE_LANGUAGE",
     "ASR_MODEL_PATH",
@@ -171,6 +168,8 @@ _ASR_STAGE_ADVANCED_KEYS = {
     "ASR_MAX_NEW_TOKENS",
     "ASR_REPETITION_PENALTY",
     "ASR_WORKER_MODE",
+    "ASR_CHUNK_MIN_DURATION_S",
+    "ASR_CONTEXT_RESET_GAP_S",
     "ASR_SLIDING_CONTEXT_SEGS",
     "ASR_INITIAL_PROMPT_MAX_CHARS",
     "ASR_INITIAL_PROMPT_MAX_TOKENS",
@@ -180,12 +179,12 @@ _ASR_STAGE_ADVANCED_KEYS = {
     "ASR_BATCH_SIZE",
     "ALIGNER_BATCH_SIZE",
     "KEEP_ASR_CHUNKS",
-    "VAD_CHUNK_CACHE_DIR",
-    "VAD_CHUNK_CACHE_ENABLED",
+    "BOUNDARY_CACHE_DIR",
+    "BOUNDARY_CACHE_ENABLED",
 }
 _ASR_STAGE_CACHE_NEUTRAL_KEYS = {
-    "VAD_CHUNK_CACHE_DIR",
-    "VAD_CHUNK_CACHE_ENABLED",
+    "BOUNDARY_CACHE_DIR",
+    "BOUNDARY_CACHE_ENABLED",
 }
 
 
@@ -210,9 +209,8 @@ def _asr_stage_env_overrides(ctx: JobContext) -> dict[str, str]:
 
 
 def _asr_stage_env_for_video(ctx: JobContext, video_fps: float | None) -> dict[str, str]:
+    del video_fps
     overrides = _asr_stage_env_overrides(ctx)
-    subtitle_options = _subtitle_options_for_ctx(ctx).with_video_fps(video_fps)
-    overrides["ASR_CHUNK_PACK_FRAME_HOP_S"] = f"{subtitle_options.frame_duration_s:.12g}"
     return overrides
 
 
@@ -254,7 +252,7 @@ def _subtitle_options_for_video(ctx: JobContext, video_fps: float | None):
 
 def _asr_runtime_signature_for_env() -> dict:
     try:
-        return dict(asr_module._get_asr_runtime_signature(last_vad_signature={}))
+        return dict(asr_module._get_asr_runtime_signature(last_boundary_signature={}))
     except Exception:
         return {}
 
@@ -269,8 +267,7 @@ def _asr_stage_config_signature_for_env() -> dict:
             "ASR_BACKEND",
             "ASR_CONTEXT",
             "ASR_WORKER_MODE",
-            "ASR_CHUNK_PACKING_ENABLED",
-            "ASR_LONG_CHUNK_PROFILE",
+            "BOUNDARY_REFINER_ENABLED",
         }
     }
     return {
@@ -321,12 +318,16 @@ def _aligned_cache_signature_for_ctx(
     options = subtitle_options or _subtitle_options_for_ctx(ctx)
     asr_signature = _asr_runtime_signature_for_env()
     return {
-        "version": 2,
+        "version": 3,
         "backend_label": backend_label,
         "asr": asr_signature,
         "asr_stage_config": _asr_stage_config_signature_for_env(),
         "f0": _f0_signature_for_ctx(ctx),
-        "subtitle": {"timeline_mode": options.timeline_mode},
+        "subtitle": {
+            "timeline_mode": options.timeline_mode,
+            "video_fps": options.effective_video_fps,
+            "frame_gap_s": options.frame_gap_s,
+        },
     }
 
 
@@ -740,8 +741,13 @@ def run_asr_alignment_f0(
         )
         _log_stage(
             logger,
-            "asr_chunk_pack_frame_hop_s="
-            f"{os.environ.get('ASR_CHUNK_PACK_FRAME_HOP_S', '')}",
+            "boundary_feature_frame_hop_s="
+            f"{os.environ.get('BOUNDARY_FEATURE_FRAME_HOP_S', '')}",
+        )
+        _log_stage(
+            logger,
+            "subtitle_frame_gap_s="
+            f"{subtitle_options.frame_gap_s:.6f}",
         )
         if cache_job_id != job_id:
             job_temp_dir = _resolve_job_temp_dir(cache_job_id)

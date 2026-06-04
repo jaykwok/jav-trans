@@ -10,7 +10,7 @@ from typing import Any, Iterable, Mapping
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
-DEFAULT_OUTPUT_DIR = "agents/temp/fusionvad-ja/alignment-failure-subtype-analysis"
+DEFAULT_OUTPUT_DIR = "agents/temp/speech-boundary-ja/alignment-failure-subtype-analysis"
 
 
 def project_path(value: str | Path) -> Path:
@@ -137,12 +137,17 @@ def recommended_route(subtype: str, rows: list[dict[str, Any]]) -> dict[str, str
     p50_duration = statistics.median(durations) if durations else 0.0
     max_duration = max(durations) if durations else 0.0
     nonempty_align = sum(1 for row in rows if str(row.get("align_text") or "").strip())
+    has_sentinel_fallback = any(
+        str(row.get("fallback_type") or "").strip() not in {"", "none"}
+        and bool(row.get("sentinel_lines") or [])
+        for row in rows
+    )
 
-    if subtype == "vad_coarse_after_sentinel":
+    if has_sentinel_fallback:
         if p50_duration >= 6.0 or max_duration >= 10.0:
             return {
                 "route": "aligner_robustness",
-                "next_action": "Do not widen chunk packing further; test CTC/secondary aligner or aligner-local speech-island splitting for nonempty align_text sentinel chunks.",
+                "next_action": "Do not widen chunk packing further; inspect the sentinel fallback chunks and improve boundary planning, CTC/secondary alignment, or aligner-local splitting.",
             }
         return {
             "route": "sentinel_policy",
@@ -161,7 +166,7 @@ def recommended_route(subtype: str, rows: list[dict[str, Any]]) -> dict[str, str
     if subtype in {"asr_empty_text", "bucket:empty_text_for_chunk"}:
         return {
             "route": "asr_or_vad_empty",
-            "next_action": "Treat as ASR/VAD proposal issue; collect hard negatives and compare with ASR confidence/QC before changing aligner.",
+            "next_action": "Treat as ASR/SpeechBoundary proposal issue; collect hard negatives and compare with ASR confidence/QC before changing aligner.",
         }
     if subtype == "asr_dropped_uncertain":
         return {
@@ -171,7 +176,7 @@ def recommended_route(subtype: str, rows: list[dict[str, Any]]) -> dict[str, str
     if subtype.startswith("word_timing_") or nonempty_align:
         return {
             "route": "alignment_quality_threshold",
-            "next_action": "Inspect word timing coverage/zero-duration thresholds before changing ASR or VAD.",
+            "next_action": "Inspect word timing coverage/zero-duration thresholds before changing ASR or SpeechBoundary-JA.",
         }
     return {
         "route": "manual_triage",

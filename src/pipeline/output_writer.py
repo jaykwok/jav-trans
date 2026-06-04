@@ -44,7 +44,9 @@ def relativize_payload_paths(value, *, project_root: Path):
 
 
 def write_json(path: str, payload: dict, *, project_root: Path) -> None:
-    with open(path, "w", encoding="utf-8") as writer:
+    target = Path(path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    with target.open("w", encoding="utf-8") as writer:
         json.dump(
             relativize_payload_paths(payload, project_root=project_root),
             writer,

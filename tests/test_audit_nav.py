@@ -36,7 +36,7 @@ def test_audit_index_lists_latest_without_auto_refresh(tmp_path: Path):
     index = (audit_root / "index.html").read_text(encoding="utf-8")
     assert 'href="latest-review/index.html"' in index
     assert 'href="old-review/index.html"' in index
-    assert "fusionvad-ja/latest-review" not in index
+    assert "speech-boundary-ja/latest-review" not in index
     assert "最新审计" in index
     assert "匿名样片 A" in index
     assert "old-review" in index
@@ -56,7 +56,7 @@ def test_latest_audit_entry_is_static_link(tmp_path: Path):
 
     entry = (audit_root / "latest-audit.html").read_text(encoding="utf-8")
     assert 'href="latest-review/index.html"' in entry
-    assert "fusionvad-ja/latest-review" not in entry
+    assert "speech-boundary-ja/latest-review" not in entry
     assert "自动跳转已关闭" in entry
     assert "http-equiv" not in entry
     assert "window.location" not in entry

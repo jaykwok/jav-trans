@@ -1,17 +1,13 @@
 from pathlib import Path
 
-from tools.vad.fusionvad_ja import run_full_workflow
+from tools.boundary.ja import run_full_workflow
 
 
-def test_run_full_workflow_context_carries_pre_asr_env(monkeypatch, tmp_path):
-    monkeypatch.setenv("ASR_PRE_ASR_CUT_SPLIT_ENABLED", "1")
-    monkeypatch.setenv("ASR_PRE_ASR_CUT_SPLIT_THRESHOLD", "0.95")
-    monkeypatch.setenv("ASR_PRE_ASR_CUT_SPLIT_MIN_CORE_FRAMES", "420")
-    monkeypatch.setenv("ASR_PRE_ASR_VALLEY_SPLIT_ENABLED", "0")
-    monkeypatch.setenv("ASR_PRE_ASR_RISK_SPLIT_ENABLED", "1")
-    monkeypatch.setenv("ASR_PRE_ASR_RISK_SPLIT_THRESHOLD", "1.5")
-    monkeypatch.setenv("ASR_PRE_ASR_RISK_SPLIT_CONTINUOUS_THRESHOLD", "2.5")
-    monkeypatch.setenv("ASR_PRE_ASR_RISK_SPLIT_TARGET_CORE_FRAMES", "240")
+def test_run_full_workflow_context_carries_boundary_env(monkeypatch, tmp_path):
+    monkeypatch.setenv("BOUNDARY_REFINER_ENABLED", "1")
+    monkeypatch.setenv("BOUNDARY_REFINER_THRESHOLD", "0.62")
+    monkeypatch.setenv("BOUNDARY_PLANNER_TARGET_CHUNK_S", "8.0")
+    monkeypatch.setenv("BOUNDARY_PLANNER_MAX_CHUNK_S", "28.0")
 
     args = run_full_workflow.parse_args(
         [
@@ -20,7 +16,7 @@ def test_run_full_workflow_context_carries_pre_asr_env(monkeypatch, tmp_path):
             "--task-name",
             "unit",
             "--label",
-            "r17",
+            "boundary",
         ]
     )
     paths = run_full_workflow.RunPaths(
@@ -37,12 +33,7 @@ def test_run_full_workflow_context_carries_pre_asr_env(monkeypatch, tmp_path):
 
     ctx = run_full_workflow.build_context(args=args, paths=paths, video=video)
 
-    assert ctx.advanced["ASR_PRE_ASR_CUT_SPLIT_ENABLED"] == "1"
-    assert ctx.advanced["ASR_PRE_ASR_CUT_SPLIT_THRESHOLD"] == "0.95"
-    assert ctx.advanced["ASR_PRE_ASR_CUT_SPLIT_MIN_CORE_FRAMES"] == "420"
-    assert ctx.advanced["ASR_PRE_ASR_VALLEY_SPLIT_ENABLED"] == "0"
-    assert ctx.advanced["ASR_PRE_ASR_CUT_SPLIT_TARGET_CORE_FRAMES"] == "270"
-    assert ctx.advanced["ASR_PRE_ASR_RISK_SPLIT_ENABLED"] == "1"
-    assert ctx.advanced["ASR_PRE_ASR_RISK_SPLIT_THRESHOLD"] == "1.5"
-    assert ctx.advanced["ASR_PRE_ASR_RISK_SPLIT_CONTINUOUS_THRESHOLD"] == "2.5"
-    assert ctx.advanced["ASR_PRE_ASR_RISK_SPLIT_TARGET_CORE_FRAMES"] == "240"
+    assert ctx.advanced["BOUNDARY_REFINER_ENABLED"] == "1"
+    assert ctx.advanced["BOUNDARY_REFINER_THRESHOLD"] == "0.62"
+    assert ctx.advanced["BOUNDARY_PLANNER_TARGET_CHUNK_S"] == "8.0"
+    assert ctx.advanced["BOUNDARY_PLANNER_MAX_CHUNK_S"] == "28.0"

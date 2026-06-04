@@ -59,7 +59,6 @@ def test_classifies_vad_and_proportional_fallbacks():
         align_text_empty=False,
         asr_dropped_uncertain=False,
         alignment_mode="even_fallback",
-        fallback_lines=["Alignment 回退: 使用比例时间戳"],
         aligned_segment_count=1,
     )
 
@@ -98,7 +97,6 @@ def test_nonlexical_empty_align_text_is_coarse_not_review():
         nonlexical_text=True,
         asr_dropped_uncertain=False,
         alignment_mode="nonlexical",
-        fallback_lines=["Alignment VAD 回退语音区间: 1"],
         aligned_segment_count=1,
     )
 

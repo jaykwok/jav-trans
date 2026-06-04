@@ -50,9 +50,6 @@ ALIGN_LONG_CHUNK_BATCH_SIZE = max(
     1,
     int(os.getenv("ALIGN_LONG_CHUNK_BATCH_SIZE", "1")),
 )
-ASR_CHUNK_PACKING_ENABLED = os.getenv(
-    "ASR_CHUNK_PACKING_ENABLED", "0"
-).strip().lower() in {"1", "true", "yes", "on"}
 ASR_NATIVE_MIN_SPAN_MS = float(os.getenv("ASR_NATIVE_MIN_SPAN_MS", "80"))
 ASR_NATIVE_MAX_ZERO_RATIO = float(os.getenv("ASR_NATIVE_MAX_ZERO_RATIO", "0.55"))
 ASR_NATIVE_MAX_REPEAT_RATIO = float(os.getenv("ASR_NATIVE_MAX_REPEAT_RATIO", "0.65"))
@@ -756,11 +753,7 @@ class LocalAsrBackend:
 
         forced_aligner = self._ensure_forced_aligner(on_stage=on_stage)
         results: list[list[dict]] = []
-        batch_size = (
-            ALIGN_LONG_CHUNK_BATCH_SIZE
-            if ASR_CHUNK_PACKING_ENABLED
-            else self.align_batch_size
-        )
+        batch_size = ALIGN_LONG_CHUNK_BATCH_SIZE
 
         for batch_start in range(0, len(items), batch_size):
             batch_items = items[batch_start : batch_start + batch_size]

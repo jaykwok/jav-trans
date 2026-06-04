@@ -4,6 +4,11 @@ set -euo pipefail
 PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
 cd "$PROJECT_ROOT"
 
+if [[ ! -d ".venv" ]]; then
+  uv venv
+fi
+export PYTHONIOENCODING="${PYTHONIOENCODING:-utf-8}"
+
 HF_CACHE_DIR="${HF_CACHE_DIR:-$PROJECT_ROOT/datasets/hf-cache}"
 HF_ENDPOINT_VALUE="${HF_ENDPOINT_VALUE:-${HF_ENDPOINT:-}}"
 QWEN_MODEL_ID="${QWEN_MODEL_ID:-Qwen/Qwen3-ASR-1.7B}"
@@ -56,7 +61,7 @@ if [[ -n "$QWEN_MODEL_REVISION" ]]; then
   MODEL_ARGS+=(--revision "$QWEN_MODEL_REVISION")
 fi
 
-.venv/bin/huggingface-cli download "${MODEL_ARGS[@]}"
+uv run --no-sync huggingface-cli download "${MODEL_ARGS[@]}"
 
 SFT_ARGS=(
   tools/asr/qwen/prepare_qwen_asr_sft_dataset.py
@@ -84,4 +89,4 @@ if [[ -n "$SFT_REVISION" ]]; then
   SFT_ARGS+=(--revision "$SFT_REVISION")
 fi
 
-.venv/bin/python "${SFT_ARGS[@]}"
+uv run --no-sync python "${SFT_ARGS[@]}"

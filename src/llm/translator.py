@@ -199,10 +199,7 @@ def _current_retry_events() -> list[dict] | None:
 
 _load_translation_cache = translation_cache._load_translation_cache
 _translation_cache_jsonl_path = translation_cache._translation_cache_jsonl_path
-_translation_cache_legacy_json_path = translation_cache._translation_cache_legacy_json_path
-_read_translation_cache_json = translation_cache._read_translation_cache_json
 _read_translation_cache_jsonl = translation_cache._read_translation_cache_jsonl
-_rewrite_translation_cache_jsonl = translation_cache._rewrite_translation_cache_jsonl
 _save_cache_entry = translation_cache._save_cache_entry
 
 

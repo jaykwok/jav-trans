@@ -296,7 +296,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--diagnostics", default="", help="alignment diagnostics JSONL")
     parser.add_argument(
         "--output-dir",
-        default="agents/temp/fusionvad-ja/speaker-sidecar-cue-planner-sweep",
+        default="agents/temp/speech-boundary-ja/speaker-sidecar-cue-planner-sweep",
     )
     parser.add_argument("--thresholds", default="0.75,0.85,0.95")
     parser.add_argument("--speaker-policies", default="block,penalize")

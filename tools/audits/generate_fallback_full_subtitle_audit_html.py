@@ -183,12 +183,8 @@ def overlaps(a_start: float, a_end: float, b_start: float, b_end: float) -> bool
 
 
 def fallback_target(row: Mapping[str, Any]) -> bool:
-    return (
-        str(row.get("fallback_type") or "") == "vad_coarse"
-        or str(row.get("alignment_quality") or "") == "vad_coarse"
-        or str(row.get("fallback_subtype") or "").startswith("vad_coarse")
-        or str(row.get("failure_bucket") or "") == "vad_coarse_alignment"
-    )
+    fallback_type = str(row.get("fallback_type") or "")
+    return fallback_type not in {"", "none"}
 
 
 def cue_text_for_range(cues: list[dict[str, Any]], start: float, end: float) -> str:
@@ -315,7 +311,7 @@ def write_audit_index(*, audit_root: Path, latest_html: Path, title: str, summar
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>FusionVAD-JA 审计入口</title>
+<title>SpeechBoundary-JA 审计入口</title>
 <style>
 body {{
   margin: 0;
@@ -342,7 +338,7 @@ code {{ font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
 </head>
 <body>
 <main>
-  <h1>FusionVAD-JA 审计入口</h1>
+  <h1>SpeechBoundary-JA 审计入口</h1>
 {cards}
   <p class="muted">{html.escape(latest_meta)}</p>
   <p class="muted">后续人工审计统一放在 <code>agents/audits/</code>。</p>
@@ -565,7 +561,7 @@ textarea { width: 100%; border: 1px solid var(--line); border-radius: 6px; paddi
 const ITEMS = JSON.parse(document.getElementById("items-json").textContent);
 const CUES = JSON.parse(document.getElementById("cues-json").textContent);
 const SUMMARY = JSON.parse(document.getElementById("summary-json").textContent);
-const STORAGE_KEY = "fusionvad-ja-fallback-full-subtitle-audit:" + SUMMARY.dataset_id;
+const STORAGE_KEY = "speech-boundary-ja-fallback-full-subtitle-audit:" + SUMMARY.dataset_id;
 const LABELS = [
   ["timing_ok", "时间轴可接受"],
   ["too_wide", "fallback 太宽"],
@@ -833,7 +829,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--output-dir",
         default="agents/audits/fallback-full-subtitle-review",
     )
-    parser.add_argument("--title", default="FusionVAD-JA fallback 完整日语字幕审计")
+    parser.add_argument("--title", default="SpeechBoundary-JA fallback 完整日语字幕审计")
     parser.add_argument("--pad-s", type=float, default=1.0)
     parser.add_argument("--max-items", type=int)
     args = parser.parse_args(argv)

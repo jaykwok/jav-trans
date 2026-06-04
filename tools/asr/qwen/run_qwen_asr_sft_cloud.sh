@@ -4,14 +4,10 @@ set -euo pipefail
 PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
 cd "$PROJECT_ROOT"
 
-if [[ ! -x ".venv/bin/python" ]]; then
-  if [[ "${CREATE_VENV:-0}" == "1" ]]; then
-    python3 -m venv .venv
-  else
-    echo "Missing .venv/bin/python. Create it first, or rerun with CREATE_VENV=1." >&2
-    exit 2
-  fi
+if [[ ! -d ".venv" ]]; then
+  uv venv
 fi
+export PYTHONIOENCODING="${PYTHONIOENCODING:-utf-8}"
 
 HF_CACHE_DIR="${HF_CACHE_DIR:-$PROJECT_ROOT/datasets/hf-cache}"
 HF_ENDPOINT_VALUE="${HF_ENDPOINT_VALUE:-${HF_ENDPOINT:-}}"
@@ -55,9 +51,9 @@ if [[ -n "$HF_ENDPOINT_VALUE" ]]; then
 fi
 
 if [[ "${INSTALL_QWEN_ASR_DEPS:-0}" == "1" ]]; then
-  .venv/bin/pip install -U qwen-asr datasets librosa transformers
+  uv pip install -U qwen-asr datasets librosa transformers
   if [[ "${INSTALL_FLASH_ATTN:-0}" == "1" ]]; then
-    MAX_JOBS="${MAX_JOBS:-4}" .venv/bin/pip install -U flash-attn --no-build-isolation
+    MAX_JOBS="${MAX_JOBS:-4}" uv pip install -U flash-attn --no-build-isolation
   fi
 fi
 
@@ -106,9 +102,9 @@ elif [[ "${RESUME:-0}" == "1" ]]; then
 fi
 
 if [[ "$NPROC_PER_NODE" -gt 1 ]]; then
-  CMD=(.venv/bin/python -m torch.distributed.run --nproc_per_node "$NPROC_PER_NODE" "${COMMON_ARGS[@]}")
+  CMD=(uv run --no-sync python -m torch.distributed.run --nproc_per_node "$NPROC_PER_NODE" "${COMMON_ARGS[@]}")
 else
-  CMD=(.venv/bin/python "${COMMON_ARGS[@]}")
+  CMD=(uv run --no-sync python "${COMMON_ARGS[@]}")
 fi
 
 echo "HF_HOME=$HF_HOME"

@@ -19,7 +19,7 @@ def _checkpoint_name(
 
     from asr import pipeline as asr
     asr = importlib.reload(asr)
-    asr._LAST_VAD_SIGNATURE = {"backend": "fusionvad_ja", "threshold": 0.2}
+    asr._LAST_BOUNDARY_SIGNATURE = {"backend": "speech_boundary_ja", "threshold": 0.2}
     return asr._get_asr_checkpoint_path("sample.wav").name
 
 

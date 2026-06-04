@@ -2,27 +2,39 @@ from __future__ import annotations
 
 import pytest
 
-from audio.chunk_packer import pack_vad_segments
-from vad.base import SpeechSegment
+from audio.chunk_packer import pack_speech_segments
+from boundary.refiner import BoundaryDecision, RefinerInput
+from boundary.base import SpeechSegment
 
 
 def _seg(start: float, end: float) -> SpeechSegment:
     return SpeechSegment(start=start, end=end)
 
 
-def _pack(segments):
-    return pack_vad_segments(
-        segments,
-        frame_hop_s=1.0,
-        window_frames=30,
-        reserve_frames=2,
-        target_padding_frames=4,
-        gap_merge_frames=3,
-    )
+class _DenyGapRefiner:
+    def decide_gap(self, item: RefinerInput) -> BoundaryDecision:
+        return BoundaryDecision(False, 0.12, "speaker_change")
+
+    def signature(self) -> dict:
+        return {"type": "deny_gap"}
+
+
+class _AllowGapRefiner:
+    def decide_gap(self, item: RefinerInput) -> BoundaryDecision:
+        return BoundaryDecision(True, 0.92, "semantic_continuation")
+
+    def signature(self) -> dict:
+        return {"type": "allow_gap"}
 
 
 def test_dense_segments_pack_into_one_chunk_with_dynamic_padding():
-    chunks = _pack([_seg(5.0, 7.0), _seg(8.0, 9.0), _seg(10.0, 11.0)])
+    chunks = pack_speech_segments(
+        [_seg(5.0, 7.0), _seg(8.0, 9.0), _seg(10.0, 11.0)],
+        frame_hop_s=1.0,
+        max_chunk_s=30.0,
+        target_chunk_s=9.0,
+        target_padding_s=4.0,
+    )
 
     assert len(chunks) == 1
     assert chunks[0].start == 1.0
@@ -30,599 +42,116 @@ def test_dense_segments_pack_into_one_chunk_with_dynamic_padding():
     assert chunks[0].duration == 14.0
     assert chunks[0].left_padding_s == 4.0
     assert chunks[0].right_padding_s == 4.0
-    assert chunks[0].vad_segments == [_seg(5.0, 7.0), _seg(8.0, 9.0), _seg(10.0, 11.0)]
+    assert chunks[0].speech_segments == [_seg(5.0, 7.0), _seg(8.0, 9.0), _seg(10.0, 11.0)]
 
 
-def test_gap_larger_than_frame_threshold_starts_new_chunk_and_splits_gap_padding():
-    chunks = _pack([_seg(10.0, 11.0), _seg(16.0, 17.0)])
-
-    assert [(chunk.start, chunk.end) for chunk in chunks] == [(6.0, 13.5), (13.5, 21.0)]
-    assert [(chunk.left_padding_s, chunk.right_padding_s) for chunk in chunks] == [
-        (4.0, 2.5),
-        (2.5, 4.0),
-    ]
-
-
-def _pack_capped(segments, max_core_frames):
-    return pack_vad_segments(
-        segments,
+def test_gap_refiner_can_block_mergeable_gap():
+    chunks = pack_speech_segments(
+        [_seg(0.0, 2.0), _seg(3.0, 5.0)],
         frame_hop_s=1.0,
-        window_frames=30,
-        reserve_frames=2,
-        target_padding_frames=4,
-        gap_merge_frames=3,
-        max_core_frames=max_core_frames,
+        max_chunk_s=30.0,
+        target_chunk_s=9.0,
+        target_padding_s=1.0,
+        boundary_refiner=_DenyGapRefiner(),
     )
 
-
-def test_max_core_cap_splits_accumulated_islands_at_mergeable_gap():
-    # gaps (2s) are below gap_merge (3s) so without a cap all three islands merge
-    # into one core=13s chunk; the soft cap forces a split at the island gap.
-    segments = [_seg(0.0, 3.0), _seg(5.0, 8.0), _seg(10.0, 13.0)]
-
-    assert len(_pack_capped(segments, 0)) == 1  # disabled == legacy behaviour
-
-    capped = _pack_capped(segments, 8)
-    assert [(c.vad_segments[0].start, c.vad_segments[-1].end) for c in capped] == [
-        (0.0, 8.0),
-        (10.0, 13.0),
-    ]
-    assert capped[0].split_reason == "soft_cap"
-    assert capped[1].split_reason == "tail"
+    assert [(chunk.core_start, chunk.core_end) for chunk in chunks] == [(0.0, 2.0), (3.0, 5.0)]
+    assert chunks[0].split_reason == "boundary_refiner:speaker_change"
+    assert chunks[0].boundary_score == pytest.approx(0.12)
+    assert chunks[0].boundary_reason == "speaker_change"
 
 
-def test_max_core_cap_does_not_split_single_island_without_gap():
-    # A single long VAD segment has no internal gap to split on, so the soft cap
-    # leaves it intact (handled by overlong splitting / left as-is by design).
-    capped = _pack_capped([_seg(2.0, 12.0)], 8)
-    assert len(capped) == 1
-    assert capped[0].vad_segments == [_seg(2.0, 12.0)]
-
-
-def test_pre_asr_island_split_disabled_keeps_packed_chunk():
-    segments = [_seg(0.0, 2.0), _seg(4.0, 6.0), _seg(8.0, 10.0)]
-
-    chunks = pack_vad_segments(
-        segments,
+def test_planner_max_splits_even_when_refiner_allows_gap():
+    chunks = pack_speech_segments(
+        [_seg(0.0, 5.0), _seg(6.0, 11.0)],
         frame_hop_s=1.0,
-        window_frames=30,
-        reserve_frames=2,
-        target_padding_frames=1,
-        gap_merge_frames=3,
-        pre_asr_island_split_enabled=False,
-        pre_asr_island_split_min_core_frames=8,
-        pre_asr_island_split_min_gap_frames=2,
+        max_chunk_s=8.0,
+        target_chunk_s=9.0,
+        target_padding_s=1.0,
+        boundary_refiner=_AllowGapRefiner(),
     )
 
-    assert len(chunks) == 1
-    assert chunks[0].split_reason == "tail"
-    assert chunks[0].internal_gap_count == 2
-    assert chunks[0].internal_gap_max_s == 2.0
+    assert [(chunk.core_start, chunk.core_end) for chunk in chunks] == [(0.0, 5.0), (6.0, 11.0)]
+    assert chunks[0].split_reason == "planner_max"
 
 
-def test_pre_asr_island_split_cuts_high_risk_multi_island_chunk():
-    segments = [_seg(0.0, 2.0), _seg(4.0, 6.0), _seg(8.0, 10.0)]
-
-    chunks = pack_vad_segments(
-        segments,
-        frame_hop_s=1.0,
-        window_frames=30,
-        reserve_frames=2,
-        target_padding_frames=1,
-        gap_merge_frames=3,
-        pre_asr_island_split_enabled=True,
-        pre_asr_island_split_min_core_frames=8,
-        pre_asr_island_split_min_gap_frames=2,
-        pre_asr_island_split_min_island_frames=1,
-    )
-
-    assert [[(seg.start, seg.end) for seg in chunk.vad_segments] for chunk in chunks] == [
-        [(0.0, 2.0)],
-        [(4.0, 6.0)],
-        [(8.0, 10.0)],
-    ]
-    assert [chunk.split_reason for chunk in chunks] == [
-        "pre_asr_island_split",
-        "pre_asr_island_split",
-        "pre_asr_island_split",
-    ]
-    assert [chunk.parent_chunk_id for chunk in chunks] == [0, 0, 0]
-    assert [chunk.island_id for chunk in chunks] == [0, 1, 2]
-    assert [chunk.island_count for chunk in chunks] == [3, 3, 3]
-    assert {chunk.split_policy for chunk in chunks} == {"r15_pre_asr_island_v1"}
-    assert chunks[0].end <= chunks[1].start
-
-
-def test_pre_asr_island_split_ignores_short_multi_island_chunk():
-    chunks = pack_vad_segments(
-        [_seg(0.0, 1.0), _seg(3.0, 4.0)],
-        frame_hop_s=1.0,
-        window_frames=30,
-        reserve_frames=2,
-        target_padding_frames=1,
-        gap_merge_frames=3,
-        pre_asr_island_split_enabled=True,
-        pre_asr_island_split_min_core_frames=8,
-        pre_asr_island_split_min_gap_frames=2,
-    )
-
-    assert len(chunks) == 1
-    assert chunks[0].split_reason == "tail"
-    assert chunks[0].parent_chunk_id is None
-
-
-def test_pre_asr_island_split_merges_tiny_island_into_neighbor():
-    chunks = pack_vad_segments(
-        [_seg(0.0, 2.0), _seg(4.0, 4.2), _seg(6.0, 8.0)],
-        frame_hop_s=1.0,
-        window_frames=30,
-        reserve_frames=2,
-        target_padding_frames=1,
-        gap_merge_frames=3,
-        pre_asr_island_split_enabled=True,
-        pre_asr_island_split_min_core_frames=6,
-        pre_asr_island_split_min_gap_frames=1,
-        pre_asr_island_split_min_island_frames=1,
-    )
-
-    assert [[(seg.start, seg.end) for seg in chunk.vad_segments] for chunk in chunks] == [
-        [(0.0, 2.0), (4.0, 4.2)],
-        [(6.0, 8.0)],
-    ]
-
-
-def test_pre_asr_valley_split_disabled_keeps_long_continuous_segment():
-    segment = _seg(0.0, 12.0)
-    scores = [0.9] * 5 + [0.05] * 2 + [0.9] * 5
-
-    chunks = pack_vad_segments(
-        [segment],
-        frame_hop_s=1.0,
-        window_frames=30,
-        reserve_frames=2,
-        target_padding_frames=1,
-        gap_merge_frames=0,
-        pre_asr_valley_split_enabled=False,
-        pre_asr_valley_split_min_core_frames=8,
-        pre_asr_valley_split_target_core_frames=5,
-        pre_asr_valley_split_min_valley_frames=2,
-        pre_asr_valley_split_min_child_frames=3,
-        frame_scores=scores,
-    )
-
-    assert len(chunks) == 1
-    assert chunks[0].vad_segments == [segment]
-    assert chunks[0].valley_split_count == 0
-
-
-def test_pre_asr_valley_split_cuts_long_continuous_segment_at_low_scores():
-    scores = [0.9] * 5 + [0.05] * 2 + [0.9] * 5
-
-    chunks = pack_vad_segments(
-        [_seg(0.0, 12.0)],
-        frame_hop_s=1.0,
-        window_frames=30,
-        reserve_frames=2,
-        target_padding_frames=1,
-        gap_merge_frames=0,
-        pre_asr_valley_split_enabled=True,
-        pre_asr_valley_split_min_core_frames=8,
-        pre_asr_valley_split_target_core_frames=5,
-        pre_asr_valley_split_min_valley_frames=2,
-        pre_asr_valley_split_min_child_frames=3,
-        pre_asr_valley_split_threshold=0.2,
-        frame_scores=scores,
-    )
-
-    assert len(chunks) == 2
-    assert chunks[0].split_reason == "pre_asr_valley_split"
-    assert chunks[1].split_reason == "pre_asr_valley_split"
-    assert chunks[0].vad_segments[0].end == pytest.approx(6.0)
-    assert chunks[1].vad_segments[0].start == pytest.approx(6.0)
-    assert {chunk.split_policy for chunk in chunks} == {"r16_pre_asr_valley_v1"}
-    assert chunks[0].valley_score_min == pytest.approx(0.05)
-
-
-def test_pre_asr_valley_split_requires_sustained_low_score_run():
-    scores = [0.9] * 5 + [0.05] + [0.9] * 6
-
-    chunks = pack_vad_segments(
-        [_seg(0.0, 12.0)],
-        frame_hop_s=1.0,
-        window_frames=30,
-        reserve_frames=2,
-        target_padding_frames=1,
-        gap_merge_frames=0,
-        pre_asr_valley_split_enabled=True,
-        pre_asr_valley_split_min_core_frames=8,
-        pre_asr_valley_split_target_core_frames=5,
-        pre_asr_valley_split_min_valley_frames=2,
-        pre_asr_valley_split_min_child_frames=3,
-        pre_asr_valley_split_threshold=0.2,
-        frame_scores=scores,
-    )
-
-    assert len(chunks) == 1
-    assert chunks[0].split_policy == ""
-
-
-def test_pre_asr_cut_split_disabled_keeps_long_continuous_segment():
-    segment = _seg(0.0, 12.0)
+def test_boundary_candidate_split_metadata_is_materialized():
     cut_scores = [0.05] * 5 + [0.98] * 2 + [0.05] * 5
 
-    chunks = pack_vad_segments(
-        [segment],
-        frame_hop_s=1.0,
-        window_frames=30,
-        reserve_frames=2,
-        target_padding_frames=1,
-        gap_merge_frames=0,
-        pre_asr_cut_split_enabled=False,
-        pre_asr_cut_split_min_core_frames=8,
-        pre_asr_cut_split_target_core_frames=5,
-        pre_asr_cut_split_min_cut_frames=2,
-        pre_asr_cut_split_min_child_frames=3,
-        cut_frame_scores=cut_scores,
-    )
-
-    assert len(chunks) == 1
-    assert chunks[0].vad_segments == [segment]
-    assert chunks[0].cut_split_count == 0
-
-
-def test_pre_asr_cut_split_cuts_long_continuous_segment_at_cut_scores():
-    cut_scores = [0.05] * 5 + [0.98] * 2 + [0.05] * 5
-
-    chunks = pack_vad_segments(
+    chunks = pack_speech_segments(
         [_seg(0.0, 12.0)],
         frame_hop_s=1.0,
-        window_frames=30,
-        reserve_frames=2,
-        target_padding_frames=1,
-        gap_merge_frames=0,
-        pre_asr_cut_split_enabled=True,
-        pre_asr_cut_split_min_core_frames=8,
-        pre_asr_cut_split_target_core_frames=5,
-        pre_asr_cut_split_min_cut_frames=2,
-        pre_asr_cut_split_min_child_frames=3,
-        pre_asr_cut_split_threshold=0.94,
+        max_chunk_s=30.0,
+        target_chunk_s=5.0,
+        min_chunk_s=3.0,
+        target_padding_s=1.0,
         cut_frame_scores=cut_scores,
     )
 
-    assert len(chunks) == 2
-    assert chunks[0].split_reason == "pre_asr_cut_split"
-    assert chunks[1].split_reason == "pre_asr_cut_split"
-    assert chunks[0].vad_segments[0].end == pytest.approx(6.0)
-    assert chunks[1].vad_segments[0].start == pytest.approx(6.0)
-    assert {chunk.split_policy for chunk in chunks} == {"r17_pre_asr_cut_v1"}
-    assert chunks[0].cut_score_max == pytest.approx(0.98)
-    assert chunks[0].cut_split_count == 1
-
-
-def test_pre_asr_cut_split_requires_sustained_cut_run():
-    cut_scores = [0.05] * 5 + [0.98] + [0.05] * 6
-
-    chunks = pack_vad_segments(
-        [_seg(0.0, 12.0)],
-        frame_hop_s=1.0,
-        window_frames=30,
-        reserve_frames=2,
-        target_padding_frames=1,
-        gap_merge_frames=0,
-        pre_asr_cut_split_enabled=True,
-        pre_asr_cut_split_min_core_frames=8,
-        pre_asr_cut_split_target_core_frames=5,
-        pre_asr_cut_split_min_cut_frames=2,
-        pre_asr_cut_split_min_child_frames=3,
-        pre_asr_cut_split_threshold=0.94,
-        cut_frame_scores=cut_scores,
-    )
-
-    assert len(chunks) == 1
-    assert chunks[0].split_policy == ""
-
-
-def test_pre_asr_cut_split_uses_score_frame_hop_independent_of_pack_frames():
-    cut_scores = [0.05] * 10 + [0.98] * 4 + [0.05] * 46
-
-    chunks = pack_vad_segments(
-        [_seg(0.0, 12.0)],
-        frame_hop_s=1.0,
-        window_frames=30,
-        reserve_frames=2,
-        target_padding_frames=1,
-        gap_merge_frames=0,
-        pre_asr_cut_split_enabled=True,
-        pre_asr_cut_split_min_core_frames=8,
-        pre_asr_cut_split_target_core_frames=5,
-        pre_asr_cut_split_min_cut_frames=2,
-        pre_asr_cut_split_min_child_frames=3,
-        pre_asr_cut_split_threshold=0.94,
-        cut_frame_scores=cut_scores,
-        score_frame_hop_s=0.5,
-    )
-
-    assert len(chunks) == 2
-    assert chunks[0].vad_segments[0].end == pytest.approx(6.0)
-    assert chunks[1].vad_segments[0].start == pytest.approx(6.0)
-
-
-def test_pre_asr_drop_gap_split_deletes_internal_gap_and_forces_boundary():
-    drop_gap_scores = [0.05] * 5 + [0.90] * 3 + [0.05] * 7
-
-    chunks = pack_vad_segments(
-        [_seg(0.0, 15.0)],
-        frame_hop_s=1.0,
-        window_frames=30,
-        reserve_frames=2,
-        target_padding_frames=1,
-        gap_merge_frames=10,
-        pre_asr_drop_gap_split_enabled=True,
-        pre_asr_drop_gap_split_min_parent_frames=8,
-        pre_asr_drop_gap_split_min_gap_frames=2,
-        pre_asr_drop_gap_split_min_gap_s=0.0,
-        pre_asr_drop_gap_split_min_child_frames=3,
-        pre_asr_drop_gap_split_threshold=0.80,
-        drop_gap_frame_scores=drop_gap_scores,
-    )
-
-    assert len(chunks) == 2
-    assert chunks[0].split_reason == "pre_asr_drop_gap_split"
-    assert chunks[1].split_reason == "pre_asr_drop_gap_split"
-    assert chunks[0].vad_segments[0].end == pytest.approx(5.0)
-    assert chunks[1].vad_segments[0].start == pytest.approx(8.0)
-    assert {chunk.split_policy for chunk in chunks} == {"r21_pre_asr_drop_gap_v1"}
-    assert [chunk.drop_gap_score_max for chunk in chunks] == [
-        pytest.approx(0.90),
-        pytest.approx(0.90),
+    assert [(chunk.core_start, chunk.core_end) for chunk in chunks] == [
+        (0.0, pytest.approx(6.0)),
+        (pytest.approx(6.0), 12.0),
     ]
-    assert all(chunk.drop_gap_split_count == 1 for chunk in chunks)
+    assert chunks[0].split_reason == "cut_candidate"
+    assert chunks[1].split_reason == "boundary_candidate"
+    assert {chunk.boundary_source for chunk in chunks} == {"cut"}
+    assert [chunk.boundary_score for chunk in chunks] == [pytest.approx(0.98), pytest.approx(0.98)]
 
 
-def test_pre_asr_drop_gap_split_requires_min_child_duration():
-    drop_gap_scores = [0.05] * 5 + [0.90] * 4 + [0.05] * 6
+def test_candidate_split_accepts_numpy_score_arrays():
+    np = pytest.importorskip("numpy")
+    cut_scores = np.asarray([0.05] * 5 + [0.98] * 2 + [0.05] * 5, dtype=np.float32)
 
-    chunks = pack_vad_segments(
-        [_seg(0.0, 15.0)],
-        frame_hop_s=1.0,
-        window_frames=30,
-        reserve_frames=2,
-        target_padding_frames=1,
-        gap_merge_frames=10,
-        pre_asr_drop_gap_split_enabled=True,
-        pre_asr_drop_gap_split_min_parent_frames=8,
-        pre_asr_drop_gap_split_min_gap_frames=2,
-        pre_asr_drop_gap_split_min_gap_s=0.0,
-        pre_asr_drop_gap_split_min_child_frames=8,
-        pre_asr_drop_gap_split_threshold=0.80,
-        drop_gap_frame_scores=drop_gap_scores,
-    )
-
-    assert len(chunks) == 1
-    assert chunks[0].split_policy == ""
-
-
-def test_pre_asr_risk_split_disabled_keeps_high_risk_chunk():
-    segments = [_seg(0.0, 3.0), _seg(4.0, 7.0), _seg(8.0, 11.0)]
-
-    chunks = pack_vad_segments(
-        segments,
-        frame_hop_s=1.0,
-        window_frames=30,
-        reserve_frames=2,
-        target_padding_frames=1,
-        gap_merge_frames=2,
-        pre_asr_risk_split_enabled=False,
-        pre_asr_risk_split_min_core_frames=8,
-        pre_asr_risk_split_target_core_frames=5,
-        pre_asr_risk_split_min_gap_frames=1,
-    )
-
-    assert len(chunks) == 1
-    assert chunks[0].split_reason == "tail"
-    assert chunks[0].risk_split_count == 0
-
-
-def test_pre_asr_risk_split_cuts_multi_island_chunk_at_global_gap_target():
-    segments = [_seg(0.0, 3.0), _seg(4.0, 7.0), _seg(8.0, 11.0)]
-
-    chunks = pack_vad_segments(
-        segments,
-        frame_hop_s=1.0,
-        window_frames=30,
-        reserve_frames=2,
-        target_padding_frames=1,
-        gap_merge_frames=2,
-        pre_asr_risk_split_enabled=True,
-        pre_asr_risk_split_min_core_frames=8,
-        pre_asr_risk_split_target_core_frames=5,
-        pre_asr_risk_split_safe_core_frames=8,
-        pre_asr_risk_split_min_gap_frames=1,
-        pre_asr_risk_split_min_child_frames=2,
-        pre_asr_risk_split_threshold=1.0,
-    )
-
-    assert [[(seg.start, seg.end) for seg in chunk.vad_segments] for chunk in chunks] == [
-        [(0.0, 3.0)],
-        [(4.0, 7.0)],
-        [(8.0, 11.0)],
-    ]
-    assert {chunk.split_reason for chunk in chunks} == {"pre_asr_risk_split"}
-    assert {chunk.split_policy for chunk in chunks} == {"r18_pre_asr_risk_v1"}
-    assert [chunk.parent_chunk_id for chunk in chunks] == [0, 0, 0]
-    assert [chunk.island_id for chunk in chunks] == [0, 1, 2]
-    assert [chunk.island_count for chunk in chunks] == [3, 3, 3]
-    assert all(chunk.risk_split_count == 1 for chunk in chunks)
-    assert all("long_core" in chunk.risk_reasons for chunk in chunks)
-
-
-def test_pre_asr_risk_split_requires_higher_threshold_for_continuous_chunk():
-    cut_scores = [0.05] * 5 + [0.98] * 2 + [0.05] * 5
-
-    chunks = pack_vad_segments(
+    chunks = pack_speech_segments(
         [_seg(0.0, 12.0)],
         frame_hop_s=1.0,
-        window_frames=30,
-        reserve_frames=2,
-        target_padding_frames=1,
-        gap_merge_frames=0,
-        pre_asr_risk_split_enabled=True,
-        pre_asr_risk_split_min_core_frames=8,
-        pre_asr_risk_split_target_core_frames=5,
-        pre_asr_risk_split_safe_core_frames=8,
-        pre_asr_risk_split_min_child_frames=3,
-        pre_asr_risk_split_threshold=1.0,
-        pre_asr_risk_split_continuous_threshold=2.0,
-        pre_asr_risk_split_cut_threshold=0.94,
-        pre_asr_cut_split_min_cut_frames=2,
-        cut_frame_scores=cut_scores,
-    )
-
-    assert len(chunks) == 1
-    assert chunks[0].split_policy == ""
-
-
-def test_pre_asr_risk_split_uses_cut_scores_for_very_high_risk_continuous_chunk():
-    cut_scores = [0.05] * 5 + [0.98] * 2 + [0.05] * 5
-
-    chunks = pack_vad_segments(
-        [_seg(0.0, 12.0)],
-        frame_hop_s=1.0,
-        window_frames=30,
-        reserve_frames=2,
-        target_padding_frames=1,
-        gap_merge_frames=0,
-        pre_asr_risk_split_enabled=True,
-        pre_asr_risk_split_min_core_frames=8,
-        pre_asr_risk_split_target_core_frames=5,
-        pre_asr_risk_split_safe_core_frames=8,
-        pre_asr_risk_split_min_child_frames=3,
-        pre_asr_risk_split_threshold=1.0,
-        pre_asr_risk_split_continuous_threshold=1.5,
-        pre_asr_risk_split_cut_threshold=0.94,
-        pre_asr_cut_split_min_cut_frames=2,
+        max_chunk_s=30.0,
+        target_chunk_s=5.0,
+        min_chunk_s=3.0,
+        target_padding_s=1.0,
         cut_frame_scores=cut_scores,
     )
 
     assert len(chunks) == 2
-    assert chunks[0].vad_segments[0].end == pytest.approx(6.0)
-    assert chunks[1].vad_segments[0].start == pytest.approx(6.0)
-    assert {chunk.split_policy for chunk in chunks} == {"r18_pre_asr_risk_v1"}
+    assert chunks[0].core_end == pytest.approx(6.0)
 
 
-def test_pre_asr_risk_split_revisits_long_residual_cut_child():
-    cut_scores = [0.05] * 5 + [0.98] * 2 + [0.05] * 5 + [0.98] * 2 + [0.05] * 10
-
-    chunks = pack_vad_segments(
-        [_seg(0.0, 24.0)],
+def test_overlong_segment_is_split_by_planner_capacity():
+    chunks = pack_speech_segments(
+        [_seg(10.0, 75.0)],
         frame_hop_s=1.0,
-        window_frames=30,
-        reserve_frames=2,
-        target_padding_frames=1,
-        gap_merge_frames=0,
-        pre_asr_cut_split_enabled=True,
-        pre_asr_cut_split_min_core_frames=8,
-        pre_asr_cut_split_target_core_frames=5,
-        pre_asr_cut_split_min_cut_frames=2,
-        pre_asr_cut_split_min_child_frames=3,
-        pre_asr_cut_split_max_children=2,
-        pre_asr_cut_split_threshold=0.94,
-        pre_asr_risk_split_enabled=True,
-        pre_asr_risk_split_min_core_frames=8,
-        pre_asr_risk_split_target_core_frames=5,
-        pre_asr_risk_split_safe_core_frames=8,
-        pre_asr_risk_split_min_child_frames=3,
-        pre_asr_risk_split_threshold=1.0,
-        pre_asr_risk_split_continuous_threshold=2.0,
-        pre_asr_risk_split_cut_threshold=0.94,
-        cut_frame_scores=cut_scores,
+        max_chunk_s=28.0,
+        target_chunk_s=9.0,
+        target_padding_s=4.0,
     )
-
-    assert [(chunk.vad_segments[0].start, chunk.vad_segments[0].end) for chunk in chunks] == [
-        (0.0, 6.0),
-        (6.0, 13.0),
-        (13.0, 24.0),
-    ]
-    assert chunks[1].split_policy == "r18_pre_asr_risk_v1"
-    assert "residual_cut_child" in chunks[1].risk_reasons
-
-
-def test_near_capacity_segment_reduces_padding_to_fit_window_reserve():
-    chunks = _pack([_seg(2.0, 28.0)])
-
-    assert len(chunks) == 1
-    assert chunks[0].duration == 28.0
-    assert chunks[0].start == 1.0
-    assert chunks[0].end == 29.0
-    assert chunks[0].left_padding_s == 1.0
-    assert chunks[0].right_padding_s == 1.0
-
-
-def test_single_overlong_segment_is_split_by_frame_capacity_before_packing():
-    chunks = _pack([_seg(10.0, 75.0)])
 
     assert [(chunk.start, chunk.end, chunk.duration) for chunk in chunks] == [
         (6.0, 34.0, 28.0),
         (26.0, 54.0, 28.0),
-        (48.5, 76.5, 28.0),
+        (46.0, 74.0, 28.0),
+        (66.0, 79.0, 13.0),
     ]
-    assert [[(seg.start, seg.end) for seg in chunk.vad_segments] for chunk in chunks] == [
+    assert [[(seg.start, seg.end) for seg in chunk.speech_segments] for chunk in chunks] == [
         [(10.0, 30.0)],
         [(30.0, 50.0)],
-        [(50.0, 70.0), (70.0, 75.0)],
-    ]
-
-
-def test_overlong_segment_split_preserves_score():
-    segment = SpeechSegment(start=0.0, end=30.0, score=0.75)
-    chunks = pack_vad_segments(
-        [segment],
-        frame_hop_s=1.0,
-        window_frames=12,
-        reserve_frames=2,
-        target_padding_frames=1,
-        gap_merge_frames=0,
-    )
-
-    assert [(chunk.start, chunk.end, chunk.duration) for chunk in chunks] == [
-        (0.0, 9.0, 9.0),
-        (7.0, 17.0, 10.0),
-        (15.0, 25.0, 10.0),
-        (23.0, 31.0, 8.0),
-    ]
-    assert [chunk.vad_segments[0].score for chunk in chunks] == [0.75, 0.75, 0.75, 0.75]
-
-
-def test_adjacent_overlong_tail_can_pack_with_following_segment_when_gap_allowed():
-    chunks = pack_vad_segments(
-        [_seg(10.0, 45.0), _seg(46.0, 47.0)],
-        frame_hop_s=1.0,
-        window_frames=30,
-        reserve_frames=2,
-        target_padding_frames=1,
-        gap_merge_frames=1,
-    )
-
-    assert [[(seg.start, seg.end) for seg in chunk.vad_segments] for chunk in chunks] == [
-        [(10.0, 36.0)],
-        [(36.0, 45.0), (46.0, 47.0)],
+        [(50.0, 70.0)],
+        [(70.0, 75.0)],
     ]
     assert all(chunk.duration <= 28.0 for chunk in chunks)
 
 
 def test_empty_segments_return_empty_list():
-    assert pack_vad_segments([]) == []
+    assert pack_speech_segments([]) == []
 
 
 def test_single_segment_at_audio_start_clamps_left_padding_to_zero():
-    chunks = _pack([_seg(0.4, 1.0)])
+    chunks = pack_speech_segments(
+        [_seg(0.4, 1.0)],
+        frame_hop_s=1.0,
+        max_chunk_s=30.0,
+        target_chunk_s=9.0,
+        target_padding_s=4.0,
+    )
 
     assert chunks[0].start == 0.0
-    assert chunks[0].end == 5.0
-    assert chunks[0].left_padding_s == 0.4
-    assert chunks[0].right_padding_s == 4.0
-
-
-def test_invalid_frame_config_raises():
-    with pytest.raises(ValueError, match="reserve_frames must be smaller"):
-        pack_vad_segments([_seg(0.0, 1.0)], window_frames=10, reserve_frames=10)
+    assert chunks[0].left_padding_s == pytest.approx(0.4)

@@ -21,10 +21,10 @@ from tools.asr.diagnostics.diagnose_asr_alignment import diagnose_case  # noqa: 
 
 
 DEFAULT_BOUNDARY_MANIFEST = (
-    "datasets/test/fusionvad-ja/v1-11/"
+    "datasets/test/speech-boundary-ja/v1-11/"
     "galgame-synthetic-timeline-v5-long-gap-test64/boundary_manifest.jsonl"
 )
-DEFAULT_OUTPUT_DIR = "agents/temp/fusionvad-ja/fallback-timing-error"
+DEFAULT_OUTPUT_DIR = "agents/temp/speech-boundary-ja/fallback-timing-error"
 DEFAULT_REPORT_TITLE = "Fallback Timing Error"
 TARGET_QUALITIES = ("forced", "vad_coarse", "proportional")
 

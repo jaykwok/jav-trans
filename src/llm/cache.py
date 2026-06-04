@@ -1,7 +1,5 @@
-import contextlib
 import hashlib
 import json
-import threading
 from pathlib import Path
 
 from llm.glossary import normalize_glossary_text
@@ -16,17 +14,8 @@ def _load_translation_cache(path) -> dict:
         return {}
     try:
         cache_path = _translation_cache_jsonl_path(Path(path))
-        legacy_path = _translation_cache_legacy_json_path(Path(path))
         if cache_path.exists():
             return _read_translation_cache_jsonl(cache_path)
-        if legacy_path.exists():
-            data = _read_translation_cache_json(legacy_path)
-            if data:
-                _rewrite_translation_cache_jsonl(cache_path, data)
-            if legacy_path != cache_path:
-                with contextlib.suppress(Exception):
-                    legacy_path.unlink()
-            return data
         return {}
     except Exception as exc:
         _warn_translation_cache(f"load failed for {path}: {exc}")
@@ -35,20 +24,6 @@ def _load_translation_cache(path) -> dict:
 
 def _translation_cache_jsonl_path(path: Path) -> Path:
     return path.with_suffix(".jsonl") if path.suffix.lower() == ".json" else path
-
-
-def _translation_cache_legacy_json_path(path: Path) -> Path:
-    return path if path.suffix.lower() == ".json" else path.with_suffix(".json")
-
-
-def _read_translation_cache_json(path: Path) -> dict:
-    try:
-        with path.open("r", encoding="utf-8") as reader:
-            data = json.load(reader)
-        return data if isinstance(data, dict) else {}
-    except Exception as exc:
-        _warn_translation_cache(f"JSON load failed for {path}: {exc}")
-        return {}
 
 
 def _read_translation_cache_jsonl(path: Path) -> dict:
@@ -74,24 +49,6 @@ def _read_translation_cache_jsonl(path: Path) -> dict:
         return {}
 
 
-def _rewrite_translation_cache_jsonl(path: Path, cache: dict) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp_path = path.with_name(f"{path.name}.{threading.get_ident()}.tmp")
-    with tmp_path.open("w", encoding="utf-8") as writer:
-        for key, value in cache.items():
-            writer.write(
-                json.dumps(
-                    {
-                        "key": str(key),
-                        "value": list(value) if isinstance(value, list) else value,
-                    },
-                    ensure_ascii=False,
-                )
-                + "\n"
-            )
-    tmp_path.replace(path)
-
-
 def _save_cache_entry(path, batch_key, zh_texts, lock) -> None:
     if not path:
         return
@@ -107,10 +64,6 @@ def _save_cache_entry(path, batch_key, zh_texts, lock) -> None:
                 )
                 + "\n"
             )
-        legacy_path = _translation_cache_legacy_json_path(raw_path)
-        if legacy_path != cache_path and legacy_path.exists():
-            with contextlib.suppress(Exception):
-                legacy_path.unlink()
 
 
 def _compute_prompt_signature(
