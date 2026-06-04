@@ -64,6 +64,12 @@ def pack_speech_segments(
     sequence_feature_provider: GapSequenceFeatureProvider | None = None,
     max_splits_per_segment: int = 16,
     sequence_batch_size: int = 256,
+    dp_chunk_base_cost: float = 0.04,
+    dp_over_target_weight: float = 0.30,
+    dp_far_over_target_weight: float = 1.50,
+    dp_under_min_weight: float = 0.20,
+    dp_long_gap_weight: float = 0.35,
+    dp_split_merge_weight: float = 0.35,
 ) -> list[PackedChunk]:
     """Convert Boundary Planner output into padded ASR chunks.
 
@@ -87,6 +93,12 @@ def pack_speech_segments(
         target_padding_s=target_padding_s,
         max_splits_per_segment=max_splits_per_segment,
         sequence_batch_size=sequence_batch_size,
+        dp_chunk_base_cost=dp_chunk_base_cost,
+        dp_over_target_weight=dp_over_target_weight,
+        dp_far_over_target_weight=dp_far_over_target_weight,
+        dp_under_min_weight=dp_under_min_weight,
+        dp_long_gap_weight=dp_long_gap_weight,
+        dp_split_merge_weight=dp_split_merge_weight,
     )
     planned = plan_boundary_chunks(
         segments,

@@ -159,6 +159,7 @@ BOUNDARY_FEATURE_FRAME_HOP_S=0.02
 BOUNDARY_REFINER_ENABLED=1
 BOUNDARY_REFINER_MODEL_PATH=src/boundary/checkpoints/boundary_refiner.pt
 BOUNDARY_REFINER_BACKBONE=transformers.Mamba2Model
+BOUNDARY_REFINER_DEVICE=auto
 BOUNDARY_REFINER_THRESHOLD=0.5
 BOUNDARY_FRAME_SEQUENCE_LEFT_CONTEXT_S=0.60
 BOUNDARY_FRAME_SEQUENCE_RIGHT_CONTEXT_S=0.60
@@ -171,6 +172,12 @@ BOUNDARY_PLANNER_START_WEIGHT=1.5
 BOUNDARY_PLANNER_TARGET_PADDING_S=2.0
 BOUNDARY_PLANNER_MAX_SPLITS_PER_SEGMENT=16
 BOUNDARY_PLANNER_SEQUENCE_BATCH_SIZE=256
+BOUNDARY_DP_CHUNK_BASE_COST=0.04
+BOUNDARY_DP_OVER_TARGET_WEIGHT=0.30
+BOUNDARY_DP_FAR_OVER_TARGET_WEIGHT=1.50
+BOUNDARY_DP_UNDER_MIN_WEIGHT=0.20
+BOUNDARY_DP_LONG_GAP_WEIGHT=0.35
+BOUNDARY_DP_SPLIT_MERGE_WEIGHT=0.35
 ```
 
 Timing 分两层处理：
@@ -178,7 +185,7 @@ Timing 分两层处理：
 - Boundary / ASR chunk planning 使用秒级上下文参数，例如 `BOUNDARY_PLANNER_TARGET_CHUNK_S=9.0` 和 `BOUNDARY_PLANNER_MAX_CHUNK_S=30.0`。`BOUNDARY_FEATURE_FRAME_HOP_S` 只是 frame-score 网格的 fallback，默认 `0.02s`，不代表视频帧率。
 - 字幕显示 / timing polish 使用真实视频 FPS。流程会探测源视频帧率并计算 `frame_duration_s=1/fps`，再按 Netflix-style 规则保留 `2 frames` gap、压缩前一条 end、限制最短/最长显示时长。24fps、29.97fps、60fps 的两帧 gap 会自然换算成不同秒数。
 
-当前 canonical `BOUNDARY_REFINER_MODEL_PATH` 固定为 `src/boundary/checkpoints/boundary_refiner.pt`。如果该文件不存在，运行时会使用 deterministic bootstrap refiner；如果文件存在，则加载 learned Boundary Refiner。训练好的 learned refiner 使用 `boundary_refiner_v1` checkpoint schema；checkpoint 内容 SHA1、模型路径、`transformers.Mamba2Model` backbone、candidate extractor version 和 planner config 都会进入 boundary-cache signature，更新权重会自动触发 cache miss。
+当前 canonical `BOUNDARY_REFINER_MODEL_PATH` 固定为 `src/boundary/checkpoints/boundary_refiner.pt`。如果该文件不存在，运行时会使用 deterministic bootstrap refiner；如果文件存在，则加载 learned Boundary Refiner。训练好的 learned refiner 使用 `boundary_refiner_v1` checkpoint schema；checkpoint 内容 SHA1、模型路径、`transformers.Mamba2Model` backbone、refiner device、candidate extractor version 和 planner config 都会进入 boundary-cache signature，更新权重或设备策略会自动触发 cache miss。`BOUNDARY_REFINER_DEVICE=auto` 会在 CUDA 可见时把这个小模型放到 GPU；如果它落到 CPU，Transformers Mamba2 pure PyTorch naive path 会明显拖慢全片 planner sweep。
 
 Frame/window sequence refiner 是当前主线训练入口。`src/boundary/sequence_features.py` 是唯一 schema authority：训练和 runtime 都从这里读取 feature config、feature dim、feature names 和 `feature_schema_hash`，禁止在训练脚本、runtime 或 planner 中手写维度常量。`runtime_adapter=frame_sequence_v1` 的 checkpoint 必须带 `feature_schema=frame_sequence_features_v1`、`feature_schema_hash` 和完整 `feature_signature`；运行时会用 SpeechBoundary-JA 导出的 PTM/MFCC frame windows 重新计算 feature names/hash，不匹配就直接报错，不做旧 checkpoint 兼容或静默回退。
 
@@ -214,10 +221,12 @@ clip-level clean speech islands
 2. 数据重建：清除旧 gap-only / BiLSTM / endpoint-head 训练格式，使用 Galgame 与 anime clean speech islands 重新生成 sequence dataset。每条样本包含多 island、touching speech、short/long gap、real negative gap、BGM/noise、轻量 overlap 和 source/speaker switch。过渡期 gap dataset 只允许作为 loader smoke 或 warm-up，不作为最终 Seq2Seq 目标。
 3. 模型升级：Boundary Refiner backbone 只保留 `transformers.Mamba2Model`。输入从 per-gap summary 升级为连续窗口序列，特征包含 Qwen PTM、MFCC、energy、speech probability、cut probability、candidate metadata；输出逐候选 split / merge / refine score 和可选 boundary offset。当前 frame/window sequence dataset、trainer、`FrameSequenceBoundaryRefiner`、runtime feature provider、schema/hash 校验和 PackedChunk 决策诊断已接通；当 checkpoint metadata 标记 `runtime_adapter=frame_sequence_v1` 时，主 pipeline 会让 SpeechBoundary-JA 导出低维 PTM/MFCC frame windows并交给 sequence refiner 做 gap 决策。
 4. Planner 接入：`pack_speech_segments()` 只 materialize planner 输出，不再承担固定 gap 合并策略。当前 planner 已能读取 refiner decision 并写入 PackedChunk 诊断字段；sequence refiner 已改成 bounded batch 打分，并接入轻量 DP / Viterbi-style constrained planner。当前 DP v2 是第一版可解释 baseline：cost 主要由模型 split/merge score、chunk duration、hard max chunk 和长 gap penalty 组成；它能避免退回局部 greedy，但还不是最终字幕目标函数。`BOUNDARY_PLANNER_SEQUENCE_BATCH_SIZE` 默认 `256`，用于避免 pure PyTorch Mamba2 naive path 在全片候选一次性推理时过慢。该变更把 planner signature 升到 `constrained_sequence_dp_planner_v2`，旧 boundary-cache 需要重建。
-5. GPU 闭环：先跑 synthetic exact truth，再跑匿名样片 A。主 gate 是 start boundary、fallback chunk duration、long/gap-crossing chunk、ASR empty / hallucination、forced/partial 比例；chunk 数只作为成本指标，不作为主要否决项。匿名样片 A frame-sequence greedy 与 DP v2 都已跑通：DP v2 把 fallback duration p90/max 从 `14.07/26.88s` 降到 `12.81/20.72s`，safe ratio 从 `0.314` 提到 `0.418`，但 fallback/sentinel chunk 数从 `322` 增到 `366`，ASR repeat-loop / nonlexical 问题仍存在。因此 DP v2 证明了“全局规划能压粗时间轴”，但 learned checkpoint 和 planner cost 暂不固化为默认质量路径。
+5. GPU 闭环：先跑 synthetic exact truth，再跑匿名样片 A。主 gate 是 start boundary、fallback chunk duration、long/gap-crossing chunk、ASR empty / hallucination 和字幕观感；chunk 数只作为成本指标，不作为主要否决项。fallback / sentinel 数只作为观察项，因为当前 Qwen3-ForcedAligner 没做 JAV / galgame 目标域 finetune，可能和 Qwen ASR SFT 输出风格不完全匹配。匿名样片 A frame-sequence greedy 与 DP v2 都已跑通：DP v2 把 fallback duration p90/max 从 `14.07/26.88s` 降到 `12.81/20.72s`，safe ratio 从 `0.314` 提到 `0.418`，但 fallback/sentinel chunk 数从 `322` 增到 `366`，ASR repeat-loop / nonlexical 问题仍存在。因此 DP v2 证明了“全局规划能压粗时间轴”，但 learned checkpoint 和 planner cost 暂不固化为默认质量路径。
 6. ASR feedback：supervised 稳定后再引入 preliminary ASR 文本、token confidence、local CER、aligner sentinel、fallback duration 和 QC reject 作为 dense reward，做 RL / DPO。Unified Joint Model 保留在 backlog，等 SpeechBoundary-JA 能稳定产出 pseudo boundary labels 后再评估。
 
-下一轮 planner cost 校准方向：把当前简单 cost 拆成可审计项，包括 calibrated model NLL、fallback-safe duration、long/gap-crossing penalty、start-boundary priority、字幕最小显示时长、2-frame gap、CPS/readability 和 ASR/QC feedback。Netflix timing 规则支持 `start/in-time` 优先、`end/out-time` 后置压缩和 2-frame gap；SubER / OptiSub 类字幕评测也说明字幕质量要同时看 timing、segmentation、显示时长和阅读速度。REBORN 的 RL boundary segmentation 可作为后续 ASR feedback / DPO 参考，但当前先用确定性 DP 做可解释 baseline。
+下一轮 planner cost 校准方向：把当前简单 cost 拆成可审计项，包括 calibrated model NLL、fallback-safe duration、long/gap-crossing penalty、start-boundary priority、字幕最小显示时长、2-frame gap、CPS/readability 和 ASR/QC feedback。Netflix timing 规则支持 `start/in-time` 优先、`end/out-time` 后置压缩和 2-frame gap；SubER / OptiSub 类字幕评测也说明字幕质量要同时看 timing、segmentation、显示时长和阅读速度。REBORN 的 RL boundary segmentation 可作为后续 ASR feedback / DPO 参考，但当前先用确定性 DP 做可解释 baseline。真实 boundary-only DP sweep 已显示：单纯把 target/cost 调紧只能把 duration p90 从 `12.64s` 降到约 `11.86s`，仍残留 `>20s` chunk；所以下一步优先补 overlong speech island 的候选切点 / dense boundary labels，而不是继续盲调 cost。
+
+Backlog：等 SpeechBoundary-JA 能稳定产出 pseudo boundary labels 后，研究不依赖 forced aligner 的直接字幕边界 / timeline model。该路线把“输出字幕文本和时间轴边界”作为主任务，forced aligner 只作为审计或 teacher 信号之一，不再把 fallback 数量当作上线 gate。
 
 训练数据构造要注意：旧 cutpoint 数据集主要提供 split supervision（贴连换人、短 gap 换人、可删除长 gap），不能单独当作完整 merge/split 训练集。正式训练前需要混入 clean speech-island 原料构造 same-utterance merge-positive，例如：
 

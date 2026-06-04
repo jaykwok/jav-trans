@@ -77,6 +77,8 @@ def _boundary_config() -> dict:
         "boundary_refiner_backbone": normalize_boundary_backbone(
             os.getenv("BOUNDARY_REFINER_BACKBONE", "transformers.Mamba2Model")
         ),
+        "boundary_refiner_device": os.getenv("BOUNDARY_REFINER_DEVICE", "auto").strip()
+        or "auto",
         "boundary_refiner_threshold": _env_float("BOUNDARY_REFINER_THRESHOLD", "0.5"),
         "boundary_candidate_extractor_version": CANDIDATE_EXTRACTOR_VERSION,
         "boundary_planner_max_chunk_s": _env_float("BOUNDARY_PLANNER_MAX_CHUNK_S", "30.0"),
@@ -90,6 +92,12 @@ def _boundary_config() -> dict:
         "boundary_planner_sequence_batch_size": _env_int(
             "BOUNDARY_PLANNER_SEQUENCE_BATCH_SIZE", "256"
         ),
+        "boundary_dp_chunk_base_cost": _env_float("BOUNDARY_DP_CHUNK_BASE_COST", "0.04"),
+        "boundary_dp_over_target_weight": _env_float("BOUNDARY_DP_OVER_TARGET_WEIGHT", "0.30"),
+        "boundary_dp_far_over_target_weight": _env_float("BOUNDARY_DP_FAR_OVER_TARGET_WEIGHT", "1.50"),
+        "boundary_dp_under_min_weight": _env_float("BOUNDARY_DP_UNDER_MIN_WEIGHT", "0.20"),
+        "boundary_dp_long_gap_weight": _env_float("BOUNDARY_DP_LONG_GAP_WEIGHT", "0.35"),
+        "boundary_dp_split_merge_weight": _env_float("BOUNDARY_DP_SPLIT_MERGE_WEIGHT", "0.35"),
         "drop_enabled": _env_bool("BOUNDARY_DROP_LOW_ENERGY_ENABLED", "0"),
         "drop_min_duration_s": _env_float("BOUNDARY_DROP_LOW_ENERGY_MIN_DURATION_S", "0.20"),
         "drop_rms_dbfs": _env_float("BOUNDARY_DROP_LOW_ENERGY_RMS_DBFS", "-40.0"),
@@ -433,6 +441,7 @@ def _build_processing_spans(
             Path(cfg["boundary_refiner_model_path"]),
             threshold=cfg["boundary_refiner_threshold"],
             backbone_override=cfg["boundary_refiner_backbone"],
+            device=cfg["boundary_refiner_device"],
         )
         sequence_feature_provider = _required_sequence_feature_provider_from_result(
             sequence_feature_frames,
@@ -448,6 +457,7 @@ def _build_processing_spans(
             enabled=cfg["boundary_refiner_enabled"],
             model_path=cfg["boundary_refiner_model_path"],
             backbone=cfg["boundary_refiner_backbone"],
+            device=cfg["boundary_refiner_device"],
             merge_threshold=cfg["boundary_refiner_threshold"],
             max_merge_gap_s=None,
             target_core_s=cfg["boundary_planner_target_chunk_s"],
@@ -493,6 +503,12 @@ def _build_processing_spans(
                 "target_padding_s": cfg["boundary_planner_target_padding_s"],
                 "max_splits_per_segment": cfg["boundary_planner_max_splits_per_segment"],
                 "sequence_batch_size": cfg["boundary_planner_sequence_batch_size"],
+                "dp_chunk_base_cost": cfg["boundary_dp_chunk_base_cost"],
+                "dp_over_target_weight": cfg["boundary_dp_over_target_weight"],
+                "dp_far_over_target_weight": cfg["boundary_dp_far_over_target_weight"],
+                "dp_under_min_weight": cfg["boundary_dp_under_min_weight"],
+                "dp_long_gap_weight": cfg["boundary_dp_long_gap_weight"],
+                "dp_split_merge_weight": cfg["boundary_dp_split_merge_weight"],
             },
         },
     }
@@ -534,6 +550,12 @@ def _build_processing_spans(
         sequence_feature_provider=sequence_feature_provider,
         max_splits_per_segment=cfg["boundary_planner_max_splits_per_segment"],
         sequence_batch_size=cfg["boundary_planner_sequence_batch_size"],
+        dp_chunk_base_cost=cfg["boundary_dp_chunk_base_cost"],
+        dp_over_target_weight=cfg["boundary_dp_over_target_weight"],
+        dp_far_over_target_weight=cfg["boundary_dp_far_over_target_weight"],
+        dp_under_min_weight=cfg["boundary_dp_under_min_weight"],
+        dp_long_gap_weight=cfg["boundary_dp_long_gap_weight"],
+        dp_split_merge_weight=cfg["boundary_dp_split_merge_weight"],
     )
     event = _boundary_cache_module.save_processing_spans(
         audio_path,
