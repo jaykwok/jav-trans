@@ -42,6 +42,13 @@ def test_boundary_planner_validates_config():
             config=BoundaryPlannerConfig(max_chunk_s=0.0),
         )
 
+    with pytest.raises(ValueError, match="dp_long_gap_weight"):
+        plan_boundary_chunks(
+            [SpeechSegment(0.0, 1.0)],
+            features=features,
+            config=BoundaryPlannerConfig(dp_long_gap_weight=-0.1),
+        )
+
 
 class _StaticSequenceRefiner:
     def __init__(self, scores: list[float]) -> None:

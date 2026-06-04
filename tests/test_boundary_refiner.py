@@ -229,6 +229,8 @@ def test_frame_sequence_refiner_checkpoint_round_trip(tmp_path):
     assert all(decision.merge for decision in decisions)
     assert refiner.signature()["runtime_adapter"] == "frame_sequence_v1"
     assert refiner.signature()["metadata"]["feature_schema"] == FRAME_SEQUENCE_FEATURE_SCHEMA
+    assert refiner.signature()["requested_device"] == "auto"
+    assert refiner.signature()["actual_device"] in {"cpu", "cuda:0"}
 
 
 def test_frame_sequence_refiner_rejects_missing_feature_schema(tmp_path):

@@ -137,6 +137,7 @@ class LearnedBoundaryRefiner:
         feature_mean: tuple[float, ...],
         feature_std: tuple[float, ...],
         backbone: str,
+        requested_device: str = "auto",
         metadata: dict | None = None,
     ) -> None:
         if not feature_names:
@@ -152,6 +153,8 @@ class LearnedBoundaryRefiner:
         self.feature_mean = feature_mean
         self.feature_std = feature_std
         self.backbone = normalize_boundary_backbone(backbone)
+        self.requested_device = str(requested_device or "auto")
+        self.actual_device = _move_model_to_device(self.model, self.requested_device)
         self.metadata = dict(metadata or {})
         self._sha1 = file_sha1(checkpoint_path)
 
@@ -163,6 +166,8 @@ class LearnedBoundaryRefiner:
             "sha1": self._sha1,
             "backbone": self.backbone,
             "threshold": self.threshold,
+            "requested_device": self.requested_device,
+            "actual_device": self.actual_device,
             "feature_names": list(self.feature_names),
             "metadata": self.metadata,
         }
@@ -253,6 +258,7 @@ def load_learned_refiner_checkpoint(
     *,
     threshold: float,
     backbone_override: str | None = None,
+    device: str = "auto",
 ) -> LearnedBoundaryRefiner:
     payload = torch.load(checkpoint_path, map_location="cpu")
     if not isinstance(payload, dict):
@@ -293,6 +299,7 @@ def load_learned_refiner_checkpoint(
         feature_mean=_float_tuple(payload.get("feature_mean"), len(feature_names), 0.0),
         feature_std=_float_tuple(payload.get("feature_std"), len(feature_names), 1.0),
         backbone=backbone,
+        requested_device=device,
         metadata=metadata if isinstance(metadata, dict) else {},
     )
 
@@ -302,14 +309,30 @@ def load_frame_sequence_refiner_checkpoint(
     *,
     threshold: float,
     backbone_override: str | None = None,
+    device: str = "auto",
 ) -> FrameSequenceBoundaryRefiner:
     return FrameSequenceBoundaryRefiner(
         load_learned_refiner_checkpoint(
             checkpoint_path,
             threshold=threshold,
             backbone_override=backbone_override,
+            device=device,
         )
     )
+
+
+def _move_model_to_device(model: torch.nn.Module, requested_device: str) -> str:
+    requested = str(requested_device or "auto").strip().lower()
+    if requested == "auto":
+        requested = "cuda" if torch.cuda.is_available() else "cpu"
+    if requested.startswith("cuda") and not torch.cuda.is_available():
+        requested = "cpu"
+    device = torch.device(requested)
+    model.to(device)
+    try:
+        return str(next(model.parameters()).device)
+    except StopIteration:
+        return str(device)
 
 
 def build_learned_refiner_checkpoint(
@@ -342,6 +365,7 @@ def load_boundary_refiner(
     enabled: bool,
     model_path: str = "",
     backbone: str = TRANSFORMERS_MAMBA2_BACKBONE,
+    device: str = "auto",
     merge_threshold: float = 0.5,
     max_merge_gap_s: float | None = None,
     target_core_s: float = 9.0,
@@ -367,6 +391,7 @@ def load_boundary_refiner(
             path,
             threshold=merge_threshold,
             backbone_override=backbone,
+            device=device,
         )
     return HeuristicBoundaryRefiner(
         merge_threshold=merge_threshold,

@@ -126,6 +126,7 @@ def configure_env(args: argparse.Namespace) -> None:
     os.environ.setdefault("BOUNDARY_REFINER_ENABLED", "1")
     os.environ.setdefault("BOUNDARY_REFINER_MODEL_PATH", args.boundary_refiner_model_path)
     os.environ.setdefault("BOUNDARY_REFINER_BACKBONE", args.boundary_refiner_backbone)
+    os.environ.setdefault("BOUNDARY_REFINER_DEVICE", args.boundary_refiner_device)
     os.environ.setdefault("BOUNDARY_REFINER_THRESHOLD", str(args.boundary_refiner_threshold))
     os.environ.setdefault("BOUNDARY_PLANNER_MAX_CHUNK_S", str(args.boundary_planner_max_chunk_s))
     os.environ.setdefault("BOUNDARY_PLANNER_TARGET_CHUNK_S", str(args.boundary_planner_target_chunk_s))
@@ -182,6 +183,7 @@ def build_context(*, args: argparse.Namespace, paths: RunPaths, video: Path):
             "BOUNDARY_REFINER_BACKBONE",
             "transformers.Mamba2Model",
         ),
+        "BOUNDARY_REFINER_DEVICE": os.getenv("BOUNDARY_REFINER_DEVICE", "auto"),
         "BOUNDARY_REFINER_THRESHOLD": os.getenv("BOUNDARY_REFINER_THRESHOLD", "0.5"),
         "BOUNDARY_PLANNER_MAX_CHUNK_S": os.getenv("BOUNDARY_PLANNER_MAX_CHUNK_S", "30.0"),
         "BOUNDARY_PLANNER_TARGET_CHUNK_S": os.getenv("BOUNDARY_PLANNER_TARGET_CHUNK_S", "9.0"),
@@ -190,6 +192,12 @@ def build_context(*, args: argparse.Namespace, paths: RunPaths, video: Path):
         "BOUNDARY_PLANNER_TARGET_PADDING_S": os.getenv("BOUNDARY_PLANNER_TARGET_PADDING_S", "2.0"),
         "BOUNDARY_PLANNER_MAX_SPLITS_PER_SEGMENT": os.getenv("BOUNDARY_PLANNER_MAX_SPLITS_PER_SEGMENT", "16"),
         "BOUNDARY_PLANNER_SEQUENCE_BATCH_SIZE": os.getenv("BOUNDARY_PLANNER_SEQUENCE_BATCH_SIZE", "256"),
+        "BOUNDARY_DP_CHUNK_BASE_COST": os.getenv("BOUNDARY_DP_CHUNK_BASE_COST", "0.04"),
+        "BOUNDARY_DP_OVER_TARGET_WEIGHT": os.getenv("BOUNDARY_DP_OVER_TARGET_WEIGHT", "0.30"),
+        "BOUNDARY_DP_FAR_OVER_TARGET_WEIGHT": os.getenv("BOUNDARY_DP_FAR_OVER_TARGET_WEIGHT", "1.50"),
+        "BOUNDARY_DP_UNDER_MIN_WEIGHT": os.getenv("BOUNDARY_DP_UNDER_MIN_WEIGHT", "0.20"),
+        "BOUNDARY_DP_LONG_GAP_WEIGHT": os.getenv("BOUNDARY_DP_LONG_GAP_WEIGHT", "0.35"),
+        "BOUNDARY_DP_SPLIT_MERGE_WEIGHT": os.getenv("BOUNDARY_DP_SPLIT_MERGE_WEIGHT", "0.35"),
         "QUALITY_REPORT_ENABLED": "1",
         "QUALITY_REPORT_DIR": str(paths.root / "quality_reports"),
         "QC_HARD_FAIL": "0",
@@ -332,6 +340,12 @@ def write_summary(paths: RunPaths, args: argparse.Namespace, results: list[dict[
             "target_padding_s": args.boundary_planner_target_padding_s,
             "max_splits_per_segment": args.boundary_planner_max_splits_per_segment,
             "sequence_batch_size": args.boundary_planner_sequence_batch_size,
+            "dp_chunk_base_cost": os.getenv("BOUNDARY_DP_CHUNK_BASE_COST", "0.04"),
+            "dp_over_target_weight": os.getenv("BOUNDARY_DP_OVER_TARGET_WEIGHT", "0.30"),
+            "dp_far_over_target_weight": os.getenv("BOUNDARY_DP_FAR_OVER_TARGET_WEIGHT", "1.50"),
+            "dp_under_min_weight": os.getenv("BOUNDARY_DP_UNDER_MIN_WEIGHT", "0.20"),
+            "dp_long_gap_weight": os.getenv("BOUNDARY_DP_LONG_GAP_WEIGHT", "0.35"),
+            "dp_split_merge_weight": os.getenv("BOUNDARY_DP_SPLIT_MERGE_WEIGHT", "0.35"),
         },
         "translate": bool(args.translate),
         "results": results,
@@ -409,6 +423,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         choices=("transformers.Mamba2Model",),
     )
     parser.add_argument("--boundary-refiner-threshold", type=float, default=0.5)
+    parser.add_argument("--boundary-refiner-device", default="auto")
     parser.add_argument("--boundary-planner-max-chunk-s", type=float, default=30.0)
     parser.add_argument("--boundary-planner-target-chunk-s", type=float, default=9.0)
     parser.add_argument("--boundary-planner-min-chunk-s", type=float, default=0.4)

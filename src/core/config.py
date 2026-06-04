@@ -108,6 +108,7 @@ DEFAULT_SETTINGS: dict[str, str] = {
     "BOUNDARY_REFINER_ENABLED": "1",
     "BOUNDARY_REFINER_MODEL_PATH": "src/boundary/checkpoints/boundary_refiner.pt",
     "BOUNDARY_REFINER_BACKBONE": "transformers.Mamba2Model",
+    "BOUNDARY_REFINER_DEVICE": "auto",
     "BOUNDARY_REFINER_THRESHOLD": "0.5",
     "BOUNDARY_FRAME_SEQUENCE_LEFT_CONTEXT_S": "0.60",
     "BOUNDARY_FRAME_SEQUENCE_RIGHT_CONTEXT_S": "0.60",
@@ -119,6 +120,13 @@ DEFAULT_SETTINGS: dict[str, str] = {
     "BOUNDARY_PLANNER_START_WEIGHT": "1.5",
     "BOUNDARY_PLANNER_TARGET_PADDING_S": "2.0",
     "BOUNDARY_PLANNER_MAX_SPLITS_PER_SEGMENT": "16",
+    "BOUNDARY_PLANNER_SEQUENCE_BATCH_SIZE": "256",
+    "BOUNDARY_DP_CHUNK_BASE_COST": "0.04",
+    "BOUNDARY_DP_OVER_TARGET_WEIGHT": "0.30",
+    "BOUNDARY_DP_FAR_OVER_TARGET_WEIGHT": "1.50",
+    "BOUNDARY_DP_UNDER_MIN_WEIGHT": "0.20",
+    "BOUNDARY_DP_LONG_GAP_WEIGHT": "0.35",
+    "BOUNDARY_DP_SPLIT_MERGE_WEIGHT": "0.35",
     # 1 stores SpeechBoundary frame scores in the SpeechBoundary result. Boundary Refiner enables
     # this at runtime even when this explicit diagnostics flag stays off.
     "SPEECH_BOUNDARY_JA_EXPORT_FRAME_SCORES": "0",

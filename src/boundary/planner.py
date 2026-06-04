@@ -25,6 +25,12 @@ class BoundaryPlannerConfig:
     target_padding_s: float = 2.0
     max_splits_per_segment: int = 16
     sequence_batch_size: int = 256
+    dp_chunk_base_cost: float = 0.04
+    dp_over_target_weight: float = 0.30
+    dp_far_over_target_weight: float = 1.50
+    dp_under_min_weight: float = 0.20
+    dp_long_gap_weight: float = 0.35
+    dp_split_merge_weight: float = 0.35
 
     def signature(self) -> dict:
         return {
@@ -37,6 +43,12 @@ class BoundaryPlannerConfig:
             "target_padding_s": self.target_padding_s,
             "max_splits_per_segment": self.max_splits_per_segment,
             "sequence_batch_size": self.sequence_batch_size,
+            "dp_chunk_base_cost": self.dp_chunk_base_cost,
+            "dp_over_target_weight": self.dp_over_target_weight,
+            "dp_far_over_target_weight": self.dp_far_over_target_weight,
+            "dp_under_min_weight": self.dp_under_min_weight,
+            "dp_long_gap_weight": self.dp_long_gap_weight,
+            "dp_split_merge_weight": self.dp_split_merge_weight,
         }
 
 
@@ -122,6 +134,16 @@ def _validate_config(config: BoundaryPlannerConfig) -> None:
         raise ValueError("max_splits_per_segment must be non-negative")
     if config.sequence_batch_size <= 0:
         raise ValueError("sequence_batch_size must be positive")
+    for field_name in (
+        "dp_chunk_base_cost",
+        "dp_over_target_weight",
+        "dp_far_over_target_weight",
+        "dp_under_min_weight",
+        "dp_long_gap_weight",
+        "dp_split_merge_weight",
+    ):
+        if getattr(config, field_name) < 0:
+            raise ValueError(f"{field_name} must be non-negative")
 
 
 def _validate_segments(segments: Sequence[SpeechSegment]) -> None:
@@ -456,7 +478,7 @@ def _dp_pack_run(
                 config=config,
             )
             if start > 0:
-                candidate_cost += _split_gap_cost(gap_infos[start - 1])
+                candidate_cost += _split_gap_cost(gap_infos[start - 1], config=config)
             if candidate_cost < costs[end]:
                 costs[end] = candidate_cost
                 previous[end] = start
@@ -551,14 +573,14 @@ def _chunk_dp_cost(
     config: BoundaryPlannerConfig,
 ) -> float:
     core_s = max(0.0, islands[end - 1].end - islands[start].start)
-    cost = 0.04
+    cost = config.dp_chunk_base_cost
     target = max(config.target_chunk_s, 1e-6)
     if core_s > config.target_chunk_s:
-        cost += 0.30 * ((core_s - config.target_chunk_s) / target) ** 2
+        cost += config.dp_over_target_weight * ((core_s - config.target_chunk_s) / target) ** 2
     if core_s > 2.0 * config.target_chunk_s:
-        cost += 1.50 * ((core_s - 2.0 * config.target_chunk_s) / target) ** 2
+        cost += config.dp_far_over_target_weight * ((core_s - 2.0 * config.target_chunk_s) / target) ** 2
     if core_s < config.min_chunk_s:
-        cost += 0.20 * ((config.min_chunk_s - core_s) / max(config.min_chunk_s, 1e-6)) ** 2
+        cost += config.dp_under_min_weight * ((config.min_chunk_s - core_s) / max(config.min_chunk_s, 1e-6)) ** 2
     for index in range(start, end - 1):
         cost += _merge_gap_cost(gap_infos[index], config=config)
     return cost
@@ -568,13 +590,16 @@ def _merge_gap_cost(info: _GapInfo, *, config: BoundaryPlannerConfig) -> float:
     score = _clamp01(info.merge_score)
     cost = config.start_weight * (1.0 - score)
     if info.gap_s > _bootstrap_gap_scale_s(config):
-        cost += 0.35 * min(4.0, (info.gap_s - _bootstrap_gap_scale_s(config)) / max(config.target_chunk_s, 1e-6))
+        cost += config.dp_long_gap_weight * min(
+            4.0,
+            (info.gap_s - _bootstrap_gap_scale_s(config)) / max(config.target_chunk_s, 1e-6),
+        )
     return cost
 
 
-def _split_gap_cost(info: _GapInfo) -> float:
+def _split_gap_cost(info: _GapInfo, *, config: BoundaryPlannerConfig) -> float:
     score = _clamp01(info.merge_score)
-    return 0.35 * score * score
+    return config.dp_split_merge_weight * score * score
 
 
 def _dp_split_reason(decision: BoundaryDecision | None) -> str:
