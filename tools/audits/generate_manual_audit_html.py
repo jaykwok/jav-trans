@@ -400,7 +400,7 @@ const PAGE_TITLE = {title_json};
 const DATASET_ID = {dataset_json};
 const OUTPUT_JSONL_NAME = {output_name_json};
 const CANDIDATES = {data_json};
-const STORAGE_KEY = "fusionvad-ja-manual-audit:" + DATASET_ID;
+const STORAGE_KEY = "speech-boundary-ja-manual-audit:" + DATASET_ID;
 
 let currentIndex = 0;
 let annotations = loadAnnotations();
@@ -990,14 +990,14 @@ def run(args: argparse.Namespace) -> None:
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Generate standalone HTML for manual FusionVAD-JA audit labeling.")
+    parser = argparse.ArgumentParser(description="Generate standalone HTML for manual SpeechBoundary-JA audit labeling.")
     parser.add_argument("--candidates", required=True, help="audit_candidates.jsonl or audit_candidates.csv.")
     parser.add_argument(
         "--output-html",
-        default=str(PROJECT_ROOT / "datasets" / "val" / "fusionvad-ja" / "v1-3" / "manual-audit-galgame" / "manual_audit.html"),
+        default=str(PROJECT_ROOT / "datasets" / "val" / "speech-boundary-ja" / "v1-3" / "manual-audit-galgame" / "manual_audit.html"),
     )
     parser.add_argument("--output-jsonl-name", default="manual_labels.jsonl")
-    parser.add_argument("--title", default="FusionVAD-JA 人工审计标注")
+    parser.add_argument("--title", default="SpeechBoundary-JA 人工审计标注")
     parser.add_argument("--dataset-id", help="Stable browser localStorage key. Defaults to candidates absolute path.")
     parser.add_argument("--limit", type=int)
     parser.add_argument("--copy-audio", action="store_true", help="Copy candidate audio next to the HTML for reliable local playback.")

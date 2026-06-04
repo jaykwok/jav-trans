@@ -8,15 +8,35 @@
 
 ## 当前结论
 
-- 默认 VAD 已切到 `fusionvad_ja`，当前 head 是 FusionVAD-JA v1.19b split-cut endpoint refiner。
+- 2026-06-04 命名决策并执行断兼容迁移：当前系统不再适合继续叫 `FusionVAD-JA`。它已经不是严格 speech/non-speech VAD，而是 `Qwen PTM + MFCC/energy bootstrap frame scores -> boundary candidate extraction -> Boundary Refiner scoring -> constrained planner -> ASR chunks` 的 speech-island boundary system。新概念名定为 **SpeechBoundary-JA**，backend key 为 `speech_boundary_ja`；active package 已从 `src/vad/fusionvad_ja/` / `tools/vad/fusionvad_ja/` 迁到 `src/boundary/ja/` / `tools/boundary/ja/`，不保留 `fusionvad_ja` alias、旧 cache 或旧路径兼容。
+- 2026-06-04 破坏式重构：旧 `ASR_PRE_ASR_*` / R15-R23 规则 packer、旧 `ASR_CHUNK_PACK_*` 配置和旧 `vad-cache` 语义已从 active code、测试和 Web 可见配置中移除。当前主线是 `SpeechBoundary-JA frame probabilities -> boundary candidate extraction -> Boundary Refiner scoring -> constrained boundary planner -> ASR chunks`；cache 断兼容升级为 `boundary-cache v1`，signature 包含 SpeechBoundary-JA、Qwen feature/PTM、Boundary Refiner、candidate extractor、planner config 和 `BOUNDARY_FEATURE_FRAME_HOP_S`。
+- 2026-06-04 FusionVAD-JA schema 断兼容迁移：feature cache / manifest / checkpoint / model layer 统一改为 `ptm`、`ptm_dim`、`ptm_proj`，不再沿用早期 `whisper_*` 命名；仓库内 v1.17、v1.19b、v1.21 小 checkpoint 已迁移 state_dict key。旧 feature cache 和旧实验 checkpoint 不做兼容迁移，重新生成。
+- 2026-06-04 配置面清理：旧 `VAD_MIN_OFF` / `VAD_PAD` / `SEGMENT_*` 已从 active defaults、`.env.example`、boundary-cache signature 和 Web advanced 透传中移除；当前只保留语义明确的 `ASR_CHUNK_MIN_DURATION_S`（导出 wav chunk 最小时长）和 `ASR_CONTEXT_RESET_GAP_S`（滑动 ASR 文本上下文重置 gap）。
+- 2026-06-04 审计发现并修复 chunk metadata 错位：`_extract_wav_chunks` 过滤过短 span 后，`_annotate_packed_chunks` 过去按输出位置 zip `PackedChunk`，会把 `vad_seg_count` / boundary reason/source/score 错贴到后一个 chunk；现在 chunk info 记录 `source_span_index`，annotation 按原始 span index 对齐，并补回归测试。
+- 2026-06-04 timing 语义修正：Boundary / ASR chunk planning 采用秒级上下文参数（如 target `9s`、max `30s`），`BOUNDARY_FEATURE_FRAME_HOP_S` 只表示 VAD/frame-score 网格 fallback，默认 `0.02s`；字幕显示 / timing polish 单独按真实视频 FPS 计算 `frame_duration_s` 和 Netflix-style `2-frame gap`。主流程不再把视频 FPS 注入 Boundary 配置，aligned-cache 签名改为 v3，并在 `subtitle` 签名中记录 `video_fps` / `frame_gap_s`。
+- 2026-06-04 BiLSTM 路线断兼容删除：旧 `AdditionFusion*BiLSTM`、v1.17/v1.19b/v1.21 endpoint / imitation checkpoint、addition / endpoint / imitation 训练导出 CLI、drop-gap imitation offline packer 和旧大测试文件已移出 active tree 到 `agents/rm/bilstm-removal/`。当前 `src/boundary/ja/` 模块只做 Qwen frozen feature + MFCC / energy bootstrap frame scoring；边界决策主线只走 `src/boundary/` 的 Boundary Refiner / Mamba2。
+- 新主线模块结构：`src/boundary/features.py` 组装帧级特征，`candidates.py` 提取 gap midpoint / cut peak / low-score valley 候选，`refiner.py` 提供 BoundaryRefiner interface 和 bootstrap refiner，`backbones.py` 放 Windows-friendly Mamba2 research wrapper，`planner.py` 做 constrained planning，`cache.py` 负责 boundary-cache v1。`src/boundary/ja/` 放 JA 目标域 bootstrap scorer。`src/audio/chunk_packer.py` 只保留把 planner 输出 materialize 成 `PackedChunk` 的 ASR-facing 职责。
+- 2026-06-04 Boundary Refiner backbone 入口收束到唯一实现路径 `transformers.Mamba2Model`：learned checkpoint schema 固定为 `boundary_refiner_v1`，runtime / CLI / cache signature / checkpoint payload 都使用该值。它直接对应 Hugging Face Transformers 的纯 PyTorch Mamba2 wrapper；`mamba2`、`torch_mamba2`、BiGRU、TCN、Transformer fallback 不再作为可选入口，避免训练和分发形成多套模型协议。
+- Windows 分发约束：默认路线不依赖 Linux-only `mamba-ssm`、Triton 或自定义 CUDA kernel。`src/boundary/backbones.py` 只提供 Hugging Face Transformers `Mamba2Model` 的纯 PyTorch wrapper 作为研究 backbone。
+- Unified Joint Model 路线进入 backlog，不进入当前重构：未来可考虑在 Qwen3-ASR decoder 中加入 `<boundary>` / `<dramatic_pause>` / `<sentence_end>` 等 token，做 joint segmentation + transcription 或 Samba-ASR 类长上下文模型。但这需要重新准备 boundary supervision、ASR SFT/RL/DPO 和云端 GPU 训练，当前维护成本和训练成本高，不作为默认路线。
+- active backend key 已改为 `speech_boundary_ja`，旧 `fusionvad_ja` key / package / path 不做兼容。
 - 默认 ASR backend key 已切到 Hugging Face repo ID 本身：`jaykwok/Qwen3-ASR-0.6B-JA-Anime-Galgame`；可选 `jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame`。短 key 不再进入主线，避免 Web/API/cache/download 出现两套命名。
-- FusionVAD-JA frozen feature 默认使用 `jaykwok/Qwen3-ASR-0.6B-JA-Anime-Galgame`，不再默认下载 base 0.6B。
-- FusionVAD-JA 默认运行依赖已收束到仓库内小 checkpoint：v1.19b endpoint refiner 和 v1.21 drop-gap imitation head 都放在 `src/vad/fusionvad_ja/checkpoints/`；默认不再指向 `datasets/train/...` 实验目录。
+- SpeechBoundary-JA frozen feature 默认使用 `jaykwok/Qwen3-ASR-0.6B-JA-Anime-Galgame`，不再默认下载 base 0.6B。
+- SpeechBoundary-JA 默认运行依赖不再包含仓库内小 checkpoint；旧 checkpoint 只作为历史产物保存在本地回收区。
 - 破坏式维护重构：`src/whisper/` 改为 `src/asr/`，`tools/fusionvad_ja/` 按职责拆到 `tools/asr/`、`tools/vad/`、`tools/subtitles/`、`tools/audits/`；Whisper/WhisperSeg/TEN/Silero/FusionLite 当前主线代码和测试移入 `agents/rm/obsolete-mainline-cleanup-20260603/`。
-- 当前主线不再是 high-recall proposal VAD，而是 speech-island boundary VAD：ASR 前 chunk 要尽量接近一句台词，避免长连续 chunk、内部 gap、多 speech island 和非语音多送诱发 ASR 空输出、非语音幻觉和 forced aligner sentinel。
+- 当前主线不再是 high-recall proposal VAD，也不再是固定 gap packer，而是 SpeechBoundary-JA / Boundary Refiner 驱动的 speech-island boundary pipeline：ASR 前 chunk 要尽量接近一句台词，避免长连续 chunk、内部 gap、多 speech island 和非语音多送诱发 ASR 空输出、非语音幻觉和 forced aligner sentinel。
 - 边界优先级：`start` 略高于 `end`，但两者都要进 gate；允许为了切准 speech island 牺牲少量 frame recall，但不能漏掉完整台词 island。
-- 下一步应训练 v1.20 boundary-first endpoint/refiner：显式优化 start/end error、fallback chunk duration、gap crossing、单 chunk 台词数，并把 recall 从硬主目标降为 guardrail。
-- 现行 `tools/` 已按职责重构：`tools/asr/qwen/` 放 Qwen SFT，`tools/asr/diagnostics/` 放 ASR/alignment 诊断，`tools/vad/fusionvad_ja/` 放 VAD 训练评测，`tools/subtitles/` 放 cue planner / speaker sidecar，`tools/audits/` 放审计页与人工审计工具。旧历史段落里的 `tools/fusionvad_ja/...` 路径保留为当时记录。
+- 下一步应把 v1.20-v1.23 的经验收敛到 learned Boundary Refiner：显式优化 start/end error、fallback chunk duration、gap crossing、单 chunk 台词数和 ASR/aligner QC reward；recall 继续作为 guardrail，而不是唯一主目标。
+- 现行 `tools/` 已按职责重构：`tools/asr/qwen/` 放 Qwen SFT，`tools/asr/diagnostics/` 放 ASR/alignment 诊断，`tools/boundary/` 放 Boundary Refiner 数据和训练，`tools/boundary/ja/` 放 SpeechBoundary-JA 训练评测，`tools/subtitles/` 放 cue planner / speaker sidecar，`tools/audits/` 放审计页与人工审计工具。旧历史段落里的 `tools/vad/fusionvad_ja/...` 路径保留为当时记录。
+
+### SpeechBoundary-JA 下一步计划
+
+1. 断兼容改名已完成：`src/vad/fusionvad_ja/` -> `src/boundary/ja/`，`tools/vad/fusionvad_ja/` -> `tools/boundary/ja/`，配置前缀 `FUSIONVAD_JA_` -> `SPEECH_BOUNDARY_JA_`，backend key `fusionvad_ja` -> `speech_boundary_ja`。旧 key / 旧 path / 旧 cache 不做 alias。
+2. 数据格式升级：删除 gap-only / BiLSTM / endpoint-head 训练格式，把 Galgame 与 `joujiboi/japanese-anime-speech-v2` clean speech islands 重新生成 sequence dataset。每条样本包含多 island、touching speech、short/long gap、real negative gap、BGM/noise、轻量 overlap、source/speaker switch。
+3. Learned refiner：只保留 `transformers.Mamba2Model` backbone。输入升级为连续窗口序列：Qwen PTM、MFCC、energy、speech_prob、cut_prob、candidate metadata。输出 split / merge / refine score 和可选 boundary offset。
+4. Planner 接入：`pack_speech_segments()` 只 materialize planner 输出。planner 负责 start/end 权重、fallback-safe duration、gap-crossing penalty、最小/最大 chunk 约束和 ASR-facing span 输出。
+5. 验收：synthetic exact truth 与匿名样片 A 双闭环。主 gate 是 start p90/p95、fallback chunk duration、long/gap-crossing chunk、ASR empty / hallucination、forced/partial 比例；chunk 数只作为成本指标。
+6. 后续强化：supervised 稳定后再加入 preliminary ASR text、token confidence、local CER、aligner sentinel、fallback duration 和 QC reject 做 dense reward / DPO / RL。Unified Joint Model 继续放 backlog，等 SpeechBoundary-JA 能产出稳定 pseudo boundary labels 后再评估。
 
 ---
 
@@ -1033,6 +1053,28 @@ v1.23 后置修正 first-pass：
 
 ---
 
+## 2026-06-04 · Boundary Refiner 训练入口落地
+
+- 主线从固定 `gap <= N` 规则收敛为 `candidate extraction -> Boundary Refiner -> constrained planner`。backbone 入口只保留实际实现名 `transformers.Mamba2Model`，对应 Hugging Face Transformers 纯 PyTorch Mamba2；不再暴露 `mamba2`、`torch_mamba2`、BiGRU、TCN 等同义或 fallback 入口。
+- 新增 `tools/boundary/build_refiner_gap_dataset.py`：读取 FusionVAD label JSONL + feature manifest，按 runtime `RefinerInput` / `DEFAULT_REFINER_FEATURES` 构造 supervised gap samples。feature manifest 断兼容要求 `ptm_dim`，不再读取旧 `whisper_dim`。输出 `boundary_refiner_gap_dataset_v1` JSONL 和 class balance summary。
+- 新增 `tools/boundary/train_refiner.py`：训练 gap-level `BoundarySequenceClassifier(transformers.Mamba2Model)`，保存标准 `boundary_refiner_v1` checkpoint，并立即通过 `load_boundary_refiner()` 做 loader smoke。当前第一版是 gap-level classifier，目的是打通 schema / cache / runtime loader；后续再扩为相邻 gap 序列、dense PTM/MFCC window、preliminary ASR signal 或 RL/DPO。
+- 单测：`tests/test_boundary_refiner_training.py` 覆盖 dataset builder、缺失 `ptm_dim` 报错、checkpoint round trip 和 loader smoke。相关回归 `tests/test_boundary_refiner_training.py tests/test_boundary_refiner.py tests/test_boundary_planner.py tests/test_boundary_cache.py tests/test_pipeline_chunk_config_runtime.py`：`28 passed`。
+- v1.22 smoke：64 条 feature rows 生成 `323` 个 gap samples，其中 `merge_positive=64`、`split_negative=259`。产物：`agents/temp/boundary-refiner/v1-smoke/gaps.jsonl` 和 summary。
+- 训练 smoke：CPU 与提权 CUDA 各跑 3 steps，均能保存并加载 checkpoint。CUDA 产物：`agents/temp/boundary-refiner/v1-smoke/train-cuda/boundary_refiner.pt`，metrics：`agents/temp/boundary-refiner/v1-smoke/train-cuda/metrics.json`。受限 sandbox 内 `torch.cuda.is_available=False` 且 NVML 初始化失败；提权后 `.venv` 中 `torch 2.12.0+cu130` 可见 RTX 4060 Ti，确认训练需要提权 CUDA。
+- Transformers Mamba2 会提示 `fast path is not available ... Falling back to the naive implementation`。这是当前 Windows-friendly / pure PyTorch 默认路径，符合分发目标；不把 Linux-only `mamba-ssm`、Triton 或自定义 CUDA kernel 放进默认依赖。
+- 数据限制：v1.22 cutpoint 数据主要提供 split supervision（贴连换人、短 gap 换人、可删除长 gap），不能单独训练完整 merge/split policy。正式训练前需要混入 clean speech-island 原料构造 same-utterance merge-positive。
+- 新数据源候选：Grok/HF 页面确认 `joujiboi/japanese-anime-speech-v2` 约 292,637 audio-text pairs、约 450 小时 anime / visual novel speech，平均 SFW clip 约 5.3s，GPL。它适合作为额外 clean speech-island 原料源，与 `litagin/Galgame_Speech_ASR_16kHz` 一起合成多 island、touching、short gap、long gap、speaker/source switch 的 Boundary Refiner 训练集；进入正式训练前需本地审计 license、字段、下载规模和文本质量。
+- 数据源落地：`tools/vad/fusionvad_ja/materialize_hf_audio.py` 已支持 `txt`、`text`、`transcription`、`transcript`、`sentence` 文本字段。`joujiboi/japanese-anime-speech-v2` 实际 split 为 `sfw` / `nsfw`；按目标域需要保留 NSFW 并提高权重。已 materialize `nsfw=512`、`sfw=256`，`litagin/Galgame_Speech_ASR_16kHz` 复用现有 `galgame-materialized-512`。
+- 旧生成数据清理：历史 generated datasets / feature caches / train-v0 旧产物已移入 `agents/rm/generated-boundary-datasets-20260604/`，源数据和负样本素材保留。后续如需释放空间再人工确认清理 `agents/rm/`。
+- v1.23 mixed source manifest：新增 `tools/boundary/build_weighted_source_manifest.py`，按 `anime_nsfw=45`、`galgame=35`、`anime_sfw=20` 采样 `20000` 行，实际 group counts 为 `9000/7000/4000`。目的不是排除 NSFW，而是让 JAV 目标域更贴近，同时保留 galgame 和 SFW 泛化。
+- v1.23 mixed synthetic timeline：输出 `datasets/train/fusionvad-ja/v1-23-boundary-refiner/mixed-nsfw45-galgame35-sfw20-boundary4096/`。4096 records，总时长 `129092.42s`，speech frame ratio `0.8566`，speaker turn boundaries `16384`，cut point segments `11444`，cut drop zones `4882`。内部 gap policy：regular `4940`、short `7389`、touch `4055`；gap mode：real_negative `12319`、fade_noise `2112`、hum `2006`、silence `2061`、white_noise `2023`；background mix `1663`、overlap mix `326`。
+- feature cache 取舍：最初压缩 `.npz` 写入时 write 约 `6s/batch`，明显拖慢 CUDA；用户确认磁盘空间充足后切到 `--no-compress`。无压缩 cache 输出 `datasets/train/fusionvad-ja/v1-23-boundary-refiner/qwen3-asr-0.6b-full29239/mixed-nsfw45-galgame35-sfw20-boundary4096-feature-cache-nocompress/`，4096/4096 cached，errors/skipped `0`，大小约 `26G`；write 降到约 `0.18-0.20s/batch`，瓶颈回到 PTM 前向。
+- v1.23 gap dataset：`synthetic_merge_positives_per_record=1` 生成 `20711` gap samples，`merge_positive=4096`、`split_negative=16615`。label reasons：`merge_synthetic_intra_island=4096`、`split_speaker_change=6750`、`split_overlap=4984`、`split_gap_zone=4777`、`split_long_gap=104`。feature dims：`ptm_dim=1024`、`mfcc_dim=40`。
+- v1.23 learned Boundary Refiner v0：CUDA 训练 `300` steps，`batch_size=512`、`lr=5e-4`、`weight_decay=0.01`、hidden `128`、layers `2`、state `32`，产物 `datasets/train/fusionvad-ja/v1-23-boundary-refiner/qwen3-asr-0.6b-full29239/boundary-refiner-mamba2-mixed4096-v0/boundary_refiner.pt`。val：accuracy `0.99565`，merge precision `0.97837`，merge recall `1.0`，merge F1 `0.98906`，FP `9`、FN `0`。注意：这个指标主要验证 schema / 数据闭环 / first supervised signal 成立，不能替代匿名样片 GPU downstream 验收。
+- v1.23 Mamba2 v0 downstream 诊断口径修正：`measure_fallback_safe_boundaries.py` 不再用旧 `vad_coarse_after_sentinel` / bucket / quality 规则库反推 fallback，也不保留 dataclass/helper 别名层；直接以当前 diagnostics 原字段为准：`fallback_type != none` 才算 alignment fallback，`fallback_subtype` 原值只做 reason，`sentinel_lines` 非空才计 sentinel fallback，缺失 `fallback_type` 的旧 diagnostics 直接报错。修正后匿名样片 A v0：chunks `1098`，alignment fallback `387`，unsafe `113`，safe ratio `0.708`，fallback duration p50/p90/max `5.54 / 10.80 / 23.09s`，unsafe p50/p90/max `10.25 / 12.76 / 23.09s`；reason counts 为 `proportional_after_sentinel=373`、`asr_qc_reject=14`。
+
+---
+
 ## 已降级路线
 
 - `fusion_lite`：保留为 baseline / fallback 思路，不再是当前默认 VAD。
@@ -1046,6 +1088,7 @@ v1.23 后置修正 first-pass：
 ## 常见坑
 
 - Codex sandbox 可能隔离 GPU；全片 VAD/ASR/ForcedAligner、ONNXRuntime CUDA、Torch CUDA、feature cache 或训练需要提权，并确认 `actual_device=cuda` / `model_param_device=cuda:*` / `CUDAExecutionProvider`。
+- Torch CUDA 也可能在 sandbox 内显示 `cuda_available=False`，但提权后同一个 `.venv` 可正常看到 GPU。2026-06-04 Boundary Refiner smoke 即为例：sandbox 报 NVML 初始化失败，提权后 RTX 4060 Ti 可见。
 - FusionVAD-JA 的 feature cache、训练、逐帧概率导出和全片 workflow 不再用 CPU 跑大规模任务；能 CUDA 就提权 CUDA。2026-06-02 曾用 CPU 导出 v1.21 drop_gap 逐帧概率，虽然跑完但效率差且产物已移入 `agents/rm/fusionvad-ja-cpu-dropgap-probabilities-20260602/`，后续重跑走 CUDA。
 - 联网默认受限；Hugging Face / ModelScope 下载、`uv pip`、`npm install`、`curl`、`git fetch`、外部搜索或 API 探测遇到网络错误时，先按“需要提权或代理环境”处理。
 - 长跑命令不要静默后台化后直接退出 shell；全片 workflow / 训练 / 大规模评测要么前台持有进程，要么在同一 shell 内循环 tail 日志并 `wait`。

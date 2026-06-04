@@ -15,7 +15,7 @@ if str(SRC_ROOT) not in sys.path:
 
 import numpy as np
 
-from vad.fusionvad_ja import audit_audio, sample_hf_audio_16k_mono
+from boundary.ja import audit_audio, sample_hf_audio_16k_mono
 
 
 def _load_dataset(*, name: str, split: str):
@@ -134,11 +134,11 @@ def run(args: argparse.Namespace) -> None:
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Audit Galgame ASR samples for FusionVAD-JA research.")
+    parser = argparse.ArgumentParser(description="Audit Galgame ASR samples for SpeechBoundary-JA research.")
     parser.add_argument("--dataset", default="litagin/Galgame_Speech_ASR_16kHz")
     parser.add_argument("--split", default="train")
     parser.add_argument("--limit", type=int, default=1000)
-    parser.add_argument("--output-dir", default=str(PROJECT_ROOT / "agents" / "temp" / "fusionvad-ja" / "galgame-audit"))
+    parser.add_argument("--output-dir", default=str(PROJECT_ROOT / "agents" / "temp" / "speech-boundary-ja" / "galgame-audit"))
     return parser.parse_args(argv)
 
 

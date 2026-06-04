@@ -19,7 +19,7 @@ def _configure(monkeypatch) -> None:
     monkeypatch.setattr(
         main.asr_module,
         "_get_asr_runtime_signature",
-        lambda last_vad_signature=None: {"asr": "sig"},
+        lambda last_boundary_signature=None: {"asr": "sig"},
     )
 
 
@@ -27,7 +27,9 @@ def _cache_signature(ctx) -> dict:
     return main.aligned_cache_expectations_for_ctx(ctx, backend_label="mock_asr")[1]
 
 
-def test_aligned_cache_signature_uses_task_video_fps(monkeypatch, tmp_path):
+def test_aligned_cache_signature_uses_video_fps_only_for_subtitle_timing(
+    monkeypatch, tmp_path
+):
     video_path = tmp_path / "clip.mp4"
     video_path.write_bytes(b"fake-video")
     ctx = make_job_context(
@@ -38,6 +40,7 @@ def test_aligned_cache_signature_uses_task_video_fps(monkeypatch, tmp_path):
         keep_temp_files=True,
     )
     _configure(monkeypatch)
+    monkeypatch.setenv("BOUNDARY_FEATURE_FRAME_HOP_S", "0.02")
     monkeypatch.setattr(pipeline_audio, "probe_video_fps", lambda _path: 25.0)
 
     expected = main.aligned_cache_expectations_for_ctx(
@@ -46,8 +49,11 @@ def test_aligned_cache_signature_uses_task_video_fps(monkeypatch, tmp_path):
         video_fps=pipeline_audio.probe_video_fps(str(video_path)),
     )[1]
 
-    assert expected["asr_stage_config"]["ASR_CHUNK_PACK_FRAME_HOP_S"] == "0.04"
+    assert expected["asr_stage_config"]["BOUNDARY_FEATURE_FRAME_HOP_S"] == "0.02"
+    assert "BOUNDARY_FRAME_HOP_S" not in expected["asr_stage_config"]
     assert expected["subtitle"]["timeline_mode"] == "alignment"
+    assert expected["subtitle"]["video_fps"] == 25.0
+    assert expected["subtitle"]["frame_gap_s"] == pytest.approx(2 / 25.0)
 
 
 def test_aligned_segments_written_with_audio_cache_key(monkeypatch, tmp_path):
@@ -90,7 +96,7 @@ def test_aligned_segments_written_with_audio_cache_key(monkeypatch, tmp_path):
     assert payload["backend"] == "mock_asr"
     assert payload["audio_cache_key"]
     assert payload["cache_stage"] == "ready"
-    assert payload["cache_signature"]["version"] == 2
+    assert payload["cache_signature"]["version"] == 3
     assert payload["cache_signature"]["subtitle"]["timeline_mode"] == "alignment"
     assert payload["segments"] == [{"start": 0.0, "end": 1.0, "text": "こんにちは"}]
     assert payload["asr_log"] == ["mock asr"]

@@ -36,7 +36,7 @@ from asr.timestamp_fallback import build_word_timestamps_fallback
 
 logger = logging.getLogger(__name__)
 
-_SEGMENT_CUT_MIN_SILENCE_S = float(os.getenv("SEGMENT_CUT_MIN_SILENCE", "0.5"))
+_ASR_CONTEXT_RESET_GAP_S = float(os.getenv("ASR_CONTEXT_RESET_GAP_S", "0.5"))
 _ASR_SLIDING_CONTEXT_SEGS = max(0, int(os.getenv("ASR_SLIDING_CONTEXT_SEGS", "2")))
 _ASR_INITIAL_PROMPT_MAX_CHARS = int(os.getenv("ASR_INITIAL_PROMPT_MAX_CHARS", "240"))
 _ALIGNMENT_STEP_DOWN_CHUNK_S = float(os.getenv("ALIGNMENT_STEP_DOWN_CHUNK", "6.0"))
@@ -300,10 +300,10 @@ def _sentinel_island_split_enabled() -> bool:
 
 def _alignment_pack_frame_hop_s() -> float:
     try:
-        value = float(os.getenv("ASR_CHUNK_PACK_FRAME_HOP_S", str(1.0 / 29.97)))
+        value = float(os.getenv("BOUNDARY_FEATURE_FRAME_HOP_S", "0.02"))
     except (TypeError, ValueError):
-        value = 1.0 / 29.97
-    return value if value > 0 else 1.0 / 29.97
+        value = 0.02
+    return value if value > 0 else 0.02
 
 
 def _alignment_sentinel_island_pad_s() -> float:
@@ -936,7 +936,7 @@ def _chunk_gender_label(chunk: dict) -> str:
 
 def _should_reset_sliding_context(previous: dict, current: dict) -> bool:
     gap = float(current.get("start", 0.0)) - float(previous.get("end", 0.0))
-    if gap > _SEGMENT_CUT_MIN_SILENCE_S:
+    if gap > _ASR_CONTEXT_RESET_GAP_S:
         return True
 
     previous_gender = _chunk_gender_label(previous)
@@ -1085,6 +1085,7 @@ def _finalize_aligned_chunk_without_asr_retry(
         chunk_log.append("Alignment 回退: 使用等比分配时间戳")
         if fallback_meta.get("vad_error"):
             chunk_log.append(f"Alignment VAD 回退异常: {fallback_meta['vad_error']}")
+    chunk_log.append(f"Alignment 模式: {fallback_mode}")
     return fallback_words, chunk_log
 
 
@@ -1506,6 +1507,7 @@ def _transcribe_asr_chunk_with_retry(
             chunk_log.append("Alignment 快速回退: 使用等比分配时间戳")
             if fallback_meta.get("vad_error"):
                 chunk_log.append(f"Alignment VAD 回退异常: {fallback_meta['vad_error']}")
+        chunk_log.append(f"Alignment 模式: {fallback_mode}")
         return fallback_words, chunk_log
 
     if retry_depth < _ALIGNMENT_MAX_REFINE_DEPTH and duration > _ALIGNMENT_COARSE_REFINE_CHUNK_S:
@@ -1546,6 +1548,7 @@ def _transcribe_asr_chunk_with_retry(
             chunk_log.append("Alignment 降级失败: 子片段不足，改用等比分配时间戳")
             if fallback_meta.get("vad_error"):
                 chunk_log.append(f"Alignment VAD 回退异常: {fallback_meta['vad_error']}")
+        chunk_log.append(f"Alignment 模式: {fallback_mode}")
         return fallback_words, chunk_log
 
     retry_dir, retry_infos = _extract_wav_chunks(source_audio_path, retry_spans)
@@ -1602,6 +1605,7 @@ def _transcribe_asr_chunk_with_retry(
         chunk_log.append("Alignment 降级后仍异常: 改用等比分配时间戳")
         if fallback_meta.get("vad_error"):
             chunk_log.append(f"Alignment VAD 回退异常: {fallback_meta['vad_error']}")
+    chunk_log.append(f"Alignment 模式: {fallback_mode}")
     return fallback_words, chunk_log
 
 

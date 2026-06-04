@@ -1,127 +1,72 @@
+import pytest
+
 from asr import pipeline
 
 
-def test_chunk_config_reads_packing_env_at_runtime(monkeypatch):
-    monkeypatch.setenv("ASR_CHUNK_PACKING_ENABLED", "0")
-    assert pipeline._chunk_config()["packing_enabled"] is False
-
-    monkeypatch.setenv("ASR_CHUNK_PACKING_ENABLED", "1")
-    assert pipeline._chunk_config()["packing_enabled"] is True
-
-
 def test_chunk_config_reads_drop_env_at_runtime(monkeypatch):
-    monkeypatch.setenv("ASR_CHUNK_DROP_ENABLED", "0")
-    assert pipeline._chunk_config()["drop_enabled"] is False
+    monkeypatch.setenv("BOUNDARY_DROP_LOW_ENERGY_ENABLED", "0")
+    assert pipeline._boundary_config()["drop_enabled"] is False
 
-    monkeypatch.setenv("ASR_CHUNK_DROP_ENABLED", "1")
-    monkeypatch.setenv("ASR_CHUNK_DROP_MIN_DURATION_S", "0.33")
-    monkeypatch.setenv("ASR_CHUNK_DROP_RMS_DBFS", "-35.5")
-    cfg = pipeline._chunk_config()
+    monkeypatch.setenv("BOUNDARY_DROP_LOW_ENERGY_ENABLED", "1")
+    monkeypatch.setenv("BOUNDARY_DROP_LOW_ENERGY_MIN_DURATION_S", "0.33")
+    monkeypatch.setenv("BOUNDARY_DROP_LOW_ENERGY_RMS_DBFS", "-35.5")
+    cfg = pipeline._boundary_config()
 
     assert cfg["drop_enabled"] is True
     assert cfg["drop_min_duration_s"] == 0.33
     assert cfg["drop_rms_dbfs"] == -35.5
 
 
-def test_chunk_config_reads_pre_asr_island_split_env_at_runtime(monkeypatch):
-    monkeypatch.setenv("ASR_PRE_ASR_ISLAND_SPLIT_ENABLED", "1")
-    monkeypatch.setenv("ASR_PRE_ASR_ISLAND_SPLIT_MIN_CORE_FRAMES", "300")
-    monkeypatch.setenv("ASR_PRE_ASR_ISLAND_SPLIT_MIN_GAP_FRAMES", "12")
-    monkeypatch.setenv("ASR_PRE_ASR_ISLAND_SPLIT_MIN_ISLAND_FRAMES", "4")
-    monkeypatch.setenv("ASR_PRE_ASR_ISLAND_SPLIT_MAX_CHILDREN", "5")
+def test_chunk_config_reads_boundary_refiner_env_at_runtime(monkeypatch):
+    monkeypatch.setenv("BOUNDARY_REFINER_ENABLED", "1")
+    monkeypatch.setenv("BOUNDARY_REFINER_MODEL_PATH", "models/boundary-refiner.pt")
+    monkeypatch.setenv("BOUNDARY_REFINER_BACKBONE", "transformers.Mamba2Model")
+    monkeypatch.setenv("BOUNDARY_REFINER_THRESHOLD", "0.63")
 
-    cfg = pipeline._chunk_config()
+    cfg = pipeline._boundary_config()
 
-    assert cfg["pre_asr_island_split_enabled"] is True
-    assert cfg["pre_asr_island_split_min_core_frames"] == 300
-    assert cfg["pre_asr_island_split_min_gap_frames"] == 12
-    assert cfg["pre_asr_island_split_min_island_frames"] == 4
-    assert cfg["pre_asr_island_split_max_children"] == 5
+    assert cfg["boundary_refiner_enabled"] is True
+    assert cfg["boundary_refiner_model_path"] == "models/boundary-refiner.pt"
+    assert cfg["boundary_refiner_backbone"] == "transformers.Mamba2Model"
+    assert cfg["boundary_refiner_threshold"] == 0.63
 
 
-def test_chunk_config_reads_pre_asr_valley_split_env_at_runtime(monkeypatch):
-    monkeypatch.setenv("ASR_PRE_ASR_VALLEY_SPLIT_ENABLED", "1")
-    monkeypatch.setenv("ASR_PRE_ASR_VALLEY_SPLIT_MIN_CORE_FRAMES", "360")
-    monkeypatch.setenv("ASR_PRE_ASR_VALLEY_SPLIT_TARGET_CORE_FRAMES", "240")
-    monkeypatch.setenv("ASR_PRE_ASR_VALLEY_SPLIT_MIN_VALLEY_FRAMES", "8")
-    monkeypatch.setenv("ASR_PRE_ASR_VALLEY_SPLIT_MIN_CHILD_FRAMES", "30")
-    monkeypatch.setenv("ASR_PRE_ASR_VALLEY_SPLIT_MAX_CHILDREN", "6")
-    monkeypatch.setenv("ASR_PRE_ASR_VALLEY_SPLIT_THRESHOLD", "0.15")
+def test_chunk_config_rejects_non_mamba2_boundary_refiner(monkeypatch):
+    monkeypatch.setenv("BOUNDARY_REFINER_BACKBONE", "tcn")
 
-    cfg = pipeline._chunk_config()
-
-    assert cfg["pre_asr_valley_split_enabled"] is True
-    assert cfg["pre_asr_valley_split_min_core_frames"] == 360
-    assert cfg["pre_asr_valley_split_target_core_frames"] == 240
-    assert cfg["pre_asr_valley_split_min_valley_frames"] == 8
-    assert cfg["pre_asr_valley_split_min_child_frames"] == 30
-    assert cfg["pre_asr_valley_split_max_children"] == 6
-    assert cfg["pre_asr_valley_split_threshold"] == 0.15
+    with pytest.raises(ValueError, match="only transformers\\.Mamba2Model"):
+        pipeline._boundary_config()
 
 
-def test_chunk_config_reads_pre_asr_cut_split_env_at_runtime(monkeypatch):
-    monkeypatch.setenv("ASR_PRE_ASR_CUT_SPLIT_ENABLED", "1")
-    monkeypatch.setenv("ASR_PRE_ASR_CUT_SPLIT_MIN_CORE_FRAMES", "360")
-    monkeypatch.setenv("ASR_PRE_ASR_CUT_SPLIT_TARGET_CORE_FRAMES", "240")
-    monkeypatch.setenv("ASR_PRE_ASR_CUT_SPLIT_MIN_CUT_FRAMES", "4")
-    monkeypatch.setenv("ASR_PRE_ASR_CUT_SPLIT_MIN_CHILD_FRAMES", "30")
-    monkeypatch.setenv("ASR_PRE_ASR_CUT_SPLIT_MAX_CHILDREN", "6")
-    monkeypatch.setenv("ASR_PRE_ASR_CUT_SPLIT_THRESHOLD", "0.92")
+def test_chunk_config_rejects_mamba2_alias(monkeypatch):
+    monkeypatch.setenv("BOUNDARY_REFINER_BACKBONE", "mamba2")
 
-    cfg = pipeline._chunk_config()
-
-    assert cfg["pre_asr_cut_split_enabled"] is True
-    assert cfg["pre_asr_cut_split_min_core_frames"] == 360
-    assert cfg["pre_asr_cut_split_target_core_frames"] == 240
-    assert cfg["pre_asr_cut_split_min_cut_frames"] == 4
-    assert cfg["pre_asr_cut_split_min_child_frames"] == 30
-    assert cfg["pre_asr_cut_split_max_children"] == 6
-    assert cfg["pre_asr_cut_split_threshold"] == 0.92
+    with pytest.raises(ValueError, match="only transformers\\.Mamba2Model"):
+        pipeline._boundary_config()
 
 
-def test_chunk_config_reads_pre_asr_drop_gap_split_env_at_runtime(monkeypatch):
-    monkeypatch.setenv("ASR_PRE_ASR_DROP_GAP_SPLIT_ENABLED", "1")
-    monkeypatch.setenv("ASR_PRE_ASR_DROP_GAP_SPLIT_MIN_PARENT_FRAMES", "360")
-    monkeypatch.setenv("ASR_PRE_ASR_DROP_GAP_SPLIT_MIN_GAP_FRAMES", "4")
-    monkeypatch.setenv("ASR_PRE_ASR_DROP_GAP_SPLIT_MIN_GAP_S", "0.55")
-    monkeypatch.setenv("ASR_PRE_ASR_DROP_GAP_SPLIT_MIN_CHILD_FRAMES", "30")
-    monkeypatch.setenv("ASR_PRE_ASR_DROP_GAP_SPLIT_MAX_CHILDREN", "6")
-    monkeypatch.setenv("ASR_PRE_ASR_DROP_GAP_SPLIT_THRESHOLD", "0.82")
+def test_chunk_config_rejects_torch_mamba2_alias(monkeypatch):
+    monkeypatch.setenv("BOUNDARY_REFINER_BACKBONE", "torch_mamba2")
 
-    cfg = pipeline._chunk_config()
-
-    assert cfg["pre_asr_drop_gap_split_enabled"] is True
-    assert cfg["pre_asr_drop_gap_split_min_parent_frames"] == 360
-    assert cfg["pre_asr_drop_gap_split_min_gap_frames"] == 4
-    assert cfg["pre_asr_drop_gap_split_min_gap_s"] == 0.55
-    assert cfg["pre_asr_drop_gap_split_min_child_frames"] == 30
-    assert cfg["pre_asr_drop_gap_split_max_children"] == 6
-    assert cfg["pre_asr_drop_gap_split_threshold"] == 0.82
+    with pytest.raises(ValueError, match="only transformers\\.Mamba2Model"):
+        pipeline._boundary_config()
 
 
-def test_chunk_config_reads_pre_asr_risk_split_env_at_runtime(monkeypatch):
-    monkeypatch.setenv("ASR_PRE_ASR_RISK_SPLIT_ENABLED", "1")
-    monkeypatch.setenv("ASR_PRE_ASR_RISK_SPLIT_MIN_CORE_FRAMES", "360")
-    monkeypatch.setenv("ASR_PRE_ASR_RISK_SPLIT_TARGET_CORE_FRAMES", "240")
-    monkeypatch.setenv("ASR_PRE_ASR_RISK_SPLIT_SAFE_CORE_FRAMES", "300")
-    monkeypatch.setenv("ASR_PRE_ASR_RISK_SPLIT_MIN_GAP_FRAMES", "4")
-    monkeypatch.setenv("ASR_PRE_ASR_RISK_SPLIT_MIN_CHILD_FRAMES", "30")
-    monkeypatch.setenv("ASR_PRE_ASR_RISK_SPLIT_MAX_CHILDREN", "6")
-    monkeypatch.setenv("ASR_PRE_ASR_RISK_SPLIT_THRESHOLD", "1.2")
-    monkeypatch.setenv("ASR_PRE_ASR_RISK_SPLIT_CONTINUOUS_THRESHOLD", "2.4")
-    monkeypatch.setenv("ASR_PRE_ASR_RISK_SPLIT_VALLEY_THRESHOLD", "0.15")
-    monkeypatch.setenv("ASR_PRE_ASR_RISK_SPLIT_CUT_THRESHOLD", "0.97")
+def test_chunk_config_reads_boundary_planner_env_at_runtime(monkeypatch):
+    monkeypatch.setenv("BOUNDARY_FEATURE_FRAME_HOP_S", "0.04")
+    monkeypatch.setenv("BOUNDARY_PLANNER_TARGET_CHUNK_S", "8.0")
+    monkeypatch.setenv("BOUNDARY_PLANNER_MAX_CHUNK_S", "28.0")
+    monkeypatch.setenv("BOUNDARY_PLANNER_MIN_CHUNK_S", "0.5")
+    monkeypatch.setenv("BOUNDARY_PLANNER_START_WEIGHT", "1.7")
+    monkeypatch.setenv("BOUNDARY_PLANNER_TARGET_PADDING_S", "1.5")
+    monkeypatch.setenv("BOUNDARY_PLANNER_MAX_SPLITS_PER_SEGMENT", "12")
 
-    cfg = pipeline._chunk_config()
+    cfg = pipeline._boundary_config()
 
-    assert cfg["pre_asr_risk_split_enabled"] is True
-    assert cfg["pre_asr_risk_split_min_core_frames"] == 360
-    assert cfg["pre_asr_risk_split_target_core_frames"] == 240
-    assert cfg["pre_asr_risk_split_safe_core_frames"] == 300
-    assert cfg["pre_asr_risk_split_min_gap_frames"] == 4
-    assert cfg["pre_asr_risk_split_min_child_frames"] == 30
-    assert cfg["pre_asr_risk_split_max_children"] == 6
-    assert cfg["pre_asr_risk_split_threshold"] == 1.2
-    assert cfg["pre_asr_risk_split_continuous_threshold"] == 2.4
-    assert cfg["pre_asr_risk_split_valley_threshold"] == 0.15
-    assert cfg["pre_asr_risk_split_cut_threshold"] == 0.97
+    assert cfg["feature_frame_hop_s"] == 0.04
+    assert cfg["boundary_planner_target_chunk_s"] == 8.0
+    assert cfg["boundary_planner_max_chunk_s"] == 28.0
+    assert cfg["boundary_planner_min_chunk_s"] == 0.5
+    assert cfg["boundary_planner_start_weight"] == 1.7
+    assert cfg["boundary_planner_target_padding_s"] == 1.5
+    assert cfg["boundary_planner_max_splits_per_segment"] == 12

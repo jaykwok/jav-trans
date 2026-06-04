@@ -416,14 +416,14 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         description=(
             "Extract offline speaker-sidecar embeddings from subtitle cues and "
-            "emit adjacent speaker-change pairs. This does not alter runtime VAD."
+            "emit adjacent speaker-change pairs. This does not alter SpeechBoundary-JA."
         )
     )
     parser.add_argument("--bilingual", required=True, help="bilingual.json path")
     parser.add_argument("--audio", required=True, help="16k/any-rate mono/stereo audio path")
     parser.add_argument(
         "--output-dir",
-        default="agents/temp/fusionvad-ja/speaker-sidecar-embeddings",
+        default="agents/temp/speech-boundary-ja/speaker-sidecar-embeddings",
     )
     parser.add_argument(
         "--backend",

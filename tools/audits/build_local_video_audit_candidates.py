@@ -272,7 +272,7 @@ def build_candidates(args: argparse.Namespace) -> None:
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Build local-video manual VAD audit candidates for FusionVAD-JA.")
+    parser = argparse.ArgumentParser(description="Build local-video manual boundary audit candidates for SpeechBoundary-JA.")
     parser.add_argument("--input", action="append", required=True, help="Video file or directory. Repeatable.")
     parser.add_argument("--recursive", action="store_true")
     parser.add_argument("--limit-videos", type=int)
@@ -290,7 +290,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--overwrite", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument(
         "--output-dir",
-        default=str(PROJECT_ROOT / "datasets" / "val" / "fusionvad-ja" / "v1-6" / "real-heldout-local-video-audit"),
+        default=str(PROJECT_ROOT / "datasets" / "val" / "speech-boundary-ja" / "v1-6" / "real-heldout-local-video-audit"),
     )
     parser.add_argument("--output-candidates", default="audit_candidates.jsonl")
     parser.add_argument("--output-manifest", default="manifest.json")

@@ -115,14 +115,13 @@ def load_diagnostics(path: Path | None) -> dict[int, dict[str, Any]]:
             for reason in row.get("failure_reasons") or []
             if str(reason).strip()
         ]
-        fallback_subtype = str(row.get("fallback_subtype") or "none")
+        fallback_type = str(row.get("fallback_type") or "none")
         alignment_quality = str(row.get("alignment_quality") or "")
         asr_qc_severity = str(row.get("asr_qc_severity") or "").lower()
         hard_risk = (
-            fallback_subtype not in {"", "none"}
-            or alignment_quality in {"vad_coarse", "drop_or_review"}
+            fallback_type not in {"", "none"}
+            or bool(row.get("sentinel_lines") or [])
             or asr_qc_severity == "reject"
-            or "alignment_sentinel" in failure_reasons
             or "asr_qc_reject" in failure_reasons
         )
         warn_risk = bool(hard_risk or row.get("failure_candidate") or asr_qc_severity == "warn")
@@ -130,7 +129,7 @@ def load_diagnostics(path: Path | None) -> dict[int, dict[str, Any]]:
             "chunk_index": chunk_index,
             "hard_risk": hard_risk,
             "warn_risk": warn_risk,
-            "fallback_subtype": fallback_subtype,
+            "fallback_subtype": str(row.get("fallback_subtype") or "none"),
             "alignment_quality": alignment_quality,
             "asr_qc_severity": asr_qc_severity,
             "failure_reasons": failure_reasons,
@@ -997,7 +996,7 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument(
         "--output-dir",
-        default="agents/temp/fusionvad-ja/subtitle-cue-merge-candidates",
+        default="agents/temp/speech-boundary-ja/subtitle-cue-merge-candidates",
     )
     parser.add_argument("--video-fps", type=float, default=30000 / 1001)
     parser.add_argument("--min-score", type=float, default=0.72)

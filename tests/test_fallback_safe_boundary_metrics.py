@@ -4,7 +4,7 @@ import json
 from pathlib import Path
 
 from tools.asr.diagnostics.measure_fallback_safe_boundaries import main
-from tools.vad.fusionvad_ja.analyze_fallback_cut_signal import analyze
+from tools.boundary.ja.analyze_fallback_cut_signal import analyze
 
 
 def _write_json(path: Path, payload: dict) -> None:
@@ -20,8 +20,8 @@ def _write_jsonl(path: Path, rows: list[dict]) -> None:
     )
 
 
-def test_fallback_safe_boundary_metrics_flags_long_coarse_fallback(tmp_path):
-    cache = tmp_path / "vad-cache.json"
+def test_fallback_safe_boundary_metrics_flags_long_alignment_fallback(tmp_path):
+    cache = tmp_path / "boundary-cache.json"
     _write_json(
         cache,
         {
@@ -32,7 +32,7 @@ def test_fallback_safe_boundary_metrics_flags_long_coarse_fallback(tmp_path):
                     "split_reason": "overlong",
                     "core_start": 2.0,
                     "core_end": 26.0,
-                    "vad_segments": [{"start": 2.0, "end": 26.0, "score": 0.9}],
+                    "speech_segments": [{"start": 2.0, "end": 26.0, "score": 0.9}],
                 },
                 {
                     "start": 40.0,
@@ -40,7 +40,7 @@ def test_fallback_safe_boundary_metrics_flags_long_coarse_fallback(tmp_path):
                     "split_reason": "gap",
                     "core_start": 40.5,
                     "core_end": 43.5,
-                    "vad_segments": [{"start": 40.5, "end": 43.5, "score": 0.9}],
+                    "speech_segments": [{"start": 40.5, "end": 43.5, "score": 0.9}],
                 },
                 {
                     "start": 50.0,
@@ -48,7 +48,7 @@ def test_fallback_safe_boundary_metrics_flags_long_coarse_fallback(tmp_path):
                     "split_reason": "gap",
                     "core_start": 50.5,
                     "core_end": 53.5,
-                    "vad_segments": [{"start": 50.5, "end": 53.5, "score": 0.9}],
+                    "speech_segments": [{"start": 50.5, "end": 53.5, "score": 0.9}],
                 },
             ],
         },
@@ -62,7 +62,9 @@ def test_fallback_safe_boundary_metrics_flags_long_coarse_fallback(tmp_path):
                 "start": 0.0,
                 "end": 28.0,
                 "alignment_quality": "vad_coarse",
+                "fallback_type": "vad_coarse",
                 "fallback_subtype": "vad_coarse_after_sentinel",
+                "sentinel_lines": ["sentinel"],
                 "failure_bucket": "vad_coarse_alignment",
                 "display_text": "long fallback",
             },
@@ -71,7 +73,9 @@ def test_fallback_safe_boundary_metrics_flags_long_coarse_fallback(tmp_path):
                 "start": 40.0,
                 "end": 44.0,
                 "alignment_quality": "vad_coarse",
+                "fallback_type": "vad_coarse",
                 "fallback_subtype": "vad_coarse_after_sentinel",
+                "sentinel_lines": ["sentinel"],
                 "failure_bucket": "vad_coarse_alignment",
                 "display_text": "short fallback",
             },
@@ -80,6 +84,7 @@ def test_fallback_safe_boundary_metrics_flags_long_coarse_fallback(tmp_path):
                 "start": 50.0,
                 "end": 54.0,
                 "alignment_quality": "forced",
+                "fallback_type": "none",
                 "fallback_subtype": "none",
                 "failure_bucket": "",
             },
@@ -89,7 +94,7 @@ def test_fallback_safe_boundary_metrics_flags_long_coarse_fallback(tmp_path):
 
     assert main(
         [
-            "--vad-cache",
+            "--boundary-cache",
             str(cache),
             "--diagnostics",
             str(diagnostics),
@@ -122,6 +127,176 @@ def test_fallback_safe_boundary_metrics_flags_long_coarse_fallback(tmp_path):
     assert unsafe[0]["chunk_index"] == 0
 
 
+def test_fallback_safe_boundary_metrics_counts_proportional_sentinel_fallback(tmp_path):
+    cache = tmp_path / "boundary-cache.json"
+    _write_json(
+        cache,
+        {
+            "processing_spans": [
+                {
+                    "start": 10.0,
+                    "end": 20.0,
+                    "split_reason": "boundary_refiner:learned_split",
+                    "core_start": 10.0,
+                    "core_end": 20.0,
+                    "speech_segments": [{"start": 10.0, "end": 20.0, "score": 0.9}],
+                },
+            ],
+        },
+    )
+    diagnostics = tmp_path / "diagnostics.jsonl"
+    _write_jsonl(
+        diagnostics,
+        [
+            {
+                "chunk_index": 0,
+                "start": 10.0,
+                "end": 20.0,
+                "alignment_quality": "proportional",
+                "fallback_type": "proportional",
+                "fallback_subtype": "proportional_after_sentinel",
+                "sentinel_lines": ["sentinel"],
+                "failure_bucket": "proportional_alignment",
+                "display_text": "sentinel fallback",
+            },
+        ],
+    )
+    output_dir = tmp_path / "out"
+
+    assert main(
+        [
+            "--boundary-cache",
+            str(cache),
+            "--diagnostics",
+            str(diagnostics),
+            "--output-dir",
+            str(output_dir),
+            "--target-duration-s",
+            "8",
+        ]
+    ) == 0
+
+    summary = json.loads((output_dir / "summary.json").read_text(encoding="utf-8"))
+    row = json.loads((output_dir / "chunk_metrics.jsonl").read_text(encoding="utf-8").splitlines()[0])
+    unsafe = [
+        json.loads(line)
+        for line in (output_dir / "unsafe_fallback_chunks.jsonl").read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+
+    assert summary["fallback_chunk_count"] == 1
+    assert summary["fallback_unsafe_count"] == 1
+    assert summary["sentinel_fallback_count"] == 1
+    assert summary["fallback_reason_counts"] == {"proportional_after_sentinel": 1}
+    assert row["fallback_reason"] == "proportional_after_sentinel"
+    assert "sentinel_fallback" in row["risk_reasons"]
+    assert unsafe[0]["fallback_reason"] == "proportional_after_sentinel"
+
+
+def test_fallback_safe_boundary_metrics_uses_sentinel_lines_not_subtype_name(tmp_path):
+    cache = tmp_path / "boundary-cache.json"
+    _write_json(
+        cache,
+        {
+            "processing_spans": [
+                {
+                    "start": 0.0,
+                    "end": 12.0,
+                    "split_reason": "boundary_refiner:learned_split",
+                    "core_start": 0.0,
+                    "core_end": 12.0,
+                    "speech_segments": [{"start": 0.0, "end": 12.0, "score": 0.9}],
+                },
+            ],
+        },
+    )
+    diagnostics = tmp_path / "diagnostics.jsonl"
+    _write_jsonl(
+        diagnostics,
+        [
+            {
+                "chunk_index": 0,
+                "start": 0.0,
+                "end": 12.0,
+                "alignment_quality": "partial",
+                "fallback_type": "none",
+                "fallback_subtype": "proportional_after_sentinel",
+                "sentinel_lines": ["sentinel"],
+                "failure_bucket": "partial_alignment",
+            },
+        ],
+    )
+    output_dir = tmp_path / "out"
+
+    assert main(
+        [
+            "--boundary-cache",
+            str(cache),
+            "--diagnostics",
+            str(diagnostics),
+            "--output-dir",
+            str(output_dir),
+            "--target-duration-s",
+            "8",
+        ]
+    ) == 0
+
+    summary = json.loads((output_dir / "summary.json").read_text(encoding="utf-8"))
+    row = json.loads((output_dir / "chunk_metrics.jsonl").read_text(encoding="utf-8").splitlines()[0])
+    assert summary["fallback_chunk_count"] == 0
+    assert summary["sentinel_fallback_count"] == 0
+    assert row["fallback_reason"] == ""
+    assert row["sentinel_fallback"] is False
+
+
+def test_fallback_safe_boundary_metrics_rejects_legacy_diagnostics_without_fallback_type(tmp_path):
+    cache = tmp_path / "boundary-cache.json"
+    _write_json(
+        cache,
+        {
+            "processing_spans": [
+                {
+                    "start": 0.0,
+                    "end": 12.0,
+                    "split_reason": "boundary_refiner:learned_split",
+                    "core_start": 0.0,
+                    "core_end": 12.0,
+                    "speech_segments": [{"start": 0.0, "end": 12.0, "score": 0.9}],
+                },
+            ],
+        },
+    )
+    diagnostics = tmp_path / "diagnostics.jsonl"
+    _write_jsonl(
+        diagnostics,
+        [
+            {
+                "chunk_index": 0,
+                "start": 0.0,
+                "end": 12.0,
+                "alignment_quality": "vad_coarse",
+                "fallback_subtype": "vad_coarse_after_sentinel",
+            },
+        ],
+    )
+
+    try:
+        main(
+            [
+                "--boundary-cache",
+                str(cache),
+                "--diagnostics",
+                str(diagnostics),
+                "--output-dir",
+                str(tmp_path / "out"),
+            ]
+        )
+    except ValueError as exc:
+        assert "fallback_type" in str(exc)
+    else:
+        raise AssertionError("legacy diagnostics without fallback_type should be rejected")
+
+
 def test_fallback_safe_boundary_metrics_adds_truth_and_silence_stats(tmp_path):
     import numpy as np
     import soundfile as sf
@@ -135,7 +310,7 @@ def test_fallback_safe_boundary_metrics_adds_truth_and_silence_stats(tmp_path):
         ]
     )
     sf.write(audio_path, audio, 16000)
-    cache = tmp_path / "vad-cache.json"
+    cache = tmp_path / "boundary-cache.json"
     _write_json(
         cache,
         {
@@ -147,7 +322,7 @@ def test_fallback_safe_boundary_metrics_adds_truth_and_silence_stats(tmp_path):
                     "split_reason": "overlong",
                     "core_start": 0.0,
                     "core_end": 1.2,
-                    "vad_segments": [{"start": 0.0, "end": 1.2, "score": 0.9}],
+                    "speech_segments": [{"start": 0.0, "end": 1.2, "score": 0.9}],
                 },
             ],
         },
@@ -162,7 +337,9 @@ def test_fallback_safe_boundary_metrics_adds_truth_and_silence_stats(tmp_path):
                 "start": 0.0,
                 "end": 1.2,
                 "alignment_quality": "vad_coarse",
+                "fallback_type": "vad_coarse",
                 "fallback_subtype": "vad_coarse_after_sentinel",
+                "sentinel_lines": ["sentinel"],
                 "failure_bucket": "vad_coarse_alignment",
                 "source_audio_path": str(audio_path),
                 "display_text": "fallback",
@@ -184,7 +361,7 @@ def test_fallback_safe_boundary_metrics_adds_truth_and_silence_stats(tmp_path):
 
     assert main(
         [
-            "--vad-cache",
+            "--boundary-cache",
             str(cache),
             "--diagnostics",
             str(diagnostics),
@@ -224,7 +401,9 @@ def test_fallback_cut_signal_analysis_reports_feasible_candidates(tmp_path):
                 "core_start": 0.0,
                 "core_end": 24.0,
                 "split_reason": "overlong",
+                "fallback_type": "vad_coarse",
                 "fallback_subtype": "vad_coarse_after_sentinel",
+                "sentinel_lines": ["sentinel"],
                 "display_text": "omitted by output",
             },
         ],
@@ -274,7 +453,9 @@ def test_fallback_cut_signal_analysis_reports_missing_candidates(tmp_path):
                 "core_start": 0.0,
                 "core_end": 24.0,
                 "split_reason": "overlong",
+                "fallback_type": "vad_coarse",
                 "fallback_subtype": "vad_coarse_after_sentinel",
+                "sentinel_lines": ["sentinel"],
             },
         ],
     )

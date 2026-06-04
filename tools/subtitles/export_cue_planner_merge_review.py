@@ -345,7 +345,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--planner-actions", required=True, help="planner_actions.json")
     parser.add_argument(
         "--output-dir",
-        default="agents/temp/fusionvad-ja/cue-planner-merge-review",
+        default="agents/temp/speech-boundary-ja/cue-planner-merge-review",
     )
     parser.add_argument(
         "--reading-warn-units-per-s",

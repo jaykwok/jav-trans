@@ -123,7 +123,7 @@ def main() -> int:
         description=(
             "Offline speaker sidecar probe. Input is JSONL with segment timing and "
             "precomputed ERes2NetV2/3D-Speaker/CAM++ embeddings. The tool only "
-            "computes adjacent speaker-change scores; it does not replace VAD."
+            "computes adjacent speaker-change scores; it does not replace SpeechBoundary-JA."
         )
     )
     parser.add_argument("--segments", required=True, help="JSONL with segment embeddings.")

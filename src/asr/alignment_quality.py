@@ -15,18 +15,6 @@ FallbackType = Literal["none", "vad_coarse", "proportional", "unknown"]
 
 
 _NORMAL_MODES = {"", "empty", "forced_aligner", "nonlexical", "align_text_empty"}
-_VAD_FALLBACK_MARKERS = (
-    "aligner_vad_fallback",
-    "vad fallback",
-    "vad 回退",
-    "vad 约束",
-)
-_PROPORTIONAL_FALLBACK_MARKERS = (
-    "even_fallback",
-    "proportional",
-    "等比分配",
-    "比例时间戳",
-)
 
 
 def _unique(items: list[str]) -> list[str]:
@@ -97,24 +85,15 @@ def _fallback_subtype(
     return "none"
 
 
-def infer_alignment_fallback_type(
-    *,
-    alignment_mode: str,
-    fallback_lines: list[str] | tuple[str, ...] | None = None,
-) -> FallbackType:
+def infer_alignment_fallback_type(*, alignment_mode: str) -> FallbackType:
     mode = (alignment_mode or "").strip()
+    if mode == "aligner_vad_fallback":
+        return "vad_coarse"
+    if mode == "even_fallback":
+        return "proportional"
     if mode in {"nonlexical", "align_text_empty"}:
         return "none"
-    lines = "\n".join(str(line) for line in (fallback_lines or []))
-    haystack = f"{mode}\n{lines}".lower()
-
-    if any(marker in haystack for marker in _VAD_FALLBACK_MARKERS):
-        return "vad_coarse"
-    if any(marker in haystack for marker in _PROPORTIONAL_FALLBACK_MARKERS):
-        return "proportional"
     if mode and mode not in _NORMAL_MODES:
-        return "unknown"
-    if lines.strip():
         return "unknown"
     return "none"
 
@@ -129,7 +108,6 @@ def classify_alignment_quality(
     asr_qc_severity: str = "",
     alignment_mode: str = "",
     align_error: str = "",
-    fallback_lines: list[str] | tuple[str, ...] | None = None,
     sentinel_lines: list[str] | tuple[str, ...] | None = None,
     aligned_segment_count: int = 0,
     word_stats: dict[str, Any] | None = None,
@@ -141,10 +119,7 @@ def classify_alignment_quality(
     """
 
     stripped_text = (text or "").strip()
-    fallback_type = infer_alignment_fallback_type(
-        alignment_mode=alignment_mode,
-        fallback_lines=fallback_lines,
-    )
+    fallback_type = infer_alignment_fallback_type(alignment_mode=alignment_mode)
     stats = word_stats or {}
     word_count = _safe_int(stats.get("word_count"))
     zero_count = _safe_int(stats.get("zero_or_negative_count"))

@@ -5,7 +5,8 @@ import sys
 import wave
 from pathlib import Path
 
-from vad.base import SegmentationResult, SpeechSegment
+from audio.chunk_packer import PackedChunk
+from boundary.base import SegmentationResult, SpeechSegment
 
 ROOT = Path(__file__).resolve().parents[1]
 SRC = ROOT / "src"
@@ -29,7 +30,7 @@ def _segments() -> list[SpeechSegment]:
     ]
 
 
-class _StubVadBackend:
+class _StubSpeechBoundaryBackend:
     name = "stub"
 
     def segment(
@@ -54,7 +55,7 @@ class _StubVadBackend:
         return {"backend": self.name}
 
 
-class _EmptyAllowedVadBackend:
+class _EmptyAllowedSpeechBoundaryBackend:
     name = "empty_allowed"
 
     def segment(
@@ -78,32 +79,8 @@ class _EmptyAllowedVadBackend:
         return {"backend": self.name, "allow_empty": True}
 
 
-class _EmptyDisallowedVadBackend:
+class _EmptyDisallowedSpeechBoundaryBackend:
     name = "empty_disallowed"
-
-    def segment(
-        self,
-        audio_path: str,
-        *,
-        target_sr: int = 16000,
-        threshold_override: float | None = None,
-    ) -> SegmentationResult:
-        del audio_path, target_sr, threshold_override
-        return SegmentationResult(
-            segments=[],
-            groups=[],
-            method=self.name,
-            audio_duration_sec=10.0,
-            parameters={"backend": self.name},
-            processing_time_sec=0.0,
-        )
-
-    def signature(self) -> dict:
-        return {"backend": self.name}
-
-
-class _RawEmptyVadBackend:
-    name = "raw_empty"
 
     def segment(
         self,
@@ -209,16 +186,12 @@ class _LowLogprobBackend(_RecordingBackend):
         ]
 
 
-def _reload_pipeline(monkeypatch, tmp_path: Path, *, packing_enabled: str):
-    monkeypatch.setenv("ASR_CHUNK_PACKING_ENABLED", packing_enabled)
-    monkeypatch.setenv("ASR_CHUNK_PACK_FRAME_HOP_S", str(1.0 / 29.97))
-    monkeypatch.setenv("ASR_CHUNK_PACK_WINDOW_FRAMES", "899")
-    monkeypatch.setenv("ASR_CHUNK_PACK_RESERVE_FRAMES", "45")
-    monkeypatch.setenv("ASR_CHUNK_PACK_TARGET_PADDING_FRAMES", "0")
-    monkeypatch.setenv("ASR_CHUNK_PACK_GAP_MERGE_FRAMES", "45")
+def _reload_pipeline(monkeypatch, tmp_path: Path):
+    monkeypatch.setenv("BOUNDARY_FEATURE_FRAME_HOP_S", "0.02")
+    monkeypatch.setenv("BOUNDARY_PLANNER_TARGET_PADDING_S", "0")
+    monkeypatch.setenv("BOUNDARY_PLANNER_TARGET_CHUNK_S", "9.0")
+    monkeypatch.setenv("BOUNDARY_PLANNER_MAX_CHUNK_S", "30.0")
     monkeypatch.setenv("ASR_CHUNK_ROOT", str(tmp_path / "chunks"))
-    monkeypatch.setenv("VAD_MERGE_SHORT_MAX_S", "0")
-    monkeypatch.setenv("VAD_MERGE_GAP_MAX_S", "0")
     monkeypatch.setenv("ASR_CHECKPOINT_ENABLED", "0")
 
     from asr import pipeline as asr
@@ -226,14 +199,14 @@ def _reload_pipeline(monkeypatch, tmp_path: Path, *, packing_enabled: str):
     return importlib.reload(asr)
 
 
-def _run_transcription(monkeypatch, tmp_path: Path, *, packing_enabled: str):
-    asr = _reload_pipeline(monkeypatch, tmp_path, packing_enabled=packing_enabled)
-    source = tmp_path / f"source_{packing_enabled}.wav"
+def _run_transcription(monkeypatch, tmp_path: Path):
+    asr = _reload_pipeline(monkeypatch, tmp_path)
+    source = tmp_path / "source_boundary.wav"
     _write_wav(source, seconds=12.0)
 
-    import vad
+    import boundary
 
-    monkeypatch.setattr(vad, "get_vad_backend", lambda: _StubVadBackend())
+    monkeypatch.setattr(boundary, "get_boundary_backend", lambda: _StubSpeechBoundaryBackend())
     backend = _RecordingBackend()
     monkeypatch.setattr(asr, "_resolve_asr_backend", lambda _device: backend)
 
@@ -246,53 +219,36 @@ def _run_transcription_with_backend(
     tmp_path: Path,
     *,
     backend,
-    packing_enabled: str = "1",
 ):
-    asr = _reload_pipeline(monkeypatch, tmp_path, packing_enabled=packing_enabled)
-    source = tmp_path / f"source_adaptive_{packing_enabled}.wav"
+    asr = _reload_pipeline(monkeypatch, tmp_path)
+    source = tmp_path / "source_adaptive_boundary.wav"
     _write_wav(source, seconds=12.0)
 
-    import vad
+    import boundary
 
-    monkeypatch.setattr(vad, "get_vad_backend", lambda: _StubVadBackend())
+    monkeypatch.setattr(boundary, "get_boundary_backend", lambda: _StubSpeechBoundaryBackend())
     monkeypatch.setattr(asr, "_resolve_asr_backend", lambda _device: backend)
 
     segments, log, details = asr._transcribe_and_align_local(str(source), "cpu")
     return backend, segments, log, details
 
 
-def test_chunk_packing_enabled_packs_vad_segments_before_transcribe(monkeypatch, tmp_path):
-    backend, _segments, log, details = _run_transcription(
-        monkeypatch,
-        tmp_path,
-        packing_enabled="1",
-    )
+def test_boundary_planner_packs_speech_segments_before_transcribe(monkeypatch, tmp_path):
+    backend, _segments, log, details = _run_transcription(monkeypatch, tmp_path)
 
     assert len(backend.audio_paths) < 10
     assert details["chunk_count"] == len(backend.audio_paths)
-    assert any("[chunk] idx=0" in entry and "vad_seg_count=10" in entry for entry in log)
+    assert any("[chunk] idx=0" in entry and "speech_segment_count=10" in entry for entry in log)
 
 
-def test_chunk_packing_disabled_keeps_original_vad_chunk_count(monkeypatch, tmp_path):
-    backend, _segments, log, details = _run_transcription(
-        monkeypatch,
-        tmp_path,
-        packing_enabled="0",
-    )
-
-    assert len(backend.audio_paths) == 10
-    assert details["chunk_count"] == 10
-    assert not any(entry.startswith("[chunk]") for entry in log)
-
-
-def test_empty_allowed_vad_does_not_fallback_to_full_audio(monkeypatch, tmp_path):
-    asr = _reload_pipeline(monkeypatch, tmp_path, packing_enabled="1")
+def test_empty_allowed_boundary_does_not_fallback_to_full_audio(monkeypatch, tmp_path):
+    asr = _reload_pipeline(monkeypatch, tmp_path)
     source = tmp_path / "source_empty_allowed.wav"
     _write_wav(source, seconds=12.0)
 
-    import vad
+    import boundary
 
-    monkeypatch.setattr(vad, "get_vad_backend", lambda: _EmptyAllowedVadBackend())
+    monkeypatch.setattr(boundary, "get_boundary_backend", lambda: _EmptyAllowedSpeechBoundaryBackend())
     backend = _RecordingBackend()
     monkeypatch.setattr(asr, "_resolve_asr_backend", lambda _device: backend)
 
@@ -304,14 +260,14 @@ def test_empty_allowed_vad_does_not_fallback_to_full_audio(monkeypatch, tmp_path
     assert any("切分完成：共 0 个处理块" in entry for entry in log)
 
 
-def test_empty_disallowed_vad_skips_asr_without_full_audio_fallback(monkeypatch, tmp_path):
-    asr = _reload_pipeline(monkeypatch, tmp_path, packing_enabled="1")
+def test_empty_disallowed_boundary_skips_asr_without_full_audio_fallback(monkeypatch, tmp_path):
+    asr = _reload_pipeline(monkeypatch, tmp_path)
     source = tmp_path / "source_empty_disallowed.wav"
     _write_wav(source, seconds=12.0)
 
-    import vad
+    import boundary
 
-    monkeypatch.setattr(vad, "get_vad_backend", lambda: _EmptyDisallowedVadBackend())
+    monkeypatch.setattr(boundary, "get_boundary_backend", lambda: _EmptyDisallowedSpeechBoundaryBackend())
     backend = _RecordingBackend()
     monkeypatch.setattr(asr, "_resolve_asr_backend", lambda _device: backend)
 
@@ -326,17 +282,59 @@ def test_empty_disallowed_vad_skips_asr_without_full_audio_fallback(monkeypatch,
     assert any("切分完成：共 0 个处理块" in entry for entry in log)
 
 
-def test_legacy_chunking_helper_does_not_full_audio_fallback(monkeypatch, tmp_path):
-    from asr import chunking
+def test_packed_chunk_metadata_uses_source_span_index_after_short_chunk_drop():
+    from asr import pipeline as asr
 
-    source = tmp_path / "legacy_empty.wav"
-    _write_wav(source, seconds=12.0)
+    skipped = PackedChunk(
+        start=0.0,
+        end=0.1,
+        speech_segments=[SpeechSegment(0.0, 0.1, 0.1)],
+        duration=0.1,
+        left_padding_s=0.0,
+        right_padding_s=0.0,
+        split_reason="skipped",
+        boundary_score=0.1,
+        boundary_reason="wrong",
+        boundary_source="wrong",
+    )
+    kept = PackedChunk(
+        start=1.0,
+        end=2.0,
+        speech_segments=[
+            SpeechSegment(1.0, 1.3, 0.8),
+            SpeechSegment(1.6, 2.0, 0.9),
+        ],
+        duration=1.0,
+        left_padding_s=0.1,
+        right_padding_s=0.2,
+        split_reason="tail",
+        parent_chunk_id=7,
+        island_id=1,
+        island_count=2,
+        internal_gap_count=1,
+        internal_gap_max_s=0.3,
+        boundary_score=0.87,
+        boundary_reason="speaker_change",
+        boundary_source="cut",
+    )
+    chunk_infos = [
+        {
+            "index": 0,
+            "source_span_index": 1,
+            "start": kept.start,
+            "end": kept.end,
+        }
+    ]
+    log: list[str] = []
 
-    import vad
+    asr._annotate_packed_chunks(chunk_infos, [skipped, kept], log)
 
-    monkeypatch.setattr(vad, "get_vad_backend", lambda: _RawEmptyVadBackend())
-
-    assert chunking._build_processing_spans(str(source)) == []
+    assert chunk_infos[0]["speech_segment_count"] == 2
+    assert chunk_infos[0]["boundary_parent_chunk_id"] == 7
+    assert chunk_infos[0]["boundary_reason"] == "speaker_change"
+    assert chunk_infos[0]["boundary_source"] == "cut"
+    assert chunk_infos[0]["boundary_score"] == 0.87
+    assert any("speech_segment_count=2" in entry and "source=cut" in entry for entry in log)
 
 
 def test_alignment_fallback_count_deduplicates_chunk_log_markers():

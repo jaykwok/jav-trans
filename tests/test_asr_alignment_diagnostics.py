@@ -115,6 +115,7 @@ def test_diagnose_case_marks_alignment_and_asr_drop_candidates(tmp_path):
                 "chunk 1: Alignment 模式: forced_aligner",
                 "chunk 1: Alignment 哨兵触发: 时间轴异常，不重新调用 ASR，改用 VAD/比例回退",
                 "chunk 1: Alignment 回退: 使用 VAD 约束比例时间戳",
+                "chunk 1: Alignment 模式: aligner_vad_fallback",
                 "chunk 3: Alignment 异常: forced aligner returned empty words",
                 "chunk 3: Alignment 模式: even_fallback",
                 "chunk 4: Alignment 词数: 1",
@@ -158,7 +159,7 @@ def test_diagnose_case_marks_alignment_and_asr_drop_candidates(tmp_path):
     assert by_chunk[2]["fallback_type"] == "proportional"
     assert by_chunk[2]["fallback_subtype"] == "align_text_empty"
     assert by_chunk[2]["failure_bucket"] == "align_text_empty"
-    assert "alignment_mode_even_fallback" in by_chunk[2]["failure_reasons"]
+    assert "alignment_fallback" in by_chunk[2]["failure_reasons"]
     assert by_chunk[3]["alignment_quality"] == "forced"
     assert by_chunk[3]["failure_candidate"] is False
     assert by_chunk[3]["failure_bucket"] == ""

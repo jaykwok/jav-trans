@@ -15,7 +15,7 @@ SRC_ROOT = PROJECT_ROOT / "src"
 if str(SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(SRC_ROOT))
 
-from vad.fusionvad_ja import LabelRecord, load_label_records
+from boundary.ja import LabelRecord, load_label_records
 
 
 def read_jsonl_rows(path: Path) -> list[dict[str, Any]]:
@@ -253,15 +253,15 @@ def run(args: argparse.Namespace) -> None:
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Select FusionVAD-JA clips for manual VAD audit.")
-    parser.add_argument("--labels", required=True, help="FusionVAD-JA label JSONL.")
+    parser = argparse.ArgumentParser(description="Select SpeechBoundary-JA clips for manual boundary audit.")
+    parser.add_argument("--labels", required=True, help="SpeechBoundary-JA label JSONL.")
     parser.add_argument("--audit", required=True, help="Manual or pseudo-label audit JSONL.")
     parser.add_argument("--manifest", help="Optional audio manifest JSON.")
     parser.add_argument("--per-bucket", type=int, default=12)
     parser.add_argument("--min-conflict-ratio", type=float, default=0.05)
     parser.add_argument(
         "--output-dir",
-        default=str(PROJECT_ROOT / "agents" / "temp" / "fusionvad-ja" / "audit-candidates"),
+        default=str(PROJECT_ROOT / "agents" / "temp" / "speech-boundary-ja" / "audit-candidates"),
     )
     args = parser.parse_args(argv)
     if args.per_bucket <= 0:

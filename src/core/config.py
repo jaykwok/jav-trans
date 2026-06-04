@@ -45,7 +45,7 @@ DEFAULT_SETTINGS: dict[str, str] = {
     # Minimum output budget preserved when prompt tokens compete with decoder context.
     "ASR_MIN_EFFECTIVE_NEW_TOKENS": "64",
     # Voice activity detection backend used before ASR chunking.
-    "ASR_VAD_BACKEND": "fusionvad_ja",
+    "ASR_BOUNDARY_BACKEND": "speech_boundary_ja",
     # Optional explicit HuggingFace model id override. Empty auto-selects by ASR_BACKEND.
     "ASR_MODEL_ID": "",
     # Optional local ASR model directory override. Empty uses models/<namespace>-<repo> for the selected backend.
@@ -97,112 +97,38 @@ DEFAULT_SETTINGS: dict[str, str] = {
     # Reject native timing when each timing item carries too much text.
     "ASR_NATIVE_MAX_CHARS_PER_ITEM": "12.0",
 
-    # --- VAD & Audio Chunking ---
-    # Minimum silence/off interval used by timestamp fallback VAD paths.
-    "VAD_MIN_OFF": "0.1",
-    # Padding, in seconds, added around detected speech by timestamp fallback VAD paths.
-    "VAD_PAD": "0.15",
-    # Minimum silence length used to split chunks.
-    "SEGMENT_MIN_SILENCE": "0.35",
-    # Minimum ASR chunk duration in seconds.
-    "SEGMENT_MIN_CHUNK": "1.2",
-    # Maximum ASR chunk duration before forced splitting.
-    "SEGMENT_MAX_CHUNK": "12.0",
-    # Discard detected speech shorter than this many seconds.
-    "SEGMENT_MIN_SPEECH": "0.25",
-    # Padding, in seconds, added around each ASR chunk.
-    "SEGMENT_PAD": "0.15",
-    # 1 packs nearby VAD speech segments into longer ASR chunks.
-    "ASR_CHUNK_PACKING_ENABLED": "1",
-    # on enables the long-chunk profile by forcing chunk packing.
-    "ASR_LONG_CHUNK_PROFILE": "on",
-    # Fallback frame duration used by packed ASR chunker when a task has no video FPS.
-    "ASR_CHUNK_PACK_FRAME_HOP_S": "0.033366700033366704",
-    # Forced-aligner feature window, in video/audio frames.
-    "ASR_CHUNK_PACK_WINDOW_FRAMES": "899",
-    # Safety reserve inside the feature window, in frames.
-    "ASR_CHUNK_PACK_RESERVE_FRAMES": "45",
-    # Target dynamic padding around VAD speech, in frames.
-    "ASR_CHUNK_PACK_TARGET_PADDING_FRAMES": "60",
-    # Maximum silence gap between VAD segments that can share one packed chunk, in frames.
-    "ASR_CHUNK_PACK_GAP_MERGE_FRAMES": "45",
-    # Soft cap on packed core duration, in frames. 0 = disabled. When > 0, island
-    # accumulation stops at the next gap once core would exceed it, so high-recall VAD
-    # does not merge many islands into one aligner-hostile super-chunk (R14 Phase 1a).
-    "ASR_CHUNK_PACK_MAX_CORE_FRAMES": "0",
-    # R15/R16 opt-in: split high-risk packed chunks into speech islands before ASR.
-    "ASR_PRE_ASR_ISLAND_SPLIT_ENABLED": "0",
-    # Only chunks whose packed core is at least this many frames are considered.
-    "ASR_PRE_ASR_ISLAND_SPLIT_MIN_CORE_FRAMES": "420",
-    # Internal gap needed to split a packed chunk into speech islands.
-    "ASR_PRE_ASR_ISLAND_SPLIT_MIN_GAP_FRAMES": "18",
-    # Tiny islands shorter than this many frames are merged into a neighbor.
-    "ASR_PRE_ASR_ISLAND_SPLIT_MIN_ISLAND_FRAMES": "3",
-    # Safety cap on child chunks created from one packed chunk.
-    "ASR_PRE_ASR_ISLAND_SPLIT_MAX_CHILDREN": "8",
-    # R16 opt-in: split long continuous VAD islands at low frame-score valleys.
-    "ASR_PRE_ASR_VALLEY_SPLIT_ENABLED": "0",
-    # Only continuous VAD islands at least this many frames are considered.
-    "ASR_PRE_ASR_VALLEY_SPLIT_MIN_CORE_FRAMES": "420",
-    # Target child core length after valley splitting, in frames.
-    "ASR_PRE_ASR_VALLEY_SPLIT_TARGET_CORE_FRAMES": "270",
-    # Minimum consecutive low-score frames needed to accept a valley.
-    "ASR_PRE_ASR_VALLEY_SPLIT_MIN_VALLEY_FRAMES": "6",
-    # Minimum child length around a valley split.
-    "ASR_PRE_ASR_VALLEY_SPLIT_MIN_CHILD_FRAMES": "45",
-    # Safety cap on child chunks created from one continuous island.
-    "ASR_PRE_ASR_VALLEY_SPLIT_MAX_CHILDREN": "8",
-    # FusionVAD frame-score threshold that defines a low valley.
-    "ASR_PRE_ASR_VALLEY_SPLIT_THRESHOLD": "0.20",
-    # R17 opt-in: split long continuous VAD islands at high endpoint-refiner cut scores.
-    "ASR_PRE_ASR_CUT_SPLIT_ENABLED": "0",
-    # Only continuous VAD islands at least this many frames are considered.
-    "ASR_PRE_ASR_CUT_SPLIT_MIN_CORE_FRAMES": "420",
-    # Target child core length after cut splitting, in frames.
-    "ASR_PRE_ASR_CUT_SPLIT_TARGET_CORE_FRAMES": "270",
-    # Minimum consecutive high-cut frames needed to accept a boundary.
-    "ASR_PRE_ASR_CUT_SPLIT_MIN_CUT_FRAMES": "3",
-    # Minimum child length around a cut split.
-    "ASR_PRE_ASR_CUT_SPLIT_MIN_CHILD_FRAMES": "45",
-    # Safety cap on child chunks created from one continuous island.
-    "ASR_PRE_ASR_CUT_SPLIT_MAX_CHILDREN": "8",
-    # FusionVAD endpoint-refiner cut threshold used by pre-ASR boundary packing.
-    "ASR_PRE_ASR_CUT_SPLIT_THRESHOLD": "0.94",
-    # R18 opt-in: fallback-risk-aware pre-ASR boundary packing.
-    "ASR_PRE_ASR_RISK_SPLIT_ENABLED": "0",
-    # Only packed chunks whose core is at least this many frames are considered.
-    "ASR_PRE_ASR_RISK_SPLIT_MIN_CORE_FRAMES": "420",
-    # Target child core length after risk-aware packing, in frames.
-    "ASR_PRE_ASR_RISK_SPLIT_TARGET_CORE_FRAMES": "270",
-    # Duration above this frame count contributes unsafe-fallback risk.
-    "ASR_PRE_ASR_RISK_SPLIT_SAFE_CORE_FRAMES": "360",
-    # Internal gap that counts as a strong split candidate.
-    "ASR_PRE_ASR_RISK_SPLIT_MIN_GAP_FRAMES": "6",
-    # Minimum child length around a risk-aware split.
-    "ASR_PRE_ASR_RISK_SPLIT_MIN_CHILD_FRAMES": "45",
-    # Safety cap on child chunks created from one packed chunk.
-    "ASR_PRE_ASR_RISK_SPLIT_MAX_CHILDREN": "8",
-    # Risk score needed before the R18 splitter acts.
-    "ASR_PRE_ASR_RISK_SPLIT_THRESHOLD": "1.0",
-    # Higher risk score required before cutting continuous chunks without gaps.
-    "ASR_PRE_ASR_RISK_SPLIT_CONTINUOUS_THRESHOLD": "2.0",
-    # Optional low frame-score valley threshold for continuous chunks.
-    "ASR_PRE_ASR_RISK_SPLIT_VALLEY_THRESHOLD": "0.20",
-    # Optional high endpoint-refiner cut threshold for continuous chunks.
-    "ASR_PRE_ASR_RISK_SPLIT_CUT_THRESHOLD": "0.94",
-    # 1 stores FusionVAD frame scores in the VAD cache for R16 diagnostics.
-    "FUSIONVAD_JA_EXPORT_FRAME_SCORES": "0",
+    # --- Boundary Refiner / ASR Chunking ---
+    # Discard exported ASR wav chunks shorter than this many seconds.
+    "ASR_CHUNK_MIN_DURATION_S": "0.25",
+    # Reset sliding ASR text context when adjacent chunks are separated by this gap.
+    "ASR_CONTEXT_RESET_GAP_S": "0.5",
+    # Boundary Refiner is the current pre-ASR chunk planning path.
+    # This is a feature-score grid fallback, not the source video frame rate.
+    "BOUNDARY_FEATURE_FRAME_HOP_S": "0.02",
+    "BOUNDARY_REFINER_ENABLED": "1",
+    "BOUNDARY_REFINER_MODEL_PATH": "",
+    "BOUNDARY_REFINER_BACKBONE": "transformers.Mamba2Model",
+    "BOUNDARY_REFINER_THRESHOLD": "0.5",
+    "BOUNDARY_PLANNER_MAX_CHUNK_S": "30.0",
+    "BOUNDARY_PLANNER_TARGET_CHUNK_S": "9.0",
+    "BOUNDARY_PLANNER_MIN_CHUNK_S": "0.4",
+    "BOUNDARY_PLANNER_START_WEIGHT": "1.5",
+    "BOUNDARY_PLANNER_TARGET_PADDING_S": "2.0",
+    "BOUNDARY_PLANNER_MAX_SPLITS_PER_SEGMENT": "16",
+    # 1 stores SpeechBoundary frame scores in the SpeechBoundary result. Boundary Refiner enables
+    # this at runtime even when this explicit diagnostics flag stays off.
+    "SPEECH_BOUNDARY_JA_EXPORT_FRAME_SCORES": "0",
     # 1 enables dropping very short low-energy spans before ASR (opt-in).
-    "ASR_CHUNK_DROP_ENABLED": "0",
+    "BOUNDARY_DROP_LOW_ENERGY_ENABLED": "0",
     # Spans shorter than this value (seconds) are candidates for dropping.
-    "ASR_CHUNK_DROP_MIN_DURATION_S": "0.20",
+    "BOUNDARY_DROP_LOW_ENERGY_MIN_DURATION_S": "0.20",
     # Spans with RMS energy below this dBFS level are candidates for dropping.
     # Both duration and energy thresholds must be met (AND logic).
-    "ASR_CHUNK_DROP_RMS_DBFS": "-40.0",
-    # 1 caches VAD/chunk boundaries separately from ASR generation settings.
-    "VAD_CHUNK_CACHE_ENABLED": "1",
-    # Persistent VAD/chunk boundary cache directory.
-    "VAD_CHUNK_CACHE_DIR": "./temp/vad-cache",
+    "BOUNDARY_DROP_LOW_ENERGY_RMS_DBFS": "-40.0",
+    # 1 caches SpeechBoundary frame score -> Boundary Planner outputs separately from ASR generation settings.
+    "BOUNDARY_CACHE_ENABLED": "1",
+    # Persistent boundary cache directory. Versioned as boundary-cache v1.
+    "BOUNDARY_CACHE_DIR": "./temp/boundary-cache",
 
     # --- Alignment Retry & Refine ---
     # Max chunk length that hybrid alignment can force-align directly.
@@ -409,11 +335,6 @@ def _load_private_env(path: Path, protected_keys: set[str]) -> None:
         os.environ[key] = "" if value is None else value
 
 
-def _apply_profiles() -> None:
-    if os.environ.get("ASR_LONG_CHUNK_PROFILE", "off").strip().lower() == "on":
-        os.environ["ASR_CHUNK_PACKING_ENABLED"] = "1"
-
-
 def load_config(*, override_existing_env: bool = False) -> None:
     """Load shared defaults, then private local overrides.
 
@@ -425,4 +346,3 @@ def load_config(*, override_existing_env: bool = False) -> None:
     protected_keys = set() if override_existing_env else set(os.environ)
     _apply_values(DEFAULT_SETTINGS, protected_keys)
     _load_private_env(PRIVATE_ENV_PATH, protected_keys)
-    _apply_profiles()

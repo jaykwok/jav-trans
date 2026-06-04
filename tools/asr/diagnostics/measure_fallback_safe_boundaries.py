@@ -131,7 +131,7 @@ def normalize_chunks(cache_payload: dict[str, Any]) -> list[dict[str, Any]]:
             continue
         start = row_float(item, "start")
         end = row_float(item, "end", start)
-        segments = normalize_segments(item.get("vad_segments") or [])
+        segments = normalize_segments(item.get("speech_segments") or [])
         core_start = row_float(item, "core_start", segments[0]["start"] if segments else start)
         core_end = row_float(item, "core_end", segments[-1]["end"] if segments else end)
         gaps = [
@@ -148,7 +148,7 @@ def normalize_chunks(cache_payload: dict[str, Any]) -> list[dict[str, Any]]:
                 "core_end": core_end,
                 "core_duration_s": max(0.0, core_end - core_start),
                 "split_reason": str(item.get("split_reason") or ""),
-                "vad_segments": segments,
+                "speech_segments": segments,
                 "speech_island_count": len(segments),
                 "internal_gap_count": sum(1 for gap in gaps if gap > 0.0),
                 "internal_gap_max_s": max(gaps or [0.0]),
@@ -171,7 +171,7 @@ def load_boundary_truth(path: Path | None) -> dict[str, dict[str, Any]]:
     return rows
 
 
-def cache_audio_id(cache_payload: dict[str, Any], diagnostics: list[dict[str, Any]], vad_cache: Path) -> str:
+def cache_audio_id(cache_payload: dict[str, Any], diagnostics: list[dict[str, Any]], boundary_cache: Path) -> str:
     for row in diagnostics:
         video = str(row.get("video") or "")
         if video:
@@ -181,7 +181,7 @@ def cache_audio_id(cache_payload: dict[str, Any], diagnostics: list[dict[str, An
         value = str(audio_payload.get(key) or "")
         if value:
             return Path(value).stem
-    return vad_cache.stem.split(".", 1)[0]
+    return boundary_cache.stem.split(".", 1)[0]
 
 
 def parse_truth_segments(row: dict[str, Any]) -> list[dict[str, float]]:
@@ -306,19 +306,6 @@ def match_diagnostic(
     return best[1] if best[0] >= min_overlap_ratio else None
 
 
-def coarse_fallback_reason(diagnostic: dict[str, Any] | None) -> str:
-    if not diagnostic:
-        return ""
-    subtype = str(diagnostic.get("fallback_subtype") or "")
-    quality = str(diagnostic.get("alignment_quality") or "")
-    bucket = str(diagnostic.get("failure_bucket") or "")
-    if subtype == "vad_coarse_after_sentinel":
-        return "vad_coarse_after_sentinel"
-    if quality == "vad_coarse" or bucket == "vad_coarse_alignment":
-        return subtype or bucket or quality
-    return ""
-
-
 def classify_row(
     chunk: dict[str, Any],
     diagnostic: dict[str, Any] | None,
@@ -328,7 +315,21 @@ def classify_row(
     silence: dict[str, float] | None = None,
     long_silence_s: float = 1.0,
 ) -> dict[str, Any]:
-    fallback_reason = coarse_fallback_reason(diagnostic)
+    fallback_type = str((diagnostic or {}).get("fallback_type") or "").strip()
+    if diagnostic is not None and fallback_type == "":
+        raise ValueError(
+            f"diagnostics row is missing fallback_type for chunk {diagnostic.get('chunk_index')}"
+        )
+    fallback_subtype = str((diagnostic or {}).get("fallback_subtype") or "").strip()
+    fallback_active = fallback_type not in {"", "none"}
+    fallback_reason = (
+        fallback_subtype
+        if fallback_active and fallback_subtype not in {"", "none"}
+        else fallback_type
+        if fallback_active
+        else ""
+    )
+    sentinel_fallback = fallback_active and bool((diagnostic or {}).get("sentinel_lines") or [])
     fallback_safe = not fallback_reason or chunk["duration_s"] <= target_duration_s
     truth_segment, truth_overlap = best_truth_overlap(chunk, truth_segments)
     truth_start_error_s = None
@@ -338,17 +339,17 @@ def classify_row(
         truth_end_error_s = chunk["end"] - truth_segment["end"]
     silence = silence or {}
     risk_reasons: list[str] = []
-    if fallback_reason:
-        risk_reasons.append("coarse_fallback")
-    if fallback_reason == "vad_coarse_after_sentinel":
+    if fallback_active:
+        risk_reasons.append("alignment_fallback")
+    if sentinel_fallback:
         risk_reasons.append("sentinel_fallback")
     if chunk["duration_s"] > target_duration_s:
-        risk_reasons.append("long_fallback_chunk" if fallback_reason else "long_chunk")
+        risk_reasons.append("long_fallback_chunk" if fallback_active else "long_chunk")
     if chunk["speech_island_count"] > 1:
         risk_reasons.append("multi_speech_island")
     if chunk["internal_gap_max_s"] > 0.0:
         risk_reasons.append("internal_gap")
-    if fallback_reason and float(silence.get("longest_silence_s") or 0.0) >= long_silence_s:
+    if fallback_active and float(silence.get("longest_silence_s") or 0.0) >= long_silence_s:
         risk_reasons.append("fallback_crosses_long_silence")
     if not risk_reasons:
         risk_reasons.append("ok")
@@ -369,9 +370,11 @@ def classify_row(
         "left_padding_s": round(chunk["left_padding_s"], 6),
         "right_padding_s": round(chunk["right_padding_s"], 6),
         "alignment_quality": str((diagnostic or {}).get("alignment_quality") or ""),
-        "fallback_subtype": str((diagnostic or {}).get("fallback_subtype") or ""),
+        "fallback_type": fallback_type,
+        "fallback_subtype": fallback_subtype,
         "failure_bucket": str((diagnostic or {}).get("failure_bucket") or ""),
         "fallback_reason": fallback_reason,
+        "sentinel_fallback": sentinel_fallback,
         "fallback_safe": fallback_safe,
         "risk_reasons": risk_reasons,
         "truth_start_error_s": None if truth_start_error_s is None else round(truth_start_error_s, 6),
@@ -387,7 +390,7 @@ def classify_row(
 def summarize(rows: list[dict[str, Any]], *, target_duration_s: float) -> dict[str, Any]:
     fallback_rows = [row for row in rows if row["fallback_reason"]]
     unsafe_rows = [row for row in fallback_rows if not row["fallback_safe"]]
-    sentinel_rows = [row for row in rows if row["fallback_reason"] == "vad_coarse_after_sentinel"]
+    sentinel_rows = [row for row in rows if row["sentinel_fallback"]]
     reason_counts: Counter[str] = Counter()
     split_counts: Counter[str] = Counter()
     fallback_reason_counts: Counter[str] = Counter()
@@ -442,7 +445,7 @@ def summarize(rows: list[dict[str, Any]], *, target_duration_s: float) -> dict[s
     }
 
 
-def build_markdown(summary: dict[str, Any], *, vad_cache: Path, diagnostics: Path, top_rows: list[dict[str, Any]]) -> str:
+def build_markdown(summary: dict[str, Any], *, boundary_cache: Path, diagnostics: Path, top_rows: list[dict[str, Any]]) -> str:
     fallback = summary["fallback_duration_s"]
     unsafe = summary["unsafe_fallback_duration_s"]
     sentinel = summary["sentinel_fallback_duration_s"]
@@ -452,11 +455,11 @@ def build_markdown(summary: dict[str, Any], *, vad_cache: Path, diagnostics: Pat
     lines = [
         "# Fallback-Safe Boundary Metrics",
         "",
-        f"- vad cache: `{project_rel(vad_cache)}`",
+        f"- boundary cache: `{project_rel(boundary_cache)}`",
         f"- diagnostics: `{project_rel(diagnostics)}`",
         f"- target fallback duration: `{summary['target_duration_s']:.3f}s`",
         f"- chunks: `{summary['chunk_count']}`",
-        f"- coarse fallback chunks: `{summary['fallback_chunk_count']}`",
+        f"- alignment fallback chunks: `{summary['fallback_chunk_count']}`",
         f"- unsafe fallback chunks: `{summary['fallback_unsafe_count']}`",
         f"- fallback safe ratio: `{summary['fallback_safe_ratio']:.3f}`",
         f"- sentinel fallback chunks: `{summary['sentinel_fallback_count']}`",
@@ -493,11 +496,11 @@ def build_markdown(summary: dict[str, Any], *, vad_cache: Path, diagnostics: Pat
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
-        description="Measure whether coarse fallback chunks are short enough to keep subtitle timing usable."
+        description="Measure whether alignment fallback chunks are short enough to keep subtitle timing usable."
     )
-    parser.add_argument("--vad-cache", required=True, help="VAD chunk cache JSON path")
+    parser.add_argument("--boundary-cache", required=True, help="Boundary cache JSON path")
     parser.add_argument("--diagnostics", required=True, help="diagnostics.jsonl path or diagnostics directory")
-    parser.add_argument("--output-dir", default="agents/temp/fusionvad-ja/fallback-safe-boundary-metrics")
+    parser.add_argument("--output-dir", default="agents/temp/speech-boundary-ja/fallback-safe-boundary-metrics")
     parser.add_argument("--boundary-manifest", help="Optional synthetic boundary_manifest.jsonl with actual_speech_segments")
     parser.add_argument("--measure-audio-silence", action="store_true", help="Measure long silence spans inside fallback chunks")
     parser.add_argument(
@@ -513,22 +516,22 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--top-n", type=int, default=20)
     args = parser.parse_args(argv)
 
-    vad_cache = project_path(args.vad_cache)
+    boundary_cache = project_path(args.boundary_cache)
     diagnostics_path = project_path(args.diagnostics)
     if diagnostics_path.is_dir():
         diagnostics_path = diagnostics_path / "diagnostics.jsonl"
     if args.target_duration_s <= 0:
         parser.error("--target-duration-s must be positive")
 
-    cache_payload = read_json(vad_cache)
+    cache_payload = read_json(boundary_cache)
     if not isinstance(cache_payload, dict):
-        raise ValueError(f"VAD cache must be a JSON object: {vad_cache}")
+        raise ValueError(f"Boundary cache must be a JSON object: {boundary_cache}")
     chunks = normalize_chunks(cache_payload)
     diagnostics = read_jsonl(diagnostics_path)
     by_index = diagnostics_by_index(diagnostics)
     boundary_manifest = project_path(args.boundary_manifest) if args.boundary_manifest else None
     truth_rows = load_boundary_truth(boundary_manifest)
-    truth_audio_id = cache_audio_id(cache_payload, diagnostics, vad_cache)
+    truth_audio_id = cache_audio_id(cache_payload, diagnostics, boundary_cache)
     truth_segments = parse_truth_segments(truth_rows.get(truth_audio_id) or {})
     audio_cache: dict[str, tuple[np.ndarray, int]] = {}
     rows = []
@@ -565,7 +568,7 @@ def main(argv: list[str] | None = None) -> int:
     summary = summarize(rows, target_duration_s=args.target_duration_s)
     summary.update(
         {
-            "vad_cache": project_rel(vad_cache),
+            "boundary_cache": project_rel(boundary_cache),
             "diagnostics": project_rel(diagnostics_path),
             "boundary_manifest": project_rel(boundary_manifest),
             "truth_audio_id": truth_audio_id,
@@ -585,7 +588,7 @@ def main(argv: list[str] | None = None) -> int:
     write_jsonl(output_dir / "chunk_metrics.jsonl", rows)
     write_jsonl(output_dir / "unsafe_fallback_chunks.jsonl", top_rows)
     (output_dir / "summary.md").write_text(
-        build_markdown(summary, vad_cache=vad_cache, diagnostics=diagnostics_path, top_rows=top_rows),
+        build_markdown(summary, boundary_cache=boundary_cache, diagnostics=diagnostics_path, top_rows=top_rows),
         encoding="utf-8",
     )
     print(f"summary={project_rel(output_dir / 'summary.json')}")

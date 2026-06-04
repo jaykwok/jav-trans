@@ -76,10 +76,6 @@ datas += copy_metadata("torchcodec")
 datas += copy_metadata("nagisa")
 datas += [
     (str(_require_path("src/web/static", "web static assets")), "src/web/static"),
-    (
-        str(_require_path("src/vad/fusionvad_ja/checkpoints", "FusionVAD-JA checkpoints")),
-        "src/vad/fusionvad_ja/checkpoints",
-    ),
     (str(_require_path("icon.ico", "application icon")), "."),
     (str(_require_path("icon.png", "application png icon")), "."),
     (

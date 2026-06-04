@@ -163,7 +163,9 @@ def test_cue_merge_candidate_analysis_penalizes_fallback_risk(tmp_path: Path, mo
             {
                 "chunk_index": 11,
                 "alignment_quality": "vad_coarse",
+                "fallback_type": "vad_coarse",
                 "fallback_subtype": "vad_coarse_after_sentinel",
+                "sentinel_lines": ["sentinel"],
                 "failure_reasons": ["alignment_sentinel"],
             }
         ],

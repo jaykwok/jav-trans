@@ -24,16 +24,6 @@ from asr.transcribe import _alignment_failure_reasons  # noqa: E402
 _CHUNK_LOG_RE = re.compile(r"^chunk\s+(\d+):\s*(.*)$")
 _WORD_COUNT_RE = re.compile(r"Alignment\s+词数:\s*(\d+)")
 _ALIGNMENT_MODE_RE = re.compile(r"Alignment\s+模式:\s*(\S+)")
-_FALLBACK_MARKERS = (
-    "aligner_vad_fallback",
-    "even_fallback",
-    "Alignment 回退",
-    "Alignment 快速回退",
-    "Alignment 降级失败",
-    "Alignment 降级后仍异常",
-    "VAD 回退",
-    "等比分配时间戳",
-)
 _CANDIDATE_BUCKET_ORDER = (
     "asr_dropped_uncertain",
     "nonlexical_text",
@@ -148,7 +138,6 @@ def parse_chunk_logs(asr_log: Iterable[str]) -> dict[int, dict[str, Any]]:
             "alignment_mode": "",
             "alignment_word_count": None,
             "align_error": "",
-            "fallback_lines": [],
             "sentinel_lines": [],
         }
     )
@@ -168,8 +157,6 @@ def parse_chunk_logs(asr_log: Iterable[str]) -> dict[int, dict[str, Any]]:
             item["align_error"] = line.split("Alignment 异常:", 1)[1].strip()
         if "哨兵" in line:
             item["sentinel_lines"].append(line)
-        if any(marker in line for marker in _FALLBACK_MARKERS):
-            item["fallback_lines"].append(line)
     return {index: dict(value) for index, value in logs.items()}
 
 
@@ -287,7 +274,6 @@ def chunk_failure_reasons(
     qc_item: dict[str, Any] | None,
     alignment_mode: str,
     align_error: str,
-    fallback_lines: list[str],
     sentinel_lines: list[str],
     aligned_segment_count: int,
     word_stats: dict[str, Any],
@@ -306,11 +292,13 @@ def chunk_failure_reasons(
         "empty",
         "nonlexical",
         "align_text_empty",
+        "aligner_vad_fallback",
+        "even_fallback",
     }:
         reasons.append(f"alignment_mode_{alignment_mode}")
     if align_error:
         reasons.append("alignment_error")
-    if fallback_lines and alignment_mode not in {"nonlexical", "align_text_empty"}:
+    if alignment_mode in {"aligner_vad_fallback", "even_fallback"}:
         reasons.append("alignment_fallback")
     if sentinel_lines:
         reasons.append("alignment_sentinel")
@@ -507,7 +495,6 @@ def diagnose_case(
         alignment_mode = str(chunk_log.get("alignment_mode") or "")
         if alignment_mode:
             alignment_modes[alignment_mode] += 1
-        fallback_lines = list(chunk_log.get("fallback_lines") or [])
         sentinel_lines = list(chunk_log.get("sentinel_lines") or [])
         aligned_segment_count = int(output_counts.get(chunk_index, 0))
         stats = word_timing_stats(words.get(chunk_index, []))
@@ -546,7 +533,6 @@ def diagnose_case(
             qc_item=qc_item_for_diagnostics,
             alignment_mode=alignment_mode,
             align_error=str(chunk_log.get("align_error") or ""),
-            fallback_lines=fallback_lines,
             sentinel_lines=sentinel_lines,
             aligned_segment_count=aligned_segment_count,
             word_stats=stats,
@@ -560,7 +546,6 @@ def diagnose_case(
             asr_qc_severity=str((qc_item_for_diagnostics or {}).get("severity") or ""),
             alignment_mode=alignment_mode,
             align_error=str(chunk_log.get("align_error") or ""),
-            fallback_lines=fallback_lines,
             sentinel_lines=sentinel_lines,
             aligned_segment_count=aligned_segment_count,
             word_stats=stats,
@@ -623,7 +608,6 @@ def diagnose_case(
             "alignment_quality_reasons": quality["alignment_quality_reasons"],
             "alignment_word_count": chunk_log.get("alignment_word_count"),
             "align_error": chunk_log.get("align_error") or "",
-            "fallback_lines": fallback_lines,
             "sentinel_lines": sentinel_lines,
             "aligned_segment_count": aligned_segment_count,
             "word_timing": stats,
@@ -843,7 +827,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--output-dir",
-        default="agents/temp/fusionvad-ja/asr-alignment-diagnostics",
+        default="agents/temp/speech-boundary-ja/asr-alignment-diagnostics",
         help="Directory for summary.json, diagnostics.jsonl, failure_candidates.jsonl, summary.md.",
     )
     return parser.parse_args()

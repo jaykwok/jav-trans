@@ -492,7 +492,7 @@ const DATASET_ID = {dataset_json};
 const OUTPUT_JSONL_NAME = {output_jsonl_json};
 const SOURCE_MANIFEST = {source_manifest_json};
 const CANDIDATES = {data_json};
-const STORAGE_KEY = "fusionvad-ja-alignment-audit:" + DATASET_ID;
+const STORAGE_KEY = "speech-boundary-ja-alignment-audit:" + DATASET_ID;
 
 const LABELS = [
   ["keep_text", "整条文本可用", "当前合并后的整条字幕文本基本可用"],
@@ -1180,7 +1180,7 @@ const DATASET_ID = __DATASET_JSON__;
 const OUTPUT_JSONL_NAME = __OUTPUT_JSONL_JSON__;
 const SOURCE_MANIFEST = __SOURCE_MANIFEST_JSON__;
 const CANDIDATES = __DATA_JSON__;
-const STORAGE_KEY = "fusionvad-ja-video-alignment-audit:" + DATASET_ID;
+const STORAGE_KEY = "speech-boundary-ja-video-alignment-audit:" + DATASET_ID;
 
 const LABELS = [
   ["keep_text", "整条文本可用", "当前合并后的整条字幕文本基本可用"],
@@ -1655,7 +1655,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--output-html",
         default="agents/audits/alignment-failure-audit.html",
     )
-    parser.add_argument("--title", default="FusionVAD-JA Alignment Failure 人工审计")
+    parser.add_argument("--title", default="SpeechBoundary-JA Alignment Failure 人工审计")
     parser.add_argument("--dataset-id", default="")
     parser.add_argument("--output-jsonl-name", default="manual_alignment_failure_labels.jsonl")
     parser.add_argument(

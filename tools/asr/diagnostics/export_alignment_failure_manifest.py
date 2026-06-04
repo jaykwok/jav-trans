@@ -206,7 +206,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--output-dir",
-        default="agents/temp/fusionvad-ja/alignment-failure-manifest",
+        default="agents/temp/speech-boundary-ja/alignment-failure-manifest",
     )
     parser.add_argument("--max-rows", type=int)
     args = parser.parse_args(argv)
