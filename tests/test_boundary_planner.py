@@ -32,6 +32,32 @@ def test_boundary_planner_uses_candidate_split_before_packing():
     assert chunks[0].split_reason == "cut_candidate"
 
 
+def test_boundary_planner_uses_soft_candidate_for_over_target_island():
+    features = make_feature_bundle(
+        frame_hop_s=1.0,
+        speech_scores=[0.8] * 24,
+    )
+
+    chunks = plan_boundary_chunks(
+        [SpeechSegment(0.0, 20.0)],
+        features=features,
+        config=BoundaryPlannerConfig(
+            frame_hop_s=1.0,
+            max_chunk_s=30.0,
+            target_chunk_s=8.0,
+            min_chunk_s=2.0,
+            target_padding_s=1.0,
+        ),
+    )
+
+    assert [(chunk.islands[0].start, chunk.islands[0].end) for chunk in chunks] == [
+        (0.0, pytest.approx(7.5)),
+        (pytest.approx(7.5), pytest.approx(15.5)),
+        (pytest.approx(15.5), 20.0),
+    ]
+    assert chunks[0].split_reason == "soft_valley_candidate"
+
+
 def test_boundary_planner_validates_config():
     features = make_feature_bundle(frame_hop_s=1.0)
 

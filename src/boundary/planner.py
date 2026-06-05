@@ -9,6 +9,7 @@ from boundary.candidates import (
     best_candidate_near_target,
     extract_boundary_candidates,
     gap_midpoint_candidate,
+    soft_candidate_near_target,
 )
 from boundary.features import BoundaryFeatureBundle, summarize_gap_features
 from boundary.refiner import BoundaryDecision, BoundaryRefiner, RefinerInput, SequenceBoundaryRefiner
@@ -209,6 +210,14 @@ def _split_single_island(
             config=extractor_config,
         )
         candidate = best_candidate_near_target(candidates, target_s=target)
+        if candidate is None:
+            candidate = soft_candidate_near_target(
+                start_s=part.start,
+                end_s=part.end,
+                target_s=target,
+                features=features,
+                config=extractor_config,
+            )
         if candidate is None:
             break
         left, right = _split_island_at_candidate(part, candidate)

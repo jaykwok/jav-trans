@@ -5,9 +5,9 @@ from typing import Literal, Sequence
 
 from boundary.features import BoundaryFeatureBundle
 
-CandidateSource = Literal["cut", "valley", "gap_midpoint"]
+CandidateSource = Literal["cut", "valley", "soft_cut", "soft_valley", "gap_midpoint"]
 
-CANDIDATE_EXTRACTOR_VERSION = 1
+CANDIDATE_EXTRACTOR_VERSION = 2
 
 
 @dataclass(frozen=True)
@@ -24,6 +24,8 @@ class CandidateExtractionConfig:
     target_chunk_s: float = 9.0
     cut_score_threshold: float = 0.94
     valley_score_threshold: float = 0.10
+    soft_candidate_search_radius_s: float = 2.0
+    soft_candidate_min_score: float = 0.0
 
     def signature(self) -> dict:
         return {
@@ -32,6 +34,8 @@ class CandidateExtractionConfig:
             "target_chunk_s": self.target_chunk_s,
             "cut_score_threshold": self.cut_score_threshold,
             "valley_score_threshold": self.valley_score_threshold,
+            "soft_candidate_search_radius_s": self.soft_candidate_search_radius_s,
+            "soft_candidate_min_score": self.soft_candidate_min_score,
         }
 
 
@@ -103,6 +107,53 @@ def best_candidate_near_target(
     return min(candidates, key=lambda item: (abs(item.time_s - target_s), -item.score))
 
 
+def soft_candidate_near_target(
+    *,
+    start_s: float,
+    end_s: float,
+    target_s: float,
+    features: BoundaryFeatureBundle,
+    config: CandidateExtractionConfig,
+) -> BoundaryCandidate | None:
+    if end_s <= start_s:
+        return None
+    lower_s = start_s + max(0.0, config.min_chunk_s)
+    upper_s = end_s - max(0.0, config.min_chunk_s)
+    if upper_s <= lower_s:
+        return None
+    target = max(lower_s, min(float(target_s), upper_s))
+    radius = max(0.0, float(config.soft_candidate_search_radius_s))
+    search_start = max(lower_s, target - radius)
+    search_end = min(upper_s, target + radius)
+    candidates = [
+        item
+        for item in (
+            _soft_score_candidate(
+                features.cut_scores,
+                score_frame_hop_s=features.frame_hop_s,
+                start_s=search_start,
+                end_s=search_end,
+                target_s=target,
+                mode="high",
+                source="soft_cut",
+            ),
+            _soft_score_candidate(
+                features.speech_scores,
+                score_frame_hop_s=features.frame_hop_s,
+                start_s=search_start,
+                end_s=search_end,
+                target_s=target,
+                mode="low",
+                source="soft_valley",
+            ),
+        )
+        if item is not None and item.score >= config.soft_candidate_min_score
+    ]
+    if not candidates:
+        return None
+    return min(candidates, key=lambda item: (abs(item.time_s - target), -item.score))
+
+
 def _score_run_candidates(
     scores: Sequence[float] | None,
     *,
@@ -139,6 +190,37 @@ def _score_run_candidates(
             _run_candidate(scores, run_start, upper, score_frame_hop_s, mode, source)
         )
     return candidates
+
+
+def _soft_score_candidate(
+    scores: Sequence[float] | None,
+    *,
+    score_frame_hop_s: float,
+    start_s: float,
+    end_s: float,
+    target_s: float,
+    mode: str,
+    source: CandidateSource,
+) -> BoundaryCandidate | None:
+    if scores is None or len(scores) == 0:
+        return None
+    lower = max(0, int(round(start_s / score_frame_hop_s)))
+    upper = min(len(scores), int(round(end_s / score_frame_hop_s)))
+    if upper <= lower:
+        return None
+    scored_frames: list[tuple[int, float, float]] = []
+    for frame in range(lower, upper):
+        value = float(scores[frame])
+        score = value if mode == "high" else 1.0 - value
+        time_s = (frame + 0.5) * score_frame_hop_s
+        scored_frames.append((frame, score, abs(time_s - target_s)))
+    frame, score, _ = max(scored_frames, key=lambda item: (item[1], -item[2]))
+    return BoundaryCandidate(
+        time_s=(frame + 0.5) * score_frame_hop_s,
+        score=score,
+        reason=f"{source}_candidate",
+        source=source,
+    )
 
 
 def _run_candidate(
