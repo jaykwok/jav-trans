@@ -191,6 +191,8 @@ Frame/window sequence refiner 是当前主线训练入口。`src/boundary/sequen
 
 Feature cache 的长期规则：大体积 frame/window 特征不写入 boundary-cache JSON。boundary-cache 只保存 ASR-facing packed spans、决策诊断和 signature；训练或诊断需要持久化密集特征时，使用对应数据集目录下的 `.npz` / `.pt` sidecar，并把 `feature_schema_hash` / checkpoint SHA1 / planner config 写进 signature，保证公式或模型变化会触发 cache miss。
 
+Boundary cache 只作为加速和诊断缓存，不作为最终质量结论。若某个实验只能用旧 cache 做近似复算，允许直接重跑 SpeechBoundary-JA / Boundary Refiner / planner；涉及 ASR empty、重复循环、forced-aligner fallback、字幕观感或上线判断时，以完整 workflow 重跑结果为准。DP planner / 风险映射本身是确定性计算，不因为跑在 CPU 上就变成近似。
+
 SpeechBoundary-JA feature cache schema 是断兼容的新 schema：feature `.npz` 使用 `ptm` + `mfcc`，manifest 使用 `ptm_dim` + `mfcc_dim`。旧实验缓存不会被迁移，重新生成即可。
 
 `models/`、`datasets/`、`agents/temp/`、`agents/audits/` 是本地运行资产，不应提交训练数据或大模型权重。例外是小型 Boundary Refiner 头：如果 `src/boundary/checkpoints/boundary_refiner.pt` 体积可控并成为默认质量路径，可以随源码提交，版本号和训练说明记录在 README / HISTORY；不要恢复旧 `src/vad` checkpoint 路径。若后续 checkpoint 变大或需要多版本分发，再改为 GitHub Release 或 Hugging Face artifact。
@@ -220,11 +222,11 @@ clip-level clean speech islands
 1. 命名收口已完成：`src/vad/fusionvad_ja/` 和 `tools/vad/fusionvad_ja/` 已断兼容迁到 `src/boundary/ja/` 与 `tools/boundary/ja/`；旧 key、旧路径、旧 cache 不做 alias 或迁移。
 2. 数据重建：清除旧 gap-only / BiLSTM / endpoint-head 训练格式，使用 Galgame 与 anime clean speech islands 重新生成 sequence dataset。每条样本包含多 island、touching speech、short/long gap、real negative gap、BGM/noise、轻量 overlap 和 source/speaker switch。过渡期 gap dataset 只允许作为 loader smoke 或 warm-up，不作为最终 Seq2Seq 目标。
 3. 模型升级：Boundary Refiner backbone 只保留 `transformers.Mamba2Model`。输入从 per-gap summary 升级为连续窗口序列，特征包含 Qwen PTM、MFCC、energy、speech probability、cut probability、candidate metadata；输出逐候选 split / merge / refine score 和可选 boundary offset。当前 frame/window sequence dataset、trainer、`FrameSequenceBoundaryRefiner`、runtime feature provider、schema/hash 校验和 PackedChunk 决策诊断已接通；当 checkpoint metadata 标记 `runtime_adapter=frame_sequence_v1` 时，主 pipeline 会让 SpeechBoundary-JA 导出低维 PTM/MFCC frame windows并交给 sequence refiner 做 gap 决策。
-4. Planner 接入：`pack_speech_segments()` 只 materialize planner 输出，不再承担固定 gap 合并策略。当前 planner 已能读取 refiner decision 并写入 PackedChunk 诊断字段；sequence refiner 已改成 bounded batch 打分，并接入轻量 DP / Viterbi-style constrained planner。当前 DP v2 是第一版可解释 baseline：cost 主要由模型 split/merge score、chunk duration、hard max chunk 和长 gap penalty 组成；它能避免退回局部 greedy，但还不是最终字幕目标函数。`BOUNDARY_PLANNER_SEQUENCE_BATCH_SIZE` 默认 `256`，用于避免 pure PyTorch Mamba2 naive path 在全片候选一次性推理时过慢。该变更把 planner signature 升到 `constrained_sequence_dp_planner_v2`，旧 boundary-cache 需要重建。
+4. Planner 接入：`pack_speech_segments()` 只 materialize planner 输出，不再承担固定 gap 合并策略。当前 planner 已能读取 refiner decision 并写入 PackedChunk 诊断字段；sequence refiner 已改成 bounded batch 打分，并接入轻量 DP / Viterbi-style constrained planner。当前 DP v2 是第一版可解释 baseline：cost 主要由模型 split/merge score、chunk duration、hard max chunk 和长 gap penalty 组成；它能避免退回局部 greedy，但还不是最终字幕目标函数。`BOUNDARY_PLANNER_SEQUENCE_BATCH_SIZE` 默认 `256`，用于避免 pure PyTorch Mamba2 naive path 在全片候选一次性推理时过慢。Candidate extractor v2 新增 overlong single-island soft candidate：当没有 hard cut / valley 时，在 target 附近用 soft cut score 或 speech-score valley 找切点，避免 20-30s 单 island fallback 粗时间轴。该变更会触发旧 boundary-cache 重建。
 5. GPU 闭环：先跑 synthetic exact truth，再跑匿名样片 A。主 gate 是 start boundary、fallback chunk duration、long/gap-crossing chunk、ASR empty / hallucination 和字幕观感；chunk 数只作为成本指标，不作为主要否决项。fallback / sentinel 数只作为观察项，因为当前 Qwen3-ForcedAligner 没做 JAV / galgame 目标域 finetune，可能和 Qwen ASR SFT 输出风格不完全匹配。匿名样片 A frame-sequence greedy 与 DP v2 都已跑通：DP v2 把 fallback duration p90/max 从 `14.07/26.88s` 降到 `12.81/20.72s`，safe ratio 从 `0.314` 提到 `0.418`，但 fallback/sentinel chunk 数从 `322` 增到 `366`，ASR repeat-loop / nonlexical 问题仍存在。因此 DP v2 证明了“全局规划能压粗时间轴”，但 learned checkpoint 和 planner cost 暂不固化为默认质量路径。
 6. ASR feedback：supervised 稳定后再引入 preliminary ASR 文本、token confidence、local CER、aligner sentinel、fallback duration 和 QC reject 作为 dense reward，做 RL / DPO。Unified Joint Model 保留在 backlog，等 SpeechBoundary-JA 能稳定产出 pseudo boundary labels 后再评估。
 
-下一轮 planner cost 校准方向：把当前简单 cost 拆成可审计项，包括 calibrated model NLL、fallback-safe duration、long/gap-crossing penalty、start-boundary priority、字幕最小显示时长、2-frame gap、CPS/readability 和 ASR/QC feedback。Netflix timing 规则支持 `start/in-time` 优先、`end/out-time` 后置压缩和 2-frame gap；SubER / OptiSub 类字幕评测也说明字幕质量要同时看 timing、segmentation、显示时长和阅读速度。REBORN 的 RL boundary segmentation 可作为后续 ASR feedback / DPO 参考，但当前先用确定性 DP 做可解释 baseline。真实 boundary-only DP sweep 已显示：单纯把 target/cost 调紧只能把 duration p90 从 `12.64s` 降到约 `11.86s`，仍残留 `>20s` chunk；所以下一步优先补 overlong speech island 的候选切点 / dense boundary labels，而不是继续盲调 cost。
+下一轮 planner cost 校准方向：把当前简单 cost 拆成可审计项，包括 calibrated model NLL、fallback-safe duration、long/gap-crossing penalty、start-boundary priority、字幕最小显示时长、2-frame gap、CPS/readability 和 ASR/QC feedback。Netflix timing 规则支持 `start/in-time` 优先、`end/out-time` 后置压缩和 2-frame gap；SubER / OptiSub 类字幕评测也说明字幕质量要同时看 timing、segmentation、显示时长和阅读速度。REBORN 的 RL boundary segmentation 可作为后续 ASR feedback / DPO 参考，但当前先用确定性 DP 做可解释 baseline。真实 boundary-only DP sweep 显示：单纯把 target/cost 调紧只能把 duration p90 从 `12.64s` 降到约 `11.86s`，仍残留 `>20s` chunk；补上 overlong speech island soft candidate 后，匿名样片 A boundary-only sweep 已把 `>20s` chunk 降到 `0`，baseline duration p50/p90/max 为 `8.12/12.34/14.40s`，8s profiles 为 `7.66/11.40/15.36s`。下一步不再继续盲调 cost，而是跑完整 ASR/QC/aligner 闭环和审计页，确认 ASR empty、重复循环、字幕观感没有恶化。
 
 Backlog：等 SpeechBoundary-JA 能稳定产出 pseudo boundary labels 后，研究不依赖 forced aligner 的直接字幕边界 / timeline model。该路线把“输出字幕文本和时间轴边界”作为主任务，forced aligner 只作为审计或 teacher 信号之一，不再把 fallback 数量当作上线 gate。
 
@@ -289,6 +291,8 @@ model_param_device=cuda:*
 ```
 
 SpeechBoundary-JA 的 feature cache、训练、逐帧概率导出和全片 workflow 都按“能 CUDA 就提权 CUDA”处理；不要为了省事让 CPU 跑大规模评测，否则会把等待时间和中间产物放大，且容易误判进度。
+
+DP sweep 的性能要分阶段看：SpeechBoundary-JA PTM 和 learned Boundary Refiner 可在 CUDA 上跑，但 planner profile 循环、风险映射和 JSONL 写入是 CPU-bound。后半段 CPU 跑不代表近似；它仍是基于真实 boundary/refiner 输出的确定性规划。看到后半段 CPU 占用高不一定代表没启用 CUDA；以 summary 中的 `refiner_signature.actual_device=cuda:0` 和边界 scorer 日志为准。
 
 ### 长任务怎么排查
 
