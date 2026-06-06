@@ -37,7 +37,7 @@ _executor = ThreadPoolExecutor(max_workers=_EXECUTOR_MAX_WORKERS)
 _jobs: dict[str, JobState] = {}
 _cancel_events: dict[str, threading.Event] = {}
 _state_lock = asyncio.Lock()
-_jobs_path = PROJECT_ROOT / "temp" / "web" / "jobs.json"
+_jobs_path = PROJECT_ROOT / "tmp" / "web" / "jobs.json"
 _FINISHED_STATUSES = {"done", "failed", "cancelled"}
 _RETRYABLE_STATUSES = {"failed", "cancelled"}
 _last_progress_write_ts: float = 0.0
@@ -181,7 +181,7 @@ def _resume_cache_job_id(job: JobState) -> str:
 
 
 def _job_temp_dir(job_id: str) -> str:
-    return str((PROJECT_ROOT / "temp" / "web" / "jobs" / sanitize_job_id(job_id)).resolve())
+    return str((PROJECT_ROOT / "tmp" / "web" / "jobs" / sanitize_job_id(job_id)).resolve())
 
 
 def _remove_job_temp_dir(job_id: str) -> None:

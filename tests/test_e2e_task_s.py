@@ -80,7 +80,7 @@ def _load_cache(path: Path) -> dict:
 
 def _cleanup_job_temp(job_temp_dir: Path) -> None:
     chunk_root = Path(
-        getattr(main.asr_module, "_ASR_CHUNK_ROOT", Path("temp") / "chunks")
+        getattr(main.asr_module, "_ASR_CHUNK_ROOT", Path("tmp") / "chunks")
     )
     cleanup_job_temp(
         str(job_temp_dir),
@@ -89,7 +89,7 @@ def _cleanup_job_temp(job_temp_dir: Path) -> None:
 
 
 def test_s1_skip_translation_writes_japanese_srt_without_translator(monkeypatch, tmp_path):
-    video_path = Path("temp/nmsl036_60s.mp4")
+    video_path = Path("tmp/tests/nmsl036_60s.mp4")
     if not video_path.exists():
         video_path = tmp_path / "test_clip_60s.mp4"
         video_path.write_bytes(b"fake mp4")
@@ -193,7 +193,7 @@ def test_s3_s4_translation_resume_then_auto_cleanup(monkeypatch, tmp_path, capsy
 
 
 def test_s5_qc_gate_blocks_headless_before_translation(monkeypatch, tmp_path, capsys):
-    video_path = Path("temp/silence_10s.mp4")
+    video_path = Path("tmp/tests/silence_10s.mp4")
     if not video_path.exists():
         video_path = tmp_path / "silence_10s.mp4"
         video_path.write_bytes(b"fake silent mp4")

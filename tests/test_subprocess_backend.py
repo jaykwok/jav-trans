@@ -14,7 +14,7 @@ def main() -> None:
     try:
         backend.load(on_stage=events.append)
         results = backend.transcribe_texts(
-            ["temp/mock.wav"],
+            ["tmp/tests/mock.wav"],
             contexts=["ctx"],
             on_stage=events.append,
         )

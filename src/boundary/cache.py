@@ -78,7 +78,7 @@ def cache_enabled() -> bool:
 
 
 def cache_root() -> Path:
-    return Path(os.getenv("BOUNDARY_CACHE_DIR", Path("temp") / "boundary-cache")).resolve()
+    return Path(os.getenv("BOUNDARY_CACHE_DIR", Path("tmp") / "cache" / "boundary")).resolve()
 
 
 def build_cache_lookup(

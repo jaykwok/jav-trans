@@ -996,7 +996,7 @@ def main(argv: list[str] | None = None) -> int:
         return 2
 
     results: list[dict] = []
-    job_temp_root = PROJECT_ROOT / "temp" / "testset-quality-eval" / "jobs"
+    job_temp_root = PROJECT_ROOT / "tmp" / "testset-quality-eval" / "jobs"
     started = time.perf_counter()
     for index, case in enumerate(cases, 1):
         print(f"[{index}/{len(cases)}] {case.video_path}")

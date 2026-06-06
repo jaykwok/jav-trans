@@ -27,6 +27,7 @@ def load_global_glossary_pairs(
         root / f"{video_stem}.translation_global_glossary.json",
         root / "translation_global_glossary.json",
     ]
+    candidates.extend(sorted(root.glob("translation_global_glossary.*.json")))
     for path in candidates:
         if not path.exists():
             continue

@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from pipeline.quality import write_quality_report
+from pipeline.quality import load_global_glossary_pairs, write_quality_report
 
 
 def _write_json_atomic(path: str | Path, payload: dict) -> None:
@@ -95,3 +95,19 @@ def test_quality_report_relative_dir_override_resolves_from_project_root(monkeyp
 
     assert Path(path) == tmp_path / "reports" / "relative.quality_report.md"
     assert (tmp_path / "reports" / "relative.quality_report.json").exists()
+
+
+def test_load_global_glossary_pairs_reads_hashed_translation_glossary(tmp_path):
+    glossary_path = tmp_path / "translation_global_glossary.abc123.json"
+    glossary_path.write_text(
+        json.dumps({"terms": [{"ja": "あなた", "zh": "你"}]}, ensure_ascii=False),
+        encoding="utf-8",
+    )
+
+    pairs = load_global_glossary_pairs(
+        str(tmp_path),
+        "sample",
+        console=_Console(),
+    )
+
+    assert pairs == [("あなた", "你")]

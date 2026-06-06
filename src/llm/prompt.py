@@ -222,9 +222,10 @@ def _build_translation_messages(
             compact=compact_system_prompt,
             extra_glossary=extra_glossary,
         )
+    effective_target_lang = (target_lang or "简体中文").strip() or "简体中文"
 
     user_parts = [
-        "【任务】把下面 JSON 数组里的日文字幕逐条翻译成中文字幕。",
+        f"【任务】把下面 JSON 数组里的日文字幕逐条翻译成{effective_target_lang}字幕。",
         "每个元素的 `id` 必须原样保留，`text` 只能是翻译结果本身。",
         f"必须恰好返回 {expected_count} 条翻译，不要多也不要少。",
         f"【待翻译字幕 JSON】\n{source_payload}",
@@ -323,6 +324,7 @@ def _build_batch_messages(
         summary = full_segments_summary
     else:
         summary = _build_full_segments_summary(full_segments_summary)
+    effective_target_lang = (target_lang or "简体中文").strip() or "简体中文"
 
     messages[0]["content"] = (
         messages[0]["content"]
@@ -330,7 +332,7 @@ def _build_batch_messages(
         + summary
     )
     messages[1]["content"] = (
-        "【任务】把下面当前批次 JSON 数组里的日文字幕逐条翻译成中文字幕。\n"
+        f"【任务】把下面当前批次 JSON 数组里的日文字幕逐条翻译成{effective_target_lang}字幕。\n"
         "每个元素的 `id` 是全片全局 id，必须原样保留；只返回本批 id，不要返回概览里的其他 id。\n"
         "每个 `text` 只能是翻译结果本身。\n"
         f"【当前批次字幕 JSON】\n{source_payload}\n\n"

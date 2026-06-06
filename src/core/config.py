@@ -13,6 +13,7 @@ _FROZEN_PATH_KEYS = {
     "HF_XET_CACHE",
     "TORCH_HOME",
     "JOB_TEMP_DIR",
+    "ASR_CHUNK_ROOT",
     "QUALITY_REPORT_DIR",
 }
 
@@ -28,7 +29,7 @@ DEFAULT_SETTINGS: dict[str, str] = {
     # Local HuggingFace/model cache path. Relative paths are resolved from project root after loading.
     "HF_HOME": "./models",
     # torch.hub runtime cache; not a model directory and not part of models/.
-    "TORCH_HOME": "./temp/torch",
+    "TORCH_HOME": "./tmp/cache/torch",
     # HuggingFace Hub endpoint. Set to https://hf-mirror.com for mainland China acceleration.
     # Empty string means use the default huggingface.co. Takes effect on next app start.
     "HF_ENDPOINT": "",
@@ -141,7 +142,7 @@ DEFAULT_SETTINGS: dict[str, str] = {
     # 1 caches SpeechBoundary frame score -> Boundary Planner outputs separately from ASR generation settings.
     "BOUNDARY_CACHE_ENABLED": "1",
     # Persistent boundary cache directory. Versioned as boundary-cache v1.
-    "BOUNDARY_CACHE_DIR": "./temp/boundary-cache",
+    "BOUNDARY_CACHE_DIR": "./tmp/cache/boundary",
 
     # --- Alignment Retry & Refine ---
     # Max chunk length that hybrid alignment can force-align directly.
@@ -212,7 +213,9 @@ DEFAULT_SETTINGS: dict[str, str] = {
 
     # --- Output & Cache ---
     # Root directory for per-video temporary files.
-    "JOB_TEMP_DIR": "./temp/jobs",
+    "JOB_TEMP_DIR": "./tmp/jobs",
+    # Root directory for transient ASR wav chunks and crash-resume checkpoints.
+    "ASR_CHUNK_ROOT": "./tmp/chunks",
     # 1 keeps optional quality reports requested by the web console.
     "KEEP_QUALITY_REPORT": "0",
     # Optional StageEvent sink: empty disables events; file:, tcp:, and memory are supported.

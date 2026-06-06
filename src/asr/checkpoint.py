@@ -28,7 +28,7 @@ def _asr_generation_error_kind(kind: str) -> str:
 
 _LAST_BOUNDARY_SIGNATURE: dict = {}
 _ASR_CHUNK_ROOT = Path(
-    os.getenv("ASR_CHUNK_ROOT", Path("temp") / "chunks")
+    os.getenv("ASR_CHUNK_ROOT", Path("tmp") / "chunks")
 ).resolve()
 
 

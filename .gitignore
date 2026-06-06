@@ -35,9 +35,12 @@ video/subtitle_qc/
 *.line_compare.html
 *.japanese_transcript_vad_compare.html
 
-# Project temp/cache root. Keep the directory placeholder if present.
-temp/*
-!temp/.gitkeep
+# Project runtime/cache root. Keep the directory placeholder if present.
+tmp/*
+!tmp/.gitkeep
+
+# Legacy runtime root from older builds. Active code writes tmp/ instead.
+temp/
 
 # Local media, generated video outputs, and models. Keep model documentation.
 video/

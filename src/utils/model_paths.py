@@ -10,8 +10,8 @@ PROJECT_ROOT = runtime_root()
 RESOURCE_ROOT = resource_root()
 MODELS_ROOT = PROJECT_ROOT / "models"
 BUNDLED_MODELS_ROOT = RESOURCE_ROOT / "models"
-TEMP_ROOT = PROJECT_ROOT / "temp"
-HF_RUNTIME_CACHE_ROOT = TEMP_ROOT / "hf-cache"
+TMP_ROOT = PROJECT_ROOT / "tmp"
+HF_RUNTIME_CACHE_ROOT = TMP_ROOT / "cache" / "hf"
 DEFAULT_HF_ENDPOINT = "https://huggingface.co"
 
 if is_frozen():
@@ -20,8 +20,8 @@ if is_frozen():
     os.environ.setdefault("HF_XET_CACHE", str(HF_RUNTIME_CACHE_ROOT / "xet"))
 else:
     os.environ.setdefault("HF_HOME", "./models")
-    os.environ.setdefault("HF_HUB_CACHE", "./temp/hf-cache/hub")
-    os.environ.setdefault("HF_XET_CACHE", "./temp/hf-cache/xet")
+    os.environ.setdefault("HF_HUB_CACHE", "./tmp/cache/hf/hub")
+    os.environ.setdefault("HF_XET_CACHE", "./tmp/cache/hf/xet")
 os.environ.setdefault("HF_HUB_DISABLE_SYMLINKS_WARNING", "1")
 
 

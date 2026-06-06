@@ -390,7 +390,7 @@ def _raise_if_cancelled(cancel_event) -> None:
 
 
 def _run_log_dir(ctx: JobContext) -> Path:
-    raw = (ctx.run_log_dir or "./temp/log").strip()
+    raw = (ctx.run_log_dir or "./tmp/log").strip()
     path = Path(raw).expanduser()
     if not path.is_absolute():
         path = PROJECT_ROOT / path
@@ -465,7 +465,7 @@ _log_timing_snapshot = stage_log_module._log_timing_snapshot
 def _resolve_job_temp_dir(job_id: str) -> str:
     root = os.getenv("JOB_TEMP_DIR", "").strip()
     if not root:
-        root = os.path.join("temp", "jobs")
+        root = os.path.join("tmp", "jobs")
     path = Path(root).expanduser()
     if not path.is_absolute():
         path = PROJECT_ROOT / path
@@ -475,10 +475,10 @@ def _resolve_job_temp_dir(job_id: str) -> str:
 def _asr_checkpoint_root() -> Path:
     try:
         return Path(
-            getattr(asr_module, "_ASR_CHUNK_ROOT", Path("temp") / "chunks")
+            getattr(asr_module, "_ASR_CHUNK_ROOT", Path("tmp") / "chunks")
         ).resolve().parent
     except Exception:
-        return Path("temp")
+        return Path("tmp")
 
 
 def _resolve_project_runtime_path(raw_path: str | Path) -> Path:
@@ -499,8 +499,8 @@ def _cleanup_pipeline_temp(job_temp_dir: str, audio_path: str, translation_cache
         checkpoint_root=_asr_checkpoint_root(),
     )
     cleanup_module.cleanup_runtime_ephemeral_temp(
-        job_temp_root=os.getenv("JOB_TEMP_DIR", "temp/jobs") or "temp/jobs",
-        asr_chunk_root=getattr(asr_module, "_ASR_CHUNK_ROOT", Path("temp") / "chunks"),
+        job_temp_root=os.getenv("JOB_TEMP_DIR", "tmp/jobs") or "tmp/jobs",
+        asr_chunk_root=getattr(asr_module, "_ASR_CHUNK_ROOT", Path("tmp") / "chunks"),
         project_root=PROJECT_ROOT,
     )
 

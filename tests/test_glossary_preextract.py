@@ -78,3 +78,13 @@ def test_prompt_signature_changes_with_extra_glossary():
 
     assert first != second
 
+
+def test_global_glossary_cache_path_uses_source_text_hash(tmp_path):
+    cache_path = str(tmp_path / "translation_cache.jsonl")
+    first = translator._global_glossary_cache_path_for_texts(cache_path, ["あなた"])
+    second = translator._global_glossary_cache_path_for_texts(cache_path, ["わたし"])
+
+    assert first != second
+    assert first.endswith(".json")
+    assert "translation_global_glossary." in first
+

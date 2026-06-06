@@ -9,6 +9,19 @@ def test_system_prompt_no_male_prefix_example():
     assert "男：" not in translator._SYSTEM_PROMPT_FULL
 
 
+def test_user_prompt_uses_target_language_label():
+    messages = translator._build_translation_messages(
+        source_payload='[{"id":0,"ja":"好き"}]',
+        expected_count=1,
+        target_lang="繁體中文",
+        glossary="",
+        character_reference="",
+    )
+
+    assert "翻译成繁體中文字幕" in messages[1]["content"]
+    assert "翻译成中文字幕" not in messages[1]["content"]
+
+
 def test_system_prompt_does_not_authorize_asr_rewrites():
     prompt = translator._build_system_prompt(
         expected_count=2,

@@ -8,7 +8,7 @@ def _cleanup_job_temp(job_temp_dir: Path, translation_cache_path: str = "") -> N
     cleanup_job_temp(
         str(job_temp_dir),
         translation_cache_path,
-        checkpoint_root=Path(getattr(asr, "_ASR_CHUNK_ROOT", Path("temp") / "chunks"))
+        checkpoint_root=Path(getattr(asr, "_ASR_CHUNK_ROOT", Path("tmp") / "chunks"))
         .resolve()
         .parent,
     )
@@ -54,10 +54,10 @@ def test_keep_temp_context_skips_cleanup_call(tmp_path):
 
 
 def test_runtime_ephemeral_cleanup_keeps_reusable_caches(tmp_path, monkeypatch):
-    temp_root = tmp_path / "temp"
-    jobs = temp_root / "jobs"
-    chunks = temp_root / "chunks"
-    hf_cache = temp_root / "hf-cache"
+    tmp_root = tmp_path / "tmp"
+    jobs = tmp_root / "jobs"
+    chunks = tmp_root / "chunks"
+    hf_cache = tmp_root / "cache" / "hf"
 
     for path in [jobs, chunks, hf_cache]:
         path.mkdir(parents=True)
