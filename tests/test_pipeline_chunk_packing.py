@@ -113,6 +113,7 @@ class _RecordingBackend:
     def __init__(self) -> None:
         self.audio_paths: list[str] = []
         self.finalized_texts: list[str] = []
+        self.finalized_payloads: list[dict] = []
 
     def load(self, on_stage=None) -> None:
         return None
@@ -149,6 +150,7 @@ class _RecordingBackend:
 
     def finalize_text_results(self, text_results, on_stage=None):
         del on_stage
+        self.finalized_payloads.extend(dict(result) for result in text_results)
         self.finalized_texts.extend(result["text"] for result in text_results)
         return [
             (
@@ -190,7 +192,8 @@ def _reload_pipeline(monkeypatch, tmp_path: Path):
     monkeypatch.setenv("BOUNDARY_FEATURE_FRAME_HOP_S", "0.02")
     monkeypatch.setenv("BOUNDARY_PLANNER_TARGET_PADDING_S", "0")
     monkeypatch.setenv("BOUNDARY_PLANNER_TARGET_CHUNK_S", "9.0")
-    monkeypatch.setenv("BOUNDARY_PLANNER_MAX_CHUNK_S", "30.0")
+    monkeypatch.setenv("BOUNDARY_PLANNER_MAX_CORE_CHUNK_S", "30.0")
+    monkeypatch.setenv("BOUNDARY_PLANNER_MAX_PADDED_CHUNK_S", "30.0")
     monkeypatch.setenv("ASR_CHUNK_ROOT", str(tmp_path / "chunks"))
     monkeypatch.setenv("ASR_CHECKPOINT_ENABLED", "0")
 
@@ -278,7 +281,7 @@ def test_empty_disallowed_boundary_skips_asr_without_full_audio_fallback(monkeyp
     assert backend.finalized_texts == []
     assert details["chunk_count"] == 0
     assert details["transcript_chunks"] == []
-    assert details["asr_qc"]["dropped_uncertain_count"] == 0
+    assert details["asr_qc"]["review_uncertain_count"] == 0
     assert any("切分完成：共 0 个处理块" in entry for entry in log)
 
 
@@ -314,7 +317,7 @@ def test_packed_chunk_metadata_uses_source_span_index_after_short_chunk_drop():
         internal_gap_count=1,
         internal_gap_max_s=0.3,
         boundary_score=0.87,
-        boundary_reason="speaker_change",
+        boundary_reason="utterance_switch",
         boundary_source="cut",
         boundary_decision_merge=False,
         boundary_merge_prob=0.13,
@@ -335,7 +338,7 @@ def test_packed_chunk_metadata_uses_source_span_index_after_short_chunk_drop():
 
     assert chunk_infos[0]["speech_segment_count"] == 2
     assert chunk_infos[0]["boundary_parent_chunk_id"] == 7
-    assert chunk_infos[0]["boundary_reason"] == "speaker_change"
+    assert chunk_infos[0]["boundary_reason"] == "utterance_switch"
     assert chunk_infos[0]["boundary_source"] == "cut"
     assert chunk_infos[0]["boundary_score"] == 0.87
     assert chunk_infos[0]["boundary_decision_merge"] is False
@@ -343,6 +346,31 @@ def test_packed_chunk_metadata_uses_source_span_index_after_short_chunk_drop():
     assert chunk_infos[0]["boundary_split_prob"] == 0.87
     assert chunk_infos[0]["boundary_decision_source"] == "frame_sequence_refiner"
     assert any("speech_segment_count=2" in entry and "source=cut" in entry for entry in log)
+
+
+def test_alignment_fallback_window_metadata_uses_speech_core():
+    from asr import pipeline as asr
+
+    chunk = {
+        "start": 10.0,
+        "end": 20.0,
+        "speech_left_padding_s": 2.0,
+        "speech_right_padding_s": 1.5,
+    }
+    text_result = {
+        "text": "テスト",
+        "raw_text": "テスト",
+        "duration": 10.0,
+        "language": "Japanese",
+        "normalized_path": "missing.wav",
+        "log": [],
+    }
+
+    annotated = asr._with_alignment_fallback_window(chunk, text_result)
+
+    assert annotated["alignment_fallback_start_s"] == 2.0
+    assert annotated["alignment_fallback_end_s"] == 8.5
+    assert annotated["alignment_fallback_source"] == "speech_core"
 
 
 def test_alignment_fallback_count_deduplicates_chunk_log_markers():
@@ -358,18 +386,17 @@ def test_alignment_fallback_count_deduplicates_chunk_log_markers():
     assert asr._alignment_fallback_count_from_log(log) == 2
 
 
-def test_adaptive_precision_drops_low_logprob_before_alignment(monkeypatch, tmp_path):
+def test_adaptive_precision_reviews_low_logprob_before_alignment(monkeypatch, tmp_path):
     monkeypatch.setenv("ASR_QC_ADAPTIVE_BASE_LOGPROB", "-1.0")
-    monkeypatch.setenv("ASR_QC_DROP_UNCERTAIN", "1")
     backend, segments, log, details = _run_transcription_with_backend(
         monkeypatch,
         tmp_path,
         backend=_LowLogprobBackend(),
     )
 
-    assert segments == []
-    assert backend.finalized_texts == []
-    assert details["asr_qc"]["dropped_uncertain_count"] == len(backend.audio_paths)
-    assert details["stage_timings"]["asr_adaptive_dropped_chunks"] == len(backend.audio_paths)
-    assert any(entry.startswith("ASR Adaptive Precision: dropped_uncertain=") for entry in log)
-    assert all(chunk["text"] == "" for chunk in details["transcript_chunks"])
+    assert segments
+    assert backend.finalized_texts
+    assert details["asr_qc"]["review_uncertain_count"] == len(backend.audio_paths)
+    assert details["stage_timings"]["asr_adaptive_review_chunks"] == len(backend.audio_paths)
+    assert any(entry.startswith("ASR Adaptive Precision: review_uncertain=") for entry in log)
+    assert all(chunk["text"] for chunk in details["transcript_chunks"])

@@ -23,7 +23,7 @@ from asr import checkpoint as _checkpoint_module
 from asr import chunking as _chunking_module
 from asr import qc_stage as _qc_stage_module
 from asr import transcribe as _transcribe_module
-from asr.qc import apply_adaptive_precision_filter
+from asr.qc import collect_adaptive_precision_review
 from asr.backends import registry as _registry_module
 
 warnings.filterwarnings("ignore")
@@ -81,8 +81,15 @@ def _boundary_config() -> dict:
         or "auto",
         "boundary_refiner_threshold": _env_float("BOUNDARY_REFINER_THRESHOLD", "0.5"),
         "boundary_candidate_extractor_version": CANDIDATE_EXTRACTOR_VERSION,
-        "boundary_planner_max_chunk_s": _env_float("BOUNDARY_PLANNER_MAX_CHUNK_S", "30.0"),
-        "boundary_planner_target_chunk_s": _env_float("BOUNDARY_PLANNER_TARGET_CHUNK_S", "9.0"),
+        "boundary_planner_max_core_chunk_s": _env_float(
+            "BOUNDARY_PLANNER_MAX_CORE_CHUNK_S",
+            "5.0",
+        ),
+        "boundary_planner_max_padded_chunk_s": _env_float(
+            "BOUNDARY_PLANNER_MAX_PADDED_CHUNK_S",
+            "9.0",
+        ),
+        "boundary_planner_target_chunk_s": _env_float("BOUNDARY_PLANNER_TARGET_CHUNK_S", "3.0"),
         "boundary_planner_min_chunk_s": _env_float("BOUNDARY_PLANNER_MIN_CHUNK_S", "0.4"),
         "boundary_planner_start_weight": _env_float("BOUNDARY_PLANNER_START_WEIGHT", "1.5"),
         "boundary_planner_target_padding_s": _env_float("BOUNDARY_PLANNER_TARGET_PADDING_S", "2.0"),
@@ -98,9 +105,6 @@ def _boundary_config() -> dict:
         "boundary_dp_under_min_weight": _env_float("BOUNDARY_DP_UNDER_MIN_WEIGHT", "0.20"),
         "boundary_dp_long_gap_weight": _env_float("BOUNDARY_DP_LONG_GAP_WEIGHT", "0.35"),
         "boundary_dp_split_merge_weight": _env_float("BOUNDARY_DP_SPLIT_MERGE_WEIGHT", "0.35"),
-        "drop_enabled": _env_bool("BOUNDARY_DROP_LOW_ENERGY_ENABLED", "0"),
-        "drop_min_duration_s": _env_float("BOUNDARY_DROP_LOW_ENERGY_MIN_DURATION_S", "0.20"),
-        "drop_rms_dbfs": _env_float("BOUNDARY_DROP_LOW_ENERGY_RMS_DBFS", "-40.0"),
     }
 
 
@@ -194,14 +198,12 @@ _chunk_original_boundaries = _chunking_module._chunk_original_boundaries
 
 ASRWorkerSystemError = _transcribe_module.ASRWorkerSystemError
 _strip_punctuation = _transcribe_module._strip_punctuation
-_compact_context_text = _transcribe_module._compact_context_text
-_context_tokens = _transcribe_module._context_tokens
-_is_context_leak = _transcribe_module._is_context_leak
+_compact_text_units = _transcribe_module._compact_text_units
 _collapse_repeated_noise = _transcribe_module._collapse_repeated_noise
 _is_low_value_text = _transcribe_module._is_low_value_text
 _clean_segment_text = _transcribe_module._clean_segment_text
-_remove_context_leak_fragments = _transcribe_module._remove_context_leak_fragments
 _build_timestamp_fallback = _transcribe_module._build_timestamp_fallback
+_with_alignment_fallback_window = _transcribe_module._with_alignment_fallback_window
 _looks_like_alignment_failure = _transcribe_module._looks_like_alignment_failure
 _alignment_failure_reasons = _transcribe_module._alignment_failure_reasons
 _split_span_evenly = _transcribe_module._split_span_evenly
@@ -214,7 +216,6 @@ _align_TRANSCRIPTION_results = _transcribe_module._align_TRANSCRIPTION_results
 _build_transcript_chunks = _transcribe_module._build_transcript_chunks
 _build_ASR_CONTEXT_for_chunk = _transcribe_module._build_ASR_CONTEXT_for_chunk
 _backend_accepts_initial_prompts = _transcribe_module._backend_accepts_initial_prompts
-_chunk_gender_label = _transcribe_module._chunk_gender_label
 _should_reset_sliding_context = _transcribe_module._should_reset_sliding_context
 _sliding_context_result_text = _transcribe_module._sliding_context_result_text
 _build_initial_prompt_for_chunk = _transcribe_module._build_initial_prompt_for_chunk
@@ -239,7 +240,6 @@ _pick_postprocess_split_index = _transcribe_module._pick_postprocess_split_index
 _split_long_postprocessed_segment = _transcribe_module._split_long_postprocessed_segment
 _split_long_postprocessed_segments = _transcribe_module._split_long_postprocessed_segments
 _repair_postprocessed_segment_windows = _transcribe_module._repair_postprocessed_segment_windows
-_should_split_on_gender = _transcribe_module._should_split_on_gender
 _merge_words_to_segments = _transcribe_module._merge_words_to_segments
 
 _run_TRANSCRIPTION_qc = _qc_stage_module._run_TRANSCRIPTION_qc
@@ -327,35 +327,6 @@ def aggregate_timeout_fragments(job_id: str) -> Path | None:
 
 import logging as _logging
 _pipeline_logger = _logging.getLogger(__name__)
-
-
-def _drop_short_low_energy_spans(
-    audio_path: str,
-    spans: list,
-) -> list:
-    """Drop spans where duration < threshold AND RMS energy < threshold (both must hold)."""
-    from audio.audio_metrics import compute_rms_dbfs
-
-    cfg = _boundary_config()
-    kept = []
-    dropped = 0
-    for span in spans:
-        start = span.start if hasattr(span, "start") else span[0]
-        end = span.end if hasattr(span, "end") else span[1]
-        dur = end - start
-        if dur < cfg["drop_min_duration_s"]:
-            rms = compute_rms_dbfs(audio_path, start, end)
-            if rms < cfg["drop_rms_dbfs"]:
-                _pipeline_logger.info(
-                    "[chunk-drop] start=%.3f end=%.3f dur=%.3f rms=%.1f dBFS",
-                    start, end, dur, rms,
-                )
-                dropped += 1
-                continue
-        kept.append(span)
-    if dropped:
-        _pipeline_logger.info("[chunk-drop] dropped %d/%d spans", dropped, dropped + len(kept))
-    return kept
 
 
 def _set_last_boundary_signature(signature: dict) -> None:
@@ -496,7 +467,8 @@ def _build_processing_spans(
                 "candidate_extractor_version": cfg[
                     "boundary_candidate_extractor_version"
                 ],
-                "max_chunk_s": cfg["boundary_planner_max_chunk_s"],
+                "max_core_chunk_s": cfg["boundary_planner_max_core_chunk_s"],
+                "max_padded_chunk_s": cfg["boundary_planner_max_padded_chunk_s"],
                 "target_chunk_s": cfg["boundary_planner_target_chunk_s"],
                 "min_chunk_s": cfg["boundary_planner_min_chunk_s"],
                 "start_weight": cfg["boundary_planner_start_weight"],
@@ -532,12 +504,11 @@ def _build_processing_spans(
             )
             _set_last_boundary_cache_event(event)
         return []
-    if cfg["drop_enabled"]:
-        segments = _drop_short_low_energy_spans(audio_path, segments)
     packed = pack_speech_segments(
         segments,
         frame_hop_s=cfg["feature_frame_hop_s"],
-        max_chunk_s=cfg["boundary_planner_max_chunk_s"],
+        max_core_chunk_s=cfg["boundary_planner_max_core_chunk_s"],
+        max_padded_chunk_s=cfg["boundary_planner_max_padded_chunk_s"],
         target_chunk_s=cfg["boundary_planner_target_chunk_s"],
         min_chunk_s=cfg["boundary_planner_min_chunk_s"],
         target_padding_s=cfg["boundary_planner_target_padding_s"],
@@ -743,8 +714,8 @@ def _transcribe_and_align_local(
                     "timeout_count": 0,
                     "quarantined_count": 0,
                     "empty_text_for_speech_count": 0,
-                    "dropped_uncertain_count": 0,
-                    "dropped_uncertain_items": [],
+                    "review_uncertain_count": 0,
+                    "review_uncertain_items": [],
                     "items": [],
                     "rejected_indices": [],
                 },
@@ -785,7 +756,6 @@ def _transcribe_and_align_local(
                 timings[timing_key] = timing_value
 
             qc_report, qc_timings = _run_TRANSCRIPTION_qc(
-                backend,
                 chunk_infos,
                 text_results,
                 log,
@@ -799,26 +769,30 @@ def _transcribe_and_align_local(
                 qc_timings["asr_qc_s"],
             )
 
-            text_results, qc_report, adaptive_drop_log = apply_adaptive_precision_filter(
+            text_results, qc_report, adaptive_review_log = collect_adaptive_precision_review(
                 chunk_infos,
                 text_results,
                 qc_report,
             )
-            if adaptive_drop_log:
-                timings["asr_adaptive_dropped_chunks"] = len(adaptive_drop_log)
+            if adaptive_review_log:
+                timings["asr_adaptive_review_chunks"] = len(adaptive_review_log)
                 log.append(
-                    "ASR Adaptive Precision: dropped_uncertain={count}".format(
-                        count=len(adaptive_drop_log)
+                    "ASR Adaptive Precision: review_uncertain={count}".format(
+                        count=len(adaptive_review_log)
                     )
                 )
-                log.extend(adaptive_drop_log[:8])
-                remaining = len(adaptive_drop_log) - 8
+                log.extend(adaptive_review_log[:8])
+                remaining = len(adaptive_review_log) - 8
                 if remaining > 0:
                     log.append(
                         "ASR Adaptive Precision: "
-                        f"{remaining} additional dropped chunks omitted from log"
+                        f"{remaining} additional review chunks omitted from log"
                     )
 
+            text_results = [
+                _with_alignment_fallback_window(chunk, text_result)
+                for chunk, text_result in zip(chunk_infos, text_results)
+            ]
             transcript_chunks = _build_transcript_chunks(chunk_infos, text_results)
 
             unload_started = time.perf_counter()

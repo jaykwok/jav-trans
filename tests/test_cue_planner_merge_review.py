@@ -32,13 +32,7 @@ def test_export_cue_planner_merge_review_prioritizes_risky_merges(tmp_path: Path
                 "combined_duration_s": 1.4,
                 "combined_text_units": 4.0,
                 "reasons": ["tight_gap"],
-                "annotations": {
-                    "speaker_pair": {
-                        "speaker_change": False,
-                        "speaker_change_score": 0.2,
-                        "threshold": 0.85,
-                    }
-                },
+                "annotations": {},
             },
             {
                 "left_index": 2,
@@ -49,11 +43,6 @@ def test_export_cue_planner_merge_review_prioritizes_risky_merges(tmp_path: Path
                 "combined_text_units": 8.0,
                 "reasons": ["tight_gap", "fallback_risk_boundary"],
                 "annotations": {
-                    "speaker_pair": {
-                        "speaker_change": False,
-                        "speaker_change_score": 0.82,
-                        "threshold": 0.85,
-                    },
                     "diagnostics": {
                         "crosses_chunk": True,
                         "risky_chunks": [9],
@@ -81,7 +70,7 @@ def test_export_cue_planner_merge_review_prioritizes_risky_merges(tmp_path: Path
     ]
     assert rows[0]["left_index"] == 2
     assert "fallback_risk" in rows[0]["risk_tags"]
-    assert "near_speaker_threshold" in rows[0]["risk_tags"]
+    assert "crosses_chunk" in rows[0]["risk_tags"]
     assert rows[0]["priority_rank"] == 1
     assert rows[1]["left_index"] == 0
     assert (tmp_path / "review" / "merge_review_items.csv").exists()

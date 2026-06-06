@@ -1,4 +1,4 @@
-from asr.qc import asr_qc_drop_uncertain_enabled, asr_qc_enabled
+from asr.qc import asr_qc_enabled, check_logprob_quality
 
 
 def test_asr_qc_enabled_reads_env_at_runtime(monkeypatch):
@@ -9,9 +9,8 @@ def test_asr_qc_enabled_reads_env_at_runtime(monkeypatch):
     assert asr_qc_enabled() is False
 
 
-def test_asr_qc_drop_uncertain_is_opt_in(monkeypatch):
-    monkeypatch.delenv("ASR_QC_DROP_UNCERTAIN", raising=False)
-    assert asr_qc_drop_uncertain_enabled() is False
-
-    monkeypatch.setenv("ASR_QC_DROP_UNCERTAIN", "1")
-    assert asr_qc_drop_uncertain_enabled() is True
+def test_asr_qc_uncertain_text_is_review_only():
+    qc = check_logprob_quality(
+        {"avg_logprob": -0.3, "no_speech_prob": 0.1, "compression_ratio": 1.2}
+    )
+    assert qc["metrics"]["review_uncertain_enabled"] is True

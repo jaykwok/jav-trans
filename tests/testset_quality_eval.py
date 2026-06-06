@@ -716,10 +716,10 @@ def _asr_metrics_from_artifacts(paths: dict[str, str]) -> dict:
         "blocks": counts.get("blocks"),
         "asr_qc_reject_count": asr_qc.get("reject_count", 0),
         "asr_qc_warning_count": asr_qc.get("warning_count", 0),
-        "asr_dropped_uncertain_count": (
-            quality.get("asr_dropped_uncertain_count")
-            if "asr_dropped_uncertain_count" in quality
-            else asr_qc.get("dropped_uncertain_count", 0)
+        "asr_review_uncertain_count": (
+            quality.get("asr_review_uncertain_count")
+            if "asr_review_uncertain_count" in quality
+            else asr_qc.get("review_uncertain_count", 0)
         ),
         "asr_generation_error_count": quality.get("asr_generation_error_count", asr_qc.get("generation_error_count", 0)),
         "asr_generation_overflow_count": quality.get("asr_generation_overflow_count", asr_qc.get("generation_overflow_count", 0)),
@@ -776,7 +776,7 @@ def aggregate_results(case_results: list[dict]) -> dict:
     }
     weight_total = 0
     asr_counts = {
-        "asr_dropped_uncertain_count": 0,
+        "asr_review_uncertain_count": 0,
         "asr_generation_error_count": 0,
         "asr_generation_overflow_count": 0,
         "asr_timeout_count": 0,
@@ -812,7 +812,7 @@ def run_pipeline_for_case(
     run_log_enabled: bool,
 ) -> dict[str, str]:
     from core.job_context import JobContext
-    from main import run_asr_alignment_f0, run_translation_and_write
+    from main import run_asr_alignment, run_translation_and_write
 
     video_path = _project_path(case.video_path)
     job_temp_dir = job_temp_root / case.case_id
@@ -828,7 +828,6 @@ def run_pipeline_for_case(
         asr_backend=backend,
         asr_context="",
         subtitle_mode="zh",
-        multi_cue_split=True,
         skip_translation=skip_translation,
         target_lang="简体中文",
         translation_glossary="",
@@ -844,7 +843,7 @@ def run_pipeline_for_case(
         fail_on_qc_block=False,
         advanced=advanced,
     )
-    artifacts = run_asr_alignment_f0(str(video_path), ctx=ctx, job_id=case.case_id)
+    artifacts = run_asr_alignment(str(video_path), ctx=ctx, job_id=case.case_id)
     run_translation_and_write(str(video_path), artifacts, ctx=ctx, job_id=case.case_id)
     return {
         key: value
@@ -876,7 +875,7 @@ def write_html_report(path: Path, payload: dict) -> None:
             f"<td>{quality['zh_cer']:.3f}</td>"
             f"<td>{quality['zh_char_f1']:.3f}</td>"
             f"<td>{proxy['no_reference_overlap_ratio']:.3f}</td>"
-            f"<td>{proxy.get('asr_dropped_uncertain_count', 0)}</td>"
+            f"<td>{proxy.get('asr_review_uncertain_count', 0)}</td>"
             "</tr>"
         )
     summary_items = "".join(

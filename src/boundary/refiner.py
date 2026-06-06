@@ -83,7 +83,7 @@ class HeuristicBoundaryRefiner:
         *,
         merge_threshold: float = 0.5,
         max_merge_gap_s: float | None = None,
-        target_core_s: float = 9.0,
+        target_core_s: float = 3.0,
         cut_score_threshold: float = 0.94,
         valley_score_threshold: float = 0.10,
     ) -> None:
@@ -368,7 +368,7 @@ def load_boundary_refiner(
     device: str = "auto",
     merge_threshold: float = 0.5,
     max_merge_gap_s: float | None = None,
-    target_core_s: float = 9.0,
+    target_core_s: float = 3.0,
     cut_score_threshold: float = 0.94,
     valley_score_threshold: float = 0.10,
 ) -> BoundaryRefiner | None:

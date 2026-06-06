@@ -3,20 +3,6 @@ import pytest
 from asr import pipeline
 
 
-def test_chunk_config_reads_drop_env_at_runtime(monkeypatch):
-    monkeypatch.setenv("BOUNDARY_DROP_LOW_ENERGY_ENABLED", "0")
-    assert pipeline._boundary_config()["drop_enabled"] is False
-
-    monkeypatch.setenv("BOUNDARY_DROP_LOW_ENERGY_ENABLED", "1")
-    monkeypatch.setenv("BOUNDARY_DROP_LOW_ENERGY_MIN_DURATION_S", "0.33")
-    monkeypatch.setenv("BOUNDARY_DROP_LOW_ENERGY_RMS_DBFS", "-35.5")
-    cfg = pipeline._boundary_config()
-
-    assert cfg["drop_enabled"] is True
-    assert cfg["drop_min_duration_s"] == 0.33
-    assert cfg["drop_rms_dbfs"] == -35.5
-
-
 def test_chunk_config_reads_boundary_refiner_env_at_runtime(monkeypatch):
     monkeypatch.setenv("BOUNDARY_REFINER_ENABLED", "1")
     monkeypatch.setenv("BOUNDARY_REFINER_MODEL_PATH", "models/boundary-refiner.pt")
@@ -57,7 +43,8 @@ def test_chunk_config_rejects_torch_mamba2_alias(monkeypatch):
 def test_chunk_config_reads_boundary_planner_env_at_runtime(monkeypatch):
     monkeypatch.setenv("BOUNDARY_FEATURE_FRAME_HOP_S", "0.04")
     monkeypatch.setenv("BOUNDARY_PLANNER_TARGET_CHUNK_S", "8.0")
-    monkeypatch.setenv("BOUNDARY_PLANNER_MAX_CHUNK_S", "28.0")
+    monkeypatch.setenv("BOUNDARY_PLANNER_MAX_CORE_CHUNK_S", "5.5")
+    monkeypatch.setenv("BOUNDARY_PLANNER_MAX_PADDED_CHUNK_S", "28.0")
     monkeypatch.setenv("BOUNDARY_PLANNER_MIN_CHUNK_S", "0.5")
     monkeypatch.setenv("BOUNDARY_PLANNER_START_WEIGHT", "1.7")
     monkeypatch.setenv("BOUNDARY_PLANNER_TARGET_PADDING_S", "1.5")
@@ -74,7 +61,8 @@ def test_chunk_config_reads_boundary_planner_env_at_runtime(monkeypatch):
 
     assert cfg["feature_frame_hop_s"] == 0.04
     assert cfg["boundary_planner_target_chunk_s"] == 8.0
-    assert cfg["boundary_planner_max_chunk_s"] == 28.0
+    assert cfg["boundary_planner_max_core_chunk_s"] == 5.5
+    assert cfg["boundary_planner_max_padded_chunk_s"] == 28.0
     assert cfg["boundary_planner_min_chunk_s"] == 0.5
     assert cfg["boundary_planner_start_weight"] == 1.7
     assert cfg["boundary_planner_target_padding_s"] == 1.5

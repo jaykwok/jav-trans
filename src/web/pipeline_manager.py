@@ -24,7 +24,7 @@ from pipeline.aligned_cache import try_load_aligned_segments
 from pipeline.audio import get_audio_cache_key, probe_video_fps
 from pipeline.ids import sanitize_job_id
 import main as pipeline_main
-from main import run_asr_alignment_f0, run_translation_and_write
+from main import run_asr_alignment, run_translation_and_write
 from utils.model_paths import PROJECT_ROOT
 from web.models import JobSpec, JobState
 
@@ -252,7 +252,7 @@ def _job_context(job: JobState) -> JobContext:
     )
 
 
-def _run_asr_alignment_f0(job: JobState, cancel_event=None):
+def _run_asr_alignment(job: JobState, cancel_event=None):
     events.set_current_job_id(job.id)
     from utils import hf_progress as _hf_progress
 
@@ -262,7 +262,7 @@ def _run_asr_alignment_f0(job: JobState, cancel_event=None):
             job.id,
             _new_cancel_event(),
         )
-        artifacts = run_asr_alignment_f0(
+        artifacts = run_asr_alignment(
             job.spec.video_paths[0],
             ctx=_job_context(job),
             cache_job_id=_resume_cache_job_id(job),
@@ -357,7 +357,7 @@ async def gpu_worker() -> None:
             loop = asyncio.get_running_loop()
             asr_artifacts = await loop.run_in_executor(
                 _executor,
-                _run_asr_alignment_f0,
+                _run_asr_alignment,
                 job,
                 cancel_event,
             )

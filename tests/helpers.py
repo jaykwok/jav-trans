@@ -36,7 +36,6 @@ def make_job_context(
         asr_backend=asr_backend,
         asr_context=asr_context,
         subtitle_mode=subtitle_mode,
-        multi_cue_split=True,
         skip_translation=skip_translation,
         target_lang="简体中文",
         translation_glossary="",
@@ -60,7 +59,7 @@ def run_pipeline(
     *,
     cache_job_id: str = "",
 ):
-    artifacts = main.run_asr_alignment_f0(
+    artifacts = main.run_asr_alignment(
         str(video_path),
         ctx=ctx,
         job_id=ctx.job_id,

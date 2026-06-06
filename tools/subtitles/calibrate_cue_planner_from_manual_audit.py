@@ -234,16 +234,11 @@ def recommendation(summary: dict[str, Any]) -> dict[str, Any]:
         "soft_penalty_tags": sorted(strong_penalty),
         "review_only_tags": sorted(review_only),
         "suggested_planner_args": {
-            "speaker_threshold": 0.95,
-            "speaker_change_policy": "block",
             "fallback_risk_policy": "penalize",
             "max_gap_s": 0.5 if "loose_gap" in strong_block else 1.2,
-            "speaker_score_penalty_threshold": 0.85 if "high_speaker_score" in strong_block else 0.0,
-            "speaker_score_penalty": 0.12 if "high_speaker_score" in strong_block else 0.0,
             "max_reading_units_per_s": 0.0,
         },
         "notes": [
-            "near_speaker_threshold has mixed labels, so it should not become a hard blocker from this batch alone.",
             "reading_density_high is useful for review/protection but is not reliable enough as a hard default gate.",
             "bad_asr and hard drop_non_speech should feed ASR QC or hard-negative pools; do not treat them as pure merge-policy failures.",
             "low_info_vocal is separate from hard drop_non_speech: moans, breaths, sighs, laughter, and short vocalizations may be transcript-worthy in the Galgame target domain.",
@@ -282,7 +277,6 @@ def build_calibration(
                 "cue_duration_s": round(duration, 6),
                 "text_units": round(units, 3),
                 "reading_units_per_s": round(units / max(0.05, duration), 3),
-                "speaker_change_score": _as_float(merged.get("speaker_change_score")),
                 "planner_score": _as_float(merged.get("score")),
             }
         )
@@ -294,22 +288,9 @@ def build_calibration(
         for tag in tags:
             risk_rows[str(tag)].append(row)
 
-    speaker_buckets: dict[str, list[dict[str, Any]]] = defaultdict(list)
     planner_buckets: dict[str, list[dict[str, Any]]] = defaultdict(list)
     reading_buckets: dict[str, list[dict[str, Any]]] = defaultdict(list)
     for row in reviewed:
-        speaker_buckets[
-            bucket_name(
-                float(row["speaker_change_score"]),
-                [
-                    (0.75, "<0.75"),
-                    (0.85, "0.75-0.85"),
-                    (0.90, "0.85-0.90"),
-                    (0.95, "0.90-0.95"),
-                    (999.0, ">=0.95"),
-                ],
-            )
-        ].append(row)
         planner_buckets[
             bucket_name(
                 float(row["planner_score"]),
@@ -345,9 +326,6 @@ def build_calibration(
         "risk_tag_stats": {
             tag: summarize_group(rows)
             for tag, rows in sorted(risk_rows.items(), key=lambda item: (-len(item[1]), item[0]))
-        },
-        "speaker_score_buckets": {
-            key: summarize_group(rows) for key, rows in sorted(speaker_buckets.items())
         },
         "planner_score_buckets": {
             key: summarize_group(rows) for key, rows in sorted(planner_buckets.items())

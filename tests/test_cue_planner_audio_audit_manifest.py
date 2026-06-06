@@ -29,7 +29,6 @@ def test_export_cue_planner_audio_audit_manifest(tmp_path: Path):
                 "merged_ja": "あ ん",
                 "risk_tags": "reading_density_high",
                 "review_priority": 20,
-                "speaker_change_score": 0.7,
                 "score": 0.6,
             }
         ],

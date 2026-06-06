@@ -21,7 +21,7 @@ class BoundaryCandidate:
 @dataclass(frozen=True)
 class CandidateExtractionConfig:
     min_chunk_s: float = 0.4
-    target_chunk_s: float = 9.0
+    target_chunk_s: float = 3.0
     cut_score_threshold: float = 0.94
     valley_score_threshold: float = 0.10
     soft_candidate_search_radius_s: float = 2.0

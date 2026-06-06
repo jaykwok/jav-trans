@@ -85,8 +85,6 @@ def quality_segments_from_blocks(blocks: list[dict]) -> list[dict]:
             "ja": str(block.get("ja_text") or block.get("text") or block.get("ja") or ""),
             "zh": str(block.get("zh_text") or block.get("zh") or ""),
         }
-        if "gender" in block:
-            segment["gender"] = block.get("gender")
         quality_segments.append(segment)
     return quality_segments
 
@@ -107,20 +105,25 @@ def _quality_report_markdown(video_stem: str, report: dict) -> str:
         "repetition_ratio",
         "kana_only_ratio",
         "short_segment_ratio",
+        "short_segment_count",
+        "micro_segment_count",
+        "long_segment_count",
+        "subtitle_duration_p50_s",
+        "subtitle_duration_p90_s",
+        "subtitle_duration_p95_s",
+        "subtitle_duration_max_s",
         "per_min_subtitle_count",
         "glossary_hit_rate",
         "alignment_fallback_ratio",
         "subtitle_overlap_count",
         "subtitle_overlap_total_s",
         "subtitle_overlap_max_s",
-        "f0_filtered_count",
-        "f0_failure",
         "asr_generation_error_count",
         "asr_generation_overflow_count",
         "asr_timeout_count",
         "asr_quarantined_count",
         "asr_empty_text_for_speech_count",
-        "asr_dropped_uncertain_count",
+        "asr_review_uncertain_count",
     ]
     lines = [
         f"# Quality Report: {video_stem}",
@@ -154,10 +157,10 @@ def _quality_report_markdown(video_stem: str, report: dict) -> str:
                 f"{_format_report_value(item.get('overlap_s'))}s"
             )
 
-    dropped = report.get("asr_dropped_uncertain_items")
-    if isinstance(dropped, list) and dropped:
-        lines.extend(["", "## ASR Dropped Uncertain Items", ""])
-        for item in dropped[:20]:
+    review_items = report.get("asr_review_uncertain_items")
+    if isinstance(review_items, list) and review_items:
+        lines.extend(["", "## ASR Review Uncertain Items", ""])
+        for item in review_items[:20]:
             lines.append(f"- `{json.dumps(item, ensure_ascii=False)}`")
 
     lines.append("")
@@ -179,8 +182,6 @@ def write_quality_report(
     write_json_atomic: Callable[[Path, dict], None],
     env_flag: Callable[[str], bool],
     video_duration_s: float | None = None,
-    f0_filtered_count: int = 0,
-    f0_failure: bool = False,
     enabled: bool | None = None,
     glossary: str | None = None,
     report_dir: Path | str | None = None,
@@ -209,8 +210,6 @@ def write_quality_report(
             glossary_pairs,
             fallback_count,
             len(aligned_segments),
-            f0_filtered_count=f0_filtered_count,
-            f0_failure=f0_failure,
             asr_qc=(asr_details or {}).get("asr_qc") or {},
         )
         explicit_report_dir = str(report_dir).strip() if report_dir is not None else ""

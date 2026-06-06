@@ -193,6 +193,94 @@ def test_fallback_safe_boundary_metrics_counts_proportional_sentinel_fallback(tm
     assert unsafe[0]["fallback_reason"] == "proportional_after_sentinel"
 
 
+def test_fallback_safe_boundary_metrics_uses_fallback_window_duration(tmp_path):
+    cache = tmp_path / "boundary-cache.json"
+    _write_json(
+        cache,
+        {
+            "signature": {"audio": {"name": "clip.wav"}},
+            "processing_spans": [
+                {
+                    "start": 0.0,
+                    "end": 12.0,
+                    "split_reason": "soft_valley_candidate",
+                    "core_start": 2.0,
+                    "core_end": 8.0,
+                    "left_padding_s": 2.0,
+                    "right_padding_s": 4.0,
+                    "speech_segments": [{"start": 2.0, "end": 8.0, "score": 0.9}],
+                },
+            ],
+        },
+    )
+    diagnostics = tmp_path / "diagnostics.jsonl"
+    _write_jsonl(
+        diagnostics,
+        [
+            {
+                "chunk_index": 0,
+                "start": 0.0,
+                "end": 12.0,
+                "duration_s": 12.0,
+                "fallback_window_start": 2.0,
+                "fallback_window_end": 8.0,
+                "fallback_duration_s": 6.0,
+                "fallback_window_source": "speech_core",
+                "alignment_quality": "proportional",
+                "fallback_type": "proportional",
+                "fallback_subtype": "proportional_after_sentinel",
+                "sentinel_lines": ["sentinel"],
+                "failure_bucket": "proportional_alignment",
+                "display_text": "core fallback",
+            },
+        ],
+    )
+    boundary_manifest = tmp_path / "boundary_manifest.jsonl"
+    _write_jsonl(
+        boundary_manifest,
+        [
+            {
+                "audio_id": "clip",
+                "duration_s": 12.0,
+                "actual_speech_segments": [{"start": 2.0, "end": 8.0}],
+            },
+        ],
+    )
+    output_dir = tmp_path / "out"
+
+    assert main(
+        [
+            "--boundary-cache",
+            str(cache),
+            "--diagnostics",
+            str(diagnostics),
+            "--boundary-manifest",
+            str(boundary_manifest),
+            "--output-dir",
+            str(output_dir),
+            "--target-duration-s",
+            "8",
+        ]
+    ) == 0
+
+    summary = json.loads((output_dir / "summary.json").read_text(encoding="utf-8"))
+    row = json.loads((output_dir / "chunk_metrics.jsonl").read_text(encoding="utf-8").splitlines()[0])
+    unsafe = (output_dir / "unsafe_fallback_chunks.jsonl").read_text(encoding="utf-8")
+
+    assert summary["fallback_chunk_count"] == 1
+    assert summary["fallback_unsafe_count"] == 0
+    assert summary["fallback_duration_s"]["p50"] == 6.0
+    assert summary["fallback_padded_chunk_duration_s"]["p50"] == 12.0
+    assert summary["truth_start_abs_error_s"]["p50"] == 0.0
+    assert summary["truth_end_abs_error_s"]["p50"] == 0.0
+    assert row["duration_s"] == 12.0
+    assert row["fallback_duration_s"] == 6.0
+    assert row["fallback_window_source"] == "speech_core"
+    assert row["fallback_safe"] is True
+    assert "long_fallback_chunk" not in row["risk_reasons"]
+    assert unsafe == ""
+
+
 def test_fallback_safe_boundary_metrics_uses_sentinel_lines_not_subtype_name(tmp_path):
     cache = tmp_path / "boundary-cache.json"
     _write_json(

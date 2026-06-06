@@ -20,6 +20,15 @@ SRC_ROOT = PROJECT_ROOT / "src"
 if str(SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(SRC_ROOT))
 
+from asr.backends.qwen import DEFAULT_QWEN_ASR_BATCH_SIZE_BY_REPO
+from core.config import load_config
+
+
+DEFAULT_ASR_BATCH_SIZE_BY_REPO_ENV = ",".join(
+    f"{repo_id}={batch_size}"
+    for repo_id, batch_size in DEFAULT_QWEN_ASR_BATCH_SIZE_BY_REPO.items()
+)
+
 
 @dataclass(frozen=True)
 class RunPaths:
@@ -40,6 +49,13 @@ def safe_label(value: str) -> str:
 def project_path(value: str | Path) -> Path:
     raw = Path(value).expanduser()
     return raw if raw.is_absolute() else (PROJECT_ROOT / raw).resolve()
+
+
+def project_path_value(value: str | Path | None) -> str:
+    raw = str(value or "").strip()
+    if not raw:
+        return ""
+    return str(project_path(raw))
 
 
 def project_rel(value: str | Path | None) -> str:
@@ -102,17 +118,40 @@ def resolve_run_log(paths: RunPaths, job_id: str, artifacts=None) -> Path | None
     return max(existing, key=lambda item: item.stat().st_mtime)
 
 
+def _env_bool(key: str, default: bool) -> bool:
+    raw = os.getenv(key, "1" if default else "0").strip().lower()
+    if raw in {"1", "true", "yes", "on"}:
+        return True
+    if raw in {"0", "false", "no", "off"}:
+        return False
+    return default
+
+
+def _env_int(key: str, default: int) -> int:
+    raw = os.getenv(key, str(default)).strip()
+    return int(raw) if raw else default
+
+
+def _env_float(key: str, default: float) -> float:
+    raw = os.getenv(key, str(default)).strip()
+    return float(raw) if raw else default
+
+
 def configure_env(args: argparse.Namespace) -> None:
     os.environ["ASR_BACKEND"] = args.asr_backend
     os.environ["ASR_BOUNDARY_BACKEND"] = "speech_boundary_ja"
-    os.environ["ASR_MODEL_PATH"] = str(project_path(args.asr_model_path))
-    os.environ.setdefault("ASR_MODEL_ID", "jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame")
-    os.environ.setdefault("ALIGNER_MODEL_PATH", str(project_path(args.aligner_model_path)))
+    os.environ["ASR_MODEL_PATH"] = project_path_value(args.asr_model_path)
+    os.environ.setdefault("ASR_MODEL_ID", os.getenv("ASR_MODEL_ID", ""))
+    os.environ.setdefault("ALIGNER_MODEL_PATH", project_path_value(args.aligner_model_path))
     os.environ.setdefault("ALIGNER_MODEL_ID", "Qwen/Qwen3-ForcedAligner-0.6B")
     os.environ.setdefault("ASR_WORKER_MODE", args.asr_worker_mode)
     os.environ.setdefault("ASR_DTYPE", args.asr_dtype)
     os.environ.setdefault("ASR_ATTENTION", args.asr_attention)
-    os.environ.setdefault("ASR_BATCH_SIZE", str(args.asr_batch_size))
+    os.environ.setdefault("ASR_BATCH_SIZE", args.asr_batch_size)
+    os.environ.setdefault(
+        "ASR_BATCH_SIZE_BY_REPO",
+        os.getenv("ASR_BATCH_SIZE_BY_REPO", DEFAULT_ASR_BATCH_SIZE_BY_REPO_ENV),
+    )
     os.environ.setdefault("ALIGNER_BATCH_SIZE", str(args.aligner_batch_size))
     os.environ.setdefault("ALIGN_LONG_CHUNK_BATCH_SIZE", str(args.align_long_chunk_batch_size))
     os.environ.setdefault("TRANSCRIPTION_TIMEOUT_S", str(args.transcription_timeout_s))
@@ -128,7 +167,14 @@ def configure_env(args: argparse.Namespace) -> None:
     os.environ.setdefault("BOUNDARY_REFINER_BACKBONE", args.boundary_refiner_backbone)
     os.environ.setdefault("BOUNDARY_REFINER_DEVICE", args.boundary_refiner_device)
     os.environ.setdefault("BOUNDARY_REFINER_THRESHOLD", str(args.boundary_refiner_threshold))
-    os.environ.setdefault("BOUNDARY_PLANNER_MAX_CHUNK_S", str(args.boundary_planner_max_chunk_s))
+    os.environ.setdefault(
+        "BOUNDARY_PLANNER_MAX_CORE_CHUNK_S",
+        str(args.boundary_planner_max_core_chunk_s),
+    )
+    os.environ.setdefault(
+        "BOUNDARY_PLANNER_MAX_PADDED_CHUNK_S",
+        str(args.boundary_planner_max_padded_chunk_s),
+    )
     os.environ.setdefault("BOUNDARY_PLANNER_TARGET_CHUNK_S", str(args.boundary_planner_target_chunk_s))
     os.environ.setdefault("BOUNDARY_PLANNER_MIN_CHUNK_S", str(args.boundary_planner_min_chunk_s))
     os.environ.setdefault("BOUNDARY_PLANNER_START_WEIGHT", str(args.boundary_planner_start_weight))
@@ -146,7 +192,7 @@ def configure_env(args: argparse.Namespace) -> None:
     os.environ["SPEECH_BOUNDARY_JA_THRESHOLD"] = str(args.speech_boundary_threshold)
     os.environ["SPEECH_BOUNDARY_JA_PAD_S"] = str(args.speech_boundary_pad_s)
     os.environ["SPEECH_BOUNDARY_JA_PTM"] = args.speech_boundary_ptm
-    os.environ["SPEECH_BOUNDARY_JA_MODEL_PATH"] = str(project_path(args.speech_boundary_model_path))
+    os.environ["SPEECH_BOUNDARY_JA_MODEL_PATH"] = project_path_value(args.speech_boundary_model_path)
     os.environ["SPEECH_BOUNDARY_JA_DEVICE"] = args.speech_boundary_device
     os.environ["SPEECH_BOUNDARY_JA_DTYPE"] = args.speech_boundary_dtype
     os.environ["SPEECH_BOUNDARY_JA_WINDOW_S"] = str(args.speech_boundary_window_s)
@@ -167,14 +213,18 @@ def build_context(*, args: argparse.Namespace, paths: RunPaths, video: Path):
     advanced = {
         "ASR_BACKEND": args.asr_backend,
         "ASR_BOUNDARY_BACKEND": "speech_boundary_ja",
-        "ASR_MODEL_PATH": str(project_path(args.asr_model_path)),
-        "ALIGNER_MODEL_PATH": str(project_path(args.aligner_model_path)),
+        "ASR_MODEL_PATH": project_path_value(args.asr_model_path),
+        "ALIGNER_MODEL_PATH": project_path_value(args.aligner_model_path),
         "ASR_WORKER_MODE": args.asr_worker_mode,
         "ASR_CONTEXT": args.asr_context,
         "TRANSCRIPTION_TIMEOUT_S": str(args.transcription_timeout_s),
         "TRANSCRIPTION_MAX_NEW_TOKENS": str(args.transcription_max_new_tokens),
         "ASR_MAX_NEW_TOKENS": str(args.asr_max_new_tokens),
-        "ASR_BATCH_SIZE": str(args.asr_batch_size),
+        "ASR_BATCH_SIZE": args.asr_batch_size,
+        "ASR_BATCH_SIZE_BY_REPO": os.getenv(
+            "ASR_BATCH_SIZE_BY_REPO",
+            DEFAULT_ASR_BATCH_SIZE_BY_REPO_ENV,
+        ),
         "ALIGNER_BATCH_SIZE": str(args.aligner_batch_size),
         "ALIGN_LONG_CHUNK_BATCH_SIZE": str(args.align_long_chunk_batch_size),
         "BOUNDARY_REFINER_ENABLED": os.getenv("BOUNDARY_REFINER_ENABLED", "1"),
@@ -185,8 +235,15 @@ def build_context(*, args: argparse.Namespace, paths: RunPaths, video: Path):
         ),
         "BOUNDARY_REFINER_DEVICE": os.getenv("BOUNDARY_REFINER_DEVICE", "auto"),
         "BOUNDARY_REFINER_THRESHOLD": os.getenv("BOUNDARY_REFINER_THRESHOLD", "0.5"),
-        "BOUNDARY_PLANNER_MAX_CHUNK_S": os.getenv("BOUNDARY_PLANNER_MAX_CHUNK_S", "30.0"),
-        "BOUNDARY_PLANNER_TARGET_CHUNK_S": os.getenv("BOUNDARY_PLANNER_TARGET_CHUNK_S", "9.0"),
+        "BOUNDARY_PLANNER_MAX_CORE_CHUNK_S": os.getenv(
+            "BOUNDARY_PLANNER_MAX_CORE_CHUNK_S",
+            "5.0",
+        ),
+        "BOUNDARY_PLANNER_MAX_PADDED_CHUNK_S": os.getenv(
+            "BOUNDARY_PLANNER_MAX_PADDED_CHUNK_S",
+            "9.0",
+        ),
+        "BOUNDARY_PLANNER_TARGET_CHUNK_S": os.getenv("BOUNDARY_PLANNER_TARGET_CHUNK_S", "3.0"),
         "BOUNDARY_PLANNER_MIN_CHUNK_S": os.getenv("BOUNDARY_PLANNER_MIN_CHUNK_S", "0.4"),
         "BOUNDARY_PLANNER_START_WEIGHT": os.getenv("BOUNDARY_PLANNER_START_WEIGHT", "1.5"),
         "BOUNDARY_PLANNER_TARGET_PADDING_S": os.getenv("BOUNDARY_PLANNER_TARGET_PADDING_S", "2.0"),
@@ -208,7 +265,7 @@ def build_context(*, args: argparse.Namespace, paths: RunPaths, video: Path):
         "SPEECH_BOUNDARY_JA_THRESHOLD": str(args.speech_boundary_threshold),
         "SPEECH_BOUNDARY_JA_PAD_S": str(args.speech_boundary_pad_s),
         "SPEECH_BOUNDARY_JA_PTM": args.speech_boundary_ptm,
-        "SPEECH_BOUNDARY_JA_MODEL_PATH": str(project_path(args.speech_boundary_model_path)),
+        "SPEECH_BOUNDARY_JA_MODEL_PATH": project_path_value(args.speech_boundary_model_path),
         "SPEECH_BOUNDARY_JA_DEVICE": args.speech_boundary_device,
         "SPEECH_BOUNDARY_JA_DTYPE": args.speech_boundary_dtype,
         "SPEECH_BOUNDARY_JA_WINDOW_S": str(args.speech_boundary_window_s),
@@ -225,7 +282,6 @@ def build_context(*, args: argparse.Namespace, paths: RunPaths, video: Path):
         asr_context=args.asr_context,
         subtitle_mode=args.subtitle_mode,
         skip_translation=not args.translate,
-        multi_cue_split=True,
         output_dir=str(paths.generated / job_id),
         keep_quality_report=True,
         keep_temp_files=True,
@@ -261,7 +317,7 @@ def run_video(args: argparse.Namespace, paths: RunPaths, video: Path) -> dict[st
         f"asr={args.asr_backend} ===",
         flush=True,
     )
-    artifacts = pipeline_main.run_asr_alignment_f0(str(video), ctx=ctx, job_id=ctx.job_id)
+    artifacts = pipeline_main.run_asr_alignment(str(video), ctx=ctx, job_id=ctx.job_id)
     output_paths = pipeline_main.run_translation_and_write(
         str(video),
         artifacts,
@@ -326,14 +382,15 @@ def write_summary(paths: RunPaths, args: argparse.Namespace, results: list[dict[
         "task": args.task_name,
         "label": args.label,
         "asr_backend": args.asr_backend,
-        "asr_model_path": project_rel(project_path(args.asr_model_path)),
+        "asr_model_path": project_rel(project_path_value(args.asr_model_path)),
         "boundary_backend": "speech_boundary_ja",
         "speech_boundary_operating_point": "qwen-feature-energy-bootstrap-v1",
         "speech_boundary_threshold": args.speech_boundary_threshold,
         "speech_boundary_pad_s": args.speech_boundary_pad_s,
         "boundary_planner": {
             "feature_frame_hop_s": args.boundary_feature_frame_hop_s,
-            "max_chunk_s": args.boundary_planner_max_chunk_s,
+            "max_core_chunk_s": args.boundary_planner_max_core_chunk_s,
+            "max_padded_chunk_s": args.boundary_planner_max_padded_chunk_s,
             "target_chunk_s": args.boundary_planner_target_chunk_s,
             "min_chunk_s": args.boundary_planner_min_chunk_s,
             "start_weight": args.boundary_planner_start_weight,
@@ -356,7 +413,7 @@ def write_summary(paths: RunPaths, args: argparse.Namespace, results: list[dict[
         "# SpeechBoundary-JA Full Workflow",
         "",
         f"- ASR: `{args.asr_backend}`",
-        f"- ASR model: `{project_rel(project_path(args.asr_model_path))}`",
+        f"- ASR model: `{project_rel(project_path_value(args.asr_model_path)) or 'auto'}`",
         f"- Boundary: `speech_boundary_ja` threshold `{args.speech_boundary_threshold:g}`, pad `{args.speech_boundary_pad_s:g}s`",
         f"- Translation: `{'on' if args.translate else 'off'}`",
         f"- Runtime root: `{project_rel(paths.root)}`",
@@ -380,27 +437,34 @@ def write_summary(paths: RunPaths, args: argparse.Namespace, results: list[dict[
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    load_config()
     parser = argparse.ArgumentParser(
         description="Run project full workflow with SpeechBoundary-JA bootstrap scores, Boundary Refiner, and Qwen3-ASR."
     )
     parser.add_argument("--video", action="append", required=True, help="Video path or stem. Repeatable.")
     parser.add_argument("--task-name", default="full-workflow-qwen200k")
     parser.add_argument("--label", default="speech_boundary_ja_qwen200k")
-    parser.add_argument("--asr-backend", default="jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame")
+    parser.add_argument(
+        "--asr-backend",
+        default=os.getenv("ASR_BACKEND", "jaykwok/Qwen3-ASR-0.6B-JA-Anime-Galgame"),
+    )
     parser.add_argument(
         "--asr-model-path",
-        default="models/jaykwok-Qwen3-ASR-1.7B-JA-Anime-Galgame",
+        default=os.getenv("ASR_MODEL_PATH", ""),
     )
-    parser.add_argument("--aligner-model-path", default="models/Qwen-Qwen3-ForcedAligner-0.6B")
-    parser.add_argument("--asr-worker-mode", default="subprocess")
-    parser.add_argument("--asr-dtype", default="bfloat16")
-    parser.add_argument("--asr-attention", default="sdpa")
-    parser.add_argument("--asr-batch-size", type=int, default=1)
-    parser.add_argument("--aligner-batch-size", type=int, default=2)
-    parser.add_argument("--align-long-chunk-batch-size", type=int, default=1)
-    parser.add_argument("--asr-max-new-tokens", type=int, default=128)
-    parser.add_argument("--transcription-max-new-tokens", type=int, default=128)
-    parser.add_argument("--transcription-timeout-s", type=int, default=300)
+    parser.add_argument(
+        "--aligner-model-path",
+        default=os.getenv("ALIGNER_MODEL_PATH", ""),
+    )
+    parser.add_argument("--asr-worker-mode", default=os.getenv("ASR_WORKER_MODE", "subprocess"))
+    parser.add_argument("--asr-dtype", default=os.getenv("ASR_DTYPE", "bfloat16"))
+    parser.add_argument("--asr-attention", default=os.getenv("ASR_ATTENTION", "sdpa"))
+    parser.add_argument("--asr-batch-size", default=os.getenv("ASR_BATCH_SIZE", "auto"))
+    parser.add_argument("--aligner-batch-size", type=int, default=_env_int("ALIGNER_BATCH_SIZE", 48))
+    parser.add_argument("--align-long-chunk-batch-size", type=int, default=_env_int("ALIGN_LONG_CHUNK_BATCH_SIZE", 48))
+    parser.add_argument("--asr-max-new-tokens", type=int, default=_env_int("ASR_MAX_NEW_TOKENS", 128))
+    parser.add_argument("--transcription-max-new-tokens", type=int, default=_env_int("TRANSCRIPTION_MAX_NEW_TOKENS", 128))
+    parser.add_argument("--transcription-timeout-s", type=int, default=_env_int("TRANSCRIPTION_TIMEOUT_S", 300))
     parser.add_argument("--asr-context", default=os.getenv("ASR_CONTEXT", ""))
     parser.add_argument("--subtitle-mode", default="zh")
     parser.add_argument("--translate", action="store_true", help="Run LLM translation too. Default outputs Japanese SRT.")
@@ -416,43 +480,51 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             "subtitle frame timing is derived from each source video's real FPS."
         ),
     )
-    parser.add_argument("--boundary-refiner-model-path", default="")
+    parser.add_argument(
+        "--boundary-refiner-model-path",
+        default=os.getenv("BOUNDARY_REFINER_MODEL_PATH", ""),
+    )
     parser.add_argument(
         "--boundary-refiner-backbone",
         default="transformers.Mamba2Model",
         choices=("transformers.Mamba2Model",),
     )
-    parser.add_argument("--boundary-refiner-threshold", type=float, default=0.5)
-    parser.add_argument("--boundary-refiner-device", default="auto")
-    parser.add_argument("--boundary-planner-max-chunk-s", type=float, default=30.0)
-    parser.add_argument("--boundary-planner-target-chunk-s", type=float, default=9.0)
-    parser.add_argument("--boundary-planner-min-chunk-s", type=float, default=0.4)
-    parser.add_argument("--boundary-planner-start-weight", type=float, default=1.5)
-    parser.add_argument("--boundary-planner-target-padding-s", type=float, default=2.0)
-    parser.add_argument("--boundary-planner-max-splits-per-segment", type=int, default=16)
-    parser.add_argument("--boundary-planner-sequence-batch-size", type=int, default=256)
+    parser.add_argument("--boundary-refiner-threshold", type=float, default=_env_float("BOUNDARY_REFINER_THRESHOLD", 0.5))
+    parser.add_argument("--boundary-refiner-device", default=os.getenv("BOUNDARY_REFINER_DEVICE", "auto"))
+    parser.add_argument("--boundary-planner-max-core-chunk-s", type=float, default=_env_float("BOUNDARY_PLANNER_MAX_CORE_CHUNK_S", 5.0))
+    parser.add_argument("--boundary-planner-max-padded-chunk-s", type=float, default=_env_float("BOUNDARY_PLANNER_MAX_PADDED_CHUNK_S", 9.0))
+    parser.add_argument("--boundary-planner-target-chunk-s", type=float, default=_env_float("BOUNDARY_PLANNER_TARGET_CHUNK_S", 3.0))
+    parser.add_argument("--boundary-planner-min-chunk-s", type=float, default=_env_float("BOUNDARY_PLANNER_MIN_CHUNK_S", 0.4))
+    parser.add_argument("--boundary-planner-start-weight", type=float, default=_env_float("BOUNDARY_PLANNER_START_WEIGHT", 1.5))
+    parser.add_argument("--boundary-planner-target-padding-s", type=float, default=_env_float("BOUNDARY_PLANNER_TARGET_PADDING_S", 2.0))
+    parser.add_argument("--boundary-planner-max-splits-per-segment", type=int, default=_env_int("BOUNDARY_PLANNER_MAX_SPLITS_PER_SEGMENT", 16))
+    parser.add_argument("--boundary-planner-sequence-batch-size", type=int, default=_env_int("BOUNDARY_PLANNER_SEQUENCE_BATCH_SIZE", 256))
     parser.add_argument("--keep-asr-chunks", action=argparse.BooleanOptionalAction, default=True)
-    parser.add_argument("--boundary-cache", action=argparse.BooleanOptionalAction, default=True)
-    parser.add_argument("--speech-boundary-threshold", dest="speech_boundary_threshold", type=float, default=0.200)
-    parser.add_argument("--speech-boundary-pad-s", dest="speech_boundary_pad_s", type=float, default=0.2)
-    parser.add_argument("--speech-boundary-ptm", dest="speech_boundary_ptm", default="jaykwok/Qwen3-ASR-0.6B-JA-Anime-Galgame")
+    parser.add_argument("--boundary-cache", action=argparse.BooleanOptionalAction, default=_env_bool("BOUNDARY_CACHE_ENABLED", True))
+    parser.add_argument("--speech-boundary-threshold", dest="speech_boundary_threshold", type=float, default=_env_float("SPEECH_BOUNDARY_JA_THRESHOLD", 0.200))
+    parser.add_argument("--speech-boundary-pad-s", dest="speech_boundary_pad_s", type=float, default=_env_float("SPEECH_BOUNDARY_JA_PAD_S", 0.2))
+    parser.add_argument(
+        "--speech-boundary-ptm",
+        dest="speech_boundary_ptm",
+        default=os.getenv("SPEECH_BOUNDARY_JA_PTM", "jaykwok/Qwen3-ASR-0.6B-JA-Anime-Galgame"),
+    )
     parser.add_argument(
         "--speech-boundary-model-path",
         dest="speech_boundary_model_path",
-        default="models/jaykwok-Qwen3-ASR-0.6B-JA-Anime-Galgame",
+        default=os.getenv("SPEECH_BOUNDARY_JA_MODEL_PATH", "models/jaykwok-Qwen3-ASR-0.6B-JA-Anime-Galgame"),
     )
-    parser.add_argument("--speech-boundary-device", dest="speech_boundary_device", default="auto")
-    parser.add_argument("--speech-boundary-dtype", dest="speech_boundary_dtype", default="bfloat16")
-    parser.add_argument("--speech-boundary-window-s", dest="speech_boundary_window_s", type=float, default=30.0)
-    parser.add_argument("--speech-boundary-overlap-s", dest="speech_boundary_overlap_s", type=float, default=1.0)
-    parser.add_argument("--speech-boundary-min-segment-s", dest="speech_boundary_min_segment_s", type=float, default=0.05)
-    parser.add_argument("--speech-boundary-merge-gap-s", dest="speech_boundary_merge_gap_s", type=float, default=0.0)
-    parser.add_argument("--speech-boundary-cut-threshold", dest="speech_boundary_cut_threshold", type=float, default=0.500)
+    parser.add_argument("--speech-boundary-device", dest="speech_boundary_device", default=os.getenv("SPEECH_BOUNDARY_JA_DEVICE", "auto"))
+    parser.add_argument("--speech-boundary-dtype", dest="speech_boundary_dtype", default=os.getenv("SPEECH_BOUNDARY_JA_DTYPE", "bfloat16"))
+    parser.add_argument("--speech-boundary-window-s", dest="speech_boundary_window_s", type=float, default=_env_float("SPEECH_BOUNDARY_JA_WINDOW_S", 30.0))
+    parser.add_argument("--speech-boundary-overlap-s", dest="speech_boundary_overlap_s", type=float, default=_env_float("SPEECH_BOUNDARY_JA_OVERLAP_S", 1.0))
+    parser.add_argument("--speech-boundary-min-segment-s", dest="speech_boundary_min_segment_s", type=float, default=_env_float("SPEECH_BOUNDARY_JA_MIN_SEGMENT_S", 0.05))
+    parser.add_argument("--speech-boundary-merge-gap-s", dest="speech_boundary_merge_gap_s", type=float, default=_env_float("SPEECH_BOUNDARY_JA_MERGE_GAP_S", 0.0))
+    parser.add_argument("--speech-boundary-cut-threshold", dest="speech_boundary_cut_threshold", type=float, default=_env_float("SPEECH_BOUNDARY_JA_CUT_THRESHOLD", 0.500))
     parser.add_argument(
         "--speech-boundary-apply-cut-to-speech",
         dest="speech_boundary_apply_cut_to_speech",
         action=argparse.BooleanOptionalAction,
-        default=True,
+        default=_env_bool("SPEECH_BOUNDARY_JA_APPLY_CUT_TO_SPEECH", True),
     )
     args = parser.parse_args(argv)
     if args.speech_boundary_threshold < 0:

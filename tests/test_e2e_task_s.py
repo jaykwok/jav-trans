@@ -15,9 +15,9 @@ from helpers import make_job_context, run_pipeline
 def _segments(count: int, *, empty: bool = False) -> list[dict]:
     return [
         {
-            "start": float(index),
-            "end": float(index) + 0.8,
-            "text": "" if empty else f"ja-{index}",
+            "start": float(index * 2),
+            "end": float(index * 2) + 0.8,
+            "text": "" if empty else f"ja-{index}。",
         }
         for index in range(count)
     ]
@@ -58,8 +58,13 @@ def _mock_audio_and_asr(monkeypatch, segments: list[dict], *, checkpoint: bool =
 
 def _fake_translation_json(messages, expected_count=0, on_progress=None, **_kwargs):
     match = re.search(r"requested_ids\s*=\s*(\[[^\]]*\])", messages[1]["content"])
-    assert match is not None, messages[1]["content"]
-    ids = json.loads(match.group(1))
+    if match is not None:
+        ids = json.loads(match.group(1))
+    else:
+        marker = "【待翻译字幕 JSON】"
+        assert marker in messages[1]["content"], messages[1]["content"]
+        payload = json.loads(messages[1]["content"].split(marker, 1)[1].strip())
+        ids = [int(item["id"]) for item in payload]
     if on_progress:
         on_progress({"phase": "translating", "translated": len(ids), "expected": expected_count})
         on_progress({"phase": "done", "translated": len(ids), "expected": expected_count})

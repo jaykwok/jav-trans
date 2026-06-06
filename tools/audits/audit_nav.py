@@ -1,13 +1,18 @@
 from __future__ import annotations
 
+import argparse
+from datetime import datetime
 import html
 import json
+import re
+import shutil
 from pathlib import Path
 from typing import Any, Mapping
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 AUDIT_ROOT = PROJECT_ROOT / "agents" / "audits"
+AUDIT_RM_ROOT = PROJECT_ROOT / "agents" / "rm" / "audit-deletions"
 
 
 def project_rel(value: str | Path | None) -> str:
@@ -49,7 +54,7 @@ def _summary_for(index_path: Path) -> Mapping[str, Any]:
 
 def _entry_desc(summary: Mapping[str, Any]) -> str:
     parts: list[str] = []
-    for key in ("review_item_count", "rows", "subtitle_cue_count", "long_chunks"):
+    for key in ("review_item_count", "rows", "subtitle_cue_count", "fallback_rows", "long_chunks"):
         value = summary.get(key)
         if value is not None:
             if key == "review_item_count":
@@ -58,6 +63,8 @@ def _entry_desc(summary: Mapping[str, Any]) -> str:
                 parts.append(f"{value} 行")
             elif key == "subtitle_cue_count":
                 parts.append(f"{value} 字幕")
+            elif key == "fallback_rows":
+                parts.append(f"{value} fallback rows")
             elif key == "long_chunks":
                 parts.append(f"{value} long chunks")
     for key in ("video_label", "video", "dataset_id"):
@@ -87,6 +94,7 @@ def _discover_entries(audit_root: Path) -> list[dict[str, str]]:
                 "href": rel_url(index_path, from_dir=audit_root),
                 "title": _entry_title(index_path, summary),
                 "desc": _entry_desc(summary),
+                "dir": rel_url(index_path.parent, from_dir=audit_root),
             }
         )
     return entries
@@ -97,12 +105,155 @@ def _card(entry: Mapping[str, str], *, latest_href: str) -> str:
     title = str(entry.get("title") or href)
     desc = str(entry.get("desc") or "审计页面")
     badge = '<span class="badge">最新</span>' if href == latest_href else ""
+    delete_label = f"删除 {title}"
     return (
-        f'  <a class="entry" href="{html.escape(href)}">\n'
-        f"    <strong>{html.escape(title)}{badge}</strong>\n"
-        f"    <span>{html.escape(desc)}</span>\n"
-        "  </a>"
+        f'  <div class="entry" data-href="{html.escape(href)}">\n'
+        f'    <a class="entry-main" href="{html.escape(href)}">\n'
+        f"      <strong>{html.escape(title)}{badge}</strong>\n"
+        f"      <span>{html.escape(desc)}</span>\n"
+        "    </a>\n"
+        f'    <button class="delete-audit" type="button" data-href="{html.escape(href)}" '
+        f'data-title="{html.escape(title)}" aria-label="{html.escape(delete_label)}">删除</button>\n'
+        "  </div>"
     )
+
+
+def _current_latest_href(audit_root: Path) -> str:
+    latest_path = audit_root / "latest-audit.html"
+    if not latest_path.exists():
+        return ""
+    try:
+        text = latest_path.read_text(encoding="utf-8")
+    except Exception:
+        return ""
+    for href in re.findall(r'href="([^"]+)"', text):
+        if href and href != "index.html" and not href.startswith(("#", "http:", "https:")):
+            return href
+    return ""
+
+
+def _resolve_audit_entry_dir(*, audit_root: Path, href: str) -> Path:
+    if not href.strip():
+        raise ValueError("empty audit href")
+    if "://" in href or href.startswith(("/", "\\")):
+        raise ValueError(f"audit href must be relative: {href}")
+    target = (audit_root / href).resolve()
+    root = audit_root.resolve()
+    try:
+        target.relative_to(root)
+    except ValueError as exc:
+        raise ValueError(f"audit href escapes audit root: {href}") from exc
+    target_dir = target.parent if target.name == "index.html" or target.suffix else target
+    if target_dir == root:
+        raise ValueError("refusing to delete audit root")
+    try:
+        target_dir.relative_to(root)
+    except ValueError as exc:
+        raise ValueError(f"audit directory escapes audit root: {target_dir}") from exc
+    if not (target_dir / "index.html").exists():
+        raise FileNotFoundError(f"audit index not found: {target_dir / 'index.html'}")
+    return target_dir
+
+
+def _unique_rm_dest(*, rm_root: Path, target_dir: Path) -> Path:
+    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    base = rm_root / f"{stamp}-{target_dir.name}"
+    dest = base
+    suffix = 2
+    while dest.exists():
+        dest = rm_root / f"{base.name}-{suffix}"
+        suffix += 1
+    return dest
+
+
+def _newest_entry_index(audit_root: Path) -> Path | None:
+    entries = [
+        path for path in audit_root.glob("**/index.html")
+        if path != audit_root / "index.html"
+    ]
+    if not entries:
+        return None
+    return max(entries, key=lambda path: path.stat().st_mtime)
+
+
+def _latest_index_after_delete(*, audit_root: Path, deleted_href: str, previous_latest_href: str) -> Path | None:
+    if previous_latest_href and previous_latest_href != deleted_href:
+        latest_candidate = (audit_root / previous_latest_href).resolve()
+        try:
+            latest_candidate.relative_to(audit_root.resolve())
+        except ValueError:
+            latest_candidate = Path()
+        if latest_candidate.exists():
+            return latest_candidate
+    return _newest_entry_index(audit_root)
+
+
+def write_empty_latest_audit_entry(*, audit_root: Path) -> None:
+    audit_root.mkdir(parents=True, exist_ok=True)
+    (audit_root / "latest-audit.html").write_text(
+        """<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>最新审计页入口</title>
+</head>
+<body>
+<h1>最新审计页入口</h1>
+<p>当前没有审计页。</p>
+<p><a href="index.html">返回审计导航</a></p>
+</body>
+</html>
+""",
+        encoding="utf-8",
+    )
+
+
+def refresh_audit_entrypoints_after_change(
+    *,
+    audit_root: Path = AUDIT_ROOT,
+    latest_html: Path | None = None,
+    latest_title: str = "",
+) -> Path | None:
+    if latest_html is None:
+        latest_html = _newest_entry_index(audit_root)
+    if latest_html is None:
+        write_empty_latest_audit_entry(audit_root=audit_root)
+        write_audit_index(audit_root=audit_root)
+        return None
+    summary = _summary_for(latest_html)
+    title = latest_title or _entry_title(latest_html, summary)
+    write_latest_audit_entry(audit_root=audit_root, latest_html=latest_html, title=title)
+    write_audit_index(audit_root=audit_root, latest_html=latest_html, latest_title=title)
+    return latest_html
+
+
+def delete_audit_entry(
+    *,
+    href: str,
+    audit_root: Path = AUDIT_ROOT,
+    rm_root: Path = AUDIT_RM_ROOT,
+) -> dict[str, str]:
+    target_dir = _resolve_audit_entry_dir(audit_root=audit_root, href=href)
+    deleted_href = rel_url(target_dir / "index.html", from_dir=audit_root)
+    previous_latest_href = _current_latest_href(audit_root)
+    rm_root.mkdir(parents=True, exist_ok=True)
+    dest = _unique_rm_dest(rm_root=rm_root, target_dir=target_dir)
+    shutil.move(str(target_dir), str(dest))
+    latest_html = _latest_index_after_delete(
+        audit_root=audit_root,
+        deleted_href=deleted_href,
+        previous_latest_href=previous_latest_href,
+    )
+    refreshed_latest = refresh_audit_entrypoints_after_change(
+        audit_root=audit_root,
+        latest_html=latest_html,
+    )
+    return {
+        "deleted_href": deleted_href,
+        "moved_to": project_rel(dest),
+        "latest_href": rel_url(refreshed_latest, from_dir=audit_root) if refreshed_latest else "",
+    }
 
 
 def write_latest_audit_entry(*, audit_root: Path, latest_html: Path, title: str) -> None:
@@ -165,12 +316,20 @@ body {{
 main {{ max-width: 980px; margin: 0 auto; padding: 32px 18px; }}
 h1 {{ margin: 0 0 18px; font-size: 24px; }}
 .entry {{
-  display: block;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 12px;
+  align-items: center;
   margin: 12px 0;
   padding: 14px 16px;
   border: 1px solid #d8ddd8;
   border-radius: 8px;
   background: #fff;
+  color: inherit;
+}}
+.entry-main {{
+  display: block;
+  min-width: 0;
   color: inherit;
   text-decoration: none;
 }}
@@ -182,6 +341,16 @@ h1 {{ margin: 0 0 18px; font-size: 24px; }}
   color: #0f766e;
 }}
 .entry span {{ color: #66706c; }}
+.delete-audit {{
+  border: 1px solid #efb5af;
+  border-radius: 6px;
+  background: #fff0ee;
+  color: #b42318;
+  cursor: pointer;
+  padding: 7px 10px;
+  white-space: nowrap;
+}}
+.delete-audit:hover {{ background: #ffe3df; }}
 .badge {{
   display: inline-block;
   border: 1px solid #0f766e;
@@ -191,6 +360,18 @@ h1 {{ margin: 0 0 18px; font-size: 24px; }}
   line-height: 1.4;
 }}
 .muted {{ color: #66706c; font-size: 13px; }}
+.status {{
+  margin: 14px 0 0;
+  padding: 10px 12px;
+  border: 1px solid #d8ddd8;
+  border-radius: 8px;
+  background: #fff;
+  color: #40504a;
+  font-size: 13px;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}}
+.status:empty {{ display: none; }}
 code {{ font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }}
 </style>
 </head>
@@ -198,9 +379,67 @@ code {{ font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
 <main>
   <h1>JAVTrans 审计导航</h1>
 {cards}
+  <div class="status" id="deleteStatus"></div>
   <p class="muted">{html.escape(latest_meta)}</p>
-  <p class="muted">所有长期审计页统一放在 <code>agents/audits/</code>，从本页进入；不使用自动跳转，避免审计中刷新。</p>
+  <p class="muted">所有长期审计页统一放在 <code>agents/audits/</code>，从本页进入；不使用自动跳转，避免审计中刷新。删除会移动到 <code>agents/rm/audit-deletions/</code>。使用 live-server 时加 middleware：<code>live-server --middleware=tools/audits/live_server_audit_middleware.js</code>。</p>
 </main>
+<script>
+const statusBox = document.getElementById("deleteStatus");
+function setStatus(text) {{
+  statusBox.textContent = text || "";
+}}
+function deleteCommand(href) {{
+  return `PYTHONIOENCODING=utf-8 UV_CACHE_DIR=agents/temp/uv-cache uv run python tools/audits/audit_nav.py delete --href "${{href.replaceAll('"', '\\"')}}"`;
+}}
+async function copyText(text) {{
+  try {{
+    await navigator.clipboard.writeText(text);
+    return true;
+  }} catch (_) {{
+    return false;
+  }}
+}}
+async function deleteAudit(button) {{
+  const href = button.dataset.href || "";
+  const title = button.dataset.title || href;
+  if (!href) return;
+  if (!window.confirm(`删除审计记录？\\n\\n${{title}}\\n\\n文件会移动到 agents/rm/audit-deletions/。`)) return;
+  button.disabled = true;
+  button.textContent = "删除中";
+  try {{
+    const response = await fetch("/__audit_api__/delete-audit", {{
+      method: "POST",
+      headers: {{"Content-Type": "application/json"}},
+      body: JSON.stringify({{href}})
+    }});
+    const payload = await response.json().catch(() => ({{}}));
+    if (!response.ok || !payload.ok) {{
+      throw new Error(payload.error || `HTTP ${{response.status}}`);
+    }}
+    const card = button.closest(".entry");
+    if (card) card.remove();
+    setStatus(`已移动到 ${{payload.moved_to || "agents/rm/audit-deletions/"}}。导航页已重建；刷新页面可看到最新状态。`);
+  }} catch (error) {{
+    const command = deleteCommand(href);
+    const copied = await copyText(command);
+    setStatus(
+      "live-server middleware 不可用，浏览器静态页不能直接删除文件。\\n" +
+      "请用以下方式从项目根目录启动：live-server --middleware=tools/audits/live_server_audit_middleware.js\\n" +
+      "或直接运行删除命令" + (copied ? "（已复制）" : "") + "：\\n" + command + "\\n" +
+      `错误：${{error.message || error}}`
+    );
+    button.disabled = false;
+    button.textContent = "删除";
+  }}
+}}
+for (const button of document.querySelectorAll(".delete-audit")) {{
+  button.addEventListener("click", event => {{
+    event.preventDefault();
+    event.stopPropagation();
+    deleteAudit(button);
+  }});
+}}
+</script>
 </body>
 </html>
 """,
@@ -215,3 +454,45 @@ def update_audit_entrypoints(*, latest_html: Path, title: str) -> None:
         return
     write_latest_audit_entry(audit_root=AUDIT_ROOT, latest_html=latest_html, title=title)
     write_audit_index(audit_root=AUDIT_ROOT, latest_html=latest_html, latest_title=title)
+
+
+def _path_arg(value: str | Path) -> Path:
+    raw = Path(value).expanduser()
+    return raw if raw.is_absolute() else (PROJECT_ROOT / raw).resolve()
+
+
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Maintain agents/audits navigation pages.")
+    parser.add_argument("--audit-root", default=str(AUDIT_ROOT))
+    parser.add_argument("--rm-root", default=str(AUDIT_RM_ROOT))
+    subparsers = parser.add_subparsers(dest="command", required=True)
+
+    delete_parser = subparsers.add_parser("delete", help="Move an audit entry to agents/rm and rebuild navigation.")
+    delete_parser.add_argument("--href", required=True, help="Audit href from agents/audits/index.html")
+
+    rebuild_parser = subparsers.add_parser("rebuild", help="Rebuild index.html/latest-audit.html")
+    rebuild_parser.add_argument("--latest-href", help="Optional latest audit href")
+
+    return parser.parse_args(argv)
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = parse_args(argv)
+    audit_root = _path_arg(args.audit_root)
+    rm_root = _path_arg(args.rm_root)
+    if args.command == "delete":
+        result = delete_audit_entry(href=args.href, audit_root=audit_root, rm_root=rm_root)
+        print(json.dumps({"ok": True, **result}, ensure_ascii=False, indent=2))
+        return 0
+    if args.command == "rebuild":
+        latest_html = None
+        if args.latest_href:
+            latest_html = _resolve_audit_entry_dir(audit_root=audit_root, href=args.latest_href) / "index.html"
+        refreshed = refresh_audit_entrypoints_after_change(audit_root=audit_root, latest_html=latest_html)
+        print(json.dumps({"ok": True, "latest_href": rel_url(refreshed, from_dir=audit_root) if refreshed else ""}, ensure_ascii=False, indent=2))
+        return 0
+    raise SystemExit(f"unknown command: {args.command}")
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

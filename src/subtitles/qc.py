@@ -66,6 +66,50 @@ def _subtitle_overlap_stats(segments: list[dict]) -> dict:
     }
 
 
+def _percentile(sorted_values: list[float], ratio: float) -> float:
+    if not sorted_values:
+        return 0.0
+    if len(sorted_values) == 1:
+        return sorted_values[0]
+    position = max(0.0, min(1.0, ratio)) * (len(sorted_values) - 1)
+    lower = int(position)
+    upper = min(len(sorted_values) - 1, lower + 1)
+    weight = position - lower
+    return sorted_values[lower] * (1.0 - weight) + sorted_values[upper] * weight
+
+
+def _subtitle_duration_stats(segments: list[dict]) -> dict:
+    durations: list[float] = []
+    short_count = 0
+    micro_count = 0
+    long_count = 0
+    for segment in segments:
+        try:
+            start = float(segment.get("start", 0.0))
+            end = float(segment.get("end", start))
+        except (TypeError, ValueError):
+            continue
+        duration = max(0.0, end - start)
+        durations.append(duration)
+        if duration < 0.8:
+            short_count += 1
+        if duration < 0.5:
+            micro_count += 1
+        if duration > 5.0:
+            long_count += 1
+
+    durations.sort()
+    return {
+        "subtitle_duration_p50_s": round(_percentile(durations, 0.50), 3),
+        "subtitle_duration_p90_s": round(_percentile(durations, 0.90), 3),
+        "subtitle_duration_p95_s": round(_percentile(durations, 0.95), 3),
+        "subtitle_duration_max_s": round(durations[-1], 3) if durations else 0.0,
+        "short_segment_count": short_count,
+        "micro_segment_count": micro_count,
+        "long_segment_count": long_count,
+    }
+
+
 _KANA_ONLY_RE = re.compile(r"^[ぁ-ゟァ-ヿ\s、。！？…ー～「」『』・\(\)（）]+$")
 
 
@@ -75,8 +119,6 @@ def compute_quality_report(
     glossary_pairs: list[tuple],
     alignment_fallback_count: int,
     total_segments: int,
-    f0_filtered_count: int = 0,
-    f0_failure: bool = False,
     asr_qc: dict | None = None,
 ) -> dict:
     """Compute SRT quality metrics and flag threshold violations."""
@@ -86,13 +128,14 @@ def compute_quality_report(
     asr_timeout_count = int(asr_qc.get("timeout_count") or 0)
     asr_quarantined_count = int(asr_qc.get("quarantined_count") or 0)
     asr_empty_text_for_speech_count = int(asr_qc.get("empty_text_for_speech_count") or 0)
-    asr_dropped_uncertain_count = int(asr_qc.get("dropped_uncertain_count") or 0)
-    asr_dropped_uncertain_items = (
-        list(asr_qc.get("dropped_uncertain_items") or [])
-        if isinstance(asr_qc.get("dropped_uncertain_items"), list)
+    asr_review_uncertain_count = int(asr_qc.get("review_uncertain_count") or 0)
+    asr_review_uncertain_items = (
+        list(asr_qc.get("review_uncertain_items") or [])
+        if isinstance(asr_qc.get("review_uncertain_items"), list)
         else []
     )
     overlap_stats = _subtitle_overlap_stats(segments)
+    duration_stats = _subtitle_duration_stats(segments)
 
     n = len(segments)
     if n == 0:
@@ -110,16 +153,15 @@ def compute_quality_report(
             "per_min_subtitle_count": 0.0,
             "glossary_hit_rate": None,
             "alignment_fallback_ratio": 0.0,
-            "f0_filtered_count": f0_filtered_count,
-            "f0_failure": f0_failure,
             "asr_generation_error_count": asr_generation_error_count,
             "asr_generation_overflow_count": asr_generation_overflow_count,
             "asr_timeout_count": asr_timeout_count,
             "asr_quarantined_count": asr_quarantined_count,
             "asr_empty_text_for_speech_count": asr_empty_text_for_speech_count,
-            "asr_dropped_uncertain_count": asr_dropped_uncertain_count,
-            "asr_dropped_uncertain_items": asr_dropped_uncertain_items,
+            "asr_review_uncertain_count": asr_review_uncertain_count,
+            "asr_review_uncertain_items": asr_review_uncertain_items,
             **overlap_stats,
+            **duration_stats,
             "warnings": warnings,
         }
 
@@ -173,15 +215,6 @@ def compute_quality_report(
     # 7. alignment_fallback_ratio
     alignment_fallback_ratio = alignment_fallback_count / max(total_segments, 1)
 
-    # 8. gender ratios (optional — only present when 'gender' field populated)
-    gendered = [s for s in segments if "gender" in s]
-    if gendered:
-        male_ratio = sum(1 for s in gendered if s["gender"] == "M") / n
-        female_ratio = sum(1 for s in gendered if s["gender"] == "F") / n
-        gender_none_ratio = sum(1 for s in gendered if s["gender"] is None) / n
-    else:
-        male_ratio = female_ratio = gender_none_ratio = None
-
     # Threshold checks
     warnings: list[str] = []
     if empty_zh_ratio > _env_float("QC_MAX_EMPTY_ZH", 0.02):
@@ -230,21 +263,16 @@ def compute_quality_report(
         "per_min_subtitle_count": round(per_min_subtitle_count, 2),
         "glossary_hit_rate": glossary_hit_rate,
         "alignment_fallback_ratio": alignment_fallback_ratio,
-        "f0_filtered_count": f0_filtered_count,
-        "f0_failure": f0_failure,
         "asr_generation_error_count": asr_generation_error_count,
         "asr_generation_overflow_count": asr_generation_overflow_count,
         "asr_timeout_count": asr_timeout_count,
         "asr_quarantined_count": asr_quarantined_count,
         "asr_empty_text_for_speech_count": asr_empty_text_for_speech_count,
-        "asr_dropped_uncertain_count": asr_dropped_uncertain_count,
-        "asr_dropped_uncertain_items": asr_dropped_uncertain_items,
+        "asr_review_uncertain_count": asr_review_uncertain_count,
+        "asr_review_uncertain_items": asr_review_uncertain_items,
         **overlap_stats,
+        **duration_stats,
         "warnings": warnings,
     }
-    if male_ratio is not None:
-        report["male_ratio"] = male_ratio
-        report["female_ratio"] = female_ratio
-        report["gender_none_ratio"] = gender_none_ratio
     return report
 

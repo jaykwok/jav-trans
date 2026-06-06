@@ -14,10 +14,10 @@ os.environ["HF_HUB_DISABLE_SYMLINKS_WARNING"] = "1"
 from core import events
 from core.config import load_config
 from core.job_context import JobContext
+from asr import noise as asr_noise_module
 from pipeline import aligned_cache as aligned_cache_module
 from pipeline import audio as audio_module
 from pipeline import cleanup as cleanup_module
-from pipeline import gender_split as gender_split_module
 from pipeline import output as output_module
 from pipeline import output_writer as output_writer_module
 from pipeline import quality as quality_module
@@ -38,7 +38,6 @@ _ENV_OVERRIDE_KEYS = (
     "ALIGNER_MODEL_ID",
     "API_KEY",
     "OPENAI_COMPATIBILITY_BASE_URL",
-    "F0_FILTER_NONE_SEGMENTS",
     "QUALITY_REPORT_ENABLED",
     "QUALITY_REPORT_DIR",
     "QC_HARD_FAIL",
@@ -130,8 +129,6 @@ def _ctx_flag(ctx: JobContext, name: str, default: bool = False) -> bool:
         return raw.strip().lower() in {"1", "true", "yes", "on"}
     if name == "SKIP_TRANSLATION":
         return ctx.skip_translation
-    if name == "MULTI_CUE_SPLIT_ENABLED":
-        return ctx.multi_cue_split
     if name == "QUALITY_REPORT_ENABLED":
         return ctx.keep_quality_report
     return default
@@ -146,13 +143,11 @@ def _ctx_env_flag(ctx: JobContext, name: str, default: bool = False) -> bool:
 
 _ASR_STAGE_ADVANCED_PREFIXES = (
     "ASR_QC_",
-    "ASR_CONTEXT_LEAK_",
     "ASR_FRAGMENT_",
     "ASR_NATIVE_",
     "BOUNDARY_",
     "SPEECH_BOUNDARY_JA_",
     "ALIGNMENT_",
-    "F0_",
 )
 _ASR_STAGE_ADVANCED_KEYS = {
     "ALIGN_LONG_CHUNK_BATCH_SIZE",
@@ -177,6 +172,7 @@ _ASR_STAGE_ADVANCED_KEYS = {
     "TRANSCRIPTION_TIMEOUT_S",
     "TRANSCRIPTION_MAX_NEW_TOKENS",
     "ASR_BATCH_SIZE",
+    "ASR_BATCH_SIZE_BY_REPO",
     "ALIGNER_BATCH_SIZE",
     "KEEP_ASR_CHUNKS",
     "BOUNDARY_CACHE_DIR",
@@ -229,7 +225,14 @@ _SUBTITLE_OPTION_KEYS = {
     "SUBTITLE_ASCII_CHAR_WEIGHT",
     "SRT_LINE_MAX_CHARS",
     "SUBTITLE_MERGE_ADJACENT",
-    "SUBTITLE_SHOW_SPEAKER",
+    "SUBTITLE_TIMING_POLISH_ENABLED",
+    "SUBTITLE_SHORT_GAP_COLLAPSE_S",
+    "SUBTITLE_LINGER_S",
+    "SUBTITLE_DENSE_CUE_MERGE_ENABLED",
+    "SUBTITLE_DENSE_CUE_MERGE_MAX_GAP_FRAMES",
+    "SUBTITLE_DENSE_CUE_MERGE_MAX_SINGLE_FRAMES",
+    "SUBTITLE_DENSE_CUE_MERGE_MAX_COMBINED_FRAMES",
+    "SUBTITLE_DENSE_CUE_MERGE_MAX_TEXT_UNITS",
 }
 
 
@@ -277,38 +280,6 @@ def _asr_stage_config_signature_for_env() -> dict:
     }
 
 
-def _f0_signature_for_ctx(ctx: JobContext) -> dict:
-    return {
-        "skip_translation": bool(ctx.skip_translation),
-        "multi_cue_split_enabled": _ctx_flag(ctx, "MULTI_CUE_SPLIT_ENABLED"),
-        "filter_none_segments": _ctx_env_flag(ctx, "F0_FILTER_NONE_SEGMENTS"),
-        "post_alignment": _ctx_flag(
-            ctx,
-            "F0_GENDER_POST_ALIGNMENT",
-            _env_flag("F0_GENDER_POST_ALIGNMENT"),
-        ),
-        "word_window_ms": _ctx_int(ctx, "F0_WORD_WINDOW_MS", 300),
-        "hop_ms": _ctx_int(ctx, "F0_HOP_MS", 100),
-        "median_filter_frames": _ctx_int(ctx, "F0_MEDIAN_FILTER_FRAMES", 9),
-        "word_min_span_ms": _ctx_int(ctx, "F0_WORD_MIN_SPAN_MS", 500),
-        "threshold_hz": _ctx_float(ctx, "F0_THRESHOLD_HZ", 160.0),
-        "nan_ratio_threshold": _ctx_value(
-            ctx,
-            "F0_NAN_RATIO_THRESHOLD",
-            os.getenv("F0_NAN_RATIO_THRESHOLD", "0.6"),
-        ),
-        "none_tolerance": _ctx_int(ctx, "F0_GENDER_NONE_TOLERANCE", 3),
-        "carryover_enabled": _ctx_env_flag(ctx, "F0_GENDER_CARRYOVER_ENABLED", True),
-        "carryover_max_gap_s": _ctx_float(ctx, "F0_GENDER_CARRYOVER_MAX_GAP_S", 15.0),
-        "carryover_max_segment_s": _ctx_float(ctx, "F0_GENDER_CARRYOVER_MAX_SEGMENT_S", 12.0),
-        "gender_turn_min_duration": _ctx_float(
-            ctx,
-            "SUBTITLE_MIN_DURATION_GENDER_TURN",
-            0.4,
-        ),
-    }
-
-
 def _aligned_cache_signature_for_ctx(
     ctx: JobContext,
     *,
@@ -317,17 +288,15 @@ def _aligned_cache_signature_for_ctx(
 ) -> dict:
     options = subtitle_options or _subtitle_options_for_ctx(ctx)
     asr_signature = _asr_runtime_signature_for_env()
+    subtitle_signature = dict(options.signature())
+    subtitle_signature["effective_video_fps"] = options.effective_video_fps
+    subtitle_signature["frame_gap_s"] = options.frame_gap_s
     return {
-        "version": 3,
+        "version": 5,
         "backend_label": backend_label,
         "asr": asr_signature,
         "asr_stage_config": _asr_stage_config_signature_for_env(),
-        "f0": _f0_signature_for_ctx(ctx),
-        "subtitle": {
-            "timeline_mode": options.timeline_mode,
-            "video_fps": options.effective_video_fps,
-            "frame_gap_s": options.frame_gap_s,
-        },
+        "subtitle": subtitle_signature,
     }
 
 
@@ -358,7 +327,6 @@ def _aligned_segments_payload(
     asr_log: list[str],
     cache_signature: dict | None,
     subtitle_options,
-    f0_filtered_count: int | None = None,
     cache_stage: str = "ready",
 ) -> dict:
     payload = {
@@ -373,8 +341,6 @@ def _aligned_segments_payload(
     }
     if cache_signature is not None:
         payload["cache_signature"] = cache_signature
-    if f0_filtered_count is not None:
-        payload["f0_filtered_count"] = f0_filtered_count
     return payload
 
 
@@ -602,8 +568,6 @@ def _write_quality_report_for_ctx(
     aligned_segments: list[dict],
     asr_details: dict,
     video_duration_s: float | None = None,
-    f0_filtered_count: int = 0,
-    f0_failure: bool = False,
     enabled: bool | None = None,
     glossary: str | None = None,
 ) -> str | None:
@@ -617,27 +581,10 @@ def _write_quality_report_for_ctx(
         write_json_atomic=_write_json_atomic,
         env_flag=_env_flag,
         video_duration_s=video_duration_s,
-        f0_filtered_count=f0_filtered_count,
-        f0_failure=f0_failure,
         enabled=enabled,
         glossary=glossary,
         report_dir=_quality_report_dir_for_ctx(ctx),
         hard_fail=_quality_hard_fail_for_ctx(ctx),
-    )
-
-
-def _filter_f0_none_segments_for_ctx(
-    segments: list[dict],
-    *,
-    f0_failed: bool = False,
-    enabled: bool | None = None,
-) -> tuple[list[dict], int]:
-    return gender_split_module.filter_f0_none_segments(
-        segments,
-        f0_failed=f0_failed,
-        enabled=enabled,
-        default_enabled=lambda: _env_flag("F0_FILTER_NONE_SEGMENTS"),
-        warn=lambda message: console.print(f"[yellow]{message}[/yellow]"),
     )
 
 
@@ -649,8 +596,6 @@ def _build_japanese_srt_blocks(segments: list[dict]) -> list[dict]:
             "ja_text": str(seg.get("text", "")),
             "zh_text": str(seg.get("text", "")),
             "words": list(seg.get("words") or []),
-            "speaker": seg.get("speaker"),
-            "gender": seg.get("gender"),
             "source_segment_ids": list(seg.get("source_segment_ids") or [idx]),
         }
         for idx, seg in enumerate(segments)
@@ -689,7 +634,7 @@ def _print_timing_summary(stage_timings: dict, asr_details: dict) -> None:
     stage_log_module._print_timing_summary(console, stage_timings, asr_details)
 
 
-def run_asr_alignment_f0(
+def run_asr_alignment(
     video_path: str,
     *,
     ctx: JobContext,
@@ -955,126 +900,6 @@ def run_asr_alignment_f0(
     console.print(f"[green]识别完成，共 {len(segments)} 个片段。[/green]")
     _log_stage(logger, f"segments_count={len(segments)}")
 
-    f0_failed = False
-    f0_filtered_count = 0
-    f0_gender_split_count = 0
-    if segments and not effective_ctx.skip_translation:
-        try:
-            from audio.f0_gender import detect_gender_f0_word_level
-
-            console.print("[cyan]F0 gender detection...[/cyan]")
-            f0_started = time.perf_counter()
-            _log_stage(logger, "stage_start f0_gender_detection")
-            # F0 already runs after ASR forced alignment; this gate documents and
-            # logs that word-level timestamps from alignment are available here.
-            if _ctx_flag(
-                effective_ctx,
-                "F0_GENDER_POST_ALIGNMENT",
-                _env_flag("F0_GENDER_POST_ALIGNMENT"),
-            ):
-                words_available = sum(len(seg.get("words") or []) for seg in segments)
-                _log_stage(
-                    logger,
-                    f"[f0] post_alignment_mode=1 words_available={words_available}",
-                )
-                console.print(
-                    "[cyan][f0] post_alignment_mode=1 "
-                    f"words_available={words_available}[/cyan]"
-                )
-            _raise_if_cancelled(cancel_event)
-            with _temporary_env(_asr_stage_env_for_video(effective_ctx, video_fps)):
-                segments = detect_gender_f0_word_level(
-                    audio_path,
-                    segments,
-                    window_ms=_ctx_int(effective_ctx, "F0_WORD_WINDOW_MS", 300),
-                    hop_ms=_ctx_int(effective_ctx, "F0_HOP_MS", 100),
-                    median_filter_frames=_ctx_int(
-                        effective_ctx,
-                        "F0_MEDIAN_FILTER_FRAMES",
-                        9,
-                    ),
-                    min_span_ms=_ctx_int(effective_ctx, "F0_WORD_MIN_SPAN_MS", 500),
-                    f0_threshold_hz=_ctx_float(effective_ctx, "F0_THRESHOLD_HZ", 160.0),
-                )
-                if _ctx_flag(effective_ctx, "MULTI_CUE_SPLIT_ENABLED"):
-                    f0_split_before = len(segments)
-                    segments, f0_gender_split_count = (
-                        gender_split_module.split_segments_on_f0_gender_turns(
-                            segments
-                        )
-                    )
-                    asr_details["f0_gender_split"] = {
-                        "segments_before": f0_split_before,
-                        "segments_after": len(segments),
-                        "split_count": f0_gender_split_count,
-                    }
-                    _log_stage(
-                        logger,
-                        "f0_gender_split "
-                        f"segments_before={f0_split_before} "
-                        f"segments_after={len(segments)} "
-                        f"split_count={f0_gender_split_count}",
-                    )
-                    if f0_gender_split_count:
-                        console.print(
-                            "[cyan]F0 gender split: "
-                            f"{f0_split_before} -> {len(segments)} "
-                            f"(split_count={f0_gender_split_count})[/cyan]"
-                        )
-                    from audio.f0_gender import (
-                        _apply_gender_carry_over,
-                        _carryover_config,
-                    )
-
-                    (
-                        carry_enabled,
-                        carry_max_gap_s,
-                        carry_max_segment_s,
-                    ) = _carryover_config()
-                    if carry_enabled:
-                        _none_before = sum(
-                            1 for s in segments if s.get("gender") is None
-                        )
-                        segments = _apply_gender_carry_over(
-                            segments,
-                            enabled=True,
-                            max_gap_s=carry_max_gap_s,
-                            max_segment_s=carry_max_segment_s,
-                        )
-                        _none_after = sum(
-                            1 for s in segments if s.get("gender") is None
-                        )
-                        _log_stage(
-                            logger,
-                            "f0_post_split_carry_over "
-                            f"none_before={_none_before} "
-                            f"none_after={_none_after} "
-                            f"rescued={_none_before - _none_after}",
-                        )
-            _raise_if_cancelled(cancel_event)
-            _log_stage(
-                logger,
-                f"stage_done f0_gender_detection elapsed={time.perf_counter() - f0_started:.2f}s",
-            )
-        except PipelineCancelledError:
-            raise
-        except Exception:
-            f0_failed = True
-            _log_stage(logger, "stage_degraded f0_gender_detection")
-            console.print(
-                "[yellow]F0 detection degraded; translating without acoustic context[/yellow]"
-            )
-            segments = [dict(seg, gender=None) for seg in segments]
-        segments, f0_filtered_count = _filter_f0_none_segments_for_ctx(
-            segments,
-            f0_failed=f0_failed,
-            enabled=_ctx_flag(effective_ctx, "F0_FILTER_NONE_SEGMENTS"),
-        )
-        if f0_filtered_count:
-            console.print(
-                f"[yellow]F0 filter: removed {f0_filtered_count} non-voice segments[/yellow]"
-            )
-
     skip_translation = effective_ctx.skip_translation
     if skip_translation:
         bilingual = False
@@ -1132,8 +957,6 @@ def run_asr_alignment_f0(
         video_duration_s=video_duration_s,
         video_fps=video_fps,
         pipeline_started=pipeline_started,
-        f0_filtered_count=f0_filtered_count,
-        f0_failed=f0_failed,
         job_id=job_id,
         aligned_cache_signature=aligned_cache_signature,
     )
@@ -1179,8 +1002,6 @@ def _run_translation_and_write_impl(
     asr_log = artifacts.asr_log
     backend_label = artifacts.backend_label or asr_module.get_backend_label()
     device = artifacts.device
-    f0_failed = artifacts.f0_failed
-    f0_filtered_count = artifacts.f0_filtered_count
     job_id = sanitize_job_id(job_id or ctx.job_id or artifacts.job_id)
     if job_id:
         events.set_current_job_id(job_id)
@@ -1277,28 +1098,18 @@ def _run_translation_and_write_impl(
             raise RuntimeError('ASR empty text rate too high; set QC_IGNORE_EMPTY=1 to skip')
         return output_paths
 
-    if segments and not skip_translation:
-        asr_noise_before = len(segments)
-        segments, asr_noise_filtered_count = gender_split_module.filter_asr_noise_segments(
-            segments
-        )
-        if asr_noise_filtered_count:
-            asr_details["asr_noise_filter"] = {
-                "segments_before": asr_noise_before,
-                "segments_after": len(segments),
-                "filtered_count": asr_noise_filtered_count,
+    if segments:
+        asr_noise_items = asr_noise_module.find_asr_noise_segments(segments)
+        if asr_noise_items:
+            asr_details["asr_noise_diagnostics"] = {
+                "count": len(asr_noise_items),
+                "items": asr_noise_items,
+                "policy": "diagnostic_only",
             }
             _log_stage(
                 logger,
-                "asr_noise_filter "
-                f"segments_before={asr_noise_before} "
-                f"segments_after={len(segments)} "
-                f"filtered_count={asr_noise_filtered_count}",
+                f"asr_noise_diagnostics count={len(asr_noise_items)} policy=diagnostic_only",
             )
-            console.print(
-                f"[yellow]ASR noise filter: removed {asr_noise_filtered_count} empty/noise segments before translation[/yellow]"
-            )
-            artifacts.segments = segments
             artifacts.asr_details = asr_details
 
     if not segments:
@@ -1339,7 +1150,6 @@ def _run_translation_and_write_impl(
                 asr_log=asr_log,
                 cache_signature=aligned_cache_signature,
                 subtitle_options=subtitle_options,
-                f0_filtered_count=f0_filtered_count,
             ),
         )
         _write_json(
@@ -1418,24 +1228,6 @@ def _run_translation_and_write_impl(
             _cleanup_pipeline_temp(job_temp_dir, audio_path, translation_cache_path)
         return output_paths
 
-    # --- Speaker Diarization (experimental, off by default) ---
-    try:
-        from audio.speaker_diarization import diarize_segments, build_speakers_report
-
-        if os.getenv("EXPERIMENTAL_SPEAKER_DIARIZATION", "0") == "1":
-            console.print("[cyan]Speaker diarization (experimental)...[/cyan]")
-            segments = diarize_segments(segments, audio_path)
-            _spk_report = build_speakers_report(segments)
-            _spk_path = Path(output_dir) / f"{video_filename}.speakers.json"
-            _spk_path.write_text(
-                json.dumps(_spk_report, ensure_ascii=False, indent=2),
-                encoding="utf-8",
-            )
-            output_paths.append(str(_spk_path))
-            console.print(f"[cyan]Speakers: {_spk_report['n_speakers']} detected[/cyan]")
-    except Exception as _spk_exc:
-        console.print(f"[yellow]Speaker diarization skipped: {_spk_exc}[/yellow]")
-
     if skip_translation:
         console.print("[yellow]SKIP_TRANSLATION=1，跳过翻译并输出日文 SRT。[/yellow]")
         _log_stage(logger, "stage_skip translation reason=SKIP_TRANSLATION")
@@ -1481,7 +1273,6 @@ def _run_translation_and_write_impl(
                 asr_log=asr_log,
                 cache_signature=aligned_cache_signature,
                 subtitle_options=subtitle_options,
-                f0_filtered_count=f0_filtered_count,
             ),
         )
         _write_json(
@@ -1687,8 +1478,6 @@ def _run_translation_and_write_impl(
             "end": seg["end"],
             "zh_text": zh_text,
             "ja_text": seg.get("ja_text") or seg.get("text", ""),
-            "speaker": seg.get("speaker"),
-            "gender": seg.get("gender"),
             "words": list(seg.get("words") or []),
             "cue_id": seg.get("cue_id"),
             "source_segment_ids": list(seg.get("source_segment_ids") or []),
@@ -1737,7 +1526,6 @@ def _run_translation_and_write_impl(
             asr_log=asr_log,
             cache_signature=aligned_cache_signature,
             subtitle_options=subtitle_options,
-            f0_filtered_count=f0_filtered_count,
         ),
     )
     _write_json(
@@ -1746,7 +1534,6 @@ def _run_translation_and_write_impl(
             "backend": backend_label,
             "timeline_mode": subtitle_options.timeline_mode,
             "blocks": srt_blocks,
-            "f0_filtered_count": f0_filtered_count,
             "video_fps": {
                 "detected": video_fps,
                 "effective": subtitle_options.effective_video_fps,
@@ -1772,8 +1559,6 @@ def _run_translation_and_write_impl(
         aligned_segments=quality_module.quality_segments_from_blocks(srt_blocks),
         asr_details=asr_details,
         video_duration_s=video_duration_s,
-        f0_filtered_count=f0_filtered_count,
-        f0_failure=f0_failed,
         enabled=_ctx_flag(ctx, "QUALITY_REPORT_ENABLED"),
         glossary=ctx.translation_glossary,
     )
@@ -1793,7 +1578,6 @@ def _run_translation_and_write_impl(
                 "segments": len(segments),
                 "translation_cues": len(translation_segments),
                 "blocks": len(srt_blocks),
-                "f0_filtered": f0_filtered_count,
             },
             "stage_timings": pipeline_timings,
             "asr_details": asr_details,

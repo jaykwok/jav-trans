@@ -82,7 +82,7 @@ def test_asr_stage_env_scope_reaches_cache_and_transcribe(monkeypatch, tmp_path)
     monkeypatch.setattr(pipeline_audio, "extract_audio", fake_extract_audio)
     monkeypatch.setattr(main.asr_module, "transcribe_and_align", fake_transcribe_and_align)
 
-    artifacts = main.run_asr_alignment_f0(
+    artifacts = main.run_asr_alignment(
         str(video_path),
         ctx=ctx,
         job_id=ctx.job_id,
@@ -103,7 +103,9 @@ def test_asr_stage_env_scope_reaches_cache_and_transcribe(monkeypatch, tmp_path)
         == "0.02"
     )
     assert seen["cache_signature"]["subtitle"]["video_fps"] == 60.0
+    assert seen["cache_signature"]["subtitle"]["effective_video_fps"] == 60.0
     assert seen["cache_signature"]["subtitle"]["frame_gap_s"] == 2 / 60.0
+    assert seen["cache_signature"]["subtitle"]["dense_cue_merge_enabled"] is True
     assert artifacts.backend_label == f"backend:{ASR_17B_BACKEND}"
     assert main.os.environ["ASR_BACKEND"] == ASR_06B_BACKEND
     assert main.os.environ["ASR_CONTEXT"] == "process actor"
@@ -124,8 +126,9 @@ def test_asr_stage_env_scope_passes_boundary_refiner_flags(monkeypatch, tmp_path
         advanced={
             "BOUNDARY_REFINER_ENABLED": "1",
             "BOUNDARY_REFINER_THRESHOLD": "0.61",
-            "BOUNDARY_PLANNER_TARGET_CHUNK_S": "8.0",
-            "BOUNDARY_PLANNER_MAX_CHUNK_S": "28.0",
+            "BOUNDARY_PLANNER_TARGET_CHUNK_S": "3.5",
+            "BOUNDARY_PLANNER_MAX_CORE_CHUNK_S": "5.5",
+            "BOUNDARY_PLANNER_MAX_PADDED_CHUNK_S": "9.5",
         },
     )
     monkeypatch.setattr(main.torch.cuda, "is_available", lambda: False)
@@ -144,7 +147,8 @@ def test_asr_stage_env_scope_passes_boundary_refiner_flags(monkeypatch, tmp_path
         seen["enabled"] = main.os.environ.get("BOUNDARY_REFINER_ENABLED")
         seen["threshold"] = main.os.environ.get("BOUNDARY_REFINER_THRESHOLD")
         seen["target_s"] = main.os.environ.get("BOUNDARY_PLANNER_TARGET_CHUNK_S")
-        seen["max_s"] = main.os.environ.get("BOUNDARY_PLANNER_MAX_CHUNK_S")
+        seen["max_core_s"] = main.os.environ.get("BOUNDARY_PLANNER_MAX_CORE_CHUNK_S")
+        seen["max_padded_s"] = main.os.environ.get("BOUNDARY_PLANNER_MAX_PADDED_CHUNK_S")
         return (
             [{"start": 0.0, "end": 1.0, "text": "こんにちは"}],
             ["mock asr"],
@@ -154,7 +158,7 @@ def test_asr_stage_env_scope_passes_boundary_refiner_flags(monkeypatch, tmp_path
     monkeypatch.setattr(pipeline_audio, "extract_audio", fake_extract_audio)
     monkeypatch.setattr(main.asr_module, "transcribe_and_align", fake_transcribe_and_align)
 
-    main.run_asr_alignment_f0(
+    main.run_asr_alignment(
         str(video_path),
         ctx=ctx,
         job_id=ctx.job_id,
@@ -163,8 +167,9 @@ def test_asr_stage_env_scope_passes_boundary_refiner_flags(monkeypatch, tmp_path
     assert seen == {
         "enabled": "1",
         "threshold": "0.61",
-        "target_s": "8.0",
-        "max_s": "28.0",
+        "target_s": "3.5",
+        "max_core_s": "5.5",
+        "max_padded_s": "9.5",
     }
 
 
@@ -225,7 +230,7 @@ def test_boundary_cache_dir_reaches_transcribe_but_not_aligned_signature(
     monkeypatch.setattr(pipeline_audio, "extract_audio", fake_extract_audio)
     monkeypatch.setattr(main.asr_module, "transcribe_and_align", fake_transcribe_and_align)
 
-    main.run_asr_alignment_f0(str(video_path), ctx=ctx, job_id=ctx.job_id)
+    main.run_asr_alignment(str(video_path), ctx=ctx, job_id=ctx.job_id)
 
     assert seen["transcribe_cache_dir"] == str(tmp_path / "boundary-cache-a")
     assert "BOUNDARY_CACHE_DIR" not in seen["cache_signature"]["asr_stage_config"]

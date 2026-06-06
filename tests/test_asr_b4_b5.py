@@ -29,7 +29,7 @@ def _write_wav(path: Path, seconds: float, sample_rate: int = 8000) -> None:
         writer.writeframes(b"\x00\x00" * int(sample_rate * seconds))
 
 
-def test_sliding_initial_prompts_reset_on_gap_and_gender(monkeypatch, tmp_path):
+def test_sliding_initial_prompts_reset_on_gap(monkeypatch, tmp_path):
     asr = _reload_pipeline(monkeypatch, tmp_path)
     source = tmp_path / "source.wav"
     _write_wav(source, 3.0)
@@ -39,15 +39,15 @@ def test_sliding_initial_prompts_reset_on_gap_and_gender(monkeypatch, tmp_path):
         {"index": 1, "start": 0.35, "end": 0.6, "path": str(tmp_path / "c1.wav"), "source_audio_path": str(source)},
         {"index": 2, "start": 0.7, "end": 1.0, "path": str(tmp_path / "c2.wav"), "source_audio_path": str(source)},
         {"index": 3, "start": 1.7, "end": 2.0, "path": str(tmp_path / "c3.wav"), "source_audio_path": str(source)},
-        {"index": 4, "start": 2.05, "end": 2.3, "path": str(tmp_path / "c4.wav"), "source_audio_path": str(source), "gender": "female"},
-        {"index": 5, "start": 2.35, "end": 2.6, "path": str(tmp_path / "c5.wav"), "source_audio_path": str(source), "gender": "male"},
+        {"index": 4, "start": 2.05, "end": 2.3, "path": str(tmp_path / "c4.wav"), "source_audio_path": str(source)},
+        {"index": 5, "start": 2.35, "end": 2.6, "path": str(tmp_path / "c5.wav"), "source_audio_path": str(source)},
     ]
 
     class FakeBackend:
         is_subprocess = False
         request_batch_size = 1
         prompts: list[str | None] = []
-        texts = ["固有名詞A", "続きB", "続きC", "リセットD", "女性E", "男性F"]
+        texts = ["固有名詞A", "続きB", "続きC", "リセットD", "続きE", "続きF"]
 
         def transcribe_texts(self, audio_paths, contexts=None, initial_prompts=None, on_stage=None):
             del audio_paths, contexts, on_stage
@@ -79,5 +79,5 @@ def test_sliding_initial_prompts_reset_on_gap_and_gender(monkeypatch, tmp_path):
         "固有名詞A\n続きB",
         None,
         "リセットD",
-        None,
+        "リセットD\n続きE",
     ]

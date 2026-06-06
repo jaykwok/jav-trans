@@ -63,6 +63,12 @@ def test_diagnose_case_marks_alignment_and_asr_drop_candidates(tmp_path):
                         "start": 0.0,
                         "end": 2.0,
                         "duration": 2.0,
+                        "alignment_fallback_start_s": 0.5,
+                        "alignment_fallback_end_s": 1.5,
+                        "alignment_fallback_duration_s": 1.0,
+                        "alignment_fallback_abs_start_s": 0.5,
+                        "alignment_fallback_abs_end_s": 1.5,
+                        "alignment_fallback_source": "speech_core",
                         "text": "ああ",
                         "raw_text": "ああ",
                     },
@@ -100,7 +106,7 @@ def test_diagnose_case_marks_alignment_and_asr_drop_candidates(tmp_path):
                             "reasons": ["long_low_value_text"],
                         }
                     ],
-                    "dropped_uncertain_items": [
+                    "review_uncertain_items": [
                         {
                             "position": 1,
                             "chunk_index": 1,
@@ -127,7 +133,7 @@ def test_diagnose_case_marks_alignment_and_asr_drop_candidates(tmp_path):
         quality_path,
         {
             "alignment_fallback_ratio": 0.5,
-            "asr_dropped_uncertain_count": 1,
+            "asr_review_uncertain_count": 1,
         },
     )
 
@@ -149,11 +155,15 @@ def test_diagnose_case_marks_alignment_and_asr_drop_candidates(tmp_path):
     assert by_chunk[0]["source_audio_path"].endswith("audio.wav")
     assert by_chunk[0]["failure_candidate"] is True
     assert by_chunk[0]["failure_bucket"] == "vad_coarse_alignment"
-    assert "asr_dropped_uncertain" in by_chunk[1]["failure_reasons"]
+    assert by_chunk[0]["fallback_window_start"] == 0.5
+    assert by_chunk[0]["fallback_window_end"] == 1.5
+    assert by_chunk[0]["fallback_duration_s"] == 1.0
+    assert by_chunk[0]["fallback_window_source"] == "speech_core"
+    assert "asr_review_uncertain" in by_chunk[1]["failure_reasons"]
     assert by_chunk[1]["alignment_quality"] == "drop_or_review"
     assert by_chunk[1]["fallback_type"] == "none"
-    assert by_chunk[1]["fallback_subtype"] == "asr_dropped_uncertain"
-    assert by_chunk[1]["failure_bucket"] == "asr_dropped_uncertain"
+    assert by_chunk[1]["fallback_subtype"] == "asr_review_uncertain"
+    assert by_chunk[1]["failure_bucket"] == "asr_review_uncertain"
     assert by_chunk[2]["align_text_empty"] is True
     assert by_chunk[2]["alignment_quality"] == "drop_or_review"
     assert by_chunk[2]["fallback_type"] == "proportional"
@@ -176,13 +186,13 @@ def test_diagnose_case_marks_alignment_and_asr_drop_candidates(tmp_path):
     }
     assert case_summary["fallback_subtype_counts"] == {
         "align_text_empty": 1,
-        "asr_dropped_uncertain": 1,
+        "asr_review_uncertain": 1,
         "none": 1,
         "vad_coarse_after_sentinel": 1,
     }
     assert case_summary["failure_bucket_counts"] == {
         "align_text_empty": 1,
-        "asr_dropped_uncertain": 1,
+        "asr_review_uncertain": 1,
         "vad_coarse_alignment": 1,
     }
     assert summary["failure_candidate_count"] == 3
@@ -193,12 +203,12 @@ def test_diagnose_case_marks_alignment_and_asr_drop_candidates(tmp_path):
     }
     assert summary["failure_bucket_counts"] == {
         "align_text_empty": 1,
-        "asr_dropped_uncertain": 1,
+        "asr_review_uncertain": 1,
         "vad_coarse_alignment": 1,
     }
     assert summary["fallback_subtype_counts"] == {
         "align_text_empty": 1,
-        "asr_dropped_uncertain": 1,
+        "asr_review_uncertain": 1,
         "none": 1,
         "vad_coarse_after_sentinel": 1,
     }
@@ -230,7 +240,7 @@ def test_diagnose_case_separates_punctuation_only_nonlexical_text(tmp_path):
                         "raw_text": "…、…",
                     }
                 ],
-                "asr_qc": {"items": [], "dropped_uncertain_items": []},
+                "asr_qc": {"items": [], "review_uncertain_items": []},
             },
             "asr_log": [
                 "chunk 1: Alignment 词数: 0",
@@ -317,7 +327,7 @@ def test_diagnose_case_exports_repetition_and_low_information_review_fields(tmp_
                             },
                         },
                     ],
-                    "dropped_uncertain_items": [],
+                    "review_uncertain_items": [],
                 },
             },
             "asr_log": [
@@ -365,7 +375,7 @@ def test_cli_broadcasts_single_case_label_for_multiple_aligned_jsons(tmp_path, m
                             "raw_text": "こんにちは",
                         }
                     ],
-                    "asr_qc": {"items": [], "dropped_uncertain_items": []},
+                    "asr_qc": {"items": [], "review_uncertain_items": []},
                 },
                 "asr_log": ["chunk 1: Alignment 模式: forced_aligner"],
             },

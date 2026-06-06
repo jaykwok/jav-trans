@@ -16,7 +16,6 @@ class JobSpec(BaseModel):
     ] = "jaykwok/Qwen3-ASR-0.6B-JA-Anime-Galgame"
     subtitle_mode: Literal["zh", "bilingual"] = "zh"
     skip_translation: bool = False
-    multi_cue_split: bool = True
     asr_context: str = Field(default="", max_length=4000)
     keep_quality_report: bool = False
     translation_max_workers: int = Field(default=4, ge=1, le=8)

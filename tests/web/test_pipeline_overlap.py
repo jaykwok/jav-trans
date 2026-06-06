@@ -53,7 +53,7 @@ async def _test_pipeline_workers_overlap(tmp_path, monkeypatch):
         time.sleep(1.0)
         return []
 
-    monkeypatch.setattr(pm, "_run_asr_alignment_f0", fake_asr)
+    monkeypatch.setattr(pm, "_run_asr_alignment", fake_asr)
     monkeypatch.setattr(pm, "_run_translation_and_write", fake_translation)
 
     workers = [

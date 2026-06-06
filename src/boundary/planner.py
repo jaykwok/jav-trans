@@ -19,8 +19,8 @@ from boundary.base import SpeechSegment
 @dataclass(frozen=True)
 class BoundaryPlannerConfig:
     frame_hop_s: float = 1.0 / 29.97
-    max_chunk_s: float = 30.0
-    target_chunk_s: float = 9.0
+    max_core_chunk_s: float = 5.0
+    target_chunk_s: float = 3.0
     min_chunk_s: float = 0.4
     start_weight: float = 1.5
     target_padding_s: float = 2.0
@@ -37,7 +37,7 @@ class BoundaryPlannerConfig:
         return {
             "planner": "constrained_sequence_dp_planner_v2",
             "frame_hop_s": self.frame_hop_s,
-            "max_chunk_s": self.max_chunk_s,
+            "max_core_chunk_s": self.max_core_chunk_s,
             "target_chunk_s": self.target_chunk_s,
             "min_chunk_s": self.min_chunk_s,
             "start_weight": self.start_weight,
@@ -121,8 +121,8 @@ def plan_boundary_chunks(
 def _validate_config(config: BoundaryPlannerConfig) -> None:
     if config.frame_hop_s <= 0:
         raise ValueError("frame_hop_s must be positive")
-    if config.max_chunk_s <= 0:
-        raise ValueError("max_chunk_s must be positive")
+    if config.max_core_chunk_s <= 0:
+        raise ValueError("max_core_chunk_s must be positive")
     if config.target_chunk_s <= 0:
         raise ValueError("target_chunk_s must be positive")
     if config.min_chunk_s < 0:
@@ -275,13 +275,11 @@ def _split_overlong_islands(
     *,
     config: BoundaryPlannerConfig,
 ) -> list[PlannedIsland]:
-    speech_limit_s = config.max_chunk_s - 2.0 * config.target_padding_s
-    if speech_limit_s <= 0.0:
-        speech_limit_s = config.max_chunk_s
+    speech_limit_s = config.max_core_chunk_s
     split: list[PlannedIsland] = []
     for island in islands:
         duration_s = island.end - island.start
-        if duration_s <= config.max_chunk_s:
+        if duration_s <= config.max_core_chunk_s:
             split.append(island)
             continue
 
@@ -355,7 +353,7 @@ def _pack_islands(
         gap_s = island.start - current[-1].end
         proposed = [*current, island]
         proposed_core_s = _core_duration(proposed)
-        within_cap = proposed_core_s <= config.max_chunk_s
+        within_cap = proposed_core_s <= config.max_core_chunk_s
         decision = _score_gap(
             current,
             island,
@@ -477,7 +475,7 @@ def _dp_pack_run(
     for end in range(1, count + 1):
         for start in range(end - 1, -1, -1):
             core_s = islands[end - 1].end - islands[start].start
-            if core_s > config.max_chunk_s and start < end - 1:
+            if core_s > config.max_core_chunk_s and start < end - 1:
                 continue
             candidate_cost = costs[start] + _chunk_dp_cost(
                 islands,

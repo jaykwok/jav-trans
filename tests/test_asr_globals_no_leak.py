@@ -43,7 +43,7 @@ def test_asr_stage_env_restored_when_transcribe_raises(monkeypatch, tmp_path):
     monkeypatch.setattr(main.asr_module, "transcribe_and_align", fake_transcribe_and_align)
 
     with pytest.raises(RuntimeError, match="forced ASR failure"):
-        main.run_asr_alignment_f0(
+        main.run_asr_alignment(
             str(video_path),
             ctx=ctx,
             job_id=ctx.job_id,

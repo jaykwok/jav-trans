@@ -46,7 +46,7 @@ async def _test_cancel_event_reaches_asr_thread(tmp_path, monkeypatch):
     started = threading.Event()
     observed_cancel = threading.Event()
 
-    def fake_run_asr_alignment_f0(_video_path, *, cancel_event=None, **_kwargs):
+    def fake_run_asr_alignment(_video_path, *, cancel_event=None, **_kwargs):
         started.set()
         deadline = time.perf_counter() + 2.0
         while time.perf_counter() < deadline:
@@ -56,7 +56,7 @@ async def _test_cancel_event_reaches_asr_thread(tmp_path, monkeypatch):
             time.sleep(0.01)
         raise AssertionError("cancel_event was not set")
 
-    monkeypatch.setattr(pm, "run_asr_alignment_f0", fake_run_asr_alignment_f0)
+    monkeypatch.setattr(pm, "run_asr_alignment", fake_run_asr_alignment)
 
     worker = asyncio.create_task(pm.gpu_worker())
     try:
@@ -284,8 +284,6 @@ def _sample_asr_artifacts(job: JobState, temp_dir: Path, output_dir: Path):
         video_duration_s=None,
         video_fps=None,
         pipeline_started=0.0,
-        f0_filtered_count=0,
-        f0_failed=False,
         job_id=job.id,
     )
 

@@ -96,7 +96,6 @@ export function installFiles() {
       subtitle_mode:            $('r-mode').value,
       asr_context:              $('r-asr-context').value.trim(),
       skip_translation:         $('r-skip-translation').checked,
-      multi_cue_split:          $('t-multi-cue-split').checked,
       keep_quality_report:      $('t-quality-report').checked,
       translation_max_workers:  parseInt($('t-translation-max-workers').value) || 4,
       ...readTranslationSettingsFromForm(),

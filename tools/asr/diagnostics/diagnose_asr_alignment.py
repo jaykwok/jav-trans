@@ -25,7 +25,7 @@ _CHUNK_LOG_RE = re.compile(r"^chunk\s+(\d+):\s*(.*)$")
 _WORD_COUNT_RE = re.compile(r"Alignment\s+词数:\s*(\d+)")
 _ALIGNMENT_MODE_RE = re.compile(r"Alignment\s+模式:\s*(\S+)")
 _CANDIDATE_BUCKET_ORDER = (
-    "asr_dropped_uncertain",
+    "asr_review_uncertain",
     "nonlexical_text",
     "align_text_empty",
     "empty_text_for_chunk",
@@ -177,10 +177,10 @@ def index_qc_items(asr_qc: dict[str, Any]) -> tuple[dict[int, dict[str, Any]], d
     return by_position, by_chunk_index
 
 
-def index_dropped_items(asr_qc: dict[str, Any]) -> tuple[dict[int, dict[str, Any]], dict[int, dict[str, Any]]]:
+def index_review_items(asr_qc: dict[str, Any]) -> tuple[dict[int, dict[str, Any]], dict[int, dict[str, Any]]]:
     by_position: dict[int, dict[str, Any]] = {}
     by_chunk_index: dict[int, dict[str, Any]] = {}
-    for item in asr_qc.get("dropped_uncertain_items") or []:
+    for item in asr_qc.get("review_uncertain_items") or []:
         if not isinstance(item, dict):
             continue
         try:
@@ -270,7 +270,7 @@ def chunk_failure_reasons(
     compact_chars: int,
     prealign_empty: bool,
     nonlexical_text: bool,
-    dropped: dict[str, Any] | None,
+    review_item: dict[str, Any] | None,
     qc_item: dict[str, Any] | None,
     alignment_mode: str,
     align_error: str,
@@ -279,8 +279,8 @@ def chunk_failure_reasons(
     word_stats: dict[str, Any],
 ) -> list[str]:
     reasons: list[str] = []
-    if dropped:
-        reasons.append("asr_dropped_uncertain")
+    if review_item:
+        reasons.append("asr_review_uncertain")
     if not text.strip() and duration_s >= 1.0:
         reasons.append("empty_text_for_chunk")
     if text.strip() and prealign_empty and not nonlexical_text:
@@ -302,7 +302,7 @@ def chunk_failure_reasons(
         reasons.append("alignment_fallback")
     if sentinel_lines:
         reasons.append("alignment_sentinel")
-    if text.strip() and aligned_segment_count <= 0 and not dropped:
+    if text.strip() and aligned_segment_count <= 0 and not review_item:
         reasons.append("text_without_output_segment")
     if qc_item:
         severity = str(qc_item.get("severity") or "").strip()
@@ -400,8 +400,8 @@ def failure_candidate_bucket(row: dict[str, Any]) -> str:
     fallback_type = str(row.get("fallback_type") or "")
 
     bucket_flags = {
-        "asr_dropped_uncertain": bool(row.get("asr_dropped_uncertain"))
-        or "asr_dropped_uncertain" in reasons,
+        "asr_review_uncertain": bool(row.get("asr_review_uncertain"))
+        or "asr_review_uncertain" in reasons,
         "nonlexical_text": bool(row.get("nonlexical_text")) or "nonlexical_text" in reasons,
         "align_text_empty": bool(row.get("align_text_empty")) and bool(str(row.get("analysis_text") or "").strip()),
         "empty_text_for_chunk": "empty_text_for_chunk" in reasons,
@@ -450,7 +450,7 @@ def diagnose_case(
     segments = [item for item in aligned.get("segments") or [] if isinstance(item, dict)]
     logs = parse_chunk_logs(aligned.get("asr_log") or [])
     qc_by_position, qc_by_chunk = index_qc_items(asr_qc)
-    dropped_by_position, dropped_by_chunk = index_dropped_items(asr_qc)
+    review_by_position, review_by_chunk = index_review_items(asr_qc)
     output_counts = segment_counts_by_chunk(segments)
     words = words_by_chunk(segments)
 
@@ -465,7 +465,7 @@ def diagnose_case(
     low_information_counts: Counter = Counter()
     fallback_chunks = 0
     align_text_empty = 0
-    dropped_chunks = 0
+    review_chunks = 0
     nonempty_chunks = 0
 
     for position, chunk in enumerate(chunks):
@@ -478,15 +478,43 @@ def diagnose_case(
         start = float(chunk.get("start", 0.0) or 0.0)
         end = float(chunk.get("end", start) or start)
         duration = float(chunk.get("duration", max(0.0, end - start)) or 0.0)
+        if "alignment_fallback_start_s" in chunk and "alignment_fallback_end_s" in chunk:
+            fallback_start_local = float(chunk.get("alignment_fallback_start_s") or 0.0)
+            fallback_end_local = float(
+                chunk.get("alignment_fallback_end_s") or fallback_start_local
+            )
+            fallback_end_local = max(fallback_start_local, fallback_end_local)
+            fallback_duration = float(
+                chunk.get(
+                    "alignment_fallback_duration_s",
+                    max(0.0, fallback_end_local - fallback_start_local),
+                )
+                or 0.0
+            )
+            fallback_abs_start = float(
+                chunk.get("alignment_fallback_abs_start_s", start + fallback_start_local)
+                or start
+            )
+            fallback_abs_end = float(
+                chunk.get("alignment_fallback_abs_end_s", start + fallback_end_local)
+                or fallback_abs_start
+            )
+            fallback_abs_end = max(fallback_abs_start, fallback_abs_end)
+            fallback_source = str(chunk.get("alignment_fallback_source") or "chunk")
+        else:
+            fallback_abs_start = start
+            fallback_abs_end = end
+            fallback_duration = duration
+            fallback_source = "chunk"
         text = str(chunk.get("text") or "")
         raw_text = str(chunk.get("raw_text") or text)
-        dropped = dropped_by_position.get(position) or dropped_by_chunk.get(chunk_index)
-        original_dropped_text = ""
-        if dropped:
-            original_dropped_text = str(
-                dropped.get("original_text") or dropped.get("original_raw_text") or ""
+        review_item = review_by_position.get(position) or review_by_chunk.get(chunk_index)
+        review_original_text = ""
+        if review_item:
+            review_original_text = str(
+                review_item.get("original_text") or review_item.get("original_raw_text") or ""
             )
-        analysis_text = original_dropped_text or text or raw_text
+        analysis_text = review_original_text or text or raw_text
         prealign = prepare_text_for_alignment(analysis_text)
         nonlexical_text = bool(analysis_text.strip() and _NONLEXICAL_TEXT_RE.fullmatch(analysis_text.strip()))
         compact_chars = len(strip_alignment_punctuation(prealign.display_text))
@@ -529,7 +557,7 @@ def diagnose_case(
             compact_chars=compact_chars,
             prealign_empty=prealign.empty_after_cleaning,
             nonlexical_text=nonlexical_text,
-            dropped=dropped,
+            review_item=review_item,
             qc_item=qc_item_for_diagnostics,
             alignment_mode=alignment_mode,
             align_error=str(chunk_log.get("align_error") or ""),
@@ -542,7 +570,7 @@ def diagnose_case(
             duration_s=duration,
             align_text_empty=prealign.empty_after_cleaning,
             nonlexical_text=nonlexical_text,
-            asr_dropped_uncertain=bool(dropped),
+            asr_review_uncertain=bool(review_item),
             asr_qc_severity=str((qc_item_for_diagnostics or {}).get("severity") or ""),
             alignment_mode=alignment_mode,
             align_error=str(chunk_log.get("align_error") or ""),
@@ -559,8 +587,8 @@ def diagnose_case(
             align_text_empty += 1
         if analysis_text.strip():
             nonempty_chunks += 1
-        if dropped:
-            dropped_chunks += 1
+        if review_item:
+            review_chunks += 1
         if quality["fallback_type"] != "none":
             fallback_chunks += 1
 
@@ -575,10 +603,14 @@ def diagnose_case(
             "start": round(start, 3),
             "end": round(end, 3),
             "duration_s": round(duration, 3),
+            "fallback_window_start": round(fallback_abs_start, 3),
+            "fallback_window_end": round(fallback_abs_end, 3),
+            "fallback_duration_s": round(fallback_duration, 3),
+            "fallback_window_source": fallback_source,
             "text": text,
             "raw_text": raw_text,
             "analysis_text": analysis_text,
-            "dropped_original_text": original_dropped_text,
+            "review_original_text": review_original_text,
             "display_text": prealign.display_text,
             "align_text": prealign.align_text,
             "prealign_flags": prealign.flags,
@@ -614,8 +646,8 @@ def diagnose_case(
             "word_timing_failure_reasons": word_failure_reasons,
             "asr_qc_severity": (qc_item_for_diagnostics or {}).get("severity", ""),
             "asr_qc_reasons": (qc_item_for_diagnostics or {}).get("reasons", []),
-            "asr_dropped_uncertain": bool(dropped),
-            "dropped_reasons": (dropped or {}).get("reasons", []),
+            "asr_review_uncertain": bool(review_item),
+            "review_reasons": (review_item or {}).get("reasons", []),
             "failure_reasons": reasons,
         }
         row["failure_candidate"] = is_failure_candidate(row)
@@ -638,7 +670,7 @@ def diagnose_case(
         "align_text_empty_count": align_text_empty,
         "fallback_chunk_count": fallback_chunks,
         "fallback_chunk_ratio": round(fallback_chunks / max(1, len(chunks)), 6),
-        "asr_dropped_uncertain_count": dropped_chunks,
+        "asr_review_uncertain_count": review_chunks,
         "reason_counts": dict(reason_counts.most_common()),
         "alignment_mode_counts": dict(alignment_modes.most_common()),
         "alignment_quality_counts": dict(alignment_quality_counts.most_common()),
@@ -653,7 +685,7 @@ def diagnose_case(
             if (row.get("repetition_repair") or {}).get("changed")
         ),
         "quality_alignment_fallback_ratio": quality.get("alignment_fallback_ratio"),
-        "quality_asr_dropped_uncertain_count": quality.get("asr_dropped_uncertain_count"),
+        "quality_asr_review_uncertain_count": quality.get("asr_review_uncertain_count"),
         "asr_details_fallback_count": asr_details.get("fallback_count"),
     }
     return rows, summary
@@ -669,7 +701,7 @@ def build_markdown(summary: dict[str, Any]) -> str:
         f"- chunks: {summary['chunk_count']}",
         f"- output segments: {summary['output_segment_count']}",
         f"- fallback chunks: {summary['fallback_chunk_count']} ({summary['fallback_chunk_ratio']:.1%})",
-        f"- ASR dropped uncertain chunks: {summary['asr_dropped_uncertain_count']}",
+        f"- ASR review uncertain chunks: {summary['asr_review_uncertain_count']}",
         f"- align-text-empty chunks: {summary['align_text_empty_count']}",
         f"- failure candidates: {summary['failure_candidate_count']}",
         "",
@@ -727,14 +759,14 @@ def build_markdown(summary: dict[str, Any]) -> str:
     for item in summary["cases"]:
         lines.append(
             "- {label}/{video}: chunks={chunks}, fallback={fallback} ({ratio:.1%}), "
-            "dropped={dropped}, align_empty={align_empty}, segments={segments}, "
+            "review={review}, align_empty={align_empty}, segments={segments}, "
             "quality={quality}".format(
                 label=item.get("case_label") or "case",
                 video=item["video"],
                 chunks=item["chunk_count"],
                 fallback=item["fallback_chunk_count"],
                 ratio=item["fallback_chunk_ratio"],
-                dropped=item["asr_dropped_uncertain_count"],
+                review=item["asr_review_uncertain_count"],
                 align_empty=item["align_text_empty_count"],
                 segments=item["output_segment_count"],
                 quality=item.get("alignment_quality_counts", {}),
@@ -789,7 +821,7 @@ def summarize(rows: list[dict[str, Any]], case_summaries: list[dict[str, Any]]) 
         "align_text_empty_count": sum(1 for row in rows if row.get("align_text_empty") and str(row.get("analysis_text") or "").strip()),
         "fallback_chunk_count": fallback_count,
         "fallback_chunk_ratio": fallback_count / max(1, chunk_count),
-        "asr_dropped_uncertain_count": sum(1 for row in rows if row.get("asr_dropped_uncertain")),
+        "asr_review_uncertain_count": sum(1 for row in rows if row.get("asr_review_uncertain")),
         "failure_candidate_count": failure_candidate_count,
         "reason_counts": dict(reason_counts.most_common()),
         "alignment_mode_counts": dict(mode_counts.most_common()),

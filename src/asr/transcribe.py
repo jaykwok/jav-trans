@@ -5,7 +5,6 @@ import re
 import time
 import uuid
 from collections import defaultdict
-from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Callable
 
@@ -67,7 +66,6 @@ _ALIGNMENT_SENTINEL_ISLAND_MAX_SPLITS = max(
     1,
     int(os.getenv("ALIGNMENT_SENTINEL_ISLAND_MAX_SPLITS", "8")),
 )
-_ASR_CONTEXT_LEAK_SIMILARITY = float(os.getenv("ASR_CONTEXT_LEAK_SIMILARITY", "0.88"))
 _ASR_FRAGMENT_MERGE_MAX_GAP_S = float(os.getenv("ASR_FRAGMENT_MERGE_MAX_GAP", "1.0"))
 _ASR_FRAGMENT_MERGE_MAX_CHARS = max(
     1,
@@ -112,8 +110,7 @@ _TRIVIAL_SEGMENT = re.compile(
     r"^[。！？…、\s,.!?・「」（）【】；：\-—–]+$"
 )
 _STRIP_PUNCT_RE = re.compile(r"[。！？…、,.!?・「」『』（）()【】\[\]\s~〜ー-]+")
-_CONTEXT_COMPACT_RE = re.compile(r"[^0-9A-Za-zぁ-ゖァ-ヺ一-龯々〆ヵヶ]+")
-_CONTEXT_TOKEN_SPLIT_RE = re.compile(r"[。！？…、,.!?・「」『』（）()【】\[\]\s~〜ー\-；;：:\n\r\t]+")
+_TEXT_UNIT_COMPACT_RE = re.compile(r"[^0-9A-Za-zぁ-ゖァ-ヺ一-龯々〆ヵヶ]+")
 _SENTENCE_TERMINAL_RE = re.compile(r"[。！？!?…」』）)\]]$")
 
 
@@ -123,7 +120,6 @@ def _asr_context() -> str:
 
 def _asr_head_context() -> str:
     return os.getenv("ASR_HEAD_CONTEXT", "").strip()
-_SENTENCE_FRAGMENT_RE = re.compile(r"[^。！？!?…]+[。！？!?…]?")
 _FRAGMENT_CONTINUATION_START_RE = re.compile(
     r"^(?:ます|ました|ません|です|でした|でしょう|ながら|ので|けど|から|たり|"
     r"程度|ところ|いる|いき|して|され|なり|効果|で[、,]?|に|を|が|は|も)"
@@ -142,45 +138,8 @@ def _strip_punctuation(text: str) -> str:
     return _STRIP_PUNCT_RE.sub("", text or "")
 
 
-def _compact_context_text(text: str) -> str:
-    return _CONTEXT_COMPACT_RE.sub("", text or "")
-
-
-def _context_tokens(context: str) -> list[str]:
-    tokens = []
-    for token in _CONTEXT_TOKEN_SPLIT_RE.split(context or ""):
-        compact = _compact_context_text(token)
-        if len(compact) >= 2:
-            tokens.append(compact)
-    return tokens
-
-
-def _is_context_leak(text: str) -> bool:
-    compact = _compact_context_text(text)
-    if len(compact) < 3:
-        return False
-
-    for context in (_asr_context(), _asr_head_context()):
-        context_compact = _compact_context_text(context)
-        if len(context_compact) < 3:
-            continue
-
-        if compact == context_compact:
-            return True
-        if compact in context_compact:
-            return True
-        if context_compact in compact and len(compact) <= len(context_compact) * 1.25:
-            return True
-        if SequenceMatcher(None, compact, context_compact).ratio() >= _ASR_CONTEXT_LEAK_SIMILARITY:
-            return True
-
-        remainder = compact
-        for token in sorted(_context_tokens(context), key=len, reverse=True):
-            remainder = remainder.replace(token, "")
-        if not remainder:
-            return True
-
-    return False
+def _compact_text_units(text: str) -> str:
+    return _TEXT_UNIT_COMPACT_RE.sub("", text or "")
 
 
 def _collapse_repeated_noise(text: str) -> str:
@@ -194,12 +153,6 @@ def _is_low_value_text(text: str) -> bool:
     if not compact:
         return True
 
-    context = _asr_context()
-    if context:
-        context_compact = _strip_punctuation(context)
-        if context_compact and context_compact in compact and len(compact) <= len(context_compact) + 3:
-            return True
-
     if _TRIVIAL_SEGMENT.match(normalized):
         return True
 
@@ -210,70 +163,11 @@ def _clean_segment_text(text: str) -> str:
     return _collapse_repeated_noise((text or "").replace("\r", " ").replace("\n", " "))
 
 
-def _remove_context_leak_fragments(text: str) -> str:
-    contexts = (_asr_context(), _asr_head_context())
-    if not any(contexts):
-        return text
-
-    context_tokens = sorted(
-        {
-            token
-            for context in contexts
-            for token in _context_tokens(context)
-            if len(token) >= 2
-        },
-        key=len,
-        reverse=True,
-    )
-    strong_tokens = [token for token in context_tokens if len(token) >= 3]
-
-    cleaned_text = text or ""
-    if len(context_tokens) >= 2 and strong_tokens:
-        token_pattern = "|".join(re.escape(token) for token in context_tokens)
-        sequence_re = re.compile(
-            rf"(?:{token_pattern})(?:[；;、。,.!?！？…・\s]+(?:{token_pattern}))+[。！？!?…]?"
-        )
-
-        def _drop_context_sequence(match: re.Match) -> str:
-            compact = _compact_context_text(match.group(0))
-            if any(token in compact for token in strong_tokens):
-                return ""
-            return match.group(0)
-
-        cleaned_text = sequence_re.sub(_drop_context_sequence, cleaned_text)
-
-    fragments = _SENTENCE_FRAGMENT_RE.findall(cleaned_text)
-    if not fragments:
-        return "" if _is_context_leak(cleaned_text) else cleaned_text
-
-    kept_fragments = []
-    changed = cleaned_text != text
-    for fragment in fragments:
-        if _is_context_leak(fragment):
-            changed = True
-            continue
-
-        cleaned_fragment = fragment
-        for token in strong_tokens:
-            if token not in cleaned_fragment:
-                continue
-            without_token = cleaned_fragment.replace(token, "")
-            if _is_low_value_text(without_token):
-                changed = True
-                cleaned_fragment = without_token
-
-        cleaned_fragment = re.sub(r"[、,\s]+([。！？!?…])", r"\1", cleaned_fragment)
-        cleaned_fragment = re.sub(r"^[、。！？!?…,.・\s]+|[、,.・\s]+$", "", cleaned_fragment)
-        cleaned_fragment = _collapse_repeated_noise(cleaned_fragment)
-
-        if not cleaned_fragment or _is_low_value_text(cleaned_fragment):
-            changed = True
-            continue
-        kept_fragments.append(cleaned_fragment)
-
-    if not changed:
-        return text
-    return _collapse_repeated_noise("".join(kept_fragments))
+def _word_backed_segment_text(words: list[dict]) -> str:
+    text = _clean_segment_text("".join(str(word.get("word", "")) for word in words))
+    if not text or not _strip_punctuation(text):
+        return ""
+    return text
 
 
 def _build_timestamp_fallback(
@@ -288,6 +182,66 @@ def _build_timestamp_fallback(
         end,
         audio_path=audio_path,
     )
+
+
+def _alignment_fallback_window_from_chunk(
+    chunk: dict,
+    *,
+    duration: float,
+) -> tuple[float, float, str]:
+    full_start = 0.0
+    full_end = max(0.0, float(duration))
+    try:
+        left_padding_s = max(0.0, float(chunk.get("speech_left_padding_s") or 0.0))
+    except (TypeError, ValueError):
+        left_padding_s = 0.0
+    try:
+        right_padding_s = max(0.0, float(chunk.get("speech_right_padding_s") or 0.0))
+    except (TypeError, ValueError):
+        right_padding_s = 0.0
+
+    if left_padding_s <= 0.0 and right_padding_s <= 0.0:
+        return full_start, full_end, "chunk"
+
+    core_start = min(full_end, left_padding_s)
+    core_end = max(core_start, full_end - right_padding_s)
+    if core_end - core_start < 0.05:
+        return full_start, full_end, "chunk"
+    return core_start, core_end, "speech_core"
+
+
+def _with_alignment_fallback_window(chunk: dict, text_result: dict) -> dict:
+    result = dict(text_result)
+    try:
+        duration = float(result.get("duration") or 0.0)
+    except (TypeError, ValueError):
+        duration = 0.0
+    if duration <= 0.0:
+        duration = max(
+            0.0,
+            float(chunk.get("end", 0.0)) - float(chunk.get("start", 0.0)),
+        )
+    start_s, end_s, source = _alignment_fallback_window_from_chunk(
+        chunk,
+        duration=duration,
+    )
+    result["alignment_fallback_start_s"] = round(start_s, 6)
+    result["alignment_fallback_end_s"] = round(end_s, 6)
+    result["alignment_fallback_source"] = source
+    return result
+
+
+def _fallback_window_for_chunk_log(chunk: dict, duration: float) -> tuple[float, float, str]:
+    start_s, end_s, source = _alignment_fallback_window_from_chunk(
+        chunk,
+        duration=duration,
+    )
+    return start_s, end_s, source
+
+
+def _append_fallback_window_log(chunk_log: list[str], source: str) -> None:
+    if source == "speech_core":
+        chunk_log.append("Alignment 回退窗口: speech_core")
 
 
 def _env_bool(name: str, default: str = "0") -> bool:
@@ -406,6 +360,10 @@ def _prepare_asr_chunk_results(
         text_stage_label,
         on_stage=on_stage,
     )
+    text_results = [
+        _with_alignment_fallback_window(chunk, text_result)
+        for chunk, text_result in zip(chunks, text_results)
+    ]
     unload_started = time.perf_counter()
     backend.unload_model(on_stage=on_stage)
     unload_elapsed = time.perf_counter() - unload_started
@@ -897,6 +855,17 @@ def _build_transcript_chunks(
             "text": text_result.get("text", ""),
             "raw_text": text_result.get("raw_text", ""),
         }
+        if "alignment_fallback_start_s" in text_result and "alignment_fallback_end_s" in text_result:
+            fallback_start = float(text_result.get("alignment_fallback_start_s") or 0.0)
+            fallback_end = float(text_result.get("alignment_fallback_end_s") or fallback_start)
+            fallback_end = max(fallback_start, fallback_end)
+            chunk_start = float(chunk["start"])
+            item["alignment_fallback_start_s"] = fallback_start
+            item["alignment_fallback_end_s"] = fallback_end
+            item["alignment_fallback_duration_s"] = max(0.0, fallback_end - fallback_start)
+            item["alignment_fallback_abs_start_s"] = chunk_start + fallback_start
+            item["alignment_fallback_abs_end_s"] = chunk_start + fallback_end
+            item["alignment_fallback_source"] = text_result.get("alignment_fallback_source", "chunk")
         if chunk.get("merged_from"):
             item["merged_from"] = list(chunk.get("merged_from") or [])
         transcript_chunks.append(item)
@@ -926,29 +895,16 @@ def _backend_accepts_initial_prompts(backend: BaseAsrBackend) -> bool:
         return False
 
 
-def _chunk_gender_label(chunk: dict) -> str:
-    for key in ("gender", "speaker_gender", "dominant_gender"):
-        value = str(chunk.get(key) or "").strip().lower()
-        if value:
-            return value
-    return ""
-
-
 def _should_reset_sliding_context(previous: dict, current: dict) -> bool:
     gap = float(current.get("start", 0.0)) - float(previous.get("end", 0.0))
-    if gap > _ASR_CONTEXT_RESET_GAP_S:
-        return True
-
-    previous_gender = _chunk_gender_label(previous)
-    current_gender = _chunk_gender_label(current)
-    return bool(previous_gender and current_gender and previous_gender != current_gender)
+    return gap > _ASR_CONTEXT_RESET_GAP_S
 
 
 def _sliding_context_result_text(text_result: dict) -> str:
     text = _clean_segment_text(str(text_result.get("text", "") or ""))
     if not text:
         return ""
-    if _is_context_leak(text) or _is_low_value_text(text):
+    if _is_low_value_text(text):
         return ""
     return text
 
@@ -1070,12 +1026,17 @@ def _finalize_aligned_chunk_without_asr_retry(
     chunk_log.append(
         "Alignment 哨兵触发: 时间轴异常，不重新调用 ASR，改用 VAD/比例回退"
     )
+    fallback_start, fallback_end, fallback_source = _fallback_window_for_chunk_log(
+        chunk,
+        duration,
+    )
     fallback_words, fallback_mode, fallback_meta = _build_timestamp_fallback(
         text,
-        0.0,
-        duration,
+        fallback_start,
+        fallback_end,
         audio_path=chunk["path"],
     )
+    _append_fallback_window_log(chunk_log, fallback_source)
     if fallback_mode == "aligner_vad_fallback":
         chunk_log.append("Alignment 回退: 使用 VAD 约束比例时间戳")
         chunk_log.append(
@@ -1492,12 +1453,17 @@ def _transcribe_asr_chunk_with_retry(
 
     if _should_skip_alignment_retry(chunk_result.get("text", "")):
         chunk_log.append("Alignment 哨兵触发: 低价值/短文本直接回退，不再做子片段重试")
+        fallback_start, fallback_end, fallback_source = _fallback_window_for_chunk_log(
+            chunk,
+            duration,
+        )
         fallback_words, fallback_mode, fallback_meta = _build_timestamp_fallback(
             chunk_result.get("text", ""),
-            0.0,
-            duration,
+            fallback_start,
+            fallback_end,
             audio_path=chunk["path"],
         )
+        _append_fallback_window_log(chunk_log, fallback_source)
         if fallback_mode == "aligner_vad_fallback":
             chunk_log.append("Alignment 快速回退: 使用 VAD 约束比例时间戳")
             chunk_log.append(
@@ -1533,12 +1499,17 @@ def _transcribe_asr_chunk_with_retry(
     )
     retry_spans = _split_span_evenly(start, end, _ALIGNMENT_STEP_DOWN_CHUNK_S)
     if len(retry_spans) <= 1:
+        fallback_start, fallback_end, fallback_source = _fallback_window_for_chunk_log(
+            chunk,
+            duration,
+        )
         fallback_words, fallback_mode, fallback_meta = _build_timestamp_fallback(
             chunk_result.get("text", ""),
-            0.0,
-            duration,
+            fallback_start,
+            fallback_end,
             audio_path=chunk["path"],
         )
+        _append_fallback_window_log(chunk_log, fallback_source)
         if fallback_mode == "aligner_vad_fallback":
             chunk_log.append("Alignment 降级失败: 子片段不足，改用 VAD 约束比例时间戳")
             chunk_log.append(
@@ -1590,12 +1561,17 @@ def _transcribe_asr_chunk_with_retry(
         chunk_log.append(f"Alignment 降级成功: {len(retry_infos)} 个子片段")
         return retry_words, chunk_log
 
+    fallback_start, fallback_end, fallback_source = _fallback_window_for_chunk_log(
+        chunk,
+        duration,
+    )
     fallback_words, fallback_mode, fallback_meta = _build_timestamp_fallback(
         chunk_result.get("text", ""),
-        0.0,
-        duration,
+        fallback_start,
+        fallback_end,
         audio_path=chunk["path"],
     )
+    _append_fallback_window_log(chunk_log, fallback_source)
     if fallback_mode == "aligner_vad_fallback":
         chunk_log.append("Alignment 降级后仍异常: 改用 VAD 约束比例时间戳")
         chunk_log.append(
@@ -1613,15 +1589,15 @@ def _postprocess_segments(segments: list[dict]) -> list[dict]:
     cleaned_segments: list[dict] = []
 
     for segment in segments:
-        text = _clean_segment_text(segment.get("text", ""))
+        segment_words = list(segment.get("words") or [])
+        word_backed_text = _word_backed_segment_text(segment_words)
+        text = word_backed_text or _clean_segment_text(segment.get("text", ""))
         if not text:
             continue
-        text = _remove_context_leak_fragments(text)
-        if not text:
-            continue
-        if _is_context_leak(text):
-            continue
-        if _is_low_value_text(text):
+        if not word_backed_text:
+            if _is_low_value_text(text):
+                continue
+        elif _TRIVIAL_SEGMENT.match(text):
             continue
 
         cleaned_segments.append(
@@ -1630,7 +1606,7 @@ def _postprocess_segments(segments: list[dict]) -> list[dict]:
                 "end": float(segment.get("end", 0.0)),
                 "text": text,
                 "source_chunk_index": segment.get("source_chunk_index"),
-                "words": list(segment.get("words") or []),
+                "words": segment_words,
             }
         )
 
@@ -1668,7 +1644,7 @@ def _should_merge_fragment(current: dict, following: dict) -> bool:
     if gap < -0.05 or gap > _ASR_FRAGMENT_MERGE_MAX_GAP_S:
         return False
 
-    combined_chars = len(_compact_context_text(current_text + following_text))
+    combined_chars = len(_compact_text_units(current_text + following_text))
     if combined_chars > _ASR_FRAGMENT_MERGE_MAX_CHARS:
         return False
 
@@ -1739,7 +1715,7 @@ def _split_long_postprocessed_segment(segment: dict) -> list[dict]:
     start = float(segment.get("start", 0.0))
     end = float(segment.get("end", start))
     duration = max(0.0, end - start)
-    compact_len = len(_compact_context_text(text))
+    compact_len = len(_compact_text_units(text))
     original_words = list(segment.get("words") or [])
 
     if (
@@ -1757,8 +1733,8 @@ def _split_long_postprocessed_segment(segment: dict) -> list[dict]:
     if not left_text or not right_text:
         return [segment]
 
-    left_weight = max(1, len(_compact_context_text(left_text)))
-    right_weight = max(1, len(_compact_context_text(right_text)))
+    left_weight = max(1, len(_compact_text_units(left_text)))
+    right_weight = max(1, len(_compact_text_units(right_text)))
     split_time = start + duration * (left_weight / (left_weight + right_weight))
     if (
         split_time - start <= _ASR_INVALID_SEGMENT_DURATION_S
@@ -1886,11 +1862,6 @@ def _repair_postprocessed_segment_windows(segments: list[dict]) -> list[dict]:
     return non_overlapping
 
 
-def _should_split_on_gender(prev_word, next_word, gap, *, min_gap_s=0.15):
-    pg, ng = prev_word.get('gender'), next_word.get('gender')
-    return pg is not None and ng is not None and pg != ng and gap >= min_gap_s
-
-
 def _merge_words_to_segments(words: list[dict]) -> list[dict]:
     if not words:
         return []
@@ -2014,7 +1985,6 @@ def _merge_words_to_segments(words: list[dict]) -> list[dict]:
                 and len(segment_text) >= 20
             )
         )
-        should_split_turn = should_split_turn or _should_split_on_gender(current_words[-1], word, gap)
         exceeds_segment_limits = (
             (
                 ends_sentence

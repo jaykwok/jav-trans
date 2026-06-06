@@ -21,8 +21,9 @@ def _boundary_config() -> dict:
         "boundary_refiner_model_path": "",
         "boundary_refiner_backbone": "transformers.Mamba2Model",
         "boundary_refiner_threshold": 0.5,
-        "boundary_planner_max_chunk_s": 30.0,
-        "boundary_planner_target_chunk_s": 9.0,
+        "boundary_planner_max_core_chunk_s": 5.0,
+        "boundary_planner_max_padded_chunk_s": 9.0,
+        "boundary_planner_target_chunk_s": 3.0,
         "boundary_planner_min_chunk_s": 0.4,
         "boundary_planner_start_weight": 1.5,
         "boundary_planner_target_padding_s": 2.0,
@@ -159,7 +160,7 @@ def test_boundary_cache_round_trips_packed_chunks(monkeypatch, tmp_path):
             duration=2.4,
             left_padding_s=0.2,
             right_padding_s=2.0,
-            split_reason="boundary_refiner:speaker_change",
+            split_reason="boundary_refiner:utterance_switch",
             parent_chunk_id=3,
             island_id=1,
             island_count=2,
@@ -168,7 +169,7 @@ def test_boundary_cache_round_trips_packed_chunks(monkeypatch, tmp_path):
             internal_gap_count=1,
             internal_gap_max_s=0.5,
             boundary_score=0.87,
-            boundary_reason="speaker_change",
+            boundary_reason="utterance_switch",
             boundary_source="cut",
             boundary_decision_merge=False,
             boundary_merge_prob=0.13,
@@ -201,7 +202,7 @@ def test_boundary_cache_round_trips_packed_chunks(monkeypatch, tmp_path):
     assert isinstance(loaded_chunks[0], PackedChunk)
     assert loaded_chunks[0].start == 0.0
     assert loaded_chunks[0].right_padding_s == 2.0
-    assert loaded_chunks[0].split_reason == "boundary_refiner:speaker_change"
+    assert loaded_chunks[0].split_reason == "boundary_refiner:utterance_switch"
     assert loaded_chunks[0].parent_chunk_id == 3
     assert loaded_chunks[0].island_id == 1
     assert loaded_chunks[0].island_count == 2
@@ -210,7 +211,7 @@ def test_boundary_cache_round_trips_packed_chunks(monkeypatch, tmp_path):
     assert loaded_chunks[0].internal_gap_count == 1
     assert loaded_chunks[0].internal_gap_max_s == 0.5
     assert loaded_chunks[0].boundary_score == 0.87
-    assert loaded_chunks[0].boundary_reason == "speaker_change"
+    assert loaded_chunks[0].boundary_reason == "utterance_switch"
     assert loaded_chunks[0].boundary_source == "cut"
     assert loaded_chunks[0].boundary_decision_merge is False
     assert loaded_chunks[0].boundary_merge_prob == 0.13
@@ -282,6 +283,8 @@ def test_pipeline_uses_boundary_scores_but_does_not_cache_score_arrays(monkeypat
     monkeypatch.setenv("BOUNDARY_CACHE_DIR", str(tmp_path / "boundary-cache"))
     monkeypatch.setenv("BOUNDARY_FEATURE_FRAME_HOP_S", "1.0")
     monkeypatch.setenv("BOUNDARY_REFINER_ENABLED", "1")
+    monkeypatch.setenv("BOUNDARY_PLANNER_MAX_CORE_CHUNK_S", "30.0")
+    monkeypatch.setenv("BOUNDARY_PLANNER_MAX_PADDED_CHUNK_S", "30.0")
     monkeypatch.setenv("BOUNDARY_PLANNER_TARGET_CHUNK_S", "5.0")
     monkeypatch.setenv("BOUNDARY_PLANNER_MIN_CHUNK_S", "3.0")
 
@@ -334,6 +337,6 @@ def test_pipeline_uses_boundary_cache_for_prompt_budget_change(monkeypatch, tmp_
     second = asr._build_processing_spans(str(audio))
 
     assert backend.calls == 1
-    assert len(first) == len(second) == 1
+    assert len(first) == len(second) == 2
     assert isinstance(second[0], PackedChunk)
     assert second[0].speech_segments[0].start == 0.2

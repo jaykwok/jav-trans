@@ -11,7 +11,12 @@ from pathlib import Path
 from typing import Callable
 
 from utils.model_paths import resolve_model_spec
-from asr.backends.qwen import active_qwen_asr_model_id, active_qwen_asr_model_path, current_qwen_asr_backend
+from asr.backends.qwen import (
+    active_qwen_asr_model_id,
+    active_qwen_asr_model_path,
+    current_qwen_asr_backend,
+    qwen_asr_default_batch_size,
+)
 from asr.prealign import (
     clean_text_for_aligner,
     normalize_display_text,
@@ -26,7 +31,16 @@ ASR_MODEL_PATH = active_qwen_asr_model_path()
 ALIGNER_MODEL_PATH = os.getenv("ALIGNER_MODEL_PATH", "").strip()
 ASR_LANGUAGE = os.getenv("ASR_LANGUAGE", "Japanese").strip() or "Japanese"
 ASR_CONTEXT = os.getenv("ASR_CONTEXT", "").strip()
-ASR_BATCH_SIZE = max(1, int(os.getenv("ASR_BATCH_SIZE", "1")))
+
+
+def _resolve_asr_batch_size() -> int:
+    raw = os.getenv("ASR_BATCH_SIZE", "auto").strip().lower()
+    if raw in {"", "auto"}:
+        return max(1, qwen_asr_default_batch_size(current_qwen_asr_backend()))
+    return max(1, int(raw))
+
+
+ASR_BATCH_SIZE = _resolve_asr_batch_size()
 ASR_MAX_NEW_TOKENS = max(64, int(os.getenv("ASR_MAX_NEW_TOKENS", "128")))
 TRANSCRIPTION_MAX_NEW_TOKENS = max(
     32,
@@ -1043,6 +1057,26 @@ class LocalAsrBackend:
             return "align_text_empty"
         return ""
 
+    def _alignment_fallback_window_for_text_result(
+        self,
+        text_result: dict,
+        duration: float,
+    ) -> tuple[float, float, str]:
+        full_start = 0.0
+        full_end = max(0.0, float(duration))
+        try:
+            start = float(text_result.get("alignment_fallback_start_s"))
+            end = float(text_result.get("alignment_fallback_end_s"))
+        except (TypeError, ValueError):
+            return full_start, full_end, "chunk"
+
+        start = max(full_start, min(full_end, start))
+        end = max(start, min(full_end, end))
+        if end - start < 0.05:
+            return full_start, full_end, "chunk"
+        source = str(text_result.get("alignment_fallback_source") or "chunk").strip()
+        return start, end, source or "chunk"
+
     def _build_finalize_output(
         self,
         *,
@@ -1055,10 +1089,13 @@ class LocalAsrBackend:
         log: list[str],
         align_error: str = "",
         fallback_meta: dict | None = None,
+        fallback_window_source: str = "",
     ) -> tuple[dict, list[str]]:
         log.append(f"Alignment 词数: {len(word_dicts)}")
         if align_error:
             log.append(f"Alignment 异常: {align_error}")
+        if fallback_window_source == "speech_core":
+            log.append("Alignment 回退窗口: speech_core")
         if fallback_meta is not None:
             if fallback_meta.get("speech_span_count", 0):
                 log.append(f"Alignment VAD 回退语音区间: {fallback_meta['speech_span_count']}")
@@ -1083,7 +1120,7 @@ class LocalAsrBackend:
             return []
 
         finalized: list[tuple[dict, list[str]] | None] = [None] * len(text_results)
-        forced_jobs: list[tuple[int, str, str, str, float, str, list[str]]] = []
+        forced_jobs: list[dict] = []
 
         for idx, text_result in enumerate(text_results):
             log: list[str] = list(text_result.get("log", []))
@@ -1092,6 +1129,9 @@ class LocalAsrBackend:
             detected_language = str(text_result["language"]).strip() or "Japanese"
             raw_master_text = str(text_result.get("raw_text", "")).strip()
             master_text = str(text_result.get("text", "")).strip()
+            fallback_start, fallback_end, fallback_window_source = (
+                self._alignment_fallback_window_for_text_result(text_result, duration)
+            )
 
             if not master_text:
                 finalized[idx] = (
@@ -1109,22 +1149,25 @@ class LocalAsrBackend:
 
             if self._should_force_align_text(master_text, raw_master_text, log):
                 forced_jobs.append(
-                    (
-                        idx,
-                        normalized_path,
-                        master_text,
-                        detected_language,
-                        duration,
-                        raw_master_text,
-                        log,
-                    )
+                    {
+                        "idx": idx,
+                        "normalized_path": normalized_path,
+                        "master_text": master_text,
+                        "detected_language": detected_language,
+                        "duration": duration,
+                        "raw_master_text": raw_master_text,
+                        "log": log,
+                        "fallback_start": fallback_start,
+                        "fallback_end": fallback_end,
+                        "fallback_window_source": fallback_window_source,
+                    }
                 )
                 continue
 
             word_dicts, alignment_mode, fallback_meta = build_word_timestamps_fallback(
                 master_text or raw_master_text,
-                0.0,
-                duration,
+                fallback_start,
+                fallback_end,
                 audio_path=normalized_path,
             )
             explicit_mode = self._fallback_alignment_mode_for_text(master_text, raw_master_text)
@@ -1140,111 +1183,94 @@ class LocalAsrBackend:
                 detected_language=detected_language,
                 log=log,
                 fallback_meta=fallback_meta,
+                fallback_window_source=fallback_window_source,
             )
 
         for batch_start in range(0, len(forced_jobs), self.align_batch_size):
             batch_jobs = forced_jobs[batch_start : batch_start + self.align_batch_size]
             batch_inputs = []
-            for (
-                _idx,
-                normalized_path,
-                master_text,
-                detected_language,
-                _duration,
-                raw_master_text,
-                _log,
-            ) in batch_jobs:
+            for job in batch_jobs:
                 batch_inputs.append(
-                    (normalized_path, raw_master_text or master_text, detected_language)
+                    (
+                        job["normalized_path"],
+                        job["raw_master_text"] or job["master_text"],
+                        job["detected_language"],
+                    )
                 )
             try:
                 batch_word_dicts = self._forced_align_words_batch(batch_inputs, on_stage=on_stage)
-                for (
-                    idx,
-                    normalized_path,
-                    master_text,
-                    detected_language,
-                    duration,
-                    raw_master_text,
-                    log,
-                ), word_dicts in zip(batch_jobs, batch_word_dicts):
+                for job, word_dicts in zip(batch_jobs, batch_word_dicts):
                     if not word_dicts:
                         fallback_words, fallback_mode, fallback_meta = build_word_timestamps_fallback(
-                            master_text,
-                            0.0,
-                            duration,
-                            audio_path=normalized_path,
+                            job["master_text"],
+                            job["fallback_start"],
+                            job["fallback_end"],
+                            audio_path=job["normalized_path"],
                         )
-                        finalized[idx] = self._build_finalize_output(
+                        finalized[job["idx"]] = self._build_finalize_output(
                             word_dicts=normalize_word_dicts(fallback_words),
-                            master_text=master_text,
-                            raw_master_text=raw_master_text,
+                            master_text=job["master_text"],
+                            raw_master_text=job["raw_master_text"],
                             alignment_mode=fallback_mode,
-                            duration=duration,
-                            detected_language=detected_language,
-                            log=log,
+                            duration=job["duration"],
+                            detected_language=job["detected_language"],
+                            log=job["log"],
                             align_error="forced aligner returned empty words",
                             fallback_meta=fallback_meta,
+                            fallback_window_source=job["fallback_window_source"],
                         )
                         continue
 
-                    finalized[idx] = self._build_finalize_output(
+                    finalized[job["idx"]] = self._build_finalize_output(
                         word_dicts=word_dicts,
-                        master_text=master_text,
-                        raw_master_text=raw_master_text,
+                        master_text=job["master_text"],
+                        raw_master_text=job["raw_master_text"],
                         alignment_mode="forced_aligner",
-                        duration=duration,
-                        detected_language=detected_language,
-                        log=log,
+                        duration=job["duration"],
+                        detected_language=job["detected_language"],
+                        log=job["log"],
                     )
             except Exception:
-                for (
-                    idx,
-                    normalized_path,
-                    master_text,
-                    detected_language,
-                    duration,
-                    raw_master_text,
-                    log,
-                ) in batch_jobs:
+                for job in batch_jobs:
                     align_error = ""
                     fallback_meta: dict | None = None
                     try:
                         word_dicts, alignment_mode = self._forced_align_words(
-                            normalized_path,
-                            raw_master_text or master_text,
-                            detected_language,
+                            job["normalized_path"],
+                            job["raw_master_text"] or job["master_text"],
+                            job["detected_language"],
                             on_stage=on_stage,
                         )
                         if not word_dicts:
                             align_error = "forced aligner returned empty words"
                             word_dicts, alignment_mode, fallback_meta = build_word_timestamps_fallback(
-                                master_text,
-                                0.0,
-                                duration,
-                                audio_path=normalized_path,
+                                job["master_text"],
+                                job["fallback_start"],
+                                job["fallback_end"],
+                                audio_path=job["normalized_path"],
                             )
                             word_dicts = normalize_word_dicts(word_dicts)
                     except Exception as exc:
                         align_error = str(exc)
                         word_dicts, alignment_mode, fallback_meta = build_word_timestamps_fallback(
-                            master_text,
-                            0.0,
-                            duration,
-                            audio_path=normalized_path,
+                            job["master_text"],
+                            job["fallback_start"],
+                            job["fallback_end"],
+                            audio_path=job["normalized_path"],
                         )
                         word_dicts = normalize_word_dicts(word_dicts)
 
-                    finalized[idx] = self._build_finalize_output(
+                    finalized[job["idx"]] = self._build_finalize_output(
                         word_dicts=word_dicts,
-                        master_text=master_text,
-                        raw_master_text=raw_master_text,
+                        master_text=job["master_text"],
+                        raw_master_text=job["raw_master_text"],
                         alignment_mode=alignment_mode,
-                        duration=duration,
-                        detected_language=detected_language,
-                        log=log,
+                        duration=job["duration"],
+                        detected_language=job["detected_language"],
+                        log=job["log"],
                         align_error=align_error,
                         fallback_meta=fallback_meta,
+                        fallback_window_source=job["fallback_window_source"],
                     )
 
         return [item for item in finalized if item is not None]

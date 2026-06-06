@@ -22,7 +22,7 @@ DATASET_SCHEMA = "boundary_refiner_gap_dataset_v1"
 
 @dataclass(frozen=True)
 class GapDatasetConfig:
-    target_chunk_s: float = 9.0
+    target_chunk_s: float = 3.0
     safe_merge_gap_s: float = 0.12
     long_gap_split_s: float = 0.60
     synthetic_merge_positives_per_record: int = 0

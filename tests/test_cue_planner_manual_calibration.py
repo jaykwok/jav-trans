@@ -20,8 +20,7 @@ def test_cue_planner_manual_calibration_summarizes_risk_tags(tmp_path: Path):
         [
             {
                 "sample_id": "a",
-                "risk_tags": "near_speaker_threshold,reading_density_high",
-                "speaker_change_score": 0.92,
+                "risk_tags": "reading_density_high",
                 "score": 0.66,
                 "source_start_s": 0.0,
                 "source_end_s": 1.0,
@@ -29,8 +28,7 @@ def test_cue_planner_manual_calibration_summarizes_risk_tags(tmp_path: Path):
             },
             {
                 "sample_id": "b",
-                "risk_tags": "high_speaker_score,loose_gap",
-                "speaker_change_score": 0.91,
+                "risk_tags": "loose_gap",
                 "score": 0.52,
                 "source_start_s": 2.0,
                 "source_end_s": 3.0,
@@ -38,8 +36,7 @@ def test_cue_planner_manual_calibration_summarizes_risk_tags(tmp_path: Path):
             },
             {
                 "sample_id": "c",
-                "risk_tags": "high_speaker_score,loose_gap",
-                "speaker_change_score": 0.86,
+                "risk_tags": "long_combined_duration,loose_gap",
                 "score": 0.51,
                 "source_start_s": 4.0,
                 "source_end_s": 4.7,
@@ -64,13 +61,16 @@ def test_cue_planner_manual_calibration_summarizes_risk_tags(tmp_path: Path):
 
     assert summary["reviewed_rows"] == 3
     assert summary["overall"]["label_counts"]["keep_text"] == 1
-    assert summary["risk_tag_stats"]["high_speaker_score"]["problem_rate"] == 1.0
+    assert summary["risk_tag_stats"]["long_combined_duration"]["problem_rate"] == 1.0
     assert summary["risk_tag_stats"]["loose_gap"]["problem_rate"] == 1.0
-    assert summary["risk_tag_stats"]["near_speaker_threshold"]["keep"] == 1
+    assert summary["risk_tag_stats"]["reading_density_high"]["keep"] == 1
     args = summary["recommendation"]["suggested_planner_args"]
-    assert args["speaker_threshold"] == 0.95
     assert args["max_gap_s"] == 0.5
-    assert args["speaker_score_penalty_threshold"] == 0.85
+    assert set(args) == {
+        "fallback_risk_policy",
+        "max_gap_s",
+        "max_reading_units_per_s",
+    }
     assert (tmp_path / "out" / "summary.md").exists()
 
 
@@ -80,8 +80,7 @@ def test_cue_planner_manual_calibration_accepts_multi_labels(tmp_path: Path):
         [
             {
                 "sample_id": "a",
-                "risk_tags": "near_speaker_threshold",
-                "speaker_change_score": 0.7,
+                "risk_tags": "reading_density_high",
                 "score": 0.6,
                 "source_start_s": 0.0,
                 "source_end_s": 1.0,
@@ -89,8 +88,7 @@ def test_cue_planner_manual_calibration_accepts_multi_labels(tmp_path: Path):
             },
             {
                 "sample_id": "b",
-                "risk_tags": "near_speaker_threshold",
-                "speaker_change_score": 0.7,
+                "risk_tags": "reading_density_high",
                 "score": 0.6,
                 "source_start_s": 2.0,
                 "source_end_s": 3.0,
@@ -135,7 +133,6 @@ def test_cue_planner_manual_calibration_separates_low_info_vocal_from_hard_drop(
             {
                 "sample_id": "a",
                 "risk_tags": "reading_density_high",
-                "speaker_change_score": 0.5,
                 "score": 0.7,
                 "source_start_s": 0.0,
                 "source_end_s": 1.0,
@@ -144,7 +141,6 @@ def test_cue_planner_manual_calibration_separates_low_info_vocal_from_hard_drop(
             {
                 "sample_id": "b",
                 "risk_tags": "reading_density_high",
-                "speaker_change_score": 0.5,
                 "score": 0.7,
                 "source_start_s": 2.0,
                 "source_end_s": 3.0,
@@ -153,7 +149,6 @@ def test_cue_planner_manual_calibration_separates_low_info_vocal_from_hard_drop(
             {
                 "sample_id": "c",
                 "risk_tags": "reading_density_high",
-                "speaker_change_score": 0.5,
                 "score": 0.7,
                 "source_start_s": 4.0,
                 "source_end_s": 5.0,
@@ -204,8 +199,7 @@ def test_cue_planner_manual_calibration_tracks_side_specific_mixed_labels(tmp_pa
         [
             {
                 "sample_id": "a",
-                "risk_tags": "near_speaker_threshold",
-                "speaker_change_score": 0.88,
+                "risk_tags": "loose_gap",
                 "score": 0.62,
                 "source_start_s": 0.0,
                 "source_end_s": 2.0,
@@ -216,7 +210,6 @@ def test_cue_planner_manual_calibration_tracks_side_specific_mixed_labels(tmp_pa
             {
                 "sample_id": "b",
                 "risk_tags": "reading_density_high",
-                "speaker_change_score": 0.5,
                 "score": 0.7,
                 "source_start_s": 3.0,
                 "source_end_s": 4.0,

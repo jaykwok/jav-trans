@@ -1,57 +1,16 @@
 from __future__ import annotations
 
-from types import SimpleNamespace
-
-import pytest
-
-from asr.qc import apply_adaptive_precision_filter, evaluate_asr_text_results_qc
+from asr.qc import collect_adaptive_precision_review, evaluate_asr_text_results_qc
 
 
-def test_context_leak_skipped_when_backend_ignores_contexts():
-    def forbidden_context_check(_text: str) -> bool:
-        raise AssertionError("context leak callback should not be called")
-
+def test_qc_policy_keeps_repetition_metadata():
     report = evaluate_asr_text_results_qc(
         [{"index": 1, "start": 0.0, "end": 3.0}],
         [{"text": "小那海あや。小那海あや。", "duration": 3.0}],
-        is_context_leak=forbidden_context_check,
-        backend=SimpleNamespace(accepts_contexts=False),
     )
 
-    assert report["context_leak_check"] == "skipped(backend_ignores_contexts)"
     assert report["repetition_check"] == "on"
     assert report["repetition_threshold"] == 10
-
-
-def test_context_leak_runs_when_backend_accepts_contexts():
-    calls: list[str] = []
-
-    def context_check(text: str) -> bool:
-        calls.append(text)
-        return True
-
-    report = evaluate_asr_text_results_qc(
-        [{"index": 1, "start": 0.0, "end": 3.0}],
-        [{"text": "context leak text", "duration": 3.0}],
-        is_context_leak=context_check,
-        backend=SimpleNamespace(accepts_contexts=True),
-    )
-
-    assert calls == ["context leak text"]
-    assert report["items"][0]["metrics"]["context_leak"] is True
-
-
-def test_context_leak_callback_failure_would_surface_without_skip():
-    def forbidden_context_check(_text: str) -> bool:
-        raise RuntimeError("called")
-
-    with pytest.raises(RuntimeError, match="called"):
-        evaluate_asr_text_results_qc(
-            [{"index": 1, "start": 0.0, "end": 3.0}],
-            [{"text": "context leak text", "duration": 3.0}],
-            is_context_leak=forbidden_context_check,
-            backend=SimpleNamespace(accepts_contexts=True),
-        )
 
 
 def test_generation_error_metadata_is_counted():
@@ -68,7 +27,6 @@ def test_generation_error_metadata_is_counted():
                 },
             }
         ],
-        backend=SimpleNamespace(accepts_contexts=True),
     )
 
     assert report["generation_error_count"] == 1
@@ -84,7 +42,6 @@ def test_generation_counters_present_when_qc_disabled(monkeypatch):
     report = evaluate_asr_text_results_qc(
         [{"index": 1, "start": 0.0, "end": 2.0}],
         [{"text": "ok", "duration": 2.0}],
-        backend=SimpleNamespace(accepts_contexts=True),
     )
 
     assert report["enabled"] is False
@@ -108,7 +65,6 @@ def test_quarantined_timeout_counts_as_timeout_and_quarantine():
                 },
             }
         ],
-        backend=SimpleNamespace(accepts_contexts=True),
     )
 
     assert report["generation_error_count"] == 1
@@ -117,8 +73,7 @@ def test_quarantined_timeout_counts_as_timeout_and_quarantine():
     assert report["reject_count"] == 1
 
 
-def test_adaptive_precision_filter_keeps_signal_reject_when_drop_disabled(monkeypatch):
-    monkeypatch.setenv("ASR_QC_DROP_UNCERTAIN", "0")
+def test_adaptive_precision_review_marks_signal_reject(monkeypatch):
     chunks = [{"index": 1, "start": 0.0, "end": 2.0}]
     text_results = [
         {
@@ -134,23 +89,22 @@ def test_adaptive_precision_filter_keeps_signal_reject_when_drop_disabled(monkey
     report = evaluate_asr_text_results_qc(
         chunks,
         text_results,
-        backend=SimpleNamespace(accepts_contexts=True),
     )
 
-    filtered, updated_report, log = apply_adaptive_precision_filter(
+    filtered, updated_report, log = collect_adaptive_precision_review(
         chunks,
         text_results,
         report,
     )
 
     assert filtered == text_results
-    assert updated_report["drop_uncertain_enabled"] is False
-    assert updated_report["dropped_uncertain_count"] == 0
-    assert log == []
+    assert updated_report["review_uncertain_enabled"] is True
+    assert updated_report["review_uncertain_count"] == 1
+    assert updated_report["review_uncertain_items"][0]["text_preview"] == "幻覚テキスト"
+    assert "ASR Adaptive Precision review chunk 1" in log[0]
 
 
-def test_adaptive_precision_filter_drops_signal_reject_when_enabled(monkeypatch):
-    monkeypatch.setenv("ASR_QC_DROP_UNCERTAIN", "1")
+def test_adaptive_precision_review_keeps_signal_reject_text(monkeypatch):
     chunks = [{"index": 1, "start": 0.0, "end": 2.0}]
     text_results = [
         {
@@ -166,24 +120,19 @@ def test_adaptive_precision_filter_drops_signal_reject_when_enabled(monkeypatch)
     report = evaluate_asr_text_results_qc(
         chunks,
         text_results,
-        backend=SimpleNamespace(accepts_contexts=True),
     )
 
-    filtered, updated_report, log = apply_adaptive_precision_filter(
+    filtered, updated_report, log = collect_adaptive_precision_review(
         chunks,
         text_results,
         report,
     )
 
-    assert filtered[0]["text"] == ""
-    assert filtered[0]["raw_text"] == ""
-    assert filtered[0]["segments"] == []
-    assert filtered[0]["asr_dropped"]["reasons"] == ["signal_reject"]
-    assert updated_report["dropped_uncertain_count"] == 1
-    assert updated_report["dropped_uncertain_items"][0]["text_preview"] == "幻覚テキスト"
-    assert updated_report["dropped_uncertain_items"][0]["original_text"] == "幻覚テキスト"
-    assert filtered[0]["asr_dropped"]["policy"] == "adaptive_precision"
-    assert "ASR Adaptive Precision drop chunk 1" in log[0]
+    assert filtered == text_results
+    assert updated_report["review_uncertain_count"] == 1
+    assert updated_report["review_uncertain_items"][0]["text_preview"] == "幻覚テキスト"
+    assert updated_report["review_uncertain_items"][0]["original_text"] == "幻覚テキスト"
+    assert "ASR Adaptive Precision review chunk 1" in log[0]
 
 
 def test_adaptive_precision_filter_keeps_low_risk_low_logprob():
@@ -202,10 +151,9 @@ def test_adaptive_precision_filter_keeps_low_risk_low_logprob():
         chunks,
         text_results,
         is_low_value_text=lambda _text: False,
-        backend=SimpleNamespace(accepts_contexts=True),
     )
 
-    filtered, updated_report, log = apply_adaptive_precision_filter(
+    filtered, updated_report, log = collect_adaptive_precision_review(
         chunks,
         text_results,
         report,
@@ -214,12 +162,11 @@ def test_adaptive_precision_filter_keeps_low_risk_low_logprob():
     assert report["precision_policy"] == "adaptive"
     assert report["reject_count"] == 0
     assert filtered == text_results
-    assert updated_report["dropped_uncertain_count"] == 0
+    assert updated_report["review_uncertain_count"] == 0
     assert log == []
 
 
-def test_adaptive_precision_filter_drops_hard_density_reject(monkeypatch):
-    monkeypatch.setenv("ASR_QC_DROP_UNCERTAIN", "1")
+def test_adaptive_precision_review_marks_hard_density_reject(monkeypatch):
     text = "もしも" * 120
     chunks = [{"index": 1, "start": 0.0, "end": 7.84}]
     text_results = [
@@ -235,10 +182,9 @@ def test_adaptive_precision_filter_drops_hard_density_reject(monkeypatch):
     report = evaluate_asr_text_results_qc(
         chunks,
         text_results,
-        backend=SimpleNamespace(accepts_contexts=True),
     )
 
-    filtered, updated_report, log = apply_adaptive_precision_filter(
+    filtered, updated_report, log = collect_adaptive_precision_review(
         chunks,
         text_results,
         report,
@@ -246,8 +192,8 @@ def test_adaptive_precision_filter_drops_hard_density_reject(monkeypatch):
 
     assert report["reject_count"] == 1
     assert "abnormal_char_density" in report["items"][0]["reasons"]
-    assert filtered[0]["text"] == ""
-    assert updated_report["dropped_uncertain_count"] == 1
+    assert filtered == text_results
+    assert updated_report["review_uncertain_count"] == 1
     assert log
-    assert "ASR Adaptive Precision drop chunk 1" in log[0]
+    assert "ASR Adaptive Precision review chunk 1" in log[0]
 

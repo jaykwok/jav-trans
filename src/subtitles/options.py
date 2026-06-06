@@ -33,7 +33,6 @@ class SubtitleOptions:
     ascii_char_weight: float = 0.55
     line_max_chars: int = 25
     merge_adjacent: bool = True
-    show_speaker: bool = False
     video_fps: float = FALLBACK_VIDEO_FPS
     timing_polish_enabled: bool = True
     short_gap_collapse_s: float = 0.5
@@ -102,7 +101,6 @@ class SubtitleOptions:
             ascii_char_weight=float(os.getenv("SUBTITLE_ASCII_CHAR_WEIGHT", "0.55")),
             line_max_chars=max(0, int(os.getenv("SRT_LINE_MAX_CHARS", "25"))),
             merge_adjacent=_env_bool("SUBTITLE_MERGE_ADJACENT", True),
-            show_speaker=_env_bool("SUBTITLE_SHOW_SPEAKER", False),
             timing_polish_enabled=_env_bool("SUBTITLE_TIMING_POLISH_ENABLED", True),
             short_gap_collapse_s=max(
                 0.0,

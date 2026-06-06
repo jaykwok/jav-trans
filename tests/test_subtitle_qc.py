@@ -67,42 +67,31 @@ def test_short_segment_ratio():
     segs = [_seg("ア", "甲", 0.0, 0.5)] * 3 + [_seg("イ", "乙", 0.0, 1.5)] * 7
     report = compute_quality_report(segs, 60.0, [], 0, 10)
     assert report["short_segment_ratio"] == pytest.approx(0.3)
+    assert report["short_segment_count"] == 3
+    assert report["micro_segment_count"] == 0
+    assert report["long_segment_count"] == 0
+    assert report["subtitle_duration_p50_s"] == pytest.approx(1.5)
+    assert report["subtitle_duration_p90_s"] == pytest.approx(1.5)
+    assert report["subtitle_duration_max_s"] == pytest.approx(1.5)
     assert any("short_segment_ratio" in w for w in report["warnings"])
 
 
 def test_empty_segments_returns_zeros():
     report = compute_quality_report([], 60.0, [], 0, 0)
     assert report["empty_zh_ratio"] == 0.0
-    assert report["f0_filtered_count"] == 0
     assert report["subtitle_overlap_count"] == 0
+    assert report["subtitle_duration_p50_s"] == 0.0
+    assert report["short_segment_count"] == 0
     assert report["warnings"] == []
 
 
-def test_gender_ratios_present_when_field_populated():
-    segs = [
-        {**_seg("ア", "甲"), "gender": "M"},
-        {**_seg("イ", "乙"), "gender": "F"},
-        {**_seg("ウ", "丙"), "gender": "F"},
-        {**_seg("エ", "丁"), "gender": None},
-    ]
-    report = compute_quality_report(segs, 60.0, [], 0, 4)
-    assert report["male_ratio"] == pytest.approx(1 / 4)
-    assert report["female_ratio"] == pytest.approx(2 / 4)
-    assert report["gender_none_ratio"] == pytest.approx(1 / 4)
-
-
-def test_gender_ratios_absent_without_field():
+def test_legacy_acoustic_metadata_does_not_create_role_metrics():
     segs = [_seg("ア", "甲"), _seg("イ", "乙")]
+    segs[0]["source_note"] = "legacy"
     report = compute_quality_report(segs, 60.0, [], 0, 2)
     assert "male_ratio" not in report
     assert "female_ratio" not in report
-    assert "gender_none_ratio" not in report
-
-
-def test_f0_filtered_count_is_reported():
-    segs = [_seg("ア", "甲"), _seg("イ", "乙")]
-    report = compute_quality_report(segs, 60.0, [], 0, 2, f0_filtered_count=3)
-    assert report["f0_filtered_count"] == 3
+    assert "role_none_ratio" not in report
 
 
 def test_asr_generation_errors_are_reported_and_warned():
@@ -119,8 +108,8 @@ def test_asr_generation_errors_are_reported_and_warned():
             "timeout_count": 1,
             "quarantined_count": 1,
             "empty_text_for_speech_count": 1,
-            "dropped_uncertain_count": 3,
-            "dropped_uncertain_items": [{"chunk_index": 7, "original_text": "怪しい"}],
+            "review_uncertain_count": 3,
+            "review_uncertain_items": [{"chunk_index": 7, "original_text": "怪しい"}],
         },
     )
 
@@ -129,8 +118,8 @@ def test_asr_generation_errors_are_reported_and_warned():
     assert report["asr_timeout_count"] == 1
     assert report["asr_quarantined_count"] == 1
     assert report["asr_empty_text_for_speech_count"] == 1
-    assert report["asr_dropped_uncertain_count"] == 3
-    assert report["asr_dropped_uncertain_items"][0]["original_text"] == "怪しい"
+    assert report["asr_review_uncertain_count"] == 3
+    assert report["asr_review_uncertain_items"][0]["original_text"] == "怪しい"
     assert any("asr_generation_error_count" in warning for warning in report["warnings"])
     assert any("asr_generation_overflow_count" in warning for warning in report["warnings"])
 

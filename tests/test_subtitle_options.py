@@ -13,7 +13,6 @@ def test_subtitle_options_from_env(monkeypatch):
     monkeypatch.setenv("SUBTITLE_TIMELINE_MODE", "reading")
     monkeypatch.setenv("SUBTITLE_READING_CPS", "10")
     monkeypatch.setenv("SUBTITLE_MERGE_ADJACENT", "0")
-    monkeypatch.setenv("SUBTITLE_SHOW_SPEAKER", "1")
     monkeypatch.setenv("SUBTITLE_TIMING_POLISH_ENABLED", "0")
     monkeypatch.setenv("SUBTITLE_SHORT_GAP_COLLAPSE_S", "0.4")
     monkeypatch.setenv("SUBTITLE_LINGER_S", "0.3")
@@ -32,7 +31,6 @@ def test_subtitle_options_from_env(monkeypatch):
     assert options.reading_cps == 10
     assert options.merge_adjacent is False
     assert options.line_max_chars == 18
-    assert options.show_speaker is True
     assert options.timing_polish_enabled is False
     assert options.short_gap_collapse_s == 0.4
     assert options.linger_s == 0.3
@@ -68,20 +66,18 @@ def test_subtitle_options_video_fps_falls_back_to_ntsc():
     assert options.with_video_fps(24).frame_gap_s == pytest.approx(2 / 24)
 
 
-def test_write_srt_explicit_options_override_env(monkeypatch, tmp_path):
-    monkeypatch.setenv("SUBTITLE_SHOW_SPEAKER", "0")
+def test_write_srt_ignores_speaker_metadata(tmp_path):
     path = tmp_path / "speaker.srt"
 
     subtitle.write_srt(
-        [{"start": 0.0, "end": 1.0, "zh_text": "过来", "speaker": "S0", "gender": "M"}],
+        [{"start": 0.0, "end": 1.0, "zh_text": "过来", "speaker": "S0"}],
         str(path),
-        options=SubtitleOptions(show_speaker=True),
+        options=SubtitleOptions(),
     )
 
     content = path.read_text(encoding="utf-8")
-    assert "[S0] 过来" in content
-    assert "[SS0]" not in content
-    assert "[M]" not in content
+    assert "过来" in content
+    assert "[S0]" not in content
 
 
 def test_prepare_srt_blocks_timeline_mode_is_per_options(monkeypatch, tmp_path):

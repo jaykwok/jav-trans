@@ -3,7 +3,11 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from tools.audits.audit_nav import write_audit_index, write_latest_audit_entry
+from tools.audits.audit_nav import (
+    delete_audit_entry,
+    write_audit_index,
+    write_latest_audit_entry,
+)
 
 
 def _write_text(path: Path, text: str) -> Path:
@@ -43,6 +47,12 @@ def test_audit_index_lists_latest_without_auto_refresh(tmp_path: Path):
     assert "http-equiv" not in index
     assert "window.location" not in index
     assert "location.reload" not in index
+    assert 'class="delete-audit"' in index
+    assert "/__audit_api__/delete-audit" in index
+    assert "live-server --middleware=tools/audits/live_server_audit_middleware.js" in index
+    assert "127.0.0.1:8765" not in index
+    assert "audit_nav.py serve" not in index
+    assert "audit_nav.py delete --href" in index
 
 
 def test_latest_audit_entry_is_static_link(tmp_path: Path):
@@ -61,3 +71,71 @@ def test_latest_audit_entry_is_static_link(tmp_path: Path):
     assert "http-equiv" not in entry
     assert "window.location" not in entry
     assert "location.reload" not in entry
+
+
+def test_delete_audit_entry_moves_directory_and_rebuilds_nav(tmp_path: Path):
+    audit_root = tmp_path / "agents" / "audits"
+    rm_root = tmp_path / "agents" / "rm" / "audit-deletions"
+    latest_html = _write_text(
+        audit_root / "latest-review" / "index.html",
+        "<!doctype html><title>latest</title>",
+    )
+    old_html = _write_text(
+        audit_root / "old-review" / "index.html",
+        "<!doctype html><title>old</title>",
+    )
+    (latest_html.parent / "summary.json").write_text(
+        json.dumps({"review_item_count": 3, "title": "Latest"}, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    (old_html.parent / "summary.json").write_text(
+        json.dumps({"review_item_count": 2, "title": "Old"}, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    write_latest_audit_entry(audit_root=audit_root, latest_html=latest_html, title="Latest")
+    write_audit_index(audit_root=audit_root, latest_html=latest_html, latest_title="Latest")
+
+    result = delete_audit_entry(
+        href="old-review/index.html",
+        audit_root=audit_root,
+        rm_root=rm_root,
+    )
+
+    assert result["deleted_href"] == "old-review/index.html"
+    assert result["latest_href"] == "latest-review/index.html"
+    assert not old_html.exists()
+    moved = list(rm_root.glob("*-old-review"))
+    assert len(moved) == 1
+    assert (moved[0] / "index.html").exists()
+    index = (audit_root / "index.html").read_text(encoding="utf-8")
+    assert "old-review/index.html" not in index
+    assert "latest-review/index.html" in index
+
+
+def test_delete_latest_audit_entry_picks_remaining_latest(tmp_path: Path):
+    audit_root = tmp_path / "agents" / "audits"
+    rm_root = tmp_path / "agents" / "rm" / "audit-deletions"
+    latest_html = _write_text(
+        audit_root / "latest-review" / "index.html",
+        "<!doctype html><title>latest</title>",
+    )
+    remaining_html = _write_text(
+        audit_root / "remaining-review" / "index.html",
+        "<!doctype html><title>remaining</title>",
+    )
+    write_latest_audit_entry(audit_root=audit_root, latest_html=latest_html, title="Latest")
+    write_audit_index(audit_root=audit_root, latest_html=latest_html, latest_title="Latest")
+
+    result = delete_audit_entry(
+        href="latest-review/index.html",
+        audit_root=audit_root,
+        rm_root=rm_root,
+    )
+
+    assert result["deleted_href"] == "latest-review/index.html"
+    assert result["latest_href"] == "remaining-review/index.html"
+    assert not latest_html.exists()
+    latest_entry = (audit_root / "latest-audit.html").read_text(encoding="utf-8")
+    assert 'href="remaining-review/index.html"' in latest_entry
+    assert 'href="latest-review/index.html"' not in latest_entry
+    assert remaining_html.exists()

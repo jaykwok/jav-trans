@@ -36,7 +36,7 @@ class FrameSequenceFeatureProvider:
     ptm: Sequence[Sequence[float]]
     mfcc: Sequence[Sequence[float]]
     config: FrameSequenceFeatureConfig = FrameSequenceFeatureConfig()
-    target_chunk_s: float = 9.0
+    target_chunk_s: float = 3.0
 
     def frame_dims(self) -> tuple[int, int, int]:
         ptm_array = _frame_array(self.ptm, name="ptm")
@@ -237,7 +237,7 @@ def gap_window_sequence_features(
     ptm: Sequence[Sequence[float]],
     mfcc: Sequence[Sequence[float]],
     config: FrameSequenceFeatureConfig,
-    target_chunk_s: float = 9.0,
+    target_chunk_s: float = 3.0,
 ) -> list[float]:
     if frame_hop_s <= 0:
         raise ValueError("frame_hop_s must be positive")

@@ -63,7 +63,6 @@ class JobContext:
     asr_backend: str
     asr_context: str
     subtitle_mode: str
-    multi_cue_split: bool
     skip_translation: bool
     target_lang: str
     translation_glossary: str
@@ -101,7 +100,6 @@ class JobContext:
             ),
             asr_context=str(getattr(spec, "asr_context", "") or ""),
             subtitle_mode=str(getattr(spec, "subtitle_mode", "bilingual") or "bilingual"),
-            multi_cue_split=bool(getattr(spec, "multi_cue_split", True)),
             skip_translation=bool(getattr(spec, "skip_translation", False)),
             target_lang=_translation_setting(
                 spec,
