@@ -31,8 +31,9 @@ from boundary.sequence_features import (  # noqa: E402
 @dataclass(frozen=True)
 class PlannerProfile:
     name: str
-    target_chunk_s: float = 9.0
-    max_chunk_s: float = 30.0
+    target_chunk_s: float = 3.0
+    max_core_chunk_s: float = 5.0
+    max_padded_chunk_s: float = 9.0
     min_chunk_s: float = 0.4
     start_weight: float = 1.5
     target_padding_s: float = 2.0
@@ -44,13 +45,14 @@ class PlannerProfile:
     dp_under_min_weight: float = 0.20
     dp_long_gap_weight: float = 0.35
     dp_split_merge_weight: float = 0.35
-    risk_target_s: float = 8.0
+    risk_target_s: float = 5.0
 
     def to_config(self) -> dict[str, float | int | str]:
         return {
             "name": self.name,
             "target_chunk_s": self.target_chunk_s,
-            "max_chunk_s": self.max_chunk_s,
+            "max_core_chunk_s": self.max_core_chunk_s,
+            "max_padded_chunk_s": self.max_padded_chunk_s,
             "min_chunk_s": self.min_chunk_s,
             "start_weight": self.start_weight,
             "target_padding_s": self.target_padding_s,
@@ -309,9 +311,10 @@ def summarize_chunks(
 
 def default_profiles(args: argparse.Namespace) -> list[PlannerProfile]:
     base = PlannerProfile(
-        name="baseline_dp_v2",
+        name="baseline_jav_short",
         target_chunk_s=args.boundary_planner_target_chunk_s,
-        max_chunk_s=args.boundary_planner_max_chunk_s,
+        max_core_chunk_s=args.boundary_planner_max_core_chunk_s,
+        max_padded_chunk_s=args.boundary_planner_max_padded_chunk_s,
         min_chunk_s=args.boundary_planner_min_chunk_s,
         start_weight=args.boundary_planner_start_weight,
         target_padding_s=args.boundary_planner_target_padding_s,
@@ -323,16 +326,16 @@ def default_profiles(args: argparse.Namespace) -> list[PlannerProfile]:
         base,
         replace(
             base,
-            name="duration_tight_8s",
-            target_chunk_s=8.0,
+            name="duration_tight_3s",
+            target_chunk_s=3.0,
             dp_over_target_weight=0.60,
             dp_far_over_target_weight=3.00,
             dp_split_merge_weight=0.25,
         ),
         replace(
             base,
-            name="gap_strict_8s",
-            target_chunk_s=8.0,
+            name="gap_strict_3s",
+            target_chunk_s=3.0,
             dp_over_target_weight=0.60,
             dp_far_over_target_weight=3.00,
             dp_long_gap_weight=0.90,
@@ -340,9 +343,10 @@ def default_profiles(args: argparse.Namespace) -> list[PlannerProfile]:
         ),
         replace(
             base,
-            name="fallback_safe_8s",
-            target_chunk_s=8.0,
-            max_chunk_s=24.0,
+            name="fallback_safe_4s",
+            target_chunk_s=4.0,
+            max_core_chunk_s=5.0,
+            max_padded_chunk_s=9.0,
             dp_over_target_weight=1.00,
             dp_far_over_target_weight=4.00,
             dp_long_gap_weight=0.90,
@@ -350,8 +354,8 @@ def default_profiles(args: argparse.Namespace) -> list[PlannerProfile]:
         ),
         replace(
             base,
-            name="start_priority_8s",
-            target_chunk_s=8.0,
+            name="start_priority_3s",
+            target_chunk_s=3.0,
             start_weight=2.00,
             dp_over_target_weight=0.80,
             dp_far_over_target_weight=3.00,
@@ -442,7 +446,8 @@ def run_sweep(args: argparse.Namespace) -> dict[str, Any]:
         chunks = pack_speech_segments(
             segmentation.segments,
             frame_hop_s=args.boundary_feature_frame_hop_s,
-            max_chunk_s=profile.max_chunk_s,
+            max_core_chunk_s=profile.max_core_chunk_s,
+            max_padded_chunk_s=profile.max_padded_chunk_s,
             target_chunk_s=profile.target_chunk_s,
             min_chunk_s=profile.min_chunk_s,
             target_padding_s=profile.target_padding_s,
@@ -562,14 +567,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--boundary-frame-sequence-right-context-s", type=float, default=0.60)
     parser.add_argument("--boundary-frame-sequence-max-ptm-dims", type=int, default=64)
     parser.add_argument("--boundary-frame-sequence-include-mfcc", type=int, default=1)
-    parser.add_argument("--boundary-planner-max-chunk-s", type=float, default=30.0)
-    parser.add_argument("--boundary-planner-target-chunk-s", type=float, default=9.0)
+    parser.add_argument("--boundary-planner-max-core-chunk-s", type=float, default=5.0)
+    parser.add_argument("--boundary-planner-max-padded-chunk-s", type=float, default=9.0)
+    parser.add_argument("--boundary-planner-target-chunk-s", type=float, default=3.0)
     parser.add_argument("--boundary-planner-min-chunk-s", type=float, default=0.4)
     parser.add_argument("--boundary-planner-start-weight", type=float, default=1.5)
     parser.add_argument("--boundary-planner-target-padding-s", type=float, default=2.0)
     parser.add_argument("--boundary-planner-max-splits-per-segment", type=int, default=16)
     parser.add_argument("--boundary-planner-sequence-batch-size", type=int, default=256)
-    parser.add_argument("--risk-target-s", type=float, default=8.0)
+    parser.add_argument("--risk-target-s", type=float, default=5.0)
     parser.add_argument("--speech-boundary-threshold", type=float, default=0.200)
     parser.add_argument("--speech-boundary-pad-s", type=float, default=0.2)
     parser.add_argument("--speech-boundary-ptm", default="jaykwok/Qwen3-ASR-0.6B-JA-Anime-Galgame")

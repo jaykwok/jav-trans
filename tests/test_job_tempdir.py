@@ -119,7 +119,7 @@ def test_run_log_is_written_only_when_enabled(monkeypatch, tmp_path):
         ),
     )
 
-    artifacts = main.run_asr_alignment_f0(
+    artifacts = main.run_asr_alignment(
         str(video_path),
         ctx=ctx,
         job_id=ctx.job_id,
@@ -192,7 +192,7 @@ def test_advanced_asr_stage_env_is_task_scoped(monkeypatch, tmp_path):
     video_path = tmp_path / "sample.mp4"
     video_path.write_bytes(b"fake-video")
     monkeypatch.setenv("BOUNDARY_REFINER_THRESHOLD", "0.5")
-    original_f0_threshold = main.os.environ.get("F0_THRESHOLD_HZ")
+    original_asr_batch_size = main.os.environ.get("ASR_BATCH_SIZE")
     ctx = make_job_context(
         video_path,
         output_dir,
@@ -201,7 +201,7 @@ def test_advanced_asr_stage_env_is_task_scoped(monkeypatch, tmp_path):
         keep_temp_files=True,
         advanced={
             "BOUNDARY_REFINER_THRESHOLD": "0.7",
-            "F0_THRESHOLD_HZ": "180",
+            "ASR_BATCH_SIZE": "12",
         },
     )
     monkeypatch.setattr(main.torch.cuda, "is_available", lambda: False)
@@ -212,7 +212,7 @@ def test_advanced_asr_stage_env_is_task_scoped(monkeypatch, tmp_path):
 
     def fake_transcribe_and_align(_audio_path, _device, on_stage=None, include_details=False):
         assert main.os.environ["BOUNDARY_REFINER_THRESHOLD"] == "0.7"
-        assert main.os.environ["F0_THRESHOLD_HZ"] == "180"
+        assert main.os.environ["ASR_BATCH_SIZE"] == "12"
         return (
             [{"start": 0.0, "end": 1.0, "text": "こんにちは"}],
             [],
@@ -225,5 +225,5 @@ def test_advanced_asr_stage_env_is_task_scoped(monkeypatch, tmp_path):
     run_pipeline(video_path, ctx)
 
     assert main.os.environ["BOUNDARY_REFINER_THRESHOLD"] == "0.5"
-    assert main.os.environ.get("F0_THRESHOLD_HZ") == original_f0_threshold
+    assert main.os.environ.get("ASR_BATCH_SIZE") == original_asr_batch_size
 

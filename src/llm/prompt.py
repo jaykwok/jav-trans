@@ -8,8 +8,7 @@ from llm.glossary import normalize_glossary_text
 
 
 PROMPT_VERSION = "v2.8"
-_GENDER_TAG_RE = re.compile(r"^\s*\[(?:M|F)\]\s*")
-_LEADING_SPEAKER_RE = re.compile(
+_LEADING_ROLE_LABEL_RE = re.compile(
     r"^\s*(?:男|女|男性|女性|男优|女优|スタッフ|撮影者|カメラマン|"
     r"[A-Za-z][A-Za-z ._-]{0,20})\s*[：:]\s*"
 )
@@ -63,7 +62,6 @@ def _translation_cache_key(
                 "start": round(start, 3),
                 "end": round(end, 3),
                 "duration_sec": round(max(0.0, end - start), 3),
-                "gender": seg.get("gender"),
                 "ja": str(seg.get("ja_text") or seg.get("text") or seg.get("ja") or ""),
             }
         )
@@ -86,15 +84,6 @@ def _normalize_source_text(text: str) -> str:
     return cleaned.strip()
 
 
-def strip_gender_tags(text: str) -> str:
-    cleaned = str(text or "").strip()
-    previous = None
-    while cleaned and previous != cleaned:
-        previous = cleaned
-        cleaned = _GENDER_TAG_RE.sub("", cleaned, count=1).strip()
-    return cleaned
-
-
 def _safe_float(value, default: float = 0.0) -> float:
     try:
         return float(value)
@@ -114,11 +103,6 @@ def _serialize_segments(
         start = _safe_float(seg.get("start"))
         end = _safe_float(seg.get("end"))
         ja_text = _normalize_source_text(seg.get("text", ""))
-        gender = seg.get("gender")
-        if gender == "M":
-            ja_text = f"[M]{ja_text}"
-        elif gender == "F":
-            ja_text = f"[F]{ja_text}"
         item_id = explicit_ids[idx] if explicit_ids is not None else start_index + idx
         payload.append(
             {
@@ -160,15 +144,14 @@ _SYSTEM_PROMPT_FULL = (
     "3. 人名不要翻译成中文；如果原文出现人物姓名，直接输出罗马音，格式用 Title Case，并用空格分隔名和姓，例如 Aya Onami。原文是汉字姓名时也必须按日语读音罗马音化，不要输出中文汉字或中文读法。\n"
     "4. {name_boundary}\n"
     "5. {name_homophone}\n"
-    "6. 输入中部分日文前可能带 [M]（男声）或 [F]（女声）声学标签；这些标签只用于理解对话切换、语气和人称。\n"
-    "7. 全片上下文只用于翻译连贯、指代判断、口吻一致和术语一致；不要修改、补全或纠正日文原文。\n"
-    "8. 每条输入必须单独翻译，不能合并、拆分、漏译、调换顺序。\n"
-    "9. 输出尽量短，贴近屏幕阅读节奏；短促呻吟和语气词也要简短自然。\n"
-    "10. 对呻吟、喘息和短促语气词保持原本情绪强度，译成适合字幕阅读的自然短句；不要按固定词表替换、删除或净化，只有明显机器循环才可在译文中适度概括。\n"
-    "11. 结构化 JSON 输出要求 prompt 明确包含 json 字样；最终只输出合法 JSON 对象。\n"
-    '12. 你必须只输出 JSON：{{"translations":[{{"id":0,"text":"..."}}]}}，条数必须严格匹配本次任务要求。\n'
-    "13. 最终 content 不能为空；即使开启思考模式，也必须把完整 JSON 对象写进最终 content。\n"
-    "14. 不要输出 Markdown，不要解释，不要额外字段；思考过程不要写进最终 content。\n\n"
+    "6. 全片上下文只用于翻译连贯、指代判断、口吻一致和术语一致；不要修改、补全或纠正日文原文。\n"
+    "7. 每条输入必须单独翻译，不能合并、拆分、漏译、调换顺序。\n"
+    "8. 输出尽量短，贴近屏幕阅读节奏；短促呻吟和语气词也要简短自然。\n"
+    "9. 对呻吟、喘息和短促语气词保持原本情绪强度，译成适合字幕阅读的自然短句；不要按固定词表替换、删除或净化，只有明显机器循环才可在译文中适度概括。\n"
+    "10. 结构化 JSON 输出要求 prompt 明确包含 json 字样；最终只输出合法 JSON 对象。\n"
+    '11. 你必须只输出 JSON：{{"translations":[{{"id":0,"text":"..."}}]}}，条数必须严格匹配本次任务要求。\n'
+    "12. 最终 content 不能为空；即使开启思考模式，也必须把完整 JSON 对象写进最终 content。\n"
+    "13. 不要输出 Markdown，不要解释，不要额外字段；思考过程不要写进最终 content。\n\n"
     "EXAMPLE JSON OUTPUT:\n"
     '{{"translations":[{{"id":0,"text":"第一句中文翻译"}},{{"id":1,"text":"第二句中文翻译"}}]}}'
 )

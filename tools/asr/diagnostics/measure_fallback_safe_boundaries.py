@@ -330,20 +330,39 @@ def classify_row(
         else ""
     )
     sentinel_fallback = fallback_active and bool((diagnostic or {}).get("sentinel_lines") or [])
-    fallback_safe = not fallback_reason or chunk["duration_s"] <= target_duration_s
-    truth_segment, truth_overlap = best_truth_overlap(chunk, truth_segments)
+    fallback_duration_s = (
+        row_float(diagnostic or {}, "fallback_duration_s", chunk["duration_s"])
+        if fallback_active
+        else chunk["duration_s"]
+    )
+    fallback_window_start = row_float(diagnostic or {}, "fallback_window_start", chunk["start"])
+    fallback_window_end = row_float(
+        diagnostic or {},
+        "fallback_window_end",
+        fallback_window_start + fallback_duration_s,
+    )
+    fallback_window_source = str((diagnostic or {}).get("fallback_window_source") or "chunk")
+    if fallback_window_end < fallback_window_start:
+        fallback_window_end = fallback_window_start
+    fallback_duration_s = max(0.0, fallback_duration_s)
+    fallback_safe = not fallback_reason or fallback_duration_s <= target_duration_s
+    timing_span = dict(chunk)
+    if fallback_active:
+        timing_span["start"] = fallback_window_start
+        timing_span["end"] = fallback_window_end
+    truth_segment, truth_overlap = best_truth_overlap(timing_span, truth_segments)
     truth_start_error_s = None
     truth_end_error_s = None
     if truth_segment is not None and truth_overlap > 0.0:
-        truth_start_error_s = chunk["start"] - truth_segment["start"]
-        truth_end_error_s = chunk["end"] - truth_segment["end"]
+        truth_start_error_s = timing_span["start"] - truth_segment["start"]
+        truth_end_error_s = timing_span["end"] - truth_segment["end"]
     silence = silence or {}
     risk_reasons: list[str] = []
     if fallback_active:
         risk_reasons.append("alignment_fallback")
     if sentinel_fallback:
         risk_reasons.append("sentinel_fallback")
-    if chunk["duration_s"] > target_duration_s:
+    if fallback_duration_s > target_duration_s:
         risk_reasons.append("long_fallback_chunk" if fallback_active else "long_chunk")
     if chunk["speech_island_count"] > 1:
         risk_reasons.append("multi_speech_island")
@@ -359,6 +378,10 @@ def classify_row(
         "start": round(chunk["start"], 6),
         "end": round(chunk["end"], 6),
         "duration_s": round(chunk["duration_s"], 6),
+        "fallback_window_start": round(fallback_window_start, 6),
+        "fallback_window_end": round(fallback_window_end, 6),
+        "fallback_duration_s": round(fallback_duration_s, 6),
+        "fallback_window_source": fallback_window_source,
         "core_start": round(chunk["core_start"], 6),
         "core_end": round(chunk["core_end"], 6),
         "core_duration_s": round(chunk["core_duration_s"], 6),
@@ -421,9 +444,10 @@ def summarize(rows: list[dict[str, Any]], *, target_duration_s: float) -> dict[s
         else 1.0,
         "sentinel_fallback_count": len(sentinel_rows),
         "all_chunk_duration_s": stats([row["duration_s"] for row in rows]),
-        "fallback_duration_s": stats([row["duration_s"] for row in fallback_rows]),
-        "unsafe_fallback_duration_s": stats([row["duration_s"] for row in unsafe_rows]),
-        "sentinel_fallback_duration_s": stats([row["duration_s"] for row in sentinel_rows]),
+        "fallback_duration_s": stats([row["fallback_duration_s"] for row in fallback_rows]),
+        "unsafe_fallback_duration_s": stats([row["fallback_duration_s"] for row in unsafe_rows]),
+        "sentinel_fallback_duration_s": stats([row["fallback_duration_s"] for row in sentinel_rows]),
+        "fallback_padded_chunk_duration_s": stats([row["duration_s"] for row in fallback_rows]),
         "fallback_core_duration_s": stats([row["core_duration_s"] for row in fallback_rows]),
         "fallback_internal_gap_max_s": stats([row["internal_gap_max_s"] for row in fallback_rows]),
         "fallback_speech_island_count": stats([float(row["speech_island_count"]) for row in fallback_rows]),
@@ -468,6 +492,7 @@ def build_markdown(summary: dict[str, Any], *, boundary_cache: Path, diagnostics
         "## Duration",
         "",
         f"- fallback duration p50/p90/max: `{fallback['p50']:.3f}` / `{fallback['p90']:.3f}` / `{fallback['max']:.3f}`",
+        f"- fallback padded chunk duration p50/p90/max: `{summary['fallback_padded_chunk_duration_s']['p50']:.3f}` / `{summary['fallback_padded_chunk_duration_s']['p90']:.3f}` / `{summary['fallback_padded_chunk_duration_s']['max']:.3f}`",
         f"- unsafe fallback duration p50/p90/max: `{unsafe['p50']:.3f}` / `{unsafe['p90']:.3f}` / `{unsafe['max']:.3f}`",
         f"- sentinel fallback duration p50/p90/max: `{sentinel['p50']:.3f}` / `{sentinel['p90']:.3f}` / `{sentinel['max']:.3f}`",
         f"- synthetic truth start abs error p50/p90/max: `{truth_start['p50']:.3f}` / `{truth_start['p90']:.3f}` / `{truth_start['max']:.3f}`",
@@ -488,7 +513,8 @@ def build_markdown(summary: dict[str, Any], *, boundary_cache: Path, diagnostics
             text = text[:77] + "..."
         lines.append(
             f"- chunk `{row['chunk_index']}` {row['start']:.2f}-{row['end']:.2f}s "
-            f"duration `{row['duration_s']:.2f}s`, islands `{row['speech_island_count']}`, "
+            f"fallback `{row['fallback_duration_s']:.2f}s` / chunk `{row['duration_s']:.2f}s`, "
+            f"islands `{row['speech_island_count']}`, "
             f"gap_max `{row['internal_gap_max_s']:.2f}s`, reason `{row['fallback_reason']}`: {text}"
         )
     return "\n".join(lines) + "\n"
@@ -548,8 +574,16 @@ def main(argv: list[str] | None = None) -> int:
                 silence = silence_stats(
                     audio_cache=audio_cache,
                     source_audio_path=str(diagnostic.get("source_audio_path") or ""),
-                    start_s=row_float(diagnostic, "start", row_float(chunk, "start")),
-                    end_s=row_float(diagnostic, "end", row_float(chunk, "end")),
+                    start_s=row_float(
+                        diagnostic,
+                        "fallback_window_start",
+                        row_float(diagnostic, "start", row_float(chunk, "start")),
+                    ),
+                    end_s=row_float(
+                        diagnostic,
+                        "fallback_window_end",
+                        row_float(diagnostic, "end", row_float(chunk, "end")),
+                    ),
                     frame_s=float(args.silence_frame_s),
                     threshold_dbfs=float(args.silence_threshold_dbfs),
                 )
@@ -581,7 +615,7 @@ def main(argv: list[str] | None = None) -> int:
         }
     )
     unsafe_rows = [row for row in rows if row["fallback_reason"] and not row["fallback_safe"]]
-    top_rows = sorted(unsafe_rows, key=lambda row: row["duration_s"], reverse=True)[: args.top_n]
+    top_rows = sorted(unsafe_rows, key=lambda row: row["fallback_duration_s"], reverse=True)[: args.top_n]
 
     output_dir = project_path(args.output_dir)
     write_json(output_dir / "summary.json", summary)

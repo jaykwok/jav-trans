@@ -26,10 +26,6 @@ def asr_qc_enabled() -> bool:
     return _env_bool("ASR_QC_ENABLED", True)
 
 
-def asr_qc_drop_uncertain_enabled() -> bool:
-    return _env_bool("ASR_QC_DROP_UNCERTAIN", False)
-
-
 ASR_QC_ENABLED = asr_qc_enabled()
 ASR_QC_REPETITION_THRESHOLD = max(
     1,
@@ -242,7 +238,7 @@ def check_logprob_quality(result: dict) -> dict:
             "logprob_threshold": logprob_threshold,
             "compression_threshold": compression_threshold,
             "nospeech_threshold": nospeech_threshold,
-            "drop_uncertain_enabled": asr_qc_drop_uncertain_enabled(),
+            "review_uncertain_enabled": True,
             "precision_policy": "adaptive",
             "adaptive": adaptive,
         },
@@ -616,7 +612,6 @@ def evaluate_asr_chunk_qc(
     text_result: dict,
     *,
     is_low_value_text: Callable[[str], bool] | None = None,
-    is_context_leak: Callable[[str], bool] | None = None,
 ) -> dict:
     raw_text = str(text_result.get("raw_text", "") or "")
     text = str(text_result.get("text", "") or raw_text)
@@ -626,7 +621,6 @@ def evaluate_asr_chunk_qc(
     repeat = _find_max_repeat(context_compact)
     chars_per_sec = len(compact) / duration if duration > 0 else 0.0
     low_value = bool(is_low_value_text(text)) if is_low_value_text else False
-    context_leak = bool(is_context_leak(text)) if is_context_leak else False
     mojibake = bool(_MOJIBAKE_RE.search(text))
     enriched_result = {
         **text_result,
@@ -636,7 +630,6 @@ def evaluate_asr_chunk_qc(
         "compact_chars": len(compact),
         "chars_per_sec": chars_per_sec,
         "low_value": low_value,
-        "context_leak": context_leak,
         "mojibake": mojibake,
         "max_repeat": repeat,
     }
@@ -659,10 +652,6 @@ def evaluate_asr_chunk_qc(
 
     if mojibake:
         reasons.append("mojibake")
-        severity = "reject"
-
-    if context_leak:
-        reasons.append("context_leak")
         severity = "reject"
 
     repeat_run = int(repeat["run"])
@@ -747,7 +736,6 @@ def evaluate_asr_chunk_qc(
             "compact_chars": len(compact),
             "chars_per_sec": round(chars_per_sec, 3),
             "low_value": low_value,
-            "context_leak": context_leak,
             "mojibake": mojibake,
             "max_repeat": repeat,
             "repetition_repair": repetition_repair,
@@ -766,18 +754,12 @@ def evaluate_asr_text_results_qc(
     text_results: list[dict],
     *,
     is_low_value_text: Callable[[str], bool] | None = None,
-    is_context_leak: Callable[[str], bool] | None = None,
-    backend=None,
 ) -> dict:
-    accepts_contexts = bool(getattr(backend, "accepts_contexts", True))
-    context_leak_callback = is_context_leak if accepts_contexts else None
-    context_leak_check = "on" if accepts_contexts else "skipped(backend_ignores_contexts)"
     qc_policy = {
-        "context_leak_check": context_leak_check,
         "repetition_check": "on",
         "repetition_threshold": ASR_QC_REPETITION_THRESHOLD,
         "precision_policy": "adaptive",
-        "drop_uncertain_enabled": asr_qc_drop_uncertain_enabled(),
+        "review_uncertain_enabled": True,
     }
 
     if not asr_qc_enabled():
@@ -791,8 +773,8 @@ def evaluate_asr_text_results_qc(
             "timeout_count": 0,
             "quarantined_count": 0,
             "empty_text_for_speech_count": 0,
-            "dropped_uncertain_count": 0,
-            "dropped_uncertain_items": [],
+            "review_uncertain_count": 0,
+            "review_uncertain_items": [],
             "items": [],
             "rejected_indices": [],
             **qc_policy,
@@ -834,7 +816,6 @@ def evaluate_asr_text_results_qc(
             chunk,
             text_result,
             is_low_value_text=is_low_value_text,
-            is_context_leak=context_leak_callback,
         )
         item = {
             "position": index,
@@ -878,15 +859,15 @@ def evaluate_asr_text_results_qc(
         "timeout_count": timeout_count,
         "quarantined_count": quarantined_count,
         "empty_text_for_speech_count": empty_text_for_speech_count,
-        "dropped_uncertain_count": 0,
-        "dropped_uncertain_items": [],
+        "review_uncertain_count": 0,
+        "review_uncertain_items": [],
         "items": items,
         "rejected_indices": rejected_indices,
         **qc_policy,
     }
 
 
-def _drop_reasons_for_qc_item(item: dict) -> list[str]:
+def _review_reasons_for_qc_item(item: dict) -> list[str]:
     severity = str(item.get("severity") or "").strip().lower()
     reasons = [str(reason) for reason in (item.get("reasons") or []) if reason]
     signal_qc = item.get("signal_qc")
@@ -894,85 +875,56 @@ def _drop_reasons_for_qc_item(item: dict) -> list[str]:
     if isinstance(signal_qc, dict):
         signal_verdict = str(signal_qc.get("verdict") or "").strip().lower()
 
-    drop_reasons: list[str] = []
+    review_reasons: list[str] = []
     for reason in reasons:
         if reason.startswith("generation_"):
-            drop_reasons.append(reason)
+            review_reasons.append(reason)
         elif reason in {"long_low_information_chunk", "long_low_value_text"}:
-            drop_reasons.append(reason)
-    if not drop_reasons:
+            review_reasons.append(reason)
+    if not review_reasons:
         if signal_verdict == "reject":
-            drop_reasons.append("signal_reject")
+            review_reasons.append("signal_reject")
         elif severity == "reject":
-            drop_reasons.append("qc_reject")
-    return list(dict.fromkeys(drop_reasons))
+            review_reasons.append("qc_reject")
+    return list(dict.fromkeys(review_reasons))
 
 
-def _dropped_text_result(text_result: dict, item: dict, drop_reasons: list[str]) -> dict:
-    dropped = dict(text_result)
-    original_text = str(text_result.get("text") or "")
-    original_raw_text = str(text_result.get("raw_text") or original_text)
-    dropped["text"] = ""
-    dropped["raw_text"] = ""
-    dropped["segments"] = []
-    dropped["asr_dropped"] = {
-        "policy": "adaptive_precision",
-        "reasons": drop_reasons,
-        "original_text": original_text,
-        "original_raw_text": original_raw_text,
-        "qc": item,
-    }
-    log = list(text_result.get("log", []))
-    log.append(
-        "ASR adaptive precision drop: reasons={reasons}, text={text}".format(
-            reasons=",".join(drop_reasons),
-            text=_preview(original_text or original_raw_text),
-        )
-    )
-    dropped["log"] = log
-    return dropped
-
-
-def apply_adaptive_precision_filter(
+def collect_adaptive_precision_review(
     chunks: list[dict],
     text_results: list[dict],
     qc_report: dict,
 ) -> tuple[list[dict], dict, list[str]]:
     if not asr_qc_enabled():
         return text_results, qc_report, []
-    if not asr_qc_drop_uncertain_enabled():
-        updated_report = dict(qc_report)
-        updated_report["drop_uncertain_enabled"] = False
-        return text_results, updated_report, []
 
     items = list(qc_report.get("items") or [])
     if not items:
-        return text_results, qc_report, []
+        updated_report = dict(qc_report)
+        updated_report["review_uncertain_enabled"] = True
+        return text_results, updated_report, []
 
     items_by_position = {
         int(item.get("position", index)): item
         for index, item in enumerate(items)
         if isinstance(item, dict)
     }
-    updated_results = list(text_results)
-    dropped_items: list[dict] = []
+    review_items: list[dict] = []
     log_lines: list[str] = []
 
     for index, text_result in enumerate(text_results):
         item = items_by_position.get(index)
         if item is None:
             continue
-        drop_reasons = _drop_reasons_for_qc_item(item)
-        if not drop_reasons:
+        review_reasons = _review_reasons_for_qc_item(item)
+        if not review_reasons:
             continue
-        updated_results[index] = _dropped_text_result(text_result, item, drop_reasons)
         chunk = chunks[index] if index < len(chunks) else {}
-        dropped_item = {
+        review_item = {
             "position": index,
             "chunk_index": item.get("chunk_index", chunk.get("index", index + 1)),
             "start": item.get("start", chunk.get("start", 0.0)),
             "end": item.get("end", chunk.get("end", 0.0)),
-            "reasons": drop_reasons,
+            "reasons": review_reasons,
             "original_text": str(text_result.get("text") or ""),
             "original_raw_text": str(
                 text_result.get("raw_text") or text_result.get("text") or ""
@@ -980,25 +932,27 @@ def apply_adaptive_precision_filter(
             "text_preview": item.get("text_preview", ""),
             "metrics": item.get("metrics") or {},
         }
-        dropped_items.append(dropped_item)
+        review_items.append(review_item)
         log_lines.append(
-            "ASR Adaptive Precision drop chunk {chunk_index}: reasons={reasons}, text={text}".format(
-                chunk_index=dropped_item["chunk_index"],
-                reasons=",".join(drop_reasons),
-                text=dropped_item["text_preview"],
+            "ASR Adaptive Precision review chunk {chunk_index}: reasons={reasons}, text={text}".format(
+                chunk_index=review_item["chunk_index"],
+                reasons=",".join(review_reasons),
+                text=review_item["text_preview"],
             )
         )
 
-    if not dropped_items:
-        return text_results, qc_report, []
+    if not review_items:
+        updated_report = dict(qc_report)
+        updated_report["review_uncertain_enabled"] = True
+        return text_results, updated_report, []
 
     updated_report = dict(qc_report)
-    existing = list(updated_report.get("dropped_uncertain_items") or [])
-    updated_report["dropped_uncertain_items"] = existing + dropped_items
-    updated_report["dropped_uncertain_count"] = len(updated_report["dropped_uncertain_items"])
-    updated_report["drop_uncertain_enabled"] = True
+    existing = list(updated_report.get("review_uncertain_items") or [])
+    updated_report["review_uncertain_items"] = existing + review_items
+    updated_report["review_uncertain_count"] = len(updated_report["review_uncertain_items"])
+    updated_report["review_uncertain_enabled"] = True
     updated_report["precision_policy"] = "adaptive"
-    return updated_results, updated_report, log_lines
+    return text_results, updated_report, log_lines
 
 
 def format_qc_log_items(report: dict, limit: int = 8) -> list[str]:

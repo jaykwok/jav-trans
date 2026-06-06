@@ -13,7 +13,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[3]
 
 
 REVIEW_TYPE_BY_BUCKET = {
-    "asr_dropped_uncertain": "review_asr_text",
+    "asr_review_uncertain": "review_asr_text",
     "align_text_empty": "review_alignment_text",
     "empty_text_for_chunk": "review_empty_asr",
     "text_without_output_segment": "review_missing_output_segment",
@@ -153,7 +153,7 @@ def manifest_row(row: Mapping[str, Any]) -> dict[str, Any]:
         "analysis_text": normalized_text(row.get("analysis_text")),
         "text": normalized_text(row.get("text")),
         "raw_text": normalized_text(row.get("raw_text")),
-        "dropped_original_text": normalized_text(row.get("dropped_original_text")),
+        "review_original_text": normalized_text(row.get("review_original_text")),
         "manual_label": "",
         "manual_text": "",
         "notes": "",

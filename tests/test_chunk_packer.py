@@ -13,7 +13,7 @@ def _seg(start: float, end: float) -> SpeechSegment:
 
 class _DenyGapRefiner:
     def decide_gap(self, item: RefinerInput) -> BoundaryDecision:
-        return BoundaryDecision(False, 0.12, "speaker_change")
+        return BoundaryDecision(False, 0.12, "utterance_switch")
 
     def signature(self) -> dict:
         return {"type": "deny_gap"}
@@ -92,7 +92,8 @@ def test_dense_segments_pack_into_one_chunk_with_dynamic_padding():
     chunks = pack_speech_segments(
         [_seg(5.0, 7.0), _seg(8.0, 9.0), _seg(10.0, 11.0)],
         frame_hop_s=1.0,
-        max_chunk_s=30.0,
+        max_core_chunk_s=30.0,
+        max_padded_chunk_s=30.0,
         target_chunk_s=9.0,
         target_padding_s=4.0,
     )
@@ -110,16 +111,17 @@ def test_gap_refiner_can_block_mergeable_gap():
     chunks = pack_speech_segments(
         [_seg(0.0, 2.0), _seg(3.0, 5.0)],
         frame_hop_s=1.0,
-        max_chunk_s=30.0,
+        max_core_chunk_s=30.0,
+        max_padded_chunk_s=30.0,
         target_chunk_s=9.0,
         target_padding_s=1.0,
         boundary_refiner=_DenyGapRefiner(),
     )
 
     assert [(chunk.core_start, chunk.core_end) for chunk in chunks] == [(0.0, 2.0), (3.0, 5.0)]
-    assert chunks[0].split_reason == "boundary_refiner:speaker_change"
+    assert chunks[0].split_reason == "boundary_refiner:utterance_switch"
     assert chunks[0].boundary_score == pytest.approx(0.12)
-    assert chunks[0].boundary_reason == "speaker_change"
+    assert chunks[0].boundary_reason == "utterance_switch"
     assert chunks[0].boundary_decision_merge is False
     assert chunks[0].boundary_merge_prob == pytest.approx(0.12)
     assert chunks[0].boundary_split_prob == pytest.approx(0.88)
@@ -129,7 +131,8 @@ def test_sequence_refiner_can_block_mergeable_gap():
     chunks = pack_speech_segments(
         [_seg(0.0, 2.0), _seg(3.0, 5.0)],
         frame_hop_s=1.0,
-        max_chunk_s=30.0,
+        max_core_chunk_s=30.0,
+        max_padded_chunk_s=30.0,
         target_chunk_s=9.0,
         target_padding_s=1.0,
         boundary_refiner=_AllowGapRefiner(),
@@ -149,7 +152,8 @@ def test_sequence_refiner_scores_all_gaps_in_one_batch():
     chunks = pack_speech_segments(
         [_seg(0.0, 1.0), _seg(1.2, 2.0), _seg(2.4, 3.0)],
         frame_hop_s=1.0,
-        max_chunk_s=30.0,
+        max_core_chunk_s=30.0,
+        max_padded_chunk_s=30.0,
         target_chunk_s=9.0,
         target_padding_s=1.0,
         sequence_boundary_refiner=refiner,
@@ -166,7 +170,8 @@ def test_planner_max_splits_even_when_refiner_allows_gap():
     chunks = pack_speech_segments(
         [_seg(0.0, 5.0), _seg(6.0, 11.0)],
         frame_hop_s=1.0,
-        max_chunk_s=8.0,
+        max_core_chunk_s=8.0,
+        max_padded_chunk_s=30.0,
         target_chunk_s=9.0,
         target_padding_s=1.0,
         boundary_refiner=_AllowGapRefiner(),
@@ -182,7 +187,8 @@ def test_boundary_candidate_split_metadata_is_materialized():
     chunks = pack_speech_segments(
         [_seg(0.0, 12.0)],
         frame_hop_s=1.0,
-        max_chunk_s=30.0,
+        max_core_chunk_s=30.0,
+        max_padded_chunk_s=30.0,
         target_chunk_s=5.0,
         min_chunk_s=3.0,
         target_padding_s=1.0,
@@ -206,7 +212,8 @@ def test_candidate_split_accepts_numpy_score_arrays():
     chunks = pack_speech_segments(
         [_seg(0.0, 12.0)],
         frame_hop_s=1.0,
-        max_chunk_s=30.0,
+        max_core_chunk_s=30.0,
+        max_padded_chunk_s=30.0,
         target_chunk_s=5.0,
         min_chunk_s=3.0,
         target_padding_s=1.0,
@@ -221,7 +228,8 @@ def test_overlong_segment_is_split_by_planner_capacity():
     chunks = pack_speech_segments(
         [_seg(10.0, 75.0)],
         frame_hop_s=1.0,
-        max_chunk_s=28.0,
+        max_core_chunk_s=20.0,
+        max_padded_chunk_s=28.0,
         target_chunk_s=9.0,
         target_padding_s=4.0,
     )
@@ -249,7 +257,8 @@ def test_single_segment_at_audio_start_clamps_left_padding_to_zero():
     chunks = pack_speech_segments(
         [_seg(0.4, 1.0)],
         frame_hop_s=1.0,
-        max_chunk_s=30.0,
+        max_core_chunk_s=30.0,
+        max_padded_chunk_s=30.0,
         target_chunk_s=9.0,
         target_padding_s=4.0,
     )

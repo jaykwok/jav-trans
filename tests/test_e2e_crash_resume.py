@@ -22,15 +22,24 @@ def _cleanup_job_temp(job_temp_dir: Path) -> None:
 
 def _segments(count: int = 5) -> list[dict]:
     return [
-        {"start": float(index), "end": float(index) + 0.8, "text": f"ja-{index}"}
+        {
+            "start": float(index * 2),
+            "end": float(index * 2) + 0.8,
+            "text": f"ja-{index}。",
+        }
         for index in range(count)
     ]
 
 
 def _batch_start_from_messages(messages) -> int:
     match = re.search(r"requested_ids\s*=\s*(\[[^\]]*\])", messages[1]["content"])
-    assert match is not None, messages[1]["content"]
-    ids = json.loads(match.group(1))
+    if match is not None:
+        ids = json.loads(match.group(1))
+        return min(ids) if ids else 0
+    marker = "【待翻译字幕 JSON】"
+    assert marker in messages[1]["content"], messages[1]["content"]
+    payload = json.loads(messages[1]["content"].split(marker, 1)[1].strip())
+    ids = [int(item["id"]) for item in payload]
     return min(ids) if ids else 0
 
 

@@ -38,8 +38,6 @@ def _artifacts(tmp_path: Path, segments: list[dict], *, bilingual: bool = False)
         video_duration_s=3.0,
         video_fps=25.0,
         pipeline_started=0.0,
-        f0_filtered_count=0,
-        f0_failed=False,
         job_id="clip",
         aligned_cache_signature={"version": 2},
     )
@@ -70,6 +68,7 @@ def test_translation_uses_pre_normalized_cues(monkeypatch, tmp_path):
         subtitle_mode="zh",
         translation_max_workers=1,
         keep_temp_files=True,
+        advanced={"SUBTITLE_MERGE_ADJACENT": "0"},
     )
     seen: dict[str, object] = {}
 

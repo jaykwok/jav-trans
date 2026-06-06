@@ -85,6 +85,7 @@ def test_measure_fallback_timing_error_writes_gate_summary(tmp_path):
                 "chunk 2: Alignment 模式: forced_aligner",
                 "chunk 2: Alignment 哨兵触发: 时间轴异常，不重新调用 ASR，改用 VAD/比例回退",
                 "chunk 2: Alignment 回退: 使用 VAD 约束比例时间戳",
+                "chunk 2: Alignment 模式: aligner_vad_fallback",
             ],
         },
     )

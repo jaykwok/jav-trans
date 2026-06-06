@@ -200,7 +200,6 @@ def _get_asr_runtime_signature(
                 "ASR_QC_ADAPTIVE_HARD_REPEAT_RATIO",
                 "0.45",
             ),
-            "qc_drop_uncertain": _env_lower("ASR_QC_DROP_UNCERTAIN", "0"),
         },
         "boundary": boundary_signature if isinstance(boundary_signature, dict) else {},
     }

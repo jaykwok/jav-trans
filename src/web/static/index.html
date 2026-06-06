@@ -87,10 +87,6 @@
               <span>不翻译（仅日文字幕）</span>
               <label class="toggle"><input type="checkbox" id="r-skip-translation"><span class="slider"></span></label>
             </div>
-            <div class="toggle-row">
-              <span>多 cue 切分（实验）</span>
-              <label class="toggle"><input type="checkbox" id="t-multi-cue-split" checked><span class="slider"></span></label>
-            </div>
             <label class="field">
               <span>并行翻译 Worker 数（API 限速时可调低）</span>
               <input type="number" id="t-translation-max-workers" value="4" min="1" max="8">
@@ -106,7 +102,7 @@
             <label class="field">
               <span>环境变量覆盖（每行 KEY=VALUE，优先级高于 .env）</span>
               <textarea id="t-env-override" rows="3"
-                placeholder="BOUNDARY_REFINER_ENABLED=1&#10;BOUNDARY_PLANNER_TARGET_CHUNK_S=9.0"></textarea>
+                placeholder="BOUNDARY_REFINER_ENABLED=1&#10;BOUNDARY_PLANNER_TARGET_CHUNK_S=3.0"></textarea>
             </label>
             <button class="btn btn-outline" id="btn-save-custom" type="button">保存自定义设置</button>
           </div>

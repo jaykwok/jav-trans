@@ -20,7 +20,6 @@ const STAGE_LABEL = {
   asr_alignment:       'ASR 转写 & 对齐',
   asr_text_transcribe: 'ASR 文本转写',
   alignment:           '强制对齐',
-  f0_gender_detection: '性别检测',
   translation_context: '翻译上下文',
   translation:         '翻译中',
   write_output:        '写入字幕',

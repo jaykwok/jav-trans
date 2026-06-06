@@ -18,15 +18,15 @@ def test_compare_cue_planner_merge_reviews_exports_extra_and_dropped(tmp_path: P
     baseline = _write_jsonl(
         tmp_path / "baseline.jsonl",
         [
-            {"left_cue_id": 1, "right_cue_id": 2, "risk_tags": "near_speaker_threshold"},
+            {"left_cue_id": 1, "right_cue_id": 2, "risk_tags": "reading_density_high"},
             {"left_cue_id": 3, "right_cue_id": 4, "risk_tags": "fallback_risk"},
         ],
     )
     candidate = _write_jsonl(
         tmp_path / "candidate.jsonl",
         [
-            {"left_cue_id": 1, "right_cue_id": 2, "risk_tags": "near_speaker_threshold"},
-            {"left_cue_id": 5, "right_cue_id": 6, "risk_tags": "loose_gap,high_speaker_score"},
+            {"left_cue_id": 1, "right_cue_id": 2, "risk_tags": "reading_density_high"},
+            {"left_cue_id": 5, "right_cue_id": 6, "risk_tags": "loose_gap,long_combined_duration"},
         ],
     )
 

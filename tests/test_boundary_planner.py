@@ -19,7 +19,7 @@ def test_boundary_planner_uses_candidate_split_before_packing():
         features=features,
         config=BoundaryPlannerConfig(
             frame_hop_s=1.0,
-            max_chunk_s=30.0,
+            max_core_chunk_s=30.0,
             target_chunk_s=5.0,
             min_chunk_s=3.0,
             target_padding_s=1.0,
@@ -43,7 +43,7 @@ def test_boundary_planner_uses_soft_candidate_for_over_target_island():
         features=features,
         config=BoundaryPlannerConfig(
             frame_hop_s=1.0,
-            max_chunk_s=30.0,
+            max_core_chunk_s=30.0,
             target_chunk_s=8.0,
             min_chunk_s=2.0,
             target_padding_s=1.0,
@@ -61,11 +61,11 @@ def test_boundary_planner_uses_soft_candidate_for_over_target_island():
 def test_boundary_planner_validates_config():
     features = make_feature_bundle(frame_hop_s=1.0)
 
-    with pytest.raises(ValueError, match="max_chunk_s"):
+    with pytest.raises(ValueError, match="max_core_chunk_s"):
         plan_boundary_chunks(
             [SpeechSegment(0.0, 1.0)],
             features=features,
-            config=BoundaryPlannerConfig(max_chunk_s=0.0),
+            config=BoundaryPlannerConfig(max_core_chunk_s=0.0),
         )
 
     with pytest.raises(ValueError, match="dp_long_gap_weight"):
@@ -126,7 +126,7 @@ def test_sequence_planner_dp_can_split_high_merge_gap_for_duration_target():
         features=features,
         config=BoundaryPlannerConfig(
             frame_hop_s=1.0,
-            max_chunk_s=30.0,
+            max_core_chunk_s=30.0,
             target_chunk_s=6.0,
             min_chunk_s=0.4,
             target_padding_s=1.0,
@@ -161,7 +161,7 @@ def test_sequence_planner_dp_preserves_learned_split_reason():
         features=features,
         config=BoundaryPlannerConfig(
             frame_hop_s=1.0,
-            max_chunk_s=30.0,
+            max_core_chunk_s=30.0,
             target_chunk_s=9.0,
             target_padding_s=1.0,
         ),
@@ -192,7 +192,7 @@ def test_sequence_planner_batches_long_sequences():
         features=features,
         config=BoundaryPlannerConfig(
             frame_hop_s=1.0,
-            max_chunk_s=30.0,
+            max_core_chunk_s=30.0,
             target_chunk_s=9.0,
             target_padding_s=1.0,
             sequence_batch_size=2,

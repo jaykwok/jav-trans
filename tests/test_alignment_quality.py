@@ -8,7 +8,7 @@ def test_classifies_clean_forced_alignment():
         text="こんにちは",
         duration_s=1.2,
         align_text_empty=False,
-        asr_dropped_uncertain=False,
+        asr_review_uncertain=False,
         alignment_mode="forced_aligner",
         aligned_segment_count=1,
         word_stats={"word_count": 3, "zero_or_negative_count": 0},
@@ -27,7 +27,7 @@ def test_classifies_partial_forced_alignment_with_sentinel():
         text="こんにちは",
         duration_s=1.2,
         align_text_empty=False,
-        asr_dropped_uncertain=False,
+        asr_review_uncertain=False,
         alignment_mode="forced_aligner",
         sentinel_lines=["Alignment 哨兵触发: 时间轴异常"],
         aligned_segment_count=1,
@@ -49,7 +49,7 @@ def test_classifies_vad_and_proportional_fallbacks():
         text="こんにちは",
         duration_s=1.2,
         align_text_empty=False,
-        asr_dropped_uncertain=False,
+        asr_review_uncertain=False,
         alignment_mode="aligner_vad_fallback",
         aligned_segment_count=1,
     )
@@ -57,7 +57,7 @@ def test_classifies_vad_and_proportional_fallbacks():
         text="こんにちは",
         duration_s=1.2,
         align_text_empty=False,
-        asr_dropped_uncertain=False,
+        asr_review_uncertain=False,
         alignment_mode="even_fallback",
         aligned_segment_count=1,
     )
@@ -75,7 +75,7 @@ def test_review_overrides_fallback_quality_for_unalignable_text():
         text="~~~♡!!!",
         duration_s=1.2,
         align_text_empty=True,
-        asr_dropped_uncertain=False,
+        asr_review_uncertain=False,
         alignment_mode="even_fallback",
         aligned_segment_count=0,
     )
@@ -95,7 +95,7 @@ def test_nonlexical_empty_align_text_is_coarse_not_review():
         duration_s=3.0,
         align_text_empty=True,
         nonlexical_text=True,
-        asr_dropped_uncertain=False,
+        asr_review_uncertain=False,
         alignment_mode="nonlexical",
         aligned_segment_count=1,
     )

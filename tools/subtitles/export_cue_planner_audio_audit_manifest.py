@@ -84,9 +84,8 @@ def export_manifest(
         right = str(item.get("right_ja") or "").strip()
         merged = str(item.get("merged_ja") or "").strip()
         risk = str(item.get("risk_tags") or "").strip() or "no_risk_tag"
-        speaker = item.get("speaker_change_score")
         display = (
-            f"{dataset_id} #{index} / priority {item.get('review_priority', '')} / speaker {speaker}\n"
+            f"{dataset_id} #{index} / priority {item.get('review_priority', '')}\n"
             f"risk: {risk}\n\n"
             f"left: {left}\n"
             f"right: {right}\n\n"
@@ -112,10 +111,9 @@ def export_manifest(
                 "left_ja": left,
                 "right_ja": right,
                 "merged_ja": merged,
-                "audit_reason": f"{dataset_id} extra merge versus baseline; review speaker/change/readability/fallback risk",
+                "audit_reason": f"{dataset_id} extra merge versus baseline; review readability/fallback/timing risk",
                 "case_label": f"{item.get('timeline_start', '')} - {item.get('timeline_end', '')}",
                 "score": item.get("score"),
-                "speaker_change_score": speaker,
                 "risk_tags": risk,
                 "manual_label": "",
                 "manual_text": "",

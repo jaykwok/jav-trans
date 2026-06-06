@@ -39,7 +39,6 @@ export async function loadConfig() {
 
     const d = cfg.defaults ?? {};
     if (d.translation_max_workers   != null) $('t-translation-max-workers').value = d.translation_max_workers;
-    if (d.multi_cue_split           != null) $('t-multi-cue-split').checked       = !!d.multi_cue_split;
     if (d.skip_translation          != null) $('r-skip-translation').checked      = !!d.skip_translation;
     applyFormMemory();
     setActivePreset(state.activePreset);

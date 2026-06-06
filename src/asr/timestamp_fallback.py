@@ -93,9 +93,9 @@ def build_word_timestamps_fallback(
         meta["speech_span_count"] = len(speech_spans)
         meta["vad_error"] = vad_error
         spans = [
-            (max(start, start + span_start), min(clipped_end, start + span_end))
+            (max(start, span_start), min(clipped_end, span_end))
             for span_start, span_end in speech_spans
-            if start + span_end > start + span_start
+            if span_end > span_start and span_end > start and span_start < clipped_end
         ]
         spans = _merge_spans(spans)
 

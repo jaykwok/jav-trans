@@ -17,7 +17,6 @@ def format_timestamp(seconds: float) -> str:
     return f"{hours:02d}:{minutes:02d}:{secs:02d},{millis:03d}"
 
 
-_MIN_DUR_FOR_GENDER_GUARD = 0.5
 _COMPACT_SPACE_RE = re.compile(r"\s+")
 _WRAP_PUNCTUATION = "，、。！？…"
 _SENTENCE_END_PUNCTUATION = "。！？…"
@@ -205,20 +204,6 @@ def _wrap_subtitle_text(
     )
 
 
-def _subtitle_prefix(
-    block: dict,
-    *,
-    options: SubtitleOptions | None = None,
-) -> str:
-    options = _coerce_options(options)
-    show_speaker = options.show_speaker
-    speaker = block.get("speaker")
-    if show_speaker and speaker is not None:
-        s = str(speaker)
-        return f"[{s}] " if s.upper().startswith("S") else f"[S{s}] "
-    return ""
-
-
 def _word_text(word: dict) -> str:
     return str(word.get("word") or word.get("text") or "")
 
@@ -277,12 +262,6 @@ def _block_text_units(block: dict) -> float:
     )
 
 
-def _same_speaker_or_unknown(left: dict, right: dict) -> bool:
-    left_speaker = left.get("speaker")
-    right_speaker = right.get("speaker")
-    return left_speaker is None or right_speaker is None or left_speaker == right_speaker
-
-
 def _text_overlap_len(left: str, right: str, *, min_overlap: int = 2) -> int:
     left_compact = _COMPACT_SPACE_RE.sub("", left or "")
     right_compact = _COMPACT_SPACE_RE.sub("", right or "")
@@ -293,20 +272,6 @@ def _text_overlap_len(left: str, right: str, *, min_overlap: int = 2) -> int:
     return 0
 
 
-def _drop_compact_prefix(text: str, compact_len: int) -> str:
-    if compact_len <= 0:
-        return text
-
-    consumed = 0
-    for index, char in enumerate(text):
-        if char.isspace():
-            continue
-        consumed += 1
-        if consumed >= compact_len:
-            return text[index + 1 :].lstrip()
-    return ""
-
-
 def _merge_text_with_overlap(left: str, right: str, *, separator: str) -> str:
     left = (left or "").strip()
     right = (right or "").strip()
@@ -314,9 +279,6 @@ def _merge_text_with_overlap(left: str, right: str, *, separator: str) -> str:
         return right
     if not right:
         return left
-    overlap = _text_overlap_len(left, right)
-    if overlap:
-        return left + _drop_compact_prefix(right, overlap)
     return separator.join((left, right))
 
 
@@ -352,8 +314,7 @@ def _can_merge_overlapping_blocks(
     max_duration = options.max_duration if options.max_duration > 0 else end - start
     max_chars = options.line_max_chars if options.line_max_chars > 0 else 25
     return (
-        _same_speaker_or_unknown(left, right)
-        and end - start <= max_duration
+        end - start <= max_duration
         and _block_text_units(left) + _block_text_units(right) <= max_chars * 2.4
     )
 
@@ -386,10 +347,6 @@ def _merge_overlapping_blocks(left: dict, right: dict) -> dict:
                 source_ids.append(source_id)
     if source_ids:
         merged["source_segment_ids"] = source_ids
-    if left.get("speaker") != right.get("speaker"):
-        merged.pop("speaker", None)
-    if left.get("gender") != right.get("gender"):
-        merged["gender"] = None
     return merged
 
 
@@ -400,8 +357,6 @@ def _can_dense_merge_blocks(
     options: SubtitleOptions,
 ) -> bool:
     if not options.dense_cue_merge_enabled:
-        return False
-    if not _same_speaker_or_unknown(left, right):
         return False
 
     left_start = float(left.get("start", 0.0))
@@ -446,7 +401,7 @@ def _merge_dense_short_cues(
     options: SubtitleOptions | None = None,
 ) -> list[dict]:
     options = _coerce_options(options)
-    if not options.dense_cue_merge_enabled or len(blocks) < 2:
+    if not options.merge_adjacent or not options.dense_cue_merge_enabled or len(blocks) < 2:
         return list(blocks)
 
     merged: list[dict] = []
@@ -581,6 +536,13 @@ def _prepare_subtitle_blocks(
     # Reading-duration expansion can push a cue back into the next cue window.
     # Keep this final pass as the hard no-overlap, frame-gap guard for the cue plan.
     prepared = _normalize_subtitle_timeline(prepared, options=options)
+    if merge_adjacent:
+        # Timing polish intentionally collapses very short display gaps to the
+        # frame gap. A final bounded merge pass prevents those polished micro
+        # cues from surviving only because the first merge pass ran on raw
+        # alignment gaps.
+        prepared = _merge_adjacent_short_blocks(prepared, options=options)
+        prepared = _normalize_subtitle_timeline(prepared, options=options)
     return prepared
 
 
@@ -591,10 +553,12 @@ def prepare_srt_blocks(
     mode: Literal["srt", "bilingual"] = "srt",
 ) -> list[dict]:
     """Return the stable cue plan to translate and write as SRT."""
+    options = _coerce_options(options)
+    del mode
     return _prepare_subtitle_blocks(
         blocks,
         options=options,
-        merge_adjacent=(mode == "bilingual"),
+        merge_adjacent=options.merge_adjacent,
     )
 
 
@@ -870,7 +834,7 @@ def _soft_split_subtitle_block(
             block_end,
             options=options,
         )
-    if candidate is None and exceeds_soft_limit and block.get("gender") is None:
+    if candidate is None and exceeds_soft_limit:
         candidate = _hard_word_split_candidate(
             words,
             block_start,
@@ -918,7 +882,7 @@ def write_srt(
 ):
     """
     blocks: [{start, end, zh_text}]
-    zh_text may contain \\n to separate multiple speakers within one subtitle block.
+    zh_text may contain \\n to preserve manual line breaks within one subtitle block.
     """
     options = _coerce_options(options)
     blocks = [dict(block) for block in blocks]
@@ -931,14 +895,7 @@ def write_srt(
 
             start_str = format_timestamp(start)
             end_str   = format_timestamp(end)
-            wrapped = _wrap_subtitle_text(
-                _subtitle_prefix(
-                    block,
-                    options=options,
-                )
-                + block.get("zh_text", ""),
-                options=options,
-            )
+            wrapped = _wrap_subtitle_text(block.get("zh_text", ""), options=options)
             f.write(f"{idx}\n{start_str} --> {end_str}\n{wrapped}\n\n")
     return blocks
 
@@ -989,25 +946,6 @@ def _merge_adjacent_short_blocks(
                 options=options,
             )
 
-            # Speaker-aware merge guard: never merge across speaker boundaries
-            if (
-                current.get("speaker") is not None
-                and nxt.get("speaker") is not None
-                and current.get("speaker") != nxt.get("speaker")
-            ):
-                break
-
-            # Gender-aware merge guard (F0 ground truth; duration floor prevents short noise fragments)
-            if (
-                current.get("gender") is not None
-                and nxt.get("gender") is not None
-                and current.get("gender") != nxt.get("gender")
-                and (current.get("end", 0) - current.get("start", 0)) >= _MIN_DUR_FOR_GENDER_GUARD
-                and (nxt.get("end", 0) - nxt.get("start", 0)) >= _MIN_DUR_FOR_GENDER_GUARD
-                and not continuation_tail
-            ):
-                break
-
             if (
                 gap <= _frames_to_seconds(_ADJACENT_SHORT_MERGE_MAX_GAP_FRAMES, options)
                 and combined_chars <= max_chars * 2
@@ -1033,10 +971,6 @@ def _merge_adjacent_short_blocks(
                             source_ids.append(source_id)
                 if source_ids:
                     current["source_segment_ids"] = source_ids
-                if current.get("speaker") != nxt.get("speaker"):
-                    current.pop("speaker", None)
-                if current.get("gender") != nxt.get("gender"):
-                    current["gender"] = None
                 index += 1
                 continue
             break
@@ -1061,16 +995,12 @@ def write_bilingual_srt(
 
             start_str = format_timestamp(start)
             end_str   = format_timestamp(end)
-            prefix = _subtitle_prefix(
-                block,
-                options=options,
-            )
-            ja_line = _wrap_subtitle_text(prefix + block.get("ja_text", ""), options=options)
+            ja_line = _wrap_subtitle_text(block.get("ja_text", ""), options=options)
             zh_text = str(block.get("zh_text", "")).strip()
             if not zh_text:
                 logger.warning("Empty translated subtitle at index %s; using placeholder", idx)
                 zh_text = "「未翻译」"
-            zh_line = _wrap_subtitle_text(prefix + zh_text, options=options)
+            zh_line = _wrap_subtitle_text(zh_text, options=options)
             content = "\n".join(
                 line for line in (ja_line + "\n" + zh_line).split("\n") if line.strip()
             )

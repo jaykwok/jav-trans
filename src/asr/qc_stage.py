@@ -1,20 +1,17 @@
 import time
 from typing import Callable
 
-from asr.backends.base import BaseAsrBackend
 from asr.qc import (
     asr_qc_enabled,
     evaluate_asr_text_results_qc,
     format_qc_log_items,
 )
 from asr.transcribe import (
-    _is_context_leak,
     _is_low_value_text,
 )
 
 
 def _run_TRANSCRIPTION_qc(
-    backend: BaseAsrBackend,
     chunks: list[dict],
     text_results: list[dict],
     log: list[str],
@@ -31,6 +28,8 @@ def _run_TRANSCRIPTION_qc(
             "timeout_count": 0,
             "quarantined_count": 0,
             "empty_text_for_speech_count": 0,
+            "review_uncertain_count": 0,
+            "review_uncertain_items": [],
             "items": [],
             "rejected_indices": [],
         }, {"asr_qc_s": 0.0}
@@ -43,14 +42,11 @@ def _run_TRANSCRIPTION_qc(
         chunks,
         text_results,
         is_low_value_text=_is_low_value_text,
-        is_context_leak=_is_context_leak,
-        backend=backend,
     )
     qc_elapsed = time.perf_counter() - qc_started
 
     log.append(
-        "[qc] context_leak_check={context} repetition_check={repetition} threshold={threshold}".format(
-            context=qc_report.get("context_leak_check", "on"),
+        "[qc] repetition_check={repetition} threshold={threshold}".format(
             repetition=qc_report.get("repetition_check", "on"),
             threshold=qc_report.get("repetition_threshold", 10),
         )

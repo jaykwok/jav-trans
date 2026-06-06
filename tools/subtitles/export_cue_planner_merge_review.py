@@ -75,9 +75,6 @@ def write_csv(path: Path, rows: list[dict[str, Any]]) -> None:
         "combined_duration_s",
         "combined_text_units",
         "combined_reading_units_per_s",
-        "speaker_change_score",
-        "speaker_threshold",
-        "speaker_change",
         "crosses_chunk",
         "risky_chunks",
         "warn_chunks",
@@ -128,17 +125,7 @@ def _time_label(seconds: float) -> str:
 def _risk_tags(action: dict[str, Any], *, reading_warn_units_per_s: float) -> list[str]:
     tags: list[str] = []
     annotations = action.get("annotations") if isinstance(action.get("annotations"), dict) else {}
-    speaker = annotations.get("speaker_pair") if isinstance(annotations.get("speaker_pair"), dict) else {}
     diagnostics = annotations.get("diagnostics") if isinstance(annotations.get("diagnostics"), dict) else {}
-
-    score = _as_float(speaker.get("speaker_change_score"))
-    threshold = _as_float(speaker.get("threshold"))
-    if speaker.get("speaker_change"):
-        tags.append("speaker_change")
-    elif threshold > 0 and score >= threshold * 0.9:
-        tags.append("near_speaker_threshold")
-    elif score >= 0.8:
-        tags.append("high_speaker_score")
 
     if diagnostics.get("risky_chunks"):
         tags.append("fallback_risk")
@@ -160,10 +147,7 @@ def _risk_tags(action: dict[str, Any], *, reading_warn_units_per_s: float) -> li
 
 def _review_priority(tags: list[str]) -> int:
     weights = {
-        "speaker_change": 120,
         "fallback_risk": 90,
-        "near_speaker_threshold": 55,
-        "high_speaker_score": 40,
         "crosses_chunk": 35,
         "fallback_warn": 25,
         "reading_density_high": 20,
@@ -197,7 +181,6 @@ def build_review_rows(
         reading = _reading_units_per_s(combined_units, combined_duration)
 
         annotations = action.get("annotations") if isinstance(action.get("annotations"), dict) else {}
-        speaker = annotations.get("speaker_pair") if isinstance(annotations.get("speaker_pair"), dict) else {}
         diagnostics = annotations.get("diagnostics") if isinstance(annotations.get("diagnostics"), dict) else {}
 
         enriched_action = {
@@ -221,9 +204,6 @@ def build_review_rows(
                 "combined_duration_s": round(combined_duration, 6),
                 "combined_text_units": round(combined_units, 3),
                 "combined_reading_units_per_s": round(reading, 3),
-                "speaker_change_score": speaker.get("speaker_change_score"),
-                "speaker_threshold": speaker.get("threshold"),
-                "speaker_change": bool(speaker.get("speaker_change")),
                 "crosses_chunk": bool(diagnostics.get("crosses_chunk")),
                 "risky_chunks": ",".join(str(v) for v in diagnostics.get("risky_chunks") or []),
                 "warn_chunks": ",".join(str(v) for v in diagnostics.get("warn_chunks") or []),
@@ -267,19 +247,18 @@ def build_markdown(summary: dict[str, Any], rows: list[dict[str, Any]], *, top_n
             "",
             f"## Top {min(top_n, len(rows))}",
             "",
-            "| rank | time | priority | score | speaker | risk | left | right |",
-            "|---:|---|---:|---:|---:|---|---|---|",
+            "| rank | time | priority | score | risk | left | right |",
+            "|---:|---|---:|---:|---|---|---|",
         ]
     )
     for row in rows[:top_n]:
         lines.append(
-            "| {rank} | {start}-{end} | {priority} | {score:.3f} | {speaker} | {risk} | {left} | {right} |".format(
+            "| {rank} | {start}-{end} | {priority} | {score:.3f} | {risk} | {left} | {right} |".format(
                 rank=row["priority_rank"],
                 start=row["timeline_start"],
                 end=row["timeline_end"],
                 priority=row["review_priority"],
                 score=row["score"],
-                speaker=row["speaker_change_score"] if row["speaker_change_score"] is not None else "",
                 risk=row["risk_tags"] or "-",
                 left=str(row["left_ja"]).replace("|", " "),
                 right=str(row["right_ja"]).replace("|", " "),

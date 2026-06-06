@@ -43,7 +43,7 @@ class PackedChunk:
 
 @dataclass(frozen=True)
 class PackingLayoutConfig:
-    max_chunk_s: float = 30.0
+    max_padded_chunk_s: float = 9.0
     target_padding_s: float = 2.0
 
 
@@ -51,8 +51,9 @@ def pack_speech_segments(
     segments: Sequence[SpeechSegment],
     *,
     frame_hop_s: float = 1.0 / 29.97,
-    max_chunk_s: float = 30.0,
-    target_chunk_s: float = 9.0,
+    max_core_chunk_s: float = 5.0,
+    max_padded_chunk_s: float = 9.0,
+    target_chunk_s: float = 3.0,
     min_chunk_s: float = 0.4,
     target_padding_s: float = 2.0,
     start_weight: float = 1.5,
@@ -86,7 +87,7 @@ def pack_speech_segments(
     )
     planner_config = BoundaryPlannerConfig(
         frame_hop_s=frame_hop_s,
-        max_chunk_s=max_chunk_s,
+        max_core_chunk_s=max_core_chunk_s,
         target_chunk_s=target_chunk_s,
         min_chunk_s=min_chunk_s,
         start_weight=start_weight,
@@ -109,7 +110,7 @@ def pack_speech_segments(
         sequence_feature_provider=sequence_feature_provider,
     )
     layout = PackingLayoutConfig(
-        max_chunk_s=max_chunk_s,
+        max_padded_chunk_s=max_padded_chunk_s,
         target_padding_s=target_padding_s,
     )
     return _materialize_packed_chunks(planned, layout=layout)
@@ -149,7 +150,7 @@ def _make_chunk(
     core_start = islands[0].start
     core_end = islands[-1].end
     core_duration = max(0.0, core_end - core_start)
-    remaining = max(0.0, layout.max_chunk_s - core_duration)
+    remaining = max(0.0, layout.max_padded_chunk_s - core_duration)
     target = min(layout.target_padding_s, remaining / 2.0)
 
     if islands[0].split_left:

@@ -99,6 +99,28 @@ def load_segments(path: Path | None) -> list[dict[str, Any]]:
     return [dict(segment) for segment in segments if isinstance(segment, dict)]
 
 
+def blocks_from_segments(segments: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    blocks: list[dict[str, Any]] = []
+    for index, segment in enumerate(segments):
+        try:
+            start = float(segment["start"])
+            end = float(segment["end"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        text = str(segment.get("text") or segment.get("ja_text") or "").strip()
+        block = {
+            "start": start,
+            "end": max(start, end),
+            "ja_text": text,
+            "zh_text": text,
+            "text": text,
+            "words": list(segment.get("words") or []),
+            "source_segment_ids": list(segment.get("source_segment_ids") or [index]),
+        }
+        blocks.append(block)
+    return blocks
+
+
 def load_asr_qc(path: Path | None) -> dict[str, Any]:
     if path is None or not path.exists():
         return {}
@@ -220,10 +242,11 @@ def replay_blocks(
     *,
     dense_enabled: bool,
     video_fps: float,
+    mode: str,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     with temp_env({"SUBTITLE_DENSE_CUE_MERGE_ENABLED": "1" if dense_enabled else "0"}):
         options = SubtitleOptions.from_env().with_video_fps(video_fps)
-        prepared = prepare_srt_blocks(source_blocks, options=options, mode="bilingual")
+        prepared = prepare_srt_blocks(source_blocks, options=options, mode=mode)
         return prepared, options.signature()
 
 
@@ -268,9 +291,16 @@ def build_summary(
     timings_path: Path | None,
     video_fps: float,
     output_dir: Path,
+    mode: str = "bilingual",
+    source: str = "blocks",
 ) -> dict[str, Any]:
-    source_blocks = load_blocks(bilingual_path)
     aligned_segments = load_segments(aligned_path)
+    if source == "aligned":
+        if not aligned_segments:
+            raise ValueError("--source aligned requires --aligned with segments")
+        source_blocks = blocks_from_segments(aligned_segments)
+    else:
+        source_blocks = load_blocks(bilingual_path)
     asr_qc = load_asr_qc(timings_path)
     video_duration_s = estimate_duration(source_blocks)
     total_segments = len(aligned_segments) or len(source_blocks)
@@ -279,11 +309,13 @@ def build_summary(
         source_blocks,
         dense_enabled=False,
         video_fps=video_fps,
+        mode=mode,
     )
     after_blocks, after_options = replay_blocks(
         source_blocks,
         dense_enabled=True,
         video_fps=video_fps,
+        mode=mode,
     )
     before = summarize_blocks(
         before_blocks,
@@ -301,6 +333,8 @@ def build_summary(
         "source_bilingual": project_rel(bilingual_path),
         "source_aligned": project_rel(aligned_path),
         "source_timings": project_rel(timings_path),
+        "mode": mode,
+        "source": source,
         "video_duration_s": video_duration_s,
         "video_fps": video_fps,
         "before_options": before_options,
@@ -353,6 +387,8 @@ def main(argv: list[str] | None = None) -> int:
         default="agents/temp/speech-boundary-ja/subtitle-postprocess-replay",
     )
     parser.add_argument("--video-fps", type=float, default=30000 / 1001)
+    parser.add_argument("--mode", choices=("srt", "bilingual"), default="bilingual")
+    parser.add_argument("--source", choices=("blocks", "aligned"), default="blocks")
     args = parser.parse_args(argv)
 
     output_dir = project_path(args.output_dir)
@@ -364,6 +400,8 @@ def main(argv: list[str] | None = None) -> int:
             timings_path=project_path(args.timings) if args.timings else None,
             video_fps=float(args.video_fps),
             output_dir=output_dir,
+            mode=args.mode,
+            source=args.source,
         )
     write_json(output_dir / "summary.json", summary)
     (output_dir / "summary.md").write_text(build_markdown(summary), encoding="utf-8")

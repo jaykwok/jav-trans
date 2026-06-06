@@ -72,12 +72,17 @@ DEFAULT_SETTINGS: dict[str, str] = {
     "ASR_HEAD_CONTEXT_MAX_START_S": "16",
 
     # --- Batch Size & Limits ---
-    # ASR inference batch size; keep low on 8GB VRAM.
-    "ASR_BATCH_SIZE": "1",
-    # Forced-alignment batch size.
-    "ALIGNER_BATCH_SIZE": "4",
-    # Forced-alignment batch size used when ASR chunk packing is enabled.
-    "ALIGN_LONG_CHUNK_BATCH_SIZE": "1",
+    # ASR inference batch size. auto resolves by ASR_BACKEND repo id:
+    # 0.6B -> 48, 1.7B -> 12. Set a number to override.
+    "ASR_BATCH_SIZE": "auto",
+    "ASR_BATCH_SIZE_BY_REPO": (
+        "jaykwok/Qwen3-ASR-0.6B-JA-Anime-Galgame=48,"
+        "jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame=12"
+    ),
+    # Forced-alignment outer batch size.
+    "ALIGNER_BATCH_SIZE": "48",
+    # Real Qwen forced-aligner batch size for chunk alignment.
+    "ALIGN_LONG_CHUNK_BATCH_SIZE": "48",
     # Max generated tokens per ASR chunk.
     "ASR_MAX_NEW_TOKENS": "128",
     # Subprocess transcription token cap; usually matches ASR_MAX_NEW_TOKENS.
@@ -114,8 +119,11 @@ DEFAULT_SETTINGS: dict[str, str] = {
     "BOUNDARY_FRAME_SEQUENCE_RIGHT_CONTEXT_S": "0.60",
     "BOUNDARY_FRAME_SEQUENCE_MAX_PTM_DIMS": "64",
     "BOUNDARY_FRAME_SEQUENCE_INCLUDE_MFCC": "1",
-    "BOUNDARY_PLANNER_MAX_CHUNK_S": "30.0",
-    "BOUNDARY_PLANNER_TARGET_CHUNK_S": "9.0",
+    # Speech core is the subtitle/fallback timing window. Keep it short for JAV dialogue.
+    "BOUNDARY_PLANNER_MAX_CORE_CHUNK_S": "5.0",
+    # Padded ASR input may be longer to preserve recognition context.
+    "BOUNDARY_PLANNER_MAX_PADDED_CHUNK_S": "9.0",
+    "BOUNDARY_PLANNER_TARGET_CHUNK_S": "3.0",
     "BOUNDARY_PLANNER_MIN_CHUNK_S": "0.4",
     "BOUNDARY_PLANNER_START_WEIGHT": "1.5",
     "BOUNDARY_PLANNER_TARGET_PADDING_S": "2.0",
@@ -130,13 +138,6 @@ DEFAULT_SETTINGS: dict[str, str] = {
     # 1 stores SpeechBoundary frame scores in the SpeechBoundary result. Boundary Refiner enables
     # this at runtime even when this explicit diagnostics flag stays off.
     "SPEECH_BOUNDARY_JA_EXPORT_FRAME_SCORES": "0",
-    # 1 enables dropping very short low-energy spans before ASR (opt-in).
-    "BOUNDARY_DROP_LOW_ENERGY_ENABLED": "0",
-    # Spans shorter than this value (seconds) are candidates for dropping.
-    "BOUNDARY_DROP_LOW_ENERGY_MIN_DURATION_S": "0.20",
-    # Spans with RMS energy below this dBFS level are candidates for dropping.
-    # Both duration and energy thresholds must be met (AND logic).
-    "BOUNDARY_DROP_LOW_ENERGY_RMS_DBFS": "-40.0",
     # 1 caches SpeechBoundary frame score -> Boundary Planner outputs separately from ASR generation settings.
     "BOUNDARY_CACHE_ENABLED": "1",
     # Persistent boundary cache directory. Versioned as boundary-cache v1.
@@ -153,8 +154,6 @@ DEFAULT_SETTINGS: dict[str, str] = {
     "ALIGNMENT_STEP_DOWN_CHUNK": "6.0",
 
     # --- ASR Post-Processing ---
-    # Similarity threshold for removing prompt/context leakage from ASR output.
-    "ASR_CONTEXT_LEAK_SIMILARITY": "0.88",
     # Max gap, in seconds, for merging adjacent ASR fragments.
     "ASR_FRAGMENT_MERGE_MAX_GAP": "1.0",
     # Max combined text length after fragment merging.
@@ -164,12 +163,10 @@ DEFAULT_SETTINGS: dict[str, str] = {
     # Hard cap for merging ASR fragments into one subtitle candidate.
     "ASR_MERGE_HARD_MAX_DURATION": "9.0",
 
-    # --- ASR QC / Conservative Filtering ---
+    # --- ASR QC / Review Signals ---
     # 1 enables ASR text quality checks before translation.
     "ASR_QC_ENABLED": "1",
-    # 1 allows QC to clear high-risk ASR text. Default 0 keeps QC diagnostic-only.
-    "ASR_QC_DROP_UNCERTAIN": "0",
-    # Adaptive precision drops high-risk ASR chunks while relaxing low-logprob true dialogue.
+    # Adaptive precision flags high-risk ASR chunks for review; it does not delete text.
     "ASR_QC_ADAPTIVE_BASE_LOGPROB": "-0.7",
     "ASR_QC_ADAPTIVE_MIN_LOGPROB": "-0.95",
     "ASR_QC_ADAPTIVE_MAX_LOGPROB": "-0.55",
@@ -257,49 +254,8 @@ DEFAULT_SETTINGS: dict[str, str] = {
     # Maximum ASR generation overflow failures before quality report warning.
     "QC_MAX_ASR_GENERATION_OVERFLOWS": "0",
 
-    # --- Speaker Diarization ---
-    # 1 enables experimental speaker clustering.
-    "EXPERIMENTAL_SPEAKER_DIARIZATION": "0",
-    # SpeechBrain speaker embedding model.
-    "SPEAKER_MODEL": "speechbrain/spkrec-ecapa-voxceleb",
-    # Minimum segment duration for speaker embedding.
-    "SPEAKER_MIN_DURATION": "0.5",
-    # Agglomerative clustering distance threshold.
-    "SPEAKER_CLUSTER_THRESHOLD": "0.5",
-    # Maximum detected speaker clusters.
-    "SPEAKER_MAX_CLUSTERS": "5",
-    # 1 prefixes subtitles with speaker labels such as [S0].
-    "SUBTITLE_SHOW_SPEAKER": "0",
-
-    # --- F0 Gender Detection ---
-    # 1 enables gender-aware word-level cue splitting; 0 disables gender splitting.
-    "MULTI_CUE_SPLIT_ENABLED": "1",
-    # 1 documents/enables F0 processing after forced alignment word timestamps.
-    "F0_GENDER_POST_ALIGNMENT": "0",
-    # Consecutive unknown-gender words needed to form a separate None group.
-    "F0_GENDER_NONE_TOLERANCE": "3",
-    # 1 lets short unknown-gender segments inherit gender from matching nearby anchors.
-    "F0_GENDER_CARRYOVER_ENABLED": "1",
-    # Max left-anchor-end to right-anchor-start gap for None segment carry-over.
-    "F0_GENDER_CARRYOVER_MAX_GAP_S": "15.0",
-    # Max duration of a None segment eligible for gender carry-over.
-    "F0_GENDER_CARRYOVER_MAX_SEGMENT_S": "12.0",
-    # Minimum duration for gender-turn split pieces.
-    "SUBTITLE_MIN_DURATION_GENDER_TURN": "0.4",
     # 1 preserves word timestamps in final output artifacts.
     "KEEP_WORD_TIMESTAMPS": "0",
-    # Median F0 threshold; below is treated as male, above/equal as female.
-    "F0_THRESHOLD_HZ": "160",
-    # High unvoiced/invalid F0 ratio marks gender as unknown.
-    "F0_NAN_RATIO_THRESHOLD": "0.6",
-    # pYIN word-level analysis window size in milliseconds.
-    "F0_WORD_WINDOW_MS": "300",
-    # RMS gate threshold in dB; lower-energy frames are excluded from gender.
-    "F0_RMS_GATE_DB": "-45.0",
-    # Minimum word-level gender span duration in milliseconds.
-    "F0_WORD_MIN_SPAN_MS": "500",
-    # 1 removes segments whose F0 gender is unknown before translation/SRT output.
-    "F0_FILTER_NONE_SEGMENTS": "0",
 
     # --- Debug / Advanced ---
     # Test-only crash injection for translation resume tests.

@@ -19,7 +19,7 @@ from testset_quality_eval import (
 
 def test_clean_subtitle_text_strips_tags_and_newlines():
     assert clean_subtitle_text(r"{\fad(1,2)}你好\N世界{\pos(1,2)}") == "你好\n世界"
-    assert normalize_eval_text("[F] 你，好！") == "你好"
+    assert normalize_eval_text("你，好！") == "你好"
 
 
 def test_parse_ass_reference_segments_filters_staff_and_styles(tmp_path):

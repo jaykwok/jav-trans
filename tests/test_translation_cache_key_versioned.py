@@ -64,13 +64,13 @@ def test_translation_cache_key_changes_with_timing():
     assert first != second
 
 
-def test_translation_cache_key_changes_with_gender():
+def test_translation_cache_key_ignores_non_timing_metadata():
     first = translator._translation_cache_key(0, _segments(), glossary="")
     changed = [
-        {"start": 0.0, "end": 1.0, "text": "いい", "gender": "F"},
+        {"start": 0.0, "end": 1.0, "text": "いい", "source_note": "ignored"},
         {"start": 1.0, "end": 2.0, "text": "もっと"},
     ]
     second = translator._translation_cache_key(0, changed, glossary="")
 
-    assert first != second
+    assert first == second
 

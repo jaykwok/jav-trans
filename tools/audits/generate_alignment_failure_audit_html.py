@@ -467,7 +467,7 @@ textarea {{ min-height: 84px; resize: vertical; }}
 
     <section class="panel" id="suggestedPanel">
       <h3>去重建议文本（去重后）</h3>
-      <p class="hint">仅作人工审计参考；选择“采用去重建议”时才写入人工修订。</p>
+      <p class="hint">仅作人工审计参考；重复建议不会自动改写最终字幕。</p>
       <div class="text-box suggested" id="suggestedText"></div>
     </section>
 
@@ -499,7 +499,7 @@ const LABELS = [
   ["left_keep_text", "上句可用", "left / 上方字幕文本可用"],
   ["right_keep_text", "下句可用", "right / 下方字幕文本可用"],
   ["timing_accurate", "时间轴准确", "字幕起止和语音基本贴合"],
-  ["use_suggested_text", "采用去重建议", "页面下方有建议文本时可选：用系统建议的去重/截断文本替代原文本"],
+  ["review_repetition_suggestion", "重复建议需复核", "页面下方有建议文本时可选：标记该重复建议值得人工复核"],
   ["drop_non_speech", "删除/无字幕价值", "纯噪声、BGM、静音、机械声等不应生成字幕的片段"],
   ["left_drop_non_speech", "上句无字幕价值", "left / 上方字幕是纯噪声、BGM、静音、机械声等不应保留内容"],
   ["right_drop_non_speech", "下句无字幕价值", "right / 下方字幕是纯噪声、BGM、静音、机械声等不应保留内容"],
@@ -563,7 +563,7 @@ function ann(row = CANDIDATES[currentIndex]) {{
 }}
 
 function primaryLabel(labels) {{
-  const priority = ["drop_non_speech", "bad_asr", "needs_split", "needs_realign", "left_bad_asr", "right_bad_asr", "left_drop_non_speech", "right_drop_non_speech", "use_suggested_text", "low_info_vocal", "left_low_info_vocal", "right_low_info_vocal", "timing_accurate", "coarse_timing_ok", "keep_text", "left_keep_text", "right_keep_text", "uncertain"];
+  const priority = ["drop_non_speech", "bad_asr", "needs_split", "needs_realign", "left_bad_asr", "right_bad_asr", "left_drop_non_speech", "right_drop_non_speech", "review_repetition_suggestion", "low_info_vocal", "left_low_info_vocal", "right_low_info_vocal", "timing_accurate", "coarse_timing_ok", "keep_text", "left_keep_text", "right_keep_text", "uncertain"];
   for (const value of priority) {{
     if ((labels || []).includes(value)) return value;
   }}
@@ -683,7 +683,7 @@ function renderLabels() {{
     button.className = active ? "active" : "";
     button.textContent = label;
     button.title = title;
-    if (value === "use_suggested_text" && !row.repetition_suggested_text) {{
+    if (value === "review_repetition_suggestion" && !row.repetition_suggested_text) {{
       button.disabled = true;
       button.title = "当前条目没有系统去重建议";
     }}
@@ -696,10 +696,6 @@ function renderLabels() {{
       current.manual_labels = Array.from(new Set(nextLabels));
       current.manual_label = primaryLabel(current.manual_labels);
       current.reviewed = true;
-      if (value === "use_suggested_text" && !current.manual_text) {{
-        current.manual_text = row.repetition_suggested_text || row.display_text || "";
-        document.getElementById("manualText").value = current.manual_text;
-      }}
       persist();
       renderLabels();
     }});
@@ -1155,7 +1151,7 @@ textarea { width: 100%; border: 1px solid var(--line); border-radius: 6px; paddi
 
     <section class="panel" id="suggestedPanel">
       <h3>去重建议文本（去重后）</h3>
-      <p class="hint">仅作人工审计参考；选择“采用去重建议”时才写入人工修订。</p>
+      <p class="hint">仅作人工审计参考；重复建议不会自动改写最终字幕。</p>
       <div class="text-box suggested" id="suggestedText"></div>
     </section>
 
@@ -1187,7 +1183,7 @@ const LABELS = [
   ["left_keep_text", "上句可用", "left / 上方字幕文本可用"],
   ["right_keep_text", "下句可用", "right / 下方字幕文本可用"],
   ["timing_accurate", "时间轴准确", "字幕起止和语音基本贴合"],
-  ["use_suggested_text", "采用去重建议", "页面下方有建议文本时可选：用系统建议的去重/截断文本替代原文本"],
+  ["review_repetition_suggestion", "重复建议需复核", "页面下方有建议文本时可选：标记该重复建议值得人工复核"],
   ["drop_non_speech", "删除/无字幕价值", "纯噪声、BGM、静音、机械声等不应生成字幕的片段"],
   ["left_drop_non_speech", "上句无字幕价值", "left / 上方字幕是纯噪声、BGM、静音、机械声等不应保留内容"],
   ["right_drop_non_speech", "下句无字幕价值", "right / 下方字幕是纯噪声、BGM、静音、机械声等不应保留内容"],
@@ -1254,7 +1250,7 @@ function ann(row = CANDIDATES[currentIndex]) {
 }
 
 function primaryLabel(labels) {
-  const priority = ["drop_non_speech", "bad_asr", "needs_split", "needs_realign", "left_bad_asr", "right_bad_asr", "left_drop_non_speech", "right_drop_non_speech", "use_suggested_text", "low_info_vocal", "left_low_info_vocal", "right_low_info_vocal", "timing_accurate", "coarse_timing_ok", "keep_text", "left_keep_text", "right_keep_text", "uncertain"];
+  const priority = ["drop_non_speech", "bad_asr", "needs_split", "needs_realign", "left_bad_asr", "right_bad_asr", "left_drop_non_speech", "right_drop_non_speech", "review_repetition_suggestion", "low_info_vocal", "left_low_info_vocal", "right_low_info_vocal", "timing_accurate", "coarse_timing_ok", "keep_text", "left_keep_text", "right_keep_text", "uncertain"];
   for (const value of priority) {
     if ((labels || []).includes(value)) return value;
   }
@@ -1375,7 +1371,7 @@ function renderLabels() {
     button.className = active ? "active" : "";
     button.textContent = label;
     button.title = title;
-    if (value === "use_suggested_text" && !row.repetition_suggested_text) {
+    if (value === "review_repetition_suggestion" && !row.repetition_suggested_text) {
       button.disabled = true;
       button.title = "当前条目没有系统去重建议";
     }
@@ -1388,10 +1384,6 @@ function renderLabels() {
       current.manual_labels = Array.from(new Set(nextLabels));
       current.manual_label = primaryLabel(current.manual_labels);
       current.reviewed = true;
-      if (value === "use_suggested_text" && !current.manual_text) {
-        current.manual_text = row.repetition_suggested_text || row.display_text || "";
-        document.getElementById("manualText").value = current.manual_text;
-      }
       persist();
       renderLabels();
     });

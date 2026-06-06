@@ -126,7 +126,7 @@ async def _test_config_lists_recommended_asr_backend_first(monkeypatch):
     assert payload["engine_defaults"]["asr_backend"] == config_routes.RECOMMENDED_ASR_BACKEND
     assert "translation_batch_size" not in payload["defaults"]
     assert payload["defaults"]["translation_max_workers"] == 4
-    assert "show_gender" not in payload["defaults"]
+    assert "show_speaker" not in payload["defaults"]
     assert set(payload["backends"]) == set(config_routes.BACKENDS)
 
 

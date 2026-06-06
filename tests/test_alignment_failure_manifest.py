@@ -115,7 +115,7 @@ def test_export_alignment_failure_manifest_cli(tmp_path):
                 "start": 1.0,
                 "end": 2.0,
                 "duration_s": 1.0,
-                "failure_bucket": "asr_dropped_uncertain",
+                "failure_bucket": "asr_review_uncertain",
                 "alignment_quality": "drop_or_review",
                 "fallback_type": "none",
                 "display_text": "んー",
@@ -155,7 +155,7 @@ def test_export_alignment_failure_manifest_cli(tmp_path):
     }
     assert summary["failure_bucket_counts"] == {
         "align_text_empty": 1,
-        "asr_dropped_uncertain": 1,
+        "asr_review_uncertain": 1,
         "repeat_repair_suggested": 1,
     }
 
@@ -279,7 +279,7 @@ def test_alignment_failure_audio_audit_has_sync_caption_preview(tmp_path):
     assert '"right_ja": "い"' in html
     assert "manual_labels" in html
     assert "时间轴准确" in html
-    assert "采用去重建议" in html
+    assert "重复建议需复核" in html
     assert "删除/无字幕价值" in html
     assert "低信息人声/呻吟" in html
     assert "上句可用" in html

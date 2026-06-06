@@ -52,17 +52,16 @@ def test_adaptive_precision_keeps_low_risk_low_logprob_dialogue():
 
     assert qc["verdict"] == "ok"
     assert qc["metrics"]["precision_policy"] == "adaptive"
-    assert qc["metrics"]["drop_uncertain_enabled"] is False
+    assert qc["metrics"]["review_uncertain_enabled"] is True
     assert qc["metrics"]["logprob_threshold"] < -0.84
     assert qc["metrics"]["adaptive"]["semantic_text_relax"] > 0
 
 
-def test_adaptive_precision_drop_uncertain_is_opt_in(monkeypatch):
-    monkeypatch.setenv("ASR_QC_DROP_UNCERTAIN", "1")
+def test_adaptive_precision_review_uncertain_is_always_on():
     qc = check_logprob_quality(
         {"avg_logprob": -0.3, "no_speech_prob": 0.1, "compression_ratio": 1.2}
     )
-    assert qc["metrics"]["drop_uncertain_enabled"] is True
+    assert qc["metrics"]["review_uncertain_enabled"] is True
 
 
 def test_adaptive_precision_hard_rejects_abnormal_density():

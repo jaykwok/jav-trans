@@ -182,7 +182,7 @@ def test_dense_short_cue_merge_reduces_micro_cues():
     ]
     options = SubtitleOptions(
         video_fps=29.97,
-        merge_adjacent=False,
+        merge_adjacent=True,
         dense_cue_merge_enabled=True,
         dense_cue_merge_max_gap_frames=4,
         dense_cue_merge_max_single_frames=24,
@@ -198,37 +198,112 @@ def test_dense_short_cue_merge_reduces_micro_cues():
     assert prepared[0]["end"] + options.frame_gap_s <= prepared[1]["start"]
 
 
-def test_dense_short_cue_merge_respects_known_speaker_change():
+def test_merge_adjacent_false_disables_dense_short_cue_merge():
     blocks = [
-        {"start": 0.0, "end": 0.35, "ja_text": "あ", "zh_text": "啊", "speaker": "S0"},
-        {"start": 0.42, "end": 0.80, "ja_text": "ん", "zh_text": "嗯", "speaker": "S1"},
+        {"start": 0.0, "end": 0.35, "ja_text": "あ", "zh_text": "啊"},
+        {"start": 0.42, "end": 0.80, "ja_text": "ん", "zh_text": "嗯"},
+    ]
+
+    prepared = subtitle.prepare_srt_blocks(
+        blocks,
+        options=SubtitleOptions(
+            video_fps=29.97,
+            merge_adjacent=False,
+            dense_cue_merge_enabled=True,
+        ),
+        mode="bilingual",
+    )
+
+    assert len(prepared) == 2
+
+
+def test_dense_short_cue_merge_ignores_acoustic_metadata_when_enabled():
+    blocks = [
+        {"start": 0.0, "end": 0.35, "ja_text": "あ", "zh_text": "啊"},
+        {"start": 0.42, "end": 0.80, "ja_text": "ん", "zh_text": "嗯"},
     ]
     options = SubtitleOptions(
         video_fps=29.97,
-        merge_adjacent=False,
+        merge_adjacent=True,
         dense_cue_merge_enabled=True,
     )
 
     prepared = subtitle.prepare_srt_blocks(blocks, options=options, mode="bilingual")
 
+    assert len(prepared) == 1
+
+
+def test_prepare_srt_blocks_uses_merge_adjacent_for_japanese_only():
+    blocks = [
+        {"start": 0.0, "end": 0.40, "ja_text": "あ", "zh_text": "あ"},
+        {"start": 0.46, "end": 0.90, "ja_text": "ん", "zh_text": "ん"},
+    ]
+
+    merged = subtitle.prepare_srt_blocks(
+        blocks,
+        options=SubtitleOptions(video_fps=29.97, merge_adjacent=True),
+        mode="srt",
+    )
+    unmerged = subtitle.prepare_srt_blocks(
+        blocks,
+        options=SubtitleOptions(video_fps=29.97, merge_adjacent=False),
+        mode="srt",
+    )
+
+    assert len(merged) == 1
+    assert merged[0]["ja_text"] == "あ ん"
+    assert len(unmerged) == 2
+
+
+def test_final_merge_pass_merges_after_timing_polish_collapses_gap():
+    blocks = [
+        {"start": 0.0, "end": 0.40, "ja_text": "あ", "zh_text": "あ"},
+        {"start": 0.90, "end": 1.30, "ja_text": "ん", "zh_text": "ん"},
+    ]
+    options = SubtitleOptions(
+        video_fps=25.0,
+        merge_adjacent=True,
+        timing_polish_enabled=True,
+        short_gap_collapse_s=0.5,
+    )
+
+    prepared = subtitle.prepare_srt_blocks(blocks, options=options, mode="srt")
+
+    assert len(prepared) == 1
+    assert prepared[0]["ja_text"] == "あ ん"
+
+
+def test_final_merge_pass_respects_merge_adjacent_switch():
+    blocks = [
+        {"start": 0.0, "end": 0.40, "ja_text": "あ", "zh_text": "あ"},
+        {"start": 0.90, "end": 1.30, "ja_text": "ん", "zh_text": "ん"},
+    ]
+    options = SubtitleOptions(
+        video_fps=25.0,
+        merge_adjacent=False,
+        timing_polish_enabled=True,
+        short_gap_collapse_s=0.5,
+    )
+
+    prepared = subtitle.prepare_srt_blocks(blocks, options=options, mode="srt")
+
     assert len(prepared) == 2
+    assert prepared[0]["end"] + options.frame_gap_s <= prepared[1]["start"]
 
 
-def test_prepare_srt_blocks_merges_same_speaker_overlap_when_too_tight():
+def test_prepare_srt_blocks_merges_overlap_when_too_tight():
     blocks = [
         {
             "start": 1.0,
             "end": 1.2,
             "ja_text": "あ",
             "zh_text": "甲",
-            "speaker": "S0",
         },
         {
             "start": 1.05,
             "end": 1.4,
             "ja_text": "い",
             "zh_text": "乙",
-            "speaker": "S0",
         },
     ]
 
@@ -394,7 +469,6 @@ def test_soft_split_recurses_until_hard_duration_is_respected(monkeypatch):
         "ja_text": "".join(word["word"] for word in words),
         "zh_text": "第一句。后续内容没有更多句末标点但仍然很长",
         "words": words,
-        "gender": "M",
     }
 
     options = SubtitleOptions(soft_split_enabled=True, soft_max=5.5, max_duration=6.5)
@@ -404,7 +478,7 @@ def test_soft_split_recurses_until_hard_duration_is_respected(monkeypatch):
     assert all(part["end"] - part["start"] <= 6.5 for part in split)
 
 
-def test_none_gender_over_soft_limit_gets_hard_split(monkeypatch):
+def test_over_soft_limit_gets_hard_split(monkeypatch):
     words = [_word(f"語{i}", i * 1.4, (i + 1) * 1.4) for i in range(5)]
     block = {
         "start": 0.0,
@@ -412,14 +486,13 @@ def test_none_gender_over_soft_limit_gets_hard_split(monkeypatch):
         "ja_text": "".join(w["word"] for w in words),
         "zh_text": "这段没有句末标点无法找到分割点",
         "words": words,
-        "gender": None,
     }
     options = SubtitleOptions(soft_split_enabled=True, soft_max=5.5, max_duration=6.5)
     split = subtitle._soft_split_subtitle_blocks([block], options=options)
     assert len(split) == 2
 
 
-def test_non_none_gender_over_soft_limit_below_hard_limit_no_forced_split(monkeypatch):
+def test_over_soft_limit_below_hard_limit_gets_soft_split(monkeypatch):
     words = [_word(f"語{i}", i * 1.4, (i + 1) * 1.4) for i in range(5)]
     block = {
         "start": 0.0,
@@ -427,14 +500,13 @@ def test_non_none_gender_over_soft_limit_below_hard_limit_no_forced_split(monkey
         "ja_text": "".join(w["word"] for w in words),
         "zh_text": "这段没有句末标点无法找到分割点",
         "words": words,
-        "gender": "F",
     }
     options = SubtitleOptions(soft_split_enabled=True, soft_max=5.5, max_duration=6.5)
     split = subtitle._soft_split_subtitle_blocks([block], options=options)
-    assert len(split) == 1
+    assert len(split) == 2
 
 
-def test_none_gender_below_soft_limit_not_split(monkeypatch):
+def test_below_soft_limit_not_split(monkeypatch):
     words = [_word(f"語{i}", i * 1.0, (i + 1) * 1.0) for i in range(4)]
     block = {
         "start": 0.0,
@@ -442,17 +514,16 @@ def test_none_gender_below_soft_limit_not_split(monkeypatch):
         "ja_text": "".join(w["word"] for w in words),
         "zh_text": "短于软上限",
         "words": words,
-        "gender": None,
     }
     options = SubtitleOptions(soft_split_enabled=True, soft_max=5.5, max_duration=6.5)
     split = subtitle._soft_split_subtitle_blocks([block], options=options)
     assert len(split) == 1
 
 
-def test_gender_same_adjacent_short_blocks_merge():
+def test_adjacent_short_blocks_merge_without_acoustic_sidecar():
     blocks = [
-        {"start": 0.0, "end": 1.0, "ja_text": "いい", "zh_text": "好", "gender": "F"},
-        {"start": 1.1, "end": 2.0, "ja_text": "もっと", "zh_text": "更多", "gender": "F"},
+        {"start": 0.0, "end": 1.0, "ja_text": "いい", "zh_text": "好"},
+        {"start": 1.1, "end": 2.0, "ja_text": "もっと", "zh_text": "更多"},
     ]
 
     merged = subtitle._merge_adjacent_short_blocks(blocks)
@@ -462,10 +533,10 @@ def test_gender_same_adjacent_short_blocks_merge():
     assert merged[0]["zh_text"] == "好，更多"
 
 
-def test_gender_different_long_enough_blocks_do_not_merge():
+def test_far_apart_short_blocks_do_not_merge():
     blocks = [
-        {"start": 0.0, "end": 1.0, "ja_text": "来て", "zh_text": "过来", "gender": "M"},
-        {"start": 1.1, "end": 2.0, "ja_text": "いや", "zh_text": "不要", "gender": "F"},
+        {"start": 0.0, "end": 1.0, "ja_text": "来て", "zh_text": "过来"},
+        {"start": 1.5, "end": 2.0, "ja_text": "いや", "zh_text": "不要"},
     ]
 
     merged = subtitle._merge_adjacent_short_blocks(blocks)
@@ -473,21 +544,19 @@ def test_gender_different_long_enough_blocks_do_not_merge():
     assert len(merged) == 2
 
 
-def test_short_overlapping_tail_merges_across_gender_guard():
+def test_short_overlapping_tail_merges_without_deduplication():
     blocks = [
         {
             "start": 176.84,
             "end": 178.493,
             "ja_text": "アルマリスト 室で イラックス ステイマンを受け",
             "zh_text": "在芳香蒸汽室接受放松",
-            "gender": "F",
         },
         {
             "start": 178.56,
             "end": 179.16,
             "ja_text": "受けて",
             "zh_text": "接受",
-            "gender": "M",
         },
     ]
 
@@ -497,26 +566,23 @@ def test_short_overlapping_tail_merges_across_gender_guard():
     )
 
     assert len(merged) == 1
-    assert merged[0]["ja_text"] == "アルマリスト 室で イラックス ステイマンを受けて"
+    assert merged[0]["ja_text"] == "アルマリスト 室で イラックス ステイマンを受け 受けて"
     assert merged[0]["zh_text"] == "在芳香蒸汽室接受放松，接受"
-    assert merged[0]["gender"] is None
 
 
-def test_short_overlapping_tail_merges_compacted_text_without_duplicate():
+def test_short_overlapping_tail_preserves_repeated_text():
     blocks = [
         {
             "start": 0.0,
             "end": 1.0,
             "ja_text": "受け",
             "zh_text": "接受",
-            "gender": "F",
         },
         {
             "start": 1.06,
             "end": 1.5,
             "ja_text": "受 けて",
             "zh_text": "接受",
-            "gender": "M",
         },
     ]
 
@@ -526,13 +592,13 @@ def test_short_overlapping_tail_merges_compacted_text_without_duplicate():
     )
 
     assert len(merged) == 1
-    assert merged[0]["ja_text"] == "受けて"
+    assert merged[0]["ja_text"] == "受け 受 けて"
 
 
-def test_short_tail_without_text_overlap_keeps_gender_guard():
+def test_short_tail_without_text_overlap_can_merge_with_close_gap():
     blocks = [
-        {"start": 0.0, "end": 1.0, "ja_text": "来て", "zh_text": "过来", "gender": "M"},
-        {"start": 1.06, "end": 1.6, "ja_text": "いや", "zh_text": "不要", "gender": "F"},
+        {"start": 0.0, "end": 1.0, "ja_text": "来て", "zh_text": "过来"},
+        {"start": 1.06, "end": 1.6, "ja_text": "いや", "zh_text": "不要"},
     ]
 
     merged = subtitle._merge_adjacent_short_blocks(
@@ -540,7 +606,7 @@ def test_short_tail_without_text_overlap_keeps_gender_guard():
         options=SubtitleOptions(video_fps=29.97),
     )
 
-    assert len(merged) == 2
+    assert len(merged) == 1
 
 
 def test_frame_rate_controls_short_tail_merge_gap():
@@ -550,14 +616,12 @@ def test_frame_rate_controls_short_tail_merge_gap():
             "end": 1.0,
             "ja_text": "受け",
             "zh_text": "接受",
-            "gender": "F",
         },
         {
-            "start": 1.1,
-            "end": 1.9,
+            "start": 1.22,
+            "end": 2.02,
             "ja_text": "受けて",
             "zh_text": "接受",
-            "gender": "M",
         },
     ]
 
@@ -575,10 +639,10 @@ def test_frame_rate_controls_short_tail_merge_gap():
     ) == 2
 
 
-def test_gender_different_short_fragment_still_merges():
+def test_different_short_fragments_still_merge_without_acoustic_sidecar():
     blocks = [
-        {"start": 0.0, "end": 0.4, "ja_text": "ん", "zh_text": "嗯", "gender": "M"},
-        {"start": 0.5, "end": 1.3, "ja_text": "いい", "zh_text": "舒服", "gender": "F"},
+        {"start": 0.0, "end": 0.4, "ja_text": "ん", "zh_text": "嗯"},
+        {"start": 0.5, "end": 1.3, "ja_text": "いい", "zh_text": "舒服"},
     ]
 
     merged = subtitle._merge_adjacent_short_blocks(blocks)
@@ -586,10 +650,10 @@ def test_gender_different_short_fragment_still_merges():
     assert len(merged) == 1
 
 
-def test_gender_none_does_not_block_merge():
+def test_acoustic_metadata_does_not_block_merge():
     blocks = [
-        {"start": 0.0, "end": 1.0, "ja_text": "ん", "zh_text": "嗯", "gender": None},
-        {"start": 1.1, "end": 2.0, "ja_text": "いい", "zh_text": "舒服", "gender": "F"},
+        {"start": 0.0, "end": 1.0, "ja_text": "ん", "zh_text": "嗯"},
+        {"start": 1.1, "end": 2.0, "ja_text": "いい", "zh_text": "舒服"},
     ]
 
     merged = subtitle._merge_adjacent_short_blocks(blocks)
@@ -597,28 +661,25 @@ def test_gender_none_does_not_block_merge():
     assert len(merged) == 1
 
 
-def test_write_srt_never_shows_gender_prefix(tmp_path):
-    path = tmp_path / "gender_never.srt"
+def test_write_srt_does_not_emit_acoustic_prefix(tmp_path):
+    path = tmp_path / "plain.srt"
 
     subtitle.write_srt(
-        [{"start": 0.0, "end": 1.0, "zh_text": "过来", "gender": "M"}],
+        [{"start": 0.0, "end": 1.0, "zh_text": "过来"}],
         str(path),
     )
 
     content = path.read_text(encoding="utf-8")
-    assert "[M]" not in content
     assert "过来" in content
 
 
-def test_write_bilingual_srt_never_shows_gender_prefix(tmp_path):
-    path = tmp_path / "gender_bilingual.srt"
+def test_write_bilingual_srt_does_not_emit_acoustic_prefix(tmp_path):
+    path = tmp_path / "plain_bilingual.srt"
 
     subtitle.write_bilingual_srt(
-        [{"start": 0.0, "end": 1.0, "ja_text": "来て", "zh_text": "过来", "gender": "F"}],
+        [{"start": 0.0, "end": 1.0, "ja_text": "来て", "zh_text": "过来"}],
         str(path),
     )
 
     content = path.read_text(encoding="utf-8")
-    assert "[F]" not in content
-    assert "[M]" not in content
     assert "过来" in content

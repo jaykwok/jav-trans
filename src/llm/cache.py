@@ -114,7 +114,6 @@ def _translation_cache_key(
                 "start": round(start, 3),
                 "end": round(end, 3),
                 "duration_sec": round(max(0.0, end - start), 3),
-                "gender": seg.get("gender"),
                 "ja": str(seg.get("ja_text") or seg.get("text") or seg.get("ja") or ""),
             }
         )

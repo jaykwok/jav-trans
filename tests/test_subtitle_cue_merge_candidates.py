@@ -19,35 +19,32 @@ def _write_jsonl(path: Path, rows: list[dict]) -> Path:
     return path
 
 
-def test_cue_merge_candidate_analysis_keeps_speaker_change(tmp_path: Path, monkeypatch):
+def test_cue_merge_candidate_analysis_merges_consecutive_safe_cues(tmp_path: Path, monkeypatch):
     monkeypatch.setenv("SUBTITLE_MERGE_ADJACENT", "0")
     bilingual = _write_json(
         tmp_path / "sample.bilingual.json",
         {
             "blocks": [
                 {
-                    "start": 0.0,
-                    "end": 0.7,
-                    "ja_text": "あ",
-                    "zh_text": "啊",
-                    "speaker": "S0",
-                },
-                {
-                    "start": 0.90,
-                    "end": 1.48,
-                    "ja_text": "ん",
-                    "zh_text": "嗯",
-                    "speaker": "S0",
-                },
-                {
-                    "start": 1.65,
-                    "end": 2.30,
-                    "ja_text": "だめ",
-                    "zh_text": "不行",
-                    "speaker": "S1",
-                },
-            ]
-        },
+                        "start": 0.0,
+                        "end": 0.7,
+                        "ja_text": "あ",
+                        "zh_text": "啊",
+                    },
+                    {
+                        "start": 0.90,
+                        "end": 1.48,
+                        "ja_text": "ん",
+                        "zh_text": "嗯",
+                    },
+                    {
+                        "start": 1.65,
+                        "end": 2.30,
+                        "ja_text": "だめ",
+                        "zh_text": "不行",
+                    },
+                ]
+            },
     )
     out_dir = tmp_path / "out"
 
@@ -63,75 +60,87 @@ def test_cue_merge_candidate_analysis_keeps_speaker_change(tmp_path: Path, monke
     )
 
     assert summary["before"]["block_count"] == 3
-    assert summary["after"]["planner_merge_count"] == 1
-    assert summary["after"]["block_count"] == 2
+    assert summary["after"]["planner_merge_count"] == 2
+    assert summary["after"]["block_count"] == 1
     assert summary["outputs"]["before_srt"].endswith("before.bilingual.srt")
     assert summary["outputs"]["planner_vtt"].endswith("planner.bilingual.vtt")
     assert (out_dir / "before.bilingual.srt").exists()
     assert (out_dir / "planner.bilingual.srt").exists()
     assert (out_dir / "before.bilingual.vtt").read_text(encoding="utf-8").startswith("WEBVTT")
     assert (out_dir / "planner.bilingual.vtt").exists()
-    assert "speaker_change" in summary["pair_analysis"]["dense_blocker_counts"]
+    assert "speaker_change" not in summary["pair_analysis"]["dense_blocker_counts"]
     actions = json.loads((out_dir / "planner_actions.json").read_text(encoding="utf-8"))
-    assert len(actions) == 1
+    assert len(actions) == 2
     assert actions[0]["left_index"] == 0
     assert (out_dir / "summary.md").exists()
 
 
-def test_cue_merge_candidate_analysis_blocks_sidecar_speaker_change(
+def test_cue_merge_candidate_analysis_can_use_aligned_segments_as_source(
     tmp_path: Path,
     monkeypatch,
 ):
     monkeypatch.setenv("SUBTITLE_MERGE_ADJACENT", "0")
-    bilingual = _write_json(
-        tmp_path / "sample.bilingual.json",
+    bilingual = _write_json(tmp_path / "sample.bilingual.json", {"blocks": []})
+    aligned = _write_json(
+        tmp_path / "sample.aligned_segments.json",
         {
-            "blocks": [
+            "segments": [
                 {
                     "start": 0.0,
-                    "end": 0.7,
-                    "ja_text": "あ",
-                    "zh_text": "啊",
-                    "cue_id": 0,
+                    "end": 0.55,
+                    "text": "あ",
+                    "source_chunk_index": 7,
+                    "words": [
+                        {
+                            "word": "あ",
+                            "start": 0.0,
+                            "end": 0.55,
+                            "source_chunk_index": 7,
+                        }
+                    ],
                 },
                 {
-                    "start": 0.9,
-                    "end": 1.4,
-                    "ja_text": "ん",
-                    "zh_text": "嗯",
-                    "cue_id": 1,
+                    "start": 0.66,
+                    "end": 1.20,
+                    "text": "ん",
+                    "source_chunk_index": 7,
+                    "words": [
+                        {
+                            "word": "ん",
+                            "start": 0.66,
+                            "end": 1.20,
+                            "source_chunk_index": 7,
+                        }
+                    ],
                 },
             ]
         },
     )
-    speaker_pairs = _write_jsonl(
-        tmp_path / "speaker_pairs.jsonl",
-        [
-            {
-                "left_cue_id": 0,
-                "right_cue_id": 1,
-                "speaker_change": True,
-                "speaker_change_score": 0.8,
-            }
-        ],
-    )
+    out_dir = tmp_path / "out-aligned"
 
     summary = build_summary(
         bilingual_path=bilingual,
+        aligned_path=aligned,
         timings_path=None,
-        output_dir=tmp_path / "out",
+        output_dir=out_dir,
         video_fps=29.97,
         min_score=0.5,
         max_gap_s=0.45,
         max_combined_s=4.8,
         max_text_units=34.0,
-        speaker_pairs_path=speaker_pairs,
-        speaker_change_policy="block",
+        mode="srt",
+        source="aligned",
     )
 
-    assert summary["after"]["planner_merge_count"] == 0
-    assert summary["pair_analysis"]["constraint_counts"]["speaker_change_sidecar"] == 1
-    assert summary["pair_analysis"]["planner_blocker_counts"]["speaker_change_sidecar"] == 1
+    assert summary["source"] == "aligned"
+    assert summary["mode"] == "srt"
+    assert summary["before"]["block_count"] == 2
+    assert summary["after"]["planner_merge_count"] == 1
+    assert summary["after"]["block_count"] == 1
+    assert summary["outputs"]["planner_srt"].endswith("planner.ja.srt")
+    assert (out_dir / "planner.ja.vtt").exists()
+    actions = json.loads((out_dir / "planner_actions.json").read_text(encoding="utf-8"))
+    assert actions[0]["left_index"] == 0
 
 
 def test_cue_merge_candidate_analysis_penalizes_fallback_risk(tmp_path: Path, monkeypatch):
@@ -231,62 +240,3 @@ def test_cue_merge_candidate_analysis_blocks_high_reading_density(
     assert summary["after"]["planner_merge_count"] == 0
     assert summary["pair_analysis"]["planner_blocker_counts"]["reading_density_too_high"] == 1
     assert summary["planner"]["max_reading_units_per_s"] == 12.0
-
-
-def test_cue_merge_candidate_analysis_penalizes_high_speaker_score(
-    tmp_path: Path,
-    monkeypatch,
-):
-    monkeypatch.setenv("SUBTITLE_MERGE_ADJACENT", "0")
-    bilingual = _write_json(
-        tmp_path / "sample.bilingual.json",
-        {
-            "blocks": [
-                {
-                    "start": 0.0,
-                    "end": 0.7,
-                    "ja_text": "あ",
-                    "zh_text": "啊",
-                    "cue_id": 0,
-                },
-                {
-                    "start": 0.9,
-                    "end": 1.4,
-                    "ja_text": "ん",
-                    "zh_text": "嗯",
-                    "cue_id": 1,
-                },
-            ]
-        },
-    )
-    speaker_pairs = _write_jsonl(
-        tmp_path / "speaker_pairs.jsonl",
-        [
-            {
-                "left_cue_id": 0,
-                "right_cue_id": 1,
-                "speaker_change": False,
-                "speaker_change_score": 0.88,
-                "threshold": 0.95,
-            }
-        ],
-    )
-
-    summary = build_summary(
-        bilingual_path=bilingual,
-        timings_path=None,
-        output_dir=tmp_path / "out-speaker-score",
-        video_fps=29.97,
-        min_score=0.5,
-        max_gap_s=0.45,
-        max_combined_s=4.8,
-        max_text_units=34.0,
-        speaker_pairs_path=speaker_pairs,
-        speaker_change_policy="block",
-        speaker_score_penalty_threshold=0.85,
-        speaker_score_penalty=0.4,
-    )
-
-    assert summary["after"]["planner_merge_count"] == 0
-    assert summary["pair_analysis"]["constraint_counts"]["penalized_high_speaker_score_sidecar"] == 1
-    assert summary["planner"]["speaker_score_penalty_threshold"] == 0.85

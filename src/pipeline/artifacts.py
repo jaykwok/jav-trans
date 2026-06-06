@@ -39,8 +39,6 @@ class AsrArtifacts:
     video_duration_s: float | None
     video_fps: float | None
     pipeline_started: float
-    f0_filtered_count: int
-    f0_failed: bool
     job_id: str
     aligned_cache_signature: dict | None = None
 
@@ -188,8 +186,6 @@ def load_translation_artifacts_snapshot(
     )
     values["audio_cached"] = bool(values.get("audio_cached"))
     values["bilingual"] = bool(values.get("bilingual"))
-    values["f0_filtered_count"] = int(values.get("f0_filtered_count") or 0)
-    values["f0_failed"] = bool(values.get("f0_failed"))
     values["video_duration_s"] = (
         float(values["video_duration_s"])
         if values.get("video_duration_s") is not None

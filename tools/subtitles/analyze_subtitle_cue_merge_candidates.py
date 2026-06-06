@@ -77,6 +77,40 @@ def load_blocks(path: Path) -> list[dict[str, Any]]:
     return [dict(block) for block in blocks if isinstance(block, dict)]
 
 
+def load_segments(path: Path | None) -> list[dict[str, Any]]:
+    if path is None or not path.exists():
+        return []
+    payload = read_json(path)
+    segments = payload.get("segments")
+    if not isinstance(segments, list):
+        return []
+    return [dict(segment) for segment in segments if isinstance(segment, dict)]
+
+
+def blocks_from_segments(segments: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    blocks: list[dict[str, Any]] = []
+    for index, segment in enumerate(segments):
+        try:
+            start = float(segment["start"])
+            end = float(segment["end"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        text = str(segment.get("text") or segment.get("ja_text") or "").strip()
+        block = {
+            "start": start,
+            "end": max(start, end),
+            "ja_text": text,
+            "zh_text": text,
+            "text": text,
+            "words": list(segment.get("words") or []),
+            "source_segment_ids": list(segment.get("source_segment_ids") or [index]),
+        }
+        if segment.get("source_chunk_index") is not None:
+            block["source_chunk_index"] = segment.get("source_chunk_index")
+        blocks.append(block)
+    return blocks
+
+
 def _as_int(value: Any) -> int | None:
     try:
         if value is None or value == "":
@@ -85,23 +119,6 @@ def _as_int(value: Any) -> int | None:
     except (TypeError, ValueError):
         return None
     return number
-
-
-def _as_bool(value: Any) -> bool:
-    if isinstance(value, bool):
-        return value
-    if isinstance(value, (int, float)):
-        return bool(value)
-    if isinstance(value, str):
-        return value.strip().lower() in {"1", "true", "yes", "on"}
-    return False
-
-
-def _number(value: Any, default: float = 0.0) -> float:
-    try:
-        return float(value)
-    except (TypeError, ValueError):
-        return default
 
 
 def load_diagnostics(path: Path | None) -> dict[int, dict[str, Any]]:
@@ -208,16 +225,26 @@ def _vtt_timestamp(seconds: float) -> str:
 
 
 def _bilingual_cue_text(block: dict[str, Any], *, options: SubtitleOptions) -> str:
-    prefix = subtitle_writer._subtitle_prefix(block, options=options)
     ja_line = subtitle_writer._wrap_subtitle_text(
-        prefix + str(block.get("ja_text") or block.get("text") or ""),
+        str(block.get("ja_text") or block.get("text") or ""),
         options=options,
     )
     zh_text = str(block.get("zh_text") or block.get("zh") or "").strip()
     if not zh_text:
         zh_text = "「未翻译」"
-    zh_line = subtitle_writer._wrap_subtitle_text(prefix + zh_text, options=options)
+    zh_line = subtitle_writer._wrap_subtitle_text(zh_text, options=options)
     return "\n".join(line for line in (ja_line + "\n" + zh_line).splitlines() if line.strip())
+
+
+def _mono_cue_text(block: dict[str, Any], *, options: SubtitleOptions) -> str:
+    text = str(block.get("ja_text") or block.get("text") or "")
+    return subtitle_writer._wrap_subtitle_text(text, options=options)
+
+
+def _cue_text(block: dict[str, Any], *, options: SubtitleOptions, mode: str) -> str:
+    if mode == "srt":
+        return _mono_cue_text(block, options=options)
+    return _bilingual_cue_text(block, options=options)
 
 
 def write_bilingual_vtt(
@@ -225,6 +252,7 @@ def write_bilingual_vtt(
     blocks: list[dict[str, Any]],
     *,
     options: SubtitleOptions,
+    mode: str = "bilingual",
 ) -> None:
     lines = ["WEBVTT", ""]
     for index, block in enumerate(blocks, 1):
@@ -234,7 +262,7 @@ def write_bilingual_vtt(
             [
                 str(index),
                 f"{_vtt_timestamp(start)} --> {_vtt_timestamp(end)}",
-                _bilingual_cue_text(block, options=options),
+                _cue_text(block, options=options, mode=mode),
                 "",
             ]
         )
@@ -248,26 +276,28 @@ def write_subtitle_exports(
     before_blocks: list[dict[str, Any]],
     planner_blocks: list[dict[str, Any]],
     options: SubtitleOptions,
+    mode: str,
 ) -> dict[str, str]:
     output_dir.mkdir(parents=True, exist_ok=True)
-    before_srt = output_dir / "before.bilingual.srt"
-    planner_srt = output_dir / "planner.bilingual.srt"
-    before_vtt = output_dir / "before.bilingual.vtt"
-    planner_vtt = output_dir / "planner.bilingual.vtt"
-    subtitle_writer.write_bilingual_srt(before_blocks, str(before_srt), options=options)
-    subtitle_writer.write_bilingual_srt(planner_blocks, str(planner_srt), options=options)
-    write_bilingual_vtt(before_vtt, before_blocks, options=options)
-    write_bilingual_vtt(planner_vtt, planner_blocks, options=options)
+    suffix = "ja" if mode == "srt" else "bilingual"
+    before_srt = output_dir / f"before.{suffix}.srt"
+    planner_srt = output_dir / f"planner.{suffix}.srt"
+    before_vtt = output_dir / f"before.{suffix}.vtt"
+    planner_vtt = output_dir / f"planner.{suffix}.vtt"
+    if mode == "srt":
+        subtitle_writer.write_srt(before_blocks, str(before_srt), options=options)
+        subtitle_writer.write_srt(planner_blocks, str(planner_srt), options=options)
+    else:
+        subtitle_writer.write_bilingual_srt(before_blocks, str(before_srt), options=options)
+        subtitle_writer.write_bilingual_srt(planner_blocks, str(planner_srt), options=options)
+    write_bilingual_vtt(before_vtt, before_blocks, options=options, mode=mode)
+    write_bilingual_vtt(planner_vtt, planner_blocks, options=options, mode=mode)
     return {
         "before_srt": project_rel(before_srt),
         "planner_srt": project_rel(planner_srt),
         "before_vtt": project_rel(before_vtt),
         "planner_vtt": project_rel(planner_vtt),
     }
-
-
-def _same_speaker_or_unknown(left: dict[str, Any], right: dict[str, Any]) -> bool:
-    return bool(subtitle_writer._same_speaker_or_unknown(left, right))
 
 
 def _ends_sentence(block: dict[str, Any]) -> bool:
@@ -304,102 +334,16 @@ def block_chunk_indices(block: dict[str, Any]) -> set[int]:
     return indices
 
 
-def block_ids(index: int, block: dict[str, Any]) -> set[str]:
-    ids = {str(index), f"index:{index}", f"cue_index:{index}"}
-    cue_id = block.get("cue_id")
-    if cue_id is not None:
-        ids.update({str(cue_id), f"cue:{cue_id}", f"cue_id:{cue_id}"})
-    for source_id in block.get("source_segment_ids") or []:
-        ids.update({str(source_id), f"segment:{source_id}", f"source_segment:{source_id}"})
-    for chunk_index in block_chunk_indices(block):
-        ids.update({f"chunk:{chunk_index}", f"source_chunk:{chunk_index}"})
-    return {item for item in ids if item.strip()}
-
-
-def load_speaker_pairs(path: Path | None) -> dict[tuple[str, str], dict[str, Any]]:
-    pairs: dict[tuple[str, str], dict[str, Any]] = {}
-    for row in read_jsonl(path):
-        left_values: list[str] = []
-        right_values: list[str] = []
-        for key in ("left_segment_id", "left_id", "left_index", "left_cue_id"):
-            if row.get(key) is not None:
-                left_values.append(str(row[key]))
-        for key in ("right_segment_id", "right_id", "right_index", "right_cue_id"):
-            if row.get(key) is not None:
-                right_values.append(str(row[key]))
-        if row.get("left_index") is not None:
-            left_values.extend([f"index:{row['left_index']}", f"cue_index:{row['left_index']}"])
-        if row.get("right_index") is not None:
-            right_values.extend([f"index:{row['right_index']}", f"cue_index:{row['right_index']}"])
-        if row.get("left_cue_id") is not None:
-            left_values.extend([f"cue:{row['left_cue_id']}", f"cue_id:{row['left_cue_id']}"])
-        if row.get("right_cue_id") is not None:
-            right_values.extend([f"cue:{row['right_cue_id']}", f"cue_id:{row['right_cue_id']}"])
-        for left in left_values:
-            for right in right_values:
-                pairs[(left, right)] = row
-    return pairs
-
-
-def speaker_pair_for(
-    left_index: int,
-    left: dict[str, Any],
-    right_index: int,
-    right: dict[str, Any],
-    speaker_pairs: dict[tuple[str, str], dict[str, Any]],
-) -> dict[str, Any] | None:
-    if not speaker_pairs:
-        return None
-    for left_id in block_ids(left_index, left):
-        for right_id in block_ids(right_index, right):
-            pair = speaker_pairs.get((left_id, right_id))
-            if pair is not None:
-                return pair
-    return None
-
-
 def pair_constraints(
-    left_index: int,
     left: dict[str, Any],
-    right_index: int,
     right: dict[str, Any],
     *,
-    speaker_pairs: dict[tuple[str, str], dict[str, Any]],
     diagnostics: dict[int, dict[str, Any]],
-    speaker_change_policy: str,
     fallback_risk_policy: str,
-    speaker_score_block_threshold: float = 0.0,
-    speaker_score_penalty_threshold: float = 0.0,
-    speaker_score_penalty: float = 0.0,
 ) -> tuple[list[str], list[tuple[str, float]], dict[str, Any]]:
     blockers: list[str] = []
     penalties: list[tuple[str, float]] = []
     annotations: dict[str, Any] = {}
-
-    speaker_pair = speaker_pair_for(left_index, left, right_index, right, speaker_pairs)
-    if speaker_pair is not None:
-        speaker_change_score = _number(speaker_pair.get("speaker_change_score"))
-        annotations["speaker_pair"] = {
-            "speaker_change": _as_bool(speaker_pair.get("speaker_change")),
-            "speaker_change_score": speaker_pair.get("speaker_change_score"),
-            "threshold": speaker_pair.get("threshold"),
-            "score_block_threshold": speaker_score_block_threshold,
-            "score_penalty_threshold": speaker_score_penalty_threshold,
-            "score_penalty": speaker_score_penalty,
-        }
-        if _as_bool(speaker_pair.get("speaker_change")):
-            if speaker_change_policy == "block":
-                blockers.append("speaker_change_sidecar")
-            elif speaker_change_policy == "penalize":
-                penalties.append(("speaker_change_sidecar", 0.35))
-        elif speaker_score_block_threshold > 0 and speaker_change_score >= speaker_score_block_threshold:
-            blockers.append("high_speaker_score_sidecar")
-        elif (
-            speaker_score_penalty_threshold > 0
-            and speaker_score_penalty > 0
-            and speaker_change_score >= speaker_score_penalty_threshold
-        ):
-            penalties.append(("high_speaker_score_sidecar", speaker_score_penalty))
 
     left_chunks = block_chunk_indices(left)
     right_chunks = block_chunk_indices(right)
@@ -439,8 +383,6 @@ def dense_merge_blockers(
     combined_duration = max(_float(left, "start"), _float(right, "end")) - _float(left, "start")
     combined_units = _text_units(left) + _text_units(right)
 
-    if not _same_speaker_or_unknown(left, right):
-        blockers.append("speaker_change")
     if gap_s < -options.frame_gap_s:
         blockers.append("negative_overlap")
     if gap_s > options.dense_cue_merge_max_gap_frames * options.frame_duration_s:
@@ -459,9 +401,7 @@ def dense_merge_blockers(
 
 
 def planner_merge_score(
-    left_index: int,
     left: dict[str, Any],
-    right_index: int,
     right: dict[str, Any],
     *,
     options: SubtitleOptions,
@@ -469,15 +409,9 @@ def planner_merge_score(
     max_combined_s: float,
     max_text_units: float,
     max_reading_units_per_s: float = 0.0,
-    speaker_pairs: dict[tuple[str, str], dict[str, Any]] | None = None,
     diagnostics: dict[int, dict[str, Any]] | None = None,
-    speaker_change_policy: str = "block",
     fallback_risk_policy: str = "penalize",
-    speaker_score_block_threshold: float = 0.0,
-    speaker_score_penalty_threshold: float = 0.0,
-    speaker_score_penalty: float = 0.0,
 ) -> tuple[float, list[str]]:
-    speaker_pairs = speaker_pairs or {}
     diagnostics = diagnostics or {}
     gap_s = _gap(left, right)
     left_duration = _duration(left)
@@ -486,20 +420,11 @@ def planner_merge_score(
     combined_units = _text_units(left) + _text_units(right)
     reasons: list[str] = []
 
-    if not _same_speaker_or_unknown(left, right):
-        return 0.0, ["speaker_change"]
     constraint_blockers, penalties, _annotations = pair_constraints(
-        left_index,
         left,
-        right_index,
         right,
-        speaker_pairs=speaker_pairs,
         diagnostics=diagnostics,
-        speaker_change_policy=speaker_change_policy,
         fallback_risk_policy=fallback_risk_policy,
-        speaker_score_block_threshold=speaker_score_block_threshold,
-        speaker_score_penalty_threshold=speaker_score_penalty_threshold,
-        speaker_score_penalty=speaker_score_penalty,
     )
     if constraint_blockers:
         return 0.0, constraint_blockers
@@ -564,15 +489,9 @@ def apply_planner_candidates(
     max_combined_s: float,
     max_text_units: float,
     max_reading_units_per_s: float = 0.0,
-    speaker_pairs: dict[tuple[str, str], dict[str, Any]] | None = None,
     diagnostics: dict[int, dict[str, Any]] | None = None,
-    speaker_change_policy: str = "block",
     fallback_risk_policy: str = "penalize",
-    speaker_score_block_threshold: float = 0.0,
-    speaker_score_penalty_threshold: float = 0.0,
-    speaker_score_penalty: float = 0.0,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
-    speaker_pairs = speaker_pairs or {}
     diagnostics = diagnostics or {}
     merged: list[dict[str, Any]] = []
     actions: list[dict[str, Any]] = []
@@ -582,37 +501,23 @@ def apply_planner_candidates(
         while index + 1 < len(blocks):
             nxt = blocks[index + 1]
             score, reasons = planner_merge_score(
-                index,
                 current,
-                index + 1,
                 nxt,
                 options=options,
                 max_gap_s=max_gap_s,
                 max_combined_s=max_combined_s,
                 max_text_units=max_text_units,
                 max_reading_units_per_s=max_reading_units_per_s,
-                speaker_pairs=speaker_pairs,
                 diagnostics=diagnostics,
-                speaker_change_policy=speaker_change_policy,
                 fallback_risk_policy=fallback_risk_policy,
-                speaker_score_block_threshold=speaker_score_block_threshold,
-                speaker_score_penalty_threshold=speaker_score_penalty_threshold,
-                speaker_score_penalty=speaker_score_penalty,
             )
             if score < min_score:
                 break
             _blockers, _penalties, annotations = pair_constraints(
-                index,
                 current,
-                index + 1,
                 nxt,
-                speaker_pairs=speaker_pairs,
                 diagnostics=diagnostics,
-                speaker_change_policy=speaker_change_policy,
                 fallback_risk_policy=fallback_risk_policy,
-                speaker_score_block_threshold=speaker_score_block_threshold,
-                speaker_score_penalty_threshold=speaker_score_penalty_threshold,
-                speaker_score_penalty=speaker_score_penalty,
             )
             actions.append(
                 {
@@ -646,15 +551,9 @@ def summarize_pairs(
     max_combined_s: float,
     max_text_units: float,
     max_reading_units_per_s: float = 0.0,
-    speaker_pairs: dict[tuple[str, str], dict[str, Any]] | None = None,
     diagnostics: dict[int, dict[str, Any]] | None = None,
-    speaker_change_policy: str = "block",
     fallback_risk_policy: str = "penalize",
-    speaker_score_block_threshold: float = 0.0,
-    speaker_score_penalty_threshold: float = 0.0,
-    speaker_score_penalty: float = 0.0,
 ) -> dict[str, Any]:
-    speaker_pairs = speaker_pairs or {}
     diagnostics = diagnostics or {}
     blocker_counts: Counter[str] = Counter()
     planner_blocker_counts: Counter[str] = Counter()
@@ -670,40 +569,22 @@ def summarize_pairs(
         else:
             blocker_counts.update(["dense_merge_allowed"])
         score, reasons = planner_merge_score(
-            index,
             left,
-            index + 1,
             right,
             options=options,
             max_gap_s=max_gap_s,
             max_combined_s=max_combined_s,
             max_text_units=max_text_units,
             max_reading_units_per_s=max_reading_units_per_s,
-            speaker_pairs=speaker_pairs,
             diagnostics=diagnostics,
-            speaker_change_policy=speaker_change_policy,
             fallback_risk_policy=fallback_risk_policy,
-            speaker_score_block_threshold=speaker_score_block_threshold,
-            speaker_score_penalty_threshold=speaker_score_penalty_threshold,
-            speaker_score_penalty=speaker_score_penalty,
         )
         _blockers, penalties, annotations = pair_constraints(
-            index,
             left,
-            index + 1,
             right,
-            speaker_pairs=speaker_pairs,
             diagnostics=diagnostics,
-            speaker_change_policy=speaker_change_policy,
             fallback_risk_policy=fallback_risk_policy,
-            speaker_score_block_threshold=speaker_score_block_threshold,
-            speaker_score_penalty_threshold=speaker_score_penalty_threshold,
-            speaker_score_penalty=speaker_score_penalty,
         )
-        if annotations.get("speaker_pair", {}).get("score_block_threshold"):
-            constraint_counts.update(["speaker_score_guard_configured"])
-        if annotations.get("speaker_pair", {}).get("speaker_change"):
-            constraint_counts.update(["speaker_change_sidecar"])
         diag = annotations.get("diagnostics") if isinstance(annotations.get("diagnostics"), dict) else {}
         if diag.get("risky_chunks"):
             constraint_counts.update(["fallback_risk_pair"])
@@ -746,9 +627,6 @@ def summarize_pairs(
                 )
         else:
             hard_blockers = {
-                "speaker_change",
-                "speaker_change_sidecar",
-                "high_speaker_score_sidecar",
                 "negative_overlap",
                 "gap_too_large",
                 "combined_duration_too_long",
@@ -793,6 +671,8 @@ def build_markdown(summary: dict[str, Any]) -> str:
         "# Subtitle Cue Merge Candidate Analysis",
         "",
         f"- source: `{summary['source_bilingual']}`",
+        f"- aligned: `{summary.get('source_aligned', '')}`",
+        f"- input_mode: `{summary['source']}` / `{summary['mode']}`",
         f"- video_duration_s: {summary['video_duration_s']:.3f}",
         f"- video_fps: {summary['video_fps']:.6f}",
         f"- planner_min_score: {summary['planner']['min_score']}",
@@ -842,6 +722,7 @@ def build_markdown(summary: dict[str, Any]) -> str:
 def build_summary(
     *,
     bilingual_path: Path,
+    aligned_path: Path | None = None,
     timings_path: Path | None,
     output_dir: Path,
     video_fps: float,
@@ -851,19 +732,21 @@ def build_summary(
     max_text_units: float,
     max_reading_units_per_s: float = 0.0,
     diagnostics_path: Path | None = None,
-    speaker_pairs_path: Path | None = None,
-    speaker_change_policy: str = "block",
     fallback_risk_policy: str = "penalize",
-    speaker_score_block_threshold: float = 0.0,
-    speaker_score_penalty_threshold: float = 0.0,
-    speaker_score_penalty: float = 0.0,
+    mode: str = "bilingual",
+    source: str = "blocks",
 ) -> dict[str, Any]:
-    source_blocks = load_blocks(bilingual_path)
+    aligned_segments = load_segments(aligned_path)
+    if source == "aligned":
+        if not aligned_segments:
+            raise ValueError("--source aligned requires --aligned with segments")
+        source_blocks = blocks_from_segments(aligned_segments)
+    else:
+        source_blocks = load_blocks(bilingual_path)
     options = SubtitleOptions.from_env().with_video_fps(video_fps)
-    prepared = subtitle_writer.prepare_srt_blocks(source_blocks, options=options, mode="bilingual")
+    prepared = subtitle_writer.prepare_srt_blocks(source_blocks, options=options, mode=mode)
     asr_qc = load_asr_qc(timings_path)
     diagnostics = load_diagnostics(diagnostics_path)
-    speaker_pairs = load_speaker_pairs(speaker_pairs_path)
     video_duration_s = estimate_duration(prepared)
     pair_analysis = summarize_pairs(
         prepared,
@@ -873,13 +756,8 @@ def build_summary(
         max_combined_s=max_combined_s,
         max_text_units=max_text_units,
         max_reading_units_per_s=max_reading_units_per_s,
-        speaker_pairs=speaker_pairs,
         diagnostics=diagnostics,
-        speaker_change_policy=speaker_change_policy,
         fallback_risk_policy=fallback_risk_policy,
-        speaker_score_block_threshold=speaker_score_block_threshold,
-        speaker_score_penalty_threshold=speaker_score_penalty_threshold,
-        speaker_score_penalty=speaker_score_penalty,
     )
     planner_blocks, actions = apply_planner_candidates(
         prepared,
@@ -889,24 +767,20 @@ def build_summary(
         max_combined_s=max_combined_s,
         max_text_units=max_text_units,
         max_reading_units_per_s=max_reading_units_per_s,
-        speaker_pairs=speaker_pairs,
         diagnostics=diagnostics,
-        speaker_change_policy=speaker_change_policy,
         fallback_risk_policy=fallback_risk_policy,
-        speaker_score_block_threshold=speaker_score_block_threshold,
-        speaker_score_penalty_threshold=speaker_score_penalty_threshold,
-        speaker_score_penalty=speaker_score_penalty,
     )
     planner_blocks = subtitle_writer.prepare_srt_blocks(
         planner_blocks,
         options=options,
-        mode="bilingual",
+        mode=mode,
     )
     subtitle_exports = write_subtitle_exports(
         output_dir,
         before_blocks=prepared,
         planner_blocks=planner_blocks,
         options=options,
+        mode=mode,
     )
     before_quality = quality(prepared, video_duration_s=video_duration_s, asr_qc=asr_qc)
     after_quality = quality(planner_blocks, video_duration_s=video_duration_s, asr_qc=asr_qc)
@@ -924,9 +798,11 @@ def build_summary(
     }
     summary = {
         "source_bilingual": project_rel(bilingual_path),
+        "source_aligned": project_rel(aligned_path),
         "source_timings": project_rel(timings_path),
         "source_diagnostics": project_rel(diagnostics_path),
-        "source_speaker_pairs": project_rel(speaker_pairs_path),
+        "mode": mode,
+        "source": source,
         "outputs": subtitle_exports,
         "video_duration_s": video_duration_s,
         "video_fps": video_fps,
@@ -936,13 +812,8 @@ def build_summary(
             "max_combined_s": max_combined_s,
             "max_text_units": max_text_units,
             "max_reading_units_per_s": max_reading_units_per_s,
-            "speaker_change_policy": speaker_change_policy,
             "fallback_risk_policy": fallback_risk_policy,
-            "speaker_score_block_threshold": speaker_score_block_threshold,
-            "speaker_score_penalty_threshold": speaker_score_penalty_threshold,
-            "speaker_score_penalty": speaker_score_penalty,
             "diagnostic_chunk_count": len(diagnostics),
-            "speaker_pair_count": len(speaker_pairs),
         },
         "pair_analysis": pair_analysis,
         "before": before,
@@ -987,18 +858,16 @@ def main(argv: list[str] | None = None) -> int:
         )
     )
     parser.add_argument("--bilingual", required=True, help="bilingual.json path")
+    parser.add_argument("--aligned", default="", help="aligned_segments.json path")
     parser.add_argument("--timings", default="", help="timings.json path with asr_qc")
     parser.add_argument("--diagnostics", default="", help="alignment diagnostics JSONL path")
-    parser.add_argument(
-        "--speaker-pairs",
-        default="",
-        help="optional adjacent speaker-change pair JSONL path",
-    )
     parser.add_argument(
         "--output-dir",
         default="agents/temp/speech-boundary-ja/subtitle-cue-merge-candidates",
     )
     parser.add_argument("--video-fps", type=float, default=30000 / 1001)
+    parser.add_argument("--mode", choices=("srt", "bilingual"), default="bilingual")
+    parser.add_argument("--source", choices=("blocks", "aligned"), default="blocks")
     parser.add_argument("--min-score", type=float, default=0.72)
     parser.add_argument("--max-gap-s", type=float, default=0.45)
     parser.add_argument("--max-combined-s", type=float, default=4.8)
@@ -1010,32 +879,9 @@ def main(argv: list[str] | None = None) -> int:
         help="Optional reading-density gate; 0 disables this diagnostic constraint.",
     )
     parser.add_argument(
-        "--speaker-change-policy",
-        choices=("block", "penalize", "ignore"),
-        default="block",
-    )
-    parser.add_argument(
         "--fallback-risk-policy",
         choices=("block", "penalize", "ignore"),
         default="penalize",
-    )
-    parser.add_argument(
-        "--speaker-score-block-threshold",
-        type=float,
-        default=0.0,
-        help="Optional hard block when sidecar speaker_change_score reaches this value; 0 disables.",
-    )
-    parser.add_argument(
-        "--speaker-score-penalty-threshold",
-        type=float,
-        default=0.0,
-        help="Optional soft penalty when sidecar speaker_change_score reaches this value; 0 disables.",
-    )
-    parser.add_argument(
-        "--speaker-score-penalty",
-        type=float,
-        default=0.0,
-        help="Score penalty applied by --speaker-score-penalty-threshold.",
     )
     args = parser.parse_args(argv)
 
@@ -1043,6 +889,7 @@ def main(argv: list[str] | None = None) -> int:
     output_dir.mkdir(parents=True, exist_ok=True)
     summary = build_summary(
         bilingual_path=project_path(args.bilingual),
+        aligned_path=project_path(args.aligned) if args.aligned else None,
         timings_path=project_path(args.timings) if args.timings else None,
         output_dir=output_dir,
         video_fps=float(args.video_fps),
@@ -1052,12 +899,9 @@ def main(argv: list[str] | None = None) -> int:
         max_text_units=float(args.max_text_units),
         max_reading_units_per_s=float(args.max_reading_units_per_s),
         diagnostics_path=project_path(args.diagnostics) if args.diagnostics else None,
-        speaker_pairs_path=project_path(args.speaker_pairs) if args.speaker_pairs else None,
-        speaker_change_policy=args.speaker_change_policy,
         fallback_risk_policy=args.fallback_risk_policy,
-        speaker_score_block_threshold=float(args.speaker_score_block_threshold),
-        speaker_score_penalty_threshold=float(args.speaker_score_penalty_threshold),
-        speaker_score_penalty=float(args.speaker_score_penalty),
+        mode=args.mode,
+        source=args.source,
     )
     print(
         "summary={path} merges={merges} blocks={before}->{after}".format(
