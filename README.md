@@ -68,7 +68,7 @@ uv pip install -r requirements.txt
 ```env
 API_KEY=你的翻译_API_KEY
 OPENAI_COMPATIBILITY_BASE_URL=https://api.deepseek.com
-LLM_MODEL_NAME=deepseek-chat
+LLM_MODEL_NAME=deepseek-v4-pro
 LLM_API_FORMAT=chat
 LLM_REASONING_EFFORT=xhigh
 TARGET_LANG=简体中文
@@ -129,6 +129,14 @@ Web 提交是否使用 CUDA 取决于后端服务进程是否能看到 GPU，而
 
 LLM 翻译前会先固定 cue plan。SRT writer 只写入已经归一化的时间轴，不再隐式改变时间轴。
 
+翻译阶段的缓存分三层：
+
+- 本地 batch cache：`translation_cache.jsonl`，用于完全相同 cue/timing/prompt 的精确复跑与 crash resume。
+- 本地 translation memory：`translation_cache.memory.jsonl`，按日文文本、目标语言、词汇表、人物参考、prompt 语义版本和模型族复用译文；时间轴或 batch 变化时仍可命中。
+- Provider prompt cache：通过稳定的 system prompt / 全片 JSON 前缀和可选 warmup 降低 API 成本；它不等同于本地翻译缓存。
+
+短片 / 审计片段的单请求翻译也会走同一套本地缓存。自动提取的全片术语表会按全片日文文本 hash 存储，避免多个任务共享同一路径时串用旧术语表。
+
 ---
 
 ## 默认模型
@@ -162,7 +170,7 @@ Boundary Refiner 配置：
 
 ```env
 BOUNDARY_CACHE_ENABLED=1
-BOUNDARY_CACHE_DIR=./temp/boundary-cache
+BOUNDARY_CACHE_DIR=./tmp/cache/boundary
 BOUNDARY_FEATURE_FRAME_HOP_S=0.02
 BOUNDARY_REFINER_ENABLED=1
 BOUNDARY_REFINER_MODEL_PATH=src/boundary/checkpoints/boundary_refiner.pt
@@ -290,14 +298,16 @@ Backlog：等 SpeechBoundary-JA 能稳定产出 pseudo boundary labels 后，研
 
 - `video/<视频名>/`：正式字幕、质量报告和人工质检报告。
 - `models/`：Hugging Face 模型缓存。
-- `temp/boundary-cache/`：SpeechBoundary-JA frame score 到 Boundary Planner 输出的 boundary-cache v1。
-- `temp/jobs/`：Web 任务临时目录。
-- `temp/log/`：启用运行日志后的任务日志。
+- `tmp/jobs/<job_id>/`：Web / pipeline 单次任务临时目录；`JOB_TEMP_DIR` 默认就是 `./tmp/jobs`，翻译 batch cache 和 translation memory 默认写在对应 job 目录下。
+- `tmp/chunks/`：ASR wav chunk 和 crash-resume checkpoint 的一次性运行目录。
+- `tmp/cache/boundary/`：SpeechBoundary-JA frame score 到 Boundary Planner 输出的 boundary-cache v1。
+- `tmp/cache/torch/`、`tmp/cache/hf/`：torch / Hugging Face 运行缓存，不和 `models/` 顶层模型目录混放。
+- `tmp/log/`：启用运行日志后的任务日志。
 - `datasets/`：本地训练、验证、测试数据归档，默认 ignored。
 - `agents/temp/`：研究脚本、smoke、临时日志和中间产物。
 - `agents/audits/`：可长期复查的本地审计页。统一从 `agents/audits/index.html` 进入；审计产物直接放在该目录下，不再套 `speech-boundary-ja/` 子目录；导航页始终指向最新审计且不使用自动跳转。用 live-server 审计时从项目根目录启动 `live-server --middleware=tools/audits/live_server_audit_middleware.js`，导航页删除按钮会调用 `POST /__audit_api__/delete-audit`，并把审计目录移动到 `agents/rm/audit-deletions/`；不再保留独立 Python 审计服务。fallback-window 和 ASR 归因审计生成器都支持 `--media-mode audio|video`，NSFW 场景可生成音频版审计页，播放时仍会同步显示完整日语字幕。
 
-成功运行后默认删除一次性 job 临时目录；保留可复用缓存，例如 `models/`、`temp/boundary-cache/` 和 Web 状态。
+成功运行后默认删除一次性 job 临时目录；保留可复用缓存，例如 `models/`、`tmp/cache/boundary/` 和 Web 状态。旧版 `temp/` 已断兼容废弃，active code 不再写入该目录；如果本地还有旧运行数据，可以手动归档或删除。
 
 ---
 
@@ -344,7 +354,7 @@ DP sweep 的性能要分阶段看：SpeechBoundary-JA PTM 和 learned Boundary R
 
 ### 长任务怎么排查
 
-启用运行日志后，日志会写入 `temp/log/` 或任务输出目录。反馈问题时请保留 `.run.log`、质量报告和对应 SRT。
+启用运行日志后，日志会写入 `tmp/log/` 或任务输出目录。反馈问题时请保留 `.run.log`、质量报告和对应 SRT。
 
 ---
 

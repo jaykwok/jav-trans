@@ -22,9 +22,9 @@ os.environ.setdefault("JAVTRANS_RUNTIME_ROOT", str(_ROOT))
 os.environ.setdefault("JAVTRANS_RESOURCE_ROOT", str(_RESOURCE_ROOT))
 os.environ.setdefault("PYTHONIOENCODING", "utf-8")
 os.environ.setdefault("HF_HOME", str(_ROOT / "models"))
-os.environ.setdefault("HF_HUB_CACHE", str(_ROOT / "temp" / "hf-cache" / "hub"))
-os.environ.setdefault("HF_XET_CACHE", str(_ROOT / "temp" / "hf-cache" / "xet"))
-os.environ.setdefault("TORCH_HOME", str(_ROOT / "temp" / "torch"))
+os.environ.setdefault("HF_HUB_CACHE", str(_ROOT / "tmp" / "cache" / "hf" / "hub"))
+os.environ.setdefault("HF_XET_CACHE", str(_ROOT / "tmp" / "cache" / "hf" / "xet"))
+os.environ.setdefault("TORCH_HOME", str(_ROOT / "tmp" / "cache" / "torch"))
 
 for _SRC in (_RESOURCE_ROOT / "src", _ROOT / "src"):
     if _SRC.exists() and str(_SRC) not in sys.path:
@@ -44,12 +44,13 @@ EVENTS_PORT = int(os.getenv("JAVTRANS_EVENTS_PORT", "17322"))
 
 # Dirs to keep across runs (model caches, reusable state)
 _KEEP_DIRS = {
-    "temp/hf-cache",
-    "temp/audio-separator",
-    "temp/web",          # keeps jobs.json + uploads; sub-cleanup below
+    "tmp/cache/hf",
+    "tmp/cache/boundary",
+    "tmp/cache/audio-separator",
+    "tmp/web",          # keeps jobs.json + uploads; sub-cleanup below
 }
 
-# Globs inside temp/ that are always safe to remove (one-time job artifacts)
+# Globs inside tmp/ that are always safe to remove (one-time job artifacts)
 _CLEAN_GLOBS = [
     "jobs_*",
     "chunk_*",
@@ -60,21 +61,21 @@ _CLEAN_GLOBS = [
 
 
 def _cleanup_temp() -> None:
-    temp = _ROOT / "temp"
-    if not temp.exists():
+    tmp = _ROOT / "tmp"
+    if not tmp.exists():
         return
 
-    # 1. One-time job/chunk dirs at temp root
+    # 1. One-time job/chunk dirs at tmp root
     for pattern in _CLEAN_GLOBS:
-        for p in temp.glob(pattern):
+        for p in tmp.glob(pattern):
             if p.is_dir():
                 shutil.rmtree(p, ignore_errors=True)
             elif p.is_file():
                 p.unlink(missing_ok=True)
 
-    # 2. Inside temp/web/jobs/<id>/ — remove audio/ subdirs (large chunks),
+    # 2. Inside tmp/web/jobs/<id>/ - remove audio/ subdirs (large chunks),
     #    keep everything else (checkpoints, aligned_segments.json)
-    jobs_root = temp / "web" / "jobs"
+    jobs_root = tmp / "web" / "jobs"
     if jobs_root.exists():
         for job_dir in jobs_root.iterdir():
             if job_dir.is_dir():

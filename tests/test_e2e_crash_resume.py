@@ -12,7 +12,7 @@ from helpers import make_job_context, run_pipeline
 
 def _cleanup_job_temp(job_temp_dir: Path) -> None:
     chunk_root = Path(
-        getattr(main.asr_module, "_ASR_CHUNK_ROOT", Path("temp") / "chunks")
+        getattr(main.asr_module, "_ASR_CHUNK_ROOT", Path("tmp") / "chunks")
     )
     cleanup_job_temp(
         str(job_temp_dir),
@@ -120,6 +120,12 @@ def test_cleanup_removes_translation_cache_and_matching_asr_checkpoint(monkeypat
 
     cache_path = tmp_path / "translation_cache.json"
     cache_path.write_text('{"0": ["zh-0"]}', encoding="utf-8")
+    cache_jsonl_path = tmp_path / "translation_cache.jsonl"
+    cache_jsonl_path.write_text("", encoding="utf-8")
+    cache_memory_path = tmp_path / "translation_cache.memory.jsonl"
+    cache_memory_path.write_text("", encoding="utf-8")
+    glossary_cache_path = tmp_path / "translation_global_glossary.abc123.json"
+    glossary_cache_path.write_text("{}", encoding="utf-8")
     checkpoint_root = tmp_path / "asr_root"
     checkpoint_root.mkdir()
     matching_checkpoint = checkpoint_root / "asr_checkpoint_match.json"
@@ -144,6 +150,9 @@ def test_cleanup_removes_translation_cache_and_matching_asr_checkpoint(monkeypat
     _cleanup_job_temp(job_dir)
 
     assert not cache_path.exists()
+    assert not cache_jsonl_path.exists()
+    assert not cache_memory_path.exists()
+    assert not glossary_cache_path.exists()
     assert not matching_checkpoint.exists()
     assert unrelated_checkpoint.exists()
     assert not audio_path.exists()

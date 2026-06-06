@@ -74,3 +74,81 @@ def test_translation_cache_key_ignores_non_timing_metadata():
 
     assert first == second
 
+
+def test_translation_memory_key_survives_timing_changes():
+    first = translator._translation_memory_key(
+        " いい\n",
+        glossary="健太（男主）",
+        target_lang="简体中文",
+    )
+    second = translator._translation_memory_key(
+        "いい",
+        glossary="健太（男主）",
+        target_lang="简体中文",
+    )
+
+    assert first == second
+
+
+def test_translation_memory_key_changes_with_glossary():
+    first = translator._translation_memory_key(
+        "いい",
+        glossary="健太-Kenta",
+        target_lang="简体中文",
+    )
+    second = translator._translation_memory_key(
+        "いい",
+        glossary="小那海-Aya",
+        target_lang="简体中文",
+    )
+
+    assert first != second
+
+
+def test_translation_memory_key_changes_with_target_lang():
+    first = translator._translation_memory_key(
+        "いい",
+        glossary="",
+        target_lang="简体中文",
+    )
+    second = translator._translation_memory_key(
+        "いい",
+        glossary="",
+        target_lang="繁體中文",
+    )
+
+    assert first != second
+
+
+def test_translation_memory_key_changes_with_character_reference():
+    first = translator._translation_memory_key(
+        "いい",
+        glossary="",
+        target_lang="简体中文",
+        character_reference="Aya",
+    )
+    second = translator._translation_memory_key(
+        "いい",
+        glossary="",
+        target_lang="简体中文",
+        character_reference="Mio",
+    )
+
+    assert first != second
+
+
+def test_translation_memory_key_changes_with_prompt_version(monkeypatch):
+    first = translator._translation_memory_key("いい", glossary="", target_lang="简体中文")
+
+    monkeypatch.setattr(translator, "PROMPT_VERSION", "v-test-next")
+    second = translator._translation_memory_key("いい", glossary="", target_lang="简体中文")
+
+    assert first != second
+
+
+def test_translation_memory_rejects_low_information_sources():
+    assert not translator._translation_memory_source_is_cacheable("")
+    assert not translator._translation_memory_source_is_cacheable("あ")
+    assert not translator._translation_memory_source_is_cacheable("ああああ")
+    assert translator._translation_memory_source_is_cacheable("もっと来て")
+

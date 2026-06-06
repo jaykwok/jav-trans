@@ -26,11 +26,19 @@ def cleanup_translation_cache(cache_path: str = "") -> None:
         cache_paths.append(raw_cache_path.with_suffix(".jsonl"))
     elif raw_cache_path.suffix.lower() == ".jsonl":
         cache_paths.append(raw_cache_path.with_suffix(".json"))
+    jsonl_cache_path = (
+        raw_cache_path.with_suffix(".jsonl")
+        if raw_cache_path.suffix.lower() == ".json"
+        else raw_cache_path
+    )
+    cache_paths.append(jsonl_cache_path.with_name(f"{jsonl_cache_path.stem}.memory.jsonl"))
 
     for cache_path_item in cache_paths:
         unlink_for_cleanup(cache_path_item)
         for tmp_path in cache_path_item.parent.glob(f"{cache_path_item.name}.*.tmp"):
             unlink_for_cleanup(tmp_path)
+        for glossary_path in cache_path_item.parent.glob("translation_global_glossary*.json"):
+            unlink_for_cleanup(glossary_path)
 
 
 def cleanup_asr_checkpoints(job_temp_dir: Path, checkpoint_root: Path) -> None:

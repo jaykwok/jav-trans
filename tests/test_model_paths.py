@@ -154,5 +154,5 @@ def test_download_snapshot_rejects_hf_endpoint_without_protocol(monkeypatch, tmp
 
 
 def test_huggingface_runtime_cache_is_not_models_top_level():
-    assert model_paths.HF_RUNTIME_CACHE_ROOT == model_paths.PROJECT_ROOT / "temp" / "hf-cache"
+    assert model_paths.HF_RUNTIME_CACHE_ROOT == model_paths.PROJECT_ROOT / "tmp" / "cache" / "hf"
     assert model_paths.HF_RUNTIME_CACHE_ROOT.parent != model_paths.MODELS_ROOT

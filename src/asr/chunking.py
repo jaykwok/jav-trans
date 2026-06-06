@@ -14,7 +14,7 @@ _KEEP_ASR_CHUNKS = os.getenv("KEEP_ASR_CHUNKS", "").strip().lower() in {
     "on",
 }
 _ASR_CHUNK_ROOT = Path(
-    os.getenv("ASR_CHUNK_ROOT", Path("temp") / "chunks")
+    os.getenv("ASR_CHUNK_ROOT", Path("tmp") / "chunks")
 ).resolve()
 _LAST_BOUNDARY_SIGNATURE: dict = {}
 

@@ -1,5 +1,6 @@
 import json
 import contextlib
+import hashlib
 import os
 import re
 import threading
@@ -200,6 +201,10 @@ _load_translation_cache = translation_cache._load_translation_cache
 _translation_cache_jsonl_path = translation_cache._translation_cache_jsonl_path
 _read_translation_cache_jsonl = translation_cache._read_translation_cache_jsonl
 _save_cache_entry = translation_cache._save_cache_entry
+_translation_memory_jsonl_path = translation_cache._translation_memory_jsonl_path
+_load_translation_memory = translation_cache._load_translation_memory
+_read_translation_memory_jsonl = translation_cache._read_translation_memory_jsonl
+_save_memory_entries = translation_cache._save_memory_entries
 
 
 def _compute_prompt_signature(
@@ -240,6 +245,29 @@ def _translation_cache_key(
         model_name=os.getenv("LLM_MODEL_NAME", LLM_MODEL_NAME).strip(),
         compact_system_prompt=COMPACT_SYSTEM_PROMPT,
     )
+
+
+def _translation_memory_key(
+    source_text: str,
+    extra_glossary: str = "",
+    *,
+    glossary: str = "",
+    target_lang: str = "简体中文",
+    character_reference: str = "",
+) -> str:
+    return translation_cache._translation_memory_key(
+        source_text,
+        extra_glossary,
+        glossary=glossary,
+        target_lang=target_lang,
+        character_reference=character_reference,
+        prompt_version=PROMPT_VERSION,
+        model_name=os.getenv("LLM_MODEL_NAME", LLM_MODEL_NAME).strip(),
+    )
+
+
+def _translation_memory_source_is_cacheable(source_text: str) -> bool:
+    return translation_cache._translation_memory_source_is_cacheable(source_text)
 
 
 def _get_nested_value(value, *path: str):
@@ -353,9 +381,15 @@ def _format_global_glossary_terms(
     return "\n".join(lines)
 
 
-def _global_glossary_cache_path(translation_cache_path: str) -> str:
+def _global_glossary_cache_path_for_texts(
+    translation_cache_path: str,
+    all_ja_texts: list[str],
+) -> str:
     cache_path = Path(translation_cache_path)
-    return str(cache_path.with_name("translation_global_glossary.json"))
+    source_sig = hashlib.sha1(
+        "\n".join(str(text or "") for text in all_ja_texts).encode("utf-8")
+    ).hexdigest()[:12]
+    return str(cache_path.with_name(f"translation_global_glossary.{source_sig}.json"))
 
 
 def extract_global_glossary(
@@ -504,6 +538,7 @@ def translate_segments(
             zh_texts, timings = _translate_segments_single_request(
                 segments,
                 global_context=global_context,
+                cache_path=effective_cache_path,
                 target_lang=effective_target_lang,
                 glossary=effective_glossary,
                 character_reference=effective_character_reference,
@@ -579,6 +614,7 @@ def _translate_segments_single_request(
     segments: list[dict],
     *,
     global_context: str | None = None,
+    cache_path: str = "",
     target_lang: str,
     glossary: str,
     character_reference: str,
@@ -598,10 +634,99 @@ def _translate_segments_single_request(
     source_payload = _serialize_segments(segments)
     expected_count = len(segments)
     request_usages: list[dict] = []
+    extra_glossary = ""
+    all_ja_texts = [str(seg.get("text", "")) for seg in segments]
+    if cache_path:
+        glossary_terms = extract_global_glossary(
+            all_ja_texts,
+            _global_glossary_cache_path_for_texts(cache_path, all_ja_texts),
+            api_format=api_format,
+            cancel_event=cancel_event,
+        )
+        extra_glossary = _format_global_glossary_terms(
+            glossary_terms,
+            glossary=glossary,
+        )
+
+    batch_key = ""
+    translation_cache = _load_translation_cache(cache_path) if cache_path else {}
+    translation_memory = _load_translation_memory(cache_path) if cache_path else {}
+    if cache_path:
+        batch_key = _translation_cache_key(
+            0,
+            segments,
+            extra_glossary=extra_glossary,
+            glossary=glossary,
+            target_lang=target_lang,
+            character_reference=character_reference,
+        )
+        cached_texts = translation_cache.get(batch_key)
+        if isinstance(cached_texts, list) and len(cached_texts) == expected_count:
+            timing = {
+                "start_index": 0,
+                "segment_count": expected_count,
+                "elapsed_s": time.perf_counter() - started,
+                "mode": "translation_cache_hit",
+                "request_count": 0,
+                "source_payload_chars": 0,
+                "global_context_chars": len(full_context),
+                "missing_count": 0,
+                "missing_indexes": [],
+                "cache_hit": True,
+                "cache_hit_type": "exact_batch",
+                "translation_memory_hit_count": 0,
+                **_merge_usage_metrics([]),
+            }
+            if on_batch_done:
+                _raise_if_cancelled(cancel_event)
+                on_batch_done(timing)
+            return [_normalize_translation_text(text) or "" for text in cached_texts], [timing]
+
+        memory_texts: list[str | None] = []
+        memory_hit_count = 0
+        for seg in segments:
+            source_text = str(seg.get("text", ""))
+            memory_text = None
+            if _translation_memory_source_is_cacheable(source_text):
+                memory_key = _translation_memory_key(
+                    source_text,
+                    extra_glossary,
+                    glossary=glossary,
+                    target_lang=target_lang,
+                    character_reference=character_reference,
+                )
+                cached_memory_text = translation_memory.get(memory_key)
+                if isinstance(cached_memory_text, str) and cached_memory_text.strip():
+                    memory_text = _normalize_translation_text(cached_memory_text) or ""
+                    memory_hit_count += 1
+            memory_texts.append(memory_text)
+        if memory_hit_count == expected_count:
+            final_texts = [text or "" for text in memory_texts]
+            _save_cache_entry(cache_path, batch_key, final_texts, _cache_lock)
+            timing = {
+                "start_index": 0,
+                "segment_count": expected_count,
+                "elapsed_s": time.perf_counter() - started,
+                "mode": "translation_memory_hit",
+                "request_count": 0,
+                "source_payload_chars": 0,
+                "global_context_chars": len(full_context),
+                "missing_count": 0,
+                "missing_indexes": [],
+                "cache_hit": True,
+                "cache_hit_type": "translation_memory",
+                "translation_memory_hit_count": memory_hit_count,
+                **_merge_usage_metrics([]),
+            }
+            if on_batch_done:
+                _raise_if_cancelled(cancel_event)
+                on_batch_done(timing)
+            return final_texts, [timing]
 
     messages = _build_translation_messages(
         source_payload=source_payload,
         expected_count=expected_count,
+        extra_glossary=extra_glossary,
         target_lang=target_lang,
         glossary=glossary,
         character_reference=character_reference,
@@ -655,7 +780,28 @@ def _translate_segments_single_request(
     if on_batch_done:
         _raise_if_cancelled(cancel_event)
         on_batch_done(timing)
-    return [text or "" for text in zh_texts], [timing]
+    final_texts = [text or "" for text in zh_texts]
+    if cache_path and batch_key:
+        _save_cache_entry(cache_path, batch_key, final_texts, _cache_lock)
+        memory_entries: list[tuple[str, str]] = []
+        for seg, text in zip(segments, final_texts):
+            source_text = str(seg.get("text", ""))
+            if text and _translation_memory_source_is_cacheable(source_text):
+                memory_entries.append(
+                    (
+                        _translation_memory_key(
+                            source_text,
+                            extra_glossary,
+                            glossary=glossary,
+                            target_lang=target_lang,
+                            character_reference=character_reference,
+                        ),
+                        text,
+                    )
+                )
+        if memory_entries:
+            _save_memory_entries(cache_path, memory_entries, _cache_lock)
+    return final_texts, [timing]
 
 
 def _translate_segments_batched(
@@ -679,10 +825,14 @@ def _translate_segments_batched(
     batches = _split_into_batches(segments, batch_size)
     expected_total = len(segments)
     extra_glossary = ""
+    all_ja_texts = [str(seg.get("text", "")) for seg in segments]
     if cache_path:
         glossary_terms = extract_global_glossary(
-            [str(seg.get("text", "")) for seg in segments],
-            _global_glossary_cache_path(cache_path),
+            all_ja_texts,
+            _global_glossary_cache_path_for_texts(
+                cache_path,
+                all_ja_texts,
+            ),
             api_format=api_format,
             cancel_event=cancel_event,
         )
@@ -721,8 +871,15 @@ def _translate_segments_batched(
         if cache_path
         else {}
     )
+    translation_memory = (
+        _load_translation_memory(cache_path)
+        if cache_path
+        else {}
+    )
     pending_batches: list[tuple[int, list[dict]]] = []
     warmup_timing: dict | None = None
+    exact_cache_hit_count = 0
+    translation_memory_hit_count = 0
 
     for batch_index, batch_segments in enumerate(batches):
         _raise_if_cancelled(cancel_event)
@@ -736,6 +893,7 @@ def _translate_segments_batched(
         )
         cached_texts = translation_cache.get(batch_key)
         if isinstance(cached_texts, list) and len(cached_texts) == len(batch_segments):
+            exact_cache_hit_count += 1
             print(f"[translation-cache] restored batch {batch_index} cache_key={batch_key}")
             start_index = batch_index * batch_size
             for offset, text in enumerate(cached_texts):
@@ -756,6 +914,8 @@ def _translate_segments_batched(
                 "missing_count": 0,
                 "missing_indexes": [],
                 "cache_hit": True,
+                "cache_hit_type": "exact_batch",
+                "translation_memory_hit_count": 0,
             }
             timings_by_batch[batch_index] = timing
             _emit_progress(
@@ -770,7 +930,82 @@ def _translate_segments_batched(
                 _raise_if_cancelled(cancel_event)
                 on_batch_done(timing)
         else:
-            pending_batches.append((batch_index, batch_segments))
+            start_index = batch_index * batch_size
+            memory_hit_ids: list[int] = []
+            for offset, seg in enumerate(batch_segments):
+                source_text = str(seg.get("text", ""))
+                if not cache_path or not _translation_memory_source_is_cacheable(source_text):
+                    continue
+                memory_key = _translation_memory_key(
+                    source_text,
+                    extra_glossary,
+                    glossary=glossary,
+                    target_lang=target_lang,
+                    character_reference=character_reference,
+                )
+                memory_text = translation_memory.get(memory_key)
+                if isinstance(memory_text, str) and memory_text.strip():
+                    global_index = start_index + offset
+                    zh_texts[global_index] = _normalize_translation_text(memory_text) or ""
+                    memory_hit_ids.append(global_index)
+
+            if memory_hit_ids:
+                translation_memory_hit_count += len(memory_hit_ids)
+                print(
+                    "[translation-memory] restored "
+                    f"batch={batch_index} ids={memory_hit_ids[:20]}"
+                )
+
+            if len(memory_hit_ids) == len(batch_segments):
+                local_texts = [
+                    zh_texts[start_index + offset] or ""
+                    for offset in range(len(batch_segments))
+                ]
+                if cache_path:
+                    _save_cache_entry(cache_path, batch_key, local_texts, _cache_lock)
+                    translation_cache[batch_key] = local_texts
+                timing = {
+                    "batch_index": batch_index,
+                    "start_index": start_index,
+                    "segment_count": len(batch_segments),
+                    "elapsed_s": 0.0,
+                    "mode": "translation_memory_hit",
+                    "request_count": 0,
+                    "source_payload_chars": 0,
+                    "global_context_chars": len(full_context),
+                    "prefix_mode": prefix_mode,
+                    "requested_ids": list(range(start_index, start_index + len(batch_segments))),
+                    "is_warmup": False,
+                    **_merge_usage_metrics([]),
+                    "missing_count": 0,
+                    "missing_indexes": [],
+                    "cache_hit": True,
+                    "cache_hit_type": "translation_memory",
+                    "translation_memory_hit_count": len(memory_hit_ids),
+                }
+                timings_by_batch[batch_index] = timing
+                _emit_progress(
+                    progress_callbacks[batch_index],
+                    {
+                        "phase": "done",
+                        "translated": len(batch_segments),
+                        "expected": len(batch_segments),
+                    },
+                )
+                if on_batch_done:
+                    _raise_if_cancelled(cancel_event)
+                    on_batch_done(timing)
+            else:
+                if memory_hit_ids:
+                    _emit_progress(
+                        progress_callbacks[batch_index],
+                        {
+                            "phase": "translating",
+                            "translated": len(memory_hit_ids),
+                            "expected": len(batch_segments),
+                        },
+                    )
+                pending_batches.append((batch_index, batch_segments))
 
     _raise_if_cancelled(cancel_event)
     if pending_batches and use_full_json_prefix and TRANSLATION_PREFIX_WARMUP:
@@ -847,8 +1082,22 @@ def _translate_segments_batched(
         worker_thread_name = worker_thread.name
         start_index = batch_index * batch_size
         expected_count = len(batch_segments)
-        source_payload = _serialize_segments(batch_segments, start_index=start_index)
-        expected_ids = list(range(start_index, start_index + expected_count))
+        all_batch_ids = list(range(start_index, start_index + expected_count))
+        requested_segments: list[dict] = []
+        expected_ids: list[int] = []
+        batch_results: list[str | None] = [None] * expected_total
+        for offset, seg in enumerate(batch_segments):
+            global_index = start_index + offset
+            cached_text = zh_texts[global_index]
+            if cached_text is not None:
+                batch_results[global_index] = cached_text
+                continue
+            requested_segments.append(seg)
+            expected_ids.append(global_index)
+        source_payload = _serialize_segments(
+            requested_segments,
+            explicit_ids=expected_ids,
+        )
         trace_base = {
             "diagnostic": True,
             "batch_index": batch_index,
@@ -861,24 +1110,24 @@ def _translate_segments_batched(
         }
         emit_batch_diagnostic({"phase": "batch_start", **trace_base})
         messages = _build_batch_messages(
-            batch_segments,
+            requested_segments,
             full_context,
-            start_index,
+            0,
             character_reference,
-            expected_count,
+            len(requested_segments),
             batch_index=batch_index,
             extra_glossary=extra_glossary,
             target_lang=target_lang,
             glossary=glossary,
+            source_payload_override=source_payload,
             full_source_payload=full_source_payload if use_full_json_prefix else None,
             requested_ids=expected_ids,
         )
-        batch_results: list[str | None] = [None] * expected_total
         missing_indexes: list[int] = []
         progress_callback = progress_callbacks[batch_index]
         request_count = 0
         pending_ids = list(expected_ids)
-        pending_segments = list(batch_segments)
+        pending_segments = list(requested_segments)
         request_usages: list[dict] = []
         first_token_ts: float | None = None
         active_request_index = 0
@@ -924,7 +1173,7 @@ def _translate_segments_batched(
                 _raise_if_cancelled(cancel_event)
                 if request_count == 0:
                     request_messages = messages
-                    request_expected_count = expected_count
+                    request_expected_count = len(requested_segments)
                     request_source_payload = source_payload
                 else:
                     request_expected_count = len(pending_segments)
@@ -967,7 +1216,7 @@ def _translate_segments_batched(
                         batch_results[idx] = parsed[idx]
                 missing_indexes = [
                     index
-                    for index in expected_ids
+                    for index in all_batch_ids
                     if batch_results[index] is None
                 ]
                 if not missing_indexes:
@@ -1045,6 +1294,8 @@ def _translate_segments_batched(
             **_merge_usage_metrics(request_usages),
             "missing_count": len(missing_indexes),
             "missing_indexes": missing_indexes,
+            "translation_memory_hit_count": expected_count - len(expected_ids),
+            "cache_hit_type": "mixed" if len(expected_ids) < expected_count else "miss",
         }
         return batch_index, batch_results, timing
 
@@ -1076,11 +1327,28 @@ def _translate_segments_batched(
                         start_index = int(timing["start_index"])
                         segment_count = int(timing["segment_count"])
                         local_texts: list[str] = []
+                        memory_entries: list[tuple[str, str]] = []
                         for offset in range(segment_count):
                             global_index = start_index + offset
-                            text = batch_results[global_index] or ""
+                            text = batch_results[global_index] or zh_texts[global_index] or ""
                             zh_texts[global_index] = text
                             local_texts.append(text)
+                            source_text = str(
+                                pending_by_index[batch_index][offset].get("text", "")
+                            )
+                            if (
+                                cache_path
+                                and text
+                                and _translation_memory_source_is_cacheable(source_text)
+                            ):
+                                memory_key = _translation_memory_key(
+                                    source_text,
+                                    extra_glossary,
+                                    glossary=glossary,
+                                    target_lang=target_lang,
+                                    character_reference=character_reference,
+                                )
+                                memory_entries.append((memory_key, text))
                         if cache_path:
                             batch_key = _translation_cache_key(
                                 batch_index,
@@ -1096,6 +1364,15 @@ def _translate_segments_batched(
                                 local_texts,
                                 _cache_lock,
                             )
+                            translation_cache[batch_key] = local_texts
+                            if memory_entries:
+                                _save_memory_entries(
+                                    cache_path,
+                                    memory_entries,
+                                    _cache_lock,
+                                )
+                                for memory_key, memory_text in memory_entries:
+                                    translation_memory[memory_key] = memory_text
                             print(f"[translation-cache] saved batch {batch_index} cache_key={batch_key}")
                             if _test_crash_translation_batch() == batch_index + 1:
                                 for pending_future in futures:
@@ -1133,7 +1410,8 @@ def _translate_segments_batched(
             "request_count": len(pending_batches),
             "batch_size": batch_size,
             "max_workers": max_workers,
-            "cache_hit_count": len(batches) - len(pending_batches),
+            "cache_hit_count": exact_cache_hit_count,
+            "translation_memory_hit_count": translation_memory_hit_count,
             "prefix_mode": prefix_mode,
             "is_warmup": False,
             "requested_ids": [],

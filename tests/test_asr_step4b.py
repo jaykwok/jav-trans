@@ -32,7 +32,7 @@ def main() -> None:
     from asr.local_backend import SubprocessAsrBackend, WorkerTimeoutError
 
     label = "ASR 文本转写"
-    root = Path("temp") / "tests" / f"step4b_{uuid.uuid4().hex[:8]}"
+    root = Path("tmp") / "tests" / f"step4b_{uuid.uuid4().hex[:8]}"
 
     def make_chunks(name: str, count: int) -> list[dict]:
         source = root / f"{name}_source.wav"

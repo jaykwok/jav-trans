@@ -74,7 +74,7 @@ class JobContext:
     keep_quality_report: bool
     keep_temp_files: bool
     run_log_enabled: bool = False
-    run_log_dir: str = "./temp/log"
+    run_log_dir: str = "./tmp/log"
     fail_on_qc_block: bool = True
     llm_api_format: str = "chat"
     llm_reasoning_effort: str = "xhigh"
@@ -128,7 +128,7 @@ class JobContext:
             ),
             run_log_dir=advanced.get(
                 "RUN_LOG_DIR",
-                str(getattr(spec, "run_log_dir", "./temp/log") or "./temp/log"),
+                str(getattr(spec, "run_log_dir", "./tmp/log") or "./tmp/log"),
             ),
             fail_on_qc_block=_flag(
                 advanced.get("FAIL_ON_QC_BLOCK"),

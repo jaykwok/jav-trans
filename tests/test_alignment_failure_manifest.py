@@ -21,7 +21,7 @@ def test_manifest_row_preserves_source_and_review_type():
         {
             "case_label": "full15000",
             "video": "sample",
-            "source_audio_path": "temp/audio.wav",
+            "source_audio_path": "tmp/tests/audio.wav",
             "aligned_path": "sample.aligned_segments.json",
             "chunk_index": 7,
             "position": 3,
@@ -37,7 +37,7 @@ def test_manifest_row_preserves_source_and_review_type():
     )
 
     assert row["sample_id"] == "full15000__sample__chunk0007__vad_coarse_alignment"
-    assert row["source_audio_path"] == "temp/audio.wav"
+    assert row["source_audio_path"] == "tmp/tests/audio.wav"
     assert row["review_type"] == "review_coarse_timing"
     assert row["display_text"] == "ああ"
     assert row["manual_label"] == ""

@@ -102,8 +102,9 @@ def test_non_python_shared_files_are_not_read(monkeypatch, tmp_path):
 
 def test_default_model_download_root_is_project_models():
     assert config.DEFAULT_SETTINGS["HF_HOME"] == "./models"
-    assert config.DEFAULT_SETTINGS["TORCH_HOME"] == "./temp/torch"
-    assert config.DEFAULT_SETTINGS["JOB_TEMP_DIR"] == "./temp/jobs"
+    assert config.DEFAULT_SETTINGS["TORCH_HOME"] == "./tmp/cache/torch"
+    assert config.DEFAULT_SETTINGS["JOB_TEMP_DIR"] == "./tmp/jobs"
+    assert config.DEFAULT_SETTINGS["ASR_CHUNK_ROOT"] == "./tmp/chunks"
     assert "KEEP_TEMP_FILES" not in config.DEFAULT_SETTINGS
     assert config.DEFAULT_SETTINGS["ASR_CONTEXT"] == ""
     assert config.DEFAULT_SETTINGS["ASR_BACKEND"] == "jaykwok/Qwen3-ASR-0.6B-JA-Anime-Galgame"
@@ -130,8 +131,8 @@ def test_frozen_path_defaults_resolve_to_runtime_root(monkeypatch, tmp_path):
         "DEFAULT_SETTINGS",
         {
             "HF_HOME": "./models",
-            "TORCH_HOME": "./temp/torch",
-            "JOB_TEMP_DIR": "./temp/jobs",
+            "TORCH_HOME": "./tmp/cache/torch",
+            "JOB_TEMP_DIR": "./tmp/jobs",
             "LLM_MODEL_NAME": "from_config",
         },
     )
@@ -141,6 +142,6 @@ def test_frozen_path_defaults_resolve_to_runtime_root(monkeypatch, tmp_path):
     config.load_config()
 
     assert os.environ["HF_HOME"] == str((tmp_path / "models").resolve())
-    assert os.environ["TORCH_HOME"] == str((tmp_path / "temp" / "torch").resolve())
-    assert os.environ["JOB_TEMP_DIR"] == str((tmp_path / "temp" / "jobs").resolve())
+    assert os.environ["TORCH_HOME"] == str((tmp_path / "tmp" / "cache" / "torch").resolve())
+    assert os.environ["JOB_TEMP_DIR"] == str((tmp_path / "tmp" / "jobs").resolve())
     assert os.environ["LLM_MODEL_NAME"] == "from_config"
