@@ -11,6 +11,7 @@ from tools.boundary.build_refiner_frame_sequence_dataset import (
     build_frame_sequence_dataset,
 )
 from tools.boundary.build_weighted_source_manifest import build_weighted_manifest
+from tools.boundary import train_refiner as train_refiner_module
 from tools.boundary.train_refiner import TrainRefinerConfig, train_refiner
 from boundary.ja import write_jsonl
 from boundary.sequence_features import FRAME_SEQUENCE_FEATURE_SCHEMA
@@ -37,22 +38,19 @@ def test_build_refiner_gap_dataset_from_boundary_metadata(tmp_path):
                         {"start": 1.02, "end": 2.0},
                         {"start": 3.0, "end": 4.0},
                     ],
-                    "speaker_turn_boundaries": [
+                    "utterance_boundaries": [
                         {
                             "index": 0,
-                            "boundary_type": "speaker_turn",
+                            "boundary_type": "cut_point",
                             "gap_s": 0.02,
-                            "speaker_changed": True,
                         },
                         {
                             "index": 1,
                             "boundary_type": "gap_zone",
                             "gap_s": 1.0,
-                            "speaker_changed": True,
                         },
                     ],
                     "source_audio_ids": ["a", "b", "c"],
-                    "speaker_proxy_ids": ["a", "b", "c"],
                 },
             }
         ],
@@ -92,7 +90,7 @@ def test_build_refiner_gap_dataset_from_boundary_metadata(tmp_path):
     rows = [json.loads(line) for line in output_jsonl.read_text(encoding="utf-8").splitlines()]
     assert summary["class_balance"] == {"merge_positive": 1, "split_negative": 2}
     assert {row["label_reason"] for row in rows} == {
-        "split_speaker_change",
+        "split_cut_point",
         "split_gap_zone",
         "merge_synthetic_intra_island",
     }
@@ -320,6 +318,93 @@ def test_train_refiner_accepts_sequence_dataset(tmp_path):
     assert metrics["class_counts"] == {"merge_positive": 6, "split_negative": 6}
 
 
+def test_train_refiner_uses_streaming_tensor_loader(tmp_path, monkeypatch):
+    pytest.importorskip("torch")
+    transformers = pytest.importorskip("transformers")
+    if not hasattr(transformers, "Mamba2Model"):
+        pytest.skip("transformers.Mamba2Model is unavailable")
+
+    feature_names = [
+        "gap_s",
+        "left_duration_s",
+        "right_duration_s",
+        "current_core_s",
+        "proposed_core_s",
+        "gap_merge_s",
+        "gap_ratio",
+        "proposed_over_target_s",
+        "left_score",
+        "right_score",
+        "valley_score_min",
+        "cut_score_max",
+        "gap_boundary_score",
+    ]
+    rows = []
+    for row_index in range(6):
+        merge = row_index % 2 == 0
+        gap_s = 0.04 if merge else 0.9
+        rows.append(
+            {
+                "schema": "boundary_refiner_sequence_dataset_v1",
+                "audio_id": f"stream-{row_index}",
+                "feature_names": feature_names,
+                "sequence_features": [
+                    [
+                        gap_s,
+                        1.0,
+                        1.0,
+                        1.0,
+                        2.0 + gap_s,
+                        1.5,
+                        min(1.0, gap_s / 1.5),
+                        1.0 + gap_s,
+                        1.0,
+                        1.0,
+                        1.0,
+                        0.0,
+                        min(1.0, gap_s / 1.5),
+                    ]
+                ],
+                "sequence_labels": [1 if merge else 0],
+            }
+        )
+    dataset = tmp_path / "streaming-sequence.jsonl"
+    dataset.write_text(
+        "\n".join(json.dumps(row, ensure_ascii=False, sort_keys=True) for row in rows) + "\n",
+        encoding="utf-8",
+    )
+
+    original_iter = train_refiner_module._iter_dataset_rows
+    calls = {"count": 0}
+
+    def counting_iter(paths):
+        calls["count"] += 1
+        yield from original_iter(paths)
+
+    monkeypatch.setattr(train_refiner_module, "_iter_dataset_rows", counting_iter)
+
+    metrics = train_refiner(
+        dataset_paths=[dataset],
+        output_dir=tmp_path / "streaming-train",
+        config=TrainRefinerConfig(
+            max_steps=1,
+            batch_size=2,
+            device="cpu",
+            hidden_size=8,
+            num_layers=1,
+            state_size=4,
+            num_heads=4,
+            n_groups=2,
+            chunk_size=4,
+            log_interval_steps=0,
+        ),
+    )
+
+    assert Path(metrics["checkpoint"]).exists()
+    assert metrics["train_items"] + metrics["val_items"] == 6
+    assert calls["count"] == 2
+
+
 def test_build_frame_sequence_dataset_trains_with_cached_features(tmp_path):
     pytest.importorskip("numpy")
     torch = pytest.importorskip("torch")
@@ -353,16 +438,14 @@ def test_build_frame_sequence_dataset_trains_with_cached_features(tmp_path):
                         {"start": 0.24, "end": 0.4},
                         {"start": 0.5, "end": 0.6},
                     ],
-                    "speaker_turn_boundaries": [
+                    "utterance_boundaries": [
                         {
                             "index": 1,
                             "boundary_type": "gap_zone",
                             "gap_s": 0.1,
-                            "speaker_changed": True,
                         },
                     ],
                     "source_audio_ids": ["a", "a", "b"],
-                    "speaker_proxy_ids": ["a", "a", "b"],
                 },
             }
         ],

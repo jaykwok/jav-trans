@@ -50,8 +50,10 @@ def materialize_from_dataset(
     output_dir: Path,
     audio_dir: Path,
     decode_mode: str,
+    existing_rows_by_input: dict[str, dict[str, Any]] | None = None,
 ) -> list[dict[str, Any]]:
     manifest_rows: list[dict[str, Any]] = []
+    existing_rows_by_input = existing_rows_by_input or {}
     if args.shuffle_buffer_size > 0:
         dataset = dataset.shuffle(seed=args.shuffle_seed, buffer_size=args.shuffle_buffer_size)
     for index, example in enumerate(dataset):
@@ -59,7 +61,12 @@ def materialize_from_dataset(
             continue
         if index >= args.start_index + args.limit:
             break
+        input_id = f"{args.dataset}:{args.split}:{index}"
         try:
+            existing_row = existing_rows_by_input.get(input_id)
+            if args.reuse_existing and existing_row and Path(str(existing_row.get("audio") or "")).exists():
+                manifest_rows.append(dict(existing_row))
+                continue
             audio, sample_rate = sample_hf_audio_16k_mono(example)
             audio_obj = example.get("audio")
             audio_path = ""
@@ -79,10 +86,11 @@ def materialize_from_dataset(
                 or ""
             )
             output_audio_path = audio_dir / f"{Path(audio_id).stem[:80]}.wav"
-            sf.write(str(output_audio_path), audio, sample_rate)
+            if not output_audio_path.exists() or not args.reuse_existing:
+                sf.write(str(output_audio_path), audio, sample_rate)
             manifest_rows.append(
                 {
-                    "input": f"{args.dataset}:{args.split}:{index}",
+                    "input": input_id,
                     "audio_id": audio_id,
                     "audio": str(output_audio_path),
                     "duration_s": len(audio) / sample_rate if sample_rate else 0.0,
@@ -95,7 +103,7 @@ def materialize_from_dataset(
         except Exception as exc:
             manifest_rows.append(
                 {
-                    "input": f"{args.dataset}:{args.split}:{index}",
+                    "input": input_id,
                     "source": args.dataset,
                     "decode_mode": decode_mode,
                     "error": str(exc),
@@ -108,6 +116,7 @@ def materialize(args: argparse.Namespace) -> None:
     output_dir = Path(args.output_dir)
     audio_dir = output_dir / "audio"
     audio_dir.mkdir(parents=True, exist_ok=True)
+    existing_rows_by_input = load_existing_rows(output_dir / "hf_audio_manifest.json") if args.reuse_existing else {}
     try:
         dataset = load_dataset_stream(name=args.dataset, split=args.split, decode_audio=True)
         manifest_rows = materialize_from_dataset(
@@ -116,6 +125,7 @@ def materialize(args: argparse.Namespace) -> None:
             output_dir=output_dir,
             audio_dir=audio_dir,
             decode_mode="torchcodec",
+            existing_rows_by_input=existing_rows_by_input,
         )
     except Exception as exc:
         manifest_rows = [
@@ -135,6 +145,7 @@ def materialize(args: argparse.Namespace) -> None:
             output_dir=output_dir,
             audio_dir=audio_dir,
             decode_mode="decode_false",
+            existing_rows_by_input=existing_rows_by_input,
         )
     manifest_path = output_dir / "hf_audio_manifest.json"
     summary_path = output_dir / "hf_audio_summary.json"
@@ -169,6 +180,25 @@ def materialize(args: argparse.Namespace) -> None:
     print(f"summary={summary_path}")
 
 
+def load_existing_rows(path: Path) -> dict[str, dict[str, Any]]:
+    if not path.exists():
+        return {}
+    try:
+        rows = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    if not isinstance(rows, list):
+        return {}
+    indexed: dict[str, dict[str, Any]] = {}
+    for row in rows:
+        if not isinstance(row, dict) or row.get("error"):
+            continue
+        input_id = str(row.get("input") or "")
+        if input_id and row.get("audio"):
+            indexed[input_id] = dict(row)
+    return indexed
+
+
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Materialize HF audio samples to local wav files for SpeechBoundary-JA research.")
     parser.add_argument("--dataset", default="litagin/Galgame_Speech_ASR_16kHz")
@@ -177,6 +207,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--limit", type=int, default=100)
     parser.add_argument("--shuffle-buffer-size", type=int, default=0)
     parser.add_argument("--shuffle-seed", type=int, default=13)
+    parser.add_argument("--reuse-existing", action="store_true", help="Reuse existing wav files in output-dir/audio.")
     parser.add_argument("--no-fallback-decode-false", dest="fallback_decode_false", action="store_false")
     parser.add_argument("--output-dir", default=str(PROJECT_ROOT / "agents" / "temp" / "speech-boundary-ja" / "hf-audio"))
     parser.set_defaults(fallback_decode_false=True)

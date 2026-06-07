@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import argparse
-import hashlib
 import json
 import math
 import sys
@@ -23,10 +22,23 @@ from boundary.ja import TeacherSegment, build_supervised_record, write_jsonl  # 
 
 
 def load_manifest_rows(path: Path) -> list[dict[str, Any]]:
-    payload = json.loads(path.read_text(encoding="utf-8"))
-    if not isinstance(payload, list):
-        raise ValueError(f"manifest must be a JSON list: {path}")
-    return [dict(row) for row in payload if isinstance(row, Mapping)]
+    text = path.read_text(encoding="utf-8")
+    if text.lstrip().startswith("["):
+        payload = json.loads(text)
+        if not isinstance(payload, list):
+            raise ValueError(f"manifest must be a JSON list or JSONL: {path}")
+        return [dict(row) for row in payload if isinstance(row, Mapping)]
+
+    rows: list[dict[str, Any]] = []
+    for line_number, line in enumerate(text.splitlines(), start=1):
+        stripped = line.strip()
+        if not stripped:
+            continue
+        row = json.loads(stripped)
+        if not isinstance(row, Mapping):
+            raise ValueError(f"manifest JSONL row must be an object: {path}:{line_number}")
+        rows.append(dict(row))
+    return rows
 
 
 def valid_source_rows(rows: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
@@ -144,53 +156,12 @@ def clipped_speech_audio(
     }
 
 
-def speaker_proxy_id(row: Mapping[str, Any], *, mode: str) -> str:
-    if mode == "none":
-        return ""
-    keys_by_mode = {
-        "auto": (
-            "speaker_proxy_id",
-            "speaker_id",
-            "speaker",
-            "character_id",
-            "char_id",
-            "character",
-            "charname",
-            "voice_actor_id",
-            "staff_id",
-            "va_normalized_name",
-            "voice_actor",
-            "audio_id",
-            "audio",
-        ),
-        "audio_id": ("audio_id", "audio"),
-        "character": ("character_id", "char_id", "character", "charname", "audio_id", "audio"),
-        "voice_actor": (
-            "voice_actor_id",
-            "staff_id",
-            "va_normalized_name",
-            "voice_actor",
-            "audio_id",
-            "audio",
-        ),
-    }
-    keys = keys_by_mode[mode]
-    for key in keys:
-        value = row.get(key)
-        if value is not None and str(value).strip():
-            raw = str(value).strip()
-            digest = hashlib.sha1(raw.encode("utf-8")).hexdigest()[:12]
-            return f"{key}:{digest}"
-    return ""
-
-
 def choose_speech_row(
     *,
     source_rows: list[dict[str, Any]],
     source_cursor: int,
     args: argparse.Namespace,
     rng: np.random.Generator,
-    previous_speaker_proxy: str | None,
     used_source_indices: set[int],
 ) -> tuple[dict[str, Any] | None, int, int | None]:
     if not source_rows:
@@ -213,28 +184,7 @@ def choose_speech_row(
     if not available_indices:
         return None, source_cursor, None
 
-    eligible_indices = [
-        index
-        for index in available_indices
-        for row in [source_rows[index]]
-        if not previous_speaker_proxy
-        or not speaker_proxy_id(row, mode=args.speaker_proxy_mode)
-        or speaker_proxy_id(row, mode=args.speaker_proxy_mode) != previous_speaker_proxy
-    ]
-    if eligible_indices:
-        selected_index = int(eligible_indices[int(rng.integers(0, len(eligible_indices)))])
-        return source_rows[selected_index], source_cursor, selected_index
-
-    attempts = min(len(available_indices), max(1, args.speaker_proxy_retry_count))
-    first_index = int(available_indices[int(rng.integers(0, len(available_indices)))])
-    selected_index = first_index
-    for attempt in range(attempts):
-        index = int(available_indices[int(rng.integers(0, len(available_indices)))]) if attempt else first_index
-        row = source_rows[index]
-        current_proxy = speaker_proxy_id(row, mode=args.speaker_proxy_mode)
-        if not previous_speaker_proxy or not current_proxy or current_proxy != previous_speaker_proxy:
-            selected_index = index
-            break
+    selected_index = int(available_indices[int(rng.integers(0, len(available_indices)))])
     return source_rows[selected_index], source_cursor, selected_index
 
 
@@ -245,7 +195,7 @@ def boundary_type_from_gap(
     cut_drop_min_gap_s: float,
 ) -> str:
     if gap_s <= cut_point_max_gap_s:
-        return "speaker_turn"
+        return "cut_point"
     if gap_s >= cut_drop_min_gap_s:
         return "gap_zone"
     return "ambiguous_gap"
@@ -768,11 +718,9 @@ def build_synthetic_timeline(args: argparse.Namespace) -> None:
         transition_regions: list[dict[str, Any]] = []
         previous_kind: str | None = None
         previous_speech_segment: TeacherSegment | None = None
-        previous_speaker_proxy: str | None = None
-        speaker_turn_boundaries: list[dict[str, Any]] = []
+        utterance_boundaries: list[dict[str, Any]] = []
         cut_point_segments: list[dict[str, Any]] = []
         cut_drop_zones: list[dict[str, Any]] = []
-        speaker_proxy_ids: list[str] = []
         gap_index = output_index * (args.speech_clips_per_example + 2)
 
         leading_samples = gap_samples(
@@ -824,7 +772,6 @@ def build_synthetic_timeline(args: argparse.Namespace) -> None:
                 source_cursor=source_cursor,
                 args=args,
                 rng=rng,
-                previous_speaker_proxy=previous_speaker_proxy,
                 used_source_indices=used_source_indices,
             )
             if row is None:
@@ -870,43 +817,30 @@ def build_synthetic_timeline(args: argparse.Namespace) -> None:
                 score=1.0,
             )
             speech_segments.append(current_segment)
-            current_speaker_proxy = speaker_proxy_id(row, mode=args.speaker_proxy_mode)
-            if current_speaker_proxy:
-                speaker_proxy_ids.append(current_speaker_proxy)
             if previous_speech_segment is not None:
                 turn_gap_s = current_segment.start - previous_speech_segment.end
-                speaker_changed = bool(
-                    previous_speaker_proxy
-                    and current_speaker_proxy
-                    and previous_speaker_proxy != current_speaker_proxy
-                )
                 boundary_time_s = (previous_speech_segment.end + current_segment.start) / 2.0
+                boundary_type = boundary_type_from_gap(
+                    turn_gap_s,
+                    cut_point_max_gap_s=args.cut_point_max_gap_s,
+                    cut_drop_min_gap_s=args.cut_drop_min_gap_s,
+                )
                 turn = {
-                    "index": len(speaker_turn_boundaries),
+                    "index": len(utterance_boundaries),
                     "time_s": boundary_time_s,
                     "previous_speech_end_s": previous_speech_segment.end,
                     "next_speech_start_s": current_segment.start,
                     "gap_s": turn_gap_s,
-                    "previous_speaker_proxy_id": previous_speaker_proxy or "",
-                    "next_speaker_proxy_id": current_speaker_proxy or "",
-                    "speaker_changed": speaker_changed,
-                    "boundary_type": boundary_type_from_gap(
-                        turn_gap_s,
-                        cut_point_max_gap_s=args.cut_point_max_gap_s,
-                        cut_drop_min_gap_s=args.cut_drop_min_gap_s,
-                    ),
+                    "boundary_type": boundary_type,
                 }
-                speaker_turn_boundaries.append(turn)
+                utterance_boundaries.append(turn)
                 if turn_gap_s <= args.cut_point_max_gap_s:
                     cut_point_segments.append(
                         {
                             "start": boundary_time_s,
                             "end": boundary_time_s,
                             "time_s": boundary_time_s,
-                            "speaker_changed": speaker_changed,
                             "gap_s": turn_gap_s,
-                            "previous_speaker_proxy_id": previous_speaker_proxy or "",
-                            "next_speaker_proxy_id": current_speaker_proxy or "",
                         }
                     )
                 elif turn_gap_s >= args.cut_drop_min_gap_s:
@@ -915,17 +849,13 @@ def build_synthetic_timeline(args: argparse.Namespace) -> None:
                             "start": previous_speech_segment.end,
                             "end": current_segment.start,
                             "duration_s": turn_gap_s,
-                            "previous_speaker_proxy_id": previous_speaker_proxy or "",
-                            "next_speaker_proxy_id": current_speaker_proxy or "",
                         }
                     )
             previous_speech_segment = current_segment
-            previous_speaker_proxy = current_speaker_proxy or previous_speaker_proxy
             source_detail.update(
                 {
                     "synthetic_start_s": speech_start_sample / sample_rate,
                     "synthetic_end_s": speech_end_sample / sample_rate,
-                    "speaker_proxy_id": current_speaker_proxy,
                     "source_index": source_index,
                 }
             )
@@ -1113,8 +1043,7 @@ def build_synthetic_timeline(args: argparse.Namespace) -> None:
             "source_audio_ids": [
                 str(item.get("source_audio_id")) for item in source_details if item.get("source_audio_id")
             ],
-            "speaker_proxy_ids": speaker_proxy_ids,
-            "speaker_turn_boundaries": speaker_turn_boundaries,
+            "utterance_boundaries": utterance_boundaries,
             "cut_point_segments": cut_point_segments,
             "cut_drop_zones": cut_drop_zones,
             "actual_speech_segments": [
@@ -1149,8 +1078,7 @@ def build_synthetic_timeline(args: argparse.Namespace) -> None:
                 "source_audio_ids": [
                     str(item.get("source_audio_id")) for item in source_details if item.get("source_audio_id")
                 ],
-                "speaker_proxy_ids": speaker_proxy_ids,
-                "speaker_turn_boundaries": speaker_turn_boundaries,
+                "utterance_boundaries": utterance_boundaries,
                 "cut_point_segments": cut_point_segments,
                 "cut_drop_zones": cut_drop_zones,
                 "speech_segments": [{"start": segment.start, "end": segment.end} for segment in label_segments],
@@ -1183,8 +1111,7 @@ def build_synthetic_timeline(args: argparse.Namespace) -> None:
                 "source_audio_ids": [
                     str(item.get("source_audio_id")) for item in source_details if item.get("source_audio_id")
                 ],
-                "speaker_proxy_ids": speaker_proxy_ids,
-                "speaker_turn_boundaries": speaker_turn_boundaries,
+                "utterance_boundaries": utterance_boundaries,
                 "cut_point_segments": cut_point_segments,
                 "cut_drop_zones": cut_drop_zones,
                 "sources": source_details,
@@ -1206,8 +1133,7 @@ def build_synthetic_timeline(args: argparse.Namespace) -> None:
                 "duration_s": duration_s,
                 "speech_segments": [{"start": segment.start, "end": segment.end} for segment in label_segments],
                 "actual_speech_segments": [{"start": segment.start, "end": segment.end} for segment in speech_segments],
-                "speaker_proxy_ids": speaker_proxy_ids,
-                "speaker_turn_boundaries": speaker_turn_boundaries,
+                "utterance_boundaries": utterance_boundaries,
                 "cut_point_segments": cut_point_segments,
                 "cut_drop_zones": cut_drop_zones,
                 "sources": source_details,
@@ -1247,7 +1173,7 @@ def build_synthetic_timeline(args: argparse.Namespace) -> None:
     speech_frames = sum(sum(int(value) for value in record.speech_frames) for record in records)
     cut_point_count = sum(len(row.get("cut_point_segments") or []) for row in boundary_rows)
     cut_drop_zone_count = sum(len(row.get("cut_drop_zones") or []) for row in boundary_rows)
-    speaker_turn_count = sum(len(row.get("speaker_turn_boundaries") or []) for row in boundary_rows)
+    utterance_boundary_count = sum(len(row.get("utterance_boundaries") or []) for row in boundary_rows)
     summary = {
         "manifest": str(Path(args.manifest)),
         "records": len(records),
@@ -1266,8 +1192,8 @@ def build_synthetic_timeline(args: argparse.Namespace) -> None:
         "gain_aug_count": gain_aug_count,
         "filter_aug_count": filter_aug_count,
         "codec_aug_count": codec_aug_count,
-        "speaker_random_enabled": bool(args.randomize_speech_order),
-        "speaker_turn_boundary_count": speaker_turn_count,
+        "random_speech_order_enabled": bool(args.randomize_speech_order),
+        "utterance_boundary_count": utterance_boundary_count,
         "cut_point_segment_count": cut_point_count,
         "cut_drop_zone_count": cut_drop_zone_count,
         "labels": str(labels_path),
@@ -1282,8 +1208,6 @@ def build_synthetic_timeline(args: argparse.Namespace) -> None:
             "shuffle": args.shuffle,
             "reuse_sources": args.reuse_sources,
             "randomize_speech_order": args.randomize_speech_order,
-            "speaker_proxy_mode": args.speaker_proxy_mode,
-            "speaker_proxy_retry_count": args.speaker_proxy_retry_count,
             "cut_point_max_gap_s": args.cut_point_max_gap_s,
             "cut_drop_min_gap_s": args.cut_drop_min_gap_s,
             "trim_head_s": args.trim_head_s,
@@ -1354,22 +1278,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Sample speech islands randomly within each synthetic example instead of taking manifest rows sequentially.",
     )
     parser.add_argument(
-        "--speaker-proxy-mode",
-        choices=("none", "auto", "audio_id", "character", "voice_actor"),
-        default="auto",
-        help="Field priority used to record speaker_proxy_id metadata for speaker-turn boundary training.",
-    )
-    parser.add_argument(
-        "--speaker-proxy-retry-count",
-        type=int,
-        default=8,
-        help="Random-sampling attempts to avoid repeating the previous speaker proxy.",
-    )
-    parser.add_argument(
         "--cut-point-max-gap-s",
         type=float,
         default=0.12,
-        help="Adjacent speech islands with gap <= this are recorded as cut_point speaker/utterance boundaries.",
+        help="Adjacent speech islands with gap <= this are recorded as cut_point utterance boundaries.",
     )
     parser.add_argument(
         "--cut-drop-min-gap-s",
@@ -1403,7 +1315,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--short-gap-max-s",
         type=float,
         default=0.12,
-        help="Upper bound for short internal gaps used to train cut_point speaker/utterance boundaries.",
+        help="Upper bound for short internal gaps used to train cut_point utterance boundaries.",
     )
     parser.add_argument("--leading-gap-min-s", type=float, default=0.5)
     parser.add_argument("--leading-gap-max-s", type=float, default=4.0)
@@ -1461,8 +1373,6 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         parser.error("--limit must be positive")
     if args.speech_clips_per_example <= 0:
         parser.error("--speech-clips-per-example must be positive")
-    if args.speaker_proxy_retry_count <= 0:
-        parser.error("--speaker-proxy-retry-count must be positive")
     if args.frame_hop_s <= 0.0:
         parser.error("--frame-hop-s must be positive")
     if args.min_speech_s <= 0.0:

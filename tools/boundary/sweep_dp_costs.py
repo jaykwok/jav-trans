@@ -388,8 +388,8 @@ def build_feature_provider(
             right_context_s=args.boundary_frame_sequence_right_context_s,
             max_ptm_dims=args.boundary_frame_sequence_max_ptm_dims,
             include_mfcc=bool(args.boundary_frame_sequence_include_mfcc),
+            target_chunk_s=target_chunk_s,
         ),
-        target_chunk_s=target_chunk_s,
     )
 
 
@@ -557,7 +557,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--output-dir", default="agents/temp/speech-boundary-ja/dp-cost-real-sweep")
     parser.add_argument(
         "--boundary-refiner-model-path",
-        default="datasets/train/fusionvad-ja/v1-23-boundary-refiner/qwen3-asr-0.6b-full29239/boundary-refiner-frame-sequence-mamba2-v1/boundary_refiner.pt",
+        default="src/boundary/checkpoints/boundary_refiner.pt",
     )
     parser.add_argument("--boundary-refiner-backbone", default="transformers.Mamba2Model")
     parser.add_argument("--boundary-refiner-device", default="auto")

@@ -254,12 +254,13 @@ class FrameSequenceBoundaryRefiner:
 
 
 def load_learned_refiner_checkpoint(
-    checkpoint_path: Path,
+    checkpoint_path: str | Path,
     *,
     threshold: float,
     backbone_override: str | None = None,
     device: str = "auto",
 ) -> LearnedBoundaryRefiner:
+    checkpoint_path = Path(checkpoint_path)
     payload = torch.load(checkpoint_path, map_location="cpu")
     if not isinstance(payload, dict):
         raise ValueError("Boundary refiner checkpoint must be a dict")
@@ -305,7 +306,7 @@ def load_learned_refiner_checkpoint(
 
 
 def load_frame_sequence_refiner_checkpoint(
-    checkpoint_path: Path,
+    checkpoint_path: str | Path,
     *,
     threshold: float,
     backbone_override: str | None = None,

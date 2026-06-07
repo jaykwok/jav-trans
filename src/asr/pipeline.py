@@ -155,8 +155,8 @@ def _sequence_feature_provider_from_result(
             right_context_s=_env_float("BOUNDARY_FRAME_SEQUENCE_RIGHT_CONTEXT_S", "0.60"),
             max_ptm_dims=_env_int("BOUNDARY_FRAME_SEQUENCE_MAX_PTM_DIMS", "64"),
             include_mfcc=_env_bool("BOUNDARY_FRAME_SEQUENCE_INCLUDE_MFCC", "1"),
+            target_chunk_s=target_chunk_s,
         ),
-        target_chunk_s=target_chunk_s,
     )
 
 

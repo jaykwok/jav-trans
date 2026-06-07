@@ -147,10 +147,9 @@ def _rows_for_record(
     rows: list[dict[str, Any]] = []
     metadata = record.boundary_metadata or {}
     source_ids = [str(value) for value in list(metadata.get("source_audio_ids") or [])]
-    speaker_ids = [str(value) for value in list(metadata.get("speaker_proxy_ids") or [])]
     boundaries = {
         int(item.get("index")): dict(item)
-        for item in list(metadata.get("speaker_turn_boundaries") or [])
+        for item in list(metadata.get("utterance_boundaries") or [])
         if str(item.get("index", "")).lstrip("-").isdigit()
     }
 
@@ -161,7 +160,6 @@ def _rows_for_record(
             gap_s=gap_s,
             boundary=boundaries.get(index),
             source_ids=source_ids,
-            speaker_ids=speaker_ids,
             config=config,
         )
         if label is None:
@@ -239,30 +237,23 @@ def _label_gap(
     gap_s: float,
     boundary: Mapping[str, Any] | None,
     source_ids: Sequence[str],
-    speaker_ids: Sequence[str],
     config: GapDatasetConfig,
 ) -> tuple[bool, str] | None:
     if gap_s < 0.0:
         return (False, "split_overlap")
     if boundary:
         boundary_type = str(boundary.get("boundary_type") or "")
-        speaker_changed = boundary.get("speaker_changed")
         if boundary_type == "gap_zone":
             return (False, "split_gap_zone")
-        if speaker_changed is True:
-            return (False, "split_speaker_change")
-        if boundary_type == "speaker_turn":
-            return (False, "split_speaker_turn")
+        if boundary_type == "cut_point":
+            return (False, "split_cut_point")
     if gap_s >= config.long_gap_split_s:
         return (False, "split_long_gap")
 
     previous_source = source_ids[index] if index < len(source_ids) else ""
     next_source = source_ids[index + 1] if index + 1 < len(source_ids) else ""
-    previous_speaker = speaker_ids[index] if index < len(speaker_ids) else ""
-    next_speaker = speaker_ids[index + 1] if index + 1 < len(speaker_ids) else ""
     same_source = bool(previous_source and previous_source == next_source)
-    same_speaker = bool(previous_speaker and previous_speaker == next_speaker)
-    if gap_s <= config.safe_merge_gap_s and (same_source or same_speaker):
+    if gap_s <= config.safe_merge_gap_s and same_source:
         return (True, "merge_same_source_short_gap")
     if config.merge_unspecified_short_gaps and gap_s <= config.safe_merge_gap_s:
         return (True, "merge_unspecified_short_gap")

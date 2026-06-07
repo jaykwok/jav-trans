@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Sequence
 
 import numpy as np
@@ -18,6 +18,7 @@ class FrameSequenceFeatureConfig:
     right_context_s: float = 0.60
     max_ptm_dims: int = 64
     include_mfcc: bool = True
+    target_chunk_s: float = 3.0
 
     def signature(self) -> dict:
         return {
@@ -26,6 +27,7 @@ class FrameSequenceFeatureConfig:
             "right_context_s": self.right_context_s,
             "max_ptm_dims": self.max_ptm_dims,
             "include_mfcc": self.include_mfcc,
+            "target_chunk_s": self.target_chunk_s,
         }
 
 
@@ -36,17 +38,31 @@ class FrameSequenceFeatureProvider:
     ptm: Sequence[Sequence[float]]
     mfcc: Sequence[Sequence[float]]
     config: FrameSequenceFeatureConfig = FrameSequenceFeatureConfig()
-    target_chunk_s: float = 3.0
+    _ptm_array: np.ndarray = field(init=False, repr=False)
+    _mfcc_array: np.ndarray = field(init=False, repr=False)
+    _frame_count: int = field(init=False, repr=False)
+    _ptm_used_dim: int = field(init=False, repr=False)
+    _mfcc_dim: int = field(init=False, repr=False)
+    _ptm_used: np.ndarray = field(init=False, repr=False)
+    _mfcc_used: np.ndarray = field(init=False, repr=False)
 
-    def frame_dims(self) -> tuple[int, int, int]:
+    def __post_init__(self) -> None:
         ptm_array = _frame_array(self.ptm, name="ptm")
         mfcc_array = _frame_array(self.mfcc, name="mfcc")
         frame_count = min(int(ptm_array.shape[0]), int(mfcc_array.shape[0]))
         if frame_count <= 0:
             raise ValueError("frame sequence features require at least one frame")
-        ptm_dim = min(int(ptm_array.shape[1]), int(self.config.max_ptm_dims))
-        mfcc_dim = int(mfcc_array.shape[1])
-        return frame_count, ptm_dim, mfcc_dim
+        ptm_used_dim = min(int(ptm_array.shape[1]), int(self.config.max_ptm_dims))
+        object.__setattr__(self, "_ptm_array", ptm_array)
+        object.__setattr__(self, "_mfcc_array", mfcc_array)
+        object.__setattr__(self, "_frame_count", frame_count)
+        object.__setattr__(self, "_ptm_used_dim", ptm_used_dim)
+        object.__setattr__(self, "_mfcc_dim", int(mfcc_array.shape[1]))
+        object.__setattr__(self, "_ptm_used", ptm_array[:frame_count, :ptm_used_dim])
+        object.__setattr__(self, "_mfcc_used", mfcc_array[:frame_count])
+
+    def frame_dims(self) -> tuple[int, int, int]:
+        return self._frame_count, self._ptm_used_dim, self._mfcc_dim
 
     def feature_names(self) -> list[str]:
         _, ptm_dim, mfcc_dim = self.frame_dims()
@@ -107,17 +123,16 @@ class FrameSequenceFeatureProvider:
         right_start_s: float,
         right_end_s: float,
     ) -> list[float]:
-        return gap_window_sequence_features(
+        return _gap_window_sequence_features_from_arrays(
             left_start_s=left_start_s,
             left_end_s=left_end_s,
             right_start_s=right_start_s,
             right_end_s=right_end_s,
             duration_s=self.duration_s,
             frame_hop_s=self.frame_hop_s,
-            ptm=self.ptm,
-            mfcc=self.mfcc,
+            ptm_used=self._ptm_used,
+            mfcc_used=self._mfcc_used,
             config=self.config,
-            target_chunk_s=self.target_chunk_s,
         )
 
 
@@ -237,10 +252,11 @@ def gap_window_sequence_features(
     ptm: Sequence[Sequence[float]],
     mfcc: Sequence[Sequence[float]],
     config: FrameSequenceFeatureConfig,
-    target_chunk_s: float = 3.0,
 ) -> list[float]:
     if frame_hop_s <= 0:
         raise ValueError("frame_hop_s must be positive")
+    if config.target_chunk_s <= 0:
+        raise ValueError("target_chunk_s must be positive")
     ptm_array = _frame_array(ptm, name="ptm")
     mfcc_array = _frame_array(mfcc, name="mfcc")
     frame_count = min(int(ptm_array.shape[0]), int(mfcc_array.shape[0]))
@@ -249,8 +265,37 @@ def gap_window_sequence_features(
     ptm_used_dim = min(int(ptm_array.shape[1]), int(config.max_ptm_dims))
     ptm_used = ptm_array[:frame_count, :ptm_used_dim]
     mfcc_used = mfcc_array[:frame_count]
+    return _gap_window_sequence_features_from_arrays(
+        left_start_s=left_start_s,
+        left_end_s=left_end_s,
+        right_start_s=right_start_s,
+        right_end_s=right_end_s,
+        duration_s=duration_s,
+        frame_hop_s=frame_hop_s,
+        ptm_used=ptm_used,
+        mfcc_used=mfcc_used,
+        config=config,
+    )
+
+
+def _gap_window_sequence_features_from_arrays(
+    *,
+    left_start_s: float,
+    left_end_s: float,
+    right_start_s: float,
+    right_end_s: float,
+    duration_s: float,
+    frame_hop_s: float,
+    ptm_used: np.ndarray,
+    mfcc_used: np.ndarray,
+    config: FrameSequenceFeatureConfig,
+) -> list[float]:
+    if frame_hop_s <= 0:
+        raise ValueError("frame_hop_s must be positive")
+    if config.target_chunk_s <= 0:
+        raise ValueError("target_chunk_s must be positive")
     gap_s = right_start_s - left_end_s
-    gap_merge_s = max(0.2, min(1.5, target_chunk_s / 6.0))
+    gap_merge_s = max(0.2, min(1.5, config.target_chunk_s / 6.0))
     ranges = {
         "left": (max(0.0, left_end_s - config.left_context_s), left_end_s),
         "gap": (left_end_s, right_start_s),
