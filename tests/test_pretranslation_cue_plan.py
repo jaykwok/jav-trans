@@ -94,11 +94,15 @@ def test_translation_uses_pre_normalized_cues(monkeypatch, tmp_path):
     srt_content = (tmp_path / "out" / "clip.srt").read_text(encoding="utf-8")
     assert "00:00:00,000 --> 00:00:00,920" in srt_content
 
-    sidecar = json.loads((tmp_path / "jobs" / "clip" / "clip.bilingual.json").read_text())
+    sidecar = json.loads(
+        (tmp_path / "jobs" / "clip" / "clip.bilingual.json").read_text(encoding="utf-8")
+    )
     assert sidecar["blocks"][0]["end"] == 0.92
     assert sidecar["blocks"][0]["zh_text"] == "zh-0"
 
-    timings = json.loads((tmp_path / "jobs" / "clip" / "clip.timings.json").read_text())
+    timings = json.loads(
+        (tmp_path / "jobs" / "clip" / "clip.timings.json").read_text(encoding="utf-8")
+    )
     assert timings["counts"]["segments"] == 2
     assert timings["counts"]["translation_cues"] == 2
     assert timings["asr_details"]["subtitle_cue_plan"]["stage"] == "pre_translation"

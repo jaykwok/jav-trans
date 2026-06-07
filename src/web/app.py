@@ -8,7 +8,6 @@ from pathlib import Path
 
 from fastapi import FastAPI
 from fastapi.staticfiles import StaticFiles
-from starlette.responses import Response
 
 from core import events
 from core.config import DEFAULT_SETTINGS, load_config
@@ -65,19 +64,11 @@ def create_app() -> FastAPI:
     app.include_router(files.router, prefix="/api")
     app.include_router(config.router, prefix="/api")
 
-    def _icon_response(filename: str, media_type: str) -> Response:
-        return Response(
-            (resource_root() / filename).read_bytes(),
-            media_type=media_type,
-        )
-
-    @app.get("/favicon.ico", include_in_schema=False)
-    async def favicon() -> Response:
-        return _icon_response("icon.ico", "image/x-icon")
-
-    @app.get("/icon.png", include_in_schema=False)
-    async def app_icon() -> Response:
-        return _icon_response("icon.png", "image/png")
+    assets_dir = resource_root() / "src" / "assets"
+    if not assets_dir.exists():
+        assets_dir = Path(__file__).resolve().parents[1] / "assets"
+    if assets_dir.exists():
+        app.mount("/assets", StaticFiles(directory=assets_dir), name="assets")
 
     static_dir = resource_root() / "src" / "web" / "static"
     if not static_dir.exists():

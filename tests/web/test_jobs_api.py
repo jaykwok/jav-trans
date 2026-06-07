@@ -47,6 +47,22 @@ def test_config_lists_recommended_asr_backend_first(monkeypatch):
     asyncio.run(_test_config_lists_recommended_asr_backend_first(monkeypatch))
 
 
+def test_model_requirements_for_17b_include_boundary_and_aligner(tmp_path, monkeypatch):
+    asyncio.run(_test_model_requirements_for_17b_include_boundary_and_aligner(tmp_path, monkeypatch))
+
+
+def test_model_requirements_dedupe_06b_asr_and_boundary(tmp_path, monkeypatch):
+    asyncio.run(_test_model_requirements_dedupe_06b_asr_and_boundary(tmp_path, monkeypatch))
+
+
+def test_model_requirements_marks_disabled_boundary_download(tmp_path, monkeypatch):
+    asyncio.run(_test_model_requirements_marks_disabled_boundary_download(tmp_path, monkeypatch))
+
+
+def test_model_requirements_native_mode_excludes_aligner(tmp_path, monkeypatch):
+    asyncio.run(_test_model_requirements_native_mode_excludes_aligner(tmp_path, monkeypatch))
+
+
 def test_settings_hf_endpoint_updates_runtime_env(monkeypatch):
     asyncio.run(_test_settings_hf_endpoint_updates_runtime_env(monkeypatch))
 
@@ -88,10 +104,12 @@ def test_open_routes_are_limited_to_job_paths(tmp_path, monkeypatch):
 
 
 async def _test_app_exposes_icon_assets(tmp_path, monkeypatch):
-    (tmp_path / "icon.ico").write_bytes(b"\x00\x00\x01\x00")
-    (tmp_path / "icon.png").write_bytes(
+    image_dir = tmp_path / "src" / "assets" / "images"
+    image_dir.mkdir(parents=True)
+    (image_dir / "icon.png").write_bytes(
         b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIEND\xaeB`\x82"
     )
+    (image_dir / "icon.ico").write_bytes(b"\x00\x00\x01\x00")
 
     import web.app as web_app
 
@@ -101,11 +119,17 @@ async def _test_app_exposes_icon_assets(tmp_path, monkeypatch):
         transport=transport,
         base_url="http://test",
     ) as client:
-        favicon = await client.get("/favicon.ico")
-        icon = await client.get("/icon.png")
+        icon = await client.get("/assets/images/icon.png")
+        app_icon = await client.get("/assets/images/icon.ico")
 
-    assert favicon.status_code == 200
     assert icon.status_code == 200
+    assert app_icon.status_code == 200
+    assert icon.headers["content-type"] == "image/png"
+    index_html = (_SRC_WEB / "static" / "index.html").read_text(encoding="utf-8")
+    assert "/assets/images/icon.png" in index_html
+    assert 'href="/icon.png"' not in index_html
+    assert 'src="/icon.png"' not in index_html
+    assert "favicon.ico" not in index_html
 
 
 async def _test_config_lists_recommended_asr_backend_first(monkeypatch):
@@ -128,6 +152,130 @@ async def _test_config_lists_recommended_asr_backend_first(monkeypatch):
     assert payload["defaults"]["translation_max_workers"] == 4
     assert "show_speaker" not in payload["defaults"]
     assert set(payload["backends"]) == set(config_routes.BACKENDS)
+
+
+def _isolate_model_requirement_env(tmp_path, monkeypatch, *, boundary_no_download: str = "0") -> None:
+    models_root = tmp_path / "models"
+    resource_root = tmp_path / "resource"
+    monkeypatch.setattr(config_routes.model_paths, "PROJECT_ROOT", tmp_path)
+    monkeypatch.setattr(config_routes.model_paths, "MODELS_ROOT", models_root)
+    monkeypatch.setattr(config_routes.model_paths, "RESOURCE_ROOT", resource_root)
+    monkeypatch.setattr(config_routes.model_paths, "BUNDLED_MODELS_ROOT", resource_root / "models")
+    monkeypatch.setattr(config_routes.model_paths, "is_frozen", lambda: False)
+    env_values = {
+        "ASR_MODEL_ID": "",
+        "ASR_MODEL_PATH": "",
+        "SPEECH_BOUNDARY_JA_PTM": config_routes.RECOMMENDED_ASR_BACKEND,
+        "SPEECH_BOUNDARY_JA_MODEL_PATH": "models/jaykwok-Qwen3-ASR-0.6B-JA-Anime-Galgame",
+        "SPEECH_BOUNDARY_JA_NO_DOWNLOAD": boundary_no_download,
+        "ALIGNER_MODEL_ID": "Qwen/Qwen3-ForcedAligner-0.6B",
+        "ALIGNER_MODEL_PATH": "",
+        "ALIGNMENT_TIMESTAMP_MODE": "forced",
+    }
+    for key, value in env_values.items():
+        monkeypatch.setenv(key, value)
+
+
+async def _test_model_requirements_for_17b_include_boundary_and_aligner(tmp_path, monkeypatch):
+    _isolate_model_requirement_env(tmp_path, monkeypatch)
+
+    transport = httpx.ASGITransport(app=create_app())
+    async with httpx.AsyncClient(
+        transport=transport,
+        base_url="http://test",
+    ) as client:
+        response = await client.get(
+            "/api/model-requirements",
+            params={"asr_backend": "jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame"},
+        )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["missing_count"] == 3
+    assert payload["alignment_timestamp_mode"] == "forced"
+    assert payload["needs_download"] is True
+    assert payload["download_disabled"] is False
+    by_role = {
+        tuple(item["roles"]): item["repo_id"]
+        for item in payload["required_models"]
+    }
+    assert by_role[("asr",)] == "jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame"
+    assert by_role[("boundary_feature",)] == config_routes.RECOMMENDED_ASR_BACKEND
+    assert by_role[("forced_aligner",)] == "Qwen/Qwen3-ForcedAligner-0.6B"
+
+
+async def _test_model_requirements_dedupe_06b_asr_and_boundary(tmp_path, monkeypatch):
+    _isolate_model_requirement_env(tmp_path, monkeypatch)
+    local_model = tmp_path / "models" / "jaykwok-Qwen3-ASR-0.6B-JA-Anime-Galgame"
+    local_model.mkdir(parents=True)
+    (local_model / "config.json").write_text("{}", encoding="utf-8")
+    (local_model / "model.safetensors").write_bytes(b"weights")
+
+    transport = httpx.ASGITransport(app=create_app())
+    async with httpx.AsyncClient(
+        transport=transport,
+        base_url="http://test",
+    ) as client:
+        response = await client.get(
+            "/api/model-requirements",
+            params={"asr_backend": config_routes.RECOMMENDED_ASR_BACKEND},
+        )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert len(payload["required_models"]) == 2
+    assert payload["missing_count"] == 1
+    merged = next(
+        item
+        for item in payload["required_models"]
+        if item["repo_id"] == config_routes.RECOMMENDED_ASR_BACKEND
+    )
+    assert set(merged["roles"]) == {"asr", "boundary_feature"}
+    assert merged["present"] is True
+
+
+async def _test_model_requirements_marks_disabled_boundary_download(tmp_path, monkeypatch):
+    _isolate_model_requirement_env(tmp_path, monkeypatch, boundary_no_download="1")
+
+    transport = httpx.ASGITransport(app=create_app())
+    async with httpx.AsyncClient(
+        transport=transport,
+        base_url="http://test",
+    ) as client:
+        response = await client.get(
+            "/api/model-requirements",
+            params={"asr_backend": "jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame"},
+        )
+
+    assert response.status_code == 200
+    payload = response.json()
+    boundary = next(
+        item for item in payload["required_models"] if item["roles"] == ["boundary_feature"]
+    )
+    assert boundary["download_enabled"] is False
+    assert payload["needs_download"] is True
+    assert payload["download_disabled"] is True
+
+
+async def _test_model_requirements_native_mode_excludes_aligner(tmp_path, monkeypatch):
+    _isolate_model_requirement_env(tmp_path, monkeypatch)
+    monkeypatch.setenv("ALIGNMENT_TIMESTAMP_MODE", "native")
+
+    transport = httpx.ASGITransport(app=create_app())
+    async with httpx.AsyncClient(
+        transport=transport,
+        base_url="http://test",
+    ) as client:
+        response = await client.get(
+            "/api/model-requirements",
+            params={"asr_backend": "jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame"},
+        )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["alignment_timestamp_mode"] == "native"
+    assert payload["missing_count"] == 2
+    assert all("forced_aligner" not in item["roles"] for item in payload["required_models"])
 
 
 async def _test_settings_hf_endpoint_updates_runtime_env(monkeypatch):
@@ -395,6 +543,7 @@ async def _test_jobs_api_rejects_invalid_job_spec(tmp_path, monkeypatch):
             invalid_payloads = [
                 {"video_paths": []},
                 {"video_paths": ["sample.mp4"], "vad_threshold": 1.5},
+                {"video_paths": ["sample.mp4"], "translation_max_workers": 5},
                 {"video_paths": ["sample.mp4"], "translation_max_workers": 99},
             ]
             for payload in invalid_payloads:
@@ -492,13 +641,21 @@ async def _test_open_routes_are_limited_to_job_paths(tmp_path, monkeypatch):
     unrelated_path = tmp_path / "secret.txt"
     unrelated_path.write_text("secret", encoding="utf-8")
     opened: list[tuple[str, str]] = []
+    app = create_app()
 
     class DummyPopen:
         def __init__(self, args):
             opened.append(("popen", str(args[-1])))
 
-    monkeypatch.setattr(files_routes.os, "name", "posix")
-    monkeypatch.setattr(files_routes.subprocess, "Popen", DummyPopen)
+    if os.name == "nt":
+        monkeypatch.setattr(
+            files_routes.os,
+            "startfile",
+            lambda path: opened.append(("startfile", str(path))),
+            raising=False,
+        )
+    else:
+        monkeypatch.setattr(files_routes.subprocess, "Popen", DummyPopen)
 
     try:
         jobs = await pm.create_job(
@@ -513,7 +670,7 @@ async def _test_open_routes_are_limited_to_job_paths(tmp_path, monkeypatch):
             job.artifacts = ["sample.srt"]
             pm._jobs[job.id] = job
 
-        transport = httpx.ASGITransport(app=create_app())
+        transport = httpx.ASGITransport(app=app)
         async with httpx.AsyncClient(
             transport=transport,
             base_url="http://test",
@@ -539,7 +696,8 @@ async def _test_open_routes_are_limited_to_job_paths(tmp_path, monkeypatch):
         assert blocked_video.status_code == 403
         assert allowed_folder.status_code == 200
         assert blocked_folder.status_code == 403
-        assert ("popen", str(video_path.resolve())) in opened
-        assert ("popen", str(output_dir.resolve())) in opened
+        open_kind = "startfile" if os.name == "nt" else "popen"
+        assert (open_kind, str(video_path.resolve())) in opened
+        assert (open_kind, str(output_dir.resolve())) in opened
     finally:
         await _reset_pm_state()

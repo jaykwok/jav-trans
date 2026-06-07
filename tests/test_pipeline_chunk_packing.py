@@ -196,6 +196,7 @@ def _reload_pipeline(monkeypatch, tmp_path: Path):
     monkeypatch.setenv("BOUNDARY_PLANNER_MAX_PADDED_CHUNK_S", "30.0")
     monkeypatch.setenv("ASR_CHUNK_ROOT", str(tmp_path / "chunks"))
     monkeypatch.setenv("ASR_CHECKPOINT_ENABLED", "0")
+    monkeypatch.setenv("BOUNDARY_REFINER_MODEL_PATH", "")
 
     from asr import pipeline as asr
 

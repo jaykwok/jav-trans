@@ -4,10 +4,67 @@ import { loadFormMemory, saveFormMemory, applyFormMemory } from './formMemory.js
 import { setActivePreset } from './presets.js';
 
 const _BACKEND_LABELS = {
-  'jaykwok/Qwen3-ASR-0.6B-JA-Anime-Galgame': 'jaykwok/Qwen3-ASR-0.6B-JA-Anime-Galgame（推荐）',
-  'jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame': 'jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame',
+  'jaykwok/Qwen3-ASR-0.6B-JA-Anime-Galgame': 'Qwen3-ASR-0.6B-JA-Anime-Galgame',
+  'jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame': 'Qwen3-ASR-1.7B-JA-Anime-Galgame',
 };
 const _SUBTITLE_MODE_LABELS = { zh: '中文字幕', bilingual: '中日双语' };
+
+function formatBackendLabel(repoId, recommendedRepoId) {
+  const id = String(repoId || '');
+  const label = _BACKEND_LABELS[id] || id.split('/').pop() || id;
+  return id === recommendedRepoId ? `${label}（推荐）` : label;
+}
+
+let _modelRequirementsRequestSeq = 0;
+
+function formatRequirementLabel(item) {
+  const labels = Array.isArray(item.role_labels) ? item.role_labels.join('/') : '';
+  const name = item.short_name || String(item.repo_id || '').split('/').pop() || item.repo_id || '';
+  return labels ? `${labels} ${name}` : name;
+}
+
+function renderModelRequirements(payload) {
+  const notice = $('model-requirements-notice');
+  if (!notice) return;
+  const missing = (payload.required_models || []).filter(item => !item.present);
+  if (!missing.length) {
+    notice.hidden = true;
+    notice.textContent = '';
+    return;
+  }
+
+  let message;
+  if (payload.download_disabled && payload.needs_download) {
+    message = `当前配置缺少 ${payload.missing_count} 个模型；可自动下载的模型会在首次运行下载，已关闭自动下载的模型需要先准备。`;
+  } else if (payload.download_disabled) {
+    message = '当前配置缺少模型文件，且已关闭自动下载，需要先准备本地模型。';
+  } else {
+    message = `首次使用该配置需要下载 ${payload.missing_count} 个模型；下载完成后会复用本地缓存。`;
+  }
+
+  const missingText = missing.map(formatRequirementLabel).join('、');
+  notice.innerHTML = `${escHtml(message)}<br><strong>缺少：</strong>${escHtml(missingText)}`;
+  notice.hidden = false;
+}
+
+export async function refreshModelRequirements() {
+  const notice = $('model-requirements-notice');
+  const backendSel = $('r-backend');
+  if (!notice || !backendSel?.value) return;
+
+  const requestSeq = ++_modelRequirementsRequestSeq;
+  try {
+    const r = await fetch(`/api/model-requirements?asr_backend=${encodeURIComponent(backendSel.value)}`);
+    if (requestSeq !== _modelRequirementsRequestSeq) return;
+    if (!r.ok) {
+      notice.hidden = true;
+      return;
+    }
+    renderModelRequirements(await r.json());
+  } catch {
+    if (requestSeq === _modelRequirementsRequestSeq) notice.hidden = true;
+  }
+}
 
 export async function loadConfig() {
   try {
@@ -20,7 +77,9 @@ export async function loadConfig() {
     for (const b of (cfg.backends || [])) {
       const opt = document.createElement('option');
       opt.value = b;
-      opt.textContent = _BACKEND_LABELS[b] || b;
+      opt.dataset.repoId = b;
+      opt.title = b;
+      opt.textContent = formatBackendLabel(b, cfg.recommended_asr_backend);
       backendSel.appendChild(opt);
     }
     if (cfg.defaults?.asr_backend && !Object.hasOwn(loadFormMemory().controls, 'r-backend')) {
@@ -42,6 +101,7 @@ export async function loadConfig() {
     if (d.skip_translation          != null) $('r-skip-translation').checked      = !!d.skip_translation;
     applyFormMemory();
     setActivePreset(state.activePreset);
+    refreshModelRequirements();
   } catch {}
 }
 
@@ -153,6 +213,8 @@ export async function syncSettingsFromFormForSubmit() {
 }
 
 export function installSettingsPanel() {
+  $('r-backend')?.addEventListener('change', refreshModelRequirements);
+
   $('btn-show-key').addEventListener('click', () => {
     const inp = $('api-key');
     const show = inp.type === 'password';

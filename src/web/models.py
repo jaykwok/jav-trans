@@ -5,6 +5,9 @@ from typing import Any, Literal
 from pydantic import BaseModel, ConfigDict, Field
 
 
+MAX_TRANSLATION_WORKERS = 4
+
+
 class JobSpec(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -18,7 +21,7 @@ class JobSpec(BaseModel):
     skip_translation: bool = False
     asr_context: str = Field(default="", max_length=4000)
     keep_quality_report: bool = False
-    translation_max_workers: int = Field(default=4, ge=1, le=8)
+    translation_max_workers: int = Field(default=4, ge=1, le=MAX_TRANSLATION_WORKERS)
     target_lang: str | None = Field(default=None, max_length=64)
     translation_glossary: str | None = Field(default=None, max_length=20000)
     llm_api_format: Literal["chat", "responses"] | None = None

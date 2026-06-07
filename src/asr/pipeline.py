@@ -367,7 +367,10 @@ def _build_processing_spans(
     cfg = _boundary_config()
     _set_last_boundary_cache_event(None)
 
-    needs_sequence_features = cfg["boundary_refiner_runtime_adapter"] == "frame_sequence_v1"
+    needs_sequence_features = (
+        cfg["boundary_refiner_enabled"]
+        and cfg["boundary_refiner_runtime_adapter"] == "frame_sequence_v1"
+    )
     restore_sequence_export = (
         os.environ.get("SPEECH_BOUNDARY_JA_EXPORT_SEQUENCE_FEATURES")
         if needs_sequence_features
@@ -406,7 +409,10 @@ def _build_processing_spans(
     cut_frame_scores = result.parameters.get("cut_frame_scores")
     score_frame_hop_s = result.parameters.get("frame_hop_s")
     sequence_feature_frames = result.parameters.get("sequence_feature_frames")
-    if cfg["boundary_refiner_runtime_adapter"] == "frame_sequence_v1":
+    if (
+        cfg["boundary_refiner_enabled"]
+        and cfg["boundary_refiner_runtime_adapter"] == "frame_sequence_v1"
+    ):
         boundary_refiner = None
         sequence_boundary_refiner = load_frame_sequence_refiner_checkpoint(
             Path(cfg["boundary_refiner_model_path"]),

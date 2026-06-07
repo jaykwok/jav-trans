@@ -5,14 +5,14 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>JAVTrans</title>
-  <link rel="icon" href="/favicon.ico">
+  <link rel="icon" type="image/png" href="/assets/images/icon.png">
   <link rel="stylesheet" href="style.css">
 </head>
 
 <body>
 
   <header>
-    <img class="app-mark" src="/icon.png" alt="" aria-hidden="true">
+    <img class="app-mark" src="/assets/images/icon.png" alt="" aria-hidden="true">
     <span class="logo">JAVTrans</span>
     <span class="sub">字幕翻译工作台</span>
     <span class="spacer"></span>
@@ -40,7 +40,7 @@
       <div class="panel">
         <div class="panel-title">选择视频</div>
         <div class="drop-zone" id="drop-zone">
-          <img class="drop-icon" src="/icon.png" alt="" aria-hidden="true">
+          <img class="drop-icon" src="/assets/images/icon.png" alt="" aria-hidden="true">
           <p><strong>点击选择（支持多选）</strong>或拖拽视频文件</p>
           <p>mp4 / mkv / avi / ts / wmv</p>
         </div>
@@ -63,6 +63,7 @@
             <span>ASR 后端</span>
             <select id="r-backend"></select>
           </label>
+          <div id="model-requirements-notice" class="model-requirements-notice" hidden></div>
           <div class="toggle-row">
             <span>hf-mirror.com 加速下载<br><span style="font-size:10px;color:var(--muted)">适合中国大陆用户，下次下载生效</span></span>
             <label class="toggle"><input type="checkbox" id="mirror-enabled"><span class="slider"></span></label>
@@ -89,7 +90,7 @@
             </div>
             <label class="field">
               <span>并行翻译 Worker 数（API 限速时可调低）</span>
-              <input type="number" id="t-translation-max-workers" value="4" min="1" max="8">
+              <input type="number" id="t-translation-max-workers" value="4" min="1" max="4">
             </label>
             <div class="toggle-row">
               <span>生成质量报告（.md）</span>

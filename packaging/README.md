@@ -12,8 +12,12 @@ It bundles:
 
 - the Python runtime and installed Python dependencies from the active uv-managed environment
 - `ffmpeg.exe` and `ffprobe.exe` from `PATH`, or from `-FfmpegExe` / `-FfprobeExe`
-- `icon.ico` for the executable and pywebview window
-- `icon.png` / `icon.ico` for the in-app header and favicon
+- `src/assets/images/icon.png` for the in-app header, drop zone image, and PNG favicon
+- `src/assets/images/icon.ico` for the pywebview native window icon and packaged executable icon
+
+Keep image assets under `src/assets/images/`. The PNG should be the 512x512
+source image used by the web UI; the ICO should be generated from the same image
+for Windows native icon consumers.
 - the default ASR model `jaykwok/Qwen3-ASR-0.6B-JA-Anime-Galgame`
 - default workflow auxiliary models:
   - forced aligner `Qwen/Qwen3-ForcedAligner-0.6B`

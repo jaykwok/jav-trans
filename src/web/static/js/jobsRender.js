@@ -136,7 +136,7 @@ export function renderJobs() {
         <div class="dl-row">
           <span class="dl-label">↓ ${escHtml(fname)}</span>
           <span class="dl-info">${escHtml(info)}</span>
-          ${showMirrorBtn ? `<button class="btn-sm btn-enable-mirror" data-enable-mirror="${escHtml(id)}">启用镜像加速</button>` : ''}
+          ${showMirrorBtn ? `<button class="btn-sm btn-enable-mirror" data-enable-mirror="${escHtml(id)}" title="切换到 hf-mirror.com，并重启当前下载">切到 hf-mirror 重试</button>` : ''}
         </div>
         <div class="dl-bar"><div class="dl-bar-fill" style="width:${dlPct}%"></div></div>`;
     }
