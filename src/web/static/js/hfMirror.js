@@ -35,10 +35,10 @@ export async function enableHfMirror(jobId = null) {
     saveFormMemory();
 
     if (jobId && state.jobs[jobId]?._download) {
-      showToast('镜像已启用，正在取消当前下载并重新开始…');
+      showToast('已切到 hf-mirror，正在取消当前下载并重新开始…');
       await _cancelAndRestartDownloadJob(jobId);
     } else {
-      showToast('镜像已启用，对下次模型下载生效');
+      showToast('已切到 hf-mirror，对下次模型下载生效');
     }
   } catch (e) {
     showToast('启用失败：' + e.message);
@@ -71,7 +71,7 @@ export function installMirrorChangeHandler() {
     const activeDownload = Object.values(state.jobs)
       .find(j => j._download && ACTIVE_STATUSES.has(j.status));
     if (activeDownload) {
-      const label = chk.checked ? '镜像已启用' : '镜像已关闭';
+      const label = chk.checked ? '已切到 hf-mirror' : '已切回官方源';
       showToast(`${label}，正在取消当前下载并重新开始…`);
       await _cancelAndRestartDownloadJob(activeDownload.id);
     }

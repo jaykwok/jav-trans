@@ -37,7 +37,11 @@ if _BIN_DIR.exists():
     if bin_text not in current_path.split(os.pathsep):
         os.environ["PATH"] = bin_text + (os.pathsep + current_path if current_path else "")
 
-_ICON_PATH = _RESOURCE_ROOT / "icon.ico"
+_APP_ICON_PATH = _RESOURCE_ROOT / "src" / "assets" / "images" / "icon.ico"
+
+
+def _webview_icon_arg() -> str | None:
+    return str(_APP_ICON_PATH) if _APP_ICON_PATH.exists() else None
 
 PORT = int(os.getenv("JAVTRANS_PORT", "17321"))
 EVENTS_PORT = int(os.getenv("JAVTRANS_EVENTS_PORT", "17322"))
@@ -136,7 +140,7 @@ if __name__ == "__main__":
         webview.start(
             _bind,
             win,
-            icon=str(_ICON_PATH) if _ICON_PATH.exists() else None,
+            icon=_webview_icon_arg(),
         )
     except ImportError:
         import webbrowser

@@ -37,6 +37,10 @@ def _require_path(path: str | Path, label: str) -> Path:
     return candidate
 
 
+def _pyinstaller_icon_path() -> Path:
+    return _require_path("src/assets/images/icon.ico", "application ico icon")
+
+
 def _which_tool(name: str, env_name: str) -> Path:
     override = os.getenv(env_name, "").strip()
     if override:
@@ -76,12 +80,11 @@ datas += copy_metadata("torchcodec")
 datas += copy_metadata("nagisa")
 datas += [
     (str(_require_path("src/web/static", "web static assets")), "src/web/static"),
+    (str(_require_path("src/assets", "application assets")), "src/assets"),
     (
         str(_require_path("src/boundary/checkpoints", "Boundary Refiner checkpoints")),
         "src/boundary/checkpoints",
     ),
-    (str(_require_path("icon.ico", "application icon")), "."),
-    (str(_require_path("icon.png", "application png icon")), "."),
     (
         str(_require_path("models/jaykwok-Qwen3-ASR-0.6B-JA-Anime-Galgame", "default ASR model")),
         "models/jaykwok-Qwen3-ASR-0.6B-JA-Anime-Galgame",
@@ -173,7 +176,7 @@ exe = EXE(
     strip=False,
     upx=False,
     console=False,
-    icon=str(ROOT / "icon.ico"),
+    icon=str(_pyinstaller_icon_path()),
     disable_windowed_traceback=False,
     argv_emulation=False,
     target_arch=None,

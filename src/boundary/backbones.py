@@ -1,9 +1,22 @@
 from __future__ import annotations
 
+import logging
+
 import torch
 from torch import nn
 
 TRANSFORMERS_MAMBA2_BACKBONE = "transformers.Mamba2Model"
+
+
+class _Mamba2FastPathWarningFilter(logging.Filter):
+    def filter(self, record: logging.LogRecord) -> bool:
+        return "The fast path is not available" not in record.getMessage()
+
+
+def _install_mamba2_warning_filter() -> None:
+    logger = logging.getLogger("transformers.models.mamba2.modeling_mamba2")
+    if not any(isinstance(item, _Mamba2FastPathWarningFilter) for item in logger.filters):
+        logger.addFilter(_Mamba2FastPathWarningFilter())
 
 
 class TinyMamba2BoundaryBackbone(nn.Module):
@@ -32,6 +45,7 @@ class TinyMamba2BoundaryBackbone(nn.Module):
         self.bidirectional = bool(bidirectional)
         self.proj = nn.Linear(input_dim, hidden_size)
 
+        _install_mamba2_warning_filter()
         from transformers import Mamba2Config, Mamba2Model
 
         config = Mamba2Config(

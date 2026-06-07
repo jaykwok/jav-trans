@@ -1,6 +1,6 @@
 import json
 import os
-import shutil
+import re
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -13,6 +13,32 @@ BUNDLED_MODELS_ROOT = RESOURCE_ROOT / "models"
 TMP_ROOT = PROJECT_ROOT / "tmp"
 HF_RUNTIME_CACHE_ROOT = TMP_ROOT / "cache" / "hf"
 DEFAULT_HF_ENDPOINT = "https://huggingface.co"
+DEFAULT_INFERENCE_IGNORE_PATTERNS = [
+    "optimizer.pt",
+    "**/optimizer.pt",
+    "optimizer.bin",
+    "**/optimizer.bin",
+    "scheduler.pt",
+    "**/scheduler.pt",
+    "scaler.pt",
+    "**/scaler.pt",
+    "rng_state*.pth",
+    "**/rng_state*.pth",
+    "trainer_state.json",
+    "**/trainer_state.json",
+    "training_args.bin",
+    "**/training_args.bin",
+]
+MODEL_CONFIG_FILENAMES = ("config.json",)
+MODEL_WEIGHT_PATTERNS = (
+    "model*.safetensors",
+    "*.safetensors",
+    "pytorch_model*.bin",
+    "model*.bin",
+    "tf_model*.h5",
+    "flax_model*.msgpack",
+)
+SHARDED_SAFETENSORS_RE = re.compile(r"^model-\d{5}-of-\d{5}\.safetensors$")
 
 if is_frozen():
     os.environ.setdefault("HF_HOME", str(MODELS_ROOT))
@@ -86,7 +112,7 @@ def _iter_local_model_candidates(repo_id: str):
 def _indexed_safetensors_complete(path: Path) -> bool:
     index_path = path / "model.safetensors.index.json"
     if not index_path.exists():
-        return True
+        return False
     try:
         payload = json.loads(index_path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
@@ -114,14 +140,95 @@ def _indexed_safetensors_complete(path: Path) -> bool:
     return True
 
 
+def _has_required_model_config(path: Path) -> bool:
+    return any((path / filename).is_file() for filename in MODEL_CONFIG_FILENAMES)
+
+
+def _has_positive_weight_file(path: Path) -> bool:
+    for pattern in MODEL_WEIGHT_PATTERNS:
+        for candidate in path.glob(pattern):
+            try:
+                if candidate.is_file() and candidate.stat().st_size > 0:
+                    return True
+            except OSError:
+                continue
+    return False
+
+
+def _has_sharded_safetensors_file(path: Path) -> bool:
+    try:
+        return any(
+            candidate.is_file() and SHARDED_SAFETENSORS_RE.fullmatch(candidate.name)
+            for candidate in path.iterdir()
+        )
+    except OSError:
+        return False
+
+
 def _path_has_model_files(path: Path) -> bool:
     if path.is_file():
-        return True
+        try:
+            return path.stat().st_size > 0
+        except OSError:
+            return False
     if path.is_dir():
         if not any(path.iterdir()):
             return False
-        return _indexed_safetensors_complete(path)
+        if not _has_required_model_config(path):
+            return False
+        if (path / "model.safetensors.index.json").exists():
+            return _indexed_safetensors_complete(path)
+        if _has_sharded_safetensors_file(path):
+            return False
+        return _has_positive_weight_file(path)
     return False
+
+
+def model_spec_status(explicit_path: str | None, repo_id: str, *, download: bool = True) -> dict:
+    target_path = canonical_model_dir(repo_id).resolve()
+    checked_paths: list[str] = []
+
+    def add_checked(path: Path) -> None:
+        value = str(path)
+        if value not in checked_paths:
+            checked_paths.append(value)
+
+    if explicit_path:
+        candidate = _project_path(explicit_path).resolve()
+        target_path = candidate
+        add_checked(candidate)
+        if _path_has_model_files(candidate):
+            return {
+                "repo_id": repo_id,
+                "present": True,
+                "path": str(candidate),
+                "checked_paths": checked_paths,
+            }
+        if download:
+            return {
+                "repo_id": repo_id,
+                "present": False,
+                "path": str(candidate),
+                "checked_paths": checked_paths,
+            }
+
+    for candidate in _iter_local_model_candidates(repo_id):
+        resolved = candidate.expanduser().resolve()
+        add_checked(resolved)
+        if _path_has_model_files(resolved):
+            return {
+                "repo_id": repo_id,
+                "present": True,
+                "path": str(resolved),
+                "checked_paths": checked_paths,
+            }
+
+    return {
+        "repo_id": repo_id,
+        "present": False,
+        "path": str(target_path),
+        "checked_paths": checked_paths,
+    }
 
 
 def _download_snapshot(
@@ -141,6 +248,8 @@ def _download_snapshot(
 
     from utils import hf_progress
 
+    effective_ignore_patterns = _merge_ignore_patterns(ignore_patterns)
+    existed_before = target_dir.exists()
     target_dir.parent.mkdir(parents=True, exist_ok=True)
     target_dir.mkdir(parents=True, exist_ok=True)
     print(f"[models] downloading {repo_id} -> {_project_relative(target_dir)}", flush=True)
@@ -155,19 +264,40 @@ def _download_snapshot(
             revision=revision,
             local_dir=target_dir,
             allow_patterns=allow_patterns,
-            ignore_patterns=ignore_patterns,
+            ignore_patterns=effective_ignore_patterns,
             endpoint=endpoint,
             **progress_kwargs,
         )
     except BaseException as exc:
-        shutil.rmtree(target_dir, ignore_errors=True)
+        if not existed_before:
+            try:
+                target_dir.rmdir()
+            except OSError:
+                pass
         if fallback_token is not None:
             hf_progress.fallback_error(fallback_token, exc)
         raise
     else:
         if fallback_token is not None:
             hf_progress.fallback_done(fallback_token)
+    if not _path_has_model_files(target_dir):
+        raise RuntimeError(
+            f"Model download for {repo_id} did not produce a complete local model at "
+            f"{_project_relative(target_dir)}. The partial files were kept; retrying "
+            "the run will continue the download."
+        )
     return str(target_dir)
+
+
+def _merge_ignore_patterns(ignore_patterns: str | list[str] | None) -> list[str]:
+    patterns = list(DEFAULT_INFERENCE_IGNORE_PATTERNS)
+    if ignore_patterns is None:
+        return patterns
+    extra_patterns = [ignore_patterns] if isinstance(ignore_patterns, str) else ignore_patterns
+    for pattern in extra_patterns:
+        if pattern not in patterns:
+            patterns.append(pattern)
+    return patterns
 
 
 def resolve_model_spec(

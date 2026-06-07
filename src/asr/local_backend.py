@@ -276,26 +276,41 @@ def _first_token_id(value) -> int | None:
 
 def _iter_generation_configs(model) -> list:
     configs = []
+
+    def add_config(config) -> None:
+        if config is not None and not any(config is existing for existing in configs):
+            configs.append(config)
+
     for candidate in (
         model,
         getattr(model, "model", None),
         getattr(getattr(model, "model", None), "thinker", None),
     ):
-        generation_config = getattr(candidate, "generation_config", None)
-        if generation_config is not None and generation_config not in configs:
-            configs.append(generation_config)
+        add_config(getattr(candidate, "generation_config", None))
+        add_config(getattr(candidate, "config", None))
     return configs
 
 
 def _normalize_deterministic_generation_config(model) -> None:
-    for generation_config in _iter_generation_configs(model):
-        if getattr(generation_config, "temperature", None) not in {None, 1.0}:
+    generation_configs = _iter_generation_configs(model)
+    fallback_eos_token_id = None
+    for generation_config in generation_configs:
+        fallback_eos_token_id = _first_token_id(
+            getattr(generation_config, "eos_token_id", None)
+        )
+        if fallback_eos_token_id is not None:
+            break
+
+    for generation_config in generation_configs:
+        if not bool(getattr(generation_config, "do_sample", False)) and getattr(
+            generation_config, "temperature", None
+        ) is not None:
             generation_config.temperature = None
 
         if getattr(generation_config, "pad_token_id", None) is None:
             eos_token_id = _first_token_id(
                 getattr(generation_config, "eos_token_id", None)
-            )
+            ) or fallback_eos_token_id
             if eos_token_id is not None:
                 generation_config.pad_token_id = eos_token_id
 

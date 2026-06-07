@@ -67,9 +67,6 @@ dist/
 *.tar
 *.tar.*
 
-# source iconpng
-icon.png
-
 # Agent coordination docs are local to this workspace.
 AGENTS.md
 CLAUDE.md

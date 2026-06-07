@@ -40,7 +40,12 @@ header {
 }
 header .logo { font-size: 18px; font-weight: 700; color: var(--accent); letter-spacing: -0.5px; }
 header .sub  { font-size: 12px; color: var(--muted); }
-header .app-mark { width: 24px; height: 24px; object-fit: contain; flex-shrink: 0; }
+header .app-mark {
+  width: 24px;
+  height: 24px;
+  flex-shrink: 0;
+  object-fit: contain;
+}
 header .spacer { flex: 1; }
 header .conn-dot {
   width: 8px; height: 8px; border-radius: 50%;
@@ -87,7 +92,7 @@ aside {
   display: flex; align-items: center; justify-content: space-between;
 }
 .panel-collapsible > summary.panel-title::-webkit-details-marker { display: none; }
-.panel-collapsible > summary.panel-title::after { content: '▸'; font-size: 9px; opacity: .5; }
+.panel-collapsible > summary.panel-title::after { content: '▸'; font-size: 13px; opacity: .65; }
 .panel-collapsible[open] > summary.panel-title::after { content: '▾'; }
 .panel-collapsible .form-grid { margin-top: 12px; }
 
@@ -105,7 +110,13 @@ aside {
   border-color: var(--accent);
   background: rgba(124,106,247,.07);
 }
-.drop-zone .drop-icon { width: 34px; height: 34px; object-fit: contain; margin-bottom: 8px; opacity: .72; }
+.drop-zone .drop-icon {
+  width: 34px;
+  height: 34px;
+  object-fit: contain;
+  margin-bottom: 8px;
+  opacity: .72;
+}
 .drop-zone p { font-size: 13px; color: var(--muted); }
 .drop-zone p strong { color: var(--text); }
 
@@ -164,6 +175,19 @@ textarea { font-family: var(--mono); font-size: 12px; resize: vertical; min-heig
 
 .form-grid { display: flex; flex-direction: column; gap: 10px; }
 
+.model-requirements-notice {
+  color: var(--warn);
+  background: rgba(240,168,67,.08);
+  border: 1px solid rgba(240,168,67,.22);
+  border-radius: 5px;
+  padding: 7px 9px;
+  font-size: 11px;
+  line-height: 1.45;
+}
+.model-requirements-notice strong {
+  color: var(--text);
+  font-weight: 600;
+}
 
 .btn {
   width: 100%; padding: 9px; border-radius: var(--radius);

@@ -7,9 +7,15 @@ from pathlib import Path
 from typing import Any, get_args
 
 import httpx
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Query
 
+from asr.backends.qwen import qwen_asr_repo_id
+from boundary.ja.backend import (
+    DEFAULT_MODEL_PATH as DEFAULT_BOUNDARY_JA_MODEL_PATH,
+    DEFAULT_PTM as DEFAULT_BOUNDARY_JA_PTM,
+)
 from core.config import DEFAULT_SETTINGS, load_config
+from utils import model_paths
 from utils.model_paths import PROJECT_ROOT, normalize_hf_endpoint
 from web.models import JobSpec, SettingsRead, SettingsUpdate
 
@@ -25,6 +31,12 @@ DEFAULT_JOB_DEFAULTS = {
     if not field.is_required()
 }
 _ENV_KEY_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+_MODEL_ROLE_LABELS = {
+    "asr": "ASR",
+    "boundary_feature": "Boundary",
+    "forced_aligner": "ForcedAligner",
+}
+_ALIGNMENT_TIMESTAMP_MODES = {"forced", "native", "hybrid"}
 
 
 def _format_env_line(key: str, value: str) -> str:
@@ -105,6 +117,89 @@ def _ordered_backends(backends: list[str]) -> list[str]:
     )
 
 
+def _truthy(value: str) -> bool:
+    return str(value or "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _alignment_timestamp_mode() -> str:
+    value = _runtime_or_env_or_setting(
+        "ALIGNMENT_TIMESTAMP_MODE",
+        DEFAULT_SETTINGS["ALIGNMENT_TIMESTAMP_MODE"],
+    ).strip().lower()
+    if value not in _ALIGNMENT_TIMESTAMP_MODES:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                "ALIGNMENT_TIMESTAMP_MODE must be one of: "
+                f"{', '.join(sorted(_ALIGNMENT_TIMESTAMP_MODES))}"
+            ),
+        )
+    return value
+
+
+def _alignment_requires_forced_aligner(mode: str) -> bool:
+    return mode in {"forced", "hybrid"}
+
+
+def _short_model_name(repo_id: str) -> str:
+    return repo_id.strip("/").rsplit("/", 1)[-1] or repo_id
+
+
+def _model_requirement(
+    *,
+    role: str,
+    repo_id: str,
+    explicit_path: str = "",
+    download_enabled: bool = True,
+) -> dict[str, Any]:
+    status = model_paths.model_spec_status(
+        explicit_path or None,
+        repo_id,
+        download=download_enabled,
+    )
+    return {
+        "roles": [role],
+        "role_labels": [_MODEL_ROLE_LABELS.get(role, role)],
+        "repo_id": repo_id,
+        "short_name": _short_model_name(repo_id),
+        "local_path": status["path"],
+        "checked_paths": status["checked_paths"],
+        "present": bool(status["present"]),
+        "download_enabled": bool(download_enabled),
+    }
+
+
+def _merge_model_requirements(requirements: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    merged: list[dict[str, Any]] = []
+    by_key: dict[tuple[str, str], dict[str, Any]] = {}
+    for requirement in requirements:
+        key = (str(requirement["repo_id"]), str(requirement["local_path"]))
+        existing = by_key.get(key)
+        if existing is None:
+            clone = dict(requirement)
+            clone["roles"] = list(requirement.get("roles") or [])
+            clone["role_labels"] = list(requirement.get("role_labels") or [])
+            clone["checked_paths"] = list(requirement.get("checked_paths") or [])
+            by_key[key] = clone
+            merged.append(clone)
+            continue
+
+        for role in requirement.get("roles") or []:
+            if role not in existing["roles"]:
+                existing["roles"].append(role)
+        for label in requirement.get("role_labels") or []:
+            if label not in existing["role_labels"]:
+                existing["role_labels"].append(label)
+        for path in requirement.get("checked_paths") or []:
+            if path not in existing["checked_paths"]:
+                existing["checked_paths"].append(path)
+        existing["present"] = bool(existing["present"] or requirement.get("present"))
+        existing["download_enabled"] = bool(
+            existing["download_enabled"] or requirement.get("download_enabled")
+        )
+    return merged
+
+
 def _sync_hf_endpoint(value: str) -> str:
     try:
         return normalize_hf_endpoint(value) or ""
@@ -169,6 +264,74 @@ async def get_config() -> dict[str, Any]:
             "skip_translation": DEFAULT_JOB_DEFAULTS["skip_translation"],
             "translation_max_workers": DEFAULT_JOB_DEFAULTS["translation_max_workers"],
         },
+    }
+
+
+@router.get("/model-requirements")
+async def get_model_requirements(
+    asr_backend: str | None = Query(default=None),
+) -> dict[str, Any]:
+    load_config()
+    backend = (asr_backend or DEFAULT_JOB_DEFAULTS["asr_backend"]).strip()
+    try:
+        selected_asr_repo = qwen_asr_repo_id(backend)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    asr_model_id = _runtime_or_env_or_setting("ASR_MODEL_ID").strip() or selected_asr_repo
+    asr_model_path = _runtime_or_env_or_setting("ASR_MODEL_PATH")
+    boundary_model_id = (
+        _runtime_or_env_or_setting("SPEECH_BOUNDARY_JA_PTM", DEFAULT_BOUNDARY_JA_PTM).strip()
+        or DEFAULT_BOUNDARY_JA_PTM
+    )
+    boundary_model_path = _runtime_or_env_or_setting(
+        "SPEECH_BOUNDARY_JA_MODEL_PATH",
+        DEFAULT_BOUNDARY_JA_MODEL_PATH,
+    )
+    boundary_download_enabled = not _truthy(
+        _runtime_or_env_or_setting("SPEECH_BOUNDARY_JA_NO_DOWNLOAD", "0")
+    )
+    aligner_model_id = (
+        _runtime_or_env_or_setting(
+            "ALIGNER_MODEL_ID",
+            DEFAULT_SETTINGS["ALIGNER_MODEL_ID"],
+        ).strip()
+        or DEFAULT_SETTINGS["ALIGNER_MODEL_ID"]
+    )
+    aligner_model_path = _runtime_or_env_or_setting("ALIGNER_MODEL_PATH")
+    alignment_mode = _alignment_timestamp_mode()
+
+    requirements = [
+        _model_requirement(
+            role="asr",
+            repo_id=asr_model_id,
+            explicit_path=asr_model_path,
+        ),
+        _model_requirement(
+            role="boundary_feature",
+            repo_id=boundary_model_id,
+            explicit_path=boundary_model_path,
+            download_enabled=boundary_download_enabled,
+        ),
+    ]
+    if _alignment_requires_forced_aligner(alignment_mode):
+        requirements.append(
+            _model_requirement(
+                role="forced_aligner",
+                repo_id=aligner_model_id,
+                explicit_path=aligner_model_path,
+            )
+        )
+    requirements = _merge_model_requirements(requirements)
+    missing = [item for item in requirements if not item["present"]]
+    return {
+        "asr_backend": backend,
+        "alignment_timestamp_mode": alignment_mode,
+        "required_models": requirements,
+        "missing_count": len(missing),
+        "needs_download": any(item["download_enabled"] for item in missing),
+        "download_disabled": any(not item["download_enabled"] for item in missing),
+        "all_present": not missing,
     }
 
 

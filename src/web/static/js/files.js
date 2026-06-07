@@ -33,6 +33,12 @@ function renderFiles() {
   btnSubmit.disabled = state.files.length === 0;
 }
 
+function readTranslationMaxWorkers() {
+  const value = parseInt($('t-translation-max-workers').value, 10);
+  if (!Number.isFinite(value)) return 4;
+  return Math.min(4, Math.max(1, value));
+}
+
 async function pickFiles() {
   try {
     const r = await fetch('/api/pick-files', { method: 'POST' });
@@ -97,7 +103,7 @@ export function installFiles() {
       asr_context:              $('r-asr-context').value.trim(),
       skip_translation:         $('r-skip-translation').checked,
       keep_quality_report:      $('t-quality-report').checked,
-      translation_max_workers:  parseInt($('t-translation-max-workers').value) || 4,
+      translation_max_workers:  readTranslationMaxWorkers(),
       ...readTranslationSettingsFromForm(),
       keep_temp_files:          $('t-keep-temp').checked,
     };

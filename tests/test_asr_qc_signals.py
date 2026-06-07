@@ -108,7 +108,10 @@ def test_legacy_density_threshold_removed_from_source():
         root / ".env.example",
     ]
 
-    assert all("ASR_QC_MAX_CHARS_PER_SEC" not in path.read_text() for path in checked)
+    assert all(
+        "ASR_QC_MAX_CHARS_PER_SEC" not in path.read_text(encoding="utf-8")
+        for path in checked
+    )
 
 
 def test_reject_on_high_compression_ratio(monkeypatch):

@@ -287,6 +287,7 @@ def test_pipeline_uses_boundary_scores_but_does_not_cache_score_arrays(monkeypat
     monkeypatch.setenv("BOUNDARY_PLANNER_MAX_PADDED_CHUNK_S", "30.0")
     monkeypatch.setenv("BOUNDARY_PLANNER_TARGET_CHUNK_S", "5.0")
     monkeypatch.setenv("BOUNDARY_PLANNER_MIN_CHUNK_S", "3.0")
+    monkeypatch.setenv("BOUNDARY_REFINER_MODEL_PATH", "")
 
     from asr import pipeline as asr
 
@@ -320,6 +321,7 @@ def test_pipeline_uses_boundary_scores_but_does_not_cache_score_arrays(monkeypat
 def test_pipeline_uses_boundary_cache_for_prompt_budget_change(monkeypatch, tmp_path):
     monkeypatch.setenv("BOUNDARY_CACHE_DIR", str(tmp_path / "boundary-cache"))
     monkeypatch.setenv("BOUNDARY_FEATURE_FRAME_HOP_S", "0.02")
+    monkeypatch.setenv("BOUNDARY_REFINER_MODEL_PATH", "")
 
     from asr import pipeline as asr
 
