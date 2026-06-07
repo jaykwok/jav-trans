@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import sys
 from collections import Counter
@@ -37,9 +38,11 @@ class FrameSequenceConfig:
     right_context_s: float = 0.60
     max_ptm_dims: int = 64
     include_mfcc: bool = True
+    target_chunk_s: float = 3.0
     safe_merge_gap_s: float = 0.12
     long_gap_split_s: float = 0.60
     synthetic_merge_positives_per_record: int = 1
+    synthetic_merge_gap_min_s: float = 0.04
     synthetic_merge_gap_s: float = 0.04
     synthetic_merge_min_segment_s: float = 1.20
 
@@ -49,6 +52,7 @@ class FrameSequenceConfig:
             right_context_s=self.right_context_s,
             max_ptm_dims=self.max_ptm_dims,
             include_mfcc=self.include_mfcc,
+            target_chunk_s=self.target_chunk_s,
         )
 
 
@@ -194,7 +198,12 @@ def _sequence_row(
     for index, segment in enumerate(segments):
         if synthetic_count >= config.synthetic_merge_positives_per_record:
             break
-        gap_s = max(0.0, config.synthetic_merge_gap_s)
+        gap_s = _synthetic_merge_gap_s(
+            audio_id=record.audio_id,
+            segment_index=index,
+            positive_index=synthetic_count,
+            config=config,
+        )
         if segment.duration_s < config.synthetic_merge_min_segment_s + gap_s:
             continue
         midpoint = (segment.start + segment.end) / 2.0
@@ -304,7 +313,7 @@ def _label_gap(
     metadata = record.boundary_metadata or {}
     boundaries = {
         int(item.get("index")): dict(item)
-        for item in list(metadata.get("speaker_turn_boundaries") or [])
+        for item in list(metadata.get("utterance_boundaries") or [])
         if str(item.get("index", "")).lstrip("-").isdigit()
     }
     boundary = boundaries.get(index)
@@ -312,24 +321,34 @@ def _label_gap(
         boundary_type = str(boundary.get("boundary_type") or "")
         if boundary_type == "gap_zone":
             return False, "split_gap_zone"
-        if boundary.get("speaker_changed") is True:
-            return False, "split_speaker_change"
-        if boundary_type == "speaker_turn":
-            return False, "split_speaker_turn"
+        if boundary_type == "cut_point":
+            return False, "split_cut_point"
     if gap_s >= config.long_gap_split_s:
         return False, "split_long_gap"
 
     source_ids = [str(value) for value in list(metadata.get("source_audio_ids") or [])]
-    speaker_ids = [str(value) for value in list(metadata.get("speaker_proxy_ids") or [])]
     previous_source = source_ids[index] if index < len(source_ids) else ""
     next_source = source_ids[index + 1] if index + 1 < len(source_ids) else ""
-    previous_speaker = speaker_ids[index] if index < len(speaker_ids) else ""
-    next_speaker = speaker_ids[index + 1] if index + 1 < len(speaker_ids) else ""
     same_source = bool(previous_source and previous_source == next_source)
-    same_speaker = bool(previous_speaker and previous_speaker == next_speaker)
-    if gap_s <= config.safe_merge_gap_s and (same_source or same_speaker):
+    if gap_s <= config.safe_merge_gap_s and same_source:
         return True, "merge_same_source_short_gap"
     return None
+
+
+def _synthetic_merge_gap_s(
+    *,
+    audio_id: str,
+    segment_index: int,
+    positive_index: int,
+    config: FrameSequenceConfig,
+) -> float:
+    lower = max(0.0, min(config.synthetic_merge_gap_min_s, config.synthetic_merge_gap_s))
+    upper = max(0.0, max(config.synthetic_merge_gap_min_s, config.synthetic_merge_gap_s))
+    if upper <= lower:
+        return upper
+    digest = hashlib.sha1(f"{audio_id}:{segment_index}:{positive_index}".encode("utf-8")).digest()
+    fraction = int.from_bytes(digest[:8], "big") / float(2**64 - 1)
+    return lower + (upper - lower) * fraction
 
 
 def _record_segments(record: LabelRecord) -> list[Segment]:
@@ -404,9 +423,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--right-context-s", type=float, default=0.60)
     parser.add_argument("--max-ptm-dims", type=int, default=64)
     parser.add_argument("--no-mfcc", action="store_true")
+    parser.add_argument("--target-chunk-s", type=float, default=3.0)
     parser.add_argument("--safe-merge-gap-s", type=float, default=0.12)
     parser.add_argument("--long-gap-split-s", type=float, default=0.60)
     parser.add_argument("--synthetic-merge-positives-per-record", type=int, default=1)
+    parser.add_argument("--synthetic-merge-gap-min-s", type=float, default=0.04)
     parser.add_argument("--synthetic-merge-gap-s", type=float, default=0.04)
     parser.add_argument("--synthetic-merge-min-segment-s", type=float, default=1.20)
     args = parser.parse_args(argv)
@@ -418,10 +439,16 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         parser.error("context seconds must be positive")
     if args.max_ptm_dims <= 0:
         parser.error("--max-ptm-dims must be positive")
+    if args.target_chunk_s <= 0.0:
+        parser.error("--target-chunk-s must be positive")
     if args.safe_merge_gap_s < 0.0 or args.long_gap_split_s < 0.0:
         parser.error("gap thresholds must be non-negative")
     if args.synthetic_merge_positives_per_record < 0:
         parser.error("--synthetic-merge-positives-per-record must be non-negative")
+    if args.synthetic_merge_gap_min_s < 0.0:
+        parser.error("--synthetic-merge-gap-min-s must be non-negative")
+    if args.synthetic_merge_gap_s < 0.0:
+        parser.error("--synthetic-merge-gap-s must be non-negative")
     return args
 
 
@@ -438,9 +465,11 @@ def main(argv: list[str] | None = None) -> None:
             right_context_s=args.right_context_s,
             max_ptm_dims=args.max_ptm_dims,
             include_mfcc=not args.no_mfcc,
+            target_chunk_s=args.target_chunk_s,
             safe_merge_gap_s=args.safe_merge_gap_s,
             long_gap_split_s=args.long_gap_split_s,
             synthetic_merge_positives_per_record=args.synthetic_merge_positives_per_record,
+            synthetic_merge_gap_min_s=args.synthetic_merge_gap_min_s,
             synthetic_merge_gap_s=args.synthetic_merge_gap_s,
             synthetic_merge_min_segment_s=args.synthetic_merge_min_segment_s,
         ),

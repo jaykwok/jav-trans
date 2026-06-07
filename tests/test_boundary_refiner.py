@@ -16,6 +16,7 @@ from boundary.refiner import (
 from boundary.sequence_features import (
     FRAME_SEQUENCE_FEATURE_SCHEMA,
     FrameSequenceFeatureConfig,
+    FrameSequenceFeatureProvider,
     feature_extraction_hash,
     feature_extraction_signature,
 )
@@ -65,10 +66,33 @@ def test_load_boundary_refiner_rejects_unknown_checkpoint(tmp_path):
         load_boundary_refiner(enabled=True, model_path=str(missing))
 
 
-def test_load_boundary_refiner_uses_bootstrap_when_default_checkpoint_missing():
+def test_load_boundary_refiner_loads_canonical_checkpoint_when_present():
+    pytest.importorskip("torch")
+    transformers = pytest.importorskip("transformers")
+    if not hasattr(transformers, "Mamba2Model"):
+        pytest.skip("transformers.Mamba2Model is unavailable")
+
+    assert DEFAULT_REFINER_CHECKPOINT_PATH.exists()
+
     refiner = load_boundary_refiner(
         enabled=True,
         model_path=str(DEFAULT_REFINER_CHECKPOINT_PATH),
+        backbone="transformers.Mamba2Model",
+    )
+
+    assert refiner.signature()["type"] == "learned_boundary_refiner"
+    assert refiner.signature()["metadata"]["runtime_adapter"] == "frame_sequence_v1"
+
+
+def test_load_boundary_refiner_uses_bootstrap_when_default_checkpoint_missing(tmp_path, monkeypatch):
+    import boundary.refiner as refiner_module
+
+    missing_default = tmp_path / "boundary_refiner.pt"
+    monkeypatch.setattr(refiner_module, "DEFAULT_REFINER_CHECKPOINT_PATH", missing_default)
+
+    refiner = load_boundary_refiner(
+        enabled=True,
+        model_path=str(missing_default),
         backbone="transformers.Mamba2Model",
     )
 
@@ -219,7 +243,7 @@ def test_frame_sequence_refiner_checkpoint_round_trip(tmp_path):
     torch.save(checkpoint, checkpoint_path)
 
     refiner = load_frame_sequence_refiner_checkpoint(
-        checkpoint_path,
+        str(checkpoint_path),
         threshold=0.0,
         backbone_override="transformers.Mamba2Model",
     )
@@ -231,6 +255,43 @@ def test_frame_sequence_refiner_checkpoint_round_trip(tmp_path):
     assert refiner.signature()["metadata"]["feature_schema"] == FRAME_SEQUENCE_FEATURE_SCHEMA
     assert refiner.signature()["requested_device"] == "auto"
     assert refiner.signature()["actual_device"] in {"cpu", "cuda:0"}
+
+
+def test_frame_sequence_feature_provider_caches_frame_arrays(monkeypatch):
+    import boundary.sequence_features as sequence_features
+
+    calls: list[str] = []
+    original = sequence_features._frame_array
+
+    def counting_frame_array(values, *, name):
+        calls.append(name)
+        return original(values, name=name)
+
+    monkeypatch.setattr(sequence_features, "_frame_array", counting_frame_array)
+    provider = FrameSequenceFeatureProvider(
+        duration_s=2.0,
+        frame_hop_s=0.02,
+        ptm=[[0.1, 0.2]] * 100,
+        mfcc=[[0.3]] * 100,
+        config=FrameSequenceFeatureConfig(max_ptm_dims=1, include_mfcc=True),
+    )
+
+    first = provider.features_for_gap(
+        left_start_s=0.0,
+        left_end_s=0.5,
+        right_start_s=0.8,
+        right_end_s=1.2,
+    )
+    second = provider.features_for_gap(
+        left_start_s=1.0,
+        left_end_s=1.2,
+        right_start_s=1.4,
+        right_end_s=1.8,
+    )
+
+    assert first
+    assert second
+    assert calls == ["ptm", "mfcc"]
 
 
 def test_frame_sequence_refiner_rejects_missing_feature_schema(tmp_path):

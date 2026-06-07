@@ -76,8 +76,7 @@ def build_exact_island_labels(
         )
         boundary_metadata = {
             "source_audio_ids": list(payload.get("source_audio_ids") or []),
-            "speaker_proxy_ids": list(payload.get("speaker_proxy_ids") or []),
-            "speaker_turn_boundaries": list(payload.get("speaker_turn_boundaries") or []),
+            "utterance_boundaries": list(payload.get("utterance_boundaries") or []),
             "cut_point_segments": list(payload.get("cut_point_segments") or []),
             "cut_drop_zones": list(payload.get("cut_drop_zones") or []),
             "actual_speech_segments": list(payload.get("actual_speech_segments") or []),

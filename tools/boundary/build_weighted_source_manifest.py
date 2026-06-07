@@ -16,11 +16,24 @@ if str(SRC_ROOT) not in sys.path:
 
 
 def load_manifest(path: Path) -> list[dict[str, Any]]:
-    payload = json.loads(path.read_text(encoding="utf-8"))
-    if not isinstance(payload, list):
-        raise ValueError(f"manifest must be a JSON list: {path}")
+    text = path.read_text(encoding="utf-8")
+    if text.lstrip().startswith("["):
+        payload = json.loads(text)
+        if not isinstance(payload, list):
+            raise ValueError(f"manifest must be a JSON list or JSONL: {path}")
+        raw_rows = payload
+    else:
+        raw_rows = []
+        for line_number, line in enumerate(text.splitlines(), start=1):
+            stripped = line.strip()
+            if not stripped:
+                continue
+            row = json.loads(stripped)
+            if not isinstance(row, Mapping):
+                raise ValueError(f"manifest JSONL row must be an object: {path}:{line_number}")
+            raw_rows.append(row)
     rows: list[dict[str, Any]] = []
-    for row in payload:
+    for row in raw_rows:
         if not isinstance(row, Mapping) or row.get("error") or not row.get("audio"):
             continue
         audio_path = Path(str(row["audio"]))

@@ -71,21 +71,15 @@ def _ffmpeg_binaries() -> list[tuple[str, str]]:
     return bundled
 
 
-def _optional_data_dir(path: str | Path, target: str) -> list[tuple[str, str]]:
-    candidate = Path(path).expanduser()
-    if not candidate.is_absolute():
-        candidate = ROOT / candidate
-    candidate = candidate.resolve()
-    if not candidate.exists():
-        return []
-    return [(str(candidate), target)]
-
-
 datas = collect_data_files("webview", include_py_files=False)
 datas += copy_metadata("torchcodec")
 datas += copy_metadata("nagisa")
 datas += [
     (str(_require_path("src/web/static", "web static assets")), "src/web/static"),
+    (
+        str(_require_path("src/boundary/checkpoints", "Boundary Refiner checkpoints")),
+        "src/boundary/checkpoints",
+    ),
     (str(_require_path("icon.ico", "application icon")), "."),
     (str(_require_path("icon.png", "application png icon")), "."),
     (
@@ -105,10 +99,6 @@ datas += [
         "qwen_asr/inference/assets",
     ),
 ]
-datas += _optional_data_dir(
-    "src/boundary/checkpoints",
-    "src/boundary/checkpoints",
-)
 
 binaries = _ffmpeg_binaries()
 
@@ -150,6 +140,7 @@ hiddenimports += collect_submodules("transformers.generation")
 hiddenimports += collect_submodules("nagisa")
 hiddenimports += collect_submodules("qwen_asr")
 hiddenimports += collect_submodules("torchcodec")
+hiddenimports += collect_submodules("transformers.models.mamba2")
 hiddenimports += collect_submodules("transformers.models.qwen2")
 hiddenimports += collect_submodules("transformers.models.qwen3")
 

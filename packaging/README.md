@@ -17,9 +17,11 @@ It bundles:
 - the default ASR model `jaykwok/Qwen3-ASR-0.6B-JA-Anime-Galgame`
 - default workflow auxiliary models:
   - forced aligner `Qwen/Qwen3-ForcedAligner-0.6B`
-  - `src/boundary/checkpoints/boundary_refiner.pt` if it exists; when this small
-    learned Boundary Refiner checkpoint is absent, the app falls back to the
-    deterministic bootstrap refiner
+  - learned Boundary Refiner `src/boundary/checkpoints/boundary_refiner.pt`
+
+The PyInstaller spec treats `src/boundary/checkpoints/` as a required data
+directory. A build should fail if the default Boundary Refiner checkpoint is
+missing, because normal inference does not regenerate it.
 
 It does not bundle Microsoft Edge WebView2. Users still need the WebView2 runtime,
 which is already present on most supported Windows systems. If the app window
@@ -38,8 +40,8 @@ At runtime, writable files are created next to `JAVTrans.exe`:
 
 - `.env` for persisted settings
 - `models/` for user-downloaded non-default models
-- `temp/web/` for job state and resumable task files
-- `temp/log/` for `.run.log` diagnostics that users can attach to bug reports
+- `tmp/jobs/` for job state and resumable task files
+- `tmp/log/` for `.run.log` diagnostics that users can attach to bug reports
 
 To create split archives with 7-Zip:
 
@@ -52,9 +54,15 @@ The default output is `dist/release-assets/JAVTrans-windows-x64.7z.001`,
 The script uses all logical CPU threads by default; override with `-Threads <n>`
 if you need to keep the machine responsive while compressing.
 
-Only the default ASR model, forced aligner, runtime assets, and the optional
-small `src/boundary/checkpoints/boundary_refiner.pt` are bundled. Other ASR
+Only the default ASR model, forced aligner, runtime assets, and the small
+`src/boundary/checkpoints/boundary_refiner.pt` are bundled. Other ASR
 models remain download-on-demand into the executable folder's `models/`
-directory. Do not restore old `src/vad` checkpoint paths; if the Boundary Refiner
+directory.
+
+Training-only Boundary Refiner artifacts are deliberately excluded from release
+packages: CUDA feature caches, synthetic WAVs, sequence JSONL files, and
+`datasets/train/...` outputs are all regenerable research data. New users only
+need the bundled `boundary_refiner.pt` plus the Hugging Face ASR / aligner models
+above. Do not restore old `src/vad` checkpoint paths; if the Boundary Refiner
 checkpoint grows too large for source distribution, publish it as a GitHub
 Release or Hugging Face artifact instead.

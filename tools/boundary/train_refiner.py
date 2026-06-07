@@ -8,7 +8,9 @@ import random
 import sys
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any, Mapping, Sequence
+from typing import Any, Iterable, Mapping, Sequence
+
+import numpy as np
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 SRC_ROOT = PROJECT_ROOT / "src"
@@ -17,7 +19,7 @@ if str(SRC_ROOT) not in sys.path:
 
 import torch
 from torch import nn
-from torch.utils.data import DataLoader, TensorDataset
+from torch.utils.data import DataLoader, Subset, TensorDataset
 
 from boundary.backbones import TRANSFORMERS_MAMBA2_BACKBONE, BoundarySequenceClassifier
 from boundary.refiner import (
@@ -53,6 +55,35 @@ class TrainRefinerConfig:
     threshold: float = 0.5
     allow_single_class: bool = False
     log_interval_steps: int = 20
+    target_domain_speedup: float = 1.5
+    target_chunk_s: float = 3.0
+    max_core_chunk_s: float = 5.0
+    max_padded_chunk_s: float = 9.0
+    min_chunk_s: float = 0.4
+    target_padding_s: float = 2.0
+
+
+@dataclass(frozen=True)
+class LoadedRefinerDataset:
+    features: torch.Tensor
+    labels: torch.Tensor
+    mask: torch.Tensor
+    feature_names: tuple[str, ...]
+    feature_metadata: dict[str, Any]
+    train_schema: str
+    class_counts: dict[str, int]
+    first_row: dict[str, Any]
+
+
+@dataclass(frozen=True)
+class DatasetScan:
+    row_count: int
+    max_len: int
+    feature_names: tuple[str, ...]
+    feature_metadata: dict[str, Any]
+    train_schema: str
+    class_counts: dict[str, int]
+    first_row: dict[str, Any]
 
 
 def train_refiner(
@@ -62,30 +93,30 @@ def train_refiner(
     config: TrainRefinerConfig = TrainRefinerConfig(),
 ) -> dict[str, Any]:
     _validate_config(config)
-    rows = _load_dataset_rows(dataset_paths)
-    if not rows:
-        raise ValueError("boundary refiner dataset is empty")
-    feature_names = _feature_names(rows)
-    features, labels, mask = _rows_to_padded_tensors(rows, feature_names)
-    feature_metadata = _feature_metadata(rows, feature_names)
-    class_counts = {
-        "merge_positive": int(labels[mask].sum().item()),
-        "split_negative": int(mask.sum().item() - labels[mask].sum().item()),
-    }
+    loaded = _load_dataset_tensors(dataset_paths)
+    features = loaded.features
+    labels = loaded.labels
+    mask = loaded.mask
+    feature_names = loaded.feature_names
+    feature_metadata = loaded.feature_metadata
+    class_counts = loaded.class_counts
     if not config.allow_single_class and (class_counts["merge_positive"] == 0 or class_counts["split_negative"] == 0):
         raise ValueError(
             "boundary refiner training requires both merge and split labels; "
             f"got {class_counts}. Use --allow-single-class only for loader smoke."
         )
 
-    train_idx, val_idx = _split_indexes(len(rows), val_ratio=config.val_ratio, seed=config.seed)
-    train_features = features[train_idx]
-    train_labels = labels[train_idx]
+    train_idx, val_idx = _split_indexes(features.shape[0], val_ratio=config.val_ratio, seed=config.seed)
     train_mask = mask[train_idx]
-    active_train_features = train_features[train_mask]
+    train_labels = labels[train_idx]
+    train_row_mask = torch.zeros(features.shape[0], dtype=torch.bool)
+    train_row_mask[train_idx] = True
+    active_train_mask = train_row_mask[:, None] & mask
+    active_train_features = features[active_train_mask]
     feature_mean = active_train_features.mean(dim=0)
     feature_std = active_train_features.std(dim=0, unbiased=False).clamp_min(1e-6)
-    features = (features - feature_mean) / feature_std
+    del active_train_features
+    features.sub_(feature_mean).div_(feature_std)
 
     device = _resolve_device(config.device)
     torch.manual_seed(config.seed)
@@ -102,7 +133,7 @@ def train_refiner(
         bidirectional=config.bidirectional,
     ).to(device)
 
-    train_dataset = TensorDataset(features[train_idx], labels[train_idx], mask[train_idx])
+    train_dataset = Subset(TensorDataset(features, labels, mask), train_idx)
     train_loader = DataLoader(
         train_dataset,
         batch_size=min(config.batch_size, len(train_dataset)),
@@ -150,19 +181,23 @@ def train_refiner(
         "last_train_loss": last_loss,
         "train": _evaluate(
             model,
-            features[train_idx],
-            labels[train_idx],
-            mask[train_idx],
+            features,
+            labels,
+            mask,
+            indexes=train_idx,
             device=device,
             threshold=config.threshold,
+            batch_size=config.batch_size,
         ),
         "val": _evaluate(
             model,
-            features[val_idx],
-            labels[val_idx],
-            mask[val_idx],
+            features,
+            labels,
+            mask,
+            indexes=val_idx,
             device=device,
             threshold=config.threshold,
+            batch_size=config.batch_size,
         )
         if val_idx
         else {},
@@ -179,8 +214,17 @@ def train_refiner(
             "trainer": "tools/boundary/train_refiner.py",
             "dataset_paths": [str(path) for path in dataset_paths],
             "class_counts": class_counts,
-            "train_schema": _train_schema(rows),
+            "train_schema": loaded.train_schema,
             "runtime_adapter": _runtime_adapter_name(feature_names),
+            "timing_policy": {
+                "target_domain_speedup": config.target_domain_speedup,
+                "target_chunk_s": config.target_chunk_s,
+                "max_core_chunk_s": config.max_core_chunk_s,
+                "max_padded_chunk_s": config.max_padded_chunk_s,
+                "min_chunk_s": config.min_chunk_s,
+                "target_padding_s": config.target_padding_s,
+                "source": "galgame_duration_distribution_speedup_1_5",
+            },
             **feature_metadata,
         },
     )
@@ -198,9 +242,9 @@ def train_refiner(
         "signature": refiner.signature(),
         "decision": None,
         "decision_skipped_reason": "",
-    }
+        }
     if _supports_refiner_input_decision(feature_names):
-        smoke_input = _row_smoke_input(rows[0], feature_names)
+        smoke_input = _row_smoke_input(loaded.first_row, feature_names)
         smoke_decision = refiner.decide_gap(smoke_input)
         metrics["loader_smoke"]["decision"] = {
             "merge": smoke_decision.merge,
@@ -223,58 +267,141 @@ def train_refiner(
     return metrics
 
 
-def _load_dataset_rows(paths: Sequence[Path]) -> list[dict[str, Any]]:
-    rows: list[dict[str, Any]] = []
+def _load_dataset_tensors(paths: Sequence[Path]) -> LoadedRefinerDataset:
+    scan = _scan_dataset(paths)
+    features = torch.zeros((scan.row_count, scan.max_len, len(scan.feature_names)), dtype=torch.float32)
+    labels = torch.zeros((scan.row_count, scan.max_len), dtype=torch.float32)
+    mask = torch.zeros((scan.row_count, scan.max_len), dtype=torch.bool)
+
+    row_index = 0
+    for row in _iter_dataset_rows(paths):
+        sequence = _row_sequence_array(row, scan.feature_names)
+        label_sequence = _row_label_sequence(row, expected_len=int(sequence.shape[0]))
+        length = int(sequence.shape[0])
+        features[row_index, :length].copy_(torch.from_numpy(sequence))
+        labels[row_index, :length].copy_(torch.tensor(label_sequence, dtype=torch.float32))
+        mask[row_index, :length] = True
+        row_index += 1
+    if row_index != scan.row_count:
+        raise ValueError(f"dataset changed while loading: expected {scan.row_count}, got {row_index}")
+    return LoadedRefinerDataset(
+        features=features,
+        labels=labels,
+        mask=mask,
+        feature_names=scan.feature_names,
+        feature_metadata=scan.feature_metadata,
+        train_schema=scan.train_schema,
+        class_counts=scan.class_counts,
+        first_row=scan.first_row,
+    )
+
+
+def _scan_dataset(paths: Sequence[Path]) -> DatasetScan:
+    row_count = 0
+    max_len = 0
+    feature_names: tuple[str, ...] | None = None
+    first_row: dict[str, Any] | None = None
+    class_counts = {"merge_positive": 0, "split_negative": 0}
+    train_schemas: set[str] = set()
+    feature_schema_values: set[str] = set()
+    feature_hash_values: set[str] = set()
+    expected_signature: dict[str, Any] | None = None
+
+    for row in _iter_dataset_rows(paths):
+        if first_row is None:
+            first_row = dict(row)
+        row_names = _row_feature_names(row, feature_names)
+        if feature_names is None:
+            feature_names = row_names
+        elif row_names != feature_names:
+            raise ValueError(f"feature_names mismatch at row {row_count}: {row_names} != {feature_names}")
+        sequence_len = _row_sequence_length(row, feature_names)
+        label_sequence = _row_label_sequence(row, expected_len=sequence_len)
+        row_positive = sum(1 for value in label_sequence if value >= 0.5)
+        class_counts["merge_positive"] += row_positive
+        class_counts["split_negative"] += len(label_sequence) - row_positive
+        max_len = max(max_len, sequence_len)
+        train_schemas.add(str(row.get("schema") or ""))
+        if row.get("feature_schema"):
+            feature_schema_values.add(str(row["feature_schema"]))
+        if row.get("feature_schema_hash"):
+            feature_hash_values.add(str(row["feature_schema_hash"]))
+        signature = row.get("feature_signature")
+        if isinstance(signature, Mapping):
+            signature_dict = dict(signature)
+            if expected_signature is None:
+                expected_signature = signature_dict
+            elif signature_dict != expected_signature:
+                raise ValueError(f"feature_signature mismatch at row {row_count}")
+        row_count += 1
+
+    if row_count == 0 or feature_names is None or first_row is None:
+        raise ValueError("boundary refiner dataset is empty")
+    if max_len <= 0:
+        raise ValueError("boundary refiner dataset has no sequence items")
+    return DatasetScan(
+        row_count=row_count,
+        max_len=max_len,
+        feature_names=feature_names,
+        feature_metadata=_feature_metadata_from_scan(
+            feature_names=feature_names,
+            schema_values=feature_schema_values,
+            hash_values=feature_hash_values,
+            expected_signature=expected_signature,
+        ),
+        train_schema=_train_schema_from_values(train_schemas),
+        class_counts=class_counts,
+        first_row=first_row,
+    )
+
+
+def _iter_dataset_rows(paths: Sequence[Path]) -> Iterable[dict[str, Any]]:
     for path in paths:
         with path.open("r", encoding="utf-8") as handle:
             for line in handle:
                 if line.strip():
-                    rows.append(json.loads(line))
-    return rows
+                    yield json.loads(line)
 
 
-def _feature_names(rows: Sequence[Mapping[str, Any]]) -> tuple[str, ...]:
-    first = rows[0].get("feature_names") or list(DEFAULT_REFINER_FEATURES)
-    names = tuple(str(name) for name in first)
+def _row_feature_names(row: Mapping[str, Any], fallback: tuple[str, ...] | None = None) -> tuple[str, ...]:
+    raw = row.get("feature_names")
+    if raw:
+        names = tuple(str(name) for name in raw)
+    elif fallback is not None:
+        names = fallback
+    else:
+        names = tuple(DEFAULT_REFINER_FEATURES)
     if not names:
         raise ValueError("dataset feature_names must not be empty")
-    for index, row in enumerate(rows):
-        row_names = tuple(str(name) for name in (row.get("feature_names") or names))
-        if row_names != names:
-            raise ValueError(f"feature_names mismatch at row {index}: {row_names} != {names}")
     return names
 
 
 def _train_schema(rows: Sequence[Mapping[str, Any]]) -> str:
     schemas = {str(row.get("schema") or "") for row in rows}
+    return _train_schema_from_values(schemas)
+
+
+def _train_schema_from_values(schemas: set[str]) -> str:
     return schemas.pop() if len(schemas) == 1 else "mixed_boundary_refiner_dataset"
 
 
-def _feature_metadata(
-    rows: Sequence[Mapping[str, Any]],
+def _feature_metadata_from_scan(
+    *,
     feature_names: tuple[str, ...],
+    schema_values: set[str],
+    hash_values: set[str],
+    expected_signature: Mapping[str, Any] | None,
 ) -> dict[str, Any]:
-    schema_values = {str(row.get("feature_schema") or "") for row in rows if row.get("feature_schema")}
-    hash_values = {str(row.get("feature_schema_hash") or "") for row in rows if row.get("feature_schema_hash")}
-    signature_values = [
-        dict(row["feature_signature"])
-        for row in rows
-        if isinstance(row.get("feature_signature"), Mapping)
-    ]
     if schema_values and schema_values != {FRAME_SEQUENCE_FEATURE_SCHEMA}:
         raise ValueError(f"unsupported sequence feature schema: {sorted(schema_values)}")
     if len(hash_values) > 1:
         raise ValueError("mixed feature_schema_hash values are not allowed")
-    if signature_values:
-        expected_signature = signature_values[0]
-        for index, signature in enumerate(signature_values):
-            if signature != expected_signature:
-                raise ValueError(f"feature_signature mismatch at row {index}")
-        feature_schema_hash = hash_values.pop() if hash_values else _hash_from_signature(expected_signature)
+    if expected_signature is not None:
+        feature_schema_hash = next(iter(hash_values)) if hash_values else _hash_from_signature(expected_signature)
         return {
             "feature_schema": str(expected_signature.get("feature_schema") or FRAME_SEQUENCE_FEATURE_SCHEMA),
             "feature_schema_hash": feature_schema_hash,
-            "feature_signature": expected_signature,
+            "feature_signature": dict(expected_signature),
             "feature_dim": len(feature_names),
         }
     if schema_values or hash_values:
@@ -296,6 +423,7 @@ def _hash_from_signature(signature: Mapping[str, Any]) -> str:
         right_context_s=float(feature_config["right_context_s"]),
         max_ptm_dims=int(feature_config["max_ptm_dims"]),
         include_mfcc=bool(feature_config["include_mfcc"]),
+        target_chunk_s=float(feature_config["target_chunk_s"]),
     )
     return feature_extraction_hash(
         config=config,
@@ -311,36 +439,34 @@ def _runtime_adapter_name(feature_names: Sequence[str]) -> str:
     return "refiner_input_v1" if _supports_refiner_input_decision(feature_names) else "frame_sequence_v1"
 
 
-def _rows_to_padded_tensors(
-    rows: Sequence[Mapping[str, Any]],
-    feature_names: tuple[str, ...],
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    sequences = [_row_sequence(row, feature_names) for row in rows]
-    label_sequences = [_row_label_sequence(row, expected_len=len(sequence)) for row, sequence in zip(rows, sequences)]
-    max_len = max(len(sequence) for sequence in sequences)
-    feature_dim = len(feature_names)
-    features = torch.zeros((len(rows), max_len, feature_dim), dtype=torch.float32)
-    labels = torch.zeros((len(rows), max_len), dtype=torch.float32)
-    mask = torch.zeros((len(rows), max_len), dtype=torch.bool)
-    for row_index, (sequence, label_sequence) in enumerate(zip(sequences, label_sequences)):
-        length = len(sequence)
-        features[row_index, :length] = torch.tensor(sequence, dtype=torch.float32)
-        labels[row_index, :length] = torch.tensor(label_sequence, dtype=torch.float32)
-        mask[row_index, :length] = True
-    return features, labels, mask
+def _row_sequence_length(row: Mapping[str, Any], feature_names: tuple[str, ...]) -> int:
+    raw_sequence = row.get("sequence_features")
+    if isinstance(raw_sequence, list) and raw_sequence:
+        first = raw_sequence[0]
+        if not isinstance(first, list) or len(first) != len(feature_names):
+            validate_sequence_features(
+                raw_sequence,
+                feature_names=feature_names,
+                expected_feature_names=row.get("feature_names") or feature_names,
+            )
+        return len(raw_sequence)
+    return 1
 
 
-def _row_sequence(row: Mapping[str, Any], feature_names: tuple[str, ...]) -> list[list[float]]:
+def _row_sequence_array(row: Mapping[str, Any], feature_names: tuple[str, ...]) -> np.ndarray:
     raw_sequence = row.get("sequence_features")
     if isinstance(raw_sequence, list) and raw_sequence:
         return validate_sequence_features(
             raw_sequence,
             feature_names=feature_names,
             expected_feature_names=row.get("feature_names") or feature_names,
-        ).astype(float).tolist()
+        ).astype(np.float32, copy=False)
     features = _row_features(row, feature_names)
-    validate_sequence_features([features], feature_names=feature_names)
-    return [features]
+    return validate_sequence_features([features], feature_names=feature_names).astype(np.float32, copy=False)
+
+
+def _row_sequence(row: Mapping[str, Any], feature_names: tuple[str, ...]) -> list[list[float]]:
+    return _row_sequence_array(row, feature_names).astype(float).tolist()
 
 
 def _row_label_sequence(row: Mapping[str, Any], *, expected_len: int) -> list[float]:
@@ -433,28 +559,52 @@ def _evaluate(
     labels: torch.Tensor,
     mask: torch.Tensor,
     *,
+    indexes: Sequence[int] | None = None,
     device: torch.device,
     threshold: float,
+    batch_size: int = 256,
 ) -> dict[str, Any]:
-    if features.numel() == 0 or not bool(mask.any().item()):
+    if features.numel() == 0:
+        return {}
+    if indexes is None:
+        indexes = list(range(features.shape[0]))
+    if not indexes:
         return {}
     model.eval()
+    tp = tn = fp = fn = count = 0
+    prob_sum = 0.0
+    prob_min = math.inf
+    prob_max = -math.inf
     with torch.inference_mode():
-        mask_device = mask.to(device)
-        logits = model(features.to(device), attention_mask=mask_device.long()).detach().cpu()
-        logits = logits[mask]
-        probs = torch.sigmoid(logits)
-    preds = probs >= threshold
-    truth = labels[mask] >= 0.5
-    tp = int(torch.logical_and(preds, truth).sum().item())
-    tn = int(torch.logical_and(~preds, ~truth).sum().item())
-    fp = int(torch.logical_and(preds, ~truth).sum().item())
-    fn = int(torch.logical_and(~preds, truth).sum().item())
+        for start in range(0, len(indexes), max(1, batch_size)):
+            batch_indexes = list(indexes[start : start + max(1, batch_size)])
+            batch_mask = mask[batch_indexes]
+            if not bool(batch_mask.any().item()):
+                continue
+            logits = model(
+                features[batch_indexes].to(device),
+                attention_mask=batch_mask.to(device).long(),
+            ).detach().cpu()
+            logits = logits[batch_mask]
+            probs = torch.sigmoid(logits)
+            truth = labels[batch_indexes][batch_mask] >= 0.5
+            preds = probs >= threshold
+            tp += int(torch.logical_and(preds, truth).sum().item())
+            tn += int(torch.logical_and(~preds, ~truth).sum().item())
+            fp += int(torch.logical_and(preds, ~truth).sum().item())
+            fn += int(torch.logical_and(~preds, truth).sum().item())
+            batch_count = int(truth.numel())
+            count += batch_count
+            prob_sum += float(probs.sum().item())
+            prob_min = min(prob_min, float(probs.min().item()))
+            prob_max = max(prob_max, float(probs.max().item()))
+    if count == 0:
+        return {}
     precision = tp / max(1, tp + fp)
     recall = tp / max(1, tp + fn)
     return {
-        "count": int(labels.numel()),
-        "accuracy": (tp + tn) / max(1, int(labels.numel())),
+        "count": count,
+        "accuracy": (tp + tn) / max(1, count),
         "merge_precision": precision,
         "merge_recall": recall,
         "merge_f1": (2 * precision * recall / max(1e-9, precision + recall)),
@@ -462,9 +612,9 @@ def _evaluate(
         "tn": tn,
         "fp": fp,
         "fn": fn,
-        "prob_mean": float(probs.mean().item()),
-        "prob_min": float(probs.min().item()),
-        "prob_max": float(probs.max().item()),
+        "prob_mean": prob_sum / count,
+        "prob_min": prob_min,
+        "prob_max": prob_max,
     }
 
 
@@ -504,6 +654,17 @@ def _validate_config(config: TrainRefinerConfig) -> None:
         raise ValueError("threshold must be in [0, 1]")
     if config.log_interval_steps < 0:
         raise ValueError("log_interval_steps must be non-negative")
+    if config.target_domain_speedup <= 0.0:
+        raise ValueError("target_domain_speedup must be positive")
+    for name in (
+        "target_chunk_s",
+        "max_core_chunk_s",
+        "max_padded_chunk_s",
+        "min_chunk_s",
+        "target_padding_s",
+    ):
+        if getattr(config, name) <= 0.0:
+            raise ValueError(f"{name} must be positive")
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -533,6 +694,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Only for loader smoke; formal training should keep both merge and split labels.",
     )
     parser.add_argument("--log-interval-steps", type=int, default=20)
+    parser.add_argument("--target-domain-speedup", type=float, default=1.5)
+    parser.add_argument("--target-chunk-s", type=float, default=3.0)
+    parser.add_argument("--max-core-chunk-s", type=float, default=5.0)
+    parser.add_argument("--max-padded-chunk-s", type=float, default=9.0)
+    parser.add_argument("--min-chunk-s", type=float, default=0.4)
+    parser.add_argument("--target-padding-s", type=float, default=2.0)
     args = parser.parse_args(argv)
     return args
 
@@ -560,6 +727,12 @@ def main(argv: list[str] | None = None) -> None:
             threshold=args.threshold,
             allow_single_class=args.allow_single_class,
             log_interval_steps=args.log_interval_steps,
+            target_domain_speedup=args.target_domain_speedup,
+            target_chunk_s=args.target_chunk_s,
+            max_core_chunk_s=args.max_core_chunk_s,
+            max_padded_chunk_s=args.max_padded_chunk_s,
+            min_chunk_s=args.min_chunk_s,
+            target_padding_s=args.target_padding_s,
         ),
     )
 
