@@ -43,7 +43,7 @@ def test_manifest_row_preserves_source_and_review_type():
     assert row["manual_label"] == ""
 
 
-def test_manifest_row_exports_repetition_and_low_information_fields():
+def test_manifest_row_exports_repetition_and_text_density_fields():
     repeat_row = manifest_row(
         {
             "case_label": "full",
@@ -61,7 +61,7 @@ def test_manifest_row_exports_repetition_and_low_information_fields():
             "repetition_repair": {"action": "truncate_repetition", "changed": True},
         }
     )
-    low_info_row = manifest_row(
+    text_density_row = manifest_row(
         {
             "case_label": "full",
             "video": "sample",
@@ -70,12 +70,12 @@ def test_manifest_row_exports_repetition_and_low_information_fields():
             "start": 3.0,
             "end": 5.0,
             "duration_s": 2.0,
-            "failure_bucket": "low_information_text",
+            "failure_bucket": "diagnostic_warning",
             "alignment_quality": "forced",
             "fallback_type": "none",
             "display_text": "んんんん",
-            "low_information_level": "repeated_nonlexical",
-            "low_information": {"level": "repeated_nonlexical"},
+            "text_density_level": "repeated_vocalization_candidate",
+            "text_density": {"level": "repeated_vocalization_candidate"},
         }
     )
 
@@ -85,8 +85,8 @@ def test_manifest_row_exports_repetition_and_low_information_fields():
         "action": "truncate_repetition",
         "changed": True,
     }
-    assert low_info_row["review_type"] == "review_low_information_text"
-    assert low_info_row["low_information_level"] == "repeated_nonlexical"
+    assert text_density_row["review_type"] == "review_diagnostic_warning"
+    assert text_density_row["text_density_level"] == "repeated_vocalization_candidate"
 
 
 def test_export_alignment_failure_manifest_cli(tmp_path):
@@ -173,13 +173,13 @@ def test_select_alignment_failure_audit_subset_cli(tmp_path):
             "failure_bucket": "repeat_repair_suggested",
         },
         {
-            "sample_id": "low-1",
+            "sample_id": "asr-1",
             "case_label": "full",
             "video": "sample",
             "chunk_index": 1,
             "start": 1.0,
-            "review_type": "review_low_information_text",
-            "failure_bucket": "long_low_information_text",
+            "review_type": "review_asr_qc_warn",
+            "failure_bucket": "asr_qc_warn",
         },
         {
             "sample_id": "coarse-2",
@@ -233,10 +233,9 @@ def test_select_alignment_failure_audit_subset_cli(tmp_path):
     ]
     summary = json.loads((output_dir / "alignment_failure_audit_subset_summary.json").read_text(encoding="utf-8"))
 
-    assert [row["sample_id"] for row in selected] == ["repeat-0", "low-1", "coarse-2", "coarse-4"]
+    assert [row["sample_id"] for row in selected] == ["repeat-0", "coarse-2", "coarse-4"]
     assert summary["review_type_counts"] == {
         "review_coarse_timing": 2,
-        "review_low_information_text": 1,
         "review_repetition_repair": 1,
     }
 

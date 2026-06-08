@@ -167,13 +167,14 @@ def test_train_refiner_checkpoint_round_trip_from_gap_dataset(tmp_path):
         gap_s = 0.03 if merge else 0.8
         rows.append(
             {
-                "schema": "boundary_refiner_gap_dataset_v1",
+                "schema": "boundary_refiner_gap_dataset_v2",
                 "audio_id": f"sample-{index}",
                 "source": "unit",
                 "label_index": index,
                 "gap_index": 0,
                 "merge_target": merge,
                 "label": 1 if merge else 0,
+                "sequence_context_targets": [[0.0, 0.0] if merge else [0.5, 0.5]],
                 "label_reason": "merge_test" if merge else "split_test",
                 "feature_names": [
                     "gap_s",
@@ -231,7 +232,7 @@ def test_train_refiner_checkpoint_round_trip_from_gap_dataset(tmp_path):
 
     checkpoint = Path(metrics["checkpoint"])
     assert checkpoint.exists()
-    assert metrics["loader_smoke"]["signature"]["schema"] == "boundary_refiner_v1"
+    assert metrics["loader_smoke"]["signature"]["schema"] == "boundary_refiner_v2"
     assert metrics["loader_smoke"]["signature"]["backbone"] == "transformers.Mamba2Model"
 
 
@@ -284,11 +285,15 @@ def test_train_refiner_accepts_sequence_dataset(tmp_path):
             labels.append(1 if merge else 0)
         rows.append(
             {
-                "schema": "boundary_refiner_sequence_dataset_v1",
+                "schema": "boundary_refiner_sequence_dataset_v2",
                 "audio_id": f"seq-{row_index}",
                 "feature_names": feature_names,
                 "sequence_features": sequence,
                 "sequence_labels": labels,
+                "sequence_context_targets": [
+                    [0.0, 0.0] if label else [0.5, 0.5]
+                    for label in labels
+                ],
             }
         )
     dataset.write_text(
@@ -345,7 +350,7 @@ def test_train_refiner_uses_streaming_tensor_loader(tmp_path, monkeypatch):
         gap_s = 0.04 if merge else 0.9
         rows.append(
             {
-                "schema": "boundary_refiner_sequence_dataset_v1",
+                "schema": "boundary_refiner_sequence_dataset_v2",
                 "audio_id": f"stream-{row_index}",
                 "feature_names": feature_names,
                 "sequence_features": [
@@ -366,6 +371,7 @@ def test_train_refiner_uses_streaming_tensor_loader(tmp_path, monkeypatch):
                     ]
                 ],
                 "sequence_labels": [1 if merge else 0],
+                "sequence_context_targets": [[[0.0, 0.0] if merge else [0.5, 0.5]][0]],
             }
         )
     dataset = tmp_path / "streaming-sequence.jsonl"
@@ -485,9 +491,10 @@ def test_build_frame_sequence_dataset_trains_with_cached_features(tmp_path):
     rows = [json.loads(line) for line in output_jsonl.read_text(encoding="utf-8").splitlines()]
 
     assert summary["class_balance"] == {"merge_positive": 2, "split_negative": 1}
-    assert rows[0]["schema"] == "boundary_refiner_frame_sequence_dataset_v1"
+    assert rows[0]["schema"] == "boundary_refiner_frame_sequence_dataset_v2"
     assert len(rows[0]["feature_names"]) == 36
     assert len(rows[0]["sequence_features"]) == 3
+    assert len(rows[0]["sequence_context_targets"]) == 3
 
     metrics = train_refiner(
         dataset_paths=[output_jsonl],

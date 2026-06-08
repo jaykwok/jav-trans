@@ -155,7 +155,7 @@ def normalize_row(
         "right_ja": str(row.get("right_ja") or ""),
         "merged_ja": str(row.get("merged_ja") or ""),
         "repetition_suggested_text": str(row.get("repetition_suggested_text") or ""),
-        "low_information_level": str(row.get("low_information_level") or ""),
+        "text_density_level": str(row.get("text_density_level") or ""),
         "audit_reason": str(row.get("audit_reason") or ""),
         "case_label": str(row.get("case_label") or ""),
         "chunk_index": int(row.get("chunk_index") or 0),

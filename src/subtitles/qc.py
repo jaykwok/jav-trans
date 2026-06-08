@@ -136,6 +136,7 @@ def compute_quality_report(
     )
     overlap_stats = _subtitle_overlap_stats(segments)
     duration_stats = _subtitle_duration_stats(segments)
+    alignment_fallback_total = max(int(total_segments or 0), 0)
 
     n = len(segments)
     if n == 0:
@@ -152,6 +153,8 @@ def compute_quality_report(
             "short_segment_ratio": 0.0,
             "per_min_subtitle_count": 0.0,
             "glossary_hit_rate": None,
+            "alignment_fallback_count": alignment_fallback_count,
+            "alignment_fallback_total": alignment_fallback_total,
             "alignment_fallback_ratio": 0.0,
             "asr_generation_error_count": asr_generation_error_count,
             "asr_generation_overflow_count": asr_generation_overflow_count,
@@ -213,7 +216,7 @@ def compute_quality_report(
         glossary_hit_rate = (hits / checks) if checks > 0 else None
 
     # 7. alignment_fallback_ratio
-    alignment_fallback_ratio = alignment_fallback_count / max(total_segments, 1)
+    alignment_fallback_ratio = alignment_fallback_count / max(alignment_fallback_total, 1)
 
     # Threshold checks
     warnings: list[str] = []
@@ -262,6 +265,8 @@ def compute_quality_report(
         "short_segment_ratio": short_segment_ratio,
         "per_min_subtitle_count": round(per_min_subtitle_count, 2),
         "glossary_hit_rate": glossary_hit_rate,
+        "alignment_fallback_count": alignment_fallback_count,
+        "alignment_fallback_total": alignment_fallback_total,
         "alignment_fallback_ratio": alignment_fallback_ratio,
         "asr_generation_error_count": asr_generation_error_count,
         "asr_generation_overflow_count": asr_generation_overflow_count,

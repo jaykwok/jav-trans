@@ -23,7 +23,6 @@ class BoundaryPlannerConfig:
     target_chunk_s: float = 3.0
     min_chunk_s: float = 0.4
     start_weight: float = 1.5
-    target_padding_s: float = 2.0
     max_splits_per_segment: int = 16
     sequence_batch_size: int = 256
     dp_chunk_base_cost: float = 0.04
@@ -41,7 +40,6 @@ class BoundaryPlannerConfig:
             "target_chunk_s": self.target_chunk_s,
             "min_chunk_s": self.min_chunk_s,
             "start_weight": self.start_weight,
-            "target_padding_s": self.target_padding_s,
             "max_splits_per_segment": self.max_splits_per_segment,
             "sequence_batch_size": self.sequence_batch_size,
             "dp_chunk_base_cost": self.dp_chunk_base_cost,
@@ -129,8 +127,6 @@ def _validate_config(config: BoundaryPlannerConfig) -> None:
         raise ValueError("min_chunk_s must be non-negative")
     if config.start_weight <= 0:
         raise ValueError("start_weight must be positive")
-    if config.target_padding_s < 0:
-        raise ValueError("target_padding_s must be non-negative")
     if config.max_splits_per_segment < 0:
         raise ValueError("max_splits_per_segment must be non-negative")
     if config.sequence_batch_size <= 0:

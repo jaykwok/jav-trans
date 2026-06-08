@@ -30,8 +30,6 @@ _CANDIDATE_BUCKET_ORDER = (
     "align_text_empty",
     "empty_text_for_chunk",
     "repeat_repair_suggested",
-    "long_low_information_text",
-    "low_information_text",
     "text_without_output_segment",
     "partial_alignment",
     "vad_coarse_alignment",
@@ -321,18 +319,6 @@ def chunk_failure_reasons(
             and repetition_repair.get("changed")
         ):
             reasons.append("repeat_repair_suggested")
-        low_information = (
-            metrics.get("low_information")
-            if isinstance(metrics.get("low_information"), dict)
-            else {}
-        )
-        low_info_level = str(low_information.get("level") or "")
-        if low_info_level == "long_sparse":
-            reasons.append("long_low_information_text")
-        elif low_info_level == "repeated_nonlexical" and duration_s >= 2.0:
-            reasons.append("low_information_text")
-    if duration_s >= 6.0 and compact_chars <= 5 and text.strip():
-        reasons.append("long_low_information_text")
     if compact_chars >= 30 and duration_s > 0 and compact_chars / duration_s > 14.0:
         reasons.append("abnormal_char_density")
     if int(word_stats.get("word_count") or 0) >= 2:
@@ -357,7 +343,7 @@ def diagnostic_qc_metrics(
         if isinstance((qc_item or {}).get("metrics"), dict)
         else {}
     )
-    if "repetition_repair" in existing_metrics and "low_information" in existing_metrics:
+    if "repetition_repair" in existing_metrics and "text_density" in existing_metrics:
         return existing_metrics, qc_item or {}
 
     offline_qc = evaluate_asr_chunk_qc(
@@ -372,7 +358,7 @@ def diagnostic_qc_metrics(
     merged_metrics = {
         **existing_metrics,
         "repetition_repair": offline_metrics.get("repetition_repair") or {},
-        "low_information": offline_metrics.get("low_information") or {},
+        "text_density": offline_metrics.get("text_density") or {},
         "diagnostic_offline_text_qc": {
             "severity": offline_qc.get("severity", ""),
             "reasons": list(offline_qc.get("reasons") or []),
@@ -411,8 +397,6 @@ def failure_candidate_bucket(row: dict[str, Any]) -> str:
         "vad_coarse_alignment": quality == "vad_coarse" or fallback_type == "vad_coarse",
         "proportional_alignment": quality == "proportional" or fallback_type == "proportional",
         "unknown_alignment_fallback": fallback_type == "unknown",
-        "long_low_information_text": "long_low_information_text" in reasons,
-        "low_information_text": "low_information_text" in reasons,
         "abnormal_char_density": "abnormal_char_density" in reasons,
         "asr_qc_reject": "asr_qc_reject" in reasons,
         "asr_qc_warn": "asr_qc_warn" in reasons,
@@ -462,7 +446,7 @@ def diagnose_case(
     fallback_subtype_counts: Counter = Counter()
     failure_bucket_counts: Counter = Counter()
     prealign_flag_counts: Counter = Counter()
-    low_information_counts: Counter = Counter()
+    text_density_counts: Counter = Counter()
     fallback_chunks = 0
     align_text_empty = 0
     review_chunks = 0
@@ -542,14 +526,14 @@ def diagnose_case(
             if isinstance(qc_metrics.get("repetition_repair"), dict)
             else {}
         )
-        low_information = (
-            qc_metrics.get("low_information")
-            if isinstance(qc_metrics.get("low_information"), dict)
+        text_density = (
+            qc_metrics.get("text_density")
+            if isinstance(qc_metrics.get("text_density"), dict)
             else {}
         )
-        low_info_level = str(low_information.get("level") or "")
-        if low_info_level:
-            low_information_counts[low_info_level] += 1
+        text_density_level = str(text_density.get("level") or "")
+        if text_density_level:
+            text_density_counts[text_density_level] += 1
         prealign_flag_counts.update(prealign.flags)
         reasons = chunk_failure_reasons(
             text=analysis_text,
@@ -625,8 +609,8 @@ def diagnose_case(
             "nonlexical_text": nonlexical_text,
             "compact_chars": compact_chars,
             "chars_per_sec": round(chars_per_sec, 3),
-            "low_information": low_information,
-            "low_information_level": low_info_level,
+            "text_density": text_density,
+            "text_density_level": text_density_level,
             "repetition_repair": repetition_repair,
             "repetition_suggested_text": str(
                 repetition_repair.get("suggested_text") or ""
@@ -678,7 +662,7 @@ def diagnose_case(
         "fallback_subtype_counts": dict(fallback_subtype_counts.most_common()),
         "failure_bucket_counts": dict(failure_bucket_counts.most_common()),
         "prealign_flag_counts": dict(prealign_flag_counts.most_common()),
-        "low_information_counts": dict(low_information_counts.most_common()),
+        "text_density_counts": dict(text_density_counts.most_common()),
         "repeat_repair_suggested_count": sum(
             1
             for row in rows
@@ -784,7 +768,7 @@ def summarize(rows: list[dict[str, Any]], case_summaries: list[dict[str, Any]]) 
     fallback_subtype_counts: Counter = Counter()
     failure_bucket_counts: Counter = Counter()
     prealign_flag_counts: Counter = Counter()
-    low_information_counts: Counter = Counter()
+    text_density_counts: Counter = Counter()
     repeat_repair_suggested_count = 0
     for row in rows:
         reason_counts.update(row.get("failure_reasons") or [])
@@ -804,9 +788,9 @@ def summarize(rows: list[dict[str, Any]], case_summaries: list[dict[str, Any]]) 
         if failure_bucket:
             failure_bucket_counts[failure_bucket] += 1
         prealign_flag_counts.update(row.get("prealign_flags") or [])
-        low_info_level = str(row.get("low_information_level") or "")
-        if low_info_level and low_info_level != "unknown":
-            low_information_counts[low_info_level] += 1
+        text_density_level = str(row.get("text_density_level") or "")
+        if text_density_level and text_density_level != "unknown":
+            text_density_counts[text_density_level] += 1
         if (row.get("repetition_repair") or {}).get("changed"):
             repeat_repair_suggested_count += 1
 
@@ -830,7 +814,7 @@ def summarize(rows: list[dict[str, Any]], case_summaries: list[dict[str, Any]]) 
         "fallback_subtype_counts": dict(fallback_subtype_counts.most_common()),
         "failure_bucket_counts": dict(failure_bucket_counts.most_common()),
         "prealign_flag_counts": dict(prealign_flag_counts.most_common()),
-        "low_information_counts": dict(low_information_counts.most_common()),
+        "text_density_counts": dict(text_density_counts.most_common()),
         "repeat_repair_suggested_count": repeat_repair_suggested_count,
         "cases": case_summaries,
     }

@@ -1786,7 +1786,6 @@ def _repair_postprocessed_segment_windows(segments: list[dict]) -> list[dict]:
         return []
 
     repaired: list[dict] = []
-    epsilon = 0.01
     for idx, segment in enumerate(segments):
         text = str(segment.get("text", "")).strip()
         if not text:
@@ -1795,16 +1794,11 @@ def _repair_postprocessed_segment_windows(segments: list[dict]) -> list[dict]:
         start = max(0.0, float(segment.get("start", 0.0)))
         end = max(start, float(segment.get("end", start)))
         if repaired and start < float(repaired[-1]["end"]):
-            start = float(repaired[-1]["end"])
-            end = max(end, start)
+            repaired[-1]["end"] = max(float(repaired[-1]["start"]), start)
 
         duration = end - start
         if duration <= _ASR_INVALID_SEGMENT_DURATION_S:
             target_end = start + _ASR_MIN_REPAIRED_SEGMENT_DURATION_S
-            if idx + 1 < len(segments):
-                next_start = float(segments[idx + 1].get("start", target_end))
-                if next_start > start:
-                    target_end = min(target_end, max(start, next_start - epsilon))
 
             if target_end - start <= _ASR_INVALID_SEGMENT_DURATION_S:
                 if (
@@ -1846,7 +1840,7 @@ def _repair_postprocessed_segment_windows(segments: list[dict]) -> list[dict]:
         start = float(segment["start"])
         end = float(segment["end"])
         if non_overlapping and start < float(non_overlapping[-1]["end"]):
-            start = float(non_overlapping[-1]["end"])
+            non_overlapping[-1]["end"] = max(float(non_overlapping[-1]["start"]), start)
         if end - start <= _ASR_INVALID_SEGMENT_DURATION_S:
             end = start + _ASR_MIN_REPAIRED_SEGMENT_DURATION_S
         non_overlapping.append(

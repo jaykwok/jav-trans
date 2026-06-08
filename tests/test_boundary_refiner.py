@@ -135,6 +135,7 @@ def test_learned_mamba2_refiner_checkpoint_round_trip(tmp_path):
         input_dim=len(DEFAULT_REFINER_FEATURES),
         hidden_size=8,
         num_layers=1,
+        output_dim=3,
         state_size=4,
         num_heads=4,
         n_groups=2,
@@ -157,6 +158,8 @@ def test_learned_mamba2_refiner_checkpoint_round_trip(tmp_path):
 
     assert decision.merge is True
     assert 0.0 <= decision.score <= 1.0
+    assert decision.left_context_s is not None
+    assert decision.right_context_s is not None
     assert refiner.signature()["type"] == "learned_boundary_refiner"
     assert refiner.signature()["backbone"] == "transformers.Mamba2Model"
     assert refiner.signature()["metadata"] == {"unit": "test"}
@@ -218,6 +221,7 @@ def test_frame_sequence_refiner_checkpoint_round_trip(tmp_path):
         input_dim=len(feature_names),
         hidden_size=8,
         num_layers=1,
+        output_dim=3,
         state_size=4,
         num_heads=4,
         n_groups=2,
@@ -251,6 +255,7 @@ def test_frame_sequence_refiner_checkpoint_round_trip(tmp_path):
 
     assert len(decisions) == 2
     assert all(decision.merge for decision in decisions)
+    assert all(decision.left_context_s is not None for decision in decisions)
     assert refiner.signature()["runtime_adapter"] == "frame_sequence_v1"
     assert refiner.signature()["metadata"]["feature_schema"] == FRAME_SEQUENCE_FEATURE_SCHEMA
     assert refiner.signature()["requested_device"] == "auto"
@@ -307,6 +312,7 @@ def test_frame_sequence_refiner_rejects_missing_feature_schema(tmp_path):
         input_dim=len(feature_names),
         hidden_size=8,
         num_layers=1,
+        output_dim=3,
         state_size=4,
         num_heads=4,
         n_groups=2,

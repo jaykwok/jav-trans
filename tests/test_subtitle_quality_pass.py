@@ -84,6 +84,58 @@ def test_prepare_srt_blocks_sorts_and_removes_overlap_with_frame_gap():
     assert prepared[0]["end"] + options.frame_gap_s <= prepared[1]["start"]
 
 
+def test_prepare_srt_blocks_anchors_start_to_first_timed_word():
+    blocks = [
+        {
+            "start": 10.35,
+            "end": 11.2,
+            "ja_text": "小那海あやです",
+            "zh_text": "我是小那海绫",
+            "words": [
+                _word("小那海", 10.0, 10.35),
+                _word("あや", 10.35, 10.55),
+                _word("です", 10.55, 11.2),
+            ],
+        }
+    ]
+
+    prepared = subtitle.prepare_srt_blocks(
+        blocks,
+        options=SubtitleOptions(video_fps=25.0, merge_adjacent=False),
+        mode="bilingual",
+    )
+
+    assert prepared[0]["start"] == pytest.approx(10.0)
+
+
+def test_prepare_srt_blocks_merged_cue_preserves_earliest_word_start_anchor():
+    blocks = [
+        {
+            "start": 10.35,
+            "end": 10.7,
+            "ja_text": "小那海",
+            "zh_text": "小那海",
+            "words": [_word("小那海", 10.0, 10.35)],
+        },
+        {
+            "start": 10.76,
+            "end": 11.2,
+            "ja_text": "あやです",
+            "zh_text": "绫",
+            "words": [_word("あやです", 10.76, 11.2)],
+        },
+    ]
+
+    prepared = subtitle.prepare_srt_blocks(
+        blocks,
+        options=SubtitleOptions(video_fps=25.0, merge_adjacent=True),
+        mode="bilingual",
+    )
+
+    assert len(prepared) == 1
+    assert prepared[0]["start"] == pytest.approx(10.0)
+
+
 def test_prepare_srt_blocks_final_normalize_guards_reading_window_overlap(monkeypatch):
     blocks = [
         {"start": 0.0, "end": 1.0, "ja_text": "あ", "zh_text": "甲"},
@@ -316,6 +368,30 @@ def test_prepare_srt_blocks_merges_overlap_when_too_tight():
     assert len(prepared) == 1
     assert prepared[0]["ja_text"] == "あ い"
     assert prepared[0]["zh_text"] == "甲，乙"
+
+
+def test_normalize_subtitle_timeline_locks_next_start_when_too_tight():
+    blocks = [
+        {
+            "start": 1.0,
+            "end": 1.03,
+            "ja_text": "前" * 80,
+            "zh_text": "前" * 80,
+        },
+        {
+            "start": 1.02,
+            "end": 1.5,
+            "ja_text": "次" * 80,
+            "zh_text": "下" * 80,
+        },
+    ]
+    options = SubtitleOptions(video_fps=25.0, merge_adjacent=False)
+
+    prepared = subtitle.prepare_srt_blocks(blocks, options=options, mode="bilingual")
+
+    assert len(prepared) == 2
+    assert prepared[1]["start"] == pytest.approx(1.02)
+    assert prepared[0]["end"] <= prepared[1]["start"]
 
 
 def test_write_bilingual_srt_returns_normalized_blocks(tmp_path):

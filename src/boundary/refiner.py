@@ -17,8 +17,10 @@ from boundary.sequence_features import (
     validate_sequence_features,
 )
 
-LEARNED_REFINER_SCHEMA = "boundary_refiner_v1"
+LEARNED_REFINER_SCHEMA = "boundary_refiner_v2"
 DEFAULT_REFINER_CHECKPOINT_PATH = Path("src/boundary/checkpoints/boundary_refiner.pt")
+CONTEXT_OUTPUT_DIM = 3
+DEFAULT_CONTEXT_MAX_PADDING_S = 1.5
 
 DEFAULT_REFINER_FEATURES = (
     "gap_s",
@@ -61,6 +63,9 @@ class BoundaryDecision:
     reason: str
     source: str = ""
     refine_delta_s: float | None = None
+    left_context_s: float | None = None
+    right_context_s: float | None = None
+    context_source: str = ""
 
 
 class BoundaryRefiner(Protocol):
@@ -157,6 +162,9 @@ class LearnedBoundaryRefiner:
         self.actual_device = _move_model_to_device(self.model, self.requested_device)
         self.metadata = dict(metadata or {})
         self._sha1 = file_sha1(checkpoint_path)
+        self.context_max_padding_s = float(
+            self.metadata.get("context_max_padding_s", DEFAULT_CONTEXT_MAX_PADDING_S)
+        )
 
     def signature(self) -> dict:
         return {
@@ -184,13 +192,20 @@ class LearnedBoundaryRefiner:
         vector = ((vector - mean) / std).view(1, 1, -1)
         device = next(self.model.parameters()).device
         with torch.inference_mode():
-            logit = self.model(vector.to(device)).reshape(-1)[0]
-            score = float(torch.sigmoid(logit).detach().cpu())
+            logits = self.model(vector.to(device)).reshape(-1).detach().cpu()
+            score = float(torch.sigmoid(logits[0]))
+            left_context_s, right_context_s = _context_from_logits(
+                logits,
+                max_padding_s=self.context_max_padding_s,
+            )
         return BoundaryDecision(
             score >= self.threshold,
             score,
             "learned_merge" if score >= self.threshold else "learned_split",
             source="learned_refiner",
+            left_context_s=left_context_s,
+            right_context_s=right_context_s,
+            context_source="learned_refiner",
         )
 
 
@@ -240,17 +255,35 @@ class FrameSequenceBoundaryRefiner:
         tensor = ((tensor - mean) / std).unsqueeze(0)
         device = next(self.learned.model.parameters()).device
         with torch.inference_mode():
-            logits = self.learned.model(tensor.to(device)).reshape(-1)
-            scores = torch.sigmoid(logits).detach().cpu().tolist()
-        return [
-            BoundaryDecision(
-                float(score) >= self.learned.threshold,
-                float(score),
-                "learned_sequence_merge" if float(score) >= self.learned.threshold else "learned_sequence_split",
-                source="frame_sequence_refiner",
+            logits = self.learned.model(tensor.to(device)).detach().cpu()
+        if logits.ndim == 3:
+            merge_scores = torch.sigmoid(logits[0, :, 0]).tolist()
+            context_logits = logits[0]
+        elif logits.ndim == 2:
+            merge_scores = torch.sigmoid(logits.reshape(-1)).tolist()
+            context_logits = logits
+        else:
+            raise ValueError("frame sequence refiner logits must have shape [batch,time,heads]")
+        decisions: list[BoundaryDecision] = []
+        for index, score in enumerate(merge_scores):
+            left_context_s, right_context_s = _context_from_logits(
+                context_logits[index],
+                max_padding_s=self.learned.context_max_padding_s,
             )
-            for score in scores
-        ]
+            decisions.append(
+                BoundaryDecision(
+                    float(score) >= self.learned.threshold,
+                    float(score),
+                    "learned_sequence_merge"
+                    if float(score) >= self.learned.threshold
+                    else "learned_sequence_split",
+                    source="frame_sequence_refiner",
+                    left_context_s=left_context_s,
+                    right_context_s=right_context_s,
+                    context_source="frame_sequence_refiner",
+                )
+            )
+        return decisions
 
 
 def load_learned_refiner_checkpoint(
@@ -284,8 +317,11 @@ def load_learned_refiner_checkpoint(
     )
     model_config["backbone"] = backbone
     model_config.setdefault("input_dim", len(feature_names))
+    model_config.setdefault("output_dim", CONTEXT_OUTPUT_DIM)
     if int(model_config["input_dim"]) != len(feature_names):
         raise ValueError("checkpoint input_dim does not match feature_names length")
+    if int(model_config.get("output_dim", 0)) != CONTEXT_OUTPUT_DIM:
+        raise ValueError("boundary refiner v2 checkpoints must use output_dim=3")
     model = BoundarySequenceClassifier(**model_config)
     state_dict = payload.get("state_dict")
     if not isinstance(state_dict, dict):
@@ -349,6 +385,9 @@ def build_learned_refiner_checkpoint(
     config.update(model_config or {})
     config["input_dim"] = len(feature_names)
     config["backbone"] = model.backbone_name
+    config["output_dim"] = getattr(model, "output_dim", CONTEXT_OUTPUT_DIM)
+    if int(config["output_dim"]) != CONTEXT_OUTPUT_DIM:
+        raise ValueError("boundary refiner v2 checkpoints require output_dim=3")
     return {
         "schema": LEARNED_REFINER_SCHEMA,
         "backbone": model.backbone_name,
@@ -466,3 +505,16 @@ def _float_tuple(values: object, expected_len: int, default: float) -> tuple[flo
     if len(result) != expected_len:
         raise ValueError("checkpoint normalization length does not match feature_names")
     return result
+
+
+def _context_from_logits(
+    logits: torch.Tensor,
+    *,
+    max_padding_s: float,
+) -> tuple[float | None, float | None]:
+    if logits.numel() < CONTEXT_OUTPUT_DIM:
+        return None, None
+    scale = max(0.0, float(max_padding_s))
+    left = float(torch.sigmoid(logits[1]) * scale)
+    right = float(torch.sigmoid(logits[2]) * scale)
+    return left, right

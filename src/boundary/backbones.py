@@ -107,9 +107,12 @@ class BoundarySequenceClassifier(nn.Module):
         backbone: str = TRANSFORMERS_MAMBA2_BACKBONE,
         hidden_size: int = 128,
         num_layers: int = 2,
+        output_dim: int = 1,
         **backbone_kwargs,
     ) -> None:
         super().__init__()
+        if output_dim <= 0:
+            raise ValueError("output_dim must be positive")
         self.backbone_name = normalize_boundary_backbone(backbone)
         if "num_heads" not in backbone_kwargs:
             backbone_kwargs["num_heads"] = 4
@@ -123,6 +126,7 @@ class BoundarySequenceClassifier(nn.Module):
             "backbone": self.backbone_name,
             "hidden_size": hidden_size,
             "num_layers": num_layers,
+            "output_dim": output_dim,
             **backbone_kwargs,
         }
         self.backbone = TinyMamba2BoundaryBackbone(
@@ -131,7 +135,8 @@ class BoundarySequenceClassifier(nn.Module):
             num_layers=num_layers,
             **backbone_kwargs,
         )
-        self.head = nn.Linear(self.backbone.output_dim, 1)
+        self.output_dim = int(output_dim)
+        self.head = nn.Linear(self.backbone.output_dim, self.output_dim)
 
     def forward(
         self,
@@ -140,7 +145,10 @@ class BoundarySequenceClassifier(nn.Module):
         attention_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
         hidden = self.backbone(features, attention_mask=attention_mask)
-        return self.head(hidden).squeeze(-1)
+        logits = self.head(hidden)
+        if self.output_dim == 1:
+            return logits.squeeze(-1)
+        return logits
 
 
 def normalize_boundary_backbone(backbone: str) -> str:

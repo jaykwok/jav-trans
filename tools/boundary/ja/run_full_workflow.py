@@ -178,7 +178,11 @@ def configure_env(args: argparse.Namespace) -> None:
     os.environ.setdefault("BOUNDARY_PLANNER_TARGET_CHUNK_S", str(args.boundary_planner_target_chunk_s))
     os.environ.setdefault("BOUNDARY_PLANNER_MIN_CHUNK_S", str(args.boundary_planner_min_chunk_s))
     os.environ.setdefault("BOUNDARY_PLANNER_START_WEIGHT", str(args.boundary_planner_start_weight))
-    os.environ.setdefault("BOUNDARY_PLANNER_TARGET_PADDING_S", str(args.boundary_planner_target_padding_s))
+    os.environ.setdefault("BOUNDARY_CONTEXT_MAX_PADDING_S", str(args.boundary_context_max_padding_s))
+    os.environ.setdefault(
+        "BOUNDARY_CONTEXT_MAX_SPEECH_OVERLAP_S",
+        str(args.boundary_context_max_speech_overlap_s),
+    )
     os.environ.setdefault(
         "BOUNDARY_PLANNER_MAX_SPLITS_PER_SEGMENT",
         str(args.boundary_planner_max_splits_per_segment),
@@ -241,12 +245,13 @@ def build_context(*, args: argparse.Namespace, paths: RunPaths, video: Path):
         ),
         "BOUNDARY_PLANNER_MAX_PADDED_CHUNK_S": os.getenv(
             "BOUNDARY_PLANNER_MAX_PADDED_CHUNK_S",
-            "9.0",
+            "6.5",
         ),
         "BOUNDARY_PLANNER_TARGET_CHUNK_S": os.getenv("BOUNDARY_PLANNER_TARGET_CHUNK_S", "3.0"),
         "BOUNDARY_PLANNER_MIN_CHUNK_S": os.getenv("BOUNDARY_PLANNER_MIN_CHUNK_S", "0.4"),
         "BOUNDARY_PLANNER_START_WEIGHT": os.getenv("BOUNDARY_PLANNER_START_WEIGHT", "1.5"),
-        "BOUNDARY_PLANNER_TARGET_PADDING_S": os.getenv("BOUNDARY_PLANNER_TARGET_PADDING_S", "2.0"),
+        "BOUNDARY_CONTEXT_MAX_PADDING_S": os.getenv("BOUNDARY_CONTEXT_MAX_PADDING_S", "1.5"),
+        "BOUNDARY_CONTEXT_MAX_SPEECH_OVERLAP_S": os.getenv("BOUNDARY_CONTEXT_MAX_SPEECH_OVERLAP_S", "0.25"),
         "BOUNDARY_PLANNER_MAX_SPLITS_PER_SEGMENT": os.getenv("BOUNDARY_PLANNER_MAX_SPLITS_PER_SEGMENT", "16"),
         "BOUNDARY_PLANNER_SEQUENCE_BATCH_SIZE": os.getenv("BOUNDARY_PLANNER_SEQUENCE_BATCH_SIZE", "256"),
         "BOUNDARY_DP_CHUNK_BASE_COST": os.getenv("BOUNDARY_DP_CHUNK_BASE_COST", "0.04"),
@@ -394,7 +399,8 @@ def write_summary(paths: RunPaths, args: argparse.Namespace, results: list[dict[
             "target_chunk_s": args.boundary_planner_target_chunk_s,
             "min_chunk_s": args.boundary_planner_min_chunk_s,
             "start_weight": args.boundary_planner_start_weight,
-            "target_padding_s": args.boundary_planner_target_padding_s,
+            "max_context_padding_s": args.boundary_context_max_padding_s,
+            "max_speech_overlap_s": args.boundary_context_max_speech_overlap_s,
             "max_splits_per_segment": args.boundary_planner_max_splits_per_segment,
             "sequence_batch_size": args.boundary_planner_sequence_batch_size,
             "dp_chunk_base_cost": os.getenv("BOUNDARY_DP_CHUNK_BASE_COST", "0.04"),
@@ -492,11 +498,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--boundary-refiner-threshold", type=float, default=_env_float("BOUNDARY_REFINER_THRESHOLD", 0.5))
     parser.add_argument("--boundary-refiner-device", default=os.getenv("BOUNDARY_REFINER_DEVICE", "auto"))
     parser.add_argument("--boundary-planner-max-core-chunk-s", type=float, default=_env_float("BOUNDARY_PLANNER_MAX_CORE_CHUNK_S", 5.0))
-    parser.add_argument("--boundary-planner-max-padded-chunk-s", type=float, default=_env_float("BOUNDARY_PLANNER_MAX_PADDED_CHUNK_S", 9.0))
+    parser.add_argument("--boundary-planner-max-padded-chunk-s", type=float, default=_env_float("BOUNDARY_PLANNER_MAX_PADDED_CHUNK_S", 6.5))
     parser.add_argument("--boundary-planner-target-chunk-s", type=float, default=_env_float("BOUNDARY_PLANNER_TARGET_CHUNK_S", 3.0))
     parser.add_argument("--boundary-planner-min-chunk-s", type=float, default=_env_float("BOUNDARY_PLANNER_MIN_CHUNK_S", 0.4))
     parser.add_argument("--boundary-planner-start-weight", type=float, default=_env_float("BOUNDARY_PLANNER_START_WEIGHT", 1.5))
-    parser.add_argument("--boundary-planner-target-padding-s", type=float, default=_env_float("BOUNDARY_PLANNER_TARGET_PADDING_S", 2.0))
+    parser.add_argument("--boundary-context-max-padding-s", type=float, default=_env_float("BOUNDARY_CONTEXT_MAX_PADDING_S", 1.5))
+    parser.add_argument("--boundary-context-max-speech-overlap-s", type=float, default=_env_float("BOUNDARY_CONTEXT_MAX_SPEECH_OVERLAP_S", 0.25))
     parser.add_argument("--boundary-planner-max-splits-per-segment", type=int, default=_env_int("BOUNDARY_PLANNER_MAX_SPLITS_PER_SEGMENT", 16))
     parser.add_argument("--boundary-planner-sequence-batch-size", type=int, default=_env_int("BOUNDARY_PLANNER_SEQUENCE_BATCH_SIZE", 256))
     parser.add_argument("--keep-asr-chunks", action=argparse.BooleanOptionalAction, default=True)

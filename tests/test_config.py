@@ -117,7 +117,9 @@ def test_default_model_download_root_is_project_models():
     assert config.DEFAULT_SETTINGS["BOUNDARY_REFINER_ENABLED"] == "1"
     assert config.DEFAULT_SETTINGS["BOUNDARY_PLANNER_TARGET_CHUNK_S"] == "3.0"
     assert config.DEFAULT_SETTINGS["BOUNDARY_PLANNER_MAX_CORE_CHUNK_S"] == "5.0"
-    assert config.DEFAULT_SETTINGS["BOUNDARY_PLANNER_MAX_PADDED_CHUNK_S"] == "9.0"
+    assert config.DEFAULT_SETTINGS["BOUNDARY_PLANNER_MAX_PADDED_CHUNK_S"] == "6.5"
+    assert config.DEFAULT_SETTINGS["BOUNDARY_CONTEXT_MAX_PADDING_S"] == "1.5"
+    assert config.DEFAULT_SETTINGS["BOUNDARY_CONTEXT_MAX_SPEECH_OVERLAP_S"] == "0.25"
     assert config.DEFAULT_SETTINGS["ASR_SUBPROCESS_READY_TIMEOUT_S"] == "600"
     assert config.DEFAULT_SETTINGS["LLM_API_FORMAT"] == "chat"
 

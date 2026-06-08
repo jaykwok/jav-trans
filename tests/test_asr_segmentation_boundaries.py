@@ -93,3 +93,16 @@ def test_postprocess_does_not_drop_context_like_text_without_word_timing(monkeyp
     postprocessed = asr._postprocess_segments(segments)
 
     assert [segment["text"] for segment in postprocessed] == ["...小那海あやです。"]
+
+
+def test_postprocess_locks_next_start_when_repairing_overlap():
+    segments = [
+        {"start": 0.0, "end": 1.2, "text": "前の字幕", "source_chunk_index": 1},
+        {"start": 1.0, "end": 1.5, "text": "次の字幕", "source_chunk_index": 2},
+    ]
+
+    postprocessed = asr._postprocess_segments(segments)
+
+    assert [segment["text"] for segment in postprocessed] == ["前の字幕", "次の字幕"]
+    assert postprocessed[0]["end"] <= postprocessed[1]["start"]
+    assert postprocessed[1]["start"] == 1.0

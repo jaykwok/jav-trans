@@ -15,7 +15,7 @@ from boundary.base import SpeechSegment
 
 log = logging.getLogger(__name__)
 
-BOUNDARY_CACHE_VERSION = 1
+BOUNDARY_CACHE_VERSION = 2
 _AUDIO_SAMPLE_BYTES = 2 * 1024 * 1024
 _AUDIO_KEY_RE = re.compile(r"^[0-9a-fA-F]{8,40}$")
 
@@ -56,7 +56,8 @@ _BOUNDARY_ENV_KEYS = (
     "BOUNDARY_PLANNER_TARGET_CHUNK_S",
     "BOUNDARY_PLANNER_MIN_CHUNK_S",
     "BOUNDARY_PLANNER_START_WEIGHT",
-    "BOUNDARY_PLANNER_TARGET_PADDING_S",
+    "BOUNDARY_CONTEXT_MAX_PADDING_S",
+    "BOUNDARY_CONTEXT_MAX_SPEECH_OVERLAP_S",
     "BOUNDARY_PLANNER_MAX_SPLITS_PER_SEGMENT",
     "BOUNDARY_PLANNER_SEQUENCE_BATCH_SIZE",
     "BOUNDARY_DP_CHUNK_BASE_COST",
@@ -323,6 +324,13 @@ def _packed_chunk_to_dict(chunk: PackedChunk) -> dict:
             None if chunk.boundary_refine_delta_s is None else float(chunk.boundary_refine_delta_s)
         ),
         "boundary_decision_source": chunk.boundary_decision_source,
+        "boundary_left_context_s": (
+            None if chunk.boundary_left_context_s is None else float(chunk.boundary_left_context_s)
+        ),
+        "boundary_right_context_s": (
+            None if chunk.boundary_right_context_s is None else float(chunk.boundary_right_context_s)
+        ),
+        "boundary_context_source": chunk.boundary_context_source,
         "speech_segments": _segments_to_payload(chunk.speech_segments),
     }
 
@@ -380,6 +388,17 @@ def _packed_chunk_from_dict(item: Any) -> PackedChunk:
             else float(item.get("boundary_refine_delta_s"))
         ),
         boundary_decision_source=str(item.get("boundary_decision_source") or ""),
+        boundary_left_context_s=(
+            None
+            if item.get("boundary_left_context_s") is None
+            else float(item.get("boundary_left_context_s"))
+        ),
+        boundary_right_context_s=(
+            None
+            if item.get("boundary_right_context_s") is None
+            else float(item.get("boundary_right_context_s"))
+        ),
+        boundary_context_source=str(item.get("boundary_context_source") or ""),
     )
 
 

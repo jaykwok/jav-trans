@@ -27,9 +27,9 @@ from boundary.sequence_features import (
     get_feature_dim,
     validate_sequence_features,
 )
-from boundary.ja import LabelRecord, TeacherSegment, load_cached_feature, load_label_records
+from boundary.ja import LabelRecord, TeacherSegment, load_cached_feature
 
-DATASET_SCHEMA = "boundary_refiner_frame_sequence_dataset_v1"
+DATASET_SCHEMA = "boundary_refiner_frame_sequence_dataset_v2"
 
 
 @dataclass(frozen=True)
@@ -45,6 +45,8 @@ class FrameSequenceConfig:
     synthetic_merge_gap_min_s: float = 0.04
     synthetic_merge_gap_s: float = 0.04
     synthetic_merge_min_segment_s: float = 1.20
+    context_max_padding_s: float = 1.5
+    context_max_speech_overlap_s: float = 0.25
 
     def feature_config(self) -> FrameSequenceFeatureConfig:
         return FrameSequenceFeatureConfig(
@@ -66,6 +68,58 @@ class Segment:
         return max(0.0, self.end - self.start)
 
 
+def _load_light_label_records(path: Path) -> dict[int, LabelRecord]:
+    records: dict[int, LabelRecord] = {}
+    with path.open("r", encoding="utf-8") as handle:
+        for label_index, line in enumerate(handle):
+            if not line.strip():
+                continue
+            payload = json.loads(line)
+            if not isinstance(payload, Mapping):
+                continue
+            records[label_index] = LabelRecord(
+                audio_id=str(payload.get("audio_id") or ""),
+                source=str(payload.get("source") or ""),
+                duration_s=float(payload.get("duration_s") or 0.0),
+                text=str(payload.get("text") or ""),
+                teacher_segments=_light_teacher_segments(payload.get("teacher_segments")),
+                frame_hop_s=float(payload.get("frame_hop_s") or 0.02),
+                speech_frames=[],
+                label_quality=str(payload.get("label_quality") or ""),
+                frame_weights=None,
+                boundary_metadata=(
+                    None
+                    if payload.get("boundary_metadata") is None
+                    else dict(payload.get("boundary_metadata") or {})
+                ),
+            )
+    return records
+
+
+def _light_teacher_segments(raw: Any) -> dict[str, list[TeacherSegment]]:
+    if not isinstance(raw, Mapping):
+        return {}
+    result: dict[str, list[TeacherSegment]] = {}
+    for name, values in raw.items():
+        segments = []
+        for item in list(values or []):
+            if not isinstance(item, Mapping):
+                continue
+            start = float(item.get("start") or 0.0)
+            end = float(item.get("end") or 0.0)
+            if end <= start:
+                continue
+            segments.append(
+                TeacherSegment(
+                    start=start,
+                    end=end,
+                    score=None if item.get("score") is None else float(item.get("score")),
+                )
+            )
+        result[str(name)] = segments
+    return result
+
+
 def build_frame_sequence_dataset(
     *,
     labels_paths: Sequence[Path],
@@ -81,56 +135,53 @@ def build_frame_sequence_dataset(
         summary_json = output_jsonl.with_suffix(output_jsonl.suffix + ".summary.json")
     output_jsonl.parent.mkdir(parents=True, exist_ok=True)
 
-    rows: list[dict[str, Any]] = []
     counters: Counter[str] = Counter()
     reason_counts: Counter[str] = Counter()
     feature_names: list[str] | None = None
     feature_schema_hash = ""
 
-    for labels_path, feature_manifest_path in zip(labels_paths, feature_manifest_paths, strict=True):
-        records = load_label_records(labels_path)
-        manifest_rows = _load_feature_manifest(feature_manifest_path)
-        for manifest_row in manifest_rows:
+    with output_jsonl.open("w", encoding="utf-8") as output_handle:
+        for labels_path, feature_manifest_path in zip(labels_paths, feature_manifest_paths, strict=True):
+            records = _load_light_label_records(labels_path)
+            for manifest_row in _iter_feature_manifest(feature_manifest_path):
+                if limit is not None and counters["manifest_rows_selected"] >= limit:
+                    break
+                label_index = int(manifest_row.get("label_index") or 0)
+                record = records.get(label_index)
+                if record is None:
+                    counters["skipped_bad_label_index"] += 1
+                    continue
+                ptm, mfcc = load_cached_feature(_resolve_feature_path(manifest_row, feature_manifest_path))
+                row = _sequence_row(
+                    record,
+                    manifest_row=manifest_row,
+                    labels_path=labels_path,
+                    feature_manifest_path=feature_manifest_path,
+                    ptm=ptm,
+                    mfcc=mfcc,
+                    config=config,
+                )
+                if row is None:
+                    counters["skipped_no_sequence_items"] += 1
+                    continue
+                if feature_names is None:
+                    feature_names = list(row["feature_names"])
+                    feature_schema_hash = str(row["feature_schema_hash"])
+                elif feature_names != list(row["feature_names"]):
+                    raise ValueError("feature_names changed across frame sequence rows")
+                elif feature_schema_hash != str(row["feature_schema_hash"]):
+                    raise ValueError("feature_schema_hash changed across frame sequence rows")
+                output_handle.write(json.dumps(row, ensure_ascii=False, sort_keys=True) + "\n")
+                counters["manifest_rows_selected"] += 1
+                counters["sequences"] += 1
+                labels = [int(value) for value in row["sequence_labels"]]
+                counters["sequence_items"] += len(labels)
+                counters["merge_positive"] += sum(labels)
+                counters["split_negative"] += len(labels) - sum(labels)
+                for reason in row["sequence_reasons"]:
+                    reason_counts[str(reason)] += 1
             if limit is not None and counters["manifest_rows_selected"] >= limit:
                 break
-            label_index = int(manifest_row.get("label_index") or 0)
-            if label_index < 0 or label_index >= len(records):
-                counters["skipped_bad_label_index"] += 1
-                continue
-            record = records[label_index]
-            ptm, mfcc = load_cached_feature(_resolve_feature_path(manifest_row, feature_manifest_path))
-            row = _sequence_row(
-                record,
-                manifest_row=manifest_row,
-                labels_path=labels_path,
-                feature_manifest_path=feature_manifest_path,
-                ptm=ptm,
-                mfcc=mfcc,
-                config=config,
-            )
-            if row is None:
-                counters["skipped_no_sequence_items"] += 1
-                continue
-            if feature_names is None:
-                feature_names = list(row["feature_names"])
-                feature_schema_hash = str(row["feature_schema_hash"])
-            elif feature_names != list(row["feature_names"]):
-                raise ValueError("feature_names changed across frame sequence rows")
-            elif feature_schema_hash != str(row["feature_schema_hash"]):
-                raise ValueError("feature_schema_hash changed across frame sequence rows")
-            rows.append(row)
-            counters["manifest_rows_selected"] += 1
-            counters["sequences"] += 1
-            labels = [int(value) for value in row["sequence_labels"]]
-            counters["sequence_items"] += len(labels)
-            counters["merge_positive"] += sum(labels)
-            counters["split_negative"] += len(labels) - sum(labels)
-            for reason in row["sequence_reasons"]:
-                reason_counts[str(reason)] += 1
-        if limit is not None and counters["manifest_rows_selected"] >= limit:
-            break
-
-    _write_jsonl(output_jsonl, rows)
     summary = {
         "schema": DATASET_SCHEMA,
         "output_jsonl": str(output_jsonl),
@@ -172,6 +223,7 @@ def _sequence_row(
         return None
     sequence_features: list[list[float]] = []
     sequence_labels: list[int] = []
+    sequence_context_targets: list[list[float]] = []
     sequence_reasons: list[str] = []
     gap_indexes: list[int] = []
 
@@ -191,6 +243,15 @@ def _sequence_row(
             )
         )
         sequence_labels.append(1 if merge_target else 0)
+        sequence_context_targets.append(
+            _context_targets(
+                left=left,
+                right=right,
+                merge_target=merge_target,
+                reason=reason,
+                config=config,
+            )
+        )
         sequence_reasons.append(reason)
         gap_indexes.append(index)
 
@@ -222,6 +283,7 @@ def _sequence_row(
             )
         )
         sequence_labels.append(1)
+        sequence_context_targets.append([0.0, 0.0])
         sequence_reasons.append("merge_synthetic_intra_island")
         gap_indexes.append(index)
         synthetic_count += 1
@@ -262,6 +324,7 @@ def _sequence_row(
         ),
         "sequence_features": sequence_features,
         "sequence_labels": sequence_labels,
+        "sequence_context_targets": sequence_context_targets,
         "sequence_reasons": sequence_reasons,
         "gap_indexes": gap_indexes,
         "metadata": {
@@ -335,6 +398,31 @@ def _label_gap(
     return None
 
 
+def _context_targets(
+    *,
+    left: Segment,
+    right: Segment,
+    merge_target: bool,
+    reason: str,
+    config: FrameSequenceConfig,
+) -> list[float]:
+    if merge_target:
+        return [0.0, 0.0]
+    gap_s = max(0.0, right.start - left.end)
+    max_padding = max(0.0, float(config.context_max_padding_s))
+    overlap_cap = max(0.0, min(float(config.context_max_speech_overlap_s), max_padding))
+    if reason in {"split_overlap", "split_cut_point"}:
+        budget = min(overlap_cap, gap_s * 0.45 if gap_s > 0.0 else overlap_cap)
+    elif reason == "split_gap_zone":
+        budget = min(max_padding, gap_s * 0.35)
+    elif reason == "split_long_gap":
+        budget = min(max_padding, gap_s * 0.45)
+    else:
+        budget = min(max_padding, gap_s * 0.40)
+    budget = max(0.0, budget)
+    return [budget, budget]
+
+
 def _synthetic_merge_gap_s(
     *,
     audio_id: str,
@@ -383,11 +471,25 @@ def _normalize_segments(
     return sorted(segments, key=lambda item: (item.start, item.end))
 
 
-def _load_feature_manifest(path: Path) -> list[dict[str, Any]]:
-    rows = json.loads(path.read_text(encoding="utf-8"))
-    if not isinstance(rows, list):
-        raise ValueError(f"feature manifest must be a JSON list: {path}")
-    return [dict(row) for row in rows]
+def _iter_feature_manifest(path: Path) -> Iterable[dict[str, Any]]:
+    with path.open("r", encoding="utf-8") as handle:
+        first = handle.read(1)
+        handle.seek(0)
+        if first == "[":
+            rows = json.load(handle)
+            if not isinstance(rows, list):
+                raise ValueError(f"feature manifest must be a JSON list or JSONL: {path}")
+            for row in rows:
+                if isinstance(row, Mapping):
+                    yield dict(row)
+            return
+        for line_number, line in enumerate(handle, start=1):
+            if not line.strip():
+                continue
+            row = json.loads(line)
+            if not isinstance(row, Mapping):
+                raise ValueError(f"feature manifest JSONL row must be an object: {path}:{line_number}")
+            yield dict(row)
 
 
 def _resolve_feature_path(row: Mapping[str, Any], manifest_path: Path) -> Path:
@@ -430,6 +532,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--synthetic-merge-gap-min-s", type=float, default=0.04)
     parser.add_argument("--synthetic-merge-gap-s", type=float, default=0.04)
     parser.add_argument("--synthetic-merge-min-segment-s", type=float, default=1.20)
+    parser.add_argument("--context-max-padding-s", type=float, default=1.5)
+    parser.add_argument("--context-max-speech-overlap-s", type=float, default=0.25)
     args = parser.parse_args(argv)
     if len(args.labels) != len(args.feature_manifest):
         parser.error("--labels and --feature-manifest must be provided the same number of times")
@@ -449,6 +553,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         parser.error("--synthetic-merge-gap-min-s must be non-negative")
     if args.synthetic_merge_gap_s < 0.0:
         parser.error("--synthetic-merge-gap-s must be non-negative")
+    if args.context_max_padding_s <= 0.0:
+        parser.error("--context-max-padding-s must be positive")
+    if args.context_max_speech_overlap_s < 0.0:
+        parser.error("--context-max-speech-overlap-s must be non-negative")
     return args
 
 
@@ -472,6 +580,8 @@ def main(argv: list[str] | None = None) -> None:
             synthetic_merge_gap_min_s=args.synthetic_merge_gap_min_s,
             synthetic_merge_gap_s=args.synthetic_merge_gap_s,
             synthetic_merge_min_segment_s=args.synthetic_merge_min_segment_s,
+            context_max_padding_s=args.context_max_padding_s,
+            context_max_speech_overlap_s=args.context_max_speech_overlap_s,
         ),
     )
     print(f"dataset={summary['output_jsonl']}")

@@ -24,8 +24,8 @@ def _row(chunk_index: int, **overrides):
         "asr_qc_reasons": [],
         "failure_bucket": "",
         "failure_reasons": [],
-        "low_information_level": "not_low_information",
-        "low_information": {"level": "not_low_information"},
+        "text_density_level": "normal_dialogue",
+        "text_density": {"level": "normal_dialogue"},
         "repetition_repair": {"changed": False},
         "display_text": f"テスト{chunk_index}",
         "text": f"テスト{chunk_index}",
@@ -50,7 +50,7 @@ def test_build_review_items_balances_attribution_buckets():
             fallback_type="proportional",
             fallback_subtype="nonlexical_text",
             align_text_empty=True,
-            low_information_level="empty",
+            text_density_level="empty_or_punctuation",
         ),
         _row(
             2,
@@ -58,7 +58,7 @@ def test_build_review_items_balances_attribution_buckets():
             fallback_type="proportional",
             fallback_subtype="proportional_after_sentinel",
         ),
-        _row(3, low_information_level="short_nonlexical"),
+        _row(3, text_density_level="short_vocalization_candidate"),
         _row(4, asr_qc_severity="warn", asr_qc_reasons=["empty_text_for_speech_chunk"]),
         _row(5),
     ]
