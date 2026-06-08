@@ -185,7 +185,8 @@ def _path_has_model_files(path: Path) -> bool:
 
 
 def model_spec_status(explicit_path: str | None, repo_id: str, *, download: bool = True) -> dict:
-    target_path = canonical_model_dir(repo_id).resolve()
+    canonical = canonical_model_dir(repo_id).resolve()
+    target_path = canonical
     checked_paths: list[str] = []
 
     def add_checked(path: Path) -> None:
@@ -204,7 +205,7 @@ def model_spec_status(explicit_path: str | None, repo_id: str, *, download: bool
                 "path": str(candidate),
                 "checked_paths": checked_paths,
             }
-        if download:
+        if download and candidate != canonical:
             return {
                 "repo_id": repo_id,
                 "present": False,
@@ -313,7 +314,8 @@ def resolve_model_spec(
         candidate = _project_path(explicit_path).resolve()
         if _path_has_model_files(candidate):
             return str(candidate)
-        if download:
+        canonical = canonical_model_dir(repo_id).resolve()
+        if download and candidate != canonical:
             return _download_snapshot(
                 repo_id,
                 candidate,
