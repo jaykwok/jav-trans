@@ -115,6 +115,8 @@ def _quality_report_markdown(video_stem: str, report: dict) -> str:
         "subtitle_duration_max_s",
         "per_min_subtitle_count",
         "glossary_hit_rate",
+        "alignment_fallback_count",
+        "alignment_fallback_total",
         "alignment_fallback_ratio",
         "subtitle_overlap_count",
         "subtitle_overlap_total_s",
@@ -210,7 +212,7 @@ def write_quality_report(
             video_duration_s,
             glossary_pairs,
             fallback_count,
-            len(aligned_segments),
+            int((asr_details or {}).get("chunk_count") or len(aligned_segments)),
             asr_qc=(asr_details or {}).get("asr_qc") or {},
         )
         explicit_report_dir = str(report_dir).strip() if report_dir is not None else ""

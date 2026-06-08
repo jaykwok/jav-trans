@@ -77,8 +77,8 @@ def repetition_changed(row: Mapping[str, Any]) -> bool:
     return isinstance(repair, Mapping) and bool(repair.get("changed"))
 
 
-def low_information_level(row: Mapping[str, Any]) -> str:
-    return str(row.get("low_information_level") or "")
+def text_density_level(row: Mapping[str, Any]) -> str:
+    return str(row.get("text_density_level") or "")
 
 
 def bucket_definitions() -> list[tuple[str, str, BucketPredicate, Callable[[Mapping[str, Any]], tuple[Any, ...]]]]:
@@ -103,7 +103,7 @@ def bucket_definitions() -> list[tuple[str, str, BucketPredicate, Callable[[Mapp
             "空文本 / 非词 fallback",
             lambda row: str(row.get("fallback_subtype") or "") == "nonlexical_text"
             or bool(row.get("align_text_empty"))
-            or low_information_level(row) == "empty",
+            or text_density_level(row) == "empty_or_punctuation",
             lambda row: (-row_float(row, "duration_s"), row_float(row, "start")),
         ),
         (
@@ -119,10 +119,15 @@ def bucket_definitions() -> list[tuple[str, str, BucketPredicate, Callable[[Mapp
         (
             "low_info_vocal",
             "低信息人声 / 语气词",
-            lambda row: low_information_level(row)
-            in {"short_kana", "short_nonlexical", "repeated_nonlexical", "long_sparse"},
+            lambda row: text_density_level(row)
+            in {
+                "short_kana_dialogue_candidate",
+                "short_vocalization_candidate",
+                "repeated_vocalization_candidate",
+                "long_sparse_text",
+            },
             lambda row: (
-                low_information_level(row) != "repeated_nonlexical",
+                text_density_level(row) != "repeated_vocalization_candidate",
                 -row_float(row, "duration_s"),
                 row_float(row, "start"),
             ),
@@ -140,7 +145,7 @@ def bucket_definitions() -> list[tuple[str, str, BucketPredicate, Callable[[Mapp
             lambda row: str(row.get("alignment_quality") or "") == "forced"
             and str(row.get("fallback_type") or "") == "none"
             and str(row.get("asr_qc_severity") or "") == "ok"
-            and low_information_level(row) == "not_low_information",
+            and text_density_level(row) == "normal_dialogue",
             lambda row: (row_float(row, "start"),),
         ),
     ]
@@ -178,9 +183,9 @@ def reason_hints(row: Mapping[str, Any]) -> list[str]:
         hints.append("aligner_sentinel")
     if str(row.get("fallback_subtype") or "") == "nonlexical_text":
         hints.append("nonlexical_text")
-    level = low_information_level(row)
-    if level and level != "not_low_information":
-        hints.append(f"low_information:{level}")
+    level = text_density_level(row)
+    if level and level != "normal_dialogue":
+        hints.append(f"text_density:{level}")
     for reason in row.get("asr_qc_reasons") or []:
         if reason not in hints:
             hints.append(str(reason))
@@ -227,7 +232,7 @@ def build_review_items(
         bucket_ordinals[bucket_id] += 1
         repair = row.get("repetition_repair") if isinstance(row.get("repetition_repair"), Mapping) else {}
         repair_changed = bool(repair.get("changed"))
-        low_info = row.get("low_information") if isinstance(row.get("low_information"), Mapping) else {}
+        text_density = row.get("text_density") if isinstance(row.get("text_density"), Mapping) else {}
         suggested_text = (
             row.get("repetition_suggested_text")
             or repair.get("suggested_text")
@@ -257,8 +262,8 @@ def build_review_items(
             "asr_qc_reasons": list(row.get("asr_qc_reasons") or []),
             "failure_bucket": str(row.get("failure_bucket") or ""),
             "failure_reasons": list(row.get("failure_reasons") or []),
-            "low_information_level": low_information_level(row),
-            "low_information": dict(low_info),
+            "text_density_level": text_density_level(row),
+            "text_density": dict(text_density),
             "nonlexical_text": bool(row.get("nonlexical_text")),
             "align_text_empty": bool(row.get("align_text_empty")),
             "chars_per_sec": row_float(row, "chars_per_sec"),
@@ -701,7 +706,7 @@ function setMetrics(item) {{
     ["alignment", `${{item.alignment_quality}} / ${{item.alignment_mode}}`],
     ["fallback", `${{item.fallback_type}} / ${{item.fallback_subtype}}`],
     ["ASR QC", `${{item.asr_qc_severity}} · ${{(item.asr_qc_reasons || []).join(", ")}}`],
-    ["low_info", `${{item.low_information_level}}`],
+    ["text_density", `${{item.text_density_level}}`],
     ["chars/sec", Number(item.chars_per_sec || 0).toFixed(2)],
     ["compact chars", item.compact_chars],
     ["failure", `${{item.failure_bucket}} · ${{(item.failure_reasons || []).join(", ")}}`],
@@ -830,7 +835,7 @@ function exportRows() {{
     fallback_subtype: item.fallback_subtype,
     asr_qc_severity: item.asr_qc_severity,
     asr_qc_reasons: item.asr_qc_reasons,
-    low_information_level: item.low_information_level,
+    text_density_level: item.text_density_level,
     display_text: item.display_text,
     repetition_suggested_text: item.repetition_suggested_text,
     subtitle_text: item.subtitle_text,
@@ -997,7 +1002,7 @@ def main(argv: list[str] | None = None) -> int:
         "alignment_quality_counts": count_by_key(diagnostics_rows, "alignment_quality"),
         "fallback_subtype_counts": count_by_key(diagnostics_rows, "fallback_subtype"),
         "asr_qc_severity_counts": count_by_key(diagnostics_rows, "asr_qc_severity"),
-        "low_information_counts": count_by_key(diagnostics_rows, "low_information_level"),
+        "text_density_counts": count_by_key(diagnostics_rows, "text_density_level"),
     }
     write_json(output_dir / "summary.json", summary)
     html_text = page_template(

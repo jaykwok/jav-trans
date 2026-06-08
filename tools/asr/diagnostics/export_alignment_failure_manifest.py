@@ -22,8 +22,6 @@ REVIEW_TYPE_BY_BUCKET = {
     "vad_coarse_alignment": "review_coarse_timing",
     "proportional_alignment": "review_coarse_timing",
     "unknown_alignment_fallback": "review_unknown_fallback",
-    "long_low_information_text": "review_low_information_text",
-    "low_information_text": "review_low_information_text",
     "abnormal_char_density": "review_possible_hallucination",
     "asr_qc_reject": "review_asr_qc_reject",
     "asr_qc_warn": "review_asr_qc_warn",
@@ -89,7 +87,7 @@ def write_csv(path: Path, rows: list[dict[str, Any]]) -> None:
         "display_text",
         "align_text",
         "repetition_suggested_text",
-        "low_information_level",
+        "text_density_level",
         "raw_text",
     ]
     with path.open("w", encoding="utf-8", newline="") as handle:
@@ -147,8 +145,8 @@ def manifest_row(row: Mapping[str, Any]) -> dict[str, Any]:
         "display_text": normalized_text(row.get("display_text")),
         "align_text": normalized_text(row.get("align_text")),
         "repetition_suggested_text": normalized_text(row.get("repetition_suggested_text")),
-        "low_information_level": str(row.get("low_information_level") or ""),
-        "low_information": dict(row.get("low_information") or {}),
+        "text_density_level": str(row.get("text_density_level") or ""),
+        "text_density": dict(row.get("text_density") or {}),
         "repetition_repair": dict(row.get("repetition_repair") or {}),
         "analysis_text": normalized_text(row.get("analysis_text")),
         "text": normalized_text(row.get("text")),

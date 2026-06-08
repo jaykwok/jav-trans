@@ -22,7 +22,6 @@ def test_boundary_planner_uses_candidate_split_before_packing():
             max_core_chunk_s=30.0,
             target_chunk_s=5.0,
             min_chunk_s=3.0,
-            target_padding_s=1.0,
         ),
     )
 
@@ -46,7 +45,6 @@ def test_boundary_planner_uses_soft_candidate_for_over_target_island():
             max_core_chunk_s=30.0,
             target_chunk_s=8.0,
             min_chunk_s=2.0,
-            target_padding_s=1.0,
         ),
     )
 
@@ -129,7 +127,6 @@ def test_sequence_planner_dp_can_split_high_merge_gap_for_duration_target():
             max_core_chunk_s=30.0,
             target_chunk_s=6.0,
             min_chunk_s=0.4,
-            target_padding_s=1.0,
             start_weight=1.5,
         ),
         sequence_refiner=refiner,
@@ -163,7 +160,6 @@ def test_sequence_planner_dp_preserves_learned_split_reason():
             frame_hop_s=1.0,
             max_core_chunk_s=30.0,
             target_chunk_s=9.0,
-            target_padding_s=1.0,
         ),
         sequence_refiner=refiner,
         sequence_feature_provider=_IndexFeatureProvider(),
@@ -194,7 +190,6 @@ def test_sequence_planner_batches_long_sequences():
             frame_hop_s=1.0,
             max_core_chunk_s=30.0,
             target_chunk_s=9.0,
-            target_padding_s=1.0,
             sequence_batch_size=2,
         ),
         sequence_refiner=refiner,

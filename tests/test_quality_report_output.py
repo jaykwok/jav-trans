@@ -97,6 +97,38 @@ def test_quality_report_relative_dir_override_resolves_from_project_root(monkeyp
     assert (tmp_path / "reports" / "relative.quality_report.json").exists()
 
 
+def test_quality_report_uses_asr_chunk_count_for_alignment_fallback_denominator(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setenv("QUALITY_REPORT_ENABLED", "1")
+    monkeypatch.setenv("QUALITY_REPORT_DIR", str(tmp_path / "reports"))
+
+    path = write_quality_report(
+        video_stem="chunk-denominator",
+        job_temp_dir=str(tmp_path),
+        aligned_segments=[
+            {
+                "start": 0.0,
+                "end": 1.0,
+                "text": "こんにちは",
+                "ja": "こんにちは",
+                "zh": "你好",
+            }
+        ],
+        asr_details={"fallback_count": 25, "chunk_count": 100},
+        project_root=tmp_path,
+        console=_Console(),
+        write_json_atomic=_write_json_atomic,
+        env_flag=_env_flag,
+        video_duration_s=60.0,
+    )
+
+    payload = json.loads(Path(path).with_suffix(".json").read_text(encoding="utf-8"))
+    assert payload["alignment_fallback_count"] == 25
+    assert payload["alignment_fallback_total"] == 100
+    assert payload["alignment_fallback_ratio"] == 0.25
+
+
 def test_load_global_glossary_pairs_reads_hashed_translation_glossary(tmp_path):
     glossary_path = tmp_path / "translation_global_glossary.abc123.json"
     glossary_path.write_text(

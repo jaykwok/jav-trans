@@ -92,7 +92,11 @@ def _boundary_config() -> dict:
         "boundary_planner_target_chunk_s": _env_float("BOUNDARY_PLANNER_TARGET_CHUNK_S", "3.0"),
         "boundary_planner_min_chunk_s": _env_float("BOUNDARY_PLANNER_MIN_CHUNK_S", "0.4"),
         "boundary_planner_start_weight": _env_float("BOUNDARY_PLANNER_START_WEIGHT", "1.5"),
-        "boundary_planner_target_padding_s": _env_float("BOUNDARY_PLANNER_TARGET_PADDING_S", "2.0"),
+        "boundary_context_max_padding_s": _env_float("BOUNDARY_CONTEXT_MAX_PADDING_S", "1.5"),
+        "boundary_context_max_speech_overlap_s": _env_float(
+            "BOUNDARY_CONTEXT_MAX_SPEECH_OVERLAP_S",
+            "0.25",
+        ),
         "boundary_planner_max_splits_per_segment": _env_int(
             "BOUNDARY_PLANNER_MAX_SPLITS_PER_SEGMENT", "16"
         ),
@@ -478,7 +482,8 @@ def _build_processing_spans(
                 "target_chunk_s": cfg["boundary_planner_target_chunk_s"],
                 "min_chunk_s": cfg["boundary_planner_min_chunk_s"],
                 "start_weight": cfg["boundary_planner_start_weight"],
-                "target_padding_s": cfg["boundary_planner_target_padding_s"],
+                "max_context_padding_s": cfg["boundary_context_max_padding_s"],
+                "max_speech_overlap_s": cfg["boundary_context_max_speech_overlap_s"],
                 "max_splits_per_segment": cfg["boundary_planner_max_splits_per_segment"],
                 "sequence_batch_size": cfg["boundary_planner_sequence_batch_size"],
                 "dp_chunk_base_cost": cfg["boundary_dp_chunk_base_cost"],
@@ -517,7 +522,8 @@ def _build_processing_spans(
         max_padded_chunk_s=cfg["boundary_planner_max_padded_chunk_s"],
         target_chunk_s=cfg["boundary_planner_target_chunk_s"],
         min_chunk_s=cfg["boundary_planner_min_chunk_s"],
-        target_padding_s=cfg["boundary_planner_target_padding_s"],
+        max_context_padding_s=cfg["boundary_context_max_padding_s"],
+        max_speech_overlap_s=cfg["boundary_context_max_speech_overlap_s"],
         start_weight=cfg["boundary_planner_start_weight"],
         frame_scores=frame_scores,
         score_frame_hop_s=score_frame_hop_s,
@@ -592,11 +598,15 @@ def _annotate_packed_chunks(
         chunk["boundary_split_prob"] = packed.boundary_split_prob
         chunk["boundary_refine_delta_s"] = packed.boundary_refine_delta_s
         chunk["boundary_decision_source"] = packed.boundary_decision_source
+        chunk["boundary_left_context_s"] = packed.boundary_left_context_s
+        chunk["boundary_right_context_s"] = packed.boundary_right_context_s
+        chunk["boundary_context_source"] = packed.boundary_context_source
         log.append(
             "[chunk] idx={idx} dur={duration:.1f} speech_segment_count={count} "
             "pad=({left:.2f},{right:.2f}) reason={reason} "
             "parent={parent} island={island}/{islands} gap_max={gap:.2f} "
             "boundary={boundary_reason} source={boundary_source} score={boundary_score} "
+            "ctx=({ctx_left},{ctx_right}) "
             "decision_source={decision_source} merge={decision_merge}".format(
                 idx=idx,
                 duration=packed.duration,
@@ -611,6 +621,8 @@ def _annotate_packed_chunks(
                 boundary_reason=packed.boundary_reason,
                 boundary_source=packed.boundary_source,
                 boundary_score=packed.boundary_score,
+                ctx_left=packed.boundary_left_context_s,
+                ctx_right=packed.boundary_right_context_s,
                 decision_source=packed.boundary_decision_source,
                 decision_merge=packed.boundary_decision_merge,
             )
@@ -632,8 +644,9 @@ def _alignment_fallback_count_from_log(log: list[str]) -> int:
     markers = (
         "aligner_vad_fallback",
         "even_fallback",
-        "Alignment 回退",
+        "Alignment 回退:",
         "Alignment 快速回退",
+        "Alignment 哨兵触发",
         "Alignment 降级失败",
         "Alignment 降级后仍异常",
         "边界回退",

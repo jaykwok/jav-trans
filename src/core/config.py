@@ -122,12 +122,13 @@ DEFAULT_SETTINGS: dict[str, str] = {
     "BOUNDARY_FRAME_SEQUENCE_INCLUDE_MFCC": "1",
     # Speech core is the subtitle/fallback timing window. Keep it short for JAV dialogue.
     "BOUNDARY_PLANNER_MAX_CORE_CHUNK_S": "5.0",
-    # Padded ASR input may be longer to preserve recognition context.
-    "BOUNDARY_PLANNER_MAX_PADDED_CHUNK_S": "9.0",
+    # Padded ASR input may be longer to preserve recognition context, but context is learned.
+    "BOUNDARY_PLANNER_MAX_PADDED_CHUNK_S": "6.5",
     "BOUNDARY_PLANNER_TARGET_CHUNK_S": "3.0",
     "BOUNDARY_PLANNER_MIN_CHUNK_S": "0.4",
     "BOUNDARY_PLANNER_START_WEIGHT": "1.5",
-    "BOUNDARY_PLANNER_TARGET_PADDING_S": "2.0",
+    "BOUNDARY_CONTEXT_MAX_PADDING_S": "1.5",
+    "BOUNDARY_CONTEXT_MAX_SPEECH_OVERLAP_S": "0.25",
     "BOUNDARY_PLANNER_MAX_SPLITS_PER_SEGMENT": "16",
     "BOUNDARY_PLANNER_SEQUENCE_BATCH_SIZE": "256",
     "BOUNDARY_DP_CHUNK_BASE_COST": "0.04",
@@ -141,7 +142,7 @@ DEFAULT_SETTINGS: dict[str, str] = {
     "SPEECH_BOUNDARY_JA_EXPORT_FRAME_SCORES": "0",
     # 1 caches SpeechBoundary frame score -> Boundary Planner outputs separately from ASR generation settings.
     "BOUNDARY_CACHE_ENABLED": "1",
-    # Persistent boundary cache directory. Versioned as boundary-cache v1.
+    # Persistent boundary cache directory. Versioned as boundary-cache v2.
     "BOUNDARY_CACHE_DIR": "./tmp/cache/boundary",
 
     # --- Alignment Retry & Refine ---

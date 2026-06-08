@@ -196,7 +196,7 @@ def test_longer_nonlexical_repeat_does_not_trigger_cap_like_reject():
     assert "hallucination_cap_like" not in qc["reasons"]
 
 
-def test_chunk_qc_exports_low_information_profile_without_dropping():
+def test_chunk_qc_exports_text_density_profile_without_dropping():
     qc = evaluate_asr_chunk_qc(
         {"index": 0, "start": 0.0, "end": 8.0, "duration": 8.0},
         {
@@ -206,6 +206,6 @@ def test_chunk_qc_exports_low_information_profile_without_dropping():
         },
     )
 
-    assert qc["metrics"]["low_information"]["level"] == "long_sparse"
-    assert qc["metrics"]["low_information"]["action"] == "preserve_with_review"
+    assert qc["metrics"]["text_density"]["level"] == "long_sparse_text"
+    assert qc["metrics"]["text_density"]["action"] == "preserve_with_review"
     assert qc["ok"] is True

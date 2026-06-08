@@ -505,7 +505,7 @@ def _repeated_vocalization_profile(
     }
 
 
-def _low_information_profile(text: str, *, duration_s: float) -> dict:
+def _text_density_profile(text: str, *, duration_s: float) -> dict:
     normalized = _collapse_repeated_noise(text)
     compact = _strip_punctuation(normalized)
     unique_chars = len(set(compact))
@@ -513,19 +513,19 @@ def _low_information_profile(text: str, *, duration_s: float) -> dict:
     has_kanji = any("\u3400" <= char <= "\u9fff" for char in compact)
     has_latin = any("A" <= char <= "Z" or "a" <= char <= "z" for char in compact)
     if not compact:
-        level = "empty"
+        level = "empty_or_punctuation"
     elif has_latin:
-        level = "not_low_information"
+        level = "normal_dialogue"
     elif duration_s >= _LOW_INFO_DURATION_S and len(compact) <= _LOW_INFO_MAX_CHARS:
-        level = "long_sparse"
+        level = "long_sparse_text"
     elif len(compact) <= 2:
-        level = "short_nonlexical"
+        level = "short_vocalization_candidate"
     elif unique_chars <= 2 and len(compact) >= 4 and not has_kanji:
-        level = "repeated_nonlexical"
+        level = "repeated_vocalization_candidate"
     elif kana_chars == len(compact) and len(compact) <= 5 and not has_kanji:
-        level = "short_kana"
+        level = "short_kana_dialogue_candidate"
     else:
-        level = "not_low_information"
+        level = "normal_dialogue"
     return {
         "level": level,
         "compact_chars": len(compact),
@@ -533,7 +533,7 @@ def _low_information_profile(text: str, *, duration_s: float) -> dict:
         "duration_s": round(duration_s, 3),
         "has_kanji": has_kanji,
         "has_latin": has_latin,
-        "action": "preserve_with_review" if level != "not_low_information" else "preserve",
+        "action": "preserve_with_review" if level != "normal_dialogue" else "preserve",
     }
 
 
@@ -658,7 +658,7 @@ def evaluate_asr_chunk_qc(
     repeat_ratio = float(repeat["ratio"])
     repeat_unit_len = int(repeat["unit_len"])
     repetition_repair = _repetition_repair_suggestion(text, repeat)
-    low_information = _low_information_profile(text, duration_s=duration)
+    text_density = _text_density_profile(text, duration_s=duration)
     vocalization_repetition = _repeated_vocalization_profile(
         text,
         repeat,
@@ -698,7 +698,7 @@ def evaluate_asr_chunk_qc(
         severity = "reject"
 
     if duration >= _LOW_INFO_DURATION_S and len(compact) <= _LOW_INFO_MAX_CHARS and low_value:
-        reasons.append("long_low_information_chunk")
+        reasons.append("long_sparse_text")
         if severity == "ok":
             severity = "warn"
     elif duration >= _LONG_LOW_VALUE_DURATION_S and low_value:
@@ -739,7 +739,7 @@ def evaluate_asr_chunk_qc(
             "mojibake": mojibake,
             "max_repeat": repeat,
             "repetition_repair": repetition_repair,
-            "low_information": low_information,
+            "text_density": text_density,
             "vocalization_repetition": vocalization_repetition,
             "signal_quality": signal_qc,
             "generation": asr_generation if isinstance(asr_generation, dict) else {},
@@ -879,7 +879,7 @@ def _review_reasons_for_qc_item(item: dict) -> list[str]:
     for reason in reasons:
         if reason.startswith("generation_"):
             review_reasons.append(reason)
-        elif reason in {"long_low_information_chunk", "long_low_value_text"}:
+        elif reason in {"long_sparse_text", "long_low_value_text"}:
             review_reasons.append(reason)
     if not review_reasons:
         if signal_verdict == "reject":

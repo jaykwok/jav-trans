@@ -264,13 +264,20 @@ def test_diagnose_case_separates_punctuation_only_nonlexical_text(tmp_path):
     assert case_summary["failure_bucket_counts"] == {"nonlexical_text": 1}
 
 
-def test_diagnose_case_exports_repetition_and_low_information_review_fields(tmp_path):
+def test_diagnose_case_exports_repetition_and_text_density_fields(tmp_path):
     aligned_path = tmp_path / "archived" / "sample" / "sample.aligned_segments.json"
     _write_json(
         aligned_path,
         {
             "audio_path": str(tmp_path / "audio.wav"),
-            "segments": [],
+            "segments": [
+                {
+                    "start": 4.0,
+                    "end": 4.5,
+                    "text": "んんんん",
+                    "source_chunk_index": 1,
+                }
+            ],
             "asr_details": {
                 "transcript_chunks": [
                     {
@@ -307,8 +314,8 @@ def test_diagnose_case_exports_repetition_and_low_information_review_fields(tmp_
                                     "suggested_text": "あっあっあっ",
                                     "changed": True,
                                 },
-                                "low_information": {
-                                    "level": "not_low_information",
+                                "text_density": {
+                                    "level": "normal_dialogue",
                                     "action": "preserve",
                                 },
                             },
@@ -320,8 +327,8 @@ def test_diagnose_case_exports_repetition_and_low_information_review_fields(tmp_
                             "reasons": [],
                             "metrics": {
                                 "repetition_repair": {"action": "none", "changed": False},
-                                "low_information": {
-                                    "level": "repeated_nonlexical",
+                                "text_density": {
+                                    "level": "repeated_vocalization_candidate",
                                     "action": "preserve_with_review",
                                 },
                             },
@@ -343,16 +350,15 @@ def test_diagnose_case_exports_repetition_and_low_information_review_fields(tmp_
     by_chunk = {row["chunk_index"]: row for row in rows}
     assert by_chunk[0]["failure_bucket"] == "repeat_repair_suggested"
     assert by_chunk[0]["repetition_suggested_text"] == "あっあっあっ"
-    assert by_chunk[1]["failure_bucket"] == "low_information_text"
-    assert by_chunk[1]["low_information_level"] == "repeated_nonlexical"
+    assert by_chunk[1]["failure_bucket"] == ""
+    assert by_chunk[1]["text_density_level"] == "repeated_vocalization_candidate"
     assert case_summary["failure_bucket_counts"] == {
-        "low_information_text": 1,
         "repeat_repair_suggested": 1,
     }
     assert case_summary["repeat_repair_suggested_count"] == 1
-    assert summary["low_information_counts"] == {
-        "not_low_information": 1,
-        "repeated_nonlexical": 1,
+    assert summary["text_density_counts"] == {
+        "normal_dialogue": 1,
+        "repeated_vocalization_candidate": 1,
     }
 
 
@@ -363,7 +369,14 @@ def test_cli_broadcasts_single_case_label_for_multiple_aligned_jsons(tmp_path, m
             workflow_root / "archived" / stem / f"{stem}.aligned_segments.json",
             {
                 "audio_path": str(tmp_path / f"{stem}.wav"),
-                "segments": [],
+                "segments": [
+                    {
+                        "start": 4.0,
+                        "end": 4.5,
+                        "text": "んんんん",
+                        "source_chunk_index": 1,
+                    }
+                ],
                 "asr_details": {
                     "transcript_chunks": [
                         {

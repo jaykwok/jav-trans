@@ -13,7 +13,6 @@ PROJECT_ROOT = Path(__file__).resolve().parents[3]
 
 DEFAULT_INCLUDE_REVIEW_TYPES = [
     "review_repetition_repair",
-    "review_low_information_text",
 ]
 DEFAULT_SAMPLE_REVIEW_TYPES = [
     "review_coarse_timing:20",
@@ -74,7 +73,7 @@ def write_csv(path: Path, rows: list[dict[str, Any]]) -> None:
         "display_text",
         "align_text",
         "repetition_suggested_text",
-        "low_information_level",
+        "text_density_level",
         "manual_label",
         "manual_text",
         "notes",

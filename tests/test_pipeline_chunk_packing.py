@@ -190,7 +190,8 @@ class _LowLogprobBackend(_RecordingBackend):
 
 def _reload_pipeline(monkeypatch, tmp_path: Path):
     monkeypatch.setenv("BOUNDARY_FEATURE_FRAME_HOP_S", "0.02")
-    monkeypatch.setenv("BOUNDARY_PLANNER_TARGET_PADDING_S", "0")
+    monkeypatch.setenv("BOUNDARY_CONTEXT_MAX_PADDING_S", "0")
+    monkeypatch.setenv("BOUNDARY_CONTEXT_MAX_SPEECH_OVERLAP_S", "0")
     monkeypatch.setenv("BOUNDARY_PLANNER_TARGET_CHUNK_S", "9.0")
     monkeypatch.setenv("BOUNDARY_PLANNER_MAX_CORE_CHUNK_S", "30.0")
     monkeypatch.setenv("BOUNDARY_PLANNER_MAX_PADDED_CHUNK_S", "30.0")
@@ -378,13 +379,17 @@ def test_alignment_fallback_count_deduplicates_chunk_log_markers():
     from asr import pipeline as asr
 
     log = [
+        "chunk 0: Alignment 回退窗口: speech_core",
         "chunk 1: Alignment 回退: 使用 VAD 约束比例时间戳",
         "chunk 1: Alignment VAD 回退语音区间: 2",
+        "chunk 1: Alignment 回退窗口: speech_core",
         "chunk 2: Alignment 降级后仍异常: 改用等比分配时间戳",
         "chunk 2: Alignment VAD 回退异常: fallback_vad failed",
+        "chunk 3: Alignment 哨兵触发: 时间轴异常，不重新调用 ASR，改用 VAD/比例回退",
+        "chunk 3: Alignment 回退窗口: speech_core",
     ]
 
-    assert asr._alignment_fallback_count_from_log(log) == 2
+    assert asr._alignment_fallback_count_from_log(log) == 3
 
 
 def test_adaptive_precision_reviews_low_logprob_before_alignment(monkeypatch, tmp_path):

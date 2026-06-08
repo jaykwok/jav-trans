@@ -23,6 +23,7 @@ from torch.utils.data import DataLoader, Subset, TensorDataset
 
 from boundary.backbones import TRANSFORMERS_MAMBA2_BACKBONE, BoundarySequenceClassifier
 from boundary.refiner import (
+    CONTEXT_OUTPUT_DIM,
     DEFAULT_REFINER_FEATURES,
     RefinerInput,
     build_learned_refiner_checkpoint,
@@ -58,15 +59,17 @@ class TrainRefinerConfig:
     target_domain_speedup: float = 1.5
     target_chunk_s: float = 3.0
     max_core_chunk_s: float = 5.0
-    max_padded_chunk_s: float = 9.0
+    max_padded_chunk_s: float = 6.5
     min_chunk_s: float = 0.4
-    target_padding_s: float = 2.0
+    context_max_padding_s: float = 1.5
+    context_loss_weight: float = 0.25
 
 
 @dataclass(frozen=True)
 class LoadedRefinerDataset:
     features: torch.Tensor
     labels: torch.Tensor
+    context_targets: torch.Tensor
     mask: torch.Tensor
     feature_names: tuple[str, ...]
     feature_metadata: dict[str, Any]
@@ -96,6 +99,7 @@ def train_refiner(
     loaded = _load_dataset_tensors(dataset_paths)
     features = loaded.features
     labels = loaded.labels
+    context_targets = loaded.context_targets
     mask = loaded.mask
     feature_names = loaded.feature_names
     feature_metadata = loaded.feature_metadata
@@ -126,6 +130,7 @@ def train_refiner(
         backbone=TRANSFORMERS_MAMBA2_BACKBONE,
         hidden_size=config.hidden_size,
         num_layers=config.num_layers,
+        output_dim=CONTEXT_OUTPUT_DIM,
         state_size=config.state_size,
         num_heads=config.num_heads,
         n_groups=config.n_groups,
@@ -133,7 +138,7 @@ def train_refiner(
         bidirectional=config.bidirectional,
     ).to(device)
 
-    train_dataset = Subset(TensorDataset(features, labels, mask), train_idx)
+    train_dataset = Subset(TensorDataset(features, labels, context_targets, mask), train_idx)
     train_loader = DataLoader(
         train_dataset,
         batch_size=min(config.batch_size, len(train_dataset)),
@@ -142,7 +147,8 @@ def train_refiner(
     )
     positives = max(1.0, float(train_labels[train_mask].sum().item()))
     negatives = max(1.0, float(train_mask.sum().item() - train_labels[train_mask].sum().item()))
-    criterion = nn.BCEWithLogitsLoss(pos_weight=torch.tensor([negatives / positives], device=device))
+    merge_criterion = nn.BCEWithLogitsLoss(pos_weight=torch.tensor([negatives / positives], device=device))
+    context_criterion = nn.SmoothL1Loss()
     optimizer = torch.optim.AdamW(
         model.parameters(),
         lr=config.learning_rate,
@@ -152,12 +158,18 @@ def train_refiner(
     step = 0
     last_loss = math.nan
     while step < config.max_steps:
-        for batch_features, batch_labels, batch_mask in train_loader:
+        for batch_features, batch_labels, batch_context_targets, batch_mask in train_loader:
             step += 1
             optimizer.zero_grad(set_to_none=True)
             batch_mask = batch_mask.to(device)
             logits = model(batch_features.to(device), attention_mask=batch_mask.long())
-            loss = criterion(logits[batch_mask], batch_labels.to(device)[batch_mask])
+            merge_loss = merge_criterion(logits[..., 0][batch_mask], batch_labels.to(device)[batch_mask])
+            context_pred = torch.sigmoid(logits[..., 1:3]) * float(config.context_max_padding_s)
+            context_loss = context_criterion(
+                context_pred[batch_mask],
+                batch_context_targets.to(device)[batch_mask],
+            )
+            loss = merge_loss + float(config.context_loss_weight) * context_loss
             loss.backward()
             optimizer.step()
             last_loss = float(loss.detach().cpu())
@@ -222,9 +234,11 @@ def train_refiner(
                 "max_core_chunk_s": config.max_core_chunk_s,
                 "max_padded_chunk_s": config.max_padded_chunk_s,
                 "min_chunk_s": config.min_chunk_s,
-                "target_padding_s": config.target_padding_s,
-                "source": "galgame_duration_distribution_speedup_1_5",
+                "context_max_padding_s": config.context_max_padding_s,
+                "context_loss_weight": config.context_loss_weight,
+                "source": "anime_nsfw_sfw_galgame_duration_distribution",
             },
+            "context_max_padding_s": config.context_max_padding_s,
             **feature_metadata,
         },
     )
@@ -271,15 +285,18 @@ def _load_dataset_tensors(paths: Sequence[Path]) -> LoadedRefinerDataset:
     scan = _scan_dataset(paths)
     features = torch.zeros((scan.row_count, scan.max_len, len(scan.feature_names)), dtype=torch.float32)
     labels = torch.zeros((scan.row_count, scan.max_len), dtype=torch.float32)
+    context_targets = torch.zeros((scan.row_count, scan.max_len, 2), dtype=torch.float32)
     mask = torch.zeros((scan.row_count, scan.max_len), dtype=torch.bool)
 
     row_index = 0
     for row in _iter_dataset_rows(paths):
         sequence = _row_sequence_array(row, scan.feature_names)
         label_sequence = _row_label_sequence(row, expected_len=int(sequence.shape[0]))
+        context_sequence = _row_context_target_sequence(row, expected_len=int(sequence.shape[0]))
         length = int(sequence.shape[0])
         features[row_index, :length].copy_(torch.from_numpy(sequence))
         labels[row_index, :length].copy_(torch.tensor(label_sequence, dtype=torch.float32))
+        context_targets[row_index, :length].copy_(torch.tensor(context_sequence, dtype=torch.float32))
         mask[row_index, :length] = True
         row_index += 1
     if row_index != scan.row_count:
@@ -287,6 +304,7 @@ def _load_dataset_tensors(paths: Sequence[Path]) -> LoadedRefinerDataset:
     return LoadedRefinerDataset(
         features=features,
         labels=labels,
+        context_targets=context_targets,
         mask=mask,
         feature_names=scan.feature_names,
         feature_metadata=scan.feature_metadata,
@@ -317,6 +335,7 @@ def _scan_dataset(paths: Sequence[Path]) -> DatasetScan:
             raise ValueError(f"feature_names mismatch at row {row_count}: {row_names} != {feature_names}")
         sequence_len = _row_sequence_length(row, feature_names)
         label_sequence = _row_label_sequence(row, expected_len=sequence_len)
+        _row_context_target_sequence(row, expected_len=sequence_len)
         row_positive = sum(1 for value in label_sequence if value >= 0.5)
         class_counts["merge_positive"] += row_positive
         class_counts["split_negative"] += len(label_sequence) - row_positive
@@ -483,6 +502,23 @@ def _row_label_sequence(row: Mapping[str, Any], *, expected_len: int) -> list[fl
     return [float(row.get("label", row.get("merge_target", 0)))]
 
 
+def _row_context_target_sequence(row: Mapping[str, Any], *, expected_len: int) -> list[list[float]]:
+    raw = row.get("sequence_context_targets")
+    if isinstance(raw, list) and raw:
+        if len(raw) != expected_len:
+            raise ValueError("sequence_context_targets length must match sequence_features length")
+        targets: list[list[float]] = []
+        for item in raw:
+            if not isinstance(item, list) or len(item) != 2:
+                raise ValueError("sequence_context_targets items must be [left_s, right_s]")
+            left, right = float(item[0]), float(item[1])
+            if not math.isfinite(left) or not math.isfinite(right):
+                raise ValueError("sequence_context_targets must not contain NaN or inf")
+            targets.append([max(0.0, left), max(0.0, right)])
+        return targets
+    raise ValueError("boundary refiner v2 rows require sequence_context_targets")
+
+
 def _row_features(row: Mapping[str, Any], feature_names: tuple[str, ...]) -> list[float]:
     raw = row.get("features")
     if isinstance(raw, list) and len(raw) == len(feature_names):
@@ -585,6 +621,8 @@ def _evaluate(
                 features[batch_indexes].to(device),
                 attention_mask=batch_mask.to(device).long(),
             ).detach().cpu()
+            if logits.ndim == 3:
+                logits = logits[..., 0]
             logits = logits[batch_mask]
             probs = torch.sigmoid(logits)
             truth = labels[batch_indexes][batch_mask] >= 0.5
@@ -661,10 +699,12 @@ def _validate_config(config: TrainRefinerConfig) -> None:
         "max_core_chunk_s",
         "max_padded_chunk_s",
         "min_chunk_s",
-        "target_padding_s",
+        "context_max_padding_s",
     ):
         if getattr(config, name) <= 0.0:
             raise ValueError(f"{name} must be positive")
+    if config.context_loss_weight < 0.0:
+        raise ValueError("context_loss_weight must be non-negative")
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -697,9 +737,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--target-domain-speedup", type=float, default=1.5)
     parser.add_argument("--target-chunk-s", type=float, default=3.0)
     parser.add_argument("--max-core-chunk-s", type=float, default=5.0)
-    parser.add_argument("--max-padded-chunk-s", type=float, default=9.0)
+    parser.add_argument("--max-padded-chunk-s", type=float, default=6.5)
     parser.add_argument("--min-chunk-s", type=float, default=0.4)
-    parser.add_argument("--target-padding-s", type=float, default=2.0)
+    parser.add_argument("--context-max-padding-s", type=float, default=1.5)
+    parser.add_argument("--context-loss-weight", type=float, default=0.25)
     args = parser.parse_args(argv)
     return args
 
@@ -732,7 +773,8 @@ def main(argv: list[str] | None = None) -> None:
             max_core_chunk_s=args.max_core_chunk_s,
             max_padded_chunk_s=args.max_padded_chunk_s,
             min_chunk_s=args.min_chunk_s,
-            target_padding_s=args.target_padding_s,
+            context_max_padding_s=args.context_max_padding_s,
+            context_loss_weight=args.context_loss_weight,
         ),
     )
 

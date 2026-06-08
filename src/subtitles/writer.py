@@ -227,12 +227,28 @@ def _timed_words(block: dict) -> list[dict]:
     return sorted(words, key=lambda word: (word["start"], word["end"]))
 
 
+def _word_start_anchor(words: list[dict]) -> float | None:
+    if not words:
+        return None
+    timed = [
+        word
+        for word in words
+        if float(word.get("end", word.get("start", 0.0))) > float(word.get("start", 0.0))
+    ]
+    if not timed:
+        return None
+    return min(float(word["start"]) for word in timed)
+
+
 def _subtitle_block_window(block: dict, words: list[dict]) -> tuple[float, float]:
     fallback_start = float(words[0]["start"]) if words else 0.0
     try:
         start = float(block.get("start", fallback_start))
     except (TypeError, ValueError):
         start = fallback_start
+    word_anchor = _word_start_anchor(words)
+    if word_anchor is not None:
+        start = min(start, word_anchor)
 
     fallback_end = float(words[-1]["end"]) if words else start
     try:
@@ -465,10 +481,7 @@ def _normalize_subtitle_timeline(
         if limit_end > current_start:
             current["end"] = max(current_start + 0.001, limit_end)
         else:
-            current["end"] = current_start + 0.05
-            shifted_next_start = current["end"] + gap_s
-            nxt["start"] = max(next_start, shifted_next_start)
-            nxt["end"] = max(next_end, float(nxt["start"]) + 0.05)
+            current["end"] = current_start
         index += 1
 
     return normalized

@@ -13,7 +13,14 @@ def _seg(start: float, end: float) -> SpeechSegment:
 
 class _DenyGapRefiner:
     def decide_gap(self, item: RefinerInput) -> BoundaryDecision:
-        return BoundaryDecision(False, 0.12, "utterance_switch")
+        return BoundaryDecision(
+            False,
+            0.12,
+            "utterance_switch",
+            left_context_s=0.3,
+            right_context_s=0.4,
+            context_source="unit",
+        )
 
     def signature(self) -> dict:
         return {"type": "deny_gap"}
@@ -21,7 +28,7 @@ class _DenyGapRefiner:
 
 class _AllowGapRefiner:
     def decide_gap(self, item: RefinerInput) -> BoundaryDecision:
-        return BoundaryDecision(True, 0.92, "semantic_continuation")
+        return BoundaryDecision(True, 0.92, "semantic_continuation", left_context_s=0.5, right_context_s=0.5)
 
     def signature(self) -> dict:
         return {"type": "allow_gap"}
@@ -36,6 +43,9 @@ class _SequenceDenyRefiner:
                 0.08,
                 "learned_sequence_split",
                 source="frame_sequence_refiner",
+                left_context_s=0.2,
+                right_context_s=0.3,
+                context_source="unit",
             )
         ]
 
@@ -65,7 +75,14 @@ class _BatchSequenceRefiner:
         assert features == [[1.0], [2.0]]
         return [
             BoundaryDecision(True, 0.91, "learned_sequence_merge", source="frame_sequence_refiner"),
-            BoundaryDecision(False, 0.07, "learned_sequence_split", source="frame_sequence_refiner"),
+            BoundaryDecision(
+                False,
+                0.07,
+                "learned_sequence_split",
+                source="frame_sequence_refiner",
+                left_context_s=0.1,
+                right_context_s=0.2,
+            ),
         ]
 
     def signature(self) -> dict:
@@ -95,15 +112,15 @@ def test_dense_segments_pack_into_one_chunk_with_dynamic_padding():
         max_core_chunk_s=30.0,
         max_padded_chunk_s=30.0,
         target_chunk_s=9.0,
-        target_padding_s=4.0,
+        max_context_padding_s=1.5,
     )
 
     assert len(chunks) == 1
-    assert chunks[0].start == 1.0
-    assert chunks[0].end == 15.0
-    assert chunks[0].duration == 14.0
-    assert chunks[0].left_padding_s == 4.0
-    assert chunks[0].right_padding_s == 4.0
+    assert chunks[0].start == 3.5
+    assert chunks[0].end == 12.5
+    assert chunks[0].duration == 9.0
+    assert chunks[0].left_padding_s == 1.5
+    assert chunks[0].right_padding_s == 1.5
     assert chunks[0].speech_segments == [_seg(5.0, 7.0), _seg(8.0, 9.0), _seg(10.0, 11.0)]
 
 
@@ -114,7 +131,7 @@ def test_gap_refiner_can_block_mergeable_gap():
         max_core_chunk_s=30.0,
         max_padded_chunk_s=30.0,
         target_chunk_s=9.0,
-        target_padding_s=1.0,
+        max_context_padding_s=1.5,
         boundary_refiner=_DenyGapRefiner(),
     )
 
@@ -125,6 +142,8 @@ def test_gap_refiner_can_block_mergeable_gap():
     assert chunks[0].boundary_decision_merge is False
     assert chunks[0].boundary_merge_prob == pytest.approx(0.12)
     assert chunks[0].boundary_split_prob == pytest.approx(0.88)
+    assert chunks[0].right_padding_s == pytest.approx(0.3)
+    assert chunks[1].left_padding_s == pytest.approx(0.4)
 
 
 def test_sequence_refiner_can_block_mergeable_gap():
@@ -134,7 +153,7 @@ def test_sequence_refiner_can_block_mergeable_gap():
         max_core_chunk_s=30.0,
         max_padded_chunk_s=30.0,
         target_chunk_s=9.0,
-        target_padding_s=1.0,
+        max_context_padding_s=1.5,
         boundary_refiner=_AllowGapRefiner(),
         sequence_boundary_refiner=_SequenceDenyRefiner(),
         sequence_feature_provider=_StaticSequenceFeatureProvider(),
@@ -144,6 +163,8 @@ def test_sequence_refiner_can_block_mergeable_gap():
     assert chunks[0].split_reason == "boundary_refiner:learned_sequence_split"
     assert chunks[0].boundary_score == pytest.approx(0.08)
     assert chunks[0].boundary_decision_source == "frame_sequence_refiner"
+    assert chunks[0].right_padding_s == pytest.approx(0.2)
+    assert chunks[1].left_padding_s == pytest.approx(0.3)
 
 
 def test_sequence_refiner_scores_all_gaps_in_one_batch():
@@ -155,7 +176,7 @@ def test_sequence_refiner_scores_all_gaps_in_one_batch():
         max_core_chunk_s=30.0,
         max_padded_chunk_s=30.0,
         target_chunk_s=9.0,
-        target_padding_s=1.0,
+        max_context_padding_s=1.5,
         sequence_boundary_refiner=refiner,
         sequence_feature_provider=_IndexSequenceFeatureProvider(),
     )
@@ -173,7 +194,7 @@ def test_planner_max_splits_even_when_refiner_allows_gap():
         max_core_chunk_s=8.0,
         max_padded_chunk_s=30.0,
         target_chunk_s=9.0,
-        target_padding_s=1.0,
+        max_context_padding_s=1.5,
         boundary_refiner=_AllowGapRefiner(),
     )
 
@@ -191,7 +212,7 @@ def test_boundary_candidate_split_metadata_is_materialized():
         max_padded_chunk_s=30.0,
         target_chunk_s=5.0,
         min_chunk_s=3.0,
-        target_padding_s=1.0,
+        max_context_padding_s=1.5,
         cut_frame_scores=cut_scores,
     )
 
@@ -216,7 +237,7 @@ def test_candidate_split_accepts_numpy_score_arrays():
         max_padded_chunk_s=30.0,
         target_chunk_s=5.0,
         min_chunk_s=3.0,
-        target_padding_s=1.0,
+        max_context_padding_s=1.5,
         cut_frame_scores=cut_scores,
     )
 
@@ -231,14 +252,15 @@ def test_overlong_segment_is_split_by_planner_capacity():
         max_core_chunk_s=20.0,
         max_padded_chunk_s=28.0,
         target_chunk_s=9.0,
-        target_padding_s=4.0,
+        max_context_padding_s=1.5,
+        max_speech_overlap_s=0.25,
     )
 
     assert [(chunk.start, chunk.end, chunk.duration) for chunk in chunks] == [
-        (6.0, 34.0, 28.0),
-        (26.0, 54.0, 28.0),
-        (46.0, 74.0, 28.0),
-        (66.0, 79.0, 13.0),
+        (8.5, 30.25, 21.75),
+        (29.75, 50.25, 20.5),
+        (49.75, 70.25, 20.5),
+        (69.75, 76.5, 6.75),
     ]
     assert [[(seg.start, seg.end) for seg in chunk.speech_segments] for chunk in chunks] == [
         [(10.0, 30.0)],
@@ -260,7 +282,7 @@ def test_single_segment_at_audio_start_clamps_left_padding_to_zero():
         max_core_chunk_s=30.0,
         max_padded_chunk_s=30.0,
         target_chunk_s=9.0,
-        target_padding_s=4.0,
+        max_context_padding_s=1.5,
     )
 
     assert chunks[0].start == 0.0
