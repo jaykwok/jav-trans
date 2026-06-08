@@ -2,7 +2,6 @@ param(
     [string]$SourceDir = "dist/JAVTrans",
     [string]$OutputDir = "dist/release-assets",
     [string]$ArchiveName = "JAVTrans-windows-x64.7z",
-    [string]$VolumeSize = "1900m",
     [int]$Threads = [Environment]::ProcessorCount
 )
 
@@ -39,10 +38,10 @@ Remove-Item -LiteralPath $Output -Force -ErrorAction SilentlyContinue
 
 Write-Host "Using $Threads compression threads."
 Write-Host "Using 7-Zip: $SevenZipPath"
-& $SevenZipPath a -t7z -m0=LZMA2 -mx=5 "-mmt=$Threads" "-v$VolumeSize" $Output $Source
+& $SevenZipPath a -t7z -m0=LZMA2 -mx=5 "-mmt=$Threads" $Output $Source
 if ($LASTEXITCODE -ne 0) {
     exit $LASTEXITCODE
 }
 
-Get-ChildItem -Path (Resolve-Path $OutputDir) -Filter "$ArchiveName.*" |
+Get-ChildItem -Path (Resolve-Path $OutputDir) -Filter $ArchiveName |
     Select-Object Name,Length,LastWriteTime

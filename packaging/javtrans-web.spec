@@ -3,6 +3,7 @@
 import os
 import shutil
 import importlib.util
+import fnmatch
 from pathlib import Path
 
 from PyInstaller.utils.hooks import (
@@ -39,6 +40,58 @@ def _require_path(path: str | Path, label: str) -> Path:
 
 def _pyinstaller_icon_path() -> Path:
     return _require_path("src/assets/images/icon.ico", "application ico icon")
+
+
+def _env_bool(name: str) -> bool:
+    return os.getenv(name, "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+INFERENCE_IGNORE_PATTERNS = [
+    "optimizer.pt",
+    "**/optimizer.pt",
+    "optimizer.bin",
+    "**/optimizer.bin",
+    "scheduler.pt",
+    "**/scheduler.pt",
+    "scaler.pt",
+    "**/scaler.pt",
+    "rng_state*.pth",
+    "**/rng_state*.pth",
+    "trainer_state.json",
+    "**/trainer_state.json",
+    "training_args.bin",
+    "**/training_args.bin",
+]
+
+
+def _ignored_inference_file(relative_path: str) -> bool:
+    normalized = relative_path.replace("\\", "/")
+    name = Path(normalized).name
+    return any(
+        fnmatch.fnmatch(normalized, pattern) or fnmatch.fnmatch(name, pattern)
+        for pattern in INFERENCE_IGNORE_PATTERNS
+    )
+
+
+def _collect_inference_model_dir(path: str, dest: str, label: str) -> list[tuple[str, str]]:
+    source = _require_path(path, label)
+    if not source.is_dir():
+        raise SystemExit(f"{label} must be a directory: {source}")
+
+    collected = []
+    for file_path in source.rglob("*"):
+        if not file_path.is_file():
+            continue
+        relative = file_path.relative_to(source).as_posix()
+        if _ignored_inference_file(relative):
+            continue
+        relative_parent = Path(relative).parent.as_posix()
+        target_dir = dest if relative_parent == "." else (Path(dest) / relative_parent).as_posix()
+        collected.append((str(file_path), target_dir))
+
+    if not collected:
+        raise SystemExit(f"{label} has no inference files to bundle: {source}")
+    return collected
 
 
 def _which_tool(name: str, env_name: str) -> Path:
@@ -86,14 +139,6 @@ datas += [
         "src/boundary/checkpoints",
     ),
     (
-        str(_require_path("models/jaykwok-Qwen3-ASR-0.6B-JA-Anime-Galgame", "default ASR model")),
-        "models/jaykwok-Qwen3-ASR-0.6B-JA-Anime-Galgame",
-    ),
-    (
-        str(_require_path("models/Qwen-Qwen3-ForcedAligner-0.6B", "default forced aligner model")),
-        "models/Qwen-Qwen3-ForcedAligner-0.6B",
-    ),
-    (
         str(NAGISA_PACKAGE_DIR / "data"),
         "nagisa/data",
     ),
@@ -102,6 +147,23 @@ datas += [
         "qwen_asr/inference/assets",
     ),
 ]
+
+if not _env_bool("JAVTRANS_SKIP_MODELS"):
+    datas += _collect_inference_model_dir(
+        "models/jaykwok-Qwen3-ASR-0.6B-JA-Anime-Galgame",
+        "models/jaykwok-Qwen3-ASR-0.6B-JA-Anime-Galgame",
+        "bundled 0.6B ASR / SpeechBoundary model",
+    )
+    datas += _collect_inference_model_dir(
+        "models/jaykwok-Qwen3-ASR-1.7B-JA-Anime-Galgame",
+        "models/jaykwok-Qwen3-ASR-1.7B-JA-Anime-Galgame",
+        "bundled 1.7B ASR model",
+    )
+    datas += _collect_inference_model_dir(
+        "models/Qwen-Qwen3-ForcedAligner-0.6B",
+        "models/Qwen-Qwen3-ForcedAligner-0.6B",
+        "bundled forced aligner model",
+    )
 
 binaries = _ffmpeg_binaries()
 

@@ -1,5 +1,6 @@
 param(
     [switch]$Clean,
+    [switch]$SkipModels,
     [string]$FfmpegExe = "",
     [string]$FfprobeExe = "",
     [string]$SpecPath = "packaging/javtrans-web.spec"
@@ -21,9 +22,14 @@ if ($FfprobeExe) {
     $env:JAVTRANS_FFPROBE_EXE = (Resolve-Path $FfprobeExe).Path
 }
 
-& uv run --no-sync python "packaging/prepare_default_model.py"
-if ($LASTEXITCODE -ne 0) {
-    exit $LASTEXITCODE
+if ($SkipModels) {
+    $env:JAVTRANS_SKIP_MODELS = "1"
+} else {
+    Remove-Item Env:JAVTRANS_SKIP_MODELS -ErrorAction SilentlyContinue
+    & uv run --no-sync python "packaging/prepare_default_model.py"
+    if ($LASTEXITCODE -ne 0) {
+        exit $LASTEXITCODE
+    }
 }
 
 if ($Clean) {
