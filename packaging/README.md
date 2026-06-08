@@ -14,59 +14,54 @@ It bundles:
 - `ffmpeg.exe` and `ffprobe.exe` from `PATH`, or from `-FfmpegExe` / `-FfprobeExe`
 - `src/assets/images/icon.png` for the in-app header, drop zone image, and PNG favicon
 - `src/assets/images/icon.ico` for the pywebview native window icon and packaged executable icon
+- the small Mamba Boundary Refiner checkpoint at `src/boundary/checkpoints/boundary_refiner.pt`
+- the bundled Hugging Face inference model directories:
+  - `jaykwok/Qwen3-ASR-0.6B-JA-Anime-Galgame`
+  - `jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame`
+  - `Qwen/Qwen3-ForcedAligner-0.6B`
 
-Keep image assets under `src/assets/images/`. The PNG should be the 512x512
-source image used by the web UI; the ICO should be generated from the same image
-for Windows native icon consumers.
-- the default ASR model `jaykwok/Qwen3-ASR-0.6B-JA-Anime-Galgame`
-- default workflow auxiliary models:
-  - forced aligner `Qwen/Qwen3-ForcedAligner-0.6B`
-  - learned Boundary Refiner `src/boundary/checkpoints/boundary_refiner.pt`
+The build script prepares those three Hugging Face models before running
+PyInstaller. Training-only files such as `optimizer.pt`, scheduler state,
+trainer state, RNG state, and `training_args.bin` are excluded from the package
+even if they exist in the local `models/` directories.
+
+For a small development build only, pass `-SkipModels`. That skips model
+preparation and leaves the Hugging Face model directories out of the PyInstaller
+package. Do not use `-SkipModels` for user-facing Windows builds.
 
 The PyInstaller spec treats `src/boundary/checkpoints/` as a required data
 directory. A build should fail if the default Boundary Refiner checkpoint is
 missing, because normal inference does not regenerate it.
 
-It does not bundle Microsoft Edge WebView2. Users still need the WebView2 runtime,
-which is already present on most supported Windows systems. If the app window
-does not open, install Evergreen Runtime from Microsoft's official WebView2
-download page: https://developer.microsoft.com/en-us/microsoft-edge/webview2/.
-Use Evergreen Bootstrapper for online installs, or Evergreen Standalone Installer
-x64 for offline installs.
-
-The release folder is expected to be several GB because it contains PyTorch/CUDA
-runtime files plus the default ASR model. GitHub currently requires every
-uploaded release asset to be under 2 GiB, so publish this as split archives or
-host the large model/runtime bundle externally and link it from the release
-notes. See GitHub Docs: https://docs.github.com/en/repositories/releasing-projects-on-github/about-releases#storage-and-bandwidth-quotas
+It does not bundle Microsoft Edge WebView2. Users still need the WebView2
+runtime, which is already present on most supported Windows systems. If the app
+window does not open, install Evergreen Runtime from Microsoft's official
+WebView2 download page: https://developer.microsoft.com/en-us/microsoft-edge/webview2/.
+Use Evergreen Bootstrapper for online installs, or Evergreen Standalone
+Installer x64 for offline installs.
 
 At runtime, writable files are created next to `JAVTrans.exe`:
 
 - `.env` for persisted settings
-- `models/` for user-downloaded non-default models
+- `models/` for user-downloaded or user-replaced models
 - `tmp/jobs/` for job state and resumable task files
 - `tmp/log/` for `.run.log` diagnostics that users can attach to bug reports
 
-To create split archives with 7-Zip:
+To create one local 7-Zip archive:
 
 ```powershell
 .\packaging\archive_release.ps1
 ```
 
-The default output is `dist/release-assets/JAVTrans-windows-x64.7z.001`,
-`.002`, etc. Users extract starting from the `.001` file.
-The script uses all logical CPU threads by default; override with `-Threads <n>`
-if you need to keep the machine responsive while compressing.
-
-Only the default ASR model, forced aligner, runtime assets, and the small
-`src/boundary/checkpoints/boundary_refiner.pt` are bundled. Other ASR
-models remain download-on-demand into the executable folder's `models/`
-directory.
+The default output is `dist/release-assets/JAVTrans-windows-x64.7z`. The archive
+script creates a single `.7z` file and no split volumes. Publish this large
+Windows bundle through external storage such as a netdisk; GitHub Releases are
+expected to publish source code and release notes only.
 
 Training-only Boundary Refiner artifacts are deliberately excluded from release
 packages: CUDA feature caches, synthetic WAVs, sequence JSONL files, and
 `datasets/train/...` outputs are all regenerable research data. New users only
-need the bundled `boundary_refiner.pt` plus the Hugging Face ASR / aligner models
-above. Do not restore old `src/vad` checkpoint paths; if the Boundary Refiner
-checkpoint grows too large for source distribution, publish it as a GitHub
-Release or Hugging Face artifact instead.
+need the bundled `boundary_refiner.pt` plus the bundled Hugging Face inference
+models above. Do not restore old `src/vad` checkpoint paths; if the Boundary
+Refiner checkpoint grows too large for source distribution, publish it as a
+GitHub Release or Hugging Face artifact instead.
