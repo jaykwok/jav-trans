@@ -56,6 +56,41 @@ def test_resolve_model_spec_uses_bundled_model_when_runtime_model_missing(monkey
     )
 
 
+def test_resolve_model_spec_uses_bundled_model_for_default_explicit_path(
+    monkeypatch,
+    tmp_path,
+):
+    runtime_root = tmp_path / "runtime"
+    resource_root = tmp_path / "resource"
+    repo_id = "jaykwok/Qwen3-ASR-0.6B-JA-Anime-Galgame"
+    monkeypatch.setattr(model_paths, "is_frozen", lambda: True)
+    monkeypatch.setattr(model_paths, "PROJECT_ROOT", runtime_root)
+    monkeypatch.setattr(model_paths, "MODELS_ROOT", runtime_root / "models")
+    monkeypatch.setattr(model_paths, "RESOURCE_ROOT", resource_root)
+    monkeypatch.setattr(model_paths, "BUNDLED_MODELS_ROOT", resource_root / "models")
+
+    bundled_model = resource_root / "models" / "jaykwok-Qwen3-ASR-0.6B-JA-Anime-Galgame"
+    bundled_model.mkdir(parents=True)
+    (bundled_model / "config.json").write_text("{}", encoding="utf-8")
+    (bundled_model / "model.safetensors").write_bytes(b"weights")
+
+    assert (
+        model_paths.resolve_model_spec(
+            "models/jaykwok-Qwen3-ASR-0.6B-JA-Anime-Galgame",
+            repo_id,
+            download=True,
+        )
+        == str(bundled_model.resolve())
+    )
+
+    status = model_paths.model_spec_status(
+        "models/jaykwok-Qwen3-ASR-0.6B-JA-Anime-Galgame",
+        repo_id,
+    )
+    assert status["present"] is True
+    assert status["path"] == str(bundled_model.resolve())
+
+
 def test_resolve_model_spec_downloads_to_models_repo_name(monkeypatch, tmp_path):
     monkeypatch.setattr(model_paths, "PROJECT_ROOT", tmp_path)
     monkeypatch.setattr(model_paths, "MODELS_ROOT", tmp_path / "models")
