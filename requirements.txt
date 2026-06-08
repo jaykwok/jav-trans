@@ -16,5 +16,3 @@ pywebview
 python-multipart
 httpx
 xxhash
-torchcodec
-pyinstaller
