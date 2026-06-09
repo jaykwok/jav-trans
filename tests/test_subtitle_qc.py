@@ -160,3 +160,39 @@ def test_subtitle_overlap_stats_warn_when_present():
     assert report["subtitle_overlap_examples"][0]["overlap_s"] == pytest.approx(0.2)
     assert any("subtitle_overlap_count" in warning for warning in report["warnings"])
 
+
+def test_subtitle_density_audit_marks_over_4cps_without_warning():
+    report = compute_quality_report(
+        [
+            _seg("あいうえお", "", 0.0, 1.0),
+            _seg("はい", "", 1.2, 2.2),
+            _seg("ありがとうございます", "", 2.4, 3.4),
+        ],
+        10.0,
+        [],
+        0,
+        3,
+    )
+
+    assert report["subtitle_density_cps_threshold"] == pytest.approx(4.0)
+    assert report["subtitle_density_over_4cps_count"] == 2
+    assert report["subtitle_density_max_ja_cps"] == pytest.approx(10.0)
+    assert report["subtitle_density_p90_ja_cps"] > 4.0
+    assert report["subtitle_density_window_10s_max_cue_count"] == 3
+    assert report["subtitle_density_window_10s_min_gap_s"] == pytest.approx(0.2)
+    assert report["subtitle_density_review_examples"][0]["ja_cps"] == pytest.approx(10.0)
+    assert not any("subtitle_density" in warning for warning in report["warnings"])
+
+
+def test_subtitle_density_below_4cps_not_marked():
+    report = compute_quality_report(
+        [_seg("あいう", "", 0.0, 1.0), _seg("はい", "", 2.0, 3.0)],
+        10.0,
+        [],
+        0,
+        2,
+    )
+
+    assert report["subtitle_density_over_4cps_count"] == 0
+    assert report["subtitle_density_max_ja_cps"] == pytest.approx(3.0)
+

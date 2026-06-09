@@ -55,7 +55,7 @@ DEFAULT_SETTINGS: dict[str, str] = {
     "ALIGNER_MODEL_ID": "Qwen/Qwen3-ForcedAligner-0.6B",
     # Optional local forced-aligner directory override. Empty uses models/<namespace>-<repo>.
     "ALIGNER_MODEL_PATH": "",
-    # Model precision; bfloat16 is the current 8GB VRAM-friendly default.
+    # Model precision; bfloat16 is the current CUDA-friendly default.
     "ASR_DTYPE": "bfloat16",
     # Attention implementation. sdpa uses PyTorch scaled-dot-product attention.
     "ASR_ATTENTION": "sdpa",
@@ -73,17 +73,17 @@ DEFAULT_SETTINGS: dict[str, str] = {
     "ASR_HEAD_CONTEXT_MAX_START_S": "16",
 
     # --- Batch Size & Limits ---
-    # ASR inference batch size. auto resolves by ASR_BACKEND repo id:
-    # 0.6B -> 48, 1.7B -> 12. Set a number to override.
+    # ASR inference batch size. auto resolves by ASR_BACKEND repo id.
+    # Defaults target 6GB-class NVIDIA GPUs; local 8GB runs can raise these.
     "ASR_BATCH_SIZE": "auto",
     "ASR_BATCH_SIZE_BY_REPO": (
-        "jaykwok/Qwen3-ASR-0.6B-JA-Anime-Galgame=48,"
-        "jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame=12"
+        "jaykwok/Qwen3-ASR-0.6B-JA-Anime-Galgame=64,"
+        "jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame=32"
     ),
     # Forced-alignment outer batch size.
-    "ALIGNER_BATCH_SIZE": "48",
+    "ALIGNER_BATCH_SIZE": "64",
     # Real Qwen forced-aligner batch size for chunk alignment.
-    "ALIGN_LONG_CHUNK_BATCH_SIZE": "48",
+    "ALIGN_LONG_CHUNK_BATCH_SIZE": "64",
     # Max generated tokens per ASR chunk.
     "ASR_MAX_NEW_TOKENS": "128",
     # Subprocess transcription token cap; usually matches ASR_MAX_NEW_TOKENS.
@@ -122,27 +122,18 @@ DEFAULT_SETTINGS: dict[str, str] = {
     "BOUNDARY_FRAME_SEQUENCE_INCLUDE_MFCC": "1",
     # Speech core is the subtitle/fallback timing window. Keep it short for JAV dialogue.
     "BOUNDARY_PLANNER_MAX_CORE_CHUNK_S": "5.0",
-    # Padded ASR input may be longer to preserve recognition context, but context is learned.
-    "BOUNDARY_PLANNER_MAX_PADDED_CHUNK_S": "6.5",
     "BOUNDARY_PLANNER_TARGET_CHUNK_S": "3.0",
     "BOUNDARY_PLANNER_MIN_CHUNK_S": "0.4",
-    "BOUNDARY_PLANNER_START_WEIGHT": "1.5",
-    "BOUNDARY_CONTEXT_MAX_PADDING_S": "1.5",
-    "BOUNDARY_CONTEXT_MAX_SPEECH_OVERLAP_S": "0.25",
     "BOUNDARY_PLANNER_MAX_SPLITS_PER_SEGMENT": "16",
     "BOUNDARY_PLANNER_SEQUENCE_BATCH_SIZE": "256",
-    "BOUNDARY_DP_CHUNK_BASE_COST": "0.04",
-    "BOUNDARY_DP_OVER_TARGET_WEIGHT": "0.30",
-    "BOUNDARY_DP_FAR_OVER_TARGET_WEIGHT": "1.50",
-    "BOUNDARY_DP_UNDER_MIN_WEIGHT": "0.20",
-    "BOUNDARY_DP_LONG_GAP_WEIGHT": "0.35",
-    "BOUNDARY_DP_SPLIT_MERGE_WEIGHT": "0.35",
     # 1 stores SpeechBoundary frame scores in the SpeechBoundary result. Boundary Refiner enables
     # this at runtime even when this explicit diagnostics flag stays off.
     "SPEECH_BOUNDARY_JA_EXPORT_FRAME_SCORES": "0",
+    # Frame-score mask dilation before raw SpeechBoundary segment extraction. This is not ASR padding.
+    "SPEECH_BOUNDARY_JA_FRAME_DILATION_S": "0.2",
     # 1 caches SpeechBoundary frame score -> Boundary Planner outputs separately from ASR generation settings.
     "BOUNDARY_CACHE_ENABLED": "1",
-    # Persistent boundary cache directory. Versioned as boundary-cache v2.
+    # Persistent boundary cache directory. Versioned as boundary-cache v4.
     "BOUNDARY_CACHE_DIR": "./tmp/cache/boundary",
 
     # --- Alignment Retry & Refine ---
@@ -155,15 +146,9 @@ DEFAULT_SETTINGS: dict[str, str] = {
     # Fallback chunk size when alignment retries step down.
     "ALIGNMENT_STEP_DOWN_CHUNK": "6.0",
 
-    # --- ASR Post-Processing ---
-    # Max gap, in seconds, for merging adjacent ASR fragments.
-    "ASR_FRAGMENT_MERGE_MAX_GAP": "1.0",
-    # Max combined text length after fragment merging.
-    "ASR_FRAGMENT_MERGE_MAX_CHARS": "72",
-    # Max combined duration after fragment merging.
-    "ASR_FRAGMENT_MERGE_MAX_DURATION": "12.5",
-    # Hard cap for merging ASR fragments into one subtitle candidate.
-    "ASR_MERGE_HARD_MAX_DURATION": "9.0",
+    # --- ASR Segmentation ---
+    # Hard cap for grouping aligned words into one subtitle candidate.
+    "ASR_SEGMENT_HARD_MAX_DURATION": "9.0",
 
     # --- ASR QC / Review Signals ---
     # 1 enables ASR text quality checks before translation.

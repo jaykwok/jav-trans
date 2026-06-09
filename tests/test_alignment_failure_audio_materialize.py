@@ -39,7 +39,7 @@ def test_materialize_alignment_failure_audio_slices_source_wav(tmp_path):
     )
     output_dir = tmp_path / "out"
 
-    assert main(["--manifest", str(manifest), "--output-dir", str(output_dir), "--pad-s", "0.1"]) == 0
+    assert main(["--manifest", str(manifest), "--output-dir", str(output_dir), "--context-margin-s", "0.1"]) == 0
 
     rows = [
         json.loads(line)

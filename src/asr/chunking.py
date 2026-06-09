@@ -93,32 +93,3 @@ def _extract_wav_chunks(
 
 def _chunk_duration(chunk: dict) -> float:
     return max(0.0, float(chunk.get("end", 0.0)) - float(chunk.get("start", 0.0)))
-
-
-def _chunk_original_boundaries(chunk: dict) -> list[dict]:
-    existing = chunk.get("merged_from")
-    if isinstance(existing, list) and existing:
-        boundaries = []
-        for item in existing:
-            if not isinstance(item, dict):
-                continue
-            try:
-                boundaries.append(
-                    {
-                        "index": int(item.get("index", len(boundaries))),
-                        "start": float(item["start"]),
-                        "end": float(item["end"]),
-                    }
-                )
-            except (KeyError, TypeError, ValueError):
-                continue
-        if boundaries:
-            return boundaries
-
-    return [
-        {
-            "index": int(chunk.get("index", 0)),
-            "start": float(chunk.get("start", 0.0)),
-            "end": float(chunk.get("end", 0.0)),
-        }
-    ]

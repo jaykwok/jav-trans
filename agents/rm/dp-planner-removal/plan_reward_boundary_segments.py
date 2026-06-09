@@ -20,13 +20,13 @@ for path in (SRC_ROOT, TOOLS_ROOT):
 from tools.boundary.ja.benchmark_boundary_predictions import (  # noqa: E402
     BoundaryRow,
     best_segment_match,
+    filter_segments,
     frames_to_segments,
     gap_segments,
     intersection_duration,
     load_boundary_rows,
     load_prediction_rows,
     max_gap_overlap_s,
-    merge_segments,
     overlap_s,
     summarize_errors,
     summarize_values,
@@ -110,23 +110,21 @@ def baseline_segments_from_prediction(
     boundary: BoundaryRow,
     prediction: Mapping[str, Any],
     speech_threshold: float,
-    pad_s: float,
-    merge_gap_s: float,
+    frame_dilation_s: float,
     min_segment_s: float,
 ) -> list[SpeechSegment]:
     speech_probabilities = frame_probabilities(prediction, "speech")
     if not speech_probabilities:
         raw = prediction.get("speech_frames") or prediction.get("predictions") or []
         speech_probabilities = [float(value) for value in raw]
-    pad = max(0, int(round(pad_s / boundary.frame_hop_s)))
+    dilation_frames = max(0, int(round(frame_dilation_s / boundary.frame_hop_s)))
     frames = pad_frames(
         threshold_frames(speech_probabilities, threshold=speech_threshold),
-        pad_frames=pad,
+        pad_frames=dilation_frames,
     )
-    return merge_segments(
+    return filter_segments(
         frames_to_segments(frames, frame_hop_s=boundary.frame_hop_s, duration_s=boundary.duration_s),
         duration_s=boundary.duration_s,
-        merge_gap_s=merge_gap_s,
         min_segment_s=min_segment_s,
     )
 
@@ -600,8 +598,7 @@ def plan_reward_boundary_segments(
     cut_threshold: float,
     endpoint_threshold: float,
     valley_threshold: float,
-    pad_s: float,
-    merge_gap_s: float,
+    frame_dilation_s: float,
     min_segment_s: float,
     min_overlap_ratio: float,
     cut_min_gap_s: float,
@@ -633,8 +630,7 @@ def plan_reward_boundary_segments(
             boundary=boundary,
             prediction=prediction,
             speech_threshold=speech_threshold,
-            pad_s=pad_s,
-            merge_gap_s=merge_gap_s,
+            frame_dilation_s=frame_dilation_s,
             min_segment_s=min_segment_s,
         )
         baseline_by_audio[audio_id] = baseline
@@ -732,8 +728,7 @@ def plan_reward_boundary_segments(
             "cut_threshold": cut_threshold,
             "endpoint_threshold": endpoint_threshold,
             "valley_threshold": valley_threshold,
-            "pad_s": pad_s,
-            "merge_gap_s": merge_gap_s,
+            "frame_dilation_s": frame_dilation_s,
             "min_segment_s": min_segment_s,
             "min_overlap_ratio": min_overlap_ratio,
             "cut_min_gap_s": cut_min_gap_s,
@@ -794,8 +789,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--cut-threshold", type=float, default=0.96)
     parser.add_argument("--endpoint-threshold", type=float, default=0.50)
     parser.add_argument("--valley-threshold", type=float, default=0.20)
-    parser.add_argument("--pad-s", type=float, default=0.2)
-    parser.add_argument("--merge-gap-s", type=float, default=0.15)
+    parser.add_argument("--frame-dilation-s", type=float, default=0.2)
     parser.add_argument("--min-segment-s", type=float, default=0.05)
     parser.add_argument("--min-overlap-ratio", type=float, default=0.1)
     parser.add_argument("--cut-min-gap-s", type=float, default=0.5)
@@ -824,8 +818,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         if not 0.0 <= value <= 1.0:
             parser.error(f"--{name.replace('_', '-')} must be in [0, 1]")
     for name in (
-        "pad_s",
-        "merge_gap_s",
+        "frame_dilation_s",
         "min_segment_s",
         "min_overlap_ratio",
         "cut_min_gap_s",
@@ -860,8 +853,7 @@ def main(argv: list[str] | None = None) -> int:
         cut_threshold=args.cut_threshold,
         endpoint_threshold=args.endpoint_threshold,
         valley_threshold=args.valley_threshold,
-        pad_s=args.pad_s,
-        merge_gap_s=args.merge_gap_s,
+        frame_dilation_s=args.frame_dilation_s,
         min_segment_s=args.min_segment_s,
         min_overlap_ratio=args.min_overlap_ratio,
         cut_min_gap_s=args.cut_min_gap_s,

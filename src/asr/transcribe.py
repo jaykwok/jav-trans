@@ -10,6 +10,7 @@ from typing import Callable
 
 from asr.backends.base import BaseAsrBackend
 from asr.backends.registry import current_asr_worker_mode, _is_subprocess_backend
+from asr.alignment_quality import classify_alignment_quality
 from asr.checkpoint import (
     _build_quarantined_text_result,
     _checkpointable_text_results,
@@ -50,29 +51,6 @@ _ALIGNMENT_MAX_CPS = float(os.getenv("ALIGNMENT_MAX_CPS", "50.0"))
 _ALIGNMENT_RETRY_SKIP_MAX_TEXT_LEN = max(
     1,
     int(os.getenv("ALIGNMENT_RETRY_SKIP_MAX_TEXT_LEN", "10")),
-)
-_ALIGNMENT_SENTINEL_ISLAND_MIN_S = float(
-    os.getenv("ALIGNMENT_SENTINEL_ISLAND_MIN_S", "0.25")
-)
-_ALIGNMENT_SENTINEL_ISLAND_PAD_FRAMES = max(
-    0,
-    int(os.getenv("ALIGNMENT_SENTINEL_ISLAND_PAD_FRAMES", "6")),
-)
-_ALIGNMENT_SENTINEL_ISLAND_MERGE_GAP_FRAMES = max(
-    0,
-    int(os.getenv("ALIGNMENT_SENTINEL_ISLAND_MERGE_GAP_FRAMES", "6")),
-)
-_ALIGNMENT_SENTINEL_ISLAND_MAX_SPLITS = max(
-    1,
-    int(os.getenv("ALIGNMENT_SENTINEL_ISLAND_MAX_SPLITS", "8")),
-)
-_ASR_FRAGMENT_MERGE_MAX_GAP_S = float(os.getenv("ASR_FRAGMENT_MERGE_MAX_GAP", "1.0"))
-_ASR_FRAGMENT_MERGE_MAX_CHARS = max(
-    1,
-    int(os.getenv("ASR_FRAGMENT_MERGE_MAX_CHARS", "72")),
-)
-_ASR_FRAGMENT_MERGE_MAX_DURATION_S = float(
-    os.getenv("ASR_FRAGMENT_MERGE_MAX_DURATION", "12.5")
 )
 _ASR_INVALID_SEGMENT_DURATION_S = float(
     os.getenv("ASR_INVALID_SEGMENT_DURATION", "0.1")
@@ -189,25 +167,8 @@ def _alignment_fallback_window_from_chunk(
     *,
     duration: float,
 ) -> tuple[float, float, str]:
-    full_start = 0.0
-    full_end = max(0.0, float(duration))
-    try:
-        left_padding_s = max(0.0, float(chunk.get("speech_left_padding_s") or 0.0))
-    except (TypeError, ValueError):
-        left_padding_s = 0.0
-    try:
-        right_padding_s = max(0.0, float(chunk.get("speech_right_padding_s") or 0.0))
-    except (TypeError, ValueError):
-        right_padding_s = 0.0
-
-    if left_padding_s <= 0.0 and right_padding_s <= 0.0:
-        return full_start, full_end, "chunk"
-
-    core_start = min(full_end, left_padding_s)
-    core_end = max(core_start, full_end - right_padding_s)
-    if core_end - core_start < 0.05:
-        return full_start, full_end, "chunk"
-    return core_start, core_end, "speech_core"
+    del chunk
+    return 0.0, max(0.0, float(duration)), "chunk"
 
 
 def _with_alignment_fallback_window(chunk: dict, text_result: dict) -> dict:
@@ -244,64 +205,6 @@ def _append_fallback_window_log(chunk_log: list[str], source: str) -> None:
         chunk_log.append("Alignment 回退窗口: speech_core")
 
 
-def _env_bool(name: str, default: str = "0") -> bool:
-    return os.getenv(name, default).strip().lower() in {"1", "true", "yes", "on"}
-
-
-def _sentinel_island_split_enabled() -> bool:
-    return _env_bool("ALIGNMENT_SENTINEL_ISLAND_SPLIT", "0")
-
-
-def _alignment_pack_frame_hop_s() -> float:
-    try:
-        value = float(os.getenv("BOUNDARY_FEATURE_FRAME_HOP_S", "0.02"))
-    except (TypeError, ValueError):
-        value = 0.02
-    return value if value > 0 else 0.02
-
-
-def _alignment_sentinel_island_pad_s() -> float:
-    return _ALIGNMENT_SENTINEL_ISLAND_PAD_FRAMES * _alignment_pack_frame_hop_s()
-
-
-def _alignment_sentinel_island_merge_gap_s() -> float:
-    return _ALIGNMENT_SENTINEL_ISLAND_MERGE_GAP_FRAMES * _alignment_pack_frame_hop_s()
-
-
-def _clamp_alignment_islands(
-    spans: list[tuple[float, float]],
-    *,
-    duration: float,
-    pad_s: float,
-    merge_gap_s: float,
-    min_s: float,
-) -> list[tuple[float, float]]:
-    prepared: list[tuple[float, float]] = []
-    for raw_start, raw_end in spans:
-        try:
-            start = float(raw_start)
-            end = float(raw_end)
-        except (TypeError, ValueError):
-            continue
-        start = max(0.0, min(duration, start - pad_s))
-        end = max(start, min(duration, end + pad_s))
-        if end - start >= min_s:
-            prepared.append((start, end))
-
-    if not prepared:
-        return []
-    prepared.sort(key=lambda item: (item[0], item[1]))
-
-    merged: list[tuple[float, float]] = []
-    for start, end in prepared:
-        if not merged or start - merged[-1][1] > merge_gap_s:
-            merged.append((start, end))
-            continue
-        prev_start, prev_end = merged[-1]
-        merged[-1] = (prev_start, max(prev_end, end))
-    return merged
-
-
 def _looks_like_alignment_failure(
     words: list[dict],
     scene_duration_sec: float | None = None,
@@ -330,6 +233,126 @@ def _alignment_failure_reasons(
         max_coverage_ratio=_ALIGNMENT_MAX_COVERAGE_RATIO,
         max_cps=_ALIGNMENT_MAX_CPS,
     )
+
+
+_ALIGNMENT_MODE_RE = re.compile(r"Alignment\s+模式:\s*(\S+)")
+_ALIGNMENT_WORD_COUNT_RE = re.compile(r"Alignment\s+词数:\s*(\d+)")
+
+
+def _word_timing_stats(words: list[dict]) -> dict:
+    if not words:
+        return {
+            "word_count": 0,
+            "zero_or_negative_count": 0,
+            "tiny_span_count": 0,
+            "min_word_duration_s": None,
+            "max_word_duration_s": None,
+        }
+    durations: list[float] = []
+    zero_or_negative = 0
+    tiny = 0
+    for word in words:
+        try:
+            start = float(word.get("start", 0.0))
+            end = float(word.get("end", 0.0))
+        except (TypeError, ValueError):
+            continue
+        duration = end - start
+        durations.append(duration)
+        if duration <= 0.0:
+            zero_or_negative += 1
+        if duration <= 0.08:
+            tiny += 1
+    if not durations:
+        return {
+            "word_count": len(words),
+            "zero_or_negative_count": 0,
+            "tiny_span_count": 0,
+            "min_word_duration_s": None,
+            "max_word_duration_s": None,
+        }
+    return {
+        "word_count": len(words),
+        "zero_or_negative_count": zero_or_negative,
+        "tiny_span_count": tiny,
+        "min_word_duration_s": round(min(durations), 4),
+        "max_word_duration_s": round(max(durations), 4),
+    }
+
+
+def _chunk_log_alignment_metadata(chunk_log: list[str]) -> dict:
+    metadata = {
+        "alignment_mode": "",
+        "alignment_word_count": None,
+        "align_error": "",
+        "sentinel_lines": [],
+    }
+    for line in chunk_log:
+        line = str(line)
+        if mode_match := _ALIGNMENT_MODE_RE.search(line):
+            metadata["alignment_mode"] = mode_match.group(1)
+        if count_match := _ALIGNMENT_WORD_COUNT_RE.search(line):
+            metadata["alignment_word_count"] = int(count_match.group(1))
+        if "Alignment 异常:" in line:
+            metadata["align_error"] = line.split("Alignment 异常:", 1)[1].strip()
+        if "哨兵" in line:
+            metadata["sentinel_lines"].append(line)
+    return metadata
+
+
+def _alignment_outcome_for_chunk(
+    *,
+    chunk: dict,
+    chunk_result: dict,
+    chunk_words: list[dict],
+    chunk_log: list[str],
+    qc_item: dict | None = None,
+    review_item: dict | None = None,
+) -> dict:
+    text = str(chunk_result.get("text") or chunk_result.get("raw_text") or "").strip()
+    raw_mode = str(chunk_result.get("alignment_mode") or "").strip()
+    log_meta = _chunk_log_alignment_metadata(chunk_log)
+    alignment_mode = str(log_meta.get("alignment_mode") or raw_mode).strip()
+    try:
+        duration = float(chunk_result.get("duration"))
+    except (TypeError, ValueError):
+        duration = max(0.0, float(chunk.get("end", 0.0)) - float(chunk.get("start", 0.0)))
+    word_stats = _word_timing_stats(chunk_words)
+    word_failure_reasons = _alignment_failure_reasons(chunk_words, scene_duration_sec=duration)
+    compact_text = _strip_punctuation(_clean_segment_text(text))
+    nonlexical_text = bool(text and not compact_text)
+    quality = classify_alignment_quality(
+        text=text,
+        duration_s=duration,
+        align_text_empty=bool(text and not compact_text),
+        nonlexical_text=nonlexical_text,
+        asr_review_uncertain=bool(review_item),
+        asr_qc_severity=str((qc_item or {}).get("severity") or ""),
+        alignment_mode=alignment_mode,
+        align_error=str(log_meta.get("align_error") or ""),
+        sentinel_lines=list(log_meta.get("sentinel_lines") or []),
+        aligned_segment_count=1 if chunk_words else 0,
+        word_stats=word_stats,
+        word_failure_reasons=word_failure_reasons,
+    )
+    return {
+        "alignment_mode": alignment_mode,
+        "alignment_quality": quality["alignment_quality"],
+        "fallback_type": quality["fallback_type"],
+        "fallback_subtype": quality["fallback_subtype"],
+        "alignment_quality_reasons": quality["alignment_quality_reasons"],
+        "alignment_word_count": log_meta.get("alignment_word_count"),
+        "align_error": str(log_meta.get("align_error") or ""),
+        "sentinel_lines": list(log_meta.get("sentinel_lines") or []),
+        "word_timing": word_stats,
+        "word_timing_failure_reasons": word_failure_reasons,
+        "forced_success": quality["alignment_quality"] == "forced",
+        "fallback_active": quality["fallback_type"] != "none",
+        "asr_qc_severity": str((qc_item or {}).get("severity") or ""),
+        "asr_qc_reasons": list((qc_item or {}).get("reasons") or []),
+        "asr_review_uncertain": bool(review_item),
+        "review_reasons": list((review_item or {}).get("reasons") or []),
+    }
 
 
 def _split_span_evenly(
@@ -842,12 +865,16 @@ def _align_TRANSCRIPTION_results(
 
 
 def _build_transcript_chunks(
-    chunks: list[dict], text_results: list[dict]
+    chunks: list[dict],
+    text_results: list[dict],
+    alignment_outcomes: dict[int, dict] | None = None,
 ) -> list[dict]:
     transcript_chunks: list[dict] = []
+    alignment_outcomes = alignment_outcomes or {}
     for chunk, text_result in zip(chunks, text_results):
+        chunk_index = int(chunk["index"])
         item = {
-            "index": chunk["index"],
+            "index": chunk_index,
             "start": float(chunk["start"]),
             "end": float(chunk["end"]),
             "duration": float(text_result.get("duration", 0.0)),
@@ -866,8 +893,33 @@ def _build_transcript_chunks(
             item["alignment_fallback_abs_start_s"] = chunk_start + fallback_start
             item["alignment_fallback_abs_end_s"] = chunk_start + fallback_end
             item["alignment_fallback_source"] = text_result.get("alignment_fallback_source", "chunk")
-        if chunk.get("merged_from"):
-            item["merged_from"] = list(chunk.get("merged_from") or [])
+        outcome = alignment_outcomes.get(chunk_index)
+        if outcome:
+            item.update(
+                {
+                    key: value
+                    for key, value in outcome.items()
+                    if key
+                    in {
+                        "alignment_mode",
+                        "alignment_quality",
+                        "fallback_type",
+                        "fallback_subtype",
+                        "alignment_quality_reasons",
+                        "alignment_word_count",
+                        "align_error",
+                        "sentinel_lines",
+                        "word_timing",
+                        "word_timing_failure_reasons",
+                        "forced_success",
+                        "fallback_active",
+                        "asr_qc_severity",
+                        "asr_qc_reasons",
+                        "asr_review_uncertain",
+                        "review_reasons",
+                    }
+                }
+            )
         transcript_chunks.append(item)
     return transcript_chunks
 
@@ -998,9 +1050,6 @@ def _finalize_aligned_chunk_without_asr_retry(
     chunk: dict,
     chunk_result: dict,
     chunk_log: list[str],
-    backend: BaseAsrBackend | None = None,
-    source_audio_path: str | None = None,
-    on_stage: Callable[[str], None] | None = None,
 ) -> tuple[list[dict], list[str]]:
     chunk_words = list(chunk_result.get("words", []))
     text = chunk_result.get("text", "")
@@ -1010,18 +1059,6 @@ def _finalize_aligned_chunk_without_asr_retry(
 
     if not _needs_alignment_fallback(chunk_words, text, scene_duration_sec=duration):
         return chunk_words, chunk_log
-
-    if backend is not None and source_audio_path:
-        split_words, split_log = _split_alignment_sentinel_with_speech_islands(
-            backend,
-            source_audio_path,
-            chunk,
-            chunk_result,
-            on_stage=on_stage,
-        )
-        chunk_log.extend(split_log)
-        if split_words:
-            return split_words, chunk_log
 
     chunk_log.append(
         "Alignment 哨兵触发: 时间轴异常，不重新调用 ASR，改用 VAD/比例回退"
@@ -1121,276 +1158,6 @@ def _refine_chunk_with_subchunks(
     return refine_words, refine_log
 
 
-def _split_alignment_sentinel_with_speech_islands(
-    backend: BaseAsrBackend,
-    source_audio_path: str,
-    chunk: dict,
-    chunk_result: dict,
-    *,
-    retry_depth: int = 0,
-    on_stage: Callable[[str], None] | None = None,
-) -> tuple[list[dict], list[str]]:
-    plan = _build_alignment_sentinel_island_plan(
-        source_audio_path,
-        chunk,
-        chunk_result,
-        retry_depth=retry_depth,
-    )
-    if plan is None:
-        return [], []
-    if not plan["island_spans"]:
-        return [], list(plan["log"])
-
-    source_path = str(plan["source_path"])
-    chunk_start = float(plan["chunk_start"])
-    duration = float(plan["duration"])
-    split_log = list(plan["log"])
-    split_dir, split_infos = _extract_wav_chunks(source_path, list(plan["island_spans"]))
-    try:
-        backend.unload_forced_aligner(on_stage=on_stage)
-        prepared_results, _stage_timings = _prepare_asr_chunk_results(
-            backend,
-            split_infos,
-            "Alignment speech-island split",
-            on_stage=on_stage,
-        )
-        backend.unload_forced_aligner(on_stage=on_stage)
-        return _collect_alignment_island_split_words(
-            split_infos,
-            prepared_results,
-            split_log,
-            parent_start=chunk_start,
-            parent_duration=duration,
-        )
-    finally:
-        backend.unload_forced_aligner(on_stage=on_stage)
-        if split_dir.exists() and not _KEEP_ASR_CHUNKS:
-            _delete_path_for_cleanup(split_dir)
-
-
-def _build_alignment_sentinel_island_plan(
-    source_audio_path: str | None,
-    chunk: dict,
-    chunk_result: dict,
-    *,
-    retry_depth: int = 0,
-) -> dict | None:
-    if not _sentinel_island_split_enabled() or retry_depth > 0:
-        return None
-
-    alignment_mode = str(chunk_result.get("alignment_mode") or "").strip()
-    if alignment_mode in {"empty", "nonlexical", "align_text_empty"}:
-        return None
-
-    text = str(chunk_result.get("text") or chunk_result.get("raw_text") or "")
-    if not _strip_punctuation(_clean_segment_text(text)):
-        return None
-
-    try:
-        chunk_start = float(chunk["start"])
-        chunk_end = float(chunk["end"])
-        duration = max(0.0, chunk_end - chunk_start)
-    except (KeyError, TypeError, ValueError):
-        return None
-
-    if duration <= 0:
-        return None
-
-    source_path = str(source_audio_path or chunk.get("source_audio_path") or "")
-    if not source_path or not Path(source_path).exists():
-        return {
-            "source_path": source_path,
-            "chunk_start": chunk_start,
-            "duration": duration,
-            "island_spans": [],
-            "log": ["Alignment speech-island split 跳过: source_audio_path missing"],
-        }
-
-    return {
-        "source_path": source_path,
-        "chunk_start": chunk_start,
-        "duration": duration,
-        "island_spans": [],
-        "log": ["Alignment speech-island split 跳过: local fallback VAD has been removed"],
-    }
-
-
-def _collect_alignment_island_split_words(
-    split_infos: list[dict],
-    prepared_results: list[tuple[dict, list[str]]],
-    split_log: list[str],
-    *,
-    parent_start: float,
-    parent_duration: float,
-) -> tuple[list[dict], list[str]]:
-    split_words: list[dict] = []
-    forced_chunks = 0
-    empty_chunks = 0
-    failed_chunks = 0
-    for split_idx, split_chunk, (split_result, split_result_log) in zip(
-        range(1, len(split_infos) + 1),
-        split_infos,
-        prepared_results,
-    ):
-        split_mode = str(split_result.get("alignment_mode", "")).strip()
-        split_text = str(split_result.get("text") or split_result.get("raw_text") or "")
-        words = list(split_result.get("words") or [])
-        if not split_text.strip():
-            empty_chunks += 1
-            continue
-        if split_mode != "forced_aligner":
-            failed_chunks += 1
-            split_log.extend(
-                f"speech-island {split_idx}: {line}"
-                for line in split_result_log
-                if line.startswith(("Alignment 模式", "Alignment 异常", "Alignment VAD 回退"))
-            )
-            continue
-        if not words or _looks_like_alignment_failure(words):
-            failed_chunks += 1
-            reasons = _alignment_failure_reasons(words)
-            split_log.append(
-                "Alignment speech-island split 子片段异常: "
-                f"idx={split_idx} reasons={','.join(reasons) or 'empty_or_unknown'}"
-            )
-            continue
-
-        forced_chunks += 1
-        offset = float(split_chunk["start"]) - parent_start
-        for word in words:
-            try:
-                word_start = float(word["start"]) + offset
-                word_end = float(word["end"]) + offset
-            except (KeyError, TypeError, ValueError):
-                continue
-            word_start = max(0.0, min(parent_duration, word_start))
-            word_end = max(word_start, min(parent_duration, word_end))
-            split_words.append(
-                {
-                    "start": word_start,
-                    "end": word_end,
-                    "word": word.get("word", ""),
-                }
-            )
-
-    split_words.sort(key=lambda item: (item["start"], item["end"]))
-    if split_words and not _looks_like_alignment_failure(split_words):
-        split_log.append(
-            "Alignment speech-island split 成功: "
-            f"islands={len(split_infos)} forced_chunks={forced_chunks} "
-            f"empty_chunks={empty_chunks} failed_chunks={failed_chunks} words={len(split_words)}"
-        )
-        return split_words, split_log
-
-    split_log.append(
-        "Alignment speech-island split 失败: "
-        f"forced_chunks={forced_chunks} empty_chunks={empty_chunks} "
-        f"failed_chunks={failed_chunks} words={len(split_words)}"
-    )
-    return [], split_log
-
-
-def _split_alignment_sentinels_with_speech_islands_batch(
-    backend: BaseAsrBackend,
-    source_audio_path: str,
-    chunks: list[dict],
-    prepared_results: list[tuple[dict, list[str]]],
-    *,
-    on_stage: Callable[[str], None] | None = None,
-) -> tuple[dict[int, list[dict]], dict[int, list[str]], bool]:
-    if not _sentinel_island_split_enabled():
-        return {}, {}, False
-
-    words_by_index: dict[int, list[dict]] = {}
-    logs_by_index: dict[int, list[str]] = {}
-    split_dirs: list[Path] = []
-    split_infos: list[dict] = []
-    parent_groups: dict[int, list[dict]] = {}
-    parent_meta: dict[int, tuple[float, float]] = {}
-
-    for chunk, (chunk_result, _chunk_log) in zip(chunks, prepared_results):
-        try:
-            chunk_index = int(chunk["index"])
-            chunk_start = float(chunk["start"])
-            chunk_end = float(chunk["end"])
-        except (KeyError, TypeError, ValueError):
-            continue
-        duration = max(0.0, chunk_end - chunk_start)
-        if not _needs_alignment_fallback(
-            list(chunk_result.get("words", [])),
-            str(chunk_result.get("text") or ""),
-            scene_duration_sec=duration,
-        ):
-            continue
-
-        plan = _build_alignment_sentinel_island_plan(
-            source_audio_path,
-            chunk,
-            chunk_result,
-        )
-        if plan is None:
-            continue
-        logs_by_index.setdefault(chunk_index, []).extend(list(plan["log"]))
-        if not plan["island_spans"]:
-            continue
-
-        split_dir, parent_split_infos = _extract_wav_chunks(
-            str(plan["source_path"]),
-            list(plan["island_spans"]),
-        )
-        split_dirs.append(split_dir)
-        parent_meta[chunk_index] = (float(plan["chunk_start"]), float(plan["duration"]))
-        for split_info in parent_split_infos:
-            copied_info = dict(split_info)
-            copied_info["index"] = len(split_infos)
-            copied_info["_parent_chunk_index"] = chunk_index
-            parent_groups.setdefault(chunk_index, []).append(copied_info)
-            split_infos.append(copied_info)
-
-    if not split_infos:
-        return words_by_index, logs_by_index, True
-
-    try:
-        backend.unload_forced_aligner(on_stage=on_stage)
-        prepared_split_results, _stage_timings = _prepare_asr_chunk_results(
-            backend,
-            split_infos,
-            "Alignment speech-island split batch",
-            on_stage=on_stage,
-        )
-        backend.unload_forced_aligner(on_stage=on_stage)
-
-        results_by_split_index = {
-            int(split_info["index"]): prepared
-            for split_info, prepared in zip(split_infos, prepared_split_results)
-        }
-        for chunk_index, group_infos in parent_groups.items():
-            parent_start, parent_duration = parent_meta[chunk_index]
-            group_results = [
-                results_by_split_index[int(split_info["index"])]
-                for split_info in group_infos
-                if int(split_info["index"]) in results_by_split_index
-            ]
-            split_words, split_log = _collect_alignment_island_split_words(
-                group_infos,
-                group_results,
-                list(logs_by_index.get(chunk_index, [])),
-                parent_start=parent_start,
-                parent_duration=parent_duration,
-            )
-            logs_by_index[chunk_index] = split_log
-            if split_words:
-                words_by_index[chunk_index] = split_words
-    finally:
-        backend.unload_forced_aligner(on_stage=on_stage)
-        if not _KEEP_ASR_CHUNKS:
-            for split_dir in split_dirs:
-                if split_dir.exists():
-                    _delete_path_for_cleanup(split_dir)
-
-    return words_by_index, logs_by_index, True
-
-
 def _transcribe_asr_chunk_with_retry(
     backend: LocalAsrBackend,
     source_audio_path: str,
@@ -1437,17 +1204,6 @@ def _transcribe_asr_chunk_with_retry(
         return chunk_words, chunk_log
 
     if chunk_mode == "forced_aligner":
-        split_words, split_log = _split_alignment_sentinel_with_speech_islands(
-            backend,
-            source_audio_path,
-            chunk,
-            chunk_result,
-            retry_depth=retry_depth,
-            on_stage=on_stage,
-        )
-        chunk_log.extend(split_log)
-        if split_words:
-            return split_words, chunk_log
         chunk_log.append("Alignment 哨兵触发: forced 模式保留原文，不再对子片段重转写")
         return chunk_words, chunk_log
 
@@ -1611,83 +1367,8 @@ def _postprocess_segments(segments: list[dict]) -> list[dict]:
         )
 
     cleaned_segments.sort(key=lambda item: (item["start"], item["end"]))
-    merged_segments = _merge_fragment_segments(cleaned_segments)
-    split_segments = _split_long_postprocessed_segments(merged_segments)
+    split_segments = _split_long_postprocessed_segments(cleaned_segments)
     return _repair_postprocessed_segment_windows(split_segments)
-
-
-def _ends_sentence(text: str) -> bool:
-    return bool(_SENTENCE_TERMINAL_RE.search((text or "").strip()))
-
-
-def _same_source_chunk(current: dict, following: dict) -> bool:
-    current_chunk = current.get("source_chunk_index")
-    following_chunk = following.get("source_chunk_index")
-    return (
-        current_chunk is not None
-        and following_chunk is not None
-        and current_chunk == following_chunk
-    )
-
-
-def _should_merge_fragment(current: dict, following: dict) -> bool:
-    current_text = str(current.get("text", "")).strip()
-    following_text = str(following.get("text", "")).strip()
-    if not current_text or not following_text:
-        return False
-    if not _same_source_chunk(current, following):
-        return False
-    if _ends_sentence(current_text):
-        return False
-
-    gap = float(following["start"]) - float(current["end"])
-    if gap < -0.05 or gap > _ASR_FRAGMENT_MERGE_MAX_GAP_S:
-        return False
-
-    combined_chars = len(_compact_text_units(current_text + following_text))
-    if combined_chars > _ASR_FRAGMENT_MERGE_MAX_CHARS:
-        return False
-
-    combined_duration = float(following["end"]) - float(current["start"])
-    if combined_duration > _ASR_FRAGMENT_MERGE_MAX_DURATION_S:
-        return False
-
-    return True
-
-
-def _join_segment_text(left: str, right: str) -> str:
-    left = (left or "").strip()
-    right = (right or "").strip()
-    if not left:
-        return right
-    if not right:
-        return left
-    if _FRAGMENT_CONTINUATION_START_RE.match(right):
-        return left + right
-    return left + right
-
-
-def _merge_fragment_segments(segments: list[dict]) -> list[dict]:
-    if len(segments) < 2:
-        return segments
-
-    merged: list[dict] = []
-    current = dict(segments[0])
-
-    for following in segments[1:]:
-        if _should_merge_fragment(current, following):
-            current["end"] = float(following["end"])
-            current["text"] = _join_segment_text(current.get("text", ""), following.get("text", ""))
-            current["words"] = list(current.get("words") or []) + list(
-                following.get("words") or []
-            )
-            continue
-
-        merged.append(current)
-        current = dict(following)
-
-    merged.append(current)
-    return merged
 
 
 def _pick_postprocess_split_index(text: str) -> int:
@@ -1801,25 +1482,6 @@ def _repair_postprocessed_segment_windows(segments: list[dict]) -> list[dict]:
             target_end = start + _ASR_MIN_REPAIRED_SEGMENT_DURATION_S
 
             if target_end - start <= _ASR_INVALID_SEGMENT_DURATION_S:
-                if (
-                    repaired
-                    and start - float(repaired[-1]["end"])
-                    <= _ASR_FRAGMENT_MERGE_MAX_GAP_S
-                    and _same_source_chunk(repaired[-1], segment)
-                ):
-                    repaired[-1]["text"] = _join_segment_text(
-                        str(repaired[-1].get("text", "")),
-                        text,
-                    )
-                    repaired[-1]["end"] = max(
-                        float(repaired[-1]["end"]),
-                        end,
-                        start + _ASR_MIN_REPAIRED_SEGMENT_DURATION_S,
-                    )
-                    repaired[-1]["words"] = list(repaired[-1].get("words") or []) + list(
-                        segment.get("words") or []
-                    )
-                    continue
                 target_end = start + _ASR_MIN_REPAIRED_SEGMENT_DURATION_S
 
             end = max(end, target_end)
@@ -1856,7 +1518,7 @@ def _repair_postprocessed_segment_windows(segments: list[dict]) -> list[dict]:
     return non_overlapping
 
 
-def _merge_words_to_segments(words: list[dict]) -> list[dict]:
+def _group_words_to_segments(words: list[dict]) -> list[dict]:
     if not words:
         return []
 
@@ -1864,7 +1526,7 @@ def _merge_words_to_segments(words: list[dict]) -> list[dict]:
     soft_max_chars = 45
     hard_max_chars = 60
     max_duration = 8.5
-    hard_max_duration = float(os.getenv("ASR_MERGE_HARD_MAX_DURATION", "9.0"))
+    hard_max_duration = float(os.getenv("ASR_SEGMENT_HARD_MAX_DURATION", "9.0"))
     max_gap = 1.2
 
     segments: list[dict] = []

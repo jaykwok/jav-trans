@@ -81,8 +81,24 @@ def text_density_level(row: Mapping[str, Any]) -> str:
     return str(row.get("text_density_level") or "")
 
 
+def density_review(row: Mapping[str, Any]) -> bool:
+    return row_float(row, "core_cps") > 4.0 or row_float(row, "fallback_cps") > 4.0
+
+
 def bucket_definitions() -> list[tuple[str, str, BucketPredicate, Callable[[Mapping[str, Any]], tuple[Any, ...]]]]:
     return [
+        (
+            "density_over_4cps",
+            "4 CPS 密度审计",
+            lambda row: density_review(row),
+            lambda row: (
+                not bool(row.get("chunk_text_leak_risk")),
+                not bool(row.get("chunk_repetition_risk")),
+                str(row.get("asr_qc_severity") or "") != "reject",
+                -row_float(row, "core_cps"),
+                row_float(row, "start"),
+            ),
+        ),
         (
             "repeat_or_qc_reject",
             "重复循环 / QC reject",
@@ -177,6 +193,12 @@ def reason_hints(row: Mapping[str, Any]) -> list[str]:
         hints.append("asr_qc_reject")
     if str(row.get("asr_qc_severity") or "") == "warn":
         hints.append("asr_qc_warn")
+    if density_review(row):
+        hints.append("subtitle_density_over_4cps")
+    if bool(row.get("chunk_text_leak_risk")):
+        hints.append("chunk_text_leak_risk")
+    if bool(row.get("chunk_repetition_risk")):
+        hints.append("chunk_repetition_risk")
     if repetition_changed(row):
         hints.append("repeat_repair_suggested")
     if str(row.get("fallback_subtype") or "") == "proportional_after_sentinel":
@@ -200,7 +222,7 @@ def build_review_items(
     diagnostics_rows: list[dict[str, Any]],
     aligned_segments_by_chunk: dict[int, list[dict[str, Any]]],
     subtitle_cues: list[dict[str, Any]],
-    context_pad_s: float,
+    context_margin_s: float,
     max_per_bucket: int,
     max_items: int | None,
     video_label: str,
@@ -222,8 +244,8 @@ def build_review_items(
         fallback_end = row_float(row, "fallback_window_end") or end
         if fallback_end <= fallback_start:
             fallback_start, fallback_end = start, end
-        context_start = max(0.0, start - context_pad_s)
-        context_end = end + context_pad_s
+        context_start = max(0.0, start - context_margin_s)
+        context_end = end + context_margin_s
         chunk_cue_rows = cues_for_range(subtitle_cues, start, end)
         fallback_cue_rows = cues_for_range(subtitle_cues, fallback_start, fallback_end)
         context_cue_rows = cues_for_range(subtitle_cues, context_start, context_end)
@@ -254,6 +276,11 @@ def build_review_items(
             "fallback_window_end": round(fallback_end, 3),
             "fallback_duration_s": round(row_float(row, "fallback_duration_s") or (fallback_end - fallback_start), 3),
             "fallback_window_source": str(row.get("fallback_window_source") or ""),
+            "chunk_duration_s": round(row_float(row, "chunk_duration_s") or (end - start), 3),
+            "core_duration_s": round(row_float(row, "core_duration_s") or row_float(row, "fallback_duration_s") or (fallback_end - fallback_start), 3),
+            "chunk_extra_to_fallback_s": round(row_float(row, "chunk_extra_to_fallback_s"), 3),
+            "fallback_to_chunk_duration_ratio": row_float(row, "fallback_to_chunk_duration_ratio"),
+            "chunk_to_fallback_duration_ratio": row_float(row, "chunk_to_fallback_duration_ratio"),
             "alignment_quality": str(row.get("alignment_quality") or ""),
             "alignment_mode": str(row.get("alignment_mode") or ""),
             "fallback_type": str(row.get("fallback_type") or ""),
@@ -267,6 +294,27 @@ def build_review_items(
             "nonlexical_text": bool(row.get("nonlexical_text")),
             "align_text_empty": bool(row.get("align_text_empty")),
             "chars_per_sec": row_float(row, "chars_per_sec"),
+            "chunk_cps": row_float(row, "chunk_cps") or row_float(row, "chars_per_sec"),
+            "core_cps": row_float(row, "core_cps") or row_float(row, "fallback_cps"),
+            "fallback_cps": row_float(row, "fallback_cps") or row_float(row, "core_cps"),
+            "chunk_text_leak_risk": bool(row.get("chunk_text_leak_risk")),
+            "chunk_repetition_risk": bool(row.get("chunk_repetition_risk")),
+            "repeat_profile": (
+                dict(row.get("repeat_profile"))
+                if isinstance(row.get("repeat_profile"), Mapping)
+                else {}
+            ),
+            "vocalization_repetition": (
+                dict(row.get("vocalization_repetition"))
+                if isinstance(row.get("vocalization_repetition"), Mapping)
+                else {}
+            ),
+            "preserve_nonlexical_repetition": bool(row.get("preserve_nonlexical_repetition")),
+            "signal_quality_verdict": str(row.get("signal_quality_verdict") or ""),
+            "signal_quality_reason": str(row.get("signal_quality_reason") or ""),
+            "avg_logprob": row.get("avg_logprob"),
+            "compression_ratio": row.get("compression_ratio"),
+            "no_speech_prob": row.get("no_speech_prob"),
             "compact_chars": int(row.get("compact_chars") or 0),
             "display_text": compact_text(row.get("display_text") or row.get("text") or ""),
             "raw_text": compact_text(row.get("raw_text") or ""),
@@ -501,7 +549,7 @@ textarea {{ width: 100%; border: 1px solid var(--line); border-radius: 6px; padd
         <button id="prevBtn">上一条</button>
         <button id="nextBtn">下一条</button>
         <button class="primary" id="playChunkBtn">播放 ASR chunk</button>
-        <button id="playFallbackBtn">播放 fallback 窗口</button>
+        <button id="playFallbackBtn">播放 speech/fallback core</button>
         <button id="playContextBtn">播放上下文</button>
         <button id="downloadBtn">下载审计 JSONL</button>
       </div>
@@ -525,7 +573,7 @@ textarea {{ width: 100%; border: 1px solid var(--line); border-radius: 6px; padd
           <a href="{html.escape(media_url)}">直接打开媒体</a>
           <a href="{html.escape(vtt_url)}">完整 VTT</a>
         </div>
-        <p class="hint">浅色外框是 ASR chunk，绿色是 fallback 插值窗口；播放会在当前模式终点自动暂停。音频模式会在播放器下方同步显示完整日语字幕当前 cue。</p>
+        <p class="hint">浅色外框是送入 ASR 的 chunk；绿色是 speech/fallback core window，代表当前 chunk 的实际语音/回退计时范围。播放会在当前模式终点自动暂停。</p>
         <p class="hint error" id="mediaError"></p>
       </section>
       <aside class="panel">
@@ -548,11 +596,11 @@ textarea {{ width: 100%; border: 1px solid var(--line); border-radius: 6px; padd
       <h3>最终字幕成效（送往 LLM 前的日文 cue）</h3>
       <div class="grid">
         <div>
-          <h3>当前 ASR chunk 范围</h3>
+          <h3>ASR chunk 内最终字幕</h3>
           <div class="cue-list" id="finalChunkCueList"></div>
         </div>
         <div>
-          <h3>fallback 窗口范围</h3>
+          <h3>speech/fallback core 内最终字幕</h3>
           <div class="cue-list" id="finalFallbackCueList"></div>
         </div>
       </div>
@@ -594,7 +642,7 @@ const LABELS = [
   ["timing_start_late", "开头偏晚"],
   ["timing_end_early", "结尾偏早"],
   ["timing_end_late", "结尾偏晚"],
-  ["merge_with_neighbor", "应与邻句合并"],
+  ["boundary_too_split", "边界切得过碎"],
   ["drop_or_review", "需要人工复核"],
   ["uncertain", "不确定"]
 ];
@@ -674,6 +722,7 @@ function applyFilters() {{
   renderCurrent(false);
 }}
 function badgeClass(item) {{
+  if (item.chunk_text_leak_risk || item.chunk_repetition_risk) return "danger";
   if (item.asr_qc_severity === "reject") return "danger";
   if (item.asr_qc_severity === "warn" || item.fallback_type !== "none") return "warn";
   return "";
@@ -690,7 +739,7 @@ function renderList() {{
     }};
     div.innerHTML = `
       <div class="item-title">#${{item.index + 1}} chunk ${{item.chunk_index}} <span class="badge ${{badgeClass(item)}}">${{escapeHtml(item.bucket_label)}}</span></div>
-      <div class="meta">${{fmt(item.start)}}-${{fmt(item.end)}} · ${{Number(item.duration_s).toFixed(2)}}s · ${{escapeHtml(item.alignment_quality)}}/${{escapeHtml(item.fallback_subtype || "none")}} · QC=${{escapeHtml(item.asr_qc_severity || "ok")}}</div>
+      <div class="meta">core ${{fmt(item.fallback_window_start)}}-${{fmt(item.fallback_window_end)}} · chunk ${{fmt(item.start)}}-${{fmt(item.end)}} · core CPS=${{Number(item.core_cps || item.fallback_cps || 0).toFixed(2)}} · chunk CPS=${{Number(item.chunk_cps || item.chars_per_sec || 0).toFixed(2)}} · ${{escapeHtml(item.alignment_quality)}}/${{escapeHtml(item.fallback_subtype || "none")}} · QC=${{escapeHtml(item.asr_qc_severity || "ok")}}</div>
       <div class="meta">${{escapeHtml(item.display_text || item.subtitle_text || "(empty)")}}</div>
     `;
     itemList.appendChild(div);
@@ -702,12 +751,22 @@ function setMetrics(item) {{
     ["媒体", item.video_label],
     ["chunk", item.chunk_index],
     ["ASR chunk", `${{fmt(item.start)}}-${{fmt(item.end)}} (${{Number(item.duration_s).toFixed(2)}}s)`],
-    ["fallback 窗口", `${{fmt(item.fallback_window_start)}}-${{fmt(item.fallback_window_end)}} (${{Number(item.fallback_duration_s).toFixed(2)}}s)`],
+    ["speech/fallback core", `${{fmt(item.fallback_window_start)}}-${{fmt(item.fallback_window_end)}} (${{Number(item.fallback_duration_s).toFixed(2)}}s) · source=${{item.fallback_window_source || "-"}}`],
+    ["chunk/core", `${{Number(item.chunk_duration_s || item.duration_s || 0).toFixed(2)}}s / ${{Number(item.core_duration_s || item.fallback_duration_s || 0).toFixed(2)}}s · ratio=${{Number(item.fallback_to_chunk_duration_ratio || 0).toFixed(3)}}`],
     ["alignment", `${{item.alignment_quality}} / ${{item.alignment_mode}}`],
     ["fallback", `${{item.fallback_type}} / ${{item.fallback_subtype}}`],
     ["ASR QC", `${{item.asr_qc_severity}} · ${{(item.asr_qc_reasons || []).join(", ")}}`],
+    ["signal", `${{item.signal_quality_verdict || "-"}} · ${{item.signal_quality_reason || "-"}}`],
+    ["avg_logprob", item.avg_logprob === null || item.avg_logprob === undefined ? "-" : Number(item.avg_logprob).toFixed(3)],
+    ["no_speech", item.no_speech_prob === null || item.no_speech_prob === undefined ? "-" : Number(item.no_speech_prob).toFixed(3)],
+    ["compression", item.compression_ratio === null || item.compression_ratio === undefined ? "-" : Number(item.compression_ratio).toFixed(3)],
     ["text_density", `${{item.text_density_level}}`],
-    ["chars/sec", Number(item.chars_per_sec || 0).toFixed(2)],
+    ["chunk CPS", Number(item.chunk_cps || item.chars_per_sec || 0).toFixed(2)],
+    ["core/fallback CPS", Number(item.core_cps || item.fallback_cps || 0).toFixed(2)],
+    ["chunk text leak risk", item.chunk_text_leak_risk ? "yes" : "no"],
+    ["chunk repetition risk", item.chunk_repetition_risk ? "yes" : "no"],
+    ["repeat profile", `${{(item.repeat_profile || {{}}).unit || ""}} x${{(item.repeat_profile || {{}}).run || 0}} · ratio=${{Number((item.repeat_profile || {{}}).ratio || 0).toFixed(2)}}`],
+    ["nonlexical repeat", item.preserve_nonlexical_repetition ? "preserve_with_review" : "standard"],
     ["compact chars", item.compact_chars],
     ["failure", `${{item.failure_bucket}} · ${{(item.failure_reasons || []).join(", ")}}`],
     ["hints", (item.reason_hints || []).join(", ")]
@@ -730,8 +789,8 @@ function renderCueGroup(rootId, cues, emptyText) {{
   }}
 }}
 function renderCueList(item) {{
-  renderCueGroup("finalChunkCueList", item.final_chunk_cues, "该 ASR chunk 范围内没有最终字幕 cue。");
-  renderCueGroup("finalFallbackCueList", item.final_fallback_cues, "该 fallback 窗口范围内没有最终字幕 cue。");
+  renderCueGroup("finalChunkCueList", item.final_chunk_cues, "该 ASR chunk 内没有最终字幕 cue。");
+  renderCueGroup("finalFallbackCueList", item.final_fallback_cues, "该 speech/fallback core 内没有最终字幕 cue。");
   renderCueGroup("cueList", item.subtitle_cues, "该上下文内没有最终字幕 cue。");
   const aligned = document.getElementById("alignedList");
   if (!item.aligned_segments || item.aligned_segments.length === 0) {{
@@ -794,7 +853,7 @@ function renderCurrent(seek) {{
   const item = ITEMS[currentIndex];
   if (!item) return;
   document.getElementById("clipTitle").textContent = `#${{item.index + 1}} ${{item.bucket_label}} · chunk ${{item.chunk_index}}`;
-  document.getElementById("clipMeta").textContent = `${{fmt(item.start)}}-${{fmt(item.end)}} · ${{Number(item.duration_s).toFixed(2)}}s · fallback ${{item.fallback_subtype || "none"}} · QC ${{item.asr_qc_severity || "ok"}}`;
+  document.getElementById("clipMeta").textContent = `core ${{fmt(item.fallback_window_start)}}-${{fmt(item.fallback_window_end)}} · chunk ${{fmt(item.start)}}-${{fmt(item.end)}} · fallback ${{item.fallback_subtype || "none"}} · QC ${{item.asr_qc_severity || "ok"}}`;
   document.getElementById("rangeStart").textContent = fmt(item.context_start);
   document.getElementById("rangeEnd").textContent = fmt(item.context_end);
   document.getElementById("displayText").textContent = item.display_text || "(empty)";
@@ -831,11 +890,28 @@ function exportRows() {{
     duration_s: item.duration_s,
     fallback_window_start: item.fallback_window_start,
     fallback_window_end: item.fallback_window_end,
+    chunk_duration_s: item.chunk_duration_s,
+    core_duration_s: item.core_duration_s,
+    chunk_extra_to_fallback_s: item.chunk_extra_to_fallback_s,
+    fallback_to_chunk_duration_ratio: item.fallback_to_chunk_duration_ratio,
     alignment_quality: item.alignment_quality,
     fallback_subtype: item.fallback_subtype,
     asr_qc_severity: item.asr_qc_severity,
     asr_qc_reasons: item.asr_qc_reasons,
     text_density_level: item.text_density_level,
+    chunk_cps: item.chunk_cps,
+    core_cps: item.core_cps,
+    fallback_cps: item.fallback_cps,
+    chunk_text_leak_risk: item.chunk_text_leak_risk,
+    chunk_repetition_risk: item.chunk_repetition_risk,
+    repeat_profile: item.repeat_profile,
+    vocalization_repetition: item.vocalization_repetition,
+    preserve_nonlexical_repetition: item.preserve_nonlexical_repetition,
+    signal_quality_verdict: item.signal_quality_verdict,
+    signal_quality_reason: item.signal_quality_reason,
+    avg_logprob: item.avg_logprob,
+    compression_ratio: item.compression_ratio,
+    no_speech_prob: item.no_speech_prob,
     display_text: item.display_text,
     repetition_suggested_text: item.repetition_suggested_text,
     subtitle_text: item.subtitle_text,
@@ -921,13 +997,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--output-dir", default="agents/audits/asr-attribution-audit")
     parser.add_argument("--title", default="ASR 低信息/幻觉归因审计")
     parser.add_argument("--video-label", default="")
-    parser.add_argument("--context-pad-s", type=float, default=2.0)
+    parser.add_argument("--context-margin-s", type=float, default=2.0)
     parser.add_argument("--max-per-bucket", type=int, default=14)
     parser.add_argument("--max-items", type=int)
     parser.add_argument("--update-entrypoints", action=argparse.BooleanOptionalAction, default=True)
     args = parser.parse_args(argv)
-    if args.context_pad_s < 0:
-        parser.error("--context-pad-s must be non-negative")
+    if args.context_margin_s < 0:
+        parser.error("--context-margin-s must be non-negative")
     if args.max_per_bucket <= 0:
         parser.error("--max-per-bucket must be positive")
     if args.max_items is not None and args.max_items <= 0:
@@ -968,7 +1044,7 @@ def main(argv: list[str] | None = None) -> int:
         diagnostics_rows=diagnostics_rows,
         aligned_segments_by_chunk=aligned_by_chunk(aligned_rows),
         subtitle_cues=subtitle_cues,
-        context_pad_s=args.context_pad_s,
+        context_margin_s=args.context_margin_s,
         max_per_bucket=args.max_per_bucket,
         max_items=args.max_items,
         video_label=video_label,
@@ -999,6 +1075,17 @@ def main(argv: list[str] | None = None) -> int:
         "subtitle_cue_count": len(subtitle_cues),
         "diagnostics_row_count": len(diagnostics_rows),
         "bucket_counts": dict(Counter(item["bucket"] for item in items).most_common()),
+        "density_over_4cps_count": sum(
+            1
+            for row in diagnostics_rows
+            if row_float(row, "core_cps") > 4.0 or row_float(row, "fallback_cps") > 4.0
+        ),
+        "chunk_text_leak_risk_count": sum(
+            1 for row in diagnostics_rows if bool(row.get("chunk_text_leak_risk"))
+        ),
+        "chunk_repetition_risk_count": sum(
+            1 for row in diagnostics_rows if bool(row.get("chunk_repetition_risk"))
+        ),
         "alignment_quality_counts": count_by_key(diagnostics_rows, "alignment_quality"),
         "fallback_subtype_counts": count_by_key(diagnostics_rows, "fallback_subtype"),
         "asr_qc_severity_counts": count_by_key(diagnostics_rows, "asr_qc_severity"),

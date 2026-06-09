@@ -38,6 +38,27 @@ def _row(chunk_index: int, **overrides):
 def test_build_review_items_balances_attribution_buckets():
     diagnostics = [
         _row(
+            6,
+            fallback_window_start=18.5,
+            fallback_window_end=19.5,
+            fallback_duration_s=1.0,
+            chunk_duration_s=4.0,
+            core_duration_s=1.0,
+            chunk_extra_to_fallback_s=3.0,
+            fallback_to_chunk_duration_ratio=0.25,
+            compact_chars=12,
+            chars_per_sec=3.0,
+            chunk_cps=3.0,
+            core_cps=12.0,
+            fallback_cps=12.0,
+            chunk_text_leak_risk=True,
+            signal_quality_verdict="reject",
+            signal_quality_reason="repeat_ngram_loop",
+            avg_logprob=-1.2,
+            compression_ratio=2.4,
+            no_speech_prob=0.2,
+        ),
+        _row(
             0,
             asr_qc_severity="reject",
             asr_qc_reasons=["repeat_ngram_loop"],
@@ -71,21 +92,25 @@ def test_build_review_items_balances_attribution_buckets():
         diagnostics_rows=diagnostics,
         aligned_segments_by_chunk={2: [{"start": 6.0, "end": 8.0, "text": "aligned"}]},
         subtitle_cues=cues,
-        context_pad_s=0.5,
+        context_margin_s=0.5,
         max_per_bucket=1,
         max_items=None,
         video_label="sample",
     )
 
-    assert [item["bucket"] for item in items] == [
+    assert {item["bucket"] for item in items} == {
+        "density_over_4cps",
         "repeat_or_qc_reject",
         "nonlexical_empty",
         "sentinel_fallback",
         "low_info_vocal",
         "asr_qc_warn",
         "forced_control",
-    ]
+    }
     by_bucket = {item["bucket"]: item for item in items}
+    assert by_bucket["density_over_4cps"]["chunk_text_leak_risk"] is True
+    assert by_bucket["density_over_4cps"]["core_cps"] == 12.0
+    assert by_bucket["density_over_4cps"]["signal_quality_reason"] == "repeat_ngram_loop"
     assert "repeat_repair_suggested" in by_bucket["repeat_or_qc_reject"]["reason_hints"]
     assert by_bucket["sentinel_fallback"]["aligned_segments"][0]["text"] == "aligned"
     assert by_bucket["low_info_vocal"]["subtitle_text"] == "字幕3"
@@ -104,6 +129,18 @@ def test_asr_attribution_audit_generator_writes_audio_page(tmp_path: Path):
             asr_qc_severity="reject",
             asr_qc_reasons=["repeat_ngram_loop"],
             failure_bucket="repeat_repair_suggested",
+            fallback_duration_s=1.0,
+            chunk_duration_s=2.0,
+            core_duration_s=1.0,
+            core_cps=5.0,
+            fallback_cps=5.0,
+            chunk_cps=2.5,
+            chunk_text_leak_risk=True,
+            signal_quality_verdict="reject",
+            signal_quality_reason="repeat_ngram_loop",
+            avg_logprob=-1.1,
+            compression_ratio=2.1,
+            no_speech_prob=0.3,
             repetition_repair={"changed": True, "run": 4, "suggested_text": "だめだめだめ"},
         ),
         _row(1, fallback_subtype="proportional_after_sentinel", fallback_type="proportional"),
@@ -161,5 +198,9 @@ def test_asr_attribution_audit_generator_writes_audio_page(tmp_path: Path):
     assert "manual_asr_attribution_labels.jsonl" in html
     assert summary["label_schema_version"] == "asr_attribution_v1"
     assert summary["media_mime"] == "audio/wav"
-    assert summary["bucket_counts"]["repeat_or_qc_reject"] == 1
-    assert "repeat_or_qc_reject" in manifest
+    assert summary["bucket_counts"]["density_over_4cps"] == 1
+    assert summary["density_over_4cps_count"] == 1
+    assert summary["chunk_text_leak_risk_count"] == 1
+    assert "density_over_4cps" in manifest
+    assert "chunk_text_leak_risk" in manifest
+    assert "avg_logprob" in manifest

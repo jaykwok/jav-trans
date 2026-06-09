@@ -293,7 +293,7 @@ def build_review_items(
     *,
     baseline_rows: list[dict[str, Any]],
     candidate_rows: list[dict[str, Any]],
-    pad_s: float,
+    context_margin_s: float,
     max_items: int | None,
 ) -> list[dict[str, Any]]:
     selected = [row for row in baseline_rows if is_baseline_fallback_target(row)]
@@ -310,8 +310,8 @@ def build_review_items(
         matched.sort(key=lambda row: (row_float(row, "start"), row_float(row, "end")))
         all_starts = [b_start, *(row_float(row, "start") for row in matched)]
         all_ends = [b_end, *(row_float(row, "end") for row in matched)]
-        item_start = max(0.0, min(all_starts) - pad_s)
-        item_end = max(all_ends) + pad_s
+        item_start = max(0.0, min(all_starts) - context_margin_s)
+        item_end = max(all_ends) + context_margin_s
         baseline_norm = normalized_row(baseline_row)
         candidate_norm = [normalized_row(row) for row in matched]
         outcome = outcome_for(candidate_norm)
@@ -560,7 +560,7 @@ textarea {{ width: 100%; border: 1px solid var(--line); border-radius: 6px; padd
         <span id="nowText"></span>
         <span id="rangeEnd"></span>
       </div>
-      <p class="hint">页面展示 baseline fallback chunk 与 opt-in speech-island split 后的时间重叠片段；这里是审计视图，不代表最终字幕分块。</p>
+      <p class="hint">页面展示 baseline fallback chunk 与 opt-in Boundary Refiner 后的时间重叠片段；这里是审计视图，不代表最终字幕分块。</p>
     </section>
     <section class="panel">
       <h3>本条对比</h3>
@@ -829,11 +829,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default="agents/audits/alignment-compare-review",
     )
     parser.add_argument("--title", default="SpeechBoundary-JA fallback 对比审计")
-    parser.add_argument("--pad-s", type=float, default=1.0)
+    parser.add_argument("--context-margin-s", type=float, default=1.0)
     parser.add_argument("--max-items", type=int)
     args = parser.parse_args(argv)
-    if args.pad_s < 0:
-        parser.error("--pad-s must be non-negative")
+    if args.context_margin_s < 0:
+        parser.error("--context-margin-s must be non-negative")
     if args.max_items is not None and args.max_items <= 0:
         parser.error("--max-items must be positive")
     return args
@@ -862,7 +862,7 @@ def main(argv: list[str] | None = None) -> int:
     items = build_review_items(
         baseline_rows=baseline_rows,
         candidate_rows=candidate_rows,
-        pad_s=args.pad_s,
+        context_margin_s=args.context_margin_s,
         max_items=args.max_items,
     )
     write_jsonl(output_dir / "alignment_compare_review_items.jsonl", items)

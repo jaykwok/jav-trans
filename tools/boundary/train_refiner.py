@@ -23,12 +23,10 @@ from torch.utils.data import DataLoader, Subset, TensorDataset
 
 from boundary.backbones import TRANSFORMERS_MAMBA2_BACKBONE, BoundarySequenceClassifier
 from boundary.refiner import (
-    CONTEXT_OUTPUT_DIM,
-    DEFAULT_REFINER_FEATURES,
-    RefinerInput,
+    BOUNDARY_REFINER_OUTPUT_DIM,
+    DEFAULT_BOUNDARY_DELTA_MAX_S,
     build_learned_refiner_checkpoint,
-    load_boundary_refiner,
-    refiner_input_to_features,
+    load_frame_sequence_refiner_checkpoint,
 )
 from boundary.sequence_features import (
     FRAME_SEQUENCE_FEATURE_SCHEMA,
@@ -59,17 +57,21 @@ class TrainRefinerConfig:
     target_domain_speedup: float = 1.5
     target_chunk_s: float = 3.0
     max_core_chunk_s: float = 5.0
-    max_padded_chunk_s: float = 6.5
     min_chunk_s: float = 0.4
-    context_max_padding_s: float = 1.5
-    context_loss_weight: float = 0.25
+    boundary_delta_max_s: float = DEFAULT_BOUNDARY_DELTA_MAX_S
+    start_delta_loss_weight: float = 0.60
+    end_delta_loss_weight: float = 0.35
+    init_checkpoint: str = ""
+    freeze_backbone: bool = False
+    tensor_cache_path: str = ""
+    loader_log_interval_rows: int = 0
 
 
 @dataclass(frozen=True)
 class LoadedRefinerDataset:
     features: torch.Tensor
     labels: torch.Tensor
-    context_targets: torch.Tensor
+    boundary_delta_targets: torch.Tensor
     mask: torch.Tensor
     feature_names: tuple[str, ...]
     feature_metadata: dict[str, Any]
@@ -96,10 +98,14 @@ def train_refiner(
     config: TrainRefinerConfig = TrainRefinerConfig(),
 ) -> dict[str, Any]:
     _validate_config(config)
-    loaded = _load_dataset_tensors(dataset_paths)
+    loaded = _load_or_build_dataset_tensors(
+        dataset_paths,
+        tensor_cache_path=Path(config.tensor_cache_path) if config.tensor_cache_path else None,
+        log_interval_rows=config.loader_log_interval_rows,
+    )
     features = loaded.features
     labels = loaded.labels
-    context_targets = loaded.context_targets
+    boundary_delta_targets = loaded.boundary_delta_targets
     mask = loaded.mask
     feature_names = loaded.feature_names
     feature_metadata = loaded.feature_metadata
@@ -130,15 +136,28 @@ def train_refiner(
         backbone=TRANSFORMERS_MAMBA2_BACKBONE,
         hidden_size=config.hidden_size,
         num_layers=config.num_layers,
-        output_dim=CONTEXT_OUTPUT_DIM,
+        output_dim=BOUNDARY_REFINER_OUTPUT_DIM,
         state_size=config.state_size,
         num_heads=config.num_heads,
         n_groups=config.n_groups,
         chunk_size=config.chunk_size,
         bidirectional=config.bidirectional,
     ).to(device)
+    init_metadata: dict[str, Any] = {}
+    if config.init_checkpoint:
+        init_metadata = _load_initial_checkpoint(
+            model,
+            Path(config.init_checkpoint),
+            expected_input_dim=len(feature_names),
+        )
+    if config.freeze_backbone:
+        for parameter in model.backbone.parameters():
+            parameter.requires_grad_(False)
 
-    train_dataset = Subset(TensorDataset(features, labels, context_targets, mask), train_idx)
+    train_dataset = Subset(
+        TensorDataset(features, labels, boundary_delta_targets, mask),
+        train_idx,
+    )
     train_loader = DataLoader(
         train_dataset,
         batch_size=min(config.batch_size, len(train_dataset)),
@@ -148,9 +167,12 @@ def train_refiner(
     positives = max(1.0, float(train_labels[train_mask].sum().item()))
     negatives = max(1.0, float(train_mask.sum().item() - train_labels[train_mask].sum().item()))
     merge_criterion = nn.BCEWithLogitsLoss(pos_weight=torch.tensor([negatives / positives], device=device))
-    context_criterion = nn.SmoothL1Loss()
+    delta_criterion = nn.SmoothL1Loss()
+    trainable_parameters = [parameter for parameter in model.parameters() if parameter.requires_grad]
+    if not trainable_parameters:
+        raise ValueError("no trainable parameters remain after applying freeze options")
     optimizer = torch.optim.AdamW(
-        model.parameters(),
+        trainable_parameters,
         lr=config.learning_rate,
         weight_decay=config.weight_decay,
     )
@@ -158,18 +180,32 @@ def train_refiner(
     step = 0
     last_loss = math.nan
     while step < config.max_steps:
-        for batch_features, batch_labels, batch_context_targets, batch_mask in train_loader:
+        for (
+            batch_features,
+            batch_labels,
+            batch_boundary_delta_targets,
+            batch_mask,
+        ) in train_loader:
             step += 1
             optimizer.zero_grad(set_to_none=True)
             batch_mask = batch_mask.to(device)
             logits = model(batch_features.to(device), attention_mask=batch_mask.long())
             merge_loss = merge_criterion(logits[..., 0][batch_mask], batch_labels.to(device)[batch_mask])
-            context_pred = torch.sigmoid(logits[..., 1:3]) * float(config.context_max_padding_s)
-            context_loss = context_criterion(
-                context_pred[batch_mask],
-                batch_context_targets.to(device)[batch_mask],
+            delta_pred = torch.tanh(logits[..., 1:3]) * float(config.boundary_delta_max_s)
+            delta_target = batch_boundary_delta_targets.to(device)
+            start_delta_loss = delta_criterion(
+                delta_pred[..., 0][batch_mask],
+                delta_target[..., 0][batch_mask],
             )
-            loss = merge_loss + float(config.context_loss_weight) * context_loss
+            end_delta_loss = delta_criterion(
+                delta_pred[..., 1][batch_mask],
+                delta_target[..., 1][batch_mask],
+            )
+            loss = (
+                merge_loss
+                + float(config.start_delta_loss_weight) * start_delta_loss
+                + float(config.end_delta_loss_weight) * end_delta_loss
+            )
             loss.backward()
             optimizer.step()
             last_loss = float(loss.detach().cpu())
@@ -227,18 +263,20 @@ def train_refiner(
             "dataset_paths": [str(path) for path in dataset_paths],
             "class_counts": class_counts,
             "train_schema": loaded.train_schema,
-            "runtime_adapter": _runtime_adapter_name(feature_names),
+            "runtime_adapter": "frame_sequence_v1",
             "timing_policy": {
                 "target_domain_speedup": config.target_domain_speedup,
                 "target_chunk_s": config.target_chunk_s,
                 "max_core_chunk_s": config.max_core_chunk_s,
-                "max_padded_chunk_s": config.max_padded_chunk_s,
                 "min_chunk_s": config.min_chunk_s,
-                "context_max_padding_s": config.context_max_padding_s,
-                "context_loss_weight": config.context_loss_weight,
+                "boundary_delta_max_s": config.boundary_delta_max_s,
+                "start_delta_loss_weight": config.start_delta_loss_weight,
+                "end_delta_loss_weight": config.end_delta_loss_weight,
                 "source": "anime_nsfw_sfw_galgame_duration_distribution",
             },
-            "context_max_padding_s": config.context_max_padding_s,
+            "boundary_delta_max_s": config.boundary_delta_max_s,
+            "init_checkpoint": init_metadata,
+            "freeze_backbone": config.freeze_backbone,
             **feature_metadata,
         },
     )
@@ -246,29 +284,26 @@ def train_refiner(
     torch.save(checkpoint, checkpoint_path)
     metrics["checkpoint"] = str(checkpoint_path)
 
-    refiner = load_boundary_refiner(
-        enabled=True,
-        model_path=str(checkpoint_path),
-        backbone=TRANSFORMERS_MAMBA2_BACKBONE,
-        merge_threshold=config.threshold,
+    refiner = load_frame_sequence_refiner_checkpoint(
+        checkpoint_path,
+        threshold=config.threshold,
+        backbone_override=TRANSFORMERS_MAMBA2_BACKBONE,
     )
+    smoke_sequence = _row_sequence(loaded.first_row, feature_names)
+    smoke_decisions = refiner.decide_sequence(smoke_sequence)
     metrics["loader_smoke"] = {
         "signature": refiner.signature(),
-        "decision": None,
-        "decision_skipped_reason": "",
-        }
-    if _supports_refiner_input_decision(feature_names):
-        smoke_input = _row_smoke_input(loaded.first_row, feature_names)
-        smoke_decision = refiner.decide_gap(smoke_input)
-        metrics["loader_smoke"]["decision"] = {
-            "merge": smoke_decision.merge,
-            "score": smoke_decision.score,
-            "reason": smoke_decision.reason,
-        }
-    else:
-        metrics["loader_smoke"]["decision_skipped_reason"] = (
-            "feature_names require frame/window runtime adapter"
-        )
+        "decision_count": len(smoke_decisions),
+        "first_decision": (
+            {
+                "merge": smoke_decisions[0].merge,
+                "score": smoke_decisions[0].score,
+                "reason": smoke_decisions[0].reason,
+            }
+            if smoke_decisions
+            else None
+        ),
+    }
 
     metrics_path = output_dir / "metrics.json"
     metrics_path.write_text(
@@ -282,29 +317,63 @@ def train_refiner(
 
 
 def _load_dataset_tensors(paths: Sequence[Path]) -> LoadedRefinerDataset:
-    scan = _scan_dataset(paths)
+    return _load_dataset_tensors_from_jsonl(paths, log_interval_rows=0)
+
+
+def _load_or_build_dataset_tensors(
+    paths: Sequence[Path],
+    *,
+    tensor_cache_path: Path | None,
+    log_interval_rows: int,
+) -> LoadedRefinerDataset:
+    if tensor_cache_path is not None and tensor_cache_path.exists():
+        try:
+            print(f"loading_tensor_cache={tensor_cache_path}", flush=True)
+            return _load_tensor_cache(tensor_cache_path, dataset_paths=paths)
+        except ValueError as exc:
+            print(f"ignoring_tensor_cache={tensor_cache_path} reason={exc}", flush=True)
+    loaded = _load_dataset_tensors_from_jsonl(paths, log_interval_rows=log_interval_rows)
+    if tensor_cache_path is not None:
+        print(f"writing_tensor_cache={tensor_cache_path}", flush=True)
+        _write_tensor_cache(tensor_cache_path, loaded, dataset_paths=paths)
+    return loaded
+
+
+def _load_dataset_tensors_from_jsonl(
+    paths: Sequence[Path],
+    *,
+    log_interval_rows: int,
+) -> LoadedRefinerDataset:
+    scan = _scan_dataset(paths, log_interval_rows=log_interval_rows)
     features = torch.zeros((scan.row_count, scan.max_len, len(scan.feature_names)), dtype=torch.float32)
     labels = torch.zeros((scan.row_count, scan.max_len), dtype=torch.float32)
-    context_targets = torch.zeros((scan.row_count, scan.max_len, 2), dtype=torch.float32)
+    boundary_delta_targets = torch.zeros((scan.row_count, scan.max_len, 2), dtype=torch.float32)
     mask = torch.zeros((scan.row_count, scan.max_len), dtype=torch.bool)
 
     row_index = 0
     for row in _iter_dataset_rows(paths):
         sequence = _row_sequence_array(row, scan.feature_names)
         label_sequence = _row_label_sequence(row, expected_len=int(sequence.shape[0]))
-        context_sequence = _row_context_target_sequence(row, expected_len=int(sequence.shape[0]))
+        boundary_delta_sequence = _row_boundary_delta_target_sequence(
+            row,
+            expected_len=int(sequence.shape[0]),
+        )
         length = int(sequence.shape[0])
         features[row_index, :length].copy_(torch.from_numpy(sequence))
         labels[row_index, :length].copy_(torch.tensor(label_sequence, dtype=torch.float32))
-        context_targets[row_index, :length].copy_(torch.tensor(context_sequence, dtype=torch.float32))
+        boundary_delta_targets[row_index, :length].copy_(
+            torch.tensor(boundary_delta_sequence, dtype=torch.float32)
+        )
         mask[row_index, :length] = True
         row_index += 1
+        if log_interval_rows > 0 and row_index % log_interval_rows == 0:
+            print(f"loaded_dataset_rows={row_index}/{scan.row_count}", flush=True)
     if row_index != scan.row_count:
         raise ValueError(f"dataset changed while loading: expected {scan.row_count}, got {row_index}")
     return LoadedRefinerDataset(
         features=features,
         labels=labels,
-        context_targets=context_targets,
+        boundary_delta_targets=boundary_delta_targets,
         mask=mask,
         feature_names=scan.feature_names,
         feature_metadata=scan.feature_metadata,
@@ -314,7 +383,161 @@ def _load_dataset_tensors(paths: Sequence[Path]) -> LoadedRefinerDataset:
     )
 
 
-def _scan_dataset(paths: Sequence[Path]) -> DatasetScan:
+def _load_tensor_cache(path: Path, *, dataset_paths: Sequence[Path] | None = None) -> LoadedRefinerDataset:
+    payload = torch.load(path, map_location="cpu", weights_only=False)
+    if not isinstance(payload, Mapping):
+        raise ValueError(f"tensor cache must be a mapping: {path}")
+    if str(payload.get("schema") or "") != "boundary_refiner_tensor_cache_v2":
+        raise ValueError(f"unsupported tensor cache schema: {payload.get('schema')!r}")
+    if dataset_paths is not None:
+        cached_sources = payload.get("dataset_sources")
+        if cached_sources != _dataset_source_fingerprints(dataset_paths):
+            raise ValueError("dataset source fingerprint mismatch")
+    tensors = payload.get("tensors")
+    if not isinstance(tensors, Mapping):
+        raise ValueError("tensor cache missing tensors")
+    features = _tensor_from_cache(tensors, "features", ndim=3, dtype=torch.float32)
+    labels = _tensor_from_cache(tensors, "labels", ndim=2, dtype=torch.float32)
+    boundary_delta_targets = _tensor_from_cache(
+        tensors,
+        "boundary_delta_targets",
+        ndim=3,
+        dtype=torch.float32,
+    )
+    mask = _tensor_from_cache(tensors, "mask", ndim=2, dtype=torch.bool)
+    row_count, max_len, feature_dim = features.shape
+    if labels.shape != (row_count, max_len):
+        raise ValueError("tensor cache labels shape mismatch")
+    if boundary_delta_targets.shape != (row_count, max_len, 2):
+        raise ValueError("tensor cache boundary_delta_targets shape mismatch")
+    if mask.shape != (row_count, max_len):
+        raise ValueError("tensor cache mask shape mismatch")
+    feature_names = tuple(str(name) for name in payload.get("feature_names") or ())
+    if len(feature_names) != feature_dim:
+        raise ValueError("tensor cache feature_names length mismatch")
+    feature_metadata = dict(payload.get("feature_metadata") or {})
+    class_counts = dict(payload.get("class_counts") or {})
+    if set(class_counts) != {"merge_positive", "split_negative"}:
+        raise ValueError("tensor cache class_counts must contain merge_positive and split_negative")
+    first_row = dict(payload.get("first_row") or {})
+    if not first_row:
+        raise ValueError("tensor cache missing first_row")
+    return LoadedRefinerDataset(
+        features=features,
+        labels=labels,
+        boundary_delta_targets=boundary_delta_targets,
+        mask=mask,
+        feature_names=feature_names,
+        feature_metadata=feature_metadata,
+        train_schema=str(payload.get("train_schema") or ""),
+        class_counts={
+            "merge_positive": int(class_counts["merge_positive"]),
+            "split_negative": int(class_counts["split_negative"]),
+        },
+        first_row=first_row,
+    )
+
+
+def _tensor_from_cache(
+    tensors: Mapping[str, Any],
+    name: str,
+    *,
+    ndim: int,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    value = tensors.get(name)
+    if not isinstance(value, torch.Tensor):
+        raise ValueError(f"tensor cache missing tensor: {name}")
+    if value.ndim != ndim:
+        raise ValueError(f"tensor cache {name} ndim mismatch: {value.ndim} != {ndim}")
+    return value.to(device="cpu", dtype=dtype, copy=False).contiguous()
+
+
+def _write_tensor_cache(
+    path: Path,
+    loaded: LoadedRefinerDataset,
+    *,
+    dataset_paths: Sequence[Path],
+) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    torch.save(
+        {
+            "schema": "boundary_refiner_tensor_cache_v2",
+            "dataset_sources": _dataset_source_fingerprints(dataset_paths),
+            "feature_names": list(loaded.feature_names),
+            "feature_metadata": loaded.feature_metadata,
+            "train_schema": loaded.train_schema,
+            "class_counts": loaded.class_counts,
+            "first_row": loaded.first_row,
+            "tensors": {
+                "features": loaded.features.contiguous(),
+                "labels": loaded.labels.contiguous(),
+                "boundary_delta_targets": loaded.boundary_delta_targets.contiguous(),
+                "mask": loaded.mask.contiguous(),
+            },
+        },
+        path,
+    )
+
+
+def _dataset_source_fingerprints(paths: Sequence[Path]) -> list[dict[str, Any]]:
+    fingerprints: list[dict[str, Any]] = []
+    for path in paths:
+        stat = path.stat()
+        fingerprints.append(
+            {
+                "path": str(path),
+                "size": int(stat.st_size),
+                "mtime_ns": int(stat.st_mtime_ns),
+            }
+        )
+    return fingerprints
+
+
+def _load_initial_checkpoint(
+    model: BoundarySequenceClassifier,
+    checkpoint_path: Path,
+    *,
+    expected_input_dim: int,
+) -> dict[str, Any]:
+    if not checkpoint_path.exists():
+        raise FileNotFoundError(f"init checkpoint not found: {checkpoint_path}")
+    payload = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+    if not isinstance(payload, Mapping):
+        raise ValueError("init checkpoint must be a mapping")
+    schema = str(payload.get("schema") or "")
+    if schema != "boundary_refiner_v4":
+        raise ValueError(f"init checkpoint schema must be boundary_refiner_v4, got {schema!r}")
+    model_config = dict(payload.get("model_config") or {})
+    if int(model_config.get("input_dim", -1)) != int(expected_input_dim):
+        raise ValueError(
+            "init checkpoint input_dim mismatch: "
+            f"{model_config.get('input_dim')} != {expected_input_dim}"
+        )
+    if int(model_config.get("output_dim", -1)) != BOUNDARY_REFINER_OUTPUT_DIM:
+        raise ValueError(
+            "init checkpoint output_dim mismatch: "
+            f"{model_config.get('output_dim')} != {BOUNDARY_REFINER_OUTPUT_DIM}"
+        )
+    state_dict = payload.get("state_dict")
+    if not isinstance(state_dict, Mapping):
+        raise ValueError("init checkpoint missing state_dict")
+    missing, unexpected = model.load_state_dict(state_dict, strict=True)
+    if missing or unexpected:
+        raise ValueError(
+            "init checkpoint state_dict mismatch: "
+            f"missing={list(missing)} unexpected={list(unexpected)}"
+        )
+    metadata = dict(payload.get("metadata") or {})
+    return {
+        "path": str(checkpoint_path),
+        "schema": schema,
+        "model_config": model_config,
+        "metadata": metadata,
+    }
+
+
+def _scan_dataset(paths: Sequence[Path], *, log_interval_rows: int = 0) -> DatasetScan:
     row_count = 0
     max_len = 0
     feature_names: tuple[str, ...] | None = None
@@ -335,7 +558,7 @@ def _scan_dataset(paths: Sequence[Path]) -> DatasetScan:
             raise ValueError(f"feature_names mismatch at row {row_count}: {row_names} != {feature_names}")
         sequence_len = _row_sequence_length(row, feature_names)
         label_sequence = _row_label_sequence(row, expected_len=sequence_len)
-        _row_context_target_sequence(row, expected_len=sequence_len)
+        _row_boundary_delta_target_sequence(row, expected_len=sequence_len)
         row_positive = sum(1 for value in label_sequence if value >= 0.5)
         class_counts["merge_positive"] += row_positive
         class_counts["split_negative"] += len(label_sequence) - row_positive
@@ -353,6 +576,8 @@ def _scan_dataset(paths: Sequence[Path]) -> DatasetScan:
             elif signature_dict != expected_signature:
                 raise ValueError(f"feature_signature mismatch at row {row_count}")
         row_count += 1
+        if log_interval_rows > 0 and row_count % log_interval_rows == 0:
+            print(f"scanned_dataset_rows={row_count}", flush=True)
 
     if row_count == 0 or feature_names is None or first_row is None:
         raise ValueError("boundary refiner dataset is empty")
@@ -389,7 +614,7 @@ def _row_feature_names(row: Mapping[str, Any], fallback: tuple[str, ...] | None 
     elif fallback is not None:
         names = fallback
     else:
-        names = tuple(DEFAULT_REFINER_FEATURES)
+        raise ValueError("boundary refiner v4 rows require feature_names")
     if not names:
         raise ValueError("dataset feature_names must not be empty")
     return names
@@ -450,14 +675,6 @@ def _hash_from_signature(signature: Mapping[str, Any]) -> str:
     )
 
 
-def _supports_refiner_input_decision(feature_names: Sequence[str]) -> bool:
-    return set(str(name) for name in feature_names).issubset(set(DEFAULT_REFINER_FEATURES))
-
-
-def _runtime_adapter_name(feature_names: Sequence[str]) -> str:
-    return "refiner_input_v1" if _supports_refiner_input_decision(feature_names) else "frame_sequence_v1"
-
-
 def _row_sequence_length(row: Mapping[str, Any], feature_names: tuple[str, ...]) -> int:
     raw_sequence = row.get("sequence_features")
     if isinstance(raw_sequence, list) and raw_sequence:
@@ -469,7 +686,7 @@ def _row_sequence_length(row: Mapping[str, Any], feature_names: tuple[str, ...])
                 expected_feature_names=row.get("feature_names") or feature_names,
             )
         return len(raw_sequence)
-    return 1
+    raise ValueError("boundary refiner v4 rows require sequence_features")
 
 
 def _row_sequence_array(row: Mapping[str, Any], feature_names: tuple[str, ...]) -> np.ndarray:
@@ -480,8 +697,7 @@ def _row_sequence_array(row: Mapping[str, Any], feature_names: tuple[str, ...]) 
             feature_names=feature_names,
             expected_feature_names=row.get("feature_names") or feature_names,
         ).astype(np.float32, copy=False)
-    features = _row_features(row, feature_names)
-    return validate_sequence_features([features], feature_names=feature_names).astype(np.float32, copy=False)
+    raise ValueError("boundary refiner v4 rows require sequence_features")
 
 
 def _row_sequence(row: Mapping[str, Any], feature_names: tuple[str, ...]) -> list[list[float]]:
@@ -497,87 +713,26 @@ def _row_label_sequence(row: Mapping[str, Any], *, expected_len: int) -> list[fl
         if any(not math.isfinite(value) for value in labels):
             raise ValueError("sequence_labels must not contain NaN or inf")
         return labels
-    if expected_len != 1:
-        raise ValueError("sequence row requires sequence_labels")
-    return [float(row.get("label", row.get("merge_target", 0)))]
+    raise ValueError("boundary refiner v4 rows require sequence_labels")
 
 
-def _row_context_target_sequence(row: Mapping[str, Any], *, expected_len: int) -> list[list[float]]:
-    raw = row.get("sequence_context_targets")
+def _row_boundary_delta_target_sequence(row: Mapping[str, Any], *, expected_len: int) -> list[list[float]]:
+    raw = row.get("sequence_boundary_delta_targets")
     if isinstance(raw, list) and raw:
         if len(raw) != expected_len:
-            raise ValueError("sequence_context_targets length must match sequence_features length")
+            raise ValueError("sequence_boundary_delta_targets length must match sequence_features length")
         targets: list[list[float]] = []
         for item in raw:
             if not isinstance(item, list) or len(item) != 2:
-                raise ValueError("sequence_context_targets items must be [left_s, right_s]")
-            left, right = float(item[0]), float(item[1])
-            if not math.isfinite(left) or not math.isfinite(right):
-                raise ValueError("sequence_context_targets must not contain NaN or inf")
-            targets.append([max(0.0, left), max(0.0, right)])
+                raise ValueError(
+                    "sequence_boundary_delta_targets items must be [start_delta_s, end_delta_s]"
+                )
+            start_delta, end_delta = float(item[0]), float(item[1])
+            if not math.isfinite(start_delta) or not math.isfinite(end_delta):
+                raise ValueError("sequence_boundary_delta_targets must not contain NaN or inf")
+            targets.append([start_delta, end_delta])
         return targets
-    raise ValueError("boundary refiner v2 rows require sequence_context_targets")
-
-
-def _row_features(row: Mapping[str, Any], feature_names: tuple[str, ...]) -> list[float]:
-    raw = row.get("features")
-    if isinstance(raw, list) and len(raw) == len(feature_names):
-        return [float(value) for value in raw]
-    return refiner_input_to_features(_row_refiner_input(row), feature_names)
-
-
-def _row_refiner_input(row: Mapping[str, Any]) -> RefinerInput:
-    payload = row.get("refiner_input")
-    if not isinstance(payload, Mapping):
-        raise ValueError("dataset row missing refiner_input")
-    return RefinerInput(
-        gap_s=float(payload["gap_s"]),
-        left_start=float(payload["left_start"]),
-        left_end=float(payload["left_end"]),
-        right_start=float(payload["right_start"]),
-        right_end=float(payload["right_end"]),
-        current_core_s=float(payload["current_core_s"]),
-        proposed_core_s=float(payload["proposed_core_s"]),
-        gap_merge_s=float(payload["gap_merge_s"]),
-        left_score=_optional_float(payload.get("left_score")),
-        right_score=_optional_float(payload.get("right_score")),
-        valley_score_min=_optional_float(payload.get("valley_score_min")),
-        cut_score_max=_optional_float(payload.get("cut_score_max")),
-        gap_boundary_score=_optional_float(payload.get("gap_boundary_score")),
-    )
-
-
-def _row_smoke_input(row: Mapping[str, Any], feature_names: tuple[str, ...]) -> RefinerInput:
-    if isinstance(row.get("refiner_input"), Mapping):
-        return _row_refiner_input(row)
-    sequence = _row_sequence(row, feature_names)
-    values = {name: float(value) for name, value in zip(feature_names, sequence[0])}
-    gap_s = values.get("gap_s", 0.0)
-    left_duration_s = max(0.0, values.get("left_duration_s", 1.0))
-    right_duration_s = max(0.0, values.get("right_duration_s", 1.0))
-    left_start = 0.0
-    left_end = left_duration_s
-    right_start = left_end + gap_s
-    right_end = right_start + right_duration_s
-    return RefinerInput(
-        gap_s=gap_s,
-        left_start=left_start,
-        left_end=left_end,
-        right_start=right_start,
-        right_end=right_end,
-        current_core_s=values.get("current_core_s", left_duration_s),
-        proposed_core_s=values.get("proposed_core_s", right_end - left_start),
-        gap_merge_s=max(1e-6, values.get("gap_merge_s", 1.5)),
-        left_score=values.get("left_score"),
-        right_score=values.get("right_score"),
-        valley_score_min=values.get("valley_score_min"),
-        cut_score_max=values.get("cut_score_max"),
-        gap_boundary_score=values.get("gap_boundary_score"),
-    )
-
-
-def _optional_float(value: Any) -> float | None:
-    return None if value is None else float(value)
+    raise ValueError("boundary refiner v4 rows require sequence_boundary_delta_targets")
 
 
 def _split_indexes(count: int, *, val_ratio: float, seed: int) -> tuple[list[int], list[int]]:
@@ -697,14 +852,15 @@ def _validate_config(config: TrainRefinerConfig) -> None:
     for name in (
         "target_chunk_s",
         "max_core_chunk_s",
-        "max_padded_chunk_s",
         "min_chunk_s",
-        "context_max_padding_s",
+        "boundary_delta_max_s",
     ):
         if getattr(config, name) <= 0.0:
             raise ValueError(f"{name} must be positive")
-    if config.context_loss_weight < 0.0:
-        raise ValueError("context_loss_weight must be non-negative")
+    if config.start_delta_loss_weight < 0.0:
+        raise ValueError("start_delta_loss_weight must be non-negative")
+    if config.end_delta_loss_weight < 0.0:
+        raise ValueError("end_delta_loss_weight must be non-negative")
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -737,10 +893,34 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--target-domain-speedup", type=float, default=1.5)
     parser.add_argument("--target-chunk-s", type=float, default=3.0)
     parser.add_argument("--max-core-chunk-s", type=float, default=5.0)
-    parser.add_argument("--max-padded-chunk-s", type=float, default=6.5)
     parser.add_argument("--min-chunk-s", type=float, default=0.4)
-    parser.add_argument("--context-max-padding-s", type=float, default=1.5)
-    parser.add_argument("--context-loss-weight", type=float, default=0.25)
+    parser.add_argument("--boundary-delta-max-s", type=float, default=DEFAULT_BOUNDARY_DELTA_MAX_S)
+    parser.add_argument("--start-delta-loss-weight", type=float, default=0.60)
+    parser.add_argument("--end-delta-loss-weight", type=float, default=0.35)
+    parser.add_argument(
+        "--init-checkpoint",
+        default="",
+        help="Optional boundary_refiner_v4 checkpoint used to initialize weights.",
+    )
+    parser.add_argument(
+        "--freeze-backbone",
+        action="store_true",
+        help="Freeze the Mamba2 backbone and train only the output head.",
+    )
+    parser.add_argument(
+        "--tensor-cache-path",
+        default="",
+        help=(
+            "Optional .pt tensor cache. If missing, JSONL is streamed once into this cache; "
+            "if present, training loads tensors directly."
+        ),
+    )
+    parser.add_argument(
+        "--loader-log-interval-rows",
+        type=int,
+        default=0,
+        help="Print JSONL scan/load progress every N rows; 0 disables loader progress logs.",
+    )
     args = parser.parse_args(argv)
     return args
 
@@ -771,10 +951,14 @@ def main(argv: list[str] | None = None) -> None:
             target_domain_speedup=args.target_domain_speedup,
             target_chunk_s=args.target_chunk_s,
             max_core_chunk_s=args.max_core_chunk_s,
-            max_padded_chunk_s=args.max_padded_chunk_s,
             min_chunk_s=args.min_chunk_s,
-            context_max_padding_s=args.context_max_padding_s,
-            context_loss_weight=args.context_loss_weight,
+            boundary_delta_max_s=args.boundary_delta_max_s,
+            start_delta_loss_weight=args.start_delta_loss_weight,
+            end_delta_loss_weight=args.end_delta_loss_weight,
+            init_checkpoint=args.init_checkpoint,
+            freeze_backbone=args.freeze_backbone,
+            tensor_cache_path=args.tensor_cache_path,
+            loader_log_interval_rows=args.loader_log_interval_rows,
         ),
     )
 

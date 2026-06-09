@@ -105,7 +105,7 @@ def test_asr_stage_env_scope_reaches_cache_and_transcribe(monkeypatch, tmp_path)
     assert seen["cache_signature"]["subtitle"]["video_fps"] == 60.0
     assert seen["cache_signature"]["subtitle"]["effective_video_fps"] == 60.0
     assert seen["cache_signature"]["subtitle"]["frame_gap_s"] == 2 / 60.0
-    assert seen["cache_signature"]["subtitle"]["dense_cue_merge_enabled"] is True
+    assert "dense_cue_merge_enabled" not in seen["cache_signature"]["subtitle"]
     assert artifacts.backend_label == f"backend:{ASR_17B_BACKEND}"
     assert main.os.environ["ASR_BACKEND"] == ASR_06B_BACKEND
     assert main.os.environ["ASR_CONTEXT"] == "process actor"
@@ -128,7 +128,6 @@ def test_asr_stage_env_scope_passes_boundary_refiner_flags(monkeypatch, tmp_path
             "BOUNDARY_REFINER_THRESHOLD": "0.61",
             "BOUNDARY_PLANNER_TARGET_CHUNK_S": "3.5",
             "BOUNDARY_PLANNER_MAX_CORE_CHUNK_S": "5.5",
-            "BOUNDARY_PLANNER_MAX_PADDED_CHUNK_S": "9.5",
         },
     )
     monkeypatch.setattr(main.torch.cuda, "is_available", lambda: False)
@@ -148,7 +147,6 @@ def test_asr_stage_env_scope_passes_boundary_refiner_flags(monkeypatch, tmp_path
         seen["threshold"] = main.os.environ.get("BOUNDARY_REFINER_THRESHOLD")
         seen["target_s"] = main.os.environ.get("BOUNDARY_PLANNER_TARGET_CHUNK_S")
         seen["max_core_s"] = main.os.environ.get("BOUNDARY_PLANNER_MAX_CORE_CHUNK_S")
-        seen["max_padded_s"] = main.os.environ.get("BOUNDARY_PLANNER_MAX_PADDED_CHUNK_S")
         return (
             [{"start": 0.0, "end": 1.0, "text": "こんにちは"}],
             ["mock asr"],
@@ -169,7 +167,6 @@ def test_asr_stage_env_scope_passes_boundary_refiner_flags(monkeypatch, tmp_path
         "threshold": "0.61",
         "target_s": "3.5",
         "max_core_s": "5.5",
-        "max_padded_s": "9.5",
     }
 
 

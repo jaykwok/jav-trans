@@ -376,6 +376,32 @@ def diagnostic_qc_metrics(
     return merged_metrics, merged_item
 
 
+def _signal_quality_metrics(qc_metrics: dict[str, Any]) -> dict[str, Any]:
+    signal = qc_metrics.get("signal_quality")
+    if not isinstance(signal, dict):
+        return {
+            "signal_quality_verdict": "",
+            "signal_quality_reason": "",
+            "avg_logprob": None,
+            "compression_ratio": None,
+            "no_speech_prob": None,
+        }
+    metrics = signal.get("metrics") if isinstance(signal.get("metrics"), dict) else {}
+    return {
+        "signal_quality_verdict": str(signal.get("verdict") or ""),
+        "signal_quality_reason": str(signal.get("reason") or ""),
+        "avg_logprob": metrics.get("avg_logprob"),
+        "compression_ratio": metrics.get("compression_ratio"),
+        "no_speech_prob": metrics.get("no_speech_prob"),
+    }
+
+
+def _safe_ratio(numerator: float, denominator: float) -> float:
+    if denominator <= 0.0:
+        return 0.0
+    return round(numerator / denominator, 6)
+
+
 def is_failure_candidate(row: dict[str, Any]) -> bool:
     return bool(row.get("failure_reasons")) or str(row.get("alignment_quality") or "") != "forced"
 
@@ -503,6 +529,10 @@ def diagnose_case(
         nonlexical_text = bool(analysis_text.strip() and _NONLEXICAL_TEXT_RE.fullmatch(analysis_text.strip()))
         compact_chars = len(strip_alignment_punctuation(prealign.display_text))
         chars_per_sec = compact_chars / duration if duration > 0 else 0.0
+        fallback_cps = compact_chars / fallback_duration if fallback_duration > 0 else 0.0
+        chunk_extra_to_fallback_s = max(0.0, duration - fallback_duration)
+        fallback_to_chunk_ratio = _safe_ratio(fallback_duration, duration)
+        chunk_to_fallback_ratio = _safe_ratio(duration, fallback_duration)
         chunk_log = logs.get(chunk_index, {})
         alignment_mode = str(chunk_log.get("alignment_mode") or "")
         if alignment_mode:
@@ -521,6 +551,7 @@ def diagnose_case(
             raw_text=raw_text,
             qc_item=qc_item,
         )
+        signal_metrics = _signal_quality_metrics(qc_metrics)
         repetition_repair = (
             qc_metrics.get("repetition_repair")
             if isinstance(qc_metrics.get("repetition_repair"), dict)
@@ -531,9 +562,32 @@ def diagnose_case(
             if isinstance(qc_metrics.get("text_density"), dict)
             else {}
         )
+        repeat_profile = (
+            qc_metrics.get("max_repeat")
+            if isinstance(qc_metrics.get("max_repeat"), dict)
+            else {}
+        )
+        vocalization_repetition = (
+            qc_metrics.get("vocalization_repetition")
+            if isinstance(qc_metrics.get("vocalization_repetition"), dict)
+            else {}
+        )
         text_density_level = str(text_density.get("level") or "")
         if text_density_level:
             text_density_counts[text_density_level] += 1
+        repeat_run = int(repeat_profile.get("run") or 0)
+        repeat_ratio = float(repeat_profile.get("ratio") or 0.0)
+        preserve_nonlexical_repeat = bool(vocalization_repetition.get("preserve_candidate"))
+        chunk_repetition_risk = bool(
+            chunk_extra_to_fallback_s >= 0.75
+            and repeat_run >= 4
+            and repeat_ratio >= 0.35
+            and (
+                fallback_cps >= 4.0
+                or text_density_level == "repeated_vocalization_candidate"
+                or str((qc_item_for_diagnostics or {}).get("severity") or "") in {"warn", "reject"}
+            )
+        )
         prealign_flag_counts.update(prealign.flags)
         reasons = chunk_failure_reasons(
             text=analysis_text,
@@ -591,6 +645,11 @@ def diagnose_case(
             "fallback_window_end": round(fallback_abs_end, 3),
             "fallback_duration_s": round(fallback_duration, 3),
             "fallback_window_source": fallback_source,
+            "chunk_duration_s": round(duration, 3),
+            "core_duration_s": round(fallback_duration, 3),
+            "chunk_extra_to_fallback_s": round(chunk_extra_to_fallback_s, 3),
+            "fallback_to_chunk_duration_ratio": fallback_to_chunk_ratio,
+            "chunk_to_fallback_duration_ratio": chunk_to_fallback_ratio,
             "text": text,
             "raw_text": raw_text,
             "analysis_text": analysis_text,
@@ -609,9 +668,27 @@ def diagnose_case(
             "nonlexical_text": nonlexical_text,
             "compact_chars": compact_chars,
             "chars_per_sec": round(chars_per_sec, 3),
+            "chunk_cps": round(chars_per_sec, 3),
+            "core_cps": round(fallback_cps, 3),
+            "fallback_cps": round(fallback_cps, 3),
+            "chunk_text_leak_risk": bool(
+                compact_chars >= 12
+                and fallback_cps > 4.0
+                and chunk_extra_to_fallback_s >= 0.75
+                and (
+                    str((qc_item_for_diagnostics or {}).get("severity") or "") in {"warn", "reject"}
+                    or fallback_to_chunk_ratio < 0.72
+                    or fallback_cps >= max(7.0, chars_per_sec * 1.35)
+                )
+            ),
+            "chunk_repetition_risk": chunk_repetition_risk,
+            "repeat_profile": repeat_profile,
+            "vocalization_repetition": vocalization_repetition,
+            "preserve_nonlexical_repetition": preserve_nonlexical_repeat,
             "text_density": text_density,
             "text_density_level": text_density_level,
             "repetition_repair": repetition_repair,
+            **signal_metrics,
             "repetition_suggested_text": str(
                 repetition_repair.get("suggested_text") or ""
             )
@@ -688,6 +765,8 @@ def build_markdown(summary: dict[str, Any]) -> str:
         f"- ASR review uncertain chunks: {summary['asr_review_uncertain_count']}",
         f"- align-text-empty chunks: {summary['align_text_empty_count']}",
         f"- failure candidates: {summary['failure_candidate_count']}",
+        f"- chunk text leak risk: {summary.get('chunk_text_leak_risk_count', 0)}",
+        f"- chunk repetition risk: {summary.get('chunk_repetition_risk_count', 0)}",
         "",
         "## Alignment Quality",
         "",
@@ -770,6 +849,7 @@ def summarize(rows: list[dict[str, Any]], case_summaries: list[dict[str, Any]]) 
     prealign_flag_counts: Counter = Counter()
     text_density_counts: Counter = Counter()
     repeat_repair_suggested_count = 0
+    chunk_repetition_risk_count = 0
     for row in rows:
         reason_counts.update(row.get("failure_reasons") or [])
         mode = str(row.get("alignment_mode") or "")
@@ -793,6 +873,8 @@ def summarize(rows: list[dict[str, Any]], case_summaries: list[dict[str, Any]]) 
             text_density_counts[text_density_level] += 1
         if (row.get("repetition_repair") or {}).get("changed"):
             repeat_repair_suggested_count += 1
+        if bool(row.get("chunk_repetition_risk")):
+            chunk_repetition_risk_count += 1
 
     chunk_count = len(rows)
     fallback_count = sum(1 for row in rows if row.get("fallback_type") not in {"", "none", None})
@@ -816,6 +898,8 @@ def summarize(rows: list[dict[str, Any]], case_summaries: list[dict[str, Any]]) 
         "prealign_flag_counts": dict(prealign_flag_counts.most_common()),
         "text_density_counts": dict(text_density_counts.most_common()),
         "repeat_repair_suggested_count": repeat_repair_suggested_count,
+        "chunk_text_leak_risk_count": sum(1 for row in rows if row.get("chunk_text_leak_risk")),
+        "chunk_repetition_risk_count": chunk_repetition_risk_count,
         "cases": case_summaries,
     }
 

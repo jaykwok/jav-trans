@@ -15,14 +15,14 @@ if str(SRC_ROOT) not in sys.path:
 from boundary.ja import frame_classification_counts, load_label_records, metrics_from_frame_counts
 
 
-def padded_predictions(predictions: list[int], *, pad_frames: int) -> list[int]:
-    if pad_frames <= 0:
+def dilated_predictions(predictions: list[int], *, dilation_frames: int) -> list[int]:
+    if dilation_frames <= 0:
         return [int(value) for value in predictions]
     result = [0] * len(predictions)
     active = [index for index, value in enumerate(predictions) if int(value)]
     for index in active:
-        start = max(0, index - pad_frames)
-        end = min(len(result), index + pad_frames + 1)
+        start = max(0, index - dilation_frames)
+        end = min(len(result), index + dilation_frames + 1)
         for offset in range(start, end):
             result[offset] = 1
     return result
@@ -44,7 +44,7 @@ def compute_recall_metrics(
     labels_path: Path,
     predictions_path: Path,
     output_path: Path,
-    pad_s: float = 0.0,
+    frame_dilation_s: float = 0.0,
     frame_hop_s: float = 0.02,
     prediction_threshold: float | None = None,
 ) -> dict:
@@ -55,7 +55,7 @@ def compute_recall_metrics(
         if line.strip()
     ]
     by_audio_id = {str(row.get("audio_id")): row for row in prediction_rows}
-    pad_frames = max(0, int(round(pad_s / frame_hop_s)))
+    dilation_frames = max(0, int(round(frame_dilation_s / frame_hop_s)))
     total_counts = {
         "frames": 0,
         "correct": 0,
@@ -79,7 +79,10 @@ def compute_recall_metrics(
         if not isinstance(raw_predictions, list):
             skipped.append({"audio_id": record.audio_id, "reason": "missing_speech_frames"})
             continue
-        predictions = padded_predictions([int(value) for value in raw_predictions], pad_frames=pad_frames)
+        predictions = dilated_predictions(
+            [int(value) for value in raw_predictions],
+            dilation_frames=dilation_frames,
+        )
         frame_total = min(len(record.speech_frames), len(predictions))
         counts = frame_classification_counts(
             labels=record.speech_frames[:frame_total],
@@ -107,7 +110,7 @@ def compute_recall_metrics(
         "prediction_threshold": prediction_threshold,
         "evaluated": evaluated,
         "skipped": len(skipped),
-        "pad_s": pad_s,
+        "frame_dilation_s": frame_dilation_s,
         "frame_hop_s": frame_hop_s,
         "missed_speech_seconds": missed_speech_frames * frame_hop_s,
         "missed_speech_segments": missed_speech_segments,
@@ -131,7 +134,7 @@ def run(args: argparse.Namespace) -> None:
         labels_path=Path(args.labels),
         predictions_path=Path(args.predictions),
         output_path=Path(args.output),
-        pad_s=args.pad_s,
+        frame_dilation_s=args.frame_dilation_s,
         frame_hop_s=args.frame_hop_s,
         prediction_threshold=args.prediction_threshold,
     )
@@ -147,11 +150,16 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Compute speech-boundary recall metrics from frame predictions.")
     parser.add_argument("--labels", required=True)
     parser.add_argument("--predictions", required=True, help="JSONL rows with audio_id and speech_frames/predictions.")
-    parser.add_argument("--pad-s", type=float, default=0.0)
+    parser.add_argument("--frame-dilation-s", type=float, default=0.0)
     parser.add_argument("--frame-hop-s", type=float, default=0.02)
     parser.add_argument("--prediction-threshold", type=float)
     parser.add_argument("--output", required=True)
-    return parser.parse_args(argv)
+    args = parser.parse_args(argv)
+    if args.frame_dilation_s < 0.0:
+        parser.error("--frame-dilation-s must be non-negative")
+    if args.frame_hop_s <= 0.0:
+        parser.error("--frame-hop-s must be positive")
+    return args
 
 
 if __name__ == "__main__":

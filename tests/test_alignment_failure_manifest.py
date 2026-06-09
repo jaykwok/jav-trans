@@ -257,7 +257,7 @@ def test_alignment_failure_audio_audit_has_sync_caption_preview(tmp_path):
                 "display_text": "left: あ\nright: い\nmerged: あ い",
                 "left_ja": "あ",
                 "right_ja": "い",
-                "merged_ja": "あ い",
+                "suggested_ja": "あ い",
             }
         ],
     )

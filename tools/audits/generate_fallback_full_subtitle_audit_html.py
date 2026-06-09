@@ -200,7 +200,7 @@ def build_review_items(
     *,
     diagnostics_rows: list[dict[str, Any]],
     subtitle_cues: list[dict[str, Any]],
-    pad_s: float,
+    context_margin_s: float,
     max_items: int | None,
 ) -> list[dict[str, Any]]:
     selected = [row for row in diagnostics_rows if fallback_target(row)]
@@ -213,8 +213,8 @@ def build_review_items(
             continue
         source_start = row_float(row, "source_start_s") or start
         source_end = row_float(row, "source_end_s") or end
-        context_start = max(0.0, min(source_start, start) - pad_s)
-        context_end = max(source_end, end) + pad_s
+        context_start = max(0.0, min(source_start, start) - context_margin_s)
+        context_end = max(source_end, end) + context_margin_s
         item = {
             "index": len(items),
             "sample_id": f"fallback-full-ja-{len(items):04d}-chunk{int(row.get('chunk_index') or 0):04d}",
@@ -830,11 +830,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default="agents/audits/fallback-full-subtitle-review",
     )
     parser.add_argument("--title", default="SpeechBoundary-JA fallback 完整日语字幕审计")
-    parser.add_argument("--pad-s", type=float, default=1.0)
+    parser.add_argument("--context-margin-s", type=float, default=1.0)
     parser.add_argument("--max-items", type=int)
     args = parser.parse_args(argv)
-    if args.pad_s < 0:
-        parser.error("--pad-s must be non-negative")
+    if args.context_margin_s < 0:
+        parser.error("--context-margin-s must be non-negative")
     if args.max_items is not None and args.max_items <= 0:
         parser.error("--max-items must be positive")
     return args
@@ -856,7 +856,7 @@ def main(argv: list[str] | None = None) -> int:
     items = build_review_items(
         diagnostics_rows=diagnostics_rows,
         subtitle_cues=subtitle_cues,
-        pad_s=args.pad_s,
+        context_margin_s=args.context_margin_s,
         max_items=args.max_items,
     )
     if not items:

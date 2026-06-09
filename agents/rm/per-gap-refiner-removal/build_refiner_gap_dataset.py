@@ -17,7 +17,8 @@ if str(SRC_ROOT) not in sys.path:
 from boundary.refiner import DEFAULT_REFINER_FEATURES, RefinerInput, refiner_input_to_features
 from boundary.ja import LabelRecord, TeacherSegment, load_label_records
 
-DATASET_SCHEMA = "boundary_refiner_gap_dataset_v1"
+DATASET_SCHEMA = "boundary_refiner_gap_dataset_v4"
+SEQUENCE_DATASET_SCHEMA = "boundary_refiner_sequence_dataset_v4"
 
 
 @dataclass(frozen=True)
@@ -405,13 +406,14 @@ def _sequence_rows(rows: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
         feature_names = list(sorted_group[0].get("feature_names") or DEFAULT_REFINER_FEATURES)
         sequence_rows.append(
             {
-                "schema": "boundary_refiner_sequence_dataset_v1",
+                "schema": SEQUENCE_DATASET_SCHEMA,
                 "audio_id": audio_id,
                 "source": str(sorted_group[0].get("source") or ""),
                 "label_index": label_index,
                 "feature_names": feature_names,
                 "sequence_features": [list(item["features"]) for item in sorted_group],
                 "sequence_labels": [int(item.get("label", item.get("merge_target", 0))) for item in sorted_group],
+                "sequence_boundary_delta_targets": [[0.0, 0.0] for _ in sorted_group],
                 "sequence_reasons": [str(item.get("label_reason") or "") for item in sorted_group],
                 "gap_indexes": [int(item.get("gap_index") or 0) for item in sorted_group],
                 "metadata": {

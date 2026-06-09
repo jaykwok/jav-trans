@@ -37,10 +37,6 @@ _JA_PARTICLE_SPLIT_SUFFIXES = (
     "より",
 )
 _JA_BOUNDARY_STRIP_CHARS = " \t\r\n、。！？!?…"
-_ADJACENT_SHORT_MERGE_MAX_GAP_FRAMES = 6.0
-_ADJACENT_SHORT_MERGE_MAX_DURATION_FRAMES = 120.0
-_OVERLAPPING_TAIL_MAX_GAP_FRAMES = 2.5
-_OVERLAPPING_TAIL_MAX_DURATION_FRAMES = 20.5
 
 
 def _count_text_units(text: str, *, ascii_char_weight: float = 0.55) -> float:
@@ -271,173 +267,6 @@ def _copy_sorted_blocks(blocks: list[dict]) -> list[dict]:
     return [item[3] for item in sortable]
 
 
-def _block_text_units(block: dict) -> float:
-    return _count_text_units(
-        str(block.get("ja_text") or block.get("text") or "")
-        + str(block.get("zh_text") or block.get("zh") or ""),
-    )
-
-
-def _text_overlap_len(left: str, right: str, *, min_overlap: int = 2) -> int:
-    left_compact = _COMPACT_SPACE_RE.sub("", left or "")
-    right_compact = _COMPACT_SPACE_RE.sub("", right or "")
-    max_overlap = min(len(left_compact), len(right_compact))
-    for size in range(max_overlap, min_overlap - 1, -1):
-        if left_compact[-size:] == right_compact[:size]:
-            return size
-    return 0
-
-
-def _merge_text_with_overlap(left: str, right: str, *, separator: str) -> str:
-    left = (left or "").strip()
-    right = (right or "").strip()
-    if not left:
-        return right
-    if not right:
-        return left
-    return separator.join((left, right))
-
-
-def _looks_like_short_overlapping_tail(
-    current_ja: str,
-    next_ja: str,
-    *,
-    gap: float,
-    next_duration: float,
-    options: SubtitleOptions,
-) -> bool:
-    current_compact = _COMPACT_SPACE_RE.sub("", current_ja or "").strip()
-    next_compact = _COMPACT_SPACE_RE.sub("", next_ja or "").strip()
-    if not current_compact or not next_compact:
-        return False
-    if current_compact.endswith(tuple(_SENTENCE_END_PUNCTUATION)):
-        return False
-    if gap > _frames_to_seconds(_OVERLAPPING_TAIL_MAX_GAP_FRAMES, options):
-        return False
-    if next_duration > _frames_to_seconds(_OVERLAPPING_TAIL_MAX_DURATION_FRAMES, options):
-        return False
-    return _text_overlap_len(current_compact, next_compact) > 0
-
-
-def _can_merge_overlapping_blocks(
-    left: dict,
-    right: dict,
-    *,
-    options: SubtitleOptions,
-) -> bool:
-    start = min(float(left["start"]), float(right["start"]))
-    end = max(float(left["end"]), float(right["end"]))
-    max_duration = options.max_duration if options.max_duration > 0 else end - start
-    max_chars = options.line_max_chars if options.line_max_chars > 0 else 25
-    return (
-        end - start <= max_duration
-        and _block_text_units(left) + _block_text_units(right) <= max_chars * 2.4
-    )
-
-
-def _merge_overlapping_blocks(left: dict, right: dict) -> dict:
-    merged = dict(left)
-    merged["start"] = min(float(left["start"]), float(right["start"]))
-    merged["end"] = max(float(left["end"]), float(right["end"]))
-    for key in ("ja_text", "zh_text", "text", "zh"):
-        parts = [
-            str(block.get(key) or "").strip()
-            for block in (left, right)
-            if str(block.get(key) or "").strip()
-        ]
-        if not parts:
-            continue
-        separator = "，" if key in {"zh_text", "zh"} else " "
-        merged[key] = separator.join(parts)
-    merged["words"] = sorted(
-        list(left.get("words") or []) + list(right.get("words") or []),
-        key=lambda word: (
-            float(word.get("start", 0.0)) if isinstance(word, dict) else 0.0,
-            float(word.get("end", 0.0)) if isinstance(word, dict) else 0.0,
-        ),
-    )
-    source_ids = []
-    for block in (left, right):
-        for source_id in block.get("source_segment_ids") or []:
-            if source_id not in source_ids:
-                source_ids.append(source_id)
-    if source_ids:
-        merged["source_segment_ids"] = source_ids
-    return merged
-
-
-def _can_dense_merge_blocks(
-    left: dict,
-    right: dict,
-    *,
-    options: SubtitleOptions,
-) -> bool:
-    if not options.dense_cue_merge_enabled:
-        return False
-
-    left_start = float(left.get("start", 0.0))
-    left_end = max(left_start, float(left.get("end", left_start)))
-    right_start = float(right.get("start", left_end))
-    right_end = max(right_start, float(right.get("end", right_start)))
-    left_duration = left_end - left_start
-    right_duration = right_end - right_start
-    combined_duration = right_end - left_start
-    gap = right_start - left_end
-
-    if gap < -_subtitle_gap_s(options):
-        return False
-    if gap > _frames_to_seconds(options.dense_cue_merge_max_gap_frames, options):
-        return False
-    max_single = _frames_to_seconds(options.dense_cue_merge_max_single_frames, options)
-    if max(left_duration, right_duration) > max_single:
-        return False
-    if combined_duration > _frames_to_seconds(
-        options.dense_cue_merge_max_combined_frames,
-        options,
-    ):
-        return False
-
-    combined_units = _block_text_units(left) + _block_text_units(right)
-    if combined_units > options.dense_cue_merge_max_text_units:
-        return False
-
-    left_ja = str(left.get("ja_text") or left.get("text") or "").strip()
-    left_zh = str(left.get("zh_text") or left.get("zh") or "").strip()
-    if left_ja.endswith(tuple(_SENTENCE_END_PUNCTUATION)):
-        return False
-    if left_zh.endswith(tuple(_ZH_SOFT_SPLIT_PUNCTUATION)):
-        return False
-
-    return True
-
-
-def _merge_dense_short_cues(
-    blocks: list[dict],
-    *,
-    options: SubtitleOptions | None = None,
-) -> list[dict]:
-    options = _coerce_options(options)
-    if not options.merge_adjacent or not options.dense_cue_merge_enabled or len(blocks) < 2:
-        return list(blocks)
-
-    merged: list[dict] = []
-    index = 0
-    while index < len(blocks):
-        current = dict(blocks[index])
-        while index + 1 < len(blocks):
-            nxt = blocks[index + 1]
-            if not _can_dense_merge_blocks(current, nxt, options=options):
-                break
-            current = _merge_overlapping_blocks(current, nxt)
-            current["dense_cue_merge_count"] = (
-                int(current.get("dense_cue_merge_count") or 0) + 1
-            )
-            index += 1
-        merged.append(current)
-        index += 1
-    return merged
-
-
 def _normalize_subtitle_timeline(
     blocks: list[dict],
     *,
@@ -469,13 +298,6 @@ def _normalize_subtitle_timeline(
         if limit_end - current_start >= min_abs_s:
             current["end"] = limit_end
             index += 1
-            continue
-
-        if _can_merge_overlapping_blocks(current, nxt, options=options):
-            normalized[index] = _merge_overlapping_blocks(current, nxt)
-            del normalized[index + 1]
-            if index:
-                index -= 1
             continue
 
         if limit_end > current_start:
@@ -531,15 +353,10 @@ def _prepare_subtitle_blocks(
     blocks: list[dict],
     *,
     options: SubtitleOptions | None = None,
-    merge_adjacent: bool,
 ) -> list[dict]:
     options = _coerce_options(options)
     prepared = _copy_sorted_blocks(blocks)
-    if merge_adjacent:
-        prepared = _merge_adjacent_short_blocks(prepared, options=options)
-        prepared = _copy_sorted_blocks(prepared)
     prepared = _soft_split_subtitle_blocks(prepared, options=options)
-    prepared = _merge_dense_short_cues(prepared, options=options)
     prepared = _normalize_subtitle_timeline(prepared, options=options)
     for idx in range(1, len(prepared) + 1):
         start, end = _resolve_subtitle_window(prepared, idx, options=options)
@@ -549,13 +366,6 @@ def _prepare_subtitle_blocks(
     # Reading-duration expansion can push a cue back into the next cue window.
     # Keep this final pass as the hard no-overlap, frame-gap guard for the cue plan.
     prepared = _normalize_subtitle_timeline(prepared, options=options)
-    if merge_adjacent:
-        # Timing polish intentionally collapses very short display gaps to the
-        # frame gap. A final bounded merge pass prevents those polished micro
-        # cues from surviving only because the first merge pass ran on raw
-        # alignment gaps.
-        prepared = _merge_adjacent_short_blocks(prepared, options=options)
-        prepared = _normalize_subtitle_timeline(prepared, options=options)
     return prepared
 
 
@@ -571,7 +381,6 @@ def prepare_srt_blocks(
     return _prepare_subtitle_blocks(
         blocks,
         options=options,
-        merge_adjacent=options.merge_adjacent,
     )
 
 
@@ -905,91 +714,14 @@ def write_srt(
         for idx, block in enumerate(blocks, 1):
             start = float(block.get("start", 0.0))
             end = max(start + 0.05, float(block.get("end", start)))
+            block["start"] = start
+            block["end"] = end
 
             start_str = format_timestamp(start)
             end_str   = format_timestamp(end)
             wrapped = _wrap_subtitle_text(block.get("zh_text", ""), options=options)
             f.write(f"{idx}\n{start_str} --> {end_str}\n{wrapped}\n\n")
     return blocks
-
-
-def _merge_adjacent_short_blocks(
-    blocks: list[dict],
-    *,
-    options: SubtitleOptions | None = None,
-) -> list[dict]:
-    options = _coerce_options(options)
-    if not options.merge_adjacent or len(blocks) < 2:
-        return list(blocks)
-
-    merged: list[dict] = []
-    index = 0
-    max_chars = options.line_max_chars if options.line_max_chars > 0 else 25
-    while index < len(blocks):
-        current = dict(blocks[index])
-        while index + 1 < len(blocks):
-            nxt = blocks[index + 1]
-            current_end = float(current.get("end", current.get("start", 0.0)))
-            next_start = float(nxt.get("start", 0.0))
-            gap = next_start - current_end
-            ja_text = str(current.get("ja_text", "")).strip()
-            next_ja_text = str(nxt.get("ja_text", "")).strip()
-            current_zh_text = str(current.get("zh_text", "")).strip()
-            next_zh_text = str(nxt.get("zh_text", "")).strip()
-            combined_ja = _merge_text_with_overlap(
-                ja_text,
-                next_ja_text,
-                separator=" ",
-            )
-            combined_zh = _merge_text_with_overlap(
-                current_zh_text,
-                next_zh_text,
-                separator="，",
-            )
-            combined_chars = len(_COMPACT_SPACE_RE.sub("", combined_ja + combined_zh))
-            combined_duration = float(nxt.get("end", next_start)) - float(
-                current.get("start", 0.0)
-            )
-            next_duration = float(nxt.get("end", next_start)) - next_start
-            continuation_tail = _looks_like_short_overlapping_tail(
-                ja_text,
-                next_ja_text,
-                gap=gap,
-                next_duration=next_duration,
-                options=options,
-            )
-
-            if (
-                gap <= _frames_to_seconds(_ADJACENT_SHORT_MERGE_MAX_GAP_FRAMES, options)
-                and combined_chars <= max_chars * 2
-                and combined_duration
-                <= _frames_to_seconds(
-                    _ADJACENT_SHORT_MERGE_MAX_DURATION_FRAMES,
-                    options,
-                )
-                and not ja_text.endswith(tuple(_SENTENCE_END_PUNCTUATION))
-            ):
-                current["end"] = nxt.get("end", current.get("end"))
-                current["ja_text"] = combined_ja
-                current["zh_text"] = combined_zh
-                if "text" in current or "text" in nxt:
-                    current["text"] = current["ja_text"]
-                current["words"] = list(current.get("words") or []) + list(
-                    nxt.get("words") or []
-                )
-                source_ids = []
-                for block in (current, nxt):
-                    for source_id in block.get("source_segment_ids") or []:
-                        if source_id not in source_ids:
-                            source_ids.append(source_id)
-                if source_ids:
-                    current["source_segment_ids"] = source_ids
-                index += 1
-                continue
-            break
-        merged.append(current)
-        index += 1
-    return merged
 
 
 def write_bilingual_srt(
@@ -1005,6 +737,8 @@ def write_bilingual_srt(
         for idx, block in enumerate(blocks, 1):
             start = float(block.get("start", 0.0))
             end = max(start + 0.05, float(block.get("end", start)))
+            block["start"] = start
+            block["end"] = end
 
             start_str = format_timestamp(start)
             end_str   = format_timestamp(end)

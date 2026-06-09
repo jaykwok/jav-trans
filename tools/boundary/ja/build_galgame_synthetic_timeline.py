@@ -284,14 +284,14 @@ def expand_segments(
     segments: list[TeacherSegment],
     *,
     duration_s: float,
-    pad_s: float,
+    dilation_s: float,
 ) -> list[TeacherSegment]:
-    if pad_s <= 0.0:
+    if dilation_s <= 0.0:
         return list(segments)
     expanded = [
         TeacherSegment(
-            start=max(0.0, segment.start - pad_s),
-            end=min(duration_s, segment.end + pad_s),
+            start=max(0.0, segment.start - dilation_s),
+            end=min(duration_s, segment.end + dilation_s),
             score=segment.score,
         )
         for segment in segments
@@ -1027,7 +1027,7 @@ def build_synthetic_timeline(args: argparse.Namespace) -> None:
         label_segments = expand_segments(
             speech_segments,
             duration_s=duration_s,
-            pad_s=args.speech_label_pad_s,
+            dilation_s=args.speech_label_dilation_s,
         )
         record = build_supervised_record(
             audio_id=audio_id,
@@ -1049,7 +1049,7 @@ def build_synthetic_timeline(args: argparse.Namespace) -> None:
             "actual_speech_segments": [
                 {"start": segment.start, "end": segment.end} for segment in speech_segments
             ],
-            "speech_label_pad_s": args.speech_label_pad_s,
+            "speech_label_dilation_s": args.speech_label_dilation_s,
         }
         record = type(record)(
             audio_id=record.audio_id,
@@ -1083,7 +1083,7 @@ def build_synthetic_timeline(args: argparse.Namespace) -> None:
                 "cut_drop_zones": cut_drop_zones,
                 "speech_segments": [{"start": segment.start, "end": segment.end} for segment in label_segments],
                 "actual_speech_segments": [{"start": segment.start, "end": segment.end} for segment in speech_segments],
-                "speech_label_pad_s": args.speech_label_pad_s,
+                "speech_label_dilation_s": args.speech_label_dilation_s,
                 "transition_regions": transition_regions,
                 "overlap_segments": overlap_segments,
                 "augmentation": {
@@ -1107,7 +1107,7 @@ def build_synthetic_timeline(args: argparse.Namespace) -> None:
                 "speech_frames": record.speech_frames,
                 "speech_segments": [{"start": segment.start, "end": segment.end} for segment in label_segments],
                 "actual_speech_segments": [{"start": segment.start, "end": segment.end} for segment in speech_segments],
-                "speech_label_pad_s": args.speech_label_pad_s,
+                "speech_label_dilation_s": args.speech_label_dilation_s,
                 "source_audio_ids": [
                     str(item.get("source_audio_id")) for item in source_details if item.get("source_audio_id")
                 ],
@@ -1231,7 +1231,7 @@ def build_synthetic_timeline(args: argparse.Namespace) -> None:
             "background_mix_prob": args.background_mix_prob,
             "background_snr_db_min": args.background_snr_db_min,
             "background_snr_db_max": args.background_snr_db_max,
-            "speech_label_pad_s": args.speech_label_pad_s,
+            "speech_label_dilation_s": args.speech_label_dilation_s,
             "crossfade_ms_min": args.crossfade_ms_min,
             "crossfade_ms_max": args.crossfade_ms_max,
             "crossfade_curve": args.crossfade_curve,
@@ -1357,10 +1357,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--overlap-snr-db-max", type=float, default=10.0)
     parser.add_argument("--overlap-max-speech-s", type=float, default=2.0)
     parser.add_argument(
-        "--speech-label-pad-s",
+        "--speech-label-dilation-s",
         type=float,
         default=0.08,
-        help="Expand speech labels on both sides without changing audio, useful for high-recall boundary training.",
+        help="Dilate speech labels on both sides without changing audio, useful for high-recall boundary training.",
     )
     parser.add_argument("--text-separator", default=" ")
     parser.add_argument("--output-dir", default=str(PROJECT_ROOT / "agents" / "temp" / "speech-boundary-ja" / "galgame-synthetic-timeline"))
@@ -1395,7 +1395,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "hum_rms",
         "negative_gap_prob",
         "background_mix_prob",
-        "speech_label_pad_s",
+        "speech_label_dilation_s",
         "crossfade_ms_min",
         "crossfade_ms_max",
         "filter_prob",

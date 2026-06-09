@@ -29,7 +29,7 @@ from boundary.sequence_features import (
 )
 from boundary.ja import LabelRecord, TeacherSegment, load_cached_feature
 
-DATASET_SCHEMA = "boundary_refiner_frame_sequence_dataset_v2"
+DATASET_SCHEMA = "boundary_refiner_frame_sequence_dataset_v4"
 
 
 @dataclass(frozen=True)
@@ -45,8 +45,8 @@ class FrameSequenceConfig:
     synthetic_merge_gap_min_s: float = 0.04
     synthetic_merge_gap_s: float = 0.04
     synthetic_merge_min_segment_s: float = 1.20
-    context_max_padding_s: float = 1.5
-    context_max_speech_overlap_s: float = 0.25
+    synthetic_boundary_delta_jitter_s: float = 0.0
+    synthetic_boundary_delta_seed: int = 240609
 
     def feature_config(self) -> FrameSequenceFeatureConfig:
         return FrameSequenceFeatureConfig(
@@ -223,7 +223,7 @@ def _sequence_row(
         return None
     sequence_features: list[list[float]] = []
     sequence_labels: list[int] = []
-    sequence_context_targets: list[list[float]] = []
+    sequence_boundary_delta_targets: list[list[float]] = []
     sequence_reasons: list[str] = []
     gap_indexes: list[int] = []
 
@@ -243,12 +243,12 @@ def _sequence_row(
             )
         )
         sequence_labels.append(1 if merge_target else 0)
-        sequence_context_targets.append(
-            _context_targets(
-                left=left,
-                right=right,
-                merge_target=merge_target,
+        sequence_boundary_delta_targets.append(
+            _boundary_delta_targets(
+                record=record,
+                gap_index=index,
                 reason=reason,
+                merge_target=merge_target,
                 config=config,
             )
         )
@@ -283,7 +283,7 @@ def _sequence_row(
             )
         )
         sequence_labels.append(1)
-        sequence_context_targets.append([0.0, 0.0])
+        sequence_boundary_delta_targets.append([0.0, 0.0])
         sequence_reasons.append("merge_synthetic_intra_island")
         gap_indexes.append(index)
         synthetic_count += 1
@@ -324,7 +324,7 @@ def _sequence_row(
         ),
         "sequence_features": sequence_features,
         "sequence_labels": sequence_labels,
-        "sequence_context_targets": sequence_context_targets,
+        "sequence_boundary_delta_targets": sequence_boundary_delta_targets,
         "sequence_reasons": sequence_reasons,
         "gap_indexes": gap_indexes,
         "metadata": {
@@ -398,29 +398,27 @@ def _label_gap(
     return None
 
 
-def _context_targets(
+def _boundary_delta_targets(
     *,
-    left: Segment,
-    right: Segment,
-    merge_target: bool,
+    record: LabelRecord,
+    gap_index: int,
     reason: str,
+    merge_target: bool,
     config: FrameSequenceConfig,
 ) -> list[float]:
-    if merge_target:
+    if merge_target or config.synthetic_boundary_delta_jitter_s <= 0.0:
         return [0.0, 0.0]
-    gap_s = max(0.0, right.start - left.end)
-    max_padding = max(0.0, float(config.context_max_padding_s))
-    overlap_cap = max(0.0, min(float(config.context_max_speech_overlap_s), max_padding))
-    if reason in {"split_overlap", "split_cut_point"}:
-        budget = min(overlap_cap, gap_s * 0.45 if gap_s > 0.0 else overlap_cap)
-    elif reason == "split_gap_zone":
-        budget = min(max_padding, gap_s * 0.35)
-    elif reason == "split_long_gap":
-        budget = min(max_padding, gap_s * 0.45)
-    else:
-        budget = min(max_padding, gap_s * 0.40)
-    budget = max(0.0, budget)
-    return [budget, budget]
+    if reason not in {"split_cut_point", "split_gap_zone", "split_long_gap", "split_overlap"}:
+        return [0.0, 0.0]
+    limit = max(0.0, float(config.synthetic_boundary_delta_jitter_s))
+    digest = hashlib.sha1(
+        f"{config.synthetic_boundary_delta_seed}:{record.audio_id}:{gap_index}:{reason}".encode("utf-8")
+    ).digest()
+    start_fraction = int.from_bytes(digest[:8], "big") / float(2**64 - 1)
+    end_fraction = int.from_bytes(digest[8:16], "big") / float(2**64 - 1)
+    start_delta = (start_fraction * 2.0 - 1.0) * limit
+    end_delta = (end_fraction * 2.0 - 1.0) * limit
+    return [round(start_delta, 6), round(end_delta, 6)]
 
 
 def _synthetic_merge_gap_s(
@@ -532,8 +530,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--synthetic-merge-gap-min-s", type=float, default=0.04)
     parser.add_argument("--synthetic-merge-gap-s", type=float, default=0.04)
     parser.add_argument("--synthetic-merge-min-segment-s", type=float, default=1.20)
-    parser.add_argument("--context-max-padding-s", type=float, default=1.5)
-    parser.add_argument("--context-max-speech-overlap-s", type=float, default=0.25)
+    parser.add_argument(
+        "--synthetic-boundary-delta-jitter-s",
+        type=float,
+        default=0.0,
+        help="Optional deterministic start/end delta supervision for split boundaries.",
+    )
+    parser.add_argument("--synthetic-boundary-delta-seed", type=int, default=240609)
     args = parser.parse_args(argv)
     if len(args.labels) != len(args.feature_manifest):
         parser.error("--labels and --feature-manifest must be provided the same number of times")
@@ -553,10 +556,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         parser.error("--synthetic-merge-gap-min-s must be non-negative")
     if args.synthetic_merge_gap_s < 0.0:
         parser.error("--synthetic-merge-gap-s must be non-negative")
-    if args.context_max_padding_s <= 0.0:
-        parser.error("--context-max-padding-s must be positive")
-    if args.context_max_speech_overlap_s < 0.0:
-        parser.error("--context-max-speech-overlap-s must be non-negative")
+    if args.synthetic_boundary_delta_jitter_s < 0.0:
+        parser.error("--synthetic-boundary-delta-jitter-s must be non-negative")
     return args
 
 
@@ -580,8 +581,8 @@ def main(argv: list[str] | None = None) -> None:
             synthetic_merge_gap_min_s=args.synthetic_merge_gap_min_s,
             synthetic_merge_gap_s=args.synthetic_merge_gap_s,
             synthetic_merge_min_segment_s=args.synthetic_merge_min_segment_s,
-            context_max_padding_s=args.context_max_padding_s,
-            context_max_speech_overlap_s=args.context_max_speech_overlap_s,
+            synthetic_boundary_delta_jitter_s=args.synthetic_boundary_delta_jitter_s,
+            synthetic_boundary_delta_seed=args.synthetic_boundary_delta_seed,
         ),
     )
     print(f"dataset={summary['output_jsonl']}")

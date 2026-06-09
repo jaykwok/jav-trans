@@ -190,14 +190,11 @@ class _LowLogprobBackend(_RecordingBackend):
 
 def _reload_pipeline(monkeypatch, tmp_path: Path):
     monkeypatch.setenv("BOUNDARY_FEATURE_FRAME_HOP_S", "0.02")
-    monkeypatch.setenv("BOUNDARY_CONTEXT_MAX_PADDING_S", "0")
-    monkeypatch.setenv("BOUNDARY_CONTEXT_MAX_SPEECH_OVERLAP_S", "0")
     monkeypatch.setenv("BOUNDARY_PLANNER_TARGET_CHUNK_S", "9.0")
     monkeypatch.setenv("BOUNDARY_PLANNER_MAX_CORE_CHUNK_S", "30.0")
-    monkeypatch.setenv("BOUNDARY_PLANNER_MAX_PADDED_CHUNK_S", "30.0")
     monkeypatch.setenv("ASR_CHUNK_ROOT", str(tmp_path / "chunks"))
     monkeypatch.setenv("ASR_CHECKPOINT_ENABLED", "0")
-    monkeypatch.setenv("BOUNDARY_REFINER_MODEL_PATH", "")
+    monkeypatch.setenv("BOUNDARY_REFINER_ENABLED", "0")
 
     from asr import pipeline as asr
 
@@ -238,12 +235,20 @@ def _run_transcription_with_backend(
     return backend, segments, log, details
 
 
-def test_boundary_planner_packs_speech_segments_before_transcribe(monkeypatch, tmp_path):
+def test_boundary_planner_emits_one_asr_chunk_per_speech_island(monkeypatch, tmp_path):
     backend, _segments, log, details = _run_transcription(monkeypatch, tmp_path)
 
-    assert len(backend.audio_paths) < 10
+    assert len(backend.audio_paths) == 10
     assert details["chunk_count"] == len(backend.audio_paths)
-    assert any("[chunk] idx=0" in entry and "speech_segment_count=10" in entry for entry in log)
+    assert details["boundary_signature"]["backend"] == "stub"
+    assert details["boundary_signature"]["boundary_pipeline"]["version"] == 4
+    assert all(
+        "source_boundary.wav" not in str(Path(path).name) for path in backend.audio_paths
+    )
+    chunk_log_entries = [entry for entry in log if entry.startswith("[chunk] idx=")]
+    assert len(chunk_log_entries) == 10
+    assert all("speech_segment_count=1" in entry for entry in chunk_log_entries)
+    assert any("[chunk] idx=0" in entry and "speech_segment_count=1" in entry for entry in log)
 
 
 def test_empty_allowed_boundary_does_not_fallback_to_full_audio(monkeypatch, tmp_path):
@@ -295,8 +300,6 @@ def test_packed_chunk_metadata_uses_source_span_index_after_short_chunk_drop():
         end=0.1,
         speech_segments=[SpeechSegment(0.0, 0.1, 0.1)],
         duration=0.1,
-        left_padding_s=0.0,
-        right_padding_s=0.0,
         split_reason="skipped",
         boundary_score=0.1,
         boundary_reason="wrong",
@@ -310,8 +313,6 @@ def test_packed_chunk_metadata_uses_source_span_index_after_short_chunk_drop():
             SpeechSegment(1.6, 2.0, 0.9),
         ],
         duration=1.0,
-        left_padding_s=0.1,
-        right_padding_s=0.2,
         split_reason="tail",
         parent_chunk_id=7,
         island_id=1,
@@ -324,6 +325,8 @@ def test_packed_chunk_metadata_uses_source_span_index_after_short_chunk_drop():
         boundary_decision_merge=False,
         boundary_merge_prob=0.13,
         boundary_split_prob=0.87,
+        boundary_start_refine_delta_s=0.04,
+        boundary_end_refine_delta_s=-0.03,
         boundary_decision_source="frame_sequence_refiner",
     )
     chunk_infos = [
@@ -346,6 +349,8 @@ def test_packed_chunk_metadata_uses_source_span_index_after_short_chunk_drop():
     assert chunk_infos[0]["boundary_decision_merge"] is False
     assert chunk_infos[0]["boundary_merge_prob"] == 0.13
     assert chunk_infos[0]["boundary_split_prob"] == 0.87
+    assert chunk_infos[0]["boundary_start_refine_delta_s"] == 0.04
+    assert chunk_infos[0]["boundary_end_refine_delta_s"] == -0.03
     assert chunk_infos[0]["boundary_decision_source"] == "frame_sequence_refiner"
     assert any("speech_segment_count=2" in entry and "source=cut" in entry for entry in log)
 
@@ -356,8 +361,6 @@ def test_alignment_fallback_window_metadata_uses_speech_core():
     chunk = {
         "start": 10.0,
         "end": 20.0,
-        "speech_left_padding_s": 2.0,
-        "speech_right_padding_s": 1.5,
     }
     text_result = {
         "text": "テスト",
@@ -370,9 +373,9 @@ def test_alignment_fallback_window_metadata_uses_speech_core():
 
     annotated = asr._with_alignment_fallback_window(chunk, text_result)
 
-    assert annotated["alignment_fallback_start_s"] == 2.0
-    assert annotated["alignment_fallback_end_s"] == 8.5
-    assert annotated["alignment_fallback_source"] == "speech_core"
+    assert annotated["alignment_fallback_start_s"] == 0.0
+    assert annotated["alignment_fallback_end_s"] == 10.0
+    assert annotated["alignment_fallback_source"] == "chunk"
 
 
 def test_alignment_fallback_count_deduplicates_chunk_log_markers():
@@ -390,6 +393,59 @@ def test_alignment_fallback_count_deduplicates_chunk_log_markers():
     ]
 
     assert asr._alignment_fallback_count_from_log(log) == 3
+
+
+def test_alignment_outcome_metadata_is_written_to_chunks_and_segments():
+    from asr import pipeline as asr
+
+    chunk = {"index": 4, "start": 10.0, "end": 12.0}
+    text_result = {
+        "text": "こんにちは",
+        "raw_text": "こんにちは",
+        "duration": 2.0,
+        "language": "Japanese",
+    }
+    chunk_words = [
+        {"start": 0.1, "end": 0.4, "word": "こん"},
+        {"start": 0.4, "end": 0.8, "word": "にちは"},
+    ]
+    outcome = asr._alignment_outcome_for_chunk(
+        chunk=chunk,
+        chunk_result={**text_result, "alignment_mode": "forced_aligner"},
+        chunk_words=chunk_words,
+        chunk_log=["Alignment 词数: 2", "Alignment 模式: forced_aligner"],
+    )
+    transcript = asr._build_transcript_chunks(
+        [chunk],
+        [text_result],
+        {4: outcome},
+    )
+    segments = asr._annotate_segments_with_alignment_outcomes(
+        [
+            {
+                "start": 10.1,
+                "end": 10.8,
+                "text": "こんにちは",
+                "source_chunk_index": 4,
+                "words": [
+                    {
+                        "start": 10.1,
+                        "end": 10.4,
+                        "word": "こん",
+                        "source_chunk_index": 4,
+                    }
+                ],
+            }
+        ],
+        {4: outcome},
+    )
+
+    assert outcome["alignment_quality"] == "forced"
+    assert outcome["forced_success"] is True
+    assert transcript[0]["alignment_quality"] == "forced"
+    assert transcript[0]["fallback_subtype"] == "none"
+    assert segments[0]["alignment_quality"] == "forced"
+    assert segments[0]["source_chunk_indices"] == [4]
 
 
 def test_adaptive_precision_reviews_low_logprob_before_alignment(monkeypatch, tmp_path):

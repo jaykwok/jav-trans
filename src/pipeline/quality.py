@@ -113,6 +113,22 @@ def _quality_report_markdown(video_stem: str, report: dict) -> str:
         "subtitle_duration_p90_s",
         "subtitle_duration_p95_s",
         "subtitle_duration_max_s",
+        "subtitle_density_cps_threshold",
+        "subtitle_density_over_4cps_count",
+        "subtitle_density_over_4cps_ratio",
+        "subtitle_density_max_ja_cps",
+        "subtitle_density_p90_ja_cps",
+        "subtitle_density_p95_ja_cps",
+        "subtitle_density_window_10s_max_cue_count",
+        "subtitle_density_window_10s_max_active_ratio",
+        "subtitle_density_window_10s_max_cps",
+        "subtitle_density_window_10s_min_gap_s",
+        "subtitle_density_window_10s_median_gap_s",
+        "subtitle_density_window_30s_max_cue_count",
+        "subtitle_density_window_30s_max_active_ratio",
+        "subtitle_density_window_30s_max_cps",
+        "subtitle_density_window_30s_min_gap_s",
+        "subtitle_density_window_30s_median_gap_s",
         "per_min_subtitle_count",
         "glossary_hit_rate",
         "alignment_fallback_count",
@@ -158,6 +174,19 @@ def _quality_report_markdown(video_stem: str, report: dict) -> str:
                 f"{_format_report_value(item.get('current_start'))}-"
                 f"{_format_report_value(item.get('current_end'))} by "
                 f"{_format_report_value(item.get('overlap_s'))}s"
+            )
+
+    density_examples = list(report.get("subtitle_density_review_examples") or [])
+    if density_examples:
+        lines.extend(["", "## Density Review Examples", ""])
+        for item in density_examples[:20]:
+            lines.append(
+                "- "
+                f"#{item.get('index')} "
+                f"{_format_report_value(item.get('start'))}-"
+                f"{_format_report_value(item.get('end'))}: "
+                f"{_format_report_value(item.get('ja_cps'))} cps, "
+                f"{item.get('ja_units')} units"
             )
 
     review_items = report.get("asr_review_uncertain_items")

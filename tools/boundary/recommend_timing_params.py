@@ -42,12 +42,6 @@ def main() -> int:
         help="Source-domain speech duration divided by target-domain speech duration. Default: 1.5",
     )
     parser.add_argument(
-        "--max-padded-cap-s",
-        type=float,
-        default=9.0,
-        help="Hard cap for padded ASR chunk context. Default: 9.0",
-    )
-    parser.add_argument(
         "--env",
         action="store_true",
         help="Print .env lines instead of full JSON.",
@@ -57,7 +51,6 @@ def main() -> int:
     result = recommend_boundary_timing_params(
         _load_duration_stats(args.summary_json),
         target_domain_speedup=args.target_domain_speedup,
-        max_padded_cap_s=args.max_padded_cap_s,
     )
     if args.env:
         for key, value in result["env"].items():

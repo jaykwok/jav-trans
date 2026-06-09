@@ -1,13 +1,13 @@
 from asr import pipeline as asr
 
 
-def test_word_merge_does_not_cross_source_chunk_boundary():
+def test_word_group_does_not_cross_source_chunk_boundary():
     words = [
         {"start": 0.0, "end": 0.4, "word": "よろしくお願いいたします。", "source_chunk_index": 1},
         {"start": 0.5, "end": 0.9, "word": "お願いします。", "source_chunk_index": 2},
     ]
 
-    segments = asr._merge_words_to_segments(words)
+    segments = asr._group_words_to_segments(words)
     postprocessed = asr._postprocess_segments(segments)
 
     assert [segment["text"] for segment in postprocessed] == [
@@ -16,13 +16,13 @@ def test_word_merge_does_not_cross_source_chunk_boundary():
     ]
 
 
-def test_word_merge_splits_compact_sentence_turns_inside_chunk():
+def test_word_group_splits_compact_sentence_turns_inside_chunk():
     words = [
         {"start": 0.0, "end": 0.4, "word": "そうですね。", "source_chunk_index": 1},
         {"start": 0.5, "end": 1.0, "word": "ありがとうございます。", "source_chunk_index": 1},
     ]
 
-    segments = asr._merge_words_to_segments(words)
+    segments = asr._group_words_to_segments(words)
 
     assert [segment["text"] for segment in segments] == [
         "そうですね。",
@@ -30,7 +30,7 @@ def test_word_merge_splits_compact_sentence_turns_inside_chunk():
     ]
 
 
-def test_postprocess_keeps_same_chunk_fragments_mergeable():
+def test_postprocess_keeps_same_chunk_fragments_separate():
     segments = [
         {"start": 0.0, "end": 0.5, "text": "本日は", "source_chunk_index": 1},
         {"start": 0.55, "end": 1.2, "text": "ありがとうございます。", "source_chunk_index": 1},
@@ -38,7 +38,7 @@ def test_postprocess_keeps_same_chunk_fragments_mergeable():
 
     postprocessed = asr._postprocess_segments(segments)
 
-    assert [segment["text"] for segment in postprocessed] == ["本日はありがとうございます。"]
+    assert [segment["text"] for segment in postprocessed] == ["本日は", "ありがとうございます。"]
 
 
 def test_postprocess_keeps_short_domain_vocalizations():
@@ -54,7 +54,11 @@ def test_postprocess_keeps_short_domain_vocalizations():
     postprocessed = asr._postprocess_segments(segments)
 
     assert [segment["text"] for segment in postprocessed] == [
-        "はぁうん気持ち好きたたたた",
+        "はぁ",
+        "うん",
+        "気持ち",
+        "好き",
+        "たたたた",
     ]
 
 
@@ -71,7 +75,7 @@ def test_postprocess_preserves_word_backed_context_actor_intro(monkeypatch):
         {"start": 12.06, "end": 12.30, "word": "ます", "source_chunk_index": 0},
     ]
 
-    postprocessed = asr._postprocess_segments(asr._merge_words_to_segments(words))
+    postprocessed = asr._postprocess_segments(asr._group_words_to_segments(words))
 
     assert [segment["text"] for segment in postprocessed] == [
         "...小那海あやです。よろしくお願いします"

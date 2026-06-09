@@ -5,7 +5,7 @@ from asr import pipeline
 
 def test_chunk_config_reads_boundary_refiner_env_at_runtime(monkeypatch):
     monkeypatch.setenv("BOUNDARY_REFINER_ENABLED", "1")
-    monkeypatch.setenv("BOUNDARY_REFINER_MODEL_PATH", "models/boundary-refiner.pt")
+    monkeypatch.setenv("BOUNDARY_REFINER_MODEL_PATH", "src/boundary/checkpoints/boundary_refiner.pt")
     monkeypatch.setenv("BOUNDARY_REFINER_BACKBONE", "transformers.Mamba2Model")
     monkeypatch.setenv("BOUNDARY_REFINER_DEVICE", "cuda")
     monkeypatch.setenv("BOUNDARY_REFINER_THRESHOLD", "0.63")
@@ -13,7 +13,7 @@ def test_chunk_config_reads_boundary_refiner_env_at_runtime(monkeypatch):
     cfg = pipeline._boundary_config()
 
     assert cfg["boundary_refiner_enabled"] is True
-    assert cfg["boundary_refiner_model_path"] == "models/boundary-refiner.pt"
+    assert cfg["boundary_refiner_model_path"] == "src/boundary/checkpoints/boundary_refiner.pt"
     assert cfg["boundary_refiner_backbone"] == "transformers.Mamba2Model"
     assert cfg["boundary_refiner_device"] == "cuda"
     assert cfg["boundary_refiner_threshold"] == 0.63
@@ -44,35 +44,15 @@ def test_chunk_config_reads_boundary_planner_env_at_runtime(monkeypatch):
     monkeypatch.setenv("BOUNDARY_FEATURE_FRAME_HOP_S", "0.04")
     monkeypatch.setenv("BOUNDARY_PLANNER_TARGET_CHUNK_S", "8.0")
     monkeypatch.setenv("BOUNDARY_PLANNER_MAX_CORE_CHUNK_S", "5.5")
-    monkeypatch.setenv("BOUNDARY_PLANNER_MAX_PADDED_CHUNK_S", "28.0")
     monkeypatch.setenv("BOUNDARY_PLANNER_MIN_CHUNK_S", "0.5")
-    monkeypatch.setenv("BOUNDARY_PLANNER_START_WEIGHT", "1.7")
-    monkeypatch.setenv("BOUNDARY_CONTEXT_MAX_PADDING_S", "1.4")
-    monkeypatch.setenv("BOUNDARY_CONTEXT_MAX_SPEECH_OVERLAP_S", "0.2")
     monkeypatch.setenv("BOUNDARY_PLANNER_MAX_SPLITS_PER_SEGMENT", "12")
     monkeypatch.setenv("BOUNDARY_PLANNER_SEQUENCE_BATCH_SIZE", "128")
-    monkeypatch.setenv("BOUNDARY_DP_CHUNK_BASE_COST", "0.02")
-    monkeypatch.setenv("BOUNDARY_DP_OVER_TARGET_WEIGHT", "0.4")
-    monkeypatch.setenv("BOUNDARY_DP_FAR_OVER_TARGET_WEIGHT", "1.8")
-    monkeypatch.setenv("BOUNDARY_DP_UNDER_MIN_WEIGHT", "0.1")
-    monkeypatch.setenv("BOUNDARY_DP_LONG_GAP_WEIGHT", "0.7")
-    monkeypatch.setenv("BOUNDARY_DP_SPLIT_MERGE_WEIGHT", "0.2")
 
     cfg = pipeline._boundary_config()
 
     assert cfg["feature_frame_hop_s"] == 0.04
     assert cfg["boundary_planner_target_chunk_s"] == 8.0
     assert cfg["boundary_planner_max_core_chunk_s"] == 5.5
-    assert cfg["boundary_planner_max_padded_chunk_s"] == 28.0
     assert cfg["boundary_planner_min_chunk_s"] == 0.5
-    assert cfg["boundary_planner_start_weight"] == 1.7
-    assert cfg["boundary_context_max_padding_s"] == 1.4
-    assert cfg["boundary_context_max_speech_overlap_s"] == 0.2
     assert cfg["boundary_planner_max_splits_per_segment"] == 12
     assert cfg["boundary_planner_sequence_batch_size"] == 128
-    assert cfg["boundary_dp_chunk_base_cost"] == 0.02
-    assert cfg["boundary_dp_over_target_weight"] == 0.4
-    assert cfg["boundary_dp_far_over_target_weight"] == 1.8
-    assert cfg["boundary_dp_under_min_weight"] == 0.1
-    assert cfg["boundary_dp_long_gap_weight"] == 0.7
-    assert cfg["boundary_dp_split_merge_weight"] == 0.2

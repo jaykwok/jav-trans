@@ -49,7 +49,7 @@ def test_audit_index_lists_latest_without_auto_refresh(tmp_path: Path):
     assert "location.reload" not in index
     assert 'class="delete-audit"' in index
     assert "/__audit_api__/delete-audit" in index
-    assert "live-server --middleware=tools/audits/live_server_audit_middleware.js" in index
+    assert "tools/audits/serve_audits.sh" in index
     assert "127.0.0.1:8765" not in index
     assert "audit_nav.py serve" not in index
     assert "audit_nav.py delete --href" in index

@@ -85,25 +85,25 @@ def test_qwen_asr_batch_size_auto_uses_repo_table(monkeypatch):
 
     monkeypatch.setenv(
         "ASR_BATCH_SIZE_BY_REPO",
-        f"{ASR_06B_BACKEND}=48,{ASR_17B_BACKEND}=12",
+        f"{ASR_06B_BACKEND}=64,{ASR_17B_BACKEND}=32",
     )
 
-    assert qwen.qwen_asr_default_batch_size(ASR_06B_BACKEND) == 48
-    assert qwen.qwen_asr_default_batch_size(ASR_17B_BACKEND) == 12
+    assert qwen.qwen_asr_default_batch_size(ASR_06B_BACKEND) == 64
+    assert qwen.qwen_asr_default_batch_size(ASR_17B_BACKEND) == 32
 
 
 def test_local_backend_asr_batch_size_auto_and_numeric_override(monkeypatch):
     monkeypatch.setenv("ASR_BACKEND", ASR_17B_BACKEND)
     monkeypatch.setenv(
         "ASR_BATCH_SIZE_BY_REPO",
-        f"{ASR_06B_BACKEND}=48,{ASR_17B_BACKEND}=12",
+        f"{ASR_06B_BACKEND}=64,{ASR_17B_BACKEND}=32",
     )
     monkeypatch.setenv("ASR_BATCH_SIZE", "auto")
 
     from asr import local_backend
 
     reloaded = importlib.reload(local_backend)
-    assert reloaded.ASR_BATCH_SIZE == 12
+    assert reloaded.ASR_BATCH_SIZE == 32
 
     monkeypatch.setenv("ASR_BATCH_SIZE", "7")
     reloaded = importlib.reload(local_backend)
