@@ -68,7 +68,6 @@ def test_translation_uses_pre_normalized_cues(monkeypatch, tmp_path):
         subtitle_mode="zh",
         translation_max_workers=1,
         keep_temp_files=True,
-        advanced={"SUBTITLE_MERGE_ADJACENT": "0"},
     )
     seen: dict[str, object] = {}
 

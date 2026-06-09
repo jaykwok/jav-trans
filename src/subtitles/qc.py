@@ -111,6 +111,124 @@ def _subtitle_duration_stats(segments: list[dict]) -> dict:
 
 
 _KANA_ONLY_RE = re.compile(r"^[ぁ-ゟァ-ヿ\s、。！？…ー～「」『』・\(\)（）]+$")
+_COMPACT_TEXT_RE = re.compile(r"\s+")
+
+
+def _subtitle_text_units(segment: dict) -> int:
+    text = str(segment.get("text") or segment.get("ja") or "")
+    return len(_COMPACT_TEXT_RE.sub("", text))
+
+
+def _subtitle_density_audit_stats(
+    segments: list[dict],
+    *,
+    cps_threshold: float = 4.0,
+) -> dict:
+    cues: list[dict] = []
+    for index, segment in enumerate(segments):
+        try:
+            start = float(segment.get("start", 0.0))
+            end = float(segment.get("end", start))
+        except (TypeError, ValueError):
+            continue
+        end = max(start, end)
+        duration = max(0.001, end - start)
+        units = _subtitle_text_units(segment)
+        cps = units / duration if units > 0 else 0.0
+        cues.append(
+            {
+                "index": index,
+                "start": start,
+                "end": end,
+                "duration": duration,
+                "units": units,
+                "cps": cps,
+            }
+        )
+    cues.sort(key=lambda item: (item["start"], item["end"], item["index"]))
+
+    over_threshold = [cue for cue in cues if cue["cps"] > cps_threshold]
+    max_cps = max((cue["cps"] for cue in cues), default=0.0)
+    cps_values = sorted(cue["cps"] for cue in cues)
+
+    def window_stats(window_s: float) -> dict:
+        max_count = 0
+        max_active_ratio = 0.0
+        max_window_cps = 0.0
+        min_gap: float | None = None
+        median_gap_values: list[float] = []
+        for cue in cues:
+            window_start = cue["start"]
+            window_end = window_start + window_s
+            members = [
+                item
+                for item in cues
+                if item["end"] > window_start and item["start"] < window_end
+            ]
+            if not members:
+                continue
+            max_count = max(max_count, len(members))
+            active_s = sum(
+                max(
+                    0.0,
+                    min(item["end"], window_end) - max(item["start"], window_start),
+                )
+                for item in members
+            )
+            max_active_ratio = max(max_active_ratio, active_s / max(window_s, 0.001))
+            max_window_cps = max(
+                max_window_cps,
+                sum(item["units"] for item in members) / max(window_s, 0.001),
+            )
+            gaps = [
+                max(0.0, right["start"] - left["end"])
+                for left, right in zip(members, members[1:])
+            ]
+            if gaps:
+                gap_sorted = sorted(gaps)
+                min_gap = min(gap_sorted[0], min_gap) if min_gap is not None else gap_sorted[0]
+                median_gap_values.append(_percentile(gap_sorted, 0.50))
+        median_gap_values.sort()
+        return {
+            f"subtitle_density_window_{int(window_s)}s_max_cue_count": max_count,
+            f"subtitle_density_window_{int(window_s)}s_max_active_ratio": round(
+                max_active_ratio,
+                3,
+            ),
+            f"subtitle_density_window_{int(window_s)}s_max_cps": round(max_window_cps, 3),
+            f"subtitle_density_window_{int(window_s)}s_min_gap_s": round(min_gap, 3)
+            if min_gap is not None
+            else None,
+            f"subtitle_density_window_{int(window_s)}s_median_gap_s": round(
+                _percentile(median_gap_values, 0.50),
+                3,
+            )
+            if median_gap_values
+            else None,
+        }
+
+    examples = [
+        {
+            "index": cue["index"],
+            "start": round(cue["start"], 3),
+            "end": round(cue["end"], 3),
+            "duration_s": round(cue["duration"], 3),
+            "ja_units": cue["units"],
+            "ja_cps": round(cue["cps"], 3),
+        }
+        for cue in sorted(over_threshold, key=lambda item: (-item["cps"], item["start"]))[:20]
+    ]
+    return {
+        "subtitle_density_cps_threshold": round(cps_threshold, 3),
+        "subtitle_density_over_4cps_count": len(over_threshold),
+        "subtitle_density_over_4cps_ratio": round(len(over_threshold) / max(1, len(cues)), 6),
+        "subtitle_density_max_ja_cps": round(max_cps, 3),
+        "subtitle_density_p90_ja_cps": round(_percentile(cps_values, 0.90), 3),
+        "subtitle_density_p95_ja_cps": round(_percentile(cps_values, 0.95), 3),
+        "subtitle_density_review_examples": examples,
+        **window_stats(10.0),
+        **window_stats(30.0),
+    }
 
 
 def compute_quality_report(
@@ -136,6 +254,7 @@ def compute_quality_report(
     )
     overlap_stats = _subtitle_overlap_stats(segments)
     duration_stats = _subtitle_duration_stats(segments)
+    density_stats = _subtitle_density_audit_stats(segments)
     alignment_fallback_total = max(int(total_segments or 0), 0)
 
     n = len(segments)
@@ -165,6 +284,7 @@ def compute_quality_report(
             "asr_review_uncertain_items": asr_review_uncertain_items,
             **overlap_stats,
             **duration_stats,
+            **density_stats,
             "warnings": warnings,
         }
 
@@ -277,6 +397,7 @@ def compute_quality_report(
         "asr_review_uncertain_items": asr_review_uncertain_items,
         **overlap_stats,
         **duration_stats,
+        **density_stats,
         "warnings": warnings,
     }
     return report

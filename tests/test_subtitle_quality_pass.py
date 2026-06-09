@@ -40,6 +40,28 @@ def test_write_bilingual_srt_does_not_normalize_unprepared_blocks(tmp_path):
     assert "00:00:00,000 --> 00:00:01,199" in path.read_text(encoding="utf-8")
 
 
+def test_write_srt_returned_blocks_match_min_written_duration(tmp_path):
+    path = tmp_path / "min-duration.srt"
+    written = subtitle.write_srt(
+        [{"start": 1.0, "end": 1.0, "zh_text": "短い"}],
+        str(path),
+    )
+
+    assert written[0]["end"] == pytest.approx(1.05)
+    assert "00:00:01,000 --> 00:00:01,050" in path.read_text(encoding="utf-8")
+
+
+def test_write_bilingual_srt_returned_blocks_match_min_written_duration(tmp_path):
+    path = tmp_path / "min-duration-bilingual.srt"
+    written = subtitle.write_bilingual_srt(
+        [{"start": 2.0, "end": 2.0, "ja_text": "あ", "zh_text": "啊"}],
+        str(path),
+    )
+
+    assert written[0]["end"] == pytest.approx(2.05)
+    assert "00:00:02,000 --> 00:00:02,049" in path.read_text(encoding="utf-8")
+
+
 def test_wrap_subtitle_line_uses_hiragana_kanji_boundary():
     assert subtitle._wrap_subtitle_line("あいうえ漢字テスト", max_chars=5) == (
         "あいうえ\n漢字テスト"
@@ -75,7 +97,7 @@ def test_prepare_srt_blocks_sorts_and_removes_overlap_with_frame_gap():
         {"start": 1.0, "end": 2.0, "ja_text": "い", "zh_text": "乙"},
         {"start": 0.0, "end": 1.2, "ja_text": "あ", "zh_text": "甲"},
     ]
-    options = SubtitleOptions(video_fps=25.0, merge_adjacent=False)
+    options = SubtitleOptions(video_fps=25.0)
 
     prepared = subtitle.prepare_srt_blocks(blocks, options=options, mode="bilingual")
 
@@ -101,14 +123,14 @@ def test_prepare_srt_blocks_anchors_start_to_first_timed_word():
 
     prepared = subtitle.prepare_srt_blocks(
         blocks,
-        options=SubtitleOptions(video_fps=25.0, merge_adjacent=False),
+        options=SubtitleOptions(video_fps=25.0),
         mode="bilingual",
     )
 
     assert prepared[0]["start"] == pytest.approx(10.0)
 
 
-def test_prepare_srt_blocks_merged_cue_preserves_earliest_word_start_anchor():
+def test_prepare_srt_blocks_preserves_earliest_word_start_anchor_without_merge():
     blocks = [
         {
             "start": 10.35,
@@ -128,11 +150,11 @@ def test_prepare_srt_blocks_merged_cue_preserves_earliest_word_start_anchor():
 
     prepared = subtitle.prepare_srt_blocks(
         blocks,
-        options=SubtitleOptions(video_fps=25.0, merge_adjacent=True),
+        options=SubtitleOptions(video_fps=25.0),
         mode="bilingual",
     )
 
-    assert len(prepared) == 1
+    assert len(prepared) == 2
     assert prepared[0]["start"] == pytest.approx(10.0)
 
 
@@ -141,7 +163,7 @@ def test_prepare_srt_blocks_final_normalize_guards_reading_window_overlap(monkey
         {"start": 0.0, "end": 1.0, "ja_text": "あ", "zh_text": "甲"},
         {"start": 1.2, "end": 2.0, "ja_text": "い", "zh_text": "乙"},
     ]
-    options = SubtitleOptions(video_fps=25.0, merge_adjacent=False)
+    options = SubtitleOptions(video_fps=25.0)
     original_resolve = subtitle._resolve_subtitle_window
 
     def expand_first_window(blocks, idx, *, options=None):
@@ -164,7 +186,6 @@ def test_timing_polish_collapses_short_gap_to_two_frames():
     ]
     options = SubtitleOptions(
         video_fps=25.0,
-        merge_adjacent=False,
         timing_polish_enabled=True,
         short_gap_collapse_s=0.5,
         linger_s=0.45,
@@ -183,7 +204,6 @@ def test_timing_polish_preserves_natural_pause():
     ]
     options = SubtitleOptions(
         video_fps=25.0,
-        merge_adjacent=False,
         timing_polish_enabled=True,
         short_gap_collapse_s=0.5,
         linger_s=0.45,
@@ -202,7 +222,6 @@ def test_timing_polish_disabled_keeps_existing_alignment_end():
     ]
     options = SubtitleOptions(
         video_fps=25.0,
-        merge_adjacent=False,
         timing_polish_enabled=False,
         short_gap_collapse_s=0.5,
         linger_s=0.45,
@@ -226,7 +245,7 @@ def test_timing_polish_respects_max_duration():
     assert prepared[0]["end"] == pytest.approx(6.5)
 
 
-def test_dense_short_cue_merge_reduces_micro_cues():
+def test_short_cues_are_not_merged():
     blocks = [
         {"start": 0.0, "end": 0.35, "ja_text": "あ", "zh_text": "啊"},
         {"start": 0.42, "end": 0.80, "ja_text": "ん", "zh_text": "嗯"},
@@ -234,23 +253,15 @@ def test_dense_short_cue_merge_reduces_micro_cues():
     ]
     options = SubtitleOptions(
         video_fps=29.97,
-        merge_adjacent=True,
-        dense_cue_merge_enabled=True,
-        dense_cue_merge_max_gap_frames=4,
-        dense_cue_merge_max_single_frames=24,
-        dense_cue_merge_max_combined_frames=90,
-        dense_cue_merge_max_text_units=12,
     )
 
     prepared = subtitle.prepare_srt_blocks(blocks, options=options, mode="bilingual")
 
-    assert len(prepared) == 2
-    assert prepared[0]["ja_text"] == "あ ん"
-    assert prepared[0]["zh_text"] == "啊，嗯"
-    assert prepared[0]["end"] + options.frame_gap_s <= prepared[1]["start"]
+    assert len(prepared) == 3
+    assert [item["ja_text"] for item in prepared] == ["あ", "ん", "いい"]
 
 
-def test_merge_adjacent_false_disables_dense_short_cue_merge():
+def test_close_short_cues_remain_separate():
     blocks = [
         {"start": 0.0, "end": 0.35, "ja_text": "あ", "zh_text": "啊"},
         {"start": 0.42, "end": 0.80, "ja_text": "ん", "zh_text": "嗯"},
@@ -258,34 +269,28 @@ def test_merge_adjacent_false_disables_dense_short_cue_merge():
 
     prepared = subtitle.prepare_srt_blocks(
         blocks,
-        options=SubtitleOptions(
-            video_fps=29.97,
-            merge_adjacent=False,
-            dense_cue_merge_enabled=True,
-        ),
+        options=SubtitleOptions(video_fps=29.97),
         mode="bilingual",
     )
 
     assert len(prepared) == 2
 
 
-def test_dense_short_cue_merge_ignores_acoustic_metadata_when_enabled():
+def test_short_cues_ignore_acoustic_metadata_without_merge():
     blocks = [
         {"start": 0.0, "end": 0.35, "ja_text": "あ", "zh_text": "啊"},
         {"start": 0.42, "end": 0.80, "ja_text": "ん", "zh_text": "嗯"},
     ]
     options = SubtitleOptions(
         video_fps=29.97,
-        merge_adjacent=True,
-        dense_cue_merge_enabled=True,
     )
 
     prepared = subtitle.prepare_srt_blocks(blocks, options=options, mode="bilingual")
 
-    assert len(prepared) == 1
+    assert len(prepared) == 2
 
 
-def test_prepare_srt_blocks_uses_merge_adjacent_for_japanese_only():
+def test_prepare_srt_blocks_has_same_no_merge_behavior_for_japanese_only():
     blocks = [
         {"start": 0.0, "end": 0.40, "ja_text": "あ", "zh_text": "あ"},
         {"start": 0.46, "end": 0.90, "ja_text": "ん", "zh_text": "ん"},
@@ -293,46 +298,43 @@ def test_prepare_srt_blocks_uses_merge_adjacent_for_japanese_only():
 
     merged = subtitle.prepare_srt_blocks(
         blocks,
-        options=SubtitleOptions(video_fps=29.97, merge_adjacent=True),
+        options=SubtitleOptions(video_fps=29.97),
         mode="srt",
     )
     unmerged = subtitle.prepare_srt_blocks(
         blocks,
-        options=SubtitleOptions(video_fps=29.97, merge_adjacent=False),
+        options=SubtitleOptions(video_fps=29.97),
         mode="srt",
     )
 
-    assert len(merged) == 1
-    assert merged[0]["ja_text"] == "あ ん"
+    assert len(merged) == 2
     assert len(unmerged) == 2
 
 
-def test_final_merge_pass_merges_after_timing_polish_collapses_gap():
+def test_timing_polish_does_not_merge_after_collapsing_gap():
     blocks = [
         {"start": 0.0, "end": 0.40, "ja_text": "あ", "zh_text": "あ"},
         {"start": 0.90, "end": 1.30, "ja_text": "ん", "zh_text": "ん"},
     ]
     options = SubtitleOptions(
         video_fps=25.0,
-        merge_adjacent=True,
         timing_polish_enabled=True,
         short_gap_collapse_s=0.5,
     )
 
     prepared = subtitle.prepare_srt_blocks(blocks, options=options, mode="srt")
 
-    assert len(prepared) == 1
-    assert prepared[0]["ja_text"] == "あ ん"
+    assert len(prepared) == 2
+    assert prepared[0]["end"] + options.frame_gap_s <= prepared[1]["start"]
 
 
-def test_final_merge_pass_respects_merge_adjacent_switch():
+def test_timing_polish_keeps_short_cues_separate():
     blocks = [
         {"start": 0.0, "end": 0.40, "ja_text": "あ", "zh_text": "あ"},
         {"start": 0.90, "end": 1.30, "ja_text": "ん", "zh_text": "ん"},
     ]
     options = SubtitleOptions(
         video_fps=25.0,
-        merge_adjacent=False,
         timing_polish_enabled=True,
         short_gap_collapse_s=0.5,
     )
@@ -361,13 +363,12 @@ def test_prepare_srt_blocks_merges_overlap_when_too_tight():
 
     prepared = subtitle.prepare_srt_blocks(
         blocks,
-        options=SubtitleOptions(video_fps=29.97, merge_adjacent=False),
+        options=SubtitleOptions(video_fps=29.97),
         mode="bilingual",
     )
 
-    assert len(prepared) == 1
-    assert prepared[0]["ja_text"] == "あ い"
-    assert prepared[0]["zh_text"] == "甲，乙"
+    assert len(prepared) == 2
+    assert prepared[0]["end"] <= prepared[1]["start"]
 
 
 def test_normalize_subtitle_timeline_locks_next_start_when_too_tight():
@@ -385,7 +386,7 @@ def test_normalize_subtitle_timeline_locks_next_start_when_too_tight():
             "zh_text": "下" * 80,
         },
     ]
-    options = SubtitleOptions(video_fps=25.0, merge_adjacent=False)
+    options = SubtitleOptions(video_fps=25.0)
 
     prepared = subtitle.prepare_srt_blocks(blocks, options=options, mode="bilingual")
 
@@ -400,7 +401,7 @@ def test_write_bilingual_srt_returns_normalized_blocks(tmp_path):
         {"start": 0.0, "end": 1.2, "ja_text": "あ", "zh_text": "甲"},
         {"start": 1.0, "end": 2.0, "ja_text": "い", "zh_text": "乙"},
     ]
-    options = SubtitleOptions(video_fps=25.0, merge_adjacent=False)
+    options = SubtitleOptions(video_fps=25.0)
 
     prepared = subtitle.prepare_srt_blocks(blocks, options=options, mode="bilingual")
     written = subtitle.write_bilingual_srt(prepared, str(path), options=options)
@@ -409,8 +410,8 @@ def test_write_bilingual_srt_returns_normalized_blocks(tmp_path):
     assert "00:00:00,000 --> 00:00:00,920" in path.read_text(encoding="utf-8")
 
 
-def test_merge_adjacent_short_blocks(tmp_path):
-    path = tmp_path / "merged.srt"
+def test_adjacent_short_blocks_are_not_merged(tmp_path):
+    path = tmp_path / "not_merged.srt"
     blocks = [
         {"start": 0.0, "end": 1.0, "ja_text": "いい", "zh_text": "好"},
         {"start": 1.1, "end": 2.0, "ja_text": "もっと", "zh_text": "更多"},
@@ -420,12 +421,14 @@ def test_merge_adjacent_short_blocks(tmp_path):
     subtitle.write_bilingual_srt(prepared, str(path))
 
     content = path.read_text(encoding="utf-8")
-    assert _cue_count(content) == 1
-    assert "いい もっと" in content
-    assert "好，更多" in content
+    assert _cue_count(content) == 2
+    assert "いい\n好" in content
+    assert "もっと\n更多" in content
+    assert "いい もっと" not in content
+    assert "好，更多" not in content
 
 
-def test_merge_adjacent_short_blocks_stops_after_sentence_punctuation(tmp_path):
+def test_adjacent_blocks_stay_separate_after_sentence_punctuation(tmp_path):
     path = tmp_path / "blocked.srt"
     blocks = [
         {"start": 0.0, "end": 1.0, "ja_text": "終わり。", "zh_text": "结束。"},
@@ -510,7 +513,7 @@ def test_soft_split_falls_back_to_japanese_particle_boundary(monkeypatch, tmp_pa
     assert "近づきたい今すぐ" in content
 
 
-def test_soft_split_does_not_change_blocks_without_words(monkeypatch, tmp_path):
+def test_soft_split_keeps_blocks_without_word_timing(monkeypatch, tmp_path):
     path = tmp_path / "fallback_no_words.srt"
     blocks = [
         {
@@ -594,147 +597,6 @@ def test_below_soft_limit_not_split(monkeypatch):
     options = SubtitleOptions(soft_split_enabled=True, soft_max=5.5, max_duration=6.5)
     split = subtitle._soft_split_subtitle_blocks([block], options=options)
     assert len(split) == 1
-
-
-def test_adjacent_short_blocks_merge_without_acoustic_sidecar():
-    blocks = [
-        {"start": 0.0, "end": 1.0, "ja_text": "いい", "zh_text": "好"},
-        {"start": 1.1, "end": 2.0, "ja_text": "もっと", "zh_text": "更多"},
-    ]
-
-    merged = subtitle._merge_adjacent_short_blocks(blocks)
-
-    assert len(merged) == 1
-    assert merged[0]["ja_text"] == "いい もっと"
-    assert merged[0]["zh_text"] == "好，更多"
-
-
-def test_far_apart_short_blocks_do_not_merge():
-    blocks = [
-        {"start": 0.0, "end": 1.0, "ja_text": "来て", "zh_text": "过来"},
-        {"start": 1.5, "end": 2.0, "ja_text": "いや", "zh_text": "不要"},
-    ]
-
-    merged = subtitle._merge_adjacent_short_blocks(blocks)
-
-    assert len(merged) == 2
-
-
-def test_short_overlapping_tail_merges_without_deduplication():
-    blocks = [
-        {
-            "start": 176.84,
-            "end": 178.493,
-            "ja_text": "アルマリスト 室で イラックス ステイマンを受け",
-            "zh_text": "在芳香蒸汽室接受放松",
-        },
-        {
-            "start": 178.56,
-            "end": 179.16,
-            "ja_text": "受けて",
-            "zh_text": "接受",
-        },
-    ]
-
-    merged = subtitle._merge_adjacent_short_blocks(
-        blocks,
-        options=SubtitleOptions(video_fps=29.97),
-    )
-
-    assert len(merged) == 1
-    assert merged[0]["ja_text"] == "アルマリスト 室で イラックス ステイマンを受け 受けて"
-    assert merged[0]["zh_text"] == "在芳香蒸汽室接受放松，接受"
-
-
-def test_short_overlapping_tail_preserves_repeated_text():
-    blocks = [
-        {
-            "start": 0.0,
-            "end": 1.0,
-            "ja_text": "受け",
-            "zh_text": "接受",
-        },
-        {
-            "start": 1.06,
-            "end": 1.5,
-            "ja_text": "受 けて",
-            "zh_text": "接受",
-        },
-    ]
-
-    merged = subtitle._merge_adjacent_short_blocks(
-        blocks,
-        options=SubtitleOptions(video_fps=29.97),
-    )
-
-    assert len(merged) == 1
-    assert merged[0]["ja_text"] == "受け 受 けて"
-
-
-def test_short_tail_without_text_overlap_can_merge_with_close_gap():
-    blocks = [
-        {"start": 0.0, "end": 1.0, "ja_text": "来て", "zh_text": "过来"},
-        {"start": 1.06, "end": 1.6, "ja_text": "いや", "zh_text": "不要"},
-    ]
-
-    merged = subtitle._merge_adjacent_short_blocks(
-        blocks,
-        options=SubtitleOptions(video_fps=29.97),
-    )
-
-    assert len(merged) == 1
-
-
-def test_frame_rate_controls_short_tail_merge_gap():
-    blocks = [
-        {
-            "start": 0.0,
-            "end": 1.0,
-            "ja_text": "受け",
-            "zh_text": "接受",
-        },
-        {
-            "start": 1.22,
-            "end": 2.02,
-            "ja_text": "受けて",
-            "zh_text": "接受",
-        },
-    ]
-
-    assert len(
-        subtitle._merge_adjacent_short_blocks(
-            blocks,
-            options=SubtitleOptions(video_fps=24.0),
-        )
-    ) == 1
-    assert len(
-        subtitle._merge_adjacent_short_blocks(
-            blocks,
-            options=SubtitleOptions(video_fps=30.0),
-        )
-    ) == 2
-
-
-def test_different_short_fragments_still_merge_without_acoustic_sidecar():
-    blocks = [
-        {"start": 0.0, "end": 0.4, "ja_text": "ん", "zh_text": "嗯"},
-        {"start": 0.5, "end": 1.3, "ja_text": "いい", "zh_text": "舒服"},
-    ]
-
-    merged = subtitle._merge_adjacent_short_blocks(blocks)
-
-    assert len(merged) == 1
-
-
-def test_acoustic_metadata_does_not_block_merge():
-    blocks = [
-        {"start": 0.0, "end": 1.0, "ja_text": "ん", "zh_text": "嗯"},
-        {"start": 1.1, "end": 2.0, "ja_text": "いい", "zh_text": "舒服"},
-    ]
-
-    merged = subtitle._merge_adjacent_short_blocks(blocks)
-
-    assert len(merged) == 1
 
 
 def test_write_srt_does_not_emit_acoustic_prefix(tmp_path):

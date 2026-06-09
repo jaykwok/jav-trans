@@ -15,7 +15,7 @@ from boundary.base import SpeechSegment
 
 log = logging.getLogger(__name__)
 
-BOUNDARY_CACHE_VERSION = 2
+BOUNDARY_CACHE_VERSION = 4
 _AUDIO_SAMPLE_BYTES = 2 * 1024 * 1024
 _AUDIO_KEY_RE = re.compile(r"^[0-9a-fA-F]{8,40}$")
 
@@ -24,7 +24,7 @@ _BOUNDARY_BACKEND_ENV_KEYS = (
     "ASR_CHUNK_MIN_DURATION_S",
     "SPEECH_BOUNDARY_JA_EXPORT_FRAME_SCORES",
     "SPEECH_BOUNDARY_JA_THRESHOLD",
-    "SPEECH_BOUNDARY_JA_PAD_S",
+    "SPEECH_BOUNDARY_JA_FRAME_DILATION_S",
     "SPEECH_BOUNDARY_JA_PTM",
     "SPEECH_BOUNDARY_JA_MODEL_PATH",
     "SPEECH_BOUNDARY_JA_DEVICE",
@@ -33,7 +33,6 @@ _BOUNDARY_BACKEND_ENV_KEYS = (
     "SPEECH_BOUNDARY_JA_WINDOW_S",
     "SPEECH_BOUNDARY_JA_OVERLAP_S",
     "SPEECH_BOUNDARY_JA_MIN_SEGMENT_S",
-    "SPEECH_BOUNDARY_JA_MERGE_GAP_S",
     "SPEECH_BOUNDARY_JA_MAX_GROUP_S",
     "SPEECH_BOUNDARY_JA_CHUNK_THRESHOLD_S",
     "SPEECH_BOUNDARY_JA_CUT_THRESHOLD",
@@ -52,20 +51,10 @@ _BOUNDARY_ENV_KEYS = (
     "BOUNDARY_FRAME_SEQUENCE_MAX_PTM_DIMS",
     "BOUNDARY_FRAME_SEQUENCE_INCLUDE_MFCC",
     "BOUNDARY_PLANNER_MAX_CORE_CHUNK_S",
-    "BOUNDARY_PLANNER_MAX_PADDED_CHUNK_S",
     "BOUNDARY_PLANNER_TARGET_CHUNK_S",
     "BOUNDARY_PLANNER_MIN_CHUNK_S",
-    "BOUNDARY_PLANNER_START_WEIGHT",
-    "BOUNDARY_CONTEXT_MAX_PADDING_S",
-    "BOUNDARY_CONTEXT_MAX_SPEECH_OVERLAP_S",
     "BOUNDARY_PLANNER_MAX_SPLITS_PER_SEGMENT",
     "BOUNDARY_PLANNER_SEQUENCE_BATCH_SIZE",
-    "BOUNDARY_DP_CHUNK_BASE_COST",
-    "BOUNDARY_DP_OVER_TARGET_WEIGHT",
-    "BOUNDARY_DP_FAR_OVER_TARGET_WEIGHT",
-    "BOUNDARY_DP_UNDER_MIN_WEIGHT",
-    "BOUNDARY_DP_LONG_GAP_WEIGHT",
-    "BOUNDARY_DP_SPLIT_MERGE_WEIGHT",
 )
 
 
@@ -298,8 +287,6 @@ def _packed_chunk_to_dict(chunk: PackedChunk) -> dict:
         "start": float(chunk.start),
         "end": float(chunk.end),
         "duration": float(chunk.duration),
-        "left_padding_s": float(chunk.left_padding_s),
-        "right_padding_s": float(chunk.right_padding_s),
         "split_reason": chunk.split_reason,
         "parent_chunk_id": chunk.parent_chunk_id,
         "island_id": chunk.island_id,
@@ -320,17 +307,17 @@ def _packed_chunk_to_dict(chunk: PackedChunk) -> dict:
         "boundary_split_prob": (
             None if chunk.boundary_split_prob is None else float(chunk.boundary_split_prob)
         ),
-        "boundary_refine_delta_s": (
-            None if chunk.boundary_refine_delta_s is None else float(chunk.boundary_refine_delta_s)
+        "boundary_start_refine_delta_s": (
+            None
+            if chunk.boundary_start_refine_delta_s is None
+            else float(chunk.boundary_start_refine_delta_s)
+        ),
+        "boundary_end_refine_delta_s": (
+            None
+            if chunk.boundary_end_refine_delta_s is None
+            else float(chunk.boundary_end_refine_delta_s)
         ),
         "boundary_decision_source": chunk.boundary_decision_source,
-        "boundary_left_context_s": (
-            None if chunk.boundary_left_context_s is None else float(chunk.boundary_left_context_s)
-        ),
-        "boundary_right_context_s": (
-            None if chunk.boundary_right_context_s is None else float(chunk.boundary_right_context_s)
-        ),
-        "boundary_context_source": chunk.boundary_context_source,
         "speech_segments": _segments_to_payload(chunk.speech_segments),
     }
 
@@ -344,8 +331,6 @@ def _packed_chunk_from_dict(item: Any) -> PackedChunk:
         end=float(item["end"]),
         duration=float(item.get("duration", float(item["end"]) - float(item["start"]))),
         speech_segments=segments,
-        left_padding_s=float(item.get("left_padding_s", 0.0)),
-        right_padding_s=float(item.get("right_padding_s", 0.0)),
         split_reason=str(item.get("split_reason") or "unknown"),
         parent_chunk_id=(
             None
@@ -382,23 +367,17 @@ def _packed_chunk_from_dict(item: Any) -> PackedChunk:
             if item.get("boundary_split_prob") is None
             else float(item.get("boundary_split_prob"))
         ),
-        boundary_refine_delta_s=(
+        boundary_start_refine_delta_s=(
             None
-            if item.get("boundary_refine_delta_s") is None
-            else float(item.get("boundary_refine_delta_s"))
+            if item.get("boundary_start_refine_delta_s") is None
+            else float(item.get("boundary_start_refine_delta_s"))
+        ),
+        boundary_end_refine_delta_s=(
+            None
+            if item.get("boundary_end_refine_delta_s") is None
+            else float(item.get("boundary_end_refine_delta_s"))
         ),
         boundary_decision_source=str(item.get("boundary_decision_source") or ""),
-        boundary_left_context_s=(
-            None
-            if item.get("boundary_left_context_s") is None
-            else float(item.get("boundary_left_context_s"))
-        ),
-        boundary_right_context_s=(
-            None
-            if item.get("boundary_right_context_s") is None
-            else float(item.get("boundary_right_context_s"))
-        ),
-        boundary_context_source=str(item.get("boundary_context_source") or ""),
     )
 
 

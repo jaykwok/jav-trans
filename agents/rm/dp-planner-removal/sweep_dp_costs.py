@@ -33,11 +33,8 @@ class PlannerProfile:
     name: str
     target_chunk_s: float = 3.0
     max_core_chunk_s: float = 5.0
-    max_padded_chunk_s: float = 6.5
     min_chunk_s: float = 0.4
     start_weight: float = 1.5
-    max_context_padding_s: float = 1.5
-    max_speech_overlap_s: float = 0.25
     max_splits_per_segment: int = 16
     sequence_batch_size: int = 256
     dp_chunk_base_cost: float = 0.04
@@ -53,11 +50,8 @@ class PlannerProfile:
             "name": self.name,
             "target_chunk_s": self.target_chunk_s,
             "max_core_chunk_s": self.max_core_chunk_s,
-            "max_padded_chunk_s": self.max_padded_chunk_s,
             "min_chunk_s": self.min_chunk_s,
             "start_weight": self.start_weight,
-            "max_context_padding_s": self.max_context_padding_s,
-            "max_speech_overlap_s": self.max_speech_overlap_s,
             "max_splits_per_segment": self.max_splits_per_segment,
             "sequence_batch_size": self.sequence_batch_size,
             "dp_chunk_base_cost": self.dp_chunk_base_cost,
@@ -161,8 +155,6 @@ def chunk_to_row(index: int, chunk: PackedChunk) -> dict[str, Any]:
             max(0.0, float(chunk.core_end or 0.0) - float(chunk.core_start or 0.0)),
             6,
         ),
-        "left_padding_s": round(float(chunk.left_padding_s), 6),
-        "right_padding_s": round(float(chunk.right_padding_s), 6),
         "speech_island_count": len(chunk.speech_segments),
         "internal_gap_count": int(chunk.internal_gap_count),
         "internal_gap_max_s": round(float(chunk.internal_gap_max_s), 6),
@@ -177,8 +169,15 @@ def chunk_to_row(index: int, chunk: PackedChunk) -> dict[str, Any]:
         "boundary_split_prob": (
             None if chunk.boundary_split_prob is None else round(float(chunk.boundary_split_prob), 6)
         ),
-        "boundary_refine_delta_s": (
-            None if chunk.boundary_refine_delta_s is None else round(float(chunk.boundary_refine_delta_s), 6)
+        "boundary_start_refine_delta_s": (
+            None
+            if chunk.boundary_start_refine_delta_s is None
+            else round(float(chunk.boundary_start_refine_delta_s), 6)
+        ),
+        "boundary_end_refine_delta_s": (
+            None
+            if chunk.boundary_end_refine_delta_s is None
+            else round(float(chunk.boundary_end_refine_delta_s), 6)
         ),
         "boundary_decision_source": chunk.boundary_decision_source,
         "speech_segments": [
@@ -316,11 +315,8 @@ def default_profiles(args: argparse.Namespace) -> list[PlannerProfile]:
         name="baseline_jav_short",
         target_chunk_s=args.boundary_planner_target_chunk_s,
         max_core_chunk_s=args.boundary_planner_max_core_chunk_s,
-        max_padded_chunk_s=args.boundary_planner_max_padded_chunk_s,
         min_chunk_s=args.boundary_planner_min_chunk_s,
         start_weight=args.boundary_planner_start_weight,
-        max_context_padding_s=args.boundary_context_max_padding_s,
-        max_speech_overlap_s=args.boundary_context_max_speech_overlap_s,
         max_splits_per_segment=args.boundary_planner_max_splits_per_segment,
         sequence_batch_size=args.boundary_planner_sequence_batch_size,
         risk_target_s=args.risk_target_s,
@@ -349,7 +345,6 @@ def default_profiles(args: argparse.Namespace) -> list[PlannerProfile]:
             name="fallback_safe_4s",
             target_chunk_s=4.0,
             max_core_chunk_s=5.0,
-            max_padded_chunk_s=9.0,
             dp_over_target_weight=1.00,
             dp_far_over_target_weight=4.00,
             dp_long_gap_weight=0.90,
@@ -405,7 +400,7 @@ def run_sweep(args: argparse.Namespace) -> dict[str, Any]:
     os.environ["BOUNDARY_REFINER_ENABLED"] = "1"
     boundary_config = SpeechBoundaryJaConfig(
         threshold=args.speech_boundary_threshold,
-        pad_s=args.speech_boundary_pad_s,
+        frame_dilation_s=args.speech_boundary_frame_dilation_s,
         ptm=args.speech_boundary_ptm,
         model_path=str(project_path(args.speech_boundary_model_path)),
         device=args.speech_boundary_device,
@@ -414,7 +409,6 @@ def run_sweep(args: argparse.Namespace) -> dict[str, Any]:
         window_s=args.speech_boundary_window_s,
         overlap_s=args.speech_boundary_overlap_s,
         min_segment_s=args.speech_boundary_min_segment_s,
-        merge_gap_s=args.speech_boundary_merge_gap_s,
         cut_threshold=args.speech_boundary_cut_threshold,
         apply_cut_to_speech=args.speech_boundary_apply_cut_to_speech,
         export_sequence_features=True,
@@ -450,11 +444,8 @@ def run_sweep(args: argparse.Namespace) -> dict[str, Any]:
             segmentation.segments,
             frame_hop_s=args.boundary_feature_frame_hop_s,
             max_core_chunk_s=profile.max_core_chunk_s,
-            max_padded_chunk_s=profile.max_padded_chunk_s,
             target_chunk_s=profile.target_chunk_s,
             min_chunk_s=profile.min_chunk_s,
-            max_context_padding_s=profile.max_context_padding_s,
-            max_speech_overlap_s=profile.max_speech_overlap_s,
             start_weight=profile.start_weight,
             frame_scores=frame_scores,
             score_frame_hop_s=score_frame_hop_s,
@@ -572,17 +563,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--boundary-frame-sequence-max-ptm-dims", type=int, default=64)
     parser.add_argument("--boundary-frame-sequence-include-mfcc", type=int, default=1)
     parser.add_argument("--boundary-planner-max-core-chunk-s", type=float, default=5.0)
-    parser.add_argument("--boundary-planner-max-padded-chunk-s", type=float, default=6.5)
     parser.add_argument("--boundary-planner-target-chunk-s", type=float, default=3.0)
     parser.add_argument("--boundary-planner-min-chunk-s", type=float, default=0.4)
     parser.add_argument("--boundary-planner-start-weight", type=float, default=1.5)
-    parser.add_argument("--boundary-context-max-padding-s", type=float, default=1.5)
-    parser.add_argument("--boundary-context-max-speech-overlap-s", type=float, default=0.25)
     parser.add_argument("--boundary-planner-max-splits-per-segment", type=int, default=16)
     parser.add_argument("--boundary-planner-sequence-batch-size", type=int, default=256)
     parser.add_argument("--risk-target-s", type=float, default=5.0)
     parser.add_argument("--speech-boundary-threshold", type=float, default=0.200)
-    parser.add_argument("--speech-boundary-pad-s", type=float, default=0.2)
+    parser.add_argument("--speech-boundary-frame-dilation-s", type=float, default=0.2)
     parser.add_argument("--speech-boundary-ptm", default="jaykwok/Qwen3-ASR-0.6B-JA-Anime-Galgame")
     parser.add_argument("--speech-boundary-model-path", default="models/jaykwok-Qwen3-ASR-0.6B-JA-Anime-Galgame")
     parser.add_argument("--speech-boundary-device", default="auto")
@@ -591,7 +579,6 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--speech-boundary-window-s", type=float, default=30.0)
     parser.add_argument("--speech-boundary-overlap-s", type=float, default=1.0)
     parser.add_argument("--speech-boundary-min-segment-s", type=float, default=0.05)
-    parser.add_argument("--speech-boundary-merge-gap-s", type=float, default=0.0)
     parser.add_argument("--speech-boundary-cut-threshold", type=float, default=0.500)
     parser.add_argument("--speech-boundary-apply-cut-to-speech", action="store_true", default=False)
     return parser.parse_args(argv)

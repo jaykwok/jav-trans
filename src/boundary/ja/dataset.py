@@ -232,7 +232,7 @@ def build_weighted_teacher_record(
     frame_hop_s: float = 0.02,
     min_speech_teachers: int = 2,
     min_negative_gap_s: float = 0.5,
-    boundary_pad_s: float = 0.08,
+    boundary_dilation_s: float = 0.08,
     positive_weight: float = 0.5,
     negative_weight: float = 0.5,
 ) -> LabelRecord:
@@ -269,11 +269,11 @@ def build_weighted_teacher_record(
             if end - start >= min_gap_frames:
                 weights[start:end] = max(0.0, float(negative_weight))
 
-    if boundary_pad_s > 0.0 and positive_mask.any():
-        pad_frames = int(math.ceil(boundary_pad_s / frame_hop_s))
+    if boundary_dilation_s > 0.0 and positive_mask.any():
+        dilation_frames = int(math.ceil(boundary_dilation_s / frame_hop_s))
         for start, end in _true_runs(positive_mask):
-            weights[max(0, start - pad_frames) : min(count, start + pad_frames)] = 0.0
-            weights[max(0, end - pad_frames) : min(count, end + pad_frames)] = 0.0
+            weights[max(0, start - dilation_frames) : min(count, start + dilation_frames)] = 0.0
+            weights[max(0, end - dilation_frames) : min(count, end + dilation_frames)] = 0.0
 
     any_teacher_speech = bool((votes > 0).any())
     if not positive_mask.any() and not any_teacher_speech and not text.strip():

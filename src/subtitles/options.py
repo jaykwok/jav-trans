@@ -32,16 +32,10 @@ class SubtitleOptions:
     bilingual_secondary_weight: float = 0.4
     ascii_char_weight: float = 0.55
     line_max_chars: int = 25
-    merge_adjacent: bool = True
     video_fps: float = FALLBACK_VIDEO_FPS
     timing_polish_enabled: bool = True
     short_gap_collapse_s: float = 0.5
     linger_s: float = 0.45
-    dense_cue_merge_enabled: bool = True
-    dense_cue_merge_max_gap_frames: float = 4.0
-    dense_cue_merge_max_single_frames: float = 24.0
-    dense_cue_merge_max_combined_frames: float = 90.0
-    dense_cue_merge_max_text_units: float = 12.0
 
     @property
     def effective_video_fps(self) -> float:
@@ -100,30 +94,12 @@ class SubtitleOptions:
             ),
             ascii_char_weight=float(os.getenv("SUBTITLE_ASCII_CHAR_WEIGHT", "0.55")),
             line_max_chars=max(0, int(os.getenv("SRT_LINE_MAX_CHARS", "25"))),
-            merge_adjacent=_env_bool("SUBTITLE_MERGE_ADJACENT", True),
             timing_polish_enabled=_env_bool("SUBTITLE_TIMING_POLISH_ENABLED", True),
             short_gap_collapse_s=max(
                 0.0,
                 float(os.getenv("SUBTITLE_SHORT_GAP_COLLAPSE_S", "0.5")),
             ),
             linger_s=max(0.0, float(os.getenv("SUBTITLE_LINGER_S", "0.45"))),
-            dense_cue_merge_enabled=_env_bool("SUBTITLE_DENSE_CUE_MERGE_ENABLED", True),
-            dense_cue_merge_max_gap_frames=max(
-                0.0,
-                float(os.getenv("SUBTITLE_DENSE_CUE_MERGE_MAX_GAP_FRAMES", "4.0")),
-            ),
-            dense_cue_merge_max_single_frames=max(
-                0.0,
-                float(os.getenv("SUBTITLE_DENSE_CUE_MERGE_MAX_SINGLE_FRAMES", "24.0")),
-            ),
-            dense_cue_merge_max_combined_frames=max(
-                0.0,
-                float(os.getenv("SUBTITLE_DENSE_CUE_MERGE_MAX_COMBINED_FRAMES", "90.0")),
-            ),
-            dense_cue_merge_max_text_units=max(
-                0.0,
-                float(os.getenv("SUBTITLE_DENSE_CUE_MERGE_MAX_TEXT_UNITS", "12.0")),
-            ),
         )
 
     def signature(self) -> dict:

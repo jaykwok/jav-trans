@@ -55,7 +55,7 @@ def test_aligned_cache_signature_uses_full_subtitle_options(
     assert expected["subtitle"]["video_fps"] == 25.0
     assert expected["subtitle"]["effective_video_fps"] == 25.0
     assert expected["subtitle"]["frame_gap_s"] == pytest.approx(2 / 25.0)
-    assert expected["subtitle"]["dense_cue_merge_enabled"] is True
+    assert "dense_cue_merge_enabled" not in expected["subtitle"]
 
 
 def test_aligned_segments_written_with_audio_cache_key(monkeypatch, tmp_path):

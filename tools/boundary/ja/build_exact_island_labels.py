@@ -80,7 +80,7 @@ def build_exact_island_labels(
             "cut_point_segments": list(payload.get("cut_point_segments") or []),
             "cut_drop_zones": list(payload.get("cut_drop_zones") or []),
             "actual_speech_segments": list(payload.get("actual_speech_segments") or []),
-            "speech_label_pad_s": payload.get("speech_label_pad_s"),
+            "speech_label_dilation_s": payload.get("speech_label_dilation_s"),
         }
         record = type(record)(
             audio_id=record.audio_id,

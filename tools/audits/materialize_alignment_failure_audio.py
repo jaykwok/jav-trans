@@ -103,13 +103,13 @@ def resolve_source_audio(row: Mapping[str, Any]) -> Path:
     return project_path(value)
 
 
-def source_span(row: Mapping[str, Any], *, pad_s: float, audio_duration_s: float) -> tuple[float, float, float, float]:
+def source_span(row: Mapping[str, Any], *, context_margin_s: float, audio_duration_s: float) -> tuple[float, float, float, float]:
     chunk_start = max(0.0, row_float(row, "start"))
     chunk_end = max(chunk_start, row_float(row, "end"))
     if chunk_end <= chunk_start:
         chunk_end = chunk_start + max(0.02, row_float(row, "duration_s"))
-    clip_start = max(0.0, chunk_start - pad_s)
-    clip_end = min(audio_duration_s, max(clip_start + 0.02, chunk_end + pad_s))
+    clip_start = max(0.0, chunk_start - context_margin_s)
+    clip_end = min(audio_duration_s, max(clip_start + 0.02, chunk_end + context_margin_s))
     return clip_start, clip_end, chunk_start, chunk_end
 
 
@@ -125,7 +125,7 @@ def materialize_rows(
     rows: list[dict[str, Any]],
     *,
     output_dir: Path,
-    pad_s: float,
+    context_margin_s: float,
     skip_missing_audio: bool,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     audio_dir = output_dir / "audio"
@@ -146,7 +146,7 @@ def materialize_rows(
             audio_duration_s = len(audio) / sample_rate if sample_rate > 0 else 0.0
             clip_start, clip_end, chunk_start, chunk_end = source_span(
                 row,
-                pad_s=pad_s,
+                context_margin_s=context_margin_s,
                 audio_duration_s=audio_duration_s,
             )
             clip = slice_audio(audio, sample_rate, clip_start, clip_end)
@@ -167,7 +167,7 @@ def materialize_rows(
                     "chunk_end_s": round(min(clip_duration, chunk_end - clip_start), 3),
                     "materialized_from_start_s": round(chunk_start, 3),
                     "materialized_from_end_s": round(chunk_end, 3),
-                    "materialized_pad_s": round(pad_s, 3),
+                    "materialized_context_margin_s": round(context_margin_s, 3),
                 }
             )
         except Exception as exc:
@@ -191,7 +191,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     materialized, errors = materialize_rows(
         rows,
         output_dir=output_dir,
-        pad_s=args.pad_s,
+        context_margin_s=args.context_margin_s,
         skip_missing_audio=args.skip_missing_audio,
     )
     manifest_path = output_dir / "alignment_failure_audio_manifest.jsonl"
@@ -206,7 +206,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "input_rows": len(rows),
         "materialized_rows": len(materialized),
         "errors": len(errors),
-        "pad_s": args.pad_s,
+        "context_margin_s": args.context_margin_s,
         "manifest_jsonl": project_rel(manifest_path),
         "manifest_csv": project_rel(csv_path),
         "errors_json": project_rel(errors_path),
@@ -226,12 +226,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--output-dir",
         default="agents/audits/alignment-failure-audio",
     )
-    parser.add_argument("--pad-s", type=float, default=0.0)
+    parser.add_argument("--context-margin-s", type=float, default=0.0)
     parser.add_argument("--limit", type=int)
     parser.add_argument("--skip-missing-audio", action=argparse.BooleanOptionalAction, default=True)
     args = parser.parse_args(argv)
-    if args.pad_s < 0.0:
-        parser.error("--pad-s must be non-negative")
+    if args.context_margin_s < 0.0:
+        parser.error("--context-margin-s must be non-negative")
     if args.limit is not None and args.limit <= 0:
         parser.error("--limit must be positive")
     return args

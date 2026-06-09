@@ -206,8 +206,6 @@ def test_fallback_safe_boundary_metrics_uses_fallback_window_duration(tmp_path):
                     "split_reason": "soft_valley_candidate",
                     "core_start": 2.0,
                     "core_end": 8.0,
-                    "left_padding_s": 2.0,
-                    "right_padding_s": 4.0,
                     "speech_segments": [{"start": 2.0, "end": 8.0, "score": 0.9}],
                 },
             ],
@@ -270,10 +268,12 @@ def test_fallback_safe_boundary_metrics_uses_fallback_window_duration(tmp_path):
     assert summary["fallback_chunk_count"] == 1
     assert summary["fallback_unsafe_count"] == 0
     assert summary["fallback_duration_s"]["p50"] == 6.0
-    assert summary["fallback_padded_chunk_duration_s"]["p50"] == 12.0
+    assert summary["fallback_chunk_duration_s"]["p50"] == 12.0
     assert summary["truth_start_abs_error_s"]["p50"] == 0.0
     assert summary["truth_end_abs_error_s"]["p50"] == 0.0
     assert row["duration_s"] == 12.0
+    assert row["core_offset_left_s"] == 2.0
+    assert row["core_offset_right_s"] == 4.0
     assert row["fallback_duration_s"] == 6.0
     assert row["fallback_window_source"] == "speech_core"
     assert row["fallback_safe"] is True

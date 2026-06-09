@@ -112,13 +112,13 @@ def normalize_row(
     if valid_end_s <= valid_start_s and source_start_s > 0:
         valid_start_s = source_start_s + chunk_start_s
         valid_end_s = source_start_s + chunk_end_s
-    materialized_pad_s = row_float(row, "materialized_pad_s")
+    materialized_context_margin_s = row_float(row, "materialized_context_margin_s")
     video_start_s = source_start_s or row_float(row, "materialized_from_start_s")
     video_end_s = source_end_s or row_float(row, "materialized_from_end_s")
     if video_start_s <= 0 and valid_start_s > 0:
-        video_start_s = max(0.0, valid_start_s - materialized_pad_s)
+        video_start_s = max(0.0, valid_start_s - materialized_context_margin_s)
     if video_end_s <= video_start_s and valid_end_s > 0:
-        video_end_s = valid_end_s + materialized_pad_s
+        video_end_s = valid_end_s + materialized_context_margin_s
     if valid_start_s > 0:
         video_start_s = min(video_start_s, valid_start_s) if video_start_s > 0 else valid_start_s
     if valid_end_s > 0:
@@ -153,7 +153,7 @@ def normalize_row(
         "raw_text": str(row.get("raw_text") or ""),
         "left_ja": str(row.get("left_ja") or ""),
         "right_ja": str(row.get("right_ja") or ""),
-        "merged_ja": str(row.get("merged_ja") or ""),
+        "suggested_ja": str(row.get("suggested_ja") or ""),
         "repetition_suggested_text": str(row.get("repetition_suggested_text") or ""),
         "text_density_level": str(row.get("text_density_level") or ""),
         "audit_reason": str(row.get("audit_reason") or ""),
@@ -432,7 +432,7 @@ textarea {{ min-height: 84px; resize: vertical; }}
         </div>
         <div class="toolbar">
           <button id="playRangeBtn" class="primary">播放有效区间</button>
-          <button id="playAllBtn">播放含 padding 全段</button>
+          <button id="playAllBtn">播放含上下文 全段</button>
           <button id="pauseBtn">暂停</button>
           <button id="replayBtn">重播</button>
         </div>
@@ -440,7 +440,7 @@ textarea {{ min-height: 84px; resize: vertical; }}
           <h3>同步字幕预览</h3>
           <div class="sync-caption" id="syncCaption"></div>
         </div>
-        <p class="hint">点击左侧条目会自动从有效区间起点播放，并在有效区间终点暂停；音频前后各含少量 padding，便于判断边界。</p>
+        <p class="hint">点击左侧条目会自动从有效区间起点播放，并在有效区间终点暂停；音频前后各含少量上下文，便于听辨边界。</p>
         <p class="hint">无词级时间轴时按有效区间和文本长度近似推进，只用于听感审计。</p>
       </section>
 
@@ -714,8 +714,8 @@ function syncLinesForText(row, text) {{
   if (left || right) {{
     return [left, right].filter(Boolean);
   }}
-  const merged = isOriginalDisplay ? (row.merged_ja || row.raw_text || row.align_text || "").trim() : "";
-  if (merged) return [merged];
+  const suggested = isOriginalDisplay ? (row.suggested_ja || row.raw_text || row.align_text || "").trim() : "";
+  if (suggested) return [suggested];
   return String(text || "")
     .split(/\\n+/)
     .map(line => line.trim())
@@ -1121,11 +1121,11 @@ textarea { width: 100%; border: 1px solid var(--line); border-radius: 6px; paddi
         </div>
         <div class="toolbar" style="margin-top:10px">
           <button id="playRangeBtn" class="primary">播放有效区间</button>
-          <button id="playContextBtn">播放含 padding 视频片段</button>
+          <button id="playContextBtn">播放含上下文 视频片段</button>
           <button id="pauseBtn">暂停</button>
           <button id="replayBtn">重播</button>
         </div>
-        <p class="hint">绿色区间是当前字幕对应的有效时间轴；字幕会叠加在原视频上，padding 段会降低字幕透明度。</p>
+        <p class="hint">绿色区间是当前字幕对应的有效时间轴；字幕会叠加在原视频上，上下文段会降低字幕透明度。</p>
       </section>
 
       <aside class="panel">

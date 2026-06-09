@@ -19,19 +19,16 @@ def test_galgame_100k_distribution_recommends_current_defaults():
     assert result["env"] == {
         "BOUNDARY_PLANNER_TARGET_CHUNK_S": 3.0,
         "BOUNDARY_PLANNER_MAX_CORE_CHUNK_S": 5.0,
-        "BOUNDARY_PLANNER_MAX_PADDED_CHUNK_S": 6.5,
         "BOUNDARY_PLANNER_MIN_CHUNK_S": 0.4,
-        "BOUNDARY_CONTEXT_MAX_PADDING_S": 0.8,
-        "BOUNDARY_CONTEXT_MAX_SPEECH_OVERLAP_S": 0.25,
         "SUBTITLE_SOFT_MAX_S": 5.5,
         "MAX_SUBTITLE_DURATION": 6.5,
-        "ASR_MERGE_HARD_MAX_DURATION": 6.5,
+        "ASR_SEGMENT_HARD_MAX_DURATION": 6.5,
     }
     assert result["rationale"]["target_core_source_equivalent_s"] == 4.5
     assert result["rationale"]["max_core_source_equivalent_s"] == 7.5
 
 
-def test_faster_target_domain_tightens_core_without_changing_padded_cap():
+def test_faster_target_domain_tightens_core_and_context_formula():
     result = recommend_boundary_timing_params(
         GALGAME_100K_DURATION_STATS,
         target_domain_speedup=2.0,
@@ -39,5 +36,3 @@ def test_faster_target_domain_tightens_core_without_changing_padded_cap():
 
     assert result["env"]["BOUNDARY_PLANNER_TARGET_CHUNK_S"] == 2.3
     assert result["env"]["BOUNDARY_PLANNER_MAX_CORE_CHUNK_S"] == 3.5
-    assert result["env"]["BOUNDARY_PLANNER_MAX_PADDED_CHUNK_S"] == 5.0
-    assert result["env"]["BOUNDARY_CONTEXT_MAX_PADDING_S"] == 0.8

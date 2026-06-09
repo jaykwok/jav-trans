@@ -252,7 +252,7 @@ def build_review_items(
     *,
     long_chunk_rows: list[dict[str, Any]],
     subtitle_cues: list[dict[str, Any]],
-    context_pad_s: float,
+    context_margin_s: float,
     max_items: int | None,
 ) -> list[dict[str, Any]]:
     sorted_rows = sorted(
@@ -265,21 +265,21 @@ def build_review_items(
     )
     items: list[dict[str, Any]] = []
     for row in sorted_rows:
-        padded_start = row_float(row, "start")
-        padded_end = row_float(row, "end")
-        if padded_end <= padded_start:
+        chunk_start = row_float(row, "start")
+        chunk_end = row_float(row, "end")
+        if chunk_end <= chunk_start:
             continue
-        core_start = row_float(row, "core_start") or padded_start
-        core_end = row_float(row, "core_end") or padded_end
+        core_start = row_float(row, "core_start") or chunk_start
+        core_end = row_float(row, "core_end") or chunk_end
         fallback_start = row_float(row, "fallback_window_start") or core_start
         fallback_end = row_float(row, "fallback_window_end") or core_end
         if fallback_end <= fallback_start:
-            fallback_start = padded_start
-            fallback_end = padded_end
+            fallback_start = chunk_start
+            fallback_end = chunk_end
         fallback_duration_s = row_float(row, "fallback_duration_s") or (fallback_end - fallback_start)
-        padded_duration_s = row_float(row, "duration_s") or (padded_end - padded_start)
-        context_start = max(0.0, min(padded_start, fallback_start) - context_pad_s)
-        context_end = max(padded_end, fallback_end) + context_pad_s
+        chunk_duration_s = row_float(row, "duration_s") or (chunk_end - chunk_start)
+        context_start = max(0.0, min(chunk_start, fallback_start) - context_margin_s)
+        context_end = max(chunk_end, fallback_end) + context_margin_s
         cue_rows = cues_for_range(subtitle_cues, fallback_start, fallback_end)
         items.append(
             {
@@ -294,9 +294,9 @@ def build_review_items(
                 "fallback_window_end": round(fallback_end, 3),
                 "fallback_window_source": str(row.get("fallback_window_source") or ""),
                 "fallback_duration_s": round(fallback_duration_s, 3),
-                "padded_start": round(padded_start, 3),
-                "padded_end": round(padded_end, 3),
-                "padded_duration_s": round(padded_duration_s, 3),
+                "chunk_start": round(chunk_start, 3),
+                "chunk_end": round(chunk_end, 3),
+                "chunk_duration_s": round(chunk_duration_s, 3),
                 "context_start": round(context_start, 3),
                 "context_end": round(context_end, 3),
                 "core_start": round(core_start, 3),
@@ -587,7 +587,7 @@ audio {{ display: block; width: 100%; min-height: 48px; background: #fff; }}
 .audio-caption-preview:empty::before {{ content: "当前没有同步字幕"; color: var(--muted); font-size: 13px; }}
 .timeline {{ position: relative; height: 48px; border: 1px solid var(--line); border-radius: 6px; background: #101715; overflow: hidden; cursor: pointer; margin-top: 10px; }}
 .fallback-range {{ position: absolute; top: 0; bottom: 0; background: rgba(15, 118, 110, 0.55); }}
-.padded-range {{ position: absolute; top: 4px; bottom: 4px; border: 1px solid rgba(255,255,255,0.32); background: rgba(255, 255, 255, 0.08); }}
+.chunk-range {{ position: absolute; top: 4px; bottom: 4px; border: 1px solid rgba(255,255,255,0.32); background: rgba(255, 255, 255, 0.08); }}
 .core-range {{ position: absolute; top: 10px; bottom: 10px; background: rgba(255, 255, 255, 0.22); border-top: 1px solid rgba(255,255,255,0.6); border-bottom: 1px solid rgba(255,255,255,0.6); }}
 .cursor {{ position: absolute; top: 0; bottom: 0; width: 2px; background: #fff; }}
 .timeline-labels {{ display: flex; justify-content: space-between; margin-top: 4px; color: var(--muted); font-size: 12px; }}
@@ -642,7 +642,7 @@ textarea {{ width: 100%; border: 1px solid var(--line); border-radius: 6px; padd
       <section class="panel">
         {media_markup}
         <div class="timeline" id="timeline">
-          <div class="padded-range" id="paddedRange"></div>
+          <div class="chunk-range" id="chunkRange"></div>
           <div class="fallback-range" id="fallbackRange"></div>
           <div class="core-range" id="coreRange"></div>
           <div class="cursor" id="cursor"></div>
@@ -658,7 +658,7 @@ textarea {{ width: 100%; border: 1px solid var(--line); border-radius: 6px; padd
           <a href="{html.escape(media_url)}">{html.escape(direct_media_label)}</a>
           <a href="{html.escape(vtt_url)}">完整 VTT</a>
         </div>
-        <p class="hint">绿色是实际 fallback 时间窗，浅色内条是 speech core，暗色外框是 ASR padded chunk；播放会在当前模式终点自动暂停。{html.escape(media_kind_label)}下方/画面字幕为完整日语字幕当前 cue。</p>
+        <p class="hint">绿色是实际 fallback 时间窗，浅色内条是 speech core，暗色外框是 ASR chunk；播放会在当前模式终点自动暂停。{html.escape(media_kind_label)}下方/画面字幕为完整日语字幕当前 cue。</p>
         <p class="hint error" id="mediaError"></p>
       </section>
       <aside class="panel">
@@ -720,7 +720,7 @@ const searchInput = document.getElementById("searchInput");
 const sortSelect = document.getElementById("sortSelect");
 const notes = document.getElementById("notes");
 const timeline = document.getElementById("timeline");
-const paddedRange = document.getElementById("paddedRange");
+const chunkRange = document.getElementById("chunkRange");
 const fallbackRange = document.getElementById("fallbackRange");
 const coreRange = document.getElementById("coreRange");
 const cursor = document.getElementById("cursor");
@@ -789,7 +789,7 @@ function renderList() {{
     }};
     div.innerHTML = `
       <div class="item-title">#${{item.index + 1}} chunk ${{item.chunk_index}} <span class="badge danger">fallback ${{Number(item.fallback_duration_s).toFixed(2)}}s</span></div>
-      <div class="meta">${{fmt(item.start)}}-${{fmt(item.end)}} · padded ${{Number(item.padded_duration_s).toFixed(2)}}s · island=${{item.speech_island_count}} · gap=${{item.internal_gap_count}} · ${{escapeHtml(item.split_reason)}}</div>
+      <div class="meta">${{fmt(item.start)}}-${{fmt(item.end)}} · chunk ${{Number(item.chunk_duration_s).toFixed(2)}}s · island=${{item.speech_island_count}} · gap=${{item.internal_gap_count}} · ${{escapeHtml(item.split_reason)}}</div>
       <div class="meta">${{escapeHtml(item.subtitle_text || item.display_text || "(empty)")}}</div>
     `;
     itemList.appendChild(div);
@@ -802,7 +802,7 @@ function setMetrics(item) {{
     ["fallback 时间窗", `${{fmt(item.fallback_window_start)}}-${{fmt(item.fallback_window_end)}}`],
     ["fallback 时长", `${{Number(item.fallback_duration_s).toFixed(2)}}s`],
     ["fallback source", item.fallback_window_source],
-    ["padded chunk", `${{fmt(item.padded_start)}}-${{fmt(item.padded_end)}} (${{Number(item.padded_duration_s).toFixed(2)}}s)`],
+    ["source chunk", `${{fmt(item.chunk_start)}}-${{fmt(item.chunk_end)}} (${{Number(item.chunk_duration_s).toFixed(2)}}s)`],
     ["core", `${{fmt(item.core_start)}}-${{fmt(item.core_end)}} (${{Number(item.core_duration_s).toFixed(2)}}s)`],
     ["split_reason", item.split_reason],
     ["fallback", item.fallback_subtype],
@@ -863,7 +863,7 @@ function updateTimeline() {{
     el.style.left = `${{left}}%`;
     el.style.width = `${{Math.max(minWidth, right - left)}}%`;
   }};
-  setRange(paddedRange, item.padded_start, item.padded_end, 0.5);
+  setRange(chunkRange, item.chunk_start, item.chunk_end, 0.5);
   setRange(fallbackRange, item.fallback_window_start, item.fallback_window_end, 0.5);
   setRange(coreRange, item.core_start || item.start, item.core_end || item.end, 0.5);
   const t = media.currentTime || 0;
@@ -878,7 +878,7 @@ function renderCurrent(seek) {{
   const item = ITEMS[currentIndex];
   if (!item) return;
   document.getElementById("clipTitle").textContent = `#${{item.index + 1}} fallback window chunk ${{item.chunk_index}}`;
-  document.getElementById("clipMeta").textContent = `${{fmt(item.fallback_window_start)}}-${{fmt(item.fallback_window_end)}} · ${{Number(item.fallback_duration_s).toFixed(2)}}s · padded ${{Number(item.padded_duration_s).toFixed(2)}}s · ${{item.fallback_subtype || "fallback"}}`;
+  document.getElementById("clipMeta").textContent = `${{fmt(item.fallback_window_start)}}-${{fmt(item.fallback_window_end)}} · ${{Number(item.fallback_duration_s).toFixed(2)}}s · chunk ${{Number(item.chunk_duration_s).toFixed(2)}}s · ${{item.fallback_subtype || "fallback"}}`;
   document.getElementById("rangeStart").textContent = fmt(item.context_start);
   document.getElementById("rangeEnd").textContent = fmt(item.context_end);
   document.getElementById("displayText").textContent = item.display_text || "(empty)";
@@ -904,9 +904,9 @@ function exportRows() {{
     end: item.end,
     fallback_duration_s: item.fallback_duration_s,
     fallback_window_source: item.fallback_window_source,
-    padded_start: item.padded_start,
-    padded_end: item.padded_end,
-    padded_duration_s: item.padded_duration_s,
+    chunk_start: item.chunk_start,
+    chunk_end: item.chunk_end,
+    chunk_duration_s: item.chunk_duration_s,
     speech_island_count: item.speech_island_count,
     internal_gap_count: item.internal_gap_count,
     display_text: item.display_text,
@@ -991,12 +991,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default="agents/audits/long-fallback-audit",
     )
     parser.add_argument("--title", default="SpeechBoundary-JA fallback-window 审计")
-    parser.add_argument("--context-pad-s", type=float, default=2.0)
+    parser.add_argument("--context-margin-s", type=float, default=2.0)
     parser.add_argument("--max-items", type=int)
     parser.add_argument("--update-entrypoints", action=argparse.BooleanOptionalAction, default=True)
     args = parser.parse_args(argv)
-    if args.context_pad_s < 0:
-        parser.error("--context-pad-s must be non-negative")
+    if args.context_margin_s < 0:
+        parser.error("--context-margin-s must be non-negative")
     if args.max_items is not None and args.max_items <= 0:
         parser.error("--max-items must be positive")
     return args
@@ -1030,7 +1030,7 @@ def main(argv: list[str] | None = None) -> int:
     items = build_review_items(
         long_chunk_rows=long_chunk_rows,
         subtitle_cues=subtitle_cues,
-        context_pad_s=args.context_pad_s,
+        context_margin_s=args.context_margin_s,
         max_items=args.max_items,
     )
     if not items:

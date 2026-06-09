@@ -66,13 +66,6 @@ def test_boundary_planner_validates_config():
             config=BoundaryPlannerConfig(max_core_chunk_s=0.0),
         )
 
-    with pytest.raises(ValueError, match="dp_long_gap_weight"):
-        plan_boundary_chunks(
-            [SpeechSegment(0.0, 1.0)],
-            features=features,
-            config=BoundaryPlannerConfig(dp_long_gap_weight=-0.1),
-        )
-
 
 class _StaticSequenceRefiner:
     def __init__(self, scores: list[float]) -> None:
@@ -110,7 +103,7 @@ class _IndexFeatureProvider:
         return [right_start_s - left_end_s]
 
 
-def test_sequence_planner_dp_can_split_high_merge_gap_for_duration_target():
+def test_sequence_refiner_scores_gaps_without_merging_chunks():
     features = make_feature_bundle(frame_hop_s=1.0)
     refiner = _StaticSequenceRefiner([0.9, 0.9, 0.9])
 
@@ -127,7 +120,6 @@ def test_sequence_planner_dp_can_split_high_merge_gap_for_duration_target():
             max_core_chunk_s=30.0,
             target_chunk_s=6.0,
             min_chunk_s=0.4,
-            start_weight=1.5,
         ),
         sequence_refiner=refiner,
         sequence_feature_provider=_IndexFeatureProvider(),
@@ -135,17 +127,17 @@ def test_sequence_planner_dp_can_split_high_merge_gap_for_duration_target():
 
     assert len(refiner.calls) == 1
     assert [(chunk.islands[0].start, chunk.islands[-1].end) for chunk in chunks] == [
-        (0.0, 6.0),
-        (6.1, 12.0),
+        (0.0, 3.0),
+        (3.1, 6.0),
+        (6.1, 9.0),
+        (9.1, 12.0),
     ]
-    assert chunks[0].split_reason == "planner_dp"
-    assert chunks[0].boundary_decision is not None
-    assert chunks[0].boundary_decision.merge is False
-    assert chunks[0].boundary_decision.score == pytest.approx(0.9)
-    assert chunks[0].boundary_decision.source == "boundary_planner"
+    assert all(len(chunk.islands) == 1 for chunk in chunks)
+    assert chunks[1].boundary_decision is not None
+    assert chunks[1].boundary_decision.merge is True
 
 
-def test_sequence_planner_dp_preserves_learned_split_reason():
+def test_sequence_refiner_preserves_learned_split_reason():
     features = make_feature_bundle(frame_hop_s=1.0)
     refiner = _StaticSequenceRefiner([0.95, 0.05])
 
@@ -166,12 +158,12 @@ def test_sequence_planner_dp_preserves_learned_split_reason():
     )
 
     assert [(chunk.islands[0].start, chunk.islands[-1].end) for chunk in chunks] == [
-        (0.0, 2.0),
+        (0.0, 1.0),
+        (1.1, 2.0),
         (2.1, 3.0),
     ]
-    assert chunks[0].split_reason == "boundary_refiner:learned_sequence_split"
-    assert chunks[0].boundary_decision is not None
-    assert chunks[0].boundary_decision.source == "frame_sequence_refiner"
+    assert chunks[1].boundary_decision is not None
+    assert chunks[1].boundary_decision.source == "frame_sequence_refiner"
 
 
 def test_sequence_planner_batches_long_sequences():

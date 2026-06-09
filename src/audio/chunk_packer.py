@@ -11,7 +11,7 @@ from boundary.planner import (
     PlannedIsland,
     plan_boundary_chunks,
 )
-from boundary.refiner import BoundaryDecision, BoundaryRefiner, SequenceBoundaryRefiner
+from boundary.refiner import BoundaryDecision, SequenceBoundaryRefiner
 from boundary.base import SpeechSegment
 
 
@@ -21,8 +21,6 @@ class PackedChunk:
     end: float
     speech_segments: list[SpeechSegment]
     duration: float
-    left_padding_s: float
-    right_padding_s: float
     split_reason: str
     parent_chunk_id: int | None = None
     island_id: int | None = None
@@ -37,18 +35,14 @@ class PackedChunk:
     boundary_decision_merge: bool | None = None
     boundary_merge_prob: float | None = None
     boundary_split_prob: float | None = None
-    boundary_refine_delta_s: float | None = None
+    boundary_start_refine_delta_s: float | None = None
+    boundary_end_refine_delta_s: float | None = None
     boundary_decision_source: str = ""
-    boundary_left_context_s: float | None = None
-    boundary_right_context_s: float | None = None
-    boundary_context_source: str = ""
 
 
 @dataclass(frozen=True)
 class PackingLayoutConfig:
-    max_padded_chunk_s: float = 9.0
-    max_context_padding_s: float = 1.5
-    max_speech_overlap_s: float = 0.25
+    min_core_s: float = 0.05
 
 
 def pack_speech_segments(
@@ -56,32 +50,21 @@ def pack_speech_segments(
     *,
     frame_hop_s: float = 1.0 / 29.97,
     max_core_chunk_s: float = 5.0,
-    max_padded_chunk_s: float = 9.0,
     target_chunk_s: float = 3.0,
     min_chunk_s: float = 0.4,
-    max_context_padding_s: float = 1.5,
-    max_speech_overlap_s: float = 0.25,
-    start_weight: float = 1.5,
     frame_scores: Sequence[float] | None = None,
     score_frame_hop_s: float | None = None,
     cut_frame_scores: Sequence[float] | None = None,
-    boundary_refiner: BoundaryRefiner | None = None,
     sequence_boundary_refiner: SequenceBoundaryRefiner | None = None,
     sequence_feature_provider: GapSequenceFeatureProvider | None = None,
     max_splits_per_segment: int = 16,
     sequence_batch_size: int = 256,
-    dp_chunk_base_cost: float = 0.04,
-    dp_over_target_weight: float = 0.30,
-    dp_far_over_target_weight: float = 1.50,
-    dp_under_min_weight: float = 0.20,
-    dp_long_gap_weight: float = 0.35,
-    dp_split_merge_weight: float = 0.35,
 ) -> list[PackedChunk]:
-    """Convert Boundary Planner output into padded ASR chunks.
+    """Convert Boundary Planner output into ASR speech-core chunks.
 
     Candidate extraction, refiner scoring, and constrained planning live under
     ``src/boundary``. This module only preserves the ASR-facing PackedChunk
-    contract and applies dynamic padding around planner cores.
+    contract and applies learned core boundary deltas.
     """
 
     score_hop = score_frame_hop_s if score_frame_hop_s is not None else frame_hop_s
@@ -95,30 +78,17 @@ def pack_speech_segments(
         max_core_chunk_s=max_core_chunk_s,
         target_chunk_s=target_chunk_s,
         min_chunk_s=min_chunk_s,
-        start_weight=start_weight,
         max_splits_per_segment=max_splits_per_segment,
         sequence_batch_size=sequence_batch_size,
-        dp_chunk_base_cost=dp_chunk_base_cost,
-        dp_over_target_weight=dp_over_target_weight,
-        dp_far_over_target_weight=dp_far_over_target_weight,
-        dp_under_min_weight=dp_under_min_weight,
-        dp_long_gap_weight=dp_long_gap_weight,
-        dp_split_merge_weight=dp_split_merge_weight,
     )
     planned = plan_boundary_chunks(
         segments,
         features=features,
         config=planner_config,
-        refiner=boundary_refiner,
         sequence_refiner=sequence_boundary_refiner,
         sequence_feature_provider=sequence_feature_provider,
     )
-    layout = PackingLayoutConfig(
-        max_padded_chunk_s=max_padded_chunk_s,
-        max_context_padding_s=max_context_padding_s,
-        max_speech_overlap_s=max_speech_overlap_s,
-    )
-    return _materialize_packed_chunks(planned, layout=layout)
+    return _materialize_packed_chunks(planned, layout=PackingLayoutConfig())
 
 
 def _materialize_packed_chunks(
@@ -130,18 +100,18 @@ def _materialize_packed_chunks(
     for index, item in enumerate(planned):
         previous_item = planned[index - 1] if index > 0 else None
         next_item = planned[index + 1] if index + 1 < len(planned) else None
-        next_start = next_item.islands[0].start if next_item is not None else None
-        next_decision = item.boundary_decision if next_item is not None else None
-        previous_end = previous_item.islands[-1].end if previous_item is not None else None
         previous_decision = previous_item.boundary_decision if previous_item is not None else None
         chunks.append(
             _make_chunk(
                 item.islands,
                 layout=layout,
-                previous_end=previous_end,
-                next_start=next_start,
                 previous_decision=previous_decision,
-                next_decision=next_decision,
+                previous_core_end=(
+                    previous_item.islands[-1].end if previous_item is not None else None
+                ),
+                next_core_start=(
+                    next_item.islands[0].start if next_item is not None else None
+                ),
                 split_reason=item.split_reason,
                 boundary_decision=item.boundary_decision,
             )
@@ -153,42 +123,33 @@ def _make_chunk(
     islands: Sequence[PlannedIsland],
     *,
     layout: PackingLayoutConfig,
-    previous_end: float | None,
-    next_start: float | None,
     previous_decision: BoundaryDecision | None,
-    next_decision: BoundaryDecision | None,
+    previous_core_end: float | None,
+    next_core_start: float | None,
     split_reason: str,
     boundary_decision: BoundaryDecision | None,
 ) -> PackedChunk:
     core_start = islands[0].start
     core_end = islands[-1].end
-    core_duration = max(0.0, core_end - core_start)
-    remaining = max(0.0, layout.max_padded_chunk_s - core_duration)
-    left_budget = _context_budget_from_decision(
-        previous_decision,
-        side="right",
-        max_context_padding_s=layout.max_context_padding_s,
+    applied_start_delta_s = (
+        previous_decision.start_refine_delta_s
+        if previous_decision is not None
+        else None
     )
-    right_budget = _context_budget_from_decision(
-        next_decision,
-        side="left",
-        max_context_padding_s=layout.max_context_padding_s,
+    applied_end_delta_s = (
+        boundary_decision.end_refine_delta_s
+        if boundary_decision is not None
+        else None
     )
-    left_limit = _left_padding_limit(
-        core_start=core_start,
-        previous_end=previous_end,
-        split_left=islands[0].split_left,
-        layout=layout,
+    core_start, core_end = _apply_boundary_delta(
+        core_start,
+        core_end,
+        previous_core_end=previous_core_end,
+        next_core_start=next_core_start,
+        previous_decision=previous_decision,
+        next_decision=boundary_decision,
+        min_core_s=layout.min_core_s,
     )
-    right_limit = _right_padding_limit(
-        core_end=core_end,
-        next_start=next_start,
-        split_right=islands[-1].split_right,
-        layout=layout,
-    )
-    left_padding = min(left_budget, left_limit, remaining)
-    right_padding = min(right_budget, right_limit, max(0.0, remaining - left_padding))
-
     if any(island.split_left or island.split_right for island in islands):
         split_reason = "boundary_candidate" if split_reason == "tail" else split_reason
 
@@ -200,15 +161,13 @@ def _make_chunk(
     boundary_reasons = [island.boundary_reason for island in islands if island.boundary_reason]
     boundary_sources = [island.boundary_source for island in islands if island.boundary_source]
 
-    start = max(0.0, core_start - left_padding)
-    end = core_end + right_padding
+    start = max(0.0, core_start)
+    end = core_end
     return PackedChunk(
         start=start,
         end=end,
         speech_segments=[island.to_speech_segment() for island in islands],
         duration=end - start,
-        left_padding_s=left_padding,
-        right_padding_s=right_padding,
         split_reason=split_reason,
         core_start=core_start,
         core_end=core_end,
@@ -234,20 +193,10 @@ def _make_chunk(
         boundary_split_prob=(
             1.0 - boundary_decision.score if boundary_decision is not None else None
         ),
-        boundary_refine_delta_s=(
-            boundary_decision.refine_delta_s if boundary_decision is not None else None
-        ),
+        boundary_start_refine_delta_s=applied_start_delta_s,
+        boundary_end_refine_delta_s=applied_end_delta_s,
         boundary_decision_source=(
             boundary_decision.source if boundary_decision is not None else ""
-        ),
-        boundary_left_context_s=(
-            boundary_decision.left_context_s if boundary_decision is not None else None
-        ),
-        boundary_right_context_s=(
-            boundary_decision.right_context_s if boundary_decision is not None else None
-        ),
-        boundary_context_source=(
-            boundary_decision.context_source if boundary_decision is not None else ""
         ),
     )
 
@@ -269,50 +218,34 @@ def _internal_gap_max_s(islands: Sequence[PlannedIsland]) -> float:
     )
 
 
-def _context_budget_from_decision(
-    decision: BoundaryDecision | None,
-    *,
-    side: str,
-    max_context_padding_s: float,
-) -> float:
-    if decision is None:
-        return max(0.0, float(max_context_padding_s))
-    if side == "left":
-        raw = decision.left_context_s
-    elif side == "right":
-        raw = decision.right_context_s
-    else:
-        raise ValueError(f"unknown context side: {side}")
-    if raw is None:
-        return max(0.0, float(max_context_padding_s))
-    return max(0.0, min(float(raw), float(max_context_padding_s)))
-
-
-def _left_padding_limit(
-    *,
+def _apply_boundary_delta(
     core_start: float,
-    previous_end: float | None,
-    split_left: bool,
-    layout: PackingLayoutConfig,
-) -> float:
-    if previous_end is None:
-        return min(layout.max_context_padding_s, max(0.0, core_start))
-    gap = max(0.0, core_start - previous_end)
-    if split_left:
-        return min(layout.max_speech_overlap_s, layout.max_context_padding_s)
-    return min(layout.max_context_padding_s, gap * 0.45)
-
-
-def _right_padding_limit(
-    *,
     core_end: float,
-    next_start: float | None,
-    split_right: bool,
-    layout: PackingLayoutConfig,
-) -> float:
-    if next_start is None:
-        return layout.max_context_padding_s
-    gap = max(0.0, next_start - core_end)
-    if split_right:
-        return min(layout.max_speech_overlap_s, layout.max_context_padding_s)
-    return min(layout.max_context_padding_s, gap * 0.45)
+    *,
+    previous_core_end: float | None,
+    next_core_start: float | None,
+    previous_decision: BoundaryDecision | None,
+    next_decision: BoundaryDecision | None,
+    min_core_s: float,
+) -> tuple[float, float]:
+    min_duration = max(0.0, float(min_core_s))
+    start = float(core_start)
+    end = float(core_end)
+    start_delta = (
+        previous_decision.start_refine_delta_s
+        if previous_decision is not None
+        else None
+    )
+    end_delta = next_decision.end_refine_delta_s if next_decision is not None else None
+    if start_delta is not None:
+        start += float(start_delta)
+    if end_delta is not None:
+        end += float(end_delta)
+
+    left_limit = 0.0 if previous_core_end is None else float(previous_core_end)
+    right_limit = float("inf") if next_core_start is None else float(next_core_start)
+    start = max(left_limit, min(start, max(left_limit, right_limit - min_duration)))
+    end = min(right_limit, max(end, start + min_duration))
+    if end < start:
+        end = start
+    return start, end

@@ -123,24 +123,21 @@ def frames_to_segments(values: Iterable[int], *, frame_hop_s: float, duration_s:
     return segments
 
 
-def merge_segments(
+def filter_segments(
     segments: Iterable[SpeechSegment],
     *,
     duration_s: float,
-    merge_gap_s: float,
     min_segment_s: float,
 ) -> list[SpeechSegment]:
-    merged: list[SpeechSegment] = []
-    for segment in sorted(segments, key=lambda item: (item.start, item.end)):
-        start = max(0.0, min(segment.start, duration_s))
-        end = max(0.0, min(segment.end, duration_s))
-        if end - start < min_segment_s:
-            continue
-        if not merged or start - merged[-1].end > merge_gap_s:
-            merged.append(SpeechSegment(start=start, end=end))
-        else:
-            merged[-1].end = max(merged[-1].end, end)
-    return merged
+    return [
+        SpeechSegment(
+            start=max(0.0, min(segment.start, duration_s)),
+            end=max(0.0, min(segment.end, duration_s)),
+        )
+        for segment in sorted(segments, key=lambda item: (item.start, item.end))
+        if max(0.0, min(segment.end, duration_s)) - max(0.0, min(segment.start, duration_s))
+        >= min_segment_s
+    ]
 
 
 def split_segments_at_cuts(
@@ -244,12 +241,17 @@ def split_segments_at_cuts_constrained(
 
 
 def union_segments(segments: Iterable[SpeechSegment], *, duration_s: float) -> list[SpeechSegment]:
-    return merge_segments(
-        segments,
-        duration_s=duration_s,
-        merge_gap_s=0.0,
-        min_segment_s=0.0,
-    )
+    union: list[SpeechSegment] = []
+    for segment in sorted(segments, key=lambda item: (item.start, item.end)):
+        start = max(0.0, min(segment.start, duration_s))
+        end = max(0.0, min(segment.end, duration_s))
+        if end <= start:
+            continue
+        if not union or start > union[-1].end:
+            union.append(SpeechSegment(start=start, end=end))
+        else:
+            union[-1].end = max(union[-1].end, end)
+    return union
 
 
 def overlap_s(left: SpeechSegment, right: SpeechSegment) -> float:
@@ -411,8 +413,7 @@ def benchmark_boundary_predictions(
     boundary_manifest: Path,
     predictions: Path,
     output_dir: Path,
-    pad_s: float,
-    merge_gap_s: float,
+    frame_dilation_s: float,
     min_segment_s: float,
     min_overlap_ratio: float,
     cut_min_gap_s: float = 0.5,
@@ -427,7 +428,7 @@ def benchmark_boundary_predictions(
     output_dir.mkdir(parents=True, exist_ok=True)
     boundary_rows = load_boundary_rows(boundary_manifest)
     prediction_rows = load_prediction_rows(predictions)
-    pad_frames_by_hop: dict[float, int] = {}
+    dilation_frames_by_hop: dict[float, int] = {}
     details = []
     start_errors: list[float] = []
     end_errors: list[float] = []
@@ -463,13 +464,18 @@ def benchmark_boundary_predictions(
         if not isinstance(raw_frames, list):
             skipped.append({"audio_id": audio_id, "reason": "missing_speech_frames"})
             continue
-        if boundary.frame_hop_s not in pad_frames_by_hop:
-            pad_frames_by_hop[boundary.frame_hop_s] = max(0, int(round(pad_s / boundary.frame_hop_s)))
-        frames = pad_frames([int(value) for value in raw_frames], pad_frames=pad_frames_by_hop[boundary.frame_hop_s])
-        pred_segments = merge_segments(
+        if boundary.frame_hop_s not in dilation_frames_by_hop:
+            dilation_frames_by_hop[boundary.frame_hop_s] = max(
+                0,
+                int(round(frame_dilation_s / boundary.frame_hop_s)),
+            )
+        frames = pad_frames(
+            [int(value) for value in raw_frames],
+            pad_frames=dilation_frames_by_hop[boundary.frame_hop_s],
+        )
+        pred_segments = filter_segments(
             frames_to_segments(frames, frame_hop_s=boundary.frame_hop_s, duration_s=boundary.duration_s),
             duration_s=boundary.duration_s,
-            merge_gap_s=merge_gap_s,
             min_segment_s=min_segment_s,
         )
         actual_segments = boundary.actual_speech_segments
@@ -484,14 +490,13 @@ def benchmark_boundary_predictions(
         audio_overlap_speech_predicted = intersection_duration(pred_segments, boundary.overlap_segments)
         cut_frames_raw = prediction.get("cut_frames")
         if isinstance(cut_frames_raw, list):
-            cut_segments = merge_segments(
+            cut_segments = filter_segments(
                 frames_to_segments(
                     [int(value) for value in cut_frames_raw],
                     frame_hop_s=boundary.frame_hop_s,
                     duration_s=boundary.duration_s,
                 ),
                 duration_s=boundary.duration_s,
-                merge_gap_s=boundary.frame_hop_s,
                 min_segment_s=0.0,
             )
         else:
@@ -638,8 +643,7 @@ def benchmark_boundary_predictions(
         "predictions": str(predictions),
         "evaluated": len(details),
         "skipped": len(skipped),
-        "pad_s": pad_s,
-        "merge_gap_s": merge_gap_s,
+        "frame_dilation_s": frame_dilation_s,
         "min_segment_s": min_segment_s,
         "min_overlap_ratio": min_overlap_ratio,
         "cut_min_gap_s": cut_min_gap_s,
@@ -719,8 +723,7 @@ def run(args: argparse.Namespace) -> None:
         boundary_manifest=Path(args.boundary_manifest),
         predictions=Path(args.predictions),
         output_dir=Path(args.output_dir),
-        pad_s=args.pad_s,
-        merge_gap_s=args.merge_gap_s,
+        frame_dilation_s=args.frame_dilation_s,
         min_segment_s=args.min_segment_s,
         min_overlap_ratio=args.min_overlap_ratio,
         cut_min_gap_s=args.cut_min_gap_s,
@@ -738,8 +741,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Benchmark speech-boundary frame predictions against synthetic boundary truth.")
     parser.add_argument("--boundary-manifest", required=True)
     parser.add_argument("--predictions", required=True)
-    parser.add_argument("--pad-s", type=float, default=0.2)
-    parser.add_argument("--merge-gap-s", type=float, default=0.15)
+    parser.add_argument("--frame-dilation-s", type=float, default=0.2)
     parser.add_argument("--min-segment-s", type=float, default=0.05)
     parser.add_argument("--min-overlap-ratio", type=float, default=0.1)
     parser.add_argument("--cut-min-gap-s", type=float, default=0.5)
@@ -783,10 +785,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=str(PROJECT_ROOT / "agents" / "temp" / "speech-boundary-ja" / "boundary-benchmark"),
     )
     args = parser.parse_args(argv)
-    if args.pad_s < 0.0:
-        parser.error("--pad-s must be non-negative")
-    if args.merge_gap_s < 0.0:
-        parser.error("--merge-gap-s must be non-negative")
+    if args.frame_dilation_s < 0.0:
+        parser.error("--frame-dilation-s must be non-negative")
     if args.min_segment_s < 0.0:
         parser.error("--min-segment-s must be non-negative")
     if not 0.0 <= args.min_overlap_ratio <= 1.0:

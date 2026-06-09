@@ -6,7 +6,6 @@ from pathlib import Path
 from typing import Callable
 
 from audio.chunk_packer import PackedChunk, pack_speech_segments
-from boundary import load_boundary_refiner
 from boundary import cache as _boundary_cache_module
 from boundary.candidates import CANDIDATE_EXTRACTOR_VERSION
 from boundary.sequence_features import (
@@ -16,6 +15,7 @@ from boundary.sequence_features import (
 )
 from boundary.backbones import normalize_boundary_backbone
 from boundary.refiner import (
+    DEFAULT_REFINER_CHECKPOINT_PATH,
     file_sha1 as _boundary_refiner_file_sha1,
     load_frame_sequence_refiner_checkpoint,
 )
@@ -61,12 +61,19 @@ def _env_int(name: str, default: str) -> int:
 
 
 def _boundary_config() -> dict:
-    refiner_path = os.getenv("BOUNDARY_REFINER_MODEL_PATH", "").strip()
+    refiner_enabled = _env_bool("BOUNDARY_REFINER_ENABLED", "1")
+    refiner_path = (
+        os.getenv("BOUNDARY_REFINER_MODEL_PATH", str(DEFAULT_REFINER_CHECKPOINT_PATH)).strip()
+        or str(DEFAULT_REFINER_CHECKPOINT_PATH)
+    )
     refiner_path_obj = Path(refiner_path).expanduser() if refiner_path else None
-    runtime_adapter = _boundary_refiner_runtime_adapter(refiner_path_obj)
+    refiner_backbone = normalize_boundary_backbone(
+        os.getenv("BOUNDARY_REFINER_BACKBONE", "transformers.Mamba2Model")
+    )
+    runtime_adapter = _boundary_refiner_runtime_adapter(refiner_path_obj) if refiner_enabled else ""
     return {
         "feature_frame_hop_s": _env_float("BOUNDARY_FEATURE_FRAME_HOP_S", "0.02"),
-        "boundary_refiner_enabled": _env_bool("BOUNDARY_REFINER_ENABLED", "1"),
+        "boundary_refiner_enabled": refiner_enabled,
         "boundary_refiner_model_path": refiner_path,
         "boundary_refiner_model_sha1": (
             _boundary_refiner_file_sha1(refiner_path_obj)
@@ -74,9 +81,7 @@ def _boundary_config() -> dict:
             else ""
         ),
         "boundary_refiner_runtime_adapter": runtime_adapter,
-        "boundary_refiner_backbone": normalize_boundary_backbone(
-            os.getenv("BOUNDARY_REFINER_BACKBONE", "transformers.Mamba2Model")
-        ),
+        "boundary_refiner_backbone": refiner_backbone,
         "boundary_refiner_device": os.getenv("BOUNDARY_REFINER_DEVICE", "auto").strip()
         or "auto",
         "boundary_refiner_threshold": _env_float("BOUNDARY_REFINER_THRESHOLD", "0.5"),
@@ -85,36 +90,23 @@ def _boundary_config() -> dict:
             "BOUNDARY_PLANNER_MAX_CORE_CHUNK_S",
             "5.0",
         ),
-        "boundary_planner_max_padded_chunk_s": _env_float(
-            "BOUNDARY_PLANNER_MAX_PADDED_CHUNK_S",
-            "9.0",
-        ),
         "boundary_planner_target_chunk_s": _env_float("BOUNDARY_PLANNER_TARGET_CHUNK_S", "3.0"),
         "boundary_planner_min_chunk_s": _env_float("BOUNDARY_PLANNER_MIN_CHUNK_S", "0.4"),
-        "boundary_planner_start_weight": _env_float("BOUNDARY_PLANNER_START_WEIGHT", "1.5"),
-        "boundary_context_max_padding_s": _env_float("BOUNDARY_CONTEXT_MAX_PADDING_S", "1.5"),
-        "boundary_context_max_speech_overlap_s": _env_float(
-            "BOUNDARY_CONTEXT_MAX_SPEECH_OVERLAP_S",
-            "0.25",
-        ),
         "boundary_planner_max_splits_per_segment": _env_int(
             "BOUNDARY_PLANNER_MAX_SPLITS_PER_SEGMENT", "16"
         ),
         "boundary_planner_sequence_batch_size": _env_int(
             "BOUNDARY_PLANNER_SEQUENCE_BATCH_SIZE", "256"
         ),
-        "boundary_dp_chunk_base_cost": _env_float("BOUNDARY_DP_CHUNK_BASE_COST", "0.04"),
-        "boundary_dp_over_target_weight": _env_float("BOUNDARY_DP_OVER_TARGET_WEIGHT", "0.30"),
-        "boundary_dp_far_over_target_weight": _env_float("BOUNDARY_DP_FAR_OVER_TARGET_WEIGHT", "1.50"),
-        "boundary_dp_under_min_weight": _env_float("BOUNDARY_DP_UNDER_MIN_WEIGHT", "0.20"),
-        "boundary_dp_long_gap_weight": _env_float("BOUNDARY_DP_LONG_GAP_WEIGHT", "0.35"),
-        "boundary_dp_split_merge_weight": _env_float("BOUNDARY_DP_SPLIT_MERGE_WEIGHT", "0.35"),
     }
 
 
 def _boundary_refiner_runtime_adapter(path: Path | None) -> str:
     if path is None or not path.exists():
-        return "refiner_input_v1"
+        raise FileNotFoundError(
+            "Boundary Refiner checkpoint is required: set BOUNDARY_REFINER_MODEL_PATH "
+            "to a frame_sequence_v1 checkpoint"
+        )
     import torch
 
     payload = torch.load(path, map_location="cpu")
@@ -123,9 +115,9 @@ def _boundary_refiner_runtime_adapter(path: Path | None) -> str:
     metadata = payload.get("metadata")
     if isinstance(metadata, dict):
         adapter = str(metadata.get("runtime_adapter") or "").strip()
-        if adapter:
+        if adapter == "frame_sequence_v1":
             return adapter
-    return "refiner_input_v1"
+    raise ValueError("Boundary Refiner checkpoint must use metadata.runtime_adapter='frame_sequence_v1'")
 
 
 def _sequence_feature_provider_from_result(
@@ -198,7 +190,6 @@ _quarantine_failed_chunks = _checkpoint_module._quarantine_failed_chunks
 _get_wav_duration = _chunking_module._get_wav_duration
 _extract_wav_chunks = _chunking_module._extract_wav_chunks
 _chunk_duration = _chunking_module._chunk_duration
-_chunk_original_boundaries = _chunking_module._chunk_original_boundaries
 
 ASRWorkerSystemError = _transcribe_module.ASRWorkerSystemError
 _strip_punctuation = _transcribe_module._strip_punctuation
@@ -210,6 +201,7 @@ _build_timestamp_fallback = _transcribe_module._build_timestamp_fallback
 _with_alignment_fallback_window = _transcribe_module._with_alignment_fallback_window
 _looks_like_alignment_failure = _transcribe_module._looks_like_alignment_failure
 _alignment_failure_reasons = _transcribe_module._alignment_failure_reasons
+_alignment_outcome_for_chunk = _transcribe_module._alignment_outcome_for_chunk
 _split_span_evenly = _transcribe_module._split_span_evenly
 _prepare_asr_chunk_results = _transcribe_module._prepare_asr_chunk_results
 _transcribe_asr_chunks_text_only = _transcribe_module._transcribe_asr_chunks_text_only
@@ -225,26 +217,15 @@ _sliding_context_result_text = _transcribe_module._sliding_context_result_text
 _build_initial_prompt_for_chunk = _transcribe_module._build_initial_prompt_for_chunk
 _should_skip_alignment_retry = _transcribe_module._should_skip_alignment_retry
 _needs_alignment_fallback = _transcribe_module._needs_alignment_fallback
-_split_alignment_sentinel_with_speech_islands = (
-    _transcribe_module._split_alignment_sentinel_with_speech_islands
-)
-_split_alignment_sentinels_with_speech_islands_batch = (
-    _transcribe_module._split_alignment_sentinels_with_speech_islands_batch
-)
 _finalize_aligned_chunk_without_asr_retry = _transcribe_module._finalize_aligned_chunk_without_asr_retry
 _refine_chunk_with_subchunks = _transcribe_module._refine_chunk_with_subchunks
 _transcribe_asr_chunk_with_retry = _transcribe_module._transcribe_asr_chunk_with_retry
 _postprocess_segments = _transcribe_module._postprocess_segments
-_ends_sentence = _transcribe_module._ends_sentence
-_same_source_chunk = _transcribe_module._same_source_chunk
-_should_merge_fragment = _transcribe_module._should_merge_fragment
-_join_segment_text = _transcribe_module._join_segment_text
-_merge_fragment_segments = _transcribe_module._merge_fragment_segments
 _pick_postprocess_split_index = _transcribe_module._pick_postprocess_split_index
 _split_long_postprocessed_segment = _transcribe_module._split_long_postprocessed_segment
 _split_long_postprocessed_segments = _transcribe_module._split_long_postprocessed_segments
 _repair_postprocessed_segment_windows = _transcribe_module._repair_postprocessed_segment_windows
-_merge_words_to_segments = _transcribe_module._merge_words_to_segments
+_group_words_to_segments = _transcribe_module._group_words_to_segments
 
 _run_TRANSCRIPTION_qc = _qc_stage_module._run_TRANSCRIPTION_qc
 
@@ -413,11 +394,7 @@ def _build_processing_spans(
     cut_frame_scores = result.parameters.get("cut_frame_scores")
     score_frame_hop_s = result.parameters.get("frame_hop_s")
     sequence_feature_frames = result.parameters.get("sequence_feature_frames")
-    if (
-        cfg["boundary_refiner_enabled"]
-        and cfg["boundary_refiner_runtime_adapter"] == "frame_sequence_v1"
-    ):
-        boundary_refiner = None
+    if cfg["boundary_refiner_enabled"]:
         sequence_boundary_refiner = load_frame_sequence_refiner_checkpoint(
             Path(cfg["boundary_refiner_model_path"]),
             threshold=cfg["boundary_refiner_threshold"],
@@ -434,15 +411,6 @@ def _build_processing_spans(
             sequence_boundary_refiner.feature_schema_hash,
         )
     else:
-        boundary_refiner = load_boundary_refiner(
-            enabled=cfg["boundary_refiner_enabled"],
-            model_path=cfg["boundary_refiner_model_path"],
-            backbone=cfg["boundary_refiner_backbone"],
-            device=cfg["boundary_refiner_device"],
-            merge_threshold=cfg["boundary_refiner_threshold"],
-            max_merge_gap_s=None,
-            target_core_s=cfg["boundary_planner_target_chunk_s"],
-        )
         sequence_boundary_refiner = None
         sequence_feature_provider = None
     result_parameters = {
@@ -453,16 +421,13 @@ def _build_processing_spans(
     runtime_boundary_signature = {
         **result_parameters,
         "boundary_pipeline": {
-            "version": 2,
+            "version": 4,
             "feature_frame_hop_s": cfg["feature_frame_hop_s"],
             "score_frame_hop_s": score_frame_hop_s,
             "feature_sources": {
                 "speech_scores": frame_scores is not None,
                 "cut_scores": cut_frame_scores is not None,
             },
-            "boundary_refiner": (
-                boundary_refiner.signature() if boundary_refiner is not None else None
-            ),
             "sequence_boundary_refiner": (
                 sequence_boundary_refiner.signature()
                 if sequence_boundary_refiner is not None
@@ -478,20 +443,10 @@ def _build_processing_spans(
                     "boundary_candidate_extractor_version"
                 ],
                 "max_core_chunk_s": cfg["boundary_planner_max_core_chunk_s"],
-                "max_padded_chunk_s": cfg["boundary_planner_max_padded_chunk_s"],
                 "target_chunk_s": cfg["boundary_planner_target_chunk_s"],
                 "min_chunk_s": cfg["boundary_planner_min_chunk_s"],
-                "start_weight": cfg["boundary_planner_start_weight"],
-                "max_context_padding_s": cfg["boundary_context_max_padding_s"],
-                "max_speech_overlap_s": cfg["boundary_context_max_speech_overlap_s"],
                 "max_splits_per_segment": cfg["boundary_planner_max_splits_per_segment"],
                 "sequence_batch_size": cfg["boundary_planner_sequence_batch_size"],
-                "dp_chunk_base_cost": cfg["boundary_dp_chunk_base_cost"],
-                "dp_over_target_weight": cfg["boundary_dp_over_target_weight"],
-                "dp_far_over_target_weight": cfg["boundary_dp_far_over_target_weight"],
-                "dp_under_min_weight": cfg["boundary_dp_under_min_weight"],
-                "dp_long_gap_weight": cfg["boundary_dp_long_gap_weight"],
-                "dp_split_merge_weight": cfg["boundary_dp_split_merge_weight"],
             },
         },
     }
@@ -519,26 +474,15 @@ def _build_processing_spans(
         segments,
         frame_hop_s=cfg["feature_frame_hop_s"],
         max_core_chunk_s=cfg["boundary_planner_max_core_chunk_s"],
-        max_padded_chunk_s=cfg["boundary_planner_max_padded_chunk_s"],
         target_chunk_s=cfg["boundary_planner_target_chunk_s"],
         min_chunk_s=cfg["boundary_planner_min_chunk_s"],
-        max_context_padding_s=cfg["boundary_context_max_padding_s"],
-        max_speech_overlap_s=cfg["boundary_context_max_speech_overlap_s"],
-        start_weight=cfg["boundary_planner_start_weight"],
         frame_scores=frame_scores,
         score_frame_hop_s=score_frame_hop_s,
         cut_frame_scores=cut_frame_scores,
-        boundary_refiner=boundary_refiner,
         sequence_boundary_refiner=sequence_boundary_refiner,
         sequence_feature_provider=sequence_feature_provider,
         max_splits_per_segment=cfg["boundary_planner_max_splits_per_segment"],
         sequence_batch_size=cfg["boundary_planner_sequence_batch_size"],
-        dp_chunk_base_cost=cfg["boundary_dp_chunk_base_cost"],
-        dp_over_target_weight=cfg["boundary_dp_over_target_weight"],
-        dp_far_over_target_weight=cfg["boundary_dp_far_over_target_weight"],
-        dp_under_min_weight=cfg["boundary_dp_under_min_weight"],
-        dp_long_gap_weight=cfg["boundary_dp_long_gap_weight"],
-        dp_split_merge_weight=cfg["boundary_dp_split_merge_weight"],
     )
     event = _boundary_cache_module.save_processing_spans(
         audio_path,
@@ -582,8 +526,6 @@ def _annotate_packed_chunks(
             continue
         packed = packed_spans[span_index]
         chunk["speech_segment_count"] = len(packed.speech_segments)
-        chunk["speech_left_padding_s"] = packed.left_padding_s
-        chunk["speech_right_padding_s"] = packed.right_padding_s
         chunk["boundary_split_reason"] = packed.split_reason
         chunk["boundary_parent_chunk_id"] = packed.parent_chunk_id
         chunk["speech_island_id"] = packed.island_id
@@ -596,23 +538,19 @@ def _annotate_packed_chunks(
         chunk["boundary_decision_merge"] = packed.boundary_decision_merge
         chunk["boundary_merge_prob"] = packed.boundary_merge_prob
         chunk["boundary_split_prob"] = packed.boundary_split_prob
-        chunk["boundary_refine_delta_s"] = packed.boundary_refine_delta_s
+        chunk["boundary_start_refine_delta_s"] = packed.boundary_start_refine_delta_s
+        chunk["boundary_end_refine_delta_s"] = packed.boundary_end_refine_delta_s
         chunk["boundary_decision_source"] = packed.boundary_decision_source
-        chunk["boundary_left_context_s"] = packed.boundary_left_context_s
-        chunk["boundary_right_context_s"] = packed.boundary_right_context_s
-        chunk["boundary_context_source"] = packed.boundary_context_source
         log.append(
             "[chunk] idx={idx} dur={duration:.1f} speech_segment_count={count} "
-            "pad=({left:.2f},{right:.2f}) reason={reason} "
+            "reason={reason} "
             "parent={parent} island={island}/{islands} gap_max={gap:.2f} "
             "boundary={boundary_reason} source={boundary_source} score={boundary_score} "
-            "ctx=({ctx_left},{ctx_right}) "
+            "delta=({start_delta},{end_delta}) "
             "decision_source={decision_source} merge={decision_merge}".format(
                 idx=idx,
                 duration=packed.duration,
                 count=len(packed.speech_segments),
-                left=packed.left_padding_s,
-                right=packed.right_padding_s,
                 reason=packed.split_reason,
                 parent=packed.parent_chunk_id,
                 island=packed.island_id,
@@ -621,8 +559,8 @@ def _annotate_packed_chunks(
                 boundary_reason=packed.boundary_reason,
                 boundary_source=packed.boundary_source,
                 boundary_score=packed.boundary_score,
-                ctx_left=packed.boundary_left_context_s,
-                ctx_right=packed.boundary_right_context_s,
+                start_delta=packed.boundary_start_refine_delta_s,
+                end_delta=packed.boundary_end_refine_delta_s,
                 decision_source=packed.boundary_decision_source,
                 decision_merge=packed.boundary_decision_merge,
             )
@@ -666,6 +604,85 @@ def _alignment_fallback_count_from_log(log: list[str]) -> int:
     return len(chunk_ids) + unscoped_count
 
 
+def _qc_items_by_chunk(qc_report: dict) -> tuple[dict[int, dict], dict[int, dict]]:
+    qc_items: dict[int, dict] = {}
+    review_items: dict[int, dict] = {}
+    for item in qc_report.get("items") or []:
+        if not isinstance(item, dict):
+            continue
+        try:
+            qc_items[int(item.get("chunk_index"))] = item
+        except (TypeError, ValueError):
+            continue
+    for item in qc_report.get("review_uncertain_items") or []:
+        if not isinstance(item, dict):
+            continue
+        try:
+            review_items[int(item.get("chunk_index"))] = item
+        except (TypeError, ValueError):
+            continue
+    return qc_items, review_items
+
+
+def _segment_alignment_outcome(segment: dict, outcomes: dict[int, dict]) -> dict:
+    chunk_indices: list[int] = []
+    for word in segment.get("words") or []:
+        try:
+            chunk_indices.append(int(word.get("source_chunk_index")))
+        except (TypeError, ValueError):
+            continue
+    if not chunk_indices:
+        try:
+            chunk_indices.append(int(segment.get("source_chunk_index")))
+        except (TypeError, ValueError):
+            pass
+    unique_indices = list(dict.fromkeys(chunk_indices))
+    if not unique_indices:
+        return {}
+    members = [outcomes[index] for index in unique_indices if index in outcomes]
+    if not members:
+        return {}
+    qualities = [str(item.get("alignment_quality") or "") for item in members]
+    if any(quality in {"vad_coarse", "proportional", "drop_or_review"} for quality in qualities):
+        selected = next(
+            item
+            for item in members
+            if str(item.get("alignment_quality") or "")
+            in {"vad_coarse", "proportional", "drop_or_review"}
+        )
+    elif any(quality == "partial" for quality in qualities):
+        selected = next(item for item in members if str(item.get("alignment_quality") or "") == "partial")
+    else:
+        selected = members[0]
+    return {
+        "source_chunk_indices": unique_indices,
+        "alignment_mode": selected.get("alignment_mode", ""),
+        "alignment_quality": selected.get("alignment_quality", ""),
+        "fallback_type": selected.get("fallback_type", ""),
+        "fallback_subtype": selected.get("fallback_subtype", ""),
+        "alignment_quality_reasons": list(selected.get("alignment_quality_reasons") or []),
+        "forced_success": bool(selected.get("forced_success")),
+        "fallback_active": bool(selected.get("fallback_active")),
+        "asr_qc_severity": selected.get("asr_qc_severity", ""),
+        "asr_qc_reasons": list(selected.get("asr_qc_reasons") or []),
+        "asr_review_uncertain": bool(selected.get("asr_review_uncertain")),
+    }
+
+
+def _annotate_segments_with_alignment_outcomes(
+    segments: list[dict],
+    outcomes: dict[int, dict],
+) -> list[dict]:
+    annotated: list[dict] = []
+    for segment in segments:
+        item = dict(segment)
+        outcome = _segment_alignment_outcome(item, outcomes)
+        if outcome:
+            item.update(outcome)
+        annotated.append(item)
+    return annotated
+
+
 def _transcribe_and_align_local(
     audio_path: str,
     device: str,
@@ -705,7 +722,7 @@ def _transcribe_and_align_local(
                     "asr_model_unload_s": 0.0,
                     "alignment_s": 0.0,
                     "alignment_model_unload_s": 0.0,
-                    "subtitle_merge_s": 0.0,
+                    "subtitle_segment_s": 0.0,
                 }
             )
             total_elapsed = time.perf_counter() - total_started
@@ -812,7 +829,7 @@ def _transcribe_and_align_local(
                 _with_alignment_fallback_window(chunk, text_result)
                 for chunk, text_result in zip(chunk_infos, text_results)
             ]
-            transcript_chunks = _build_transcript_chunks(chunk_infos, text_results)
+            qc_items, review_items = _qc_items_by_chunk(qc_report)
 
             unload_started = time.perf_counter()
             backend.unload_model(on_stage=on_stage)
@@ -849,22 +866,7 @@ def _transcribe_and_align_local(
                 aligner_unload_elapsed,
             )
 
-            island_split_words, island_split_logs, island_split_attempted = (
-                _split_alignment_sentinels_with_speech_islands_batch(
-                    backend,
-                    audio_path,
-                    chunk_infos,
-                    prepared_results,
-                    on_stage=on_stage,
-                )
-            )
-            if island_split_attempted:
-                log.append(
-                    "Alignment speech-island split batch: "
-                    f"success_chunks={len(island_split_words)} "
-                    f"candidate_chunks={len(island_split_logs)}"
-                )
-
+            alignment_outcomes: dict[int, dict] = {}
             for idx, chunk, (chunk_result, chunk_log) in zip(
                 range(1, len(chunk_infos) + 1),
                 chunk_infos,
@@ -872,19 +874,20 @@ def _transcribe_and_align_local(
             ):
                 chunk_index = int(chunk.get("index", idx - 1))
                 chunk_log = list(chunk_log)
-                if chunk_index in island_split_logs:
-                    chunk_log.extend(island_split_logs[chunk_index])
-                if chunk_index in island_split_words:
-                    chunk_words = island_split_words[chunk_index]
-                else:
-                    chunk_words, chunk_log = _finalize_aligned_chunk_without_asr_retry(
-                        chunk,
-                        chunk_result,
-                        chunk_log,
-                        backend=None if island_split_attempted else backend,
-                        source_audio_path=None if island_split_attempted else audio_path,
-                        on_stage=on_stage,
-                    )
+                chunk_words, chunk_log = _finalize_aligned_chunk_without_asr_retry(
+                    chunk,
+                    chunk_result,
+                    chunk_log,
+                )
+                outcome = _alignment_outcome_for_chunk(
+                    chunk=chunk,
+                    chunk_result=chunk_result,
+                    chunk_words=chunk_words,
+                    chunk_log=chunk_log,
+                    qc_item=qc_items.get(chunk_index),
+                    review_item=review_items.get(chunk_index),
+                )
+                alignment_outcomes[chunk_index] = outcome
                 for entry in chunk_log:
                     if entry.startswith(
                         (
@@ -911,19 +914,29 @@ def _transcribe_and_align_local(
                             "end": chunk["start"] + float(word["end"]),
                             "word": word["word"],
                             "source_chunk_index": chunk.get("index", idx - 1),
+                            "alignment_mode": outcome.get("alignment_mode", ""),
+                            "alignment_quality": outcome.get("alignment_quality", ""),
+                            "fallback_type": outcome.get("fallback_type", ""),
+                            "fallback_subtype": outcome.get("fallback_subtype", ""),
                         }
                     )
+            transcript_chunks = _build_transcript_chunks(
+                chunk_infos,
+                text_results,
+                alignment_outcomes,
+            )
         finally:
             backend.close()
 
-        merge_started = time.perf_counter()
+        segment_started = time.perf_counter()
         word_dicts.sort(key=lambda item: (item["start"], item["end"]))
         log.append(f"Alignment 汇总词数: {len(word_dicts)}")
-        segments = _merge_words_to_segments(word_dicts)
+        segments = _group_words_to_segments(word_dicts)
         segments = _postprocess_segments(segments)
-        merge_elapsed = time.perf_counter() - merge_started
+        segments = _annotate_segments_with_alignment_outcomes(segments, alignment_outcomes)
+        segment_elapsed = time.perf_counter() - segment_started
         _record_stage_timing(
-            log, timings, "subtitle_merge_s", "字幕合并", merge_elapsed
+            log, timings, "subtitle_segment_s", "字幕分段", segment_elapsed
         )
 
         total_elapsed = time.perf_counter() - total_started
@@ -946,7 +959,40 @@ def _transcribe_and_align_local(
             "stage_timings": timings,
             "word_count": len(word_dicts),
             "segment_count": len(segments),
-            "fallback_count": _alignment_fallback_count_from_log(log),
+            "boundary_signature": dict(_LAST_BOUNDARY_SIGNATURE),
+            "fallback_count": sum(
+                1
+                for outcome in alignment_outcomes.values()
+                if bool(outcome.get("fallback_active"))
+            ),
+            "alignment_outcome_counts": {
+                key: sum(
+                    1
+                    for outcome in alignment_outcomes.values()
+                    if str(outcome.get("alignment_quality") or "") == key
+                )
+                for key in sorted(
+                    {
+                        str(outcome.get("alignment_quality") or "")
+                        for outcome in alignment_outcomes.values()
+                        if outcome.get("alignment_quality")
+                    }
+                )
+            },
+            "fallback_subtype_counts": {
+                key: sum(
+                    1
+                    for outcome in alignment_outcomes.values()
+                    if str(outcome.get("fallback_subtype") or "") == key
+                )
+                for key in sorted(
+                    {
+                        str(outcome.get("fallback_subtype") or "")
+                        for outcome in alignment_outcomes.values()
+                        if outcome.get("fallback_subtype")
+                    }
+                )
+            },
         }
         return segments, log, details
     finally:

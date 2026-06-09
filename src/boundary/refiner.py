@@ -17,43 +17,10 @@ from boundary.sequence_features import (
     validate_sequence_features,
 )
 
-LEARNED_REFINER_SCHEMA = "boundary_refiner_v2"
+LEARNED_REFINER_SCHEMA = "boundary_refiner_v4"
 DEFAULT_REFINER_CHECKPOINT_PATH = Path("src/boundary/checkpoints/boundary_refiner.pt")
-CONTEXT_OUTPUT_DIM = 3
-DEFAULT_CONTEXT_MAX_PADDING_S = 1.5
-
-DEFAULT_REFINER_FEATURES = (
-    "gap_s",
-    "left_duration_s",
-    "right_duration_s",
-    "current_core_s",
-    "proposed_core_s",
-    "gap_merge_s",
-    "gap_ratio",
-    "proposed_over_target_s",
-    "left_score",
-    "right_score",
-    "valley_score_min",
-    "cut_score_max",
-    "gap_boundary_score",
-)
-
-
-@dataclass(frozen=True)
-class RefinerInput:
-    gap_s: float
-    left_start: float
-    left_end: float
-    right_start: float
-    right_end: float
-    current_core_s: float
-    proposed_core_s: float
-    gap_merge_s: float
-    left_score: float | None = None
-    right_score: float | None = None
-    valley_score_min: float | None = None
-    cut_score_max: float | None = None
-    gap_boundary_score: float | None = None
+BOUNDARY_REFINER_OUTPUT_DIM = 3
+DEFAULT_BOUNDARY_DELTA_MAX_S = 0.5
 
 
 @dataclass(frozen=True)
@@ -62,71 +29,14 @@ class BoundaryDecision:
     score: float
     reason: str
     source: str = ""
-    refine_delta_s: float | None = None
-    left_context_s: float | None = None
-    right_context_s: float | None = None
-    context_source: str = ""
-
-
-class BoundaryRefiner(Protocol):
-    def decide_gap(self, item: RefinerInput) -> BoundaryDecision: ...
-
-    def signature(self) -> dict: ...
+    start_refine_delta_s: float | None = None
+    end_refine_delta_s: float | None = None
 
 
 class SequenceBoundaryRefiner(Protocol):
     def decide_sequence(self, features: Sequence[Sequence[float]]) -> list[BoundaryDecision]: ...
 
     def signature(self) -> dict: ...
-
-
-class HeuristicBoundaryRefiner:
-    """Deterministic bootstrap refiner used until a learned checkpoint is available."""
-
-    def __init__(
-        self,
-        *,
-        merge_threshold: float = 0.5,
-        max_merge_gap_s: float | None = None,
-        target_core_s: float = 3.0,
-        cut_score_threshold: float = 0.94,
-        valley_score_threshold: float = 0.10,
-    ) -> None:
-        self.merge_threshold = float(merge_threshold)
-        self.max_merge_gap_s = None if max_merge_gap_s is None else float(max_merge_gap_s)
-        self.target_core_s = float(target_core_s)
-        self.cut_score_threshold = float(cut_score_threshold)
-        self.valley_score_threshold = float(valley_score_threshold)
-
-    def signature(self) -> dict:
-        return {
-            "type": "heuristic_boundary_refiner",
-            "merge_threshold": self.merge_threshold,
-            "max_merge_gap_s": self.max_merge_gap_s,
-            "target_core_s": self.target_core_s,
-            "cut_score_threshold": self.cut_score_threshold,
-            "valley_score_threshold": self.valley_score_threshold,
-        }
-
-    def decide_gap(self, item: RefinerInput) -> BoundaryDecision:
-        if item.gap_s < 0.0:
-            return BoundaryDecision(False, 0.0, "overlap_gap", source="heuristic_refiner")
-        if self.max_merge_gap_s is not None and item.gap_s > self.max_merge_gap_s:
-            return BoundaryDecision(False, 0.0, "gap_above_refiner_limit", source="heuristic_refiner")
-        if item.cut_score_max is not None and item.cut_score_max >= self.cut_score_threshold:
-            return BoundaryDecision(False, 0.0, "cut_score_high", source="heuristic_refiner")
-        if item.valley_score_min is not None and item.valley_score_min <= self.valley_score_threshold:
-            return BoundaryDecision(False, 0.0, "valley_low", source="heuristic_refiner")
-
-        base = 1.0 - min(1.0, item.gap_s / max(item.gap_merge_s, 1e-6))
-        length_penalty = min(0.35, max(0.0, item.proposed_core_s - self.target_core_s) / 30.0)
-        score = max(0.0, min(1.0, base - length_penalty))
-        return BoundaryDecision(
-            score >= self.merge_threshold,
-            score,
-            "heuristic_score",
-            source="heuristic_refiner",
-        )
 
 
 class LearnedBoundaryRefiner:
@@ -162,8 +72,8 @@ class LearnedBoundaryRefiner:
         self.actual_device = _move_model_to_device(self.model, self.requested_device)
         self.metadata = dict(metadata or {})
         self._sha1 = file_sha1(checkpoint_path)
-        self.context_max_padding_s = float(
-            self.metadata.get("context_max_padding_s", DEFAULT_CONTEXT_MAX_PADDING_S)
+        self.boundary_delta_max_s = float(
+            self.metadata.get("boundary_delta_max_s", DEFAULT_BOUNDARY_DELTA_MAX_S)
         )
 
     def signature(self) -> dict:
@@ -179,34 +89,6 @@ class LearnedBoundaryRefiner:
             "feature_names": list(self.feature_names),
             "metadata": self.metadata,
         }
-
-    def decide_gap(self, item: RefinerInput) -> BoundaryDecision:
-        if item.gap_s < 0.0:
-            return BoundaryDecision(False, 0.0, "overlap_gap", source="learned_refiner")
-        vector = torch.tensor(
-            [_feature_value(item, name) for name in self.feature_names],
-            dtype=torch.float32,
-        )
-        mean = torch.tensor(self.feature_mean, dtype=torch.float32)
-        std = torch.tensor(self.feature_std, dtype=torch.float32).clamp_min(1e-6)
-        vector = ((vector - mean) / std).view(1, 1, -1)
-        device = next(self.model.parameters()).device
-        with torch.inference_mode():
-            logits = self.model(vector.to(device)).reshape(-1).detach().cpu()
-            score = float(torch.sigmoid(logits[0]))
-            left_context_s, right_context_s = _context_from_logits(
-                logits,
-                max_padding_s=self.context_max_padding_s,
-            )
-        return BoundaryDecision(
-            score >= self.threshold,
-            score,
-            "learned_merge" if score >= self.threshold else "learned_split",
-            source="learned_refiner",
-            left_context_s=left_context_s,
-            right_context_s=right_context_s,
-            context_source="learned_refiner",
-        )
 
 
 class FrameSequenceBoundaryRefiner:
@@ -260,15 +142,15 @@ class FrameSequenceBoundaryRefiner:
             merge_scores = torch.sigmoid(logits[0, :, 0]).tolist()
             context_logits = logits[0]
         elif logits.ndim == 2:
-            merge_scores = torch.sigmoid(logits.reshape(-1)).tolist()
+            merge_scores = torch.sigmoid(logits[:, 0]).tolist()
             context_logits = logits
         else:
             raise ValueError("frame sequence refiner logits must have shape [batch,time,heads]")
         decisions: list[BoundaryDecision] = []
         for index, score in enumerate(merge_scores):
-            left_context_s, right_context_s = _context_from_logits(
+            start_delta_s, end_delta_s = _boundary_delta_from_logits(
                 context_logits[index],
-                max_padding_s=self.learned.context_max_padding_s,
+                max_delta_s=self.learned.boundary_delta_max_s,
             )
             decisions.append(
                 BoundaryDecision(
@@ -278,9 +160,8 @@ class FrameSequenceBoundaryRefiner:
                     if float(score) >= self.learned.threshold
                     else "learned_sequence_split",
                     source="frame_sequence_refiner",
-                    left_context_s=left_context_s,
-                    right_context_s=right_context_s,
-                    context_source="frame_sequence_refiner",
+                    start_refine_delta_s=start_delta_s,
+                    end_refine_delta_s=end_delta_s,
                 )
             )
         return decisions
@@ -305,7 +186,7 @@ def load_learned_refiner_checkpoint(
         )
     feature_names = tuple(str(name) for name in payload.get("feature_names") or ())
     if not feature_names:
-        feature_names = DEFAULT_REFINER_FEATURES
+        raise ValueError("boundary refiner v4 checkpoint missing feature_names")
     model_config = dict(payload.get("model_config") or {})
     backbone = normalize_boundary_backbone(
         backbone_override
@@ -317,11 +198,11 @@ def load_learned_refiner_checkpoint(
     )
     model_config["backbone"] = backbone
     model_config.setdefault("input_dim", len(feature_names))
-    model_config.setdefault("output_dim", CONTEXT_OUTPUT_DIM)
+    model_config.setdefault("output_dim", BOUNDARY_REFINER_OUTPUT_DIM)
     if int(model_config["input_dim"]) != len(feature_names):
         raise ValueError("checkpoint input_dim does not match feature_names length")
-    if int(model_config.get("output_dim", 0)) != CONTEXT_OUTPUT_DIM:
-        raise ValueError("boundary refiner v2 checkpoints must use output_dim=3")
+    if int(model_config.get("output_dim", 0)) != BOUNDARY_REFINER_OUTPUT_DIM:
+        raise ValueError("boundary refiner v4 checkpoints must use output_dim=3")
     model = BoundarySequenceClassifier(**model_config)
     state_dict = payload.get("state_dict")
     if not isinstance(state_dict, dict):
@@ -375,7 +256,7 @@ def _move_model_to_device(model: torch.nn.Module, requested_device: str) -> str:
 def build_learned_refiner_checkpoint(
     *,
     model: BoundarySequenceClassifier,
-    feature_names: tuple[str, ...] = DEFAULT_REFINER_FEATURES,
+    feature_names: tuple[str, ...],
     feature_mean: tuple[float, ...] | None = None,
     feature_std: tuple[float, ...] | None = None,
     model_config: dict | None = None,
@@ -385,9 +266,9 @@ def build_learned_refiner_checkpoint(
     config.update(model_config or {})
     config["input_dim"] = len(feature_names)
     config["backbone"] = model.backbone_name
-    config["output_dim"] = getattr(model, "output_dim", CONTEXT_OUTPUT_DIM)
-    if int(config["output_dim"]) != CONTEXT_OUTPUT_DIM:
-        raise ValueError("boundary refiner v2 checkpoints require output_dim=3")
+    config["output_dim"] = getattr(model, "output_dim", BOUNDARY_REFINER_OUTPUT_DIM)
+    if int(config["output_dim"]) != BOUNDARY_REFINER_OUTPUT_DIM:
+        raise ValueError("boundary refiner v4 checkpoints require output_dim=3")
     return {
         "schema": LEARNED_REFINER_SCHEMA,
         "backbone": model.backbone_name,
@@ -400,102 +281,12 @@ def build_learned_refiner_checkpoint(
     }
 
 
-def load_boundary_refiner(
-    *,
-    enabled: bool,
-    model_path: str = "",
-    backbone: str = TRANSFORMERS_MAMBA2_BACKBONE,
-    device: str = "auto",
-    merge_threshold: float = 0.5,
-    max_merge_gap_s: float | None = None,
-    target_core_s: float = 3.0,
-    cut_score_threshold: float = 0.94,
-    valley_score_threshold: float = 0.10,
-) -> BoundaryRefiner | None:
-    if not enabled:
-        return None
-    backbone = normalize_boundary_backbone(backbone)
-    path = Path(model_path).expanduser() if model_path else None
-    if path is not None and str(path) and not path.exists():
-        if _is_default_refiner_checkpoint_path(Path(model_path)):
-            return HeuristicBoundaryRefiner(
-                merge_threshold=merge_threshold,
-                max_merge_gap_s=max_merge_gap_s,
-                target_core_s=target_core_s,
-                cut_score_threshold=cut_score_threshold,
-                valley_score_threshold=valley_score_threshold,
-            )
-        raise FileNotFoundError(f"Boundary refiner checkpoint not found: {path}")
-    if path is not None and path.exists():
-        return load_learned_refiner_checkpoint(
-            path,
-            threshold=merge_threshold,
-            backbone_override=backbone,
-            device=device,
-        )
-    return HeuristicBoundaryRefiner(
-        merge_threshold=merge_threshold,
-        max_merge_gap_s=max_merge_gap_s,
-        target_core_s=target_core_s,
-        cut_score_threshold=cut_score_threshold,
-        valley_score_threshold=valley_score_threshold,
-    )
-
-
-def _is_default_refiner_checkpoint_path(path: Path) -> bool:
-    try:
-        return path.expanduser().resolve(strict=False) == DEFAULT_REFINER_CHECKPOINT_PATH.resolve(strict=False)
-    except Exception:
-        return str(path).replace("\\", "/").lstrip("./") == str(DEFAULT_REFINER_CHECKPOINT_PATH).replace("\\", "/")
-
-
-def refiner_input_to_features(
-    item: RefinerInput,
-    feature_names: tuple[str, ...] = DEFAULT_REFINER_FEATURES,
-) -> list[float]:
-    return [_feature_value(item, name) for name in feature_names]
-
-
 def file_sha1(path: Path) -> str:
     hasher = hashlib.sha1()
     with path.open("rb") as handle:
         for chunk in iter(lambda: handle.read(1024 * 1024), b""):
             hasher.update(chunk)
     return hasher.hexdigest()
-
-
-def _feature_value(item: RefinerInput, name: str) -> float:
-    if name == "gap_s":
-        return float(item.gap_s)
-    if name == "left_duration_s":
-        return float(max(0.0, item.left_end - item.left_start))
-    if name == "right_duration_s":
-        return float(max(0.0, item.right_end - item.right_start))
-    if name == "current_core_s":
-        return float(item.current_core_s)
-    if name == "proposed_core_s":
-        return float(item.proposed_core_s)
-    if name == "gap_merge_s":
-        return float(item.gap_merge_s)
-    if name == "gap_ratio":
-        return float(item.gap_s / max(item.gap_merge_s, 1e-6))
-    if name == "proposed_over_target_s":
-        return float(item.proposed_core_s - item.current_core_s)
-    if name == "left_score":
-        return _none_to_default(item.left_score, 0.0)
-    if name == "right_score":
-        return _none_to_default(item.right_score, 0.0)
-    if name == "valley_score_min":
-        return _none_to_default(item.valley_score_min, 1.0)
-    if name == "cut_score_max":
-        return _none_to_default(item.cut_score_max, 0.0)
-    if name == "gap_boundary_score":
-        return _none_to_default(item.gap_boundary_score, 0.0)
-    raise ValueError(f"unknown boundary refiner feature: {name}")
-
-
-def _none_to_default(value: float | None, default: float) -> float:
-    return float(default if value is None else value)
 
 
 def _float_tuple(values: object, expected_len: int, default: float) -> tuple[float, ...]:
@@ -507,14 +298,14 @@ def _float_tuple(values: object, expected_len: int, default: float) -> tuple[flo
     return result
 
 
-def _context_from_logits(
+def _boundary_delta_from_logits(
     logits: torch.Tensor,
     *,
-    max_padding_s: float,
+    max_delta_s: float,
 ) -> tuple[float | None, float | None]:
-    if logits.numel() < CONTEXT_OUTPUT_DIM:
+    if logits.numel() < BOUNDARY_REFINER_OUTPUT_DIM:
         return None, None
-    scale = max(0.0, float(max_padding_s))
-    left = float(torch.sigmoid(logits[1]) * scale)
-    right = float(torch.sigmoid(logits[2]) * scale)
-    return left, right
+    scale = max(0.0, float(max_delta_s))
+    start = float(torch.tanh(logits[1]) * scale)
+    end = float(torch.tanh(logits[2]) * scale)
+    return start, end

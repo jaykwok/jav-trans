@@ -61,15 +61,15 @@ def _first_parameter_device_dtype(model) -> tuple[str, str]:
     return str(parameter.device), str(parameter.dtype)
 
 
-def _padded_frames(values: np.ndarray, *, pad_frames: int) -> np.ndarray:
+def _dilated_frames(values: np.ndarray, *, dilation_frames: int) -> np.ndarray:
     mask = np.asarray(values, dtype=bool)
-    if pad_frames <= 0 or mask.size == 0:
+    if dilation_frames <= 0 or mask.size == 0:
         return mask.astype(np.int8, copy=False)
     out = mask.copy()
     active = np.flatnonzero(mask)
     for index in active:
-        start = max(0, int(index) - pad_frames)
-        end = min(out.size, int(index) + pad_frames + 1)
+        start = max(0, int(index) - dilation_frames)
+        end = min(out.size, int(index) + dilation_frames + 1)
         out[start:end] = True
     return out.astype(np.int8, copy=False)
 
@@ -160,8 +160,8 @@ def _bootstrap_frame_scores(
 
     speech = (0.70 * energy + 0.20 * ptm_norm + 0.10 * mfcc_delta).astype(np.float32)
     if speech.size >= 3:
-        padded = np.pad(speech, (1, 1), mode="edge")
-        speech = ((padded[:-2] + padded[1:-1] + padded[2:]) / 3.0).astype(np.float32)
+        smoothed = np.pad(speech, (1, 1), mode="edge")
+        speech = ((smoothed[:-2] + smoothed[1:-1] + smoothed[2:]) / 3.0).astype(np.float32)
     cut = (1.0 - speech).astype(np.float32)
     return np.clip(speech, 0.0, 1.0), np.clip(cut, 0.0, 1.0)
 
@@ -191,43 +191,33 @@ def frames_to_segments(
     return segments
 
 
-def merge_segments(
+def filter_segments(
     segments: Iterable[SpeechSegment],
     *,
     duration_s: float,
-    merge_gap_s: float,
     min_segment_s: float,
 ) -> list[SpeechSegment]:
-    ordered = sorted(
-        (
-            SpeechSegment(
-                start=max(0.0, min(float(segment.start), duration_s)),
-                end=max(0.0, min(float(segment.end), duration_s)),
-                score=segment.score,
-            )
-            for segment in segments
-        ),
-        key=lambda item: (item.start, item.end),
-    )
-    merged: list[SpeechSegment] = []
-    for segment in ordered:
-        if segment.end - segment.start < min_segment_s:
-            continue
-        if not merged or segment.start - merged[-1].end > merge_gap_s:
-            merged.append(segment)
-            continue
-        merged[-1].end = max(merged[-1].end, segment.end)
-        if merged[-1].score is None:
-            merged[-1].score = segment.score
-        elif segment.score is not None:
-            merged[-1].score = max(float(merged[-1].score), float(segment.score))
-    return [segment for segment in merged if segment.end - segment.start >= min_segment_s]
+    return [
+        segment
+        for segment in sorted(
+            (
+                SpeechSegment(
+                    start=max(0.0, min(float(segment.start), duration_s)),
+                    end=max(0.0, min(float(segment.end), duration_s)),
+                    score=segment.score,
+                )
+                for segment in segments
+            ),
+            key=lambda item: (item.start, item.end),
+        )
+        if segment.end - segment.start >= min_segment_s
+    ]
 
 
 @dataclass(frozen=True)
 class SpeechBoundaryJaConfig:
     threshold: float = 0.200
-    pad_s: float = 0.2
+    frame_dilation_s: float = 0.2
     frame_hop_s: float = 0.02
     ptm: str = DEFAULT_PTM
     model_path: str = DEFAULT_MODEL_PATH
@@ -237,7 +227,6 @@ class SpeechBoundaryJaConfig:
     window_s: float = 30.0
     overlap_s: float = 1.0
     min_segment_s: float = 0.05
-    merge_gap_s: float = 0.0
     max_group_s: float = 6.0
     chunk_threshold_s: float = 1.0
     cut_threshold: float = 0.500
@@ -250,7 +239,7 @@ class SpeechBoundaryJaConfig:
     def from_env(cls) -> "SpeechBoundaryJaConfig":
         return cls(
             threshold=_env_float("SPEECH_BOUNDARY_JA_THRESHOLD", "0.200"),
-            pad_s=_env_float("SPEECH_BOUNDARY_JA_PAD_S", "0.2"),
+            frame_dilation_s=_env_float("SPEECH_BOUNDARY_JA_FRAME_DILATION_S", "0.2"),
             frame_hop_s=_env_float("SPEECH_BOUNDARY_JA_FRAME_HOP_S", "0.02"),
             ptm=os.getenv("SPEECH_BOUNDARY_JA_PTM", DEFAULT_PTM).strip() or DEFAULT_PTM,
             model_path=os.getenv("SPEECH_BOUNDARY_JA_MODEL_PATH", DEFAULT_MODEL_PATH).strip(),
@@ -260,7 +249,6 @@ class SpeechBoundaryJaConfig:
             window_s=_env_float("SPEECH_BOUNDARY_JA_WINDOW_S", "30.0"),
             overlap_s=_env_float("SPEECH_BOUNDARY_JA_OVERLAP_S", "1.0"),
             min_segment_s=_env_float("SPEECH_BOUNDARY_JA_MIN_SEGMENT_S", "0.05"),
-            merge_gap_s=_env_float("SPEECH_BOUNDARY_JA_MERGE_GAP_S", "0.0"),
             max_group_s=_env_float("SPEECH_BOUNDARY_JA_MAX_GROUP_S", "6.0"),
             chunk_threshold_s=_env_float("SPEECH_BOUNDARY_JA_CHUNK_THRESHOLD_S", "1.0"),
             cut_threshold=_env_float("SPEECH_BOUNDARY_JA_CUT_THRESHOLD", "0.500"),
@@ -285,7 +273,7 @@ class SpeechBoundaryJaBackend:
         return {
             "backend": self.name,
             "threshold": float(cfg.threshold),
-            "pad_s": float(cfg.pad_s),
+            "frame_dilation_s": float(cfg.frame_dilation_s),
             "frame_hop_s": float(cfg.frame_hop_s),
             "ptm": cfg.ptm,
             "model_path": cfg.model_path,
@@ -295,7 +283,6 @@ class SpeechBoundaryJaBackend:
             "window_s": float(cfg.window_s),
             "overlap_s": float(cfg.overlap_s),
             "min_segment_s": float(cfg.min_segment_s),
-            "merge_gap_s": float(cfg.merge_gap_s),
             "max_group_s": float(cfg.max_group_s),
             "chunk_threshold_s": float(cfg.chunk_threshold_s),
             "cut_threshold": float(cfg.cut_threshold),
@@ -441,20 +428,19 @@ class SpeechBoundaryJaBackend:
                 apply_cut=cfg.apply_cut_to_speech,
             )
             raw_frames = effective_probabilities >= threshold
-            padded = _padded_frames(
+            dilated = _dilated_frames(
                 raw_frames,
-                pad_frames=max(0, int(round(cfg.pad_s / cfg.frame_hop_s))),
+                dilation_frames=max(0, int(round(cfg.frame_dilation_s / cfg.frame_hop_s))),
             )
             segments = frames_to_segments(
-                padded,
+                dilated,
                 frame_hop_s=cfg.frame_hop_s,
                 duration_s=duration_s,
                 scores=probabilities,
             )
-            segments = merge_segments(
+            segments = filter_segments(
                 segments,
                 duration_s=duration_s,
-                merge_gap_s=cfg.merge_gap_s,
                 min_segment_s=cfg.min_segment_s,
             )
             groups = group_segments(
@@ -488,7 +474,7 @@ class SpeechBoundaryJaBackend:
                             float(cut_probabilities.max()) if cut_probabilities.size else 0.0
                         ),
                         "raw_speech_ratio": float(raw_frames.mean()) if raw_frames.size else 0.0,
-                        "padded_speech_ratio": float(padded.mean()) if padded.size else 0.0,
+                        "dilated_speech_ratio": float(dilated.mean()) if dilated.size else 0.0,
                         "uncovered_frame_ratio": float((probability_count <= 0).mean())
                         if probability_count.size
                         else 0.0,

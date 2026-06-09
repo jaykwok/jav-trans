@@ -13,6 +13,7 @@ from typing import Any, Mapping
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 AUDIT_ROOT = PROJECT_ROOT / "agents" / "audits"
 AUDIT_RM_ROOT = PROJECT_ROOT / "agents" / "rm" / "audit-deletions"
+AUDIT_SERVER_COMMAND = "tools/audits/serve_audits.sh"
 
 
 def project_rel(value: str | Path | None) -> str:
@@ -381,7 +382,7 @@ code {{ font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
 {cards}
   <div class="status" id="deleteStatus"></div>
   <p class="muted">{html.escape(latest_meta)}</p>
-  <p class="muted">所有长期审计页统一放在 <code>agents/audits/</code>，从本页进入；不使用自动跳转，避免审计中刷新。删除会移动到 <code>agents/rm/audit-deletions/</code>。使用 live-server 时加 middleware：<code>live-server --middleware=tools/audits/live_server_audit_middleware.js</code>。</p>
+  <p class="muted">所有长期审计页统一放在 <code>agents/audits/</code>，从本页进入；不使用自动跳转。推荐用 <code>{AUDIT_SERVER_COMMAND}</code> 启动，它仍从项目根目录提供媒体文件，但只 watch <code>agents/audits/</code>，避免训练日志、cache、tmp 写入触发浏览器持续刷新。删除会移动到 <code>agents/rm/audit-deletions/</code>。</p>
 </main>
 <script>
 const statusBox = document.getElementById("deleteStatus");
@@ -424,7 +425,7 @@ async function deleteAudit(button) {{
     const copied = await copyText(command);
     setStatus(
       "live-server middleware 不可用，浏览器静态页不能直接删除文件。\\n" +
-      "请用以下方式从项目根目录启动：live-server --middleware=tools/audits/live_server_audit_middleware.js\\n" +
+      "请用以下方式从项目根目录启动：" + {json.dumps(AUDIT_SERVER_COMMAND)} + "\\n" +
       "或直接运行删除命令" + (copied ? "（已复制）" : "") + "：\\n" + command + "\\n" +
       `错误：${{error.message || error}}`
     );

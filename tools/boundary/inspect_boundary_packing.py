@@ -89,7 +89,8 @@ def chunk_to_row(index: int, chunk: PackedChunk) -> dict[str, Any]:
         "boundary_decision_merge": chunk.boundary_decision_merge,
         "boundary_merge_prob": chunk.boundary_merge_prob,
         "boundary_split_prob": chunk.boundary_split_prob,
-        "boundary_refine_delta_s": chunk.boundary_refine_delta_s,
+        "boundary_start_refine_delta_s": chunk.boundary_start_refine_delta_s,
+        "boundary_end_refine_delta_s": chunk.boundary_end_refine_delta_s,
         "boundary_decision_source": chunk.boundary_decision_source,
     }
 
@@ -112,7 +113,6 @@ def inspect(audio_path: Path, output_dir: Path) -> dict[str, Any]:
         "internal_gap_max_s": stats(row["internal_gap_max_s"] for row in rows),
         "split_reason_counts": dict(Counter(str(row["split_reason"]) for row in rows).most_common()),
         "decision_source_counts": dict(Counter(str(row["boundary_decision_source"] or "none") for row in rows).most_common()),
-        "planner_dp_count": sum(1 for row in rows if row["split_reason"] == "planner_dp"),
         "learned_split_count": sum(
             1 for row in rows if str(row["split_reason"]).startswith("boundary_refiner:learned_sequence_split")
         ),
