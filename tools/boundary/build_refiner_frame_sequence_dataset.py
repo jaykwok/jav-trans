@@ -20,16 +20,16 @@ if str(SRC_ROOT) not in sys.path:
 from boundary.sequence_features import (
     FRAME_SEQUENCE_FEATURE_SCHEMA,
     FrameSequenceFeatureConfig,
+    boundary_window_sequence_features,
     feature_extraction_hash,
     feature_extraction_signature,
     frame_sequence_feature_names,
-    gap_window_sequence_features,
     get_feature_dim,
     validate_sequence_features,
 )
 from boundary.ja import LabelRecord, TeacherSegment, load_cached_feature
 
-DATASET_SCHEMA = "boundary_refiner_frame_sequence_dataset_v4"
+DATASET_SCHEMA = "boundary_refiner_frame_sequence_dataset_v5"
 
 
 @dataclass(frozen=True)
@@ -39,12 +39,7 @@ class FrameSequenceConfig:
     max_ptm_dims: int = 64
     include_mfcc: bool = True
     target_chunk_s: float = 3.0
-    safe_merge_gap_s: float = 0.12
     long_gap_split_s: float = 0.60
-    synthetic_merge_positives_per_record: int = 1
-    synthetic_merge_gap_min_s: float = 0.04
-    synthetic_merge_gap_s: float = 0.04
-    synthetic_merge_min_segment_s: float = 1.20
     synthetic_boundary_delta_jitter_s: float = 0.0
     synthetic_boundary_delta_seed: int = 240609
 
@@ -174,10 +169,13 @@ def build_frame_sequence_dataset(
                 output_handle.write(json.dumps(row, ensure_ascii=False, sort_keys=True) + "\n")
                 counters["manifest_rows_selected"] += 1
                 counters["sequences"] += 1
-                labels = [int(value) for value in row["sequence_labels"]]
-                counters["sequence_items"] += len(labels)
-                counters["merge_positive"] += sum(labels)
-                counters["split_negative"] += len(labels) - sum(labels)
+                counters["sequence_items"] += len(row["sequence_features"])
+                counters["start_supervised"] += sum(
+                    1 for item in row["sequence_boundary_delta_weights"] if float(item[0]) > 0.0
+                )
+                counters["end_supervised"] += sum(
+                    1 for item in row["sequence_boundary_delta_weights"] if float(item[1]) > 0.0
+                )
                 for reason in row["sequence_reasons"]:
                     reason_counts[str(reason)] += 1
             if limit is not None and counters["manifest_rows_selected"] >= limit:
@@ -195,10 +193,6 @@ def build_frame_sequence_dataset(
         "feature_dim": len(feature_names or []),
         "counts": dict(counters),
         "label_reasons": dict(reason_counts),
-        "class_balance": {
-            "merge_positive": int(counters["merge_positive"]),
-            "split_negative": int(counters["split_negative"]),
-        },
     }
     summary_json.parent.mkdir(parents=True, exist_ok=True)
     summary_json.write_text(
@@ -219,19 +213,18 @@ def _sequence_row(
     config: FrameSequenceConfig,
 ) -> dict[str, Any] | None:
     segments = _record_segments(record)
-    if not segments and config.synthetic_merge_positives_per_record <= 0:
+    if not segments:
         return None
     sequence_features: list[list[float]] = []
-    sequence_labels: list[int] = []
     sequence_boundary_delta_targets: list[list[float]] = []
+    sequence_boundary_delta_weights: list[list[float]] = []
     sequence_reasons: list[str] = []
     gap_indexes: list[int] = []
 
     for index, (left, right) in enumerate(zip(segments, segments[1:])):
-        label = _label_gap(index=index, left=left, right=right, record=record, config=config)
-        if label is None:
+        reason = _boundary_reason(index=index, left=left, right=right, record=record, config=config)
+        if reason is None:
             continue
-        merge_target, reason = label
         sequence_features.append(
             _candidate_features(
                 left=left,
@@ -242,51 +235,17 @@ def _sequence_row(
                 config=config,
             )
         )
-        sequence_labels.append(1 if merge_target else 0)
         sequence_boundary_delta_targets.append(
             _boundary_delta_targets(
                 record=record,
                 gap_index=index,
                 reason=reason,
-                merge_target=merge_target,
                 config=config,
             )
         )
+        sequence_boundary_delta_weights.append([1.0, 0.6])
         sequence_reasons.append(reason)
         gap_indexes.append(index)
-
-    synthetic_count = 0
-    for index, segment in enumerate(segments):
-        if synthetic_count >= config.synthetic_merge_positives_per_record:
-            break
-        gap_s = _synthetic_merge_gap_s(
-            audio_id=record.audio_id,
-            segment_index=index,
-            positive_index=synthetic_count,
-            config=config,
-        )
-        if segment.duration_s < config.synthetic_merge_min_segment_s + gap_s:
-            continue
-        midpoint = (segment.start + segment.end) / 2.0
-        left = Segment(segment.start, midpoint - gap_s / 2.0)
-        right = Segment(midpoint + gap_s / 2.0, segment.end)
-        if left.end <= left.start or right.end <= right.start:
-            continue
-        sequence_features.append(
-            _candidate_features(
-                left=left,
-                right=right,
-                record=record,
-                ptm=ptm,
-                mfcc=mfcc,
-                config=config,
-            )
-        )
-        sequence_labels.append(1)
-        sequence_boundary_delta_targets.append([0.0, 0.0])
-        sequence_reasons.append("merge_synthetic_intra_island")
-        gap_indexes.append(index)
-        synthetic_count += 1
 
     if not sequence_features:
         return None
@@ -298,7 +257,6 @@ def _sequence_row(
     )
     validate_sequence_features(
         sequence_features,
-        labels=sequence_labels,
         feature_names=feature_names,
     )
     schema_hash = feature_extraction_hash(
@@ -323,8 +281,8 @@ def _sequence_row(
             mfcc_dim=int(mfcc.shape[1]),
         ),
         "sequence_features": sequence_features,
-        "sequence_labels": sequence_labels,
         "sequence_boundary_delta_targets": sequence_boundary_delta_targets,
+        "sequence_boundary_delta_weights": sequence_boundary_delta_weights,
         "sequence_reasons": sequence_reasons,
         "gap_indexes": gap_indexes,
         "metadata": {
@@ -349,7 +307,7 @@ def _candidate_features(
     mfcc: np.ndarray,
     config: FrameSequenceConfig,
 ) -> list[float]:
-    return gap_window_sequence_features(
+    return boundary_window_sequence_features(
         left_start_s=left.start,
         left_end_s=left.end,
         right_start_s=right.start,
@@ -362,17 +320,17 @@ def _candidate_features(
     )
 
 
-def _label_gap(
+def _boundary_reason(
     *,
     index: int,
     left: Segment,
     right: Segment,
     record: LabelRecord,
     config: FrameSequenceConfig,
-) -> tuple[bool, str] | None:
+) -> str | None:
     gap_s = right.start - left.end
     if gap_s < 0.0:
-        return False, "split_overlap"
+        return "boundary_overlap"
     metadata = record.boundary_metadata or {}
     boundaries = {
         int(item.get("index")): dict(item)
@@ -383,18 +341,11 @@ def _label_gap(
     if boundary:
         boundary_type = str(boundary.get("boundary_type") or "")
         if boundary_type == "gap_zone":
-            return False, "split_gap_zone"
+            return "boundary_gap_zone"
         if boundary_type == "cut_point":
-            return False, "split_cut_point"
+            return "boundary_cut_point"
     if gap_s >= config.long_gap_split_s:
-        return False, "split_long_gap"
-
-    source_ids = [str(value) for value in list(metadata.get("source_audio_ids") or [])]
-    previous_source = source_ids[index] if index < len(source_ids) else ""
-    next_source = source_ids[index + 1] if index + 1 < len(source_ids) else ""
-    same_source = bool(previous_source and previous_source == next_source)
-    if gap_s <= config.safe_merge_gap_s and same_source:
-        return True, "merge_same_source_short_gap"
+        return "boundary_long_gap"
     return None
 
 
@@ -403,12 +354,11 @@ def _boundary_delta_targets(
     record: LabelRecord,
     gap_index: int,
     reason: str,
-    merge_target: bool,
     config: FrameSequenceConfig,
 ) -> list[float]:
-    if merge_target or config.synthetic_boundary_delta_jitter_s <= 0.0:
+    if config.synthetic_boundary_delta_jitter_s <= 0.0:
         return [0.0, 0.0]
-    if reason not in {"split_cut_point", "split_gap_zone", "split_long_gap", "split_overlap"}:
+    if reason not in {"boundary_cut_point", "boundary_gap_zone", "boundary_long_gap", "boundary_overlap"}:
         return [0.0, 0.0]
     limit = max(0.0, float(config.synthetic_boundary_delta_jitter_s))
     digest = hashlib.sha1(
@@ -419,22 +369,6 @@ def _boundary_delta_targets(
     start_delta = (start_fraction * 2.0 - 1.0) * limit
     end_delta = (end_fraction * 2.0 - 1.0) * limit
     return [round(start_delta, 6), round(end_delta, 6)]
-
-
-def _synthetic_merge_gap_s(
-    *,
-    audio_id: str,
-    segment_index: int,
-    positive_index: int,
-    config: FrameSequenceConfig,
-) -> float:
-    lower = max(0.0, min(config.synthetic_merge_gap_min_s, config.synthetic_merge_gap_s))
-    upper = max(0.0, max(config.synthetic_merge_gap_min_s, config.synthetic_merge_gap_s))
-    if upper <= lower:
-        return upper
-    digest = hashlib.sha1(f"{audio_id}:{segment_index}:{positive_index}".encode("utf-8")).digest()
-    fraction = int.from_bytes(digest[:8], "big") / float(2**64 - 1)
-    return lower + (upper - lower) * fraction
 
 
 def _record_segments(record: LabelRecord) -> list[Segment]:
@@ -524,12 +458,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--max-ptm-dims", type=int, default=64)
     parser.add_argument("--no-mfcc", action="store_true")
     parser.add_argument("--target-chunk-s", type=float, default=3.0)
-    parser.add_argument("--safe-merge-gap-s", type=float, default=0.12)
     parser.add_argument("--long-gap-split-s", type=float, default=0.60)
-    parser.add_argument("--synthetic-merge-positives-per-record", type=int, default=1)
-    parser.add_argument("--synthetic-merge-gap-min-s", type=float, default=0.04)
-    parser.add_argument("--synthetic-merge-gap-s", type=float, default=0.04)
-    parser.add_argument("--synthetic-merge-min-segment-s", type=float, default=1.20)
     parser.add_argument(
         "--synthetic-boundary-delta-jitter-s",
         type=float,
@@ -548,14 +477,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         parser.error("--max-ptm-dims must be positive")
     if args.target_chunk_s <= 0.0:
         parser.error("--target-chunk-s must be positive")
-    if args.safe_merge_gap_s < 0.0 or args.long_gap_split_s < 0.0:
-        parser.error("gap thresholds must be non-negative")
-    if args.synthetic_merge_positives_per_record < 0:
-        parser.error("--synthetic-merge-positives-per-record must be non-negative")
-    if args.synthetic_merge_gap_min_s < 0.0:
-        parser.error("--synthetic-merge-gap-min-s must be non-negative")
-    if args.synthetic_merge_gap_s < 0.0:
-        parser.error("--synthetic-merge-gap-s must be non-negative")
+    if args.long_gap_split_s < 0.0:
+        parser.error("--long-gap-split-s must be non-negative")
     if args.synthetic_boundary_delta_jitter_s < 0.0:
         parser.error("--synthetic-boundary-delta-jitter-s must be non-negative")
     return args
@@ -575,12 +498,7 @@ def main(argv: list[str] | None = None) -> None:
             max_ptm_dims=args.max_ptm_dims,
             include_mfcc=not args.no_mfcc,
             target_chunk_s=args.target_chunk_s,
-            safe_merge_gap_s=args.safe_merge_gap_s,
             long_gap_split_s=args.long_gap_split_s,
-            synthetic_merge_positives_per_record=args.synthetic_merge_positives_per_record,
-            synthetic_merge_gap_min_s=args.synthetic_merge_gap_min_s,
-            synthetic_merge_gap_s=args.synthetic_merge_gap_s,
-            synthetic_merge_min_segment_s=args.synthetic_merge_min_segment_s,
             synthetic_boundary_delta_jitter_s=args.synthetic_boundary_delta_jitter_s,
             synthetic_boundary_delta_seed=args.synthetic_boundary_delta_seed,
         ),
@@ -588,7 +506,6 @@ def main(argv: list[str] | None = None) -> None:
     print(f"dataset={summary['output_jsonl']}")
     print(f"summary={summary['summary_json']}")
     print(f"counts={json.dumps(summary['counts'], ensure_ascii=False, sort_keys=True)}")
-    print(f"class_balance={json.dumps(summary['class_balance'], ensure_ascii=False, sort_keys=True)}")
 
 
 if __name__ == "__main__":

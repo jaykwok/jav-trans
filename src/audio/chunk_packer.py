@@ -5,8 +5,8 @@ from typing import Sequence
 
 from boundary.features import make_feature_bundle
 from boundary.planner import (
+    BoundarySequenceFeatureProvider,
     BoundaryPlannerConfig,
-    GapSequenceFeatureProvider,
     PlannedChunk,
     PlannedIsland,
     plan_boundary_chunks,
@@ -32,9 +32,6 @@ class PackedChunk:
     boundary_score: float | None = None
     boundary_reason: str = ""
     boundary_source: str = ""
-    boundary_decision_merge: bool | None = None
-    boundary_merge_prob: float | None = None
-    boundary_split_prob: float | None = None
     boundary_start_refine_delta_s: float | None = None
     boundary_end_refine_delta_s: float | None = None
     boundary_decision_source: str = ""
@@ -56,7 +53,7 @@ def pack_speech_segments(
     score_frame_hop_s: float | None = None,
     cut_frame_scores: Sequence[float] | None = None,
     sequence_boundary_refiner: SequenceBoundaryRefiner | None = None,
-    sequence_feature_provider: GapSequenceFeatureProvider | None = None,
+    sequence_feature_provider: BoundarySequenceFeatureProvider | None = None,
     max_splits_per_segment: int = 16,
     sequence_batch_size: int = 256,
 ) -> list[PackedChunk]:
@@ -174,25 +171,12 @@ def _make_chunk(
         internal_gap_count=_internal_gap_count(islands),
         internal_gap_max_s=_internal_gap_max_s(islands),
         boundary_score=(
-            boundary_decision.score
-            if boundary_decision is not None
-            else (max(boundary_scores) if boundary_scores else None)
+            max(boundary_scores) if boundary_scores else None
         ),
         boundary_reason=(
-            boundary_decision.reason
-            if boundary_decision is not None
-            else ",".join(sorted(set(boundary_reasons)))
+            ",".join(sorted(set(boundary_reasons)))
         ),
         boundary_source=",".join(sorted(set(boundary_sources))),
-        boundary_decision_merge=(
-            boundary_decision.merge if boundary_decision is not None else None
-        ),
-        boundary_merge_prob=(
-            boundary_decision.score if boundary_decision is not None else None
-        ),
-        boundary_split_prob=(
-            1.0 - boundary_decision.score if boundary_decision is not None else None
-        ),
         boundary_start_refine_delta_s=applied_start_delta_s,
         boundary_end_refine_delta_s=applied_end_delta_s,
         boundary_decision_source=(

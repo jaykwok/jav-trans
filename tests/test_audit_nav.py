@@ -53,6 +53,7 @@ def test_audit_index_lists_latest_without_auto_refresh(tmp_path: Path):
     assert "127.0.0.1:8765" not in index
     assert "audit_nav.py serve" not in index
     assert "audit_nav.py delete --href" in index
+    assert "按更新时间倒序排列" in index
 
 
 def test_latest_audit_entry_is_static_link(tmp_path: Path):
@@ -139,3 +140,28 @@ def test_delete_latest_audit_entry_picks_remaining_latest(tmp_path: Path):
     assert 'href="remaining-review/index.html"' in latest_entry
     assert 'href="latest-review/index.html"' not in latest_entry
     assert remaining_html.exists()
+
+
+def test_audit_index_defaults_to_mtime_descending(tmp_path: Path):
+    audit_root = tmp_path / "agents" / "audits"
+    old_html = _write_text(
+        audit_root / "old-review" / "index.html",
+        "<!doctype html><title>old</title>",
+    )
+    new_html = _write_text(
+        audit_root / "new-review" / "index.html",
+        "<!doctype html><title>new</title>",
+    )
+    old_time = 1_700_000_000
+    new_time = old_time + 100
+    import os
+
+    os.utime(old_html.parent, (old_time, old_time))
+    os.utime(old_html, (old_time, old_time))
+    os.utime(new_html.parent, (new_time, new_time))
+    os.utime(new_html, (new_time, new_time))
+
+    write_audit_index(audit_root=audit_root)
+
+    index = (audit_root / "index.html").read_text(encoding="utf-8")
+    assert index.index('href="new-review/index.html"') < index.index('href="old-review/index.html"')

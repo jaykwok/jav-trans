@@ -44,6 +44,7 @@ function runAuditDelete(href) {
         env: {
           ...process.env,
           PYTHONIOENCODING: "utf-8",
+          PYTHONPATH: process.env.PYTHONPATH || "src",
           UV_CACHE_DIR: process.env.UV_CACHE_DIR || "agents/temp/uv-cache",
         },
         windowsHide: true,

@@ -68,23 +68,22 @@ def test_boundary_planner_validates_config():
 
 
 class _StaticSequenceRefiner:
-    def __init__(self, scores: list[float]) -> None:
-        self.scores = scores
+    def __init__(self, deltas: list[tuple[float, float]]) -> None:
+        self.deltas = deltas
         self.calls: list[list[list[float]]] = []
         self.cursor = 0
 
     def decide_sequence(self, features: list[list[float]]) -> list[BoundaryDecision]:
         self.calls.append(features)
-        scores = self.scores[self.cursor : self.cursor + len(features)]
+        deltas = self.deltas[self.cursor : self.cursor + len(features)]
         self.cursor += len(features)
         return [
             BoundaryDecision(
-                score >= 0.5,
-                score,
-                "learned_sequence_merge" if score >= 0.5 else "learned_sequence_split",
                 source="frame_sequence_refiner",
+                start_refine_delta_s=start_delta,
+                end_refine_delta_s=end_delta,
             )
-            for score in scores
+            for start_delta, end_delta in deltas
         ]
 
     def signature(self) -> dict:
@@ -92,7 +91,7 @@ class _StaticSequenceRefiner:
 
 
 class _IndexFeatureProvider:
-    def features_for_gap(
+    def features_for_boundary(
         self,
         *,
         left_start_s: float,
@@ -105,7 +104,7 @@ class _IndexFeatureProvider:
 
 def test_sequence_refiner_scores_gaps_without_merging_chunks():
     features = make_feature_bundle(frame_hop_s=1.0)
-    refiner = _StaticSequenceRefiner([0.9, 0.9, 0.9])
+    refiner = _StaticSequenceRefiner([(0.0, 0.0), (0.1, -0.1), (0.0, 0.0)])
 
     chunks = plan_boundary_chunks(
         [
@@ -134,12 +133,12 @@ def test_sequence_refiner_scores_gaps_without_merging_chunks():
     ]
     assert all(len(chunk.islands) == 1 for chunk in chunks)
     assert chunks[1].boundary_decision is not None
-    assert chunks[1].boundary_decision.merge is True
+    assert chunks[1].boundary_decision.source == "frame_sequence_refiner"
 
 
-def test_sequence_refiner_preserves_learned_split_reason():
+def test_sequence_refiner_preserves_decision_source():
     features = make_feature_bundle(frame_hop_s=1.0)
-    refiner = _StaticSequenceRefiner([0.95, 0.05])
+    refiner = _StaticSequenceRefiner([(0.0, 0.0), (0.0, 0.0)])
 
     chunks = plan_boundary_chunks(
         [
@@ -168,7 +167,7 @@ def test_sequence_refiner_preserves_learned_split_reason():
 
 def test_sequence_planner_batches_long_sequences():
     features = make_feature_bundle(frame_hop_s=1.0)
-    refiner = _StaticSequenceRefiner([0.05, 0.05, 0.05])
+    refiner = _StaticSequenceRefiner([(0.0, 0.0), (0.0, 0.0), (0.0, 0.0)])
 
     chunks = plan_boundary_chunks(
         [

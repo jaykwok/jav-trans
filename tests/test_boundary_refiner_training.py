@@ -5,13 +5,6 @@ from pathlib import Path
 
 import pytest
 
-from tools.boundary.build_refiner_frame_sequence_dataset import (
-    FrameSequenceConfig,
-    build_frame_sequence_dataset,
-)
-from tools.boundary.build_weighted_source_manifest import build_weighted_manifest
-from tools.boundary import train_refiner as train_refiner_module
-from tools.boundary.train_refiner import TrainRefinerConfig, train_refiner
 from boundary.ja import write_jsonl
 from boundary.sequence_features import (
     FRAME_SEQUENCE_FEATURE_SCHEMA,
@@ -19,6 +12,31 @@ from boundary.sequence_features import (
     feature_extraction_hash,
     feature_extraction_signature,
 )
+from tools.boundary import train_refiner as train_refiner_module
+from tools.boundary.build_refiner_frame_sequence_dataset import (
+    FrameSequenceConfig,
+    build_frame_sequence_dataset,
+)
+from tools.boundary.build_silver_refiner_dataset import (
+    SilverRefinerDatasetConfig,
+    build_silver_refiner_dataset,
+)
+from tools.boundary.build_weighted_source_manifest import build_weighted_manifest
+from tools.boundary.train_refiner import TrainRefinerConfig, train_refiner
+
+
+def _feature_names() -> list[str]:
+    return [
+        "gap_s",
+        "left_duration_s",
+        "right_duration_s",
+        "proposed_core_s",
+        "gap_reference_s",
+        "gap_ratio",
+        "left_ptm_mean_000",
+        "gap_ptm_mean_000",
+        "right_ptm_mean_000",
+    ]
 
 
 def _sequence_feature_metadata(feature_names: list[str]) -> dict:
@@ -36,160 +54,120 @@ def _sequence_feature_metadata(feature_names: list[str]) -> dict:
     }
 
 
-def test_train_refiner_accepts_sequence_dataset(tmp_path):
-    pytest.importorskip("torch")
-    transformers = pytest.importorskip("transformers")
-    if not hasattr(transformers, "Mamba2Model"):
-        pytest.skip("transformers.Mamba2Model is unavailable")
-
-    feature_names = [
-        "gap_s",
-        "left_duration_s",
-        "right_duration_s",
-        "current_core_s",
-        "proposed_core_s",
-        "gap_merge_s",
-        "gap_ratio",
-        "proposed_over_target_s",
-        "left_score",
-        "right_score",
-        "valley_score_min",
-        "cut_score_max",
-        "gap_boundary_score",
-    ]
-    dataset = tmp_path / "sequence.jsonl"
-    rows = []
-    for row_index in range(4):
+def _write_v5_dataset(path: Path, *, rows: int = 4, items_per_row: int = 2) -> Path:
+    feature_names = _feature_names()
+    payloads = []
+    for row_index in range(rows):
         sequence = []
-        labels = []
-        for step_index in range(3):
-            merge = (row_index + step_index) % 2 == 0
-            gap_s = 0.04 if merge else 0.9
+        targets = []
+        weights = []
+        for item_index in range(items_per_row):
+            gap_s = 0.2 + 0.1 * item_index
             sequence.append(
                 [
                     gap_s,
                     1.0,
-                    1.0,
-                    1.0 + step_index,
-                    2.0 + gap_s + step_index,
-                    1.5,
-                    min(1.0, gap_s / 1.5),
-                    1.0 + gap_s,
-                    1.0,
-                    1.0,
-                    1.0,
-                    0.0,
-                    min(1.0, gap_s / 1.5),
+                    0.8,
+                    2.0 + gap_s,
+                    0.5,
+                    gap_s / 0.5,
+                    0.1 * row_index,
+                    0.2 * item_index,
+                    0.3,
                 ]
             )
-            labels.append(1 if merge else 0)
-        rows.append(
+            targets.append([0.02 * (item_index + 1), -0.03 * (row_index + 1)])
+            weights.append([1.0, 0.6])
+        payloads.append(
             {
-                "schema": "boundary_refiner_sequence_dataset_v4",
+                "schema": "boundary_refiner_frame_sequence_dataset_v5",
                 "audio_id": f"seq-{row_index}",
                 "feature_names": feature_names,
                 "sequence_features": sequence,
-                "sequence_labels": labels,
-                "sequence_boundary_delta_targets": [[0.0, 0.0] for _ in labels],
+                "sequence_boundary_delta_targets": targets,
+                "sequence_boundary_delta_weights": weights,
                 **_sequence_feature_metadata(feature_names),
             }
         )
-    dataset.write_text(
-        "\n".join(json.dumps(row, ensure_ascii=False, sort_keys=True) for row in rows) + "\n",
+    path.write_text(
+        "\n".join(json.dumps(row, ensure_ascii=False, sort_keys=True) for row in payloads) + "\n",
         encoding="utf-8",
     )
+    return path
 
-    metrics = train_refiner(
-        dataset_paths=[dataset],
-        output_dir=tmp_path / "sequence-train",
-        config=TrainRefinerConfig(
-            max_steps=2,
-            batch_size=2,
-            device="cpu",
-            hidden_size=8,
-            num_layers=1,
-            state_size=4,
-            num_heads=4,
-            n_groups=2,
-            chunk_size=4,
-            log_interval_steps=0,
-        ),
+
+def _tiny_train_config(**overrides) -> TrainRefinerConfig:
+    return TrainRefinerConfig(
+        **{
+            "max_steps": 1,
+            "batch_size": 2,
+            "device": "cpu",
+            "hidden_size": 8,
+            "num_layers": 1,
+            "state_size": 4,
+            "num_heads": 4,
+            "n_groups": 2,
+            "chunk_size": 4,
+            "log_interval_steps": 0,
+            **overrides,
+        }
     )
 
-    assert Path(metrics["checkpoint"]).exists()
-    assert metrics["train_items"] + metrics["val_items"] == 12
-    assert metrics["class_counts"] == {"merge_positive": 6, "split_negative": 6}
 
-
-def test_train_refiner_can_initialize_checkpoint_and_freeze_backbone(tmp_path):
+def test_train_refiner_accepts_v5_delta_dataset(tmp_path):
     pytest.importorskip("torch")
     transformers = pytest.importorskip("transformers")
     if not hasattr(transformers, "Mamba2Model"):
         pytest.skip("transformers.Mamba2Model is unavailable")
+    dataset = _write_v5_dataset(tmp_path / "sequence.jsonl", rows=4, items_per_row=3)
 
-    feature_names = [
-        "gap_s",
-        "left_duration_s",
-        "right_duration_s",
-        "current_core_s",
-        "proposed_core_s",
-        "gap_merge_s",
-        "gap_ratio",
-        "proposed_over_target_s",
-        "left_score",
-        "right_score",
-        "valley_score_min",
-        "cut_score_max",
-        "gap_boundary_score",
-    ]
-    rows = []
-    for row_index in range(4):
-        merge = row_index % 2 == 0
-        gap_s = 0.04 if merge else 0.9
-        rows.append(
-            {
-                "schema": "boundary_refiner_sequence_dataset_v4",
-                "audio_id": f"init-{row_index}",
-                "feature_names": feature_names,
-                "sequence_features": [
-                    [
-                        gap_s,
-                        1.0,
-                        1.0,
-                        1.0,
-                        2.0 + gap_s,
-                        1.5,
-                        min(1.0, gap_s / 1.5),
-                        1.0 + gap_s,
-                        1.0,
-                        1.0,
-                        1.0,
-                        0.0,
-                        min(1.0, gap_s / 1.5),
-                    ]
-                ],
-                "sequence_labels": [1 if merge else 0],
-                "sequence_boundary_delta_targets": [[0.0, 0.0]],
-                **_sequence_feature_metadata(feature_names),
-            }
+    metrics = train_refiner(
+        dataset_paths=[dataset],
+        output_dir=tmp_path / "sequence-train",
+        config=_tiny_train_config(max_steps=2),
+    )
+
+    assert Path(metrics["checkpoint"]).exists()
+    assert metrics["train_items"] + metrics["val_items"] == 12
+    assert "class_counts" not in metrics
+    assert metrics["train"]["start_delta_mae_s"] >= 0.0
+    assert metrics["train"]["start_delta_error"]["mae_s"] >= 0.0
+    assert metrics["train"]["end_delta_error"]["mae_s"] >= 0.0
+    timing_policy = metrics["loader_smoke"]["signature"]["metadata"]["timing_policy"]
+    assert timing_policy["delta_loss"] == "smooth_l1"
+    assert timing_policy["start_delta_loss_weight"] == 1.0
+    assert timing_policy["end_delta_loss_weight"] == 0.6
+    smoke = metrics["loader_smoke"]["first_decision"]
+    assert set(smoke) == {"source", "start_refine_delta_s", "end_refine_delta_s"}
+
+
+def test_train_refiner_rejects_merge_era_fields(tmp_path):
+    pytest.importorskip("torch")
+    transformers = pytest.importorskip("transformers")
+    if not hasattr(transformers, "Mamba2Model"):
+        pytest.skip("transformers.Mamba2Model is unavailable")
+    dataset = _write_v5_dataset(tmp_path / "sequence-with-old-labels.jsonl", rows=1, items_per_row=1)
+    row = json.loads(dataset.read_text(encoding="utf-8").splitlines()[0])
+    row["sequence_labels"] = [1]
+    row["merge_positive"] = 1
+    dataset.write_text(json.dumps(row, ensure_ascii=False, sort_keys=True) + "\n", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="old merge/split/context fields"):
+        train_refiner(
+            dataset_paths=[dataset],
+            output_dir=tmp_path / "rejected-train",
+            config=_tiny_train_config(),
         )
-    dataset = tmp_path / "init-sequence.jsonl"
-    dataset.write_text(
-        "\n".join(json.dumps(row, ensure_ascii=False, sort_keys=True) for row in rows) + "\n",
-        encoding="utf-8",
-    )
-    base_config = TrainRefinerConfig(
-        max_steps=1,
-        batch_size=2,
-        device="cpu",
-        hidden_size=8,
-        num_layers=1,
-        state_size=4,
-        num_heads=4,
-        n_groups=2,
-        chunk_size=4,
-        log_interval_steps=0,
-    )
+
+
+def test_train_refiner_can_initialize_v5_checkpoint_and_freeze_backbone(tmp_path):
+    pytest.importorskip("torch")
+    transformers = pytest.importorskip("transformers")
+    if not hasattr(transformers, "Mamba2Model"):
+        pytest.skip("transformers.Mamba2Model is unavailable")
+    dataset = _write_v5_dataset(tmp_path / "init-sequence.jsonl")
+    base_config = _tiny_train_config()
+
     first = train_refiner(
         dataset_paths=[dataset],
         output_dir=tmp_path / "base-train",
@@ -203,13 +181,16 @@ def test_train_refiner_can_initialize_checkpoint_and_freeze_backbone(tmp_path):
                 **base_config.__dict__,
                 "init_checkpoint": str(first["checkpoint"]),
                 "freeze_backbone": True,
+                "preserve_init_normalization": True,
             }
         ),
     )
 
     metadata = second["loader_smoke"]["signature"]["metadata"]
     assert metadata["freeze_backbone"] is True
-    assert metadata["init_checkpoint"]["schema"] == "boundary_refiner_v4"
+    assert metadata["preserve_init_normalization"] is True
+    assert metadata["normalization_source"] == "init_checkpoint"
+    assert metadata["init_checkpoint"]["schema"] == "boundary_refiner_v5"
 
 
 def test_train_refiner_uses_streaming_tensor_loader(tmp_path, monkeypatch):
@@ -217,58 +198,7 @@ def test_train_refiner_uses_streaming_tensor_loader(tmp_path, monkeypatch):
     transformers = pytest.importorskip("transformers")
     if not hasattr(transformers, "Mamba2Model"):
         pytest.skip("transformers.Mamba2Model is unavailable")
-
-    feature_names = [
-        "gap_s",
-        "left_duration_s",
-        "right_duration_s",
-        "current_core_s",
-        "proposed_core_s",
-        "gap_merge_s",
-        "gap_ratio",
-        "proposed_over_target_s",
-        "left_score",
-        "right_score",
-        "valley_score_min",
-        "cut_score_max",
-        "gap_boundary_score",
-    ]
-    rows = []
-    for row_index in range(6):
-        merge = row_index % 2 == 0
-        gap_s = 0.04 if merge else 0.9
-        rows.append(
-            {
-                "schema": "boundary_refiner_sequence_dataset_v4",
-                "audio_id": f"stream-{row_index}",
-                "feature_names": feature_names,
-                "sequence_features": [
-                    [
-                        gap_s,
-                        1.0,
-                        1.0,
-                        1.0,
-                        2.0 + gap_s,
-                        1.5,
-                        min(1.0, gap_s / 1.5),
-                        1.0 + gap_s,
-                        1.0,
-                        1.0,
-                        1.0,
-                        0.0,
-                        min(1.0, gap_s / 1.5),
-                    ]
-                ],
-                "sequence_labels": [1 if merge else 0],
-                "sequence_boundary_delta_targets": [[0.0, 0.0]],
-                **_sequence_feature_metadata(feature_names),
-            }
-        )
-    dataset = tmp_path / "streaming-sequence.jsonl"
-    dataset.write_text(
-        "\n".join(json.dumps(row, ensure_ascii=False, sort_keys=True) for row in rows) + "\n",
-        encoding="utf-8",
-    )
+    dataset = _write_v5_dataset(tmp_path / "streaming-sequence.jsonl", rows=6, items_per_row=1)
 
     original_iter = train_refiner_module._iter_dataset_rows
     calls = {"count": 0}
@@ -282,18 +212,7 @@ def test_train_refiner_uses_streaming_tensor_loader(tmp_path, monkeypatch):
     metrics = train_refiner(
         dataset_paths=[dataset],
         output_dir=tmp_path / "streaming-train",
-        config=TrainRefinerConfig(
-            max_steps=1,
-            batch_size=2,
-            device="cpu",
-            hidden_size=8,
-            num_layers=1,
-            state_size=4,
-            num_heads=4,
-            n_groups=2,
-            chunk_size=4,
-            log_interval_steps=0,
-        ),
+        config=_tiny_train_config(),
     )
 
     assert Path(metrics["checkpoint"]).exists()
@@ -301,81 +220,18 @@ def test_train_refiner_uses_streaming_tensor_loader(tmp_path, monkeypatch):
     assert calls["count"] == 2
 
 
-def test_train_refiner_reuses_tensor_cache_without_jsonl_rescan(tmp_path, monkeypatch):
+def test_train_refiner_reuses_v5_tensor_cache_without_jsonl_rescan(tmp_path, monkeypatch):
     pytest.importorskip("torch")
     transformers = pytest.importorskip("transformers")
     if not hasattr(transformers, "Mamba2Model"):
         pytest.skip("transformers.Mamba2Model is unavailable")
-
-    feature_names = [
-        "gap_s",
-        "left_duration_s",
-        "right_duration_s",
-        "current_core_s",
-        "proposed_core_s",
-        "gap_merge_s",
-        "gap_ratio",
-        "proposed_over_target_s",
-        "left_score",
-        "right_score",
-        "valley_score_min",
-        "cut_score_max",
-        "gap_boundary_score",
-    ]
-    rows = []
-    for row_index in range(6):
-        merge = row_index % 2 == 0
-        gap_s = 0.04 if merge else 0.9
-        rows.append(
-            {
-                "schema": "boundary_refiner_sequence_dataset_v4",
-                "audio_id": f"cache-{row_index}",
-                "feature_names": feature_names,
-                "sequence_features": [
-                    [
-                        gap_s,
-                        1.0,
-                        1.0,
-                        1.0,
-                        2.0 + gap_s,
-                        1.5,
-                        min(1.0, gap_s / 1.5),
-                        1.0 + gap_s,
-                        1.0,
-                        1.0,
-                        1.0,
-                        0.0,
-                        min(1.0, gap_s / 1.5),
-                    ]
-                ],
-                "sequence_labels": [1 if merge else 0],
-                "sequence_boundary_delta_targets": [[0.0, 0.0]],
-                **_sequence_feature_metadata(feature_names),
-            }
-        )
-    dataset = tmp_path / "cache-sequence.jsonl"
-    dataset.write_text(
-        "\n".join(json.dumps(row, ensure_ascii=False, sort_keys=True) for row in rows) + "\n",
-        encoding="utf-8",
-    )
+    dataset = _write_v5_dataset(tmp_path / "cache-sequence.jsonl", rows=6, items_per_row=1)
     tensor_cache = tmp_path / "cache-sequence.tensor.pt"
 
     first = train_refiner(
         dataset_paths=[dataset],
         output_dir=tmp_path / "cache-train-first",
-        config=TrainRefinerConfig(
-            max_steps=1,
-            batch_size=2,
-            device="cpu",
-            hidden_size=8,
-            num_layers=1,
-            state_size=4,
-            num_heads=4,
-            n_groups=2,
-            chunk_size=4,
-            log_interval_steps=0,
-            tensor_cache_path=str(tensor_cache),
-        ),
+        config=_tiny_train_config(tensor_cache_path=str(tensor_cache)),
     )
     assert Path(first["checkpoint"]).exists()
     assert tensor_cache.exists()
@@ -388,21 +244,8 @@ def test_train_refiner_reuses_tensor_cache_without_jsonl_rescan(tmp_path, monkey
     second = train_refiner(
         dataset_paths=[dataset],
         output_dir=tmp_path / "cache-train-second",
-        config=TrainRefinerConfig(
-            max_steps=1,
-            batch_size=2,
-            device="cpu",
-            hidden_size=8,
-            num_layers=1,
-            state_size=4,
-            num_heads=4,
-            n_groups=2,
-            chunk_size=4,
-            log_interval_steps=0,
-            tensor_cache_path=str(tensor_cache),
-        ),
+        config=_tiny_train_config(tensor_cache_path=str(tensor_cache)),
     )
-    assert second["class_counts"] == first["class_counts"]
     assert second["train_items"] + second["val_items"] == 6
 
 
@@ -446,7 +289,6 @@ def test_build_frame_sequence_dataset_trains_with_cached_features(tmp_path):
                             "gap_s": 0.1,
                         },
                     ],
-                    "source_audio_ids": ["a", "a", "b"],
                 },
             }
         ],
@@ -479,49 +321,135 @@ def test_build_frame_sequence_dataset_trains_with_cached_features(tmp_path):
             left_context_s=0.2,
             right_context_s=0.2,
             max_ptm_dims=3,
-            synthetic_merge_positives_per_record=1,
-            synthetic_merge_min_segment_s=0.15,
             synthetic_boundary_delta_jitter_s=0.2,
         ),
     )
     rows = [json.loads(line) for line in output_jsonl.read_text(encoding="utf-8").splitlines()]
 
-    assert summary["class_balance"] == {"merge_positive": 2, "split_negative": 1}
-    assert rows[0]["schema"] == "boundary_refiner_frame_sequence_dataset_v4"
-    assert len(rows[0]["feature_names"]) == 36
-    assert len(rows[0]["sequence_features"]) == 3
-    assert len(rows[0]["sequence_boundary_delta_targets"]) == 3
-    assert rows[0]["sequence_boundary_delta_targets"][0] == [0.0, 0.0]
-    assert rows[0]["sequence_boundary_delta_targets"][1] != [0.0, 0.0]
-    assert rows[0]["sequence_boundary_delta_targets"][2] == [0.0, 0.0]
+    assert "class_balance" not in summary
+    assert rows[0]["schema"] == "boundary_refiner_frame_sequence_dataset_v5"
+    assert "sequence_labels" not in rows[0]
+    assert "gap_reference_s" in rows[0]["feature_names"]
+    assert "gap_merge_s" not in rows[0]["feature_names"]
+    assert len(rows[0]["sequence_features"]) == 1
+    assert len(rows[0]["sequence_boundary_delta_targets"]) == 1
+    assert rows[0]["sequence_boundary_delta_targets"][0] != [0.0, 0.0]
 
     metrics = train_refiner(
         dataset_paths=[output_jsonl],
         output_dir=tmp_path / "frame-sequence-train",
-        config=TrainRefinerConfig(
-            max_steps=2,
-            batch_size=1,
-            device="cpu",
-            hidden_size=8,
-            num_layers=1,
-            state_size=4,
-            num_heads=4,
-            n_groups=2,
-            chunk_size=4,
-            log_interval_steps=0,
-        ),
+        config=_tiny_train_config(max_steps=2, batch_size=1),
     )
     assert Path(metrics["checkpoint"]).exists()
-    assert metrics["train_items"] + metrics["val_items"] == 3
-    assert metrics["loader_smoke"]["decision_count"] == 3
-    assert metrics["loader_smoke"]["first_decision"] is not None
+    assert metrics["train_items"] + metrics["val_items"] == 1
+    assert metrics["loader_smoke"]["decision_count"] == 1
     assert metrics["loader_smoke"]["signature"]["metadata"]["runtime_adapter"] == "frame_sequence_v1"
     assert metrics["loader_smoke"]["signature"]["metadata"]["feature_schema"] == FRAME_SEQUENCE_FEATURE_SCHEMA
-    assert metrics["loader_smoke"]["signature"]["metadata"]["feature_schema_hash"]
     assert rows[0]["feature_schema"] == FRAME_SEQUENCE_FEATURE_SCHEMA
     assert rows[0]["feature_schema_hash"]
     assert rows[0]["feature_signature"]["feature_schema"] == FRAME_SEQUENCE_FEATURE_SCHEMA
     assert torch.cuda.is_available() in {True, False}
+
+
+def test_build_silver_refiner_dataset_uses_weighted_forced_boundaries(tmp_path):
+    pytest.importorskip("numpy")
+    import numpy as np
+
+    aligned_path = tmp_path / "archived" / "sample" / "sample.aligned_segments.json"
+    aligned_path.parent.mkdir(parents=True, exist_ok=True)
+    aligned_path.write_text(
+        json.dumps(
+            {
+                "asr_details": {
+                    "transcript_chunks": [
+                        {"index": 0, "start": 1.0, "end": 2.0},
+                        {"index": 1, "start": 3.0, "end": 4.0},
+                        {"index": 2, "start": 5.0, "end": 6.0},
+                    ]
+                }
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    silver_path = tmp_path / "silver.jsonl"
+    source_audio_path = tmp_path / "sample.wav"
+    source_audio_path.write_bytes(b"RIFF")
+    silver_rows = [
+        {
+            "schema": "speech_boundary_silver_display_v1",
+            "video": "sample",
+            "aligned_path": str(aligned_path),
+            "source_audio_path": str(source_audio_path),
+            "chunk_index": 0,
+            "display_start_label": 1.0,
+            "display_end_label": 1.8,
+            "speech_core_start": 1.0,
+            "speech_core_end": 2.0,
+            "label_policy": {"start_weight": 1.0, "end_weight": 0.35},
+        },
+        {
+            "schema": "speech_boundary_silver_display_v1",
+            "video": "sample",
+            "aligned_path": str(aligned_path),
+            "source_audio_path": str(source_audio_path),
+            "chunk_index": 1,
+            "display_start_label": 3.1,
+            "display_end_label": 3.7,
+            "speech_core_start": 3.0,
+            "speech_core_end": 4.0,
+            "label_policy": {"start_weight": 1.0, "end_weight": 0.35},
+        },
+    ]
+    silver_path.write_text(
+        "\n".join(json.dumps(row, ensure_ascii=False, sort_keys=True) for row in silver_rows) + "\n",
+        encoding="utf-8",
+    )
+    feature_path = tmp_path / "sample-seqfeat.npz"
+    np.savez(
+        feature_path,
+        ptm=np.ones((80, 2), dtype=np.float32),
+        mfcc=np.ones((80, 1), dtype=np.float32),
+        duration_s=np.asarray([8.0], dtype=np.float32),
+        frame_hop_s=np.asarray([0.1], dtype=np.float32),
+    )
+    manifest_path = tmp_path / "sequence_feature_manifest.jsonl"
+    manifest_path.write_text(
+        json.dumps(
+            {
+                "video": "sample",
+                "source_audio_path": str(source_audio_path),
+                "feature_path": str(feature_path),
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    output_jsonl = tmp_path / "silver-sequence.jsonl"
+
+    summary = build_silver_refiner_dataset(
+        silver_labels_path=silver_path,
+        sequence_feature_manifest_path=manifest_path,
+        output_jsonl=output_jsonl,
+        config=SilverRefinerDatasetConfig(
+            left_context_s=0.2,
+            right_context_s=0.2,
+            max_ptm_dims=1,
+            include_mfcc=False,
+            max_sequence_items=16,
+        ),
+    )
+    rows = [json.loads(line) for line in output_jsonl.read_text(encoding="utf-8").splitlines()]
+
+    assert "class_balance" not in summary
+    assert summary["counts"]["start_supervised"] == 1
+    assert summary["counts"]["end_supervised"] == 2
+    assert rows[0]["schema"] == "boundary_refiner_frame_sequence_dataset_v5"
+    assert "sequence_labels" not in rows[0]
+    assert rows[0]["sequence_boundary_delta_targets"] == [[0.1, -0.2], [0.0, -0.3]]
+    assert rows[0]["sequence_boundary_delta_weights"] == [[1.0, 0.6], [0.0, 0.6]]
 
 
 def test_build_weighted_source_manifest_samples_requested_mix(tmp_path):

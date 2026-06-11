@@ -13,7 +13,6 @@ from boundary.sequence_features import (
     FrameSequenceFeatureConfig,
     FrameSequenceFeatureProvider,
 )
-from boundary.backbones import normalize_boundary_backbone
 from boundary.refiner import (
     DEFAULT_REFINER_CHECKPOINT_PATH,
     file_sha1 as _boundary_refiner_file_sha1,
@@ -61,19 +60,14 @@ def _env_int(name: str, default: str) -> int:
 
 
 def _boundary_config() -> dict:
-    refiner_enabled = _env_bool("BOUNDARY_REFINER_ENABLED", "1")
     refiner_path = (
         os.getenv("BOUNDARY_REFINER_MODEL_PATH", str(DEFAULT_REFINER_CHECKPOINT_PATH)).strip()
         or str(DEFAULT_REFINER_CHECKPOINT_PATH)
     )
     refiner_path_obj = Path(refiner_path).expanduser() if refiner_path else None
-    refiner_backbone = normalize_boundary_backbone(
-        os.getenv("BOUNDARY_REFINER_BACKBONE", "transformers.Mamba2Model")
-    )
-    runtime_adapter = _boundary_refiner_runtime_adapter(refiner_path_obj) if refiner_enabled else ""
+    runtime_adapter = _boundary_refiner_runtime_adapter(refiner_path_obj)
     return {
         "feature_frame_hop_s": _env_float("BOUNDARY_FEATURE_FRAME_HOP_S", "0.02"),
-        "boundary_refiner_enabled": refiner_enabled,
         "boundary_refiner_model_path": refiner_path,
         "boundary_refiner_model_sha1": (
             _boundary_refiner_file_sha1(refiner_path_obj)
@@ -81,10 +75,8 @@ def _boundary_config() -> dict:
             else ""
         ),
         "boundary_refiner_runtime_adapter": runtime_adapter,
-        "boundary_refiner_backbone": refiner_backbone,
         "boundary_refiner_device": os.getenv("BOUNDARY_REFINER_DEVICE", "auto").strip()
         or "auto",
-        "boundary_refiner_threshold": _env_float("BOUNDARY_REFINER_THRESHOLD", "0.5"),
         "boundary_candidate_extractor_version": CANDIDATE_EXTRACTOR_VERSION,
         "boundary_planner_max_core_chunk_s": _env_float(
             "BOUNDARY_PLANNER_MAX_CORE_CHUNK_S",
@@ -352,10 +344,7 @@ def _build_processing_spans(
     cfg = _boundary_config()
     _set_last_boundary_cache_event(None)
 
-    needs_sequence_features = (
-        cfg["boundary_refiner_enabled"]
-        and cfg["boundary_refiner_runtime_adapter"] == "frame_sequence_v1"
-    )
+    needs_sequence_features = cfg["boundary_refiner_runtime_adapter"] == "frame_sequence_v1"
     restore_sequence_export = (
         os.environ.get("SPEECH_BOUNDARY_JA_EXPORT_SEQUENCE_FEATURES")
         if needs_sequence_features
@@ -394,25 +383,19 @@ def _build_processing_spans(
     cut_frame_scores = result.parameters.get("cut_frame_scores")
     score_frame_hop_s = result.parameters.get("frame_hop_s")
     sequence_feature_frames = result.parameters.get("sequence_feature_frames")
-    if cfg["boundary_refiner_enabled"]:
-        sequence_boundary_refiner = load_frame_sequence_refiner_checkpoint(
-            Path(cfg["boundary_refiner_model_path"]),
-            threshold=cfg["boundary_refiner_threshold"],
-            backbone_override=cfg["boundary_refiner_backbone"],
-            device=cfg["boundary_refiner_device"],
-        )
-        sequence_feature_provider = _required_sequence_feature_provider_from_result(
-            sequence_feature_frames,
-            duration_s=result.audio_duration_sec,
-            target_chunk_s=cfg["boundary_planner_target_chunk_s"],
-        )
-        sequence_feature_provider.validate_for_checkpoint(
-            sequence_boundary_refiner.feature_names,
-            sequence_boundary_refiner.feature_schema_hash,
-        )
-    else:
-        sequence_boundary_refiner = None
-        sequence_feature_provider = None
+    sequence_boundary_refiner = load_frame_sequence_refiner_checkpoint(
+        Path(cfg["boundary_refiner_model_path"]),
+        device=cfg["boundary_refiner_device"],
+    )
+    sequence_feature_provider = _required_sequence_feature_provider_from_result(
+        sequence_feature_frames,
+        duration_s=result.audio_duration_sec,
+        target_chunk_s=cfg["boundary_planner_target_chunk_s"],
+    )
+    sequence_feature_provider.validate_for_checkpoint(
+        sequence_boundary_refiner.feature_names,
+        sequence_boundary_refiner.feature_schema_hash,
+    )
     result_parameters = {
         key: value
         for key, value in result.parameters.items()
@@ -421,7 +404,8 @@ def _build_processing_spans(
     runtime_boundary_signature = {
         **result_parameters,
         "boundary_pipeline": {
-            "version": 4,
+            "version": 5,
+            "refiner_schema": "boundary_refiner_v5",
             "feature_frame_hop_s": cfg["feature_frame_hop_s"],
             "score_frame_hop_s": score_frame_hop_s,
             "feature_sources": {
@@ -535,9 +519,6 @@ def _annotate_packed_chunks(
         chunk["boundary_score"] = packed.boundary_score
         chunk["boundary_reason"] = packed.boundary_reason
         chunk["boundary_source"] = packed.boundary_source
-        chunk["boundary_decision_merge"] = packed.boundary_decision_merge
-        chunk["boundary_merge_prob"] = packed.boundary_merge_prob
-        chunk["boundary_split_prob"] = packed.boundary_split_prob
         chunk["boundary_start_refine_delta_s"] = packed.boundary_start_refine_delta_s
         chunk["boundary_end_refine_delta_s"] = packed.boundary_end_refine_delta_s
         chunk["boundary_decision_source"] = packed.boundary_decision_source
@@ -547,7 +528,7 @@ def _annotate_packed_chunks(
             "parent={parent} island={island}/{islands} gap_max={gap:.2f} "
             "boundary={boundary_reason} source={boundary_source} score={boundary_score} "
             "delta=({start_delta},{end_delta}) "
-            "decision_source={decision_source} merge={decision_merge}".format(
+            "decision_source={decision_source}".format(
                 idx=idx,
                 duration=packed.duration,
                 count=len(packed.speech_segments),
@@ -562,7 +543,6 @@ def _annotate_packed_chunks(
                 start_delta=packed.boundary_start_refine_delta_s,
                 end_delta=packed.boundary_end_refine_delta_s,
                 decision_source=packed.boundary_decision_source,
-                decision_merge=packed.boundary_decision_merge,
             )
         )
 

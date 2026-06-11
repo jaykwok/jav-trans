@@ -263,7 +263,6 @@ def _asr_stage_config_signature_for_env() -> dict:
             "ASR_BACKEND",
             "ASR_CONTEXT",
             "ASR_WORKER_MODE",
-            "BOUNDARY_REFINER_ENABLED",
         }
     }
     return {

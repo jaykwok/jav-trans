@@ -7,6 +7,7 @@ from pathlib import Path
 
 from audio.chunk_packer import PackedChunk
 from boundary.base import SegmentationResult, SpeechSegment
+from boundary.refiner import BoundaryDecision
 
 ROOT = Path(__file__).resolve().parents[1]
 SRC = ROOT / "src"
@@ -17,10 +18,7 @@ if str(SRC) not in sys.path:
 def _boundary_config() -> dict:
     return {
         "feature_frame_hop_s": 0.02,
-        "boundary_refiner_enabled": False,
         "boundary_refiner_model_path": "",
-        "boundary_refiner_backbone": "transformers.Mamba2Model",
-        "boundary_refiner_threshold": 0.5,
         "boundary_planner_max_core_chunk_s": 5.0,
         "boundary_planner_target_chunk_s": 3.0,
         "boundary_planner_min_chunk_s": 0.4,
@@ -108,7 +106,6 @@ def test_boundary_cache_key_changes_with_boundary_config(monkeypatch, tmp_path):
         boundary_config=_boundary_config(),
     )
     cfg = _boundary_config()
-    cfg["boundary_refiner_enabled"] = True
     cfg["boundary_planner_target_chunk_s"] = 8.0
     lookup_b = boundary_cache.build_cache_lookup(
         str(audio),
@@ -166,9 +163,6 @@ def test_boundary_cache_round_trips_packed_chunks(monkeypatch, tmp_path):
             boundary_score=0.87,
             boundary_reason="utterance_switch",
             boundary_source="cut",
-            boundary_decision_merge=False,
-            boundary_merge_prob=0.13,
-            boundary_split_prob=0.87,
             boundary_start_refine_delta_s=0.01,
             boundary_end_refine_delta_s=-0.02,
             boundary_decision_source="frame_sequence_refiner",
@@ -208,9 +202,8 @@ def test_boundary_cache_round_trips_packed_chunks(monkeypatch, tmp_path):
     assert loaded_chunks[0].boundary_score == 0.87
     assert loaded_chunks[0].boundary_reason == "utterance_switch"
     assert loaded_chunks[0].boundary_source == "cut"
-    assert loaded_chunks[0].boundary_decision_merge is False
-    assert loaded_chunks[0].boundary_merge_prob == 0.13
-    assert loaded_chunks[0].boundary_split_prob == 0.87
+    assert loaded_chunks[0].boundary_start_refine_delta_s == 0.01
+    assert loaded_chunks[0].boundary_end_refine_delta_s == -0.02
     assert loaded_chunks[0].boundary_decision_source == "frame_sequence_refiner"
     assert loaded_chunks[0].speech_segments[0].score == 0.9
 
@@ -274,10 +267,59 @@ class _CutScoredSpeechBoundaryBackend(_CountingSpeechBoundaryBackend):
         )
 
 
+class _FakeSequenceRefiner:
+    feature_names = ("gap_s",)
+    feature_schema_hash = "test-feature-schema"
+
+    def decide_sequence(self, features: list[list[float]]) -> list[BoundaryDecision]:
+        return [
+            BoundaryDecision(
+                source="frame_sequence_refiner",
+                start_refine_delta_s=0.0,
+                end_refine_delta_s=0.0,
+            )
+            for _ in features
+        ]
+
+    def signature(self) -> dict:
+        return {"schema": "boundary_refiner_v5", "type": "fake_sequence_refiner"}
+
+
+class _FakeSequenceFeatureProvider:
+    def features_for_boundary(
+        self,
+        *,
+        left_start_s: float,
+        left_end_s: float,
+        right_start_s: float,
+        right_end_s: float,
+    ) -> list[float]:
+        del left_start_s, right_end_s
+        return [right_start_s - left_end_s]
+
+    def validate_for_checkpoint(self, feature_names, feature_schema_hash) -> None:
+        del feature_names, feature_schema_hash
+
+    def signature(self) -> dict:
+        return {"schema": "speech_boundary_ja_sequence_feature_frames_v1", "type": "fake"}
+
+
+def _patch_fake_refiner(monkeypatch, asr) -> None:
+    monkeypatch.setattr(
+        asr,
+        "load_frame_sequence_refiner_checkpoint",
+        lambda *_args, **_kwargs: _FakeSequenceRefiner(),
+    )
+    monkeypatch.setattr(
+        asr,
+        "_required_sequence_feature_provider_from_result",
+        lambda *_args, **_kwargs: _FakeSequenceFeatureProvider(),
+    )
+
+
 def test_pipeline_uses_boundary_scores_but_does_not_cache_score_arrays(monkeypatch, tmp_path):
     monkeypatch.setenv("BOUNDARY_CACHE_DIR", str(tmp_path / "boundary-cache"))
     monkeypatch.setenv("BOUNDARY_FEATURE_FRAME_HOP_S", "1.0")
-    monkeypatch.setenv("BOUNDARY_REFINER_ENABLED", "0")
     monkeypatch.setenv("BOUNDARY_PLANNER_MAX_CORE_CHUNK_S", "30.0")
     monkeypatch.setenv("BOUNDARY_PLANNER_TARGET_CHUNK_S", "5.0")
     monkeypatch.setenv("BOUNDARY_PLANNER_MIN_CHUNK_S", "3.0")
@@ -285,6 +327,7 @@ def test_pipeline_uses_boundary_scores_but_does_not_cache_score_arrays(monkeypat
     from asr import pipeline as asr
 
     asr = importlib.reload(asr)
+    _patch_fake_refiner(monkeypatch, asr)
     audio = tmp_path / "sample.cf3671a5.wav"
     _write_wav(audio, seconds=12.0)
 
@@ -301,7 +344,10 @@ def test_pipeline_uses_boundary_scores_but_does_not_cache_score_arrays(monkeypat
     assert {span.boundary_source for span in spans} == {"cut"}
     assert max(float(span.boundary_score or 0.0) for span in spans) == 0.98
     assert asr._LAST_BOUNDARY_SIGNATURE["boundary_pipeline"]["score_frame_hop_s"] == 1.0
-    assert asr._LAST_BOUNDARY_SIGNATURE["boundary_pipeline"]["sequence_boundary_refiner"] is None
+    assert (
+        asr._LAST_BOUNDARY_SIGNATURE["boundary_pipeline"]["sequence_boundary_refiner"]["schema"]
+        == "boundary_refiner_v5"
+    )
     cached_files = list((tmp_path / "boundary-cache").glob("*.json"))
     assert len(cached_files) == 1
     payload = cached_files[0].read_text(encoding="utf-8")
@@ -312,11 +358,11 @@ def test_pipeline_uses_boundary_scores_but_does_not_cache_score_arrays(monkeypat
 def test_pipeline_uses_boundary_cache_for_prompt_budget_change(monkeypatch, tmp_path):
     monkeypatch.setenv("BOUNDARY_CACHE_DIR", str(tmp_path / "boundary-cache"))
     monkeypatch.setenv("BOUNDARY_FEATURE_FRAME_HOP_S", "0.02")
-    monkeypatch.setenv("BOUNDARY_REFINER_ENABLED", "0")
 
     from asr import pipeline as asr
 
     asr = importlib.reload(asr)
+    _patch_fake_refiner(monkeypatch, asr)
     audio = tmp_path / "sample.cf3671a5.wav"
     _write_wav(audio)
 

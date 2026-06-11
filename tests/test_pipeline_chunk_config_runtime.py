@@ -1,44 +1,15 @@
-import pytest
-
 from asr import pipeline
 
 
 def test_chunk_config_reads_boundary_refiner_env_at_runtime(monkeypatch):
-    monkeypatch.setenv("BOUNDARY_REFINER_ENABLED", "1")
     monkeypatch.setenv("BOUNDARY_REFINER_MODEL_PATH", "src/boundary/checkpoints/boundary_refiner.pt")
-    monkeypatch.setenv("BOUNDARY_REFINER_BACKBONE", "transformers.Mamba2Model")
     monkeypatch.setenv("BOUNDARY_REFINER_DEVICE", "cuda")
-    monkeypatch.setenv("BOUNDARY_REFINER_THRESHOLD", "0.63")
 
     cfg = pipeline._boundary_config()
 
-    assert cfg["boundary_refiner_enabled"] is True
     assert cfg["boundary_refiner_model_path"] == "src/boundary/checkpoints/boundary_refiner.pt"
-    assert cfg["boundary_refiner_backbone"] == "transformers.Mamba2Model"
     assert cfg["boundary_refiner_device"] == "cuda"
-    assert cfg["boundary_refiner_threshold"] == 0.63
-
-
-def test_chunk_config_rejects_non_mamba2_boundary_refiner(monkeypatch):
-    monkeypatch.setenv("BOUNDARY_REFINER_BACKBONE", "tcn")
-
-    with pytest.raises(ValueError, match="only transformers\\.Mamba2Model"):
-        pipeline._boundary_config()
-
-
-def test_chunk_config_rejects_mamba2_alias(monkeypatch):
-    monkeypatch.setenv("BOUNDARY_REFINER_BACKBONE", "mamba2")
-
-    with pytest.raises(ValueError, match="only transformers\\.Mamba2Model"):
-        pipeline._boundary_config()
-
-
-def test_chunk_config_rejects_torch_mamba2_alias(monkeypatch):
-    monkeypatch.setenv("BOUNDARY_REFINER_BACKBONE", "torch_mamba2")
-
-    with pytest.raises(ValueError, match="only transformers\\.Mamba2Model"):
-        pipeline._boundary_config()
-
+    assert "boundary_refiner_backbone" not in cfg
 
 def test_chunk_config_reads_boundary_planner_env_at_runtime(monkeypatch):
     monkeypatch.setenv("BOUNDARY_FEATURE_FRAME_HOP_S", "0.04")

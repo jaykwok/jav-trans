@@ -191,7 +191,7 @@ def test_advanced_asr_stage_env_is_task_scoped(monkeypatch, tmp_path):
     temp_root = tmp_path / "jobs"
     video_path = tmp_path / "sample.mp4"
     video_path.write_bytes(b"fake-video")
-    monkeypatch.setenv("BOUNDARY_REFINER_THRESHOLD", "0.5")
+    monkeypatch.setenv("BOUNDARY_REFINER_DEVICE", "auto")
     original_asr_batch_size = main.os.environ.get("ASR_BATCH_SIZE")
     ctx = make_job_context(
         video_path,
@@ -200,7 +200,7 @@ def test_advanced_asr_stage_env_is_task_scoped(monkeypatch, tmp_path):
         skip_translation=True,
         keep_temp_files=True,
         advanced={
-            "BOUNDARY_REFINER_THRESHOLD": "0.7",
+            "BOUNDARY_REFINER_DEVICE": "cpu",
             "ASR_BATCH_SIZE": "12",
         },
     )
@@ -211,7 +211,7 @@ def test_advanced_asr_stage_env_is_task_scoped(monkeypatch, tmp_path):
         Path(out_path).write_bytes(b"")
 
     def fake_transcribe_and_align(_audio_path, _device, on_stage=None, include_details=False):
-        assert main.os.environ["BOUNDARY_REFINER_THRESHOLD"] == "0.7"
+        assert main.os.environ["BOUNDARY_REFINER_DEVICE"] == "cpu"
         assert main.os.environ["ASR_BATCH_SIZE"] == "12"
         return (
             [{"start": 0.0, "end": 1.0, "text": "こんにちは"}],
@@ -224,6 +224,6 @@ def test_advanced_asr_stage_env_is_task_scoped(monkeypatch, tmp_path):
 
     run_pipeline(video_path, ctx)
 
-    assert main.os.environ["BOUNDARY_REFINER_THRESHOLD"] == "0.5"
+    assert main.os.environ["BOUNDARY_REFINER_DEVICE"] == "auto"
     assert main.os.environ.get("ASR_BATCH_SIZE") == original_asr_batch_size
 
