@@ -227,7 +227,7 @@ def mine_case(aligned_path: Path, workflow_root: Path | None) -> tuple[list[dict
                     "text_density_level": row.get("text_density_level", ""),
                     "label_policy": {
                         "start_weight": 1.0,
-                        "end_weight": 0.35,
+                        "end_weight": 0.6,
                         "end_may_be_shorter": True,
                     },
                 }

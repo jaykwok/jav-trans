@@ -115,7 +115,7 @@ class FrameSequenceFeatureProvider:
                 f"{runtime_hash} != {feature_schema_hash}"
             )
 
-    def features_for_gap(
+    def features_for_boundary(
         self,
         *,
         left_start_s: float,
@@ -123,7 +123,7 @@ class FrameSequenceFeatureProvider:
         right_start_s: float,
         right_end_s: float,
     ) -> list[float]:
-        return _gap_window_sequence_features_from_arrays(
+        return _boundary_window_sequence_features_from_arrays(
             left_start_s=left_start_s,
             left_end_s=left_end_s,
             right_start_s=right_start_s,
@@ -164,7 +164,7 @@ def frame_sequence_feature_names(
         "left_duration_s",
         "right_duration_s",
         "proposed_core_s",
-        "gap_merge_s",
+        "gap_reference_s",
         "gap_ratio",
     ]
     for region in ("left", "gap", "right"):
@@ -211,7 +211,6 @@ def validate_sequence_features(
     features: Sequence[Sequence[float]],
     *,
     feature_names: Sequence[str],
-    labels: Sequence[float] | None = None,
     expected_feature_names: Sequence[str] | None = None,
 ) -> np.ndarray:
     names = tuple(str(name) for name in feature_names)
@@ -230,18 +229,10 @@ def validate_sequence_features(
         raise ValueError("sequence_features dim does not match feature_names")
     if not np.isfinite(array).all():
         raise ValueError("sequence_features must not contain NaN or inf")
-    if labels is not None:
-        label_array = np.asarray(labels, dtype=np.float32)
-        if label_array.ndim != 1:
-            raise ValueError("sequence_labels must have shape [time]")
-        if label_array.shape[0] != array.shape[0]:
-            raise ValueError("sequence_labels length must match sequence_features length")
-        if not np.isfinite(label_array).all():
-            raise ValueError("sequence_labels must not contain NaN or inf")
     return array
 
 
-def gap_window_sequence_features(
+def boundary_window_sequence_features(
     *,
     left_start_s: float,
     left_end_s: float,
@@ -265,7 +256,7 @@ def gap_window_sequence_features(
     ptm_used_dim = min(int(ptm_array.shape[1]), int(config.max_ptm_dims))
     ptm_used = ptm_array[:frame_count, :ptm_used_dim]
     mfcc_used = mfcc_array[:frame_count]
-    return _gap_window_sequence_features_from_arrays(
+    return _boundary_window_sequence_features_from_arrays(
         left_start_s=left_start_s,
         left_end_s=left_end_s,
         right_start_s=right_start_s,
@@ -278,7 +269,7 @@ def gap_window_sequence_features(
     )
 
 
-def _gap_window_sequence_features_from_arrays(
+def _boundary_window_sequence_features_from_arrays(
     *,
     left_start_s: float,
     left_end_s: float,
@@ -295,7 +286,7 @@ def _gap_window_sequence_features_from_arrays(
     if config.target_chunk_s <= 0:
         raise ValueError("target_chunk_s must be positive")
     gap_s = right_start_s - left_end_s
-    gap_merge_s = max(0.2, min(1.5, config.target_chunk_s / 6.0))
+    gap_reference_s = max(0.2, min(1.5, config.target_chunk_s / 6.0))
     ranges = {
         "left": (max(0.0, left_end_s - config.left_context_s), left_end_s),
         "gap": (left_end_s, right_start_s),
@@ -306,8 +297,8 @@ def _gap_window_sequence_features_from_arrays(
         float(max(0.0, left_end_s - left_start_s)),
         float(max(0.0, right_end_s - right_start_s)),
         float(max(0.0, right_end_s - left_start_s)),
-        float(gap_merge_s),
-        float(gap_s / max(1e-6, gap_merge_s)),
+        float(gap_reference_s),
+        float(gap_s / max(1e-6, gap_reference_s)),
     ]
     for name in ("left", "gap", "right"):
         start_s, end_s = ranges[name]

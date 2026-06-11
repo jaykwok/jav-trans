@@ -124,8 +124,7 @@ def test_asr_stage_env_scope_passes_boundary_refiner_flags(monkeypatch, tmp_path
         skip_translation=True,
         keep_temp_files=True,
         advanced={
-            "BOUNDARY_REFINER_ENABLED": "1",
-            "BOUNDARY_REFINER_THRESHOLD": "0.61",
+            "BOUNDARY_REFINER_DEVICE": "cpu",
             "BOUNDARY_PLANNER_TARGET_CHUNK_S": "3.5",
             "BOUNDARY_PLANNER_MAX_CORE_CHUNK_S": "5.5",
         },
@@ -143,8 +142,7 @@ def test_asr_stage_env_scope_passes_boundary_refiner_flags(monkeypatch, tmp_path
         Path(out_path).write_bytes(b"wav")
 
     def fake_transcribe_and_align(_audio_path, _device, on_stage=None, include_details=False):
-        seen["enabled"] = main.os.environ.get("BOUNDARY_REFINER_ENABLED")
-        seen["threshold"] = main.os.environ.get("BOUNDARY_REFINER_THRESHOLD")
+        seen["device"] = main.os.environ.get("BOUNDARY_REFINER_DEVICE")
         seen["target_s"] = main.os.environ.get("BOUNDARY_PLANNER_TARGET_CHUNK_S")
         seen["max_core_s"] = main.os.environ.get("BOUNDARY_PLANNER_MAX_CORE_CHUNK_S")
         return (
@@ -163,8 +161,7 @@ def test_asr_stage_env_scope_passes_boundary_refiner_flags(monkeypatch, tmp_path
     )
 
     assert seen == {
-        "enabled": "1",
-        "threshold": "0.61",
+        "device": "cpu",
         "target_s": "3.5",
         "max_core_s": "5.5",
     }

@@ -111,11 +111,8 @@ DEFAULT_SETTINGS: dict[str, str] = {
     # Boundary Refiner is the current pre-ASR chunk planning path.
     # This is a feature-score grid fallback, not the source video frame rate.
     "BOUNDARY_FEATURE_FRAME_HOP_S": "0.02",
-    "BOUNDARY_REFINER_ENABLED": "1",
     "BOUNDARY_REFINER_MODEL_PATH": "src/boundary/checkpoints/boundary_refiner.pt",
-    "BOUNDARY_REFINER_BACKBONE": "transformers.Mamba2Model",
     "BOUNDARY_REFINER_DEVICE": "auto",
-    "BOUNDARY_REFINER_THRESHOLD": "0.5",
     "BOUNDARY_FRAME_SEQUENCE_LEFT_CONTEXT_S": "0.60",
     "BOUNDARY_FRAME_SEQUENCE_RIGHT_CONTEXT_S": "0.60",
     "BOUNDARY_FRAME_SEQUENCE_MAX_PTM_DIMS": "64",
@@ -133,7 +130,7 @@ DEFAULT_SETTINGS: dict[str, str] = {
     "SPEECH_BOUNDARY_JA_FRAME_DILATION_S": "0.2",
     # 1 caches SpeechBoundary frame score -> Boundary Planner outputs separately from ASR generation settings.
     "BOUNDARY_CACHE_ENABLED": "1",
-    # Persistent boundary cache directory. Versioned as boundary-cache v4.
+    # Persistent boundary cache directory. Versioned as boundary-cache v5.
     "BOUNDARY_CACHE_DIR": "./tmp/cache/boundary",
 
     # --- Alignment Retry & Refine ---

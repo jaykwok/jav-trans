@@ -47,8 +47,7 @@ def test_run_full_workflow_context_carries_boundary_env(monkeypatch, tmp_path):
         "jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame=8"
     )
     monkeypatch.setenv("ASR_BATCH_SIZE_BY_REPO", batch_table)
-    monkeypatch.setenv("BOUNDARY_REFINER_ENABLED", "1")
-    monkeypatch.setenv("BOUNDARY_REFINER_THRESHOLD", "0.62")
+    monkeypatch.setenv("BOUNDARY_REFINER_DEVICE", "cpu")
     monkeypatch.setenv("BOUNDARY_PLANNER_TARGET_CHUNK_S", "3.5")
     monkeypatch.setenv("BOUNDARY_PLANNER_MAX_CORE_CHUNK_S", "5.5")
 
@@ -78,8 +77,7 @@ def test_run_full_workflow_context_carries_boundary_env(monkeypatch, tmp_path):
 
     assert ctx.advanced["ASR_BATCH_SIZE"] == "auto"
     assert ctx.advanced["ASR_BATCH_SIZE_BY_REPO"] == batch_table
-    assert ctx.advanced["BOUNDARY_REFINER_ENABLED"] == "1"
-    assert ctx.advanced["BOUNDARY_REFINER_THRESHOLD"] == "0.62"
+    assert ctx.advanced["BOUNDARY_REFINER_DEVICE"] == "cpu"
     assert ctx.advanced["BOUNDARY_PLANNER_TARGET_CHUNK_S"] == "3.5"
     assert ctx.advanced["BOUNDARY_PLANNER_MAX_CORE_CHUNK_S"] == "5.5"
 

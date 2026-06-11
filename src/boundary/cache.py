@@ -15,7 +15,7 @@ from boundary.base import SpeechSegment
 
 log = logging.getLogger(__name__)
 
-BOUNDARY_CACHE_VERSION = 4
+BOUNDARY_CACHE_VERSION = 5
 _AUDIO_SAMPLE_BYTES = 2 * 1024 * 1024
 _AUDIO_KEY_RE = re.compile(r"^[0-9a-fA-F]{8,40}$")
 
@@ -37,15 +37,11 @@ _BOUNDARY_BACKEND_ENV_KEYS = (
     "SPEECH_BOUNDARY_JA_CHUNK_THRESHOLD_S",
     "SPEECH_BOUNDARY_JA_CUT_THRESHOLD",
     "SPEECH_BOUNDARY_JA_APPLY_CUT_TO_SPEECH",
-    "SPEECH_BOUNDARY_JA_EXPORT_SEQUENCE_FEATURES",
 )
 _BOUNDARY_ENV_KEYS = (
     "BOUNDARY_FEATURE_FRAME_HOP_S",
-    "BOUNDARY_REFINER_ENABLED",
     "BOUNDARY_REFINER_MODEL_PATH",
-    "BOUNDARY_REFINER_BACKBONE",
     "BOUNDARY_REFINER_DEVICE",
-    "BOUNDARY_REFINER_THRESHOLD",
     "BOUNDARY_FRAME_SEQUENCE_LEFT_CONTEXT_S",
     "BOUNDARY_FRAME_SEQUENCE_RIGHT_CONTEXT_S",
     "BOUNDARY_FRAME_SEQUENCE_MAX_PTM_DIMS",
@@ -300,13 +296,6 @@ def _packed_chunk_to_dict(chunk: PackedChunk) -> dict:
         ),
         "boundary_reason": chunk.boundary_reason,
         "boundary_source": chunk.boundary_source,
-        "boundary_decision_merge": chunk.boundary_decision_merge,
-        "boundary_merge_prob": (
-            None if chunk.boundary_merge_prob is None else float(chunk.boundary_merge_prob)
-        ),
-        "boundary_split_prob": (
-            None if chunk.boundary_split_prob is None else float(chunk.boundary_split_prob)
-        ),
         "boundary_start_refine_delta_s": (
             None
             if chunk.boundary_start_refine_delta_s is None
@@ -352,21 +341,6 @@ def _packed_chunk_from_dict(item: Any) -> PackedChunk:
         ),
         boundary_reason=str(item.get("boundary_reason") or ""),
         boundary_source=str(item.get("boundary_source") or ""),
-        boundary_decision_merge=(
-            None
-            if item.get("boundary_decision_merge") is None
-            else bool(item.get("boundary_decision_merge"))
-        ),
-        boundary_merge_prob=(
-            None
-            if item.get("boundary_merge_prob") is None
-            else float(item.get("boundary_merge_prob"))
-        ),
-        boundary_split_prob=(
-            None
-            if item.get("boundary_split_prob") is None
-            else float(item.get("boundary_split_prob"))
-        ),
         boundary_start_refine_delta_s=(
             None
             if item.get("boundary_start_refine_delta_s") is None

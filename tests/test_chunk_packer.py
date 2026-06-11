@@ -16,10 +16,9 @@ class _SequenceDenyRefiner:
         assert features == [[42.0]]
         return [
             BoundaryDecision(
-                False,
-                0.08,
-                "learned_sequence_split",
                 source="frame_sequence_refiner",
+                start_refine_delta_s=0.0,
+                end_refine_delta_s=0.0,
             )
         ]
 
@@ -28,7 +27,7 @@ class _SequenceDenyRefiner:
 
 
 class _StaticSequenceFeatureProvider:
-    def features_for_gap(
+    def features_for_boundary(
         self,
         *,
         left_start_s: float,
@@ -48,12 +47,15 @@ class _BatchSequenceRefiner:
         self.calls.append(features)
         assert features == [[1.0], [2.0]]
         return [
-            BoundaryDecision(True, 0.91, "learned_sequence_merge", source="frame_sequence_refiner"),
             BoundaryDecision(
-                False,
-                0.07,
-                "learned_sequence_split",
                 source="frame_sequence_refiner",
+                start_refine_delta_s=0.0,
+                end_refine_delta_s=0.0,
+            ),
+            BoundaryDecision(
+                source="frame_sequence_refiner",
+                start_refine_delta_s=0.0,
+                end_refine_delta_s=0.0,
             ),
         ]
 
@@ -66,17 +68,11 @@ class _DeltaSequenceRefiner:
         assert features == [[1.0], [2.0]]
         return [
             BoundaryDecision(
-                False,
-                0.10,
-                "learned_sequence_split",
                 source="frame_sequence_refiner",
                 start_refine_delta_s=-0.2,
                 end_refine_delta_s=-0.3,
             ),
             BoundaryDecision(
-                False,
-                0.20,
-                "learned_sequence_split",
                 source="frame_sequence_refiner",
                 start_refine_delta_s=0.15,
                 end_refine_delta_s=0.25,
@@ -88,7 +84,7 @@ class _DeltaSequenceRefiner:
 
 
 class _IndexSequenceFeatureProvider:
-    def features_for_gap(
+    def features_for_boundary(
         self,
         *,
         left_start_s: float,
@@ -127,7 +123,7 @@ def test_dense_segments_stay_as_speech_core_chunks():
     ]
 
 
-def test_sequence_refiner_can_block_mergeable_gap():
+def test_sequence_refiner_scores_gap_without_merging():
     chunks = pack_speech_segments(
         [_seg(0.0, 2.0), _seg(3.0, 5.0)],
         frame_hop_s=1.0,
@@ -138,8 +134,8 @@ def test_sequence_refiner_can_block_mergeable_gap():
     )
 
     assert [(chunk.core_start, chunk.core_end) for chunk in chunks] == [(0.0, 2.0), (3.0, 5.0)]
-    assert chunks[0].split_reason == "boundary_refiner:learned_sequence_split"
-    assert chunks[0].boundary_score == pytest.approx(0.08)
+    assert chunks[0].split_reason == "speech_island"
+    assert chunks[0].boundary_score is None
     assert chunks[0].boundary_decision_source == "frame_sequence_refiner"
     assert [(chunk.start, chunk.end) for chunk in chunks] == [(0.0, 2.0), (3.0, 5.0)]
 
@@ -162,7 +158,7 @@ def test_sequence_refiner_scores_all_gaps_in_one_batch():
         (1.2, 2.0),
         (2.4, 3.0),
     ]
-    assert chunks[1].boundary_decision_merge is False
+    assert chunks[1].boundary_start_refine_delta_s == pytest.approx(0.0)
     assert chunks[1].boundary_decision_source == "frame_sequence_refiner"
 
 

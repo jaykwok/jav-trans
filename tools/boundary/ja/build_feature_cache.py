@@ -242,6 +242,7 @@ def run(args: argparse.Namespace) -> None:
         frame_hop_s=args.frame_hop_s,
         n_mfcc=args.n_mfcc,
         n_fft=args.n_fft,
+        feature_dim=args.feature_dim,
         device=args.device,
         dtype=args.dtype,
         revision=args.revision,
@@ -492,6 +493,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--frame-hop-s", type=float, default=0.02)
     parser.add_argument("--n-mfcc", type=int, default=40)
     parser.add_argument("--n-fft", type=int, default=400)
+    parser.add_argument(
+        "--feature-dim",
+        type=int,
+        help="Optional PTM feature dimension to keep in the cache. Omit to keep the full PTM.",
+    )
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--dtype", choices=["float16", "float32", "bfloat16"], default="float16")
     parser.add_argument("--batch-size", type=int, default=1)
@@ -510,7 +516,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--log-every", type=int, default=1, help="Print one cached row every N examples; 1 logs every row.")
     parser.add_argument("--resume", action="store_true", help="Append to existing feature_manifest.jsonl and skip cached label_index rows.")
     parser.add_argument("--output-dir", default=str(PROJECT_ROOT / "agents" / "temp" / "speech-boundary-ja" / "feature-cache"))
-    return parser.parse_args(argv)
+    args = parser.parse_args(argv)
+    if args.feature_dim is not None and args.feature_dim <= 0:
+        parser.error("--feature-dim must be positive when set")
+    return args
 
 
 if __name__ == "__main__":

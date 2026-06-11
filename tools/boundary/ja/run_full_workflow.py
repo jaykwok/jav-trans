@@ -159,11 +159,8 @@ def configure_env(args: argparse.Namespace) -> None:
     os.environ["ASR_MAX_NEW_TOKENS"] = str(args.asr_max_new_tokens)
     if args.boundary_feature_frame_hop_s is not None:
         os.environ["BOUNDARY_FEATURE_FRAME_HOP_S"] = str(args.boundary_feature_frame_hop_s)
-    os.environ["BOUNDARY_REFINER_ENABLED"] = "1"
     os.environ["BOUNDARY_REFINER_MODEL_PATH"] = args.boundary_refiner_model_path
-    os.environ["BOUNDARY_REFINER_BACKBONE"] = args.boundary_refiner_backbone
     os.environ["BOUNDARY_REFINER_DEVICE"] = args.boundary_refiner_device
-    os.environ["BOUNDARY_REFINER_THRESHOLD"] = str(args.boundary_refiner_threshold)
     os.environ["BOUNDARY_PLANNER_MAX_CORE_CHUNK_S"] = str(args.boundary_planner_max_core_chunk_s)
     os.environ["BOUNDARY_PLANNER_TARGET_CHUNK_S"] = str(args.boundary_planner_target_chunk_s)
     os.environ["BOUNDARY_PLANNER_MIN_CHUNK_S"] = str(args.boundary_planner_min_chunk_s)
@@ -208,14 +205,8 @@ def build_context(*, args: argparse.Namespace, paths: RunPaths, video: Path):
         ),
         "ALIGNER_BATCH_SIZE": str(args.aligner_batch_size),
         "ALIGN_LONG_CHUNK_BATCH_SIZE": str(args.align_long_chunk_batch_size),
-        "BOUNDARY_REFINER_ENABLED": os.getenv("BOUNDARY_REFINER_ENABLED", "1"),
         "BOUNDARY_REFINER_MODEL_PATH": os.getenv("BOUNDARY_REFINER_MODEL_PATH", ""),
-        "BOUNDARY_REFINER_BACKBONE": os.getenv(
-            "BOUNDARY_REFINER_BACKBONE",
-            "transformers.Mamba2Model",
-        ),
         "BOUNDARY_REFINER_DEVICE": os.getenv("BOUNDARY_REFINER_DEVICE", "auto"),
-        "BOUNDARY_REFINER_THRESHOLD": os.getenv("BOUNDARY_REFINER_THRESHOLD", "0.5"),
         "BOUNDARY_PLANNER_MAX_CORE_CHUNK_S": os.getenv(
             "BOUNDARY_PLANNER_MAX_CORE_CHUNK_S",
             "5.0",
@@ -443,12 +434,6 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--boundary-refiner-model-path",
         default=os.getenv("BOUNDARY_REFINER_MODEL_PATH", ""),
     )
-    parser.add_argument(
-        "--boundary-refiner-backbone",
-        default="transformers.Mamba2Model",
-        choices=("transformers.Mamba2Model",),
-    )
-    parser.add_argument("--boundary-refiner-threshold", type=float, default=_env_float("BOUNDARY_REFINER_THRESHOLD", 0.5))
     parser.add_argument("--boundary-refiner-device", default=os.getenv("BOUNDARY_REFINER_DEVICE", "auto"))
     parser.add_argument("--boundary-planner-max-core-chunk-s", type=float, default=_env_float("BOUNDARY_PLANNER_MAX_CORE_CHUNK_S", 5.0))
     parser.add_argument("--boundary-planner-target-chunk-s", type=float, default=_env_float("BOUNDARY_PLANNER_TARGET_CHUNK_S", 3.0))

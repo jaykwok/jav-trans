@@ -14,6 +14,26 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 AUDIT_ROOT = PROJECT_ROOT / "agents" / "audits"
 AUDIT_RM_ROOT = PROJECT_ROOT / "agents" / "rm" / "audit-deletions"
 AUDIT_SERVER_COMMAND = "tools/audits/serve_audits.sh"
+ANON_LABELS = {
+    "NAMH-055": "匿名样片 A",
+    "REAL-988": "匿名样片 B",
+    "FJIN-059": "匿名样片 C",
+    "867HTTM-0045": "匿名样片 D",
+    "BONY-173": "匿名样片 E",
+    "HAME-052": "匿名样片 F",
+    "MADM-217": "匿名样片 G",
+    "MKMP-549": "匿名样片 H",
+    "MKMP-577": "匿名样片 I",
+    "NMSL-036": "匿名样片 J",
+    "SORA-575": "匿名样片 K",
+}
+
+
+def anonymize_display_text(value: str) -> str:
+    text = str(value)
+    for raw, label in ANON_LABELS.items():
+        text = text.replace(raw, label)
+    return text
 
 
 def project_rel(value: str | Path | None) -> str:
@@ -71,17 +91,25 @@ def _entry_desc(summary: Mapping[str, Any]) -> str:
     for key in ("video_label", "video", "dataset_id"):
         value = summary.get(key)
         if value:
-            parts.append(str(value))
+            parts.append(anonymize_display_text(str(value)))
             break
     return " · ".join(parts) if parts else "审计页面"
 
 
 def _entry_title(index_path: Path, summary: Mapping[str, Any]) -> str:
     if summary.get("title"):
-        return str(summary["title"])
+        return anonymize_display_text(str(summary["title"]))
     if summary.get("dataset_id"):
-        return str(summary["dataset_id"])
-    return index_path.parent.name
+        return anonymize_display_text(str(summary["dataset_id"]))
+    return anonymize_display_text(index_path.parent.name)
+
+
+def _audit_entry_mtime(index_path: Path) -> float:
+    candidates = [index_path, index_path.parent]
+    for summary_path in (index_path.parent / "summary.json", index_path.with_suffix(".summary.json")):
+        if summary_path.exists():
+            candidates.append(summary_path)
+    return max(path.stat().st_mtime for path in candidates if path.exists())
 
 
 def _discover_entries(audit_root: Path) -> list[dict[str, str]]:
@@ -96,8 +124,10 @@ def _discover_entries(audit_root: Path) -> list[dict[str, str]]:
                 "title": _entry_title(index_path, summary),
                 "desc": _entry_desc(summary),
                 "dir": rel_url(index_path.parent, from_dir=audit_root),
+                "mtime": str(_audit_entry_mtime(index_path)),
             }
         )
+    entries.sort(key=lambda entry: float(entry["mtime"]), reverse=True)
     return entries
 
 
@@ -174,7 +204,7 @@ def _newest_entry_index(audit_root: Path) -> Path | None:
     ]
     if not entries:
         return None
-    return max(entries, key=lambda path: path.stat().st_mtime)
+    return max(entries, key=_audit_entry_mtime)
 
 
 def _latest_index_after_delete(*, audit_root: Path, deleted_href: str, previous_latest_href: str) -> Path | None:
@@ -299,6 +329,8 @@ def write_audit_index(
         }
         entries = [latest_entry, *[entry for entry in entries if entry["href"] != latest_href]]
     cards = "\n".join(_card(entry, latest_href=latest_href) for entry in entries)
+    if not cards:
+        cards = '  <p class="muted">当前没有审计页。新的审计生成后会按更新时间倒序显示在这里。</p>'
     latest_meta = f"当前 latest: {project_rel(latest_html)}" if latest_html else "当前 latest: 未指定"
     (audit_root / "index.html").write_text(
         f"""<!doctype html>
@@ -382,7 +414,7 @@ code {{ font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
 {cards}
   <div class="status" id="deleteStatus"></div>
   <p class="muted">{html.escape(latest_meta)}</p>
-  <p class="muted">所有长期审计页统一放在 <code>agents/audits/</code>，从本页进入；不使用自动跳转。推荐用 <code>{AUDIT_SERVER_COMMAND}</code> 启动，它仍从项目根目录提供媒体文件，但只 watch <code>agents/audits/</code>，避免训练日志、cache、tmp 写入触发浏览器持续刷新。删除会移动到 <code>agents/rm/audit-deletions/</code>。</p>
+  <p class="muted">所有长期审计页统一放在 <code>agents/audits/</code>，从本页进入；按更新时间倒序排列，最上面是最新需要审计的页面。不使用自动跳转。推荐用 <code>{AUDIT_SERVER_COMMAND}</code> 启动，它仍从项目根目录提供媒体文件，但只 watch <code>agents/audits/</code>，避免训练日志、cache、tmp 写入触发浏览器持续刷新。删除按钮只有通过该脚本启动时才能直接移动本地文件并重建导航；否则页面会给出可手动运行的删除命令。删除会移动到 <code>agents/rm/audit-deletions/</code>。</p>
 </main>
 <script>
 const statusBox = document.getElementById("deleteStatus");

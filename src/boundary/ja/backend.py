@@ -499,9 +499,7 @@ class SpeechBoundaryJaBackend:
                     "ptm_dim": int(sequence_ptm.shape[1]),
                     "mfcc_dim": int(sequence_mfcc.shape[1]),
                 }
-            if _env_bool("SPEECH_BOUNDARY_JA_EXPORT_FRAME_SCORES", "0") or _env_bool(
-                "BOUNDARY_REFINER_ENABLED", "0"
-            ):
+            if _env_bool("SPEECH_BOUNDARY_JA_EXPORT_FRAME_SCORES", "0") or cfg.export_sequence_features:
                 params["frame_scores"] = [float(value) for value in probabilities]
                 params["cut_frame_scores"] = [float(value) for value in cut_probabilities]
             return SegmentationResult(

@@ -17,17 +17,14 @@ from boundary.sequence_features import (
     validate_sequence_features,
 )
 
-LEARNED_REFINER_SCHEMA = "boundary_refiner_v4"
+LEARNED_REFINER_SCHEMA = "boundary_refiner_v5"
 DEFAULT_REFINER_CHECKPOINT_PATH = Path("src/boundary/checkpoints/boundary_refiner.pt")
-BOUNDARY_REFINER_OUTPUT_DIM = 3
+BOUNDARY_REFINER_OUTPUT_DIM = 2
 DEFAULT_BOUNDARY_DELTA_MAX_S = 0.5
 
 
 @dataclass(frozen=True)
 class BoundaryDecision:
-    merge: bool
-    score: float
-    reason: str
     source: str = ""
     start_refine_delta_s: float | None = None
     end_refine_delta_s: float | None = None
@@ -47,13 +44,12 @@ class LearnedBoundaryRefiner:
         *,
         model: BoundarySequenceClassifier,
         checkpoint_path: Path,
-        threshold: float,
         feature_names: tuple[str, ...],
         feature_mean: tuple[float, ...],
         feature_std: tuple[float, ...],
         backbone: str,
-        requested_device: str = "auto",
         metadata: dict | None = None,
+        requested_device: str = "auto",
     ) -> None:
         if not feature_names:
             raise ValueError("feature_names must not be empty")
@@ -63,7 +59,6 @@ class LearnedBoundaryRefiner:
             raise ValueError("feature_std length must match feature_names")
         self.model = model.eval()
         self.checkpoint_path = checkpoint_path
-        self.threshold = float(threshold)
         self.feature_names = feature_names
         self.feature_mean = feature_mean
         self.feature_std = feature_std
@@ -83,7 +78,6 @@ class LearnedBoundaryRefiner:
             "path": str(self.checkpoint_path),
             "sha1": self._sha1,
             "backbone": self.backbone,
-            "threshold": self.threshold,
             "requested_device": self.requested_device,
             "actual_device": self.actual_device,
             "feature_names": list(self.feature_names),
@@ -139,26 +133,19 @@ class FrameSequenceBoundaryRefiner:
         with torch.inference_mode():
             logits = self.learned.model(tensor.to(device)).detach().cpu()
         if logits.ndim == 3:
-            merge_scores = torch.sigmoid(logits[0, :, 0]).tolist()
-            context_logits = logits[0]
+            delta_logits = logits[0]
         elif logits.ndim == 2:
-            merge_scores = torch.sigmoid(logits[:, 0]).tolist()
-            context_logits = logits
+            delta_logits = logits
         else:
             raise ValueError("frame sequence refiner logits must have shape [batch,time,heads]")
         decisions: list[BoundaryDecision] = []
-        for index, score in enumerate(merge_scores):
+        for index in range(delta_logits.shape[0]):
             start_delta_s, end_delta_s = _boundary_delta_from_logits(
-                context_logits[index],
+                delta_logits[index],
                 max_delta_s=self.learned.boundary_delta_max_s,
             )
             decisions.append(
                 BoundaryDecision(
-                    float(score) >= self.learned.threshold,
-                    float(score),
-                    "learned_sequence_merge"
-                    if float(score) >= self.learned.threshold
-                    else "learned_sequence_split",
                     source="frame_sequence_refiner",
                     start_refine_delta_s=start_delta_s,
                     end_refine_delta_s=end_delta_s,
@@ -170,7 +157,6 @@ class FrameSequenceBoundaryRefiner:
 def load_learned_refiner_checkpoint(
     checkpoint_path: str | Path,
     *,
-    threshold: float,
     backbone_override: str | None = None,
     device: str = "auto",
 ) -> LearnedBoundaryRefiner:
@@ -186,7 +172,7 @@ def load_learned_refiner_checkpoint(
         )
     feature_names = tuple(str(name) for name in payload.get("feature_names") or ())
     if not feature_names:
-        raise ValueError("boundary refiner v4 checkpoint missing feature_names")
+        raise ValueError("boundary refiner v5 checkpoint missing feature_names")
     model_config = dict(payload.get("model_config") or {})
     backbone = normalize_boundary_backbone(
         backbone_override
@@ -202,37 +188,36 @@ def load_learned_refiner_checkpoint(
     if int(model_config["input_dim"]) != len(feature_names):
         raise ValueError("checkpoint input_dim does not match feature_names length")
     if int(model_config.get("output_dim", 0)) != BOUNDARY_REFINER_OUTPUT_DIM:
-        raise ValueError("boundary refiner v4 checkpoints must use output_dim=3")
+        raise ValueError("boundary refiner v5 checkpoints must use output_dim=2")
     model = BoundarySequenceClassifier(**model_config)
     state_dict = payload.get("state_dict")
     if not isinstance(state_dict, dict):
         raise ValueError("Boundary refiner checkpoint missing state_dict")
     model.load_state_dict(state_dict)
     metadata = payload.get("metadata")
+    metadata_dict = metadata if isinstance(metadata, dict) else {}
+    _validate_top_level_feature_metadata(payload, metadata_dict)
     return LearnedBoundaryRefiner(
         model=model,
         checkpoint_path=checkpoint_path,
-        threshold=threshold,
         feature_names=feature_names,
         feature_mean=_float_tuple(payload.get("feature_mean"), len(feature_names), 0.0),
         feature_std=_float_tuple(payload.get("feature_std"), len(feature_names), 1.0),
         backbone=backbone,
         requested_device=device,
-        metadata=metadata if isinstance(metadata, dict) else {},
+        metadata=metadata_dict,
     )
 
 
 def load_frame_sequence_refiner_checkpoint(
     checkpoint_path: str | Path,
     *,
-    threshold: float,
     backbone_override: str | None = None,
     device: str = "auto",
 ) -> FrameSequenceBoundaryRefiner:
     return FrameSequenceBoundaryRefiner(
         load_learned_refiner_checkpoint(
             checkpoint_path,
-            threshold=threshold,
             backbone_override=backbone_override,
             device=device,
         )
@@ -268,8 +253,9 @@ def build_learned_refiner_checkpoint(
     config["backbone"] = model.backbone_name
     config["output_dim"] = getattr(model, "output_dim", BOUNDARY_REFINER_OUTPUT_DIM)
     if int(config["output_dim"]) != BOUNDARY_REFINER_OUTPUT_DIM:
-        raise ValueError("boundary refiner v4 checkpoints require output_dim=3")
-    return {
+        raise ValueError("boundary refiner v5 checkpoints require output_dim=2")
+    metadata_dict = dict(metadata or {})
+    payload = {
         "schema": LEARNED_REFINER_SCHEMA,
         "backbone": model.backbone_name,
         "model_config": config,
@@ -277,8 +263,20 @@ def build_learned_refiner_checkpoint(
         "feature_mean": list(feature_mean or (0.0,) * len(feature_names)),
         "feature_std": list(feature_std or (1.0,) * len(feature_names)),
         "state_dict": model.state_dict(),
-        "metadata": dict(metadata or {}),
+        "metadata": metadata_dict,
     }
+    for key in ("feature_schema", "feature_schema_hash", "feature_signature"):
+        if key in metadata_dict:
+            payload[key] = metadata_dict[key]
+    return payload
+
+
+def _validate_top_level_feature_metadata(payload: dict, metadata: dict) -> None:
+    for key in ("feature_schema", "feature_schema_hash", "feature_signature"):
+        top_value = payload.get(key)
+        metadata_value = metadata.get(key)
+        if top_value is not None and metadata_value is not None and top_value != metadata_value:
+            raise ValueError(f"checkpoint top-level {key} does not match metadata.{key}")
 
 
 def file_sha1(path: Path) -> str:
@@ -306,6 +304,6 @@ def _boundary_delta_from_logits(
     if logits.numel() < BOUNDARY_REFINER_OUTPUT_DIM:
         return None, None
     scale = max(0.0, float(max_delta_s))
-    start = float(torch.tanh(logits[1]) * scale)
-    end = float(torch.tanh(logits[2]) * scale)
+    start = float(torch.tanh(logits[0]) * scale)
+    end = float(torch.tanh(logits[1]) * scale)
     return start, end

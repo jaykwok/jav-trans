@@ -76,6 +76,7 @@ def extract_feature_bundle(
         mfcc,
         resize_ptm=is_low_frame_rate_ptm(config.ptm),
     )
+    ptm = _truncate_ptm_feature_dim(ptm, config=config)
     return {
         "ptm": ptm.astype("float32", copy=False),
         "mfcc": mfcc.astype("float32", copy=False),
@@ -286,6 +287,19 @@ def align_feature_frames(
     )
 
 
+def _truncate_ptm_feature_dim(ptm: np.ndarray, *, config: FeatureConfig) -> np.ndarray:
+    if config.feature_dim is None:
+        return np.ascontiguousarray(ptm, dtype=np.float32)
+    feature_dim = int(config.feature_dim)
+    if feature_dim <= 0:
+        raise ValueError("feature_dim must be positive when set")
+    if ptm.ndim != 2:
+        raise ValueError(f"ptm must be 2D, got shape={ptm.shape}")
+    if feature_dim > int(ptm.shape[1]):
+        raise ValueError(f"feature_dim={feature_dim} exceeds PTM dim={ptm.shape[1]}")
+    return np.ascontiguousarray(ptm[:, :feature_dim], dtype=np.float32)
+
+
 def write_feature_cache(
     *,
     output_dir: Path,
@@ -300,15 +314,15 @@ def write_feature_cache(
     key = cache_key_for_audio(audio_path=audio_path, config=config)
     feature_path = output_dir / f"{audio_id}-{key}.npz"
     save_func = np.savez_compressed if compressed else np.savez
+    ptm = _truncate_ptm_feature_dim(np.asarray(bundle["ptm"]), config=config)
+    mfcc = np.ascontiguousarray(bundle["mfcc"], dtype=np.float32)
     save_func(
         feature_path,
-        ptm=bundle["ptm"],
-        mfcc=bundle["mfcc"],
+        ptm=ptm,
+        mfcc=mfcc,
         duration_s=np.asarray([bundle["duration_s"]], dtype=np.float32),
         sample_rate=np.asarray([bundle["sample_rate"]], dtype=np.int32),
     )
-    ptm = bundle["ptm"]
-    mfcc = bundle["mfcc"]
     return CachedFeature(
         audio_id=audio_id,
         source=source,

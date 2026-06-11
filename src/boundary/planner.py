@@ -26,7 +26,7 @@ class BoundaryPlannerConfig:
 
     def signature(self) -> dict:
         return {
-            "planner": "candidate_sequence_core_planner_v4",
+            "planner": "candidate_sequence_core_planner_v5",
             "frame_hop_s": self.frame_hop_s,
             "max_core_chunk_s": self.max_core_chunk_s,
             "target_chunk_s": self.target_chunk_s,
@@ -59,8 +59,8 @@ class PlannedChunk:
     boundary_decision: BoundaryDecision | None = None
 
 
-class GapSequenceFeatureProvider(Protocol):
-    def features_for_gap(
+class BoundarySequenceFeatureProvider(Protocol):
+    def features_for_boundary(
         self,
         *,
         left_start_s: float,
@@ -76,7 +76,7 @@ def plan_boundary_chunks(
     features: BoundaryFeatureBundle,
     config: BoundaryPlannerConfig,
     sequence_refiner: SequenceBoundaryRefiner | None = None,
-    sequence_feature_provider: GapSequenceFeatureProvider | None = None,
+    sequence_feature_provider: BoundarySequenceFeatureProvider | None = None,
 ) -> list[PlannedChunk]:
     _validate_config(config)
     ordered = sorted(segments, key=lambda item: (item.start, item.end))
@@ -270,7 +270,7 @@ def _pack_islands(
     *,
     config: BoundaryPlannerConfig,
     sequence_refiner: SequenceBoundaryRefiner | None,
-    sequence_feature_provider: GapSequenceFeatureProvider | None,
+    sequence_feature_provider: BoundarySequenceFeatureProvider | None,
 ) -> list[PlannedChunk]:
     chunks: list[PlannedChunk] = []
     sequence_decisions = _precompute_sequence_decisions(
@@ -282,8 +282,6 @@ def _pack_islands(
     for index, island in enumerate(islands):
         decision = sequence_decisions[index] if index + 1 < len(islands) else None
         reason = island.boundary_reason or "speech_island"
-        if decision is not None and not decision.merge:
-            reason = f"boundary_refiner:{decision.reason}"
         chunks.append(
             PlannedChunk(
                 islands=[island],
@@ -298,7 +296,7 @@ def _precompute_sequence_decisions(
     islands: Sequence[PlannedIsland],
     *,
     sequence_refiner: SequenceBoundaryRefiner | None,
-    sequence_feature_provider: GapSequenceFeatureProvider | None,
+    sequence_feature_provider: BoundarySequenceFeatureProvider | None,
     sequence_batch_size: int,
 ) -> list[BoundaryDecision | None]:
     if len(islands) < 2:
@@ -312,7 +310,7 @@ def _precompute_sequence_decisions(
         if right.force_break_before or right.start - left.end < 0.0:
             continue
         features_by_gap.append(
-            sequence_feature_provider.features_for_gap(
+            sequence_feature_provider.features_for_boundary(
                 left_start_s=left.start,
                 left_end_s=left.end,
                 right_start_s=right.start,

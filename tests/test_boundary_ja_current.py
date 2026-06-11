@@ -22,6 +22,7 @@ from boundary.ja import (
     is_low_frame_rate_ptm,
     is_qwen3_asr_ptm,
     metrics_from_frame_counts,
+    load_cached_feature,
     qwen3_asr_audio_output_lengths,
     qwen3_asr_repo_id,
     resize_binary_frames,
@@ -29,6 +30,7 @@ from boundary.ja import (
     segments_to_frame_labels,
     stable_hf_audio_id,
     train_tiny_frame_classifier,
+    write_feature_cache,
     write_jsonl,
 )
 from boundary.ja.backend import DEFAULT_MODEL_PATH, DEFAULT_OPERATING_POINT, SpeechBoundaryJaConfig
@@ -133,6 +135,32 @@ def test_feature_schema_uses_ptm_names():
     assert aligned_ptm.shape == (6, 4)
     assert aligned_mfcc.shape == (6, 2)
     assert resize_binary_frames(np.asarray([0, 1], dtype=np.float32), 4).tolist() == [0, 0, 1, 1]
+
+
+def test_feature_cache_can_store_truncated_ptm_dim(tmp_path):
+    audio_path = tmp_path / "clip.wav"
+    audio_path.write_bytes(b"RIFF")
+    cached = write_feature_cache(
+        output_dir=tmp_path / "features",
+        audio_id="clip",
+        source="unit",
+        audio_path=audio_path,
+        config=FeatureConfig(feature_dim=2),
+        bundle={
+            "ptm": np.arange(12, dtype=np.float32).reshape(3, 4),
+            "mfcc": np.arange(6, dtype=np.float32).reshape(3, 2),
+            "duration_s": 0.3,
+            "sample_rate": 16000,
+        },
+        compressed=False,
+    )
+
+    ptm, mfcc = load_cached_feature(Path(cached.feature_path))
+
+    assert cached.ptm_dim == 2
+    assert ptm.shape == (3, 2)
+    assert mfcc.shape == (3, 2)
+    assert ptm.tolist() == [[0.0, 1.0], [4.0, 5.0], [8.0, 9.0]]
 
 
 def test_qwen_audio_output_lengths_formula():

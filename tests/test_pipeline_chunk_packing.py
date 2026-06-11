@@ -7,6 +7,7 @@ from pathlib import Path
 
 from audio.chunk_packer import PackedChunk
 from boundary.base import SegmentationResult, SpeechSegment
+from boundary.refiner import BoundaryDecision
 
 ROOT = Path(__file__).resolve().parents[1]
 SRC = ROOT / "src"
@@ -188,17 +189,64 @@ class _LowLogprobBackend(_RecordingBackend):
         ]
 
 
+class _FakeSequenceRefiner:
+    feature_names = ("gap_s",)
+    feature_schema_hash = "test-feature-schema"
+
+    def decide_sequence(self, features: list[list[float]]) -> list[BoundaryDecision]:
+        return [
+            BoundaryDecision(
+                source="frame_sequence_refiner",
+                start_refine_delta_s=0.0,
+                end_refine_delta_s=0.0,
+            )
+            for _ in features
+        ]
+
+    def signature(self) -> dict:
+        return {"schema": "boundary_refiner_v5", "type": "fake_sequence_refiner"}
+
+
+class _FakeSequenceFeatureProvider:
+    def features_for_boundary(
+        self,
+        *,
+        left_start_s: float,
+        left_end_s: float,
+        right_start_s: float,
+        right_end_s: float,
+    ) -> list[float]:
+        del left_start_s, right_end_s
+        return [right_start_s - left_end_s]
+
+    def validate_for_checkpoint(self, feature_names, feature_schema_hash) -> None:
+        del feature_names, feature_schema_hash
+
+    def signature(self) -> dict:
+        return {"schema": "speech_boundary_ja_sequence_feature_frames_v1", "type": "fake"}
+
+
 def _reload_pipeline(monkeypatch, tmp_path: Path):
     monkeypatch.setenv("BOUNDARY_FEATURE_FRAME_HOP_S", "0.02")
     monkeypatch.setenv("BOUNDARY_PLANNER_TARGET_CHUNK_S", "9.0")
     monkeypatch.setenv("BOUNDARY_PLANNER_MAX_CORE_CHUNK_S", "30.0")
     monkeypatch.setenv("ASR_CHUNK_ROOT", str(tmp_path / "chunks"))
     monkeypatch.setenv("ASR_CHECKPOINT_ENABLED", "0")
-    monkeypatch.setenv("BOUNDARY_REFINER_ENABLED", "0")
 
     from asr import pipeline as asr
 
-    return importlib.reload(asr)
+    asr = importlib.reload(asr)
+    monkeypatch.setattr(
+        asr,
+        "load_frame_sequence_refiner_checkpoint",
+        lambda *_args, **_kwargs: _FakeSequenceRefiner(),
+    )
+    monkeypatch.setattr(
+        asr,
+        "_required_sequence_feature_provider_from_result",
+        lambda *_args, **_kwargs: _FakeSequenceFeatureProvider(),
+    )
+    return asr
 
 
 def _run_transcription(monkeypatch, tmp_path: Path):
@@ -241,7 +289,7 @@ def test_boundary_planner_emits_one_asr_chunk_per_speech_island(monkeypatch, tmp
     assert len(backend.audio_paths) == 10
     assert details["chunk_count"] == len(backend.audio_paths)
     assert details["boundary_signature"]["backend"] == "stub"
-    assert details["boundary_signature"]["boundary_pipeline"]["version"] == 4
+    assert details["boundary_signature"]["boundary_pipeline"]["version"] == 5
     assert all(
         "source_boundary.wav" not in str(Path(path).name) for path in backend.audio_paths
     )
@@ -322,9 +370,6 @@ def test_packed_chunk_metadata_uses_source_span_index_after_short_chunk_drop():
         boundary_score=0.87,
         boundary_reason="utterance_switch",
         boundary_source="cut",
-        boundary_decision_merge=False,
-        boundary_merge_prob=0.13,
-        boundary_split_prob=0.87,
         boundary_start_refine_delta_s=0.04,
         boundary_end_refine_delta_s=-0.03,
         boundary_decision_source="frame_sequence_refiner",
@@ -346,9 +391,6 @@ def test_packed_chunk_metadata_uses_source_span_index_after_short_chunk_drop():
     assert chunk_infos[0]["boundary_reason"] == "utterance_switch"
     assert chunk_infos[0]["boundary_source"] == "cut"
     assert chunk_infos[0]["boundary_score"] == 0.87
-    assert chunk_infos[0]["boundary_decision_merge"] is False
-    assert chunk_infos[0]["boundary_merge_prob"] == 0.13
-    assert chunk_infos[0]["boundary_split_prob"] == 0.87
     assert chunk_infos[0]["boundary_start_refine_delta_s"] == 0.04
     assert chunk_infos[0]["boundary_end_refine_delta_s"] == -0.03
     assert chunk_infos[0]["boundary_decision_source"] == "frame_sequence_refiner"

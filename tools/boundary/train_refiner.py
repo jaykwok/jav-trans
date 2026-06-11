@@ -34,7 +34,6 @@ from boundary.sequence_features import (
     validate_sequence_features,
 )
 
-
 @dataclass(frozen=True)
 class TrainRefinerConfig:
     max_steps: int = 100
@@ -51,17 +50,16 @@ class TrainRefinerConfig:
     n_groups: int = 2
     chunk_size: int = 8
     bidirectional: bool = True
-    threshold: float = 0.5
-    allow_single_class: bool = False
     log_interval_steps: int = 20
     target_domain_speedup: float = 1.5
     target_chunk_s: float = 3.0
     max_core_chunk_s: float = 5.0
     min_chunk_s: float = 0.4
     boundary_delta_max_s: float = DEFAULT_BOUNDARY_DELTA_MAX_S
-    start_delta_loss_weight: float = 0.60
-    end_delta_loss_weight: float = 0.35
+    start_delta_loss_weight: float = 1.00
+    end_delta_loss_weight: float = 0.60
     init_checkpoint: str = ""
+    preserve_init_normalization: bool = False
     freeze_backbone: bool = False
     tensor_cache_path: str = ""
     loader_log_interval_rows: int = 0
@@ -70,13 +68,12 @@ class TrainRefinerConfig:
 @dataclass(frozen=True)
 class LoadedRefinerDataset:
     features: torch.Tensor
-    labels: torch.Tensor
     boundary_delta_targets: torch.Tensor
+    boundary_delta_weights: torch.Tensor
     mask: torch.Tensor
     feature_names: tuple[str, ...]
     feature_metadata: dict[str, Any]
     train_schema: str
-    class_counts: dict[str, int]
     first_row: dict[str, Any]
 
 
@@ -87,7 +84,6 @@ class DatasetScan:
     feature_names: tuple[str, ...]
     feature_metadata: dict[str, Any]
     train_schema: str
-    class_counts: dict[str, int]
     first_row: dict[str, Any]
 
 
@@ -104,21 +100,14 @@ def train_refiner(
         log_interval_rows=config.loader_log_interval_rows,
     )
     features = loaded.features
-    labels = loaded.labels
     boundary_delta_targets = loaded.boundary_delta_targets
+    boundary_delta_weights = loaded.boundary_delta_weights
     mask = loaded.mask
     feature_names = loaded.feature_names
     feature_metadata = loaded.feature_metadata
-    class_counts = loaded.class_counts
-    if not config.allow_single_class and (class_counts["merge_positive"] == 0 or class_counts["split_negative"] == 0):
-        raise ValueError(
-            "boundary refiner training requires both merge and split labels; "
-            f"got {class_counts}. Use --allow-single-class only for loader smoke."
-        )
 
     train_idx, val_idx = _split_indexes(features.shape[0], val_ratio=config.val_ratio, seed=config.seed)
     train_mask = mask[train_idx]
-    train_labels = labels[train_idx]
     train_row_mask = torch.zeros(features.shape[0], dtype=torch.bool)
     train_row_mask[train_idx] = True
     active_train_mask = train_row_mask[:, None] & mask
@@ -126,6 +115,17 @@ def train_refiner(
     feature_mean = active_train_features.mean(dim=0)
     feature_std = active_train_features.std(dim=0, unbiased=False).clamp_min(1e-6)
     del active_train_features
+    normalization_source = "train_dataset"
+    if config.preserve_init_normalization:
+        if not config.init_checkpoint:
+            raise ValueError("--preserve-init-normalization requires --init-checkpoint")
+        init_mean, init_std = _load_initial_checkpoint_normalization(
+            Path(config.init_checkpoint),
+            expected_feature_names=feature_names,
+        )
+        feature_mean = init_mean
+        feature_std = init_std
+        normalization_source = "init_checkpoint"
     features.sub_(feature_mean).div_(feature_std)
 
     device = _resolve_device(config.device)
@@ -155,7 +155,7 @@ def train_refiner(
             parameter.requires_grad_(False)
 
     train_dataset = Subset(
-        TensorDataset(features, labels, boundary_delta_targets, mask),
+        TensorDataset(features, boundary_delta_targets, boundary_delta_weights, mask),
         train_idx,
     )
     train_loader = DataLoader(
@@ -164,10 +164,7 @@ def train_refiner(
         shuffle=True,
         drop_last=False,
     )
-    positives = max(1.0, float(train_labels[train_mask].sum().item()))
-    negatives = max(1.0, float(train_mask.sum().item() - train_labels[train_mask].sum().item()))
-    merge_criterion = nn.BCEWithLogitsLoss(pos_weight=torch.tensor([negatives / positives], device=device))
-    delta_criterion = nn.SmoothL1Loss()
+    delta_criterion = nn.SmoothL1Loss(reduction="none")
     trainable_parameters = [parameter for parameter in model.parameters() if parameter.requires_grad]
     if not trainable_parameters:
         raise ValueError("no trainable parameters remain after applying freeze options")
@@ -182,28 +179,33 @@ def train_refiner(
     while step < config.max_steps:
         for (
             batch_features,
-            batch_labels,
             batch_boundary_delta_targets,
+            batch_boundary_delta_weights,
             batch_mask,
         ) in train_loader:
             step += 1
             optimizer.zero_grad(set_to_none=True)
             batch_mask = batch_mask.to(device)
             logits = model(batch_features.to(device), attention_mask=batch_mask.long())
-            merge_loss = merge_criterion(logits[..., 0][batch_mask], batch_labels.to(device)[batch_mask])
-            delta_pred = torch.tanh(logits[..., 1:3]) * float(config.boundary_delta_max_s)
+            delta_pred = torch.tanh(logits[..., :2]) * float(config.boundary_delta_max_s)
             delta_target = batch_boundary_delta_targets.to(device)
-            start_delta_loss = delta_criterion(
-                delta_pred[..., 0][batch_mask],
-                delta_target[..., 0][batch_mask],
+            delta_weight = batch_boundary_delta_weights.to(device)
+            start_delta_loss = _weighted_delta_loss(
+                delta_pred[..., 0],
+                delta_target[..., 0],
+                weights=delta_weight[..., 0],
+                mask=batch_mask,
+                criterion=delta_criterion,
             )
-            end_delta_loss = delta_criterion(
-                delta_pred[..., 1][batch_mask],
-                delta_target[..., 1][batch_mask],
+            end_delta_loss = _weighted_delta_loss(
+                delta_pred[..., 1],
+                delta_target[..., 1],
+                weights=delta_weight[..., 1],
+                mask=batch_mask,
+                criterion=delta_criterion,
             )
             loss = (
-                merge_loss
-                + float(config.start_delta_loss_weight) * start_delta_loss
+                float(config.start_delta_loss_weight) * start_delta_loss
                 + float(config.end_delta_loss_weight) * end_delta_loss
             )
             loss.backward()
@@ -221,7 +223,6 @@ def train_refiner(
         "config": asdict(config),
         "feature_names": list(feature_names),
         "feature_metadata": feature_metadata,
-        "class_counts": class_counts,
         "train_size": len(train_idx),
         "val_size": len(val_idx),
         "train_items": int(mask[train_idx].sum().item()),
@@ -230,21 +231,23 @@ def train_refiner(
         "train": _evaluate(
             model,
             features,
-            labels,
+            boundary_delta_targets,
+            boundary_delta_weights,
             mask,
             indexes=train_idx,
             device=device,
-            threshold=config.threshold,
+            boundary_delta_max_s=config.boundary_delta_max_s,
             batch_size=config.batch_size,
         ),
         "val": _evaluate(
             model,
             features,
-            labels,
+            boundary_delta_targets,
+            boundary_delta_weights,
             mask,
             indexes=val_idx,
             device=device,
-            threshold=config.threshold,
+            boundary_delta_max_s=config.boundary_delta_max_s,
             batch_size=config.batch_size,
         )
         if val_idx
@@ -261,7 +264,6 @@ def train_refiner(
         metadata={
             "trainer": "tools/boundary/train_refiner.py",
             "dataset_paths": [str(path) for path in dataset_paths],
-            "class_counts": class_counts,
             "train_schema": loaded.train_schema,
             "runtime_adapter": "frame_sequence_v1",
             "timing_policy": {
@@ -272,10 +274,13 @@ def train_refiner(
                 "boundary_delta_max_s": config.boundary_delta_max_s,
                 "start_delta_loss_weight": config.start_delta_loss_weight,
                 "end_delta_loss_weight": config.end_delta_loss_weight,
+                "delta_loss": "smooth_l1",
                 "source": "anime_nsfw_sfw_galgame_duration_distribution",
             },
             "boundary_delta_max_s": config.boundary_delta_max_s,
             "init_checkpoint": init_metadata,
+            "normalization_source": normalization_source,
+            "preserve_init_normalization": config.preserve_init_normalization,
             "freeze_backbone": config.freeze_backbone,
             **feature_metadata,
         },
@@ -286,7 +291,6 @@ def train_refiner(
 
     refiner = load_frame_sequence_refiner_checkpoint(
         checkpoint_path,
-        threshold=config.threshold,
         backbone_override=TRANSFORMERS_MAMBA2_BACKBONE,
     )
     smoke_sequence = _row_sequence(loaded.first_row, feature_names)
@@ -296,9 +300,9 @@ def train_refiner(
         "decision_count": len(smoke_decisions),
         "first_decision": (
             {
-                "merge": smoke_decisions[0].merge,
-                "score": smoke_decisions[0].score,
-                "reason": smoke_decisions[0].reason,
+                "source": smoke_decisions[0].source,
+                "start_refine_delta_s": smoke_decisions[0].start_refine_delta_s,
+                "end_refine_delta_s": smoke_decisions[0].end_refine_delta_s,
             }
             if smoke_decisions
             else None
@@ -312,7 +316,7 @@ def train_refiner(
     )
     print(f"checkpoint={checkpoint_path}")
     print(f"metrics={metrics_path}")
-    print(f"class_counts={json.dumps(class_counts, ensure_ascii=False, sort_keys=True)}")
+    print(f"items={metrics['train_items'] + metrics['val_items']}")
     return metrics
 
 
@@ -346,23 +350,28 @@ def _load_dataset_tensors_from_jsonl(
 ) -> LoadedRefinerDataset:
     scan = _scan_dataset(paths, log_interval_rows=log_interval_rows)
     features = torch.zeros((scan.row_count, scan.max_len, len(scan.feature_names)), dtype=torch.float32)
-    labels = torch.zeros((scan.row_count, scan.max_len), dtype=torch.float32)
     boundary_delta_targets = torch.zeros((scan.row_count, scan.max_len, 2), dtype=torch.float32)
+    boundary_delta_weights = torch.zeros((scan.row_count, scan.max_len, 2), dtype=torch.float32)
     mask = torch.zeros((scan.row_count, scan.max_len), dtype=torch.bool)
 
     row_index = 0
     for row in _iter_dataset_rows(paths):
         sequence = _row_sequence_array(row, scan.feature_names)
-        label_sequence = _row_label_sequence(row, expected_len=int(sequence.shape[0]))
         boundary_delta_sequence = _row_boundary_delta_target_sequence(
+            row,
+            expected_len=int(sequence.shape[0]),
+        )
+        boundary_delta_weight_sequence = _row_boundary_delta_weight_sequence(
             row,
             expected_len=int(sequence.shape[0]),
         )
         length = int(sequence.shape[0])
         features[row_index, :length].copy_(torch.from_numpy(sequence))
-        labels[row_index, :length].copy_(torch.tensor(label_sequence, dtype=torch.float32))
         boundary_delta_targets[row_index, :length].copy_(
             torch.tensor(boundary_delta_sequence, dtype=torch.float32)
+        )
+        boundary_delta_weights[row_index, :length].copy_(
+            torch.tensor(boundary_delta_weight_sequence, dtype=torch.float32)
         )
         mask[row_index, :length] = True
         row_index += 1
@@ -372,13 +381,12 @@ def _load_dataset_tensors_from_jsonl(
         raise ValueError(f"dataset changed while loading: expected {scan.row_count}, got {row_index}")
     return LoadedRefinerDataset(
         features=features,
-        labels=labels,
         boundary_delta_targets=boundary_delta_targets,
+        boundary_delta_weights=boundary_delta_weights,
         mask=mask,
         feature_names=scan.feature_names,
         feature_metadata=scan.feature_metadata,
         train_schema=scan.train_schema,
-        class_counts=scan.class_counts,
         first_row=scan.first_row,
     )
 
@@ -387,7 +395,7 @@ def _load_tensor_cache(path: Path, *, dataset_paths: Sequence[Path] | None = Non
     payload = torch.load(path, map_location="cpu", weights_only=False)
     if not isinstance(payload, Mapping):
         raise ValueError(f"tensor cache must be a mapping: {path}")
-    if str(payload.get("schema") or "") != "boundary_refiner_tensor_cache_v2":
+    if str(payload.get("schema") or "") != "boundary_refiner_tensor_cache_v5":
         raise ValueError(f"unsupported tensor cache schema: {payload.get('schema')!r}")
     if dataset_paths is not None:
         cached_sources = payload.get("dataset_sources")
@@ -397,43 +405,41 @@ def _load_tensor_cache(path: Path, *, dataset_paths: Sequence[Path] | None = Non
     if not isinstance(tensors, Mapping):
         raise ValueError("tensor cache missing tensors")
     features = _tensor_from_cache(tensors, "features", ndim=3, dtype=torch.float32)
-    labels = _tensor_from_cache(tensors, "labels", ndim=2, dtype=torch.float32)
     boundary_delta_targets = _tensor_from_cache(
         tensors,
         "boundary_delta_targets",
         ndim=3,
         dtype=torch.float32,
     )
+    boundary_delta_weights = _tensor_from_cache(
+        tensors,
+        "boundary_delta_weights",
+        ndim=3,
+        dtype=torch.float32,
+    )
     mask = _tensor_from_cache(tensors, "mask", ndim=2, dtype=torch.bool)
     row_count, max_len, feature_dim = features.shape
-    if labels.shape != (row_count, max_len):
-        raise ValueError("tensor cache labels shape mismatch")
     if boundary_delta_targets.shape != (row_count, max_len, 2):
         raise ValueError("tensor cache boundary_delta_targets shape mismatch")
+    if boundary_delta_weights.shape != (row_count, max_len, 2):
+        raise ValueError("tensor cache boundary_delta_weights shape mismatch")
     if mask.shape != (row_count, max_len):
         raise ValueError("tensor cache mask shape mismatch")
     feature_names = tuple(str(name) for name in payload.get("feature_names") or ())
     if len(feature_names) != feature_dim:
         raise ValueError("tensor cache feature_names length mismatch")
     feature_metadata = dict(payload.get("feature_metadata") or {})
-    class_counts = dict(payload.get("class_counts") or {})
-    if set(class_counts) != {"merge_positive", "split_negative"}:
-        raise ValueError("tensor cache class_counts must contain merge_positive and split_negative")
     first_row = dict(payload.get("first_row") or {})
     if not first_row:
         raise ValueError("tensor cache missing first_row")
     return LoadedRefinerDataset(
         features=features,
-        labels=labels,
         boundary_delta_targets=boundary_delta_targets,
+        boundary_delta_weights=boundary_delta_weights,
         mask=mask,
         feature_names=feature_names,
         feature_metadata=feature_metadata,
         train_schema=str(payload.get("train_schema") or ""),
-        class_counts={
-            "merge_positive": int(class_counts["merge_positive"]),
-            "split_negative": int(class_counts["split_negative"]),
-        },
         first_row=first_row,
     )
 
@@ -462,17 +468,16 @@ def _write_tensor_cache(
     path.parent.mkdir(parents=True, exist_ok=True)
     torch.save(
         {
-            "schema": "boundary_refiner_tensor_cache_v2",
+            "schema": "boundary_refiner_tensor_cache_v5",
             "dataset_sources": _dataset_source_fingerprints(dataset_paths),
             "feature_names": list(loaded.feature_names),
             "feature_metadata": loaded.feature_metadata,
             "train_schema": loaded.train_schema,
-            "class_counts": loaded.class_counts,
             "first_row": loaded.first_row,
             "tensors": {
                 "features": loaded.features.contiguous(),
-                "labels": loaded.labels.contiguous(),
                 "boundary_delta_targets": loaded.boundary_delta_targets.contiguous(),
+                "boundary_delta_weights": loaded.boundary_delta_weights.contiguous(),
                 "mask": loaded.mask.contiguous(),
             },
         },
@@ -506,8 +511,8 @@ def _load_initial_checkpoint(
     if not isinstance(payload, Mapping):
         raise ValueError("init checkpoint must be a mapping")
     schema = str(payload.get("schema") or "")
-    if schema != "boundary_refiner_v4":
-        raise ValueError(f"init checkpoint schema must be boundary_refiner_v4, got {schema!r}")
+    if schema != "boundary_refiner_v5":
+        raise ValueError(f"init checkpoint schema must be boundary_refiner_v5, got {schema!r}")
     model_config = dict(payload.get("model_config") or {})
     if int(model_config.get("input_dim", -1)) != int(expected_input_dim):
         raise ValueError(
@@ -537,18 +542,45 @@ def _load_initial_checkpoint(
     }
 
 
+def _load_initial_checkpoint_normalization(
+    checkpoint_path: Path,
+    *,
+    expected_feature_names: Sequence[str],
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if not checkpoint_path.exists():
+        raise FileNotFoundError(f"init checkpoint not found: {checkpoint_path}")
+    payload = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+    if not isinstance(payload, Mapping):
+        raise ValueError("init checkpoint must be a mapping")
+    checkpoint_feature_names = tuple(str(name) for name in payload.get("feature_names") or ())
+    if checkpoint_feature_names != tuple(expected_feature_names):
+        raise ValueError("init checkpoint feature_names do not match training dataset")
+    mean = _normalization_tensor(payload.get("feature_mean"), expected_len=len(checkpoint_feature_names), name="feature_mean")
+    std = _normalization_tensor(payload.get("feature_std"), expected_len=len(checkpoint_feature_names), name="feature_std")
+    return mean, std.clamp_min(1e-6)
+
+
+def _normalization_tensor(raw: object, *, expected_len: int, name: str) -> torch.Tensor:
+    if not isinstance(raw, (list, tuple)) or len(raw) != expected_len:
+        raise ValueError(f"init checkpoint {name} length mismatch")
+    values = torch.tensor([float(value) for value in raw], dtype=torch.float32)
+    if not bool(torch.isfinite(values).all().item()):
+        raise ValueError(f"init checkpoint {name} must be finite")
+    return values
+
+
 def _scan_dataset(paths: Sequence[Path], *, log_interval_rows: int = 0) -> DatasetScan:
     row_count = 0
     max_len = 0
     feature_names: tuple[str, ...] | None = None
     first_row: dict[str, Any] | None = None
-    class_counts = {"merge_positive": 0, "split_negative": 0}
     train_schemas: set[str] = set()
     feature_schema_values: set[str] = set()
     feature_hash_values: set[str] = set()
     expected_signature: dict[str, Any] | None = None
 
     for row in _iter_dataset_rows(paths):
+        _validate_v5_delta_row(row, row_index=row_count)
         if first_row is None:
             first_row = dict(row)
         row_names = _row_feature_names(row, feature_names)
@@ -557,11 +589,8 @@ def _scan_dataset(paths: Sequence[Path], *, log_interval_rows: int = 0) -> Datas
         elif row_names != feature_names:
             raise ValueError(f"feature_names mismatch at row {row_count}: {row_names} != {feature_names}")
         sequence_len = _row_sequence_length(row, feature_names)
-        label_sequence = _row_label_sequence(row, expected_len=sequence_len)
         _row_boundary_delta_target_sequence(row, expected_len=sequence_len)
-        row_positive = sum(1 for value in label_sequence if value >= 0.5)
-        class_counts["merge_positive"] += row_positive
-        class_counts["split_negative"] += len(label_sequence) - row_positive
+        _row_boundary_delta_weight_sequence(row, expected_len=sequence_len)
         max_len = max(max_len, sequence_len)
         train_schemas.add(str(row.get("schema") or ""))
         if row.get("feature_schema"):
@@ -594,7 +623,6 @@ def _scan_dataset(paths: Sequence[Path], *, log_interval_rows: int = 0) -> Datas
             expected_signature=expected_signature,
         ),
         train_schema=_train_schema_from_values(train_schemas),
-        class_counts=class_counts,
         first_row=first_row,
     )
 
@@ -614,7 +642,7 @@ def _row_feature_names(row: Mapping[str, Any], fallback: tuple[str, ...] | None 
     elif fallback is not None:
         names = fallback
     else:
-        raise ValueError("boundary refiner v4 rows require feature_names")
+        raise ValueError("boundary refiner v5 rows require feature_names")
     if not names:
         raise ValueError("dataset feature_names must not be empty")
     return names
@@ -626,7 +654,37 @@ def _train_schema(rows: Sequence[Mapping[str, Any]]) -> str:
 
 
 def _train_schema_from_values(schemas: set[str]) -> str:
-    return schemas.pop() if len(schemas) == 1 else "mixed_boundary_refiner_dataset"
+    if schemas == {"boundary_refiner_frame_sequence_dataset_v5"}:
+        return "boundary_refiner_frame_sequence_dataset_v5"
+    raise ValueError(f"unsupported boundary refiner dataset schema values: {sorted(schemas)}")
+
+
+def _validate_v5_delta_row(row: Mapping[str, Any], *, row_index: int) -> None:
+    schema = str(row.get("schema") or "")
+    if schema != "boundary_refiner_frame_sequence_dataset_v5":
+        raise ValueError(
+            "boundary refiner training only accepts "
+            f"'boundary_refiner_frame_sequence_dataset_v5', got {schema!r} at row {row_index}"
+        )
+    stale_fields = (
+        "sequence_labels",
+        "sequence_context_targets",
+        "merge_positive",
+        "split_negative",
+        "boundary_merge_prob",
+        "boundary_split_prob",
+        "boundary_decision_merge",
+        "merge_label",
+        "merge_weight",
+        "split_label",
+        "split_weight",
+    )
+    present = [field for field in stale_fields if field in row]
+    if present:
+        raise ValueError(
+            "boundary refiner v5 rows must not contain old merge/split/context fields "
+            f"at row {row_index}: {present}"
+        )
 
 
 def _feature_metadata_from_scan(
@@ -686,7 +744,7 @@ def _row_sequence_length(row: Mapping[str, Any], feature_names: tuple[str, ...])
                 expected_feature_names=row.get("feature_names") or feature_names,
             )
         return len(raw_sequence)
-    raise ValueError("boundary refiner v4 rows require sequence_features")
+    raise ValueError("boundary refiner v5 rows require sequence_features")
 
 
 def _row_sequence_array(row: Mapping[str, Any], feature_names: tuple[str, ...]) -> np.ndarray:
@@ -697,23 +755,11 @@ def _row_sequence_array(row: Mapping[str, Any], feature_names: tuple[str, ...]) 
             feature_names=feature_names,
             expected_feature_names=row.get("feature_names") or feature_names,
         ).astype(np.float32, copy=False)
-    raise ValueError("boundary refiner v4 rows require sequence_features")
+    raise ValueError("boundary refiner v5 rows require sequence_features")
 
 
 def _row_sequence(row: Mapping[str, Any], feature_names: tuple[str, ...]) -> list[list[float]]:
     return _row_sequence_array(row, feature_names).astype(float).tolist()
-
-
-def _row_label_sequence(row: Mapping[str, Any], *, expected_len: int) -> list[float]:
-    raw = row.get("sequence_labels")
-    if isinstance(raw, list) and raw:
-        if len(raw) != expected_len:
-            raise ValueError("sequence_labels length must match sequence_features length")
-        labels = [float(value) for value in raw]
-        if any(not math.isfinite(value) for value in labels):
-            raise ValueError("sequence_labels must not contain NaN or inf")
-        return labels
-    raise ValueError("boundary refiner v4 rows require sequence_labels")
 
 
 def _row_boundary_delta_target_sequence(row: Mapping[str, Any], *, expected_len: int) -> list[list[float]]:
@@ -732,7 +778,47 @@ def _row_boundary_delta_target_sequence(row: Mapping[str, Any], *, expected_len:
                 raise ValueError("sequence_boundary_delta_targets must not contain NaN or inf")
             targets.append([start_delta, end_delta])
         return targets
-    raise ValueError("boundary refiner v4 rows require sequence_boundary_delta_targets")
+    raise ValueError("boundary refiner v5 rows require sequence_boundary_delta_targets")
+
+
+def _row_boundary_delta_weight_sequence(row: Mapping[str, Any], *, expected_len: int) -> list[list[float]]:
+    raw = row.get("sequence_boundary_delta_weights")
+    if raw is None:
+        return [[1.0, 1.0] for _ in range(expected_len)]
+    if isinstance(raw, list) and raw:
+        if len(raw) != expected_len:
+            raise ValueError("sequence_boundary_delta_weights length must match sequence_features length")
+        weights: list[list[float]] = []
+        for item in raw:
+            if not isinstance(item, list) or len(item) != 2:
+                raise ValueError(
+                    "sequence_boundary_delta_weights items must be [start_weight, end_weight]"
+                )
+            start_weight, end_weight = float(item[0]), float(item[1])
+            if (
+                not math.isfinite(start_weight)
+                or not math.isfinite(end_weight)
+                or start_weight < 0.0
+                or end_weight < 0.0
+            ):
+                raise ValueError("sequence_boundary_delta_weights must be finite non-negative values")
+            weights.append([start_weight, end_weight])
+        return weights
+    raise ValueError("sequence_boundary_delta_weights must be omitted or a non-empty list")
+
+
+def _weighted_delta_loss(
+    pred: torch.Tensor,
+    target: torch.Tensor,
+    *,
+    weights: torch.Tensor,
+    mask: torch.Tensor,
+    criterion: nn.Module,
+) -> torch.Tensor:
+    active_weights = weights * mask.to(dtype=weights.dtype)
+    denominator = active_weights.sum().clamp_min(1.0)
+    losses = criterion(pred, target)
+    return (losses * active_weights).sum() / denominator
 
 
 def _split_indexes(count: int, *, val_ratio: float, seed: int) -> tuple[list[int], list[int]]:
@@ -747,12 +833,13 @@ def _split_indexes(count: int, *, val_ratio: float, seed: int) -> tuple[list[int
 def _evaluate(
     model: BoundarySequenceClassifier,
     features: torch.Tensor,
-    labels: torch.Tensor,
+    boundary_delta_targets: torch.Tensor,
+    boundary_delta_weights: torch.Tensor,
     mask: torch.Tensor,
     *,
     indexes: Sequence[int] | None = None,
     device: torch.device,
-    threshold: float,
+    boundary_delta_max_s: float,
     batch_size: int = 256,
 ) -> dict[str, Any]:
     if features.numel() == 0:
@@ -762,10 +849,16 @@ def _evaluate(
     if not indexes:
         return {}
     model.eval()
-    tp = tn = fp = fn = count = 0
-    prob_sum = 0.0
-    prob_min = math.inf
-    prob_max = -math.inf
+    count = 0
+    start_weighted_abs_error = 0.0
+    end_weighted_abs_error = 0.0
+    start_weight_sum = 0.0
+    end_weight_sum = 0.0
+    max_abs_error = 0.0
+    start_error_parts: list[torch.Tensor] = []
+    end_error_parts: list[torch.Tensor] = []
+    start_weight_parts: list[torch.Tensor] = []
+    end_weight_parts: list[torch.Tensor] = []
     with torch.inference_mode():
         for start in range(0, len(indexes), max(1, batch_size)):
             batch_indexes = list(indexes[start : start + max(1, batch_size)])
@@ -776,39 +869,101 @@ def _evaluate(
                 features[batch_indexes].to(device),
                 attention_mask=batch_mask.to(device).long(),
             ).detach().cpu()
-            if logits.ndim == 3:
-                logits = logits[..., 0]
-            logits = logits[batch_mask]
-            probs = torch.sigmoid(logits)
-            truth = labels[batch_indexes][batch_mask] >= 0.5
-            preds = probs >= threshold
-            tp += int(torch.logical_and(preds, truth).sum().item())
-            tn += int(torch.logical_and(~preds, ~truth).sum().item())
-            fp += int(torch.logical_and(preds, ~truth).sum().item())
-            fn += int(torch.logical_and(~preds, truth).sum().item())
-            batch_count = int(truth.numel())
-            count += batch_count
-            prob_sum += float(probs.sum().item())
-            prob_min = min(prob_min, float(probs.min().item()))
-            prob_max = max(prob_max, float(probs.max().item()))
+            pred = torch.tanh(logits[..., :2]) * float(boundary_delta_max_s)
+            target = boundary_delta_targets[batch_indexes]
+            weights = boundary_delta_weights[batch_indexes]
+            active = batch_mask.unsqueeze(-1)
+            abs_error = torch.abs(pred - target) * active
+            start_weights = weights[..., 0] * batch_mask.to(dtype=weights.dtype)
+            end_weights = weights[..., 1] * batch_mask.to(dtype=weights.dtype)
+            start_weighted_abs_error += float((abs_error[..., 0] * start_weights).sum().item())
+            end_weighted_abs_error += float((abs_error[..., 1] * end_weights).sum().item())
+            start_weight_sum += float(start_weights.sum().item())
+            end_weight_sum += float(end_weights.sum().item())
+            count += int(batch_mask.sum().item())
+            start_active = batch_mask & (start_weights > 0.0)
+            end_active = batch_mask & (end_weights > 0.0)
+            if bool(start_active.any().item()):
+                start_error_parts.append((pred[..., 0] - target[..., 0])[start_active].detach().cpu())
+                start_weight_parts.append(start_weights[start_active].detach().cpu())
+            if bool(end_active.any().item()):
+                end_error_parts.append((pred[..., 1] - target[..., 1])[end_active].detach().cpu())
+                end_weight_parts.append(end_weights[end_active].detach().cpu())
+            if bool(batch_mask.any().item()):
+                max_abs_error = max(max_abs_error, float(abs_error[active.expand_as(abs_error)].max().item()))
     if count == 0:
         return {}
-    precision = tp / max(1, tp + fp)
-    recall = tp / max(1, tp + fn)
+    start_error_stats = _boundary_delta_error_stats(
+        _cat_or_empty(start_error_parts),
+        _cat_or_empty(start_weight_parts),
+    )
+    end_error_stats = _boundary_delta_error_stats(
+        _cat_or_empty(end_error_parts),
+        _cat_or_empty(end_weight_parts),
+    )
     return {
         "count": count,
-        "accuracy": (tp + tn) / max(1, count),
-        "merge_precision": precision,
-        "merge_recall": recall,
-        "merge_f1": (2 * precision * recall / max(1e-9, precision + recall)),
-        "tp": tp,
-        "tn": tn,
-        "fp": fp,
-        "fn": fn,
-        "prob_mean": prob_sum / count,
-        "prob_min": prob_min,
-        "prob_max": prob_max,
+        "start_delta_mae_s": start_weighted_abs_error / max(1e-9, start_weight_sum),
+        "end_delta_mae_s": end_weighted_abs_error / max(1e-9, end_weight_sum),
+        "start_weight_sum": start_weight_sum,
+        "end_weight_sum": end_weight_sum,
+        "max_abs_delta_error_s": max_abs_error,
+        "start_delta_error": start_error_stats,
+        "end_delta_error": end_error_stats,
     }
+
+
+def _cat_or_empty(parts: Sequence[torch.Tensor]) -> torch.Tensor:
+    if not parts:
+        return torch.empty((0,), dtype=torch.float32)
+    return torch.cat([part.to(dtype=torch.float32).flatten() for part in parts], dim=0)
+
+
+def _boundary_delta_error_stats(
+    errors: torch.Tensor,
+    weights: torch.Tensor,
+) -> dict[str, Any]:
+    errors = errors.detach().cpu().to(dtype=torch.float32).flatten()
+    weights = weights.detach().cpu().to(dtype=torch.float32).flatten()
+    if errors.numel() != weights.numel():
+        raise ValueError("errors and weights must have the same length")
+    if errors.numel() == 0:
+        return {
+            "count": 0,
+            "weight_sum": 0.0,
+        }
+    finite = torch.isfinite(errors) & torch.isfinite(weights) & (weights > 0.0)
+    errors = errors[finite]
+    weights = weights[finite]
+    if errors.numel() == 0:
+        return {
+            "count": 0,
+            "weight_sum": 0.0,
+        }
+    abs_errors = errors.abs()
+    weight_sum = weights.sum().clamp_min(1e-9)
+    return {
+        "count": int(errors.numel()),
+        "weight_sum": float(weights.sum().item()),
+        "mean_error_s": float((errors * weights).sum().item() / float(weight_sum.item())),
+        "mae_s": float((abs_errors * weights).sum().item() / float(weight_sum.item())),
+        "signed_error_p05_s": _quantile(errors, 0.05),
+        "signed_error_p10_s": _quantile(errors, 0.10),
+        "signed_error_p50_s": _quantile(errors, 0.50),
+        "signed_error_p90_s": _quantile(errors, 0.90),
+        "signed_error_p95_s": _quantile(errors, 0.95),
+        "abs_error_p50_s": _quantile(abs_errors, 0.50),
+        "abs_error_p90_s": _quantile(abs_errors, 0.90),
+        "abs_error_p95_s": _quantile(abs_errors, 0.95),
+        "abs_error_p99_s": _quantile(abs_errors, 0.99),
+        "max_abs_error_s": float(abs_errors.max().item()),
+    }
+
+
+def _quantile(values: torch.Tensor, q: float) -> float:
+    if values.numel() == 0:
+        return 0.0
+    return float(torch.quantile(values.to(dtype=torch.float32), float(q)).item())
 
 
 def _resolve_device(requested: str) -> torch.device:
@@ -843,8 +998,6 @@ def _validate_config(config: TrainRefinerConfig) -> None:
         raise ValueError("n_groups must be positive")
     if config.chunk_size <= 0:
         raise ValueError("chunk_size must be positive")
-    if not 0.0 <= config.threshold <= 1.0:
-        raise ValueError("threshold must be in [0, 1]")
     if config.log_interval_steps < 0:
         raise ValueError("log_interval_steps must be non-negative")
     if config.target_domain_speedup <= 0.0:
@@ -883,24 +1036,23 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--n-groups", type=int, default=2)
     parser.add_argument("--chunk-size", type=int, default=8)
     parser.add_argument("--unidirectional", action="store_true")
-    parser.add_argument("--threshold", type=float, default=0.5)
-    parser.add_argument(
-        "--allow-single-class",
-        action="store_true",
-        help="Only for loader smoke; formal training should keep both merge and split labels.",
-    )
     parser.add_argument("--log-interval-steps", type=int, default=20)
     parser.add_argument("--target-domain-speedup", type=float, default=1.5)
     parser.add_argument("--target-chunk-s", type=float, default=3.0)
     parser.add_argument("--max-core-chunk-s", type=float, default=5.0)
     parser.add_argument("--min-chunk-s", type=float, default=0.4)
     parser.add_argument("--boundary-delta-max-s", type=float, default=DEFAULT_BOUNDARY_DELTA_MAX_S)
-    parser.add_argument("--start-delta-loss-weight", type=float, default=0.60)
-    parser.add_argument("--end-delta-loss-weight", type=float, default=0.35)
+    parser.add_argument("--start-delta-loss-weight", type=float, default=1.00)
+    parser.add_argument("--end-delta-loss-weight", type=float, default=0.60)
     parser.add_argument(
         "--init-checkpoint",
         default="",
-        help="Optional boundary_refiner_v4 checkpoint used to initialize weights.",
+        help="Optional boundary_refiner_v5 checkpoint used to initialize weights.",
+    )
+    parser.add_argument(
+        "--preserve-init-normalization",
+        action="store_true",
+        help="Reuse feature_mean/std from --init-checkpoint instead of recomputing them from the fine-tune dataset.",
     )
     parser.add_argument(
         "--freeze-backbone",
@@ -945,8 +1097,6 @@ def main(argv: list[str] | None = None) -> None:
             n_groups=args.n_groups,
             chunk_size=args.chunk_size,
             bidirectional=not args.unidirectional,
-            threshold=args.threshold,
-            allow_single_class=args.allow_single_class,
             log_interval_steps=args.log_interval_steps,
             target_domain_speedup=args.target_domain_speedup,
             target_chunk_s=args.target_chunk_s,
@@ -956,6 +1106,7 @@ def main(argv: list[str] | None = None) -> None:
             start_delta_loss_weight=args.start_delta_loss_weight,
             end_delta_loss_weight=args.end_delta_loss_weight,
             init_checkpoint=args.init_checkpoint,
+            preserve_init_normalization=args.preserve_init_normalization,
             freeze_backbone=args.freeze_backbone,
             tensor_cache_path=args.tensor_cache_path,
             loader_log_interval_rows=args.loader_log_interval_rows,
