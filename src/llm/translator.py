@@ -1008,22 +1008,28 @@ def _translate_segments_batched(
                 pending_batches.append((batch_index, batch_segments))
 
     _raise_if_cancelled(cancel_event)
-    if pending_batches and use_full_json_prefix and TRANSLATION_PREFIX_WARMUP:
+    if pending_batches and TRANSLATION_PREFIX_WARMUP:
         warmup_started = time.perf_counter()
         warmup_usages: list[dict] = []
+        warmup_kwargs = {
+            "batch_index": 0,
+            "extra_glossary": extra_glossary,
+            "target_lang": target_lang,
+            "glossary": glossary,
+            "requested_ids": [],
+            "warmup": True,
+        }
+        if use_full_json_prefix:
+            warmup_kwargs["full_source_payload"] = full_source_payload
+        else:
+            warmup_kwargs["source_payload_override"] = "[]"
         warmup_messages = _build_batch_messages(
             [],
             full_context,
             0,
             character_reference,
             0,
-            batch_index=0,
-            extra_glossary=extra_glossary,
-            target_lang=target_lang,
-            glossary=glossary,
-            full_source_payload=full_source_payload,
-            requested_ids=[],
-            warmup=True,
+            **warmup_kwargs,
         )
         try:
             _raise_if_cancelled(cancel_event)
@@ -1043,7 +1049,11 @@ def _translate_segments_batched(
                 "mode": "translation_prefix_warmup",
                 "request_count": 1,
                 "source_payload_chars": 0,
-                "global_context_chars": len(full_source_payload),
+                "global_context_chars": (
+                    len(full_source_payload)
+                    if use_full_json_prefix
+                    else len(full_context)
+                ),
                 "prefix_mode": prefix_mode,
                 "requested_ids": [],
                 "is_warmup": True,
@@ -1062,7 +1072,11 @@ def _translate_segments_batched(
                 "mode": "translation_prefix_warmup_failed",
                 "request_count": 1,
                 "source_payload_chars": 0,
-                "global_context_chars": len(full_source_payload),
+                "global_context_chars": (
+                    len(full_source_payload)
+                    if use_full_json_prefix
+                    else len(full_context)
+                ),
                 "prefix_mode": prefix_mode,
                 "requested_ids": [],
                 "is_warmup": True,
@@ -1686,8 +1700,8 @@ def _auto_translation_batch_size(segment_count: int, max_workers: int) -> int:
     context_window_cues = 25
     context_overlap_cues = 10
     stride_cues = max(1, context_window_cues - context_overlap_cues)
-    batch_size = context_window_cues + stride_cues * workers * 3
-    return min(count, max(context_window_cues, min(200, batch_size)))
+    batch_size = context_window_cues + stride_cues * workers * 6
+    return min(count, max(context_window_cues, min(400, batch_size)))
 
 
 _serialize_segments = prompt_module._serialize_segments

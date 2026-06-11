@@ -149,7 +149,7 @@ async def _test_config_lists_recommended_asr_backend_first(monkeypatch):
     assert payload["recommended_asr_backend"] == config_routes.RECOMMENDED_ASR_BACKEND
     assert payload["engine_defaults"]["asr_backend"] == config_routes.RECOMMENDED_ASR_BACKEND
     assert "translation_batch_size" not in payload["defaults"]
-    assert payload["defaults"]["translation_max_workers"] == 4
+    assert payload["defaults"]["translation_max_workers"] == 16
     assert "show_speaker" not in payload["defaults"]
     assert set(payload["backends"]) == set(config_routes.BACKENDS)
 
@@ -543,7 +543,8 @@ async def _test_jobs_api_rejects_invalid_job_spec(tmp_path, monkeypatch):
             invalid_payloads = [
                 {"video_paths": []},
                 {"video_paths": ["sample.mp4"], "vad_threshold": 1.5},
-                {"video_paths": ["sample.mp4"], "translation_max_workers": 5},
+                {"video_paths": ["sample.mp4"], "translation_max_workers": 0},
+                {"video_paths": ["sample.mp4"], "translation_max_workers": 65},
                 {"video_paths": ["sample.mp4"], "translation_max_workers": 99},
             ]
             for payload in invalid_payloads:

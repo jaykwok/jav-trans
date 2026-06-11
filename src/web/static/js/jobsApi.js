@@ -36,10 +36,9 @@ export async function fetchAllJobs() {
 
 export function startJobPolling() {
   setInterval(() => {
-    // Only poll when SSE is not open (disconnected / reconnecting) to avoid redundant requests.
-    // When SSE is healthy, per-event fetchJob() calls in sse.js already keep state fresh.
-    const sseOpen = state.sse && state.sse.readyState === 1; // 1 = EventSource.OPEN
-    if (sseOpen) return;
+    // SSE progress can arrive just before the final job state is persisted.
+    // Keep a lightweight reconciliation poll while jobs are active so a missed
+    // or early final event cannot leave the UI stuck in an active state.
     const hasActive = Object.values(state.jobs).some(j => ACTIVE_STATUSES.has(j.status));
     if (hasActive) fetchAllJobs();
   }, 3000);

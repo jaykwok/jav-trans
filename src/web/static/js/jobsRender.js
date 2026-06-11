@@ -60,7 +60,6 @@ export function renderJobs() {
       card = document.createElement('div');
       card.className = 'job-card';
       card.dataset.id = id;
-      jobArea.insertBefore(card, jobArea.firstChild);
     }
     const translated = job.progress?.translated ?? job.progress?.extra?.translated;
     const expected = job.progress?.expected ?? job.progress?.extra?.expected;
@@ -159,6 +158,8 @@ export function renderJobs() {
         ${CLEARABLE.has(job.status) ? `<button class="btn-sm btn-remove" data-remove="${escHtml(id)}" title="从列表删除">✕ 删除</button>` : ''}
       </div>
       ${errorMsg}`;
+    // Keep the visual order aligned with the API's FIFO job order.
+    jobArea.appendChild(card);
   });
 }
 

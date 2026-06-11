@@ -50,11 +50,11 @@ def test_split_into_batches():
 def test_auto_translation_batch_size_uses_window_overlap_and_workers():
     assert translator._auto_translation_batch_size(0, 4) == 0
     assert translator._auto_translation_batch_size(10, 4) == 10
-    assert translator._auto_translation_batch_size(100, 1) == 70
+    assert translator._auto_translation_batch_size(100, 1) == 100
     assert translator._auto_translation_batch_size(100, 4) == 100
-    assert translator._auto_translation_batch_size(450, 1) == 70
-    assert translator._auto_translation_batch_size(450, 4) == 200
-    assert translator._auto_translation_batch_size(5000, 8) == 200
+    assert translator._auto_translation_batch_size(450, 1) == 115
+    assert translator._auto_translation_batch_size(450, 4) == 385
+    assert translator._auto_translation_batch_size(5000, 8) == 400
 
 
 def test_translate_segments_single_request_when_below_threshold(monkeypatch):
@@ -534,6 +534,49 @@ def test_batch_warmup_runs_before_pending_batches(monkeypatch):
     assert timings[0]["is_warmup"] is True
     assert timings[0]["requested_ids"] == []
     assert timings[0]["mode"] == "translation_prefix_warmup"
+
+
+def test_batch_warmup_also_runs_for_summary_fallback(monkeypatch):
+    calls: list[dict] = []
+
+    def fake_chat(messages, expected_count=0, on_progress=None, **_kwargs):
+        requested_ids = _requested_ids_from_messages(messages)
+        calls.append(
+            {
+                "expected_count": expected_count,
+                "requested_ids": requested_ids,
+                "system": messages[0]["content"],
+            }
+        )
+        return json.dumps(
+            {
+                "translations": [
+                    {"id": idx, "text": f"zh-{idx}"}
+                    for idx in requested_ids
+                ]
+            },
+            ensure_ascii=False,
+        )
+
+    monkeypatch.setattr(translator, "_chat_with_reasoning", fake_chat)
+    monkeypatch.setattr(translator, "_auto_translation_batch_size", lambda *_args: 2)
+    monkeypatch.setattr(translator, "TRANSLATION_FULL_JSON_PREFIX_MAX_CHARS", 1)
+
+    zh_texts, timings, retry_events = translator.translate_segments(
+        _segments(4),
+        max_workers=2,
+        cache_path="",
+        target_lang="简体中文",
+        glossary="",
+    )
+
+    assert retry_events == []
+    assert zh_texts == ["zh-0", "zh-1", "zh-2", "zh-3"]
+    assert calls[0]["expected_count"] == 0
+    assert calls[0]["requested_ids"] == []
+    assert calls[0]["system"] == calls[1]["system"] == calls[2]["system"]
+    assert timings[0]["mode"] == "translation_prefix_warmup"
+    assert timings[0]["prefix_mode"] == "summary_fallback"
 
 
 def test_translation_repair_pass_does_not_fix_asr_fragments(monkeypatch):
