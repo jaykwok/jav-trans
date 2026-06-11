@@ -48,7 +48,7 @@ SpeechBoundary-JA frame scores
 
 ## Backlog
 
-- true v5 downstream gate：匿名样片 A / 匿名样片 A GPU 闭环已完成，指标略优于 v4 32768；下一步是人工字幕审计和 held-out 全片复核，确认是否真正优于 v4。
+- true v5 downstream gate：匿名样片 A GPU 闭环已完成，指标略优于 v4 32768；v5 本地字幕审计页已生成，下一步是人工审计该页并补 held-out 全片复核，确认是否真正优于 v4。
 - real-domain silver mining v5：只从 forced-aligner 成功、QC ok、非 nonlexical、非明显短促/重复 vocal 的样本挖 `speech_core -> word.start/end`，作为后续 display-boundary 监督；不能跳过人工审计。
 - ASR/QC dense feedback：在 supervised v5 稳定后，再考虑 preliminary ASR text、token confidence、local CER、aligner sentinel、fallback duration、ASR empty、repeat-loop 和 QC reject 作为 dense reward / DPO / RL 信号。
 - 直接字幕边界 / timeline model：未来研究不依赖 forced aligner 的字幕文本 + 时间轴边界模型，forced aligner 只作为 teacher / audit signal。
@@ -69,6 +69,7 @@ SpeechBoundary-JA frame scores
 - 2026-06-11 true v5 delta-only 32768 训练落地：按断兼容要求清理旧 merge-era 生成训练产物，`agents/temp/speech-boundary-ja/v4-core-32768-hardmix` 和旧 full-video silver refiner train/data 已移到 `agents/rm/20260610_v4_merge_weight_training_artifacts/`；`tools/boundary/train_refiner.py` 新增 fail-fast guard，只接受 `boundary_refiner_frame_sequence_dataset_v5`，并拒绝 `sequence_labels`、`sequence_context_targets`、`merge_positive`、`split_negative`、`boundary_merge_prob`、`boundary_split_prob`、`boundary_decision_merge`、`merge_label`、`merge_weight`、`split_label`、`split_weight` 等旧字段。新数据生成到 `agents/temp/speech-boundary-ja/v5-delta-only-32768/`：mixed source `196608` 条，组成为 `nsfw=88474`、`sfw=58982`、`galgame=49152`；synthetic `32768` 条，skipped `4`，`cut_point_segment_count=85192`、`cut_drop_zone_count=77820`、`overlap_mix_count=6558`，gap modes 为 `fade_noise=58967`、`hum=26161`、`silence=58851`、`white_noise=52494`。CUDA/bf16/no-compress feature cache 使用 `jaykwok/Qwen3-ASR-0.6B-JA-Anime-Galgame`，`cached=32768`、`errors=0`、`skipped=0`；frame sequence v5 输出 `32768` sequences、`167928` items，`start_supervised=167928`、`end_supervised=167928`，label reasons 为 `boundary_cut_point=46308`、`boundary_gap_zone=74201`、`boundary_long_gap=2585`、`boundary_overlap=44834`，feature dim `630`、hash `cb44d7804ad4eaec9e5e4db80123f817a99650fa`。训练从零开始，CUDA `600` steps、batch `512`、lr `5e-4`、weight decay `0.01`、hidden/layers/state `128/2/32`、start/end loss weights `1.0/0.6`、target/core/min `3.0/5.0/0.4s`；last loss `0.003754`，train start/end MAE `0.0576/0.0591s`，val start/end MAE `0.0616/0.0603s`。checkpoint schema `boundary_refiner_v5`、output dim `2`、backbone `transformers.Mamba2Model`、runtime adapter `frame_sequence_v1`，已替换默认 `src/boundary/checkpoints/boundary_refiner.pt`；补齐顶层 feature metadata 镜像后的 sha256 为 `503d7e2299460aff555e02cba2b840c59195e577719bd0637a5ae98657ef919f`。替换后聚焦回归 `tests/test_boundary_refiner.py tests/test_boundary_refiner_training.py tests/test_boundary_cache.py tests/test_boundary_planner.py tests/test_chunk_packer.py tests/test_pipeline_chunk_config_runtime.py tests/test_pipeline_chunk_packing.py` 为 `50 passed`；补 metadata 镜像后 `tests/test_boundary_refiner.py tests/test_boundary_refiner_training.py` 为 `18 passed`。不能只凭 synthetic MAE 判定优劣，仍需真实 downstream 与人工审计 gate。
 - 2026-06-11 true v5 delta-only 匿名样片 A GPU 闭环完成：命令使用默认 `src/boundary/checkpoints/boundary_refiner.pt`、`jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame`、ASR batch `64`、aligner batch `128`、日文-only、不翻译、`--no-boundary-cache` 强制重算，输出 `agents/temp/speech-boundary-ja/sample-a-true-v5-delta-only-qwen17b-gpu/`。结果：`transcript_chunks=3199`、最终 `segments/blocks=2260`，pipeline total `297.9s`，整体 elapsed `300.1s`，ASR model load `8.26s`、ASR transcription `162.51s`、alignment `52.00s`、ASR+Alignment `254.1s`。质量报告：subtitle duration p50/p90/p95/max `1.09/2.171/2.473/3.438s`，long segment `0`，short ratio `0.158`，micro `81`，overlap `3` / `0.124s` total / `0.049s` max，per-min subtitle count `25.13`，density>4cps `1841`。ASR QC：reject `5`、warn `257`、empty-for-speech `245`、review uncertain `5`。Alignment fallback `731/3199` (`22.9%`)。对比 v4 core 32768 同片：chunks 相同 `3199`，blocks `2255 -> 2260`，ASR+Alignment `263.6s -> 254.1s`，pipeline total `307.6s -> 297.9s`，warn `268 -> 257`，empty `256 -> 245`，fallback `780 (24.4%) -> 731 (22.9%)`，duration p90/p95 `2.210/2.564s -> 2.171/2.473s`；短字幕比例 `0.149 -> 0.158` 略升。结论：true v5 指标小幅优于 v4，尤其是 fallback、ASR empty、warning 和耗时；但差距不大，不能直接宣布替换成功，下一步应生成 v4 vs true v5 审计页做人工观感 gate，并补 held-out 全片。
 - 2026-06-11 post-v5 loss 实验回滚决策：匿名样片 A / 匿名样片 B / 匿名样片 C 都已做 v5 vs v6e 字幕对比。v6e 在部分 forced/fallback 数字上更好，但 ASR empty、字幕密度或人工观感风险没有稳定胜出；用户决定“切回 v5”。确认默认 `src/boundary/checkpoints/boundary_refiner.pt` 仍是 true v5 sha256 `503d7e2299460aff555e02cba2b840c59195e577719bd0637a5ae98657ef919f`，未替换为 v6e sha256 `d96df85f26df96688ef2abd8e9ec27b211ea6bd5ab6beb7dfa33ca188e7c7aee`。断兼容清理后，active 训练入口只保留 v5 的 `smooth_l1`、`start_delta_loss_weight=1.0`、`end_delta_loss_weight=0.6`；post-v5 的 centered/asymmetric/exp-band loss、tolerance-band 指标、独立误差评估脚本和 v6/v6e 审计/临时产物均已移出 active tree，只在 HISTORY 保留结论。
+- 2026-06-11 v5 审计准备与提交：active tree 扫描确认 v6/v6e 产物文件名不再残留，v6/v6e 只保留在本文件的实验结论中；默认 checkpoint 仍是 true v5 sha256 `503d7e2299460aff555e02cba2b840c59195e577719bd0637a5ae98657ef919f`。基于 v5 全片输出重建 alignment diagnostics：`chunks=3199`、`failure candidates=1785`，生成本地音频字幕审计页 `agents/audits/v5-subtitle-audio-audit/index.html`，抽样 `102` 条，完整日文 cue `2260` 条；审计页与 `agents/` 目录按 `.gitignore` 保留本地，不随 push 发布。聚焦回归 `tests/test_audit_nav.py tests/test_boundary_refiner.py tests/test_boundary_refiner_training.py tests/test_boundary_cache.py tests/test_boundary_planner.py tests/test_chunk_packer.py tests/test_config.py tests/test_asr_stage_env_scope.py tests/test_pipeline_chunk_config_runtime.py tests/test_pipeline_chunk_packing.py` 为 `66 passed`。已提交并推送 `bff811f Finalize v5 boundary refiner cleanup`。
 - 2026-06-10 v4 core-only 32768 hardmix 真实域闭环完成：按用户要求旧 11 部 silver artifacts 直接作废，使用 `agents/temp/speech-boundary-ja/v4-core-32768-hardmix/train-mamba2-v4-core-32768-s07e055/boundary_refiner.pt`、`jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame`、ASR batch `64`、aligner batch `128`，对 11 部匿名全片从视频重新跑 SpeechBoundary / ASR / forced aligner。产物 `agents/temp/speech-boundary-ja/full-video-qwen17b-v4-core-32768-s07e055/`：总 transcript chunks `48848`、最终 blocks `31339`、ASR+Alignment 合计 `3790.3s`、总 elapsed `4410.5s`。单片 chunks/blocks 最高为匿名长片 `5303/4067`，字幕密度整体偏高，说明该 32768 synthetic checkpoint 适合挖真实域 silver label，但还不能只凭合成验证或训练 loss 直接替换默认。
 - 2026-06-10 full-video silver boundary mining 与真实域训练链路更新：`tools/boundary/mine_silver_boundary_labels.py` 的 label policy 从 `start_weight=1.0 / end_weight=0.35` 改为 `start_weight=1.0 / end_weight=0.6`：结论是 end 不是低价值，只是字幕显示层在相邻 cue 过近时可以压缩前一条 end 来保持 2-frame gap；Boundary Refiner 训练仍应学习 end。基于上述新边界完整重跑结果挖 silver，产物 `agents/temp/speech-boundary-ja/full-video-qwen17b-v4-core-32768-s07e055/silver-boundary-labels/`：chunks `48848`、silver labels `12574`、hard cases `36274`；alignment quality 为 forced `18682`、nonlexical `18643`、proportional `11442`、drop/review `64`、partial `17`；silver start error p50/p90/p95/max `-0.16/0/0.000187/0.0005s`，end error p50/p90/p95/max `0.222375/1.059869/1.405856/2.831875s`。这说明当前 speech core start 通常略早于 forced first word，end 通常偏晚，适合作为真实域 display-boundary correction 的监督信号。
 - 2026-06-10 新增真实域 silver -> Boundary Refiner v4 数据与微调链路：`tools/boundary/export_silver_sequence_features.py` 从新 silver labels 去重 11 个源音频，提权 CUDA 重新导出 full-audio `Qwen3-ASR-0.6B-JA-Anime-Galgame` PTM + MFCC sequence frame `.npz`，产物 `agents/temp/speech-boundary-ja/full-video-qwen17b-v4-core-32768-s07e055/silver-sequence-features-ptm64/`，导出 `11/11`、errors `0`。`tools/boundary/build_silver_refiner_dataset.py` 再把 silver labels、aligned transcript chunks 和 sequence feature manifest 转成 `boundary_refiner_frame_sequence_dataset_v4` 训练 JSONL，产物 `.../silver-refiner-dataset-v1/`：rows `47`、sequence items `20734`、split_negative `20734`、start_supervised `12570`、end_supervised `12573`、overlapping_chunk_gap `616`、feature_dim `630`、feature_schema_hash `ab5ca6f85b2e4da013a7ffaeef0ba73ccbd598a6`。随后从 32768 hardmix checkpoint 初始化，冻结 Mamba2 backbone，只训练输出头，`merge_loss_weight=0`、`start/end_delta_loss_weight=0.80/0.60`、`preserve_init_normalization=1`、`lr=1e-4`、`300` steps，得到 `.../train-mamba2-v4-core-32768-s07e055-silver-ft01/boundary_refiner.pt`。该 silver-ft01 尚未设为默认，下一步必须用 匿名样片 A / 匿名样片 B 做 downstream A/B。
@@ -135,7 +136,9 @@ SpeechBoundary-JA frame scores
 - 下一步应把 v1.20-v1.23 的经验收敛到 learned Boundary Refiner：显式优化 start/end error、fallback chunk duration、gap crossing、单 chunk 台词数和 ASR/aligner QC reward；recall 继续作为 guardrail，而不是唯一主目标。
 - 现行 `tools/` 已按职责重构：`tools/asr/qwen/` 放 Qwen SFT，`tools/asr/diagnostics/` 放 ASR/alignment 诊断，`tools/boundary/` 放 Boundary Refiner 数据和训练，`tools/boundary/ja/` 放 SpeechBoundary-JA 训练评测，`tools/subtitles/` 放字幕 postprocess / cue planner / 审计校准，`tools/audits/` 放审计页与人工审计工具。旧历史段落里的 `tools/vad/fusionvad_ja/...` 路径保留为当时记录。
 
-### SpeechBoundary-JA 下一步计划
+### 历史计划快照：SpeechBoundary-JA v2/v3
+
+以下计划是 v5 delta-only 之前的路线快照，已被当前 `frame-sequence Mamba2 start/end delta -> core planner -> ASR` 主线取代；保留是为了追踪断兼容重构的来源。
 
 1. 断兼容改名已完成：`src/vad/fusionvad_ja/` -> `src/boundary/ja/`，`tools/vad/fusionvad_ja/` -> `tools/boundary/ja/`，配置前缀 `FUSIONVAD_JA_` -> `SPEECH_BOUNDARY_JA_`，backend key `fusionvad_ja` -> `speech_boundary_ja`。旧 key / 旧 path / 旧 cache 不做 alias。
 2. 数据格式升级：删除 gap-only / BiLSTM / endpoint-head 训练格式，把 Galgame 与 `joujiboi/japanese-anime-speech-v2` clean speech islands 重新生成 sequence dataset。每条样本包含多 island、touching speech、short/long gap、real negative gap、BGM/noise、轻量 overlap、source/utterance switch。
@@ -248,6 +251,9 @@ Galgame / JAV 目标域里，喘息、呻吟、亲吻声、短促拟声可能本
 - 大 batch feature cache 在 WSL2 8GB RAM 下可能被系统 kill，没有 Python traceback；需要查内存和系统日志，不能只看显存。
 
 ---
+
+<details>
+<summary>历史：FusionVAD-JA / R14-R18 早期 VAD 与 chunk packing 记录</summary>
 
 ## FusionVAD-JA 版本记录
 
@@ -747,6 +753,8 @@ fallback-safe 对比（`recall>=0.9999`）：
 - 不替换默认 operating point；继续保持 v1.17 默认，并把 `0.04/0.96` 记录为 synthetic 优但真实闭环收益不足的负例。
 - 这进一步确认主瓶颈不是全局 speech threshold，而是 long overlong chunk / continuous island 内缺少可靠句边界。
 
+</details>
+
 ---
 
 ## ASR / Alignment 文本策略
@@ -791,6 +799,9 @@ diagnose_asr_alignment.py
 - ASR 输出文本时，start 边界比 end 更重要。
 - end 偏长可以在 cue timing polish 中压缩，尤其是两条字幕相邻时可以压缩前者 end 来保留 gap。
 - 但如果 VAD / chunk 本身跨了大段无声，后置 timing polish 无法修复 ASR 幻觉或 forced aligner coarse fallback。
+
+<details>
+<summary>历史：R19-v1.23 / DP / context-budget / cue-density 试验记录</summary>
 
 ### R19 · Reward-shaped speech-island segmentation
 
@@ -1211,6 +1222,8 @@ v1.23 后置修正 first-pass：
 - 验证：`tests/test_subtitle_quality_pass.py tests/test_subtitle_options.py tests/test_replay_subtitle_postprocess.py tests/test_subtitle_cue_merge_candidates.py` 52 passed。
 - ASR 低信息/重复/幻觉归因审计入口落地：新增 `tools/audits/generate_asr_attribution_audit_html.py`，从 alignment diagnostics + aligned segments + 完整日语 SRT 离线抽样，不重跑 ASR/aligner。采样桶固定为 `repeat_or_qc_reject`、`nonlexical_empty`、`sentinel_fallback`、`low_info_vocal`、`asr_qc_warn`、`forced_control`，用于区分真实低信息人声、ASR 幻觉/错听、非语音噪声/BGM、多人/重叠、轻声弱人声、边界上下文过短/过长、文本可用和时间轴准确等原因。匿名样片 A 当前 diagnostics 全量统计：chunks `2459`，alignment quality 为 forced `1200`、proportional `861`、nonlexical `378`、drop_or_review `20`；ASR QC ok/warn/reject 为 `2102/337/20`；fallback subtype 为 none `1200`、proportional_after_sentinel `861`、nonlexical_text `378`、asr_qc_reject `20`；low-information 分布为 not_low_information `1132`、short_kana `462`、short_nonlexical `385`、empty `378`、repeated_nonlexical `98`、long_sparse `4`。已生成音频审计页，共 `84` 条、每桶 `14` 条，完整日语 VTT 和人工导出文件 `manual_asr_attribution_labels.jsonl`；导航 latest 已指向该页。该步骤是评估闭环：先看人工分布，再决定是否改 ASR QC、cue planner、speaker sidecar、hard-negative 训练或 0.6B/1.7B 稳定性对比。
 - 验证：`tests/test_asr_attribution_audit.py tests/test_audit_nav.py tests/test_long_fallback_audit_media_mode.py` 7 passed；`python -m py_compile tools/audits/generate_asr_attribution_audit_html.py` passed。
+
+</details>
 
 ---
 
