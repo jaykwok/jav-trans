@@ -6,7 +6,7 @@ from typing import Any
 
 
 _DEFAULT_ASR_BACKEND = "jaykwok/Qwen3-ASR-0.6B-JA-Anime-Galgame"
-_MAX_TRANSLATION_WORKERS = 4
+_MAX_TRANSLATION_WORKERS = 64
 
 from core.config import DEFAULT_SETTINGS
 
@@ -118,7 +118,7 @@ class JobContext:
             ),
             translation_max_workers=min(
                 _MAX_TRANSLATION_WORKERS,
-                max(1, int(getattr(spec, "translation_max_workers", 4))),
+                max(1, int(getattr(spec, "translation_max_workers", 16))),
             ),
             translation_cache_path=str(cache_path or ""),
             job_id=str(job_id or ""),

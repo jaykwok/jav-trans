@@ -184,7 +184,7 @@ DEFAULT_SETTINGS: dict[str, str] = {
     # Base URL for providers that expose an OpenAI-compatible API; DeepSeek by default.
     "OPENAI_COMPATIBILITY_BASE_URL": "https://api.deepseek.com",
     # Translation model name sent to the SDK client.
-    "LLM_MODEL_NAME": "deepseek-v4-pro",
+    "LLM_MODEL_NAME": "deepseek-v4-flash",
     # OpenAI-compatible API surface for translation requests. Valid values: chat, responses.
     "LLM_API_FORMAT": "chat",
     # Reasoning effort parameter for models that support it. Valid values: medium, xhigh.

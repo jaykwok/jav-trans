@@ -61,7 +61,7 @@ uv pip install -r requirements.txt
 ```env
 API_KEY=你的翻译_API_KEY
 OPENAI_COMPATIBILITY_BASE_URL=https://api.deepseek.com
-LLM_MODEL_NAME=deepseek-v4-pro
+LLM_MODEL_NAME=deepseek-v4-flash
 LLM_API_FORMAT=chat
 LLM_REASONING_EFFORT=xhigh
 TARGET_LANG=简体中文
@@ -180,7 +180,7 @@ Boundary Refiner v5 只规划 speech core：Mamba2 输出 `start_delta + end_del
 - `tmp/log/`：启用运行日志后的任务日志。
 - `datasets/`：本地训练、验证、测试数据归档，默认 ignored；不参与普通推理和 release 打包。
 - `agents/temp/`：研究脚本、smoke、临时日志和中间产物。
-- `agents/audits/`：可长期复查的本地审计页，统一从 `agents/audits/index.html` 进入；导航按更新时间倒序排列，最上面是最新需要审计的页面。该目录是本地研究产物，默认 ignored，不会随 `git push` 发布。推荐用 `tools/audits/serve_audits.sh` 启动，避免训练日志 / cache 写入触发 live-server 持续刷新；删除按钮也需要通过该脚本启动才会实际移动本地审计目录并重建导航，裸 `live-server` / 直接打开 HTML 只能显示手动删除命令。
+- `agents/audits/`：可长期复查的本地审计页，统一从 `agents/audits/index.html` 进入；导航按更新时间倒序排列，最上面是最新需要审计的页面。该目录是本地研究产物，默认 ignored，不会随 `git push` 发布。Windows 使用 `.\tools\audits\serve_audits.ps1`，Linux / WSL2 使用 `tools/audits/serve_audits.sh`；脚本会限制 live-server watch 范围，避免训练日志 / cache 写入触发持续刷新。删除按钮也需要通过对应脚本启动才会实际移动本地审计目录并重建导航，裸 `live-server` / 直接打开 HTML 只能显示手动删除命令。
 
 成功运行后默认删除一次性 job 临时目录；保留可复用缓存，例如 `models/`、`tmp/cache/boundary/` 和 Web 状态。
 

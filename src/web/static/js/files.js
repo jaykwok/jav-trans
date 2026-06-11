@@ -35,8 +35,8 @@ function renderFiles() {
 
 function readTranslationMaxWorkers() {
   const value = parseInt($('t-translation-max-workers').value, 10);
-  if (!Number.isFinite(value)) return 4;
-  return Math.min(4, Math.max(1, value));
+  if (!Number.isFinite(value)) return 16;
+  return Math.min(64, Math.max(1, value));
 }
 
 async function pickFiles() {
