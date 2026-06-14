@@ -160,6 +160,21 @@ DEFAULT_SETTINGS: dict[str, str] = {
     "ASR_QC_ADAPTIVE_HARD_COMPRESSION_THRESHOLD": "2.0",
     "ASR_QC_ADAPTIVE_HARD_MAX_CHARS_PER_SEC": "14.0",
     "ASR_QC_ADAPTIVE_HARD_REPEAT_RATIO": "0.45",
+
+    # --- CueQC Shadow Classifier / Cluster-First Review ---
+    # 1 records CueQC candidate features and conservative shadow decisions.
+    "CUEQC_SHADOW_ENABLED": "1",
+    # First release is shadow-only; pre-align skip remains disabled until manual gate passes.
+    "CUEQC_PREALIGN_SKIP_ENABLED": "0",
+    "CUEQC_PREALIGN_SKIP_MIN_CONFIDENCE": "0.92",
+    "CUEQC_TAXONOMY_VERSION": "cluster_first_v1",
+    "CUEQC_MODEL_VERSION": "rules_shadow_v1",
+    "CUEQC_MODEL_PATH": "",
+    # Optional JSONL export path for cluster-first audit candidates.
+    "CUEQC_EXPORT_CANDIDATES_PATH": "",
+    "CUEQC_EXPORT_CANDIDATES_APPEND": "1",
+    # 0 keeps aligned cache compact; use export path for full candidate features.
+    "CUEQC_SHADOW_EMBED_CANDIDATES": "0",
     # --- Subtitle Timings ---
     # Conservative hard maximum for one subtitle cue; 7s is the industry ceiling, 6.5s avoids hanging text.
     "MAX_SUBTITLE_DURATION": "6.5",

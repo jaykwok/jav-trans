@@ -504,3 +504,18 @@ def test_adaptive_precision_reviews_low_logprob_before_alignment(monkeypatch, tm
     assert details["stage_timings"]["asr_adaptive_review_chunks"] == len(backend.audio_paths)
     assert any(entry.startswith("ASR Adaptive Precision: review_uncertain=") for entry in log)
     assert all(chunk["text"] for chunk in details["transcript_chunks"])
+
+
+def test_cueqc_shadow_records_without_skipping_alignment(monkeypatch, tmp_path):
+    backend, segments, log, details = _run_transcription(monkeypatch, tmp_path)
+
+    assert backend.finalized_payloads
+    assert len(backend.finalized_payloads) == len(backend.audio_paths)
+    assert details["cueqc_shadow"]["shadow_only"] is True
+    assert details["cueqc_shadow"]["candidate_count"] == len(backend.audio_paths)
+    assert details["cueqc_shadow"]["counts"]["alignment_policy"] == {"align": len(backend.audio_paths)}
+    assert details["transcript_chunks"]
+    assert all("cueqc_shadow" in chunk for chunk in details["transcript_chunks"])
+    assert segments
+    assert all(segment.get("cueqc_shadow") for segment in segments)
+    assert any(entry.startswith("CueQC shadow: candidates=") for entry in log)
