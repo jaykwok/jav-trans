@@ -6,13 +6,21 @@ from pathlib import Path
 from asr import cueqc
 from tools.asr.cueqc.cluster_candidates import cluster_rows, main as cluster_main
 from tools.asr.cueqc.compile_training_set import compile_records
+from tools.asr.cueqc.enrich_embeddings import enrich_text_embeddings
 from tools.asr.cueqc.export_candidates import aligned_payload_to_candidates
 
 
-def _candidate(index: int, text: str, *, severity: str = "ok", density: str = "normal_dialogue") -> dict:
+def _candidate(
+    index: int,
+    text: str,
+    *,
+    severity: str = "ok",
+    density: str = "normal_dialogue",
+    embedding: list[float] | None = None,
+) -> dict:
     duration = 0.6 if len(text) <= 3 else 2.0
     tf = cueqc.text_features(text, text, duration_s=duration)
-    return {
+    row = {
         "schema": "cueqc_candidate_v1",
         "sample_id": f"sample-{index:03d}",
         "cluster_id": "",
@@ -44,6 +52,22 @@ def _candidate(index: int, text: str, *, severity: str = "ok", density: str = "n
         "asr_signals": {},
         "alignment_diagnostics": {},
     }
+    if embedding is not None:
+        row["embeddings"] = {
+            "text": {
+                "model": "unit-test-text",
+                "dim": len(embedding),
+                "normalized": False,
+                "vector": list(embedding),
+            },
+            "audio": {
+                "model": "unit-test-audio",
+                "dim": len(embedding),
+                "normalized": False,
+                "vector": list(reversed(embedding)),
+            },
+        }
+    return row
 
 
 def test_cueqc_candidate_export_from_aligned_payload_preserves_required_fields(tmp_path: Path):
@@ -113,7 +137,7 @@ def test_cueqc_finch_cluster_outputs_stable_audit_files(tmp_path: Path):
     ]
     clustered, representatives, summaries, summary = cluster_rows(
         rows,
-        method="auto",
+        method="finch_first_neighbor",
         metric="euclidean",
         min_clusters=2,
         max_clusters=4,
@@ -139,6 +163,8 @@ def test_cueqc_finch_cluster_outputs_stable_audit_files(tmp_path: Path):
             str(input_path),
             "--output-dir",
             str(output_dir),
+            "--method",
+            "finch_first_neighbor",
             "--min-clusters",
             "2",
             "--max-clusters",
@@ -152,6 +178,79 @@ def test_cueqc_finch_cluster_outputs_stable_audit_files(tmp_path: Path):
     html = (output_dir / "cluster_audit.html").read_text(encoding="utf-8")
     assert "CueQC cluster-first" in html
     assert "cueqc_manual_labels.jsonl" in html
+
+
+def test_cueqc_umap_hdbscan_uses_high_dim_embeddings():
+    centers = [
+        [10.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+        [0.0, 10.0, 0.0, 0.0, 0.0, 0.0],
+        [0.0, 0.0, 10.0, 0.0, 0.0, 0.0],
+    ]
+    rows = []
+    index = 0
+    for cluster_index, center in enumerate(centers):
+        for offset in (0.0, 0.1, 0.2, 0.3):
+            vector = [
+                value + (offset if dim == cluster_index else 0.0)
+                for dim, value in enumerate(center)
+            ]
+            rows.append(_candidate(index, f"テスト{cluster_index}", embedding=vector))
+            index += 1
+
+    clustered, representatives, summaries, summary = cluster_rows(
+        rows,
+        method="umap_hdbscan",
+        metric="euclidean",
+        feature_space="dense",
+        min_clusters=2,
+        max_clusters=4,
+        min_cluster_size=2,
+        min_samples=1,
+        selection_method="leaf",
+        umap_components=2,
+        umap_neighbors=3,
+        representatives_per_cluster=1,
+        random_state=7,
+    )
+
+    assert len(clustered) == len(rows)
+    assert summary["method"] == "umap_hdbscan"
+    assert summary["feature_space"]["resolved"] == "dense"
+    assert summary["feature_space"]["dense"]["sources"] == ["audio", "text"]
+    assert summary["cluster_count"] >= 2
+    assert representatives
+    assert summaries
+    assert all(row["cluster_backend"] == "umap_hdbscan" for row in clustered)
+    assert all("cluster_confidence" in row for row in clustered)
+
+
+def test_cueqc_text_embedding_enrichment_writes_dense_vectors(monkeypatch):
+    rows = [_candidate(0, "今日はいい天気ですね"), _candidate(1, "あ")]
+
+    def fake_loader(model_name: str, *, device: str):
+        def encode(texts: list[str], *, batch_size: int):
+            return [[float(index), float(len(text)), 1.0] for index, text in enumerate(texts)]
+
+        return encode, "fake_backend"
+
+    monkeypatch.setattr(
+        "tools.asr.cueqc.enrich_embeddings._load_text_embedder",
+        fake_loader,
+    )
+
+    summary = enrich_text_embeddings(
+        rows,
+        model_name="fake-text-model",
+        device="cpu",
+        batch_size=2,
+        text_prefix="",
+        vector_digits=4,
+    )
+
+    assert summary["model"] == "fake-text-model"
+    assert summary["dim"] == 3
+    assert rows[0]["embeddings"]["text"]["backend"] == "fake_backend"
+    assert rows[1]["embeddings"]["text"]["vector"][1] == 1.0
 
 
 def test_cueqc_training_compile_low_consistency_does_not_hard_reject():

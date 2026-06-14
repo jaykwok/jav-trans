@@ -8,7 +8,7 @@ import math
 import sys
 from collections import Counter, defaultdict
 from pathlib import Path
-from typing import Any, Iterable, Mapping
+from typing import Any, Iterable, Mapping, Sequence
 
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
 SRC_ROOT = PROJECT_ROOT / "src"
@@ -66,6 +66,255 @@ def _distance(left: list[float], right: list[float], metric: str) -> float:
     if metric == "euclidean":
         return _euclidean_distance(left, right)
     raise ValueError(f"unsupported metric: {metric}")
+
+
+def _l2_normalize_matrix(matrix: Sequence[Sequence[float]]) -> list[list[float]]:
+    normalized: list[list[float]] = []
+    for row in matrix:
+        norm = math.sqrt(sum(value * value for value in row)) or 1.0
+        normalized.append([float(value) / norm for value in row])
+    return normalized
+
+
+def _stable_cluster_count(labels: Sequence[int]) -> int:
+    return len({int(label) for label in labels if int(label) >= 0})
+
+
+def _noise_count(labels: Sequence[int]) -> int:
+    return sum(1 for label in labels if int(label) < 0)
+
+
+def _mean_probability(labels: Sequence[int], probabilities: Sequence[float]) -> float:
+    values = [
+        float(probability)
+        for label, probability in zip(labels, probabilities)
+        if int(label) >= 0
+    ]
+    return sum(values) / max(1, len(values))
+
+
+def _hdbscan_min_cluster_sizes(
+    *,
+    row_count: int,
+    min_clusters: int,
+    max_clusters: int,
+    explicit: int | None,
+) -> list[int]:
+    if explicit is not None and explicit > 0:
+        return [max(2, min(explicit, max(2, row_count)))]
+    if row_count <= 2:
+        return [2]
+    upper = min(50, max(2, row_count // max(1, min_clusters)), max(2, row_count // 2))
+    seeds = {
+        2,
+        3,
+        4,
+        5,
+        max(2, row_count // max(1, max_clusters)),
+        max(2, row_count // max(1, (min_clusters + max_clusters) // 2)),
+        max(2, row_count // max(1, min_clusters)),
+    }
+    sizes = {value for value in seeds if 2 <= value <= upper}
+    if upper <= 30:
+        sizes.update(range(2, upper + 1))
+    else:
+        step = max(1, upper // 16)
+        sizes.update(range(2, upper + 1, step))
+        sizes.add(upper)
+    return sorted(sizes)
+
+
+def _pca_reduce_matrix(
+    matrix: list[list[float]],
+    *,
+    components: int,
+) -> tuple[list[list[float]], dict[str, Any]]:
+    if components <= 0 or len(matrix) < 3 or not matrix or len(matrix[0]) < 3:
+        return matrix, {"method": "none", "reason": "pca_not_applicable"}
+    try:
+        from sklearn.decomposition import PCA
+    except Exception as exc:  # pragma: no cover - exercised only without sklearn.
+        return matrix, {"method": "none", "reason": f"pca_unavailable:{exc!r}"}
+    width = len(matrix[0])
+    n_components = min(max(2, components), width, len(matrix) - 1)
+    if n_components < 2:
+        return matrix, {"method": "none", "reason": "too_few_components"}
+    pca = PCA(n_components=n_components, whiten=True, copy=True)
+    reduced = pca.fit_transform(matrix)
+    explained = getattr(pca, "explained_variance_ratio_", [])
+    return reduced.tolist(), {
+        "method": "pca_whiten",
+        "components": n_components,
+        "input_dim": width,
+        "explained_variance_ratio_sum": round(float(sum(explained)), 6),
+    }
+
+
+def _hdbscan_score(
+    labels: Sequence[int],
+    probabilities: Sequence[float],
+    *,
+    min_clusters: int,
+    max_clusters: int,
+) -> tuple[float, float, float, float]:
+    stable_count = _stable_cluster_count(labels)
+    target = (min_clusters + max_clusters) / 2.0
+    if min_clusters <= stable_count <= max_clusters:
+        cluster_penalty = abs(stable_count - target) / max(1.0, target)
+        range_penalty = 0.0
+    elif stable_count < min_clusters:
+        cluster_penalty = (min_clusters - stable_count) / max(1.0, min_clusters)
+        range_penalty = 1.0
+    else:
+        cluster_penalty = (stable_count - max_clusters) / max(1.0, max_clusters)
+        range_penalty = 1.0
+    noise_ratio = _noise_count(labels) / max(1, len(labels))
+    confidence_penalty = 1.0 - _mean_probability(labels, probabilities)
+    return (range_penalty, cluster_penalty, noise_ratio, confidence_penalty)
+
+
+def _relabel_hdbscan_by_size(labels: Sequence[int]) -> list[str]:
+    stable_counts = Counter(int(label) for label in labels if int(label) >= 0)
+    stable_order = {
+        label: rank
+        for rank, (label, _count) in enumerate(
+            sorted(stable_counts.items(), key=lambda item: (-item[1], item[0]))
+        )
+    }
+    out: list[str] = []
+    for label in labels:
+        raw = int(label)
+        if raw < 0:
+            out.append("noise_00")
+        else:
+            out.append(f"cluster_{stable_order[raw]:02d}")
+    return out
+
+
+def _sklearn_hdbscan_cluster(
+    matrix: list[list[float]],
+    *,
+    metric: str,
+    reducer: str,
+    min_clusters: int,
+    max_clusters: int,
+    min_cluster_size: int | None,
+    min_samples: int | None,
+    selection_method: str,
+    pca_components: int,
+    umap_components: int,
+    umap_neighbors: int,
+    umap_min_dist: float,
+    random_state: int,
+) -> tuple[list[int], list[float], dict[str, Any]]:
+    try:
+        from sklearn.cluster import HDBSCAN
+    except Exception as exc:
+        raise RuntimeError(
+            "sklearn HDBSCAN backend requires scikit-learn>=1.9; "
+            "install it with `uv pip install scikit-learn>=1.9`"
+        ) from exc
+    if reducer == "auto":
+        reducer = "umap"
+    if reducer == "umap":
+        reduced, reduction = _umap_reduce_matrix(
+            matrix,
+            metric=metric,
+            components=umap_components,
+            neighbors=umap_neighbors,
+            min_dist=umap_min_dist,
+            random_state=random_state,
+        )
+    elif reducer == "pca":
+        reduced, reduction = _pca_reduce_matrix(matrix, components=pca_components)
+    elif reducer == "none":
+        reduced, reduction = matrix, {"method": "none", "reason": "disabled"}
+    else:
+        raise ValueError(f"unsupported reducer: {reducer}")
+    hdbscan_matrix = reduced
+    effective_metric = "euclidean"
+    if metric == "cosine":
+        hdbscan_matrix = _l2_normalize_matrix(reduced)
+    elif metric != "euclidean":
+        raise ValueError(f"unsupported metric for sklearn_hdbscan: {metric}")
+
+    selection_methods = (
+        ["eom", "leaf"] if selection_method == "auto" else [selection_method]
+    )
+    min_sizes = _hdbscan_min_cluster_sizes(
+        row_count=len(hdbscan_matrix),
+        min_clusters=min_clusters,
+        max_clusters=max_clusters,
+        explicit=min_cluster_size,
+    )
+    candidates: list[dict[str, Any]] = []
+    best: dict[str, Any] | None = None
+    for method_name in selection_methods:
+        for size in min_sizes:
+            model = HDBSCAN(
+                min_cluster_size=size,
+                min_samples=min_samples,
+                metric=effective_metric,
+                cluster_selection_method=method_name,
+                allow_single_cluster=False,
+                copy=True,
+            )
+            model.fit(hdbscan_matrix)
+            labels = [int(label) for label in model.labels_]
+            probabilities = [
+                float(value)
+                for value in getattr(model, "probabilities_", [1.0] * len(labels))
+            ]
+            candidate = {
+                "selection_method": method_name,
+                "min_cluster_size": size,
+                "min_samples": min_samples,
+                "stable_cluster_count": _stable_cluster_count(labels),
+                "noise_count": _noise_count(labels),
+                "noise_ratio": round(_noise_count(labels) / max(1, len(labels)), 6),
+                "mean_cluster_probability": round(
+                    _mean_probability(labels, probabilities),
+                    6,
+                ),
+                "score": _hdbscan_score(
+                    labels,
+                    probabilities,
+                    min_clusters=min_clusters,
+                    max_clusters=max_clusters,
+                ),
+                "labels": labels,
+                "probabilities": probabilities,
+            }
+            candidates.append(candidate)
+            if best is None or candidate["score"] < best["score"]:
+                best = candidate
+    if best is None or int(best["stable_cluster_count"]) <= 0:
+        raise RuntimeError("sklearn HDBSCAN produced no stable clusters")
+    diagnostics = [
+        {
+            key: value
+            for key, value in candidate.items()
+            if key not in {"labels", "probabilities", "score"}
+        }
+        | {"score": [round(float(value), 6) for value in candidate["score"]]}
+        for candidate in candidates
+    ]
+    return list(best["labels"]), list(best["probabilities"]), {
+        "backend": "umap_hdbscan" if reduction.get("method") == "umap" else (
+            "sklearn_hdbscan_pca" if reduction.get("method") == "pca_whiten" else "sklearn_hdbscan"
+        ),
+        "metric": metric,
+        "effective_metric": effective_metric,
+        "reduction": reduction,
+        "selection_method": best["selection_method"],
+        "min_cluster_size": best["min_cluster_size"],
+        "min_samples": best["min_samples"],
+        "stable_cluster_count": best["stable_cluster_count"],
+        "noise_count": best["noise_count"],
+        "noise_ratio": best["noise_ratio"],
+        "mean_cluster_probability": best["mean_cluster_probability"],
+        "tuned_candidates": diagnostics,
+    }
 
 
 def _nearest_neighbors(matrix: list[list[float]], *, metric: str) -> list[int]:
@@ -205,6 +454,203 @@ def _pick_partition(
     return min(partitions, key=lambda labels: abs(_cluster_count(labels) - target))
 
 
+def _zscore_matrix(matrix: list[list[float]]) -> list[list[float]]:
+    if not matrix:
+        return []
+    width = len(matrix[0])
+    means: list[float] = []
+    stds: list[float] = []
+    for col in range(width):
+        values = [row[col] for row in matrix]
+        mean = sum(values) / max(1, len(values))
+        variance = sum((value - mean) ** 2 for value in values) / max(1, len(values))
+        means.append(mean)
+        stds.append(math.sqrt(variance) or 1.0)
+    return [
+        [(row[col] - means[col]) / stds[col] for col in range(width)]
+        for row in matrix
+    ]
+
+
+def _numeric_vector(value: Any) -> list[float]:
+    if isinstance(value, Mapping):
+        for key in ("vector", "values", "embedding"):
+            if key in value:
+                return _numeric_vector(value[key])
+        return []
+    if not isinstance(value, Sequence) or isinstance(value, (str, bytes, bytearray)):
+        return []
+    out: list[float] = []
+    for item in value:
+        if isinstance(item, Sequence) and not isinstance(item, (str, bytes, bytearray)):
+            out.extend(_numeric_vector(item))
+            continue
+        try:
+            parsed = float(item)
+        except (TypeError, ValueError):
+            continue
+        if math.isfinite(parsed):
+            out.append(parsed)
+    return out
+
+
+def _embedding_vectors(row: Mapping[str, Any]) -> dict[str, list[float]]:
+    vectors: dict[str, list[float]] = {}
+    for key, name in (
+        ("text_embedding", "text"),
+        ("audio_embedding", "audio"),
+        ("semantic_embedding", "semantic"),
+        ("acoustic_embedding", "audio"),
+        ("embedding", "generic"),
+    ):
+        vector = _numeric_vector(row.get(key))
+        if vector and name not in vectors:
+            vectors[name] = vector
+    embeddings = row.get("embeddings")
+    if isinstance(embeddings, Mapping):
+        for name, payload in embeddings.items():
+            vector = _numeric_vector(payload)
+            if vector:
+                vectors[str(name)] = vector
+    return vectors
+
+
+def _dense_embedding_matrix(rows: list[Mapping[str, Any]]) -> tuple[list[list[float]], dict[str, Any]]:
+    row_vectors = [_embedding_vectors(row) for row in rows]
+    names = sorted({name for vectors in row_vectors for name in vectors})
+    if not names:
+        return [], {
+            "available": False,
+            "sources": [],
+            "dimensions": {},
+            "rows_with_any_embedding": 0,
+        }
+    dimensions = {
+        name: max((len(vectors.get(name, [])) for vectors in row_vectors), default=0)
+        for name in names
+    }
+    matrix: list[list[float]] = []
+    rows_with_any = 0
+    source_counts: Counter[str] = Counter()
+    for vectors in row_vectors:
+        row_values: list[float] = []
+        if vectors:
+            rows_with_any += 1
+        for name in names:
+            dim = dimensions[name]
+            values = list(vectors.get(name, []))[:dim]
+            if values:
+                source_counts[name] += 1
+            row_values.extend(values + [0.0] * max(0, dim - len(values)))
+        matrix.append(row_values)
+    return matrix, {
+        "available": True,
+        "sources": names,
+        "dimensions": dimensions,
+        "rows_with_any_embedding": rows_with_any,
+        "source_counts": dict(source_counts),
+        "total_dim": len(matrix[0]) if matrix else 0,
+    }
+
+
+def _feature_matrix(
+    rows: list[dict[str, Any]],
+    *,
+    feature_space: str,
+) -> tuple[list[list[float]], dict[str, Any]]:
+    structured = normalize_feature_matrix(rows)
+    dense, dense_meta = _dense_embedding_matrix(rows)
+    resolved = feature_space
+    if feature_space == "auto":
+        resolved = "fused" if dense else "structured"
+    if resolved == "structured":
+        return structured, {
+            "requested": feature_space,
+            "resolved": resolved,
+            "structured_dim": len(structured[0]) if structured else 0,
+            "dense": dense_meta,
+        }
+    if resolved == "dense":
+        if not dense:
+            return structured, {
+                "requested": feature_space,
+                "resolved": "structured",
+                "fallback_reason": "no_dense_embeddings",
+                "structured_dim": len(structured[0]) if structured else 0,
+                "dense": dense_meta,
+            }
+        dense_norm = _l2_normalize_matrix(_zscore_matrix(dense))
+        return dense_norm, {
+            "requested": feature_space,
+            "resolved": resolved,
+            "structured_dim": len(structured[0]) if structured else 0,
+            "dense": dense_meta,
+        }
+    if resolved != "fused":
+        raise ValueError(f"unsupported feature space: {feature_space}")
+    if not dense:
+        return structured, {
+            "requested": feature_space,
+            "resolved": "structured",
+            "fallback_reason": "no_dense_embeddings",
+            "structured_dim": len(structured[0]) if structured else 0,
+            "dense": dense_meta,
+        }
+    dense_norm = _l2_normalize_matrix(_zscore_matrix(dense))
+    structured_norm = _l2_normalize_matrix(structured)
+    fused = [
+        list(structured_row) + list(dense_row)
+        for structured_row, dense_row in zip(structured_norm, dense_norm)
+    ]
+    return fused, {
+        "requested": feature_space,
+        "resolved": "fused",
+        "structured_dim": len(structured[0]) if structured else 0,
+        "dense": dense_meta,
+        "fused_dim": len(fused[0]) if fused else 0,
+        "block_scaling": "l2_per_block",
+    }
+
+
+def _umap_reduce_matrix(
+    matrix: list[list[float]],
+    *,
+    metric: str,
+    components: int,
+    neighbors: int,
+    min_dist: float,
+    random_state: int,
+) -> tuple[list[list[float]], dict[str, Any]]:
+    if components <= 0 or len(matrix) < 5:
+        return matrix, {"method": "none", "reason": "umap_not_applicable"}
+    try:
+        import umap
+    except Exception as exc:  # pragma: no cover - exercised only without umap-learn.
+        raise RuntimeError(
+            "UMAP backend requires umap-learn; install it with `uv pip install umap-learn`"
+        ) from exc
+    n_neighbors = min(max(2, neighbors), max(2, len(matrix) - 1))
+    n_components = min(max(2, components), max(2, len(matrix) - 2), len(matrix[0]))
+    reducer = umap.UMAP(
+        n_neighbors=n_neighbors,
+        n_components=n_components,
+        min_dist=min_dist,
+        metric=metric,
+        random_state=random_state,
+        transform_seed=random_state,
+    )
+    reduced = reducer.fit_transform(matrix)
+    return reduced.tolist(), {
+        "method": "umap",
+        "components": n_components,
+        "neighbors": n_neighbors,
+        "min_dist": min_dist,
+        "metric": metric,
+        "random_state": random_state,
+        "input_dim": len(matrix[0]) if matrix else 0,
+    }
+
+
 def _representatives(rows: list[dict[str, Any]], matrix: list[list[float]], labels: list[str], *, per_cluster: int) -> list[dict[str, Any]]:
     grouped: dict[str, list[int]] = defaultdict(list)
     for index, label in enumerate(labels):
@@ -238,6 +684,8 @@ def _representatives(rows: list[dict[str, Any]], matrix: list[list[float]], labe
                     "text_preview": row.get("text_preview", ""),
                     "qc": row.get("qc", {}),
                     "text_features": row.get("text_features", {}),
+                    "cluster_confidence": row.get("cluster_confidence"),
+                    "cluster_noise": row.get("cluster_noise"),
                 }
             )
     return representatives
@@ -268,6 +716,12 @@ def _cluster_summaries(rows: list[dict[str, Any]], labels: list[str]) -> list[di
             {
                 "cluster_id": label,
                 "count": len(members),
+                "noise_count": sum(1 for member in members if bool(member.get("cluster_noise"))),
+                "confidence_avg": round(
+                    sum(float(member.get("cluster_confidence") or 0.0) for member in members)
+                    / max(1, len(members)),
+                    4,
+                ),
                 "qc_severity_counts": dict(severity_counts.most_common()),
                 "text_density_counts": dict(density_counts.most_common()),
                 "char_count_avg": round(sum(char_counts) / max(1, len(char_counts)), 3),
@@ -492,17 +946,96 @@ def cluster_rows(
     min_clusters: int,
     max_clusters: int,
     representatives_per_cluster: int,
+    feature_space: str = "auto",
+    reducer: str = "umap",
+    min_cluster_size: int | None = None,
+    min_samples: int | None = None,
+    selection_method: str = "auto",
+    pca_components: int = 8,
+    umap_components: int = 8,
+    umap_neighbors: int = 15,
+    umap_min_dist: float = 0.0,
+    random_state: int = 17,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]], dict[str, Any]]:
-    if method not in {"auto", "finch_first_neighbor"}:
+    if method not in {"auto", "umap_hdbscan", "sklearn_hdbscan", "finch_first_neighbor"}:
         raise ValueError(f"unsupported method: {method}")
-    matrix = normalize_feature_matrix(rows)
+    matrix, feature_summary = _feature_matrix(rows, feature_space=feature_space)
     if not matrix:
         return [], [], [], {
             "schema": "cueqc_cluster_summary_v1",
             "method": method,
             "cluster_count": 0,
             "candidate_count": 0,
+            "feature_space": feature_summary,
         }
+    resolved_method = "umap_hdbscan" if method == "auto" else method
+    hdbscan_error = ""
+    if resolved_method in {"umap_hdbscan", "sklearn_hdbscan"}:
+        try:
+            labels_raw_hdbscan, probabilities, backend_summary = _sklearn_hdbscan_cluster(
+                matrix,
+                metric=metric,
+                reducer="umap" if resolved_method == "umap_hdbscan" else reducer,
+                min_clusters=min_clusters,
+                max_clusters=max_clusters,
+                min_cluster_size=min_cluster_size,
+                min_samples=min_samples,
+                selection_method=selection_method,
+                pca_components=pca_components,
+                umap_components=umap_components,
+                umap_neighbors=umap_neighbors,
+                umap_min_dist=umap_min_dist,
+                random_state=random_state,
+            )
+            labels = _relabel_hdbscan_by_size(labels_raw_hdbscan)
+            clustered_rows = []
+            for row, raw_label, label, probability in zip(
+                rows,
+                labels_raw_hdbscan,
+                labels,
+                probabilities,
+            ):
+                item = dict(row)
+                item["cluster_id"] = label
+                item["cluster_raw_label"] = int(raw_label)
+                item["cluster_method"] = backend_summary["backend"]
+                item["cluster_backend"] = backend_summary["backend"]
+                item["cluster_noise"] = int(raw_label) < 0
+                item["cluster_confidence"] = round(float(probability), 6)
+                clustered_rows.append(item)
+            summaries = _cluster_summaries(clustered_rows, labels)
+            representatives = _representatives(
+                clustered_rows,
+                matrix,
+                labels,
+                per_cluster=representatives_per_cluster,
+            )
+            summary = {
+                "schema": "cueqc_cluster_summary_v1",
+                "method": backend_summary["backend"],
+                "requested_method": method,
+                "metric": metric,
+                "candidate_count": len(rows),
+                "cluster_count": len(
+                    {label for label in labels if not label.startswith("noise_")}
+                ),
+                "total_groups_including_noise": len(summaries),
+                "target_min_clusters": min_clusters,
+                "target_max_clusters": max_clusters,
+                "cluster_counts": {
+                    summary["cluster_id"]: summary["count"] for summary in summaries
+                },
+                "representatives_per_cluster": representatives_per_cluster,
+                "feature_space": feature_summary,
+                "backend": backend_summary,
+            }
+            return clustered_rows, representatives, summaries, summary
+        except Exception as exc:
+            if method != "auto":
+                raise
+            hdbscan_error = repr(exc)
+            resolved_method = "finch_first_neighbor"
+
     partitions = finch_partitions(matrix, metric=metric)
     labels_raw = _pick_partition(
         partitions,
@@ -515,6 +1048,9 @@ def cluster_rows(
         item = dict(row)
         item["cluster_id"] = label
         item["cluster_method"] = "finch_first_neighbor"
+        item["cluster_backend"] = "finch_first_neighbor"
+        item["cluster_noise"] = False
+        item["cluster_confidence"] = 1.0
         clustered_rows.append(item)
     summaries = _cluster_summaries(clustered_rows, labels)
     representatives = _representatives(
@@ -526,6 +1062,7 @@ def cluster_rows(
     summary = {
         "schema": "cueqc_cluster_summary_v1",
         "method": "finch_first_neighbor",
+        "requested_method": method,
         "metric": metric,
         "candidate_count": len(rows),
         "cluster_count": len(summaries),
@@ -534,7 +1071,10 @@ def cluster_rows(
         "partition_cluster_counts": [_cluster_count(labels) for labels in partitions],
         "cluster_counts": {summary["cluster_id"]: summary["count"] for summary in summaries},
         "representatives_per_cluster": representatives_per_cluster,
+        "feature_space": feature_summary,
     }
+    if hdbscan_error:
+        summary["fallback_reason"] = f"umap_hdbscan_unavailable:{hdbscan_error}"
     return clustered_rows, representatives, summaries, summary
 
 
@@ -546,9 +1086,19 @@ def run(args: argparse.Namespace) -> int:
         rows,
         method=args.method,
         metric=args.metric,
+        feature_space=args.feature_space,
+        reducer=args.reducer,
         min_clusters=args.min_clusters,
         max_clusters=args.max_clusters,
         representatives_per_cluster=args.representatives_per_cluster,
+        min_cluster_size=args.min_cluster_size,
+        min_samples=args.min_samples,
+        selection_method=args.selection_method,
+        pca_components=args.pca_components,
+        umap_components=args.umap_components,
+        umap_neighbors=args.umap_neighbors,
+        umap_min_dist=args.umap_min_dist,
+        random_state=args.random_state,
     )
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -590,13 +1140,38 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--output-dir", required=True)
     parser.add_argument(
         "--method",
-        choices=("auto", "finch_first_neighbor"),
+        choices=("auto", "umap_hdbscan", "sklearn_hdbscan", "finch_first_neighbor"),
         default="auto",
-        help="auto currently resolves to FINCH-style first-neighbor clustering.",
+        help="auto resolves to fused embeddings + UMAP + HDBSCAN, with FINCH fallback.",
     )
     parser.add_argument("--metric", choices=("cosine", "euclidean"), default="euclidean")
+    parser.add_argument(
+        "--feature-space",
+        choices=("auto", "structured", "dense", "fused"),
+        default="auto",
+        help="auto uses fused structured+dense embeddings when embeddings are present.",
+    )
+    parser.add_argument(
+        "--reducer",
+        choices=("auto", "umap", "pca", "none"),
+        default="umap",
+        help="dimensionality reducer for sklearn_hdbscan; umap_hdbscan always uses UMAP.",
+    )
     parser.add_argument("--min-clusters", type=int, default=DEFAULT_CLUSTER_COUNT_MIN)
     parser.add_argument("--max-clusters", type=int, default=DEFAULT_CLUSTER_COUNT_MAX)
+    parser.add_argument("--min-cluster-size", type=int)
+    parser.add_argument("--min-samples", type=int)
+    parser.add_argument(
+        "--selection-method",
+        choices=("auto", "eom", "leaf"),
+        default="auto",
+        help="HDBSCAN cluster selection strategy; auto sweeps eom and leaf.",
+    )
+    parser.add_argument("--pca-components", type=int, default=8)
+    parser.add_argument("--umap-components", type=int, default=8)
+    parser.add_argument("--umap-neighbors", type=int, default=15)
+    parser.add_argument("--umap-min-dist", type=float, default=0.0)
+    parser.add_argument("--random-state", type=int, default=17)
     parser.add_argument("--representatives-per-cluster", type=int, default=3)
     parser.add_argument("--max-items", type=int)
     parser.add_argument("--title", default="CueQC cluster-first 审计")
@@ -607,6 +1182,18 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         parser.error("--min-clusters must be <= --max-clusters")
     if args.representatives_per_cluster <= 0:
         parser.error("--representatives-per-cluster must be positive")
+    if args.min_cluster_size is not None and args.min_cluster_size <= 1:
+        parser.error("--min-cluster-size must be > 1")
+    if args.min_samples is not None and args.min_samples <= 0:
+        parser.error("--min-samples must be positive")
+    if args.pca_components < 0:
+        parser.error("--pca-components must be non-negative")
+    if args.umap_components < 0:
+        parser.error("--umap-components must be non-negative")
+    if args.umap_neighbors <= 1:
+        parser.error("--umap-neighbors must be > 1")
+    if args.umap_min_dist < 0.0:
+        parser.error("--umap-min-dist must be non-negative")
     if args.max_items is not None and args.max_items <= 0:
         parser.error("--max-items must be positive")
     return args
