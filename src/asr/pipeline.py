@@ -1,4 +1,5 @@
 import importlib
+import json
 import os
 import time
 import warnings
@@ -20,6 +21,7 @@ from boundary.refiner import (
 )
 from asr import checkpoint as _checkpoint_module
 from asr import chunking as _chunking_module
+from asr import cueqc as _cueqc_module
 from asr import qc_stage as _qc_stage_module
 from asr import transcribe as _transcribe_module
 from asr.qc import collect_adaptive_precision_review
@@ -30,6 +32,7 @@ warnings.filterwarnings("ignore")
 _registry_module = importlib.reload(_registry_module)
 _chunking_module = importlib.reload(_chunking_module)
 _checkpoint_module = importlib.reload(_checkpoint_module)
+_cueqc_module = importlib.reload(_cueqc_module)
 _transcribe_module = importlib.reload(_transcribe_module)
 _qc_stage_module = importlib.reload(_qc_stage_module)
 _boundary_cache_module = importlib.reload(_boundary_cache_module)
@@ -46,6 +49,8 @@ _LAST_BOUNDARY_SIGNATURE: dict = _chunking_module._LAST_BOUNDARY_SIGNATURE
 _LAST_BOUNDARY_CACHE_EVENT: dict | None = None
 _ASR_SLIDING_CONTEXT_SEGS = _transcribe_module._ASR_SLIDING_CONTEXT_SEGS
 _ASR_CHECKPOINT_ENABLED = _transcribe_module._ASR_CHECKPOINT_ENABLED
+CUEQC_TAXONOMY_VERSION = _cueqc_module.CUEQC_TAXONOMY_VERSION
+CUEQC_MODEL_VERSION = _cueqc_module.CUEQC_MODEL_VERSION
 
 def _env_bool(name: str, default: str) -> bool:
     return os.getenv(name, default).strip().lower() in {"1", "true", "yes", "on"}
@@ -220,6 +225,9 @@ _repair_postprocessed_segment_windows = _transcribe_module._repair_postprocessed
 _group_words_to_segments = _transcribe_module._group_words_to_segments
 
 _run_TRANSCRIPTION_qc = _qc_stage_module._run_TRANSCRIPTION_qc
+build_cueqc_candidates = _cueqc_module.build_candidates
+build_cueqc_shadow_report = _cueqc_module.build_shadow_report
+cueqc_enabled = _cueqc_module.cueqc_enabled
 
 
 def _sync_checkpoint_state() -> None:
@@ -604,6 +612,108 @@ def _qc_items_by_chunk(qc_report: dict) -> tuple[dict[int, dict], dict[int, dict
     return qc_items, review_items
 
 
+def _empty_cueqc_shadow_report() -> dict:
+    return _cueqc_module.build_shadow_report([])
+
+
+def _write_cueqc_candidates_if_requested(
+    candidates: list[dict],
+    *,
+    log: list[str],
+) -> None:
+    if not candidates:
+        return
+    output_path_raw = os.getenv("CUEQC_EXPORT_CANDIDATES_PATH", "").strip()
+    if not output_path_raw:
+        return
+    output_path = Path(output_path_raw).expanduser()
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    append = os.getenv("CUEQC_EXPORT_CANDIDATES_APPEND", "1").strip().lower() not in {
+        "0",
+        "false",
+        "no",
+        "off",
+    }
+    mode = "a" if append else "w"
+    with output_path.open(mode, encoding="utf-8") as handle:
+        for row in candidates:
+            handle.write(json.dumps(row, ensure_ascii=False, sort_keys=True) + "\n")
+    log.append(
+        "CueQC shadow: exported candidates path={path} count={count}".format(
+            path=_display_cache_path(str(output_path)),
+            count=len(candidates),
+        )
+    )
+
+
+def _run_cueqc_shadow(
+    *,
+    audio_path: str,
+    chunk_infos: list[dict],
+    text_results: list[dict],
+    qc_report: dict,
+    log: list[str],
+) -> tuple[dict, dict[int, dict]]:
+    if not cueqc_enabled():
+        return _empty_cueqc_shadow_report(), {}
+    try:
+        audio_id = Path(audio_path).stem
+        candidates = build_cueqc_candidates(
+            chunk_infos,
+            text_results,
+            qc_report=qc_report,
+            audio_id=audio_id,
+            video_id=audio_id,
+        )
+        report = build_cueqc_shadow_report(candidates)
+        if os.getenv("CUEQC_SHADOW_EMBED_CANDIDATES", "0").strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }:
+            report["candidates"] = candidates
+        _write_cueqc_candidates_if_requested(candidates, log=log)
+        decision_by_chunk = {
+            int(item["chunk_index"]): {
+                key: value
+                for key, value in item.items()
+                if key
+                in {
+                    "schema",
+                    "schema_version",
+                    "model_version",
+                    "taxonomy_version",
+                    "mode",
+                    "qc_decision",
+                    "content_type",
+                    "cluster_id",
+                    "alignment_policy",
+                    "display_hint",
+                    "confidence",
+                    "reasons",
+                }
+            }
+            for item in report.get("decisions", [])
+            if item.get("chunk_index") is not None
+        }
+        log.append(
+            "CueQC shadow: candidates={count} display={display} align={align}".format(
+                count=report.get("candidate_count", 0),
+                display=dict((report.get("counts") or {}).get("display_hint") or {}),
+                align=dict((report.get("counts") or {}).get("alignment_policy") or {}),
+            )
+        )
+        return report, decision_by_chunk
+    except Exception as exc:
+        log.append(f"CueQC shadow: failed conservatively, all chunks continue align ({exc!r})")
+        return {
+            **_empty_cueqc_shadow_report(),
+            "error": repr(exc),
+            "candidate_count": 0,
+        }, {}
+
+
 def _segment_alignment_outcome(segment: dict, outcomes: dict[int, dict]) -> dict:
     chunk_indices: list[int] = []
     for word in segment.get("words") or []:
@@ -740,6 +850,7 @@ def _transcribe_and_align_local(
                 "segment_count": 0,
                 "boundary_no_speech": True,
                 "boundary_signature": dict(_LAST_BOUNDARY_SIGNATURE),
+                "cueqc_shadow": _empty_cueqc_shadow_report(),
             }
             return [], log, details
 
@@ -810,6 +921,13 @@ def _transcribe_and_align_local(
                 for chunk, text_result in zip(chunk_infos, text_results)
             ]
             qc_items, review_items = _qc_items_by_chunk(qc_report)
+            cueqc_shadow_report, cueqc_shadow_by_chunk = _run_cueqc_shadow(
+                audio_path=audio_path,
+                chunk_infos=chunk_infos,
+                text_results=text_results,
+                qc_report=qc_report,
+                log=log,
+            )
 
             unload_started = time.perf_counter()
             backend.unload_model(on_stage=on_stage)
@@ -905,6 +1023,14 @@ def _transcribe_and_align_local(
                 text_results,
                 alignment_outcomes,
             )
+            for transcript_chunk in transcript_chunks:
+                try:
+                    chunk_index = int(transcript_chunk.get("index"))
+                except (TypeError, ValueError):
+                    continue
+                cueqc_shadow = cueqc_shadow_by_chunk.get(chunk_index)
+                if cueqc_shadow:
+                    transcript_chunk["cueqc_shadow"] = dict(cueqc_shadow)
         finally:
             backend.close()
 
@@ -914,6 +1040,25 @@ def _transcribe_and_align_local(
         segments = _group_words_to_segments(word_dicts)
         segments = _postprocess_segments(segments)
         segments = _annotate_segments_with_alignment_outcomes(segments, alignment_outcomes)
+        for segment in segments:
+            chunk_indices: list[int] = []
+            for word in segment.get("words") or []:
+                try:
+                    chunk_indices.append(int(word.get("source_chunk_index")))
+                except (TypeError, ValueError):
+                    continue
+            if not chunk_indices:
+                try:
+                    chunk_indices.append(int(segment.get("source_chunk_index")))
+                except (TypeError, ValueError):
+                    pass
+            shadows = [
+                cueqc_shadow_by_chunk[index]
+                for index in list(dict.fromkeys(chunk_indices))
+                if index in cueqc_shadow_by_chunk
+            ]
+            if shadows:
+                segment["cueqc_shadow"] = shadows[0] if len(shadows) == 1 else shadows
         segment_elapsed = time.perf_counter() - segment_started
         _record_stage_timing(
             log, timings, "subtitle_segment_s", "字幕分段", segment_elapsed
@@ -936,6 +1081,7 @@ def _transcribe_and_align_local(
             "chunk_count": len(chunk_infos),
             "transcript_chunks": transcript_chunks,
             "asr_qc": qc_report,
+            "cueqc_shadow": cueqc_shadow_report,
             "stage_timings": timings,
             "word_count": len(word_dicts),
             "segment_count": len(segments),
