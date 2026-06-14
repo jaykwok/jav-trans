@@ -55,6 +55,8 @@ def test_aligned_cache_signature_uses_full_subtitle_options(
     assert expected["subtitle"]["video_fps"] == 25.0
     assert expected["subtitle"]["effective_video_fps"] == 25.0
     assert expected["subtitle"]["frame_gap_s"] == pytest.approx(2 / 25.0)
+    assert expected["subtitle"]["display_policy"]["mode"] == "readability"
+    assert expected["subtitle"]["display_policy"]["version"] == 1
     assert "dense_cue_merge_enabled" not in expected["subtitle"]
 
 
@@ -98,11 +100,42 @@ def test_aligned_segments_written_with_audio_cache_key(monkeypatch, tmp_path):
     assert payload["backend"] == "mock_asr"
     assert payload["audio_cache_key"]
     assert payload["cache_stage"] == "ready"
-    assert payload["cache_signature"]["version"] == 5
+    assert payload["cache_signature"]["version"] == 7
     assert payload["cache_signature"]["subtitle"]["timeline_mode"] == "alignment"
+    assert payload["cache_signature"]["subtitle"]["display_policy"]["mode"] == "readability"
     assert payload["segments"] == [{"start": 0.0, "end": 1.0, "text": "こんにちは"}]
     assert payload["asr_log"] == ["mock asr"]
     _assert_no_project_absolute_path(aligned_path.read_text(encoding="utf-8"))
+
+
+def test_aligned_cache_signature_changes_with_display_policy(monkeypatch, tmp_path):
+    video_path = tmp_path / "clip.mp4"
+    video_path.write_bytes(b"fake-video")
+    ctx = make_job_context(
+        video_path,
+        tmp_path / "out",
+        tmp_path / "jobs",
+        skip_translation=True,
+        keep_temp_files=True,
+    )
+    _configure(monkeypatch)
+    monkeypatch.setattr(pipeline_audio, "probe_video_fps", lambda _path: 25.0)
+
+    default_signature = main.aligned_cache_expectations_for_ctx(
+        ctx,
+        backend_label="mock_asr",
+        video_fps=25.0,
+    )[1]
+    monkeypatch.setenv("SUBTITLE_DISPLAY_POLICY", "off")
+    off_signature = main.aligned_cache_expectations_for_ctx(
+        ctx,
+        backend_label="mock_asr",
+        video_fps=25.0,
+    )[1]
+
+    assert default_signature["subtitle"]["display_policy"]["mode"] == "readability"
+    assert off_signature["subtitle"]["display_policy"]["mode"] == "off"
+    assert default_signature != off_signature
 
 
 def test_aligned_segments_cache_hit_skips_asr(monkeypatch, tmp_path):
