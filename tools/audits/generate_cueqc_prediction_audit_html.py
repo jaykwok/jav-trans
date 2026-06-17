@@ -29,6 +29,14 @@ from tools.audits.generate_cueqc_cluster_audit_html import (  # noqa: E402
 
 
 LABEL_SCHEMA = "cueqc_false_drop_audit_label_v1"
+REASON_TAG_OPTIONS = [
+    {"value": "dialogue", "label": "正常对白"},
+    {"value": "vocalization", "label": "语气词/呻吟"},
+    {"value": "breath", "label": "呼吸声"},
+    {"value": "environment", "label": "环境/噪声"},
+    {"value": "overlap", "label": "多人/重叠"},
+    {"value": "short_fragment", "label": "短碎片"},
+]
 
 
 def _confidence_bin(row: Mapping[str, Any]) -> str:
@@ -232,11 +240,7 @@ textarea { width: 100%; min-height: 70px; border: 1px solid var(--line); border-
         <button data-label="uncertain">不确定</button>
       </div>
       <div class="tags" style="margin-top:10px">
-        <button data-tag="dialogue">正常对白</button>
-        <button data-tag="vocalization">语气词/呻吟</button>
-        <button data-tag="environment">环境/噪声</button>
-        <button data-tag="overlap">多人/重叠</button>
-        <button data-tag="short_fragment">短碎片</button>
+%%REASON_TAG_BUTTONS%%
       </div>
       <p class="meta" id="labelStatus"></p>
     </section>
@@ -517,9 +521,14 @@ def _page_html(
     rows: list[dict[str, Any]],
     cues_by_video: Mapping[str, list[dict[str, Any]]],
 ) -> str:
+    reason_tag_buttons = "\n".join(
+        f'        <button data-tag="{option["value"]}">{option["label"]}</button>'
+        for option in REASON_TAG_OPTIONS
+    )
     return (
         HTML_TEMPLATE
         .replace("%%TITLE%%", title)
+        .replace("%%REASON_TAG_BUTTONS%%", reason_tag_buttons)
         .replace("%%ROWS_JSON%%", json_for_script(rows))
         .replace("%%CUES_JSON%%", json_for_script(cues_by_video))
         .replace("%%DATASET_ID_JSON%%", json.dumps(dataset_id, ensure_ascii=False))
@@ -600,6 +609,7 @@ def build_audit(
         "label_schema": LABEL_SCHEMA,
         "label_export": "cueqc_false_drop_audit_labels.jsonl",
         "manual_decision_options": ["drop_ok", "false_drop_keep", "uncertain"],
+        "reason_tag_options": REASON_TAG_OPTIONS,
     }
     write_json(output_dir / "summary.json", summary)
     if refresh_nav:

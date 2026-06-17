@@ -67,4 +67,6 @@ def test_cueqc_prediction_audit_builds_html_with_label_schema(tmp_path: Path):
     assert summary["review_item_count"] == 1
     assert summary["label_schema"] == audit.LABEL_SCHEMA
     assert "误删应保留" in html
+    assert "呼吸声" in html
     assert "cueqc_false_drop_audit_labels.jsonl" in html
+    assert {"value": "breath", "label": "呼吸声"} in summary["reason_tag_options"]
