@@ -8,6 +8,7 @@ import pytest
 import torch
 
 from tools.asr.cueqc import extract_features_v3_fusion
+from tools.asr.cueqc import merge_features_v3_fusion
 from tools.asr.cueqc import predict_v3_fusion
 from tools.asr.cueqc import train_mamba_v3_fusion
 
@@ -65,6 +66,25 @@ def test_cueqc_v3_feature_extractor_marks_unlabeled_candidate_rows():
     }
 
     assert extract_features_v3_fusion._label_from_row(row) == -1
+
+
+def test_cueqc_v3_feature_merge_preserves_unlabeled_shards(tmp_path: Path):
+    shard_a = tmp_path / "a.pt"
+    shard_b = tmp_path / "b.pt"
+    out = tmp_path / "merged.pt"
+    torch.save(_feature_bundle(label=-1), shard_a)
+    bundle_b = _feature_bundle(label=1)
+    bundle_b["samples"][0]["sample_id"] = "cueqc-VIDEO-chunk00002"
+    bundle_b["meta"][0]["sample_id"] = "cueqc-VIDEO-chunk00002"
+    torch.save(bundle_b, shard_b)
+
+    summary = merge_features_v3_fusion.merge([shard_a, shard_b], out)
+    merged = torch.load(out, map_location="cpu", weights_only=False)
+
+    assert summary["samples"] == 2
+    assert summary["labels_unlabeled"] == 1
+    assert merged["labels"].tolist() == [-1, 1]
+    assert len(merged["samples"]) == 2
 
 
 def test_cueqc_v3_training_rejects_unlabeled_feature_bundle(tmp_path: Path):
