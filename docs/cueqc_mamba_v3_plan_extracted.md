@@ -1,6 +1,6 @@
 # CueQC Mamba v3-Fusion Plan
 
-本文件是当前 CueQC 权威计划。`cueqc_mamba_v2_plan.md` 只保留为历史废案，不再作为实现依据。
+本文件是当前 CueQC 权威计划。`cueqc_mamba_v2_plan.md` 只保留为历史废案，不再作为实现依据。实验流水账和取舍背景记录在 `HISTORY.md`，本文件只保留当前边界、已执行状态和剩余计划。
 
 ## 当前边界
 
@@ -10,6 +10,7 @@
 - 模型不可用、加载失败或推理异常时一律 fallback `keep`。
 - 不再打 `content_type`、`qc_decision`、`alignment_policy`、`compact`、`review` 训练标签。
 - 不引入 BGE、sentence-transformers、HuBERT、UMAP/HDBSCAN/FINCH 或额外 audio embedding 作为默认依赖。
+- Torque Clustering 只作为第一次 cold-start 粗标签工具，不进入 runtime、自训练或长期 QC 分类器。
 
 ## Runtime Flow
 
@@ -50,6 +51,8 @@ Runtime decision schema:
   "confidence": 0.0,
   "display_prob_keep": 0.0,
   "display_prob_drop": 0.0,
+  "drop_threshold": 0.85,
+  "threshold_profile": {},
   "reasons": []
 }
 ```
@@ -61,195 +64,25 @@ Training labels are encoded as:
 
 The safety objective is conservative subtraction: maximize keep recall and minimize false drop rate, accepting lower drop recall during cold start.
 
-## Bootstrap Clustering
+## Executed State
 
-Torque Clustering is only a one-time bootstrap tool for roughly 300 sampled chunks:
+- Bootstrap pool: CueQC 合入前 baseline commit `5afe535` 的 10 部全片，不翻译、保留 ASR chunks；NAMH-055 固定为 smoke / holdout，不进入 10-film training pool。
+- Candidate pool: `agents/temp/20260615_152934_cueqc-10film-candidates/cueqc_candidates.full.jsonl`，共 `45643` 条；分层抽样 `300` 条用于 cold-start。
+- Bootstrap clustering: Torque Clustering `--merge-layer 1` 得到 7 簇；用户完成簇级 `keep/drop` 标注后广播成 cold-start seed。旧 HDBSCAN/FINCH/UMAP/PCA/embedding 路线已退役。
+- Cold-start training: 300 条种子最终 labels `keep=133/drop=167`；首轮过拟合模型废弃，保守配置作为 Stage 2 起点。
+- Stage 2 feature pool: `agents/temp/20260617_113159_cueqc-v3-10film-sharded-features/cueqc_full_features_v3_fusion.pt`，46 个 shard 合并，`45643` unlabeled records。
+- Stage 2 audits: 三轮 false-drop 审计合计 `600` 条，`drop_ok=573 / false_drop_keep=25 / uncertain=2`。
+- Stage 2b default checkpoint: `src/asr/checkpoints/cueqc_mamba_v3_fusion.pt`，sha1 `98f9631a63dc19736b50619100fb4be4d08075e8`。
+- Adaptive threshold profile: base `drop_threshold=0.85`，`text_bucket=short_text` 提升到 `0.87`，由 `src/asr/cueqc_thresholds.py` 在 runtime 与 offline prediction 共用。
+- Adaptive 10-film prediction: `agents/temp/20260617_174344_cueqc-v3-stage2b-adaptive-10film-predictions/`，records `45643`，`drop=19380/keep=26263`，high-confidence pseudo `drop=19380/keep=1372`。
 
-1. Cluster sampled candidates.
-2. Human labels each cluster as `keep` or `drop`.
-3. `compile_training_set.py --cluster-labels cueqc_cluster_labels.jsonl` broadcasts cluster labels to sample rows.
-4. Train the first v3-Fusion checkpoint.
+## Remaining V3 Plan
 
-Important constraints:
-
-- Clustering does not enter runtime.
-- Clustering does not enter self-training.
-- Mixed clusters are acceptable seed noise.
-- No `--method` compatibility layer.
-- No per-sample `cueqc_manual_labels.jsonl` compatibility.
-
-## Stage 2: Self-Training
-
-After cold start:
-
-1. Run CueQC v3-Fusion on the 10-film candidate pool.
-2. Collect high-confidence `keep` / `drop` pseudo labels.
-3. Manually audit false drop risk.
-4. Expand the training set.
-5. Retrain CueQC v3-Fusion.
-
-Primary acceptance metrics:
-
-- keep recall
-- false drop rate
-- drop precision / recall as secondary metrics
-
-Current Stage 2 tooling:
-
-```powershell
-$env:PYTHONIOENCODING='utf-8'
-uv run python -B tools/asr/cueqc/extract_features_v3_fusion.py `
-  --input agents/temp/20260615_152934_cueqc-10film-candidates/cueqc_candidates.full.jsonl `
-  --audio-root agents/temp/20260615_094437_b5/agents/temp/speech-boundary-ja/20260615_094437_o10 `
-  --output agents/temp/YYYYMMDD_HHMMSS_cueqc-v3-10film-full-features/shards/shard_00000.pt `
-  --device auto `
-  --start-index 0 `
-  --max-samples 1000 `
-  --audio-cache-size 1
-
-uv run python -B tools/asr/cueqc/merge_features_v3_fusion.py `
-  --input agents/temp/YYYYMMDD_HHMMSS_cueqc-v3-10film-full-features/shards/shard_00000.pt `
-  --output agents/temp/YYYYMMDD_HHMMSS_cueqc-v3-10film-full-features/cueqc_full_features_v3_fusion.pt
-
-uv run python -B tools/asr/cueqc/predict_v3_fusion.py `
-  --features agents/temp/YYYYMMDD_HHMMSS_cueqc-v3-10film-full-features/cueqc_full_features_v3_fusion.pt `
-  --checkpoint src/asr/checkpoints/cueqc_mamba_v3_fusion.pt `
-  --output-dir agents/temp/YYYYMMDD_HHMMSS_cueqc-v3-10film-predictions `
-  --device auto
-```
-
-For the 45643-row pool, run feature extraction in shards (`--start-index` +
-`--max-samples`) and merge them with `merge_features_v3_fusion.py`; a single
-all-in-one extraction has no intermediate save point and is too costly to retry.
-The extractor caches decoded full-video wav arrays while processing a shard
-(`--audio-cache-size`, default `1`), which avoids rereading the same 100-400MB
-wav for every chunk while keeping memory bounded.
-`extract_features_v3_fusion.py --input` writes unlabeled samples with label `-1`.
-`train_mamba_v3_fusion.py` rejects unlabeled bundles; run `predict_v3_fusion.py`
-first, audit false-drop risk from `cueqc_pseudo_labels.high_conf.jsonl`, then
-merge accepted pseudo labels with the cold-start seed before retraining.
-
-After the false-drop audit, compile Stage 2a features without rerunning ASR
-internals:
-
-```powershell
-$env:PYTHONIOENCODING='utf-8'
-uv run python -B tools/asr/cueqc/compile_stage2a_features_v3_fusion.py `
-  --cold-start-features agents/temp/20260617_cueqc-mamba-v3-fusion/cueqc_train_features_v3_fusion.pt `
-  --full-features agents/temp/20260617_113159_cueqc-v3-10film-sharded-features/cueqc_full_features_v3_fusion.pt `
-  --pseudo-labels agents/temp/20260617_130642_cueqc-v3-10film-predictions/cueqc_pseudo_labels.high_conf.jsonl `
-  --false-drop-audit-labels agents/audits/20260617_130642_cueqc-v3-false-drop-audit/cueqc_false_drop_audit_labels.jsonl `
-  --output agents/temp/YYYYMMDD_HHMMSS_cueqc-v3-stage2a-training-features/cueqc_stage2a_train_features_v3_fusion.pt
-```
-
-Stage 2a policy:
-
-- Manual false-drop audit labels override cold-start seed labels.
-- `drop_ok` becomes `drop=0`; `false_drop_keep` becomes `keep=1`.
-- `uncertain` is skipped.
-- High-confidence `keep` pseudo labels are included.
-- Unaudited high-confidence `drop` pseudo labels are skipped.
-
-2026-06-17 run status:
-
-- Full 10-film feature extraction completed in 46 shards under
-  `agents/temp/20260617_113159_cueqc-v3-10film-sharded-features/`.
-- Merged bundle:
-  `agents/temp/20260617_113159_cueqc-v3-10film-sharded-features/cueqc_full_features_v3_fusion.pt`
-  (`45643` unlabeled records).
-- Prediction output:
-  `agents/temp/20260617_130642_cueqc-v3-10film-predictions/`.
-- Prediction counts: `keep=31055`, `drop=14588`; high-confidence pseudo labels:
-  `14629` total (`drop=14588`, `keep=41`).
-- Because high-confidence drop volume is large, do not retrain directly from
-  these pseudo labels. First audit false-drop risk via
-  `agents/audits/20260617_130642_cueqc-v3-false-drop-audit/index.html`.
-- User audit export:
-  `agents/audits/20260617_130642_cueqc-v3-false-drop-audit/cueqc_false_drop_audit_labels.jsonl`.
-- Audit result: `200` reviewed, `178 drop_ok`, `21 false_drop_keep`,
-  `1 uncertain`; raw false-drop rate `10.5%`. Stratified population-weighted
-  estimate over `drop>=0.85` is about `4.2%`, still too high for accepting all
-  `14588` high-confidence drop pseudo labels.
-- Stage 2a compiled bundle:
-  `agents/temp/20260617_143121_cueqc-v3-stage2a-training-features/cueqc_stage2a_train_features_v3_fusion.pt`.
-  Records: `538`, labels `drop=344/keep=194`. Sources:
-  `298` cold-start seed, `178` manual `drop_ok`, `21` manual false-drop keep,
-  `41` high-confidence keep pseudo. The `14588` unaudited drop pseudo labels
-  were skipped.
-- Stage 2a training output:
-  `agents/temp/20260617_143911_cueqc-v3-stage2a-train/cueqc_mamba_v3_fusion.pt`.
-  At `drop_threshold=0.85`, fixed holdout `867HTTM-0045` still has
-  `keep_recall=0.9375` and `false_drop_rate=0.0625`, so it is not safe to
-  replace the default checkpoint.
-- Threshold scan shows `drop_threshold=0.88` reaches holdout
-  `keep_recall=1.0 / false_drop_rate=0.0` with lower `drop_recall=0.618`.
-  The t=0.88 10-film prediction output is
-  `agents/temp/20260617_144200_cueqc-v3-stage2a-10film-predictions-t088/`:
-  `keep=35936/drop=9707`, high-confidence pseudo labels
-  `drop=9707/keep=1507`.
-- A new t=0.88 false-drop audit is required before replacing the runtime
-  checkpoint:
-  `agents/audits/20260617_144327_cueqc-v3-stage2a-t088-false-drop-audit/index.html`.
-  In this state, keep `src/asr/checkpoints/cueqc_mamba_v3_fusion.pt` unchanged.
-- The t=0.88 audit result is improved but not clean enough:
-  `197 drop_ok / 3 false_drop_keep`, false-drop rate `1.5%`.
-  Raising threshold to `0.92` avoids these audited false drops but leaves only
-  `337` predicted drops, so threshold-only replacement is not useful.
-- Stage 2b compiled bundle:
-  `agents/temp/20260617_161704_cueqc-v3-stage2b-training-features/cueqc_stage2b_train_features_v3_fusion.pt`.
-  Records: `2177`, labels `drop=532/keep=1645`. Sources:
-  `375` manual `drop_ok`, `24` manual false-drop keep, `1504` high-confidence
-  keep pseudo, plus remaining cold-start seed. The `9707` unaudited t=0.88 drop
-  pseudo labels were skipped.
-- Stage 2b training output:
-  `agents/temp/20260617_161806_cueqc-v3-stage2b-train/cueqc_mamba_v3_fusion.pt`.
-  Fixed holdout `867HTTM-0045` reaches `keep_recall=1.0`,
-  `false_drop_rate=0.0`, `drop_precision=1.0`, `drop_recall=0.8475`.
-  Replay over the first two audit rounds keeps all `24` manually corrected
-  `false_drop_keep` samples.
-- Stage 2b full prediction:
-  `agents/temp/20260617_162231_cueqc-v3-stage2b-10film-predictions/`.
-  Counts: `drop=19456/keep=26187`. Because the model is more aggressive on the
-  full pool, a fresh false-drop audit is required before replacing the runtime
-  checkpoint:
-  `agents/audits/20260617_162350_cueqc-v3-stage2b-false-drop-audit/index.html`.
-  This gate has now been reviewed.
-- The Stage 2b false-drop audit page includes reason tags:
-  `dialogue`, `vocalization`, `breath`, `environment`, `overlap`,
-  `short_fragment`. `breath / 呼吸声` was added after the initial Stage 2b page
-  generation and the same audit directory was regenerated before manual labels
-  were exported.
-- Stage 2b gate result:
-  `agents/audits/20260617_162350_cueqc-v3-stage2b-false-drop-audit/cueqc_false_drop_audit_labels.jsonl`
-  has `198 drop_ok`, `1 false_drop_keep`, and `1 uncertain`. The only false
-  drop is a `short_text` sample with `p_drop=0.864778`.
-- Default runtime checkpoint:
-  `src/asr/checkpoints/cueqc_mamba_v3_fusion.pt` is now Stage 2b with an
-  adaptive threshold profile. Base `drop_threshold=0.85`; `short_text` uses
-  `0.87`; other buckets use the base threshold. This keeps all `25` manually
-  corrected `false_drop_keep` samples across three audit rounds while retaining
-  `540/573` audited `drop_ok` samples as drop.
-- Adaptive full prediction output:
-  `agents/temp/20260617_174344_cueqc-v3-stage2b-adaptive-10film-predictions/`.
-  Counts: `drop=19380/keep=26263`; high-confidence pseudo labels
-  `drop=19380/keep=1372`. Checkpoint sha1:
-  `98f9631a63dc19736b50619100fb4be4d08075e8`.
-
-## Stage 3: Boundary Feedback
-
-Later, `display=drop` chunks can be mined as Boundary preference / hard-case data:
-
-- very short noise chunks
-- invalid speech islands
-- chunks that should be merged into neighbors
-- repeated no-subtitle-value fragments
-
-The current false-drop audit has `178` manually confirmed `drop_ok` chunks.
-They are good candidates for a later Boundary hard-negative / preference
-finetune set, but they are not compiled into Boundary training yet. Keep this
-as a separate Stage 3 task after CueQC Stage 2a retraining is evaluated.
-
-This remains an offline preference-training loop. CueQC decisions must not be coupled into Boundary runtime planning.
+- Run NAMH-055 full workflow smoke with the promoted Stage 2b adaptive checkpoint. Current docs have no evidence that this was executed after checkpoint promotion.
+- Continue false-drop / keep-recall audits before accepting any new high-confidence drop pseudo labels into training.
+- If more self-training is needed, repeat the Stage 2 loop: predict on full pool, audit false drops, compile accepted labels, retrain, replay all historical false-drop audits, then promote only if keep recall remains safe.
+- Compile confirmed `display=drop` and short invalid chunks into a separate Boundary hard-case / preference dataset. This Stage 3 task has not been executed and must stay offline; CueQC decisions must not be coupled into Boundary runtime planning.
+- Revisit forced `forced/native/hybrid` aligner A/B separately if model size or cost becomes a priority. CueQC v3-Fusion does not decide aligner removal.
 
 ## Active Files
 
@@ -257,9 +90,11 @@ This remains an offline preference-training loop. CueQC decisions must not be co
 - `src/asr/cueqc_features.py`
 - `src/asr/cueqc_model.py`
 - `src/asr/cueqc_refiner.py`
+- `src/asr/cueqc_thresholds.py`
 - `src/asr/asr_internals.py`
 - `src/asr/pipeline.py`
 - `tools/asr/cueqc/cluster_candidates.py`
+- `tools/asr/cueqc/torque.py`
 - `tools/asr/cueqc/compile_training_set.py`
 - `tools/asr/cueqc/extract_features_v3_fusion.py`
 - `tools/asr/cueqc/merge_features_v3_fusion.py`
@@ -267,3 +102,4 @@ This remains an offline preference-training loop. CueQC decisions must not be co
 - `tools/asr/cueqc/compile_stage2a_features_v3_fusion.py`
 - `tools/asr/cueqc/train_mamba_v3_fusion.py`
 - `tools/audits/generate_cueqc_cluster_audit_html.py`
+- `tools/audits/generate_cueqc_prediction_audit_html.py`
