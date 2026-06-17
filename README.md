@@ -323,4 +323,8 @@ uv run python -m tools.web.smoke.summarize_job --job-id <job_id> --run-dir agent
 - `tools.audits.generate_*_audit_html`：生成字幕、alignment、CueQC prediction、Boundary preference 等人工审计页。
 - `tools.asr.diagnostics.*`：分析 alignment failure、fallback timing、安全边界和 ASR hard-negative 候选。
 - `tools.boundary.*`、`tools.boundary.ja.*`：Boundary preference、silver mining、训练数据构建、SpeechBoundary-JA 训练和 frame score 导出工具。
+- `tools.boundary.export_cueqc_drop_hardcases`：把 CueQC false-drop 审计中已确认可丢弃的 chunk 导出为 Boundary / SpeechBoundary hard-case 候选池；不会生成可直接训练 v5.1 的 delta 标签。
+- `tools.boundary.prepare_cueqc_drop_v51_sources`：把 CueQC drop hard-case 候选补回审计音频，切出 SpeechBoundary-JA negative labels，并生成 Boundary preference seed；不会直接启动训练。
+- `tools.boundary.ja.build_positive_anchor_replay`：从 anime / galgame 源 manifest 按权重抽样生成 SpeechBoundary-JA positive anchor replay labels；默认提高 NSFW 权重为 `anime_nsfw=55 / anime_sfw=20 / galgame=25`。
+- `tools.boundary.prepare_speech_boundary_hard_negative_finetune`：校验 SpeechBoundary-JA hard-negative finetune source，混合 positive/synthetic anchor replay，输出 feature-cache / tiny smoke 脚本，并在缺少 anchor 或负样本占比过高时阻止正式训练。
 - `tools.boundary.prepare_v51_training`：生成 Boundary v5.1 preference finetune 准备包，校验现有 v5 checkpoint 架构并写出 dry-run / head-finetune 命令；不会替换默认 checkpoint。
