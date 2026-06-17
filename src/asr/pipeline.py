@@ -845,6 +845,8 @@ def _run_cueqc_shadow(
                     "reasons",
                     "display_prob_keep",
                     "display_prob_drop",
+                    "drop_threshold",
+                    "threshold_profile",
                 }
             }
             for item in report.get("decisions", [])

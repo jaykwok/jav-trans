@@ -97,7 +97,9 @@ class CueQCRefinerV3Fusion:
         self.structured_std = np.asarray(norm.get("structured_std", []), dtype=np.float32)
 
         decision = checkpoint.get("decision_config") or {}
+        self.decision_config = dict(decision)
         self.drop_threshold = float(decision.get("drop_threshold", 0.85))
+        self.drop_threshold_profile = decision.get("drop_threshold_profile") or {}
         self.fallback_policy = str(decision.get("fallback_policy", "keep"))
 
     def signature(self) -> dict[str, Any]:
@@ -108,6 +110,7 @@ class CueQCRefinerV3Fusion:
             "sha1": self.sha1,
             "decision_version": self.decision_version,
             "drop_threshold": self.drop_threshold,
+            "drop_threshold_profile": self.drop_threshold_profile,
             "feature_config": self.feature_config,
         }
 
@@ -269,7 +272,14 @@ class CueQCRefinerV3Fusion:
             j = next(ok_iter)
             p_drop = float(probs[j, 0])
             p_keep = float(probs[j, 1])
-            is_drop = p_drop >= self.drop_threshold
+            from asr.cueqc_thresholds import resolve_drop_threshold
+
+            threshold, threshold_info = resolve_drop_threshold(
+                self.decision_config,
+                text=cand.get("text", ""),
+                default=self.drop_threshold,
+            )
+            is_drop = p_drop >= threshold
             display = "drop" if is_drop else "keep"
             confidence = round(p_drop if is_drop else p_keep, 4)
             decisions[i] = {
@@ -282,7 +292,9 @@ class CueQCRefinerV3Fusion:
                 "confidence": confidence,
                 "display_prob_keep": round(p_keep, 4),
                 "display_prob_drop": round(p_drop, 4),
-                "reasons": [f"cueqc_mamba_v3:{display}:p_drop={p_drop:.3f}"],
+                "drop_threshold": round(threshold, 4),
+                "threshold_profile": threshold_info,
+                "reasons": [f"cueqc_mamba_v3:{display}:p_drop={p_drop:.3f}:threshold={threshold:.3f}"],
             }
         return decisions
 

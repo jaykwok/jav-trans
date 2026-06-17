@@ -12,6 +12,7 @@ from tools.asr.cueqc import compile_stage2a_features_v3_fusion
 from tools.asr.cueqc import merge_features_v3_fusion
 from tools.asr.cueqc import predict_v3_fusion
 from tools.asr.cueqc import train_mamba_v3_fusion
+from asr.cueqc_thresholds import resolve_drop_threshold
 
 
 def _feature_sample(label: int = -1) -> dict:
@@ -90,6 +91,24 @@ def test_cueqc_v3_feature_extractor_marks_unlabeled_candidate_rows():
     }
 
     assert extract_features_v3_fusion._label_from_row(row) == -1
+
+
+def test_cueqc_threshold_profile_only_raises_risky_text_bucket():
+    config = {
+        "drop_threshold": 0.85,
+        "drop_threshold_profile": {
+            "mode": "text_bucket_profile_v1",
+            "text_bucket": {"short_text": 0.87, "medium_text": 0.80},
+        },
+    }
+
+    short_threshold, short_info = resolve_drop_threshold(config, text="あ...", default=0.85)
+    medium_threshold, medium_info = resolve_drop_threshold(config, text="気持ちいい...", default=0.85)
+
+    assert short_threshold == 0.87
+    assert short_info["text_bucket"] == "short_text"
+    assert medium_threshold == 0.85
+    assert medium_info["text_bucket"] == "medium_text"
 
 
 def test_cueqc_v3_feature_merge_preserves_unlabeled_shards(tmp_path: Path):
@@ -267,6 +286,87 @@ def test_cueqc_v3_predict_exports_high_confidence_pseudo_labels(tmp_path: Path, 
     assert len(pseudo_rows) == 1
     assert pseudo_rows[0]["targets"]["display_decision"] == "drop"
     assert pseudo_rows[0]["targets"]["display_label"] == 0
+
+
+def test_cueqc_v3_predict_uses_checkpoint_threshold_profile(tmp_path: Path, monkeypatch):
+    features_path = tmp_path / "features.pt"
+    checkpoint_path = tmp_path / "checkpoint.pt"
+    output_dir = tmp_path / "pred"
+    torch.save(_feature_bundle(label=-1), features_path)
+    checkpoint = {
+        "schema": "cueqc_mamba_checkpoint_v3_fusion",
+        "model_config": {
+            "asr_dim": 4,
+            "token_dim": 2,
+            "decoder_dim": 3,
+            "structured_dim": 2,
+            "hidden_size": 8,
+            "num_layers": 1,
+            "state_size": 8,
+            "num_heads": 2,
+            "head_dim": 8,
+            "n_groups": 1,
+            "chunk_size": 4,
+            "mlp_dim": 4,
+            "dropout": 0.0,
+        },
+        "state_dict": {},
+        "normalization": {
+            "asr_mean": torch.zeros(4),
+            "asr_std": torch.ones(4),
+            "token_mean": torch.zeros(2),
+            "token_std": torch.ones(2),
+            "decoder_mean": torch.zeros(3),
+            "decoder_std": torch.ones(3),
+            "structured_mean": torch.zeros(2),
+            "structured_std": torch.ones(2),
+        },
+        "decision_config": {
+            "drop_threshold": 0.85,
+            "drop_threshold_profile": {
+                "mode": "text_bucket_profile_v1",
+                "text_bucket": {"short_text": 0.87},
+            },
+        },
+    }
+    torch.save(checkpoint, checkpoint_path)
+
+    class StubModel(torch.nn.Module):
+        def to(self, device):
+            return self
+
+        def eval(self):
+            return self
+
+        def forward(self, **kwargs):
+            return torch.tensor([[0.86, 0.14]], dtype=torch.float32)
+
+    def fake_model_from_checkpoint(checkpoint, device):
+        return StubModel()
+
+    monkeypatch.setattr(predict_v3_fusion, "_model_from_checkpoint", fake_model_from_checkpoint)
+
+    rc = predict_v3_fusion.run(
+        SimpleNamespace(
+            features=str(features_path),
+            checkpoint=str(checkpoint_path),
+            output_dir=str(output_dir),
+            device="cpu",
+            batch_size=8,
+            drop_threshold=None,
+            keep_threshold=0.95,
+        )
+    )
+
+    assert rc == 0
+    rows = [
+        json.loads(line)
+        for line in (output_dir / "cueqc_predictions.jsonl").read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    assert rows[0]["display_hint"] == "keep"
+    assert rows[0]["drop_threshold"] == 0.87
+    assert rows[0]["threshold_profile"]["text_bucket"] == "short_text"
 
 
 def test_cueqc_stage2a_compiler_trusts_manual_labels_and_skips_unaudited_drop(tmp_path: Path):
