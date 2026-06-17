@@ -33,8 +33,6 @@ def _fallback_subtype(
     fallback_type: FallbackType,
     align_text_empty: bool,
     nonlexical_text: bool,
-    asr_review_uncertain: bool,
-    asr_qc_severity: str,
     stripped_text: str,
     duration_s: float,
     aligned_segment_count: int,
@@ -43,11 +41,6 @@ def _fallback_subtype(
     word_failure_reasons: list[str],
     zero_heavy: bool,
 ) -> str:
-    severity = (asr_qc_severity or "").strip()
-    if asr_review_uncertain:
-        return "asr_review_uncertain"
-    if severity == "reject":
-        return "asr_qc_reject"
     if nonlexical_text and align_text_empty:
         return "nonlexical_text"
     if not stripped_text and duration_s >= 1.0:
@@ -103,9 +96,7 @@ def classify_alignment_quality(
     text: str,
     duration_s: float,
     align_text_empty: bool,
-    asr_review_uncertain: bool,
     nonlexical_text: bool = False,
-    asr_qc_severity: str = "",
     alignment_mode: str = "",
     align_error: str = "",
     sentinel_lines: list[str] | tuple[str, ...] | None = None,
@@ -128,8 +119,6 @@ def classify_alignment_quality(
         fallback_type=fallback_type,
         align_text_empty=align_text_empty,
         nonlexical_text=nonlexical_text,
-        asr_review_uncertain=asr_review_uncertain,
-        asr_qc_severity=asr_qc_severity,
         stripped_text=stripped_text,
         duration_s=duration_s,
         aligned_segment_count=aligned_segment_count,
@@ -140,8 +129,6 @@ def classify_alignment_quality(
     )
 
     reasons: list[str] = []
-    if asr_review_uncertain:
-        reasons.append("asr_review_uncertain")
     if not stripped_text and duration_s >= 1.0:
         reasons.append("empty_text_for_chunk")
     if nonlexical_text and align_text_empty and not reasons:
@@ -153,10 +140,8 @@ def classify_alignment_quality(
         }
     if stripped_text and align_text_empty and not nonlexical_text:
         reasons.append("align_text_empty")
-    if stripped_text and aligned_segment_count <= 0 and not asr_review_uncertain:
+    if stripped_text and aligned_segment_count <= 0:
         reasons.append("text_without_output_segment")
-    if (asr_qc_severity or "").strip() == "reject":
-        reasons.append("asr_qc_reject")
 
     if reasons:
         return {

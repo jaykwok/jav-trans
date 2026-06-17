@@ -114,10 +114,6 @@ def _is_silver_candidate(row: dict[str, Any], words: list[dict[str, Any]]) -> tu
         reject.append("nonlexical_text")
     if row.get("align_text_empty"):
         reject.append("align_text_empty")
-    if row.get("asr_review_uncertain"):
-        reject.append("asr_review_uncertain")
-    if str(row.get("asr_qc_severity") or "") not in {"", "ok"}:
-        reject.append("asr_qc_not_ok")
     if not str(row.get("analysis_text") or row.get("text") or "").strip():
         reject.append("empty_text")
     if not words:
@@ -223,7 +219,6 @@ def mine_case(aligned_path: Path, workflow_root: Path | None) -> tuple[list[dict
                     "last_word": last_word,
                     "alignment_quality": row.get("alignment_quality", ""),
                     "fallback_subtype": row.get("fallback_subtype", ""),
-                    "asr_qc_severity": row.get("asr_qc_severity", ""),
                     "text_density_level": row.get("text_density_level", ""),
                     "label_policy": {
                         "start_weight": 1.0,
@@ -250,8 +245,6 @@ def mine_case(aligned_path: Path, workflow_root: Path | None) -> tuple[list[dict
                         "alignment_quality": row.get("alignment_quality", ""),
                         "fallback_type": row.get("fallback_type", ""),
                         "fallback_subtype": row.get("fallback_subtype", ""),
-                        "asr_qc_severity": row.get("asr_qc_severity", ""),
-                        "asr_qc_reasons": row.get("asr_qc_reasons", []),
                         "text_density_level": row.get("text_density_level", ""),
                         "fallback_window_start": row.get("fallback_window_start"),
                         "fallback_window_end": row.get("fallback_window_end"),

@@ -79,7 +79,6 @@ def _patch_pipeline(
         keep_temp_files=True,
     )
     monkeypatch.setattr(main.torch.cuda, "is_available", lambda: False)
-    monkeypatch.delenv("QC_IGNORE_EMPTY", raising=False)
     monkeypatch.setattr(
         main.asr_module,
         "_ASR_CHUNK_ROOT",
@@ -217,7 +216,7 @@ def test_translation_crash_resume_and_success_cleanup(monkeypatch, tmp_path, cap
     assert not list(job_dir.rglob("*.wav")) if job_dir.exists() else True
 
 
-def test_qc_gate_blocks_headless_before_translation(monkeypatch, tmp_path, capsys):
+def test_empty_asr_text_no_longer_runs_legacy_qc_gate(monkeypatch, tmp_path):
     video_path = tmp_path / "silence_10s.mp4"
     video_path.write_bytes(b"fake-silence")
     output_dir = tmp_path / "out"
@@ -235,18 +234,17 @@ def test_qc_gate_blocks_headless_before_translation(monkeypatch, tmp_path, capsy
         ],
     )
 
-    def fail_translate_segments(*_args, **_kwargs):
-        raise AssertionError("translation should not run after QC gate blocks")
+    def fake_translate_segments(segments, **_kwargs):
+        return (
+            ["zh-empty" for _ in segments],
+            [],
+            [],
+        )
 
-    monkeypatch.setattr(main.translator_module, "translate_segments", fail_translate_segments)
+    monkeypatch.setattr(main.translator_module, "generate_global_context", lambda _segments: "")
+    monkeypatch.setattr(main.translator_module, "translate_segments", fake_translate_segments)
 
-    with pytest.raises(
-        RuntimeError,
-        match="ASR empty text rate too high; set QC_IGNORE_EMPTY=1 to skip",
-    ):
-        run_pipeline(video_path, ctx)
+    run_pipeline(video_path, ctx)
 
-    stdout = capsys.readouterr().out
-    assert "ASR 空文本率过高" in stdout or "empty_text_ratio" in stdout
-    assert not (output_dir / "silence_10s.srt").exists()
+    assert (output_dir / "silence_10s.srt").exists()
 

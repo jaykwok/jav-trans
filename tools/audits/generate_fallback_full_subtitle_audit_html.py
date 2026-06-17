@@ -232,8 +232,6 @@ def build_review_items(
             "fallback_subtype": str(row.get("fallback_subtype") or ""),
             "failure_bucket": str(row.get("failure_bucket") or ""),
             "failure_reasons": list(row.get("failure_reasons") or []),
-            "asr_qc_severity": str(row.get("asr_qc_severity") or ""),
-            "asr_qc_reasons": list(row.get("asr_qc_reasons") or []),
             "display_text": compact_text(row.get("display_text") or row.get("text") or ""),
             "align_text": compact_text(row.get("align_text") or ""),
             "raw_text": compact_text(row.get("raw_text") or ""),
@@ -669,7 +667,6 @@ function setMetrics(item) {
     ["context", `${fmt(item.context_start)}-${fmt(item.context_end)}`],
     ["quality", `${item.alignment_quality} / ${item.fallback_subtype || "none"}`],
     ["bucket", item.failure_bucket],
-    ["asr_qc", `${item.asr_qc_severity || ""} ${(item.asr_qc_reasons || []).join(", ")}`],
     ["reasons", (item.failure_reasons || []).join(", ")],
     ["chars/sec", item.chars_per_sec == null ? "" : item.chars_per_sec]
   ];

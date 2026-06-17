@@ -237,21 +237,14 @@ def compute_quality_report(
     glossary_pairs: list[tuple],
     alignment_fallback_count: int,
     total_segments: int,
-    asr_qc: dict | None = None,
+    asr_generation: dict | None = None,
 ) -> dict:
     """Compute SRT quality metrics and flag threshold violations."""
-    asr_qc = asr_qc or {}
-    asr_generation_error_count = int(asr_qc.get("generation_error_count") or 0)
-    asr_generation_overflow_count = int(asr_qc.get("generation_overflow_count") or 0)
-    asr_timeout_count = int(asr_qc.get("timeout_count") or 0)
-    asr_quarantined_count = int(asr_qc.get("quarantined_count") or 0)
-    asr_empty_text_for_speech_count = int(asr_qc.get("empty_text_for_speech_count") or 0)
-    asr_review_uncertain_count = int(asr_qc.get("review_uncertain_count") or 0)
-    asr_review_uncertain_items = (
-        list(asr_qc.get("review_uncertain_items") or [])
-        if isinstance(asr_qc.get("review_uncertain_items"), list)
-        else []
-    )
+    asr_generation = asr_generation or {}
+    asr_generation_error_count = int(asr_generation.get("generation_error_count") or 0)
+    asr_generation_overflow_count = int(asr_generation.get("generation_overflow_count") or 0)
+    asr_timeout_count = int(asr_generation.get("timeout_count") or 0)
+    asr_quarantined_count = int(asr_generation.get("quarantined_count") or 0)
     overlap_stats = _subtitle_overlap_stats(segments)
     duration_stats = _subtitle_duration_stats(segments)
     density_stats = _subtitle_density_audit_stats(segments)
@@ -279,9 +272,6 @@ def compute_quality_report(
             "asr_generation_overflow_count": asr_generation_overflow_count,
             "asr_timeout_count": asr_timeout_count,
             "asr_quarantined_count": asr_quarantined_count,
-            "asr_empty_text_for_speech_count": asr_empty_text_for_speech_count,
-            "asr_review_uncertain_count": asr_review_uncertain_count,
-            "asr_review_uncertain_items": asr_review_uncertain_items,
             **overlap_stats,
             **duration_stats,
             **density_stats,
@@ -392,9 +382,6 @@ def compute_quality_report(
         "asr_generation_overflow_count": asr_generation_overflow_count,
         "asr_timeout_count": asr_timeout_count,
         "asr_quarantined_count": asr_quarantined_count,
-        "asr_empty_text_for_speech_count": asr_empty_text_for_speech_count,
-        "asr_review_uncertain_count": asr_review_uncertain_count,
-        "asr_review_uncertain_items": asr_review_uncertain_items,
         **overlap_stats,
         **duration_stats,
         **density_stats,

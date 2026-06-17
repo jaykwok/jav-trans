@@ -306,8 +306,6 @@ def _alignment_outcome_for_chunk(
     chunk_result: dict,
     chunk_words: list[dict],
     chunk_log: list[str],
-    qc_item: dict | None = None,
-    review_item: dict | None = None,
 ) -> dict:
     text = str(chunk_result.get("text") or chunk_result.get("raw_text") or "").strip()
     raw_mode = str(chunk_result.get("alignment_mode") or "").strip()
@@ -326,8 +324,6 @@ def _alignment_outcome_for_chunk(
         duration_s=duration,
         align_text_empty=bool(text and not compact_text),
         nonlexical_text=nonlexical_text,
-        asr_review_uncertain=bool(review_item),
-        asr_qc_severity=str((qc_item or {}).get("severity") or ""),
         alignment_mode=alignment_mode,
         align_error=str(log_meta.get("align_error") or ""),
         sentinel_lines=list(log_meta.get("sentinel_lines") or []),
@@ -348,10 +344,6 @@ def _alignment_outcome_for_chunk(
         "word_timing_failure_reasons": word_failure_reasons,
         "forced_success": quality["alignment_quality"] == "forced",
         "fallback_active": quality["fallback_type"] != "none",
-        "asr_qc_severity": str((qc_item or {}).get("severity") or ""),
-        "asr_qc_reasons": list((qc_item or {}).get("reasons") or []),
-        "asr_review_uncertain": bool(review_item),
-        "review_reasons": list((review_item or {}).get("reasons") or []),
     }
 
 
@@ -913,10 +905,6 @@ def _build_transcript_chunks(
                         "word_timing_failure_reasons",
                         "forced_success",
                         "fallback_active",
-                        "asr_qc_severity",
-                        "asr_qc_reasons",
-                        "asr_review_uncertain",
-                        "review_reasons",
                     }
                 }
             )

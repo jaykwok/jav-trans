@@ -86,7 +86,6 @@ def timings_payload(
     translation_api_retry_events: list[dict],
     outputs: dict,
     asr_log: list[str],
-    asr_qc_blocked: bool | None = None,
 ) -> dict:
     payload = {
         "video_path": video_path,
@@ -104,6 +103,4 @@ def timings_payload(
         "outputs": outputs,
         "asr_log": asr_log,
     }
-    if asr_qc_blocked is not None:
-        payload["asr_qc_blocked"] = asr_qc_blocked
     return payload

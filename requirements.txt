@@ -6,9 +6,6 @@ transformers==4.57.6
 accelerate
 numpy
 scipy
-scikit-learn>=1.9
-umap-learn
-sentence-transformers
 soundfile
 openai
 python-dotenv

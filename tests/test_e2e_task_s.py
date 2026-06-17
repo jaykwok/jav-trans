@@ -192,14 +192,13 @@ def test_s3_s4_translation_resume_then_auto_cleanup(monkeypatch, tmp_path, capsy
     assert not (job_dir / "asr_checkpoint_fake.json").exists()
 
 
-def test_s5_qc_gate_blocks_headless_before_translation(monkeypatch, tmp_path, capsys):
+def test_s5_empty_asr_text_no_longer_runs_legacy_qc_gate(monkeypatch, tmp_path):
     video_path = Path("tmp/tests/silence_10s.mp4")
     if not video_path.exists():
         video_path = tmp_path / "silence_10s.mp4"
         video_path.write_bytes(b"fake silent mp4")
 
     _configure_headless(monkeypatch)
-    monkeypatch.delenv("QC_IGNORE_EMPTY", raising=False)
     ctx = make_job_context(
         video_path,
         tmp_path / "out",
@@ -207,20 +206,18 @@ def test_s5_qc_gate_blocks_headless_before_translation(monkeypatch, tmp_path, ca
         keep_temp_files=True,
     )
     _mock_audio_and_asr(monkeypatch, _segments(3, empty=True))
-    monkeypatch.setattr(
-        main.translator_module,
-        "translate_segments",
-        lambda *_args, **_kwargs: (_ for _ in ()).throw(
-            AssertionError("translation should be blocked by QC")
-        ),
-    )
 
-    with pytest.raises(
-        RuntimeError,
-        match="ASR empty text rate too high; set QC_IGNORE_EMPTY=1 to skip",
-    ):
-        run_pipeline(video_path, ctx)
+    def fake_translate_segments(segments, **_kwargs):
+        return (
+            ["zh-empty" for _ in segments],
+            [],
+            [],
+        )
 
-    stdout = capsys.readouterr().out
-    assert "ASR 空文本率过高" in stdout or "empty_text_ratio" in stdout
+    monkeypatch.setattr(main.translator_module, "generate_global_context", lambda _segments: "")
+    monkeypatch.setattr(main.translator_module, "translate_segments", fake_translate_segments)
+
+    run_pipeline(video_path, ctx)
+
+    assert (tmp_path / "out" / f"{video_path.stem}.srt").is_file()
 

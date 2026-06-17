@@ -123,10 +123,6 @@ def is_nonlexical_text(value: Any) -> bool:
     return bool(text and _NONLEXICAL_RE.fullmatch(text))
 
 
-def qc_rank(value: Any) -> int:
-    return {"": 0, "ok": 0, "warn": 1, "reject": 2}.get(str(value or "").lower(), 1)
-
-
 def alignment_rank(result: Mapping[str, Any]) -> int:
     quality = str(result.get("alignment_quality") or "")
     subtype = str(result.get("fallback_subtype") or "")
@@ -157,8 +153,6 @@ def candidate_observables(
     challenger: Mapping[str, Any],
 ) -> dict[str, Any]:
     similarity = text_similarity(baseline.get("text"), challenger.get("text"))
-    baseline_qc = qc_rank(baseline.get("asr_qc_severity"))
-    challenger_qc = qc_rank(challenger.get("asr_qc_severity"))
     baseline_alignment = alignment_rank(baseline)
     challenger_alignment = alignment_rank(challenger)
     baseline_repeat = repeat_risk(baseline)
@@ -177,8 +171,6 @@ def candidate_observables(
 
     score_parts = {
         "asr_text_instability": round(1.0 - similarity, 6),
-        "asr_qc_delta": abs(challenger_qc - baseline_qc),
-        "asr_qc_risk": max(baseline_qc, challenger_qc),
         "repeat_nonlexical_delta": int(baseline_repeat != challenger_repeat)
         + int(baseline_nonlexical != challenger_nonlexical),
         "repeat_nonlexical_risk": int(baseline_repeat or challenger_repeat)
@@ -191,8 +183,6 @@ def candidate_observables(
     }
     score = (
         score_parts["asr_text_instability"] * 6.0
-        + score_parts["asr_qc_delta"] * 2.5
-        + score_parts["asr_qc_risk"] * 0.8
         + score_parts["repeat_nonlexical_delta"] * 2.0
         + score_parts["repeat_nonlexical_risk"] * 0.6
         + score_parts["alignment_delta"] * 2.5
@@ -204,8 +194,8 @@ def candidate_observables(
     risk_bucket = "stable_control"
     if gap_crossing:
         risk_bucket = "gap_crossing"
-    elif score_parts["alignment_delta"] or score_parts["asr_qc_delta"]:
-        risk_bucket = "qc_alignment_change"
+    elif score_parts["alignment_delta"]:
+        risk_bucket = "alignment_change"
     elif score_parts["repeat_nonlexical_delta"] or score_parts["repeat_nonlexical_risk"]:
         risk_bucket = "repeat_nonlexical"
     elif score_parts["cue_density_delta"] >= 1.0 or score_parts["cue_density_risk"] >= 6.0:
@@ -340,8 +330,6 @@ def _side_payload(candidate: Mapping[str, Any], identity: str) -> dict[str, Any]
         "duration_s": round(float(interval["end"]) - float(interval["start"]), 6),
         "text": str(result.get("text") or ""),
         "raw_text": str(result.get("raw_text") or ""),
-        "asr_qc_severity": str(result.get("asr_qc_severity") or ""),
-        "asr_qc_reasons": list(result.get("asr_qc_reasons") or []),
         "alignment_quality": str(result.get("alignment_quality") or ""),
         "fallback_subtype": str(result.get("fallback_subtype") or ""),
         "sentinel": bool(result.get("sentinel")),

@@ -286,7 +286,6 @@ function updateProgress() {{
 }}
 function metricRows(side) {{
   return [
-    ["QC", `${{side.asr_qc_severity || "ok"}} · ${{(side.asr_qc_reasons || []).join(", ") || "-"}}`],
     ["alignment", `${{side.alignment_quality || "-"}} / ${{side.fallback_subtype || "none"}}`],
     ["sentinel", side.sentinel ? "yes" : "no"],
     ["nonlexical", side.nonlexical_text ? "yes" : "no"],

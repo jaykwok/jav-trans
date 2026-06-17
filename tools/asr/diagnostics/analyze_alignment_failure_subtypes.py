@@ -168,11 +168,6 @@ def recommended_route(subtype: str, rows: list[dict[str, Any]]) -> dict[str, str
             "route": "asr_or_vad_empty",
             "next_action": "Treat as ASR/SpeechBoundary proposal issue; collect hard negatives and compare with ASR confidence/QC before changing aligner.",
         }
-    if subtype == "asr_review_uncertain":
-        return {
-            "route": "asr_qc_policy",
-            "next_action": "Keep as QC decision data; do not tune forced aligner until ASR uncertainty policy is fixed.",
-        }
     if subtype.startswith("word_timing_") or nonempty_align:
         return {
             "route": "alignment_quality_threshold",

@@ -516,14 +516,11 @@ def run_candidate_asr(
         _align_TRANSCRIPTION_results,
         _alignment_outcome_for_chunk,
         _finalize_aligned_chunk_without_asr_retry,
-        _qc_items_by_chunk,
-        _run_TRANSCRIPTION_qc,
         _transcribe_asr_chunks_text_only,
         _with_alignment_fallback_window,
-        collect_adaptive_precision_review,
     )
     from asr.prealign import prepare_text_for_alignment, strip_alignment_punctuation
-    from tools.asr.diagnostics.diagnose_asr_alignment import diagnostic_qc_metrics
+    from tools.asr.diagnostics.diagnose_asr_alignment import diagnostic_text_metrics
 
     chunks: list[dict[str, Any]] = []
     job_meta: list[tuple[str, str]] = []
@@ -565,22 +562,10 @@ def run_candidate_asr(
             "Boundary preference ASR",
             on_stage=on_stage,
         )
-        qc_report, qc_timings = _run_TRANSCRIPTION_qc(
-            chunks,
-            text_results,
-            log,
-            on_stage=on_stage,
-        )
-        text_results, qc_report, _ = collect_adaptive_precision_review(
-            chunks,
-            text_results,
-            qc_report,
-        )
         text_results = [
             _with_alignment_fallback_window(chunk, result)
             for chunk, result in zip(chunks, text_results, strict=True)
         ]
-        qc_items, review_items = _qc_items_by_chunk(qc_report)
         backend.unload_model(on_stage=on_stage)
         prepared, align_timings = _align_TRANSCRIPTION_results(
             backend,
@@ -601,34 +586,29 @@ def run_candidate_asr(
                 chunk_result,
                 list(chunk_log),
             )
-            chunk_index = int(chunk["index"])
-            qc_item = qc_items.get(chunk_index)
-            review_item = review_items.get(chunk_index)
             outcome = _alignment_outcome_for_chunk(
                 chunk=chunk,
                 chunk_result=chunk_result,
                 chunk_words=chunk_words,
                 chunk_log=chunk_log,
-                qc_item=qc_item,
-                review_item=review_item,
             )
             text = str(text_result.get("text") or text_result.get("raw_text") or "")
             raw_text = str(text_result.get("raw_text") or text)
             prealign = prepare_text_for_alignment(text)
-            qc_metrics, merged_qc_item = diagnostic_qc_metrics(
-                chunk=chunk,
+            duration = max(0.001, float(chunk["duration"]))
+            text_metrics = diagnostic_text_metrics(
                 analysis_text=text,
                 raw_text=raw_text,
-                qc_item=qc_item,
+                duration_s=duration,
             )
             repeat_profile = (
-                dict(qc_metrics.get("max_repeat") or {})
-                if isinstance(qc_metrics.get("max_repeat"), Mapping)
+                dict(text_metrics.get("max_repeat") or {})
+                if isinstance(text_metrics.get("max_repeat"), Mapping)
                 else {}
             )
             repetition_repair = (
-                dict(qc_metrics.get("repetition_repair") or {})
-                if isinstance(qc_metrics.get("repetition_repair"), Mapping)
+                dict(text_metrics.get("repetition_repair") or {})
+                if isinstance(text_metrics.get("repetition_repair"), Mapping)
                 else {}
             )
             if not repeat_profile and repetition_repair.get("changed"):
@@ -638,7 +618,6 @@ def run_candidate_asr(
                     "ratio": repetition_repair.get("ratio") or 0.0,
                 }
             compact_chars = len(strip_alignment_punctuation(prealign.display_text))
-            duration = max(0.001, float(chunk["duration"]))
             candidate_value, identity = meta
             output.append(
                 {
@@ -647,16 +626,6 @@ def run_candidate_asr(
                     "text": text,
                     "raw_text": raw_text,
                     "display_text": prealign.display_text,
-                    "asr_qc_severity": str(
-                        (merged_qc_item or {}).get("severity")
-                        or outcome.get("asr_qc_severity")
-                        or ""
-                    ),
-                    "asr_qc_reasons": list(
-                        (merged_qc_item or {}).get("reasons")
-                        or outcome.get("asr_qc_reasons")
-                        or []
-                    ),
                     "alignment_quality": outcome.get("alignment_quality"),
                     "fallback_type": outcome.get("fallback_type"),
                     "fallback_subtype": outcome.get("fallback_subtype"),
@@ -665,7 +634,8 @@ def run_candidate_asr(
                     "nonlexical_text": is_nonlexical_text(text),
                     "repeat_profile": repeat_profile,
                     "repetition_repair": repetition_repair,
-                    "text_density": dict(qc_metrics.get("text_density") or {}),
+                    "text_density": dict(text_metrics.get("text_density") or {}),
+                    "text_features": dict(text_metrics.get("text_features") or {}),
                     "compact_chars": compact_chars,
                     "chars_per_sec": round(compact_chars / duration, 6),
                     "cue_density_cps": round(compact_chars / duration, 6),
@@ -673,10 +643,9 @@ def run_candidate_asr(
                 }
             )
         print(
-            "asr_backend={backend} text_s={text_s:.3f} qc_s={qc_s:.3f} align_s={align_s:.3f}".format(
+            "asr_backend={backend} text_s={text_s:.3f} align_s={align_s:.3f}".format(
                 backend=get_backend_label(),
                 text_s=float(text_timings.get("text_transcribe_s") or 0.0),
-                qc_s=float(qc_timings.get("asr_qc_s") or 0.0),
                 align_s=float(align_timings.get("alignment_s") or 0.0),
             ),
             flush=True,
@@ -747,7 +716,6 @@ def build_summary(
         "risk_bucket_counts": dict(Counter(str(row["risk_bucket"]) for row in selected)),
         "signals_used_for_selection": [
             "asr_text_stability",
-            "asr_qc",
             "repeat_nonlexical",
             "forced_fallback_sentinel",
             "cue_density",

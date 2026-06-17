@@ -96,13 +96,13 @@ def test_checkpoint_key_changes_with_asr_model_id_override(monkeypatch):
     assert default_key != tuned_key
 
 
-def test_checkpoint_key_changes_with_adaptive_precision_threshold(monkeypatch):
+def test_checkpoint_key_changes_with_cueqc_drop_threshold(monkeypatch):
     default_key = _checkpoint_name(
         monkeypatch,
         asr_backend=ASR_06B_BACKEND,
     )
 
-    monkeypatch.setenv("ASR_QC_ADAPTIVE_MIN_LOGPROB", "-0.90")
+    monkeypatch.setenv("CUEQC_DROP_THRESHOLD", "0.90")
     tuned_key = _checkpoint_name(
         monkeypatch,
         asr_backend=ASR_06B_BACKEND,

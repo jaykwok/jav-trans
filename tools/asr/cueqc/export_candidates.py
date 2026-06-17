@@ -110,7 +110,6 @@ def aligned_payload_to_candidates(payload: Mapping[str, Any], *, video_id: str =
     return build_candidates(
         chunks,
         text_results,
-        qc_report=details.get("asr_qc") if isinstance(details.get("asr_qc"), Mapping) else None,
         audio_id=audio_id,
         video_id=video_id or audio_id,
     )
@@ -176,7 +175,6 @@ def diagnostics_to_candidates(rows: list[Mapping[str, Any]], *, video_id: str = 
                 position=position,
                 chunks=chunks,
                 text_results=text_results,
-                qc_item=None,
                 audio_id=video_id or "diagnostics",
                 video_id=video_id or str(rows[position].get("video") or "diagnostics"),
             )

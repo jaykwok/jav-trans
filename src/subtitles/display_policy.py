@@ -158,7 +158,6 @@ def _source_segments_for_cue(
 
 def _source_signals(sources: list[dict]) -> dict:
     values: list[str] = []
-    severities: list[str] = []
     for segment in sources:
         for key in (
             "alignment_quality",
@@ -169,11 +168,7 @@ def _source_signals(sources: list[dict]) -> dict:
             value = str(segment.get(key) or "").strip()
             if value:
                 values.append(value)
-        severity = str(segment.get("asr_qc_severity") or "").strip().lower()
-        if severity:
-            severities.append(severity)
-            values.append(severity)
-        for key in ("alignment_quality_reasons", "asr_qc_reasons"):
+        for key in ("alignment_quality_reasons",):
             for reason in segment.get(key) or []:
                 value = str(reason or "").strip()
                 if value:
@@ -183,8 +178,8 @@ def _source_signals(sources: list[dict]) -> dict:
         "nonlexical_signal": "nonlexical" in joined,
         "repetition_signal": "repeat" in joined or "repetition" in joined,
         "fallback_signal": "fallback" in joined or "proportional" in joined,
-        "qc_reject": "reject" in severities,
-        "qc_warn": "warn" in severities,
+        "qc_reject": False,
+        "qc_warn": False,
     }
 
 

@@ -386,8 +386,8 @@ function renderMetrics(item) {{
     ["per min", oldQ.per_min_subtitle_count, newQ.per_min_subtitle_count],
     ["short ratio", oldQ.short_segment_ratio, newQ.short_segment_ratio],
     ["fallback", oldQ.alignment_fallback_ratio, newQ.alignment_fallback_ratio],
-    ["ASR empty", oldM.asr_empty, newM.asr_empty],
-    ["QC reject", oldM.qc_reject, newM.qc_reject],
+    ["ASR gen errors", oldM.asr_generation_errors, newM.asr_generation_errors],
+    ["ASR gen overflow", oldM.asr_generation_overflow, newM.asr_generation_overflow],
   ];
   document.getElementById("metrics").innerHTML = rows.map(([name, oldValue, newValue]) => `
     <div class="metric">
@@ -548,16 +548,15 @@ def metrics_for_case(summary_path: Path, case_id: str) -> dict[str, Any]:
         if Path(str(row.get("video") or "")).stem != case_id:
             continue
         counts = row.get("counts") or {}
-        qc = row.get("asr_qc") or {}
+        asr_generation = row.get("asr_generation") or {}
         stage = row.get("stage_timings") or {}
         return {
             "chunks": counts.get("transcript_chunks"),
             "blocks": counts.get("blocks"),
             "asr_align_s": round(float(stage.get("asr_alignment_total_s") or 0.0), 1),
             "total_s": round(float(stage.get("pipeline_total_s") or 0.0), 1),
-            "qc_reject": qc.get("reject_count"),
-            "qc_warn": qc.get("warning_count"),
-            "asr_empty": qc.get("empty_text_for_speech_count"),
+            "asr_generation_errors": asr_generation.get("error_count"),
+            "asr_generation_overflow": asr_generation.get("overflow_count"),
         }
     return {}
 

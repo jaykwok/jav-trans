@@ -141,8 +141,6 @@ def _quality_report_markdown(video_stem: str, report: dict) -> str:
         "asr_generation_overflow_count",
         "asr_timeout_count",
         "asr_quarantined_count",
-        "asr_empty_text_for_speech_count",
-        "asr_review_uncertain_count",
     ]
     lines = [
         f"# Quality Report: {video_stem}",
@@ -188,12 +186,6 @@ def _quality_report_markdown(video_stem: str, report: dict) -> str:
                 f"{_format_report_value(item.get('ja_cps'))} cps, "
                 f"{item.get('ja_units')} units"
             )
-
-    review_items = report.get("asr_review_uncertain_items")
-    if isinstance(review_items, list) and review_items:
-        lines.extend(["", "## ASR Review Uncertain Items", ""])
-        for item in review_items[:20]:
-            lines.append(f"- `{json.dumps(item, ensure_ascii=False)}`")
 
     lines.append("")
     return "\n".join(lines)
@@ -242,7 +234,7 @@ def write_quality_report(
             glossary_pairs,
             fallback_count,
             int((asr_details or {}).get("chunk_count") or len(aligned_segments)),
-            asr_qc=(asr_details or {}).get("asr_qc") or {},
+            asr_generation={},
         )
         explicit_report_dir = str(report_dir).strip() if report_dir is not None else ""
         env_report_dir = os.getenv("QUALITY_REPORT_DIR", "").strip()

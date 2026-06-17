@@ -67,10 +67,10 @@ if os.getenv("HF_ENDPOINT"):
 import torch
 
 from asr import pipeline as asr_module
+from asr.manifest import build_asr_manifest
 from subtitles import display_policy as display_policy_module
 from subtitles import writer as subtitle_module
 from llm import translator as translator_module
-from asr.qc import asr_qc_gate, build_asr_manifest
 
 from rich.console import Console
 from rich.progress import (
@@ -143,7 +143,6 @@ def _ctx_env_flag(ctx: JobContext, name: str, default: bool = False) -> bool:
 
 
 _ASR_STAGE_ADVANCED_PREFIXES = (
-    "ASR_QC_",
     "ASR_NATIVE_",
     "CUEQC_",
     "BOUNDARY_",
@@ -548,7 +547,6 @@ def _timings_payload(
     translation_api_retry_events: list[dict],
     outputs: dict,
     asr_log: list[str],
-    asr_qc_blocked: bool | None = None,
 ) -> dict:
     return output_writer_module.timings_payload(
         video_path=video_path,
@@ -565,7 +563,6 @@ def _timings_payload(
         translation_api_retry_events=translation_api_retry_events,
         outputs=outputs,
         asr_log=asr_log,
-        asr_qc_blocked=asr_qc_blocked,
     )
 
 
@@ -1080,56 +1077,6 @@ def _run_translation_and_write_impl(
     output_paths.append(asr_manifest_path)
     artifacts.asr_manifest_path = asr_manifest_path
     _raise_if_cancelled(cancel_event)
-
-    if not asr_qc_gate(segments, headless=True):
-        _log_stage(logger, "stage_blocked asr_qc_gate")
-        pipeline_timings["translation_context_s"] = 0.0
-        pipeline_timings["translation_s"] = 0.0
-        pipeline_timings["pipeline_total_s"] = time.perf_counter() - pipeline_started
-        _log_timing_snapshot(logger, pipeline_timings, asr_details)
-        _write_json(
-            timings_path,
-            {
-                "video_path": video_path,
-                "audio_path": audio_path,
-                "audio_cached": audio_cached,
-                "job_id": job_id,
-                "job_temp_dir": job_temp_dir,
-                "device": device,
-                "backend": backend_label,
-                "counts": {
-                    "transcript_chunks": len(asr_details.get("transcript_chunks", [])),
-                    "segments": len(segments),
-                    "blocks": 0,
-                },
-                "stage_timings": pipeline_timings,
-                "asr_details": asr_details,
-                "translation_request_timings": [],
-                "translation_api_retry_events": [],
-                "asr_qc_blocked": True,
-                "video_fps": {
-                    "detected": video_fps,
-                    "effective": subtitle_options.effective_video_fps,
-                    "fallback": video_fps is None,
-                },
-                "outputs": {
-                    "job_temp_dir": job_temp_dir,
-                    "asr_manifest": asr_manifest_path,
-                    "timings": timings_path,
-                    "run_log": str(run_log_path) if run_log_path else None,
-                },
-                "asr_log": asr_log,
-            },
-        )
-        output_paths.append(timings_path)
-        _print_timing_summary(pipeline_timings, asr_details)
-        console.print(
-            "[bold red]ASR 空文本率过高，已停止翻译。[/bold red] "
-            "设置 QC_IGNORE_EMPTY=1 可强制继续。"
-        )
-        if ctx.fail_on_qc_block:
-            raise RuntimeError('ASR empty text rate too high; set QC_IGNORE_EMPTY=1 to skip')
-        return output_paths
 
     if segments:
         asr_noise_items = asr_noise_module.find_asr_noise_segments(segments)

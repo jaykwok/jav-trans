@@ -164,7 +164,7 @@ Boundary Refiner v5 只规划 speech core：Mamba2 输出 `start_delta + end_del
 - `align_text` 只给 forced aligner 使用，可删除标点、emoji、音乐符号和不可发音装饰符。
 - `ASR_CONTEXT` / `ASR_HEAD_CONTEXT` 只作为 Qwen ASR 提示词，不再作为字幕后处理删除规则。
 - 不使用具体词黑名单，不直接删除 `ん`、`あ`、喘息、呻吟、拟声、低信息短句或常见台词。
-- 重复循环、低置信、fallback 和 `asr_review_uncertain` 只作为 QC / 诊断 / 审计信号；默认不会直接清空最终字幕。
+- 旧规则 ASR QC 已退役；字幕保留/丢弃由 CueQC v3-Fusion 输出的二元 `keep/drop` 决策负责，模型不可用时默认保守保留。
 - forced aligner 失败时不伪造精确时间轴，会保留可诊断 fallback 标签。
 
 ---

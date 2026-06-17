@@ -22,9 +22,7 @@ from boundary.refiner import (
 from asr import checkpoint as _checkpoint_module
 from asr import chunking as _chunking_module
 from asr import cueqc as _cueqc_module
-from asr import qc_stage as _qc_stage_module
 from asr import transcribe as _transcribe_module
-from asr.qc import collect_adaptive_precision_review
 from asr.backends import registry as _registry_module
 
 warnings.filterwarnings("ignore")
@@ -34,7 +32,6 @@ _chunking_module = importlib.reload(_chunking_module)
 _checkpoint_module = importlib.reload(_checkpoint_module)
 _cueqc_module = importlib.reload(_cueqc_module)
 _transcribe_module = importlib.reload(_transcribe_module)
-_qc_stage_module = importlib.reload(_qc_stage_module)
 _boundary_cache_module = importlib.reload(_boundary_cache_module)
 
 ASR_BACKEND = _registry_module.current_asr_backend()
@@ -49,8 +46,33 @@ _LAST_BOUNDARY_SIGNATURE: dict = _chunking_module._LAST_BOUNDARY_SIGNATURE
 _LAST_BOUNDARY_CACHE_EVENT: dict | None = None
 _ASR_SLIDING_CONTEXT_SEGS = _transcribe_module._ASR_SLIDING_CONTEXT_SEGS
 _ASR_CHECKPOINT_ENABLED = _transcribe_module._ASR_CHECKPOINT_ENABLED
-CUEQC_TAXONOMY_VERSION = _cueqc_module.CUEQC_TAXONOMY_VERSION
+CUEQC_DECISION_VERSION = _cueqc_module.CUEQC_DECISION_VERSION
 CUEQC_MODEL_VERSION = _cueqc_module.CUEQC_MODEL_VERSION
+
+# CueQC Mamba v3-Fusion model is lazily loaded and cached per process.
+# ASR-internals capture is delegated to the backend (inline or subprocess
+# worker) via capture_asr_internals(), so the model is reused wherever it is
+# loaded — no second Qwen3-ASR in VRAM (v3-Fusion §5.2).
+_CUEQC_REFINER_CACHE: dict[str, object] = {}
+
+
+def _cueqc_refiner_for(path: str):
+    """Lazily load + cache the CueQC v3-Fusion refiner for ``path``."""
+    if not path:
+        return None
+    cached = _CUEQC_REFINER_CACHE.get(path)
+    if cached is not None:
+        return cached
+    try:
+        from asr.cueqc_refiner import load_cueqc_mamba_checkpoint
+
+        device = os.getenv("CUEQC_DEVICE", "auto").strip() or "auto"
+        refiner = load_cueqc_mamba_checkpoint(path, device=device)
+        _CUEQC_REFINER_CACHE[path] = refiner
+        return refiner
+    except Exception as exc:  # noqa: BLE001 - keep the pipeline running
+        print(f"CueQC v3-Fusion: failed to load model {path}: {exc!r}")
+        return None
 
 def _env_bool(name: str, default: str) -> bool:
     return os.getenv(name, default).strip().lower() in {"1", "true", "yes", "on"}
@@ -224,9 +246,7 @@ _split_long_postprocessed_segments = _transcribe_module._split_long_postprocesse
 _repair_postprocessed_segment_windows = _transcribe_module._repair_postprocessed_segment_windows
 _group_words_to_segments = _transcribe_module._group_words_to_segments
 
-_run_TRANSCRIPTION_qc = _qc_stage_module._run_TRANSCRIPTION_qc
 build_cueqc_candidates = _cueqc_module.build_candidates
-build_cueqc_shadow_report = _cueqc_module.build_shadow_report
 cueqc_enabled = _cueqc_module.cueqc_enabled
 
 
@@ -592,26 +612,6 @@ def _alignment_fallback_count_from_log(log: list[str]) -> int:
     return len(chunk_ids) + unscoped_count
 
 
-def _qc_items_by_chunk(qc_report: dict) -> tuple[dict[int, dict], dict[int, dict]]:
-    qc_items: dict[int, dict] = {}
-    review_items: dict[int, dict] = {}
-    for item in qc_report.get("items") or []:
-        if not isinstance(item, dict):
-            continue
-        try:
-            qc_items[int(item.get("chunk_index"))] = item
-        except (TypeError, ValueError):
-            continue
-    for item in qc_report.get("review_uncertain_items") or []:
-        if not isinstance(item, dict):
-            continue
-        try:
-            review_items[int(item.get("chunk_index"))] = item
-        except (TypeError, ValueError):
-            continue
-    return qc_items, review_items
-
-
 def _empty_cueqc_shadow_report() -> dict:
     return _cueqc_module.build_shadow_report([])
 
@@ -646,13 +646,149 @@ def _write_cueqc_candidates_if_requested(
     )
 
 
+def _apply_cueqc_drop_filter(
+    chunk_infos: list[dict],
+    text_results: list[dict],
+    cueqc_shadow_by_chunk: dict[int, dict],
+) -> tuple[list[dict], list[dict], str]:
+    """Remove high-confidence model-drop chunks from the parallel arrays.
+
+    Only decisions with ``mode == "cueqc_mamba_v3_fusion"`` and
+    ``display_hint == "drop"`` are removed; heuristic / fallback / keep decisions
+    are never dropped. All parallel lists (chunk_infos, text_results) are kept
+    index-aligned by filtering on the same kept positions.
+    """
+    drop_indices: set[int] = set()
+    for chunk_index, dec in cueqc_shadow_by_chunk.items():
+        if (
+            dec.get("display_hint") == "drop"
+            and dec.get("mode") == "cueqc_mamba_v3_fusion"
+        ):
+            drop_indices.add(int(chunk_index))
+    if not drop_indices:
+        return chunk_infos, text_results, ""
+
+    kept_chunks: list[dict] = []
+    kept_texts: list[dict] = []
+    removed = 0
+    for pos, (chunk, text_result) in enumerate(zip(chunk_infos, text_results)):
+        raw_index = chunk.get("index") if hasattr(chunk, "get") else None
+        try:
+            chunk_index = int(raw_index) if raw_index is not None else pos
+        except (TypeError, ValueError):
+            chunk_index = pos
+        if chunk_index in drop_indices:
+            removed += 1
+            continue
+        kept_chunks.append(chunk)
+        kept_texts.append(text_result)
+    log_msg = f"CueQC v3-Fusion: dropped {removed} candidate(s) before alignment"
+    return kept_chunks, kept_texts, log_msg
+
+
+def _candidate_capture_window(
+    candidate: dict,
+    fallback_audio_path: str,
+) -> tuple[str, float, float]:
+    """Resolve the wav path and local capture window for a candidate.
+
+    Candidate ``audio.path`` normally points at the extracted chunk wav. In that
+    case the ASR-internals capture must use the chunk-local window
+    ``0..duration``. Passing the global movie timestamp into a chunk wav slices
+    past EOF and forces every v3 sample into fallback-keep.
+    """
+    audio = candidate.get("audio") if isinstance(candidate.get("audio"), dict) else {}
+    own = audio.get("path") or candidate.get("source_audio_path") or ""
+    if own and os.path.exists(str(own)):
+        duration = float(candidate.get("duration_s") or 0.0)
+        if duration <= 0.0:
+            start = float(candidate.get("start", 0.0))
+            end = float(candidate.get("end", start))
+            duration = max(0.0, end - start)
+        return str(own), 0.0, duration
+    start_s = float(candidate.get("start", 0.0))
+    end_s = float(candidate.get("end", start_s))
+    return str(fallback_audio_path) if fallback_audio_path else "", start_s, end_s
+
+
+def _apply_cueqc_v3_model(
+    *,
+    refiner,
+    candidates: list[dict],
+    backend,
+    audio_path: str,
+    log: list[str],
+) -> list[dict] | None:
+    """Run the v3-Fusion refiner over candidates, reusing the shared ASR model.
+
+    Captures ASR internals via ``backend.capture_asr_internals()`` which works in
+    both inline and subprocess worker modes (the capture runs where the model is
+    loaded). Returns one decision dict per candidate (model or fallback-keep),
+    or None if capture is unavailable (caller keeps heuristic decisions).
+    """
+    if not candidates:
+        return []
+    if backend is None or not hasattr(backend, "capture_asr_internals"):
+        log.append("CueQC v3-Fusion: backend has no capture_asr_internals, heuristic shadow retained")
+        return None
+    capture_chunks = []
+    for cand in candidates:
+        path, start_s, end_s = _candidate_capture_window(cand, audio_path)
+        capture_chunks.append({
+            "path": path,
+            "text": str(cand.get("text") or ""),
+            "start_s": start_s,
+            "end_s": end_s,
+        })
+    try:
+        asr_internals = backend.capture_asr_internals(capture_chunks)
+    except Exception as exc:  # noqa: BLE001
+        log.append(f"CueQC v3-Fusion: capture failed ({exc!r}), heuristic shadow retained")
+        return None
+    if not isinstance(asr_internals, list) or len(asr_internals) != len(candidates):
+        log.append("CueQC v3-Fusion: capture count mismatch, heuristic shadow retained")
+        return None
+    try:
+        decisions = refiner.decide(candidates, asr_internals=asr_internals)
+    except Exception:
+        raise
+    drops = sum(1 for d in decisions if d.get("display_hint") == "drop")
+    log.append(f"CueQC v3-Fusion: model decisions={len(decisions)} drops={drops}")
+    return decisions
+
+
+def _merge_cueqc_v3_decisions(
+    report: dict,
+    candidates: list[dict],
+    model_decisions: list[dict],
+) -> dict:
+    """Replace report decisions with v3 model decisions, keyed by chunk_index."""
+    decisions = []
+    for cand, dec in zip(candidates, model_decisions):
+        item = dict(dec)
+        item["chunk_index"] = cand.get("chunk_index")
+        decisions.append(item)
+    report = dict(report)
+    report["decisions"] = decisions
+    # Recompute display_hint counts for the shadow log line.
+    counts: dict[str, int] = {}
+    for dec in decisions:
+        key = str(dec.get("display_hint") or "keep")
+        counts[key] = counts.get(key, 0) + 1
+    existing_counts = dict(report.get("counts") or {})
+    existing_counts["display_hint"] = counts
+    report["counts"] = existing_counts
+    report["decision_source"] = "cueqc_mamba_v3_fusion"
+    return report
+
+
 def _run_cueqc_shadow(
     *,
     audio_path: str,
     chunk_infos: list[dict],
     text_results: list[dict],
-    qc_report: dict,
     log: list[str],
+    backend=None,
 ) -> tuple[dict, dict[int, dict]]:
     if not cueqc_enabled():
         return _empty_cueqc_shadow_report(), {}
@@ -661,11 +797,10 @@ def _run_cueqc_shadow(
         candidates = build_cueqc_candidates(
             chunk_infos,
             text_results,
-            qc_report=qc_report,
             audio_id=audio_id,
             video_id=audio_id,
         )
-        report = build_cueqc_shadow_report(candidates)
+        report = _cueqc_module.build_shadow_report(candidates)
         if os.getenv("CUEQC_SHADOW_EMBED_CANDIDATES", "0").strip().lower() in {
             "1",
             "true",
@@ -674,6 +809,25 @@ def _run_cueqc_shadow(
         }:
             report["candidates"] = candidates
         _write_cueqc_candidates_if_requested(candidates, log=log)
+
+        # v3-Fusion model override: when a checkpoint is present, replace the
+        # heuristic decisions with model decisions (heuristic stays as shadow).
+        model_path = os.getenv("CUEQC_MODEL_PATH", "").strip()
+        refiner = _cueqc_refiner_for(model_path) if model_path else None
+        if refiner is not None:
+            try:
+                model_decisions = _apply_cueqc_v3_model(
+                    refiner=refiner,
+                    candidates=candidates,
+                    backend=backend,
+                    audio_path=audio_path,
+                    log=log,
+                )
+                if model_decisions is not None:
+                    report = _merge_cueqc_v3_decisions(report, candidates, model_decisions)
+            except Exception as exc:  # noqa: BLE001 - model errors fall back to heuristic
+                log.append(f"CueQC v3-Fusion: model inference failed, using heuristic shadow ({exc!r})")
+
         decision_by_chunk = {
             int(item["chunk_index"]): {
                 key: value
@@ -683,25 +837,23 @@ def _run_cueqc_shadow(
                     "schema",
                     "schema_version",
                     "model_version",
-                    "taxonomy_version",
+                    "decision_version",
                     "mode",
-                    "qc_decision",
-                    "content_type",
                     "cluster_id",
-                    "alignment_policy",
                     "display_hint",
                     "confidence",
                     "reasons",
+                    "display_prob_keep",
+                    "display_prob_drop",
                 }
             }
             for item in report.get("decisions", [])
             if item.get("chunk_index") is not None
         }
         log.append(
-            "CueQC shadow: candidates={count} display={display} align={align}".format(
+            "CueQC: candidates={count} display={display}".format(
                 count=report.get("candidate_count", 0),
                 display=dict((report.get("counts") or {}).get("display_hint") or {}),
-                align=dict((report.get("counts") or {}).get("alignment_policy") or {}),
             )
         )
         return report, decision_by_chunk
@@ -753,9 +905,6 @@ def _segment_alignment_outcome(segment: dict, outcomes: dict[int, dict]) -> dict
         "alignment_quality_reasons": list(selected.get("alignment_quality_reasons") or []),
         "forced_success": bool(selected.get("forced_success")),
         "fallback_active": bool(selected.get("fallback_active")),
-        "asr_qc_severity": selected.get("asr_qc_severity", ""),
-        "asr_qc_reasons": list(selected.get("asr_qc_reasons") or []),
-        "asr_review_uncertain": bool(selected.get("asr_review_uncertain")),
     }
 
 
@@ -808,7 +957,6 @@ def _transcribe_and_align_local(
                 {
                     "asr_model_load_s": 0.0,
                     "asr_text_transcribe_s": 0.0,
-                    "asr_qc_s": 0.0,
                     "asr_model_unload_s": 0.0,
                     "alignment_s": 0.0,
                     "alignment_model_unload_s": 0.0,
@@ -830,21 +978,6 @@ def _transcribe_and_align_local(
                 "device": device,
                 "chunk_count": 0,
                 "transcript_chunks": [],
-                "asr_qc": {
-                    "enabled": True,
-                    "chunk_count": 0,
-                    "reject_count": 0,
-                    "warning_count": 0,
-                    "generation_error_count": 0,
-                    "generation_overflow_count": 0,
-                    "timeout_count": 0,
-                    "quarantined_count": 0,
-                    "empty_text_for_speech_count": 0,
-                    "review_uncertain_count": 0,
-                    "review_uncertain_items": [],
-                    "items": [],
-                    "rejected_indices": [],
-                },
                 "stage_timings": timings,
                 "word_count": 0,
                 "segment_count": 0,
@@ -882,51 +1015,16 @@ def _transcribe_and_align_local(
                     continue
                 timings[timing_key] = timing_value
 
-            qc_report, qc_timings = _run_TRANSCRIPTION_qc(
-                chunk_infos,
-                text_results,
-                log,
-                on_stage=on_stage,
-            )
-            _record_stage_timing(
-                log,
-                timings,
-                "asr_qc_s",
-                "ASR质检",
-                qc_timings["asr_qc_s"],
-            )
-
-            text_results, qc_report, adaptive_review_log = collect_adaptive_precision_review(
-                chunk_infos,
-                text_results,
-                qc_report,
-            )
-            if adaptive_review_log:
-                timings["asr_adaptive_review_chunks"] = len(adaptive_review_log)
-                log.append(
-                    "ASR Adaptive Precision: review_uncertain={count}".format(
-                        count=len(adaptive_review_log)
-                    )
-                )
-                log.extend(adaptive_review_log[:8])
-                remaining = len(adaptive_review_log) - 8
-                if remaining > 0:
-                    log.append(
-                        "ASR Adaptive Precision: "
-                        f"{remaining} additional review chunks omitted from log"
-                    )
-
             text_results = [
                 _with_alignment_fallback_window(chunk, text_result)
                 for chunk, text_result in zip(chunk_infos, text_results)
             ]
-            qc_items, review_items = _qc_items_by_chunk(qc_report)
             cueqc_shadow_report, cueqc_shadow_by_chunk = _run_cueqc_shadow(
                 audio_path=audio_path,
                 chunk_infos=chunk_infos,
                 text_results=text_results,
-                qc_report=qc_report,
                 log=log,
+                backend=backend,
             )
 
             unload_started = time.perf_counter()
@@ -939,6 +1037,23 @@ def _transcribe_and_align_local(
                 "ASR模型卸载",
                 unload_elapsed,
             )
+
+            # v3-Fusion drop filter: remove model-confirmed drop candidates from
+            # the parallel arrays BEFORE alignment. Only high-confidence model
+            # drops (mode=cueqc_mamba_v3_fusion) are removed; fallback/heuristic
+            # decisions never drop. Indices are aligned across all three lists.
+            if _env_bool("CUEQC_DROP_APPLY_ENABLED", "1"):
+                chunk_infos, text_results, _drop_log = _apply_cueqc_drop_filter(
+                    chunk_infos,
+                    text_results,
+                    cueqc_shadow_by_chunk,
+                )
+                if _drop_log:
+                    log.append(_drop_log)
+                    timings["cueqc_drop_count"] = int(
+                        sum(1 for v in cueqc_shadow_by_chunk.values()
+                            if v.get("display_hint") == "drop" and v.get("mode") == "cueqc_mamba_v3_fusion")
+                    )
 
             prepared_results, align_timings = _align_TRANSCRIPTION_results(
                 backend,
@@ -982,8 +1097,6 @@ def _transcribe_and_align_local(
                     chunk_result=chunk_result,
                     chunk_words=chunk_words,
                     chunk_log=chunk_log,
-                    qc_item=qc_items.get(chunk_index),
-                    review_item=review_items.get(chunk_index),
                 )
                 alignment_outcomes[chunk_index] = outcome
                 for entry in chunk_log:
@@ -1080,7 +1193,6 @@ def _transcribe_and_align_local(
             "device": device,
             "chunk_count": len(chunk_infos),
             "transcript_chunks": transcript_chunks,
-            "asr_qc": qc_report,
             "cueqc_shadow": cueqc_shadow_report,
             "stage_timings": timings,
             "word_count": len(word_dicts),

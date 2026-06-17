@@ -708,23 +708,15 @@ def _asr_metrics_from_artifacts(paths: dict[str, str]) -> dict:
     timings = _load_json_if_exists(paths.get("timings"))
     quality = _load_json_if_exists(paths.get("quality_report"))
     asr_details = timings.get("asr_details") if isinstance(timings.get("asr_details"), dict) else {}
-    asr_qc = asr_details.get("asr_qc") if isinstance(asr_details.get("asr_qc"), dict) else {}
     counts = timings.get("counts") if isinstance(timings.get("counts"), dict) else {}
     return {
         "backend": timings.get("backend") or "",
         "segments": counts.get("segments"),
         "blocks": counts.get("blocks"),
-        "asr_qc_reject_count": asr_qc.get("reject_count", 0),
-        "asr_qc_warning_count": asr_qc.get("warning_count", 0),
-        "asr_review_uncertain_count": (
-            quality.get("asr_review_uncertain_count")
-            if "asr_review_uncertain_count" in quality
-            else asr_qc.get("review_uncertain_count", 0)
-        ),
-        "asr_generation_error_count": quality.get("asr_generation_error_count", asr_qc.get("generation_error_count", 0)),
-        "asr_generation_overflow_count": quality.get("asr_generation_overflow_count", asr_qc.get("generation_overflow_count", 0)),
-        "asr_timeout_count": quality.get("asr_timeout_count", asr_qc.get("timeout_count", 0)),
-        "asr_quarantined_count": quality.get("asr_quarantined_count", asr_qc.get("quarantined_count", 0)),
+        "asr_generation_error_count": quality.get("asr_generation_error_count", 0),
+        "asr_generation_overflow_count": quality.get("asr_generation_overflow_count", 0),
+        "asr_timeout_count": quality.get("asr_timeout_count", 0),
+        "asr_quarantined_count": quality.get("asr_quarantined_count", 0),
         "quality_warnings": quality.get("warnings", []),
         "stage_timings": timings.get("stage_timings", {}),
     }
@@ -776,7 +768,6 @@ def aggregate_results(case_results: list[dict]) -> dict:
     }
     weight_total = 0
     asr_counts = {
-        "asr_review_uncertain_count": 0,
         "asr_generation_error_count": 0,
         "asr_generation_overflow_count": 0,
         "asr_timeout_count": 0,
@@ -840,7 +831,6 @@ def run_pipeline_for_case(
         keep_temp_files=True,
         run_log_enabled=run_log_enabled,
         run_log_dir=str(output_dir / "run_logs"),
-        fail_on_qc_block=False,
         advanced=advanced,
     )
     artifacts = run_asr_alignment(str(video_path), ctx=ctx, job_id=case.case_id)
@@ -875,7 +865,7 @@ def write_html_report(path: Path, payload: dict) -> None:
             f"<td>{quality['zh_cer']:.3f}</td>"
             f"<td>{quality['zh_char_f1']:.3f}</td>"
             f"<td>{proxy['no_reference_overlap_ratio']:.3f}</td>"
-            f"<td>{proxy.get('asr_review_uncertain_count', 0)}</td>"
+            f"<td>{proxy.get('asr_generation_error_count', 0)}</td>"
             "</tr>"
         )
     summary_items = "".join(
@@ -905,7 +895,7 @@ def write_html_report(path: Path, payload: dict) -> None:
       <tr>
         <th>Case</th><th>Video</th><th>Reference</th><th>Ref</th><th>Pred</th>
         <th>Time Recall</th><th>Time Precision</th><th>ZH CER</th>
-        <th>ZH F1</th><th>No-ref Pred</th><th>ASR Drops</th>
+        <th>ZH F1</th><th>No-ref Pred</th><th>ASR Gen Errors</th>
       </tr>
     </thead>
     <tbody>{''.join(rows)}</tbody>
