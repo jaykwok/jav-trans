@@ -1,6 +1,6 @@
 # JAVTrans
 
-JAVTrans 是一个本地字幕生成工具，面向 Windows + NVIDIA 显卡，也可在 WSL2 / Linux 下源码运行。它把视频处理成日文字幕、中文字幕或中日双语字幕，并把音频准备、speech-island 边界规划、ASR、强制对齐、字幕时间轴归一化、LLM 翻译和质量报告串成一条本地优先的流水线。
+JAVTrans 是一个本地字幕生成工具，面向 Windows + NVIDIA 显卡，也可在 WSL2 / Linux 下源码运行。它把视频处理成日文字幕、中文字幕或中日双语字幕，并把音频准备、speech-island 边界规划、ASR、CueQC v3-Fusion 保留/丢弃路由、强制对齐、字幕时间轴归一化、LLM 翻译和质量报告串成一条本地优先的流水线。
 
 项目目标：本地完成视频、音频、边界切分、ASR 和时间轴重计算；LLM 只负责翻译、术语一致和口吻连贯，不负责脑补剧情或修正 ASR 误听。
 
@@ -14,7 +14,8 @@ JAVTrans 是一个本地字幕生成工具，面向 Windows + NVIDIA 显卡，�
 - 可选 ASR：`jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame`。
 - 默认边界系统：SpeechBoundary-JA，backend key 为 `speech_boundary_ja`。它不是传统 VAD，而是 `Qwen PTM + MFCC/energy frame scores -> boundary candidates -> Boundary Refiner -> constrained planner -> ASR chunks` 的 speech-island boundary pipeline。
 - 默认 Boundary Refiner：随源码提供 learned `transformers.Mamba2Model` 小 checkpoint，文件为 `src/boundary/checkpoints/boundary_refiner.pt`。当前默认是 true v5 delta-only 32768 hardmix checkpoint；v5 协议只输出 `start_delta / end_delta`，不再保留 merge score、merge label、merge threshold、runtime disable 开关或 backbone override。
-- 当前研究方向：从真实片源 forced-aligner 成功样本挖 `speech_core -> word.start/end` silver labels，用于后续 Boundary Refiner 的 display-boundary 再训练；普通推理不会额外加载新模型。已有 silver-ft01 证明自动指标可能改善但人工观感变差，因此不会替换当前默认模型。
+- 默认 CueQC：`src/asr/checkpoints/cueqc_mamba_v3_fusion.pt`，在 ASR 后、forced alignment 前输出二元 `keep/drop`。当前默认 checkpoint 是 Stage 2b 自训练后版本，基础丢弃阈值 `0.85`，`short_text` 桶自适应提升到 `0.87`；模型缺失或推理异常时保守 `keep`。
+- 当前研究方向：CueQC 已替代旧规则 ASR QC。后续优先做 匿名样片 A 全链路 smoke、更多全片人工抽检和离线 Boundary 反哺数据整理；forced aligner 暂保留为默认 word-timing polish、诊断和未来 teacher 信号。
 - 默认显存目标：单阶段峰值适配 6GB 级 NVIDIA 显卡。8GB 本机可提高 `.env` 中的 ASR / aligner batch size；更小显存则手动降低。
 - 当前字幕策略：边界层尽量把 ASR chunk 切成接近一句台词；字幕层优先用可靠词级 `word.start` 锚定 cue start，只做 2-frame gap、显示时长和读速控制，不再运行相邻 cue 合并策略。
 
@@ -100,7 +101,7 @@ Web 提交是否使用 CUDA 取决于后端服务进程是否能看到 GPU，而
 4. 提交任务。
 5. 在输出目录查看 SRT、质量报告和日志。
 
-勾选“不翻译（仅日文字幕）”时，流水线仍会执行边界规划、ASR、ASR QC、forced alignment 和字幕时间轴归一化，但跳过 LLM 翻译，最终输出 `<视频名>.ja.srt`。这是验证本地边界 / ASR / 对齐链路的推荐 smoke 模式。
+勾选“不翻译（仅日文字幕）”时，流水线仍会执行边界规划、ASR、CueQC v3-Fusion keep/drop 路由、forced alignment 和字幕时间轴归一化，但跳过 LLM 翻译，最终输出 `<视频名>.ja.srt`。这是验证本地边界 / ASR / CueQC / 对齐链路的推荐 smoke 模式。
 
 主流水线：
 
@@ -112,7 +113,7 @@ Web 提交是否使用 CUDA 取决于后端服务进程是否能看到 GPU，而
 -> Boundary Refiner scoring
 -> constrained boundary planner
 -> ASR
--> ASR QC
+-> CueQC v3-Fusion keep/drop routing
 -> forced alignment
 -> display_text / align_text 预处理
 -> cue plan 时间轴归一化
@@ -139,6 +140,7 @@ Boundary Refiner v5 只规划 speech core：Mamba2 输出 `start_delta + end_del
 | 默认 ASR | `jaykwok/Qwen3-ASR-0.6B-JA-Anime-Galgame` | `models/jaykwok-Qwen3-ASR-0.6B-JA-Anime-Galgame` |
 | 可选 ASR | `jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame` | `models/jaykwok-Qwen3-ASR-1.7B-JA-Anime-Galgame` |
 | SpeechBoundary-JA frozen feature | `jaykwok/Qwen3-ASR-0.6B-JA-Anime-Galgame` | `models/jaykwok-Qwen3-ASR-0.6B-JA-Anime-Galgame` |
+| CueQC v3-Fusion | learned Mamba2 fusion checkpoint，输入 ASR encoder features、token trace、decoder stats 和 chunk metadata | `src/asr/checkpoints/cueqc_mamba_v3_fusion.pt` |
 | Forced aligner | `Qwen/Qwen3-ForcedAligner-0.6B` | `models/Qwen-Qwen3-ForcedAligner-0.6B` |
 | Boundary Refiner | learned `transformers.Mamba2Model` true v5 delta-only 32768 hardmix checkpoint | `src/boundary/checkpoints/boundary_refiner.pt` |
 
@@ -165,6 +167,7 @@ Boundary Refiner v5 只规划 speech core：Mamba2 输出 `start_delta + end_del
 - `ASR_CONTEXT` / `ASR_HEAD_CONTEXT` 只作为 Qwen ASR 提示词，不再作为字幕后处理删除规则。
 - 不使用具体词黑名单，不直接删除 `ん`、`あ`、喘息、呻吟、拟声、低信息短句或常见台词。
 - 旧规则 ASR QC 已退役；字幕保留/丢弃由 CueQC v3-Fusion 输出的二元 `keep/drop` 决策负责，模型不可用时默认保守保留。
+- CueQC 当前只做保守减法：基础 `drop_threshold=0.85`，checkpoint 可按风险桶抬高阈值；默认 Stage 2b profile 将 `short_text` 桶提升到 `0.87`。
 - forced aligner 失败时不伪造精确时间轴，会保留可诊断 fallback 标签。
 
 ---
