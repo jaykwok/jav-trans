@@ -176,6 +176,21 @@ Stage 2a policy:
   `298` cold-start seed, `178` manual `drop_ok`, `21` manual false-drop keep,
   `41` high-confidence keep pseudo. The `14588` unaudited drop pseudo labels
   were skipped.
+- Stage 2a training output:
+  `agents/temp/20260617_143911_cueqc-v3-stage2a-train/cueqc_mamba_v3_fusion.pt`.
+  At `drop_threshold=0.85`, fixed holdout `867HTTM-0045` still has
+  `keep_recall=0.9375` and `false_drop_rate=0.0625`, so it is not safe to
+  replace the default checkpoint.
+- Threshold scan shows `drop_threshold=0.88` reaches holdout
+  `keep_recall=1.0 / false_drop_rate=0.0` with lower `drop_recall=0.618`.
+  The t=0.88 10-film prediction output is
+  `agents/temp/20260617_144200_cueqc-v3-stage2a-10film-predictions-t088/`:
+  `keep=35936/drop=9707`, high-confidence pseudo labels
+  `drop=9707/keep=1507`.
+- A new t=0.88 false-drop audit is required before replacing the runtime
+  checkpoint:
+  `agents/audits/20260617_144327_cueqc-v3-stage2a-t088-false-drop-audit/index.html`.
+  In this state, keep `src/asr/checkpoints/cueqc_mamba_v3_fusion.pt` unchanged.
 
 ## Stage 3: Boundary Feedback
 
