@@ -138,9 +138,15 @@ def extract(args: argparse.Namespace) -> int:
     source_mode = "train" if args.train else "candidate"
     rows = _read_jsonl(source_path)
     audio_root = Path(args.audio_root)
-    n_rows = len(rows) if args.max_samples is None else min(len(rows), args.max_samples)
+    start_index = int(args.start_index)
+    if start_index >= len(rows):
+        selected_rows: list[dict[str, Any]] = []
+    else:
+        end_index = len(rows) if args.max_samples is None else min(len(rows), start_index + int(args.max_samples))
+        selected_rows = rows[start_index:end_index]
+    n_rows = len(selected_rows)
     print(
-        f"rows={len(rows)} processing={n_rows} source_mode={source_mode} "
+        f"rows={len(rows)} start_index={start_index} processing={n_rows} source_mode={source_mode} "
         f"audio_root={audio_root} device={args.device}"
     )
 
@@ -164,8 +170,7 @@ def extract(args: argparse.Namespace) -> int:
     meta: list[dict[str, Any]] = []
     skipped = 0
 
-    for idx in range(n_rows):
-        row = rows[idx]
+    for idx, row in enumerate(selected_rows):
         sample_id = str(row.get("sample_id") or "")
         video_id = _video_id_from_sample(sample_id)
         if video_id not in wav_cache:
@@ -240,7 +245,7 @@ def extract(args: argparse.Namespace) -> int:
         })
 
         if (idx + 1) % 25 == 0:
-            print(f"  processed {idx + 1}/{n_rows} (kept={len(samples)} skipped={skipped})")
+            print(f"  processed {idx + 1}/{n_rows} global={start_index + idx + 1} (kept={len(samples)} skipped={skipped})")
 
     capturer.close()
 
@@ -258,6 +263,8 @@ def extract(args: argparse.Namespace) -> int:
         "feature_config": {
             "source_path": str(source_path),
             "source_mode": source_mode,
+            "start_index": start_index,
+            "processed_rows": n_rows,
             "asr_dim": asr_dim,
             "token_dim": K_TOK,
             "decoder_dim": K_DEC,
@@ -287,11 +294,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--output", required=True, help="output .pt path")
     p.add_argument("--model-spec", default="", help="Qwen3-ASR repo id (default env ASR_MODEL_SPEC)")
     p.add_argument("--device", default="auto")
+    p.add_argument("--start-index", type=int, default=0)
     p.add_argument("--max-samples", type=int, default=None)
     args = p.parse_args(argv)
     if bool(args.train) == bool(args.input):
         p.error("exactly one of --train or --input is required")
-    if args.input and args.max_samples is not None and args.max_samples <= 0:
+    if args.start_index < 0:
+        p.error("--start-index must be non-negative")
+    if args.max_samples is not None and args.max_samples <= 0:
         p.error("--max-samples must be positive")
     return args
 
