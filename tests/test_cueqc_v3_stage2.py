@@ -8,6 +8,7 @@ import pytest
 import torch
 
 from tools.asr.cueqc import extract_features_v3_fusion
+from tools.asr.cueqc import compile_stage2a_features_v3_fusion
 from tools.asr.cueqc import merge_features_v3_fusion
 from tools.asr.cueqc import predict_v3_fusion
 from tools.asr.cueqc import train_mamba_v3_fusion
@@ -56,6 +57,29 @@ def _feature_bundle(label: int = -1) -> dict:
         },
         "label_config": {"drop": 0, "keep": 1},
     }
+
+
+def _multi_feature_bundle(sample_ids: list[str], labels: list[int]) -> dict:
+    bundle = _feature_bundle(label=labels[0])
+    bundle["samples"] = []
+    bundle["labels"] = torch.tensor(labels, dtype=torch.long)
+    bundle["meta"] = []
+    for index, (sample_id, label) in enumerate(zip(sample_ids, labels)):
+        sample = _feature_sample(label=label)
+        sample["sample_id"] = sample_id
+        bundle["samples"].append(sample)
+        bundle["meta"].append(
+            {
+                "sample_id": sample_id,
+                "audio_id": "VIDEO",
+                "video_id": "VIDEO",
+                "chunk_index": index,
+                "start": float(index),
+                "end": float(index) + 0.5,
+                "text": "あ",
+            }
+        )
+    return bundle
 
 
 def test_cueqc_v3_feature_extractor_marks_unlabeled_candidate_rows():
@@ -243,3 +267,96 @@ def test_cueqc_v3_predict_exports_high_confidence_pseudo_labels(tmp_path: Path, 
     assert len(pseudo_rows) == 1
     assert pseudo_rows[0]["targets"]["display_decision"] == "drop"
     assert pseudo_rows[0]["targets"]["display_label"] == 0
+
+
+def test_cueqc_stage2a_compiler_trusts_manual_labels_and_skips_unaudited_drop(tmp_path: Path):
+    cold_path = tmp_path / "cold.pt"
+    full_path = tmp_path / "full.pt"
+    pseudo_path = tmp_path / "pseudo.jsonl"
+    audit_path = tmp_path / "audit.jsonl"
+    output_path = tmp_path / "stage2a.pt"
+    summary_path = tmp_path / "summary.json"
+
+    cold_ids = ["cueqc-VIDEO-chunk00001", "cueqc-VIDEO-chunk00002"]
+    torch.save(_multi_feature_bundle(cold_ids, [0, 0]), cold_path)
+    full_ids = [
+        "cueqc-VIDEO-chunk00002",
+        "cueqc-VIDEO-chunk00003",
+        "cueqc-VIDEO-chunk00004",
+        "cueqc-VIDEO-chunk00005",
+        "cueqc-VIDEO-chunk00006",
+    ]
+    torch.save(_multi_feature_bundle(full_ids, [-1, -1, -1, -1, -1]), full_path)
+    pseudo_path.write_text(
+        "\n".join(
+            json.dumps(row)
+            for row in [
+                {
+                    "schema": "cueqc_pseudo_label_v3_fusion_v1",
+                    "sample_id": "cueqc-VIDEO-chunk00004",
+                    "display_hint": "keep",
+                    "display_prob_keep": 0.97,
+                },
+                {
+                    "schema": "cueqc_pseudo_label_v3_fusion_v1",
+                    "sample_id": "cueqc-VIDEO-chunk00005",
+                    "display_hint": "drop",
+                    "display_prob_drop": 0.99,
+                },
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    audit_path.write_text(
+        "\n".join(
+            json.dumps(row)
+            for row in [
+                {
+                    "schema": "cueqc_false_drop_audit_label_v1",
+                    "sample_id": "cueqc-VIDEO-chunk00002",
+                    "manual_decision": "false_drop_keep",
+                    "is_false_drop": True,
+                },
+                {
+                    "schema": "cueqc_false_drop_audit_label_v1",
+                    "sample_id": "cueqc-VIDEO-chunk00003",
+                    "manual_decision": "drop_ok",
+                    "is_false_drop": False,
+                },
+                {
+                    "schema": "cueqc_false_drop_audit_label_v1",
+                    "sample_id": "cueqc-VIDEO-chunk00006",
+                    "manual_decision": "uncertain",
+                    "is_false_drop": False,
+                },
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    summary = compile_stage2a_features_v3_fusion.compile_stage2a(
+        cold_start_features=cold_path,
+        full_features=full_path,
+        pseudo_labels=pseudo_path,
+        false_drop_audit_labels=audit_path,
+        output=output_path,
+        summary_path=summary_path,
+        min_keep_confidence=0.95,
+    )
+    compiled = torch.load(output_path, map_location="cpu", weights_only=False)
+    labels_by_sample = {
+        meta["sample_id"]: int(label)
+        for meta, label in zip(compiled["meta"], compiled["labels"].tolist())
+    }
+
+    assert labels_by_sample == {
+        "cueqc-VIDEO-chunk00001": 0,
+        "cueqc-VIDEO-chunk00002": 1,
+        "cueqc-VIDEO-chunk00003": 0,
+        "cueqc-VIDEO-chunk00004": 1,
+    }
+    assert summary["labels"] == {"drop": 2, "keep": 2}
+    assert summary["source_counts"]["pseudo_skipped_unaudited_drop"] == 1
+    assert summary["source_counts"]["audit_skipped:uncertain"] == 1

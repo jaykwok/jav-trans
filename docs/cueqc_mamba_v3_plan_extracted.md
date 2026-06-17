@@ -129,6 +129,27 @@ wav for every chunk while keeping memory bounded.
 first, audit false-drop risk from `cueqc_pseudo_labels.high_conf.jsonl`, then
 merge accepted pseudo labels with the cold-start seed before retraining.
 
+After the false-drop audit, compile Stage 2a features without rerunning ASR
+internals:
+
+```powershell
+$env:PYTHONIOENCODING='utf-8'
+uv run python -B tools/asr/cueqc/compile_stage2a_features_v3_fusion.py `
+  --cold-start-features agents/temp/20260617_cueqc-mamba-v3-fusion/cueqc_train_features_v3_fusion.pt `
+  --full-features agents/temp/20260617_113159_cueqc-v3-10film-sharded-features/cueqc_full_features_v3_fusion.pt `
+  --pseudo-labels agents/temp/20260617_130642_cueqc-v3-10film-predictions/cueqc_pseudo_labels.high_conf.jsonl `
+  --false-drop-audit-labels agents/audits/20260617_130642_cueqc-v3-false-drop-audit/cueqc_false_drop_audit_labels.jsonl `
+  --output agents/temp/YYYYMMDD_HHMMSS_cueqc-v3-stage2a-training-features/cueqc_stage2a_train_features_v3_fusion.pt
+```
+
+Stage 2a policy:
+
+- Manual false-drop audit labels override cold-start seed labels.
+- `drop_ok` becomes `drop=0`; `false_drop_keep` becomes `keep=1`.
+- `uncertain` is skipped.
+- High-confidence `keep` pseudo labels are included.
+- Unaudited high-confidence `drop` pseudo labels are skipped.
+
 2026-06-17 run status:
 
 - Full 10-film feature extraction completed in 46 shards under
@@ -143,6 +164,18 @@ merge accepted pseudo labels with the cold-start seed before retraining.
 - Because high-confidence drop volume is large, do not retrain directly from
   these pseudo labels. First audit false-drop risk via
   `agents/audits/20260617_130642_cueqc-v3-false-drop-audit/index.html`.
+- User audit export:
+  `agents/audits/20260617_130642_cueqc-v3-false-drop-audit/cueqc_false_drop_audit_labels.jsonl`.
+- Audit result: `200` reviewed, `178 drop_ok`, `21 false_drop_keep`,
+  `1 uncertain`; raw false-drop rate `10.5%`. Stratified population-weighted
+  estimate over `drop>=0.85` is about `4.2%`, still too high for accepting all
+  `14588` high-confidence drop pseudo labels.
+- Stage 2a compiled bundle:
+  `agents/temp/20260617_143121_cueqc-v3-stage2a-training-features/cueqc_stage2a_train_features_v3_fusion.pt`.
+  Records: `538`, labels `drop=344/keep=194`. Sources:
+  `298` cold-start seed, `178` manual `drop_ok`, `21` manual false-drop keep,
+  `41` high-confidence keep pseudo. The `14588` unaudited drop pseudo labels
+  were skipped.
 
 ## Stage 3: Boundary Feedback
 
@@ -152,6 +185,11 @@ Later, `display=drop` chunks can be mined as Boundary preference / hard-case dat
 - invalid speech islands
 - chunks that should be merged into neighbors
 - repeated no-subtitle-value fragments
+
+The current false-drop audit has `178` manually confirmed `drop_ok` chunks.
+They are good candidates for a later Boundary hard-negative / preference
+finetune set, but they are not compiled into Boundary training yet. Keep this
+as a separate Stage 3 task after CueQC Stage 2a retraining is evaluated.
 
 This remains an offline preference-training loop. CueQC decisions must not be coupled into Boundary runtime planning.
 
@@ -168,5 +206,6 @@ This remains an offline preference-training loop. CueQC decisions must not be co
 - `tools/asr/cueqc/extract_features_v3_fusion.py`
 - `tools/asr/cueqc/merge_features_v3_fusion.py`
 - `tools/asr/cueqc/predict_v3_fusion.py`
+- `tools/asr/cueqc/compile_stage2a_features_v3_fusion.py`
 - `tools/asr/cueqc/train_mamba_v3_fusion.py`
 - `tools/audits/generate_cueqc_cluster_audit_html.py`
