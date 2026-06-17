@@ -115,10 +115,10 @@ def test_export_alignment_failure_manifest_cli(tmp_path):
                 "start": 1.0,
                 "end": 2.0,
                 "duration_s": 1.0,
-                "failure_bucket": "asr_review_uncertain",
+                "failure_bucket": "empty_text_for_chunk",
                 "alignment_quality": "drop_or_review",
                 "fallback_type": "none",
-                "display_text": "んー",
+                "display_text": "",
             },
             {
                 "case_label": "full",
@@ -150,12 +150,12 @@ def test_export_alignment_failure_manifest_cli(tmp_path):
     assert len(rows) == 3
     assert {row["review_type"] for row in rows} == {
         "review_alignment_text",
-        "review_asr_text",
+        "review_empty_asr",
         "review_repetition_repair",
     }
     assert summary["failure_bucket_counts"] == {
         "align_text_empty": 1,
-        "asr_review_uncertain": 1,
+        "empty_text_for_chunk": 1,
         "repeat_repair_suggested": 1,
     }
 
@@ -173,13 +173,13 @@ def test_select_alignment_failure_audit_subset_cli(tmp_path):
             "failure_bucket": "repeat_repair_suggested",
         },
         {
-            "sample_id": "asr-1",
+            "sample_id": "empty-1",
             "case_label": "full",
             "video": "sample",
             "chunk_index": 1,
             "start": 1.0,
-            "review_type": "review_asr_qc_warn",
-            "failure_bucket": "asr_qc_warn",
+            "review_type": "review_empty_asr",
+            "failure_bucket": "empty_text_for_chunk",
         },
         {
             "sample_id": "coarse-2",

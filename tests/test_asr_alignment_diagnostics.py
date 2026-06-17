@@ -12,7 +12,7 @@ def _write_json(path: Path, payload: dict) -> None:
     path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
 
 
-def test_diagnose_case_marks_alignment_and_asr_drop_candidates(tmp_path):
+def test_diagnose_case_marks_alignment_candidates(tmp_path):
     aligned_path = tmp_path / "archived" / "sample" / "sample.aligned_segments.json"
     quality_path = tmp_path / "quality_reports" / "sample.quality_report.json"
     _write_json(
@@ -97,24 +97,6 @@ def test_diagnose_case_marks_alignment_and_asr_drop_candidates(tmp_path):
                         "raw_text": "こんにちは",
                     },
                 ],
-                "asr_qc": {
-                    "items": [
-                        {
-                            "position": 1,
-                            "chunk_index": 1,
-                            "severity": "warn",
-                            "reasons": ["long_low_value_text"],
-                        }
-                    ],
-                    "review_uncertain_items": [
-                        {
-                            "position": 1,
-                            "chunk_index": 1,
-                            "reasons": ["long_low_value_text"],
-                            "original_text": "んー",
-                        }
-                    ],
-                },
             },
             "asr_log": [
                 "chunk 1: Alignment 词数: 2",
@@ -133,7 +115,6 @@ def test_diagnose_case_marks_alignment_and_asr_drop_candidates(tmp_path):
         quality_path,
         {
             "alignment_fallback_ratio": 0.5,
-            "asr_review_uncertain_count": 1,
         },
     )
 
@@ -159,11 +140,11 @@ def test_diagnose_case_marks_alignment_and_asr_drop_candidates(tmp_path):
     assert by_chunk[0]["fallback_window_end"] == 1.5
     assert by_chunk[0]["fallback_duration_s"] == 1.0
     assert by_chunk[0]["fallback_window_source"] == "speech_core"
-    assert "asr_review_uncertain" in by_chunk[1]["failure_reasons"]
+    assert "empty_text_for_chunk" in by_chunk[1]["failure_reasons"]
     assert by_chunk[1]["alignment_quality"] == "drop_or_review"
     assert by_chunk[1]["fallback_type"] == "none"
-    assert by_chunk[1]["fallback_subtype"] == "asr_review_uncertain"
-    assert by_chunk[1]["failure_bucket"] == "asr_review_uncertain"
+    assert by_chunk[1]["fallback_subtype"] == "asr_empty_text"
+    assert by_chunk[1]["failure_bucket"] == "empty_text_for_chunk"
     assert by_chunk[2]["align_text_empty"] is True
     assert by_chunk[2]["alignment_quality"] == "drop_or_review"
     assert by_chunk[2]["fallback_type"] == "proportional"
@@ -186,13 +167,13 @@ def test_diagnose_case_marks_alignment_and_asr_drop_candidates(tmp_path):
     }
     assert case_summary["fallback_subtype_counts"] == {
         "align_text_empty": 1,
-        "asr_review_uncertain": 1,
+        "asr_empty_text": 1,
         "none": 1,
         "vad_coarse_after_sentinel": 1,
     }
     assert case_summary["failure_bucket_counts"] == {
         "align_text_empty": 1,
-        "asr_review_uncertain": 1,
+        "empty_text_for_chunk": 1,
         "vad_coarse_alignment": 1,
     }
     assert summary["failure_candidate_count"] == 3
@@ -203,12 +184,12 @@ def test_diagnose_case_marks_alignment_and_asr_drop_candidates(tmp_path):
     }
     assert summary["failure_bucket_counts"] == {
         "align_text_empty": 1,
-        "asr_review_uncertain": 1,
+        "empty_text_for_chunk": 1,
         "vad_coarse_alignment": 1,
     }
     assert summary["fallback_subtype_counts"] == {
         "align_text_empty": 1,
-        "asr_review_uncertain": 1,
+        "asr_empty_text": 1,
         "none": 1,
         "vad_coarse_after_sentinel": 1,
     }
@@ -240,7 +221,6 @@ def test_diagnose_case_separates_punctuation_only_nonlexical_text(tmp_path):
                         "raw_text": "…、…",
                     }
                 ],
-                "asr_qc": {"items": [], "review_uncertain_items": []},
             },
             "asr_log": [
                 "chunk 1: Alignment 词数: 0",
@@ -297,45 +277,6 @@ def test_diagnose_case_exports_repetition_and_text_density_fields(tmp_path):
                         "raw_text": "んんんん",
                     },
                 ],
-                "asr_qc": {
-                    "items": [
-                        {
-                            "position": 0,
-                            "chunk_index": 0,
-                            "severity": "reject",
-                            "reasons": ["repeat_ngram_loop"],
-                            "metrics": {
-                                "repetition_repair": {
-                                    "action": "truncate_repetition",
-                                    "reason": "repeat_ngram_loop",
-                                    "unit": "あっ",
-                                    "run": 6,
-                                    "keep_runs": 3,
-                                    "suggested_text": "あっあっあっ",
-                                    "changed": True,
-                                },
-                                "text_density": {
-                                    "level": "normal_dialogue",
-                                    "action": "preserve",
-                                },
-                            },
-                        },
-                        {
-                            "position": 1,
-                            "chunk_index": 1,
-                            "severity": "ok",
-                            "reasons": [],
-                            "metrics": {
-                                "repetition_repair": {"action": "none", "changed": False},
-                                "text_density": {
-                                    "level": "repeated_vocalization_candidate",
-                                    "action": "preserve_with_review",
-                                },
-                            },
-                        },
-                    ],
-                    "review_uncertain_items": [],
-                },
             },
             "asr_log": [
                 "chunk 1: Alignment 模式: forced_aligner",
@@ -349,7 +290,7 @@ def test_diagnose_case_exports_repetition_and_text_density_fields(tmp_path):
 
     by_chunk = {row["chunk_index"]: row for row in rows}
     assert by_chunk[0]["failure_bucket"] == "repeat_repair_suggested"
-    assert by_chunk[0]["repetition_suggested_text"] == "あっあっあっ"
+    assert by_chunk[0]["repetition_repair"]["changed"] is True
     assert by_chunk[1]["failure_bucket"] == ""
     assert by_chunk[1]["text_density_level"] == "repeated_vocalization_candidate"
     assert case_summary["failure_bucket_counts"] == {
@@ -357,8 +298,7 @@ def test_diagnose_case_exports_repetition_and_text_density_fields(tmp_path):
     }
     assert case_summary["repeat_repair_suggested_count"] == 1
     assert summary["text_density_counts"] == {
-        "normal_dialogue": 1,
-        "repeated_vocalization_candidate": 1,
+        "repeated_vocalization_candidate": 2,
     }
 
 
@@ -388,7 +328,6 @@ def test_cli_broadcasts_single_case_label_for_multiple_aligned_jsons(tmp_path, m
                             "raw_text": "こんにちは",
                         }
                     ],
-                    "asr_qc": {"items": [], "review_uncertain_items": []},
                 },
                 "asr_log": ["chunk 1: Alignment 模式: forced_aligner"],
             },

@@ -1,4 +1,14 @@
 #!/usr/bin/env python3
+"""Cluster CueQC candidates with Torque Clustering (TORC).
+
+The previous HDBSCAN / FINCH / UMAP / PCA backends were removed and the whole
+clustering path now routes through :mod:`tools.asr.cueqc.torque`, a single-file
+port of Jie Yang's parameter-free Torque Clustering algorithm. TORC decides the
+number of clusters autonomously from the distance matrix, so this module no
+longer exposes ``--method``, ``--reducer``, ``--min-clusters`` /
+``--max-clusters`` or any backend-specific tuning flags — only the feature
+space (structured / dense / fused embeddings) and the distance metric remain.
+"""
 from __future__ import annotations
 
 import argparse
@@ -15,11 +25,8 @@ SRC_ROOT = PROJECT_ROOT / "src"
 if str(SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(SRC_ROOT))
 
-from asr.cueqc import (
-    DEFAULT_CLUSTER_COUNT_MAX,
-    DEFAULT_CLUSTER_COUNT_MIN,
-    normalize_feature_matrix,
-)
+from asr.cueqc import normalize_feature_matrix
+from tools.asr.cueqc.torque import torque_clustering
 
 
 def read_jsonl(path: Path) -> list[dict[str, Any]]:
@@ -52,12 +59,12 @@ def _norm(vec: list[float]) -> float:
     return math.sqrt(sum(value * value for value in vec)) or 1.0
 
 
-def _cosine_distance(left: list[float], right: list[float]) -> float:
-    return 1.0 - (_dot(left, right) / (_norm(left) * _norm(right)))
-
-
 def _euclidean_distance(left: list[float], right: list[float]) -> float:
     return math.sqrt(sum((a - b) ** 2 for a, b in zip(left, right)))
+
+
+def _cosine_distance(left: list[float], right: list[float]) -> float:
+    return 1.0 - (_dot(left, right) / (_norm(left) * _norm(right)))
 
 
 def _distance(left: list[float], right: list[float], metric: str) -> float:
@@ -74,384 +81,6 @@ def _l2_normalize_matrix(matrix: Sequence[Sequence[float]]) -> list[list[float]]
         norm = math.sqrt(sum(value * value for value in row)) or 1.0
         normalized.append([float(value) / norm for value in row])
     return normalized
-
-
-def _stable_cluster_count(labels: Sequence[int]) -> int:
-    return len({int(label) for label in labels if int(label) >= 0})
-
-
-def _noise_count(labels: Sequence[int]) -> int:
-    return sum(1 for label in labels if int(label) < 0)
-
-
-def _mean_probability(labels: Sequence[int], probabilities: Sequence[float]) -> float:
-    values = [
-        float(probability)
-        for label, probability in zip(labels, probabilities)
-        if int(label) >= 0
-    ]
-    return sum(values) / max(1, len(values))
-
-
-def _hdbscan_min_cluster_sizes(
-    *,
-    row_count: int,
-    min_clusters: int,
-    max_clusters: int,
-    explicit: int | None,
-) -> list[int]:
-    if explicit is not None and explicit > 0:
-        return [max(2, min(explicit, max(2, row_count)))]
-    if row_count <= 2:
-        return [2]
-    upper = min(50, max(2, row_count // max(1, min_clusters)), max(2, row_count // 2))
-    seeds = {
-        2,
-        3,
-        4,
-        5,
-        max(2, row_count // max(1, max_clusters)),
-        max(2, row_count // max(1, (min_clusters + max_clusters) // 2)),
-        max(2, row_count // max(1, min_clusters)),
-    }
-    sizes = {value for value in seeds if 2 <= value <= upper}
-    if upper <= 30:
-        sizes.update(range(2, upper + 1))
-    else:
-        step = max(1, upper // 16)
-        sizes.update(range(2, upper + 1, step))
-        sizes.add(upper)
-    return sorted(sizes)
-
-
-def _pca_reduce_matrix(
-    matrix: list[list[float]],
-    *,
-    components: int,
-) -> tuple[list[list[float]], dict[str, Any]]:
-    if components <= 0 or len(matrix) < 3 or not matrix or len(matrix[0]) < 3:
-        return matrix, {"method": "none", "reason": "pca_not_applicable"}
-    try:
-        from sklearn.decomposition import PCA
-    except Exception as exc:  # pragma: no cover - exercised only without sklearn.
-        return matrix, {"method": "none", "reason": f"pca_unavailable:{exc!r}"}
-    width = len(matrix[0])
-    n_components = min(max(2, components), width, len(matrix) - 1)
-    if n_components < 2:
-        return matrix, {"method": "none", "reason": "too_few_components"}
-    pca = PCA(n_components=n_components, whiten=True, copy=True)
-    reduced = pca.fit_transform(matrix)
-    explained = getattr(pca, "explained_variance_ratio_", [])
-    return reduced.tolist(), {
-        "method": "pca_whiten",
-        "components": n_components,
-        "input_dim": width,
-        "explained_variance_ratio_sum": round(float(sum(explained)), 6),
-    }
-
-
-def _hdbscan_score(
-    labels: Sequence[int],
-    probabilities: Sequence[float],
-    *,
-    min_clusters: int,
-    max_clusters: int,
-) -> tuple[float, float, float, float]:
-    stable_count = _stable_cluster_count(labels)
-    target = (min_clusters + max_clusters) / 2.0
-    if min_clusters <= stable_count <= max_clusters:
-        cluster_penalty = abs(stable_count - target) / max(1.0, target)
-        range_penalty = 0.0
-    elif stable_count < min_clusters:
-        cluster_penalty = (min_clusters - stable_count) / max(1.0, min_clusters)
-        range_penalty = 1.0
-    else:
-        cluster_penalty = (stable_count - max_clusters) / max(1.0, max_clusters)
-        range_penalty = 1.0
-    noise_ratio = _noise_count(labels) / max(1, len(labels))
-    confidence_penalty = 1.0 - _mean_probability(labels, probabilities)
-    return (range_penalty, cluster_penalty, noise_ratio, confidence_penalty)
-
-
-def _relabel_hdbscan_by_size(labels: Sequence[int]) -> list[str]:
-    stable_counts = Counter(int(label) for label in labels if int(label) >= 0)
-    stable_order = {
-        label: rank
-        for rank, (label, _count) in enumerate(
-            sorted(stable_counts.items(), key=lambda item: (-item[1], item[0]))
-        )
-    }
-    out: list[str] = []
-    for label in labels:
-        raw = int(label)
-        if raw < 0:
-            out.append("noise_00")
-        else:
-            out.append(f"cluster_{stable_order[raw]:02d}")
-    return out
-
-
-def _sklearn_hdbscan_cluster(
-    matrix: list[list[float]],
-    *,
-    metric: str,
-    reducer: str,
-    min_clusters: int,
-    max_clusters: int,
-    min_cluster_size: int | None,
-    min_samples: int | None,
-    selection_method: str,
-    pca_components: int,
-    umap_components: int,
-    umap_neighbors: int,
-    umap_min_dist: float,
-    random_state: int,
-) -> tuple[list[int], list[float], dict[str, Any]]:
-    try:
-        from sklearn.cluster import HDBSCAN
-    except Exception as exc:
-        raise RuntimeError(
-            "sklearn HDBSCAN backend requires scikit-learn>=1.9; "
-            "install it with `uv pip install scikit-learn>=1.9`"
-        ) from exc
-    if reducer == "auto":
-        reducer = "umap"
-    if reducer == "umap":
-        reduced, reduction = _umap_reduce_matrix(
-            matrix,
-            metric=metric,
-            components=umap_components,
-            neighbors=umap_neighbors,
-            min_dist=umap_min_dist,
-            random_state=random_state,
-        )
-    elif reducer == "pca":
-        reduced, reduction = _pca_reduce_matrix(matrix, components=pca_components)
-    elif reducer == "none":
-        reduced, reduction = matrix, {"method": "none", "reason": "disabled"}
-    else:
-        raise ValueError(f"unsupported reducer: {reducer}")
-    hdbscan_matrix = reduced
-    effective_metric = "euclidean"
-    if metric == "cosine":
-        hdbscan_matrix = _l2_normalize_matrix(reduced)
-    elif metric != "euclidean":
-        raise ValueError(f"unsupported metric for sklearn_hdbscan: {metric}")
-
-    selection_methods = (
-        ["eom", "leaf"] if selection_method == "auto" else [selection_method]
-    )
-    min_sizes = _hdbscan_min_cluster_sizes(
-        row_count=len(hdbscan_matrix),
-        min_clusters=min_clusters,
-        max_clusters=max_clusters,
-        explicit=min_cluster_size,
-    )
-    candidates: list[dict[str, Any]] = []
-    best: dict[str, Any] | None = None
-    for method_name in selection_methods:
-        for size in min_sizes:
-            model = HDBSCAN(
-                min_cluster_size=size,
-                min_samples=min_samples,
-                metric=effective_metric,
-                cluster_selection_method=method_name,
-                allow_single_cluster=False,
-                copy=True,
-            )
-            model.fit(hdbscan_matrix)
-            labels = [int(label) for label in model.labels_]
-            probabilities = [
-                float(value)
-                for value in getattr(model, "probabilities_", [1.0] * len(labels))
-            ]
-            candidate = {
-                "selection_method": method_name,
-                "min_cluster_size": size,
-                "min_samples": min_samples,
-                "stable_cluster_count": _stable_cluster_count(labels),
-                "noise_count": _noise_count(labels),
-                "noise_ratio": round(_noise_count(labels) / max(1, len(labels)), 6),
-                "mean_cluster_probability": round(
-                    _mean_probability(labels, probabilities),
-                    6,
-                ),
-                "score": _hdbscan_score(
-                    labels,
-                    probabilities,
-                    min_clusters=min_clusters,
-                    max_clusters=max_clusters,
-                ),
-                "labels": labels,
-                "probabilities": probabilities,
-            }
-            candidates.append(candidate)
-            if best is None or candidate["score"] < best["score"]:
-                best = candidate
-    if best is None or int(best["stable_cluster_count"]) <= 0:
-        raise RuntimeError("sklearn HDBSCAN produced no stable clusters")
-    diagnostics = [
-        {
-            key: value
-            for key, value in candidate.items()
-            if key not in {"labels", "probabilities", "score"}
-        }
-        | {"score": [round(float(value), 6) for value in candidate["score"]]}
-        for candidate in candidates
-    ]
-    return list(best["labels"]), list(best["probabilities"]), {
-        "backend": "umap_hdbscan" if reduction.get("method") == "umap" else (
-            "sklearn_hdbscan_pca" if reduction.get("method") == "pca_whiten" else "sklearn_hdbscan"
-        ),
-        "metric": metric,
-        "effective_metric": effective_metric,
-        "reduction": reduction,
-        "selection_method": best["selection_method"],
-        "min_cluster_size": best["min_cluster_size"],
-        "min_samples": best["min_samples"],
-        "stable_cluster_count": best["stable_cluster_count"],
-        "noise_count": best["noise_count"],
-        "noise_ratio": best["noise_ratio"],
-        "mean_cluster_probability": best["mean_cluster_probability"],
-        "tuned_candidates": diagnostics,
-    }
-
-
-def _nearest_neighbors(matrix: list[list[float]], *, metric: str) -> list[int]:
-    neighbors: list[int] = []
-    for index, row in enumerate(matrix):
-        best_index = index
-        best_distance = math.inf
-        for other_index, other in enumerate(matrix):
-            if other_index == index:
-                continue
-            distance = _distance(row, other, metric)
-            if distance < best_distance:
-                best_index = other_index
-                best_distance = distance
-        neighbors.append(best_index)
-    return neighbors
-
-
-def _connected_components(edges: list[tuple[int, int]], count: int) -> list[int]:
-    parent = list(range(count))
-
-    def find(value: int) -> int:
-        while parent[value] != value:
-            parent[value] = parent[parent[value]]
-            value = parent[value]
-        return value
-
-    def union(left: int, right: int) -> None:
-        left_root = find(left)
-        right_root = find(right)
-        if left_root != right_root:
-            parent[right_root] = left_root
-
-    for left, right in edges:
-        union(left, right)
-    roots: dict[int, int] = {}
-    labels: list[int] = []
-    for index in range(count):
-        root = find(index)
-        if root not in roots:
-            roots[root] = len(roots)
-        labels.append(roots[root])
-    return labels
-
-
-def _centroids(matrix: list[list[float]], labels: list[int]) -> dict[int, list[float]]:
-    grouped: dict[int, list[list[float]]] = defaultdict(list)
-    for row, label in zip(matrix, labels):
-        grouped[label].append(row)
-    out: dict[int, list[float]] = {}
-    for label, rows in grouped.items():
-        width = len(rows[0]) if rows else 0
-        out[label] = [
-            sum(row[col] for row in rows) / max(1, len(rows))
-            for col in range(width)
-        ]
-    return out
-
-
-def finch_partitions(matrix: list[list[float]], *, metric: str) -> list[list[int]]:
-    if not matrix:
-        return []
-    if len(matrix) == 1:
-        return [[0]]
-    partitions: list[list[int]] = []
-    current_matrix = matrix
-    original_to_current = list(range(len(matrix)))
-    current_cluster_members: dict[int, list[int]] = {idx: [idx] for idx in range(len(matrix))}
-    previous_count = len(matrix)
-    while len(current_matrix) > 1:
-        nn = _nearest_neighbors(current_matrix, metric=metric)
-        edges: set[tuple[int, int]] = set()
-        for index, neighbor in enumerate(nn):
-            edges.add(tuple(sorted((index, neighbor))))
-            if 0 <= neighbor < len(nn):
-                edges.add(tuple(sorted((index, nn[neighbor]))))
-        local_labels = _connected_components(sorted(edges), len(current_matrix))
-        label_map: dict[int, int] = {}
-        next_members: dict[int, list[int]] = {}
-        for local_index, raw_label in enumerate(local_labels):
-            next_label = label_map.setdefault(raw_label, len(label_map))
-            members = current_cluster_members[local_index]
-            next_members.setdefault(next_label, []).extend(members)
-        original_labels = [0] * len(matrix)
-        for label, members in next_members.items():
-            for member in members:
-                original_labels[member] = label
-        cluster_count = len(set(original_labels))
-        if cluster_count >= previous_count:
-            break
-        partitions.append(original_labels)
-        previous_count = cluster_count
-        centroids = _centroids(matrix, original_labels)
-        current_matrix = [centroids[label] for label in sorted(centroids)]
-        current_cluster_members = {
-            label: next_members[label]
-            for label in sorted(next_members)
-        }
-        original_to_current = [original_labels[index] for index in range(len(matrix))]
-        if cluster_count == 1:
-            break
-    return partitions or [[index for index in range(len(matrix))]]
-
-
-def _cluster_count(labels: list[int]) -> int:
-    return len(set(labels))
-
-
-def _relabel_by_size(labels: list[int]) -> list[str]:
-    counts = Counter(labels)
-    order = {
-        label: rank
-        for rank, (label, _count) in enumerate(
-            sorted(counts.items(), key=lambda item: (-item[1], item[0]))
-        )
-    }
-    return [f"cluster_{order[label]:02d}" for label in labels]
-
-
-def _pick_partition(
-    partitions: list[list[int]],
-    *,
-    min_clusters: int,
-    max_clusters: int,
-) -> list[int]:
-    if not partitions:
-        return []
-    in_range = [
-        labels
-        for labels in partitions
-        if min_clusters <= _cluster_count(labels) <= max_clusters
-    ]
-    if in_range:
-        target = (min_clusters + max_clusters) / 2.0
-        return min(in_range, key=lambda labels: abs(_cluster_count(labels) - target))
-    target = max(min_clusters, min(max_clusters, _cluster_count(partitions[0])))
-    return min(partitions, key=lambda labels: abs(_cluster_count(labels) - target))
 
 
 def _zscore_matrix(matrix: list[list[float]]) -> list[list[float]]:
@@ -612,46 +241,44 @@ def _feature_matrix(
     }
 
 
-def _umap_reduce_matrix(
-    matrix: list[list[float]],
-    *,
-    metric: str,
-    components: int,
-    neighbors: int,
-    min_dist: float,
-    random_state: int,
-) -> tuple[list[list[float]], dict[str, Any]]:
-    if components <= 0 or len(matrix) < 5:
-        return matrix, {"method": "none", "reason": "umap_not_applicable"}
-    try:
-        import umap
-    except Exception as exc:  # pragma: no cover - exercised only without umap-learn.
-        raise RuntimeError(
-            "UMAP backend requires umap-learn; install it with `uv pip install umap-learn`"
-        ) from exc
-    n_neighbors = min(max(2, neighbors), max(2, len(matrix) - 1))
-    n_components = min(max(2, components), max(2, len(matrix) - 2), len(matrix[0]))
-    reducer = umap.UMAP(
-        n_neighbors=n_neighbors,
-        n_components=n_components,
-        min_dist=min_dist,
-        metric=metric,
-        random_state=random_state,
-        transform_seed=random_state,
-    )
-    reduced = reducer.fit_transform(matrix)
-    return reduced.tolist(), {
-        "method": "umap",
-        "components": n_components,
-        "neighbors": n_neighbors,
-        "min_dist": min_dist,
-        "metric": metric,
-        "random_state": random_state,
-        "input_dim": len(matrix[0]) if matrix else 0,
+def _distance_matrix(matrix: list[list[float]], *, metric: str) -> list[list[float]]:
+    n = len(matrix)
+    dm: list[list[float]] = [[0.0] * n for _ in range(n)]
+    for i in range(n):
+        for j in range(i + 1, n):
+            value = _distance(matrix[i], matrix[j], metric)
+            dm[i][j] = value
+            dm[j][i] = value
+    return dm
+
+
+def _relabel_by_size(labels: Sequence[int]) -> list[str]:
+    """Map integer TORC labels to ``cluster_NN`` / ``noise_00`` strings.
+
+    Noise points (label < 0) collapse into a single ``noise_00`` bucket, matching
+    the audit HTML's expectation of one review bucket.
+    """
+    counts = Counter(int(label) for label in labels if int(label) >= 0)
+    order = {
+        label: rank
+        for rank, (label, _count) in enumerate(
+            sorted(counts.items(), key=lambda item: (-item[1], item[0]))
+        )
     }
+    out: list[str] = []
+    for label in labels:
+        raw = int(label)
+        out.append(f"cluster_{order[raw]:02d}" if raw >= 0 else "noise_00")
+    return out
 
 
-def _representatives(rows: list[dict[str, Any]], matrix: list[list[float]], labels: list[str], *, per_cluster: int) -> list[dict[str, Any]]:
+def _representatives(
+    rows: list[dict[str, Any]],
+    matrix: list[list[float]],
+    labels: list[str],
+    *,
+    per_cluster: int,
+) -> list[dict[str, Any]]:
     grouped: dict[str, list[int]] = defaultdict(list)
     for index, label in enumerate(labels):
         grouped[label].append(index)
@@ -781,7 +408,7 @@ code {{ background: #eef3ef; padding: 1px 4px; border-radius: 4px; }}
         <select id="cluster"></select>
       </div>
       <p class="meta" id="summary"></p>
-      <button id="download">下载人工标签 JSONL</button>
+      <button id="download">下载 keep/drop 标签 JSONL</button>
     </div>
     <div id="list"></div>
   </aside>
@@ -796,15 +423,9 @@ code {{ background: #eef3ef; padding: 1px 4px; border-radius: 4px; }}
       <div class="kv" id="metrics"></div>
     </section>
     <section class="panel">
-      <h3>人工标签</h3>
-      <p class="meta">内容标签和决策标签分开标；低一致性簇先标 uncertain/review。</p>
-      <div class="labels" id="contentButtons"></div>
-      <div style="height:8px"></div>
+      <h3>初始训练标签</h3>
+      <p class="meta">聚类只用于第一次粗标签；每条样本只标 keep/drop，混簇噪声交给后续全量训练修正。</p>
       <div class="labels" id="displayButtons"></div>
-      <div style="height:8px"></div>
-      <div class="labels" id="alignButtons"></div>
-      <div style="height:8px"></div>
-      <div class="labels" id="qcButtons"></div>
       <label class="meta" for="notes">notes</label>
       <textarea id="notes"></textarea>
     </section>
@@ -816,10 +437,7 @@ code {{ background: #eef3ef; padding: 1px 4px; border-radius: 4px; }}
 const ROWS = JSON.parse(document.getElementById("rows-json").textContent);
 const SUMMARIES = JSON.parse(document.getElementById("summaries-json").textContent);
 const STORAGE_KEY = "cueqc-cluster-audit:" + location.pathname;
-const CONTENT = [["dialogue","dialogue"],["non_dialogue","non_dialogue"],["mixed","mixed"],["uncertain","uncertain"]];
-const DISPLAY = [["keep","keep"],["drop","drop"],["compact","compact"],["review","review"]];
-const ALIGN = [["align","align"],["skip_align_fallback","skip_align_fallback"]];
-const QC = [["keep","keep"],["review","review"],["reject","reject"]];
+const DISPLAY = [["keep","keep"],["drop","drop"]];
 let annotations = loadAnnotations();
 let filtered = [...ROWS];
 let current = 0;
@@ -896,10 +514,7 @@ function renderCurrent() {{
     ["audio", (row.audio || {{}}).path || ""]
   ];
   document.getElementById("metrics").innerHTML = metrics.map(([k,v]) => `<div>${{escapeHtml(k)}}</div><div>${{escapeHtml(v)}}</div>`).join("");
-  setButtons("contentButtons", CONTENT, "content_label");
   setButtons("displayButtons", DISPLAY, "display_decision");
-  setButtons("alignButtons", ALIGN, "alignment_policy");
-  setButtons("qcButtons", QC, "qc_decision");
   document.getElementById("notes").value = (annotations[row.sample_id] || {{}}).notes || "";
 }}
 function exportRows() {{
@@ -912,6 +527,7 @@ function exportRows() {{
     duration_s: row.duration_s,
     text: row.text,
     raw_text: row.raw_text,
+    display_decision: (annotations[row.sample_id] || {{}}).display_decision || "",
     ...(annotations[row.sample_id] || {{}})
   }}));
 }}
@@ -926,7 +542,7 @@ document.getElementById("download").onclick = () => {{
   const blob = new Blob([exportRows().map(row => JSON.stringify(row)).join("\\n") + "\\n"], {{type:"application/jsonl;charset=utf-8"}});
   const a = document.createElement("a");
   a.href = URL.createObjectURL(blob);
-  a.download = "cueqc_manual_labels.jsonl";
+  a.download = "cueqc_cluster_labels.jsonl";
   a.click();
   URL.revokeObjectURL(a.href);
 }};
@@ -941,140 +557,81 @@ applyFilters();
 def cluster_rows(
     rows: list[dict[str, Any]],
     *,
-    method: str,
-    metric: str,
-    min_clusters: int,
-    max_clusters: int,
-    representatives_per_cluster: int,
+    metric: str = "euclidean",
     feature_space: str = "auto",
-    reducer: str = "umap",
-    min_cluster_size: int | None = None,
-    min_samples: int | None = None,
-    selection_method: str = "auto",
-    pca_components: int = 8,
-    umap_components: int = 8,
-    umap_neighbors: int = 15,
-    umap_min_dist: float = 0.0,
-    random_state: int = 17,
+    representatives_per_cluster: int = 3,
+    detect_noise: bool = True,
+    adjustment_factor: float | None = None,
+    merge_layer: int | None = None,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]], dict[str, Any]]:
-    if method not in {"auto", "umap_hdbscan", "sklearn_hdbscan", "finch_first_neighbor"}:
-        raise ValueError(f"unsupported method: {method}")
+    """Cluster candidates with Torque Clustering.
+
+    The cluster count is decided by TORC itself. By default the torque-gap cut
+    on the final merge tree is used (factor-auto-tuned); pass ``merge_layer`` to
+    instead take a partition from the TORC merge hierarchy (layer 0 = initial
+    1-NN layer, layer 1 = after one merge pass, ...) which is far more stable on
+    heavy-tailed distance distributions. Returns
+    ``(clustered_rows, representatives, summaries, summary)``.
+    """
     matrix, feature_summary = _feature_matrix(rows, feature_space=feature_space)
     if not matrix:
         return [], [], [], {
             "schema": "cueqc_cluster_summary_v1",
-            "method": method,
+            "method": "torque",
             "cluster_count": 0,
             "candidate_count": 0,
             "feature_space": feature_summary,
         }
-    resolved_method = "umap_hdbscan" if method == "auto" else method
-    hdbscan_error = ""
-    if resolved_method in {"umap_hdbscan", "sklearn_hdbscan"}:
-        try:
-            labels_raw_hdbscan, probabilities, backend_summary = _sklearn_hdbscan_cluster(
-                matrix,
-                metric=metric,
-                reducer="umap" if resolved_method == "umap_hdbscan" else reducer,
-                min_clusters=min_clusters,
-                max_clusters=max_clusters,
-                min_cluster_size=min_cluster_size,
-                min_samples=min_samples,
-                selection_method=selection_method,
-                pca_components=pca_components,
-                umap_components=umap_components,
-                umap_neighbors=umap_neighbors,
-                umap_min_dist=umap_min_dist,
-                random_state=random_state,
-            )
-            labels = _relabel_hdbscan_by_size(labels_raw_hdbscan)
-            clustered_rows = []
-            for row, raw_label, label, probability in zip(
-                rows,
-                labels_raw_hdbscan,
-                labels,
-                probabilities,
-            ):
-                item = dict(row)
-                item["cluster_id"] = label
-                item["cluster_raw_label"] = int(raw_label)
-                item["cluster_method"] = backend_summary["backend"]
-                item["cluster_backend"] = backend_summary["backend"]
-                item["cluster_noise"] = int(raw_label) < 0
-                item["cluster_confidence"] = round(float(probability), 6)
-                clustered_rows.append(item)
-            summaries = _cluster_summaries(clustered_rows, labels)
-            representatives = _representatives(
-                clustered_rows,
-                matrix,
-                labels,
-                per_cluster=representatives_per_cluster,
-            )
-            summary = {
-                "schema": "cueqc_cluster_summary_v1",
-                "method": backend_summary["backend"],
-                "requested_method": method,
-                "metric": metric,
-                "candidate_count": len(rows),
-                "cluster_count": len(
-                    {label for label in labels if not label.startswith("noise_")}
-                ),
-                "total_groups_including_noise": len(summaries),
-                "target_min_clusters": min_clusters,
-                "target_max_clusters": max_clusters,
-                "cluster_counts": {
-                    summary["cluster_id"]: summary["count"] for summary in summaries
-                },
-                "representatives_per_cluster": representatives_per_cluster,
-                "feature_space": feature_summary,
-                "backend": backend_summary,
-            }
-            return clustered_rows, representatives, summaries, summary
-        except Exception as exc:
-            if method != "auto":
-                raise
-            hdbscan_error = repr(exc)
-            resolved_method = "finch_first_neighbor"
 
-    partitions = finch_partitions(matrix, metric=metric)
-    labels_raw = _pick_partition(
-        partitions,
-        min_clusters=min_clusters,
-        max_clusters=max_clusters,
+    distance_matrix = _distance_matrix(matrix, metric=metric)
+    labels_raw, labels_noise, diag = torque_clustering(
+        distance_matrix, k=0, detect_noise=detect_noise,
+        adjustment_factor=adjustment_factor, merge_layer=merge_layer,
     )
-    labels = _relabel_by_size(labels_raw)
-    clustered_rows = []
+    # merge_layer partitions carry no noise flag; only the final-tree cut does.
+    labels = _relabel_by_size(labels_noise if (detect_noise and merge_layer is None) else labels_raw)
+
+    clustered_rows: list[dict[str, Any]] = []
     for row, label in zip(rows, labels):
         item = dict(row)
         item["cluster_id"] = label
-        item["cluster_method"] = "finch_first_neighbor"
-        item["cluster_backend"] = "finch_first_neighbor"
-        item["cluster_noise"] = False
+        item["cluster_method"] = "torque"
+        item["cluster_backend"] = "torque"
+        item["cluster_noise"] = label == "noise_00"
         item["cluster_confidence"] = 1.0
         clustered_rows.append(item)
+
     summaries = _cluster_summaries(clustered_rows, labels)
     representatives = _representatives(
-        clustered_rows,
-        matrix,
-        labels,
-        per_cluster=representatives_per_cluster,
+        clustered_rows, matrix, labels, per_cluster=representatives_per_cluster
     )
+    stable_count = len({label for label in labels if not label.startswith("noise_")})
     summary = {
         "schema": "cueqc_cluster_summary_v1",
-        "method": "finch_first_neighbor",
-        "requested_method": method,
+        "method": "torque",
         "metric": metric,
         "candidate_count": len(rows),
-        "cluster_count": len(summaries),
-        "target_min_clusters": min_clusters,
-        "target_max_clusters": max_clusters,
-        "partition_cluster_counts": [_cluster_count(labels) for labels in partitions],
-        "cluster_counts": {summary["cluster_id"]: summary["count"] for summary in summaries},
+        "cluster_count": stable_count,
+        "total_groups_including_noise": len(summaries),
+        "cluster_counts": {s["cluster_id"]: s["count"] for s in summaries},
         "representatives_per_cluster": representatives_per_cluster,
         "feature_space": feature_summary,
+        "backend": {
+            "algorithm": "torque",
+            "mode": "merge_layer" if merge_layer is not None else "torque_gap_cut",
+            "merge_layer": merge_layer,
+            "layer_cluster_counts": diag.get("layer_cluster_counts"),
+            "k_requested": diag["k_requested"],
+            "autonomous_k": diag["cluster_count"],
+            "cut_count": diag["cut_count"],
+            "noise_count": diag["noise_count"],
+            "detect_noise": diag["detect_noise"],
+            "adjustment_factor": round(float(diag["adjustment_factor"]), 4),
+            "auto_config": diag["auto_config"],
+            "torque_max": round(float(max(diag["torque"])) if diag["torque"].size else 0.0, 6),
+            "mass_sum": round(float(diag["mass"].sum()) if diag["mass"].size else 0.0, 6),
+        },
     }
-    if hdbscan_error:
-        summary["fallback_reason"] = f"umap_hdbscan_unavailable:{hdbscan_error}"
     return clustered_rows, representatives, summaries, summary
 
 
@@ -1084,21 +641,12 @@ def run(args: argparse.Namespace) -> int:
         rows = rows[: args.max_items]
     clustered, representatives, summaries, summary = cluster_rows(
         rows,
-        method=args.method,
         metric=args.metric,
         feature_space=args.feature_space,
-        reducer=args.reducer,
-        min_clusters=args.min_clusters,
-        max_clusters=args.max_clusters,
         representatives_per_cluster=args.representatives_per_cluster,
-        min_cluster_size=args.min_cluster_size,
-        min_samples=args.min_samples,
-        selection_method=args.selection_method,
-        pca_components=args.pca_components,
-        umap_components=args.umap_components,
-        umap_neighbors=args.umap_neighbors,
-        umap_min_dist=args.umap_min_dist,
-        random_state=args.random_state,
+        detect_noise=not args.no_noise,
+        adjustment_factor=args.adjustment_factor,
+        merge_layer=args.merge_layer,
     )
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -1135,65 +683,44 @@ def run(args: argparse.Namespace) -> int:
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Cluster CueQC candidates for cluster-first manual audit.")
+    parser = argparse.ArgumentParser(
+        description="Cluster CueQC candidates with parameter-free Torque Clustering."
+    )
     parser.add_argument("--input", required=True, help="cueqc_candidates.jsonl")
     parser.add_argument("--output-dir", required=True)
-    parser.add_argument(
-        "--method",
-        choices=("auto", "umap_hdbscan", "sklearn_hdbscan", "finch_first_neighbor"),
-        default="auto",
-        help="auto resolves to fused embeddings + UMAP + HDBSCAN, with FINCH fallback.",
-    )
     parser.add_argument("--metric", choices=("cosine", "euclidean"), default="euclidean")
     parser.add_argument(
         "--feature-space",
         choices=("auto", "structured", "dense", "fused"),
         default="auto",
-        help="auto uses fused structured+dense embeddings when embeddings are present.",
+        help="auto uses structured features unless dense embeddings are present.",
     )
-    parser.add_argument(
-        "--reducer",
-        choices=("auto", "umap", "pca", "none"),
-        default="umap",
-        help="dimensionality reducer for sklearn_hdbscan; umap_hdbscan always uses UMAP.",
-    )
-    parser.add_argument("--min-clusters", type=int, default=DEFAULT_CLUSTER_COUNT_MIN)
-    parser.add_argument("--max-clusters", type=int, default=DEFAULT_CLUSTER_COUNT_MAX)
-    parser.add_argument("--min-cluster-size", type=int)
-    parser.add_argument("--min-samples", type=int)
-    parser.add_argument(
-        "--selection-method",
-        choices=("auto", "eom", "leaf"),
-        default="auto",
-        help="HDBSCAN cluster selection strategy; auto sweeps eom and leaf.",
-    )
-    parser.add_argument("--pca-components", type=int, default=8)
-    parser.add_argument("--umap-components", type=int, default=8)
-    parser.add_argument("--umap-neighbors", type=int, default=15)
-    parser.add_argument("--umap-min-dist", type=float, default=0.0)
-    parser.add_argument("--random-state", type=int, default=17)
     parser.add_argument("--representatives-per-cluster", type=int, default=3)
+    parser.add_argument("--no-noise", action="store_true", help="disable TORC noise detection")
+    parser.add_argument(
+        "--adjustment-factor",
+        type=float,
+        default=None,
+        help="override TORC cut threshold in [0,1]; default auto-tunes from the distance matrix.",
+    )
+    parser.add_argument(
+        "--merge-layer",
+        type=int,
+        default=None,
+        help=(
+            "take a partition from the TORC merge hierarchy instead of the "
+            "torque-gap cut. layer 0 = initial 1-NN layer, layer 1 = one merge "
+            "pass, etc. Far more stable than the factor-sensitive cut on "
+            "heavy-tailed distance distributions."
+        ),
+    )
     parser.add_argument("--max-items", type=int)
     parser.add_argument("--title", default="CueQC cluster-first 审计")
     args = parser.parse_args(argv)
-    if args.min_clusters <= 0 or args.max_clusters <= 0:
-        parser.error("cluster bounds must be positive")
-    if args.min_clusters > args.max_clusters:
-        parser.error("--min-clusters must be <= --max-clusters")
     if args.representatives_per_cluster <= 0:
         parser.error("--representatives-per-cluster must be positive")
-    if args.min_cluster_size is not None and args.min_cluster_size <= 1:
-        parser.error("--min-cluster-size must be > 1")
-    if args.min_samples is not None and args.min_samples <= 0:
-        parser.error("--min-samples must be positive")
-    if args.pca_components < 0:
-        parser.error("--pca-components must be non-negative")
-    if args.umap_components < 0:
-        parser.error("--umap-components must be non-negative")
-    if args.umap_neighbors <= 1:
-        parser.error("--umap-neighbors must be > 1")
-    if args.umap_min_dist < 0.0:
-        parser.error("--umap-min-dist must be non-negative")
+    if args.adjustment_factor is not None and not 0.0 <= args.adjustment_factor <= 1.0:
+        parser.error("--adjustment-factor must be in [0, 1]")
     if args.max_items is not None and args.max_items <= 0:
         parser.error("--max-items must be positive")
     return args

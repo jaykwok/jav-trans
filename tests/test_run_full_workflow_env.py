@@ -1,6 +1,22 @@
 from pathlib import Path
 
-from tools.boundary.ja import run_full_workflow
+from tools.workflows import run_full_workflow
+
+
+def test_run_full_workflow_paths_add_timestamp_to_unprefixed_task(monkeypatch):
+    monkeypatch.setattr(run_full_workflow.time, "strftime", lambda fmt: "20260617_104500")
+
+    paths = run_full_workflow.make_paths("unit workflow")
+
+    assert paths.root.name == "20260617_104500_unit_workflow"
+
+
+def test_run_full_workflow_paths_keep_existing_timestamp_prefix(monkeypatch):
+    monkeypatch.setattr(run_full_workflow.time, "strftime", lambda fmt: "20260617_104500")
+
+    paths = run_full_workflow.make_paths("20260615_094437_o10")
+
+    assert paths.root.name == "20260615_094437_o10"
 
 
 def test_run_full_workflow_parse_args_uses_loaded_env(monkeypatch):

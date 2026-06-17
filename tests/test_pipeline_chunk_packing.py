@@ -336,7 +336,6 @@ def test_empty_disallowed_boundary_skips_asr_without_full_audio_fallback(monkeyp
     assert backend.finalized_texts == []
     assert details["chunk_count"] == 0
     assert details["transcript_chunks"] == []
-    assert details["asr_qc"]["review_uncertain_count"] == 0
     assert any("切分完成：共 0 个处理块" in entry for entry in log)
 
 
@@ -490,8 +489,7 @@ def test_alignment_outcome_metadata_is_written_to_chunks_and_segments():
     assert segments[0]["source_chunk_indices"] == [4]
 
 
-def test_adaptive_precision_reviews_low_logprob_before_alignment(monkeypatch, tmp_path):
-    monkeypatch.setenv("ASR_QC_ADAPTIVE_BASE_LOGPROB", "-1.0")
+def test_low_logprob_chunks_continue_without_legacy_adaptive_review(monkeypatch, tmp_path):
     backend, segments, log, details = _run_transcription_with_backend(
         monkeypatch,
         tmp_path,
@@ -500,9 +498,9 @@ def test_adaptive_precision_reviews_low_logprob_before_alignment(monkeypatch, tm
 
     assert segments
     assert backend.finalized_texts
-    assert details["asr_qc"]["review_uncertain_count"] == len(backend.audio_paths)
-    assert details["stage_timings"]["asr_adaptive_review_chunks"] == len(backend.audio_paths)
-    assert any(entry.startswith("ASR Adaptive Precision: review_uncertain=") for entry in log)
+    assert "asr_qc" not in details
+    assert "asr_adaptive_review_chunks" not in details["stage_timings"]
+    assert not any(entry.startswith("ASR Adaptive Precision:") for entry in log)
     assert all(chunk["text"] for chunk in details["transcript_chunks"])
 
 
@@ -513,9 +511,9 @@ def test_cueqc_shadow_records_without_skipping_alignment(monkeypatch, tmp_path):
     assert len(backend.finalized_payloads) == len(backend.audio_paths)
     assert details["cueqc_shadow"]["shadow_only"] is True
     assert details["cueqc_shadow"]["candidate_count"] == len(backend.audio_paths)
-    assert details["cueqc_shadow"]["counts"]["alignment_policy"] == {"align": len(backend.audio_paths)}
+    assert details["cueqc_shadow"]["counts"]["display_hint"] == {"keep": len(backend.audio_paths)}
     assert details["transcript_chunks"]
     assert all("cueqc_shadow" in chunk for chunk in details["transcript_chunks"])
     assert segments
     assert all(segment.get("cueqc_shadow") for segment in segments)
-    assert any(entry.startswith("CueQC shadow: candidates=") for entry in log)
+    assert any(entry.startswith("CueQC: candidates=") for entry in log)

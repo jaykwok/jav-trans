@@ -147,29 +147,21 @@ DEFAULT_SETTINGS: dict[str, str] = {
     # Hard cap for grouping aligned words into one subtitle candidate.
     "ASR_SEGMENT_HARD_MAX_DURATION": "9.0",
 
-    # --- ASR QC / Review Signals ---
-    # 1 enables ASR text quality checks before translation.
-    "ASR_QC_ENABLED": "1",
-    # Adaptive precision flags high-risk ASR chunks for review; it does not delete text.
-    "ASR_QC_ADAPTIVE_BASE_LOGPROB": "-0.7",
-    "ASR_QC_ADAPTIVE_MIN_LOGPROB": "-0.95",
-    "ASR_QC_ADAPTIVE_MAX_LOGPROB": "-0.55",
-    "ASR_QC_ADAPTIVE_VIDEO_MAD_MULTIPLIER": "1.8",
-    "ASR_QC_ADAPTIVE_VIDEO_MAX_LOGPROB": "-0.70",
-    "ASR_QC_ADAPTIVE_HARD_NOSPEECH_THRESHOLD": "0.5",
-    "ASR_QC_ADAPTIVE_HARD_COMPRESSION_THRESHOLD": "2.0",
-    "ASR_QC_ADAPTIVE_HARD_MAX_CHARS_PER_SEC": "14.0",
-    "ASR_QC_ADAPTIVE_HARD_REPEAT_RATIO": "0.45",
-
-    # --- CueQC Shadow Classifier / Cluster-First Review ---
-    # 1 records CueQC candidate features and conservative shadow decisions.
+    # --- CueQC Mamba v3-Fusion (display keep/drop binary filter) ---
+    # 1 records CueQC candidate features and model/fallback decisions.
     "CUEQC_SHADOW_ENABLED": "1",
-    # First release is shadow-only; pre-align skip remains disabled until manual gate passes.
-    "CUEQC_PREALIGN_SKIP_ENABLED": "0",
-    "CUEQC_PREALIGN_SKIP_MIN_CONFIDENCE": "0.92",
-    "CUEQC_TAXONOMY_VERSION": "cluster_first_v1",
-    "CUEQC_MODEL_VERSION": "rules_shadow_v1",
-    "CUEQC_MODEL_PATH": "",
+    # v3-Fusion: teacher-forced ASR encoder features + token trace + decoder
+    # stats + structured metadata -> display keep/drop. Legacy rule QC removed.
+    "CUEQC_DECISION_VERSION": "cueqc_display_binary_v1",
+    "CUEQC_MODEL_VERSION": "cueqc_mamba_v3_fusion",
+    "CUEQC_MODEL_PATH": "src/asr/checkpoints/cueqc_mamba_v3_fusion.pt",
+    # drop only when model p_drop >= this threshold (conservative; else keep).
+    "CUEQC_DROP_THRESHOLD": "0.85",
+    "CUEQC_FALLBACK_POLICY": "keep",
+    # 1 = actually remove model-confirmed drop candidates before alignment;
+    # 0 = record shadow only (audit), keep all candidates.
+    "CUEQC_DROP_APPLY_ENABLED": "1",
+    "CUEQC_DEVICE": "auto",
     # Optional JSONL export path for cluster-first audit candidates.
     "CUEQC_EXPORT_CANDIDATES_PATH": "",
     "CUEQC_EXPORT_CANDIDATES_APPEND": "1",

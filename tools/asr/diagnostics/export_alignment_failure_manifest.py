@@ -13,7 +13,6 @@ PROJECT_ROOT = Path(__file__).resolve().parents[3]
 
 
 REVIEW_TYPE_BY_BUCKET = {
-    "asr_review_uncertain": "review_asr_text",
     "align_text_empty": "review_alignment_text",
     "empty_text_for_chunk": "review_empty_asr",
     "text_without_output_segment": "review_missing_output_segment",
@@ -23,8 +22,6 @@ REVIEW_TYPE_BY_BUCKET = {
     "proportional_alignment": "review_coarse_timing",
     "unknown_alignment_fallback": "review_unknown_fallback",
     "abnormal_char_density": "review_possible_hallucination",
-    "asr_qc_reject": "review_asr_qc_reject",
-    "asr_qc_warn": "review_asr_qc_warn",
     "diagnostic_warning": "review_diagnostic_warning",
 }
 
@@ -83,7 +80,6 @@ def write_csv(path: Path, rows: list[dict[str, Any]]) -> None:
         "duration_s",
         "alignment_quality",
         "fallback_type",
-        "asr_qc_severity",
         "display_text",
         "align_text",
         "repetition_suggested_text",
@@ -140,8 +136,6 @@ def manifest_row(row: Mapping[str, Any]) -> dict[str, Any]:
         "alignment_quality": str(row.get("alignment_quality") or ""),
         "fallback_type": str(row.get("fallback_type") or ""),
         "alignment_quality_reasons": list(row.get("alignment_quality_reasons") or []),
-        "asr_qc_severity": str(row.get("asr_qc_severity") or ""),
-        "asr_qc_reasons": list(row.get("asr_qc_reasons") or []),
         "display_text": normalized_text(row.get("display_text")),
         "align_text": normalized_text(row.get("align_text")),
         "repetition_suggested_text": normalized_text(row.get("repetition_suggested_text")),

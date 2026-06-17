@@ -104,14 +104,11 @@ def test_asr_generation_errors_are_reported_and_warned():
         [],
         0,
         1,
-        asr_qc={
+        asr_generation={
             "generation_error_count": 2,
             "generation_overflow_count": 1,
             "timeout_count": 1,
             "quarantined_count": 1,
-            "empty_text_for_speech_count": 1,
-            "review_uncertain_count": 3,
-            "review_uncertain_items": [{"chunk_index": 7, "original_text": "怪しい"}],
         },
     )
 
@@ -119,21 +116,18 @@ def test_asr_generation_errors_are_reported_and_warned():
     assert report["asr_generation_overflow_count"] == 1
     assert report["asr_timeout_count"] == 1
     assert report["asr_quarantined_count"] == 1
-    assert report["asr_empty_text_for_speech_count"] == 1
-    assert report["asr_review_uncertain_count"] == 3
-    assert report["asr_review_uncertain_items"][0]["original_text"] == "怪しい"
     assert any("asr_generation_error_count" in warning for warning in report["warnings"])
     assert any("asr_generation_overflow_count" in warning for warning in report["warnings"])
 
 
-def test_empty_segments_keep_asr_qc_counts():
+def test_empty_segments_keep_asr_generation_counts():
     report = compute_quality_report(
         [],
         60.0,
         [],
         0,
         0,
-        asr_qc={"generation_error_count": 1, "generation_overflow_count": 1},
+        asr_generation={"generation_error_count": 1, "generation_overflow_count": 1},
     )
 
     assert report["asr_generation_error_count"] == 1

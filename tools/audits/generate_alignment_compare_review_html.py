@@ -259,8 +259,6 @@ def normalized_row(row: Mapping[str, Any]) -> dict[str, Any]:
         "fallback_type": str(row.get("fallback_type") or ""),
         "fallback_subtype": str(row.get("fallback_subtype") or ""),
         "failure_bucket": str(row.get("failure_bucket") or ""),
-        "asr_qc_severity": str(row.get("asr_qc_severity") or ""),
-        "asr_qc_reasons": list(row.get("asr_qc_reasons") or []),
         "failure_reasons": list(row.get("failure_reasons") or []),
         "display_text": compact_text(row.get("display_text") or row.get("text") or ""),
         "align_text": compact_text(row.get("align_text") or ""),
@@ -690,7 +688,6 @@ function chunkHtml(chunk) {{
       <div>chunk</div><div>${{chunk.chunk_index}}</div>
       <div>time</div><div>${{fmt(chunk.start)}}-${{fmt(chunk.end)}} (${{Number(chunk.duration_s || 0).toFixed(2)}}s)</div>
       <div>quality</div><div>${{escapeHtml(chunk.alignment_quality)}} / ${{escapeHtml(chunk.fallback_subtype || "none")}}</div>
-      <div>qc</div><div>${{escapeHtml(chunk.asr_qc_severity || "")}} ${{escapeHtml((chunk.asr_qc_reasons || []).join(", "))}}</div>
     </div>
     <div class="text">${{escapeHtml(chunk.display_text || chunk.align_text || chunk.raw_text || "(empty)")}}</div>
   </div>`;

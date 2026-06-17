@@ -15,7 +15,7 @@ from types import SimpleNamespace
 from typing import Any
 
 
-PROJECT_ROOT = Path(__file__).resolve().parents[3]
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
 SRC_ROOT = PROJECT_ROOT / "src"
 if str(SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(SRC_ROOT))
@@ -46,6 +46,13 @@ def safe_label(value: str) -> str:
     return clean.strip("_") or "item"
 
 
+def timestamped_label(value: str) -> str:
+    label = safe_label(value)
+    if re.match(r"^\d{8}_\d{6}_", label):
+        return label
+    return f"{time.strftime('%Y%m%d_%H%M%S')}_{label}"
+
+
 def project_path(value: str | Path) -> Path:
     raw = Path(value).expanduser()
     return raw if raw.is_absolute() else (PROJECT_ROOT / raw).resolve()
@@ -69,7 +76,7 @@ def project_rel(value: str | Path | None) -> str:
 
 
 def make_paths(task_name: str) -> RunPaths:
-    root = PROJECT_ROOT / "agents" / "temp" / "speech-boundary-ja" / safe_label(task_name)
+    root = PROJECT_ROOT / "agents" / "temp" / "speech-boundary-ja" / timestamped_label(task_name)
     return RunPaths(
         root=root,
         jobs=root / "jobs",
@@ -234,7 +241,6 @@ def build_context(*, args: argparse.Namespace, paths: RunPaths, video: Path):
         "SPEECH_BOUNDARY_JA_CUT_THRESHOLD": str(args.speech_boundary_cut_threshold),
         "SPEECH_BOUNDARY_JA_APPLY_CUT_TO_SPEECH": "1" if args.speech_boundary_apply_cut_to_speech else "0",
         "KEEP_ASR_CHUNKS": "1" if args.keep_asr_chunks else "0",
-        "FAIL_ON_QC_BLOCK": "0",
     }
     spec = SimpleNamespace(
         asr_backend=args.asr_backend,
@@ -246,7 +252,6 @@ def build_context(*, args: argparse.Namespace, paths: RunPaths, video: Path):
         keep_temp_files=True,
         run_log_enabled=True,
         run_log_dir=str(paths.run_logs),
-        fail_on_qc_block=False,
         translation_max_workers=args.translation_max_workers,
         target_lang=args.target_lang,
         translation_glossary=os.getenv("TRANSLATION_GLOSSARY", ""),
@@ -324,7 +329,6 @@ def run_video(args: argparse.Namespace, paths: RunPaths, video: Path) -> dict[st
         "raw_output_paths": [project_rel(path) for path in output_paths],
         "counts": timings.get("counts", {}),
         "stage_timings": timings.get("stage_timings", {}),
-        "asr_qc": (timings.get("asr_details") or {}).get("asr_qc", {}),
         "boundary_signature": (timings.get("asr_details") or {}).get("boundary_signature", {}),
     }
     print(

@@ -24,12 +24,10 @@ from tools.boundary.compile_boundary_preferences import compile_rows
 VIDEO_IDS = ["short", "medium", "long"]
 
 
-def _result(text: str, *, qc: str = "ok", fallback: str = "none") -> dict:
+def _result(text: str, *, fallback: str = "none") -> dict:
     return {
         "text": text,
         "raw_text": text,
-        "asr_qc_severity": qc,
-        "asr_qc_reasons": [],
         "alignment_quality": "forced" if fallback == "none" else "proportional",
         "fallback_type": "none" if fallback == "none" else "coarse",
         "fallback_subtype": fallback,
@@ -103,7 +101,7 @@ def _candidate_pool() -> list[dict]:
     rows = []
     risk_buckets = [
         "text_changed",
-        "qc_alignment_change",
+        "alignment_change",
         "repeat_nonlexical",
         "cue_density",
         "gap_crossing",

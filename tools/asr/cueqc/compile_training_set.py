@@ -14,10 +14,8 @@ if str(SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(SRC_ROOT))
 
 
-CONTENT_LABELS = {"dialogue", "non_dialogue", "mixed", "uncertain"}
-DISPLAY_DECISIONS = {"keep", "drop", "compact", "review"}
-ALIGNMENT_POLICIES = {"align", "skip_align_fallback"}
-QC_DECISIONS = {"keep", "review", "reject"}
+DISPLAY_DECISIONS = {"keep", "drop"}
+TARGET_DECISION_VERSION = "cueqc_display_binary_v1"
 
 
 def read_jsonl(path: Path) -> list[dict[str, Any]]:
@@ -52,6 +50,51 @@ def _label_by_sample(rows: list[Mapping[str, Any]]) -> dict[str, dict[str, Any]]
     return out
 
 
+def _broadcast_cluster_labels(
+    clusters: list[Mapping[str, Any]],
+    cluster_labels: list[Mapping[str, Any]],
+) -> list[dict[str, Any]]:
+    """Expand cluster-level display_decision into per-sample pseudo-labels.
+
+    Reads the ``cueqc_cluster_labels.jsonl`` exported from the audit page (one
+    row per cluster with ``display_decision``) and broadcasts each cluster's
+    decision to every sample in that cluster. This is intentionally coarse:
+    mixed clusters still receive one seed label, and later full-data self
+    training is expected to correct the intra-cluster noise.
+    """
+    decision_by_cluster: dict[str, str] = {}
+    reason_by_cluster: dict[str, str] = {}
+    for row in cluster_labels:
+        cluster_id = str(row.get("cluster_id") or "").strip()
+        decision = str(row.get("display_decision") or "").strip()
+        if cluster_id and decision:
+            decision_by_cluster[cluster_id] = decision
+            reason_by_cluster[cluster_id] = str(row.get("classification_reason") or "").strip()
+
+    expanded: list[dict[str, Any]] = []
+    for row in clusters:
+        sample_id = str(row.get("sample_id") or "").strip()
+        cluster_id = str(row.get("cluster_id") or "").strip()
+        if not sample_id or not cluster_id:
+            continue
+        cluster_decision = decision_by_cluster.get(cluster_id)
+        if not cluster_decision:
+            continue
+        final_decision = _valid_label(cluster_decision, DISPLAY_DECISIONS, "")
+        if not final_decision:
+            continue
+
+        expanded.append({
+            "sample_id": sample_id,
+            "cluster_id": cluster_id,
+            "display_decision": final_decision,
+            "notes": reason_by_cluster.get(cluster_id, ""),
+            "label_source": "cluster_broadcast",
+            "cluster_display_decision": cluster_decision,
+        })
+    return expanded
+
+
 def _valid_label(value: Any, allowed: set[str], fallback: str) -> str:
     normalized = str(value or "").strip()
     return normalized if normalized in allowed else fallback
@@ -61,16 +104,12 @@ def _cluster_consistency(labels: list[dict[str, Any]]) -> dict[str, Any]:
     if not labels:
         return {"count": 0, "agreement": 0.0, "low_consistency": True}
     display_counts = Counter(str(row.get("display_decision") or "") for row in labels)
-    content_counts = Counter(str(row.get("content_label") or "") for row in labels)
-    qc_counts = Counter(str(row.get("qc_decision") or "") for row in labels)
     agreement = max(display_counts.values() or [0]) / max(1, sum(display_counts.values()))
     return {
         "count": len(labels),
         "agreement": round(agreement, 4),
         "low_consistency": agreement < 0.67,
         "display_counts": dict(display_counts.most_common()),
-        "content_counts": dict(content_counts.most_common()),
-        "qc_counts": dict(qc_counts.most_common()),
     }
 
 
@@ -106,33 +145,20 @@ def compile_records(
             skipped.append({"sample_id": sample_id, "cluster_id": cluster_id, "reason": "missing_manual_label"})
             counters["missing_manual_label"] += 1
             continue
-        content_label = _valid_label(label.get("content_label"), CONTENT_LABELS, "uncertain")
-        display_decision = _valid_label(label.get("display_decision"), DISPLAY_DECISIONS, "review")
-        alignment_policy = _valid_label(label.get("alignment_policy"), ALIGNMENT_POLICIES, "align")
-        qc_decision = _valid_label(label.get("qc_decision"), QC_DECISIONS, "review")
-        uncertain = content_label == "uncertain" or display_decision == "review" or qc_decision == "review"
+        display_decision = _valid_label(label.get("display_decision"), DISPLAY_DECISIONS, "")
+        if not display_decision:
+            skipped.append({"sample_id": sample_id, "cluster_id": cluster_id, "reason": "missing_display_decision"})
+            counters["missing_display_decision"] += 1
+            continue
         cluster_info = consistency.get(cluster_id, {"agreement": 1.0, "low_consistency": False})
         low_consistency = float(cluster_info.get("agreement") or 0.0) < min_cluster_agreement
-        if low_consistency:
-            if qc_decision == "reject":
-                qc_decision = "review"
-            if display_decision == "drop":
-                display_decision = "review"
-            if content_label != "dialogue":
-                content_label = "uncertain"
-        hard_reject_target = (
-            qc_decision == "reject"
-            and not uncertain
-            and not low_consistency
-            and content_label != "uncertain"
-        )
         record = {
             "schema": "cueqc_training_record_v1",
             "sample_id": sample_id,
             "cluster_id": cluster_id,
             "features": {
                 "text_features": row.get("text_features", {}),
-                "qc": row.get("qc", {}),
+                "cue_features": row.get("cue_features", {}),
                 "boundary": row.get("boundary", {}),
                 "adjacency": row.get("adjacency", {}),
                 "asr_signals": row.get("asr_signals", {}),
@@ -142,28 +168,26 @@ def compile_records(
             "raw_text": row.get("raw_text", ""),
             "audio": row.get("audio", {}),
             "targets": {
-                "content_type": content_label,
-                "display_hint": display_decision,
-                "alignment_policy": alignment_policy if not low_consistency else "align",
-                "qc_decision": qc_decision,
-                "hard_reject_target": hard_reject_target,
+                "display_decision": display_decision,
+                "display_label": 0 if display_decision == "drop" else 1,
             },
             "label_meta": {
                 "notes": str(label.get("notes") or ""),
+                "label_source": str(label.get("label_source") or "manual"),
+                "cluster_display_decision": str(label.get("cluster_display_decision") or ""),
                 "low_cluster_consistency": bool(low_consistency),
                 "cluster_agreement": float(cluster_info.get("agreement") or 0.0),
-                "uncertain": bool(uncertain or low_consistency),
+                "coarse_cluster_seed": str(label.get("label_source") or "manual") == "cluster_broadcast",
             },
         }
         records.append(record)
-        counters[f"content:{content_label}"] += 1
         counters[f"display:{display_decision}"] += 1
-        counters[f"align:{record['targets']['alignment_policy']}"] += 1
-        counters[f"qc:{qc_decision}"] += 1
-        if hard_reject_target:
-            counters["hard_reject_target"] += 1
     summary = {
         "schema": "cueqc_training_compile_summary_v1",
+        "target_decision_version": TARGET_DECISION_VERSION,
+        "target_labels": {
+            "display_decision": sorted(DISPLAY_DECISIONS),
+        },
         "clusters": len(clusters),
         "manual_labels": len(manual_labels),
         "records": len(records),
@@ -176,9 +200,12 @@ def compile_records(
 
 
 def run(args: argparse.Namespace) -> int:
+    clusters = read_jsonl(Path(args.clusters))
+    cluster_label_rows = read_jsonl(Path(args.cluster_labels))
+    manual_labels = _broadcast_cluster_labels(clusters, cluster_label_rows)
     records, skipped, summary = compile_records(
-        clusters=read_jsonl(Path(args.clusters)),
-        manual_labels=read_jsonl(Path(args.labels)),
+        clusters=clusters,
+        manual_labels=manual_labels,
         min_cluster_agreement=args.min_cluster_agreement,
     )
     output_dir = Path(args.output_dir)
@@ -194,7 +221,7 @@ def run(args: argparse.Namespace) -> int:
     summary.update(
         {
             "clusters_path": args.clusters,
-            "labels_path": args.labels,
+            "cluster_labels_path": args.cluster_labels,
             "train_path": str(train_path),
             "skipped_path": str(skipped_path),
         }
@@ -204,14 +231,18 @@ def run(args: argparse.Namespace) -> int:
         encoding="utf-8",
     )
     print(f"train={train_path}")
-    print(f"records={len(records)} skipped={len(skipped)} hard_reject={summary['counts'].get('hard_reject_target', 0)}")
+    print(f"records={len(records)} skipped={len(skipped)}")
     return 0
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Compile manually labeled CueQC clusters into training JSONL.")
+    parser = argparse.ArgumentParser(description="Compile cluster-level CueQC keep/drop labels into training JSONL.")
     parser.add_argument("--clusters", required=True, help="cueqc_clusters.jsonl")
-    parser.add_argument("--labels", required=True, help="cueqc_manual_labels.jsonl exported from audit HTML")
+    parser.add_argument(
+        "--cluster-labels",
+        required=True,
+        help="cueqc_cluster_labels.jsonl (cluster-level display_decision); broadcasts to every sample in each cluster",
+    )
     parser.add_argument("--output-dir", required=True)
     parser.add_argument("--min-cluster-agreement", type=float, default=0.67)
     args = parser.parse_args(argv)

@@ -8,15 +8,11 @@ from collections import Counter
 from pathlib import Path
 from typing import Any, Iterable, Mapping
 
-from asr.qc import evaluate_asr_chunk_qc
-
 
 CUEQC_FEATURE_SCHEMA_VERSION = 1
 CUEQC_SHADOW_SCHEMA_VERSION = 1
-CUEQC_TAXONOMY_VERSION = "cluster_first_v1"
-CUEQC_MODEL_VERSION = "rules_shadow_v1"
-DEFAULT_CLUSTER_COUNT_MIN = 12
-DEFAULT_CLUSTER_COUNT_MAX = 20
+CUEQC_DECISION_VERSION = "cueqc_display_binary_v1"
+CUEQC_MODEL_VERSION = "cueqc_mamba_v3_fusion"
 
 _FALSE_VALUES = {"0", "false", "no", "off", "disabled"}
 _TRUE_VALUES = {"1", "true", "yes", "on", "enabled"}
@@ -283,18 +279,44 @@ def _run_length_features(
     }
 
 
-def _qc_item_by_chunk(qc_report: Mapping[str, Any] | None) -> dict[int, dict[str, Any]]:
-    out: dict[int, dict[str, Any]] = {}
-    if not isinstance(qc_report, Mapping):
-        return out
-    for item in qc_report.get("items") or []:
-        if not isinstance(item, Mapping):
-            continue
-        try:
-            out[int(item.get("chunk_index"))] = dict(item)
-        except (TypeError, ValueError):
-            continue
-    return out
+def _cue_observation_features(
+    *,
+    text_features_payload: Mapping[str, Any],
+    duration_s: float,
+) -> dict[str, Any]:
+    char_count = _safe_int(text_features_payload.get("char_count"))
+    unique_chars = _safe_int(text_features_payload.get("unique_chars"))
+    kana_only = bool(text_features_payload.get("kana_only"))
+    has_stable = bool(text_features_payload.get("has_stable_vocabulary"))
+    repeat = (
+        text_features_payload.get("repeat_profile")
+        if isinstance(text_features_payload.get("repeat_profile"), Mapping)
+        else {}
+    )
+    repeat_run = _safe_int(repeat.get("run"))
+    repeat_ratio = _safe_float(repeat.get("ratio"))
+    if char_count <= 0:
+        density_level = "empty_or_punctuation"
+    elif duration_s >= 6.0 and char_count <= 5 and not has_stable:
+        density_level = "long_sparse_text"
+    elif char_count <= 2 and kana_only:
+        density_level = "short_vocalization_candidate"
+    elif repeat_run >= 4 and repeat_ratio >= 0.4 and not has_stable:
+        density_level = "repeated_vocalization_candidate"
+    elif kana_only and char_count <= 5 and not has_stable:
+        density_level = "short_kana_dialogue_candidate"
+    else:
+        density_level = "normal_dialogue_candidate"
+    return {
+        "text_density": {
+            "level": density_level,
+            "duration_s": round(duration_s, 3),
+            "char_count": char_count,
+            "unique_chars": unique_chars,
+        },
+        "repeat_profile": dict(repeat),
+        "has_stable_vocabulary": has_stable,
+    }
 
 
 def build_candidate(
@@ -304,7 +326,6 @@ def build_candidate(
     position: int,
     chunks: list[Mapping[str, Any]],
     text_results: list[Mapping[str, Any]],
-    qc_item: Mapping[str, Any] | None = None,
     audio_id: str = "",
     video_id: str = "",
 ) -> dict[str, Any]:
@@ -315,22 +336,9 @@ def build_candidate(
     raw_text = str(text_result.get("raw_text") or "")
     text = str(text_result.get("text") or raw_text)
     features = text_features(raw_text, text, duration_s=duration)
-    qc_payload: dict[str, Any]
-    if isinstance(qc_item, Mapping):
-        qc_payload = dict(qc_item)
-    else:
-        qc_payload = evaluate_asr_chunk_qc(dict(chunk), dict(text_result))
-    metrics = qc_payload.get("metrics") if isinstance(qc_payload.get("metrics"), Mapping) else {}
-    text_density = metrics.get("text_density") if isinstance(metrics.get("text_density"), Mapping) else {}
-    vocalization = (
-        metrics.get("vocalization_repetition")
-        if isinstance(metrics.get("vocalization_repetition"), Mapping)
-        else {}
-    )
-    signal_quality = (
-        metrics.get("signal_quality")
-        if isinstance(metrics.get("signal_quality"), Mapping)
-        else {}
+    observation = _cue_observation_features(
+        text_features_payload=features,
+        duration_s=duration,
     )
     sample_id = f"cueqc-{video_id or audio_id or 'audio'}-chunk{chunk_index:05d}"
     return {
@@ -378,20 +386,7 @@ def build_candidate(
             **_neighbor_features(position, chunks, text_results),
             **_run_length_features(position, chunks, text_results),
         },
-        "qc": {
-            "severity": str(qc_payload.get("severity") or "ok"),
-            "reasons": list(qc_payload.get("reasons") or []),
-            "ok": bool(qc_payload.get("ok", True)),
-            "text_density": dict(text_density),
-            "vocalization_repetition": dict(vocalization),
-            "signal_quality": dict(signal_quality),
-            "max_repeat": dict(metrics.get("max_repeat") or {}),
-            "repetition_repair": dict(metrics.get("repetition_repair") or {}),
-            "low_value": bool(metrics.get("low_value")),
-            "mojibake": bool(metrics.get("mojibake")),
-            "chars_per_sec": metrics.get("chars_per_sec"),
-            "compact_chars": metrics.get("compact_chars"),
-        },
+        "cue_features": observation,
         "asr_signals": {
             "avg_logprob": text_result.get("avg_logprob"),
             "no_speech_prob": text_result.get("no_speech_prob"),
@@ -406,9 +401,7 @@ def build_candidate(
             "fallback_window_end_s": text_result.get("alignment_fallback_end_s"),
             "fallback_window_source": text_result.get("alignment_fallback_source", ""),
         },
-        "existing_diagnostics": {
-            "qc_item": dict(qc_payload),
-        },
+        "existing_diagnostics": {},
         "labels": {},
     }
 
@@ -417,11 +410,9 @@ def build_candidates(
     chunks: list[Mapping[str, Any]],
     text_results: list[Mapping[str, Any]],
     *,
-    qc_report: Mapping[str, Any] | None = None,
     audio_id: str = "",
     video_id: str = "",
 ) -> list[dict[str, Any]]:
-    qc_by_chunk = _qc_item_by_chunk(qc_report)
     candidates: list[dict[str, Any]] = []
     for position, (chunk, text_result) in enumerate(zip(chunks, text_results)):
         chunk_index = _safe_int(chunk.get("index"), position)
@@ -432,7 +423,6 @@ def build_candidates(
                 position=position,
                 chunks=chunks,
                 text_results=text_results,
-                qc_item=qc_by_chunk.get(chunk_index),
                 audio_id=audio_id,
                 video_id=video_id,
             )
@@ -441,23 +431,26 @@ def build_candidates(
 
 
 def heuristic_shadow_decision(candidate: Mapping[str, Any]) -> dict[str, Any]:
-    qc = candidate.get("qc") if isinstance(candidate.get("qc"), Mapping) else {}
     text_features_payload = (
         candidate.get("text_features")
         if isinstance(candidate.get("text_features"), Mapping)
         else {}
     )
+    cue_features = (
+        candidate.get("cue_features")
+        if isinstance(candidate.get("cue_features"), Mapping)
+        else {}
+    )
     adjacency = candidate.get("adjacency") if isinstance(candidate.get("adjacency"), Mapping) else {}
     reasons: list[str] = []
-    content_type = "dialogue"
     display_hint = "keep"
-    qc_decision = "keep"
-    alignment_policy = "align"
     confidence = 0.55
 
-    severity = str(qc.get("severity") or "ok")
-    qc_reasons = [str(item) for item in qc.get("reasons") or []]
-    text_density = qc.get("text_density") if isinstance(qc.get("text_density"), Mapping) else {}
+    text_density = (
+        cue_features.get("text_density")
+        if isinstance(cue_features.get("text_density"), Mapping)
+        else {}
+    )
     density_level = str(text_density.get("level") or "")
     repeat_profile = (
         text_features_payload.get("repeat_profile")
@@ -473,49 +466,23 @@ def heuristic_shadow_decision(candidate: Mapping[str, Any]) -> dict[str, Any]:
         "repeated_vocalization_candidate",
         "long_sparse_text",
     }:
-        content_type = "non_dialogue"
-        display_hint = "review"
-        qc_decision = "review"
+        display_hint = "keep"
         reasons.append(f"text_density:{density_level}")
         confidence = max(confidence, 0.62)
-    elif severity in {"warn", "reject"}:
-        content_type = "uncertain"
-        display_hint = "review"
-        qc_decision = "review"
-        reasons.append(f"asr_qc:{severity}")
-    if "repeated_nonlexical_vocalization" in qc_reasons:
-        content_type = "non_dialogue"
-        display_hint = "compact" if same_run_length >= 3 else "review"
-        qc_decision = "review"
-        reasons.append("repeated_nonlexical_vocalization")
-        confidence = max(confidence, 0.68)
     if same_run_length >= 3 and not has_stable and char_count <= 4:
-        content_type = "non_dialogue"
-        display_hint = "compact"
-        qc_decision = "review"
+        display_hint = "keep"
         reasons.append("repeated_low_information_run")
         confidence = max(confidence, 0.7)
-    if severity == "reject":
-        qc_decision = "review"
-        display_hint = "review"
-        reasons.extend(qc_reasons)
-        confidence = max(confidence, 0.72)
     if char_count == 0:
-        content_type = "non_dialogue"
-        display_hint = "drop"
-        qc_decision = "review"
+        display_hint = "keep"
         reasons.append("empty_text")
         confidence = max(confidence, 0.8)
-    if has_stable and severity == "ok":
-        content_type = "dialogue"
+    if has_stable:
         display_hint = "keep"
-        qc_decision = "keep"
         reasons = [reason for reason in reasons if reason.startswith("cluster:")]
         confidence = max(confidence, 0.78)
     if int(repeat_profile.get("run") or 0) >= 4 and not has_stable:
-        content_type = "non_dialogue"
-        display_hint = "compact" if same_run_length >= 2 else "review"
-        qc_decision = "review"
+        display_hint = "keep"
         reasons.append("repeat_profile")
         confidence = max(confidence, 0.68)
 
@@ -523,15 +490,12 @@ def heuristic_shadow_decision(candidate: Mapping[str, Any]) -> dict[str, Any]:
         "schema": "cueqc_shadow_v1",
         "schema_version": CUEQC_SHADOW_SCHEMA_VERSION,
         "model_version": CUEQC_MODEL_VERSION,
-        "taxonomy_version": CUEQC_TAXONOMY_VERSION,
-        "mode": "shadow",
-        "qc_decision": qc_decision,
-        "content_type": content_type,
+        "decision_version": CUEQC_DECISION_VERSION,
+        "mode": "fallback_keep",
         "cluster_id": candidate.get("cluster_id", "unclustered"),
-        "alignment_policy": alignment_policy,
         "display_hint": display_hint,
         "confidence": round(min(0.99, confidence), 4),
-        "reasons": list(dict.fromkeys(reasons or ["shadow_conservative"])),
+        "reasons": list(dict.fromkeys(reasons or ["cueqc_model_unavailable_keep"])),
     }
 
 
@@ -552,16 +516,13 @@ def build_shadow_report(candidates: list[Mapping[str, Any]]) -> dict[str, Any]:
     return {
         "schema": "cueqc_shadow_report_v1",
         "enabled": cueqc_enabled(),
-        "shadow_only": True,
+        "shadow_only": _env_text("CUEQC_MODEL_PATH", "") == "",
         "feature_schema_version": CUEQC_FEATURE_SCHEMA_VERSION,
-        "taxonomy_version": CUEQC_TAXONOMY_VERSION,
+        "decision_version": CUEQC_DECISION_VERSION,
         "model_version": CUEQC_MODEL_VERSION,
         "candidate_count": len(candidates),
         "decisions": decisions,
         "counts": {
-            "qc_decision": dict(Counter(str(item.get("qc_decision") or "") for item in decisions)),
-            "content_type": dict(Counter(str(item.get("content_type") or "") for item in decisions)),
-            "alignment_policy": dict(Counter(str(item.get("alignment_policy") or "") for item in decisions)),
             "display_hint": dict(Counter(str(item.get("display_hint") or "") for item in decisions)),
         },
     }
@@ -589,19 +550,17 @@ def runtime_signature() -> dict[str, Any]:
         "schema_version": CUEQC_SHADOW_SCHEMA_VERSION,
         "feature_schema_version": CUEQC_FEATURE_SCHEMA_VERSION,
         "enabled": cueqc_enabled(),
-        "shadow_only": True,
-        "policy": "cluster_first_shadow",
-        "taxonomy_version": _env_text("CUEQC_TAXONOMY_VERSION", CUEQC_TAXONOMY_VERSION)
-        or CUEQC_TAXONOMY_VERSION,
+        "shadow_only": checkpoint == "",
+        "policy": "cueqc_mamba_v3_fusion",
+        "decision_version": _env_text("CUEQC_DECISION_VERSION", CUEQC_DECISION_VERSION)
+        or CUEQC_DECISION_VERSION,
         "model_version": _env_text("CUEQC_MODEL_VERSION", CUEQC_MODEL_VERSION)
         or CUEQC_MODEL_VERSION,
         "model_path": checkpoint,
         "checkpoint_sha1": checkpoint_hash,
-        "prealign_skip_enabled": _env_bool("CUEQC_PREALIGN_SKIP_ENABLED", False),
-        "prealign_skip_min_confidence": _env_text(
-            "CUEQC_PREALIGN_SKIP_MIN_CONFIDENCE",
-            "0.92",
-        ),
+        "drop_threshold": _env_text("CUEQC_DROP_THRESHOLD", "0.85"),
+        "drop_apply_enabled": _env_bool("CUEQC_DROP_APPLY_ENABLED", True),
+        "fallback_policy": _env_text("CUEQC_FALLBACK_POLICY", "keep") or "keep",
         "shadow_embed_candidates": _env_bool("CUEQC_SHADOW_EMBED_CANDIDATES", False),
     }
 
@@ -612,21 +571,18 @@ def numeric_feature_vector(candidate: Mapping[str, Any]) -> list[float]:
         if isinstance(candidate.get("text_features"), Mapping)
         else {}
     )
-    qc = candidate.get("qc") if isinstance(candidate.get("qc"), Mapping) else {}
+    cue_features = candidate.get("cue_features") if isinstance(candidate.get("cue_features"), Mapping) else {}
     adjacency = candidate.get("adjacency") if isinstance(candidate.get("adjacency"), Mapping) else {}
     repeat = (
         text_features_payload.get("repeat_profile")
         if isinstance(text_features_payload.get("repeat_profile"), Mapping)
         else {}
     )
-    density = qc.get("text_density") if isinstance(qc.get("text_density"), Mapping) else {}
-    vocal = (
-        qc.get("vocalization_repetition")
-        if isinstance(qc.get("vocalization_repetition"), Mapping)
+    density = (
+        cue_features.get("text_density")
+        if isinstance(cue_features.get("text_density"), Mapping)
         else {}
     )
-    severity = str(qc.get("severity") or "ok")
-    severity_num = {"ok": 0.0, "warn": 0.5, "reject": 1.0}.get(severity, 0.25)
     density_level = str(density.get("level") or "")
     density_num = {
         "normal_dialogue": 0.0,
@@ -650,9 +606,9 @@ def numeric_feature_vector(candidate: Mapping[str, Any]) -> list[float]:
         _safe_float(adjacency.get("prev_gap_s"), 5.0),
         _safe_float(adjacency.get("next_gap_s"), 5.0),
         _safe_float(adjacency.get("same_text_run_length")),
-        severity_num,
+        0.0,
         density_num,
-        1.0 if bool(vocal.get("preserve_candidate")) else 0.0,
+        0.0,
         1.0 if bool(text_features_payload.get("has_stable_vocabulary")) else 0.0,
     ]
 

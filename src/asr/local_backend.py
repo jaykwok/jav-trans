@@ -1050,6 +1050,44 @@ class LocalAsrBackend:
             _clear_cuda_cache(self.device)
         return payloads
 
+    def capture_asr_internals(self, chunks: list[dict], **_kwargs) -> list[dict]:
+        """Capture ASR internals (encoder frames + token logits) in-process.
+
+        Reuses this backend's loaded Qwen3-ASR (no second model load). Each
+        chunk: {path, text, start_s, end_s}. Returns one dict per chunk.
+        """
+        if not chunks:
+            return []
+        if self.model is None:
+            self.load()
+        try:
+            from asr.asr_internals import AsrInternalsCapturer
+
+            capturer = AsrInternalsCapturer(wrapper=self.model)
+        except Exception:  # noqa: BLE001
+            return [{"ok": False, "error": "capturer build failed"}] * len(chunks)
+        out: list[dict] = []
+        for chunk in chunks:
+            path = str(chunk.get("path") or "")
+            text = str(chunk.get("text") or "")
+            start_s = float(chunk.get("start_s") or 0.0)
+            end_s = float(chunk.get("end_s") or start_s)
+            try:
+                internals = capturer.extract(path, text, start_s=start_s, end_s=end_s)
+                out.append({
+                    "ok": True,
+                    "asr_frames": internals["asr_frames"],
+                    "token_logprobs": internals["token_logprobs"],
+                    "token_entropies": internals["token_entropies"],
+                    "token_top1_top2_margins": internals["token_top1_top2_margins"],
+                    "token_ids": internals["token_ids"],
+                    "decoded_tokens": internals.get("decoded_tokens") or [],
+                    "has_timestamps": bool(internals.get("has_timestamps", False)),
+                })
+            except Exception as exc:  # noqa: BLE001
+                out.append({"ok": False, "error": repr(exc)})
+        return out
+
     def _should_force_align_text(self, master_text: str, raw_master_text: str, log: list[str]) -> bool:
         prealign = prepare_text_for_alignment(raw_master_text or master_text)
         if prealign.empty_after_cleaning:
@@ -1617,6 +1655,57 @@ class SubprocessAsrBackend:
                 WorkerError("protocol_error", f"unexpected worker op: {op}"),
                 on_stage=on_stage,
             )
+
+    def capture_asr_internals(
+        self,
+        chunks: list[dict],
+        *,
+        timeout_s: float | None = None,
+    ) -> list[dict]:
+        """Capture ASR internals (encoder frames + token logits) in the worker.
+
+        Each chunk: {path, text, start_s, end_s}. Returns one dict per chunk
+        with asr_frames/token_logprobs/... or {ok: False, error: ...}. The
+        capture reuses the worker's loaded Qwen3-ASR (no second model load).
+        """
+        if not chunks:
+            return []
+        self._ensure_worker()
+        assert self._conn is not None
+        job_id = uuid.uuid4().hex[:8]
+        payload = [
+            {
+                "path": str(c.get("path") or ""),
+                "text": str(c.get("text") or ""),
+                "start_s": float(c.get("start_s") or 0.0),
+                "end_s": float(c.get("end_s") or c.get("start_s") or 0.0),
+            }
+            for c in chunks
+        ]
+        try:
+            self._conn.send({"op": "capture_internals", "job_id": job_id, "chunks": payload})
+        except (BrokenPipeError, EOFError, OSError):
+            return [{"ok": False, "error": "worker send failed"}] * len(chunks)
+        deadline = time.monotonic() + (timeout_s or 600.0)
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return [{"ok": False, "error": "capture timeout"}] * len(chunks)
+            if not self._conn.poll(min(1.0, remaining)):
+                continue
+            try:
+                message = self._conn.recv()
+            except EOFError:
+                return [{"ok": False, "error": "worker pipe closed"}] * len(chunks)
+            if not isinstance(message, dict) or str(message.get("job_id") or "") != job_id:
+                continue
+            if message.get("op") == "result":
+                internals = message.get("internals")
+                if isinstance(internals, list) and len(internals) == len(chunks):
+                    return internals
+                return [{"ok": False, "error": "count mismatch"}] * len(chunks)
+            if message.get("op") == "error":
+                return [{"ok": False, "error": str(message.get("detail") or "worker error")}] * len(chunks)
 
     def finalize_text_results(
         self,

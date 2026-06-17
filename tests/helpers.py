@@ -26,7 +26,6 @@ def make_job_context(
     keep_quality_report: bool = False,
     run_log_enabled: bool = False,
     run_log_dir: Path | str = "./tmp/log",
-    fail_on_qc_block: bool = True,
     advanced: dict[str, str] | None = None,
 ) -> JobContext:
     video = Path(video_path)
@@ -48,7 +47,6 @@ def make_job_context(
         keep_temp_files=keep_temp_files,
         run_log_enabled=run_log_enabled,
         run_log_dir=str(run_log_dir),
-        fail_on_qc_block=fail_on_qc_block,
         advanced=dict(advanced or {}),
     )
 

@@ -76,7 +76,6 @@ def test_measure_fallback_timing_error_writes_gate_summary(tmp_path):
                         "raw_text": "こんばんは",
                     },
                 ],
-                "asr_qc": {},
             },
             "asr_log": [
                 "chunk 1: Alignment 词数: 1",

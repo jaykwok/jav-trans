@@ -85,25 +85,6 @@ def test_mine_case_filters_forced_silver_labels(tmp_path):
                         "raw_text": "~~~",
                     },
                 ],
-                "asr_qc": {
-                    "items": [
-                        {"position": 0, "chunk_index": 0, "severity": "ok", "reasons": []},
-                        {
-                            "position": 2,
-                            "chunk_index": 2,
-                            "severity": "reject",
-                            "reasons": ["mojibake"],
-                        },
-                    ],
-                    "review_uncertain_items": [
-                        {
-                            "position": 2,
-                            "chunk_index": 2,
-                            "reasons": ["mojibake"],
-                            "original_text": "~~~",
-                        }
-                    ],
-                },
             },
             "asr_log": [
                 "chunk 1: Alignment 词数: 2",

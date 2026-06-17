@@ -94,6 +94,7 @@ def main(parent_conn: Connection, backend_kwargs: dict[str, Any]) -> None:
     backend = None
     torch = None
     clear_cuda_cache = None
+    capturer_cache: list = []  # persists across messages; holds the AsrInternalsCapturer
 
     try:
         import torch as torch_module
@@ -160,6 +161,10 @@ def main(parent_conn: Connection, backend_kwargs: dict[str, Any]) -> None:
                     clear_cuda_cache(backend.device)
             raise SystemExit(0)
 
+        if op == "capture_internals":
+            _handle_capture_internals(parent_conn, msg, backend, capturer_cache)
+            continue
+
         if op != "transcribe":
             _safe_send(
                 parent_conn,
@@ -206,6 +211,57 @@ def main(parent_conn: Connection, backend_kwargs: dict[str, Any]) -> None:
                 },
             )
             raise SystemExit(0)
+
+
+def _handle_capture_internals(parent_conn, msg, backend, capturer_cache: list):
+    """Capture ASR internals (encoder frames + token logits) in the worker, where
+    the model is loaded. Returns one internals dict per requested chunk. The
+    capturer is cached so the Qwen3-ASR wrapper is reused (no second model load).
+    """
+    import numpy as np
+
+    job_id = str(msg.get("job_id") or "")
+    chunks = msg.get("chunks") or []
+    try:
+        if not capturer_cache:
+            from asr.asr_internals import AsrInternalsCapturer
+
+            wrapper = getattr(backend, "model", None)
+            if wrapper is None:
+                _safe_send(parent_conn, {
+                    "op": "result", "job_id": job_id, "internals": [],
+                    "error": "backend has no loaded model",
+                })
+                return
+            capturer_cache.append(AsrInternalsCapturer(wrapper=wrapper))
+        capturer = capturer_cache[0]
+        internals_list = []
+        for chunk in chunks:
+            path = str(chunk.get("path") or "")
+            text = str(chunk.get("text") or "")
+            start_s = float(chunk.get("start_s") or 0.0)
+            end_s = float(chunk.get("end_s") or start_s)
+            try:
+                internals = capturer.extract(path, text, start_s=start_s, end_s=end_s)
+                internals_list.append({
+                    "ok": True,
+                    "asr_frames": np.asarray(internals["asr_frames"], dtype=np.float32),
+                    "token_logprobs": np.asarray(internals["token_logprobs"], dtype=np.float32),
+                    "token_entropies": np.asarray(internals["token_entropies"], dtype=np.float32),
+                    "token_top1_top2_margins": np.asarray(internals["token_top1_top2_margins"], dtype=np.float32),
+                    "token_ids": np.asarray(internals["token_ids"], dtype=np.int64),
+                    "decoded_tokens": internals.get("decoded_tokens") or [],
+                    "has_timestamps": bool(internals.get("has_timestamps", False)),
+                })
+            except Exception as exc:  # noqa: BLE001 - per-chunk failure -> mark, keep going
+                internals_list.append({"ok": False, "error": repr(exc)})
+        _safe_send(parent_conn, {
+            "op": "result", "job_id": job_id, "internals": internals_list,
+        })
+    except Exception as exc:  # noqa: BLE001
+        _safe_send(parent_conn, {
+            "op": "error", "job_id": job_id, "kind": "crash", "detail": repr(exc),
+        })
 
 
 if __name__ == "__main__":
