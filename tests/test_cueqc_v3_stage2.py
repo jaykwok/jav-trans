@@ -99,6 +99,77 @@ def test_cueqc_v3_training_rejects_unlabeled_feature_bundle(tmp_path: Path):
         )
 
 
+def test_cueqc_v3_feature_extractor_reuses_video_audio_cache(tmp_path: Path, monkeypatch):
+    rows_path = tmp_path / "candidates.jsonl"
+    audio_root = tmp_path / "audio"
+    wav_path = audio_root / "jobs" / "VIDEO_b5" / "audio" / "VIDEO.wav"
+    wav_path.parent.mkdir(parents=True)
+    wav_path.write_bytes(b"stub")
+    rows_path.write_text(
+        "\n".join(
+            json.dumps(
+                {
+                    "schema": "cueqc_candidate_v1",
+                    "sample_id": f"cueqc-VIDEO-chunk{index:05d}",
+                    "start": 0.0,
+                    "end": 0.2,
+                    "text": "あ",
+                    "targets": {},
+                },
+                ensure_ascii=False,
+            )
+            for index in range(2)
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    load_calls = []
+
+    def fake_load_wav_audio(path: Path):
+        load_calls.append(path)
+        return torch.zeros(3200).numpy()
+
+    class StubCapturer:
+        def __init__(self, **kwargs):
+            pass
+
+        def extract(self, wav_or_audio, text, *, start_s, end_s):
+            assert not isinstance(wav_or_audio, Path)
+            return {
+                "asr_frames": torch.zeros(1, 4).numpy(),
+                "token_ids": torch.tensor([1]).numpy(),
+                "token_logprobs": torch.tensor([-0.1]).numpy(),
+                "token_entropies": torch.tensor([0.2]).numpy(),
+                "token_top1_top2_margins": torch.tensor([0.3]).numpy(),
+                "decoded_tokens": ["あ"],
+                "has_timestamps": False,
+            }
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(extract_features_v3_fusion, "_load_wav_audio", fake_load_wav_audio)
+    monkeypatch.setattr(extract_features_v3_fusion, "AsrInternalsCapturer", StubCapturer)
+
+    rc = extract_features_v3_fusion.extract(
+        SimpleNamespace(
+            train="",
+            input=str(rows_path),
+            audio_root=str(audio_root),
+            output=str(tmp_path / "features.pt"),
+            model_spec="stub-model",
+            device="cpu",
+            start_index=0,
+            max_samples=None,
+            audio_cache_size=1,
+        )
+    )
+
+    assert rc == 0
+    assert load_calls == [wav_path]
+
+
 def test_cueqc_v3_predict_exports_high_confidence_pseudo_labels(tmp_path: Path, monkeypatch):
     features_path = tmp_path / "features.pt"
     checkpoint_path = tmp_path / "checkpoint.pt"
