@@ -215,6 +215,11 @@ Stage 2a policy:
   `agents/audits/20260617_162350_cueqc-v3-stage2b-false-drop-audit/index.html`.
   Keep `src/asr/checkpoints/cueqc_mamba_v3_fusion.pt` unchanged until that gate
   is reviewed.
+- The Stage 2b false-drop audit page includes reason tags:
+  `dialogue`, `vocalization`, `breath`, `environment`, `overlap`,
+  `short_fragment`. `breath / 呼吸声` was added after the initial Stage 2b page
+  generation and the same audit directory was regenerated before manual labels
+  were exported.
 
 ## Stage 3: Boundary Feedback
 
