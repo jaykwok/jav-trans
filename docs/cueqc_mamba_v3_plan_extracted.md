@@ -76,12 +76,16 @@ The safety objective is conservative subtraction: maximize keep recall and minim
 - Adaptive threshold profile: base `drop_threshold=0.85`，`text_bucket=short_text` 提升到 `0.87`，由 `src/asr/cueqc_thresholds.py` 在 runtime 与 offline prediction 共用。
 - Adaptive 10-film prediction: `agents/temp/20260617_174344_cueqc-v3-stage2b-adaptive-10film-predictions/`，records `45643`，`drop=19380/keep=26263`，high-confidence pseudo `drop=19380/keep=1372`。
 - NAMH-055 Web full-workflow smoke after Stage 2b promotion: job `38a5d14ea1a54236a24b56e716f36175` completed with `translation_skipped=true`，CueQC `candidates=3199/drop=1052/keep=2147/fallback=0`，最终 `transcript_chunks=2147/segments=2157/blocks=2087`，输出 `video/NAMH-055.ja.srt`，summary 为 `agents/temp/20260617_191654_web-smoke-namh055-cueqc-batched/job_summary.json`。
+- Stage 3 Boundary hard-case candidate export: `tools.boundary.export_cueqc_drop_hardcases` 已把三轮 false-drop 审计导出到 `agents/temp/20260617_214103_boundary-hardcase-candidates-from-cueqc/`。原始标签 `600` 行，去重后 `578` 个 unique item，其中 `551` 个 confirmed drop candidate，`27` 个 safety holdout；候选 route 为 `speech_boundary_frame_negative_candidate=522`、`boundary_preference_candidate=29`。该产物仍是候选 manifest，不是可直接训练 v5.1 的 delta dataset。
+- Stage 3 v5.1 source preparation: `tools.boundary.prepare_cueqc_drop_v51_sources` 已使用三份审计页的 `cueqc_prediction_audit_items.jsonl` 补回音频路径，并生成 `agents/temp/20260617_220854_boundary-v5.1-sources-from-cueqc/`。`522/522` 个 frame-negative candidate 已切出短音频并生成 SpeechBoundary-JA negative labels/training manifest，`29` 个 Boundary preference seed 已保留上下文字幕和 aligned segments；`missing_audit_item_samples=0`、`frame_negative_skipped=0`。该步骤仍不生成 `boundary_refiner_frame_sequence_dataset_v5`。
+- Stage 3 SpeechBoundary-JA hard-negative readiness: `tools.boundary.prepare_speech_boundary_hard_negative_finetune` 的 negative-only gate 先确认 522 条 negative examples 全部可解析，但缺少 anchor 时 `formal_training_ready=false`。随后 `tools.boundary.ja.build_positive_anchor_replay` 已按 `anime_nsfw=55 / anime_sfw=20 / galgame=25` 生成 `agents/temp/20260617_230636_speech-boundary-positive-anchor-replay/`，共 1500 条 positive anchors，实际 `anime_nsfw=825/anime_sfw=300/galgame=375`。混合 gate 包 `agents/temp/20260617_230948_speech-boundary-hard-negative-finetune-prep/` 已输出 `speech_boundary_mixed_hard_negative_anchor_labels.jsonl` / manifest，`records=2022`、`trainable_examples=2022`、`negative_share=0.25816`，`formal_training_ready=true`。当前停止在训练开启前，尚未跑 feature cache 或训练。
 
 ## Remaining V3 Plan
 
 - Continue false-drop / keep-recall audits before accepting any new high-confidence drop pseudo labels into training.
 - If more self-training is needed, repeat the Stage 2 loop: predict on full pool, audit false drops, compile accepted labels, retrain, replay all historical false-drop audits, then promote only if keep recall remains safe.
-- Compile confirmed `display=drop` and short invalid chunks into a separate Boundary hard-case / preference dataset. This Stage 3 task has not been executed and must stay offline; CueQC decisions must not be coupled into Boundary runtime planning. `display=drop` is not a direct v5.1 `start_delta/end_delta` label. It must first be converted into one of two training sources: SpeechBoundary-JA frame-level negative examples for pure non-speech/short noise, or Boundary Refiner preference/hard-case samples for over-fragmented chunks that should be shortened, merged into neighbors, or suppressed by a better boundary choice.
+- Next SpeechBoundary-JA step is feature cache generation from `agents/temp/20260617_230948_speech-boundary-hard-negative-finetune-prep/build_mixed_feature_cache.ps1`, then a plumbing / training experiment. Do not promote any trained scorer without full downstream smoke and human audit.
+- Convert the `boundary_preference_seed_candidates.jsonl` rows into neighbor-context A/B or explicit start/end delta targets before Boundary Refiner v5.1 training. CueQC decisions must stay offline and must not be coupled into Boundary runtime planning.
 - Revisit forced `forced/native/hybrid` aligner A/B separately if model size or cost becomes a priority. CueQC v3-Fusion does not decide aligner removal.
 
 ## Active Files
@@ -101,5 +105,9 @@ The safety objective is conservative subtraction: maximize keep recall and minim
 - `tools/asr/cueqc/predict_v3_fusion.py`
 - `tools/asr/cueqc/compile_stage2a_features_v3_fusion.py`
 - `tools/asr/cueqc/train_mamba_v3_fusion.py`
+- `tools/boundary/export_cueqc_drop_hardcases.py`
+- `tools/boundary/prepare_cueqc_drop_v51_sources.py`
+- `tools/boundary/prepare_speech_boundary_hard_negative_finetune.py`
+- `tools/boundary/ja/build_positive_anchor_replay.py`
 - `tools/audits/generate_cueqc_cluster_audit_html.py`
 - `tools/audits/generate_cueqc_prediction_audit_html.py`
