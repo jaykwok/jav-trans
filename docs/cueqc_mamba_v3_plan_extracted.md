@@ -104,7 +104,8 @@ uv run python -B tools/asr/cueqc/extract_features_v3_fusion.py `
   --output agents/temp/YYYYMMDD_HHMMSS_cueqc-v3-10film-full-features/shards/shard_00000.pt `
   --device auto `
   --start-index 0 `
-  --max-samples 1000
+  --max-samples 1000 `
+  --audio-cache-size 1
 
 uv run python -B tools/asr/cueqc/merge_features_v3_fusion.py `
   --input agents/temp/YYYYMMDD_HHMMSS_cueqc-v3-10film-full-features/shards/shard_00000.pt `
@@ -120,6 +121,9 @@ uv run python -B tools/asr/cueqc/predict_v3_fusion.py `
 For the 45643-row pool, run feature extraction in shards (`--start-index` +
 `--max-samples`) and merge them with `merge_features_v3_fusion.py`; a single
 all-in-one extraction has no intermediate save point and is too costly to retry.
+The extractor caches decoded full-video wav arrays while processing a shard
+(`--audio-cache-size`, default `1`), which avoids rereading the same 100-400MB
+wav for every chunk while keeping memory bounded.
 `extract_features_v3_fusion.py --input` writes unlabeled samples with label `-1`.
 `train_mamba_v3_fusion.py` rejects unlabeled bundles; run `predict_v3_fusion.py`
 first, audit false-drop risk from `cueqc_pseudo_labels.high_conf.jsonl`, then

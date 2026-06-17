@@ -27,6 +27,7 @@ import os
 import re
 import sys
 import types
+from collections import OrderedDict
 from importlib.machinery import ModuleSpec
 from pathlib import Path
 from typing import Any
@@ -101,6 +102,20 @@ def _find_wav(audio_root: Path, video_id: str) -> Path | None:
     return None
 
 
+def _load_wav_audio(wav_path: Path) -> np.ndarray:
+    """Load a full wav once; per-chunk slicing happens inside the capturer."""
+    import soundfile as sf
+
+    audio, sr = sf.read(str(wav_path), dtype="float32", always_2d=False)
+    if audio.ndim > 1:
+        audio = audio.mean(axis=1)
+    if sr != SAMPLE_RATE:
+        import scipy.signal
+
+        audio = scipy.signal.resample_poly(audio, SAMPLE_RATE, sr).astype(np.float32)
+    return np.ascontiguousarray(audio, dtype=np.float32)
+
+
 def _chunk_window(row: dict[str, Any]) -> tuple[float, float]:
     start = row.get("start")
     end = row.get("end")
@@ -147,7 +162,8 @@ def extract(args: argparse.Namespace) -> int:
     n_rows = len(selected_rows)
     print(
         f"rows={len(rows)} start_index={start_index} processing={n_rows} source_mode={source_mode} "
-        f"audio_root={audio_root} device={args.device}"
+        f"audio_root={audio_root} device={args.device} audio_cache_size={args.audio_cache_size}",
+        flush=True,
     )
 
     from asr.local_backend import (
@@ -160,10 +176,11 @@ def extract(args: argparse.Namespace) -> int:
         active_qwen_asr_model_path() or None,
         active_qwen_asr_model_id() or "jaykwok/Qwen3-ASR-0.6B-JA-Anime-Galgame",
     )
-    print(f"model_spec={model_spec}")
+    print(f"model_spec={model_spec}", flush=True)
     capturer = AsrInternalsCapturer(model_spec=model_spec, device=args.device)
 
     wav_cache: dict[str, Path | None] = {}
+    audio_cache: OrderedDict[str, np.ndarray] = OrderedDict()
 
     samples: list[dict[str, Any]] = []
     labels: list[int] = []
@@ -179,14 +196,22 @@ def extract(args: argparse.Namespace) -> int:
         if wav_path is None:
             skipped += 1
             continue
+        if video_id not in audio_cache:
+            audio_cache[video_id] = _load_wav_audio(wav_path)
+            print(f"  loaded_audio video_id={video_id} wav={wav_path}", flush=True)
+            while len(audio_cache) > int(args.audio_cache_size):
+                audio_cache.popitem(last=False)
+        else:
+            audio_cache.move_to_end(video_id)
+        audio = audio_cache[video_id]
 
         text = str(row.get("text") or row.get("raw_text") or "")
         start_s, end_s = _chunk_window(row)
 
         try:
-            internals = capturer.extract(wav_path, text, start_s=start_s, end_s=end_s)
+            internals = capturer.extract(audio, text, start_s=start_s, end_s=end_s)
         except Exception as exc:  # noqa: BLE001 - offline tool keeps going on bad chunks
-            print(f"WARN extract {sample_id}: {exc}")
+            print(f"WARN extract {sample_id}: {exc}", flush=True)
             skipped += 1
             continue
 
@@ -245,14 +270,21 @@ def extract(args: argparse.Namespace) -> int:
         })
 
         if (idx + 1) % 25 == 0:
-            print(f"  processed {idx + 1}/{n_rows} global={start_index + idx + 1} (kept={len(samples)} skipped={skipped})")
+            print(
+                f"  processed {idx + 1}/{n_rows} global={start_index + idx + 1} "
+                f"(kept={len(samples)} skipped={skipped})",
+                flush=True,
+            )
 
     capturer.close()
 
     n = len(samples)
     asr_dim = int(samples[0]["asr_frames"].shape[1]) if n else 0
-    print(f"extracted={n} skipped={skipped} asr_dim={asr_dim}")
-    print(f"labels_keep={labels.count(1)} labels_drop={labels.count(0)} labels_unlabeled={labels.count(-1)}")
+    print(f"extracted={n} skipped={skipped} asr_dim={asr_dim}", flush=True)
+    print(
+        f"labels_keep={labels.count(1)} labels_drop={labels.count(0)} labels_unlabeled={labels.count(-1)}",
+        flush=True,
+    )
 
     bundle = {
         "schema": "cueqc_mamba_v3_fusion_features",
@@ -265,6 +297,7 @@ def extract(args: argparse.Namespace) -> int:
             "source_mode": source_mode,
             "start_index": start_index,
             "processed_rows": n_rows,
+            "audio_cache_size": int(args.audio_cache_size),
             "asr_dim": asr_dim,
             "token_dim": K_TOK,
             "decoder_dim": K_DEC,
@@ -282,7 +315,10 @@ def extract(args: argparse.Namespace) -> int:
     out = Path(args.output)
     out.parent.mkdir(parents=True, exist_ok=True)
     torch.save(bundle, out)
-    print(f"saved={out} n={n} asr_dim={asr_dim} token_dim={K_TOK} decoder_dim={K_DEC} structured_dim={S_DIM}")
+    print(
+        f"saved={out} n={n} asr_dim={asr_dim} token_dim={K_TOK} decoder_dim={K_DEC} structured_dim={S_DIM}",
+        flush=True,
+    )
     return 0
 
 
@@ -296,6 +332,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--device", default="auto")
     p.add_argument("--start-index", type=int, default=0)
     p.add_argument("--max-samples", type=int, default=None)
+    p.add_argument(
+        "--audio-cache-size",
+        type=int,
+        default=1,
+        help="Number of decoded full-video wav arrays to keep in memory while extracting.",
+    )
     args = p.parse_args(argv)
     if bool(args.train) == bool(args.input):
         p.error("exactly one of --train or --input is required")
@@ -303,6 +345,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         p.error("--start-index must be non-negative")
     if args.max_samples is not None and args.max_samples <= 0:
         p.error("--max-samples must be positive")
+    if args.audio_cache_size <= 0:
+        p.error("--audio-cache-size must be positive")
     return args
 
 
