@@ -164,7 +164,7 @@ def compile_stage2a(
     cold_start_features: Path,
     full_features: Path,
     pseudo_labels: Path,
-    false_drop_audit_labels: Path,
+    false_drop_audit_labels: Path | list[Path],
     output: Path,
     summary_path: Path,
     min_keep_confidence: float,
@@ -176,7 +176,31 @@ def compile_stage2a(
     if not _compatible_config(cold_config, full_config):
         raise ValueError("cold-start and full feature bundles have incompatible feature_config")
 
-    audit_rows = read_jsonl(false_drop_audit_labels)
+    audit_paths = (
+        [false_drop_audit_labels]
+        if isinstance(false_drop_audit_labels, Path)
+        else list(false_drop_audit_labels)
+    )
+    audit_rows: list[dict[str, Any]] = []
+    audit_path_summaries: list[dict[str, Any]] = []
+    for audit_path in audit_paths:
+        rows = read_jsonl(audit_path)
+        audit_rows.extend(rows)
+        decisions = Counter(str(row.get("manual_decision") or "") for row in rows)
+        false_drop_count = sum(
+            1
+            for row in rows
+            if row.get("manual_decision") == "false_drop_keep" or row.get("is_false_drop") is True
+        )
+        audit_path_summaries.append(
+            {
+                "path": str(audit_path),
+                "records": len(rows),
+                "manual_decisions": dict(decisions.most_common()),
+                "false_drop_count": int(false_drop_count),
+                "false_drop_rate": round(false_drop_count / len(rows), 4) if rows else 0.0,
+            }
+        )
     pseudo_rows = read_jsonl(pseudo_labels)
     selected_full_labels: dict[str, LabelSource] = {}
     counters: Counter[str] = Counter()
@@ -271,7 +295,7 @@ def compile_stage2a(
             "cold_start_features": str(cold_start_features),
             "full_features": str(full_features),
             "pseudo_labels": str(pseudo_labels),
-            "false_drop_audit_labels": str(false_drop_audit_labels),
+            "false_drop_audit_labels": [str(path) for path in audit_paths],
             "min_keep_confidence": float(min_keep_confidence),
         }
     )
@@ -295,7 +319,8 @@ def compile_stage2a(
         "labels": {"drop": int(label_counts.get(0, 0)), "keep": int(label_counts.get(1, 0))},
         "source_counts": dict(counters.most_common()),
         "audit": {
-            "path": str(false_drop_audit_labels),
+            "paths": [str(path) for path in audit_paths],
+            "path_summaries": audit_path_summaries,
             "records": len(audit_rows),
             "manual_decisions": dict(manual_decisions.most_common()),
             "false_drop_count": int(false_drops),
@@ -326,7 +351,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--cold-start-features", required=True, help="Original labeled cold-start .pt feature bundle.")
     parser.add_argument("--full-features", required=True, help="Full 10-film unlabeled .pt feature bundle.")
     parser.add_argument("--pseudo-labels", required=True, help="cueqc_pseudo_labels.high_conf.jsonl from predict_v3_fusion.py.")
-    parser.add_argument("--false-drop-audit-labels", required=True, help="cueqc_false_drop_audit_labels.jsonl exported by the audit page.")
+    parser.add_argument(
+        "--false-drop-audit-labels",
+        action="append",
+        required=True,
+        help="cueqc_false_drop_audit_labels.jsonl exported by an audit page. Repeat for multiple rounds.",
+    )
     parser.add_argument("--output", required=True, help="Output labeled .pt feature bundle.")
     parser.add_argument("--summary", default="", help="Output summary JSON. Defaults to <output-dir>/summary.json.")
     parser.add_argument("--min-keep-confidence", type=float, default=0.95)
@@ -344,7 +374,7 @@ def main(argv: list[str] | None = None) -> int:
         cold_start_features=Path(args.cold_start_features),
         full_features=Path(args.full_features),
         pseudo_labels=Path(args.pseudo_labels),
-        false_drop_audit_labels=Path(args.false_drop_audit_labels),
+        false_drop_audit_labels=[Path(path) for path in args.false_drop_audit_labels],
         output=output,
         summary_path=summary_path,
         min_keep_confidence=float(args.min_keep_confidence),

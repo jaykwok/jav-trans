@@ -274,6 +274,7 @@ def test_cueqc_stage2a_compiler_trusts_manual_labels_and_skips_unaudited_drop(tm
     full_path = tmp_path / "full.pt"
     pseudo_path = tmp_path / "pseudo.jsonl"
     audit_path = tmp_path / "audit.jsonl"
+    audit_path_b = tmp_path / "audit_b.jsonl"
     output_path = tmp_path / "stage2a.pt"
     summary_path = tmp_path / "summary.json"
 
@@ -335,12 +336,24 @@ def test_cueqc_stage2a_compiler_trusts_manual_labels_and_skips_unaudited_drop(tm
         + "\n",
         encoding="utf-8",
     )
+    audit_path_b.write_text(
+        json.dumps(
+            {
+                "schema": "cueqc_false_drop_audit_label_v1",
+                "sample_id": "cueqc-VIDEO-chunk00005",
+                "manual_decision": "drop_ok",
+                "is_false_drop": False,
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
 
     summary = compile_stage2a_features_v3_fusion.compile_stage2a(
         cold_start_features=cold_path,
         full_features=full_path,
         pseudo_labels=pseudo_path,
-        false_drop_audit_labels=audit_path,
+        false_drop_audit_labels=[audit_path, audit_path_b],
         output=output_path,
         summary_path=summary_path,
         min_keep_confidence=0.95,
@@ -356,7 +369,9 @@ def test_cueqc_stage2a_compiler_trusts_manual_labels_and_skips_unaudited_drop(tm
         "cueqc-VIDEO-chunk00002": 1,
         "cueqc-VIDEO-chunk00003": 0,
         "cueqc-VIDEO-chunk00004": 1,
+        "cueqc-VIDEO-chunk00005": 0,
     }
-    assert summary["labels"] == {"drop": 2, "keep": 2}
+    assert summary["labels"] == {"drop": 3, "keep": 2}
     assert summary["source_counts"]["pseudo_skipped_unaudited_drop"] == 1
     assert summary["source_counts"]["audit_skipped:uncertain"] == 1
+    assert summary["audit"]["paths"] == [str(audit_path), str(audit_path_b)]

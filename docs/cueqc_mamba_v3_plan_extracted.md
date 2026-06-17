@@ -191,6 +191,30 @@ Stage 2a policy:
   checkpoint:
   `agents/audits/20260617_144327_cueqc-v3-stage2a-t088-false-drop-audit/index.html`.
   In this state, keep `src/asr/checkpoints/cueqc_mamba_v3_fusion.pt` unchanged.
+- The t=0.88 audit result is improved but not clean enough:
+  `197 drop_ok / 3 false_drop_keep`, false-drop rate `1.5%`.
+  Raising threshold to `0.92` avoids these audited false drops but leaves only
+  `337` predicted drops, so threshold-only replacement is not useful.
+- Stage 2b compiled bundle:
+  `agents/temp/20260617_161704_cueqc-v3-stage2b-training-features/cueqc_stage2b_train_features_v3_fusion.pt`.
+  Records: `2177`, labels `drop=532/keep=1645`. Sources:
+  `375` manual `drop_ok`, `24` manual false-drop keep, `1504` high-confidence
+  keep pseudo, plus remaining cold-start seed. The `9707` unaudited t=0.88 drop
+  pseudo labels were skipped.
+- Stage 2b training output:
+  `agents/temp/20260617_161806_cueqc-v3-stage2b-train/cueqc_mamba_v3_fusion.pt`.
+  Fixed holdout `867HTTM-0045` reaches `keep_recall=1.0`,
+  `false_drop_rate=0.0`, `drop_precision=1.0`, `drop_recall=0.8475`.
+  Replay over the first two audit rounds keeps all `24` manually corrected
+  `false_drop_keep` samples.
+- Stage 2b full prediction:
+  `agents/temp/20260617_162231_cueqc-v3-stage2b-10film-predictions/`.
+  Counts: `drop=19456/keep=26187`. Because the model is more aggressive on the
+  full pool, a fresh false-drop audit is required before replacing the runtime
+  checkpoint:
+  `agents/audits/20260617_162350_cueqc-v3-stage2b-false-drop-audit/index.html`.
+  Keep `src/asr/checkpoints/cueqc_mamba_v3_fusion.pt` unchanged until that gate
+  is reviewed.
 
 ## Stage 3: Boundary Feedback
 
