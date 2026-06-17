@@ -18,6 +18,7 @@ if str(SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(SRC_ROOT))
 
 from asr.cueqc_model import CueQCMambaV3Fusion  # noqa: E402
+from asr.cueqc_thresholds import resolve_drop_threshold  # noqa: E402
 
 
 def _normalize(arr: np.ndarray, mean: np.ndarray, std: np.ndarray) -> np.ndarray:
@@ -105,8 +106,11 @@ def run(args: argparse.Namespace) -> int:
     checkpoint = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
     model = _model_from_checkpoint(checkpoint, device)
     norm = _normalization(checkpoint)
-    decision = checkpoint.get("decision_config") or {}
-    drop_threshold = float(args.drop_threshold if args.drop_threshold is not None else decision.get("drop_threshold", 0.85))
+    decision = dict(checkpoint.get("decision_config") or {})
+    if args.drop_threshold is not None:
+        decision["drop_threshold"] = float(args.drop_threshold)
+        decision.pop("drop_threshold_profile", None)
+    drop_threshold = float(decision.get("drop_threshold", 0.85))
     keep_threshold = float(args.keep_threshold)
 
     samples: list[dict[str, Any]] = list(features.get("samples") or [])
@@ -136,13 +140,14 @@ def run(args: argparse.Namespace) -> int:
                 index = start + offset
                 p_drop = float(prob[0])
                 p_keep = float(prob[1])
-                if p_drop >= drop_threshold:
-                    display = "drop"
-                    confidence = p_drop
-                else:
-                    display = "keep"
-                    confidence = p_keep
                 item_meta = meta[index] if index < len(meta) and isinstance(meta[index], dict) else {}
+                sample_threshold, threshold_info = resolve_drop_threshold(
+                    decision,
+                    text=item_meta.get("text", ""),
+                    default=drop_threshold,
+                )
+                display = "drop" if p_drop >= sample_threshold else "keep"
+                confidence = p_drop if display == "drop" else p_keep
                 rows.append({
                     "schema": "cueqc_prediction_v3_fusion_v1",
                     "sample_id": item_meta.get("sample_id", ""),
@@ -158,7 +163,8 @@ def run(args: argparse.Namespace) -> int:
                     "confidence": round(confidence, 6),
                     "display_prob_drop": round(p_drop, 6),
                     "display_prob_keep": round(p_keep, 6),
-                    "drop_threshold": drop_threshold,
+                    "drop_threshold": round(sample_threshold, 6),
+                    "threshold_profile": threshold_info,
                     "keep_threshold": keep_threshold,
                     "model_version": "cueqc_mamba_v3_fusion",
                     "decision_version": "cueqc_display_binary_v1",
@@ -204,6 +210,7 @@ def run(args: argparse.Namespace) -> int:
         "counts": dict(counts.most_common()),
         "pseudo_counts": dict(pseudo_counts.most_common()),
         "drop_threshold": drop_threshold,
+        "decision_config": decision,
         "keep_threshold": keep_threshold,
         "batch_size": batch_size,
     }

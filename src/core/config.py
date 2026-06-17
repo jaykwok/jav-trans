@@ -155,7 +155,7 @@ DEFAULT_SETTINGS: dict[str, str] = {
     "CUEQC_DECISION_VERSION": "cueqc_display_binary_v1",
     "CUEQC_MODEL_VERSION": "cueqc_mamba_v3_fusion",
     "CUEQC_MODEL_PATH": "src/asr/checkpoints/cueqc_mamba_v3_fusion.pt",
-    # drop only when model p_drop >= this threshold (conservative; else keep).
+    # Base drop threshold. Checkpoints may raise it per risk bucket.
     "CUEQC_DROP_THRESHOLD": "0.85",
     "CUEQC_FALLBACK_POLICY": "keep",
     # 1 = actually remove model-confirmed drop candidates before alignment;

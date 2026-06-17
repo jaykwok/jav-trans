@@ -213,13 +213,27 @@ Stage 2a policy:
   full pool, a fresh false-drop audit is required before replacing the runtime
   checkpoint:
   `agents/audits/20260617_162350_cueqc-v3-stage2b-false-drop-audit/index.html`.
-  Keep `src/asr/checkpoints/cueqc_mamba_v3_fusion.pt` unchanged until that gate
-  is reviewed.
+  This gate has now been reviewed.
 - The Stage 2b false-drop audit page includes reason tags:
   `dialogue`, `vocalization`, `breath`, `environment`, `overlap`,
   `short_fragment`. `breath / 呼吸声` was added after the initial Stage 2b page
   generation and the same audit directory was regenerated before manual labels
   were exported.
+- Stage 2b gate result:
+  `agents/audits/20260617_162350_cueqc-v3-stage2b-false-drop-audit/cueqc_false_drop_audit_labels.jsonl`
+  has `198 drop_ok`, `1 false_drop_keep`, and `1 uncertain`. The only false
+  drop is a `short_text` sample with `p_drop=0.864778`.
+- Default runtime checkpoint:
+  `src/asr/checkpoints/cueqc_mamba_v3_fusion.pt` is now Stage 2b with an
+  adaptive threshold profile. Base `drop_threshold=0.85`; `short_text` uses
+  `0.87`; other buckets use the base threshold. This keeps all `25` manually
+  corrected `false_drop_keep` samples across three audit rounds while retaining
+  `540/573` audited `drop_ok` samples as drop.
+- Adaptive full prediction output:
+  `agents/temp/20260617_174344_cueqc-v3-stage2b-adaptive-10film-predictions/`.
+  Counts: `drop=19380/keep=26263`; high-confidence pseudo labels
+  `drop=19380/keep=1372`. Checkpoint sha1:
+  `98f9631a63dc19736b50619100fb4be4d08075e8`.
 
 ## Stage 3: Boundary Feedback
 
