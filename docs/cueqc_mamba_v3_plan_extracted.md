@@ -129,6 +129,21 @@ wav for every chunk while keeping memory bounded.
 first, audit false-drop risk from `cueqc_pseudo_labels.high_conf.jsonl`, then
 merge accepted pseudo labels with the cold-start seed before retraining.
 
+2026-06-17 run status:
+
+- Full 10-film feature extraction completed in 46 shards under
+  `agents/temp/20260617_113159_cueqc-v3-10film-sharded-features/`.
+- Merged bundle:
+  `agents/temp/20260617_113159_cueqc-v3-10film-sharded-features/cueqc_full_features_v3_fusion.pt`
+  (`45643` unlabeled records).
+- Prediction output:
+  `agents/temp/20260617_130642_cueqc-v3-10film-predictions/`.
+- Prediction counts: `keep=31055`, `drop=14588`; high-confidence pseudo labels:
+  `14629` total (`drop=14588`, `keep=41`).
+- Because high-confidence drop volume is large, do not retrain directly from
+  these pseudo labels. First audit false-drop risk via
+  `agents/audits/20260617_130642_cueqc-v3-false-drop-audit/index.html`.
+
 ## Stage 3: Boundary Feedback
 
 Later, `display=drop` chunks can be mined as Boundary preference / hard-case data:
