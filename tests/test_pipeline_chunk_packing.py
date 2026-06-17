@@ -517,3 +517,75 @@ def test_cueqc_shadow_records_without_skipping_alignment(monkeypatch, tmp_path):
     assert segments
     assert all(segment.get("cueqc_shadow") for segment in segments)
     assert any(entry.startswith("CueQC: candidates=") for entry in log)
+
+
+def test_cueqc_runtime_fallback_summary_is_logged_and_reported(monkeypatch, tmp_path):
+    asr = _reload_pipeline(monkeypatch, tmp_path)
+
+    class CaptureBackend:
+        def capture_asr_internals(self, chunks):
+            assert len(chunks) == 2
+            return [
+                {"ok": False, "error": "capture timeout"},
+                {"ok": True},
+            ]
+
+    class FakeRefiner:
+        def decide(self, candidates, *, asr_internals):
+            del asr_internals
+            return [
+                {
+                    "schema": "cueqc_shadow_v1",
+                    "model_version": "cueqc_mamba_v3_fusion",
+                    "decision_version": "cueqc_display_binary_v1",
+                    "mode": "fallback_keep",
+                    "display_hint": "keep",
+                    "cluster_id": "runtime-test",
+                    "confidence": 1.0,
+                    "display_prob_keep": 1.0,
+                    "display_prob_drop": 0.0,
+                    "fallback_stage": "capture",
+                    "fallback_detail": "capture timeout",
+                    "reasons": ["cueqc_capture_error", "cueqc_capture_error:capture timeout"],
+                },
+                {
+                    "schema": "cueqc_shadow_v1",
+                    "model_version": "cueqc_mamba_v3_fusion",
+                    "decision_version": "cueqc_display_binary_v1",
+                    "mode": "cueqc_mamba_v3_fusion",
+                    "display_hint": "drop",
+                    "cluster_id": "runtime-test",
+                    "confidence": 0.95,
+                    "display_prob_keep": 0.05,
+                    "display_prob_drop": 0.95,
+                    "drop_threshold": 0.85,
+                    "threshold_profile": {"mode": "base"},
+                    "reasons": ["cueqc_mamba_v3:drop:p_drop=0.950:threshold=0.850"],
+                },
+            ]
+
+    candidates = [
+        {"chunk_index": 0, "start": 0.0, "end": 1.0, "duration_s": 1.0, "text": "あ"},
+        {"chunk_index": 1, "start": 1.0, "end": 2.0, "duration_s": 1.0, "text": "い"},
+    ]
+    log: list[str] = []
+
+    decisions = asr._apply_cueqc_v3_model(
+        refiner=FakeRefiner(),
+        candidates=candidates,
+        backend=CaptureBackend(),
+        audio_path=str(tmp_path / "source.wav"),
+        log=log,
+    )
+    report = asr._merge_cueqc_v3_decisions(
+        {"counts": {"display_hint": {"keep": 2}}, "decisions": []},
+        candidates,
+        decisions,
+    )
+
+    assert any("capture fallback candidates=1/2" in entry for entry in log)
+    assert any("fallback=1" in entry and "cueqc_capture_error" in entry for entry in log)
+    assert report["counts"]["display_hint"] == {"keep": 1, "drop": 1}
+    assert report["counts"]["fallback_stage"] == {"capture": 1}
+    assert report["counts"]["fallback_reason"] == {"cueqc_capture_error": 1}
+    assert report["fallback_summary"]["details"] == {"capture timeout": 1}

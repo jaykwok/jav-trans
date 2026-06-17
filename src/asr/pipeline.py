@@ -711,6 +711,32 @@ def _candidate_capture_window(
     return str(fallback_audio_path) if fallback_audio_path else "", start_s, end_s
 
 
+def _top_counts(items: list[str], *, limit: int = 3) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for item in items:
+        key = str(item or "").strip() or "unknown"
+        counts[key] = counts.get(key, 0) + 1
+    return dict(sorted(counts.items(), key=lambda entry: (-entry[1], entry[0]))[:limit])
+
+
+def _cueqc_fallback_summary(decisions: list[dict]) -> dict:
+    fallback = [
+        item for item in decisions
+        if item.get("mode") != "cueqc_mamba_v3_fusion"
+    ]
+    return {
+        "count": len(fallback),
+        "stages": _top_counts([str(item.get("fallback_stage") or "") for item in fallback]),
+        "reasons": _top_counts([
+            str((item.get("reasons") or [""])[0])
+            if isinstance(item.get("reasons"), list)
+            else str(item.get("reasons") or "")
+            for item in fallback
+        ]),
+        "details": _top_counts([str(item.get("fallback_detail") or "") for item in fallback if item.get("fallback_detail")]),
+    }
+
+
 def _apply_cueqc_v3_model(
     *,
     refiner,
@@ -748,12 +774,36 @@ def _apply_cueqc_v3_model(
     if not isinstance(asr_internals, list) or len(asr_internals) != len(candidates):
         log.append("CueQC v3-Fusion: capture count mismatch, heuristic shadow retained")
         return None
+    capture_failed = [
+        str(item.get("error") or item.get("detail") or "")
+        for item in asr_internals
+        if not (isinstance(item, dict) and item.get("ok"))
+    ]
+    if capture_failed:
+        log.append(
+            "CueQC v3-Fusion: capture fallback candidates={failed}/{total} top_errors={errors}".format(
+                failed=len(capture_failed),
+                total=len(candidates),
+                errors=_top_counts(capture_failed),
+            )
+        )
     try:
         decisions = refiner.decide(candidates, asr_internals=asr_internals)
     except Exception:
         raise
     drops = sum(1 for d in decisions if d.get("display_hint") == "drop")
-    log.append(f"CueQC v3-Fusion: model decisions={len(decisions)} drops={drops}")
+    fallback_summary = _cueqc_fallback_summary(decisions)
+    log.append(
+        "CueQC v3-Fusion: model decisions={decisions} drops={drops} fallback={fallback} "
+        "fallback_stages={stages} fallback_reasons={reasons} fallback_details={details}".format(
+            decisions=len(decisions),
+            drops=drops,
+            fallback=fallback_summary["count"],
+            stages=fallback_summary["stages"],
+            reasons=fallback_summary["reasons"],
+            details=fallback_summary["details"],
+        )
+    )
     return decisions
 
 
@@ -777,8 +827,12 @@ def _merge_cueqc_v3_decisions(
         counts[key] = counts.get(key, 0) + 1
     existing_counts = dict(report.get("counts") or {})
     existing_counts["display_hint"] = counts
+    fallback_summary = _cueqc_fallback_summary(decisions)
+    existing_counts["fallback_stage"] = fallback_summary["stages"]
+    existing_counts["fallback_reason"] = fallback_summary["reasons"]
     report["counts"] = existing_counts
     report["decision_source"] = "cueqc_mamba_v3_fusion"
+    report["fallback_summary"] = fallback_summary
     return report
 
 
@@ -847,6 +901,8 @@ def _run_cueqc_shadow(
                     "display_prob_drop",
                     "drop_threshold",
                     "threshold_profile",
+                    "fallback_stage",
+                    "fallback_detail",
                 }
             }
             for item in report.get("decisions", [])

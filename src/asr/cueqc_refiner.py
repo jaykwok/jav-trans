@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Any, Sequence
 
 import numpy as np
+import os
 
 CUEQC_MAMBA_CHECKPOINT_SCHEMA = "cueqc_mamba_checkpoint_v3_fusion"
 MODE_TAG = "cueqc_mamba_v3_fusion"
@@ -31,7 +32,24 @@ def _file_sha1(path: Path) -> str:
     return h.hexdigest()
 
 
-def _fallback_keep(reason: str, cluster_id: str = "unclustered") -> dict[str, Any]:
+def _short_detail(value: Any, *, limit: int = 180) -> str:
+    text = str(value or "").replace("\r", " ").replace("\n", " ").strip()
+    if len(text) > limit:
+        return text[: limit - 3] + "..."
+    return text
+
+
+def _fallback_keep(
+    reason: str,
+    cluster_id: str = "unclustered",
+    *,
+    stage: str = "",
+    detail: Any = "",
+) -> dict[str, Any]:
+    detail_text = _short_detail(detail)
+    reasons = [reason]
+    if detail_text:
+        reasons.append(f"{reason}:{detail_text}")
     return {
         "schema": "cueqc_shadow_v1",
         "model_version": MODE_TAG,
@@ -42,7 +60,9 @@ def _fallback_keep(reason: str, cluster_id: str = "unclustered") -> dict[str, An
         "confidence": 1.0,
         "display_prob_keep": 1.0,
         "display_prob_drop": 0.0,
-        "reasons": [reason],
+        "fallback_stage": stage or "unknown",
+        "fallback_detail": detail_text,
+        "reasons": reasons,
     }
 
 
@@ -213,39 +233,70 @@ class CueQCRefinerV3Fusion:
 
         # Build features per candidate, recording which ones succeeded.
         norm_samples: list[dict[str, np.ndarray]] = []
-        ok_mask: list[bool] = []
+        sample_indices: list[int] = []
+        failures: dict[int, dict[str, str]] = {}
         for i, cand in enumerate(candidates):
-            cluster_id = str(cand.get("cluster_id", "unclustered"))
             try:
                 if use_pre:
                     internals = asr_internals[i]  # type: ignore[index]
                     if not isinstance(internals, dict) or not internals.get("ok"):
-                        ok_mask.append(False)
+                        detail = ""
+                        if isinstance(internals, dict):
+                            detail = str(internals.get("error") or internals.get("detail") or "")
+                        failures[i] = {"stage": "capture", "reason": "cueqc_capture_error", "detail": detail}
                         continue
                 else:
                     if capturer is None:
-                        ok_mask.append(False)
+                        failures[i] = {
+                            "stage": "capture_request",
+                            "reason": "cueqc_capture_unavailable",
+                            "detail": "capturer is not configured",
+                        }
                         continue
                     wav = (audio_path_by_idx[i] if audio_path_by_idx else default_audio_path)
                     if not wav:
-                        ok_mask.append(False)
+                        failures[i] = {
+                            "stage": "capture_request",
+                            "reason": "cueqc_capture_audio_missing",
+                            "detail": "empty audio path",
+                        }
                         continue
                     start_s = float(cand.get("start", 0.0))
                     end_s = float(cand.get("end", start_s))
                     internals = capturer.extract(wav, str(cand.get("text") or ""), start_s=start_s, end_s=end_s)
                 sample = self._build_sample(cand, internals)
                 norm_samples.append(self._normalize(sample))
-                ok_mask.append(True)
-            except Exception:  # noqa: BLE001 - runtime must not crash the pipeline
-                ok_mask.append(False)
+                sample_indices.append(i)
+            except Exception as exc:  # noqa: BLE001 - runtime must not crash the pipeline
+                failures[i] = {
+                    "stage": "feature",
+                    "reason": "cueqc_feature_error",
+                    "detail": repr(exc),
+                }
 
         # Build decision list; failed candidates get fallback keep.
         decisions: list[dict[str, Any]] = [None] * n  # type: ignore[list-item]
-        if norm_samples:
-            asr_batch, asr_mask = self._pad_batch([s["asr_frames"] for s in norm_samples])
-            tok_batch, tok_mask = self._pad_batch([s["token_trace"] for s in norm_samples])
-            dec_batch = np.stack([s["decoder_stats"] for s in norm_samples])
-            struct_batch = np.stack([s["structured"] for s in norm_samples])
+        for i, failure in failures.items():
+            cand = candidates[i]
+            decisions[i] = _fallback_keep(
+                failure["reason"],
+                str(cand.get("cluster_id", "unclustered")),
+                stage=failure["stage"],
+                detail=failure.get("detail", ""),
+            )
+
+        try:
+            batch_size = max(1, int(float(os.getenv("CUEQC_INFERENCE_BATCH_SIZE", "64"))))
+        except (TypeError, ValueError):
+            batch_size = 64
+
+        for start in range(0, len(norm_samples), batch_size):
+            batch_samples = norm_samples[start : start + batch_size]
+            batch_candidate_indices = sample_indices[start : start + batch_size]
+            asr_batch, asr_mask = self._pad_batch([s["asr_frames"] for s in batch_samples])
+            tok_batch, tok_mask = self._pad_batch([s["token_trace"] for s in batch_samples])
+            dec_batch = np.stack([s["decoder_stats"] for s in batch_samples])
+            struct_batch = np.stack([s["structured"] for s in batch_samples])
             try:
                 with torch.inference_mode():
                     logits = self.model(
@@ -257,45 +308,59 @@ class CueQCRefinerV3Fusion:
                         structured=torch.from_numpy(struct_batch).to(self.device),
                     )
                     probs = torch.softmax(logits, dim=-1).float().cpu().numpy()
-            except Exception:  # noqa: BLE001 - inference failure -> all fallback keep
-                probs = None
-        else:
-            probs = None
-
-        # Map probabilities back to candidate order.
-        ok_iter = iter(range(len(norm_samples)))
-        for i, cand in enumerate(candidates):
-            cluster_id = str(cand.get("cluster_id", "unclustered"))
-            if not ok_mask[i] or probs is None:
-                decisions[i] = _fallback_keep("cueqc_feature_or_inference_error", cluster_id)
+            except Exception as exc:  # noqa: BLE001 - inference failure -> fallback keep for this batch
+                if str(self.device).startswith("cuda"):
+                    try:
+                        torch.cuda.empty_cache()
+                    except Exception:
+                        pass
+                for i in batch_candidate_indices:
+                    cand = candidates[i]
+                    decisions[i] = _fallback_keep(
+                        "cueqc_inference_error",
+                        str(cand.get("cluster_id", "unclustered")),
+                        stage="inference",
+                        detail=repr(exc),
+                    )
                 continue
-            j = next(ok_iter)
-            p_drop = float(probs[j, 0])
-            p_keep = float(probs[j, 1])
+
             from asr.cueqc_thresholds import resolve_drop_threshold
 
-            threshold, threshold_info = resolve_drop_threshold(
-                self.decision_config,
-                text=cand.get("text", ""),
-                default=self.drop_threshold,
-            )
-            is_drop = p_drop >= threshold
-            display = "drop" if is_drop else "keep"
-            confidence = round(p_drop if is_drop else p_keep, 4)
-            decisions[i] = {
-                "schema": "cueqc_shadow_v1",
-                "model_version": MODE_TAG,
-                "decision_version": self.decision_version,
-                "mode": MODE_TAG,
-                "display_hint": display,
-                "cluster_id": cluster_id,
-                "confidence": confidence,
-                "display_prob_keep": round(p_keep, 4),
-                "display_prob_drop": round(p_drop, 4),
-                "drop_threshold": round(threshold, 4),
-                "threshold_profile": threshold_info,
-                "reasons": [f"cueqc_mamba_v3:{display}:p_drop={p_drop:.3f}:threshold={threshold:.3f}"],
-            }
+            for local_j, i in enumerate(batch_candidate_indices):
+                cand = candidates[i]
+                cluster_id = str(cand.get("cluster_id", "unclustered"))
+                p_drop = float(probs[local_j, 0])
+                p_keep = float(probs[local_j, 1])
+                threshold, threshold_info = resolve_drop_threshold(
+                    self.decision_config,
+                    text=cand.get("text", ""),
+                    default=self.drop_threshold,
+                )
+                is_drop = p_drop >= threshold
+                display = "drop" if is_drop else "keep"
+                confidence = round(p_drop if is_drop else p_keep, 4)
+                decisions[i] = {
+                    "schema": "cueqc_shadow_v1",
+                    "model_version": MODE_TAG,
+                    "decision_version": self.decision_version,
+                    "mode": MODE_TAG,
+                    "display_hint": display,
+                    "cluster_id": cluster_id,
+                    "confidence": confidence,
+                    "display_prob_keep": round(p_keep, 4),
+                    "display_prob_drop": round(p_drop, 4),
+                    "drop_threshold": round(threshold, 4),
+                    "threshold_profile": threshold_info,
+                    "reasons": [f"cueqc_mamba_v3:{display}:p_drop={p_drop:.3f}:threshold={threshold:.3f}"],
+                }
+        for i, decision in enumerate(decisions):
+            if decision is None:
+                cand = candidates[i]
+                decisions[i] = _fallback_keep(
+                    "cueqc_unknown_runtime_error",
+                    str(cand.get("cluster_id", "unclustered")),
+                    stage="unknown",
+                )
         return decisions
 
 

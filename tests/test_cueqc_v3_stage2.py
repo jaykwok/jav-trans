@@ -1,14 +1,18 @@
 from __future__ import annotations
 
 import json
+import subprocess
+import sys
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 import torch
 
+from asr.cueqc_refiner import CueQCRefinerV3Fusion
 from tools.asr.cueqc import extract_features_v3_fusion
 from tools.asr.cueqc import compile_stage2a_features_v3_fusion
+from tools.asr.cueqc import extract_feature_shards
 from tools.asr.cueqc import merge_features_v3_fusion
 from tools.asr.cueqc import predict_v3_fusion
 from tools.asr.cueqc import train_mamba_v3_fusion
@@ -91,6 +95,107 @@ def test_cueqc_v3_feature_extractor_marks_unlabeled_candidate_rows():
     }
 
     assert extract_features_v3_fusion._label_from_row(row) == -1
+
+
+def _runtime_candidate(text: str = "あ") -> dict:
+    return {
+        "start": 0.0,
+        "end": 1.0,
+        "duration_s": 1.0,
+        "text": text,
+        "text_features": {"char_count": len(text)},
+        "adjacency": {},
+        "boundary": {},
+        "asr_signals": {},
+        "cluster_id": "runtime-test",
+    }
+
+
+def _runtime_internals(asr_dim: int = 4) -> dict:
+    return {
+        "ok": True,
+        "asr_frames": torch.zeros(2, asr_dim).numpy(),
+        "token_ids": torch.tensor([1, 2]).numpy(),
+        "token_logprobs": torch.tensor([-0.1, -0.2]).numpy(),
+        "token_entropies": torch.tensor([1.0, 1.0]).numpy(),
+        "token_top1_top2_margins": torch.tensor([0.4, 0.5]).numpy(),
+        "decoded_tokens": ["あ", "い"],
+        "has_timestamps": False,
+    }
+
+
+def _runtime_refiner(fake_model) -> CueQCRefinerV3Fusion:
+    refiner = object.__new__(CueQCRefinerV3Fusion)
+    refiner.model = fake_model
+    refiner.device = torch.device("cpu")
+    refiner.decision_version = "cueqc_display_binary_v1"
+    refiner.decision_config = {"drop_threshold": 0.85}
+    refiner.drop_threshold = 0.85
+    refiner.asr_mean = torch.zeros(4).numpy()
+    refiner.asr_std = torch.ones(4).numpy()
+    refiner.token_mean = torch.zeros(13).numpy()
+    refiner.token_std = torch.ones(13).numpy()
+    refiner.decoder_mean = torch.zeros(22).numpy()
+    refiner.decoder_std = torch.ones(22).numpy()
+    refiner.structured_mean = torch.zeros(14).numpy()
+    refiner.structured_std = torch.ones(14).numpy()
+    return refiner
+
+
+def test_cueqc_refiner_batches_runtime_inference_and_exposes_fallback_detail(monkeypatch):
+    class ShapeCheckingModel(torch.nn.Module):
+        def forward(self, *, asr_frames, **_kwargs):
+            if asr_frames.shape[-1] != 4:
+                raise RuntimeError(f"bad asr_dim={asr_frames.shape[-1]}")
+            return torch.tensor([[0.0, 3.0]], dtype=torch.float32)
+
+    monkeypatch.setenv("CUEQC_INFERENCE_BATCH_SIZE", "1")
+    refiner = _runtime_refiner(ShapeCheckingModel())
+
+    decisions = refiner.decide(
+        [_runtime_candidate("あ"), _runtime_candidate("東京")],
+        asr_internals=[_runtime_internals(asr_dim=5), _runtime_internals(asr_dim=4)],
+    )
+
+    assert decisions[0]["mode"] == "fallback_keep"
+    assert decisions[0]["fallback_stage"] == "inference"
+    assert "bad asr_dim=5" in decisions[0]["fallback_detail"]
+    assert decisions[0]["reasons"][0] == "cueqc_inference_error"
+    assert decisions[1]["mode"] == "cueqc_mamba_v3_fusion"
+    assert decisions[1]["display_hint"] == "keep"
+
+
+def test_cueqc_refiner_reports_capture_errors_without_feature_work():
+    class UnusedModel(torch.nn.Module):
+        def forward(self, **_kwargs):
+            raise AssertionError("capture failures should not reach inference")
+
+    refiner = _runtime_refiner(UnusedModel())
+
+    decisions = refiner.decide(
+        [_runtime_candidate()],
+        asr_internals=[{"ok": False, "error": "worker pipe closed"}],
+    )
+
+    assert decisions == [
+        {
+            "schema": "cueqc_shadow_v1",
+            "model_version": "cueqc_mamba_v3_fusion",
+            "decision_version": "cueqc_display_binary_v1",
+            "mode": "fallback_keep",
+            "display_hint": "keep",
+            "cluster_id": "runtime-test",
+            "confidence": 1.0,
+            "display_prob_keep": 1.0,
+            "display_prob_drop": 0.0,
+            "fallback_stage": "capture",
+            "fallback_detail": "worker pipe closed",
+            "reasons": [
+                "cueqc_capture_error",
+                "cueqc_capture_error:worker pipe closed",
+            ],
+        }
+    ]
 
 
 def test_cueqc_threshold_profile_only_raises_risky_text_bucket():
@@ -211,6 +316,75 @@ def test_cueqc_v3_feature_extractor_reuses_video_audio_cache(tmp_path: Path, mon
 
     assert rc == 0
     assert load_calls == [wav_path]
+
+
+def test_cueqc_feature_shards_runs_resumable_extract_commands(tmp_path: Path, monkeypatch):
+    rows_path = tmp_path / "candidates.jsonl"
+    rows_path.write_text(
+        "\n".join(
+            json.dumps({"schema": "cueqc_candidate_v1", "sample_id": f"cueqc-AAA-chunk{index:05d}"})
+            for index in range(5)
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    audio_root = tmp_path / "audio"
+    audio_root.mkdir()
+    out_dir = tmp_path / "out"
+    commands: list[list[str]] = []
+
+    def fake_run_shard(command, *, stdout_path, stderr_path):
+        del stdout_path, stderr_path
+        commands.append(command)
+        output_path = Path(command[command.index("--output") + 1])
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_bytes(b"feature-shard")
+        return subprocess.CompletedProcess(command, 0)
+
+    monkeypatch.setattr(extract_feature_shards, "_run_shard", fake_run_shard)
+
+    rc = extract_feature_shards.run(
+        SimpleNamespace(
+            train="",
+            input=str(rows_path),
+            audio_root=str(audio_root),
+            output_dir=str(out_dir),
+            merged_output="",
+            model_spec="stub-model",
+            device="cpu",
+            start_index=1,
+            max_samples=3,
+            shard_size=2,
+            audio_cache_size=1,
+            force=False,
+        )
+    )
+
+    summary = json.loads((out_dir / "summary.json").read_text(encoding="utf-8"))
+    status_rows = [
+        json.loads(line)
+        for line in (out_dir / "status.jsonl").read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+
+    assert rc == 0
+    assert len(commands) == 2
+    assert commands[0][0] == sys.executable
+    assert commands[0][commands[0].index("--input") + 1] == str(rows_path)
+    assert commands[0][commands[0].index("--start-index") + 1] == "1"
+    assert commands[0][commands[0].index("--max-samples") + 1] == "2"
+    assert commands[1][commands[1].index("--start-index") + 1] == "3"
+    assert commands[1][commands[1].index("--max-samples") + 1] == "1"
+    assert summary["planned_rows"] == 3
+    assert len(summary["shards"]) == 2
+    assert [row["event"] for row in status_rows] == [
+        "start",
+        "shard_start",
+        "shard_done",
+        "shard_start",
+        "shard_done",
+        "done",
+    ]
 
 
 def test_cueqc_v3_predict_exports_high_confidence_pseudo_labels(tmp_path: Path, monkeypatch):

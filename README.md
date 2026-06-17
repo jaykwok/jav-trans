@@ -275,3 +275,51 @@ uv pip install pyinstaller torchcodec
 ```
 
 构建产物位于 `dist\JAVTrans\JAVTrans.exe`。如需分发，可再压缩为 `.7z` 并上传到网盘；GitHub Releases 只发布源码和版本说明。打包细节见 `packaging/README.md`。
+
+---
+
+## 工具索引
+
+所有 Python 工具都从项目根目录执行，并使用当前 `.venv`：
+
+```powershell
+$env:PYTHONIOENCODING='utf-8'
+uv run python -m <module> --help
+```
+
+### 全链路与 Web smoke
+
+- `tools.workflows.run_full_workflow`：从命令行跑完整本地工作流；默认不翻译、保留 ASR chunks，并把运行归档写到 `agents/temp/speech-boundary-ja/YYYYMMDD_HHMMSS_*`。
+- `tools.web.smoke.start_server`：启动 FastAPI Web 服务并把 pid / stdout / stderr 写入 `agents/temp/YYYYMMDD_HHMMSS_*`。
+- `tools.web.smoke.submit_job`：通过 Web API 提交分发任务；默认是不翻译 smoke，并启用 CueQC v3-Fusion。
+- `tools.web.smoke.poll_job`：按固定间隔轮询 `/api/jobs/{id}`，默认可用于 5 分钟长任务检查。
+- `tools.web.smoke.summarize_job`：读取 `tmp/web/jobs/<job_id>` 的产物，汇总阶段耗时和完整 CueQC keep/drop/fallback 统计。
+
+示例：
+
+```powershell
+uv run python -m tools.workflows.run_full_workflow --video video/NAMH-055.mp4 --task-name 20260617_191654_cli-smoke --label smoke
+uv run python -m tools.web.smoke.start_server --run-dir agents/temp/20260617_191654_web-smoke
+uv run python -m tools.web.smoke.submit_job --video-path video/NAMH-055.mp4 --output-dir video --run-dir agents/temp/20260617_191654_web-smoke
+uv run python -m tools.web.smoke.poll_job --job-id-file agents/temp/20260617_191654_web-smoke/job_id.txt --run-dir agents/temp/20260617_191654_web-smoke --interval-seconds 300
+uv run python -m tools.web.smoke.summarize_job --job-id <job_id> --run-dir agents/temp/20260617_191654_web-smoke
+```
+
+### CueQC 训练与预测
+
+- `tools.asr.cueqc.export_candidates`：从全链路产物导出 CueQC candidate JSONL。
+- `tools.asr.cueqc.cluster_candidates`：仅用于 cold-start 的一次性 Torque 聚类和审计素材生成，不进入 runtime。
+- `tools.asr.cueqc.compile_training_set`：把簇级 keep/drop 审计标签广播为初始训练 JSONL。
+- `tools.asr.cueqc.extract_features_v3_fusion`：从 ASR internals 提取 CueQC v3-Fusion 特征。
+- `tools.asr.cueqc.extract_feature_shards`：参数化分片提取大规模 CueQC 特征，替代 `agents/temp` 中的一次性硬编码脚本。
+- `tools.asr.cueqc.merge_features_v3_fusion`：合并分片特征 bundle。
+- `tools.asr.cueqc.train_mamba_v3_fusion`：训练 CueQC v3-Fusion checkpoint。
+- `tools.asr.cueqc.predict_v3_fusion`：对特征 bundle 输出 keep/drop prediction 和 high-confidence pseudo labels。
+- `tools.asr.cueqc.compile_stage2a_features_v3_fusion`：合并 cold-start、人工 false-drop 审计和高置信 keep pseudo，生成 Stage 2 训练 bundle。
+
+### 审计、诊断与 Boundary
+
+- `tools.audits.audit_nav`、`tools.audits.serve_audits.ps1`、`tools.audits.serve_audits.sh`：维护和启动本地审计导航页。
+- `tools.audits.generate_*_audit_html`：生成字幕、alignment、CueQC prediction、Boundary preference 等人工审计页。
+- `tools.asr.diagnostics.*`：分析 alignment failure、fallback timing、安全边界和 ASR hard-negative 候选。
+- `tools.boundary.*`、`tools.boundary.ja.*`：Boundary preference、silver mining、训练数据构建、SpeechBoundary-JA 训练和 frame score 导出工具。
