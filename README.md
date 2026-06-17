@@ -323,3 +323,4 @@ uv run python -m tools.web.smoke.summarize_job --job-id <job_id> --run-dir agent
 - `tools.audits.generate_*_audit_html`：生成字幕、alignment、CueQC prediction、Boundary preference 等人工审计页。
 - `tools.asr.diagnostics.*`：分析 alignment failure、fallback timing、安全边界和 ASR hard-negative 候选。
 - `tools.boundary.*`、`tools.boundary.ja.*`：Boundary preference、silver mining、训练数据构建、SpeechBoundary-JA 训练和 frame score 导出工具。
+- `tools.boundary.prepare_v51_training`：生成 Boundary v5.1 preference finetune 准备包，校验现有 v5 checkpoint 架构并写出 dry-run / head-finetune 命令；不会替换默认 checkpoint。

@@ -75,13 +75,13 @@ The safety objective is conservative subtraction: maximize keep recall and minim
 - Stage 2b default checkpoint: `src/asr/checkpoints/cueqc_mamba_v3_fusion.pt`，sha1 `98f9631a63dc19736b50619100fb4be4d08075e8`。
 - Adaptive threshold profile: base `drop_threshold=0.85`，`text_bucket=short_text` 提升到 `0.87`，由 `src/asr/cueqc_thresholds.py` 在 runtime 与 offline prediction 共用。
 - Adaptive 10-film prediction: `agents/temp/20260617_174344_cueqc-v3-stage2b-adaptive-10film-predictions/`，records `45643`，`drop=19380/keep=26263`，high-confidence pseudo `drop=19380/keep=1372`。
+- NAMH-055 Web full-workflow smoke after Stage 2b promotion: job `38a5d14ea1a54236a24b56e716f36175` completed with `translation_skipped=true`，CueQC `candidates=3199/drop=1052/keep=2147/fallback=0`，最终 `transcript_chunks=2147/segments=2157/blocks=2087`，输出 `video/NAMH-055.ja.srt`，summary 为 `agents/temp/20260617_191654_web-smoke-namh055-cueqc-batched/job_summary.json`。
 
 ## Remaining V3 Plan
 
-- Run NAMH-055 full workflow smoke with the promoted Stage 2b adaptive checkpoint. Current docs have no evidence that this was executed after checkpoint promotion.
 - Continue false-drop / keep-recall audits before accepting any new high-confidence drop pseudo labels into training.
 - If more self-training is needed, repeat the Stage 2 loop: predict on full pool, audit false drops, compile accepted labels, retrain, replay all historical false-drop audits, then promote only if keep recall remains safe.
-- Compile confirmed `display=drop` and short invalid chunks into a separate Boundary hard-case / preference dataset. This Stage 3 task has not been executed and must stay offline; CueQC decisions must not be coupled into Boundary runtime planning.
+- Compile confirmed `display=drop` and short invalid chunks into a separate Boundary hard-case / preference dataset. This Stage 3 task has not been executed and must stay offline; CueQC decisions must not be coupled into Boundary runtime planning. `display=drop` is not a direct v5.1 `start_delta/end_delta` label. It must first be converted into one of two training sources: SpeechBoundary-JA frame-level negative examples for pure non-speech/short noise, or Boundary Refiner preference/hard-case samples for over-fragmented chunks that should be shortened, merged into neighbors, or suppressed by a better boundary choice.
 - Revisit forced `forced/native/hybrid` aligner A/B separately if model size or cost becomes a priority. CueQC v3-Fusion does not decide aligner removal.
 
 ## Active Files
