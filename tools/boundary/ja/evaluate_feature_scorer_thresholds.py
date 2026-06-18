@@ -83,6 +83,59 @@ def _empty_counts() -> dict[str, int]:
     }
 
 
+def _speech_boundary_distances_s(labels: np.ndarray, *, frame_hop_s: float) -> np.ndarray:
+    values = (np.asarray(labels, dtype=np.float32).reshape(-1) > 0.5).astype(np.int32)
+    if values.size <= 0:
+        return np.zeros(0, dtype=np.float32)
+    transition_indices = np.flatnonzero(values[1:] != values[:-1]) + 1
+    if transition_indices.size <= 0:
+        return np.full(values.size, np.inf, dtype=np.float32)
+    frame_centers = (np.arange(values.size, dtype=np.float32) + 0.5) * float(frame_hop_s)
+    boundary_times = transition_indices.astype(np.float32) * float(frame_hop_s)
+    distances = np.min(np.abs(frame_centers[:, None] - boundary_times[None, :]), axis=1)
+    return np.asarray(distances, dtype=np.float32)
+
+
+def _distance_bucket_key(distance_s: float, buckets_s: tuple[float, ...]) -> str:
+    if not np.isfinite(float(distance_s)):
+        return "no_boundary"
+    for bound in buckets_s:
+        if float(distance_s) <= float(bound) + 1e-9:
+            return f"le_{float(bound):.3f}s"
+    return f"gt_{float(buckets_s[-1]):.3f}s" if buckets_s else "all_boundary_distance"
+
+
+def _empty_diagnostic_state(
+    *,
+    kind: str,
+    label: str,
+    buckets_s: tuple[float, ...],
+    near_boundary_s: float,
+) -> dict[str, Any]:
+    bucket_keys = [_distance_bucket_key(float(bound), buckets_s) for bound in buckets_s]
+    if buckets_s:
+        bucket_keys.append(f"gt_{float(buckets_s[-1]):.3f}s")
+    bucket_keys.append("no_boundary")
+    return {
+        "kind": kind,
+        "label": label,
+        "near_boundary_s": float(near_boundary_s),
+        "boundary_buckets_s": [float(value) for value in buckets_s],
+        "overall": _empty_counts(),
+        "distance_buckets": {key: _empty_counts() for key in dict.fromkeys(bucket_keys)},
+        "regions": {
+            "near_boundary": _empty_counts(),
+            "far_from_boundary": _empty_counts(),
+            "no_boundary": _empty_counts(),
+            "cut_target": _empty_counts(),
+            "non_cut_background": _empty_counts(),
+            "speech_far_from_boundary": _empty_counts(),
+            "background_far_from_boundary": _empty_counts(),
+        },
+        "top_error_rows": [],
+    }
+
+
 def _update_counts(
     counts: dict[str, int],
     *,
@@ -104,6 +157,120 @@ def _update_counts(
     counts["false_positive"] += fp
     counts["false_negative"] += fn
     counts["correct"] += tp + tn
+
+
+def _update_diagnostic_state(
+    state: dict[str, Any],
+    *,
+    labels: np.ndarray,
+    predictions: np.ndarray,
+    boundary_distances_s: np.ndarray,
+    cut_labels: np.ndarray,
+    item: Mapping[str, Any],
+    buckets_s: tuple[float, ...],
+    near_boundary_s: float,
+) -> None:
+    label_values = (np.asarray(labels, dtype=np.float32).reshape(-1) > 0.5).astype(np.float32)
+    pred_values = (np.asarray(predictions, dtype=np.float32).reshape(-1) > 0.5).astype(np.float32)
+    distances = np.asarray(boundary_distances_s, dtype=np.float32).reshape(-1)
+    cut_values = (np.asarray(cut_labels, dtype=np.float32).reshape(-1) > 0.5).astype(np.float32)
+    frame_total = min(label_values.size, pred_values.size, distances.size, cut_values.size)
+    if frame_total <= 0:
+        return
+    label_values = label_values[:frame_total]
+    pred_values = pred_values[:frame_total]
+    distances = distances[:frame_total]
+    cut_values = cut_values[:frame_total]
+    _update_counts(state["overall"], labels=label_values, predictions=pred_values)
+
+    bucket_keys = np.asarray([_distance_bucket_key(float(value), buckets_s) for value in distances], dtype=object)
+    for bucket_key in sorted(set(str(value) for value in bucket_keys.tolist())):
+        mask = bucket_keys == bucket_key
+        if bool(mask.any()):
+            state["distance_buckets"].setdefault(str(bucket_key), _empty_counts())
+            _update_counts(
+                state["distance_buckets"][str(bucket_key)],
+                labels=label_values[mask],
+                predictions=pred_values[mask],
+            )
+
+    finite = np.isfinite(distances)
+    near_mask = finite & (distances <= float(near_boundary_s))
+    region_masks = {
+        "near_boundary": near_mask,
+        "far_from_boundary": finite & np.logical_not(near_mask),
+        "no_boundary": np.logical_not(finite),
+        "cut_target": cut_values > 0.5,
+        "non_cut_background": (cut_values <= 0.5) & (label_values <= 0.5),
+        "speech_far_from_boundary": (label_values > 0.5) & finite & np.logical_not(near_mask),
+        "background_far_from_boundary": (label_values <= 0.5)
+        & (cut_values <= 0.5)
+        & finite
+        & np.logical_not(near_mask),
+    }
+    for region, mask in region_masks.items():
+        if bool(mask.any()):
+            _update_counts(state["regions"][region], labels=label_values[mask], predictions=pred_values[mask])
+
+    row_counts = _empty_counts()
+    _update_counts(row_counts, labels=label_values, predictions=pred_values)
+    error_frames = int(row_counts["false_positive"] + row_counts["false_negative"])
+    if error_frames <= 0:
+        return
+    state["top_error_rows"].append(
+        {
+            "audio_id": str(item.get("audio_id") or ""),
+            "label_index": int(item.get("label_index") or 0),
+            "row_index": int(item.get("row_index") or 0),
+            "duration_s": float(item.get("duration_s") or 0.0),
+            "frames": int(row_counts["frames"]),
+            "speech_positive_frames": int(row_counts["positives"]),
+            "cut_positive_frames": int(cut_values.sum()),
+            "false_positive": int(row_counts["false_positive"]),
+            "false_negative": int(row_counts["false_negative"]),
+            "error_frames": error_frames,
+            "error_rate": error_frames / max(1, int(row_counts["frames"])),
+            "boundary_count": int(item.get("boundary_count") or 0),
+            "cut_drop_zone_count": int(item.get("cut_drop_zone_count") or 0),
+            "cut_point_segment_count": int(item.get("cut_point_segment_count") or 0),
+        }
+    )
+
+
+def _summarize_diagnostic_state(state: Mapping[str, Any]) -> dict[str, Any]:
+    overall = _metrics_from_counts(state.get("overall") or {}, threshold=0.0)
+    bucket_metrics = {
+        key: _metrics_from_counts(counts, threshold=0.0)
+        for key, counts in sorted(dict(state.get("distance_buckets") or {}).items())
+        if int(counts.get("frames") or 0) > 0
+    }
+    region_metrics = {
+        key: _metrics_from_counts(counts, threshold=0.0)
+        for key, counts in sorted(dict(state.get("regions") or {}).items())
+        if int(counts.get("frames") or 0) > 0
+    }
+    near_counts = dict((state.get("regions") or {}).get("near_boundary") or {})
+    overall_counts = dict(state.get("overall") or {})
+    fp_total = int(overall_counts.get("false_positive") or 0)
+    fn_total = int(overall_counts.get("false_negative") or 0)
+    top_error_rows = sorted(
+        list(state.get("top_error_rows") or []),
+        key=lambda row: (-int(row.get("error_frames") or 0), -float(row.get("error_rate") or 0.0)),
+    )[:20]
+    return {
+        "kind": str(state.get("kind") or ""),
+        "label": str(state.get("label") or ""),
+        "near_boundary_s": float(state.get("near_boundary_s") or 0.0),
+        "boundary_buckets_s": list(state.get("boundary_buckets_s") or []),
+        "overall": overall,
+        "distance_buckets": bucket_metrics,
+        "regions": region_metrics,
+        "near_boundary_error_share": {
+            "false_positive": int(near_counts.get("false_positive") or 0) / max(1, fp_total),
+            "false_negative": int(near_counts.get("false_negative") or 0) / max(1, fn_total),
+        },
+        "top_error_rows": top_error_rows,
+    }
 
 
 def _hysteresis_predictions(
@@ -314,6 +481,10 @@ def evaluate_thresholds(
     limit: int | None = None,
     batch_size: int = 8,
     runtime_profiles: Iterable[tuple[float, float, float]] | None = None,
+    diagnostic_thresholds: Iterable[float] | None = None,
+    diagnostic_runtime_profiles: Iterable[tuple[float, float, float]] | None = None,
+    diagnostic_boundary_buckets_s: Iterable[float] = (0.04, 0.08, 0.16, 0.32, 0.64),
+    diagnostic_near_boundary_s: float = 0.12,
 ) -> dict[str, Any]:
     records = load_label_records(labels)
     rows = _read_jsonl(feature_manifest)
@@ -340,6 +511,39 @@ def evaluate_thresholds(
         if on_threshold < off_threshold:
             raise ValueError("runtime profile speech on threshold must be >= speech off threshold")
     runtime_profile_counts = {profile: _empty_counts() for profile in profile_values}
+    diagnostic_threshold_values = sorted({round(float(value), 6) for value in (diagnostic_thresholds or [])})
+    diagnostic_profile_values = sorted(
+        {
+            (
+                round(float(on_threshold), 6),
+                round(float(off_threshold), 6),
+                round(float(cut_threshold), 6),
+            )
+            for on_threshold, off_threshold, cut_threshold in (diagnostic_runtime_profiles or [])
+        }
+    )
+    for on_threshold, off_threshold, _cut_threshold in diagnostic_profile_values:
+        if on_threshold < off_threshold:
+            raise ValueError("diagnostic runtime profile speech on threshold must be >= speech off threshold")
+    diagnostic_buckets = tuple(sorted({float(value) for value in diagnostic_boundary_buckets_s if float(value) >= 0.0}))
+    diagnostic_near_boundary_s = max(0.0, float(diagnostic_near_boundary_s))
+    diagnostic_states: dict[str, dict[str, Any]] = {}
+    for threshold in diagnostic_threshold_values:
+        key = f"threshold_{threshold:.6f}"
+        diagnostic_states[key] = _empty_diagnostic_state(
+            kind="threshold",
+            label=f"threshold={threshold:g}",
+            buckets_s=diagnostic_buckets,
+            near_boundary_s=diagnostic_near_boundary_s,
+        )
+    for on_threshold, off_threshold, cut_threshold in diagnostic_profile_values:
+        key = f"runtime_on{on_threshold:.6f}_off{off_threshold:.6f}_cut{cut_threshold:.6f}"
+        diagnostic_states[key] = _empty_diagnostic_state(
+            kind="runtime_profile",
+            label=f"on={on_threshold:g},off={off_threshold:g},cut={cut_threshold:g}",
+            buckets_s=diagnostic_buckets,
+            near_boundary_s=diagnostic_near_boundary_s,
+        )
     quality_counts: dict[str, dict[str, dict[float, dict[str, int]]]] = {}
     source_counts = Counter()
     label_quality_counts = Counter()
@@ -357,6 +561,7 @@ def evaluate_thresholds(
         cut_scores_array = np.asarray(cut_scores[:frame_total], dtype=np.float32)[mask]
         speech_labels = np.asarray(item["speech_labels"], dtype=np.float32)
         cut_labels = np.asarray(item["cut_labels"], dtype=np.float32)
+        boundary_distances_s = np.asarray(item["boundary_distances_s"], dtype=np.float32)
         quality = str(item["quality"])
         quality_counts.setdefault(
             quality,
@@ -399,6 +604,42 @@ def evaluate_thresholds(
                 labels=speech_labels,
                 predictions=profile_predictions,
             )
+        for threshold in diagnostic_threshold_values:
+            key = f"threshold_{threshold:.6f}"
+            speech_predictions = (speech_scores_array >= threshold).astype(np.float32)
+            _update_diagnostic_state(
+                diagnostic_states[key],
+                labels=speech_labels,
+                predictions=speech_predictions,
+                boundary_distances_s=boundary_distances_s,
+                cut_labels=cut_labels,
+                item=item,
+                buckets_s=diagnostic_buckets,
+                near_boundary_s=diagnostic_near_boundary_s,
+            )
+        for profile in diagnostic_profile_values:
+            on_threshold, off_threshold, cut_threshold = profile
+            key = f"runtime_on{on_threshold:.6f}_off{off_threshold:.6f}_cut{cut_threshold:.6f}"
+            gated_scores = _apply_cut_gate(
+                speech_scores_array,
+                cut_scores_array,
+                cut_threshold=cut_threshold,
+            )
+            profile_predictions = _hysteresis_predictions(
+                gated_scores,
+                on_threshold=on_threshold,
+                off_threshold=off_threshold,
+            )
+            _update_diagnostic_state(
+                diagnostic_states[key],
+                labels=speech_labels,
+                predictions=profile_predictions,
+                boundary_distances_s=boundary_distances_s,
+                cut_labels=cut_labels,
+                item=item,
+                buckets_s=diagnostic_buckets,
+                near_boundary_s=diagnostic_near_boundary_s,
+            )
 
     indexed_rows = sorted(enumerate(rows), key=lambda item: (_row_frame_count(item[1]), item[0]))
     for batch_start in range(0, len(indexed_rows), batch_size):
@@ -424,19 +665,31 @@ def evaluate_thresholds(
                     cut_min_gap_s=cut_min_gap_s,
                     cut_boundary_radius_frames=cut_boundary_radius_frames,
                 )
+                metadata = dict(record.boundary_metadata or {})
+                speech_label_array = np.asarray(record.speech_frames[:frame_total], dtype=np.float32)
+                boundary_distances_s = _speech_boundary_distances_s(
+                    speech_label_array,
+                    frame_hop_s=float(record.frame_hop_s),
+                )[mask]
                 batch_items.append(
                     {
                         "row_index": row_index,
                         "label_index": label_index,
+                        "audio_id": record.audio_id,
+                        "duration_s": float(record.duration_s),
                         "features": _normalized_features(bundle, ptm=ptm, mfcc=mfcc, frame_total=frame_total),
                         "frame_total": frame_total,
                         "mask": mask,
-                        "speech_labels": np.asarray(record.speech_frames[:frame_total], dtype=np.float32)[mask],
+                        "speech_labels": speech_label_array[mask],
                         "cut_labels": np.maximum(cut_drops[:frame_total], cut_points[:frame_total]).astype(np.float32)[
                             mask
                         ],
+                        "boundary_distances_s": boundary_distances_s,
                         "quality": str(record.label_quality or row.get("label_quality") or ""),
                         "source": str(record.source),
+                        "boundary_count": len(list(metadata.get("utterance_boundaries") or [])),
+                        "cut_drop_zone_count": len(list(metadata.get("cut_drop_zones") or [])),
+                        "cut_point_segment_count": len(list(metadata.get("cut_point_segments") or [])),
                     }
                 )
             except Exception as exc:  # pragma: no cover - exercised by real corrupt manifests
@@ -535,6 +788,10 @@ def evaluate_thresholds(
             "selected": {},
         },
     }
+    speech_error_diagnostics = {
+        key: _summarize_diagnostic_state(state)
+        for key, state in sorted(diagnostic_states.items())
+    }
     output_dir.mkdir(parents=True, exist_ok=True)
     summary = {
         "schema": "speech_boundary_ja_mamba2_frame_boundary_scorer_threshold_eval_v3",
@@ -555,6 +812,7 @@ def evaluate_thresholds(
         "speech_metrics": speech_metrics,
         "cut_metrics": cut_metrics,
         "runtime_profile_metrics": runtime_profile_metrics,
+        "speech_error_diagnostics": speech_error_diagnostics,
         "by_label_quality": by_quality,
         "recommendation": recommendation,
         "cut_target_policy": {
@@ -580,6 +838,11 @@ def evaluate_thresholds(
         for row in runtime_profile_metrics:
             payload = {"head": "runtime_profile", **row}
             handle.write(json.dumps(payload, ensure_ascii=False, sort_keys=True) + "\n")
+    if speech_error_diagnostics:
+        with (output_dir / "speech_error_diagnostics.jsonl").open("w", encoding="utf-8") as handle:
+            for key, row in speech_error_diagnostics.items():
+                payload = {"diagnostic_id": key, **row}
+                handle.write(json.dumps(payload, ensure_ascii=False, sort_keys=True) + "\n")
     (output_dir / "summary.md").write_text(render_markdown(summary), encoding="utf-8")
     return summary
 
@@ -674,6 +937,55 @@ def render_markdown(summary: Mapping[str, Any]) -> str:
                     **row
                 )
             )
+    if summary.get("speech_error_diagnostics"):
+        lines.extend(["", "## Speech Error Diagnostics", ""])
+        for diagnostic_id, diagnostic in sorted(dict(summary.get("speech_error_diagnostics") or {}).items()):
+            overall = dict(diagnostic.get("overall") or {})
+            near_share = dict(diagnostic.get("near_boundary_error_share") or {})
+            lines.extend(
+                [
+                    f"### {diagnostic.get('label') or diagnostic_id}",
+                    "",
+                    f"- Overall recall: `{float(overall.get('recall', 0.0)):.6f}`",
+                    f"- Overall FPR: `{float(overall.get('false_positive_rate', 0.0)):.6f}`",
+                    f"- FP near-boundary share: `{float(near_share.get('false_positive', 0.0)):.6f}`",
+                    f"- FN near-boundary share: `{float(near_share.get('false_negative', 0.0)):.6f}`",
+                    "",
+                    "| distance bucket | frames | fp | fn | recall | fpr |",
+                    "| --- | ---: | ---: | ---: | ---: | ---: |",
+                ]
+            )
+            for bucket, row in sorted(dict(diagnostic.get("distance_buckets") or {}).items()):
+                lines.append(
+                    "| {bucket} | {frames} | {false_positive} | {false_negative} | {recall:.6f} | {false_positive_rate:.6f} |".format(
+                        bucket=bucket,
+                        **row,
+                    )
+                )
+            lines.extend(["", "| region | frames | fp | fn | recall | fpr |", "| --- | ---: | ---: | ---: | ---: | ---: |"])
+            for region, row in sorted(dict(diagnostic.get("regions") or {}).items()):
+                lines.append(
+                    "| {region} | {frames} | {false_positive} | {false_negative} | {recall:.6f} | {false_positive_rate:.6f} |".format(
+                        region=region,
+                        **row,
+                    )
+                )
+            top_rows = list(diagnostic.get("top_error_rows") or [])[:10]
+            if top_rows:
+                lines.extend(
+                    [
+                        "",
+                        "| top error audio_id | fp | fn | error_rate | boundary_count | cut_drop | cut_point |",
+                        "| --- | ---: | ---: | ---: | ---: | ---: | ---: |",
+                    ]
+                )
+                for row in top_rows:
+                    lines.append(
+                        "| {audio_id} | {false_positive} | {false_negative} | {error_rate:.6f} | {boundary_count} | {cut_drop_zone_count} | {cut_point_segment_count} |".format(
+                            **row
+                        )
+                    )
+            lines.append("")
     lines.extend(
         [
             "",
@@ -728,6 +1040,28 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=[],
         help="Evaluate a runtime profile as speech_on,speech_off,cut after cut gate and hysteresis.",
     )
+    parser.add_argument(
+        "--diagnostic-threshold",
+        action="append",
+        type=float,
+        default=[],
+        help="Add speech error diagnostics for a simple speech probability threshold.",
+    )
+    parser.add_argument(
+        "--diagnostic-runtime-profile",
+        action="append",
+        type=_parse_runtime_profile,
+        default=[],
+        help="Add speech error diagnostics for a runtime profile as speech_on,speech_off,cut.",
+    )
+    parser.add_argument(
+        "--diagnostic-boundary-bucket-s",
+        action="append",
+        type=float,
+        default=[],
+        help="Boundary-distance bucket upper bound in seconds. Repeat to override defaults.",
+    )
+    parser.add_argument("--diagnostic-near-boundary-s", type=float, default=0.12)
     args = parser.parse_args(argv)
     if not 0.0 <= args.min_speech_recall <= 1.0:
         parser.error("--min-speech-recall must be in [0, 1]")
@@ -745,6 +1079,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         parser.error("--limit must be positive when set")
     if args.batch_size <= 0:
         parser.error("--batch-size must be positive")
+    for threshold in args.diagnostic_threshold:
+        if not 0.0 <= threshold <= 1.0:
+            parser.error("--diagnostic-threshold must be in [0, 1]")
+    for bucket in args.diagnostic_boundary_bucket_s:
+        if bucket < 0.0:
+            parser.error("--diagnostic-boundary-bucket-s must be non-negative")
+    if args.diagnostic_near_boundary_s < 0.0:
+        parser.error("--diagnostic-near-boundary-s must be non-negative")
     return args
 
 
@@ -766,6 +1108,14 @@ def run(args: argparse.Namespace) -> None:
         limit=args.limit,
         batch_size=args.batch_size,
         runtime_profiles=args.runtime_profile,
+        diagnostic_thresholds=args.diagnostic_threshold,
+        diagnostic_runtime_profiles=args.diagnostic_runtime_profile,
+        diagnostic_boundary_buckets_s=(
+            args.diagnostic_boundary_bucket_s
+            if args.diagnostic_boundary_bucket_s
+            else (0.04, 0.08, 0.16, 0.32, 0.64)
+        ),
+        diagnostic_near_boundary_s=args.diagnostic_near_boundary_s,
     )
     speech_selected = summary["recommendation"]["speech"].get("selected") or {}
     cut_selected = summary["recommendation"]["cut"].get("selected") or {}

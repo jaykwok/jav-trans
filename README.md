@@ -16,7 +16,7 @@ JAVTrans 是一个本地字幕生成工具，面向 Windows + NVIDIA 显卡，�
 - SpeechBoundary-JA 支持实验性的 Mamba2 frame boundary scorer v3 checkpoint，但默认不启用。只有显式设置 `SPEECH_BOUNDARY_JA_SCORER_CHECKPOINT` 时才会用 learned scorer 替代 bootstrap frame scores；v3 scorer 输出 `speech_prob / cut_prob`，运行时支持 `speech_on/speech_off` 双阈值 hysteresis 和 cut gate；正式分发默认仍是 `qwen-feature-energy-bootstrap-v1`。
 - 默认 Boundary Refiner：随源码提供 learned `transformers.Mamba2Model` 小 checkpoint，文件为 `src/boundary/checkpoints/boundary_refiner.pt`。当前默认是 true v5 delta-only 32768 hardmix checkpoint；v5 协议只输出 `start_delta / end_delta`，不再保留 merge score、merge label、merge threshold、runtime disable 开关或 backbone override。
 - 默认 CueQC：`src/asr/checkpoints/cueqc_mamba_v3_fusion.pt`，在 ASR 后输出二元 `keep/drop`。当前默认 checkpoint 是 Stage 2b 自训练后版本，基础丢弃阈值 `0.85`，`short_text` 桶自适应提升到 `0.87`；模型缺失或推理异常时保守 `keep`。
-- 当前研究方向：CueQC 已替代旧规则 ASR QC。后续优先做 Mamba2 frame boundary scorer v3 的 匿名样片 A opt-in 对比人工审计、更多全片人工抽检和离线 Boundary 反哺数据整理。
+- 当前研究方向：CueQC 已替代旧规则 ASR QC。SpeechBoundary-JA Mamba2 frame boundary scorer v3 仍处于 opt-in 研究阶段，优先做 negative-rich synthetic 数据、boundary-aware / segment-level 评估和人工观感 gate；通过前不替换默认 scorer。
 - 默认显存目标：单阶段峰值适配 6GB 级 NVIDIA 显卡。8GB 本机可提高 `.env` 中的 ASR batch size；更小显存则手动降低。
 - 当前字幕策略：Boundary Refiner 输出的 speech-core chunk 就是字幕初始时间轴；字幕层只做 2-frame gap、显示时长和读速控制，不再运行相邻 cue 合并策略。
 
@@ -320,4 +320,4 @@ uv run python -m tools.web.smoke.summarize_job --job-id <job_id> --run-dir agent
 - `tools.boundary.ja.build_galgame_synthetic_timeline`：按 v5-style 随机时间线生成带 `speech_frames`、`cut_point_segments` 和 `cut_drop_zones` 的 SpeechBoundary-JA synthetic labels。
 - `tools.boundary.ja.prepare_frame_boundary_scorer_v3`：校验 synthetic true-structure labels 并输出 feature-cache、train、threshold-eval 三个 PowerShell 脚本；不会直接训练或替换默认 runtime。
 - `tools.boundary.ja.train_feature_scorer`：从已缓存的 Qwen PTM + MFCC feature manifest 训练 runtime-loadable SpeechBoundary-JA Mamba2 speech+cut frame boundary scorer v3；checkpoint 只通过 `SPEECH_BOUNDARY_JA_SCORER_CHECKPOINT` opt-in 使用，完整 smoke 和人工审计通过前不替换默认 runtime。
-- `tools.boundary.ja.evaluate_feature_scorer_thresholds`：离线读取 Mamba2 frame boundary scorer v3 checkpoint 和缓存特征，分别扫描 speech / cut threshold；只用于候选评估，不替换默认 runtime。
+- `tools.boundary.ja.evaluate_feature_scorer_thresholds`：离线读取 Mamba2 frame boundary scorer v3 checkpoint 和缓存特征，分别扫描 speech / cut threshold，并可输出 speech error boundary-distance diagnostics；只用于候选评估，不替换默认 runtime。

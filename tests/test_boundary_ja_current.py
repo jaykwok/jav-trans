@@ -490,6 +490,73 @@ def test_feature_frame_scorer_threshold_eval_writes_summary(tmp_path):
     assert '"head": "runtime_profile"' in (tmp_path / "eval" / "threshold_metrics.jsonl").read_text(encoding="utf-8")
 
 
+def test_feature_frame_scorer_threshold_eval_can_diagnose_speech_errors(tmp_path):
+    torch = pytest.importorskip("torch")
+    model, model_config = _build_mamba2_scorer(ptm_dim=3, mfcc_dim=2)
+    checkpoint_path = tmp_path / "feature_scorer.pt"
+    torch.save(
+        build_feature_frame_scorer_checkpoint(
+            model=model,
+            model_config=model_config,
+            normalization={"feature_mean": [0.0] * 5, "feature_std": [1.0] * 5},
+            metadata={"operating_point": "unit"},
+        ),
+        checkpoint_path,
+    )
+    labels_path = tmp_path / "labels.jsonl"
+    record = build_supervised_record(
+        audio_id="clip",
+        source="unit",
+        duration_s=0.6,
+        speech_segments=[{"start": 0.2, "end": 0.4}],
+        frame_hop_s=0.1,
+    )
+    write_jsonl(labels_path, [record])
+    feature_path = tmp_path / "clip.npz"
+    np.savez(
+        feature_path,
+        ptm=np.ones((6, 3), dtype=np.float32),
+        mfcc=np.ones((6, 2), dtype=np.float32),
+    )
+    manifest_path = tmp_path / "feature_manifest.jsonl"
+    manifest_path.write_text(
+        json.dumps(
+            {
+                "label_index": 0,
+                "feature_path": str(feature_path),
+                "frame_count": 6,
+                "ptm_dim": 3,
+                "mfcc_dim": 2,
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    summary = evaluate_thresholds(
+        checkpoint=checkpoint_path,
+        labels=labels_path,
+        feature_manifest=manifest_path,
+        output_dir=tmp_path / "eval",
+        thresholds=[0.5],
+        device="cpu",
+        diagnostic_thresholds=[1.0],
+        diagnostic_boundary_buckets_s=[0.05, 0.15],
+        diagnostic_near_boundary_s=0.15,
+    )
+
+    diagnostics = summary["speech_error_diagnostics"]
+    assert "threshold_1.000000" in diagnostics
+    diagnostic = diagnostics["threshold_1.000000"]
+    assert diagnostic["overall"]["false_negative"] >= 1
+    assert diagnostic["distance_buckets"]
+    assert diagnostic["regions"]["near_boundary"]["frames"] >= 1
+    assert diagnostic["top_error_rows"][0]["audio_id"] == "clip"
+    assert (tmp_path / "eval" / "speech_error_diagnostics.jsonl").exists()
+
+
 def test_backend_scorer_is_opt_in_and_keeps_segment_contract(tmp_path, monkeypatch):
     torch = pytest.importorskip("torch")
     model, model_config = _build_mamba2_scorer(ptm_dim=4, mfcc_dim=2)
