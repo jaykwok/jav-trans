@@ -105,6 +105,42 @@ def _distance_bucket_key(distance_s: float, buckets_s: tuple[float, ...]) -> str
     return f"gt_{float(buckets_s[-1]):.3f}s" if buckets_s else "all_boundary_distance"
 
 
+def _binary_runs(values: np.ndarray) -> list[tuple[int, int]]:
+    flags = np.asarray(values, dtype=np.float32).reshape(-1) > 0.5
+    runs: list[tuple[int, int]] = []
+    start: int | None = None
+    for index, flag in enumerate(flags.tolist() + [False]):
+        if flag and start is None:
+            start = index
+        elif not flag and start is not None:
+            runs.append((start, index))
+            start = None
+    return runs
+
+
+def _overlap_frames(left: tuple[int, int], right: tuple[int, int]) -> int:
+    start = max(int(left[0]), int(right[0]))
+    end = min(int(left[1]), int(right[1]))
+    return max(0, end - start)
+
+
+def _empty_island_counts() -> dict[str, float | int]:
+    return {
+        "label_islands": 0,
+        "detected_label_islands": 0,
+        "missed_label_islands": 0,
+        "label_island_coverage_sum": 0.0,
+        "predicted_islands": 0,
+        "matched_predicted_islands": 0,
+        "false_predicted_islands": 0,
+        "predicted_island_overlap_sum": 0.0,
+        "cut_drop_zones": 0,
+        "clean_cut_drop_zones": 0,
+        "dirty_cut_drop_zones": 0,
+        "cut_drop_zone_predicted_ratio_sum": 0.0,
+    }
+
+
 def _empty_diagnostic_state(
     *,
     kind: str,
@@ -132,6 +168,7 @@ def _empty_diagnostic_state(
             "speech_far_from_boundary": _empty_counts(),
             "background_far_from_boundary": _empty_counts(),
         },
+        "islands": _empty_island_counts(),
         "top_error_rows": [],
     }
 
@@ -166,6 +203,7 @@ def _update_diagnostic_state(
     predictions: np.ndarray,
     boundary_distances_s: np.ndarray,
     cut_labels: np.ndarray,
+    cut_drop_labels: np.ndarray,
     item: Mapping[str, Any],
     buckets_s: tuple[float, ...],
     near_boundary_s: float,
@@ -174,13 +212,15 @@ def _update_diagnostic_state(
     pred_values = (np.asarray(predictions, dtype=np.float32).reshape(-1) > 0.5).astype(np.float32)
     distances = np.asarray(boundary_distances_s, dtype=np.float32).reshape(-1)
     cut_values = (np.asarray(cut_labels, dtype=np.float32).reshape(-1) > 0.5).astype(np.float32)
-    frame_total = min(label_values.size, pred_values.size, distances.size, cut_values.size)
+    cut_drop_values = (np.asarray(cut_drop_labels, dtype=np.float32).reshape(-1) > 0.5).astype(np.float32)
+    frame_total = min(label_values.size, pred_values.size, distances.size, cut_values.size, cut_drop_values.size)
     if frame_total <= 0:
         return
     label_values = label_values[:frame_total]
     pred_values = pred_values[:frame_total]
     distances = distances[:frame_total]
     cut_values = cut_values[:frame_total]
+    cut_drop_values = cut_drop_values[:frame_total]
     _update_counts(state["overall"], labels=label_values, predictions=pred_values)
 
     bucket_keys = np.asarray([_distance_bucket_key(float(value), buckets_s) for value in distances], dtype=object)
@@ -211,6 +251,12 @@ def _update_diagnostic_state(
     for region, mask in region_masks.items():
         if bool(mask.any()):
             _update_counts(state["regions"][region], labels=label_values[mask], predictions=pred_values[mask])
+    _update_island_counts(
+        state["islands"],
+        labels=label_values,
+        predictions=pred_values,
+        cut_drop_labels=cut_drop_values,
+    )
 
     row_counts = _empty_counts()
     _update_counts(row_counts, labels=label_values, predictions=pred_values)
@@ -226,6 +272,7 @@ def _update_diagnostic_state(
             "frames": int(row_counts["frames"]),
             "speech_positive_frames": int(row_counts["positives"]),
             "cut_positive_frames": int(cut_values.sum()),
+            "cut_drop_frames": int(cut_drop_values.sum()),
             "false_positive": int(row_counts["false_positive"]),
             "false_negative": int(row_counts["false_negative"]),
             "error_frames": error_frames,
@@ -235,6 +282,55 @@ def _update_diagnostic_state(
             "cut_point_segment_count": int(item.get("cut_point_segment_count") or 0),
         }
     )
+
+
+def _update_island_counts(
+    counts: dict[str, float | int],
+    *,
+    labels: np.ndarray,
+    predictions: np.ndarray,
+    cut_drop_labels: np.ndarray,
+    min_overlap_ratio: float = 0.5,
+    clean_cut_drop_predicted_ratio: float = 0.10,
+) -> None:
+    label_runs = _binary_runs(labels)
+    predicted_runs = _binary_runs(predictions)
+    cut_drop_runs = _binary_runs(cut_drop_labels)
+    counts["label_islands"] = int(counts["label_islands"]) + len(label_runs)
+    counts["predicted_islands"] = int(counts["predicted_islands"]) + len(predicted_runs)
+    counts["cut_drop_zones"] = int(counts["cut_drop_zones"]) + len(cut_drop_runs)
+
+    for label_run in label_runs:
+        length = max(1, int(label_run[1] - label_run[0]))
+        best_overlap = max((_overlap_frames(label_run, pred_run) for pred_run in predicted_runs), default=0)
+        coverage = best_overlap / length
+        counts["label_island_coverage_sum"] = float(counts["label_island_coverage_sum"]) + coverage
+        if coverage >= float(min_overlap_ratio):
+            counts["detected_label_islands"] = int(counts["detected_label_islands"]) + 1
+        else:
+            counts["missed_label_islands"] = int(counts["missed_label_islands"]) + 1
+
+    for pred_run in predicted_runs:
+        length = max(1, int(pred_run[1] - pred_run[0]))
+        best_overlap = max((_overlap_frames(pred_run, label_run) for label_run in label_runs), default=0)
+        overlap_ratio = best_overlap / length
+        counts["predicted_island_overlap_sum"] = float(counts["predicted_island_overlap_sum"]) + overlap_ratio
+        if overlap_ratio >= float(min_overlap_ratio):
+            counts["matched_predicted_islands"] = int(counts["matched_predicted_islands"]) + 1
+        else:
+            counts["false_predicted_islands"] = int(counts["false_predicted_islands"]) + 1
+
+    predicted_bool = np.asarray(predictions, dtype=np.float32).reshape(-1) > 0.5
+    for drop_run in cut_drop_runs:
+        length = max(1, int(drop_run[1] - drop_run[0]))
+        predicted_ratio = float(predicted_bool[drop_run[0] : drop_run[1]].sum()) / length
+        counts["cut_drop_zone_predicted_ratio_sum"] = (
+            float(counts["cut_drop_zone_predicted_ratio_sum"]) + predicted_ratio
+        )
+        if predicted_ratio <= float(clean_cut_drop_predicted_ratio):
+            counts["clean_cut_drop_zones"] = int(counts["clean_cut_drop_zones"]) + 1
+        else:
+            counts["dirty_cut_drop_zones"] = int(counts["dirty_cut_drop_zones"]) + 1
 
 
 def _summarize_diagnostic_state(state: Mapping[str, Any]) -> dict[str, Any]:
@@ -257,6 +353,26 @@ def _summarize_diagnostic_state(state: Mapping[str, Any]) -> dict[str, Any]:
         list(state.get("top_error_rows") or []),
         key=lambda row: (-int(row.get("error_frames") or 0), -float(row.get("error_rate") or 0.0)),
     )[:20]
+    island_counts = dict(state.get("islands") or {})
+    label_islands = int(island_counts.get("label_islands") or 0)
+    predicted_islands = int(island_counts.get("predicted_islands") or 0)
+    cut_drop_zones = int(island_counts.get("cut_drop_zones") or 0)
+    island_metrics = {
+        **island_counts,
+        "speech_island_recall": int(island_counts.get("detected_label_islands") or 0) / max(1, label_islands),
+        "predicted_island_precision": int(island_counts.get("matched_predicted_islands") or 0)
+        / max(1, predicted_islands),
+        "mean_label_island_coverage": float(island_counts.get("label_island_coverage_sum") or 0.0)
+        / max(1, label_islands),
+        "mean_predicted_island_overlap": float(island_counts.get("predicted_island_overlap_sum") or 0.0)
+        / max(1, predicted_islands),
+        "cut_drop_zone_clean_rate": int(island_counts.get("clean_cut_drop_zones") or 0)
+        / max(1, cut_drop_zones),
+        "mean_cut_drop_zone_predicted_ratio": float(
+            island_counts.get("cut_drop_zone_predicted_ratio_sum") or 0.0
+        )
+        / max(1, cut_drop_zones),
+    }
     return {
         "kind": str(state.get("kind") or ""),
         "label": str(state.get("label") or ""),
@@ -265,6 +381,7 @@ def _summarize_diagnostic_state(state: Mapping[str, Any]) -> dict[str, Any]:
         "overall": overall,
         "distance_buckets": bucket_metrics,
         "regions": region_metrics,
+        "islands": island_metrics,
         "near_boundary_error_share": {
             "false_positive": int(near_counts.get("false_positive") or 0) / max(1, fp_total),
             "false_negative": int(near_counts.get("false_negative") or 0) / max(1, fn_total),
@@ -561,6 +678,7 @@ def evaluate_thresholds(
         cut_scores_array = np.asarray(cut_scores[:frame_total], dtype=np.float32)[mask]
         speech_labels = np.asarray(item["speech_labels"], dtype=np.float32)
         cut_labels = np.asarray(item["cut_labels"], dtype=np.float32)
+        cut_drop_labels = np.asarray(item["cut_drop_labels"], dtype=np.float32)
         boundary_distances_s = np.asarray(item["boundary_distances_s"], dtype=np.float32)
         quality = str(item["quality"])
         quality_counts.setdefault(
@@ -613,6 +731,7 @@ def evaluate_thresholds(
                 predictions=speech_predictions,
                 boundary_distances_s=boundary_distances_s,
                 cut_labels=cut_labels,
+                cut_drop_labels=cut_drop_labels,
                 item=item,
                 buckets_s=diagnostic_buckets,
                 near_boundary_s=diagnostic_near_boundary_s,
@@ -636,6 +755,7 @@ def evaluate_thresholds(
                 predictions=profile_predictions,
                 boundary_distances_s=boundary_distances_s,
                 cut_labels=cut_labels,
+                cut_drop_labels=cut_drop_labels,
                 item=item,
                 buckets_s=diagnostic_buckets,
                 near_boundary_s=diagnostic_near_boundary_s,
@@ -684,6 +804,7 @@ def evaluate_thresholds(
                         "cut_labels": np.maximum(cut_drops[:frame_total], cut_points[:frame_total]).astype(np.float32)[
                             mask
                         ],
+                        "cut_drop_labels": cut_drops[:frame_total].astype(np.float32)[mask],
                         "boundary_distances_s": boundary_distances_s,
                         "quality": str(record.label_quality or row.get("label_quality") or ""),
                         "source": str(record.source),
@@ -969,6 +1090,24 @@ def render_markdown(summary: Mapping[str, Any]) -> str:
                         region=region,
                         **row,
                     )
+                )
+            islands = dict(diagnostic.get("islands") or {})
+            if islands:
+                lines.extend(
+                    [
+                        "",
+                        "| island metric | value |",
+                        "| --- | ---: |",
+                        f"| label_islands | {int(islands.get('label_islands') or 0)} |",
+                        f"| speech_island_recall | {float(islands.get('speech_island_recall') or 0.0):.6f} |",
+                        f"| mean_label_island_coverage | {float(islands.get('mean_label_island_coverage') or 0.0):.6f} |",
+                        f"| predicted_islands | {int(islands.get('predicted_islands') or 0)} |",
+                        f"| predicted_island_precision | {float(islands.get('predicted_island_precision') or 0.0):.6f} |",
+                        f"| mean_predicted_island_overlap | {float(islands.get('mean_predicted_island_overlap') or 0.0):.6f} |",
+                        f"| cut_drop_zones | {int(islands.get('cut_drop_zones') or 0)} |",
+                        f"| cut_drop_zone_clean_rate | {float(islands.get('cut_drop_zone_clean_rate') or 0.0):.6f} |",
+                        f"| mean_cut_drop_zone_predicted_ratio | {float(islands.get('mean_cut_drop_zone_predicted_ratio') or 0.0):.6f} |",
+                    ]
                 )
             top_rows = list(diagnostic.get("top_error_rows") or [])[:10]
             if top_rows:

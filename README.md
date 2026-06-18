@@ -320,4 +320,4 @@ uv run python -m tools.web.smoke.summarize_job --job-id <job_id> --run-dir agent
 - `tools.boundary.ja.build_galgame_synthetic_timeline`：按 v5-style 随机时间线生成带 `speech_frames`、`cut_point_segments` 和 `cut_drop_zones` 的 SpeechBoundary-JA synthetic labels。
 - `tools.boundary.ja.prepare_frame_boundary_scorer_v3`：校验 synthetic true-structure labels 并输出 feature-cache、train、threshold-eval 三个 PowerShell 脚本；不会直接训练或替换默认 runtime。
 - `tools.boundary.ja.train_feature_scorer`：从已缓存的 Qwen PTM + MFCC feature manifest 训练 runtime-loadable SpeechBoundary-JA Mamba2 speech+cut frame boundary scorer v3；checkpoint 只通过 `SPEECH_BOUNDARY_JA_SCORER_CHECKPOINT` opt-in 使用，完整 smoke 和人工审计通过前不替换默认 runtime。
-- `tools.boundary.ja.evaluate_feature_scorer_thresholds`：离线读取 Mamba2 frame boundary scorer v3 checkpoint 和缓存特征，分别扫描 speech / cut threshold，并可输出 speech error boundary-distance diagnostics；只用于候选评估，不替换默认 runtime。
+- `tools.boundary.ja.evaluate_feature_scorer_thresholds`：离线读取 Mamba2 frame boundary scorer v3 checkpoint 和缓存特征，分别扫描 speech / cut threshold，并可输出 speech error boundary-distance 与 island-level diagnostics；只用于候选评估，不替换默认 runtime。
