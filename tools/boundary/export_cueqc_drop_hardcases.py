@@ -17,7 +17,7 @@ if str(PROJECT_ROOT) not in sys.path:
 
 
 LABEL_SCHEMA = "cueqc_false_drop_audit_label_v1"
-CANDIDATE_SCHEMA = "boundary_hardcase_candidate_from_cueqc_v1"
+CANDIDATE_SCHEMA = "speech_boundary_hard_negative_candidate_from_cueqc_v1"
 SAFETY_SCHEMA = "cueqc_drop_safety_holdout_v1"
 SUMMARY_SCHEMA = "cueqc_drop_hardcase_export_summary_v1"
 
@@ -25,7 +25,6 @@ CONFIRMED_DROP = "drop_ok"
 SAFETY_DECISIONS = {"false_drop_keep", "uncertain"}
 
 FRAME_NEGATIVE_ROUTE = "speech_boundary_frame_negative_candidate"
-PREFERENCE_ROUTE = "boundary_preference_candidate"
 
 PUNCT_OR_NONLEXICAL_RE = re.compile(
     r"^[\s\u3000、。！？!?.,，．…・「」『』（）()【】\[\]~〜ー"
@@ -173,31 +172,10 @@ def duration_bucket(duration_s: float) -> str:
 
 
 def route_confirmed_drop(*, tags: Sequence[str], duration_s: float, text: str) -> tuple[str, str]:
-    tag_set = set(tags)
-    lexical_or_mixed = bool(tag_set & {"dialogue", "overlap"})
-    if lexical_or_mixed:
-        return (
-            PREFERENCE_ROUTE,
-            "confirmed drop contains dialogue/overlap tag; needs boundary preference target before training",
-        )
-    if duration_s >= 2.0:
-        return (
-            PREFERENCE_ROUTE,
-            "confirmed drop is long enough to need neighbor/boundary context before training",
-        )
-    if tag_set & {"environment", "breath", "short_fragment", "vocalization"}:
-        return (
-            FRAME_NEGATIVE_ROUTE,
-            "confirmed short non-lexical/noise drop; candidate for SpeechBoundary-JA frame-negative conversion",
-        )
-    if is_nonlexical_text(text):
-        return (
-            FRAME_NEGATIVE_ROUTE,
-            "confirmed short non-lexical drop without explicit tag; candidate for frame-negative conversion",
-        )
+    del tags, duration_s, text
     return (
-        PREFERENCE_ROUTE,
-        "confirmed drop has possible lexical signal; keep as boundary hard-case candidate",
+        FRAME_NEGATIVE_ROUTE,
+        "manual drop_ok is direct discard supervision; category tags are metadata only",
     )
 
 
@@ -267,12 +245,8 @@ def build_candidate(
         "display_prob_keep_mean": round(sum(probs_keep) / len(probs_keep), 6) if probs_keep else 0.0,
         "candidate_route": route,
         "route_reason": route_reason,
-        "v51_status": "candidate_only_not_direct_delta_label",
-        "required_conversion": (
-            "convert to SpeechBoundary-JA frame-negative labels"
-            if route == FRAME_NEGATIVE_ROUTE
-            else "convert to Boundary preference or start/end delta targets"
-        ),
+        "hard_negative_status": "candidate_requires_audio_materialization",
+        "required_conversion": "convert to SpeechBoundary-JA frame-negative labels",
     }
 
 
@@ -370,13 +344,12 @@ def summarize_candidates(
         "candidate_reason_tag_counts": dict(reason_counts),
         "candidate_video_counts": dict(video_counts),
         "candidate_duration_bucket_counts": dict(duration_counts),
-        "v51_boundary": {
-            "direct_training_dataset_emitted": False,
-            "direct_schema": None,
-            "reason": "CueQC drop_ok is chunk-level display routing, not Boundary v5.1 start/end delta supervision.",
+        "speech_boundary_hard_negative": {
+            "frame_negative_labels_emitted": False,
+            "direct_boundary_refiner_dataset_emitted": False,
+            "reason": "Manual CueQC drop_ok means direct discard and is routed only as SpeechBoundary-JA frame-level hard negative.",
             "next_conversion": [
-                "frame-negative candidates need audio/frame materialization before SpeechBoundary-JA finetune",
-                "boundary preference candidates need neighbor context and A/B or delta targets before Boundary Refiner v5.1 training",
+                "frame-negative candidates need audio/frame materialization before later SpeechBoundary-JA replay",
             ],
         },
     }
@@ -411,11 +384,11 @@ def render_markdown(summary: Mapping[str, Any]) -> str:
     lines.extend(
         [
             "",
-            "## Boundary v5.1 Status",
+            "## SpeechBoundary Hard-Negative Status",
             "",
             "- This export is a candidate manifest only.",
-            "- It does not emit `boundary_refiner_frame_sequence_dataset_v5`.",
-            "- Confirmed CueQC drops must be converted into frame-negative labels or boundary preference/delta targets before v5.1 training.",
+            "- It does not emit Boundary Refiner training labels.",
+            "- Confirmed CueQC drops are direct discard supervision and must be converted into SpeechBoundary-JA frame-negative labels.",
             "",
         ]
     )
@@ -497,8 +470,8 @@ def export_cueqc_drop_hardcases(
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Export confirmed CueQC drop_ok audit labels as Boundary/SpeechBoundary hard-case "
-            "candidates. This does not create a direct Boundary v5.1 training dataset."
+            "Export confirmed CueQC drop_ok audit labels as SpeechBoundary-JA hard-negative "
+            "candidates. This does not create Boundary Refiner training labels."
         )
     )
     parser.add_argument(
@@ -513,7 +486,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--output-dir",
         default="",
-        help="Defaults to agents/temp/YYYYMMDD_HHMMSS_boundary-hardcase-candidates-from-cueqc.",
+        help="Defaults to agents/temp/YYYYMMDD_HHMMSS_speech-boundary-hard-negative-candidates-from-cueqc.",
     )
     parser.add_argument(
         "--allow-empty",
@@ -536,7 +509,7 @@ def main(argv: list[str] | None = None) -> int:
         else PROJECT_ROOT
         / "agents"
         / "temp"
-        / f"{local_timestamp()}_boundary-hardcase-candidates-from-cueqc"
+        / f"{local_timestamp()}_speech-boundary-hard-negative-candidates-from-cueqc"
     )
     summary = export_cueqc_drop_hardcases(
         label_paths=label_paths,

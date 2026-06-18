@@ -20,7 +20,7 @@ if str(SRC_ROOT) not in sys.path:
 from boundary.ja import build_training_examples, load_label_records, load_manifest_audio_map, write_jsonl  # noqa: E402
 
 
-SUMMARY_SCHEMA = "speech_boundary_hard_negative_finetune_prep_v1"
+SUMMARY_SCHEMA = "speech_boundary_hard_negative_replay_prep_v2"
 DEFAULT_MIN_NEGATIVES = 300
 DEFAULT_MIN_POSITIVE_ANCHORS = 1000
 DEFAULT_MAX_NEGATIVE_SHARE = 0.35
@@ -90,12 +90,13 @@ def read_json(path: Path | None) -> list[dict[str, Any]]:
 def discover_latest_sources() -> tuple[Path, Path]:
     paths = sorted(
         (PROJECT_ROOT / "agents" / "temp").glob(
-            "*_boundary-v5.1-sources-from-cueqc/speech_boundary_negative_labels.jsonl"
+            "*_speech-boundary-hard-negative-sources-from-cueqc/speech_boundary_negative_labels.jsonl"
         )
     )
     if not paths:
         raise FileNotFoundError(
-            "no speech_boundary_negative_labels.jsonl found under agents/temp/*_boundary-v5.1-sources-from-cueqc"
+            "no speech_boundary_negative_labels.jsonl found under "
+            "agents/temp/*_speech-boundary-hard-negative-sources-from-cueqc"
         )
     labels = paths[-1]
     manifest = labels.with_name("speech_boundary_negative_manifest.json")
@@ -247,32 +248,7 @@ def formal_tiny_train_script(
     return "\n".join(lines) + "\n"
 
 
-def feature_scorer_train_script(
-    *,
-    labels: Path,
-    feature_manifest: Path,
-    output_dir: Path,
-    device: str,
-    max_steps: int,
-) -> str:
-    lines = [
-        "$env:PYTHONIOENCODING='utf-8'",
-        "# Candidate scorer only. Runtime uses it only when SPEECH_BOUNDARY_JA_SCORER_CHECKPOINT is set.",
-        "uv run python -m tools.boundary.ja.train_feature_scorer `",
-        f"  --labels {_ps_literal(repo_display_path(labels))} `",
-        f"  --feature-manifest {_ps_literal(repo_display_path(feature_manifest))} `",
-        f"  --output-dir {_ps_literal(repo_display_path(output_dir))} `",
-        f"  --device {_ps_literal(device)} `",
-        f"  --max-steps {int(max_steps)} `",
-        "  --hidden-size 128 `",
-        "  --dropout 0.05 `",
-        "  --eval-ratio 0.1 `",
-        "  --threshold 0.5",
-    ]
-    return "\n".join(lines) + "\n"
-
-
-def prepare_hard_negative_finetune(
+def prepare_hard_negative_replay(
     *,
     negative_labels: Path,
     negative_manifest: Path | None,
@@ -320,8 +296,6 @@ def prepare_hard_negative_finetune(
     mixed_training_skipped_path = output_dir / "speech_boundary_mixed_training_manifest_skipped.json"
     mixed_feature_dir = output_dir / "feature-cache-mixed-hard-negative-anchor"
     tiny_mixed_dir = output_dir / "tiny-mixed-hard-negative-anchor"
-    feature_scorer_dir = output_dir / "feature-scorer-hard-negative-anchor"
-    mixed_feature_manifest_path = mixed_feature_dir / "feature_manifest.jsonl"
     mixed_record_count = 0
     mixed_manifest_count = 0
     mixed_examples: list[Any] = []
@@ -384,16 +358,19 @@ def prepare_hard_negative_finetune(
                 max_steps=tiny_max_steps,
             ),
         )
-        write_text(
-            output_dir / "train_mixed_feature_scorer.ps1",
-            feature_scorer_train_script(
-                labels=mixed_labels_path,
-                feature_manifest=mixed_feature_manifest_path,
-                output_dir=feature_scorer_dir,
-                device=device,
-                max_steps=tiny_max_steps,
-            ),
-        )
+    next_steps = (
+        [
+            "keep this replay pack for a later self-training replay stage",
+            "do not use this replay pack as first-scorer bootstrap training data",
+            "after a synthetic speech+cut scorer is trained, consider replaying these labels as hard negatives with a separate gate",
+        ]
+        if formal_ready
+        else [
+            "add enough anchor positive/synthetic label sources before preserving this as a replay pack",
+            "build a mixed sampling manifest with capped negative share",
+            "do not train first-scorer bootstrap from this old heuristic-derived label set",
+        ]
+    )
 
     summary = {
         "schema": SUMMARY_SCHEMA,
@@ -422,16 +399,16 @@ def prepare_hard_negative_finetune(
             },
             "negative_share": round(negative_share, 6),
             "reason": (
-                "ready to build a mixed hard-negative finetune dataset"
+                "ready to preserve a mixed hard-negative replay pack"
                 if formal_ready
-                else "not ready: hard negatives must be mixed with enough positive/synthetic anchor examples before finetune"
+                else "not ready: hard negatives must be mixed with enough positive/synthetic anchor examples before replay"
             ),
         },
         "runtime_caveat": {
             "speech_boundary_runtime": "qwen-feature-energy-bootstrap-v1",
             "direct_replacement_checkpoint_supported": False,
             "opt_in_scorer_env": "SPEECH_BOUNDARY_JA_SCORER_CHECKPOINT",
-            "reason": "feature scorer checkpoints are runtime-loadable only when explicitly enabled and still need workflow smoke plus human audit before promotion; train_tiny remains plumbing-only.",
+            "reason": "CueQC drop labels were mined from old heuristic chunks, so this pack is replay material only and must not bootstrap the first speech+cut scorer.",
         },
         "commands": {
             "negative_feature_cache_script": repo_display_path(output_dir / "build_negative_feature_cache.ps1"),
@@ -442,17 +419,8 @@ def prepare_hard_negative_finetune(
             "tiny_mixed_plumbing_train": (
                 repo_display_path(output_dir / "tiny_mixed_plumbing_train.ps1") if formal_ready else ""
             ),
-            "mixed_feature_scorer_train": (
-                repo_display_path(output_dir / "train_mixed_feature_scorer.ps1") if formal_ready else ""
-            ),
         },
-        "next_steps": [
-            "add anchor positive/synthetic label sources before any formal SpeechBoundary-JA hard-negative finetune",
-            "build a mixed sampling manifest with capped negative share",
-            "run mixed feature-cache generation only after the anchor gate passes",
-            "train a runtime-loadable feature scorer from the mixed feature cache",
-            "gate any trained scorer with full workflow smoke and human audit before runtime promotion",
-        ],
+        "next_steps": next_steps,
     }
     write_json(output_dir / "summary.json", summary)
     write_text(output_dir / "summary.md", render_markdown(summary))
@@ -464,7 +432,7 @@ def render_markdown(summary: Mapping[str, Any]) -> str:
     neg = summary["negative_source"]
     mixed = summary.get("mixed_source") or {}
     lines = [
-        "# SpeechBoundary Hard-Negative Finetune Prep",
+        "# SpeechBoundary Hard-Negative Replay Prep",
         "",
         f"- Output: `{summary['output_dir']}`",
         f"- Negative labels: `{neg['labels_path']}`",
@@ -501,9 +469,9 @@ def render_markdown(summary: Mapping[str, Any]) -> str:
             "",
             "## Caveat",
             "",
-            "- Current SpeechBoundary-JA runtime is a Qwen/MFCC bootstrap scorer, not a trained replaceable TinyFrameClassifier.",
-            "- Feature scorer checkpoints are opt-in via `SPEECH_BOUNDARY_JA_SCORER_CHECKPOINT`; generated tiny scripts only validate label/audio plumbing.",
-            "- Do not train on the 522 negatives alone; mix with positive/synthetic anchors first.",
+            "- This replay pack is not first-scorer bootstrap data.",
+            "- Generated tiny scripts only validate label/audio plumbing.",
+            "- Use these labels only after the synthetic speech+cut scorer route has its own gate.",
             "",
         ]
     )
@@ -512,7 +480,7 @@ def render_markdown(summary: Mapping[str, Any]) -> str:
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Prepare and gate SpeechBoundary-JA hard-negative finetune sources."
+        description="Prepare and gate SpeechBoundary-JA hard-negative replay sources."
     )
     parser.add_argument("--negative-labels", default="")
     parser.add_argument("--negative-manifest", default="")
@@ -521,7 +489,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--output-dir",
         default="",
-        help="Defaults to agents/temp/YYYYMMDD_HHMMSS_speech-boundary-hard-negative-finetune-prep.",
+        help="Defaults to agents/temp/YYYYMMDD_HHMMSS_speech-boundary-hard-negative-replay-prep.",
     )
     parser.add_argument("--min-negatives", type=int, default=DEFAULT_MIN_NEGATIVES)
     parser.add_argument("--min-positive-anchors", type=int, default=DEFAULT_MIN_POSITIVE_ANCHORS)
@@ -557,9 +525,9 @@ def main(argv: list[str] | None = None) -> int:
         else PROJECT_ROOT
         / "agents"
         / "temp"
-        / f"{local_timestamp()}_speech-boundary-hard-negative-finetune-prep"
+        / f"{local_timestamp()}_speech-boundary-hard-negative-replay-prep"
     )
-    summary = prepare_hard_negative_finetune(
+    summary = prepare_hard_negative_replay(
         negative_labels=negative_labels,
         negative_manifest=negative_manifest,
         output_dir=output_dir,

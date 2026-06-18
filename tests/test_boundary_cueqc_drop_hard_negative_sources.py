@@ -4,9 +4,12 @@ import json
 from pathlib import Path
 
 import numpy as np
+import pytest
 import soundfile as sf
 
-from tools.boundary.prepare_cueqc_drop_v51_sources import prepare_cueqc_drop_v51_sources
+from tools.boundary.prepare_cueqc_drop_hard_negative_sources import (
+    prepare_cueqc_drop_hard_negative_sources,
+)
 
 
 def _write_jsonl(path: Path, rows: list[dict]) -> None:
@@ -19,7 +22,7 @@ def _write_jsonl(path: Path, rows: list[dict]) -> None:
 
 def _candidate(sample_id: str, *, route: str, start: float, end: float) -> dict:
     return {
-        "schema": "boundary_hardcase_candidate_from_cueqc_v1",
+        "schema": "speech_boundary_hard_negative_candidate_from_cueqc_v1",
         "candidate_id": f"cueqc-drop-hardcase-{sample_id}",
         "sample_id": sample_id,
         "audit_id": sample_id,
@@ -39,7 +42,7 @@ def _candidate(sample_id: str, *, route: str, start: float, end: float) -> dict:
     }
 
 
-def test_prepare_cueqc_drop_v51_sources_materializes_negative_audio(tmp_path: Path):
+def test_prepare_cueqc_drop_hard_negative_sources_materializes_negative_audio(tmp_path: Path):
     source_audio = tmp_path / "source.wav"
     samples = np.linspace(-0.25, 0.25, 16000, dtype=np.float32)
     sf.write(source_audio, samples, 16000)
@@ -56,7 +59,7 @@ def test_prepare_cueqc_drop_v51_sources_materializes_negative_audio(tmp_path: Pa
             ),
             _candidate(
                 "cueqc-AAA-chunk00002",
-                route="boundary_preference_candidate",
+                route="speech_boundary_frame_negative_candidate",
                 start=0.50,
                 end=0.90,
             ),
@@ -89,17 +92,16 @@ def test_prepare_cueqc_drop_v51_sources_materializes_negative_audio(tmp_path: Pa
         ],
     )
 
-    summary = prepare_cueqc_drop_v51_sources(
+    summary = prepare_cueqc_drop_hard_negative_sources(
         candidates_path=candidates_path,
         output_dir=tmp_path / "out",
         audit_item_paths=[audit_items],
     )
 
     assert summary["counts"]["input_candidates"] == 2
-    assert summary["counts"]["frame_negative_materialized"] == 1
-    assert summary["counts"]["speech_boundary_training_examples"] == 1
-    assert summary["counts"]["boundary_preference_seed_candidates"] == 1
-    assert summary["v51_boundary"]["direct_boundary_refiner_dataset_emitted"] is False
+    assert summary["counts"]["frame_negative_materialized"] == 2
+    assert summary["counts"]["speech_boundary_training_examples"] == 2
+    assert summary["speech_boundary_hard_negative"]["direct_boundary_refiner_dataset_emitted"] is False
 
     labels = [
         json.loads(line)
@@ -116,11 +118,28 @@ def test_prepare_cueqc_drop_v51_sources_materializes_negative_audio(tmp_path: Pa
     assert sample_rate == 16000
     assert 3000 <= len(audio) <= 3400
 
-    seeds = [
-        json.loads(line)
-        for line in (tmp_path / "out" / "boundary_preference_seed_candidates.jsonl")
-        .read_text(encoding="utf-8")
-        .splitlines()
-    ]
-    assert seeds[0]["direct_v51_training"] is False
-    assert seeds[0]["chunk_subtitle_cues"] == [{"start": 0.5, "end": 0.9, "text": "..."}]
+    output_names = {path.name for path in (tmp_path / "out").iterdir()}
+    assert "speech_boundary_negative_labels.jsonl" in output_names
+    assert "speech_boundary_negative_manifest.json" in output_names
+
+
+def test_prepare_cueqc_drop_hard_negative_sources_rejects_unsupported_route(tmp_path: Path):
+    candidates_path = tmp_path / "cueqc_confirmed_drop_candidates.jsonl"
+    _write_jsonl(
+        candidates_path,
+        [
+            _candidate(
+                "cueqc-AAA-chunk00001",
+                route="unsupported_legacy_route",
+                start=0.10,
+                end=0.30,
+            )
+        ],
+    )
+
+    with pytest.raises(ValueError, match="Regenerate candidates"):
+        prepare_cueqc_drop_hard_negative_sources(
+            candidates_path=candidates_path,
+            output_dir=tmp_path / "out",
+            audit_item_paths=[],
+        )

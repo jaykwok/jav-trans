@@ -19,6 +19,35 @@ def test_run_full_workflow_paths_keep_existing_timestamp_prefix(monkeypatch):
     assert paths.root.name == "20260615_094437_o10"
 
 
+def test_run_full_workflow_operating_point_uses_opt_in_scorer_metadata():
+    results = [
+        {
+            "boundary_signature": {
+                "operating_point": "qwen-feature-energy-bootstrap-v1",
+                "scorer_checkpoint": {
+                    "schema": "speech_boundary_ja_mamba2_frame_boundary_scorer_v3",
+                    "metadata": {"operating_point": "qwen-mamba2-frame-boundary-scorer-synthetic-v3"},
+                },
+            }
+        }
+    ]
+
+    assert (
+        run_full_workflow.speech_boundary_operating_point(results)
+        == "qwen-mamba2-frame-boundary-scorer-synthetic-v3"
+    )
+
+
+def test_run_full_workflow_operating_point_defaults_without_scorer():
+    assert run_full_workflow.speech_boundary_operating_point([]) == "qwen-feature-energy-bootstrap-v1"
+    assert (
+        run_full_workflow.speech_boundary_operating_point(
+            [{"boundary_signature": {"operating_point": "qwen-feature-energy-bootstrap-v1"}}]
+        )
+        == "qwen-feature-energy-bootstrap-v1"
+    )
+
+
 def test_run_full_workflow_parse_args_uses_loaded_env(monkeypatch):
     monkeypatch.setenv("ASR_BACKEND", "jaykwok/Qwen3-ASR-0.6B-JA-Anime-Galgame")
     monkeypatch.setenv("ASR_MODEL_PATH", "")

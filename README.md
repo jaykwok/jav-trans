@@ -13,10 +13,10 @@ JAVTrans 是一个本地字幕生成工具，面向 Windows + NVIDIA 显卡，�
 - 默认 ASR：`jaykwok/Qwen3-ASR-0.6B-JA-Anime-Galgame`。
 - 可选 ASR：`jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame`。
 - 默认边界系统：SpeechBoundary-JA，backend key 为 `speech_boundary_ja`。它不是传统 VAD，而是 `Qwen PTM + MFCC/energy frame scores -> boundary candidates -> Boundary Refiner -> constrained planner -> ASR chunks` 的 speech-island boundary pipeline。
-- SpeechBoundary-JA 支持实验性的 feature scorer checkpoint，但默认不启用。只有显式设置 `SPEECH_BOUNDARY_JA_SCORER_CHECKPOINT` 时才会用 learned scorer 替代 bootstrap frame scores；正式分发默认仍是 `qwen-feature-energy-bootstrap-v1`。
+- SpeechBoundary-JA 支持实验性的 Mamba2 frame scorer v2 checkpoint，但默认不启用。只有显式设置 `SPEECH_BOUNDARY_JA_SCORER_CHECKPOINT` 时才会用 learned scorer 替代 bootstrap frame scores；正式分发默认仍是 `qwen-feature-energy-bootstrap-v1`。
 - 默认 Boundary Refiner：随源码提供 learned `transformers.Mamba2Model` 小 checkpoint，文件为 `src/boundary/checkpoints/boundary_refiner.pt`。当前默认是 true v5 delta-only 32768 hardmix checkpoint；v5 协议只输出 `start_delta / end_delta`，不再保留 merge score、merge label、merge threshold、runtime disable 开关或 backbone override。
 - 默认 CueQC：`src/asr/checkpoints/cueqc_mamba_v3_fusion.pt`，在 ASR 后、forced alignment 前输出二元 `keep/drop`。当前默认 checkpoint 是 Stage 2b 自训练后版本，基础丢弃阈值 `0.85`，`short_text` 桶自适应提升到 `0.87`；模型缺失或推理异常时保守 `keep`。
-- 当前研究方向：CueQC 已替代旧规则 ASR QC。后续优先做 匿名样片 A 全链路 smoke、更多全片人工抽检和离线 Boundary 反哺数据整理；forced aligner 暂保留为默认 word-timing polish、诊断和未来 teacher 信号。
+- 当前研究方向：CueQC 已替代旧规则 ASR QC。后续优先做 Mamba2 frame scorer v2 的 匿名样片 A 对比人工审计、更多全片人工抽检和离线 Boundary 反哺数据整理；forced aligner 暂保留为默认 word-timing polish、诊断和未来 teacher 信号。
 - 默认显存目标：单阶段峰值适配 6GB 级 NVIDIA 显卡。8GB 本机可提高 `.env` 中的 ASR / aligner batch size；更小显存则手动降低。
 - 当前字幕策略：边界层尽量把 ASR chunk 切成接近一句台词；字幕层优先用可靠词级 `word.start` 锚定 cue start，只做 2-frame gap、显示时长和读速控制，不再运行相邻 cue 合并策略。
 
@@ -321,13 +321,14 @@ uv run python -m tools.web.smoke.summarize_job --job-id <job_id> --run-dir agent
 ### 审计、诊断与 Boundary
 
 - `tools.audits.audit_nav`、`tools.audits.serve_audits.ps1`、`tools.audits.serve_audits.sh`：维护和启动本地审计导航页。
-- `tools.audits.generate_*_audit_html`：生成字幕、alignment、CueQC prediction、Boundary preference 等人工审计页。
+- `tools.audits.generate_*_audit_html`：生成字幕、alignment、CueQC prediction 等人工审计页。
 - `tools.asr.diagnostics.*`：分析 alignment failure、fallback timing、安全边界和 ASR hard-negative 候选。
-- `tools.boundary.*`、`tools.boundary.ja.*`：Boundary preference、silver mining、训练数据构建、SpeechBoundary-JA 训练和 frame score 导出工具。
-- `tools.boundary.export_cueqc_drop_hardcases`：把 CueQC false-drop 审计中已确认可丢弃的 chunk 导出为 Boundary / SpeechBoundary hard-case 候选池；不会生成可直接训练 v5.1 的 delta 标签。
-- `tools.boundary.prepare_cueqc_drop_v51_sources`：把 CueQC drop hard-case 候选补回审计音频，切出 SpeechBoundary-JA negative labels，并生成 Boundary preference seed；不会直接启动训练。
+- `tools.boundary.*`、`tools.boundary.ja.*`：Boundary Refiner 训练数据构建、SpeechBoundary-JA 训练和 frame score 导出工具。
+- `tools.boundary.export_cueqc_drop_hardcases`：把 CueQC false-drop 审计中已确认可丢弃的 chunk 导出为 SpeechBoundary-JA hard-negative 候选池；不会生成 Boundary Refiner 训练标签。
+- `tools.boundary.prepare_cueqc_drop_hard_negative_sources`：把 CueQC `drop_ok` hard-negative 候选补回审计音频，并切出 SpeechBoundary-JA negative labels；不会直接启动训练。
 - `tools.boundary.ja.build_positive_anchor_replay`：从 anime / galgame 源 manifest 按权重抽样生成 SpeechBoundary-JA positive anchor replay labels；默认提高 NSFW 权重为 `anime_nsfw=55 / anime_sfw=20 / galgame=25`。
-- `tools.boundary.prepare_speech_boundary_hard_negative_finetune`：校验 SpeechBoundary-JA hard-negative finetune source，混合 positive/synthetic anchor replay，输出 feature-cache / tiny smoke 脚本，并在缺少 anchor 或负样本占比过高时阻止正式训练。
-- `tools.boundary.ja.train_feature_scorer`：从已缓存的 Qwen PTM + MFCC feature manifest 训练 runtime-loadable SpeechBoundary-JA frame scorer；checkpoint 只通过 `SPEECH_BOUNDARY_JA_SCORER_CHECKPOINT` opt-in 使用，完整 smoke 和人工审计通过前不替换默认 runtime。
-- `tools.boundary.ja.evaluate_feature_scorer_thresholds`：离线读取 feature scorer checkpoint 和缓存特征，扫描 threshold / operating point；只用于候选评估，不替换默认 runtime。
-- `tools.boundary.prepare_v51_training`：生成 Boundary v5.1 preference finetune 准备包，校验现有 v5 checkpoint 架构并写出 dry-run / head-finetune 命令；不会替换默认 checkpoint。
+- `tools.boundary.prepare_speech_boundary_hard_negative_replay`：校验 CueQC `drop_ok` hard-negative replay source，并混合 positive/synthetic anchor replay；该工具不生成 first-scorer 训练脚本。
+- `tools.boundary.ja.build_galgame_synthetic_timeline`：按 v5-style 随机时间线生成带 `speech_frames`、`cut_point_segments` 和 `cut_drop_zones` 的 SpeechBoundary-JA synthetic labels。
+- `tools.boundary.ja.prepare_frame_boundary_scorer_v3`：校验 synthetic true-structure labels 并输出 feature-cache、train、threshold-eval 三个 PowerShell 脚本；不会直接训练或替换默认 runtime。
+- `tools.boundary.ja.train_feature_scorer`：从已缓存的 Qwen PTM + MFCC feature manifest 训练 runtime-loadable SpeechBoundary-JA Mamba2 speech+cut frame boundary scorer v3；checkpoint 只通过 `SPEECH_BOUNDARY_JA_SCORER_CHECKPOINT` opt-in 使用，完整 smoke 和人工审计通过前不替换默认 runtime。
+- `tools.boundary.ja.evaluate_feature_scorer_thresholds`：离线读取 Mamba2 frame boundary scorer v3 checkpoint 和缓存特征，分别扫描 speech / cut threshold；只用于候选评估，不替换默认 runtime。

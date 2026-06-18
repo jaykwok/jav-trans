@@ -16,11 +16,12 @@ if str(SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(SRC_ROOT))
 
 from boundary.ja import (  # noqa: E402
+    endpoint_targets_from_record,
     effective_frame_weights,
     load_cached_feature,
     load_feature_frame_scorer_checkpoint,
     load_label_records,
-    score_feature_frame_probabilities,
+    score_feature_frame_boundary_probabilities,
 )
 
 
@@ -188,8 +189,12 @@ def evaluate_thresholds(
     feature_manifest: Path,
     output_dir: Path,
     thresholds: Iterable[float],
-    min_recall: float = 0.995,
-    max_false_positive_rate: float = 0.02,
+    min_speech_recall: float = 0.995,
+    max_speech_false_positive_rate: float = 0.02,
+    min_cut_recall: float = 0.90,
+    max_cut_false_positive_rate: float = 0.10,
+    cut_min_gap_s: float = 0.5,
+    cut_boundary_radius_frames: int = 1,
     device: str = "cpu",
     limit: int | None = None,
 ) -> dict[str, Any]:
@@ -201,8 +206,9 @@ def evaluate_thresholds(
     if not threshold_values:
         raise ValueError("at least one threshold is required")
     bundle = load_feature_frame_scorer_checkpoint(checkpoint, device=device)
-    overall_counts = {threshold: _empty_counts() for threshold in threshold_values}
-    quality_counts: dict[str, dict[float, dict[str, int]]] = {}
+    speech_counts = {threshold: _empty_counts() for threshold in threshold_values}
+    cut_counts = {threshold: _empty_counts() for threshold in threshold_values}
+    quality_counts: dict[str, dict[str, dict[float, dict[str, int]]]] = {}
     source_counts = Counter()
     label_quality_counts = Counter()
     skipped: list[dict[str, Any]] = []
@@ -212,9 +218,9 @@ def evaluate_thresholds(
             label_index = int(row["label_index"])
             record = records[label_index]
             ptm, mfcc = load_cached_feature(Path(str(row["feature_path"])))
-            scores = score_feature_frame_probabilities(bundle, ptm=ptm, mfcc=mfcc)
+            speech_scores, cut_scores = score_feature_frame_boundary_probabilities(bundle, ptm=ptm, mfcc=mfcc)
             weights = np.asarray(effective_frame_weights(record), dtype=np.float32)
-            frame_total = min(scores.shape[0], len(record.speech_frames), weights.shape[0])
+            frame_total = min(speech_scores.shape[0], cut_scores.shape[0], len(record.speech_frames), weights.shape[0])
             if frame_total <= 0:
                 skipped.append({"row_index": row_index, "label_index": label_index, "reason": "empty_frames"})
                 continue
@@ -222,19 +228,41 @@ def evaluate_thresholds(
             if not bool(mask.any()):
                 skipped.append({"row_index": row_index, "label_index": label_index, "reason": "zero_weight"})
                 continue
-            labels_array = np.asarray(record.speech_frames[:frame_total], dtype=np.float32)[mask]
-            scores_array = scores[:frame_total][mask]
+            _starts, _ends, cut_drops, cut_points = endpoint_targets_from_record(
+                record,
+                frame_count=frame_total,
+                boundary_radius_frames=0,
+                cut_min_gap_s=cut_min_gap_s,
+                cut_boundary_radius_frames=cut_boundary_radius_frames,
+            )
+            speech_labels = np.asarray(record.speech_frames[:frame_total], dtype=np.float32)[mask]
+            cut_labels = np.maximum(cut_drops[:frame_total], cut_points[:frame_total]).astype(np.float32)[mask]
+            speech_scores_array = speech_scores[:frame_total][mask]
+            cut_scores_array = cut_scores[:frame_total][mask]
             quality = str(record.label_quality or row.get("label_quality") or "")
-            quality_counts.setdefault(quality, {threshold: _empty_counts() for threshold in threshold_values})
+            quality_counts.setdefault(
+                quality,
+                {
+                    "speech": {threshold: _empty_counts() for threshold in threshold_values},
+                    "cut": {threshold: _empty_counts() for threshold in threshold_values},
+                },
+            )
             source_counts[str(record.source)] += 1
             label_quality_counts[quality] += 1
             for threshold in threshold_values:
-                predictions = (scores_array >= threshold).astype(np.float32)
-                _update_counts(overall_counts[threshold], labels=labels_array, predictions=predictions)
+                speech_predictions = (speech_scores_array >= threshold).astype(np.float32)
+                cut_predictions = (cut_scores_array >= threshold).astype(np.float32)
+                _update_counts(speech_counts[threshold], labels=speech_labels, predictions=speech_predictions)
+                _update_counts(cut_counts[threshold], labels=cut_labels, predictions=cut_predictions)
                 _update_counts(
-                    quality_counts[quality][threshold],
-                    labels=labels_array,
-                    predictions=predictions,
+                    quality_counts[quality]["speech"][threshold],
+                    labels=speech_labels,
+                    predictions=speech_predictions,
+                )
+                _update_counts(
+                    quality_counts[quality]["cut"][threshold],
+                    labels=cut_labels,
+                    predictions=cut_predictions,
                 )
         except Exception as exc:  # pragma: no cover - exercised by real corrupt manifests
             skipped.append(
@@ -246,22 +274,36 @@ def evaluate_thresholds(
                 }
             )
 
-    metrics = [_metrics_from_counts(overall_counts[threshold], threshold=threshold) for threshold in threshold_values]
+    speech_metrics = [_metrics_from_counts(speech_counts[threshold], threshold=threshold) for threshold in threshold_values]
+    cut_metrics = [_metrics_from_counts(cut_counts[threshold], threshold=threshold) for threshold in threshold_values]
     by_quality = {
-        quality: [
-            _metrics_from_counts(counts_by_threshold[threshold], threshold=threshold)
-            for threshold in threshold_values
-        ]
-        for quality, counts_by_threshold in sorted(quality_counts.items())
+        quality: {
+            "speech": [
+                _metrics_from_counts(head_counts["speech"][threshold], threshold=threshold)
+                for threshold in threshold_values
+            ],
+            "cut": [
+                _metrics_from_counts(head_counts["cut"][threshold], threshold=threshold)
+                for threshold in threshold_values
+            ],
+        }
+        for quality, head_counts in sorted(quality_counts.items())
     }
-    recommendation = _choose_threshold(
-        metrics,
-        min_recall=min_recall,
-        max_false_positive_rate=max_false_positive_rate,
-    )
+    recommendation = {
+        "speech": _choose_threshold(
+            speech_metrics,
+            min_recall=min_speech_recall,
+            max_false_positive_rate=max_speech_false_positive_rate,
+        ),
+        "cut": _choose_threshold(
+            cut_metrics,
+            min_recall=min_cut_recall,
+            max_false_positive_rate=max_cut_false_positive_rate,
+        ),
+    }
     output_dir.mkdir(parents=True, exist_ok=True)
     summary = {
-        "schema": "speech_boundary_ja_feature_scorer_threshold_eval_v1",
+        "schema": "speech_boundary_ja_mamba2_frame_boundary_scorer_threshold_eval_v3",
         "checkpoint": _repo_display(checkpoint),
         "checkpoint_signature": bundle.signature(),
         "labels": _repo_display(labels),
@@ -274,9 +316,15 @@ def evaluate_thresholds(
         "label_quality_counts": dict(sorted(label_quality_counts.items())),
         "source_counts": dict(sorted(source_counts.items())),
         "thresholds": threshold_values,
-        "metrics": metrics,
+        "speech_metrics": speech_metrics,
+        "cut_metrics": cut_metrics,
         "by_label_quality": by_quality,
         "recommendation": recommendation,
+        "cut_target_policy": {
+            "cut_min_gap_s": float(cut_min_gap_s),
+            "cut_boundary_radius_frames": int(cut_boundary_radius_frames),
+            "positive_target": "cut_point_segments_or_cut_drop_zones",
+        },
         "runtime_status": {
             "default_replaced": False,
             "opt_in_env": "SPEECH_BOUNDARY_JA_SCORER_CHECKPOINT",
@@ -288,39 +336,71 @@ def evaluate_thresholds(
         encoding="utf-8",
     )
     with (output_dir / "threshold_metrics.jsonl").open("w", encoding="utf-8") as handle:
-        for row in metrics:
-            handle.write(json.dumps(row, ensure_ascii=False, sort_keys=True) + "\n")
+        for head, rows_for_head in (("speech", speech_metrics), ("cut", cut_metrics)):
+            for row in rows_for_head:
+                payload = {"head": head, **row}
+                handle.write(json.dumps(payload, ensure_ascii=False, sort_keys=True) + "\n")
     (output_dir / "summary.md").write_text(render_markdown(summary), encoding="utf-8")
     return summary
 
 
 def render_markdown(summary: Mapping[str, Any]) -> str:
-    selected = dict(summary.get("recommendation", {}).get("selected") or {})
+    speech_recommendation = dict(summary.get("recommendation", {}).get("speech") or {})
+    cut_recommendation = dict(summary.get("recommendation", {}).get("cut") or {})
+    speech_selected = dict(speech_recommendation.get("selected") or {})
+    cut_selected = dict(cut_recommendation.get("selected") or {})
     lines = [
-        "# SpeechBoundary-JA Feature Scorer Threshold Eval",
+        "# SpeechBoundary-JA Mamba2 Frame Boundary Scorer Threshold Eval",
         "",
         f"- Checkpoint: `{summary['checkpoint']}`",
         f"- Rows: `{summary['rows']}`",
         f"- Skipped: `{summary['skipped']}`",
-        f"- Recommendation status: `{summary['recommendation']['status']}`",
+        f"- Speech recommendation status: `{speech_recommendation.get('status', '')}`",
+        f"- Cut recommendation status: `{cut_recommendation.get('status', '')}`",
     ]
-    if selected:
+    if speech_selected:
         lines.extend(
             [
-                f"- Selected threshold: `{selected.get('threshold')}`",
-                f"- Recall: `{float(selected.get('recall', 0.0)):.6f}`",
-                f"- FPR: `{float(selected.get('false_positive_rate', 0.0)):.6f}`",
-                f"- F1: `{float(selected.get('f1', 0.0)):.6f}`",
+                f"- Selected speech threshold: `{speech_selected.get('threshold')}`",
+                f"- Speech recall: `{float(speech_selected.get('recall', 0.0)):.6f}`",
+                f"- Speech FPR: `{float(speech_selected.get('false_positive_rate', 0.0)):.6f}`",
+                f"- Speech F1: `{float(speech_selected.get('f1', 0.0)):.6f}`",
+            ]
+        )
+    if cut_selected:
+        lines.extend(
+            [
+                f"- Selected cut threshold: `{cut_selected.get('threshold')}`",
+                f"- Cut recall: `{float(cut_selected.get('recall', 0.0)):.6f}`",
+                f"- Cut FPR: `{float(cut_selected.get('false_positive_rate', 0.0)):.6f}`",
+                f"- Cut F1: `{float(cut_selected.get('f1', 0.0)):.6f}`",
             ]
         )
     lines.extend(
         [
             "",
+            "## Speech",
+            "",
             "| threshold | precision | recall | f1 | fpr | predicted_positive_ratio |",
             "| --- | ---: | ---: | ---: | ---: | ---: |",
         ]
     )
-    for row in list(summary.get("metrics") or []):
+    for row in list(summary.get("speech_metrics") or []):
+        lines.append(
+            "| {threshold:.3f} | {precision:.6f} | {recall:.6f} | {f1:.6f} | {false_positive_rate:.6f} | {predicted_positive_ratio:.6f} |".format(
+                **row
+            )
+        )
+    lines.extend(
+        [
+            "",
+            "## Cut",
+            "",
+            "| threshold | precision | recall | f1 | fpr | predicted_positive_ratio |",
+            "| --- | ---: | ---: | ---: | ---: | ---: |",
+        ]
+    )
+    for row in list(summary.get("cut_metrics") or []):
         lines.append(
             "| {threshold:.3f} | {precision:.6f} | {recall:.6f} | {f1:.6f} | {false_positive_rate:.6f} | {predicted_positive_ratio:.6f} |".format(
                 **row
@@ -338,22 +418,34 @@ def render_markdown(summary: Mapping[str, Any]) -> str:
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Evaluate SpeechBoundary-JA feature scorer thresholds from cached features."
+        description="Evaluate SpeechBoundary-JA speech+cut feature scorer thresholds from cached features."
     )
     parser.add_argument("--checkpoint", required=True, help="Feature scorer checkpoint.")
     parser.add_argument("--labels", required=True, help="SpeechBoundary-JA label JSONL.")
     parser.add_argument("--feature-manifest", required=True, help="Feature cache manifest JSONL.")
     parser.add_argument("--output-dir", required=True)
     parser.add_argument("--threshold", action="append", type=float, default=[])
-    parser.add_argument("--min-recall", type=float, default=0.995)
-    parser.add_argument("--max-false-positive-rate", type=float, default=0.02)
+    parser.add_argument("--min-speech-recall", type=float, default=0.995)
+    parser.add_argument("--max-speech-false-positive-rate", type=float, default=0.02)
+    parser.add_argument("--min-cut-recall", type=float, default=0.90)
+    parser.add_argument("--max-cut-false-positive-rate", type=float, default=0.10)
+    parser.add_argument("--cut-min-gap-s", type=float, default=0.5)
+    parser.add_argument("--cut-boundary-radius-frames", type=int, default=1)
     parser.add_argument("--device", default="cpu")
     parser.add_argument("--limit", type=int)
     args = parser.parse_args(argv)
-    if not 0.0 <= args.min_recall <= 1.0:
-        parser.error("--min-recall must be in [0, 1]")
-    if not 0.0 <= args.max_false_positive_rate <= 1.0:
-        parser.error("--max-false-positive-rate must be in [0, 1]")
+    if not 0.0 <= args.min_speech_recall <= 1.0:
+        parser.error("--min-speech-recall must be in [0, 1]")
+    if not 0.0 <= args.max_speech_false_positive_rate <= 1.0:
+        parser.error("--max-speech-false-positive-rate must be in [0, 1]")
+    if not 0.0 <= args.min_cut_recall <= 1.0:
+        parser.error("--min-cut-recall must be in [0, 1]")
+    if not 0.0 <= args.max_cut_false_positive_rate <= 1.0:
+        parser.error("--max-cut-false-positive-rate must be in [0, 1]")
+    if args.cut_min_gap_s < 0.0:
+        parser.error("--cut-min-gap-s must be non-negative")
+    if args.cut_boundary_radius_frames < 0:
+        parser.error("--cut-boundary-radius-frames must be non-negative")
     if args.limit is not None and args.limit <= 0:
         parser.error("--limit must be positive when set")
     return args
@@ -367,18 +459,28 @@ def run(args: argparse.Namespace) -> None:
         feature_manifest=Path(args.feature_manifest),
         output_dir=Path(args.output_dir),
         thresholds=thresholds,
-        min_recall=args.min_recall,
-        max_false_positive_rate=args.max_false_positive_rate,
+        min_speech_recall=args.min_speech_recall,
+        max_speech_false_positive_rate=args.max_speech_false_positive_rate,
+        min_cut_recall=args.min_cut_recall,
+        max_cut_false_positive_rate=args.max_cut_false_positive_rate,
+        cut_min_gap_s=args.cut_min_gap_s,
+        cut_boundary_radius_frames=args.cut_boundary_radius_frames,
         device=args.device,
         limit=args.limit,
     )
-    selected = summary["recommendation"].get("selected") or {}
+    speech_selected = summary["recommendation"]["speech"].get("selected") or {}
+    cut_selected = summary["recommendation"]["cut"].get("selected") or {}
     print(f"summary={Path(args.output_dir) / 'threshold_eval_summary.json'}")
-    print(f"recommendation_status={summary['recommendation']['status']}")
-    if selected:
-        print(f"selected_threshold={selected['threshold']}")
-        print(f"selected_recall={selected['recall']:.6f}")
-        print(f"selected_fpr={selected['false_positive_rate']:.6f}")
+    print(f"speech_recommendation_status={summary['recommendation']['speech']['status']}")
+    print(f"cut_recommendation_status={summary['recommendation']['cut']['status']}")
+    if speech_selected:
+        print(f"selected_speech_threshold={speech_selected['threshold']}")
+        print(f"selected_speech_recall={speech_selected['recall']:.6f}")
+        print(f"selected_speech_fpr={speech_selected['false_positive_rate']:.6f}")
+    if cut_selected:
+        print(f"selected_cut_threshold={cut_selected['threshold']}")
+        print(f"selected_cut_recall={cut_selected['recall']:.6f}")
+        print(f"selected_cut_fpr={cut_selected['false_positive_rate']:.6f}")
 
 
 if __name__ == "__main__":

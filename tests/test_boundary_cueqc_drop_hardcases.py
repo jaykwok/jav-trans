@@ -76,8 +76,7 @@ def test_export_cueqc_drop_hardcases_routes_and_deduplicates(tmp_path: Path):
     assert summary["counts"]["confirmed_drop_candidates"] == 3
     assert summary["counts"]["safety_holdout_items"] == 2
     assert summary["candidate_route_counts"] == {
-        "boundary_preference_candidate": 2,
-        "speech_boundary_frame_negative_candidate": 1,
+        "speech_boundary_frame_negative_candidate": 3,
     }
 
     candidates = [
@@ -90,9 +89,14 @@ def test_export_cueqc_drop_hardcases_routes_and_deduplicates(tmp_path: Path):
     assert by_sample["drop-short"]["candidate_route"] == "speech_boundary_frame_negative_candidate"
     assert by_sample["drop-short"]["source_label_count"] == 2
     assert by_sample["drop-short"]["reason_tags"] == ["breath", "vocalization"]
-    assert by_sample["drop-dialogue"]["candidate_route"] == "boundary_preference_candidate"
-    assert by_sample["drop-long"]["candidate_route"] == "boundary_preference_candidate"
-    assert all(row["v51_status"] == "candidate_only_not_direct_delta_label" for row in candidates)
+    assert by_sample["drop-dialogue"]["candidate_route"] == "speech_boundary_frame_negative_candidate"
+    assert by_sample["drop-long"]["candidate_route"] == "speech_boundary_frame_negative_candidate"
+    assert by_sample["drop-dialogue"]["reason_tags"] == ["dialogue"]
+    assert by_sample["drop-long"]["reason_tags"] == ["environment"]
+    assert all(
+        row["hard_negative_status"] == "candidate_requires_audio_materialization"
+        for row in candidates
+    )
 
     safety = [
         json.loads(line)
