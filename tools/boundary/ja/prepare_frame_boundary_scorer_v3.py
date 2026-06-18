@@ -118,8 +118,12 @@ def train_script(
     device: str,
     max_steps: int,
     batch_hidden_size: int,
+    positive_weight: float,
+    negative_weight: float,
     cut_positive_weight: float,
+    cut_negative_weight: float,
     cut_loss_weight: float,
+    focal_gamma: float,
 ) -> str:
     return "\n".join(
         [
@@ -136,14 +140,14 @@ def train_script(
             "  --num-heads 4 `",
             "  --n-groups 2 `",
             "  --chunk-size 8 `",
-            "  --positive-weight 1.0 `",
-            "  --negative-weight 15.0 `",
+            f"  --positive-weight {float(positive_weight)} `",
+            f"  --negative-weight {float(negative_weight)} `",
             f"  --cut-positive-weight {float(cut_positive_weight)} `",
-            "  --cut-negative-weight 1.0 `",
+            f"  --cut-negative-weight {float(cut_negative_weight)} `",
             f"  --cut-loss-weight {float(cut_loss_weight)} `",
             "  --cut-min-gap-s 0.5 `",
             "  --cut-boundary-radius-frames 1 `",
-            "  --focal-gamma 2.0 `",
+            f"  --focal-gamma {float(focal_gamma)} `",
             "  --eval-ratio 0.1 `",
             "  --threshold 0.5 `",
             "  --cut-threshold 0.5",
@@ -159,19 +163,24 @@ def eval_script(
     feature_manifest: Path,
     output_dir: Path,
     device: str,
+    batch_size: int,
+    runtime_profiles: list[str],
 ) -> str:
-    return "\n".join(
-        [
-            "$env:PYTHONIOENCODING='utf-8'",
-            "uv run python -m tools.boundary.ja.evaluate_feature_scorer_thresholds `",
-            f"  --checkpoint {_ps_literal(repo_display_path(checkpoint))} `",
-            f"  --labels {_ps_literal(repo_display_path(labels))} `",
-            f"  --feature-manifest {_ps_literal(repo_display_path(feature_manifest))} `",
-            f"  --output-dir {_ps_literal(repo_display_path(output_dir))} `",
-            f"  --device {_ps_literal(device)}",
-            "",
-        ]
-    )
+    lines = [
+        "$env:PYTHONIOENCODING='utf-8'",
+        "uv run python -m tools.boundary.ja.evaluate_feature_scorer_thresholds `",
+        f"  --checkpoint {_ps_literal(repo_display_path(checkpoint))} `",
+        f"  --labels {_ps_literal(repo_display_path(labels))} `",
+        f"  --feature-manifest {_ps_literal(repo_display_path(feature_manifest))} `",
+        f"  --output-dir {_ps_literal(repo_display_path(output_dir))} `",
+        f"  --device {_ps_literal(device)} `",
+        f"  --batch-size {int(batch_size)}",
+    ]
+    for profile in runtime_profiles:
+        lines[-1] += " `"
+        lines.append(f"  --runtime-profile {_ps_literal(profile)}")
+    lines.append("")
+    return "\n".join(lines)
 
 
 def prepare_frame_boundary_scorer_v3(
@@ -184,8 +193,14 @@ def prepare_frame_boundary_scorer_v3(
     prepare_workers: int = 2,
     max_steps: int = 1000,
     hidden_size: int = 128,
+    positive_weight: float = 1.0,
+    negative_weight: float = 15.0,
     cut_positive_weight: float = 4.0,
+    cut_negative_weight: float = 1.0,
     cut_loss_weight: float = 1.0,
+    focal_gamma: float = 2.0,
+    eval_batch_size: int = 8,
+    runtime_profiles: list[str] | None = None,
     allow_no_cut_targets: bool = False,
 ) -> dict[str, Any]:
     labels = labels.resolve()
@@ -226,8 +241,12 @@ def prepare_frame_boundary_scorer_v3(
             device=device,
             max_steps=max_steps,
             batch_hidden_size=hidden_size,
+            positive_weight=positive_weight,
+            negative_weight=negative_weight,
             cut_positive_weight=cut_positive_weight,
+            cut_negative_weight=cut_negative_weight,
             cut_loss_weight=cut_loss_weight,
+            focal_gamma=focal_gamma,
         ),
     )
     write_text(
@@ -238,6 +257,8 @@ def prepare_frame_boundary_scorer_v3(
             feature_manifest=feature_manifest,
             output_dir=eval_dir,
             device=device,
+            batch_size=eval_batch_size,
+            runtime_profiles=list(runtime_profiles or []),
         ),
     )
     payload = {
@@ -260,6 +281,20 @@ def prepare_frame_boundary_scorer_v3(
             "checkpoint": repo_display_path(checkpoint),
             "threshold_eval": repo_display_path(eval_dir),
         },
+        "training_config": {
+            "max_steps": int(max_steps),
+            "hidden_size": int(hidden_size),
+            "positive_weight": float(positive_weight),
+            "negative_weight": float(negative_weight),
+            "cut_positive_weight": float(cut_positive_weight),
+            "cut_negative_weight": float(cut_negative_weight),
+            "cut_loss_weight": float(cut_loss_weight),
+            "focal_gamma": float(focal_gamma),
+        },
+        "eval_config": {
+            "batch_size": int(eval_batch_size),
+            "runtime_profiles": list(runtime_profiles or []),
+        },
     }
     write_json(output_dir / "summary.json", payload)
     write_text(output_dir / "summary.md", render_markdown(payload))
@@ -277,6 +312,8 @@ def render_markdown(summary: Mapping[str, Any]) -> str:
         f"- Metadata records: `{labels['metadata_records']}`",
         f"- Cut point segments: `{labels['cut_point_segments']}`",
         f"- Cut drop zones: `{labels['cut_drop_zones']}`",
+        f"- Training weights: `speech +{summary['training_config']['positive_weight']} / -{summary['training_config']['negative_weight']}; cut +{summary['training_config']['cut_positive_weight']} / -{summary['training_config']['cut_negative_weight']}`",
+        f"- Eval runtime profiles: `{len(summary['eval_config']['runtime_profiles'])}`",
         "",
         "## Scripts",
         "",
@@ -305,8 +342,19 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--prepare-workers", type=int, default=2)
     parser.add_argument("--max-steps", type=int, default=1000)
     parser.add_argument("--hidden-size", type=int, default=128)
+    parser.add_argument("--positive-weight", type=float, default=1.0)
+    parser.add_argument("--negative-weight", type=float, default=15.0)
     parser.add_argument("--cut-positive-weight", type=float, default=4.0)
+    parser.add_argument("--cut-negative-weight", type=float, default=1.0)
     parser.add_argument("--cut-loss-weight", type=float, default=1.0)
+    parser.add_argument("--focal-gamma", type=float, default=2.0)
+    parser.add_argument("--eval-batch-size", type=int, default=8)
+    parser.add_argument(
+        "--runtime-profile",
+        action="append",
+        default=[],
+        help="Add a threshold eval runtime profile as speech_on,speech_off,cut.",
+    )
     parser.add_argument("--allow-no-cut-targets", action="store_true")
     args = parser.parse_args(argv)
     if args.batch_size <= 0:
@@ -317,10 +365,32 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         parser.error("--max-steps must be positive")
     if args.hidden_size <= 0:
         parser.error("--hidden-size must be positive")
+    if args.positive_weight <= 0.0:
+        parser.error("--positive-weight must be positive")
+    if args.negative_weight <= 0.0:
+        parser.error("--negative-weight must be positive")
     if args.cut_positive_weight <= 0.0:
         parser.error("--cut-positive-weight must be positive")
+    if args.cut_negative_weight <= 0.0:
+        parser.error("--cut-negative-weight must be positive")
     if args.cut_loss_weight <= 0.0:
         parser.error("--cut-loss-weight must be positive")
+    if args.focal_gamma < 0.0:
+        parser.error("--focal-gamma must be non-negative")
+    if args.eval_batch_size <= 0:
+        parser.error("--eval-batch-size must be positive")
+    for profile in args.runtime_profile:
+        parts = [part.strip() for part in str(profile).split(",")]
+        if len(parts) != 3:
+            parser.error("--runtime-profile must be speech_on,speech_off,cut")
+        try:
+            on_threshold, off_threshold, cut_threshold = (float(part) for part in parts)
+        except ValueError:
+            parser.error("--runtime-profile values must be numbers")
+        if not (0.0 <= on_threshold <= 1.0 and 0.0 <= off_threshold <= 1.0 and 0.0 <= cut_threshold <= 1.0):
+            parser.error("--runtime-profile values must be in [0, 1]")
+        if on_threshold < off_threshold:
+            parser.error("--runtime-profile speech_on must be >= speech_off")
     return args
 
 
@@ -340,8 +410,14 @@ def main(argv: list[str] | None = None) -> int:
         prepare_workers=args.prepare_workers,
         max_steps=args.max_steps,
         hidden_size=args.hidden_size,
+        positive_weight=args.positive_weight,
+        negative_weight=args.negative_weight,
         cut_positive_weight=args.cut_positive_weight,
+        cut_negative_weight=args.cut_negative_weight,
         cut_loss_weight=args.cut_loss_weight,
+        focal_gamma=args.focal_gamma,
+        eval_batch_size=args.eval_batch_size,
+        runtime_profiles=args.runtime_profile,
         allow_no_cut_targets=args.allow_no_cut_targets,
     )
     print(f"output_dir={summary['output_dir']}")

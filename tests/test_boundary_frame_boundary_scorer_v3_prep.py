@@ -48,14 +48,30 @@ def test_frame_boundary_scorer_v3_prep_writes_scripts(tmp_path: Path):
         device="cpu",
         batch_size=1,
         max_steps=2,
+        positive_weight=3.0,
+        negative_weight=4.0,
+        cut_positive_weight=5.0,
+        cut_negative_weight=2.0,
+        cut_loss_weight=1.5,
+        focal_gamma=1.0,
+        eval_batch_size=2,
+        runtime_profiles=["0.7,0.5,0.9"],
     )
 
     assert summary["schema"] == "speech_boundary_ja_frame_boundary_scorer_v3_prep"
     assert summary["label_summary"]["cut_point_segments"] == 1
     assert summary["label_summary"]["cut_drop_zones"] == 1
+    assert summary["training_config"]["positive_weight"] == pytest.approx(3.0)
+    assert summary["eval_config"]["runtime_profiles"] == ["0.7,0.5,0.9"]
     assert (tmp_path / "prep" / "build_feature_cache.ps1").exists()
     assert (tmp_path / "prep" / "train_frame_boundary_scorer_v3.ps1").exists()
     assert (tmp_path / "prep" / "evaluate_frame_boundary_scorer_v3.ps1").exists()
+    assert "--positive-weight 3.0" in (tmp_path / "prep" / "train_frame_boundary_scorer_v3.ps1").read_text(
+        encoding="utf-8"
+    )
+    assert "--runtime-profile '0.7,0.5,0.9'" in (
+        tmp_path / "prep" / "evaluate_frame_boundary_scorer_v3.ps1"
+    ).read_text(encoding="utf-8")
 
 
 def test_frame_boundary_scorer_v3_prep_rejects_missing_cut_targets(tmp_path: Path):
