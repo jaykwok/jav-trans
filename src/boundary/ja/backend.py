@@ -18,6 +18,10 @@ from boundary.ja.features import (
     extract_mfcc,
     is_low_frame_rate_ptm,
 )
+from boundary.ja.model import (
+    load_feature_frame_scorer_checkpoint,
+    score_feature_frame_probabilities,
+)
 from boundary.ja.postprocess import group_segments
 
 
@@ -234,6 +238,8 @@ class SpeechBoundaryJaConfig:
     export_sequence_features: bool = False
     sequence_feature_max_ptm_dims: int = 64
     no_download: bool = False
+    scorer_checkpoint: str = ""
+    scorer_device: str = "auto"
 
     @classmethod
     def from_env(cls) -> "SpeechBoundaryJaConfig":
@@ -259,6 +265,8 @@ class SpeechBoundaryJaConfig:
                 int(_env_float("BOUNDARY_FRAME_SEQUENCE_MAX_PTM_DIMS", "64")),
             ),
             no_download=_env_bool("SPEECH_BOUNDARY_JA_NO_DOWNLOAD", "0"),
+            scorer_checkpoint=os.getenv("SPEECH_BOUNDARY_JA_SCORER_CHECKPOINT", "").strip(),
+            scorer_device=os.getenv("SPEECH_BOUNDARY_JA_SCORER_DEVICE", "auto").strip() or "auto",
         )
 
 
@@ -270,7 +278,7 @@ class SpeechBoundaryJaBackend:
 
     def signature(self) -> dict:
         cfg = self.config
-        return {
+        signature = {
             "backend": self.name,
             "threshold": float(cfg.threshold),
             "frame_dilation_s": float(cfg.frame_dilation_s),
@@ -289,9 +297,15 @@ class SpeechBoundaryJaBackend:
             "apply_cut_to_speech": bool(cfg.apply_cut_to_speech),
             "export_sequence_features": bool(cfg.export_sequence_features),
             "sequence_feature_max_ptm_dims": int(cfg.sequence_feature_max_ptm_dims),
+            "scorer_checkpoint": "",
             "operating_point": DEFAULT_OPERATING_POINT,
             "allow_empty": True,
         }
+        scorer_checkpoint = cfg.scorer_checkpoint.strip()
+        if scorer_checkpoint:
+            signature["scorer_checkpoint"] = scorer_checkpoint
+            signature["scorer_device"] = cfg.scorer_device
+        return signature
 
     def segment(
         self,
@@ -313,6 +327,13 @@ class SpeechBoundaryJaBackend:
         import torch
 
         device = _model_device(cfg.device)
+        scorer_device = _model_device(cfg.scorer_device)
+        scorer = (
+            load_feature_frame_scorer_checkpoint(cfg.scorer_checkpoint, device=scorer_device)
+            if cfg.scorer_checkpoint.strip()
+            else None
+        )
+        scorer_signature = scorer.signature() if scorer is not None else None
         threshold = float(cfg.threshold if threshold_override is None else threshold_override)
         feature_config = FeatureConfig(
             ptm=cfg.ptm,
@@ -336,7 +357,8 @@ class SpeechBoundaryJaBackend:
             "dtype": cfg.dtype,
             "ptm_param_device": ptm_param_device,
             "ptm_param_dtype": ptm_param_dtype,
-            "score_model": "bootstrap_energy_ptm_mfcc",
+            "score_model": "feature_frame_scorer" if scorer is not None else "bootstrap_energy_ptm_mfcc",
+            "scorer_device": str(scorer_device) if scorer is not None else "",
         }
         print(
             "[boundary] speech_boundary_ja device "
@@ -345,7 +367,7 @@ class SpeechBoundaryJaBackend:
             f"dtype={runtime_device['dtype']} "
             f"ptm_param_device={runtime_device['ptm_param_device']} "
             f"ptm_param_dtype={runtime_device['ptm_param_dtype']} "
-            "score_model=bootstrap_energy_ptm_mfcc",
+            f"score_model={runtime_device['score_model']}",
             flush=True,
         )
         try:
@@ -375,13 +397,17 @@ class SpeechBoundaryJaBackend:
                     mfcc,
                     resize_ptm=is_low_frame_rate_ptm(cfg.ptm),
                 )
-                probs, cut_probs = _bootstrap_frame_scores(
-                    audio=chunk,
-                    sample_rate=sample_rate,
-                    ptm=ptm,
-                    mfcc=mfcc,
-                    config=feature_config,
-                )
+                if scorer is None:
+                    probs, cut_probs = _bootstrap_frame_scores(
+                        audio=chunk,
+                        sample_rate=sample_rate,
+                        ptm=ptm,
+                        mfcc=mfcc,
+                        config=feature_config,
+                    )
+                else:
+                    probs = score_feature_frame_probabilities(scorer, ptm=ptm, mfcc=mfcc)
+                    cut_probs = np.zeros_like(probs, dtype=np.float32)
                 window_start_s = start_sample / sample_rate
                 global_start = max(0, int(round(window_start_s / cfg.frame_hop_s)))
                 global_end = min(total_frames, global_start + probs.size)
@@ -482,6 +508,8 @@ class SpeechBoundaryJaBackend:
                     "runtime_device": runtime_device,
                 }
             )
+            if scorer_signature is not None:
+                params["scorer_checkpoint"] = scorer_signature
             if (
                 cfg.export_sequence_features
                 and sequence_ptm_sum is not None

@@ -247,6 +247,31 @@ def formal_tiny_train_script(
     return "\n".join(lines) + "\n"
 
 
+def feature_scorer_train_script(
+    *,
+    labels: Path,
+    feature_manifest: Path,
+    output_dir: Path,
+    device: str,
+    max_steps: int,
+) -> str:
+    lines = [
+        "$env:PYTHONIOENCODING='utf-8'",
+        "# Candidate scorer only. Runtime uses it only when SPEECH_BOUNDARY_JA_SCORER_CHECKPOINT is set.",
+        "uv run python -m tools.boundary.ja.train_feature_scorer `",
+        f"  --labels {_ps_literal(repo_display_path(labels))} `",
+        f"  --feature-manifest {_ps_literal(repo_display_path(feature_manifest))} `",
+        f"  --output-dir {_ps_literal(repo_display_path(output_dir))} `",
+        f"  --device {_ps_literal(device)} `",
+        f"  --max-steps {int(max_steps)} `",
+        "  --hidden-size 128 `",
+        "  --dropout 0.05 `",
+        "  --eval-ratio 0.1 `",
+        "  --threshold 0.5",
+    ]
+    return "\n".join(lines) + "\n"
+
+
 def prepare_hard_negative_finetune(
     *,
     negative_labels: Path,
@@ -295,6 +320,8 @@ def prepare_hard_negative_finetune(
     mixed_training_skipped_path = output_dir / "speech_boundary_mixed_training_manifest_skipped.json"
     mixed_feature_dir = output_dir / "feature-cache-mixed-hard-negative-anchor"
     tiny_mixed_dir = output_dir / "tiny-mixed-hard-negative-anchor"
+    feature_scorer_dir = output_dir / "feature-scorer-hard-negative-anchor"
+    mixed_feature_manifest_path = mixed_feature_dir / "feature_manifest.jsonl"
     mixed_record_count = 0
     mixed_manifest_count = 0
     mixed_examples: list[Any] = []
@@ -357,6 +384,16 @@ def prepare_hard_negative_finetune(
                 max_steps=tiny_max_steps,
             ),
         )
+        write_text(
+            output_dir / "train_mixed_feature_scorer.ps1",
+            feature_scorer_train_script(
+                labels=mixed_labels_path,
+                feature_manifest=mixed_feature_manifest_path,
+                output_dir=feature_scorer_dir,
+                device=device,
+                max_steps=tiny_max_steps,
+            ),
+        )
 
     summary = {
         "schema": SUMMARY_SCHEMA,
@@ -393,7 +430,8 @@ def prepare_hard_negative_finetune(
         "runtime_caveat": {
             "speech_boundary_runtime": "qwen-feature-energy-bootstrap-v1",
             "direct_replacement_checkpoint_supported": False,
-            "reason": "current SpeechBoundary-JA runtime is a bootstrap scorer over Qwen/MFCC features; train_tiny is only a plumbing smoke model.",
+            "opt_in_scorer_env": "SPEECH_BOUNDARY_JA_SCORER_CHECKPOINT",
+            "reason": "feature scorer checkpoints are runtime-loadable only when explicitly enabled and still need workflow smoke plus human audit before promotion; train_tiny remains plumbing-only.",
         },
         "commands": {
             "negative_feature_cache_script": repo_display_path(output_dir / "build_negative_feature_cache.ps1"),
@@ -404,11 +442,15 @@ def prepare_hard_negative_finetune(
             "tiny_mixed_plumbing_train": (
                 repo_display_path(output_dir / "tiny_mixed_plumbing_train.ps1") if formal_ready else ""
             ),
+            "mixed_feature_scorer_train": (
+                repo_display_path(output_dir / "train_mixed_feature_scorer.ps1") if formal_ready else ""
+            ),
         },
         "next_steps": [
             "add anchor positive/synthetic label sources before any formal SpeechBoundary-JA hard-negative finetune",
             "build a mixed sampling manifest with capped negative share",
-            "run feature-cache generation only after the anchor gate passes",
+            "run mixed feature-cache generation only after the anchor gate passes",
+            "train a runtime-loadable feature scorer from the mixed feature cache",
             "gate any trained scorer with full workflow smoke and human audit before runtime promotion",
         ],
     }
@@ -460,7 +502,7 @@ def render_markdown(summary: Mapping[str, Any]) -> str:
             "## Caveat",
             "",
             "- Current SpeechBoundary-JA runtime is a Qwen/MFCC bootstrap scorer, not a trained replaceable TinyFrameClassifier.",
-            "- The generated tiny smoke script only validates label/audio plumbing.",
+            "- Feature scorer checkpoints are opt-in via `SPEECH_BOUNDARY_JA_SCORER_CHECKPOINT`; generated tiny scripts only validate label/audio plumbing.",
             "- Do not train on the 522 negatives alone; mix with positive/synthetic anchors first.",
             "",
         ]

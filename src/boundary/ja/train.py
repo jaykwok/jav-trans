@@ -13,7 +13,11 @@ from boundary.ja.dataset import LabelRecord
 from boundary.ja.dataset import effective_frame_weights
 from boundary.ja.features import load_cached_feature
 from boundary.ja.manifest import TrainingExample
-from boundary.ja.model import TinyFrameClassifier
+from boundary.ja.model import (
+    FeatureFrameScorer,
+    TinyFrameClassifier,
+    build_feature_frame_scorer_checkpoint,
+)
 
 
 @dataclass(frozen=True)
@@ -48,6 +52,40 @@ class EvalMetrics:
     windows: int
     metrics_path: str
     threshold: float = 0.5
+
+
+@dataclass(frozen=True)
+class FeatureScorerTrainConfig:
+    max_steps: int = 1000
+    learning_rate: float = 2e-4
+    seed: int = 13
+    device: str = "cpu"
+    hidden_size: int = 128
+    dropout: float = 0.05
+    eval_ratio: float = 0.1
+    threshold: float = 0.5
+    max_eval_windows: int = 256
+
+
+@dataclass(frozen=True)
+class FeatureScorerTrainMetrics:
+    steps: int
+    loss: float
+    eval_loss: float
+    frame_accuracy: float
+    positive_ratio: float
+    predicted_positive_ratio: float
+    precision: float
+    recall: float
+    f1: float
+    train_windows: int
+    eval_windows: int
+    input_dim: int
+    ptm_dim: int
+    mfcc_dim: int
+    checkpoint: str
+    metrics_path: str
+    threshold: float
 
 
 def train_tiny_frame_classifier(
@@ -118,6 +156,262 @@ def train_tiny_frame_classifier(
         encoding="utf-8",
     )
     return metrics
+
+
+def train_feature_frame_scorer(
+    *,
+    records: list[LabelRecord],
+    feature_manifest_rows: Iterable[Mapping[str, Any]],
+    output_dir: Path,
+    config: FeatureScorerTrainConfig,
+    labels_path: str = "",
+    feature_manifest_path: str = "",
+) -> FeatureScorerTrainMetrics:
+    import torch
+    from torch import nn
+
+    rows = [dict(row) for row in feature_manifest_rows]
+    if not rows:
+        raise ValueError("at least one feature manifest row is required")
+    output_dir.mkdir(parents=True, exist_ok=True)
+    torch.manual_seed(config.seed)
+    rng = np.random.default_rng(config.seed)
+    rows = [row for row in rows if _feature_row_frame_count(row, records) > 0]
+    if not rows:
+        raise ValueError("no feature rows have usable frames")
+
+    ptm_dim = int(rows[0]["ptm_dim"])
+    mfcc_dim = int(rows[0]["mfcc_dim"])
+    for row in rows:
+        if int(row["ptm_dim"]) != ptm_dim or int(row["mfcc_dim"]) != mfcc_dim:
+            raise ValueError("all feature rows must have the same ptm_dim and mfcc_dim")
+    input_dim = ptm_dim + mfcc_dim
+
+    order = [int(index) for index in rng.permutation(len(rows))]
+    eval_count = min(
+        max(1, int(round(len(rows) * max(0.0, min(0.9, config.eval_ratio))))),
+        max(1, len(rows) - 1),
+    ) if len(rows) > 1 else 0
+    eval_rows = [rows[index] for index in order[:eval_count]]
+    train_rows = [rows[index] for index in order[eval_count:]] or list(rows)
+    normalization = compute_feature_normalization(records=records, feature_manifest_rows=train_rows)
+
+    device = torch.device(config.device)
+    model = FeatureFrameScorer(
+        input_dim=input_dim,
+        hidden_size=config.hidden_size,
+        dropout=config.dropout,
+    ).to(device)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=config.learning_rate)
+    criterion = nn.BCEWithLogitsLoss(reduction="none")
+    train_order = shuffled_window_order(len(train_rows), seed=config.seed)
+    losses: list[float] = []
+
+    for step in range(config.max_steps):
+        row = train_rows[train_order[step % len(train_order)]]
+        features, labels, weights = feature_training_tensors(
+            row=row,
+            records=records,
+            normalization=normalization,
+        )
+        if float(np.sum(weights)) <= 0.0:
+            continue
+        feature_tensor = torch.from_numpy(features).to(device).unsqueeze(0)
+        label_tensor = torch.from_numpy(labels).to(device).unsqueeze(0)
+        weight_tensor = torch.from_numpy(weights).to(device).unsqueeze(0)
+        logits = model(feature_tensor)
+        loss_values = criterion(logits, label_tensor)
+        loss = (loss_values * weight_tensor).sum() / weight_tensor.sum().clamp_min(1e-6)
+        optimizer.zero_grad(set_to_none=True)
+        loss.backward()
+        optimizer.step()
+        losses.append(float(loss.detach().cpu()))
+
+    eval_metrics = evaluate_feature_frame_scorer(
+        model=model,
+        records=records,
+        rows=eval_rows or train_rows,
+        normalization=normalization,
+        device=device,
+        threshold=config.threshold,
+        max_windows=config.max_eval_windows,
+    )
+    checkpoint_path = output_dir / "speech_boundary_ja_feature_scorer.pt"
+    metrics_path = output_dir / "train_metrics.json"
+    model_config = {
+        "ptm_dim": ptm_dim,
+        "mfcc_dim": mfcc_dim,
+        "input_dim": input_dim,
+        "hidden_size": int(config.hidden_size),
+        "dropout": float(config.dropout),
+    }
+    torch.save(
+        build_feature_frame_scorer_checkpoint(
+            model=model,
+            model_config=model_config,
+            normalization=normalization,
+            metadata={
+                "operating_point": "qwen-feature-scorer-hard-negative-v1",
+                "labels": labels_path,
+                "feature_manifest": feature_manifest_path,
+                "records": len(records),
+                "train_windows": len(train_rows),
+                "eval_windows": len(eval_rows),
+                "trained_steps": int(config.max_steps),
+                "config": asdict(config),
+            },
+        ),
+        checkpoint_path,
+    )
+    metrics = FeatureScorerTrainMetrics(
+        steps=config.max_steps,
+        loss=float(np.mean(losses)) if losses else 0.0,
+        eval_loss=float(eval_metrics["loss"]),
+        frame_accuracy=float(eval_metrics["frame_accuracy"]),
+        positive_ratio=float(eval_metrics["positive_ratio"]),
+        predicted_positive_ratio=float(eval_metrics["predicted_positive_ratio"]),
+        precision=float(eval_metrics["precision"]),
+        recall=float(eval_metrics["recall"]),
+        f1=float(eval_metrics["f1"]),
+        train_windows=len(train_rows),
+        eval_windows=len(eval_rows),
+        input_dim=input_dim,
+        ptm_dim=ptm_dim,
+        mfcc_dim=mfcc_dim,
+        checkpoint=str(checkpoint_path),
+        metrics_path=str(metrics_path),
+        threshold=float(config.threshold),
+    )
+    metrics_path.write_text(
+        json.dumps(asdict(metrics), ensure_ascii=False, indent=2, sort_keys=True),
+        encoding="utf-8",
+    )
+    return metrics
+
+
+def compute_feature_normalization(
+    *,
+    records: list[LabelRecord],
+    feature_manifest_rows: Iterable[Mapping[str, Any]],
+) -> dict[str, Any]:
+    total_weight = 0.0
+    feature_sum: np.ndarray | None = None
+    feature_square_sum: np.ndarray | None = None
+    frame_count_total = 0
+    for row in feature_manifest_rows:
+        features, _labels, weights = _feature_training_arrays(row=row, records=records)
+        frame_weight = weights.reshape(-1, 1).astype(np.float64, copy=False)
+        if float(frame_weight.sum()) <= 0.0:
+            continue
+        values = features.astype(np.float64, copy=False)
+        if feature_sum is None:
+            feature_sum = np.zeros(values.shape[1], dtype=np.float64)
+            feature_square_sum = np.zeros(values.shape[1], dtype=np.float64)
+        feature_sum += np.sum(values * frame_weight, axis=0)
+        feature_square_sum += np.sum(np.square(values) * frame_weight, axis=0)
+        total_weight += float(frame_weight.sum())
+        frame_count_total += int(values.shape[0])
+    if feature_sum is None or feature_square_sum is None or total_weight <= 0.0:
+        raise ValueError("cannot compute normalization without weighted feature frames")
+    mean = feature_sum / total_weight
+    variance = np.maximum(feature_square_sum / total_weight - np.square(mean), 1e-6)
+    std = np.sqrt(variance)
+    return {
+        "feature_mean": [float(value) for value in mean.astype(np.float32).tolist()],
+        "feature_std": [float(value) for value in std.astype(np.float32).tolist()],
+        "weighted_frames": float(total_weight),
+        "observed_frames": int(frame_count_total),
+    }
+
+
+def feature_training_tensors(
+    *,
+    row: Mapping[str, Any],
+    records: list[LabelRecord],
+    normalization: Mapping[str, Any],
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    features, labels, weights = _feature_training_arrays(row=row, records=records)
+    mean = np.asarray(normalization["feature_mean"], dtype=np.float32)
+    std = np.asarray(normalization["feature_std"], dtype=np.float32)
+    if int(mean.shape[0]) != int(features.shape[1]) or int(std.shape[0]) != int(features.shape[1]):
+        raise ValueError("normalization dimension does not match feature dimension")
+    normalized = (features - mean) / np.maximum(std, 1e-6)
+    return (
+        np.ascontiguousarray(normalized, dtype=np.float32),
+        np.ascontiguousarray(labels, dtype=np.float32),
+        np.ascontiguousarray(weights, dtype=np.float32),
+    )
+
+
+def evaluate_feature_frame_scorer(
+    *,
+    model: Any,
+    records: list[LabelRecord],
+    rows: Iterable[Mapping[str, Any]],
+    normalization: Mapping[str, Any],
+    device: Any,
+    threshold: float = 0.5,
+    max_windows: int = 256,
+) -> dict[str, float | int]:
+    import torch
+    from torch import nn
+
+    criterion = nn.BCEWithLogitsLoss(reduction="none")
+    counts = {
+        "frames": 0,
+        "correct": 0,
+        "positives": 0,
+        "predicted_positives": 0,
+        "true_positive": 0,
+        "false_positive": 0,
+        "false_negative": 0,
+    }
+    loss_sum = 0.0
+    weight_sum = 0.0
+    windows = 0
+    model.eval()
+    with torch.inference_mode():
+        for row in rows:
+            if windows >= int(max_windows):
+                break
+            features, labels, weights = feature_training_tensors(
+                row=row,
+                records=records,
+                normalization=normalization,
+            )
+            if float(np.sum(weights)) <= 0.0:
+                continue
+            feature_tensor = torch.from_numpy(features).to(device).unsqueeze(0)
+            label_tensor = torch.from_numpy(labels).to(device).unsqueeze(0)
+            weight_tensor = torch.from_numpy(weights).to(device).unsqueeze(0)
+            logits = model(feature_tensor)
+            loss_values = criterion(logits, label_tensor)
+            loss_sum += float((loss_values * weight_tensor).sum().detach().cpu())
+            weight_sum += float(weight_tensor.sum().detach().cpu())
+            probabilities = torch.sigmoid(logits).squeeze(0).detach().cpu().numpy()
+            mask = weights > 0.0
+            pred_values = (probabilities[mask] >= float(threshold)).astype(np.int32)
+            label_values = (labels[mask] > 0.5).astype(np.int32)
+            counts["frames"] += int(label_values.size)
+            counts["correct"] += int((pred_values == label_values).sum())
+            counts["positives"] += int(label_values.sum())
+            counts["predicted_positives"] += int(pred_values.sum())
+            counts["true_positive"] += int(np.logical_and(label_values == 1, pred_values == 1).sum())
+            counts["false_positive"] += int(np.logical_and(label_values == 0, pred_values == 1).sum())
+            counts["false_negative"] += int(np.logical_and(label_values == 1, pred_values == 0).sum())
+            windows += 1
+    metrics = metrics_from_frame_counts(counts=counts, windows=windows, threshold=threshold)
+    return {
+        "loss": loss_sum / max(1e-6, weight_sum),
+        "frame_accuracy": metrics.frame_accuracy,
+        "positive_ratio": metrics.positive_ratio,
+        "predicted_positive_ratio": metrics.predicted_positive_ratio,
+        "precision": metrics.precision,
+        "recall": metrics.recall,
+        "f1": metrics.f1,
+        "frames": counts["frames"],
+        "windows": windows,
+    }
 
 
 def frame_classification_counts(
@@ -199,6 +493,45 @@ def build_feature_windows(
             )
         )
     return windows
+
+
+def _feature_row_frame_count(row: Mapping[str, Any], records: list[LabelRecord]) -> int:
+    try:
+        label_index = int(row["label_index"])
+        record = records[label_index]
+        return min(
+            int(row.get("frame_count") or len(record.speech_frames)),
+            len(record.speech_frames),
+            len(effective_frame_weights(record)),
+        )
+    except (IndexError, KeyError, TypeError, ValueError):
+        return 0
+
+
+def _feature_training_arrays(
+    *,
+    row: Mapping[str, Any],
+    records: list[LabelRecord],
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    label_index = int(row["label_index"])
+    record = records[label_index]
+    ptm, mfcc = load_cached_feature(Path(str(row["feature_path"])))
+    weights = effective_frame_weights(record)
+    frame_total = min(ptm.shape[0], mfcc.shape[0], len(record.speech_frames), len(weights))
+    if frame_total <= 0:
+        raise ValueError(f"feature row has no usable frames: label_index={label_index}")
+    features = np.concatenate(
+        [
+            np.ascontiguousarray(ptm[:frame_total], dtype=np.float32),
+            np.ascontiguousarray(mfcc[:frame_total], dtype=np.float32),
+        ],
+        axis=1,
+    )
+    return (
+        features,
+        np.asarray(record.speech_frames[:frame_total], dtype=np.float32),
+        np.asarray(weights[:frame_total], dtype=np.float32),
+    )
 
 
 def resize_binary_frames(values: np.ndarray, target_frames: int) -> np.ndarray:
