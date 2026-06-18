@@ -191,27 +191,33 @@ def load_quality(path: Path | None) -> dict[str, Any]:
 def page_html(*, title: str, dataset: dict[str, Any]) -> str:
     data_json = json.dumps(dataset, ensure_ascii=False, sort_keys=True).replace("</", "<\\/")
     media_mode = str(dataset.get("media_mode") or "video")
+    cases = dataset.get("cases") or []
+    first_case = cases[0] if cases and isinstance(cases[0], dict) else {}
+    old_label_text = str((first_case.get("old") or {}).get("label") or "旧")
+    new_label_text = str((first_case.get("new") or {}).get("label") or "新")
+    old_label_html = html.escape(old_label_text)
+    new_label_html = html.escape(new_label_text)
     if media_mode == "audio":
-        stage_html = """
+        stage_html = f"""
     <div class="stage audio-stage">
-      <div class="subtitle audio-subtitle old"><span class="tag">旧</span><span id="oldOverlay"></span></div>
+      <div class="subtitle audio-subtitle old"><span class="tag">{old_label_html}</span><span id="oldOverlay"></span></div>
       <audio id="video" controls preload="metadata"></audio>
-      <div class="subtitle audio-subtitle new"><span class="tag">新</span><span id="newOverlay"></span></div>
+      <div class="subtitle audio-subtitle new"><span class="tag">{new_label_html}</span><span id="newOverlay"></span></div>
     </div>
 """
-        media_hint = "旧字幕显示在音频控件上方，新字幕显示在音频控件下方。这里直接比较完整日语 SRT 的显示效果。"
+        media_hint = f"{old_label_text} 字幕显示在音频控件上方，{new_label_text} 字幕显示在音频控件下方。这里直接比较完整日语 SRT 的显示效果。"
         media_link_label = "音频源"
     else:
-        stage_html = """
+        stage_html = f"""
     <div class="stage">
       <video id="video" controls preload="metadata" playsinline></video>
       <div class="subtitle-layer">
-        <div class="subtitle old"><span class="tag">旧</span><span id="oldOverlay"></span></div>
-        <div class="subtitle new"><span class="tag">新</span><span id="newOverlay"></span></div>
+        <div class="subtitle old"><span class="tag">{old_label_html}</span><span id="oldOverlay"></span></div>
+        <div class="subtitle new"><span class="tag">{new_label_html}</span><span id="newOverlay"></span></div>
       </div>
     </div>
 """
-        media_hint = "旧字幕显示在视频上方，新字幕显示在视频下方。这里直接比较完整日语 SRT 的显示效果，浏览器原生字幕轨不参与渲染。"
+        media_hint = f"{old_label_text} 字幕显示在视频上方，{new_label_text} 字幕显示在视频下方。这里直接比较完整日语 SRT 的显示效果，浏览器原生字幕轨不参与渲染。"
         media_link_label = "视频"
     return f"""<!doctype html>
 <html lang="zh-CN">
@@ -330,11 +336,11 @@ a {{ color: #0f5f57; }}
       <section class="panel">
         <div class="now-grid">
           <div class="cue-box">
-            <div class="cue-title"><strong class="old-label">旧字幕当前 cue</strong><span id="oldCount"></span></div>
+            <div class="cue-title"><strong class="old-label">{old_label_html} 当前 cue</strong><span id="oldCount"></span></div>
             <div class="cue-text" id="oldNow"></div>
           </div>
           <div class="cue-box">
-            <div class="cue-title"><strong class="new-label">新字幕当前 cue</strong><span id="newCount"></span></div>
+            <div class="cue-title"><strong class="new-label">{new_label_html} 当前 cue</strong><span id="newCount"></span></div>
             <div class="cue-text" id="newNow"></div>
           </div>
         </div>
@@ -402,9 +408,9 @@ function renderHotspots() {{
     <h2 style="margin:0 0 10px;font-size:15px;">差异窗口</h2>
     ${{item.hotspots.map((row, index) => `
       <button class="hotspot ${{index === hotspotIndex ? "active" : ""}}" data-index="${{index}}">
-        <span class="hotspot-time">${{fmtTime(row.start)}} - ${{fmtTime(row.end)}} · 旧 ${{row.old_count}} / 新 ${{row.new_count}}</span>
-        <span class="hotspot-preview"><b>旧</b> ${{escapeHtml(row.old_preview || "(empty)")}}</span>
-        <span class="hotspot-preview"><b>新</b> ${{escapeHtml(row.new_preview || "(empty)")}}</span>
+        <span class="hotspot-time">${{fmtTime(row.start)}} - ${{fmtTime(row.end)}} · ${{escapeHtml(item.old.label || "旧")}} ${{row.old_count}} / ${{escapeHtml(item.new.label || "新")}} ${{row.new_count}}</span>
+        <span class="hotspot-preview"><b>${{escapeHtml(item.old.label || "旧")}}</b> ${{escapeHtml(row.old_preview || "(empty)")}}</span>
+        <span class="hotspot-preview"><b>${{escapeHtml(item.new.label || "新")}}</b> ${{escapeHtml(row.new_preview || "(empty)")}}</span>
       </button>
     `).join("")}}
   `;
@@ -419,10 +425,10 @@ function renderHotspots() {{
 function renderLinks(item) {{
   document.getElementById("links").innerHTML = `
     <a href="${{escapeHtml(item.media)}}">{html.escape(media_link_label)}</a>
-    <a href="${{escapeHtml(item.old.srt_url)}}">旧 SRT</a>
-    <a href="${{escapeHtml(item.new.srt_url)}}">新 SRT</a>
-    <a href="${{escapeHtml(item.old.vtt_url)}}">旧 VTT</a>
-    <a href="${{escapeHtml(item.new.vtt_url)}}">新 VTT</a>
+    <a href="${{escapeHtml(item.old.srt_url)}}">${{escapeHtml(item.old.label || "旧")}} SRT</a>
+    <a href="${{escapeHtml(item.new.srt_url)}}">${{escapeHtml(item.new.label || "新")}} SRT</a>
+    <a href="${{escapeHtml(item.old.vtt_url)}}">${{escapeHtml(item.old.label || "旧")}} VTT</a>
+    <a href="${{escapeHtml(item.new.vtt_url)}}">${{escapeHtml(item.new.label || "新")}} VTT</a>
   `;
 }}
 function loadCase(index) {{

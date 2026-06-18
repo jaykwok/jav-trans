@@ -14,7 +14,9 @@ from boundary.ja.dataset import effective_frame_weights
 from boundary.ja.features import load_cached_feature
 from boundary.ja.manifest import TrainingExample
 from boundary.ja.model import (
-    FeatureFrameScorer,
+    MAMBA2_FRAME_SCORER_OUTPUT_DIM,
+    MAMBA2_FRAME_SCORER_SCHEMA,
+    build_feature_frame_scorer_model,
     TinyFrameClassifier,
     build_feature_frame_scorer_checkpoint,
 )
@@ -61,23 +63,44 @@ class FeatureScorerTrainConfig:
     seed: int = 13
     device: str = "cpu"
     hidden_size: int = 128
-    dropout: float = 0.05
+    num_layers: int = 2
+    state_size: int = 32
+    num_heads: int = 4
+    n_groups: int = 2
+    chunk_size: int = 8
+    bidirectional: bool = True
+    positive_weight: float = 1.0
+    negative_weight: float = 15.0
+    cut_positive_weight: float = 4.0
+    cut_negative_weight: float = 1.0
+    cut_loss_weight: float = 1.0
+    cut_min_gap_s: float = 0.5
+    cut_boundary_radius_frames: int = 1
+    focal_gamma: float = 2.0
     eval_ratio: float = 0.1
     threshold: float = 0.5
+    cut_threshold: float = 0.5
     max_eval_windows: int = 256
 
 
 @dataclass(frozen=True)
 class FeatureScorerTrainMetrics:
+    schema: str
     steps: int
     loss: float
     eval_loss: float
-    frame_accuracy: float
-    positive_ratio: float
-    predicted_positive_ratio: float
-    precision: float
-    recall: float
-    f1: float
+    speech_frame_accuracy: float
+    speech_positive_ratio: float
+    speech_predicted_positive_ratio: float
+    speech_precision: float
+    speech_recall: float
+    speech_f1: float
+    cut_frame_accuracy: float
+    cut_positive_ratio: float
+    cut_predicted_positive_ratio: float
+    cut_precision: float
+    cut_recall: float
+    cut_f1: float
     train_windows: int
     eval_windows: int
     input_dim: int
@@ -86,6 +109,13 @@ class FeatureScorerTrainMetrics:
     checkpoint: str
     metrics_path: str
     threshold: float
+    cut_threshold: float
+    positive_weight: float
+    negative_weight: float
+    cut_positive_weight: float
+    cut_negative_weight: float
+    cut_loss_weight: float
+    focal_gamma: float
 
 
 def train_tiny_frame_classifier(
@@ -168,7 +198,6 @@ def train_feature_frame_scorer(
     feature_manifest_path: str = "",
 ) -> FeatureScorerTrainMetrics:
     import torch
-    from torch import nn
 
     rows = [dict(row) for row in feature_manifest_rows]
     if not rows:
@@ -179,6 +208,23 @@ def train_feature_frame_scorer(
     rows = [row for row in rows if _feature_row_frame_count(row, records) > 0]
     if not rows:
         raise ValueError("no feature rows have usable frames")
+    schema = MAMBA2_FRAME_SCORER_SCHEMA
+    if config.positive_weight <= 0.0:
+        raise ValueError("positive_weight must be positive")
+    if config.negative_weight <= 0.0:
+        raise ValueError("negative_weight must be positive")
+    if config.cut_positive_weight <= 0.0:
+        raise ValueError("cut_positive_weight must be positive")
+    if config.cut_negative_weight <= 0.0:
+        raise ValueError("cut_negative_weight must be positive")
+    if config.cut_loss_weight <= 0.0:
+        raise ValueError("cut_loss_weight must be positive")
+    if config.cut_min_gap_s < 0.0:
+        raise ValueError("cut_min_gap_s must be non-negative")
+    if config.cut_boundary_radius_frames < 0:
+        raise ValueError("cut_boundary_radius_frames must be non-negative")
+    if config.focal_gamma < 0.0:
+        raise ValueError("focal_gamma must be non-negative")
 
     ptm_dim = int(rows[0]["ptm_dim"])
     mfcc_dim = int(rows[0]["mfcc_dim"])
@@ -194,16 +240,22 @@ def train_feature_frame_scorer(
     ) if len(rows) > 1 else 0
     eval_rows = [rows[index] for index in order[:eval_count]]
     train_rows = [rows[index] for index in order[eval_count:]] or list(rows)
-    normalization = compute_feature_normalization(records=records, feature_manifest_rows=train_rows)
+    normalization = compute_feature_normalization(
+        records=records,
+        feature_manifest_rows=train_rows,
+        cut_min_gap_s=config.cut_min_gap_s,
+        cut_boundary_radius_frames=config.cut_boundary_radius_frames,
+    )
 
     device = torch.device(config.device)
-    model = FeatureFrameScorer(
+    model_config = feature_scorer_model_config(
+        ptm_dim=ptm_dim,
+        mfcc_dim=mfcc_dim,
         input_dim=input_dim,
-        hidden_size=config.hidden_size,
-        dropout=config.dropout,
-    ).to(device)
+        config=config,
+    )
+    model = build_feature_frame_scorer_model(schema=schema, model_config=model_config).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=config.learning_rate)
-    criterion = nn.BCEWithLogitsLoss(reduction="none")
     train_order = shuffled_window_order(len(train_rows), seed=config.seed)
     losses: list[float] = []
 
@@ -213,6 +265,8 @@ def train_feature_frame_scorer(
             row=row,
             records=records,
             normalization=normalization,
+            cut_min_gap_s=config.cut_min_gap_s,
+            cut_boundary_radius_frames=config.cut_boundary_radius_frames,
         )
         if float(np.sum(weights)) <= 0.0:
             continue
@@ -220,8 +274,17 @@ def train_feature_frame_scorer(
         label_tensor = torch.from_numpy(labels).to(device).unsqueeze(0)
         weight_tensor = torch.from_numpy(weights).to(device).unsqueeze(0)
         logits = model(feature_tensor)
-        loss_values = criterion(logits, label_tensor)
-        loss = (loss_values * weight_tensor).sum() / weight_tensor.sum().clamp_min(1e-6)
+        loss, _effective_weight_sum = weighted_frame_bce_loss(
+            logits,
+            label_tensor,
+            weight_tensor,
+            positive_weight=config.positive_weight,
+            negative_weight=config.negative_weight,
+            cut_positive_weight=config.cut_positive_weight,
+            cut_negative_weight=config.cut_negative_weight,
+            cut_loss_weight=config.cut_loss_weight,
+            focal_gamma=config.focal_gamma,
+        )
         optimizer.zero_grad(set_to_none=True)
         loss.backward()
         optimizer.step()
@@ -234,45 +297,63 @@ def train_feature_frame_scorer(
         normalization=normalization,
         device=device,
         threshold=config.threshold,
+        cut_threshold=config.cut_threshold,
         max_windows=config.max_eval_windows,
+        positive_weight=config.positive_weight,
+        negative_weight=config.negative_weight,
+        cut_positive_weight=config.cut_positive_weight,
+        cut_negative_weight=config.cut_negative_weight,
+        cut_loss_weight=config.cut_loss_weight,
+        cut_min_gap_s=config.cut_min_gap_s,
+        cut_boundary_radius_frames=config.cut_boundary_radius_frames,
+        focal_gamma=config.focal_gamma,
     )
     checkpoint_path = output_dir / "speech_boundary_ja_feature_scorer.pt"
     metrics_path = output_dir / "train_metrics.json"
-    model_config = {
-        "ptm_dim": ptm_dim,
-        "mfcc_dim": mfcc_dim,
-        "input_dim": input_dim,
-        "hidden_size": int(config.hidden_size),
-        "dropout": float(config.dropout),
-    }
     torch.save(
         build_feature_frame_scorer_checkpoint(
             model=model,
             model_config=model_config,
             normalization=normalization,
             metadata={
-                "operating_point": "qwen-feature-scorer-hard-negative-v1",
+                "operating_point": "qwen-mamba2-frame-boundary-scorer-synthetic-v3",
                 "labels": labels_path,
                 "feature_manifest": feature_manifest_path,
                 "records": len(records),
                 "train_windows": len(train_rows),
                 "eval_windows": len(eval_rows),
                 "trained_steps": int(config.max_steps),
+                "loss": {
+                    "positive_weight": float(config.positive_weight),
+                    "negative_weight": float(config.negative_weight),
+                    "cut_positive_weight": float(config.cut_positive_weight),
+                    "cut_negative_weight": float(config.cut_negative_weight),
+                    "cut_loss_weight": float(config.cut_loss_weight),
+                    "focal_gamma": float(config.focal_gamma),
+                },
                 "config": asdict(config),
             },
+            schema=schema,
         ),
         checkpoint_path,
     )
     metrics = FeatureScorerTrainMetrics(
+        schema=schema,
         steps=config.max_steps,
         loss=float(np.mean(losses)) if losses else 0.0,
         eval_loss=float(eval_metrics["loss"]),
-        frame_accuracy=float(eval_metrics["frame_accuracy"]),
-        positive_ratio=float(eval_metrics["positive_ratio"]),
-        predicted_positive_ratio=float(eval_metrics["predicted_positive_ratio"]),
-        precision=float(eval_metrics["precision"]),
-        recall=float(eval_metrics["recall"]),
-        f1=float(eval_metrics["f1"]),
+        speech_frame_accuracy=float(eval_metrics["speech_frame_accuracy"]),
+        speech_positive_ratio=float(eval_metrics["speech_positive_ratio"]),
+        speech_predicted_positive_ratio=float(eval_metrics["speech_predicted_positive_ratio"]),
+        speech_precision=float(eval_metrics["speech_precision"]),
+        speech_recall=float(eval_metrics["speech_recall"]),
+        speech_f1=float(eval_metrics["speech_f1"]),
+        cut_frame_accuracy=float(eval_metrics["cut_frame_accuracy"]),
+        cut_positive_ratio=float(eval_metrics["cut_positive_ratio"]),
+        cut_predicted_positive_ratio=float(eval_metrics["cut_predicted_positive_ratio"]),
+        cut_precision=float(eval_metrics["cut_precision"]),
+        cut_recall=float(eval_metrics["cut_recall"]),
+        cut_f1=float(eval_metrics["cut_f1"]),
         train_windows=len(train_rows),
         eval_windows=len(eval_rows),
         input_dim=input_dim,
@@ -281,6 +362,13 @@ def train_feature_frame_scorer(
         checkpoint=str(checkpoint_path),
         metrics_path=str(metrics_path),
         threshold=float(config.threshold),
+        cut_threshold=float(config.cut_threshold),
+        positive_weight=float(config.positive_weight),
+        negative_weight=float(config.negative_weight),
+        cut_positive_weight=float(config.cut_positive_weight),
+        cut_negative_weight=float(config.cut_negative_weight),
+        cut_loss_weight=float(config.cut_loss_weight),
+        focal_gamma=float(config.focal_gamma),
     )
     metrics_path.write_text(
         json.dumps(asdict(metrics), ensure_ascii=False, indent=2, sort_keys=True),
@@ -289,18 +377,92 @@ def train_feature_frame_scorer(
     return metrics
 
 
+def feature_scorer_model_config(
+    *,
+    ptm_dim: int,
+    mfcc_dim: int,
+    input_dim: int,
+    config: FeatureScorerTrainConfig,
+) -> dict[str, Any]:
+    model_config: dict[str, Any] = {
+        "ptm_dim": int(ptm_dim),
+        "mfcc_dim": int(mfcc_dim),
+        "input_dim": int(input_dim),
+        "hidden_size": int(config.hidden_size),
+        "num_layers": int(config.num_layers),
+        "state_size": int(config.state_size),
+        "num_heads": int(config.num_heads),
+        "n_groups": int(config.n_groups),
+        "chunk_size": int(config.chunk_size),
+        "bidirectional": bool(config.bidirectional),
+        "output_dim": MAMBA2_FRAME_SCORER_OUTPUT_DIM,
+    }
+    return model_config
+
+
+def weighted_frame_bce_loss(
+    logits,
+    labels,
+    frame_weights,
+    *,
+    positive_weight: float = 1.0,
+    negative_weight: float = 1.0,
+    cut_positive_weight: float = 4.0,
+    cut_negative_weight: float = 1.0,
+    cut_loss_weight: float = 1.0,
+    focal_gamma: float = 0.0,
+):
+    import torch
+    import torch.nn.functional as F
+
+    if tuple(logits.shape) != tuple(labels.shape):
+        raise ValueError("logits and labels must have identical [batch, frames, 2] shape")
+    if tuple(frame_weights.shape) != tuple(labels.shape):
+        raise ValueError("frame_weights and labels must have identical [batch, frames, 2] shape")
+    if labels.ndim != 3 or int(labels.shape[-1]) != MAMBA2_FRAME_SCORER_OUTPUT_DIM:
+        raise ValueError(f"feature scorer labels must have shape [batch, frames, {MAMBA2_FRAME_SCORER_OUTPUT_DIM}]")
+    loss_values = F.binary_cross_entropy_with_logits(logits, labels, reduction="none")
+    speech_class_weights = torch.where(
+        labels[..., 0] > 0.5,
+        torch.full_like(labels[..., 0], float(positive_weight)),
+        torch.full_like(labels[..., 0], float(negative_weight)),
+    )
+    cut_class_weights = torch.where(
+        labels[..., 1] > 0.5,
+        torch.full_like(labels[..., 1], float(cut_positive_weight)),
+        torch.full_like(labels[..., 1], float(cut_negative_weight)),
+    )
+    class_weights = torch.stack((speech_class_weights, cut_class_weights), dim=-1)
+    head_weights = torch.ones_like(class_weights)
+    head_weights[..., 1] = float(cut_loss_weight)
+    if float(focal_gamma) > 0.0:
+        probabilities = torch.sigmoid(logits)
+        pt = torch.where(labels > 0.5, probabilities, 1.0 - probabilities)
+        loss_values = loss_values * torch.pow((1.0 - pt).clamp(min=0.0, max=1.0), float(focal_gamma))
+    effective_weights = frame_weights * class_weights * head_weights
+    weight_sum = effective_weights.sum().clamp_min(1e-6)
+    return (loss_values * effective_weights).sum() / weight_sum, weight_sum
+
+
 def compute_feature_normalization(
     *,
     records: list[LabelRecord],
     feature_manifest_rows: Iterable[Mapping[str, Any]],
+    cut_min_gap_s: float = 0.5,
+    cut_boundary_radius_frames: int = 1,
 ) -> dict[str, Any]:
     total_weight = 0.0
     feature_sum: np.ndarray | None = None
     feature_square_sum: np.ndarray | None = None
     frame_count_total = 0
     for row in feature_manifest_rows:
-        features, _labels, weights = _feature_training_arrays(row=row, records=records)
-        frame_weight = weights.reshape(-1, 1).astype(np.float64, copy=False)
+        features, _labels, weights = _feature_training_arrays(
+            row=row,
+            records=records,
+            cut_min_gap_s=cut_min_gap_s,
+            cut_boundary_radius_frames=cut_boundary_radius_frames,
+        )
+        frame_weight = np.max(weights, axis=1, keepdims=True).astype(np.float64, copy=False)
         if float(frame_weight.sum()) <= 0.0:
             continue
         values = features.astype(np.float64, copy=False)
@@ -329,8 +491,15 @@ def feature_training_tensors(
     row: Mapping[str, Any],
     records: list[LabelRecord],
     normalization: Mapping[str, Any],
+    cut_min_gap_s: float = 0.5,
+    cut_boundary_radius_frames: int = 1,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    features, labels, weights = _feature_training_arrays(row=row, records=records)
+    features, labels, weights = _feature_training_arrays(
+        row=row,
+        records=records,
+        cut_min_gap_s=cut_min_gap_s,
+        cut_boundary_radius_frames=cut_boundary_radius_frames,
+    )
     mean = np.asarray(normalization["feature_mean"], dtype=np.float32)
     std = np.asarray(normalization["feature_std"], dtype=np.float32)
     if int(mean.shape[0]) != int(features.shape[1]) or int(std.shape[0]) != int(features.shape[1]):
@@ -351,21 +520,20 @@ def evaluate_feature_frame_scorer(
     normalization: Mapping[str, Any],
     device: Any,
     threshold: float = 0.5,
+    cut_threshold: float = 0.5,
     max_windows: int = 256,
+    positive_weight: float = 1.0,
+    negative_weight: float = 15.0,
+    cut_positive_weight: float = 4.0,
+    cut_negative_weight: float = 1.0,
+    cut_loss_weight: float = 1.0,
+    cut_min_gap_s: float = 0.5,
+    cut_boundary_radius_frames: int = 1,
+    focal_gamma: float = 2.0,
 ) -> dict[str, float | int]:
     import torch
-    from torch import nn
-
-    criterion = nn.BCEWithLogitsLoss(reduction="none")
-    counts = {
-        "frames": 0,
-        "correct": 0,
-        "positives": 0,
-        "predicted_positives": 0,
-        "true_positive": 0,
-        "false_positive": 0,
-        "false_negative": 0,
-    }
+    speech_counts = empty_frame_counts()
+    cut_counts = empty_frame_counts()
     loss_sum = 0.0
     weight_sum = 0.0
     windows = 0
@@ -378,6 +546,8 @@ def evaluate_feature_frame_scorer(
                 row=row,
                 records=records,
                 normalization=normalization,
+                cut_min_gap_s=cut_min_gap_s,
+                cut_boundary_radius_frames=cut_boundary_radius_frames,
             )
             if float(np.sum(weights)) <= 0.0:
                 continue
@@ -385,45 +555,60 @@ def evaluate_feature_frame_scorer(
             label_tensor = torch.from_numpy(labels).to(device).unsqueeze(0)
             weight_tensor = torch.from_numpy(weights).to(device).unsqueeze(0)
             logits = model(feature_tensor)
-            loss_values = criterion(logits, label_tensor)
-            loss_sum += float((loss_values * weight_tensor).sum().detach().cpu())
-            weight_sum += float(weight_tensor.sum().detach().cpu())
+            loss, effective_weight_sum = weighted_frame_bce_loss(
+                logits,
+                label_tensor,
+                weight_tensor,
+                positive_weight=positive_weight,
+                negative_weight=negative_weight,
+                cut_positive_weight=cut_positive_weight,
+                cut_negative_weight=cut_negative_weight,
+                cut_loss_weight=cut_loss_weight,
+                focal_gamma=focal_gamma,
+            )
+            loss_sum += float((loss * effective_weight_sum).detach().cpu())
+            weight_sum += float(effective_weight_sum.detach().cpu())
             probabilities = torch.sigmoid(logits).squeeze(0).detach().cpu().numpy()
-            mask = weights > 0.0
-            pred_values = (probabilities[mask] >= float(threshold)).astype(np.int32)
-            label_values = (labels[mask] > 0.5).astype(np.int32)
-            counts["frames"] += int(label_values.size)
-            counts["correct"] += int((pred_values == label_values).sum())
-            counts["positives"] += int(label_values.sum())
-            counts["predicted_positives"] += int(pred_values.sum())
-            counts["true_positive"] += int(np.logical_and(label_values == 1, pred_values == 1).sum())
-            counts["false_positive"] += int(np.logical_and(label_values == 0, pred_values == 1).sum())
-            counts["false_negative"] += int(np.logical_and(label_values == 1, pred_values == 0).sum())
+            speech_mask = weights[:, 0] > 0.0
+            if bool(speech_mask.any()):
+                update_frame_counts(
+                    speech_counts,
+                    labels=labels[:, 0][speech_mask],
+                    predictions=(probabilities[:, 0][speech_mask] >= float(threshold)).astype(np.float32),
+                )
+            cut_mask = weights[:, 1] > 0.0
+            if bool(cut_mask.any()):
+                update_frame_counts(
+                    cut_counts,
+                    labels=labels[:, 1][cut_mask],
+                    predictions=(probabilities[:, 1][cut_mask] >= float(cut_threshold)).astype(np.float32),
+                )
             windows += 1
-    metrics = metrics_from_frame_counts(counts=counts, windows=windows, threshold=threshold)
+    speech_metrics = metrics_from_frame_counts(counts=speech_counts, windows=windows, threshold=threshold)
+    cut_metrics = metrics_from_frame_counts(counts=cut_counts, windows=windows, threshold=cut_threshold)
     return {
         "loss": loss_sum / max(1e-6, weight_sum),
-        "frame_accuracy": metrics.frame_accuracy,
-        "positive_ratio": metrics.positive_ratio,
-        "predicted_positive_ratio": metrics.predicted_positive_ratio,
-        "precision": metrics.precision,
-        "recall": metrics.recall,
-        "f1": metrics.f1,
-        "frames": counts["frames"],
+        "speech_frame_accuracy": speech_metrics.frame_accuracy,
+        "speech_positive_ratio": speech_metrics.positive_ratio,
+        "speech_predicted_positive_ratio": speech_metrics.predicted_positive_ratio,
+        "speech_precision": speech_metrics.precision,
+        "speech_recall": speech_metrics.recall,
+        "speech_f1": speech_metrics.f1,
+        "speech_frames": speech_counts["frames"],
+        "cut_frame_accuracy": cut_metrics.frame_accuracy,
+        "cut_positive_ratio": cut_metrics.positive_ratio,
+        "cut_predicted_positive_ratio": cut_metrics.predicted_positive_ratio,
+        "cut_precision": cut_metrics.precision,
+        "cut_recall": cut_metrics.recall,
+        "cut_f1": cut_metrics.f1,
+        "cut_frames": cut_counts["frames"],
         "windows": windows,
     }
 
 
-def frame_classification_counts(
-    *,
-    labels: Iterable[int | float],
-    predictions: Iterable[int | float],
-) -> dict[str, int]:
-    label_values = [1 if float(value) > 0.5 else 0 for value in labels]
-    pred_values = [1 if float(value) > 0.5 else 0 for value in predictions]
-    frame_total = min(len(label_values), len(pred_values))
-    counts = {
-        "frames": frame_total,
+def empty_frame_counts() -> dict[str, int]:
+    return {
+        "frames": 0,
         "correct": 0,
         "positives": 0,
         "predicted_positives": 0,
@@ -431,6 +616,17 @@ def frame_classification_counts(
         "false_positive": 0,
         "false_negative": 0,
     }
+
+
+def update_frame_counts(
+    counts: dict[str, int],
+    *,
+    labels: Iterable[int | float],
+    predictions: Iterable[int | float],
+) -> None:
+    label_values = [1 if float(value) > 0.5 else 0 for value in labels]
+    pred_values = [1 if float(value) > 0.5 else 0 for value in predictions]
+    frame_total = min(len(label_values), len(pred_values))
     for label, prediction in zip(label_values[:frame_total], pred_values[:frame_total]):
         counts["correct"] += int(label == prediction)
         counts["positives"] += int(label)
@@ -438,6 +634,16 @@ def frame_classification_counts(
         counts["true_positive"] += int(label and prediction)
         counts["false_positive"] += int((not label) and prediction)
         counts["false_negative"] += int(label and (not prediction))
+    counts["frames"] += frame_total
+
+
+def frame_classification_counts(
+    *,
+    labels: Iterable[int | float],
+    predictions: Iterable[int | float],
+) -> dict[str, int]:
+    counts = empty_frame_counts()
+    update_frame_counts(counts, labels=labels, predictions=predictions)
     return counts
 
 
@@ -512,14 +718,26 @@ def _feature_training_arrays(
     *,
     row: Mapping[str, Any],
     records: list[LabelRecord],
+    cut_min_gap_s: float = 0.5,
+    cut_boundary_radius_frames: int = 1,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     label_index = int(row["label_index"])
     record = records[label_index]
     ptm, mfcc = load_cached_feature(Path(str(row["feature_path"])))
-    weights = effective_frame_weights(record)
-    frame_total = min(ptm.shape[0], mfcc.shape[0], len(record.speech_frames), len(weights))
+    base_weights = np.asarray(effective_frame_weights(record), dtype=np.float32)
+    frame_total = min(ptm.shape[0], mfcc.shape[0], len(record.speech_frames), len(base_weights))
     if frame_total <= 0:
         raise ValueError(f"feature row has no usable frames: label_index={label_index}")
+    _starts, _ends, cut_drops, cut_points = endpoint_targets_from_record(
+        record,
+        frame_count=frame_total,
+        boundary_radius_frames=0,
+        cut_min_gap_s=cut_min_gap_s,
+        cut_boundary_radius_frames=cut_boundary_radius_frames,
+    )
+    speech_labels = np.asarray(record.speech_frames[:frame_total], dtype=np.float32)
+    cut_labels = np.maximum(cut_drops[:frame_total], cut_points[:frame_total]).astype(np.float32)
+    frame_weights = base_weights[:frame_total].astype(np.float32, copy=False)
     features = np.concatenate(
         [
             np.ascontiguousarray(ptm[:frame_total], dtype=np.float32),
@@ -529,8 +747,8 @@ def _feature_training_arrays(
     )
     return (
         features,
-        np.asarray(record.speech_frames[:frame_total], dtype=np.float32),
-        np.asarray(weights[:frame_total], dtype=np.float32),
+        np.stack((speech_labels, cut_labels), axis=1).astype(np.float32, copy=False),
+        np.stack((frame_weights, frame_weights), axis=1).astype(np.float32, copy=False),
     )
 
 

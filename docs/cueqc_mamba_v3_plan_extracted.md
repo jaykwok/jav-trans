@@ -76,18 +76,22 @@ The safety objective is conservative subtraction: maximize keep recall and minim
 - Adaptive threshold profile: base `drop_threshold=0.85`，`text_bucket=short_text` 提升到 `0.87`，由 `src/asr/cueqc_thresholds.py` 在 runtime 与 offline prediction 共用。
 - Adaptive 10-film prediction: `agents/temp/20260617_174344_cueqc-v3-stage2b-adaptive-10film-predictions/`，records `45643`，`drop=19380/keep=26263`，high-confidence pseudo `drop=19380/keep=1372`。
 - NAMH-055 Web full-workflow smoke after Stage 2b promotion: job `38a5d14ea1a54236a24b56e716f36175` completed with `translation_skipped=true`，CueQC `candidates=3199/drop=1052/keep=2147/fallback=0`，最终 `transcript_chunks=2147/segments=2157/blocks=2087`，输出 `video/NAMH-055.ja.srt`，summary 为 `agents/temp/20260617_191654_web-smoke-namh055-cueqc-batched/job_summary.json`。
-- Stage 3 Boundary hard-case candidate export: `tools.boundary.export_cueqc_drop_hardcases` 已把三轮 false-drop 审计导出到 `agents/temp/20260617_214103_boundary-hardcase-candidates-from-cueqc/`。原始标签 `600` 行，去重后 `578` 个 unique item，其中 `551` 个 confirmed drop candidate，`27` 个 safety holdout；候选 route 为 `speech_boundary_frame_negative_candidate=522`、`boundary_preference_candidate=29`。该产物仍是候选 manifest，不是可直接训练 v5.1 的 delta dataset。
-- Stage 3 v5.1 source preparation: `tools.boundary.prepare_cueqc_drop_v51_sources` 已使用三份审计页的 `cueqc_prediction_audit_items.jsonl` 补回音频路径，并生成 `agents/temp/20260617_220854_boundary-v5.1-sources-from-cueqc/`。`522/522` 个 frame-negative candidate 已切出短音频并生成 SpeechBoundary-JA negative labels/training manifest，`29` 个 Boundary preference seed 已保留上下文字幕和 aligned segments；`missing_audit_item_samples=0`、`frame_negative_skipped=0`。该步骤仍不生成 `boundary_refiner_frame_sequence_dataset_v5`。
-- Stage 3 SpeechBoundary-JA hard-negative readiness: `tools.boundary.prepare_speech_boundary_hard_negative_finetune` 的 negative-only gate 先确认 522 条 negative examples 全部可解析，但缺少 anchor 时 `formal_training_ready=false`。随后 `tools.boundary.ja.build_positive_anchor_replay` 已按 `anime_nsfw=55 / anime_sfw=20 / galgame=25` 生成 `agents/temp/20260617_230636_speech-boundary-positive-anchor-replay/`，共 1500 条 positive anchors，实际 `anime_nsfw=825/anime_sfw=300/galgame=375`。混合 gate 包 `agents/temp/20260617_230948_speech-boundary-hard-negative-finetune-prep/` 已输出 `speech_boundary_mixed_hard_negative_anchor_labels.jsonl` / manifest，`records=2022`、`trainable_examples=2022`、`negative_share=0.25816`，`formal_training_ready=true`。
-- Stage 3 SpeechBoundary-JA mixed feature cache / tiny plumbing train: 2026-06-18 已执行 `build_mixed_feature_cache.ps1`，feature summary 为 `cached=2022/skipped=0/errors=0`，label qualities `negative=522/supervised=1500`。随后执行 `tiny_mixed_plumbing_train.ps1`，输出 `tiny-mixed-hard-negative-anchor/speech_boundary_ja_tiny.pt`，metrics 为 `steps=200/loss=0.607988/frame_accuracy=0.73/positive_ratio=0.73`。这只是当前 `train_tiny` research/plumbing artifact，不替换 `qwen-feature-energy-bootstrap-v1` runtime。
-- Stage 3 SpeechBoundary-JA runtime-loadable scorer: 2026-06-18 已新增正式 `speech_boundary_ja_feature_scorer_v1` checkpoint schema、`tools.boundary.ja.train_feature_scorer`、`tools.boundary.ja.evaluate_feature_scorer_thresholds` 和 opt-in runtime env `SPEECH_BOUNDARY_JA_SCORER_CHECKPOINT`。候选 checkpoint 位于 `agents/temp/20260618_093327_speech-boundary-feature-scorer-hard-negative-anchor/speech_boundary_ja_feature_scorer.pt`，sha256 `d99c065bd6164471f54072126caf53d09dbda85db11177ada5de7f302ffbb5d5`；held-out frame metrics 为 `frame_accuracy=0.992343/precision=0.996499/recall=0.995528/f1=0.996013`。CUDA opt-in smoke 已确认 scorer 可加载并导出 frame scores，但短 negative 样本在默认 threshold/dilation 下仍残留短 segment。离线 threshold sweep 位于 `agents/temp/20260618_094005_speech-boundary-feature-scorer-threshold-eval/`，policy `recall>=0.995/FPR<=0.02` 下无 threshold 通过；最佳 F1 threshold `0.5` 为 `recall=0.998066/FPR=0.086026/F1=0.997301`，threshold `0.8` 满足 FPR 但 recall 降到 `0.989536`。默认 runtime 未替换；当前候选需要继续调训练数据比例、损失或阈值策略。
+- Stage 3 SpeechBoundary hard-negative candidate export: 2026-06-18 已按“人工 `drop_ok` 全部直接丢弃”的断兼容规则重新导出 hardnegative-only manifest。三轮 false-drop 审计原始标签 `600` 行，去重后 `578` 个 unique item，其中 `551` 个 confirmed drop candidate、`27` 个 safety holdout；`551/551` 全部 route 为 `speech_boundary_frame_negative_candidate`。分类标签（对话、呻吟、呼吸、环境、短碎片等）只保留为审计元数据，不再决定 route，也不再生成 Boundary Refiner 训练标签。
+- Stage 3 SpeechBoundary hard-negative source preparation: 2026-06-18 已用 hardnegative-only manifest 切出短音频并生成 SpeechBoundary-JA negative labels/training manifest。`551/551` 个 frame-negative candidate 已 materialize，`missing_audit_item_samples=0`、`frame_negative_skipped=0`；该步骤不生成 Boundary Refiner 训练标签。
+- Stage 3 SpeechBoundary-JA hard-negative replay: 三轮 CueQC false-drop 审计得到的 `551` 条人工 `drop_ok` 已确认都是直接丢弃监督，但这些样本来自旧启发式 chunk，因此不再作为 first scorer bootstrap 训练输入。当前只保留为后续自训练/finetune 阶段的 replay material；`tools.boundary.prepare_speech_boundary_hard_negative_replay` 不再生成 scorer 训练脚本。
+- Stage 3 SpeechBoundary-JA v2/neg20-s800 结论：旧 Mamba2 speech-only scorer v2 和 `neg20-s800` 诊断候选已废弃。失败根因是模型只输出 speech score，runtime `cut_probs=0`，长 speech island 会回落到约 3 秒机械切分，导致 NAMH-055 开头“中出し”被拆坏并引发 ASR 误识别。相关 checkpoint 和审计页只保留为失败证据，不作为训练、推广或 runtime 候选。
+- Stage 3 SpeechBoundary-JA first scorer v3: 当前唯一 active 路线是 `speech_boundary_ja_mamba2_frame_boundary_scorer_v3`，Mamba2 输出 `[speech_prob, cut_prob]` 两路 frame score。训练目标来自 synthetic true-structure timeline：`speech_frames` 监督 speech head，`cut_point_segments` 与 `cut_drop_zones` 并集监督 cut/drop gate。旧 v1/v2 checkpoint schema、旧 `mamba2_frame_scorer` model type、旧单通道输出和缺失 `output_dim=2` 的 payload 均 fail-fast 拒绝。
+- Stage 3 SpeechBoundary-JA v3 runtime policy: 默认 runtime 仍是 `qwen-feature-energy-bootstrap-v1`；v3 scorer 只通过 `SPEECH_BOUNDARY_JA_SCORER_CHECKPOINT` opt-in 加载，runtime signature 为 `score_model=mamba2_frame_boundary_scorer`。任何 v3 scorer 必须先经过离线 speech/cut threshold eval、NAMH-055 smoke、人工对比审计和至少一个额外 held-out full-film smoke，才可讨论默认替换。
 
 ## Remaining V3 Plan
 
 - Continue false-drop / keep-recall audits before accepting any new high-confidence drop pseudo labels into training.
 - If more self-training is needed, repeat the Stage 2 loop: predict on full pool, audit false drops, compile accepted labels, retrain, replay all historical false-drop audits, then promote only if keep recall remains safe.
-- Next SpeechBoundary-JA step is improving the opt-in scorer operating point: reduce hard-negative false positives without dropping positive-anchor recall, then rerun threshold eval. Keep `train_tiny` as plumbing-only and do not promote any scorer without downstream smoke plus audit.
-- Convert the `boundary_preference_seed_candidates.jsonl` rows into neighbor-context A/B or explicit start/end delta targets before Boundary Refiner v5.1 training. CueQC decisions must stay offline and must not be coupled into Boundary runtime planning.
+- Build a larger synthetic true-structure first-scorer dataset using the existing v5-style random timeline generator (`tools.boundary.ja.build_galgame_synthetic_timeline`) and local anime/galgame source manifests. This dataset replaces old heuristic-derived hard negatives as the bootstrap source.
+- Generate Qwen PTM + MFCC feature cache for that synthetic dataset, then train `speech_boundary_ja_mamba2_frame_boundary_scorer_v3` with two heads: speech and cut/drop gate.
+- Run offline threshold eval for both heads. Speech threshold must prioritize recall / low false positive rate; cut threshold must be evaluated separately because cut failure causes mechanical island splitting.
+- Run NAMH-055 no-translate smoke against the default baseline, then generate a manual compare page before any default replacement discussion.
+- CueQC `drop_ok` decisions stay offline SpeechBoundary-JA replay material and must not be coupled into Boundary Refiner training or first-scorer bootstrap.
 - Revisit forced `forced/native/hybrid` aligner A/B separately if model size or cost becomes a priority. CueQC v3-Fusion does not decide aligner removal.
 
 ## Active Files
@@ -108,8 +112,13 @@ The safety objective is conservative subtraction: maximize keep recall and minim
 - `tools/asr/cueqc/compile_stage2a_features_v3_fusion.py`
 - `tools/asr/cueqc/train_mamba_v3_fusion.py`
 - `tools/boundary/export_cueqc_drop_hardcases.py`
-- `tools/boundary/prepare_cueqc_drop_v51_sources.py`
-- `tools/boundary/prepare_speech_boundary_hard_negative_finetune.py`
+- `tools/boundary/prepare_cueqc_drop_hard_negative_sources.py`
+- `tools/boundary/prepare_speech_boundary_hard_negative_replay.py`
 - `tools/boundary/ja/build_positive_anchor_replay.py`
+- `tools/boundary/ja/build_galgame_synthetic_timeline.py`
+- `tools/boundary/ja/prepare_frame_boundary_scorer_v3.py`
+- `tools/boundary/ja/build_feature_cache.py`
+- `tools/boundary/ja/train_feature_scorer.py`
+- `tools/boundary/ja/evaluate_feature_scorer_thresholds.py`
 - `tools/audits/generate_cueqc_cluster_audit_html.py`
 - `tools/audits/generate_cueqc_prediction_audit_html.py`

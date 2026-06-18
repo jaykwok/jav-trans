@@ -20,7 +20,7 @@ from boundary.ja.features import (
 )
 from boundary.ja.model import (
     load_feature_frame_scorer_checkpoint,
-    score_feature_frame_probabilities,
+    score_feature_frame_boundary_probabilities,
 )
 from boundary.ja.postprocess import group_segments
 
@@ -357,7 +357,9 @@ class SpeechBoundaryJaBackend:
             "dtype": cfg.dtype,
             "ptm_param_device": ptm_param_device,
             "ptm_param_dtype": ptm_param_dtype,
-            "score_model": "feature_frame_scorer" if scorer is not None else "bootstrap_energy_ptm_mfcc",
+            "score_model": (
+                "mamba2_frame_boundary_scorer" if scorer is not None else "bootstrap_energy_ptm_mfcc"
+            ),
             "scorer_device": str(scorer_device) if scorer is not None else "",
         }
         print(
@@ -406,8 +408,11 @@ class SpeechBoundaryJaBackend:
                         config=feature_config,
                     )
                 else:
-                    probs = score_feature_frame_probabilities(scorer, ptm=ptm, mfcc=mfcc)
-                    cut_probs = np.zeros_like(probs, dtype=np.float32)
+                    probs, cut_probs = score_feature_frame_boundary_probabilities(
+                        scorer,
+                        ptm=ptm,
+                        mfcc=mfcc,
+                    )
                 window_start_s = start_sample / sample_rate
                 global_start = max(0, int(round(window_start_s / cfg.frame_hop_s)))
                 global_end = min(total_frames, global_start + probs.size)

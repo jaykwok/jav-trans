@@ -7,8 +7,8 @@ import numpy as np
 import soundfile as sf
 
 from boundary.ja import build_negative_record, build_supervised_record, write_jsonl
-from tools.boundary.prepare_speech_boundary_hard_negative_finetune import (
-    prepare_hard_negative_finetune,
+from tools.boundary.prepare_speech_boundary_hard_negative_replay import (
+    prepare_hard_negative_replay,
 )
 
 
@@ -21,7 +21,7 @@ def _write_audio(path: Path, duration_s: float = 0.2) -> None:
     sf.write(path, samples, 16000)
 
 
-def test_hard_negative_finetune_prep_blocks_negative_only_training(tmp_path: Path):
+def test_hard_negative_replay_prep_blocks_negative_only_training(tmp_path: Path):
     audio = tmp_path / "neg.wav"
     _write_audio(audio)
     labels = tmp_path / "negative_labels.jsonl"
@@ -39,7 +39,7 @@ def test_hard_negative_finetune_prep_blocks_negative_only_training(tmp_path: Pat
     )
     _write_manifest(manifest, [{"audio_id": "neg", "audio": str(audio), "duration_s": 0.2}])
 
-    summary = prepare_hard_negative_finetune(
+    summary = prepare_hard_negative_replay(
         negative_labels=labels,
         negative_manifest=manifest,
         output_dir=tmp_path / "prep",
@@ -55,7 +55,7 @@ def test_hard_negative_finetune_prep_blocks_negative_only_training(tmp_path: Pat
     assert (tmp_path / "prep" / "tiny_negative_plumbing_smoke.ps1").exists()
 
 
-def test_hard_negative_finetune_prep_passes_with_anchor_examples(tmp_path: Path):
+def test_hard_negative_replay_prep_passes_with_anchor_examples(tmp_path: Path):
     neg_audio = tmp_path / "neg.wav"
     pos_audio = tmp_path / "pos.wav"
     _write_audio(neg_audio)
@@ -91,7 +91,7 @@ def test_hard_negative_finetune_prep_passes_with_anchor_examples(tmp_path: Path)
     _write_manifest(neg_manifest, [{"audio_id": "neg", "audio": str(neg_audio), "duration_s": 0.2}])
     _write_manifest(pos_manifest, [{"audio_id": "pos", "audio": str(pos_audio), "duration_s": 0.2}])
 
-    summary = prepare_hard_negative_finetune(
+    summary = prepare_hard_negative_replay(
         negative_labels=neg_labels,
         negative_manifest=neg_manifest,
         output_dir=tmp_path / "prep",
@@ -112,3 +112,4 @@ def test_hard_negative_finetune_prep_passes_with_anchor_examples(tmp_path: Path)
     assert (tmp_path / "prep" / "speech_boundary_mixed_hard_negative_anchor_manifest.json").exists()
     assert (tmp_path / "prep" / "build_mixed_feature_cache.ps1").exists()
     assert (tmp_path / "prep" / "tiny_mixed_plumbing_train.ps1").exists()
+    assert not (tmp_path / "prep" / "train_mixed_feature_scorer.ps1").exists()

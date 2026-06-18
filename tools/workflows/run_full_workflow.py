@@ -28,6 +28,7 @@ DEFAULT_ASR_BATCH_SIZE_BY_REPO_ENV = ",".join(
     f"{repo_id}={batch_size}"
     for repo_id, batch_size in DEFAULT_QWEN_ASR_BATCH_SIZE_BY_REPO.items()
 )
+DEFAULT_SPEECH_BOUNDARY_OPERATING_POINT = "qwen-feature-energy-bootstrap-v1"
 
 
 @dataclass(frozen=True)
@@ -51,6 +52,23 @@ def timestamped_label(value: str) -> str:
     if re.match(r"^\d{8}_\d{6}_", label):
         return label
     return f"{time.strftime('%Y%m%d_%H%M%S')}_{label}"
+
+
+def speech_boundary_operating_point(results: list[dict[str, Any]]) -> str:
+    for result in results:
+        signature = result.get("boundary_signature") or {}
+        if not isinstance(signature, dict):
+            continue
+        scorer = signature.get("scorer_checkpoint")
+        if isinstance(scorer, dict):
+            metadata = scorer.get("metadata") or {}
+            if isinstance(metadata, dict) and metadata.get("operating_point"):
+                return str(metadata["operating_point"])
+            if scorer.get("schema"):
+                return str(scorer["schema"])
+        if signature.get("operating_point"):
+            return str(signature["operating_point"])
+    return DEFAULT_SPEECH_BOUNDARY_OPERATING_POINT
 
 
 def project_path(value: str | Path) -> Path:
@@ -347,7 +365,7 @@ def write_summary(paths: RunPaths, args: argparse.Namespace, results: list[dict[
         "asr_backend": args.asr_backend,
         "asr_model_path": project_rel(project_path_value(args.asr_model_path)),
         "boundary_backend": "speech_boundary_ja",
-        "speech_boundary_operating_point": "qwen-feature-energy-bootstrap-v1",
+        "speech_boundary_operating_point": speech_boundary_operating_point(results),
         "speech_boundary_threshold": args.speech_boundary_threshold,
         "speech_boundary_frame_dilation_s": args.speech_boundary_frame_dilation_s,
         "boundary_planner": {

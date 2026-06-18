@@ -8,58 +8,59 @@ from typing import Any
 import numpy as np
 
 
-FEATURE_FRAME_SCORER_SCHEMA = "speech_boundary_ja_feature_scorer_v1"
+MAMBA2_FRAME_SCORER_SCHEMA = "speech_boundary_ja_mamba2_frame_boundary_scorer_v3"
+MAMBA2_FRAME_SCORER_MODEL_TYPE = "mamba2_frame_boundary_scorer"
+MAMBA2_FRAME_SCORER_OUTPUT_DIM = 2
 
 
 def count_trainable_parameters(model) -> int:
     return sum(parameter.numel() for parameter in model.parameters() if parameter.requires_grad)
 
 
-class FeatureFrameScorer:
-    """Runtime-loadable frame scorer over normalized PTM+MFCC features."""
+def _bool_config(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "on"}
+    return bool(value)
 
-    def __new__(
-        cls,
-        *,
-        input_dim: int,
-        hidden_size: int = 128,
-        dropout: float = 0.05,
-    ):
-        from torch import nn
 
-        input_dim = int(input_dim)
-        hidden_size = int(hidden_size)
-        dropout = float(dropout)
-        if input_dim <= 0:
-            raise ValueError("input_dim must be positive")
-        if hidden_size <= 0:
-            raise ValueError("hidden_size must be positive")
-        if dropout < 0.0:
-            raise ValueError("dropout must be non-negative")
+def build_feature_frame_scorer_model(*, schema: str, model_config: dict[str, Any]):
+    if schema == MAMBA2_FRAME_SCORER_SCHEMA:
+        from boundary.backbones import TRANSFORMERS_MAMBA2_BACKBONE, BoundarySequenceClassifier
 
-        class _FeatureFrameScorer(nn.Module):
-            def __init__(self) -> None:
-                super().__init__()
-                self.input_dim = input_dim
-                self.hidden_size = hidden_size
-                self.dropout = dropout
-                self.net = nn.Sequential(
-                    nn.Linear(input_dim, hidden_size),
-                    nn.GELU(),
-                    nn.Dropout(dropout),
-                    nn.Linear(hidden_size, max(16, hidden_size // 2)),
-                    nn.GELU(),
-                    nn.Linear(max(16, hidden_size // 2), 1),
-                )
-
-            def forward(self, features):
-                if features.ndim != 3:
-                    raise ValueError(f"features must be [batch, frames, dim], got shape={tuple(features.shape)}")
-                if int(features.shape[-1]) != self.input_dim:
-                    raise ValueError(f"expected input_dim={self.input_dim}, got {int(features.shape[-1])}")
-                return self.net(features).squeeze(-1)
-
-        return _FeatureFrameScorer()
+        for key in ("input_dim", "hidden_size", "num_layers"):
+            if key not in model_config:
+                raise ValueError(f"Mamba2 scorer checkpoint missing model_config.{key}")
+        backbone_kwargs: dict[str, Any] = {
+            "state_size": int(model_config.get("state_size", 32)),
+            "num_heads": int(model_config.get("num_heads", 4)),
+            "n_groups": int(model_config.get("n_groups", 2)),
+            "chunk_size": int(model_config.get("chunk_size", 8)),
+            "bidirectional": _bool_config(model_config.get("bidirectional", True)),
+        }
+        if "head_dim" in model_config:
+            backbone_kwargs["head_dim"] = int(model_config["head_dim"])
+        if "output_dim" not in model_config:
+            raise ValueError("Mamba2 boundary scorer checkpoint missing model_config.output_dim")
+        output_dim = int(model_config["output_dim"])
+        if output_dim != MAMBA2_FRAME_SCORER_OUTPUT_DIM:
+            raise ValueError(
+                f"Mamba2 boundary scorer requires output_dim={MAMBA2_FRAME_SCORER_OUTPUT_DIM}, "
+                f"got {output_dim}"
+            )
+        return BoundarySequenceClassifier(
+            input_dim=int(model_config["input_dim"]),
+            backbone=str(model_config.get("backbone") or TRANSFORMERS_MAMBA2_BACKBONE),
+            hidden_size=int(model_config["hidden_size"]),
+            num_layers=int(model_config["num_layers"]),
+            output_dim=output_dim,
+            **backbone_kwargs,
+        )
+    raise ValueError(
+        f"unsupported scorer checkpoint schema: {schema!r}; "
+        f"expected {MAMBA2_FRAME_SCORER_SCHEMA!r}"
+    )
 
 
 class TinyFrameClassifier:
@@ -94,7 +95,7 @@ class TinyFrameClassifier:
 
 
 @dataclass(frozen=True)
-class FeatureFrameScorerBundle:
+class Mamba2FrameScorerBundle:
     path: str
     sha256: str
     model: Any
@@ -102,6 +103,8 @@ class FeatureFrameScorerBundle:
     normalization: dict[str, Any]
     metadata: dict[str, Any]
     device: str
+    schema: str = MAMBA2_FRAME_SCORER_SCHEMA
+    model_type: str = MAMBA2_FRAME_SCORER_MODEL_TYPE
 
     @property
     def ptm_dim(self) -> int:
@@ -116,17 +119,33 @@ class FeatureFrameScorerBundle:
         return int(self.model_config["input_dim"])
 
     def signature(self) -> dict[str, Any]:
+        model_config: dict[str, Any] = {
+            "ptm_dim": self.ptm_dim,
+            "mfcc_dim": self.mfcc_dim,
+            "input_dim": self.input_dim,
+        }
+        for key in (
+            "hidden_size",
+            "backbone",
+            "num_layers",
+            "state_size",
+            "num_heads",
+            "head_dim",
+            "n_groups",
+            "chunk_size",
+            "bidirectional",
+            "output_dim",
+        ):
+            if key in self.model_config:
+                value = self.model_config[key]
+                if isinstance(value, (bool, int, float, str)):
+                    model_config[key] = value
         return {
-            "schema": FEATURE_FRAME_SCORER_SCHEMA,
+            "schema": self.schema,
+            "model_type": self.model_type,
             "path": self.path,
             "sha256": self.sha256,
-            "model_config": {
-                "ptm_dim": self.ptm_dim,
-                "mfcc_dim": self.mfcc_dim,
-                "input_dim": self.input_dim,
-                "hidden_size": int(self.model_config["hidden_size"]),
-                "dropout": float(self.model_config["dropout"]),
-            },
+            "model_config": model_config,
             "metadata": {
                 "operating_point": str(self.metadata.get("operating_point") or ""),
                 "trained_steps": int(self.metadata.get("trained_steps") or 0),
@@ -150,10 +169,20 @@ def build_feature_frame_scorer_checkpoint(
     model_config: dict[str, Any],
     normalization: dict[str, Any],
     metadata: dict[str, Any] | None = None,
+    schema: str = MAMBA2_FRAME_SCORER_SCHEMA,
 ) -> dict[str, Any]:
+    if schema != MAMBA2_FRAME_SCORER_SCHEMA:
+        raise ValueError(
+            f"unsupported scorer checkpoint schema: {schema!r}; "
+            f"expected {MAMBA2_FRAME_SCORER_SCHEMA!r}"
+        )
+    if int(model_config.get("output_dim", 0)) != MAMBA2_FRAME_SCORER_OUTPUT_DIM:
+        raise ValueError(
+            f"Mamba2 boundary scorer checkpoint requires output_dim={MAMBA2_FRAME_SCORER_OUTPUT_DIM}"
+        )
     return {
-        "schema": FEATURE_FRAME_SCORER_SCHEMA,
-        "model_type": "feature_frame_scorer",
+        "schema": schema,
+        "model_type": MAMBA2_FRAME_SCORER_MODEL_TYPE,
         "model_config": dict(model_config),
         "normalization": dict(normalization),
         "metadata": dict(metadata or {}),
@@ -165,7 +194,7 @@ def load_feature_frame_scorer_checkpoint(
     path: str | Path,
     *,
     device: str | Any = "cpu",
-) -> FeatureFrameScorerBundle:
+) -> Mamba2FrameScorerBundle:
     import torch
 
     checkpoint_path = Path(path)
@@ -177,13 +206,20 @@ def load_feature_frame_scorer_checkpoint(
         payload = torch.load(checkpoint_path, map_location=device)
     if not isinstance(payload, dict):
         raise ValueError(f"invalid scorer checkpoint payload: {checkpoint_path}")
-    if payload.get("schema") != FEATURE_FRAME_SCORER_SCHEMA:
+    schema = str(payload.get("schema") or "")
+    if schema != MAMBA2_FRAME_SCORER_SCHEMA:
         raise ValueError(
             f"unsupported scorer checkpoint schema: {payload.get('schema')!r}; "
-            f"expected {FEATURE_FRAME_SCORER_SCHEMA!r}"
+            f"expected {MAMBA2_FRAME_SCORER_SCHEMA!r}"
+        )
+    model_type = str(payload.get("model_type") or "")
+    if model_type != MAMBA2_FRAME_SCORER_MODEL_TYPE:
+        raise ValueError(
+            f"unsupported scorer checkpoint model_type: {payload.get('model_type')!r}; "
+            f"expected {MAMBA2_FRAME_SCORER_MODEL_TYPE!r}"
         )
     model_config = dict(payload.get("model_config") or {})
-    for key in ("ptm_dim", "mfcc_dim", "input_dim", "hidden_size", "dropout"):
+    for key in ("ptm_dim", "mfcc_dim", "input_dim"):
         if key not in model_config:
             raise ValueError(f"scorer checkpoint missing model_config.{key}")
     if int(model_config["input_dim"]) != int(model_config["ptm_dim"]) + int(model_config["mfcc_dim"]):
@@ -193,18 +229,14 @@ def load_feature_frame_scorer_checkpoint(
     std = list(normalization.get("feature_std") or [])
     if len(mean) != int(model_config["input_dim"]) or len(std) != int(model_config["input_dim"]):
         raise ValueError("scorer checkpoint normalization length does not match input_dim")
-    model = FeatureFrameScorer(
-        input_dim=int(model_config["input_dim"]),
-        hidden_size=int(model_config["hidden_size"]),
-        dropout=float(model_config["dropout"]),
-    )
+    model = build_feature_frame_scorer_model(schema=schema, model_config=model_config)
     state = payload.get("model_state_dict")
     if not isinstance(state, dict):
         raise ValueError("scorer checkpoint missing model_state_dict")
     model.load_state_dict(state)
     model.to(device)
     model.eval()
-    return FeatureFrameScorerBundle(
+    return Mamba2FrameScorerBundle(
         path=str(checkpoint_path),
         sha256=checkpoint_sha256(checkpoint_path),
         model=model,
@@ -212,24 +244,32 @@ def load_feature_frame_scorer_checkpoint(
         normalization=normalization,
         metadata=dict(payload.get("metadata") or {}),
         device=str(device),
+        schema=schema,
+        model_type=model_type,
     )
 
 
-def score_feature_frame_probabilities(
-    bundle: FeatureFrameScorerBundle,
+def score_feature_frame_boundary_probabilities(
+    bundle: Mamba2FrameScorerBundle,
     *,
     ptm: np.ndarray,
     mfcc: np.ndarray,
-) -> np.ndarray:
+) -> tuple[np.ndarray, np.ndarray]:
     import torch
 
     frame_total = min(int(ptm.shape[0]), int(mfcc.shape[0]))
     if frame_total <= 0:
-        return np.zeros(0, dtype=np.float32)
+        empty = np.zeros(0, dtype=np.float32)
+        return empty, empty
     if int(ptm.shape[1]) != bundle.ptm_dim:
         raise ValueError(f"scorer expected ptm_dim={bundle.ptm_dim}, got {int(ptm.shape[1])}")
     if int(mfcc.shape[1]) != bundle.mfcc_dim:
         raise ValueError(f"scorer expected mfcc_dim={bundle.mfcc_dim}, got {int(mfcc.shape[1])}")
+    if int(bundle.model_config.get("output_dim", 0)) != MAMBA2_FRAME_SCORER_OUTPUT_DIM:
+        raise ValueError(
+            f"scorer expected output_dim={MAMBA2_FRAME_SCORER_OUTPUT_DIM}, "
+            f"got {bundle.model_config.get('output_dim')}"
+        )
     features = np.concatenate(
         [
             np.asarray(ptm[:frame_total], dtype=np.float32),
@@ -243,4 +283,9 @@ def score_feature_frame_probabilities(
     with torch.inference_mode():
         tensor = torch.from_numpy(features).to(bundle.device).unsqueeze(0)
         logits = bundle.model(tensor).squeeze(0)
-        return torch.sigmoid(logits).detach().cpu().numpy().astype(np.float32)
+        probabilities = torch.sigmoid(logits).detach().cpu().numpy().astype(np.float32)
+    if probabilities.ndim != 2 or probabilities.shape[1] != MAMBA2_FRAME_SCORER_OUTPUT_DIM:
+        raise ValueError("boundary scorer probabilities must have shape [frames, 2]")
+    speech = np.ascontiguousarray(probabilities[:, 0], dtype=np.float32)
+    cut = np.ascontiguousarray(probabilities[:, 1], dtype=np.float32)
+    return speech, cut

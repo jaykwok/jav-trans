@@ -11,11 +11,12 @@ import pytest
 from asr.backends.qwen import QWEN_ASR_06B_REPO_ID, QWEN_ASR_17B_REPO_ID
 from boundary.ja import (
     FeatureConfig,
-    FeatureFrameScorer,
     FeatureScorerTrainConfig,
+    MAMBA2_FRAME_SCORER_SCHEMA,
     TeacherSegment,
     TrainConfig,
     align_feature_frames,
+    build_feature_frame_scorer_model,
     build_feature_frame_scorer_checkpoint,
     build_supervised_record,
     build_training_windows,
@@ -30,7 +31,7 @@ from boundary.ja import (
     qwen3_asr_audio_output_lengths,
     qwen3_asr_repo_id,
     resize_binary_frames,
-    score_feature_frame_probabilities,
+    score_feature_frame_boundary_probabilities,
     sample_hf_audio_16k_mono,
     segments_to_frame_labels,
     stable_hf_audio_id,
@@ -46,12 +47,42 @@ from boundary.ja.backend import (
     SpeechBoundaryJaConfig,
 )
 from boundary.ja.manifest import TrainingExample
-from boundary.ja.model import (
-    FEATURE_FRAME_SCORER_SCHEMA,
-    TinyFrameClassifier,
-    load_feature_frame_scorer_checkpoint,
-)
+from boundary.ja.model import TinyFrameClassifier, load_feature_frame_scorer_checkpoint
 from tools.boundary.ja.evaluate_feature_scorer_thresholds import evaluate_thresholds
+
+
+def _require_mamba2():
+    transformers = pytest.importorskip("transformers")
+    if not hasattr(transformers, "Mamba2Model"):
+        pytest.skip("transformers.Mamba2Model is unavailable")
+
+
+def _mamba2_scorer_config(*, ptm_dim: int, mfcc_dim: int) -> dict:
+    return {
+        "ptm_dim": ptm_dim,
+        "mfcc_dim": mfcc_dim,
+        "input_dim": ptm_dim + mfcc_dim,
+        "hidden_size": 4,
+        "num_layers": 1,
+        "state_size": 8,
+        "num_heads": 2,
+        "n_groups": 1,
+        "chunk_size": 4,
+        "bidirectional": True,
+        "output_dim": 2,
+    }
+
+
+def _build_mamba2_scorer(*, ptm_dim: int, mfcc_dim: int):
+    _require_mamba2()
+    model_config = _mamba2_scorer_config(ptm_dim=ptm_dim, mfcc_dim=mfcc_dim)
+    return (
+        build_feature_frame_scorer_model(
+            schema=MAMBA2_FRAME_SCORER_SCHEMA,
+            model_config=model_config,
+        ),
+        model_config,
+    )
 
 
 def test_hf_audio_sample_normalizes_to_16k_mono():
@@ -239,16 +270,10 @@ def test_write_jsonl_and_bootstrap_backend_signature(tmp_path):
 
 def test_feature_frame_scorer_checkpoint_round_trip(tmp_path):
     torch = pytest.importorskip("torch")
-    model = FeatureFrameScorer(input_dim=6, hidden_size=16, dropout=0.0)
+    model, model_config = _build_mamba2_scorer(ptm_dim=4, mfcc_dim=2)
     checkpoint = build_feature_frame_scorer_checkpoint(
         model=model,
-        model_config={
-            "ptm_dim": 4,
-            "mfcc_dim": 2,
-            "input_dim": 6,
-            "hidden_size": 16,
-            "dropout": 0.0,
-        },
+        model_config=model_config,
         normalization={
             "feature_mean": [0.0] * 6,
             "feature_std": [1.0] * 6,
@@ -259,21 +284,50 @@ def test_feature_frame_scorer_checkpoint_round_trip(tmp_path):
     torch.save(checkpoint, checkpoint_path)
 
     bundle = load_feature_frame_scorer_checkpoint(checkpoint_path, device="cpu")
-    probs = score_feature_frame_probabilities(
+    speech_probs, cut_probs = score_feature_frame_boundary_probabilities(
         bundle,
         ptm=np.ones((3, 4), dtype=np.float32),
         mfcc=np.ones((3, 2), dtype=np.float32),
     )
 
-    assert bundle.signature()["schema"] == FEATURE_FRAME_SCORER_SCHEMA
+    assert bundle.signature()["schema"] == MAMBA2_FRAME_SCORER_SCHEMA
+    assert bundle.signature()["model_type"] == "mamba2_frame_boundary_scorer"
     assert bundle.input_dim == 6
-    assert probs.shape == (3,)
-    assert np.all((0.0 <= probs) & (probs <= 1.0))
+    assert speech_probs.shape == (3,)
+    assert cut_probs.shape == (3,)
+    assert np.all((0.0 <= speech_probs) & (speech_probs <= 1.0))
+    assert np.all((0.0 <= cut_probs) & (cut_probs <= 1.0))
+
+
+def test_feature_frame_scorer_rejects_removed_v1_schema(tmp_path):
+    torch = pytest.importorskip("torch")
+    checkpoint_path = tmp_path / "feature_scorer_v1.pt"
+    torch.save(
+        {
+            "schema": "speech_boundary_ja_feature_scorer_v1",
+            "model_type": "feature_frame_scorer",
+            "model_config": {
+                "ptm_dim": 4,
+                "mfcc_dim": 2,
+                "input_dim": 6,
+                "hidden_size": 16,
+                "dropout": 0.0,
+            },
+            "normalization": {"feature_mean": [0.0] * 6, "feature_std": [1.0] * 6},
+            "metadata": {},
+            "model_state_dict": {},
+        },
+        checkpoint_path,
+    )
+
+    with pytest.raises(ValueError, match="speech_boundary_ja_mamba2_frame_boundary_scorer_v3"):
+        load_feature_frame_scorer_checkpoint(checkpoint_path, device="cpu")
 
 
 def test_feature_frame_scorer_training_from_cached_features(tmp_path):
     torch = pytest.importorskip("torch")
     del torch
+    _require_mamba2()
     feature_dir = tmp_path / "features"
     feature_dir.mkdir()
     labels_path = tmp_path / "labels.jsonl"
@@ -316,31 +370,37 @@ def test_feature_frame_scorer_training_from_cached_features(tmp_path):
         records=records,
         feature_manifest_rows=rows,
         output_dir=tmp_path / "train",
-        config=FeatureScorerTrainConfig(max_steps=2, hidden_size=16, dropout=0.0, device="cpu"),
+        config=FeatureScorerTrainConfig(
+            max_steps=2,
+            hidden_size=4,
+            num_layers=1,
+            state_size=8,
+            num_heads=2,
+            n_groups=1,
+            chunk_size=4,
+            device="cpu",
+        ),
         labels_path=str(labels_path),
         feature_manifest_path=str(tmp_path / "feature_manifest.jsonl"),
     )
 
     assert Path(metrics.checkpoint).exists()
+    assert metrics.schema == MAMBA2_FRAME_SCORER_SCHEMA
     assert metrics.input_dim == 5
+    assert 0.0 <= metrics.speech_f1 <= 1.0
+    assert 0.0 <= metrics.cut_f1 <= 1.0
     bundle = load_feature_frame_scorer_checkpoint(metrics.checkpoint, device="cpu")
     assert bundle.signature()["metadata"]["trained_steps"] == 2
 
 
 def test_feature_frame_scorer_threshold_eval_writes_summary(tmp_path):
     torch = pytest.importorskip("torch")
-    model = FeatureFrameScorer(input_dim=5, hidden_size=16, dropout=0.0)
+    model, model_config = _build_mamba2_scorer(ptm_dim=3, mfcc_dim=2)
     checkpoint_path = tmp_path / "feature_scorer.pt"
     torch.save(
         build_feature_frame_scorer_checkpoint(
             model=model,
-            model_config={
-                "ptm_dim": 3,
-                "mfcc_dim": 2,
-                "input_dim": 5,
-                "hidden_size": 16,
-                "dropout": 0.0,
-            },
+            model_config=model_config,
             normalization={"feature_mean": [0.0] * 5, "feature_std": [1.0] * 5},
             metadata={"operating_point": "unit"},
         ),
@@ -388,25 +448,21 @@ def test_feature_frame_scorer_threshold_eval_writes_summary(tmp_path):
     )
 
     assert summary["rows"] == 1
-    assert len(summary["metrics"]) == 2
+    assert summary["schema"] == "speech_boundary_ja_mamba2_frame_boundary_scorer_threshold_eval_v3"
+    assert len(summary["speech_metrics"]) == 2
+    assert len(summary["cut_metrics"]) == 2
     assert (tmp_path / "eval" / "threshold_eval_summary.json").exists()
     assert (tmp_path / "eval" / "threshold_metrics.jsonl").exists()
 
 
 def test_backend_scorer_is_opt_in_and_keeps_segment_contract(tmp_path, monkeypatch):
     torch = pytest.importorskip("torch")
-    model = FeatureFrameScorer(input_dim=6, hidden_size=16, dropout=0.0)
+    model, model_config = _build_mamba2_scorer(ptm_dim=4, mfcc_dim=2)
     checkpoint_path = tmp_path / "feature_scorer.pt"
     torch.save(
         build_feature_frame_scorer_checkpoint(
             model=model,
-            model_config={
-                "ptm_dim": 4,
-                "mfcc_dim": 2,
-                "input_dim": 6,
-                "hidden_size": 16,
-                "dropout": 0.0,
-            },
+            model_config=model_config,
             normalization={"feature_mean": [0.0] * 6, "feature_std": [1.0] * 6},
             metadata={"operating_point": "unit", "trained_steps": 1},
         ),
@@ -447,7 +503,7 @@ def test_backend_scorer_is_opt_in_and_keeps_segment_contract(tmp_path, monkeypat
     assert result.segments
     assert result.segments[0].start == 0.0
     assert result.segments[0].end > result.segments[0].start
-    assert result.parameters["runtime_device"]["score_model"] == "feature_frame_scorer"
-    assert result.parameters["scorer_checkpoint"]["schema"] == FEATURE_FRAME_SCORER_SCHEMA
+    assert result.parameters["runtime_device"]["score_model"] == "mamba2_frame_boundary_scorer"
+    assert result.parameters["scorer_checkpoint"]["schema"] == MAMBA2_FRAME_SCORER_SCHEMA
     assert SpeechBoundaryJaConfig().scorer_checkpoint == ""
     assert SpeechBoundaryJaBackend(SpeechBoundaryJaConfig()).signature()["scorer_checkpoint"] == ""
