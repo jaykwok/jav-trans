@@ -13,6 +13,7 @@ JAVTrans 是一个本地字幕生成工具，面向 Windows + NVIDIA 显卡，�
 - 默认 ASR：`jaykwok/Qwen3-ASR-0.6B-JA-Anime-Galgame`。
 - 可选 ASR：`jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame`。
 - 默认边界系统：SpeechBoundary-JA，backend key 为 `speech_boundary_ja`。它不是传统 VAD，而是 `Qwen PTM + MFCC/energy frame scores -> boundary candidates -> Boundary Refiner -> constrained planner -> ASR chunks` 的 speech-island boundary pipeline。
+- SpeechBoundary-JA 支持实验性的 feature scorer checkpoint，但默认不启用。只有显式设置 `SPEECH_BOUNDARY_JA_SCORER_CHECKPOINT` 时才会用 learned scorer 替代 bootstrap frame scores；正式分发默认仍是 `qwen-feature-energy-bootstrap-v1`。
 - 默认 Boundary Refiner：随源码提供 learned `transformers.Mamba2Model` 小 checkpoint，文件为 `src/boundary/checkpoints/boundary_refiner.pt`。当前默认是 true v5 delta-only 32768 hardmix checkpoint；v5 协议只输出 `start_delta / end_delta`，不再保留 merge score、merge label、merge threshold、runtime disable 开关或 backbone override。
 - 默认 CueQC：`src/asr/checkpoints/cueqc_mamba_v3_fusion.pt`，在 ASR 后、forced alignment 前输出二元 `keep/drop`。当前默认 checkpoint 是 Stage 2b 自训练后版本，基础丢弃阈值 `0.85`，`short_text` 桶自适应提升到 `0.87`；模型缺失或推理异常时保守 `keep`。
 - 当前研究方向：CueQC 已替代旧规则 ASR QC。后续优先做 匿名样片 A 全链路 smoke、更多全片人工抽检和离线 Boundary 反哺数据整理；forced aligner 暂保留为默认 word-timing polish、诊断和未来 teacher 信号。
@@ -327,4 +328,6 @@ uv run python -m tools.web.smoke.summarize_job --job-id <job_id> --run-dir agent
 - `tools.boundary.prepare_cueqc_drop_v51_sources`：把 CueQC drop hard-case 候选补回审计音频，切出 SpeechBoundary-JA negative labels，并生成 Boundary preference seed；不会直接启动训练。
 - `tools.boundary.ja.build_positive_anchor_replay`：从 anime / galgame 源 manifest 按权重抽样生成 SpeechBoundary-JA positive anchor replay labels；默认提高 NSFW 权重为 `anime_nsfw=55 / anime_sfw=20 / galgame=25`。
 - `tools.boundary.prepare_speech_boundary_hard_negative_finetune`：校验 SpeechBoundary-JA hard-negative finetune source，混合 positive/synthetic anchor replay，输出 feature-cache / tiny smoke 脚本，并在缺少 anchor 或负样本占比过高时阻止正式训练。
+- `tools.boundary.ja.train_feature_scorer`：从已缓存的 Qwen PTM + MFCC feature manifest 训练 runtime-loadable SpeechBoundary-JA frame scorer；checkpoint 只通过 `SPEECH_BOUNDARY_JA_SCORER_CHECKPOINT` opt-in 使用，完整 smoke 和人工审计通过前不替换默认 runtime。
+- `tools.boundary.ja.evaluate_feature_scorer_thresholds`：离线读取 feature scorer checkpoint 和缓存特征，扫描 threshold / operating point；只用于候选评估，不替换默认 runtime。
 - `tools.boundary.prepare_v51_training`：生成 Boundary v5.1 preference finetune 准备包，校验现有 v5 checkpoint 架构并写出 dry-run / head-finetune 命令；不会替换默认 checkpoint。

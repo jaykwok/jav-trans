@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import io
+import json
 from dataclasses import replace
 from pathlib import Path
 
@@ -10,9 +11,12 @@ import pytest
 from asr.backends.qwen import QWEN_ASR_06B_REPO_ID, QWEN_ASR_17B_REPO_ID
 from boundary.ja import (
     FeatureConfig,
+    FeatureFrameScorer,
+    FeatureScorerTrainConfig,
     TeacherSegment,
     TrainConfig,
     align_feature_frames,
+    build_feature_frame_scorer_checkpoint,
     build_supervised_record,
     build_training_windows,
     count_trainable_parameters,
@@ -26,16 +30,28 @@ from boundary.ja import (
     qwen3_asr_audio_output_lengths,
     qwen3_asr_repo_id,
     resize_binary_frames,
+    score_feature_frame_probabilities,
     sample_hf_audio_16k_mono,
     segments_to_frame_labels,
     stable_hf_audio_id,
+    train_feature_frame_scorer,
     train_tiny_frame_classifier,
     write_feature_cache,
     write_jsonl,
 )
-from boundary.ja.backend import DEFAULT_MODEL_PATH, DEFAULT_OPERATING_POINT, SpeechBoundaryJaConfig
+from boundary.ja.backend import (
+    DEFAULT_MODEL_PATH,
+    DEFAULT_OPERATING_POINT,
+    SpeechBoundaryJaBackend,
+    SpeechBoundaryJaConfig,
+)
 from boundary.ja.manifest import TrainingExample
-from boundary.ja.model import TinyFrameClassifier
+from boundary.ja.model import (
+    FEATURE_FRAME_SCORER_SCHEMA,
+    TinyFrameClassifier,
+    load_feature_frame_scorer_checkpoint,
+)
+from tools.boundary.ja.evaluate_feature_scorer_thresholds import evaluate_thresholds
 
 
 def test_hf_audio_sample_normalizes_to_16k_mono():
@@ -217,5 +233,221 @@ def test_write_jsonl_and_bootstrap_backend_signature(tmp_path):
     assert DEFAULT_MODEL_PATH == "models/jaykwok-Qwen3-ASR-0.6B-JA-Anime-Galgame"
     assert DEFAULT_OPERATING_POINT == "qwen-feature-energy-bootstrap-v1"
     assert cfg.ptm == QWEN_ASR_06B_REPO_ID
-    assert not hasattr(cfg, "checkpoint")
+    assert cfg.scorer_checkpoint == ""
     assert not hasattr(cfg, "imitation_checkpoint")
+
+
+def test_feature_frame_scorer_checkpoint_round_trip(tmp_path):
+    torch = pytest.importorskip("torch")
+    model = FeatureFrameScorer(input_dim=6, hidden_size=16, dropout=0.0)
+    checkpoint = build_feature_frame_scorer_checkpoint(
+        model=model,
+        model_config={
+            "ptm_dim": 4,
+            "mfcc_dim": 2,
+            "input_dim": 6,
+            "hidden_size": 16,
+            "dropout": 0.0,
+        },
+        normalization={
+            "feature_mean": [0.0] * 6,
+            "feature_std": [1.0] * 6,
+        },
+        metadata={"operating_point": "unit"},
+    )
+    checkpoint_path = tmp_path / "feature_scorer.pt"
+    torch.save(checkpoint, checkpoint_path)
+
+    bundle = load_feature_frame_scorer_checkpoint(checkpoint_path, device="cpu")
+    probs = score_feature_frame_probabilities(
+        bundle,
+        ptm=np.ones((3, 4), dtype=np.float32),
+        mfcc=np.ones((3, 2), dtype=np.float32),
+    )
+
+    assert bundle.signature()["schema"] == FEATURE_FRAME_SCORER_SCHEMA
+    assert bundle.input_dim == 6
+    assert probs.shape == (3,)
+    assert np.all((0.0 <= probs) & (probs <= 1.0))
+
+
+def test_feature_frame_scorer_training_from_cached_features(tmp_path):
+    torch = pytest.importorskip("torch")
+    del torch
+    feature_dir = tmp_path / "features"
+    feature_dir.mkdir()
+    labels_path = tmp_path / "labels.jsonl"
+    records = [
+        build_supervised_record(
+            audio_id="pos",
+            source="unit",
+            duration_s=0.4,
+            speech_segments=[{"start": 0.1, "end": 0.3}],
+            frame_hop_s=0.1,
+        ),
+        build_supervised_record(
+            audio_id="neg",
+            source="unit",
+            duration_s=0.4,
+            speech_segments=[],
+            frame_hop_s=0.1,
+        ),
+    ]
+    write_jsonl(labels_path, records)
+    rows = []
+    for index, record in enumerate(records):
+        feature_path = feature_dir / f"{record.audio_id}.npz"
+        np.savez(
+            feature_path,
+            ptm=np.ones((4, 3), dtype=np.float32) * (index + 1),
+            mfcc=np.ones((4, 2), dtype=np.float32) * (index + 2),
+        )
+        rows.append(
+            {
+                "label_index": index,
+                "feature_path": str(feature_path),
+                "frame_count": 4,
+                "ptm_dim": 3,
+                "mfcc_dim": 2,
+            }
+        )
+
+    metrics = train_feature_frame_scorer(
+        records=records,
+        feature_manifest_rows=rows,
+        output_dir=tmp_path / "train",
+        config=FeatureScorerTrainConfig(max_steps=2, hidden_size=16, dropout=0.0, device="cpu"),
+        labels_path=str(labels_path),
+        feature_manifest_path=str(tmp_path / "feature_manifest.jsonl"),
+    )
+
+    assert Path(metrics.checkpoint).exists()
+    assert metrics.input_dim == 5
+    bundle = load_feature_frame_scorer_checkpoint(metrics.checkpoint, device="cpu")
+    assert bundle.signature()["metadata"]["trained_steps"] == 2
+
+
+def test_feature_frame_scorer_threshold_eval_writes_summary(tmp_path):
+    torch = pytest.importorskip("torch")
+    model = FeatureFrameScorer(input_dim=5, hidden_size=16, dropout=0.0)
+    checkpoint_path = tmp_path / "feature_scorer.pt"
+    torch.save(
+        build_feature_frame_scorer_checkpoint(
+            model=model,
+            model_config={
+                "ptm_dim": 3,
+                "mfcc_dim": 2,
+                "input_dim": 5,
+                "hidden_size": 16,
+                "dropout": 0.0,
+            },
+            normalization={"feature_mean": [0.0] * 5, "feature_std": [1.0] * 5},
+            metadata={"operating_point": "unit"},
+        ),
+        checkpoint_path,
+    )
+    labels_path = tmp_path / "labels.jsonl"
+    record = build_supervised_record(
+        audio_id="clip",
+        source="unit",
+        duration_s=0.4,
+        speech_segments=[{"start": 0.1, "end": 0.3}],
+        frame_hop_s=0.1,
+    )
+    write_jsonl(labels_path, [record])
+    feature_path = tmp_path / "clip.npz"
+    np.savez(
+        feature_path,
+        ptm=np.ones((4, 3), dtype=np.float32),
+        mfcc=np.ones((4, 2), dtype=np.float32),
+    )
+    manifest_path = tmp_path / "feature_manifest.jsonl"
+    manifest_path.write_text(
+        json.dumps(
+            {
+                "label_index": 0,
+                "feature_path": str(feature_path),
+                "frame_count": 4,
+                "ptm_dim": 3,
+                "mfcc_dim": 2,
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    summary = evaluate_thresholds(
+        checkpoint=checkpoint_path,
+        labels=labels_path,
+        feature_manifest=manifest_path,
+        output_dir=tmp_path / "eval",
+        thresholds=[0.0, 1.0],
+        device="cpu",
+    )
+
+    assert summary["rows"] == 1
+    assert len(summary["metrics"]) == 2
+    assert (tmp_path / "eval" / "threshold_eval_summary.json").exists()
+    assert (tmp_path / "eval" / "threshold_metrics.jsonl").exists()
+
+
+def test_backend_scorer_is_opt_in_and_keeps_segment_contract(tmp_path, monkeypatch):
+    torch = pytest.importorskip("torch")
+    model = FeatureFrameScorer(input_dim=6, hidden_size=16, dropout=0.0)
+    checkpoint_path = tmp_path / "feature_scorer.pt"
+    torch.save(
+        build_feature_frame_scorer_checkpoint(
+            model=model,
+            model_config={
+                "ptm_dim": 4,
+                "mfcc_dim": 2,
+                "input_dim": 6,
+                "hidden_size": 16,
+                "dropout": 0.0,
+            },
+            normalization={"feature_mean": [0.0] * 6, "feature_std": [1.0] * 6},
+            metadata={"operating_point": "unit", "trained_steps": 1},
+        ),
+        checkpoint_path,
+    )
+
+    class FakeExtractor:
+        model = None
+
+        def extract(self, audio, *, sample_rate):
+            return np.ones((5, 4), dtype=np.float32)
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr("boundary.ja.backend.build_ptm_feature_extractor", lambda _config: FakeExtractor())
+    monkeypatch.setattr(
+        "boundary.ja.backend.extract_mfcc",
+        lambda _audio, sample_rate, config: np.ones((5, 2), dtype=np.float32),
+    )
+    monkeypatch.setattr(
+        "boundary.ja.backend.load_audio_16k_mono",
+        lambda _path: (np.ones(1600, dtype=np.float32), 16000),
+    )
+
+    cfg = SpeechBoundaryJaConfig(
+        threshold=0.0,
+        frame_dilation_s=0.0,
+        frame_hop_s=0.02,
+        window_s=1.0,
+        overlap_s=0.0,
+        min_segment_s=0.0,
+        scorer_checkpoint=str(checkpoint_path),
+        scorer_device="cpu",
+    )
+    result = SpeechBoundaryJaBackend(cfg).segment(str(tmp_path / "audio.wav"))
+
+    assert result.segments
+    assert result.segments[0].start == 0.0
+    assert result.segments[0].end > result.segments[0].start
+    assert result.parameters["runtime_device"]["score_model"] == "feature_frame_scorer"
+    assert result.parameters["scorer_checkpoint"]["schema"] == FEATURE_FRAME_SCORER_SCHEMA
+    assert SpeechBoundaryJaConfig().scorer_checkpoint == ""
+    assert SpeechBoundaryJaBackend(SpeechBoundaryJaConfig()).signature()["scorer_checkpoint"] == ""
