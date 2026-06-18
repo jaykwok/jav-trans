@@ -140,7 +140,7 @@ def test_display_policy_compacts_cues_without_mutating_aligned_segments(
             "end": 3.0,
             "text": "今日はいい天気ですね",
             "words": [{"word": "今日はいい天気ですね", "start": 2.0, "end": 3.0}],
-            "alignment_quality": "forced",
+            "alignment_quality": "boundary",
         },
     ]
     artifacts = _artifacts(tmp_path, segments)

@@ -63,26 +63,23 @@ def test_public_asr_config_loads_generic_names(monkeypatch, tmp_path):
         "DEFAULT_SETTINGS",
         {
             "ASR_MODEL_PATH": "./models/asr",
-            "ALIGNER_MODEL_PATH": "./models/aligner",
             "ASR_CONTEXT": "sample-name",
-            "ALIGNER_BATCH_SIZE": "3",
+            "ASR_BATCH_SIZE": "3",
         },
     )
     monkeypatch.setattr(config, "PRIVATE_ENV_PATH", private_path)
     for key in (
         "ASR_MODEL_PATH",
-        "ALIGNER_MODEL_PATH",
         "ASR_CONTEXT",
-        "ALIGNER_BATCH_SIZE",
+        "ASR_BATCH_SIZE",
     ):
         monkeypatch.delenv(key, raising=False)
 
     config.load_config()
 
     assert os.environ["ASR_MODEL_PATH"] == "./models/asr"
-    assert os.environ["ALIGNER_MODEL_PATH"] == "./models/aligner"
     assert os.environ["ASR_CONTEXT"] == "sample-name"
-    assert os.environ["ALIGNER_BATCH_SIZE"] == "3"
+    assert os.environ["ASR_BATCH_SIZE"] == "3"
 
 
 def test_non_python_shared_files_are_not_read(monkeypatch, tmp_path):
@@ -112,8 +109,7 @@ def test_default_model_download_root_is_project_models():
     assert config.DEFAULT_SETTINGS["ASR_BATCH_SIZE"] == "auto"
     assert "Qwen3-ASR-0.6B-JA-Anime-Galgame=64" in config.DEFAULT_SETTINGS["ASR_BATCH_SIZE_BY_REPO"]
     assert "Qwen3-ASR-1.7B-JA-Anime-Galgame=32" in config.DEFAULT_SETTINGS["ASR_BATCH_SIZE_BY_REPO"]
-    assert config.DEFAULT_SETTINGS["ALIGNER_BATCH_SIZE"] == "64"
-    assert config.DEFAULT_SETTINGS["ALIGN_LONG_CHUNK_BATCH_SIZE"] == "64"
+    assert not any(key.startswith("ALIGN") for key in config.DEFAULT_SETTINGS)
     assert "BOUNDARY_REFINER_ENABLED" not in config.DEFAULT_SETTINGS
     assert config.DEFAULT_SETTINGS["BOUNDARY_PLANNER_TARGET_CHUNK_S"] == "3.0"
     assert config.DEFAULT_SETTINGS["BOUNDARY_PLANNER_MAX_CORE_CHUNK_S"] == "5.0"

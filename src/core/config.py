@@ -34,11 +34,9 @@ DEFAULT_SETTINGS: dict[str, str] = {
     # Empty string means use the default huggingface.co. Takes effect on next app start.
     "HF_ENDPOINT": "",
 
-    # --- ASR & Alignment Model Settings ---
+    # --- ASR Model Settings ---
     # Transcription backend. Use the Hugging Face repo id as the stable key.
     "ASR_BACKEND": "jaykwok/Qwen3-ASR-0.6B-JA-Anime-Galgame",
-    # Local/Qwen ASR timestamp mode. Valid values: forced, native, hybrid.
-    "ALIGNMENT_TIMESTAMP_MODE": "forced",
     # Character cap for sliding ASR context prompt before tokenizer-level budgeting.
     "ASR_INITIAL_PROMPT_MAX_CHARS": "240",
     # Max prompt tokens kept before generation budgeting.
@@ -51,10 +49,6 @@ DEFAULT_SETTINGS: dict[str, str] = {
     "ASR_MODEL_ID": "",
     # Optional local ASR model directory override. Empty uses models/<namespace>-<repo> for the selected backend.
     "ASR_MODEL_PATH": "",
-    # Remote HuggingFace forced-aligner model id used as fallback.
-    "ALIGNER_MODEL_ID": "Qwen/Qwen3-ForcedAligner-0.6B",
-    # Optional local forced-aligner directory override. Empty uses models/<namespace>-<repo>.
-    "ALIGNER_MODEL_PATH": "",
     # Model precision; bfloat16 is the current CUDA-friendly default.
     "ASR_DTYPE": "bfloat16",
     # Attention implementation. sdpa uses PyTorch scaled-dot-product attention.
@@ -80,10 +74,6 @@ DEFAULT_SETTINGS: dict[str, str] = {
         "jaykwok/Qwen3-ASR-0.6B-JA-Anime-Galgame=64,"
         "jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame=32"
     ),
-    # Forced-alignment outer batch size.
-    "ALIGNER_BATCH_SIZE": "64",
-    # Real Qwen forced-aligner batch size for chunk alignment.
-    "ALIGN_LONG_CHUNK_BATCH_SIZE": "64",
     # Max generated tokens per ASR chunk.
     "ASR_MAX_NEW_TOKENS": "128",
     # Subprocess transcription token cap; usually matches ASR_MAX_NEW_TOKENS.
@@ -92,16 +82,6 @@ DEFAULT_SETTINGS: dict[str, str] = {
     "ASR_SUBPROCESS_READY_TIMEOUT_S": "600",
     # Generation penalty to reduce repeated ASR text.
     "ASR_REPETITION_PENALTY": "1.05",
-
-    # --- ASR Native Timing Guards ---
-    # Minimum native word/span duration accepted from ASR timestamps.
-    "ASR_NATIVE_MIN_SPAN_MS": "80",
-    # Reject native timing when too many spans have near-zero duration.
-    "ASR_NATIVE_MAX_ZERO_RATIO": "0.55",
-    # Reject native timing when repeated token spans dominate.
-    "ASR_NATIVE_MAX_REPEAT_RATIO": "0.65",
-    # Reject native timing when each timing item carries too much text.
-    "ASR_NATIVE_MAX_CHARS_PER_ITEM": "12.0",
 
     # --- Boundary Refiner / ASR Chunking ---
     # Discard exported ASR wav chunks shorter than this many seconds.
@@ -117,7 +97,7 @@ DEFAULT_SETTINGS: dict[str, str] = {
     "BOUNDARY_FRAME_SEQUENCE_RIGHT_CONTEXT_S": "0.60",
     "BOUNDARY_FRAME_SEQUENCE_MAX_PTM_DIMS": "64",
     "BOUNDARY_FRAME_SEQUENCE_INCLUDE_MFCC": "1",
-    # Speech core is the subtitle/fallback timing window. Keep it short for JAV dialogue.
+    # Speech core is the subtitle timing window. Keep it short for JAV dialogue.
     "BOUNDARY_PLANNER_MAX_CORE_CHUNK_S": "5.0",
     "BOUNDARY_PLANNER_TARGET_CHUNK_S": "3.0",
     "BOUNDARY_PLANNER_MIN_CHUNK_S": "0.4",
@@ -133,18 +113,8 @@ DEFAULT_SETTINGS: dict[str, str] = {
     # Persistent boundary cache directory. Versioned as boundary-cache v5.
     "BOUNDARY_CACHE_DIR": "./tmp/cache/boundary",
 
-    # --- Alignment Retry & Refine ---
-    # Max chunk length that hybrid alignment can force-align directly.
-    "ALIGNMENT_HYBRID_FORCE_MAX_CHUNK": "24.0",
-    # Chunk size used by coarse-to-fine alignment refinement.
-    "ALIGNMENT_COARSE_REFINE_CHUNK": "18.0",
-    # Maximum recursive refinement depth for difficult alignment chunks.
-    "ALIGNMENT_MAX_REFINE_DEPTH": "2",
-    # Fallback chunk size when alignment retries step down.
-    "ALIGNMENT_STEP_DOWN_CHUNK": "6.0",
-
     # --- ASR Segmentation ---
-    # Hard cap for grouping aligned words into one subtitle candidate.
+    # Hard cap for grouping subtitle timing units into one subtitle candidate.
     "ASR_SEGMENT_HARD_MAX_DURATION": "9.0",
 
     # --- CueQC Mamba v3-Fusion (display keep/drop binary filter) ---
@@ -158,7 +128,7 @@ DEFAULT_SETTINGS: dict[str, str] = {
     # Base drop threshold. Checkpoints may raise it per risk bucket.
     "CUEQC_DROP_THRESHOLD": "0.85",
     "CUEQC_FALLBACK_POLICY": "keep",
-    # 1 = actually remove model-confirmed drop candidates before alignment;
+    # 1 = actually remove model-confirmed drop candidates before subtitle timing;
     # 0 = record shadow only (audit), keep all candidates.
     "CUEQC_DROP_APPLY_ENABLED": "1",
     "CUEQC_DEVICE": "auto",
@@ -240,8 +210,6 @@ DEFAULT_SETTINGS: dict[str, str] = {
     "QC_MAX_PER_MIN": "8",
     # Minimum required glossary hit rate when glossary terms are present.
     "QC_MIN_GLOSSARY_HIT": "0.80",
-    # Maximum allowed forced-alignment fallback ratio.
-    "QC_MAX_ALIGN_FALLBACK": "0.20",
     # Maximum ASR generation failures before quality report warning.
     "QC_MAX_ASR_GENERATION_ERRORS": "0",
     # Maximum ASR generation overflow failures before quality report warning.

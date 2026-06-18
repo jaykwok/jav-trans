@@ -199,26 +199,48 @@ def page_html(*, title: str, dataset: dict[str, Any]) -> str:
     new_label_html = html.escape(new_label_text)
     if media_mode == "audio":
         stage_html = f"""
-    <div class="stage audio-stage">
-      <div class="subtitle audio-subtitle old"><span class="tag">{old_label_html}</span><span id="oldOverlay"></span></div>
-      <audio id="video" controls preload="metadata"></audio>
-      <div class="subtitle audio-subtitle new"><span class="tag">{new_label_html}</span><span id="newOverlay"></span></div>
-    </div>
-"""
-        media_hint = f"{old_label_text} 字幕显示在音频控件上方，{new_label_text} 字幕显示在音频控件下方。这里直接比较完整日语 SRT 的显示效果。"
-        media_link_label = "音频源"
-    else:
-        stage_html = f"""
-    <div class="stage">
-      <video id="video" controls preload="metadata" playsinline></video>
-      <div class="subtitle-layer">
-        <div class="subtitle old"><span class="tag">{old_label_html}</span><span id="oldOverlay"></span></div>
-        <div class="subtitle new"><span class="tag">{new_label_html}</span><span id="newOverlay"></span></div>
+    <div class="stage audio-stage dual-stage">
+      <div class="media-pane old-pane">
+        <div class="media-pane-header"><strong class="old-label">{old_label_html}</strong><button class="play-side" data-play-side="old" type="button">播放当前窗口</button></div>
+        <div class="subtitle audio-subtitle old"><span id="oldOverlay"></span></div>
+        <audio id="oldPlayer" data-media-player="1" data-side="old" controls preload="metadata"></audio>
+      </div>
+      <div class="media-pane new-pane">
+        <div class="media-pane-header"><strong class="new-label">{new_label_html}</strong><button class="play-side" data-play-side="new" type="button">播放当前窗口</button></div>
+        <div class="subtitle audio-subtitle new"><span id="newOverlay"></span></div>
+        <audio id="newPlayer" data-media-player="1" data-side="new" controls preload="metadata"></audio>
       </div>
     </div>
 """
-        media_hint = f"{old_label_text} 字幕显示在视频上方，{new_label_text} 字幕显示在视频下方。这里直接比较完整日语 SRT 的显示效果，浏览器原生字幕轨不参与渲染。"
-        media_link_label = "视频"
+        media_hint = f"{old_label_text} 与 {new_label_text} 使用两个独立音频播放器；播放任意一边会自动暂停另一边，便于单独审计字幕观感。差异窗口只负责把两边定位到同一时间。"
+        media_link_label = "音频源"
+        play_window_label = "定位当前窗口"
+    else:
+        stage_html = f"""
+    <div class="stage video-stage dual-stage">
+      <div class="media-pane old-pane">
+        <div class="media-pane-header"><strong class="old-label">{old_label_html}</strong><button class="play-side" data-play-side="old" type="button">播放当前窗口</button></div>
+        <div class="video-shell">
+          <video id="oldPlayer" data-media-player="1" data-side="old" controls preload="metadata" playsinline></video>
+          <div class="subtitle-layer single-subtitle-layer">
+            <div class="subtitle old"><span id="oldOverlay"></span></div>
+          </div>
+        </div>
+      </div>
+      <div class="media-pane new-pane">
+        <div class="media-pane-header"><strong class="new-label">{new_label_html}</strong><button class="play-side" data-play-side="new" type="button">播放当前窗口</button></div>
+        <div class="video-shell">
+          <video id="newPlayer" data-media-player="1" data-side="new" controls preload="metadata" playsinline></video>
+          <div class="subtitle-layer single-subtitle-layer">
+            <div class="subtitle new"><span id="newOverlay"></span></div>
+          </div>
+        </div>
+      </div>
+    </div>
+"""
+        media_hint = f"{old_label_text} 与 {new_label_text} 使用两个独立视频播放器；播放任意一边会自动暂停另一边，便于单独审计字幕观感。差异窗口只负责把两边定位到同一时间。"
+        media_link_label = "视频源"
+        play_window_label = "定位当前窗口"
     return f"""<!doctype html>
 <html lang="zh-CN">
 <head>
@@ -264,7 +286,15 @@ h1 {{ margin: 0 0 6px; font-size: 20px; }}
 video {{ display: block; width: 100%; max-height: 72vh; background: #050706; }}
 audio {{ display: block; width: min(900px, 100%); margin: 16px auto; }}
 .audio-stage {{ padding: 16px; }}
+.dual-stage {{ display: grid; gap: 14px; background: #f8faf9; padding: 16px; }}
+.media-pane {{ border: 1px solid var(--line); border-radius: 8px; padding: 12px; background: #ffffff; }}
+.media-pane-header {{ display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 10px; }}
+.media-pane audio {{ margin: 10px 0 0; width: 100%; }}
+.video-shell {{ position: relative; overflow: hidden; border-radius: 6px; background: #050706; }}
+.video-shell video {{ max-height: 48vh; }}
+.play-side {{ padding: 6px 9px; }}
 .subtitle-layer {{ position: absolute; inset: 12px 20px 58px; pointer-events: none; display: flex; flex-direction: column; justify-content: space-between; gap: 20px; }}
+.single-subtitle-layer {{ justify-content: flex-end; }}
 .subtitle {{
   max-width: min(980px, 94%);
   margin: 0 auto;
@@ -282,7 +312,7 @@ audio {{ display: block; width: min(900px, 100%); margin: 16px auto; }}
 }}
 .subtitle.old {{ border-top: 3px solid var(--old); }}
 .subtitle.new {{ border-bottom: 3px solid var(--new); }}
-.audio-subtitle {{ min-height: 74px; }}
+.audio-subtitle {{ min-height: 74px; max-width: 100%; color: var(--ink); text-shadow: none; background: #f3f6f4; border-radius: 6px; }}
 .tag {{ display: inline-block; margin-right: 8px; font-size: 12px; color: #fff; opacity: .82; vertical-align: middle; }}
 .grid {{ display: grid; grid-template-columns: minmax(0, 1fr) 360px; gap: 12px; }}
 .now-grid {{ display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }}
@@ -320,7 +350,7 @@ a {{ color: #0f5f57; }}
       <select id="videoSelect"></select>
       <button id="prevBtn">上一处</button>
       <button id="nextBtn">下一处</button>
-      <button class="primary" id="playWindowBtn">播放当前窗口</button>
+      <button class="primary" id="playWindowBtn">{html.escape(play_window_label)}</button>
     </div>
   </div>
   <section class="panel">
@@ -352,12 +382,19 @@ a {{ color: #0f5f57; }}
 <script id="dataset" type="application/json">{data_json}</script>
 <script>
 const DATA = JSON.parse(document.getElementById("dataset").textContent);
+const mediaMode = DATA.media_mode || "video";
 const video = document.getElementById("video");
+const oldPlayer = document.getElementById("oldPlayer");
+const newPlayer = document.getElementById("newPlayer");
+const mediaPlayers = [video, oldPlayer, newPlayer].filter(Boolean);
+const primaryPlayer = video || oldPlayer || newPlayer;
+const dualMode = Boolean(oldPlayer && newPlayer);
 const videoSelect = document.getElementById("videoSelect");
 const hotspotList = document.getElementById("hotspotList");
 let videoIndex = 0;
 let hotspotIndex = 0;
-let stopAt = null;
+let stopAt = {{ video: null, old: null, new: null }};
+let syncFrameId = null;
 
 function fmtTime(value) {{
   const seconds = Math.max(0, Number(value || 0));
@@ -376,6 +413,20 @@ function cueText(cues) {{
 }}
 function currentCase() {{ return DATA.cases[videoIndex]; }}
 function currentHotspot() {{ return currentCase().hotspots[hotspotIndex] || null; }}
+function playerSide(player) {{ return player?.dataset?.side || "video"; }}
+function playerForSide(side) {{
+  if (side === "old") return oldPlayer || primaryPlayer;
+  if (side === "new") return newPlayer || primaryPlayer;
+  return primaryPlayer;
+}}
+function anyPlaying() {{
+  return mediaPlayers.some(player => !player.paused && !player.ended);
+}}
+function pauseOtherPlayers(activePlayer) {{
+  for (const player of mediaPlayers) {{
+    if (player !== activePlayer && !player.paused) player.pause();
+  }}
+}}
 function renderSelect() {{
   videoSelect.innerHTML = DATA.cases.map((item, index) => `<option value="${{index}}">${{escapeHtml(item.label)}}</option>`).join("");
   videoSelect.value = String(videoIndex);
@@ -388,7 +439,7 @@ function renderMetrics(item) {{
   const rows = [
     ["chunks", oldM.chunks, newM.chunks],
     ["blocks", oldM.blocks, newM.blocks],
-    ["ASR+align", `${{oldM.asr_align_s || "?"}}s`, `${{newM.asr_align_s || "?"}}s`],
+    ["ASR+timing", `${{oldM.asr_align_s || "?"}}s`, `${{newM.asr_align_s || "?"}}s`],
     ["per min", oldQ.per_min_subtitle_count, newQ.per_min_subtitle_count],
     ["short ratio", oldQ.short_segment_ratio, newQ.short_segment_ratio],
     ["fallback", oldQ.alignment_fallback_ratio, newQ.alignment_fallback_ratio],
@@ -417,7 +468,7 @@ function renderHotspots() {{
   for (const button of hotspotList.querySelectorAll(".hotspot")) {{
     button.addEventListener("click", () => {{
       hotspotIndex = Number(button.dataset.index || 0);
-      seekHotspot(true);
+      seekHotspot(!dualMode);
       renderHotspots();
     }});
   }}
@@ -435,8 +486,10 @@ function loadCase(index) {{
   videoIndex = index;
   hotspotIndex = 0;
   const item = currentCase();
-  video.src = item.media;
-  video.load();
+  for (const player of mediaPlayers) {{
+    player.src = item.media;
+    player.load();
+  }}
   document.getElementById("summaryLine").textContent = DATA.summary;
   renderSelect();
   renderMetrics(item);
@@ -444,11 +497,17 @@ function loadCase(index) {{
   renderHotspots();
   updateCurrentText();
 }}
-function updateCurrentText() {{
+function updateCurrentText(timeOverride = null, sideOverride = "") {{
   const item = currentCase();
-  const t = video.currentTime || 0;
-  const oldActive = activeCues(item.old.cues, t);
-  const newActive = activeCues(item.new.cues, t);
+  const sharedTime = Number.isFinite(timeOverride) ? timeOverride : (primaryPlayer?.currentTime || 0);
+  const oldTime = dualMode
+    ? (sideOverride === "old" || sideOverride === "both" ? sharedTime : (oldPlayer?.currentTime || 0))
+    : sharedTime;
+  const newTime = dualMode
+    ? (sideOverride === "new" || sideOverride === "both" ? sharedTime : (newPlayer?.currentTime || 0))
+    : sharedTime;
+  const oldActive = activeCues(item.old.cues, oldTime);
+  const newActive = activeCues(item.new.cues, newTime);
   const oldText = cueText(oldActive);
   const newText = cueText(newActive);
   document.getElementById("oldOverlay").textContent = oldText;
@@ -457,38 +516,90 @@ function updateCurrentText() {{
   document.getElementById("newNow").textContent = newText || "(无当前字幕)";
   document.getElementById("oldCount").textContent = oldActive.length ? `${{oldActive.length}} cue` : "";
   document.getElementById("newCount").textContent = newActive.length ? `${{newActive.length}} cue` : "";
-  if (stopAt !== null && t >= stopAt) {{
-    video.pause();
-    stopAt = null;
+  for (const player of mediaPlayers) {{
+    const side = playerSide(player);
+    if (stopAt[side] !== null && (player.currentTime || 0) >= stopAt[side]) {{
+      player.pause();
+      stopAt[side] = null;
+    }}
   }}
+}}
+function startTextSync() {{
+  if (syncFrameId !== null) return;
+  const tick = () => {{
+    syncFrameId = null;
+    updateCurrentText();
+    if (anyPlaying()) {{
+      startTextSync();
+    }}
+  }};
+  syncFrameId = window.requestAnimationFrame(tick);
+}}
+function stopTextSync() {{
+  if (anyPlaying()) return;
+  if (syncFrameId !== null) {{
+    window.cancelAnimationFrame(syncFrameId);
+    syncFrameId = null;
+  }}
+  updateCurrentText();
 }}
 function seekHotspot(play) {{
   const row = currentHotspot();
   if (!row) return;
-  video.currentTime = Math.max(0, row.start - 0.3);
-  stopAt = row.end + 0.3;
-  updateCurrentText();
-  if (play) video.play();
+  const startTime = Math.max(0, row.start - 0.3);
+  for (const player of mediaPlayers) {{
+    player.currentTime = startTime;
+    stopAt[playerSide(player)] = row.end + 0.3;
+  }}
+  updateCurrentText(startTime, "both");
+  if (play && primaryPlayer) primaryPlayer.play();
 }}
 videoSelect.addEventListener("change", () => loadCase(Number(videoSelect.value || 0)));
-video.addEventListener("timeupdate", updateCurrentText);
-video.addEventListener("seeked", updateCurrentText);
-document.getElementById("playWindowBtn").addEventListener("click", () => seekHotspot(true));
+for (const player of mediaPlayers) {{
+  player.addEventListener("timeupdate", updateCurrentText);
+  player.addEventListener("loadedmetadata", updateCurrentText);
+  player.addEventListener("seeking", updateCurrentText);
+  player.addEventListener("seeked", () => {{
+    updateCurrentText();
+    if (!player.paused && !player.ended) startTextSync();
+  }});
+  player.addEventListener("play", () => {{
+    pauseOtherPlayers(player);
+    startTextSync();
+  }});
+  player.addEventListener("playing", startTextSync);
+  player.addEventListener("pause", stopTextSync);
+  player.addEventListener("ended", stopTextSync);
+}}
+function playSide(side) {{
+  seekHotspot(false);
+  const player = playerForSide(side);
+  if (!player) return;
+  pauseOtherPlayers(player);
+  const row = currentHotspot();
+  if (row) stopAt[playerSide(player)] = row.end + 0.3;
+  const promise = player.play();
+  if (promise && typeof promise.catch === "function") promise.catch(() => {{}});
+}}
+for (const button of document.querySelectorAll("[data-play-side]")) {{
+  button.addEventListener("click", () => playSide(button.dataset.playSide || "old"));
+}}
+document.getElementById("playWindowBtn").addEventListener("click", () => seekHotspot(!dualMode));
 document.getElementById("prevBtn").addEventListener("click", () => {{
   hotspotIndex = Math.max(0, hotspotIndex - 1);
-  seekHotspot(true);
+  seekHotspot(!dualMode);
   renderHotspots();
 }});
 document.getElementById("nextBtn").addEventListener("click", () => {{
   hotspotIndex = Math.min(currentCase().hotspots.length - 1, hotspotIndex + 1);
-  seekHotspot(true);
+  seekHotspot(!dualMode);
   renderHotspots();
 }});
 document.addEventListener("keydown", event => {{
   if (event.target && ["INPUT", "TEXTAREA", "SELECT"].includes(event.target.tagName)) return;
   if (event.key === "j") document.getElementById("prevBtn").click();
   if (event.key === "k") document.getElementById("nextBtn").click();
-  if (event.key === " ") {{ event.preventDefault(); video.paused ? video.play() : video.pause(); }}
+  if (event.key === " " && !dualMode && primaryPlayer) {{ event.preventDefault(); primaryPlayer.paused ? primaryPlayer.play() : primaryPlayer.pause(); }}
 }});
 loadCase(0);
 </script>

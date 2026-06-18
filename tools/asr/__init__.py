@@ -1,1 +1,1 @@
-"""ASR dataset, diagnostics, and model utilities."""
+"""ASR dataset, CueQC, and model utilities."""

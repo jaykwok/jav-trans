@@ -35,8 +35,6 @@ _ENV_OVERRIDE_KEYS = (
     "ASR_WORKER_MODE",
     "ASR_MODEL_PATH",
     "ASR_MODEL_ID",
-    "ALIGNER_MODEL_PATH",
-    "ALIGNER_MODEL_ID",
     "API_KEY",
     "OPENAI_COMPATIBILITY_BASE_URL",
     "QUALITY_REPORT_ENABLED",
@@ -148,10 +146,8 @@ _ASR_STAGE_ADVANCED_PREFIXES = (
     "CUEQC_",
     "BOUNDARY_",
     "SPEECH_BOUNDARY_JA_",
-    "ALIGNMENT_",
 )
 _ASR_STAGE_ADVANCED_KEYS = {
-    "ALIGN_LONG_CHUNK_BATCH_SIZE",
     "ASR_BOUNDARY_BACKEND",
     "ASR_LANGUAGE",
     "ASR_FORCE_LANGUAGE",
@@ -174,7 +170,6 @@ _ASR_STAGE_ADVANCED_KEYS = {
     "TRANSCRIPTION_MAX_NEW_TOKENS",
     "ASR_BATCH_SIZE",
     "ASR_BATCH_SIZE_BY_REPO",
-    "ALIGNER_BATCH_SIZE",
     "KEEP_ASR_CHUNKS",
     "BOUNDARY_CACHE_DIR",
     "BOUNDARY_CACHE_ENABLED",
@@ -805,7 +800,7 @@ def run_asr_alignment(
             f"stage_done audio_prepare elapsed={pipeline_timings['audio_prepare_s']:.2f}s cached={audio_cached}",
         )
 
-        # 2. ASR text-only transcription, model unload, then alignment
+        # 2. ASR text-only transcription, model unload, then Boundary subtitle timing.
         device = "cuda:0" if torch.cuda.is_available() else "cpu"
         _log_stage(logger, f"device={device}")
         _raise_if_cancelled(cancel_event)
@@ -892,7 +887,7 @@ def run_asr_alignment(
                     include_details=True,
                 )
                 _raise_if_cancelled(cancel_event)
-                for event_stage in ("asr_text_transcribe", "alignment"):
+                for event_stage in ("asr_text_transcribe", "subtitle_timing"):
                     if event_stage in asr_event_started and event_stage not in asr_event_done:
                         _emit_stage_event(
                             video_path,

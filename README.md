@@ -1,6 +1,6 @@
 # JAVTrans
 
-JAVTrans 是一个本地字幕生成工具，面向 Windows + NVIDIA 显卡，也可在 WSL2 / Linux 下源码运行。它把视频处理成日文字幕、中文字幕或中日双语字幕，并把音频准备、speech-island 边界规划、ASR、CueQC v3-Fusion 保留/丢弃路由、强制对齐、字幕时间轴归一化、LLM 翻译和质量报告串成一条本地优先的流水线。
+JAVTrans 是一个本地字幕生成工具，面向 Windows + NVIDIA 显卡，也可在 WSL2 / Linux 下源码运行。它把视频处理成日文字幕、中文字幕或中日双语字幕，并把音频准备、speech-island 边界规划、ASR、CueQC v3-Fusion 保留/丢弃路由、Boundary chunk 字幕时间轴、LLM 翻译和质量报告串成一条本地优先的流水线。
 
 项目目标：本地完成视频、音频、边界切分、ASR 和时间轴重计算；LLM 只负责翻译、术语一致和口吻连贯，不负责脑补剧情或修正 ASR 误听。
 
@@ -15,10 +15,10 @@ JAVTrans 是一个本地字幕生成工具，面向 Windows + NVIDIA 显卡，�
 - 默认边界系统：SpeechBoundary-JA，backend key 为 `speech_boundary_ja`。它不是传统 VAD，而是 `Qwen PTM + MFCC/energy frame scores -> boundary candidates -> Boundary Refiner -> constrained planner -> ASR chunks` 的 speech-island boundary pipeline。
 - SpeechBoundary-JA 支持实验性的 Mamba2 frame boundary scorer v3 checkpoint，但默认不启用。只有显式设置 `SPEECH_BOUNDARY_JA_SCORER_CHECKPOINT` 时才会用 learned scorer 替代 bootstrap frame scores；v3 scorer 输出 `speech_prob / cut_prob`，运行时支持 `speech_on/speech_off` 双阈值 hysteresis 和 cut gate；正式分发默认仍是 `qwen-feature-energy-bootstrap-v1`。
 - 默认 Boundary Refiner：随源码提供 learned `transformers.Mamba2Model` 小 checkpoint，文件为 `src/boundary/checkpoints/boundary_refiner.pt`。当前默认是 true v5 delta-only 32768 hardmix checkpoint；v5 协议只输出 `start_delta / end_delta`，不再保留 merge score、merge label、merge threshold、runtime disable 开关或 backbone override。
-- 默认 CueQC：`src/asr/checkpoints/cueqc_mamba_v3_fusion.pt`，在 ASR 后、forced alignment 前输出二元 `keep/drop`。当前默认 checkpoint 是 Stage 2b 自训练后版本，基础丢弃阈值 `0.85`，`short_text` 桶自适应提升到 `0.87`；模型缺失或推理异常时保守 `keep`。
-- 当前研究方向：CueQC 已替代旧规则 ASR QC。后续优先做 Mamba2 frame boundary scorer v3 的 匿名样片 A opt-in 对比人工审计、更多全片人工抽检和离线 Boundary 反哺数据整理；forced aligner 暂保留为默认 word-timing polish、诊断和未来 teacher 信号。
-- 默认显存目标：单阶段峰值适配 6GB 级 NVIDIA 显卡。8GB 本机可提高 `.env` 中的 ASR / aligner batch size；更小显存则手动降低。
-- 当前字幕策略：边界层尽量把 ASR chunk 切成接近一句台词；字幕层优先用可靠词级 `word.start` 锚定 cue start，只做 2-frame gap、显示时长和读速控制，不再运行相邻 cue 合并策略。
+- 默认 CueQC：`src/asr/checkpoints/cueqc_mamba_v3_fusion.pt`，在 ASR 后输出二元 `keep/drop`。当前默认 checkpoint 是 Stage 2b 自训练后版本，基础丢弃阈值 `0.85`，`short_text` 桶自适应提升到 `0.87`；模型缺失或推理异常时保守 `keep`。
+- 当前研究方向：CueQC 已替代旧规则 ASR QC。后续优先做 Mamba2 frame boundary scorer v3 的 匿名样片 A opt-in 对比人工审计、更多全片人工抽检和离线 Boundary 反哺数据整理。
+- 默认显存目标：单阶段峰值适配 6GB 级 NVIDIA 显卡。8GB 本机可提高 `.env` 中的 ASR batch size；更小显存则手动降低。
+- 当前字幕策略：Boundary Refiner 输出的 speech-core chunk 就是字幕初始时间轴；字幕层只做 2-frame gap、显示时长和读速控制，不再运行相邻 cue 合并策略。
 
 ---
 
@@ -32,7 +32,7 @@ GitHub Releases 只用于发布 source code、release notes 和版本说明，�
 JAVTrans.exe
 ```
 
-Windows 打包版默认内置 0.6B ASR、1.7B ASR、forced aligner、`ffmpeg` / `ffprobe` 和小型 Boundary Refiner checkpoint。
+Windows 打包版默认内置 0.6B ASR、1.7B ASR、`ffmpeg` / `ffprobe` 和小型 Boundary Refiner checkpoint。
 
 Release 版不内置 Microsoft Edge WebView2 Runtime。大多数 Windows 10/11 已自带；如果无法打开窗口，请安装 [Microsoft Edge WebView2 Evergreen Runtime](https://developer.microsoft.com/en-us/microsoft-edge/webview2/)。
 
@@ -90,7 +90,7 @@ Linux / WSL2 下如果只启动浏览器版 Web 服务，也可以直接运行�
 PYTHONIOENCODING=utf-8 PYTHONPATH=src uv run python -m uvicorn web.app:create_app --factory --host 127.0.0.1 --port 17321
 ```
 
-Web 提交是否使用 CUDA 取决于后端服务进程是否能看到 GPU，而不是浏览器本身。完整 SpeechBoundary-JA / ASR / ForcedAligner smoke 应确认日志中出现 `cuda_available=True`、`device=cuda:0` 或 `actual_device=cuda`。
+Web 提交是否使用 CUDA 取决于后端服务进程是否能看到 GPU，而不是浏览器本身。完整 SpeechBoundary-JA / ASR smoke 应确认日志中出现 `cuda_available=True`、`device=cuda:0` 或 `actual_device=cuda`。
 
 ---
 
@@ -102,7 +102,7 @@ Web 提交是否使用 CUDA 取决于后端服务进程是否能看到 GPU，而
 4. 提交任务。
 5. 在输出目录查看 SRT、质量报告和日志。
 
-勾选“不翻译（仅日文字幕）”时，流水线仍会执行边界规划、ASR、CueQC v3-Fusion keep/drop 路由、forced alignment 和字幕时间轴归一化，但跳过 LLM 翻译，最终输出 `<视频名>.ja.srt`。这是验证本地边界 / ASR / CueQC / 对齐链路的推荐 smoke 模式。
+勾选“不翻译（仅日文字幕）”时，流水线仍会执行边界规划、ASR、CueQC v3-Fusion keep/drop 路由和 Boundary chunk 字幕时间轴生成，但跳过 LLM 翻译，最终输出 `<视频名>.ja.srt`。这是验证本地边界 / ASR / CueQC / 字幕时间轴链路的推荐 smoke 模式。
 
 主流水线：
 
@@ -115,8 +115,7 @@ Web 提交是否使用 CUDA 取决于后端服务进程是否能看到 GPU，而
 -> constrained boundary planner
 -> ASR
 -> CueQC v3-Fusion keep/drop routing
--> forced alignment
--> display_text / align_text 预处理
+-> Boundary chunk subtitle timing
 -> cue plan 时间轴归一化
 -> LLM 翻译
 -> SRT / quality report
@@ -124,7 +123,7 @@ Web 提交是否使用 CUDA 取决于后端服务进程是否能看到 GPU，而
 
 LLM 翻译前会先固定 cue plan。SRT writer 只写入已经归一化的时间轴，不再隐式改变时间轴。
 
-Boundary Refiner v5 只规划 speech core：Mamba2 输出 `start_delta + end_delta`。ASR chunk、fallback window 和字幕初始时间轴都使用 refined speech core。运行时不跨 island 合并，不学习或应用 ASR padding/context budget，也不能再通过 env 关闭 refiner 或切换非 canonical backbone；训练数据不再写 `sequence_labels` / `merge_positive` / `split_negative`。
+Boundary Refiner v5 只规划 speech core：Mamba2 输出 `start_delta + end_delta`。ASR chunk 和字幕初始时间轴都使用 refined speech core。运行时不跨 island 合并，不学习或应用 ASR padding/context budget，也不能再通过 env 关闭 refiner 或切换非 canonical backbone；训练数据不再写 `sequence_labels` / `merge_positive` / `split_negative`。
 
 翻译缓存分三层：
 
@@ -142,34 +141,31 @@ Boundary Refiner v5 只规划 speech core：Mamba2 输出 `start_delta + end_del
 | 可选 ASR | `jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame` | `models/jaykwok-Qwen3-ASR-1.7B-JA-Anime-Galgame` |
 | SpeechBoundary-JA frozen feature | `jaykwok/Qwen3-ASR-0.6B-JA-Anime-Galgame` | `models/jaykwok-Qwen3-ASR-0.6B-JA-Anime-Galgame` |
 | CueQC v3-Fusion | learned Mamba2 fusion checkpoint，输入 ASR encoder features、token trace、decoder stats 和 chunk metadata | `src/asr/checkpoints/cueqc_mamba_v3_fusion.pt` |
-| Forced aligner | `Qwen/Qwen3-ForcedAligner-0.6B` | `models/Qwen-Qwen3-ForcedAligner-0.6B` |
 | Boundary Refiner | learned `transformers.Mamba2Model` true v5 delta-only 32768 hardmix checkpoint | `src/boundary/checkpoints/boundary_refiner.pt` |
 
 常用配置见 [.env.example](.env.example)。通常只需要修改 API key、翻译模型、`HF_ENDPOINT`、ASR backend 和 batch size。
 
 推荐 batch 档位：
 
-| 显存档 | `ASR_BATCH_SIZE_BY_REPO` | `ALIGNER_BATCH_SIZE` / `ALIGN_LONG_CHUNK_BATCH_SIZE` |
-| --- | --- | --- |
-| 6GB 默认 / 分发 | `0.6B=64, 1.7B=32` | `64 / 64` |
-| 8GB 本机实验 | `0.6B=128, 1.7B=64` | `128 / 128` |
+| 显存档 | `ASR_BATCH_SIZE_BY_REPO` |
+| --- | --- |
+| 6GB 默认 / 分发 | `0.6B=64, 1.7B=32` |
+| 8GB 本机实验 | `0.6B=128, 1.7B=64` |
 
 8GB 档面向本机调参和快速审计；如果后台还有其他 CUDA 进程或出现 OOM，先退回 6GB 档。
 
-推理需要源码内置的 `src/boundary/checkpoints/boundary_refiner.pt`，以及 ASR / SpeechBoundary-JA frozen feature / forced aligner Hugging Face 模型。Windows 打包版默认内置 0.6B ASR、1.7B ASR 和 forced aligner；源码运行时如果本地没有模型，仍会按需下载到 `models/`。Boundary Refiner 训练时生成的 CUDA feature cache、synthetic WAV、sequence JSONL、tensor cache 和 `datasets/train/...` 产物都不是运行依赖，不随源码或 Windows release 打包；重新训练大数据集时应使用训练脚本的流式读取 / tensor cache，避免 WSL2 8GB 内存下整量加载 JSONL。
+推理需要源码内置的 `src/boundary/checkpoints/boundary_refiner.pt`，以及 ASR / SpeechBoundary-JA frozen feature Hugging Face 模型。Windows 打包版默认内置 0.6B ASR 和 1.7B ASR；源码运行时如果本地没有模型，仍会按需下载到 `models/`。Boundary Refiner 训练时生成的 CUDA feature cache、synthetic WAV、sequence JSONL、tensor cache 和 `datasets/train/...` 产物都不是运行依赖，不随源码或 Windows release 打包；重新训练大数据集时应使用训练脚本的流式读取 / tensor cache，避免 WSL2 8GB 内存下整量加载 JSONL。
 
 ---
 
 ## 字幕与文本策略
 
-- 系统维护 `display_text` 和 `align_text` 两份文本。
-- `display_text` 用于最终字幕显示，只做 Unicode NFKC、空白归一、换行折叠和展示安全处理。
-- `align_text` 只给 forced aligner 使用，可删除标点、emoji、音乐符号和不可发音装饰符。
+- ASR 文本只保留用于显示和 CueQC 的规范化文本：Unicode NFKC、空白归一、换行折叠和展示安全处理。
 - `ASR_CONTEXT` / `ASR_HEAD_CONTEXT` 只作为 Qwen ASR 提示词，不再作为字幕后处理删除规则。
 - 不使用具体词黑名单，不直接删除 `ん`、`あ`、喘息、呻吟、拟声、低信息短句或常见台词。
 - 旧规则 ASR QC 已退役；字幕保留/丢弃由 CueQC v3-Fusion 输出的二元 `keep/drop` 决策负责，模型不可用时默认保守保留。
 - CueQC 当前只做保守减法：基础 `drop_threshold=0.85`，checkpoint 可按风险桶抬高阈值；默认 Stage 2b profile 将 `short_text` 桶提升到 `0.87`。
-- forced aligner 失败时不伪造精确时间轴，会保留可诊断 fallback 标签。
+- 字幕时间轴来自 Boundary chunk；ASR 输出文本只负责显示和 CueQC，不再参与单独的文本/时间轴匹配步骤。
 
 ---
 
@@ -219,24 +215,18 @@ model_param_device=cuda:*
 
 ```env
 ASR_BATCH_SIZE_BY_REPO=jaykwok/Qwen3-ASR-0.6B-JA-Anime-Galgame=64,jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame=32
-ALIGNER_BATCH_SIZE=64
-ALIGN_LONG_CHUNK_BATCH_SIZE=64
 ```
 
 8GB 本机可尝试：
 
 ```env
 ASR_BATCH_SIZE_BY_REPO=jaykwok/Qwen3-ASR-0.6B-JA-Anime-Galgame=128,jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame=64
-ALIGNER_BATCH_SIZE=128
-ALIGN_LONG_CHUNK_BATCH_SIZE=128
 ```
 
 如果仍然 OOM，优先降低：
 
 ```env
 ASR_BATCH_SIZE_BY_REPO=jaykwok/Qwen3-ASR-0.6B-JA-Anime-Galgame=24,jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame=8
-ALIGNER_BATCH_SIZE=24
-ALIGN_LONG_CHUNK_BATCH_SIZE=24
 ```
 
 ### 长任务怎么排查
@@ -252,13 +242,13 @@ ALIGN_LONG_CHUNK_BATCH_SIZE=24
 - `src/main.py`：主流程编排。
 - `src/core/`：配置和任务上下文。
 - `src/pipeline/`：音频、缓存、输出、质量报告和阶段日志。
-- `src/asr/`：ASR、forced alignment、prealign 和转写流程。
+- `src/asr/`：ASR、Boundary 字幕时间轴分配、CueQC 和转写流程。
 - `src/boundary/`：Boundary features、candidate extraction、Boundary Refiner checkpoint loader、sequence Mamba2 adapter、core planner 和 boundary-cache v5。
 - `src/boundary/ja/`：SpeechBoundary-JA bootstrap scorer、PTM/MFCC feature cache schema、训练数据 manifest 和 frame-score 训练工具。
 - `src/llm/`：翻译 prompt、cache、glossary、API patch 和 translator。
 - `src/subtitles/`：SRT writer、字幕选项和字幕 QC。
 - `src/web/`：FastAPI 接口和静态前端。
-- `tools/`：训练、诊断、字幕审计和发布辅助脚本。
+- `tools/`：训练、字幕审计、workflow smoke 和发布辅助脚本。
 
 常用测试：
 
@@ -318,11 +308,10 @@ uv run python -m tools.web.smoke.summarize_job --job-id <job_id> --run-dir agent
 - `tools.asr.cueqc.predict_v3_fusion`：对特征 bundle 输出 keep/drop prediction 和 high-confidence pseudo labels。
 - `tools.asr.cueqc.compile_stage2a_features_v3_fusion`：合并 cold-start、人工 false-drop 审计和高置信 keep pseudo，生成 Stage 2 训练 bundle。
 
-### 审计、诊断与 Boundary
+### 审计与 Boundary
 
 - `tools.audits.audit_nav`、`tools.audits.serve_audits.ps1`、`tools.audits.serve_audits.sh`：维护和启动本地审计导航页。
-- `tools.audits.generate_*_audit_html`：生成字幕、alignment、CueQC prediction 等人工审计页。
-- `tools.asr.diagnostics.*`：分析 alignment failure、fallback timing、安全边界和 ASR hard-negative 候选。
+- `tools.audits.generate_*_audit_html`：生成字幕 A/B、CueQC prediction、cluster review 和手工标注审计页。
 - `tools.boundary.*`、`tools.boundary.ja.*`：Boundary Refiner 训练数据构建、SpeechBoundary-JA 训练和 frame score 导出工具。
 - `tools.boundary.export_cueqc_drop_hardcases`：把 CueQC false-drop 审计中已确认可丢弃的 chunk 导出为 SpeechBoundary-JA hard-negative 候选池；不会生成 Boundary Refiner 训练标签。
 - `tools.boundary.prepare_cueqc_drop_hard_negative_sources`：把 CueQC `drop_ok` hard-negative 候选补回审计音频，并切出 SpeechBoundary-JA negative labels；不会直接启动训练。

@@ -23,7 +23,7 @@ def _segment(text: str, start: float, end: float, **extra) -> dict:
 
 def test_isolated_short_vocalization_is_kept():
     cues = [_cue(0, "あ", 0.0, 0.4)]
-    segments = [_segment("あ", 0.0, 0.4, alignment_quality="forced")]
+    segments = [_segment("あ", 0.0, 0.4, alignment_quality="boundary")]
 
     displayed, summary = display_policy.apply_display_policy(
         cues,
@@ -72,7 +72,7 @@ def test_stable_dialogue_is_kept_even_when_short_runs_are_nearby():
     ]
     segments = [
         _segment("あ", 0.0, 0.4, fallback_subtype="nonlexical_text"),
-        _segment("今日はいい天気ですね", 0.5, 2.4, alignment_quality="forced"),
+        _segment("今日はいい天気ですね", 0.5, 2.4, alignment_quality="boundary"),
         _segment("あ", 2.5, 2.9, fallback_subtype="nonlexical_text"),
     ]
 

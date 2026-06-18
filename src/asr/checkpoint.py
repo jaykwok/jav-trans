@@ -13,7 +13,7 @@ from asr.backends.registry import (
 )
 from asr.backends.qwen import active_qwen_asr_model_id
 from asr.cueqc import runtime_signature as cueqc_runtime_signature
-from asr.local_backend import ASR_DTYPE, ALIGNMENT_TIMESTAMP_MODE
+from asr.local_backend import ASR_DTYPE
 
 
 def _asr_generation_error_kind(kind: str) -> str:
@@ -124,7 +124,7 @@ def _get_asr_runtime_signature(
         "backend": current_asr_backend(),
         "worker_mode": current_asr_worker_mode(),
         "timestamp": {
-            "alignment_mode": _env_lower("ALIGNMENT_TIMESTAMP_MODE", ALIGNMENT_TIMESTAMP_MODE),
+            "source": "boundary_chunk_timeline",
         },
         "model": {
             "asr_model_id": _env_text("ASR_MODEL_ID", ""),

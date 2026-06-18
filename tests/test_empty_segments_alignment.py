@@ -1,25 +1,17 @@
-from asr import pipeline as asr
 from asr import local_backend
-from asr.local_backend import align_text_to_words
+from asr import pipeline as asr
 
 
 class _NoFinalizeBackend:
     is_subprocess = False
     accepts_contexts = True
-    timestamp_mode = "forced"
     request_batch_size = 1
-    align_batch_size = 1
 
     def unload_model(self, on_stage=None):
         raise AssertionError("empty segment placeholders should not unload model")
 
     def finalize_text_results(self, text_results, on_stage=None):
         raise AssertionError("empty segment placeholders should not reach finalize")
-
-
-class _EmptyAligner:
-    def align(self, *, audio, text, language):
-        return []
 
 
 def test_align_TRANSCRIPTION_results_empty_input_returns_quarantine_placeholder():
@@ -57,108 +49,19 @@ def test_align_TRANSCRIPTION_results_empty_segments_placeholder():
     assert any(entry.startswith("QUARANTINED:") for entry in chunk_log)
 
 
-def test_quarantined_text_result_has_generation_error_metadata(tmp_path):
-    audio_path = tmp_path / "chunk.wav"
-    audio_path.write_bytes(b"not a real wav")
-
-    result = asr._build_quarantined_text_result(
-        {
-            "path": str(audio_path),
-            "start": 2.0,
-            "end": 5.0,
-        },
-        kind="timeout",
-        detail="worker timeout",
-        respawn_count=3,
-        run_id="run123",
-    )
-
-    assert result["duration"] == 3.0
-    assert result["asr_generation"]["error_kind"] == "timeout"
-    assert result["asr_generation"]["failure_kind"] == "timeout"
-    assert result["asr_generation"]["respawn_count"] == 3
-    assert result["asr_generation"]["run_id"] == "run123"
-
-
-def test_align_text_to_words_with_empty_aligner_result():
-    words, mode = align_text_to_words(
-        "missing.wav",
-        "テスト",
-        "Japanese",
-        aligner_handle=_EmptyAligner(),
-    )
-
-    assert words == []
-    assert mode == "forced_aligner"
-
-
-def test_qwen_finalize_empty_forced_words_falls_back(monkeypatch):
+def test_qwen_finalize_uses_boundary_chunk_timeline(monkeypatch):
     backend = local_backend.LocalAsrBackend("cpu")
-    backend.align_batch_size = 1
+    calls = []
 
-    fallback_calls = []
-
-    def fake_forced_batch(items, on_stage=None):
-        return [[] for _item in items]
-
-    def fake_fallback(text, start, end, audio_path=None):
-        fallback_calls.append((text, start, end, audio_path))
+    def fake_boundary_timing(text, start, end, audio_path=None):
+        calls.append((text, start, end, audio_path))
         return (
             [{"word": text, "start": start, "end": end}],
-            "aligner_vad_fallback",
-            {"speech_span_count": 1},
+            "boundary_proportional",
+            {"timing_source": "boundary_chunk"},
         )
 
-    monkeypatch.setattr(backend, "_forced_align_words_batch", fake_forced_batch)
-    monkeypatch.setattr(
-        local_backend,
-        "build_word_timestamps_fallback",
-        fake_fallback,
-    )
-
-    prepared = backend.finalize_text_results(
-        [
-            {
-                "text": "テスト",
-                "raw_text": "テスト",
-                "duration": 2.0,
-                "language": "Japanese",
-                "normalized_path": "missing.wav",
-                "log": [],
-            }
-        ]
-    )
-
-    chunk_result, chunk_log = prepared[0]
-    assert chunk_result["words"] == [{"word": "テスト", "start": 0.0, "end": 2.0}]
-    assert chunk_result["alignment_mode"] == "aligner_vad_fallback"
-    assert fallback_calls == [("テスト", 0.0, 2.0, "missing.wav")]
-    assert any("forced aligner returned empty words" in entry for entry in chunk_log)
-
-
-def test_qwen_finalize_empty_forced_words_uses_alignment_fallback_window(monkeypatch):
-    backend = local_backend.LocalAsrBackend("cpu")
-    backend.align_batch_size = 1
-
-    fallback_calls = []
-
-    def fake_forced_batch(items, on_stage=None):
-        return [[] for _item in items]
-
-    def fake_fallback(text, start, end, audio_path=None):
-        fallback_calls.append((text, start, end, audio_path))
-        return (
-            [{"word": text, "start": start, "end": end}],
-            "aligner_vad_fallback",
-            {"speech_span_count": 1},
-        )
-
-    monkeypatch.setattr(backend, "_forced_align_words_batch", fake_forced_batch)
-    monkeypatch.setattr(
-        local_backend,
-        "build_word_timestamps_fallback",
-        fake_fallback,
-    )
+    monkeypatch.setattr(local_backend, "build_boundary_word_timestamps", fake_boundary_timing)
 
     prepared = backend.finalize_text_results(
         [
@@ -178,49 +81,7 @@ def test_qwen_finalize_empty_forced_words_uses_alignment_fallback_window(monkeyp
 
     chunk_result, chunk_log = prepared[0]
     assert chunk_result["words"] == [{"word": "テスト", "start": 2.0, "end": 8.0}]
-    assert chunk_result["alignment_mode"] == "aligner_vad_fallback"
-    assert fallback_calls == [("テスト", 2.0, 8.0, "missing.wav")]
-    assert any("Alignment 回退窗口: speech_core" in entry for entry in chunk_log)
-
-
-def test_qwen_finalize_nonlexical_text_skips_forced_aligner(monkeypatch):
-    backend = local_backend.LocalAsrBackend("cpu")
-    backend.align_batch_size = 1
-
-    def fail_forced_batch(items, on_stage=None):
-        raise AssertionError("nonlexical text should not call forced aligner")
-
-    def fake_fallback(text, start, end, audio_path=None):
-        return (
-            [{"word": text, "start": 0.0, "end": end}],
-            "even_fallback",
-            {"speech_span_count": 0, "vad_error": ""},
-        )
-
-    monkeypatch.setattr(backend, "_forced_align_words_batch", fail_forced_batch)
-    monkeypatch.setattr(
-        local_backend,
-        "build_word_timestamps_fallback",
-        fake_fallback,
-    )
-
-    prepared = backend.finalize_text_results(
-        [
-            {
-                "text": "...。",
-                "raw_text": "...。",
-                "duration": 1.5,
-                "language": "Japanese",
-                "normalized_path": "missing.wav",
-                "log": [],
-            }
-        ]
-    )
-
-    chunk_result, chunk_log = prepared[0]
-    assert chunk_result["words"] == [{"word": "...。", "start": 0.0, "end": 1.5}]
-    assert chunk_result["alignment_mode"] == "nonlexical"
-    assert any("Alignment 策略: nonlexical_fallback" in entry for entry in chunk_log)
-    assert any("Alignment 非词文本" in entry for entry in chunk_log)
-
-
+    assert chunk_result["alignment_mode"] == "boundary_proportional"
+    assert calls == [("テスト", 2.0, 8.0, "missing.wav")]
+    assert any("Subtitle timing: boundary_chunk_timeline" in entry for entry in chunk_log)
+    assert any("Subtitle timing window: speech_core" in entry for entry in chunk_log)

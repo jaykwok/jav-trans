@@ -55,7 +55,7 @@ def _candidate(
             "same_text_run_length": 3 if text == "あ" else 1,
         },
         "asr_signals": {},
-        "alignment_diagnostics": {},
+        "subtitle_timing": {},
     }
     if embedding is not None:
         row["embeddings"] = {
@@ -235,7 +235,7 @@ def test_cueqc_torque_outputs_stable_audit_files(tmp_path: Path):
     assert "cueqc_cluster_labels.jsonl" in html
 
 
-def test_cueqc_runtime_signature_is_v3_without_prealign_skip(monkeypatch):
+def test_cueqc_runtime_signature_is_v3_binary_routing(monkeypatch):
     monkeypatch.setenv("CUEQC_MODEL_PATH", "src/asr/checkpoints/cueqc_mamba_v3_fusion.pt")
     monkeypatch.setenv("CUEQC_DROP_APPLY_ENABLED", "1")
 
@@ -245,7 +245,22 @@ def test_cueqc_runtime_signature_is_v3_without_prealign_skip(monkeypatch):
     assert sig["model_version"] == "cueqc_mamba_v3_fusion"
     assert sig["decision_version"] == "cueqc_display_binary_v1"
     assert sig["fallback_policy"] == "keep"
-    assert "prealign_skip_enabled" not in sig
+    assert sig["drop_apply_enabled"] is True
+    assert set(sig) == {
+        "schema_version",
+        "feature_schema_version",
+        "enabled",
+        "shadow_only",
+        "policy",
+        "decision_version",
+        "model_version",
+        "model_path",
+        "checkpoint_sha1",
+        "drop_threshold",
+        "drop_apply_enabled",
+        "fallback_policy",
+        "shadow_embed_candidates",
+    }
 
 
 def test_cueqc_v3_does_not_extend_boundary_frame_provider_api():

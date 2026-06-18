@@ -121,8 +121,8 @@ def _chunk_window(row: dict[str, Any]) -> tuple[float, float]:
     end = row.get("end")
     if start is not None and end is not None:
         return float(start), float(end)
-    align = (row.get("features") or {}).get("alignment_diagnostics") or {}
-    end_v = align.get("fallback_window_end_s")
+    timing = (row.get("features") or {}).get("subtitle_timing") or {}
+    end_v = timing.get("fallback_window_end_s")
     return 0.0, float(end_v) if end_v is not None else 1.0
 
 

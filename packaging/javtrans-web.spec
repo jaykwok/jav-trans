@@ -159,11 +159,6 @@ if not _env_bool("JAVTRANS_SKIP_MODELS"):
         "models/jaykwok-Qwen3-ASR-1.7B-JA-Anime-Galgame",
         "bundled 1.7B ASR model",
     )
-    datas += _collect_inference_model_dir(
-        "models/Qwen-Qwen3-ForcedAligner-0.6B",
-        "models/Qwen-Qwen3-ForcedAligner-0.6B",
-        "bundled forced aligner model",
-    )
 
 binaries = _ffmpeg_binaries()
 

@@ -749,7 +749,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--fallback-target-duration-s",
         type=float,
         default=8.0,
-        help="Target maximum segment duration if forced alignment falls back to coarse boundary timing.",
+        help="Target maximum segment duration for Boundary chunk subtitle timing.",
     )
     parser.add_argument(
         "--fallback-gap-overlap-s",

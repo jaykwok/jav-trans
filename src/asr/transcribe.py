@@ -22,16 +22,12 @@ from asr.checkpoint import (
     _quarantine_failed_chunks,
     _save_asr_checkpoint,
 )
-from asr.chunking import _KEEP_ASR_CHUNKS, _extract_wav_chunks
 from asr.local_backend import (
     LocalAsrBackend,
     SubprocessAsrBackend,
     WorkerError,
     WorkerTimeoutError,
-    looks_like_word_timing_failure,
-    word_timing_failure_reasons,
 )
-from asr.timestamp_fallback import build_word_timestamps_fallback
 
 
 logger = logging.getLogger(__name__)
@@ -39,19 +35,7 @@ logger = logging.getLogger(__name__)
 _ASR_CONTEXT_RESET_GAP_S = float(os.getenv("ASR_CONTEXT_RESET_GAP_S", "0.5"))
 _ASR_SLIDING_CONTEXT_SEGS = max(0, int(os.getenv("ASR_SLIDING_CONTEXT_SEGS", "2")))
 _ASR_INITIAL_PROMPT_MAX_CHARS = int(os.getenv("ASR_INITIAL_PROMPT_MAX_CHARS", "240"))
-_ALIGNMENT_STEP_DOWN_CHUNK_S = float(os.getenv("ALIGNMENT_STEP_DOWN_CHUNK", "6.0"))
-_ALIGNMENT_COARSE_REFINE_CHUNK_S = float(os.getenv("ALIGNMENT_COARSE_REFINE_CHUNK", "18.0"))
-_ALIGNMENT_MAX_REFINE_DEPTH = max(0, int(os.getenv("ALIGNMENT_MAX_REFINE_DEPTH", "2")))
 _ASR_HEAD_CONTEXT_MAX_START_S = float(os.getenv("ASR_HEAD_CONTEXT_MAX_START_S", "16"))
-_ALIGNMENT_MIN_SPAN_MS = float(os.getenv("ALIGNMENT_MIN_SPAN_MS", "120"))
-_ALIGNMENT_MAX_ZERO_RATIO = float(os.getenv("ALIGNMENT_MAX_ZERO_RATIO", "0.55"))
-_ALIGNMENT_MAX_REPEAT_RATIO = float(os.getenv("ALIGNMENT_MAX_REPEAT_RATIO", "0.65"))
-_ALIGNMENT_MAX_COVERAGE_RATIO = float(os.getenv("ALIGNMENT_MAX_COVERAGE_RATIO", "0.05"))
-_ALIGNMENT_MAX_CPS = float(os.getenv("ALIGNMENT_MAX_CPS", "50.0"))
-_ALIGNMENT_RETRY_SKIP_MAX_TEXT_LEN = max(
-    1,
-    int(os.getenv("ALIGNMENT_RETRY_SKIP_MAX_TEXT_LEN", "10")),
-)
 _ASR_INVALID_SEGMENT_DURATION_S = float(
     os.getenv("ASR_INVALID_SEGMENT_DURATION", "0.1")
 )
@@ -148,20 +132,6 @@ def _word_backed_segment_text(words: list[dict]) -> str:
     return text
 
 
-def _build_timestamp_fallback(
-    text: str,
-    start: float,
-    end: float,
-    audio_path: str | None = None,
-) -> tuple[list[dict], str, dict]:
-    return build_word_timestamps_fallback(
-        _clean_segment_text(text),
-        start,
-        end,
-        audio_path=audio_path,
-    )
-
-
 def _alignment_fallback_window_from_chunk(
     chunk: dict,
     *,
@@ -190,53 +160,6 @@ def _with_alignment_fallback_window(chunk: dict, text_result: dict) -> dict:
     result["alignment_fallback_end_s"] = round(end_s, 6)
     result["alignment_fallback_source"] = source
     return result
-
-
-def _fallback_window_for_chunk_log(chunk: dict, duration: float) -> tuple[float, float, str]:
-    start_s, end_s, source = _alignment_fallback_window_from_chunk(
-        chunk,
-        duration=duration,
-    )
-    return start_s, end_s, source
-
-
-def _append_fallback_window_log(chunk_log: list[str], source: str) -> None:
-    if source == "speech_core":
-        chunk_log.append("Alignment 回退窗口: speech_core")
-
-
-def _looks_like_alignment_failure(
-    words: list[dict],
-    scene_duration_sec: float | None = None,
-) -> bool:
-    return looks_like_word_timing_failure(
-        words,
-        min_span_ms=_ALIGNMENT_MIN_SPAN_MS,
-        max_zero_ratio=_ALIGNMENT_MAX_ZERO_RATIO,
-        max_repeat_ratio=_ALIGNMENT_MAX_REPEAT_RATIO,
-        scene_duration_sec=scene_duration_sec,
-        max_coverage_ratio=_ALIGNMENT_MAX_COVERAGE_RATIO,
-        max_cps=_ALIGNMENT_MAX_CPS,
-    )
-
-
-def _alignment_failure_reasons(
-    words: list[dict],
-    scene_duration_sec: float | None = None,
-) -> list[str]:
-    return word_timing_failure_reasons(
-        words,
-        min_span_ms=_ALIGNMENT_MIN_SPAN_MS,
-        max_zero_ratio=_ALIGNMENT_MAX_ZERO_RATIO,
-        max_repeat_ratio=_ALIGNMENT_MAX_REPEAT_RATIO,
-        scene_duration_sec=scene_duration_sec,
-        max_coverage_ratio=_ALIGNMENT_MAX_COVERAGE_RATIO,
-        max_cps=_ALIGNMENT_MAX_CPS,
-    )
-
-
-_ALIGNMENT_MODE_RE = re.compile(r"Alignment\s+模式:\s*(\S+)")
-_ALIGNMENT_WORD_COUNT_RE = re.compile(r"Alignment\s+词数:\s*(\d+)")
 
 
 def _word_timing_stats(words: list[dict]) -> dict:
@@ -280,26 +203,6 @@ def _word_timing_stats(words: list[dict]) -> dict:
     }
 
 
-def _chunk_log_alignment_metadata(chunk_log: list[str]) -> dict:
-    metadata = {
-        "alignment_mode": "",
-        "alignment_word_count": None,
-        "align_error": "",
-        "sentinel_lines": [],
-    }
-    for line in chunk_log:
-        line = str(line)
-        if mode_match := _ALIGNMENT_MODE_RE.search(line):
-            metadata["alignment_mode"] = mode_match.group(1)
-        if count_match := _ALIGNMENT_WORD_COUNT_RE.search(line):
-            metadata["alignment_word_count"] = int(count_match.group(1))
-        if "Alignment 异常:" in line:
-            metadata["align_error"] = line.split("Alignment 异常:", 1)[1].strip()
-        if "哨兵" in line:
-            metadata["sentinel_lines"].append(line)
-    return metadata
-
-
 def _alignment_outcome_for_chunk(
     *,
     chunk: dict,
@@ -307,29 +210,25 @@ def _alignment_outcome_for_chunk(
     chunk_words: list[dict],
     chunk_log: list[str],
 ) -> dict:
+    del chunk_log
     text = str(chunk_result.get("text") or chunk_result.get("raw_text") or "").strip()
-    raw_mode = str(chunk_result.get("alignment_mode") or "").strip()
-    log_meta = _chunk_log_alignment_metadata(chunk_log)
-    alignment_mode = str(log_meta.get("alignment_mode") or raw_mode).strip()
+    alignment_mode = str(chunk_result.get("alignment_mode") or "").strip()
+    align_error = str(chunk_result.get("align_error") or "").strip()
     try:
         duration = float(chunk_result.get("duration"))
     except (TypeError, ValueError):
         duration = max(0.0, float(chunk.get("end", 0.0)) - float(chunk.get("start", 0.0)))
     word_stats = _word_timing_stats(chunk_words)
-    word_failure_reasons = _alignment_failure_reasons(chunk_words, scene_duration_sec=duration)
     compact_text = _strip_punctuation(_clean_segment_text(text))
     nonlexical_text = bool(text and not compact_text)
     quality = classify_alignment_quality(
         text=text,
         duration_s=duration,
-        align_text_empty=bool(text and not compact_text),
         nonlexical_text=nonlexical_text,
         alignment_mode=alignment_mode,
-        align_error=str(log_meta.get("align_error") or ""),
-        sentinel_lines=list(log_meta.get("sentinel_lines") or []),
+        align_error=align_error,
         aligned_segment_count=1 if chunk_words else 0,
         word_stats=word_stats,
-        word_failure_reasons=word_failure_reasons,
     )
     return {
         "alignment_mode": alignment_mode,
@@ -337,63 +236,10 @@ def _alignment_outcome_for_chunk(
         "fallback_type": quality["fallback_type"],
         "fallback_subtype": quality["fallback_subtype"],
         "alignment_quality_reasons": quality["alignment_quality_reasons"],
-        "alignment_word_count": log_meta.get("alignment_word_count"),
-        "align_error": str(log_meta.get("align_error") or ""),
-        "sentinel_lines": list(log_meta.get("sentinel_lines") or []),
+        "alignment_word_count": word_stats["word_count"],
+        "align_error": align_error,
         "word_timing": word_stats,
-        "word_timing_failure_reasons": word_failure_reasons,
-        "forced_success": quality["alignment_quality"] == "forced",
         "fallback_active": quality["fallback_type"] != "none",
-    }
-
-
-def _split_span_evenly(
-    start: float, end: float, chunk_size: float
-) -> list[tuple[float, float]]:
-    if end - start <= chunk_size:
-        return [(start, end)]
-
-    spans: list[tuple[float, float]] = []
-    cursor = start
-    while cursor < end:
-        chunk_end = min(end, cursor + chunk_size)
-        spans.append((cursor, chunk_end))
-        cursor = chunk_end
-    return spans
-
-
-def _prepare_asr_chunk_results(
-    backend: LocalAsrBackend,
-    chunks: list[dict],
-    text_stage_label: str,
-    on_stage: Callable[[str], None] | None = None,
-) -> tuple[list[tuple[dict, list[str]]], dict[str, float]]:
-    stage_started = time.perf_counter()
-    text_results, text_timings = _transcribe_asr_chunks_text_only(
-        backend,
-        chunks,
-        text_stage_label,
-        on_stage=on_stage,
-    )
-    text_results = [
-        _with_alignment_fallback_window(chunk, text_result)
-        for chunk, text_result in zip(chunks, text_results)
-    ]
-    unload_started = time.perf_counter()
-    backend.unload_model(on_stage=on_stage)
-    unload_elapsed = time.perf_counter() - unload_started
-    prepared, align_timings = _align_TRANSCRIPTION_results(
-        backend,
-        text_results,
-        on_stage=on_stage,
-    )
-    total_elapsed = time.perf_counter() - stage_started
-
-    return prepared, {
-        "text_transcribe_s": text_timings["text_transcribe_s"],
-        "asr_unload_s": unload_elapsed,
-        "alignment_s": align_timings["alignment_s"],
-        "total_s": total_elapsed,
     }
 
 
@@ -753,7 +599,7 @@ def _is_empty_segment_text_result(text_result: dict) -> bool:
 def _empty_alignment_placeholder(
     text_result: dict,
     *,
-    reason: str = "Alignment skipped: empty segments placeholder",
+    reason: str = "Subtitle timing skipped: empty segments placeholder",
 ) -> tuple[dict, list[str]]:
     log = list(text_result.get("log", []))
     if reason and reason not in log:
@@ -789,7 +635,7 @@ def _empty_segments_quarantine_placeholder() -> tuple[dict, list[str]]:
                 (
                     "QUARANTINED: "
                     "kind=empty_segment, respawn_count=0, "
-                    "run_id=, detail=empty alignment input"
+                    "run_id=, detail=empty subtitle timing input"
                 )
             ],
         }
@@ -823,26 +669,20 @@ def _align_TRANSCRIPTION_results(
     if _is_subprocess_backend(backend) or getattr(backend, "model", None) is not None:
         backend.unload_model(on_stage=on_stage)
 
-    finalize_batch_size = max(1, int(getattr(backend, "align_batch_size", 1)))
-
-    for batch_start in range(0, len(pending_results), finalize_batch_size):
-        batch_results = pending_results[batch_start : batch_start + finalize_batch_size]
-        batch_indices = pending_indices[batch_start : batch_start + finalize_batch_size]
-        batch_end = batch_start + len(batch_results)
-        if on_stage:
-            on_stage(f"Alignment 对齐 {batch_end}/{len(pending_results)}...")
-        finalized_batch = backend.finalize_text_results(
-            batch_results,
-            on_stage=on_stage,
-        )
-        for result_index, finalized in zip(batch_indices, finalized_batch):
-            prepared[result_index] = finalized
-        if len(finalized_batch) < len(batch_results):
-            for missing_index in batch_indices[len(finalized_batch) :]:
-                prepared[missing_index] = _empty_alignment_placeholder(
-                    text_results[missing_index],
-                    reason="Alignment skipped: backend returned no finalize result",
-                )
+    if on_stage:
+        on_stage(f"字幕时间轴 {len(pending_results)}/{len(pending_results)}...")
+    finalized_batch = backend.finalize_text_results(
+        pending_results,
+        on_stage=on_stage,
+    )
+    for result_index, finalized in zip(pending_indices, finalized_batch):
+        prepared[result_index] = finalized
+    if len(finalized_batch) < len(pending_results):
+        for missing_index in pending_indices[len(finalized_batch) :]:
+            prepared[missing_index] = _empty_alignment_placeholder(
+                text_results[missing_index],
+                reason="Subtitle timing skipped: backend returned no finalize result",
+            )
 
     align_elapsed = time.perf_counter() - align_started
     return [
@@ -850,7 +690,7 @@ def _align_TRANSCRIPTION_results(
         if item is not None
         else _empty_alignment_placeholder(
             text_results[idx],
-            reason="Alignment skipped: missing finalize result",
+            reason="Subtitle timing skipped: missing finalize result",
         )
         for idx, item in enumerate(prepared)
     ], {"alignment_s": align_elapsed}
@@ -900,10 +740,7 @@ def _build_transcript_chunks(
                         "alignment_quality_reasons",
                         "alignment_word_count",
                         "align_error",
-                        "sentinel_lines",
                         "word_timing",
-                        "word_timing_failure_reasons",
-                        "forced_success",
                         "fallback_active",
                     }
                 }
@@ -1009,324 +846,6 @@ def _build_initial_prompt_for_chunk(
     if not prompt_parts:
         return None
     return _truncate_initial_prompt("\n".join(reversed(prompt_parts)))
-
-
-def _should_skip_alignment_retry(text: str) -> bool:
-    cleaned = _clean_segment_text(text)
-    compact = _strip_punctuation(cleaned)
-    if not compact:
-        return True
-    if len(compact) <= _ALIGNMENT_RETRY_SKIP_MAX_TEXT_LEN:
-        return True
-    return _is_low_value_text(cleaned)
-
-
-def _needs_alignment_fallback(
-    words: list[dict],
-    text: str,
-    scene_duration_sec: float | None = None,
-) -> bool:
-    compact_len = len(_strip_punctuation(text))
-    if compact_len > 0 and not words:
-        return True
-    if compact_len >= 18 and len(words) <= 1:
-        return True
-    return _looks_like_alignment_failure(words, scene_duration_sec=scene_duration_sec)
-
-
-def _finalize_aligned_chunk_without_asr_retry(
-    chunk: dict,
-    chunk_result: dict,
-    chunk_log: list[str],
-) -> tuple[list[dict], list[str]]:
-    chunk_words = list(chunk_result.get("words", []))
-    text = chunk_result.get("text", "")
-    start = float(chunk["start"])
-    end = float(chunk["end"])
-    duration = max(0.0, end - start)
-
-    if not _needs_alignment_fallback(chunk_words, text, scene_duration_sec=duration):
-        return chunk_words, chunk_log
-
-    chunk_log.append(
-        "Alignment 哨兵触发: 时间轴异常，不重新调用 ASR，改用 VAD/比例回退"
-    )
-    fallback_start, fallback_end, fallback_source = _fallback_window_for_chunk_log(
-        chunk,
-        duration,
-    )
-    fallback_words, fallback_mode, fallback_meta = _build_timestamp_fallback(
-        text,
-        fallback_start,
-        fallback_end,
-        audio_path=chunk["path"],
-    )
-    _append_fallback_window_log(chunk_log, fallback_source)
-    if fallback_mode == "aligner_vad_fallback":
-        chunk_log.append("Alignment 回退: 使用 VAD 约束比例时间戳")
-        chunk_log.append(
-            f"Alignment VAD 回退语音区间: {fallback_meta.get('speech_span_count', 0)}"
-        )
-    else:
-        chunk_log.append("Alignment 回退: 使用等比分配时间戳")
-        if fallback_meta.get("vad_error"):
-            chunk_log.append(f"Alignment VAD 回退异常: {fallback_meta['vad_error']}")
-    chunk_log.append(f"Alignment 模式: {fallback_mode}")
-    return fallback_words, chunk_log
-
-
-def _refine_chunk_with_subchunks(
-    backend: LocalAsrBackend,
-    source_audio_path: str,
-    chunk: dict,
-    subchunk_size: float,
-    retry_depth: int,
-    on_stage: Callable[[str], None] | None = None,
-) -> tuple[list[dict], list[str]]:
-    start = float(chunk["start"])
-    end = float(chunk["end"])
-    refine_spans = _split_span_evenly(start, end, subchunk_size)
-    if len(refine_spans) <= 1:
-        return [], []
-
-    refine_dir, refine_infos = _extract_wav_chunks(source_audio_path, refine_spans)
-    refine_words: list[dict] = []
-    refine_log: list[str] = []
-    try:
-        prepared_results, _stage_timings = _prepare_asr_chunk_results(
-            backend,
-            refine_infos,
-            "Alignment 局部细化",
-            on_stage=on_stage,
-        )
-        for refine_idx, refine_chunk, (initial_chunk_result, initial_chunk_log) in zip(
-            range(1, len(refine_infos) + 1),
-            refine_infos,
-            prepared_results,
-        ):
-            sub_words, sub_log = _transcribe_asr_chunk_with_retry(
-                backend,
-                source_audio_path,
-                refine_chunk,
-                on_stage=on_stage,
-                retry_depth=retry_depth + 1,
-                initial_chunk_result=initial_chunk_result,
-                initial_chunk_log=initial_chunk_log,
-            )
-            refine_log.extend(
-                f"refine {refine_idx}: {line}"
-                for line in sub_log
-                if line.startswith(
-                    (
-                        "ASR 时间戳策略",
-                        "ASR 原生时间戳词数",
-                        "ASR 原生时间戳异常",
-                        "ASR 原生时间戳需局部细化",
-                        "Alignment 模式",
-                        "Alignment 异常",
-                        "Alignment 哨兵",
-                        "Alignment 降级",
-                        "Alignment VAD 回退",
-                    )
-                )
-            )
-            for word in sub_words:
-                refine_words.append(
-                    {
-                        "start": float(word["start"]) + refine_chunk["start"] - start,
-                        "end": float(word["end"]) + refine_chunk["start"] - start,
-                        "word": word["word"],
-                    }
-                )
-    finally:
-        if refine_dir.exists() and not _KEEP_ASR_CHUNKS:
-            _delete_path_for_cleanup(refine_dir)
-
-    refine_words.sort(key=lambda item: (item["start"], item["end"]))
-    return refine_words, refine_log
-
-
-def _transcribe_asr_chunk_with_retry(
-    backend: LocalAsrBackend,
-    source_audio_path: str,
-    chunk: dict,
-    on_stage: Callable[[str], None] | None = None,
-    retry_depth: int = 0,
-    initial_chunk_result: dict | None = None,
-    initial_chunk_log: list[str] | None = None,
-) -> tuple[list[dict], list[str]]:
-    if initial_chunk_result is None:
-        chunk_result, chunk_log = backend.transcribe_to_words(
-            chunk["path"], on_stage=on_stage
-        )
-    else:
-        chunk_result = initial_chunk_result
-        chunk_log = list(initial_chunk_log or [])
-    chunk_words = list(chunk_result.get("words", []))
-    chunk_mode = str(chunk_result.get("alignment_mode", "")).strip()
-    start = float(chunk["start"])
-    end = float(chunk["end"])
-    duration = max(0.0, end - start)
-
-    if (
-        chunk_mode == "ASR_NATIVE_refine_needed"
-        and retry_depth < _ALIGNMENT_MAX_REFINE_DEPTH
-        and duration > _ALIGNMENT_COARSE_REFINE_CHUNK_S
-    ):
-        chunk_log.append(
-            "ASR 原生时间戳需局部细化: 长块不直接整块强制对齐，先拆为中等片段"
-        )
-        refined_words, refined_log = _refine_chunk_with_subchunks(
-            backend,
-            source_audio_path,
-            chunk,
-            _ALIGNMENT_COARSE_REFINE_CHUNK_S,
-            retry_depth,
-            on_stage=on_stage,
-        )
-        chunk_log.extend(refined_log)
-        if refined_words:
-            return refined_words, chunk_log
-
-    if not _looks_like_alignment_failure(chunk_words, scene_duration_sec=duration):
-        return chunk_words, chunk_log
-
-    if chunk_mode == "forced_aligner":
-        chunk_log.append("Alignment 哨兵触发: forced 模式保留原文，不再对子片段重转写")
-        return chunk_words, chunk_log
-
-    if _should_skip_alignment_retry(chunk_result.get("text", "")):
-        chunk_log.append("Alignment 哨兵触发: 低价值/短文本直接回退，不再做子片段重试")
-        fallback_start, fallback_end, fallback_source = _fallback_window_for_chunk_log(
-            chunk,
-            duration,
-        )
-        fallback_words, fallback_mode, fallback_meta = _build_timestamp_fallback(
-            chunk_result.get("text", ""),
-            fallback_start,
-            fallback_end,
-            audio_path=chunk["path"],
-        )
-        _append_fallback_window_log(chunk_log, fallback_source)
-        if fallback_mode == "aligner_vad_fallback":
-            chunk_log.append("Alignment 快速回退: 使用 VAD 约束比例时间戳")
-            chunk_log.append(
-                f"Alignment VAD 回退语音区间: {fallback_meta.get('speech_span_count', 0)}"
-            )
-        else:
-            chunk_log.append("Alignment 快速回退: 使用等比分配时间戳")
-            if fallback_meta.get("vad_error"):
-                chunk_log.append(f"Alignment VAD 回退异常: {fallback_meta['vad_error']}")
-        chunk_log.append(f"Alignment 模式: {fallback_mode}")
-        return fallback_words, chunk_log
-
-    if retry_depth < _ALIGNMENT_MAX_REFINE_DEPTH and duration > _ALIGNMENT_COARSE_REFINE_CHUNK_S:
-        chunk_log.append("Alignment 哨兵触发: 长块先细化为中等片段重试")
-        refined_words, refined_log = _refine_chunk_with_subchunks(
-            backend,
-            source_audio_path,
-            chunk,
-            _ALIGNMENT_COARSE_REFINE_CHUNK_S,
-            retry_depth,
-            on_stage=on_stage,
-        )
-        chunk_log.extend(refined_log)
-        if refined_words and not _looks_like_alignment_failure(
-            refined_words,
-            scene_duration_sec=duration,
-        ):
-            chunk_log.append(f"Alignment 长块细化成功: {len(refined_words)} 词")
-            return refined_words, chunk_log
-
-    chunk_log.append(
-        "Alignment 哨兵触发: 检测到异常密集/重复时间戳，准备切为更小片段重试"
-    )
-    retry_spans = _split_span_evenly(start, end, _ALIGNMENT_STEP_DOWN_CHUNK_S)
-    if len(retry_spans) <= 1:
-        fallback_start, fallback_end, fallback_source = _fallback_window_for_chunk_log(
-            chunk,
-            duration,
-        )
-        fallback_words, fallback_mode, fallback_meta = _build_timestamp_fallback(
-            chunk_result.get("text", ""),
-            fallback_start,
-            fallback_end,
-            audio_path=chunk["path"],
-        )
-        _append_fallback_window_log(chunk_log, fallback_source)
-        if fallback_mode == "aligner_vad_fallback":
-            chunk_log.append("Alignment 降级失败: 子片段不足，改用 VAD 约束比例时间戳")
-            chunk_log.append(
-                f"Alignment VAD 回退语音区间: {fallback_meta.get('speech_span_count', 0)}"
-            )
-        else:
-            chunk_log.append("Alignment 降级失败: 子片段不足，改用等比分配时间戳")
-            if fallback_meta.get("vad_error"):
-                chunk_log.append(f"Alignment VAD 回退异常: {fallback_meta['vad_error']}")
-        chunk_log.append(f"Alignment 模式: {fallback_mode}")
-        return fallback_words, chunk_log
-
-    retry_dir, retry_infos = _extract_wav_chunks(source_audio_path, retry_spans)
-    retry_words: list[dict] = []
-    try:
-        prepared_results, _stage_timings = _prepare_asr_chunk_results(
-            backend,
-            retry_infos,
-            "Alignment 降级重试",
-            on_stage=on_stage,
-        )
-        for retry_idx, retry_chunk, (retry_result, retry_log) in zip(
-            range(1, len(retry_infos) + 1),
-            retry_infos,
-            prepared_results,
-        ):
-            chunk_log.extend(
-                f"retry {retry_idx}: {line}"
-                for line in retry_log
-                if line.startswith(("Alignment 模式", "Alignment 异常"))
-            )
-            for word in retry_result.get("words", []):
-                retry_words.append(
-                    {
-                        "start": float(word["start"]) + retry_chunk["start"] - start,
-                        "end": float(word["end"]) + retry_chunk["start"] - start,
-                        "word": word["word"],
-                    }
-                )
-    finally:
-        if retry_dir.exists() and not _KEEP_ASR_CHUNKS:
-            _delete_path_for_cleanup(retry_dir)
-
-    retry_words.sort(key=lambda item: (item["start"], item["end"]))
-    if retry_words and not _looks_like_alignment_failure(
-        retry_words,
-        scene_duration_sec=duration,
-    ):
-        chunk_log.append(f"Alignment 降级成功: {len(retry_infos)} 个子片段")
-        return retry_words, chunk_log
-
-    fallback_start, fallback_end, fallback_source = _fallback_window_for_chunk_log(
-        chunk,
-        duration,
-    )
-    fallback_words, fallback_mode, fallback_meta = _build_timestamp_fallback(
-        chunk_result.get("text", ""),
-        fallback_start,
-        fallback_end,
-        audio_path=chunk["path"],
-    )
-    _append_fallback_window_log(chunk_log, fallback_source)
-    if fallback_mode == "aligner_vad_fallback":
-        chunk_log.append("Alignment 降级后仍异常: 改用 VAD 约束比例时间戳")
-        chunk_log.append(
-            f"Alignment VAD 回退语音区间: {fallback_meta.get('speech_span_count', 0)}"
-        )
-    else:
-        chunk_log.append("Alignment 降级后仍异常: 改用等比分配时间戳")
-        if fallback_meta.get("vad_error"):
-            chunk_log.append(f"Alignment VAD 回退异常: {fallback_meta['vad_error']}")
-    chunk_log.append(f"Alignment 模式: {fallback_mode}")
-    return fallback_words, chunk_log
 
 
 def _postprocess_segments(segments: list[dict]) -> list[dict]:

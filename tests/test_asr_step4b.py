@@ -24,7 +24,6 @@ def _write_wav(path: Path, seconds: float = 0.1) -> None:
 
 def main() -> None:
     os.environ["ASR_WORKER_MODE"] = "subprocess"
-    os.environ["ALIGNMENT_TIMESTAMP_MODE"] = "forced"
     os.environ.setdefault("ASR_SUBPROCESS_RESPAWN_MAX", "2")
     os.environ.setdefault("ASR_SUBPROCESS_CONSECUTIVE_TIMEOUT_LIMIT", "3")
 
@@ -56,7 +55,6 @@ def main() -> None:
         def __init__(self, outcomes: list[str], *, batch_size: int = 1):
             self.outcomes = list(outcomes)
             self.request_batch_size = batch_size
-            self.align_batch_size = 1
             self.device = "cpu"
 
         def transcribe_texts(self, audio_paths, contexts=None, on_stage=None):

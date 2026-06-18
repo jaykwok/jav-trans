@@ -21,10 +21,6 @@ REQUIRED_MODEL_SPECS = [
         "label": "bundled 1.7B ASR model",
         "repo_id": "jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame",
     },
-    {
-        "label": "bundled forced aligner model",
-        "repo_id": "Qwen/Qwen3-ForcedAligner-0.6B",
-    },
 ]
 
 

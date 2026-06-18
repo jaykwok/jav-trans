@@ -162,7 +162,7 @@ def compile_records(
                 "boundary": row.get("boundary", {}),
                 "adjacency": row.get("adjacency", {}),
                 "asr_signals": row.get("asr_signals", {}),
-                "alignment_diagnostics": row.get("alignment_diagnostics", {}),
+                "subtitle_timing": row.get("subtitle_timing", {}),
             },
             "text": row.get("text", ""),
             "raw_text": row.get("raw_text", ""),

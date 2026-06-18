@@ -17,10 +17,6 @@ from tools.boundary.build_refiner_frame_sequence_dataset import (
     FrameSequenceConfig,
     build_frame_sequence_dataset,
 )
-from tools.boundary.build_silver_refiner_dataset import (
-    SilverRefinerDatasetConfig,
-    build_silver_refiner_dataset,
-)
 from tools.boundary.build_weighted_source_manifest import build_weighted_manifest
 from tools.boundary.train_refiner import TrainRefinerConfig, train_refiner
 
@@ -349,107 +345,6 @@ def test_build_frame_sequence_dataset_trains_with_cached_features(tmp_path):
     assert rows[0]["feature_schema_hash"]
     assert rows[0]["feature_signature"]["feature_schema"] == FRAME_SEQUENCE_FEATURE_SCHEMA
     assert torch.cuda.is_available() in {True, False}
-
-
-def test_build_silver_refiner_dataset_uses_weighted_forced_boundaries(tmp_path):
-    pytest.importorskip("numpy")
-    import numpy as np
-
-    aligned_path = tmp_path / "archived" / "sample" / "sample.aligned_segments.json"
-    aligned_path.parent.mkdir(parents=True, exist_ok=True)
-    aligned_path.write_text(
-        json.dumps(
-            {
-                "asr_details": {
-                    "transcript_chunks": [
-                        {"index": 0, "start": 1.0, "end": 2.0},
-                        {"index": 1, "start": 3.0, "end": 4.0},
-                        {"index": 2, "start": 5.0, "end": 6.0},
-                    ]
-                }
-            },
-            ensure_ascii=False,
-        ),
-        encoding="utf-8",
-    )
-    silver_path = tmp_path / "silver.jsonl"
-    source_audio_path = tmp_path / "sample.wav"
-    source_audio_path.write_bytes(b"RIFF")
-    silver_rows = [
-        {
-            "schema": "speech_boundary_silver_display_v1",
-            "video": "sample",
-            "aligned_path": str(aligned_path),
-            "source_audio_path": str(source_audio_path),
-            "chunk_index": 0,
-            "display_start_label": 1.0,
-            "display_end_label": 1.8,
-            "speech_core_start": 1.0,
-            "speech_core_end": 2.0,
-            "label_policy": {"start_weight": 1.0, "end_weight": 0.35},
-        },
-        {
-            "schema": "speech_boundary_silver_display_v1",
-            "video": "sample",
-            "aligned_path": str(aligned_path),
-            "source_audio_path": str(source_audio_path),
-            "chunk_index": 1,
-            "display_start_label": 3.1,
-            "display_end_label": 3.7,
-            "speech_core_start": 3.0,
-            "speech_core_end": 4.0,
-            "label_policy": {"start_weight": 1.0, "end_weight": 0.35},
-        },
-    ]
-    silver_path.write_text(
-        "\n".join(json.dumps(row, ensure_ascii=False, sort_keys=True) for row in silver_rows) + "\n",
-        encoding="utf-8",
-    )
-    feature_path = tmp_path / "sample-seqfeat.npz"
-    np.savez(
-        feature_path,
-        ptm=np.ones((80, 2), dtype=np.float32),
-        mfcc=np.ones((80, 1), dtype=np.float32),
-        duration_s=np.asarray([8.0], dtype=np.float32),
-        frame_hop_s=np.asarray([0.1], dtype=np.float32),
-    )
-    manifest_path = tmp_path / "sequence_feature_manifest.jsonl"
-    manifest_path.write_text(
-        json.dumps(
-            {
-                "video": "sample",
-                "source_audio_path": str(source_audio_path),
-                "feature_path": str(feature_path),
-            },
-            ensure_ascii=False,
-            sort_keys=True,
-        )
-        + "\n",
-        encoding="utf-8",
-    )
-    output_jsonl = tmp_path / "silver-sequence.jsonl"
-
-    summary = build_silver_refiner_dataset(
-        silver_labels_path=silver_path,
-        sequence_feature_manifest_path=manifest_path,
-        output_jsonl=output_jsonl,
-        config=SilverRefinerDatasetConfig(
-            left_context_s=0.2,
-            right_context_s=0.2,
-            max_ptm_dims=1,
-            include_mfcc=False,
-            max_sequence_items=16,
-        ),
-    )
-    rows = [json.loads(line) for line in output_jsonl.read_text(encoding="utf-8").splitlines()]
-
-    assert "class_balance" not in summary
-    assert summary["counts"]["start_supervised"] == 1
-    assert summary["counts"]["end_supervised"] == 2
-    assert rows[0]["schema"] == "boundary_refiner_frame_sequence_dataset_v5"
-    assert "sequence_labels" not in rows[0]
-    assert rows[0]["sequence_boundary_delta_targets"] == [[0.1, -0.2], [0.0, -0.3]]
-    assert rows[0]["sequence_boundary_delta_weights"] == [[1.0, 0.6], [0.0, 0.6]]
 
 
 def test_build_weighted_source_manifest_samples_requested_mix(tmp_path):
