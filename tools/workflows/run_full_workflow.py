@@ -162,6 +162,11 @@ def _env_float(key: str, default: float) -> float:
     return float(raw) if raw else default
 
 
+def _env_optional_float(key: str) -> float | None:
+    raw = os.getenv(key, "").strip()
+    return float(raw) if raw else None
+
+
 def configure_env(args: argparse.Namespace) -> None:
     os.environ["ASR_BACKEND"] = args.asr_backend
     os.environ["ASR_BOUNDARY_BACKEND"] = "speech_boundary_ja"
@@ -194,6 +199,8 @@ def configure_env(args: argparse.Namespace) -> None:
     os.environ["KEEP_ASR_CHUNKS"] = "1" if args.keep_asr_chunks else "0"
     os.environ["BOUNDARY_CACHE_ENABLED"] = "1" if args.boundary_cache else "0"
     os.environ["SPEECH_BOUNDARY_JA_THRESHOLD"] = str(args.speech_boundary_threshold)
+    os.environ["SPEECH_BOUNDARY_JA_SPEECH_ON_THRESHOLD"] = str(args.speech_boundary_speech_on_threshold)
+    os.environ["SPEECH_BOUNDARY_JA_SPEECH_OFF_THRESHOLD"] = str(args.speech_boundary_speech_off_threshold)
     os.environ["SPEECH_BOUNDARY_JA_FRAME_DILATION_S"] = str(args.speech_boundary_frame_dilation_s)
     os.environ["SPEECH_BOUNDARY_JA_PTM"] = args.speech_boundary_ptm
     os.environ["SPEECH_BOUNDARY_JA_MODEL_PATH"] = project_path_value(args.speech_boundary_model_path)
@@ -248,6 +255,8 @@ def build_context(*, args: argparse.Namespace, paths: RunPaths, video: Path):
         "BOUNDARY_CACHE_ENABLED": "1" if args.boundary_cache else "0",
         "BOUNDARY_CACHE_DIR": str(paths.root / "boundary-cache"),
         "SPEECH_BOUNDARY_JA_THRESHOLD": str(args.speech_boundary_threshold),
+        "SPEECH_BOUNDARY_JA_SPEECH_ON_THRESHOLD": str(args.speech_boundary_speech_on_threshold),
+        "SPEECH_BOUNDARY_JA_SPEECH_OFF_THRESHOLD": str(args.speech_boundary_speech_off_threshold),
         "SPEECH_BOUNDARY_JA_FRAME_DILATION_S": str(args.speech_boundary_frame_dilation_s),
         "SPEECH_BOUNDARY_JA_PTM": args.speech_boundary_ptm,
         "SPEECH_BOUNDARY_JA_MODEL_PATH": project_path_value(args.speech_boundary_model_path),
@@ -295,7 +304,9 @@ def run_video(args: argparse.Namespace, paths: RunPaths, video: Path) -> dict[st
     ctx = build_context(args=args, paths=paths, video=video)
     print(
         f"=== START {video.name} label={args.label} "
-        f"boundary=speech_boundary_ja threshold={args.speech_boundary_threshold:g} "
+        f"boundary=speech_boundary_ja speech_on={args.speech_boundary_speech_on_threshold:g} "
+        f"speech_off={args.speech_boundary_speech_off_threshold:g} "
+        f"cut={args.speech_boundary_cut_threshold:g} "
         f"asr={args.asr_backend} ===",
         flush=True,
     )
@@ -367,6 +378,10 @@ def write_summary(paths: RunPaths, args: argparse.Namespace, results: list[dict[
         "boundary_backend": "speech_boundary_ja",
         "speech_boundary_operating_point": speech_boundary_operating_point(results),
         "speech_boundary_threshold": args.speech_boundary_threshold,
+        "speech_boundary_speech_on_threshold": args.speech_boundary_speech_on_threshold,
+        "speech_boundary_speech_off_threshold": args.speech_boundary_speech_off_threshold,
+        "speech_boundary_cut_threshold": args.speech_boundary_cut_threshold,
+        "speech_boundary_apply_cut_to_speech": bool(args.speech_boundary_apply_cut_to_speech),
         "speech_boundary_frame_dilation_s": args.speech_boundary_frame_dilation_s,
         "boundary_planner": {
             "feature_frame_hop_s": args.boundary_feature_frame_hop_s,
@@ -386,7 +401,13 @@ def write_summary(paths: RunPaths, args: argparse.Namespace, results: list[dict[
         "",
         f"- ASR: `{args.asr_backend}`",
         f"- ASR model: `{project_rel(project_path_value(args.asr_model_path)) or 'auto'}`",
-        f"- Boundary: `speech_boundary_ja` threshold `{args.speech_boundary_threshold:g}`, frame dilation `{args.speech_boundary_frame_dilation_s:g}s`",
+        (
+            f"- Boundary: `speech_boundary_ja` speech on/off "
+            f"`{args.speech_boundary_speech_on_threshold:g}` / "
+            f"`{args.speech_boundary_speech_off_threshold:g}`, cut "
+            f"`{args.speech_boundary_cut_threshold:g}`, frame dilation "
+            f"`{args.speech_boundary_frame_dilation_s:g}s`"
+        ),
         f"- Translation: `{'on' if args.translate else 'off'}`",
         f"- Runtime root: `{project_rel(paths.root)}`",
         "",
@@ -465,6 +486,20 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--keep-asr-chunks", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--boundary-cache", action=argparse.BooleanOptionalAction, default=_env_bool("BOUNDARY_CACHE_ENABLED", True))
     parser.add_argument("--speech-boundary-threshold", dest="speech_boundary_threshold", type=float, default=_env_float("SPEECH_BOUNDARY_JA_THRESHOLD", 0.200))
+    parser.add_argument(
+        "--speech-boundary-speech-on-threshold",
+        dest="speech_boundary_speech_on_threshold",
+        type=float,
+        default=_env_optional_float("SPEECH_BOUNDARY_JA_SPEECH_ON_THRESHOLD"),
+        help="Speech activation threshold. Defaults to --speech-boundary-threshold.",
+    )
+    parser.add_argument(
+        "--speech-boundary-speech-off-threshold",
+        dest="speech_boundary_speech_off_threshold",
+        type=float,
+        default=_env_optional_float("SPEECH_BOUNDARY_JA_SPEECH_OFF_THRESHOLD"),
+        help="Speech deactivation threshold. Defaults to --speech-boundary-threshold.",
+    )
     parser.add_argument("--speech-boundary-frame-dilation-s", dest="speech_boundary_frame_dilation_s", type=float, default=_env_float("SPEECH_BOUNDARY_JA_FRAME_DILATION_S", 0.2))
     parser.add_argument(
         "--speech-boundary-ptm",
@@ -489,8 +524,18 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=_env_bool("SPEECH_BOUNDARY_JA_APPLY_CUT_TO_SPEECH", True),
     )
     args = parser.parse_args(argv)
+    if args.speech_boundary_speech_on_threshold is None:
+        args.speech_boundary_speech_on_threshold = args.speech_boundary_threshold
+    if args.speech_boundary_speech_off_threshold is None:
+        args.speech_boundary_speech_off_threshold = args.speech_boundary_threshold
     if args.speech_boundary_threshold < 0:
         parser.error("--speech-boundary-threshold must be non-negative")
+    if args.speech_boundary_speech_on_threshold < 0:
+        parser.error("--speech-boundary-speech-on-threshold must be non-negative")
+    if args.speech_boundary_speech_off_threshold < 0:
+        parser.error("--speech-boundary-speech-off-threshold must be non-negative")
+    if args.speech_boundary_speech_on_threshold < args.speech_boundary_speech_off_threshold:
+        parser.error("--speech-boundary-speech-on-threshold must be >= --speech-boundary-speech-off-threshold")
     if args.speech_boundary_frame_dilation_s < 0:
         parser.error("--speech-boundary-frame-dilation-s must be non-negative")
     if args.speech_boundary_window_s <= 0:

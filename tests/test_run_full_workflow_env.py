@@ -84,6 +84,8 @@ def test_run_full_workflow_parse_args_uses_loaded_env(monkeypatch):
     assert args.boundary_refiner_model_path == "src/boundary/checkpoints/boundary_refiner.pt"
     assert args.boundary_planner_target_chunk_s == 3.0
     assert args.boundary_planner_max_core_chunk_s == 5.0
+    assert args.speech_boundary_speech_on_threshold == args.speech_boundary_threshold
+    assert args.speech_boundary_speech_off_threshold == args.speech_boundary_threshold
 
 
 def test_run_full_workflow_context_carries_boundary_env(monkeypatch, tmp_path):
@@ -104,6 +106,12 @@ def test_run_full_workflow_context_carries_boundary_env(monkeypatch, tmp_path):
             "unit",
             "--label",
             "boundary",
+            "--speech-boundary-speech-on-threshold",
+            "0.7",
+            "--speech-boundary-speech-off-threshold",
+            "0.5",
+            "--speech-boundary-cut-threshold",
+            "0.7",
         ]
     )
     paths = run_full_workflow.RunPaths(
@@ -125,6 +133,9 @@ def test_run_full_workflow_context_carries_boundary_env(monkeypatch, tmp_path):
     assert ctx.advanced["BOUNDARY_REFINER_DEVICE"] == "cpu"
     assert ctx.advanced["BOUNDARY_PLANNER_TARGET_CHUNK_S"] == "3.5"
     assert ctx.advanced["BOUNDARY_PLANNER_MAX_CORE_CHUNK_S"] == "5.5"
+    assert ctx.advanced["SPEECH_BOUNDARY_JA_SPEECH_ON_THRESHOLD"] == "0.7"
+    assert ctx.advanced["SPEECH_BOUNDARY_JA_SPEECH_OFF_THRESHOLD"] == "0.5"
+    assert ctx.advanced["SPEECH_BOUNDARY_JA_CUT_THRESHOLD"] == "0.7"
 
 
 def test_run_full_workflow_cli_batch_overrides_loaded_env(monkeypatch):
@@ -146,6 +157,10 @@ def test_run_full_workflow_cli_batch_overrides_loaded_env(monkeypatch):
             "12",
             "--aligner-batch-size",
             "48",
+            "--speech-boundary-speech-on-threshold",
+            "0.7",
+            "--speech-boundary-speech-off-threshold",
+            "0.5",
         ]
     )
     run_full_workflow.configure_env(args)
@@ -153,3 +168,5 @@ def test_run_full_workflow_cli_batch_overrides_loaded_env(monkeypatch):
     assert run_full_workflow.os.environ["ASR_BACKEND"] == "jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame"
     assert run_full_workflow.os.environ["ASR_BATCH_SIZE"] == "12"
     assert run_full_workflow.os.environ["ALIGNER_BATCH_SIZE"] == "48"
+    assert run_full_workflow.os.environ["SPEECH_BOUNDARY_JA_SPEECH_ON_THRESHOLD"] == "0.7"
+    assert run_full_workflow.os.environ["SPEECH_BOUNDARY_JA_SPEECH_OFF_THRESHOLD"] == "0.5"

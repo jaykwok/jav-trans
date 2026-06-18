@@ -654,8 +654,8 @@ def _apply_cueqc_drop_filter(
     """Remove high-confidence model-drop chunks from the parallel arrays.
 
     Only decisions with ``mode == "cueqc_mamba_v3_fusion"`` and
-    ``display_hint == "drop"`` are removed; heuristic / fallback / keep decisions
-    are never dropped. All parallel lists (chunk_infos, text_results) are kept
+    ``display_hint == "drop"`` are removed; fallback / keep decisions are never
+    dropped. All parallel lists (chunk_infos, text_results) are kept
     index-aligned by filtering on the same kept positions.
     """
     drop_indices: set[int] = set()
@@ -750,12 +750,12 @@ def _apply_cueqc_v3_model(
     Captures ASR internals via ``backend.capture_asr_internals()`` which works in
     both inline and subprocess worker modes (the capture runs where the model is
     loaded). Returns one decision dict per candidate (model or fallback-keep),
-    or None if capture is unavailable (caller keeps heuristic decisions).
+    or None if capture is unavailable (caller keeps fallback-keep decisions).
     """
     if not candidates:
         return []
     if backend is None or not hasattr(backend, "capture_asr_internals"):
-        log.append("CueQC v3-Fusion: backend has no capture_asr_internals, heuristic shadow retained")
+        log.append("CueQC v3-Fusion: backend has no capture_asr_internals, fallback keep retained")
         return None
     capture_chunks = []
     for cand in candidates:
@@ -769,10 +769,10 @@ def _apply_cueqc_v3_model(
     try:
         asr_internals = backend.capture_asr_internals(capture_chunks)
     except Exception as exc:  # noqa: BLE001
-        log.append(f"CueQC v3-Fusion: capture failed ({exc!r}), heuristic shadow retained")
+        log.append(f"CueQC v3-Fusion: capture failed ({exc!r}), fallback keep retained")
         return None
     if not isinstance(asr_internals, list) or len(asr_internals) != len(candidates):
-        log.append("CueQC v3-Fusion: capture count mismatch, heuristic shadow retained")
+        log.append("CueQC v3-Fusion: capture count mismatch, fallback keep retained")
         return None
     capture_failed = [
         str(item.get("error") or item.get("detail") or "")
@@ -865,7 +865,7 @@ def _run_cueqc_shadow(
         _write_cueqc_candidates_if_requested(candidates, log=log)
 
         # v3-Fusion model override: when a checkpoint is present, replace the
-        # heuristic decisions with model decisions (heuristic stays as shadow).
+        # conservative fallback-keep decisions with model decisions.
         model_path = os.getenv("CUEQC_MODEL_PATH", "").strip()
         refiner = _cueqc_refiner_for(model_path) if model_path else None
         if refiner is not None:
@@ -879,8 +879,8 @@ def _run_cueqc_shadow(
                 )
                 if model_decisions is not None:
                     report = _merge_cueqc_v3_decisions(report, candidates, model_decisions)
-            except Exception as exc:  # noqa: BLE001 - model errors fall back to heuristic
-                log.append(f"CueQC v3-Fusion: model inference failed, using heuristic shadow ({exc!r})")
+            except Exception as exc:  # noqa: BLE001 - model errors fall back to keep
+                log.append(f"CueQC v3-Fusion: model inference failed, using fallback keep ({exc!r})")
 
         decision_by_chunk = {
             int(item["chunk_index"]): {
@@ -1098,7 +1098,7 @@ def _transcribe_and_align_local(
 
             # v3-Fusion drop filter: remove model-confirmed drop candidates from
             # the parallel arrays BEFORE alignment. Only high-confidence model
-            # drops (mode=cueqc_mamba_v3_fusion) are removed; fallback/heuristic
+            # drops (mode=cueqc_mamba_v3_fusion) are removed; fallback
             # decisions never drop. Indices are aligned across all three lists.
             if _env_bool("CUEQC_DROP_APPLY_ENABLED", "1"):
                 chunk_infos, text_results, _drop_log = _apply_cueqc_drop_filter(

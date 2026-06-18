@@ -334,10 +334,12 @@ def test_cueqc_training_compile_cluster_labels_only_keep_drop():
     assert summary["target_labels"]["display_decision"] == ["drop", "keep"]
 
 
-def test_cueqc_shadow_is_conservative_for_stable_dialogue():
+def test_cueqc_fallback_keep_is_conservative_for_stable_dialogue():
     row = _candidate(9, "今日はいい天気ですね")
 
-    decision = cueqc.heuristic_shadow_decision(row)
+    decision = cueqc.fallback_keep_decision(row)
 
     assert decision["mode"] == "fallback_keep"
     assert decision["display_hint"] == "keep"
+    assert decision["confidence"] == 1.0
+    assert decision["fallback_stage"] == "model_unavailable"

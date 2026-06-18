@@ -45,6 +45,7 @@ from boundary.ja.backend import (
     DEFAULT_OPERATING_POINT,
     SpeechBoundaryJaBackend,
     SpeechBoundaryJaConfig,
+    _hysteresis_frames,
 )
 from boundary.ja.manifest import TrainingExample
 from boundary.ja.model import TinyFrameClassifier, load_feature_frame_scorer_checkpoint
@@ -266,6 +267,25 @@ def test_write_jsonl_and_bootstrap_backend_signature(tmp_path):
     assert cfg.ptm == QWEN_ASR_06B_REPO_ID
     assert cfg.scorer_checkpoint == ""
     assert not hasattr(cfg, "imitation_checkpoint")
+
+
+def test_hysteresis_frames_uses_activation_and_deactivation_thresholds():
+    frames = _hysteresis_frames(
+        np.asarray([0.10, 0.80, 0.60, 0.45, 0.55, 0.49, 0.71], dtype=np.float32),
+        on_threshold=0.70,
+        off_threshold=0.50,
+    )
+
+    assert frames.tolist() == [0, 1, 1, 0, 0, 0, 1]
+
+
+def test_hysteresis_frames_rejects_inverted_thresholds():
+    with pytest.raises(ValueError, match="greater than or equal"):
+        _hysteresis_frames(
+            np.asarray([0.5], dtype=np.float32),
+            on_threshold=0.40,
+            off_threshold=0.50,
+        )
 
 
 def test_feature_frame_scorer_checkpoint_round_trip(tmp_path):

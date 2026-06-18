@@ -13,10 +13,10 @@ JAVTrans 是一个本地字幕生成工具，面向 Windows + NVIDIA 显卡，�
 - 默认 ASR：`jaykwok/Qwen3-ASR-0.6B-JA-Anime-Galgame`。
 - 可选 ASR：`jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame`。
 - 默认边界系统：SpeechBoundary-JA，backend key 为 `speech_boundary_ja`。它不是传统 VAD，而是 `Qwen PTM + MFCC/energy frame scores -> boundary candidates -> Boundary Refiner -> constrained planner -> ASR chunks` 的 speech-island boundary pipeline。
-- SpeechBoundary-JA 支持实验性的 Mamba2 frame scorer v2 checkpoint，但默认不启用。只有显式设置 `SPEECH_BOUNDARY_JA_SCORER_CHECKPOINT` 时才会用 learned scorer 替代 bootstrap frame scores；正式分发默认仍是 `qwen-feature-energy-bootstrap-v1`。
+- SpeechBoundary-JA 支持实验性的 Mamba2 frame boundary scorer v3 checkpoint，但默认不启用。只有显式设置 `SPEECH_BOUNDARY_JA_SCORER_CHECKPOINT` 时才会用 learned scorer 替代 bootstrap frame scores；v3 scorer 输出 `speech_prob / cut_prob`，运行时支持 `speech_on/speech_off` 双阈值 hysteresis 和 cut gate；正式分发默认仍是 `qwen-feature-energy-bootstrap-v1`。
 - 默认 Boundary Refiner：随源码提供 learned `transformers.Mamba2Model` 小 checkpoint，文件为 `src/boundary/checkpoints/boundary_refiner.pt`。当前默认是 true v5 delta-only 32768 hardmix checkpoint；v5 协议只输出 `start_delta / end_delta`，不再保留 merge score、merge label、merge threshold、runtime disable 开关或 backbone override。
 - 默认 CueQC：`src/asr/checkpoints/cueqc_mamba_v3_fusion.pt`，在 ASR 后、forced alignment 前输出二元 `keep/drop`。当前默认 checkpoint 是 Stage 2b 自训练后版本，基础丢弃阈值 `0.85`，`short_text` 桶自适应提升到 `0.87`；模型缺失或推理异常时保守 `keep`。
-- 当前研究方向：CueQC 已替代旧规则 ASR QC。后续优先做 Mamba2 frame scorer v2 的 匿名样片 A 对比人工审计、更多全片人工抽检和离线 Boundary 反哺数据整理；forced aligner 暂保留为默认 word-timing polish、诊断和未来 teacher 信号。
+- 当前研究方向：CueQC 已替代旧规则 ASR QC。后续优先做 Mamba2 frame boundary scorer v3 的 匿名样片 A opt-in 对比人工审计、更多全片人工抽检和离线 Boundary 反哺数据整理；forced aligner 暂保留为默认 word-timing polish、诊断和未来 teacher 信号。
 - 默认显存目标：单阶段峰值适配 6GB 级 NVIDIA 显卡。8GB 本机可提高 `.env` 中的 ASR / aligner batch size；更小显存则手动降低。
 - 当前字幕策略：边界层尽量把 ASR chunk 切成接近一句台词；字幕层优先用可靠词级 `word.start` 锚定 cue start，只做 2-frame gap、显示时长和读速控制，不再运行相邻 cue 合并策略。
 

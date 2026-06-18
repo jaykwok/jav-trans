@@ -4,6 +4,7 @@ import logging
 import time
 import sys
 import warnings
+import hashlib
 from contextlib import contextmanager
 from pathlib import Path
 
@@ -405,6 +406,15 @@ def _run_log_dir(ctx: JobContext) -> Path:
     return path.resolve()
 
 
+def _run_log_component(value: str, *, max_chars: int) -> str:
+    safe = sanitize_job_id((value or "run").replace(" ", "_")) or "run"
+    if len(safe) <= max_chars:
+        return safe
+    digest = hashlib.sha1(safe.encode("utf-8", errors="ignore")).hexdigest()[:8]
+    keep = max(1, max_chars - len(digest) - 1)
+    return f"{safe[:keep]}-{digest}"
+
+
 def _setup_run_logger(
     job_id: str,
     backend_label: str,
@@ -412,9 +422,10 @@ def _setup_run_logger(
 ) -> tuple[logging.Logger, Path]:
     log_dir = _run_log_dir(ctx)
     log_dir.mkdir(parents=True, exist_ok=True)
-    safe_backend = sanitize_job_id(backend_label.replace(" ", "_"))
+    safe_job_id = _run_log_component(job_id, max_chars=48)
+    safe_backend = _run_log_component(backend_label, max_chars=40)
     stamp = time.strftime("%Y%m%d_%H%M%S")
-    log_path = log_dir / f"{stamp}_{job_id}_{safe_backend}.run.log"
+    log_path = log_dir / f"{stamp}_{safe_job_id}_{safe_backend}.run.log"
     logger_name = f"javtrans.run.{job_id}.{stamp}"
     logger = logging.getLogger(logger_name)
     logger.setLevel(logging.INFO)
