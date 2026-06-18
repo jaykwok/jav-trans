@@ -37,6 +37,16 @@ def _env_float(name: str, default: str) -> float:
         return float(default)
 
 
+def _env_optional_float(name: str) -> float | None:
+    raw = os.getenv(name, "").strip()
+    if not raw:
+        return None
+    try:
+        return float(raw)
+    except (TypeError, ValueError):
+        return None
+
+
 def _env_bool(name: str, default: str) -> bool:
     return os.getenv(name, default).strip().lower() in {"1", "true", "yes", "on"}
 
@@ -76,6 +86,35 @@ def _dilated_frames(values: np.ndarray, *, dilation_frames: int) -> np.ndarray:
         end = min(out.size, int(index) + dilation_frames + 1)
         out[start:end] = True
     return out.astype(np.int8, copy=False)
+
+
+def _hysteresis_frames(
+    probabilities: np.ndarray,
+    *,
+    on_threshold: float,
+    off_threshold: float,
+) -> np.ndarray:
+    if on_threshold < 0.0:
+        raise ValueError("SPEECH_BOUNDARY_JA_SPEECH_ON_THRESHOLD must be non-negative")
+    if off_threshold < 0.0:
+        raise ValueError("SPEECH_BOUNDARY_JA_SPEECH_OFF_THRESHOLD must be non-negative")
+    if on_threshold < off_threshold:
+        raise ValueError(
+            "SPEECH_BOUNDARY_JA_SPEECH_ON_THRESHOLD must be greater than or equal to "
+            "SPEECH_BOUNDARY_JA_SPEECH_OFF_THRESHOLD"
+        )
+    values = np.asarray(probabilities, dtype=np.float32).reshape(-1)
+    frames = np.zeros(values.size, dtype=np.int8)
+    active = False
+    for index, value in enumerate(values):
+        if active:
+            if float(value) < off_threshold:
+                active = False
+        elif float(value) >= on_threshold:
+            active = True
+        if active:
+            frames[index] = 1
+    return frames
 
 
 def _apply_cut_gate(
@@ -221,6 +260,8 @@ def filter_segments(
 @dataclass(frozen=True)
 class SpeechBoundaryJaConfig:
     threshold: float = 0.200
+    speech_on_threshold: float | None = None
+    speech_off_threshold: float | None = None
     frame_dilation_s: float = 0.2
     frame_hop_s: float = 0.02
     ptm: str = DEFAULT_PTM
@@ -245,6 +286,8 @@ class SpeechBoundaryJaConfig:
     def from_env(cls) -> "SpeechBoundaryJaConfig":
         return cls(
             threshold=_env_float("SPEECH_BOUNDARY_JA_THRESHOLD", "0.200"),
+            speech_on_threshold=_env_optional_float("SPEECH_BOUNDARY_JA_SPEECH_ON_THRESHOLD"),
+            speech_off_threshold=_env_optional_float("SPEECH_BOUNDARY_JA_SPEECH_OFF_THRESHOLD"),
             frame_dilation_s=_env_float("SPEECH_BOUNDARY_JA_FRAME_DILATION_S", "0.2"),
             frame_hop_s=_env_float("SPEECH_BOUNDARY_JA_FRAME_HOP_S", "0.02"),
             ptm=os.getenv("SPEECH_BOUNDARY_JA_PTM", DEFAULT_PTM).strip() or DEFAULT_PTM,
@@ -276,11 +319,46 @@ class SpeechBoundaryJaBackend:
     def __init__(self, config: SpeechBoundaryJaConfig | None = None) -> None:
         self.config = config or SpeechBoundaryJaConfig.from_env()
 
+    @staticmethod
+    def _speech_thresholds(
+        config: SpeechBoundaryJaConfig,
+        *,
+        threshold_override: float | None = None,
+    ) -> tuple[float, float]:
+        if threshold_override is not None:
+            threshold = float(threshold_override)
+            return threshold, threshold
+        fallback = float(config.threshold)
+        speech_on_threshold = (
+            fallback
+            if config.speech_on_threshold is None
+            else float(config.speech_on_threshold)
+        )
+        speech_off_threshold = (
+            fallback
+            if config.speech_off_threshold is None
+            else float(config.speech_off_threshold)
+        )
+        if speech_on_threshold < 0.0:
+            raise ValueError("SPEECH_BOUNDARY_JA_SPEECH_ON_THRESHOLD must be non-negative")
+        if speech_off_threshold < 0.0:
+            raise ValueError("SPEECH_BOUNDARY_JA_SPEECH_OFF_THRESHOLD must be non-negative")
+        if speech_on_threshold < speech_off_threshold:
+            raise ValueError(
+                "SPEECH_BOUNDARY_JA_SPEECH_ON_THRESHOLD must be greater than or equal to "
+                "SPEECH_BOUNDARY_JA_SPEECH_OFF_THRESHOLD"
+            )
+        return speech_on_threshold, speech_off_threshold
+
     def signature(self) -> dict:
         cfg = self.config
+        speech_on_threshold, speech_off_threshold = self._speech_thresholds(cfg)
         signature = {
             "backend": self.name,
             "threshold": float(cfg.threshold),
+            "speech_threshold_mode": "hysteresis",
+            "speech_on_threshold": float(speech_on_threshold),
+            "speech_off_threshold": float(speech_off_threshold),
             "frame_dilation_s": float(cfg.frame_dilation_s),
             "frame_hop_s": float(cfg.frame_hop_s),
             "ptm": cfg.ptm,
@@ -334,7 +412,10 @@ class SpeechBoundaryJaBackend:
             else None
         )
         scorer_signature = scorer.signature() if scorer is not None else None
-        threshold = float(cfg.threshold if threshold_override is None else threshold_override)
+        speech_on_threshold, speech_off_threshold = self._speech_thresholds(
+            cfg,
+            threshold_override=threshold_override,
+        )
         feature_config = FeatureConfig(
             ptm=cfg.ptm,
             frame_hop_s=cfg.frame_hop_s,
@@ -458,7 +539,11 @@ class SpeechBoundaryJaBackend:
                 cut_threshold=cfg.cut_threshold,
                 apply_cut=cfg.apply_cut_to_speech,
             )
-            raw_frames = effective_probabilities >= threshold
+            raw_frames = _hysteresis_frames(
+                effective_probabilities,
+                on_threshold=speech_on_threshold,
+                off_threshold=speech_off_threshold,
+            )
             dilated = _dilated_frames(
                 raw_frames,
                 dilation_frames=max(0, int(round(cfg.frame_dilation_s / cfg.frame_hop_s))),
@@ -486,6 +571,9 @@ class SpeechBoundaryJaBackend:
                         "duration_s": duration_s,
                         "frames": int(total_frames),
                         "windows": len(starts),
+                        "speech_threshold_mode": "hysteresis",
+                        "speech_on_threshold": float(speech_on_threshold),
+                        "speech_off_threshold": float(speech_off_threshold),
                         "probability_mean": float(probabilities.mean()) if probabilities.size else 0.0,
                         "probability_max": float(probabilities.max()) if probabilities.size else 0.0,
                         "effective_probability_mean": (

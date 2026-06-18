@@ -430,62 +430,7 @@ def build_candidates(
     return candidates
 
 
-def heuristic_shadow_decision(candidate: Mapping[str, Any]) -> dict[str, Any]:
-    text_features_payload = (
-        candidate.get("text_features")
-        if isinstance(candidate.get("text_features"), Mapping)
-        else {}
-    )
-    cue_features = (
-        candidate.get("cue_features")
-        if isinstance(candidate.get("cue_features"), Mapping)
-        else {}
-    )
-    adjacency = candidate.get("adjacency") if isinstance(candidate.get("adjacency"), Mapping) else {}
-    reasons: list[str] = []
-    display_hint = "keep"
-    confidence = 0.55
-
-    text_density = (
-        cue_features.get("text_density")
-        if isinstance(cue_features.get("text_density"), Mapping)
-        else {}
-    )
-    density_level = str(text_density.get("level") or "")
-    repeat_profile = (
-        text_features_payload.get("repeat_profile")
-        if isinstance(text_features_payload.get("repeat_profile"), Mapping)
-        else {}
-    )
-    char_count = _safe_int(text_features_payload.get("char_count"))
-    has_stable = bool(text_features_payload.get("has_stable_vocabulary"))
-    same_run_length = _safe_int(adjacency.get("same_text_run_length"))
-    if density_level in {
-        "empty_or_punctuation",
-        "short_vocalization_candidate",
-        "repeated_vocalization_candidate",
-        "long_sparse_text",
-    }:
-        display_hint = "keep"
-        reasons.append(f"text_density:{density_level}")
-        confidence = max(confidence, 0.62)
-    if same_run_length >= 3 and not has_stable and char_count <= 4:
-        display_hint = "keep"
-        reasons.append("repeated_low_information_run")
-        confidence = max(confidence, 0.7)
-    if char_count == 0:
-        display_hint = "keep"
-        reasons.append("empty_text")
-        confidence = max(confidence, 0.8)
-    if has_stable:
-        display_hint = "keep"
-        reasons = [reason for reason in reasons if reason.startswith("cluster:")]
-        confidence = max(confidence, 0.78)
-    if int(repeat_profile.get("run") or 0) >= 4 and not has_stable:
-        display_hint = "keep"
-        reasons.append("repeat_profile")
-        confidence = max(confidence, 0.68)
-
+def fallback_keep_decision(candidate: Mapping[str, Any]) -> dict[str, Any]:
     return {
         "schema": "cueqc_shadow_v1",
         "schema_version": CUEQC_SHADOW_SCHEMA_VERSION,
@@ -493,16 +438,20 @@ def heuristic_shadow_decision(candidate: Mapping[str, Any]) -> dict[str, Any]:
         "decision_version": CUEQC_DECISION_VERSION,
         "mode": "fallback_keep",
         "cluster_id": candidate.get("cluster_id", "unclustered"),
-        "display_hint": display_hint,
-        "confidence": round(min(0.99, confidence), 4),
-        "reasons": list(dict.fromkeys(reasons or ["cueqc_model_unavailable_keep"])),
+        "display_hint": "keep",
+        "confidence": 1.0,
+        "display_prob_keep": 1.0,
+        "display_prob_drop": 0.0,
+        "fallback_stage": "model_unavailable",
+        "fallback_detail": "",
+        "reasons": ["cueqc_model_unavailable_keep"],
     }
 
 
 def build_shadow_report(candidates: list[Mapping[str, Any]]) -> dict[str, Any]:
     decisions = []
     for candidate in candidates:
-        decision = heuristic_shadow_decision(candidate)
+        decision = fallback_keep_decision(candidate)
         decisions.append(
             {
                 "sample_id": candidate.get("sample_id", ""),

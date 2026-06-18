@@ -150,6 +150,17 @@ def test_run_log_is_written_only_when_enabled(monkeypatch, tmp_path):
     _assert_no_project_absolute_path(content)
 
 
+def test_run_log_filename_components_are_bounded():
+    component = main._run_log_component(
+        "NAMH-055_" + "speech-boundary-v3-grok-hysteresis_" * 4,
+        max_chars=48,
+    )
+
+    assert len(component) <= 48
+    assert component.startswith("NAMH-055_")
+    assert "-" in component
+
+
 def test_successful_run_cleans_job_temp_by_default(monkeypatch, tmp_path):
     output_dir = tmp_path / "out"
     temp_root = tmp_path / "jobs"
