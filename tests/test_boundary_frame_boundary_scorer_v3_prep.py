@@ -45,7 +45,7 @@ def test_frame_boundary_scorer_v3_prep_writes_scripts(tmp_path: Path):
         labels=labels,
         manifest=manifest,
         output_dir=tmp_path / "prep",
-        device="cpu",
+        device="cuda",
         batch_size=1,
         max_steps=2,
         positive_weight=3.0,
@@ -54,7 +54,6 @@ def test_frame_boundary_scorer_v3_prep_writes_scripts(tmp_path: Path):
         cut_negative_weight=2.0,
         cut_loss_weight=1.5,
         focal_gamma=1.0,
-        eval_batch_size=2,
         runtime_profiles=["0.7,0.5,0.9"],
     )
 
@@ -62,6 +61,8 @@ def test_frame_boundary_scorer_v3_prep_writes_scripts(tmp_path: Path):
     assert summary["label_summary"]["cut_point_segments"] == 1
     assert summary["label_summary"]["cut_drop_zones"] == 1
     assert summary["training_config"]["positive_weight"] == pytest.approx(3.0)
+    assert summary["eval_config"]["device"] == "cpu"
+    assert summary["eval_config"]["batch_size"] == 1
     assert summary["eval_config"]["runtime_profiles"] == ["0.7,0.5,0.9"]
     assert (tmp_path / "prep" / "build_feature_cache.ps1").exists()
     assert (tmp_path / "prep" / "train_frame_boundary_scorer_v3.ps1").exists()
@@ -69,9 +70,10 @@ def test_frame_boundary_scorer_v3_prep_writes_scripts(tmp_path: Path):
     assert "--positive-weight 3.0" in (tmp_path / "prep" / "train_frame_boundary_scorer_v3.ps1").read_text(
         encoding="utf-8"
     )
-    assert "--runtime-profile '0.7,0.5,0.9'" in (
-        tmp_path / "prep" / "evaluate_frame_boundary_scorer_v3.ps1"
-    ).read_text(encoding="utf-8")
+    eval_script = (tmp_path / "prep" / "evaluate_frame_boundary_scorer_v3.ps1").read_text(encoding="utf-8")
+    assert "--device 'cpu'" in eval_script
+    assert "--batch-size 1" in eval_script
+    assert "--runtime-profile '0.7,0.5,0.9'" in eval_script
 
 
 def test_frame_boundary_scorer_v3_prep_rejects_missing_cut_targets(tmp_path: Path):

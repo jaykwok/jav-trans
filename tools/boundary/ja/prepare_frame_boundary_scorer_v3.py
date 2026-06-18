@@ -174,7 +174,7 @@ def eval_script(
     labels: Path,
     feature_manifest: Path,
     output_dir: Path,
-    device: str,
+    eval_device: str,
     batch_size: int,
     runtime_profiles: list[str],
 ) -> str:
@@ -185,7 +185,7 @@ def eval_script(
         f"  --labels {_ps_literal(repo_display_path(labels))} `",
         f"  --feature-manifest {_ps_literal(repo_display_path(feature_manifest))} `",
         f"  --output-dir {_ps_literal(repo_display_path(output_dir))} `",
-        f"  --device {_ps_literal(device)} `",
+        f"  --device {_ps_literal(eval_device)} `",
         f"  --batch-size {int(batch_size)}",
     ]
     for profile in runtime_profiles:
@@ -213,7 +213,8 @@ def prepare_frame_boundary_scorer_v3(
     cut_negative_weight: float = 1.0,
     cut_loss_weight: float = 1.0,
     focal_gamma: float = 2.0,
-    eval_batch_size: int = 8,
+    eval_device: str = "cpu",
+    eval_batch_size: int = 1,
     runtime_profiles: list[str] | None = None,
     allow_no_cut_targets: bool = False,
 ) -> dict[str, Any]:
@@ -275,7 +276,7 @@ def prepare_frame_boundary_scorer_v3(
             labels=labels,
             feature_manifest=feature_manifest,
             output_dir=eval_dir,
-            device=device,
+            eval_device=eval_device,
             batch_size=eval_batch_size,
             runtime_profiles=list(runtime_profiles or []),
         ),
@@ -315,6 +316,7 @@ def prepare_frame_boundary_scorer_v3(
             "focal_gamma": float(focal_gamma),
         },
         "eval_config": {
+            "device": str(eval_device),
             "batch_size": int(eval_batch_size),
             "runtime_profiles": list(runtime_profiles or []),
         },
@@ -340,6 +342,8 @@ def render_markdown(summary: Mapping[str, Any]) -> str:
         f"- PTM model path: `{summary['training_config']['model_path']}`",
         f"- Checkpoint: `{summary['outputs']['checkpoint']}`",
         f"- Training weights: `speech +{summary['training_config']['positive_weight']} / -{summary['training_config']['negative_weight']}; cut +{summary['training_config']['cut_positive_weight']} / -{summary['training_config']['cut_negative_weight']}`",
+        f"- Eval device: `{summary['eval_config']['device']}`",
+        f"- Eval batch size: `{summary['eval_config']['batch_size']}`",
         f"- Eval runtime profiles: `{len(summary['eval_config']['runtime_profiles'])}`",
         "",
         "## Scripts",
@@ -377,7 +381,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--cut-negative-weight", type=float, default=1.0)
     parser.add_argument("--cut-loss-weight", type=float, default=1.0)
     parser.add_argument("--focal-gamma", type=float, default=2.0)
-    parser.add_argument("--eval-batch-size", type=int, default=8)
+    parser.add_argument(
+        "--eval-device",
+        default="cpu",
+        help="Threshold-eval device. Defaults to CPU so offline sweeps do not consume GPU/shared VRAM.",
+    )
+    parser.add_argument("--eval-batch-size", type=int, default=1)
     parser.add_argument(
         "--runtime-profile",
         action="append",
@@ -450,6 +459,7 @@ def main(argv: list[str] | None = None) -> int:
         cut_negative_weight=args.cut_negative_weight,
         cut_loss_weight=args.cut_loss_weight,
         focal_gamma=args.focal_gamma,
+        eval_device=args.eval_device,
         eval_batch_size=args.eval_batch_size,
         runtime_profiles=args.runtime_profile,
         allow_no_cut_targets=args.allow_no_cut_targets,
