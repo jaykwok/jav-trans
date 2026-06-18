@@ -107,9 +107,7 @@ class _EmptyDisallowedSpeechBoundaryBackend:
 class _RecordingBackend:
     is_subprocess = False
     accepts_contexts = True
-    timestamp_mode = "forced"
     request_batch_size = 1
-    align_batch_size = 1
 
     def __init__(self) -> None:
         self.audio_paths: list[str] = []
@@ -123,9 +121,6 @@ class _RecordingBackend:
         return None
 
     def unload_model(self, on_stage=None) -> None:
-        return None
-
-    def unload_forced_aligner(self, on_stage=None) -> None:
         return None
 
     def transcribe_texts(self, audio_paths, contexts=None, on_stage=None):
@@ -163,7 +158,7 @@ class _RecordingBackend:
                     "duration": result["duration"],
                     "language": result["language"],
                 },
-                ["Alignment 模式: fake"],
+                ["Subtitle timing mode: fake"],
             )
             for result in text_results
         ]
@@ -420,23 +415,6 @@ def test_alignment_fallback_window_metadata_uses_speech_core():
     assert annotated["alignment_fallback_source"] == "chunk"
 
 
-def test_alignment_fallback_count_deduplicates_chunk_log_markers():
-    from asr import pipeline as asr
-
-    log = [
-        "chunk 0: Alignment 回退窗口: speech_core",
-        "chunk 1: Alignment 回退: 使用 VAD 约束比例时间戳",
-        "chunk 1: Alignment VAD 回退语音区间: 2",
-        "chunk 1: Alignment 回退窗口: speech_core",
-        "chunk 2: Alignment 降级后仍异常: 改用等比分配时间戳",
-        "chunk 2: Alignment VAD 回退异常: fallback_vad failed",
-        "chunk 3: Alignment 哨兵触发: 时间轴异常，不重新调用 ASR，改用 VAD/比例回退",
-        "chunk 3: Alignment 回退窗口: speech_core",
-    ]
-
-    assert asr._alignment_fallback_count_from_log(log) == 3
-
-
 def test_alignment_outcome_metadata_is_written_to_chunks_and_segments():
     from asr import pipeline as asr
 
@@ -453,9 +431,9 @@ def test_alignment_outcome_metadata_is_written_to_chunks_and_segments():
     ]
     outcome = asr._alignment_outcome_for_chunk(
         chunk=chunk,
-        chunk_result={**text_result, "alignment_mode": "forced_aligner"},
+        chunk_result={**text_result, "alignment_mode": "boundary_proportional"},
         chunk_words=chunk_words,
-        chunk_log=["Alignment 词数: 2", "Alignment 模式: forced_aligner"],
+        chunk_log=[],
     )
     transcript = asr._build_transcript_chunks(
         [chunk],
@@ -482,11 +460,11 @@ def test_alignment_outcome_metadata_is_written_to_chunks_and_segments():
         {4: outcome},
     )
 
-    assert outcome["alignment_quality"] == "forced"
-    assert outcome["forced_success"] is True
-    assert transcript[0]["alignment_quality"] == "forced"
+    assert outcome["alignment_quality"] == "boundary"
+    assert outcome["alignment_mode"] == "boundary_proportional"
+    assert transcript[0]["alignment_quality"] == "boundary"
     assert transcript[0]["fallback_subtype"] == "none"
-    assert segments[0]["alignment_quality"] == "forced"
+    assert segments[0]["alignment_quality"] == "boundary"
     assert segments[0]["source_chunk_indices"] == [4]
 
 
@@ -505,7 +483,7 @@ def test_low_logprob_chunks_continue_without_legacy_adaptive_review(monkeypatch,
     assert all(chunk["text"] for chunk in details["transcript_chunks"])
 
 
-def test_cueqc_shadow_records_without_skipping_alignment(monkeypatch, tmp_path):
+def test_cueqc_shadow_records_without_skipping_subtitle_timing(monkeypatch, tmp_path):
     backend, segments, log, details = _run_transcription(monkeypatch, tmp_path)
 
     assert backend.finalized_payloads

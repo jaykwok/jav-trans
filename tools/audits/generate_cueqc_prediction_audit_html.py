@@ -278,7 +278,7 @@ textarea { width: 100%; min-height: 70px; border: 1px solid var(--line); border-
       </div>
     </section>
     <section class="panel">
-      <h3>aligned segments</h3>
+      <h3>字幕片段</h3>
       <div class="cue-list" id="alignedSegments"></div>
     </section>
     <section class="panel">

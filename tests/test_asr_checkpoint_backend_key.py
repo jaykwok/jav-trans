@@ -9,11 +9,9 @@ def _checkpoint_name(
     monkeypatch,
     *,
     asr_backend: str,
-    alignment_mode: str = "forced",
     asr_context: str = "",
 ) -> str:
     monkeypatch.setenv("ASR_BACKEND", asr_backend)
-    monkeypatch.setenv("ALIGNMENT_TIMESTAMP_MODE", alignment_mode)
     monkeypatch.setenv("ASR_WORKER_MODE", "inproc")
     monkeypatch.setenv("ASR_CONTEXT", asr_context)
 
@@ -34,21 +32,6 @@ def test_checkpoint_key_changes_between_qwen_repo_backends(monkeypatch):
     )
 
     assert default_key != large_key
-
-
-def test_checkpoint_key_changes_with_alignment_timestamp_mode(monkeypatch):
-    forced_key = _checkpoint_name(
-        monkeypatch,
-        asr_backend=ASR_06B_BACKEND,
-        alignment_mode="forced",
-    )
-    native_key = _checkpoint_name(
-        monkeypatch,
-        asr_backend=ASR_06B_BACKEND,
-        alignment_mode="native",
-    )
-
-    assert forced_key != native_key
 
 
 def test_checkpoint_key_changes_with_prompt_token_budget(monkeypatch):

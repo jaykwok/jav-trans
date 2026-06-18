@@ -325,7 +325,7 @@ def compute_quality_report(
                         hits += 1
         glossary_hit_rate = (hits / checks) if checks > 0 else None
 
-    # 7. alignment_fallback_ratio
+    # 7. Subtitle timing fallback observation. Field names stay stable for reports.
     alignment_fallback_ratio = alignment_fallback_count / max(alignment_fallback_total, 1)
 
     # Threshold checks
@@ -353,10 +353,6 @@ def compute_quality_report(
     if glossary_hit_rate is not None and glossary_hit_rate < _env_float("QC_MIN_GLOSSARY_HIT", 0.80):
         warnings.append(
             f"glossary_hit_rate={glossary_hit_rate:.3f} < QC_MIN_GLOSSARY_HIT={_env_float('QC_MIN_GLOSSARY_HIT', 0.80)}"
-        )
-    if alignment_fallback_ratio > _env_float("QC_MAX_ALIGN_FALLBACK", 0.20):
-        warnings.append(
-            f"alignment_fallback_ratio={alignment_fallback_ratio:.3f} > QC_MAX_ALIGN_FALLBACK={_env_float('QC_MAX_ALIGN_FALLBACK', 0.20)}"
         )
     if overlap_stats["subtitle_overlap_count"] > 0:
         warnings.append(

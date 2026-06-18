@@ -216,13 +216,8 @@ _compact_text_units = _transcribe_module._compact_text_units
 _collapse_repeated_noise = _transcribe_module._collapse_repeated_noise
 _is_low_value_text = _transcribe_module._is_low_value_text
 _clean_segment_text = _transcribe_module._clean_segment_text
-_build_timestamp_fallback = _transcribe_module._build_timestamp_fallback
 _with_alignment_fallback_window = _transcribe_module._with_alignment_fallback_window
-_looks_like_alignment_failure = _transcribe_module._looks_like_alignment_failure
-_alignment_failure_reasons = _transcribe_module._alignment_failure_reasons
 _alignment_outcome_for_chunk = _transcribe_module._alignment_outcome_for_chunk
-_split_span_evenly = _transcribe_module._split_span_evenly
-_prepare_asr_chunk_results = _transcribe_module._prepare_asr_chunk_results
 _transcribe_asr_chunks_text_only = _transcribe_module._transcribe_asr_chunks_text_only
 _is_empty_segment_text_result = _transcribe_module._is_empty_segment_text_result
 _empty_alignment_placeholder = _transcribe_module._empty_alignment_placeholder
@@ -234,11 +229,6 @@ _backend_accepts_initial_prompts = _transcribe_module._backend_accepts_initial_p
 _should_reset_sliding_context = _transcribe_module._should_reset_sliding_context
 _sliding_context_result_text = _transcribe_module._sliding_context_result_text
 _build_initial_prompt_for_chunk = _transcribe_module._build_initial_prompt_for_chunk
-_should_skip_alignment_retry = _transcribe_module._should_skip_alignment_retry
-_needs_alignment_fallback = _transcribe_module._needs_alignment_fallback
-_finalize_aligned_chunk_without_asr_retry = _transcribe_module._finalize_aligned_chunk_without_asr_retry
-_refine_chunk_with_subchunks = _transcribe_module._refine_chunk_with_subchunks
-_transcribe_asr_chunk_with_retry = _transcribe_module._transcribe_asr_chunk_with_retry
 _postprocess_segments = _transcribe_module._postprocess_segments
 _pick_postprocess_split_index = _transcribe_module._pick_postprocess_split_index
 _split_long_postprocessed_segment = _transcribe_module._split_long_postprocessed_segment
@@ -586,32 +576,6 @@ def _record_stage_timing(
     log.append(f"ASR 阶段耗时: {label}={elapsed_s:.2f}s")
 
 
-def _alignment_fallback_count_from_log(log: list[str]) -> int:
-    markers = (
-        "aligner_vad_fallback",
-        "even_fallback",
-        "Alignment 回退:",
-        "Alignment 快速回退",
-        "Alignment 哨兵触发",
-        "Alignment 降级失败",
-        "Alignment 降级后仍异常",
-        "边界回退",
-        "等比分配时间戳",
-    )
-    chunk_ids: set[str] = set()
-    unscoped_count = 0
-    for entry in log:
-        if not any(marker in entry for marker in markers):
-            continue
-        if entry.startswith("chunk ") and ":" in entry:
-            chunk_id = entry.split(":", 1)[0].replace("chunk", "", 1).strip()
-            if chunk_id:
-                chunk_ids.add(chunk_id)
-                continue
-        unscoped_count += 1
-    return len(chunk_ids) + unscoped_count
-
-
 def _empty_cueqc_shadow_report() -> dict:
     return _cueqc_module.build_shadow_report([])
 
@@ -682,7 +646,7 @@ def _apply_cueqc_drop_filter(
             continue
         kept_chunks.append(chunk)
         kept_texts.append(text_result)
-    log_msg = f"CueQC v3-Fusion: dropped {removed} candidate(s) before alignment"
+    log_msg = f"CueQC v3-Fusion: dropped {removed} candidate(s) before subtitle timing"
     return kept_chunks, kept_texts, log_msg
 
 
@@ -916,7 +880,9 @@ def _run_cueqc_shadow(
         )
         return report, decision_by_chunk
     except Exception as exc:
-        log.append(f"CueQC shadow: failed conservatively, all chunks continue align ({exc!r})")
+        log.append(
+            f"CueQC shadow: failed conservatively, all chunks continue subtitle timing ({exc!r})"
+        )
         return {
             **_empty_cueqc_shadow_report(),
             "error": repr(exc),
@@ -943,15 +909,13 @@ def _segment_alignment_outcome(segment: dict, outcomes: dict[int, dict]) -> dict
     if not members:
         return {}
     qualities = [str(item.get("alignment_quality") or "") for item in members]
-    if any(quality in {"vad_coarse", "proportional", "drop_or_review"} for quality in qualities):
+    if any(quality in {"drop_or_review", "partial"} for quality in qualities):
         selected = next(
             item
             for item in members
             if str(item.get("alignment_quality") or "")
-            in {"vad_coarse", "proportional", "drop_or_review"}
+            in {"drop_or_review", "partial"}
         )
-    elif any(quality == "partial" for quality in qualities):
-        selected = next(item for item in members if str(item.get("alignment_quality") or "") == "partial")
     else:
         selected = members[0]
     return {
@@ -961,7 +925,6 @@ def _segment_alignment_outcome(segment: dict, outcomes: dict[int, dict]) -> dict
         "fallback_type": selected.get("fallback_type", ""),
         "fallback_subtype": selected.get("fallback_subtype", ""),
         "alignment_quality_reasons": list(selected.get("alignment_quality_reasons") or []),
-        "forced_success": bool(selected.get("forced_success")),
         "fallback_active": bool(selected.get("fallback_active")),
     }
 
@@ -1026,7 +989,7 @@ def _transcribe_and_align_local(
                 log,
                 timings,
                 "asr_alignment_total_s",
-                "ASR与Alignment总计",
+                "ASR与字幕时间轴总计",
                 total_elapsed,
             )
             log.append("边界系统未检测到可处理语音块，跳过 ASR")
@@ -1097,8 +1060,8 @@ def _transcribe_and_align_local(
             )
 
             # v3-Fusion drop filter: remove model-confirmed drop candidates from
-            # the parallel arrays BEFORE alignment. Only high-confidence model
-            # drops (mode=cueqc_mamba_v3_fusion) are removed; fallback
+            # the parallel arrays before subtitle timing. Only high-confidence
+            # model drops (mode=cueqc_mamba_v3_fusion) are removed; fallback
             # decisions never drop. Indices are aligned across all three lists.
             if _env_bool("CUEQC_DROP_APPLY_ENABLED", "1"):
                 chunk_infos, text_results, _drop_log = _apply_cueqc_drop_filter(
@@ -1122,19 +1085,8 @@ def _transcribe_and_align_local(
                 log,
                 timings,
                 "alignment_s",
-                "Alignment对齐",
+                "字幕时间轴生成",
                 align_timings["alignment_s"],
-            )
-
-            aligner_unload_started = time.perf_counter()
-            backend.unload_forced_aligner(on_stage=on_stage)
-            aligner_unload_elapsed = time.perf_counter() - aligner_unload_started
-            _record_stage_timing(
-                log,
-                timings,
-                "alignment_model_unload_s",
-                "Alignment模型卸载",
-                aligner_unload_elapsed,
             )
 
             alignment_outcomes: dict[int, dict] = {}
@@ -1145,11 +1097,7 @@ def _transcribe_and_align_local(
             ):
                 chunk_index = int(chunk.get("index", idx - 1))
                 chunk_log = list(chunk_log)
-                chunk_words, chunk_log = _finalize_aligned_chunk_without_asr_retry(
-                    chunk,
-                    chunk_result,
-                    chunk_log,
-                )
+                chunk_words = list(chunk_result.get("words", []))
                 outcome = _alignment_outcome_for_chunk(
                     chunk=chunk,
                     chunk_result=chunk_result,
@@ -1161,16 +1109,9 @@ def _transcribe_and_align_local(
                     if entry.startswith(
                         (
                             "ASR 输出",
-                            "Alignment 策略",
-                            "Alignment 哨兵",
-                            "Alignment 回退",
-                            "Alignment 词数",
-                            "Alignment 输入文本长度",
+                            "Subtitle timing",
+                            "Subtitle timing word count",
                             "ASR 原始文本长度",
-                            "Alignment 模式",
-                            "Alignment 异常",
-                            "Alignment 边界回退",
-                            "Alignment speech-island",
                             "speech-island",
                         )
                     ):
@@ -1207,7 +1148,7 @@ def _transcribe_and_align_local(
 
         segment_started = time.perf_counter()
         word_dicts.sort(key=lambda item: (item["start"], item["end"]))
-        log.append(f"Alignment 汇总词数: {len(word_dicts)}")
+        log.append(f"字幕时间轴汇总词数: {len(word_dicts)}")
         segments = _group_words_to_segments(word_dicts)
         segments = _postprocess_segments(segments)
         segments = _annotate_segments_with_alignment_outcomes(segments, alignment_outcomes)
@@ -1240,7 +1181,7 @@ def _transcribe_and_align_local(
             log,
             timings,
             "asr_alignment_total_s",
-            "ASR与Alignment总计",
+            "ASR与字幕时间轴总计",
             total_elapsed,
         )
         log.append(f"过滤后保留字幕: {len(segments)}")

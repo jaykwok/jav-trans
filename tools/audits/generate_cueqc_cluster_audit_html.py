@@ -270,11 +270,11 @@ def discover_media(*, baseline_root: Path, output_dir: Path, rows: list[dict[str
 
 
 def absolute_fallback_range(row: Mapping[str, Any], start: float, end: float) -> tuple[float, float]:
-    diagnostics = row.get("alignment_diagnostics")
-    if not isinstance(diagnostics, Mapping):
+    timing = row.get("subtitle_timing")
+    if not isinstance(timing, Mapping):
         return start, end
-    rel_start = diagnostics.get("fallback_window_start_s")
-    rel_end = diagnostics.get("fallback_window_end_s")
+    rel_start = timing.get("fallback_window_start_s")
+    rel_end = timing.get("fallback_window_end_s")
     try:
         fallback_start = start + float(rel_start) if rel_start is not None else start
         fallback_end = start + float(rel_end) if rel_end is not None else end
@@ -533,7 +533,7 @@ code {{ background: #eef3ef; padding: 1px 4px; border-radius: 4px; }}
           <div class="cue-list" id="chunkCueList"></div>
         </div>
         <div>
-          <h3>fallback/core 内字幕</h3>
+          <h3>字幕时间轴窗口内字幕</h3>
           <div class="cue-list" id="fallbackCueList"></div>
         </div>
       </div>
@@ -541,7 +541,7 @@ code {{ background: #eef3ef; padding: 1px 4px; border-radius: 4px; }}
       <div class="cue-list" id="contextCueList"></div>
     </section>
     <section class="panel">
-      <h3>aligned segments</h3>
+      <h3>字幕片段</h3>
       <div class="cue-list" id="alignedList"></div>
     </section>
     </div>
@@ -569,7 +569,7 @@ try {{
   localStorage.removeItem(LEGACY_STORAGE_KEY + ":custom-group");
 }} catch (_) {{}}
 const DISPLAY = [{{value:"keep", label:"保留"}},{{value:"drop", label:"丢弃"}}];
-const CLUSTER_DISPLAY = [{{value:"keep", label:"保留（进 aligner 正常显示）"}},{{value:"drop", label:"丢弃（不进 aligner + boundary 偏好种子）"}}];
+const CLUSTER_DISPLAY = [{{value:"keep", label:"保留（进入字幕）"}},{{value:"drop", label:"丢弃（不进入字幕）"}}];
 function clusterOrder(summary) {{
   const match = String(summary.cluster_id || "").match(/^cluster_(\\d+)$/);
   return match ? Number(match[1]) : 1000;
@@ -1072,7 +1072,7 @@ function setMetrics(row) {{
     ["cluster", `${{row.cluster_id}} · confidence=${{Number(row.cluster_confidence || 0).toFixed(3)}}`],
     ["chunk", `${{row.chunk_index}} · ${{fmt(row.start)}}-${{fmt(row.end)}}`],
     ["context", `${{fmt(row.context_start)}}-${{fmt(row.context_end)}}`],
-    ["fallback/core", `${{fmt(row.fallback_window_start)}}-${{fmt(row.fallback_window_end)}}`],
+    ["字幕时间轴窗口", `${{fmt(row.fallback_window_start)}}-${{fmt(row.fallback_window_end)}}`],
     ["density", JSON.stringify(cueFeatures.text_density || row.text_density || {{}})],
     ["chars", `${{tf.char_count || 0}} unique=${{tf.unique_chars || 0}} kana=${{tf.kana_ratio || 0}} kanji=${{tf.kanji_ratio || 0}}`],
     ["repeat", JSON.stringify(tf.repeat_profile || {{}})],
@@ -1096,9 +1096,9 @@ function renderCueGroup(rootId, cues, emptyText) {{
 }}
 function renderCueLists(row) {{
   renderCueGroup("chunkCueList", row.chunk_subtitle_cues, "该 chunk 内没有字幕 cue。");
-  renderCueGroup("fallbackCueList", row.fallback_subtitle_cues, "该 fallback/core 内没有字幕 cue。");
+  renderCueGroup("fallbackCueList", row.fallback_subtitle_cues, "该字幕时间轴窗口内没有字幕 cue。");
   renderCueGroup("contextCueList", row.context_subtitle_cues, "该上下文内没有字幕 cue。");
-  renderCueGroup("alignedList", row.aligned_segments, "该 chunk 内没有 aligned segment。");
+  renderCueGroup("alignedList", row.aligned_segments, "该 chunk 内没有字幕片段。");
 }}
 function updateTimeline() {{
   const row = ROWS[current];

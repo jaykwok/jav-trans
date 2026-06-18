@@ -18,9 +18,8 @@ It bundles:
 - the bundled Hugging Face inference model directories:
   - `jaykwok/Qwen3-ASR-0.6B-JA-Anime-Galgame`
   - `jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame`
-  - `Qwen/Qwen3-ForcedAligner-0.6B`
 
-The build script prepares those three Hugging Face models before running
+The build script prepares those two Hugging Face models before running
 PyInstaller. Training-only files such as `optimizer.pt`, scheduler state,
 trainer state, RNG state, and `training_args.bin` are excluded from the package
 even if they exist in the local `models/` directories.

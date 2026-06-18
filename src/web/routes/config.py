@@ -34,9 +34,7 @@ _ENV_KEY_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _MODEL_ROLE_LABELS = {
     "asr": "ASR",
     "boundary_feature": "Boundary",
-    "forced_aligner": "ForcedAligner",
 }
-_ALIGNMENT_TIMESTAMP_MODES = {"forced", "native", "hybrid"}
 
 
 def _format_env_line(key: str, value: str) -> str:
@@ -119,26 +117,6 @@ def _ordered_backends(backends: list[str]) -> list[str]:
 
 def _truthy(value: str) -> bool:
     return str(value or "").strip().lower() in {"1", "true", "yes", "on"}
-
-
-def _alignment_timestamp_mode() -> str:
-    value = _runtime_or_env_or_setting(
-        "ALIGNMENT_TIMESTAMP_MODE",
-        DEFAULT_SETTINGS["ALIGNMENT_TIMESTAMP_MODE"],
-    ).strip().lower()
-    if value not in _ALIGNMENT_TIMESTAMP_MODES:
-        raise HTTPException(
-            status_code=422,
-            detail=(
-                "ALIGNMENT_TIMESTAMP_MODE must be one of: "
-                f"{', '.join(sorted(_ALIGNMENT_TIMESTAMP_MODES))}"
-            ),
-        )
-    return value
-
-
-def _alignment_requires_forced_aligner(mode: str) -> bool:
-    return mode in {"forced", "hybrid"}
 
 
 def _short_model_name(repo_id: str) -> str:
@@ -291,16 +269,6 @@ async def get_model_requirements(
     boundary_download_enabled = not _truthy(
         _runtime_or_env_or_setting("SPEECH_BOUNDARY_JA_NO_DOWNLOAD", "0")
     )
-    aligner_model_id = (
-        _runtime_or_env_or_setting(
-            "ALIGNER_MODEL_ID",
-            DEFAULT_SETTINGS["ALIGNER_MODEL_ID"],
-        ).strip()
-        or DEFAULT_SETTINGS["ALIGNER_MODEL_ID"]
-    )
-    aligner_model_path = _runtime_or_env_or_setting("ALIGNER_MODEL_PATH")
-    alignment_mode = _alignment_timestamp_mode()
-
     requirements = [
         _model_requirement(
             role="asr",
@@ -314,19 +282,10 @@ async def get_model_requirements(
             download_enabled=boundary_download_enabled,
         ),
     ]
-    if _alignment_requires_forced_aligner(alignment_mode):
-        requirements.append(
-            _model_requirement(
-                role="forced_aligner",
-                repo_id=aligner_model_id,
-                explicit_path=aligner_model_path,
-            )
-        )
     requirements = _merge_model_requirements(requirements)
     missing = [item for item in requirements if not item["present"]]
     return {
         "asr_backend": backend,
-        "alignment_timestamp_mode": alignment_mode,
         "required_models": requirements,
         "missing_count": len(missing),
         "needs_download": any(item["download_enabled"] for item in missing),

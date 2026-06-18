@@ -47,8 +47,8 @@ def test_config_lists_recommended_asr_backend_first(monkeypatch):
     asyncio.run(_test_config_lists_recommended_asr_backend_first(monkeypatch))
 
 
-def test_model_requirements_for_17b_include_boundary_and_aligner(tmp_path, monkeypatch):
-    asyncio.run(_test_model_requirements_for_17b_include_boundary_and_aligner(tmp_path, monkeypatch))
+def test_model_requirements_for_17b_include_boundary(tmp_path, monkeypatch):
+    asyncio.run(_test_model_requirements_for_17b_include_boundary(tmp_path, monkeypatch))
 
 
 def test_model_requirements_dedupe_06b_asr_and_boundary(tmp_path, monkeypatch):
@@ -57,10 +57,6 @@ def test_model_requirements_dedupe_06b_asr_and_boundary(tmp_path, monkeypatch):
 
 def test_model_requirements_marks_disabled_boundary_download(tmp_path, monkeypatch):
     asyncio.run(_test_model_requirements_marks_disabled_boundary_download(tmp_path, monkeypatch))
-
-
-def test_model_requirements_native_mode_excludes_aligner(tmp_path, monkeypatch):
-    asyncio.run(_test_model_requirements_native_mode_excludes_aligner(tmp_path, monkeypatch))
 
 
 def test_settings_hf_endpoint_updates_runtime_env(monkeypatch):
@@ -168,15 +164,12 @@ def _isolate_model_requirement_env(tmp_path, monkeypatch, *, boundary_no_downloa
         "SPEECH_BOUNDARY_JA_PTM": config_routes.RECOMMENDED_ASR_BACKEND,
         "SPEECH_BOUNDARY_JA_MODEL_PATH": "models/jaykwok-Qwen3-ASR-0.6B-JA-Anime-Galgame",
         "SPEECH_BOUNDARY_JA_NO_DOWNLOAD": boundary_no_download,
-        "ALIGNER_MODEL_ID": "Qwen/Qwen3-ForcedAligner-0.6B",
-        "ALIGNER_MODEL_PATH": "",
-        "ALIGNMENT_TIMESTAMP_MODE": "forced",
     }
     for key, value in env_values.items():
         monkeypatch.setenv(key, value)
 
 
-async def _test_model_requirements_for_17b_include_boundary_and_aligner(tmp_path, monkeypatch):
+async def _test_model_requirements_for_17b_include_boundary(tmp_path, monkeypatch):
     _isolate_model_requirement_env(tmp_path, monkeypatch)
 
     transport = httpx.ASGITransport(app=create_app())
@@ -191,8 +184,7 @@ async def _test_model_requirements_for_17b_include_boundary_and_aligner(tmp_path
 
     assert response.status_code == 200
     payload = response.json()
-    assert payload["missing_count"] == 3
-    assert payload["alignment_timestamp_mode"] == "forced"
+    assert payload["missing_count"] == 2
     assert payload["needs_download"] is True
     assert payload["download_disabled"] is False
     by_role = {
@@ -201,7 +193,6 @@ async def _test_model_requirements_for_17b_include_boundary_and_aligner(tmp_path
     }
     assert by_role[("asr",)] == "jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame"
     assert by_role[("boundary_feature",)] == config_routes.RECOMMENDED_ASR_BACKEND
-    assert by_role[("forced_aligner",)] == "Qwen/Qwen3-ForcedAligner-0.6B"
 
 
 async def _test_model_requirements_dedupe_06b_asr_and_boundary(tmp_path, monkeypatch):
@@ -223,8 +214,9 @@ async def _test_model_requirements_dedupe_06b_asr_and_boundary(tmp_path, monkeyp
 
     assert response.status_code == 200
     payload = response.json()
-    assert len(payload["required_models"]) == 2
-    assert payload["missing_count"] == 1
+    assert len(payload["required_models"]) == 1
+    assert payload["missing_count"] == 0
+    assert payload["needs_download"] is False
     merged = next(
         item
         for item in payload["required_models"]
@@ -255,28 +247,6 @@ async def _test_model_requirements_marks_disabled_boundary_download(tmp_path, mo
     assert boundary["download_enabled"] is False
     assert payload["needs_download"] is True
     assert payload["download_disabled"] is True
-
-
-async def _test_model_requirements_native_mode_excludes_aligner(tmp_path, monkeypatch):
-    _isolate_model_requirement_env(tmp_path, monkeypatch)
-    monkeypatch.setenv("ALIGNMENT_TIMESTAMP_MODE", "native")
-
-    transport = httpx.ASGITransport(app=create_app())
-    async with httpx.AsyncClient(
-        transport=transport,
-        base_url="http://test",
-    ) as client:
-        response = await client.get(
-            "/api/model-requirements",
-            params={"asr_backend": "jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame"},
-        )
-
-    assert response.status_code == 200
-    payload = response.json()
-    assert payload["alignment_timestamp_mode"] == "native"
-    assert payload["missing_count"] == 2
-    assert all("forced_aligner" not in item["roles"] for item in payload["required_models"])
-
 
 async def _test_settings_hf_endpoint_updates_runtime_env(monkeypatch):
     monkeypatch.delenv("HF_ENDPOINT", raising=False)

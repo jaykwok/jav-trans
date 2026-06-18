@@ -172,8 +172,6 @@ def configure_env(args: argparse.Namespace) -> None:
     os.environ["ASR_BOUNDARY_BACKEND"] = "speech_boundary_ja"
     os.environ["ASR_MODEL_PATH"] = project_path_value(args.asr_model_path)
     os.environ["ASR_MODEL_ID"] = ""
-    os.environ["ALIGNER_MODEL_PATH"] = project_path_value(args.aligner_model_path)
-    os.environ["ALIGNER_MODEL_ID"] = os.getenv("ALIGNER_MODEL_ID", "Qwen/Qwen3-ForcedAligner-0.6B")
     os.environ["ASR_WORKER_MODE"] = args.asr_worker_mode
     os.environ["ASR_DTYPE"] = args.asr_dtype
     os.environ["ASR_ATTENTION"] = args.asr_attention
@@ -182,8 +180,6 @@ def configure_env(args: argparse.Namespace) -> None:
         "ASR_BATCH_SIZE_BY_REPO",
         DEFAULT_ASR_BATCH_SIZE_BY_REPO_ENV,
     )
-    os.environ["ALIGNER_BATCH_SIZE"] = str(args.aligner_batch_size)
-    os.environ["ALIGN_LONG_CHUNK_BATCH_SIZE"] = str(args.align_long_chunk_batch_size)
     os.environ["TRANSCRIPTION_TIMEOUT_S"] = str(args.transcription_timeout_s)
     os.environ["TRANSCRIPTION_MAX_NEW_TOKENS"] = str(args.transcription_max_new_tokens)
     os.environ["ASR_MAX_NEW_TOKENS"] = str(args.asr_max_new_tokens)
@@ -224,7 +220,6 @@ def build_context(*, args: argparse.Namespace, paths: RunPaths, video: Path):
         "ASR_BACKEND": args.asr_backend,
         "ASR_BOUNDARY_BACKEND": "speech_boundary_ja",
         "ASR_MODEL_PATH": project_path_value(args.asr_model_path),
-        "ALIGNER_MODEL_PATH": project_path_value(args.aligner_model_path),
         "ASR_WORKER_MODE": args.asr_worker_mode,
         "ASR_CONTEXT": args.asr_context,
         "TRANSCRIPTION_TIMEOUT_S": str(args.transcription_timeout_s),
@@ -235,8 +230,6 @@ def build_context(*, args: argparse.Namespace, paths: RunPaths, video: Path):
             "ASR_BATCH_SIZE_BY_REPO",
             DEFAULT_ASR_BATCH_SIZE_BY_REPO_ENV,
         ),
-        "ALIGNER_BATCH_SIZE": str(args.aligner_batch_size),
-        "ALIGN_LONG_CHUNK_BATCH_SIZE": str(args.align_long_chunk_batch_size),
         "BOUNDARY_REFINER_MODEL_PATH": os.getenv("BOUNDARY_REFINER_MODEL_PATH", ""),
         "BOUNDARY_REFINER_DEVICE": os.getenv("BOUNDARY_REFINER_DEVICE", "auto"),
         "BOUNDARY_PLANNER_MAX_CORE_CHUNK_S": os.getenv(
@@ -400,6 +393,7 @@ def write_summary(paths: RunPaths, args: argparse.Namespace, results: list[dict[
         "# SpeechBoundary-JA Full Workflow",
         "",
         f"- ASR: `{args.asr_backend}`",
+        "- Subtitle timing: `boundary chunk timeline`",
         f"- ASR model: `{project_rel(project_path_value(args.asr_model_path)) or 'auto'}`",
         (
             f"- Boundary: `speech_boundary_ja` speech on/off "
@@ -445,16 +439,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--asr-model-path",
         default=os.getenv("ASR_MODEL_PATH", ""),
     )
-    parser.add_argument(
-        "--aligner-model-path",
-        default=os.getenv("ALIGNER_MODEL_PATH", ""),
-    )
     parser.add_argument("--asr-worker-mode", default=os.getenv("ASR_WORKER_MODE", "subprocess"))
     parser.add_argument("--asr-dtype", default=os.getenv("ASR_DTYPE", "bfloat16"))
     parser.add_argument("--asr-attention", default=os.getenv("ASR_ATTENTION", "sdpa"))
     parser.add_argument("--asr-batch-size", default=os.getenv("ASR_BATCH_SIZE", "auto"))
-    parser.add_argument("--aligner-batch-size", type=int, default=_env_int("ALIGNER_BATCH_SIZE", 64))
-    parser.add_argument("--align-long-chunk-batch-size", type=int, default=_env_int("ALIGN_LONG_CHUNK_BATCH_SIZE", 64))
     parser.add_argument("--asr-max-new-tokens", type=int, default=_env_int("ASR_MAX_NEW_TOKENS", 128))
     parser.add_argument("--transcription-max-new-tokens", type=int, default=_env_int("TRANSCRIPTION_MAX_NEW_TOKENS", 128))
     parser.add_argument("--transcription-timeout-s", type=int, default=_env_int("TRANSCRIPTION_TIMEOUT_S", 300))

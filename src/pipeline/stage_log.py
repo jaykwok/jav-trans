@@ -10,16 +10,14 @@ from rich.table import Table
 
 
 _ASR_PROGRESS_RE = re.compile(
-    r"(?P<label>音频切块|ASR 文本转写|Alignment 对齐|Alignment 局部细化|Alignment 降级重试)\s+(?P<current>\d+)/(?P<total>\d+)"
+    r"(?P<label>音频切块|ASR 文本转写|字幕时间轴)\s+(?P<current>\d+)/(?P<total>\d+)"
 )
 _STAGE_LOG_RE = re.compile(
     r"^stage_(?P<phase>start|done|skip|blocked|degraded)\s+(?P<stage>[A-Za-z0-9_]+)(?:\s+(?P<extra>.*))?$"
 )
 _ASR_STAGE_MAP = {
     "ASR 文本转写": "asr_text_transcribe",
-    "Alignment 对齐": "alignment",
-    "Alignment 局部细化": "alignment",
-    "Alignment 降级重试": "alignment",
+    "字幕时间轴": "subtitle_timing",
 }
 
 
@@ -133,10 +131,10 @@ def _log_timing_snapshot(
         ("asr_model_load_s", "asr_model_load"),
         ("asr_text_transcribe_s", "asr_text_transcribe"),
         ("asr_model_unload_s", "asr_model_unload"),
-        ("alignment_s", "alignment"),
-        ("alignment_model_unload_s", "alignment_model_unload"),
+        ("alignment_s", "subtitle_timing"),
+        ("alignment_model_unload_s", "subtitle_timing_model_unload"),
         ("subtitle_segment_s", "subtitle_segment"),
-        ("asr_alignment_total_s", "asr_alignment_total"),
+        ("asr_alignment_total_s", "asr_subtitle_timing_total"),
         ("translation_context_s", "translation_context"),
         ("translation_s", "translation"),
         ("write_output_s", "write_output"),
@@ -152,9 +150,7 @@ def _format_asr_stage_label(raw_label: str) -> str:
     mapping = {
         "音频切块": "音频切块",
         "ASR 文本转写": "ASR 转写",
-        "Alignment 对齐": "Alignment 对齐",
-        "Alignment 局部细化": "Alignment 局部细化",
-        "Alignment 降级重试": "Alignment 降级重试",
+        "字幕时间轴": "字幕时间轴",
     }
     return mapping.get(raw_label, raw_label)
 
@@ -176,10 +172,10 @@ def _print_timing_summary(console, stage_timings: dict, asr_details: dict) -> No
         ("ASR 模型加载", "asr_model_load_s"),
         ("ASR 文本转写", "asr_text_transcribe_s"),
         ("ASR 模型卸载", "asr_model_unload_s"),
-        ("Alignment 对齐", "alignment_s"),
-        ("Alignment 模型卸载", "alignment_model_unload_s"),
+        ("字幕时间轴", "alignment_s"),
+        ("字幕时间轴模型卸载", "alignment_model_unload_s"),
         ("字幕分段", "subtitle_segment_s"),
-        ("ASR+Alignment", "asr_alignment_total_s"),
+        ("ASR+字幕时间轴", "asr_alignment_total_s"),
         ("翻译上下文", "translation_context_s"),
         ("翻译", "translation_s"),
         ("输出写入", "write_output_s"),

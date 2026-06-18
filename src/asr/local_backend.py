@@ -17,18 +17,11 @@ from asr.backends.qwen import (
     current_qwen_asr_backend,
     qwen_asr_default_batch_size,
 )
-from asr.prealign import (
-    clean_text_for_aligner,
-    normalize_display_text,
-    prepare_text_for_alignment,
-    strip_alignment_punctuation,
-)
-from asr.timestamp_fallback import build_word_timestamps_fallback
+from asr.subtitle_timing import build_boundary_word_timestamps
+from asr.text_normalize import normalize_display_text, strip_text_punctuation
 
 ASR_MODEL_ID = active_qwen_asr_model_id()
-ALIGNER_MODEL_ID = os.getenv("ALIGNER_MODEL_ID", "Qwen/Qwen3-ForcedAligner-0.6B")
 ASR_MODEL_PATH = active_qwen_asr_model_path()
-ALIGNER_MODEL_PATH = os.getenv("ALIGNER_MODEL_PATH", "").strip()
 ASR_LANGUAGE = os.getenv("ASR_LANGUAGE", "Japanese").strip() or "Japanese"
 ASR_CONTEXT = os.getenv("ASR_CONTEXT", "").strip()
 
@@ -56,46 +49,10 @@ ASR_FORCE_LANGUAGE = os.getenv("ASR_FORCE_LANGUAGE", "1").strip().lower() not in
     "no",
     "off",
 }
-ALIGNER_BATCH_SIZE = max(
-    1,
-    int(os.getenv("ALIGNER_BATCH_SIZE", str(ASR_BATCH_SIZE))),
-)
-ALIGN_LONG_CHUNK_BATCH_SIZE = max(
-    1,
-    int(os.getenv("ALIGN_LONG_CHUNK_BATCH_SIZE", "1")),
-)
-ASR_NATIVE_MIN_SPAN_MS = float(os.getenv("ASR_NATIVE_MIN_SPAN_MS", "80"))
-ASR_NATIVE_MAX_ZERO_RATIO = float(os.getenv("ASR_NATIVE_MAX_ZERO_RATIO", "0.55"))
-ASR_NATIVE_MAX_REPEAT_RATIO = float(os.getenv("ASR_NATIVE_MAX_REPEAT_RATIO", "0.65"))
-ASR_NATIVE_MAX_CHARS_PER_ITEM = float(os.getenv("ASR_NATIVE_MAX_CHARS_PER_ITEM", "12.0"))
-_ALIGNMENT_MAX_COVERAGE_RATIO = float(
-    os.getenv("ALIGNMENT_MAX_COVERAGE_RATIO", "0.05")
-)
-_ALIGNMENT_MAX_CPS = float(os.getenv("ALIGNMENT_MAX_CPS", "50.0"))
-ALIGNMENT_HYBRID_FORCE_MAX_CHUNK_S = float(os.getenv("ALIGNMENT_HYBRID_FORCE_MAX_CHUNK", "24.0"))
-ALIGNMENT_HYBRID_FORCE_MIN_TEXT_LEN = max(
-    1,
-    int(os.getenv("ALIGNMENT_HYBRID_FORCE_MIN_TEXT_LEN", "20")),
-)
 _ASR_SUBPROCESS_KILL_GRACE_S = float(os.getenv("ASR_SUBPROCESS_KILL_GRACE_S", "5"))
 _ASR_SUBPROCESS_READY_TIMEOUT_S = float(
     os.getenv("ASR_SUBPROCESS_READY_TIMEOUT_S", "600")
 )
-
-
-def _resolve_timestamp_mode() -> str:
-    raw = os.getenv("ALIGNMENT_TIMESTAMP_MODE", "forced").strip().lower()
-    valid_modes = {"forced", "native", "hybrid"}
-    if raw not in valid_modes:
-        raise ValueError(
-            f"Unsupported ALIGNMENT_TIMESTAMP_MODE={raw!r}; "
-            f"expected one of {sorted(valid_modes)}"
-        )
-    return raw
-
-
-ALIGNMENT_TIMESTAMP_MODE = _resolve_timestamp_mode()
-
 
 def _get_wav_duration(audio_path: str) -> float:
     with wave.open(audio_path, "rb") as wav_file:
@@ -167,100 +124,8 @@ def _clean_master_text(text: str) -> str:
     return normalize_display_text(text)
 
 
-def restore_timestamps_to_original(
-    original_text: str,
-    cleaned_text: str,
-    word_dicts: list[dict],
-) -> list[dict]:
-    try:
-        if not original_text or not cleaned_text or not word_dicts:
-            return word_dicts
-
-        original = original_text.strip()
-        cleaned = cleaned_text.strip()
-        if not original or not cleaned:
-            return word_dicts
-
-        prealign = prepare_text_for_alignment(original)
-        if prealign.align_text == cleaned and prealign.align_to_display_spans:
-            restored: list[dict] = []
-            cursor = 0
-            spans = prealign.align_to_display_spans
-            display_text = prealign.display_text
-            mapped_items: list[tuple[dict, int, int]] = []
-            for word in word_dicts:
-                token = str(word.get("word", ""))
-                if not token:
-                    mapped_items.append((dict(word), 0, 0))
-                    continue
-
-                clean_start = cleaned.find(token, cursor)
-                if clean_start < 0:
-                    clean_start = min(cursor, len(cleaned))
-                clean_end = min(len(cleaned), max(clean_start + 1, clean_start + len(token)))
-                cursor = clean_end
-
-                covered = [
-                    span
-                    for span in spans
-                    if span.align_start < clean_end and span.align_end > clean_start
-                ]
-                restored_word = dict(word)
-                if covered:
-                    display_start = min(span.display_start for span in covered)
-                    display_end = max(span.display_end for span in covered)
-                    mapped_items.append((restored_word, display_start, display_end))
-                else:
-                    mapped_items.append((restored_word, 0, 0))
-            valid_indices = [i for i, (_word, start, end) in enumerate(mapped_items) if end > start]
-            for ordinal, (word, display_start, display_end) in enumerate(mapped_items):
-                if display_end <= display_start:
-                    word["word"] = str(word.get("word", ""))
-                    restored.append(word)
-                    continue
-                if valid_indices and ordinal == valid_indices[0]:
-                    display_start = 0
-                next_valid = next((i for i in valid_indices if i > ordinal), None)
-                if next_valid is not None:
-                    display_end = mapped_items[next_valid][1]
-                elif valid_indices and ordinal == valid_indices[-1]:
-                    display_end = len(display_text)
-                word["word"] = display_text[display_start:display_end] or str(word.get("word", ""))
-                restored.append(word)
-            return restored
-
-        ratio = len(original) / max(1, len(cleaned))
-        restored: list[dict] = []
-        cursor = 0
-        for word in word_dicts:
-            token = str(word.get("word", ""))
-            if not token:
-                restored.append(dict(word))
-                continue
-
-            clean_start = cleaned.find(token, cursor)
-            if clean_start < 0:
-                clean_start = min(cursor, len(cleaned))
-            clean_end = min(len(cleaned), max(clean_start + 1, clean_start + len(token)))
-            cursor = clean_end
-
-            original_start = min(len(original), int(clean_start * ratio))
-            original_end = min(len(original), max(original_start + 1, int(clean_end * ratio)))
-            restored_word = dict(word)
-            restored_word["word"] = original[original_start:original_end] or token
-            restored.append(restored_word)
-
-        return restored
-    except Exception:
-        return word_dicts
-
-
 def _strip_punctuation(text: str) -> str:
-    return strip_alignment_punctuation(text)
-
-
-def _compact_text_len(text: str) -> int:
-    return len(_strip_punctuation(text))
+    return strip_text_punctuation(text)
 
 
 def _first_token_id(value) -> int | None:
@@ -323,14 +188,6 @@ def _apply_generation_safety(model) -> None:
         model.model.thinker.generation_config.repetition_penalty = ASR_REPETITION_PENALTY
     except Exception:
         pass
-
-
-def _get_attr(obj, attr: str):
-    if hasattr(obj, attr):
-        return getattr(obj, attr)
-    if isinstance(obj, dict):
-        return obj.get(attr)
-    return None
 
 
 def _callable_accepts_kwarg(func, name: str) -> bool:
@@ -402,58 +259,6 @@ def _qwen_generation_metadata(
     }
 
 
-def merge_master_with_timestamps(master_text: str, timestamps) -> list[dict]:
-    if not master_text or not master_text.strip():
-        return []
-
-    if not timestamps:
-        return [{"word": master_text.strip(), "start": 0.0, "end": 0.0}]
-
-    result: list[dict] = []
-    master_pos = 0
-
-    for ts in timestamps:
-        ts_word = _get_attr(ts, "text")
-        ts_start = _get_attr(ts, "start_time")
-        ts_end = _get_attr(ts, "end_time")
-
-        if not ts_word:
-            continue
-
-        word_start = master_text.find(ts_word, master_pos)
-        if word_start == -1:
-            result.append(
-                {
-                    "word": str(ts_word),
-                    "start": float(ts_start) if ts_start is not None else 0.0,
-                    "end": float(ts_end) if ts_end is not None else 0.0,
-                }
-            )
-            continue
-
-        word_end = word_start + len(ts_word)
-        if word_start > master_pos:
-            gap = master_text[master_pos:word_start]
-            if result:
-                result[-1]["word"] += gap
-            else:
-                ts_word = gap + ts_word
-
-        result.append(
-            {
-                "word": str(ts_word),
-                "start": float(ts_start) if ts_start is not None else 0.0,
-                "end": float(ts_end) if ts_end is not None else 0.0,
-            }
-        )
-        master_pos = word_end
-
-    if master_pos < len(master_text) and result:
-        result[-1]["word"] += master_text[master_pos:]
-
-    return result
-
-
 def normalize_word_dicts(words: list[dict]) -> list[dict]:
     normalized: list[dict] = []
     for word in words:
@@ -467,176 +272,6 @@ def normalize_word_dicts(words: list[dict]) -> list[dict]:
         normalized.append({"start": start, "end": end, "word": token})
     normalized.sort(key=lambda item: (item["start"], item["end"]))
     return normalized
-
-
-def _log_forced_alignment_stats(
-    word_dicts: list[dict],
-    *,
-    chunk_dur: float = 0.0,
-) -> None:
-    if not word_dicts:
-        return
-
-    durations_ms = [
-        max(0.0, float(word["end"]) - float(word["start"])) * 1000.0
-        for word in word_dicts
-    ]
-    word_count = len(word_dicts)
-    avg_word_dur = sum(durations_ms) / word_count
-    min_dur = min(durations_ms)
-    print(
-        f"[align] chunk_dur={chunk_dur:.1f}s word_count={word_count} "
-        f"avg_word_dur={avg_word_dur:.0f}ms min_dur={min_dur:.0f}ms"
-    )
-
-
-def looks_like_word_timing_failure(
-    words: list[dict],
-    *,
-    min_span_ms: float = ASR_NATIVE_MIN_SPAN_MS,
-    max_zero_ratio: float = ASR_NATIVE_MAX_ZERO_RATIO,
-    max_repeat_ratio: float = ASR_NATIVE_MAX_REPEAT_RATIO,
-    scene_duration_sec: float | None = None,
-    max_coverage_ratio: float = _ALIGNMENT_MAX_COVERAGE_RATIO,
-    max_cps: float = _ALIGNMENT_MAX_CPS,
-) -> bool:
-    return bool(
-        word_timing_failure_reasons(
-            words,
-            min_span_ms=min_span_ms,
-            max_zero_ratio=max_zero_ratio,
-            max_repeat_ratio=max_repeat_ratio,
-            scene_duration_sec=scene_duration_sec,
-            max_coverage_ratio=max_coverage_ratio,
-            max_cps=max_cps,
-        )
-    )
-
-
-def word_timing_failure_reasons(
-    words: list[dict],
-    *,
-    min_span_ms: float = ASR_NATIVE_MIN_SPAN_MS,
-    max_zero_ratio: float = ASR_NATIVE_MAX_ZERO_RATIO,
-    max_repeat_ratio: float = ASR_NATIVE_MAX_REPEAT_RATIO,
-    scene_duration_sec: float | None = None,
-    max_coverage_ratio: float = _ALIGNMENT_MAX_COVERAGE_RATIO,
-    max_cps: float = _ALIGNMENT_MAX_CPS,
-) -> list[str]:
-    if not words:
-        return []
-    if len(words) < 2 and scene_duration_sec is None:
-        return []
-
-    tiny_span_count = 0
-    zero_or_negative_count = 0
-    repeated_count = 0
-    prev_word = None
-    min_start = float("inf")
-    max_end = float("-inf")
-    char_count = 0
-
-    for word in words:
-        start = float(word.get("start", 0.0))
-        end = float(word.get("end", 0.0))
-        token = _strip_punctuation(word.get("word", ""))
-        min_start = min(min_start, start)
-        max_end = max(max_end, end)
-        char_count += len(token)
-        span_ms = max(0.0, end - start) * 1000.0
-        if span_ms <= min_span_ms:
-            tiny_span_count += 1
-        if end <= start:
-            zero_or_negative_count += 1
-        if token and prev_word and token == prev_word:
-            repeated_count += 1
-        if token:
-            prev_word = token
-
-    total = len(words)
-    reasons: list[str] = []
-    if tiny_span_count / total >= max_zero_ratio:
-        reasons.append("word_timing_tiny_span_heavy")
-    if zero_or_negative_count / total >= max_zero_ratio:
-        reasons.append("word_timing_zero_heavy")
-    if repeated_count / max(1, total - 1) >= max_repeat_ratio:
-        reasons.append("word_timing_repeat_heavy")
-
-    if scene_duration_sec is not None and scene_duration_sec > 0:
-        word_span = max(0.0, max_end - min_start)
-        if word_span > 0:
-            if word_span / scene_duration_sec < max_coverage_ratio:
-                reasons.append("word_timing_low_coverage")
-            if char_count > 0 and char_count / word_span > max_cps:
-                reasons.append("word_timing_high_cps")
-
-    return reasons
-
-
-def _native_timestamp_issue(words: list[dict], text: str) -> str:
-    if not words:
-        return "无原生时间戳"
-
-    compact_text_len = len(_strip_punctuation(text))
-    compact_word_len = sum(len(_strip_punctuation(word["word"])) for word in words)
-    avg_chars_per_item = compact_word_len / max(1, len(words))
-
-    if compact_text_len >= 18 and len(words) <= 1:
-        return "原生时间戳过粗"
-    if compact_text_len >= 24 and avg_chars_per_item > ASR_NATIVE_MAX_CHARS_PER_ITEM:
-        return f"原生时间戳颗粒度过粗(avg_chars={avg_chars_per_item:.1f})"
-    if looks_like_word_timing_failure(words):
-        return "原生时间戳存在密集/零时长异常"
-    return ""
-
-
-def align_text_to_words(
-    audio_path: str,
-    text: str,
-    language: str,
-    *,
-    aligner_handle,
-) -> tuple[list[dict], str]:
-    normalized_path = str(Path(audio_path).resolve())
-    master_text = _clean_master_text((text or "").strip())
-    detected_language = (language or ASR_LANGUAGE or "Japanese").strip()
-
-    if not master_text:
-        return [], "empty"
-
-    align_result = None
-    try:
-        align_results = aligner_handle.align(
-            audio=[normalized_path],
-            text=[master_text],
-            language=[detected_language],
-        )
-        align_result = next(iter(align_results or []), None)
-        if align_result is None:
-            return [], "forced_aligner"
-        merged_words = merge_master_with_timestamps(
-            master_text,
-            getattr(align_result, "items", None),
-        )
-        return normalize_word_dicts(merged_words), "forced_aligner"
-    finally:
-        if align_result is not None:
-            try:
-                del align_result
-            except Exception:
-                pass
-
-
-def _extract_timestamp_items(asr_result) -> list | None:
-    timestamps = _get_attr(asr_result, "time_stamps")
-    if timestamps is None:
-        return None
-    items = _get_attr(timestamps, "items")
-    if items is not None:
-        return items
-    if isinstance(timestamps, list):
-        return timestamps
-    return None
 
 
 class WorkerTimeoutError(RuntimeError):
@@ -661,10 +296,7 @@ class LocalAsrBackend:
         self.dtype = _detect_dtype(self.device)
         self.attention = _detect_attention(self.device)
         self.model = None
-        self.forced_aligner = None
-        self.timestamp_mode = ALIGNMENT_TIMESTAMP_MODE
         self.request_batch_size = ASR_BATCH_SIZE
-        self.align_batch_size = ALIGNER_BATCH_SIZE
 
     def load(self, on_stage: Callable[[str], None] | None = None) -> None:
         from qwen_asr import Qwen3ASRModel
@@ -691,28 +323,6 @@ class LocalAsrBackend:
         self.model = Qwen3ASRModel.from_pretrained(model_spec, **model_kwargs)
         _apply_generation_safety(self.model)
 
-    def _ensure_forced_aligner(self, on_stage: Callable[[str], None] | None = None):
-        from qwen_asr import Qwen3ForcedAligner
-
-        if self.forced_aligner is not None:
-            return self.forced_aligner
-
-        _notify(on_stage, "加载 Forced Aligner...")
-        aligner_spec = resolve_model_spec(
-            ALIGNER_MODEL_PATH or None,
-            ALIGNER_MODEL_ID,
-            download=True,
-        )
-        model_kwargs = {
-            "dtype": self.dtype,
-            "device_map": self.device,
-        }
-        if self.attention and self.attention != "sdpa":
-            model_kwargs["attn_implementation"] = self.attention
-        self.forced_aligner = Qwen3ForcedAligner.from_pretrained(aligner_spec, **model_kwargs)
-        _normalize_deterministic_generation_config(self.forced_aligner)
-        return self.forced_aligner
-
     def unload_model(self, on_stage: Callable[[str], None] | None = None) -> None:
         if self.model is None:
             return
@@ -724,211 +334,8 @@ class LocalAsrBackend:
         self.model = None
         _clear_cuda_cache(self.device)
 
-    def unload_forced_aligner(self, on_stage: Callable[[str], None] | None = None) -> None:
-        if self.forced_aligner is None:
-            return
-        _notify(on_stage, "卸载 Forced Aligner...")
-        try:
-            del self.forced_aligner
-        except Exception:
-            pass
-        self.forced_aligner = None
-        _clear_cuda_cache(self.device)
-
     def close(self) -> None:
         self.unload_model()
-        self.unload_forced_aligner()
-
-    def _forced_align_words(
-        self,
-        normalized_path: str,
-        master_text: str,
-        detected_language: str,
-        on_stage: Callable[[str], None] | None = None,
-    ) -> tuple[list[dict], str]:
-        forced_aligner = self._ensure_forced_aligner(on_stage=on_stage)
-        _notify(on_stage, "Alignment 强制对齐中...")
-        try:
-            cleaned = clean_text_for_aligner(master_text)
-            if not cleaned:
-                return [], "empty"
-            word_dicts, alignment_mode = align_text_to_words(
-                normalized_path,
-                cleaned,
-                detected_language,
-                aligner_handle=forced_aligner,
-            )
-            if word_dicts and cleaned != master_text:
-                word_dicts = restore_timestamps_to_original(
-                    master_text,
-                    cleaned,
-                    word_dicts,
-                )
-            _log_forced_alignment_stats(
-                word_dicts,
-                chunk_dur=_get_wav_duration_or_zero(normalized_path),
-            )
-            return word_dicts, alignment_mode
-        finally:
-            _clear_cuda_cache(self.device)
-
-    def _forced_align_words_batch(
-        self,
-        items: list[tuple[str, str, str]],
-        on_stage: Callable[[str], None] | None = None,
-    ) -> list[list[dict]]:
-        if not items:
-            return []
-
-        forced_aligner = self._ensure_forced_aligner(on_stage=on_stage)
-        results: list[list[dict]] = []
-        batch_size = ALIGN_LONG_CHUNK_BATCH_SIZE
-
-        for batch_start in range(0, len(items), batch_size):
-            batch_items = items[batch_start : batch_start + batch_size]
-            _notify(on_stage, "Alignment 强制对齐中...")
-            align_results = None
-            try:
-                batch_outputs: list[list[dict] | None] = [None] * len(batch_items)
-                aligner_jobs: list[tuple[int, str, str, str, str]] = []
-                for local_idx, (normalized_path, master_text, language) in enumerate(batch_items):
-                    cleaned = clean_text_for_aligner(master_text)
-                    if not cleaned:
-                        batch_outputs[local_idx] = []
-                        continue
-                    aligner_jobs.append(
-                        (local_idx, normalized_path, master_text, cleaned, language)
-                    )
-
-                if aligner_jobs:
-                    align_results = forced_aligner.align(
-                        audio=[
-                            normalized_path
-                            for _idx, normalized_path, _master_text, _cleaned, _language in aligner_jobs
-                        ],
-                        text=[
-                            cleaned
-                            for _idx, _normalized_path, _master_text, cleaned, _language in aligner_jobs
-                        ],
-                        language=[
-                            language
-                            for _idx, _normalized_path, _master_text, _cleaned, language in aligner_jobs
-                        ],
-                    )
-                align_result_items = list(align_results or [])
-
-                for (
-                    local_idx,
-                    _normalized_path,
-                    master_text,
-                    cleaned,
-                    _language,
-                ), align_result in zip(aligner_jobs, align_result_items):
-                    merged_words = merge_master_with_timestamps(
-                        cleaned,
-                        getattr(align_result, "items", None),
-                    )
-                    restored_words = normalize_word_dicts(merged_words)
-                    if restored_words and cleaned != master_text:
-                        restored_words = restore_timestamps_to_original(
-                            master_text,
-                            cleaned,
-                            restored_words,
-                        )
-                    batch_outputs[local_idx] = normalize_word_dicts(restored_words)
-                    _log_forced_alignment_stats(
-                        batch_outputs[local_idx] or [],
-                        chunk_dur=_get_wav_duration_or_zero(_normalized_path),
-                    )
-                if len(align_result_items) < len(aligner_jobs):
-                    for local_idx, *_rest in aligner_jobs[len(align_result_items) :]:
-                        batch_outputs[local_idx] = []
-
-                results.extend(output or [] for output in batch_outputs)
-            finally:
-                if align_results is not None:
-                    try:
-                        del align_results
-                    except Exception:
-                        pass
-                _clear_cuda_cache(self.device)
-
-        return results
-
-    def align_text_to_words(
-        self,
-        audio_path: str,
-        text: str,
-        language: str | None = None,
-        on_stage: Callable[[str], None] | None = None,
-    ) -> tuple[dict, list[str]]:
-        log: list[str] = []
-        normalized_path = str(Path(audio_path).resolve())
-        duration = _get_wav_duration(normalized_path)
-        raw_master_text = (text or "").strip()
-        master_text = _clean_master_text(raw_master_text)
-        detected_language = (language or ASR_LANGUAGE or "Japanese").strip()
-
-        log.append(f"Alignment 输入文本长度: {len(raw_master_text)}")
-        if master_text != raw_master_text:
-            log.append(f"Alignment 清洗后文本长度: {len(master_text)}")
-
-        if not master_text:
-            return {
-                "words": [],
-                "text": "",
-                "raw_text": raw_master_text,
-                "alignment_mode": "empty",
-                "duration": duration,
-                "language": detected_language,
-            }, log
-
-        alignment_mode = "forced_aligner"
-        align_error = ""
-        fallback_meta: dict | None = None
-
-        try:
-            word_dicts, alignment_mode = self._forced_align_words(
-                normalized_path,
-                master_text,
-                detected_language,
-                on_stage=on_stage,
-            )
-        except Exception as exc:
-            align_error = str(exc)
-            word_dicts, alignment_mode, fallback_meta = build_word_timestamps_fallback(
-                master_text,
-                0.0,
-                duration,
-                audio_path=normalized_path,
-            )
-            word_dicts = normalize_word_dicts(word_dicts)
-
-        log.append(f"Alignment 词数: {len(word_dicts)}")
-        if align_error:
-            log.append(f"Alignment 异常: {align_error}")
-        if fallback_meta is not None:
-            coarse_label = {
-                "nonlexical": "Alignment 非词粗时间轴语音区间",
-                "align_text_empty": "Alignment align_text 为空粗时间轴语音区间",
-            }.get(alignment_mode, "Alignment VAD 回退语音区间")
-            error_label = {
-                "nonlexical": "Alignment 非词粗时间轴异常",
-                "align_text_empty": "Alignment align_text 为空粗时间轴异常",
-            }.get(alignment_mode, "Alignment VAD 回退异常")
-            if fallback_meta.get("speech_span_count", 0):
-                log.append(f"{coarse_label}: {fallback_meta['speech_span_count']}")
-            elif fallback_meta.get("vad_error"):
-                log.append(f"{error_label}: {fallback_meta['vad_error']}")
-        log.append(f"Alignment 模式: {alignment_mode}")
-        return {
-            "words": word_dicts,
-            "text": master_text,
-            "raw_text": raw_master_text,
-            "alignment_mode": alignment_mode,
-            "duration": duration,
-            "language": detected_language,
-        }, log
 
     def _build_text_result(
         self,
@@ -949,14 +356,15 @@ class LocalAsrBackend:
             log.append(f"ASR 清洗后文本长度: {len(master_text)}")
         log.append("ASR 输出模式: text_only")
 
-        return {
+        payload = {
             "text": master_text,
             "raw_text": raw_master_text,
             "duration": duration,
             "language": detected_language,
             "normalized_path": normalized_path,
             "asr_generation": _qwen_generation_metadata(),
-        }, log
+        }
+        return payload, log
 
     def transcribe_texts(
         self,
@@ -986,6 +394,7 @@ class LocalAsrBackend:
         transcribe_kwargs = {
             "context": request_contexts,
             "language": language_hint,
+            # Runtime timing comes from Boundary/speech-core chunk windows.
             "return_time_stamps": False,
         }
         if _callable_accepts_kwarg(self.model.transcribe, "max_new_tokens"):
@@ -1088,27 +497,37 @@ class LocalAsrBackend:
                 out.append({"ok": False, "error": repr(exc)})
         return out
 
-    def _should_force_align_text(self, master_text: str, raw_master_text: str, log: list[str]) -> bool:
-        prealign = prepare_text_for_alignment(raw_master_text or master_text)
-        if prealign.empty_after_cleaning:
-            compact_display_len = _compact_text_len(prealign.display_text)
-            if compact_display_len <= 0:
-                log.append("Alignment 策略: nonlexical_fallback")
-                log.append("Alignment 非词文本: 跳过 forced aligner，保留显示文本并使用粗时间轴")
-            else:
-                log.append("Alignment 策略: align_text_empty_fallback")
-                log.append("Alignment align_text 为空: 跳过 forced aligner，保留显示文本并使用粗时间轴")
-            return False
-        log.append("Alignment 策略: forced_aligner")
-        return True
-
-    def _fallback_alignment_mode_for_text(self, master_text: str, raw_master_text: str) -> str:
-        prealign = prepare_text_for_alignment(raw_master_text or master_text)
-        if prealign.empty_after_cleaning and _compact_text_len(prealign.display_text) <= 0:
-            return "nonlexical"
-        if prealign.empty_after_cleaning:
-            return "align_text_empty"
-        return ""
+    def _use_boundary_timing_result(
+        self,
+        *,
+        master_text: str,
+        raw_master_text: str,
+        duration: float,
+        detected_language: str,
+        normalized_path: str,
+        timing_start: float,
+        timing_end: float,
+        timing_window_source: str,
+        log: list[str],
+    ) -> tuple[dict, list[str]]:
+        log.append("Subtitle timing: boundary_chunk_timeline")
+        word_dicts, alignment_mode, timing_meta = build_boundary_word_timestamps(
+            master_text or raw_master_text,
+            timing_start,
+            timing_end,
+            audio_path=normalized_path,
+        )
+        return self._build_finalize_output(
+            word_dicts=normalize_word_dicts(word_dicts),
+            master_text=master_text,
+            raw_master_text=raw_master_text,
+            alignment_mode=alignment_mode,
+            duration=duration,
+            detected_language=detected_language,
+            log=log,
+            timing_meta=timing_meta,
+            timing_window_source=timing_window_source,
+        )
 
     def _alignment_fallback_window_for_text_result(
         self,
@@ -1141,20 +560,17 @@ class LocalAsrBackend:
         detected_language: str,
         log: list[str],
         align_error: str = "",
-        fallback_meta: dict | None = None,
-        fallback_window_source: str = "",
+        timing_meta: dict | None = None,
+        timing_window_source: str = "",
     ) -> tuple[dict, list[str]]:
-        log.append(f"Alignment 词数: {len(word_dicts)}")
+        log.append(f"Subtitle timing word count: {len(word_dicts)}")
         if align_error:
-            log.append(f"Alignment 异常: {align_error}")
-        if fallback_window_source == "speech_core":
-            log.append("Alignment 回退窗口: speech_core")
-        if fallback_meta is not None:
-            if fallback_meta.get("speech_span_count", 0):
-                log.append(f"Alignment VAD 回退语音区间: {fallback_meta['speech_span_count']}")
-            elif fallback_meta.get("vad_error"):
-                log.append(f"Alignment VAD 回退异常: {fallback_meta['vad_error']}")
-        log.append(f"Alignment 模式: {alignment_mode}")
+            log.append(f"Subtitle timing error: {align_error}")
+        if timing_window_source == "speech_core":
+            log.append("Subtitle timing window: speech_core")
+        if timing_meta is not None and timing_meta.get("timing_source"):
+            log.append(f"Subtitle timing source: {timing_meta['timing_source']}")
+        log.append(f"Subtitle timing mode: {alignment_mode}")
         return {
             "words": word_dicts,
             "text": master_text,
@@ -1172,10 +588,8 @@ class LocalAsrBackend:
         if not text_results:
             return []
 
-        finalized: list[tuple[dict, list[str]] | None] = [None] * len(text_results)
-        forced_jobs: list[dict] = []
-
-        for idx, text_result in enumerate(text_results):
+        finalized: list[tuple[dict, list[str]]] = []
+        for text_result in text_results:
             log: list[str] = list(text_result.get("log", []))
             normalized_path = str(text_result["normalized_path"])
             duration = float(text_result["duration"])
@@ -1187,7 +601,7 @@ class LocalAsrBackend:
             )
 
             if not master_text:
-                finalized[idx] = (
+                finalized.append((
                     {
                         "words": [],
                         "text": "",
@@ -1197,136 +611,23 @@ class LocalAsrBackend:
                         "language": detected_language,
                     },
                     log,
-                )
+                ))
                 continue
 
-            if self._should_force_align_text(master_text, raw_master_text, log):
-                forced_jobs.append(
-                    {
-                        "idx": idx,
-                        "normalized_path": normalized_path,
-                        "master_text": master_text,
-                        "detected_language": detected_language,
-                        "duration": duration,
-                        "raw_master_text": raw_master_text,
-                        "log": log,
-                        "fallback_start": fallback_start,
-                        "fallback_end": fallback_end,
-                        "fallback_window_source": fallback_window_source,
-                    }
+            finalized.append(
+                self._use_boundary_timing_result(
+                    master_text=master_text,
+                    raw_master_text=raw_master_text,
+                    duration=duration,
+                    detected_language=detected_language,
+                    normalized_path=normalized_path,
+                    timing_start=fallback_start,
+                    timing_end=fallback_end,
+                    timing_window_source=fallback_window_source,
+                    log=log,
                 )
-                continue
-
-            word_dicts, alignment_mode, fallback_meta = build_word_timestamps_fallback(
-                master_text or raw_master_text,
-                fallback_start,
-                fallback_end,
-                audio_path=normalized_path,
             )
-            explicit_mode = self._fallback_alignment_mode_for_text(master_text, raw_master_text)
-            if explicit_mode:
-                alignment_mode = explicit_mode
-            word_dicts = normalize_word_dicts(word_dicts)
-            finalized[idx] = self._build_finalize_output(
-                word_dicts=word_dicts,
-                master_text=master_text,
-                raw_master_text=raw_master_text,
-                alignment_mode=alignment_mode,
-                duration=duration,
-                detected_language=detected_language,
-                log=log,
-                fallback_meta=fallback_meta,
-                fallback_window_source=fallback_window_source,
-            )
-
-        for batch_start in range(0, len(forced_jobs), self.align_batch_size):
-            batch_jobs = forced_jobs[batch_start : batch_start + self.align_batch_size]
-            batch_inputs = []
-            for job in batch_jobs:
-                batch_inputs.append(
-                    (
-                        job["normalized_path"],
-                        job["raw_master_text"] or job["master_text"],
-                        job["detected_language"],
-                    )
-                )
-            try:
-                batch_word_dicts = self._forced_align_words_batch(batch_inputs, on_stage=on_stage)
-                for job, word_dicts in zip(batch_jobs, batch_word_dicts):
-                    if not word_dicts:
-                        fallback_words, fallback_mode, fallback_meta = build_word_timestamps_fallback(
-                            job["master_text"],
-                            job["fallback_start"],
-                            job["fallback_end"],
-                            audio_path=job["normalized_path"],
-                        )
-                        finalized[job["idx"]] = self._build_finalize_output(
-                            word_dicts=normalize_word_dicts(fallback_words),
-                            master_text=job["master_text"],
-                            raw_master_text=job["raw_master_text"],
-                            alignment_mode=fallback_mode,
-                            duration=job["duration"],
-                            detected_language=job["detected_language"],
-                            log=job["log"],
-                            align_error="forced aligner returned empty words",
-                            fallback_meta=fallback_meta,
-                            fallback_window_source=job["fallback_window_source"],
-                        )
-                        continue
-
-                    finalized[job["idx"]] = self._build_finalize_output(
-                        word_dicts=word_dicts,
-                        master_text=job["master_text"],
-                        raw_master_text=job["raw_master_text"],
-                        alignment_mode="forced_aligner",
-                        duration=job["duration"],
-                        detected_language=job["detected_language"],
-                        log=job["log"],
-                    )
-            except Exception:
-                for job in batch_jobs:
-                    align_error = ""
-                    fallback_meta: dict | None = None
-                    try:
-                        word_dicts, alignment_mode = self._forced_align_words(
-                            job["normalized_path"],
-                            job["raw_master_text"] or job["master_text"],
-                            job["detected_language"],
-                            on_stage=on_stage,
-                        )
-                        if not word_dicts:
-                            align_error = "forced aligner returned empty words"
-                            word_dicts, alignment_mode, fallback_meta = build_word_timestamps_fallback(
-                                job["master_text"],
-                                job["fallback_start"],
-                                job["fallback_end"],
-                                audio_path=job["normalized_path"],
-                            )
-                            word_dicts = normalize_word_dicts(word_dicts)
-                    except Exception as exc:
-                        align_error = str(exc)
-                        word_dicts, alignment_mode, fallback_meta = build_word_timestamps_fallback(
-                            job["master_text"],
-                            job["fallback_start"],
-                            job["fallback_end"],
-                            audio_path=job["normalized_path"],
-                        )
-                        word_dicts = normalize_word_dicts(word_dicts)
-
-                    finalized[job["idx"]] = self._build_finalize_output(
-                        word_dicts=word_dicts,
-                        master_text=job["master_text"],
-                        raw_master_text=job["raw_master_text"],
-                        alignment_mode=alignment_mode,
-                        duration=job["duration"],
-                        detected_language=job["detected_language"],
-                        log=job["log"],
-                        align_error=align_error,
-                        fallback_meta=fallback_meta,
-                        fallback_window_source=job["fallback_window_source"],
-                    )
-
-        return [item for item in finalized if item is not None]
+        return finalized
 
     def finalize_text_result(
         self,
@@ -1346,12 +647,7 @@ class LocalAsrBackend:
 
 
 class SubprocessAsrBackend:
-    """Run ASR text inference in a killable child process; keep alignment local.
-
-    The public API mirrors LocalAsrBackend. finalize_text_results runs in the
-    parent process by lazily creating an in-process LocalAsrBackend for the
-    forced aligner only.
-    """
+    """Run ASR text inference in a killable child process."""
 
     is_subprocess = True
     accepts_contexts = True
@@ -1359,16 +655,12 @@ class SubprocessAsrBackend:
     def __init__(self, device: str):
         self.device = device if device.startswith("cuda") else "cpu"
         self.request_batch_size = ASR_BATCH_SIZE
-        self.align_batch_size = ALIGNER_BATCH_SIZE
-        self.timestamp_mode = ALIGNMENT_TIMESTAMP_MODE
         self.kill_grace_s = _ASR_SUBPROCESS_KILL_GRACE_S
         self.ready_timeout_s = _ASR_SUBPROCESS_READY_TIMEOUT_S
         self.model = None
-        self.forced_aligner = None
         self._ctx = mp.get_context("spawn")
         self._process = None
         self._conn = None
-        self._align_backend: LocalAsrBackend | None = None
 
     def load(self, on_stage: Callable[[str], None] | None = None) -> None:
         self._ensure_worker(on_stage=on_stage)
@@ -1511,21 +803,8 @@ class SubprocessAsrBackend:
                 self._close_conn()
                 _clear_cuda_cache(self.device)
 
-    def unload_forced_aligner(self, on_stage: Callable[[str], None] | None = None) -> None:
-        if self._align_backend is not None:
-            self._align_backend.unload_forced_aligner(on_stage=on_stage)
-        self.forced_aligner = None
-
     def close(self) -> None:
         self.unload_model()
-        if self._align_backend is not None:
-            self._align_backend.close()
-            self._align_backend = None
-
-    def _ensure_align_backend(self) -> LocalAsrBackend:
-        if self._align_backend is None:
-            self._align_backend = LocalAsrBackend(self.device)
-        return self._align_backend
 
     def transcribe_texts(
         self,
@@ -1712,10 +991,7 @@ class SubprocessAsrBackend:
         text_results: list[dict],
         on_stage: Callable[[str], None] | None = None,
     ) -> list[tuple[dict, list[str]]]:
-        return self._ensure_align_backend().finalize_text_results(
-            text_results,
-            on_stage=on_stage,
-        )
+        return LocalAsrBackend(self.device).finalize_text_results(text_results, on_stage=on_stage)
 
     def finalize_text_result(
         self,
@@ -1746,6 +1022,3 @@ def transcribe_to_words(
         return result, log + extra_log
     finally:
         backend.close()
-
-
-

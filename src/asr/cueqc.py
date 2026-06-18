@@ -396,12 +396,11 @@ def build_candidate(
             if isinstance(text_result.get("asr_generation"), Mapping)
             else {},
         },
-        "alignment_diagnostics": {
+        "subtitle_timing": {
             "fallback_window_start_s": text_result.get("alignment_fallback_start_s"),
             "fallback_window_end_s": text_result.get("alignment_fallback_end_s"),
             "fallback_window_source": text_result.get("alignment_fallback_source", ""),
         },
-        "existing_diagnostics": {},
         "labels": {},
     }
 

@@ -97,7 +97,7 @@ def test_quality_report_relative_dir_override_resolves_from_project_root(monkeyp
     assert (tmp_path / "reports" / "relative.quality_report.json").exists()
 
 
-def test_quality_report_uses_asr_chunk_count_for_alignment_fallback_denominator(
+def test_quality_report_keeps_subtitle_timing_fallback_observation_without_warning(
     monkeypatch, tmp_path
 ):
     monkeypatch.setenv("QUALITY_REPORT_ENABLED", "1")
@@ -127,6 +127,7 @@ def test_quality_report_uses_asr_chunk_count_for_alignment_fallback_denominator(
     assert payload["alignment_fallback_count"] == 25
     assert payload["alignment_fallback_total"] == 100
     assert payload["alignment_fallback_ratio"] == 0.25
+    assert not any("alignment_fallback_ratio" in item for item in payload["warnings"])
 
 
 def test_load_global_glossary_pairs_reads_hashed_translation_glossary(tmp_path):
