@@ -49,7 +49,7 @@ from boundary.ja.backend import (
 )
 from boundary.ja.manifest import TrainingExample
 from boundary.ja.model import TinyFrameClassifier, load_feature_frame_scorer_checkpoint
-from tools.boundary.ja.evaluate_feature_scorer_thresholds import evaluate_thresholds
+from tools.boundary.ja.evaluate_feature_scorer_thresholds import _hysteresis_predictions, evaluate_thresholds
 
 
 def _require_mamba2():
@@ -288,6 +288,16 @@ def test_hysteresis_frames_rejects_inverted_thresholds():
         )
 
 
+def test_threshold_eval_hysteresis_predictions_match_runtime_semantics():
+    frames = _hysteresis_predictions(
+        np.asarray([0.10, 0.80, 0.60, 0.45, 0.55, 0.49, 0.71], dtype=np.float32),
+        on_threshold=0.70,
+        off_threshold=0.50,
+    )
+
+    assert frames.tolist() == [0, 1, 1, 0, 0, 0, 1]
+
+
 def test_feature_frame_scorer_checkpoint_round_trip(tmp_path):
     torch = pytest.importorskip("torch")
     model, model_config = _build_mamba2_scorer(ptm_dim=4, mfcc_dim=2)
@@ -465,14 +475,19 @@ def test_feature_frame_scorer_threshold_eval_writes_summary(tmp_path):
         output_dir=tmp_path / "eval",
         thresholds=[0.0, 1.0],
         device="cpu",
+        runtime_profiles=[(0.7, 0.5, 0.7)],
     )
 
     assert summary["rows"] == 1
     assert summary["schema"] == "speech_boundary_ja_mamba2_frame_boundary_scorer_threshold_eval_v3"
     assert len(summary["speech_metrics"]) == 2
     assert len(summary["cut_metrics"]) == 2
+    assert summary["runtime_profile_metrics"][0]["speech_on_threshold"] == pytest.approx(0.7)
+    assert summary["runtime_profile_metrics"][0]["speech_off_threshold"] == pytest.approx(0.5)
+    assert summary["runtime_profile_metrics"][0]["cut_threshold"] == pytest.approx(0.7)
     assert (tmp_path / "eval" / "threshold_eval_summary.json").exists()
     assert (tmp_path / "eval" / "threshold_metrics.jsonl").exists()
+    assert '"head": "runtime_profile"' in (tmp_path / "eval" / "threshold_metrics.jsonl").read_text(encoding="utf-8")
 
 
 def test_backend_scorer_is_opt_in_and_keeps_segment_contract(tmp_path, monkeypatch):
