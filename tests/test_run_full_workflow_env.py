@@ -57,8 +57,8 @@ def test_run_full_workflow_parse_args_uses_loaded_env(monkeypatch):
         "jaykwok/Qwen3-ASR-0.6B-JA-Anime-Galgame=64,"
         "jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame=32",
     )
-    boundary_mapping = "jaykwok/Qwen3-ASR-0.6B-JA-Anime-Galgame=src/boundary/checkpoints/boundary_refiner.pt"
-    cueqc_mapping = "jaykwok/Qwen3-ASR-0.6B-JA-Anime-Galgame=src/asr/checkpoints/cueqc_mamba_v3_fusion.pt"
+    boundary_mapping = "jaykwok/Qwen3-ASR-0.6B-JA-Anime-Galgame=src/boundary/checkpoints/boundary_refiner.jaykwok-Qwen3-ASR-0.6B-JA-Anime-Galgame.pt"
+    cueqc_mapping = "jaykwok/Qwen3-ASR-0.6B-JA-Anime-Galgame=src/asr/checkpoints/cueqc_mamba_v3_fusion.jaykwok-Qwen3-ASR-0.6B-JA-Anime-Galgame.pt"
     scorer_mapping = "jaykwok/Qwen3-ASR-0.6B-JA-Anime-Galgame=agents/temp/scorer.pt"
     monkeypatch.setenv("BOUNDARY_REFINER_MODEL_PATH_BY_REPO", boundary_mapping)
     monkeypatch.setenv("CUEQC_MODEL_PATH_BY_REPO", cueqc_mapping)
@@ -95,8 +95,8 @@ def test_run_full_workflow_context_carries_boundary_env(monkeypatch, tmp_path):
         "jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame=8"
     )
     monkeypatch.setenv("ASR_BATCH_SIZE_BY_REPO", batch_table)
-    boundary_mapping = "jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame=src/boundary/checkpoints/boundary_refiner.pt"
-    cueqc_mapping = "jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame=src/asr/checkpoints/cueqc_mamba_v3_fusion.pt"
+    boundary_mapping = "jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame=src/boundary/checkpoints/boundary_refiner.jaykwok-Qwen3-ASR-1.7B-JA-Anime-Galgame.pt"
+    cueqc_mapping = "jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame=src/asr/checkpoints/cueqc_mamba_v3_fusion.jaykwok-Qwen3-ASR-1.7B-JA-Anime-Galgame.pt"
     scorer_mapping = "jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame=agents/temp/scorer.pt"
     monkeypatch.setenv("BOUNDARY_REFINER_MODEL_PATH_BY_REPO", boundary_mapping)
     monkeypatch.setenv("CUEQC_MODEL_PATH_BY_REPO", cueqc_mapping)

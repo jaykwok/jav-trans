@@ -139,6 +139,10 @@ datas += [
         "src/boundary/checkpoints",
     ),
     (
+        str(_require_path("src/boundary/ja/checkpoints", "SpeechBoundary-JA scorer checkpoints")),
+        "src/boundary/ja/checkpoints",
+    ),
+    (
         str(NAGISA_PACKAGE_DIR / "data"),
         "nagisa/data",
     ),

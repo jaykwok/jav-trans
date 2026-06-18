@@ -8,7 +8,7 @@ from tools.web.smoke.common import default_run_dir, http_json, write_json
 
 DEFAULT_ASR_BACKEND = "jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame"
 DEFAULT_CUEQC_MODEL_BY_REPO = (
-    "jaykwok/Qwen3-ASR-0.6B-JA-Anime-Galgame=src/asr/checkpoints/cueqc_mamba_v3_fusion.pt"
+    "jaykwok/Qwen3-ASR-0.6B-JA-Anime-Galgame=src/asr/checkpoints/cueqc_mamba_v3_fusion.jaykwok-Qwen3-ASR-0.6B-JA-Anime-Galgame.pt"
 )
 
 

@@ -14,7 +14,8 @@ It bundles:
 - `ffmpeg.exe` and `ffprobe.exe` from `PATH`, or from `-FfmpegExe` / `-FfprobeExe`
 - `src/assets/images/icon.png` for the in-app header, drop zone image, and PNG favicon
 - `src/assets/images/icon.ico` for the pywebview native window icon and packaged executable icon
-- the small Mamba Boundary Refiner checkpoint at `src/boundary/checkpoints/boundary_refiner.pt`
+- the small Mamba Boundary Refiner checkpoint at `src/boundary/checkpoints/boundary_refiner.jaykwok-Qwen3-ASR-0.6B-JA-Anime-Galgame.pt`
+- the opt-in 0.6B SpeechBoundary-JA scorer checkpoint at `src/boundary/ja/checkpoints/speech_boundary_ja_feature_scorer.jaykwok-Qwen3-ASR-0.6B-JA-Anime-Galgame.pt`
 - the bundled Hugging Face inference model directories:
   - `jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame`
   - `jaykwok/Qwen3-ASR-0.6B-JA-Anime-Galgame`
@@ -60,7 +61,7 @@ expected to publish source code and release notes only.
 Training-only Boundary Refiner artifacts are deliberately excluded from release
 packages: CUDA feature caches, synthetic WAVs, sequence JSONL files, and
 `datasets/train/...` outputs are all regenerable research data. New users only
-need the bundled `boundary_refiner.pt` plus the bundled Hugging Face inference
-models above. Do not restore old `src/vad` checkpoint paths; if the Boundary
-Refiner checkpoint grows too large for source distribution, publish it as a
-GitHub Release or Hugging Face artifact instead.
+need the bundled repo-tagged Boundary Refiner checkpoint plus the bundled
+Hugging Face inference models above. Do not restore old `src/vad` checkpoint
+paths; if the Boundary Refiner checkpoint grows too large for source
+distribution, publish it as a GitHub Release or Hugging Face artifact instead.

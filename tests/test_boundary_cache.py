@@ -43,7 +43,7 @@ def _set_boundary_refiner_mapping(monkeypatch) -> None:
     monkeypatch.setenv("ASR_BACKEND", asr_backend)
     monkeypatch.setenv(
         "BOUNDARY_REFINER_MODEL_PATH_BY_REPO",
-        f"{asr_backend}=src/boundary/checkpoints/boundary_refiner.pt",
+        f"{asr_backend}=src/boundary/checkpoints/boundary_refiner.jaykwok-Qwen3-ASR-0.6B-JA-Anime-Galgame.pt",
     )
 
 

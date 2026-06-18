@@ -16,7 +16,7 @@ def _reload_pipeline(monkeypatch):
 def test_chunk_config_reads_boundary_refiner_env_at_runtime(monkeypatch):
     monkeypatch.setenv(
         "BOUNDARY_REFINER_MODEL_PATH_BY_REPO",
-        f"{ASR_06B_BACKEND}=src/boundary/checkpoints/boundary_refiner.pt",
+        f"{ASR_06B_BACKEND}=src/boundary/checkpoints/boundary_refiner.jaykwok-Qwen3-ASR-0.6B-JA-Anime-Galgame.pt",
     )
     monkeypatch.setenv("BOUNDARY_REFINER_DEVICE", "cuda")
     pipeline = _reload_pipeline(monkeypatch)
@@ -24,7 +24,7 @@ def test_chunk_config_reads_boundary_refiner_env_at_runtime(monkeypatch):
     cfg = pipeline._boundary_config()
 
     assert cfg["boundary_refiner_model_path"] == str(
-        Path("src/boundary/checkpoints/boundary_refiner.pt").resolve()
+        Path("src/boundary/checkpoints/boundary_refiner.jaykwok-Qwen3-ASR-0.6B-JA-Anime-Galgame.pt").resolve()
     )
     assert cfg["boundary_refiner_device"] == "cuda"
     assert "boundary_refiner_backbone" not in cfg
@@ -33,7 +33,7 @@ def test_chunk_config_reads_boundary_refiner_env_at_runtime(monkeypatch):
 def test_chunk_config_reads_boundary_planner_env_at_runtime(monkeypatch):
     monkeypatch.setenv(
         "BOUNDARY_REFINER_MODEL_PATH_BY_REPO",
-        f"{ASR_06B_BACKEND}=src/boundary/checkpoints/boundary_refiner.pt",
+        f"{ASR_06B_BACKEND}=src/boundary/checkpoints/boundary_refiner.jaykwok-Qwen3-ASR-0.6B-JA-Anime-Galgame.pt",
     )
     monkeypatch.setenv("BOUNDARY_FEATURE_FRAME_HOP_S", "0.04")
     monkeypatch.setenv("BOUNDARY_PLANNER_TARGET_CHUNK_S", "8.0")
@@ -57,7 +57,7 @@ def test_chunk_config_rejects_boundary_refiner_repo_metadata_mismatch(monkeypatc
     monkeypatch.setenv("ASR_BACKEND", ASR_17B_BACKEND)
     monkeypatch.setenv(
         "BOUNDARY_REFINER_MODEL_PATH_BY_REPO",
-        f"{ASR_17B_BACKEND}=src/boundary/checkpoints/boundary_refiner.pt",
+        f"{ASR_17B_BACKEND}=src/boundary/checkpoints/boundary_refiner.jaykwok-Qwen3-ASR-0.6B-JA-Anime-Galgame.pt",
     )
     from asr import pipeline
 
