@@ -553,6 +553,9 @@ def test_feature_frame_scorer_threshold_eval_can_diagnose_speech_errors(tmp_path
     assert diagnostic["overall"]["false_negative"] >= 1
     assert diagnostic["distance_buckets"]
     assert diagnostic["regions"]["near_boundary"]["frames"] >= 1
+    assert diagnostic["islands"]["label_islands"] == 1
+    assert 0.0 <= diagnostic["islands"]["speech_island_recall"] <= 1.0
+    assert diagnostic["islands"]["cut_drop_zone_clean_rate"] == pytest.approx(0.0)
     assert diagnostic["top_error_rows"][0]["audio_id"] == "clip"
     assert (tmp_path / "eval" / "speech_error_diagnostics.jsonl").exists()
 
