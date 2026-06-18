@@ -144,6 +144,9 @@ class _RecordingBackend:
             )
         return results
 
+    def capture_asr_internals(self, chunks):
+        return [{"ok": True} for _chunk in chunks]
+
     def finalize_text_results(self, text_results, on_stage=None):
         del on_stage
         self.finalized_payloads.extend(dict(result) for result in text_results)
@@ -221,13 +224,48 @@ class _FakeSequenceFeatureProvider:
         return {"schema": "speech_boundary_ja_sequence_feature_frames_v1", "type": "fake"}
 
 
-def _reload_pipeline(monkeypatch, tmp_path: Path):
+class _FakeCueQCRefiner:
+    def decide(self, candidates, *, asr_internals):
+        assert len(asr_internals) == len(candidates)
+        return [
+            {
+                "schema": "cueqc_shadow_v1",
+                "model_version": "cueqc_mamba_v3_fusion",
+                "decision_version": "cueqc_display_binary_v1",
+                "mode": "cueqc_mamba_v3_fusion",
+                "display_hint": "keep",
+                "cluster_id": "runtime-test",
+                "confidence": 0.99,
+                "display_prob_keep": 0.99,
+                "display_prob_drop": 0.01,
+                "drop_threshold": 0.85,
+                "threshold_profile": {"mode": "base"},
+                "reasons": ["cueqc_mamba_v3:keep:p_drop=0.010:threshold=0.850"],
+            }
+            for _candidate in candidates
+        ]
+
+
+def _reload_pipeline(monkeypatch, tmp_path: Path, *, enable_cueqc: bool = False):
+    asr_backend = "jaykwok/Qwen3-ASR-0.6B-JA-Anime-Galgame"
+    monkeypatch.setenv("ASR_BACKEND", asr_backend)
+    monkeypatch.setenv(
+        "BOUNDARY_REFINER_MODEL_PATH_BY_REPO",
+        f"{asr_backend}=src/boundary/checkpoints/boundary_refiner.pt",
+    )
     monkeypatch.setenv("BOUNDARY_FEATURE_FRAME_HOP_S", "0.02")
     monkeypatch.setenv("BOUNDARY_PLANNER_TARGET_CHUNK_S", "9.0")
     monkeypatch.setenv("BOUNDARY_PLANNER_MAX_CORE_CHUNK_S", "30.0")
     monkeypatch.setenv("ASR_CHUNK_ROOT", str(tmp_path / "chunks"))
     monkeypatch.setenv("ASR_CHECKPOINT_ENABLED", "0")
-    monkeypatch.setenv("CUEQC_MODEL_PATH", "")
+    monkeypatch.setenv("CUEQC_SHADOW_ENABLED", "1" if enable_cueqc else "0")
+    if enable_cueqc:
+        monkeypatch.setenv(
+            "CUEQC_MODEL_PATH_BY_REPO",
+            f"{asr_backend}=src/asr/checkpoints/cueqc_mamba_v3_fusion.pt",
+        )
+    else:
+        monkeypatch.delenv("CUEQC_MODEL_PATH_BY_REPO", raising=False)
 
     from asr import pipeline as asr
 
@@ -242,11 +280,13 @@ def _reload_pipeline(monkeypatch, tmp_path: Path):
         "_required_sequence_feature_provider_from_result",
         lambda *_args, **_kwargs: _FakeSequenceFeatureProvider(),
     )
+    if enable_cueqc:
+        monkeypatch.setattr(asr, "_cueqc_refiner_for", lambda _path, **_kwargs: _FakeCueQCRefiner())
     return asr
 
 
-def _run_transcription(monkeypatch, tmp_path: Path):
-    asr = _reload_pipeline(monkeypatch, tmp_path)
+def _run_transcription(monkeypatch, tmp_path: Path, *, enable_cueqc: bool = False):
+    asr = _reload_pipeline(monkeypatch, tmp_path, enable_cueqc=enable_cueqc)
     source = tmp_path / "source_boundary.wav"
     _write_wav(source, seconds=12.0)
 
@@ -484,11 +524,15 @@ def test_low_logprob_chunks_continue_without_legacy_adaptive_review(monkeypatch,
 
 
 def test_cueqc_shadow_records_without_skipping_subtitle_timing(monkeypatch, tmp_path):
-    backend, segments, log, details = _run_transcription(monkeypatch, tmp_path)
+    backend, segments, log, details = _run_transcription(
+        monkeypatch,
+        tmp_path,
+        enable_cueqc=True,
+    )
 
     assert backend.finalized_payloads
     assert len(backend.finalized_payloads) == len(backend.audio_paths)
-    assert details["cueqc_shadow"]["shadow_only"] is True
+    assert details["cueqc_shadow"]["shadow_only"] is False
     assert details["cueqc_shadow"]["candidate_count"] == len(backend.audio_paths)
     assert details["cueqc_shadow"]["counts"]["display_hint"] == {"keep": len(backend.audio_paths)}
     assert details["transcript_chunks"]

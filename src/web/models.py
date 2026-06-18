@@ -16,7 +16,7 @@ class JobSpec(BaseModel):
     asr_backend: Literal[
         "jaykwok/Qwen3-ASR-0.6B-JA-Anime-Galgame",
         "jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame",
-    ] = "jaykwok/Qwen3-ASR-0.6B-JA-Anime-Galgame"
+    ] = "jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame"
     subtitle_mode: Literal["zh", "bilingual"] = "zh"
     skip_translation: bool = False
     asr_context: str = Field(default="", max_length=4000)

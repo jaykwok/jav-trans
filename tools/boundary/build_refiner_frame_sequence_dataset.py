@@ -289,6 +289,7 @@ def _sequence_row(
             "labels_path": str(labels_path),
             "feature_manifest_path": str(feature_manifest_path),
             "feature_path": str(manifest_row.get("feature_path") or ""),
+            "ptm_repo_id": str(manifest_row.get("ptm") or ""),
             "frame_hop_s": float(manifest_row.get("frame_hop_s") or record.frame_hop_s),
             "frame_count": int(manifest_row.get("frame_count") or ptm.shape[0]),
             "ptm_dim": int(ptm.shape[1]),

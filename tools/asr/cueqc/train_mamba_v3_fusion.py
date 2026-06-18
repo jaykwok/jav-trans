@@ -34,6 +34,7 @@ if str(SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(SRC_ROOT))
 
 from asr.cueqc_model import CueQCMambaV3Fusion  # noqa: E402
+from asr.backends.qwen import qwen_asr_repo_tag  # noqa: E402
 
 CHECKPOINT_SCHEMA = "cueqc_mamba_checkpoint_v3_fusion"
 METRICS_SCHEMA = "cueqc_mamba_train_metrics_v3_fusion"
@@ -192,11 +193,27 @@ def evaluate(
     }
 
 
-def train(config: TrainConfig, *, features_path: Path, output_dir: Path) -> dict[str, Any]:
+def _checkpoint_name(feature_config: dict[str, Any], explicit: str = "") -> str:
+    if explicit.strip():
+        return explicit.strip()
+    asr_model_id = str(feature_config.get("asr_model_id") or "").strip()
+    return f"cueqc_mamba_v3_fusion.{qwen_asr_repo_tag(asr_model_id)}.pt"
+
+
+def train(
+    config: TrainConfig,
+    *,
+    features_path: Path,
+    output_dir: Path,
+    checkpoint_name: str = "",
+) -> dict[str, Any]:
     bundle = torch.load(features_path, map_location="cpu", weights_only=False)
     if bundle.get("schema") != "cueqc_mamba_v3_fusion_features":
         raise ValueError(f"unexpected feature schema: {bundle.get('schema')!r}")
     fcfg = bundle["feature_config"]
+    asr_model_id = str(fcfg.get("asr_model_id") or "").strip()
+    if not asr_model_id:
+        raise ValueError("CueQC feature_config.asr_model_id is required for repo-id checkpoint binding")
     samples = bundle["samples"]
     labels = bundle["labels"].tolist()
     meta = bundle["meta"]
@@ -341,7 +358,10 @@ def train(config: TrainConfig, *, features_path: Path, output_dir: Path) -> dict
 
     # ---- Checkpoint ----
     output_dir.mkdir(parents=True, exist_ok=True)
-    checkpoint_path = output_dir / "cueqc_mamba_v3_fusion.pt"
+    checkpoint_file_name = _checkpoint_name(fcfg, checkpoint_name)
+    if Path(checkpoint_file_name).name != checkpoint_file_name:
+        raise ValueError("--checkpoint-name must be a file name, not a path")
+    checkpoint_path = output_dir / checkpoint_file_name
     checkpoint = {
         "schema": CHECKPOINT_SCHEMA,
         "version": 3,
@@ -349,6 +369,8 @@ def train(config: TrainConfig, *, features_path: Path, output_dir: Path) -> dict
         "model_config": dict(model.model_config),
         "feature_config": {
             "feature_source": fcfg["feature_source"],
+            "asr_model_id": fcfg.get("asr_model_id", ""),
+            "asr_model_spec": fcfg.get("asr_model_spec", ""),
             "uses_bge": fcfg["uses_bge"],
             "text_embedding": fcfg["text_embedding"],
             "asr_dim": fcfg["asr_dim"],
@@ -358,6 +380,10 @@ def train(config: TrainConfig, *, features_path: Path, output_dir: Path) -> dict
             "token_feature_names": fcfg["token_feature_names"],
             "decoder_feature_names": fcfg["decoder_feature_names"],
             "structured_feature_names": fcfg["structured_feature_names"],
+        },
+        "metadata": {
+            "asr_repo_id": asr_model_id,
+            "asr_model_spec": str(fcfg.get("asr_model_spec") or ""),
         },
         "normalization": {
             "asr_mean": torch.from_numpy(asr_mean),
@@ -423,6 +449,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Train CueQC Mamba v3-Fusion.")
     p.add_argument("--features", required=True, help="cueqc_train_features_v3_fusion.pt")
     p.add_argument("--output-dir", required=True)
+    p.add_argument(
+        "--checkpoint-name",
+        default="",
+        help="Checkpoint file name. Default appends feature_config.asr_model_id repo id tag.",
+    )
     p.add_argument("--max-steps", type=int, default=500)
     p.add_argument("--batch-size", type=int, default=32)
     p.add_argument("--lr", dest="learning_rate", type=float, default=1e-3)
@@ -463,7 +494,12 @@ def main(argv: list[str] | None = None) -> int:
         "early_stop_patience",
     }
     config = TrainConfig(**{k: getattr(args, k) for k in fields})
-    train(config, features_path=Path(args.features), output_dir=Path(args.output_dir))
+    train(
+        config,
+        features_path=Path(args.features),
+        output_dir=Path(args.output_dir),
+        checkpoint_name=args.checkpoint_name,
+    )
     return 0
 
 

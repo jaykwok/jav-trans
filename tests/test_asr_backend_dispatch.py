@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import importlib
 
+import pytest
+
 from asr.backends.base import BaseAsrBackend
 from helpers import ASR_06B_BACKEND, ASR_17B_BACKEND
 
@@ -90,6 +92,86 @@ def test_qwen_asr_batch_size_auto_uses_repo_table(monkeypatch):
 
     assert qwen.qwen_asr_default_batch_size(ASR_06B_BACKEND) == 64
     assert qwen.qwen_asr_default_batch_size(ASR_17B_BACKEND) == 32
+
+
+def test_qwen_checkpoint_path_mapping_uses_repo_id_keys(monkeypatch, tmp_path):
+    from asr.backends import qwen
+
+    checkpoint_06b = tmp_path / "06b.pt"
+    checkpoint_17b = tmp_path / "17b.pt"
+    checkpoint_06b.write_bytes(b"06b")
+    checkpoint_17b.write_bytes(b"17b")
+    monkeypatch.setenv("ASR_BACKEND", ASR_17B_BACKEND)
+    monkeypatch.setenv(
+        "BOUNDARY_REFINER_MODEL_PATH_BY_REPO",
+        f"{ASR_06B_BACKEND}={checkpoint_06b},{ASR_17B_BACKEND}={checkpoint_17b}",
+    )
+
+    assert qwen.qwen_asr_repo_tag(ASR_17B_BACKEND) == "jaykwok-Qwen3-ASR-1.7B-JA-Anime-Galgame"
+    assert (
+        qwen.checkpoint_path_for_repo_env(
+            repo_id=ASR_17B_BACKEND,
+            mapping_env="BOUNDARY_REFINER_MODEL_PATH_BY_REPO",
+        )
+        == str(checkpoint_17b.resolve())
+    )
+
+
+def test_qwen_checkpoint_path_mapping_requires_env(monkeypatch):
+    from asr.backends import qwen
+
+    monkeypatch.delenv("BOUNDARY_REFINER_MODEL_PATH_BY_REPO", raising=False)
+
+    with pytest.raises(RuntimeError, match="BOUNDARY_REFINER_MODEL_PATH_BY_REPO is required"):
+        qwen.checkpoint_path_for_repo_env(
+            repo_id=ASR_17B_BACKEND,
+            mapping_env="BOUNDARY_REFINER_MODEL_PATH_BY_REPO",
+        )
+
+
+def test_qwen_checkpoint_path_mapping_requires_selected_repo(monkeypatch, tmp_path):
+    from asr.backends import qwen
+
+    checkpoint_06b = tmp_path / "06b.pt"
+    checkpoint_06b.write_bytes(b"06b")
+    monkeypatch.setenv(
+        "BOUNDARY_REFINER_MODEL_PATH_BY_REPO",
+        f"{ASR_06B_BACKEND}={checkpoint_06b}",
+    )
+
+    with pytest.raises(RuntimeError, match="has no checkpoint for ASR repo"):
+        qwen.checkpoint_path_for_repo_env(
+            repo_id=ASR_17B_BACKEND,
+            mapping_env="BOUNDARY_REFINER_MODEL_PATH_BY_REPO",
+        )
+
+
+def test_qwen_checkpoint_path_mapping_requires_existing_file(monkeypatch, tmp_path):
+    from asr.backends import qwen
+
+    missing = tmp_path / "missing.pt"
+    monkeypatch.setenv(
+        "BOUNDARY_REFINER_MODEL_PATH_BY_REPO",
+        f"{ASR_17B_BACKEND}={missing}",
+    )
+
+    with pytest.raises(FileNotFoundError, match="does not exist"):
+        qwen.checkpoint_path_for_repo_env(
+            repo_id=ASR_17B_BACKEND,
+            mapping_env="BOUNDARY_REFINER_MODEL_PATH_BY_REPO",
+        )
+
+
+def test_qwen_checkpoint_path_mapping_rejects_malformed_env(monkeypatch):
+    from asr.backends import qwen
+
+    monkeypatch.setenv("BOUNDARY_REFINER_MODEL_PATH_BY_REPO", "not-a-mapping-entry")
+
+    with pytest.raises(RuntimeError, match="is malformed"):
+        qwen.checkpoint_path_for_repo_env(
+            repo_id=ASR_17B_BACKEND,
+            mapping_env="BOUNDARY_REFINER_MODEL_PATH_BY_REPO",
+        )
 
 
 def test_local_backend_asr_batch_size_auto_and_numeric_override(monkeypatch):

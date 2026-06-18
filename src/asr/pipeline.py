@@ -15,7 +15,6 @@ from boundary.sequence_features import (
     FrameSequenceFeatureProvider,
 )
 from boundary.refiner import (
-    DEFAULT_REFINER_CHECKPOINT_PATH,
     file_sha1 as _boundary_refiner_file_sha1,
     load_frame_sequence_refiner_checkpoint,
 )
@@ -23,6 +22,7 @@ from asr import checkpoint as _checkpoint_module
 from asr import chunking as _chunking_module
 from asr import cueqc as _cueqc_module
 from asr import transcribe as _transcribe_module
+from asr.backends.qwen import checkpoint_path_for_repo_env, validate_checkpoint_repo_id
 from asr.backends import registry as _registry_module
 
 warnings.filterwarnings("ignore")
@@ -56,7 +56,7 @@ CUEQC_MODEL_VERSION = _cueqc_module.CUEQC_MODEL_VERSION
 _CUEQC_REFINER_CACHE: dict[str, object] = {}
 
 
-def _cueqc_refiner_for(path: str):
+def _cueqc_refiner_for(path: str, *, expected_asr_repo_id: str | None = None):
     """Lazily load + cache the CueQC v3-Fusion refiner for ``path``."""
     if not path:
         return None
@@ -67,12 +67,15 @@ def _cueqc_refiner_for(path: str):
         from asr.cueqc_refiner import load_cueqc_mamba_checkpoint
 
         device = os.getenv("CUEQC_DEVICE", "auto").strip() or "auto"
-        refiner = load_cueqc_mamba_checkpoint(path, device=device)
+        refiner = load_cueqc_mamba_checkpoint(
+            path,
+            device=device,
+            expected_asr_repo_id=expected_asr_repo_id,
+        )
         _CUEQC_REFINER_CACHE[path] = refiner
         return refiner
-    except Exception as exc:  # noqa: BLE001 - keep the pipeline running
-        print(f"CueQC v3-Fusion: failed to load model {path}: {exc!r}")
-        return None
+    except Exception as exc:  # noqa: BLE001 - surface checkpoint/config errors clearly
+        raise RuntimeError(f"CueQC v3-Fusion checkpoint load failed for {path}: {exc!r}") from exc
 
 def _env_bool(name: str, default: str) -> bool:
     return os.getenv(name, default).strip().lower() in {"1", "true", "yes", "on"}
@@ -87,9 +90,9 @@ def _env_int(name: str, default: str) -> int:
 
 
 def _boundary_config() -> dict:
-    refiner_path = (
-        os.getenv("BOUNDARY_REFINER_MODEL_PATH", str(DEFAULT_REFINER_CHECKPOINT_PATH)).strip()
-        or str(DEFAULT_REFINER_CHECKPOINT_PATH)
+    refiner_path = checkpoint_path_for_repo_env(
+        repo_id=ASR_BACKEND,
+        mapping_env="BOUNDARY_REFINER_MODEL_PATH_BY_REPO",
     )
     refiner_path_obj = Path(refiner_path).expanduser() if refiner_path else None
     runtime_adapter = _boundary_refiner_runtime_adapter(refiner_path_obj)
@@ -123,8 +126,8 @@ def _boundary_config() -> dict:
 def _boundary_refiner_runtime_adapter(path: Path | None) -> str:
     if path is None or not path.exists():
         raise FileNotFoundError(
-            "Boundary Refiner checkpoint is required: set BOUNDARY_REFINER_MODEL_PATH "
-            "to a frame_sequence_v1 checkpoint"
+            "Boundary Refiner checkpoint is required: set BOUNDARY_REFINER_MODEL_PATH_BY_REPO "
+            "with an entry for the selected ASR repo id"
         )
     import torch
 
@@ -133,6 +136,12 @@ def _boundary_refiner_runtime_adapter(path: Path | None) -> str:
         raise ValueError("Boundary refiner checkpoint must be a dict")
     metadata = payload.get("metadata")
     if isinstance(metadata, dict):
+        validate_checkpoint_repo_id(
+            metadata.get("ptm_repo_id"),
+            ASR_BACKEND,
+            checkpoint_kind="Boundary Refiner",
+            metadata_key="metadata.ptm_repo_id",
+        )
         adapter = str(metadata.get("runtime_adapter") or "").strip()
         if adapter == "frame_sequence_v1":
             return adapter
@@ -404,6 +413,7 @@ def _build_processing_spans(
     sequence_boundary_refiner = load_frame_sequence_refiner_checkpoint(
         Path(cfg["boundary_refiner_model_path"]),
         device=cfg["boundary_refiner_device"],
+        expected_ptm_repo_id=ASR_BACKEND,
     )
     sequence_feature_provider = _required_sequence_feature_provider_from_result(
         sequence_feature_frames,
@@ -713,13 +723,14 @@ def _apply_cueqc_v3_model(
 
     Captures ASR internals via ``backend.capture_asr_internals()`` which works in
     both inline and subprocess worker modes (the capture runs where the model is
-    loaded). Returns one decision dict per candidate (model or fallback-keep),
-    or None if capture is unavailable (caller keeps fallback-keep decisions).
+    loaded). Returns one decision dict per candidate. Per-candidate capture or
+    inference failures are handled inside the refiner, but model-level capture
+    unavailability is fatal to the job.
     """
     if not candidates:
         return []
     if backend is None or not hasattr(backend, "capture_asr_internals"):
-        log.append("CueQC v3-Fusion: backend has no capture_asr_internals, fallback keep retained")
+        log.append("CueQC v3-Fusion: backend has no capture_asr_internals; cannot continue")
         return None
     capture_chunks = []
     for cand in candidates:
@@ -733,10 +744,10 @@ def _apply_cueqc_v3_model(
     try:
         asr_internals = backend.capture_asr_internals(capture_chunks)
     except Exception as exc:  # noqa: BLE001
-        log.append(f"CueQC v3-Fusion: capture failed ({exc!r}), fallback keep retained")
+        log.append(f"CueQC v3-Fusion: capture failed ({exc!r}); cannot continue")
         return None
     if not isinstance(asr_internals, list) or len(asr_internals) != len(candidates):
-        log.append("CueQC v3-Fusion: capture count mismatch, fallback keep retained")
+        log.append("CueQC v3-Fusion: capture count mismatch; cannot continue")
         return None
     capture_failed = [
         str(item.get("error") or item.get("detail") or "")
@@ -828,23 +839,24 @@ def _run_cueqc_shadow(
             report["candidates"] = candidates
         _write_cueqc_candidates_if_requested(candidates, log=log)
 
-        # v3-Fusion model override: when a checkpoint is present, replace the
-        # conservative fallback-keep decisions with model decisions.
-        model_path = os.getenv("CUEQC_MODEL_PATH", "").strip()
-        refiner = _cueqc_refiner_for(model_path) if model_path else None
+        # v3-Fusion is required when CueQC is enabled; checkpoint mapping/load
+        # failures should stop the job instead of falling back to old rules.
+        model_path = checkpoint_path_for_repo_env(
+            repo_id=ASR_BACKEND,
+            mapping_env="CUEQC_MODEL_PATH_BY_REPO",
+        )
+        refiner = _cueqc_refiner_for(model_path, expected_asr_repo_id=ASR_BACKEND) if model_path else None
         if refiner is not None:
-            try:
-                model_decisions = _apply_cueqc_v3_model(
-                    refiner=refiner,
-                    candidates=candidates,
-                    backend=backend,
-                    audio_path=audio_path,
-                    log=log,
-                )
-                if model_decisions is not None:
-                    report = _merge_cueqc_v3_decisions(report, candidates, model_decisions)
-            except Exception as exc:  # noqa: BLE001 - model errors fall back to keep
-                log.append(f"CueQC v3-Fusion: model inference failed, using fallback keep ({exc!r})")
+            model_decisions = _apply_cueqc_v3_model(
+                refiner=refiner,
+                candidates=candidates,
+                backend=backend,
+                audio_path=audio_path,
+                log=log,
+            )
+            if model_decisions is None:
+                raise RuntimeError("CueQC v3-Fusion produced no model decisions")
+            report = _merge_cueqc_v3_decisions(report, candidates, model_decisions)
 
         decision_by_chunk = {
             int(item["chunk_index"]): {
@@ -880,14 +892,9 @@ def _run_cueqc_shadow(
         )
         return report, decision_by_chunk
     except Exception as exc:
-        log.append(
-            f"CueQC shadow: failed conservatively, all chunks continue subtitle timing ({exc!r})"
-        )
-        return {
-            **_empty_cueqc_shadow_report(),
-            "error": repr(exc),
-            "candidate_count": 0,
-        }, {}
+        message = f"CueQC v3-Fusion failed; job cannot continue ({exc!r})"
+        log.append(message)
+        raise RuntimeError(message) from exc
 
 
 def _segment_alignment_outcome(segment: dict, outcomes: dict[int, dict]) -> dict:

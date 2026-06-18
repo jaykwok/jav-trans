@@ -23,7 +23,7 @@ from web.models import JobSpec, SettingsRead, SettingsUpdate
 router = APIRouter()
 
 BACKENDS = list(get_args(JobSpec.model_fields["asr_backend"].annotation))
-RECOMMENDED_ASR_BACKEND = "jaykwok/Qwen3-ASR-0.6B-JA-Anime-Galgame"
+RECOMMENDED_ASR_BACKEND = "jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame"
 SUBTITLE_MODES = list(get_args(JobSpec.model_fields["subtitle_mode"].annotation))
 DEFAULT_JOB_DEFAULTS = {
     name: field.default

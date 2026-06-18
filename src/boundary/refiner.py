@@ -7,6 +7,7 @@ from typing import Protocol
 
 import torch
 
+from asr.backends.qwen import validate_checkpoint_repo_id
 from boundary.backbones import (
     TRANSFORMERS_MAMBA2_BACKBONE,
     BoundarySequenceClassifier,
@@ -159,6 +160,7 @@ def load_learned_refiner_checkpoint(
     *,
     backbone_override: str | None = None,
     device: str = "auto",
+    expected_ptm_repo_id: str | None = None,
 ) -> LearnedBoundaryRefiner:
     checkpoint_path = Path(checkpoint_path)
     payload = torch.load(checkpoint_path, map_location="cpu")
@@ -197,6 +199,13 @@ def load_learned_refiner_checkpoint(
     metadata = payload.get("metadata")
     metadata_dict = metadata if isinstance(metadata, dict) else {}
     _validate_top_level_feature_metadata(payload, metadata_dict)
+    if expected_ptm_repo_id is not None:
+        validate_checkpoint_repo_id(
+            metadata_dict.get("ptm_repo_id"),
+            expected_ptm_repo_id,
+            checkpoint_kind="Boundary Refiner",
+            metadata_key="metadata.ptm_repo_id",
+        )
     return LearnedBoundaryRefiner(
         model=model,
         checkpoint_path=checkpoint_path,
@@ -214,12 +223,14 @@ def load_frame_sequence_refiner_checkpoint(
     *,
     backbone_override: str | None = None,
     device: str = "auto",
+    expected_ptm_repo_id: str | None = None,
 ) -> FrameSequenceBoundaryRefiner:
     return FrameSequenceBoundaryRefiner(
         load_learned_refiner_checkpoint(
             checkpoint_path,
             backbone_override=backbone_override,
             device=device,
+            expected_ptm_repo_id=expected_ptm_repo_id,
         )
     )
 

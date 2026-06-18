@@ -6,8 +6,10 @@ from pathlib import Path
 from tools.web.smoke.common import default_run_dir, http_json, write_json
 
 
-DEFAULT_ASR_BACKEND = "jaykwok/Qwen3-ASR-0.6B-JA-Anime-Galgame"
-DEFAULT_CUEQC_MODEL = "src/asr/checkpoints/cueqc_mamba_v3_fusion.pt"
+DEFAULT_ASR_BACKEND = "jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame"
+DEFAULT_CUEQC_MODEL_BY_REPO = (
+    "jaykwok/Qwen3-ASR-0.6B-JA-Anime-Galgame=src/asr/checkpoints/cueqc_mamba_v3_fusion.pt"
+)
 
 
 def _parse_advanced(values: list[str]) -> dict[str, str]:
@@ -35,15 +37,25 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--translate", action="store_true", help="Run translation. Default is no-translation smoke.")
     parser.add_argument("--keep-quality-report", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--keep-temp-files", action=argparse.BooleanOptionalAction, default=True)
-    parser.add_argument("--cueqc-model-path", default=DEFAULT_CUEQC_MODEL)
+    parser.add_argument("--cueqc-model-path-by-repo", default=DEFAULT_CUEQC_MODEL_BY_REPO)
+    parser.add_argument(
+        "--speech-boundary-scorer-checkpoint-by-repo",
+        default="",
+        help="Optional repo-id scorer map. Empty uses bootstrap SpeechBoundary-JA scores.",
+    )
     parser.add_argument("--cueqc-inference-batch-size", default="64")
     parser.add_argument("--disable-cueqc-drop", action="store_true")
     parser.add_argument("--advanced", action="append", default=[], help="Extra advanced env override, KEY=VALUE.")
     args = parser.parse_args(argv)
 
     advanced = _parse_advanced(args.advanced)
-    if args.cueqc_model_path:
-        advanced.setdefault("CUEQC_MODEL_PATH", args.cueqc_model_path)
+    if args.cueqc_model_path_by_repo:
+        advanced.setdefault("CUEQC_MODEL_PATH_BY_REPO", args.cueqc_model_path_by_repo)
+    if args.speech_boundary_scorer_checkpoint_by_repo:
+        advanced.setdefault(
+            "SPEECH_BOUNDARY_JA_SCORER_CHECKPOINT_BY_REPO",
+            args.speech_boundary_scorer_checkpoint_by_repo,
+        )
     advanced.setdefault("CUEQC_DROP_APPLY_ENABLED", "0" if args.disable_cueqc_drop else "1")
     if args.cueqc_inference_batch_size:
         advanced.setdefault("CUEQC_INFERENCE_BATCH_SIZE", str(args.cueqc_inference_batch_size))

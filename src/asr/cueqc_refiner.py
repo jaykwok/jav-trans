@@ -6,8 +6,9 @@ dict consumed by ``pipeline._run_cueqc_shadow``.
 
 The refiner never loads its own Qwen3-ASR — at runtime the caller passes an
 ``AsrInternalsCapturer`` that wraps the already-loaded ``LocalAsrBackend.model``
-(see v3-Fusion §5.2: no second ASR model in VRAM). All failures fall back to
-``keep`` (v3-Fusion §2.4).
+(see v3-Fusion §5.2: no second ASR model in VRAM). Per-candidate capture,
+feature, or inference failures fall back to ``keep``; model-level mapping/load
+failures are handled by the pipeline as hard job failures.
 """
 from __future__ import annotations
 
@@ -16,6 +17,8 @@ from typing import Any, Sequence
 
 import numpy as np
 import os
+
+from asr.backends.qwen import validate_checkpoint_repo_id
 
 CUEQC_MAMBA_CHECKPOINT_SCHEMA = "cueqc_mamba_checkpoint_v3_fusion"
 MODE_TAG = "cueqc_mamba_v3_fusion"
@@ -69,7 +72,14 @@ def _fallback_keep(
 class CueQCRefinerV3Fusion:
     """Runtime wrapper around a trained CueQC Mamba v3-Fusion checkpoint."""
 
-    def __init__(self, *, checkpoint: dict[str, Any], path: Path, device: str = "auto") -> None:
+    def __init__(
+        self,
+        *,
+        checkpoint: dict[str, Any],
+        path: Path,
+        device: str = "auto",
+        expected_asr_repo_id: str | None = None,
+    ) -> None:
         import torch
 
         schema = str(checkpoint.get("schema") or "")
@@ -105,6 +115,22 @@ class CueQCRefinerV3Fusion:
             or "cueqc_display_binary_v1"
         )
         self.feature_config = dict(checkpoint.get("feature_config") or {})
+        metadata = dict(checkpoint.get("metadata") or {})
+        self.metadata = metadata
+        metadata_repo = str(metadata.get("asr_repo_id") or "").strip()
+        feature_repo = str(self.feature_config.get("asr_model_id") or "").strip()
+        if feature_repo and metadata_repo and feature_repo != metadata_repo:
+            raise ValueError(
+                "CueQC checkpoint metadata.asr_repo_id does not match "
+                "feature_config.asr_model_id"
+            )
+        if expected_asr_repo_id is not None:
+            validate_checkpoint_repo_id(
+                metadata_repo,
+                expected_asr_repo_id,
+                checkpoint_kind="CueQC",
+                metadata_key="metadata.asr_repo_id",
+            )
 
         norm = checkpoint.get("normalization") or {}
         self.asr_mean = np.asarray(norm.get("asr_mean", []), dtype=np.float32)
@@ -131,6 +157,7 @@ class CueQCRefinerV3Fusion:
             "decision_version": self.decision_version,
             "drop_threshold": self.drop_threshold,
             "drop_threshold_profile": self.drop_threshold_profile,
+            "metadata": self.metadata,
             "feature_config": self.feature_config,
         }
 
@@ -364,11 +391,21 @@ class CueQCRefinerV3Fusion:
         return decisions
 
 
-def load_cueqc_mamba_checkpoint(path: str | Path, *, device: str = "auto") -> CueQCRefinerV3Fusion:
+def load_cueqc_mamba_checkpoint(
+    path: str | Path,
+    *,
+    device: str = "auto",
+    expected_asr_repo_id: str | None = None,
+) -> CueQCRefinerV3Fusion:
     import torch
 
     p = Path(path)
     if not p.exists():
         raise FileNotFoundError(f"CueQC checkpoint not found: {p}")
     checkpoint = torch.load(p, map_location="cpu", weights_only=False)
-    return CueQCRefinerV3Fusion(checkpoint=checkpoint, path=p, device=device)
+    return CueQCRefinerV3Fusion(
+        checkpoint=checkpoint,
+        path=p,
+        device=device,
+        expected_asr_repo_id=expected_asr_repo_id,
+    )

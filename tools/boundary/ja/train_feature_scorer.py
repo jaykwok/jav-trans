@@ -13,6 +13,7 @@ SRC_ROOT = PROJECT_ROOT / "src"
 if str(SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(SRC_ROOT))
 
+from asr.backends.qwen import qwen_asr_repo_tag  # noqa: E402
 from boundary.ja import (  # noqa: E402
     FeatureScorerTrainConfig,
     load_label_records,
@@ -31,6 +32,15 @@ def _read_jsonl(path: Path) -> list[dict[str, Any]]:
                 raise ValueError(f"feature manifest row must be an object: {path}:{line_number}")
             rows.append(dict(row))
     return rows
+
+
+def _checkpoint_name(rows: list[dict[str, Any]], explicit: str = "") -> str:
+    if explicit.strip():
+        return explicit.strip()
+    ptm = str(rows[0].get("ptm") or "").strip() if rows else ""
+    if not ptm:
+        return "speech_boundary_ja_feature_scorer.pt"
+    return f"speech_boundary_ja_feature_scorer.{qwen_asr_repo_tag(ptm)}.pt"
 
 
 def run(args: argparse.Namespace) -> None:
@@ -70,6 +80,7 @@ def run(args: argparse.Namespace) -> None:
         ),
         labels_path=str(labels_path),
         feature_manifest_path=str(feature_manifest_path),
+        checkpoint_name=_checkpoint_name(rows, args.checkpoint_name),
     )
     summary_path = output_dir / "summary.json"
     summary_path.write_text(
@@ -81,8 +92,8 @@ def run(args: argparse.Namespace) -> None:
                 "metrics": asdict(metrics),
                 "runtime_status": {
                     "default_replaced": False,
-                    "opt_in_env": "SPEECH_BOUNDARY_JA_SCORER_CHECKPOINT",
-                    "note": "Candidate scorer is runtime-loadable only when explicitly enabled.",
+                    "opt_in_env": "SPEECH_BOUNDARY_JA_SCORER_CHECKPOINT_BY_REPO",
+                    "note": "Candidate scorer is runtime-loadable only through an explicit repo-id map.",
                 },
             },
             ensure_ascii=False,
@@ -104,6 +115,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--labels", required=True, help="SpeechBoundary-JA label JSONL.")
     parser.add_argument("--feature-manifest", required=True, help="Feature cache manifest JSONL.")
     parser.add_argument("--output-dir", required=True, help="Output directory for checkpoint and metrics.")
+    parser.add_argument(
+        "--checkpoint-name",
+        default="",
+        help="Checkpoint file name. Default appends the feature manifest PTM repo id tag.",
+    )
     parser.add_argument("--max-steps", type=int, default=1000)
     parser.add_argument("--learning-rate", type=float, default=2e-4)
     parser.add_argument("--seed", type=int, default=13)

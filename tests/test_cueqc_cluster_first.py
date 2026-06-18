@@ -236,7 +236,11 @@ def test_cueqc_torque_outputs_stable_audit_files(tmp_path: Path):
 
 
 def test_cueqc_runtime_signature_is_v3_binary_routing(monkeypatch):
-    monkeypatch.setenv("CUEQC_MODEL_PATH", "src/asr/checkpoints/cueqc_mamba_v3_fusion.pt")
+    monkeypatch.setenv("ASR_BACKEND", "jaykwok/Qwen3-ASR-0.6B-JA-Anime-Galgame")
+    monkeypatch.setenv(
+        "CUEQC_MODEL_PATH_BY_REPO",
+        "jaykwok/Qwen3-ASR-0.6B-JA-Anime-Galgame=src/asr/checkpoints/cueqc_mamba_v3_fusion.pt",
+    )
     monkeypatch.setenv("CUEQC_DROP_APPLY_ENABLED", "1")
 
     sig = cueqc.runtime_signature()
@@ -244,7 +248,6 @@ def test_cueqc_runtime_signature_is_v3_binary_routing(monkeypatch):
     assert sig["policy"] == "cueqc_mamba_v3_fusion"
     assert sig["model_version"] == "cueqc_mamba_v3_fusion"
     assert sig["decision_version"] == "cueqc_display_binary_v1"
-    assert sig["fallback_policy"] == "keep"
     assert sig["drop_apply_enabled"] is True
     assert set(sig) == {
         "schema_version",
@@ -258,7 +261,6 @@ def test_cueqc_runtime_signature_is_v3_binary_routing(monkeypatch):
         "checkpoint_sha1",
         "drop_threshold",
         "drop_apply_enabled",
-        "fallback_policy",
         "shadow_embed_candidates",
     }
 
@@ -349,12 +351,12 @@ def test_cueqc_training_compile_cluster_labels_only_keep_drop():
     assert summary["target_labels"]["display_decision"] == ["drop", "keep"]
 
 
-def test_cueqc_fallback_keep_is_conservative_for_stable_dialogue():
+def test_cueqc_shadow_report_uses_pending_placeholder_before_model_decision():
     row = _candidate(9, "今日はいい天気ですね")
 
-    decision = cueqc.fallback_keep_decision(row)
+    decision = cueqc.pending_model_decision(row)
 
-    assert decision["mode"] == "fallback_keep"
+    assert decision["mode"] == "pending_cueqc_model"
     assert decision["display_hint"] == "keep"
     assert decision["confidence"] == 1.0
-    assert decision["fallback_stage"] == "model_unavailable"
+    assert decision["fallback_stage"] == ""

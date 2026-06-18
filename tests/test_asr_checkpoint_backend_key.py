@@ -14,6 +14,7 @@ def _checkpoint_name(
     monkeypatch.setenv("ASR_BACKEND", asr_backend)
     monkeypatch.setenv("ASR_WORKER_MODE", "inproc")
     monkeypatch.setenv("ASR_CONTEXT", asr_context)
+    monkeypatch.setenv("CUEQC_SHADOW_ENABLED", "0")
 
     from asr import pipeline as asr
     asr = importlib.reload(asr)

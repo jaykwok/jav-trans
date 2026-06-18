@@ -36,7 +36,7 @@ DEFAULT_SETTINGS: dict[str, str] = {
 
     # --- ASR Model Settings ---
     # Transcription backend. Use the Hugging Face repo id as the stable key.
-    "ASR_BACKEND": "jaykwok/Qwen3-ASR-0.6B-JA-Anime-Galgame",
+    "ASR_BACKEND": "jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame",
     # Character cap for sliding ASR context prompt before tokenizer-level budgeting.
     "ASR_INITIAL_PROMPT_MAX_CHARS": "240",
     # Max prompt tokens kept before generation budgeting.
@@ -68,11 +68,11 @@ DEFAULT_SETTINGS: dict[str, str] = {
 
     # --- Batch Size & Limits ---
     # ASR inference batch size. auto resolves by ASR_BACKEND repo id.
-    # Defaults target 6GB-class NVIDIA GPUs; local 8GB runs can raise these.
+    # Defaults target low-config 0.6B fallback and 6GB-class 1.7B runs.
     "ASR_BATCH_SIZE": "auto",
     "ASR_BATCH_SIZE_BY_REPO": (
-        "jaykwok/Qwen3-ASR-0.6B-JA-Anime-Galgame=64,"
-        "jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame=32"
+        "jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame=32,"
+        "jaykwok/Qwen3-ASR-0.6B-JA-Anime-Galgame=64"
     ),
     # Max generated tokens per ASR chunk.
     "ASR_MAX_NEW_TOKENS": "128",
@@ -91,7 +91,9 @@ DEFAULT_SETTINGS: dict[str, str] = {
     # Boundary Refiner is the current pre-ASR chunk planning path.
     # This is a feature-score grid fallback, not the source video frame rate.
     "BOUNDARY_FEATURE_FRAME_HOP_S": "0.02",
-    "BOUNDARY_REFINER_MODEL_PATH": "src/boundary/checkpoints/boundary_refiner.pt",
+    "BOUNDARY_REFINER_MODEL_PATH_BY_REPO": (
+        "jaykwok/Qwen3-ASR-0.6B-JA-Anime-Galgame=src/boundary/checkpoints/boundary_refiner.pt"
+    ),
     "BOUNDARY_REFINER_DEVICE": "auto",
     "BOUNDARY_FRAME_SEQUENCE_LEFT_CONTEXT_S": "0.60",
     "BOUNDARY_FRAME_SEQUENCE_RIGHT_CONTEXT_S": "0.60",
@@ -106,6 +108,9 @@ DEFAULT_SETTINGS: dict[str, str] = {
     # 1 stores SpeechBoundary frame scores in the SpeechBoundary result. Boundary Refiner enables
     # this at runtime even when this explicit diagnostics flag stays off.
     "SPEECH_BOUNDARY_JA_EXPORT_FRAME_SCORES": "0",
+    # Optional learned SpeechBoundary-JA Mamba2 scorer map. Empty uses bootstrap frame scores.
+    "SPEECH_BOUNDARY_JA_SCORER_CHECKPOINT_BY_REPO": "",
+    "SPEECH_BOUNDARY_JA_SCORER_DEVICE": "auto",
     # Frame-score mask dilation before raw SpeechBoundary segment extraction. This is not ASR padding.
     "SPEECH_BOUNDARY_JA_FRAME_DILATION_S": "0.2",
     # 1 caches SpeechBoundary frame score -> Boundary Planner outputs separately from ASR generation settings.
@@ -124,10 +129,11 @@ DEFAULT_SETTINGS: dict[str, str] = {
     # stats + structured metadata -> display keep/drop. Legacy rule QC removed.
     "CUEQC_DECISION_VERSION": "cueqc_display_binary_v1",
     "CUEQC_MODEL_VERSION": "cueqc_mamba_v3_fusion",
-    "CUEQC_MODEL_PATH": "src/asr/checkpoints/cueqc_mamba_v3_fusion.pt",
+    "CUEQC_MODEL_PATH_BY_REPO": (
+        "jaykwok/Qwen3-ASR-0.6B-JA-Anime-Galgame=src/asr/checkpoints/cueqc_mamba_v3_fusion.pt"
+    ),
     # Base drop threshold. Checkpoints may raise it per risk bucket.
     "CUEQC_DROP_THRESHOLD": "0.85",
-    "CUEQC_FALLBACK_POLICY": "keep",
     # 1 = actually remove model-confirmed drop candidates before subtitle timing;
     # 0 = record shadow only (audit), keep all candidates.
     "CUEQC_DROP_APPLY_ENABLED": "1",

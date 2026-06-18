@@ -943,7 +943,7 @@ def evaluate_thresholds(
         },
         "runtime_status": {
             "default_replaced": False,
-            "opt_in_env": "SPEECH_BOUNDARY_JA_SCORER_CHECKPOINT",
+            "opt_in_env": "SPEECH_BOUNDARY_JA_SCORER_CHECKPOINT_BY_REPO",
             "note": "Threshold eval is offline. Do not promote without full workflow smoke and human audit.",
         },
     }

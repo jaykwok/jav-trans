@@ -150,14 +150,14 @@ datas += [
 
 if not _env_bool("JAVTRANS_SKIP_MODELS"):
     datas += _collect_inference_model_dir(
-        "models/jaykwok-Qwen3-ASR-0.6B-JA-Anime-Galgame",
-        "models/jaykwok-Qwen3-ASR-0.6B-JA-Anime-Galgame",
-        "bundled 0.6B ASR / SpeechBoundary model",
+        "models/jaykwok-Qwen3-ASR-1.7B-JA-Anime-Galgame",
+        "models/jaykwok-Qwen3-ASR-1.7B-JA-Anime-Galgame",
+        "bundled default 1.7B ASR / SpeechBoundary model",
     )
     datas += _collect_inference_model_dir(
-        "models/jaykwok-Qwen3-ASR-1.7B-JA-Anime-Galgame",
-        "models/jaykwok-Qwen3-ASR-1.7B-JA-Anime-Galgame",
-        "bundled 1.7B ASR model",
+        "models/jaykwok-Qwen3-ASR-0.6B-JA-Anime-Galgame",
+        "models/jaykwok-Qwen3-ASR-0.6B-JA-Anime-Galgame",
+        "bundled low-config 0.6B ASR / SpeechBoundary model",
     )
 
 binaries = _ffmpeg_binaries()

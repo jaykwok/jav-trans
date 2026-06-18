@@ -50,7 +50,13 @@ def _sequence_feature_metadata(feature_names: list[str]) -> dict:
     }
 
 
-def _write_v5_dataset(path: Path, *, rows: int = 4, items_per_row: int = 2) -> Path:
+def _write_v5_dataset(
+    path: Path,
+    *,
+    rows: int = 4,
+    items_per_row: int = 2,
+    include_ptm_repo_id: bool = True,
+) -> Path:
     feature_names = _feature_names()
     payloads = []
     for row_index in range(rows):
@@ -74,17 +80,20 @@ def _write_v5_dataset(path: Path, *, rows: int = 4, items_per_row: int = 2) -> P
             )
             targets.append([0.02 * (item_index + 1), -0.03 * (row_index + 1)])
             weights.append([1.0, 0.6])
-        payloads.append(
-            {
-                "schema": "boundary_refiner_frame_sequence_dataset_v5",
-                "audio_id": f"seq-{row_index}",
-                "feature_names": feature_names,
-                "sequence_features": sequence,
-                "sequence_boundary_delta_targets": targets,
-                "sequence_boundary_delta_weights": weights,
-                **_sequence_feature_metadata(feature_names),
+        payload = {
+            "schema": "boundary_refiner_frame_sequence_dataset_v5",
+            "audio_id": f"seq-{row_index}",
+            "feature_names": feature_names,
+            "sequence_features": sequence,
+            "sequence_boundary_delta_targets": targets,
+            "sequence_boundary_delta_weights": weights,
+            **_sequence_feature_metadata(feature_names),
+        }
+        if include_ptm_repo_id:
+            payload["metadata"] = {
+                "ptm_repo_id": "jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame",
             }
-        )
+        payloads.append(payload)
     path.write_text(
         "\n".join(json.dumps(row, ensure_ascii=False, sort_keys=True) for row in payloads) + "\n",
         encoding="utf-8",
@@ -135,6 +144,26 @@ def test_train_refiner_accepts_v5_delta_dataset(tmp_path):
     assert timing_policy["end_delta_loss_weight"] == 0.6
     smoke = metrics["loader_smoke"]["first_decision"]
     assert set(smoke) == {"source", "start_refine_delta_s", "end_refine_delta_s"}
+
+
+def test_train_refiner_rejects_dataset_without_ptm_repo_id(tmp_path):
+    pytest.importorskip("torch")
+    transformers = pytest.importorskip("transformers")
+    if not hasattr(transformers, "Mamba2Model"):
+        pytest.skip("transformers.Mamba2Model is unavailable")
+    dataset = _write_v5_dataset(
+        tmp_path / "sequence.jsonl",
+        rows=2,
+        items_per_row=1,
+        include_ptm_repo_id=False,
+    )
+
+    with pytest.raises(ValueError, match="metadata\\.ptm_repo_id"):
+        train_refiner(
+            dataset_paths=[dataset],
+            output_dir=tmp_path / "sequence-train",
+            config=_tiny_train_config(),
+        )
 
 
 def test_train_refiner_rejects_merge_era_fields(tmp_path):
@@ -330,6 +359,7 @@ def test_build_frame_sequence_dataset_trains_with_cached_features(tmp_path):
     assert len(rows[0]["sequence_features"]) == 1
     assert len(rows[0]["sequence_boundary_delta_targets"]) == 1
     assert rows[0]["sequence_boundary_delta_targets"][0] != [0.0, 0.0]
+    assert rows[0]["metadata"]["ptm_repo_id"] == "qwen"
 
     metrics = train_refiner(
         dataset_paths=[output_jsonl],
@@ -341,6 +371,7 @@ def test_build_frame_sequence_dataset_trains_with_cached_features(tmp_path):
     assert metrics["loader_smoke"]["decision_count"] == 1
     assert metrics["loader_smoke"]["signature"]["metadata"]["runtime_adapter"] == "frame_sequence_v1"
     assert metrics["loader_smoke"]["signature"]["metadata"]["feature_schema"] == FRAME_SEQUENCE_FEATURE_SCHEMA
+    assert metrics["loader_smoke"]["signature"]["metadata"]["ptm_repo_id"] == "qwen"
     assert rows[0]["feature_schema"] == FRAME_SEQUENCE_FEATURE_SCHEMA
     assert rows[0]["feature_schema_hash"]
     assert rows[0]["feature_signature"]["feature_schema"] == FRAME_SEQUENCE_FEATURE_SCHEMA

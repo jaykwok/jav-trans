@@ -196,6 +196,7 @@ def train_feature_frame_scorer(
     config: FeatureScorerTrainConfig,
     labels_path: str = "",
     feature_manifest_path: str = "",
+    checkpoint_name: str = "speech_boundary_ja_feature_scorer.pt",
 ) -> FeatureScorerTrainMetrics:
     import torch
 
@@ -228,6 +229,16 @@ def train_feature_frame_scorer(
 
     ptm_dim = int(rows[0]["ptm_dim"])
     mfcc_dim = int(rows[0]["mfcc_dim"])
+    ptm_repo_ids = {
+        str(row.get("ptm") or "").strip()
+        for row in rows
+        if str(row.get("ptm") or "").strip()
+    }
+    if not ptm_repo_ids:
+        raise ValueError("feature manifest rows must include a PTM repo id in 'ptm'")
+    if len(ptm_repo_ids) > 1:
+        raise ValueError(f"feature manifest mixes PTM repo ids: {sorted(ptm_repo_ids)}")
+    ptm_repo_id = next(iter(ptm_repo_ids), "")
     for row in rows:
         if int(row["ptm_dim"]) != ptm_dim or int(row["mfcc_dim"]) != mfcc_dim:
             raise ValueError("all feature rows must have the same ptm_dim and mfcc_dim")
@@ -308,7 +319,10 @@ def train_feature_frame_scorer(
         cut_boundary_radius_frames=config.cut_boundary_radius_frames,
         focal_gamma=config.focal_gamma,
     )
-    checkpoint_path = output_dir / "speech_boundary_ja_feature_scorer.pt"
+    checkpoint_name = checkpoint_name.strip() or "speech_boundary_ja_feature_scorer.pt"
+    if Path(checkpoint_name).name != checkpoint_name:
+        raise ValueError("checkpoint_name must be a file name, not a path")
+    checkpoint_path = output_dir / checkpoint_name
     metrics_path = output_dir / "train_metrics.json"
     torch.save(
         build_feature_frame_scorer_checkpoint(
@@ -317,6 +331,7 @@ def train_feature_frame_scorer(
             normalization=normalization,
             metadata={
                 "operating_point": "qwen-mamba2-frame-boundary-scorer-synthetic-v3",
+                "ptm_repo_id": ptm_repo_id,
                 "labels": labels_path,
                 "feature_manifest": feature_manifest_path,
                 "records": len(records),

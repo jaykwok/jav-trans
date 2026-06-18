@@ -52,6 +52,7 @@ if str(SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(SRC_ROOT))
 
 from asr.asr_internals import AsrInternalsCapturer  # noqa: E402
+from asr.backends.qwen import QWEN_ASR_REPO_ID  # noqa: E402
 from asr.cueqc_features import (  # noqa: E402
     DECODER_FEATURE_NAMES,
     STRUCTURED_FEATURE_NAMES,
@@ -172,9 +173,10 @@ def extract(args: argparse.Namespace) -> int:
         resolve_model_spec,
     )
 
+    asr_model_id = active_qwen_asr_model_id() or QWEN_ASR_REPO_ID
     model_spec = args.model_spec or resolve_model_spec(
         active_qwen_asr_model_path() or None,
-        active_qwen_asr_model_id() or "jaykwok/Qwen3-ASR-0.6B-JA-Anime-Galgame",
+        asr_model_id,
     )
     print(f"model_spec={model_spec}", flush=True)
     capturer = AsrInternalsCapturer(model_spec=model_spec, device=args.device)
@@ -298,6 +300,8 @@ def extract(args: argparse.Namespace) -> int:
             "start_index": start_index,
             "processed_rows": n_rows,
             "audio_cache_size": int(args.audio_cache_size),
+            "asr_model_id": asr_model_id,
+            "asr_model_spec": str(model_spec),
             "asr_dim": asr_dim,
             "token_dim": K_TOK,
             "decoder_dim": K_DEC,

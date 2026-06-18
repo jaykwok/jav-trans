@@ -9,7 +9,11 @@ from typing import Any
 import numpy as np
 
 from audio.loading import load_audio_16k_mono
-from asr.backends.qwen import QWEN_ASR_06B_REPO_ID, QWEN_ASR_17B_REPO_ID
+from asr.backends.qwen import (
+    QWEN_ASR_06B_REPO_ID,
+    QWEN_ASR_17B_REPO_ID,
+    QWEN_ASR_REPO_ID,
+)
 from utils.model_paths import resolve_model_spec
 
 QWEN3_ASR_REPO_IDS = {QWEN_ASR_06B_REPO_ID, QWEN_ASR_17B_REPO_ID}
@@ -17,7 +21,7 @@ QWEN3_ASR_REPO_IDS = {QWEN_ASR_06B_REPO_ID, QWEN_ASR_17B_REPO_ID}
 
 @dataclass(frozen=True)
 class FeatureConfig:
-    ptm: str = QWEN_ASR_06B_REPO_ID
+    ptm: str = QWEN_ASR_REPO_ID
     frame_hop_s: float = 0.02
     n_mfcc: int = 40
     n_fft: int = 400

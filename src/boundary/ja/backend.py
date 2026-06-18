@@ -8,6 +8,7 @@ from typing import Iterable
 
 import numpy as np
 
+from asr.backends.qwen import checkpoint_path_for_repo_env, validate_checkpoint_repo_id
 from audio.loading import load_audio_16k_mono
 from boundary.base import SegmentationResult, SpeechSegment
 from boundary.ja.dataset import frame_count
@@ -25,9 +26,9 @@ from boundary.ja.model import (
 from boundary.ja.postprocess import group_segments
 
 
-DEFAULT_MODEL_PATH = "models/jaykwok-Qwen3-ASR-0.6B-JA-Anime-Galgame"
+DEFAULT_MODEL_PATH = "models/jaykwok-Qwen3-ASR-1.7B-JA-Anime-Galgame"
 DEFAULT_OPERATING_POINT = "qwen-feature-energy-bootstrap-v1"
-DEFAULT_PTM = "jaykwok/Qwen3-ASR-0.6B-JA-Anime-Galgame"
+DEFAULT_PTM = "jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame"
 
 
 def _env_float(name: str, default: str) -> float:
@@ -49,6 +50,32 @@ def _env_optional_float(name: str) -> float | None:
 
 def _env_bool(name: str, default: str) -> bool:
     return os.getenv(name, default).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _scorer_checkpoint_from_env(ptm: str) -> str:
+    legacy = os.getenv("SPEECH_BOUNDARY_JA_SCORER_CHECKPOINT", "").strip()
+    if legacy:
+        raise RuntimeError(
+            "SPEECH_BOUNDARY_JA_SCORER_CHECKPOINT is no longer supported. "
+            "Use SPEECH_BOUNDARY_JA_SCORER_CHECKPOINT_BY_REPO="
+            f"{ptm}=path/to/speech_boundary_ja_feature_scorer.pt"
+        )
+    raw_mapping = os.getenv("SPEECH_BOUNDARY_JA_SCORER_CHECKPOINT_BY_REPO", "").strip()
+    if not raw_mapping:
+        return ""
+    return checkpoint_path_for_repo_env(
+        repo_id=ptm,
+        mapping_env="SPEECH_BOUNDARY_JA_SCORER_CHECKPOINT_BY_REPO",
+    )
+
+
+def _validate_scorer_checkpoint_repo(scorer, expected_ptm: str) -> None:
+    validate_checkpoint_repo_id(
+        scorer.metadata.get("ptm_repo_id"),
+        expected_ptm,
+        checkpoint_kind="SpeechBoundary-JA scorer",
+        metadata_key="metadata.ptm_repo_id",
+    )
 
 
 def _model_device(requested: str):
@@ -280,17 +307,20 @@ class SpeechBoundaryJaConfig:
     sequence_feature_max_ptm_dims: int = 64
     no_download: bool = False
     scorer_checkpoint: str = ""
+    scorer_checkpoint_repo_id: str = ""
     scorer_device: str = "auto"
 
     @classmethod
     def from_env(cls) -> "SpeechBoundaryJaConfig":
+        ptm = os.getenv("SPEECH_BOUNDARY_JA_PTM", DEFAULT_PTM).strip() or DEFAULT_PTM
+        scorer_checkpoint = _scorer_checkpoint_from_env(ptm)
         return cls(
             threshold=_env_float("SPEECH_BOUNDARY_JA_THRESHOLD", "0.200"),
             speech_on_threshold=_env_optional_float("SPEECH_BOUNDARY_JA_SPEECH_ON_THRESHOLD"),
             speech_off_threshold=_env_optional_float("SPEECH_BOUNDARY_JA_SPEECH_OFF_THRESHOLD"),
             frame_dilation_s=_env_float("SPEECH_BOUNDARY_JA_FRAME_DILATION_S", "0.2"),
             frame_hop_s=_env_float("SPEECH_BOUNDARY_JA_FRAME_HOP_S", "0.02"),
-            ptm=os.getenv("SPEECH_BOUNDARY_JA_PTM", DEFAULT_PTM).strip() or DEFAULT_PTM,
+            ptm=ptm,
             model_path=os.getenv("SPEECH_BOUNDARY_JA_MODEL_PATH", DEFAULT_MODEL_PATH).strip(),
             device=os.getenv("SPEECH_BOUNDARY_JA_DEVICE", "auto").strip() or "auto",
             dtype=os.getenv("SPEECH_BOUNDARY_JA_DTYPE", "bfloat16").strip() or "bfloat16",
@@ -308,7 +338,8 @@ class SpeechBoundaryJaConfig:
                 int(_env_float("BOUNDARY_FRAME_SEQUENCE_MAX_PTM_DIMS", "64")),
             ),
             no_download=_env_bool("SPEECH_BOUNDARY_JA_NO_DOWNLOAD", "0"),
-            scorer_checkpoint=os.getenv("SPEECH_BOUNDARY_JA_SCORER_CHECKPOINT", "").strip(),
+            scorer_checkpoint=scorer_checkpoint,
+            scorer_checkpoint_repo_id=ptm if scorer_checkpoint else "",
             scorer_device=os.getenv("SPEECH_BOUNDARY_JA_SCORER_DEVICE", "auto").strip() or "auto",
         )
 
@@ -382,6 +413,7 @@ class SpeechBoundaryJaBackend:
         scorer_checkpoint = cfg.scorer_checkpoint.strip()
         if scorer_checkpoint:
             signature["scorer_checkpoint"] = scorer_checkpoint
+            signature["scorer_checkpoint_repo_id"] = cfg.scorer_checkpoint_repo_id or cfg.ptm
             signature["scorer_device"] = cfg.scorer_device
         return signature
 
@@ -411,6 +443,8 @@ class SpeechBoundaryJaBackend:
             if cfg.scorer_checkpoint.strip()
             else None
         )
+        if scorer is not None:
+            _validate_scorer_checkpoint_repo(scorer, cfg.scorer_checkpoint_repo_id or cfg.ptm)
         scorer_signature = scorer.signature() if scorer is not None else None
         speech_on_threshold, speech_off_threshold = self._speech_thresholds(
             cfg,

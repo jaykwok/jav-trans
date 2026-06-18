@@ -148,6 +148,7 @@ class Mamba2FrameScorerBundle:
             "model_config": model_config,
             "metadata": {
                 "operating_point": str(self.metadata.get("operating_point") or ""),
+                "ptm_repo_id": str(self.metadata.get("ptm_repo_id") or ""),
                 "trained_steps": int(self.metadata.get("trained_steps") or 0),
                 "labels": str(self.metadata.get("labels") or ""),
                 "feature_manifest": str(self.metadata.get("feature_manifest") or ""),

@@ -185,8 +185,9 @@ def configure_env(args: argparse.Namespace) -> None:
     os.environ["ASR_MAX_NEW_TOKENS"] = str(args.asr_max_new_tokens)
     if args.boundary_feature_frame_hop_s is not None:
         os.environ["BOUNDARY_FEATURE_FRAME_HOP_S"] = str(args.boundary_feature_frame_hop_s)
-    os.environ["BOUNDARY_REFINER_MODEL_PATH"] = args.boundary_refiner_model_path
+    os.environ["BOUNDARY_REFINER_MODEL_PATH_BY_REPO"] = args.boundary_refiner_model_path_by_repo
     os.environ["BOUNDARY_REFINER_DEVICE"] = args.boundary_refiner_device
+    os.environ["CUEQC_MODEL_PATH_BY_REPO"] = args.cueqc_model_path_by_repo
     os.environ["BOUNDARY_PLANNER_MAX_CORE_CHUNK_S"] = str(args.boundary_planner_max_core_chunk_s)
     os.environ["BOUNDARY_PLANNER_TARGET_CHUNK_S"] = str(args.boundary_planner_target_chunk_s)
     os.environ["BOUNDARY_PLANNER_MIN_CHUNK_S"] = str(args.boundary_planner_min_chunk_s)
@@ -202,6 +203,10 @@ def configure_env(args: argparse.Namespace) -> None:
     os.environ["SPEECH_BOUNDARY_JA_MODEL_PATH"] = project_path_value(args.speech_boundary_model_path)
     os.environ["SPEECH_BOUNDARY_JA_DEVICE"] = args.speech_boundary_device
     os.environ["SPEECH_BOUNDARY_JA_DTYPE"] = args.speech_boundary_dtype
+    os.environ["SPEECH_BOUNDARY_JA_SCORER_CHECKPOINT_BY_REPO"] = (
+        args.speech_boundary_scorer_checkpoint_by_repo
+    )
+    os.environ["SPEECH_BOUNDARY_JA_SCORER_DEVICE"] = args.speech_boundary_scorer_device
     os.environ["SPEECH_BOUNDARY_JA_WINDOW_S"] = str(args.speech_boundary_window_s)
     os.environ["SPEECH_BOUNDARY_JA_OVERLAP_S"] = str(args.speech_boundary_overlap_s)
     os.environ["SPEECH_BOUNDARY_JA_MIN_SEGMENT_S"] = str(args.speech_boundary_min_segment_s)
@@ -230,8 +235,9 @@ def build_context(*, args: argparse.Namespace, paths: RunPaths, video: Path):
             "ASR_BATCH_SIZE_BY_REPO",
             DEFAULT_ASR_BATCH_SIZE_BY_REPO_ENV,
         ),
-        "BOUNDARY_REFINER_MODEL_PATH": os.getenv("BOUNDARY_REFINER_MODEL_PATH", ""),
+        "BOUNDARY_REFINER_MODEL_PATH_BY_REPO": os.getenv("BOUNDARY_REFINER_MODEL_PATH_BY_REPO", ""),
         "BOUNDARY_REFINER_DEVICE": os.getenv("BOUNDARY_REFINER_DEVICE", "auto"),
+        "CUEQC_MODEL_PATH_BY_REPO": os.getenv("CUEQC_MODEL_PATH_BY_REPO", ""),
         "BOUNDARY_PLANNER_MAX_CORE_CHUNK_S": os.getenv(
             "BOUNDARY_PLANNER_MAX_CORE_CHUNK_S",
             "5.0",
@@ -255,6 +261,14 @@ def build_context(*, args: argparse.Namespace, paths: RunPaths, video: Path):
         "SPEECH_BOUNDARY_JA_MODEL_PATH": project_path_value(args.speech_boundary_model_path),
         "SPEECH_BOUNDARY_JA_DEVICE": args.speech_boundary_device,
         "SPEECH_BOUNDARY_JA_DTYPE": args.speech_boundary_dtype,
+        "SPEECH_BOUNDARY_JA_SCORER_CHECKPOINT_BY_REPO": os.getenv(
+            "SPEECH_BOUNDARY_JA_SCORER_CHECKPOINT_BY_REPO",
+            "",
+        ),
+        "SPEECH_BOUNDARY_JA_SCORER_DEVICE": os.getenv(
+            "SPEECH_BOUNDARY_JA_SCORER_DEVICE",
+            "auto",
+        ),
         "SPEECH_BOUNDARY_JA_WINDOW_S": str(args.speech_boundary_window_s),
         "SPEECH_BOUNDARY_JA_OVERLAP_S": str(args.speech_boundary_overlap_s),
         "SPEECH_BOUNDARY_JA_MIN_SEGMENT_S": str(args.speech_boundary_min_segment_s),
@@ -376,6 +390,7 @@ def write_summary(paths: RunPaths, args: argparse.Namespace, results: list[dict[
         "speech_boundary_cut_threshold": args.speech_boundary_cut_threshold,
         "speech_boundary_apply_cut_to_speech": bool(args.speech_boundary_apply_cut_to_speech),
         "speech_boundary_frame_dilation_s": args.speech_boundary_frame_dilation_s,
+        "speech_boundary_scorer_checkpoint_by_repo": args.speech_boundary_scorer_checkpoint_by_repo,
         "boundary_planner": {
             "feature_frame_hop_s": args.boundary_feature_frame_hop_s,
             "max_core_chunk_s": args.boundary_planner_max_core_chunk_s,
@@ -433,7 +448,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--label", default="speech_boundary_ja_qwen200k")
     parser.add_argument(
         "--asr-backend",
-        default=os.getenv("ASR_BACKEND", "jaykwok/Qwen3-ASR-0.6B-JA-Anime-Galgame"),
+        default=os.getenv("ASR_BACKEND", "jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame"),
     )
     parser.add_argument(
         "--asr-model-path",
@@ -462,8 +477,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         ),
     )
     parser.add_argument(
-        "--boundary-refiner-model-path",
-        default=os.getenv("BOUNDARY_REFINER_MODEL_PATH", ""),
+        "--boundary-refiner-model-path-by-repo",
+        default=os.getenv("BOUNDARY_REFINER_MODEL_PATH_BY_REPO", ""),
+        help="Required repo-id checkpoint map: '<repo_id>=<boundary_refiner.pt>[,<repo_id>=...]'.",
+    )
+    parser.add_argument(
+        "--cueqc-model-path-by-repo",
+        default=os.getenv("CUEQC_MODEL_PATH_BY_REPO", ""),
+        help="Required repo-id checkpoint map: '<repo_id>=<cueqc.pt>[,<repo_id>=...]'.",
     )
     parser.add_argument("--boundary-refiner-device", default=os.getenv("BOUNDARY_REFINER_DEVICE", "auto"))
     parser.add_argument("--boundary-planner-max-core-chunk-s", type=float, default=_env_float("BOUNDARY_PLANNER_MAX_CORE_CHUNK_S", 5.0))
@@ -492,15 +513,29 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--speech-boundary-ptm",
         dest="speech_boundary_ptm",
-        default=os.getenv("SPEECH_BOUNDARY_JA_PTM", "jaykwok/Qwen3-ASR-0.6B-JA-Anime-Galgame"),
+        default=os.getenv("SPEECH_BOUNDARY_JA_PTM", "jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame"),
     )
     parser.add_argument(
         "--speech-boundary-model-path",
         dest="speech_boundary_model_path",
-        default=os.getenv("SPEECH_BOUNDARY_JA_MODEL_PATH", "models/jaykwok-Qwen3-ASR-0.6B-JA-Anime-Galgame"),
+        default=os.getenv("SPEECH_BOUNDARY_JA_MODEL_PATH", "models/jaykwok-Qwen3-ASR-1.7B-JA-Anime-Galgame"),
     )
     parser.add_argument("--speech-boundary-device", dest="speech_boundary_device", default=os.getenv("SPEECH_BOUNDARY_JA_DEVICE", "auto"))
     parser.add_argument("--speech-boundary-dtype", dest="speech_boundary_dtype", default=os.getenv("SPEECH_BOUNDARY_JA_DTYPE", "bfloat16"))
+    parser.add_argument(
+        "--speech-boundary-scorer-checkpoint-by-repo",
+        dest="speech_boundary_scorer_checkpoint_by_repo",
+        default=os.getenv("SPEECH_BOUNDARY_JA_SCORER_CHECKPOINT_BY_REPO", ""),
+        help=(
+            "Optional repo-id scorer map: '<repo_id>=<speech_boundary_ja_feature_scorer.pt>'"
+            "[,<repo_id>=...]'. Empty uses bootstrap scores."
+        ),
+    )
+    parser.add_argument(
+        "--speech-boundary-scorer-device",
+        dest="speech_boundary_scorer_device",
+        default=os.getenv("SPEECH_BOUNDARY_JA_SCORER_DEVICE", "auto"),
+    )
     parser.add_argument("--speech-boundary-window-s", dest="speech_boundary_window_s", type=float, default=_env_float("SPEECH_BOUNDARY_JA_WINDOW_S", 30.0))
     parser.add_argument("--speech-boundary-overlap-s", dest="speech_boundary_overlap_s", type=float, default=_env_float("SPEECH_BOUNDARY_JA_OVERLAP_S", 1.0))
     parser.add_argument("--speech-boundary-min-segment-s", dest="speech_boundary_min_segment_s", type=float, default=_env_float("SPEECH_BOUNDARY_JA_MIN_SEGMENT_S", 0.05))
