@@ -221,7 +221,7 @@ def test_cueqc_threshold_profile_only_raises_risky_text_bucket():
 def test_cueqc_checkpoint_rejects_repo_metadata_mismatch():
     with pytest.raises(ValueError, match="does not match selected repo"):
         load_cueqc_mamba_checkpoint(
-            "src/asr/checkpoints/cueqc_mamba_v3_fusion.pt",
+            "src/asr/checkpoints/cueqc_mamba_v3_fusion.jaykwok-Qwen3-ASR-0.6B-JA-Anime-Galgame.pt",
             device="cpu",
             expected_asr_repo_id="jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame",
         )

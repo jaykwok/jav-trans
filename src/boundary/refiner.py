@@ -19,7 +19,7 @@ from boundary.sequence_features import (
 )
 
 LEARNED_REFINER_SCHEMA = "boundary_refiner_v5"
-DEFAULT_REFINER_CHECKPOINT_PATH = Path("src/boundary/checkpoints/boundary_refiner.pt")
+DEFAULT_REFINER_CHECKPOINT_PATH = Path("src/boundary/checkpoints/boundary_refiner.jaykwok-Qwen3-ASR-0.6B-JA-Anime-Galgame.pt")
 BOUNDARY_REFINER_OUTPUT_DIM = 2
 DEFAULT_BOUNDARY_DELTA_MAX_S = 0.5
 

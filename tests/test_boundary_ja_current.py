@@ -365,6 +365,23 @@ def test_feature_frame_scorer_checkpoint_round_trip(tmp_path):
     assert np.all((0.0 <= cut_probs) & (cut_probs <= 1.0))
 
 
+def test_committed_06b_feature_frame_scorer_has_repo_metadata():
+    pytest.importorskip("torch")
+    _require_mamba2()
+    checkpoint_path = Path(
+        "src/boundary/ja/checkpoints/"
+        "speech_boundary_ja_feature_scorer.jaykwok-Qwen3-ASR-0.6B-JA-Anime-Galgame.pt"
+    )
+
+    bundle = load_feature_frame_scorer_checkpoint(checkpoint_path, device="cpu")
+    _validate_scorer_checkpoint_repo(bundle, QWEN_ASR_06B_REPO_ID)
+
+    assert bundle.schema == MAMBA2_FRAME_SCORER_SCHEMA
+    assert bundle.model_type == "mamba2_frame_boundary_scorer"
+    assert bundle.metadata["ptm_repo_id"] == QWEN_ASR_06B_REPO_ID
+    assert bundle.model_config["output_dim"] == 2
+
+
 def test_feature_frame_scorer_rejects_removed_v1_schema(tmp_path):
     torch = pytest.importorskip("torch")
     checkpoint_path = tmp_path / "feature_scorer_v1.pt"

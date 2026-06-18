@@ -251,7 +251,7 @@ def _reload_pipeline(monkeypatch, tmp_path: Path, *, enable_cueqc: bool = False)
     monkeypatch.setenv("ASR_BACKEND", asr_backend)
     monkeypatch.setenv(
         "BOUNDARY_REFINER_MODEL_PATH_BY_REPO",
-        f"{asr_backend}=src/boundary/checkpoints/boundary_refiner.pt",
+        f"{asr_backend}=src/boundary/checkpoints/boundary_refiner.jaykwok-Qwen3-ASR-0.6B-JA-Anime-Galgame.pt",
     )
     monkeypatch.setenv("BOUNDARY_FEATURE_FRAME_HOP_S", "0.02")
     monkeypatch.setenv("BOUNDARY_PLANNER_TARGET_CHUNK_S", "9.0")
@@ -262,7 +262,7 @@ def _reload_pipeline(monkeypatch, tmp_path: Path, *, enable_cueqc: bool = False)
     if enable_cueqc:
         monkeypatch.setenv(
             "CUEQC_MODEL_PATH_BY_REPO",
-            f"{asr_backend}=src/asr/checkpoints/cueqc_mamba_v3_fusion.pt",
+            f"{asr_backend}=src/asr/checkpoints/cueqc_mamba_v3_fusion.jaykwok-Qwen3-ASR-0.6B-JA-Anime-Galgame.pt",
         )
     else:
         monkeypatch.delenv("CUEQC_MODEL_PATH_BY_REPO", raising=False)
