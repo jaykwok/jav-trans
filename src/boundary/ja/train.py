@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 import math
+import os
+import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Iterable, Mapping
@@ -81,6 +83,7 @@ class FeatureScorerTrainConfig:
     threshold: float = 0.5
     cut_threshold: float = 0.5
     max_eval_windows: int = 256
+    log_every: int = 0
 
 
 @dataclass(frozen=True)
@@ -204,6 +207,15 @@ def train_feature_frame_scorer(
     if not rows:
         raise ValueError("at least one feature manifest row is required")
     output_dir.mkdir(parents=True, exist_ok=True)
+    checkpoint_name = checkpoint_name.strip() or "speech_boundary_ja_feature_scorer.pt"
+    if Path(checkpoint_name).name != checkpoint_name:
+        raise ValueError("checkpoint_name must be a file name, not a path")
+    checkpoint_path = output_dir / checkpoint_name
+    if os.name == "nt" and len(str(checkpoint_path.absolute())) >= 240:
+        raise ValueError(
+            "checkpoint path is too long for torch.save on Windows; use a shorter output directory or checkpoint name"
+        )
+    metrics_path = output_dir / "train_metrics.json"
     torch.manual_seed(config.seed)
     rng = np.random.default_rng(config.seed)
     rows = [row for row in rows if _feature_row_frame_count(row, records) > 0]
@@ -269,6 +281,8 @@ def train_feature_frame_scorer(
     optimizer = torch.optim.AdamW(model.parameters(), lr=config.learning_rate)
     train_order = shuffled_window_order(len(train_rows), seed=config.seed)
     losses: list[float] = []
+    log_every = max(0, int(config.log_every))
+    started_at = time.monotonic()
 
     for step in range(config.max_steps):
         row = train_rows[train_order[step % len(train_order)]]
@@ -300,6 +314,17 @@ def train_feature_frame_scorer(
         loss.backward()
         optimizer.step()
         losses.append(float(loss.detach().cpu()))
+        current_step = step + 1
+        if log_every > 0 and (current_step % log_every == 0 or current_step >= config.max_steps):
+            elapsed_s = max(0.001, time.monotonic() - started_at)
+            print(
+                "train_progress="
+                f"{current_step}/{config.max_steps} "
+                f"loss={float(loss.detach().cpu()):.6f} "
+                f"avg_loss={float(np.mean(losses)):.6f} "
+                f"elapsed_s={elapsed_s:.1f}",
+                flush=True,
+            )
 
     eval_metrics = evaluate_feature_frame_scorer(
         model=model,
@@ -319,11 +344,6 @@ def train_feature_frame_scorer(
         cut_boundary_radius_frames=config.cut_boundary_radius_frames,
         focal_gamma=config.focal_gamma,
     )
-    checkpoint_name = checkpoint_name.strip() or "speech_boundary_ja_feature_scorer.pt"
-    if Path(checkpoint_name).name != checkpoint_name:
-        raise ValueError("checkpoint_name must be a file name, not a path")
-    checkpoint_path = output_dir / checkpoint_name
-    metrics_path = output_dir / "train_metrics.json"
     torch.save(
         build_feature_frame_scorer_checkpoint(
             model=model,

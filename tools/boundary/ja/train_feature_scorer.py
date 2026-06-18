@@ -77,6 +77,7 @@ def run(args: argparse.Namespace) -> None:
             threshold=args.threshold,
             cut_threshold=args.cut_threshold,
             max_eval_windows=args.max_eval_windows,
+            log_every=args.log_every,
         ),
         labels_path=str(labels_path),
         feature_manifest_path=str(feature_manifest_path),
@@ -143,6 +144,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--threshold", type=float, default=0.5)
     parser.add_argument("--cut-threshold", type=float, default=0.5)
     parser.add_argument("--max-eval-windows", type=int, default=256)
+    parser.add_argument("--log-every", type=int, default=0, help="Print train progress every N steps; 0 disables.")
     args = parser.parse_args(argv)
     if args.max_steps <= 0:
         parser.error("--max-steps must be positive")
@@ -184,6 +186,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         parser.error("--cut-threshold must be in [0, 1]")
     if args.max_eval_windows <= 0:
         parser.error("--max-eval-windows must be positive")
+    if args.log_every < 0:
+        parser.error("--log-every must be non-negative")
     return args
 
 

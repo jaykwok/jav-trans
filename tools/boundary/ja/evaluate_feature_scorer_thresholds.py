@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+import time
 from collections import Counter
 from pathlib import Path
 from typing import Any, Iterable, Mapping
@@ -597,6 +598,7 @@ def evaluate_thresholds(
     device: str = "cpu",
     limit: int | None = None,
     batch_size: int = 8,
+    log_every: int = 0,
     runtime_profiles: Iterable[tuple[float, float, float]] | None = None,
     diagnostic_thresholds: Iterable[float] | None = None,
     diagnostic_runtime_profiles: Iterable[tuple[float, float, float]] | None = None,
@@ -611,6 +613,7 @@ def evaluate_thresholds(
     if not threshold_values:
         raise ValueError("at least one threshold is required")
     batch_size = max(1, int(batch_size))
+    log_every = max(0, int(log_every))
     bundle = load_feature_frame_scorer_checkpoint(checkpoint, device=device)
     speech_counts = {threshold: _empty_counts() for threshold in threshold_values}
     cut_counts = {threshold: _empty_counts() for threshold in threshold_values}
@@ -762,6 +765,8 @@ def evaluate_thresholds(
             )
 
     indexed_rows = sorted(enumerate(rows), key=lambda item: (_row_frame_count(item[1]), item[0]))
+    started_at = time.monotonic()
+    next_log_at = log_every if log_every > 0 else 0
     for batch_start in range(0, len(indexed_rows), batch_size):
         batch_items: list[dict[str, Any]] = []
         for row_index, row in indexed_rows[batch_start : batch_start + batch_size]:
@@ -853,6 +858,19 @@ def evaluate_thresholds(
                         "error": str(item_exc),
                     }
                 )
+        processed_rows = min(batch_start + batch_size, len(indexed_rows))
+        if log_every > 0 and (processed_rows >= next_log_at or processed_rows >= len(indexed_rows)):
+            elapsed_s = max(0.001, time.monotonic() - started_at)
+            print(
+                "eval_progress="
+                f"{processed_rows}/{len(indexed_rows)} "
+                f"scored={sum(source_counts.values())} "
+                f"skipped={len(skipped)} "
+                f"elapsed_s={elapsed_s:.1f}",
+                flush=True,
+            )
+            while next_log_at <= processed_rows:
+                next_log_at += log_every
 
     speech_metrics = [_metrics_from_counts(speech_counts[threshold], threshold=threshold) for threshold in threshold_values]
     cut_metrics = [_metrics_from_counts(cut_counts[threshold], threshold=threshold) for threshold in threshold_values]
@@ -923,7 +941,7 @@ def evaluate_thresholds(
         "output_dir": _repo_display(output_dir),
         "device": str(device),
         "batch_size": int(batch_size),
-        "batching": {"length_bucketed": True},
+        "batching": {"length_bucketed": True, "log_every": int(log_every)},
         "rows": len(rows),
         "skipped": len(skipped),
         "skipped_samples": skipped[:20],
@@ -1172,6 +1190,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--device", default="cpu")
     parser.add_argument("--limit", type=int)
     parser.add_argument("--batch-size", type=int, default=8)
+    parser.add_argument("--log-every", type=int, default=0, help="Print eval progress every N input rows; 0 disables.")
     parser.add_argument(
         "--runtime-profile",
         action="append",
@@ -1218,6 +1237,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         parser.error("--limit must be positive when set")
     if args.batch_size <= 0:
         parser.error("--batch-size must be positive")
+    if args.log_every < 0:
+        parser.error("--log-every must be non-negative")
     for threshold in args.diagnostic_threshold:
         if not 0.0 <= threshold <= 1.0:
             parser.error("--diagnostic-threshold must be in [0, 1]")
@@ -1246,6 +1267,7 @@ def run(args: argparse.Namespace) -> None:
         device=args.device,
         limit=args.limit,
         batch_size=args.batch_size,
+        log_every=args.log_every,
         runtime_profiles=args.runtime_profile,
         diagnostic_thresholds=args.diagnostic_threshold,
         diagnostic_runtime_profiles=args.diagnostic_runtime_profile,

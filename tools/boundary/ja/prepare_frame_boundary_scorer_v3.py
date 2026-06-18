@@ -135,6 +135,7 @@ def train_script(
     cut_negative_weight: float,
     cut_loss_weight: float,
     focal_gamma: float,
+    log_every: int,
 ) -> str:
     return "\n".join(
         [
@@ -162,7 +163,8 @@ def train_script(
             f"  --focal-gamma {float(focal_gamma)} `",
             "  --eval-ratio 0.1 `",
             "  --threshold 0.5 `",
-            "  --cut-threshold 0.5",
+            "  --cut-threshold 0.5 `",
+            f"  --log-every {int(log_every)}",
             "",
         ]
     )
@@ -176,6 +178,7 @@ def eval_script(
     output_dir: Path,
     eval_device: str,
     batch_size: int,
+    log_every: int,
     runtime_profiles: list[str],
 ) -> str:
     lines = [
@@ -186,7 +189,8 @@ def eval_script(
         f"  --feature-manifest {_ps_literal(repo_display_path(feature_manifest))} `",
         f"  --output-dir {_ps_literal(repo_display_path(output_dir))} `",
         f"  --device {_ps_literal(eval_device)} `",
-        f"  --batch-size {int(batch_size)}",
+        f"  --batch-size {int(batch_size)} `",
+        f"  --log-every {int(log_every)}",
     ]
     for profile in runtime_profiles:
         lines[-1] += " `"
@@ -213,8 +217,10 @@ def prepare_frame_boundary_scorer_v3(
     cut_negative_weight: float = 1.0,
     cut_loss_weight: float = 1.0,
     focal_gamma: float = 2.0,
+    train_log_every: int = 100,
     eval_device: str = "cpu",
     eval_batch_size: int = 1,
+    eval_log_every: int = 100,
     runtime_profiles: list[str] | None = None,
     allow_no_cut_targets: bool = False,
 ) -> dict[str, Any]:
@@ -267,6 +273,7 @@ def prepare_frame_boundary_scorer_v3(
             cut_negative_weight=cut_negative_weight,
             cut_loss_weight=cut_loss_weight,
             focal_gamma=focal_gamma,
+            log_every=train_log_every,
         ),
     )
     write_text(
@@ -278,6 +285,7 @@ def prepare_frame_boundary_scorer_v3(
             output_dir=eval_dir,
             eval_device=eval_device,
             batch_size=eval_batch_size,
+            log_every=eval_log_every,
             runtime_profiles=list(runtime_profiles or []),
         ),
     )
@@ -314,10 +322,12 @@ def prepare_frame_boundary_scorer_v3(
             "cut_negative_weight": float(cut_negative_weight),
             "cut_loss_weight": float(cut_loss_weight),
             "focal_gamma": float(focal_gamma),
+            "log_every": int(train_log_every),
         },
         "eval_config": {
             "device": str(eval_device),
             "batch_size": int(eval_batch_size),
+            "log_every": int(eval_log_every),
             "runtime_profiles": list(runtime_profiles or []),
         },
     }
@@ -342,8 +352,10 @@ def render_markdown(summary: Mapping[str, Any]) -> str:
         f"- PTM model path: `{summary['training_config']['model_path']}`",
         f"- Checkpoint: `{summary['outputs']['checkpoint']}`",
         f"- Training weights: `speech +{summary['training_config']['positive_weight']} / -{summary['training_config']['negative_weight']}; cut +{summary['training_config']['cut_positive_weight']} / -{summary['training_config']['cut_negative_weight']}`",
+        f"- Train log every: `{summary['training_config']['log_every']}`",
         f"- Eval device: `{summary['eval_config']['device']}`",
         f"- Eval batch size: `{summary['eval_config']['batch_size']}`",
+        f"- Eval log every: `{summary['eval_config']['log_every']}`",
         f"- Eval runtime profiles: `{len(summary['eval_config']['runtime_profiles'])}`",
         "",
         "## Scripts",
@@ -381,12 +393,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--cut-negative-weight", type=float, default=1.0)
     parser.add_argument("--cut-loss-weight", type=float, default=1.0)
     parser.add_argument("--focal-gamma", type=float, default=2.0)
+    parser.add_argument("--train-log-every", type=int, default=100)
     parser.add_argument(
         "--eval-device",
         default="cpu",
         help="Threshold-eval device. Defaults to CPU so offline sweeps do not consume GPU/shared VRAM.",
     )
     parser.add_argument("--eval-batch-size", type=int, default=1)
+    parser.add_argument("--eval-log-every", type=int, default=100)
     parser.add_argument(
         "--runtime-profile",
         action="append",
@@ -415,8 +429,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         parser.error("--cut-loss-weight must be positive")
     if args.focal_gamma < 0.0:
         parser.error("--focal-gamma must be non-negative")
+    if args.train_log_every < 0:
+        parser.error("--train-log-every must be non-negative")
     if args.eval_batch_size <= 0:
         parser.error("--eval-batch-size must be positive")
+    if args.eval_log_every < 0:
+        parser.error("--eval-log-every must be non-negative")
     for profile in args.runtime_profile:
         parts = [part.strip() for part in str(profile).split(",")]
         if len(parts) != 3:
@@ -459,8 +477,10 @@ def main(argv: list[str] | None = None) -> int:
         cut_negative_weight=args.cut_negative_weight,
         cut_loss_weight=args.cut_loss_weight,
         focal_gamma=args.focal_gamma,
+        train_log_every=args.train_log_every,
         eval_device=args.eval_device,
         eval_batch_size=args.eval_batch_size,
+        eval_log_every=args.eval_log_every,
         runtime_profiles=args.runtime_profile,
         allow_no_cut_targets=args.allow_no_cut_targets,
     )
