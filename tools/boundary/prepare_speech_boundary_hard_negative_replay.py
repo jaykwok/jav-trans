@@ -407,7 +407,7 @@ def prepare_hard_negative_replay(
         "runtime_caveat": {
             "speech_boundary_runtime": "qwen-feature-energy-bootstrap-v1",
             "direct_replacement_checkpoint_supported": False,
-            "opt_in_scorer_env": "SPEECH_BOUNDARY_JA_SCORER_CHECKPOINT",
+            "opt_in_scorer_env": "SPEECH_BOUNDARY_JA_SCORER_CHECKPOINT_BY_REPO",
             "reason": "CueQC drop labels were mined from old heuristic chunks, so this pack is replay material only and must not bootstrap the first speech+cut scorer.",
         },
         "commands": {

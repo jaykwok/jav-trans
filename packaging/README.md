@@ -16,8 +16,8 @@ It bundles:
 - `src/assets/images/icon.ico` for the pywebview native window icon and packaged executable icon
 - the small Mamba Boundary Refiner checkpoint at `src/boundary/checkpoints/boundary_refiner.pt`
 - the bundled Hugging Face inference model directories:
-  - `jaykwok/Qwen3-ASR-0.6B-JA-Anime-Galgame`
   - `jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame`
+  - `jaykwok/Qwen3-ASR-0.6B-JA-Anime-Galgame`
 
 The build script prepares those two Hugging Face models before running
 PyInstaller. Training-only files such as `optimizer.pt`, scheduler state,

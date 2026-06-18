@@ -16,7 +16,7 @@ def make_job_context(
     job_temp_root: Path | str,
     *,
     job_id: str | None = None,
-    asr_backend: str = ASR_06B_BACKEND,
+    asr_backend: str = ASR_17B_BACKEND,
     asr_context: str = "",
     subtitle_mode: str = "zh",
     skip_translation: bool = False,

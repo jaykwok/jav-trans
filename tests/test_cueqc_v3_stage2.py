@@ -9,7 +9,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from asr.cueqc_refiner import CueQCRefinerV3Fusion
+from asr.cueqc_refiner import CueQCRefinerV3Fusion, load_cueqc_mamba_checkpoint
 from tools.asr.cueqc import extract_features_v3_fusion
 from tools.asr.cueqc import compile_stage2a_features_v3_fusion
 from tools.asr.cueqc import extract_feature_shards
@@ -50,6 +50,8 @@ def _feature_bundle(label: int = -1) -> dict:
         ],
         "feature_config": {
             "feature_source": "asr_internal",
+            "asr_model_id": "jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame",
+            "asr_model_spec": "models/jaykwok-Qwen3-ASR-1.7B-JA-Anime-Galgame",
             "uses_bge": False,
             "text_embedding": "none",
             "asr_dim": 4,
@@ -216,6 +218,15 @@ def test_cueqc_threshold_profile_only_raises_risky_text_bucket():
     assert medium_info["text_bucket"] == "medium_text"
 
 
+def test_cueqc_checkpoint_rejects_repo_metadata_mismatch():
+    with pytest.raises(ValueError, match="does not match selected repo"):
+        load_cueqc_mamba_checkpoint(
+            "src/asr/checkpoints/cueqc_mamba_v3_fusion.pt",
+            device="cpu",
+            expected_asr_repo_id="jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame",
+        )
+
+
 def test_cueqc_v3_feature_merge_preserves_unlabeled_shards(tmp_path: Path):
     shard_a = tmp_path / "a.pt"
     shard_b = tmp_path / "b.pt"
@@ -240,6 +251,21 @@ def test_cueqc_v3_training_rejects_unlabeled_feature_bundle(tmp_path: Path):
     torch.save(_feature_bundle(label=-1), features_path)
 
     with pytest.raises(RuntimeError, match="unlabeled"):
+        train_mamba_v3_fusion.train(
+            train_mamba_v3_fusion.TrainConfig(max_steps=1, device="cpu", test_audio_id=""),
+            features_path=features_path,
+            output_dir=tmp_path / "out",
+        )
+
+
+def test_cueqc_v3_training_rejects_missing_asr_model_id(tmp_path: Path):
+    features_path = tmp_path / "features.pt"
+    bundle = _feature_bundle(label=1)
+    bundle["feature_config"].pop("asr_model_id", None)
+    bundle["feature_config"].pop("asr_model_spec", None)
+    torch.save(bundle, features_path)
+
+    with pytest.raises(ValueError, match="asr_model_id"):
         train_mamba_v3_fusion.train(
             train_mamba_v3_fusion.TrainConfig(max_steps=1, device="cpu", test_audio_id=""),
             features_path=features_path,

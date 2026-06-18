@@ -38,6 +38,15 @@ def _write_wav(path: Path, seconds: float = 2.0, sample_rate: int = 8000) -> Non
         writer.writeframes(b"\x00\x00" * int(sample_rate * seconds))
 
 
+def _set_boundary_refiner_mapping(monkeypatch) -> None:
+    asr_backend = "jaykwok/Qwen3-ASR-0.6B-JA-Anime-Galgame"
+    monkeypatch.setenv("ASR_BACKEND", asr_backend)
+    monkeypatch.setenv(
+        "BOUNDARY_REFINER_MODEL_PATH_BY_REPO",
+        f"{asr_backend}=src/boundary/checkpoints/boundary_refiner.pt",
+    )
+
+
 def test_boundary_cache_key_ignores_asr_prompt_budget(monkeypatch, tmp_path):
     from boundary import cache as boundary_cache
 
@@ -318,6 +327,7 @@ def _patch_fake_refiner(monkeypatch, asr) -> None:
 
 
 def test_pipeline_uses_boundary_scores_but_does_not_cache_score_arrays(monkeypatch, tmp_path):
+    _set_boundary_refiner_mapping(monkeypatch)
     monkeypatch.setenv("BOUNDARY_CACHE_DIR", str(tmp_path / "boundary-cache"))
     monkeypatch.setenv("BOUNDARY_FEATURE_FRAME_HOP_S", "1.0")
     monkeypatch.setenv("BOUNDARY_PLANNER_MAX_CORE_CHUNK_S", "30.0")
@@ -356,6 +366,7 @@ def test_pipeline_uses_boundary_scores_but_does_not_cache_score_arrays(monkeypat
 
 
 def test_pipeline_uses_boundary_cache_for_prompt_budget_change(monkeypatch, tmp_path):
+    _set_boundary_refiner_mapping(monkeypatch)
     monkeypatch.setenv("BOUNDARY_CACHE_DIR", str(tmp_path / "boundary-cache"))
     monkeypatch.setenv("BOUNDARY_FEATURE_FRAME_HOP_S", "0.02")
 

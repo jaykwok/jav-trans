@@ -1,19 +1,22 @@
 from __future__ import annotations
 
 import os
+from pathlib import Path
 
+from utils.runtime_paths import runtime_path
 
 QWEN_ASR_06B_REPO_ID = "jaykwok/Qwen3-ASR-0.6B-JA-Anime-Galgame"
 QWEN_ASR_17B_REPO_ID = "jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame"
+QWEN_ASR_REPO_ID = QWEN_ASR_17B_REPO_ID
 
-DEFAULT_QWEN_ASR_BACKEND = QWEN_ASR_06B_REPO_ID
+DEFAULT_QWEN_ASR_BACKEND = QWEN_ASR_REPO_ID
 QWEN_ASR_BACKEND_REPOS: dict[str, str] = {
     QWEN_ASR_06B_REPO_ID: QWEN_ASR_06B_REPO_ID,
-    QWEN_ASR_17B_REPO_ID: QWEN_ASR_17B_REPO_ID,
+    QWEN_ASR_REPO_ID: QWEN_ASR_REPO_ID,
 }
 DEFAULT_QWEN_ASR_BATCH_SIZE_BY_REPO: dict[str, int] = {
     QWEN_ASR_06B_REPO_ID: 64,
-    QWEN_ASR_17B_REPO_ID: 32,
+    QWEN_ASR_REPO_ID: 32,
 }
 
 
@@ -30,6 +33,93 @@ def qwen_asr_repo_id(backend: str | None = None) -> str:
             f"Unsupported Qwen ASR backend: {normalized!r}. "
             f"Choose one of: {', '.join(sorted(QWEN_ASR_BACKEND_REPOS))}"
         ) from exc
+
+
+def qwen_asr_repo_tag(repo_id: str | None = None) -> str:
+    normalized = (repo_id or DEFAULT_QWEN_ASR_BACKEND).strip()
+    if not normalized:
+        normalized = DEFAULT_QWEN_ASR_BACKEND
+    if normalized in QWEN_ASR_BACKEND_REPOS:
+        normalized = qwen_asr_repo_id(normalized)
+    return normalized.replace("/", "-")
+
+
+def repo_path_mapping(raw: str) -> dict[str, str]:
+    mapping: dict[str, str] = {}
+    for item in (raw or "").split(","):
+        item = item.strip()
+        if not item:
+            continue
+        if "=" not in item:
+            raise ValueError(
+                "Invalid repo path mapping entry "
+                f"{item!r}; expected '<repo_id>=<path>'"
+            )
+        repo_id, path = item.split("=", 1)
+        repo_id = repo_id.strip()
+        path = path.strip()
+        if not repo_id or not path:
+            raise ValueError(
+                "Invalid repo path mapping entry "
+                f"{item!r}; repo id and path are required"
+            )
+        mapping[repo_id] = path
+    return mapping
+
+
+def checkpoint_path_for_repo_env(
+    *,
+    repo_id: str | None,
+    mapping_env: str,
+) -> str:
+    selected_repo = qwen_asr_repo_id((repo_id or current_qwen_asr_backend()).strip())
+    raw = os.getenv(mapping_env, "").strip()
+    if not raw:
+        raise RuntimeError(
+            f"{mapping_env} is required. Set an explicit repo-id mapping like "
+            f"{selected_repo}=path/to/checkpoint.pt"
+        )
+    try:
+        mapping = repo_path_mapping(raw)
+    except ValueError as exc:
+        raise RuntimeError(f"{mapping_env} is malformed: {exc}") from exc
+    path = mapping.get(selected_repo, "").strip()
+    if not path:
+        raise RuntimeError(
+            f"{mapping_env} has no checkpoint for ASR repo {selected_repo!r}. "
+            "Add a '<repo_id>=<checkpoint_path>' entry for the selected ASR backend."
+        )
+    checkpoint_path = runtime_path(Path(path).expanduser())
+    if not checkpoint_path.exists() or not checkpoint_path.is_file():
+        raise FileNotFoundError(
+            f"{mapping_env} checkpoint for ASR repo {selected_repo!r} does not exist: "
+            f"{path} (resolved: {checkpoint_path})"
+        )
+    return str(checkpoint_path)
+
+
+def validate_checkpoint_repo_id(
+    actual_repo_id: str | None,
+    expected_repo_id: str | None,
+    *,
+    checkpoint_kind: str,
+    metadata_key: str,
+) -> str:
+    expected = qwen_asr_repo_id((expected_repo_id or current_qwen_asr_backend()).strip())
+    actual = str(actual_repo_id or "").strip()
+    if not actual:
+        raise ValueError(
+            f"{checkpoint_kind} checkpoint missing {metadata_key}; "
+            "repo-id binding cannot be verified"
+        )
+    if actual in QWEN_ASR_BACKEND_REPOS:
+        actual = qwen_asr_repo_id(actual)
+    if actual != expected:
+        raise ValueError(
+            f"{checkpoint_kind} checkpoint {metadata_key}={actual!r} does not match "
+            f"selected repo {expected!r}"
+        )
+    return actual
 
 
 def active_qwen_asr_model_id() -> str:

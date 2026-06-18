@@ -922,7 +922,7 @@ def _manifest_payload(cases: list[DatasetCase], dataset_root: str | Path, index_
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
-    from asr.backends.qwen import QWEN_ASR_06B_REPO_ID
+    from asr.backends.qwen import QWEN_ASR_REPO_ID
 
     parser = argparse.ArgumentParser(
         description=(
@@ -936,7 +936,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--predictions-root", default="")
     parser.add_argument("--run-pipeline", action="store_true")
     parser.add_argument("--skip-translation", action="store_true")
-    parser.add_argument("--backend", default=QWEN_ASR_06B_REPO_ID)
+    parser.add_argument("--backend", default=QWEN_ASR_REPO_ID)
     parser.add_argument("--limit", type=int, default=0)
     parser.add_argument("--case-contains", default="")
     parser.add_argument("--min-overlap-s", type=float, default=0.10)

@@ -880,12 +880,18 @@ def run_asr_alignment(
                         description=f"[magenta]{msg}[/magenta] [dim]{elapsed:.0f}s[/dim]",
                     )
 
-                segments, asr_log, asr_details = asr_module.transcribe_and_align(
-                    audio_path,
-                    device,
-                    on_stage=_on_stage,
-                    include_details=True,
-                )
+                try:
+                    segments, asr_log, asr_details = asr_module.transcribe_and_align(
+                        audio_path,
+                        device,
+                        on_stage=_on_stage,
+                        include_details=True,
+                    )
+                except Exception as exc:
+                    _log_stage(logger, f"stage_blocked asr_alignment error={exc!r}")
+                    if logger is not None:
+                        logger.exception("asr_alignment_failed")
+                    raise
                 _raise_if_cancelled(cancel_event)
                 for event_stage in ("asr_text_transcribe", "subtitle_timing"):
                     if event_stage in asr_event_started and event_stage not in asr_event_done:

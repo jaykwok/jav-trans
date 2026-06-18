@@ -4,11 +4,12 @@ import io
 import json
 from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
 
-from asr.backends.qwen import QWEN_ASR_06B_REPO_ID, QWEN_ASR_17B_REPO_ID
+from asr.backends.qwen import QWEN_ASR_06B_REPO_ID, QWEN_ASR_17B_REPO_ID, QWEN_ASR_REPO_ID
 from boundary.ja import (
     FeatureConfig,
     FeatureScorerTrainConfig,
@@ -46,6 +47,7 @@ from boundary.ja.backend import (
     SpeechBoundaryJaBackend,
     SpeechBoundaryJaConfig,
     _hysteresis_frames,
+    _validate_scorer_checkpoint_repo,
 )
 from boundary.ja.manifest import TrainingExample
 from boundary.ja.model import TinyFrameClassifier, load_feature_frame_scorer_checkpoint
@@ -179,7 +181,7 @@ def test_feature_schema_uses_ptm_names():
     mfcc = np.ones((6, 2), dtype=np.float32)
     aligned_ptm, aligned_mfcc = align_feature_frames(ptm, mfcc, resize_ptm=True)
 
-    assert FeatureConfig().ptm == QWEN_ASR_06B_REPO_ID
+    assert FeatureConfig().ptm == QWEN_ASR_REPO_ID
     assert aligned_ptm.shape == (6, 4)
     assert aligned_mfcc.shape == (6, 2)
     assert resize_binary_frames(np.asarray([0, 1], dtype=np.float32), 4).tolist() == [0, 0, 1, 1]
@@ -262,11 +264,45 @@ def test_write_jsonl_and_bootstrap_backend_signature(tmp_path):
     cfg = SpeechBoundaryJaConfig()
 
     assert path.read_text(encoding="utf-8").strip()
-    assert DEFAULT_MODEL_PATH == "models/jaykwok-Qwen3-ASR-0.6B-JA-Anime-Galgame"
+    assert DEFAULT_MODEL_PATH == "models/jaykwok-Qwen3-ASR-1.7B-JA-Anime-Galgame"
     assert DEFAULT_OPERATING_POINT == "qwen-feature-energy-bootstrap-v1"
-    assert cfg.ptm == QWEN_ASR_06B_REPO_ID
+    assert cfg.ptm == QWEN_ASR_REPO_ID
     assert cfg.scorer_checkpoint == ""
+    assert cfg.scorer_checkpoint_repo_id == ""
     assert not hasattr(cfg, "imitation_checkpoint")
+
+
+def test_backend_scorer_checkpoint_env_resolves_by_ptm_repo_id(monkeypatch, tmp_path):
+    checkpoint_path = tmp_path / "speech_boundary_ja_feature_scorer.pt"
+    checkpoint_path.write_bytes(b"checkpoint")
+    monkeypatch.setenv("SPEECH_BOUNDARY_JA_PTM", QWEN_ASR_17B_REPO_ID)
+    monkeypatch.setenv(
+        "SPEECH_BOUNDARY_JA_SCORER_CHECKPOINT_BY_REPO",
+        f"{QWEN_ASR_06B_REPO_ID}=missing.pt,{QWEN_ASR_17B_REPO_ID}={checkpoint_path}",
+    )
+
+    cfg = SpeechBoundaryJaConfig.from_env()
+
+    assert cfg.scorer_checkpoint == str(checkpoint_path.resolve())
+    assert cfg.scorer_checkpoint_repo_id == QWEN_ASR_17B_REPO_ID
+    sig = SpeechBoundaryJaBackend(cfg).signature()
+    assert sig["scorer_checkpoint"] == str(checkpoint_path.resolve())
+    assert sig["scorer_checkpoint_repo_id"] == QWEN_ASR_17B_REPO_ID
+
+
+def test_backend_scorer_checkpoint_rejects_legacy_single_path_env(monkeypatch):
+    monkeypatch.setenv("SPEECH_BOUNDARY_JA_SCORER_CHECKPOINT", "old.pt")
+    monkeypatch.delenv("SPEECH_BOUNDARY_JA_SCORER_CHECKPOINT_BY_REPO", raising=False)
+
+    with pytest.raises(RuntimeError, match="SCORER_CHECKPOINT_BY_REPO"):
+        SpeechBoundaryJaConfig.from_env()
+
+
+def test_backend_scorer_checkpoint_rejects_repo_metadata_mismatch():
+    scorer = SimpleNamespace(metadata={"ptm_repo_id": QWEN_ASR_06B_REPO_ID})
+
+    with pytest.raises(ValueError, match="does not match selected repo"):
+        _validate_scorer_checkpoint_repo(scorer, QWEN_ASR_17B_REPO_ID)
 
 
 def test_hysteresis_frames_uses_activation_and_deactivation_thresholds():
@@ -393,6 +429,7 @@ def test_feature_frame_scorer_training_from_cached_features(tmp_path):
                 "frame_count": 4,
                 "ptm_dim": 3,
                 "mfcc_dim": 2,
+                "ptm": QWEN_ASR_17B_REPO_ID,
             }
         )
 
@@ -421,6 +458,39 @@ def test_feature_frame_scorer_training_from_cached_features(tmp_path):
     assert 0.0 <= metrics.cut_f1 <= 1.0
     bundle = load_feature_frame_scorer_checkpoint(metrics.checkpoint, device="cpu")
     assert bundle.signature()["metadata"]["trained_steps"] == 2
+    assert bundle.signature()["metadata"]["ptm_repo_id"] == QWEN_ASR_17B_REPO_ID
+
+
+def test_feature_frame_scorer_training_rejects_missing_ptm_repo_id(tmp_path):
+    torch = pytest.importorskip("torch")
+    pytest.importorskip("transformers")
+    del torch
+    records = [
+        build_supervised_record(
+            audio_id="missing-ptm",
+            source="unit",
+            duration_s=0.4,
+            speech_segments=[{"start": 0.1, "end": 0.3}],
+            frame_hop_s=0.1,
+        )
+    ]
+    rows = [
+        {
+            "label_index": 0,
+            "feature_path": str(tmp_path / "missing.npz"),
+            "frame_count": 4,
+            "ptm_dim": 3,
+            "mfcc_dim": 2,
+        }
+    ]
+
+    with pytest.raises(ValueError, match="PTM repo id"):
+        train_feature_frame_scorer(
+            records=records,
+            feature_manifest_rows=rows,
+            output_dir=tmp_path / "train",
+            config=FeatureScorerTrainConfig(max_steps=1, device="cpu"),
+        )
 
 
 def test_feature_frame_scorer_threshold_eval_writes_summary(tmp_path):
@@ -569,7 +639,11 @@ def test_backend_scorer_is_opt_in_and_keeps_segment_contract(tmp_path, monkeypat
             model=model,
             model_config=model_config,
             normalization={"feature_mean": [0.0] * 6, "feature_std": [1.0] * 6},
-            metadata={"operating_point": "unit", "trained_steps": 1},
+            metadata={
+                "operating_point": "unit",
+                "trained_steps": 1,
+                "ptm_repo_id": QWEN_ASR_REPO_ID,
+            },
         ),
         checkpoint_path,
     )

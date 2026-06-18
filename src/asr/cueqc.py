@@ -8,6 +8,8 @@ from collections import Counter
 from pathlib import Path
 from typing import Any, Iterable, Mapping
 
+from asr.backends.qwen import checkpoint_path_for_repo_env, current_qwen_asr_backend
+
 
 CUEQC_FEATURE_SCHEMA_VERSION = 1
 CUEQC_SHADOW_SCHEMA_VERSION = 1
@@ -37,6 +39,13 @@ def _env_bool(name: str, default: bool) -> bool:
 
 def _env_text(name: str, default: str = "") -> str:
     return os.getenv(name, default).strip()
+
+
+def _active_cueqc_checkpoint_path() -> str:
+    return checkpoint_path_for_repo_env(
+        repo_id=current_qwen_asr_backend(),
+        mapping_env="CUEQC_MODEL_PATH_BY_REPO",
+    )
 
 
 def _optional_float(value: Any) -> float | None:
@@ -429,28 +438,28 @@ def build_candidates(
     return candidates
 
 
-def fallback_keep_decision(candidate: Mapping[str, Any]) -> dict[str, Any]:
+def pending_model_decision(candidate: Mapping[str, Any]) -> dict[str, Any]:
     return {
         "schema": "cueqc_shadow_v1",
         "schema_version": CUEQC_SHADOW_SCHEMA_VERSION,
         "model_version": CUEQC_MODEL_VERSION,
         "decision_version": CUEQC_DECISION_VERSION,
-        "mode": "fallback_keep",
+        "mode": "pending_cueqc_model",
         "cluster_id": candidate.get("cluster_id", "unclustered"),
         "display_hint": "keep",
         "confidence": 1.0,
         "display_prob_keep": 1.0,
         "display_prob_drop": 0.0,
-        "fallback_stage": "model_unavailable",
+        "fallback_stage": "",
         "fallback_detail": "",
-        "reasons": ["cueqc_model_unavailable_keep"],
+        "reasons": ["cueqc_model_pending"],
     }
 
 
 def build_shadow_report(candidates: list[Mapping[str, Any]]) -> dict[str, Any]:
     decisions = []
     for candidate in candidates:
-        decision = fallback_keep_decision(candidate)
+        decision = pending_model_decision(candidate)
         decisions.append(
             {
                 "sample_id": candidate.get("sample_id", ""),
@@ -464,7 +473,7 @@ def build_shadow_report(candidates: list[Mapping[str, Any]]) -> dict[str, Any]:
     return {
         "schema": "cueqc_shadow_report_v1",
         "enabled": cueqc_enabled(),
-        "shadow_only": _env_text("CUEQC_MODEL_PATH", "") == "",
+        "shadow_only": False,
         "feature_schema_version": CUEQC_FEATURE_SCHEMA_VERSION,
         "decision_version": CUEQC_DECISION_VERSION,
         "model_version": CUEQC_MODEL_VERSION,
@@ -481,7 +490,7 @@ def cueqc_enabled() -> bool:
 
 
 def runtime_signature() -> dict[str, Any]:
-    checkpoint = _env_text("CUEQC_MODEL_PATH", "")
+    checkpoint = _active_cueqc_checkpoint_path() if cueqc_enabled() else ""
     checkpoint_hash = ""
     if checkpoint:
         path = Path(checkpoint).expanduser()
@@ -508,7 +517,6 @@ def runtime_signature() -> dict[str, Any]:
         "checkpoint_sha1": checkpoint_hash,
         "drop_threshold": _env_text("CUEQC_DROP_THRESHOLD", "0.85"),
         "drop_apply_enabled": _env_bool("CUEQC_DROP_APPLY_ENABLED", True),
-        "fallback_policy": _env_text("CUEQC_FALLBACK_POLICY", "keep") or "keep",
         "shadow_embed_candidates": _env_bool("CUEQC_SHADOW_EMBED_CANDIDATES", False),
     }
 

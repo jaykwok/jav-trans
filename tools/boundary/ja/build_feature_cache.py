@@ -17,7 +17,7 @@ SRC_ROOT = PROJECT_ROOT / "src"
 if str(SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(SRC_ROOT))
 
-from asr.backends.qwen import QWEN_ASR_06B_REPO_ID
+from asr.backends.qwen import QWEN_ASR_REPO_ID
 from boundary.ja import (
     DEFAULT_TRAINABLE_LABEL_QUALITIES,
     FeatureConfig,
@@ -489,7 +489,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--extension", action="append", default=[".wav", ".flac", ".ogg", ".mp3", ".m4a"])
     parser.add_argument("--include-non-trainable", action="store_true")
     parser.add_argument("--limit", type=int)
-    parser.add_argument("--ptm", default=QWEN_ASR_06B_REPO_ID)
+    parser.add_argument("--ptm", default=QWEN_ASR_REPO_ID)
     parser.add_argument("--frame-hop-s", type=float, default=0.02)
     parser.add_argument("--n-mfcc", type=int, default=40)
     parser.add_argument("--n-fft", type=int, default=400)

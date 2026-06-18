@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
 import shutil
 import threading
@@ -29,6 +30,7 @@ from utils.model_paths import PROJECT_ROOT
 from web.models import JobSpec, JobState
 
 
+log = logging.getLogger(__name__)
 gpu_queue: asyncio.Queue[JobState] = asyncio.Queue()
 trans_queue: asyncio.Queue[tuple[JobState, Any]] = asyncio.Queue()
 _EXECUTOR_MAX_WORKERS = 4
@@ -389,6 +391,7 @@ async def gpu_worker() -> None:
                     expected_cancel_event=cancel_event,
                 )
             else:
+                log.exception("ASR job failed: job_id=%s", job.id)
                 await _set_job(
                     job,
                     status="failed",
@@ -457,6 +460,7 @@ async def translation_worker() -> None:
                     expected_cancel_event=cancel_event,
                 )
             else:
+                log.exception("translation job failed: job_id=%s", job.id)
                 await _set_job(
                     job,
                     status="failed",

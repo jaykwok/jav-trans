@@ -17,10 +17,12 @@ if str(PROJECT_ROOT) not in sys.path:
 if str(SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(SRC_ROOT))
 
+from asr.backends.qwen import QWEN_ASR_REPO_ID, qwen_asr_repo_tag  # noqa: E402
 from boundary.ja import load_label_records  # noqa: E402
 
 
 SUMMARY_SCHEMA = "speech_boundary_ja_frame_boundary_scorer_v3_prep"
+DEFAULT_PTM_MODEL_PATH = "models/jaykwok-Qwen3-ASR-1.7B-JA-Anime-Galgame"
 
 
 def local_timestamp() -> str:
@@ -88,17 +90,24 @@ def feature_cache_script(
     labels: Path,
     manifest: Path,
     output_dir: Path,
+    ptm: str,
+    model_path: str,
     device: str,
     batch_size: int,
     prepare_workers: int,
 ) -> str:
-    return "\n".join(
+    lines = [
+        "$env:PYTHONIOENCODING='utf-8'",
+        "uv run python -m tools.boundary.ja.build_feature_cache `",
+        f"  --labels {_ps_literal(repo_display_path(labels))} `",
+        f"  --manifest {_ps_literal(repo_display_path(manifest))} `",
+        f"  --output-dir {_ps_literal(repo_display_path(output_dir))} `",
+        f"  --ptm {_ps_literal(ptm)} `",
+    ]
+    if model_path:
+        lines.append(f"  --model-path {_ps_literal(repo_display_path(model_path))} `")
+    lines.extend(
         [
-            "$env:PYTHONIOENCODING='utf-8'",
-            "uv run python -m tools.boundary.ja.build_feature_cache `",
-            f"  --labels {_ps_literal(repo_display_path(labels))} `",
-            f"  --manifest {_ps_literal(repo_display_path(manifest))} `",
-            f"  --output-dir {_ps_literal(repo_display_path(output_dir))} `",
             f"  --device {_ps_literal(device)} `",
             "  --dtype 'bfloat16' `",
             f"  --batch-size {int(batch_size)} `",
@@ -108,6 +117,7 @@ def feature_cache_script(
             "",
         ]
     )
+    return "\n".join(lines)
 
 
 def train_script(
@@ -115,6 +125,7 @@ def train_script(
     labels: Path,
     feature_manifest: Path,
     output_dir: Path,
+    checkpoint_name: str,
     device: str,
     max_steps: int,
     batch_hidden_size: int,
@@ -132,6 +143,7 @@ def train_script(
             f"  --labels {_ps_literal(repo_display_path(labels))} `",
             f"  --feature-manifest {_ps_literal(repo_display_path(feature_manifest))} `",
             f"  --output-dir {_ps_literal(repo_display_path(output_dir))} `",
+            f"  --checkpoint-name {_ps_literal(checkpoint_name)} `",
             f"  --device {_ps_literal(device)} `",
             f"  --max-steps {int(max_steps)} `",
             f"  --hidden-size {int(batch_hidden_size)} `",
@@ -188,6 +200,8 @@ def prepare_frame_boundary_scorer_v3(
     labels: Path,
     manifest: Path,
     output_dir: Path,
+    ptm: str = QWEN_ASR_REPO_ID,
+    model_path: str = DEFAULT_PTM_MODEL_PATH,
     device: str = "cuda",
     batch_size: int = 64,
     prepare_workers: int = 2,
@@ -218,7 +232,9 @@ def prepare_frame_boundary_scorer_v3(
     scorer_dir = output_dir / "frame-boundary-scorer-v3"
     eval_dir = output_dir / "threshold-eval"
     feature_manifest = feature_dir / "feature_manifest.jsonl"
-    checkpoint = scorer_dir / "speech_boundary_ja_feature_scorer.pt"
+    ptm_repo_tag = qwen_asr_repo_tag(ptm)
+    checkpoint_name = f"speech_boundary_ja_feature_scorer.{ptm_repo_tag}.pt"
+    checkpoint = scorer_dir / checkpoint_name
 
     output_dir.mkdir(parents=True, exist_ok=True)
     write_text(
@@ -227,6 +243,8 @@ def prepare_frame_boundary_scorer_v3(
             labels=labels,
             manifest=manifest,
             output_dir=feature_dir,
+            ptm=ptm,
+            model_path=model_path,
             device=device,
             batch_size=batch_size,
             prepare_workers=prepare_workers,
@@ -238,6 +256,7 @@ def prepare_frame_boundary_scorer_v3(
             labels=labels,
             feature_manifest=feature_manifest,
             output_dir=scorer_dir,
+            checkpoint_name=checkpoint_name,
             device=device,
             max_steps=max_steps,
             batch_hidden_size=hidden_size,
@@ -268,7 +287,7 @@ def prepare_frame_boundary_scorer_v3(
         "label_summary": summary,
         "runtime_caveat": {
             "default_replaced": False,
-            "opt_in_env": "SPEECH_BOUNDARY_JA_SCORER_CHECKPOINT",
+            "opt_in_env": "SPEECH_BOUNDARY_JA_SCORER_CHECKPOINT_BY_REPO",
             "required_schema": "speech_boundary_ja_mamba2_frame_boundary_scorer_v3",
         },
         "commands": {
@@ -282,6 +301,10 @@ def prepare_frame_boundary_scorer_v3(
             "threshold_eval": repo_display_path(eval_dir),
         },
         "training_config": {
+            "ptm": str(ptm),
+            "ptm_repo_tag": ptm_repo_tag,
+            "model_path": repo_display_path(model_path),
+            "checkpoint_name": checkpoint_name,
             "max_steps": int(max_steps),
             "hidden_size": int(hidden_size),
             "positive_weight": float(positive_weight),
@@ -312,6 +335,10 @@ def render_markdown(summary: Mapping[str, Any]) -> str:
         f"- Metadata records: `{labels['metadata_records']}`",
         f"- Cut point segments: `{labels['cut_point_segments']}`",
         f"- Cut drop zones: `{labels['cut_drop_zones']}`",
+        f"- PTM: `{summary['training_config']['ptm']}`",
+        f"- PTM repo tag: `{summary['training_config']['ptm_repo_tag']}`",
+        f"- PTM model path: `{summary['training_config']['model_path']}`",
+        f"- Checkpoint: `{summary['outputs']['checkpoint']}`",
         f"- Training weights: `speech +{summary['training_config']['positive_weight']} / -{summary['training_config']['negative_weight']}; cut +{summary['training_config']['cut_positive_weight']} / -{summary['training_config']['cut_negative_weight']}`",
         f"- Eval runtime profiles: `{len(summary['eval_config']['runtime_profiles'])}`",
         "",
@@ -337,6 +364,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--labels", required=True, help="Synthetic true-structure SpeechBoundary-JA labels JSONL.")
     parser.add_argument("--manifest", required=True, help="Audio manifest matching labels.")
     parser.add_argument("--output-dir", default="")
+    parser.add_argument("--ptm", default=QWEN_ASR_REPO_ID)
+    parser.add_argument("--model-path", default=DEFAULT_PTM_MODEL_PATH)
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--batch-size", type=int, default=64)
     parser.add_argument("--prepare-workers", type=int, default=2)
@@ -399,12 +428,17 @@ def main(argv: list[str] | None = None) -> int:
     output_dir = (
         project_path(args.output_dir)
         if args.output_dir
-        else PROJECT_ROOT / "agents" / "temp" / f"{local_timestamp()}_speech-boundary-frame-boundary-scorer-v3-prep"
+        else PROJECT_ROOT
+        / "agents"
+        / "temp"
+        / f"{local_timestamp()}_speech-boundary-frame-boundary-scorer-v3-{qwen_asr_repo_tag(args.ptm)}-prep"
     )
     summary = prepare_frame_boundary_scorer_v3(
         labels=project_path(args.labels),
         manifest=project_path(args.manifest),
         output_dir=output_dir,
+        ptm=args.ptm,
+        model_path=args.model_path,
         device=args.device,
         batch_size=args.batch_size,
         prepare_workers=args.prepare_workers,

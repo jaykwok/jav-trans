@@ -21,6 +21,7 @@ import torch
 from torch import nn
 from torch.utils.data import DataLoader, Subset, TensorDataset
 
+from asr.backends.qwen import qwen_asr_repo_tag
 from boundary.backbones import TRANSFORMERS_MAMBA2_BACKBONE, BoundarySequenceClassifier
 from boundary.refiner import (
     BOUNDARY_REFINER_OUTPUT_DIM,
@@ -63,6 +64,7 @@ class TrainRefinerConfig:
     freeze_backbone: bool = False
     tensor_cache_path: str = ""
     loader_log_interval_rows: int = 0
+    checkpoint_name: str = ""
 
 
 @dataclass(frozen=True)
@@ -285,7 +287,17 @@ def train_refiner(
             **feature_metadata,
         },
     )
-    checkpoint_path = output_dir / "boundary_refiner.pt"
+    checkpoint_name = config.checkpoint_name.strip()
+    if not checkpoint_name:
+        ptm_repo_id = str(feature_metadata.get("ptm_repo_id") or "").strip()
+        checkpoint_name = (
+            f"boundary_refiner.{qwen_asr_repo_tag(ptm_repo_id)}.pt"
+            if ptm_repo_id
+            else "boundary_refiner.pt"
+        )
+    if Path(checkpoint_name).name != checkpoint_name:
+        raise ValueError("checkpoint_name must be a file name, not a path")
+    checkpoint_path = output_dir / checkpoint_name
     torch.save(checkpoint, checkpoint_path)
     metrics["checkpoint"] = str(checkpoint_path)
 
@@ -577,6 +589,7 @@ def _scan_dataset(paths: Sequence[Path], *, log_interval_rows: int = 0) -> Datas
     train_schemas: set[str] = set()
     feature_schema_values: set[str] = set()
     feature_hash_values: set[str] = set()
+    ptm_repo_values: set[str] = set()
     expected_signature: dict[str, Any] | None = None
 
     for row in _iter_dataset_rows(paths):
@@ -597,6 +610,9 @@ def _scan_dataset(paths: Sequence[Path], *, log_interval_rows: int = 0) -> Datas
             feature_schema_values.add(str(row["feature_schema"]))
         if row.get("feature_schema_hash"):
             feature_hash_values.add(str(row["feature_schema_hash"]))
+        metadata = row.get("metadata")
+        if isinstance(metadata, Mapping) and metadata.get("ptm_repo_id"):
+            ptm_repo_values.add(str(metadata["ptm_repo_id"]))
         signature = row.get("feature_signature")
         if isinstance(signature, Mapping):
             signature_dict = dict(signature)
@@ -621,6 +637,7 @@ def _scan_dataset(paths: Sequence[Path], *, log_interval_rows: int = 0) -> Datas
             schema_values=feature_schema_values,
             hash_values=feature_hash_values,
             expected_signature=expected_signature,
+            ptm_repo_values=ptm_repo_values,
         ),
         train_schema=_train_schema_from_values(train_schemas),
         first_row=first_row,
@@ -693,24 +710,34 @@ def _feature_metadata_from_scan(
     schema_values: set[str],
     hash_values: set[str],
     expected_signature: Mapping[str, Any] | None,
+    ptm_repo_values: set[str],
 ) -> dict[str, Any]:
     if schema_values and schema_values != {FRAME_SEQUENCE_FEATURE_SCHEMA}:
         raise ValueError(f"unsupported sequence feature schema: {sorted(schema_values)}")
     if len(hash_values) > 1:
         raise ValueError("mixed feature_schema_hash values are not allowed")
+    if not ptm_repo_values:
+        raise ValueError("boundary refiner v5 rows require metadata.ptm_repo_id")
+    if len(ptm_repo_values) > 1:
+        raise ValueError(f"mixed ptm_repo_id values are not allowed: {sorted(ptm_repo_values)}")
+    ptm_repo_id = next(iter(ptm_repo_values))
     if expected_signature is not None:
         feature_schema_hash = next(iter(hash_values)) if hash_values else _hash_from_signature(expected_signature)
-        return {
+        metadata = {
             "feature_schema": str(expected_signature.get("feature_schema") or FRAME_SEQUENCE_FEATURE_SCHEMA),
             "feature_schema_hash": feature_schema_hash,
             "feature_signature": dict(expected_signature),
             "feature_dim": len(feature_names),
+            "ptm_repo_id": ptm_repo_id,
         }
+        return metadata
     if schema_values or hash_values:
         raise ValueError("sequence feature rows require feature_signature metadata")
-    return {
+    metadata = {
         "feature_dim": len(feature_names),
+        "ptm_repo_id": ptm_repo_id,
     }
+    return metadata
 
 
 def _hash_from_signature(signature: Mapping[str, Any]) -> str:
@@ -1073,6 +1100,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=0,
         help="Print JSONL scan/load progress every N rows; 0 disables loader progress logs.",
     )
+    parser.add_argument(
+        "--checkpoint-name",
+        default="",
+        help="Checkpoint file name. Default appends the dataset metadata.ptm_repo_id repo id tag.",
+    )
     args = parser.parse_args(argv)
     return args
 
@@ -1110,6 +1142,7 @@ def main(argv: list[str] | None = None) -> None:
             freeze_backbone=args.freeze_backbone,
             tensor_cache_path=args.tensor_cache_path,
             loader_log_interval_rows=args.loader_log_interval_rows,
+            checkpoint_name=args.checkpoint_name,
         ),
     )
 
