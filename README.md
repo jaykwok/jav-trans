@@ -13,10 +13,10 @@ JAVTrans 是一个本地字幕生成工具，面向 Windows + NVIDIA 显卡，�
 - 默认 ASR：`jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame`。
 - 低配置可选 ASR：`jaykwok/Qwen3-ASR-0.6B-JA-Anime-Galgame`。
 - 默认边界系统：SpeechBoundary-JA，backend key 为 `speech_boundary_ja`。它不是传统 VAD，而是 `Qwen PTM + MFCC/energy frame scores -> boundary candidates -> Boundary Refiner -> constrained planner -> ASR chunks` 的 speech-island boundary pipeline。
-- SpeechBoundary-JA 支持实验性的 Mamba2 frame boundary scorer v3 checkpoint，但默认不启用。已提交的 0.6B scorer 候选文件为 `src/boundary/ja/checkpoints/speech_boundary_ja_feature_scorer.jaykwok-Qwen3-ASR-0.6B-JA-Anime-Galgame.pt`；只有显式设置 `SPEECH_BOUNDARY_JA_SCORER_CHECKPOINT_BY_REPO` 并命中当前 `SPEECH_BOUNDARY_JA_PTM` repo id 时才会用 learned scorer 替代 bootstrap frame scores。v3 scorer 输出 `speech_prob / cut_prob`，运行时支持 `speech_on/speech_off` 双阈值 hysteresis 和 cut gate；正式分发默认仍是 `qwen-feature-energy-bootstrap-v1`。
-- 默认 Boundary Refiner：随源码提供 learned `transformers.Mamba2Model` 小 checkpoint，文件为 `src/boundary/checkpoints/boundary_refiner.jaykwok-Qwen3-ASR-0.6B-JA-Anime-Galgame.pt`。当前默认是 true v5 delta-only 32768 hardmix checkpoint；v5 协议只输出 `start_delta / end_delta`，不再保留 merge score、merge label、merge threshold、runtime disable 开关或 backbone override。
-- 默认 CueQC：通过 `CUEQC_MODEL_PATH_BY_REPO` 绑定到当前 ASR repo id，在 ASR 后输出二元 `keep/drop`。当前已提交 checkpoint 是 0.6B Stage 2b 自训练后版本，基础丢弃阈值 `0.85`，`short_text` 桶自适应提升到 `0.87`；模型映射、文件或加载失败会终止任务并显示错误，模型内部的单样本 capture / feature / inference 失败才会保守 `keep` 并记录原因。
-- 当前研究方向：CueQC 已替代旧规则 ASR QC。SpeechBoundary-JA Mamba2 frame boundary scorer v3 仍处于 opt-in 研究阶段，优先做 negative-rich synthetic 数据、boundary-aware / segment-level 评估和人工观感 gate；通过前不替换默认 scorer。后续新训练的 Mamba checkpoint 必须写入 Qwen ASR repo id 元数据，并通过 repo-id 映射配置与 ASR 后端绑定；默认文件名会带 repo id tag，但文件名不参与归属判断。
+- SpeechBoundary-JA 支持 Mamba2 frame boundary scorer v3 checkpoint。0.6B ASR 默认使用已审计通过的 scorer `src/boundary/ja/checkpoints/speech_boundary_ja_feature_scorer.jaykwok-Qwen3-ASR-0.6B-JA-Anime-Galgame.pt`；1.7B scorer 因 boundary-aware gate 未过，仍默认使用 bootstrap frame scores。`SPEECH_BOUNDARY_JA_SCORER_CHECKPOINT_BY_REPO` 仅作为实验覆盖项。v3 scorer 输出 `speech_prob / cut_prob`，运行时支持 `speech_on/speech_off` 双阈值 hysteresis 和 cut gate。
+- 默认 Boundary Refiner：后端按当前 ASR repo id 从内置 registry 自动解析 checkpoint，`BOUNDARY_REFINER_MODEL_PATH_BY_REPO` 仅作为实验覆盖项；默认 1.7B 文件为 `src/boundary/checkpoints/boundary_refiner.jaykwok-Qwen3-ASR-1.7B-JA-Anime-Galgame.pt`，低配 0.6B 文件保留为同名 repo tag 版本。v5 协议只输出 `start_delta / end_delta`，不再保留 merge score、merge label、merge threshold、runtime disable 开关或 backbone override。
+- 默认 CueQC：后端按当前 ASR repo id 从内置 registry 自动解析 checkpoint，`CUEQC_MODEL_PATH_BY_REPO` 仅作为实验覆盖项；在 ASR 后输出二元 `keep/drop`。当前已提交 1.7B 默认 checkpoint `src/asr/checkpoints/cueqc_mamba_v3_fusion.jaykwok-Qwen3-ASR-1.7B-JA-Anime-Galgame.pt`，并保留 0.6B 低配 checkpoint；1.7B 质量仍需 匿名样片 A no-translate smoke 和多片人工抽检确认。基础丢弃阈值 `0.85`，`short_text` 桶自适应提升到 `0.87`；模型映射、文件或加载失败会终止任务并显示错误，模型内部的单样本 capture / feature / inference 失败才会保守 `keep` 并记录原因。
+- 当前研究方向：CueQC 已替代旧规则 ASR QC。SpeechBoundary-JA Mamba2 frame boundary scorer v3 的 0.6B checkpoint 已通过 匿名样片 A 人工观感审计并进入 0.6B 默认；1.7B scorer 仍处于研究阶段，优先做 negative-rich synthetic 数据、boundary-aware / segment-level 评估和人工观感 gate。后续新训练的 Mamba checkpoint 必须写入 Qwen ASR repo id 元数据，并登记到后端 repo-id registry 或用 env 覆盖项显式绑定；默认文件名会带 repo id tag，但文件名不参与归属判断。
 - 默认显存目标：单阶段峰值适配 6GB 级 NVIDIA 显卡。8GB 本机可提高 `.env` 中的 ASR batch size；更小显存则手动降低。
 - 当前字幕策略：Boundary Refiner 输出的 speech-core chunk 就是字幕初始时间轴；字幕层只做 2-frame gap、显示时长和读速控制，不再运行相邻 cue 合并策略。
 
@@ -109,7 +109,7 @@ Web 提交是否使用 CUDA 取决于后端服务进程是否能看到 GPU，而
 ```text
 视频
 -> 音频准备
--> SpeechBoundary-JA bootstrap frame scores
+-> SpeechBoundary-JA repo-default frame scores
 -> boundary candidate extraction
 -> Boundary Refiner scoring
 -> constrained boundary planner
@@ -141,8 +141,8 @@ Boundary Refiner v5 只规划 speech core：Mamba2 输出 `start_delta + end_del
 | 低配 ASR | `jaykwok/Qwen3-ASR-0.6B-JA-Anime-Galgame` | `models/jaykwok-Qwen3-ASR-0.6B-JA-Anime-Galgame` |
 | SpeechBoundary-JA frozen feature | 默认同 ASR repo id，推荐 `jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame` | `models/jaykwok-Qwen3-ASR-1.7B-JA-Anime-Galgame` |
 | SpeechBoundary-JA scorer | opt-in Mamba2 frame boundary scorer v3，默认不启用；当前已提交候选属于 0.6B repo id | `src/boundary/ja/checkpoints/speech_boundary_ja_feature_scorer.jaykwok-Qwen3-ASR-0.6B-JA-Anime-Galgame.pt` |
-| CueQC v3-Fusion | learned Mamba2 fusion checkpoint，输入 ASR encoder features、token trace、decoder stats 和 chunk metadata | `src/asr/checkpoints/cueqc_mamba_v3_fusion.jaykwok-Qwen3-ASR-0.6B-JA-Anime-Galgame.pt` |
-| Boundary Refiner | learned `transformers.Mamba2Model` true v5 delta-only 32768 hardmix checkpoint | `src/boundary/checkpoints/boundary_refiner.jaykwok-Qwen3-ASR-0.6B-JA-Anime-Galgame.pt` |
+| CueQC v3-Fusion | learned Mamba2 fusion checkpoint，输入 ASR encoder features、token trace、decoder stats 和 chunk metadata，按当前 ASR repo id 选择 1.7B / 0.6B checkpoint | `src/asr/checkpoints/cueqc_mamba_v3_fusion.jaykwok-Qwen3-ASR-1.7B-JA-Anime-Galgame.pt` |
+| Boundary Refiner | learned `transformers.Mamba2Model` true v5 delta-only checkpoint，按当前 ASR repo id 选择 1.7B / 0.6B checkpoint | `src/boundary/checkpoints/boundary_refiner.jaykwok-Qwen3-ASR-1.7B-JA-Anime-Galgame.pt` |
 
 常用配置见 [.env.example](.env.example)。通常只需要修改 API key、翻译模型、`HF_ENDPOINT`、ASR backend 和 batch size。
 
@@ -155,7 +155,7 @@ Boundary Refiner v5 只规划 speech core：Mamba2 输出 `start_delta + end_del
 
 8GB 档面向本机调参和快速审计；如果后台还有其他 CUDA 进程或出现 OOM，先退回 6GB 档。
 
-推理需要 ASR / SpeechBoundary-JA frozen feature Hugging Face 模型，以及与当前 repo id 匹配的 Mamba checkpoint。Windows 打包版默认内置 1.7B ASR 和 0.6B 低配 ASR；源码运行时如果本地没有 Hugging Face 模型，仍会按需下载到 `models/`。Boundary Refiner / CueQC / SpeechBoundary-JA scorer 的新训练 checkpoint 必须带 Qwen ASR repo id 元数据，默认文件名也会包含 repo id tag，并分别通过 `BOUNDARY_REFINER_MODEL_PATH_BY_REPO`、`CUEQC_MODEL_PATH_BY_REPO`、`SPEECH_BOUNDARY_JA_SCORER_CHECKPOINT_BY_REPO` 绑定到对应 repo id；映射缺失、未命中当前 repo id 或文件不存在都会 fail-fast。当前已提交的 Boundary Refiner / CueQC checkpoint 和 opt-in SpeechBoundary-JA scorer 候选均属于 0.6B 绑定，1.7B 默认链路需要完成重训并写入映射后才能运行。训练时生成的 CUDA feature cache、synthetic WAV、sequence JSONL、tensor cache 和 `datasets/train/...` 产物都不是运行依赖，不随源码或 Windows release 打包；重新训练大数据集时应使用训练脚本的流式读取 / tensor cache，避免 WSL2 8GB 内存下整量加载 JSONL。
+推理需要 ASR / SpeechBoundary-JA frozen feature Hugging Face 模型，以及与当前 repo id 匹配的 Mamba checkpoint。Windows 打包版默认内置 1.7B ASR 和 0.6B 低配 ASR；源码运行时如果本地没有 Hugging Face 模型，仍会按需下载到 `models/`。Boundary Refiner / CueQC / SpeechBoundary-JA scorer 的新训练 checkpoint 必须带 Qwen ASR repo id 元数据，默认文件名也会包含 repo id tag。Boundary Refiner 与 CueQC 默认由后端 registry 按当前 `ASR_BACKEND` 自动解析；`BOUNDARY_REFINER_MODEL_PATH_BY_REPO`、`CUEQC_MODEL_PATH_BY_REPO` 和 `SPEECH_BOUNDARY_JA_SCORER_CHECKPOINT_BY_REPO` 只作为实验覆盖入口。registry 缺失、覆盖映射未命中当前 repo id、文件不存在或 metadata 不匹配都会 fail-fast。当前 Boundary Refiner / CueQC 已提交 1.7B 默认和 0.6B 低配 checkpoint；SpeechBoundary-JA learned scorer 已进入 0.6B 默认，1.7B 仍使用 bootstrap frame scores。训练时生成的 CUDA feature cache、synthetic WAV、sequence JSONL、tensor cache 和 `datasets/train/...` 产物都不是运行依赖，不随源码或 Windows release 打包；重新训练大数据集时应使用训练脚本的流式读取 / tensor cache，避免 WSL2 8GB 内存下整量加载 JSONL。
 
 ---
 
@@ -320,5 +320,5 @@ uv run python -m tools.web.smoke.summarize_job --job-id <job_id> --run-dir agent
 - `tools.boundary.prepare_speech_boundary_hard_negative_replay`：校验 CueQC `drop_ok` hard-negative replay source，并混合 positive/synthetic anchor replay；该工具不生成 first-scorer 训练脚本。
 - `tools.boundary.ja.build_galgame_synthetic_timeline`：按 v5-style 随机时间线生成带 `speech_frames`、`cut_point_segments` 和 `cut_drop_zones` 的 SpeechBoundary-JA synthetic labels。
 - `tools.boundary.ja.prepare_frame_boundary_scorer_v3`：校验 synthetic true-structure labels 并输出 feature-cache、train、threshold-eval 三个 PowerShell 脚本；默认给长训练/评估脚本加进度日志，不会直接训练或替换默认 runtime。
-- `tools.boundary.ja.train_feature_scorer`：从已缓存的 Qwen PTM + MFCC feature manifest 训练 runtime-loadable SpeechBoundary-JA Mamba2 speech+cut frame boundary scorer v3；支持 `--log-every`，Windows 下会提前拒绝过长 checkpoint 路径。checkpoint 只通过 `SPEECH_BOUNDARY_JA_SCORER_CHECKPOINT_BY_REPO` opt-in 使用，完整 smoke 和人工审计通过前不替换默认 runtime。
-- `tools.boundary.ja.evaluate_feature_scorer_thresholds`：离线读取 Mamba2 frame boundary scorer v3 checkpoint 和缓存特征，分别扫描 speech / cut threshold，并可输出 speech error boundary-distance 与 island-level diagnostics；支持 `--log-every`。1.7B 全量离线评估可用 `--device cuda --batch-size 1`，不要用大 batch 抢满显存；只用于候选评估，不替换默认 runtime。
+- `tools.boundary.ja.train_feature_scorer`：从已缓存的 Qwen PTM + MFCC feature manifest 训练 runtime-loadable SpeechBoundary-JA Mamba2 speech+cut frame boundary scorer v3；支持 `--log-every`，Windows 下会提前拒绝过长 checkpoint 路径。0.6B scorer 已进入默认 registry；新 scorer checkpoint 需要通过 registry 或 `SPEECH_BOUNDARY_JA_SCORER_CHECKPOINT_BY_REPO` 覆盖项接入，完整 smoke 和人工审计通过前不替换对应 repo 默认。
+- `tools.boundary.ja.evaluate_feature_scorer_thresholds`：离线读取 Mamba2 frame boundary scorer v3 checkpoint 和缓存特征，分别扫描 speech / cut threshold，并输出 boundary-aware runtime profile、boundary-distance、far/near region 与 island-level diagnostics；支持 `--log-every`。1.7B 全量离线评估可用 `--device cuda --batch-size 1`，不要用大 batch 抢满显存；只用于候选评估，不替换默认 runtime。

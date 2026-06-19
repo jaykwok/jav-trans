@@ -8,7 +8,11 @@ from collections import Counter
 from pathlib import Path
 from typing import Any, Iterable, Mapping
 
-from asr.backends.qwen import checkpoint_path_for_repo_env, current_qwen_asr_backend
+from asr.backends.qwen import (
+    DEFAULT_CUEQC_CHECKPOINT_BY_REPO,
+    checkpoint_path_for_repo_env,
+    current_qwen_asr_backend,
+)
 
 
 CUEQC_FEATURE_SCHEMA_VERSION = 1
@@ -45,6 +49,7 @@ def _active_cueqc_checkpoint_path() -> str:
     return checkpoint_path_for_repo_env(
         repo_id=current_qwen_asr_backend(),
         mapping_env="CUEQC_MODEL_PATH_BY_REPO",
+        default_mapping=DEFAULT_CUEQC_CHECKPOINT_BY_REPO,
     )
 
 

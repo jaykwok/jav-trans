@@ -9,11 +9,7 @@ from typing import Any, get_args
 import httpx
 from fastapi import APIRouter, HTTPException, Query
 
-from asr.backends.qwen import qwen_asr_repo_id
-from boundary.ja.backend import (
-    DEFAULT_MODEL_PATH as DEFAULT_BOUNDARY_JA_MODEL_PATH,
-    DEFAULT_PTM as DEFAULT_BOUNDARY_JA_PTM,
-)
+from asr.backends.qwen import qwen_asr_default_model_path, qwen_asr_repo_id
 from core.config import DEFAULT_SETTINGS, load_config
 from utils import model_paths
 from utils.model_paths import PROJECT_ROOT, normalize_hf_endpoint
@@ -258,14 +254,10 @@ async def get_model_requirements(
 
     asr_model_id = _runtime_or_env_or_setting("ASR_MODEL_ID").strip() or selected_asr_repo
     asr_model_path = _runtime_or_env_or_setting("ASR_MODEL_PATH")
-    boundary_model_id = (
-        _runtime_or_env_or_setting("SPEECH_BOUNDARY_JA_PTM", DEFAULT_BOUNDARY_JA_PTM).strip()
-        or DEFAULT_BOUNDARY_JA_PTM
-    )
-    boundary_model_path = _runtime_or_env_or_setting(
-        "SPEECH_BOUNDARY_JA_MODEL_PATH",
-        DEFAULT_BOUNDARY_JA_MODEL_PATH,
-    )
+    boundary_model_id = selected_asr_repo
+    boundary_model_path = _runtime_or_env_or_setting("SPEECH_BOUNDARY_JA_MODEL_PATH", "")
+    if not boundary_model_path:
+        boundary_model_path = qwen_asr_default_model_path(selected_asr_repo)
     boundary_download_enabled = not _truthy(
         _runtime_or_env_or_setting("SPEECH_BOUNDARY_JA_NO_DOWNLOAD", "0")
     )
