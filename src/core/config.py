@@ -105,7 +105,7 @@ DEFAULT_SETTINGS: dict[str, str] = {
     # 1 stores SpeechBoundary frame scores in the SpeechBoundary result. Boundary Refiner enables
     # this at runtime even when this explicit diagnostics flag stays off.
     "SPEECH_BOUNDARY_JA_EXPORT_FRAME_SCORES": "0",
-    # Optional learned SpeechBoundary-JA Mamba2 scorer override. Empty uses bootstrap frame scores; auto resolves the registered scorer.
+    # Optional learned SpeechBoundary-JA Mamba2 scorer override. Empty uses the registered repo-id scorer when available; auto resolves the same registry explicitly.
     "SPEECH_BOUNDARY_JA_SCORER_CHECKPOINT_BY_REPO": "",
     "SPEECH_BOUNDARY_JA_SCORER_DEVICE": "auto",
     # Frame-score mask dilation before raw SpeechBoundary segment extraction. This is not ASR padding.
@@ -275,3 +275,4 @@ def load_config(*, override_existing_env: bool = False) -> None:
     protected_keys = set() if override_existing_env else set(os.environ)
     _apply_values(DEFAULT_SETTINGS, protected_keys)
     _load_private_env(PRIVATE_ENV_PATH, protected_keys)
+
