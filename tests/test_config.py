@@ -117,6 +117,7 @@ def test_default_model_download_root_is_project_models():
     assert qwen.QWEN_ASR_06B_REPO_ID in qwen.DEFAULT_BOUNDARY_REFINER_CHECKPOINT_BY_REPO
     assert qwen.QWEN_ASR_17B_REPO_ID in qwen.DEFAULT_CUEQC_CHECKPOINT_BY_REPO
     assert qwen.QWEN_ASR_06B_REPO_ID in qwen.DEFAULT_CUEQC_CHECKPOINT_BY_REPO
+    assert qwen.QWEN_ASR_17B_REPO_ID in qwen.DEFAULT_SPEECH_BOUNDARY_SCORER_CHECKPOINT_BY_REPO
     assert qwen.QWEN_ASR_06B_REPO_ID in qwen.DEFAULT_SPEECH_BOUNDARY_SCORER_CHECKPOINT_BY_REPO
     assert "SPEECH_BOUNDARY_JA_SCORER_CHECKPOINT" not in config.DEFAULT_SETTINGS
     assert not any(key.startswith("ALIGN") for key in config.DEFAULT_SETTINGS)
@@ -153,3 +154,4 @@ def test_frozen_path_defaults_resolve_to_runtime_root(monkeypatch, tmp_path):
     assert os.environ["TORCH_HOME"] == str((tmp_path / "tmp" / "cache" / "torch").resolve())
     assert os.environ["JOB_TEMP_DIR"] == str((tmp_path / "tmp" / "jobs").resolve())
     assert os.environ["LLM_MODEL_NAME"] == "from_config"
+

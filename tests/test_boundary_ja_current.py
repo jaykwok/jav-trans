@@ -288,14 +288,16 @@ def test_backend_scorer_defaults_to_registered_06b_checkpoint(monkeypatch):
     assert cfg.scorer_checkpoint_repo_id == QWEN_ASR_06B_REPO_ID
 
 
-def test_backend_scorer_has_no_registered_17b_default(monkeypatch):
+def test_backend_scorer_defaults_to_registered_17b_checkpoint(monkeypatch):
     monkeypatch.setenv("SPEECH_BOUNDARY_JA_PTM", QWEN_ASR_17B_REPO_ID)
     monkeypatch.delenv("SPEECH_BOUNDARY_JA_SCORER_CHECKPOINT_BY_REPO", raising=False)
 
     cfg = SpeechBoundaryJaConfig.from_env()
 
-    assert cfg.scorer_checkpoint == ""
-    assert cfg.scorer_checkpoint_repo_id == ""
+    assert cfg.scorer_checkpoint.endswith(
+        "speech_boundary_ja_feature_scorer.jaykwok-Qwen3-ASR-1.7B-JA-Anime-Galgame.pt"
+    )
+    assert cfg.scorer_checkpoint_repo_id == QWEN_ASR_17B_REPO_ID
 def test_backend_scorer_checkpoint_env_resolves_by_ptm_repo_id(monkeypatch, tmp_path):
     checkpoint_path = tmp_path / "speech_boundary_ja_feature_scorer.pt"
     checkpoint_path.write_bytes(b"checkpoint")
@@ -772,3 +774,4 @@ def test_backend_scorer_is_opt_in_and_keeps_segment_contract(tmp_path, monkeypat
     assert result.parameters["scorer_checkpoint"]["schema"] == MAMBA2_FRAME_SCORER_SCHEMA
     assert SpeechBoundaryJaConfig().scorer_checkpoint == ""
     assert SpeechBoundaryJaBackend(SpeechBoundaryJaConfig()).signature()["scorer_checkpoint"] == ""
+

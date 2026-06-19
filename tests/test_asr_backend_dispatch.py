@@ -136,14 +136,22 @@ def test_qwen_checkpoint_path_auto_uses_registered_scorer(monkeypatch):
 
     monkeypatch.setenv("SPEECH_BOUNDARY_JA_SCORER_CHECKPOINT_BY_REPO", "auto")
 
-    path = qwen.checkpoint_path_for_repo_env(
+    path_06b = qwen.checkpoint_path_for_repo_env(
         repo_id=ASR_06B_BACKEND,
         mapping_env="SPEECH_BOUNDARY_JA_SCORER_CHECKPOINT_BY_REPO",
         default_mapping=qwen.DEFAULT_SPEECH_BOUNDARY_SCORER_CHECKPOINT_BY_REPO,
     )
+    path_17b = qwen.checkpoint_path_for_repo_env(
+        repo_id=ASR_17B_BACKEND,
+        mapping_env="SPEECH_BOUNDARY_JA_SCORER_CHECKPOINT_BY_REPO",
+        default_mapping=qwen.DEFAULT_SPEECH_BOUNDARY_SCORER_CHECKPOINT_BY_REPO,
+    )
 
-    assert path.endswith(
+    assert path_06b.endswith(
         "speech_boundary_ja_feature_scorer.jaykwok-Qwen3-ASR-0.6B-JA-Anime-Galgame.pt"
+    )
+    assert path_17b.endswith(
+        "speech_boundary_ja_feature_scorer.jaykwok-Qwen3-ASR-1.7B-JA-Anime-Galgame.pt"
     )
 def test_qwen_checkpoint_path_mapping_requires_env(monkeypatch):
     from asr.backends import qwen
@@ -218,3 +226,4 @@ def test_local_backend_asr_batch_size_auto_and_numeric_override(monkeypatch):
     monkeypatch.setenv("ASR_BATCH_SIZE", "7")
     reloaded = importlib.reload(local_backend)
     assert reloaded.ASR_BATCH_SIZE == 7
+
