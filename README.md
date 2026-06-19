@@ -140,7 +140,7 @@ Boundary Refiner v5 只规划 speech core：Mamba2 输出 `start_delta + end_del
 | 默认 ASR | `jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame` | `models/jaykwok-Qwen3-ASR-1.7B-JA-Anime-Galgame` |
 | 低配 ASR | `jaykwok/Qwen3-ASR-0.6B-JA-Anime-Galgame` | `models/jaykwok-Qwen3-ASR-0.6B-JA-Anime-Galgame` |
 | SpeechBoundary-JA frozen feature | 默认同 ASR repo id，推荐 `jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame` | `models/jaykwok-Qwen3-ASR-1.7B-JA-Anime-Galgame` |
-| SpeechBoundary-JA scorer | opt-in Mamba2 frame boundary scorer v3，默认不启用；当前已提交候选属于 0.6B repo id | `src/boundary/ja/checkpoints/speech_boundary_ja_feature_scorer.jaykwok-Qwen3-ASR-0.6B-JA-Anime-Galgame.pt` |
+| SpeechBoundary-JA scorer | Mamba2 frame boundary scorer v3；0.6B ASR 默认启用已审计 checkpoint，1.7B 在 scorer 重新过 gate 前继续使用 bootstrap frame scores | `src/boundary/ja/checkpoints/speech_boundary_ja_feature_scorer.jaykwok-Qwen3-ASR-0.6B-JA-Anime-Galgame.pt` |
 | CueQC v3-Fusion | learned Mamba2 fusion checkpoint，输入 ASR encoder features、token trace、decoder stats 和 chunk metadata，按当前 ASR repo id 选择 1.7B / 0.6B checkpoint | `src/asr/checkpoints/cueqc_mamba_v3_fusion.jaykwok-Qwen3-ASR-1.7B-JA-Anime-Galgame.pt` |
 | Boundary Refiner | learned `transformers.Mamba2Model` true v5 delta-only checkpoint，按当前 ASR repo id 选择 1.7B / 0.6B checkpoint | `src/boundary/checkpoints/boundary_refiner.jaykwok-Qwen3-ASR-1.7B-JA-Anime-Galgame.pt` |
 
