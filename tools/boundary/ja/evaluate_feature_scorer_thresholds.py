@@ -500,6 +500,43 @@ def _score_feature_batches(
     return scored
 
 
+def _cuda_memory_log(device: Any) -> str:
+    device_text = str(device or "")
+    if not device_text.startswith("cuda"):
+        return ""
+    try:
+        import torch
+
+        if not torch.cuda.is_available():
+            return "cuda_mem=unavailable"
+        torch_device = torch.device(device_text)
+        device_index = torch_device.index if torch_device.index is not None else torch.cuda.current_device()
+        free_bytes, total_bytes = torch.cuda.mem_get_info(device_index)
+        scale = 1024.0 * 1024.0
+        return (
+            f"cuda_alloc_mb={torch.cuda.memory_allocated(device_index) / scale:.1f} "
+            f"cuda_reserved_mb={torch.cuda.memory_reserved(device_index) / scale:.1f} "
+            f"cuda_max_reserved_mb={torch.cuda.max_memory_reserved(device_index) / scale:.1f} "
+            f"cuda_free_mb={free_bytes / scale:.1f} "
+            f"cuda_total_mb={total_bytes / scale:.1f}"
+        )
+    except Exception as exc:  # pragma: no cover - diagnostic best effort
+        return f"cuda_mem_error={type(exc).__name__}:{exc}"
+
+
+def _empty_cuda_cache(device: Any) -> None:
+    device_text = str(device or "")
+    if not device_text.startswith("cuda"):
+        return
+    try:
+        import torch
+
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    except Exception:
+        return
+
+
 def _row_frame_count(row: Mapping[str, Any]) -> int:
     try:
         return max(0, int(row.get("frame_count") or 0))
@@ -705,6 +742,7 @@ def evaluate_thresholds(
     limit: int | None = None,
     batch_size: int = 8,
     log_every: int = 0,
+    cuda_empty_cache_every: int = 0,
     runtime_profiles: Iterable[tuple[float, float, float]] | None = None,
     diagnostic_thresholds: Iterable[float] | None = None,
     diagnostic_runtime_profiles: Iterable[tuple[float, float, float]] | None = None,
@@ -720,6 +758,7 @@ def evaluate_thresholds(
         raise ValueError("at least one threshold is required")
     batch_size = max(1, int(batch_size))
     log_every = max(0, int(log_every))
+    cuda_empty_cache_every = max(0, int(cuda_empty_cache_every))
     bundle = load_feature_frame_scorer_checkpoint(checkpoint, device=device)
     speech_counts = {threshold: _empty_counts() for threshold in threshold_values}
     cut_counts = {threshold: _empty_counts() for threshold in threshold_values}
@@ -873,6 +912,9 @@ def evaluate_thresholds(
     indexed_rows = sorted(enumerate(rows), key=lambda item: (_row_frame_count(item[1]), item[0]))
     started_at = time.monotonic()
     next_log_at = log_every if log_every > 0 else 0
+    last_batch_items = 0
+    last_batch_max_frames = 0
+    last_batch_padded_feature_mb = 0.0
     for batch_start in range(0, len(indexed_rows), batch_size):
         batch_items: list[dict[str, Any]] = []
         for row_index, row in indexed_rows[batch_start : batch_start + batch_size]:
@@ -935,8 +977,15 @@ def evaluate_thresholds(
                 )
         if not batch_items:
             continue
+        batch_features = [np.asarray(item["features"]) for item in batch_items]
+        last_batch_items = len(batch_features)
+        last_batch_max_frames = max((int(item.shape[0]) for item in batch_features), default=0)
+        last_batch_input_dim = int(batch_features[0].shape[1]) if batch_features else 0
+        last_batch_padded_feature_mb = (
+            last_batch_items * last_batch_max_frames * last_batch_input_dim * 4.0 / (1024.0 * 1024.0)
+        )
         try:
-            scored_batch = _score_feature_batches(bundle, [np.asarray(item["features"]) for item in batch_items])
+            scored_batch = _score_feature_batches(bundle, batch_features)
         except Exception as batch_exc:  # pragma: no cover - fallback for device/batch-size limits
             for item in batch_items:
                 try:
@@ -965,14 +1014,23 @@ def evaluate_thresholds(
                     }
                 )
         processed_rows = min(batch_start + batch_size, len(indexed_rows))
+        completed_batches = batch_start // max(1, batch_size) + 1
+        if cuda_empty_cache_every > 0 and completed_batches % cuda_empty_cache_every == 0:
+            _empty_cuda_cache(bundle.device)
         if log_every > 0 and (processed_rows >= next_log_at or processed_rows >= len(indexed_rows)):
             elapsed_s = max(0.001, time.monotonic() - started_at)
+            cuda_memory = _cuda_memory_log(bundle.device)
+            cuda_suffix = f" {cuda_memory}" if cuda_memory else ""
             print(
                 "eval_progress="
                 f"{processed_rows}/{len(indexed_rows)} "
                 f"scored={sum(source_counts.values())} "
                 f"skipped={len(skipped)} "
-                f"elapsed_s={elapsed_s:.1f}",
+                f"elapsed_s={elapsed_s:.1f} "
+                f"batch_items={last_batch_items} "
+                f"batch_max_frames={last_batch_max_frames} "
+                f"batch_padded_feature_mb={last_batch_padded_feature_mb:.1f}"
+                f"{cuda_suffix}",
                 flush=True,
             )
             while next_log_at <= processed_rows:
@@ -1051,7 +1109,11 @@ def evaluate_thresholds(
         "output_dir": _repo_display(output_dir),
         "device": str(device),
         "batch_size": int(batch_size),
-        "batching": {"length_bucketed": True, "log_every": int(log_every)},
+        "batching": {
+            "length_bucketed": True,
+            "log_every": int(log_every),
+            "cuda_empty_cache_every": int(cuda_empty_cache_every),
+        },
         "rows": len(rows),
         "skipped": len(skipped),
         "skipped_samples": skipped[:20],
@@ -1318,6 +1380,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--batch-size", type=int, default=8)
     parser.add_argument("--log-every", type=int, default=0, help="Print eval progress every N input rows; 0 disables.")
     parser.add_argument(
+        "--cuda-empty-cache-every",
+        type=int,
+        default=0,
+        help="Call torch.cuda.empty_cache() every N scored batches during CUDA eval; 0 disables.",
+    )
+    parser.add_argument(
         "--runtime-profile",
         action="append",
         type=_parse_runtime_profile,
@@ -1365,6 +1433,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         parser.error("--batch-size must be positive")
     if args.log_every < 0:
         parser.error("--log-every must be non-negative")
+    if args.cuda_empty_cache_every < 0:
+        parser.error("--cuda-empty-cache-every must be non-negative")
     for threshold in args.diagnostic_threshold:
         if not 0.0 <= threshold <= 1.0:
             parser.error("--diagnostic-threshold must be in [0, 1]")
@@ -1394,6 +1464,7 @@ def run(args: argparse.Namespace) -> None:
         limit=args.limit,
         batch_size=args.batch_size,
         log_every=args.log_every,
+        cuda_empty_cache_every=args.cuda_empty_cache_every,
         runtime_profiles=args.runtime_profile,
         diagnostic_thresholds=args.diagnostic_threshold,
         diagnostic_runtime_profiles=args.diagnostic_runtime_profile,
@@ -1447,3 +1518,4 @@ def run(args: argparse.Namespace) -> None:
 
 if __name__ == "__main__":
     run(parse_args())
+
