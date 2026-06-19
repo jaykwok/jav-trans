@@ -453,7 +453,7 @@ def write_summary(paths: RunPaths, args: argparse.Namespace, results: list[dict[
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     load_config()
     parser = argparse.ArgumentParser(
-        description="Run project full workflow with SpeechBoundary-JA bootstrap scores, Boundary Refiner, and Qwen3-ASR."
+        description="Run project full workflow with SpeechBoundary-JA repo-id scorer, Boundary Refiner, and Qwen3-ASR."
     )
     parser.add_argument("--video", action="append", required=True, help="Video path or stem. Repeatable.")
     parser.add_argument("--task-name", default="full-workflow-qwen200k")
@@ -540,7 +540,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=os.getenv("SPEECH_BOUNDARY_JA_SCORER_CHECKPOINT_BY_REPO", ""),
         help=(
             "Optional repo-id scorer map: '<repo_id>=<speech_boundary_ja_feature_scorer.pt>'"
-            "[,<repo_id>=...]'. Empty uses bootstrap scores."
+            "[,<repo_id>=...]'. Empty uses the registered repo-id scorer when available."
         ),
     )
     parser.add_argument(
@@ -626,3 +626,4 @@ def main(argv: list[str] | None = None) -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+
