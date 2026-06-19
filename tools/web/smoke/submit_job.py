@@ -41,7 +41,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--speech-boundary-scorer-checkpoint-by-repo",
         default="",
-        help="Optional repo-id scorer map. Empty uses bootstrap SpeechBoundary-JA scores.",
+        help="Optional repo-id scorer map. Empty uses the registered repo-id scorer when available.",
     )
     parser.add_argument("--cueqc-inference-batch-size", default="64")
     parser.add_argument("--disable-cueqc-drop", action="store_true")
@@ -89,3 +89,4 @@ def main(argv: list[str] | None = None) -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+
