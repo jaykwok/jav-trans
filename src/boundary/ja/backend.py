@@ -8,7 +8,14 @@ from typing import Iterable
 
 import numpy as np
 
-from asr.backends.qwen import checkpoint_path_for_repo_env, validate_checkpoint_repo_id
+from asr.backends.qwen import (
+    DEFAULT_SPEECH_BOUNDARY_SCORER_CHECKPOINT_BY_REPO,
+    checkpoint_path_for_repo_env,
+    current_qwen_asr_backend,
+    qwen_asr_default_model_path,
+    qwen_asr_repo_id,
+    validate_checkpoint_repo_id,
+)
 from audio.loading import load_audio_16k_mono
 from boundary.base import SegmentationResult, SpeechSegment
 from boundary.ja.dataset import frame_count
@@ -26,9 +33,9 @@ from boundary.ja.model import (
 from boundary.ja.postprocess import group_segments
 
 
-DEFAULT_MODEL_PATH = "models/jaykwok-Qwen3-ASR-1.7B-JA-Anime-Galgame"
-DEFAULT_OPERATING_POINT = "qwen-feature-energy-bootstrap-v1"
 DEFAULT_PTM = "jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame"
+DEFAULT_MODEL_PATH = qwen_asr_default_model_path(DEFAULT_PTM)
+DEFAULT_OPERATING_POINT = "qwen-feature-energy-bootstrap-v1"
 
 
 def _env_float(name: str, default: str) -> float:
@@ -61,11 +68,11 @@ def _scorer_checkpoint_from_env(ptm: str) -> str:
             f"{ptm}=path/to/speech_boundary_ja_feature_scorer.pt"
         )
     raw_mapping = os.getenv("SPEECH_BOUNDARY_JA_SCORER_CHECKPOINT_BY_REPO", "").strip()
-    if not raw_mapping:
-        return ""
     return checkpoint_path_for_repo_env(
         repo_id=ptm,
         mapping_env="SPEECH_BOUNDARY_JA_SCORER_CHECKPOINT_BY_REPO",
+        default_mapping=DEFAULT_SPEECH_BOUNDARY_SCORER_CHECKPOINT_BY_REPO,
+        required=bool(raw_mapping),
     )
 
 
@@ -312,7 +319,9 @@ class SpeechBoundaryJaConfig:
 
     @classmethod
     def from_env(cls) -> "SpeechBoundaryJaConfig":
-        ptm = os.getenv("SPEECH_BOUNDARY_JA_PTM", DEFAULT_PTM).strip() or DEFAULT_PTM
+        ptm = os.getenv("SPEECH_BOUNDARY_JA_PTM", "").strip() or current_qwen_asr_backend()
+        ptm = qwen_asr_repo_id(ptm)
+        model_path = os.getenv("SPEECH_BOUNDARY_JA_MODEL_PATH", "").strip() or qwen_asr_default_model_path(ptm)
         scorer_checkpoint = _scorer_checkpoint_from_env(ptm)
         return cls(
             threshold=_env_float("SPEECH_BOUNDARY_JA_THRESHOLD", "0.200"),
@@ -321,7 +330,7 @@ class SpeechBoundaryJaConfig:
             frame_dilation_s=_env_float("SPEECH_BOUNDARY_JA_FRAME_DILATION_S", "0.2"),
             frame_hop_s=_env_float("SPEECH_BOUNDARY_JA_FRAME_HOP_S", "0.02"),
             ptm=ptm,
-            model_path=os.getenv("SPEECH_BOUNDARY_JA_MODEL_PATH", DEFAULT_MODEL_PATH).strip(),
+            model_path=model_path,
             device=os.getenv("SPEECH_BOUNDARY_JA_DEVICE", "auto").strip() or "auto",
             dtype=os.getenv("SPEECH_BOUNDARY_JA_DTYPE", "bfloat16").strip() or "bfloat16",
             attention=os.getenv("SPEECH_BOUNDARY_JA_ATTENTION", "sdpa").strip() or "sdpa",

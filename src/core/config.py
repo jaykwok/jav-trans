@@ -91,9 +91,6 @@ DEFAULT_SETTINGS: dict[str, str] = {
     # Boundary Refiner is the current pre-ASR chunk planning path.
     # This is a feature-score grid fallback, not the source video frame rate.
     "BOUNDARY_FEATURE_FRAME_HOP_S": "0.02",
-    "BOUNDARY_REFINER_MODEL_PATH_BY_REPO": (
-        "jaykwok/Qwen3-ASR-0.6B-JA-Anime-Galgame=src/boundary/checkpoints/boundary_refiner.jaykwok-Qwen3-ASR-0.6B-JA-Anime-Galgame.pt"
-    ),
     "BOUNDARY_REFINER_DEVICE": "auto",
     "BOUNDARY_FRAME_SEQUENCE_LEFT_CONTEXT_S": "0.60",
     "BOUNDARY_FRAME_SEQUENCE_RIGHT_CONTEXT_S": "0.60",
@@ -108,7 +105,7 @@ DEFAULT_SETTINGS: dict[str, str] = {
     # 1 stores SpeechBoundary frame scores in the SpeechBoundary result. Boundary Refiner enables
     # this at runtime even when this explicit diagnostics flag stays off.
     "SPEECH_BOUNDARY_JA_EXPORT_FRAME_SCORES": "0",
-    # Optional learned SpeechBoundary-JA Mamba2 scorer map. Empty uses bootstrap frame scores.
+    # Optional learned SpeechBoundary-JA Mamba2 scorer override. Empty uses bootstrap frame scores; auto resolves the registered scorer.
     "SPEECH_BOUNDARY_JA_SCORER_CHECKPOINT_BY_REPO": "",
     "SPEECH_BOUNDARY_JA_SCORER_DEVICE": "auto",
     # Frame-score mask dilation before raw SpeechBoundary segment extraction. This is not ASR padding.
@@ -129,9 +126,6 @@ DEFAULT_SETTINGS: dict[str, str] = {
     # stats + structured metadata -> display keep/drop. Legacy rule QC removed.
     "CUEQC_DECISION_VERSION": "cueqc_display_binary_v1",
     "CUEQC_MODEL_VERSION": "cueqc_mamba_v3_fusion",
-    "CUEQC_MODEL_PATH_BY_REPO": (
-        "jaykwok/Qwen3-ASR-0.6B-JA-Anime-Galgame=src/asr/checkpoints/cueqc_mamba_v3_fusion.jaykwok-Qwen3-ASR-0.6B-JA-Anime-Galgame.pt"
-    ),
     # Base drop threshold. Checkpoints may raise it per risk bucket.
     "CUEQC_DROP_THRESHOLD": "0.85",
     # 1 = actually remove model-confirmed drop candidates before subtitle timing;

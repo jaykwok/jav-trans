@@ -51,7 +51,11 @@ from boundary.ja.backend import (
 )
 from boundary.ja.manifest import TrainingExample
 from boundary.ja.model import TinyFrameClassifier, load_feature_frame_scorer_checkpoint
-from tools.boundary.ja.evaluate_feature_scorer_thresholds import _hysteresis_predictions, evaluate_thresholds
+from tools.boundary.ja.evaluate_feature_scorer_thresholds import (
+    _choose_boundary_aware_runtime_profile,
+    _hysteresis_predictions,
+    evaluate_thresholds,
+)
 
 
 def _require_mamba2():
@@ -272,6 +276,26 @@ def test_write_jsonl_and_bootstrap_backend_signature(tmp_path):
     assert not hasattr(cfg, "imitation_checkpoint")
 
 
+def test_backend_scorer_defaults_to_registered_06b_checkpoint(monkeypatch):
+    monkeypatch.setenv("SPEECH_BOUNDARY_JA_PTM", QWEN_ASR_06B_REPO_ID)
+    monkeypatch.delenv("SPEECH_BOUNDARY_JA_SCORER_CHECKPOINT_BY_REPO", raising=False)
+
+    cfg = SpeechBoundaryJaConfig.from_env()
+
+    assert cfg.scorer_checkpoint.endswith(
+        "speech_boundary_ja_feature_scorer.jaykwok-Qwen3-ASR-0.6B-JA-Anime-Galgame.pt"
+    )
+    assert cfg.scorer_checkpoint_repo_id == QWEN_ASR_06B_REPO_ID
+
+
+def test_backend_scorer_has_no_registered_17b_default(monkeypatch):
+    monkeypatch.setenv("SPEECH_BOUNDARY_JA_PTM", QWEN_ASR_17B_REPO_ID)
+    monkeypatch.delenv("SPEECH_BOUNDARY_JA_SCORER_CHECKPOINT_BY_REPO", raising=False)
+
+    cfg = SpeechBoundaryJaConfig.from_env()
+
+    assert cfg.scorer_checkpoint == ""
+    assert cfg.scorer_checkpoint_repo_id == ""
 def test_backend_scorer_checkpoint_env_resolves_by_ptm_repo_id(monkeypatch, tmp_path):
     checkpoint_path = tmp_path / "speech_boundary_ja_feature_scorer.pt"
     checkpoint_path.write_bytes(b"checkpoint")
@@ -645,6 +669,51 @@ def test_feature_frame_scorer_threshold_eval_can_diagnose_speech_errors(tmp_path
     assert diagnostic["islands"]["cut_drop_zone_clean_rate"] == pytest.approx(0.0)
     assert diagnostic["top_error_rows"][0]["audio_id"] == "clip"
     assert (tmp_path / "eval" / "speech_error_diagnostics.jsonl").exists()
+
+
+def test_boundary_aware_runtime_profile_recommendation_reports_failures():
+    rows = [
+        {
+            "speech_on_threshold": 0.65,
+            "speech_off_threshold": 0.60,
+            "cut_threshold": 1.0,
+            "precision": 0.99,
+            "recall": 0.988,
+            "f1": 0.989,
+            "false_positive_rate": 0.009,
+        }
+    ]
+    diagnostics = {
+        "runtime_on0.650000_off0.600000_cut1.000000": {
+            "regions": {
+                "far_from_boundary": {
+                    "frames": 100,
+                    "recall": 0.996,
+                    "false_positive_rate": 0.004,
+                }
+            },
+            "islands": {
+                "label_islands": 10,
+                "predicted_islands": 12,
+                "speech_island_recall": 1.0,
+                "mean_label_island_coverage": 0.99,
+                "predicted_island_precision": 0.92,
+                "cut_drop_zones": 4,
+                "cut_drop_zone_clean_rate": 0.50,
+                "mean_cut_drop_zone_predicted_ratio": 0.20,
+            },
+        }
+    }
+
+    recommendation = _choose_boundary_aware_runtime_profile(rows, diagnostics)
+
+    assert recommendation["status"] == "no_profile_passes_policy"
+    selected = recommendation["selected"]
+    assert selected["speech_island_recall"] == pytest.approx(1.0)
+    assert selected["diagnostic_id"] == "runtime_on0.650000_off0.600000_cut1.000000"
+    assert "predicted_island_precision" in selected["boundary_aware_failures"]
+    assert "cut_drop_zone_clean_rate" in selected["boundary_aware_failures"]
+    assert "mean_cut_drop_zone_predicted_ratio" in selected["boundary_aware_failures"]
 
 
 def test_backend_scorer_is_opt_in_and_keeps_segment_contract(tmp_path, monkeypatch):

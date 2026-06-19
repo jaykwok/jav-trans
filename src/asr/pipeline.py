@@ -22,7 +22,12 @@ from asr import checkpoint as _checkpoint_module
 from asr import chunking as _chunking_module
 from asr import cueqc as _cueqc_module
 from asr import transcribe as _transcribe_module
-from asr.backends.qwen import checkpoint_path_for_repo_env, validate_checkpoint_repo_id
+from asr.backends.qwen import (
+    DEFAULT_BOUNDARY_REFINER_CHECKPOINT_BY_REPO,
+    DEFAULT_CUEQC_CHECKPOINT_BY_REPO,
+    checkpoint_path_for_repo_env,
+    validate_checkpoint_repo_id,
+)
 from asr.backends import registry as _registry_module
 
 warnings.filterwarnings("ignore")
@@ -93,6 +98,7 @@ def _boundary_config() -> dict:
     refiner_path = checkpoint_path_for_repo_env(
         repo_id=ASR_BACKEND,
         mapping_env="BOUNDARY_REFINER_MODEL_PATH_BY_REPO",
+        default_mapping=DEFAULT_BOUNDARY_REFINER_CHECKPOINT_BY_REPO,
     )
     refiner_path_obj = Path(refiner_path).expanduser() if refiner_path else None
     runtime_adapter = _boundary_refiner_runtime_adapter(refiner_path_obj)
@@ -126,8 +132,7 @@ def _boundary_config() -> dict:
 def _boundary_refiner_runtime_adapter(path: Path | None) -> str:
     if path is None or not path.exists():
         raise FileNotFoundError(
-            "Boundary Refiner checkpoint is required: set BOUNDARY_REFINER_MODEL_PATH_BY_REPO "
-            "with an entry for the selected ASR repo id"
+            "Boundary Refiner checkpoint is required for the selected ASR repo id"
         )
     import torch
 
@@ -844,6 +849,7 @@ def _run_cueqc_shadow(
         model_path = checkpoint_path_for_repo_env(
             repo_id=ASR_BACKEND,
             mapping_env="CUEQC_MODEL_PATH_BY_REPO",
+            default_mapping=DEFAULT_CUEQC_CHECKPOINT_BY_REPO,
         )
         refiner = _cueqc_refiner_for(model_path, expected_asr_repo_id=ASR_BACKEND) if model_path else None
         if refiner is not None:

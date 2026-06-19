@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 
+from asr.backends import qwen
 from core import config
 
 
@@ -109,9 +110,14 @@ def test_default_model_download_root_is_project_models():
     assert config.DEFAULT_SETTINGS["ASR_BATCH_SIZE"] == "auto"
     assert "Qwen3-ASR-0.6B-JA-Anime-Galgame=64" in config.DEFAULT_SETTINGS["ASR_BATCH_SIZE_BY_REPO"]
     assert "Qwen3-ASR-1.7B-JA-Anime-Galgame=32" in config.DEFAULT_SETTINGS["ASR_BATCH_SIZE_BY_REPO"]
-    assert "BOUNDARY_REFINER_MODEL_PATH_BY_REPO" in config.DEFAULT_SETTINGS
-    assert "CUEQC_MODEL_PATH_BY_REPO" in config.DEFAULT_SETTINGS
+    assert "BOUNDARY_REFINER_MODEL_PATH_BY_REPO" not in config.DEFAULT_SETTINGS
+    assert "CUEQC_MODEL_PATH_BY_REPO" not in config.DEFAULT_SETTINGS
     assert "SPEECH_BOUNDARY_JA_SCORER_CHECKPOINT_BY_REPO" in config.DEFAULT_SETTINGS
+    assert qwen.QWEN_ASR_17B_REPO_ID in qwen.DEFAULT_BOUNDARY_REFINER_CHECKPOINT_BY_REPO
+    assert qwen.QWEN_ASR_06B_REPO_ID in qwen.DEFAULT_BOUNDARY_REFINER_CHECKPOINT_BY_REPO
+    assert qwen.QWEN_ASR_17B_REPO_ID in qwen.DEFAULT_CUEQC_CHECKPOINT_BY_REPO
+    assert qwen.QWEN_ASR_06B_REPO_ID in qwen.DEFAULT_CUEQC_CHECKPOINT_BY_REPO
+    assert qwen.QWEN_ASR_06B_REPO_ID in qwen.DEFAULT_SPEECH_BOUNDARY_SCORER_CHECKPOINT_BY_REPO
     assert "SPEECH_BOUNDARY_JA_SCORER_CHECKPOINT" not in config.DEFAULT_SETTINGS
     assert not any(key.startswith("ALIGN") for key in config.DEFAULT_SETTINGS)
     assert "BOUNDARY_REFINER_ENABLED" not in config.DEFAULT_SETTINGS

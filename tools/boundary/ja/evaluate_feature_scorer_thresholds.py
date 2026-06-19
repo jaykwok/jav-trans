@@ -582,6 +582,112 @@ def _choose_threshold(
     }
 
 
+def _runtime_profile_key(row: Mapping[str, Any]) -> str:
+    return (
+        f"runtime_on{float(row.get('speech_on_threshold', 0.0)):.6f}_"
+        f"off{float(row.get('speech_off_threshold', 0.0)):.6f}_"
+        f"cut{float(row.get('cut_threshold', 0.0)):.6f}"
+    )
+
+
+def _choose_boundary_aware_runtime_profile(
+    rows: list[dict[str, Any]],
+    diagnostics: Mapping[str, Any],
+    *,
+    min_speech_island_recall: float = 0.995,
+    min_mean_label_island_coverage: float = 0.985,
+    min_predicted_island_precision: float = 0.950,
+    min_cut_drop_zone_clean_rate: float = 0.850,
+    max_mean_cut_drop_zone_predicted_ratio: float = 0.100,
+    min_far_region_recall: float = 0.995,
+    max_far_region_false_positive_rate: float = 0.010,
+) -> dict[str, Any]:
+    policy = {
+        "min_speech_island_recall": float(min_speech_island_recall),
+        "min_mean_label_island_coverage": float(min_mean_label_island_coverage),
+        "min_predicted_island_precision": float(min_predicted_island_precision),
+        "min_cut_drop_zone_clean_rate": float(min_cut_drop_zone_clean_rate),
+        "max_mean_cut_drop_zone_predicted_ratio": float(max_mean_cut_drop_zone_predicted_ratio),
+        "min_far_region_recall": float(min_far_region_recall),
+        "max_far_region_false_positive_rate": float(max_far_region_false_positive_rate),
+    }
+    candidates: list[dict[str, Any]] = []
+    for row in rows:
+        diagnostic_id = _runtime_profile_key(row)
+        diagnostic = dict(diagnostics.get(diagnostic_id) or {})
+        if not diagnostic:
+            continue
+        islands = dict(diagnostic.get("islands") or {})
+        far_region = dict((diagnostic.get("regions") or {}).get("far_from_boundary") or {})
+        failures: list[str] = []
+        if float(islands.get("speech_island_recall") or 0.0) < min_speech_island_recall:
+            failures.append("speech_island_recall")
+        if float(islands.get("mean_label_island_coverage") or 0.0) < min_mean_label_island_coverage:
+            failures.append("mean_label_island_coverage")
+        if float(islands.get("predicted_island_precision") or 0.0) < min_predicted_island_precision:
+            failures.append("predicted_island_precision")
+        if int(islands.get("cut_drop_zones") or 0) > 0:
+            if float(islands.get("cut_drop_zone_clean_rate") or 0.0) < min_cut_drop_zone_clean_rate:
+                failures.append("cut_drop_zone_clean_rate")
+            if (
+                float(islands.get("mean_cut_drop_zone_predicted_ratio") or 0.0)
+                > max_mean_cut_drop_zone_predicted_ratio
+            ):
+                failures.append("mean_cut_drop_zone_predicted_ratio")
+        if int(far_region.get("frames") or 0) > 0:
+            if float(far_region.get("recall") or 0.0) < min_far_region_recall:
+                failures.append("far_region_recall")
+            if float(far_region.get("false_positive_rate") or 0.0) > max_far_region_false_positive_rate:
+                failures.append("far_region_false_positive_rate")
+        candidates.append(
+            {
+                **row,
+                "diagnostic_id": diagnostic_id,
+                "boundary_aware_failures": failures,
+                "speech_island_recall": float(islands.get("speech_island_recall") or 0.0),
+                "mean_label_island_coverage": float(islands.get("mean_label_island_coverage") or 0.0),
+                "predicted_island_precision": float(islands.get("predicted_island_precision") or 0.0),
+                "cut_drop_zone_clean_rate": float(islands.get("cut_drop_zone_clean_rate") or 0.0),
+                "mean_cut_drop_zone_predicted_ratio": float(
+                    islands.get("mean_cut_drop_zone_predicted_ratio") or 0.0
+                ),
+                "far_region_recall": float(far_region.get("recall") or 0.0),
+                "far_region_false_positive_rate": float(far_region.get("false_positive_rate") or 0.0),
+            }
+        )
+    if not candidates:
+        return {
+            "status": "not_evaluated",
+            "policy": policy,
+            "selected": {},
+            "note": "Pass --diagnostic-runtime-profile for each runtime profile to evaluate boundary-aware gates.",
+        }
+    passing = [row for row in candidates if not row["boundary_aware_failures"]]
+    if passing:
+        selected = sorted(
+            passing,
+            key=lambda row: (
+                -float(row["speech_island_recall"]),
+                -float(row["mean_label_island_coverage"]),
+                -float(row["cut_drop_zone_clean_rate"]),
+                float(row["false_positive_rate"]),
+                -float(row["f1"]),
+            ),
+        )[0]
+        return {"status": "passes_policy", "policy": policy, "selected": selected}
+    selected = sorted(
+        candidates,
+        key=lambda row: (
+            len(row["boundary_aware_failures"]),
+            -float(row["speech_island_recall"]),
+            -float(row["mean_label_island_coverage"]),
+            -float(row["cut_drop_zone_clean_rate"]),
+            -float(row["f1"]),
+        ),
+    )[0]
+    return {"status": "no_profile_passes_policy", "policy": policy, "selected": selected}
+
+
 def evaluate_thresholds(
     *,
     checkpoint: Path,
@@ -931,6 +1037,10 @@ def evaluate_thresholds(
         key: _summarize_diagnostic_state(state)
         for key, state in sorted(diagnostic_states.items())
     }
+    recommendation["boundary_aware_runtime_profile"] = _choose_boundary_aware_runtime_profile(
+        runtime_profile_metrics,
+        speech_error_diagnostics,
+    )
     output_dir.mkdir(parents=True, exist_ok=True)
     summary = {
         "schema": "speech_boundary_ja_mamba2_frame_boundary_scorer_threshold_eval_v3",
@@ -990,6 +1100,7 @@ def render_markdown(summary: Mapping[str, Any]) -> str:
     speech_recommendation = dict(summary.get("recommendation", {}).get("speech") or {})
     cut_recommendation = dict(summary.get("recommendation", {}).get("cut") or {})
     runtime_recommendation = dict(summary.get("recommendation", {}).get("runtime_profile") or {})
+    boundary_recommendation = dict(summary.get("recommendation", {}).get("boundary_aware_runtime_profile") or {})
     speech_selected = dict(speech_recommendation.get("selected") or {})
     cut_selected = dict(cut_recommendation.get("selected") or {})
     runtime_selected = dict(runtime_recommendation.get("selected") or {})
@@ -1002,6 +1113,7 @@ def render_markdown(summary: Mapping[str, Any]) -> str:
         f"- Speech recommendation status: `{speech_recommendation.get('status', '')}`",
         f"- Cut recommendation status: `{cut_recommendation.get('status', '')}`",
         f"- Runtime profile recommendation status: `{runtime_recommendation.get('status', '')}`",
+        f"- Boundary-aware runtime profile status: `{boundary_recommendation.get('status', '')}`",
     ]
     if speech_selected:
         lines.extend(
@@ -1021,6 +1133,20 @@ def render_markdown(summary: Mapping[str, Any]) -> str:
                 f"- Runtime profile F1: `{float(runtime_selected.get('f1', 0.0)):.6f}`",
             ]
         )
+    boundary_selected = dict(boundary_recommendation.get("selected") or {})
+    if boundary_selected:
+        lines.extend(
+            [
+                f"- Boundary-aware profile: `on={boundary_selected.get('speech_on_threshold')}, off={boundary_selected.get('speech_off_threshold')}, cut={boundary_selected.get('cut_threshold')}`",
+                f"- Boundary-aware island recall: `{float(boundary_selected.get('speech_island_recall', 0.0)):.6f}`",
+                f"- Boundary-aware island coverage: `{float(boundary_selected.get('mean_label_island_coverage', 0.0)):.6f}`",
+                f"- Boundary-aware cut-drop clean rate: `{float(boundary_selected.get('cut_drop_zone_clean_rate', 0.0)):.6f}`",
+                f"- Boundary-aware far-region FPR: `{float(boundary_selected.get('far_region_false_positive_rate', 0.0)):.6f}`",
+            ]
+        )
+        failures = list(boundary_selected.get("boundary_aware_failures") or [])
+        if failures:
+            lines.append(f"- Boundary-aware failures: `{', '.join(str(item) for item in failures)}`")
     if cut_selected:
         lines.extend(
             [
@@ -1284,6 +1410,8 @@ def run(args: argparse.Namespace) -> None:
     print(f"speech_recommendation_status={summary['recommendation']['speech']['status']}")
     print(f"cut_recommendation_status={summary['recommendation']['cut']['status']}")
     print(f"runtime_profile_recommendation_status={summary['recommendation']['runtime_profile']['status']}")
+    boundary_recommendation = summary["recommendation"].get("boundary_aware_runtime_profile") or {}
+    print(f"boundary_aware_runtime_profile_status={boundary_recommendation.get('status', 'not_evaluated')}")
     if speech_selected:
         print(f"selected_speech_threshold={speech_selected['threshold']}")
         print(f"selected_speech_recall={speech_selected['recall']:.6f}")
@@ -1293,6 +1421,19 @@ def run(args: argparse.Namespace) -> None:
         print(f"selected_cut_recall={cut_selected['recall']:.6f}")
         print(f"selected_cut_fpr={cut_selected['false_positive_rate']:.6f}")
     runtime_selected = summary["recommendation"]["runtime_profile"].get("selected") or {}
+    boundary_selected = dict(boundary_recommendation.get("selected") or {})
+    if boundary_selected:
+        print(
+            "selected_boundary_aware_runtime_profile="
+            f"on={boundary_selected['speech_on_threshold']},"
+            f"off={boundary_selected['speech_off_threshold']},"
+            f"cut={boundary_selected['cut_threshold']}"
+        )
+        print(f"selected_boundary_aware_speech_island_recall={boundary_selected['speech_island_recall']:.6f}")
+        print(f"selected_boundary_aware_cut_drop_clean_rate={boundary_selected['cut_drop_zone_clean_rate']:.6f}")
+        failures = boundary_selected.get("boundary_aware_failures") or []
+        if failures:
+            print("selected_boundary_aware_failures=" + ",".join(str(item) for item in failures))
     if runtime_selected:
         print(
             "selected_runtime_profile="

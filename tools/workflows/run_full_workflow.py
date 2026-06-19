@@ -20,7 +20,7 @@ SRC_ROOT = PROJECT_ROOT / "src"
 if str(SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(SRC_ROOT))
 
-from asr.backends.qwen import DEFAULT_QWEN_ASR_BATCH_SIZE_BY_REPO
+from asr.backends.qwen import DEFAULT_QWEN_ASR_BATCH_SIZE_BY_REPO, qwen_asr_default_model_path
 from core.config import load_config
 
 
@@ -185,9 +185,15 @@ def configure_env(args: argparse.Namespace) -> None:
     os.environ["ASR_MAX_NEW_TOKENS"] = str(args.asr_max_new_tokens)
     if args.boundary_feature_frame_hop_s is not None:
         os.environ["BOUNDARY_FEATURE_FRAME_HOP_S"] = str(args.boundary_feature_frame_hop_s)
-    os.environ["BOUNDARY_REFINER_MODEL_PATH_BY_REPO"] = args.boundary_refiner_model_path_by_repo
+    if args.boundary_refiner_model_path_by_repo.strip():
+        os.environ["BOUNDARY_REFINER_MODEL_PATH_BY_REPO"] = args.boundary_refiner_model_path_by_repo
+    else:
+        os.environ.pop("BOUNDARY_REFINER_MODEL_PATH_BY_REPO", None)
     os.environ["BOUNDARY_REFINER_DEVICE"] = args.boundary_refiner_device
-    os.environ["CUEQC_MODEL_PATH_BY_REPO"] = args.cueqc_model_path_by_repo
+    if args.cueqc_model_path_by_repo.strip():
+        os.environ["CUEQC_MODEL_PATH_BY_REPO"] = args.cueqc_model_path_by_repo
+    else:
+        os.environ.pop("CUEQC_MODEL_PATH_BY_REPO", None)
     os.environ["BOUNDARY_PLANNER_MAX_CORE_CHUNK_S"] = str(args.boundary_planner_max_core_chunk_s)
     os.environ["BOUNDARY_PLANNER_TARGET_CHUNK_S"] = str(args.boundary_planner_target_chunk_s)
     os.environ["BOUNDARY_PLANNER_MIN_CHUNK_S"] = str(args.boundary_planner_min_chunk_s)
@@ -200,12 +206,18 @@ def configure_env(args: argparse.Namespace) -> None:
     os.environ["SPEECH_BOUNDARY_JA_SPEECH_OFF_THRESHOLD"] = str(args.speech_boundary_speech_off_threshold)
     os.environ["SPEECH_BOUNDARY_JA_FRAME_DILATION_S"] = str(args.speech_boundary_frame_dilation_s)
     os.environ["SPEECH_BOUNDARY_JA_PTM"] = args.speech_boundary_ptm
-    os.environ["SPEECH_BOUNDARY_JA_MODEL_PATH"] = project_path_value(args.speech_boundary_model_path)
+    if str(args.speech_boundary_model_path or "").strip():
+        os.environ["SPEECH_BOUNDARY_JA_MODEL_PATH"] = project_path_value(args.speech_boundary_model_path)
+    else:
+        os.environ.pop("SPEECH_BOUNDARY_JA_MODEL_PATH", None)
     os.environ["SPEECH_BOUNDARY_JA_DEVICE"] = args.speech_boundary_device
     os.environ["SPEECH_BOUNDARY_JA_DTYPE"] = args.speech_boundary_dtype
-    os.environ["SPEECH_BOUNDARY_JA_SCORER_CHECKPOINT_BY_REPO"] = (
-        args.speech_boundary_scorer_checkpoint_by_repo
-    )
+    if args.speech_boundary_scorer_checkpoint_by_repo.strip():
+        os.environ["SPEECH_BOUNDARY_JA_SCORER_CHECKPOINT_BY_REPO"] = (
+            args.speech_boundary_scorer_checkpoint_by_repo
+        )
+    else:
+        os.environ.pop("SPEECH_BOUNDARY_JA_SCORER_CHECKPOINT_BY_REPO", None)
     os.environ["SPEECH_BOUNDARY_JA_SCORER_DEVICE"] = args.speech_boundary_scorer_device
     os.environ["SPEECH_BOUNDARY_JA_WINDOW_S"] = str(args.speech_boundary_window_s)
     os.environ["SPEECH_BOUNDARY_JA_OVERLAP_S"] = str(args.speech_boundary_overlap_s)
@@ -513,12 +525,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--speech-boundary-ptm",
         dest="speech_boundary_ptm",
-        default=os.getenv("SPEECH_BOUNDARY_JA_PTM", "jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame"),
+        default=os.getenv("SPEECH_BOUNDARY_JA_PTM", ""),
     )
     parser.add_argument(
         "--speech-boundary-model-path",
         dest="speech_boundary_model_path",
-        default=os.getenv("SPEECH_BOUNDARY_JA_MODEL_PATH", "models/jaykwok-Qwen3-ASR-1.7B-JA-Anime-Galgame"),
+        default=os.getenv("SPEECH_BOUNDARY_JA_MODEL_PATH", ""),
     )
     parser.add_argument("--speech-boundary-device", dest="speech_boundary_device", default=os.getenv("SPEECH_BOUNDARY_JA_DEVICE", "auto"))
     parser.add_argument("--speech-boundary-dtype", dest="speech_boundary_dtype", default=os.getenv("SPEECH_BOUNDARY_JA_DTYPE", "bfloat16"))
@@ -551,6 +563,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         args.speech_boundary_speech_on_threshold = args.speech_boundary_threshold
     if args.speech_boundary_speech_off_threshold is None:
         args.speech_boundary_speech_off_threshold = args.speech_boundary_threshold
+    if not str(args.speech_boundary_ptm or "").strip():
+        args.speech_boundary_ptm = args.asr_backend
+    if not str(args.speech_boundary_model_path or "").strip():
+        args.speech_boundary_model_path = qwen_asr_default_model_path(args.speech_boundary_ptm)
     if args.speech_boundary_threshold < 0:
         parser.error("--speech-boundary-threshold must be non-negative")
     if args.speech_boundary_speech_on_threshold < 0:

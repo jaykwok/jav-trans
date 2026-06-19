@@ -18,6 +18,32 @@ DEFAULT_QWEN_ASR_BATCH_SIZE_BY_REPO: dict[str, int] = {
     QWEN_ASR_06B_REPO_ID: 64,
     QWEN_ASR_REPO_ID: 32,
 }
+DEFAULT_BOUNDARY_REFINER_CHECKPOINT_BY_REPO: dict[str, str] = {
+    QWEN_ASR_17B_REPO_ID: (
+        "src/boundary/checkpoints/"
+        "boundary_refiner.jaykwok-Qwen3-ASR-1.7B-JA-Anime-Galgame.pt"
+    ),
+    QWEN_ASR_06B_REPO_ID: (
+        "src/boundary/checkpoints/"
+        "boundary_refiner.jaykwok-Qwen3-ASR-0.6B-JA-Anime-Galgame.pt"
+    ),
+}
+DEFAULT_CUEQC_CHECKPOINT_BY_REPO: dict[str, str] = {
+    QWEN_ASR_17B_REPO_ID: (
+        "src/asr/checkpoints/"
+        "cueqc_mamba_v3_fusion.jaykwok-Qwen3-ASR-1.7B-JA-Anime-Galgame.pt"
+    ),
+    QWEN_ASR_06B_REPO_ID: (
+        "src/asr/checkpoints/"
+        "cueqc_mamba_v3_fusion.jaykwok-Qwen3-ASR-0.6B-JA-Anime-Galgame.pt"
+    ),
+}
+DEFAULT_SPEECH_BOUNDARY_SCORER_CHECKPOINT_BY_REPO: dict[str, str] = {
+    QWEN_ASR_06B_REPO_ID: (
+        "src/boundary/ja/checkpoints/"
+        "speech_boundary_ja_feature_scorer.jaykwok-Qwen3-ASR-0.6B-JA-Anime-Galgame.pt"
+    ),
+}
 
 
 def current_qwen_asr_backend(default: str = DEFAULT_QWEN_ASR_BACKEND) -> str:
@@ -44,6 +70,10 @@ def qwen_asr_repo_tag(repo_id: str | None = None) -> str:
     return normalized.replace("/", "-")
 
 
+def qwen_asr_default_model_path(repo_id: str | None = None) -> str:
+    return f"models/{qwen_asr_repo_tag(repo_id)}"
+
+
 def repo_path_mapping(raw: str) -> dict[str, str]:
     mapping: dict[str, str] = {}
     for item in (raw or "").split(","):
@@ -67,24 +97,39 @@ def repo_path_mapping(raw: str) -> dict[str, str]:
     return mapping
 
 
+def repo_path_mapping_env(mapping: dict[str, str]) -> str:
+    return ",".join(f"{repo_id}={path}" for repo_id, path in mapping.items())
+
+
 def checkpoint_path_for_repo_env(
     *,
     repo_id: str | None,
     mapping_env: str,
+    default_mapping: dict[str, str] | None = None,
+    required: bool = True,
 ) -> str:
     selected_repo = qwen_asr_repo_id((repo_id or current_qwen_asr_backend()).strip())
     raw = os.getenv(mapping_env, "").strip()
-    if not raw:
+    if raw.lower() in {"auto", "default"}:
+        mapping = dict(default_mapping or {})
+    elif raw:
+        try:
+            mapping = repo_path_mapping(raw)
+        except ValueError as exc:
+            raise RuntimeError(f"{mapping_env} is malformed: {exc}") from exc
+    else:
+        mapping = dict(default_mapping or {})
+    if not mapping:
+        if not required:
+            return ""
         raise RuntimeError(
             f"{mapping_env} is required. Set an explicit repo-id mapping like "
             f"{selected_repo}=path/to/checkpoint.pt"
         )
-    try:
-        mapping = repo_path_mapping(raw)
-    except ValueError as exc:
-        raise RuntimeError(f"{mapping_env} is malformed: {exc}") from exc
     path = mapping.get(selected_repo, "").strip()
     if not path:
+        if not required:
+            return ""
         raise RuntimeError(
             f"{mapping_env} has no checkpoint for ASR repo {selected_repo!r}. "
             "Add a '<repo_id>=<checkpoint_path>' entry for the selected ASR backend."
