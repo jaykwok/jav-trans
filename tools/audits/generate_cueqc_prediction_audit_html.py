@@ -341,6 +341,7 @@ button.danger { color: var(--danger); }
 .item.false-drop .item-title::before { content: "! "; color: var(--danger); }
 .item-title { font-weight: 650; overflow-wrap: anywhere; }
 .meta { color: var(--muted); font-size: 12px; }
+.error { color: var(--danger); }
 .workspace { padding: 18px; max-height: 100vh; overflow: auto; }
 .topbar { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; margin-bottom: 12px; }
 .topbar h2 { margin: 0; font-size: 18px; overflow-wrap: anywhere; }
@@ -411,8 +412,10 @@ textarea { width: 100%; min-height: 70px; border: 1px solid var(--line); border-
         <div class="toolbar">
           <button id="playChunkBtn">播放片段</button>
           <button id="playContextBtn">播放上下文</button>
+          <a id="mediaLink" href="#">打开音频</a>
           <a id="vttLink" href="#">打开 VTT</a>
         </div>
+        <p class="meta error" id="mediaError"></p>
         <h3>当前字幕</h3>
         <div class="caption" id="captionText"></div>
       </section>
@@ -562,27 +565,79 @@ function renderLabelState() {
   const labelText = item.manual_decision ? item.manual_decision : "未审";
   document.getElementById("labelStatus").textContent = `${labelText} · ${(item.reason_tags || []).join(", ")}`;
 }
+function mediaInfo(row = ROWS[currentIndex]) {
+  return row.media || {};
+}
+function mediaError(message) {
+  document.getElementById("mediaError").textContent = message || "";
+}
+function safeSeek(time) {
+  const target = Number(time || 0);
+  try { media.currentTime = Number.isFinite(target) ? target : 0; } catch (_) {}
+}
+function setMediaSource(row) {
+  const info = mediaInfo(row);
+  const audioUrl = info.audio_url || "";
+  document.getElementById("mediaLink").href = audioUrl || "#";
+  document.getElementById("vttLink").href = info.vtt_url || "#";
+  if (activeVideo === row.video_id && media.dataset.audioUrl === audioUrl) return;
+  activeVideo = row.video_id;
+  rangeEnd = null;
+  media.pause();
+  media.innerHTML = "";
+  media.removeAttribute("src");
+  media.dataset.audioUrl = audioUrl;
+  if (!audioUrl) {
+    mediaError("音频文件未找到。");
+    media.load();
+    return;
+  }
+  const source = document.createElement("source");
+  source.src = audioUrl;
+  source.type = info.audio_mime || "audio/wav";
+  media.appendChild(source);
+  if (info.vtt_url) {
+    const track = document.createElement("track");
+    track.kind = "subtitles";
+    track.srclang = "ja";
+    track.label = "日本語";
+    track.src = info.vtt_url;
+    media.appendChild(track);
+  }
+  mediaError("");
+  media.load();
+}
+function seekWhenReady(time) {
+  if (media.readyState >= 1) {
+    safeSeek(time);
+    updateCaption();
+    return Promise.resolve();
+  }
+  return new Promise(resolve => {
+    const onLoaded = () => {
+      safeSeek(time);
+      updateCaption();
+      resolve();
+    };
+    media.addEventListener("loadedmetadata", onLoaded, {once: true});
+    media.load();
+  });
+}
 function loadRow(index) {
   currentIndex = Math.max(0, Math.min(ROWS.length - 1, index));
   const row = ROWS[currentIndex];
   ann(row);
-  if (activeVideo !== row.video_id) {
-    activeVideo = row.video_id;
-    media.src = (row.media || {}).audio_url || "";
-  }
-  rangeEnd = null;
+  setMediaSource(row);
   document.getElementById("rowTitle").textContent = `${currentIndex + 1} / ${ROWS.length} · ${row.video_label || row.video_id}`;
   document.getElementById("rowMeta").textContent = `${row.sample_id} · ${fmt(row.start)}-${fmt(row.end)} · p_drop=${fmt(row.display_prob_drop)}`;
   document.getElementById("asrText").textContent = row.text || "";
-  document.getElementById("vttLink").href = (row.media || {}).vtt_url || "#";
   renderMetrics(row);
   renderCues("chunkCues", row.chunk_subtitle_cues || []);
   renderCues("contextCues", row.context_subtitle_cues || []);
   renderCues("alignedSegments", row.aligned_segments || []);
   renderLabelState();
   renderList();
-  media.currentTime = Number(row.start || 0);
-  updateCaption();
+  seekWhenReady(row.start);
 }
 function setDecision(value) {
   const row = ROWS[currentIndex];
@@ -600,10 +655,21 @@ function toggleTag(value) {
   item.updated_at = new Date().toISOString();
   saveAnnotations();
 }
-function playRange(start, end) {
+async function playRange(start, end) {
+  const row = ROWS[currentIndex];
+  const info = mediaInfo(row);
+  setMediaSource(row);
+  if (!info.audio_url) {
+    mediaError("音频文件未找到。");
+    return;
+  }
   rangeEnd = Number(end);
-  media.currentTime = Number(start || 0);
-  media.play();
+  mediaError("");
+  await seekWhenReady(start);
+  const promise = media.play();
+  if (promise && typeof promise.catch === "function") {
+    promise.catch(error => mediaError(`播放失败：${error.message || error}`));
+  }
 }
 function updateCaption() {
   const row = ROWS[currentIndex];
@@ -676,6 +742,8 @@ document.getElementById("copyBtn").onclick = copyJsonl;
 document.getElementById("searchInput").oninput = renderList;
 document.getElementById("stateFilter").onchange = renderList;
 media.addEventListener("timeupdate", updateCaption);
+media.addEventListener("loadedmetadata", updateCaption);
+media.addEventListener("error", () => mediaError("媒体无法加载。请用审计服务从项目根目录打开，或点“打开音频”检查路径。"));
 loadRow(0);
 </script>
 </body>
