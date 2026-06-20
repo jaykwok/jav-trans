@@ -313,7 +313,8 @@ uv run python -m tools.web.smoke.summarize_job --job-id <job_id> --run-dir agent
 
 - `tools.audits.audit_nav`、`tools.audits.serve_audits.ps1`、`tools.audits.serve_audits.sh`：维护和启动本地审计导航页。
 - `tools.audits.generate_cueqc_cluster_audit_html`：生成 CueQC 簇级 keep/drop 审计页，必须显式传 `--archived-root` 和一个或多个 `--media-root`；页面使用单播放器懒加载播放 chunk 与上下文，不再为每条样本创建独立 audio 控件，也不再从旧 job 命名推导媒体路径。
-- `tools.audits.generate_*_audit_html`：生成字幕 A/B、CueQC prediction 和其他手工标注审计页。
+- `tools.audits.generate_cueqc_prediction_audit_html`：生成 CueQC 预测后的 false-drop 人工审计页，用于 Stage 2 / 主动学习闭环；默认只在模型判定为 drop 的池内按高置信、近阈值、风险桶和随机监控混合抽样，必须显式传 `--archived-root` 和一个或多个 `--media-root`，不再接受旧 `--baseline-root`。
+- `tools.audits.generate_*_audit_html`：生成字幕 A/B 和其他手工标注审计页。
 - `tools.boundary.*`、`tools.boundary.ja.*`：Boundary Refiner 训练数据构建、SpeechBoundary-JA 训练和 frame score 导出工具。
 - `tools.boundary.export_cueqc_drop_hardcases`：把 CueQC false-drop 审计中已确认可丢弃的 chunk 导出为 SpeechBoundary-JA hard-negative 候选池；不会生成 Boundary Refiner 训练标签。
 - `tools.boundary.prepare_cueqc_drop_hard_negative_sources`：把 CueQC `drop_ok` hard-negative 候选补回审计音频，并切出 SpeechBoundary-JA negative labels；不会直接启动训练。
