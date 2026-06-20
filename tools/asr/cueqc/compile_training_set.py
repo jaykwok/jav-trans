@@ -66,7 +66,10 @@ def _broadcast_cluster_labels(
     reason_by_cluster: dict[str, str] = {}
     for row in cluster_labels:
         cluster_id = str(row.get("cluster_id") or "").strip()
+        seed_action = str(row.get("seed_action") or "").strip()
         decision = str(row.get("display_decision") or "").strip()
+        if seed_action != "use_seed" or row.get("training_label_included") is False:
+            continue
         if cluster_id and decision:
             decision_by_cluster[cluster_id] = decision
             reason_by_cluster[cluster_id] = str(row.get("classification_reason") or "").strip()

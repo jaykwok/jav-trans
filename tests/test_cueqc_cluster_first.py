@@ -356,11 +356,15 @@ def test_cueqc_cluster_broadcast_abstains_mixed_and_skip_labels():
         {**_candidate(0, "あ"), "cluster_id": "cluster_00"},
         {**_candidate(1, ""), "cluster_id": "cluster_01"},
         {**_candidate(2, ""), "cluster_id": "cluster_02"},
+        {**_candidate(3, ""), "cluster_id": "cluster_03"},
+        {**_candidate(4, ""), "cluster_id": "cluster_04"},
     ]
     cluster_labels = [
         {"cluster_id": "cluster_00", "seed_action": "use_seed", "display_decision": "keep"},
         {"cluster_id": "cluster_01", "seed_action": "mixed_skip", "display_decision": ""},
         {"cluster_id": "cluster_02", "seed_action": "skip", "display_decision": ""},
+        {"cluster_id": "cluster_03", "seed_action": "mixed_skip", "display_decision": "drop"},
+        {"cluster_id": "cluster_04", "seed_action": "use_seed", "display_decision": "drop", "training_label_included": False},
     ]
 
     manual_labels = _broadcast_cluster_labels(clusters, cluster_labels)

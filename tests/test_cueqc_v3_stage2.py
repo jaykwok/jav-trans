@@ -413,6 +413,22 @@ def test_cueqc_feature_shards_runs_resumable_extract_commands(tmp_path: Path, mo
     ]
 
 
+def test_cueqc_v3_predict_requires_explicit_low_drop_threshold():
+    base_args = [
+        "--features", "features.pt",
+        "--checkpoint", "checkpoint.pt",
+        "--output-dir", "pred",
+        "--drop-threshold", "0.4",
+    ]
+
+    with pytest.raises(SystemExit):
+        predict_v3_fusion.parse_args(base_args)
+
+    args = predict_v3_fusion.parse_args([*base_args, "--allow-low-drop-threshold"])
+    assert args.drop_threshold == 0.4
+    assert args.allow_low_drop_threshold is True
+
+
 def test_cueqc_v3_predict_exports_high_confidence_pseudo_labels(tmp_path: Path, monkeypatch):
     features_path = tmp_path / "features.pt"
     checkpoint_path = tmp_path / "checkpoint.pt"
