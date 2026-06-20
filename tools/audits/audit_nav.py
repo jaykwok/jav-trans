@@ -13,7 +13,7 @@ from typing import Any, Mapping
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 AUDIT_ROOT = PROJECT_ROOT / "agents" / "audits"
 AUDIT_RM_ROOT = PROJECT_ROOT / "agents" / "rm" / "audit-deletions"
-AUDIT_SERVER_COMMAND = "tools/audits/serve_audits.sh"
+AUDIT_SERVER_COMMAND = "tools/audits/serve_audits.ps1"
 ANON_LABELS = {
     "NAMH-055": "匿名样片 A",
     "REAL-988": "匿名样片 B",

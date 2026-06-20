@@ -141,7 +141,7 @@ Boundary Refiner v5 只规划 speech core：Mamba2 输出 `start_delta + end_del
 | 低配 ASR | `jaykwok/Qwen3-ASR-0.6B-JA-Anime-Galgame` | `models/jaykwok-Qwen3-ASR-0.6B-JA-Anime-Galgame` |
 | SpeechBoundary-JA frozen feature | 默认同 ASR repo id，推荐 `jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame` | `models/jaykwok-Qwen3-ASR-1.7B-JA-Anime-Galgame` |
 | SpeechBoundary-JA scorer | Mamba2 frame boundary scorer v3；按当前 ASR repo id 选择 1.7B / 0.6B checkpoint | `src/boundary/ja/checkpoints/speech_boundary_ja_feature_scorer.jaykwok-Qwen3-ASR-1.7B-JA-Anime-Galgame.pt` |
-| CueQC v3-Fusion | learned Mamba2 fusion checkpoint，输入 ASR encoder features、token trace、decoder stats 和 chunk metadata，按当前 ASR repo id 选择 1.7B / 0.6B checkpoint | `src/asr/checkpoints/cueqc_mamba_v3_fusion.jaykwok-Qwen3-ASR-1.7B-JA-Anime-Galgame.pt` |
+| CueQC v3-Fusion | learned Mamba2 fusion checkpoint；不是纯文本分类器，输入 ASR encoder features、teacher-forced token trace、decoder stats、text/cue/boundary/adjacency/asr_signals/subtitle_timing 等 structured metadata，输出 keep/drop 二分类；按当前 ASR repo id 选择 1.7B / 0.6B checkpoint | `src/asr/checkpoints/cueqc_mamba_v3_fusion.jaykwok-Qwen3-ASR-1.7B-JA-Anime-Galgame.pt` |
 | Boundary Refiner | learned `transformers.Mamba2Model` true v5 delta-only checkpoint，按当前 ASR repo id 选择 1.7B / 0.6B checkpoint | `src/boundary/checkpoints/boundary_refiner.jaykwok-Qwen3-ASR-1.7B-JA-Anime-Galgame.pt` |
 
 常用配置见 [.env.example](.env.example)。通常只需要修改 API key、翻译模型、`HF_ENDPOINT`、ASR backend 和 batch size。
@@ -312,7 +312,8 @@ uv run python -m tools.web.smoke.summarize_job --job-id <job_id> --run-dir agent
 ### 审计与 Boundary
 
 - `tools.audits.audit_nav`、`tools.audits.serve_audits.ps1`、`tools.audits.serve_audits.sh`：维护和启动本地审计导航页。
-- `tools.audits.generate_*_audit_html`：生成字幕 A/B、CueQC prediction、cluster review 和手工标注审计页。
+- `tools.audits.generate_cueqc_cluster_audit_html`：生成 CueQC 簇级 keep/drop 审计页，必须显式传 `--archived-root` 和一个或多个 `--media-root`；页面支持播放 chunk 与上下文，不再从旧 job 命名推导媒体路径。
+- `tools.audits.generate_*_audit_html`：生成字幕 A/B、CueQC prediction 和其他手工标注审计页。
 - `tools.boundary.*`、`tools.boundary.ja.*`：Boundary Refiner 训练数据构建、SpeechBoundary-JA 训练和 frame score 导出工具。
 - `tools.boundary.export_cueqc_drop_hardcases`：把 CueQC false-drop 审计中已确认可丢弃的 chunk 导出为 SpeechBoundary-JA hard-negative 候选池；不会生成 Boundary Refiner 训练标签。
 - `tools.boundary.prepare_cueqc_drop_hard_negative_sources`：把 CueQC `drop_ok` hard-negative 候选补回审计音频，并切出 SpeechBoundary-JA negative labels；不会直接启动训练。

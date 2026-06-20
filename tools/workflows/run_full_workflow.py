@@ -54,6 +54,19 @@ def timestamped_label(value: str) -> str:
     return f"{time.strftime('%Y%m%d_%H%M%S')}_{label}"
 
 
+def peak_cuda_reserved_mb(snapshots: list[dict[str, Any]]) -> float | None:
+    values = []
+    for snapshot in snapshots:
+        if not isinstance(snapshot, dict):
+            continue
+        value = snapshot.get("max_reserved_mb")
+        try:
+            values.append(float(value))
+        except (TypeError, ValueError):
+            continue
+    return round(max(values), 1) if values else None
+
+
 def speech_boundary_operating_point(results: list[dict[str, Any]]) -> str:
     for result in results:
         signature = result.get("boundary_signature") or {}
@@ -194,6 +207,7 @@ def configure_env(args: argparse.Namespace) -> None:
         os.environ["CUEQC_MODEL_PATH_BY_REPO"] = args.cueqc_model_path_by_repo
     else:
         os.environ.pop("CUEQC_MODEL_PATH_BY_REPO", None)
+    os.environ["CUEQC_INFERENCE_BATCH_SIZE"] = str(args.cueqc_inference_batch_size)
     os.environ["BOUNDARY_PLANNER_MAX_CORE_CHUNK_S"] = str(args.boundary_planner_max_core_chunk_s)
     os.environ["BOUNDARY_PLANNER_TARGET_CHUNK_S"] = str(args.boundary_planner_target_chunk_s)
     os.environ["BOUNDARY_PLANNER_MIN_CHUNK_S"] = str(args.boundary_planner_min_chunk_s)
@@ -250,6 +264,7 @@ def build_context(*, args: argparse.Namespace, paths: RunPaths, video: Path):
         "BOUNDARY_REFINER_MODEL_PATH_BY_REPO": os.getenv("BOUNDARY_REFINER_MODEL_PATH_BY_REPO", ""),
         "BOUNDARY_REFINER_DEVICE": os.getenv("BOUNDARY_REFINER_DEVICE", "auto"),
         "CUEQC_MODEL_PATH_BY_REPO": os.getenv("CUEQC_MODEL_PATH_BY_REPO", ""),
+        "CUEQC_INFERENCE_BATCH_SIZE": os.getenv("CUEQC_INFERENCE_BATCH_SIZE", "64"),
         "BOUNDARY_PLANNER_MAX_CORE_CHUNK_S": os.getenv(
             "BOUNDARY_PLANNER_MAX_CORE_CHUNK_S",
             "5.0",
@@ -367,6 +382,13 @@ def run_video(args: argparse.Namespace, paths: RunPaths, video: Path) -> dict[st
         "run_log": str(run_log) if run_log else "",
     }
     timings = read_json(artifacts.timings_path)
+    asr_details = timings.get("asr_details") if isinstance(timings.get("asr_details"), dict) else {}
+    cuda_memory = asr_details.get("cuda_memory") if isinstance(asr_details.get("cuda_memory"), list) else []
+    pipeline_cuda_memory = (
+        asr_details.get("pipeline_cuda_memory")
+        if isinstance(asr_details.get("pipeline_cuda_memory"), list)
+        else []
+    )
     result = {
         "video": video.name,
         "video_path": project_rel(video),
@@ -377,7 +399,11 @@ def run_video(args: argparse.Namespace, paths: RunPaths, video: Path) -> dict[st
         "raw_output_paths": [project_rel(path) for path in output_paths],
         "counts": timings.get("counts", {}),
         "stage_timings": timings.get("stage_timings", {}),
-        "boundary_signature": (timings.get("asr_details") or {}).get("boundary_signature", {}),
+        "cuda_memory_peak_reserved_mb": peak_cuda_reserved_mb(cuda_memory),
+        "pipeline_cuda_memory_peak_reserved_mb": peak_cuda_reserved_mb(pipeline_cuda_memory),
+        "cuda_memory": cuda_memory,
+        "pipeline_cuda_memory": pipeline_cuda_memory,
+        "boundary_signature": asr_details.get("boundary_signature", {}),
     }
     print(
         f"=== DONE {video.name} elapsed={elapsed:.1f}s "
@@ -403,6 +429,8 @@ def write_summary(paths: RunPaths, args: argparse.Namespace, results: list[dict[
         "speech_boundary_apply_cut_to_speech": bool(args.speech_boundary_apply_cut_to_speech),
         "speech_boundary_frame_dilation_s": args.speech_boundary_frame_dilation_s,
         "speech_boundary_scorer_checkpoint_by_repo": args.speech_boundary_scorer_checkpoint_by_repo,
+        "asr_batch_size": args.asr_batch_size,
+        "cueqc_inference_batch_size": args.cueqc_inference_batch_size,
         "boundary_planner": {
             "feature_frame_hop_s": args.boundary_feature_frame_hop_s,
             "max_core_chunk_s": args.boundary_planner_max_core_chunk_s,
@@ -432,8 +460,8 @@ def write_summary(paths: RunPaths, args: argparse.Namespace, results: list[dict[
         f"- Translation: `{'on' if args.translate else 'off'}`",
         f"- Runtime root: `{project_rel(paths.root)}`",
         "",
-        "| video | status | segments | blocks | asr_s | total_s | srt |",
-        "| --- | --- | ---: | ---: | ---: | ---: | --- |",
+        "| video | status | segments | blocks | asr_s | total_s | cuda_peak_mb | srt |",
+        "| --- | --- | ---: | ---: | ---: | ---: | ---: | --- |",
     ]
     for result in results:
         timings = result.get("stage_timings") or {}
@@ -445,6 +473,7 @@ def write_summary(paths: RunPaths, args: argparse.Namespace, results: list[dict[
             f"{int(counts.get('blocks') or 0)} | "
             f"{float(timings.get('asr_alignment_total_s') or 0.0):.1f} | "
             f"{float(timings.get('pipeline_total_s') or result.get('elapsed_s') or 0.0):.1f} | "
+            f"{float(result.get('cuda_memory_peak_reserved_mb') or 0.0):.1f} | "
             f"`{project_rel(paths_payload.get('srt'))}` |"
         )
     paths.summary_md.write_text("\n".join(lines) + "\n", encoding="utf-8")
@@ -497,6 +526,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--cueqc-model-path-by-repo",
         default=os.getenv("CUEQC_MODEL_PATH_BY_REPO", ""),
         help="Required repo-id checkpoint map: '<repo_id>=<cueqc.pt>[,<repo_id>=...]'.",
+    )
+    parser.add_argument(
+        "--cueqc-inference-batch-size",
+        type=int,
+        default=_env_int("CUEQC_INFERENCE_BATCH_SIZE", 64),
+        help="CueQC v3-Fusion inference batch size.",
     )
     parser.add_argument("--boundary-refiner-device", default=os.getenv("BOUNDARY_REFINER_DEVICE", "auto"))
     parser.add_argument("--boundary-planner-max-core-chunk-s", type=float, default=_env_float("BOUNDARY_PLANNER_MAX_CORE_CHUNK_S", 5.0))
@@ -585,6 +620,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         parser.error("--speech-boundary-cut-threshold must be non-negative")
     if args.boundary_planner_sequence_batch_size <= 0:
         parser.error("--boundary-planner-sequence-batch-size must be positive")
+    if args.cueqc_inference_batch_size <= 0:
+        parser.error("--cueqc-inference-batch-size must be positive")
     return args
 
 
