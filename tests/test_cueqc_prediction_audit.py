@@ -6,7 +6,14 @@ from pathlib import Path
 from tools.audits import generate_cueqc_prediction_audit_html as audit
 
 
-def _prediction(index: int, *, video_id: str, p_drop: float, text: str = "...") -> dict:
+def _prediction(
+    index: int,
+    *,
+    video_id: str,
+    p_drop: float,
+    text: str = "...",
+    drop_threshold: float = 0.85,
+) -> dict:
     return {
         "schema": "cueqc_prediction_v3_fusion_v1",
         "sample_id": f"cueqc-{video_id}-chunk{index:05d}",
@@ -20,6 +27,7 @@ def _prediction(index: int, *, video_id: str, p_drop: float, text: str = "...") 
         "confidence": p_drop,
         "display_prob_drop": p_drop,
         "display_prob_keep": 1.0 - p_drop,
+        "drop_threshold": drop_threshold,
     }
 
 
@@ -37,12 +45,48 @@ def test_cueqc_prediction_audit_samples_across_videos_and_bins():
     assert {row["video_id"] for row in selected} == {"AAA", "BBB"}
     assert all(row["audit_id"] for row in selected)
     assert all(row["audit_bucket"] for row in selected)
+    assert all(row["audit_sample_reason"] for row in selected)
+
+
+def test_cueqc_prediction_audit_mixed_policy_marks_sampling_reasons():
+    rows = [
+        _prediction(0, video_id="AAA", p_drop=0.95, text="今日はいい"),
+        _prediction(1, video_id="BBB", p_drop=0.852, text="普通の文"),
+        _prediction(2, video_id="CCC", p_drop=0.89, text="..."),
+        _prediction(3, video_id="DDD", p_drop=0.88, text="別の文"),
+        _prediction(4, video_id="EEE", p_drop=0.93, text="追加文"),
+    ]
+
+    selected = audit.select_audit_rows(
+        rows,
+        max_drop=4,
+        min_drop_confidence=0.85,
+        seed=13,
+        sampling_policy="mixed",
+        high_confidence=0.92,
+        near_threshold_margin=0.01,
+        high_confidence_fraction=0.25,
+        near_threshold_fraction=0.25,
+        risk_fraction=0.25,
+    )
+
+    reasons = {row["audit_sample_reason"] for row in selected}
+    assert len(selected) == 4
+    assert reasons == {
+        "high_confidence_drop",
+        "near_threshold_drop",
+        "risk_bucket_drop",
+        "random_drop_monitor",
+    }
+    assert any(row["audit_risk_bucket"] == "text:punct_or_empty" for row in selected)
+    assert all(row["audit_sampling_policy"] == "mixed" for row in selected)
 
 
 def test_cueqc_prediction_audit_builds_html_with_label_schema(tmp_path: Path):
-    baseline_root = tmp_path / "baseline"
-    archived = baseline_root / "archived" / "AAA"
-    audio_dir = baseline_root / "jobs" / "AAA_b5" / "audio"
+    archived_root = tmp_path / "archived"
+    media_root = tmp_path / "workflow-media" / "custom_job_name" / "sound"
+    archived = archived_root / "AAA"
+    audio_dir = media_root
     archived.mkdir(parents=True)
     audio_dir.mkdir(parents=True)
     (archived / "AAA.ja.srt").write_text("1\n00:00:00,000 --> 00:00:01,000\n...\n\n", encoding="utf-8")
@@ -56,7 +100,8 @@ def test_cueqc_prediction_audit_builds_html_with_label_schema(tmp_path: Path):
 
     summary = audit.build_audit(
         predictions_jsonl=predictions,
-        baseline_root=baseline_root,
+        archived_root=archived_root,
+        media_roots=[media_root],
         output_dir=tmp_path / "audit",
         title="CueQC false drop",
         dataset_id="test-dataset",
@@ -65,6 +110,10 @@ def test_cueqc_prediction_audit_builds_html_with_label_schema(tmp_path: Path):
 
     html = (tmp_path / "audit" / "index.html").read_text(encoding="utf-8")
     assert summary["review_item_count"] == 1
+    assert summary["archived_root"].endswith("archived")
+    assert summary["media_roots"][0].endswith("workflow-media/custom_job_name/sound")
+    assert "baseline_root" not in summary
+    assert summary["media_by_video"]["AAA"]["audio_exists"] is True
     assert summary["label_schema"] == audit.LABEL_SCHEMA
     assert "误删应保留" in html
     assert "呼吸声" in html

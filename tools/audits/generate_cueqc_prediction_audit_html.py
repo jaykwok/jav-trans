@@ -8,7 +8,7 @@ import random
 import sys
 from collections import Counter, defaultdict
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any, Mapping, Sequence
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -93,44 +93,205 @@ def _sample_round_robin(rows: list[dict[str, Any]], *, limit: int, seed: int) ->
     return selected
 
 
+def _drop_confidence(row: Mapping[str, Any]) -> float:
+    return row_float(row, "display_prob_drop", row_float(row, "confidence"))
+
+
+def _drop_threshold(row: Mapping[str, Any], *, min_drop_confidence: float) -> float:
+    return row_float(row, "drop_threshold", min_drop_confidence)
+
+
+def _drop_margin(row: Mapping[str, Any], *, min_drop_confidence: float) -> float:
+    return _drop_confidence(row) - _drop_threshold(row, min_drop_confidence=min_drop_confidence)
+
+
+def _row_key(row: Mapping[str, Any]) -> str:
+    sample_id = str(row.get("sample_id") or "").strip()
+    if sample_id:
+        return sample_id
+    return "|".join(
+        [
+            str(row.get("video_id") or ""),
+            str(row.get("chunk_index") or ""),
+            f"{row_float(row, 'start'):.3f}",
+            f"{row_float(row, 'end'):.3f}",
+        ]
+    )
+
+
+def _risk_bucket(row: Mapping[str, Any]) -> str:
+    text_bucket = _text_bucket(row)
+    if text_bucket in {"punct_or_empty", "short_text"}:
+        return f"text:{text_bucket}"
+    compact = str(row.get("text") or "").strip().replace(" ", "")
+    if len(compact) >= 3 and len(set(compact)) <= 2:
+        return "text:repeated"
+    duration = max(0.0, row_float(row, "end") - row_float(row, "start"))
+    if 0.0 < duration < 0.45:
+        return "timing:very_short"
+    if duration > 12.0:
+        return "timing:very_long"
+    return "standard"
+
+
+def _is_drop_candidate(row: Mapping[str, Any], *, min_drop_confidence: float) -> bool:
+    return str(row.get("display_hint") or "") == "drop" and _drop_confidence(row) >= min_drop_confidence
+
+
+def _mixed_quotas(
+    *,
+    max_drop: int,
+    high_confidence_fraction: float,
+    near_threshold_fraction: float,
+    risk_fraction: float,
+) -> dict[str, int]:
+    fractions = {
+        "high_confidence_drop": high_confidence_fraction,
+        "near_threshold_drop": near_threshold_fraction,
+        "risk_bucket_drop": risk_fraction,
+    }
+    if any(value < 0.0 for value in fractions.values()):
+        raise ValueError("sampling fractions must be non-negative")
+    if sum(fractions.values()) > 1.0 + 1e-9:
+        raise ValueError("sampling fractions must sum to <= 1.0")
+    quotas = {key: int(round(max_drop * value)) for key, value in fractions.items()}
+    while sum(quotas.values()) > max_drop:
+        for key in ("risk_bucket_drop", "near_threshold_drop", "high_confidence_drop"):
+            if quotas[key] > 0:
+                quotas[key] -= 1
+                break
+    quotas["random_drop_monitor"] = max(0, max_drop - sum(quotas.values()))
+    return quotas
+
+
+def _sample_labeled_pool(
+    rows: list[dict[str, Any]],
+    *,
+    limit: int,
+    seed: int,
+    selected_keys: set[str],
+    reason: str,
+) -> list[tuple[dict[str, Any], str]]:
+    if limit <= 0:
+        return []
+    available = [row for row in rows if _row_key(row) not in selected_keys]
+    sampled = _sample_round_robin(available, limit=limit, seed=seed)
+    labeled: list[tuple[dict[str, Any], str]] = []
+    for row in sampled:
+        selected_keys.add(_row_key(row))
+        labeled.append((row, reason))
+    return labeled
+
+
 def select_audit_rows(
     predictions: list[dict[str, Any]],
     *,
     max_drop: int,
     min_drop_confidence: float,
     seed: int,
+    sampling_policy: str = "mixed",
+    high_confidence: float = 0.91,
+    near_threshold_margin: float = 0.03,
+    high_confidence_fraction: float = 0.40,
+    near_threshold_fraction: float = 0.30,
+    risk_fraction: float = 0.20,
 ) -> list[dict[str, Any]]:
     drop_rows = [
         row
         for row in predictions
-        if str(row.get("display_hint") or "") == "drop"
-        and row_float(row, "display_prob_drop", row_float(row, "confidence")) >= min_drop_confidence
+        if _is_drop_candidate(row, min_drop_confidence=min_drop_confidence)
     ]
-    sampled = _sample_round_robin(drop_rows, limit=max_drop, seed=seed)
-    sampled.sort(
-        key=lambda row: (
-            str(row.get("video_id") or ""),
-            row_float(row, "start"),
-            int(row.get("chunk_index") or 0),
+    selected_pairs: list[tuple[dict[str, Any], str]] = []
+    if sampling_policy == "high_confidence":
+        selected_pairs = [
+            (row, "stratified_drop")
+            for row in _sample_round_robin(drop_rows, limit=max_drop, seed=seed)
+        ]
+    elif sampling_policy == "mixed":
+        quotas = _mixed_quotas(
+            max_drop=max_drop,
+            high_confidence_fraction=high_confidence_fraction,
+            near_threshold_fraction=near_threshold_fraction,
+            risk_fraction=risk_fraction,
+        )
+        selected_keys: set[str] = set()
+        high_pool = [row for row in drop_rows if _drop_confidence(row) >= high_confidence]
+        near_pool = [
+            row
+            for row in drop_rows
+            if 0.0 <= _drop_margin(row, min_drop_confidence=min_drop_confidence) <= near_threshold_margin
+        ]
+        risk_pool = [row for row in drop_rows if _risk_bucket(row) != "standard"]
+        selected_pairs.extend(
+            _sample_labeled_pool(
+                high_pool,
+                limit=quotas["high_confidence_drop"],
+                seed=seed + 11,
+                selected_keys=selected_keys,
+                reason="high_confidence_drop",
+            )
+        )
+        selected_pairs.extend(
+            _sample_labeled_pool(
+                near_pool,
+                limit=quotas["near_threshold_drop"],
+                seed=seed + 23,
+                selected_keys=selected_keys,
+                reason="near_threshold_drop",
+            )
+        )
+        selected_pairs.extend(
+            _sample_labeled_pool(
+                risk_pool,
+                limit=quotas["risk_bucket_drop"],
+                seed=seed + 37,
+                selected_keys=selected_keys,
+                reason="risk_bucket_drop",
+            )
+        )
+        selected_pairs.extend(
+            _sample_labeled_pool(
+                drop_rows,
+                limit=max_drop - len(selected_pairs),
+                seed=seed + 53,
+                selected_keys=selected_keys,
+                reason="random_drop_monitor",
+            )
+        )
+    else:
+        raise ValueError(f"unknown sampling_policy: {sampling_policy!r}")
+
+    selected_pairs.sort(
+        key=lambda pair: (
+            str(pair[0].get("video_id") or ""),
+            row_float(pair[0], "start"),
+            int(pair[0].get("chunk_index") or 0),
         )
     )
     rows: list[dict[str, Any]] = []
-    for index, row in enumerate(sampled):
+    for index, (row, reason) in enumerate(selected_pairs[:max_drop]):
         item = dict(row)
         start = row_float(item, "start")
         end = row_float(item, "end", start)
+        risk_bucket = _risk_bucket(item)
         item.update(
             {
                 "audit_id": str(item.get("sample_id") or f"cueqc-pred-{index:05d}"),
                 "audit_index": index,
-                "audit_bucket": f"{str(item.get('video_id') or '')}:{_confidence_bin(item)}:{_text_bucket(item)}",
+                "audit_bucket": (
+                    f"{reason}:{str(item.get('video_id') or '')}:"
+                    f"{_confidence_bin(item)}:{_text_bucket(item)}:{risk_bucket}"
+                ),
+                "audit_sample_reason": reason,
+                "audit_sampling_policy": sampling_policy,
+                "audit_risk_bucket": risk_bucket,
+                "drop_margin": round(_drop_margin(item, min_drop_confidence=min_drop_confidence), 6),
                 "duration_s": max(0.0, end - start),
                 "video_label": ANON_LABELS.get(str(item.get("video_id") or ""), str(item.get("video_id") or "")),
             }
         )
         rows.append(item)
     return rows
-
 
 HTML_TEMPLATE = """<!doctype html>
 <html lang="zh-CN">
@@ -377,6 +538,9 @@ function renderMetrics(row) {
     ["p_drop", row.display_prob_drop],
     ["p_keep", row.display_prob_keep],
     ["阈值", row.drop_threshold],
+    ["阈值差", row.drop_margin],
+    ["抽样", row.audit_sample_reason],
+    ["风险桶", row.audit_risk_bucket],
     ["bucket", row.audit_bucket],
     ["chunk", row.chunk_index],
     ["时长", row.duration_s]
@@ -468,6 +632,11 @@ function exportRows() {
       display_prob_drop: row.display_prob_drop,
       display_prob_keep: row.display_prob_keep,
       confidence: row.confidence,
+      audit_sample_reason: row.audit_sample_reason,
+      audit_sampling_policy: row.audit_sampling_policy,
+      audit_risk_bucket: row.audit_risk_bucket,
+      audit_bucket: row.audit_bucket,
+      drop_margin: row.drop_margin,
       manual_decision: item.manual_decision,
       is_false_drop: item.manual_decision === "false_drop_keep",
       reason_tags: item.reason_tags || [],
@@ -539,13 +708,20 @@ def _page_html(
 def build_audit(
     *,
     predictions_jsonl: Path,
-    baseline_root: Path,
+    archived_root: Path,
+    media_roots: Sequence[Path],
     output_dir: Path,
     title: str,
     dataset_id: str,
     max_drop: int = 200,
     min_drop_confidence: float = 0.85,
     seed: int = 20260617,
+    sampling_policy: str = "mixed",
+    high_confidence: float = 0.91,
+    near_threshold_margin: float = 0.03,
+    high_confidence_fraction: float = 0.40,
+    near_threshold_fraction: float = 0.30,
+    risk_fraction: float = 0.20,
     refresh_nav: bool = False,
 ) -> dict[str, Any]:
     predictions = read_jsonl(predictions_jsonl)
@@ -554,10 +730,17 @@ def build_audit(
         max_drop=max_drop,
         min_drop_confidence=min_drop_confidence,
         seed=seed,
+        sampling_policy=sampling_policy,
+        high_confidence=high_confidence,
+        near_threshold_margin=near_threshold_margin,
+        high_confidence_fraction=high_confidence_fraction,
+        near_threshold_fraction=near_threshold_fraction,
+        risk_fraction=risk_fraction,
     )
     output_dir.mkdir(parents=True, exist_ok=True)
     media_by_video, cues_by_video, aligned_by_video = discover_media(
-        baseline_root=baseline_root,
+        archived_root=archived_root,
+        media_roots=media_roots,
         output_dir=output_dir,
         rows=rows,
     )
@@ -589,16 +772,24 @@ def build_audit(
         "html": project_rel(index_path),
         "predictions_path": project_rel(predictions_jsonl),
         "audit_items_path": project_rel(items_path),
-        "baseline_root": project_rel(baseline_root),
+        "archived_root": project_rel(archived_root),
+        "media_roots": [project_rel(path) for path in media_roots],
         "review_item_count": len(rows),
         "prediction_records": len(predictions),
         "prediction_counts": dict(counts),
         "sample_counts_by_video": dict(sample_counts),
         "sample_policy": {
+            "sampling_policy": sampling_policy,
             "max_drop": max_drop,
             "min_drop_confidence": min_drop_confidence,
+            "high_confidence": high_confidence,
+            "near_threshold_margin": near_threshold_margin,
+            "high_confidence_fraction": high_confidence_fraction,
+            "near_threshold_fraction": near_threshold_fraction,
+            "risk_fraction": risk_fraction,
+            "random_fraction": round(max(0.0, 1.0 - high_confidence_fraction - near_threshold_fraction - risk_fraction), 6),
             "seed": seed,
-            "strata": ["video_id", "drop_confidence_bin", "text_bucket"],
+            "strata": ["video_id", "drop_confidence_bin", "text_bucket", "audit_sample_reason"],
         },
         "media_enabled": True,
         "media_mode": "audio",
@@ -620,12 +811,24 @@ def build_audit(
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Generate a CueQC prediction false-drop audit page.")
     parser.add_argument("--predictions", required=True, help="cueqc_predictions.jsonl")
-    parser.add_argument("--baseline-root", required=True, help="Baseline run root containing archived/ and jobs/")
+    parser.add_argument("--archived-root", required=True, help="Archive root containing <video_id>/<video_id>.ja.srt and aligned segments")
+    parser.add_argument(
+        "--media-root",
+        action="append",
+        required=True,
+        help="Audio/media search root. Repeat for multiple workflow job or media directories.",
+    )
     parser.add_argument("--output-dir", required=True)
     parser.add_argument("--title", required=True)
     parser.add_argument("--dataset-id", required=True)
     parser.add_argument("--max-drop", type=int, default=200)
     parser.add_argument("--min-drop-confidence", type=float, default=0.85)
+    parser.add_argument("--sampling-policy", choices=["mixed", "high_confidence"], default="mixed")
+    parser.add_argument("--high-confidence", type=float, default=0.91)
+    parser.add_argument("--near-threshold-margin", type=float, default=0.03)
+    parser.add_argument("--high-confidence-fraction", type=float, default=0.40)
+    parser.add_argument("--near-threshold-fraction", type=float, default=0.30)
+    parser.add_argument("--risk-fraction", type=float, default=0.20)
     parser.add_argument("--seed", type=int, default=20260617)
     parser.add_argument("--refresh-nav", action="store_true")
     args = parser.parse_args(argv)
@@ -633,6 +836,17 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         parser.error("--max-drop must be non-negative")
     if not 0.0 <= args.min_drop_confidence <= 1.0:
         parser.error("--min-drop-confidence must be in [0, 1]")
+    if not 0.0 <= args.high_confidence <= 1.0:
+        parser.error("--high-confidence must be in [0, 1]")
+    if args.high_confidence < args.min_drop_confidence:
+        parser.error("--high-confidence must be >= --min-drop-confidence")
+    if args.near_threshold_margin < 0.0:
+        parser.error("--near-threshold-margin must be non-negative")
+    fractions = [args.high_confidence_fraction, args.near_threshold_fraction, args.risk_fraction]
+    if any(value < 0.0 or value > 1.0 for value in fractions):
+        parser.error("sampling fractions must be in [0, 1]")
+    if sum(fractions) > 1.0 + 1e-9:
+        parser.error("sampling fractions must sum to <= 1.0")
     return args
 
 
@@ -640,13 +854,20 @@ def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
     summary = build_audit(
         predictions_jsonl=project_path(args.predictions),
-        baseline_root=project_path(args.baseline_root),
+        archived_root=project_path(args.archived_root),
+        media_roots=[project_path(path) for path in args.media_root],
         output_dir=project_path(args.output_dir),
         title=args.title,
         dataset_id=args.dataset_id,
         max_drop=args.max_drop,
         min_drop_confidence=args.min_drop_confidence,
         seed=args.seed,
+        sampling_policy=args.sampling_policy,
+        high_confidence=args.high_confidence,
+        near_threshold_margin=args.near_threshold_margin,
+        high_confidence_fraction=args.high_confidence_fraction,
+        near_threshold_fraction=args.near_threshold_fraction,
+        risk_fraction=args.risk_fraction,
         refresh_nav=args.refresh_nav,
     )
     print(json.dumps({"ok": True, "html": summary["html"], "review_item_count": summary["review_item_count"]}, ensure_ascii=False, indent=2))
