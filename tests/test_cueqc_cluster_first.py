@@ -6,7 +6,7 @@ from pathlib import Path
 from asr import cueqc
 from boundary.sequence_features import FrameSequenceFeatureProvider
 from tools.asr.cueqc.cluster_candidates import cluster_rows, main as cluster_main
-from tools.asr.cueqc.compile_training_set import compile_records
+from tools.asr.cueqc.compile_training_set import _broadcast_cluster_labels, compile_records
 from tools.asr.cueqc.export_candidates import aligned_payload_to_candidates
 
 
@@ -349,6 +349,32 @@ def test_cueqc_training_compile_cluster_labels_only_keep_drop():
     assert by_id["sample-002"]["targets"]["display_decision"] == "drop"
     assert by_id["sample-002"]["targets"]["display_label"] == 0
     assert summary["target_labels"]["display_decision"] == ["drop", "keep"]
+
+
+def test_cueqc_cluster_broadcast_abstains_mixed_and_skip_labels():
+    clusters = [
+        {**_candidate(0, "あ"), "cluster_id": "cluster_00"},
+        {**_candidate(1, ""), "cluster_id": "cluster_01"},
+        {**_candidate(2, ""), "cluster_id": "cluster_02"},
+    ]
+    cluster_labels = [
+        {"cluster_id": "cluster_00", "seed_action": "use_seed", "display_decision": "keep"},
+        {"cluster_id": "cluster_01", "seed_action": "mixed_skip", "display_decision": ""},
+        {"cluster_id": "cluster_02", "seed_action": "skip", "display_decision": ""},
+    ]
+
+    manual_labels = _broadcast_cluster_labels(clusters, cluster_labels)
+    records, skipped, summary = compile_records(
+        clusters=clusters,
+        manual_labels=manual_labels,
+        min_cluster_agreement=0.0,
+    )
+
+    assert [row["sample_id"] for row in manual_labels] == ["sample-000"]
+    assert len(records) == 1
+    assert records[0]["targets"]["display_decision"] == "keep"
+    assert summary["counts"]["display:keep"] == 1
+    assert {row["reason"] for row in skipped} == {"missing_manual_label"}
 
 
 def test_cueqc_shadow_report_uses_pending_placeholder_before_model_decision():

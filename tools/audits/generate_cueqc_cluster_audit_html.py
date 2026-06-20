@@ -491,6 +491,7 @@ a {{ color: var(--accent); text-decoration: none; }}
 .cluster-audio-head {{ display: flex; align-items: baseline; justify-content: space-between; gap: 8px; flex-wrap: wrap; }}
 .cluster-audio-meta {{ color: var(--muted); font-size: 12px; white-space: pre-wrap; overflow-wrap: anywhere; }}
 .cluster-audio-text {{ white-space: pre-wrap; overflow-wrap: anywhere; }}
+.cluster-audio-actions {{ display: flex; flex-wrap: wrap; gap: 8px; }}
 .legacy-ui[hidden] {{ display: none !important; }}
 #labelStatus {{ min-height: 18px; margin: 8px 0 0; }}
 textarea {{ width: 100%; min-height: 80px; border: 1px solid var(--line); border-radius: 6px; padding: 8px; resize: vertical; }}
@@ -537,7 +538,9 @@ code {{ background: #eef3ef; padding: 1px 4px; border-radius: 4px; }}
       </div>
       <div class="cluster-detail-summary" id="clusterSummary"></div>
       <div class="cluster-detail-fields">
-        <div class="label-heading"><span class="label-title">训练标签</span><span class="meta">必选 · 只导出 keep/drop · 后续全量训练修正混簇噪声</span></div>
+        <div class="label-heading"><span class="label-title">种子控制</span><span class="meta">只有“用作种子 + keep/drop”会进入 cold-start 训练</span></div>
+        <div class="labels" id="clusterSeedActionButtons"></div>
+        <div class="label-heading"><span class="label-title">训练标签</span><span class="meta">CueQC 训练目标仍只导出 keep/drop；混簇和跳过不导出标签</span></div>
         <div class="labels" id="clusterDisplayButtons"></div>
         <textarea id="activeClusterReason" placeholder="备注 / 原因（可选，不进训练）"></textarea>
       </div>
@@ -554,6 +557,7 @@ code {{ background: #eef3ef; padding: 1px 4px; border-radius: 4px; }}
       </div>
       <div id="list"></div>
       <div class="cluster-review" id="clusterReview"></div>
+    </div>
     <section class="panel">
       <h2 id="sampleTitle"></h2>
       <p class="meta" id="sampleMeta"></p>
@@ -567,7 +571,7 @@ code {{ background: #eef3ef; padding: 1px 4px; border-radius: 4px; }}
           <button class="primary" id="playChunkBtn">播放 chunk</button>
           <button id="playContextBtn">播放上下文</button>
         </div>
-        <audio id="media" controls preload="metadata"></audio>
+        <audio id="media" controls preload="none"></audio>
         <div class="caption-preview" id="captionOverlay"></div>
         <div class="timeline" id="timeline">
           <div class="context-range"></div>
@@ -638,6 +642,7 @@ try {{
 }} catch (_) {{}}
 const DISPLAY = [{{value:"keep", label:"保留"}},{{value:"drop", label:"丢弃"}}];
 const CLUSTER_DISPLAY = [{{value:"keep", label:"保留（进入字幕）"}},{{value:"drop", label:"丢弃（不进入字幕）"}}];
+const CLUSTER_SEED_ACTIONS = [{{value:"use_seed", label:"用作种子"}},{{value:"mixed_skip", label:"混簇跳过"}},{{value:"skip", label:"跳过"}}];
 function clusterOrder(summary) {{
   const match = String(summary.cluster_id || "").match(/^cluster_(\\d+)$/);
   return match ? Number(match[1]) : 1000;
@@ -656,6 +661,9 @@ let filtered = [...ROWS];
 let current = 0;
 let activeVideo = "";
 let playMode = "chunk";
+let lastCueRenderKey = "";
+const CLUSTER_AUDIO_PAGE_SIZE = 80;
+const clusterAudioVisible = new Map();
 const media = document.getElementById("media");
 const labelStatus = document.getElementById("labelStatus");
 const timeline = document.getElementById("timeline");
@@ -749,7 +757,8 @@ function setClusterButtons(rootId, options, clusterId, key) {{
     const btn = document.createElement("button");
     btn.type = "button";
     btn.textContent = option.label;
-    btn.className = ann[key] === option.value ? "active" : "";
+    const currentValue = key === "seed_action" ? clusterSeedAction(ann) : ann[key];
+    btn.className = currentValue === option.value ? "active" : "";
     btn.onclick = () => {{
       updateClusterAnnotation(clusterId, key, option.value);
       renderClusterDetail();
@@ -758,11 +767,16 @@ function setClusterButtons(rootId, options, clusterId, key) {{
   }}
 }}
 function updateClusterAnnotation(clusterId, key, value) {{
-  clusterAnnotations[clusterId] = {{
-    ...(clusterAnnotations[clusterId] || {{}}),
-    [key]: value,
-    updated_at: new Date().toISOString()
-  }};
+  const next = {{ ...(clusterAnnotations[clusterId] || {{}}) }};
+  next[key] = value;
+  if (key === "display_decision" && ["keep", "drop"].includes(String(value || ""))) {{
+    next.seed_action = "use_seed";
+  }}
+  if (key === "seed_action" && value !== "use_seed") {{
+    next.display_decision = "";
+  }}
+  next.updated_at = new Date().toISOString();
+  clusterAnnotations[clusterId] = next;
   saveClusterAnnotations();
   updateClusterProgress();
   renderClusterNav();
@@ -770,19 +784,28 @@ function updateClusterAnnotation(clusterId, key, value) {{
     const status = document.getElementById("clusterStatus");
     if (status) {{
       status.textContent = isClusterComplete(clusterId)
-        ? "已选显示策略"
-        : "先选显示策略（保留/丢弃），再看下面的音频。";
+        ? "已完成种子决策"
+        : "选择用作种子并给 keep/drop，或标为混簇/跳过。";
     }}
   }}
 }}
+function clusterSeedAction(ann) {{
+  return ann.seed_action || (ann.display_decision ? "use_seed" : "");
+}}
+function clusterTrainingDecision(ann) {{
+  return clusterSeedAction(ann) === "use_seed" && ["keep", "drop"].includes(String(ann.display_decision || ""))
+    ? ann.display_decision
+    : "";
+}}
 function isClusterComplete(clusterId) {{
   const ann = clusterAnnotations[clusterId] || {{}};
-  return ["keep", "drop"].includes(String(ann.display_decision || ""));
+  const action = clusterSeedAction(ann);
+  return ["mixed_skip", "skip"].includes(action) || Boolean(clusterTrainingDecision(ann));
 }}
 function updateClusterProgress() {{
   const complete = SUMMARIES.filter(summary => isClusterComplete(summary.cluster_id)).length;
   const total = SUMMARIES.length;
-  document.getElementById("clusterProgress").textContent = `${{complete}} / ${{total}} 簇已选显示策略`;
+  document.getElementById("clusterProgress").textContent = `${{complete}} / ${{total}} 簇已完成种子决策`;
 }}
 function selectCluster(clusterId) {{
   const entry = getClusterEntry(clusterId);
@@ -811,13 +834,17 @@ function renderClusterNav() {{
       </div>
       <div class="cluster-nav-sub">
         ${{escapeHtml(entry.clusterId)}}
-        ${{ann.display_decision ? ` · ${{escapeHtml(ann.display_decision === "drop" ? "丢弃" : "保留")}}` : ""}}
+        ${{clusterSeedAction(ann) ? ` · ${{escapeHtml(clusterSeedAction(ann) === "use_seed" ? (ann.display_decision === "drop" ? "种子:丢弃" : "种子:保留") : (clusterSeedAction(ann) === "mixed_skip" ? "混簇跳过" : "跳过"))}}` : ""}}
       </div>`;
     button.onclick = () => selectCluster(entry.clusterId);
     root.appendChild(button);
   }});
   const summaryLine = document.getElementById("summaryLine");
   if (summaryLine) summaryLine.textContent = `${{ROWS.length}} 条样本 · ${{CLUSTER_ENTRIES.length}} 个簇`;
+}}
+function clusterAudioVisibleCount(clusterId, total) {{
+  const currentLimit = clusterAudioVisible.get(clusterId) || CLUSTER_AUDIO_PAGE_SIZE;
+  return Math.min(total, currentLimit);
 }}
 function renderClusterAudioList(entry) {{
   const root = document.getElementById("clusterAudioList");
@@ -828,68 +855,51 @@ function renderClusterAudioList(entry) {{
     root.innerHTML = '<div class="meta">没有可展示的代表样本。</div>';
     return;
   }}
+  const visibleCount = clusterAudioVisibleCount(entry.clusterId, examples.length);
   const count = document.createElement("div");
   count.className = "meta";
-  count.textContent = `共 ${{examples.length}} 条音频`;
+  count.textContent = `共 ${{examples.length}} 条音频 · 当前显示 ${{visibleCount}} 条 · 单播放器懒加载`;
   root.appendChild(count);
-  for (const row of examples) {{
+  for (const row of examples.slice(0, visibleCount)) {{
     const info = row.media || {{}};
     const card = document.createElement("div");
     card.className = "cluster-audio-card";
-    const audioId = `audio-${{row.sample_id}}`;
     card.innerHTML = `
       <div class="cluster-audio-head">
         <strong>${{escapeHtml(row.video_label || row.video_id || "")}} · chunk ${{escapeHtml(row.chunk_index)}} · ${{Number(row.duration_s || 0).toFixed(2)}}s</strong>
         <span class="meta">${{escapeHtml(row.sample_id)}}</span>
       </div>
       <div class="cluster-audio-meta">${{fmt(row.start)}} - ${{fmt(row.end)}}${{info.audio_url ? "" : " · 音频缺失"}}${{info.vtt_url ? "" : " · 字幕缺失"}}</div>
-      <div id="${{audioId}}"></div>
+      <div class="cluster-audio-actions">
+        <button class="primary" type="button" data-play-sample="${{escapeHtml(row.sample_id)}}" data-play-mode="chunk"${{info.audio_url ? "" : " disabled"}}>播放 chunk</button>
+        <button type="button" data-play-sample="${{escapeHtml(row.sample_id)}}" data-play-mode="context"${{info.audio_url ? "" : " disabled"}}>播放上下文</button>
+        <button type="button" data-open-sample="${{escapeHtml(row.sample_id)}}">打开详情</button>
+      </div>
       <div class="cluster-audio-text">${{escapeHtml(row.text_preview || row.text || row.raw_text || "(empty)")}}</div>
     `;
     root.appendChild(card);
-    const slot = card.querySelector(`#${{CSS.escape(audioId)}}`);
-    if (slot) {{
-      if (info.audio_url) {{
-        const audio = document.createElement("audio");
-        audio.controls = true;
-        audio.preload = "metadata";
-        const source = document.createElement("source");
-        source.src = info.audio_url;
-        source.type = info.audio_mime || "audio/wav";
-        audio.appendChild(source);
-        if (info.vtt_url) {{
-          const track = document.createElement("track");
-          track.kind = "subtitles";
-          track.label = "完整日语字幕";
-          track.srclang = "ja";
-          track.src = info.vtt_url;
-          track.default = true;
-          audio.appendChild(track);
-        }}
-        const start = Number(row.start || 0);
-        const end = Number(row.end || 0);
-        const seekToChunkStart = () => {{
-          try {{
-            if (Number.isFinite(start) && start >= 0 && start < audio.duration) {{
-              audio.currentTime = start;
-            }}
-          }} catch (_) {{}}
-        }};
-        audio.addEventListener("loadedmetadata", seekToChunkStart, {{ once: true }});
-        audio.addEventListener("play", () => {{
-          if (Number.isFinite(start) && Number.isFinite(end) && end > start) {{
-            if (audio.currentTime < start || audio.currentTime >= end) seekToChunkStart();
-          }}
-        }});
-        audio.addEventListener("timeupdate", () => {{
-          if (Number.isFinite(end) && end > start && audio.currentTime >= end) audio.pause();
-        }});
-        slot.appendChild(audio);
-      }} else {{
-        slot.textContent = "音频文件未找到。";
-      }}
-    }}
   }}
+  if (visibleCount < examples.length) {{
+    const loadMore = document.createElement("button");
+    loadMore.type = "button";
+    loadMore.textContent = `再显示 ${{Math.min(CLUSTER_AUDIO_PAGE_SIZE, examples.length - visibleCount)}} 条`;
+    loadMore.onclick = () => {{
+      clusterAudioVisible.set(entry.clusterId, visibleCount + CLUSTER_AUDIO_PAGE_SIZE);
+      renderClusterAudioList(entry);
+    }};
+    root.appendChild(loadMore);
+  }}
+  root.querySelectorAll("[data-open-sample]").forEach(button => {{
+    button.onclick = () => selectSample(button.getAttribute("data-open-sample") || "", false);
+  }});
+  root.querySelectorAll("[data-play-sample]").forEach(button => {{
+    button.onclick = () => {{
+      const sampleId = button.getAttribute("data-play-sample") || "";
+      const mode = button.getAttribute("data-play-mode") || "chunk";
+      selectSample(sampleId, false);
+      setTimeout(() => playCurrent(mode), 0);
+    }};
+  }});
 }}
 function renderClusterDetail() {{
   const entry = getActiveClusterEntry();
@@ -902,6 +912,7 @@ function renderClusterDetail() {{
   if (count) count.textContent = `${{summary.count || 0}} 条 · ${{entry.clusterId}}`;
   const summaryNode = document.getElementById("clusterSummary");
   if (summaryNode) summaryNode.textContent = clusterSummaryText(summary);
+  setClusterButtons("clusterSeedActionButtons", CLUSTER_SEED_ACTIONS, entry.clusterId, "seed_action");
   setClusterButtons("clusterDisplayButtons", CLUSTER_DISPLAY, entry.clusterId, "display_decision");
   const reasonInput = document.getElementById("activeClusterReason");
   if (reasonInput) {{
@@ -911,10 +922,17 @@ function renderClusterDetail() {{
   const status = document.getElementById("clusterStatus");
   if (status) {{
     status.textContent = isClusterComplete(entry.clusterId)
-      ? "已选显示策略"
-      : "先选显示策略（保留/丢弃），再看下面的音频。";
+      ? "已完成种子决策"
+      : "选择用作种子并给 keep/drop，或标为混簇/跳过。";
   }}
   renderClusterAudioList(entry);
+  const examples = clusterRowsForDisplay(entry.clusterId);
+  if (examples.length) {{
+    if (!ROWS[current] || ROWS[current].cluster_id !== entry.clusterId) {{
+      current = ROWS.indexOf(examples[0]);
+    }}
+    renderCurrent(false);
+  }}
 }}
 function selectSample(sampleId, autoplay = true) {{
   const row = ROWS.find(item => item.sample_id === sampleId);
@@ -1071,7 +1089,8 @@ function setButtons(rootId, options, key) {{
     const btn = document.createElement("button");
     btn.textContent = option.label;
     btn.title = `${{option.label}} / ${{option.value}}`;
-    btn.className = ann[key] === option.value ? "active" : "";
+    const currentValue = key === "seed_action" ? clusterSeedAction(ann) : ann[key];
+    btn.className = currentValue === option.value ? "active" : "";
     btn.onclick = () => {{
       if (key === "display_decision" && option.value === "drop") {{
         markDropAndAdvance(row);
@@ -1187,7 +1206,11 @@ function updateTimeline() {{
   document.getElementById("captionOverlay").textContent = activeCueText(row.video_id || "", t);
   const stopAt = playMode === "context" ? Number(row.context_end) : Number(row.end);
   if (!media.paused && t >= stopAt) media.pause();
-  renderCueLists(row);
+  const cueRenderKey = String(row.sample_id || "") + "|" + String(Math.floor(t * 2));
+  if (cueRenderKey !== lastCueRenderKey) {{
+    lastCueRenderKey = cueRenderKey;
+    renderCueLists(row);
+  }}
 }}
 function renderCurrent(seek) {{
   const row = ROWS[current];
@@ -1199,23 +1222,48 @@ function renderCurrent(seek) {{
   document.getElementById("rangeEnd").textContent = fmt(row.context_end);
   setMediaForItem(row, seek);
   setMetrics(row);
+  lastCueRenderKey = "";
   renderCueLists(row);
   setButtons("displayButtons", DISPLAY, "display_decision");
   updateTimeline();
-  renderClusterReview();
+  const legacy = document.querySelector(".legacy-ui");
+  if (legacy && !legacy.hidden) renderClusterReview();
 }}
 function playCurrent(mode) {{
   const row = ROWS[current];
   if (!row) return;
+  const error = document.getElementById("mediaError");
   playMode = mode;
   setMediaForItem(row, false);
-  media.currentTime = mode === "context" ? Number(row.context_start) : Number(row.start);
-  media.play().catch(() => {{}});
+  const target = mode === "context" ? Number(row.context_start) : Number(row.start);
+  const startPlayback = () => {{
+    try {{ media.currentTime = Number.isFinite(target) ? target : 0; }} catch (_) {{}}
+    error.textContent = "";
+    const promise = media.play();
+    if (promise && promise.catch) {{
+      promise.catch(err => {{
+        error.textContent = `播放失败：${{err && err.message ? err.message : err}}`;
+      }});
+    }}
+  }};
+  if (!media.querySelector("source")) {{
+    error.textContent = "音频文件未找到。";
+    return;
+  }}
+  if (media.readyState < 1) {{
+    error.textContent = "正在加载音频...";
+    media.addEventListener("loadedmetadata", startPlayback, {{ once: true }});
+    media.load();
+  }} else {{
+    startPlayback();
+  }}
 }}
 function exportClusterRows() {{
   return SUMMARIES.map(summary => {{
     const clusterId = summary.cluster_id || "";
     const ann = clusterAnnotations[clusterId] || {{}};
+    const seedAction = clusterSeedAction(ann);
+    const trainingDecision = clusterTrainingDecision(ann);
     const examples = clusterExampleRows(summary, CLUSTER_EXAMPLES_PER_CLUSTER).map(row => ({{
       sample_id: row.sample_id,
       video_id: row.video_id,
@@ -1232,7 +1280,9 @@ function exportClusterRows() {{
       schema: "cueqc_cluster_label_v1",
       dataset_id: DATASET_ID,
       cluster_id: clusterId,
-      display_decision: ann.display_decision || "",
+      display_decision: trainingDecision,
+      seed_action: seedAction,
+      training_label_included: Boolean(trainingDecision),
       notes: ann.classification_reason || "",
       updated_at: ann.updated_at || "",
       count: summary.count || 0,
@@ -1384,12 +1434,15 @@ def build_audit(
             "cluster_label_export": "cueqc_cluster_labels.jsonl",
             "cluster_label_storage_suffix": "cluster-labels-v1",
             "cluster_display_decision_options": ["keep", "drop"],
-            "cluster_display_decision_required": True,
+            "cluster_seed_action_options": ["use_seed", "mixed_skip", "skip"],
+            "cluster_display_decision_required": False,
+            "cluster_training_label_rule": "only seed_action=use_seed with display_decision keep/drop is broadcast into training; mixed_skip/skip abstain",
             "cluster_review_enabled": True,
             "cluster_review_group_count": len(summaries),
             "cluster_review_examples_per_cluster": 3,
-            "cluster_review_layout": "left_nav_single_cluster_audio_list_all_v2",
-            "cluster_review_audio_render_mode": "all",
+            "cluster_review_layout": "left_nav_single_cluster_single_player_lazy_v3",
+            "cluster_review_audio_render_mode": "single_player_lazy",
+            "cluster_audio_page_size": 80,
             "cluster_review_scope": "natural_clusters_including_noise",
             "training_label_fields": ["display_decision"],
         }
