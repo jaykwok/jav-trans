@@ -300,8 +300,8 @@ uv run python -m tools.web.smoke.summarize_job --job-id <job_id> --run-dir agent
 ### CueQC 训练与预测
 
 - `tools.asr.cueqc.export_candidates`：从全链路产物导出 CueQC candidate JSONL。
-- `tools.asr.cueqc.cluster_candidates`：仅用于 cold-start 的一次性 Torque 聚类和审计素材生成，不进入 runtime。
-- `tools.asr.cueqc.compile_training_set`：把簇级 keep/drop 审计标签广播为初始训练 JSONL。
+- `tools.asr.cueqc.cluster_candidates`：仅用于 cold-start 的一次性 Torque 聚类和审计素材生成，不进入 runtime；训练时只接收人工确认的高精 seed，不要求簇级标签覆盖全量。
+- `tools.asr.cueqc.compile_training_set`：只把显式 `seed_action=use_seed` 且 `display_decision=keep/drop` 的簇级审计标签广播为初始训练 JSONL；`mixed_skip` / `skip` 只保留为审计元数据。
 - `tools.asr.cueqc.extract_features_v3_fusion`：从 ASR internals 提取 CueQC v3-Fusion 特征。
 - `tools.asr.cueqc.extract_feature_shards`：参数化分片提取大规模 CueQC 特征，替代 `agents/temp` 中的一次性硬编码脚本。
 - `tools.asr.cueqc.merge_features_v3_fusion`：合并分片特征 bundle。
@@ -312,7 +312,7 @@ uv run python -m tools.web.smoke.summarize_job --job-id <job_id> --run-dir agent
 ### 审计与 Boundary
 
 - `tools.audits.audit_nav`、`tools.audits.serve_audits.ps1`、`tools.audits.serve_audits.sh`：维护和启动本地审计导航页。
-- `tools.audits.generate_cueqc_cluster_audit_html`：生成 CueQC 簇级 keep/drop 审计页，必须显式传 `--archived-root` 和一个或多个 `--media-root`；页面支持播放 chunk 与上下文，不再从旧 job 命名推导媒体路径。
+- `tools.audits.generate_cueqc_cluster_audit_html`：生成 CueQC 簇级 keep/drop 审计页，必须显式传 `--archived-root` 和一个或多个 `--media-root`；页面使用单播放器懒加载播放 chunk 与上下文，不再为每条样本创建独立 audio 控件，也不再从旧 job 命名推导媒体路径。
 - `tools.audits.generate_*_audit_html`：生成字幕 A/B、CueQC prediction 和其他手工标注审计页。
 - `tools.boundary.*`、`tools.boundary.ja.*`：Boundary Refiner 训练数据构建、SpeechBoundary-JA 训练和 frame score 导出工具。
 - `tools.boundary.export_cueqc_drop_hardcases`：把 CueQC false-drop 审计中已确认可丢弃的 chunk 导出为 SpeechBoundary-JA hard-negative 候选池；不会生成 Boundary Refiner 训练标签。

@@ -57,10 +57,10 @@ def _broadcast_cluster_labels(
     """Expand cluster-level display_decision into per-sample pseudo-labels.
 
     Reads the ``cueqc_cluster_labels.jsonl`` exported from the audit page (one
-    row per cluster with ``display_decision``) and broadcasts each cluster's
-    decision to every sample in that cluster. This is intentionally coarse:
-    mixed clusters still receive one seed label, and later full-data self
-    training is expected to correct the intra-cluster noise.
+    row per cluster with ``display_decision``) and broadcasts only explicit
+    binary keep/drop seed labels. Audit rows marked mixed/skip abstain by leaving
+    ``display_decision`` empty; they remain review metadata and do not enter
+    cold-start training.
     """
     decision_by_cluster: dict[str, str] = {}
     reason_by_cluster: dict[str, str] = {}
@@ -241,7 +241,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--cluster-labels",
         required=True,
-        help="cueqc_cluster_labels.jsonl (cluster-level display_decision); broadcasts to every sample in each cluster",
+        help="cueqc_cluster_labels.jsonl; broadcasts only explicit keep/drop seed labels, while mixed/skip rows abstain",
     )
     parser.add_argument("--output-dir", required=True)
     parser.add_argument("--min-cluster-agreement", type=float, default=0.67)
