@@ -591,6 +591,63 @@ def _record_stage_timing(
     log.append(f"ASR 阶段耗时: {label}={elapsed_s:.2f}s")
 
 
+def _cuda_memory_snapshot(stage: str, *, elapsed_s: float | None = None) -> dict:
+    snapshot: dict[str, object] = {
+        "stage": stage,
+        "cuda_available": False,
+    }
+    if elapsed_s is not None:
+        snapshot["elapsed_s"] = round(float(elapsed_s), 3)
+    try:
+        import torch
+
+        snapshot["cuda_available"] = bool(torch.cuda.is_available())
+        if not torch.cuda.is_available():
+            return snapshot
+        device_index = torch.cuda.current_device()
+        free_bytes, total_bytes = torch.cuda.mem_get_info(device_index)
+        scale = 1024 * 1024
+        snapshot.update(
+            {
+                "device_index": int(device_index),
+                "device_name": torch.cuda.get_device_name(device_index),
+                "allocated_mb": round(torch.cuda.memory_allocated(device_index) / scale, 1),
+                "reserved_mb": round(torch.cuda.memory_reserved(device_index) / scale, 1),
+                "max_allocated_mb": round(torch.cuda.max_memory_allocated(device_index) / scale, 1),
+                "max_reserved_mb": round(torch.cuda.max_memory_reserved(device_index) / scale, 1),
+                "free_mb": round(free_bytes / scale, 1),
+                "total_mb": round(total_bytes / scale, 1),
+            }
+        )
+    except Exception as exc:  # noqa: BLE001 - diagnostics must not break ASR
+        snapshot["error"] = f"{type(exc).__name__}: {exc}"
+    return snapshot
+
+
+def _record_cuda_memory(
+    log: list[str],
+    snapshots: list[dict],
+    stage: str,
+    *,
+    elapsed_s: float | None = None,
+) -> None:
+    snapshot = _cuda_memory_snapshot(stage, elapsed_s=elapsed_s)
+    snapshots.append(snapshot)
+    if not snapshot.get("cuda_available"):
+        return
+    log.append(
+        "CUDA memory {stage}: allocated={allocated}MB reserved={reserved}MB "
+        "max_reserved={max_reserved}MB free={free}MB total={total}MB".format(
+            stage=stage,
+            allocated=snapshot.get("allocated_mb"),
+            reserved=snapshot.get("reserved_mb"),
+            max_reserved=snapshot.get("max_reserved_mb"),
+            free=snapshot.get("free_mb"),
+            total=snapshot.get("total_mb"),
+        )
+    )
+
+
 def _empty_cueqc_shadow_report() -> dict:
     return _cueqc_module.build_shadow_report([])
 
@@ -967,9 +1024,11 @@ def _transcribe_and_align_local(
 
     log: list[str] = [f"ASR backend: {get_backend_label()}"]
     timings: dict[str, float] = {}
+    cuda_memory: list[dict] = []
     transcript_chunks: list[dict] = []
     chunk_dir: Path | None = None
     total_started = time.perf_counter()
+    _record_cuda_memory(log, cuda_memory, "asr_start", elapsed_s=0.0)
 
     try:
         _notify("分析静音并切分音频...")
@@ -985,6 +1044,12 @@ def _transcribe_and_align_local(
         split_elapsed = time.perf_counter() - split_started
         log.append(f"切分完成：共 {len(chunk_infos)} 个处理块")
         _record_stage_timing(log, timings, "split_s", "静音分析与切块", split_elapsed)
+        _record_cuda_memory(
+            log,
+            cuda_memory,
+            "split_done",
+            elapsed_s=time.perf_counter() - total_started,
+        )
 
         if not chunk_infos:
             timings.update(
@@ -1013,6 +1078,7 @@ def _transcribe_and_align_local(
                 "chunk_count": 0,
                 "transcript_chunks": [],
                 "stage_timings": timings,
+                "cuda_memory": cuda_memory,
                 "word_count": 0,
                 "segment_count": 0,
                 "boundary_no_speech": True,
@@ -1029,6 +1095,12 @@ def _transcribe_and_align_local(
             load_elapsed = time.perf_counter() - load_started
             _record_stage_timing(
                 log, timings, "asr_model_load_s", "ASR模型加载", load_elapsed
+            )
+            _record_cuda_memory(
+                log,
+                cuda_memory,
+                "asr_model_load_done",
+                elapsed_s=time.perf_counter() - total_started,
             )
 
             text_results, text_timings = _transcribe_asr_chunks_text_only(
@@ -1048,6 +1120,12 @@ def _transcribe_and_align_local(
                 if timing_key == "text_transcribe_s":
                     continue
                 timings[timing_key] = timing_value
+            _record_cuda_memory(
+                log,
+                cuda_memory,
+                "asr_text_transcribe_done",
+                elapsed_s=time.perf_counter() - total_started,
+            )
 
             text_results = [
                 _with_alignment_fallback_window(chunk, text_result)
@@ -1060,6 +1138,12 @@ def _transcribe_and_align_local(
                 log=log,
                 backend=backend,
             )
+            _record_cuda_memory(
+                log,
+                cuda_memory,
+                "cueqc_done",
+                elapsed_s=time.perf_counter() - total_started,
+            )
 
             unload_started = time.perf_counter()
             backend.unload_model(on_stage=on_stage)
@@ -1070,6 +1154,12 @@ def _transcribe_and_align_local(
                 "asr_model_unload_s",
                 "ASR模型卸载",
                 unload_elapsed,
+            )
+            _record_cuda_memory(
+                log,
+                cuda_memory,
+                "asr_model_unload_done",
+                elapsed_s=time.perf_counter() - total_started,
             )
 
             # v3-Fusion drop filter: remove model-confirmed drop candidates from
@@ -1100,6 +1190,12 @@ def _transcribe_and_align_local(
                 "alignment_s",
                 "字幕时间轴生成",
                 align_timings["alignment_s"],
+            )
+            _record_cuda_memory(
+                log,
+                cuda_memory,
+                "alignment_done",
+                elapsed_s=time.perf_counter() - total_started,
             )
 
             alignment_outcomes: dict[int, dict] = {}
@@ -1188,6 +1284,12 @@ def _transcribe_and_align_local(
         _record_stage_timing(
             log, timings, "subtitle_segment_s", "字幕分段", segment_elapsed
         )
+        _record_cuda_memory(
+            log,
+            cuda_memory,
+            "subtitle_segment_done",
+            elapsed_s=time.perf_counter() - total_started,
+        )
 
         total_elapsed = time.perf_counter() - total_started
         _record_stage_timing(
@@ -1196,6 +1298,12 @@ def _transcribe_and_align_local(
             "asr_alignment_total_s",
             "ASR与字幕时间轴总计",
             total_elapsed,
+        )
+        _record_cuda_memory(
+            log,
+            cuda_memory,
+            "asr_alignment_total_done",
+            elapsed_s=total_elapsed,
         )
         log.append(f"过滤后保留字幕: {len(segments)}")
 
@@ -1207,6 +1315,7 @@ def _transcribe_and_align_local(
             "transcript_chunks": transcript_chunks,
             "cueqc_shadow": cueqc_shadow_report,
             "stage_timings": timings,
+            "cuda_memory": cuda_memory,
             "word_count": len(word_dicts),
             "segment_count": len(segments),
             "boundary_signature": dict(_LAST_BOUNDARY_SIGNATURE),

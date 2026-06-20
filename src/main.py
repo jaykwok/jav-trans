@@ -476,6 +476,62 @@ def _project_relative_required(path: str | Path) -> str:
 _log_timing_snapshot = stage_log_module._log_timing_snapshot
 
 
+def _pipeline_cuda_memory_snapshot(stage: str, *, elapsed_s: float | None = None) -> dict:
+    snapshot: dict[str, object] = {
+        "stage": stage,
+        "cuda_available": False,
+    }
+    if elapsed_s is not None:
+        snapshot["elapsed_s"] = round(float(elapsed_s), 3)
+    try:
+        snapshot["cuda_available"] = bool(torch.cuda.is_available())
+        if not torch.cuda.is_available():
+            return snapshot
+        device_index = torch.cuda.current_device()
+        free_bytes, total_bytes = torch.cuda.mem_get_info(device_index)
+        scale = 1024 * 1024
+        snapshot.update(
+            {
+                "device_index": int(device_index),
+                "device_name": torch.cuda.get_device_name(device_index),
+                "allocated_mb": round(torch.cuda.memory_allocated(device_index) / scale, 1),
+                "reserved_mb": round(torch.cuda.memory_reserved(device_index) / scale, 1),
+                "max_allocated_mb": round(torch.cuda.max_memory_allocated(device_index) / scale, 1),
+                "max_reserved_mb": round(torch.cuda.max_memory_reserved(device_index) / scale, 1),
+                "free_mb": round(free_bytes / scale, 1),
+                "total_mb": round(total_bytes / scale, 1),
+            }
+        )
+    except Exception as exc:  # noqa: BLE001 - diagnostics must not break workflow
+        snapshot["error"] = f"{type(exc).__name__}: {exc}"
+    return snapshot
+
+
+def _record_pipeline_cuda_memory(
+    snapshots: list[dict],
+    stage: str,
+    *,
+    logger: logging.Logger | None = None,
+    elapsed_s: float | None = None,
+) -> None:
+    snapshot = _pipeline_cuda_memory_snapshot(stage, elapsed_s=elapsed_s)
+    snapshots.append(snapshot)
+    if not snapshot.get("cuda_available"):
+        return
+    _log_stage(
+        logger,
+        "cuda_memory stage={stage} allocated={allocated}MB reserved={reserved}MB "
+        "max_reserved={max_reserved}MB free={free}MB total={total}MB".format(
+            stage=stage,
+            allocated=snapshot.get("allocated_mb"),
+            reserved=snapshot.get("reserved_mb"),
+            max_reserved=snapshot.get("max_reserved_mb"),
+            free=snapshot.get("free_mb"),
+            total=snapshot.get("total_mb"),
+        ),
+    )
+
+
 def _resolve_job_temp_dir(job_id: str) -> str:
     root = os.getenv("JOB_TEMP_DIR", "").strip()
     if not root:
@@ -679,6 +735,7 @@ def run_asr_alignment(
     run_log_path: Path | None = None
     pipeline_started = time.perf_counter()
     pipeline_timings: dict[str, float] = {}
+    pipeline_cuda_memory: list[dict] = []
 
     video_name = os.path.splitext(os.path.basename(video_path))[0]
     video_filename = video_name
@@ -708,6 +765,16 @@ def run_asr_alignment(
         )
         if torch.cuda.is_available():
             _log_stage(logger, f"cuda_device={torch.cuda.get_device_name(0)}")
+            try:
+                torch.cuda.reset_peak_memory_stats()
+            except Exception:
+                pass
+        _record_pipeline_cuda_memory(
+            pipeline_cuda_memory,
+            "run_start",
+            logger=logger,
+            elapsed_s=time.perf_counter() - pipeline_started,
+        )
         if run_log_path is not None:
             console.print(f"[dim]运行日志：{_project_relative(run_log_path)}[/dim]")
 
@@ -798,6 +865,12 @@ def run_asr_alignment(
         _log_stage(
             logger,
             f"stage_done audio_prepare elapsed={pipeline_timings['audio_prepare_s']:.2f}s cached={audio_cached}",
+        )
+        _record_pipeline_cuda_memory(
+            pipeline_cuda_memory,
+            "audio_prepare_done",
+            logger=logger,
+            elapsed_s=time.perf_counter() - pipeline_started,
         )
 
         # 2. ASR text-only transcription, model unload, then Boundary subtitle timing.
@@ -911,6 +984,12 @@ def run_asr_alignment(
                 logger,
                 f"stage_done asr_alignment elapsed={pipeline_timings['asr_alignment_total_s']:.2f}s segments={len(segments)}",
             )
+            _record_pipeline_cuda_memory(
+                pipeline_cuda_memory,
+                "asr_alignment_done",
+                logger=logger,
+                elapsed_s=time.perf_counter() - pipeline_started,
+            )
             _write_json(
                 aligned_segments_path,
                 _aligned_segments_payload(
@@ -932,8 +1011,15 @@ def run_asr_alignment(
         else:
             pipeline_timings["asr_alignment_total_s"] = 0.0
             _log_stage(logger, "stage_skip asr_alignment reason=aligned_cache")
+            _record_pipeline_cuda_memory(
+                pipeline_cuda_memory,
+                "asr_alignment_skipped",
+                logger=logger,
+                elapsed_s=time.perf_counter() - pipeline_started,
+            )
 
     _raise_if_cancelled(cancel_event)
+    asr_details.setdefault("pipeline_cuda_memory", pipeline_cuda_memory)
     console.print(f"[dim]ASR backend: {backend_label}[/dim]")
     for line in asr_log:
         console.print(f"[cyan]{line}[/cyan]")
@@ -1165,6 +1251,14 @@ def _run_translation_and_write_impl(
             logger,
             f"stage_done write_output elapsed={pipeline_timings['write_output_s']:.2f}s",
         )
+
+        _record_pipeline_cuda_memory(
+            asr_details.setdefault("pipeline_cuda_memory", []),
+            "write_output_done",
+            logger=logger,
+            elapsed_s=time.perf_counter() - pipeline_started,
+        )
+
         _log_timing_snapshot(logger, pipeline_timings, asr_details)
         quality_report_path = _write_quality_report_for_ctx(
             ctx=ctx,
@@ -1293,6 +1387,14 @@ def _run_translation_and_write_impl(
             logger,
             f"stage_done write_output elapsed={pipeline_timings['write_output_s']:.2f}s blocks={len(srt_blocks)}",
         )
+
+        _record_pipeline_cuda_memory(
+            asr_details.setdefault("pipeline_cuda_memory", []),
+            "write_output_done",
+            logger=logger,
+            elapsed_s=time.perf_counter() - pipeline_started,
+        )
+
         quality_report_path = _write_quality_report_for_ctx(
             ctx=ctx,
             video_stem=video_filename,
@@ -1552,6 +1654,12 @@ def _run_translation_and_write_impl(
     _log_stage(
         logger,
         f"stage_done write_output elapsed={pipeline_timings['write_output_s']:.2f}s",
+    )
+    _record_pipeline_cuda_memory(
+        asr_details.setdefault("pipeline_cuda_memory", []),
+        "write_output_done",
+        logger=logger,
+        elapsed_s=time.perf_counter() - pipeline_started,
     )
     quality_report_path = _write_quality_report_for_ctx(
         ctx=ctx,

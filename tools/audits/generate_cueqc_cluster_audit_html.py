@@ -8,7 +8,7 @@ import os
 import re
 import sys
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any, Mapping, Sequence
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -202,8 +202,68 @@ def audio_mime(path: Path) -> str:
     return "audio/wav"
 
 
-def discover_media(*, baseline_root: Path, output_dir: Path, rows: list[dict[str, Any]]) -> tuple[dict[str, Any], dict[str, list[dict[str, Any]]], dict[str, list[dict[str, Any]]]]:
+def _candidate_audio_paths(rows: Sequence[Mapping[str, Any]]) -> list[Path]:
+    paths: list[Path] = []
+    seen: set[str] = set()
+    for row in rows:
+        raw_audio_values = [row.get("source_audio_path")]
+        audio_payload = row.get("audio")
+        if isinstance(audio_payload, Mapping):
+            raw_audio_values.append(audio_payload.get("path"))
+        for raw_audio in raw_audio_values:
+            if not raw_audio:
+                continue
+            path = project_path(str(raw_audio))
+            key = str(path.resolve()) if path.exists() else str(path)
+            if key in seen:
+                continue
+            seen.add(key)
+            if path.exists() and path.is_file() and path.suffix.lower() in AUDIO_SUFFIXES:
+                paths.append(path)
+    return paths
+
+
+def _media_root_audio_paths(*, video_id: str, rows: Sequence[Mapping[str, Any]], media_roots: Sequence[Path]) -> list[Path]:
+    keys = {video_id.lower()}
+    for row in rows:
+        for value in (row.get("audio_id"), row.get("sample_id")):
+            raw = str(value or "").strip().lower()
+            if raw:
+                keys.add(raw)
+                keys.add(Path(raw).stem)
+    paths: list[Path] = []
+    seen: set[str] = set()
+    for root in media_roots:
+        if not root.exists():
+            continue
+        candidates = [root] if root.is_file() else root.rglob("*")
+        for path in candidates:
+            if not path.is_file() or path.suffix.lower() not in AUDIO_SUFFIXES:
+                continue
+            haystack = f"{path.stem} {path.parent.as_posix()}".lower()
+            if not any(key and key in haystack for key in keys):
+                continue
+            resolved = str(path.resolve())
+            if resolved in seen:
+                continue
+            seen.add(resolved)
+            paths.append(path)
+    return sorted(paths, key=lambda item: item.as_posix())
+
+
+def discover_media(
+    *,
+    archived_root: Path,
+    media_roots: Sequence[Path],
+    output_dir: Path,
+    rows: list[dict[str, Any]],
+) -> tuple[dict[str, Any], dict[str, list[dict[str, Any]]], dict[str, list[dict[str, Any]]]]:
     video_ids = sorted({str(row.get("video_id") or "").strip() for row in rows if row.get("video_id")})
+    rows_by_video: dict[str, list[dict[str, Any]]] = {}
+    for row in rows:
+        video_id = str(row.get("video_id") or "").strip()
+        if video_id:
+            rows_by_video.setdefault(video_id, []).append(row)
     media_by_video: dict[str, Any] = {}
     cues_by_video: dict[str, list[dict[str, Any]]] = {}
     aligned_by_video: dict[str, list[dict[str, Any]]] = {}
@@ -211,14 +271,23 @@ def discover_media(*, baseline_root: Path, output_dir: Path, rows: list[dict[str
 
     for video_id in video_ids:
         label = ANON_LABELS.get(video_id, video_id)
-        archived_dir = baseline_root / "archived" / video_id
+        archived_dir = archived_root / video_id
         srt_path = archived_dir / f"{video_id}.ja.srt"
         aligned_path = archived_dir / f"{video_id}.aligned_segments.json"
-        audio_dir = baseline_root / "jobs" / f"{video_id}_b5" / "audio"
-        audio_candidates = sorted(
-            path for path in audio_dir.glob("*") if path.is_file() and path.suffix.lower() in AUDIO_SUFFIXES
-        )
-        audio_path = audio_candidates[0] if audio_candidates else None
+        video_rows = rows_by_video.get(video_id, [])
+        audio_candidates = [
+            *_candidate_audio_paths(video_rows),
+            *_media_root_audio_paths(video_id=video_id, rows=video_rows, media_roots=media_roots),
+        ]
+        deduped_audio_candidates: list[Path] = []
+        seen_audio: set[str] = set()
+        for path in audio_candidates:
+            resolved = str(path.resolve())
+            if resolved in seen_audio:
+                continue
+            seen_audio.add(resolved)
+            deduped_audio_candidates.append(path)
+        audio_path = deduped_audio_candidates[0] if deduped_audio_candidates else None
 
         cues: list[dict[str, Any]] = []
         vtt_path = subtitles_dir / f"{video_id}.ja.vtt"
@@ -267,7 +336,6 @@ def discover_media(*, baseline_root: Path, output_dir: Path, rows: list[dict[str
         cues_by_video[video_id] = cues
         aligned_by_video[video_id] = aligned_segments
     return media_by_video, cues_by_video, aligned_by_video
-
 
 def absolute_fallback_range(row: Mapping[str, Any], start: float, end: float) -> tuple[float, float]:
     timing = row.get("subtitle_timing")
@@ -1231,18 +1299,28 @@ def build_audit(
     *,
     clusters_jsonl: Path,
     summaries_jsonl: Path,
-    baseline_root: Path,
+    archived_root: Path,
+    media_roots: Sequence[Path],
     output_dir: Path,
     title: str,
     dataset_id: str,
     summary_json: Path | None = None,
     refresh_nav: bool = False,
 ) -> dict[str, Any]:
+    if not archived_root.exists():
+        raise FileNotFoundError(f"archived root not found: {archived_root}")
+    if not media_roots:
+        raise ValueError("at least one --media-root is required")
+    missing_media_roots = [path for path in media_roots if not path.exists()]
+    if missing_media_roots:
+        raise FileNotFoundError("media root not found: " + ", ".join(str(path) for path in missing_media_roots))
+
     rows = read_jsonl(clusters_jsonl)
     summaries = read_jsonl(summaries_jsonl)
     output_dir.mkdir(parents=True, exist_ok=True)
     media_by_video, cues_by_video, aligned_by_video = discover_media(
-        baseline_root=baseline_root,
+        archived_root=archived_root,
+        media_roots=media_roots,
         output_dir=output_dir,
         rows=rows,
     )
@@ -1272,6 +1350,7 @@ def build_audit(
         loaded = read_json(summary_source)
         if isinstance(loaded, dict):
             summary.update(loaded)
+    summary.pop("baseline_root", None)
     missing_media = [video_id for video_id, info in media_by_video.items() if not info.get("audio_exists")]
     missing_subtitles = [video_id for video_id, info in media_by_video.items() if not info.get("subtitle_exists")]
     summary.update(
@@ -1282,7 +1361,8 @@ def build_audit(
             "html": project_rel(index_path),
             "source_clusters": project_rel(clusters_jsonl),
             "source_cluster_summaries": project_rel(summaries_jsonl),
-            "baseline_root": project_rel(baseline_root),
+            "archived_root": project_rel(archived_root),
+            "media_roots": [project_rel(path) for path in media_roots],
             "media_enabled": True,
             "media_mode": "audio",
             "media_by_video": media_by_video,
@@ -1319,12 +1399,12 @@ def build_audit(
         update_audit_entrypoints(latest_html=index_path, title=title)
     return summary
 
-
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Generate a CueQC cluster audit page with synchronized audio and subtitles.")
     parser.add_argument("--clusters", required=True, help="cueqc_clusters.jsonl")
     parser.add_argument("--summaries", required=True, help="cueqc_cluster_summaries.jsonl")
-    parser.add_argument("--baseline-root", required=True, help="Baseline run root containing archived/ and jobs/")
+    parser.add_argument("--archived-root", required=True, help="Directory containing <video_id>/<video_id>.ja.srt and aligned_segments.json.")
+    parser.add_argument("--media-root", action="append", required=True, help="Job/audio/media root to search recursively for source audio. Repeatable.")
     parser.add_argument("--output-dir", required=True, help="Audit output directory")
     parser.add_argument("--title", required=True)
     parser.add_argument("--dataset-id", required=True)
@@ -1332,13 +1412,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--refresh-nav", action="store_true", help="Rebuild agents/audits index and latest-audit.html")
     return parser.parse_args(argv)
 
-
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
     summary = build_audit(
         clusters_jsonl=project_path(args.clusters),
         summaries_jsonl=project_path(args.summaries),
-        baseline_root=project_path(args.baseline_root),
+        archived_root=project_path(args.archived_root),
+        media_roots=[project_path(path) for path in args.media_root],
         output_dir=project_path(args.output_dir),
         title=args.title,
         dataset_id=args.dataset_id,
