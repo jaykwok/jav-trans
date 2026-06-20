@@ -233,9 +233,17 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--batch-size", type=int, default=64)
     parser.add_argument("--drop-threshold", type=float, default=None)
     parser.add_argument("--keep-threshold", type=float, default=0.95)
+    parser.add_argument(
+        "--allow-low-drop-threshold",
+        action="store_true",
+        help="Allow drop thresholds below 0.5 for offline active-learning audits only.",
+    )
     args = parser.parse_args(argv)
-    if args.drop_threshold is not None and not 0.5 <= args.drop_threshold <= 1.0:
-        parser.error("--drop-threshold must be in [0.5, 1.0]")
+    if args.drop_threshold is not None:
+        min_drop_threshold = 0.0 if args.allow_low_drop_threshold else 0.5
+        if not min_drop_threshold <= args.drop_threshold <= 1.0:
+            interval = "[0.0, 1.0]" if args.allow_low_drop_threshold else "[0.5, 1.0]"
+            parser.error(f"--drop-threshold must be in {interval}")
     if not 0.5 <= args.keep_threshold <= 1.0:
         parser.error("--keep-threshold must be in [0.5, 1.0]")
     if args.batch_size <= 0:
