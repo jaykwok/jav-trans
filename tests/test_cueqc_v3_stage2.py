@@ -273,6 +273,46 @@ def test_cueqc_v3_training_rejects_missing_asr_model_id(tmp_path: Path):
         )
 
 
+def test_cueqc_v3_evaluate_batches_samples():
+    samples = []
+    for label in [1, 0, 1]:
+        sample = _feature_sample(label=label)
+        sample["__label__"] = label
+        samples.append(sample)
+
+    class StubModel(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.batch_sizes = []
+
+        def forward(self, **kwargs):
+            batch_size = int(kwargs["asr_frames"].shape[0])
+            self.batch_sizes.append(batch_size)
+            return torch.tensor([[0.0, 2.0]] * batch_size, dtype=torch.float32)
+
+    model = StubModel()
+    result = train_mamba_v3_fusion.evaluate(
+        model,
+        samples,
+        asr_mean=torch.zeros(4).numpy(),
+        asr_std=torch.ones(4).numpy(),
+        token_mean=torch.zeros(2).numpy(),
+        token_std=torch.ones(2).numpy(),
+        decoder_mean=torch.zeros(3).numpy(),
+        decoder_std=torch.ones(3).numpy(),
+        structured_mean=torch.zeros(2).numpy(),
+        structured_std=torch.ones(2).numpy(),
+        device=torch.device("cpu"),
+        drop_threshold=0.85,
+        batch_size=1,
+    )
+
+    assert model.batch_sizes == [1, 1, 1]
+    assert result["n"] == 3
+    assert result["keep_recall"] == 1.0
+    assert result["false_drop_rate"] == 0.0
+
+
 def test_cueqc_v3_feature_extractor_reuses_video_audio_cache(tmp_path: Path, monkeypatch):
     rows_path = tmp_path / "candidates.jsonl"
     audio_root = tmp_path / "audio"

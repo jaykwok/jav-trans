@@ -305,7 +305,7 @@ uv run python -m tools.web.smoke.summarize_job --job-id <job_id> --run-dir agent
 - `tools.asr.cueqc.extract_features_v3_fusion`：从 ASR internals 提取 CueQC v3-Fusion 特征。
 - `tools.asr.cueqc.extract_feature_shards`：参数化分片提取大规模 CueQC 特征，替代 `agents/temp` 中的一次性硬编码脚本。
 - `tools.asr.cueqc.merge_features_v3_fusion`：合并分片特征 bundle。
-- `tools.asr.cueqc.train_mamba_v3_fusion`：训练 CueQC v3-Fusion checkpoint。
+- `tools.asr.cueqc.train_mamba_v3_fusion`：训练 CueQC v3-Fusion checkpoint；1.7B 大特征验证/测试可用 `--eval-batch-size` 控制显存。
 - `tools.asr.cueqc.predict_v3_fusion`：对特征 bundle 输出 keep/drop prediction 和 high-confidence pseudo labels；低于 `0.5` 的 drop 阈值只允许在主动学习审计中显式加 `--allow-low-drop-threshold`。
 - `tools.asr.cueqc.compile_stage2a_features_v3_fusion`：合并 cold-start、人工 false-drop 审计和高置信 keep pseudo，生成 Stage 2 训练 bundle。
 
