@@ -64,6 +64,7 @@ class TrainConfig:
     keep_class_weight: float = 1.5
     label_smoothing: float = 0.1
     eval_every: int = 25
+    eval_batch_size: int = 32
     early_stop_patience: int = 6
 
 
@@ -137,6 +138,7 @@ def evaluate(
     structured_std: np.ndarray,
     device: torch.device,
     drop_threshold: float,
+    batch_size: int = 32,
 ) -> dict[str, float]:
     if not samples:
         return {"n": 0}
@@ -150,20 +152,23 @@ def evaluate(
             "structured": torch.from_numpy(_normalize_split([s["structured"].numpy(), ], structured_mean, structured_std)[0]),
         })
     model.eval()
-    batch = _collate(norm_samples)
-    logits = model(
-        asr_frames=batch["asr_frames"].to(device),
-        asr_mask=batch["asr_mask"].to(device),
-        token_trace=batch["token_trace"].to(device),
-        token_mask=batch["token_mask"].to(device),
-        decoder_stats=batch["decoder_stats"].to(device),
-        structured=batch["structured"].to(device),
-    )
-    probs = torch.softmax(logits, dim=-1)
-    p_drop = probs[:, 0]
+    p_drop_batches: list[torch.Tensor] = []
+    eval_batch_size = max(1, int(batch_size))
+    for start in range(0, len(norm_samples), eval_batch_size):
+        batch = _collate(norm_samples[start : start + eval_batch_size])
+        logits = model(
+            asr_frames=batch["asr_frames"].to(device),
+            asr_mask=batch["asr_mask"].to(device),
+            token_trace=batch["token_trace"].to(device),
+            token_mask=batch["token_mask"].to(device),
+            decoder_stats=batch["decoder_stats"].to(device),
+            structured=batch["structured"].to(device),
+        )
+        p_drop_batches.append(torch.softmax(logits, dim=-1)[:, 0])
+    p_drop = torch.cat(p_drop_batches, dim=0)
     # Decision: drop only if p_drop >= threshold (conservative), else keep.
-    preds = torch.where(p_drop >= drop_threshold, torch.tensor(0), torch.tensor(1)).to(logits.device)
-    labels = torch.tensor([s["__label__"] for s in samples], device=logits.device)
+    preds = torch.where(p_drop >= drop_threshold, torch.tensor(0), torch.tensor(1)).to(p_drop.device)
+    labels = torch.tensor([s["__label__"] for s in samples], device=p_drop.device)
 
     n = labels.shape[0]
     keep_mask = labels == 1
@@ -298,7 +303,7 @@ def train(
         token_mean=token_mean, token_std=token_std,
         decoder_mean=decoder_mean, decoder_std=decoder_std,
         structured_mean=structured_mean, structured_std=structured_std,
-        device=device, drop_threshold=config.drop_threshold,
+        device=device, drop_threshold=config.drop_threshold, batch_size=config.eval_batch_size,
     )
     val_samples_eval = [samples[i] for i in val_idx]
     best_val_score = -1.0
@@ -475,12 +480,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--keep-class-weight", type=float, default=1.5)
     p.add_argument("--label-smoothing", type=float, default=0.1)
     p.add_argument("--eval-every", type=int, default=25)
+    p.add_argument("--eval-batch-size", type=int, default=32)
     p.add_argument("--early-stop-patience", type=int, default=6)
     args = p.parse_args(argv)
     if not 0.0 <= args.val_ratio < 1.0:
         p.error("--val-ratio must be in [0, 1)")
     if not 0.5 <= args.drop_threshold <= 1.0:
         p.error("--drop-threshold must be in [0.5, 1.0]")
+    if args.eval_batch_size <= 0:
+        p.error("--eval-batch-size must be positive")
     return args
 
 
@@ -491,7 +499,7 @@ def main(argv: list[str] | None = None) -> int:
         "val_ratio", "drop_threshold", "hidden_size", "num_layers", "state_size",
         "num_heads", "head_dim", "n_groups", "chunk_size", "mlp_dim", "dropout",
         "test_audio_id", "keep_class_weight", "label_smoothing", "eval_every",
-        "early_stop_patience",
+        "eval_batch_size", "early_stop_patience",
     }
     config = TrainConfig(**{k: getattr(args, k) for k in fields})
     train(
