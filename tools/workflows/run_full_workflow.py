@@ -216,8 +216,11 @@ def configure_env(args: argparse.Namespace) -> None:
     os.environ["SPEECH_BOUNDARY_JA_SPEECH_OFF_THRESHOLD"] = str(args.speech_boundary_speech_off_threshold)
     os.environ["SPEECH_BOUNDARY_JA_FRAME_DILATION_S"] = str(args.speech_boundary_frame_dilation_s)
     os.environ["SPEECH_BOUNDARY_JA_DROP_GAP_THRESHOLD"] = str(args.speech_boundary_drop_gap_threshold)
-    os.environ["SPEECH_BOUNDARY_JA_SPLIT_THRESHOLD"] = str(args.speech_boundary_split_threshold)
-    os.environ["SPEECH_BOUNDARY_JA_SPLIT_PROMINENCE"] = str(args.speech_boundary_split_prominence)
+    os.environ["SPEECH_BOUNDARY_JA_SPLIT_TARGET_S"] = str(args.speech_boundary_split_target_s)
+    os.environ["SPEECH_BOUNDARY_JA_SPLIT_SCORE_QUANTILE"] = str(args.speech_boundary_split_score_quantile)
+    os.environ["SPEECH_BOUNDARY_JA_SPLIT_PROMINENCE_QUANTILE"] = str(
+        args.speech_boundary_split_prominence_quantile
+    )
     os.environ["SPEECH_BOUNDARY_JA_SPLIT_SMOOTH_S"] = str(args.speech_boundary_split_smooth_s)
     os.environ["SPEECH_BOUNDARY_JA_SPLIT_NMS_S"] = str(args.speech_boundary_split_nms_s)
     os.environ["SPEECH_BOUNDARY_JA_SPLIT_SNAP_S"] = str(args.speech_boundary_split_snap_s)
@@ -279,8 +282,11 @@ def build_context(*, args: argparse.Namespace, paths: RunPaths, video: Path):
         "SPEECH_BOUNDARY_JA_SPEECH_OFF_THRESHOLD": str(args.speech_boundary_speech_off_threshold),
         "SPEECH_BOUNDARY_JA_FRAME_DILATION_S": str(args.speech_boundary_frame_dilation_s),
         "SPEECH_BOUNDARY_JA_DROP_GAP_THRESHOLD": str(args.speech_boundary_drop_gap_threshold),
-        "SPEECH_BOUNDARY_JA_SPLIT_THRESHOLD": str(args.speech_boundary_split_threshold),
-        "SPEECH_BOUNDARY_JA_SPLIT_PROMINENCE": str(args.speech_boundary_split_prominence),
+        "SPEECH_BOUNDARY_JA_SPLIT_TARGET_S": str(args.speech_boundary_split_target_s),
+        "SPEECH_BOUNDARY_JA_SPLIT_SCORE_QUANTILE": str(args.speech_boundary_split_score_quantile),
+        "SPEECH_BOUNDARY_JA_SPLIT_PROMINENCE_QUANTILE": str(
+            args.speech_boundary_split_prominence_quantile
+        ),
         "SPEECH_BOUNDARY_JA_SPLIT_SMOOTH_S": str(args.speech_boundary_split_smooth_s),
         "SPEECH_BOUNDARY_JA_SPLIT_NMS_S": str(args.speech_boundary_split_nms_s),
         "SPEECH_BOUNDARY_JA_SPLIT_SNAP_S": str(args.speech_boundary_split_snap_s),
@@ -425,8 +431,10 @@ def write_summary(paths: RunPaths, args: argparse.Namespace, results: list[dict[
         "speech_boundary_speech_off_threshold": args.speech_boundary_speech_off_threshold,
         "speech_boundary_frame_dilation_s": args.speech_boundary_frame_dilation_s,
         "speech_boundary_drop_gap_threshold": args.speech_boundary_drop_gap_threshold,
-        "speech_boundary_split_threshold": args.speech_boundary_split_threshold,
-        "speech_boundary_split_prominence": args.speech_boundary_split_prominence,
+        "speech_boundary_split_strategy": "adaptive_topk_peak",
+        "speech_boundary_split_target_s": args.speech_boundary_split_target_s,
+        "speech_boundary_split_score_quantile": args.speech_boundary_split_score_quantile,
+        "speech_boundary_split_prominence_quantile": args.speech_boundary_split_prominence_quantile,
         "speech_boundary_split_smooth_s": args.speech_boundary_split_smooth_s,
         "speech_boundary_split_nms_s": args.speech_boundary_split_nms_s,
         "speech_boundary_split_snap_s": args.speech_boundary_split_snap_s,
@@ -454,7 +462,8 @@ def write_summary(paths: RunPaths, args: argparse.Namespace, results: list[dict[
             f"`{args.speech_boundary_speech_on_threshold:g}` / "
             f"`{args.speech_boundary_speech_off_threshold:g}`, "
             f"frame dilation `{args.speech_boundary_frame_dilation_s:g}s`, "
-            f"split `{args.speech_boundary_split_threshold:g}`, drop_gap `{args.speech_boundary_drop_gap_threshold:g}`"
+            f"adaptive split target `{args.speech_boundary_split_target_s:g}s`, "
+            f"drop_gap `{args.speech_boundary_drop_gap_threshold:g}`"
         ),
         f"- Translation: `{'on' if args.translate else 'off'}`",
         f"- Runtime root: `{project_rel(paths.root)}`",
@@ -553,8 +562,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("--speech-boundary-frame-dilation-s", dest="speech_boundary_frame_dilation_s", type=float, default=_env_float("SPEECH_BOUNDARY_JA_FRAME_DILATION_S", 0.2))
     parser.add_argument("--speech-boundary-drop-gap-threshold", dest="speech_boundary_drop_gap_threshold", type=float, default=_env_float("SPEECH_BOUNDARY_JA_DROP_GAP_THRESHOLD", 0.75))
-    parser.add_argument("--speech-boundary-split-threshold", dest="speech_boundary_split_threshold", type=float, default=_env_float("SPEECH_BOUNDARY_JA_SPLIT_THRESHOLD", 0.55))
-    parser.add_argument("--speech-boundary-split-prominence", dest="speech_boundary_split_prominence", type=float, default=_env_float("SPEECH_BOUNDARY_JA_SPLIT_PROMINENCE", 0.08))
+    parser.add_argument("--speech-boundary-split-target-s", dest="speech_boundary_split_target_s", type=float, default=_env_float("SPEECH_BOUNDARY_JA_SPLIT_TARGET_S", 5.0))
+    parser.add_argument("--speech-boundary-split-score-quantile", dest="speech_boundary_split_score_quantile", type=float, default=_env_float("SPEECH_BOUNDARY_JA_SPLIT_SCORE_QUANTILE", 0.50))
+    parser.add_argument("--speech-boundary-split-prominence-quantile", dest="speech_boundary_split_prominence_quantile", type=float, default=_env_float("SPEECH_BOUNDARY_JA_SPLIT_PROMINENCE_QUANTILE", 0.50))
     parser.add_argument("--speech-boundary-split-smooth-s", dest="speech_boundary_split_smooth_s", type=float, default=_env_float("SPEECH_BOUNDARY_JA_SPLIT_SMOOTH_S", 0.08))
     parser.add_argument("--speech-boundary-split-nms-s", dest="speech_boundary_split_nms_s", type=float, default=_env_float("SPEECH_BOUNDARY_JA_SPLIT_NMS_S", 0.20))
     parser.add_argument("--speech-boundary-split-snap-s", dest="speech_boundary_split_snap_s", type=float, default=_env_float("SPEECH_BOUNDARY_JA_SPLIT_SNAP_S", 0.10))
@@ -609,8 +619,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         parser.error("--speech-boundary-frame-dilation-s must be non-negative")
     for name in (
         "speech_boundary_drop_gap_threshold",
-        "speech_boundary_split_threshold",
-        "speech_boundary_split_prominence",
+        "speech_boundary_split_target_s",
         "speech_boundary_split_smooth_s",
         "speech_boundary_split_nms_s",
         "speech_boundary_split_snap_s",
@@ -618,6 +627,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     ):
         if getattr(args, name) < 0:
             parser.error(f"--{name.replace('_', '-')} must be non-negative")
+    for name in ("speech_boundary_split_score_quantile", "speech_boundary_split_prominence_quantile"):
+        value = getattr(args, name)
+        if not 0.0 <= value <= 1.0:
+            parser.error(f"--{name.replace('_', '-')} must be between 0 and 1")
     if args.speech_boundary_window_s <= 0:
         parser.error("--speech-boundary-window-s must be positive")
     if args.speech_boundary_overlap_s < 0 or args.speech_boundary_overlap_s >= args.speech_boundary_window_s:
@@ -667,4 +680,3 @@ def main(argv: list[str] | None = None) -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

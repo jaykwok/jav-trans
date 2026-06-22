@@ -36,6 +36,13 @@ DEFAULT_MODEL_PATH = qwen_asr_default_model_path(DEFAULT_PTM)
 DEFAULT_OPERATING_POINT = "qwen-mamba2-frame-boundary-scorer-v4"
 
 
+@dataclass(frozen=True)
+class _SplitPeakCandidate:
+    frame: int
+    score: float
+    prominence: float
+
+
 def _env_float(name: str, default: str) -> float:
     try:
         return float(os.getenv(name, default))
@@ -187,6 +194,16 @@ def _peak_prominence(values: np.ndarray, index: int, *, lower: int, upper: int, 
     return float(values[index]) - base
 
 
+def _quantile(values: Iterable[float], quantile: float) -> float:
+    data = np.asarray(list(values), dtype=np.float32)
+    if data.size == 0:
+        return 0.0
+    finite = data[np.isfinite(data)]
+    if finite.size == 0:
+        return 0.0
+    return float(np.quantile(finite, min(1.0, max(0.0, float(quantile)))))
+
+
 def _snap_split_frame(
     peak_frame: int,
     *,
@@ -217,20 +234,17 @@ def _snap_split_frame(
     )
 
 
-def _split_peak_frames_for_segment(
+def _split_peak_candidates_for_segment(
     segment: SpeechSegment,
     *,
     speech_probs: np.ndarray,
     split_probs: np.ndarray,
     drop_gap_probs: np.ndarray,
     frame_hop_s: float,
-    split_threshold: float,
-    split_prominence: float,
     split_smooth_s: float,
-    split_nms_s: float,
     split_snap_s: float,
     min_split_segment_s: float,
-) -> list[int]:
+) -> list[_SplitPeakCandidate]:
     total = min(int(speech_probs.size), int(split_probs.size), int(drop_gap_probs.size))
     if total <= 0:
         return []
@@ -243,11 +257,9 @@ def _split_peak_frames_for_segment(
         return []
     smooth_window = max(1, int(round(max(0.0, split_smooth_s) / frame_hop_s)))
     smoothed = _smooth_scores(split_probs[:total], window_frames=smooth_window)
-    candidates: list[tuple[int, float]] = []
+    candidates: list[_SplitPeakCandidate] = []
     for frame in range(lower, upper):
         value = float(smoothed[frame])
-        if value < split_threshold:
-            continue
         prev_value = float(smoothed[frame - 1]) if frame > start_frame else value
         next_value = float(smoothed[frame + 1]) if frame + 1 < end_frame else value
         if value < prev_value or value < next_value:
@@ -259,7 +271,7 @@ def _split_peak_frames_for_segment(
             upper=end_frame,
             window_frames=max(1, smooth_window),
         )
-        if prominence < split_prominence:
+        if prominence <= 0.0:
             continue
         snapped = _snap_split_frame(
             frame,
@@ -269,15 +281,91 @@ def _split_peak_frames_for_segment(
             drop_gap_probs=drop_gap_probs[:total],
             snap_frames=max(0, int(round(max(0.0, split_snap_s) / frame_hop_s))),
         )
-        candidates.append((snapped, value))
-    if not candidates:
-        return []
-    nms_frames = max(1, int(round(max(0.0, split_nms_s) / frame_hop_s)))
+        candidates.append(_SplitPeakCandidate(frame=snapped, score=value, prominence=prominence))
+    return candidates
+
+
+def _select_peak_frames(
+    candidates: Iterable[_SplitPeakCandidate],
+    *,
+    nms_frames: int,
+    max_count: int | None = None,
+    rank_by_prominence: bool = False,
+) -> list[int]:
     selected: list[int] = []
-    for frame, _score in sorted(candidates, key=lambda item: item[1], reverse=True):
+    ranked = sorted(
+        candidates,
+        key=(
+            (lambda item: (item.prominence, item.score))
+            if rank_by_prominence
+            else (lambda item: (item.score, item.prominence))
+        ),
+        reverse=True,
+    )
+    added: list[int] = []
+    for candidate in ranked:
+        if max_count is not None and len(added) >= max_count:
+            break
+        frame = int(candidate.frame)
         if all(abs(frame - existing) >= nms_frames for existing in selected):
             selected.append(frame)
-    return sorted(selected)
+            added.append(frame)
+    return added
+
+
+def _split_peak_frames_for_segment(
+    segment: SpeechSegment,
+    *,
+    speech_probs: np.ndarray,
+    split_probs: np.ndarray,
+    drop_gap_probs: np.ndarray,
+    frame_hop_s: float,
+    split_smooth_s: float,
+    split_nms_s: float,
+    split_snap_s: float,
+    min_split_segment_s: float,
+    split_target_s: float,
+    split_score_quantile: float,
+    split_prominence_quantile: float,
+) -> list[int]:
+    candidates = _split_peak_candidates_for_segment(
+        segment,
+        speech_probs=speech_probs,
+        split_probs=split_probs,
+        drop_gap_probs=drop_gap_probs,
+        frame_hop_s=frame_hop_s,
+        split_smooth_s=split_smooth_s,
+        split_snap_s=split_snap_s,
+        min_split_segment_s=min_split_segment_s,
+    )
+    if not candidates:
+        return []
+    target_s = max(0.0, float(split_target_s))
+    if target_s <= 0.0:
+        return []
+    segment_duration = max(0.0, float(segment.end) - float(segment.start))
+    budget = max(0, int(np.ceil(segment_duration / target_s)) - 1)
+    if budget <= 0:
+        return []
+    nms_frames = max(1, int(round(max(0.0, split_nms_s) / frame_hop_s)))
+    score_floor = _quantile((candidate.score for candidate in candidates), split_score_quantile)
+    prominence_floor = _quantile(
+        (candidate.prominence for candidate in candidates),
+        split_prominence_quantile,
+    )
+    adaptive_candidates = [
+        candidate
+        for candidate in candidates
+        if candidate.score >= score_floor and candidate.prominence >= prominence_floor
+    ]
+    return sorted(
+        _select_peak_frames(
+            adaptive_candidates,
+            nms_frames=nms_frames,
+            max_count=budget,
+            rank_by_prominence=True,
+        )
+    )
 
 
 def _split_segment_at_frames(
@@ -320,12 +408,13 @@ def _split_segments_by_peaks(
             split_probs=split_probs,
             drop_gap_probs=drop_gap_probs,
             frame_hop_s=config.frame_hop_s,
-            split_threshold=config.split_threshold,
-            split_prominence=config.split_prominence,
             split_smooth_s=config.split_smooth_s,
             split_nms_s=config.split_nms_s,
             split_snap_s=config.split_snap_s,
             min_split_segment_s=config.min_split_segment_s,
+            split_target_s=config.split_target_s,
+            split_score_quantile=config.split_score_quantile,
+            split_prominence_quantile=config.split_prominence_quantile,
         )
         result.extend(
             _split_segment_at_frames(
@@ -591,12 +680,13 @@ class SpeechBoundaryJaConfig:
     overlap_s: float = 1.0
     min_segment_s: float = 0.05
     drop_gap_threshold: float = 0.75
-    split_threshold: float = 0.55
-    split_prominence: float = 0.08
+    split_target_s: float = 5.0
     split_smooth_s: float = 0.08
     split_nms_s: float = 0.20
     split_snap_s: float = 0.10
     min_split_segment_s: float = 0.08
+    split_score_quantile: float = 0.50
+    split_prominence_quantile: float = 0.50
     export_sequence_features: bool = False
     sequence_feature_max_ptm_dims: int = 64
     no_download: bool = False
@@ -625,12 +715,19 @@ class SpeechBoundaryJaConfig:
             overlap_s=_env_float("SPEECH_BOUNDARY_JA_OVERLAP_S", "1.0"),
             min_segment_s=_env_float("SPEECH_BOUNDARY_JA_MIN_SEGMENT_S", "0.05"),
             drop_gap_threshold=_env_float("SPEECH_BOUNDARY_JA_DROP_GAP_THRESHOLD", "0.75"),
-            split_threshold=_env_float("SPEECH_BOUNDARY_JA_SPLIT_THRESHOLD", "0.55"),
-            split_prominence=_env_float("SPEECH_BOUNDARY_JA_SPLIT_PROMINENCE", "0.08"),
+            split_target_s=_env_float("SPEECH_BOUNDARY_JA_SPLIT_TARGET_S", "5.0"),
             split_smooth_s=_env_float("SPEECH_BOUNDARY_JA_SPLIT_SMOOTH_S", "0.08"),
             split_nms_s=_env_float("SPEECH_BOUNDARY_JA_SPLIT_NMS_S", "0.20"),
             split_snap_s=_env_float("SPEECH_BOUNDARY_JA_SPLIT_SNAP_S", "0.10"),
             min_split_segment_s=_env_float("SPEECH_BOUNDARY_JA_MIN_SPLIT_SEGMENT_S", "0.08"),
+            split_score_quantile=_env_float(
+                "SPEECH_BOUNDARY_JA_SPLIT_SCORE_QUANTILE",
+                "0.50",
+            ),
+            split_prominence_quantile=_env_float(
+                "SPEECH_BOUNDARY_JA_SPLIT_PROMINENCE_QUANTILE",
+                "0.50",
+            ),
             export_sequence_features=_env_bool("SPEECH_BOUNDARY_JA_EXPORT_SEQUENCE_FEATURES", "0"),
             sequence_feature_max_ptm_dims=max(
                 1,
@@ -678,12 +775,14 @@ class SpeechBoundaryJaBackend:
             "overlap_s": float(cfg.overlap_s),
             "min_segment_s": float(cfg.min_segment_s),
             "drop_gap_threshold": float(cfg.drop_gap_threshold),
-            "split_threshold": float(cfg.split_threshold),
-            "split_prominence": float(cfg.split_prominence),
+            "split_strategy": "adaptive_topk_peak",
+            "split_target_s": float(cfg.split_target_s),
             "split_smooth_s": float(cfg.split_smooth_s),
             "split_nms_s": float(cfg.split_nms_s),
             "split_snap_s": float(cfg.split_snap_s),
             "min_split_segment_s": float(cfg.min_split_segment_s),
+            "split_score_quantile": float(cfg.split_score_quantile),
+            "split_prominence_quantile": float(cfg.split_prominence_quantile),
             "export_sequence_features": bool(cfg.export_sequence_features),
             "sequence_feature_max_ptm_dims": int(cfg.sequence_feature_max_ptm_dims),
             "scorer_checkpoint": "",
