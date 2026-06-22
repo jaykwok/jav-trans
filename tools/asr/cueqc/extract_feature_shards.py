@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run CueQC v3-Fusion feature extraction in resumable shards."""
+"""Run CueQC v4 binary feature extraction in resumable shards."""
 from __future__ import annotations
 
 import argparse
@@ -76,7 +76,7 @@ def _extract_command(
     command = [
         sys.executable,
         "-m",
-        "tools.asr.cueqc.extract_features_v3_fusion",
+        "tools.asr.cueqc.extract_features_v4_binary",
         "--audio-root",
         str(_project_path(args.audio_root)),
         "--output",
@@ -125,7 +125,7 @@ def _run_shard(
 
 
 def _merge_shards(shards: list[Path], output: Path) -> int:
-    command = [sys.executable, "-m", "tools.asr.cueqc.merge_features_v3_fusion"]
+    command = [sys.executable, "-m", "tools.asr.cueqc.merge_features_v4_binary"]
     for shard in shards:
         command.extend(["--input", str(shard)])
     command.extend(["--output", str(output)])
@@ -250,10 +250,10 @@ def run(args: argparse.Namespace) -> int:
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Extract CueQC v3-Fusion features in resumable shards.")
+    parser = argparse.ArgumentParser(description="Extract CueQC v4 binary features in resumable shards.")
     source = parser.add_mutually_exclusive_group(required=True)
     source.add_argument("--train", default="", help="Labeled cueqc_train.jsonl.")
-    source.add_argument("--input", default="", help="Unlabeled cueqc_candidate_v1 JSONL.")
+    source.add_argument("--input", default="", help="Unlabeled cueqc_candidate_v4 JSONL.")
     parser.add_argument("--audio-root", required=True, help="Root containing per-video baseline wav artifacts.")
     parser.add_argument("--output-dir", default="", help="Defaults to agents/temp/YYYYMMDD_HHMMSS_cueqc-feature-shards.")
     parser.add_argument("--merged-output", default="", help="Optional merged .pt output after all shards succeed.")

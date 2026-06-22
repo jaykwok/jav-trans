@@ -8,7 +8,7 @@ from typing import Sequence
 import numpy as np
 
 
-FRAME_SEQUENCE_FEATURE_SCHEMA = "frame_sequence_features_v1"
+FRAME_SEQUENCE_FEATURE_SCHEMA = "edge_sequence_features_v1"
 FRAME_SEQUENCE_FRAMES_SCHEMA = "speech_boundary_ja_sequence_feature_frames_v1"
 
 
@@ -18,7 +18,6 @@ class FrameSequenceFeatureConfig:
     right_context_s: float = 0.60
     max_ptm_dims: int = 64
     include_mfcc: bool = True
-    target_chunk_s: float = 3.0
 
     def signature(self) -> dict:
         return {
@@ -27,7 +26,6 @@ class FrameSequenceFeatureConfig:
             "right_context_s": self.right_context_s,
             "max_ptm_dims": self.max_ptm_dims,
             "include_mfcc": self.include_mfcc,
-            "target_chunk_s": self.target_chunk_s,
         }
 
 
@@ -51,7 +49,7 @@ class FrameSequenceFeatureProvider:
         mfcc_array = _frame_array(self.mfcc, name="mfcc")
         frame_count = min(int(ptm_array.shape[0]), int(mfcc_array.shape[0]))
         if frame_count <= 0:
-            raise ValueError("frame sequence features require at least one frame")
+            raise ValueError("edge sequence features require at least one frame")
         ptm_used_dim = min(int(ptm_array.shape[1]), int(self.config.max_ptm_dims))
         object.__setattr__(self, "_ptm_array", ptm_array)
         object.__setattr__(self, "_mfcc_array", mfcc_array)
@@ -107,11 +105,11 @@ class FrameSequenceFeatureProvider:
         runtime_names = tuple(self.feature_names())
         expected_names = tuple(str(name) for name in feature_names)
         if runtime_names != expected_names:
-            raise ValueError("runtime frame sequence feature_names do not match checkpoint")
+            raise ValueError("runtime edge sequence feature_names do not match checkpoint")
         runtime_hash = self.feature_schema_hash()
         if runtime_hash != str(feature_schema_hash):
             raise ValueError(
-                "runtime frame sequence feature schema hash does not match checkpoint: "
+                "runtime edge sequence feature schema hash does not match checkpoint: "
                 f"{runtime_hash} != {feature_schema_hash}"
             )
 
@@ -163,9 +161,6 @@ def frame_sequence_feature_names(
         "gap_s",
         "left_duration_s",
         "right_duration_s",
-        "proposed_core_s",
-        "gap_reference_s",
-        "gap_ratio",
     ]
     for region in ("left", "gap", "right"):
         names.extend(f"{region}_ptm_mean_{index:03d}" for index in range(ptm_dim))
@@ -246,13 +241,11 @@ def boundary_window_sequence_features(
 ) -> list[float]:
     if frame_hop_s <= 0:
         raise ValueError("frame_hop_s must be positive")
-    if config.target_chunk_s <= 0:
-        raise ValueError("target_chunk_s must be positive")
     ptm_array = _frame_array(ptm, name="ptm")
     mfcc_array = _frame_array(mfcc, name="mfcc")
     frame_count = min(int(ptm_array.shape[0]), int(mfcc_array.shape[0]))
     if frame_count <= 0:
-        raise ValueError("frame sequence features require at least one frame")
+        raise ValueError("edge sequence features require at least one frame")
     ptm_used_dim = min(int(ptm_array.shape[1]), int(config.max_ptm_dims))
     ptm_used = ptm_array[:frame_count, :ptm_used_dim]
     mfcc_used = mfcc_array[:frame_count]
@@ -283,10 +276,7 @@ def _boundary_window_sequence_features_from_arrays(
 ) -> list[float]:
     if frame_hop_s <= 0:
         raise ValueError("frame_hop_s must be positive")
-    if config.target_chunk_s <= 0:
-        raise ValueError("target_chunk_s must be positive")
     gap_s = right_start_s - left_end_s
-    gap_reference_s = max(0.2, min(1.5, config.target_chunk_s / 6.0))
     ranges = {
         "left": (max(0.0, left_end_s - config.left_context_s), left_end_s),
         "gap": (left_end_s, right_start_s),
@@ -296,9 +286,6 @@ def _boundary_window_sequence_features_from_arrays(
         float(gap_s),
         float(max(0.0, left_end_s - left_start_s)),
         float(max(0.0, right_end_s - right_start_s)),
-        float(max(0.0, right_end_s - left_start_s)),
-        float(gap_reference_s),
-        float(gap_s / max(1e-6, gap_reference_s)),
     ]
     for name in ("left", "gap", "right"):
         start_s, end_s = ranges[name]

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Merge sharded CueQC v3-Fusion feature bundles."""
+"""Merge sharded CueQC v4 binary feature bundles."""
 from __future__ import annotations
 
 import argparse
@@ -42,7 +42,7 @@ def merge(inputs: list[Path], output: Path) -> dict[str, Any]:
 
     for path in inputs:
         bundle = torch.load(path, map_location="cpu", weights_only=False)
-        if bundle.get("schema") != "cueqc_mamba_v3_fusion_features":
+        if bundle.get("schema") != "cueqc_mamba_v4_binary_features":
             raise ValueError(f"unexpected schema in {path}: {bundle.get('schema')!r}")
         config = dict(bundle.get("feature_config") or {})
         if base_config is None:
@@ -71,7 +71,7 @@ def merge(inputs: list[Path], output: Path) -> dict[str, Any]:
     feature_config["source_mode"] = "merged"
     feature_config["source_shards"] = source_shards
     payload = {
-        "schema": "cueqc_mamba_v3_fusion_features",
+        "schema": "cueqc_mamba_v4_binary_features",
         "version": 3,
         "samples": merged_samples,
         "labels": torch.tensor(merged_labels, dtype=torch.long),
@@ -91,7 +91,7 @@ def merge(inputs: list[Path], output: Path) -> dict[str, Any]:
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Merge CueQC v3-Fusion feature shards.")
+    parser = argparse.ArgumentParser(description="Merge CueQC v4 binary feature shards.")
     parser.add_argument("--input", action="append", required=True, help="Input .pt shard. Repeatable.")
     parser.add_argument("--output", required=True)
     return parser.parse_args(argv)

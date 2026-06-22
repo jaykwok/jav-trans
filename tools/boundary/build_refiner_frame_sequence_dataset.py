@@ -29,7 +29,7 @@ from boundary.sequence_features import (
 )
 from boundary.ja import LabelRecord, TeacherSegment, load_cached_feature
 
-DATASET_SCHEMA = "boundary_refiner_frame_sequence_dataset_v5"
+DATASET_SCHEMA = "boundary_edge_refiner_dataset_v6"
 
 
 @dataclass(frozen=True)
@@ -38,7 +38,6 @@ class FrameSequenceConfig:
     right_context_s: float = 0.60
     max_ptm_dims: int = 64
     include_mfcc: bool = True
-    target_chunk_s: float = 3.0
     long_gap_split_s: float = 0.60
     synthetic_boundary_delta_jitter_s: float = 0.0
     synthetic_boundary_delta_seed: int = 240609
@@ -49,7 +48,6 @@ class FrameSequenceConfig:
             right_context_s=self.right_context_s,
             max_ptm_dims=self.max_ptm_dims,
             include_mfcc=self.include_mfcc,
-            target_chunk_s=self.target_chunk_s,
         )
 
 
@@ -447,7 +445,7 @@ def _write_jsonl(path: Path, rows: Iterable[Mapping[str, Any]]) -> None:
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Build feature-window sequence rows for the Boundary Refiner."
+        description="Build edge-only sequence rows for Boundary Refiner v6."
     )
     parser.add_argument("--labels", action="append", required=True)
     parser.add_argument("--feature-manifest", action="append", required=True)
@@ -458,7 +456,6 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--right-context-s", type=float, default=0.60)
     parser.add_argument("--max-ptm-dims", type=int, default=64)
     parser.add_argument("--no-mfcc", action="store_true")
-    parser.add_argument("--target-chunk-s", type=float, default=3.0)
     parser.add_argument("--long-gap-split-s", type=float, default=0.60)
     parser.add_argument(
         "--synthetic-boundary-delta-jitter-s",
@@ -476,8 +473,6 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         parser.error("context seconds must be positive")
     if args.max_ptm_dims <= 0:
         parser.error("--max-ptm-dims must be positive")
-    if args.target_chunk_s <= 0.0:
-        parser.error("--target-chunk-s must be positive")
     if args.long_gap_split_s < 0.0:
         parser.error("--long-gap-split-s must be non-negative")
     if args.synthetic_boundary_delta_jitter_s < 0.0:
@@ -498,7 +493,6 @@ def main(argv: list[str] | None = None) -> None:
             right_context_s=args.right_context_s,
             max_ptm_dims=args.max_ptm_dims,
             include_mfcc=not args.no_mfcc,
-            target_chunk_s=args.target_chunk_s,
             long_gap_split_s=args.long_gap_split_s,
             synthetic_boundary_delta_jitter_s=args.synthetic_boundary_delta_jitter_s,
             synthetic_boundary_delta_seed=args.synthetic_boundary_delta_seed,

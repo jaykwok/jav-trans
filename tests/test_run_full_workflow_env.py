@@ -23,9 +23,9 @@ def test_run_full_workflow_operating_point_uses_opt_in_scorer_metadata():
     results = [
         {
             "boundary_signature": {
-                "operating_point": "qwen-feature-energy-bootstrap-v1",
+                "operating_point": "qwen-mamba2-frame-boundary-scorer-v4",
                 "scorer_checkpoint": {
-                    "schema": "speech_boundary_ja_mamba2_frame_boundary_scorer_v3",
+                    "schema": "speech_boundary_ja_mamba2_frame_boundary_scorer_v4",
                     "metadata": {"operating_point": "qwen-mamba2-frame-boundary-scorer-synthetic-v3"},
                 },
             }
@@ -39,12 +39,12 @@ def test_run_full_workflow_operating_point_uses_opt_in_scorer_metadata():
 
 
 def test_run_full_workflow_operating_point_defaults_without_scorer():
-    assert run_full_workflow.speech_boundary_operating_point([]) == "qwen-feature-energy-bootstrap-v1"
+    assert run_full_workflow.speech_boundary_operating_point([]) == "qwen-mamba2-frame-boundary-scorer-v4"
     assert (
         run_full_workflow.speech_boundary_operating_point(
-            [{"boundary_signature": {"operating_point": "qwen-feature-energy-bootstrap-v1"}}]
+            [{"boundary_signature": {"operating_point": "qwen-mamba2-frame-boundary-scorer-v4"}}]
         )
-        == "qwen-feature-energy-bootstrap-v1"
+        == "qwen-mamba2-frame-boundary-scorer-v4"
     )
 
 
@@ -57,14 +57,14 @@ def test_run_full_workflow_parse_args_uses_loaded_env(monkeypatch):
         "jaykwok/Qwen3-ASR-0.6B-JA-Anime-Galgame=64,"
         "jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame=32",
     )
-    boundary_mapping = "jaykwok/Qwen3-ASR-0.6B-JA-Anime-Galgame=src/boundary/checkpoints/boundary_refiner.jaykwok-Qwen3-ASR-0.6B-JA-Anime-Galgame.pt"
-    cueqc_mapping = "jaykwok/Qwen3-ASR-0.6B-JA-Anime-Galgame=src/asr/checkpoints/cueqc_mamba_v3_fusion.jaykwok-Qwen3-ASR-0.6B-JA-Anime-Galgame.pt"
+    boundary_mapping = "jaykwok/Qwen3-ASR-0.6B-JA-Anime-Galgame=src/boundary/checkpoints/boundary_edge_refiner_v6.jaykwok-Qwen3-ASR-0.6B-JA-Anime-Galgame.pt"
+    cueqc_mapping = "jaykwok/Qwen3-ASR-0.6B-JA-Anime-Galgame=src/asr/checkpoints/cueqc_mamba_v4_binary.jaykwok-Qwen3-ASR-0.6B-JA-Anime-Galgame.pt"
     scorer_mapping = "jaykwok/Qwen3-ASR-0.6B-JA-Anime-Galgame=agents/temp/scorer.pt"
     monkeypatch.setenv("BOUNDARY_REFINER_MODEL_PATH_BY_REPO", boundary_mapping)
     monkeypatch.setenv("CUEQC_MODEL_PATH_BY_REPO", cueqc_mapping)
     monkeypatch.setenv("SPEECH_BOUNDARY_JA_SCORER_CHECKPOINT_BY_REPO", scorer_mapping)
-    monkeypatch.setenv("BOUNDARY_PLANNER_TARGET_CHUNK_S", "3.0")
-    monkeypatch.setenv("BOUNDARY_PLANNER_MAX_CORE_CHUNK_S", "5.0")
+    monkeypatch.setenv("SPEECH_BOUNDARY_JA_SPLIT_THRESHOLD", "0.6")
+    monkeypatch.setenv("SPEECH_BOUNDARY_JA_DROP_GAP_THRESHOLD", "0.8")
 
     args = run_full_workflow.parse_args(
         [
@@ -83,8 +83,8 @@ def test_run_full_workflow_parse_args_uses_loaded_env(monkeypatch):
     assert args.boundary_refiner_model_path_by_repo == boundary_mapping
     assert args.cueqc_model_path_by_repo == cueqc_mapping
     assert args.speech_boundary_scorer_checkpoint_by_repo == scorer_mapping
-    assert args.boundary_planner_target_chunk_s == 3.0
-    assert args.boundary_planner_max_core_chunk_s == 5.0
+    assert args.speech_boundary_split_threshold == 0.6
+    assert args.speech_boundary_drop_gap_threshold == 0.8
     assert args.speech_boundary_speech_on_threshold == args.speech_boundary_threshold
     assert args.speech_boundary_speech_off_threshold == args.speech_boundary_threshold
 
@@ -95,15 +95,15 @@ def test_run_full_workflow_context_carries_boundary_env(monkeypatch, tmp_path):
         "jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame=8"
     )
     monkeypatch.setenv("ASR_BATCH_SIZE_BY_REPO", batch_table)
-    boundary_mapping = "jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame=src/boundary/checkpoints/boundary_refiner.jaykwok-Qwen3-ASR-1.7B-JA-Anime-Galgame.pt"
-    cueqc_mapping = "jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame=src/asr/checkpoints/cueqc_mamba_v3_fusion.jaykwok-Qwen3-ASR-1.7B-JA-Anime-Galgame.pt"
+    boundary_mapping = "jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame=src/boundary/checkpoints/boundary_edge_refiner_v6.jaykwok-Qwen3-ASR-1.7B-JA-Anime-Galgame.pt"
+    cueqc_mapping = "jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame=src/asr/checkpoints/cueqc_mamba_v4_binary.jaykwok-Qwen3-ASR-1.7B-JA-Anime-Galgame.pt"
     scorer_mapping = "jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame=agents/temp/scorer.pt"
     monkeypatch.setenv("BOUNDARY_REFINER_MODEL_PATH_BY_REPO", boundary_mapping)
     monkeypatch.setenv("CUEQC_MODEL_PATH_BY_REPO", cueqc_mapping)
     monkeypatch.setenv("SPEECH_BOUNDARY_JA_SCORER_CHECKPOINT_BY_REPO", scorer_mapping)
     monkeypatch.setenv("BOUNDARY_REFINER_DEVICE", "cpu")
-    monkeypatch.setenv("BOUNDARY_PLANNER_TARGET_CHUNK_S", "3.5")
-    monkeypatch.setenv("BOUNDARY_PLANNER_MAX_CORE_CHUNK_S", "5.5")
+    monkeypatch.setenv("SPEECH_BOUNDARY_JA_SPLIT_THRESHOLD", "0.65")
+    monkeypatch.setenv("SPEECH_BOUNDARY_JA_DROP_GAP_THRESHOLD", "0.85")
 
     args = run_full_workflow.parse_args(
         [
@@ -117,8 +117,10 @@ def test_run_full_workflow_context_carries_boundary_env(monkeypatch, tmp_path):
             "0.7",
             "--speech-boundary-speech-off-threshold",
             "0.5",
-            "--speech-boundary-cut-threshold",
+            "--speech-boundary-split-threshold",
             "0.7",
+            "--speech-boundary-drop-gap-threshold",
+            "0.9",
         ]
     )
     paths = run_full_workflow.RunPaths(
@@ -141,11 +143,10 @@ def test_run_full_workflow_context_carries_boundary_env(monkeypatch, tmp_path):
     assert ctx.advanced["CUEQC_MODEL_PATH_BY_REPO"] == cueqc_mapping
     assert ctx.advanced["SPEECH_BOUNDARY_JA_SCORER_CHECKPOINT_BY_REPO"] == scorer_mapping
     assert ctx.advanced["BOUNDARY_REFINER_DEVICE"] == "cpu"
-    assert ctx.advanced["BOUNDARY_PLANNER_TARGET_CHUNK_S"] == "3.5"
-    assert ctx.advanced["BOUNDARY_PLANNER_MAX_CORE_CHUNK_S"] == "5.5"
+    assert ctx.advanced["SPEECH_BOUNDARY_JA_SPLIT_THRESHOLD"] == "0.7"
+    assert ctx.advanced["SPEECH_BOUNDARY_JA_DROP_GAP_THRESHOLD"] == "0.9"
     assert ctx.advanced["SPEECH_BOUNDARY_JA_SPEECH_ON_THRESHOLD"] == "0.7"
     assert ctx.advanced["SPEECH_BOUNDARY_JA_SPEECH_OFF_THRESHOLD"] == "0.5"
-    assert ctx.advanced["SPEECH_BOUNDARY_JA_CUT_THRESHOLD"] == "0.7"
 
 
 def test_run_full_workflow_cli_batch_overrides_loaded_env(monkeypatch):

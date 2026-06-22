@@ -21,31 +21,31 @@ DEFAULT_QWEN_ASR_BATCH_SIZE_BY_REPO: dict[str, int] = {
 DEFAULT_BOUNDARY_REFINER_CHECKPOINT_BY_REPO: dict[str, str] = {
     QWEN_ASR_17B_REPO_ID: (
         "src/boundary/checkpoints/"
-        "boundary_refiner.jaykwok-Qwen3-ASR-1.7B-JA-Anime-Galgame.pt"
+        "boundary_edge_refiner_v6.jaykwok-Qwen3-ASR-1.7B-JA-Anime-Galgame.pt"
     ),
     QWEN_ASR_06B_REPO_ID: (
         "src/boundary/checkpoints/"
-        "boundary_refiner.jaykwok-Qwen3-ASR-0.6B-JA-Anime-Galgame.pt"
+        "boundary_edge_refiner_v6.jaykwok-Qwen3-ASR-0.6B-JA-Anime-Galgame.pt"
     ),
 }
 DEFAULT_CUEQC_CHECKPOINT_BY_REPO: dict[str, str] = {
     QWEN_ASR_17B_REPO_ID: (
         "src/asr/checkpoints/"
-        "cueqc_mamba_v3_fusion.jaykwok-Qwen3-ASR-1.7B-JA-Anime-Galgame.pt"
+        "cueqc_mamba_v4_binary.jaykwok-Qwen3-ASR-1.7B-JA-Anime-Galgame.pt"
     ),
     QWEN_ASR_06B_REPO_ID: (
         "src/asr/checkpoints/"
-        "cueqc_mamba_v3_fusion.jaykwok-Qwen3-ASR-0.6B-JA-Anime-Galgame.pt"
+        "cueqc_mamba_v4_binary.jaykwok-Qwen3-ASR-0.6B-JA-Anime-Galgame.pt"
     ),
 }
 DEFAULT_SPEECH_BOUNDARY_SCORER_CHECKPOINT_BY_REPO: dict[str, str] = {
     QWEN_ASR_17B_REPO_ID: (
         "src/boundary/ja/checkpoints/"
-        "speech_boundary_ja_feature_scorer.jaykwok-Qwen3-ASR-1.7B-JA-Anime-Galgame.pt"
+        "speech_boundary_ja_frame_boundary_scorer_v4.jaykwok-Qwen3-ASR-1.7B-JA-Anime-Galgame.pt"
     ),
     QWEN_ASR_06B_REPO_ID: (
         "src/boundary/ja/checkpoints/"
-        "speech_boundary_ja_feature_scorer.jaykwok-Qwen3-ASR-0.6B-JA-Anime-Galgame.pt"
+        "speech_boundary_ja_frame_boundary_scorer_v4.jaykwok-Qwen3-ASR-0.6B-JA-Anime-Galgame.pt"
     ),
 }
 

@@ -9,7 +9,7 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 
-from asr.backends.qwen import QWEN_ASR_06B_REPO_ID, QWEN_ASR_17B_REPO_ID, QWEN_ASR_REPO_ID
+from asr.backends.qwen import QWEN_ASR_06B_REPO_ID, QWEN_ASR_17B_REPO_ID, QWEN_ASR_REPO_ID, qwen_asr_repo_tag
 from boundary.ja import (
     FeatureConfig,
     FeatureScorerTrainConfig,
@@ -51,12 +51,6 @@ from boundary.ja.backend import (
 )
 from boundary.ja.manifest import TrainingExample
 from boundary.ja.model import TinyFrameClassifier, load_feature_frame_scorer_checkpoint
-from tools.boundary.ja.evaluate_feature_scorer_thresholds import (
-    _choose_boundary_aware_runtime_profile,
-    _hysteresis_predictions,
-    evaluate_thresholds,
-)
-
 
 def _require_mamba2():
     transformers = pytest.importorskip("transformers")
@@ -76,7 +70,7 @@ def _mamba2_scorer_config(*, ptm_dim: int, mfcc_dim: int) -> dict:
         "n_groups": 1,
         "chunk_size": 4,
         "bidirectional": True,
-        "output_dim": 2,
+        "output_dim": 3,
     }
 
 
@@ -90,6 +84,13 @@ def _build_mamba2_scorer(*, ptm_dim: int, mfcc_dim: int):
         ),
         model_config,
     )
+
+
+
+def _registered_placeholder(tmp_path: Path, repo_id: str) -> Path:
+    path = tmp_path / f"speech_boundary_ja_frame_boundary_scorer_v4.{qwen_asr_repo_tag(repo_id)}.pt"
+    path.write_bytes(b"placeholder")
+    return path
 
 
 def test_hf_audio_sample_normalizes_to_16k_mono():
@@ -143,19 +144,19 @@ def test_label_record_and_endpoint_targets_keep_boundary_metadata():
         },
     )
 
-    starts, ends, cut_drops, cut_points = endpoint_targets_from_record(
+    starts, ends, drop_gaps, split_points = endpoint_targets_from_record(
         record,
         frame_count=10,
         boundary_radius_frames=0,
-        cut_min_gap_s=0.5,
-        cut_boundary_radius_frames=0,
+        drop_gap_min_gap_s=0.5,
+        split_boundary_radius_frames=0,
     )
 
     assert record.boundary_metadata["cut_drop_zones"] == [{"start": 0.3, "end": 0.7}]
     assert starts.tolist() == [1, 0, 0, 0, 0, 0, 0, 1, 0, 0]
     assert ends.tolist() == [0, 0, 1, 0, 0, 0, 0, 0, 0, 1]
-    assert cut_drops.tolist() == [0, 0, 0, 1, 1, 1, 1, 0, 0, 0]
-    assert cut_points.tolist()[5] == 1
+    assert drop_gaps.tolist() == [0, 0, 0, 1, 1, 1, 1, 0, 0, 0]
+    assert split_points.tolist()[5] == 1
 
 
 def test_frame_helpers_and_metrics():
@@ -269,37 +270,44 @@ def test_write_jsonl_and_bootstrap_backend_signature(tmp_path):
 
     assert path.read_text(encoding="utf-8").strip()
     assert DEFAULT_MODEL_PATH == "models/jaykwok-Qwen3-ASR-1.7B-JA-Anime-Galgame"
-    assert DEFAULT_OPERATING_POINT == "qwen-feature-energy-bootstrap-v1"
+    assert DEFAULT_OPERATING_POINT == "qwen-mamba2-frame-boundary-scorer-v4"
     assert cfg.ptm == QWEN_ASR_REPO_ID
     assert cfg.scorer_checkpoint == ""
     assert cfg.scorer_checkpoint_repo_id == ""
     assert not hasattr(cfg, "imitation_checkpoint")
 
 
-def test_backend_scorer_defaults_to_registered_06b_checkpoint(monkeypatch):
+def test_backend_scorer_defaults_to_registered_06b_checkpoint(monkeypatch, tmp_path):
+    checkpoint_path = _registered_placeholder(tmp_path, QWEN_ASR_06B_REPO_ID)
+    monkeypatch.setattr(
+        "boundary.ja.backend.DEFAULT_SPEECH_BOUNDARY_SCORER_CHECKPOINT_BY_REPO",
+        {QWEN_ASR_06B_REPO_ID: str(checkpoint_path)},
+    )
     monkeypatch.setenv("SPEECH_BOUNDARY_JA_PTM", QWEN_ASR_06B_REPO_ID)
     monkeypatch.delenv("SPEECH_BOUNDARY_JA_SCORER_CHECKPOINT_BY_REPO", raising=False)
 
     cfg = SpeechBoundaryJaConfig.from_env()
 
-    assert cfg.scorer_checkpoint.endswith(
-        "speech_boundary_ja_feature_scorer.jaykwok-Qwen3-ASR-0.6B-JA-Anime-Galgame.pt"
-    )
+    assert cfg.scorer_checkpoint == str(checkpoint_path.resolve())
     assert cfg.scorer_checkpoint_repo_id == QWEN_ASR_06B_REPO_ID
 
 
-def test_backend_scorer_defaults_to_registered_17b_checkpoint(monkeypatch):
+def test_backend_scorer_defaults_to_registered_17b_checkpoint(monkeypatch, tmp_path):
+    checkpoint_path = _registered_placeholder(tmp_path, QWEN_ASR_17B_REPO_ID)
+    monkeypatch.setattr(
+        "boundary.ja.backend.DEFAULT_SPEECH_BOUNDARY_SCORER_CHECKPOINT_BY_REPO",
+        {QWEN_ASR_17B_REPO_ID: str(checkpoint_path)},
+    )
     monkeypatch.setenv("SPEECH_BOUNDARY_JA_PTM", QWEN_ASR_17B_REPO_ID)
     monkeypatch.delenv("SPEECH_BOUNDARY_JA_SCORER_CHECKPOINT_BY_REPO", raising=False)
 
     cfg = SpeechBoundaryJaConfig.from_env()
 
-    assert cfg.scorer_checkpoint.endswith(
-        "speech_boundary_ja_feature_scorer.jaykwok-Qwen3-ASR-1.7B-JA-Anime-Galgame.pt"
-    )
+    assert cfg.scorer_checkpoint == str(checkpoint_path.resolve())
     assert cfg.scorer_checkpoint_repo_id == QWEN_ASR_17B_REPO_ID
+
 def test_backend_scorer_checkpoint_env_resolves_by_ptm_repo_id(monkeypatch, tmp_path):
-    checkpoint_path = tmp_path / "speech_boundary_ja_feature_scorer.pt"
+    checkpoint_path = tmp_path / "speech_boundary_ja_frame_boundary_scorer_v4.pt"
     checkpoint_path.write_bytes(b"checkpoint")
     monkeypatch.setenv("SPEECH_BOUNDARY_JA_PTM", QWEN_ASR_17B_REPO_ID)
     monkeypatch.setenv(
@@ -350,14 +358,6 @@ def test_hysteresis_frames_rejects_inverted_thresholds():
         )
 
 
-def test_threshold_eval_hysteresis_predictions_match_runtime_semantics():
-    frames = _hysteresis_predictions(
-        np.asarray([0.10, 0.80, 0.60, 0.45, 0.55, 0.49, 0.71], dtype=np.float32),
-        on_threshold=0.70,
-        off_threshold=0.50,
-    )
-
-    assert frames.tolist() == [0, 1, 1, 0, 0, 0, 1]
 
 
 def test_feature_frame_scorer_checkpoint_round_trip(tmp_path):
@@ -376,7 +376,7 @@ def test_feature_frame_scorer_checkpoint_round_trip(tmp_path):
     torch.save(checkpoint, checkpoint_path)
 
     bundle = load_feature_frame_scorer_checkpoint(checkpoint_path, device="cpu")
-    speech_probs, cut_probs = score_feature_frame_boundary_probabilities(
+    speech_probs, split_probs, drop_gap_probs = score_feature_frame_boundary_probabilities(
         bundle,
         ptm=np.ones((3, 4), dtype=np.float32),
         mfcc=np.ones((3, 2), dtype=np.float32),
@@ -386,26 +386,13 @@ def test_feature_frame_scorer_checkpoint_round_trip(tmp_path):
     assert bundle.signature()["model_type"] == "mamba2_frame_boundary_scorer"
     assert bundle.input_dim == 6
     assert speech_probs.shape == (3,)
-    assert cut_probs.shape == (3,)
+    assert split_probs.shape == (3,)
+    assert drop_gap_probs.shape == (3,)
     assert np.all((0.0 <= speech_probs) & (speech_probs <= 1.0))
-    assert np.all((0.0 <= cut_probs) & (cut_probs <= 1.0))
+    assert np.all((0.0 <= split_probs) & (split_probs <= 1.0))
+    assert np.all((0.0 <= drop_gap_probs) & (drop_gap_probs <= 1.0))
 
 
-def test_committed_06b_feature_frame_scorer_has_repo_metadata():
-    pytest.importorskip("torch")
-    _require_mamba2()
-    checkpoint_path = Path(
-        "src/boundary/ja/checkpoints/"
-        "speech_boundary_ja_feature_scorer.jaykwok-Qwen3-ASR-0.6B-JA-Anime-Galgame.pt"
-    )
-
-    bundle = load_feature_frame_scorer_checkpoint(checkpoint_path, device="cpu")
-    _validate_scorer_checkpoint_repo(bundle, QWEN_ASR_06B_REPO_ID)
-
-    assert bundle.schema == MAMBA2_FRAME_SCORER_SCHEMA
-    assert bundle.model_type == "mamba2_frame_boundary_scorer"
-    assert bundle.metadata["ptm_repo_id"] == QWEN_ASR_06B_REPO_ID
-    assert bundle.model_config["output_dim"] == 2
 
 
 def test_feature_frame_scorer_rejects_removed_v1_schema(tmp_path):
@@ -429,7 +416,7 @@ def test_feature_frame_scorer_rejects_removed_v1_schema(tmp_path):
         checkpoint_path,
     )
 
-    with pytest.raises(ValueError, match="speech_boundary_ja_mamba2_frame_boundary_scorer_v3"):
+    with pytest.raises(ValueError, match="speech_boundary_ja_mamba2_frame_boundary_scorer_v4"):
         load_feature_frame_scorer_checkpoint(checkpoint_path, device="cpu")
 
 
@@ -498,7 +485,8 @@ def test_feature_frame_scorer_training_from_cached_features(tmp_path):
     assert metrics.schema == MAMBA2_FRAME_SCORER_SCHEMA
     assert metrics.input_dim == 5
     assert 0.0 <= metrics.speech_f1 <= 1.0
-    assert 0.0 <= metrics.cut_f1 <= 1.0
+    assert 0.0 <= metrics.split_boundary_f1 <= 1.0
+    assert 0.0 <= metrics.drop_gap_f1 <= 1.0
     bundle = load_feature_frame_scorer_checkpoint(metrics.checkpoint, device="cpu")
     assert bundle.signature()["metadata"]["trained_steps"] == 2
     assert bundle.signature()["metadata"]["ptm_repo_id"] == QWEN_ASR_17B_REPO_ID
@@ -536,186 +524,7 @@ def test_feature_frame_scorer_training_rejects_missing_ptm_repo_id(tmp_path):
         )
 
 
-def test_feature_frame_scorer_threshold_eval_writes_summary(tmp_path):
-    torch = pytest.importorskip("torch")
-    model, model_config = _build_mamba2_scorer(ptm_dim=3, mfcc_dim=2)
-    checkpoint_path = tmp_path / "feature_scorer.pt"
-    torch.save(
-        build_feature_frame_scorer_checkpoint(
-            model=model,
-            model_config=model_config,
-            normalization={"feature_mean": [0.0] * 5, "feature_std": [1.0] * 5},
-            metadata={"operating_point": "unit"},
-        ),
-        checkpoint_path,
-    )
-    labels_path = tmp_path / "labels.jsonl"
-    record = build_supervised_record(
-        audio_id="clip",
-        source="unit",
-        duration_s=0.4,
-        speech_segments=[{"start": 0.1, "end": 0.3}],
-        frame_hop_s=0.1,
-    )
-    write_jsonl(labels_path, [record])
-    feature_path = tmp_path / "clip.npz"
-    np.savez(
-        feature_path,
-        ptm=np.ones((4, 3), dtype=np.float32),
-        mfcc=np.ones((4, 2), dtype=np.float32),
-    )
-    manifest_path = tmp_path / "feature_manifest.jsonl"
-    manifest_path.write_text(
-        json.dumps(
-            {
-                "label_index": 0,
-                "feature_path": str(feature_path),
-                "frame_count": 4,
-                "ptm_dim": 3,
-                "mfcc_dim": 2,
-            },
-            ensure_ascii=False,
-            sort_keys=True,
-        )
-        + "\n",
-        encoding="utf-8",
-    )
 
-    summary = evaluate_thresholds(
-        checkpoint=checkpoint_path,
-        labels=labels_path,
-        feature_manifest=manifest_path,
-        output_dir=tmp_path / "eval",
-        thresholds=[0.0, 1.0],
-        device="cpu",
-        runtime_profiles=[(0.7, 0.5, 0.7)],
-    )
-
-    assert summary["rows"] == 1
-    assert summary["schema"] == "speech_boundary_ja_mamba2_frame_boundary_scorer_threshold_eval_v3"
-    assert len(summary["speech_metrics"]) == 2
-    assert len(summary["cut_metrics"]) == 2
-    assert summary["runtime_profile_metrics"][0]["speech_on_threshold"] == pytest.approx(0.7)
-    assert summary["runtime_profile_metrics"][0]["speech_off_threshold"] == pytest.approx(0.5)
-    assert summary["runtime_profile_metrics"][0]["cut_threshold"] == pytest.approx(0.7)
-    assert (tmp_path / "eval" / "threshold_eval_summary.json").exists()
-    assert (tmp_path / "eval" / "threshold_metrics.jsonl").exists()
-    assert '"head": "runtime_profile"' in (tmp_path / "eval" / "threshold_metrics.jsonl").read_text(encoding="utf-8")
-
-
-def test_feature_frame_scorer_threshold_eval_can_diagnose_speech_errors(tmp_path):
-    torch = pytest.importorskip("torch")
-    model, model_config = _build_mamba2_scorer(ptm_dim=3, mfcc_dim=2)
-    checkpoint_path = tmp_path / "feature_scorer.pt"
-    torch.save(
-        build_feature_frame_scorer_checkpoint(
-            model=model,
-            model_config=model_config,
-            normalization={"feature_mean": [0.0] * 5, "feature_std": [1.0] * 5},
-            metadata={"operating_point": "unit"},
-        ),
-        checkpoint_path,
-    )
-    labels_path = tmp_path / "labels.jsonl"
-    record = build_supervised_record(
-        audio_id="clip",
-        source="unit",
-        duration_s=0.6,
-        speech_segments=[{"start": 0.2, "end": 0.4}],
-        frame_hop_s=0.1,
-    )
-    write_jsonl(labels_path, [record])
-    feature_path = tmp_path / "clip.npz"
-    np.savez(
-        feature_path,
-        ptm=np.ones((6, 3), dtype=np.float32),
-        mfcc=np.ones((6, 2), dtype=np.float32),
-    )
-    manifest_path = tmp_path / "feature_manifest.jsonl"
-    manifest_path.write_text(
-        json.dumps(
-            {
-                "label_index": 0,
-                "feature_path": str(feature_path),
-                "frame_count": 6,
-                "ptm_dim": 3,
-                "mfcc_dim": 2,
-            },
-            ensure_ascii=False,
-            sort_keys=True,
-        )
-        + "\n",
-        encoding="utf-8",
-    )
-
-    summary = evaluate_thresholds(
-        checkpoint=checkpoint_path,
-        labels=labels_path,
-        feature_manifest=manifest_path,
-        output_dir=tmp_path / "eval",
-        thresholds=[0.5],
-        device="cpu",
-        diagnostic_thresholds=[1.0],
-        diagnostic_boundary_buckets_s=[0.05, 0.15],
-        diagnostic_near_boundary_s=0.15,
-    )
-
-    diagnostics = summary["speech_error_diagnostics"]
-    assert "threshold_1.000000" in diagnostics
-    diagnostic = diagnostics["threshold_1.000000"]
-    assert diagnostic["overall"]["false_negative"] >= 1
-    assert diagnostic["distance_buckets"]
-    assert diagnostic["regions"]["near_boundary"]["frames"] >= 1
-    assert diagnostic["islands"]["label_islands"] == 1
-    assert 0.0 <= diagnostic["islands"]["speech_island_recall"] <= 1.0
-    assert diagnostic["islands"]["cut_drop_zone_clean_rate"] == pytest.approx(0.0)
-    assert diagnostic["top_error_rows"][0]["audio_id"] == "clip"
-    assert (tmp_path / "eval" / "speech_error_diagnostics.jsonl").exists()
-
-
-def test_boundary_aware_runtime_profile_recommendation_reports_failures():
-    rows = [
-        {
-            "speech_on_threshold": 0.65,
-            "speech_off_threshold": 0.60,
-            "cut_threshold": 1.0,
-            "precision": 0.99,
-            "recall": 0.988,
-            "f1": 0.989,
-            "false_positive_rate": 0.009,
-        }
-    ]
-    diagnostics = {
-        "runtime_on0.650000_off0.600000_cut1.000000": {
-            "regions": {
-                "far_from_boundary": {
-                    "frames": 100,
-                    "recall": 0.996,
-                    "false_positive_rate": 0.004,
-                }
-            },
-            "islands": {
-                "label_islands": 10,
-                "predicted_islands": 12,
-                "speech_island_recall": 1.0,
-                "mean_label_island_coverage": 0.99,
-                "predicted_island_precision": 0.92,
-                "cut_drop_zones": 4,
-                "cut_drop_zone_clean_rate": 0.50,
-                "mean_cut_drop_zone_predicted_ratio": 0.20,
-            },
-        }
-    }
-
-    recommendation = _choose_boundary_aware_runtime_profile(rows, diagnostics)
-
-    assert recommendation["status"] == "no_profile_passes_policy"
-    selected = recommendation["selected"]
-    assert selected["speech_island_recall"] == pytest.approx(1.0)
-    assert selected["diagnostic_id"] == "runtime_on0.650000_off0.600000_cut1.000000"
-    assert "predicted_island_precision" in selected["boundary_aware_failures"]
-    assert "cut_drop_zone_clean_rate" in selected["boundary_aware_failures"]
-    assert "mean_cut_drop_zone_predicted_ratio" in selected["boundary_aware_failures"]
 
 
 def test_backend_scorer_is_opt_in_and_keeps_segment_contract(tmp_path, monkeypatch):
@@ -770,7 +579,7 @@ def test_backend_scorer_is_opt_in_and_keeps_segment_contract(tmp_path, monkeypat
     assert result.segments
     assert result.segments[0].start == 0.0
     assert result.segments[0].end > result.segments[0].start
-    assert result.parameters["runtime_device"]["score_model"] == "mamba2_frame_boundary_scorer"
+    assert result.parameters["runtime_device"]["score_model"] == "mamba2_frame_boundary_scorer_v4"
     assert result.parameters["scorer_checkpoint"]["schema"] == MAMBA2_FRAME_SCORER_SCHEMA
     assert SpeechBoundaryJaConfig().scorer_checkpoint == ""
     assert SpeechBoundaryJaBackend(SpeechBoundaryJaConfig()).signature()["scorer_checkpoint"] == ""

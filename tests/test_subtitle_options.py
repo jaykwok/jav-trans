@@ -7,8 +7,6 @@ from subtitles import writer as subtitle
 
 def test_subtitle_options_from_env(monkeypatch):
     monkeypatch.setenv("MAX_SUBTITLE_DURATION", "9.5")
-    monkeypatch.setenv("SUBTITLE_SOFT_MAX_S", "7.5")
-    monkeypatch.setenv("SUBTITLE_SOFT_SPLIT_ENABLED", "0")
     monkeypatch.setenv("SRT_LINE_MAX_CHARS", "18")
     monkeypatch.setenv("SUBTITLE_TIMELINE_MODE", "reading")
     monkeypatch.setenv("SUBTITLE_READING_CPS", "10")
@@ -19,8 +17,6 @@ def test_subtitle_options_from_env(monkeypatch):
     options = SubtitleOptions.from_env()
 
     assert options.max_duration == 9.5
-    assert options.soft_max == 7.5
-    assert options.soft_split_enabled is False
     assert options.timeline_mode == "reading"
     assert options.reading_cps == 10
     assert options.line_max_chars == 18
@@ -31,12 +27,10 @@ def test_subtitle_options_from_env(monkeypatch):
 
 def test_subtitle_options_defaults_are_conservative(monkeypatch):
     monkeypatch.delenv("MAX_SUBTITLE_DURATION", raising=False)
-    monkeypatch.delenv("SUBTITLE_SOFT_MAX_S", raising=False)
 
     options = SubtitleOptions.from_env()
 
     assert options.max_duration == 6.5
-    assert options.soft_max == 5.5
     assert options.effective_video_fps == FALLBACK_VIDEO_FPS
     assert options.frame_gap_s == 2 / FALLBACK_VIDEO_FPS
     assert options.timing_polish_enabled is True

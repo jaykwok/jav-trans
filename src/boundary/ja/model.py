@@ -8,9 +8,15 @@ from typing import Any
 import numpy as np
 
 
-MAMBA2_FRAME_SCORER_SCHEMA = "speech_boundary_ja_mamba2_frame_boundary_scorer_v3"
+MAMBA2_FRAME_SCORER_SCHEMA = "speech_boundary_ja_mamba2_frame_boundary_scorer_v4"
 MAMBA2_FRAME_SCORER_MODEL_TYPE = "mamba2_frame_boundary_scorer"
-MAMBA2_FRAME_SCORER_OUTPUT_DIM = 2
+MAMBA2_FRAME_SCORER_OUTPUT_DIM = 3
+MAMBA2_FRAME_SCORER_OUTPUT_HEADS = (
+    "speech_prob",
+    "split_boundary_prob",
+    "drop_gap_prob",
+)
+MAMBA2_FRAME_SCORER_DECODER = "peak_split_v1"
 
 
 def count_trainable_parameters(model) -> int:
@@ -23,6 +29,21 @@ def _bool_config(value: Any) -> bool:
     if isinstance(value, str):
         return value.strip().lower() in {"1", "true", "yes", "on"}
     return bool(value)
+
+
+def _validate_metadata(metadata: dict[str, Any]) -> None:
+    heads = tuple(str(item) for item in (metadata.get("output_heads") or ()))
+    if heads != MAMBA2_FRAME_SCORER_OUTPUT_HEADS:
+        raise ValueError(
+            "Mamba2 boundary scorer checkpoint metadata.output_heads must be "
+            f"{list(MAMBA2_FRAME_SCORER_OUTPUT_HEADS)!r}; got {list(heads)!r}"
+        )
+    decoder = str(metadata.get("decoder") or "")
+    if decoder != MAMBA2_FRAME_SCORER_DECODER:
+        raise ValueError(
+            "Mamba2 boundary scorer checkpoint metadata.decoder must be "
+            f"{MAMBA2_FRAME_SCORER_DECODER!r}; got {decoder!r}"
+        )
 
 
 def build_feature_frame_scorer_model(*, schema: str, model_config: dict[str, Any]):
@@ -152,6 +173,8 @@ class Mamba2FrameScorerBundle:
                 "trained_steps": int(self.metadata.get("trained_steps") or 0),
                 "labels": str(self.metadata.get("labels") or ""),
                 "feature_manifest": str(self.metadata.get("feature_manifest") or ""),
+                "output_heads": list(self.metadata.get("output_heads") or ()),
+                "decoder": str(self.metadata.get("decoder") or ""),
             },
         }
 
@@ -181,12 +204,16 @@ def build_feature_frame_scorer_checkpoint(
         raise ValueError(
             f"Mamba2 boundary scorer checkpoint requires output_dim={MAMBA2_FRAME_SCORER_OUTPUT_DIM}"
         )
+    metadata_dict = dict(metadata or {})
+    metadata_dict.setdefault("output_heads", list(MAMBA2_FRAME_SCORER_OUTPUT_HEADS))
+    metadata_dict.setdefault("decoder", MAMBA2_FRAME_SCORER_DECODER)
+    _validate_metadata(metadata_dict)
     return {
         "schema": schema,
         "model_type": MAMBA2_FRAME_SCORER_MODEL_TYPE,
         "model_config": dict(model_config),
         "normalization": dict(normalization),
-        "metadata": dict(metadata or {}),
+        "metadata": metadata_dict,
         "model_state_dict": model.state_dict(),
     }
 
@@ -225,6 +252,8 @@ def load_feature_frame_scorer_checkpoint(
             raise ValueError(f"scorer checkpoint missing model_config.{key}")
     if int(model_config["input_dim"]) != int(model_config["ptm_dim"]) + int(model_config["mfcc_dim"]):
         raise ValueError("scorer checkpoint input_dim does not match ptm_dim + mfcc_dim")
+    metadata = dict(payload.get("metadata") or {})
+    _validate_metadata(metadata)
     normalization = dict(payload.get("normalization") or {})
     mean = list(normalization.get("feature_mean") or [])
     std = list(normalization.get("feature_std") or [])
@@ -243,7 +272,7 @@ def load_feature_frame_scorer_checkpoint(
         model=model,
         model_config=model_config,
         normalization=normalization,
-        metadata=dict(payload.get("metadata") or {}),
+        metadata=metadata,
         device=str(device),
         schema=schema,
         model_type=model_type,
@@ -255,13 +284,13 @@ def score_feature_frame_boundary_probabilities(
     *,
     ptm: np.ndarray,
     mfcc: np.ndarray,
-) -> tuple[np.ndarray, np.ndarray]:
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     import torch
 
     frame_total = min(int(ptm.shape[0]), int(mfcc.shape[0]))
     if frame_total <= 0:
         empty = np.zeros(0, dtype=np.float32)
-        return empty, empty
+        return empty, empty, empty
     if int(ptm.shape[1]) != bundle.ptm_dim:
         raise ValueError(f"scorer expected ptm_dim={bundle.ptm_dim}, got {int(ptm.shape[1])}")
     if int(mfcc.shape[1]) != bundle.mfcc_dim:
@@ -286,7 +315,10 @@ def score_feature_frame_boundary_probabilities(
         logits = bundle.model(tensor).squeeze(0)
         probabilities = torch.sigmoid(logits).detach().cpu().numpy().astype(np.float32)
     if probabilities.ndim != 2 or probabilities.shape[1] != MAMBA2_FRAME_SCORER_OUTPUT_DIM:
-        raise ValueError("boundary scorer probabilities must have shape [frames, 2]")
+        raise ValueError(
+            f"boundary scorer probabilities must have shape [frames, {MAMBA2_FRAME_SCORER_OUTPUT_DIM}]"
+        )
     speech = np.ascontiguousarray(probabilities[:, 0], dtype=np.float32)
-    cut = np.ascontiguousarray(probabilities[:, 1], dtype=np.float32)
-    return speech, cut
+    split = np.ascontiguousarray(probabilities[:, 1], dtype=np.float32)
+    drop_gap = np.ascontiguousarray(probabilities[:, 2], dtype=np.float32)
+    return speech, split, drop_gap

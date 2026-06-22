@@ -1,14 +1,13 @@
-"""CueQC Mamba v3-Fusion — feature construction from ASR internals.
+"""CueQC Mamba v4 binary feature construction from ASR internals.
 
 Three builders that turn an ASR candidate into the model feature arms:
 
 * ``build_token_trace``  → [L, K_tok]   per-token features from teacher-forced logits
 * ``build_decoder_stats`` → [K_dec]     chunk-level aggregate statistics
-* ``build_structured_features`` → [S]   metadata (timing / density / boundary)
+* ``build_structured_features`` → [S]   metadata (timing / text stats / boundary)
 
 All outputs are ``float32`` and free of NaN/inf. An empty token sequence yields a
-single zero row so the downstream Mamba always has ``L >= 1`` (see v3-Fusion data
-constraints). Feature names are frozen here and echoed into the checkpoint so the
+single zero row so the downstream Mamba always has ``L >= 1``. Feature names are frozen here and echoed into the checkpoint so the
 runtime refiner can rebuild the exact same layout.
 """
 from __future__ import annotations
@@ -62,7 +61,7 @@ DECODER_FEATURE_NAMES: list[str] = [
     "max_token_gap",
 ]
 
-# Structured metadata: timing, density, optional boundary signal. Missing
+# Structured metadata: timing, text statistics, optional boundary signal. Missing
 # optional fields are filled with 0.0 so the vector layout is fixed.
 STRUCTURED_FEATURE_NAMES: list[str] = [
     "start_s",

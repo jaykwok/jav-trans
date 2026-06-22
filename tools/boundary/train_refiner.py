@@ -27,7 +27,7 @@ from boundary.refiner import (
     BOUNDARY_REFINER_OUTPUT_DIM,
     DEFAULT_BOUNDARY_DELTA_MAX_S,
     build_learned_refiner_checkpoint,
-    load_frame_sequence_refiner_checkpoint,
+    load_edge_sequence_refiner_v6_checkpoint,
 )
 from boundary.sequence_features import (
     FRAME_SEQUENCE_FEATURE_SCHEMA,
@@ -52,10 +52,6 @@ class TrainRefinerConfig:
     chunk_size: int = 8
     bidirectional: bool = True
     log_interval_steps: int = 20
-    target_domain_speedup: float = 1.5
-    target_chunk_s: float = 3.0
-    max_core_chunk_s: float = 5.0
-    min_chunk_s: float = 0.4
     boundary_delta_max_s: float = DEFAULT_BOUNDARY_DELTA_MAX_S
     start_delta_loss_weight: float = 1.00
     end_delta_loss_weight: float = 0.60
@@ -267,17 +263,13 @@ def train_refiner(
             "trainer": "tools/boundary/train_refiner.py",
             "dataset_paths": [str(path) for path in dataset_paths],
             "train_schema": loaded.train_schema,
-            "runtime_adapter": "frame_sequence_v1",
-            "timing_policy": {
-                "target_domain_speedup": config.target_domain_speedup,
-                "target_chunk_s": config.target_chunk_s,
-                "max_core_chunk_s": config.max_core_chunk_s,
-                "min_chunk_s": config.min_chunk_s,
+            "runtime_adapter": "edge_sequence_v1",
+            "edge_policy": {
                 "boundary_delta_max_s": config.boundary_delta_max_s,
                 "start_delta_loss_weight": config.start_delta_loss_weight,
                 "end_delta_loss_weight": config.end_delta_loss_weight,
                 "delta_loss": "smooth_l1",
-                "source": "anime_nsfw_sfw_galgame_duration_distribution",
+                "source": "scorer_v4_island_edges",
             },
             "boundary_delta_max_s": config.boundary_delta_max_s,
             "init_checkpoint": init_metadata,
@@ -291,9 +283,9 @@ def train_refiner(
     if not checkpoint_name:
         ptm_repo_id = str(feature_metadata.get("ptm_repo_id") or "").strip()
         checkpoint_name = (
-            f"boundary_refiner.{qwen_asr_repo_tag(ptm_repo_id)}.pt"
+            f"boundary_edge_refiner_v6.{qwen_asr_repo_tag(ptm_repo_id)}.pt"
             if ptm_repo_id
-            else "boundary_refiner.pt"
+            else "boundary_edge_refiner_v6.pt"
         )
     if Path(checkpoint_name).name != checkpoint_name:
         raise ValueError("checkpoint_name must be a file name, not a path")
@@ -301,7 +293,7 @@ def train_refiner(
     torch.save(checkpoint, checkpoint_path)
     metrics["checkpoint"] = str(checkpoint_path)
 
-    refiner = load_frame_sequence_refiner_checkpoint(
+    refiner = load_edge_sequence_refiner_v6_checkpoint(
         checkpoint_path,
         backbone_override=TRANSFORMERS_MAMBA2_BACKBONE,
     )
@@ -407,7 +399,7 @@ def _load_tensor_cache(path: Path, *, dataset_paths: Sequence[Path] | None = Non
     payload = torch.load(path, map_location="cpu", weights_only=False)
     if not isinstance(payload, Mapping):
         raise ValueError(f"tensor cache must be a mapping: {path}")
-    if str(payload.get("schema") or "") != "boundary_refiner_tensor_cache_v5":
+    if str(payload.get("schema") or "") != "boundary_refiner_tensor_cache_v6":
         raise ValueError(f"unsupported tensor cache schema: {payload.get('schema')!r}")
     if dataset_paths is not None:
         cached_sources = payload.get("dataset_sources")
@@ -480,7 +472,7 @@ def _write_tensor_cache(
     path.parent.mkdir(parents=True, exist_ok=True)
     torch.save(
         {
-            "schema": "boundary_refiner_tensor_cache_v5",
+            "schema": "boundary_refiner_tensor_cache_v6",
             "dataset_sources": _dataset_source_fingerprints(dataset_paths),
             "feature_names": list(loaded.feature_names),
             "feature_metadata": loaded.feature_metadata,
@@ -523,8 +515,8 @@ def _load_initial_checkpoint(
     if not isinstance(payload, Mapping):
         raise ValueError("init checkpoint must be a mapping")
     schema = str(payload.get("schema") or "")
-    if schema != "boundary_refiner_v5":
-        raise ValueError(f"init checkpoint schema must be boundary_refiner_v5, got {schema!r}")
+    if schema != "boundary_edge_refiner_v6":
+        raise ValueError(f"init checkpoint schema must be boundary_edge_refiner_v6, got {schema!r}")
     model_config = dict(payload.get("model_config") or {})
     if int(model_config.get("input_dim", -1)) != int(expected_input_dim):
         raise ValueError(
@@ -593,7 +585,7 @@ def _scan_dataset(paths: Sequence[Path], *, log_interval_rows: int = 0) -> Datas
     expected_signature: dict[str, Any] | None = None
 
     for row in _iter_dataset_rows(paths):
-        _validate_v5_delta_row(row, row_index=row_count)
+        _validate_v6_edge_row(row, row_index=row_count)
         if first_row is None:
             first_row = dict(row)
         row_names = _row_feature_names(row, feature_names)
@@ -659,7 +651,7 @@ def _row_feature_names(row: Mapping[str, Any], fallback: tuple[str, ...] | None 
     elif fallback is not None:
         names = fallback
     else:
-        raise ValueError("boundary refiner v5 rows require feature_names")
+        raise ValueError("boundary refiner v6 rows require feature_names")
     if not names:
         raise ValueError("dataset feature_names must not be empty")
     return names
@@ -671,17 +663,17 @@ def _train_schema(rows: Sequence[Mapping[str, Any]]) -> str:
 
 
 def _train_schema_from_values(schemas: set[str]) -> str:
-    if schemas == {"boundary_refiner_frame_sequence_dataset_v5"}:
-        return "boundary_refiner_frame_sequence_dataset_v5"
+    if schemas == {"boundary_edge_refiner_dataset_v6"}:
+        return "boundary_edge_refiner_dataset_v6"
     raise ValueError(f"unsupported boundary refiner dataset schema values: {sorted(schemas)}")
 
 
-def _validate_v5_delta_row(row: Mapping[str, Any], *, row_index: int) -> None:
+def _validate_v6_edge_row(row: Mapping[str, Any], *, row_index: int) -> None:
     schema = str(row.get("schema") or "")
-    if schema != "boundary_refiner_frame_sequence_dataset_v5":
+    if schema != "boundary_edge_refiner_dataset_v6":
         raise ValueError(
             "boundary refiner training only accepts "
-            f"'boundary_refiner_frame_sequence_dataset_v5', got {schema!r} at row {row_index}"
+            f"'boundary_edge_refiner_dataset_v6', got {schema!r} at row {row_index}"
         )
     stale_fields = (
         "sequence_labels",
@@ -699,7 +691,7 @@ def _validate_v5_delta_row(row: Mapping[str, Any], *, row_index: int) -> None:
     present = [field for field in stale_fields if field in row]
     if present:
         raise ValueError(
-            "boundary refiner v5 rows must not contain old merge/split/context fields "
+            "boundary refiner v6 rows must not contain old merge/split/context fields "
             f"at row {row_index}: {present}"
         )
 
@@ -717,7 +709,7 @@ def _feature_metadata_from_scan(
     if len(hash_values) > 1:
         raise ValueError("mixed feature_schema_hash values are not allowed")
     if not ptm_repo_values:
-        raise ValueError("boundary refiner v5 rows require metadata.ptm_repo_id")
+        raise ValueError("boundary refiner v6 rows require metadata.ptm_repo_id")
     if len(ptm_repo_values) > 1:
         raise ValueError(f"mixed ptm_repo_id values are not allowed: {sorted(ptm_repo_values)}")
     ptm_repo_id = next(iter(ptm_repo_values))
@@ -752,7 +744,6 @@ def _hash_from_signature(signature: Mapping[str, Any]) -> str:
         right_context_s=float(feature_config["right_context_s"]),
         max_ptm_dims=int(feature_config["max_ptm_dims"]),
         include_mfcc=bool(feature_config["include_mfcc"]),
-        target_chunk_s=float(feature_config["target_chunk_s"]),
     )
     return feature_extraction_hash(
         config=config,
@@ -771,7 +762,7 @@ def _row_sequence_length(row: Mapping[str, Any], feature_names: tuple[str, ...])
                 expected_feature_names=row.get("feature_names") or feature_names,
             )
         return len(raw_sequence)
-    raise ValueError("boundary refiner v5 rows require sequence_features")
+    raise ValueError("boundary refiner v6 rows require sequence_features")
 
 
 def _row_sequence_array(row: Mapping[str, Any], feature_names: tuple[str, ...]) -> np.ndarray:
@@ -782,7 +773,7 @@ def _row_sequence_array(row: Mapping[str, Any], feature_names: tuple[str, ...]) 
             feature_names=feature_names,
             expected_feature_names=row.get("feature_names") or feature_names,
         ).astype(np.float32, copy=False)
-    raise ValueError("boundary refiner v5 rows require sequence_features")
+    raise ValueError("boundary refiner v6 rows require sequence_features")
 
 
 def _row_sequence(row: Mapping[str, Any], feature_names: tuple[str, ...]) -> list[list[float]]:
@@ -805,7 +796,7 @@ def _row_boundary_delta_target_sequence(row: Mapping[str, Any], *, expected_len:
                 raise ValueError("sequence_boundary_delta_targets must not contain NaN or inf")
             targets.append([start_delta, end_delta])
         return targets
-    raise ValueError("boundary refiner v5 rows require sequence_boundary_delta_targets")
+    raise ValueError("boundary refiner v6 rows require sequence_boundary_delta_targets")
 
 
 def _row_boundary_delta_weight_sequence(row: Mapping[str, Any], *, expected_len: int) -> list[list[float]]:
@@ -1027,16 +1018,8 @@ def _validate_config(config: TrainRefinerConfig) -> None:
         raise ValueError("chunk_size must be positive")
     if config.log_interval_steps < 0:
         raise ValueError("log_interval_steps must be non-negative")
-    if config.target_domain_speedup <= 0.0:
-        raise ValueError("target_domain_speedup must be positive")
-    for name in (
-        "target_chunk_s",
-        "max_core_chunk_s",
-        "min_chunk_s",
-        "boundary_delta_max_s",
-    ):
-        if getattr(config, name) <= 0.0:
-            raise ValueError(f"{name} must be positive")
+    if config.boundary_delta_max_s <= 0.0:
+        raise ValueError("boundary_delta_max_s must be positive")
     if config.start_delta_loss_weight < 0.0:
         raise ValueError("start_delta_loss_weight must be non-negative")
     if config.end_delta_loss_weight < 0.0:
@@ -1045,7 +1028,7 @@ def _validate_config(config: TrainRefinerConfig) -> None:
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Train a transformers.Mamba2Model Boundary Refiner from supervised gap samples."
+        description="Train a transformers.Mamba2Model Boundary Refiner v6 from scorer island edge samples."
     )
     parser.add_argument("--dataset", action="append", required=True, help="Gap dataset JSONL. Repeatable.")
     parser.add_argument("--output-dir", required=True)
@@ -1064,17 +1047,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--chunk-size", type=int, default=8)
     parser.add_argument("--unidirectional", action="store_true")
     parser.add_argument("--log-interval-steps", type=int, default=20)
-    parser.add_argument("--target-domain-speedup", type=float, default=1.5)
-    parser.add_argument("--target-chunk-s", type=float, default=3.0)
-    parser.add_argument("--max-core-chunk-s", type=float, default=5.0)
-    parser.add_argument("--min-chunk-s", type=float, default=0.4)
     parser.add_argument("--boundary-delta-max-s", type=float, default=DEFAULT_BOUNDARY_DELTA_MAX_S)
     parser.add_argument("--start-delta-loss-weight", type=float, default=1.00)
     parser.add_argument("--end-delta-loss-weight", type=float, default=0.60)
     parser.add_argument(
         "--init-checkpoint",
         default="",
-        help="Optional boundary_refiner_v5 checkpoint used to initialize weights.",
+        help="Optional boundary_edge_refiner_v6 checkpoint used to initialize weights.",
     )
     parser.add_argument(
         "--preserve-init-normalization",
@@ -1130,10 +1109,6 @@ def main(argv: list[str] | None = None) -> None:
             chunk_size=args.chunk_size,
             bidirectional=not args.unidirectional,
             log_interval_steps=args.log_interval_steps,
-            target_domain_speedup=args.target_domain_speedup,
-            target_chunk_s=args.target_chunk_s,
-            max_core_chunk_s=args.max_core_chunk_s,
-            min_chunk_s=args.min_chunk_s,
             boundary_delta_max_s=args.boundary_delta_max_s,
             start_delta_loss_weight=args.start_delta_loss_weight,
             end_delta_loss_weight=args.end_delta_loss_weight,

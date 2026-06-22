@@ -9,7 +9,7 @@ def test_web_smoke_summary_prefers_full_cueqc_decisions() -> None:
             {
                 "text": "keep",
                 "cueqc_shadow": {
-                    "mode": "cueqc_mamba_v3_fusion",
+                    "mode": "cueqc_mamba_v4_binary",
                     "display_hint": "keep",
                 },
             }
@@ -20,8 +20,8 @@ def test_web_smoke_summary_prefers_full_cueqc_decisions() -> None:
             "counts": {"display_hint": {"keep": 2, "drop": 1}},
             "fallback_summary": {"count": 1, "stages": {"capture": 1}},
             "decisions": [
-                {"mode": "cueqc_mamba_v3_fusion", "display_hint": "keep"},
-                {"mode": "cueqc_mamba_v3_fusion", "display_hint": "drop"},
+                {"mode": "cueqc_mamba_v4_binary", "display_hint": "keep"},
+                {"mode": "cueqc_mamba_v4_binary", "display_hint": "drop"},
                 {
                     "mode": "fallback_keep",
                     "display_hint": "keep",

@@ -67,7 +67,6 @@ import torch
 
 from asr import pipeline as asr_module
 from asr.manifest import build_asr_manifest
-from subtitles import display_policy as display_policy_module
 from subtitles import writer as subtitle_module
 from llm import translator as translator_module
 
@@ -208,8 +207,7 @@ def _asr_stage_env_for_video(ctx: JobContext, video_fps: float | None) -> dict[s
 
 _SUBTITLE_OPTION_KEYS = {
     "MAX_SUBTITLE_DURATION",
-    "SUBTITLE_SOFT_MAX_S",
-    "SUBTITLE_SOFT_SPLIT_ENABLED",
+
     "MIN_SUBTITLE_DURATION",
     "SUBTITLE_MIN_DURATION",
     "SUBTITLE_READING_CPS",
@@ -223,11 +221,11 @@ _SUBTITLE_OPTION_KEYS = {
     "SUBTITLE_TIMING_POLISH_ENABLED",
     "SUBTITLE_SHORT_GAP_COLLAPSE_S",
     "SUBTITLE_LINGER_S",
-    "SUBTITLE_DISPLAY_POLICY",
-    "SUBTITLE_DISPLAY_POLICY_REPEAT_RUN_MIN",
-    "SUBTITLE_DISPLAY_POLICY_MAX_RUN_GAP_S",
-    "SUBTITLE_DISPLAY_POLICY_SHORT_KANA_MAX_CHARS",
-    "SUBTITLE_DISPLAY_POLICY_STABLE_MIN_CHARS",
+
+
+
+
+
 }
 
 
@@ -248,9 +246,6 @@ def _subtitle_options_for_video(ctx: JobContext, video_fps: float | None):
     return _subtitle_options_for_ctx(ctx).with_video_fps(video_fps)
 
 
-def _subtitle_display_policy_settings_for_ctx(ctx: JobContext) -> dict:
-    with _temporary_env(_subtitle_env_overrides(ctx)):
-        return display_policy_module.settings_from_env()
 
 
 def _asr_runtime_signature_for_env() -> dict:
@@ -284,17 +279,14 @@ def _aligned_cache_signature_for_ctx(
     *,
     backend_label: str,
     subtitle_options=None,
-    display_policy_settings: dict | None = None,
 ) -> dict:
     options = subtitle_options or _subtitle_options_for_ctx(ctx)
-    policy_settings = display_policy_settings or _subtitle_display_policy_settings_for_ctx(ctx)
     asr_signature = _asr_runtime_signature_for_env()
     subtitle_signature = dict(options.signature())
     subtitle_signature["effective_video_fps"] = options.effective_video_fps
     subtitle_signature["frame_gap_s"] = options.frame_gap_s
-    subtitle_signature["display_policy"] = display_policy_module.signature(policy_settings)
     return {
-        "version": 7,
+        "version": 8,
         "backend_label": backend_label,
         "asr": asr_signature,
         "asr_stage_config": _asr_stage_config_signature_for_env(),
@@ -311,12 +303,10 @@ def aligned_cache_expectations_for_ctx(
     with _temporary_env(_asr_stage_env_for_video(ctx, video_fps)):
         resolved_backend_label = backend_label or asr_module.get_backend_label()
         subtitle_options = _subtitle_options_for_video(ctx, video_fps)
-        display_policy_settings = _subtitle_display_policy_settings_for_ctx(ctx)
         signature = _aligned_cache_signature_for_ctx(
             ctx,
             backend_label=resolved_backend_label,
-            subtitle_options=subtitle_options,
-            display_policy_settings=display_policy_settings,
+            subtitle_options=subtitle_options
         )
     return resolved_backend_label, signature
 
@@ -675,7 +665,6 @@ def _prepare_translation_cues(
     *,
     subtitle_options,
     bilingual: bool,
-    display_policy_settings: dict | None = None,
 ) -> tuple[list[dict], dict]:
     source_blocks = _build_japanese_srt_blocks(segments)
     mode = "bilingual" if bilingual else "srt"
@@ -696,26 +685,26 @@ def _prepare_translation_cues(
         if "source_segment_ids" not in item:
             item["source_segment_ids"] = [cue_id]
         normalized.append(item)
-    return display_policy_module.apply_display_policy(
-        normalized,
-        source_segments=segments,
-        settings=display_policy_settings,
-    )
+    return normalized, {
+        "schema": "subtitle_cue_summary_v1",
+        "cues_before": len(cues),
+        "cues_after": len(normalized),
+        "counts": {"keep": len(normalized)},
+    }
 
 
 def _subtitle_cue_plan_summary(
     *,
     segments_before: int,
     mode: str,
-    display_policy_summary: dict,
+    cue_summary: dict,
 ) -> dict:
     return {
         "segments_before": segments_before,
-        "cues_before_display_policy": int(display_policy_summary.get("cues_before", 0)),
-        "cues_after": int(display_policy_summary.get("cues_after", 0)),
+        "cues_before": int(cue_summary.get("cues_before", 0)),
+        "cues_after": int(cue_summary.get("cues_after", 0)),
         "mode": mode,
         "stage": "pre_translation",
-        "display_policy_counts": dict(display_policy_summary.get("counts") or {}),
     }
 
 
@@ -794,7 +783,6 @@ def run_asr_alignment(
             "subtitle_frame_gap_s="
             f"{subtitle_options.frame_gap_s:.6f}",
         )
-        display_policy_settings = _subtitle_display_policy_settings_for_ctx(effective_ctx)
         if cache_job_id != job_id:
             job_temp_dir = _resolve_job_temp_dir(cache_job_id)
         elif effective_ctx.job_temp_dir:
@@ -808,8 +796,7 @@ def run_asr_alignment(
         aligned_cache_signature = _aligned_cache_signature_for_ctx(
             effective_ctx,
             backend_label=backend_label,
-            subtitle_options=subtitle_options,
-            display_policy_settings=display_policy_settings,
+            subtitle_options=subtitle_options
         )
         audio_dir = os.path.join(job_temp_dir, "audio")
         os.makedirs(audio_dir, exist_ok=True)
@@ -1152,7 +1139,6 @@ def _run_translation_and_write_impl(
     bilingual = artifacts.bilingual
     skip_translation = ctx.skip_translation
     subtitle_options = _subtitle_options_for_video(ctx, video_fps)
-    display_policy_settings = _subtitle_display_policy_settings_for_ctx(ctx)
     aligned_cache_signature = artifacts.aligned_cache_signature
     if aligned_cache_signature is None:
         _, aligned_cache_signature = aligned_cache_expectations_for_ctx(
@@ -1320,17 +1306,15 @@ def _run_translation_and_write_impl(
         pipeline_timings["translation_context_s"] = 0.0
         pipeline_timings["translation_s"] = 0.0
         translation_request_timings: list[dict] = []
-        srt_blocks, display_policy_summary = _prepare_translation_cues(
+        srt_blocks, cue_summary = _prepare_translation_cues(
             segments,
             subtitle_options=subtitle_options,
             bilingual=False,
-            display_policy_settings=display_policy_settings,
         )
-        asr_details["subtitle_display_policy"] = display_policy_summary
         asr_details["subtitle_cue_plan"] = _subtitle_cue_plan_summary(
             segments_before=len(segments),
             mode="srt",
-            display_policy_summary=display_policy_summary,
+            cue_summary=cue_summary,
         )
 
         write_started = time.perf_counter()
@@ -1461,26 +1445,23 @@ def _run_translation_and_write_impl(
         return output_paths
 
     # 4. Global context for LLM
-    translation_segments, display_policy_summary = _prepare_translation_cues(
+    translation_segments, cue_summary = _prepare_translation_cues(
         segments,
         subtitle_options=subtitle_options,
         bilingual=bilingual,
-        display_policy_settings=display_policy_settings,
     )
-    asr_details["subtitle_display_policy"] = display_policy_summary
     asr_details["subtitle_cue_plan"] = _subtitle_cue_plan_summary(
         segments_before=len(segments),
         mode="bilingual" if bilingual else "srt",
-        display_policy_summary=display_policy_summary,
+        cue_summary=cue_summary,
     )
     _log_stage(
         logger,
         "subtitle_cue_plan "
         f"segments_before={len(segments)} "
-        f"cues_before_display_policy={display_policy_summary.get('cues_before', 0)} "
+        f"cues_before={cue_summary.get('cues_before', 0)} "
         f"cues_after={len(translation_segments)} "
         f"mode={'bilingual' if bilingual else 'srt'} "
-        f"display_policy_counts={display_policy_summary.get('counts', {})}",
     )
     artifacts.asr_details = asr_details
     _raise_if_cancelled(cancel_event)
@@ -1581,8 +1562,6 @@ def _run_translation_and_write_impl(
             "source_segment_ids": list(seg.get("source_segment_ids") or []),
             "raw_text": seg.get("raw_text", seg.get("ja_text") or seg.get("text", "")),
             "display_decision": seg.get("display_decision", "keep"),
-            "display_policy_reasons": list(seg.get("display_policy_reasons") or []),
-            "display_policy_features": dict(seg.get("display_policy_features") or {}),
             "raw_texts": list(seg.get("raw_texts") or []),
         }
         for seg, zh_text in zip(translation_segments, zh_texts)

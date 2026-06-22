@@ -8,22 +8,16 @@ from boundary.backbones import (
     normalize_boundary_backbone,
 )
 from boundary.base import SegmentationResult, SpeechBoundaryBackend, SpeechSegment
-from boundary.candidates import (
-    BoundaryCandidate,
-    CandidateExtractionConfig,
-    extract_boundary_candidates,
-)
-from boundary.features import BoundaryFeatureBundle, make_feature_bundle, summarize_gap_features
 from boundary.planner import BoundaryPlannerConfig, PlannedChunk, PlannedIsland, plan_boundary_chunks
 from boundary.refiner import (
     BoundaryDecision,
     DEFAULT_REFINER_CHECKPOINT_PATH,
-    FrameSequenceBoundaryRefiner,
+    EdgeSequenceBoundaryRefiner,
     LEARNED_REFINER_SCHEMA,
     LearnedBoundaryRefiner,
     build_learned_refiner_checkpoint,
     load_learned_refiner_checkpoint,
-    load_frame_sequence_refiner_checkpoint,
+    load_edge_sequence_refiner_v6_checkpoint,
 )
 from boundary.sequence_features import (
     FRAME_SEQUENCE_FEATURE_SCHEMA,
@@ -52,17 +46,14 @@ def get_boundary_backend(name: str | None = None) -> SpeechBoundaryBackend:
     )
 
 __all__ = [
-    "BoundaryCandidate",
     "BoundaryDecision",
-    "BoundaryFeatureBundle",
     "BoundaryPlannerConfig",
     "BoundarySequenceClassifier",
     "SegmentationResult",
     "SpeechBoundaryBackend",
     "SpeechSegment",
-    "CandidateExtractionConfig",
     "DEFAULT_REFINER_CHECKPOINT_PATH",
-    "FrameSequenceBoundaryRefiner",
+    "EdgeSequenceBoundaryRefiner",
     "FRAME_SEQUENCE_FEATURE_SCHEMA",
     "FRAME_SEQUENCE_FRAMES_SCHEMA",
     "FrameSequenceFeatureConfig",
@@ -74,7 +65,6 @@ __all__ = [
     "TinyMamba2BoundaryBackbone",
     "build_learned_refiner_checkpoint",
     "boundary_window_sequence_features",
-    "extract_boundary_candidates",
     "feature_extraction_hash",
     "feature_extraction_signature",
     "get_boundary_backend",
@@ -82,10 +72,8 @@ __all__ = [
     "get_feature_dim",
     "frame_sequence_feature_names",
     "load_learned_refiner_checkpoint",
-    "load_frame_sequence_refiner_checkpoint",
-    "make_feature_bundle",
+    "load_edge_sequence_refiner_v6_checkpoint",
     "normalize_boundary_backbone",
     "plan_boundary_chunks",
-    "summarize_gap_features",
     "validate_sequence_features",
 ]

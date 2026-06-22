@@ -3,7 +3,7 @@ from __future__ import annotations
 import hashlib
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Protocol
+from typing import Protocol, Sequence
 
 import torch
 
@@ -18,8 +18,11 @@ from boundary.sequence_features import (
     validate_sequence_features,
 )
 
-LEARNED_REFINER_SCHEMA = "boundary_refiner_v5"
-DEFAULT_REFINER_CHECKPOINT_PATH = Path("src/boundary/checkpoints/boundary_refiner.jaykwok-Qwen3-ASR-0.6B-JA-Anime-Galgame.pt")
+LEARNED_REFINER_SCHEMA = "boundary_edge_refiner_v6"
+EDGE_SEQUENCE_RUNTIME_ADAPTER = "edge_sequence_v1"
+DEFAULT_REFINER_CHECKPOINT_PATH = Path(
+    "src/boundary/checkpoints/boundary_edge_refiner_v6.jaykwok-Qwen3-ASR-1.7B-JA-Anime-Galgame.pt"
+)
 BOUNDARY_REFINER_OUTPUT_DIM = 2
 DEFAULT_BOUNDARY_DELTA_MAX_S = 0.5
 
@@ -38,7 +41,7 @@ class SequenceBoundaryRefiner(Protocol):
 
 
 class LearnedBoundaryRefiner:
-    """Runtime adapter for learned Boundary Refiner checkpoints."""
+    """Runtime adapter for learned edge-only Boundary Refiner checkpoints."""
 
     def __init__(
         self,
@@ -74,7 +77,7 @@ class LearnedBoundaryRefiner:
 
     def signature(self) -> dict:
         return {
-            "type": "learned_boundary_refiner",
+            "type": "learned_boundary_edge_refiner",
             "schema": LEARNED_REFINER_SCHEMA,
             "path": str(self.checkpoint_path),
             "sha1": self._sha1,
@@ -86,29 +89,29 @@ class LearnedBoundaryRefiner:
         }
 
 
-class FrameSequenceBoundaryRefiner:
-    """Learned refiner adapter for precomputed candidate/window feature sequences."""
+class EdgeSequenceBoundaryRefiner:
+    """Learned edge-only refiner for scorer-produced island boundaries."""
 
     def __init__(self, learned: LearnedBoundaryRefiner) -> None:
         runtime_adapter = str(learned.metadata.get("runtime_adapter") or "")
-        if runtime_adapter != "frame_sequence_v1":
+        if runtime_adapter != EDGE_SEQUENCE_RUNTIME_ADAPTER:
             raise ValueError(
-                "frame sequence refiner checkpoint metadata.runtime_adapter must be "
-                "'frame_sequence_v1'"
+                "Boundary Refiner v6 checkpoint metadata.runtime_adapter must be "
+                f"{EDGE_SEQUENCE_RUNTIME_ADAPTER!r}"
             )
         feature_schema = str(learned.metadata.get("feature_schema") or "")
         if feature_schema != FRAME_SEQUENCE_FEATURE_SCHEMA:
             raise ValueError(
-                "frame sequence refiner checkpoint metadata.feature_schema must be "
+                "Boundary Refiner v6 checkpoint metadata.feature_schema must be "
                 f"{FRAME_SEQUENCE_FEATURE_SCHEMA!r}"
             )
         if not str(learned.metadata.get("feature_schema_hash") or ""):
-            raise ValueError("frame sequence refiner checkpoint missing feature_schema_hash")
+            raise ValueError("Boundary Refiner v6 checkpoint missing feature_schema_hash")
         self.learned = learned
 
     def signature(self) -> dict:
         signature = self.learned.signature()
-        signature["runtime_adapter"] = "frame_sequence_v1"
+        signature["runtime_adapter"] = EDGE_SEQUENCE_RUNTIME_ADAPTER
         return signature
 
     @property
@@ -138,7 +141,7 @@ class FrameSequenceBoundaryRefiner:
         elif logits.ndim == 2:
             delta_logits = logits
         else:
-            raise ValueError("frame sequence refiner logits must have shape [batch,time,heads]")
+            raise ValueError("edge sequence refiner logits must have shape [batch,time,heads]")
         decisions: list[BoundaryDecision] = []
         for index in range(delta_logits.shape[0]):
             start_delta_s, end_delta_s = _boundary_delta_from_logits(
@@ -147,7 +150,7 @@ class FrameSequenceBoundaryRefiner:
             )
             decisions.append(
                 BoundaryDecision(
-                    source="frame_sequence_refiner",
+                    source="edge_sequence_refiner_v6",
                     start_refine_delta_s=start_delta_s,
                     end_refine_delta_s=end_delta_s,
                 )
@@ -165,7 +168,7 @@ def load_learned_refiner_checkpoint(
     checkpoint_path = Path(checkpoint_path)
     payload = torch.load(checkpoint_path, map_location="cpu")
     if not isinstance(payload, dict):
-        raise ValueError("Boundary refiner checkpoint must be a dict")
+        raise ValueError("Boundary Refiner checkpoint must be a dict")
     schema = payload.get("schema")
     if schema != LEARNED_REFINER_SCHEMA:
         raise ValueError(
@@ -174,7 +177,7 @@ def load_learned_refiner_checkpoint(
         )
     feature_names = tuple(str(name) for name in payload.get("feature_names") or ())
     if not feature_names:
-        raise ValueError("boundary refiner v5 checkpoint missing feature_names")
+        raise ValueError("Boundary Refiner v6 checkpoint missing feature_names")
     model_config = dict(payload.get("model_config") or {})
     backbone = normalize_boundary_backbone(
         backbone_override
@@ -190,11 +193,11 @@ def load_learned_refiner_checkpoint(
     if int(model_config["input_dim"]) != len(feature_names):
         raise ValueError("checkpoint input_dim does not match feature_names length")
     if int(model_config.get("output_dim", 0)) != BOUNDARY_REFINER_OUTPUT_DIM:
-        raise ValueError("boundary refiner v5 checkpoints must use output_dim=2")
+        raise ValueError("Boundary Refiner v6 checkpoints must use output_dim=2")
     model = BoundarySequenceClassifier(**model_config)
     state_dict = payload.get("state_dict")
     if not isinstance(state_dict, dict):
-        raise ValueError("Boundary refiner checkpoint missing state_dict")
+        raise ValueError("Boundary Refiner checkpoint missing state_dict")
     model.load_state_dict(state_dict)
     metadata = payload.get("metadata")
     metadata_dict = metadata if isinstance(metadata, dict) else {}
@@ -218,14 +221,14 @@ def load_learned_refiner_checkpoint(
     )
 
 
-def load_frame_sequence_refiner_checkpoint(
+def load_edge_sequence_refiner_v6_checkpoint(
     checkpoint_path: str | Path,
     *,
     backbone_override: str | None = None,
     device: str = "auto",
     expected_ptm_repo_id: str | None = None,
-) -> FrameSequenceBoundaryRefiner:
-    return FrameSequenceBoundaryRefiner(
+) -> EdgeSequenceBoundaryRefiner:
+    return EdgeSequenceBoundaryRefiner(
         load_learned_refiner_checkpoint(
             checkpoint_path,
             backbone_override=backbone_override,
@@ -264,8 +267,14 @@ def build_learned_refiner_checkpoint(
     config["backbone"] = model.backbone_name
     config["output_dim"] = getattr(model, "output_dim", BOUNDARY_REFINER_OUTPUT_DIM)
     if int(config["output_dim"]) != BOUNDARY_REFINER_OUTPUT_DIM:
-        raise ValueError("boundary refiner v5 checkpoints require output_dim=2")
+        raise ValueError("Boundary Refiner v6 checkpoints require output_dim=2")
     metadata_dict = dict(metadata or {})
+    metadata_dict.setdefault("runtime_adapter", EDGE_SEQUENCE_RUNTIME_ADAPTER)
+    if metadata_dict.get("runtime_adapter") != EDGE_SEQUENCE_RUNTIME_ADAPTER:
+        raise ValueError(
+            "Boundary Refiner v6 metadata.runtime_adapter must be "
+            f"{EDGE_SEQUENCE_RUNTIME_ADAPTER!r}"
+        )
     payload = {
         "schema": LEARNED_REFINER_SCHEMA,
         "backbone": model.backbone_name,

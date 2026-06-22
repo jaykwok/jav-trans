@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Compile CueQC v3-Fusion Stage 2a training features.
+"""Compile CueQC v4 binary Stage 2a training features.
 
 Stage 2a deliberately does not trust unaudited high-confidence drop pseudo
 labels. It combines:
@@ -28,9 +28,9 @@ SRC_ROOT = PROJECT_ROOT / "src"
 if str(SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(SRC_ROOT))
 
-FEATURE_SCHEMA = "cueqc_mamba_v3_fusion_features"
+FEATURE_SCHEMA = "cueqc_mamba_v4_binary_features"
 FALSE_DROP_AUDIT_SCHEMA = "cueqc_false_drop_audit_label_v1"
-PSEUDO_LABEL_SCHEMA = "cueqc_pseudo_label_v3_fusion_v1"
+PSEUDO_LABEL_SCHEMA = "cueqc_pseudo_label_v4_binary_v1"
 
 
 @dataclass(frozen=True)
@@ -127,7 +127,7 @@ def _pseudo_keep_label(row: dict[str, Any], *, min_keep_confidence: float) -> La
     return LabelSource(
         label=1,
         display_decision="keep",
-        label_source="cueqc_v3_high_conf_keep_pseudo",
+        label_source="cueqc_v4_high_conf_keep_pseudo",
         priority=50,
         source_row=row,
     )
@@ -291,7 +291,7 @@ def compile_stage2a(
     feature_config = dict(cold_config)
     feature_config.update(
         {
-            "source_mode": "cueqc_v3_stage2a_self_training",
+            "source_mode": "cueqc_v4_stage2a_self_training",
             "cold_start_features": str(cold_start_features),
             "full_features": str(full_features),
             "pseudo_labels": str(pseudo_labels),
@@ -347,10 +347,10 @@ def compile_stage2a(
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Compile CueQC v3-Fusion Stage 2a training feature bundle.")
+    parser = argparse.ArgumentParser(description="Compile CueQC v4 binary Stage 2a training feature bundle.")
     parser.add_argument("--cold-start-features", required=True, help="Original labeled cold-start .pt feature bundle.")
     parser.add_argument("--full-features", required=True, help="Full 10-film unlabeled .pt feature bundle.")
-    parser.add_argument("--pseudo-labels", required=True, help="cueqc_pseudo_labels.high_conf.jsonl from predict_v3_fusion.py.")
+    parser.add_argument("--pseudo-labels", required=True, help="cueqc_pseudo_labels.high_conf.jsonl from predict_v4_binary.py.")
     parser.add_argument(
         "--false-drop-audit-labels",
         action="append",

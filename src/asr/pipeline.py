@@ -8,7 +8,6 @@ from typing import Callable
 
 from audio.chunk_packer import PackedChunk, pack_speech_segments
 from boundary import cache as _boundary_cache_module
-from boundary.candidates import CANDIDATE_EXTRACTOR_VERSION
 from boundary.sequence_features import (
     FRAME_SEQUENCE_FRAMES_SCHEMA,
     FrameSequenceFeatureConfig,
@@ -16,7 +15,7 @@ from boundary.sequence_features import (
 )
 from boundary.refiner import (
     file_sha1 as _boundary_refiner_file_sha1,
-    load_frame_sequence_refiner_checkpoint,
+    load_edge_sequence_refiner_v6_checkpoint,
 )
 from asr import checkpoint as _checkpoint_module
 from asr import chunking as _chunking_module
@@ -54,15 +53,15 @@ _ASR_CHECKPOINT_ENABLED = _transcribe_module._ASR_CHECKPOINT_ENABLED
 CUEQC_DECISION_VERSION = _cueqc_module.CUEQC_DECISION_VERSION
 CUEQC_MODEL_VERSION = _cueqc_module.CUEQC_MODEL_VERSION
 
-# CueQC Mamba v3-Fusion model is lazily loaded and cached per process.
+# CueQC Mamba v4 binary model is lazily loaded and cached per process.
 # ASR-internals capture is delegated to the backend (inline or subprocess
 # worker) via capture_asr_internals(), so the model is reused wherever it is
-# loaded — no second Qwen3-ASR in VRAM (v3-Fusion §5.2).
+# loaded — no second Qwen3-ASR in VRAM (v4 binary §5.2).
 _CUEQC_REFINER_CACHE: dict[str, object] = {}
 
 
 def _cueqc_refiner_for(path: str, *, expected_asr_repo_id: str | None = None):
-    """Lazily load + cache the CueQC v3-Fusion refiner for ``path``."""
+    """Lazily load + cache the CueQC v4 binary refiner for ``path``."""
     if not path:
         return None
     cached = _CUEQC_REFINER_CACHE.get(path)
@@ -80,7 +79,7 @@ def _cueqc_refiner_for(path: str, *, expected_asr_repo_id: str | None = None):
         _CUEQC_REFINER_CACHE[path] = refiner
         return refiner
     except Exception as exc:  # noqa: BLE001 - surface checkpoint/config errors clearly
-        raise RuntimeError(f"CueQC v3-Fusion checkpoint load failed for {path}: {exc!r}") from exc
+        raise RuntimeError(f"CueQC v4 binary checkpoint load failed for {path}: {exc!r}") from exc
 
 def _env_bool(name: str, default: str) -> bool:
     return os.getenv(name, default).strip().lower() in {"1", "true", "yes", "on"}
@@ -113,16 +112,6 @@ def _boundary_config() -> dict:
         "boundary_refiner_runtime_adapter": runtime_adapter,
         "boundary_refiner_device": os.getenv("BOUNDARY_REFINER_DEVICE", "auto").strip()
         or "auto",
-        "boundary_candidate_extractor_version": CANDIDATE_EXTRACTOR_VERSION,
-        "boundary_planner_max_core_chunk_s": _env_float(
-            "BOUNDARY_PLANNER_MAX_CORE_CHUNK_S",
-            "5.0",
-        ),
-        "boundary_planner_target_chunk_s": _env_float("BOUNDARY_PLANNER_TARGET_CHUNK_S", "3.0"),
-        "boundary_planner_min_chunk_s": _env_float("BOUNDARY_PLANNER_MIN_CHUNK_S", "0.4"),
-        "boundary_planner_max_splits_per_segment": _env_int(
-            "BOUNDARY_PLANNER_MAX_SPLITS_PER_SEGMENT", "16"
-        ),
         "boundary_planner_sequence_batch_size": _env_int(
             "BOUNDARY_PLANNER_SEQUENCE_BATCH_SIZE", "256"
         ),
@@ -148,16 +137,15 @@ def _boundary_refiner_runtime_adapter(path: Path | None) -> str:
             metadata_key="metadata.ptm_repo_id",
         )
         adapter = str(metadata.get("runtime_adapter") or "").strip()
-        if adapter == "frame_sequence_v1":
+        if adapter == "edge_sequence_v1":
             return adapter
-    raise ValueError("Boundary Refiner checkpoint must use metadata.runtime_adapter='frame_sequence_v1'")
+    raise ValueError("Boundary Refiner checkpoint must use metadata.runtime_adapter='edge_sequence_v1'")
 
 
 def _sequence_feature_provider_from_result(
     payload,
     *,
     duration_s: float,
-    target_chunk_s: float,
 ) -> FrameSequenceFeatureProvider | None:
     if not isinstance(payload, dict):
         return None
@@ -184,7 +172,6 @@ def _sequence_feature_provider_from_result(
             right_context_s=_env_float("BOUNDARY_FRAME_SEQUENCE_RIGHT_CONTEXT_S", "0.60"),
             max_ptm_dims=_env_int("BOUNDARY_FRAME_SEQUENCE_MAX_PTM_DIMS", "64"),
             include_mfcc=_env_bool("BOUNDARY_FRAME_SEQUENCE_INCLUDE_MFCC", "1"),
-            target_chunk_s=target_chunk_s,
         ),
     )
 
@@ -193,16 +180,14 @@ def _required_sequence_feature_provider_from_result(
     payload,
     *,
     duration_s: float,
-    target_chunk_s: float,
 ) -> FrameSequenceFeatureProvider:
     provider = _sequence_feature_provider_from_result(
         payload,
         duration_s=duration_s,
-        target_chunk_s=target_chunk_s,
     )
     if provider is None:
         raise ValueError(
-            "frame_sequence_v1 Boundary Refiner requires "
+            "edge_sequence_v1 Boundary Refiner requires "
             f"{FRAME_SEQUENCE_FRAMES_SCHEMA} in SpeechBoundary-JA output"
         )
     return provider
@@ -376,7 +361,7 @@ def _build_processing_spans(
     cfg = _boundary_config()
     _set_last_boundary_cache_event(None)
 
-    needs_sequence_features = cfg["boundary_refiner_runtime_adapter"] == "frame_sequence_v1"
+    needs_sequence_features = cfg["boundary_refiner_runtime_adapter"] == "edge_sequence_v1"
     restore_sequence_export = (
         os.environ.get("SPEECH_BOUNDARY_JA_EXPORT_SEQUENCE_FEATURES")
         if needs_sequence_features
@@ -412,10 +397,11 @@ def _build_processing_spans(
         elif needs_sequence_features:
             os.environ.pop("SPEECH_BOUNDARY_JA_EXPORT_SEQUENCE_FEATURES", None)
     frame_scores = result.parameters.get("frame_scores")
-    cut_frame_scores = result.parameters.get("cut_frame_scores")
+    split_boundary_frame_scores = result.parameters.get("split_boundary_frame_scores")
+    drop_gap_frame_scores = result.parameters.get("drop_gap_frame_scores")
     score_frame_hop_s = result.parameters.get("frame_hop_s")
     sequence_feature_frames = result.parameters.get("sequence_feature_frames")
-    sequence_boundary_refiner = load_frame_sequence_refiner_checkpoint(
+    sequence_boundary_refiner = load_edge_sequence_refiner_v6_checkpoint(
         Path(cfg["boundary_refiner_model_path"]),
         device=cfg["boundary_refiner_device"],
         expected_ptm_repo_id=ASR_BACKEND,
@@ -423,7 +409,6 @@ def _build_processing_spans(
     sequence_feature_provider = _required_sequence_feature_provider_from_result(
         sequence_feature_frames,
         duration_s=result.audio_duration_sec,
-        target_chunk_s=cfg["boundary_planner_target_chunk_s"],
     )
     sequence_feature_provider.validate_for_checkpoint(
         sequence_boundary_refiner.feature_names,
@@ -432,18 +417,19 @@ def _build_processing_spans(
     result_parameters = {
         key: value
         for key, value in result.parameters.items()
-        if key not in {"frame_scores", "cut_frame_scores", "sequence_feature_frames"}
+        if key not in {"frame_scores", "split_boundary_frame_scores", "drop_gap_frame_scores", "sequence_feature_frames"}
     }
     runtime_boundary_signature = {
         **result_parameters,
         "boundary_pipeline": {
-            "version": 5,
-            "refiner_schema": "boundary_refiner_v5",
+            "version": 6,
+            "refiner_schema": "boundary_edge_refiner_v6",
             "feature_frame_hop_s": cfg["feature_frame_hop_s"],
             "score_frame_hop_s": score_frame_hop_s,
             "feature_sources": {
                 "speech_scores": frame_scores is not None,
-                "cut_scores": cut_frame_scores is not None,
+                "split_boundary_scores": split_boundary_frame_scores is not None,
+                "drop_gap_scores": drop_gap_frame_scores is not None,
             },
             "sequence_boundary_refiner": (
                 sequence_boundary_refiner.signature()
@@ -456,13 +442,7 @@ def _build_processing_spans(
                 else None
             ),
             "boundary_planner": {
-                "candidate_extractor_version": cfg[
-                    "boundary_candidate_extractor_version"
-                ],
-                "max_core_chunk_s": cfg["boundary_planner_max_core_chunk_s"],
-                "target_chunk_s": cfg["boundary_planner_target_chunk_s"],
-                "min_chunk_s": cfg["boundary_planner_min_chunk_s"],
-                "max_splits_per_segment": cfg["boundary_planner_max_splits_per_segment"],
+                "planner": "edge_sequence_island_planner_v6",
                 "sequence_batch_size": cfg["boundary_planner_sequence_batch_size"],
             },
         },
@@ -490,15 +470,8 @@ def _build_processing_spans(
     packed = pack_speech_segments(
         segments,
         frame_hop_s=cfg["feature_frame_hop_s"],
-        max_core_chunk_s=cfg["boundary_planner_max_core_chunk_s"],
-        target_chunk_s=cfg["boundary_planner_target_chunk_s"],
-        min_chunk_s=cfg["boundary_planner_min_chunk_s"],
-        frame_scores=frame_scores,
-        score_frame_hop_s=score_frame_hop_s,
-        cut_frame_scores=cut_frame_scores,
         sequence_boundary_refiner=sequence_boundary_refiner,
         sequence_feature_provider=sequence_feature_provider,
-        max_splits_per_segment=cfg["boundary_planner_max_splits_per_segment"],
         sequence_batch_size=cfg["boundary_planner_sequence_batch_size"],
     )
     event = _boundary_cache_module.save_processing_spans(
@@ -689,7 +662,7 @@ def _apply_cueqc_drop_filter(
 ) -> tuple[list[dict], list[dict], str]:
     """Remove high-confidence model-drop chunks from the parallel arrays.
 
-    Only decisions with ``mode == "cueqc_mamba_v3_fusion"`` and
+    Only decisions with ``mode == "cueqc_mamba_v4_binary"`` and
     ``display_hint == "drop"`` are removed; fallback / keep decisions are never
     dropped. All parallel lists (chunk_infos, text_results) are kept
     index-aligned by filtering on the same kept positions.
@@ -698,7 +671,7 @@ def _apply_cueqc_drop_filter(
     for chunk_index, dec in cueqc_shadow_by_chunk.items():
         if (
             dec.get("display_hint") == "drop"
-            and dec.get("mode") == "cueqc_mamba_v3_fusion"
+            and dec.get("mode") == "cueqc_mamba_v4_binary"
         ):
             drop_indices.add(int(chunk_index))
     if not drop_indices:
@@ -718,7 +691,7 @@ def _apply_cueqc_drop_filter(
             continue
         kept_chunks.append(chunk)
         kept_texts.append(text_result)
-    log_msg = f"CueQC v3-Fusion: dropped {removed} candidate(s) before subtitle timing"
+    log_msg = f"CueQC v4 binary: dropped {removed} candidate(s) before subtitle timing"
     return kept_chunks, kept_texts, log_msg
 
 
@@ -731,7 +704,7 @@ def _candidate_capture_window(
     Candidate ``audio.path`` normally points at the extracted chunk wav. In that
     case the ASR-internals capture must use the chunk-local window
     ``0..duration``. Passing the global movie timestamp into a chunk wav slices
-    past EOF and forces every v3 sample into fallback-keep.
+    past EOF and forces every v4 sample into fallback-keep.
     """
     audio = candidate.get("audio") if isinstance(candidate.get("audio"), dict) else {}
     own = audio.get("path") or candidate.get("source_audio_path") or ""
@@ -758,7 +731,7 @@ def _top_counts(items: list[str], *, limit: int = 3) -> dict[str, int]:
 def _cueqc_fallback_summary(decisions: list[dict]) -> dict:
     fallback = [
         item for item in decisions
-        if item.get("mode") != "cueqc_mamba_v3_fusion"
+        if item.get("mode") != "cueqc_mamba_v4_binary"
     ]
     return {
         "count": len(fallback),
@@ -773,7 +746,7 @@ def _cueqc_fallback_summary(decisions: list[dict]) -> dict:
     }
 
 
-def _apply_cueqc_v3_model(
+def _apply_cueqc_v4_model(
     *,
     refiner,
     candidates: list[dict],
@@ -781,7 +754,7 @@ def _apply_cueqc_v3_model(
     audio_path: str,
     log: list[str],
 ) -> list[dict] | None:
-    """Run the v3-Fusion refiner over candidates, reusing the shared ASR model.
+    """Run the v4 binary refiner over candidates, reusing the shared ASR model.
 
     Captures ASR internals via ``backend.capture_asr_internals()`` which works in
     both inline and subprocess worker modes (the capture runs where the model is
@@ -792,7 +765,7 @@ def _apply_cueqc_v3_model(
     if not candidates:
         return []
     if backend is None or not hasattr(backend, "capture_asr_internals"):
-        log.append("CueQC v3-Fusion: backend has no capture_asr_internals; cannot continue")
+        log.append("CueQC v4 binary: backend has no capture_asr_internals; cannot continue")
         return None
     capture_chunks = []
     for cand in candidates:
@@ -806,10 +779,10 @@ def _apply_cueqc_v3_model(
     try:
         asr_internals = backend.capture_asr_internals(capture_chunks)
     except Exception as exc:  # noqa: BLE001
-        log.append(f"CueQC v3-Fusion: capture failed ({exc!r}); cannot continue")
+        log.append(f"CueQC v4 binary: capture failed ({exc!r}); cannot continue")
         return None
     if not isinstance(asr_internals, list) or len(asr_internals) != len(candidates):
-        log.append("CueQC v3-Fusion: capture count mismatch; cannot continue")
+        log.append("CueQC v4 binary: capture count mismatch; cannot continue")
         return None
     capture_failed = [
         str(item.get("error") or item.get("detail") or "")
@@ -818,7 +791,7 @@ def _apply_cueqc_v3_model(
     ]
     if capture_failed:
         log.append(
-            "CueQC v3-Fusion: capture fallback candidates={failed}/{total} top_errors={errors}".format(
+            "CueQC v4 binary: capture fallback candidates={failed}/{total} top_errors={errors}".format(
                 failed=len(capture_failed),
                 total=len(candidates),
                 errors=_top_counts(capture_failed),
@@ -831,7 +804,7 @@ def _apply_cueqc_v3_model(
     drops = sum(1 for d in decisions if d.get("display_hint") == "drop")
     fallback_summary = _cueqc_fallback_summary(decisions)
     log.append(
-        "CueQC v3-Fusion: model decisions={decisions} drops={drops} fallback={fallback} "
+        "CueQC v4 binary: model decisions={decisions} drops={drops} fallback={fallback} "
         "fallback_stages={stages} fallback_reasons={reasons} fallback_details={details}".format(
             decisions=len(decisions),
             drops=drops,
@@ -844,12 +817,12 @@ def _apply_cueqc_v3_model(
     return decisions
 
 
-def _merge_cueqc_v3_decisions(
+def _merge_cueqc_v4_decisions(
     report: dict,
     candidates: list[dict],
     model_decisions: list[dict],
 ) -> dict:
-    """Replace report decisions with v3 model decisions, keyed by chunk_index."""
+    """Replace report decisions with v4 model decisions, keyed by chunk_index."""
     decisions = []
     for cand, dec in zip(candidates, model_decisions):
         item = dict(dec)
@@ -868,7 +841,7 @@ def _merge_cueqc_v3_decisions(
     existing_counts["fallback_stage"] = fallback_summary["stages"]
     existing_counts["fallback_reason"] = fallback_summary["reasons"]
     report["counts"] = existing_counts
-    report["decision_source"] = "cueqc_mamba_v3_fusion"
+    report["decision_source"] = "cueqc_mamba_v4_binary"
     report["fallback_summary"] = fallback_summary
     return report
 
@@ -901,7 +874,7 @@ def _run_cueqc_shadow(
             report["candidates"] = candidates
         _write_cueqc_candidates_if_requested(candidates, log=log)
 
-        # v3-Fusion is required when CueQC is enabled; checkpoint mapping/load
+        # v4 binary is required when CueQC is enabled; checkpoint mapping/load
         # failures should stop the job instead of falling back to old rules.
         model_path = checkpoint_path_for_repo_env(
             repo_id=ASR_BACKEND,
@@ -910,7 +883,7 @@ def _run_cueqc_shadow(
         )
         refiner = _cueqc_refiner_for(model_path, expected_asr_repo_id=ASR_BACKEND) if model_path else None
         if refiner is not None:
-            model_decisions = _apply_cueqc_v3_model(
+            model_decisions = _apply_cueqc_v4_model(
                 refiner=refiner,
                 candidates=candidates,
                 backend=backend,
@@ -918,8 +891,8 @@ def _run_cueqc_shadow(
                 log=log,
             )
             if model_decisions is None:
-                raise RuntimeError("CueQC v3-Fusion produced no model decisions")
-            report = _merge_cueqc_v3_decisions(report, candidates, model_decisions)
+                raise RuntimeError("CueQC v4 binary produced no model decisions")
+            report = _merge_cueqc_v4_decisions(report, candidates, model_decisions)
 
         decision_by_chunk = {
             int(item["chunk_index"]): {
@@ -939,7 +912,6 @@ def _run_cueqc_shadow(
                     "display_prob_keep",
                     "display_prob_drop",
                     "drop_threshold",
-                    "threshold_profile",
                     "fallback_stage",
                     "fallback_detail",
                 }
@@ -955,7 +927,7 @@ def _run_cueqc_shadow(
         )
         return report, decision_by_chunk
     except Exception as exc:
-        message = f"CueQC v3-Fusion failed; job cannot continue ({exc!r})"
+        message = f"CueQC v4 binary failed; job cannot continue ({exc!r})"
         log.append(message)
         raise RuntimeError(message) from exc
 
@@ -1162,9 +1134,9 @@ def _transcribe_and_align_local(
                 elapsed_s=time.perf_counter() - total_started,
             )
 
-            # v3-Fusion drop filter: remove model-confirmed drop candidates from
+            # v4 binary drop filter: remove model-confirmed drop candidates from
             # the parallel arrays before subtitle timing. Only high-confidence
-            # model drops (mode=cueqc_mamba_v3_fusion) are removed; fallback
+            # model drops (mode=cueqc_mamba_v4_binary) are removed; fallback
             # decisions never drop. Indices are aligned across all three lists.
             if _env_bool("CUEQC_DROP_APPLY_ENABLED", "1"):
                 chunk_infos, text_results, _drop_log = _apply_cueqc_drop_filter(
@@ -1176,7 +1148,7 @@ def _transcribe_and_align_local(
                     log.append(_drop_log)
                     timings["cueqc_drop_count"] = int(
                         sum(1 for v in cueqc_shadow_by_chunk.values()
-                            if v.get("display_hint") == "drop" and v.get("mode") == "cueqc_mamba_v3_fusion")
+                            if v.get("display_hint") == "drop" and v.get("mode") == "cueqc_mamba_v4_binary")
                     )
 
             prepared_results, align_timings = _align_TRANSCRIPTION_results(

@@ -26,11 +26,11 @@ def _cueqc_from_chunks(chunks: list[dict[str, Any]]) -> dict[str, Any]:
         mode = str(decision.get("mode") or "")
         _counter_add(modes, mode)
         _counter_add(display, decision.get("display_hint"))
-        if mode == "cueqc_mamba_v3_fusion":
+        if mode == "cueqc_mamba_v4_binary":
             model_count += 1
-        if mode == "cueqc_mamba_v3_fusion" and decision.get("display_hint") == "drop":
+        if mode == "cueqc_mamba_v4_binary" and decision.get("display_hint") == "drop":
             drop_count += 1
-        if mode != "cueqc_mamba_v3_fusion":
+        if mode != "cueqc_mamba_v4_binary":
             _counter_add(fallback_stage, decision.get("fallback_stage"))
             reasons = decision.get("reasons") if isinstance(decision.get("reasons"), list) else []
             _counter_add(fallback_reason, reasons[0] if reasons else "")
@@ -70,7 +70,7 @@ def _cueqc_from_decisions(
         mode = str(decision.get("mode") or "")
         _counter_add(modes, mode)
         _counter_add(display, decision.get("display_hint"))
-        if mode == "cueqc_mamba_v3_fusion":
+        if mode == "cueqc_mamba_v4_binary":
             model_count += 1
         else:
             fallback_count += 1

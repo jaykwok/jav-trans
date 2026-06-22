@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Train CueQC Mamba v3-Fusion — display (keep/drop) classifier.
+"""Train CueQC Mamba v4 binary — display (keep/drop) classifier.
 
-Consumes the ASR-internals feature bundle from ``extract_features_v3_fusion.py``
-and trains a ``CueQCMambaV3Fusion`` (ASR Mamba2 + token Mamba2 + decoder/structured
+Consumes the ASR-internals feature bundle from ``extract_features_v4_binary.py``
+and trains a ``CueQCMambaV4Binary`` (ASR Mamba2 + token Mamba2 + decoder/structured
 fusion). Binary CrossEntropy with keep up-weighted.
 
 Data split is a **fixed test movie** (``--test-audio-id``): all samples from one
@@ -11,8 +11,8 @@ is computed on the **train split only** so test leakage cannot happen. A small
 inner validation split (random) is used for early monitoring; the headline
 metrics are evaluated on the fixed test movie.
 
-Label convention (v3): ``drop = 0``, ``keep = 1``. ``logits[:, 0]`` = drop.
-Checkpoint schema: ``cueqc_mamba_checkpoint_v3_fusion``.
+Label convention (v4): ``drop = 0``, ``keep = 1``. ``logits[:, 0]`` = drop.
+Checkpoint schema: ``cueqc_mamba_v4_binary``.
 """
 from __future__ import annotations
 
@@ -33,11 +33,11 @@ SRC_ROOT = PROJECT_ROOT / "src"
 if str(SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(SRC_ROOT))
 
-from asr.cueqc_model import CueQCMambaV3Fusion  # noqa: E402
+from asr.cueqc_model import CueQCMambaV4Binary  # noqa: E402
 from asr.backends.qwen import qwen_asr_repo_tag  # noqa: E402
 
-CHECKPOINT_SCHEMA = "cueqc_mamba_checkpoint_v3_fusion"
-METRICS_SCHEMA = "cueqc_mamba_train_metrics_v3_fusion"
+CHECKPOINT_SCHEMA = "cueqc_mamba_v4_binary"
+METRICS_SCHEMA = "cueqc_mamba_train_metrics_v4_binary"
 DECISION_VERSION = "cueqc_display_binary_v1"
 
 
@@ -125,7 +125,7 @@ def _compute_stats(arrays: list[np.ndarray]) -> tuple[np.ndarray, np.ndarray]:
 
 @torch.no_grad()
 def evaluate(
-    model: CueQCMambaV3Fusion,
+    model: CueQCMambaV4Binary,
     samples: list[dict[str, Any]],
     *,
     asr_mean: np.ndarray,
@@ -202,7 +202,7 @@ def _checkpoint_name(feature_config: dict[str, Any], explicit: str = "") -> str:
     if explicit.strip():
         return explicit.strip()
     asr_model_id = str(feature_config.get("asr_model_id") or "").strip()
-    return f"cueqc_mamba_v3_fusion.{qwen_asr_repo_tag(asr_model_id)}.pt"
+    return f"cueqc_mamba_v4_binary.{qwen_asr_repo_tag(asr_model_id)}.pt"
 
 
 def train(
@@ -213,7 +213,7 @@ def train(
     checkpoint_name: str = "",
 ) -> dict[str, Any]:
     bundle = torch.load(features_path, map_location="cpu", weights_only=False)
-    if bundle.get("schema") != "cueqc_mamba_v3_fusion_features":
+    if bundle.get("schema") != "cueqc_mamba_v4_binary_features":
         raise ValueError(f"unexpected feature schema: {bundle.get('schema')!r}")
     fcfg = bundle["feature_config"]
     asr_model_id = str(fcfg.get("asr_model_id") or "").strip()
@@ -226,7 +226,7 @@ def train(
     if n == 0:
         raise RuntimeError("no samples in feature bundle")
     if any(int(label) not in {0, 1} for label in labels):
-        raise RuntimeError("feature bundle contains unlabeled samples; run predict_v3_fusion.py instead")
+        raise RuntimeError("feature bundle contains unlabeled samples; run predict_v4_binary.py instead")
     # Stamp labels onto samples for evaluation convenience.
     for s, lb, m in zip(samples, labels, meta):
         s["__label__"] = lb
@@ -275,7 +275,7 @@ def train(
     norm_train = [(normalize_sample(samples[i]), samples[i]["__label__"]) for i in train_only_idx]
 
     device = _resolve_device(config.device)
-    model = CueQCMambaV3Fusion(
+    model = CueQCMambaV4Binary(
         asr_dim=fcfg["asr_dim"],
         token_dim=fcfg["token_dim"],
         decoder_dim=fcfg["decoder_dim"],
@@ -369,7 +369,7 @@ def train(
     checkpoint_path = output_dir / checkpoint_file_name
     checkpoint = {
         "schema": CHECKPOINT_SCHEMA,
-        "version": 3,
+        "version": 4,
         "decision_version": DECISION_VERSION,
         "model_config": dict(model.model_config),
         "feature_config": {
@@ -451,8 +451,8 @@ def train(
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="Train CueQC Mamba v3-Fusion.")
-    p.add_argument("--features", required=True, help="cueqc_train_features_v3_fusion.pt")
+    p = argparse.ArgumentParser(description="Train CueQC Mamba v4 binary.")
+    p.add_argument("--features", required=True, help="cueqc_train_features_v4_binary.pt")
     p.add_argument("--output-dir", required=True)
     p.add_argument(
         "--checkpoint-name",

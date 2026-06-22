@@ -3,7 +3,6 @@ from __future__ import annotations
 import os
 import time
 from dataclasses import dataclass
-from pathlib import Path
 from typing import Iterable
 
 import numpy as np
@@ -30,12 +29,11 @@ from boundary.ja.model import (
     load_feature_frame_scorer_checkpoint,
     score_feature_frame_boundary_probabilities,
 )
-from boundary.ja.postprocess import group_segments
 
 
 DEFAULT_PTM = "jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame"
 DEFAULT_MODEL_PATH = qwen_asr_default_model_path(DEFAULT_PTM)
-DEFAULT_OPERATING_POINT = "qwen-feature-energy-bootstrap-v1"
+DEFAULT_OPERATING_POINT = "qwen-mamba2-frame-boundary-scorer-v4"
 
 
 def _env_float(name: str, default: str) -> float:
@@ -65,7 +63,7 @@ def _scorer_checkpoint_from_env(ptm: str) -> str:
         raise RuntimeError(
             "SPEECH_BOUNDARY_JA_SCORER_CHECKPOINT is no longer supported. "
             "Use SPEECH_BOUNDARY_JA_SCORER_CHECKPOINT_BY_REPO="
-            f"{ptm}=path/to/speech_boundary_ja_feature_scorer.pt"
+            f"{ptm}=path/to/speech_boundary_ja_frame_boundary_scorer_v4.pt"
         )
     raw_mapping = os.getenv("SPEECH_BOUNDARY_JA_SCORER_CHECKPOINT_BY_REPO", "").strip()
     return checkpoint_path_for_repo_env(
@@ -151,22 +149,193 @@ def _hysteresis_frames(
     return frames
 
 
-def _apply_cut_gate(
-    speech_probs: np.ndarray,
-    cut_probs: np.ndarray | None,
+def _smooth_scores(values: np.ndarray, *, window_frames: int) -> np.ndarray:
+    data = np.asarray(values, dtype=np.float32).reshape(-1)
+    window = max(1, int(window_frames))
+    if data.size == 0 or window <= 1:
+        return data.astype(np.float32, copy=True)
+    if window % 2 == 0:
+        window += 1
+    radius = window // 2
+    padded = np.pad(data, (radius, radius), mode="edge")
+    kernel = np.ones(window, dtype=np.float32) / float(window)
+    return np.convolve(padded, kernel, mode="valid").astype(np.float32)
+
+
+def _apply_drop_gap_mask(
+    speech_frames: np.ndarray,
+    drop_gap_probs: np.ndarray,
     *,
-    cut_threshold: float,
-    apply_cut: bool,
+    drop_gap_threshold: float,
 ) -> np.ndarray:
-    if not apply_cut or cut_probs is None:
-        return speech_probs
-    frame_total = min(int(speech_probs.size), int(cut_probs.size))
-    if frame_total <= 0:
-        return speech_probs
-    gated = speech_probs.copy()
-    active = gated[:frame_total]
-    active[cut_probs[:frame_total] >= cut_threshold] = 0.0
-    return gated
+    frames = np.asarray(speech_frames, dtype=np.int8).copy()
+    if frames.size == 0 or drop_gap_probs.size == 0:
+        return frames
+    total = min(int(frames.size), int(drop_gap_probs.size))
+    active = frames[:total]
+    active[np.asarray(drop_gap_probs[:total], dtype=np.float32) >= drop_gap_threshold] = 0
+    return frames
+
+
+def _peak_prominence(values: np.ndarray, index: int, *, lower: int, upper: int, window_frames: int) -> float:
+    radius = max(1, int(window_frames))
+    left = values[max(lower, index - radius) : index + 1]
+    right = values[index : min(upper, index + radius + 1)]
+    if left.size == 0 or right.size == 0:
+        return 0.0
+    base = max(float(np.min(left)), float(np.min(right)))
+    return float(values[index]) - base
+
+
+def _snap_split_frame(
+    peak_frame: int,
+    *,
+    start_frame: int,
+    end_frame: int,
+    speech_probs: np.ndarray,
+    drop_gap_probs: np.ndarray,
+    snap_frames: int,
+) -> int:
+    lower = max(start_frame + 1, int(peak_frame) - max(0, int(snap_frames)))
+    upper = min(end_frame - 1, int(peak_frame) + max(0, int(snap_frames)))
+    if upper < lower:
+        return int(peak_frame)
+    speech = np.asarray(speech_probs, dtype=np.float32)
+    drop = np.asarray(drop_gap_probs, dtype=np.float32)
+    total = min(int(speech.size), int(drop.size))
+    lower = min(lower, max(0, total - 1))
+    upper = min(upper, max(0, total - 1))
+    if upper < lower:
+        return int(peak_frame)
+    candidates = list(range(lower, upper + 1))
+    return min(
+        candidates,
+        key=lambda frame: (
+            float(speech[frame]) - float(drop[frame]),
+            abs(int(frame) - int(peak_frame)),
+        ),
+    )
+
+
+def _split_peak_frames_for_segment(
+    segment: SpeechSegment,
+    *,
+    speech_probs: np.ndarray,
+    split_probs: np.ndarray,
+    drop_gap_probs: np.ndarray,
+    frame_hop_s: float,
+    split_threshold: float,
+    split_prominence: float,
+    split_smooth_s: float,
+    split_nms_s: float,
+    split_snap_s: float,
+    min_split_segment_s: float,
+) -> list[int]:
+    total = min(int(speech_probs.size), int(split_probs.size), int(drop_gap_probs.size))
+    if total <= 0:
+        return []
+    start_frame = max(0, min(total, int(np.floor(max(0.0, segment.start) / frame_hop_s))))
+    end_frame = max(start_frame, min(total, int(np.ceil(max(segment.start, segment.end) / frame_hop_s))))
+    min_frames = max(1, int(round(max(0.0, min_split_segment_s) / frame_hop_s)))
+    lower = start_frame + min_frames
+    upper = end_frame - min_frames
+    if upper <= lower:
+        return []
+    smooth_window = max(1, int(round(max(0.0, split_smooth_s) / frame_hop_s)))
+    smoothed = _smooth_scores(split_probs[:total], window_frames=smooth_window)
+    candidates: list[tuple[int, float]] = []
+    for frame in range(lower, upper):
+        value = float(smoothed[frame])
+        if value < split_threshold:
+            continue
+        prev_value = float(smoothed[frame - 1]) if frame > start_frame else value
+        next_value = float(smoothed[frame + 1]) if frame + 1 < end_frame else value
+        if value < prev_value or value < next_value:
+            continue
+        prominence = _peak_prominence(
+            smoothed,
+            frame,
+            lower=start_frame,
+            upper=end_frame,
+            window_frames=max(1, smooth_window),
+        )
+        if prominence < split_prominence:
+            continue
+        snapped = _snap_split_frame(
+            frame,
+            start_frame=start_frame,
+            end_frame=end_frame,
+            speech_probs=speech_probs[:total],
+            drop_gap_probs=drop_gap_probs[:total],
+            snap_frames=max(0, int(round(max(0.0, split_snap_s) / frame_hop_s))),
+        )
+        candidates.append((snapped, value))
+    if not candidates:
+        return []
+    nms_frames = max(1, int(round(max(0.0, split_nms_s) / frame_hop_s)))
+    selected: list[int] = []
+    for frame, _score in sorted(candidates, key=lambda item: item[1], reverse=True):
+        if all(abs(frame - existing) >= nms_frames for existing in selected):
+            selected.append(frame)
+    return sorted(selected)
+
+
+def _split_segment_at_frames(
+    segment: SpeechSegment,
+    split_frames: Iterable[int],
+    *,
+    frame_hop_s: float,
+    min_split_segment_s: float,
+) -> list[SpeechSegment]:
+    boundaries = [float(frame) * frame_hop_s for frame in sorted(set(int(frame) for frame in split_frames))]
+    parts: list[SpeechSegment] = []
+    cursor = float(segment.start)
+    min_duration = max(0.0, float(min_split_segment_s))
+    for boundary in boundaries:
+        boundary = max(segment.start, min(float(boundary), segment.end))
+        if boundary - cursor < min_duration:
+            continue
+        if segment.end - boundary < min_duration:
+            continue
+        parts.append(SpeechSegment(start=cursor, end=boundary, score=segment.score))
+        cursor = boundary
+    if segment.end > cursor:
+        parts.append(SpeechSegment(start=cursor, end=segment.end, score=segment.score))
+    return parts or [segment]
+
+
+def _split_segments_by_peaks(
+    segments: Iterable[SpeechSegment],
+    *,
+    speech_probs: np.ndarray,
+    split_probs: np.ndarray,
+    drop_gap_probs: np.ndarray,
+    config: "SpeechBoundaryJaConfig",
+) -> list[SpeechSegment]:
+    result: list[SpeechSegment] = []
+    for segment in segments:
+        peaks = _split_peak_frames_for_segment(
+            segment,
+            speech_probs=speech_probs,
+            split_probs=split_probs,
+            drop_gap_probs=drop_gap_probs,
+            frame_hop_s=config.frame_hop_s,
+            split_threshold=config.split_threshold,
+            split_prominence=config.split_prominence,
+            split_smooth_s=config.split_smooth_s,
+            split_nms_s=config.split_nms_s,
+            split_snap_s=config.split_snap_s,
+            min_split_segment_s=config.min_split_segment_s,
+        )
+        result.extend(
+            _split_segment_at_frames(
+                segment,
+                peaks,
+                frame_hop_s=config.frame_hop_s,
+                min_split_segment_s=config.min_split_segment_s,
+            )
+        )
+    return result
 
 
 def _range_normalize(values: np.ndarray, *, lower_pct: float = 20.0, upper_pct: float = 95.0) -> np.ndarray:
@@ -213,10 +382,11 @@ def _bootstrap_frame_scores(
     ptm: np.ndarray,
     mfcc: np.ndarray,
     config: FeatureConfig,
-) -> tuple[np.ndarray, np.ndarray]:
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     frame_total = min(int(ptm.shape[0]), int(mfcc.shape[0]))
     if frame_total <= 0:
-        return np.zeros(0, dtype=np.float32), np.zeros(0, dtype=np.float32)
+        empty = np.zeros(0, dtype=np.float32)
+        return empty, empty, empty
 
     energy = _range_normalize(
         _frame_rms_db(
@@ -239,8 +409,9 @@ def _bootstrap_frame_scores(
     if speech.size >= 3:
         smoothed = np.pad(speech, (1, 1), mode="edge")
         speech = ((smoothed[:-2] + smoothed[1:-1] + smoothed[2:]) / 3.0).astype(np.float32)
-    cut = (1.0 - speech).astype(np.float32)
-    return np.clip(speech, 0.0, 1.0), np.clip(cut, 0.0, 1.0)
+    split = np.zeros_like(speech, dtype=np.float32)
+    drop_gap = (1.0 - speech).astype(np.float32)
+    return np.clip(speech, 0.0, 1.0), split, np.clip(drop_gap, 0.0, 1.0)
 
 
 def frames_to_segments(
@@ -306,10 +477,13 @@ class SpeechBoundaryJaConfig:
     window_s: float = 30.0
     overlap_s: float = 1.0
     min_segment_s: float = 0.05
-    max_group_s: float = 6.0
-    chunk_threshold_s: float = 1.0
-    cut_threshold: float = 0.500
-    apply_cut_to_speech: bool = True
+    drop_gap_threshold: float = 0.75
+    split_threshold: float = 0.55
+    split_prominence: float = 0.08
+    split_smooth_s: float = 0.08
+    split_nms_s: float = 0.20
+    split_snap_s: float = 0.10
+    min_split_segment_s: float = 0.08
     export_sequence_features: bool = False
     sequence_feature_max_ptm_dims: int = 64
     no_download: bool = False
@@ -337,10 +511,13 @@ class SpeechBoundaryJaConfig:
             window_s=_env_float("SPEECH_BOUNDARY_JA_WINDOW_S", "30.0"),
             overlap_s=_env_float("SPEECH_BOUNDARY_JA_OVERLAP_S", "1.0"),
             min_segment_s=_env_float("SPEECH_BOUNDARY_JA_MIN_SEGMENT_S", "0.05"),
-            max_group_s=_env_float("SPEECH_BOUNDARY_JA_MAX_GROUP_S", "6.0"),
-            chunk_threshold_s=_env_float("SPEECH_BOUNDARY_JA_CHUNK_THRESHOLD_S", "1.0"),
-            cut_threshold=_env_float("SPEECH_BOUNDARY_JA_CUT_THRESHOLD", "0.500"),
-            apply_cut_to_speech=_env_bool("SPEECH_BOUNDARY_JA_APPLY_CUT_TO_SPEECH", "1"),
+            drop_gap_threshold=_env_float("SPEECH_BOUNDARY_JA_DROP_GAP_THRESHOLD", "0.75"),
+            split_threshold=_env_float("SPEECH_BOUNDARY_JA_SPLIT_THRESHOLD", "0.55"),
+            split_prominence=_env_float("SPEECH_BOUNDARY_JA_SPLIT_PROMINENCE", "0.08"),
+            split_smooth_s=_env_float("SPEECH_BOUNDARY_JA_SPLIT_SMOOTH_S", "0.08"),
+            split_nms_s=_env_float("SPEECH_BOUNDARY_JA_SPLIT_NMS_S", "0.20"),
+            split_snap_s=_env_float("SPEECH_BOUNDARY_JA_SPLIT_SNAP_S", "0.10"),
+            min_split_segment_s=_env_float("SPEECH_BOUNDARY_JA_MIN_SPLIT_SEGMENT_S", "0.08"),
             export_sequence_features=_env_bool("SPEECH_BOUNDARY_JA_EXPORT_SEQUENCE_FEATURES", "0"),
             sequence_feature_max_ptm_dims=max(
                 1,
@@ -354,7 +531,7 @@ class SpeechBoundaryJaConfig:
 
 
 class SpeechBoundaryJaBackend:
-    name = "speech_boundary_ja_qwen_feature_bootstrap"
+    name = "speech_boundary_ja_mamba2_frame_boundary_scorer_v4"
 
     def __init__(self, config: SpeechBoundaryJaConfig | None = None) -> None:
         self.config = config or SpeechBoundaryJaConfig.from_env()
@@ -395,6 +572,7 @@ class SpeechBoundaryJaBackend:
         speech_on_threshold, speech_off_threshold = self._speech_thresholds(cfg)
         signature = {
             "backend": self.name,
+            "schema": "speech_boundary_ja_mamba2_frame_boundary_scorer_v4",
             "threshold": float(cfg.threshold),
             "speech_threshold_mode": "hysteresis",
             "speech_on_threshold": float(speech_on_threshold),
@@ -409,10 +587,13 @@ class SpeechBoundaryJaBackend:
             "window_s": float(cfg.window_s),
             "overlap_s": float(cfg.overlap_s),
             "min_segment_s": float(cfg.min_segment_s),
-            "max_group_s": float(cfg.max_group_s),
-            "chunk_threshold_s": float(cfg.chunk_threshold_s),
-            "cut_threshold": float(cfg.cut_threshold),
-            "apply_cut_to_speech": bool(cfg.apply_cut_to_speech),
+            "drop_gap_threshold": float(cfg.drop_gap_threshold),
+            "split_threshold": float(cfg.split_threshold),
+            "split_prominence": float(cfg.split_prominence),
+            "split_smooth_s": float(cfg.split_smooth_s),
+            "split_nms_s": float(cfg.split_nms_s),
+            "split_snap_s": float(cfg.split_snap_s),
+            "min_split_segment_s": float(cfg.min_split_segment_s),
             "export_sequence_features": bool(cfg.export_sequence_features),
             "sequence_feature_max_ptm_dims": int(cfg.sequence_feature_max_ptm_dims),
             "scorer_checkpoint": "",
@@ -482,7 +663,7 @@ class SpeechBoundaryJaBackend:
             "ptm_param_device": ptm_param_device,
             "ptm_param_dtype": ptm_param_dtype,
             "score_model": (
-                "mamba2_frame_boundary_scorer" if scorer is not None else "bootstrap_energy_ptm_mfcc"
+                "mamba2_frame_boundary_scorer_v4" if scorer is not None else "bootstrap_energy_ptm_mfcc"
             ),
             "scorer_device": str(scorer_device) if scorer is not None else "",
         }
@@ -502,8 +683,10 @@ class SpeechBoundaryJaBackend:
             total_frames = frame_count(duration_s, cfg.frame_hop_s)
             probability_sum = np.zeros(total_frames, dtype=np.float64)
             probability_count = np.zeros(total_frames, dtype=np.float32)
-            cut_probability_sum = np.zeros(total_frames, dtype=np.float64)
-            cut_probability_count = np.zeros(total_frames, dtype=np.float32)
+            split_probability_sum = np.zeros(total_frames, dtype=np.float64)
+            split_probability_count = np.zeros(total_frames, dtype=np.float32)
+            drop_gap_probability_sum = np.zeros(total_frames, dtype=np.float64)
+            drop_gap_probability_count = np.zeros(total_frames, dtype=np.float32)
             sequence_ptm_sum: np.ndarray | None = None
             sequence_mfcc_sum: np.ndarray | None = None
             sequence_feature_count: np.ndarray | None = None
@@ -524,7 +707,7 @@ class SpeechBoundaryJaBackend:
                     resize_ptm=is_low_frame_rate_ptm(cfg.ptm),
                 )
                 if scorer is None:
-                    probs, cut_probs = _bootstrap_frame_scores(
+                    probs, split_probs, drop_gap_probs = _bootstrap_frame_scores(
                         audio=chunk,
                         sample_rate=sample_rate,
                         ptm=ptm,
@@ -532,7 +715,7 @@ class SpeechBoundaryJaBackend:
                         config=feature_config,
                     )
                 else:
-                    probs, cut_probs = score_feature_frame_boundary_probabilities(
+                    probs, split_probs, drop_gap_probs = score_feature_frame_boundary_probabilities(
                         scorer,
                         ptm=ptm,
                         mfcc=mfcc,
@@ -545,8 +728,10 @@ class SpeechBoundaryJaBackend:
                     continue
                 probability_sum[global_start:global_end] += probs[:local_end]
                 probability_count[global_start:global_end] += 1.0
-                cut_probability_sum[global_start:global_end] += cut_probs[:local_end]
-                cut_probability_count[global_start:global_end] += 1.0
+                split_probability_sum[global_start:global_end] += split_probs[:local_end]
+                split_probability_count[global_start:global_end] += 1.0
+                drop_gap_probability_sum[global_start:global_end] += drop_gap_probs[:local_end]
+                drop_gap_probability_count[global_start:global_end] += 1.0
                 if cfg.export_sequence_features:
                     ptm_dim = min(int(ptm.shape[1]), int(cfg.sequence_feature_max_ptm_dims))
                     mfcc_dim = int(mfcc.shape[1])
@@ -570,20 +755,20 @@ class SpeechBoundaryJaBackend:
                 out=np.zeros_like(probability_sum, dtype=np.float64),
                 where=probability_count > 0,
             ).astype(np.float32)
-            cut_probabilities = np.divide(
-                cut_probability_sum,
-                np.maximum(cut_probability_count, 1.0),
-                out=np.zeros_like(cut_probability_sum, dtype=np.float64),
-                where=cut_probability_count > 0,
+            split_probabilities = np.divide(
+                split_probability_sum,
+                np.maximum(split_probability_count, 1.0),
+                out=np.zeros_like(split_probability_sum, dtype=np.float64),
+                where=split_probability_count > 0,
             ).astype(np.float32)
-            effective_probabilities = _apply_cut_gate(
-                probabilities,
-                cut_probabilities,
-                cut_threshold=cfg.cut_threshold,
-                apply_cut=cfg.apply_cut_to_speech,
-            )
+            drop_gap_probabilities = np.divide(
+                drop_gap_probability_sum,
+                np.maximum(drop_gap_probability_count, 1.0),
+                out=np.zeros_like(drop_gap_probability_sum, dtype=np.float64),
+                where=drop_gap_probability_count > 0,
+            ).astype(np.float32)
             raw_frames = _hysteresis_frames(
-                effective_probabilities,
+                probabilities,
                 on_threshold=speech_on_threshold,
                 off_threshold=speech_off_threshold,
             )
@@ -591,22 +776,35 @@ class SpeechBoundaryJaBackend:
                 raw_frames,
                 dilation_frames=max(0, int(round(cfg.frame_dilation_s / cfg.frame_hop_s))),
             )
-            segments = frames_to_segments(
+            gap_masked = _apply_drop_gap_mask(
                 dilated,
+                drop_gap_probabilities,
+                drop_gap_threshold=cfg.drop_gap_threshold,
+            )
+            coarse_segments = frames_to_segments(
+                gap_masked,
                 frame_hop_s=cfg.frame_hop_s,
                 duration_s=duration_s,
                 scores=probabilities,
             )
-            segments = filter_segments(
-                segments,
+            coarse_segments = filter_segments(
+                coarse_segments,
                 duration_s=duration_s,
                 min_segment_s=cfg.min_segment_s,
             )
-            groups = group_segments(
-                segments,
-                max_group_duration_s=cfg.max_group_s,
-                chunk_threshold_s=cfg.chunk_threshold_s,
+            split_segments = _split_segments_by_peaks(
+                coarse_segments,
+                speech_probs=probabilities,
+                split_probs=split_probabilities,
+                drop_gap_probs=drop_gap_probabilities,
+                config=cfg,
             )
+            segments = filter_segments(
+                split_segments,
+                duration_s=duration_s,
+                min_segment_s=cfg.min_segment_s,
+            )
+            groups = [[segment] for segment in segments]
             params = self.signature()
             params.update(
                 {
@@ -619,24 +817,23 @@ class SpeechBoundaryJaBackend:
                         "speech_off_threshold": float(speech_off_threshold),
                         "probability_mean": float(probabilities.mean()) if probabilities.size else 0.0,
                         "probability_max": float(probabilities.max()) if probabilities.size else 0.0,
-                        "effective_probability_mean": (
-                            float(effective_probabilities.mean())
-                            if effective_probabilities.size
-                            else 0.0
+                        "split_boundary_probability_mean": (
+                            float(split_probabilities.mean()) if split_probabilities.size else 0.0
                         ),
-                        "effective_probability_max": (
-                            float(effective_probabilities.max())
-                            if effective_probabilities.size
-                            else 0.0
+                        "split_boundary_probability_max": (
+                            float(split_probabilities.max()) if split_probabilities.size else 0.0
                         ),
-                        "cut_probability_mean": (
-                            float(cut_probabilities.mean()) if cut_probabilities.size else 0.0
+                        "drop_gap_probability_mean": (
+                            float(drop_gap_probabilities.mean()) if drop_gap_probabilities.size else 0.0
                         ),
-                        "cut_probability_max": (
-                            float(cut_probabilities.max()) if cut_probabilities.size else 0.0
+                        "drop_gap_probability_max": (
+                            float(drop_gap_probabilities.max()) if drop_gap_probabilities.size else 0.0
                         ),
                         "raw_speech_ratio": float(raw_frames.mean()) if raw_frames.size else 0.0,
                         "dilated_speech_ratio": float(dilated.mean()) if dilated.size else 0.0,
+                        "drop_gap_masked_speech_ratio": float(gap_masked.mean()) if gap_masked.size else 0.0,
+                        "coarse_segment_count": len(coarse_segments),
+                        "split_segment_count": len(segments),
                         "uncovered_frame_ratio": float((probability_count <= 0).mean())
                         if probability_count.size
                         else 0.0,
@@ -665,7 +862,8 @@ class SpeechBoundaryJaBackend:
                 }
             if _env_bool("SPEECH_BOUNDARY_JA_EXPORT_FRAME_SCORES", "0") or cfg.export_sequence_features:
                 params["frame_scores"] = [float(value) for value in probabilities]
-                params["cut_frame_scores"] = [float(value) for value in cut_probabilities]
+                params["split_boundary_frame_scores"] = [float(value) for value in split_probabilities]
+                params["drop_gap_frame_scores"] = [float(value) for value in drop_gap_probabilities]
             return SegmentationResult(
                 segments=segments,
                 groups=groups,

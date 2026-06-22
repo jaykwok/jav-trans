@@ -194,7 +194,7 @@ class _FakeSequenceRefiner:
     def decide_sequence(self, features: list[list[float]]) -> list[BoundaryDecision]:
         return [
             BoundaryDecision(
-                source="frame_sequence_refiner",
+                source="edge_sequence_refiner_v6",
                 start_refine_delta_s=0.0,
                 end_refine_delta_s=0.0,
             )
@@ -202,7 +202,7 @@ class _FakeSequenceRefiner:
         ]
 
     def signature(self) -> dict:
-        return {"schema": "boundary_refiner_v5", "type": "fake_sequence_refiner"}
+        return {"schema": "boundary_edge_refiner_v6", "type": "fake_sequence_refiner"}
 
 
 class _FakeSequenceFeatureProvider:
@@ -230,17 +230,16 @@ class _FakeCueQCRefiner:
         return [
             {
                 "schema": "cueqc_shadow_v1",
-                "model_version": "cueqc_mamba_v3_fusion",
+                "model_version": "cueqc_mamba_v4_binary",
                 "decision_version": "cueqc_display_binary_v1",
-                "mode": "cueqc_mamba_v3_fusion",
+                "mode": "cueqc_mamba_v4_binary",
                 "display_hint": "keep",
                 "cluster_id": "runtime-test",
                 "confidence": 0.99,
                 "display_prob_keep": 0.99,
                 "display_prob_drop": 0.01,
                 "drop_threshold": 0.85,
-                "threshold_profile": {"mode": "base"},
-                "reasons": ["cueqc_mamba_v3:keep:p_drop=0.010:threshold=0.850"],
+                "reasons": ["cueqc_mamba_v4_binary:keep:p_drop=0.010:threshold=0.850"],
             }
             for _candidate in candidates
         ]
@@ -248,21 +247,23 @@ class _FakeCueQCRefiner:
 
 def _reload_pipeline(monkeypatch, tmp_path: Path, *, enable_cueqc: bool = False):
     asr_backend = "jaykwok/Qwen3-ASR-0.6B-JA-Anime-Galgame"
+    boundary_checkpoint = tmp_path / "boundary_edge_refiner_v6.jaykwok-Qwen3-ASR-0.6B-JA-Anime-Galgame.pt"
+    boundary_checkpoint.write_bytes(b"v6")
     monkeypatch.setenv("ASR_BACKEND", asr_backend)
     monkeypatch.setenv(
         "BOUNDARY_REFINER_MODEL_PATH_BY_REPO",
-        f"{asr_backend}=src/boundary/checkpoints/boundary_refiner.jaykwok-Qwen3-ASR-0.6B-JA-Anime-Galgame.pt",
+        f"{asr_backend}={boundary_checkpoint}",
     )
     monkeypatch.setenv("BOUNDARY_FEATURE_FRAME_HOP_S", "0.02")
-    monkeypatch.setenv("BOUNDARY_PLANNER_TARGET_CHUNK_S", "9.0")
-    monkeypatch.setenv("BOUNDARY_PLANNER_MAX_CORE_CHUNK_S", "30.0")
     monkeypatch.setenv("ASR_CHUNK_ROOT", str(tmp_path / "chunks"))
     monkeypatch.setenv("ASR_CHECKPOINT_ENABLED", "0")
     monkeypatch.setenv("CUEQC_SHADOW_ENABLED", "1" if enable_cueqc else "0")
     if enable_cueqc:
+        cueqc_checkpoint = tmp_path / "cueqc_mamba_v4_binary.pt"
+        cueqc_checkpoint.write_bytes(b"placeholder")
         monkeypatch.setenv(
             "CUEQC_MODEL_PATH_BY_REPO",
-            f"{asr_backend}=src/asr/checkpoints/cueqc_mamba_v3_fusion.jaykwok-Qwen3-ASR-0.6B-JA-Anime-Galgame.pt",
+            f"{asr_backend}={cueqc_checkpoint}",
         )
     else:
         monkeypatch.delenv("CUEQC_MODEL_PATH_BY_REPO", raising=False)
@@ -272,7 +273,12 @@ def _reload_pipeline(monkeypatch, tmp_path: Path, *, enable_cueqc: bool = False)
     asr = importlib.reload(asr)
     monkeypatch.setattr(
         asr,
-        "load_frame_sequence_refiner_checkpoint",
+        "_boundary_refiner_runtime_adapter",
+        lambda _path: "edge_sequence_v1",
+    )
+    monkeypatch.setattr(
+        asr,
+        "load_edge_sequence_refiner_v6_checkpoint",
         lambda *_args, **_kwargs: _FakeSequenceRefiner(),
     )
     monkeypatch.setattr(
@@ -325,7 +331,7 @@ def test_boundary_planner_emits_one_asr_chunk_per_speech_island(monkeypatch, tmp
     assert len(backend.audio_paths) == 10
     assert details["chunk_count"] == len(backend.audio_paths)
     assert details["boundary_signature"]["backend"] == "stub"
-    assert details["boundary_signature"]["boundary_pipeline"]["version"] == 5
+    assert details["boundary_signature"]["boundary_pipeline"]["version"] == 6
     assert all(
         "source_boundary.wav" not in str(Path(path).name) for path in backend.audio_paths
     )
@@ -407,7 +413,7 @@ def test_packed_chunk_metadata_uses_source_span_index_after_short_chunk_drop():
         boundary_source="cut",
         boundary_start_refine_delta_s=0.04,
         boundary_end_refine_delta_s=-0.03,
-        boundary_decision_source="frame_sequence_refiner",
+        boundary_decision_source="edge_sequence_refiner_v6",
     )
     chunk_infos = [
         {
@@ -428,7 +434,7 @@ def test_packed_chunk_metadata_uses_source_span_index_after_short_chunk_drop():
     assert chunk_infos[0]["boundary_score"] == 0.87
     assert chunk_infos[0]["boundary_start_refine_delta_s"] == 0.04
     assert chunk_infos[0]["boundary_end_refine_delta_s"] == -0.03
-    assert chunk_infos[0]["boundary_decision_source"] == "frame_sequence_refiner"
+    assert chunk_infos[0]["boundary_decision_source"] == "edge_sequence_refiner_v6"
     assert any("speech_segment_count=2" in entry and "source=cut" in entry for entry in log)
 
 
@@ -559,7 +565,7 @@ def test_cueqc_runtime_fallback_summary_is_logged_and_reported(monkeypatch, tmp_
             return [
                 {
                     "schema": "cueqc_shadow_v1",
-                    "model_version": "cueqc_mamba_v3_fusion",
+                    "model_version": "cueqc_mamba_v4_binary",
                     "decision_version": "cueqc_display_binary_v1",
                     "mode": "fallback_keep",
                     "display_hint": "keep",
@@ -573,17 +579,16 @@ def test_cueqc_runtime_fallback_summary_is_logged_and_reported(monkeypatch, tmp_
                 },
                 {
                     "schema": "cueqc_shadow_v1",
-                    "model_version": "cueqc_mamba_v3_fusion",
+                    "model_version": "cueqc_mamba_v4_binary",
                     "decision_version": "cueqc_display_binary_v1",
-                    "mode": "cueqc_mamba_v3_fusion",
+                    "mode": "cueqc_mamba_v4_binary",
                     "display_hint": "drop",
                     "cluster_id": "runtime-test",
                     "confidence": 0.95,
                     "display_prob_keep": 0.05,
                     "display_prob_drop": 0.95,
                     "drop_threshold": 0.85,
-                    "threshold_profile": {"mode": "base"},
-                    "reasons": ["cueqc_mamba_v3:drop:p_drop=0.950:threshold=0.850"],
+                    "reasons": ["cueqc_mamba_v4_binary:drop:p_drop=0.950:threshold=0.850"],
                 },
             ]
 
@@ -593,14 +598,14 @@ def test_cueqc_runtime_fallback_summary_is_logged_and_reported(monkeypatch, tmp_
     ]
     log: list[str] = []
 
-    decisions = asr._apply_cueqc_v3_model(
+    decisions = asr._apply_cueqc_v4_model(
         refiner=FakeRefiner(),
         candidates=candidates,
         backend=CaptureBackend(),
         audio_path=str(tmp_path / "source.wav"),
         log=log,
     )
-    report = asr._merge_cueqc_v3_decisions(
+    report = asr._merge_cueqc_v4_decisions(
         {"counts": {"display_hint": {"keep": 2}}, "decisions": []},
         candidates,
         decisions,

@@ -14,8 +14,9 @@ It bundles:
 - `ffmpeg.exe` and `ffprobe.exe` from `PATH`, or from `-FfmpegExe` / `-FfprobeExe`
 - `src/assets/images/icon.png` for the in-app header, drop zone image, and PNG favicon
 - `src/assets/images/icon.ico` for the pywebview native window icon and packaged executable icon
-- the small Mamba Boundary Refiner checkpoint at `src/boundary/checkpoints/boundary_refiner.jaykwok-Qwen3-ASR-0.6B-JA-Anime-Galgame.pt`
-- the opt-in 0.6B SpeechBoundary-JA scorer checkpoint at `src/boundary/ja/checkpoints/speech_boundary_ja_feature_scorer.jaykwok-Qwen3-ASR-0.6B-JA-Anime-Galgame.pt`
+- repo-id tagged Boundary Refiner v6 checkpoints at `src/boundary/checkpoints/boundary_edge_refiner_v6.<repo-tag>.pt`
+- repo-id tagged SpeechBoundary-JA scorer v4 checkpoints at `src/boundary/ja/checkpoints/speech_boundary_ja_frame_boundary_scorer_v4.<repo-tag>.pt`
+- repo-id tagged CueQC v4 binary checkpoints at `src/asr/checkpoints/cueqc_mamba_v4_binary.<repo-tag>.pt`
 - the bundled Hugging Face inference model directories:
   - `jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame`
   - `jaykwok/Qwen3-ASR-0.6B-JA-Anime-Galgame`
@@ -29,9 +30,10 @@ For a small development build only, pass `-SkipModels`. That skips model
 preparation and leaves the Hugging Face model directories out of the PyInstaller
 package. Do not use `-SkipModels` for user-facing Windows builds.
 
-The PyInstaller spec treats `src/boundary/checkpoints/` as a required data
-directory. A build should fail if the default Boundary Refiner checkpoint is
-missing, because normal inference does not regenerate it.
+The PyInstaller spec treats the repo-id tagged Mamba checkpoint directories as
+required data directories. A build should fail if the default registry
+checkpoint for the selected ASR repo is missing, because normal inference does
+not regenerate it.
 
 It does not bundle Microsoft Edge WebView2. Users still need the WebView2
 runtime, which is already present on most supported Windows systems. If the app
@@ -61,7 +63,8 @@ expected to publish source code and release notes only.
 Training-only Boundary Refiner artifacts are deliberately excluded from release
 packages: CUDA feature caches, synthetic WAVs, sequence JSONL files, and
 `datasets/train/...` outputs are all regenerable research data. New users only
-need the bundled repo-tagged Boundary Refiner checkpoint plus the bundled
-Hugging Face inference models above. Do not restore old `src/vad` checkpoint
-paths; if the Boundary Refiner checkpoint grows too large for source
-distribution, publish it as a GitHub Release or Hugging Face artifact instead.
+need the bundled repo-tagged Boundary Refiner, SpeechBoundary-JA scorer, CueQC
+checkpoint set plus the bundled Hugging Face inference models above. Do not
+restore old `src/vad` checkpoint paths; if Mamba checkpoints grow too large for
+source distribution, publish them as GitHub Release or Hugging Face artifacts
+instead.

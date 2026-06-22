@@ -122,8 +122,12 @@ def test_default_model_download_root_is_project_models():
     assert "SPEECH_BOUNDARY_JA_SCORER_CHECKPOINT" not in config.DEFAULT_SETTINGS
     assert not any(key.startswith("ALIGN") for key in config.DEFAULT_SETTINGS)
     assert "BOUNDARY_REFINER_ENABLED" not in config.DEFAULT_SETTINGS
-    assert config.DEFAULT_SETTINGS["BOUNDARY_PLANNER_TARGET_CHUNK_S"] == "3.0"
-    assert config.DEFAULT_SETTINGS["BOUNDARY_PLANNER_MAX_CORE_CHUNK_S"] == "5.0"
+    assert "BOUNDARY_PLANNER_TARGET_CHUNK_S" not in config.DEFAULT_SETTINGS
+    assert "BOUNDARY_PLANNER_MAX_CORE_CHUNK_S" not in config.DEFAULT_SETTINGS
+    assert "BOUNDARY_PLANNER_MIN_CHUNK_S" not in config.DEFAULT_SETTINGS
+    assert "BOUNDARY_PLANNER_MAX_SPLITS_PER_SEGMENT" not in config.DEFAULT_SETTINGS
+    assert "CUEQC_MODEL_VERSION" not in config.DEFAULT_SETTINGS
+    assert "CUEQC_DECISION_VERSION" not in config.DEFAULT_SETTINGS
     assert "BOUNDARY_CONTEXT_MAX_PADDING_S" not in config.DEFAULT_SETTINGS
     assert "BOUNDARY_PLANNER_MAX_PADDED_CHUNK_S" not in config.DEFAULT_SETTINGS
     assert "BOUNDARY_CONTEXT_MAX_SPEECH_OVERLAP_S" not in config.DEFAULT_SETTINGS

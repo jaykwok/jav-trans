@@ -1,7 +1,7 @@
-"""CueQC Mamba v3-Fusion — ASR internals capture via teacher-forced forward.
+"""CueQC Mamba v4 binary ASR internals capture via teacher-forced forward.
 
 ``AsrInternalsCapturer`` extracts, for one ASR candidate, the two signal sources
-v3-Fusion needs that the public ``qwen_asr.transcribe()`` API does not return:
+CueQC v4 binary needs values that the public ``qwen_asr.transcribe()`` API does not return:
 
 * ``asr_frames``  — Qwen3-ASR encoder (audio-tower) hidden states for the chunk
 * token-level logprob / entropy / top1-top2 margin — via a single
@@ -10,7 +10,7 @@ v3-Fusion needs that the public ``qwen_asr.transcribe()`` API does not return:
 Both training (offline) and runtime reuse this class so the feature pipeline is
 identical end-to-end. The capturer holds no model of its own when a wrapper is
 passed in — at runtime it reuses the already-loaded ``LocalAsrBackend.model``
-to avoid doubling VRAM (see v3-Fusion §5.2).
+to avoid doubling VRAM.
 
 The teacher-forced logits reproduce the same positions ASR decoding produced
 because the wrapper is greedy (default ``generate``). If the ASR backend ever
