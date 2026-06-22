@@ -288,6 +288,8 @@ def train_feature_frame_scorer(
         feature_manifest_rows=train_rows,
         drop_gap_min_gap_s=config.drop_gap_min_gap_s,
         split_boundary_radius_frames=config.split_boundary_radius_frames,
+        log_every=max(0, int(config.log_every)),
+        total_rows=len(train_rows),
     )
 
     device = torch.device(config.device)
@@ -341,7 +343,7 @@ def train_feature_frame_scorer(
         if log_every > 0 and (current_step % log_every == 0 or current_step >= config.max_steps):
             elapsed_s = max(0.001, time.monotonic() - started_at)
             print(
-                "train_progrepp="
+                "train_progress="
                 f"{current_step}/{config.max_steps} "
                 f"loss={float(loss.detach().cpu()):.6f} "
                 f"avg_loss={float(np.mean(lossep)):.6f} "
@@ -537,12 +539,18 @@ def compute_feature_normalization(
     feature_manifest_rows: Iterable[Mapping[str, Any]],
     drop_gap_min_gap_s: float = 0.5,
     split_boundary_radius_frames: int = 1,
+    log_every: int = 0,
+    total_rows: int | None = None,
 ) -> dict[str, Any]:
     total_weight = 0.0
     feature_sum: np.ndarray | None = None
     feature_square_sum: np.ndarray | None = None
     frame_count_total = 0
-    for row in feature_manifest_rows:
+    started_at = time.monotonic()
+    processed_rows = 0
+    log_every = max(0, int(log_every))
+    expected_rows = int(total_rows) if total_rows is not None else None
+    for processed_rows, row in enumerate(feature_manifest_rows, start=1):
         features, _labels, weights = _feature_training_arrays(
             row=row,
             records=records,
@@ -560,8 +568,30 @@ def compute_feature_normalization(
         feature_square_sum += np.sum(np.square(values) * frame_weight, axis=0)
         total_weight += float(frame_weight.sum())
         frame_count_total += int(values.shape[0])
+        if log_every > 0 and (processed_rows % log_every == 0):
+            elapsed_s = max(0.001, time.monotonic() - started_at)
+            suffix = f"/{expected_rows}" if expected_rows is not None else ""
+            print(
+                "normalization_progress="
+                f"{processed_rows}{suffix} "
+                f"weighted_frames={total_weight:.0f} "
+                f"observed_frames={frame_count_total} "
+                f"elapsed_s={elapsed_s:.1f}",
+                flush=True,
+            )
     if feature_sum is None or feature_square_sum is None or total_weight <= 0.0:
         raise ValueError("cannot compute normalization without weighted feature frames")
+    if log_every > 0:
+        elapsed_s = max(0.001, time.monotonic() - started_at)
+        suffix = f"/{expected_rows}" if expected_rows is not None else ""
+        print(
+            "normalization_progress="
+            f"{processed_rows}{suffix} "
+            f"weighted_frames={total_weight:.0f} "
+            f"observed_frames={frame_count_total} "
+            f"elapsed_s={elapsed_s:.1f} done",
+            flush=True,
+        )
     mean = feature_sum / total_weight
     variance = np.maximum(feature_square_sum / total_weight - np.square(mean), 1e-6)
     std = np.sqrt(variance)
