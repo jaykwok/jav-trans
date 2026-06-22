@@ -3,7 +3,7 @@ from __future__ import annotations
 import hashlib
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Sequence
 
 import numpy as np
 
@@ -285,40 +285,90 @@ def score_feature_frame_boundary_probabilities(
     ptm: np.ndarray,
     mfcc: np.ndarray,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    import torch
-
-    frame_total = min(int(ptm.shape[0]), int(mfcc.shape[0]))
-    if frame_total <= 0:
+    scored = score_feature_frame_boundary_probabilities_batch(
+        bundle,
+        feature_pairs=[(ptm, mfcc)],
+    )
+    if not scored:
         empty = np.zeros(0, dtype=np.float32)
         return empty, empty, empty
-    if int(ptm.shape[1]) != bundle.ptm_dim:
-        raise ValueError(f"scorer expected ptm_dim={bundle.ptm_dim}, got {int(ptm.shape[1])}")
-    if int(mfcc.shape[1]) != bundle.mfcc_dim:
-        raise ValueError(f"scorer expected mfcc_dim={bundle.mfcc_dim}, got {int(mfcc.shape[1])}")
+    return scored[0]
+
+
+def score_feature_frame_boundary_probabilities_batch(
+    bundle: Mamba2FrameScorerBundle,
+    *,
+    feature_pairs: Sequence[tuple[np.ndarray, np.ndarray]],
+) -> list[tuple[np.ndarray, np.ndarray, np.ndarray]]:
+    import torch
+
+    pairs = list(feature_pairs)
+    if not pairs:
+        return []
     if int(bundle.model_config.get("output_dim", 0)) != MAMBA2_FRAME_SCORER_OUTPUT_DIM:
         raise ValueError(
             f"scorer expected output_dim={MAMBA2_FRAME_SCORER_OUTPUT_DIM}, "
             f"got {bundle.model_config.get('output_dim')}"
         )
-    features = np.concatenate(
-        [
-            np.asarray(ptm[:frame_total], dtype=np.float32),
-            np.asarray(mfcc[:frame_total], dtype=np.float32),
-        ],
-        axis=1,
-    )
     mean = np.asarray(bundle.normalization["feature_mean"], dtype=np.float32)
     std = np.asarray(bundle.normalization["feature_std"], dtype=np.float32)
-    features = np.ascontiguousarray((features - mean) / np.maximum(std, 1e-6), dtype=np.float32)
-    with torch.inference_mode():
-        tensor = torch.from_numpy(features).to(bundle.device).unsqueeze(0)
-        logits = bundle.model(tensor).squeeze(0)
-        probabilities = torch.sigmoid(logits).detach().cpu().numpy().astype(np.float32)
-    if probabilities.ndim != 2 or probabilities.shape[1] != MAMBA2_FRAME_SCORER_OUTPUT_DIM:
-        raise ValueError(
-            f"boundary scorer probabilities must have shape [frames, {MAMBA2_FRAME_SCORER_OUTPUT_DIM}]"
+    lengths: list[int] = []
+    normalized_rows: list[np.ndarray] = []
+    for ptm, mfcc in pairs:
+        frame_total = min(int(ptm.shape[0]), int(mfcc.shape[0]))
+        if int(ptm.shape[1]) != bundle.ptm_dim:
+            raise ValueError(f"scorer expected ptm_dim={bundle.ptm_dim}, got {int(ptm.shape[1])}")
+        if int(mfcc.shape[1]) != bundle.mfcc_dim:
+            raise ValueError(f"scorer expected mfcc_dim={bundle.mfcc_dim}, got {int(mfcc.shape[1])}")
+        lengths.append(frame_total)
+        if frame_total <= 0:
+            normalized_rows.append(np.zeros((0, bundle.input_dim), dtype=np.float32))
+            continue
+        features = np.concatenate(
+            [
+                np.asarray(ptm[:frame_total], dtype=np.float32),
+                np.asarray(mfcc[:frame_total], dtype=np.float32),
+            ],
+            axis=1,
         )
-    speech = np.ascontiguousarray(probabilities[:, 0], dtype=np.float32)
-    split = np.ascontiguousarray(probabilities[:, 1], dtype=np.float32)
-    drop_gap = np.ascontiguousarray(probabilities[:, 2], dtype=np.float32)
-    return speech, split, drop_gap
+        normalized_rows.append(
+            np.ascontiguousarray((features - mean) / np.maximum(std, 1e-6), dtype=np.float32)
+        )
+    max_len = max(lengths, default=0)
+    if max_len <= 0:
+        empty = np.zeros(0, dtype=np.float32)
+        return [(empty, empty, empty) for _length in lengths]
+    batch = np.zeros((len(normalized_rows), max_len, bundle.input_dim), dtype=np.float32)
+    mask = np.zeros((len(normalized_rows), max_len), dtype=np.int64)
+    for index, row in enumerate(normalized_rows):
+        length = int(lengths[index])
+        if length <= 0:
+            continue
+        batch[index, :length, :] = row
+        mask[index, :length] = 1
+    with torch.inference_mode():
+        tensor = torch.from_numpy(batch).to(bundle.device)
+        attention_mask = torch.from_numpy(mask).to(bundle.device)
+        logits = bundle.model(tensor, attention_mask=attention_mask)
+        probabilities = torch.sigmoid(logits).detach().cpu().numpy().astype(np.float32)
+    if probabilities.ndim != 3 or probabilities.shape[2] != MAMBA2_FRAME_SCORER_OUTPUT_DIM:
+        raise ValueError(
+            "boundary scorer probabilities must have shape "
+            f"[batch, frames, {MAMBA2_FRAME_SCORER_OUTPUT_DIM}]"
+        )
+    outputs: list[tuple[np.ndarray, np.ndarray, np.ndarray]] = []
+    for index, length in enumerate(lengths):
+        length = int(length)
+        if length <= 0:
+            empty = np.zeros(0, dtype=np.float32)
+            outputs.append((empty, empty, empty))
+            continue
+        row = probabilities[index, :length, :]
+        outputs.append(
+            (
+                np.ascontiguousarray(row[:, 0], dtype=np.float32),
+                np.ascontiguousarray(row[:, 1], dtype=np.float32),
+                np.ascontiguousarray(row[:, 2], dtype=np.float32),
+            )
+        )
+    return outputs

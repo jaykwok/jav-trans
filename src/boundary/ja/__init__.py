@@ -65,6 +65,7 @@ from boundary.ja.model import (
     count_trainable_parameters,
     load_feature_frame_scorer_checkpoint,
     score_feature_frame_boundary_probabilities,
+    score_feature_frame_boundary_probabilities_batch,
 )
 from boundary.ja.train import (
     EvalMetrics,
@@ -155,6 +156,7 @@ __all__ = [
     "stable_hf_audio_id",
     "supervised_segments_for_record",
     "score_feature_frame_boundary_probabilities",
+    "score_feature_frame_boundary_probabilities_batch",
     "with_frame_weights",
     "shuffled_window_order",
     "TinyFrameClassifier",

@@ -582,6 +582,8 @@ def _scan_dataset(paths: Sequence[Path], *, log_interval_rows: int = 0) -> Datas
     feature_schema_values: set[str] = set()
     feature_hash_values: set[str] = set()
     ptm_repo_values: set[str] = set()
+    dataset_source_values: set[str] = set()
+    scorer_checkpoint_values: set[str] = set()
     expected_signature: dict[str, Any] | None = None
 
     for row in _iter_dataset_rows(paths):
@@ -605,6 +607,16 @@ def _scan_dataset(paths: Sequence[Path], *, log_interval_rows: int = 0) -> Datas
         metadata = row.get("metadata")
         if isinstance(metadata, Mapping) and metadata.get("ptm_repo_id"):
             ptm_repo_values.add(str(metadata["ptm_repo_id"]))
+        dataset_source = (
+            metadata.get("dataset_source") if isinstance(metadata, Mapping) else row.get("dataset_source")
+        )
+        if dataset_source:
+            dataset_source_values.add(str(dataset_source))
+        scorer_checkpoint = metadata.get("scorer_checkpoint") if isinstance(metadata, Mapping) else None
+        if isinstance(scorer_checkpoint, Mapping):
+            scorer_checkpoint_values.add(
+                json.dumps(dict(scorer_checkpoint), ensure_ascii=False, sort_keys=True)
+            )
         signature = row.get("feature_signature")
         if isinstance(signature, Mapping):
             signature_dict = dict(signature)
@@ -630,6 +642,8 @@ def _scan_dataset(paths: Sequence[Path], *, log_interval_rows: int = 0) -> Datas
             hash_values=feature_hash_values,
             expected_signature=expected_signature,
             ptm_repo_values=ptm_repo_values,
+            dataset_source_values=dataset_source_values,
+            scorer_checkpoint_values=scorer_checkpoint_values,
         ),
         train_schema=_train_schema_from_values(train_schemas),
         first_row=first_row,
@@ -694,6 +708,17 @@ def _validate_v6_edge_row(row: Mapping[str, Any], *, row_index: int) -> None:
             "boundary refiner v6 rows must not contain old merge/split/context fields "
             f"at row {row_index}: {present}"
         )
+    metadata = row.get("metadata")
+    metadata_source = metadata.get("dataset_source") if isinstance(metadata, Mapping) else ""
+    dataset_source = str(row.get("dataset_source") or metadata_source or "")
+    if dataset_source != "scorer_v4_predicted_island_edges":
+        raise ValueError(
+            "boundary refiner v6 rows must use "
+            f"'scorer_v4_predicted_island_edges', got {dataset_source!r} at row {row_index}"
+        )
+    scorer_checkpoint = metadata.get("scorer_checkpoint") if isinstance(metadata, Mapping) else None
+    if not isinstance(scorer_checkpoint, Mapping):
+        raise ValueError(f"boundary refiner v6 rows require metadata.scorer_checkpoint at row {row_index}")
 
 
 def _feature_metadata_from_scan(
@@ -703,6 +728,8 @@ def _feature_metadata_from_scan(
     hash_values: set[str],
     expected_signature: Mapping[str, Any] | None,
     ptm_repo_values: set[str],
+    dataset_source_values: set[str],
+    scorer_checkpoint_values: set[str],
 ) -> dict[str, Any]:
     if schema_values and schema_values != {FRAME_SEQUENCE_FEATURE_SCHEMA}:
         raise ValueError(f"unsupported sequence feature schema: {sorted(schema_values)}")
@@ -712,7 +739,16 @@ def _feature_metadata_from_scan(
         raise ValueError("boundary refiner v6 rows require metadata.ptm_repo_id")
     if len(ptm_repo_values) > 1:
         raise ValueError(f"mixed ptm_repo_id values are not allowed: {sorted(ptm_repo_values)}")
+    if len(dataset_source_values) > 1:
+        raise ValueError(f"mixed dataset_source values are not allowed: {sorted(dataset_source_values)}")
+    if len(scorer_checkpoint_values) > 1:
+        raise ValueError("mixed scorer_checkpoint metadata values are not allowed")
     ptm_repo_id = next(iter(ptm_repo_values))
+    extra_metadata: dict[str, Any] = {}
+    if dataset_source_values:
+        extra_metadata["dataset_source"] = next(iter(dataset_source_values))
+    if scorer_checkpoint_values:
+        extra_metadata["scorer_checkpoint"] = json.loads(next(iter(scorer_checkpoint_values)))
     if expected_signature is not None:
         feature_schema_hash = next(iter(hash_values)) if hash_values else _hash_from_signature(expected_signature)
         metadata = {
@@ -721,6 +757,7 @@ def _feature_metadata_from_scan(
             "feature_signature": dict(expected_signature),
             "feature_dim": len(feature_names),
             "ptm_repo_id": ptm_repo_id,
+            **extra_metadata,
         }
         return metadata
     if schema_values or hash_values:
@@ -728,6 +765,7 @@ def _feature_metadata_from_scan(
     metadata = {
         "feature_dim": len(feature_names),
         "ptm_repo_id": ptm_repo_id,
+        **extra_metadata,
     }
     return metadata
 

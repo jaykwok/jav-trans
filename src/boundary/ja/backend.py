@@ -463,6 +463,119 @@ def filter_segments(
 
 
 @dataclass(frozen=True)
+class FrameBoundaryDecodeResult:
+    segments: list[SpeechSegment]
+    coarse_segments: list[SpeechSegment]
+    raw_frames: np.ndarray
+    dilated_frames: np.ndarray
+    gap_masked_frames: np.ndarray
+    speech_on_threshold: float
+    speech_off_threshold: float
+
+
+def _speech_thresholds_for_config(
+    config: "SpeechBoundaryJaConfig",
+    *,
+    threshold_override: float | None = None,
+) -> tuple[float, float]:
+    if threshold_override is not None:
+        threshold = float(threshold_override)
+        return threshold, threshold
+    fallback = float(config.threshold)
+    speech_on_threshold = (
+        fallback
+        if config.speech_on_threshold is None
+        else float(config.speech_on_threshold)
+    )
+    speech_off_threshold = (
+        fallback
+        if config.speech_off_threshold is None
+        else float(config.speech_off_threshold)
+    )
+    if speech_on_threshold < 0.0:
+        raise ValueError("SPEECH_BOUNDARY_JA_SPEECH_ON_THRESHOLD must be non-negative")
+    if speech_off_threshold < 0.0:
+        raise ValueError("SPEECH_BOUNDARY_JA_SPEECH_OFF_THRESHOLD must be non-negative")
+    if speech_on_threshold < speech_off_threshold:
+        raise ValueError(
+            "SPEECH_BOUNDARY_JA_SPEECH_ON_THRESHOLD must be greater than or equal to "
+            "SPEECH_BOUNDARY_JA_SPEECH_OFF_THRESHOLD"
+        )
+    return speech_on_threshold, speech_off_threshold
+
+
+def decode_frame_boundary_segments(
+    *,
+    speech_probabilities: np.ndarray,
+    split_probabilities: np.ndarray,
+    drop_gap_probabilities: np.ndarray,
+    duration_s: float,
+    config: "SpeechBoundaryJaConfig",
+    threshold_override: float | None = None,
+) -> FrameBoundaryDecodeResult:
+    """Decode scorer v4 frame heads into speech islands.
+
+    This is intentionally shared by runtime and Boundary Refiner v6 dataset
+    export so the refiner learns from exactly the same island contract it sees
+    during inference.
+    """
+
+    speech_on_threshold, speech_off_threshold = _speech_thresholds_for_config(
+        config,
+        threshold_override=threshold_override,
+    )
+    probabilities = np.asarray(speech_probabilities, dtype=np.float32).reshape(-1)
+    split_probs = np.asarray(split_probabilities, dtype=np.float32).reshape(-1)
+    drop_gap_probs = np.asarray(drop_gap_probabilities, dtype=np.float32).reshape(-1)
+    raw_frames = _hysteresis_frames(
+        probabilities,
+        on_threshold=speech_on_threshold,
+        off_threshold=speech_off_threshold,
+    )
+    dilated = _dilated_frames(
+        raw_frames,
+        dilation_frames=max(0, int(round(config.frame_dilation_s / config.frame_hop_s))),
+    )
+    gap_masked = _apply_drop_gap_mask(
+        dilated,
+        drop_gap_probs,
+        drop_gap_threshold=config.drop_gap_threshold,
+    )
+    coarse_segments = frames_to_segments(
+        gap_masked,
+        frame_hop_s=config.frame_hop_s,
+        duration_s=duration_s,
+        scores=probabilities,
+    )
+    coarse_segments = filter_segments(
+        coarse_segments,
+        duration_s=duration_s,
+        min_segment_s=config.min_segment_s,
+    )
+    split_segments = _split_segments_by_peaks(
+        coarse_segments,
+        speech_probs=probabilities,
+        split_probs=split_probs,
+        drop_gap_probs=drop_gap_probs,
+        config=config,
+    )
+    segments = filter_segments(
+        split_segments,
+        duration_s=duration_s,
+        min_segment_s=config.min_segment_s,
+    )
+    return FrameBoundaryDecodeResult(
+        segments=segments,
+        coarse_segments=coarse_segments,
+        raw_frames=raw_frames,
+        dilated_frames=dilated,
+        gap_masked_frames=gap_masked,
+        speech_on_threshold=speech_on_threshold,
+        speech_off_threshold=speech_off_threshold,
+    )
+
+
+@dataclass(frozen=True)
 class SpeechBoundaryJaConfig:
     threshold: float = 0.200
     speech_on_threshold: float | None = None
@@ -542,30 +655,7 @@ class SpeechBoundaryJaBackend:
         *,
         threshold_override: float | None = None,
     ) -> tuple[float, float]:
-        if threshold_override is not None:
-            threshold = float(threshold_override)
-            return threshold, threshold
-        fallback = float(config.threshold)
-        speech_on_threshold = (
-            fallback
-            if config.speech_on_threshold is None
-            else float(config.speech_on_threshold)
-        )
-        speech_off_threshold = (
-            fallback
-            if config.speech_off_threshold is None
-            else float(config.speech_off_threshold)
-        )
-        if speech_on_threshold < 0.0:
-            raise ValueError("SPEECH_BOUNDARY_JA_SPEECH_ON_THRESHOLD must be non-negative")
-        if speech_off_threshold < 0.0:
-            raise ValueError("SPEECH_BOUNDARY_JA_SPEECH_OFF_THRESHOLD must be non-negative")
-        if speech_on_threshold < speech_off_threshold:
-            raise ValueError(
-                "SPEECH_BOUNDARY_JA_SPEECH_ON_THRESHOLD must be greater than or equal to "
-                "SPEECH_BOUNDARY_JA_SPEECH_OFF_THRESHOLD"
-            )
-        return speech_on_threshold, speech_off_threshold
+        return _speech_thresholds_for_config(config, threshold_override=threshold_override)
 
     def signature(self) -> dict:
         cfg = self.config
@@ -767,43 +857,19 @@ class SpeechBoundaryJaBackend:
                 out=np.zeros_like(drop_gap_probability_sum, dtype=np.float64),
                 where=drop_gap_probability_count > 0,
             ).astype(np.float32)
-            raw_frames = _hysteresis_frames(
-                probabilities,
-                on_threshold=speech_on_threshold,
-                off_threshold=speech_off_threshold,
-            )
-            dilated = _dilated_frames(
-                raw_frames,
-                dilation_frames=max(0, int(round(cfg.frame_dilation_s / cfg.frame_hop_s))),
-            )
-            gap_masked = _apply_drop_gap_mask(
-                dilated,
-                drop_gap_probabilities,
-                drop_gap_threshold=cfg.drop_gap_threshold,
-            )
-            coarse_segments = frames_to_segments(
-                gap_masked,
-                frame_hop_s=cfg.frame_hop_s,
+            decode = decode_frame_boundary_segments(
+                speech_probabilities=probabilities,
+                split_probabilities=split_probabilities,
+                drop_gap_probabilities=drop_gap_probabilities,
                 duration_s=duration_s,
-                scores=probabilities,
-            )
-            coarse_segments = filter_segments(
-                coarse_segments,
-                duration_s=duration_s,
-                min_segment_s=cfg.min_segment_s,
-            )
-            split_segments = _split_segments_by_peaks(
-                coarse_segments,
-                speech_probs=probabilities,
-                split_probs=split_probabilities,
-                drop_gap_probs=drop_gap_probabilities,
                 config=cfg,
+                threshold_override=threshold_override,
             )
-            segments = filter_segments(
-                split_segments,
-                duration_s=duration_s,
-                min_segment_s=cfg.min_segment_s,
-            )
+            raw_frames = decode.raw_frames
+            dilated = decode.dilated_frames
+            gap_masked = decode.gap_masked_frames
+            coarse_segments = decode.coarse_segments
+            segments = decode.segments
             groups = [[segment] for segment in segments]
             params = self.signature()
             params.update(
