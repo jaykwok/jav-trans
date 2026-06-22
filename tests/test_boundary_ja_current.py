@@ -46,6 +46,7 @@ from boundary.ja.backend import (
     DEFAULT_OPERATING_POINT,
     SpeechBoundaryJaBackend,
     SpeechBoundaryJaConfig,
+    decode_frame_boundary_segments,
     _hysteresis_frames,
     _validate_scorer_checkpoint_repo,
 )
@@ -358,6 +359,40 @@ def test_hysteresis_frames_rejects_inverted_thresholds():
         )
 
 
+def test_scorer_split_uses_adaptive_peaks_below_old_absolute_threshold(monkeypatch):
+    monkeypatch.setenv("SPEECH_BOUNDARY_JA_SPLIT_THRESHOLD", "0.99")
+    monkeypatch.setenv("SPEECH_BOUNDARY_JA_SPLIT_PROMINENCE", "0.99")
+
+    frame_hop_s = 0.1
+    cfg = replace(
+        SpeechBoundaryJaConfig.from_env(),
+        frame_hop_s=frame_hop_s,
+        threshold=0.5,
+        frame_dilation_s=0.0,
+        min_segment_s=0.0,
+    )
+
+    assert cfg.split_target_s == pytest.approx(5.0)
+    assert cfg.split_score_quantile == pytest.approx(0.50)
+    assert not hasattr(cfg, "split_threshold")
+    assert not hasattr(cfg, "split_prominence")
+
+    frame_count = 600
+    split_probs = np.full(frame_count, 0.05, dtype=np.float32)
+    for peak in (50, 110, 170, 230, 290, 350, 410, 470, 530):
+        split_probs[peak - 1 : peak + 2] = [0.16, 0.28, 0.16]
+    result = decode_frame_boundary_segments(
+        speech_probabilities=np.full(frame_count, 0.9, dtype=np.float32),
+        split_probabilities=split_probs,
+        drop_gap_probabilities=np.zeros(frame_count, dtype=np.float32),
+        duration_s=60.0,
+        config=cfg,
+    )
+
+    assert len(result.segments) > 2
+    assert max(segment.end - segment.start for segment in result.segments) < 20.0
+
+
 
 
 def test_feature_frame_scorer_checkpoint_round_trip(tmp_path):
@@ -583,4 +618,3 @@ def test_backend_scorer_is_opt_in_and_keeps_segment_contract(tmp_path, monkeypat
     assert result.parameters["scorer_checkpoint"]["schema"] == MAMBA2_FRAME_SCORER_SCHEMA
     assert SpeechBoundaryJaConfig().scorer_checkpoint == ""
     assert SpeechBoundaryJaBackend(SpeechBoundaryJaConfig()).signature()["scorer_checkpoint"] == ""
-

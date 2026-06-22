@@ -125,7 +125,7 @@ def test_asr_stage_env_scope_passes_boundary_refiner_flags(monkeypatch, tmp_path
         keep_temp_files=True,
         advanced={
             "BOUNDARY_REFINER_DEVICE": "cpu",
-            "SPEECH_BOUNDARY_JA_SPLIT_THRESHOLD": "0.6",
+            "SPEECH_BOUNDARY_JA_SPLIT_TARGET_S": "4.5",
             "SPEECH_BOUNDARY_JA_DROP_GAP_THRESHOLD": "0.8",
         },
     )
@@ -143,7 +143,7 @@ def test_asr_stage_env_scope_passes_boundary_refiner_flags(monkeypatch, tmp_path
 
     def fake_transcribe_and_align(_audio_path, _device, on_stage=None, include_details=False):
         seen["device"] = main.os.environ.get("BOUNDARY_REFINER_DEVICE")
-        seen["split_threshold"] = main.os.environ.get("SPEECH_BOUNDARY_JA_SPLIT_THRESHOLD")
+        seen["split_target_s"] = main.os.environ.get("SPEECH_BOUNDARY_JA_SPLIT_TARGET_S")
         seen["drop_gap_threshold"] = main.os.environ.get("SPEECH_BOUNDARY_JA_DROP_GAP_THRESHOLD")
         return (
             [{"start": 0.0, "end": 1.0, "text": "こんにちは"}],
@@ -162,7 +162,7 @@ def test_asr_stage_env_scope_passes_boundary_refiner_flags(monkeypatch, tmp_path
 
     assert seen == {
         "device": "cpu",
-        "split_threshold": "0.6",
+        "split_target_s": "4.5",
         "drop_gap_threshold": "0.8",
     }
 

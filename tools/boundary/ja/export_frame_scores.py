@@ -61,7 +61,10 @@ def export_frame_scores(*, audio_path: Path, output_path: Path) -> dict[str, Any
         "split_boundary_frame_count": len(split_scores),
         "drop_gap_frame_count": len(drop_gap_scores),
         "threshold": float(result.parameters.get("threshold") or 0.0),
-        "split_threshold": float(result.parameters.get("split_threshold") or 0.0),
+        "split_strategy": result.parameters.get("split_strategy") or "",
+        "split_target_s": float(result.parameters.get("split_target_s") or 0.0),
+        "split_score_quantile": float(result.parameters.get("split_score_quantile") or 0.0),
+        "split_prominence_quantile": float(result.parameters.get("split_prominence_quantile") or 0.0),
         "drop_gap_threshold": float(result.parameters.get("drop_gap_threshold") or 0.0),
         "segments": [
             {"start": float(segment.start), "end": float(segment.end), "score": segment.score}
