@@ -62,7 +62,7 @@ def test_cueqc_cluster_audit_uses_explicit_media_root(tmp_path: Path):
     assert summary["missing_subtitle_videos"] == []
     assert summary["media_by_video"]["AAA"]["audio_exists"] is True
     assert summary["media_roots"] == [audit.project_rel(media_root)]
-    assert summary["cluster_review_audio_render_mode"] == "single_player_lazy"
+    assert summary["cluster_review_audio_render_mode"] == "per_chunk_inline_audio"
     assert summary["cluster_seed_action_options"] == ["use_seed", "mixed_skip", "skip"]
     assert summary["cluster_training_label_rule"].startswith("only seed_action=use_seed")
     assert "baseline_root" not in summary
@@ -70,9 +70,10 @@ def test_cueqc_cluster_audit_uses_explicit_media_root(tmp_path: Path):
     assert "playChunkBtn" in html
     assert "playContextBtn" in html
     assert "data-play-sample" in html
+    assert "data-inline-audio" in html
     assert "clusterSeedActionButtons" in html
     assert "mixed_skip" in html
-    assert "单播放器懒加载" in html
+    assert "每条独立播放器" in html
     assert 'document.createElement("audio")' not in html
     assert "keep" in html
     assert "drop" in html
