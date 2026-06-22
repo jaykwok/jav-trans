@@ -492,6 +492,9 @@ a {{ color: var(--accent); text-decoration: none; }}
 .cluster-audio-meta {{ color: var(--muted); font-size: 12px; white-space: pre-wrap; overflow-wrap: anywhere; }}
 .cluster-audio-text {{ white-space: pre-wrap; overflow-wrap: anywhere; }}
 .cluster-audio-actions {{ display: flex; flex-wrap: wrap; gap: 8px; }}
+.cluster-inline-player {{ display: grid; gap: 6px; }}
+.cluster-inline-player audio {{ width: 100%; height: 32px; }}
+.cluster-inline-status {{ color: var(--muted); font-size: 12px; min-height: 16px; }}
 .legacy-ui[hidden] {{ display: none !important; }}
 #labelStatus {{ min-height: 18px; margin: 8px 0 0; }}
 textarea {{ width: 100%; min-height: 80px; border: 1px solid var(--line); border-radius: 6px; padding: 8px; resize: vertical; }}
@@ -858,22 +861,27 @@ function renderClusterAudioList(entry) {{
   const visibleCount = clusterAudioVisibleCount(entry.clusterId, examples.length);
   const count = document.createElement("div");
   count.className = "meta";
-  count.textContent = `共 ${{examples.length}} 条音频 · 当前显示 ${{visibleCount}} 条 · 单播放器懒加载`;
+  count.textContent = `共 ${{examples.length}} 条音频 · 当前显示 ${{visibleCount}} 条 · 每条独立播放器`;
   root.appendChild(count);
   for (const row of examples.slice(0, visibleCount)) {{
     const info = row.media || {{}};
+    const sampleId = escapeHtml(row.sample_id);
     const card = document.createElement("div");
     card.className = "cluster-audio-card";
     card.innerHTML = `
       <div class="cluster-audio-head">
         <strong>${{escapeHtml(row.video_label || row.video_id || "")}} · chunk ${{escapeHtml(row.chunk_index)}} · ${{Number(row.duration_s || 0).toFixed(2)}}s</strong>
-        <span class="meta">${{escapeHtml(row.sample_id)}}</span>
+        <span class="meta">${{sampleId}}</span>
       </div>
       <div class="cluster-audio-meta">${{fmt(row.start)}} - ${{fmt(row.end)}}${{info.audio_url ? "" : " · 音频缺失"}}${{info.vtt_url ? "" : " · 字幕缺失"}}</div>
       <div class="cluster-audio-actions">
-        <button class="primary" type="button" data-play-sample="${{escapeHtml(row.sample_id)}}" data-play-mode="chunk"${{info.audio_url ? "" : " disabled"}}>播放 chunk</button>
-        <button type="button" data-play-sample="${{escapeHtml(row.sample_id)}}" data-play-mode="context"${{info.audio_url ? "" : " disabled"}}>播放上下文</button>
-        <button type="button" data-open-sample="${{escapeHtml(row.sample_id)}}">打开详情</button>
+        <button class="primary" type="button" data-play-sample="${{sampleId}}" data-play-mode="chunk"${{info.audio_url ? "" : " disabled"}}>播放 chunk</button>
+        <button type="button" data-play-sample="${{sampleId}}" data-play-mode="context"${{info.audio_url ? "" : " disabled"}}>播放上下文</button>
+        <button type="button" data-open-sample="${{sampleId}}">打开详情</button>
+      </div>
+      <div class="cluster-inline-player">
+        <audio controls preload="none" data-inline-audio="${{sampleId}}" src="${{escapeHtml(info.audio_url || "")}}"></audio>
+        <div class="cluster-inline-status" data-inline-status="${{sampleId}}"></div>
       </div>
       <div class="cluster-audio-text">${{escapeHtml(row.text_preview || row.text || row.raw_text || "(empty)")}}</div>
     `;
@@ -896,11 +904,72 @@ function renderClusterAudioList(entry) {{
     button.onclick = () => {{
       const sampleId = button.getAttribute("data-play-sample") || "";
       const mode = button.getAttribute("data-play-mode") || "chunk";
-      selectSample(sampleId, false);
-      setTimeout(() => playCurrent(mode), 0);
+      playInlineAudio(sampleId, mode);
     }};
   }});
 }}
+function stopOtherInlineAudio(activeAudio) {{
+  document.querySelectorAll("[data-inline-audio]").forEach(audio => {{
+    if (audio !== activeAudio) audio.pause();
+  }});
+}}
+function inlineAudioForSample(sampleId) {{
+  return Array.from(document.querySelectorAll("[data-inline-audio]")).find(
+    audio => audio.getAttribute("data-inline-audio") === sampleId
+  );
+}}
+function inlineStatusForSample(sampleId) {{
+  return Array.from(document.querySelectorAll("[data-inline-status]")).find(
+    node => node.getAttribute("data-inline-status") === sampleId
+  );
+}}
+function playInlineAudio(sampleId, mode) {{
+  const row = ROWS.find(item => item.sample_id === sampleId);
+  if (!row) return;
+  const audio = inlineAudioForSample(sampleId);
+  const status = inlineStatusForSample(sampleId);
+  if (!audio) return;
+  const info = row.media || {{}};
+  if (!info.audio_url) {{
+    if (status) status.textContent = "音频文件未找到。";
+    return;
+  }}
+  stopOtherInlineAudio(audio);
+  const start = mode === "context" ? Number(row.context_start ?? row.start ?? 0) : Number(row.start ?? 0);
+  const end = mode === "context" ? Number(row.context_end ?? row.end ?? start) : Number(row.end ?? start);
+  audio.dataset.stopAt = Number.isFinite(end) ? String(end) : "";
+  audio.dataset.sampleId = sampleId;
+  audio.dataset.playMode = mode;
+  const begin = () => {{
+    try {{ audio.currentTime = Number.isFinite(start) ? start : 0; }} catch (_) {{}}
+    if (status) status.textContent = `${{mode === "context" ? "上下文" : "chunk"}} ${{fmt(start)}} - ${{fmt(end)}}`;
+    const promise = audio.play();
+    if (promise && promise.catch) {{
+      promise.catch(err => {{
+        if (status) status.textContent = `播放失败：${{err && err.message ? err.message : err}}`;
+      }});
+    }}
+  }};
+  if (audio.readyState < 1) {{
+    audio.addEventListener("loadedmetadata", begin, {{once: true}});
+    audio.load();
+  }} else {{
+    begin();
+  }}
+}}
+document.addEventListener("timeupdate", event => {{
+  const audio = event.target;
+  if (!(audio instanceof HTMLAudioElement) || !audio.matches("[data-inline-audio]")) return;
+  const stopAt = Number(audio.dataset.stopAt || 0);
+  if (stopAt > 0 && !audio.paused && audio.currentTime >= stopAt) audio.pause();
+}}, true);
+document.addEventListener("error", event => {{
+  const audio = event.target;
+  if (!(audio instanceof HTMLAudioElement) || !audio.matches("[data-inline-audio]")) return;
+  const sampleId = audio.getAttribute("data-inline-audio") || "";
+  const status = inlineStatusForSample(sampleId);
+  if (status) status.textContent = "媒体无法加载。";
+}}, true);
 function renderClusterDetail() {{
   const entry = getActiveClusterEntry();
   if (!entry) return;
@@ -1440,8 +1509,8 @@ def build_audit(
             "cluster_review_enabled": True,
             "cluster_review_group_count": len(summaries),
             "cluster_review_examples_per_cluster": 3,
-            "cluster_review_layout": "left_nav_single_cluster_single_player_lazy_v3",
-            "cluster_review_audio_render_mode": "single_player_lazy",
+            "cluster_review_layout": "left_nav_single_cluster_inline_players_v4",
+            "cluster_review_audio_render_mode": "per_chunk_inline_audio",
             "cluster_audio_page_size": 80,
             "cluster_review_scope": "natural_clusters_including_noise",
             "training_label_fields": ["display_decision"],
