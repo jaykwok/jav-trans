@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Generate a CueQC v3-Fusion false-drop audit page."""
+"""Generate a CueQC v4 binary false-drop audit page."""
 from __future__ import annotations
 
 import argparse
@@ -50,7 +50,7 @@ def _confidence_bin(row: Mapping[str, Any]) -> str:
     return "drop_091_plus"
 
 
-def _text_bucket(row: Mapping[str, Any]) -> str:
+def _text_observation_bucket(row: Mapping[str, Any]) -> str:
     text = str(row.get("text") or "").strip()
     compact = text.replace("…", ".").replace("・", "").strip()
     if not compact or set(compact) <= {".", "!", "?", "。", "、", " "}:
@@ -68,7 +68,7 @@ def _sample_round_robin(rows: list[dict[str, Any]], *, limit: int, seed: int) ->
     rng = random.Random(seed)
     groups: dict[tuple[str, str, str], list[dict[str, Any]]] = defaultdict(list)
     for row in rows:
-        key = (str(row.get("video_id") or ""), _confidence_bin(row), _text_bucket(row))
+        key = (str(row.get("video_id") or ""), _confidence_bin(row), _text_observation_bucket(row))
         groups[key].append(row)
     for bucket in groups.values():
         bucket.sort(
@@ -120,9 +120,9 @@ def _row_key(row: Mapping[str, Any]) -> str:
 
 
 def _risk_bucket(row: Mapping[str, Any]) -> str:
-    text_bucket = _text_bucket(row)
-    if text_bucket in {"punct_or_empty", "short_text"}:
-        return f"text:{text_bucket}"
+    text_observation_bucket = _text_observation_bucket(row)
+    if text_observation_bucket in {"punct_or_empty", "short_text"}:
+        return f"text:{text_observation_bucket}"
     compact = str(row.get("text") or "").strip().replace(" ", "")
     if len(compact) >= 3 and len(set(compact)) <= 2:
         return "text:repeated"
@@ -280,7 +280,7 @@ def select_audit_rows(
                 "audit_index": index,
                 "audit_bucket": (
                     f"{reason}:{str(item.get('video_id') or '')}:"
-                    f"{_confidence_bin(item)}:{_text_bucket(item)}:{risk_bucket}"
+                    f"{_confidence_bin(item)}:{_text_observation_bucket(item)}:{risk_bucket}"
                 ),
                 "audit_sample_reason": reason,
                 "audit_sampling_policy": sampling_policy,
@@ -857,7 +857,7 @@ def build_audit(
             "risk_fraction": risk_fraction,
             "random_fraction": round(max(0.0, 1.0 - high_confidence_fraction - near_threshold_fraction - risk_fraction), 6),
             "seed": seed,
-            "strata": ["video_id", "drop_confidence_bin", "text_bucket", "audit_sample_reason"],
+            "strata": ["video_id", "drop_confidence_bin", "text_observation_bucket", "audit_sample_reason"],
         },
         "media_enabled": True,
         "media_mode": "audio",

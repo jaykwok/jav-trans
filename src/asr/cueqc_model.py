@@ -1,4 +1,4 @@
-"""CueQC Mamba v3-Fusion — display (keep/drop) classifier.
+"""CueQC Mamba v4 binary keep/drop classifier.
 
 Four feature arms fused into a 2-way display decision:
 
@@ -12,7 +12,7 @@ Concat → fusion MLP → display logits [B, 2]. Label convention: ``0 = drop``,
 
 Pooling is masked mean + max (NOT last hidden) — candidate lengths vary, so the
 last valid frame would be padding-contaminated and display quality depends on
-the whole segment, not the final frame (v3-Fusion design §1).
+the whole segment, not the final frame.
 """
 from __future__ import annotations
 
@@ -132,8 +132,8 @@ class _MlpArm(nn.Module):
         return self.net(self.norm(x))
 
 
-class CueQCMambaV3Fusion(nn.Module):
-    """CueQC v3-Fusion display classifier (4 arms → fusion → [B, 2])."""
+class CueQCMambaV4Binary(nn.Module):
+    """CueQC v4 binary classifier (4 arms -> fusion -> [B, 2])."""
 
     def __init__(
         self,
@@ -199,7 +199,7 @@ class CueQCMambaV3Fusion(nn.Module):
         )
 
         self.model_config: dict[str, Any] = {
-            "model_type": "CueQCMambaV3Fusion",
+            "model_type": "CueQCMambaV4Binary",
             "asr_dim": self.asr_dim,
             "token_dim": self.token_dim,
             "decoder_dim": self.decoder_dim,

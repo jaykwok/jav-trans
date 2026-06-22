@@ -28,7 +28,7 @@ DEFAULT_ASR_BATCH_SIZE_BY_REPO_ENV = ",".join(
     f"{repo_id}={batch_size}"
     for repo_id, batch_size in DEFAULT_QWEN_ASR_BATCH_SIZE_BY_REPO.items()
 )
-DEFAULT_SPEECH_BOUNDARY_OPERATING_POINT = "qwen-feature-energy-bootstrap-v1"
+DEFAULT_SPEECH_BOUNDARY_OPERATING_POINT = "qwen-mamba2-frame-boundary-scorer-v4"
 
 
 @dataclass(frozen=True)
@@ -208,10 +208,6 @@ def configure_env(args: argparse.Namespace) -> None:
     else:
         os.environ.pop("CUEQC_MODEL_PATH_BY_REPO", None)
     os.environ["CUEQC_INFERENCE_BATCH_SIZE"] = str(args.cueqc_inference_batch_size)
-    os.environ["BOUNDARY_PLANNER_MAX_CORE_CHUNK_S"] = str(args.boundary_planner_max_core_chunk_s)
-    os.environ["BOUNDARY_PLANNER_TARGET_CHUNK_S"] = str(args.boundary_planner_target_chunk_s)
-    os.environ["BOUNDARY_PLANNER_MIN_CHUNK_S"] = str(args.boundary_planner_min_chunk_s)
-    os.environ["BOUNDARY_PLANNER_MAX_SPLITS_PER_SEGMENT"] = str(args.boundary_planner_max_splits_per_segment)
     os.environ["BOUNDARY_PLANNER_SEQUENCE_BATCH_SIZE"] = str(args.boundary_planner_sequence_batch_size)
     os.environ["KEEP_ASR_CHUNKS"] = "1" if args.keep_asr_chunks else "0"
     os.environ["BOUNDARY_CACHE_ENABLED"] = "1" if args.boundary_cache else "0"
@@ -219,6 +215,13 @@ def configure_env(args: argparse.Namespace) -> None:
     os.environ["SPEECH_BOUNDARY_JA_SPEECH_ON_THRESHOLD"] = str(args.speech_boundary_speech_on_threshold)
     os.environ["SPEECH_BOUNDARY_JA_SPEECH_OFF_THRESHOLD"] = str(args.speech_boundary_speech_off_threshold)
     os.environ["SPEECH_BOUNDARY_JA_FRAME_DILATION_S"] = str(args.speech_boundary_frame_dilation_s)
+    os.environ["SPEECH_BOUNDARY_JA_DROP_GAP_THRESHOLD"] = str(args.speech_boundary_drop_gap_threshold)
+    os.environ["SPEECH_BOUNDARY_JA_SPLIT_THRESHOLD"] = str(args.speech_boundary_split_threshold)
+    os.environ["SPEECH_BOUNDARY_JA_SPLIT_PROMINENCE"] = str(args.speech_boundary_split_prominence)
+    os.environ["SPEECH_BOUNDARY_JA_SPLIT_SMOOTH_S"] = str(args.speech_boundary_split_smooth_s)
+    os.environ["SPEECH_BOUNDARY_JA_SPLIT_NMS_S"] = str(args.speech_boundary_split_nms_s)
+    os.environ["SPEECH_BOUNDARY_JA_SPLIT_SNAP_S"] = str(args.speech_boundary_split_snap_s)
+    os.environ["SPEECH_BOUNDARY_JA_MIN_SPLIT_SEGMENT_S"] = str(args.speech_boundary_min_split_segment_s)
     os.environ["SPEECH_BOUNDARY_JA_PTM"] = args.speech_boundary_ptm
     if str(args.speech_boundary_model_path or "").strip():
         os.environ["SPEECH_BOUNDARY_JA_MODEL_PATH"] = project_path_value(args.speech_boundary_model_path)
@@ -236,8 +239,6 @@ def configure_env(args: argparse.Namespace) -> None:
     os.environ["SPEECH_BOUNDARY_JA_WINDOW_S"] = str(args.speech_boundary_window_s)
     os.environ["SPEECH_BOUNDARY_JA_OVERLAP_S"] = str(args.speech_boundary_overlap_s)
     os.environ["SPEECH_BOUNDARY_JA_MIN_SEGMENT_S"] = str(args.speech_boundary_min_segment_s)
-    os.environ["SPEECH_BOUNDARY_JA_CUT_THRESHOLD"] = str(args.speech_boundary_cut_threshold)
-    os.environ["SPEECH_BOUNDARY_JA_APPLY_CUT_TO_SPEECH"] = "1" if args.speech_boundary_apply_cut_to_speech else "0"
     os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
 
@@ -265,13 +266,6 @@ def build_context(*, args: argparse.Namespace, paths: RunPaths, video: Path):
         "BOUNDARY_REFINER_DEVICE": os.getenv("BOUNDARY_REFINER_DEVICE", "auto"),
         "CUEQC_MODEL_PATH_BY_REPO": os.getenv("CUEQC_MODEL_PATH_BY_REPO", ""),
         "CUEQC_INFERENCE_BATCH_SIZE": os.getenv("CUEQC_INFERENCE_BATCH_SIZE", "64"),
-        "BOUNDARY_PLANNER_MAX_CORE_CHUNK_S": os.getenv(
-            "BOUNDARY_PLANNER_MAX_CORE_CHUNK_S",
-            "5.0",
-        ),
-        "BOUNDARY_PLANNER_TARGET_CHUNK_S": os.getenv("BOUNDARY_PLANNER_TARGET_CHUNK_S", "3.0"),
-        "BOUNDARY_PLANNER_MIN_CHUNK_S": os.getenv("BOUNDARY_PLANNER_MIN_CHUNK_S", "0.4"),
-        "BOUNDARY_PLANNER_MAX_SPLITS_PER_SEGMENT": os.getenv("BOUNDARY_PLANNER_MAX_SPLITS_PER_SEGMENT", "16"),
         "BOUNDARY_PLANNER_SEQUENCE_BATCH_SIZE": os.getenv("BOUNDARY_PLANNER_SEQUENCE_BATCH_SIZE", "256"),
         "QUALITY_REPORT_ENABLED": "1",
         "QUALITY_REPORT_DIR": str(paths.root / "quality_reports"),
@@ -284,6 +278,13 @@ def build_context(*, args: argparse.Namespace, paths: RunPaths, video: Path):
         "SPEECH_BOUNDARY_JA_SPEECH_ON_THRESHOLD": str(args.speech_boundary_speech_on_threshold),
         "SPEECH_BOUNDARY_JA_SPEECH_OFF_THRESHOLD": str(args.speech_boundary_speech_off_threshold),
         "SPEECH_BOUNDARY_JA_FRAME_DILATION_S": str(args.speech_boundary_frame_dilation_s),
+        "SPEECH_BOUNDARY_JA_DROP_GAP_THRESHOLD": str(args.speech_boundary_drop_gap_threshold),
+        "SPEECH_BOUNDARY_JA_SPLIT_THRESHOLD": str(args.speech_boundary_split_threshold),
+        "SPEECH_BOUNDARY_JA_SPLIT_PROMINENCE": str(args.speech_boundary_split_prominence),
+        "SPEECH_BOUNDARY_JA_SPLIT_SMOOTH_S": str(args.speech_boundary_split_smooth_s),
+        "SPEECH_BOUNDARY_JA_SPLIT_NMS_S": str(args.speech_boundary_split_nms_s),
+        "SPEECH_BOUNDARY_JA_SPLIT_SNAP_S": str(args.speech_boundary_split_snap_s),
+        "SPEECH_BOUNDARY_JA_MIN_SPLIT_SEGMENT_S": str(args.speech_boundary_min_split_segment_s),
         "SPEECH_BOUNDARY_JA_PTM": args.speech_boundary_ptm,
         "SPEECH_BOUNDARY_JA_MODEL_PATH": project_path_value(args.speech_boundary_model_path),
         "SPEECH_BOUNDARY_JA_DEVICE": args.speech_boundary_device,
@@ -299,8 +300,6 @@ def build_context(*, args: argparse.Namespace, paths: RunPaths, video: Path):
         "SPEECH_BOUNDARY_JA_WINDOW_S": str(args.speech_boundary_window_s),
         "SPEECH_BOUNDARY_JA_OVERLAP_S": str(args.speech_boundary_overlap_s),
         "SPEECH_BOUNDARY_JA_MIN_SEGMENT_S": str(args.speech_boundary_min_segment_s),
-        "SPEECH_BOUNDARY_JA_CUT_THRESHOLD": str(args.speech_boundary_cut_threshold),
-        "SPEECH_BOUNDARY_JA_APPLY_CUT_TO_SPEECH": "1" if args.speech_boundary_apply_cut_to_speech else "0",
         "KEEP_ASR_CHUNKS": "1" if args.keep_asr_chunks else "0",
     }
     spec = SimpleNamespace(
@@ -340,7 +339,6 @@ def run_video(args: argparse.Namespace, paths: RunPaths, video: Path) -> dict[st
         f"=== START {video.name} label={args.label} "
         f"boundary=speech_boundary_ja speech_on={args.speech_boundary_speech_on_threshold:g} "
         f"speech_off={args.speech_boundary_speech_off_threshold:g} "
-        f"cut={args.speech_boundary_cut_threshold:g} "
         f"asr={args.asr_backend} ===",
         flush=True,
     )
@@ -425,18 +423,19 @@ def write_summary(paths: RunPaths, args: argparse.Namespace, results: list[dict[
         "speech_boundary_threshold": args.speech_boundary_threshold,
         "speech_boundary_speech_on_threshold": args.speech_boundary_speech_on_threshold,
         "speech_boundary_speech_off_threshold": args.speech_boundary_speech_off_threshold,
-        "speech_boundary_cut_threshold": args.speech_boundary_cut_threshold,
-        "speech_boundary_apply_cut_to_speech": bool(args.speech_boundary_apply_cut_to_speech),
         "speech_boundary_frame_dilation_s": args.speech_boundary_frame_dilation_s,
+        "speech_boundary_drop_gap_threshold": args.speech_boundary_drop_gap_threshold,
+        "speech_boundary_split_threshold": args.speech_boundary_split_threshold,
+        "speech_boundary_split_prominence": args.speech_boundary_split_prominence,
+        "speech_boundary_split_smooth_s": args.speech_boundary_split_smooth_s,
+        "speech_boundary_split_nms_s": args.speech_boundary_split_nms_s,
+        "speech_boundary_split_snap_s": args.speech_boundary_split_snap_s,
+        "speech_boundary_min_split_segment_s": args.speech_boundary_min_split_segment_s,
         "speech_boundary_scorer_checkpoint_by_repo": args.speech_boundary_scorer_checkpoint_by_repo,
         "asr_batch_size": args.asr_batch_size,
         "cueqc_inference_batch_size": args.cueqc_inference_batch_size,
         "boundary_planner": {
             "feature_frame_hop_s": args.boundary_feature_frame_hop_s,
-            "max_core_chunk_s": args.boundary_planner_max_core_chunk_s,
-            "target_chunk_s": args.boundary_planner_target_chunk_s,
-            "min_chunk_s": args.boundary_planner_min_chunk_s,
-            "max_splits_per_segment": args.boundary_planner_max_splits_per_segment,
             "sequence_batch_size": args.boundary_planner_sequence_batch_size,
         },
         "translate": bool(args.translate),
@@ -453,9 +452,9 @@ def write_summary(paths: RunPaths, args: argparse.Namespace, results: list[dict[
         (
             f"- Boundary: `speech_boundary_ja` speech on/off "
             f"`{args.speech_boundary_speech_on_threshold:g}` / "
-            f"`{args.speech_boundary_speech_off_threshold:g}`, cut "
-            f"`{args.speech_boundary_cut_threshold:g}`, frame dilation "
-            f"`{args.speech_boundary_frame_dilation_s:g}s`"
+            f"`{args.speech_boundary_speech_off_threshold:g}`, "
+            f"frame dilation `{args.speech_boundary_frame_dilation_s:g}s`, "
+            f"split `{args.speech_boundary_split_threshold:g}`, drop_gap `{args.speech_boundary_drop_gap_threshold:g}`"
         ),
         f"- Translation: `{'on' if args.translate else 'off'}`",
         f"- Runtime root: `{project_rel(paths.root)}`",
@@ -520,24 +519,20 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--boundary-refiner-model-path-by-repo",
         default=os.getenv("BOUNDARY_REFINER_MODEL_PATH_BY_REPO", ""),
-        help="Required repo-id checkpoint map: '<repo_id>=<boundary_refiner.pt>[,<repo_id>=...]'.",
+        help="Required repo-id checkpoint map: '<repo_id>=<boundary_edge_refiner_v6.pt>[,<repo_id>=...]'.",
     )
     parser.add_argument(
         "--cueqc-model-path-by-repo",
         default=os.getenv("CUEQC_MODEL_PATH_BY_REPO", ""),
-        help="Required repo-id checkpoint map: '<repo_id>=<cueqc.pt>[,<repo_id>=...]'.",
+        help="Required repo-id checkpoint map: '<repo_id>=<cueqc_mamba_v4_binary.pt>[,<repo_id>=...]'.",
     )
     parser.add_argument(
         "--cueqc-inference-batch-size",
         type=int,
         default=_env_int("CUEQC_INFERENCE_BATCH_SIZE", 64),
-        help="CueQC v3-Fusion inference batch size.",
+        help="CueQC v4 binary inference batch size.",
     )
     parser.add_argument("--boundary-refiner-device", default=os.getenv("BOUNDARY_REFINER_DEVICE", "auto"))
-    parser.add_argument("--boundary-planner-max-core-chunk-s", type=float, default=_env_float("BOUNDARY_PLANNER_MAX_CORE_CHUNK_S", 5.0))
-    parser.add_argument("--boundary-planner-target-chunk-s", type=float, default=_env_float("BOUNDARY_PLANNER_TARGET_CHUNK_S", 3.0))
-    parser.add_argument("--boundary-planner-min-chunk-s", type=float, default=_env_float("BOUNDARY_PLANNER_MIN_CHUNK_S", 0.4))
-    parser.add_argument("--boundary-planner-max-splits-per-segment", type=int, default=_env_int("BOUNDARY_PLANNER_MAX_SPLITS_PER_SEGMENT", 16))
     parser.add_argument("--boundary-planner-sequence-batch-size", type=int, default=_env_int("BOUNDARY_PLANNER_SEQUENCE_BATCH_SIZE", 256))
     parser.add_argument("--keep-asr-chunks", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--boundary-cache", action=argparse.BooleanOptionalAction, default=_env_bool("BOUNDARY_CACHE_ENABLED", True))
@@ -557,6 +552,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Speech deactivation threshold. Defaults to --speech-boundary-threshold.",
     )
     parser.add_argument("--speech-boundary-frame-dilation-s", dest="speech_boundary_frame_dilation_s", type=float, default=_env_float("SPEECH_BOUNDARY_JA_FRAME_DILATION_S", 0.2))
+    parser.add_argument("--speech-boundary-drop-gap-threshold", dest="speech_boundary_drop_gap_threshold", type=float, default=_env_float("SPEECH_BOUNDARY_JA_DROP_GAP_THRESHOLD", 0.75))
+    parser.add_argument("--speech-boundary-split-threshold", dest="speech_boundary_split_threshold", type=float, default=_env_float("SPEECH_BOUNDARY_JA_SPLIT_THRESHOLD", 0.55))
+    parser.add_argument("--speech-boundary-split-prominence", dest="speech_boundary_split_prominence", type=float, default=_env_float("SPEECH_BOUNDARY_JA_SPLIT_PROMINENCE", 0.08))
+    parser.add_argument("--speech-boundary-split-smooth-s", dest="speech_boundary_split_smooth_s", type=float, default=_env_float("SPEECH_BOUNDARY_JA_SPLIT_SMOOTH_S", 0.08))
+    parser.add_argument("--speech-boundary-split-nms-s", dest="speech_boundary_split_nms_s", type=float, default=_env_float("SPEECH_BOUNDARY_JA_SPLIT_NMS_S", 0.20))
+    parser.add_argument("--speech-boundary-split-snap-s", dest="speech_boundary_split_snap_s", type=float, default=_env_float("SPEECH_BOUNDARY_JA_SPLIT_SNAP_S", 0.10))
+    parser.add_argument("--speech-boundary-min-split-segment-s", dest="speech_boundary_min_split_segment_s", type=float, default=_env_float("SPEECH_BOUNDARY_JA_MIN_SPLIT_SEGMENT_S", 0.08))
     parser.add_argument(
         "--speech-boundary-ptm",
         dest="speech_boundary_ptm",
@@ -574,7 +576,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         dest="speech_boundary_scorer_checkpoint_by_repo",
         default=os.getenv("SPEECH_BOUNDARY_JA_SCORER_CHECKPOINT_BY_REPO", ""),
         help=(
-            "Optional repo-id scorer map: '<repo_id>=<speech_boundary_ja_feature_scorer.pt>'"
+            "Optional repo-id scorer map: '<repo_id>=<speech_boundary_ja_frame_boundary_scorer_v4.pt>'"
             "[,<repo_id>=...]'. Empty uses the registered repo-id scorer when available."
         ),
     )
@@ -586,13 +588,6 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--speech-boundary-window-s", dest="speech_boundary_window_s", type=float, default=_env_float("SPEECH_BOUNDARY_JA_WINDOW_S", 30.0))
     parser.add_argument("--speech-boundary-overlap-s", dest="speech_boundary_overlap_s", type=float, default=_env_float("SPEECH_BOUNDARY_JA_OVERLAP_S", 1.0))
     parser.add_argument("--speech-boundary-min-segment-s", dest="speech_boundary_min_segment_s", type=float, default=_env_float("SPEECH_BOUNDARY_JA_MIN_SEGMENT_S", 0.05))
-    parser.add_argument("--speech-boundary-cut-threshold", dest="speech_boundary_cut_threshold", type=float, default=_env_float("SPEECH_BOUNDARY_JA_CUT_THRESHOLD", 0.500))
-    parser.add_argument(
-        "--speech-boundary-apply-cut-to-speech",
-        dest="speech_boundary_apply_cut_to_speech",
-        action=argparse.BooleanOptionalAction,
-        default=_env_bool("SPEECH_BOUNDARY_JA_APPLY_CUT_TO_SPEECH", True),
-    )
     args = parser.parse_args(argv)
     if args.speech_boundary_speech_on_threshold is None:
         args.speech_boundary_speech_on_threshold = args.speech_boundary_threshold
@@ -612,12 +607,21 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         parser.error("--speech-boundary-speech-on-threshold must be >= --speech-boundary-speech-off-threshold")
     if args.speech_boundary_frame_dilation_s < 0:
         parser.error("--speech-boundary-frame-dilation-s must be non-negative")
+    for name in (
+        "speech_boundary_drop_gap_threshold",
+        "speech_boundary_split_threshold",
+        "speech_boundary_split_prominence",
+        "speech_boundary_split_smooth_s",
+        "speech_boundary_split_nms_s",
+        "speech_boundary_split_snap_s",
+        "speech_boundary_min_split_segment_s",
+    ):
+        if getattr(args, name) < 0:
+            parser.error(f"--{name.replace('_', '-')} must be non-negative")
     if args.speech_boundary_window_s <= 0:
         parser.error("--speech-boundary-window-s must be positive")
     if args.speech_boundary_overlap_s < 0 or args.speech_boundary_overlap_s >= args.speech_boundary_window_s:
         parser.error("--speech-boundary-overlap-s must be non-negative and smaller than window")
-    if args.speech_boundary_cut_threshold < 0:
-        parser.error("--speech-boundary-cut-threshold must be non-negative")
     if args.boundary_planner_sequence_batch_size <= 0:
         parser.error("--boundary-planner-sequence-batch-size must be positive")
     if args.cueqc_inference_batch_size <= 0:

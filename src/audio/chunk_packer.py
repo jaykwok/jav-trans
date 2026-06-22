@@ -3,7 +3,6 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Sequence
 
-from boundary.features import make_feature_bundle
 from boundary.planner import (
     BoundarySequenceFeatureProvider,
     BoundaryPlannerConfig,
@@ -46,41 +45,23 @@ def pack_speech_segments(
     segments: Sequence[SpeechSegment],
     *,
     frame_hop_s: float = 1.0 / 29.97,
-    max_core_chunk_s: float = 5.0,
-    target_chunk_s: float = 3.0,
-    min_chunk_s: float = 0.4,
-    frame_scores: Sequence[float] | None = None,
-    score_frame_hop_s: float | None = None,
-    cut_frame_scores: Sequence[float] | None = None,
     sequence_boundary_refiner: SequenceBoundaryRefiner | None = None,
     sequence_feature_provider: BoundarySequenceFeatureProvider | None = None,
-    max_splits_per_segment: int = 16,
     sequence_batch_size: int = 256,
 ) -> list[PackedChunk]:
-    """Convert Boundary Planner output into ASR speech-core chunks.
+    """Convert scorer-produced speech islands into ASR chunks.
 
-    Candidate extraction, refiner scoring, and constrained planning live under
-    ``src/boundary``. This module only preserves the ASR-facing PackedChunk
-    contract and applies learned core boundary deltas.
+    Scorer v4 is the only island splitter. The planner no longer creates
+    duration-driven splits or secondary boundary candidates; Boundary Refiner v6
+    may only adjust the start/end of already-planned island chunks.
     """
 
-    score_hop = score_frame_hop_s if score_frame_hop_s is not None else frame_hop_s
-    features = make_feature_bundle(
-        frame_hop_s=score_hop,
-        speech_scores=frame_scores,
-        cut_scores=cut_frame_scores,
-    )
     planner_config = BoundaryPlannerConfig(
         frame_hop_s=frame_hop_s,
-        max_core_chunk_s=max_core_chunk_s,
-        target_chunk_s=target_chunk_s,
-        min_chunk_s=min_chunk_s,
-        max_splits_per_segment=max_splits_per_segment,
         sequence_batch_size=sequence_batch_size,
     )
     planned = plan_boundary_chunks(
         segments,
-        features=features,
         config=planner_config,
         sequence_refiner=sequence_boundary_refiner,
         sequence_feature_provider=sequence_feature_provider,
@@ -147,8 +128,6 @@ def _make_chunk(
         next_decision=boundary_decision,
         min_core_s=layout.min_core_s,
     )
-    if any(island.split_left or island.split_right for island in islands):
-        split_reason = "boundary_candidate" if split_reason == "tail" else split_reason
 
     boundary_scores = [
         float(island.boundary_score)
@@ -170,12 +149,8 @@ def _make_chunk(
         core_end=core_end,
         internal_gap_count=_internal_gap_count(islands),
         internal_gap_max_s=_internal_gap_max_s(islands),
-        boundary_score=(
-            max(boundary_scores) if boundary_scores else None
-        ),
-        boundary_reason=(
-            ",".join(sorted(set(boundary_reasons)))
-        ),
+        boundary_score=(max(boundary_scores) if boundary_scores else None),
+        boundary_reason=(",".join(sorted(set(boundary_reasons)))),
         boundary_source=",".join(sorted(set(boundary_sources))),
         boundary_start_refine_delta_s=applied_start_delta_s,
         boundary_end_refine_delta_s=applied_end_delta_s,

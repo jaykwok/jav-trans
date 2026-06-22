@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run CueQC v3-Fusion inference on a feature bundle and export pseudo labels."""
+"""Run CueQC v4 binary inference on a feature bundle and export pseudo labels."""
 from __future__ import annotations
 
 import argparse
@@ -17,8 +17,7 @@ SRC_ROOT = PROJECT_ROOT / "src"
 if str(SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(SRC_ROOT))
 
-from asr.cueqc_model import CueQCMambaV3Fusion  # noqa: E402
-from asr.cueqc_thresholds import resolve_drop_threshold  # noqa: E402
+from asr.cueqc_model import CueQCMambaV4Binary  # noqa: E402
 
 
 def _normalize(arr: np.ndarray, mean: np.ndarray, std: np.ndarray) -> np.ndarray:
@@ -49,8 +48,8 @@ def _resolve_device(requested: str) -> torch.device:
     return torch.device(normalized)
 
 
-def _model_from_checkpoint(checkpoint: dict[str, Any], device: torch.device) -> CueQCMambaV3Fusion:
-    if checkpoint.get("schema") != "cueqc_mamba_checkpoint_v3_fusion":
+def _model_from_checkpoint(checkpoint: dict[str, Any], device: torch.device) -> CueQCMambaV4Binary:
+    if checkpoint.get("schema") != "cueqc_mamba_v4_binary":
         raise ValueError(f"unexpected checkpoint schema: {checkpoint.get('schema')!r}")
     model_config = dict(checkpoint.get("model_config") or {})
     valid = {
@@ -58,7 +57,7 @@ def _model_from_checkpoint(checkpoint: dict[str, Any], device: torch.device) -> 
         "hidden_size", "num_layers", "state_size", "num_heads", "head_dim",
         "n_groups", "chunk_size", "mlp_dim", "dropout",
     }
-    model = CueQCMambaV3Fusion(**{key: value for key, value in model_config.items() if key in valid})
+    model = CueQCMambaV4Binary(**{key: value for key, value in model_config.items() if key in valid})
     model.load_state_dict(checkpoint["state_dict"])
     model.to(device)
     model.eval()
@@ -101,15 +100,16 @@ def _write_jsonl(path: Path, rows: list[dict[str, Any]]) -> None:
 def run(args: argparse.Namespace) -> int:
     device = _resolve_device(args.device)
     features = torch.load(args.features, map_location="cpu", weights_only=False)
-    if features.get("schema") != "cueqc_mamba_v3_fusion_features":
+    if features.get("schema") != "cueqc_mamba_v4_binary_features":
         raise ValueError(f"unexpected feature schema: {features.get('schema')!r}")
     checkpoint = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
     model = _model_from_checkpoint(checkpoint, device)
     norm = _normalization(checkpoint)
     decision = dict(checkpoint.get("decision_config") or {})
+    if "drop_threshold_profile" in decision:
+        raise ValueError("CueQC v4 binary checkpoints must not contain decision_config.drop_threshold_profile")
     if args.drop_threshold is not None:
         decision["drop_threshold"] = float(args.drop_threshold)
-        decision.pop("drop_threshold_profile", None)
     drop_threshold = float(decision.get("drop_threshold", 0.85))
     keep_threshold = float(args.keep_threshold)
 
@@ -141,15 +141,11 @@ def run(args: argparse.Namespace) -> int:
                 p_drop = float(prob[0])
                 p_keep = float(prob[1])
                 item_meta = meta[index] if index < len(meta) and isinstance(meta[index], dict) else {}
-                sample_threshold, threshold_info = resolve_drop_threshold(
-                    decision,
-                    text=item_meta.get("text", ""),
-                    default=drop_threshold,
-                )
+                sample_threshold = drop_threshold
                 display = "drop" if p_drop >= sample_threshold else "keep"
                 confidence = p_drop if display == "drop" else p_keep
                 rows.append({
-                    "schema": "cueqc_prediction_v3_fusion_v1",
+                    "schema": "cueqc_prediction_v4_binary_v1",
                     "sample_id": item_meta.get("sample_id", ""),
                     "audio_id": item_meta.get("audio_id", ""),
                     "video_id": item_meta.get("video_id", ""),
@@ -164,22 +160,21 @@ def run(args: argparse.Namespace) -> int:
                     "display_prob_drop": round(p_drop, 6),
                     "display_prob_keep": round(p_keep, 6),
                     "drop_threshold": round(sample_threshold, 6),
-                    "threshold_profile": threshold_info,
                     "keep_threshold": keep_threshold,
-                    "model_version": "cueqc_mamba_v3_fusion",
+                    "model_version": "cueqc_mamba_v4_binary",
                     "decision_version": "cueqc_display_binary_v1",
                 })
 
     pseudo_rows = [
         {
             **row,
-            "schema": "cueqc_pseudo_label_v3_fusion_v1",
+            "schema": "cueqc_pseudo_label_v4_binary_v1",
             "targets": {
                 "display_decision": row["display_hint"],
                 "display_label": 0 if row["display_hint"] == "drop" else 1,
             },
             "label_meta": {
-                "label_source": "cueqc_v3_fusion_pseudo",
+                "label_source": "cueqc_v4_binary_pseudo",
                 "confidence": row["confidence"],
                 "display_prob_drop": row["display_prob_drop"],
                 "display_prob_keep": row["display_prob_keep"],
@@ -200,7 +195,7 @@ def run(args: argparse.Namespace) -> int:
     counts = Counter(str(row["display_hint"]) for row in rows)
     pseudo_counts = Counter(str(row["display_hint"]) for row in pseudo_rows)
     summary = {
-        "schema": "cueqc_prediction_summary_v3_fusion_v1",
+        "schema": "cueqc_prediction_summary_v4_binary_v1",
         "features": str(args.features),
         "checkpoint": str(args.checkpoint),
         "predictions_path": str(predictions_path),
@@ -225,25 +220,17 @@ def run(args: argparse.Namespace) -> int:
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Predict CueQC v3-Fusion keep/drop labels from extracted features.")
-    parser.add_argument("--features", required=True, help="cueqc_mamba_v3_fusion_features .pt bundle")
-    parser.add_argument("--checkpoint", required=True, help="cueqc_mamba_v3_fusion.pt checkpoint")
+    parser = argparse.ArgumentParser(description="Predict CueQC v4 binary keep/drop labels from extracted features.")
+    parser.add_argument("--features", required=True, help="cueqc_mamba_v4_binary_features .pt bundle")
+    parser.add_argument("--checkpoint", required=True, help="cueqc_mamba_v4_binary.pt checkpoint")
     parser.add_argument("--output-dir", required=True)
     parser.add_argument("--device", default="auto")
     parser.add_argument("--batch-size", type=int, default=64)
     parser.add_argument("--drop-threshold", type=float, default=None)
     parser.add_argument("--keep-threshold", type=float, default=0.95)
-    parser.add_argument(
-        "--allow-low-drop-threshold",
-        action="store_true",
-        help="Allow drop thresholds below 0.5 for offline active-learning audits only.",
-    )
     args = parser.parse_args(argv)
-    if args.drop_threshold is not None:
-        min_drop_threshold = 0.0 if args.allow_low_drop_threshold else 0.5
-        if not min_drop_threshold <= args.drop_threshold <= 1.0:
-            interval = "[0.0, 1.0]" if args.allow_low_drop_threshold else "[0.5, 1.0]"
-            parser.error(f"--drop-threshold must be in {interval}")
+    if args.drop_threshold is not None and not 0.0 <= args.drop_threshold <= 1.0:
+        parser.error("--drop-threshold must be in [0.0, 1.0]")
     if not 0.5 <= args.keep_threshold <= 1.0:
         parser.error("--keep-threshold must be in [0.5, 1.0]")
     if args.batch_size <= 0:

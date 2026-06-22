@@ -18,7 +18,7 @@ from asr.backends.qwen import (
 CUEQC_FEATURE_SCHEMA_VERSION = 1
 CUEQC_SHADOW_SCHEMA_VERSION = 1
 CUEQC_DECISION_VERSION = "cueqc_display_binary_v1"
-CUEQC_MODEL_VERSION = "cueqc_mamba_v3_fusion"
+CUEQC_MODEL_VERSION = "cueqc_mamba_v4_binary"
 
 _FALSE_VALUES = {"0", "false", "no", "off", "disabled"}
 _TRUE_VALUES = {"1", "true", "yes", "on", "enabled"}
@@ -300,36 +300,29 @@ def _cue_observation_features(
 ) -> dict[str, Any]:
     char_count = _safe_int(text_features_payload.get("char_count"))
     unique_chars = _safe_int(text_features_payload.get("unique_chars"))
-    kana_only = bool(text_features_payload.get("kana_only"))
-    has_stable = bool(text_features_payload.get("has_stable_vocabulary"))
     repeat = (
         text_features_payload.get("repeat_profile")
         if isinstance(text_features_payload.get("repeat_profile"), Mapping)
         else {}
     )
-    repeat_run = _safe_int(repeat.get("run"))
-    repeat_ratio = _safe_float(repeat.get("ratio"))
-    if char_count <= 0:
-        density_level = "empty_or_punctuation"
-    elif duration_s >= 6.0 and char_count <= 5 and not has_stable:
-        density_level = "long_sparse_text"
-    elif char_count <= 2 and kana_only:
-        density_level = "short_vocalization_candidate"
-    elif repeat_run >= 4 and repeat_ratio >= 0.4 and not has_stable:
-        density_level = "repeated_vocalization_candidate"
-    elif kana_only and char_count <= 5 and not has_stable:
-        density_level = "short_kana_dialogue_candidate"
-    else:
-        density_level = "normal_dialogue_candidate"
     return {
-        "text_density": {
-            "level": density_level,
+        "text_observation": {
             "duration_s": round(duration_s, 3),
             "char_count": char_count,
+            "raw_char_count": _safe_int(text_features_payload.get("raw_char_count")),
             "unique_chars": unique_chars,
+            "unique_ratio": _safe_float(text_features_payload.get("unique_ratio")),
+            "kana_ratio": _safe_float(text_features_payload.get("kana_ratio")),
+            "kanji_ratio": _safe_float(text_features_payload.get("kanji_ratio")),
+            "chars_per_sec": _safe_float(text_features_payload.get("chars_per_sec")),
+            "kana_only": bool(text_features_payload.get("kana_only")),
+            "has_kanji": bool(text_features_payload.get("has_kanji")),
+            "has_latin_or_digit": bool(text_features_payload.get("has_latin_or_digit")),
+            "repeat_run": _safe_int(repeat.get("run")),
+            "repeat_unit_len": _safe_int(repeat.get("unit_len")),
+            "repeat_ratio": _safe_float(repeat.get("ratio")),
         },
         "repeat_profile": dict(repeat),
-        "has_stable_vocabulary": has_stable,
     }
 
 
@@ -356,7 +349,7 @@ def build_candidate(
     )
     sample_id = f"cueqc-{video_id or audio_id or 'audio'}-chunk{chunk_index:05d}"
     return {
-        "schema": "cueqc_candidate_v1",
+        "schema": "cueqc_candidate_v4",
         "schema_version": CUEQC_FEATURE_SCHEMA_VERSION,
         "sample_id": sample_id,
         "audio_id": audio_id,
@@ -513,11 +506,9 @@ def runtime_signature() -> dict[str, Any]:
         "feature_schema_version": CUEQC_FEATURE_SCHEMA_VERSION,
         "enabled": cueqc_enabled(),
         "shadow_only": checkpoint == "",
-        "policy": "cueqc_mamba_v3_fusion",
-        "decision_version": _env_text("CUEQC_DECISION_VERSION", CUEQC_DECISION_VERSION)
-        or CUEQC_DECISION_VERSION,
-        "model_version": _env_text("CUEQC_MODEL_VERSION", CUEQC_MODEL_VERSION)
-        or CUEQC_MODEL_VERSION,
+        "policy": "cueqc_mamba_v4_binary",
+        "decision_version": CUEQC_DECISION_VERSION,
+        "model_version": CUEQC_MODEL_VERSION,
         "model_path": checkpoint,
         "checkpoint_sha1": checkpoint_hash,
         "drop_threshold": _env_text("CUEQC_DROP_THRESHOLD", "0.85"),
@@ -539,20 +530,7 @@ def numeric_feature_vector(candidate: Mapping[str, Any]) -> list[float]:
         if isinstance(text_features_payload.get("repeat_profile"), Mapping)
         else {}
     )
-    density = (
-        cue_features.get("text_density")
-        if isinstance(cue_features.get("text_density"), Mapping)
-        else {}
-    )
-    density_level = str(density.get("level") or "")
-    density_num = {
-        "normal_dialogue": 0.0,
-        "short_kana_dialogue_candidate": 0.25,
-        "short_vocalization_candidate": 0.5,
-        "repeated_vocalization_candidate": 0.7,
-        "long_sparse_text": 0.8,
-        "empty_or_punctuation": 1.0,
-    }.get(density_level, 0.25)
+
     return [
         _safe_float(candidate.get("duration_s")),
         _safe_float(text_features_payload.get("char_count")),
@@ -567,10 +545,10 @@ def numeric_feature_vector(candidate: Mapping[str, Any]) -> list[float]:
         _safe_float(adjacency.get("prev_gap_s"), 5.0),
         _safe_float(adjacency.get("next_gap_s"), 5.0),
         _safe_float(adjacency.get("same_text_run_length")),
-        0.0,
-        density_num,
-        0.0,
-        1.0 if bool(text_features_payload.get("has_stable_vocabulary")) else 0.0,
+        1.0 if bool(text_features_payload.get("kana_only")) else 0.0,
+        1.0 if bool(text_features_payload.get("has_kanji")) else 0.0,
+        1.0 if bool(text_features_payload.get("has_latin_or_digit")) else 0.0,
+        _safe_float(text_features_payload.get("raw_char_count")),
     ]
 
 

@@ -30,7 +30,7 @@ def test_cueqc_cluster_audit_uses_explicit_media_root(tmp_path: Path):
         clusters,
         [
             {
-                "schema": "cueqc_candidate_v1",
+                "schema": "cueqc_candidate_v4",
                 "sample_id": "cueqc-AAA-chunk00000",
                 "audio_id": "AAA.somehash",
                 "video_id": "AAA",

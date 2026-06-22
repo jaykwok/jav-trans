@@ -33,7 +33,7 @@ def _candidate(sample_id: str, *, route: str, start: float, end: float) -> dict:
         "end": end,
         "duration_s": end - start,
         "text": "...",
-        "text_bucket": "nonlexical",
+        "text_observation_bucket": "nonlexical",
         "reason_tags": ["vocalization"],
         "display_prob_drop_mean": 0.91,
         "candidate_route": route,

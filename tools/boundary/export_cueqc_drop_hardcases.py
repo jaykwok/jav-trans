@@ -146,7 +146,7 @@ def is_nonlexical_text(value: Any) -> bool:
     return bool(PUNCT_OR_NONLEXICAL_RE.fullmatch(compact))
 
 
-def text_bucket(value: Any) -> str:
+def text_observation_bucket(value: Any) -> str:
     text = str(value or "").strip()
     if not text:
         return "empty"
@@ -235,7 +235,7 @@ def build_candidate(
         "duration_s": round(duration_s, 6),
         "duration_bucket": duration_bucket(duration_s),
         "text": text,
-        "text_bucket": text_bucket(text),
+        "text_observation_bucket": text_observation_bucket(text),
         "manual_decision": CONFIRMED_DROP,
         "reason_tags": tags,
         "notes": nonempty_notes(rows),

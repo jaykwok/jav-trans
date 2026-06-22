@@ -744,9 +744,9 @@ function clusterExampleRows(summary, limit = 3) {{
   return selected;
 }}
 function clusterSummaryText(summary) {{
-  const density = summary.text_density_counts || {{}};
-  const densityText = Object.entries(density).map(([k, v]) => `${{k}}=${{v}}`).join(", ");
-  return `count=${{summary.count || 0}} · chars_avg=${{Number(summary.char_count_avg || 0).toFixed(2)}} · conf=${{Number(summary.confidence_avg || 0).toFixed(3)}} · density ${{densityText || "n/a"}}`;
+  const obs = summary.text_observation_counts || {{}};
+  const obsText = Object.entries(obs).map(([k, v]) => `${{k}}=${{v}}`).join(", ");
+  return `count=${{summary.count || 0}} · chars_avg=${{Number(summary.char_count_avg || 0).toFixed(2)}} · conf=${{Number(summary.confidence_avg || 0).toFixed(3)}} · text ${{obsText || "n/a"}}`;
 }}
 function setClusterButtons(rootId, options, clusterId, key) {{
   const root = document.getElementById(rootId);
@@ -1013,12 +1013,12 @@ function renderList() {{
   for (const row of filtered) {{
     const div = document.createElement("div");
     const cueFeatures = row.cue_features || {{}};
-    const density = ((cueFeatures.text_density || row.text_density || {{}}).level) || "";
+    const textObs = cueFeatures.text_observation || row.text_observation || {{}};
     div.className = "item" + (ROWS[current] === row ? " active" : "");
     div.onclick = () => {{ current = ROWS.indexOf(row); renderList(); renderCurrent(true); }};
     const badgeClass = row.cluster_noise ? "badge noise" : "badge";
     div.innerHTML = `<div class="item-title"><strong>${{escapeHtml(row.cluster_id)}} · chunk ${{row.chunk_index}}</strong><span class="${{badgeClass}}">${{escapeHtml(row.video_label || row.video_id || "")}}</span></div>
-      <div class="meta">${{fmt(row.start)}}-${{fmt(row.end)}} · ${{Number(row.duration_s||0).toFixed(2)}}s · ${{escapeHtml(density)}}</div>
+      <div class="meta">${{fmt(row.start)}}-${{fmt(row.end)}} · ${{Number(row.duration_s||0).toFixed(2)}}s · chars=${{escapeHtml(String(textObs.char_count ?? ""))}}</div>
       <div class="meta">${{escapeHtml(row.text_preview || row.text || "(empty)")}}</div>`;
     root.appendChild(div);
   }}
@@ -1160,7 +1160,7 @@ function setMetrics(row) {{
     ["chunk", `${{row.chunk_index}} · ${{fmt(row.start)}}-${{fmt(row.end)}}`],
     ["context", `${{fmt(row.context_start)}}-${{fmt(row.context_end)}}`],
     ["字幕时间轴窗口", `${{fmt(row.fallback_window_start)}}-${{fmt(row.fallback_window_end)}}`],
-    ["density", JSON.stringify(cueFeatures.text_density || row.text_density || {{}})],
+    ["text_obs", JSON.stringify(cueFeatures.text_observation || row.text_observation || {{}})],
     ["chars", `${{tf.char_count || 0}} unique=${{tf.unique_chars || 0}} kana=${{tf.kana_ratio || 0}} kanji=${{tf.kanji_ratio || 0}}`],
     ["repeat", JSON.stringify(tf.repeat_profile || {{}})],
     ["adjacency", JSON.stringify(row.adjacency || {{}})],
@@ -1288,7 +1288,7 @@ function exportClusterRows() {{
       count: summary.count || 0,
       char_count_avg: summary.char_count_avg || 0,
       confidence_avg: summary.confidence_avg || 0,
-      text_density_counts: summary.text_density_counts || {{}},
+      text_observation_counts: summary.text_observation_counts || {{}},
       examples
     }};
   }});

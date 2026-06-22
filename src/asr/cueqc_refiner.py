@@ -1,12 +1,12 @@
-"""CueQC Mamba v3-Fusion runtime adapter.
+"""CueQC Mamba v4 binary runtime adapter.
 
-Loads a ``cueqc_mamba_checkpoint_v3_fusion`` checkpoint, rebuilds
-``CueQCMambaV3Fusion``, and exposes ``decide()`` that emits the runtime contract
+Loads a ``cueqc_mamba_v4_binary`` checkpoint, rebuilds
+``CueQCMambaV4Binary``, and exposes ``decide()`` that emits the runtime contract
 dict consumed by ``pipeline._run_cueqc_shadow``.
 
 The refiner never loads its own Qwen3-ASR — at runtime the caller passes an
 ``AsrInternalsCapturer`` that wraps the already-loaded ``LocalAsrBackend.model``
-(see v3-Fusion §5.2: no second ASR model in VRAM). Per-candidate capture,
+(see v4 binary §5.2: no second ASR model in VRAM). Per-candidate capture,
 feature, or inference failures fall back to ``keep``; model-level mapping/load
 failures are handled by the pipeline as hard job failures.
 """
@@ -20,8 +20,8 @@ import os
 
 from asr.backends.qwen import validate_checkpoint_repo_id
 
-CUEQC_MAMBA_CHECKPOINT_SCHEMA = "cueqc_mamba_checkpoint_v3_fusion"
-MODE_TAG = "cueqc_mamba_v3_fusion"
+CUEQC_MAMBA_CHECKPOINT_SCHEMA = "cueqc_mamba_v4_binary"
+MODE_TAG = "cueqc_mamba_v4_binary"
 FALLBACK_MODE_TAG = "fallback_keep"
 
 
@@ -69,8 +69,8 @@ def _fallback_keep(
     }
 
 
-class CueQCRefinerV3Fusion:
-    """Runtime wrapper around a trained CueQC Mamba v3-Fusion checkpoint."""
+class CueQCRefinerV4Binary:
+    """Runtime wrapper around a trained CueQC Mamba v4 binary checkpoint."""
 
     def __init__(
         self,
@@ -85,17 +85,17 @@ class CueQCRefinerV3Fusion:
         schema = str(checkpoint.get("schema") or "")
         if schema != CUEQC_MAMBA_CHECKPOINT_SCHEMA:
             raise ValueError(f"unsupported CueQC checkpoint schema: {schema!r}")
-        from asr.cueqc_model import CueQCMambaV3Fusion
+        from asr.cueqc_model import CueQCMambaV4Binary
 
         model_config = dict(checkpoint.get("model_config") or {})
-        # Only keep CueQCMambaV3Fusion constructor kwargs.
+        # Only keep CueQCMambaV4Binary constructor kwargs.
         valid = {
             "asr_dim", "token_dim", "decoder_dim", "structured_dim",
             "hidden_size", "num_layers", "state_size", "num_heads", "head_dim",
             "n_groups", "chunk_size", "mlp_dim", "dropout",
         }
         model_config = {k: v for k, v in model_config.items() if k in valid}
-        self.model = CueQCMambaV3Fusion(**model_config)
+        self.model = CueQCMambaV4Binary(**model_config)
         state_dict = checkpoint.get("state_dict")
         if state_dict is None:
             raise ValueError("checkpoint missing 'state_dict'")
@@ -144,8 +144,9 @@ class CueQCRefinerV3Fusion:
 
         decision = checkpoint.get("decision_config") or {}
         self.decision_config = dict(decision)
+        if "drop_threshold_profile" in decision:
+            raise ValueError("CueQC v4 binary checkpoints must not contain decision_config.drop_threshold_profile")
         self.drop_threshold = float(decision.get("drop_threshold", 0.85))
-        self.drop_threshold_profile = decision.get("drop_threshold_profile") or {}
         self.fallback_policy = str(decision.get("fallback_policy", "keep"))
 
     def signature(self) -> dict[str, Any]:
@@ -156,7 +157,6 @@ class CueQCRefinerV3Fusion:
             "sha1": self.sha1,
             "decision_version": self.decision_version,
             "drop_threshold": self.drop_threshold,
-            "drop_threshold_profile": self.drop_threshold_profile,
             "metadata": self.metadata,
             "feature_config": self.feature_config,
         }
@@ -351,18 +351,12 @@ class CueQCRefinerV3Fusion:
                     )
                 continue
 
-            from asr.cueqc_thresholds import resolve_drop_threshold
-
             for local_j, i in enumerate(batch_candidate_indices):
                 cand = candidates[i]
                 cluster_id = str(cand.get("cluster_id", "unclustered"))
                 p_drop = float(probs[local_j, 0])
                 p_keep = float(probs[local_j, 1])
-                threshold, threshold_info = resolve_drop_threshold(
-                    self.decision_config,
-                    text=cand.get("text", ""),
-                    default=self.drop_threshold,
-                )
+                threshold = float(self.drop_threshold)
                 is_drop = p_drop >= threshold
                 display = "drop" if is_drop else "keep"
                 confidence = round(p_drop if is_drop else p_keep, 4)
@@ -377,8 +371,7 @@ class CueQCRefinerV3Fusion:
                     "display_prob_keep": round(p_keep, 4),
                     "display_prob_drop": round(p_drop, 4),
                     "drop_threshold": round(threshold, 4),
-                    "threshold_profile": threshold_info,
-                    "reasons": [f"cueqc_mamba_v3:{display}:p_drop={p_drop:.3f}:threshold={threshold:.3f}"],
+                    "reasons": [f"cueqc_mamba_v4_binary:{display}:p_drop={p_drop:.3f}:threshold={threshold:.3f}"],
                 }
         for i, decision in enumerate(decisions):
             if decision is None:
@@ -396,14 +389,14 @@ def load_cueqc_mamba_checkpoint(
     *,
     device: str = "auto",
     expected_asr_repo_id: str | None = None,
-) -> CueQCRefinerV3Fusion:
+) -> CueQCRefinerV4Binary:
     import torch
 
     p = Path(path)
     if not p.exists():
         raise FileNotFoundError(f"CueQC checkpoint not found: {p}")
     checkpoint = torch.load(p, map_location="cpu", weights_only=False)
-    return CueQCRefinerV3Fusion(
+    return CueQCRefinerV4Binary(
         checkpoint=checkpoint,
         path=p,
         device=device,

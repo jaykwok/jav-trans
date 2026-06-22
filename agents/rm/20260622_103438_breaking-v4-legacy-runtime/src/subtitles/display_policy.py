@@ -25,9 +25,9 @@ def _env_int(name: str, default: int) -> int:
 
 
 def settings_from_env() -> dict:
-    mode = os.getenv("SUBTITLE_DISPLAY_POLICY", "readability").strip().lower()
+    mode = os.getenv("SUBTITLE_DISPLAY_POLICY", "off").strip().lower()
     if not mode:
-        mode = "readability"
+        mode = "off"
     if mode in _OFF_MODES:
         mode = "off"
     return {
@@ -56,7 +56,7 @@ def signature(settings: dict | None = None) -> dict:
     cfg = dict(settings or settings_from_env())
     return {
         "version": DISPLAY_POLICY_VERSION,
-        "mode": str(cfg.get("mode") or "readability"),
+        "mode": str(cfg.get("mode") or "off"),
         "repeat_run_min": int(cfg.get("repeat_run_min") or 3),
         "max_run_gap_s": float(cfg.get("max_run_gap_s") or 0.0),
         "short_kana_max_chars": int(cfg.get("short_kana_max_chars") or 4),
@@ -409,7 +409,7 @@ def apply_display_policy(
         for index, cue in enumerate(normalized_cues)
     ]
 
-    if str(cfg.get("mode") or "readability").lower() == "off":
+    if str(cfg.get("mode") or "off").lower() == "off":
         displayed: list[dict] = []
         decisions: list[dict] = []
         for cue, item in zip(normalized_cues, features):

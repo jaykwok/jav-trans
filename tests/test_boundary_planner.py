@@ -2,69 +2,9 @@ from __future__ import annotations
 
 import pytest
 
-from boundary.features import make_feature_bundle
 from boundary.planner import BoundaryPlannerConfig, plan_boundary_chunks
 from boundary.refiner import BoundaryDecision
 from boundary.base import SpeechSegment
-
-
-def test_boundary_planner_uses_candidate_split_before_packing():
-    features = make_feature_bundle(
-        frame_hop_s=1.0,
-        cut_scores=[0.05] * 5 + [0.98] * 2 + [0.05] * 5,
-    )
-
-    chunks = plan_boundary_chunks(
-        [SpeechSegment(0.0, 12.0)],
-        features=features,
-        config=BoundaryPlannerConfig(
-            frame_hop_s=1.0,
-            max_core_chunk_s=30.0,
-            target_chunk_s=5.0,
-            min_chunk_s=3.0,
-        ),
-    )
-
-    assert len(chunks) == 2
-    assert chunks[0].islands[0].end == pytest.approx(6.0)
-    assert chunks[1].islands[0].start == pytest.approx(6.0)
-    assert chunks[0].split_reason == "cut_candidate"
-
-
-def test_boundary_planner_uses_soft_candidate_for_over_target_island():
-    features = make_feature_bundle(
-        frame_hop_s=1.0,
-        speech_scores=[0.8] * 24,
-    )
-
-    chunks = plan_boundary_chunks(
-        [SpeechSegment(0.0, 20.0)],
-        features=features,
-        config=BoundaryPlannerConfig(
-            frame_hop_s=1.0,
-            max_core_chunk_s=30.0,
-            target_chunk_s=8.0,
-            min_chunk_s=2.0,
-        ),
-    )
-
-    assert [(chunk.islands[0].start, chunk.islands[0].end) for chunk in chunks] == [
-        (0.0, pytest.approx(7.5)),
-        (pytest.approx(7.5), pytest.approx(15.5)),
-        (pytest.approx(15.5), 20.0),
-    ]
-    assert chunks[0].split_reason == "soft_valley_candidate"
-
-
-def test_boundary_planner_validates_config():
-    features = make_feature_bundle(frame_hop_s=1.0)
-
-    with pytest.raises(ValueError, match="max_core_chunk_s"):
-        plan_boundary_chunks(
-            [SpeechSegment(0.0, 1.0)],
-            features=features,
-            config=BoundaryPlannerConfig(max_core_chunk_s=0.0),
-        )
 
 
 class _StaticSequenceRefiner:
@@ -79,7 +19,7 @@ class _StaticSequenceRefiner:
         self.cursor += len(features)
         return [
             BoundaryDecision(
-                source="frame_sequence_refiner",
+                source="edge_sequence_refiner_v6",
                 start_refine_delta_s=start_delta,
                 end_refine_delta_s=end_delta,
             )
@@ -102,8 +42,27 @@ class _IndexFeatureProvider:
         return [right_start_s - left_end_s]
 
 
-def test_sequence_refiner_scores_gaps_without_merging_chunks():
-    features = make_feature_bundle(frame_hop_s=1.0)
+def test_boundary_planner_emits_one_chunk_per_scorer_island():
+    chunks = plan_boundary_chunks(
+        [SpeechSegment(0.0, 12.0), SpeechSegment(12.2, 13.0)],
+        config=BoundaryPlannerConfig(frame_hop_s=1.0),
+    )
+
+    assert [(chunk.islands[0].start, chunk.islands[0].end) for chunk in chunks] == [
+        (0.0, 12.0),
+        (12.2, 13.0),
+    ]
+    assert [chunk.split_reason for chunk in chunks] == ["speech_island", "speech_island"]
+
+
+def test_boundary_planner_validates_edge_only_config():
+    with pytest.raises(ValueError, match="frame_hop_s"):
+        plan_boundary_chunks([SpeechSegment(0.0, 1.0)], config=BoundaryPlannerConfig(frame_hop_s=0.0))
+    with pytest.raises(ValueError, match="sequence_batch_size"):
+        plan_boundary_chunks([SpeechSegment(0.0, 1.0)], config=BoundaryPlannerConfig(sequence_batch_size=0))
+
+
+def test_sequence_refiner_scores_gaps_without_merging_or_splitting():
     refiner = _StaticSequenceRefiner([(0.0, 0.0), (0.1, -0.1), (0.0, 0.0)])
 
     chunks = plan_boundary_chunks(
@@ -113,13 +72,7 @@ def test_sequence_refiner_scores_gaps_without_merging_chunks():
             SpeechSegment(6.1, 9.0),
             SpeechSegment(9.1, 12.0),
         ],
-        features=features,
-        config=BoundaryPlannerConfig(
-            frame_hop_s=1.0,
-            max_core_chunk_s=30.0,
-            target_chunk_s=6.0,
-            min_chunk_s=0.4,
-        ),
+        config=BoundaryPlannerConfig(frame_hop_s=1.0),
         sequence_refiner=refiner,
         sequence_feature_provider=_IndexFeatureProvider(),
     )
@@ -133,40 +86,10 @@ def test_sequence_refiner_scores_gaps_without_merging_chunks():
     ]
     assert all(len(chunk.islands) == 1 for chunk in chunks)
     assert chunks[1].boundary_decision is not None
-    assert chunks[1].boundary_decision.source == "frame_sequence_refiner"
-
-
-def test_sequence_refiner_preserves_decision_source():
-    features = make_feature_bundle(frame_hop_s=1.0)
-    refiner = _StaticSequenceRefiner([(0.0, 0.0), (0.0, 0.0)])
-
-    chunks = plan_boundary_chunks(
-        [
-            SpeechSegment(0.0, 1.0),
-            SpeechSegment(1.1, 2.0),
-            SpeechSegment(2.1, 3.0),
-        ],
-        features=features,
-        config=BoundaryPlannerConfig(
-            frame_hop_s=1.0,
-            max_core_chunk_s=30.0,
-            target_chunk_s=9.0,
-        ),
-        sequence_refiner=refiner,
-        sequence_feature_provider=_IndexFeatureProvider(),
-    )
-
-    assert [(chunk.islands[0].start, chunk.islands[-1].end) for chunk in chunks] == [
-        (0.0, 1.0),
-        (1.1, 2.0),
-        (2.1, 3.0),
-    ]
-    assert chunks[1].boundary_decision is not None
-    assert chunks[1].boundary_decision.source == "frame_sequence_refiner"
+    assert chunks[1].boundary_decision.source == "edge_sequence_refiner_v6"
 
 
 def test_sequence_planner_batches_long_sequences():
-    features = make_feature_bundle(frame_hop_s=1.0)
     refiner = _StaticSequenceRefiner([(0.0, 0.0), (0.0, 0.0), (0.0, 0.0)])
 
     chunks = plan_boundary_chunks(
@@ -176,21 +99,10 @@ def test_sequence_planner_batches_long_sequences():
             SpeechSegment(2.1, 3.0),
             SpeechSegment(3.1, 4.0),
         ],
-        features=features,
-        config=BoundaryPlannerConfig(
-            frame_hop_s=1.0,
-            max_core_chunk_s=30.0,
-            target_chunk_s=9.0,
-            sequence_batch_size=2,
-        ),
+        config=BoundaryPlannerConfig(frame_hop_s=1.0, sequence_batch_size=2),
         sequence_refiner=refiner,
         sequence_feature_provider=_IndexFeatureProvider(),
     )
 
     assert [len(call) for call in refiner.calls] == [2, 1]
-    assert [(chunk.islands[0].start, chunk.islands[-1].end) for chunk in chunks] == [
-        (0.0, 1.0),
-        (1.1, 2.0),
-        (2.1, 3.0),
-        (3.1, 4.0),
-    ]
+    assert len(chunks) == 4

@@ -125,8 +125,8 @@ def test_asr_stage_env_scope_passes_boundary_refiner_flags(monkeypatch, tmp_path
         keep_temp_files=True,
         advanced={
             "BOUNDARY_REFINER_DEVICE": "cpu",
-            "BOUNDARY_PLANNER_TARGET_CHUNK_S": "3.5",
-            "BOUNDARY_PLANNER_MAX_CORE_CHUNK_S": "5.5",
+            "SPEECH_BOUNDARY_JA_SPLIT_THRESHOLD": "0.6",
+            "SPEECH_BOUNDARY_JA_DROP_GAP_THRESHOLD": "0.8",
         },
     )
     monkeypatch.setattr(main.torch.cuda, "is_available", lambda: False)
@@ -143,8 +143,8 @@ def test_asr_stage_env_scope_passes_boundary_refiner_flags(monkeypatch, tmp_path
 
     def fake_transcribe_and_align(_audio_path, _device, on_stage=None, include_details=False):
         seen["device"] = main.os.environ.get("BOUNDARY_REFINER_DEVICE")
-        seen["target_s"] = main.os.environ.get("BOUNDARY_PLANNER_TARGET_CHUNK_S")
-        seen["max_core_s"] = main.os.environ.get("BOUNDARY_PLANNER_MAX_CORE_CHUNK_S")
+        seen["split_threshold"] = main.os.environ.get("SPEECH_BOUNDARY_JA_SPLIT_THRESHOLD")
+        seen["drop_gap_threshold"] = main.os.environ.get("SPEECH_BOUNDARY_JA_DROP_GAP_THRESHOLD")
         return (
             [{"start": 0.0, "end": 1.0, "text": "こんにちは"}],
             ["mock asr"],
@@ -162,8 +162,8 @@ def test_asr_stage_env_scope_passes_boundary_refiner_flags(monkeypatch, tmp_path
 
     assert seen == {
         "device": "cpu",
-        "target_s": "3.5",
-        "max_core_s": "5.5",
+        "split_threshold": "0.6",
+        "drop_gap_threshold": "0.8",
     }
 
 

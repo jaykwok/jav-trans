@@ -15,13 +15,12 @@ def _candidate(
     text: str,
     *,
     severity: str = "ok",
-    density: str = "normal_dialogue",
     embedding: list[float] | None = None,
 ) -> dict:
     duration = 0.6 if len(text) <= 3 else 2.0
     tf = cueqc.text_features(text, text, duration_s=duration)
     row = {
-        "schema": "cueqc_candidate_v1",
+        "schema": "cueqc_candidate_v4",
         "sample_id": f"sample-{index:03d}",
         "cluster_id": "",
         "chunk_index": index,
@@ -40,13 +39,20 @@ def _candidate(
         "qc": {
             "severity": severity,
             "reasons": ["repeated_nonlexical_vocalization"] if severity == "warn" else [],
-            "text_density": {"level": density},
-            "vocalization_repetition": {"preserve_candidate": density != "normal_dialogue"},
         },
         "cue_features": {
-            "text_density": {"level": density},
+            "text_observation": {
+                "duration_s": duration,
+                "char_count": tf["char_count"],
+                "raw_char_count": tf["raw_char_count"],
+                "unique_chars": tf["unique_chars"],
+                "chars_per_sec": tf["chars_per_sec"],
+                "kana_only": tf["kana_only"],
+                "repeat_run": tf["repeat_profile"]["run"],
+                "repeat_unit_len": tf["repeat_profile"]["unit_len"],
+                "repeat_ratio": tf["repeat_profile"]["ratio"],
+            },
             "repeat_profile": tf["repeat_profile"],
-            "has_stable_vocabulary": tf["has_stable_vocabulary"],
         },
         "boundary": {"speech_segment_count": 1, "boundary_reason": "test"},
         "adjacency": {
@@ -107,12 +113,13 @@ def test_cueqc_candidate_export_from_aligned_payload_preserves_required_fields(t
     rows = aligned_payload_to_candidates(payload, video_id="clip")
 
     assert len(rows) == 2
-    assert rows[0]["schema"] == "cueqc_candidate_v1"
+    assert rows[0]["schema"] == "cueqc_candidate_v4"
     assert rows[0]["audio"]["path"]
     assert rows[0]["text_features"]["char_count"] == 1
     assert rows[0]["boundary"]["speech_segment_count"] == 1
     assert rows[0]["adjacency"]["next_gap_s"] == 0.5
-    assert rows[0]["cue_features"]["text_density"]["level"] == "short_vocalization_candidate"
+    assert rows[0]["cue_features"]["text_observation"]["char_count"] == 1
+    assert "text_density" not in rows[0]["cue_features"]
     assert rows[1]["text_features"]["has_stable_vocabulary"] is True
 
 
@@ -190,9 +197,9 @@ def test_cueqc_torque_merge_layer_returns_hierarchy_partition():
 def test_cueqc_torque_outputs_stable_audit_files(tmp_path: Path):
     """TORC over structured features writes the audit artifacts unchanged."""
     rows = [
-        _candidate(0, "あ", severity="warn", density="short_vocalization_candidate"),
-        _candidate(1, "あ", severity="warn", density="short_vocalization_candidate"),
-        _candidate(2, "ん", severity="warn", density="short_vocalization_candidate"),
+        _candidate(0, "あ", severity="warn"),
+        _candidate(1, "あ", severity="warn"),
+        _candidate(2, "ん", severity="warn"),
         _candidate(3, "今日はいい天気ですね"),
         _candidate(4, "明日は学校に行きます"),
         _candidate(5, "これは普通の会話です"),
@@ -235,18 +242,20 @@ def test_cueqc_torque_outputs_stable_audit_files(tmp_path: Path):
     assert "cueqc_cluster_labels.jsonl" in html
 
 
-def test_cueqc_runtime_signature_is_v3_binary_routing(monkeypatch):
+def test_cueqc_runtime_signature_is_v4_binary_routing(monkeypatch, tmp_path: Path):
+    checkpoint = tmp_path / "cueqc_mamba_v4_binary.pt"
+    checkpoint.write_bytes(b"placeholder")
     monkeypatch.setenv("ASR_BACKEND", "jaykwok/Qwen3-ASR-0.6B-JA-Anime-Galgame")
     monkeypatch.setenv(
         "CUEQC_MODEL_PATH_BY_REPO",
-        "jaykwok/Qwen3-ASR-0.6B-JA-Anime-Galgame=src/asr/checkpoints/cueqc_mamba_v3_fusion.jaykwok-Qwen3-ASR-0.6B-JA-Anime-Galgame.pt",
+        f"jaykwok/Qwen3-ASR-0.6B-JA-Anime-Galgame={checkpoint}",
     )
     monkeypatch.setenv("CUEQC_DROP_APPLY_ENABLED", "1")
 
     sig = cueqc.runtime_signature()
 
-    assert sig["policy"] == "cueqc_mamba_v3_fusion"
-    assert sig["model_version"] == "cueqc_mamba_v3_fusion"
+    assert sig["policy"] == "cueqc_mamba_v4_binary"
+    assert sig["model_version"] == "cueqc_mamba_v4_binary"
     assert sig["decision_version"] == "cueqc_display_binary_v1"
     assert sig["drop_apply_enabled"] is True
     assert set(sig) == {
@@ -265,7 +274,7 @@ def test_cueqc_runtime_signature_is_v3_binary_routing(monkeypatch):
     }
 
 
-def test_cueqc_v3_does_not_extend_boundary_frame_provider_api():
+def test_cueqc_v4_does_not_extend_boundary_frame_provider_api():
     assert not hasattr(FrameSequenceFeatureProvider, "frames_for_window")
 
 

@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Extract CueQC Mamba v3-Fusion features from ASR internals.
+"""Extract CueQC Mamba v4 binary features from ASR internals.
 
 Reads either labeled ``cueqc_train.jsonl`` rows or unlabeled
-``cueqc_candidate_v1`` rows, resolves each sample's audio from the baseline wav
+``cueqc_candidate_v4`` rows, resolves each sample's audio from the baseline wav
 tree, and runs the teacher-forced
 ``AsrInternalsCapturer`` to capture, per candidate:
 
@@ -15,7 +15,7 @@ Raw (variable-length) features are stored — NOT padded, NOT normalized.
 Padding happens in the training collate_fn; normalization is computed on the
 train split only inside the training script (to avoid test leakage).
 
-Label convention (v3): ``drop = 0``, ``keep = 1`` (inverted from v2).
+Label convention (v4): ``drop = 0``, ``keep = 1``.
 Unlabeled candidate rows are encoded as ``-1`` and are intended for prediction /
 pseudo-label export, not direct training.
 """
@@ -66,7 +66,7 @@ from asr.cueqc_features import (  # noqa: E402
 )
 
 SAMPLE_RATE = 16000
-# v3 label convention: 0 = drop, 1 = keep (inverted from v2's keep=0/drop=1).
+# v4 label convention: 0 = drop, 1 = keep.
 DISPLAY_LABEL_MAP = {"drop": 0, "keep": 1}
 
 
@@ -219,7 +219,7 @@ def extract(args: argparse.Namespace) -> int:
 
         asr_frames = internals["asr_frames"]
         if asr_frames.shape[0] == 0:
-            # v3 data constraint: drop samples with no asr frames.
+            # v4 data constraint: drop samples with no asr frames.
             skipped += 1
             continue
 
@@ -289,8 +289,8 @@ def extract(args: argparse.Namespace) -> int:
     )
 
     bundle = {
-        "schema": "cueqc_mamba_v3_fusion_features",
-        "version": 3,
+        "schema": "cueqc_mamba_v4_binary_features",
+        "version": 4,
         "samples": samples,
         "labels": torch.tensor(labels, dtype=torch.long),
         "meta": meta,
@@ -327,9 +327,9 @@ def extract(args: argparse.Namespace) -> int:
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="Extract CueQC v3-Fusion features from ASR internals.")
+    p = argparse.ArgumentParser(description="Extract CueQC v4 binary features from ASR internals.")
     p.add_argument("--train", default="", help="labeled cueqc_train.jsonl")
-    p.add_argument("--input", default="", help="unlabeled cueqc_candidate_v1 JSONL for prediction/self-training")
+    p.add_argument("--input", default="", help="unlabeled cueqc_candidate_v4 JSONL for prediction/self-training")
     p.add_argument("--audio-root", required=True, help="baseline root containing jobs/<VIDEO>_b5/audio/*.wav")
     p.add_argument("--output", required=True, help="output .pt path")
     p.add_argument("--model-spec", default="", help="Qwen3-ASR repo id (default env ASR_MODEL_SPEC)")

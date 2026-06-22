@@ -97,10 +97,6 @@ DEFAULT_SETTINGS: dict[str, str] = {
     "BOUNDARY_FRAME_SEQUENCE_MAX_PTM_DIMS": "64",
     "BOUNDARY_FRAME_SEQUENCE_INCLUDE_MFCC": "1",
     # Speech core is the subtitle timing window. Keep it short for JAV dialogue.
-    "BOUNDARY_PLANNER_MAX_CORE_CHUNK_S": "5.0",
-    "BOUNDARY_PLANNER_TARGET_CHUNK_S": "3.0",
-    "BOUNDARY_PLANNER_MIN_CHUNK_S": "0.4",
-    "BOUNDARY_PLANNER_MAX_SPLITS_PER_SEGMENT": "16",
     "BOUNDARY_PLANNER_SEQUENCE_BATCH_SIZE": "256",
     # 1 stores SpeechBoundary frame scores in the SpeechBoundary result. Boundary Refiner enables
     # this at runtime even when this explicit diagnostics flag stays off.
@@ -112,21 +108,19 @@ DEFAULT_SETTINGS: dict[str, str] = {
     "SPEECH_BOUNDARY_JA_FRAME_DILATION_S": "0.2",
     # 1 caches SpeechBoundary frame score -> Boundary Planner outputs separately from ASR generation settings.
     "BOUNDARY_CACHE_ENABLED": "1",
-    # Persistent boundary cache directory. Versioned as boundary-cache v5.
+    # Persistent boundary cache directory. Versioned as boundary-cache v6.
     "BOUNDARY_CACHE_DIR": "./tmp/cache/boundary",
 
     # --- ASR Segmentation ---
     # Hard cap for grouping subtitle timing units into one subtitle candidate.
     "ASR_SEGMENT_HARD_MAX_DURATION": "9.0",
 
-    # --- CueQC Mamba v3-Fusion (display keep/drop binary filter) ---
+    # --- CueQC Mamba v4 binary keep/drop filter ---
     # 1 records CueQC candidate features and model/fallback decisions.
     "CUEQC_SHADOW_ENABLED": "1",
-    # v3-Fusion: teacher-forced ASR encoder features + token trace + decoder
-    # stats + structured metadata -> display keep/drop. Legacy rule QC removed.
-    "CUEQC_DECISION_VERSION": "cueqc_display_binary_v1",
-    "CUEQC_MODEL_VERSION": "cueqc_mamba_v3_fusion",
-    # Base drop threshold. Checkpoints may raise it per risk bucket.
+    # v4 binary: teacher-forced ASR encoder features + token trace + decoder
+    # stats + numeric structured metadata -> keep/drop. Schema is not env-selectable.
+    # Global drop threshold. CueQC v4 does not support text/risk threshold profiles.
     "CUEQC_DROP_THRESHOLD": "0.85",
     # 1 = actually remove model-confirmed drop candidates before subtitle timing;
     # 0 = record shadow only (audit), keep all candidates.
@@ -140,10 +134,6 @@ DEFAULT_SETTINGS: dict[str, str] = {
     # --- Subtitle Timings ---
     # Conservative hard maximum for one subtitle cue; 7s is the industry ceiling, 6.5s avoids hanging text.
     "MAX_SUBTITLE_DURATION": "6.5",
-    # Soft split target before the hard cap.
-    "SUBTITLE_SOFT_MAX_S": "5.5",
-    # 1 enables word/punctuation based soft splitting before SRT output.
-    "SUBTITLE_SOFT_SPLIT_ENABLED": "1",
     # Minimum displayed subtitle duration in seconds.
     "MIN_SUBTITLE_DURATION": "0.6",
     # Estimated Chinese reading speed in characters per second.
@@ -275,4 +265,3 @@ def load_config(*, override_existing_env: bool = False) -> None:
     protected_keys = set() if override_existing_env else set(os.environ)
     _apply_values(DEFAULT_SETTINGS, protected_keys)
     _load_private_env(PRIVATE_ENV_PATH, protected_keys)
-

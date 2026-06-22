@@ -329,10 +329,10 @@ def _cluster_summaries(rows: list[dict[str, Any]], labels: list[str]) -> list[di
             for member in members
             if isinstance(member.get("qc"), Mapping)
         )
-        density_counts = Counter(
-            str((((member.get("qc") or {}).get("text_density") or {}).get("level") or ""))
+        observation_counts = Counter(
+            "empty_text" if int(((member.get("text_features") or {}).get("char_count") or 0)) <= 0 else "text_present"
             for member in members
-            if isinstance(member.get("qc"), Mapping)
+            if isinstance(member.get("text_features"), Mapping)
         )
         char_counts = [
             int(((member.get("text_features") or {}).get("char_count") or 0))
@@ -350,7 +350,7 @@ def _cluster_summaries(rows: list[dict[str, Any]], labels: list[str]) -> list[di
                     4,
                 ),
                 "qc_severity_counts": dict(severity_counts.most_common()),
-                "text_density_counts": dict(density_counts.most_common()),
+                "text_observation_counts": dict(observation_counts.most_common()),
                 "char_count_avg": round(sum(char_counts) / max(1, len(char_counts)), 3),
                 "examples": [
                     {
@@ -509,7 +509,7 @@ function renderCurrent() {{
     ["chars", `${{tf.char_count || 0}} unique=${{tf.unique_chars || 0}} kana=${{tf.kana_ratio || 0}} kanji=${{tf.kanji_ratio || 0}}`],
     ["stable_vocab", String(!!tf.has_stable_vocabulary)],
     ["repeat", JSON.stringify(tf.repeat_profile || {{}})],
-    ["density", JSON.stringify(qc.text_density || {{}})],
+    ["text_obs", JSON.stringify((cueFeatures.text_observation || row.text_observation || {{}}))],
     ["adjacency", JSON.stringify(row.adjacency || {{}})],
     ["audio", (row.audio || {{}}).path || ""]
   ];

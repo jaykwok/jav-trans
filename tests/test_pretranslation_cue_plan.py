@@ -107,41 +107,15 @@ def test_translation_uses_pre_normalized_cues(monkeypatch, tmp_path):
     assert timings["asr_details"]["subtitle_cue_plan"]["stage"] == "pre_translation"
 
 
-def test_display_policy_compacts_cues_without_mutating_aligned_segments(
-    monkeypatch,
-    tmp_path,
-):
+
+def test_pretranslation_cue_plan_preserves_model_routed_cues(monkeypatch, tmp_path):
     video_path = tmp_path / "clip.mp4"
     video_path.write_bytes(b"fake-video")
     segments = [
-        {
-            "start": 0.0,
-            "end": 0.4,
-            "text": "あ",
-            "words": [{"word": "あ", "start": 0.0, "end": 0.4}],
-            "fallback_subtype": "nonlexical_text",
-        },
-        {
-            "start": 0.5,
-            "end": 0.9,
-            "text": "あ",
-            "words": [{"word": "あ", "start": 0.5, "end": 0.9}],
-            "fallback_subtype": "nonlexical_text",
-        },
-        {
-            "start": 1.0,
-            "end": 1.4,
-            "text": "あ",
-            "words": [{"word": "あ", "start": 1.0, "end": 1.4}],
-            "fallback_subtype": "nonlexical_text",
-        },
-        {
-            "start": 2.0,
-            "end": 3.0,
-            "text": "今日はいい天気ですね",
-            "words": [{"word": "今日はいい天気ですね", "start": 2.0, "end": 3.0}],
-            "alignment_quality": "boundary",
-        },
+        {"start": 0.0, "end": 0.4, "text": "あ", "words": [{"word": "あ", "start": 0.0, "end": 0.4}]},
+        {"start": 0.5, "end": 0.9, "text": "あ", "words": [{"word": "あ", "start": 0.5, "end": 0.9}]},
+        {"start": 1.0, "end": 1.4, "text": "あ", "words": [{"word": "あ", "start": 1.0, "end": 1.4}]},
+        {"start": 2.0, "end": 3.0, "text": "今日はいい天気ですね", "words": [{"word": "今日はいい天気ですね", "start": 2.0, "end": 3.0}]},
     ]
     artifacts = _artifacts(tmp_path, segments)
     ctx = make_job_context(
@@ -167,40 +141,14 @@ def test_display_policy_compacts_cues_without_mutating_aligned_segments(
     main.run_translation_and_write(str(video_path), artifacts, ctx=ctx, job_id="clip")
 
     translated = seen["items"]
-    assert len(translated) == 2
-    assert translated[0]["display_decision"] == "compact"
-    assert translated[0]["source_segment_ids"] == [0, 1, 2]
-    assert translated[1]["text"] == "今日はいい天気ですね"
-
-    sidecar = json.loads(
-        (tmp_path / "jobs" / "clip" / "clip.bilingual.json").read_text(encoding="utf-8")
-    )
-    assert [block["display_decision"] for block in sidecar["blocks"]] == [
-        "compact",
-        "keep",
-    ]
-    assert sidecar["blocks"][0]["raw_texts"] == ["あ", "あ", "あ"]
+    assert len(translated) == 4
+    assert [item["text"] for item in translated] == ["あ", "あ", "あ", "今日はいい天気ですね"]
 
     aligned_payload = json.loads(
-        (tmp_path / "jobs" / "clip" / "clip.aligned_segments.json").read_text(
-            encoding="utf-8"
-        )
+        (tmp_path / "jobs" / "clip" / "clip.aligned_segments.json").read_text(encoding="utf-8")
     )
-    assert [segment["text"] for segment in aligned_payload["segments"]] == [
-        "あ",
-        "あ",
-        "あ",
-        "今日はいい天気ですね",
-    ]
-    assert "display_decision" not in aligned_payload["segments"][0]
-
-    policy = aligned_payload["asr_details"]["subtitle_display_policy"]
-    assert policy["cues_before"] == 4
-    assert policy["cues_after"] == 2
-    assert policy["counts"]["compact"] == 1
-    assert policy["counts"]["drop"] == 2
-
+    assert "subtitle_display_policy" not in aligned_payload["asr_details"]
     plan = aligned_payload["asr_details"]["subtitle_cue_plan"]
     assert plan["segments_before"] == 4
-    assert plan["cues_before_display_policy"] == 4
-    assert plan["cues_after"] == 2
+    assert plan["cues_before"] == 4
+    assert plan["cues_after"] == 4

@@ -15,7 +15,7 @@ def _prediction(
     drop_threshold: float = 0.85,
 ) -> dict:
     return {
-        "schema": "cueqc_prediction_v3_fusion_v1",
+        "schema": "cueqc_prediction_v4_binary_v1",
         "sample_id": f"cueqc-{video_id}-chunk{index:05d}",
         "audio_id": video_id,
         "video_id": video_id,
