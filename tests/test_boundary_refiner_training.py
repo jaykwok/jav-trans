@@ -5,7 +5,9 @@ from pathlib import Path
 
 import pytest
 
+from asr.backends.qwen import QWEN_ASR_17B_REPO_ID
 from boundary.ja import write_jsonl
+from boundary.ja.model import MAMBA2_FRAME_SCORER_SCHEMA
 from boundary.sequence_features import (
     FRAME_SEQUENCE_FEATURE_SCHEMA,
     FrameSequenceFeatureConfig,
@@ -76,6 +78,7 @@ def _write_v6_dataset(
             weights.append([1.0, 0.6])
         payload = {
             "schema": "boundary_edge_refiner_dataset_v6",
+            "dataset_source": "scorer_v4_predicted_island_edges",
             "audio_id": f"seq-{row_index}",
             "feature_names": feature_names,
             "sequence_features": sequence,
@@ -85,7 +88,23 @@ def _write_v6_dataset(
         }
         if include_ptm_repo_id:
             payload["metadata"] = {
+                "dataset_source": "scorer_v4_predicted_island_edges",
                 "ptm_repo_id": "jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame",
+                "scorer_checkpoint": {
+                    "schema": "speech_boundary_ja_mamba2_frame_boundary_scorer_v4",
+                    "sha256": "unit-helper",
+                    "metadata": {
+                        "ptm_repo_id": "jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame",
+                    },
+                },
+            }
+        else:
+            payload["metadata"] = {
+                "dataset_source": "scorer_v4_predicted_island_edges",
+                "scorer_checkpoint": {
+                    "schema": "speech_boundary_ja_mamba2_frame_boundary_scorer_v4",
+                    "sha256": "unit-helper",
+                },
             }
         payloads.append(payload)
     path.write_text(
@@ -269,7 +288,7 @@ def test_train_refiner_reuses_v6_tensor_cache_without_jsonl_rescan(tmp_path, mon
     assert second["train_items"] + second["val_items"] == 6
 
 
-def test_build_frame_sequence_dataset_trains_with_cached_features(tmp_path):
+def test_build_frame_sequence_dataset_trains_with_cached_features(tmp_path, monkeypatch):
     pytest.importorskip("numpy")
     torch = pytest.importorskip("torch")
     transformers = pytest.importorskip("transformers")
@@ -277,6 +296,40 @@ def test_build_frame_sequence_dataset_trains_with_cached_features(tmp_path):
         pytest.skip("transformers.Mamba2Model is unavailable")
 
     import numpy as np
+    import tools.boundary.build_refiner_frame_sequence_dataset as builder_module
+
+    class FakeScorer:
+        metadata = {"ptm_repo_id": QWEN_ASR_17B_REPO_ID}
+
+        def signature(self):
+            return {
+                "schema": MAMBA2_FRAME_SCORER_SCHEMA,
+                "path": "fake-scorer.pt",
+                "sha256": "unit",
+                "metadata": {
+                    "ptm_repo_id": QWEN_ASR_17B_REPO_ID,
+                    "output_heads": ["speech_prob", "split_boundary_prob", "drop_gap_prob"],
+                    "decoder": "peak_split_v1",
+                },
+            }
+
+    monkeypatch.setattr(
+        builder_module,
+        "load_feature_frame_scorer_checkpoint",
+        lambda _path, device="cpu": FakeScorer(),
+    )
+    monkeypatch.setattr(
+        builder_module,
+        "score_feature_frame_boundary_probabilities_batch",
+        lambda _scorer, *, feature_pairs: [
+            (
+                np.asarray([0.95, 0.95, 0.15, 0.95, 0.95, 0.15], dtype=np.float32),
+                np.asarray([0.05, 0.05, 0.05, 0.05, 0.05, 0.05], dtype=np.float32),
+                np.asarray([0.05, 0.05, 0.95, 0.05, 0.05, 0.95], dtype=np.float32),
+            )
+            for _ptm, _mfcc in feature_pairs
+        ],
+    )
 
     labels_path = tmp_path / "labels.jsonl"
     feature_manifest = tmp_path / "feature_manifest.json"
@@ -298,8 +351,8 @@ def test_build_frame_sequence_dataset_trains_with_cached_features(tmp_path):
                 "label_quality": "supervised",
                 "boundary_metadata": {
                     "actual_speech_segments": [
-                        {"start": 0.0, "end": 0.2},
-                        {"start": 0.24, "end": 0.4},
+                        {"start": 0.0, "end": 0.18},
+                        {"start": 0.32, "end": 0.42},
                         {"start": 0.5, "end": 0.6},
                     ],
                     "utterance_boundaries": [
@@ -324,7 +377,7 @@ def test_build_frame_sequence_dataset_trains_with_cached_features(tmp_path):
                     "frame_hop_s": 0.1,
                     "ptm_dim": 4,
                     "mfcc_dim": 2,
-                    "ptm": "qwen",
+                    "ptm": QWEN_ASR_17B_REPO_ID,
                 }
             ],
             ensure_ascii=False,
@@ -336,12 +389,18 @@ def test_build_frame_sequence_dataset_trains_with_cached_features(tmp_path):
     summary = build_frame_sequence_dataset(
         labels_paths=[labels_path],
         feature_manifest_paths=[feature_manifest],
+        scorer_checkpoint_path=tmp_path / "fake-scorer.pt",
         output_jsonl=output_jsonl,
         config=FrameSequenceConfig(
             left_context_s=0.2,
             right_context_s=0.2,
             max_ptm_dims=3,
-            synthetic_boundary_delta_jitter_s=0.2,
+            frame_dilation_s=0.0,
+            threshold=0.5,
+            drop_gap_threshold=0.7,
+            min_segment_s=0.05,
+            min_split_segment_s=0.05,
+            max_edge_alignment_distance_s=0.2,
         ),
     )
     rows = [json.loads(line) for line in output_jsonl.read_text(encoding="utf-8").splitlines()]
@@ -353,8 +412,11 @@ def test_build_frame_sequence_dataset_trains_with_cached_features(tmp_path):
     assert "gap_merge_s" not in rows[0]["feature_names"]
     assert len(rows[0]["sequence_features"]) == 1
     assert len(rows[0]["sequence_boundary_delta_targets"]) == 1
-    assert rows[0]["sequence_boundary_delta_targets"][0] != [0.0, 0.0]
-    assert rows[0]["metadata"]["ptm_repo_id"] == "qwen"
+    assert rows[0]["sequence_boundary_delta_targets"][0] == pytest.approx([0.02, -0.02])
+    assert rows[0]["metadata"]["ptm_repo_id"] == QWEN_ASR_17B_REPO_ID
+    assert rows[0]["metadata"]["dataset_source"] == "scorer_v4_predicted_island_edges"
+    assert rows[0]["metadata"]["scorer_checkpoint"]["sha256"] == "unit"
+    assert summary["source"] == "scorer_v4_predicted_island_edges"
 
     metrics = train_refiner(
         dataset_paths=[output_jsonl],
@@ -366,7 +428,12 @@ def test_build_frame_sequence_dataset_trains_with_cached_features(tmp_path):
     assert metrics["loader_smoke"]["decision_count"] == 1
     assert metrics["loader_smoke"]["signature"]["metadata"]["runtime_adapter"] == "edge_sequence_v1"
     assert metrics["loader_smoke"]["signature"]["metadata"]["feature_schema"] == FRAME_SEQUENCE_FEATURE_SCHEMA
-    assert metrics["loader_smoke"]["signature"]["metadata"]["ptm_repo_id"] == "qwen"
+    assert metrics["loader_smoke"]["signature"]["metadata"]["ptm_repo_id"] == QWEN_ASR_17B_REPO_ID
+    assert (
+        metrics["loader_smoke"]["signature"]["metadata"]["dataset_source"]
+        == "scorer_v4_predicted_island_edges"
+    )
+    assert metrics["loader_smoke"]["signature"]["metadata"]["scorer_checkpoint"]["sha256"] == "unit"
     assert rows[0]["feature_schema"] == FRAME_SEQUENCE_FEATURE_SCHEMA
     assert rows[0]["feature_schema_hash"]
     assert rows[0]["feature_signature"]["feature_schema"] == FRAME_SEQUENCE_FEATURE_SCHEMA
