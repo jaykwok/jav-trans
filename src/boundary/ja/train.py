@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 import os
 import time
+from collections import Counter
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Iterable, Mapping
@@ -372,16 +374,25 @@ def train_feature_frame_scorer(
         split_boundary_radius_frames=config.split_boundary_radius_frames,
         focal_gamma=config.focal_gamma,
     )
+    feature_hash, feature_hash_source = scorer_feature_hash(
+        rows=rows,
+        feature_manifest_path=feature_manifest_path,
+    )
+    dataset_metadata = scorer_dataset_metadata(records)
     torch.save(
         build_feature_frame_scorer_checkpoint(
             model=model,
             model_config=model_config,
             normalization=normalization,
             metadata={
-                "operating_point": "qwen-mamba2-frame-boundary-scorer-v4-hardmix",
+                "operating_point": "qwen-mamba2-frame-boundary-scorer-v4-native",
                 "ptm_repo_id": ptm_repo_id,
                 "labels": labels_path,
                 "feature_manifest": feature_manifest_path,
+                "feature_hash": feature_hash,
+                "feature_hash_source": feature_hash_source,
+                "dataset_schema": dataset_metadata.get("dataset_schema", ""),
+                "dataset": dataset_metadata,
                 "records": len(records),
                 "train_windows": len(train_rows),
                 "eval_windows": len(eval_rows),
@@ -451,6 +462,113 @@ def train_feature_frame_scorer(
         encoding="utf-8",
     )
     return metrics
+
+
+def scorer_feature_hash(
+    *,
+    rows: Iterable[Mapping[str, Any]],
+    feature_manifest_path: str = "",
+) -> tuple[str, str]:
+    path = Path(feature_manifest_path) if feature_manifest_path else None
+    if path is not None and path.exists():
+        hasher = hashlib.sha256()
+        with path.open("rb") as handle:
+            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                hasher.update(chunk)
+        return hasher.hexdigest(), "feature_manifest_file_sha256"
+    signature_rows = []
+    for row in rows:
+        signature_rows.append(
+            {
+                "label_index": int(row.get("label_index") or 0),
+                "frame_count": int(row.get("frame_count") or 0),
+                "ptm": str(row.get("ptm") or ""),
+                "ptm_dim": int(row.get("ptm_dim") or 0),
+                "mfcc_dim": int(row.get("mfcc_dim") or 0),
+                "cache_key": str(row.get("cache_key") or ""),
+            }
+        )
+    encoded = json.dumps(signature_rows, ensure_ascii=False, sort_keys=True).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest(), "feature_rows_signature_sha256"
+
+
+def scorer_dataset_metadata(records: Iterable[LabelRecord]) -> dict[str, Any]:
+    schema_counts: Counter[str] = Counter()
+    type_counts: Counter[str] = Counter()
+    source_group_counts: Counter[str] = Counter()
+    negative_source_counts: Counter[str] = Counter()
+    partition_counts: Counter[str] = Counter()
+    asr_repo_ids: set[str] = set()
+    feature_hashes: set[str] = set()
+    speech_dilation_values: set[float] = set()
+    split_radius_values: set[int] = set()
+    drop_policies: set[str] = set()
+    seeds: set[int] = set()
+    for record in records:
+        metadata = dict(record.boundary_metadata or {})
+        dataset_schema = str(metadata.get("dataset_schema") or "")
+        if dataset_schema:
+            schema_counts[dataset_schema] += 1
+        example_type = str(metadata.get("native_example_type") or "")
+        if example_type:
+            type_counts[example_type] += 1
+        partition = str(metadata.get("source_partition") or "")
+        if partition:
+            partition_counts[partition] += 1
+        asr_repo_id = str(metadata.get("asr_repo_id") or "")
+        if asr_repo_id:
+            asr_repo_ids.add(asr_repo_id)
+        feature_hash = str(metadata.get("feature_hash") or "")
+        if feature_hash:
+            feature_hashes.add(feature_hash)
+        if metadata.get("speech_label_dilation_s") is not None:
+            try:
+                speech_dilation_values.add(float(metadata["speech_label_dilation_s"]))
+            except (TypeError, ValueError):
+                pass
+        if metadata.get("split_boundary_radius_frames") is not None:
+            try:
+                split_radius_values.add(int(metadata["split_boundary_radius_frames"]))
+            except (TypeError, ValueError):
+                pass
+        drop_policy = str(metadata.get("drop_policy") or "")
+        if drop_policy:
+            drop_policies.add(drop_policy)
+        if metadata.get("seed") is not None:
+            try:
+                seeds.add(int(metadata["seed"]))
+            except (TypeError, ValueError):
+                pass
+        source_mix = metadata.get("source_mix")
+        if isinstance(source_mix, Mapping):
+            speech_items = source_mix.get("speech") or []
+            for item in list(speech_items):
+                if isinstance(item, Mapping):
+                    source_group = str(item.get("source_group") or "")
+                    if source_group:
+                        source_group_counts[source_group] += 1
+        negative_source = metadata.get("negative_source")
+        if isinstance(negative_source, Mapping):
+            source_name = str(negative_source.get("negative_source") or "")
+            if source_name:
+                negative_source_counts[source_name] += 1
+    dataset_schema = ""
+    if schema_counts:
+        dataset_schema = schema_counts.most_common(1)[0][0]
+    return {
+        "dataset_schema": dataset_schema,
+        "dataset_schema_counts": dict(sorted(schema_counts.items())),
+        "native_example_type_counts": dict(sorted(type_counts.items())),
+        "source_group_counts": dict(sorted(source_group_counts.items())),
+        "negative_source_counts": dict(sorted(negative_source_counts.items())),
+        "source_partition_counts": dict(sorted(partition_counts.items())),
+        "asr_repo_ids": sorted(asr_repo_ids),
+        "feature_hashes": sorted(feature_hashes),
+        "speech_label_dilation_s_values": sorted(speech_dilation_values),
+        "split_boundary_radius_frame_values": sorted(split_radius_values),
+        "drop_policies": sorted(drop_policies),
+        "seeds": sorted(seeds),
+    }
 
 
 def feature_scorer_model_config(
@@ -879,6 +997,11 @@ def _feature_training_arrays(
     split_labels = split_targets[:frame_total].astype(np.float32)
     drop_gap_labels = drop_gap_targets[:frame_total].astype(np.float32)
     frame_weights = base_weights[:frame_total].astype(np.float32, copy=False)
+    head_weights = _head_frame_weights(
+        record=record,
+        frame_total=frame_total,
+        base_weights=frame_weights,
+    )
     features = np.concatenate(
         [
             np.ascontiguousarray(ptm[:frame_total], dtype=np.float32),
@@ -889,8 +1012,49 @@ def _feature_training_arrays(
     return (
         features,
         np.stack((speech_labels, split_labels, drop_gap_labels), axis=1).astype(np.float32, copy=False),
-        np.stack((frame_weights, frame_weights, frame_weights), axis=1).astype(np.float32, copy=False),
+        head_weights,
     )
+
+
+def _head_frame_weights(
+    *,
+    record: LabelRecord,
+    frame_total: int,
+    base_weights: np.ndarray,
+) -> np.ndarray:
+    frame_total = int(frame_total)
+    base = np.asarray(base_weights[:frame_total], dtype=np.float32).reshape(-1)
+    if int(base.shape[0]) != frame_total:
+        raise ValueError("base_weights length does not match frame_total")
+    metadata = dict(record.boundary_metadata or {})
+    raw_weights = metadata.get("head_frame_weights")
+    if raw_weights is None:
+        return np.stack((base, base, base), axis=1).astype(np.float32, copy=False)
+    if not isinstance(raw_weights, Mapping):
+        raise ValueError("boundary_metadata.head_frame_weights must be a mapping")
+    aliases = {
+        "speech": ("speech", "speech_prob"),
+        "split_boundary": ("split_boundary", "split", "split_boundary_prob"),
+        "drop_gap": ("drop_gap", "drop", "drop_gap_prob"),
+    }
+    columns: list[np.ndarray] = []
+    for canonical, names in aliases.items():
+        raw_values = None
+        for name in names:
+            if name in raw_weights:
+                raw_values = raw_weights[name]
+                break
+        if raw_values is None:
+            columns.append(base)
+            continue
+        values = np.asarray(list(raw_values), dtype=np.float32).reshape(-1)
+        if int(values.shape[0]) < frame_total:
+            raise ValueError(
+                "boundary_metadata.head_frame_weights."
+                f"{canonical} length {int(values.shape[0])} is shorter than frame_total {frame_total}"
+            )
+        columns.append((base * values[:frame_total]).astype(np.float32, copy=False))
+    return np.stack(columns, axis=1).astype(np.float32, copy=False)
 
 
 def resize_binary_frames(values: np.ndarray, target_frames: int) -> np.ndarray:

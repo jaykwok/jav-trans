@@ -52,6 +52,7 @@ from boundary.ja.backend import (
 )
 from boundary.ja.manifest import TrainingExample
 from boundary.ja.model import TinyFrameClassifier, load_feature_frame_scorer_checkpoint
+from boundary.ja.train import _feature_training_arrays
 
 def _require_mamba2():
     transformers = pytest.importorskip("transformers")
@@ -158,6 +159,90 @@ def test_label_record_and_endpoint_targets_keep_boundary_metadata():
     assert ends.tolist() == [0, 0, 1, 0, 0, 0, 0, 0, 0, 1]
     assert drop_gaps.tolist() == [0, 0, 0, 1, 1, 1, 1, 0, 0, 0]
     assert split_points.tolist()[5] == 1
+
+
+def test_feature_training_arrays_support_head_specific_frame_weights(tmp_path):
+    audio_path = tmp_path / "clip.wav"
+    audio_path.write_bytes(b"RIFF")
+    cached = write_feature_cache(
+        output_dir=tmp_path / "features",
+        audio_id="clip",
+        source="unit",
+        audio_path=audio_path,
+        config=FeatureConfig(feature_dim=2),
+        bundle={
+            "ptm": np.ones((10, 4), dtype=np.float32),
+            "mfcc": np.ones((10, 2), dtype=np.float32),
+            "duration_s": 1.0,
+            "sample_rate": 16000,
+        },
+        compressed=False,
+    )
+    record = replace(
+        build_supervised_record(
+            audio_id="clip",
+            source="unit",
+            duration_s=1.0,
+            speech_segments=[TeacherSegment(0.0, 0.3), TeacherSegment(0.7, 1.0)],
+            frame_hop_s=0.1,
+        ),
+        frame_weights=[1.0] * 10,
+        boundary_metadata={
+            "cut_drop_zones": [{"start": 0.3, "end": 0.7}],
+            "head_frame_weights": {
+                "speech": [1.0] * 10,
+                "split_boundary": [0.5] * 10,
+                "drop_gap": [0.0 if 3 <= index < 7 else 1.0 for index in range(10)],
+            },
+        },
+    )
+
+    _features, labels, weights = _feature_training_arrays(
+        row={"label_index": 0, "feature_path": cached.feature_path},
+        records=[record],
+        drop_gap_min_gap_s=0.5,
+    )
+
+    assert labels[4, 2] == 1.0
+    assert weights[:, 0].tolist() == [1.0] * 10
+    assert weights[:, 1].tolist() == [0.5] * 10
+    assert weights[4, 2] == 0.0
+
+
+def test_feature_training_arrays_reject_bad_head_weight_length(tmp_path):
+    audio_path = tmp_path / "clip.wav"
+    audio_path.write_bytes(b"RIFF")
+    cached = write_feature_cache(
+        output_dir=tmp_path / "features",
+        audio_id="clip",
+        source="unit",
+        audio_path=audio_path,
+        config=FeatureConfig(feature_dim=2),
+        bundle={
+            "ptm": np.ones((5, 4), dtype=np.float32),
+            "mfcc": np.ones((5, 2), dtype=np.float32),
+            "duration_s": 0.5,
+            "sample_rate": 16000,
+        },
+        compressed=False,
+    )
+    record = replace(
+        build_supervised_record(
+            audio_id="clip",
+            source="unit",
+            duration_s=0.5,
+            speech_segments=[TeacherSegment(0.0, 0.5)],
+            frame_hop_s=0.1,
+        ),
+        frame_weights=[1.0] * 5,
+        boundary_metadata={"head_frame_weights": {"drop_gap": [1.0, 1.0]}},
+    )
+
+    with pytest.raises(ValueError, match="head_frame_weights.drop_gap length"):
+        _feature_training_arrays(
+            row={"label_index": 0, "feature_path": cached.feature_path},
+            records=[record],
+        )
 
 
 def test_frame_helpers_and_metrics():
@@ -463,19 +548,39 @@ def test_feature_frame_scorer_training_from_cached_features(tmp_path):
     feature_dir.mkdir()
     labels_path = tmp_path / "labels.jsonl"
     records = [
-        build_supervised_record(
-            audio_id="pos",
-            source="unit",
-            duration_s=0.4,
-            speech_segments=[{"start": 0.1, "end": 0.3}],
-            frame_hop_s=0.1,
+        replace(
+            build_supervised_record(
+                audio_id="pos",
+                source="unit",
+                duration_s=0.4,
+                speech_segments=[{"start": 0.1, "end": 0.3}],
+                frame_hop_s=0.1,
+            ),
+            boundary_metadata={
+                "dataset_schema": "unit_scorer_dataset",
+                "native_example_type": "positive_speech_timeline",
+                "asr_repo_id": QWEN_ASR_17B_REPO_ID,
+                "source_mix": {"speech": [{"source_group": "unit"}]},
+                "speech_label_dilation_s": 0.06,
+                "split_boundary_radius_frames": 1,
+                "drop_policy": "unit",
+                "seed": 7,
+            },
         ),
-        build_supervised_record(
-            audio_id="neg",
-            source="unit",
-            duration_s=0.4,
-            speech_segments=[],
-            frame_hop_s=0.1,
+        replace(
+            build_supervised_record(
+                audio_id="neg",
+                source="unit",
+                duration_s=0.4,
+                speech_segments=[],
+                frame_hop_s=0.1,
+            ),
+            boundary_metadata={
+                "dataset_schema": "unit_scorer_dataset",
+                "native_example_type": "pure_hard_negative",
+                "negative_source": {"negative_source": "synthetic"},
+                "source_partition": "train",
+            },
         ),
     ]
     write_jsonl(labels_path, records)
@@ -525,6 +630,12 @@ def test_feature_frame_scorer_training_from_cached_features(tmp_path):
     bundle = load_feature_frame_scorer_checkpoint(metrics.checkpoint, device="cpu")
     assert bundle.signature()["metadata"]["trained_steps"] == 2
     assert bundle.signature()["metadata"]["ptm_repo_id"] == QWEN_ASR_17B_REPO_ID
+    assert bundle.metadata["dataset_schema"] == "unit_scorer_dataset"
+    assert bundle.metadata["feature_hash"]
+    assert bundle.metadata["dataset"]["native_example_type_counts"] == {
+        "positive_speech_timeline": 1,
+        "pure_hard_negative": 1,
+    }
 
 
 def test_feature_frame_scorer_training_rejects_missing_ptm_repo_id(tmp_path):
