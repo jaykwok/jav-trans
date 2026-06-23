@@ -545,7 +545,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--boundary-planner-sequence-batch-size", type=int, default=_env_int("BOUNDARY_PLANNER_SEQUENCE_BATCH_SIZE", 256))
     parser.add_argument("--keep-asr-chunks", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--boundary-cache", action=argparse.BooleanOptionalAction, default=_env_bool("BOUNDARY_CACHE_ENABLED", True))
-    parser.add_argument("--speech-boundary-threshold", dest="speech_boundary_threshold", type=float, default=_env_float("SPEECH_BOUNDARY_JA_THRESHOLD", 0.200))
+    parser.add_argument("--speech-boundary-threshold", dest="speech_boundary_threshold", type=float, default=_env_float("SPEECH_BOUNDARY_JA_THRESHOLD", 0.5))
     parser.add_argument(
         "--speech-boundary-speech-on-threshold",
         dest="speech_boundary_speech_on_threshold",
@@ -561,7 +561,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Speech deactivation threshold. Defaults to --speech-boundary-threshold.",
     )
     parser.add_argument("--speech-boundary-frame-dilation-s", dest="speech_boundary_frame_dilation_s", type=float, default=_env_float("SPEECH_BOUNDARY_JA_FRAME_DILATION_S", 0.2))
-    parser.add_argument("--speech-boundary-drop-gap-threshold", dest="speech_boundary_drop_gap_threshold", type=float, default=_env_float("SPEECH_BOUNDARY_JA_DROP_GAP_THRESHOLD", 0.75))
+    parser.add_argument("--speech-boundary-drop-gap-threshold", dest="speech_boundary_drop_gap_threshold", type=float, default=_env_float("SPEECH_BOUNDARY_JA_DROP_GAP_THRESHOLD", 0.5))
     parser.add_argument("--speech-boundary-split-target-s", dest="speech_boundary_split_target_s", type=float, default=_env_float("SPEECH_BOUNDARY_JA_SPLIT_TARGET_S", 5.0))
     parser.add_argument("--speech-boundary-split-score-quantile", dest="speech_boundary_split_score_quantile", type=float, default=_env_float("SPEECH_BOUNDARY_JA_SPLIT_SCORE_QUANTILE", 0.50))
     parser.add_argument("--speech-boundary-split-prominence-quantile", dest="speech_boundary_split_prominence_quantile", type=float, default=_env_float("SPEECH_BOUNDARY_JA_SPLIT_PROMINENCE_QUANTILE", 0.50))

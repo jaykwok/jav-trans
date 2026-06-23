@@ -48,6 +48,20 @@ def test_run_full_workflow_operating_point_defaults_without_scorer():
     )
 
 
+def test_run_full_workflow_boundary_threshold_defaults_match_training_eval(monkeypatch):
+    monkeypatch.delenv("SPEECH_BOUNDARY_JA_THRESHOLD", raising=False)
+    monkeypatch.delenv("SPEECH_BOUNDARY_JA_SPEECH_ON_THRESHOLD", raising=False)
+    monkeypatch.delenv("SPEECH_BOUNDARY_JA_SPEECH_OFF_THRESHOLD", raising=False)
+    monkeypatch.delenv("SPEECH_BOUNDARY_JA_DROP_GAP_THRESHOLD", raising=False)
+
+    args = run_full_workflow.parse_args(["--video", "sample.mp4"])
+
+    assert args.speech_boundary_threshold == 0.5
+    assert args.speech_boundary_speech_on_threshold == 0.5
+    assert args.speech_boundary_speech_off_threshold == 0.5
+    assert args.speech_boundary_drop_gap_threshold == 0.5
+
+
 def test_run_full_workflow_parse_args_uses_loaded_env(monkeypatch):
     monkeypatch.setenv("ASR_BACKEND", "jaykwok/Qwen3-ASR-0.6B-JA-Anime-Galgame")
     monkeypatch.setenv("ASR_MODEL_PATH", "")

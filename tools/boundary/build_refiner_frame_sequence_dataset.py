@@ -45,12 +45,12 @@ class FrameSequenceConfig:
     max_ptm_dims: int = 64
     include_mfcc: bool = True
     frame_hop_s: float = 0.02
-    threshold: float = 0.200
+    threshold: float = 0.5
     speech_on_threshold: float | None = None
     speech_off_threshold: float | None = None
     frame_dilation_s: float = 0.2
     min_segment_s: float = 0.05
-    drop_gap_threshold: float = 0.75
+    drop_gap_threshold: float = 0.5
     split_target_s: float = 5.0
     split_smooth_s: float = 0.08
     split_nms_s: float = 0.20
@@ -731,12 +731,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--max-ptm-dims", type=int, default=64)
     parser.add_argument("--no-mfcc", action="store_true")
     parser.add_argument("--frame-hop-s", type=float, default=0.02)
-    parser.add_argument("--threshold", type=float, default=0.200)
+    parser.add_argument("--threshold", type=float, default=0.5)
     parser.add_argument("--speech-on-threshold", type=float, default=None)
     parser.add_argument("--speech-off-threshold", type=float, default=None)
     parser.add_argument("--frame-dilation-s", type=float, default=0.2)
     parser.add_argument("--min-segment-s", type=float, default=0.05)
-    parser.add_argument("--drop-gap-threshold", type=float, default=0.75)
+    parser.add_argument("--drop-gap-threshold", type=float, default=0.5)
     parser.add_argument("--split-target-s", type=float, default=5.0)
     parser.add_argument("--split-score-quantile", type=float, default=0.50)
     parser.add_argument("--split-prominence-quantile", type=float, default=0.50)

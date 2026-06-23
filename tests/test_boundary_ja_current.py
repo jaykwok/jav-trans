@@ -358,6 +358,8 @@ def test_write_jsonl_and_bootstrap_backend_signature(tmp_path):
     assert DEFAULT_MODEL_PATH == "models/jaykwok-Qwen3-ASR-1.7B-JA-Anime-Galgame"
     assert DEFAULT_OPERATING_POINT == "qwen-mamba2-frame-boundary-scorer-v4"
     assert cfg.ptm == QWEN_ASR_REPO_ID
+    assert cfg.threshold == 0.5
+    assert cfg.drop_gap_threshold == 0.5
     assert cfg.scorer_checkpoint == ""
     assert cfg.scorer_checkpoint_repo_id == ""
     assert not hasattr(cfg, "imitation_checkpoint")
