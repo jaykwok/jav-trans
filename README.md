@@ -317,11 +317,13 @@ uv run python -m tools.web.smoke.summarize_job --job-id <job_id> --run-dir agent
 - `tools.boundary.build_weighted_source_manifest`：按权重合并 anime / galgame source manifest，供 scorer/refiner 训练数据构造使用。
 - `tools.boundary.build_refiner_frame_sequence_dataset`：基于 scorer v4 predicted island edge 导出 `boundary_edge_refiner_dataset_v6` 训练 JSONL；必须显式传 `--scorer-checkpoint`，row metadata 会记录 scorer schema / repo id / sha。
 - `tools.boundary.train_refiner`：训练 `boundary_edge_refiner_v6` edge-only checkpoint，输出文件名默认带 repo id tag。
+- `tools.boundary.export_cueqc_cluster_seed_hardcases`：把 CueQC cluster 审计里保守的 `seed_action=use_seed` + `display_decision=drop` 空文本簇导出为 SpeechBoundary-JA hard-negative 候选；`mixed_skip` / `skip` / text-present 簇默认 abstain。
 - `tools.boundary.export_cueqc_drop_hardcases`：把 CueQC false-drop 审计中已确认可丢弃的 chunk 导出为 SpeechBoundary-JA hard-negative 候选池；不会生成 Boundary Refiner 训练标签。
 - `tools.boundary.prepare_cueqc_drop_hard_negative_sources`：把 CueQC `drop_ok` hard-negative 候选补回审计音频，并切出 SpeechBoundary-JA negative labels；不会直接启动训练。
 - `tools.boundary.prepare_speech_boundary_hard_negative_replay`：校验 CueQC `drop_ok` hard-negative replay source，并混合 positive/synthetic anchor replay；该工具不生成 first-scorer 训练脚本。
 - `tools.boundary.ja.build_positive_anchor_replay`：从 anime / galgame 源 manifest 按权重抽样生成 SpeechBoundary-JA positive anchor replay labels。
 - `tools.boundary.ja.build_galgame_synthetic_timeline`：按 v5-style 随机时间线生成带 `speech_frames`、`cut_point_segments` 和 `cut_drop_zones` 的 SpeechBoundary-JA synthetic labels。
+- `tools.boundary.ja.build_scorer_v4_native_dataset`：生成 `speech_boundary_ja_scorer_v4_native_dataset`，把 `speech`、`split_boundary`、`drop_gap` 三个监督语义分开，并写入 source-id 分组 split metadata。
 - `tools.boundary.ja.build_feature_cache`：为 SpeechBoundary-JA scorer 训练缓存 Qwen PTM + MFCC feature。
 - `tools.boundary.ja.train_feature_scorer`：训练 runtime-loadable SpeechBoundary-JA Mamba2 scorer v4，输出三头 `speech/split_boundary/drop_gap`。
 - `tools.boundary.ja.export_frame_scores`：导出 scorer v4 frame scores，用于诊断 speech island、adaptive split peak 和 drop gap 行为。
