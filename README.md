@@ -318,6 +318,7 @@ uv run python -m tools.web.smoke.summarize_job --job-id <job_id> --run-dir agent
 - `tools.boundary.build_refiner_frame_sequence_dataset`：基于 scorer v4 predicted island edge 导出 `boundary_edge_refiner_dataset_v6` 训练 JSONL；必须显式传 `--scorer-checkpoint`，row metadata 会记录 scorer schema / repo id / sha。
 - `tools.boundary.train_refiner`：训练 `boundary_edge_refiner_v6` edge-only checkpoint，输出文件名默认带 repo id tag。
 - `tools.boundary.export_cueqc_cluster_seed_hardcases`：把 CueQC cluster 审计里保守的 `seed_action=use_seed` + `display_decision=drop` 空文本簇导出为 SpeechBoundary-JA hard-negative 候选；`mixed_skip` / `skip` / text-present 簇默认 abstain。
+- `tools.boundary.export_cueqc_seed_drop_background_spans`：基于已审计 seed-drop 候选，在 fresh CueQC 全量候选时间轴上合并连续空文本背景 span，输出可物化的 SpeechBoundary-JA hard-negative 候选。
 - `tools.boundary.export_cueqc_drop_hardcases`：把 CueQC false-drop 审计中已确认可丢弃的 chunk 导出为 SpeechBoundary-JA hard-negative 候选池；不会生成 Boundary Refiner 训练标签。
 - `tools.boundary.prepare_cueqc_drop_hard_negative_sources`：把 CueQC `drop_ok` hard-negative 候选补回审计音频，并切出 SpeechBoundary-JA negative labels；不会直接启动训练。
 - `tools.boundary.prepare_speech_boundary_hard_negative_replay`：校验 CueQC `drop_ok` hard-negative replay source，并混合 positive/synthetic anchor replay；该工具不生成 first-scorer 训练脚本。
