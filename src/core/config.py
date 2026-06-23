@@ -84,8 +84,8 @@ DEFAULT_SETTINGS: dict[str, str] = {
     "ASR_REPETITION_PENALTY": "1.05",
 
     # --- Boundary Refiner / ASR Chunking ---
-    # Discard exported ASR wav chunks shorter than this many seconds.
-    "ASR_CHUNK_MIN_DURATION_S": "0.25",
+    # Discard only deglitch-sized exported ASR wav chunks; scorer split validation owns real chunking.
+    "ASR_CHUNK_MIN_DURATION_S": "0.08",
     # Reset sliding ASR text context when adjacent chunks are separated by this gap.
     "ASR_CONTEXT_RESET_GAP_S": "0.5",
     # Boundary Refiner is the current pre-ASR chunk planning path.
@@ -110,10 +110,6 @@ DEFAULT_SETTINGS: dict[str, str] = {
     "BOUNDARY_CACHE_ENABLED": "1",
     # Persistent boundary cache directory. Versioned as boundary-cache v7.
     "BOUNDARY_CACHE_DIR": "./tmp/cache/boundary",
-
-    # --- ASR Segmentation ---
-    # Hard cap for grouping subtitle timing units into one subtitle candidate.
-    "ASR_SEGMENT_HARD_MAX_DURATION": "9.0",
 
     # --- CueQC Mamba v4 binary keep/drop filter ---
     # 1 records CueQC candidate features and model/fallback decisions.

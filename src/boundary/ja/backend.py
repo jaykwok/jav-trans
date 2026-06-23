@@ -666,7 +666,7 @@ def decode_frame_boundary_segments(
 
 @dataclass(frozen=True)
 class SpeechBoundaryJaConfig:
-    threshold: float = 0.200
+    threshold: float = 0.5
     speech_on_threshold: float | None = None
     speech_off_threshold: float | None = None
     frame_dilation_s: float = 0.2
@@ -679,7 +679,7 @@ class SpeechBoundaryJaConfig:
     window_s: float = 30.0
     overlap_s: float = 1.0
     min_segment_s: float = 0.05
-    drop_gap_threshold: float = 0.75
+    drop_gap_threshold: float = 0.5
     split_target_s: float = 5.0
     split_smooth_s: float = 0.08
     split_nms_s: float = 0.20
@@ -701,7 +701,7 @@ class SpeechBoundaryJaConfig:
         model_path = os.getenv("SPEECH_BOUNDARY_JA_MODEL_PATH", "").strip() or qwen_asr_default_model_path(ptm)
         scorer_checkpoint = _scorer_checkpoint_from_env(ptm)
         return cls(
-            threshold=_env_float("SPEECH_BOUNDARY_JA_THRESHOLD", "0.200"),
+            threshold=_env_float("SPEECH_BOUNDARY_JA_THRESHOLD", "0.5"),
             speech_on_threshold=_env_optional_float("SPEECH_BOUNDARY_JA_SPEECH_ON_THRESHOLD"),
             speech_off_threshold=_env_optional_float("SPEECH_BOUNDARY_JA_SPEECH_OFF_THRESHOLD"),
             frame_dilation_s=_env_float("SPEECH_BOUNDARY_JA_FRAME_DILATION_S", "0.2"),
@@ -714,7 +714,7 @@ class SpeechBoundaryJaConfig:
             window_s=_env_float("SPEECH_BOUNDARY_JA_WINDOW_S", "30.0"),
             overlap_s=_env_float("SPEECH_BOUNDARY_JA_OVERLAP_S", "1.0"),
             min_segment_s=_env_float("SPEECH_BOUNDARY_JA_MIN_SEGMENT_S", "0.05"),
-            drop_gap_threshold=_env_float("SPEECH_BOUNDARY_JA_DROP_GAP_THRESHOLD", "0.75"),
+            drop_gap_threshold=_env_float("SPEECH_BOUNDARY_JA_DROP_GAP_THRESHOLD", "0.5"),
             split_target_s=_env_float("SPEECH_BOUNDARY_JA_SPLIT_TARGET_S", "5.0"),
             split_smooth_s=_env_float("SPEECH_BOUNDARY_JA_SPLIT_SMOOTH_S", "0.08"),
             split_nms_s=_env_float("SPEECH_BOUNDARY_JA_SPLIT_NMS_S", "0.20"),

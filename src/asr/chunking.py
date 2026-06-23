@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import Callable
 
 
-_ASR_CHUNK_MIN_DURATION_S = float(os.getenv("ASR_CHUNK_MIN_DURATION_S", "0.25"))
+_ASR_CHUNK_MIN_DURATION_S = float(os.getenv("ASR_CHUNK_MIN_DURATION_S", "0.08"))
 _KEEP_ASR_CHUNKS = os.getenv("KEEP_ASR_CHUNKS", "").strip().lower() in {
     "1",
     "true",

@@ -42,17 +42,6 @@ _ASR_INVALID_SEGMENT_DURATION_S = float(
 _ASR_MIN_REPAIRED_SEGMENT_DURATION_S = float(
     os.getenv("ASR_MIN_REPAIRED_SEGMENT_DURATION", "0.6")
 )
-_ASR_POSTPROCESS_MAX_CHARS = max(
-    8,
-    int(os.getenv("ASR_POSTPROCESS_MAX_CHARS", "60")),
-)
-_ASR_POSTPROCESS_MAX_DURATION_S = float(
-    os.getenv("ASR_POSTPROCESS_MAX_DURATION", "12.5")
-)
-_ASR_POSTPROCESS_SPLIT_MIN_CHARS = max(
-    4,
-    int(os.getenv("ASR_POSTPROCESS_SPLIT_MIN_CHARS", "4")),
-)
 _ASR_CHECKPOINT_INTERVAL = max(1, int(os.getenv("ASR_CHECKPOINT_INTERVAL", "50")))
 _ASR_SUBPROCESS_RESPAWN_MAX = max(
     0,
@@ -72,7 +61,6 @@ _TRIVIAL_SEGMENT = re.compile(
     r"^[。！？…、\s,.!?・「」（）【】；：\-—–]+$"
 )
 _STRIP_PUNCT_RE = re.compile(r"[。！？…、,.!?・「」『』（）()【】\[\]\s~〜ー-]+")
-_TEXT_UNIT_COMPACT_RE = re.compile(r"[^0-9A-Za-zぁ-ゖァ-ヺ一-龯々〆ヵヶ]+")
 _SENTENCE_TERMINAL_RE = re.compile(r"[。！？!?…」』）)\]]$")
 
 
@@ -98,10 +86,6 @@ class ASRWorkerSystemError(RuntimeError):
 
 def _strip_punctuation(text: str) -> str:
     return _STRIP_PUNCT_RE.sub("", text or "")
-
-
-def _compact_text_units(text: str) -> str:
-    return _TEXT_UNIT_COMPACT_RE.sub("", text or "")
 
 
 def _collapse_repeated_noise(text: str) -> str:
@@ -874,99 +858,7 @@ def _postprocess_segments(segments: list[dict]) -> list[dict]:
         )
 
     cleaned_segments.sort(key=lambda item: (item["start"], item["end"]))
-    split_segments = _split_long_postprocessed_segments(cleaned_segments)
-    return _repair_postprocessed_segment_windows(split_segments)
-
-
-def _pick_postprocess_split_index(text: str) -> int:
-    text = (text or "").strip()
-    if len(text) < _ASR_POSTPROCESS_SPLIT_MIN_CHARS * 2:
-        return 0
-
-    target = len(text) // 2
-    split_chars = "。！？!?…、,，・ "
-    candidates = [
-        idx + 1
-        for idx, char in enumerate(text[:-1])
-        if char in split_chars
-        and _ASR_POSTPROCESS_SPLIT_MIN_CHARS <= idx + 1
-        and len(text) - (idx + 1) >= _ASR_POSTPROCESS_SPLIT_MIN_CHARS
-    ]
-    if candidates:
-        return min(candidates, key=lambda idx: abs(idx - target))
-
-    return target
-
-
-def _split_long_postprocessed_segment(segment: dict) -> list[dict]:
-    text = str(segment.get("text", "")).strip()
-    start = float(segment.get("start", 0.0))
-    end = float(segment.get("end", start))
-    duration = max(0.0, end - start)
-    compact_len = len(_compact_text_units(text))
-    original_words = list(segment.get("words") or [])
-
-    if (
-        compact_len <= _ASR_POSTPROCESS_MAX_CHARS
-        and duration <= _ASR_POSTPROCESS_MAX_DURATION_S
-    ):
-        return [segment]
-
-    split_idx = _pick_postprocess_split_index(text)
-    if not split_idx:
-        return [segment]
-
-    left_text = text[:split_idx].strip()
-    right_text = text[split_idx:].strip()
-    if not left_text or not right_text:
-        return [segment]
-
-    left_weight = max(1, len(_compact_text_units(left_text)))
-    right_weight = max(1, len(_compact_text_units(right_text)))
-    split_time = start + duration * (left_weight / (left_weight + right_weight))
-    if (
-        split_time - start <= _ASR_INVALID_SEGMENT_DURATION_S
-        or end - split_time <= _ASR_INVALID_SEGMENT_DURATION_S
-    ):
-        return [segment]
-
-    left_words = [
-        word
-        for word in original_words
-        if float(word.get("start", start)) < split_time
-    ]
-    right_words = [
-        word
-        for word in original_words
-        if float(word.get("start", start)) >= split_time
-    ]
-    assert len(left_words) + len(right_words) == len(original_words)
-
-    left_segment = {
-        "start": start,
-        "end": split_time,
-        "text": left_text,
-        "source_chunk_index": segment.get("source_chunk_index"),
-        "words": left_words,
-    }
-    right_segment = {
-        "start": split_time,
-        "end": end,
-        "text": right_text,
-        "source_chunk_index": segment.get("source_chunk_index"),
-        "words": right_words,
-    }
-    return (
-        _split_long_postprocessed_segment(left_segment)
-        + _split_long_postprocessed_segment(right_segment)
-    )
-
-
-def _split_long_postprocessed_segments(segments: list[dict]) -> list[dict]:
-    split_segments: list[dict] = []
-    for segment in segments:
-        split_segments.extend(_split_long_postprocessed_segment(dict(segment)))
-    return split_segments
+    return _repair_postprocessed_segment_windows(cleaned_segments)
 
 
 def _repair_postprocessed_segment_windows(segments: list[dict]) -> list[dict]:
@@ -1029,59 +921,8 @@ def _group_words_to_segments(words: list[dict]) -> list[dict]:
     if not words:
         return []
 
-    japanese_sentence_end = {"。", "！", "？", "…", "!", "?"}
-    soft_max_chars = 45
-    hard_max_chars = 60
-    max_duration = 8.5
-    hard_max_duration = float(os.getenv("ASR_SEGMENT_HARD_MAX_DURATION", "9.0"))
-    max_gap = 1.2
-
     segments: list[dict] = []
     current_words: list[dict] = []
-
-    def _pick_sentence_split(word_list: list[dict]) -> int:
-        if len(word_list) < 2:
-            return 0
-
-        total_text = "".join(w["word"] for w in word_list).strip()
-        total_len = len(total_text)
-        segment_start = word_list[0]["start"]
-        running_len = 0
-        candidates: list[tuple[float, int]] = []
-
-        for idx, item in enumerate(word_list[:-1], 1):
-            token = item["word"]
-            running_len += len(token)
-            if not token or token[-1] not in japanese_sentence_end:
-                continue
-
-            left_duration = item["end"] - segment_start
-            right_words = word_list[idx:]
-            right_text_len = total_len - running_len
-            right_duration = (
-                word_list[-1]["end"] - right_words[0]["start"] if right_words else 0.0
-            )
-
-            if running_len < 8 or left_duration < 1.0:
-                continue
-
-            score = abs(running_len - soft_max_chars)
-            if right_text_len < 6:
-                score += 100
-            elif right_text_len < 10:
-                score += 12
-            if right_duration < 0.5:
-                score += 40
-            if running_len > hard_max_chars:
-                score += 25
-
-            candidates.append((score, idx))
-
-        if not candidates:
-            return 0
-
-        candidates.sort(key=lambda item: item[0])
-        return candidates[0][1]
 
     def flush(word_list: list[dict]) -> None:
         if not word_list:
@@ -1089,13 +930,6 @@ def _group_words_to_segments(words: list[dict]) -> list[dict]:
         text = "".join(w["word"] for w in word_list).strip()
         if not text:
             return
-        segment_duration = word_list[-1]["end"] - word_list[0]["start"]
-        if len(text) > soft_max_chars or segment_duration > max_duration:
-            split_idx = _pick_sentence_split(word_list)
-            if split_idx:
-                flush(word_list[:split_idx])
-                flush(word_list[split_idx:])
-                return
         if _TRIVIAL_SEGMENT.match(text):
             return
         segments.append(
@@ -1113,12 +947,6 @@ def _group_words_to_segments(words: list[dict]) -> list[dict]:
             current_words.append(word)
             continue
 
-        segment_duration = current_words[-1]["end"] - current_words[0]["start"]
-        segment_text = "".join(w["word"] for w in current_words)
-        gap = word["start"] - current_words[-1]["end"]
-        ends_sentence = bool(segment_text) and segment_text[-1] in japanese_sentence_end
-        projected_text = segment_text + word["word"]
-        projected_duration = word["end"] - current_words[0]["start"]
         current_chunk = current_words[-1].get("source_chunk_index")
         next_chunk = word.get("source_chunk_index")
         crosses_chunk_boundary = (
@@ -1126,46 +954,8 @@ def _group_words_to_segments(words: list[dict]) -> list[dict]:
             and next_chunk is not None
             and current_chunk != next_chunk
         )
-        should_split_turn = (
-            (
-                ends_sentence
-                and segment_duration >= 0.8
-                and len(segment_text) >= 4
-            )
-            or (ends_sentence and gap > 0.05)
-            or (
-                gap > 0.35
-                and segment_duration >= 0.8
-                and len(segment_text) >= 4
-            )
-            or (
-                gap > 0.2
-                and segment_duration >= 1.2
-                and len(segment_text) >= 8
-            )
-            or (
-                segment_duration >= 4.0
-                and len(segment_text) >= 20
-            )
-        )
-        exceeds_segment_limits = (
-            (
-                ends_sentence
-                and (
-                    gap > max_gap
-                    or segment_duration >= max_duration
-                    or len(segment_text) >= soft_max_chars
-                )
-            )
-            or len(projected_text) > hard_max_chars
-            or projected_duration >= hard_max_duration
-        )
 
-        if (
-            crosses_chunk_boundary
-            or should_split_turn
-            or exceeds_segment_limits
-        ):
+        if crosses_chunk_boundary:
             flush(current_words)
             current_words = [word]
         else:

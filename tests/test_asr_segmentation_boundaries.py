@@ -1,4 +1,8 @@
+from pathlib import Path
+
 from asr import pipeline as asr
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
 
 def test_word_group_does_not_cross_source_chunk_boundary():
@@ -16,7 +20,7 @@ def test_word_group_does_not_cross_source_chunk_boundary():
     ]
 
 
-def test_word_group_splits_compact_sentence_turns_inside_chunk():
+def test_word_group_keeps_same_source_chunk_as_one_segment():
     words = [
         {"start": 0.0, "end": 0.4, "word": "そうですね。", "source_chunk_index": 1},
         {"start": 0.5, "end": 1.0, "word": "ありがとうございます。", "source_chunk_index": 1},
@@ -24,10 +28,8 @@ def test_word_group_splits_compact_sentence_turns_inside_chunk():
 
     segments = asr._group_words_to_segments(words)
 
-    assert [segment["text"] for segment in segments] == [
-        "そうですね。",
-        "ありがとうございます。",
-    ]
+    assert [segment["text"] for segment in segments] == ["そうですね。ありがとうございます。"]
+    assert segments[0]["source_chunk_index"] == 1
 
 
 def test_postprocess_keeps_same_chunk_fragments_separate():
@@ -60,6 +62,33 @@ def test_postprocess_keeps_short_domain_vocalizations():
         "好き",
         "たたたた",
     ]
+
+
+def test_postprocess_does_not_hard_split_long_word_backed_segment():
+    text = "これは長い同一ASRチャンクです。後段では時間や文字数で分割しません。"
+    segments = [
+        {
+            "start": 10.0,
+            "end": 44.0,
+            "text": text,
+            "source_chunk_index": 7,
+            "words": [
+                {
+                    "start": 10.0,
+                    "end": 44.0,
+                    "word": text,
+                    "source_chunk_index": 7,
+                }
+            ],
+        }
+    ]
+
+    postprocessed = asr._postprocess_segments(segments)
+
+    assert len(postprocessed) == 1
+    assert postprocessed[0]["start"] == 10.0
+    assert postprocessed[0]["end"] == 44.0
+    assert postprocessed[0]["text"] == text
 
 
 def test_postprocess_preserves_word_backed_context_actor_intro(monkeypatch):
@@ -110,3 +139,26 @@ def test_postprocess_locks_next_start_when_repairing_overlap():
     assert [segment["text"] for segment in postprocessed] == ["前の字幕", "次の字幕"]
     assert postprocessed[0]["end"] <= postprocessed[1]["start"]
     assert postprocessed[1]["start"] == 1.0
+
+
+def test_removed_asr_post_split_runtime_knobs_are_absent():
+    removed = (
+        "ASR_SEGMENT_HARD_MAX_DURATION",
+        "ASR_POSTPROCESS_MAX_CHARS",
+        "ASR_POSTPROCESS_MAX_DURATION",
+        "ASR_POSTPROCESS_SPLIT_MIN_CHARS",
+        "_pick_postprocess_split_index",
+        "_split_long_postprocessed_segment",
+        "_split_long_postprocessed_segments",
+    )
+    checked_paths = [
+        PROJECT_ROOT / ".env.example",
+        PROJECT_ROOT / "src" / "asr" / "pipeline.py",
+        PROJECT_ROOT / "src" / "asr" / "transcribe.py",
+        PROJECT_ROOT / "src" / "core" / "config.py",
+    ]
+
+    for path in checked_paths:
+        text = path.read_text(encoding="utf-8")
+        for key in removed:
+            assert key not in text, path
