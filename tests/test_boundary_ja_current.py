@@ -502,6 +502,7 @@ def test_scorer_split_peak_selection_keeps_all_effective_peaks_after_nms():
         min_split_segment_s=0.1,
         split_score_quantile=0.0,
         split_prominence_quantile=0.0,
+        video_fps=240.0,
     )
     frame_total = 428
     split_probs = np.full(frame_total, 0.02, dtype=np.float32)
@@ -532,6 +533,158 @@ def test_scorer_split_peak_selection_keeps_all_effective_peaks_after_nms():
     assert any(15.0 <= segment.start <= 20.0 for segment in result.segments)
 
 
+def test_scorer_decoder_exports_primary_and_weak_cut_candidates():
+    cfg = SpeechBoundaryJaConfig(
+        frame_hop_s=0.1,
+        threshold=0.5,
+        speech_on_threshold=0.5,
+        speech_off_threshold=0.5,
+        frame_dilation_s=0.0,
+        min_segment_s=0.0,
+        split_smooth_s=0.0,
+        split_nms_s=0.1,
+        split_snap_s=0.0,
+        min_split_segment_s=0.1,
+        split_score_quantile=0.75,
+        split_prominence_quantile=0.0,
+        video_fps=24.0,
+    )
+    split_probs = np.full(100, 0.01, dtype=np.float32)
+    split_probs[20] = 0.90
+    split_probs[50] = 0.30
+
+    result = decode_frame_boundary_segments(
+        speech_probabilities=np.full(100, 0.9, dtype=np.float32),
+        split_probabilities=split_probs,
+        duration_s=10.0,
+        config=cfg,
+    )
+
+    assert [(segment.start, segment.end) for segment in result.segments] == [
+        (0.0, pytest.approx(2.0)),
+        (pytest.approx(2.0), 10.0),
+    ]
+    assert result.segments[1].primary_cut_candidates[0]["time_s"] == pytest.approx(2.0)
+    assert result.segments[1].weak_cut_candidates[0]["time_s"] == pytest.approx(5.0)
+    assert result.segments[1].weak_cut_candidates[0]["kind"] == "weak"
+
+
+def test_micro_chunk_resolver_merges_middle_segment_into_left_when_left_split_weaker():
+    frame_hop_s = 0.1
+    cfg = SpeechBoundaryJaConfig(
+        frame_hop_s=frame_hop_s,
+        threshold=0.5,
+        speech_on_threshold=0.5,
+        speech_off_threshold=0.5,
+        frame_dilation_s=0.0,
+        min_segment_s=0.0,
+        split_smooth_s=0.0,
+        split_nms_s=0.1,
+        split_snap_s=0.0,
+        min_split_segment_s=0.1,
+        split_score_quantile=0.0,
+        split_prominence_quantile=0.0,
+        video_fps=24.0,
+    )
+    split_probs = np.full(30, 0.01, dtype=np.float32)
+    split_probs[10] = 0.30
+    split_probs[15] = 0.80
+
+    result = decode_frame_boundary_segments(
+        speech_probabilities=np.full(30, 0.9, dtype=np.float32),
+        split_probabilities=split_probs,
+        duration_s=3.0,
+        config=cfg,
+    )
+
+    assert [(segment.start, segment.end) for segment in result.segments] == [
+        (0.0, pytest.approx(1.5)),
+        (pytest.approx(1.5), 3.0),
+    ]
+    assert result.segments[0].micro_resolve_action == "merge_micro_into_left"
+    assert result.segments[0].below_subtitle_min_duration is False
+    assert result.segments[0].weak_cut_candidates[0]["time_s"] == pytest.approx(1.0)
+    assert result.segments[0].weak_cut_candidates[0]["downgraded_from"] == "primary"
+
+
+def test_micro_chunk_resolver_merges_middle_segment_into_right_when_right_split_weaker():
+    frame_hop_s = 0.1
+    cfg = SpeechBoundaryJaConfig(
+        frame_hop_s=frame_hop_s,
+        threshold=0.5,
+        speech_on_threshold=0.5,
+        speech_off_threshold=0.5,
+        frame_dilation_s=0.0,
+        min_segment_s=0.0,
+        split_smooth_s=0.0,
+        split_nms_s=0.1,
+        split_snap_s=0.0,
+        min_split_segment_s=0.1,
+        split_score_quantile=0.0,
+        split_prominence_quantile=0.0,
+        video_fps=24.0,
+    )
+    split_probs = np.full(30, 0.01, dtype=np.float32)
+    split_probs[10] = 0.80
+    split_probs[15] = 0.30
+
+    result = decode_frame_boundary_segments(
+        speech_probabilities=np.full(30, 0.9, dtype=np.float32),
+        split_probabilities=split_probs,
+        duration_s=3.0,
+        config=cfg,
+    )
+
+    assert [(segment.start, segment.end) for segment in result.segments] == [
+        (0.0, pytest.approx(1.0)),
+        (pytest.approx(1.0), 3.0),
+    ]
+    assert result.segments[1].micro_resolve_action == "merge_micro_into_right"
+    assert result.segments[1].below_subtitle_min_duration is False
+
+
+def test_micro_chunk_resolver_preserves_balanced_short_middle_segment_for_model_route():
+    frame_hop_s = 0.1
+    cfg = SpeechBoundaryJaConfig(
+        frame_hop_s=frame_hop_s,
+        threshold=0.5,
+        speech_on_threshold=0.5,
+        speech_off_threshold=0.5,
+        frame_dilation_s=0.0,
+        min_segment_s=0.0,
+        split_smooth_s=0.0,
+        split_nms_s=0.1,
+        split_snap_s=0.0,
+        min_split_segment_s=0.1,
+        split_score_quantile=0.0,
+        split_prominence_quantile=0.0,
+        video_fps=24.0,
+    )
+    split_probs = np.full(30, 0.01, dtype=np.float32)
+    split_probs[10] = 0.80
+    split_probs[15] = 0.82
+
+    result = decode_frame_boundary_segments(
+        speech_probabilities=np.full(30, 0.9, dtype=np.float32),
+        split_probabilities=split_probs,
+        duration_s=3.0,
+        config=cfg,
+    )
+
+    assert [(segment.start, segment.end) for segment in result.segments] == [
+        (0.0, pytest.approx(1.0)),
+        (pytest.approx(1.0), pytest.approx(1.5)),
+        (pytest.approx(1.5), 3.0),
+    ]
+    middle = result.segments[1]
+    assert middle.subtitle_min_duration_s == pytest.approx(20.0 / 24.0)
+    assert middle.below_subtitle_min_duration is True
+    assert middle.micro_chunk_candidate is True
+    assert middle.micro_resolve_action == "preserve_micro_candidate"
+    assert middle.left_split_score == pytest.approx(0.80)
+    assert middle.right_split_score == pytest.approx(0.82)
+
+
 def test_feature_frame_scorer_checkpoint_round_trip(tmp_path):
     torch = pytest.importorskip("torch")
     model, model_config = _build_mamba2_scorer(ptm_dim=4, mfcc_dim=2)
@@ -556,6 +709,7 @@ def test_feature_frame_scorer_checkpoint_round_trip(tmp_path):
 
     assert bundle.signature()["schema"] == MAMBA2_FRAME_SCORER_SCHEMA
     assert bundle.signature()["model_type"] == "mamba2_frame_boundary_scorer"
+    assert bundle.signature()["metadata"]["decoder"] == "topographic_split_micro_resolver_v3"
     assert bundle.input_dim == 6
     assert speech_probs.shape == (3,)
     assert split_probs.shape == (3,)
@@ -587,6 +741,26 @@ def test_feature_frame_scorer_rejects_removed_v1_schema(tmp_path):
     )
 
     with pytest.raises(ValueError, match="speech_boundary_ja_mamba2_frame_boundary_scorer_v5"):
+        load_feature_frame_scorer_checkpoint(checkpoint_path, device="cpu")
+
+
+def test_feature_frame_scorer_rejects_old_decoder_contract(tmp_path):
+    torch = pytest.importorskip("torch")
+    model, model_config = _build_mamba2_scorer(ptm_dim=4, mfcc_dim=2)
+    checkpoint = build_feature_frame_scorer_checkpoint(
+        model=model,
+        model_config=model_config,
+        normalization={
+            "feature_mean": [0.0] * 6,
+            "feature_std": [1.0] * 6,
+        },
+        metadata={"operating_point": "unit"},
+    )
+    checkpoint["metadata"]["decoder"] = "topographic_split_v2"
+    checkpoint_path = tmp_path / "feature_scorer_old_decoder.pt"
+    torch.save(checkpoint, checkpoint_path)
+
+    with pytest.raises(ValueError, match="topographic_split_micro_resolver_v3"):
         load_feature_frame_scorer_checkpoint(checkpoint_path, device="cpu")
 
 

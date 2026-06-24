@@ -1,6 +1,6 @@
 # JAVTrans
 
-JAVTrans 是一个本地字幕生成工具，面向 Windows + NVIDIA 显卡，也可在 WSL2 / Linux 下源码运行。它把视频处理成日文字幕、中文字幕或中日双语字幕，并把音频准备、SpeechBoundary-JA scorer v5、Boundary Refiner v6、Pre-ASR CueQC v5、ASR、Boundary chunk 字幕时间轴、LLM 翻译和质量报告串成一条本地优先的流水线。
+JAVTrans 是一个本地字幕生成工具，面向 Windows + NVIDIA 显卡，也可在 WSL2 / Linux 下源码运行。它把视频处理成日文字幕、中文字幕或中日双语字幕，并把音频准备、SpeechBoundary-JA scorer v5、Boundary Refiner v6、Pre-ASR CueQC v6、ASR、Boundary chunk 字幕时间轴、LLM 翻译和质量报告串成一条本地优先的流水线。
 
 项目目标：本地完成视频、音频、边界切分、ASR 和时间轴重计算；LLM 只负责翻译、术语一致和口吻连贯，不负责脑补剧情或修正 ASR 误听。
 
@@ -13,12 +13,13 @@ JAVTrans 是一个本地字幕生成工具，面向 Windows + NVIDIA 显卡，�
 - 默认 ASR：`jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame`。
 - 低配置可选 ASR：`jaykwok/Qwen3-ASR-0.6B-JA-Anime-Galgame`。
 - 默认边界系统：SpeechBoundary-JA，backend key 为 `speech_boundary_ja`。
-- 当前主链路：SpeechBoundary-JA scorer v5 -> Boundary Refiner v6 -> Pre-ASR CueQC v5 -> ASR -> 字幕时间轴 -> 翻译。
+- 当前主链路：SpeechBoundary-JA scorer v5 -> Boundary Refiner v6 -> Pre-ASR CueQC v6 预留位 -> ASR -> 字幕时间轴 -> 翻译。
 - 三个 Mamba checkpoint 按当前 ASR repo id 自动解析；metadata 的 repo id / schema / feature hash 必须匹配。
-- ASR-after CueQC v4 仅保留为显式 opt-in 的 shadow/mining，不参与默认 keep/drop。
+- Pre-ASR CueQC v6 checkpoint 仍在训练准备阶段，默认关闭；ASR-after CueQC v4 仅保留为显式 opt-in 的 shadow/mining，不参与默认 keep/drop。
 - 当前是断兼容重构状态：旧 scorer、旧 ASR-after active CueQC checkpoint 和旧数据集不再作为 active contract。
 - 默认显存目标：单阶段峰值适配 6GB 级 NVIDIA 显卡。8GB 本机可提高 `.env` 中的 ASR batch size；更小显存则手动降低。
-- 字幕切分发生在 ASR 前；ASR 后不再按时长、文本比例或句末硬拆同一 chunk。
+- ASR chunk 切分只使用 scorer 的 primary acoustic cut candidates；weak cut candidates 只作为字幕布局、审计和后续训练的时间锚点。
+- 7 秒是字幕显示 soft guard，不是 ASR chunk 上限；字幕 layout 可把过长 cue 按文本断句拆开，并优先吸附到 weak cut time，再退回比例估算。
 
 ---
 
@@ -102,15 +103,15 @@ Web 提交是否使用 CUDA 取决于后端服务进程是否能看到 GPU，而
 4. 提交任务。
 5. 在输出目录查看 SRT、质量报告和日志。
 
-勾选“不翻译（仅日文字幕）”时，流水线仍会执行边界规划、Pre-ASR CueQC、ASR 和 Boundary chunk 字幕时间轴生成，但跳过 LLM 翻译，最终输出 `<视频名>.ja.srt`。这是验证本地边界 / ASR / 字幕时间轴链路的推荐 smoke 模式。
+勾选“不翻译（仅日文字幕）”时，流水线仍会执行边界规划、可选 Pre-ASR CueQC、ASR 和 Boundary chunk 字幕时间轴生成，但跳过 LLM 翻译，最终输出 `<视频名>.ja.srt`。这是验证本地边界 / ASR / 字幕时间轴链路的推荐 smoke 模式。
 
 主流水线：
 
 ```text
-视频 -> 音频准备 -> Boundary/Scorer -> Pre-ASR CueQC -> ASR -> 字幕时间轴 -> 翻译 -> SRT / quality report
+视频 -> 音频准备 -> Boundary/Scorer primary cuts -> Refiner -> 可选 Pre-ASR CueQC -> ASR -> 字幕 layout -> 翻译 -> SRT / quality report
 ```
 
-LLM 翻译前会先固定 cue plan。SRT writer 只写入已经归一化的时间轴，不再隐式改变时间轴。
+LLM 翻译前会先固定 cue plan。SRT writer 只处理字幕显示层：保留 2-frame gap 和 20-frame 最小显示时长；遇到 `>7s` cue 时先按 ASR 文本断句确定文本拆分点，再吸附到对应时间窗内的 weak cut，没有可用 weak cut 才按比例估算。这个步骤不反向修改 ASR chunk 语义。
 
 ---
 
@@ -121,9 +122,9 @@ LLM 翻译前会先固定 cue plan。SRT writer 只写入已经归一化的时�
 | 默认 ASR | `jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame` | `models/jaykwok-Qwen3-ASR-1.7B-JA-Anime-Galgame` |
 | 低配 ASR | `jaykwok/Qwen3-ASR-0.6B-JA-Anime-Galgame` | `models/jaykwok-Qwen3-ASR-0.6B-JA-Anime-Galgame` |
 | SpeechBoundary-JA frozen feature | 跟随当前 ASR repo id | `models/<repo-tag>` |
-| SpeechBoundary-JA scorer v5 | Mamba2 frame boundary scorer；输出 speech/split 两头 | `src/boundary/ja/checkpoints/speech_boundary_ja_frame_boundary_scorer_v5.<repo-tag>.pt` |
+| SpeechBoundary-JA scorer v5 | Mamba2 frame boundary scorer；输出 speech/split 两头；decoder contract 为 `topographic_split_micro_resolver_v3`；primary cuts 用于 ASR chunk split，weak cuts 透传到字幕 layout | `src/boundary/ja/checkpoints/speech_boundary_ja_frame_boundary_scorer_v5.<repo-tag>.pt` |
 | Boundary Refiner v6 | learned `transformers.Mamba2Model` edge-only delta checkpoint | `src/boundary/checkpoints/boundary_edge_refiner_v6.<repo-tag>.pt` |
-| Pre-ASR CueQC v5 | learned binary checkpoint；pre-ASR numeric features -> keep/drop | `src/asr/checkpoints/cueqc_pre_asr_mamba_v5_binary.<repo-tag>.pt` |
+| Pre-ASR CueQC v6 | learned binary checkpoint；pre-ASR numeric + micro chunk features -> keep/drop；训练完成前默认关闭 | `src/asr/checkpoints/cueqc_pre_asr_mamba_v6_binary.<repo-tag>.pt` |
 
 常用配置见 [.env.example](.env.example)。通常只需要修改 API key、翻译模型、`HF_ENDPOINT`、`ASR_BACKEND` 和 batch size。
 
@@ -155,7 +156,7 @@ LLM 翻译前会先固定 cue plan。SRT writer 只写入已经归一化的时�
 - `models/`：Hugging Face 模型缓存。
 - `tmp/jobs/<job_id>/`：Web / pipeline 单次任务临时目录；`JOB_TEMP_DIR` 默认是 `./tmp/jobs`。
 - `tmp/chunks/`：ASR wav chunk 和 crash-resume checkpoint 的一次性运行目录。
-- `tmp/cache/boundary/`：SpeechBoundary-JA frame score 到 Boundary Refiner 输出的 boundary-cache v8。
+- `tmp/cache/boundary/`：SpeechBoundary-JA frame score 到 Boundary Refiner 输出的 boundary-cache v10。
 - `tmp/cache/torch/`、`tmp/cache/hf/`：torch / Hugging Face 运行缓存。
 - `tmp/log/`：启用运行日志后的任务日志。
 - `datasets/`：本地训练、验证、测试数据归档，默认 ignored；不参与普通推理和 release 打包。
@@ -223,7 +224,7 @@ ASR_BATCH_SIZE_BY_REPO=jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame=8,jaykwok/Qwen3-A
 - `src/core/`：配置和任务上下文。
 - `src/pipeline/`：音频、缓存、输出、质量报告和阶段日志。
 - `src/asr/`：ASR、Boundary 字幕时间轴分配、Pre-ASR CueQC / ASR-after shadow CueQC 和转写流程。
-- `src/boundary/`：Boundary Refiner v6 checkpoint loader、edge-sequence Mamba2 adapter、core planner 和 boundary-cache v8。
+- `src/boundary/`：Boundary Refiner v6 checkpoint loader、edge-sequence Mamba2 adapter、core planner 和 boundary-cache v10。
 - `src/boundary/ja/`：SpeechBoundary-JA scorer v5、PTM/MFCC feature cache schema、训练数据 manifest 和 frame-score 训练工具。
 - `src/llm/`：翻译 prompt、cache、glossary、API patch 和 translator。
 - `src/subtitles/`：SRT writer、字幕选项和字幕 QC。
@@ -266,9 +267,9 @@ uv run python -m <module> --help
 - `tools.audits.generate_cueqc_prediction_audit_html`：生成 CueQC 预测 false-drop 审计页。
 
 ```powershell
-uv run python -m tools.workflows.run_full_workflow --video video/匿名样片 A.mp4 --task-name 20260617_191654_cli-smoke --label smoke
+uv run python -m tools.workflows.run_full_workflow --video video/<your-video>.mp4 --task-name 20260617_191654_cli-smoke --label smoke
 uv run python -m tools.web.smoke.start_server --run-dir agents/temp/20260617_191654_web-smoke
-uv run python -m tools.web.smoke.submit_job --video-path video/匿名样片 A.mp4 --output-dir video --run-dir agents/temp/20260617_191654_web-smoke
+uv run python -m tools.web.smoke.submit_job --video-path video/<your-video>.mp4 --output-dir video --run-dir agents/temp/20260617_191654_web-smoke
 uv run python -m tools.web.smoke.poll_job --job-id-file agents/temp/20260617_191654_web-smoke/job_id.txt --run-dir agents/temp/20260617_191654_web-smoke --interval-seconds 300
 uv run python -m tools.web.smoke.summarize_job --job-id <job_id> --run-dir agents/temp/20260617_191654_web-smoke
 ```
@@ -283,8 +284,8 @@ uv run python -m tools.web.smoke.summarize_job --job-id <job_id> --run-dir agent
 - `tools.boundary.ja.train_feature_scorer`
 - `tools.boundary.build_refiner_frame_sequence_dataset`
 - `tools.boundary.train_refiner`
-- `tools.asr.cueqc.compile_pre_asr_v5_features`
-- `tools.asr.cueqc.train_pre_asr_v5_binary`
+- `tools.asr.cueqc.compile_pre_asr_v6_features`
+- `tools.asr.cueqc.train_pre_asr_v6_binary`
 
 诊断和数据准备：
 

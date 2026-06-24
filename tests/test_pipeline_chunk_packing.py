@@ -425,6 +425,35 @@ def test_packed_chunk_metadata_uses_source_span_index_after_short_chunk_drop():
         boundary_start_refine_delta_s=0.04,
         boundary_end_refine_delta_s=-0.03,
         boundary_decision_source="edge_sequence_refiner_v6",
+        subtitle_min_duration_s=20.0 / 24.0,
+        below_subtitle_min_duration=False,
+        micro_chunk_candidate=True,
+        micro_resolve_action="merge_micro_into_left",
+        micro_resolve_reason="left_split_weaker",
+        left_split_score=0.31,
+        right_split_score=0.82,
+        primary_cut_candidates=[
+            {
+                "kind": "primary",
+                "time_s": 1.5,
+                "frame": 75,
+                "score": 0.82,
+                "prominence": 0.2,
+                "speech_valley": 0.7,
+                "strength": 1.72,
+            }
+        ],
+        weak_cut_candidates=[
+            {
+                "kind": "weak",
+                "time_s": 1.8,
+                "frame": 90,
+                "score": 0.3,
+                "prominence": 0.12,
+                "speech_valley": 0.5,
+                "strength": 0.92,
+            }
+        ],
     )
     chunk_infos = [
         {
@@ -446,7 +475,39 @@ def test_packed_chunk_metadata_uses_source_span_index_after_short_chunk_drop():
     assert chunk_infos[0]["boundary_start_refine_delta_s"] == 0.04
     assert chunk_infos[0]["boundary_end_refine_delta_s"] == -0.03
     assert chunk_infos[0]["boundary_decision_source"] == "edge_sequence_refiner_v6"
+    assert chunk_infos[0]["subtitle_min_duration_s"] == 20.0 / 24.0
+    assert chunk_infos[0]["micro_chunk_candidate"] is True
+    assert chunk_infos[0]["micro_resolve_action"] == "merge_micro_into_left"
+    assert chunk_infos[0]["right_split_score"] == 0.82
+    assert chunk_infos[0]["primary_cut_candidates"][0]["time_s"] == 1.5
+    assert chunk_infos[0]["weak_cut_candidates"][0]["time_s"] == 1.8
     assert any("speech_segment_count=2" in entry and "source=cut" in entry for entry in log)
+
+
+def test_cut_candidates_for_segment_filters_to_segment_window():
+    from asr import pipeline as asr
+
+    chunks_by_index = {
+        0: {
+            "weak_cut_candidates": [
+                {"kind": "weak", "time_s": 1.0, "frame": 50, "strength": 0.5},
+                {"kind": "weak", "time_s": 3.0, "frame": 150, "strength": 0.9},
+            ]
+        }
+    }
+    segment = {
+        "start": 2.0,
+        "end": 4.0,
+        "words": [{"source_chunk_index": 0, "start": 2.1, "end": 2.2, "word": "あ"}],
+    }
+
+    candidates = asr._cut_candidates_for_segment(
+        segment,
+        chunks_by_index,
+        key="weak_cut_candidates",
+    )
+
+    assert [candidate["time_s"] for candidate in candidates] == [3.0]
 
 
 def test_alignment_window_metadata_uses_chunk_span():

@@ -15,9 +15,9 @@ from asr.backends.qwen import (
 )
 
 
-PRE_ASR_CUEQC_SCHEMA = "cueqc_pre_asr_mamba_v5_binary"
+PRE_ASR_CUEQC_SCHEMA = "cueqc_pre_asr_mamba_v6_binary"
 PRE_ASR_CUEQC_DECISION_VERSION = "pre_asr_cueqc_binary_v1"
-PRE_ASR_CUEQC_FEATURE_SCHEMA = "pre_asr_cueqc_features_v1"
+PRE_ASR_CUEQC_FEATURE_SCHEMA = "pre_asr_cueqc_features_v2"
 PRE_ASR_CUEQC_FEATURE_NAMES = (
     "duration_s",
     "speech_segment_count",
@@ -34,6 +34,18 @@ PRE_ASR_CUEQC_FEATURE_NAMES = (
     "scorer_split_p90",
     "prev_gap_s",
     "next_gap_s",
+    "subtitle_min_duration_s",
+    "below_subtitle_min_duration",
+    "micro_chunk_candidate",
+    "micro_action_preserve",
+    "micro_action_merge_left",
+    "micro_action_merge_right",
+    "left_split_score",
+    "right_split_score",
+    "left_split_prominence",
+    "right_split_prominence",
+    "left_split_speech_valley",
+    "right_split_speech_valley",
 )
 _BANNED_FEATURE_TOKENS = (
     "text",
@@ -106,6 +118,11 @@ def _sequence_count(value: Any) -> float:
     return 0.0
 
 
+def _has_action(value: Any, token: str) -> float:
+    actions = {item.strip() for item in str(value or "").split(",") if item.strip()}
+    return 1.0 if token in actions else 0.0
+
+
 def candidate_from_span(spans: Sequence[Any], index: int) -> dict[str, Any]:
     span = spans[index]
     start = _safe_float(_packed_value(span, "start"))
@@ -127,12 +144,44 @@ def candidate_from_span(spans: Sequence[Any], index: int) -> dict[str, Any]:
         "scorer_split_p90": _safe_float(_packed_value(span, "scorer_split_p90")),
         "prev_gap_s": _gap(spans, index, left=True),
         "next_gap_s": _gap(spans, index, left=False),
+        "subtitle_min_duration_s": _safe_float(_packed_value(span, "subtitle_min_duration_s")),
+        "below_subtitle_min_duration": 1.0
+        if bool(_packed_value(span, "below_subtitle_min_duration", False))
+        else 0.0,
+        "micro_chunk_candidate": 1.0
+        if bool(_packed_value(span, "micro_chunk_candidate", False))
+        else 0.0,
+        "micro_action_preserve": max(
+            _has_action(_packed_value(span, "micro_resolve_action"), "preserve_micro_candidate"),
+            _has_action(_packed_value(span, "micro_resolve_action"), "preserve_edge_micro_candidate"),
+        ),
+        "micro_action_merge_left": _has_action(
+            _packed_value(span, "micro_resolve_action"),
+            "merge_micro_into_left",
+        ),
+        "micro_action_merge_right": _has_action(
+            _packed_value(span, "micro_resolve_action"),
+            "merge_micro_into_right",
+        ),
+        "left_split_score": _safe_float(_packed_value(span, "left_split_score")),
+        "right_split_score": _safe_float(_packed_value(span, "right_split_score")),
+        "left_split_prominence": _safe_float(_packed_value(span, "left_split_prominence")),
+        "right_split_prominence": _safe_float(_packed_value(span, "right_split_prominence")),
+        "left_split_speech_valley": _safe_float(_packed_value(span, "left_split_speech_valley")),
+        "right_split_speech_valley": _safe_float(_packed_value(span, "right_split_speech_valley")),
     }
     return {
         "schema": PRE_ASR_CUEQC_FEATURE_SCHEMA,
         "index": index,
         "start": round(start, 6),
         "end": round(end, 6),
+        "subtitle_min_duration_s": round(features["subtitle_min_duration_s"], 6),
+        "below_subtitle_min_duration": bool(features["below_subtitle_min_duration"]),
+        "micro_chunk_candidate": bool(features["micro_chunk_candidate"]),
+        "micro_resolve_action": str(_packed_value(span, "micro_resolve_action", "") or ""),
+        "micro_resolve_reason": str(_packed_value(span, "micro_resolve_reason", "") or ""),
+        "left_split_score": features["left_split_score"],
+        "right_split_score": features["right_split_score"],
         "features": features,
         "feature_names": list(PRE_ASR_CUEQC_FEATURE_NAMES),
     }

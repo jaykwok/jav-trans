@@ -6,7 +6,6 @@ from subtitles import writer as subtitle
 
 
 def test_subtitle_options_from_env(monkeypatch):
-    monkeypatch.setenv("MAX_SUBTITLE_DURATION", "9.5")
     monkeypatch.setenv("SRT_LINE_MAX_CHARS", "18")
     monkeypatch.setenv("SUBTITLE_TIMELINE_MODE", "reading")
     monkeypatch.setenv("SUBTITLE_READING_CPS", "10")
@@ -16,7 +15,7 @@ def test_subtitle_options_from_env(monkeypatch):
 
     options = SubtitleOptions.from_env()
 
-    assert options.max_duration == 9.5
+    assert options.max_display_duration_s == 7.0
     assert options.timeline_mode == "reading"
     assert options.reading_cps == 10
     assert options.line_max_chars == 18
@@ -25,12 +24,10 @@ def test_subtitle_options_from_env(monkeypatch):
     assert options.linger_s == 0.3
 
 
-def test_subtitle_options_defaults_are_conservative(monkeypatch):
-    monkeypatch.delenv("MAX_SUBTITLE_DURATION", raising=False)
-
+def test_subtitle_options_defaults_are_conservative():
     options = SubtitleOptions.from_env()
 
-    assert options.max_duration == 6.5
+    assert options.max_display_duration_s == 7.0
     assert options.effective_video_fps == FALLBACK_VIDEO_FPS
     assert options.frame_gap_s == 2 / FALLBACK_VIDEO_FPS
     assert options.timing_polish_enabled is True
@@ -70,7 +67,6 @@ def test_prepare_srt_blocks_timeline_mode_is_per_options(monkeypatch, tmp_path):
         min_duration=0.6,
         duration_ratio_cap=1.0,
         duration_grace=0.0,
-        max_duration=8.0,
     )
     blocks = subtitle.prepare_srt_blocks(
         [{"start": 0.0, "end": 10.0, "zh_text": "短句"}],
@@ -84,7 +80,7 @@ def test_prepare_srt_blocks_timeline_mode_is_per_options(monkeypatch, tmp_path):
     )
 
     content = path.read_text(encoding="utf-8")
-    assert "00:00:00,000 --> 00:00:01,050" in content
+    assert "00:00:00,000 --> 00:00:01,117" in content
 
 
 def test_prepare_bilingual_keeps_adjacent_cues_separate(tmp_path):

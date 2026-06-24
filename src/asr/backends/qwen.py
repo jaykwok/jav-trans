@@ -41,11 +41,11 @@ DEFAULT_CUEQC_CHECKPOINT_BY_REPO: dict[str, str] = {
 DEFAULT_PRE_ASR_CUEQC_CHECKPOINT_BY_REPO: dict[str, str] = {
     QWEN_ASR_17B_REPO_ID: (
         "src/asr/checkpoints/"
-        "cueqc_pre_asr_mamba_v5_binary.jaykwok-Qwen3-ASR-1.7B-JA-Anime-Galgame.pt"
+        "cueqc_pre_asr_mamba_v6_binary.jaykwok-Qwen3-ASR-1.7B-JA-Anime-Galgame.pt"
     ),
     QWEN_ASR_06B_REPO_ID: (
         "src/asr/checkpoints/"
-        "cueqc_pre_asr_mamba_v5_binary.jaykwok-Qwen3-ASR-0.6B-JA-Anime-Galgame.pt"
+        "cueqc_pre_asr_mamba_v6_binary.jaykwok-Qwen3-ASR-0.6B-JA-Anime-Galgame.pt"
     ),
 }
 DEFAULT_SPEECH_BOUNDARY_SCORER_CHECKPOINT_BY_REPO: dict[str, str] = {

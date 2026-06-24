@@ -135,6 +135,7 @@ def test_default_model_download_root_is_project_models():
     assert "BOUNDARY_CONTEXT_MAX_PADDING_S" not in config.DEFAULT_SETTINGS
     assert "BOUNDARY_PLANNER_MAX_PADDED_CHUNK_S" not in config.DEFAULT_SETTINGS
     assert "BOUNDARY_CONTEXT_MAX_SPEECH_OVERLAP_S" not in config.DEFAULT_SETTINGS
+    assert "MAX_SUBTITLE_DURATION" not in config.DEFAULT_SETTINGS
     assert config.DEFAULT_SETTINGS["ASR_SUBPROCESS_READY_TIMEOUT_S"] == "600"
     assert config.DEFAULT_SETTINGS["CUEQC_SHADOW_ENABLED"] == "0"
     assert config.DEFAULT_SETTINGS["PRE_ASR_CUEQC_ENABLED"] == "0"
@@ -154,6 +155,21 @@ def test_asr_chunk_min_duration_removed_from_active_config_surface():
         text = (ROOT / relative_path).read_text(encoding="utf-8")
         assert "ASR_CHUNK_MIN_DURATION_S" not in text
     assert "ASR_CHUNK_MIN_DURATION_S" not in config.DEFAULT_SETTINGS
+
+
+def test_subtitle_max_duration_clamp_removed_from_active_config_surface():
+    active_files = (
+        "src/core/config.py",
+        "src/main.py",
+        "src/subtitles/options.py",
+        "src/subtitles/writer.py",
+        ".env.example",
+        "README.md",
+    )
+    for relative_path in active_files:
+        text = (ROOT / relative_path).read_text(encoding="utf-8")
+        assert "MAX_SUBTITLE_DURATION" not in text
+        assert "max_duration" not in text
 
 
 def test_frozen_path_defaults_resolve_to_runtime_root(monkeypatch, tmp_path):

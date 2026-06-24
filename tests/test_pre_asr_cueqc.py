@@ -8,7 +8,7 @@ import pytest
 from asr import pre_asr_cueqc
 from audio.chunk_packer import PackedChunk
 from boundary.base import SpeechSegment
-from tools.asr.cueqc.compile_pre_asr_v5_features import compile_features
+from tools.asr.cueqc.compile_pre_asr_v6_features import compile_features
 
 
 def _pre_asr_candidate(index: int, *, video_id: str = "AAA", cluster_id: str = "") -> dict:
@@ -43,7 +43,7 @@ def _pre_asr_candidate(index: int, *, video_id: str = "AAA", cluster_id: str = "
 def test_pre_asr_cueqc_feature_schema_excludes_asr_text_fields():
     names = " ".join(pre_asr_cueqc.PRE_ASR_CUEQC_FEATURE_NAMES).lower()
 
-    for banned in ("text", "token", "decoder", "asr_confidence", "subtitle"):
+    for banned in ("text", "token", "decoder", "asr_confidence", "subtitle_timing"):
         assert banned not in names
 
 
@@ -67,6 +67,40 @@ def test_pre_asr_cueqc_candidate_uses_numeric_chunk_features_only():
     assert candidate["feature_names"] == list(pre_asr_cueqc.PRE_ASR_CUEQC_FEATURE_NAMES)
     assert set(candidate["features"]) == set(pre_asr_cueqc.PRE_ASR_CUEQC_FEATURE_NAMES)
     assert "text" not in json.dumps(candidate["features"], ensure_ascii=False).lower()
+
+
+def test_pre_asr_cueqc_candidate_includes_micro_numeric_features():
+    spans = [
+        PackedChunk(
+            start=0.0,
+            end=0.5,
+            speech_segments=[SpeechSegment(0.0, 0.5)],
+            duration=0.5,
+            split_reason="unit",
+            subtitle_min_duration_s=20.0 / 24.0,
+            below_subtitle_min_duration=True,
+            micro_chunk_candidate=True,
+            micro_resolve_action="preserve_micro_candidate",
+            micro_resolve_reason="balanced_split_evidence",
+            left_split_score=0.8,
+            right_split_score=0.82,
+            left_split_prominence=0.2,
+            right_split_prominence=0.21,
+            left_split_speech_valley=0.7,
+            right_split_speech_valley=0.72,
+        )
+    ]
+
+    candidate = pre_asr_cueqc.candidate_from_span(spans, 0)
+
+    assert candidate["schema"] == pre_asr_cueqc.PRE_ASR_CUEQC_FEATURE_SCHEMA
+    assert candidate["below_subtitle_min_duration"] is True
+    assert candidate["micro_chunk_candidate"] is True
+    assert candidate["micro_resolve_action"] == "preserve_micro_candidate"
+    assert candidate["features"]["below_subtitle_min_duration"] == 1.0
+    assert candidate["features"]["micro_action_preserve"] == 1.0
+    assert candidate["features"]["micro_action_merge_left"] == 0.0
+    assert candidate["features"]["left_split_score"] == 0.8
 
 
 def test_pre_asr_cueqc_filters_before_wav_export(monkeypatch):

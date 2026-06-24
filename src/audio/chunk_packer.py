@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Sequence
+from typing import Any, Sequence
 
 from boundary.planner import (
     BoundarySequenceFeatureProvider,
@@ -40,6 +40,19 @@ class PackedChunk:
     scorer_split_mean: float | None = None
     scorer_split_max: float | None = None
     scorer_split_p90: float | None = None
+    subtitle_min_duration_s: float | None = None
+    below_subtitle_min_duration: bool = False
+    micro_chunk_candidate: bool = False
+    micro_resolve_action: str = ""
+    micro_resolve_reason: str = ""
+    left_split_score: float | None = None
+    right_split_score: float | None = None
+    left_split_prominence: float | None = None
+    right_split_prominence: float | None = None
+    left_split_speech_valley: float | None = None
+    right_split_speech_valley: float | None = None
+    primary_cut_candidates: list[dict[str, Any]] | None = None
+    weak_cut_candidates: list[dict[str, Any]] | None = None
 
 
 @dataclass(frozen=True)
@@ -142,9 +155,14 @@ def _make_chunk(
     ]
     boundary_reasons = [island.boundary_reason for island in islands if island.boundary_reason]
     boundary_sources = [island.boundary_source for island in islands if island.boundary_source]
+    micro_actions = [island.micro_resolve_action for island in islands if island.micro_resolve_action]
+    micro_reasons = [island.micro_resolve_reason for island in islands if island.micro_resolve_reason]
 
     start = max(0.0, core_start)
     end = core_end
+    subtitle_min_duration_s = _first_float(
+        island.subtitle_min_duration_s for island in islands
+    )
     return PackedChunk(
         start=start,
         end=end,
@@ -163,7 +181,62 @@ def _make_chunk(
         boundary_decision_source=(
             boundary_decision.source if boundary_decision is not None else ""
         ),
+        subtitle_min_duration_s=subtitle_min_duration_s,
+        below_subtitle_min_duration=(
+            bool(subtitle_min_duration_s is not None and end - start < subtitle_min_duration_s)
+            or any(island.below_subtitle_min_duration for island in islands)
+        ),
+        micro_chunk_candidate=any(island.micro_chunk_candidate for island in islands),
+        micro_resolve_action=",".join(sorted(set(micro_actions))),
+        micro_resolve_reason=",".join(sorted(set(micro_reasons))),
+        left_split_score=_max_float(island.left_split_score for island in islands),
+        right_split_score=_max_float(island.right_split_score for island in islands),
+        left_split_prominence=_max_float(island.left_split_prominence for island in islands),
+        right_split_prominence=_max_float(island.right_split_prominence for island in islands),
+        left_split_speech_valley=_max_float(island.left_split_speech_valley for island in islands),
+        right_split_speech_valley=_max_float(island.right_split_speech_valley for island in islands),
+        primary_cut_candidates=_merge_cut_candidates(
+            island.primary_cut_candidates for island in islands
+        ),
+        weak_cut_candidates=_merge_cut_candidates(
+            island.weak_cut_candidates for island in islands
+        ),
     )
+
+
+def _first_float(values) -> float | None:
+    for value in values:
+        if value is not None:
+            return float(value)
+    return None
+
+
+def _max_float(values) -> float | None:
+    finite = [float(value) for value in values if value is not None]
+    return max(finite) if finite else None
+
+
+def _merge_cut_candidates(values) -> list[dict[str, Any]]:
+    by_key: dict[tuple[str, int], dict[str, Any]] = {}
+    for candidates in values:
+        for candidate in candidates or []:
+            if not isinstance(candidate, dict):
+                continue
+            try:
+                time_s = float(candidate["time_s"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            kind = str(candidate.get("kind") or "")
+            key = (kind, int(round(time_s * 1000.0)))
+            existing = by_key.get(key)
+            strength = float(candidate.get("strength") or 0.0)
+            existing_strength = float(existing.get("strength") or 0.0) if existing else -1.0
+            if existing is None or strength > existing_strength:
+                by_key[key] = dict(candidate)
+    return [
+        by_key[key]
+        for key in sorted(by_key, key=lambda item: (float(by_key[item].get("time_s") or 0.0), item[0]))
+    ]
 
 
 def _internal_gap_count(islands: Sequence[PlannedIsland]) -> int:
