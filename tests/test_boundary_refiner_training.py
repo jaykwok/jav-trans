@@ -438,6 +438,110 @@ def test_build_frame_sequence_dataset_trains_with_cached_features(tmp_path, monk
     assert torch.cuda.is_available() in {True, False}
 
 
+def test_build_frame_sequence_dataset_skips_internal_splits_within_same_true_segment(
+    tmp_path,
+    monkeypatch,
+):
+    pytest.importorskip("numpy")
+
+    import numpy as np
+    import tools.boundary.build_refiner_frame_sequence_dataset as builder_module
+
+    class FakeScorer:
+        metadata = {"ptm_repo_id": QWEN_ASR_17B_REPO_ID}
+
+        def signature(self):
+            return {
+                "schema": MAMBA2_FRAME_SCORER_SCHEMA,
+                "path": "fake-scorer.pt",
+                "sha256": "unit",
+                "metadata": {
+                    "ptm_repo_id": QWEN_ASR_17B_REPO_ID,
+                    "output_heads": ["speech_prob", "split_boundary_prob"],
+                },
+            }
+
+    monkeypatch.setattr(
+        builder_module,
+        "load_feature_frame_scorer_checkpoint",
+        lambda _path, device="cpu": FakeScorer(),
+    )
+    monkeypatch.setattr(
+        builder_module,
+        "score_feature_frame_boundary_probabilities_batch",
+        lambda _scorer, feature_pairs: [
+            (
+                np.ones(6, dtype=np.float32),
+                np.array([0.0, 0.0, 1.0, 0.0, 1.0, 0.0], dtype=np.float32),
+            )
+            for _pair in feature_pairs
+        ],
+    )
+
+    labels_path = tmp_path / "labels.jsonl"
+    feature_manifest = tmp_path / "feature_manifest.jsonl"
+    feature_path = tmp_path / "sample-features.npz"
+    np.savez(
+        feature_path,
+        ptm=np.arange(24, dtype=np.float32).reshape(6, 4) / 24.0,
+        mfcc=np.arange(12, dtype=np.float32).reshape(6, 2) / 12.0,
+    )
+    write_jsonl(
+        labels_path,
+        [
+            {
+                "audio_id": "same-utterance",
+                "source": "unit",
+                "duration_s": 0.6,
+                "text": "",
+                "teacher_segments": {"supervised": [{"start": 0.0, "end": 0.6, "score": 1.0}]},
+                "frame_hop_s": 0.1,
+                "speech_frames": [1] * 6,
+                "label_quality": "supervised",
+                "boundary_metadata": {
+                    "actual_speech_segments": [{"start": 0.0, "end": 0.6}],
+                },
+            }
+        ],
+    )
+    feature_manifest.write_text(
+        json.dumps(
+            [
+                {
+                    "label_index": 0,
+                    "feature_path": str(feature_path),
+                    "frame_hop_s": 0.1,
+                    "ptm_dim": 4,
+                    "mfcc_dim": 2,
+                    "ptm": QWEN_ASR_17B_REPO_ID,
+                }
+            ],
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
+    output_jsonl = tmp_path / "frame-sequences.jsonl"
+    summary = build_frame_sequence_dataset(
+        labels_paths=[labels_path],
+        feature_manifest_paths=[feature_manifest],
+        scorer_checkpoint_path=tmp_path / "fake-scorer.pt",
+        output_jsonl=output_jsonl,
+        config=FrameSequenceConfig(
+            frame_hop_s=0.1,
+            frame_dilation_s=0.0,
+            threshold=0.5,
+            min_segment_s=0.05,
+            min_split_segment_s=0.05,
+            max_edge_alignment_distance_s=0.2,
+        ),
+    )
+
+    assert output_jsonl.read_text(encoding="utf-8") == ""
+    assert summary["counts"]["skipped_no_sequence_items"] == 1
+    assert summary["counts"].get("sequence_items", 0) == 0
+
+
 def test_build_weighted_source_manifest_samples_requested_mix(tmp_path):
     nsfw_audio = tmp_path / "nsfw.wav"
     sfw_audio = tmp_path / "sfw.wav"

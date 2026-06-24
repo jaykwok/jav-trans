@@ -383,6 +383,8 @@ def _sequence_row(
     for index, (left, right) in enumerate(zip(predicted_segments, predicted_segments[1:])):
         left_true = _align_true_segment(left, true_segments, edge="end", config=config)
         right_true = _align_true_segment(right, true_segments, edge="start", config=config)
+        if left_true is not None and right_true is not None and left_true == right_true:
+            continue
         start_weight = 1.0 if right_true is not None else 0.0
         end_weight = 0.6 if left_true is not None else 0.0
         if start_weight <= 0.0 and end_weight <= 0.0:
