@@ -115,7 +115,7 @@ DEFAULT_SETTINGS: dict[str, str] = {
     "PRE_ASR_CUEQC_ENABLED": "0",
     "PRE_ASR_CUEQC_MODEL_PATH_BY_REPO": "",
     "PRE_ASR_CUEQC_DEVICE": "auto",
-    "PRE_ASR_CUEQC_DROP_THRESHOLD": "0.90",
+    "PRE_ASR_CUEQC_DROP_THRESHOLD": "0.999",
 
     # --- ASR-after CueQC v4 shadow / hard-negative mining ---
     # Opt-in only; active keep/drop routing moved to Pre-ASR CueQC v6.

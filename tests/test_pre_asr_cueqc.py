@@ -225,6 +225,75 @@ def test_compile_pre_asr_cueqc_features_ignores_text_columns(tmp_path: Path):
     assert "text" not in " ".join(summary["feature_names"]).lower()
 
 
+def test_compile_pre_asr_cueqc_features_reads_jsonl_chunk_candidates(tmp_path: Path):
+    torch = pytest.importorskip("torch")
+    del torch
+    chunks = tmp_path / "chunks.jsonl"
+    labels = tmp_path / "labels.jsonl"
+    output = tmp_path / "features.pt"
+    rows = [_pre_asr_candidate(0, video_id="AAA"), _pre_asr_candidate(1, video_id="AAA")]
+    chunks.write_text(
+        "\n".join(json.dumps(row, ensure_ascii=False) for row in rows) + "\n",
+        encoding="utf-8",
+    )
+    labels.write_text(
+        "\n".join(
+            [
+                json.dumps({"sample_id": "preasr-AAA-chunk00000", "label": "keep"}),
+                json.dumps({"sample_id": "preasr-AAA-chunk00001", "label": "drop"}),
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    summary = compile_features(
+        chunk_paths=[str(chunks)],
+        label_paths=[str(labels)],
+        output=output,
+        asr_repo_id="jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame",
+    )
+
+    assert summary["count"] == 2
+    assert summary["keep"] == 1
+    assert summary["drop"] == 1
+
+
+def test_compile_pre_asr_cueqc_sample_labels_do_not_broadcast_by_cluster(tmp_path: Path):
+    torch = pytest.importorskip("torch")
+    chunks = tmp_path / "chunks.jsonl"
+    labels = tmp_path / "labels.jsonl"
+    output = tmp_path / "features.pt"
+    first = _pre_asr_candidate(0, video_id="AAA", cluster_id="cluster_mixed")
+    second = _pre_asr_candidate(1, video_id="AAA", cluster_id="cluster_mixed")
+    chunks.write_text(
+        "\n".join(json.dumps(row, ensure_ascii=False) for row in [first, second]) + "\n",
+        encoding="utf-8",
+    )
+    labels.write_text(
+        json.dumps(
+            {
+                "sample_id": "preasr-AAA-chunk00000",
+                "cluster_id": "cluster_mixed",
+                "label": "drop",
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    summary = compile_features(
+        chunk_paths=[str(chunks)],
+        label_paths=[str(labels)],
+        output=output,
+        asr_repo_id="jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame",
+    )
+    bundle = torch.load(output, map_location="cpu")
+
+    assert summary["count"] == 1
+    assert [row["id"] for row in bundle["rows"]] == ["preasr-AAA-chunk00000"]
+
+
 def test_compile_pre_asr_cueqc_broadcasts_cluster_examples_to_sample_ids(tmp_path: Path):
     torch = pytest.importorskip("torch")
     chunks = tmp_path / "pre_asr_candidates.json"

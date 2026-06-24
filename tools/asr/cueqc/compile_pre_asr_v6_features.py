@@ -113,7 +113,10 @@ def read_chunk_document(path: Path) -> tuple[str, list[dict[str, Any]]]:
     if text.lstrip().startswith("["):
         payload = json.loads(text)
     elif text.lstrip().startswith("{"):
-        payload = json.loads(text)
+        try:
+            payload = json.loads(text)
+        except json.JSONDecodeError:
+            payload = read_json_or_jsonl(path)
     else:
         payload = read_json_or_jsonl(path)
     audio_id = infer_audio_id(path, payload if isinstance(payload, Mapping) else None)
@@ -200,9 +203,10 @@ def read_labels(paths: Iterable[str]) -> dict[str, dict[str, Any]]:
                 item = dict(source_item)
                 item["label_index"] = value
                 cluster_id = str(item.get("cluster_id") or "").strip()
-                if cluster_id:
+                item_keys = label_keys(item)
+                if cluster_id and not item_keys:
                     labels[f"cluster:{cluster_id}"] = item
-                for key in label_keys(item):
+                for key in item_keys:
                     labels[key] = item
     return labels
 

@@ -210,9 +210,11 @@ Boundary Refiner 只修 chunk 两端。它不学习中间切点、不新增 chun
 | Runtime position | Boundary Refiner 后、wav chunk export 前 |
 | Architecture | `Linear(input_dim, hidden_size) -> GELU -> Linear(hidden_size, 2)` |
 | Output | `keep_for_asr`, `drop_before_asr` |
-| Decision | `p_drop >= PRE_ASR_CUEQC_DROP_THRESHOLD` 时 drop |
+| Decision | `p_drop >= PRE_ASR_CUEQC_DROP_THRESHOLD` 时 drop；当前 cold-start 推荐阈值 `0.999` |
 
 Pre-ASR CueQC 只看 ASR 前数值特征：duration、speech segment count、internal gap、refiner delta、scorer speech/split 分布、邻接 gap、micro chunk evidence 等。它禁止使用 ASR text、raw text、token trace、decoder stats、ASR confidence 和 subtitle timing。
+
+当前 1.7B repo 已有 conservative cold-start checkpoint，但默认仍关闭；开启前应先跑 no-translate workflow smoke / audit，确认 false-drop 风险可接受。
 
 ### ASR-after CueQC shadow
 

@@ -16,14 +16,14 @@ SpeechBoundary-JA scorer v5 frame scores
 -> split_boundary adaptive topographic peak / acoustic valley split
 -> micro chunk resolver
 -> Boundary Refiner v6 edge-only start/end trim
--> Pre-ASR CueQC v6 keep_for_asr/drop_before_asr（checkpoint 训练完成前默认关闭）
+-> Pre-ASR CueQC v6 keep_for_asr/drop_before_asr（conservative cold-start checkpoint 已训练，默认仍关闭待 workflow 审计）
 -> Qwen ASR speech-core chunks
 -> optional CueQC v4 shadow / hard-negative mining
 -> Boundary chunk subtitle timing
 -> SRT / translation
 ```
 
-目标已经从“传统 VAD 高 recall”修正为“字幕边界可用”：scorer v5 只负责 speech / split 两个 frame 任务，Boundary Refiner v6 只修 island 两端，Pre-ASR CueQC v6 在 ASR 前做高精 keep/drop 路由以减少无效 ASR。Pre-ASR CueQC v6 checkpoint 尚未训练完成前保持默认关闭；CueQC v4 仅保留为 ASR 后显式 opt-in 的 shadow/对照和 hard-negative mining。三个 active 模型不互相兼容旧 checkpoint，不保留 alias；schema、repo id、feature hash 或文件存在性不匹配都必须 fail-fast。
+目标已经从“传统 VAD 高 recall”修正为“字幕边界可用”：scorer v5 只负责 speech / split 两个 frame 任务，Boundary Refiner v6 只修 island 两端，Pre-ASR CueQC v6 在 ASR 前做高精 keep/drop 路由以减少无效 ASR。Pre-ASR CueQC v6 已完成 1.7B conservative cold-start 训练并使用 `0.999` drop threshold，但默认仍关闭，等待完整 workflow 审计确认 false-drop 风险；CueQC v4 仅保留为 ASR 后显式 opt-in 的 shadow/对照和 hard-negative mining。三个 active 模型不互相兼容旧 checkpoint，不保留 alias；schema、repo id、feature hash 或文件存在性不匹配都必须 fail-fast。
 
 当前运行时只规划 speech core。Scorer v5 用 `speech_prob` 找 speech frames，用 `split_boundary_prob` 产生声学切点；decoder 输出 `primary_cut_candidates` 和 `weak_cut_candidates`，前者用于 ASR chunk split，后者透传到 `SpeechSegment` / `PackedChunk` / boundary cache / ASR chunk metadata / subtitle blocks，作为字幕布局和审计时间锚点。split peak 后进入 micro chunk resolver：`20 / video_fps` 只作为字幕显示下限和 micro 风险线，若两个 split 夹出短 B 段则优先删除证据较弱的 split，把 B 合到 A 或 C；两侧证据接近时保留 B 并交给 Pre-ASR CueQC。Boundary Refiner v6 checkpoint schema 是 `boundary_edge_refiner_v6`、runtime adapter 是 `edge_sequence_v1`，head 只输出 `start_delta_s/end_delta_s`，不跨 island merge，不新增 chunk，不学习 ASR padding/context budget。Pre-ASR CueQC v6 checkpoint schema 是 `cueqc_pre_asr_mamba_v6_binary`，输入只允许 PTM/scorer/refiner/timing/micro 数值特征，禁止 ASR text、token trace、decoder stats、ASR confidence 和 subtitle timing。7 秒只作为字幕显示 soft guard：字幕层处理 `>7s` cue 时先按 ASR 文本断句，再吸附到对应时间窗内的 weak cut；没有 weak cut 才 proportional fallback，不反向修改 ASR chunk。
 
@@ -58,15 +58,17 @@ SpeechBoundary-JA scorer v5 frame scores
 
 ## Backlog
 
-- 1.7B Scorer v5：micro resolver 32768 full checkpoint 已通过 two-film 人工观感 gate；本轮不重训 scorer。后续训练使用该 checkpoint 显式路径作为 scorer source，直到 registry promotion 可单独完成。
-- Boundary Refiner v6：micro scorer predicted edge 数据已重导并完成 1.7B repo-id tagged v6 训练；下一步用两部 current workflow 审计边界微调和 chunk 质量，确认后再考虑 registry promotion。
-- Pre-ASR CueQC v6：必须使用当前 scorer+refiner workflow 的 fresh candidates 与人工 keep/drop 标签训练；旧 v4/v5/no-split-budget 簇标签不直接复用。下一步生成 current two-film 审计/广播标签源，再编译无 ASR 文本且包含 micro metadata 的特征，训练 `cueqc_pre_asr_mamba_v6_binary`。
+- 1.7B Scorer v5：micro resolver 32768 full checkpoint 已通过 two-film 人工观感 gate，并提升到 repo-id registry；后续只在 split peak 缺失或左右证据不可分时重建 v5-native 数据。
+- Boundary Refiner v6：micro scorer predicted edge 数据已重导并完成 1.7B repo-id tagged v6 训练，并提升到 repo-id registry；下一步用 Pre-ASR CueQC enabled workflow 审计边界微调和 chunk 质量。
+- Pre-ASR CueQC v6：已用 current scorer+refiner two-film fresh candidates 与 ASR-audit teacher labels 完成 conservative cold-start 训练，并提升到 repo-id registry；当前默认关闭，下一步跑 enabled smoke/audit 观察 false-drop、ASR 时间节省和短有效台词保留。
 - ASR-after CueQC v4：仅保留 shadow/mining；当 Pre-ASR CueQC v6 false-drop gate 稳定后，删除后置 runtime 与训练入口。
 - REAL-988：只作为最终测试集，不进入训练、pseudo pool 或 cold-start 聚类。
 - 0.6B 三模型：1.7B scorer/refiner/cueqc 完整通过后，再按相同 schema 独立重训 0.6B；不复用 1.7B checkpoint。
 - 长期研究：等 Boundary/CueQC 审计闭环稳定后，再评估 Qwen ASR boundary-token SFT / DPO / RL、长上下文 joint segmentation-transcription 和小模型蒸馏。
 
 ## 近期记录
+
+- 2026-06-25 Pre-ASR CueQC v6 cold-start 训练与 registry promotion：基于 current two-film `8834` 条 Pre-ASR v6 candidates，按审计策略用 ASR `raw_text` 只作 teacher/audit 标签源，空 ASR、纯标点、喘息/呻吟/亲吻/点头等低信息非词人声标为 drop，`やだ/やめ/いや/うん/え?` 等短但有语义的台词保留；混合或不确定短 kana/ascii 样本跳过，不做 cluster 误广播。最终 sample-level labels `8742` 条，其中 keep `1701`、drop `7041`、skip `92`。修复 `compile_pre_asr_v6_features` 两个问题：JSONL candidate 文件不再被误当成单个 JSON object；带 `sample_id` 的标签不再同时按 `cluster_id` 广播到混簇。特征包 `features=8742/keep=1701/drop=7041`，训练 `5000` steps、hidden `128`、threshold `0.999` 输出 `cueqc_pre_asr_mamba_v6_binary.jaykwok-Qwen3-ASR-1.7B-JA-Anime-Galgame.pt`，sha256 `00cca38ed1cbfb4409336b45a66b20d72fb90dccf3592499b27fa68c2509de8a`；all drop precision/recall `0.9990/0.1423`，keep recall `0.9994`，val drop precision/recall `0.9936/0.1474`，val keep recall `0.9960`。该 checkpoint 已提升到 `src/asr/checkpoints/`；scorer v5 micro full 与 Boundary Refiner v6 micro-edge checkpoint 也提升到 repo-id registry。当前结论：这是保守 cold-start drop router，不声称 production 质量；默认仍关闭，下一步必须跑 enabled workflow smoke/audit。
 
 - 2026-06-25 Pre-ASR CueQC v6 聚类代码审计与 TORC-only 优化：用户确认不采用 k-means fallback，当前聚类路线保持 TORC-only。`cluster_candidates.py` 的 `feature_space=auto` 优先使用 Pre-ASR v6 数值特征，距离矩阵改为 SciPy/NumPy 向量化实现；新增 `--layer-preview-max/--layer-preview-only` 用于先看 TORC merge hierarchy 层级规模，再用 `--merge-layer` 选择人工可审计层。`torque.py` 新增 fast merge-layer 路径，直接返回 1NN + mass-rule merge hierarchy 的指定层，不再跑最终 torque-gap/cut-tree；随机距离矩阵与朴素参考实现一致性检查通过。审计中删除旧 `auto_config` / distance-statistics preset 代码和 summary 字段，避免 merge-layer 路线继续携带无意义自适应配置；修复旧 cluster audit HTML 中 `cueFeatures` 未定义导致样本详情渲染中断的问题。当前 two-film Pre-ASR v6 candidates 为 `8834` 条，layer preview 为 `1991 -> 77 -> 1`，已选 layer 1 生成 `77` 个簇；广播标注页 `agents/audits/20260625_003018_pre-asr-v6-current-twofilm-cluster-broadcast-audit/index.html`，音频复核页 `agents/audits/20260625_003018_pre-asr-v6-current-twofilm-audio-label-audit/index.html`。验证：聚类/审计 focused tests `17 passed`，`py_compile` 通过，`git diff --check` 仅 CRLF 提示。
 
