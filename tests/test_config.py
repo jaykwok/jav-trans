@@ -139,6 +139,7 @@ def test_default_model_download_root_is_project_models():
     assert config.DEFAULT_SETTINGS["ASR_SUBPROCESS_READY_TIMEOUT_S"] == "600"
     assert config.DEFAULT_SETTINGS["CUEQC_SHADOW_ENABLED"] == "0"
     assert config.DEFAULT_SETTINGS["PRE_ASR_CUEQC_ENABLED"] == "0"
+    assert config.DEFAULT_SETTINGS["PRE_ASR_CUEQC_DROP_THRESHOLD"] == "0.999"
     assert config.DEFAULT_SETTINGS["LLM_API_FORMAT"] == "chat"
 
 

@@ -573,7 +573,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--pre-asr-cueqc-drop-threshold",
         type=float,
-        default=_env_float("PRE_ASR_CUEQC_DROP_THRESHOLD", 0.90),
+        default=_env_float("PRE_ASR_CUEQC_DROP_THRESHOLD", 0.999),
     )
     parser.add_argument("--boundary-refiner-device", default=os.getenv("BOUNDARY_REFINER_DEVICE", "auto"))
     parser.add_argument("--boundary-planner-sequence-batch-size", type=int, default=_env_int("BOUNDARY_PLANNER_SEQUENCE_BATCH_SIZE", 256))

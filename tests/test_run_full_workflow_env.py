@@ -117,6 +117,7 @@ def test_run_full_workflow_context_carries_boundary_env(monkeypatch, tmp_path):
         "jaykwok/Qwen3-ASR-0.6B-JA-Anime-Galgame=32,"
         "jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame=8"
     )
+    monkeypatch.setenv("ASR_BATCH_SIZE", "auto")
     monkeypatch.setenv("ASR_BATCH_SIZE_BY_REPO", batch_table)
     boundary_mapping = "jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame=src/boundary/checkpoints/boundary_edge_refiner_v6.jaykwok-Qwen3-ASR-1.7B-JA-Anime-Galgame.pt"
     cueqc_mapping = "jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame=src/asr/checkpoints/cueqc_mamba_v4_binary.jaykwok-Qwen3-ASR-1.7B-JA-Anime-Galgame.pt"
