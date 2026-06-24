@@ -19,6 +19,11 @@ from tools.audits.audit_nav import AUDIT_RM_ROOT, AUDIT_ROOT, PROJECT_ROOT, dele
 API_DELETE_AUDIT = "/__audit_api__/delete-audit"
 BODY_LIMIT_BYTES = 64 * 1024
 COPY_CHUNK_BYTES = 1024 * 1024
+CLIENT_DISCONNECT_ERRORS: tuple[type[OSError], ...] = (
+    BrokenPipeError,
+    ConnectionAbortedError,
+    ConnectionResetError,
+)
 
 
 mimetypes.add_type("application/javascript; charset=utf-8", ".js")
@@ -232,7 +237,7 @@ def make_handler(
                         break
                     try:
                         self.wfile.write(chunk)
-                    except (BrokenPipeError, ConnectionResetError):
+                    except CLIENT_DISCONNECT_ERRORS:
                         break
                     remaining -= len(chunk)
 
