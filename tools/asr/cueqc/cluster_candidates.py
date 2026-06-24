@@ -7,7 +7,8 @@ port of Jie Yang's parameter-free Torque Clustering algorithm. TORC decides the
 number of clusters autonomously from the distance matrix, so this module no
 longer exposes ``--method``, ``--reducer``, ``--min-clusters`` /
 ``--max-clusters`` or any backend-specific tuning flags — only the feature
-space (structured / dense / fused embeddings) and the distance metric remain.
+space (Pre-ASR numeric / structured / dense / fused embeddings) and the
+distance metric remain.
 """
 from __future__ import annotations
 
@@ -20,13 +21,16 @@ from collections import Counter, defaultdict
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
 
+import numpy as np
+from scipy.spatial.distance import pdist, squareform
+
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
 SRC_ROOT = PROJECT_ROOT / "src"
 if str(SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(SRC_ROOT))
 
 from asr.cueqc import normalize_feature_matrix
-from tools.asr.cueqc.torque import torque_clustering
+from tools.asr.cueqc.torque import torque_clustering, torque_merge_layer_preview
 
 
 def read_jsonl(path: Path) -> list[dict[str, Any]]:
@@ -123,6 +127,69 @@ def _numeric_vector(value: Any) -> list[float]:
     return out
 
 
+def _safe_float(value: Any, default: float = 0.0) -> float:
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return default
+    return parsed if math.isfinite(parsed) else default
+
+
+def _pre_asr_feature_names(rows: list[Mapping[str, Any]]) -> list[str]:
+    for row in rows:
+        features = row.get("features")
+        names = row.get("feature_names")
+        if not isinstance(features, Mapping):
+            continue
+        if isinstance(names, Sequence) and not isinstance(names, (str, bytes, bytearray)):
+            ordered = [str(name) for name in names if str(name)]
+            if ordered:
+                return ordered
+    names_seen: set[str] = set()
+    for row in rows:
+        features = row.get("features")
+        if not isinstance(features, Mapping):
+            continue
+        for name, value in features.items():
+            if name in names_seen:
+                continue
+            try:
+                parsed = float(value)
+            except (TypeError, ValueError):
+                continue
+            if math.isfinite(parsed):
+                names_seen.add(str(name))
+    return sorted(names_seen)
+
+
+def _pre_asr_numeric_matrix(rows: list[Mapping[str, Any]]) -> tuple[list[list[float]], dict[str, Any]]:
+    names = _pre_asr_feature_names(rows)
+    if not names:
+        return [], {
+            "available": False,
+            "source": "features",
+            "feature_names": [],
+            "rows_with_features": 0,
+            "total_dim": 0,
+        }
+    matrix: list[list[float]] = []
+    rows_with_features = 0
+    for row in rows:
+        features = row.get("features")
+        if isinstance(features, Mapping):
+            rows_with_features += 1
+        else:
+            features = {}
+        matrix.append([_safe_float(features.get(name)) for name in names])
+    return matrix, {
+        "available": True,
+        "source": "features",
+        "feature_names": names,
+        "rows_with_features": rows_with_features,
+        "total_dim": len(names),
+    }
+
+
 def _embedding_vectors(row: Mapping[str, Any]) -> dict[str, list[float]]:
     vectors: dict[str, list[float]] = {}
     for key, name in (
@@ -187,16 +254,38 @@ def _feature_matrix(
     *,
     feature_space: str,
 ) -> tuple[list[list[float]], dict[str, Any]]:
-    structured = normalize_feature_matrix(rows)
+    pre_asr, pre_asr_meta = _pre_asr_numeric_matrix(rows)
+    structured: list[list[float]] | None = None
     dense, dense_meta = _dense_embedding_matrix(rows)
     resolved = feature_space
     if feature_space == "auto":
-        resolved = "fused" if dense else "structured"
+        resolved = "pre_asr" if pre_asr else "fused" if dense else "structured"
+    if resolved == "pre_asr":
+        if not pre_asr:
+            structured = normalize_feature_matrix(rows)
+            return structured, {
+                "requested": feature_space,
+                "resolved": "structured",
+                "fallback_reason": "no_pre_asr_numeric_features",
+                "structured_dim": len(structured[0]) if structured else 0,
+                "pre_asr": pre_asr_meta,
+                "dense": dense_meta,
+            }
+        pre_asr_norm = _l2_normalize_matrix(_zscore_matrix(pre_asr))
+        return pre_asr_norm, {
+            "requested": feature_space,
+            "resolved": resolved,
+            "pre_asr": pre_asr_meta,
+            "dense": dense_meta,
+            "normalization": "zscore_then_l2",
+        }
+    structured = normalize_feature_matrix(rows)
     if resolved == "structured":
         return structured, {
             "requested": feature_space,
             "resolved": resolved,
             "structured_dim": len(structured[0]) if structured else 0,
+            "pre_asr": pre_asr_meta,
             "dense": dense_meta,
         }
     if resolved == "dense":
@@ -206,6 +295,7 @@ def _feature_matrix(
                 "resolved": "structured",
                 "fallback_reason": "no_dense_embeddings",
                 "structured_dim": len(structured[0]) if structured else 0,
+                "pre_asr": pre_asr_meta,
                 "dense": dense_meta,
             }
         dense_norm = _l2_normalize_matrix(_zscore_matrix(dense))
@@ -213,6 +303,7 @@ def _feature_matrix(
             "requested": feature_space,
             "resolved": resolved,
             "structured_dim": len(structured[0]) if structured else 0,
+            "pre_asr": pre_asr_meta,
             "dense": dense_meta,
         }
     if resolved != "fused":
@@ -223,6 +314,7 @@ def _feature_matrix(
             "resolved": "structured",
             "fallback_reason": "no_dense_embeddings",
             "structured_dim": len(structured[0]) if structured else 0,
+            "pre_asr": pre_asr_meta,
             "dense": dense_meta,
         }
     dense_norm = _l2_normalize_matrix(_zscore_matrix(dense))
@@ -235,21 +327,29 @@ def _feature_matrix(
         "requested": feature_space,
         "resolved": "fused",
         "structured_dim": len(structured[0]) if structured else 0,
+        "pre_asr": pre_asr_meta,
         "dense": dense_meta,
         "fused_dim": len(fused[0]) if fused else 0,
         "block_scaling": "l2_per_block",
     }
 
 
-def _distance_matrix(matrix: list[list[float]], *, metric: str) -> list[list[float]]:
-    n = len(matrix)
-    dm: list[list[float]] = [[0.0] * n for _ in range(n)]
-    for i in range(n):
-        for j in range(i + 1, n):
-            value = _distance(matrix[i], matrix[j], metric)
-            dm[i][j] = value
-            dm[j][i] = value
-    return dm
+def _distance_matrix(matrix: Sequence[Sequence[float]], *, metric: str) -> np.ndarray:
+    values = np.asarray(matrix, dtype=np.float64)
+    if values.ndim != 2:
+        raise ValueError("distance matrix input must be 2-D")
+    n = values.shape[0]
+    if n == 0:
+        return np.zeros((0, 0), dtype=np.float64)
+    if metric == "euclidean":
+        return squareform(pdist(values, metric="euclidean"))
+    if metric == "cosine":
+        norms = np.linalg.norm(values, axis=1, keepdims=True)
+        safe = np.divide(values, np.where(norms == 0.0, 1.0, norms))
+        distances = 1.0 - np.clip(safe @ safe.T, -1.0, 1.0)
+        np.fill_diagonal(distances, 0.0)
+        return distances
+    raise ValueError(f"unsupported metric: {metric}")
 
 
 def _relabel_by_size(labels: Sequence[int]) -> list[str]:
@@ -499,6 +599,7 @@ function renderCurrent() {{
   const row = ROWS[current];
   if (!row) return;
   const tf = row.text_features || {{}};
+  const cueFeatures = row.cue_features || {{}};
   const qc = row.qc || {{}};
   document.getElementById("sampleTitle").textContent = `${{row.cluster_id}} · ${{row.sample_id}}`;
   document.getElementById("sampleMeta").textContent = `chunk ${{row.chunk_index}} · ${{Number(row.start||0).toFixed(3)}}-${{Number(row.end||0).toFixed(3)}} · duration ${{Number(row.duration_s||0).toFixed(3)}}s`;
@@ -606,6 +707,22 @@ def cluster_rows(
         clustered_rows, matrix, labels, per_cluster=representatives_per_cluster
     )
     stable_count = len({label for label in labels if not label.startswith("noise_")})
+    backend = {
+        "algorithm": "torque",
+        "mode": "merge_layer" if merge_layer is not None else "torque_gap_cut",
+        "merge_layer": merge_layer,
+        "layer_cluster_counts": diag.get("layer_cluster_counts"),
+        "k_requested": diag["k_requested"],
+        "autonomous_k": diag["cluster_count"],
+        "cut_count": diag["cut_count"],
+        "noise_count": diag["noise_count"],
+        "detect_noise": diag["detect_noise"],
+        "fast_merge_layer": bool(diag.get("fast_merge_layer", False)),
+        "torque_max": round(float(max(diag["torque"])) if diag["torque"].size else 0.0, 6),
+        "mass_sum": round(float(diag["mass"].sum()) if diag["mass"].size else 0.0, 6),
+    }
+    if "adjustment_factor" in diag:
+        backend["adjustment_factor"] = round(float(diag["adjustment_factor"]), 4)
     summary = {
         "schema": "cueqc_cluster_summary_v1",
         "method": "torque",
@@ -616,29 +733,60 @@ def cluster_rows(
         "cluster_counts": {s["cluster_id"]: s["count"] for s in summaries},
         "representatives_per_cluster": representatives_per_cluster,
         "feature_space": feature_summary,
-        "backend": {
-            "algorithm": "torque",
-            "mode": "merge_layer" if merge_layer is not None else "torque_gap_cut",
-            "merge_layer": merge_layer,
-            "layer_cluster_counts": diag.get("layer_cluster_counts"),
-            "k_requested": diag["k_requested"],
-            "autonomous_k": diag["cluster_count"],
-            "cut_count": diag["cut_count"],
-            "noise_count": diag["noise_count"],
-            "detect_noise": diag["detect_noise"],
-            "adjustment_factor": round(float(diag["adjustment_factor"]), 4),
-            "auto_config": diag["auto_config"],
-            "torque_max": round(float(max(diag["torque"])) if diag["torque"].size else 0.0, 6),
-            "mass_sum": round(float(diag["mass"].sum()) if diag["mass"].size else 0.0, 6),
-        },
+        "backend": backend,
     }
     return clustered_rows, representatives, summaries, summary
+
+
+def preview_layers(
+    rows: list[dict[str, Any]],
+    *,
+    metric: str,
+    feature_space: str,
+    max_layer: int,
+) -> dict[str, Any]:
+    matrix, feature_summary = _feature_matrix(rows, feature_space=feature_space)
+    distance_matrix = _distance_matrix(matrix, metric=metric)
+    layers = torque_merge_layer_preview(distance_matrix, max_layer=max_layer)
+    return {
+        "schema": "cueqc_torc_layer_preview_v1",
+        "method": "torque",
+        "metric": metric,
+        "candidate_count": len(rows),
+        "feature_space": feature_summary,
+        "max_layer_requested": max_layer,
+        "layers": layers,
+    }
 
 
 def run(args: argparse.Namespace) -> int:
     rows = read_jsonl(Path(args.input))
     if args.max_items is not None:
         rows = rows[: args.max_items]
+    output_dir = Path(args.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    layer_preview_path = output_dir / "torc_layer_preview.json"
+    if args.layer_preview_max is not None:
+        preview = preview_layers(
+            rows,
+            metric=args.metric,
+            feature_space=args.feature_space,
+            max_layer=args.layer_preview_max,
+        )
+        layer_preview_path.write_text(
+            json.dumps(preview, ensure_ascii=False, indent=2, sort_keys=True),
+            encoding="utf-8",
+        )
+        print(f"layer_preview={layer_preview_path}")
+        if args.layer_preview_only:
+            print(
+                "layers="
+                + ", ".join(
+                    f"{item['layer']}:{item['cluster_count']}"
+                    for item in preview["layers"]
+                )
+            )
+            return 0
     clustered, representatives, summaries, summary = cluster_rows(
         rows,
         metric=args.metric,
@@ -648,8 +796,6 @@ def run(args: argparse.Namespace) -> int:
         adjustment_factor=args.adjustment_factor,
         merge_layer=args.merge_layer,
     )
-    output_dir = Path(args.output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
     clusters_path = output_dir / "cueqc_clusters.jsonl"
     reps_path = output_dir / "cueqc_cluster_representatives.jsonl"
     summaries_path = output_dir / "cueqc_cluster_summaries.jsonl"
@@ -667,6 +813,8 @@ def run(args: argparse.Namespace) -> int:
             "html": str(html_path),
         }
     )
+    if layer_preview_path.exists():
+        summary["layer_preview"] = str(layer_preview_path)
     summary_path.write_text(
         json.dumps(summary, ensure_ascii=False, indent=2, sort_keys=True),
         encoding="utf-8",
@@ -691,9 +839,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--metric", choices=("cosine", "euclidean"), default="euclidean")
     parser.add_argument(
         "--feature-space",
-        choices=("auto", "structured", "dense", "fused"),
+        choices=("auto", "pre_asr", "structured", "dense", "fused"),
         default="auto",
-        help="auto uses structured features unless dense embeddings are present.",
+        help="auto uses Pre-ASR numeric features when present, then dense embeddings, then structured text features.",
     )
     parser.add_argument("--representatives-per-cluster", type=int, default=3)
     parser.add_argument("--no-noise", action="store_true", help="disable TORC noise detection")
@@ -716,6 +864,17 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("--max-items", type=int)
     parser.add_argument("--title", default="CueQC cluster-first 审计")
+    parser.add_argument(
+        "--layer-preview-max",
+        type=int,
+        default=None,
+        help="write torc_layer_preview.json with merge-layer cluster counts up to this layer",
+    )
+    parser.add_argument(
+        "--layer-preview-only",
+        action="store_true",
+        help="only write torc_layer_preview.json; do not generate clustered candidates",
+    )
     args = parser.parse_args(argv)
     if args.representatives_per_cluster <= 0:
         parser.error("--representatives-per-cluster must be positive")
@@ -723,6 +882,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         parser.error("--adjustment-factor must be in [0, 1]")
     if args.max_items is not None and args.max_items <= 0:
         parser.error("--max-items must be positive")
+    if args.layer_preview_max is not None and args.layer_preview_max < 0:
+        parser.error("--layer-preview-max must be non-negative")
+    if args.layer_preview_only and args.layer_preview_max is None:
+        parser.error("--layer-preview-only requires --layer-preview-max")
     return args
 
 

@@ -92,9 +92,12 @@ def test_cueqc_cluster_audit_uses_explicit_media_root(tmp_path: Path):
     assert html.index('class="sample-list" id="list"') < html.index('id="clusterNav"')
     assert "current = ROWS.indexOf(examples[0]);" not in html
     assert 'document.getElementById("sortBy").addEventListener("change", () => {\n  applyFilters();\n});' in html
-    assert "alignmentFilter" in html
-    assert "issueFilter" in html
-    assert "all alignment issue" in html
+    assert "alignmentFilter" not in html
+    assert "issueFilter" not in html
+    assert "all alignment quality" not in html
+    assert "all alignment issue" not in html
+    assert "row.cluster_id && row.cluster_id !== activeClusterId" in html
+    assert "renderClusterDetail();" in html
     assert "fallbackFilter" not in html
     assert "all fallback subtype" not in html
     assert "ALIGNED_BY_VIDEO" in html

@@ -67,88 +67,6 @@ def _qac(sort_p: np.ndarray) -> np.ndarray:
     return ind
 
 
-# ---------------------------------------------------------------------------
-# Auto-configuration (ported from Cognet-74 dataset_config.py).
-#
-# TORC's cut decision depends on ``adjustment_factor``; the right value varies
-# with dataset shape (noisy / subtle / well-separated / high-dim / sparse). The
-# reference ships a heuristic that inspects the distance-matrix statistics and
-# picks a preset, then nudges it for extreme dispersion. This makes the
-# "parameter-free" claim honest in practice — without it the std-adjusted
-# thresholds collapse on heavy-tailed distance distributions.
-# ---------------------------------------------------------------------------
-
-_PRESET_CONFIGS = {
-    "noisy": {"use_std_adjustment": True, "adjustment_factor": 0.3, "isnoise": True},
-    "subtle": {"use_std_adjustment": True, "adjustment_factor": 0.7, "isnoise": False},
-    "well_separated": {"use_std_adjustment": True, "adjustment_factor": 0.5, "isnoise": False},
-    "high_dimensional": {"use_std_adjustment": True, "adjustment_factor": 0.4, "isnoise": True},
-    "sparse": {"use_std_adjustment": True, "adjustment_factor": 0.6, "isnoise": True},
-}
-
-
-def _analyze_distance_matrix(dm: sp.spmatrix | np.ndarray, *, sample_size: int = 10000) -> dict[str, float]:
-    if sp.issparse(dm):
-        distances = np.asarray(dm.tocoo().data, dtype=np.float64)
-    else:
-        distances = np.asarray(dm, dtype=np.float64).ravel()
-    if distances.size > sample_size:
-        rng = np.random.default_rng(0)
-        distances = rng.choice(distances, sample_size, replace=False)
-    mean = float(np.mean(distances)) if distances.size else 0.0
-    std = float(np.std(distances)) if distances.size else 0.0
-    # Sample skewness and kurtosis (excess), computed inline to avoid scipy.stats.
-    n = distances.size
-    if n > 2 and std > 0:
-        z = (distances - mean) / std
-        skewness = float((z ** 3).mean() * np.sqrt(n * (n - 1)) / (n - 2))
-        kurtosis = float((z ** 4).mean() - 3.0)
-    else:
-        skewness = 0.0
-        kurtosis = 0.0
-    return {
-        "mean_distance": mean,
-        "std_distance": std,
-        "skewness": skewness,
-        "kurtosis": kurtosis,
-        "sparsity": float(np.sum(distances == 0) / max(1, distances.size)),
-        "dimensionality": int(dm.shape[0]),
-        "coefficient_variation": std / mean if mean != 0 else float("inf"),
-    }
-
-
-def _get_dataset_type(stats: dict[str, float]) -> str:
-    if stats["sparsity"] > 0.8:
-        return "sparse"
-    if stats["dimensionality"] > 100:
-        return "high_dimensional"
-    if stats["coefficient_variation"] > 2.0 or stats["kurtosis"] > 5.0:
-        return "noisy"
-    if stats["coefficient_variation"] < 0.5 and abs(stats["skewness"]) < 0.5:
-        return "subtle"
-    return "well_separated"
-
-
-def _auto_config(dm: sp.spmatrix | np.ndarray, *, detect_noise: bool) -> tuple[float, dict[str, Any]]:
-    """Pick ``adjustment_factor`` from distance-matrix statistics.
-
-    Returns ``(adjustment_factor, diagnostics)``. ``detect_noise`` is preserved
-    as the caller requested rather than overwritten by the preset.
-    """
-    stats = _analyze_distance_matrix(dm)
-    dataset_type = _get_dataset_type(stats)
-    config = dict(_PRESET_CONFIGS[dataset_type])
-    if stats["coefficient_variation"] > 3.0:
-        config["adjustment_factor"] *= 0.8
-    if stats["dimensionality"] > 1000:
-        config["adjustment_factor"] *= 0.9
-    config["adjustment_factor"] = float(min(1.0, max(0.0, config["adjustment_factor"])))
-    config["detected_type"] = dataset_type
-    config["dataset_analysis"] = stats
-    config["isnoise"] = detect_noise
-    return config["adjustment_factor"], config
-
-
 def _unique_z(z: np.ndarray, ljmat: sp.spmatrix):
     """Deduplicate recorded links and drop the redundant ones from the graph."""
     if z.size == 0:
@@ -253,6 +171,154 @@ def _nab_dec(p: np.ndarray, mass: np.ndarray, r: np.ndarray, florderloc: np.ndar
     return max(1, cut)
 
 
+def _community_min_distance_matrix(
+    dm: np.ndarray,
+    point_to_comm: np.ndarray,
+    comm_num: int,
+    *,
+    chunk_rows: int = 256,
+) -> np.ndarray:
+    """Minimum point-to-point distance between current TORC communities.
+
+    This is the vectorized equivalent of the original nested
+    ``_ps2psdist(community[i], community[j])`` loop. It preserves the same
+    min-distance community metric while avoiding Python-level O(c^2) loops.
+    """
+    inter = np.full((comm_num, comm_num), np.inf, dtype=np.float64)
+    labels_right = point_to_comm[None, :]
+    n = dm.shape[0]
+    for start in range(0, n, chunk_rows):
+        end = min(n, start + chunk_rows)
+        labels_left = point_to_comm[start:end, None]
+        np.minimum.at(inter, (labels_left, labels_right), dm[start:end, :])
+    np.fill_diagonal(inter, np.inf)
+    return inter
+
+
+def _merge_layers_fast(
+    dm: np.ndarray,
+    *,
+    max_layer: int,
+) -> list[np.ndarray]:
+    """Return TORC merge-hierarchy partitions without building the cut tree.
+
+    Merge-layer mode never uses torque-gap pruning. The requested partitions are
+    fully determined by repeated 1NN / mass-rule community merges, so this fast
+    path returns the layer sequence directly and stops at ``max_layer``.
+    """
+    if max_layer < 0:
+        raise ValueError("max_layer must be non-negative")
+    n = dm.shape[0]
+    if n <= 1:
+        return [np.zeros(n, dtype=np.int64)]
+
+    diag = np.diag(dm).copy()
+    np.fill_diagonal(dm, np.inf)
+    try:
+        nearest = np.argmin(dm, axis=1).astype(np.int64)
+        graph = sp.csr_matrix(
+            (
+                np.ones(n * 2, dtype=np.float64),
+                (
+                    np.concatenate([np.arange(n, dtype=np.int64), nearest]),
+                    np.concatenate([nearest, np.arange(n, dtype=np.int64)]),
+                ),
+            ),
+            shape=(n, n),
+        )
+        _count, point_labels = connected_components(graph, directed=False)
+        point_labels = point_labels.astype(np.int64, copy=False)
+        layer_labels = [point_labels.copy()]
+        if max_layer == 0:
+            return layer_labels
+
+        while len(layer_labels) <= max_layer:
+            _unique, point_to_comm = np.unique(point_labels, return_inverse=True)
+            point_to_comm = point_to_comm.astype(np.int64, copy=False)
+            comm_num = int(point_to_comm.max()) + 1
+            sizes = np.bincount(point_to_comm, minlength=comm_num)
+            if comm_num <= 1:
+                break
+
+            inter = _community_min_distance_matrix(dm, point_to_comm, comm_num)
+            # Mass rule: community i may attach only to a community j that is
+            # not smaller. This matches the reference loop's first nearest
+            # candidate with sizes[i] <= sizes[j].
+            inter[sizes[None, :] < sizes[:, None]] = np.inf
+            nearest_comm = np.argmin(inter, axis=1).astype(np.int64)
+            rows = np.arange(comm_num, dtype=np.int64)
+            valid = np.isfinite(inter[rows, nearest_comm])
+            if not np.any(valid):
+                break
+
+            graph = sp.csr_matrix(
+                (
+                    np.ones(int(np.sum(valid)) * 2, dtype=np.float64),
+                    (
+                        np.concatenate([rows[valid], nearest_comm[valid]]),
+                        np.concatenate([nearest_comm[valid], rows[valid]]),
+                    ),
+                ),
+                shape=(comm_num, comm_num),
+            )
+            _count, comm_bins = connected_components(graph, directed=False)
+            next_labels = comm_bins[point_to_comm].astype(np.int64, copy=False)
+            if np.array_equal(next_labels, point_labels):
+                break
+            point_labels = next_labels
+            layer_labels.append(point_labels.copy())
+
+        return layer_labels
+    finally:
+        np.fill_diagonal(dm, diag)
+
+
+def _merge_layer_fast(
+    dm: np.ndarray,
+    *,
+    merge_layer: int,
+) -> tuple[np.ndarray, list[int]]:
+    """Return one TORC merge-hierarchy partition without building the cut tree."""
+    layer_labels = _merge_layers_fast(dm, max_layer=merge_layer)
+    if merge_layer >= len(layer_labels):
+        raise ValueError(
+            f"merge_layer {merge_layer} out of range; "
+            f"available layers 0..{len(layer_labels) - 1}"
+        )
+    return _relabel_by_size(layer_labels[merge_layer]), [
+        int(len(np.unique(labels))) for labels in layer_labels
+    ]
+
+
+def torque_merge_layer_preview(
+    all_dm: np.ndarray | sp.spmatrix,
+    *,
+    max_layer: int = 8,
+) -> list[dict[str, Any]]:
+    """Summarize TORC merge layers for choosing a human-auditable cluster level."""
+    if max_layer < 0:
+        raise ValueError("max_layer must be non-negative")
+    if isinstance(all_dm, sp.spmatrix):
+        dm = all_dm.toarray().astype(np.float64, copy=False)
+    else:
+        dm = np.asarray(all_dm, dtype=np.float64)
+    if dm.ndim != 2 or dm.shape[0] != dm.shape[1]:
+        raise ValueError("distance matrix must be square")
+    preview: list[dict[str, Any]] = []
+    for layer, labels in enumerate(_merge_layers_fast(dm.copy(), max_layer=max_layer)):
+        _unique, counts = np.unique(labels, return_counts=True)
+        preview.append(
+            {
+                "layer": layer,
+                "cluster_count": int(len(counts)),
+                "cluster_size_min": int(counts.min()) if counts.size else 0,
+                "cluster_size_max": int(counts.max()) if counts.size else 0,
+                "cluster_size_avg": round(float(counts.mean()) if counts.size else 0.0, 4),
+            }
+        )
+    return preview
+
+
 # ---------------------------------------------------------------------------
 # Core algorithm
 # ---------------------------------------------------------------------------
@@ -271,9 +337,8 @@ def torque_clustering(
     Parameters mirror the official signature ``TorqueClustering(ALL_DM, K, isnoise)``:
     ``k=0`` selects automatic cluster-count determination; ``k>0`` forces that many
     clusters. ``detect_noise`` flags outliers (label 0 in the noise-aware output).
-    ``adjustment_factor`` defaults to ``None`` which enables per-dataset auto-tuning
-    of the TORC cut threshold from the distance-matrix statistics (ported from the
-    reference ``dataset_config``); pass an explicit float in [0, 1] to override.
+    ``adjustment_factor`` is used only by the legacy torque-gap cut. ``None``
+    uses the fixed default ``0.5``. Merge-layer mode ignores it.
 
     ``merge_layer`` selects a partition from the TORC merge hierarchy instead of
     the torque-gap cut on the final tree. Layer 0 is the initial 1-NN layer;
@@ -288,6 +353,7 @@ def torque_clustering(
     """
     if all_dm is None:
         raise ValueError("distance matrix is required")
+    dense_dm: np.ndarray | None = None
     if isinstance(all_dm, sp.spmatrix):
         dm_sparse = all_dm.tocsr().astype(np.float64)
         n = dm_sparse.shape[0]
@@ -296,22 +362,37 @@ def torque_clustering(
         if arr.ndim != 2 or arr.shape[0] != arr.shape[1]:
             raise ValueError("distance matrix must be square")
         n = arr.shape[0]
+        dense_dm = arr
         dm_sparse = sp.csr_matrix(arr)
     if n <= 1:
+        if adjustment_factor is None:
+            adjustment_factor = 0.5
         return np.zeros(n, dtype=np.int64), np.zeros(n, dtype=np.int64), {
             "cluster_count": max(1, n), "cut_count": 0,
+            "noise_count": 0,
             "mass": np.array([]), "r": np.array([]), "torque": np.array([]),
             "k_requested": k, "detect_noise": detect_noise,
+            "adjustment_factor": float(adjustment_factor),
         }
 
-    # Auto-tune the cut threshold from distance-matrix statistics unless the
-    # caller pinned adjustment_factor. The right factor varies with dataset
-    # shape; without this the std-adjusted thresholds collapse on heavy-tailed
-    # distance distributions.
+    if merge_layer is not None:
+        if dense_dm is None:
+            dense_dm = dm_sparse.toarray()
+        labels, layer_counts = _merge_layer_fast(dense_dm, merge_layer=merge_layer)
+        diag = {
+            "cluster_count": int(len(np.unique(labels))),
+            "cut_count": 0,
+            "noise_count": 0,
+            "mass": np.array([]), "r": np.array([]), "torque": np.array([]),
+            "k_requested": k, "detect_noise": detect_noise,
+            "merge_layer": merge_layer,
+            "layer_cluster_counts": layer_counts,
+            "fast_merge_layer": True,
+        }
+        return labels, labels.copy(), diag
+
     if adjustment_factor is None:
-        adjustment_factor, auto_diag = _auto_config(dm_sparse, detect_noise=detect_noise)
-    else:
-        auto_diag = {"adjustment_factor": float(adjustment_factor), "auto": False}
+        adjustment_factor = 0.5
 
     with np.errstate(all="ignore"):
         link_adj = sp.lil_matrix((n, n), dtype=np.float64)
@@ -406,45 +487,13 @@ def torque_clustering(
 
         if not cutlinkpower_all:
             empty_mass = np.array([])
-            if merge_layer is not None and 0 <= merge_layer < len(layer_labels):
-                labels = _relabel_by_size(layer_labels[merge_layer])
-                return labels, labels.copy(), {
-                    "cluster_count": int(len(np.unique(labels))),
-                    "cut_count": 0, "mass": empty_mass, "r": empty_mass, "torque": empty_mass,
-                    "k_requested": k, "detect_noise": detect_noise,
-                    "merge_layer": merge_layer,
-                    "layer_cluster_counts": [int(len(np.unique(l))) for l in layer_labels],
-                }
             return np.zeros(n, dtype=np.int64), np.zeros(n, dtype=np.int64), {
                 "cluster_count": 1, "cut_count": 0,
+                "noise_count": 0,
                 "mass": empty_mass, "r": empty_mass, "torque": empty_mass,
                 "k_requested": k, "detect_noise": detect_noise,
-            }
-
-        # When merge_layer is set, skip the factor-sensitive torque-gap cut and
-        # return the requested merge-hierarchy partition directly. Each layer is
-        # a natural coarsening of the 1-NN + mass-rule merge tree, which is far
-        # more stable than cutting the final aggregated tree on heavy-tailed
-        # distance distributions.
-        if merge_layer is not None:
-            if not 0 <= merge_layer < len(layer_labels):
-                raise ValueError(
-                    f"merge_layer {merge_layer} out of range; "
-                    f"available layers 0..{len(layer_labels) - 1}"
-                )
-            labels = _relabel_by_size(layer_labels[merge_layer])
-            diag = {
-                "cluster_count": int(len(np.unique(labels))),
-                "cut_count": 0,
-                "noise_count": 0,
-                "mass": np.array([]), "r": np.array([]), "torque": np.array([]),
-                "k_requested": k, "detect_noise": detect_noise,
                 "adjustment_factor": float(adjustment_factor),
-                "auto_config": auto_diag,
-                "merge_layer": merge_layer,
-                "layer_cluster_counts": [int(len(np.unique(l))) for l in layer_labels],
             }
-            return labels, labels.copy(), diag
 
         cutlink_all = np.vstack([c for c in cutlinkpower_all if c.size]).astype(np.float64)
         mass = cutlink_all[:, 4] * cutlink_all[:, 5]
@@ -530,7 +579,6 @@ def torque_clustering(
         "detect_noise": detect_noise,
         "noise_count": int(np.sum(labels_with_noise < 0)),
         "adjustment_factor": float(adjustment_factor),
-        "auto_config": auto_diag,
     }
     return labels, labels_with_noise, diag
 
