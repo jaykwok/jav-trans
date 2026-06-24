@@ -5,7 +5,7 @@ import time
 import warnings
 from dataclasses import replace
 from pathlib import Path
-from typing import Callable
+from typing import Any, Callable
 
 import numpy as np
 
@@ -738,6 +738,88 @@ def _apply_pre_asr_cueqc(
     return kept, report
 
 
+def _normalize_cut_candidates(value: Any) -> list[dict[str, Any]]:
+    if not isinstance(value, list):
+        return []
+    candidates: list[dict[str, Any]] = []
+    for item in value:
+        if not isinstance(item, dict):
+            continue
+        try:
+            candidate = {
+                "kind": str(item.get("kind") or ""),
+                "time_s": float(item["time_s"]),
+                "frame": int(item["frame"]),
+                "score": float(item.get("score") or 0.0),
+                "prominence": float(item.get("prominence") or 0.0),
+                "speech_valley": float(item.get("speech_valley") or 0.0),
+                "strength": float(item.get("strength") or 0.0),
+            }
+        except (KeyError, TypeError, ValueError):
+            continue
+        if item.get("downgraded_from") is not None:
+            candidate["downgraded_from"] = str(item.get("downgraded_from") or "")
+        candidates.append(candidate)
+    return _dedupe_cut_candidates(candidates)
+
+
+def _dedupe_cut_candidates(candidates: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    by_key: dict[tuple[str, int], dict[str, Any]] = {}
+    for candidate in candidates:
+        try:
+            time_s = float(candidate["time_s"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        kind = str(candidate.get("kind") or "")
+        key = (kind, int(round(time_s * 1000.0)))
+        existing = by_key.get(key)
+        strength = float(candidate.get("strength") or 0.0)
+        existing_strength = float(existing.get("strength") or 0.0) if existing else -1.0
+        if existing is None or strength > existing_strength:
+            by_key[key] = dict(candidate)
+    return [
+        by_key[key]
+        for key in sorted(
+            by_key,
+            key=lambda item: (float(by_key[item].get("time_s") or 0.0), item[0]),
+        )
+    ]
+
+
+def _cut_candidates_for_segment(
+    segment: dict,
+    chunks_by_index: dict[int, dict],
+    *,
+    key: str,
+) -> list[dict[str, Any]]:
+    start = float(segment.get("start", 0.0))
+    end = max(start, float(segment.get("end", start)))
+    chunk_indexes: list[int] = []
+    for word in segment.get("words") or []:
+        try:
+            chunk_indexes.append(int(word.get("source_chunk_index")))
+        except (TypeError, ValueError):
+            continue
+    if not chunk_indexes:
+        try:
+            chunk_indexes.append(int(segment.get("source_chunk_index")))
+        except (TypeError, ValueError):
+            pass
+    selected: list[dict[str, Any]] = []
+    for chunk_index in list(dict.fromkeys(chunk_indexes)):
+        chunk = chunks_by_index.get(chunk_index)
+        if not chunk:
+            continue
+        for candidate in _normalize_cut_candidates(chunk.get(key)):
+            try:
+                time_s = float(candidate["time_s"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            if start < time_s < end:
+                selected.append(candidate)
+    return _dedupe_cut_candidates(selected)
+
+
 def _annotate_packed_chunks(
     chunk_infos: list[dict],
     spans: list[tuple[float, float]] | list[PackedChunk],
@@ -770,11 +852,29 @@ def _annotate_packed_chunks(
         chunk["scorer_split_mean"] = packed.scorer_split_mean
         chunk["scorer_split_max"] = packed.scorer_split_max
         chunk["scorer_split_p90"] = packed.scorer_split_p90
+        chunk["subtitle_min_duration_s"] = packed.subtitle_min_duration_s
+        chunk["below_subtitle_min_duration"] = packed.below_subtitle_min_duration
+        chunk["micro_chunk_candidate"] = packed.micro_chunk_candidate
+        chunk["micro_resolve_action"] = packed.micro_resolve_action
+        chunk["micro_resolve_reason"] = packed.micro_resolve_reason
+        chunk["left_split_score"] = packed.left_split_score
+        chunk["right_split_score"] = packed.right_split_score
+        chunk["left_split_prominence"] = packed.left_split_prominence
+        chunk["right_split_prominence"] = packed.right_split_prominence
+        chunk["left_split_speech_valley"] = packed.left_split_speech_valley
+        chunk["right_split_speech_valley"] = packed.right_split_speech_valley
+        chunk["primary_cut_candidates"] = _normalize_cut_candidates(
+            packed.primary_cut_candidates
+        )
+        chunk["weak_cut_candidates"] = _normalize_cut_candidates(
+            packed.weak_cut_candidates
+        )
         log.append(
             "[chunk] idx={idx} dur={duration:.1f} speech_segment_count={count} "
             "reason={reason} "
             "parent={parent} island={island}/{islands} gap_max={gap:.2f} "
             "boundary={boundary_reason} source={boundary_source} score={boundary_score} "
+            "micro={micro_action} below_subtitle_min={below_min} "
             "delta=({start_delta},{end_delta}) "
             "decision_source={decision_source}".format(
                 idx=idx,
@@ -788,6 +888,8 @@ def _annotate_packed_chunks(
                 boundary_reason=packed.boundary_reason,
                 boundary_source=packed.boundary_source,
                 boundary_score=packed.boundary_score,
+                micro_action=packed.micro_resolve_action,
+                below_min=packed.below_subtitle_min_duration,
                 start_delta=packed.boundary_start_refine_delta_s,
                 end_delta=packed.boundary_end_refine_delta_s,
                 decision_source=packed.boundary_decision_source,
@@ -1432,6 +1534,10 @@ def _transcribe_and_align_local(
         segments = _group_words_to_segments(word_dicts)
         segments = _postprocess_segments(segments)
         segments = _annotate_segments_with_alignment_outcomes(segments, alignment_outcomes)
+        chunks_by_index = {
+            int(chunk.get("index", index)): chunk
+            for index, chunk in enumerate(chunk_infos)
+        }
         for segment in segments:
             chunk_indices: list[int] = []
             for word in segment.get("words") or []:
@@ -1451,6 +1557,20 @@ def _transcribe_and_align_local(
             ]
             if shadows:
                 segment["cueqc_shadow"] = shadows[0] if len(shadows) == 1 else shadows
+            primary_cut_candidates = _cut_candidates_for_segment(
+                segment,
+                chunks_by_index,
+                key="primary_cut_candidates",
+            )
+            weak_cut_candidates = _cut_candidates_for_segment(
+                segment,
+                chunks_by_index,
+                key="weak_cut_candidates",
+            )
+            if primary_cut_candidates:
+                segment["primary_cut_candidates"] = primary_cut_candidates
+            if weak_cut_candidates:
+                segment["weak_cut_candidates"] = weak_cut_candidates
         segment_elapsed = time.perf_counter() - segment_started
         _record_stage_timing(
             log, timings, "subtitle_segment_s", "字幕分段", segment_elapsed

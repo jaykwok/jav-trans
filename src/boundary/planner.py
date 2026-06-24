@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Protocol, Sequence
+from typing import Any, Protocol, Sequence
 
 from boundary.refiner import BoundaryDecision, SequenceBoundaryRefiner
 from boundary.base import SpeechSegment
@@ -31,9 +31,39 @@ class PlannedIsland:
     boundary_score: float | None = None
     boundary_reason: str = ""
     boundary_source: str = ""
+    subtitle_min_duration_s: float | None = None
+    below_subtitle_min_duration: bool = False
+    micro_chunk_candidate: bool = False
+    micro_resolve_action: str = ""
+    micro_resolve_reason: str = ""
+    left_split_score: float | None = None
+    right_split_score: float | None = None
+    left_split_prominence: float | None = None
+    right_split_prominence: float | None = None
+    left_split_speech_valley: float | None = None
+    right_split_speech_valley: float | None = None
+    primary_cut_candidates: list[dict[str, Any]] | None = None
+    weak_cut_candidates: list[dict[str, Any]] | None = None
 
     def to_speech_segment(self) -> SpeechSegment:
-        return SpeechSegment(start=self.start, end=self.end, score=self.score)
+        return SpeechSegment(
+            start=self.start,
+            end=self.end,
+            score=self.score,
+            subtitle_min_duration_s=self.subtitle_min_duration_s,
+            below_subtitle_min_duration=self.below_subtitle_min_duration,
+            micro_chunk_candidate=self.micro_chunk_candidate,
+            micro_resolve_action=self.micro_resolve_action,
+            micro_resolve_reason=self.micro_resolve_reason,
+            left_split_score=self.left_split_score,
+            right_split_score=self.right_split_score,
+            left_split_prominence=self.left_split_prominence,
+            right_split_prominence=self.right_split_prominence,
+            left_split_speech_valley=self.left_split_speech_valley,
+            right_split_speech_valley=self.right_split_speech_valley,
+            primary_cut_candidates=list(self.primary_cut_candidates or []),
+            weak_cut_candidates=list(self.weak_cut_candidates or []),
+        )
 
 
 @dataclass(frozen=True)
@@ -87,7 +117,27 @@ def _validate_segments(segments: Sequence[SpeechSegment]) -> None:
 
 
 def _island_from_segment(segment: SpeechSegment) -> PlannedIsland:
-    return PlannedIsland(start=segment.start, end=segment.end, score=segment.score)
+    return PlannedIsland(
+        start=segment.start,
+        end=segment.end,
+        score=segment.score,
+        boundary_score=segment.right_split_score,
+        boundary_reason=segment.micro_resolve_reason,
+        boundary_source="micro_split_resolver" if segment.micro_resolve_reason else "",
+        subtitle_min_duration_s=segment.subtitle_min_duration_s,
+        below_subtitle_min_duration=segment.below_subtitle_min_duration,
+        micro_chunk_candidate=segment.micro_chunk_candidate,
+        micro_resolve_action=segment.micro_resolve_action,
+        micro_resolve_reason=segment.micro_resolve_reason,
+        left_split_score=segment.left_split_score,
+        right_split_score=segment.right_split_score,
+        left_split_prominence=segment.left_split_prominence,
+        right_split_prominence=segment.right_split_prominence,
+        left_split_speech_valley=segment.left_split_speech_valley,
+        right_split_speech_valley=segment.right_split_speech_valley,
+        primary_cut_candidates=list(segment.primary_cut_candidates or []),
+        weak_cut_candidates=list(segment.weak_cut_candidates or []),
+    )
 
 
 def _pack_islands(

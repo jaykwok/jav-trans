@@ -15,7 +15,7 @@ from boundary.base import SpeechSegment
 
 log = logging.getLogger(__name__)
 
-BOUNDARY_CACHE_VERSION = 8
+BOUNDARY_CACHE_VERSION = 10
 _AUDIO_SAMPLE_BYTES = 2 * 1024 * 1024
 _AUDIO_KEY_RE = re.compile(r"^[0-9a-fA-F]{8,40}$")
 
@@ -314,6 +314,19 @@ def _packed_chunk_to_dict(chunk: PackedChunk) -> dict:
         "scorer_split_mean": chunk.scorer_split_mean,
         "scorer_split_max": chunk.scorer_split_max,
         "scorer_split_p90": chunk.scorer_split_p90,
+        "subtitle_min_duration_s": chunk.subtitle_min_duration_s,
+        "below_subtitle_min_duration": bool(chunk.below_subtitle_min_duration),
+        "micro_chunk_candidate": bool(chunk.micro_chunk_candidate),
+        "micro_resolve_action": chunk.micro_resolve_action,
+        "micro_resolve_reason": chunk.micro_resolve_reason,
+        "left_split_score": chunk.left_split_score,
+        "right_split_score": chunk.right_split_score,
+        "left_split_prominence": chunk.left_split_prominence,
+        "right_split_prominence": chunk.right_split_prominence,
+        "left_split_speech_valley": chunk.left_split_speech_valley,
+        "right_split_speech_valley": chunk.right_split_speech_valley,
+        "primary_cut_candidates": _jsonable(chunk.primary_cut_candidates or []),
+        "weak_cut_candidates": _jsonable(chunk.weak_cut_candidates or []),
         "speech_segments": _segments_to_payload(chunk.speech_segments),
     }
 
@@ -377,6 +390,43 @@ def _packed_chunk_from_dict(item: Any) -> PackedChunk:
         scorer_split_p90=(
             None if item.get("scorer_split_p90") is None else float(item.get("scorer_split_p90"))
         ),
+        subtitle_min_duration_s=(
+            None
+            if item.get("subtitle_min_duration_s") is None
+            else float(item.get("subtitle_min_duration_s"))
+        ),
+        below_subtitle_min_duration=bool(item.get("below_subtitle_min_duration", False)),
+        micro_chunk_candidate=bool(item.get("micro_chunk_candidate", False)),
+        micro_resolve_action=str(item.get("micro_resolve_action") or ""),
+        micro_resolve_reason=str(item.get("micro_resolve_reason") or ""),
+        left_split_score=(
+            None if item.get("left_split_score") is None else float(item.get("left_split_score"))
+        ),
+        right_split_score=(
+            None if item.get("right_split_score") is None else float(item.get("right_split_score"))
+        ),
+        left_split_prominence=(
+            None
+            if item.get("left_split_prominence") is None
+            else float(item.get("left_split_prominence"))
+        ),
+        right_split_prominence=(
+            None
+            if item.get("right_split_prominence") is None
+            else float(item.get("right_split_prominence"))
+        ),
+        left_split_speech_valley=(
+            None
+            if item.get("left_split_speech_valley") is None
+            else float(item.get("left_split_speech_valley"))
+        ),
+        right_split_speech_valley=(
+            None
+            if item.get("right_split_speech_valley") is None
+            else float(item.get("right_split_speech_valley"))
+        ),
+        primary_cut_candidates=_cut_candidates_from_payload(item.get("primary_cut_candidates")),
+        weak_cut_candidates=_cut_candidates_from_payload(item.get("weak_cut_candidates")),
     )
 
 
@@ -399,6 +449,19 @@ def _segment_to_dict(segment: SpeechSegment) -> dict:
         "start": float(segment.start),
         "end": float(segment.end),
         "score": None if segment.score is None else float(segment.score),
+        "subtitle_min_duration_s": segment.subtitle_min_duration_s,
+        "below_subtitle_min_duration": bool(segment.below_subtitle_min_duration),
+        "micro_chunk_candidate": bool(segment.micro_chunk_candidate),
+        "micro_resolve_action": segment.micro_resolve_action,
+        "micro_resolve_reason": segment.micro_resolve_reason,
+        "left_split_score": segment.left_split_score,
+        "right_split_score": segment.right_split_score,
+        "left_split_prominence": segment.left_split_prominence,
+        "right_split_prominence": segment.right_split_prominence,
+        "left_split_speech_valley": segment.left_split_speech_valley,
+        "right_split_speech_valley": segment.right_split_speech_valley,
+        "primary_cut_candidates": _jsonable(segment.primary_cut_candidates or []),
+        "weak_cut_candidates": _jsonable(segment.weak_cut_candidates or []),
     }
 
 
@@ -410,4 +473,66 @@ def _segment_from_dict(item: Any) -> SpeechSegment:
         start=float(item["start"]),
         end=float(item["end"]),
         score=None if score is None else float(score),
+        subtitle_min_duration_s=(
+            None
+            if item.get("subtitle_min_duration_s") is None
+            else float(item.get("subtitle_min_duration_s"))
+        ),
+        below_subtitle_min_duration=bool(item.get("below_subtitle_min_duration", False)),
+        micro_chunk_candidate=bool(item.get("micro_chunk_candidate", False)),
+        micro_resolve_action=str(item.get("micro_resolve_action") or ""),
+        micro_resolve_reason=str(item.get("micro_resolve_reason") or ""),
+        left_split_score=(
+            None if item.get("left_split_score") is None else float(item.get("left_split_score"))
+        ),
+        right_split_score=(
+            None if item.get("right_split_score") is None else float(item.get("right_split_score"))
+        ),
+        left_split_prominence=(
+            None
+            if item.get("left_split_prominence") is None
+            else float(item.get("left_split_prominence"))
+        ),
+        right_split_prominence=(
+            None
+            if item.get("right_split_prominence") is None
+            else float(item.get("right_split_prominence"))
+        ),
+        left_split_speech_valley=(
+            None
+            if item.get("left_split_speech_valley") is None
+            else float(item.get("left_split_speech_valley"))
+        ),
+        right_split_speech_valley=(
+            None
+            if item.get("right_split_speech_valley") is None
+            else float(item.get("right_split_speech_valley"))
+        ),
+        primary_cut_candidates=_cut_candidates_from_payload(item.get("primary_cut_candidates")),
+        weak_cut_candidates=_cut_candidates_from_payload(item.get("weak_cut_candidates")),
     )
+
+
+def _cut_candidates_from_payload(value: Any) -> list[dict[str, Any]]:
+    if not isinstance(value, list):
+        return []
+    candidates: list[dict[str, Any]] = []
+    for item in value:
+        if not isinstance(item, dict):
+            continue
+        try:
+            candidate = {
+                "kind": str(item.get("kind") or ""),
+                "time_s": float(item["time_s"]),
+                "frame": int(item["frame"]),
+                "score": float(item.get("score") or 0.0),
+                "prominence": float(item.get("prominence") or 0.0),
+                "speech_valley": float(item.get("speech_valley") or 0.0),
+                "strength": float(item.get("strength") or 0.0),
+            }
+        except (KeyError, TypeError, ValueError):
+            continue
+        if item.get("downgraded_from") is not None:
+            candidate["downgraded_from"] = str(item.get("downgraded_from") or "")
+        candidates.append(candidate)
+    return candidates

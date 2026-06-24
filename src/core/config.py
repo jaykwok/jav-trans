@@ -106,11 +106,11 @@ DEFAULT_SETTINGS: dict[str, str] = {
     "SPEECH_BOUNDARY_JA_FRAME_DILATION_S": "0.2",
     # 1 caches SpeechBoundary frame score -> Boundary Planner outputs separately from ASR generation settings.
     "BOUNDARY_CACHE_ENABLED": "1",
-    # Persistent boundary cache directory. Versioned as boundary-cache v8.
+    # Persistent boundary cache directory. Versioned as boundary-cache v10.
     "BOUNDARY_CACHE_DIR": "./tmp/cache/boundary",
 
-    # --- Pre-ASR CueQC v5 binary keep/drop router ---
-    # Disabled until a repo-matched v5 checkpoint is trained; when enabled it runs after
+    # --- Pre-ASR CueQC v6 binary keep/drop router ---
+    # Disabled until a repo-matched v6 checkpoint is trained; when enabled it runs after
     # Boundary Refiner and before wav chunk export / ASR.
     "PRE_ASR_CUEQC_ENABLED": "0",
     "PRE_ASR_CUEQC_MODEL_PATH_BY_REPO": "",
@@ -118,7 +118,7 @@ DEFAULT_SETTINGS: dict[str, str] = {
     "PRE_ASR_CUEQC_DROP_THRESHOLD": "0.90",
 
     # --- ASR-after CueQC v4 shadow / hard-negative mining ---
-    # Opt-in only; active keep/drop routing moved to Pre-ASR CueQC v5.
+    # Opt-in only; active keep/drop routing moved to Pre-ASR CueQC v6.
     "CUEQC_SHADOW_ENABLED": "0",
     # v4 binary remains a temporary shadow source; it no longer removes chunks.
     "CUEQC_DROP_THRESHOLD": "0.85",
@@ -129,15 +129,13 @@ DEFAULT_SETTINGS: dict[str, str] = {
     # 0 keeps aligned cache compact; use export path for full candidate features.
     "CUEQC_SHADOW_EMBED_CANDIDATES": "0",
     # --- Subtitle Timings ---
-    # Conservative hard maximum for one subtitle cue; 7s is the industry ceiling, 6.5s avoids hanging text.
-    "MAX_SUBTITLE_DURATION": "6.5",
     # Minimum displayed subtitle duration in seconds.
     "MIN_SUBTITLE_DURATION": "0.6",
     # Estimated Chinese reading speed in characters per second.
     "SUBTITLE_READING_CPS": "7.0",
     # Fixed reading-time buffer added to each subtitle.
     "SUBTITLE_READING_BASE": "0.35",
-    # Max stretch ratio compared with the original segment duration.
+    # Max stretch ratio compared with the original segment duration in reading mode.
     "SUBTITLE_DURATION_RATIO_CAP": "1.65",
     # Extra seconds allowed when extending short subtitles.
     "SUBTITLE_DURATION_GRACE": "0.9",

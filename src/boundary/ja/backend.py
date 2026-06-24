@@ -2,8 +2,8 @@ from __future__ import annotations
 
 import os
 import time
-from dataclasses import dataclass
-from typing import Iterable
+from dataclasses import dataclass, replace
+from typing import Any, Iterable
 
 import numpy as np
 
@@ -41,6 +41,90 @@ class _SplitPeakCandidate:
     frame: int
     score: float
     prominence: float
+    speech_valley: float = 0.0
+
+    @property
+    def strength(self) -> float:
+        return float(self.score) + float(self.prominence) + float(self.speech_valley)
+
+
+_MAX_WEAK_CUT_CANDIDATES_PER_SEGMENT = 64
+
+
+def _cut_candidate_payload(
+    candidate: _SplitPeakCandidate,
+    *,
+    frame_hop_s: float,
+    kind: str,
+) -> dict[str, Any]:
+    frame = int(candidate.frame)
+    time_s = float(frame) * float(frame_hop_s)
+    return {
+        "kind": str(kind),
+        "time_s": round(time_s, 6),
+        "frame": frame,
+        "score": float(candidate.score),
+        "prominence": float(candidate.prominence),
+        "speech_valley": float(candidate.speech_valley),
+        "strength": float(candidate.strength),
+    }
+
+
+def _dedupe_cut_candidate_payloads(
+    candidates: Iterable[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    by_key: dict[tuple[str, int], dict[str, Any]] = {}
+    for candidate in candidates:
+        if not isinstance(candidate, dict):
+            continue
+        try:
+            time_s = float(candidate["time_s"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        kind = str(candidate.get("kind") or "")
+        key = (kind, int(round(time_s * 1000.0)))
+        strength = float(candidate.get("strength") or 0.0)
+        existing = by_key.get(key)
+        existing_strength = float(existing.get("strength") or 0.0) if existing else -1.0
+        if existing is None or strength > existing_strength:
+            by_key[key] = dict(candidate)
+    return [
+        by_key[key]
+        for key in sorted(
+            by_key,
+            key=lambda item: (float(by_key[item].get("time_s") or 0.0), item[0]),
+        )
+    ]
+
+
+def _candidate_payloads_in_window(
+    candidates: Iterable[dict[str, Any]],
+    *,
+    start: float,
+    end: float,
+    include_edges: bool = False,
+) -> list[dict[str, Any]]:
+    eps = 1e-6
+    selected: list[dict[str, Any]] = []
+    for candidate in candidates:
+        try:
+            time_s = float(candidate["time_s"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        if include_edges:
+            keep = float(start) - eps <= time_s <= float(end) + eps
+        else:
+            keep = float(start) + eps < time_s < float(end) - eps
+        if keep:
+            selected.append(dict(candidate))
+    return _dedupe_cut_candidate_payloads(selected)
+
+
+def _as_weak_cut_candidate(candidate: dict[str, Any]) -> dict[str, Any]:
+    payload = dict(candidate)
+    payload["kind"] = "weak"
+    payload["downgraded_from"] = str(candidate.get("kind") or "primary")
+    return payload
 
 
 def _env_float(name: str, default: str) -> float:
@@ -255,18 +339,27 @@ def _split_peak_candidates_for_segment(
             speech_probs=speech_probs[:total],
             snap_frames=max(0, int(round(max(0.0, split_snap_s) / frame_hop_s))),
         )
-        candidates.append(_SplitPeakCandidate(frame=snapped, score=value, prominence=prominence))
+        speech_valley = 1.0 - float(np.clip(speech_probs[min(max(snapped, 0), total - 1)], 0.0, 1.0))
+        candidates.append(
+            _SplitPeakCandidate(
+                frame=snapped,
+                score=value,
+                prominence=prominence,
+                speech_valley=speech_valley,
+            )
+        )
     return candidates
 
 
-def _select_peak_frames(
+def _select_peak_candidates(
     candidates: Iterable[_SplitPeakCandidate],
     *,
     nms_frames: int,
     max_count: int | None = None,
     rank_by_prominence: bool = False,
-) -> list[int]:
-    selected: list[int] = []
+) -> list[_SplitPeakCandidate]:
+    selected_frames: list[int] = []
+    selected: list[_SplitPeakCandidate] = []
     ranked = sorted(
         candidates,
         key=(
@@ -276,18 +369,35 @@ def _select_peak_frames(
         ),
         reverse=True,
     )
-    added: list[int] = []
     for candidate in ranked:
-        if max_count is not None and len(added) >= max_count:
+        if max_count is not None and len(selected) >= max_count:
             break
         frame = int(candidate.frame)
-        if all(abs(frame - existing) >= nms_frames for existing in selected):
-            selected.append(frame)
-            added.append(frame)
-    return added
+        if all(abs(frame - existing) >= nms_frames for existing in selected_frames):
+            selected_frames.append(frame)
+            selected.append(candidate)
+    return selected
 
 
-def _split_peak_frames_for_segment(
+def _select_peak_frames(
+    candidates: Iterable[_SplitPeakCandidate],
+    *,
+    nms_frames: int,
+    max_count: int | None = None,
+    rank_by_prominence: bool = False,
+) -> list[int]:
+    return [
+        int(candidate.frame)
+        for candidate in _select_peak_candidates(
+            candidates,
+            nms_frames=nms_frames,
+            max_count=max_count,
+            rank_by_prominence=rank_by_prominence,
+        )
+    ]
+
+
+def _split_peak_candidates_for_segment_selected(
     segment: SpeechSegment,
     *,
     speech_probs: np.ndarray,
@@ -299,7 +409,7 @@ def _split_peak_frames_for_segment(
     min_split_segment_s: float,
     split_score_quantile: float,
     split_prominence_quantile: float,
-) -> list[int]:
+) -> list[_SplitPeakCandidate]:
     candidates = _split_peak_candidates_for_segment(
         segment,
         speech_probs=speech_probs,
@@ -320,39 +430,390 @@ def _split_peak_frames_for_segment(
     adaptive_candidates = [
         candidate
         for candidate in candidates
-        if candidate.score >= score_floor and candidate.prominence >= prominence_floor
+        if candidate.score >= score_floor - 1e-6 and candidate.prominence >= prominence_floor - 1e-6
     ]
     return sorted(
-        _select_peak_frames(
+        _select_peak_candidates(
             adaptive_candidates,
             nms_frames=nms_frames,
             rank_by_prominence=True,
-        )
+        ),
+        key=lambda item: int(item.frame),
     )
 
 
-def _split_segment_at_frames(
+def _weak_split_peak_candidates_for_segment(
+    candidates: Iterable[_SplitPeakCandidate],
+    primary_candidates: Iterable[_SplitPeakCandidate],
+    *,
+    nms_frames: int,
+) -> list[_SplitPeakCandidate]:
+    primary_frames = [int(candidate.frame) for candidate in primary_candidates]
+    weak_pool = [
+        candidate
+        for candidate in candidates
+        if all(abs(int(candidate.frame) - frame) >= nms_frames for frame in primary_frames)
+    ]
+    if not weak_pool:
+        return []
+    return sorted(
+        _select_peak_candidates(
+            weak_pool,
+            nms_frames=nms_frames,
+            max_count=_MAX_WEAK_CUT_CANDIDATES_PER_SEGMENT,
+            rank_by_prominence=True,
+        ),
+        key=lambda item: int(item.frame),
+    )
+
+
+def _split_peak_frames_for_segment(
     segment: SpeechSegment,
-    split_frames: Iterable[int],
+    *,
+    speech_probs: np.ndarray,
+    split_probs: np.ndarray,
+    frame_hop_s: float,
+    split_smooth_s: float,
+    split_nms_s: float,
+    split_snap_s: float,
+    min_split_segment_s: float,
+    split_score_quantile: float,
+    split_prominence_quantile: float,
+) -> list[int]:
+    return [
+        int(candidate.frame)
+        for candidate in _split_peak_candidates_for_segment_selected(
+            segment,
+            speech_probs=speech_probs,
+            split_probs=split_probs,
+            frame_hop_s=frame_hop_s,
+            split_smooth_s=split_smooth_s,
+            split_nms_s=split_nms_s,
+            split_snap_s=split_snap_s,
+            min_split_segment_s=min_split_segment_s,
+            split_score_quantile=split_score_quantile,
+            split_prominence_quantile=split_prominence_quantile,
+        )
+    ]
+
+
+def _split_segment_at_candidates(
+    segment: SpeechSegment,
+    split_candidates: Iterable[_SplitPeakCandidate],
     *,
     frame_hop_s: float,
     min_split_segment_s: float,
+    subtitle_min_duration_s: float,
+    weak_candidates: Iterable[_SplitPeakCandidate] = (),
 ) -> list[SpeechSegment]:
-    boundaries = [float(frame) * frame_hop_s for frame in sorted(set(int(frame) for frame in split_frames))]
+    by_frame: dict[int, _SplitPeakCandidate] = {}
+    for candidate in split_candidates:
+        frame = int(candidate.frame)
+        current = by_frame.get(frame)
+        if current is None or candidate.strength > current.strength:
+            by_frame[frame] = candidate
+    candidates = [by_frame[frame] for frame in sorted(by_frame)]
+    weak_payloads = [
+        _cut_candidate_payload(candidate, frame_hop_s=frame_hop_s, kind="weak")
+        for candidate in weak_candidates
+    ]
     parts: list[SpeechSegment] = []
     cursor = float(segment.start)
+    left_candidate: _SplitPeakCandidate | None = None
+    left_payload: dict[str, Any] | None = None
     min_duration = max(0.0, float(min_split_segment_s))
-    for boundary in boundaries:
+    for candidate in candidates:
+        boundary = float(candidate.frame) * frame_hop_s
         boundary = max(segment.start, min(float(boundary), segment.end))
         if boundary - cursor < min_duration:
             continue
         if segment.end - boundary < min_duration:
             continue
-        parts.append(SpeechSegment(start=cursor, end=boundary, score=segment.score))
+        right_payload = _cut_candidate_payload(candidate, frame_hop_s=frame_hop_s, kind="primary")
+        parts.append(
+            _segment_with_split_metadata(
+                start=cursor,
+                end=boundary,
+                score=segment.score,
+                subtitle_min_duration_s=subtitle_min_duration_s,
+                left=left_candidate,
+                right=candidate,
+                primary_cut_candidates=[
+                    payload for payload in (left_payload, right_payload) if payload is not None
+                ],
+                weak_cut_candidates=_candidate_payloads_in_window(
+                    weak_payloads,
+                    start=cursor,
+                    end=boundary,
+                ),
+            )
+        )
         cursor = boundary
+        left_candidate = candidate
+        left_payload = right_payload
     if segment.end > cursor:
-        parts.append(SpeechSegment(start=cursor, end=segment.end, score=segment.score))
-    return parts or [segment]
+        parts.append(
+            _segment_with_split_metadata(
+                start=cursor,
+                end=segment.end,
+                score=segment.score,
+                subtitle_min_duration_s=subtitle_min_duration_s,
+                left=left_candidate,
+                right=None,
+                primary_cut_candidates=(
+                    [] if left_payload is None else [left_payload]
+                ),
+                weak_cut_candidates=_candidate_payloads_in_window(
+                    weak_payloads,
+                    start=cursor,
+                    end=segment.end,
+                ),
+            )
+        )
+    return _resolve_micro_segments(parts or [segment], subtitle_min_duration_s=subtitle_min_duration_s)
+
+
+def _segment_with_split_metadata(
+    *,
+    start: float,
+    end: float,
+    score: float | None,
+    subtitle_min_duration_s: float,
+    left: _SplitPeakCandidate | None,
+    right: _SplitPeakCandidate | None,
+    micro_chunk_candidate: bool = False,
+    micro_resolve_action: str = "",
+    micro_resolve_reason: str = "",
+    primary_cut_candidates: Iterable[dict[str, Any]] = (),
+    weak_cut_candidates: Iterable[dict[str, Any]] = (),
+) -> SpeechSegment:
+    duration = max(0.0, float(end) - float(start))
+    return SpeechSegment(
+        start=float(start),
+        end=float(end),
+        score=score,
+        subtitle_min_duration_s=float(subtitle_min_duration_s),
+        below_subtitle_min_duration=duration < float(subtitle_min_duration_s),
+        micro_chunk_candidate=bool(micro_chunk_candidate),
+        micro_resolve_action=micro_resolve_action,
+        micro_resolve_reason=micro_resolve_reason,
+        left_split_score=None if left is None else float(left.score),
+        right_split_score=None if right is None else float(right.score),
+        left_split_prominence=None if left is None else float(left.prominence),
+        right_split_prominence=None if right is None else float(right.prominence),
+        left_split_speech_valley=None if left is None else float(left.speech_valley),
+        right_split_speech_valley=None if right is None else float(right.speech_valley),
+        primary_cut_candidates=_dedupe_cut_candidate_payloads(primary_cut_candidates),
+        weak_cut_candidates=_dedupe_cut_candidate_payloads(weak_cut_candidates),
+    )
+
+
+def _split_strength(
+    *,
+    score: float | None,
+    prominence: float | None,
+    speech_valley: float | None,
+) -> float | None:
+    if score is None or prominence is None or speech_valley is None:
+        return None
+    return float(score) + float(prominence) + float(speech_valley)
+
+
+def _metadata_candidate_from_side(segment: SpeechSegment, *, right: bool) -> _SplitPeakCandidate | None:
+    if right:
+        strength = _split_strength(
+            score=segment.right_split_score,
+            prominence=segment.right_split_prominence,
+            speech_valley=segment.right_split_speech_valley,
+        )
+        if strength is None:
+            return None
+        return _SplitPeakCandidate(
+            frame=0,
+            score=float(segment.right_split_score),
+            prominence=float(segment.right_split_prominence),
+            speech_valley=float(segment.right_split_speech_valley),
+        )
+    strength = _split_strength(
+        score=segment.left_split_score,
+        prominence=segment.left_split_prominence,
+        speech_valley=segment.left_split_speech_valley,
+    )
+    if strength is None:
+        return None
+    return _SplitPeakCandidate(
+        frame=0,
+        score=float(segment.left_split_score),
+        prominence=float(segment.left_split_prominence),
+        speech_valley=float(segment.left_split_speech_valley),
+    )
+
+
+def _split_strength_for_side(segment: SpeechSegment, *, right: bool) -> float | None:
+    if right:
+        return _split_strength(
+            score=segment.right_split_score,
+            prominence=segment.right_split_prominence,
+            speech_valley=segment.right_split_speech_valley,
+        )
+    return _split_strength(
+        score=segment.left_split_score,
+        prominence=segment.left_split_prominence,
+        speech_valley=segment.left_split_speech_valley,
+    )
+
+
+def _micro_strengths_are_balanced(left: float, right: float) -> bool:
+    stronger = max(abs(left), abs(right), 1e-6)
+    return abs(left - right) <= 0.15 * stronger
+
+
+def _merge_segments(
+    left: SpeechSegment,
+    right: SpeechSegment,
+    *,
+    subtitle_min_duration_s: float,
+    action: str,
+    reason: str,
+) -> SpeechSegment:
+    left_boundary = _metadata_candidate_from_side(left, right=False)
+    right_boundary = _metadata_candidate_from_side(right, right=True)
+    start = float(left.start)
+    end = float(right.end)
+    primary_candidates: list[dict[str, Any]] = []
+    weak_candidates: list[dict[str, Any]] = []
+    for candidate in list(left.primary_cut_candidates or []) + list(right.primary_cut_candidates or []):
+        try:
+            time_s = float(candidate["time_s"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        if start + 1e-6 < time_s < end - 1e-6:
+            weak_candidates.append(_as_weak_cut_candidate(candidate))
+        else:
+            primary_candidates.append(dict(candidate))
+    weak_candidates.extend(left.weak_cut_candidates or [])
+    weak_candidates.extend(right.weak_cut_candidates or [])
+    return _segment_with_split_metadata(
+        start=start,
+        end=end,
+        score=max(
+            [value for value in (left.score, right.score) if value is not None],
+            default=None,
+        ),
+        subtitle_min_duration_s=subtitle_min_duration_s,
+        left=left_boundary,
+        right=right_boundary,
+        micro_chunk_candidate=left.micro_chunk_candidate or right.micro_chunk_candidate,
+        micro_resolve_action=action,
+        micro_resolve_reason=reason,
+        primary_cut_candidates=primary_candidates,
+        weak_cut_candidates=weak_candidates,
+    )
+
+
+def _mark_micro_candidate(
+    segment: SpeechSegment,
+    *,
+    subtitle_min_duration_s: float,
+    action: str,
+    reason: str,
+) -> SpeechSegment:
+    return _segment_with_split_metadata(
+        start=segment.start,
+        end=segment.end,
+        score=segment.score,
+        subtitle_min_duration_s=subtitle_min_duration_s,
+        left=_metadata_candidate_from_side(segment, right=False),
+        right=_metadata_candidate_from_side(segment, right=True),
+        micro_chunk_candidate=True,
+        micro_resolve_action=action,
+        micro_resolve_reason=reason,
+        primary_cut_candidates=segment.primary_cut_candidates,
+        weak_cut_candidates=segment.weak_cut_candidates,
+    )
+
+
+def _with_subtitle_metadata(
+    segment: SpeechSegment,
+    *,
+    subtitle_min_duration_s: float,
+) -> SpeechSegment:
+    return _segment_with_split_metadata(
+        start=segment.start,
+        end=segment.end,
+        score=segment.score,
+        subtitle_min_duration_s=subtitle_min_duration_s,
+        left=_metadata_candidate_from_side(segment, right=False),
+        right=_metadata_candidate_from_side(segment, right=True),
+        micro_chunk_candidate=segment.micro_chunk_candidate,
+        micro_resolve_action=segment.micro_resolve_action,
+        micro_resolve_reason=segment.micro_resolve_reason,
+        primary_cut_candidates=segment.primary_cut_candidates,
+        weak_cut_candidates=segment.weak_cut_candidates,
+    )
+
+
+def _resolve_micro_segments(
+    parts: list[SpeechSegment],
+    *,
+    subtitle_min_duration_s: float,
+) -> list[SpeechSegment]:
+    resolved = list(parts)
+    index = 0
+    while index < len(resolved):
+        segment = resolved[index]
+        duration = max(0.0, float(segment.end) - float(segment.start))
+        if duration >= subtitle_min_duration_s:
+            index += 1
+            continue
+        if segment.micro_resolve_action == "preserve_micro_candidate":
+            index += 1
+            continue
+        left_strength = _split_strength_for_side(segment, right=False)
+        right_strength = _split_strength_for_side(segment, right=True)
+        if index <= 0 or index + 1 >= len(resolved) or left_strength is None or right_strength is None:
+            resolved[index] = _mark_micro_candidate(
+                segment,
+                subtitle_min_duration_s=subtitle_min_duration_s,
+                action="preserve_edge_micro_candidate",
+                reason="micro_chunk_without_two_split_boundaries",
+            )
+            index += 1
+            continue
+        if _micro_strengths_are_balanced(left_strength, right_strength):
+            resolved[index] = _mark_micro_candidate(
+                segment,
+                subtitle_min_duration_s=subtitle_min_duration_s,
+                action="preserve_micro_candidate",
+                reason="balanced_split_evidence",
+            )
+            index += 1
+            continue
+        if left_strength < right_strength:
+            merged = _merge_segments(
+                resolved[index - 1],
+                segment,
+                subtitle_min_duration_s=subtitle_min_duration_s,
+                action="merge_micro_into_left",
+                reason="left_split_weaker",
+            )
+            resolved[index - 1 : index + 1] = [merged]
+            index = max(0, index - 1)
+            continue
+        merged = _merge_segments(
+            segment,
+            resolved[index + 1],
+            subtitle_min_duration_s=subtitle_min_duration_s,
+            action="merge_micro_into_right",
+            reason="right_split_weaker",
+        )
+        resolved[index : index + 2] = [merged]
+    return [
+        segment
+        if segment.subtitle_min_duration_s is not None
+        else _with_subtitle_metadata(segment, subtitle_min_duration_s=subtitle_min_duration_s)
+        for segment in resolved
+    ]
 
 
 def _split_segments_by_peaks(
@@ -363,28 +824,63 @@ def _split_segments_by_peaks(
     config: "SpeechBoundaryJaConfig",
 ) -> list[SpeechSegment]:
     result: list[SpeechSegment] = []
+    subtitle_min_duration_s = _subtitle_min_duration_s_for_config(config)
     for segment in segments:
-        peaks = _split_peak_frames_for_segment(
+        all_candidates = _split_peak_candidates_for_segment(
             segment,
             speech_probs=speech_probs,
             split_probs=split_probs,
             frame_hop_s=config.frame_hop_s,
             split_smooth_s=config.split_smooth_s,
-            split_nms_s=config.split_nms_s,
             split_snap_s=config.split_snap_s,
             min_split_segment_s=config.min_split_segment_s,
-            split_score_quantile=config.split_score_quantile,
-            split_prominence_quantile=config.split_prominence_quantile,
+        )
+        nms_frames = max(1, int(round(max(0.0, config.split_nms_s) / config.frame_hop_s)))
+        score_floor = _quantile(
+            (candidate.score for candidate in all_candidates),
+            config.split_score_quantile,
+        )
+        prominence_floor = _quantile(
+            (candidate.prominence for candidate in all_candidates),
+            config.split_prominence_quantile,
+        )
+        primary_pool = [
+            candidate
+            for candidate in all_candidates
+            if candidate.score >= score_floor - 1e-6
+            and candidate.prominence >= prominence_floor - 1e-6
+        ]
+        peaks = sorted(
+            _select_peak_candidates(
+                primary_pool,
+                nms_frames=nms_frames,
+                rank_by_prominence=True,
+            ),
+            key=lambda item: int(item.frame),
+        )
+        weak_candidates = _weak_split_peak_candidates_for_segment(
+            all_candidates,
+            peaks,
+            nms_frames=nms_frames,
         )
         result.extend(
-            _split_segment_at_frames(
+            _split_segment_at_candidates(
                 segment,
                 peaks,
                 frame_hop_s=config.frame_hop_s,
                 min_split_segment_s=config.min_split_segment_s,
+                subtitle_min_duration_s=subtitle_min_duration_s,
+                weak_candidates=weak_candidates,
             )
         )
     return result
+
+
+def _subtitle_min_duration_s_for_config(config: "SpeechBoundaryJaConfig") -> float:
+    fps = float(config.video_fps or 24.0)
+    if not np.isfinite(fps) or fps <= 0.0:
+        fps = 24.0
+    return 20.0 / fps
 
 
 def _range_normalize(values: np.ndarray, *, lower_pct: float = 20.0, upper_pct: float = 95.0) -> np.ndarray:
@@ -493,21 +989,24 @@ def filter_segments(
     duration_s: float,
     min_segment_s: float,
 ) -> list[SpeechSegment]:
-    return [
-        segment
-        for segment in sorted(
-            (
-                SpeechSegment(
-                    start=max(0.0, min(float(segment.start), duration_s)),
-                    end=max(0.0, min(float(segment.end), duration_s)),
-                    score=segment.score,
-                )
-                for segment in segments
-            ),
-            key=lambda item: (item.start, item.end),
+    normalized: list[SpeechSegment] = []
+    for segment in segments:
+        start = max(0.0, min(float(segment.start), duration_s))
+        end = max(0.0, min(float(segment.end), duration_s))
+        if end - start < min_segment_s:
+            continue
+        below_subtitle_min_duration = segment.below_subtitle_min_duration
+        if segment.subtitle_min_duration_s is not None:
+            below_subtitle_min_duration = end - start < float(segment.subtitle_min_duration_s)
+        normalized.append(
+            replace(
+                segment,
+                start=start,
+                end=end,
+                below_subtitle_min_duration=below_subtitle_min_duration,
+            )
         )
-        if segment.end - segment.start >= min_segment_s
-    ]
+    return sorted(normalized, key=lambda item: (item.start, item.end))
 
 
 @dataclass(frozen=True)
@@ -634,6 +1133,7 @@ class SpeechBoundaryJaConfig:
     min_split_segment_s: float = 0.08
     split_score_quantile: float = 0.50
     split_prominence_quantile: float = 0.50
+    video_fps: float = 24.0
     export_sequence_features: bool = False
     sequence_feature_max_ptm_dims: int = 64
     no_download: bool = False
@@ -673,6 +1173,7 @@ class SpeechBoundaryJaConfig:
                 "SPEECH_BOUNDARY_JA_SPLIT_PROMINENCE_QUANTILE",
                 "0.50",
             ),
+            video_fps=_env_float("SPEECH_BOUNDARY_JA_VIDEO_FPS", "24.0"),
             export_sequence_features=_env_bool("SPEECH_BOUNDARY_JA_EXPORT_SEQUENCE_FEATURES", "0"),
             sequence_feature_max_ptm_dims=max(
                 1,
@@ -726,6 +1227,9 @@ class SpeechBoundaryJaBackend:
             "min_split_segment_s": float(cfg.min_split_segment_s),
             "split_score_quantile": float(cfg.split_score_quantile),
             "split_prominence_quantile": float(cfg.split_prominence_quantile),
+            "micro_chunk_resolver": "subtitle_min_duration_split_evidence_v1",
+            "micro_chunk_video_fps": float(cfg.video_fps),
+            "micro_chunk_min_duration_s": float(_subtitle_min_duration_s_for_config(cfg)),
             "export_sequence_features": bool(cfg.export_sequence_features),
             "sequence_feature_max_ptm_dims": int(cfg.sequence_feature_max_ptm_dims),
             "scorer_checkpoint": "",

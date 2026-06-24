@@ -27,7 +27,7 @@ from asr.pre_asr_cueqc import (  # noqa: E402
 )
 
 
-FEATURE_BUNDLE_SCHEMA = "cueqc_pre_asr_mamba_v5_features"
+FEATURE_BUNDLE_SCHEMA = "cueqc_pre_asr_mamba_v6_features"
 
 
 def project_path(value: str | Path) -> Path:
@@ -304,7 +304,7 @@ def compile_features(
     output.parent.mkdir(parents=True, exist_ok=True)
     torch.save(bundle, output)
     summary = {
-        "schema": "cueqc_pre_asr_mamba_v5_feature_summary",
+        "schema": "cueqc_pre_asr_mamba_v6_feature_summary",
         "feature_bundle": repo_display_path(output),
         "feature_schema": PRE_ASR_CUEQC_FEATURE_SCHEMA,
         "feature_names": list(PRE_ASR_CUEQC_FEATURE_NAMES),
@@ -321,7 +321,7 @@ def compile_features(
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Compile Pre-ASR CueQC v5 numeric features.")
+    parser = argparse.ArgumentParser(description="Compile Pre-ASR CueQC v6 numeric features.")
     parser.add_argument("--chunks", action="append", required=True, help="Workflow details/chunk JSON or JSONL.")
     parser.add_argument("--labels", action="append", required=True, help="JSON/JSONL labels with keep/drop.")
     parser.add_argument("--output", required=True)

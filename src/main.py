@@ -1,6 +1,7 @@
 import os
 import json
 import logging
+import math
 import time
 import sys
 import warnings
@@ -199,14 +200,18 @@ def _asr_stage_env_overrides(ctx: JobContext) -> dict[str, str]:
 
 
 def _asr_stage_env_for_video(ctx: JobContext, video_fps: float | None) -> dict[str, str]:
-    del video_fps
     overrides = _asr_stage_env_overrides(ctx)
+    try:
+        fps = float(video_fps) if video_fps is not None else 24.0
+    except (TypeError, ValueError):
+        fps = 24.0
+    if not math.isfinite(fps) or fps <= 0.0:
+        fps = 24.0
+    overrides["SPEECH_BOUNDARY_JA_VIDEO_FPS"] = f"{fps:.6f}"
     return overrides
 
 
 _SUBTITLE_OPTION_KEYS = {
-    "MAX_SUBTITLE_DURATION",
-
     "MIN_SUBTITLE_DURATION",
     "SUBTITLE_MIN_DURATION",
     "SUBTITLE_READING_CPS",
@@ -654,6 +659,8 @@ def _build_japanese_srt_blocks(segments: list[dict]) -> list[dict]:
             "zh_text": str(seg.get("text", "")),
             "words": list(seg.get("words") or []),
             "source_segment_ids": list(seg.get("source_segment_ids") or [idx]),
+            "primary_cut_candidates": list(seg.get("primary_cut_candidates") or []),
+            "weak_cut_candidates": list(seg.get("weak_cut_candidates") or []),
         }
         for idx, seg in enumerate(segments)
     ]
@@ -1562,6 +1569,8 @@ def _run_translation_and_write_impl(
             "raw_text": seg.get("raw_text", seg.get("ja_text") or seg.get("text", "")),
             "display_decision": seg.get("display_decision", "keep"),
             "raw_texts": list(seg.get("raw_texts") or []),
+            "primary_cut_candidates": list(seg.get("primary_cut_candidates") or []),
+            "weak_cut_candidates": list(seg.get("weak_cut_candidates") or []),
         }
         for seg, zh_text in zip(translation_segments, zh_texts)
     ]

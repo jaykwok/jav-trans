@@ -20,7 +20,7 @@ def _env_bool(name: str, default: bool) -> bool:
 
 @dataclass(frozen=True)
 class SubtitleOptions:
-    max_duration: float = 6.5
+    max_display_duration_s: float = 7.0
     min_duration: float = 0.6
     reading_cps: float = 7.0
     reading_base: float = 0.35
@@ -70,7 +70,6 @@ class SubtitleOptions:
     @classmethod
     def from_env(cls) -> "SubtitleOptions":
         return cls(
-            max_duration=float(os.getenv("MAX_SUBTITLE_DURATION", "6.5")),
             min_duration=float(
                 os.getenv(
                     "SUBTITLE_MIN_DURATION",

@@ -5,6 +5,8 @@ import sys
 import wave
 from pathlib import Path
 
+import pytest
+
 from audio.chunk_packer import PackedChunk
 from boundary.base import SegmentationResult, SpeechSegment
 from boundary.refiner import BoundaryDecision
@@ -174,7 +176,53 @@ def test_boundary_cache_round_trips_packed_chunks(monkeypatch, tmp_path):
             boundary_start_refine_delta_s=0.01,
             boundary_end_refine_delta_s=-0.02,
             boundary_decision_source="edge_sequence_refiner_v6",
-            speech_segments=[SpeechSegment(0.2, 0.4, 0.9)],
+            subtitle_min_duration_s=20.0 / 24.0,
+            below_subtitle_min_duration=True,
+            micro_chunk_candidate=True,
+            micro_resolve_action="preserve_micro_candidate",
+            micro_resolve_reason="balanced_split_evidence",
+            left_split_score=0.7,
+            right_split_score=0.72,
+            primary_cut_candidates=[
+                {
+                    "kind": "primary",
+                    "time_s": 1.2,
+                    "frame": 60,
+                    "score": 0.8,
+                    "prominence": 0.2,
+                    "speech_valley": 0.7,
+                    "strength": 1.7,
+                }
+            ],
+            weak_cut_candidates=[
+                {
+                    "kind": "weak",
+                    "time_s": 1.7,
+                    "frame": 85,
+                    "score": 0.4,
+                    "prominence": 0.1,
+                    "speech_valley": 0.6,
+                    "strength": 1.1,
+                }
+            ],
+            speech_segments=[
+                SpeechSegment(
+                    0.2,
+                    0.4,
+                    0.9,
+                    weak_cut_candidates=[
+                        {
+                            "kind": "weak",
+                            "time_s": 0.3,
+                            "frame": 15,
+                            "score": 0.3,
+                            "prominence": 0.1,
+                            "speech_valley": 0.6,
+                            "strength": 1.0,
+                        }
+                    ],
+                )
+            ],
         )
     ]
 
@@ -213,7 +261,16 @@ def test_boundary_cache_round_trips_packed_chunks(monkeypatch, tmp_path):
     assert loaded_chunks[0].boundary_start_refine_delta_s == 0.01
     assert loaded_chunks[0].boundary_end_refine_delta_s == -0.02
     assert loaded_chunks[0].boundary_decision_source == "edge_sequence_refiner_v6"
+    assert loaded_chunks[0].subtitle_min_duration_s == pytest.approx(20.0 / 24.0)
+    assert loaded_chunks[0].below_subtitle_min_duration is True
+    assert loaded_chunks[0].micro_chunk_candidate is True
+    assert loaded_chunks[0].micro_resolve_action == "preserve_micro_candidate"
+    assert loaded_chunks[0].left_split_score == pytest.approx(0.7)
+    assert loaded_chunks[0].right_split_score == pytest.approx(0.72)
+    assert loaded_chunks[0].primary_cut_candidates[0]["time_s"] == pytest.approx(1.2)
+    assert loaded_chunks[0].weak_cut_candidates[0]["time_s"] == pytest.approx(1.7)
     assert loaded_chunks[0].speech_segments[0].score == 0.9
+    assert loaded_chunks[0].speech_segments[0].weak_cut_candidates[0]["time_s"] == pytest.approx(0.3)
 
 
 class _CountingSpeechBoundaryBackend:

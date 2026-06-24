@@ -15,7 +15,7 @@ MAMBA2_FRAME_SCORER_OUTPUT_HEADS = (
     "speech_prob",
     "split_boundary_prob",
 )
-MAMBA2_FRAME_SCORER_DECODER = "topographic_split_v2"
+MAMBA2_FRAME_SCORER_DECODER = "topographic_split_micro_resolver_v3"
 
 
 def count_trainable_parameters(model) -> int:

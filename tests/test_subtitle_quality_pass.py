@@ -77,7 +77,20 @@ def test_alignment_window_extends_min_duration_without_overlapping_next():
     start, end = subtitle._resolve_subtitle_window(blocks, 1)
 
     assert start == 0.0
-    assert end == 0.6
+    assert end == pytest.approx(0.7 - SubtitleOptions().frame_gap_s)
+
+
+def test_alignment_window_extends_micro_cue_to_twenty_video_frames():
+    blocks = [
+        {"start": 0.0, "end": 0.1, "ja_text": "あ", "zh_text": "啊"},
+        {"start": 2.0, "end": 2.5, "ja_text": "い", "zh_text": "咿"},
+    ]
+    options = SubtitleOptions(video_fps=24.0)
+
+    start, end = subtitle._resolve_subtitle_window(blocks, 1, options=options)
+
+    assert start == 0.0
+    assert end == pytest.approx(20.0 / 24.0)
 
 
 def test_alignment_window_uses_two_frame_gap_from_video_fps():
@@ -232,17 +245,56 @@ def test_timing_polish_disabled_keeps_existing_alignment_end():
     assert prepared[0]["end"] == pytest.approx(1.0)
 
 
-def test_timing_polish_respects_max_duration():
-    blocks = [{"start": 0.0, "end": 6.4, "ja_text": "あ", "zh_text": "甲"}]
+def test_long_display_cue_splits_at_weak_cut_candidate():
+    blocks = [
+        {
+            "start": 0.0,
+            "end": 9.0,
+            "ja_text": "これは長い台詞です。次の台詞です。",
+            "zh_text": "这是很长的台词。下一句台词。",
+            "weak_cut_candidates": [
+                {
+                    "kind": "weak",
+                    "time_s": 4.2,
+                    "frame": 210,
+                    "score": 0.2,
+                    "prominence": 0.1,
+                    "speech_valley": 0.8,
+                    "strength": 1.1,
+                }
+            ],
+        }
+    ]
     options = SubtitleOptions(
-        max_duration=6.5,
+        video_fps=24.0,
         timing_polish_enabled=True,
         linger_s=0.45,
     )
 
     prepared = subtitle.prepare_srt_blocks(blocks, options=options, mode="bilingual")
 
-    assert prepared[0]["end"] == pytest.approx(6.5)
+    assert len(prepared) == 2
+    assert prepared[1]["start"] == pytest.approx(4.2)
+    assert prepared[0]["end"] + options.frame_gap_s <= prepared[1]["start"]
+    assert max(item["end"] - item["start"] for item in prepared) <= 7.0
+
+
+def test_long_display_cue_falls_back_to_proportional_text_split():
+    blocks = [
+        {
+            "start": 0.0,
+            "end": 9.0,
+            "ja_text": "これは長い台詞です。次の台詞です。",
+            "zh_text": "这是很长的台词。下一句台词。",
+        }
+    ]
+    options = SubtitleOptions(video_fps=24.0, timing_polish_enabled=False)
+
+    prepared = subtitle.prepare_srt_blocks(blocks, options=options, mode="bilingual")
+
+    assert len(prepared) == 2
+    assert prepared[1]["start"] == pytest.approx(5.294117647058823)
+    assert prepared[0]["end"] + options.frame_gap_s <= prepared[1]["start"]
 
 
 def test_short_cues_are_not_merged():

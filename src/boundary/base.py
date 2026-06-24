@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import Protocol, runtime_checkable
+from dataclasses import dataclass, field
+from typing import Any, Protocol, runtime_checkable
 
 
 @dataclass
@@ -11,6 +11,19 @@ class SpeechSegment:
     start: float
     end: float
     score: float | None = None
+    subtitle_min_duration_s: float | None = None
+    below_subtitle_min_duration: bool = False
+    micro_chunk_candidate: bool = False
+    micro_resolve_action: str = ""
+    micro_resolve_reason: str = ""
+    left_split_score: float | None = None
+    right_split_score: float | None = None
+    left_split_prominence: float | None = None
+    right_split_prominence: float | None = None
+    left_split_speech_valley: float | None = None
+    right_split_speech_valley: float | None = None
+    primary_cut_candidates: list[dict[str, Any]] = field(default_factory=list)
+    weak_cut_candidates: list[dict[str, Any]] = field(default_factory=list)
 
 
 @dataclass
