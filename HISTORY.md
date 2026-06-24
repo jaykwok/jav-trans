@@ -59,14 +59,18 @@ SpeechBoundary-JA scorer v5 frame scores
 ## Backlog
 
 - 1.7B Scorer v5：micro resolver 32768 full checkpoint 已通过 two-film 人工观感 gate；本轮不重训 scorer。后续训练使用该 checkpoint 显式路径作为 scorer source，直到 registry promotion 可单独完成。
-- Boundary Refiner v6：下一步重新用 micro scorer 产生的 predicted island edge 导出 edge-only dataset，再训练 repo-id tagged v6 checkpoint。
-- Pre-ASR CueQC v6：Refiner v6 候选稳定后，从 refined chunk 与人工 keep/drop 标签编译无 ASR 文本且包含 micro metadata 的特征，训练 `cueqc_pre_asr_mamba_v6_binary`。
+- Boundary Refiner v6：micro scorer predicted edge 数据已重导并完成 1.7B repo-id tagged v6 训练；下一步用两部 current workflow 审计边界微调和 chunk 质量，确认后再考虑 registry promotion。
+- Pre-ASR CueQC v6：必须使用当前 scorer+refiner workflow 的 fresh candidates 与人工 keep/drop 标签训练；旧 v4/v5/no-split-budget 簇标签不直接复用。下一步生成 current two-film 审计/广播标签源，再编译无 ASR 文本且包含 micro metadata 的特征，训练 `cueqc_pre_asr_mamba_v6_binary`。
 - ASR-after CueQC v4：仅保留 shadow/mining；当 Pre-ASR CueQC v6 false-drop gate 稳定后，删除后置 runtime 与训练入口。
 - REAL-988：只作为最终测试集，不进入训练、pseudo pool 或 cold-start 聚类。
 - 0.6B 三模型：1.7B scorer/refiner/cueqc 完整通过后，再按相同 schema 独立重训 0.6B；不复用 1.7B checkpoint。
 - 长期研究：等 Boundary/CueQC 审计闭环稳定后，再评估 Qwen ASR boundary-token SFT / DPO / RL、长上下文 joint segmentation-transcription 和小模型蒸馏。
 
 ## 近期记录
+
+- 2026-06-24 Boundary Refiner v6 micro-edge 重训完成：使用已通过人工观感 gate 的 1.7B scorer v5 micro checkpoint，基于 `agents/temp/20260624_193453_scorer-v5-micro-32768-full/scorer_v5_native_labels.jsonl` 与 1.7B feature cache 重导 edge-only dataset 到 `agents/temp/20260624_225603_refiner17b-v6-micro-edge-prep/`。数据 schema 为 `boundary_edge_refiner_dataset_v6`，feature schema/hash 为 `edge_sequence_features_v1` / `5ef1426b2f181a8e6d5d3c3a3b54862e54497feb`，共 `9499` sequences / `19744` edge items，start/end supervised 为 `15872/16981`，clipped target 为 `3362/3352`。训练输出 `agents/temp/20260624_232351_train-refiner17b-v6-micro-edge-s2000/boundary_edge_refiner_v6.jaykwok-Qwen3-ASR-1.7B-JA-Anime-Galgame.pt`，last train loss `0.0004176`，train MAE start/end `0.0147/0.0174s`，val MAE start/end `0.1601/0.1499s`，loader smoke 通过 repo id/schema/feature hash 校验。随后用该 refiner + scorer v5 micro checkpoint 跑 867HTTM no-CueQC workflow smoke：`agents/temp/speech-boundary-ja/20260624_233009_refiner-v6-micro-edge-867httm-smoke/`，status `done`，elapsed `507.1s`，ASR chunks `2943`，final subtitles `1073`，pipeline CUDA peak reserved `5328MB`，Pre-ASR CueQC disabled 且 `pass_to_asr=2943`。当前结论：refiner 可加载且 workflow 可跑通；Pre-ASR CueQC v6 不使用旧簇标签直接训练，需从 current scorer+refiner 候选重新审计/标注。
+
+- 2026-06-25 Pre-ASR CueQC v6 fresh two-film 标注源准备：补跑 BONY current workflow，使用 scorer v5 micro checkpoint + `20260624_232351` Boundary Refiner v6 micro-edge checkpoint、Pre-ASR CueQC off、CueQC shadow off、无 boundary cache，输出 `agents/temp/speech-boundary-ja/20260624_235500_refiner-v6-micro-edge-bony-smoke/`，status `done`，elapsed `1052.741s`，ASR chunks `5891`，final subtitles `2275`，pipeline CUDA peak reserved `5328MB`。新增 `tools.asr.cueqc.export_pre_asr_v6_audit_candidates`，从 current `.timings.json` 导出 `pre_asr_cueqc_features_v2` numeric candidates，并把 ASR/transcript text 只作为审计参考字段；两部合计 `8834` candidates，cluster bucket 为 below-subtitle-min `3349`、micro-left `1726`、micro-right `1454`、standard `2190`、high-split-density `110`、long-duration `4`、low-speech-mean `1`。音频标注页生成并刷新导航：`agents/audits/20260625_001100_pre-asr-v6-current-twofilm-audio-label-audit/index.html`，支持 chunk/context 播放、字幕同步、时长排序/筛选、Pre-ASR v6 numeric features/micro/weak cuts 展示与 keep/drop 标签导出。Pre-ASR CueQC v6 训练仍等待该 current 页面导出的人工 keep/drop 标签；不使用旧 no-split-budget 或 v4/v5 簇标签。
 
 - 2026-06-24 训练前决策：本轮 acoustic time anchors / 7 秒字幕 soft guard 没有改变 scorer 模型头，且用户确认 micro scorer two-film 观感好，因此不重新训练 scorer；下一轮训练顺序固定为：用已通过 gate 的 1.7B scorer v5 micro checkpoint 重导 Boundary Refiner v6 edge-only 数据并训练 refiner，随后用新 scorer+refiner workflow 重导 Pre-ASR CueQC v6 candidates/features 并训练前置 keep/drop。Pre-ASR CueQC v6 训练完成前保持默认关闭；ASR-after CueQC v4 继续只做 opt-in shadow/mining。
 
