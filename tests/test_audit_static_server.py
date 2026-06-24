@@ -9,7 +9,7 @@ from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
 from tools.audits.audit_nav import write_audit_index, write_latest_audit_entry
-from tools.audits.serve_static import make_handler, parse_range_header, resolve_url_path
+from tools.audits.serve_static import CLIENT_DISCONNECT_ERRORS, make_handler, parse_range_header, resolve_url_path
 
 
 def _write(path: Path, data: bytes | str) -> Path:
@@ -94,6 +94,10 @@ def test_static_server_supports_range_requests(tmp_path: Path):
             assert exc.headers["Content-Range"] == "bytes */10"
         else:
             raise AssertionError("invalid range did not return 416")
+
+
+def test_static_server_treats_windows_range_abort_as_client_disconnect():
+    assert isinstance(ConnectionAbortedError(), CLIENT_DISCONNECT_ERRORS)
 
 
 def test_static_server_delete_api_moves_audit_and_rebuilds_nav(tmp_path: Path):
