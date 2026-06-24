@@ -75,5 +75,32 @@ def test_cueqc_cluster_audit_uses_explicit_media_root(tmp_path: Path):
     assert "mixed_skip" in html
     assert "每条独立播放器" in html
     assert 'document.createElement("audio")' not in html
+    assert "captionMeta" in html
+    assert "renderCaptionPreview" in html
+    assert "当前时刻没有字幕" in html
+    assert "sortBy" in html
+    assert "minDuration" in html
+    assert 'Number(document.getElementById("minDuration").value)' not in html
+    assert 'optionalNumberInput("minDuration")' in html
+    assert 'optionalNumberInput("maxDuration")' in html
+    assert 'optionalNumberInput("minConfidence")' in html
+    assert "current = Math.max(0, ROWS.indexOf(filtered[0] || ROWS[0]));" in html
+    assert "if (!filtered.includes(ROWS[current]))" not in html
+    assert 'class="sample-list" id="list"' in html
+    assert 'class="panel sample-detail-panel"' in html
+    assert 'class="panel cluster-admin-panel"' in html
+    assert html.index('class="sample-list" id="list"') < html.index('id="clusterNav"')
+    assert "current = ROWS.indexOf(examples[0]);" not in html
+    assert 'document.getElementById("sortBy").addEventListener("change", () => {\n  applyFilters();\n});' in html
+    assert "alignmentFilter" in html
+    assert "issueFilter" in html
+    assert "all alignment issue" in html
+    assert "fallbackFilter" not in html
+    assert "all fallback subtype" not in html
+    assert "ALIGNED_BY_VIDEO" in html
+    assert "rowsForRange(cues, row.context_start, row.context_end)" in html
+    assert "subtitle_window_start" in html
+    assert "fallback_window_start" not in html
+    assert "context_subtitle_cues" not in html
     assert "keep" in html
     assert "drop" in html

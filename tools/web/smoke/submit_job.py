@@ -7,9 +7,7 @@ from tools.web.smoke.common import default_run_dir, http_json, write_json
 
 
 DEFAULT_ASR_BACKEND = "jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame"
-DEFAULT_CUEQC_MODEL_BY_REPO = (
-    "jaykwok/Qwen3-ASR-0.6B-JA-Anime-Galgame=src/asr/checkpoints/cueqc_mamba_v4_binary.jaykwok-Qwen3-ASR-0.6B-JA-Anime-Galgame.pt"
-)
+DEFAULT_CUEQC_MODEL_BY_REPO = ""
 
 
 def _parse_advanced(values: list[str]) -> dict[str, str]:
@@ -44,7 +42,7 @@ def main(argv: list[str] | None = None) -> int:
         help="Optional repo-id scorer map. Empty uses the registered repo-id scorer when available.",
     )
     parser.add_argument("--cueqc-inference-batch-size", default="64")
-    parser.add_argument("--disable-cueqc-drop", action="store_true")
+    parser.add_argument("--cueqc-shadow-enabled", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--advanced", action="append", default=[], help="Extra advanced env override, KEY=VALUE.")
     args = parser.parse_args(argv)
 
@@ -56,7 +54,7 @@ def main(argv: list[str] | None = None) -> int:
             "SPEECH_BOUNDARY_JA_SCORER_CHECKPOINT_BY_REPO",
             args.speech_boundary_scorer_checkpoint_by_repo,
         )
-    advanced.setdefault("CUEQC_DROP_APPLY_ENABLED", "0" if args.disable_cueqc_drop else "1")
+    advanced.setdefault("CUEQC_SHADOW_ENABLED", "1" if args.cueqc_shadow_enabled else "0")
     if args.cueqc_inference_batch_size:
         advanced.setdefault("CUEQC_INFERENCE_BATCH_SIZE", str(args.cueqc_inference_batch_size))
 
@@ -89,4 +87,3 @@ def main(argv: list[str] | None = None) -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

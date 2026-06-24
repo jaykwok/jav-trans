@@ -13,6 +13,7 @@ from asr.backends.registry import (
 )
 from asr.backends.qwen import active_qwen_asr_model_id
 from asr.cueqc import runtime_signature as cueqc_runtime_signature
+from asr.pre_asr_cueqc import runtime_signature as pre_asr_cueqc_runtime_signature
 from asr.local_backend import ASR_DTYPE
 
 
@@ -166,7 +167,8 @@ def _get_asr_runtime_signature(
             ),
             "asr_repetition_penalty": _env_text("ASR_REPETITION_PENALTY", "1.05"),
         },
-        "cueqc": cueqc_runtime_signature(),
+        "pre_asr_cueqc": pre_asr_cueqc_runtime_signature(),
+        "cueqc_shadow": cueqc_runtime_signature(),
         "boundary": boundary_signature if isinstance(boundary_signature, dict) else {},
     }
 

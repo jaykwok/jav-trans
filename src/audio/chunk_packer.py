@@ -34,6 +34,12 @@ class PackedChunk:
     boundary_start_refine_delta_s: float | None = None
     boundary_end_refine_delta_s: float | None = None
     boundary_decision_source: str = ""
+    scorer_speech_mean: float | None = None
+    scorer_speech_max: float | None = None
+    scorer_speech_p90: float | None = None
+    scorer_split_mean: float | None = None
+    scorer_split_max: float | None = None
+    scorer_split_p90: float | None = None
 
 
 @dataclass(frozen=True)
@@ -51,7 +57,7 @@ def pack_speech_segments(
 ) -> list[PackedChunk]:
     """Convert scorer-produced speech islands into ASR chunks.
 
-    Scorer v4 is the only island splitter. The planner no longer creates
+    Scorer v5 is the only island splitter. The planner no longer creates
     duration-driven splits or secondary boundary candidates; Boundary Refiner v6
     may only adjust the start/end of already-planned island chunks.
     """

@@ -28,7 +28,7 @@ DEFAULT_ASR_BATCH_SIZE_BY_REPO_ENV = ",".join(
     f"{repo_id}={batch_size}"
     for repo_id, batch_size in DEFAULT_QWEN_ASR_BATCH_SIZE_BY_REPO.items()
 )
-DEFAULT_SPEECH_BOUNDARY_OPERATING_POINT = "qwen-mamba2-frame-boundary-scorer-v4"
+DEFAULT_SPEECH_BOUNDARY_OPERATING_POINT = "qwen-mamba2-frame-boundary-scorer-v5"
 
 
 @dataclass(frozen=True)
@@ -207,7 +207,15 @@ def configure_env(args: argparse.Namespace) -> None:
         os.environ["CUEQC_MODEL_PATH_BY_REPO"] = args.cueqc_model_path_by_repo
     else:
         os.environ.pop("CUEQC_MODEL_PATH_BY_REPO", None)
+    os.environ["CUEQC_SHADOW_ENABLED"] = "1" if args.cueqc_shadow_enabled else "0"
     os.environ["CUEQC_INFERENCE_BATCH_SIZE"] = str(args.cueqc_inference_batch_size)
+    os.environ["PRE_ASR_CUEQC_ENABLED"] = "1" if args.pre_asr_cueqc_enabled else "0"
+    if args.pre_asr_cueqc_model_path_by_repo.strip():
+        os.environ["PRE_ASR_CUEQC_MODEL_PATH_BY_REPO"] = args.pre_asr_cueqc_model_path_by_repo
+    else:
+        os.environ.pop("PRE_ASR_CUEQC_MODEL_PATH_BY_REPO", None)
+    os.environ["PRE_ASR_CUEQC_DEVICE"] = args.pre_asr_cueqc_device
+    os.environ["PRE_ASR_CUEQC_DROP_THRESHOLD"] = str(args.pre_asr_cueqc_drop_threshold)
     os.environ["BOUNDARY_PLANNER_SEQUENCE_BATCH_SIZE"] = str(args.boundary_planner_sequence_batch_size)
     os.environ["KEEP_ASR_CHUNKS"] = "1" if args.keep_asr_chunks else "0"
     os.environ["BOUNDARY_CACHE_ENABLED"] = "1" if args.boundary_cache else "0"
@@ -215,8 +223,6 @@ def configure_env(args: argparse.Namespace) -> None:
     os.environ["SPEECH_BOUNDARY_JA_SPEECH_ON_THRESHOLD"] = str(args.speech_boundary_speech_on_threshold)
     os.environ["SPEECH_BOUNDARY_JA_SPEECH_OFF_THRESHOLD"] = str(args.speech_boundary_speech_off_threshold)
     os.environ["SPEECH_BOUNDARY_JA_FRAME_DILATION_S"] = str(args.speech_boundary_frame_dilation_s)
-    os.environ["SPEECH_BOUNDARY_JA_DROP_GAP_THRESHOLD"] = str(args.speech_boundary_drop_gap_threshold)
-    os.environ["SPEECH_BOUNDARY_JA_SPLIT_TARGET_S"] = str(args.speech_boundary_split_target_s)
     os.environ["SPEECH_BOUNDARY_JA_SPLIT_SCORE_QUANTILE"] = str(args.speech_boundary_split_score_quantile)
     os.environ["SPEECH_BOUNDARY_JA_SPLIT_PROMINENCE_QUANTILE"] = str(
         args.speech_boundary_split_prominence_quantile
@@ -268,7 +274,12 @@ def build_context(*, args: argparse.Namespace, paths: RunPaths, video: Path):
         "BOUNDARY_REFINER_MODEL_PATH_BY_REPO": os.getenv("BOUNDARY_REFINER_MODEL_PATH_BY_REPO", ""),
         "BOUNDARY_REFINER_DEVICE": os.getenv("BOUNDARY_REFINER_DEVICE", "auto"),
         "CUEQC_MODEL_PATH_BY_REPO": os.getenv("CUEQC_MODEL_PATH_BY_REPO", ""),
+        "CUEQC_SHADOW_ENABLED": "1" if args.cueqc_shadow_enabled else "0",
         "CUEQC_INFERENCE_BATCH_SIZE": os.getenv("CUEQC_INFERENCE_BATCH_SIZE", "64"),
+        "PRE_ASR_CUEQC_ENABLED": "1" if args.pre_asr_cueqc_enabled else "0",
+        "PRE_ASR_CUEQC_MODEL_PATH_BY_REPO": os.getenv("PRE_ASR_CUEQC_MODEL_PATH_BY_REPO", ""),
+        "PRE_ASR_CUEQC_DEVICE": os.getenv("PRE_ASR_CUEQC_DEVICE", "auto"),
+        "PRE_ASR_CUEQC_DROP_THRESHOLD": str(args.pre_asr_cueqc_drop_threshold),
         "BOUNDARY_PLANNER_SEQUENCE_BATCH_SIZE": os.getenv("BOUNDARY_PLANNER_SEQUENCE_BATCH_SIZE", "256"),
         "QUALITY_REPORT_ENABLED": "1",
         "QUALITY_REPORT_DIR": str(paths.root / "quality_reports"),
@@ -281,8 +292,6 @@ def build_context(*, args: argparse.Namespace, paths: RunPaths, video: Path):
         "SPEECH_BOUNDARY_JA_SPEECH_ON_THRESHOLD": str(args.speech_boundary_speech_on_threshold),
         "SPEECH_BOUNDARY_JA_SPEECH_OFF_THRESHOLD": str(args.speech_boundary_speech_off_threshold),
         "SPEECH_BOUNDARY_JA_FRAME_DILATION_S": str(args.speech_boundary_frame_dilation_s),
-        "SPEECH_BOUNDARY_JA_DROP_GAP_THRESHOLD": str(args.speech_boundary_drop_gap_threshold),
-        "SPEECH_BOUNDARY_JA_SPLIT_TARGET_S": str(args.speech_boundary_split_target_s),
         "SPEECH_BOUNDARY_JA_SPLIT_SCORE_QUANTILE": str(args.speech_boundary_split_score_quantile),
         "SPEECH_BOUNDARY_JA_SPLIT_PROMINENCE_QUANTILE": str(
             args.speech_boundary_split_prominence_quantile
@@ -430,9 +439,7 @@ def write_summary(paths: RunPaths, args: argparse.Namespace, results: list[dict[
         "speech_boundary_speech_on_threshold": args.speech_boundary_speech_on_threshold,
         "speech_boundary_speech_off_threshold": args.speech_boundary_speech_off_threshold,
         "speech_boundary_frame_dilation_s": args.speech_boundary_frame_dilation_s,
-        "speech_boundary_drop_gap_threshold": args.speech_boundary_drop_gap_threshold,
-        "speech_boundary_split_strategy": "adaptive_topk_peak",
-        "speech_boundary_split_target_s": args.speech_boundary_split_target_s,
+        "speech_boundary_split_strategy": "adaptive_topographic_time_valley_peak",
         "speech_boundary_split_score_quantile": args.speech_boundary_split_score_quantile,
         "speech_boundary_split_prominence_quantile": args.speech_boundary_split_prominence_quantile,
         "speech_boundary_split_smooth_s": args.speech_boundary_split_smooth_s,
@@ -441,7 +448,10 @@ def write_summary(paths: RunPaths, args: argparse.Namespace, results: list[dict[
         "speech_boundary_min_split_segment_s": args.speech_boundary_min_split_segment_s,
         "speech_boundary_scorer_checkpoint_by_repo": args.speech_boundary_scorer_checkpoint_by_repo,
         "asr_batch_size": args.asr_batch_size,
+        "cueqc_shadow_enabled": bool(args.cueqc_shadow_enabled),
         "cueqc_inference_batch_size": args.cueqc_inference_batch_size,
+        "pre_asr_cueqc_enabled": bool(args.pre_asr_cueqc_enabled),
+        "pre_asr_cueqc_drop_threshold": args.pre_asr_cueqc_drop_threshold,
         "boundary_planner": {
             "feature_frame_hop_s": args.boundary_feature_frame_hop_s,
             "sequence_batch_size": args.boundary_planner_sequence_batch_size,
@@ -462,9 +472,10 @@ def write_summary(paths: RunPaths, args: argparse.Namespace, results: list[dict[
             f"`{args.speech_boundary_speech_on_threshold:g}` / "
             f"`{args.speech_boundary_speech_off_threshold:g}`, "
             f"frame dilation `{args.speech_boundary_frame_dilation_s:g}s`, "
-            f"adaptive split target `{args.speech_boundary_split_target_s:g}s`, "
-            f"drop_gap `{args.speech_boundary_drop_gap_threshold:g}`"
+            f"adaptive split decoder"
         ),
+        f"- Pre-ASR CueQC: `{'on' if args.pre_asr_cueqc_enabled else 'off'}`",
+        f"- CueQC shadow: `{'on' if args.cueqc_shadow_enabled else 'off'}`",
         f"- Translation: `{'on' if args.translate else 'off'}`",
         f"- Runtime root: `{project_rel(paths.root)}`",
         "",
@@ -536,10 +547,33 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Required repo-id checkpoint map: '<repo_id>=<cueqc_mamba_v4_binary.pt>[,<repo_id>=...]'.",
     )
     parser.add_argument(
+        "--cueqc-shadow-enabled",
+        action=argparse.BooleanOptionalAction,
+        default=_env_bool("CUEQC_SHADOW_ENABLED", False),
+        help="Enable ASR-after CueQC v4 shadow decisions for audit/mining. It does not drop runtime chunks.",
+    )
+    parser.add_argument(
         "--cueqc-inference-batch-size",
         type=int,
         default=_env_int("CUEQC_INFERENCE_BATCH_SIZE", 64),
         help="CueQC v4 binary inference batch size.",
+    )
+    parser.add_argument(
+        "--pre-asr-cueqc-enabled",
+        action=argparse.BooleanOptionalAction,
+        default=_env_bool("PRE_ASR_CUEQC_ENABLED", False),
+        help="Run Pre-ASR CueQC v5 after Boundary Refiner and before ASR chunk export.",
+    )
+    parser.add_argument(
+        "--pre-asr-cueqc-model-path-by-repo",
+        default=os.getenv("PRE_ASR_CUEQC_MODEL_PATH_BY_REPO", ""),
+        help="Optional repo-id checkpoint map: '<repo_id>=<cueqc_pre_asr_mamba_v5_binary.pt>[,<repo_id>=...]'.",
+    )
+    parser.add_argument("--pre-asr-cueqc-device", default=os.getenv("PRE_ASR_CUEQC_DEVICE", "auto"))
+    parser.add_argument(
+        "--pre-asr-cueqc-drop-threshold",
+        type=float,
+        default=_env_float("PRE_ASR_CUEQC_DROP_THRESHOLD", 0.90),
     )
     parser.add_argument("--boundary-refiner-device", default=os.getenv("BOUNDARY_REFINER_DEVICE", "auto"))
     parser.add_argument("--boundary-planner-sequence-batch-size", type=int, default=_env_int("BOUNDARY_PLANNER_SEQUENCE_BATCH_SIZE", 256))
@@ -561,8 +595,6 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Speech deactivation threshold. Defaults to --speech-boundary-threshold.",
     )
     parser.add_argument("--speech-boundary-frame-dilation-s", dest="speech_boundary_frame_dilation_s", type=float, default=_env_float("SPEECH_BOUNDARY_JA_FRAME_DILATION_S", 0.2))
-    parser.add_argument("--speech-boundary-drop-gap-threshold", dest="speech_boundary_drop_gap_threshold", type=float, default=_env_float("SPEECH_BOUNDARY_JA_DROP_GAP_THRESHOLD", 0.5))
-    parser.add_argument("--speech-boundary-split-target-s", dest="speech_boundary_split_target_s", type=float, default=_env_float("SPEECH_BOUNDARY_JA_SPLIT_TARGET_S", 5.0))
     parser.add_argument("--speech-boundary-split-score-quantile", dest="speech_boundary_split_score_quantile", type=float, default=_env_float("SPEECH_BOUNDARY_JA_SPLIT_SCORE_QUANTILE", 0.50))
     parser.add_argument("--speech-boundary-split-prominence-quantile", dest="speech_boundary_split_prominence_quantile", type=float, default=_env_float("SPEECH_BOUNDARY_JA_SPLIT_PROMINENCE_QUANTILE", 0.50))
     parser.add_argument("--speech-boundary-split-smooth-s", dest="speech_boundary_split_smooth_s", type=float, default=_env_float("SPEECH_BOUNDARY_JA_SPLIT_SMOOTH_S", 0.08))
@@ -586,7 +618,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         dest="speech_boundary_scorer_checkpoint_by_repo",
         default=os.getenv("SPEECH_BOUNDARY_JA_SCORER_CHECKPOINT_BY_REPO", ""),
         help=(
-            "Optional repo-id scorer map: '<repo_id>=<speech_boundary_ja_frame_boundary_scorer_v4.pt>'"
+            "Optional repo-id scorer map: '<repo_id>=<speech_boundary_ja_frame_boundary_scorer_v5.pt>'"
             "[,<repo_id>=...]'. Empty uses the registered repo-id scorer when available."
         ),
     )
@@ -618,8 +650,6 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     if args.speech_boundary_frame_dilation_s < 0:
         parser.error("--speech-boundary-frame-dilation-s must be non-negative")
     for name in (
-        "speech_boundary_drop_gap_threshold",
-        "speech_boundary_split_target_s",
         "speech_boundary_split_smooth_s",
         "speech_boundary_split_nms_s",
         "speech_boundary_split_snap_s",
@@ -631,6 +661,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         value = getattr(args, name)
         if not 0.0 <= value <= 1.0:
             parser.error(f"--{name.replace('_', '-')} must be between 0 and 1")
+    if not 0.0 <= args.pre_asr_cueqc_drop_threshold <= 1.0:
+        parser.error("--pre-asr-cueqc-drop-threshold must be between 0 and 1")
     if args.speech_boundary_window_s <= 0:
         parser.error("--speech-boundary-window-s must be positive")
     if args.speech_boundary_overlap_s < 0 or args.speech_boundary_overlap_s >= args.speech_boundary_window_s:

@@ -56,13 +56,14 @@ def test_glossary_empty_returns_null():
     assert not any("glossary_hit_rate" in w for w in report["warnings"])
 
 
-def test_alignment_fallback_ratio_is_observation_only():
+def test_alignment_issue_ratio_is_observation_only():
     segs = [_seg("テスト", "测试")] * 10
     report = compute_quality_report(segs, 60.0, [], 3, 10)
-    assert report["alignment_fallback_count"] == 3
-    assert report["alignment_fallback_total"] == 10
-    assert report["alignment_fallback_ratio"] == pytest.approx(0.3)
-    assert not any("alignment_fallback_ratio" in w for w in report["warnings"])
+    assert report["alignment_issue_count"] == 3
+    assert report["alignment_issue_total"] == 10
+    assert report["alignment_issue_ratio"] == pytest.approx(0.3)
+    assert "alignment_fallback_ratio" not in report
+    assert not any("alignment_issue_ratio" in w for w in report["warnings"])
 
 
 def test_short_segment_ratio():

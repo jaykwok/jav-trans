@@ -78,7 +78,7 @@ def _write_v6_dataset(
             weights.append([1.0, 0.6])
         payload = {
             "schema": "boundary_edge_refiner_dataset_v6",
-            "dataset_source": "scorer_v4_predicted_island_edges",
+            "dataset_source": "scorer_v5_predicted_island_edges",
             "audio_id": f"seq-{row_index}",
             "feature_names": feature_names,
             "sequence_features": sequence,
@@ -88,10 +88,10 @@ def _write_v6_dataset(
         }
         if include_ptm_repo_id:
             payload["metadata"] = {
-                "dataset_source": "scorer_v4_predicted_island_edges",
+                "dataset_source": "scorer_v5_predicted_island_edges",
                 "ptm_repo_id": "jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame",
                 "scorer_checkpoint": {
-                    "schema": "speech_boundary_ja_mamba2_frame_boundary_scorer_v4",
+                    "schema": "speech_boundary_ja_mamba2_frame_boundary_scorer_v5",
                     "sha256": "unit-helper",
                     "metadata": {
                         "ptm_repo_id": "jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame",
@@ -100,9 +100,9 @@ def _write_v6_dataset(
             }
         else:
             payload["metadata"] = {
-                "dataset_source": "scorer_v4_predicted_island_edges",
+                "dataset_source": "scorer_v5_predicted_island_edges",
                 "scorer_checkpoint": {
-                    "schema": "speech_boundary_ja_mamba2_frame_boundary_scorer_v4",
+                    "schema": "speech_boundary_ja_mamba2_frame_boundary_scorer_v5",
                     "sha256": "unit-helper",
                 },
             }
@@ -155,7 +155,7 @@ def test_train_refiner_accepts_v6_delta_dataset(tmp_path):
     assert edge_policy["delta_loss"] == "smooth_l1"
     assert edge_policy["start_delta_loss_weight"] == 1.0
     assert edge_policy["end_delta_loss_weight"] == 0.6
-    assert edge_policy["source"] == "scorer_v4_island_edges"
+    assert edge_policy["source"] == "scorer_v5_island_edges"
     smoke = metrics["loader_smoke"]["first_decision"]
     assert set(smoke) == {"source", "start_refine_delta_s", "end_refine_delta_s"}
 
@@ -308,8 +308,8 @@ def test_build_frame_sequence_dataset_trains_with_cached_features(tmp_path, monk
                 "sha256": "unit",
                 "metadata": {
                     "ptm_repo_id": QWEN_ASR_17B_REPO_ID,
-                    "output_heads": ["speech_prob", "split_boundary_prob", "drop_gap_prob"],
-                    "decoder": "peak_split_v1",
+                    "output_heads": ["speech_prob", "split_boundary_prob"],
+                    "decoder": "topographic_split_v2",
                 },
             }
 
@@ -325,7 +325,6 @@ def test_build_frame_sequence_dataset_trains_with_cached_features(tmp_path, monk
             (
                 np.asarray([0.95, 0.95, 0.15, 0.95, 0.95, 0.15], dtype=np.float32),
                 np.asarray([0.05, 0.05, 0.05, 0.05, 0.05, 0.05], dtype=np.float32),
-                np.asarray([0.05, 0.05, 0.95, 0.05, 0.05, 0.95], dtype=np.float32),
             )
             for _ptm, _mfcc in feature_pairs
         ],
@@ -397,7 +396,6 @@ def test_build_frame_sequence_dataset_trains_with_cached_features(tmp_path, monk
             max_ptm_dims=3,
             frame_dilation_s=0.0,
             threshold=0.5,
-            drop_gap_threshold=0.7,
             min_segment_s=0.05,
             min_split_segment_s=0.05,
             max_edge_alignment_distance_s=0.2,
@@ -414,9 +412,9 @@ def test_build_frame_sequence_dataset_trains_with_cached_features(tmp_path, monk
     assert len(rows[0]["sequence_boundary_delta_targets"]) == 1
     assert rows[0]["sequence_boundary_delta_targets"][0] == pytest.approx([0.02, -0.02])
     assert rows[0]["metadata"]["ptm_repo_id"] == QWEN_ASR_17B_REPO_ID
-    assert rows[0]["metadata"]["dataset_source"] == "scorer_v4_predicted_island_edges"
+    assert rows[0]["metadata"]["dataset_source"] == "scorer_v5_predicted_island_edges"
     assert rows[0]["metadata"]["scorer_checkpoint"]["sha256"] == "unit"
-    assert summary["source"] == "scorer_v4_predicted_island_edges"
+    assert summary["source"] == "scorer_v5_predicted_island_edges"
 
     metrics = train_refiner(
         dataset_paths=[output_jsonl],
@@ -431,7 +429,7 @@ def test_build_frame_sequence_dataset_trains_with_cached_features(tmp_path, monk
     assert metrics["loader_smoke"]["signature"]["metadata"]["ptm_repo_id"] == QWEN_ASR_17B_REPO_ID
     assert (
         metrics["loader_smoke"]["signature"]["metadata"]["dataset_source"]
-        == "scorer_v4_predicted_island_edges"
+        == "scorer_v5_predicted_island_edges"
     )
     assert metrics["loader_smoke"]["signature"]["metadata"]["scorer_checkpoint"]["sha256"] == "unit"
     assert rows[0]["feature_schema"] == FRAME_SEQUENCE_FEATURE_SCHEMA

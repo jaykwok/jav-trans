@@ -8,42 +8,26 @@ param(
 $ErrorActionPreference = "Stop"
 
 $rootDir = (Resolve-Path (Join-Path $PSScriptRoot "..\..")).Path
-$middleware = Join-Path $rootDir "tools\audits\live_server_audit_middleware.js"
+$env:PYTHONIOENCODING = "utf-8"
+$env:PYTHONPATH = $(if ($env:PYTHONPATH) { $env:PYTHONPATH } else { "src" })
+$env:UV_CACHE_DIR = $(if ($env:UV_CACHE_DIR) { $env:UV_CACHE_DIR } else { "agents/temp/uv-cache" })
 $arguments = @(
-    "--host=$BindAddress"
-    "--port=$Port"
-    "--no-browser"
-    "--middleware=$middleware"
-    "--watch=agents/audits"
-    "--wait=500"
-    "."
+    "run"
+    "python"
+    "-m"
+    "tools.audits.serve_static"
+    "--host"
+    $BindAddress
+    "--port"
+    "$Port"
 )
 if ($Open) {
-    $arguments = @("--open=agents/audits/index.html") + ($arguments | Where-Object { $_ -ne "--no-browser" })
+    $arguments += "--open"
 }
 
 Push-Location $rootDir
 try {
-    Write-Host "Audit navigation: http://$BindAddress`:$Port/agents/audits/index.html"
-    Write-Host "Latest audit entry: http://$BindAddress`:$Port/agents/audits/latest-audit.html"
-    $liveServer = Get-Command "live-server.cmd" -ErrorAction SilentlyContinue
-    if (-not $liveServer) {
-        $liveServer = Get-Command "live-server" -ErrorAction SilentlyContinue
-    }
-    if ($liveServer) {
-        & $liveServer.Source @arguments
-    }
-    else {
-        $npx = Get-Command "npx.cmd" -ErrorAction SilentlyContinue
-        if (-not $npx) {
-            $npx = Get-Command "npx" -ErrorAction SilentlyContinue
-        }
-        if (-not $npx) {
-            throw "live-server and npx were not found in PATH. Install live-server with npm first."
-        }
-        & $npx.Source --no-install live-server @arguments
-    }
-
+    & uv @arguments
     if ($LASTEXITCODE -ne 0) {
         exit $LASTEXITCODE
     }

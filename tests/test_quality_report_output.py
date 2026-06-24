@@ -115,7 +115,7 @@ def test_quality_report_keeps_subtitle_timing_fallback_observation_without_warni
                 "zh": "你好",
             }
         ],
-        asr_details={"fallback_count": 25, "chunk_count": 100},
+        asr_details={"alignment_issue_count": 25, "chunk_count": 100},
         project_root=tmp_path,
         console=_Console(),
         write_json_atomic=_write_json_atomic,
@@ -124,10 +124,11 @@ def test_quality_report_keeps_subtitle_timing_fallback_observation_without_warni
     )
 
     payload = json.loads(Path(path).with_suffix(".json").read_text(encoding="utf-8"))
-    assert payload["alignment_fallback_count"] == 25
-    assert payload["alignment_fallback_total"] == 100
-    assert payload["alignment_fallback_ratio"] == 0.25
-    assert not any("alignment_fallback_ratio" in item for item in payload["warnings"])
+    assert payload["alignment_issue_count"] == 25
+    assert payload["alignment_issue_total"] == 100
+    assert payload["alignment_issue_ratio"] == 0.25
+    assert "alignment_fallback_ratio" not in payload
+    assert not any("alignment_issue_ratio" in item for item in payload["warnings"])
 
 
 def test_load_global_glossary_pairs_reads_hashed_translation_glossary(tmp_path):

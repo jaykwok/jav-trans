@@ -529,7 +529,7 @@ class LocalAsrBackend:
             timing_window_source=timing_window_source,
         )
 
-    def _alignment_fallback_window_for_text_result(
+    def _alignment_window_for_text_result(
         self,
         text_result: dict,
         duration: float,
@@ -537,8 +537,8 @@ class LocalAsrBackend:
         full_start = 0.0
         full_end = max(0.0, float(duration))
         try:
-            start = float(text_result.get("alignment_fallback_start_s"))
-            end = float(text_result.get("alignment_fallback_end_s"))
+            start = float(text_result.get("alignment_window_start_s"))
+            end = float(text_result.get("alignment_window_end_s"))
         except (TypeError, ValueError):
             return full_start, full_end, "chunk"
 
@@ -546,7 +546,7 @@ class LocalAsrBackend:
         end = max(start, min(full_end, end))
         if end - start < 0.05:
             return full_start, full_end, "chunk"
-        source = str(text_result.get("alignment_fallback_source") or "chunk").strip()
+        source = str(text_result.get("alignment_window_source") or "chunk").strip()
         return start, end, source or "chunk"
 
     def _build_finalize_output(
@@ -596,8 +596,8 @@ class LocalAsrBackend:
             detected_language = str(text_result["language"]).strip() or "Japanese"
             raw_master_text = str(text_result.get("raw_text", "")).strip()
             master_text = str(text_result.get("text", "")).strip()
-            fallback_start, fallback_end, fallback_window_source = (
-                self._alignment_fallback_window_for_text_result(text_result, duration)
+            window_start, window_end, window_source = (
+                self._alignment_window_for_text_result(text_result, duration)
             )
 
             if not master_text:
@@ -621,9 +621,9 @@ class LocalAsrBackend:
                     duration=duration,
                     detected_language=detected_language,
                     normalized_path=normalized_path,
-                    timing_start=fallback_start,
-                    timing_end=fallback_end,
-                    timing_window_source=fallback_window_source,
+                    timing_start=window_start,
+                    timing_end=window_end,
+                    timing_window_source=window_source,
                     log=log,
                 )
             )

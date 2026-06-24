@@ -1,9 +1,13 @@
 from __future__ import annotations
 
 import os
+from pathlib import Path
 
 from asr.backends import qwen
 from core import config
+
+
+ROOT = Path(__file__).resolve().parents[1]
 
 
 def test_config_defaults_loaded_before_private_env(monkeypatch, tmp_path):
@@ -132,7 +136,24 @@ def test_default_model_download_root_is_project_models():
     assert "BOUNDARY_PLANNER_MAX_PADDED_CHUNK_S" not in config.DEFAULT_SETTINGS
     assert "BOUNDARY_CONTEXT_MAX_SPEECH_OVERLAP_S" not in config.DEFAULT_SETTINGS
     assert config.DEFAULT_SETTINGS["ASR_SUBPROCESS_READY_TIMEOUT_S"] == "600"
+    assert config.DEFAULT_SETTINGS["CUEQC_SHADOW_ENABLED"] == "0"
+    assert config.DEFAULT_SETTINGS["PRE_ASR_CUEQC_ENABLED"] == "0"
     assert config.DEFAULT_SETTINGS["LLM_API_FORMAT"] == "chat"
+
+
+def test_asr_chunk_min_duration_removed_from_active_config_surface():
+    active_files = (
+        "src/asr/chunking.py",
+        "src/boundary/cache.py",
+        "src/core/config.py",
+        "src/main.py",
+        ".env.example",
+        "README.md",
+    )
+    for relative_path in active_files:
+        text = (ROOT / relative_path).read_text(encoding="utf-8")
+        assert "ASR_CHUNK_MIN_DURATION_S" not in text
+    assert "ASR_CHUNK_MIN_DURATION_S" not in config.DEFAULT_SETTINGS
 
 
 def test_frozen_path_defaults_resolve_to_runtime_root(monkeypatch, tmp_path):
@@ -158,4 +179,3 @@ def test_frozen_path_defaults_resolve_to_runtime_root(monkeypatch, tmp_path):
     assert os.environ["TORCH_HOME"] == str((tmp_path / "tmp" / "cache" / "torch").resolve())
     assert os.environ["JOB_TEMP_DIR"] == str((tmp_path / "tmp" / "jobs").resolve())
     assert os.environ["LLM_MODEL_NAME"] == "from_config"
-

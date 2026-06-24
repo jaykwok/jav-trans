@@ -192,12 +192,12 @@ def boundary_type_from_gap(
     gap_s: float,
     *,
     cut_point_max_gap_s: float,
-    cut_drop_min_gap_s: float,
+    long_gap_boundary_min_s: float,
 ) -> str:
     if gap_s <= cut_point_max_gap_s:
         return "cut_point"
-    if gap_s >= cut_drop_min_gap_s:
-        return "gap_zone"
+    if gap_s >= long_gap_boundary_min_s:
+        return "long_gap"
     return "ambiguous_gap"
 
 
@@ -720,7 +720,6 @@ def build_synthetic_timeline(args: argparse.Namespace) -> None:
         previous_speech_segment: TeacherSegment | None = None
         utterance_boundaries: list[dict[str, Any]] = []
         cut_point_segments: list[dict[str, Any]] = []
-        cut_drop_zones: list[dict[str, Any]] = []
         gap_index = output_index * (args.speech_clips_per_example + 2)
 
         leading_samples = gap_samples(
@@ -823,7 +822,7 @@ def build_synthetic_timeline(args: argparse.Namespace) -> None:
                 boundary_type = boundary_type_from_gap(
                     turn_gap_s,
                     cut_point_max_gap_s=args.cut_point_max_gap_s,
-                    cut_drop_min_gap_s=args.cut_drop_min_gap_s,
+                    long_gap_boundary_min_s=args.long_gap_boundary_min_s,
                 )
                 turn = {
                     "index": len(utterance_boundaries),
@@ -841,14 +840,6 @@ def build_synthetic_timeline(args: argparse.Namespace) -> None:
                             "end": boundary_time_s,
                             "time_s": boundary_time_s,
                             "gap_s": turn_gap_s,
-                        }
-                    )
-                elif turn_gap_s >= args.cut_drop_min_gap_s:
-                    cut_drop_zones.append(
-                        {
-                            "start": previous_speech_segment.end,
-                            "end": current_segment.start,
-                            "duration_s": turn_gap_s,
                         }
                     )
             previous_speech_segment = current_segment
@@ -1045,7 +1036,6 @@ def build_synthetic_timeline(args: argparse.Namespace) -> None:
             ],
             "utterance_boundaries": utterance_boundaries,
             "cut_point_segments": cut_point_segments,
-            "cut_drop_zones": cut_drop_zones,
             "actual_speech_segments": [
                 {"start": segment.start, "end": segment.end} for segment in speech_segments
             ],
@@ -1080,7 +1070,6 @@ def build_synthetic_timeline(args: argparse.Namespace) -> None:
                 ],
                 "utterance_boundaries": utterance_boundaries,
                 "cut_point_segments": cut_point_segments,
-                "cut_drop_zones": cut_drop_zones,
                 "speech_segments": [{"start": segment.start, "end": segment.end} for segment in label_segments],
                 "actual_speech_segments": [{"start": segment.start, "end": segment.end} for segment in speech_segments],
                 "speech_label_dilation_s": args.speech_label_dilation_s,
@@ -1113,7 +1102,6 @@ def build_synthetic_timeline(args: argparse.Namespace) -> None:
                 ],
                 "utterance_boundaries": utterance_boundaries,
                 "cut_point_segments": cut_point_segments,
-                "cut_drop_zones": cut_drop_zones,
                 "sources": source_details,
                 "background_mix": background_detail,
                 "transition_regions": transition_regions,
@@ -1135,7 +1123,6 @@ def build_synthetic_timeline(args: argparse.Namespace) -> None:
                 "actual_speech_segments": [{"start": segment.start, "end": segment.end} for segment in speech_segments],
                 "utterance_boundaries": utterance_boundaries,
                 "cut_point_segments": cut_point_segments,
-                "cut_drop_zones": cut_drop_zones,
                 "sources": source_details,
                 "background_mix": background_detail,
                 "transition_regions": transition_regions,
@@ -1172,7 +1159,6 @@ def build_synthetic_timeline(args: argparse.Namespace) -> None:
     total_frames = sum(len(record.speech_frames) for record in records)
     speech_frames = sum(sum(int(value) for value in record.speech_frames) for record in records)
     cut_point_count = sum(len(row.get("cut_point_segments") or []) for row in boundary_rows)
-    cut_drop_zone_count = sum(len(row.get("cut_drop_zones") or []) for row in boundary_rows)
     utterance_boundary_count = sum(len(row.get("utterance_boundaries") or []) for row in boundary_rows)
     summary = {
         "manifest": str(Path(args.manifest)),
@@ -1195,7 +1181,6 @@ def build_synthetic_timeline(args: argparse.Namespace) -> None:
         "random_speech_order_enabled": bool(args.randomize_speech_order),
         "utterance_boundary_count": utterance_boundary_count,
         "cut_point_segment_count": cut_point_count,
-        "cut_drop_zone_count": cut_drop_zone_count,
         "labels": str(labels_path),
         "output_manifest": str(manifest_path),
         "boundary_manifest": str(boundary_manifest_path),
@@ -1209,7 +1194,7 @@ def build_synthetic_timeline(args: argparse.Namespace) -> None:
             "reuse_sources": args.reuse_sources,
             "randomize_speech_order": args.randomize_speech_order,
             "cut_point_max_gap_s": args.cut_point_max_gap_s,
-            "cut_drop_min_gap_s": args.cut_drop_min_gap_s,
+            "long_gap_boundary_min_s": args.long_gap_boundary_min_s,
             "trim_head_s": args.trim_head_s,
             "trim_tail_s": args.trim_tail_s,
             "max_speech_s": args.max_speech_s,
@@ -1284,10 +1269,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Adjacent speech islands with gap <= this are recorded as cut_point utterance boundaries.",
     )
     parser.add_argument(
-        "--cut-drop-min-gap-s",
+        "--long-gap-boundary-min-s",
+        dest="long_gap_boundary_min_s",
         type=float,
         default=0.5,
-        help="Adjacent speech islands with gap >= this are recorded as cut_drop_zone gap regions.",
+        help="Adjacent speech islands with gap >= this are recorded as long_gap utterance boundaries.",
     )
     parser.add_argument("--seed", type=int, default=13)
     parser.add_argument("--source", default="galgame-synthetic-timeline-v5-long-gap")
@@ -1381,7 +1367,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "trim_head_s",
         "trim_tail_s",
         "cut_point_max_gap_s",
-        "cut_drop_min_gap_s",
+        "long_gap_boundary_min_s",
         "gap_min_s",
         "gap_max_s",
         "touch_gap_prob",

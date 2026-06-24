@@ -123,7 +123,7 @@ def _chunk_window(row: dict[str, Any]) -> tuple[float, float]:
     if start is not None and end is not None:
         return float(start), float(end)
     timing = (row.get("features") or {}).get("subtitle_timing") or {}
-    end_v = timing.get("fallback_window_end_s")
+    end_v = timing.get("alignment_window_end_s")
     return 0.0, float(end_v) if end_v is not None else 1.0
 
 

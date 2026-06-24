@@ -6,28 +6,25 @@ cd "$ROOT_DIR"
 
 PORT="${PORT:-8080}"
 HOST="${HOST:-127.0.0.1}"
-MIDDLEWARE="$ROOT_DIR/tools/audits/live_server_audit_middleware.js"
 OPEN="${OPEN:-0}"
 
 ARGS=(
-  "--host=$HOST"
-  "--port=$PORT"
-  "--no-browser"
-  "--middleware=$MIDDLEWARE"
-  "--watch=agents/audits"
-  "--wait=500"
-  "."
+  "run"
+  "python"
+  "-m"
+  "tools.audits.serve_static"
+  "--host"
+  "$HOST"
+  "--port"
+  "$PORT"
 )
 
 if [[ "$OPEN" == "1" ]]; then
-  NEXT_ARGS=()
-  for arg in "${ARGS[@]}"; do
-    [[ "$arg" == "--no-browser" ]] && continue
-    NEXT_ARGS+=("$arg")
-  done
-  ARGS=("--open=agents/audits/index.html" "${NEXT_ARGS[@]}")
+  ARGS+=("--open")
 fi
 
-echo "Audit navigation: http://$HOST:$PORT/agents/audits/index.html"
-echo "Latest audit entry: http://$HOST:$PORT/agents/audits/latest-audit.html"
-exec live-server "${ARGS[@]}"
+export PYTHONIOENCODING="${PYTHONIOENCODING:-utf-8}"
+export PYTHONPATH="${PYTHONPATH:-src}"
+export UV_CACHE_DIR="${UV_CACHE_DIR:-agents/temp/uv-cache}"
+
+exec uv "${ARGS[@]}"

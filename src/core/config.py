@@ -84,8 +84,6 @@ DEFAULT_SETTINGS: dict[str, str] = {
     "ASR_REPETITION_PENALTY": "1.05",
 
     # --- Boundary Refiner / ASR Chunking ---
-    # Discard only deglitch-sized exported ASR wav chunks; scorer split validation owns real chunking.
-    "ASR_CHUNK_MIN_DURATION_S": "0.08",
     # Reset sliding ASR text context when adjacent chunks are separated by this gap.
     "ASR_CONTEXT_RESET_GAP_S": "0.5",
     # Boundary Refiner is the current pre-ASR chunk planning path.
@@ -108,19 +106,22 @@ DEFAULT_SETTINGS: dict[str, str] = {
     "SPEECH_BOUNDARY_JA_FRAME_DILATION_S": "0.2",
     # 1 caches SpeechBoundary frame score -> Boundary Planner outputs separately from ASR generation settings.
     "BOUNDARY_CACHE_ENABLED": "1",
-    # Persistent boundary cache directory. Versioned as boundary-cache v7.
+    # Persistent boundary cache directory. Versioned as boundary-cache v8.
     "BOUNDARY_CACHE_DIR": "./tmp/cache/boundary",
 
-    # --- CueQC Mamba v4 binary keep/drop filter ---
-    # 1 records CueQC candidate features and model/fallback decisions.
-    "CUEQC_SHADOW_ENABLED": "1",
-    # v4 binary: teacher-forced ASR encoder features + token trace + decoder
-    # stats + numeric structured metadata -> keep/drop. Schema is not env-selectable.
-    # Global drop threshold. CueQC v4 does not support text/risk threshold profiles.
+    # --- Pre-ASR CueQC v5 binary keep/drop router ---
+    # Disabled until a repo-matched v5 checkpoint is trained; when enabled it runs after
+    # Boundary Refiner and before wav chunk export / ASR.
+    "PRE_ASR_CUEQC_ENABLED": "0",
+    "PRE_ASR_CUEQC_MODEL_PATH_BY_REPO": "",
+    "PRE_ASR_CUEQC_DEVICE": "auto",
+    "PRE_ASR_CUEQC_DROP_THRESHOLD": "0.90",
+
+    # --- ASR-after CueQC v4 shadow / hard-negative mining ---
+    # Opt-in only; active keep/drop routing moved to Pre-ASR CueQC v5.
+    "CUEQC_SHADOW_ENABLED": "0",
+    # v4 binary remains a temporary shadow source; it no longer removes chunks.
     "CUEQC_DROP_THRESHOLD": "0.85",
-    # 1 = actually remove model-confirmed drop candidates before subtitle timing;
-    # 0 = record shadow only (audit), keep all candidates.
-    "CUEQC_DROP_APPLY_ENABLED": "1",
     "CUEQC_DEVICE": "auto",
     # Optional JSONL export path for cluster-first audit candidates.
     "CUEQC_EXPORT_CANDIDATES_PATH": "",

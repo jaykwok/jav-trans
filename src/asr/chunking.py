@@ -6,7 +6,6 @@ from pathlib import Path
 from typing import Callable
 
 
-_ASR_CHUNK_MIN_DURATION_S = float(os.getenv("ASR_CHUNK_MIN_DURATION_S", "0.08"))
 _KEEP_ASR_CHUNKS = os.getenv("KEEP_ASR_CHUNKS", "").strip().lower() in {
     "1",
     "true",
@@ -43,13 +42,12 @@ def _extract_wav_chunks(
         params = reader.getparams()
         frame_rate = reader.getframerate()
         total_frames = reader.getnframes()
-        min_chunk_frames = max(1, int(_ASR_CHUNK_MIN_DURATION_S * frame_rate))
         valid_spans: list[tuple[int, int, int, float, float]] = []
 
         for span_index, (start, end) in enumerate(spans):
-            start_frame = max(0, int(start * frame_rate))
-            end_frame = min(total_frames, int(end * frame_rate))
-            if end_frame - start_frame < min_chunk_frames:
+            start_frame = min(total_frames, max(0, int(start * frame_rate)))
+            end_frame = min(total_frames, max(0, int(end * frame_rate)))
+            if end_frame <= start_frame:
                 continue
             valid_spans.append(
                 (

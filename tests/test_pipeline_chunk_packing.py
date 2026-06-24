@@ -341,6 +341,17 @@ def test_boundary_planner_emits_one_asr_chunk_per_speech_island(monkeypatch, tmp
     assert any("[chunk] idx=0" in entry and "speech_segment_count=1" in entry for entry in log)
 
 
+def test_pipeline_persists_pre_asr_candidates_before_transcription(monkeypatch, tmp_path):
+    backend, _segments, _log, details = _run_transcription(monkeypatch, tmp_path)
+
+    candidates = details["pre_asr_candidates"]
+    assert len(candidates) == len(backend.audio_paths)
+    assert candidates[0]["sample_id"] == "preasr-source_boundary-chunk00000"
+    assert candidates[0]["video_id"] == "source_boundary"
+    assert candidates[0]["feature_names"]
+    assert "text" not in " ".join(candidates[0]["feature_names"]).lower()
+
+
 def test_empty_allowed_boundary_does_not_fallback_to_full_audio(monkeypatch, tmp_path):
     asr = _reload_pipeline(monkeypatch, tmp_path)
     source = tmp_path / "source_empty_allowed.wav"
@@ -438,7 +449,7 @@ def test_packed_chunk_metadata_uses_source_span_index_after_short_chunk_drop():
     assert any("speech_segment_count=2" in entry and "source=cut" in entry for entry in log)
 
 
-def test_alignment_fallback_window_metadata_uses_speech_core():
+def test_alignment_window_metadata_uses_chunk_span():
     from asr import pipeline as asr
 
     chunk = {
@@ -454,11 +465,12 @@ def test_alignment_fallback_window_metadata_uses_speech_core():
         "log": [],
     }
 
-    annotated = asr._with_alignment_fallback_window(chunk, text_result)
+    annotated = asr._with_alignment_window(chunk, text_result)
 
-    assert annotated["alignment_fallback_start_s"] == 0.0
-    assert annotated["alignment_fallback_end_s"] == 10.0
-    assert annotated["alignment_fallback_source"] == "chunk"
+    assert annotated["alignment_window_start_s"] == 0.0
+    assert annotated["alignment_window_end_s"] == 10.0
+    assert annotated["alignment_window_source"] == "chunk"
+    assert "alignment_fallback_start_s" not in annotated
 
 
 def test_alignment_outcome_metadata_is_written_to_chunks_and_segments():
@@ -509,8 +521,10 @@ def test_alignment_outcome_metadata_is_written_to_chunks_and_segments():
     assert outcome["alignment_quality"] == "boundary"
     assert outcome["alignment_mode"] == "boundary_proportional"
     assert transcript[0]["alignment_quality"] == "boundary"
-    assert transcript[0]["fallback_subtype"] == "none"
+    assert transcript[0]["alignment_issue_subtype"] == "none"
+    assert "fallback_subtype" not in transcript[0]
     assert segments[0]["alignment_quality"] == "boundary"
+    assert segments[0]["alignment_issue_subtype"] == "none"
     assert segments[0]["source_chunk_indices"] == [4]
 
 

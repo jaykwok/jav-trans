@@ -235,7 +235,7 @@ def compute_quality_report(
     segments: list[dict],
     video_duration_s: float,
     glossary_pairs: list[tuple],
-    alignment_fallback_count: int,
+    alignment_issue_count: int,
     total_segments: int,
     asr_generation: dict | None = None,
 ) -> dict:
@@ -248,7 +248,7 @@ def compute_quality_report(
     overlap_stats = _subtitle_overlap_stats(segments)
     duration_stats = _subtitle_duration_stats(segments)
     density_stats = _subtitle_density_audit_stats(segments)
-    alignment_fallback_total = max(int(total_segments or 0), 0)
+    alignment_issue_total = max(int(total_segments or 0), 0)
 
     n = len(segments)
     if n == 0:
@@ -265,9 +265,9 @@ def compute_quality_report(
             "short_segment_ratio": 0.0,
             "per_min_subtitle_count": 0.0,
             "glossary_hit_rate": None,
-            "alignment_fallback_count": alignment_fallback_count,
-            "alignment_fallback_total": alignment_fallback_total,
-            "alignment_fallback_ratio": 0.0,
+            "alignment_issue_count": alignment_issue_count,
+            "alignment_issue_total": alignment_issue_total,
+            "alignment_issue_ratio": 0.0,
             "asr_generation_error_count": asr_generation_error_count,
             "asr_generation_overflow_count": asr_generation_overflow_count,
             "asr_timeout_count": asr_timeout_count,
@@ -325,8 +325,8 @@ def compute_quality_report(
                         hits += 1
         glossary_hit_rate = (hits / checks) if checks > 0 else None
 
-    # 7. Subtitle timing fallback observation. Field names stay stable for reports.
-    alignment_fallback_ratio = alignment_fallback_count / max(alignment_fallback_total, 1)
+    # 7. Subtitle timing/alignment issue observation.
+    alignment_issue_ratio = alignment_issue_count / max(alignment_issue_total, 1)
 
     # Threshold checks
     warnings: list[str] = []
@@ -371,9 +371,9 @@ def compute_quality_report(
         "short_segment_ratio": short_segment_ratio,
         "per_min_subtitle_count": round(per_min_subtitle_count, 2),
         "glossary_hit_rate": glossary_hit_rate,
-        "alignment_fallback_count": alignment_fallback_count,
-        "alignment_fallback_total": alignment_fallback_total,
-        "alignment_fallback_ratio": alignment_fallback_ratio,
+        "alignment_issue_count": alignment_issue_count,
+        "alignment_issue_total": alignment_issue_total,
+        "alignment_issue_ratio": alignment_issue_ratio,
         "asr_generation_error_count": asr_generation_error_count,
         "asr_generation_overflow_count": asr_generation_overflow_count,
         "asr_timeout_count": asr_timeout_count,

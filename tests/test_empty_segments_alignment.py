@@ -71,9 +71,9 @@ def test_qwen_finalize_uses_boundary_chunk_timeline(monkeypatch):
                 "duration": 10.0,
                 "language": "Japanese",
                 "normalized_path": "missing.wav",
-                "alignment_fallback_start_s": 2.0,
-                "alignment_fallback_end_s": 8.0,
-                "alignment_fallback_source": "speech_core",
+                "alignment_window_start_s": 2.0,
+                "alignment_window_end_s": 8.0,
+                "alignment_window_source": "speech_core",
                 "log": [],
             }
         ]

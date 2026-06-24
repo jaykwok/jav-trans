@@ -35,18 +35,32 @@ from boundary.ja import (  # noqa: E402
 )
 
 
-DATASET_SCHEMA = "speech_boundary_ja_scorer_v4_native_dataset"
+DATASET_SCHEMA = "speech_boundary_ja_scorer_v5_native_dataset"
 DEFAULT_SOURCE_SPECS = (
     "anime_nsfw=40=datasets/train/boundary-sources/japanese-anime-speech-v2-nsfw-60k/hf_audio_manifest.json",
     "anime_sfw=40=datasets/train/boundary-sources/japanese-anime-speech-v2-sfw-40k/hf_audio_manifest.json",
     "galgame=20=datasets/train/boundary-sources/galgame-asr-100k-ogg/manifest.jsonl",
 )
+MIX_KEYS = (
+    "long_speech_chain",
+    "positive_speech_timeline",
+    "pure_hard_negative",
+    "mixed_contrast",
+    "split_stress",
+)
 DEFAULT_MIX = {
+    "long_speech_chain": 0.0,
     "positive_speech_timeline": 0.40,
     "pure_hard_negative": 0.25,
     "mixed_contrast": 0.20,
     "split_stress": 0.15,
 }
+LONG_CHAIN_GAP_BUCKETS = (
+    ("touch", 0.0, 0.0),
+    ("micro_20_80ms", 0.02, 0.08),
+    ("short_80_250ms", 0.08, 0.25),
+    ("medium_250_600ms", 0.25, 0.60),
+)
 SAMPLE_RATE = 16000
 
 
@@ -121,6 +135,15 @@ def row_float(row: Mapping[str, Any], key: str, default: float = 0.0) -> float:
         return float(row.get(key, default) or default)
     except (TypeError, ValueError):
         return float(default)
+
+
+def row_str_list(row: Mapping[str, Any], key: str) -> list[str]:
+    raw = row.get(key) or []
+    if isinstance(raw, str):
+        return [part.strip() for part in raw.split(",") if part.strip()]
+    if isinstance(raw, (list, tuple)):
+        return [str(item) for item in raw if str(item).strip()]
+    return []
 
 
 def candidate_rows(
@@ -240,6 +263,27 @@ def allocate_counts(count: int, weights: Mapping[str, float]) -> dict[str, int]:
     return allocated
 
 
+def scorer_mix_from_args(args: argparse.Namespace) -> dict[str, float]:
+    mix = dict(DEFAULT_MIX)
+    for raw in getattr(args, "type_mix", []) or []:
+        name, sep, value = str(raw).partition("=")
+        if not sep:
+            raise ValueError(f"--type-mix must be name=weight, got: {raw!r}")
+        name = name.strip()
+        if name not in MIX_KEYS:
+            raise ValueError(f"unknown --type-mix name {name!r}; expected one of {', '.join(MIX_KEYS)}")
+        try:
+            weight = float(value)
+        except ValueError as exc:
+            raise ValueError(f"--type-mix weight must be numeric, got: {raw!r}") from exc
+        if weight < 0.0:
+            raise ValueError(f"--type-mix weight must be non-negative, got: {raw!r}")
+        mix[name] = weight
+    if sum(mix.values()) <= 0.0:
+        raise ValueError("at least one scorer type mix weight must be positive")
+    return {name: float(mix.get(name, 0.0)) for name in MIX_KEYS}
+
+
 def choose_source_row(
     groups: Sequence[tuple[str, float, list[dict[str, Any]], Path]],
     rng: random.Random,
@@ -335,6 +379,10 @@ def load_or_synthesize_negative(
                     "negative_audio_path": repo_display_path(audio_path),
                     "negative_manifest": str(row.get("_manifest") or ""),
                     "negative_offset_s": start / SAMPLE_RATE,
+                    "negative_source_label": str(row.get("source") or row.get("negative_source") or ""),
+                    "negative_reason": str(row.get("reason") or row.get("manual_reason") or ""),
+                    "negative_reason_tags": row_str_list(row, "reason_tags"),
+                    "negative_audit_label": str(row.get("audit_label") or row.get("manual_label") or ""),
                 }
             except Exception as exc:
                 errors.append(str(exc))
@@ -504,7 +552,7 @@ def base_metadata(
         "negative_source": dict(negative_source or {}),
         "speech_label_dilation_s": args.speech_label_dilation_s,
         "split_boundary_radius_frames": args.split_boundary_radius_frames,
-        "drop_policy": "drop_gap_only_clear_non_speech_not_split",
+        "negative_policy": "speech_negative_only_pre_asr_cueqc_handles_drop",
         "head_frame_weights_policy": "base_frame_weights_times_optional_head_frame_weights",
         "seed": args.seed,
         "created_at": datetime.now().isoformat(timespec="seconds"),
@@ -523,7 +571,7 @@ def build_positive_example(
     row = choose_source_row(source_groups, rng)
     audio, detail = load_clip(row, rng=rng, min_speech_s=args.min_speech_s, max_speech_s=args.max_speech_s)
     duration_s = len(audio) / SAMPLE_RATE
-    audio_id = f"scorer-v4native-pos-{index:06d}"
+    audio_id = f"scorer-v5native-pos-{index:06d}"
     segment = TeacherSegment(0.0, duration_s, score=1.0)
     metadata = base_metadata(
         example_type="positive_speech_timeline",
@@ -537,12 +585,11 @@ def build_positive_example(
         {
             "actual_speech_segments": [{"start": 0.0, "end": duration_s}],
             "cut_point_segments": [],
-            "cut_drop_zones": [],
         }
     )
     record = build_record(
         audio_id=audio_id,
-        source="speech_boundary_ja_scorer_v4_native:positive_speech_timeline",
+        source="speech_boundary_ja_scorer_v5_native:positive_speech_timeline",
         duration_s=duration_s,
         text=str(detail.get("source_text") or ""),
         speech_segments=[segment],
@@ -571,7 +618,7 @@ def build_pure_negative_example(
         noise_rms=args.noise_rms,
     )
     duration_s = len(audio) / SAMPLE_RATE
-    audio_id = f"scorer-v4native-neg-{index:06d}"
+    audio_id = f"scorer-v5native-neg-{index:06d}"
     source_id = str(negative_detail.get("negative_audio_id") or audio_id)
     source_partition = str(negative_detail.get("negative_partition") or partition_for_source_id(source_id))
     metadata = base_metadata(
@@ -586,12 +633,11 @@ def build_pure_negative_example(
         {
             "actual_speech_segments": [],
             "cut_point_segments": [],
-            "cut_drop_zones": [{"start": 0.0, "end": duration_s, "reason": "pure_hard_negative"}],
         }
     )
     record = build_record(
         audio_id=audio_id,
-        source="speech_boundary_ja_scorer_v4_native:pure_hard_negative",
+        source="speech_boundary_ja_scorer_v5_native:pure_hard_negative",
         duration_s=duration_s,
         text="",
         speech_segments=[],
@@ -637,7 +683,7 @@ def build_mixed_contrast_example(
     duration_s = len(mixed) / SAMPLE_RATE
     start_s = lead_samples / SAMPLE_RATE
     end_s = (lead_samples + len(speech)) / SAMPLE_RATE
-    audio_id = f"scorer-v4native-mixed-{index:06d}"
+    audio_id = f"scorer-v5native-mixed-{index:06d}"
     source_audio_ids = [str(detail["source_audio_id"])]
     if negative_detail.get("negative_audio_id"):
         source_audio_ids.append(str(negative_detail["negative_audio_id"]))
@@ -649,28 +695,15 @@ def build_mixed_contrast_example(
         source_mix={"speech": [detail], "snr_db": snr_db},
         negative_source=negative_detail,
     )
-    drop_margin_s = max(float(args.frame_hop_s), 0.0)
     metadata.update(
         {
             "actual_speech_segments": [{"start": start_s, "end": end_s}],
             "cut_point_segments": [],
-            "cut_drop_zones": [
-                {
-                    "start": 0.0,
-                    "end": max(0.0, start_s - drop_margin_s),
-                    "reason": "leading_non_speech_background",
-                },
-                {
-                    "start": min(duration_s, end_s + drop_margin_s),
-                    "end": duration_s,
-                    "reason": "trailing_non_speech_background",
-                },
-            ],
         }
     )
     record = build_record(
         audio_id=audio_id,
-        source="speech_boundary_ja_scorer_v4_native:mixed_contrast",
+        source="speech_boundary_ja_scorer_v5_native:mixed_contrast",
         duration_s=duration_s,
         text=str(detail.get("source_text") or ""),
         speech_segments=[TeacherSegment(start_s, end_s, score=1.0)],
@@ -679,6 +712,161 @@ def build_mixed_contrast_example(
         metadata=metadata,
     )
     return normalize_peak(mixed), record, {"speech": detail, "negative": negative_detail, "snr_db": snr_db}
+
+
+def sample_long_chain_gap(
+    *,
+    example_index: int,
+    boundary_index: int,
+    rng: random.Random,
+) -> tuple[str, float]:
+    bucket_name, min_s, max_s = LONG_CHAIN_GAP_BUCKETS[
+        (int(example_index) + int(boundary_index)) % len(LONG_CHAIN_GAP_BUCKETS)
+    ]
+    if max_s <= 0.0:
+        return bucket_name, 0.0
+    return bucket_name, rng.uniform(min_s, max_s)
+
+
+def build_long_speech_chain_example(
+    *,
+    index: int,
+    source_groups: Sequence[tuple[str, float, list[dict[str, Any]], Path]],
+    negative_rows: Sequence[Mapping[str, Any]],
+    args: argparse.Namespace,
+    rng: random.Random,
+    np_rng: np.random.Generator,
+) -> tuple[np.ndarray, LabelRecord, dict[str, Any]]:
+    utterance_target = rng.randint(args.long_chain_utterances_min, args.long_chain_utterances_max)
+    target_duration_s = rng.uniform(args.long_chain_min_duration_s, args.long_chain_max_duration_s)
+    parts: list[np.ndarray] = []
+    details: list[dict[str, Any]] = []
+    speech_segments: list[TeacherSegment] = []
+    cut_points: list[dict[str, Any]] = []
+    negative_details: list[dict[str, Any]] = []
+    gap_bucket_counts: Counter[str] = Counter()
+    cursor = 0
+    source_partition: str | None = None
+    previous_detail: dict[str, Any] | None = None
+
+    while True:
+        clip_index = len(details)
+        row = choose_source_row(source_groups, rng, source_partition=source_partition)
+        speech, detail = load_clip(
+            row,
+            rng=rng,
+            min_speech_s=args.min_speech_s,
+            max_speech_s=args.split_max_speech_s,
+        )
+        if source_partition is None:
+            source_partition = str(detail["source_partition"])
+        start_s = cursor / SAMPLE_RATE
+        parts.append(speech)
+        cursor += len(speech)
+        end_s = cursor / SAMPLE_RATE
+        speech_segments.append(TeacherSegment(start_s, end_s, score=1.0))
+        details.append(detail)
+
+        duration_s = cursor / SAMPLE_RATE
+        minimum_ready = (
+            len(details) >= args.long_chain_utterances_min
+            and duration_s >= args.long_chain_min_duration_s
+        )
+        if minimum_ready and (len(details) >= utterance_target or duration_s >= target_duration_s):
+            break
+        if len(details) >= args.long_chain_utterances_max or duration_s >= args.long_chain_max_duration_s:
+            break
+
+        bucket_name, gap_s = sample_long_chain_gap(
+            example_index=index,
+            boundary_index=clip_index,
+            rng=rng,
+        )
+        gap_start_s = cursor / SAMPLE_RATE
+        gap_samples = int(round(gap_s * SAMPLE_RATE))
+        gap_end_s = (cursor + gap_samples) / SAMPLE_RATE
+        gap_bucket_counts[bucket_name] += 1
+        cut_points.append(
+            {
+                "time_s": (gap_start_s + gap_end_s) / 2.0,
+                "start": gap_start_s,
+                "end": gap_end_s,
+                "reason": "long_speech_chain_utterance_boundary",
+                "gap_s": gap_s,
+                "gap_bucket": bucket_name,
+                "left_source_audio_id": detail.get("source_audio_id"),
+                "right_source_pending": True,
+                "source_switch": bool(
+                    previous_detail
+                    and previous_detail.get("source_audio_id") != detail.get("source_audio_id")
+                ),
+            }
+        )
+        if gap_samples > 0:
+            gap_audio, negative_detail = load_or_synthesize_negative(
+                negative_rows,
+                samples=gap_samples,
+                rng=rng,
+                np_rng=np_rng,
+                noise_rms=args.noise_rms,
+                source_partition=source_partition,
+            )
+            parts.append(gap_audio)
+            negative_details.append({**negative_detail, "gap_bucket": bucket_name})
+            cursor += gap_samples
+        previous_detail = detail
+
+    for boundary_index, point in enumerate(cut_points):
+        if boundary_index + 1 < len(details):
+            point["right_source_audio_id"] = details[boundary_index + 1].get("source_audio_id")
+            point["source_switch"] = (
+                details[boundary_index].get("source_audio_id")
+                != details[boundary_index + 1].get("source_audio_id")
+            )
+        point.pop("right_source_pending", None)
+
+    audio = np.concatenate(parts).astype(np.float32, copy=False) if parts else np.zeros(1, dtype=np.float32)
+    duration_s = len(audio) / SAMPLE_RATE
+    audio_id = f"scorer-v5native-longchain-{index:06d}"
+    source_partition = source_partition or partition_for_source_id(audio_id)
+    source_audio_ids = [str(item.get("source_audio_id") or "") for item in details]
+    source_audio_ids.extend(
+        str(item.get("negative_audio_id") or "") for item in negative_details if item.get("negative_audio_id")
+    )
+    metadata = base_metadata(
+        example_type="long_speech_chain",
+        args=args,
+        source_audio_ids=source_audio_ids,
+        source_partition=source_partition,
+        source_mix={
+            "speech": details,
+            "utterance_count": len(details),
+            "target_duration_s": target_duration_s,
+            "gap_bucket_counts": dict(sorted(gap_bucket_counts.items())),
+        },
+        negative_source={"gap_negative_sources": negative_details},
+    )
+    metadata.update(
+        {
+            "actual_speech_segments": [
+                {"start": segment.start, "end": segment.end} for segment in speech_segments
+            ],
+            "utterance_boundaries": list(cut_points),
+            "cut_point_segments": list(cut_points),
+            "disable_implicit_gap_drop": True,
+        }
+    )
+    record = build_record(
+        audio_id=audio_id,
+        source="speech_boundary_ja_scorer_v5_native:long_speech_chain",
+        duration_s=duration_s,
+        text=" ".join(str(item.get("source_text") or "") for item in details if item.get("source_text")),
+        speech_segments=speech_segments,
+        frame_hop_s=args.frame_hop_s,
+        speech_label_dilation_s=args.speech_label_dilation_s,
+        metadata=metadata,
+    )
+    return normalize_peak(audio), record, {"speech": details, "negative": negative_details}
 
 
 def build_split_stress_example(
@@ -741,7 +929,7 @@ def build_split_stress_example(
             cursor += gap_samples
     audio = np.concatenate(parts).astype(np.float32, copy=False) if parts else np.zeros(1, dtype=np.float32)
     duration_s = len(audio) / SAMPLE_RATE
-    audio_id = f"scorer-v4native-split-{index:06d}"
+    audio_id = f"scorer-v5native-split-{index:06d}"
     source_partition = source_partition or partition_for_source_id(audio_id)
     source_audio_ids = [str(item.get("source_audio_id") or "") for item in details]
     source_audio_ids.extend(
@@ -762,12 +950,12 @@ def build_split_stress_example(
             ],
             "utterance_boundaries": list(cut_points),
             "cut_point_segments": list(cut_points),
-            "cut_drop_zones": [],
+            "disable_implicit_gap_drop": True,
         }
     )
     record = build_record(
         audio_id=audio_id,
-        source="speech_boundary_ja_scorer_v4_native:split_stress",
+        source="speech_boundary_ja_scorer_v5_native:split_stress",
         duration_s=duration_s,
         text=" ".join(str(item.get("source_text") or "") for item in details if item.get("source_text")),
         speech_segments=speech_segments,
@@ -778,7 +966,7 @@ def build_split_stress_example(
     return normalize_peak(audio), record, {"speech": details, "negative": negative_details}
 
 
-def build_scorer_v4_native_dataset(
+def build_scorer_v5_native_dataset(
     *,
     source_specs: Sequence[str],
     negative_manifests: Sequence[str],
@@ -795,7 +983,8 @@ def build_scorer_v4_native_dataset(
         max_duration_s=args.source_max_duration_s,
     )
     negative_rows, negative_skipped = load_negative_rows(negative_manifests)
-    counts = allocate_counts(count, DEFAULT_MIX)
+    mix_weights = scorer_mix_from_args(args)
+    counts = allocate_counts(count, mix_weights)
 
     output_dir = output_dir.resolve()
     audio_dir = output_dir / "audio"
@@ -805,15 +994,25 @@ def build_scorer_v4_native_dataset(
     detail_rows: list[dict[str, Any]] = []
     split_rows: dict[str, list[int]] = {"train": [], "val": [], "test": []}
     example_builders = (
-        ("positive_speech_timeline", counts["positive_speech_timeline"]),
-        ("pure_hard_negative", counts["pure_hard_negative"]),
-        ("mixed_contrast", counts["mixed_contrast"]),
-        ("split_stress", counts["split_stress"]),
+        ("long_speech_chain", counts.get("long_speech_chain", 0)),
+        ("split_stress", counts.get("split_stress", 0)),
+        ("mixed_contrast", counts.get("mixed_contrast", 0)),
+        ("pure_hard_negative", counts.get("pure_hard_negative", 0)),
+        ("positive_speech_timeline", counts.get("positive_speech_timeline", 0)),
     )
     output_index = 0
     for example_type, type_count in example_builders:
         for _local_index in range(type_count):
-            if example_type == "positive_speech_timeline":
+            if example_type == "long_speech_chain":
+                audio, record, detail = build_long_speech_chain_example(
+                    index=output_index,
+                    source_groups=source_groups,
+                    negative_rows=negative_rows,
+                    args=args,
+                    rng=rng,
+                    np_rng=np_rng,
+                )
+            elif example_type == "positive_speech_timeline":
                 audio, record, detail = build_positive_example(
                     index=output_index,
                     source_groups=source_groups,
@@ -891,12 +1090,12 @@ def build_scorer_v4_native_dataset(
         partition = str((record.boundary_metadata or {}).get("source_partition") or "train")
         split_rows.setdefault(partition, []).append(index)
 
-    labels_path = output_dir / "scorer_v4_native_labels.jsonl"
-    manifest_path = output_dir / "scorer_v4_native_manifest.json"
-    training_manifest_path = output_dir / "scorer_v4_native_training_manifest.jsonl"
-    details_path = output_dir / "scorer_v4_native_details.jsonl"
-    splits_path = output_dir / "scorer_v4_native_splits.json"
-    skipped_path = output_dir / "scorer_v4_native_skipped.json"
+    labels_path = output_dir / "scorer_v5_native_labels.jsonl"
+    manifest_path = output_dir / "scorer_v5_native_manifest.json"
+    training_manifest_path = output_dir / "scorer_v5_native_training_manifest.jsonl"
+    details_path = output_dir / "scorer_v5_native_details.jsonl"
+    splits_path = output_dir / "scorer_v5_native_splits.json"
+    skipped_path = output_dir / "scorer_v5_native_skipped.json"
     summary_path = output_dir / "summary.json"
     summary_md_path = output_dir / "summary.md"
 
@@ -923,20 +1122,22 @@ def build_scorer_v4_native_dataset(
 
     total_frames = sum(len(record.speech_frames) for record in records)
     speech_frames = sum(sum(int(value) for value in record.speech_frames) for record in records)
-    drop_frame_count = 0
     split_point_count = 0
+    long_chain_gap_bucket_counts: Counter[str] = Counter()
+    long_chain_utterance_counts: list[int] = []
+    long_chain_durations: list[float] = []
     for record in records:
         metadata = dict(record.boundary_metadata or {})
-        for zone in metadata.get("cut_drop_zones") or []:
-            try:
-                drop_frame_count += max(
-                    0,
-                    int(math.ceil(float(zone["end"]) / record.frame_hop_s))
-                    - int(math.floor(float(zone["start"]) / record.frame_hop_s)),
-                )
-            except (KeyError, TypeError, ValueError):
-                continue
         split_point_count += len(metadata.get("cut_point_segments") or [])
+        if metadata.get("native_example_type") == "long_speech_chain":
+            long_chain_durations.append(float(record.duration_s))
+            actual_segments = list(metadata.get("actual_speech_segments") or [])
+            long_chain_utterance_counts.append(len(actual_segments))
+            for point in metadata.get("cut_point_segments") or []:
+                if isinstance(point, Mapping):
+                    bucket = str(point.get("gap_bucket") or "")
+                    if bucket:
+                        long_chain_gap_bucket_counts[bucket] += 1
     summary = {
         "schema": DATASET_SCHEMA,
         "created_at": datetime.now().isoformat(timespec="seconds"),
@@ -961,8 +1162,12 @@ def build_scorer_v4_native_dataset(
         "frame_count": total_frames,
         "speech_frame_count": speech_frames,
         "speech_frame_ratio": speech_frames / total_frames if total_frames else 0.0,
-        "drop_gap_labeled_frame_estimate": drop_frame_count,
         "split_point_count": split_point_count,
+        "long_chain_gap_bucket_counts": dict(sorted(long_chain_gap_bucket_counts.items())),
+        "long_chain_utterance_count_min": min(long_chain_utterance_counts) if long_chain_utterance_counts else 0,
+        "long_chain_utterance_count_max": max(long_chain_utterance_counts) if long_chain_utterance_counts else 0,
+        "long_chain_duration_s_min": min(long_chain_durations) if long_chain_durations else 0.0,
+        "long_chain_duration_s_max": max(long_chain_durations) if long_chain_durations else 0.0,
         "training_examples": len(examples),
         "source_rows_skipped": len(source_skipped),
         "negative_rows": len(negative_rows),
@@ -974,7 +1179,7 @@ def build_scorer_v4_native_dataset(
         "splits": repo_display_path(splits_path),
         "skipped": repo_display_path(skipped_path),
         "config": {
-            "mix": dict(DEFAULT_MIX),
+            "mix": dict(mix_weights),
             "frame_hop_s": args.frame_hop_s,
             "speech_label_dilation_s": args.speech_label_dilation_s,
             "split_boundary_radius_frames": args.split_boundary_radius_frames,
@@ -989,6 +1194,14 @@ def build_scorer_v4_native_dataset(
             "mixed_snr_db_max": args.mixed_snr_db_max,
             "short_gap_max_s": args.short_gap_max_s,
             "touch_gap_prob": args.touch_gap_prob,
+            "long_chain_gap_buckets": [
+                {"name": name, "min_s": min_s, "max_s": max_s}
+                for name, min_s, max_s in LONG_CHAIN_GAP_BUCKETS
+            ],
+            "long_chain_utterances_min": args.long_chain_utterances_min,
+            "long_chain_utterances_max": args.long_chain_utterances_max,
+            "long_chain_min_duration_s": args.long_chain_min_duration_s,
+            "long_chain_max_duration_s": args.long_chain_max_duration_s,
         },
     }
     write_json(summary_path, summary)
@@ -998,7 +1211,7 @@ def build_scorer_v4_native_dataset(
 
 def render_markdown(summary: Mapping[str, Any]) -> str:
     lines = [
-        "# SpeechBoundary-JA Scorer v4 Native Dataset",
+        "# SpeechBoundary-JA Scorer v5 Native Dataset",
         "",
         f"- Output: `{summary['output_dir']}`",
         f"- Schema: `{summary['schema']}`",
@@ -1019,8 +1232,7 @@ def render_markdown(summary: Mapping[str, Any]) -> str:
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Build a SpeechBoundary-JA scorer v4-native dataset with separate speech, split_boundary "
-            "and drop_gap semantics."
+            "Build a SpeechBoundary-JA scorer v5-native dataset with speech and split_boundary labels."
         )
     )
     parser.add_argument(
@@ -1030,6 +1242,16 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="name=weight=manifest_path. Defaults keep anime NSFW:SFW at 1:1 plus galgame.",
     )
     parser.add_argument("--negative-manifest", action="append", default=[])
+    parser.add_argument(
+        "--type-mix",
+        action="append",
+        default=[],
+        help=(
+            "Override scorer example mix as name=weight. Valid names: "
+            "long_speech_chain, positive_speech_timeline, pure_hard_negative, "
+            "mixed_contrast, split_stress."
+        ),
+    )
     parser.add_argument("--count", type=int, default=4096)
     parser.add_argument("--seed", type=int, default=260623)
     parser.add_argument("--asr-repo-id", default=QWEN_ASR_17B_REPO_ID)
@@ -1051,11 +1273,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--touch-gap-prob", type=float, default=0.35)
     parser.add_argument("--split-clips-min", type=int, default=2)
     parser.add_argument("--split-clips-max", type=int, default=4)
+    parser.add_argument("--long-chain-utterances-min", type=int, default=6)
+    parser.add_argument("--long-chain-utterances-max", type=int, default=20)
+    parser.add_argument("--long-chain-min-duration-s", type=float, default=10.0)
+    parser.add_argument("--long-chain-max-duration-s", type=float, default=40.0)
     parser.add_argument("--noise-rms", type=float, default=0.015)
     parser.add_argument(
         "--output-dir",
         default="",
-        help="Defaults to agents/temp/YYYYMMDD_HHMMSS_scorer-v4-native-4096.",
+        help="Defaults to agents/temp/YYYYMMDD_HHMMSS_scorer-v5-native-4096.",
     )
     args = parser.parse_args(argv)
     if args.count <= 0:
@@ -1075,6 +1301,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "context_gap_max_s",
         "short_gap_max_s",
         "touch_gap_prob",
+        "long_chain_min_duration_s",
+        "long_chain_max_duration_s",
         "noise_rms",
     ):
         if float(getattr(args, name)) < 0.0:
@@ -1093,6 +1321,16 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         parser.error("--split-clips-min must be >= 2")
     if args.split_clips_max < args.split_clips_min:
         parser.error("--split-clips-max must be >= --split-clips-min")
+    if args.long_chain_utterances_min < 6:
+        parser.error("--long-chain-utterances-min must be >= 6")
+    if args.long_chain_utterances_max < args.long_chain_utterances_min:
+        parser.error("--long-chain-utterances-max must be >= --long-chain-utterances-min")
+    if args.long_chain_max_duration_s < args.long_chain_min_duration_s:
+        parser.error("--long-chain-max-duration-s must be >= --long-chain-min-duration-s")
+    try:
+        scorer_mix_from_args(args)
+    except ValueError as exc:
+        parser.error(str(exc))
     return args
 
 
@@ -1101,9 +1339,9 @@ def main(argv: list[str] | None = None) -> int:
     output_dir = (
         project_path(args.output_dir)
         if args.output_dir
-        else PROJECT_ROOT / "agents" / "temp" / f"{local_timestamp()}_scorer-v4-native-{args.count}"
+        else PROJECT_ROOT / "agents" / "temp" / f"{local_timestamp()}_scorer-v5-native-{args.count}"
     )
-    summary = build_scorer_v4_native_dataset(
+    summary = build_scorer_v5_native_dataset(
         source_specs=args.source or DEFAULT_SOURCE_SPECS,
         negative_manifests=args.negative_manifest,
         output_dir=output_dir,
@@ -1126,3 +1364,4 @@ def main(argv: list[str] | None = None) -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+

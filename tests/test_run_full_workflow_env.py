@@ -1,4 +1,5 @@
 import re
+import json
 
 from tools.workflows import run_full_workflow
 
@@ -23,10 +24,10 @@ def test_run_full_workflow_operating_point_uses_opt_in_scorer_metadata():
     results = [
         {
             "boundary_signature": {
-                "operating_point": "qwen-mamba2-frame-boundary-scorer-v4",
+                "operating_point": "qwen-mamba2-frame-boundary-scorer-v5",
                 "scorer_checkpoint": {
-                    "schema": "speech_boundary_ja_mamba2_frame_boundary_scorer_v4",
-                    "metadata": {"operating_point": "qwen-mamba2-frame-boundary-scorer-synthetic-v3"},
+                    "schema": "speech_boundary_ja_mamba2_frame_boundary_scorer_v5",
+                    "metadata": {"operating_point": "qwen-mamba2-frame-boundary-scorer-v5-native"},
                 },
             }
         }
@@ -34,32 +35,33 @@ def test_run_full_workflow_operating_point_uses_opt_in_scorer_metadata():
 
     assert (
         run_full_workflow.speech_boundary_operating_point(results)
-        == "qwen-mamba2-frame-boundary-scorer-synthetic-v3"
+        == "qwen-mamba2-frame-boundary-scorer-v5-native"
     )
 
 
 def test_run_full_workflow_operating_point_defaults_without_scorer():
-    assert run_full_workflow.speech_boundary_operating_point([]) == "qwen-mamba2-frame-boundary-scorer-v4"
+    assert run_full_workflow.speech_boundary_operating_point([]) == "qwen-mamba2-frame-boundary-scorer-v5"
     assert (
         run_full_workflow.speech_boundary_operating_point(
-            [{"boundary_signature": {"operating_point": "qwen-mamba2-frame-boundary-scorer-v4"}}]
+            [{"boundary_signature": {"operating_point": "qwen-mamba2-frame-boundary-scorer-v5"}}]
         )
-        == "qwen-mamba2-frame-boundary-scorer-v4"
+        == "qwen-mamba2-frame-boundary-scorer-v5"
     )
 
 
 def test_run_full_workflow_boundary_threshold_defaults_match_training_eval(monkeypatch):
+    monkeypatch.setattr(run_full_workflow, "load_config", lambda: None)
     monkeypatch.delenv("SPEECH_BOUNDARY_JA_THRESHOLD", raising=False)
     monkeypatch.delenv("SPEECH_BOUNDARY_JA_SPEECH_ON_THRESHOLD", raising=False)
     monkeypatch.delenv("SPEECH_BOUNDARY_JA_SPEECH_OFF_THRESHOLD", raising=False)
-    monkeypatch.delenv("SPEECH_BOUNDARY_JA_DROP_GAP_THRESHOLD", raising=False)
+    monkeypatch.delenv("CUEQC_SHADOW_ENABLED", raising=False)
 
     args = run_full_workflow.parse_args(["--video", "sample.mp4"])
 
     assert args.speech_boundary_threshold == 0.5
     assert args.speech_boundary_speech_on_threshold == 0.5
     assert args.speech_boundary_speech_off_threshold == 0.5
-    assert args.speech_boundary_drop_gap_threshold == 0.5
+    assert args.cueqc_shadow_enabled is False
 
 
 def test_run_full_workflow_parse_args_uses_loaded_env(monkeypatch):
@@ -76,12 +78,13 @@ def test_run_full_workflow_parse_args_uses_loaded_env(monkeypatch):
     scorer_mapping = "jaykwok/Qwen3-ASR-0.6B-JA-Anime-Galgame=agents/temp/scorer.pt"
     monkeypatch.setenv("BOUNDARY_REFINER_MODEL_PATH_BY_REPO", boundary_mapping)
     monkeypatch.setenv("CUEQC_MODEL_PATH_BY_REPO", cueqc_mapping)
+    monkeypatch.setenv("CUEQC_SHADOW_ENABLED", "0")
     monkeypatch.setenv("SPEECH_BOUNDARY_JA_SCORER_CHECKPOINT_BY_REPO", scorer_mapping)
     monkeypatch.setenv("SPEECH_BOUNDARY_JA_SPLIT_THRESHOLD", "0.6")
-    monkeypatch.setenv("SPEECH_BOUNDARY_JA_SPLIT_TARGET_S", "4.5")
     monkeypatch.setenv("SPEECH_BOUNDARY_JA_SPLIT_SCORE_QUANTILE", "0.4")
     monkeypatch.setenv("SPEECH_BOUNDARY_JA_SPLIT_PROMINENCE_QUANTILE", "0.6")
-    monkeypatch.setenv("SPEECH_BOUNDARY_JA_DROP_GAP_THRESHOLD", "0.8")
+    monkeypatch.setenv("PRE_ASR_CUEQC_ENABLED", "1")
+    monkeypatch.setenv("PRE_ASR_CUEQC_DROP_THRESHOLD", "0.88")
 
     args = run_full_workflow.parse_args(
         [
@@ -99,11 +102,12 @@ def test_run_full_workflow_parse_args_uses_loaded_env(monkeypatch):
     assert args.asr_batch_size == "auto"
     assert args.boundary_refiner_model_path_by_repo == boundary_mapping
     assert args.cueqc_model_path_by_repo == cueqc_mapping
+    assert args.cueqc_shadow_enabled is False
     assert args.speech_boundary_scorer_checkpoint_by_repo == scorer_mapping
-    assert args.speech_boundary_split_target_s == 4.5
     assert args.speech_boundary_split_score_quantile == 0.4
     assert args.speech_boundary_split_prominence_quantile == 0.6
-    assert args.speech_boundary_drop_gap_threshold == 0.8
+    assert args.pre_asr_cueqc_enabled is True
+    assert args.pre_asr_cueqc_drop_threshold == 0.88
     assert args.speech_boundary_speech_on_threshold == args.speech_boundary_threshold
     assert args.speech_boundary_speech_off_threshold == args.speech_boundary_threshold
 
@@ -121,7 +125,7 @@ def test_run_full_workflow_context_carries_boundary_env(monkeypatch, tmp_path):
     monkeypatch.setenv("CUEQC_MODEL_PATH_BY_REPO", cueqc_mapping)
     monkeypatch.setenv("SPEECH_BOUNDARY_JA_SCORER_CHECKPOINT_BY_REPO", scorer_mapping)
     monkeypatch.setenv("BOUNDARY_REFINER_DEVICE", "cpu")
-    monkeypatch.setenv("SPEECH_BOUNDARY_JA_DROP_GAP_THRESHOLD", "0.85")
+    monkeypatch.setenv("PRE_ASR_CUEQC_ENABLED", "1")
 
     args = run_full_workflow.parse_args(
         [
@@ -135,14 +139,13 @@ def test_run_full_workflow_context_carries_boundary_env(monkeypatch, tmp_path):
             "0.7",
             "--speech-boundary-speech-off-threshold",
             "0.5",
-            "--speech-boundary-split-target-s",
-            "4.0",
             "--speech-boundary-split-score-quantile",
             "0.45",
             "--speech-boundary-split-prominence-quantile",
             "0.55",
-            "--speech-boundary-drop-gap-threshold",
+            "--pre-asr-cueqc-drop-threshold",
             "0.9",
+            "--no-cueqc-shadow-enabled",
         ]
     )
     paths = run_full_workflow.RunPaths(
@@ -163,14 +166,15 @@ def test_run_full_workflow_context_carries_boundary_env(monkeypatch, tmp_path):
     assert ctx.advanced["ASR_BATCH_SIZE_BY_REPO"] == batch_table
     assert ctx.advanced["BOUNDARY_REFINER_MODEL_PATH_BY_REPO"] == boundary_mapping
     assert ctx.advanced["CUEQC_MODEL_PATH_BY_REPO"] == cueqc_mapping
+    assert ctx.advanced["CUEQC_SHADOW_ENABLED"] == "0"
     assert ctx.advanced["SPEECH_BOUNDARY_JA_SCORER_CHECKPOINT_BY_REPO"] == scorer_mapping
     assert ctx.advanced["BOUNDARY_REFINER_DEVICE"] == "cpu"
-    assert ctx.advanced["SPEECH_BOUNDARY_JA_SPLIT_TARGET_S"] == "4.0"
     assert ctx.advanced["SPEECH_BOUNDARY_JA_SPLIT_SCORE_QUANTILE"] == "0.45"
     assert ctx.advanced["SPEECH_BOUNDARY_JA_SPLIT_PROMINENCE_QUANTILE"] == "0.55"
     assert "SPEECH_BOUNDARY_JA_SPLIT_THRESHOLD" not in ctx.advanced
     assert "SPEECH_BOUNDARY_JA_SPLIT_PROMINENCE" not in ctx.advanced
-    assert ctx.advanced["SPEECH_BOUNDARY_JA_DROP_GAP_THRESHOLD"] == "0.9"
+    assert ctx.advanced["PRE_ASR_CUEQC_ENABLED"] == "1"
+    assert ctx.advanced["PRE_ASR_CUEQC_DROP_THRESHOLD"] == "0.9"
     assert ctx.advanced["SPEECH_BOUNDARY_JA_SPEECH_ON_THRESHOLD"] == "0.7"
     assert ctx.advanced["SPEECH_BOUNDARY_JA_SPEECH_OFF_THRESHOLD"] == "0.5"
 
@@ -195,18 +199,55 @@ def test_run_full_workflow_cli_batch_overrides_loaded_env(monkeypatch):
             "0.7",
             "--speech-boundary-speech-off-threshold",
             "0.5",
+            "--no-cueqc-shadow-enabled",
         ]
     )
     run_full_workflow.configure_env(args)
 
     assert run_full_workflow.os.environ["ASR_BACKEND"] == "jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame"
     assert run_full_workflow.os.environ["ASR_BATCH_SIZE"] == "12"
+    assert run_full_workflow.os.environ["CUEQC_SHADOW_ENABLED"] == "0"
     assert run_full_workflow.os.environ["SPEECH_BOUNDARY_JA_SPEECH_ON_THRESHOLD"] == "0.7"
     assert run_full_workflow.os.environ["SPEECH_BOUNDARY_JA_SPEECH_OFF_THRESHOLD"] == "0.5"
 
 
-def test_removed_split_threshold_env_is_absent_from_current_runtime_files():
-    removed = ("SPEECH_BOUNDARY_JA_SPLIT_THRESHOLD", "SPEECH_BOUNDARY_JA_SPLIT_PROMINENCE")
+def test_run_full_workflow_summary_uses_shadow_specific_cueqc_keys(tmp_path):
+    args = run_full_workflow.parse_args(
+        [
+            "--video",
+            "sample.mp4",
+            "--pre-asr-cueqc-enabled",
+            "--cueqc-shadow-enabled",
+        ]
+    )
+    paths = run_full_workflow.RunPaths(
+        root=tmp_path,
+        jobs=tmp_path / "jobs",
+        generated=tmp_path / "generated",
+        run_logs=tmp_path / "run-logs",
+        archived=tmp_path / "archived",
+        summary_json=tmp_path / "summary.json",
+        summary_md=tmp_path / "summary.md",
+    )
+    paths.root.mkdir(parents=True, exist_ok=True)
+    results = [{"boundary_signature": {"operating_point": "qwen-mamba2-frame-boundary-scorer-v5"}}]
+
+    run_full_workflow.write_summary(paths, args, results)
+
+    payload = json.loads(paths.summary_json.read_text(encoding="utf-8"))
+    assert payload["pre_asr_cueqc_enabled"] is True
+    assert payload["cueqc_shadow_enabled"] is True
+    assert "cueqc_enabled" not in payload
+    markdown = paths.summary_md.read_text(encoding="utf-8")
+    assert "CueQC shadow" in markdown
+
+
+def test_removed_split_env_is_absent_from_current_runtime_files():
+    removed = (
+        "SPEECH_BOUNDARY_JA_SPLIT_THRESHOLD",
+        "SPEECH_BOUNDARY_JA_SPLIT_PROMINENCE",
+        "SPEECH_BOUNDARY_JA_SPLIT_TARGET_S",
+    )
     checked_paths = [
         run_full_workflow.PROJECT_ROOT / ".env.example",
         run_full_workflow.PROJECT_ROOT / "src" / "boundary" / "cache.py",

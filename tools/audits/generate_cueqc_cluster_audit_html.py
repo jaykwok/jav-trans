@@ -314,7 +314,7 @@ def discover_media(
                             "end": round(end, 3),
                             "text": clean_cue_text(segment.get("text")),
                             "alignment_quality": segment.get("alignment_quality", ""),
-                            "fallback_subtype": segment.get("fallback_subtype", ""),
+                            "alignment_issue_subtype": segment.get("alignment_issue_subtype", ""),
                         }
                     )
 
@@ -337,20 +337,28 @@ def discover_media(
         aligned_by_video[video_id] = aligned_segments
     return media_by_video, cues_by_video, aligned_by_video
 
-def absolute_fallback_range(row: Mapping[str, Any], start: float, end: float) -> tuple[float, float]:
+def absolute_subtitle_window_range(row: Mapping[str, Any], start: float, end: float) -> tuple[float, float]:
     timing = row.get("subtitle_timing")
     if not isinstance(timing, Mapping):
         return start, end
-    rel_start = timing.get("fallback_window_start_s")
-    rel_end = timing.get("fallback_window_end_s")
+    raw_start = timing.get("alignment_window_start_s")
+    raw_end = timing.get("alignment_window_end_s")
     try:
-        fallback_start = start + float(rel_start) if rel_start is not None else start
-        fallback_end = start + float(rel_end) if rel_end is not None else end
+        window_start = float(raw_start) if raw_start is not None else start
+        window_end = float(raw_end) if raw_end is not None else end
     except (TypeError, ValueError):
         return start, end
-    if fallback_end <= fallback_start:
+    if window_end <= window_start:
         return start, end
-    return max(0.0, fallback_start), fallback_end
+    source = str(timing.get("alignment_window_source") or "")
+    looks_absolute = (
+        source == "final_subtitle"
+        or (window_start >= max(0.0, start - 1.0) and window_end <= end + 1.0)
+    )
+    if not looks_absolute:
+        window_start = start + window_start
+        window_end = start + window_end
+    return max(0.0, window_start), window_end
 
 
 def enrich_rows(
@@ -368,9 +376,9 @@ def enrich_rows(
         end = row_float(item, "end")
         if end <= start:
             end = start + max(0.0, row_float(item, "duration_s"))
-        fallback_start, fallback_end = absolute_fallback_range(item, start, end)
-        context_start = max(0.0, min(start, fallback_start) - PREROLL_S)
-        context_end = max(end, fallback_end) + POSTROLL_S
+        subtitle_window_start, subtitle_window_end = absolute_subtitle_window_range(item, start, end)
+        context_start = max(0.0, min(start, subtitle_window_start) - PREROLL_S)
+        context_end = max(end, subtitle_window_end) + POSTROLL_S
         cues = cues_by_video.get(video_id, [])
         aligned_segments = aligned_by_video.get(video_id, [])
         media = dict(media_by_video.get(video_id) or {})
@@ -380,18 +388,68 @@ def enrich_rows(
                 "index": index,
                 "video_label": media.get("video_label", video_id),
                 "media": media,
+                "alignment_issue_type": item.get("alignment_issue_type", ""),
+                "alignment_issue_subtype": item.get("alignment_issue_subtype", ""),
                 "context_start": round(context_start, 3),
                 "context_end": round(context_end, 3),
-                "fallback_window_start": round(fallback_start, 3),
-                "fallback_window_end": round(fallback_end, 3),
+                "subtitle_window_start": round(subtitle_window_start, 3),
+                "subtitle_window_end": round(subtitle_window_end, 3),
                 "chunk_subtitle_cues": cues_for_range(cues, start, end),
-                "fallback_subtitle_cues": cues_for_range(cues, fallback_start, fallback_end),
+                "subtitle_window_cues": cues_for_range(cues, subtitle_window_start, subtitle_window_end),
                 "context_subtitle_cues": cues_for_range(cues, context_start, context_end),
                 "aligned_segments": cues_for_range(aligned_segments, start, end),
             }
         )
         enriched.append(item)
     return enriched
+
+
+def rows_for_page(rows: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
+    page_keys = {
+        "adjacency",
+        "alignment_issue_subtype",
+        "alignment_issue_type",
+        "alignment_mode",
+        "alignment_quality",
+        "audio",
+        "audio_id",
+        "audit_sampling_score",
+        "chunk_index",
+        "cluster_confidence",
+        "cluster_id",
+        "cluster_label",
+        "cluster_noise",
+        "confidence",
+        "context_end",
+        "context_start",
+        "cue_features",
+        "display_prob_drop",
+        "display_prob_keep",
+        "duration_rank",
+        "duration_rank_key",
+        "duration_s",
+        "end",
+        "index",
+        "labels",
+        "media",
+        "position",
+        "qc",
+        "raw_text",
+        "sample_id",
+        "start",
+        "subtitle_window_end",
+        "subtitle_window_start",
+        "text",
+        "text_features",
+        "text_observation",
+        "text_preview",
+        "video_id",
+        "video_label",
+    }
+    return [
+        {key: row[key] for key in page_keys if key in row}
+        for row in rows
+    ]
 
 
 def _page_html(
@@ -402,11 +460,13 @@ def _page_html(
     summaries: list[dict[str, Any]],
     media_by_video: Mapping[str, Any],
     cues_by_video: Mapping[str, list[dict[str, Any]]],
+    aligned_by_video: Mapping[str, list[dict[str, Any]]],
 ) -> str:
-    rows_json = json_for_script(rows)
+    rows_json = json_for_script(rows_for_page(rows))
     summaries_json = json_for_script(summaries)
     media_json = json_for_script(media_by_video)
     cues_json = json_for_script(cues_by_video)
+    aligned_json = json_for_script(aligned_by_video)
     dataset_id_json = json_for_script(dataset_id)
     return f"""<!doctype html>
 <html lang="zh-CN">
@@ -431,7 +491,7 @@ def _page_html(
 body {{ margin: 0; background: var(--bg); color: var(--ink); font: 14px/1.45 system-ui, -apple-system, "Segoe UI", "Microsoft YaHei", sans-serif; }}
 .app {{ display: grid; grid-template-columns: 380px minmax(0, 1fr); min-height: 100vh; }}
 .side {{ border-right: 1px solid var(--line); background: #fff; max-height: 100vh; overflow: auto; }}
-.main {{ padding: 16px; max-height: 100vh; overflow: auto; }}
+.main {{ display: flex; flex-direction: column; padding: 16px; max-height: 100vh; overflow: auto; }}
 .head {{ position: sticky; top: 0; z-index: 3; background: #fff; padding: 12px; border-bottom: 1px solid var(--line); }}
 h1 {{ margin: 0 0 8px; font-size: 16px; }}
 h2, h3 {{ margin: 0 0 8px; }}
@@ -445,15 +505,27 @@ button.primary {{ background: var(--accent); border-color: var(--accent); color:
 summary {{ cursor: pointer; font-weight: 700; }}
 a {{ color: var(--accent); text-decoration: none; }}
 .filters {{ display: grid; grid-template-columns: 1fr 150px; gap: 8px; }}
+.audit-controls {{ display: grid; gap: 8px; margin-top: 10px; }}
+.audit-controls .wide {{ grid-column: 1 / -1; }}
+.control-grid {{ display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; }}
+.control-grid.three {{ grid-template-columns: repeat(3, minmax(0, 1fr)); }}
+.sample-list {{ border-top: 1px solid var(--line); }}
+.sidebar-details {{ border-top: 1px solid var(--line); padding: 10px 12px; }}
+.sidebar-details .cluster-nav {{ margin-top: 10px; max-height: 280px; overflow: auto; padding-right: 4px; }}
 .item {{ padding: 10px 12px; border-bottom: 1px solid var(--line); cursor: pointer; }}
 .item.active, .item:hover {{ background: #eaf4f1; }}
 .item-title {{ display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }}
+.item-metrics {{ display: flex; gap: 6px; flex-wrap: wrap; margin-top: 4px; }}
 .badge {{ display: inline-block; border-radius: 999px; padding: 1px 7px; background: #eef3ef; color: var(--muted); font-size: 12px; }}
 .badge.warn {{ background: var(--amber-soft); color: #7a3f00; }}
 .badge.noise {{ background: #eee7df; color: #76533b; }}
 .meta {{ color: var(--muted); font-size: 12px; }}
 .grid {{ display: grid; grid-template-columns: minmax(0, 1.25fr) minmax(300px, 0.75fr); gap: 12px; align-items: start; }}
 .panel {{ background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 12px; margin-bottom: 12px; }}
+.main > .panel {{ order: 5; }}
+.main > .sample-detail-panel {{ order: 1; }}
+.main > .grid {{ order: 2; }}
+.main > .cluster-admin-panel {{ order: 20; }}
 .kv {{ display: grid; grid-template-columns: 170px minmax(0, 1fr); gap: 6px 10px; }}
 .kv > div:nth-child(odd) {{ color: var(--muted); }}
 .text {{ white-space: pre-wrap; overflow-wrap: anywhere; font-size: 18px; }}
@@ -499,12 +571,19 @@ a {{ color: var(--accent); text-decoration: none; }}
 #labelStatus {{ min-height: 18px; margin: 8px 0 0; }}
 textarea {{ width: 100%; min-height: 80px; border: 1px solid var(--line); border-radius: 6px; padding: 8px; resize: vertical; }}
 audio {{ width: 100%; }}
-.caption-preview {{ margin-top: 10px; min-height: 54px; display: flex; align-items: center; justify-content: center; text-align: center; white-space: pre-wrap; overflow-wrap: anywhere; border: 1px solid var(--line); border-radius: 8px; background: #17201d; color: #fff; font-size: 20px; padding: 10px; }}
+.caption-preview {{ margin-top: 10px; min-height: 88px; display: grid; align-items: center; border: 1px solid var(--line); border-radius: 8px; background: #17201d; color: #fff; padding: 12px; }}
+.caption-preview.empty {{ color: #bac7c0; }}
+.caption-stack {{ display: grid; gap: 8px; width: 100%; }}
+.caption-line {{ white-space: pre-wrap; overflow-wrap: anywhere; text-align: center; line-height: 1.45; }}
+.caption-line.dim {{ color: rgba(255, 255, 255, 0.58); font-size: 14px; }}
+.caption-line.current {{ color: #fff; font-size: 22px; font-weight: 700; }}
+.caption-empty {{ text-align: center; color: #bac7c0; font-size: 15px; }}
+.caption-meta {{ margin-top: 6px; min-height: 18px; color: var(--muted); font-size: 12px; text-align: center; }}
 .timeline {{ position: relative; height: 22px; margin-top: 12px; border: 1px solid var(--line); border-radius: 999px; background: #edf1ee; overflow: hidden; cursor: pointer; }}
 .context-range {{ position: absolute; top: 0; bottom: 0; left: 0; right: 0; background: #e5ece8; }}
-.chunk-range, .fallback-range {{ position: absolute; top: 3px; bottom: 3px; border-radius: 999px; }}
+.chunk-range, .subtitle-window-range {{ position: absolute; top: 3px; bottom: 3px; border-radius: 999px; }}
 .chunk-range {{ background: rgba(15, 118, 110, 0.28); border: 1px solid rgba(15, 118, 110, 0.5); }}
-.fallback-range {{ background: rgba(180, 83, 9, 0.34); border: 1px solid rgba(180, 83, 9, 0.55); }}
+.subtitle-window-range {{ background: rgba(180, 83, 9, 0.34); border: 1px solid rgba(180, 83, 9, 0.55); }}
 .cursor {{ position: absolute; top: 0; bottom: 0; width: 2px; background: var(--danger); transform: translateX(-1px); }}
 .timeline-labels {{ display: flex; justify-content: space-between; gap: 8px; color: var(--muted); font-size: 12px; margin-top: 4px; }}
 .cue-list {{ display: grid; gap: 6px; }}
@@ -530,11 +609,50 @@ code {{ background: #eef3ef; padding: 1px 4px; border-radius: 4px; }}
       </div>
       <p class="meta" id="clusterProgress"></p>
       <p class="meta" id="summaryLine"></p>
+      <div class="audit-controls">
+        <input class="wide" id="search" placeholder="搜索文本 / sample_id / 视频 / 指标 JSON">
+        <div class="control-grid">
+          <select id="videoFilter"></select>
+          <select id="cluster"></select>
+        </div>
+        <div class="control-grid">
+          <select id="alignmentFilter"></select>
+          <select id="issueFilter"></select>
+        </div>
+        <div class="control-grid three">
+          <input id="minDuration" inputmode="decimal" placeholder="最小时长 s">
+          <input id="maxDuration" inputmode="decimal" placeholder="最大时长 s">
+          <input id="minConfidence" inputmode="decimal" placeholder="最低置信度">
+        </div>
+        <div class="control-grid">
+          <select id="sortBy">
+            <option value="duration_desc">时长 ↓</option>
+            <option value="duration_asc">时长 ↑</option>
+            <option value="confidence_desc">置信度/采样分 ↓</option>
+            <option value="confidence_asc">置信度/采样分 ↑</option>
+            <option value="chars_desc">字符数 ↓</option>
+            <option value="chars_per_sec_desc">字符密度 ↓</option>
+            <option value="start_asc">时间轴 ↑</option>
+            <option value="video_start">视频 + 时间轴 ↑</option>
+            <option value="chunk_asc">chunk index ↑</option>
+          </select>
+          <select id="pageSize">
+            <option value="200">显示 200</option>
+            <option value="500">显示 500</option>
+            <option value="1000">显示 1000</option>
+            <option value="all">显示全部</option>
+          </select>
+        </div>
+      </div>
     </div>
-    <div class="cluster-nav" id="clusterNav"></div>
+    <div class="sample-list" id="list"></div>
+    <details class="sidebar-details">
+      <summary>簇级导航</summary>
+      <div class="cluster-nav" id="clusterNav"></div>
+    </details>
   </aside>
   <main class="main">
-    <section class="panel">
+    <section class="panel cluster-admin-panel">
       <div class="label-heading">
         <h2 id="clusterTitle">簇级粗标签</h2>
         <span class="meta" id="clusterCount"></span>
@@ -549,19 +667,14 @@ code {{ background: #eef3ef; padding: 1px 4px; border-radius: 4px; }}
       </div>
       <p class="meta cluster-status" id="clusterStatus"></p>
     </section>
-    <section class="panel">
+    <section class="panel cluster-admin-panel">
       <h3>全部音频</h3>
       <div class="cluster-audio-list" id="clusterAudioList"></div>
     </section>
     <div class="legacy-ui" hidden>
-      <div class="filters">
-        <input id="search" placeholder="搜索文本 / sample_id">
-        <select id="cluster"></select>
-      </div>
-      <div id="list"></div>
       <div class="cluster-review" id="clusterReview"></div>
     </div>
-    <section class="panel">
+    <section class="panel sample-detail-panel">
       <h2 id="sampleTitle"></h2>
       <p class="meta" id="sampleMeta"></p>
       <div class="text" id="text"></div>
@@ -576,10 +689,11 @@ code {{ background: #eef3ef; padding: 1px 4px; border-radius: 4px; }}
         </div>
         <audio id="media" controls preload="none"></audio>
         <div class="caption-preview" id="captionOverlay"></div>
+        <div class="caption-meta" id="captionMeta"></div>
         <div class="timeline" id="timeline">
           <div class="context-range"></div>
           <div class="chunk-range" id="chunkRange"></div>
-          <div class="fallback-range" id="fallbackRange"></div>
+          <div class="subtitle-window-range" id="subtitleWindowRange"></div>
           <div class="cursor" id="cursor"></div>
         </div>
         <div class="timeline-labels">
@@ -609,7 +723,7 @@ code {{ background: #eef3ef; padding: 1px 4px; border-radius: 4px; }}
         </div>
         <div>
           <h3>字幕时间轴窗口内字幕</h3>
-          <div class="cue-list" id="fallbackCueList"></div>
+          <div class="cue-list" id="subtitleWindowCueList"></div>
         </div>
       </div>
       <h3 style="margin-top:12px">上下文字幕</h3>
@@ -626,11 +740,13 @@ code {{ background: #eef3ef; padding: 1px 4px; border-radius: 4px; }}
 <script type="application/json" id="summaries-json">{summaries_json}</script>
 <script type="application/json" id="media-json">{media_json}</script>
 <script type="application/json" id="cues-json">{cues_json}</script>
+<script type="application/json" id="aligned-json">{aligned_json}</script>
 <script>
 const ROWS = JSON.parse(document.getElementById("rows-json").textContent);
 const SUMMARIES = JSON.parse(document.getElementById("summaries-json").textContent);
 const MEDIA_BY_VIDEO = JSON.parse(document.getElementById("media-json").textContent);
 const CUES_BY_VIDEO = JSON.parse(document.getElementById("cues-json").textContent);
+const ALIGNED_BY_VIDEO = JSON.parse(document.getElementById("aligned-json").textContent);
 const DATASET_ID = {dataset_id_json};
 const STORAGE_VERSION = "cluster-display-seed-v1";
 const STORAGE_KEY = `cueqc-cluster-audit:${{STORAGE_VERSION}}:${{DATASET_ID}}:${{location.pathname}}`;
@@ -671,7 +787,7 @@ const media = document.getElementById("media");
 const labelStatus = document.getElementById("labelStatus");
 const timeline = document.getElementById("timeline");
 const chunkRange = document.getElementById("chunkRange");
-const fallbackRange = document.getElementById("fallbackRange");
+const subtitleWindowRange = document.getElementById("subtitleWindowRange");
 const cursor = document.getElementById("cursor");
 function loadAnnotations() {{ try {{ return JSON.parse(localStorage.getItem(STORAGE_KEY) || "{{}}"); }} catch (_) {{ return {{}}; }} }}
 function saveAnnotations() {{ localStorage.setItem(STORAGE_KEY, JSON.stringify(annotations)); }}
@@ -687,16 +803,155 @@ function fmt(t) {{
   const s = (v - h * 3600 - m * 60).toFixed(2).padStart(5, "0");
   return h ? `${{h}}:${{String(m).padStart(2, "0")}}:${{s}}` : `${{m}}:${{s}}`;
 }}
-function activeCueText(videoId, t) {{
+function cueWindow(videoId, t) {{
   const cues = CUES_BY_VIDEO[videoId] || [];
-  const lines = [];
-  for (const cue of cues) {{
-    if (Number(cue.start) <= t && t <= Number(cue.end)) lines.push(cue.text);
+  let prev = null;
+  let next = null;
+  let activeIndex = -1;
+  for (let index = 0; index < cues.length; index += 1) {{
+    const cue = cues[index];
+    const start = Number(cue.start || 0);
+    const end = Number(cue.end || start);
+    if (start <= t && t <= end) {{
+      activeIndex = index;
+      break;
+    }}
+    if (end < t) prev = cue;
+    else if (!next && start > t) next = cue;
   }}
-  return lines.join("\\n");
+  if (activeIndex >= 0) {{
+    const current = [];
+    let tail = activeIndex;
+    for (let index = activeIndex; index < cues.length; index += 1) {{
+      const cue = cues[index];
+      const start = Number(cue.start || 0);
+      const end = Number(cue.end || start);
+      if (!(start <= t && t <= end)) break;
+      current.push(cue);
+      tail = index;
+    }}
+    return {{
+      prev: cues[activeIndex - 1] || prev,
+      current,
+      next: cues[tail + 1] || next,
+    }};
+  }}
+  return {{ prev, current: [], next }};
+}}
+function cueText(cues) {{
+  if (!Array.isArray(cues)) return "";
+  return cues.map(cue => String(cue && cue.text ? cue.text : "").trim()).filter(Boolean).join("\\n");
+}}
+function cueTimeRange(cues) {{
+  if (!Array.isArray(cues) || cues.length === 0) return "";
+  const start = Number(cues[0].start || 0);
+  const end = Number(cues[cues.length - 1].end || cues[0].end || start);
+  return `${{fmt(start)}} - ${{fmt(end)}}`;
+}}
+function renderCaptionPreview(row) {{
+  const root = document.getElementById("captionOverlay");
+  const meta = document.getElementById("captionMeta");
+  if (!root) return;
+  const t = media.currentTime || 0;
+  const window = cueWindow(row.video_id || "", t);
+  const prevText = window.prev ? String(window.prev.text || "").trim() : "";
+  const currentText = cueText(window.current);
+  const nextText = window.next ? String(window.next.text || "").trim() : "";
+  const lines = [];
+  if (prevText) {{
+    lines.push(`<div class="caption-line dim">${{escapeHtml(prevText)}}</div>`);
+  }}
+  if (currentText) {{
+    lines.push(`<div class="caption-line current">${{escapeHtml(currentText)}}</div>`);
+  }} else {{
+    lines.push(`<div class="caption-empty">当前时刻没有字幕</div>`);
+  }}
+  if (nextText) {{
+    lines.push(`<div class="caption-line dim">${{escapeHtml(nextText)}}</div>`);
+  }}
+  root.className = `caption-preview${{currentText ? "" : " empty"}}`;
+  root.innerHTML = `<div class="caption-stack">${{lines.join("")}}</div>`;
+  if (meta) {{
+    meta.textContent = currentText ? `当前字幕 ${{cueTimeRange(window.current)}}` : "当前时刻没有字幕 cue";
+  }}
 }}
 function rowText(row) {{
-  return [row.sample_id,row.video_id,row.video_label,row.cluster_id,row.text,row.raw_text,JSON.stringify(row.qc||{{}}),JSON.stringify(row.text_features||{{}})].join("\\n").toLowerCase();
+  return [
+    row.sample_id,
+    row.video_id,
+    row.video_label,
+    row.audio_id,
+    row.cluster_id,
+    row.cluster_label,
+    row.text,
+    row.raw_text,
+    row.alignment_quality,
+    row.alignment_mode,
+    row.alignment_issue_type,
+    row.alignment_issue_subtype,
+    JSON.stringify(row.qc || {{}}),
+    JSON.stringify(row.text_features || {{}}),
+    JSON.stringify(row.cue_features || {{}}),
+    JSON.stringify(row.adjacency || {{}})
+  ].join("\\n").toLowerCase();
+}}
+function textObservation(row) {{
+  const cueFeatures = row.cue_features || {{}};
+  return cueFeatures.text_observation || row.text_observation || {{}};
+}}
+function rowNumber(row, key, fallback = 0) {{
+  const value = Number(row && row[key]);
+  return Number.isFinite(value) ? value : fallback;
+}}
+function optionalNumberInput(id) {{
+  const raw = document.getElementById(id).value.trim();
+  if (!raw) return null;
+  const value = Number(raw);
+  return Number.isFinite(value) ? value : null;
+}}
+function rowConfidence(row) {{
+  const values = [
+    row.cluster_confidence,
+    row.audit_sampling_score,
+    row.confidence,
+    row.display_prob_drop,
+    row.display_prob_keep
+  ].map(Number).filter(Number.isFinite);
+  return values.length ? values[0] : 0;
+}}
+function rowCharCount(row) {{
+  const obs = textObservation(row);
+  return Number(obs.char_count ?? obs.raw_char_count ?? 0) || 0;
+}}
+function rowCharsPerSec(row) {{
+  const obs = textObservation(row);
+  const direct = Number(obs.chars_per_sec);
+  if (Number.isFinite(direct)) return direct;
+  const duration = Math.max(0.001, rowNumber(row, "duration_s", rowNumber(row, "end") - rowNumber(row, "start")));
+  return rowCharCount(row) / duration;
+}}
+function compareRows(a, b) {{
+  const sortBy = document.getElementById("sortBy") ? document.getElementById("sortBy").value : "duration_desc";
+  const videoCompare = String(a.video_label || a.video_id || "").localeCompare(String(b.video_label || b.video_id || ""));
+  const startCompare = rowNumber(a, "start") - rowNumber(b, "start");
+  if (sortBy === "duration_asc") return rowNumber(a, "duration_s") - rowNumber(b, "duration_s") || videoCompare || startCompare;
+  if (sortBy === "confidence_desc") return rowConfidence(b) - rowConfidence(a) || rowNumber(b, "duration_s") - rowNumber(a, "duration_s") || videoCompare || startCompare;
+  if (sortBy === "confidence_asc") return rowConfidence(a) - rowConfidence(b) || rowNumber(b, "duration_s") - rowNumber(a, "duration_s") || videoCompare || startCompare;
+  if (sortBy === "chars_desc") return rowCharCount(b) - rowCharCount(a) || rowNumber(b, "duration_s") - rowNumber(a, "duration_s") || videoCompare || startCompare;
+  if (sortBy === "chars_per_sec_desc") return rowCharsPerSec(b) - rowCharsPerSec(a) || rowNumber(b, "duration_s") - rowNumber(a, "duration_s") || videoCompare || startCompare;
+  if (sortBy === "start_asc") return startCompare || videoCompare || rowNumber(a, "chunk_index") - rowNumber(b, "chunk_index");
+  if (sortBy === "video_start") return videoCompare || startCompare || rowNumber(a, "chunk_index") - rowNumber(b, "chunk_index");
+  if (sortBy === "chunk_asc") return videoCompare || rowNumber(a, "chunk_index") - rowNumber(b, "chunk_index") || startCompare;
+  return rowNumber(b, "duration_s") - rowNumber(a, "duration_s") || videoCompare || startCompare;
+}}
+function sortRows(rows) {{
+  return [...rows].sort(compareRows);
+}}
+function currentRenderLimit() {{
+  const raw = document.getElementById("pageSize") ? document.getElementById("pageSize").value : "200";
+  if (raw === "all") return Number.POSITIVE_INFINITY;
+  const value = Number(raw);
+  return Number.isFinite(value) && value > 0 ? value : 200;
 }}
 function clusterDisplayId(index) {{
   return `cluster_${{String(index).padStart(2, "0")}}`;
@@ -712,13 +967,7 @@ function clusterRows(clusterId) {{
   return ROWS.filter(row => row.cluster_id === clusterId);
 }}
 function clusterRowsForDisplay(clusterId) {{
-  return clusterRows(clusterId).sort((a, b) => {{
-    const confidenceDelta = Number(b.cluster_confidence || 0) - Number(a.cluster_confidence || 0);
-    if (Math.abs(confidenceDelta) > 1e-9) return confidenceDelta;
-    const videoDelta = String(a.video_label || a.video_id || "").localeCompare(String(b.video_label || b.video_id || ""));
-    if (videoDelta !== 0) return videoDelta;
-    return Number(a.chunk_index || 0) - Number(b.chunk_index || 0);
-  }});
+  return sortRows(clusterRows(clusterId));
 }}
 function clusterExampleRows(summary, limit = 3) {{
   const clusterId = summary.cluster_id || "";
@@ -815,6 +1064,9 @@ function selectCluster(clusterId) {{
   if (!entry) return;
   activeClusterId = entry.clusterId;
   saveActiveClusterId(activeClusterId);
+  const clusterSelect = document.getElementById("cluster");
+  if (clusterSelect) clusterSelect.value = entry.clusterId;
+  applyFilters();
   renderClusterNav();
   renderClusterDetail();
 }}
@@ -842,8 +1094,6 @@ function renderClusterNav() {{
     button.onclick = () => selectCluster(entry.clusterId);
     root.appendChild(button);
   }});
-  const summaryLine = document.getElementById("summaryLine");
-  if (summaryLine) summaryLine.textContent = `${{ROWS.length}} 条样本 · ${{CLUSTER_ENTRIES.length}} 个簇`;
 }}
 function clusterAudioVisibleCount(clusterId, total) {{
   const currentLimit = clusterAudioVisible.get(clusterId) || CLUSTER_AUDIO_PAGE_SIZE;
@@ -995,20 +1245,13 @@ function renderClusterDetail() {{
       : "选择用作种子并给 keep/drop，或标为混簇/跳过。";
   }}
   renderClusterAudioList(entry);
-  const examples = clusterRowsForDisplay(entry.clusterId);
-  if (examples.length) {{
-    if (!ROWS[current] || ROWS[current].cluster_id !== entry.clusterId) {{
-      current = ROWS.indexOf(examples[0]);
-    }}
-    renderCurrent(false);
-  }}
 }}
 function selectSample(sampleId, autoplay = true) {{
   const row = ROWS.find(item => item.sample_id === sampleId);
   if (!row) return;
   document.getElementById("search").value = "";
   document.getElementById("cluster").value = row.cluster_id || "";
-  filtered = ROWS.filter(item => item.cluster_id === row.cluster_id);
+  filtered = sortRows(ROWS.filter(item => item.cluster_id === row.cluster_id));
   current = ROWS.indexOf(row);
   renderList();
   renderCurrent(true);
@@ -1058,40 +1301,110 @@ function renderClusterReview() {{
   }});
   updateClusterProgress();
 }}
-function setupClusters() {{
-  const select = document.getElementById("cluster");
-  select.innerHTML = '<option value="">all clusters</option>';
-  for (const summary of SUMMARIES) {{
-    const option = document.createElement("option");
-    option.value = summary.cluster_id;
-    option.textContent = `${{summary.cluster_id}} (${{summary.count}})`;
-    select.appendChild(option);
+function fillSelect(selectId, options, allLabel) {{
+  const select = document.getElementById(selectId);
+  if (!select) return;
+  select.innerHTML = "";
+  const all = document.createElement("option");
+  all.value = "";
+  all.textContent = allLabel;
+  select.appendChild(all);
+  for (const option of options) {{
+    const node = document.createElement("option");
+    node.value = option.value;
+    node.textContent = option.label;
+    select.appendChild(node);
   }}
+}}
+function uniqueOptions(rows, key, labelFn) {{
+  const values = new Map();
+  for (const row of rows) {{
+    const value = String(row[key] ?? "").trim();
+    if (!value || values.has(value)) continue;
+    values.set(value, labelFn ? labelFn(value, row) : value);
+  }}
+  return [...values.entries()]
+    .sort((a, b) => String(a[1]).localeCompare(String(b[1])))
+    .map(([value, label]) => ({{value, label}}));
+}}
+function setupFilters() {{
+  fillSelect(
+    "cluster",
+    SUMMARIES.map(summary => ({{value: summary.cluster_id || "", label: `${{summary.cluster_id}} (${{summary.count || 0}})`}})),
+    "all duration buckets / clusters"
+  );
+  fillSelect(
+    "videoFilter",
+    uniqueOptions(ROWS, "video_id", (_value, row) => row.video_label || row.video_id || ""),
+    "all videos"
+  );
+  fillSelect("alignmentFilter", uniqueOptions(ROWS, "alignment_quality"), "all alignment quality");
+  fillSelect("issueFilter", uniqueOptions(ROWS, "alignment_issue_subtype"), "all alignment issue");
 }}
 function applyFilters() {{
   const q = document.getElementById("search").value.trim().toLowerCase();
   const cluster = document.getElementById("cluster").value;
-  filtered = ROWS.filter(row => (!cluster || row.cluster_id === cluster) && (!q || rowText(row).includes(q)));
-  if (!filtered.includes(ROWS[current])) current = Math.max(0, ROWS.indexOf(filtered[0] || ROWS[0]));
+  const video = document.getElementById("videoFilter").value;
+  const alignment = document.getElementById("alignmentFilter").value;
+  const issue = document.getElementById("issueFilter").value;
+  const minDuration = optionalNumberInput("minDuration");
+  const maxDuration = optionalNumberInput("maxDuration");
+  const minConfidence = optionalNumberInput("minConfidence");
+  filtered = sortRows(ROWS.filter(row => {{
+    const duration = rowNumber(row, "duration_s", rowNumber(row, "end") - rowNumber(row, "start"));
+    if (cluster && row.cluster_id !== cluster) return false;
+    if (video && row.video_id !== video) return false;
+    if (alignment && String(row.alignment_quality || "") !== alignment) return false;
+    if (issue && String(row.alignment_issue_subtype || "") !== issue) return false;
+    if (minDuration !== null && duration < minDuration) return false;
+    if (maxDuration !== null && duration > maxDuration) return false;
+    if (minConfidence !== null && rowConfidence(row) < minConfidence) return false;
+    if (q && !rowText(row).includes(q)) return false;
+    return true;
+  }}));
+  if (cluster && CLUSTER_BY_ID.has(cluster) && cluster !== activeClusterId) {{
+    activeClusterId = cluster;
+    saveActiveClusterId(activeClusterId);
+    renderClusterNav();
+    renderClusterDetail();
+  }}
+  current = Math.max(0, ROWS.indexOf(filtered[0] || ROWS[0]));
   renderList();
   renderCurrent(false);
 }}
 function renderList() {{
   const root = document.getElementById("list");
   root.innerHTML = "";
-  for (const row of filtered) {{
+  const limit = currentRenderLimit();
+  const visibleRows = filtered.slice(0, limit);
+  for (const row of visibleRows) {{
     const div = document.createElement("div");
-    const cueFeatures = row.cue_features || {{}};
-    const textObs = cueFeatures.text_observation || row.text_observation || {{}};
+    const textObs = textObservation(row);
     div.className = "item" + (ROWS[current] === row ? " active" : "");
     div.onclick = () => {{ current = ROWS.indexOf(row); renderList(); renderCurrent(true); }};
     const badgeClass = row.cluster_noise ? "badge noise" : "badge";
     div.innerHTML = `<div class="item-title"><strong>${{escapeHtml(row.cluster_id)}} · chunk ${{row.chunk_index}}</strong><span class="${{badgeClass}}">${{escapeHtml(row.video_label || row.video_id || "")}}</span></div>
-      <div class="meta">${{fmt(row.start)}}-${{fmt(row.end)}} · ${{Number(row.duration_s||0).toFixed(2)}}s · chars=${{escapeHtml(String(textObs.char_count ?? ""))}}</div>
+      <div class="meta">${{fmt(row.start)}}-${{fmt(row.end)}} · ${{Number(row.duration_s||0).toFixed(2)}}s · conf=${{rowConfidence(row).toFixed(3)}} · rank=${{escapeHtml(String(row.duration_rank ?? row.index ?? ""))}}</div>
+      <div class="item-metrics">
+        <span class="badge">chars=${{escapeHtml(String(textObs.char_count ?? ""))}}</span>
+        <span class="badge">cps=${{rowCharsPerSec(row).toFixed(2)}}</span>
+        <span class="badge">${{escapeHtml(row.alignment_quality || "align:n/a")}}</span>
+        <span class="badge">${{escapeHtml(row.alignment_issue_subtype || "issue:n/a")}}</span>
+      </div>
       <div class="meta">${{escapeHtml(row.text_preview || row.text || "(empty)")}}</div>`;
     root.appendChild(div);
   }}
-  document.getElementById("summaryLine").textContent = `${{filtered.length}} / ${{ROWS.length}} samples · ${{SUMMARIES.length}} clusters`;
+  if (visibleRows.length < filtered.length) {{
+    const more = document.createElement("button");
+    more.type = "button";
+    more.textContent = `当前显示 ${{visibleRows.length}} / ${{filtered.length}}，切换“显示数量”可查看更多`;
+    more.onclick = () => {{
+      document.getElementById("pageSize").value = "all";
+      renderList();
+    }};
+    root.appendChild(more);
+  }}
+  document.getElementById("summaryLine").textContent = `${{filtered.length}} / ${{ROWS.length}} samples · showing ${{visibleRows.length}} · ${{SUMMARIES.length}} clusters`;
 }}
 function fixedOptions(options) {{
   const merged = [];
@@ -1222,21 +1535,34 @@ function setMediaForItem(row, seek) {{
 function setMetrics(row) {{
   const tf = row.text_features || {{}};
   const cueFeatures = row.cue_features || {{}};
+  const textObs = textObservation(row);
   const mediaInfo = row.media || {{}};
   const rows = [
     ["video", `${{row.video_label || ""}} · ${{row.video_id || ""}}`],
     ["cluster", `${{row.cluster_id}} · confidence=${{Number(row.cluster_confidence || 0).toFixed(3)}}`],
+    ["sampling", `score=${{Number(row.audit_sampling_score ?? rowConfidence(row)).toFixed(3)}} · rank=${{row.duration_rank ?? row.index ?? ""}}`],
     ["chunk", `${{row.chunk_index}} · ${{fmt(row.start)}}-${{fmt(row.end)}}`],
+    ["duration", `${{Number(row.duration_s || 0).toFixed(3)}}s · cps=${{rowCharsPerSec(row).toFixed(3)}}`],
     ["context", `${{fmt(row.context_start)}}-${{fmt(row.context_end)}}`],
-    ["字幕时间轴窗口", `${{fmt(row.fallback_window_start)}}-${{fmt(row.fallback_window_end)}}`],
-    ["text_obs", JSON.stringify(cueFeatures.text_observation || row.text_observation || {{}})],
+    ["字幕时间轴窗口", `${{fmt(row.subtitle_window_start)}}-${{fmt(row.subtitle_window_end)}}`],
+    ["text_obs", JSON.stringify(textObs)],
     ["chars", `${{tf.char_count || 0}} unique=${{tf.unique_chars || 0}} kana=${{tf.kana_ratio || 0}} kanji=${{tf.kanji_ratio || 0}}`],
     ["repeat", JSON.stringify(tf.repeat_profile || {{}})],
+    ["alignment", `${{row.alignment_quality || ""}} · mode=${{row.alignment_mode || ""}}`],
+    ["alignment issue", `${{row.alignment_issue_type || ""}} · ${{row.alignment_issue_subtype || ""}}`],
     ["adjacency", JSON.stringify(row.adjacency || {{}})],
+    ["cue_features", JSON.stringify(cueFeatures)],
     ["audio", mediaInfo.audio_path || ""],
     ["subtitle", mediaInfo.srt_path || ""]
   ];
   document.getElementById("metrics").innerHTML = rows.map(([k,v]) => `<div>${{escapeHtml(k)}}</div><div>${{escapeHtml(v)}}</div>`).join("");
+}}
+function overlapsRange(aStart, aEnd, bStart, bEnd) {{
+  return Math.min(Number(aEnd), Number(bEnd)) - Math.max(Number(aStart), Number(bStart)) > 0.01;
+}}
+function rowsForRange(items, start, end) {{
+  if (!Array.isArray(items)) return [];
+  return items.filter(item => overlapsRange(start, end, item.start, item.end));
 }}
 function renderCueGroup(rootId, cues, emptyText) {{
   const root = document.getElementById(rootId);
@@ -1251,10 +1577,12 @@ function renderCueGroup(rootId, cues, emptyText) {{
   }}).join("");
 }}
 function renderCueLists(row) {{
-  renderCueGroup("chunkCueList", row.chunk_subtitle_cues, "该 chunk 内没有字幕 cue。");
-  renderCueGroup("fallbackCueList", row.fallback_subtitle_cues, "该字幕时间轴窗口内没有字幕 cue。");
-  renderCueGroup("contextCueList", row.context_subtitle_cues, "该上下文内没有字幕 cue。");
-  renderCueGroup("alignedList", row.aligned_segments, "该 chunk 内没有字幕片段。");
+  const cues = CUES_BY_VIDEO[row.video_id || ""] || [];
+  const aligned = ALIGNED_BY_VIDEO[row.video_id || ""] || [];
+  renderCueGroup("chunkCueList", rowsForRange(cues, row.start, row.end), "该 chunk 内没有字幕 cue。");
+  renderCueGroup("subtitleWindowCueList", rowsForRange(cues, row.subtitle_window_start, row.subtitle_window_end), "该字幕时间轴窗口内没有字幕 cue。");
+  renderCueGroup("contextCueList", rowsForRange(cues, row.context_start, row.context_end), "该上下文内没有字幕 cue。");
+  renderCueGroup("alignedList", rowsForRange(aligned, row.start, row.end), "该 chunk 内没有字幕片段。");
 }}
 function updateTimeline() {{
   const row = ROWS[current];
@@ -1267,12 +1595,12 @@ function updateTimeline() {{
     el.style.width = `${{Math.max(minWidth, right - left)}}%`;
   }};
   setRange(chunkRange, row.start, row.end, 0.5);
-  setRange(fallbackRange, row.fallback_window_start, row.fallback_window_end, 0.5);
+  setRange(subtitleWindowRange, row.subtitle_window_start, row.subtitle_window_end, 0.5);
   const t = media.currentTime || 0;
   const pct = Math.max(0, Math.min(100, ((t - Number(row.context_start)) / width) * 100));
   cursor.style.left = `${{pct}}%`;
   document.getElementById("nowText").textContent = fmt(t);
-  document.getElementById("captionOverlay").textContent = activeCueText(row.video_id || "", t);
+  renderCaptionPreview(row);
   const stopAt = playMode === "context" ? Number(row.context_end) : Number(row.end);
   if (!media.paused && t >= stopAt) media.pause();
   const cueRenderKey = String(row.sample_id || "") + "|" + String(Math.floor(t * 2));
@@ -1372,6 +1700,16 @@ function downloadClusterJsonl() {{
 }}
 document.getElementById("search").addEventListener("input", applyFilters);
 document.getElementById("cluster").addEventListener("change", applyFilters);
+document.getElementById("videoFilter").addEventListener("change", applyFilters);
+document.getElementById("alignmentFilter").addEventListener("change", applyFilters);
+document.getElementById("issueFilter").addEventListener("change", applyFilters);
+document.getElementById("minDuration").addEventListener("input", applyFilters);
+document.getElementById("maxDuration").addEventListener("input", applyFilters);
+document.getElementById("minConfidence").addEventListener("input", applyFilters);
+document.getElementById("sortBy").addEventListener("change", () => {{
+  applyFilters();
+}});
+document.getElementById("pageSize").addEventListener("change", renderList);
 document.getElementById("downloadClusters").onclick = downloadClusterJsonl;
 document.getElementById("playChunkBtn").onclick = () => playCurrent("chunk");
 document.getElementById("playContextBtn").onclick = () => playCurrent("context");
@@ -1406,6 +1744,8 @@ if (!activeClusterId || !CLUSTER_BY_ID.has(activeClusterId)) {{
   activeClusterId = (CLUSTER_ENTRIES[0] && CLUSTER_ENTRIES[0].clusterId) || "";
 }}
 renderClusterNav();
+setupFilters();
+applyFilters();
 renderClusterDetail();
 updateClusterProgress();
 </script>
@@ -1459,6 +1799,7 @@ def build_audit(
             summaries=summaries,
             media_by_video=media_by_video,
             cues_by_video=cues_by_video,
+            aligned_by_video=aligned_by_video,
         ),
         encoding="utf-8",
     )

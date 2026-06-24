@@ -34,9 +34,15 @@ def test_cueqc_runtime_signature_is_v4_binary(monkeypatch, tmp_path: Path):
 
     sig = cueqc.runtime_signature()
 
-    assert sig["policy"] == "cueqc_mamba_v4_binary"
+    assert sig["policy"] == "cueqc_mamba_v4_binary_shadow"
     assert sig["model_version"] == "cueqc_mamba_v4_binary"
     assert "threshold_profile" not in sig
+
+
+def test_cueqc_shadow_is_opt_in(monkeypatch):
+    monkeypatch.delenv("CUEQC_SHADOW_ENABLED", raising=False)
+
+    assert cueqc.cueqc_enabled() is False
 
 
 def test_cueqc_loader_rejects_v3_schema(tmp_path: Path):
