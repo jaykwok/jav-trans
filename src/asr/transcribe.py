@@ -32,6 +32,12 @@ from asr.local_backend import (
 
 logger = logging.getLogger(__name__)
 
+
+def _emit_progress(on_stage: Callable[[str], None] | None, message: str) -> None:
+    if on_stage:
+        on_stage(message)
+    print(message, flush=True)
+
 _ASR_CONTEXT_RESET_GAP_S = float(os.getenv("ASR_CONTEXT_RESET_GAP_S", "0.5"))
 _ASR_SLIDING_CONTEXT_SEGS = max(0, int(os.getenv("ASR_SLIDING_CONTEXT_SEGS", "2")))
 _ASR_INITIAL_PROMPT_MAX_CHARS = int(os.getenv("ASR_INITIAL_PROMPT_MAX_CHARS", "240"))
@@ -116,7 +122,7 @@ def _word_backed_segment_text(words: list[dict]) -> str:
     return text
 
 
-def _alignment_fallback_window_from_chunk(
+def _alignment_window_from_chunk(
     chunk: dict,
     *,
     duration: float,
@@ -125,7 +131,7 @@ def _alignment_fallback_window_from_chunk(
     return 0.0, max(0.0, float(duration)), "chunk"
 
 
-def _with_alignment_fallback_window(chunk: dict, text_result: dict) -> dict:
+def _with_alignment_window(chunk: dict, text_result: dict) -> dict:
     result = dict(text_result)
     try:
         duration = float(result.get("duration") or 0.0)
@@ -136,13 +142,13 @@ def _with_alignment_fallback_window(chunk: dict, text_result: dict) -> dict:
             0.0,
             float(chunk.get("end", 0.0)) - float(chunk.get("start", 0.0)),
         )
-    start_s, end_s, source = _alignment_fallback_window_from_chunk(
+    start_s, end_s, source = _alignment_window_from_chunk(
         chunk,
         duration=duration,
     )
-    result["alignment_fallback_start_s"] = round(start_s, 6)
-    result["alignment_fallback_end_s"] = round(end_s, 6)
-    result["alignment_fallback_source"] = source
+    result["alignment_window_start_s"] = round(start_s, 6)
+    result["alignment_window_end_s"] = round(end_s, 6)
+    result["alignment_window_source"] = source
     return result
 
 
@@ -217,13 +223,13 @@ def _alignment_outcome_for_chunk(
     return {
         "alignment_mode": alignment_mode,
         "alignment_quality": quality["alignment_quality"],
-        "fallback_type": quality["fallback_type"],
-        "fallback_subtype": quality["fallback_subtype"],
+        "alignment_issue_type": quality["alignment_issue_type"],
+        "alignment_issue_subtype": quality["alignment_issue_subtype"],
         "alignment_quality_reasons": quality["alignment_quality_reasons"],
         "alignment_word_count": word_stats["word_count"],
         "align_error": align_error,
         "word_timing": word_stats,
-        "fallback_active": quality["fallback_type"] != "none",
+        "alignment_issue_active": quality["alignment_issue_type"] != "none",
     }
 
 
@@ -367,23 +373,53 @@ def _transcribe_asr_chunks_text_only(
                     if int(chunk["index"]) not in text_results_by_index
                 ]
                 batch_end = batch_start + len(batch_chunks)
-                if on_stage:
-                    on_stage(f"{text_stage_label} {batch_end}/{len(chunks)}...")
+                batch_number = batch_start // request_batch_size + 1
+                batch_started = time.perf_counter()
+                _emit_progress(
+                    on_stage,
+                    (
+                        f"{text_stage_label} {batch_end}/{len(chunks)} "
+                        f"batch={batch_number} size={len(pending_chunks)} start"
+                    ),
+                )
                 if not pending_chunks:
                     continue
 
-                _store_text_results(pending_chunks, _transcribe_batch(pending_chunks))
+                batch_text_results = _transcribe_batch(pending_chunks)
+                _store_text_results(pending_chunks, batch_text_results)
+                batch_elapsed = time.perf_counter() - batch_started
+                _emit_progress(
+                    on_stage,
+                    (
+                        f"{text_stage_label} {len(text_results_by_index)}/{len(chunks)} "
+                        f"batch={batch_number} size={len(batch_text_results)} done "
+                        f"elapsed={batch_elapsed:.2f}s "
+                        f"sec_per_chunk={batch_elapsed / max(len(batch_text_results), 1):.3f}"
+                    ),
+                )
         else:
             pending_chunks = [
                 chunk for chunk in chunks if int(chunk["index"]) not in text_results_by_index
             ]
+            total_batches = max(
+                1,
+                (len(pending_chunks) + request_batch_size - 1) // request_batch_size,
+            )
+            batch_number = 0
             while pending_chunks:
                 batch_chunks = pending_chunks[:request_batch_size]
                 pending_chunks = pending_chunks[request_batch_size:]
-                if on_stage:
-                    on_stage(
-                        f"{text_stage_label} {min(len(text_results_by_index) + len(batch_chunks), len(chunks))}/{len(chunks)}..."
-                    )
+                batch_number += 1
+                batch_target = min(len(text_results_by_index) + len(batch_chunks), len(chunks))
+                batch_started = time.perf_counter()
+                _emit_progress(
+                    on_stage,
+                    (
+                        f"{text_stage_label} {batch_target}/{len(chunks)} "
+                        f"batch={batch_number}/{total_batches} "
+                        f"size={len(batch_chunks)} start"
+                    ),
+                )
 
                 try:
                     batch_text_results = _transcribe_batch(batch_chunks)
@@ -502,6 +538,17 @@ def _transcribe_asr_chunks_text_only(
                     raise
                 else:
                     _store_text_results(batch_chunks, batch_text_results)
+                    batch_elapsed = time.perf_counter() - batch_started
+                    _emit_progress(
+                        on_stage,
+                        (
+                            f"{text_stage_label} {len(text_results_by_index)}/{len(chunks)} "
+                            f"batch={batch_number}/{total_batches} "
+                            f"size={len(batch_text_results)} done "
+                            f"elapsed={batch_elapsed:.2f}s "
+                            f"sec_per_chunk={batch_elapsed / max(len(batch_text_results), 1):.3f}"
+                        ),
+                    )
                     consecutive_failures = 0
 
         timeout_count = sum(
@@ -698,17 +745,17 @@ def _build_transcript_chunks(
             "text": text_result.get("text", ""),
             "raw_text": text_result.get("raw_text", ""),
         }
-        if "alignment_fallback_start_s" in text_result and "alignment_fallback_end_s" in text_result:
-            fallback_start = float(text_result.get("alignment_fallback_start_s") or 0.0)
-            fallback_end = float(text_result.get("alignment_fallback_end_s") or fallback_start)
-            fallback_end = max(fallback_start, fallback_end)
+        if "alignment_window_start_s" in text_result and "alignment_window_end_s" in text_result:
+            window_start = float(text_result.get("alignment_window_start_s") or 0.0)
+            window_end = float(text_result.get("alignment_window_end_s") or window_start)
+            window_end = max(window_start, window_end)
             chunk_start = float(chunk["start"])
-            item["alignment_fallback_start_s"] = fallback_start
-            item["alignment_fallback_end_s"] = fallback_end
-            item["alignment_fallback_duration_s"] = max(0.0, fallback_end - fallback_start)
-            item["alignment_fallback_abs_start_s"] = chunk_start + fallback_start
-            item["alignment_fallback_abs_end_s"] = chunk_start + fallback_end
-            item["alignment_fallback_source"] = text_result.get("alignment_fallback_source", "chunk")
+            item["alignment_window_start_s"] = window_start
+            item["alignment_window_end_s"] = window_end
+            item["alignment_window_duration_s"] = max(0.0, window_end - window_start)
+            item["alignment_window_abs_start_s"] = chunk_start + window_start
+            item["alignment_window_abs_end_s"] = chunk_start + window_end
+            item["alignment_window_source"] = text_result.get("alignment_window_source", "chunk")
         outcome = alignment_outcomes.get(chunk_index)
         if outcome:
             item.update(
@@ -719,13 +766,13 @@ def _build_transcript_chunks(
                     in {
                         "alignment_mode",
                         "alignment_quality",
-                        "fallback_type",
-                        "fallback_subtype",
+                        "alignment_issue_type",
+                        "alignment_issue_subtype",
                         "alignment_quality_reasons",
                         "alignment_word_count",
                         "align_error",
                         "word_timing",
-                        "fallback_active",
+                        "alignment_issue_active",
                     }
                 }
             )

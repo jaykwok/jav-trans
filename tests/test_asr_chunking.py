@@ -13,8 +13,8 @@ def _write_wav(path: Path, *, duration_s: float = 1.0, sample_rate: int = 16000)
         wav.writeframes(b"\x00\x00" * int(duration_s * sample_rate))
 
 
-def test_default_chunk_export_min_duration_only_deglitches(monkeypatch, tmp_path):
-    monkeypatch.delenv("ASR_CHUNK_MIN_DURATION_S", raising=False)
+def test_chunk_export_keeps_any_nonzero_clamped_span(monkeypatch, tmp_path):
+    monkeypatch.setenv("ASR_CHUNK_MIN_DURATION_S", "9.0")
     monkeypatch.setenv("ASR_CHUNK_ROOT", str(tmp_path / "chunks"))
 
     from asr import chunking
@@ -26,14 +26,21 @@ def test_default_chunk_export_min_duration_only_deglitches(monkeypatch, tmp_path
     _chunk_dir, chunks = chunking._extract_wav_chunks(
         str(audio),
         [
-            (0.00, 0.07),
-            (0.10, 0.19),
-            (0.30, 0.45),
+            (0.00, 0.01),
+            (0.10, 0.15),
+            (0.20, 0.27),
+            (0.30, 0.30),
+            (0.40, 0.39),
+            (0.95, 1.20),
+            (1.10, 1.20),
         ],
     )
 
     assert [(round(chunk["start"], 2), round(chunk["end"], 2)) for chunk in chunks] == [
-        (0.10, 0.19),
-        (0.30, 0.45),
+        (0.00, 0.01),
+        (0.10, 0.15),
+        (0.20, 0.27),
+        (0.95, 1.00),
     ]
+    assert [chunk["source_span_index"] for chunk in chunks] == [0, 1, 2, 5]
     assert all(Path(chunk["path"]).exists() for chunk in chunks)

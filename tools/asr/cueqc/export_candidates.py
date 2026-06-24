@@ -89,9 +89,9 @@ def aligned_payload_to_candidates(payload: Mapping[str, Any], *, video_id: str =
                 "avg_logprob": row.get("avg_logprob"),
                 "no_speech_prob": row.get("no_speech_prob"),
                 "compression_ratio": row.get("compression_ratio"),
-                "alignment_fallback_start_s": row.get("alignment_fallback_start_s"),
-                "alignment_fallback_end_s": row.get("alignment_fallback_end_s"),
-                "alignment_fallback_source": row.get("alignment_fallback_source", ""),
+                "alignment_window_start_s": row.get("alignment_window_start_s"),
+                "alignment_window_end_s": row.get("alignment_window_end_s"),
+                "alignment_window_source": row.get("alignment_window_source", ""),
             }
         )
     audio_id = Path(str(payload.get("audio_path") or video_id or "audio")).stem

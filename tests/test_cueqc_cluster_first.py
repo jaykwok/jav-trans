@@ -242,7 +242,7 @@ def test_cueqc_torque_outputs_stable_audit_files(tmp_path: Path):
     assert "cueqc_cluster_labels.jsonl" in html
 
 
-def test_cueqc_runtime_signature_is_v4_binary_routing(monkeypatch, tmp_path: Path):
+def test_cueqc_runtime_signature_is_v4_binary_shadow(monkeypatch, tmp_path: Path):
     checkpoint = tmp_path / "cueqc_mamba_v4_binary.pt"
     checkpoint.write_bytes(b"placeholder")
     monkeypatch.setenv("ASR_BACKEND", "jaykwok/Qwen3-ASR-0.6B-JA-Anime-Galgame")
@@ -250,14 +250,14 @@ def test_cueqc_runtime_signature_is_v4_binary_routing(monkeypatch, tmp_path: Pat
         "CUEQC_MODEL_PATH_BY_REPO",
         f"jaykwok/Qwen3-ASR-0.6B-JA-Anime-Galgame={checkpoint}",
     )
-    monkeypatch.setenv("CUEQC_DROP_APPLY_ENABLED", "1")
+    monkeypatch.setenv("CUEQC_SHADOW_ENABLED", "1")
 
     sig = cueqc.runtime_signature()
 
-    assert sig["policy"] == "cueqc_mamba_v4_binary"
+    assert sig["policy"] == "cueqc_mamba_v4_binary_shadow"
     assert sig["model_version"] == "cueqc_mamba_v4_binary"
     assert sig["decision_version"] == "cueqc_display_binary_v1"
-    assert sig["drop_apply_enabled"] is True
+    assert sig["drop_apply_enabled"] is False
     assert set(sig) == {
         "schema_version",
         "feature_schema_version",

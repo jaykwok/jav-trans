@@ -35,7 +35,7 @@ from boundary.sequence_features import (
 )
 
 DATASET_SCHEMA = "boundary_edge_refiner_dataset_v6"
-DATASET_SOURCE = "scorer_v4_predicted_island_edges"
+DATASET_SOURCE = "scorer_v5_predicted_island_edges"
 
 
 @dataclass(frozen=True)
@@ -50,8 +50,6 @@ class FrameSequenceConfig:
     speech_off_threshold: float | None = None
     frame_dilation_s: float = 0.2
     min_segment_s: float = 0.05
-    drop_gap_threshold: float = 0.5
-    split_target_s: float = 5.0
     split_smooth_s: float = 0.08
     split_nms_s: float = 0.20
     split_snap_s: float = 0.10
@@ -80,8 +78,6 @@ class FrameSequenceConfig:
             ptm=ptm_repo_id,
             model_path="",
             min_segment_s=self.min_segment_s,
-            drop_gap_threshold=self.drop_gap_threshold,
-            split_target_s=self.split_target_s,
             split_smooth_s=self.split_smooth_s,
             split_nms_s=self.split_nms_s,
             split_snap_s=self.split_snap_s,
@@ -352,7 +348,7 @@ def _sequence_row(
     ptm: np.ndarray,
     mfcc: np.ndarray,
     scorer_signature: Mapping[str, Any],
-    probabilities: tuple[np.ndarray, np.ndarray, np.ndarray],
+    probabilities: tuple[np.ndarray, np.ndarray],
     config: FrameSequenceConfig,
 ) -> dict[str, Any] | None:
     true_segments = _record_segments(record)
@@ -361,11 +357,10 @@ def _sequence_row(
 
     ptm_repo_id = _manifest_ptm_repo_id(manifest_row)
     frame_hop_s = float(manifest_row.get("frame_hop_s") or record.frame_hop_s or config.frame_hop_s)
-    speech_probs, split_probs, drop_gap_probs = probabilities
+    speech_probs, split_probs = probabilities
     decoded = decode_frame_boundary_segments(
         speech_probabilities=speech_probs,
         split_probabilities=split_probs,
-        drop_gap_probabilities=drop_gap_probs,
         duration_s=record.duration_s,
         config=config.decoder_config(frame_hop_s=frame_hop_s, ptm_repo_id=ptm_repo_id),
     )
@@ -493,9 +488,7 @@ def _sequence_row(
                 "speech_on_threshold": float(decoded.speech_on_threshold),
                 "speech_off_threshold": float(decoded.speech_off_threshold),
                 "frame_dilation_s": float(config.frame_dilation_s),
-                "drop_gap_threshold": float(config.drop_gap_threshold),
-                "split_strategy": "adaptive_topk_peak",
-                "split_target_s": float(config.split_target_s),
+                "split_strategy": "adaptive_topographic_time_valley_peak",
                 "split_score_quantile": float(config.split_score_quantile),
                 "split_prominence_quantile": float(config.split_prominence_quantile),
                 "split_smooth_s": float(config.split_smooth_s),
@@ -736,8 +729,6 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--speech-off-threshold", type=float, default=None)
     parser.add_argument("--frame-dilation-s", type=float, default=0.2)
     parser.add_argument("--min-segment-s", type=float, default=0.05)
-    parser.add_argument("--drop-gap-threshold", type=float, default=0.5)
-    parser.add_argument("--split-target-s", type=float, default=5.0)
     parser.add_argument("--split-score-quantile", type=float, default=0.50)
     parser.add_argument("--split-prominence-quantile", type=float, default=0.50)
     parser.add_argument("--split-smooth-s", type=float, default=0.08)
@@ -768,8 +759,6 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         parser.error("--frame-dilation-s must be non-negative")
     if args.min_segment_s < 0.0 or args.min_split_segment_s < 0.0:
         parser.error("minimum segment durations must be non-negative")
-    if args.split_target_s < 0.0:
-        parser.error("--split-target-s must be non-negative")
     for name in ("split_score_quantile", "split_prominence_quantile"):
         value = float(getattr(args, name))
         if not 0.0 <= value <= 1.0:
@@ -809,8 +798,6 @@ def main(argv: list[str] | None = None) -> None:
             speech_off_threshold=args.speech_off_threshold,
             frame_dilation_s=args.frame_dilation_s,
             min_segment_s=args.min_segment_s,
-            drop_gap_threshold=args.drop_gap_threshold,
-            split_target_s=args.split_target_s,
             split_score_quantile=args.split_score_quantile,
             split_prominence_quantile=args.split_prominence_quantile,
             split_smooth_s=args.split_smooth_s,

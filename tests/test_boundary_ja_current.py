@@ -72,7 +72,7 @@ def _mamba2_scorer_config(*, ptm_dim: int, mfcc_dim: int) -> dict:
         "n_groups": 1,
         "chunk_size": 4,
         "bidirectional": True,
-        "output_dim": 3,
+        "output_dim": 2,
     }
 
 
@@ -90,7 +90,7 @@ def _build_mamba2_scorer(*, ptm_dim: int, mfcc_dim: int):
 
 
 def _registered_placeholder(tmp_path: Path, repo_id: str) -> Path:
-    path = tmp_path / f"speech_boundary_ja_frame_boundary_scorer_v4.{qwen_asr_repo_tag(repo_id)}.pt"
+    path = tmp_path / f"speech_boundary_ja_frame_boundary_scorer_v5.{qwen_asr_repo_tag(repo_id)}.pt"
     path.write_bytes(b"placeholder")
     return path
 
@@ -141,23 +141,44 @@ def test_label_record_and_endpoint_targets_keep_boundary_metadata():
             frame_hop_s=0.1,
         ),
         boundary_metadata={
-            "cut_drop_zones": [{"start": 0.3, "end": 0.7}],
             "cut_point_segments": [{"time_s": 0.5}],
         },
     )
 
-    starts, ends, drop_gaps, split_points = endpoint_targets_from_record(
+    starts, ends, split_points = endpoint_targets_from_record(
         record,
         frame_count=10,
         boundary_radius_frames=0,
-        drop_gap_min_gap_s=0.5,
         split_boundary_radius_frames=0,
     )
 
-    assert record.boundary_metadata["cut_drop_zones"] == [{"start": 0.3, "end": 0.7}]
     assert starts.tolist() == [1, 0, 0, 0, 0, 0, 0, 1, 0, 0]
     assert ends.tolist() == [0, 0, 1, 0, 0, 0, 0, 0, 0, 1]
-    assert drop_gaps.tolist() == [0, 0, 0, 1, 1, 1, 1, 0, 0, 0]
+    assert split_points.tolist()[5] == 1
+
+
+def test_endpoint_targets_mark_supervised_gap_boundaries_as_split_points():
+    record = replace(
+        build_supervised_record(
+            audio_id="clip",
+            source="unit",
+            duration_s=1.0,
+            speech_segments=[TeacherSegment(0.0, 0.2), TeacherSegment(0.8, 1.0)],
+            frame_hop_s=0.1,
+        ),
+        boundary_metadata={
+            "cut_point_segments": [{"time_s": 0.5}],
+            "disable_implicit_gap_drop": True,
+        },
+    )
+
+    _starts, _ends, split_points = endpoint_targets_from_record(
+        record,
+        frame_count=10,
+        boundary_radius_frames=0,
+        split_boundary_radius_frames=0,
+    )
+
     assert split_points.tolist()[5] == 1
 
 
@@ -188,11 +209,9 @@ def test_feature_training_arrays_support_head_specific_frame_weights(tmp_path):
         ),
         frame_weights=[1.0] * 10,
         boundary_metadata={
-            "cut_drop_zones": [{"start": 0.3, "end": 0.7}],
             "head_frame_weights": {
                 "speech": [1.0] * 10,
                 "split_boundary": [0.5] * 10,
-                "drop_gap": [0.0 if 3 <= index < 7 else 1.0 for index in range(10)],
             },
         },
     )
@@ -200,13 +219,11 @@ def test_feature_training_arrays_support_head_specific_frame_weights(tmp_path):
     _features, labels, weights = _feature_training_arrays(
         row={"label_index": 0, "feature_path": cached.feature_path},
         records=[record],
-        drop_gap_min_gap_s=0.5,
     )
 
-    assert labels[4, 2] == 1.0
+    assert labels.shape == (10, 2)
     assert weights[:, 0].tolist() == [1.0] * 10
     assert weights[:, 1].tolist() == [0.5] * 10
-    assert weights[4, 2] == 0.0
 
 
 def test_feature_training_arrays_reject_bad_head_weight_length(tmp_path):
@@ -235,10 +252,10 @@ def test_feature_training_arrays_reject_bad_head_weight_length(tmp_path):
             frame_hop_s=0.1,
         ),
         frame_weights=[1.0] * 5,
-        boundary_metadata={"head_frame_weights": {"drop_gap": [1.0, 1.0]}},
+        boundary_metadata={"head_frame_weights": {"split_boundary": [1.0, 1.0]}},
     )
 
-    with pytest.raises(ValueError, match="head_frame_weights.drop_gap length"):
+    with pytest.raises(ValueError, match="head_frame_weights.split_boundary length"):
         _feature_training_arrays(
             row={"label_index": 0, "feature_path": cached.feature_path},
             records=[record],
@@ -356,10 +373,9 @@ def test_write_jsonl_and_bootstrap_backend_signature(tmp_path):
 
     assert path.read_text(encoding="utf-8").strip()
     assert DEFAULT_MODEL_PATH == "models/jaykwok-Qwen3-ASR-1.7B-JA-Anime-Galgame"
-    assert DEFAULT_OPERATING_POINT == "qwen-mamba2-frame-boundary-scorer-v4"
+    assert DEFAULT_OPERATING_POINT == "qwen-mamba2-frame-boundary-scorer-v5"
     assert cfg.ptm == QWEN_ASR_REPO_ID
     assert cfg.threshold == 0.5
-    assert cfg.drop_gap_threshold == 0.5
     assert cfg.scorer_checkpoint == ""
     assert cfg.scorer_checkpoint_repo_id == ""
     assert not hasattr(cfg, "imitation_checkpoint")
@@ -395,7 +411,7 @@ def test_backend_scorer_defaults_to_registered_17b_checkpoint(monkeypatch, tmp_p
     assert cfg.scorer_checkpoint_repo_id == QWEN_ASR_17B_REPO_ID
 
 def test_backend_scorer_checkpoint_env_resolves_by_ptm_repo_id(monkeypatch, tmp_path):
-    checkpoint_path = tmp_path / "speech_boundary_ja_frame_boundary_scorer_v4.pt"
+    checkpoint_path = tmp_path / "speech_boundary_ja_frame_boundary_scorer_v5.pt"
     checkpoint_path.write_bytes(b"checkpoint")
     monkeypatch.setenv("SPEECH_BOUNDARY_JA_PTM", QWEN_ASR_17B_REPO_ID)
     monkeypatch.setenv(
@@ -410,15 +426,6 @@ def test_backend_scorer_checkpoint_env_resolves_by_ptm_repo_id(monkeypatch, tmp_
     sig = SpeechBoundaryJaBackend(cfg).signature()
     assert sig["scorer_checkpoint"] == str(checkpoint_path.resolve())
     assert sig["scorer_checkpoint_repo_id"] == QWEN_ASR_17B_REPO_ID
-
-
-def test_backend_scorer_checkpoint_rejects_legacy_single_path_env(monkeypatch):
-    monkeypatch.setenv("SPEECH_BOUNDARY_JA_SCORER_CHECKPOINT", "old.pt")
-    monkeypatch.delenv("SPEECH_BOUNDARY_JA_SCORER_CHECKPOINT_BY_REPO", raising=False)
-
-    with pytest.raises(RuntimeError, match="SCORER_CHECKPOINT_BY_REPO"):
-        SpeechBoundaryJaConfig.from_env()
-
 
 def test_backend_scorer_checkpoint_rejects_repo_metadata_mismatch():
     scorer = SimpleNamespace(metadata={"ptm_repo_id": QWEN_ASR_06B_REPO_ID})
@@ -452,14 +459,13 @@ def test_scorer_split_uses_adaptive_peaks_below_old_absolute_threshold(monkeypat
 
     frame_hop_s = 0.1
     cfg = replace(
-        SpeechBoundaryJaConfig.from_env(),
+        SpeechBoundaryJaConfig(),
         frame_hop_s=frame_hop_s,
         threshold=0.5,
         frame_dilation_s=0.0,
         min_segment_s=0.0,
     )
 
-    assert cfg.split_target_s == pytest.approx(5.0)
     assert cfg.split_score_quantile == pytest.approx(0.50)
     assert not hasattr(cfg, "split_threshold")
     assert not hasattr(cfg, "split_prominence")
@@ -471,15 +477,59 @@ def test_scorer_split_uses_adaptive_peaks_below_old_absolute_threshold(monkeypat
     result = decode_frame_boundary_segments(
         speech_probabilities=np.full(frame_count, 0.9, dtype=np.float32),
         split_probabilities=split_probs,
-        drop_gap_probabilities=np.zeros(frame_count, dtype=np.float32),
         duration_s=60.0,
         config=cfg,
     )
 
-    assert len(result.segments) > 2
-    assert max(segment.end - segment.start for segment in result.segments) < 20.0
+    assert len(result.segments) == 10
+    assert max(segment.end - segment.start for segment in result.segments) < 8.0
 
 
+
+
+def test_scorer_split_peak_selection_keeps_all_effective_peaks_after_nms():
+    frame_hop_s = 0.1
+    cfg = SpeechBoundaryJaConfig(
+        frame_hop_s=frame_hop_s,
+        threshold=0.5,
+        speech_on_threshold=0.5,
+        speech_off_threshold=0.5,
+        frame_dilation_s=0.0,
+        min_segment_s=0.0,
+        split_smooth_s=0.0,
+        split_nms_s=0.2,
+        split_snap_s=0.0,
+        min_split_segment_s=0.1,
+        split_score_quantile=0.0,
+        split_prominence_quantile=0.0,
+    )
+    frame_total = 428
+    split_probs = np.full(frame_total, 0.02, dtype=np.float32)
+    for frame, value in (
+        (35, 0.45),
+        (42, 0.44),
+        (61, 0.21),
+        (65, 0.32),
+        (109, 0.39),
+        (146, 0.29),
+        (326, 0.38),
+        (340, 0.40),
+        (163, 0.28),
+        (191, 0.29),
+        (277, 0.19),
+    ):
+        split_probs[frame - 1 : frame + 2] = [0.08, value, 0.08]
+
+    result = decode_frame_boundary_segments(
+        speech_probabilities=np.full(frame_total, 0.9, dtype=np.float32),
+        split_probabilities=split_probs,
+        duration_s=42.8,
+        config=cfg,
+    )
+
+    assert len(result.segments) == 12
+    assert max(segment.end - segment.start for segment in result.segments) < 9.0
+    assert any(15.0 <= segment.start <= 20.0 for segment in result.segments)
 
 
 def test_feature_frame_scorer_checkpoint_round_trip(tmp_path):
@@ -498,7 +548,7 @@ def test_feature_frame_scorer_checkpoint_round_trip(tmp_path):
     torch.save(checkpoint, checkpoint_path)
 
     bundle = load_feature_frame_scorer_checkpoint(checkpoint_path, device="cpu")
-    speech_probs, split_probs, drop_gap_probs = score_feature_frame_boundary_probabilities(
+    speech_probs, split_probs = score_feature_frame_boundary_probabilities(
         bundle,
         ptm=np.ones((3, 4), dtype=np.float32),
         mfcc=np.ones((3, 2), dtype=np.float32),
@@ -509,10 +559,8 @@ def test_feature_frame_scorer_checkpoint_round_trip(tmp_path):
     assert bundle.input_dim == 6
     assert speech_probs.shape == (3,)
     assert split_probs.shape == (3,)
-    assert drop_gap_probs.shape == (3,)
     assert np.all((0.0 <= speech_probs) & (speech_probs <= 1.0))
     assert np.all((0.0 <= split_probs) & (split_probs <= 1.0))
-    assert np.all((0.0 <= drop_gap_probs) & (drop_gap_probs <= 1.0))
 
 
 
@@ -538,7 +586,7 @@ def test_feature_frame_scorer_rejects_removed_v1_schema(tmp_path):
         checkpoint_path,
     )
 
-    with pytest.raises(ValueError, match="speech_boundary_ja_mamba2_frame_boundary_scorer_v4"):
+    with pytest.raises(ValueError, match="speech_boundary_ja_mamba2_frame_boundary_scorer_v5"):
         load_feature_frame_scorer_checkpoint(checkpoint_path, device="cpu")
 
 
@@ -565,7 +613,7 @@ def test_feature_frame_scorer_training_from_cached_features(tmp_path):
                 "source_mix": {"speech": [{"source_group": "unit"}]},
                 "speech_label_dilation_s": 0.06,
                 "split_boundary_radius_frames": 1,
-                "drop_policy": "unit",
+                "negative_policy": "unit",
                 "seed": 7,
             },
         ),
@@ -628,7 +676,6 @@ def test_feature_frame_scorer_training_from_cached_features(tmp_path):
     assert metrics.input_dim == 5
     assert 0.0 <= metrics.speech_f1 <= 1.0
     assert 0.0 <= metrics.split_boundary_f1 <= 1.0
-    assert 0.0 <= metrics.drop_gap_f1 <= 1.0
     bundle = load_feature_frame_scorer_checkpoint(metrics.checkpoint, device="cpu")
     assert bundle.signature()["metadata"]["trained_steps"] == 2
     assert bundle.signature()["metadata"]["ptm_repo_id"] == QWEN_ASR_17B_REPO_ID
@@ -727,7 +774,7 @@ def test_backend_scorer_is_opt_in_and_keeps_segment_contract(tmp_path, monkeypat
     assert result.segments
     assert result.segments[0].start == 0.0
     assert result.segments[0].end > result.segments[0].start
-    assert result.parameters["runtime_device"]["score_model"] == "mamba2_frame_boundary_scorer_v4"
+    assert result.parameters["runtime_device"]["score_model"] == "mamba2_frame_boundary_scorer_v5"
     assert result.parameters["scorer_checkpoint"]["schema"] == MAMBA2_FRAME_SCORER_SCHEMA
     assert SpeechBoundaryJaConfig().scorer_checkpoint == ""
     assert SpeechBoundaryJaBackend(SpeechBoundaryJaConfig()).signature()["scorer_checkpoint"] == ""

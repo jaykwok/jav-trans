@@ -51,7 +51,6 @@ def export_frame_scores(*, audio_path: Path, output_path: Path) -> dict[str, Any
 
     scores = result.parameters.get("frame_scores") or []
     split_scores = result.parameters.get("split_boundary_frame_scores") or []
-    drop_gap_scores = result.parameters.get("drop_gap_frame_scores") or []
     payload = {
         "audio_path": project_rel(audio_path),
         "backend": result.method,
@@ -59,13 +58,10 @@ def export_frame_scores(*, audio_path: Path, output_path: Path) -> dict[str, Any
         "frame_hop_s": float(result.parameters.get("frame_hop_s") or 0.02),
         "frame_count": len(scores),
         "split_boundary_frame_count": len(split_scores),
-        "drop_gap_frame_count": len(drop_gap_scores),
         "threshold": float(result.parameters.get("threshold") or 0.0),
         "split_strategy": result.parameters.get("split_strategy") or "",
-        "split_target_s": float(result.parameters.get("split_target_s") or 0.0),
         "split_score_quantile": float(result.parameters.get("split_score_quantile") or 0.0),
         "split_prominence_quantile": float(result.parameters.get("split_prominence_quantile") or 0.0),
-        "drop_gap_threshold": float(result.parameters.get("drop_gap_threshold") or 0.0),
         "segments": [
             {"start": float(segment.start), "end": float(segment.end), "score": segment.score}
             for segment in result.segments
@@ -74,7 +70,6 @@ def export_frame_scores(*, audio_path: Path, output_path: Path) -> dict[str, Any
         "runtime_device": result.parameters.get("runtime_device") or {},
         "scores": [float(value) for value in scores],
         "split_boundary_scores": [float(value) for value in split_scores],
-        "drop_gap_scores": [float(value) for value in drop_gap_scores],
     }
     write_json(output_path, payload)
     return payload
@@ -97,7 +92,7 @@ def run(args: argparse.Namespace) -> None:
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Export SpeechBoundary-JA v4 per-frame speech/split/drop_gap scores."
+        description="Export SpeechBoundary-JA v5 per-frame speech/split scores."
     )
     parser.add_argument("--audio", required=True, help="16k wav or workflow audio path.")
     parser.add_argument(

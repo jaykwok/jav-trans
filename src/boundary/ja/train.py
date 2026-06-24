@@ -78,16 +78,11 @@ class FeatureScorerTrainConfig:
     split_positive_weight: float = 4.0
     split_negative_weight: float = 1.0
     split_loss_weight: float = 1.0
-    drop_gap_positive_weight: float = 4.0
-    drop_gap_negative_weight: float = 1.0
-    drop_gap_loss_weight: float = 1.0
-    drop_gap_min_gap_s: float = 0.5
     split_boundary_radius_frames: int = 1
     focal_gamma: float = 2.0
     eval_ratio: float = 0.1
     threshold: float = 0.5
     split_threshold: float = 0.5
-    drop_gap_threshold: float = 0.5
     max_eval_windows: int = 256
     log_every: int = 0
 
@@ -110,12 +105,6 @@ class FeatureScorerTrainMetrics:
     split_boundary_precision: float
     split_boundary_recall: float
     split_boundary_f1: float
-    drop_gap_frame_accuracy: float
-    drop_gap_positive_ratio: float
-    drop_gap_predicted_positive_ratio: float
-    drop_gap_precision: float
-    drop_gap_recall: float
-    drop_gap_f1: float
     train_windows: int
     eval_windows: int
     input_dim: int
@@ -125,15 +114,11 @@ class FeatureScorerTrainMetrics:
     metrics_path: str
     threshold: float
     split_threshold: float
-    drop_gap_threshold: float
     positive_weight: float
     negative_weight: float
     split_positive_weight: float
     split_negative_weight: float
     split_loss_weight: float
-    drop_gap_positive_weight: float
-    drop_gap_negative_weight: float
-    drop_gap_loss_weight: float
     focal_gamma: float
 
 
@@ -215,7 +200,7 @@ def train_feature_frame_scorer(
     config: FeatureScorerTrainConfig,
     labels_path: str = "",
     feature_manifest_path: str = "",
-    checkpoint_name: str = "speech_boundary_ja_frame_boundary_scorer_v4.pt",
+    checkpoint_name: str = "speech_boundary_ja_frame_boundary_scorer_v5.pt",
 ) -> FeatureScorerTrainMetrics:
     import torch
 
@@ -223,7 +208,7 @@ def train_feature_frame_scorer(
     if not rows:
         raise ValueError("at least one feature manifest row is required")
     output_dir.mkdir(parents=True, exist_ok=True)
-    checkpoint_name = checkpoint_name.strip() or "speech_boundary_ja_frame_boundary_scorer_v4.pt"
+    checkpoint_name = checkpoint_name.strip() or "speech_boundary_ja_frame_boundary_scorer_v5.pt"
     if Path(checkpoint_name).name != checkpoint_name:
         raise ValueError("checkpoint_name must be a file name, not a path")
     checkpoint_path = output_dir / checkpoint_name
@@ -248,14 +233,6 @@ def train_feature_frame_scorer(
         raise ValueError("split_negative_weight must be positive")
     if config.split_loss_weight <= 0.0:
         raise ValueError("split_loss_weight must be positive")
-    if config.drop_gap_positive_weight <= 0.0:
-        raise ValueError("drop_gap_positive_weight must be positive")
-    if config.drop_gap_negative_weight <= 0.0:
-        raise ValueError("drop_gap_negative_weight must be positive")
-    if config.drop_gap_loss_weight <= 0.0:
-        raise ValueError("drop_gap_loss_weight must be positive")
-    if config.drop_gap_min_gap_s < 0.0:
-        raise ValueError("drop_gap_min_gap_s must be non-negative")
     if config.split_boundary_radius_frames < 0:
         raise ValueError("split_boundary_radius_frames must be non-negative")
     if config.focal_gamma < 0.0:
@@ -288,7 +265,6 @@ def train_feature_frame_scorer(
     normalization = compute_feature_normalization(
         records=records,
         feature_manifest_rows=train_rows,
-        drop_gap_min_gap_s=config.drop_gap_min_gap_s,
         split_boundary_radius_frames=config.split_boundary_radius_frames,
         log_every=max(0, int(config.log_every)),
         total_rows=len(train_rows),
@@ -314,7 +290,6 @@ def train_feature_frame_scorer(
             row=row,
             records=records,
             normalization=normalization,
-            drop_gap_min_gap_s=config.drop_gap_min_gap_s,
             split_boundary_radius_frames=config.split_boundary_radius_frames,
         )
         if float(np.sum(weights)) <= 0.0:
@@ -332,9 +307,6 @@ def train_feature_frame_scorer(
             split_positive_weight=config.split_positive_weight,
             split_negative_weight=config.split_negative_weight,
             split_loss_weight=config.split_loss_weight,
-            drop_gap_positive_weight=config.drop_gap_positive_weight,
-            drop_gap_negative_weight=config.drop_gap_negative_weight,
-            drop_gap_loss_weight=config.drop_gap_loss_weight,
             focal_gamma=config.focal_gamma,
         )
         optimizer.zero_grad(set_to_none=True)
@@ -367,10 +339,6 @@ def train_feature_frame_scorer(
         split_positive_weight=config.split_positive_weight,
         split_negative_weight=config.split_negative_weight,
         split_loss_weight=config.split_loss_weight,
-        drop_gap_positive_weight=config.drop_gap_positive_weight,
-        drop_gap_negative_weight=config.drop_gap_negative_weight,
-        drop_gap_loss_weight=config.drop_gap_loss_weight,
-        drop_gap_min_gap_s=config.drop_gap_min_gap_s,
         split_boundary_radius_frames=config.split_boundary_radius_frames,
         focal_gamma=config.focal_gamma,
     )
@@ -385,7 +353,7 @@ def train_feature_frame_scorer(
             model_config=model_config,
             normalization=normalization,
             metadata={
-                "operating_point": "qwen-mamba2-frame-boundary-scorer-v4-native",
+                "operating_point": "qwen-mamba2-frame-boundary-scorer-v5-native",
                 "ptm_repo_id": ptm_repo_id,
                 "labels": labels_path,
                 "feature_manifest": feature_manifest_path,
@@ -403,9 +371,6 @@ def train_feature_frame_scorer(
                     "split_positive_weight": float(config.split_positive_weight),
                     "split_negative_weight": float(config.split_negative_weight),
                     "split_loss_weight": float(config.split_loss_weight),
-                    "drop_gap_positive_weight": float(config.drop_gap_positive_weight),
-                    "drop_gap_negative_weight": float(config.drop_gap_negative_weight),
-                    "drop_gap_loss_weight": float(config.drop_gap_loss_weight),
                     "focal_gamma": float(config.focal_gamma),
                 },
                 "config": asdict(config),
@@ -431,12 +396,6 @@ def train_feature_frame_scorer(
         split_boundary_precision=float(eval_metrics["split_boundary_precision"]),
         split_boundary_recall=float(eval_metrics["split_boundary_recall"]),
         split_boundary_f1=float(eval_metrics["split_boundary_f1"]),
-        drop_gap_frame_accuracy=float(eval_metrics["drop_gap_frame_accuracy"]),
-        drop_gap_positive_ratio=float(eval_metrics["drop_gap_positive_ratio"]),
-        drop_gap_predicted_positive_ratio=float(eval_metrics["drop_gap_predicted_positive_ratio"]),
-        drop_gap_precision=float(eval_metrics["drop_gap_precision"]),
-        drop_gap_recall=float(eval_metrics["drop_gap_recall"]),
-        drop_gap_f1=float(eval_metrics["drop_gap_f1"]),
         train_windows=len(train_rows),
         eval_windows=len(eval_rows),
         input_dim=input_dim,
@@ -446,15 +405,11 @@ def train_feature_frame_scorer(
         metrics_path=str(metrics_path),
         threshold=float(config.threshold),
         split_threshold=float(config.split_threshold),
-        drop_gap_threshold=float(config.drop_gap_threshold),
         positive_weight=float(config.positive_weight),
         negative_weight=float(config.negative_weight),
         split_positive_weight=float(config.split_positive_weight),
         split_negative_weight=float(config.split_negative_weight),
         split_loss_weight=float(config.split_loss_weight),
-        drop_gap_positive_weight=float(config.drop_gap_positive_weight),
-        drop_gap_negative_weight=float(config.drop_gap_negative_weight),
-        drop_gap_loss_weight=float(config.drop_gap_loss_weight),
         focal_gamma=float(config.focal_gamma),
     )
     metrics_path.write_text(
@@ -604,9 +559,6 @@ def weighted_frame_bce_loss(
     split_positive_weight: float = 4.0,
     split_negative_weight: float = 1.0,
     split_loss_weight: float = 1.0,
-    drop_gap_positive_weight: float = 4.0,
-    drop_gap_negative_weight: float = 1.0,
-    drop_gap_loss_weight: float = 1.0,
     focal_gamma: float = 0.0,
 ):
     import torch
@@ -630,18 +582,12 @@ def weighted_frame_bce_loss(
         torch.full_like(labels[..., 1], float(split_positive_weight)),
         torch.full_like(labels[..., 1], float(split_negative_weight)),
     )
-    drop_gap_class_weights = torch.where(
-        labels[..., 2] > 0.5,
-        torch.full_like(labels[..., 2], float(drop_gap_positive_weight)),
-        torch.full_like(labels[..., 2], float(drop_gap_negative_weight)),
-    )
     class_weights = torch.stack(
-        (speech_class_weights, split_class_weights, drop_gap_class_weights),
+        (speech_class_weights, split_class_weights),
         dim=-1,
     )
     head_weights = torch.ones_like(class_weights)
     head_weights[..., 1] = float(split_loss_weight)
-    head_weights[..., 2] = float(drop_gap_loss_weight)
     if float(focal_gamma) > 0.0:
         probabilities = torch.sigmoid(logits)
         pt = torch.where(labels > 0.5, probabilities, 1.0 - probabilities)
@@ -655,7 +601,6 @@ def compute_feature_normalization(
     *,
     records: list[LabelRecord],
     feature_manifest_rows: Iterable[Mapping[str, Any]],
-    drop_gap_min_gap_s: float = 0.5,
     split_boundary_radius_frames: int = 1,
     log_every: int = 0,
     total_rows: int | None = None,
@@ -672,7 +617,6 @@ def compute_feature_normalization(
         features, _labels, weights = _feature_training_arrays(
             row=row,
             records=records,
-            drop_gap_min_gap_s=drop_gap_min_gap_s,
             split_boundary_radius_frames=split_boundary_radius_frames,
         )
         frame_weight = np.max(weights, axis=1, keepdims=True).astype(np.float64, copy=False)
@@ -726,13 +670,11 @@ def feature_training_tensors(
     row: Mapping[str, Any],
     records: list[LabelRecord],
     normalization: Mapping[str, Any],
-    drop_gap_min_gap_s: float = 0.5,
     split_boundary_radius_frames: int = 1,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     features, labels, weights = _feature_training_arrays(
         row=row,
         records=records,
-        drop_gap_min_gap_s=drop_gap_min_gap_s,
         split_boundary_radius_frames=split_boundary_radius_frames,
     )
     mean = np.asarray(normalization["feature_mean"], dtype=np.float32)
@@ -756,24 +698,18 @@ def evaluate_feature_frame_scorer(
     device: Any,
     threshold: float = 0.5,
     split_threshold: float = 0.5,
-    drop_gap_threshold: float = 0.5,
     max_windows: int = 256,
     positive_weight: float = 1.0,
     negative_weight: float = 15.0,
     split_positive_weight: float = 4.0,
     split_negative_weight: float = 1.0,
     split_loss_weight: float = 1.0,
-    drop_gap_positive_weight: float = 4.0,
-    drop_gap_negative_weight: float = 1.0,
-    drop_gap_loss_weight: float = 1.0,
-    drop_gap_min_gap_s: float = 0.5,
     split_boundary_radius_frames: int = 1,
     focal_gamma: float = 2.0,
 ) -> dict[str, float | int]:
     import torch
     speech_counts = empty_frame_counts()
     split_counts = empty_frame_counts()
-    drop_gap_counts = empty_frame_counts()
     loss_sum = 0.0
     weight_sum = 0.0
     windows = 0
@@ -786,7 +722,6 @@ def evaluate_feature_frame_scorer(
                 row=row,
                 records=records,
                 normalization=normalization,
-                drop_gap_min_gap_s=drop_gap_min_gap_s,
                 split_boundary_radius_frames=split_boundary_radius_frames,
             )
             if float(np.sum(weights)) <= 0.0:
@@ -804,9 +739,6 @@ def evaluate_feature_frame_scorer(
                 split_positive_weight=split_positive_weight,
                 split_negative_weight=split_negative_weight,
                 split_loss_weight=split_loss_weight,
-                drop_gap_positive_weight=drop_gap_positive_weight,
-                drop_gap_negative_weight=drop_gap_negative_weight,
-                drop_gap_loss_weight=drop_gap_loss_weight,
                 focal_gamma=focal_gamma,
             )
             loss_sum += float((loss * effective_weight_sum).detach().cpu())
@@ -826,17 +758,9 @@ def evaluate_feature_frame_scorer(
                     labels=labels[:, 1][split_mapk],
                     predictions=(probabilities[:, 1][split_mapk] >= float(split_threshold)).astype(np.float32),
                 )
-            drop_gap_mapk = weights[:, 2] > 0.0
-            if bool(drop_gap_mapk.any()):
-                update_frame_counts(
-                    drop_gap_counts,
-                    labels=labels[:, 2][drop_gap_mapk],
-                    predictions=(probabilities[:, 2][drop_gap_mapk] >= float(drop_gap_threshold)).astype(np.float32),
-                )
             windows += 1
     speech_metrics = metrics_from_frame_counts(counts=speech_counts, windows=windows, threshold=threshold)
     split_metrics = metrics_from_frame_counts(counts=split_counts, windows=windows, threshold=split_threshold)
-    drop_gap_metrics = metrics_from_frame_counts(counts=drop_gap_counts, windows=windows, threshold=drop_gap_threshold)
     return {
         "loss": loss_sum / max(1e-6, weight_sum),
         "speech_frame_accuracy": speech_metrics.frame_accuracy,
@@ -853,13 +777,6 @@ def evaluate_feature_frame_scorer(
         "split_boundary_recall": split_metrics.recall,
         "split_boundary_f1": split_metrics.f1,
         "split_boundary_frames": split_counts["frames"],
-        "drop_gap_frame_accuracy": drop_gap_metrics.frame_accuracy,
-        "drop_gap_positive_ratio": drop_gap_metrics.positive_ratio,
-        "drop_gap_predicted_positive_ratio": drop_gap_metrics.predicted_positive_ratio,
-        "drop_gap_precision": drop_gap_metrics.precision,
-        "drop_gap_recall": drop_gap_metrics.recall,
-        "drop_gap_f1": drop_gap_metrics.f1,
-        "drop_gap_frames": drop_gap_counts["frames"],
         "windows": windows,
     }
 
@@ -976,7 +893,6 @@ def _feature_training_arrays(
     *,
     row: Mapping[str, Any],
     records: list[LabelRecord],
-    drop_gap_min_gap_s: float = 0.5,
     split_boundary_radius_frames: int = 1,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     label_index = int(row["label_index"])
@@ -986,16 +902,13 @@ def _feature_training_arrays(
     frame_total = min(ptm.shape[0], mfcc.shape[0], len(record.speech_frames), len(base_weights))
     if frame_total <= 0:
         raise ValueError(f"feature row has no usable frames: label_index={label_index}")
-    _starts, _ends, drop_gap_targets, split_targets = endpoint_targets_from_record(
+    _speech_targets, split_targets = scorer_v5_targets_from_record(
         record,
         frame_count=frame_total,
-        boundary_radius_frames=0,
-        drop_gap_min_gap_s=drop_gap_min_gap_s,
         split_boundary_radius_frames=split_boundary_radius_frames,
     )
-    speech_labels = np.asarray(record.speech_frames[:frame_total], dtype=np.float32)
+    speech_labels = _speech_targets[:frame_total].astype(np.float32)
     split_labels = split_targets[:frame_total].astype(np.float32)
-    drop_gap_labels = drop_gap_targets[:frame_total].astype(np.float32)
     frame_weights = base_weights[:frame_total].astype(np.float32, copy=False)
     head_weights = _head_frame_weights(
         record=record,
@@ -1011,7 +924,7 @@ def _feature_training_arrays(
     )
     return (
         features,
-        np.stack((speech_labels, split_labels, drop_gap_labels), axis=1).astype(np.float32, copy=False),
+        np.stack((speech_labels, split_labels), axis=1).astype(np.float32, copy=False),
         head_weights,
     )
 
@@ -1029,13 +942,12 @@ def _head_frame_weights(
     metadata = dict(record.boundary_metadata or {})
     raw_weights = metadata.get("head_frame_weights")
     if raw_weights is None:
-        return np.stack((base, base, base), axis=1).astype(np.float32, copy=False)
+        return np.stack((base, base), axis=1).astype(np.float32, copy=False)
     if not isinstance(raw_weights, Mapping):
         raise ValueError("boundary_metadata.head_frame_weights must be a mapping")
     aliases = {
         "speech": ("speech", "speech_prob"),
         "split_boundary": ("split_boundary", "split", "split_boundary_prob"),
-        "drop_gap": ("drop_gap", "drop", "drop_gap_prob"),
     }
     columns: list[np.ndarray] = []
     for canonical, names in aliases.items():
@@ -1055,6 +967,29 @@ def _head_frame_weights(
             )
         columns.append((base * values[:frame_total]).astype(np.float32, copy=False))
     return np.stack(columns, axis=1).astype(np.float32, copy=False)
+
+
+def scorer_v5_targets_from_record(
+    record: LabelRecord,
+    *,
+    frame_count: int,
+    split_boundary_radius_frames: int = 1,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Return the two active Scorer v5 frame targets: speech and split boundary."""
+
+    frame_count = max(0, int(frame_count))
+    speech = np.asarray(record.speech_frames[:frame_count], dtype=np.float32)
+    if speech.shape[0] < frame_count:
+        speech = np.pad(speech, (0, frame_count - int(speech.shape[0])), mode="constant")
+    split = np.zeros(frame_count, dtype=np.float32)
+    if frame_count <= 0:
+        return speech.astype(np.float32, copy=False), split
+    cut_radius = max(0, int(split_boundary_radius_frames))
+    metadata = dict(record.boundary_metadata or {})
+    for point_time in metadata_cut_points(metadata.get("cut_point_segments")):
+        point_index = max(0, min(frame_count - 1, int(round(point_time / record.frame_hop_s))))
+        split[max(0, point_index - cut_radius) : min(frame_count, point_index + cut_radius + 1)] = 1.0
+    return speech.astype(np.float32, copy=False), split
 
 
 def resize_binary_frames(values: np.ndarray, target_frames: int) -> np.ndarray:
@@ -1078,16 +1013,14 @@ def endpoint_targets_from_record(
     *,
     frame_count: int,
     boundary_radius_frames: int = 1,
-    drop_gap_min_gap_s: float = 0.5,
     split_boundary_radius_frames: int = 0,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     frame_count = max(0, int(frame_count))
     startp = np.zeros(frame_count, dtype=np.float32)
     endp = np.zeros(frame_count, dtype=np.float32)
-    cut_dropp = np.zeros(frame_count, dtype=np.float32)
     cut_pointp = np.zeros(frame_count, dtype=np.float32)
     if frame_count <= 0:
-        return startp, endp, cut_dropp, cut_pointp
+        return startp, endp, cut_pointp
     segments = supervised_segments_for_record(record)
     radius = max(0, int(boundary_radius_frames))
     for segment in segments:
@@ -1095,47 +1028,27 @@ def endpoint_targets_from_record(
         end_index = max(0, min(frame_count - 1, int(round(segment.end / record.frame_hop_s)) - 1))
         startp[max(0, start_index - radius) : min(frame_count, start_index + radius + 1)] = 1.0
         endp[max(0, end_index - radius) : min(frame_count, end_index + radius + 1)] = 1.0
-    min_gap = max(0.0, float(drop_gap_min_gap_s))
     cut_radius = max(0, int(split_boundary_radius_frames))
     metadata = dict(record.boundary_metadata or {})
-    for zone_start, zone_end in metadata_time_spans(metadata.get("cut_drop_zones")):
-        start_index, end_index = time_span_to_frame_range(
-            zone_start,
-            zone_end,
-            frame_count=frame_count,
-            frame_hop_s=record.frame_hop_s,
-        )
-        if end_index > start_index:
-            cut_dropp[start_index:end_index] = 1.0
     for point_time in metadata_cut_points(metadata.get("cut_point_segments")):
         point_index = max(0, min(frame_count - 1, int(round(point_time / record.frame_hop_s))))
         cut_pointp[max(0, point_index - cut_radius) : min(frame_count, point_index + cut_radius + 1)] = 1.0
     for previoup, current in zip(segments, segments[1:]):
         gap_start = previoup.end
         gap_end = current.start
-        if gap_end - gap_start < min_gap:
-            if cut_radius <= 0:
-                continue
-            for boundary in (gap_start, gap_end):
-                boundary_index = max(
-                    0,
-                    min(frame_count - 1, int(round(boundary / record.frame_hop_s))),
-                )
-                cut_pointp[
-                    max(0, boundary_index - cut_radius) : min(
-                        frame_count, boundary_index + cut_radius + 1
-                    )
-                ] = 1.0
+        if cut_radius <= 0:
             continue
-        start_index, end_index = time_span_to_frame_range(
-            gap_start,
-            gap_end,
-            frame_count=frame_count,
-            frame_hop_s=record.frame_hop_s,
-        )
-        if end_index > start_index:
-            cut_dropp[start_index:end_index] = 1.0
-    return startp, endp, cut_dropp, cut_pointp
+        for boundary in (gap_start, gap_end):
+            boundary_index = max(
+                0,
+                min(frame_count - 1, int(round(boundary / record.frame_hop_s))),
+            )
+            cut_pointp[
+                max(0, boundary_index - cut_radius) : min(
+                    frame_count, boundary_index + cut_radius + 1
+                )
+            ] = 1.0
+    return startp, endp, cut_pointp
 
 
 def time_span_to_frame_range(
@@ -1151,21 +1064,6 @@ def time_span_to_frame_range(
     start_index = max(0, min(frame_count, int(math.floor((float(start_s) / frame_hop_s) + epsilon))))
     end_index = max(0, min(frame_count, int(math.ceil((float(end_s) / frame_hop_s) - epsilon))))
     return start_index, end_index
-
-
-def metadata_time_spans(itemp: Any) -> list[tuple[float, float]]:
-    spans: list[tuple[float, float]] = []
-    for item in list(itemp or []):
-        if not isinstance(item, Mapping):
-            continue
-        try:
-            start = float(item.get("start", 0.0))
-            end = float(item.get("end", 0.0))
-        except (TypeError, ValueError):
-            continue
-        if end > start:
-            spans.append((start, end))
-    return spans
 
 
 def metadata_cut_points(itemp: Any) -> list[float]:

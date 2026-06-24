@@ -9,7 +9,7 @@ AlignmentQuality = Literal[
     "nonlexical",
     "drop_or_review",
 ]
-FallbackType = Literal["none", "unknown"]
+AlignmentIssueType = Literal["none", "unknown"]
 
 
 _NORMAL_MODES = {
@@ -31,9 +31,9 @@ def _safe_int(value: Any, default: int = 0) -> int:
         return default
 
 
-def _fallback_subtype(
+def _alignment_issue_subtype(
     *,
-    fallback_type: FallbackType,
+    alignment_issue_type: AlignmentIssueType,
     nonlexical_text: bool,
     stripped_text: str,
     duration_s: float,
@@ -46,14 +46,14 @@ def _fallback_subtype(
         return "asr_empty_text"
     if stripped_text and aligned_segment_count <= 0:
         return "text_without_output_segment"
-    if fallback_type == "unknown":
-        return "unknown_fallback"
+    if alignment_issue_type == "unknown":
+        return "unknown_alignment_mode"
     if align_error:
         return "subtitle_timing_error"
     return "none"
 
 
-def infer_alignment_fallback_type(*, alignment_mode: str) -> FallbackType:
+def infer_alignment_issue_type(*, alignment_mode: str) -> AlignmentIssueType:
     mode = (alignment_mode or "").strip()
     if mode in {"boundary_proportional", "nonlexical"}:
         return "none"
@@ -79,10 +79,10 @@ def classify_alignment_quality(
     """
 
     stripped_text = (text or "").strip()
-    fallback_type = infer_alignment_fallback_type(alignment_mode=alignment_mode)
+    alignment_issue_type = infer_alignment_issue_type(alignment_mode=alignment_mode)
     word_count = _safe_int((word_stats or {}).get("word_count"))
-    subtype = _fallback_subtype(
-        fallback_type=fallback_type,
+    subtype = _alignment_issue_subtype(
+        alignment_issue_type=alignment_issue_type,
         nonlexical_text=nonlexical_text,
         stripped_text=stripped_text,
         duration_s=duration_s,
@@ -96,8 +96,8 @@ def classify_alignment_quality(
     if nonlexical_text and not reasons:
         return {
             "alignment_quality": "nonlexical",
-            "fallback_type": fallback_type,
-            "fallback_subtype": subtype,
+            "alignment_issue_type": alignment_issue_type,
+            "alignment_issue_subtype": subtype,
             "alignment_quality_reasons": ["nonlexical_text"],
         }
     if stripped_text and aligned_segment_count <= 0:
@@ -106,24 +106,24 @@ def classify_alignment_quality(
     if reasons:
         return {
             "alignment_quality": "drop_or_review",
-            "fallback_type": fallback_type,
-            "fallback_subtype": subtype,
+            "alignment_issue_type": alignment_issue_type,
+            "alignment_issue_subtype": subtype,
             "alignment_quality_reasons": _unique(reasons),
         }
 
-    if fallback_type == "unknown":
+    if alignment_issue_type == "unknown":
         return {
             "alignment_quality": "partial",
-            "fallback_type": fallback_type,
-            "fallback_subtype": subtype,
-            "alignment_quality_reasons": ["fallback_type_unknown"],
+            "alignment_issue_type": alignment_issue_type,
+            "alignment_issue_subtype": subtype,
+            "alignment_quality_reasons": ["alignment_mode_unknown"],
         }
 
     if align_error:
         return {
             "alignment_quality": "partial",
-            "fallback_type": fallback_type,
-            "fallback_subtype": subtype,
+            "alignment_issue_type": alignment_issue_type,
+            "alignment_issue_subtype": subtype,
             "alignment_quality_reasons": ["subtitle_timing_error"],
         }
 
@@ -131,20 +131,20 @@ def classify_alignment_quality(
     if mode == "boundary_proportional" and (word_count > 0 or aligned_segment_count > 0):
         return {
             "alignment_quality": "boundary",
-            "fallback_type": fallback_type,
-            "fallback_subtype": subtype,
+            "alignment_issue_type": alignment_issue_type,
+            "alignment_issue_subtype": subtype,
             "alignment_quality_reasons": [],
         }
     if not stripped_text or mode == "empty":
         return {
             "alignment_quality": "drop_or_review",
-            "fallback_type": fallback_type,
-            "fallback_subtype": subtype,
+            "alignment_issue_type": alignment_issue_type,
+            "alignment_issue_subtype": subtype,
             "alignment_quality_reasons": ["empty_or_unaligned_text"],
         }
     return {
         "alignment_quality": "partial",
-        "fallback_type": fallback_type,
-        "fallback_subtype": subtype,
+        "alignment_issue_type": alignment_issue_type,
+        "alignment_issue_subtype": subtype,
         "alignment_quality_reasons": ["alignment_mode_missing_or_unconfirmed"],
     }

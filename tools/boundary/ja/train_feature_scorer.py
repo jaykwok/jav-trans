@@ -39,8 +39,8 @@ def _checkpoint_name(rows: list[dict[str, Any]], explicit: str = "") -> str:
         return explicit.strip()
     ptm = str(rows[0].get("ptm") or "").strip() if rows else ""
     if not ptm:
-        return "speech_boundary_ja_frame_boundary_scorer_v4.pt"
-    return f"speech_boundary_ja_frame_boundary_scorer_v4.{qwen_asr_repo_tag(ptm)}.pt"
+        return "speech_boundary_ja_frame_boundary_scorer_v5.pt"
+    return f"speech_boundary_ja_frame_boundary_scorer_v5.{qwen_asr_repo_tag(ptm)}.pt"
 
 
 def run(args: argparse.Namespace) -> None:
@@ -70,16 +70,11 @@ def run(args: argparse.Namespace) -> None:
             split_positive_weight=args.split_positive_weight,
             split_negative_weight=args.split_negative_weight,
             split_loss_weight=args.split_loss_weight,
-            drop_gap_positive_weight=args.drop_gap_positive_weight,
-            drop_gap_negative_weight=args.drop_gap_negative_weight,
-            drop_gap_loss_weight=args.drop_gap_loss_weight,
-            drop_gap_min_gap_s=args.drop_gap_min_gap_s,
             split_boundary_radius_frames=args.split_boundary_radius_frames,
             focal_gamma=args.focal_gamma,
             eval_ratio=args.eval_ratio,
             threshold=args.threshold,
             split_threshold=args.split_threshold,
-            drop_gap_threshold=args.drop_gap_threshold,
             max_eval_windows=args.max_eval_windows,
             log_every=args.log_every,
         ),
@@ -91,7 +86,7 @@ def run(args: argparse.Namespace) -> None:
     summary_path.write_text(
         json.dumps(
             {
-                "schema": "speech_boundary_ja_mamba2_frame_boundary_scorer_train_summary_v4",
+                "schema": "speech_boundary_ja_mamba2_frame_boundary_scorer_train_summary_v5",
                 "labels": str(labels_path),
                 "feature_manifest": str(feature_manifest_path),
                 "metrics": asdict(metrics),
@@ -115,7 +110,7 @@ def run(args: argparse.Namespace) -> None:
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Train a runtime-loadable SpeechBoundary-JA Mamba2 speech/split/drop-gap frame boundary scorer v4."
+        description="Train a runtime-loadable SpeechBoundary-JA Mamba2 speech/split frame boundary scorer v5."
     )
     parser.add_argument("--labels", required=True, help="SpeechBoundary-JA label JSONL.")
     parser.add_argument("--feature-manifest", required=True, help="Feature cache manifest JSONL.")
@@ -141,16 +136,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--split-positive-weight", type=float, default=4.0)
     parser.add_argument("--split-negative-weight", type=float, default=1.0)
     parser.add_argument("--split-loss-weight", type=float, default=1.0)
-    parser.add_argument("--drop-gap-positive-weight", type=float, default=4.0)
-    parser.add_argument("--drop-gap-negative-weight", type=float, default=1.0)
-    parser.add_argument("--drop-gap-loss-weight", type=float, default=1.0)
-    parser.add_argument("--drop-gap-min-gap-s", type=float, default=0.5)
     parser.add_argument("--split-boundary-radius-frames", type=int, default=1)
     parser.add_argument("--focal-gamma", type=float, default=2.0)
     parser.add_argument("--eval-ratio", type=float, default=0.1)
     parser.add_argument("--threshold", type=float, default=0.5)
     parser.add_argument("--split-threshold", type=float, default=0.5)
-    parser.add_argument("--drop-gap-threshold", type=float, default=0.5)
     parser.add_argument("--max-eval-windows", type=int, default=256)
     parser.add_argument("--log-every", type=int, default=0, help="Print train progress every N steps; 0 disables.")
     args = parser.parse_args(argv)
@@ -180,14 +170,6 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         parser.error("--split-negative-weight must be positive")
     if args.split_loss_weight <= 0.0:
         parser.error("--split-loss-weight must be positive")
-    if args.drop_gap_positive_weight <= 0.0:
-        parser.error("--drop-gap-positive-weight must be positive")
-    if args.drop_gap_negative_weight <= 0.0:
-        parser.error("--drop-gap-negative-weight must be positive")
-    if args.drop_gap_loss_weight <= 0.0:
-        parser.error("--drop-gap-loss-weight must be positive")
-    if args.drop_gap_min_gap_s < 0.0:
-        parser.error("--drop-gap-min-gap-s must be non-negative")
     if args.split_boundary_radius_frames < 0:
         parser.error("--split-boundary-radius-frames must be non-negative")
     if args.focal_gamma < 0.0:
@@ -198,8 +180,6 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         parser.error("--threshold must be in [0, 1]")
     if not 0.0 <= args.split_threshold <= 1.0:
         parser.error("--split-threshold must be in [0, 1]")
-    if not 0.0 <= args.drop_gap_threshold <= 1.0:
-        parser.error("--drop-gap-threshold must be in [0, 1]")
     if args.max_eval_windows <= 0:
         parser.error("--max-eval-windows must be positive")
     if args.log_every < 0:

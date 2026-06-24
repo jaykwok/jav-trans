@@ -442,7 +442,7 @@ function renderMetrics(item) {{
     ["ASR+timing", `${{oldM.asr_align_s || "?"}}s`, `${{newM.asr_align_s || "?"}}s`],
     ["per min", oldQ.per_min_subtitle_count, newQ.per_min_subtitle_count],
     ["short ratio", oldQ.short_segment_ratio, newQ.short_segment_ratio],
-    ["fallback", oldQ.alignment_fallback_ratio, newQ.alignment_fallback_ratio],
+    ["alignment issue", oldQ.alignment_issue_ratio, newQ.alignment_issue_ratio],
     ["ASR gen errors", oldM.asr_generation_errors, newM.asr_generation_errors],
     ["ASR gen overflow", oldM.asr_generation_overflow, newM.asr_generation_overflow],
   ];

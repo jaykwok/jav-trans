@@ -3,8 +3,11 @@ import json
 import os
 import time
 import warnings
+from dataclasses import replace
 from pathlib import Path
 from typing import Callable
+
+import numpy as np
 
 from audio.chunk_packer import PackedChunk, pack_speech_segments
 from boundary import cache as _boundary_cache_module
@@ -20,6 +23,7 @@ from boundary.refiner import (
 from asr import checkpoint as _checkpoint_module
 from asr import chunking as _chunking_module
 from asr import cueqc as _cueqc_module
+from asr import pre_asr_cueqc as _pre_asr_cueqc_module
 from asr import transcribe as _transcribe_module
 from asr.backends.qwen import (
     DEFAULT_BOUNDARY_REFINER_CHECKPOINT_BY_REPO,
@@ -35,6 +39,7 @@ _registry_module = importlib.reload(_registry_module)
 _chunking_module = importlib.reload(_chunking_module)
 _checkpoint_module = importlib.reload(_checkpoint_module)
 _cueqc_module = importlib.reload(_cueqc_module)
+_pre_asr_cueqc_module = importlib.reload(_pre_asr_cueqc_module)
 _transcribe_module = importlib.reload(_transcribe_module)
 _boundary_cache_module = importlib.reload(_boundary_cache_module)
 
@@ -214,7 +219,7 @@ _strip_punctuation = _transcribe_module._strip_punctuation
 _collapse_repeated_noise = _transcribe_module._collapse_repeated_noise
 _is_low_value_text = _transcribe_module._is_low_value_text
 _clean_segment_text = _transcribe_module._clean_segment_text
-_with_alignment_fallback_window = _transcribe_module._with_alignment_fallback_window
+_with_alignment_window = _transcribe_module._with_alignment_window
 _alignment_outcome_for_chunk = _transcribe_module._alignment_outcome_for_chunk
 _transcribe_asr_chunks_text_only = _transcribe_module._transcribe_asr_chunks_text_only
 _is_empty_segment_text_result = _transcribe_module._is_empty_segment_text_result
@@ -394,7 +399,6 @@ def _build_processing_spans(
             os.environ.pop("SPEECH_BOUNDARY_JA_EXPORT_SEQUENCE_FEATURES", None)
     frame_scores = result.parameters.get("frame_scores")
     split_boundary_frame_scores = result.parameters.get("split_boundary_frame_scores")
-    drop_gap_frame_scores = result.parameters.get("drop_gap_frame_scores")
     score_frame_hop_s = result.parameters.get("frame_hop_s")
     sequence_feature_frames = result.parameters.get("sequence_feature_frames")
     sequence_boundary_refiner = load_edge_sequence_refiner_v6_checkpoint(
@@ -413,7 +417,7 @@ def _build_processing_spans(
     result_parameters = {
         key: value
         for key, value in result.parameters.items()
-        if key not in {"frame_scores", "split_boundary_frame_scores", "drop_gap_frame_scores", "sequence_feature_frames"}
+        if key not in {"frame_scores", "split_boundary_frame_scores", "sequence_feature_frames"}
     }
     runtime_boundary_signature = {
         **result_parameters,
@@ -425,7 +429,6 @@ def _build_processing_spans(
             "feature_sources": {
                 "speech_scores": frame_scores is not None,
                 "split_boundary_scores": split_boundary_frame_scores is not None,
-                "drop_gap_scores": drop_gap_frame_scores is not None,
             },
             "sequence_boundary_refiner": (
                 sequence_boundary_refiner.signature()
@@ -470,6 +473,12 @@ def _build_processing_spans(
         sequence_feature_provider=sequence_feature_provider,
         sequence_batch_size=cfg["boundary_planner_sequence_batch_size"],
     )
+    packed = _annotate_scorer_stats_on_packed_chunks(
+        packed,
+        frame_scores=frame_scores,
+        split_scores=split_boundary_frame_scores,
+        frame_hop_s=float(score_frame_hop_s or cfg["feature_frame_hop_s"]),
+    )
     event = _boundary_cache_module.save_processing_spans(
         audio_path,
         boundary_signature=boundary_signature,
@@ -498,6 +507,237 @@ def _span_boundaries(
     ]
 
 
+def _pre_asr_audio_id(audio_path: str) -> str:
+    stem = Path(audio_path).stem
+    if "." in stem:
+        prefix, suffix = stem.rsplit(".", 1)
+        if len(suffix) == 8 and all(char in "0123456789abcdefABCDEF" for char in suffix):
+            return prefix
+    return stem
+
+
+def _pre_asr_candidates_for_spans(
+    audio_path: str,
+    spans: list[tuple[float, float]] | list[PackedChunk],
+) -> list[dict]:
+    audio_id = _pre_asr_audio_id(audio_path)
+    candidates: list[dict] = []
+    for index in range(len(spans)):
+        candidate = _pre_asr_cueqc_module.candidate_from_span(spans, index)
+        chunk_index = int(candidate.get("index", index))
+        start = float(candidate.get("start", 0.0))
+        end = float(candidate.get("end", start))
+        sample_id = f"preasr-{audio_id}-chunk{chunk_index:05d}"
+        candidates.append(
+            {
+                **candidate,
+                "sample_id": sample_id,
+                "candidate_id": sample_id,
+                "audio_id": audio_id,
+                "video_id": audio_id,
+                "chunk_index": chunk_index,
+                "duration_s": round(max(0.0, end - start), 6),
+            }
+        )
+    return candidates
+
+
+def _pre_asr_candidates_with_decisions(candidates: list[dict], report: dict) -> list[dict]:
+    decisions: dict[int, dict] = {}
+    for decision in report.get("decisions") or []:
+        try:
+            decisions[int(decision.get("index"))] = dict(decision)
+        except (TypeError, ValueError):
+            continue
+    annotated: list[dict] = []
+    for candidate in candidates:
+        item = dict(candidate)
+        try:
+            index = int(candidate.get("index"))
+        except (TypeError, ValueError):
+            index = int(candidate.get("chunk_index", len(annotated)))
+        decision = decisions.get(index)
+        if decision:
+            item["pre_asr_cueqc"] = decision
+            item["pre_asr_route"] = str(decision.get("route") or "")
+            item["pre_asr_prob_drop"] = decision.get("prob_drop")
+            item["pre_asr_prob_keep"] = decision.get("prob_keep")
+        annotated.append(item)
+    return annotated
+
+
+def _score_stats_for_span(
+    values: list[float] | tuple[float, ...] | None,
+    *,
+    start_s: float,
+    end_s: float,
+    frame_hop_s: float,
+) -> tuple[float | None, float | None, float | None]:
+    if not values:
+        return None, None, None
+    hop = max(1e-6, float(frame_hop_s))
+    data = np.asarray(values, dtype=np.float32).reshape(-1)
+    start = max(0, min(data.size, int(float(start_s) / hop)))
+    end = max(start, min(data.size, int(np.ceil(float(end_s) / hop))))
+    if end <= start:
+        return None, None, None
+    window = data[start:end]
+    if window.size == 0:
+        return None, None, None
+    return float(window.mean()), float(window.max()), float(np.quantile(window, 0.90))
+
+
+def _annotate_scorer_stats_on_packed_chunks(
+    spans: list[tuple[float, float]] | list[PackedChunk],
+    *,
+    frame_scores: list[float] | None,
+    split_scores: list[float] | None,
+    frame_hop_s: float,
+) -> list[tuple[float, float]] | list[PackedChunk]:
+    if not spans or not all(isinstance(span, PackedChunk) for span in spans):
+        return spans
+    annotated: list[PackedChunk] = []
+    for span in spans:
+        speech_mean, speech_max, speech_p90 = _score_stats_for_span(
+            frame_scores,
+            start_s=span.start,
+            end_s=span.end,
+            frame_hop_s=frame_hop_s,
+        )
+        split_mean, split_max, split_p90 = _score_stats_for_span(
+            split_scores,
+            start_s=span.start,
+            end_s=span.end,
+            frame_hop_s=frame_hop_s,
+        )
+        annotated.append(
+            replace(
+                span,
+                scorer_speech_mean=speech_mean,
+                scorer_speech_max=speech_max,
+                scorer_speech_p90=speech_p90,
+                scorer_split_mean=split_mean,
+                scorer_split_max=split_max,
+                scorer_split_p90=split_p90,
+            )
+        )
+    return annotated
+
+
+def _apply_pre_asr_cueqc(
+    spans: list[tuple[float, float]] | list[PackedChunk],
+    *,
+    log: list[str],
+    candidates: list[dict] | None = None,
+    on_stage: Callable[[str], None] | None = None,
+) -> tuple[list[tuple[float, float]] | list[PackedChunk], dict]:
+    def _progress(message: str) -> None:
+        log.append(message)
+        if on_stage:
+            on_stage(message)
+        print(message, flush=True)
+
+    report = {
+        "schema": "pre_asr_cueqc_report_v1",
+        "enabled": _pre_asr_cueqc_module.enabled(),
+        "candidate_count": len(spans),
+        "drop_count": 0,
+        "decisions": [],
+    }
+    if not spans:
+        return spans, report
+    if not _pre_asr_cueqc_module.enabled():
+        _progress(
+            f"Pre-ASR CueQC disabled candidates={len(spans)} pass_to_asr={len(spans)}"
+        )
+        return spans, report
+    started = time.perf_counter()
+    model = _pre_asr_cueqc_module.load_active(expected_asr_repo_id=ASR_BACKEND)
+    candidates = candidates or [
+        _pre_asr_cueqc_module.candidate_from_span(spans, index)
+        for index in range(len(spans))
+    ]
+    _progress(
+        "Pre-ASR CueQC keep/drop route start candidates={candidates} drop_threshold={threshold}".format(
+            candidates=len(candidates),
+            threshold=getattr(model, "drop_threshold", ""),
+        )
+    )
+    decisions = model.decide(candidates)
+    candidate_by_index = {
+        int(candidate.get("index", index)): candidate
+        for index, candidate in enumerate(candidates)
+    }
+    for decision in decisions:
+        try:
+            decision_index = int(decision.get("index"))
+        except (TypeError, ValueError):
+            continue
+        candidate = candidate_by_index.get(decision_index)
+        if candidate is None:
+            continue
+        for key in ("sample_id", "candidate_id", "audio_id", "video_id", "chunk_index"):
+            if key in candidate:
+                decision[key] = candidate[key]
+    drop_indexes = {
+        int(decision.get("index"))
+        for decision in decisions
+        if decision.get("route") == "drop_before_asr"
+    }
+    kept = [span for index, span in enumerate(spans) if index not in drop_indexes]
+    keep_count = len(kept)
+    drop_count = len(drop_indexes)
+    confidences = sorted(
+        float(decision.get("confidence"))
+        for decision in decisions
+        if decision.get("confidence") is not None
+    )
+    confidence_stats = {}
+    if confidences:
+        confidence_stats = {
+            "confidence_min": round(confidences[0], 4),
+            "confidence_p10": round(
+                confidences[min(len(confidences) - 1, int(len(confidences) * 0.10))],
+                4,
+            ),
+            "confidence_p50": round(confidences[len(confidences) // 2], 4),
+            "confidence_mean": round(sum(confidences) / len(confidences), 4),
+        }
+    report.update(
+        {
+            "enabled": True,
+            "candidate_count": len(spans),
+            "drop_count": drop_count,
+            "keep_count": keep_count,
+            **confidence_stats,
+            "model": model.signature(),
+            "decisions": decisions,
+        }
+    )
+    elapsed = time.perf_counter() - started
+    _progress(
+        (
+            "Pre-ASR CueQC keep/drop route done candidates={candidates} decisions={decisions} "
+            "keep_for_asr={keep} drop_before_asr={drop} pass_to_asr={pass_to_asr} "
+            "confidence_min={confidence_min} confidence_p10={confidence_p10} "
+            "confidence_p50={confidence_p50} confidence_mean={confidence_mean} "
+            "elapsed={elapsed:.2f}s"
+        ).format(
+            candidates=len(spans),
+            decisions=len(decisions),
+            keep=keep_count,
+            drop=drop_count,
+            pass_to_asr=keep_count,
+            confidence_min=confidence_stats.get("confidence_min", ""),
+            confidence_p10=confidence_stats.get("confidence_p10", ""),
+            confidence_p50=confidence_stats.get("confidence_p50", ""),
+            confidence_mean=confidence_stats.get("confidence_mean", ""),
+            elapsed=elapsed,
+        )
+    )
+    return kept, report
+
+
 def _annotate_packed_chunks(
     chunk_infos: list[dict],
     spans: list[tuple[float, float]] | list[PackedChunk],
@@ -524,6 +764,12 @@ def _annotate_packed_chunks(
         chunk["boundary_start_refine_delta_s"] = packed.boundary_start_refine_delta_s
         chunk["boundary_end_refine_delta_s"] = packed.boundary_end_refine_delta_s
         chunk["boundary_decision_source"] = packed.boundary_decision_source
+        chunk["scorer_speech_mean"] = packed.scorer_speech_mean
+        chunk["scorer_speech_max"] = packed.scorer_speech_max
+        chunk["scorer_speech_p90"] = packed.scorer_speech_p90
+        chunk["scorer_split_mean"] = packed.scorer_split_mean
+        chunk["scorer_split_max"] = packed.scorer_split_max
+        chunk["scorer_split_p90"] = packed.scorer_split_p90
         log.append(
             "[chunk] idx={idx} dur={duration:.1f} speech_segment_count={count} "
             "reason={reason} "
@@ -649,46 +895,6 @@ def _write_cueqc_candidates_if_requested(
             count=len(candidates),
         )
     )
-
-
-def _apply_cueqc_drop_filter(
-    chunk_infos: list[dict],
-    text_results: list[dict],
-    cueqc_shadow_by_chunk: dict[int, dict],
-) -> tuple[list[dict], list[dict], str]:
-    """Remove high-confidence model-drop chunks from the parallel arrays.
-
-    Only decisions with ``mode == "cueqc_mamba_v4_binary"`` and
-    ``display_hint == "drop"`` are removed; fallback / keep decisions are never
-    dropped. All parallel lists (chunk_infos, text_results) are kept
-    index-aligned by filtering on the same kept positions.
-    """
-    drop_indices: set[int] = set()
-    for chunk_index, dec in cueqc_shadow_by_chunk.items():
-        if (
-            dec.get("display_hint") == "drop"
-            and dec.get("mode") == "cueqc_mamba_v4_binary"
-        ):
-            drop_indices.add(int(chunk_index))
-    if not drop_indices:
-        return chunk_infos, text_results, ""
-
-    kept_chunks: list[dict] = []
-    kept_texts: list[dict] = []
-    removed = 0
-    for pos, (chunk, text_result) in enumerate(zip(chunk_infos, text_results)):
-        raw_index = chunk.get("index") if hasattr(chunk, "get") else None
-        try:
-            chunk_index = int(raw_index) if raw_index is not None else pos
-        except (TypeError, ValueError):
-            chunk_index = pos
-        if chunk_index in drop_indices:
-            removed += 1
-            continue
-        kept_chunks.append(chunk)
-        kept_texts.append(text_result)
-    log_msg = f"CueQC v4 binary: dropped {removed} candidate(s) before subtitle timing"
-    return kept_chunks, kept_texts, log_msg
 
 
 def _candidate_capture_window(
@@ -960,10 +1166,10 @@ def _segment_alignment_outcome(segment: dict, outcomes: dict[int, dict]) -> dict
         "source_chunk_indices": unique_indices,
         "alignment_mode": selected.get("alignment_mode", ""),
         "alignment_quality": selected.get("alignment_quality", ""),
-        "fallback_type": selected.get("fallback_type", ""),
-        "fallback_subtype": selected.get("fallback_subtype", ""),
+        "alignment_issue_type": selected.get("alignment_issue_type", ""),
+        "alignment_issue_subtype": selected.get("alignment_issue_subtype", ""),
         "alignment_quality_reasons": list(selected.get("alignment_quality_reasons") or []),
-        "fallback_active": bool(selected.get("fallback_active")),
+        "alignment_issue_active": bool(selected.get("alignment_issue_active")),
     }
 
 
@@ -994,6 +1200,7 @@ def _transcribe_and_align_local(
     timings: dict[str, float] = {}
     cuda_memory: list[dict] = []
     transcript_chunks: list[dict] = []
+    pre_asr_cueqc_report: dict = _pre_asr_cueqc_module.runtime_signature()
     chunk_dir: Path | None = None
     total_started = time.perf_counter()
     _record_cuda_memory(log, cuda_memory, "asr_start", elapsed_s=0.0)
@@ -1005,6 +1212,17 @@ def _transcribe_and_align_local(
         cache_log_entry = _boundary_cache_log_entry(_LAST_BOUNDARY_CACHE_EVENT)
         if cache_log_entry:
             log.append(cache_log_entry)
+        pre_asr_candidates = _pre_asr_candidates_for_spans(audio_path, chunk_spans)
+        chunk_spans, pre_asr_cueqc_report = _apply_pre_asr_cueqc(
+            chunk_spans,
+            log=log,
+            candidates=pre_asr_candidates,
+            on_stage=on_stage,
+        )
+        pre_asr_candidates = _pre_asr_candidates_with_decisions(
+            pre_asr_candidates,
+            pre_asr_cueqc_report,
+        )
         chunk_dir, chunk_infos = _extract_wav_chunks(
             audio_path, _span_boundaries(chunk_spans), on_stage=on_stage
         )
@@ -1051,6 +1269,8 @@ def _transcribe_and_align_local(
                 "segment_count": 0,
                 "boundary_no_speech": True,
                 "boundary_signature": dict(_LAST_BOUNDARY_SIGNATURE),
+                "pre_asr_cueqc": pre_asr_cueqc_report,
+                "pre_asr_candidates": pre_asr_candidates,
                 "cueqc_shadow": _empty_cueqc_shadow_report(),
             }
             return [], log, details
@@ -1096,7 +1316,7 @@ def _transcribe_and_align_local(
             )
 
             text_results = [
-                _with_alignment_fallback_window(chunk, text_result)
+                _with_alignment_window(chunk, text_result)
                 for chunk, text_result in zip(chunk_infos, text_results)
             ]
             cueqc_shadow_report, cueqc_shadow_by_chunk = _run_cueqc_shadow(
@@ -1129,23 +1349,6 @@ def _transcribe_and_align_local(
                 "asr_model_unload_done",
                 elapsed_s=time.perf_counter() - total_started,
             )
-
-            # v4 binary drop filter: remove model-confirmed drop candidates from
-            # the parallel arrays before subtitle timing. Only high-confidence
-            # model drops (mode=cueqc_mamba_v4_binary) are removed; fallback
-            # decisions never drop. Indices are aligned across all three lists.
-            if _env_bool("CUEQC_DROP_APPLY_ENABLED", "1"):
-                chunk_infos, text_results, _drop_log = _apply_cueqc_drop_filter(
-                    chunk_infos,
-                    text_results,
-                    cueqc_shadow_by_chunk,
-                )
-                if _drop_log:
-                    log.append(_drop_log)
-                    timings["cueqc_drop_count"] = int(
-                        sum(1 for v in cueqc_shadow_by_chunk.values()
-                            if v.get("display_hint") == "drop" and v.get("mode") == "cueqc_mamba_v4_binary")
-                    )
 
             prepared_results, align_timings = _align_TRANSCRIPTION_results(
                 backend,
@@ -1203,8 +1406,8 @@ def _transcribe_and_align_local(
                             "source_chunk_index": chunk.get("index", idx - 1),
                             "alignment_mode": outcome.get("alignment_mode", ""),
                             "alignment_quality": outcome.get("alignment_quality", ""),
-                            "fallback_type": outcome.get("fallback_type", ""),
-                            "fallback_subtype": outcome.get("fallback_subtype", ""),
+                            "alignment_issue_type": outcome.get("alignment_issue_type", ""),
+                            "alignment_issue_subtype": outcome.get("alignment_issue_subtype", ""),
                         }
                     )
             transcript_chunks = _build_transcript_chunks(
@@ -1281,16 +1484,18 @@ def _transcribe_and_align_local(
             "device": device,
             "chunk_count": len(chunk_infos),
             "transcript_chunks": transcript_chunks,
+            "pre_asr_cueqc": pre_asr_cueqc_report,
+            "pre_asr_candidates": pre_asr_candidates,
             "cueqc_shadow": cueqc_shadow_report,
             "stage_timings": timings,
             "cuda_memory": cuda_memory,
             "word_count": len(word_dicts),
             "segment_count": len(segments),
             "boundary_signature": dict(_LAST_BOUNDARY_SIGNATURE),
-            "fallback_count": sum(
+            "alignment_issue_count": sum(
                 1
                 for outcome in alignment_outcomes.values()
-                if bool(outcome.get("fallback_active"))
+                if bool(outcome.get("alignment_issue_active"))
             ),
             "alignment_outcome_counts": {
                 key: sum(
@@ -1306,17 +1511,17 @@ def _transcribe_and_align_local(
                     }
                 )
             },
-            "fallback_subtype_counts": {
+            "alignment_issue_subtype_counts": {
                 key: sum(
                     1
                     for outcome in alignment_outcomes.values()
-                    if str(outcome.get("fallback_subtype") or "") == key
+                    if str(outcome.get("alignment_issue_subtype") or "") == key
                 )
                 for key in sorted(
                     {
-                        str(outcome.get("fallback_subtype") or "")
+                        str(outcome.get("alignment_issue_subtype") or "")
                         for outcome in alignment_outcomes.values()
-                        if outcome.get("fallback_subtype")
+                        if outcome.get("alignment_issue_subtype")
                     }
                 )
             },

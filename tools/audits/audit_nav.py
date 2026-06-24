@@ -414,7 +414,7 @@ code {{ font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
 {cards}
   <div class="status" id="deleteStatus"></div>
   <p class="muted">{html.escape(latest_meta)}</p>
-  <p class="muted">所有长期审计页统一放在 <code>agents/audits/</code>，从本页进入；按更新时间倒序排列，最上面是最新需要审计的页面。不使用自动跳转。推荐用 <code>{AUDIT_SERVER_COMMAND}</code> 启动，它仍从项目根目录提供媒体文件，但只 watch <code>agents/audits/</code>，避免训练日志、cache、tmp 写入触发浏览器持续刷新。删除按钮只有通过该脚本启动时才能直接移动本地文件并重建导航；否则页面会给出可手动运行的删除命令。删除会移动到 <code>agents/rm/audit-deletions/</code>。</p>
+  <p class="muted">所有长期审计页统一放在 <code>agents/audits/</code>，从本页进入；按更新时间倒序排列，最上面是最新需要审计的页面。不使用自动跳转。推荐用 <code>{AUDIT_SERVER_COMMAND}</code> 启动轻量审计服务，它从项目根目录提供媒体文件，支持音频 Range seek，不 watch 项目目录也不注入自动刷新脚本。删除按钮只有通过该脚本启动时才能直接移动本地文件并重建导航；否则页面会给出可手动运行的删除命令。删除会移动到 <code>agents/rm/audit-deletions/</code>。</p>
 </main>
 <script>
 const statusBox = document.getElementById("deleteStatus");
@@ -432,6 +432,22 @@ async function copyText(text) {{
     return false;
   }}
 }}
+async function postDeleteAudit(href) {{
+  const controller = new AbortController();
+  const timer = window.setTimeout(() => controller.abort(), 45000);
+  try {{
+    const response = await fetch("/__audit_api__/delete-audit", {{
+      method: "POST",
+      headers: {{"Content-Type": "application/json"}},
+      body: JSON.stringify({{href}}),
+      signal: controller.signal
+    }});
+    const payload = await response.json().catch(() => ({{}}));
+    return {{response, payload}};
+  }} finally {{
+    window.clearTimeout(timer);
+  }}
+}}
 async function deleteAudit(button) {{
   const href = button.dataset.href || "";
   const title = button.dataset.title || href;
@@ -440,26 +456,22 @@ async function deleteAudit(button) {{
   button.disabled = true;
   button.textContent = "删除中";
   try {{
-    const response = await fetch("/__audit_api__/delete-audit", {{
-      method: "POST",
-      headers: {{"Content-Type": "application/json"}},
-      body: JSON.stringify({{href}})
-    }});
-    const payload = await response.json().catch(() => ({{}}));
+    const {{response, payload}} = await postDeleteAudit(href);
     if (!response.ok || !payload.ok) {{
       throw new Error(payload.error || `HTTP ${{response.status}}`);
     }}
     const card = button.closest(".entry");
     if (card) card.remove();
-    setStatus(`已移动到 ${{payload.moved_to || "agents/rm/audit-deletions/"}}。导航页已重建；刷新页面可看到最新状态。`);
+    setStatus(`已移动到 ${{payload.moved_to || "agents/rm/audit-deletions/"}}。导航页已重建；刷新页面可看到最新状态。耗时 ${{payload.delete_elapsed_s ?? "?"}}s。`);
   }} catch (error) {{
     const command = deleteCommand(href);
     const copied = await copyText(command);
+    const reason = error && error.name === "AbortError" ? "删除请求超时，服务端可能仍在移动目录；可稍后刷新页面确认。" : `错误：${{error.message || error}}`;
     setStatus(
-      "live-server middleware 不可用，浏览器静态页不能直接删除文件。\\n" +
+      "审计服务删除 API 不可用，浏览器静态页不能直接删除文件。\\n" +
       "请用以下方式从项目根目录启动：" + {json.dumps(AUDIT_SERVER_COMMAND)} + "\\n" +
       "或直接运行删除命令" + (copied ? "（已复制）" : "") + "：\\n" + command + "\\n" +
-      `错误：${{error.message || error}}`
+      reason
     );
     button.disabled = false;
     button.textContent = "删除";

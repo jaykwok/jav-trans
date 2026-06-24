@@ -14,10 +14,11 @@ def test_classifies_boundary_timing_as_normal():
 
     assert result == {
         "alignment_quality": "boundary",
-        "fallback_type": "none",
-        "fallback_subtype": "none",
+        "alignment_issue_type": "none",
+        "alignment_issue_subtype": "none",
         "alignment_quality_reasons": [],
     }
+    assert "fallback_subtype" not in result
 
 
 def test_classifies_nonlexical_boundary_text():
@@ -32,8 +33,8 @@ def test_classifies_nonlexical_boundary_text():
 
     assert result == {
         "alignment_quality": "nonlexical",
-        "fallback_type": "none",
-        "fallback_subtype": "nonlexical_text",
+        "alignment_issue_type": "none",
+        "alignment_issue_subtype": "nonlexical_text",
         "alignment_quality_reasons": ["nonlexical_text"],
     }
 
@@ -48,8 +49,8 @@ def test_review_for_text_without_timing_words():
     )
 
     assert result["alignment_quality"] == "drop_or_review"
-    assert result["fallback_type"] == "none"
-    assert result["fallback_subtype"] == "text_without_output_segment"
+    assert result["alignment_issue_type"] == "none"
+    assert result["alignment_issue_subtype"] == "text_without_output_segment"
     assert result["alignment_quality_reasons"] == ["text_without_output_segment"]
 
 
@@ -63,5 +64,5 @@ def test_unknown_timing_mode_is_partial():
     )
 
     assert result["alignment_quality"] == "partial"
-    assert result["fallback_type"] == "unknown"
-    assert result["fallback_subtype"] == "unknown_fallback"
+    assert result["alignment_issue_type"] == "unknown"
+    assert result["alignment_issue_subtype"] == "unknown_alignment_mode"

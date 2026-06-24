@@ -131,9 +131,9 @@ def _quality_report_markdown(video_stem: str, report: dict) -> str:
         "subtitle_density_window_30s_median_gap_s",
         "per_min_subtitle_count",
         "glossary_hit_rate",
-        "alignment_fallback_count",
-        "alignment_fallback_total",
-        "alignment_fallback_ratio",
+        "alignment_issue_count",
+        "alignment_issue_total",
+        "alignment_issue_ratio",
         "subtitle_overlap_count",
         "subtitle_overlap_total_s",
         "subtitle_overlap_max_s",
@@ -223,7 +223,7 @@ def write_quality_report(
             glossary=glossary,
             console=console,
         )
-        fallback_count = int((asr_details or {}).get("fallback_count", 0))
+        alignment_issue_count = int((asr_details or {}).get("alignment_issue_count", 0))
         if video_duration_s is None:
             video_duration_s = float(
                 (asr_details or {}).get("audio_duration_s", len(aligned_segments) * 2.0)
@@ -232,7 +232,7 @@ def write_quality_report(
             aligned_segments,
             video_duration_s,
             glossary_pairs,
-            fallback_count,
+            alignment_issue_count,
             int((asr_details or {}).get("chunk_count") or len(aligned_segments)),
             asr_generation={},
         )

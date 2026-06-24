@@ -71,7 +71,7 @@ def test_boundary_cache_key_ignores_asr_prompt_budget(monkeypatch, tmp_path):
     assert lookup_a["path"] == lookup_b["path"]
 
 
-def test_boundary_cache_signature_uses_current_chunk_export_env_only(monkeypatch, tmp_path):
+def test_boundary_cache_signature_ignores_removed_chunk_export_env(monkeypatch, tmp_path):
     from boundary import cache as boundary_cache
 
     monkeypatch.setenv("BOUNDARY_CACHE_DIR", str(tmp_path / "boundary-cache"))
@@ -98,7 +98,7 @@ def test_boundary_cache_signature_uses_current_chunk_export_env_only(monkeypatch
     )
 
     assert lookup_a["digest"] == lookup_b["digest"]
-    assert lookup_a["digest"] != lookup_c["digest"]
+    assert lookup_a["digest"] == lookup_c["digest"]
 
 
 def test_boundary_cache_key_changes_with_boundary_config(monkeypatch, tmp_path):
@@ -269,7 +269,6 @@ class _ScoreExportingSpeechBoundaryBackend(_CountingSpeechBoundaryBackend):
                 "threshold": 0.10,
                 "frame_scores": [0.9] * 12,
                 "split_boundary_frame_scores": [0.05] * 5 + [0.98] * 2 + [0.05] * 5,
-                "drop_gap_frame_scores": [0.01] * 12,
                 "frame_hop_s": 1.0,
             },
             processing_time_sec=0.0,
@@ -361,14 +360,12 @@ def test_pipeline_uses_boundary_scores_but_does_not_cache_score_arrays(monkeypat
     assert asr._LAST_BOUNDARY_SIGNATURE["boundary_pipeline"]["feature_sources"] == {
         "speech_scores": True,
         "split_boundary_scores": True,
-        "drop_gap_scores": True,
     }
     cached_files = list((tmp_path / "boundary-cache").glob("*.json"))
     assert len(cached_files) == 1
     payload = cached_files[0].read_text(encoding="utf-8")
     assert "frame_scores" not in payload
     assert "split_boundary_frame_scores" not in payload
-    assert "drop_gap_frame_scores" not in payload
 
 
 def test_pipeline_uses_boundary_cache_for_prompt_budget_change(monkeypatch, tmp_path):

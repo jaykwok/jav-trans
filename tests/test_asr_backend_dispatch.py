@@ -136,10 +136,10 @@ def test_qwen_checkpoint_path_defaults_to_registry_when_env_is_absent(monkeypatc
 def test_qwen_checkpoint_path_auto_uses_registered_scorer(monkeypatch, tmp_path):
     from asr.backends import qwen
 
-    checkpoint_06b = tmp_path / "speech_boundary_ja_frame_boundary_scorer_v4.jaykwok-Qwen3-ASR-0.6B-JA-Anime-Galgame.pt"
-    checkpoint_17b = tmp_path / "speech_boundary_ja_frame_boundary_scorer_v4.jaykwok-Qwen3-ASR-1.7B-JA-Anime-Galgame.pt"
-    checkpoint_06b.write_bytes(b"v4-06b")
-    checkpoint_17b.write_bytes(b"v4-17b")
+    checkpoint_06b = tmp_path / "speech_boundary_ja_frame_boundary_scorer_v5.jaykwok-Qwen3-ASR-0.6B-JA-Anime-Galgame.pt"
+    checkpoint_17b = tmp_path / "speech_boundary_ja_frame_boundary_scorer_v5.jaykwok-Qwen3-ASR-1.7B-JA-Anime-Galgame.pt"
+    checkpoint_06b.write_bytes(b"v5-06b")
+    checkpoint_17b.write_bytes(b"v5-17b")
     monkeypatch.setenv("SPEECH_BOUNDARY_JA_SCORER_CHECKPOINT_BY_REPO", "auto")
 
     default_mapping = {
@@ -158,10 +158,10 @@ def test_qwen_checkpoint_path_auto_uses_registered_scorer(monkeypatch, tmp_path)
     )
 
     assert path_06b.endswith(
-        "speech_boundary_ja_frame_boundary_scorer_v4.jaykwok-Qwen3-ASR-0.6B-JA-Anime-Galgame.pt"
+        "speech_boundary_ja_frame_boundary_scorer_v5.jaykwok-Qwen3-ASR-0.6B-JA-Anime-Galgame.pt"
     )
     assert path_17b.endswith(
-        "speech_boundary_ja_frame_boundary_scorer_v4.jaykwok-Qwen3-ASR-1.7B-JA-Anime-Galgame.pt"
+        "speech_boundary_ja_frame_boundary_scorer_v5.jaykwok-Qwen3-ASR-1.7B-JA-Anime-Galgame.pt"
     )
 
 

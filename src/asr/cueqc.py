@@ -404,9 +404,9 @@ def build_candidate(
             else {},
         },
         "subtitle_timing": {
-            "fallback_window_start_s": text_result.get("alignment_fallback_start_s"),
-            "fallback_window_end_s": text_result.get("alignment_fallback_end_s"),
-            "fallback_window_source": text_result.get("alignment_fallback_source", ""),
+            "alignment_window_start_s": text_result.get("alignment_window_start_s"),
+            "alignment_window_end_s": text_result.get("alignment_window_end_s"),
+            "alignment_window_source": text_result.get("alignment_window_source", ""),
         },
         "labels": {},
     }
@@ -484,7 +484,7 @@ def build_shadow_report(candidates: list[Mapping[str, Any]]) -> dict[str, Any]:
 
 
 def cueqc_enabled() -> bool:
-    return _env_bool("CUEQC_SHADOW_ENABLED", True)
+    return _env_bool("CUEQC_SHADOW_ENABLED", False)
 
 
 def runtime_signature() -> dict[str, Any]:
@@ -505,14 +505,14 @@ def runtime_signature() -> dict[str, Any]:
         "schema_version": CUEQC_SHADOW_SCHEMA_VERSION,
         "feature_schema_version": CUEQC_FEATURE_SCHEMA_VERSION,
         "enabled": cueqc_enabled(),
-        "shadow_only": checkpoint == "",
-        "policy": "cueqc_mamba_v4_binary",
+        "shadow_only": True,
+        "policy": "cueqc_mamba_v4_binary_shadow",
         "decision_version": CUEQC_DECISION_VERSION,
         "model_version": CUEQC_MODEL_VERSION,
         "model_path": checkpoint,
         "checkpoint_sha1": checkpoint_hash,
         "drop_threshold": _env_text("CUEQC_DROP_THRESHOLD", "0.85"),
-        "drop_apply_enabled": _env_bool("CUEQC_DROP_APPLY_ENABLED", True),
+        "drop_apply_enabled": False,
         "shadow_embed_candidates": _env_bool("CUEQC_SHADOW_EMBED_CANDIDATES", False),
     }
 

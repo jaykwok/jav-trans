@@ -15,8 +15,8 @@ It bundles:
 - `src/assets/images/icon.png` for the in-app header, drop zone image, and PNG favicon
 - `src/assets/images/icon.ico` for the pywebview native window icon and packaged executable icon
 - repo-id tagged Boundary Refiner v6 checkpoints at `src/boundary/checkpoints/boundary_edge_refiner_v6.<repo-tag>.pt`
-- repo-id tagged SpeechBoundary-JA scorer v4 checkpoints at `src/boundary/ja/checkpoints/speech_boundary_ja_frame_boundary_scorer_v4.<repo-tag>.pt`
-- repo-id tagged CueQC v4 binary checkpoints at `src/asr/checkpoints/cueqc_mamba_v4_binary.<repo-tag>.pt`
+- repo-id tagged SpeechBoundary-JA scorer v5 checkpoints at `src/boundary/ja/checkpoints/speech_boundary_ja_frame_boundary_scorer_v5.<repo-tag>.pt`
+- repo-id tagged Pre-ASR CueQC v5 checkpoints at `src/asr/checkpoints/cueqc_pre_asr_mamba_v5_binary.<repo-tag>.pt`
 - the bundled Hugging Face inference model directories:
   - `jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame`
   - `jaykwok/Qwen3-ASR-0.6B-JA-Anime-Galgame`
@@ -60,11 +60,11 @@ script creates a single `.7z` file and no split volumes. Publish this large
 Windows bundle through external storage such as a netdisk; GitHub Releases are
 expected to publish source code and release notes only.
 
-Training-only Boundary Refiner artifacts are deliberately excluded from release
+Training-only Mamba artifacts are deliberately excluded from release
 packages: CUDA feature caches, synthetic WAVs, sequence JSONL files, and
 `datasets/train/...` outputs are all regenerable research data. New users only
-need the bundled repo-tagged Boundary Refiner, SpeechBoundary-JA scorer, CueQC
-checkpoint set plus the bundled Hugging Face inference models above. Do not
+need the bundled repo-tagged Boundary Refiner, SpeechBoundary-JA scorer,
+Pre-ASR CueQC checkpoint set plus the bundled Hugging Face inference models above. Do not
 restore old `src/vad` checkpoint paths; if Mamba checkpoints grow too large for
 source distribution, publish them as GitHub Release or Hugging Face artifacts
 instead.

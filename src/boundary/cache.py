@@ -15,13 +15,12 @@ from boundary.base import SpeechSegment
 
 log = logging.getLogger(__name__)
 
-BOUNDARY_CACHE_VERSION = 7
+BOUNDARY_CACHE_VERSION = 8
 _AUDIO_SAMPLE_BYTES = 2 * 1024 * 1024
 _AUDIO_KEY_RE = re.compile(r"^[0-9a-fA-F]{8,40}$")
 
 _BOUNDARY_BACKEND_ENV_KEYS = (
     "ASR_BOUNDARY_BACKEND",
-    "ASR_CHUNK_MIN_DURATION_S",
     "SPEECH_BOUNDARY_JA_EXPORT_FRAME_SCORES",
     "SPEECH_BOUNDARY_JA_THRESHOLD",
     "SPEECH_BOUNDARY_JA_SPEECH_ON_THRESHOLD",
@@ -35,8 +34,6 @@ _BOUNDARY_BACKEND_ENV_KEYS = (
     "SPEECH_BOUNDARY_JA_WINDOW_S",
     "SPEECH_BOUNDARY_JA_OVERLAP_S",
     "SPEECH_BOUNDARY_JA_MIN_SEGMENT_S",
-    "SPEECH_BOUNDARY_JA_DROP_GAP_THRESHOLD",
-    "SPEECH_BOUNDARY_JA_SPLIT_TARGET_S",
     "SPEECH_BOUNDARY_JA_SPLIT_SCORE_QUANTILE",
     "SPEECH_BOUNDARY_JA_SPLIT_PROMINENCE_QUANTILE",
     "SPEECH_BOUNDARY_JA_SPLIT_SMOOTH_S",
@@ -311,6 +308,12 @@ def _packed_chunk_to_dict(chunk: PackedChunk) -> dict:
             else float(chunk.boundary_end_refine_delta_s)
         ),
         "boundary_decision_source": chunk.boundary_decision_source,
+        "scorer_speech_mean": chunk.scorer_speech_mean,
+        "scorer_speech_max": chunk.scorer_speech_max,
+        "scorer_speech_p90": chunk.scorer_speech_p90,
+        "scorer_split_mean": chunk.scorer_split_mean,
+        "scorer_split_max": chunk.scorer_split_max,
+        "scorer_split_p90": chunk.scorer_split_p90,
         "speech_segments": _segments_to_payload(chunk.speech_segments),
     }
 
@@ -356,6 +359,24 @@ def _packed_chunk_from_dict(item: Any) -> PackedChunk:
             else float(item.get("boundary_end_refine_delta_s"))
         ),
         boundary_decision_source=str(item.get("boundary_decision_source") or ""),
+        scorer_speech_mean=(
+            None if item.get("scorer_speech_mean") is None else float(item.get("scorer_speech_mean"))
+        ),
+        scorer_speech_max=(
+            None if item.get("scorer_speech_max") is None else float(item.get("scorer_speech_max"))
+        ),
+        scorer_speech_p90=(
+            None if item.get("scorer_speech_p90") is None else float(item.get("scorer_speech_p90"))
+        ),
+        scorer_split_mean=(
+            None if item.get("scorer_split_mean") is None else float(item.get("scorer_split_mean"))
+        ),
+        scorer_split_max=(
+            None if item.get("scorer_split_max") is None else float(item.get("scorer_split_max"))
+        ),
+        scorer_split_p90=(
+            None if item.get("scorer_split_p90") is None else float(item.get("scorer_split_p90"))
+        ),
     )
 
 

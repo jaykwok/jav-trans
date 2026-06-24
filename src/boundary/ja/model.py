@@ -8,15 +8,14 @@ from typing import Any, Sequence
 import numpy as np
 
 
-MAMBA2_FRAME_SCORER_SCHEMA = "speech_boundary_ja_mamba2_frame_boundary_scorer_v4"
+MAMBA2_FRAME_SCORER_SCHEMA = "speech_boundary_ja_mamba2_frame_boundary_scorer_v5"
 MAMBA2_FRAME_SCORER_MODEL_TYPE = "mamba2_frame_boundary_scorer"
-MAMBA2_FRAME_SCORER_OUTPUT_DIM = 3
+MAMBA2_FRAME_SCORER_OUTPUT_DIM = 2
 MAMBA2_FRAME_SCORER_OUTPUT_HEADS = (
     "speech_prob",
     "split_boundary_prob",
-    "drop_gap_prob",
 )
-MAMBA2_FRAME_SCORER_DECODER = "peak_split_v1"
+MAMBA2_FRAME_SCORER_DECODER = "topographic_split_v2"
 
 
 def count_trainable_parameters(model) -> int:
@@ -284,14 +283,14 @@ def score_feature_frame_boundary_probabilities(
     *,
     ptm: np.ndarray,
     mfcc: np.ndarray,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+) -> tuple[np.ndarray, np.ndarray]:
     scored = score_feature_frame_boundary_probabilities_batch(
         bundle,
         feature_pairs=[(ptm, mfcc)],
     )
     if not scored:
         empty = np.zeros(0, dtype=np.float32)
-        return empty, empty, empty
+        return empty, empty
     return scored[0]
 
 
@@ -299,7 +298,7 @@ def score_feature_frame_boundary_probabilities_batch(
     bundle: Mamba2FrameScorerBundle,
     *,
     feature_pairs: Sequence[tuple[np.ndarray, np.ndarray]],
-) -> list[tuple[np.ndarray, np.ndarray, np.ndarray]]:
+) -> list[tuple[np.ndarray, np.ndarray]]:
     import torch
 
     pairs = list(feature_pairs)
@@ -337,7 +336,7 @@ def score_feature_frame_boundary_probabilities_batch(
     max_len = max(lengths, default=0)
     if max_len <= 0:
         empty = np.zeros(0, dtype=np.float32)
-        return [(empty, empty, empty) for _length in lengths]
+        return [(empty, empty) for _length in lengths]
     batch = np.zeros((len(normalized_rows), max_len, bundle.input_dim), dtype=np.float32)
     mask = np.zeros((len(normalized_rows), max_len), dtype=np.int64)
     for index, row in enumerate(normalized_rows):
@@ -356,19 +355,18 @@ def score_feature_frame_boundary_probabilities_batch(
             "boundary scorer probabilities must have shape "
             f"[batch, frames, {MAMBA2_FRAME_SCORER_OUTPUT_DIM}]"
         )
-    outputs: list[tuple[np.ndarray, np.ndarray, np.ndarray]] = []
+    outputs: list[tuple[np.ndarray, np.ndarray]] = []
     for index, length in enumerate(lengths):
         length = int(length)
         if length <= 0:
             empty = np.zeros(0, dtype=np.float32)
-            outputs.append((empty, empty, empty))
+            outputs.append((empty, empty))
             continue
         row = probabilities[index, :length, :]
         outputs.append(
             (
                 np.ascontiguousarray(row[:, 0], dtype=np.float32),
                 np.ascontiguousarray(row[:, 1], dtype=np.float32),
-                np.ascontiguousarray(row[:, 2], dtype=np.float32),
             )
         )
     return outputs
