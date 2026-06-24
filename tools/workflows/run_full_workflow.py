@@ -628,7 +628,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=os.getenv("SPEECH_BOUNDARY_JA_SCORER_DEVICE", "auto"),
     )
     parser.add_argument("--speech-boundary-window-s", dest="speech_boundary_window_s", type=float, default=_env_float("SPEECH_BOUNDARY_JA_WINDOW_S", 30.0))
-    parser.add_argument("--speech-boundary-overlap-s", dest="speech_boundary_overlap_s", type=float, default=_env_float("SPEECH_BOUNDARY_JA_OVERLAP_S", 1.0))
+    parser.add_argument("--speech-boundary-overlap-s", dest="speech_boundary_overlap_s", type=float, default=_env_float("SPEECH_BOUNDARY_JA_OVERLAP_S", 5.0))
     parser.add_argument("--speech-boundary-min-segment-s", dest="speech_boundary_min_segment_s", type=float, default=_env_float("SPEECH_BOUNDARY_JA_MIN_SEGMENT_S", 0.05))
     args = parser.parse_args(argv)
     if args.speech_boundary_speech_on_threshold is None:

@@ -253,7 +253,7 @@ def _media_root_audio_paths(*, video_id: str, rows: Sequence[Mapping[str, Any]],
 
 def discover_media(
     *,
-    archived_root: Path,
+    archived_roots: Sequence[Path],
     media_roots: Sequence[Path],
     output_dir: Path,
     rows: list[dict[str, Any]],
@@ -271,7 +271,10 @@ def discover_media(
 
     for video_id in video_ids:
         label = ANON_LABELS.get(video_id, video_id)
-        archived_dir = archived_root / video_id
+        archived_dir = next(
+            (root / video_id for root in archived_roots if (root / video_id).exists()),
+            (archived_roots[0] / video_id) if archived_roots else PROJECT_ROOT / video_id,
+        )
         srt_path = archived_dir / f"{video_id}.ja.srt"
         aligned_path = archived_dir / f"{video_id}.aligned_segments.json"
         video_rows = rows_by_video.get(video_id, [])
@@ -623,10 +626,6 @@ code {{ background: #eef3ef; padding: 1px 4px; border-radius: 4px; }}
         <div class="control-grid">
           <select id="videoFilter"></select>
           <select id="cluster"></select>
-        </div>
-        <div class="control-grid">
-          <select id="alignmentFilter"></select>
-          <select id="issueFilter"></select>
         </div>
         <div class="control-grid three">
           <input id="minDuration" inputmode="decimal" placeholder="最小时长 s">
@@ -1347,15 +1346,11 @@ function setupFilters() {{
     uniqueOptions(ROWS, "video_id", (_value, row) => row.video_label || row.video_id || ""),
     "all videos"
   );
-  fillSelect("alignmentFilter", uniqueOptions(ROWS, "alignment_quality"), "all alignment quality");
-  fillSelect("issueFilter", uniqueOptions(ROWS, "alignment_issue_subtype"), "all alignment issue");
 }}
 function applyFilters() {{
   const q = document.getElementById("search").value.trim().toLowerCase();
   const cluster = document.getElementById("cluster").value;
   const video = document.getElementById("videoFilter").value;
-  const alignment = document.getElementById("alignmentFilter").value;
-  const issue = document.getElementById("issueFilter").value;
   const minDuration = optionalNumberInput("minDuration");
   const maxDuration = optionalNumberInput("maxDuration");
   const minConfidence = optionalNumberInput("minConfidence");
@@ -1363,8 +1358,6 @@ function applyFilters() {{
     const duration = rowNumber(row, "duration_s", rowNumber(row, "end") - rowNumber(row, "start"));
     if (cluster && row.cluster_id !== cluster) return false;
     if (video && row.video_id !== video) return false;
-    if (alignment && String(row.alignment_quality || "") !== alignment) return false;
-    if (issue && String(row.alignment_issue_subtype || "") !== issue) return false;
     if (minDuration !== null && duration < minDuration) return false;
     if (maxDuration !== null && duration > maxDuration) return false;
     if (minConfidence !== null && rowConfidence(row) < minConfidence) return false;
@@ -1390,7 +1383,17 @@ function renderList() {{
     const div = document.createElement("div");
     const textObs = textObservation(row);
     div.className = "item" + (ROWS[current] === row ? " active" : "");
-    div.onclick = () => {{ current = ROWS.indexOf(row); renderList(); renderCurrent(true); }};
+    div.onclick = () => {{
+      current = ROWS.indexOf(row);
+      if (row.cluster_id && row.cluster_id !== activeClusterId) {{
+        activeClusterId = row.cluster_id;
+        saveActiveClusterId(activeClusterId);
+        renderClusterNav();
+        renderClusterDetail();
+      }}
+      renderList();
+      renderCurrent(true);
+    }};
     const badgeClass = row.cluster_noise ? "badge noise" : "badge";
     div.innerHTML = `<div class="item-title"><strong>${{escapeHtml(row.cluster_id)}} · chunk ${{row.chunk_index}}</strong><span class="${{badgeClass}}">${{escapeHtml(row.video_label || row.video_id || "")}}</span></div>
       <div class="meta">${{fmt(row.start)}}-${{fmt(row.end)}} · ${{Number(row.duration_s||0).toFixed(2)}}s · conf=${{rowConfidence(row).toFixed(3)}} · rank=${{escapeHtml(String(row.duration_rank ?? row.index ?? ""))}}</div>
@@ -1719,8 +1722,6 @@ function downloadClusterJsonl() {{
 document.getElementById("search").addEventListener("input", applyFilters);
 document.getElementById("cluster").addEventListener("change", applyFilters);
 document.getElementById("videoFilter").addEventListener("change", applyFilters);
-document.getElementById("alignmentFilter").addEventListener("change", applyFilters);
-document.getElementById("issueFilter").addEventListener("change", applyFilters);
 document.getElementById("minDuration").addEventListener("input", applyFilters);
 document.getElementById("maxDuration").addEventListener("input", applyFilters);
 document.getElementById("minConfidence").addEventListener("input", applyFilters);
@@ -1776,7 +1777,8 @@ def build_audit(
     *,
     clusters_jsonl: Path,
     summaries_jsonl: Path,
-    archived_root: Path,
+    archived_root: Path | None = None,
+    archived_roots: Sequence[Path] | None = None,
     media_roots: Sequence[Path],
     output_dir: Path,
     title: str,
@@ -1784,8 +1786,6 @@ def build_audit(
     summary_json: Path | None = None,
     refresh_nav: bool = False,
 ) -> dict[str, Any]:
-    if not archived_root.exists():
-        raise FileNotFoundError(f"archived root not found: {archived_root}")
     if not media_roots:
         raise ValueError("at least one --media-root is required")
     missing_media_roots = [path for path in media_roots if not path.exists()]
@@ -1795,8 +1795,27 @@ def build_audit(
     rows = read_jsonl(clusters_jsonl)
     summaries = read_jsonl(summaries_jsonl)
     output_dir.mkdir(parents=True, exist_ok=True)
+    resolved_archived_roots = [Path(path) for path in (archived_roots or [])]
+    if archived_root is not None:
+        resolved_archived_roots.insert(0, Path(archived_root))
+    if not resolved_archived_roots:
+        raise ValueError("at least one archived root is required")
+    deduped_archived_roots: list[Path] = []
+    seen_archived: set[str] = set()
+    for root in resolved_archived_roots:
+        key = str(root.resolve())
+        if key in seen_archived:
+            continue
+        seen_archived.add(key)
+        deduped_archived_roots.append(root)
+    missing_archived_roots = [path for path in deduped_archived_roots if not path.exists()]
+    if missing_archived_roots:
+        raise FileNotFoundError(
+            "archived root not found: " + ", ".join(str(path) for path in missing_archived_roots)
+        )
+
     media_by_video, cues_by_video, aligned_by_video = discover_media(
-        archived_root=archived_root,
+        archived_roots=deduped_archived_roots,
         media_roots=media_roots,
         output_dir=output_dir,
         rows=rows,
@@ -1839,7 +1858,8 @@ def build_audit(
             "html": project_rel(index_path),
             "source_clusters": project_rel(clusters_jsonl),
             "source_cluster_summaries": project_rel(summaries_jsonl),
-            "archived_root": project_rel(archived_root),
+            "archived_root": project_rel(deduped_archived_roots[0]),
+            "archived_roots": [project_rel(path) for path in deduped_archived_roots],
             "media_roots": [project_rel(path) for path in media_roots],
             "media_enabled": True,
             "media_mode": "audio",
@@ -1884,7 +1904,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Generate a CueQC cluster audit page with synchronized audio and subtitles.")
     parser.add_argument("--clusters", required=True, help="cueqc_clusters.jsonl")
     parser.add_argument("--summaries", required=True, help="cueqc_cluster_summaries.jsonl")
-    parser.add_argument("--archived-root", required=True, help="Directory containing <video_id>/<video_id>.ja.srt and aligned_segments.json.")
+    parser.add_argument(
+        "--archived-root",
+        action="append",
+        required=True,
+        help="Directory containing <video_id>/<video_id>.ja.srt and aligned_segments.json. Repeatable.",
+    )
     parser.add_argument("--media-root", action="append", required=True, help="Job/audio/media root to search recursively for source audio. Repeatable.")
     parser.add_argument("--output-dir", required=True, help="Audit output directory")
     parser.add_argument("--title", required=True)
@@ -1898,7 +1923,7 @@ def main(argv: list[str] | None = None) -> int:
     summary = build_audit(
         clusters_jsonl=project_path(args.clusters),
         summaries_jsonl=project_path(args.summaries),
-        archived_root=project_path(args.archived_root),
+        archived_roots=[project_path(path) for path in args.archived_root],
         media_roots=[project_path(path) for path in args.media_root],
         output_dir=project_path(args.output_dir),
         title=args.title,
