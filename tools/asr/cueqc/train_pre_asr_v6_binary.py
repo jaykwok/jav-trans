@@ -141,11 +141,15 @@ def train(
     opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
     train_x = x_norm[train_idx].to(dev)
     train_y = y[train_idx].to(dev)
+    class_counts = torch.bincount(train_y.cpu(), minlength=2).float()
+    class_weights = (
+        float(train_y.shape[0]) / (2.0 * class_counts.clamp_min(1.0))
+    ).to(dev)
     batch_size = max(1, int(batch_size))
     for _step in range(max(1, int(steps))):
         sample = torch.randint(0, train_x.shape[0], (min(batch_size, train_x.shape[0]),), device=dev)
         logits = model(train_x[sample])
-        loss = F.cross_entropy(logits, train_y[sample])
+        loss = F.cross_entropy(logits, train_y[sample], weight=class_weights)
         opt.zero_grad(set_to_none=True)
         loss.backward()
         opt.step()
@@ -163,6 +167,14 @@ def train(
         "train_count": int(train_idx.shape[0]),
         "val_count": int(val_idx.shape[0]),
         "all_count": count,
+        "class_counts": {
+            "drop": int(torch.sum(y == 0).item()),
+            "keep": int(torch.sum(y == 1).item()),
+        },
+        "train_class_weights": {
+            "drop": float(class_weights[0].detach().cpu().item()),
+            "keep": float(class_weights[1].detach().cpu().item()),
+        },
         "drop_threshold": float(drop_threshold),
         "val": classification_metrics(val_probs, y[val_idx].numpy(), threshold=drop_threshold),
         "all": classification_metrics(all_probs, y.numpy(), threshold=drop_threshold),

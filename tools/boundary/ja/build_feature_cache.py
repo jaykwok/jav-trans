@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import os
 import sys
 import time
 from collections import Counter
@@ -11,6 +12,8 @@ from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import asdict
 from pathlib import Path
 from typing import Any, Iterable, Mapping
+
+import numpy as np
 
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
 SRC_ROOT = PROJECT_ROOT / "src"
@@ -158,6 +161,95 @@ def _frame_count(duration_s: float, frame_hop_s: float) -> int:
     return int(math.ceil((duration_s / frame_hop_s) - 1e-9))
 
 
+def _env_float(name: str, default: float) -> float:
+    raw = os.getenv(name, "").strip()
+    if not raw:
+        return float(default)
+    try:
+        return float(raw)
+    except (TypeError, ValueError):
+        return float(default)
+
+
+def _workflow_window_starts(
+    *,
+    sample_count: int,
+    sample_rate: int,
+    window_s: float,
+    overlap_s: float,
+) -> list[int]:
+    if window_s <= 0.0:
+        raise ValueError("--feature-window-s must be positive")
+    if overlap_s < 0.0:
+        raise ValueError("--feature-overlap-s must be non-negative")
+    if overlap_s >= window_s:
+        raise ValueError("--feature-overlap-s must be smaller than --feature-window-s")
+    window_samples = max(1, int(round(window_s * sample_rate)))
+    stride_samples = max(1, int(round((window_s - overlap_s) * sample_rate)))
+    return list(range(0, max(1, int(sample_count)), stride_samples))
+
+
+def _combine_workflow_window_features(
+    *,
+    windows: list[dict[str, Any]],
+    ptm_features: list[np.ndarray],
+    duration_s: float,
+    sample_rate: int,
+    config: FeatureConfig,
+) -> dict[str, Any]:
+    total_frames = _frame_count(duration_s, config.frame_hop_s)
+    if total_frames <= 0:
+        raise ValueError("feature cache item has no target frames")
+    if len(windows) != len(ptm_features):
+        raise ValueError("window/PTM feature count mismatch")
+    ptm_sum: np.ndarray | None = None
+    mfcc_sum: np.ndarray | None = None
+    feature_count = np.zeros(total_frames, dtype=np.float32)
+    for window, ptm in zip(windows, ptm_features, strict=True):
+        aligned_ptm, aligned_mfcc = align_feature_frames(
+            ptm,
+            window["mfcc"],
+            resize_ptm=is_low_frame_rate_ptm(config.ptm),
+        )
+        ptm_dim = int(aligned_ptm.shape[1])
+        mfcc_dim = int(aligned_mfcc.shape[1])
+        if ptm_sum is None:
+            ptm_sum = np.zeros((total_frames, ptm_dim), dtype=np.float64)
+            mfcc_sum = np.zeros((total_frames, mfcc_dim), dtype=np.float64)
+        elif int(ptm_sum.shape[1]) != ptm_dim or int(mfcc_sum.shape[1]) != mfcc_dim:
+            raise ValueError("window feature dimensions changed within one audio item")
+        window_start_s = float(window["start_sample"]) / float(sample_rate)
+        global_start = max(0, int(round(window_start_s / config.frame_hop_s)))
+        global_end = min(total_frames, global_start + int(aligned_ptm.shape[0]))
+        local_end = max(0, global_end - global_start)
+        if local_end <= 0:
+            continue
+        ptm_sum[global_start:global_end] += aligned_ptm[:local_end]
+        mfcc_sum[global_start:global_end] += aligned_mfcc[:local_end]
+        feature_count[global_start:global_end] += 1.0
+    if ptm_sum is None or mfcc_sum is None:
+        raise ValueError("feature extraction produced no windows")
+    coverage = feature_count > 0
+    ptm = np.divide(
+        ptm_sum,
+        np.maximum(feature_count, 1.0).reshape(-1, 1),
+        out=np.zeros_like(ptm_sum, dtype=np.float64),
+    ).astype(np.float32)
+    mfcc = np.divide(
+        mfcc_sum,
+        np.maximum(feature_count, 1.0).reshape(-1, 1),
+        out=np.zeros_like(mfcc_sum, dtype=np.float64),
+    ).astype(np.float32)
+    return {
+        "ptm": np.ascontiguousarray(ptm, dtype=np.float32),
+        "mfcc": np.ascontiguousarray(mfcc, dtype=np.float32),
+        "duration_s": float(duration_s),
+        "sample_rate": int(sample_rate),
+        "window_count": len(windows),
+        "feature_coverage_ratio": float(np.mean(coverage)) if coverage.size else 0.0,
+    }
+
+
 def _resolve_audio_path(
     *,
     audio_id: str,
@@ -189,6 +281,8 @@ def _prepare_batch(
     batch_examples: list,
     selected_count: int,
     config: FeatureConfig,
+    feature_window_s: float,
+    feature_overlap_s: float,
 ) -> tuple[list[dict], list[dict], float]:
     prepared = []
     errors = []
@@ -198,17 +292,37 @@ def _prepare_batch(
         try:
             audio_path = Path(example.audio_path)
             audio, sample_rate = load_audio_16k_mono(str(audio_path))
-            mfcc = extract_mfcc(audio, sample_rate=sample_rate, config=config)
             duration_s = len(audio) / sample_rate if sample_rate else 0.0
+            windows = []
+            window_samples = max(1, int(round(feature_window_s * sample_rate)))
+            for window_index, start_sample in enumerate(
+                _workflow_window_starts(
+                    sample_count=len(audio),
+                    sample_rate=sample_rate,
+                    window_s=feature_window_s,
+                    overlap_s=feature_overlap_s,
+                )
+            ):
+                end_sample = min(len(audio), start_sample + window_samples)
+                if start_sample >= end_sample:
+                    continue
+                chunk = np.ascontiguousarray(audio[start_sample:end_sample], dtype=np.float32)
+                windows.append(
+                    {
+                        "window_index": window_index,
+                        "start_sample": int(start_sample),
+                        "audio": chunk,
+                        "mfcc": extract_mfcc(chunk, sample_rate=sample_rate, config=config),
+                    }
+                )
             prepared.append(
                 {
                     "index": item_index,
                     "example": example,
                     "audio_path": audio_path,
-                    "audio": audio,
                     "sample_rate": sample_rate,
-                    "mfcc": mfcc,
                     "duration_s": duration_s,
+                    "windows": windows,
                 }
             )
         except Exception as exc:
@@ -240,6 +354,8 @@ def run(args: argparse.Namespace) -> None:
     config = FeatureConfig(
         ptm=args.ptm,
         frame_hop_s=args.frame_hop_s,
+        window_s=args.feature_window_s,
+        overlap_s=args.feature_overlap_s,
         n_mfcc=args.n_mfcc,
         n_fft=args.n_fft,
         feature_dim=args.feature_dim,
@@ -255,7 +371,8 @@ def run(args: argparse.Namespace) -> None:
     print(
         f"feature_cache_start selected={len(selected_examples)} examples={len(examples)} "
         f"device={args.device} dtype={args.dtype} ptm={args.ptm} "
-        f"batch_size={args.batch_size} prepare_workers={args.prepare_workers}",
+        f"batch_size={args.batch_size} prepare_workers={args.prepare_workers} "
+        f"feature_window_s={args.feature_window_s} feature_overlap_s={args.feature_overlap_s}",
         flush=True,
     )
     ptm_extractor = build_ptm_feature_extractor(config)
@@ -316,6 +433,8 @@ def run(args: argparse.Namespace) -> None:
                         batch_examples=batch_examples,
                         selected_count=len(selected_examples),
                         config=config,
+                        feature_window_s=args.feature_window_s,
+                        feature_overlap_s=args.feature_overlap_s,
                     )
                 )
                 return inline_future
@@ -325,6 +444,8 @@ def run(args: argparse.Namespace) -> None:
                 batch_examples=batch_examples,
                 selected_count=len(selected_examples),
                 config=config,
+                feature_window_s=args.feature_window_s,
+                feature_overlap_s=args.feature_overlap_s,
             )
 
         if prepare_workers > 0:
@@ -370,26 +491,33 @@ def run(args: argparse.Namespace) -> None:
                         sample_rates = {int(item["sample_rate"]) for item in prepared}
                         if len(sample_rates) != 1:
                             raise ValueError(f"mixed sample rates in batch: {sorted(sample_rates)}")
+                        window_refs: list[tuple[dict, dict]] = []
+                        window_audios: list[np.ndarray] = []
+                        for item in prepared:
+                            for window in item["windows"]:
+                                window_refs.append((item, window))
+                                window_audios.append(window["audio"])
+                        if not window_audios:
+                            raise ValueError("prepared batch has no feature windows")
                         ptm_start = time.perf_counter()
                         ptm_features = ptm_extractor.extract_batch(
-                            [item["audio"] for item in prepared],
+                            window_audios,
                             sample_rate=int(prepared[0]["sample_rate"]),
                         )
                         ptm_elapsed_s = time.perf_counter() - ptm_start
+                        ptm_by_item: dict[int, list[np.ndarray]] = {id(item): [] for item in prepared}
+                        for (item, _window), ptm in zip(window_refs, ptm_features, strict=True):
+                            ptm_by_item[id(item)].append(ptm)
                         write_elapsed_s = 0.0
-                        for item, ptm in zip(prepared, ptm_features, strict=True):
+                        for item in prepared:
                             example = item["example"]
-                            aligned_ptm, aligned_mfcc = align_feature_frames(
-                                ptm,
-                                item["mfcc"],
-                                resize_ptm=is_low_frame_rate_ptm(config.ptm),
+                            bundle = _combine_workflow_window_features(
+                                windows=item["windows"],
+                                ptm_features=ptm_by_item[id(item)],
+                                duration_s=float(item["duration_s"]),
+                                sample_rate=int(item["sample_rate"]),
+                                config=config,
                             )
-                            bundle = {
-                                "ptm": aligned_ptm,
-                                "mfcc": aligned_mfcc,
-                                "duration_s": float(item["duration_s"]),
-                                "sample_rate": int(item["sample_rate"]),
-                            }
                             write_start = time.perf_counter()
                             cached = write_feature_cache(
                                 output_dir=feature_dir,
@@ -406,6 +534,10 @@ def run(args: argparse.Namespace) -> None:
                                 "label_index": example.label_index,
                                 "label_quality": example.label_quality,
                                 "speech_frame_count": example.speech_frame_count,
+                                "feature_window_s": float(args.feature_window_s),
+                                "feature_overlap_s": float(args.feature_overlap_s),
+                                "feature_window_count": int(bundle["window_count"]),
+                                "feature_coverage_ratio": float(bundle["feature_coverage_ratio"]),
                             }
                             _write_jsonl_row(manifest_handle, manifest_row)
                             manifest_handle.flush()
@@ -470,6 +602,8 @@ def run(args: argparse.Namespace) -> None:
         "ptm": args.ptm,
         "compressed": not args.no_compress,
         "config": asdict(config),
+        "feature_window_s": float(args.feature_window_s),
+        "feature_overlap_s": float(args.feature_overlap_s),
     }
     summary_path.write_text(
         json.dumps(summary, ensure_ascii=False, indent=2, sort_keys=True),
@@ -491,6 +625,18 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--limit", type=int)
     parser.add_argument("--ptm", default=QWEN_ASR_REPO_ID)
     parser.add_argument("--frame-hop-s", type=float, default=0.02)
+    parser.add_argument(
+        "--feature-window-s",
+        type=float,
+        default=_env_float("SPEECH_BOUNDARY_JA_WINDOW_S", 30.0),
+        help="Workflow-style acoustic feature extraction window in seconds.",
+    )
+    parser.add_argument(
+        "--feature-overlap-s",
+        type=float,
+        default=_env_float("SPEECH_BOUNDARY_JA_OVERLAP_S", 5.0),
+        help="Workflow-style acoustic feature extraction overlap in seconds.",
+    )
     parser.add_argument("--n-mfcc", type=int, default=40)
     parser.add_argument("--n-fft", type=int, default=400)
     parser.add_argument(
@@ -519,6 +665,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     args = parser.parse_args(argv)
     if args.feature_dim is not None and args.feature_dim <= 0:
         parser.error("--feature-dim must be positive when set")
+    if args.feature_window_s <= 0.0:
+        parser.error("--feature-window-s must be positive")
+    if args.feature_overlap_s < 0.0:
+        parser.error("--feature-overlap-s must be non-negative")
+    if args.feature_overlap_s >= args.feature_window_s:
+        parser.error("--feature-overlap-s must be smaller than --feature-window-s")
     return args
 
 

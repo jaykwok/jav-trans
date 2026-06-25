@@ -17,6 +17,8 @@ if str(PROJECT_ROOT) not in sys.path:
 if str(SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(SRC_ROOT))
 
+from asr.cueqc import text_features as cue_text_features  # noqa: E402
+
 
 def project_path(value: str | Path) -> Path:
     raw = Path(value).expanduser()
@@ -162,6 +164,7 @@ def export_candidates(*, timing_paths: list[str], output_dir: Path) -> dict[str,
                 transcript_chunks=transcript_chunks,
                 aligned_segments=aligned_segments,
             )
+            text_payload = cue_text_features(transcript_text, text, duration_s=duration)
             cluster_id = _cluster_for_candidate(item)
             rows.append(
                 {
@@ -178,6 +181,12 @@ def export_candidates(*, timing_paths: list[str], output_dir: Path) -> dict[str,
                     "text": text,
                     "raw_text": transcript_text,
                     "text_preview": text[:160],
+                    "compact_text": text_payload.get("compact_text", ""),
+                    "text_features": {
+                        key: value
+                        for key, value in text_payload.items()
+                        if key not in {"text", "raw_text", "compact_text", "context_compact_text"}
+                    },
                     "audit_reference": {
                         "transcript_text": transcript_text,
                         "aligned_text": aligned_text,

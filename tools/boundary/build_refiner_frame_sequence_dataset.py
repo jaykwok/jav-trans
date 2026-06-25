@@ -127,7 +127,7 @@ def build_frame_sequence_dataset(
 
     with output_jsonl.open("w", encoding="utf-8") as output_handle:
         for labels_path, feature_manifest_path in zip(labels_paths, feature_manifest_paths, strict=True):
-            records = _load_light_label_records(labels_path)
+            records = _load_light_label_records(labels_path, log_every=log_every)
             batch: list[tuple[LabelRecord, dict[str, Any], np.ndarray, np.ndarray]] = []
             for manifest_row in _iter_feature_manifest(feature_manifest_path):
                 stop = limit is not None and counters["manifest_rows_selected"] >= limit
@@ -607,8 +607,9 @@ def _normalize_segments(
     return sorted(segments, key=lambda item: (item.start, item.end))
 
 
-def _load_light_label_records(path: Path) -> dict[int, LabelRecord]:
+def _load_light_label_records(path: Path, *, log_every: int = 0) -> dict[int, LabelRecord]:
     records: dict[int, LabelRecord] = {}
+    started = time.perf_counter()
     with path.open("r", encoding="utf-8") as handle:
         for label_index, line in enumerate(handle):
             if not line.strip():
@@ -632,6 +633,17 @@ def _load_light_label_records(path: Path) -> dict[int, LabelRecord]:
                     else dict(payload.get("boundary_metadata") or {})
                 ),
             )
+            if log_every > 0 and len(records) % int(log_every) == 0:
+                print(
+                    "label_load_progress="
+                    f"{len(records)} label_index={label_index} elapsed_s={time.perf_counter() - started:.1f}",
+                    flush=True,
+                )
+    if log_every > 0:
+        print(
+            f"label_load_done={len(records)} elapsed_s={time.perf_counter() - started:.1f}",
+            flush=True,
+        )
     return records
 
 
