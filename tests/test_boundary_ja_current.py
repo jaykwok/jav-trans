@@ -94,7 +94,7 @@ def _build_mamba2_scorer(*, ptm_dim: int, mfcc_dim: int):
 
 
 def _registered_placeholder(tmp_path: Path, repo_id: str) -> Path:
-    path = tmp_path / f"speech_boundary_ja_frame_boundary_scorer_v5.{qwen_asr_repo_tag(repo_id)}.pt"
+    path = tmp_path / f"speech_boundary_ja_frame_boundary_scorer_v6.{qwen_asr_repo_tag(repo_id)}.pt"
     path.write_bytes(b"placeholder")
     return path
 
@@ -453,7 +453,7 @@ def test_write_jsonl_and_bootstrap_backend_signature(tmp_path):
 
     assert path.read_text(encoding="utf-8").strip()
     assert DEFAULT_MODEL_PATH == "models/jaykwok-Qwen3-ASR-1.7B-JA-Anime-Galgame"
-    assert DEFAULT_OPERATING_POINT == "qwen-mamba2-frame-boundary-scorer-v5"
+    assert DEFAULT_OPERATING_POINT == "qwen-mamba2-frame-boundary-scorer-v6"
     assert cfg.ptm == QWEN_ASR_REPO_ID
     assert cfg.threshold == 0.5
     assert cfg.scorer_checkpoint == ""
@@ -491,7 +491,7 @@ def test_backend_scorer_defaults_to_registered_17b_checkpoint(monkeypatch, tmp_p
     assert cfg.scorer_checkpoint_repo_id == QWEN_ASR_17B_REPO_ID
 
 def test_backend_scorer_checkpoint_env_resolves_by_ptm_repo_id(monkeypatch, tmp_path):
-    checkpoint_path = tmp_path / "speech_boundary_ja_frame_boundary_scorer_v5.pt"
+    checkpoint_path = tmp_path / "speech_boundary_ja_frame_boundary_scorer_v6.pt"
     checkpoint_path.write_bytes(b"checkpoint")
     monkeypatch.setenv("SPEECH_BOUNDARY_JA_PTM", QWEN_ASR_17B_REPO_ID)
     monkeypatch.setenv(
@@ -789,7 +789,7 @@ def test_feature_frame_scorer_checkpoint_round_trip(tmp_path):
 
     assert bundle.signature()["schema"] == MAMBA2_FRAME_SCORER_SCHEMA
     assert bundle.signature()["model_type"] == "mamba2_frame_boundary_scorer"
-    assert bundle.signature()["metadata"]["decoder"] == "topographic_split_micro_resolver_v3"
+    assert bundle.signature()["metadata"]["decoder"] == "topographic_split_micro_resolver_v4"
     assert bundle.input_dim == 6
     assert speech_probs.shape == (3,)
     assert split_probs.shape == (3,)
@@ -820,7 +820,7 @@ def test_feature_frame_scorer_rejects_removed_v1_schema(tmp_path):
         checkpoint_path,
     )
 
-    with pytest.raises(ValueError, match="speech_boundary_ja_mamba2_frame_boundary_scorer_v5"):
+    with pytest.raises(ValueError, match="speech_boundary_ja_mamba2_frame_boundary_scorer_v6"):
         load_feature_frame_scorer_checkpoint(checkpoint_path, device="cpu")
 
 
@@ -840,7 +840,7 @@ def test_feature_frame_scorer_rejects_old_decoder_contract(tmp_path):
     checkpoint_path = tmp_path / "feature_scorer_old_decoder.pt"
     torch.save(checkpoint, checkpoint_path)
 
-    with pytest.raises(ValueError, match="topographic_split_micro_resolver_v3"):
+    with pytest.raises(ValueError, match="topographic_split_micro_resolver_v4"):
         load_feature_frame_scorer_checkpoint(checkpoint_path, device="cpu")
 
 
@@ -1028,7 +1028,7 @@ def test_backend_scorer_is_opt_in_and_keeps_segment_contract(tmp_path, monkeypat
     assert result.segments
     assert result.segments[0].start == 0.0
     assert result.segments[0].end > result.segments[0].start
-    assert result.parameters["runtime_device"]["score_model"] == "mamba2_frame_boundary_scorer_v5"
+    assert result.parameters["runtime_device"]["score_model"] == "mamba2_frame_boundary_scorer_v6"
     assert result.parameters["scorer_checkpoint"]["schema"] == MAMBA2_FRAME_SCORER_SCHEMA
     assert SpeechBoundaryJaConfig().scorer_checkpoint == ""
     assert SpeechBoundaryJaBackend(SpeechBoundaryJaConfig()).signature()["scorer_checkpoint"] == ""

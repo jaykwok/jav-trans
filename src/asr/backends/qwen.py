@@ -51,11 +51,11 @@ DEFAULT_PRE_ASR_CUEQC_CHECKPOINT_BY_REPO: dict[str, str] = {
 DEFAULT_SPEECH_BOUNDARY_SCORER_CHECKPOINT_BY_REPO: dict[str, str] = {
     QWEN_ASR_17B_REPO_ID: (
         "src/boundary/ja/checkpoints/"
-        "speech_boundary_ja_frame_boundary_scorer_v5.jaykwok-Qwen3-ASR-1.7B-JA-Anime-Galgame.pt"
+        "speech_boundary_ja_frame_boundary_scorer_v6.jaykwok-Qwen3-ASR-1.7B-JA-Anime-Galgame.pt"
     ),
     QWEN_ASR_06B_REPO_ID: (
         "src/boundary/ja/checkpoints/"
-        "speech_boundary_ja_frame_boundary_scorer_v5.jaykwok-Qwen3-ASR-0.6B-JA-Anime-Galgame.pt"
+        "speech_boundary_ja_frame_boundary_scorer_v6.jaykwok-Qwen3-ASR-0.6B-JA-Anime-Galgame.pt"
     ),
 }
 

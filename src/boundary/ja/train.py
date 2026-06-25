@@ -78,7 +78,12 @@ class FeatureScorerTrainConfig:
     split_positive_weight: float = 4.0
     split_negative_weight: float = 1.0
     split_loss_weight: float = 1.0
+    split_tversky_loss_weight: float = 0.35
+    split_tversky_alpha: float = 0.35
+    split_tversky_beta: float = 0.65
+    split_target_mode: str = "gaussian"
     split_boundary_radius_frames: int = 1
+    split_boundary_sigma_frames: float = 1.0
     focal_gamma: float = 2.0
     eval_ratio: float = 0.1
     threshold: float = 0.5
@@ -119,6 +124,11 @@ class FeatureScorerTrainMetrics:
     split_positive_weight: float
     split_negative_weight: float
     split_loss_weight: float
+    split_tversky_loss_weight: float
+    split_tversky_alpha: float
+    split_tversky_beta: float
+    split_target_mode: str
+    split_boundary_sigma_frames: float
     focal_gamma: float
 
 
@@ -200,7 +210,7 @@ def train_feature_frame_scorer(
     config: FeatureScorerTrainConfig,
     labels_path: str = "",
     feature_manifest_path: str = "",
-    checkpoint_name: str = "speech_boundary_ja_frame_boundary_scorer_v5.pt",
+    checkpoint_name: str = "speech_boundary_ja_frame_boundary_scorer_v6.pt",
 ) -> FeatureScorerTrainMetrics:
     import torch
 
@@ -208,7 +218,7 @@ def train_feature_frame_scorer(
     if not rows:
         raise ValueError("at least one feature manifest row is required")
     output_dir.mkdir(parents=True, exist_ok=True)
-    checkpoint_name = checkpoint_name.strip() or "speech_boundary_ja_frame_boundary_scorer_v5.pt"
+    checkpoint_name = checkpoint_name.strip() or "speech_boundary_ja_frame_boundary_scorer_v6.pt"
     if Path(checkpoint_name).name != checkpoint_name:
         raise ValueError("checkpoint_name must be a file name, not a path")
     checkpoint_path = output_dir / checkpoint_name
@@ -233,8 +243,18 @@ def train_feature_frame_scorer(
         raise ValueError("split_negative_weight must be positive")
     if config.split_loss_weight <= 0.0:
         raise ValueError("split_loss_weight must be positive")
+    if config.split_tversky_loss_weight < 0.0:
+        raise ValueError("split_tversky_loss_weight must be non-negative")
+    if config.split_tversky_alpha <= 0.0:
+        raise ValueError("split_tversky_alpha must be positive")
+    if config.split_tversky_beta <= 0.0:
+        raise ValueError("split_tversky_beta must be positive")
+    if config.split_target_mode not in {"hard", "gaussian"}:
+        raise ValueError("split_target_mode must be 'hard' or 'gaussian'")
     if config.split_boundary_radius_frames < 0:
         raise ValueError("split_boundary_radius_frames must be non-negative")
+    if config.split_boundary_sigma_frames <= 0.0:
+        raise ValueError("split_boundary_sigma_frames must be positive")
     if config.focal_gamma < 0.0:
         raise ValueError("focal_gamma must be non-negative")
 
@@ -266,6 +286,8 @@ def train_feature_frame_scorer(
         records=records,
         feature_manifest_rows=train_rows,
         split_boundary_radius_frames=config.split_boundary_radius_frames,
+        split_boundary_sigma_frames=config.split_boundary_sigma_frames,
+        split_target_mode=config.split_target_mode,
         log_every=max(0, int(config.log_every)),
         total_rows=len(train_rows),
     )
@@ -291,6 +313,8 @@ def train_feature_frame_scorer(
             records=records,
             normalization=normalization,
             split_boundary_radius_frames=config.split_boundary_radius_frames,
+            split_boundary_sigma_frames=config.split_boundary_sigma_frames,
+            split_target_mode=config.split_target_mode,
         )
         if float(np.sum(weights)) <= 0.0:
             continue
@@ -307,6 +331,9 @@ def train_feature_frame_scorer(
             split_positive_weight=config.split_positive_weight,
             split_negative_weight=config.split_negative_weight,
             split_loss_weight=config.split_loss_weight,
+            split_tversky_loss_weight=config.split_tversky_loss_weight,
+            split_tversky_alpha=config.split_tversky_alpha,
+            split_tversky_beta=config.split_tversky_beta,
             focal_gamma=config.focal_gamma,
         )
         optimizer.zero_grad(set_to_none=True)
@@ -340,6 +367,11 @@ def train_feature_frame_scorer(
         split_negative_weight=config.split_negative_weight,
         split_loss_weight=config.split_loss_weight,
         split_boundary_radius_frames=config.split_boundary_radius_frames,
+        split_boundary_sigma_frames=config.split_boundary_sigma_frames,
+        split_target_mode=config.split_target_mode,
+        split_tversky_loss_weight=config.split_tversky_loss_weight,
+        split_tversky_alpha=config.split_tversky_alpha,
+        split_tversky_beta=config.split_tversky_beta,
         focal_gamma=config.focal_gamma,
     )
     feature_hash, feature_hash_source = scorer_feature_hash(
@@ -353,7 +385,7 @@ def train_feature_frame_scorer(
             model_config=model_config,
             normalization=normalization,
             metadata={
-                "operating_point": "qwen-mamba2-frame-boundary-scorer-v5-native",
+                "operating_point": "qwen-mamba2-frame-boundary-scorer-v6-native",
                 "ptm_repo_id": ptm_repo_id,
                 "labels": labels_path,
                 "feature_manifest": feature_manifest_path,
@@ -371,7 +403,15 @@ def train_feature_frame_scorer(
                     "split_positive_weight": float(config.split_positive_weight),
                     "split_negative_weight": float(config.split_negative_weight),
                     "split_loss_weight": float(config.split_loss_weight),
+                    "split_tversky_loss_weight": float(config.split_tversky_loss_weight),
+                    "split_tversky_alpha": float(config.split_tversky_alpha),
+                    "split_tversky_beta": float(config.split_tversky_beta),
                     "focal_gamma": float(config.focal_gamma),
+                },
+                "target": {
+                    "split_target_mode": str(config.split_target_mode),
+                    "split_boundary_radius_frames": int(config.split_boundary_radius_frames),
+                    "split_boundary_sigma_frames": float(config.split_boundary_sigma_frames),
                 },
                 "config": asdict(config),
             },
@@ -410,6 +450,11 @@ def train_feature_frame_scorer(
         split_positive_weight=float(config.split_positive_weight),
         split_negative_weight=float(config.split_negative_weight),
         split_loss_weight=float(config.split_loss_weight),
+        split_tversky_loss_weight=float(config.split_tversky_loss_weight),
+        split_tversky_alpha=float(config.split_tversky_alpha),
+        split_tversky_beta=float(config.split_tversky_beta),
+        split_target_mode=str(config.split_target_mode),
+        split_boundary_sigma_frames=float(config.split_boundary_sigma_frames),
         focal_gamma=float(config.focal_gamma),
     )
     metrics_path.write_text(
@@ -457,6 +502,8 @@ def scorer_dataset_metadata(records: Iterable[LabelRecord]) -> dict[str, Any]:
     feature_hashes: set[str] = set()
     speech_dilation_values: set[float] = set()
     split_radius_values: set[int] = set()
+    split_sigma_values: set[float] = set()
+    split_label_modes: set[str] = set()
     drop_policies: set[str] = set()
     seeds: set[int] = set()
     for record in records:
@@ -486,6 +533,14 @@ def scorer_dataset_metadata(records: Iterable[LabelRecord]) -> dict[str, Any]:
                 split_radius_values.add(int(metadata["split_boundary_radius_frames"]))
             except (TypeError, ValueError):
                 pass
+        if metadata.get("split_boundary_sigma_frames") is not None:
+            try:
+                split_sigma_values.add(float(metadata["split_boundary_sigma_frames"]))
+            except (TypeError, ValueError):
+                pass
+        split_label_mode = str(metadata.get("split_boundary_label_mode") or "")
+        if split_label_mode:
+            split_label_modes.add(split_label_mode)
         drop_policy = str(metadata.get("drop_policy") or "")
         if drop_policy:
             drop_policies.add(drop_policy)
@@ -521,6 +576,8 @@ def scorer_dataset_metadata(records: Iterable[LabelRecord]) -> dict[str, Any]:
         "feature_hashes": sorted(feature_hashes),
         "speech_label_dilation_s_values": sorted(speech_dilation_values),
         "split_boundary_radius_frame_values": sorted(split_radius_values),
+        "split_boundary_sigma_frame_values": sorted(split_sigma_values),
+        "split_boundary_label_modes": sorted(split_label_modes),
         "drop_policies": sorted(drop_policies),
         "seeds": sorted(seeds),
     }
@@ -559,6 +616,9 @@ def weighted_frame_bce_loss(
     split_positive_weight: float = 4.0,
     split_negative_weight: float = 1.0,
     split_loss_weight: float = 1.0,
+    split_tversky_loss_weight: float = 0.0,
+    split_tversky_alpha: float = 0.35,
+    split_tversky_beta: float = 0.65,
     focal_gamma: float = 0.0,
 ):
     import torch
@@ -594,7 +654,23 @@ def weighted_frame_bce_loss(
         loss_values = loss_values * torch.pow((1.0 - pt).clamp(min=0.0, max=1.0), float(focal_gamma))
     effective_weights = frame_weights * class_weights * head_weights
     weight_sum = effective_weights.sum().clamp_min(1e-6)
-    return (loss_values * effective_weights).sum() / weight_sum, weight_sum
+    bce_loss = (loss_values * effective_weights).sum() / weight_sum
+    if float(split_tversky_loss_weight) <= 0.0:
+        return bce_loss, weight_sum
+
+    split_weights = frame_weights[..., 1].clamp(min=0.0)
+    split_labelp = labels[..., 1].clamp(min=0.0, max=1.0)
+    split_probp = torch.sigmoid(logits[..., 1]).clamp(min=0.0, max=1.0)
+    true_positive = (split_weights * split_probp * split_labelp).sum()
+    false_positive = (split_weights * split_probp * (1.0 - split_labelp)).sum()
+    false_negative = (split_weights * (1.0 - split_probp) * split_labelp).sum()
+    tversky = (true_positive + 1e-6) / (
+        true_positive
+        + float(split_tversky_alpha) * false_positive
+        + float(split_tversky_beta) * false_negative
+        + 1e-6
+    )
+    return bce_loss + float(split_tversky_loss_weight) * (1.0 - tversky), weight_sum
 
 
 def compute_feature_normalization(
@@ -602,6 +678,8 @@ def compute_feature_normalization(
     records: list[LabelRecord],
     feature_manifest_rows: Iterable[Mapping[str, Any]],
     split_boundary_radius_frames: int = 1,
+    split_boundary_sigma_frames: float = 1.0,
+    split_target_mode: str = "gaussian",
     log_every: int = 0,
     total_rows: int | None = None,
 ) -> dict[str, Any]:
@@ -618,6 +696,8 @@ def compute_feature_normalization(
             row=row,
             records=records,
             split_boundary_radius_frames=split_boundary_radius_frames,
+            split_boundary_sigma_frames=split_boundary_sigma_frames,
+            split_target_mode=split_target_mode,
         )
         frame_weight = np.max(weights, axis=1, keepdims=True).astype(np.float64, copy=False)
         if float(frame_weight.sum()) <= 0.0:
@@ -671,11 +751,15 @@ def feature_training_tensors(
     records: list[LabelRecord],
     normalization: Mapping[str, Any],
     split_boundary_radius_frames: int = 1,
+    split_boundary_sigma_frames: float = 1.0,
+    split_target_mode: str = "gaussian",
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     features, labels, weights = _feature_training_arrays(
         row=row,
         records=records,
         split_boundary_radius_frames=split_boundary_radius_frames,
+        split_boundary_sigma_frames=split_boundary_sigma_frames,
+        split_target_mode=split_target_mode,
     )
     mean = np.asarray(normalization["feature_mean"], dtype=np.float32)
     std = np.asarray(normalization["feature_std"], dtype=np.float32)
@@ -705,6 +789,11 @@ def evaluate_feature_frame_scorer(
     split_negative_weight: float = 1.0,
     split_loss_weight: float = 1.0,
     split_boundary_radius_frames: int = 1,
+    split_boundary_sigma_frames: float = 1.0,
+    split_target_mode: str = "gaussian",
+    split_tversky_loss_weight: float = 0.0,
+    split_tversky_alpha: float = 0.35,
+    split_tversky_beta: float = 0.65,
     focal_gamma: float = 2.0,
 ) -> dict[str, float | int]:
     import torch
@@ -723,6 +812,8 @@ def evaluate_feature_frame_scorer(
                 records=records,
                 normalization=normalization,
                 split_boundary_radius_frames=split_boundary_radius_frames,
+                split_boundary_sigma_frames=split_boundary_sigma_frames,
+                split_target_mode=split_target_mode,
             )
             if float(np.sum(weights)) <= 0.0:
                 continue
@@ -739,6 +830,9 @@ def evaluate_feature_frame_scorer(
                 split_positive_weight=split_positive_weight,
                 split_negative_weight=split_negative_weight,
                 split_loss_weight=split_loss_weight,
+                split_tversky_loss_weight=split_tversky_loss_weight,
+                split_tversky_alpha=split_tversky_alpha,
+                split_tversky_beta=split_tversky_beta,
                 focal_gamma=focal_gamma,
             )
             loss_sum += float((loss * effective_weight_sum).detach().cpu())
@@ -894,6 +988,8 @@ def _feature_training_arrays(
     row: Mapping[str, Any],
     records: list[LabelRecord],
     split_boundary_radius_frames: int = 1,
+    split_boundary_sigma_frames: float = 1.0,
+    split_target_mode: str = "gaussian",
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     label_index = int(row["label_index"])
     record = records[label_index]
@@ -902,10 +998,12 @@ def _feature_training_arrays(
     frame_total = min(ptm.shape[0], mfcc.shape[0], len(record.speech_frames), len(base_weights))
     if frame_total <= 0:
         raise ValueError(f"feature row has no usable frames: label_index={label_index}")
-    _speech_targets, split_targets = scorer_v5_targets_from_record(
+    _speech_targets, split_targets = scorer_v6_targets_from_record(
         record,
         frame_count=frame_total,
         split_boundary_radius_frames=split_boundary_radius_frames,
+        split_boundary_sigma_frames=split_boundary_sigma_frames,
+        split_target_mode=split_target_mode,
     )
     speech_labels = _speech_targets[:frame_total].astype(np.float32)
     split_labels = split_targets[:frame_total].astype(np.float32)
@@ -962,13 +1060,15 @@ def _head_frame_weights(
     return np.stack(columns, axis=1).astype(np.float32, copy=False)
 
 
-def scorer_v5_targets_from_record(
+def scorer_v6_targets_from_record(
     record: LabelRecord,
     *,
     frame_count: int,
     split_boundary_radius_frames: int = 1,
+    split_boundary_sigma_frames: float = 1.0,
+    split_target_mode: str = "gaussian",
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Return the two active Scorer v5 frame targets: speech and split boundary."""
+    """Return Scorer v6 frame targets: speech and split-boundary heatmap."""
 
     frame_count = max(0, int(frame_count))
     speech = np.asarray(record.speech_frames[:frame_count], dtype=np.float32)
@@ -978,10 +1078,23 @@ def scorer_v5_targets_from_record(
     if frame_count <= 0:
         return speech.astype(np.float32, copy=False), split
     cut_radius = max(0, int(split_boundary_radius_frames))
+    sigma = max(1e-6, float(split_boundary_sigma_frames))
+    target_mode = str(split_target_mode or "gaussian").strip().lower()
+    if target_mode not in {"hard", "gaussian"}:
+        raise ValueError("split_target_mode must be 'hard' or 'gaussian'")
     metadata = dict(record.boundary_metadata or {})
     for point_time in metadata_cut_points(metadata.get("cut_point_segments")):
-        point_index = max(0, min(frame_count - 1, int(round(point_time / record.frame_hop_s))))
-        split[max(0, point_index - cut_radius) : min(frame_count, point_index + cut_radius + 1)] = 1.0
+        center = float(point_time) / max(1e-9, float(record.frame_hop_s))
+        point_index = max(0, min(frame_count - 1, int(round(center))))
+        start = max(0, point_index - cut_radius)
+        end = min(frame_count, point_index + cut_radius + 1)
+        if target_mode == "hard":
+            split[start:end] = 1.0
+            continue
+        indexes = np.arange(start, end, dtype=np.float32)
+        values = np.exp(-0.5 * np.square((indexes - float(center)) / sigma)).astype(np.float32)
+        if values.size:
+            split[start:end] = np.maximum(split[start:end], values)
     return speech.astype(np.float32, copy=False), split
 
 

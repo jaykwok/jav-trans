@@ -33,7 +33,7 @@ from boundary.ja.model import (
 
 DEFAULT_PTM = "jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame"
 DEFAULT_MODEL_PATH = qwen_asr_default_model_path(DEFAULT_PTM)
-DEFAULT_OPERATING_POINT = "qwen-mamba2-frame-boundary-scorer-v5"
+DEFAULT_OPERATING_POINT = "qwen-mamba2-frame-boundary-scorer-v6"
 
 
 @dataclass(frozen=True)
@@ -1058,7 +1058,7 @@ def decode_frame_boundary_segments(
     config: "SpeechBoundaryJaConfig",
     threshold_override: float | None = None,
 ) -> FrameBoundaryDecodeResult:
-    """Decode scorer v5 frame heads into speech islands.
+    """Decode scorer v6 frame heads into speech islands.
 
     This is intentionally shared by runtime and Boundary Refiner v6 dataset
     export so the refiner learns from exactly the same island contract it sees
@@ -1187,7 +1187,7 @@ class SpeechBoundaryJaConfig:
 
 
 class SpeechBoundaryJaBackend:
-    name = "speech_boundary_ja_mamba2_frame_boundary_scorer_v5"
+    name = "speech_boundary_ja_mamba2_frame_boundary_scorer_v6"
 
     def __init__(self, config: SpeechBoundaryJaConfig | None = None) -> None:
         self.config = config or SpeechBoundaryJaConfig.from_env()
@@ -1205,7 +1205,7 @@ class SpeechBoundaryJaBackend:
         speech_on_threshold, speech_off_threshold = self._speech_thresholds(cfg)
         signature = {
             "backend": self.name,
-            "schema": "speech_boundary_ja_mamba2_frame_boundary_scorer_v5",
+            "schema": "speech_boundary_ja_mamba2_frame_boundary_scorer_v6",
             "threshold": float(cfg.threshold),
             "speech_threshold_mode": "hysteresis",
             "speech_on_threshold": float(speech_on_threshold),
@@ -1299,7 +1299,7 @@ class SpeechBoundaryJaBackend:
             "ptm_param_device": ptm_param_device,
             "ptm_param_dtype": ptm_param_dtype,
             "score_model": (
-                "mamba2_frame_boundary_scorer_v5" if scorer is not None else "bootstrap_energy_ptm_mfcc"
+                "mamba2_frame_boundary_scorer_v6" if scorer is not None else "bootstrap_energy_ptm_mfcc"
             ),
             "scorer_device": str(scorer_device) if scorer is not None else "",
         }

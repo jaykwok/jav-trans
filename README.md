@@ -116,7 +116,7 @@ Web 提交是否使用 CUDA 取决于后端服务进程是否能看到 GPU，而
   -> Shared Qwen feature extraction
      - Qwen ASR repo 对应的 frozen PTM/encoder frame features
      - MFCC / timing numeric features
-  -> SpeechBoundary-JA Scorer v5
+  -> SpeechBoundary-JA Scorer v6
      - dense frame speech_prob
      - dense frame split_boundary_prob
   -> Scorer decoder
@@ -169,17 +169,19 @@ Web 提交是否使用 CUDA 取决于后端服务进程是否能看到 GPU，而
 
 同一个 ASR repo id 也决定 SpeechBoundary-JA frozen feature 的来源，以及三个本地 checkpoint 的 registry key。checkpoint 文件名只是人工可读 tag，真正归属以 metadata 中的 repo id / schema / feature hash 为准。
 
-### SpeechBoundary-JA Scorer v5
+### SpeechBoundary-JA Scorer v6
 
 | 项 | 内容 |
 | --- | --- |
-| Schema | `speech_boundary_ja_mamba2_frame_boundary_scorer_v5` |
+| Schema | `speech_boundary_ja_mamba2_frame_boundary_scorer_v6` |
 | Model type | `mamba2_frame_boundary_scorer` |
 | Backbone | `BoundarySequenceClassifier` + `transformers.Mamba2Model` wrapper |
 | Input | Qwen PTM/encoder frame features + MFCC / timing frame features |
 | Output dim | `2` |
 | Output heads | `speech_prob`, `split_boundary_prob` |
-| Decoder contract | `topographic_split_micro_resolver_v3` |
+| Decoder contract | `topographic_split_micro_resolver_v4` |
+| Split training target | Gaussian boundary heatmap |
+| Split loss | BCE/focal + Tversky overlap loss |
 
 `speech_prob` 负责找 speech frames；`split_boundary_prob` 负责找应切开的 acoustic boundary。Scorer 不做 keep/drop，也不承担字幕显示时长规则。
 

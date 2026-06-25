@@ -8,14 +8,14 @@ from typing import Any, Sequence
 import numpy as np
 
 
-MAMBA2_FRAME_SCORER_SCHEMA = "speech_boundary_ja_mamba2_frame_boundary_scorer_v5"
+MAMBA2_FRAME_SCORER_SCHEMA = "speech_boundary_ja_mamba2_frame_boundary_scorer_v6"
 MAMBA2_FRAME_SCORER_MODEL_TYPE = "mamba2_frame_boundary_scorer"
 MAMBA2_FRAME_SCORER_OUTPUT_DIM = 2
 MAMBA2_FRAME_SCORER_OUTPUT_HEADS = (
     "speech_prob",
     "split_boundary_prob",
 )
-MAMBA2_FRAME_SCORER_DECODER = "topographic_split_micro_resolver_v3"
+MAMBA2_FRAME_SCORER_DECODER = "topographic_split_micro_resolver_v4"
 
 
 def count_trainable_parameters(model) -> int:

@@ -92,7 +92,7 @@ def run(args: argparse.Namespace) -> None:
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Export SpeechBoundary-JA v5 per-frame speech/split scores."
+        description="Export SpeechBoundary-JA v6 per-frame speech/split scores."
     )
     parser.add_argument("--audio", required=True, help="16k wav or workflow audio path.")
     parser.add_argument(
