@@ -27,7 +27,7 @@ from boundary.refiner import (
     BOUNDARY_REFINER_OUTPUT_DIM,
     DEFAULT_BOUNDARY_DELTA_MAX_S,
     build_learned_refiner_checkpoint,
-    load_edge_sequence_refiner_v6_checkpoint,
+    load_edge_sequence_refiner_v7_checkpoint,
 )
 from boundary.sequence_features import (
     FRAME_SEQUENCE_FEATURE_SCHEMA,
@@ -269,7 +269,7 @@ def train_refiner(
                 "start_delta_loss_weight": config.start_delta_loss_weight,
                 "end_delta_loss_weight": config.end_delta_loss_weight,
                 "delta_loss": "smooth_l1",
-                "source": "scorer_v6_island_edges",
+                "source": "scorer_v7_island_edges",
             },
             "boundary_delta_max_s": config.boundary_delta_max_s,
             "init_checkpoint": init_metadata,
@@ -283,9 +283,9 @@ def train_refiner(
     if not checkpoint_name:
         ptm_repo_id = str(feature_metadata.get("ptm_repo_id") or "").strip()
         checkpoint_name = (
-            f"boundary_edge_refiner_v6.{qwen_asr_repo_tag(ptm_repo_id)}.pt"
+            f"boundary_edge_refiner_v7.{qwen_asr_repo_tag(ptm_repo_id)}.pt"
             if ptm_repo_id
-            else "boundary_edge_refiner_v6.pt"
+            else "boundary_edge_refiner_v7.pt"
         )
     if Path(checkpoint_name).name != checkpoint_name:
         raise ValueError("checkpoint_name must be a file name, not a path")
@@ -293,7 +293,7 @@ def train_refiner(
     torch.save(checkpoint, checkpoint_path)
     metrics["checkpoint"] = str(checkpoint_path)
 
-    refiner = load_edge_sequence_refiner_v6_checkpoint(
+    refiner = load_edge_sequence_refiner_v7_checkpoint(
         checkpoint_path,
         backbone_override=TRANSFORMERS_MAMBA2_BACKBONE,
     )
@@ -399,7 +399,7 @@ def _load_tensor_cache(path: Path, *, dataset_paths: Sequence[Path] | None = Non
     payload = torch.load(path, map_location="cpu", weights_only=False)
     if not isinstance(payload, Mapping):
         raise ValueError(f"tensor cache must be a mapping: {path}")
-    if str(payload.get("schema") or "") != "boundary_refiner_tensor_cache_v6":
+    if str(payload.get("schema") or "") != "boundary_refiner_tensor_cache_v7":
         raise ValueError(f"unsupported tensor cache schema: {payload.get('schema')!r}")
     if dataset_paths is not None:
         cached_sources = payload.get("dataset_sources")
@@ -472,7 +472,7 @@ def _write_tensor_cache(
     path.parent.mkdir(parents=True, exist_ok=True)
     torch.save(
         {
-            "schema": "boundary_refiner_tensor_cache_v6",
+            "schema": "boundary_refiner_tensor_cache_v7",
             "dataset_sources": _dataset_source_fingerprints(dataset_paths),
             "feature_names": list(loaded.feature_names),
             "feature_metadata": loaded.feature_metadata,
@@ -515,8 +515,8 @@ def _load_initial_checkpoint(
     if not isinstance(payload, Mapping):
         raise ValueError("init checkpoint must be a mapping")
     schema = str(payload.get("schema") or "")
-    if schema != "boundary_edge_refiner_v6":
-        raise ValueError(f"init checkpoint schema must be boundary_edge_refiner_v6, got {schema!r}")
+    if schema != "boundary_edge_refiner_v7":
+        raise ValueError(f"init checkpoint schema must be boundary_edge_refiner_v7, got {schema!r}")
     model_config = dict(payload.get("model_config") or {})
     if int(model_config.get("input_dim", -1)) != int(expected_input_dim):
         raise ValueError(
@@ -587,7 +587,7 @@ def _scan_dataset(paths: Sequence[Path], *, log_interval_rows: int = 0) -> Datas
     expected_signature: dict[str, Any] | None = None
 
     for row in _iter_dataset_rows(paths):
-        _validate_v6_edge_row(row, row_index=row_count)
+        _validate_v7_edge_row(row, row_index=row_count)
         if first_row is None:
             first_row = dict(row)
         row_names = _row_feature_names(row, feature_names)
@@ -665,7 +665,7 @@ def _row_feature_names(row: Mapping[str, Any], fallback: tuple[str, ...] | None 
     elif fallback is not None:
         names = fallback
     else:
-        raise ValueError("boundary refiner v6 rows require feature_names")
+        raise ValueError("boundary refiner v7 rows require feature_names")
     if not names:
         raise ValueError("dataset feature_names must not be empty")
     return names
@@ -677,17 +677,17 @@ def _train_schema(rows: Sequence[Mapping[str, Any]]) -> str:
 
 
 def _train_schema_from_values(schemas: set[str]) -> str:
-    if schemas == {"boundary_edge_refiner_dataset_v6"}:
-        return "boundary_edge_refiner_dataset_v6"
+    if schemas == {"boundary_edge_refiner_dataset_v7"}:
+        return "boundary_edge_refiner_dataset_v7"
     raise ValueError(f"unsupported boundary refiner dataset schema values: {sorted(schemas)}")
 
 
-def _validate_v6_edge_row(row: Mapping[str, Any], *, row_index: int) -> None:
+def _validate_v7_edge_row(row: Mapping[str, Any], *, row_index: int) -> None:
     schema = str(row.get("schema") or "")
-    if schema != "boundary_edge_refiner_dataset_v6":
+    if schema != "boundary_edge_refiner_dataset_v7":
         raise ValueError(
             "boundary refiner training only accepts "
-            f"'boundary_edge_refiner_dataset_v6', got {schema!r} at row {row_index}"
+            f"'boundary_edge_refiner_dataset_v7', got {schema!r} at row {row_index}"
         )
     stale_fields = (
         "sequence_labels",
@@ -705,20 +705,20 @@ def _validate_v6_edge_row(row: Mapping[str, Any], *, row_index: int) -> None:
     present = [field for field in stale_fields if field in row]
     if present:
         raise ValueError(
-            "boundary refiner v6 rows must not contain old merge/split/context fields "
+            "boundary refiner v7 rows must not contain old merge/split/context fields "
             f"at row {row_index}: {present}"
         )
     metadata = row.get("metadata")
     metadata_source = metadata.get("dataset_source") if isinstance(metadata, Mapping) else ""
     dataset_source = str(row.get("dataset_source") or metadata_source or "")
-    if dataset_source != "scorer_v6_predicted_island_edges":
+    if dataset_source != "scorer_v7_predicted_island_edges":
         raise ValueError(
-            "boundary refiner v6 rows must use "
-            f"'scorer_v6_predicted_island_edges', got {dataset_source!r} at row {row_index}"
+            "boundary refiner v7 rows must use "
+            f"'scorer_v7_predicted_island_edges', got {dataset_source!r} at row {row_index}"
         )
     scorer_checkpoint = metadata.get("scorer_checkpoint") if isinstance(metadata, Mapping) else None
     if not isinstance(scorer_checkpoint, Mapping):
-        raise ValueError(f"boundary refiner v6 rows require metadata.scorer_checkpoint at row {row_index}")
+        raise ValueError(f"boundary refiner v7 rows require metadata.scorer_checkpoint at row {row_index}")
 
 
 def _feature_metadata_from_scan(
@@ -736,7 +736,7 @@ def _feature_metadata_from_scan(
     if len(hash_values) > 1:
         raise ValueError("mixed feature_schema_hash values are not allowed")
     if not ptm_repo_values:
-        raise ValueError("boundary refiner v6 rows require metadata.ptm_repo_id")
+        raise ValueError("boundary refiner v7 rows require metadata.ptm_repo_id")
     if len(ptm_repo_values) > 1:
         raise ValueError(f"mixed ptm_repo_id values are not allowed: {sorted(ptm_repo_values)}")
     if len(dataset_source_values) > 1:
@@ -800,7 +800,7 @@ def _row_sequence_length(row: Mapping[str, Any], feature_names: tuple[str, ...])
                 expected_feature_names=row.get("feature_names") or feature_names,
             )
         return len(raw_sequence)
-    raise ValueError("boundary refiner v6 rows require sequence_features")
+    raise ValueError("boundary refiner v7 rows require sequence_features")
 
 
 def _row_sequence_array(row: Mapping[str, Any], feature_names: tuple[str, ...]) -> np.ndarray:
@@ -811,7 +811,7 @@ def _row_sequence_array(row: Mapping[str, Any], feature_names: tuple[str, ...]) 
             feature_names=feature_names,
             expected_feature_names=row.get("feature_names") or feature_names,
         ).astype(np.float32, copy=False)
-    raise ValueError("boundary refiner v6 rows require sequence_features")
+    raise ValueError("boundary refiner v7 rows require sequence_features")
 
 
 def _row_sequence(row: Mapping[str, Any], feature_names: tuple[str, ...]) -> list[list[float]]:
@@ -834,7 +834,7 @@ def _row_boundary_delta_target_sequence(row: Mapping[str, Any], *, expected_len:
                 raise ValueError("sequence_boundary_delta_targets must not contain NaN or inf")
             targets.append([start_delta, end_delta])
         return targets
-    raise ValueError("boundary refiner v6 rows require sequence_boundary_delta_targets")
+    raise ValueError("boundary refiner v7 rows require sequence_boundary_delta_targets")
 
 
 def _row_boundary_delta_weight_sequence(row: Mapping[str, Any], *, expected_len: int) -> list[list[float]]:
@@ -1066,7 +1066,7 @@ def _validate_config(config: TrainRefinerConfig) -> None:
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Train a transformers.Mamba2Model Boundary Refiner v6 from scorer island edge samples."
+        description="Train a transformers.Mamba2Model Boundary Refiner v7 from scorer island edge samples."
     )
     parser.add_argument("--dataset", action="append", required=True, help="Gap dataset JSONL. Repeatable.")
     parser.add_argument("--output-dir", required=True)
@@ -1091,7 +1091,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--init-checkpoint",
         default="",
-        help="Optional boundary_edge_refiner_v6 checkpoint used to initialize weights.",
+        help="Optional boundary_edge_refiner_v7 checkpoint used to initialize weights.",
     )
     parser.add_argument(
         "--preserve-init-normalization",

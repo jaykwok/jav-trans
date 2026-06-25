@@ -49,7 +49,7 @@ def _sequence_feature_metadata(feature_names: list[str]) -> dict:
     }
 
 
-def _write_v6_dataset(
+def _write_v7_dataset(
     path: Path,
     *,
     rows: int = 4,
@@ -77,8 +77,8 @@ def _write_v6_dataset(
             targets.append([0.02 * (item_index + 1), -0.03 * (row_index + 1)])
             weights.append([1.0, 0.6])
         payload = {
-            "schema": "boundary_edge_refiner_dataset_v6",
-            "dataset_source": "scorer_v6_predicted_island_edges",
+            "schema": "boundary_edge_refiner_dataset_v7",
+            "dataset_source": "scorer_v7_predicted_island_edges",
             "audio_id": f"seq-{row_index}",
             "feature_names": feature_names,
             "sequence_features": sequence,
@@ -88,10 +88,10 @@ def _write_v6_dataset(
         }
         if include_ptm_repo_id:
             payload["metadata"] = {
-                "dataset_source": "scorer_v6_predicted_island_edges",
+                "dataset_source": "scorer_v7_predicted_island_edges",
                 "ptm_repo_id": "jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame",
                 "scorer_checkpoint": {
-                    "schema": "speech_boundary_ja_mamba2_frame_boundary_scorer_v6",
+                    "schema": "speech_boundary_ja_mamba2_frame_boundary_scorer_v7",
                     "sha256": "unit-helper",
                     "metadata": {
                         "ptm_repo_id": "jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame",
@@ -100,9 +100,9 @@ def _write_v6_dataset(
             }
         else:
             payload["metadata"] = {
-                "dataset_source": "scorer_v6_predicted_island_edges",
+                "dataset_source": "scorer_v7_predicted_island_edges",
                 "scorer_checkpoint": {
-                    "schema": "speech_boundary_ja_mamba2_frame_boundary_scorer_v6",
+                    "schema": "speech_boundary_ja_mamba2_frame_boundary_scorer_v7",
                     "sha256": "unit-helper",
                 },
             }
@@ -132,12 +132,12 @@ def _tiny_train_config(**overrides) -> TrainRefinerConfig:
     )
 
 
-def test_train_refiner_accepts_v6_delta_dataset(tmp_path):
+def test_train_refiner_accepts_v7_delta_dataset(tmp_path):
     pytest.importorskip("torch")
     transformers = pytest.importorskip("transformers")
     if not hasattr(transformers, "Mamba2Model"):
         pytest.skip("transformers.Mamba2Model is unavailable")
-    dataset = _write_v6_dataset(tmp_path / "sequence.jsonl", rows=4, items_per_row=3)
+    dataset = _write_v7_dataset(tmp_path / "sequence.jsonl", rows=4, items_per_row=3)
 
     metrics = train_refiner(
         dataset_paths=[dataset],
@@ -155,7 +155,7 @@ def test_train_refiner_accepts_v6_delta_dataset(tmp_path):
     assert edge_policy["delta_loss"] == "smooth_l1"
     assert edge_policy["start_delta_loss_weight"] == 1.0
     assert edge_policy["end_delta_loss_weight"] == 0.6
-    assert edge_policy["source"] == "scorer_v6_island_edges"
+    assert edge_policy["source"] == "scorer_v7_island_edges"
     smoke = metrics["loader_smoke"]["first_decision"]
     assert set(smoke) == {"source", "start_refine_delta_s", "end_refine_delta_s"}
 
@@ -165,7 +165,7 @@ def test_train_refiner_rejects_dataset_without_ptm_repo_id(tmp_path):
     transformers = pytest.importorskip("transformers")
     if not hasattr(transformers, "Mamba2Model"):
         pytest.skip("transformers.Mamba2Model is unavailable")
-    dataset = _write_v6_dataset(
+    dataset = _write_v7_dataset(
         tmp_path / "sequence.jsonl",
         rows=2,
         items_per_row=1,
@@ -185,7 +185,7 @@ def test_train_refiner_rejects_merge_era_fields(tmp_path):
     transformers = pytest.importorskip("transformers")
     if not hasattr(transformers, "Mamba2Model"):
         pytest.skip("transformers.Mamba2Model is unavailable")
-    dataset = _write_v6_dataset(tmp_path / "sequence-with-old-labels.jsonl", rows=1, items_per_row=1)
+    dataset = _write_v7_dataset(tmp_path / "sequence-with-old-labels.jsonl", rows=1, items_per_row=1)
     row = json.loads(dataset.read_text(encoding="utf-8").splitlines()[0])
     row["sequence_labels"] = [1]
     row["merge_positive"] = 1
@@ -199,12 +199,12 @@ def test_train_refiner_rejects_merge_era_fields(tmp_path):
         )
 
 
-def test_train_refiner_can_initialize_v6_checkpoint_and_freeze_backbone(tmp_path):
+def test_train_refiner_can_initialize_v7_checkpoint_and_freeze_backbone(tmp_path):
     pytest.importorskip("torch")
     transformers = pytest.importorskip("transformers")
     if not hasattr(transformers, "Mamba2Model"):
         pytest.skip("transformers.Mamba2Model is unavailable")
-    dataset = _write_v6_dataset(tmp_path / "init-sequence.jsonl")
+    dataset = _write_v7_dataset(tmp_path / "init-sequence.jsonl")
     base_config = _tiny_train_config()
 
     first = train_refiner(
@@ -229,7 +229,7 @@ def test_train_refiner_can_initialize_v6_checkpoint_and_freeze_backbone(tmp_path
     assert metadata["freeze_backbone"] is True
     assert metadata["preserve_init_normalization"] is True
     assert metadata["normalization_source"] == "init_checkpoint"
-    assert metadata["init_checkpoint"]["schema"] == "boundary_edge_refiner_v6"
+    assert metadata["init_checkpoint"]["schema"] == "boundary_edge_refiner_v7"
 
 
 def test_train_refiner_uses_streaming_tensor_loader(tmp_path, monkeypatch):
@@ -237,7 +237,7 @@ def test_train_refiner_uses_streaming_tensor_loader(tmp_path, monkeypatch):
     transformers = pytest.importorskip("transformers")
     if not hasattr(transformers, "Mamba2Model"):
         pytest.skip("transformers.Mamba2Model is unavailable")
-    dataset = _write_v6_dataset(tmp_path / "streaming-sequence.jsonl", rows=6, items_per_row=1)
+    dataset = _write_v7_dataset(tmp_path / "streaming-sequence.jsonl", rows=6, items_per_row=1)
 
     original_iter = train_refiner_module._iter_dataset_rows
     calls = {"count": 0}
@@ -259,12 +259,12 @@ def test_train_refiner_uses_streaming_tensor_loader(tmp_path, monkeypatch):
     assert calls["count"] == 2
 
 
-def test_train_refiner_reuses_v6_tensor_cache_without_jsonl_rescan(tmp_path, monkeypatch):
+def test_train_refiner_reuses_v7_tensor_cache_without_jsonl_rescan(tmp_path, monkeypatch):
     pytest.importorskip("torch")
     transformers = pytest.importorskip("transformers")
     if not hasattr(transformers, "Mamba2Model"):
         pytest.skip("transformers.Mamba2Model is unavailable")
-    dataset = _write_v6_dataset(tmp_path / "cache-sequence.jsonl", rows=6, items_per_row=1)
+    dataset = _write_v7_dataset(tmp_path / "cache-sequence.jsonl", rows=6, items_per_row=1)
     tensor_cache = tmp_path / "cache-sequence.tensor.pt"
 
     first = train_refiner(
@@ -404,7 +404,7 @@ def test_build_frame_sequence_dataset_trains_with_cached_features(tmp_path, monk
     rows = [json.loads(line) for line in output_jsonl.read_text(encoding="utf-8").splitlines()]
 
     assert "class_balance" not in summary
-    assert rows[0]["schema"] == "boundary_edge_refiner_dataset_v6"
+    assert rows[0]["schema"] == "boundary_edge_refiner_dataset_v7"
     assert "sequence_labels" not in rows[0]
     assert "gap_s" in rows[0]["feature_names"]
     assert "gap_merge_s" not in rows[0]["feature_names"]
@@ -412,9 +412,9 @@ def test_build_frame_sequence_dataset_trains_with_cached_features(tmp_path, monk
     assert len(rows[0]["sequence_boundary_delta_targets"]) == 1
     assert rows[0]["sequence_boundary_delta_targets"][0] == pytest.approx([0.02, -0.02])
     assert rows[0]["metadata"]["ptm_repo_id"] == QWEN_ASR_17B_REPO_ID
-    assert rows[0]["metadata"]["dataset_source"] == "scorer_v6_predicted_island_edges"
+    assert rows[0]["metadata"]["dataset_source"] == "scorer_v7_predicted_island_edges"
     assert rows[0]["metadata"]["scorer_checkpoint"]["sha256"] == "unit"
-    assert summary["source"] == "scorer_v6_predicted_island_edges"
+    assert summary["source"] == "scorer_v7_predicted_island_edges"
 
     metrics = train_refiner(
         dataset_paths=[output_jsonl],
@@ -429,7 +429,7 @@ def test_build_frame_sequence_dataset_trains_with_cached_features(tmp_path, monk
     assert metrics["loader_smoke"]["signature"]["metadata"]["ptm_repo_id"] == QWEN_ASR_17B_REPO_ID
     assert (
         metrics["loader_smoke"]["signature"]["metadata"]["dataset_source"]
-        == "scorer_v6_predicted_island_edges"
+        == "scorer_v7_predicted_island_edges"
     )
     assert metrics["loader_smoke"]["signature"]["metadata"]["scorer_checkpoint"]["sha256"] == "unit"
     assert rows[0]["feature_schema"] == FRAME_SEQUENCE_FEATURE_SCHEMA

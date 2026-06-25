@@ -20,7 +20,7 @@ from boundary.sequence_features import (
 )
 from boundary.refiner import (
     file_sha1 as _boundary_refiner_file_sha1,
-    load_edge_sequence_refiner_v6_checkpoint,
+    load_edge_sequence_refiner_v7_checkpoint,
 )
 from asr import checkpoint as _checkpoint_module
 from asr import chunking as _chunking_module
@@ -403,7 +403,7 @@ def _build_processing_spans(
     split_boundary_frame_scores = result.parameters.get("split_boundary_frame_scores")
     score_frame_hop_s = result.parameters.get("frame_hop_s")
     sequence_feature_frames = result.parameters.get("sequence_feature_frames")
-    sequence_boundary_refiner = load_edge_sequence_refiner_v6_checkpoint(
+    sequence_boundary_refiner = load_edge_sequence_refiner_v7_checkpoint(
         Path(cfg["boundary_refiner_model_path"]),
         device=cfg["boundary_refiner_device"],
         expected_ptm_repo_id=ASR_BACKEND,
@@ -424,8 +424,8 @@ def _build_processing_spans(
     runtime_boundary_signature = {
         **result_parameters,
         "boundary_pipeline": {
-            "version": 6,
-            "refiner_schema": "boundary_edge_refiner_v6",
+            "version": 7,
+            "refiner_schema": "boundary_edge_refiner_v7",
             "feature_frame_hop_s": cfg["feature_frame_hop_s"],
             "score_frame_hop_s": score_frame_hop_s,
             "feature_sources": {
@@ -443,7 +443,7 @@ def _build_processing_spans(
                 else None
             ),
             "boundary_planner": {
-                "planner": "edge_sequence_island_planner_v6",
+                "planner": "edge_sequence_island_planner_v7",
                 "sequence_batch_size": cfg["boundary_planner_sequence_batch_size"],
             },
         },

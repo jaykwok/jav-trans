@@ -19,7 +19,7 @@ class _StaticSequenceRefiner:
         self.cursor += len(features)
         return [
             BoundaryDecision(
-                source="edge_sequence_refiner_v6",
+                source="edge_sequence_refiner_v7",
                 start_refine_delta_s=start_delta,
                 end_refine_delta_s=end_delta,
             )
@@ -86,7 +86,7 @@ def test_sequence_refiner_scores_gaps_without_merging_or_splitting():
     ]
     assert all(len(chunk.islands) == 1 for chunk in chunks)
     assert chunks[1].boundary_decision is not None
-    assert chunks[1].boundary_decision.source == "edge_sequence_refiner_v6"
+    assert chunks[1].boundary_decision.source == "edge_sequence_refiner_v7"
 
 
 def test_sequence_planner_batches_long_sequences():

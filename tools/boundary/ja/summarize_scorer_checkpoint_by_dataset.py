@@ -24,7 +24,7 @@ from boundary.ja.model import (  # noqa: E402
     load_feature_frame_scorer_checkpoint,
     score_feature_frame_boundary_probabilities_batch,
 )
-from boundary.ja.train import scorer_v6_targets_from_record  # noqa: E402
+from boundary.ja.train import scorer_v7_targets_from_record  # noqa: E402
 
 
 SCHEMA = "speech_boundary_ja_scorer_dataset_output_summary_v1"
@@ -234,7 +234,7 @@ def summarize_checkpoint_by_dataset(
             frame_total = min(int(speech_probs.size), len(record.speech_frames))
             if frame_total <= 0:
                 continue
-            speech_labels, split_labels = scorer_v6_targets_from_record(
+            speech_labels, split_labels = scorer_v7_targets_from_record(
                 record,
                 frame_count=frame_total,
                 split_boundary_radius_frames=split_boundary_radius_frames,
@@ -282,7 +282,7 @@ def summarize_checkpoint_by_dataset(
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Summarize SpeechBoundary-JA scorer v6 checkpoint outputs by v6-native dataset group."
+        description="Summarize SpeechBoundary-JA scorer v7 checkpoint outputs by v7-native dataset group."
     )
     parser.add_argument("--checkpoint", required=True)
     parser.add_argument("--labels", required=True)

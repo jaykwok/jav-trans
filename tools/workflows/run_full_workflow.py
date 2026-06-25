@@ -28,7 +28,7 @@ DEFAULT_ASR_BATCH_SIZE_BY_REPO_ENV = ",".join(
     f"{repo_id}={batch_size}"
     for repo_id, batch_size in DEFAULT_QWEN_ASR_BATCH_SIZE_BY_REPO.items()
 )
-DEFAULT_SPEECH_BOUNDARY_OPERATING_POINT = "qwen-mamba2-frame-boundary-scorer-v6"
+DEFAULT_SPEECH_BOUNDARY_OPERATING_POINT = "qwen-mamba2-frame-boundary-scorer-v7"
 
 
 @dataclass(frozen=True)
@@ -539,7 +539,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--boundary-refiner-model-path-by-repo",
         default=os.getenv("BOUNDARY_REFINER_MODEL_PATH_BY_REPO", ""),
-        help="Required repo-id checkpoint map: '<repo_id>=<boundary_edge_refiner_v6.pt>[,<repo_id>=...]'.",
+        help="Required repo-id checkpoint map: '<repo_id>=<boundary_edge_refiner_v7.pt>[,<repo_id>=...]'.",
     )
     parser.add_argument(
         "--cueqc-model-path-by-repo",
@@ -562,12 +562,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--pre-asr-cueqc-enabled",
         action=argparse.BooleanOptionalAction,
         default=_env_bool("PRE_ASR_CUEQC_ENABLED", False),
-        help="Run Pre-ASR CueQC v7 after Boundary Refiner and before ASR chunk export.",
+        help="Run Pre-ASR CueQC v8 after Boundary Refiner and before ASR chunk export.",
     )
     parser.add_argument(
         "--pre-asr-cueqc-model-path-by-repo",
         default=os.getenv("PRE_ASR_CUEQC_MODEL_PATH_BY_REPO", ""),
-        help="Optional repo-id checkpoint map: '<repo_id>=<cueqc_pre_asr_mamba_v7_binary.pt>[,<repo_id>=...]'.",
+        help="Optional repo-id checkpoint map: '<repo_id>=<cueqc_pre_asr_mamba_v8_binary.pt>[,<repo_id>=...]'.",
     )
     parser.add_argument("--pre-asr-cueqc-device", default=os.getenv("PRE_ASR_CUEQC_DEVICE", "auto"))
     parser.add_argument(
@@ -618,7 +618,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         dest="speech_boundary_scorer_checkpoint_by_repo",
         default=os.getenv("SPEECH_BOUNDARY_JA_SCORER_CHECKPOINT_BY_REPO", ""),
         help=(
-            "Optional repo-id scorer map: '<repo_id>=<speech_boundary_ja_frame_boundary_scorer_v6.pt>'"
+            "Optional repo-id scorer map: '<repo_id>=<speech_boundary_ja_frame_boundary_scorer_v7.pt>'"
             "[,<repo_id>=...]'. Empty uses the registered repo-id scorer when available."
         ),
     )

@@ -44,7 +44,7 @@ def _write_wav(path: Path, seconds: float = 2.0, sample_rate: int = 8000) -> Non
 
 def _set_boundary_refiner_mapping(monkeypatch, tmp_path: Path) -> None:
     asr_backend = "jaykwok/Qwen3-ASR-0.6B-JA-Anime-Galgame"
-    checkpoint = tmp_path / "boundary_edge_refiner_v6.jaykwok-Qwen3-ASR-0.6B-JA-Anime-Galgame.pt"
+    checkpoint = tmp_path / "boundary_edge_refiner_v7.jaykwok-Qwen3-ASR-0.6B-JA-Anime-Galgame.pt"
     checkpoint.write_bytes(b"v6")
     monkeypatch.setenv("ASR_BACKEND", asr_backend)
     monkeypatch.setenv(
@@ -180,7 +180,7 @@ def test_boundary_cache_round_trips_packed_chunks(monkeypatch, tmp_path):
             boundary_source="split_boundary",
             boundary_start_refine_delta_s=0.01,
             boundary_end_refine_delta_s=-0.02,
-            boundary_decision_source="edge_sequence_refiner_v6",
+            boundary_decision_source="edge_sequence_refiner_v7",
             subtitle_min_duration_s=20.0 / 24.0,
             below_subtitle_min_duration=True,
             micro_chunk_candidate=True,
@@ -269,7 +269,7 @@ def test_boundary_cache_round_trips_packed_chunks(monkeypatch, tmp_path):
     assert loaded_chunks[0].boundary_source == "split_boundary"
     assert loaded_chunks[0].boundary_start_refine_delta_s == 0.01
     assert loaded_chunks[0].boundary_end_refine_delta_s == -0.02
-    assert loaded_chunks[0].boundary_decision_source == "edge_sequence_refiner_v6"
+    assert loaded_chunks[0].boundary_decision_source == "edge_sequence_refiner_v7"
     assert loaded_chunks[0].subtitle_min_duration_s == pytest.approx(20.0 / 24.0)
     assert loaded_chunks[0].below_subtitle_min_duration is True
     assert loaded_chunks[0].micro_chunk_candidate is True
@@ -352,7 +352,7 @@ class _FakeSequenceRefiner:
     def decide_sequence(self, features: list[list[float]]) -> list[BoundaryDecision]:
         return [
             BoundaryDecision(
-                source="edge_sequence_refiner_v6",
+                source="edge_sequence_refiner_v7",
                 start_refine_delta_s=0.0,
                 end_refine_delta_s=0.0,
             )
@@ -360,7 +360,7 @@ class _FakeSequenceRefiner:
         ]
 
     def signature(self) -> dict:
-        return {"schema": "boundary_edge_refiner_v6", "type": "fake_sequence_refiner"}
+        return {"schema": "boundary_edge_refiner_v7", "type": "fake_sequence_refiner"}
 
 
 class _FakeSequenceFeatureProvider:
@@ -407,7 +407,7 @@ def _patch_fake_refiner(monkeypatch, asr) -> None:
     )
     monkeypatch.setattr(
         asr,
-        "load_edge_sequence_refiner_v6_checkpoint",
+        "load_edge_sequence_refiner_v7_checkpoint",
         lambda *_args, **_kwargs: _FakeSequenceRefiner(),
     )
     monkeypatch.setattr(
@@ -442,7 +442,7 @@ def test_pipeline_uses_boundary_scores_but_does_not_cache_score_arrays(monkeypat
     assert asr._LAST_BOUNDARY_SIGNATURE["boundary_pipeline"]["score_frame_hop_s"] == 1.0
     assert (
         asr._LAST_BOUNDARY_SIGNATURE["boundary_pipeline"]["sequence_boundary_refiner"]["schema"]
-        == "boundary_edge_refiner_v6"
+        == "boundary_edge_refiner_v7"
     )
     assert asr._LAST_BOUNDARY_SIGNATURE["boundary_pipeline"]["feature_sources"] == {
         "speech_scores": True,

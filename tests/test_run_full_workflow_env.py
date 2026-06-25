@@ -24,10 +24,10 @@ def test_run_full_workflow_operating_point_uses_opt_in_scorer_metadata():
     results = [
         {
             "boundary_signature": {
-                "operating_point": "qwen-mamba2-frame-boundary-scorer-v6",
+                "operating_point": "qwen-mamba2-frame-boundary-scorer-v7",
                 "scorer_checkpoint": {
-                    "schema": "speech_boundary_ja_mamba2_frame_boundary_scorer_v6",
-                    "metadata": {"operating_point": "qwen-mamba2-frame-boundary-scorer-v6-native"},
+                    "schema": "speech_boundary_ja_mamba2_frame_boundary_scorer_v7",
+                    "metadata": {"operating_point": "qwen-mamba2-frame-boundary-scorer-v7-native"},
                 },
             }
         }
@@ -35,17 +35,17 @@ def test_run_full_workflow_operating_point_uses_opt_in_scorer_metadata():
 
     assert (
         run_full_workflow.speech_boundary_operating_point(results)
-        == "qwen-mamba2-frame-boundary-scorer-v6-native"
+        == "qwen-mamba2-frame-boundary-scorer-v7-native"
     )
 
 
 def test_run_full_workflow_operating_point_defaults_without_scorer():
-    assert run_full_workflow.speech_boundary_operating_point([]) == "qwen-mamba2-frame-boundary-scorer-v6"
+    assert run_full_workflow.speech_boundary_operating_point([]) == "qwen-mamba2-frame-boundary-scorer-v7"
     assert (
         run_full_workflow.speech_boundary_operating_point(
-            [{"boundary_signature": {"operating_point": "qwen-mamba2-frame-boundary-scorer-v6"}}]
+            [{"boundary_signature": {"operating_point": "qwen-mamba2-frame-boundary-scorer-v7"}}]
         )
-        == "qwen-mamba2-frame-boundary-scorer-v6"
+        == "qwen-mamba2-frame-boundary-scorer-v7"
     )
 
 
@@ -73,7 +73,7 @@ def test_run_full_workflow_parse_args_uses_loaded_env(monkeypatch):
         "jaykwok/Qwen3-ASR-0.6B-JA-Anime-Galgame=64,"
         "jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame=32",
     )
-    boundary_mapping = "jaykwok/Qwen3-ASR-0.6B-JA-Anime-Galgame=src/boundary/checkpoints/boundary_edge_refiner_v6.jaykwok-Qwen3-ASR-0.6B-JA-Anime-Galgame.pt"
+    boundary_mapping = "jaykwok/Qwen3-ASR-0.6B-JA-Anime-Galgame=src/boundary/checkpoints/boundary_edge_refiner_v7.jaykwok-Qwen3-ASR-0.6B-JA-Anime-Galgame.pt"
     cueqc_mapping = "jaykwok/Qwen3-ASR-0.6B-JA-Anime-Galgame=src/asr/checkpoints/cueqc_mamba_v4_binary.jaykwok-Qwen3-ASR-0.6B-JA-Anime-Galgame.pt"
     scorer_mapping = "jaykwok/Qwen3-ASR-0.6B-JA-Anime-Galgame=agents/temp/scorer.pt"
     monkeypatch.setenv("BOUNDARY_REFINER_MODEL_PATH_BY_REPO", boundary_mapping)
@@ -119,7 +119,7 @@ def test_run_full_workflow_context_carries_boundary_env(monkeypatch, tmp_path):
     )
     monkeypatch.setenv("ASR_BATCH_SIZE", "auto")
     monkeypatch.setenv("ASR_BATCH_SIZE_BY_REPO", batch_table)
-    boundary_mapping = "jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame=src/boundary/checkpoints/boundary_edge_refiner_v6.jaykwok-Qwen3-ASR-1.7B-JA-Anime-Galgame.pt"
+    boundary_mapping = "jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame=src/boundary/checkpoints/boundary_edge_refiner_v7.jaykwok-Qwen3-ASR-1.7B-JA-Anime-Galgame.pt"
     cueqc_mapping = "jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame=src/asr/checkpoints/cueqc_mamba_v4_binary.jaykwok-Qwen3-ASR-1.7B-JA-Anime-Galgame.pt"
     scorer_mapping = "jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame=agents/temp/scorer.pt"
     monkeypatch.setenv("BOUNDARY_REFINER_MODEL_PATH_BY_REPO", boundary_mapping)
@@ -231,7 +231,7 @@ def test_run_full_workflow_summary_uses_shadow_specific_cueqc_keys(tmp_path):
         summary_md=tmp_path / "summary.md",
     )
     paths.root.mkdir(parents=True, exist_ok=True)
-    results = [{"boundary_signature": {"operating_point": "qwen-mamba2-frame-boundary-scorer-v6"}}]
+    results = [{"boundary_signature": {"operating_point": "qwen-mamba2-frame-boundary-scorer-v7"}}]
 
     run_full_workflow.write_summary(paths, args, results)
 

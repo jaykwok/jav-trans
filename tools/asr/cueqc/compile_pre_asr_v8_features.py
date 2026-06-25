@@ -28,7 +28,7 @@ from asr.pre_asr_cueqc import (  # noqa: E402
 )
 
 
-FEATURE_BUNDLE_SCHEMA = "cueqc_pre_asr_mamba_v7_features"
+FEATURE_BUNDLE_SCHEMA = "cueqc_pre_asr_mamba_v8_features"
 
 
 def project_path(value: str | Path) -> Path:
@@ -259,7 +259,7 @@ def candidate_for_chunk(chunks: list[dict[str, Any]], index: int) -> dict[str, A
         candidate = candidate_from_span(chunks, index, require_ptm_pooling=True)
     if not _has_required_ptm_pooling(candidate):
         raise ValueError(
-            "Pre-ASR CueQC v7 feature compilation requires chunk-level pooled PTM features"
+            "Pre-ASR CueQC v8 feature compilation requires chunk-level pooled PTM features"
         )
     return candidate
 
@@ -324,7 +324,7 @@ def compile_features(
     output.parent.mkdir(parents=True, exist_ok=True)
     torch.save(bundle, output)
     summary = {
-        "schema": "cueqc_pre_asr_mamba_v7_feature_summary",
+        "schema": "cueqc_pre_asr_mamba_v8_feature_summary",
         "feature_bundle": repo_display_path(output),
         "feature_schema": PRE_ASR_CUEQC_FEATURE_SCHEMA,
         "feature_names": list(PRE_ASR_CUEQC_FEATURE_NAMES),
@@ -341,7 +341,7 @@ def compile_features(
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Compile Pre-ASR CueQC v7 pooled PTM features.")
+    parser = argparse.ArgumentParser(description="Compile Pre-ASR CueQC v8 pooled PTM features.")
     parser.add_argument("--chunks", action="append", required=True, help="Workflow details/chunk JSON or JSONL.")
     parser.add_argument("--labels", action="append", required=True, help="JSON/JSONL labels with keep/drop.")
     parser.add_argument("--output", required=True)

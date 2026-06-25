@@ -13,7 +13,7 @@ from boundary.sequence_features import (
     FrameSequenceFeatureConfig,
     FrameSequenceFeatureProvider,
 )
-from tools.asr.cueqc.compile_pre_asr_v7_features import compile_features
+from tools.asr.cueqc.compile_pre_asr_v8_features import compile_features
 
 
 def _ptm_pool() -> list[float]:

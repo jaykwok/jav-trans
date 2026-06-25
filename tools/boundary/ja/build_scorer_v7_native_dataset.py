@@ -35,7 +35,7 @@ from boundary.ja import (  # noqa: E402
 )
 
 
-DATASET_SCHEMA = "speech_boundary_ja_scorer_v6_native_dataset"
+DATASET_SCHEMA = "speech_boundary_ja_scorer_v7_native_dataset"
 DEFAULT_SOURCE_SPECS = (
     "anime_nsfw=40=datasets/train/boundary-sources/japanese-anime-speech-v2-nsfw-60k/hf_audio_manifest.json",
     "anime_sfw=40=datasets/train/boundary-sources/japanese-anime-speech-v2-sfw-40k/hf_audio_manifest.json",
@@ -573,7 +573,7 @@ def build_positive_example(
     row = choose_source_row(source_groups, rng)
     audio, detail = load_clip(row, rng=rng, min_speech_s=args.min_speech_s, max_speech_s=args.max_speech_s)
     duration_s = len(audio) / SAMPLE_RATE
-    audio_id = f"scorer-v6native-pos-{index:06d}"
+    audio_id = f"scorer-v7native-pos-{index:06d}"
     segment = TeacherSegment(0.0, duration_s, score=1.0)
     metadata = base_metadata(
         example_type="positive_speech_timeline",
@@ -591,7 +591,7 @@ def build_positive_example(
     )
     record = build_record(
         audio_id=audio_id,
-        source="speech_boundary_ja_scorer_v6_native:positive_speech_timeline",
+        source="speech_boundary_ja_scorer_v7_native:positive_speech_timeline",
         duration_s=duration_s,
         text=str(detail.get("source_text") or ""),
         speech_segments=[segment],
@@ -620,7 +620,7 @@ def build_pure_negative_example(
         noise_rms=args.noise_rms,
     )
     duration_s = len(audio) / SAMPLE_RATE
-    audio_id = f"scorer-v6native-neg-{index:06d}"
+    audio_id = f"scorer-v7native-neg-{index:06d}"
     source_id = str(negative_detail.get("negative_audio_id") or audio_id)
     source_partition = str(negative_detail.get("negative_partition") or partition_for_source_id(source_id))
     metadata = base_metadata(
@@ -639,7 +639,7 @@ def build_pure_negative_example(
     )
     record = build_record(
         audio_id=audio_id,
-        source="speech_boundary_ja_scorer_v6_native:pure_hard_negative",
+        source="speech_boundary_ja_scorer_v7_native:pure_hard_negative",
         duration_s=duration_s,
         text="",
         speech_segments=[],
@@ -685,7 +685,7 @@ def build_mixed_contrast_example(
     duration_s = len(mixed) / SAMPLE_RATE
     start_s = lead_samples / SAMPLE_RATE
     end_s = (lead_samples + len(speech)) / SAMPLE_RATE
-    audio_id = f"scorer-v6native-mixed-{index:06d}"
+    audio_id = f"scorer-v7native-mixed-{index:06d}"
     source_audio_ids = [str(detail["source_audio_id"])]
     if negative_detail.get("negative_audio_id"):
         source_audio_ids.append(str(negative_detail["negative_audio_id"]))
@@ -705,7 +705,7 @@ def build_mixed_contrast_example(
     )
     record = build_record(
         audio_id=audio_id,
-        source="speech_boundary_ja_scorer_v6_native:mixed_contrast",
+        source="speech_boundary_ja_scorer_v7_native:mixed_contrast",
         duration_s=duration_s,
         text=str(detail.get("source_text") or ""),
         speech_segments=[TeacherSegment(start_s, end_s, score=1.0)],
@@ -829,7 +829,7 @@ def build_long_speech_chain_example(
 
     audio = np.concatenate(parts).astype(np.float32, copy=False) if parts else np.zeros(1, dtype=np.float32)
     duration_s = len(audio) / SAMPLE_RATE
-    audio_id = f"scorer-v6native-longchain-{index:06d}"
+    audio_id = f"scorer-v7native-longchain-{index:06d}"
     source_partition = source_partition or partition_for_source_id(audio_id)
     source_audio_ids = [str(item.get("source_audio_id") or "") for item in details]
     source_audio_ids.extend(
@@ -860,7 +860,7 @@ def build_long_speech_chain_example(
     )
     record = build_record(
         audio_id=audio_id,
-        source="speech_boundary_ja_scorer_v6_native:long_speech_chain",
+        source="speech_boundary_ja_scorer_v7_native:long_speech_chain",
         duration_s=duration_s,
         text=" ".join(str(item.get("source_text") or "") for item in details if item.get("source_text")),
         speech_segments=speech_segments,
@@ -931,7 +931,7 @@ def build_split_stress_example(
             cursor += gap_samples
     audio = np.concatenate(parts).astype(np.float32, copy=False) if parts else np.zeros(1, dtype=np.float32)
     duration_s = len(audio) / SAMPLE_RATE
-    audio_id = f"scorer-v6native-split-{index:06d}"
+    audio_id = f"scorer-v7native-split-{index:06d}"
     source_partition = source_partition or partition_for_source_id(audio_id)
     source_audio_ids = [str(item.get("source_audio_id") or "") for item in details]
     source_audio_ids.extend(
@@ -957,7 +957,7 @@ def build_split_stress_example(
     )
     record = build_record(
         audio_id=audio_id,
-        source="speech_boundary_ja_scorer_v6_native:split_stress",
+        source="speech_boundary_ja_scorer_v7_native:split_stress",
         duration_s=duration_s,
         text=" ".join(str(item.get("source_text") or "") for item in details if item.get("source_text")),
         speech_segments=speech_segments,
@@ -968,7 +968,7 @@ def build_split_stress_example(
     return normalize_peak(audio), record, {"speech": details, "negative": negative_details}
 
 
-def build_scorer_v6_native_dataset(
+def build_scorer_v7_native_dataset(
     *,
     source_specs: Sequence[str],
     negative_manifests: Sequence[str],
@@ -1092,12 +1092,12 @@ def build_scorer_v6_native_dataset(
         partition = str((record.boundary_metadata or {}).get("source_partition") or "train")
         split_rows.setdefault(partition, []).append(index)
 
-    labels_path = output_dir / "scorer_v6_native_labels.jsonl"
-    manifest_path = output_dir / "scorer_v6_native_manifest.json"
-    training_manifest_path = output_dir / "scorer_v6_native_training_manifest.jsonl"
-    details_path = output_dir / "scorer_v6_native_details.jsonl"
-    splits_path = output_dir / "scorer_v6_native_splits.json"
-    skipped_path = output_dir / "scorer_v6_native_skipped.json"
+    labels_path = output_dir / "scorer_v7_native_labels.jsonl"
+    manifest_path = output_dir / "scorer_v7_native_manifest.json"
+    training_manifest_path = output_dir / "scorer_v7_native_training_manifest.jsonl"
+    details_path = output_dir / "scorer_v7_native_details.jsonl"
+    splits_path = output_dir / "scorer_v7_native_splits.json"
+    skipped_path = output_dir / "scorer_v7_native_skipped.json"
     summary_path = output_dir / "summary.json"
     summary_md_path = output_dir / "summary.md"
 
@@ -1215,7 +1215,7 @@ def build_scorer_v6_native_dataset(
 
 def render_markdown(summary: Mapping[str, Any]) -> str:
     lines = [
-        "# SpeechBoundary-JA Scorer v6 Native Dataset",
+        "# SpeechBoundary-JA Scorer v7 Native Dataset",
         "",
         f"- Output: `{summary['output_dir']}`",
         f"- Schema: `{summary['schema']}`",
@@ -1236,7 +1236,7 @@ def render_markdown(summary: Mapping[str, Any]) -> str:
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Build a SpeechBoundary-JA scorer v6-native dataset with speech and split-boundary heatmap labels."
+            "Build a SpeechBoundary-JA scorer v7-native dataset with speech and split-boundary heatmap labels."
         )
     )
     parser.add_argument(
@@ -1287,7 +1287,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--output-dir",
         default="",
-        help="Defaults to agents/temp/YYYYMMDD_HHMMSS_scorer-v6-native-4096.",
+        help="Defaults to agents/temp/YYYYMMDD_HHMMSS_scorer-v7-native-4096.",
     )
     args = parser.parse_args(argv)
     if args.count <= 0:
@@ -1347,9 +1347,9 @@ def main(argv: list[str] | None = None) -> int:
     output_dir = (
         project_path(args.output_dir)
         if args.output_dir
-        else PROJECT_ROOT / "agents" / "temp" / f"{local_timestamp()}_scorer-v6-native-{args.count}"
+        else PROJECT_ROOT / "agents" / "temp" / f"{local_timestamp()}_scorer-v7-native-{args.count}"
     )
-    summary = build_scorer_v6_native_dataset(
+    summary = build_scorer_v7_native_dataset(
         source_specs=args.source or DEFAULT_SOURCE_SPECS,
         negative_manifests=args.negative_manifest,
         output_dir=output_dir,

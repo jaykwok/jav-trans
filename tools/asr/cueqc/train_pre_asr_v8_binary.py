@@ -24,14 +24,14 @@ from asr.pre_asr_cueqc import (  # noqa: E402
     PRE_ASR_CUEQC_FEATURE_SCHEMA,
     PRE_ASR_CUEQC_SCHEMA,
 )
-from tools.asr.cueqc.compile_pre_asr_v7_features import FEATURE_BUNDLE_SCHEMA, project_path, repo_display_path  # noqa: E402
+from tools.asr.cueqc.compile_pre_asr_v8_features import FEATURE_BUNDLE_SCHEMA, project_path, repo_display_path  # noqa: E402
 
 
-METRICS_SCHEMA = "cueqc_pre_asr_mamba_v7_train_metrics"
+METRICS_SCHEMA = "cueqc_pre_asr_mamba_v8_train_metrics"
 
 
 def default_checkpoint_name(asr_repo_id: str) -> str:
-    return f"cueqc_pre_asr_mamba_v7_binary.{qwen_asr_repo_tag(asr_repo_id)}.pt"
+    return f"cueqc_pre_asr_mamba_v8_binary.{qwen_asr_repo_tag(asr_repo_id)}.pt"
 
 
 def file_sha256(path: Path) -> str:
@@ -51,7 +51,7 @@ def load_feature_bundle(path: Path) -> dict[str, Any]:
     if payload.get("schema") != FEATURE_BUNDLE_SCHEMA:
         raise ValueError(f"unsupported feature bundle schema: {payload.get('schema')!r}")
     if tuple(payload.get("feature_names") or ()) != PRE_ASR_CUEQC_FEATURE_NAMES:
-        raise ValueError("feature bundle feature_names do not match Pre-ASR CueQC v7 runtime")
+        raise ValueError("feature bundle feature_names do not match Pre-ASR CueQC v8 runtime")
     if payload.get("feature_schema") != PRE_ASR_CUEQC_FEATURE_SCHEMA:
         raise ValueError("feature bundle feature_schema mismatch")
     return dict(payload)
@@ -215,7 +215,7 @@ def train(
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Train Pre-ASR CueQC v7 binary checkpoint.")
+    parser = argparse.ArgumentParser(description="Train Pre-ASR CueQC v8 binary checkpoint.")
     parser.add_argument("--features", required=True)
     parser.add_argument("--output-dir", required=True)
     parser.add_argument("--asr-repo-id", required=True)
