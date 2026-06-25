@@ -7,7 +7,6 @@ requires-python = ">=3.13"
 testpaths = ["tests"]
 pythonpath = [".", "src"]
 addopts = [
-    "--basetemp=agents/temp/pytest_verify",
     "-p",
     "no:cacheprovider",
 ]
