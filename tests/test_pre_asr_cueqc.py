@@ -13,7 +13,7 @@ from boundary.sequence_features import (
     FrameSequenceFeatureConfig,
     FrameSequenceFeatureProvider,
 )
-from tools.asr.cueqc.compile_pre_asr_v8_features import compile_features
+from tools.asr.cueqc.compile_pre_asr_v9_features import compile_features
 
 
 def _ptm_pool() -> list[float]:
@@ -183,6 +183,43 @@ def test_pre_asr_cueqc_requires_pooled_ptm_when_requested():
         pre_asr_cueqc.candidate_from_span(spans, 0, require_ptm_pooling=True)
 
 
+def test_pre_asr_cueqc_v9_model_forward_backward_ignores_padding():
+    torch = pytest.importorskip("torch")
+    transformers = pytest.importorskip("transformers")
+    if not hasattr(transformers, "Mamba2Model"):
+        pytest.skip("transformers.Mamba2Model is unavailable")
+
+    model = pre_asr_cueqc.PreAsrCueQCMambaV9(
+        ptm_dim=4,
+        scalar_dim=3,
+        hidden_size=16,
+        bin_mamba_layers=1,
+        chunk_mamba_layers=1,
+        state_size=8,
+        num_heads=2,
+        head_dim=16,
+        n_groups=1,
+        chunk_size=4,
+        dropout=0.0,
+    )
+    ptm_bins = torch.randn(1, 3, 2, 4)
+    scalar = torch.randn(1, 3, 3)
+    chunk_mask = torch.tensor([[1.0, 1.0, 0.0]])
+    bin_mask = torch.tensor([[[1.0, 1.0], [1.0, 0.0], [0.0, 0.0]]])
+    labels = torch.tensor([[1, 0, pre_asr_cueqc.PRE_ASR_CUEQC_IGNORE_LABEL]])
+
+    logits = model(ptm_bins, scalar, chunk_mask=chunk_mask, bin_mask=bin_mask)
+    loss = torch.nn.functional.cross_entropy(
+        logits.reshape(-1, 2),
+        labels.reshape(-1),
+        ignore_index=pre_asr_cueqc.PRE_ASR_CUEQC_IGNORE_LABEL,
+    )
+    loss.backward()
+
+    assert logits.shape == (1, 3, 2)
+    assert torch.isfinite(loss)
+
+
 def test_pre_asr_cueqc_filters_before_wav_export(monkeypatch):
     from asr import pipeline as asr_pipeline
 
@@ -303,7 +340,7 @@ def test_compile_pre_asr_cueqc_features_ignores_text_columns(tmp_path: Path):
         asr_repo_id="jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame",
     )
 
-    assert summary["count"] == 2
+    assert summary["chunk_count"] == 2
     assert summary["keep"] == 1
     assert summary["drop"] == 1
     assert "text" not in " ".join(summary["feature_names"]).lower()
@@ -338,7 +375,7 @@ def test_compile_pre_asr_cueqc_features_reads_jsonl_chunk_candidates(tmp_path: P
         asr_repo_id="jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame",
     )
 
-    assert summary["count"] == 2
+    assert summary["chunk_count"] == 2
     assert summary["keep"] == 1
     assert summary["drop"] == 1
 
@@ -374,8 +411,9 @@ def test_compile_pre_asr_cueqc_sample_labels_do_not_broadcast_by_cluster(tmp_pat
     )
     bundle = torch.load(output, map_location="cpu")
 
-    assert summary["count"] == 1
-    assert [row["id"] for row in bundle["rows"]] == ["preasr-AAA-chunk00000"]
+    assert summary["chunk_count"] == 1
+    assert bundle["labels"][0, 0].item() == 0
+    assert bundle["labels"][0, 1].item() == pre_asr_cueqc.PRE_ASR_CUEQC_IGNORE_LABEL
 
 
 def test_compile_pre_asr_cueqc_broadcasts_cluster_examples_to_sample_ids(tmp_path: Path):
@@ -435,12 +473,13 @@ def test_compile_pre_asr_cueqc_broadcasts_cluster_examples_to_sample_ids(tmp_pat
     )
     bundle = torch.load(output, map_location="cpu")
 
-    assert summary["count"] == 2
+    assert summary["chunk_count"] == 2
     assert summary["drop"] == 2
-    assert [row["id"] for row in bundle["rows"]] == [
+    assert [row["id"] for row in bundle["rows"][:2]] == [
         "preasr-AAA-chunk00000",
         "preasr-AAA-chunk00001",
     ]
+    assert bundle["labels"][0, 2].item() == pre_asr_cueqc.PRE_ASR_CUEQC_IGNORE_LABEL
 
 
 def test_compile_pre_asr_cueqc_matches_video_chunk_and_cluster_id_labels(tmp_path: Path):
@@ -496,7 +535,7 @@ def test_compile_pre_asr_cueqc_matches_video_chunk_and_cluster_id_labels(tmp_pat
     )
     bundle = torch.load(output, map_location="cpu")
 
-    assert summary["count"] == 2
+    assert summary["chunk_count"] == 2
     assert summary["keep"] == 1
     assert summary["drop"] == 1
     assert [row["label"] for row in bundle["rows"]] == ["drop_before_asr", "keep_for_asr"]

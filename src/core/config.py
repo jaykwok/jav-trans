@@ -109,16 +109,16 @@ DEFAULT_SETTINGS: dict[str, str] = {
     # Persistent boundary cache directory. Versioned as boundary-cache v11.
     "BOUNDARY_CACHE_DIR": "./tmp/cache/boundary",
 
-    # --- Pre-ASR CueQC v8 binary keep/drop router ---
-    # Disabled until a repo-matched v8 checkpoint is trained; when enabled it runs after
+    # --- Pre-ASR CueQC v9 hierarchical keep/drop router ---
+    # Disabled until a repo-matched v9 checkpoint is trained; when enabled it runs after
     # Boundary Refiner and before wav chunk export / ASR.
     "PRE_ASR_CUEQC_ENABLED": "0",
     "PRE_ASR_CUEQC_MODEL_PATH_BY_REPO": "",
     "PRE_ASR_CUEQC_DEVICE": "auto",
-    "PRE_ASR_CUEQC_DROP_THRESHOLD": "0.999",
+    "PRE_ASR_CUEQC_DROP_THRESHOLD": "0.95",
 
     # --- ASR-after CueQC v4 shadow / hard-negative mining ---
-    # Opt-in only; active keep/drop routing moved to Pre-ASR CueQC v8.
+    # Opt-in only; active keep/drop routing moved to Pre-ASR CueQC v9.
     "CUEQC_SHADOW_ENABLED": "0",
     # v4 binary remains a temporary shadow source; it no longer removes chunks.
     "CUEQC_DROP_THRESHOLD": "0.85",

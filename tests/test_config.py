@@ -139,7 +139,7 @@ def test_default_model_download_root_is_project_models():
     assert config.DEFAULT_SETTINGS["ASR_SUBPROCESS_READY_TIMEOUT_S"] == "600"
     assert config.DEFAULT_SETTINGS["CUEQC_SHADOW_ENABLED"] == "0"
     assert config.DEFAULT_SETTINGS["PRE_ASR_CUEQC_ENABLED"] == "0"
-    assert config.DEFAULT_SETTINGS["PRE_ASR_CUEQC_DROP_THRESHOLD"] == "0.999"
+    assert config.DEFAULT_SETTINGS["PRE_ASR_CUEQC_DROP_THRESHOLD"] == "0.95"
     assert config.DEFAULT_SETTINGS["LLM_API_FORMAT"] == "chat"
 
 
@@ -173,7 +173,7 @@ def test_subtitle_max_duration_clamp_removed_from_active_config_surface():
         assert "max_duration" not in text
 
 
-def test_pre_asr_cueqc_v6_removed_from_active_runtime_surface():
+def test_pre_asr_cueqc_old_versions_removed_from_active_runtime_surface():
     active_files = (
         "src/asr/pre_asr_cueqc.py",
         "src/asr/backends/qwen.py",
@@ -181,24 +181,30 @@ def test_pre_asr_cueqc_v6_removed_from_active_runtime_surface():
         ".env.example",
         "README.md",
         "tools/workflows/run_full_workflow.py",
-        "tools/asr/cueqc/compile_pre_asr_v8_features.py",
-        "tools/asr/cueqc/train_pre_asr_v8_binary.py",
-        "tools/asr/cueqc/export_pre_asr_v8_audit_candidates.py",
+        "tools/asr/cueqc/compile_pre_asr_v9_features.py",
+        "tools/asr/cueqc/train_pre_asr_v9_binary.py",
+        "tools/asr/cueqc/export_pre_asr_v9_audit_candidates.py",
     )
     retired_tokens = (
         "cueqc_pre_asr_mamba_v6",
+        "cueqc_pre_asr_mamba_v8",
         "pre_asr_cueqc_features_v2",
+        "pre_asr_cueqc_features_v4",
         "compile_pre_asr_v6",
+        "compile_pre_asr_v8",
         "train_pre_asr_v6",
+        "train_pre_asr_v8",
         "export_pre_asr_v6",
+        "export_pre_asr_v8",
         "Pre-ASR CueQC v6",
+        "Pre-ASR CueQC v8",
     )
     for relative_path in active_files:
         text = (ROOT / relative_path).read_text(encoding="utf-8")
         for token in retired_tokens:
             assert token not in text
     assert all(
-        "cueqc_pre_asr_mamba_v8_binary" in path
+        "cueqc_pre_asr_mamba_v9_binary" in path
         for path in qwen.DEFAULT_PRE_ASR_CUEQC_CHECKPOINT_BY_REPO.values()
     )
 

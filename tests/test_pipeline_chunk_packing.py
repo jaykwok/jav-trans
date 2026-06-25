@@ -349,7 +349,7 @@ def test_boundary_planner_emits_one_asr_chunk_per_speech_island(monkeypatch, tmp
     assert len(backend.audio_paths) == 10
     assert details["chunk_count"] == len(backend.audio_paths)
     assert details["boundary_signature"]["backend"] == "stub"
-    assert details["boundary_signature"]["boundary_pipeline"]["version"] == 6
+    assert details["boundary_signature"]["boundary_pipeline"]["version"] == 7
     assert all(
         "source_boundary.wav" not in str(Path(path).name) for path in backend.audio_paths
     )

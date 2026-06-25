@@ -37,9 +37,16 @@ class PackedChunk:
     scorer_speech_mean: float | None = None
     scorer_speech_max: float | None = None
     scorer_speech_p90: float | None = None
+    scorer_speech_p10: float | None = None
+    scorer_speech_p50: float | None = None
+    scorer_speech_std: float | None = None
+    scorer_speech_active_ratio_05: float | None = None
+    scorer_speech_active_ratio_07: float | None = None
+    scorer_speech_active_ratio_09: float | None = None
     scorer_split_mean: float | None = None
     scorer_split_max: float | None = None
     scorer_split_p90: float | None = None
+    scorer_split_std: float | None = None
     subtitle_min_duration_s: float | None = None
     below_subtitle_min_duration: bool = False
     micro_chunk_candidate: bool = False

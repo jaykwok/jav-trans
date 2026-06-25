@@ -311,9 +311,16 @@ def _packed_chunk_to_dict(chunk: PackedChunk) -> dict:
         "scorer_speech_mean": chunk.scorer_speech_mean,
         "scorer_speech_max": chunk.scorer_speech_max,
         "scorer_speech_p90": chunk.scorer_speech_p90,
+        "scorer_speech_p10": chunk.scorer_speech_p10,
+        "scorer_speech_p50": chunk.scorer_speech_p50,
+        "scorer_speech_std": chunk.scorer_speech_std,
+        "scorer_speech_active_ratio_05": chunk.scorer_speech_active_ratio_05,
+        "scorer_speech_active_ratio_07": chunk.scorer_speech_active_ratio_07,
+        "scorer_speech_active_ratio_09": chunk.scorer_speech_active_ratio_09,
         "scorer_split_mean": chunk.scorer_split_mean,
         "scorer_split_max": chunk.scorer_split_max,
         "scorer_split_p90": chunk.scorer_split_p90,
+        "scorer_split_std": chunk.scorer_split_std,
         "subtitle_min_duration_s": chunk.subtitle_min_duration_s,
         "below_subtitle_min_duration": bool(chunk.below_subtitle_min_duration),
         "micro_chunk_candidate": bool(chunk.micro_chunk_candidate),
@@ -385,6 +392,30 @@ def _packed_chunk_from_dict(item: Any) -> PackedChunk:
         scorer_speech_p90=(
             None if item.get("scorer_speech_p90") is None else float(item.get("scorer_speech_p90"))
         ),
+        scorer_speech_p10=(
+            None if item.get("scorer_speech_p10") is None else float(item.get("scorer_speech_p10"))
+        ),
+        scorer_speech_p50=(
+            None if item.get("scorer_speech_p50") is None else float(item.get("scorer_speech_p50"))
+        ),
+        scorer_speech_std=(
+            None if item.get("scorer_speech_std") is None else float(item.get("scorer_speech_std"))
+        ),
+        scorer_speech_active_ratio_05=(
+            None
+            if item.get("scorer_speech_active_ratio_05") is None
+            else float(item.get("scorer_speech_active_ratio_05"))
+        ),
+        scorer_speech_active_ratio_07=(
+            None
+            if item.get("scorer_speech_active_ratio_07") is None
+            else float(item.get("scorer_speech_active_ratio_07"))
+        ),
+        scorer_speech_active_ratio_09=(
+            None
+            if item.get("scorer_speech_active_ratio_09") is None
+            else float(item.get("scorer_speech_active_ratio_09"))
+        ),
         scorer_split_mean=(
             None if item.get("scorer_split_mean") is None else float(item.get("scorer_split_mean"))
         ),
@@ -393,6 +424,9 @@ def _packed_chunk_from_dict(item: Any) -> PackedChunk:
         ),
         scorer_split_p90=(
             None if item.get("scorer_split_p90") is None else float(item.get("scorer_split_p90"))
+        ),
+        scorer_split_std=(
+            None if item.get("scorer_split_std") is None else float(item.get("scorer_split_std"))
         ),
         subtitle_min_duration_s=(
             None

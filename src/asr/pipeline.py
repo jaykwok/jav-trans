@@ -582,19 +582,40 @@ def _score_stats_for_span(
     start_s: float,
     end_s: float,
     frame_hop_s: float,
-) -> tuple[float | None, float | None, float | None]:
+) -> dict[str, float | None]:
+    empty = {
+        "mean": None,
+        "max": None,
+        "p10": None,
+        "p50": None,
+        "p90": None,
+        "std": None,
+        "active_ratio_05": None,
+        "active_ratio_07": None,
+        "active_ratio_09": None,
+    }
     if not values:
-        return None, None, None
+        return empty
     hop = max(1e-6, float(frame_hop_s))
     data = np.asarray(values, dtype=np.float32).reshape(-1)
     start = max(0, min(data.size, int(float(start_s) / hop)))
     end = max(start, min(data.size, int(np.ceil(float(end_s) / hop))))
     if end <= start:
-        return None, None, None
+        return empty
     window = data[start:end]
     if window.size == 0:
-        return None, None, None
-    return float(window.mean()), float(window.max()), float(np.quantile(window, 0.90))
+        return empty
+    return {
+        "mean": float(window.mean()),
+        "max": float(window.max()),
+        "p10": float(np.quantile(window, 0.10)),
+        "p50": float(np.quantile(window, 0.50)),
+        "p90": float(np.quantile(window, 0.90)),
+        "std": float(window.std()),
+        "active_ratio_05": float(np.mean(window >= 0.50)),
+        "active_ratio_07": float(np.mean(window >= 0.70)),
+        "active_ratio_09": float(np.mean(window >= 0.90)),
+    }
 
 
 def _annotate_scorer_stats_on_packed_chunks(
@@ -608,13 +629,13 @@ def _annotate_scorer_stats_on_packed_chunks(
         return spans
     annotated: list[PackedChunk] = []
     for span in spans:
-        speech_mean, speech_max, speech_p90 = _score_stats_for_span(
+        speech_stats = _score_stats_for_span(
             frame_scores,
             start_s=span.start,
             end_s=span.end,
             frame_hop_s=frame_hop_s,
         )
-        split_mean, split_max, split_p90 = _score_stats_for_span(
+        split_stats = _score_stats_for_span(
             split_scores,
             start_s=span.start,
             end_s=span.end,
@@ -623,12 +644,19 @@ def _annotate_scorer_stats_on_packed_chunks(
         annotated.append(
             replace(
                 span,
-                scorer_speech_mean=speech_mean,
-                scorer_speech_max=speech_max,
-                scorer_speech_p90=speech_p90,
-                scorer_split_mean=split_mean,
-                scorer_split_max=split_max,
-                scorer_split_p90=split_p90,
+                scorer_speech_mean=speech_stats["mean"],
+                scorer_speech_max=speech_stats["max"],
+                scorer_speech_p90=speech_stats["p90"],
+                scorer_speech_p10=speech_stats["p10"],
+                scorer_speech_p50=speech_stats["p50"],
+                scorer_speech_std=speech_stats["std"],
+                scorer_speech_active_ratio_05=speech_stats["active_ratio_05"],
+                scorer_speech_active_ratio_07=speech_stats["active_ratio_07"],
+                scorer_speech_active_ratio_09=speech_stats["active_ratio_09"],
+                scorer_split_mean=split_stats["mean"],
+                scorer_split_max=split_stats["max"],
+                scorer_split_p90=split_stats["p90"],
+                scorer_split_std=split_stats["std"],
             )
         )
     return annotated
@@ -642,20 +670,20 @@ def _annotate_pre_asr_ptm_pooling_on_packed_chunks(
     if not spans or not all(isinstance(span, PackedChunk) for span in spans):
         return spans
     feature_names = sequence_feature_provider.chunk_pooled_ptm_feature_names(
-        bins=DEFAULT_CHUNK_POOLED_PTM_BINS
+        bins=_pre_asr_cueqc_module.PRE_ASR_CUEQC_PTM_BINS
     )
     annotated: list[PackedChunk] = []
     for span in spans:
         values = sequence_feature_provider.chunk_pooled_ptm_features(
             start_s=span.start,
             end_s=span.end,
-            bins=DEFAULT_CHUNK_POOLED_PTM_BINS,
+            bins=_pre_asr_cueqc_module.PRE_ASR_CUEQC_PTM_BINS,
         )
         annotated.append(
             replace(
                 span,
                 pre_asr_ptm_pooling_schema=CHUNK_POOLED_PTM_SCHEMA,
-                pre_asr_ptm_pooling_bins=DEFAULT_CHUNK_POOLED_PTM_BINS,
+                pre_asr_ptm_pooling_bins=_pre_asr_cueqc_module.PRE_ASR_CUEQC_PTM_BINS,
                 pre_asr_ptm_pooling_dim=len(feature_names),
                 pre_asr_ptm_pooled_features=values,
             )
@@ -892,9 +920,16 @@ def _annotate_packed_chunks(
         chunk["scorer_speech_mean"] = packed.scorer_speech_mean
         chunk["scorer_speech_max"] = packed.scorer_speech_max
         chunk["scorer_speech_p90"] = packed.scorer_speech_p90
+        chunk["scorer_speech_p10"] = packed.scorer_speech_p10
+        chunk["scorer_speech_p50"] = packed.scorer_speech_p50
+        chunk["scorer_speech_std"] = packed.scorer_speech_std
+        chunk["scorer_speech_active_ratio_05"] = packed.scorer_speech_active_ratio_05
+        chunk["scorer_speech_active_ratio_07"] = packed.scorer_speech_active_ratio_07
+        chunk["scorer_speech_active_ratio_09"] = packed.scorer_speech_active_ratio_09
         chunk["scorer_split_mean"] = packed.scorer_split_mean
         chunk["scorer_split_max"] = packed.scorer_split_max
         chunk["scorer_split_p90"] = packed.scorer_split_p90
+        chunk["scorer_split_std"] = packed.scorer_split_std
         chunk["subtitle_min_duration_s"] = packed.subtitle_min_duration_s
         chunk["below_subtitle_min_duration"] = packed.below_subtitle_min_duration
         chunk["micro_chunk_candidate"] = packed.micro_chunk_candidate

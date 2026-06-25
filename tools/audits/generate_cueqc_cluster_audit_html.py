@@ -1555,7 +1555,7 @@ function setMetrics(row) {{
     ["sampling", `score=${{Number(row.audit_sampling_score ?? rowConfidence(row)).toFixed(3)}} · rank=${{row.duration_rank ?? row.index ?? ""}}`],
     ["chunk", `${{row.chunk_index}} · ${{fmt(row.start)}}-${{fmt(row.end)}}`],
     ["duration", `${{Number(row.duration_s || 0).toFixed(3)}}s · cps=${{rowCharsPerSec(row).toFixed(3)}}`],
-    ["pre_asr_v8", JSON.stringify({{
+    ["pre_asr_v9", JSON.stringify({{
       features: row.features || {{}},
       ptm_pooling_available: row.ptm_pooling_available,
       ptm_pooling_schema: row.ptm_pooling_schema,

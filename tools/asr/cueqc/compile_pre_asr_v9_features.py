@@ -21,14 +21,20 @@ if str(SRC_ROOT) not in sys.path:
 from asr.backends.qwen import current_qwen_asr_backend, qwen_asr_repo_id  # noqa: E402
 from asr.pre_asr_cueqc import (  # noqa: E402
     PRE_ASR_CUEQC_FEATURE_NAMES,
-    PRE_ASR_CUEQC_POOLED_PTM_FEATURE_NAMES,
     PRE_ASR_CUEQC_FEATURE_SCHEMA,
+    PRE_ASR_CUEQC_IGNORE_LABEL,
+    PRE_ASR_CUEQC_POOLED_PTM_FEATURE_NAMES,
+    PRE_ASR_CUEQC_PTM_BINS,
+    PRE_ASR_CUEQC_PTM_DIM,
+    PRE_ASR_CUEQC_RUNTIME_ADAPTER,
+    PRE_ASR_CUEQC_SCALAR_FEATURE_NAMES,
     candidate_from_span,
-    feature_vector,
+    ptm_bin_matrix,
+    scalar_vector,
 )
 
 
-FEATURE_BUNDLE_SCHEMA = "cueqc_pre_asr_mamba_v8_features"
+FEATURE_BUNDLE_SCHEMA = "cueqc_pre_asr_mamba_v9_features"
 
 
 def project_path(value: str | Path) -> Path:
@@ -77,15 +83,6 @@ def extract_chunks(payload: Any) -> list[dict[str, Any]]:
     if isinstance(details, Mapping):
         return extract_chunks(details)
     return []
-
-
-def read_chunks(path: Path) -> list[dict[str, Any]]:
-    text = path.read_text(encoding="utf-8-sig")
-    if text.lstrip().startswith("["):
-        return extract_chunks(json.loads(text))
-    if text.lstrip().startswith("{"):
-        return extract_chunks(json.loads(text))
-    return read_json_or_jsonl(path)
 
 
 def infer_audio_id(path: Path, payload: Mapping[str, Any] | None = None) -> str:
@@ -183,10 +180,12 @@ def normalize_label(row: Mapping[str, Any]) -> int | None:
         or row.get("display_decision")
         or ""
     ).strip().lower()
-    if raw in {"keep", "keep_for_asr", "1", "positive"}:
+    if raw in {"keep", "keep_for_asr", "1", "positive", "definite_keep"}:
         return 1
-    if raw in {"drop", "drop_before_asr", "0", "negative"}:
+    if raw in {"drop", "drop_before_asr", "0", "negative", "definite_drop"}:
         return 0
+    if raw in {"ignore", "skip", "ambiguous", "ambiguous_ignore", str(PRE_ASR_CUEQC_IGNORE_LABEL)}:
+        return PRE_ASR_CUEQC_IGNORE_LABEL
     return None
 
 
@@ -199,7 +198,7 @@ def read_labels(paths: Iterable[str]) -> dict[str, dict[str, Any]]:
             if value is None:
                 continue
             if row.get("training_label_included") is False:
-                continue
+                value = PRE_ASR_CUEQC_IGNORE_LABEL
             for source_item in label_items(row):
                 item = dict(source_item)
                 item["label_index"] = value
@@ -259,9 +258,52 @@ def candidate_for_chunk(chunks: list[dict[str, Any]], index: int) -> dict[str, A
         candidate = candidate_from_span(chunks, index, require_ptm_pooling=True)
     if not _has_required_ptm_pooling(candidate):
         raise ValueError(
-            "Pre-ASR CueQC v8 feature compilation requires chunk-level pooled PTM features"
+            "Pre-ASR CueQC v9 feature compilation requires chunk-level pooled PTM features"
         )
     return candidate
+
+
+def _group_key(source: str, audio_id: str, candidate: Mapping[str, Any]) -> tuple[str, str, str]:
+    return (
+        source,
+        str(candidate.get("audio_id") or candidate.get("video_id") or audio_id),
+        str(candidate.get("planned_island_id") or "sequence"),
+    )
+
+
+def _make_tensor_bundle(rows: list[dict[str, Any]], groups: list[list[int]]) -> dict[str, Any]:
+    import torch
+
+    group_count = len(groups)
+    max_chunks = max((len(group) for group in groups), default=0)
+    scalar = np.zeros(
+        (group_count, max_chunks, len(PRE_ASR_CUEQC_SCALAR_FEATURE_NAMES)),
+        dtype=np.float32,
+    )
+    ptm_bins = np.zeros(
+        (group_count, max_chunks, PRE_ASR_CUEQC_PTM_BINS, PRE_ASR_CUEQC_PTM_DIM),
+        dtype=np.float32,
+    )
+    bin_mask = np.zeros((group_count, max_chunks, PRE_ASR_CUEQC_PTM_BINS), dtype=np.float32)
+    chunk_mask = np.zeros((group_count, max_chunks), dtype=np.float32)
+    labels = np.full((group_count, max_chunks), PRE_ASR_CUEQC_IGNORE_LABEL, dtype=np.int64)
+    for group_index, row_indexes in enumerate(groups):
+        for chunk_position, row_index in enumerate(row_indexes):
+            row = rows[row_index]
+            candidate = row["candidate"]
+            scalar[group_index, chunk_position] = scalar_vector(candidate)
+            bins, mask = ptm_bin_matrix(candidate)
+            ptm_bins[group_index, chunk_position] = bins
+            bin_mask[group_index, chunk_position] = mask
+            chunk_mask[group_index, chunk_position] = 1.0
+            labels[group_index, chunk_position] = int(row["label_index"])
+    return {
+        "scalar_features": torch.from_numpy(scalar),
+        "ptm_bins": torch.from_numpy(ptm_bins),
+        "bin_mask": torch.from_numpy(bin_mask),
+        "chunk_mask": torch.from_numpy(chunk_mask),
+        "labels": torch.from_numpy(labels),
+    }
 
 
 def compile_features(
@@ -275,63 +317,101 @@ def compile_features(
 
     labels = read_labels(label_paths)
     rows: list[dict[str, Any]] = []
-    features: list[np.ndarray] = []
-    targets: list[int] = []
+    group_map: dict[tuple[str, str, str], list[int]] = {}
     for raw_path in chunk_paths:
         path = project_path(raw_path)
+        source = repo_display_path(path)
         audio_id, chunks = read_chunk_document(path)
         for index, chunk in enumerate(chunks):
+            candidate = candidate_for_chunk(chunks, index)
             rid = row_id(audio_id, chunk, index)
             label = label_for_chunk(labels, audio_id=audio_id, chunk=chunk, index=index)
-            if label is None:
-                continue
-            candidate = candidate_for_chunk(chunks, index)
-            vector = feature_vector(candidate)
-            features.append(vector)
-            targets.append(int(label["label_index"]))
+            label_index = (
+                PRE_ASR_CUEQC_IGNORE_LABEL if label is None else int(label["label_index"])
+            )
+            group_key = _group_key(source, audio_id, candidate)
+            row_index = len(rows)
+            group_map.setdefault(group_key, []).append(row_index)
             rows.append(
                 {
                     "id": rid,
-                    "source": repo_display_path(path),
+                    "source": source,
+                    "audio_id": audio_id,
+                    "planned_island_id": str(candidate.get("planned_island_id") or "sequence"),
                     "chunk_index": int(candidate["index"]),
                     "start": candidate["start"],
                     "end": candidate["end"],
-                    "label": "keep_for_asr" if int(label["label_index"]) == 1 else "drop_before_asr",
-                    "label_source": str(
+                    "label_index": label_index,
+                    "label": (
+                        "keep_for_asr"
+                        if label_index == 1
+                        else "drop_before_asr"
+                        if label_index == 0
+                        else "ambiguous_ignore"
+                    ),
+                    "label_source": ""
+                    if label is None
+                    else str(
                         label.get("label_source")
                         or label.get("cluster_label_source")
                         or label.get("source")
                         or ""
                     ),
+                    "candidate": candidate,
                 }
             )
-    if not features:
-        raise ValueError("no labeled Pre-ASR CueQC examples were compiled")
-    x = np.stack(features).astype(np.float32)
-    y = np.asarray(targets, dtype=np.int64)
+    groups: list[list[int]] = []
+    for row_indexes in group_map.values():
+        if any(int(rows[row_index]["label_index"]) in (0, 1) for row_index in row_indexes):
+            groups.append(row_indexes)
+    if not groups:
+        raise ValueError("no definite labeled Pre-ASR CueQC examples were compiled")
+    bundle_tensors = _make_tensor_bundle(rows, groups)
+    y = bundle_tensors["labels"].numpy()
+    row_payload = [
+        {key: value for key, value in row.items() if key != "candidate"}
+        for group in groups
+        for row in (rows[row_index] for row_index in group)
+    ]
+    group_payload = [
+        {
+            "group_index": group_index,
+            "row_ids": [rows[row_index]["id"] for row_index in group],
+            "audio_id": rows[group[0]]["audio_id"],
+            "planned_island_id": rows[group[0]]["planned_island_id"],
+        }
+        for group_index, group in enumerate(groups)
+    ]
     bundle = {
         "schema": FEATURE_BUNDLE_SCHEMA,
         "feature_schema": PRE_ASR_CUEQC_FEATURE_SCHEMA,
-        "feature_names": list(PRE_ASR_CUEQC_FEATURE_NAMES),
+        "runtime_adapter": PRE_ASR_CUEQC_RUNTIME_ADAPTER,
+        "feature_names": list(PRE_ASR_CUEQC_SCALAR_FEATURE_NAMES),
+        "all_feature_names": list(PRE_ASR_CUEQC_FEATURE_NAMES),
+        "ptm_bins": PRE_ASR_CUEQC_PTM_BINS,
+        "ptm_dim": PRE_ASR_CUEQC_PTM_DIM,
         "asr_repo_id": qwen_asr_repo_id(asr_repo_id),
         "created_at": datetime.now().isoformat(timespec="seconds"),
-        "x": torch.from_numpy(x),
-        "y": torch.from_numpy(y),
-        "rows": rows,
+        "rows": row_payload,
+        "groups": group_payload,
         "source_files": [repo_display_path(project_path(path)) for path in chunk_paths],
         "label_files": [repo_display_path(project_path(path)) for path in label_paths],
+        **bundle_tensors,
     }
     output.parent.mkdir(parents=True, exist_ok=True)
     torch.save(bundle, output)
     summary = {
-        "schema": "cueqc_pre_asr_mamba_v8_feature_summary",
+        "schema": "cueqc_pre_asr_mamba_v9_feature_summary",
         "feature_bundle": repo_display_path(output),
         "feature_schema": PRE_ASR_CUEQC_FEATURE_SCHEMA,
-        "feature_names": list(PRE_ASR_CUEQC_FEATURE_NAMES),
+        "runtime_adapter": PRE_ASR_CUEQC_RUNTIME_ADAPTER,
+        "feature_names": list(PRE_ASR_CUEQC_SCALAR_FEATURE_NAMES),
         "asr_repo_id": qwen_asr_repo_id(asr_repo_id),
-        "count": int(y.shape[0]),
+        "group_count": int(len(groups)),
+        "chunk_count": int(np.sum(y != PRE_ASR_CUEQC_IGNORE_LABEL)),
         "keep": int(np.sum(y == 1)),
         "drop": int(np.sum(y == 0)),
+        "ambiguous_ignore": int(np.sum((y == PRE_ASR_CUEQC_IGNORE_LABEL) & (bundle_tensors["chunk_mask"].numpy() > 0))),
     }
     output.with_suffix(".summary.json").write_text(
         json.dumps(summary, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
@@ -341,9 +421,9 @@ def compile_features(
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Compile Pre-ASR CueQC v8 pooled PTM features.")
+    parser = argparse.ArgumentParser(description="Compile Pre-ASR CueQC v9 planned-island features.")
     parser.add_argument("--chunks", action="append", required=True, help="Workflow details/chunk JSON or JSONL.")
-    parser.add_argument("--labels", action="append", required=True, help="JSON/JSONL labels with keep/drop.")
+    parser.add_argument("--labels", action="append", required=True, help="JSON/JSONL labels with keep/drop/ignore.")
     parser.add_argument("--output", required=True)
     parser.add_argument("--asr-repo-id", default=current_qwen_asr_backend())
     return parser.parse_args(argv)
@@ -357,7 +437,15 @@ def main(argv: list[str] | None = None) -> int:
         output=project_path(args.output),
         asr_repo_id=str(args.asr_repo_id),
     )
-    print(f"features={summary['feature_bundle']} count={summary['count']} keep={summary['keep']} drop={summary['drop']}")
+    print(
+        "features={feature_bundle} groups={group_count} keep={keep} drop={drop} ignore={ignore}".format(
+            feature_bundle=summary["feature_bundle"],
+            group_count=summary["group_count"],
+            keep=summary["keep"],
+            drop=summary["drop"],
+            ignore=summary["ambiguous_ignore"],
+        )
+    )
     return 0
 
 
