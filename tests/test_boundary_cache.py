@@ -10,6 +10,11 @@ import pytest
 from audio.chunk_packer import PackedChunk
 from boundary.base import SegmentationResult, SpeechSegment
 from boundary.refiner import BoundaryDecision
+from boundary.sequence_features import (
+    CHUNK_POOLED_PTM_SCHEMA,
+    DEFAULT_CHUNK_POOLED_PTM_BINS,
+    chunk_pooled_ptm_feature_names,
+)
 
 ROOT = Path(__file__).resolve().parents[1]
 SRC = ROOT / "src"
@@ -205,6 +210,10 @@ def test_boundary_cache_round_trips_packed_chunks(monkeypatch, tmp_path):
                     "strength": 1.1,
                 }
             ],
+            pre_asr_ptm_pooling_schema=CHUNK_POOLED_PTM_SCHEMA,
+            pre_asr_ptm_pooling_bins=DEFAULT_CHUNK_POOLED_PTM_BINS,
+            pre_asr_ptm_pooling_dim=2,
+            pre_asr_ptm_pooled_features=[0.1, 0.2],
             speech_segments=[
                 SpeechSegment(
                     0.2,
@@ -269,6 +278,10 @@ def test_boundary_cache_round_trips_packed_chunks(monkeypatch, tmp_path):
     assert loaded_chunks[0].right_split_score == pytest.approx(0.72)
     assert loaded_chunks[0].primary_cut_candidates[0]["time_s"] == pytest.approx(1.2)
     assert loaded_chunks[0].weak_cut_candidates[0]["time_s"] == pytest.approx(1.7)
+    assert loaded_chunks[0].pre_asr_ptm_pooling_schema == CHUNK_POOLED_PTM_SCHEMA
+    assert loaded_chunks[0].pre_asr_ptm_pooling_bins == DEFAULT_CHUNK_POOLED_PTM_BINS
+    assert loaded_chunks[0].pre_asr_ptm_pooling_dim == 2
+    assert loaded_chunks[0].pre_asr_ptm_pooled_features == pytest.approx([0.1, 0.2])
     assert loaded_chunks[0].speech_segments[0].score == 0.9
     assert loaded_chunks[0].speech_segments[0].weak_cut_candidates[0]["time_s"] == pytest.approx(0.3)
 
@@ -367,6 +380,23 @@ class _FakeSequenceFeatureProvider:
 
     def signature(self) -> dict:
         return {"schema": "speech_boundary_ja_sequence_feature_frames_v1", "type": "fake"}
+
+    def chunk_pooled_ptm_feature_names(
+        self,
+        *,
+        bins: int = DEFAULT_CHUNK_POOLED_PTM_BINS,
+    ) -> list[str]:
+        return chunk_pooled_ptm_feature_names(ptm_dim=64, bins=bins)
+
+    def chunk_pooled_ptm_features(
+        self,
+        *,
+        start_s: float,
+        end_s: float,
+        bins: int = DEFAULT_CHUNK_POOLED_PTM_BINS,
+    ) -> list[float]:
+        del start_s, end_s
+        return [0.0] * len(self.chunk_pooled_ptm_feature_names(bins=bins))
 
 
 def _patch_fake_refiner(monkeypatch, asr) -> None:

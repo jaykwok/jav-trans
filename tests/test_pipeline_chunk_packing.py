@@ -8,6 +8,7 @@ from pathlib import Path
 from audio.chunk_packer import PackedChunk
 from boundary.base import SegmentationResult, SpeechSegment
 from boundary.refiner import BoundaryDecision
+from boundary.sequence_features import DEFAULT_CHUNK_POOLED_PTM_BINS, chunk_pooled_ptm_feature_names
 
 ROOT = Path(__file__).resolve().parents[1]
 SRC = ROOT / "src"
@@ -222,6 +223,23 @@ class _FakeSequenceFeatureProvider:
 
     def signature(self) -> dict:
         return {"schema": "speech_boundary_ja_sequence_feature_frames_v1", "type": "fake"}
+
+    def chunk_pooled_ptm_feature_names(
+        self,
+        *,
+        bins: int = DEFAULT_CHUNK_POOLED_PTM_BINS,
+    ) -> list[str]:
+        return chunk_pooled_ptm_feature_names(ptm_dim=64, bins=bins)
+
+    def chunk_pooled_ptm_features(
+        self,
+        *,
+        start_s: float,
+        end_s: float,
+        bins: int = DEFAULT_CHUNK_POOLED_PTM_BINS,
+    ) -> list[float]:
+        del start_s, end_s
+        return [0.0] * len(self.chunk_pooled_ptm_feature_names(bins=bins))
 
 
 class _FakeCueQCRefiner:

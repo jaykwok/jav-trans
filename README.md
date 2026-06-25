@@ -113,7 +113,7 @@ Web 提交是否使用 CUDA 取决于后端服务进程是否能看到 GPU，而
 视频输入
   -> 任务上下文 / 配置解析
   -> 音频抽取与标准化
-  -> SpeechBoundary-JA feature extraction
+  -> Shared Qwen feature extraction
      - Qwen ASR repo 对应的 frozen PTM/encoder frame features
      - MFCC / timing numeric features
   -> SpeechBoundary-JA Scorer v5
@@ -128,8 +128,9 @@ Web 提交是否使用 CUDA 取决于后端服务进程是否能看到 GPU，而
      - 只修 start/end edge delta
      - 不新增 chunk、不合并 chunk、不做 drop
   -> chunk packing / boundary-cache
-  -> 可选 Pre-ASR CueQC v6
+  -> 可选 Pre-ASR CueQC v7
      - keep_for_asr / drop_before_asr
+     - 复用 chunk-level pooled Qwen PTM features
      - drop 的 chunk 不导出 wav、不进入 ASR
   -> ASR wav chunk export
   -> Qwen ASR text transcription
@@ -201,20 +202,20 @@ Decoder 会输出两类 acoustic cut：
 
 Boundary Refiner 只修 chunk 两端。它不学习中间切点、不新增 chunk、不合并 chunk、不做删除路由，也不学习 ASR padding/context budget。
 
-### Pre-ASR CueQC v6
+### Pre-ASR CueQC v7
 
 | 项 | 内容 |
 | --- | --- |
-| Schema | `cueqc_pre_asr_mamba_v6_binary` |
-| Feature schema | `pre_asr_cueqc_features_v2` |
+| Schema | `cueqc_pre_asr_mamba_v7_binary` |
+| Feature schema | `pre_asr_cueqc_features_v3` |
 | Runtime position | Boundary Refiner 后、wav chunk export 前 |
 | Architecture | `Linear(input_dim, hidden_size) -> GELU -> Linear(hidden_size, 2)` |
 | Output | `keep_for_asr`, `drop_before_asr` |
-| Decision | `p_drop >= PRE_ASR_CUEQC_DROP_THRESHOLD` 时 drop；当前 cold-start 推荐阈值 `0.999` |
+| Decision | `p_drop >= PRE_ASR_CUEQC_DROP_THRESHOLD` 时 drop；低置信默认 keep |
 
-Pre-ASR CueQC 只看 ASR 前数值特征：duration、speech segment count、internal gap、refiner delta、scorer speech/split 分布、邻接 gap、micro chunk evidence 等。它禁止使用 ASR text、raw text、token trace、decoder stats、ASR confidence 和 subtitle timing。
+Pre-ASR CueQC 只看 ASR 前特征：duration、speech segment count、internal gap、refiner delta、scorer speech/split 分布、邻接 gap、micro chunk evidence，以及从共享 Qwen PTM/encoder frame features 池化得到的 chunk-level embedding。它禁止使用 ASR text、raw text、token trace、decoder stats、ASR confidence 和 subtitle timing。
 
-当前 1.7B repo 已有 conservative cold-start checkpoint，但默认仍关闭；开启前应先跑 no-translate workflow smoke / audit，确认 false-drop 风险可接受。
+v7 需要用 current scorer/refiner workflow 重新导出候选并训练，不复用 v6 checkpoint。默认仍关闭；开启前应先跑 no-translate workflow smoke / audit，确认 false-drop 风险可接受。
 
 ### ASR-after CueQC shadow
 
@@ -387,7 +388,7 @@ uv run python -m <module> --help
 - `tools.audits.audit_nav`、`tools.audits.serve_static`、`tools.audits.serve_audits.ps1`、`tools.audits.serve_audits.sh`：维护和启动本地审计导航页。
 - `tools.audits.generate_cueqc_cluster_audit_html`：生成音频审计页，支持 chunk/context 播放、筛选排序和字幕对照。
 - `tools.audits.generate_cueqc_cluster_broadcast_html`：生成独立簇级 keep/drop 广播标注页；混簇/跳过只记录 abstain。
-- `tools.asr.cueqc.export_pre_asr_v6_audit_candidates`：从 current workflow `.timings.json` 导出 Pre-ASR CueQC v6 审计候选。
+- `tools.asr.cueqc.export_pre_asr_v7_audit_candidates`：从 current workflow `.timings.json` 导出 Pre-ASR CueQC v7 审计候选。
 
 命令行完整工作流 smoke：
 

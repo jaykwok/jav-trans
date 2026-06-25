@@ -173,6 +173,36 @@ def test_subtitle_max_duration_clamp_removed_from_active_config_surface():
         assert "max_duration" not in text
 
 
+def test_pre_asr_cueqc_v6_removed_from_active_runtime_surface():
+    active_files = (
+        "src/asr/pre_asr_cueqc.py",
+        "src/asr/backends/qwen.py",
+        "src/core/config.py",
+        ".env.example",
+        "README.md",
+        "tools/workflows/run_full_workflow.py",
+        "tools/asr/cueqc/compile_pre_asr_v7_features.py",
+        "tools/asr/cueqc/train_pre_asr_v7_binary.py",
+        "tools/asr/cueqc/export_pre_asr_v7_audit_candidates.py",
+    )
+    retired_tokens = (
+        "cueqc_pre_asr_mamba_v6",
+        "pre_asr_cueqc_features_v2",
+        "compile_pre_asr_v6",
+        "train_pre_asr_v6",
+        "export_pre_asr_v6",
+        "Pre-ASR CueQC v6",
+    )
+    for relative_path in active_files:
+        text = (ROOT / relative_path).read_text(encoding="utf-8")
+        for token in retired_tokens:
+            assert token not in text
+    assert all(
+        "cueqc_pre_asr_mamba_v7_binary" in path
+        for path in qwen.DEFAULT_PRE_ASR_CUEQC_CHECKPOINT_BY_REPO.values()
+    )
+
+
 def test_frozen_path_defaults_resolve_to_runtime_root(monkeypatch, tmp_path):
     monkeypatch.setattr(config, "PROJECT_ROOT", tmp_path)
     monkeypatch.setattr(config, "PRIVATE_ENV_PATH", tmp_path / ".env")

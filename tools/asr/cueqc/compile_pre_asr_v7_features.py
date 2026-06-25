@@ -21,13 +21,14 @@ if str(SRC_ROOT) not in sys.path:
 from asr.backends.qwen import current_qwen_asr_backend, qwen_asr_repo_id  # noqa: E402
 from asr.pre_asr_cueqc import (  # noqa: E402
     PRE_ASR_CUEQC_FEATURE_NAMES,
+    PRE_ASR_CUEQC_POOLED_PTM_FEATURE_NAMES,
     PRE_ASR_CUEQC_FEATURE_SCHEMA,
     candidate_from_span,
     feature_vector,
 )
 
 
-FEATURE_BUNDLE_SCHEMA = "cueqc_pre_asr_mamba_v6_features"
+FEATURE_BUNDLE_SCHEMA = "cueqc_pre_asr_mamba_v7_features"
 
 
 def project_path(value: str | Path) -> Path:
@@ -239,13 +240,28 @@ def label_for_chunk(
     return None
 
 
+def _has_required_ptm_pooling(candidate: Mapping[str, Any]) -> bool:
+    values = candidate.get("pre_asr_ptm_pooled_features")
+    return (
+        bool(candidate.get("ptm_pooling_available"))
+        and isinstance(values, list)
+        and len(values) == len(PRE_ASR_CUEQC_POOLED_PTM_FEATURE_NAMES)
+    )
+
+
 def candidate_for_chunk(chunks: list[dict[str, Any]], index: int) -> dict[str, Any]:
     chunk = chunks[index]
     features = chunk.get("features")
     feature_names = tuple(str(item) for item in chunk.get("feature_names") or ())
     if isinstance(features, Mapping) and feature_names == PRE_ASR_CUEQC_FEATURE_NAMES:
-        return dict(chunk)
-    return candidate_from_span(chunks, index)
+        candidate = dict(chunk)
+    else:
+        candidate = candidate_from_span(chunks, index, require_ptm_pooling=True)
+    if not _has_required_ptm_pooling(candidate):
+        raise ValueError(
+            "Pre-ASR CueQC v7 feature compilation requires chunk-level pooled PTM features"
+        )
+    return candidate
 
 
 def compile_features(
@@ -308,7 +324,7 @@ def compile_features(
     output.parent.mkdir(parents=True, exist_ok=True)
     torch.save(bundle, output)
     summary = {
-        "schema": "cueqc_pre_asr_mamba_v6_feature_summary",
+        "schema": "cueqc_pre_asr_mamba_v7_feature_summary",
         "feature_bundle": repo_display_path(output),
         "feature_schema": PRE_ASR_CUEQC_FEATURE_SCHEMA,
         "feature_names": list(PRE_ASR_CUEQC_FEATURE_NAMES),
@@ -325,7 +341,7 @@ def compile_features(
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Compile Pre-ASR CueQC v6 numeric features.")
+    parser = argparse.ArgumentParser(description="Compile Pre-ASR CueQC v7 pooled PTM features.")
     parser.add_argument("--chunks", action="append", required=True, help="Workflow details/chunk JSON or JSONL.")
     parser.add_argument("--labels", action="append", required=True, help="JSON/JSONL labels with keep/drop.")
     parser.add_argument("--output", required=True)
