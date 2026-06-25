@@ -8,7 +8,29 @@ import pytest
 from asr import pre_asr_cueqc
 from audio.chunk_packer import PackedChunk
 from boundary.base import SpeechSegment
-from tools.asr.cueqc.compile_pre_asr_v6_features import compile_features
+from boundary.sequence_features import (
+    CHUNK_POOLED_PTM_SCHEMA,
+    FrameSequenceFeatureConfig,
+    FrameSequenceFeatureProvider,
+)
+from tools.asr.cueqc.compile_pre_asr_v7_features import compile_features
+
+
+def _ptm_pool() -> list[float]:
+    return [
+        float(index) / 1000.0
+        for index in range(len(pre_asr_cueqc.PRE_ASR_CUEQC_POOLED_PTM_FEATURE_NAMES))
+    ]
+
+
+def _ptm_pooling_fields() -> dict:
+    values = _ptm_pool()
+    return {
+        "pre_asr_ptm_pooling_schema": CHUNK_POOLED_PTM_SCHEMA,
+        "pre_asr_ptm_pooling_bins": pre_asr_cueqc.PRE_ASR_CUEQC_PTM_BINS,
+        "pre_asr_ptm_pooling_dim": len(values),
+        "pre_asr_ptm_pooled_features": values,
+    }
 
 
 def _pre_asr_candidate(index: int, *, video_id: str = "AAA", cluster_id: str = "") -> dict:
@@ -19,6 +41,7 @@ def _pre_asr_candidate(index: int, *, video_id: str = "AAA", cluster_id: str = "
                 "end": float(index) + 0.5,
                 "scorer_speech_mean": 0.8,
                 "scorer_split_p90": 0.2,
+                **_ptm_pooling_fields(),
             }
         ],
         0,
@@ -65,7 +88,10 @@ def test_pre_asr_cueqc_candidate_uses_numeric_chunk_features_only():
 
     assert candidate["schema"] == pre_asr_cueqc.PRE_ASR_CUEQC_FEATURE_SCHEMA
     assert candidate["feature_names"] == list(pre_asr_cueqc.PRE_ASR_CUEQC_FEATURE_NAMES)
-    assert set(candidate["features"]) == set(pre_asr_cueqc.PRE_ASR_CUEQC_FEATURE_NAMES)
+    assert set(candidate["features"]) == set(pre_asr_cueqc.PRE_ASR_CUEQC_SCALAR_FEATURE_NAMES)
+    assert len(candidate["pre_asr_ptm_pooled_features"]) == len(
+        pre_asr_cueqc.PRE_ASR_CUEQC_POOLED_PTM_FEATURE_NAMES
+    )
     assert "text" not in json.dumps(candidate["features"], ensure_ascii=False).lower()
 
 
@@ -88,6 +114,7 @@ def test_pre_asr_cueqc_candidate_includes_micro_numeric_features():
             right_split_prominence=0.21,
             left_split_speech_valley=0.7,
             right_split_speech_valley=0.72,
+            **_ptm_pooling_fields(),
         )
     ]
 
@@ -103,6 +130,59 @@ def test_pre_asr_cueqc_candidate_includes_micro_numeric_features():
     assert candidate["features"]["left_split_score"] == 0.8
 
 
+def test_pre_asr_cueqc_candidate_uses_chunk_pooled_ptm_embedding():
+    spans = [
+        PackedChunk(
+            start=0.0,
+            end=1.0,
+            speech_segments=[SpeechSegment(0.0, 1.0)],
+            duration=1.0,
+            split_reason="unit",
+            **_ptm_pooling_fields(),
+        )
+    ]
+
+    candidate = pre_asr_cueqc.candidate_from_span(spans, 0, require_ptm_pooling=True)
+    vector = pre_asr_cueqc.feature_vector(candidate)
+
+    assert candidate["ptm_pooling_available"] is True
+    assert candidate["ptm_pooling_schema"] == CHUNK_POOLED_PTM_SCHEMA
+    assert vector.shape[0] == len(pre_asr_cueqc.PRE_ASR_CUEQC_FEATURE_NAMES)
+    assert vector[-1] == pytest.approx(_ptm_pool()[-1])
+
+
+def test_frame_sequence_provider_pools_chunk_ptm_features():
+    provider = FrameSequenceFeatureProvider(
+        duration_s=0.04,
+        frame_hop_s=0.01,
+        ptm=[[1.0, 2.0], [3.0, 4.0], [5.0, 6.0], [7.0, 8.0]],
+        mfcc=[[0.0], [0.0], [0.0], [0.0]],
+        config=FrameSequenceFeatureConfig(max_ptm_dims=2),
+    )
+
+    names = provider.chunk_pooled_ptm_feature_names(bins=4)
+    values = provider.chunk_pooled_ptm_features(start_s=0.0, end_s=0.04, bins=4)
+
+    assert len(names) == 12
+    assert values[:2] == pytest.approx([4.0, 5.0])
+    assert values[4:] == pytest.approx([1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0])
+
+
+def test_pre_asr_cueqc_requires_pooled_ptm_when_requested():
+    spans = [
+        PackedChunk(
+            start=0.0,
+            end=1.0,
+            speech_segments=[SpeechSegment(0.0, 1.0)],
+            duration=1.0,
+            split_reason="unit",
+        )
+    ]
+
+    with pytest.raises(ValueError, match="requires chunk-level pooled PTM"):
+        pre_asr_cueqc.candidate_from_span(spans, 0, require_ptm_pooling=True)
+
+
 def test_pre_asr_cueqc_filters_before_wav_export(monkeypatch):
     from asr import pipeline as asr_pipeline
 
@@ -113,6 +193,7 @@ def test_pre_asr_cueqc_filters_before_wav_export(monkeypatch):
             speech_segments=[SpeechSegment(0.0, 1.0)],
             duration=1.0,
             split_reason="unit",
+            **_ptm_pooling_fields(),
         ),
         PackedChunk(
             start=1.2,
@@ -120,6 +201,7 @@ def test_pre_asr_cueqc_filters_before_wav_export(monkeypatch):
             speech_segments=[SpeechSegment(1.2, 2.0)],
             duration=0.8,
             split_reason="unit",
+            **_ptm_pooling_fields(),
         ),
     ]
 
@@ -186,6 +268,7 @@ def test_compile_pre_asr_cueqc_features_ignores_text_columns(tmp_path: Path):
                         "raw_text": "ignored",
                         "scorer_speech_mean": 0.9,
                         "scorer_split_p90": 0.1,
+                        **_ptm_pooling_fields(),
                     },
                     {
                         "index": 1,
@@ -194,6 +277,7 @@ def test_compile_pre_asr_cueqc_features_ignores_text_columns(tmp_path: Path):
                         "decoder_stats": {"ignored": True},
                         "scorer_speech_mean": 0.2,
                         "scorer_split_p90": 0.0,
+                        **_ptm_pooling_fields(),
                     },
                 ]
             },

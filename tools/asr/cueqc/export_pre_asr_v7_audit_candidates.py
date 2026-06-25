@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Export current Pre-ASR CueQC v6 candidates for audio audit/labeling."""
+"""Export current Pre-ASR CueQC v7 candidates for audio audit/labeling."""
 from __future__ import annotations
 
 import argparse
@@ -169,7 +169,7 @@ def export_candidates(*, timing_paths: list[str], output_dir: Path) -> dict[str,
             rows.append(
                 {
                     **item,
-                    "schema": "pre_asr_cueqc_v6_audit_candidate",
+                    "schema": "pre_asr_cueqc_v7_audit_candidate",
                     "sample_id": sample_id,
                     "candidate_id": sample_id,
                     "video_id": video_id,
@@ -193,7 +193,7 @@ def export_candidates(*, timing_paths: list[str], output_dir: Path) -> dict[str,
                     },
                     "cluster_id": cluster_id,
                     "cluster_label": cluster_id,
-                    "cluster_method": "pre_asr_v6_feature_bucket",
+                    "cluster_method": "pre_asr_v7_feature_bucket",
                     "cluster_backend": "rule_bucket_for_audit_only",
                     "cluster_confidence": 1.0,
                     "cluster_noise": False,
@@ -216,7 +216,7 @@ def export_candidates(*, timing_paths: list[str], output_dir: Path) -> dict[str,
             {
                 "cluster_id": cluster_id,
                 "cluster_label": cluster_id,
-                "cluster_method": "pre_asr_v6_feature_bucket",
+                "cluster_method": "pre_asr_v7_feature_bucket",
                 "cluster_noise": False,
                 "count": len(members),
                 "duration_min_s": round(min(durations), 6) if durations else 0.0,
@@ -236,13 +236,13 @@ def export_candidates(*, timing_paths: list[str], output_dir: Path) -> dict[str,
         )
 
     output_dir.mkdir(parents=True, exist_ok=True)
-    clusters_path = output_dir / "pre_asr_cueqc_v6_audit_candidates.jsonl"
-    summaries_path = output_dir / "pre_asr_cueqc_v6_audit_summaries.jsonl"
+    clusters_path = output_dir / "pre_asr_cueqc_v7_audit_candidates.jsonl"
+    summaries_path = output_dir / "pre_asr_cueqc_v7_audit_summaries.jsonl"
     summary_path = output_dir / "summary.json"
     write_jsonl(clusters_path, rows)
     write_jsonl(summaries_path, summaries)
     summary = {
-        "schema": "pre_asr_cueqc_v6_audit_candidate_export_summary",
+        "schema": "pre_asr_cueqc_v7_audit_candidate_export_summary",
         "candidate_count": len(rows),
         "cluster_count": len(summaries),
         "clusters": repo_rel(clusters_path),
@@ -266,7 +266,7 @@ def export_candidates(*, timing_paths: list[str], output_dir: Path) -> dict[str,
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Export current Pre-ASR CueQC v6 candidates for audit.")
+    parser = argparse.ArgumentParser(description="Export current Pre-ASR CueQC v7 candidates for audit.")
     parser.add_argument("--timings", action="append", required=True, help="Workflow .timings.json. Repeatable.")
     parser.add_argument("--output-dir", required=True)
     return parser.parse_args(argv)

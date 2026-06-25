@@ -10,6 +10,8 @@ import numpy as np
 
 FRAME_SEQUENCE_FEATURE_SCHEMA = "edge_sequence_features_v1"
 FRAME_SEQUENCE_FRAMES_SCHEMA = "speech_boundary_ja_sequence_feature_frames_v1"
+CHUNK_POOLED_PTM_SCHEMA = "pre_asr_chunk_pooled_ptm_v1"
+DEFAULT_CHUNK_POOLED_PTM_BINS = 4
 
 
 @dataclass(frozen=True)
@@ -133,6 +135,45 @@ class FrameSequenceFeatureProvider:
             config=self.config,
         )
 
+    def chunk_pooled_ptm_feature_names(
+        self,
+        *,
+        bins: int = DEFAULT_CHUNK_POOLED_PTM_BINS,
+    ) -> list[str]:
+        return chunk_pooled_ptm_feature_names(ptm_dim=self._ptm_used_dim, bins=bins)
+
+    def chunk_pooled_ptm_signature(
+        self,
+        *,
+        bins: int = DEFAULT_CHUNK_POOLED_PTM_BINS,
+    ) -> dict:
+        names = self.chunk_pooled_ptm_feature_names(bins=bins)
+        return {
+            "schema": CHUNK_POOLED_PTM_SCHEMA,
+            "bins": int(bins),
+            "ptm_used_dim": int(self._ptm_used_dim),
+            "feature_dim": len(names),
+            "feature_names_hash": hashlib.sha1(
+                json.dumps(names, separators=(",", ":")).encode("utf-8")
+            ).hexdigest(),
+            "frame_hop_s": float(self.frame_hop_s),
+        }
+
+    def chunk_pooled_ptm_features(
+        self,
+        *,
+        start_s: float,
+        end_s: float,
+        bins: int = DEFAULT_CHUNK_POOLED_PTM_BINS,
+    ) -> list[float]:
+        return _chunk_pooled_ptm_features_from_array(
+            self._ptm_used,
+            frame_hop_s=self.frame_hop_s,
+            start_s=start_s,
+            end_s=end_s,
+            bins=bins,
+        )
+
 
 def get_default_config() -> FrameSequenceFeatureConfig:
     return FrameSequenceFeatureConfig()
@@ -169,6 +210,26 @@ def frame_sequence_feature_names(
         for region in ("left", "gap", "right"):
             names.extend(f"{region}_mfcc_mean_{index:03d}" for index in range(mfcc_dim))
             names.extend(f"{region}_mfcc_std_{index:03d}" for index in range(mfcc_dim))
+    return names
+
+
+def chunk_pooled_ptm_feature_names(
+    *,
+    ptm_dim: int,
+    bins: int = DEFAULT_CHUNK_POOLED_PTM_BINS,
+) -> list[str]:
+    if ptm_dim <= 0:
+        raise ValueError("ptm_dim must be positive")
+    if bins <= 0:
+        raise ValueError("bins must be positive")
+    names: list[str] = []
+    names.extend(f"chunk_ptm_mean_{index:03d}" for index in range(ptm_dim))
+    names.extend(f"chunk_ptm_std_{index:03d}" for index in range(ptm_dim))
+    for bin_index in range(int(bins)):
+        names.extend(
+            f"chunk_ptm_bin{bin_index:02d}_mean_{index:03d}"
+            for index in range(ptm_dim)
+        )
     return names
 
 
@@ -310,6 +371,18 @@ def _frame_array(values: Sequence[Sequence[float]], *, name: str) -> np.ndarray:
     return array
 
 
+def _frame_bounds_for_range(
+    frame_count: int,
+    *,
+    frame_hop_s: float,
+    start_s: float,
+    end_s: float,
+) -> tuple[int, int]:
+    lower = max(0, int(round(max(0.0, start_s) / frame_hop_s)))
+    upper = min(int(frame_count), int(round(max(start_s, end_s) / frame_hop_s)))
+    return lower, max(lower, upper)
+
+
 def _stats_for_range(
     array: np.ndarray,
     *,
@@ -317,11 +390,47 @@ def _stats_for_range(
     start_s: float,
     end_s: float,
 ) -> list[float]:
-    lower = max(0, int(round(max(0.0, start_s) / frame_hop_s)))
-    upper = min(int(array.shape[0]), int(round(max(start_s, end_s) / frame_hop_s)))
+    lower, upper = _frame_bounds_for_range(
+        int(array.shape[0]),
+        frame_hop_s=frame_hop_s,
+        start_s=start_s,
+        end_s=end_s,
+    )
     if upper <= lower:
         return [0.0] * (int(array.shape[1]) * 2)
     window = np.asarray(array[lower:upper], dtype=np.float32)
     mean = window.mean(axis=0)
     std = window.std(axis=0)
     return [float(value) for value in np.concatenate([mean, std], axis=0)]
+
+
+def _chunk_pooled_ptm_features_from_array(
+    array: np.ndarray,
+    *,
+    frame_hop_s: float,
+    start_s: float,
+    end_s: float,
+    bins: int,
+) -> list[float]:
+    if frame_hop_s <= 0:
+        raise ValueError("frame_hop_s must be positive")
+    if bins <= 0:
+        raise ValueError("bins must be positive")
+    dim = int(array.shape[1])
+    lower, upper = _frame_bounds_for_range(
+        int(array.shape[0]),
+        frame_hop_s=frame_hop_s,
+        start_s=start_s,
+        end_s=end_s,
+    )
+    if upper <= lower:
+        return [0.0] * (dim * (2 + int(bins)))
+    window = np.asarray(array[lower:upper], dtype=np.float32)
+    values = [float(value) for value in window.mean(axis=0)]
+    values.extend(float(value) for value in window.std(axis=0))
+    for part in np.array_split(window, int(bins), axis=0):
+        if part.shape[0] <= 0:
+            values.extend([0.0] * dim)
+        else:
+            values.extend(float(value) for value in part.mean(axis=0))
+    return values

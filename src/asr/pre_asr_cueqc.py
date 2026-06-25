@@ -13,12 +13,20 @@ from asr.backends.qwen import (
     current_qwen_asr_backend,
     validate_checkpoint_repo_id,
 )
+from boundary.sequence_features import (
+    CHUNK_POOLED_PTM_SCHEMA,
+    DEFAULT_CHUNK_POOLED_PTM_BINS,
+    FrameSequenceFeatureConfig,
+    chunk_pooled_ptm_feature_names,
+)
 
 
-PRE_ASR_CUEQC_SCHEMA = "cueqc_pre_asr_mamba_v6_binary"
+PRE_ASR_CUEQC_SCHEMA = "cueqc_pre_asr_mamba_v7_binary"
 PRE_ASR_CUEQC_DECISION_VERSION = "pre_asr_cueqc_binary_v1"
-PRE_ASR_CUEQC_FEATURE_SCHEMA = "pre_asr_cueqc_features_v2"
-PRE_ASR_CUEQC_FEATURE_NAMES = (
+PRE_ASR_CUEQC_FEATURE_SCHEMA = "pre_asr_cueqc_features_v3"
+PRE_ASR_CUEQC_PTM_DIM = FrameSequenceFeatureConfig().max_ptm_dims
+PRE_ASR_CUEQC_PTM_BINS = DEFAULT_CHUNK_POOLED_PTM_BINS
+PRE_ASR_CUEQC_SCALAR_FEATURE_NAMES = (
     "duration_s",
     "speech_segment_count",
     "internal_gap_count",
@@ -46,6 +54,16 @@ PRE_ASR_CUEQC_FEATURE_NAMES = (
     "right_split_prominence",
     "left_split_speech_valley",
     "right_split_speech_valley",
+)
+PRE_ASR_CUEQC_POOLED_PTM_FEATURE_NAMES = tuple(
+    chunk_pooled_ptm_feature_names(
+        ptm_dim=PRE_ASR_CUEQC_PTM_DIM,
+        bins=PRE_ASR_CUEQC_PTM_BINS,
+    )
+)
+PRE_ASR_CUEQC_FEATURE_NAMES = (
+    PRE_ASR_CUEQC_SCALAR_FEATURE_NAMES
+    + PRE_ASR_CUEQC_POOLED_PTM_FEATURE_NAMES
 )
 _BANNED_FEATURE_TOKENS = (
     "text",
@@ -123,11 +141,55 @@ def _has_action(value: Any, token: str) -> float:
     return 1.0 if token in actions else 0.0
 
 
-def candidate_from_span(spans: Sequence[Any], index: int) -> dict[str, Any]:
+def _pooled_ptm_values(
+    span: Any,
+    *,
+    require_ptm_pooling: bool,
+) -> tuple[list[float], bool, str, int | None, int | None]:
+    raw_values = _packed_value(span, "pre_asr_ptm_pooled_features", [])
+    schema = str(_packed_value(span, "pre_asr_ptm_pooling_schema", "") or "")
+    bins = _packed_value(span, "pre_asr_ptm_pooling_bins")
+    dim = _packed_value(span, "pre_asr_ptm_pooling_dim")
+    try:
+        parsed_bins = None if bins is None else int(bins)
+    except (TypeError, ValueError):
+        parsed_bins = None
+    try:
+        parsed_dim = None if dim is None else int(dim)
+    except (TypeError, ValueError):
+        parsed_dim = None
+    values: list[float] = []
+    if isinstance(raw_values, Sequence) and not isinstance(raw_values, (str, bytes, bytearray)):
+        for item in raw_values:
+            values.append(_safe_float(item))
+    expected_dim = len(PRE_ASR_CUEQC_POOLED_PTM_FEATURE_NAMES)
+    available = (
+        schema == CHUNK_POOLED_PTM_SCHEMA
+        and len(values) == expected_dim
+        and (parsed_bins is None or parsed_bins == PRE_ASR_CUEQC_PTM_BINS)
+        and (parsed_dim is None or parsed_dim == expected_dim)
+    )
+    if available:
+        return values, True, schema, parsed_bins or PRE_ASR_CUEQC_PTM_BINS, expected_dim
+    if require_ptm_pooling:
+        raise ValueError("Pre-ASR CueQC v7 requires chunk-level pooled PTM features")
+    return [0.0] * expected_dim, False, schema, parsed_bins, parsed_dim
+
+
+def candidate_from_span(
+    spans: Sequence[Any],
+    index: int,
+    *,
+    require_ptm_pooling: bool = False,
+) -> dict[str, Any]:
     span = spans[index]
     start = _safe_float(_packed_value(span, "start"))
     end = max(start, _safe_float(_packed_value(span, "end"), start))
     duration = max(0.0, end - start)
+    pooled_values, pooled_available, pooling_schema, pooling_bins, pooling_dim = _pooled_ptm_values(
+        span,
+        require_ptm_pooling=require_ptm_pooling,
+    )
     features = {
         "duration_s": duration,
         "speech_segment_count": _sequence_count(_packed_value(span, "speech_segments", [])),
@@ -183,13 +245,29 @@ def candidate_from_span(spans: Sequence[Any], index: int) -> dict[str, Any]:
         "left_split_score": features["left_split_score"],
         "right_split_score": features["right_split_score"],
         "features": features,
+        "ptm_pooling_schema": pooling_schema,
+        "ptm_pooling_available": pooled_available,
+        "ptm_pooling_bins": pooling_bins,
+        "ptm_pooling_dim": pooling_dim,
+        "pre_asr_ptm_pooled_features": pooled_values,
         "feature_names": list(PRE_ASR_CUEQC_FEATURE_NAMES),
     }
 
 
 def feature_vector(candidate: Mapping[str, Any]) -> np.ndarray:
     features = candidate.get("features") if isinstance(candidate.get("features"), Mapping) else {}
-    return np.asarray([_safe_float(features.get(name)) for name in PRE_ASR_CUEQC_FEATURE_NAMES], dtype=np.float32)
+    values = [_safe_float(features.get(name)) for name in PRE_ASR_CUEQC_SCALAR_FEATURE_NAMES]
+    raw_pooled = candidate.get("pre_asr_ptm_pooled_features")
+    pooled: list[float] = []
+    if isinstance(raw_pooled, Sequence) and not isinstance(raw_pooled, (str, bytes, bytearray)):
+        pooled = [_safe_float(item) for item in raw_pooled]
+    expected = len(PRE_ASR_CUEQC_POOLED_PTM_FEATURE_NAMES)
+    if len(pooled) != expected:
+        pooled = [_safe_float(features.get(name)) for name in PRE_ASR_CUEQC_POOLED_PTM_FEATURE_NAMES]
+    if len(pooled) != expected:
+        pooled = [0.0] * expected
+    values.extend(pooled)
+    return np.asarray(values, dtype=np.float32)
 
 
 class PreAsrCueQC:

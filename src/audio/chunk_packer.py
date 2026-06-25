@@ -53,6 +53,10 @@ class PackedChunk:
     right_split_speech_valley: float | None = None
     primary_cut_candidates: list[dict[str, Any]] | None = None
     weak_cut_candidates: list[dict[str, Any]] | None = None
+    pre_asr_ptm_pooling_schema: str = ""
+    pre_asr_ptm_pooling_bins: int | None = None
+    pre_asr_ptm_pooling_dim: int | None = None
+    pre_asr_ptm_pooled_features: list[float] | None = None
 
 
 @dataclass(frozen=True)

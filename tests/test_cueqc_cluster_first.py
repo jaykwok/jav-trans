@@ -169,7 +169,9 @@ def test_cueqc_torque_auto_clusters_separated_dense_embeddings():
 
 def test_cueqc_torque_auto_prefers_pre_asr_numeric_features():
     rows = []
-    feature_names = ["duration_s", "scorer_speech_mean", "scorer_split_max"]
+    scalar_feature_names = ["duration_s", "scorer_speech_mean", "scorer_split_max"]
+    pooled_feature_names = ["chunk_ptm_mean_000", "chunk_ptm_mean_001"]
+    feature_names = scalar_feature_names + pooled_feature_names
     for index, values in enumerate(
         [
             [0.25, 0.15, 0.05],
@@ -180,15 +182,17 @@ def test_cueqc_torque_auto_prefers_pre_asr_numeric_features():
     ):
         rows.append(
             {
-                "schema": "pre_asr_cueqc_v6_audit_candidate",
+                "schema": "pre_asr_cueqc_v7_audit_candidate",
                 "sample_id": f"preasr-sample-{index:03d}",
                 "chunk_index": index,
                 "start": float(index),
                 "end": float(index) + values[0],
                 "duration_s": values[0],
                 "text": "",
-                "features": dict(zip(feature_names, values)),
+                "features": dict(zip(scalar_feature_names, values)),
                 "feature_names": feature_names,
+                "ptm_pooling_available": True,
+                "pre_asr_ptm_pooled_features": [float(index), float(index + 1)],
             }
         )
 
@@ -203,8 +207,14 @@ def test_cueqc_torque_auto_prefers_pre_asr_numeric_features():
     assert representatives
     assert summaries
     assert summary["feature_space"]["resolved"] == "pre_asr"
+    assert (
+        summary["feature_space"]["pre_asr"]["source"]
+        == "features+pre_asr_ptm_pooled_features"
+    )
     assert summary["feature_space"]["pre_asr"]["feature_names"] == feature_names
     assert summary["feature_space"]["pre_asr"]["rows_with_features"] == len(rows)
+    assert summary["feature_space"]["pre_asr"]["rows_with_ptm_pooling"] == len(rows)
+    assert summary["feature_space"]["pre_asr"]["ptm_pooling_dim"] == len(pooled_feature_names)
     assert summary["feature_space"]["pre_asr"]["total_dim"] == len(feature_names)
 
 

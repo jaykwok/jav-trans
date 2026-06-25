@@ -15,7 +15,7 @@ from boundary.base import SpeechSegment
 
 log = logging.getLogger(__name__)
 
-BOUNDARY_CACHE_VERSION = 10
+BOUNDARY_CACHE_VERSION = 11
 _AUDIO_SAMPLE_BYTES = 2 * 1024 * 1024
 _AUDIO_KEY_RE = re.compile(r"^[0-9a-fA-F]{8,40}$")
 
@@ -327,6 +327,10 @@ def _packed_chunk_to_dict(chunk: PackedChunk) -> dict:
         "right_split_speech_valley": chunk.right_split_speech_valley,
         "primary_cut_candidates": _jsonable(chunk.primary_cut_candidates or []),
         "weak_cut_candidates": _jsonable(chunk.weak_cut_candidates or []),
+        "pre_asr_ptm_pooling_schema": chunk.pre_asr_ptm_pooling_schema,
+        "pre_asr_ptm_pooling_bins": chunk.pre_asr_ptm_pooling_bins,
+        "pre_asr_ptm_pooling_dim": chunk.pre_asr_ptm_pooling_dim,
+        "pre_asr_ptm_pooled_features": _jsonable(chunk.pre_asr_ptm_pooled_features or []),
         "speech_segments": _segments_to_payload(chunk.speech_segments),
     }
 
@@ -427,6 +431,20 @@ def _packed_chunk_from_dict(item: Any) -> PackedChunk:
         ),
         primary_cut_candidates=_cut_candidates_from_payload(item.get("primary_cut_candidates")),
         weak_cut_candidates=_cut_candidates_from_payload(item.get("weak_cut_candidates")),
+        pre_asr_ptm_pooling_schema=str(item.get("pre_asr_ptm_pooling_schema") or ""),
+        pre_asr_ptm_pooling_bins=(
+            None
+            if item.get("pre_asr_ptm_pooling_bins") is None
+            else int(item.get("pre_asr_ptm_pooling_bins"))
+        ),
+        pre_asr_ptm_pooling_dim=(
+            None
+            if item.get("pre_asr_ptm_pooling_dim") is None
+            else int(item.get("pre_asr_ptm_pooling_dim"))
+        ),
+        pre_asr_ptm_pooled_features=_float_list_from_payload(
+            item.get("pre_asr_ptm_pooled_features")
+        ),
     )
 
 
@@ -536,3 +554,16 @@ def _cut_candidates_from_payload(value: Any) -> list[dict[str, Any]]:
             candidate["downgraded_from"] = str(item.get("downgraded_from") or "")
         candidates.append(candidate)
     return candidates
+
+
+def _float_list_from_payload(value: Any) -> list[float]:
+    if not isinstance(value, list):
+        return []
+    out: list[float] = []
+    for item in value:
+        try:
+            parsed = float(item)
+        except (TypeError, ValueError):
+            continue
+        out.append(parsed)
+    return out

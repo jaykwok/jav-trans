@@ -174,18 +174,44 @@ def _pre_asr_numeric_matrix(rows: list[Mapping[str, Any]]) -> tuple[list[list[fl
         }
     matrix: list[list[float]] = []
     rows_with_features = 0
+    rows_with_ptm_pooling = 0
+    ptm_pooling_dim = 0
     for row in rows:
         features = row.get("features")
         if isinstance(features, Mapping):
             rows_with_features += 1
         else:
             features = {}
-        matrix.append([_safe_float(features.get(name)) for name in names])
+        pooled = _numeric_vector(row.get("pre_asr_ptm_pooled_features"))
+        pooled_by_name: dict[str, float] = {}
+        if pooled:
+            missing_names = [name for name in names if name not in features]
+            if len(missing_names) == len(pooled):
+                pooled_by_name = {
+                    name: float(value)
+                    for name, value in zip(missing_names, pooled)
+                }
+                rows_with_ptm_pooling += 1
+                ptm_pooling_dim = max(ptm_pooling_dim, len(pooled))
+        matrix.append([
+            _safe_float(
+                features.get(name)
+                if name in features
+                else pooled_by_name.get(name)
+            )
+            for name in names
+        ])
     return matrix, {
         "available": True,
-        "source": "features",
+        "source": (
+            "features+pre_asr_ptm_pooled_features"
+            if rows_with_ptm_pooling
+            else "features"
+        ),
         "feature_names": names,
         "rows_with_features": rows_with_features,
+        "rows_with_ptm_pooling": rows_with_ptm_pooling,
+        "ptm_pooling_dim": ptm_pooling_dim,
         "total_dim": len(names),
     }
 

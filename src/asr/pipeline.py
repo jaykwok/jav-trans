@@ -12,6 +12,8 @@ import numpy as np
 from audio.chunk_packer import PackedChunk, pack_speech_segments
 from boundary import cache as _boundary_cache_module
 from boundary.sequence_features import (
+    CHUNK_POOLED_PTM_SCHEMA,
+    DEFAULT_CHUNK_POOLED_PTM_BINS,
     FRAME_SEQUENCE_FRAMES_SCHEMA,
     FrameSequenceFeatureConfig,
     FrameSequenceFeatureProvider,
@@ -479,6 +481,10 @@ def _build_processing_spans(
         split_scores=split_boundary_frame_scores,
         frame_hop_s=float(score_frame_hop_s or cfg["feature_frame_hop_s"]),
     )
+    packed = _annotate_pre_asr_ptm_pooling_on_packed_chunks(
+        packed,
+        sequence_feature_provider=sequence_feature_provider,
+    )
     event = _boundary_cache_module.save_processing_spans(
         audio_path,
         boundary_signature=boundary_signature,
@@ -523,7 +529,11 @@ def _pre_asr_candidates_for_spans(
     audio_id = _pre_asr_audio_id(audio_path)
     candidates: list[dict] = []
     for index in range(len(spans)):
-        candidate = _pre_asr_cueqc_module.candidate_from_span(spans, index)
+        candidate = _pre_asr_cueqc_module.candidate_from_span(
+            spans,
+            index,
+            require_ptm_pooling=_pre_asr_cueqc_module.enabled(),
+        )
         chunk_index = int(candidate.get("index", index))
         start = float(candidate.get("start", 0.0))
         end = float(candidate.get("end", start))
@@ -624,6 +634,35 @@ def _annotate_scorer_stats_on_packed_chunks(
     return annotated
 
 
+def _annotate_pre_asr_ptm_pooling_on_packed_chunks(
+    spans: list[tuple[float, float]] | list[PackedChunk],
+    *,
+    sequence_feature_provider: FrameSequenceFeatureProvider,
+) -> list[tuple[float, float]] | list[PackedChunk]:
+    if not spans or not all(isinstance(span, PackedChunk) for span in spans):
+        return spans
+    feature_names = sequence_feature_provider.chunk_pooled_ptm_feature_names(
+        bins=DEFAULT_CHUNK_POOLED_PTM_BINS
+    )
+    annotated: list[PackedChunk] = []
+    for span in spans:
+        values = sequence_feature_provider.chunk_pooled_ptm_features(
+            start_s=span.start,
+            end_s=span.end,
+            bins=DEFAULT_CHUNK_POOLED_PTM_BINS,
+        )
+        annotated.append(
+            replace(
+                span,
+                pre_asr_ptm_pooling_schema=CHUNK_POOLED_PTM_SCHEMA,
+                pre_asr_ptm_pooling_bins=DEFAULT_CHUNK_POOLED_PTM_BINS,
+                pre_asr_ptm_pooling_dim=len(feature_names),
+                pre_asr_ptm_pooled_features=values,
+            )
+        )
+    return annotated
+
+
 def _apply_pre_asr_cueqc(
     spans: list[tuple[float, float]] | list[PackedChunk],
     *,
@@ -654,7 +693,11 @@ def _apply_pre_asr_cueqc(
     started = time.perf_counter()
     model = _pre_asr_cueqc_module.load_active(expected_asr_repo_id=ASR_BACKEND)
     candidates = candidates or [
-        _pre_asr_cueqc_module.candidate_from_span(spans, index)
+        _pre_asr_cueqc_module.candidate_from_span(
+            spans,
+            index,
+            require_ptm_pooling=True,
+        )
         for index in range(len(spans))
     ]
     _progress(
@@ -869,6 +912,10 @@ def _annotate_packed_chunks(
         chunk["weak_cut_candidates"] = _normalize_cut_candidates(
             packed.weak_cut_candidates
         )
+        chunk["pre_asr_ptm_pooling_schema"] = packed.pre_asr_ptm_pooling_schema
+        chunk["pre_asr_ptm_pooling_bins"] = packed.pre_asr_ptm_pooling_bins
+        chunk["pre_asr_ptm_pooling_dim"] = packed.pre_asr_ptm_pooling_dim
+        chunk["pre_asr_ptm_pooled_features"] = list(packed.pre_asr_ptm_pooled_features or [])
         log.append(
             "[chunk] idx={idx} dur={duration:.1f} speech_segment_count={count} "
             "reason={reason} "
