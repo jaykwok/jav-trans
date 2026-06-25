@@ -6,7 +6,7 @@ from boundary.refiner import (
     LEARNED_REFINER_SCHEMA,
     DEFAULT_REFINER_CHECKPOINT_PATH,
     build_learned_refiner_checkpoint,
-    load_edge_sequence_refiner_v6_checkpoint,
+    load_edge_sequence_refiner_v7_checkpoint,
 )
 from boundary.sequence_features import (
     FRAME_SEQUENCE_FEATURE_SCHEMA,
@@ -56,20 +56,20 @@ def _frame_sequence_checkpoint(model, feature_names: tuple[str, ...]) -> dict:
     )
 
 
-def test_load_edge_sequence_refiner_v6_loads_canonical_checkpoint_when_present():
+def test_load_edge_sequence_refiner_v7_loads_canonical_checkpoint_when_present():
     pytest.importorskip("torch")
     transformers = pytest.importorskip("transformers")
     if not hasattr(transformers, "Mamba2Model"):
         pytest.skip("transformers.Mamba2Model is unavailable")
 
     if not DEFAULT_REFINER_CHECKPOINT_PATH.exists():
-        pytest.skip("default Boundary Refiner v6 checkpoint has not been trained yet")
+        pytest.skip("default Boundary Refiner v7 checkpoint has not been trained yet")
     import torch
     payload = torch.load(DEFAULT_REFINER_CHECKPOINT_PATH, map_location="cpu", weights_only=False)
     if payload.get("schema") != LEARNED_REFINER_SCHEMA:
-        pytest.skip("default checkpoint has not been replaced with v6 yet")
+        pytest.skip("default checkpoint has not been replaced with v7 yet")
 
-    refiner = load_edge_sequence_refiner_v6_checkpoint(
+    refiner = load_edge_sequence_refiner_v7_checkpoint(
         DEFAULT_REFINER_CHECKPOINT_PATH,
         backbone_override="transformers.Mamba2Model",
     )
@@ -78,7 +78,7 @@ def test_load_edge_sequence_refiner_v6_loads_canonical_checkpoint_when_present()
     assert refiner.signature()["metadata"]["runtime_adapter"] == "edge_sequence_v1"
 
 
-def test_load_edge_sequence_refiner_v6_rejects_non_mamba2_backbone(tmp_path):
+def test_load_edge_sequence_refiner_v7_rejects_non_mamba2_backbone(tmp_path):
     torch = pytest.importorskip("torch")
     feature_names = ("left_ptm_mean_000", "gap_ptm_mean_000", "right_ptm_mean_000")
     model = _tiny_sequence_classifier(feature_names)
@@ -86,10 +86,10 @@ def test_load_edge_sequence_refiner_v6_rejects_non_mamba2_backbone(tmp_path):
     torch.save(_frame_sequence_checkpoint(model, feature_names), checkpoint_path)
 
     with pytest.raises(ValueError, match="only transformers\\.Mamba2Model"):
-        load_edge_sequence_refiner_v6_checkpoint(checkpoint_path, backbone_override="tcn")
+        load_edge_sequence_refiner_v7_checkpoint(checkpoint_path, backbone_override="tcn")
 
 
-def test_load_edge_sequence_refiner_v6_rejects_mamba2_alias(tmp_path):
+def test_load_edge_sequence_refiner_v7_rejects_mamba2_alias(tmp_path):
     torch = pytest.importorskip("torch")
     feature_names = ("left_ptm_mean_000", "gap_ptm_mean_000", "right_ptm_mean_000")
     model = _tiny_sequence_classifier(feature_names)
@@ -97,10 +97,10 @@ def test_load_edge_sequence_refiner_v6_rejects_mamba2_alias(tmp_path):
     torch.save(_frame_sequence_checkpoint(model, feature_names), checkpoint_path)
 
     with pytest.raises(ValueError, match="only transformers\\.Mamba2Model"):
-        load_edge_sequence_refiner_v6_checkpoint(checkpoint_path, backbone_override="mamba2")
+        load_edge_sequence_refiner_v7_checkpoint(checkpoint_path, backbone_override="mamba2")
 
 
-def test_load_edge_sequence_refiner_v6_rejects_torch_mamba2_alias(tmp_path):
+def test_load_edge_sequence_refiner_v7_rejects_torch_mamba2_alias(tmp_path):
     torch = pytest.importorskip("torch")
     feature_names = ("left_ptm_mean_000", "gap_ptm_mean_000", "right_ptm_mean_000")
     model = _tiny_sequence_classifier(feature_names)
@@ -108,7 +108,7 @@ def test_load_edge_sequence_refiner_v6_rejects_torch_mamba2_alias(tmp_path):
     torch.save(_frame_sequence_checkpoint(model, feature_names), checkpoint_path)
 
     with pytest.raises(ValueError, match="only transformers\\.Mamba2Model"):
-        load_edge_sequence_refiner_v6_checkpoint(
+        load_edge_sequence_refiner_v7_checkpoint(
             checkpoint_path,
             backbone_override="torch_mamba2",
         )
@@ -156,7 +156,7 @@ def test_tiny_mamba2_backbone_validates_head_shape():
         )
 
 
-def test_edge_sequence_refiner_v6_checkpoint_round_trip(tmp_path):
+def test_edge_sequence_refiner_v7_checkpoint_round_trip(tmp_path):
     torch = pytest.importorskip("torch")
     pytest.importorskip("transformers")
     try:
@@ -198,14 +198,14 @@ def test_edge_sequence_refiner_v6_checkpoint_round_trip(tmp_path):
     checkpoint_path = tmp_path / "frame-sequence-refiner.pt"
     torch.save(checkpoint, checkpoint_path)
 
-    refiner = load_edge_sequence_refiner_v6_checkpoint(
+    refiner = load_edge_sequence_refiner_v7_checkpoint(
         str(checkpoint_path),
         backbone_override="transformers.Mamba2Model",
     )
     decisions = refiner.decide_sequence([[0.0, 0.1, 0.2], [0.2, 0.1, 0.0]])
 
     assert len(decisions) == 2
-    assert all(decision.source == "edge_sequence_refiner_v6" for decision in decisions)
+    assert all(decision.source == "edge_sequence_refiner_v7" for decision in decisions)
     assert all(decision.start_refine_delta_s is not None for decision in decisions)
     assert all(decision.end_refine_delta_s is not None for decision in decisions)
     assert refiner.signature()["runtime_adapter"] == "edge_sequence_v1"
@@ -251,7 +251,7 @@ def test_frame_sequence_feature_provider_caches_frame_arrays(monkeypatch):
     assert calls == ["ptm", "mfcc"]
 
 
-def test_edge_sequence_refiner_v6_rejects_missing_feature_schema(tmp_path):
+def test_edge_sequence_refiner_v7_rejects_missing_feature_schema(tmp_path):
     torch = pytest.importorskip("torch")
     pytest.importorskip("transformers")
     try:
@@ -279,13 +279,13 @@ def test_edge_sequence_refiner_v6_rejects_missing_feature_schema(tmp_path):
     torch.save(checkpoint, checkpoint_path)
 
     with pytest.raises(ValueError, match="metadata\\.feature_schema"):
-        load_edge_sequence_refiner_v6_checkpoint(
+        load_edge_sequence_refiner_v7_checkpoint(
             checkpoint_path,
             backbone_override="transformers.Mamba2Model",
         )
 
 
-def test_edge_sequence_refiner_v6_rejects_mismatched_top_level_feature_metadata(tmp_path):
+def test_edge_sequence_refiner_v7_rejects_mismatched_top_level_feature_metadata(tmp_path):
     torch = pytest.importorskip("torch")
     pytest.importorskip("transformers")
     try:
@@ -310,7 +310,7 @@ def test_edge_sequence_refiner_v6_rejects_mismatched_top_level_feature_metadata(
     torch.save(checkpoint, checkpoint_path)
 
     with pytest.raises(ValueError, match="top-level feature_schema_hash"):
-        load_edge_sequence_refiner_v6_checkpoint(
+        load_edge_sequence_refiner_v7_checkpoint(
             checkpoint_path,
             backbone_override="transformers.Mamba2Model",
         )

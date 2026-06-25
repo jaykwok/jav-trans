@@ -35,8 +35,8 @@ from boundary.sequence_features import (
     validate_sequence_features,
 )
 
-DATASET_SCHEMA = "boundary_edge_refiner_dataset_v6"
-DATASET_SOURCE = "scorer_v6_predicted_island_edges"
+DATASET_SCHEMA = "boundary_edge_refiner_dataset_v7"
+DATASET_SOURCE = "scorer_v7_predicted_island_edges"
 
 
 @dataclass(frozen=True)
@@ -722,7 +722,7 @@ def _resolve_feature_path(row: Mapping[str, Any], manifest_path: Path) -> Path:
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Build scorer-driven edge-only sequence rows for Boundary Refiner v6."
+        description="Build scorer-driven edge-only sequence rows for Boundary Refiner v7."
     )
     parser.add_argument("--labels", action="append", required=True)
     parser.add_argument("--feature-manifest", action="append", required=True)

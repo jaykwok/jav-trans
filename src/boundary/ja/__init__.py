@@ -55,6 +55,7 @@ from boundary.ja.manifest import (
     write_training_manifest,
 )
 from boundary.ja.model import (
+    MAMBA2_FRAME_SCORER_MODEL_ARCH,
     MAMBA2_FRAME_SCORER_OUTPUT_DIM,
     MAMBA2_FRAME_SCORER_SCHEMA,
     Mamba2FrameScorerBundle,
@@ -83,7 +84,7 @@ from boundary.ja.train import (
     supervised_segments_for_record,
     metrics_from_frame_counts,
     resize_binary_frames,
-    scorer_v6_targets_from_record,
+    scorer_v7_targets_from_record,
     shuffled_window_order,
     train_feature_frame_scorer,
     train_tiny_frame_classifier,
@@ -123,6 +124,7 @@ __all__ = [
     "FeatureScorerTrainConfig",
     "FeatureScorerTrainMetrics",
     "MAMBA2_FRAME_SCORER_OUTPUT_DIM",
+    "MAMBA2_FRAME_SCORER_MODEL_ARCH",
     "MAMBA2_FRAME_SCORER_SCHEMA",
     "Mamba2FrameScorerBundle",
     "build_feature_frame_scorer_model",
@@ -153,7 +155,7 @@ __all__ = [
     "resize_feature_frames",
     "resolve_audio_path",
     "sample_hf_audio_16k_mono",
-    "scorer_v6_targets_from_record",
+    "scorer_v7_targets_from_record",
     "segments_to_frame_labels",
     "stable_hf_audio_id",
     "supervised_segments_for_record",

@@ -18,10 +18,10 @@ from boundary.sequence_features import (
     validate_sequence_features,
 )
 
-LEARNED_REFINER_SCHEMA = "boundary_edge_refiner_v6"
+LEARNED_REFINER_SCHEMA = "boundary_edge_refiner_v7"
 EDGE_SEQUENCE_RUNTIME_ADAPTER = "edge_sequence_v1"
 DEFAULT_REFINER_CHECKPOINT_PATH = Path(
-    "src/boundary/checkpoints/boundary_edge_refiner_v6.jaykwok-Qwen3-ASR-1.7B-JA-Anime-Galgame.pt"
+    "src/boundary/checkpoints/boundary_edge_refiner_v7.jaykwok-Qwen3-ASR-1.7B-JA-Anime-Galgame.pt"
 )
 BOUNDARY_REFINER_OUTPUT_DIM = 2
 DEFAULT_BOUNDARY_DELTA_MAX_S = 0.5
@@ -96,17 +96,17 @@ class EdgeSequenceBoundaryRefiner:
         runtime_adapter = str(learned.metadata.get("runtime_adapter") or "")
         if runtime_adapter != EDGE_SEQUENCE_RUNTIME_ADAPTER:
             raise ValueError(
-                "Boundary Refiner v6 checkpoint metadata.runtime_adapter must be "
+                "Boundary Refiner v7 checkpoint metadata.runtime_adapter must be "
                 f"{EDGE_SEQUENCE_RUNTIME_ADAPTER!r}"
             )
         feature_schema = str(learned.metadata.get("feature_schema") or "")
         if feature_schema != FRAME_SEQUENCE_FEATURE_SCHEMA:
             raise ValueError(
-                "Boundary Refiner v6 checkpoint metadata.feature_schema must be "
+                "Boundary Refiner v7 checkpoint metadata.feature_schema must be "
                 f"{FRAME_SEQUENCE_FEATURE_SCHEMA!r}"
             )
         if not str(learned.metadata.get("feature_schema_hash") or ""):
-            raise ValueError("Boundary Refiner v6 checkpoint missing feature_schema_hash")
+            raise ValueError("Boundary Refiner v7 checkpoint missing feature_schema_hash")
         self.learned = learned
 
     def signature(self) -> dict:
@@ -150,7 +150,7 @@ class EdgeSequenceBoundaryRefiner:
             )
             decisions.append(
                 BoundaryDecision(
-                    source="edge_sequence_refiner_v6",
+                    source="edge_sequence_refiner_v7",
                     start_refine_delta_s=start_delta_s,
                     end_refine_delta_s=end_delta_s,
                 )
@@ -177,7 +177,7 @@ def load_learned_refiner_checkpoint(
         )
     feature_names = tuple(str(name) for name in payload.get("feature_names") or ())
     if not feature_names:
-        raise ValueError("Boundary Refiner v6 checkpoint missing feature_names")
+        raise ValueError("Boundary Refiner v7 checkpoint missing feature_names")
     model_config = dict(payload.get("model_config") or {})
     backbone = normalize_boundary_backbone(
         backbone_override
@@ -193,7 +193,7 @@ def load_learned_refiner_checkpoint(
     if int(model_config["input_dim"]) != len(feature_names):
         raise ValueError("checkpoint input_dim does not match feature_names length")
     if int(model_config.get("output_dim", 0)) != BOUNDARY_REFINER_OUTPUT_DIM:
-        raise ValueError("Boundary Refiner v6 checkpoints must use output_dim=2")
+        raise ValueError("Boundary Refiner v7 checkpoints must use output_dim=2")
     model = BoundarySequenceClassifier(**model_config)
     state_dict = payload.get("state_dict")
     if not isinstance(state_dict, dict):
@@ -221,7 +221,7 @@ def load_learned_refiner_checkpoint(
     )
 
 
-def load_edge_sequence_refiner_v6_checkpoint(
+def load_edge_sequence_refiner_v7_checkpoint(
     checkpoint_path: str | Path,
     *,
     backbone_override: str | None = None,
@@ -267,12 +267,12 @@ def build_learned_refiner_checkpoint(
     config["backbone"] = model.backbone_name
     config["output_dim"] = getattr(model, "output_dim", BOUNDARY_REFINER_OUTPUT_DIM)
     if int(config["output_dim"]) != BOUNDARY_REFINER_OUTPUT_DIM:
-        raise ValueError("Boundary Refiner v6 checkpoints require output_dim=2")
+        raise ValueError("Boundary Refiner v7 checkpoints require output_dim=2")
     metadata_dict = dict(metadata or {})
     metadata_dict.setdefault("runtime_adapter", EDGE_SEQUENCE_RUNTIME_ADAPTER)
     if metadata_dict.get("runtime_adapter") != EDGE_SEQUENCE_RUNTIME_ADAPTER:
         raise ValueError(
-            "Boundary Refiner v6 metadata.runtime_adapter must be "
+            "Boundary Refiner v7 metadata.runtime_adapter must be "
             f"{EDGE_SEQUENCE_RUNTIME_ADAPTER!r}"
         )
     payload = {

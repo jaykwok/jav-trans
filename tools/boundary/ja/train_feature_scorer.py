@@ -39,8 +39,8 @@ def _checkpoint_name(rows: list[dict[str, Any]], explicit: str = "") -> str:
         return explicit.strip()
     ptm = str(rows[0].get("ptm") or "").strip() if rows else ""
     if not ptm:
-        return "speech_boundary_ja_frame_boundary_scorer_v6.pt"
-    return f"speech_boundary_ja_frame_boundary_scorer_v6.{qwen_asr_repo_tag(ptm)}.pt"
+        return "speech_boundary_ja_frame_boundary_scorer_v7.pt"
+    return f"speech_boundary_ja_frame_boundary_scorer_v7.{qwen_asr_repo_tag(ptm)}.pt"
 
 
 def run(args: argparse.Namespace) -> None:
@@ -63,8 +63,10 @@ def run(args: argparse.Namespace) -> None:
             state_size=args.state_size,
             num_heads=args.num_heads,
             n_groups=args.n_groups,
+            conv_kernel=args.conv_kernel,
             chunk_size=args.chunk_size,
             bidirectional=not args.unidirectional,
+            split_adapter_kernel_size=args.split_adapter_kernel_size,
             positive_weight=args.positive_weight,
             negative_weight=args.negative_weight,
             split_positive_weight=args.split_positive_weight,
@@ -91,7 +93,7 @@ def run(args: argparse.Namespace) -> None:
     summary_path.write_text(
         json.dumps(
             {
-                "schema": "speech_boundary_ja_mamba2_frame_boundary_scorer_train_summary_v6",
+                "schema": "speech_boundary_ja_mamba2_frame_boundary_scorer_train_summary_v7",
                 "labels": str(labels_path),
                 "feature_manifest": str(feature_manifest_path),
                 "metrics": asdict(metrics),
@@ -115,7 +117,7 @@ def run(args: argparse.Namespace) -> None:
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Train a runtime-loadable SpeechBoundary-JA Mamba2 speech/split frame boundary scorer v6."
+        description="Train a runtime-loadable SpeechBoundary-JA Mamba2 speech/split frame boundary scorer v7."
     )
     parser.add_argument("--labels", required=True, help="SpeechBoundary-JA label JSONL.")
     parser.add_argument("--feature-manifest", required=True, help="Feature cache manifest JSONL.")
@@ -134,14 +136,16 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--state-size", type=int, default=32)
     parser.add_argument("--num-heads", type=int, default=4)
     parser.add_argument("--n-groups", type=int, default=2)
+    parser.add_argument("--conv-kernel", type=int, default=4)
     parser.add_argument("--chunk-size", type=int, default=8)
+    parser.add_argument("--split-adapter-kernel-size", type=int, default=5)
     parser.add_argument("--unidirectional", action="store_true")
     parser.add_argument("--positive-weight", type=float, default=1.0)
     parser.add_argument("--negative-weight", type=float, default=15.0)
-    parser.add_argument("--split-positive-weight", type=float, default=4.0)
+    parser.add_argument("--split-positive-weight", type=float, default=3.0)
     parser.add_argument("--split-negative-weight", type=float, default=1.0)
     parser.add_argument("--split-loss-weight", type=float, default=1.0)
-    parser.add_argument("--split-tversky-loss-weight", type=float, default=0.35)
+    parser.add_argument("--split-tversky-loss-weight", type=float, default=0.0)
     parser.add_argument("--split-tversky-alpha", type=float, default=0.35)
     parser.add_argument("--split-tversky-beta", type=float, default=0.65)
     parser.add_argument("--split-target-mode", choices=["hard", "gaussian"], default="gaussian")
@@ -168,8 +172,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         parser.error("--num-heads must be positive")
     if args.n_groups <= 0:
         parser.error("--n-groups must be positive")
+    if args.conv_kernel <= 0:
+        parser.error("--conv-kernel must be positive")
     if args.chunk_size <= 0:
         parser.error("--chunk-size must be positive")
+    if args.split_adapter_kernel_size <= 0 or args.split_adapter_kernel_size % 2 == 0:
+        parser.error("--split-adapter-kernel-size must be a positive odd integer")
     if args.positive_weight <= 0.0:
         parser.error("--positive-weight must be positive")
     if args.negative_weight <= 0.0:

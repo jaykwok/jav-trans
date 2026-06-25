@@ -116,7 +116,7 @@ Web 提交是否使用 CUDA 取决于后端服务进程是否能看到 GPU，而
   -> Shared Qwen feature extraction
      - Qwen ASR repo 对应的 frozen PTM/encoder frame features
      - MFCC / timing numeric features
-  -> SpeechBoundary-JA Scorer v6
+  -> SpeechBoundary-JA Scorer v7
      - dense frame speech_prob
      - dense frame split_boundary_prob
   -> Scorer decoder
@@ -124,11 +124,11 @@ Web 提交是否使用 CUDA 取决于后端服务进程是否能看到 GPU，而
      - topographic split peak / acoustic valley 生成 primary_cut_candidates
      - weak_cut_candidates 作为字幕布局和审计时间锚点
      - micro chunk resolver 合并过短且证据较弱的 split
-  -> Boundary Refiner v6
+  -> Boundary Refiner v7
      - 只修 start/end edge delta
      - 不新增 chunk、不合并 chunk、不做 drop
   -> chunk packing / boundary-cache
-  -> 可选 Pre-ASR CueQC v7
+  -> 可选 Pre-ASR CueQC v8
      - keep_for_asr / drop_before_asr
      - 复用 chunk-level pooled Qwen PTM features
      - drop 的 chunk 不导出 wav、不进入 ASR
@@ -169,19 +169,19 @@ Web 提交是否使用 CUDA 取决于后端服务进程是否能看到 GPU，而
 
 同一个 ASR repo id 也决定 SpeechBoundary-JA frozen feature 的来源，以及三个本地 checkpoint 的 registry key。checkpoint 文件名只是人工可读 tag，真正归属以 metadata 中的 repo id / schema / feature hash 为准。
 
-### SpeechBoundary-JA Scorer v6
+### SpeechBoundary-JA Scorer v7
 
 | 项 | 内容 |
 | --- | --- |
-| Schema | `speech_boundary_ja_mamba2_frame_boundary_scorer_v6` |
+| Schema | `speech_boundary_ja_mamba2_frame_boundary_scorer_v7` |
 | Model type | `mamba2_frame_boundary_scorer` |
-| Backbone | `BoundarySequenceClassifier` + `transformers.Mamba2Model` wrapper |
-| Input | Qwen PTM/encoder frame features + MFCC / timing frame features |
+| Architecture | dual-branch-diff：speech/split 独立 projection + 独立 Bi-Mamba2；split 分支带 local conv adapter 和 temporal diff feature |
+| Input | Qwen PTM/encoder frame features + MFCC frame features |
 | Output dim | `2` |
 | Output heads | `speech_prob`, `split_boundary_prob` |
-| Decoder contract | `topographic_split_micro_resolver_v4` |
-| Split training target | Gaussian boundary heatmap |
-| Split loss | BCE/focal + Tversky overlap loss |
+| Decoder contract | `topographic_split_micro_resolver_v5` |
+| Split training target | hard split core baseline；后续可切 core + ignore collar |
+| Split loss | weighted focal BCE；Tversky 只作为后续 precision-first 实验项 |
 
 `speech_prob` 负责找 speech frames；`split_boundary_prob` 负责找应切开的 acoustic boundary。Scorer 不做 keep/drop，也不承担字幕显示时长规则。
 
@@ -190,11 +190,11 @@ Decoder 会输出两类 acoustic cut：
 - `primary_cut_candidates`：高可信切点，用于 ASR chunk split。
 - `weak_cut_candidates`：弱证据切点，包含 `time_s/frame/score/prominence/speech_valley/strength`，透传到 chunk metadata、boundary cache、ASR chunk metadata 和字幕 layout。
 
-### Boundary Refiner v6
+### Boundary Refiner v7
 
 | 项 | 内容 |
 | --- | --- |
-| Schema | `boundary_edge_refiner_v6` |
+| Schema | `boundary_edge_refiner_v7` |
 | Runtime adapter | `edge_sequence_v1` |
 | Backbone | `BoundarySequenceClassifier` + `transformers.Mamba2Model` wrapper |
 | Input | scorer 产出的 island edge 上下文特征；包含 left/right/gap 的 PTM/MFCC/timing 统计 |
@@ -204,12 +204,12 @@ Decoder 会输出两类 acoustic cut：
 
 Boundary Refiner 只修 chunk 两端。它不学习中间切点、不新增 chunk、不合并 chunk、不做删除路由，也不学习 ASR padding/context budget。
 
-### Pre-ASR CueQC v7
+### Pre-ASR CueQC v8
 
 | 项 | 内容 |
 | --- | --- |
-| Schema | `cueqc_pre_asr_mamba_v7_binary` |
-| Feature schema | `pre_asr_cueqc_features_v3` |
+| Schema | `cueqc_pre_asr_mamba_v8_binary` |
+| Feature schema | `pre_asr_cueqc_features_v4` |
 | Runtime position | Boundary Refiner 后、wav chunk export 前 |
 | Architecture | `Linear(input_dim, hidden_size) -> GELU -> Linear(hidden_size, 2)` |
 | Output | `keep_for_asr`, `drop_before_asr` |
@@ -217,7 +217,7 @@ Boundary Refiner 只修 chunk 两端。它不学习中间切点、不新增 chun
 
 Pre-ASR CueQC 只看 ASR 前特征：duration、speech segment count、internal gap、refiner delta、scorer speech/split 分布、邻接 gap、micro chunk evidence，以及从共享 Qwen PTM/encoder frame features 池化得到的 chunk-level embedding。它禁止使用 ASR text、raw text、token trace、decoder stats、ASR confidence 和 subtitle timing。
 
-v7 需要用 current scorer/refiner workflow 重新导出候选并训练，不复用 v6 checkpoint。默认仍关闭；开启前应先跑 no-translate workflow smoke / audit，确认 false-drop 风险可接受。
+v8 需要用 Scorer v7 + Boundary Refiner v7 workflow 重新导出候选并训练，不复用旧 checkpoint。默认仍关闭；开启前应先跑 no-translate workflow smoke / audit，确认 false-drop 风险可接受。
 
 ### ASR-after CueQC shadow
 
@@ -390,7 +390,7 @@ uv run python -m <module> --help
 - `tools.audits.audit_nav`、`tools.audits.serve_static`、`tools.audits.serve_audits.ps1`、`tools.audits.serve_audits.sh`：维护和启动本地审计导航页。
 - `tools.audits.generate_cueqc_cluster_audit_html`：生成音频审计页，支持 chunk/context 播放、筛选排序和字幕对照。
 - `tools.audits.generate_cueqc_cluster_broadcast_html`：生成独立簇级 keep/drop 广播标注页；混簇/跳过只记录 abstain。
-- `tools.asr.cueqc.export_pre_asr_v7_audit_candidates`：从 current workflow `.timings.json` 导出 Pre-ASR CueQC v7 审计候选。
+- `tools.asr.cueqc.export_pre_asr_v8_audit_candidates`：从 current workflow `.timings.json` 导出 Pre-ASR CueQC v8 审计候选。
 
 命令行完整工作流 smoke：
 

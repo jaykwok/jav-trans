@@ -19,6 +19,7 @@ from boundary.ja.features import load_cached_feature
 from boundary.ja.manifest import TrainingExample
 from boundary.ja.model import (
     MAMBA2_FRAME_SCORER_OUTPUT_DIM,
+    MAMBA2_FRAME_SCORER_MODEL_ARCH,
     MAMBA2_FRAME_SCORER_SCHEMA,
     build_feature_frame_scorer_model,
     TinyFrameClassifier,
@@ -71,14 +72,17 @@ class FeatureScorerTrainConfig:
     state_size: int = 32
     num_heads: int = 4
     n_groups: int = 2
+    conv_kernel: int = 4
     chunk_size: int = 8
     bidirectional: bool = True
+    model_arch: str = MAMBA2_FRAME_SCORER_MODEL_ARCH
+    split_adapter_kernel_size: int = 5
     positive_weight: float = 1.0
     negative_weight: float = 15.0
-    split_positive_weight: float = 4.0
+    split_positive_weight: float = 3.0
     split_negative_weight: float = 1.0
     split_loss_weight: float = 1.0
-    split_tversky_loss_weight: float = 0.35
+    split_tversky_loss_weight: float = 0.0
     split_tversky_alpha: float = 0.35
     split_tversky_beta: float = 0.65
     split_target_mode: str = "gaussian"
@@ -210,7 +214,7 @@ def train_feature_frame_scorer(
     config: FeatureScorerTrainConfig,
     labels_path: str = "",
     feature_manifest_path: str = "",
-    checkpoint_name: str = "speech_boundary_ja_frame_boundary_scorer_v6.pt",
+    checkpoint_name: str = "speech_boundary_ja_frame_boundary_scorer_v7.pt",
 ) -> FeatureScorerTrainMetrics:
     import torch
 
@@ -218,7 +222,7 @@ def train_feature_frame_scorer(
     if not rows:
         raise ValueError("at least one feature manifest row is required")
     output_dir.mkdir(parents=True, exist_ok=True)
-    checkpoint_name = checkpoint_name.strip() or "speech_boundary_ja_frame_boundary_scorer_v6.pt"
+    checkpoint_name = checkpoint_name.strip() or "speech_boundary_ja_frame_boundary_scorer_v7.pt"
     if Path(checkpoint_name).name != checkpoint_name:
         raise ValueError("checkpoint_name must be a file name, not a path")
     checkpoint_path = output_dir / checkpoint_name
@@ -257,6 +261,12 @@ def train_feature_frame_scorer(
         raise ValueError("split_boundary_sigma_frames must be positive")
     if config.focal_gamma < 0.0:
         raise ValueError("focal_gamma must be non-negative")
+    if config.conv_kernel <= 0:
+        raise ValueError("conv_kernel must be positive")
+    if config.model_arch != MAMBA2_FRAME_SCORER_MODEL_ARCH:
+        raise ValueError(f"model_arch must be {MAMBA2_FRAME_SCORER_MODEL_ARCH!r}")
+    if config.split_adapter_kernel_size <= 0 or config.split_adapter_kernel_size % 2 == 0:
+        raise ValueError("split_adapter_kernel_size must be a positive odd integer")
 
     ptm_dim = int(rows[0]["ptm_dim"])
     mfcc_dim = int(rows[0]["mfcc_dim"])
@@ -385,7 +395,7 @@ def train_feature_frame_scorer(
             model_config=model_config,
             normalization=normalization,
             metadata={
-                "operating_point": "qwen-mamba2-frame-boundary-scorer-v6-native",
+                "operating_point": "qwen-mamba2-frame-boundary-scorer-v7-native",
                 "ptm_repo_id": ptm_repo_id,
                 "labels": labels_path,
                 "feature_manifest": feature_manifest_path,
@@ -397,6 +407,7 @@ def train_feature_frame_scorer(
                 "train_windows": len(train_rows),
                 "eval_windows": len(eval_rows),
                 "trained_steps": int(config.max_steps),
+                "model_arch": str(config.model_arch),
                 "loss": {
                     "positive_weight": float(config.positive_weight),
                     "negative_weight": float(config.negative_weight),
@@ -599,8 +610,11 @@ def feature_scorer_model_config(
         "state_size": int(config.state_size),
         "num_heads": int(config.num_heads),
         "n_groups": int(config.n_groups),
+        "conv_kernel": int(config.conv_kernel),
         "chunk_size": int(config.chunk_size),
         "bidirectional": bool(config.bidirectional),
+        "model_arch": str(config.model_arch),
+        "split_adapter_kernel_size": int(config.split_adapter_kernel_size),
         "output_dim": MAMBA2_FRAME_SCORER_OUTPUT_DIM,
     }
     return model_config
@@ -998,7 +1012,7 @@ def _feature_training_arrays(
     frame_total = min(ptm.shape[0], mfcc.shape[0], len(record.speech_frames), len(base_weights))
     if frame_total <= 0:
         raise ValueError(f"feature row has no usable frames: label_index={label_index}")
-    _speech_targets, split_targets = scorer_v6_targets_from_record(
+    _speech_targets, split_targets = scorer_v7_targets_from_record(
         record,
         frame_count=frame_total,
         split_boundary_radius_frames=split_boundary_radius_frames,
@@ -1060,7 +1074,7 @@ def _head_frame_weights(
     return np.stack(columns, axis=1).astype(np.float32, copy=False)
 
 
-def scorer_v6_targets_from_record(
+def scorer_v7_targets_from_record(
     record: LabelRecord,
     *,
     frame_count: int,
@@ -1068,7 +1082,7 @@ def scorer_v6_targets_from_record(
     split_boundary_sigma_frames: float = 1.0,
     split_target_mode: str = "gaussian",
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Return Scorer v6 frame targets: speech and split-boundary heatmap."""
+    """Return Scorer v7 frame targets: speech and split-boundary heatmap."""
 
     frame_count = max(0, int(frame_count))
     speech = np.asarray(record.speech_frames[:frame_count], dtype=np.float32)

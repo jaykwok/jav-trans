@@ -8,14 +8,15 @@ from typing import Any, Sequence
 import numpy as np
 
 
-MAMBA2_FRAME_SCORER_SCHEMA = "speech_boundary_ja_mamba2_frame_boundary_scorer_v6"
+MAMBA2_FRAME_SCORER_SCHEMA = "speech_boundary_ja_mamba2_frame_boundary_scorer_v7"
 MAMBA2_FRAME_SCORER_MODEL_TYPE = "mamba2_frame_boundary_scorer"
+MAMBA2_FRAME_SCORER_MODEL_ARCH = "v7-dual-branch-diff"
 MAMBA2_FRAME_SCORER_OUTPUT_DIM = 2
 MAMBA2_FRAME_SCORER_OUTPUT_HEADS = (
     "speech_prob",
     "split_boundary_prob",
 )
-MAMBA2_FRAME_SCORER_DECODER = "topographic_split_micro_resolver_v4"
+MAMBA2_FRAME_SCORER_DECODER = "topographic_split_micro_resolver_v5"
 
 
 def count_trainable_parameters(model) -> int:
@@ -47,20 +48,28 @@ def _validate_metadata(metadata: dict[str, Any]) -> None:
 
 def build_feature_frame_scorer_model(*, schema: str, model_config: dict[str, Any]):
     if schema == MAMBA2_FRAME_SCORER_SCHEMA:
-        from boundary.backbones import TRANSFORMERS_MAMBA2_BACKBONE, BoundarySequenceClassifier
+        from boundary.backbones import TRANSFORMERS_MAMBA2_BACKBONE, DualBranchDiffBoundarySequenceClassifier
 
         for key in ("input_dim", "hidden_size", "num_layers"):
             if key not in model_config:
                 raise ValueError(f"Mamba2 scorer checkpoint missing model_config.{key}")
+        model_arch = str(model_config.get("model_arch") or "")
+        if model_arch != MAMBA2_FRAME_SCORER_MODEL_ARCH:
+            raise ValueError(
+                "Mamba2 scorer checkpoint model_config.model_arch must be "
+                f"{MAMBA2_FRAME_SCORER_MODEL_ARCH!r}; got {model_arch!r}"
+            )
         backbone_kwargs: dict[str, Any] = {
             "state_size": int(model_config.get("state_size", 32)),
             "num_heads": int(model_config.get("num_heads", 4)),
             "n_groups": int(model_config.get("n_groups", 2)),
             "chunk_size": int(model_config.get("chunk_size", 8)),
             "bidirectional": _bool_config(model_config.get("bidirectional", True)),
+            "conv_kernel": int(model_config.get("conv_kernel", 4)),
         }
         if "head_dim" in model_config:
             backbone_kwargs["head_dim"] = int(model_config["head_dim"])
+        split_adapter_kernel_size = int(model_config.get("split_adapter_kernel_size", 5))
         if "output_dim" not in model_config:
             raise ValueError("Mamba2 boundary scorer checkpoint missing model_config.output_dim")
         output_dim = int(model_config["output_dim"])
@@ -69,12 +78,14 @@ def build_feature_frame_scorer_model(*, schema: str, model_config: dict[str, Any
                 f"Mamba2 boundary scorer requires output_dim={MAMBA2_FRAME_SCORER_OUTPUT_DIM}, "
                 f"got {output_dim}"
             )
-        return BoundarySequenceClassifier(
+        return DualBranchDiffBoundarySequenceClassifier(
             input_dim=int(model_config["input_dim"]),
             backbone=str(model_config.get("backbone") or TRANSFORMERS_MAMBA2_BACKBONE),
             hidden_size=int(model_config["hidden_size"]),
             num_layers=int(model_config["num_layers"]),
             output_dim=output_dim,
+            model_arch=model_arch,
+            split_adapter_kernel_size=split_adapter_kernel_size,
             **backbone_kwargs,
         )
     raise ValueError(
@@ -145,6 +156,7 @@ class Mamba2FrameScorerBundle:
             "input_dim": self.input_dim,
         }
         for key in (
+            "model_arch",
             "hidden_size",
             "backbone",
             "num_layers",
@@ -153,8 +165,10 @@ class Mamba2FrameScorerBundle:
             "head_dim",
             "n_groups",
             "chunk_size",
+            "conv_kernel",
             "bidirectional",
             "output_dim",
+            "split_adapter_kernel_size",
         ):
             if key in self.model_config:
                 value = self.model_config[key]

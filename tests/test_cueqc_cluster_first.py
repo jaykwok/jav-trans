@@ -182,7 +182,7 @@ def test_cueqc_torque_auto_prefers_pre_asr_numeric_features():
     ):
         rows.append(
             {
-                "schema": "pre_asr_cueqc_v7_audit_candidate",
+                "schema": "pre_asr_cueqc_v8_audit_candidate",
                 "sample_id": f"preasr-sample-{index:03d}",
                 "chunk_index": index,
                 "start": float(index),

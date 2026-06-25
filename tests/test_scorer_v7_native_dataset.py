@@ -8,11 +8,11 @@ import numpy as np
 import soundfile as sf
 
 from boundary.ja import read_jsonl
-from boundary.ja.train import scorer_v6_targets_from_record, time_span_to_frame_range
-from tools.boundary.ja.build_scorer_v6_native_dataset import (
+from boundary.ja.train import scorer_v7_targets_from_record, time_span_to_frame_range
+from tools.boundary.ja.build_scorer_v7_native_dataset import (
     DATASET_SCHEMA,
     DEFAULT_MIX,
-    build_scorer_v6_native_dataset,
+    build_scorer_v7_native_dataset,
     build_positive_example,
     build_pure_negative_example,
     load_negative_rows,
@@ -74,7 +74,7 @@ def _negative_manifest(tmp_path: Path, *, rows: int = 6) -> Path:
     return manifest_path
 
 
-def test_build_scorer_v6_native_dataset_labels_speech_and_split_heatmap(tmp_path: Path):
+def test_build_scorer_v7_native_dataset_labels_speech_and_split_heatmap(tmp_path: Path):
     nsfw = _source_manifest(tmp_path, "anime_nsfw")
     sfw = _source_manifest(tmp_path, "anime_sfw")
     galgame = _source_manifest(tmp_path, "galgame")
@@ -124,7 +124,7 @@ def test_build_scorer_v6_native_dataset_labels_speech_and_split_heatmap(tmp_path
         ]
     )
 
-    summary = build_scorer_v6_native_dataset(
+    summary = build_scorer_v7_native_dataset(
         source_specs=args.source,
         negative_manifests=args.negative_manifest,
         output_dir=tmp_path / "dataset",
@@ -148,13 +148,13 @@ def test_build_scorer_v6_native_dataset_labels_speech_and_split_heatmap(tmp_path
         "touch",
     }
     assert summary["long_chain_utterance_count_min"] >= 6
-    records = read_jsonl(tmp_path / "dataset" / "scorer_v6_native_labels.jsonl")
+    records = read_jsonl(tmp_path / "dataset" / "scorer_v7_native_labels.jsonl")
     by_type: dict[str, list] = {}
     for record in records:
         by_type.setdefault(record.boundary_metadata["native_example_type"], []).append(record)
 
     pure_negative = by_type["pure_hard_negative"][0]
-    pure_speech, pure_split = scorer_v6_targets_from_record(
+    pure_speech, pure_split = scorer_v7_targets_from_record(
         pure_negative,
         frame_count=len(pure_negative.speech_frames),
         split_boundary_radius_frames=1,
@@ -163,7 +163,7 @@ def test_build_scorer_v6_native_dataset_labels_speech_and_split_heatmap(tmp_path
     assert float(np.max(pure_split)) == 0.0
 
     mixed = by_type["mixed_contrast"][0]
-    mixed_speech, _split = scorer_v6_targets_from_record(
+    mixed_speech, _split = scorer_v7_targets_from_record(
         mixed,
         frame_count=len(mixed.speech_frames),
         split_boundary_radius_frames=1,
@@ -179,7 +179,7 @@ def test_build_scorer_v6_native_dataset_labels_speech_and_split_heatmap(tmp_path
     assert float(np.min(mixed_speech[start:end])) == 1.0
 
     split_stress = by_type["split_stress"][0]
-    _speech, split_points = scorer_v6_targets_from_record(
+    _speech, split_points = scorer_v7_targets_from_record(
         split_stress,
         frame_count=len(split_stress.speech_frames),
         split_boundary_radius_frames=1,
@@ -189,7 +189,7 @@ def test_build_scorer_v6_native_dataset_labels_speech_and_split_heatmap(tmp_path
     assert float(np.min(split_points[split_points > 0.0])) < 1.0
 
     long_chain = by_type["long_speech_chain"][0]
-    long_speech, long_split = scorer_v6_targets_from_record(
+    long_speech, long_split = scorer_v7_targets_from_record(
         long_chain,
         frame_count=len(long_chain.speech_frames),
         split_boundary_radius_frames=1,
@@ -215,7 +215,7 @@ def test_build_scorer_v6_native_dataset_labels_speech_and_split_heatmap(tmp_path
                 continue
             assert seen_sources.setdefault(source_id, partition) == partition
 
-    splits = json.loads((tmp_path / "dataset" / "scorer_v6_native_splits.json").read_text(encoding="utf-8"))
+    splits = json.loads((tmp_path / "dataset" / "scorer_v7_native_splits.json").read_text(encoding="utf-8"))
     assert sorted(index for rows in splits.values() for index in rows) == list(range(len(records)))
 
 
@@ -292,7 +292,7 @@ def test_audited_low_info_vocalization_manifest_is_speech_negative_only(tmp_path
         np_rng=np.random.default_rng(11),
     )
 
-    speech, split_points = scorer_v6_targets_from_record(
+    speech, split_points = scorer_v7_targets_from_record(
         record,
         frame_count=len(record.speech_frames),
         split_boundary_radius_frames=1,
@@ -347,7 +347,7 @@ def test_short_positive_anchor_is_not_marked_drop_by_duration(tmp_path: Path):
         args=args,
         rng=random.Random(7),
     )
-    speech, split_points = scorer_v6_targets_from_record(
+    speech, split_points = scorer_v7_targets_from_record(
         record,
         frame_count=len(record.speech_frames),
         split_boundary_radius_frames=1,

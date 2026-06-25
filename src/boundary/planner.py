@@ -14,7 +14,7 @@ class BoundaryPlannerConfig:
 
     def signature(self) -> dict:
         return {
-            "planner": "edge_sequence_island_planner_v6",
+            "planner": "edge_sequence_island_planner_v7",
             "frame_hop_s": self.frame_hop_s,
             "sequence_batch_size": self.sequence_batch_size,
         }

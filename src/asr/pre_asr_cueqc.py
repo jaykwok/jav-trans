@@ -21,9 +21,9 @@ from boundary.sequence_features import (
 )
 
 
-PRE_ASR_CUEQC_SCHEMA = "cueqc_pre_asr_mamba_v7_binary"
+PRE_ASR_CUEQC_SCHEMA = "cueqc_pre_asr_mamba_v8_binary"
 PRE_ASR_CUEQC_DECISION_VERSION = "pre_asr_cueqc_binary_v1"
-PRE_ASR_CUEQC_FEATURE_SCHEMA = "pre_asr_cueqc_features_v3"
+PRE_ASR_CUEQC_FEATURE_SCHEMA = "pre_asr_cueqc_features_v4"
 PRE_ASR_CUEQC_PTM_DIM = FrameSequenceFeatureConfig().max_ptm_dims
 PRE_ASR_CUEQC_PTM_BINS = DEFAULT_CHUNK_POOLED_PTM_BINS
 PRE_ASR_CUEQC_SCALAR_FEATURE_NAMES = (
@@ -172,7 +172,7 @@ def _pooled_ptm_values(
     if available:
         return values, True, schema, parsed_bins or PRE_ASR_CUEQC_PTM_BINS, expected_dim
     if require_ptm_pooling:
-        raise ValueError("Pre-ASR CueQC v7 requires chunk-level pooled PTM features")
+        raise ValueError("Pre-ASR CueQC v8 requires chunk-level pooled PTM features")
     return [0.0] * expected_dim, False, schema, parsed_bins, parsed_dim
 
 

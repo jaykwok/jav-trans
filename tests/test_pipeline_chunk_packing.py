@@ -195,7 +195,7 @@ class _FakeSequenceRefiner:
     def decide_sequence(self, features: list[list[float]]) -> list[BoundaryDecision]:
         return [
             BoundaryDecision(
-                source="edge_sequence_refiner_v6",
+                source="edge_sequence_refiner_v7",
                 start_refine_delta_s=0.0,
                 end_refine_delta_s=0.0,
             )
@@ -203,7 +203,7 @@ class _FakeSequenceRefiner:
         ]
 
     def signature(self) -> dict:
-        return {"schema": "boundary_edge_refiner_v6", "type": "fake_sequence_refiner"}
+        return {"schema": "boundary_edge_refiner_v7", "type": "fake_sequence_refiner"}
 
 
 class _FakeSequenceFeatureProvider:
@@ -265,7 +265,7 @@ class _FakeCueQCRefiner:
 
 def _reload_pipeline(monkeypatch, tmp_path: Path, *, enable_cueqc: bool = False):
     asr_backend = "jaykwok/Qwen3-ASR-0.6B-JA-Anime-Galgame"
-    boundary_checkpoint = tmp_path / "boundary_edge_refiner_v6.jaykwok-Qwen3-ASR-0.6B-JA-Anime-Galgame.pt"
+    boundary_checkpoint = tmp_path / "boundary_edge_refiner_v7.jaykwok-Qwen3-ASR-0.6B-JA-Anime-Galgame.pt"
     boundary_checkpoint.write_bytes(b"v6")
     monkeypatch.setenv("ASR_BACKEND", asr_backend)
     monkeypatch.setenv(
@@ -296,7 +296,7 @@ def _reload_pipeline(monkeypatch, tmp_path: Path, *, enable_cueqc: bool = False)
     )
     monkeypatch.setattr(
         asr,
-        "load_edge_sequence_refiner_v6_checkpoint",
+        "load_edge_sequence_refiner_v7_checkpoint",
         lambda *_args, **_kwargs: _FakeSequenceRefiner(),
     )
     monkeypatch.setattr(
@@ -442,7 +442,7 @@ def test_packed_chunk_metadata_uses_source_span_index_after_short_chunk_drop():
         boundary_source="cut",
         boundary_start_refine_delta_s=0.04,
         boundary_end_refine_delta_s=-0.03,
-        boundary_decision_source="edge_sequence_refiner_v6",
+        boundary_decision_source="edge_sequence_refiner_v7",
         subtitle_min_duration_s=20.0 / 24.0,
         below_subtitle_min_duration=False,
         micro_chunk_candidate=True,
@@ -492,7 +492,7 @@ def test_packed_chunk_metadata_uses_source_span_index_after_short_chunk_drop():
     assert chunk_infos[0]["boundary_score"] == 0.87
     assert chunk_infos[0]["boundary_start_refine_delta_s"] == 0.04
     assert chunk_infos[0]["boundary_end_refine_delta_s"] == -0.03
-    assert chunk_infos[0]["boundary_decision_source"] == "edge_sequence_refiner_v6"
+    assert chunk_infos[0]["boundary_decision_source"] == "edge_sequence_refiner_v7"
     assert chunk_infos[0]["subtitle_min_duration_s"] == 20.0 / 24.0
     assert chunk_infos[0]["micro_chunk_candidate"] is True
     assert chunk_infos[0]["micro_resolve_action"] == "merge_micro_into_left"

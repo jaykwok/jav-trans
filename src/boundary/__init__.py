@@ -4,7 +4,10 @@ import os
 
 from boundary.backbones import (
     BoundarySequenceClassifier,
+    DualBranchDiffBoundarySequenceClassifier,
+    SplitBoundaryAdapter,
     TinyMamba2BoundaryBackbone,
+    compute_temporal_diff_features,
     normalize_boundary_backbone,
 )
 from boundary.base import SegmentationResult, SpeechBoundaryBackend, SpeechSegment
@@ -17,7 +20,7 @@ from boundary.refiner import (
     LearnedBoundaryRefiner,
     build_learned_refiner_checkpoint,
     load_learned_refiner_checkpoint,
-    load_edge_sequence_refiner_v6_checkpoint,
+    load_edge_sequence_refiner_v7_checkpoint,
 )
 from boundary.sequence_features import (
     FRAME_SEQUENCE_FEATURE_SCHEMA,
@@ -49,6 +52,7 @@ __all__ = [
     "BoundaryDecision",
     "BoundaryPlannerConfig",
     "BoundarySequenceClassifier",
+    "DualBranchDiffBoundarySequenceClassifier",
     "SegmentationResult",
     "SpeechBoundaryBackend",
     "SpeechSegment",
@@ -62,17 +66,19 @@ __all__ = [
     "LearnedBoundaryRefiner",
     "PlannedChunk",
     "PlannedIsland",
+    "SplitBoundaryAdapter",
     "TinyMamba2BoundaryBackbone",
     "build_learned_refiner_checkpoint",
     "boundary_window_sequence_features",
     "feature_extraction_hash",
     "feature_extraction_signature",
+    "compute_temporal_diff_features",
     "get_boundary_backend",
     "get_default_config",
     "get_feature_dim",
     "frame_sequence_feature_names",
     "load_learned_refiner_checkpoint",
-    "load_edge_sequence_refiner_v6_checkpoint",
+    "load_edge_sequence_refiner_v7_checkpoint",
     "normalize_boundary_backbone",
     "plan_boundary_chunks",
     "validate_sequence_features",

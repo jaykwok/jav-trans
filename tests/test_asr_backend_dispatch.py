@@ -120,7 +120,7 @@ def test_qwen_checkpoint_path_mapping_uses_repo_id_keys(monkeypatch, tmp_path):
 def test_qwen_checkpoint_path_defaults_to_registry_when_env_is_absent(monkeypatch, tmp_path):
     from asr.backends import qwen
 
-    checkpoint = tmp_path / "boundary_edge_refiner_v6.jaykwok-Qwen3-ASR-1.7B-JA-Anime-Galgame.pt"
+    checkpoint = tmp_path / "boundary_edge_refiner_v7.jaykwok-Qwen3-ASR-1.7B-JA-Anime-Galgame.pt"
     checkpoint.write_bytes(b"v6")
     monkeypatch.delenv("BOUNDARY_REFINER_MODEL_PATH_BY_REPO", raising=False)
 
@@ -130,14 +130,14 @@ def test_qwen_checkpoint_path_defaults_to_registry_when_env_is_absent(monkeypatc
         default_mapping={ASR_17B_BACKEND: str(checkpoint)},
     )
 
-    assert path.endswith("boundary_edge_refiner_v6.jaykwok-Qwen3-ASR-1.7B-JA-Anime-Galgame.pt")
+    assert path.endswith("boundary_edge_refiner_v7.jaykwok-Qwen3-ASR-1.7B-JA-Anime-Galgame.pt")
 
 
 def test_qwen_checkpoint_path_auto_uses_registered_scorer(monkeypatch, tmp_path):
     from asr.backends import qwen
 
-    checkpoint_06b = tmp_path / "speech_boundary_ja_frame_boundary_scorer_v6.jaykwok-Qwen3-ASR-0.6B-JA-Anime-Galgame.pt"
-    checkpoint_17b = tmp_path / "speech_boundary_ja_frame_boundary_scorer_v6.jaykwok-Qwen3-ASR-1.7B-JA-Anime-Galgame.pt"
+    checkpoint_06b = tmp_path / "speech_boundary_ja_frame_boundary_scorer_v7.jaykwok-Qwen3-ASR-0.6B-JA-Anime-Galgame.pt"
+    checkpoint_17b = tmp_path / "speech_boundary_ja_frame_boundary_scorer_v7.jaykwok-Qwen3-ASR-1.7B-JA-Anime-Galgame.pt"
     checkpoint_06b.write_bytes(b"v6-06b")
     checkpoint_17b.write_bytes(b"v6-17b")
     monkeypatch.setenv("SPEECH_BOUNDARY_JA_SCORER_CHECKPOINT_BY_REPO", "auto")
@@ -158,10 +158,10 @@ def test_qwen_checkpoint_path_auto_uses_registered_scorer(monkeypatch, tmp_path)
     )
 
     assert path_06b.endswith(
-        "speech_boundary_ja_frame_boundary_scorer_v6.jaykwok-Qwen3-ASR-0.6B-JA-Anime-Galgame.pt"
+        "speech_boundary_ja_frame_boundary_scorer_v7.jaykwok-Qwen3-ASR-0.6B-JA-Anime-Galgame.pt"
     )
     assert path_17b.endswith(
-        "speech_boundary_ja_frame_boundary_scorer_v6.jaykwok-Qwen3-ASR-1.7B-JA-Anime-Galgame.pt"
+        "speech_boundary_ja_frame_boundary_scorer_v7.jaykwok-Qwen3-ASR-1.7B-JA-Anime-Galgame.pt"
     )
 
 
@@ -238,4 +238,3 @@ def test_local_backend_asr_batch_size_auto_and_numeric_override(monkeypatch):
     monkeypatch.setenv("ASR_BATCH_SIZE", "7")
     reloaded = importlib.reload(local_backend)
     assert reloaded.ASR_BATCH_SIZE == 7
-
