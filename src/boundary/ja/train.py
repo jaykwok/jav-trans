@@ -945,17 +945,10 @@ def _head_frame_weights(
         return np.stack((base, base), axis=1).astype(np.float32, copy=False)
     if not isinstance(raw_weights, Mapping):
         raise ValueError("boundary_metadata.head_frame_weights must be a mapping")
-    aliases = {
-        "speech": ("speech", "speech_prob"),
-        "split_boundary": ("split_boundary", "split", "split_boundary_prob"),
-    }
+    canonical_heads = ("speech", "split_boundary")
     columns: list[np.ndarray] = []
-    for canonical, names in aliases.items():
-        raw_values = None
-        for name in names:
-            if name in raw_weights:
-                raw_values = raw_weights[name]
-                break
+    for canonical in canonical_heads:
+        raw_values = raw_weights.get(canonical)
         if raw_values is None:
             columns.append(base)
             continue

@@ -53,6 +53,10 @@ from boundary.ja.backend import (
 from boundary.ja.manifest import TrainingExample
 from boundary.ja.model import TinyFrameClassifier, load_feature_frame_scorer_checkpoint
 from boundary.ja.train import _feature_training_arrays
+from tools.boundary.ja.build_feature_cache import (
+    _combine_workflow_window_features,
+    _workflow_window_starts,
+)
 
 def _require_mamba2():
     transformers = pytest.importorskip("transformers")
@@ -226,6 +230,50 @@ def test_feature_training_arrays_support_head_specific_frame_weights(tmp_path):
     assert weights[:, 1].tolist() == [0.5] * 10
 
 
+def test_feature_training_arrays_ignore_old_head_weight_aliases(tmp_path):
+    audio_path = tmp_path / "clip.wav"
+    audio_path.write_bytes(b"RIFF")
+    cached = write_feature_cache(
+        output_dir=tmp_path / "features",
+        audio_id="clip",
+        source="unit",
+        audio_path=audio_path,
+        config=FeatureConfig(feature_dim=2),
+        bundle={
+            "ptm": np.ones((5, 4), dtype=np.float32),
+            "mfcc": np.ones((5, 2), dtype=np.float32),
+            "duration_s": 0.5,
+            "sample_rate": 16000,
+        },
+        compressed=False,
+    )
+    record = replace(
+        build_supervised_record(
+            audio_id="clip",
+            source="unit",
+            duration_s=0.5,
+            speech_segments=[TeacherSegment(0.0, 0.5)],
+            frame_hop_s=0.1,
+        ),
+        frame_weights=[1.0] * 5,
+        boundary_metadata={
+            "head_frame_weights": {
+                "speech_prob": [0.25] * 5,
+                "split": [0.25] * 5,
+                "split_boundary_prob": [0.25] * 5,
+            },
+        },
+    )
+
+    _features, _labels, weights = _feature_training_arrays(
+        row={"label_index": 0, "feature_path": cached.feature_path},
+        records=[record],
+    )
+
+    assert weights[:, 0].tolist() == [1.0] * 5
+    assert weights[:, 1].tolist() == [1.0] * 5
+
+
 def test_feature_training_arrays_reject_bad_head_weight_length(tmp_path):
     audio_path = tmp_path / "clip.wav"
     audio_path.write_bytes(b"RIFF")
@@ -319,6 +367,38 @@ def test_feature_cache_can_store_truncated_ptm_dim(tmp_path):
     assert ptm.shape == (3, 2)
     assert mfcc.shape == (3, 2)
     assert ptm.tolist() == [[0.0, 1.0], [4.0, 5.0], [8.0, 9.0]]
+
+
+def test_feature_cache_workflow_windows_average_overlap_frames():
+    config = FeatureConfig(frame_hop_s=0.02, window_s=0.06, overlap_s=0.02, ptm="unit")
+    starts = _workflow_window_starts(
+        sample_count=10,
+        sample_rate=100,
+        window_s=0.06,
+        overlap_s=0.02,
+    )
+
+    bundle = _combine_workflow_window_features(
+        windows=[
+            {"start_sample": 0, "mfcc": np.ones((3, 1), dtype=np.float32)},
+            {"start_sample": 4, "mfcc": np.ones((3, 1), dtype=np.float32) * 3.0},
+            {"start_sample": 8, "mfcc": np.ones((1, 1), dtype=np.float32) * 5.0},
+        ],
+        ptm_features=[
+            np.ones((3, 1), dtype=np.float32),
+            np.ones((3, 1), dtype=np.float32) * 3.0,
+            np.ones((1, 1), dtype=np.float32) * 5.0,
+        ],
+        duration_s=0.10,
+        sample_rate=100,
+        config=config,
+    )
+
+    assert starts == [0, 4, 8]
+    assert bundle["window_count"] == 3
+    assert bundle["feature_coverage_ratio"] == 1.0
+    assert bundle["ptm"].reshape(-1).tolist() == [1.0, 1.0, 2.0, 3.0, 4.0]
+    assert bundle["mfcc"].reshape(-1).tolist() == [1.0, 1.0, 2.0, 3.0, 4.0]
 
 
 def test_qwen_audio_output_lengths_formula():

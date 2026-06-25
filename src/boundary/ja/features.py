@@ -23,6 +23,8 @@ QWEN3_ASR_REPO_IDS = {QWEN_ASR_06B_REPO_ID, QWEN_ASR_17B_REPO_ID}
 class FeatureConfig:
     ptm: str = QWEN_ASR_REPO_ID
     frame_hop_s: float = 0.02
+    window_s: float = 0.0
+    overlap_s: float = 0.0
     n_mfcc: int = 40
     n_fft: int = 400
     feature_dim: int | None = None
