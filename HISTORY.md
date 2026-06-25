@@ -8,10 +8,10 @@
 
 ## 路线总览
 
-当前主线是 **1.7B Scorer v5 + Micro Chunk Resolver + Pre-ASR CueQC v7 断兼容重构**：
+当前主线是 **1.7B Scorer v6 + Micro Chunk Resolver + Pre-ASR CueQC v7 断兼容重构**：
 
 ```text
-SpeechBoundary-JA scorer v5 frame scores
+SpeechBoundary-JA scorer v6 frame scores
 -> speech hysteresis coarse islands
 -> split_boundary adaptive topographic peak / acoustic valley split
 -> micro chunk resolver
@@ -23,9 +23,9 @@ SpeechBoundary-JA scorer v5 frame scores
 -> SRT / translation
 ```
 
-目标已经从“传统 VAD 高 recall”修正为“字幕边界可用”：scorer v5 只负责 speech / split 两个 frame 任务，Boundary Refiner v6 只修 island 两端，Pre-ASR CueQC v7 在 ASR 前做高精 keep/drop 路由以减少无效 ASR。v7 不再只依赖 scalar timing/stat features，而是复用同一次 Qwen PTM/encoder frame feature extraction，在 PackedChunk 上持久化 chunk-level pooled PTM embedding，再与 scorer/refiner/micro numeric features 拼接。Pre-ASR CueQC v7 需要用 current scorer+refiner workflow 重新导出 candidates/features 并重训；旧 v6 checkpoint 只保留为历史对照，不作为 active registry 目标。CueQC v4 仅保留为 ASR 后显式 opt-in 的 shadow/对照和 hard-negative mining。三个 active 模型不互相兼容旧 checkpoint，不保留 alias；schema、repo id、feature hash 或文件存在性不匹配都必须 fail-fast。
+目标已经从“传统 VAD 高 recall”修正为“字幕边界可用”：scorer v6 只负责 speech / split 两个 frame 任务，Boundary Refiner v6 只修 island 两端，Pre-ASR CueQC v7 在 ASR 前做高精 keep/drop 路由以减少无效 ASR。v6 scorer 不再沿用 v5 的 hard-radius split target，改为 Gaussian boundary heatmap，并在 BCE/focal 外加入 split Tversky overlap loss，缓解 split 正样本稀疏导致的召回/F1 上限。Pre-ASR CueQC v7 不再只依赖 scalar timing/stat features，而是复用同一次 Qwen PTM/encoder frame feature extraction，在 PackedChunk 上持久化 chunk-level pooled PTM embedding，再与 scorer/refiner/micro numeric features 拼接。Pre-ASR CueQC v7 需要用 current scorer+refiner workflow 重新导出 candidates/features 并重训；旧 v6 checkpoint 只保留为历史对照，不作为 active registry 目标。CueQC v4 仅保留为 ASR 后显式 opt-in 的 shadow/对照和 hard-negative mining。三个 active 模型不互相兼容旧 checkpoint，不保留 alias；schema、repo id、feature hash 或文件存在性不匹配都必须 fail-fast。
 
-当前运行时只规划 speech core。Scorer v5 用 `speech_prob` 找 speech frames，用 `split_boundary_prob` 产生声学切点；decoder 输出 `primary_cut_candidates` 和 `weak_cut_candidates`，前者用于 ASR chunk split，后者透传到 `SpeechSegment` / `PackedChunk` / boundary cache / ASR chunk metadata / subtitle blocks，作为字幕布局和审计时间锚点。split peak 后进入 micro chunk resolver：`20 / video_fps` 只作为字幕显示下限和 micro 风险线，若两个 split 夹出短 B 段则优先删除证据较弱的 split，把 B 合到 A 或 C；两侧证据接近时保留 B 并交给 Pre-ASR CueQC。Boundary Refiner v6 checkpoint schema 是 `boundary_edge_refiner_v6`、runtime adapter 是 `edge_sequence_v1`，head 只输出 `start_delta_s/end_delta_s`，不跨 island merge，不新增 chunk，不学习 ASR padding/context budget。Pre-ASR CueQC v7 checkpoint schema 是 `cueqc_pre_asr_mamba_v7_binary`，feature schema 是 `pre_asr_cueqc_features_v3`，输入只允许 ASR 前 pooled PTM/scorer/refiner/timing/micro 数值特征，禁止 ASR text、token trace、decoder stats、ASR confidence 和 subtitle timing。7 秒只作为字幕显示 soft guard：字幕层处理 `>7s` cue 时先按 ASR 文本断句，再吸附到对应时间窗内的 weak cut；没有 weak cut 才 proportional fallback，不反向修改 ASR chunk。
+当前运行时只规划 speech core。Scorer v6 用 `speech_prob` 找 speech frames，用 `split_boundary_prob` 产生声学切点；decoder contract 是 `topographic_split_micro_resolver_v4`，输出 `primary_cut_candidates` 和 `weak_cut_candidates`，前者用于 ASR chunk split，后者透传到 `SpeechSegment` / `PackedChunk` / boundary cache / ASR chunk metadata / subtitle blocks，作为字幕布局和审计时间锚点。split peak 后进入 micro chunk resolver：`20 / video_fps` 只作为字幕显示下限和 micro 风险线，若两个 split 夹出短 B 段则优先删除证据较弱的 split，把 B 合到 A 或 C；两侧证据接近时保留 B 并交给 Pre-ASR CueQC。Boundary Refiner v6 checkpoint schema 是 `boundary_edge_refiner_v6`、runtime adapter 是 `edge_sequence_v1`，head 只输出 `start_delta_s/end_delta_s`，不跨 island merge，不新增 chunk，不学习 ASR padding/context budget。Pre-ASR CueQC v7 checkpoint schema 是 `cueqc_pre_asr_mamba_v7_binary`，feature schema 是 `pre_asr_cueqc_features_v3`，输入只允许 ASR 前 pooled PTM/scorer/refiner/timing/micro 数值特征，禁止 ASR text、token trace、decoder stats、ASR confidence 和 subtitle timing。7 秒只作为字幕显示 soft guard：字幕层处理 `>7s` cue 时先按 ASR 文本断句，再吸附到对应时间窗内的 weak cut；没有 weak cut 才 proportional fallback，不反向修改 ASR chunk。
 
 ## 路线修正
 
@@ -37,7 +37,7 @@ SpeechBoundary-JA scorer v5 frame scores
 
 - `FusionVAD-JA / VAD` -> `SpeechBoundary-JA / Boundary`：项目已经不是严格 speech/non-speech VAD，而是面向字幕切分的边界系统。
 - `speech/split/drop 三头` -> `speech/split 双头 + Pre-ASR CueQC`：scorer 只做帧级 speech 和切点，删除路由独立为前置二分类模型，避免 scorer decoder 同时承担过多职责。
-- `boundary candidates + 字幕级 planner duration split` -> `scorer adaptive split peak + edge trim`：切分由 scorer v5 的 `split_boundary_prob` 负责；Boundary Refiner v6 不做中间切点、不做 merge，也不保留 `target_chunk_s/max_core_chunk_s/min_chunk_s/max_splits_per_segment`。
+- `boundary candidates + 字幕级 planner duration split` -> `scorer adaptive split peak + edge trim`：切分由 scorer v6 的 `split_boundary_prob` 负责；Boundary Refiner v6 不做中间切点、不做 merge，也不保留 `target_chunk_s/max_core_chunk_s/min_chunk_s/max_splits_per_segment`。
 - `Boundary Refiner v5 frame_sequence_v1` -> `Boundary Refiner v6 edge_sequence_v1`：v5 checkpoint 或 metadata 不匹配 v6 edge-only contract 时直接报错。
 - `ASR-after active CueQC` -> `Pre-ASR CueQC v7 active + CueQC v4 shadow`：旧规则 QC 不再运行；前置模型负责节省 ASR，后置 v4 只用于对照、审计和 hard-negative mining。
 - `单 checkpoint 路径` -> `repo-id registry + env override`：默认/推荐 Qwen ASR 是 `jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame`，0.6B 保留为低配置可选 backend。三个 Mamba checkpoint 都按 ASR repo id 自动解析；文件名只作人工 tag，归属以 checkpoint metadata 为准。
@@ -50,7 +50,7 @@ SpeechBoundary-JA scorer v5 frame scores
 - pyannote 默认依赖：官方预训练 diarization 通常需要 HF token / 条款接受，不进入默认分发。
 - CAM++ / 3D-Speaker / ERes2NetV2 默认 sidecar：不替代 Boundary；当前不接入 runtime。
 - runtime merge、subtitle merge、context leak 删除规则、低信息文本删除规则、具体词黑名单：目标域误伤成本高，已从默认产物链路中移除或改为 review-only。
-- learned padding/context budget、ASR padded fallback 时间轴、DP/Viterbi planner、per-gap binary merge classifier：均已被当前 scorer v5 + micro chunk resolver + Boundary Refiner v6 + Pre-ASR CueQC v7 路线取代。
+- learned padding/context budget、ASR padded fallback 时间轴、DP/Viterbi planner、per-gap binary merge classifier：均已被当前 scorer v6 + micro chunk resolver + Boundary Refiner v6 + Pre-ASR CueQC v7 路线取代。
 - 旧规则 ASR QC、QC 覆盖、per-sample CueQC 旧标签 schema、`content_type/qc_decision/alignment_policy` 多头标签：均已断兼容退役，后续不恢复 shadow 观测或兼容入口。
 - Qwen3-ForcedAligner 默认模型、runtime 对齐路径、forced/native/hybrid timestamp mode、forced silver mining、fallback/sentinel 诊断和为 forced 字幕匹配保留的 `align_text` / 日志解析 / 审计入口：均已断兼容归档；字幕时间轴以 Boundary chunk 为准。
 - silver-ft01 默认替换：已被人工 A/B 否决。
@@ -58,7 +58,7 @@ SpeechBoundary-JA scorer v5 frame scores
 
 ## Backlog
 
-- 1.7B Scorer v5：micro resolver 32768 full checkpoint 已通过 two-film 人工观感 gate，并提升到 repo-id registry；后续只在 split peak 缺失或左右证据不可分时重建 v5-native 数据。
+- 1.7B Scorer v6：正在重训 split heatmap/Tversky 版；先跑 4096 smoke，再跑 32768 full，之后重导 downstream refiner/pre-ASR CueQC 数据。
 - Boundary Refiner v6：micro scorer predicted edge 数据已重导并完成 1.7B repo-id tagged v6 训练，并提升到 repo-id registry；下一步用 Pre-ASR CueQC enabled workflow 审计边界微调和 chunk 质量。
 - Pre-ASR CueQC v7：已断兼容到 `cueqc_pre_asr_mamba_v7_binary` / `pre_asr_cueqc_features_v3`，输入新增 chunk-level pooled Qwen PTM embedding；下一步用 current scorer+refiner workflow 重新导出 v7 candidates/features，复用人工语义簇标签策略但不复用 v6 checkpoint。
 - ASR-after CueQC v4：仅保留 shadow/mining；当 Pre-ASR CueQC v7 false-drop gate 稳定后，删除后置 runtime 与训练入口。
@@ -67,6 +67,8 @@ SpeechBoundary-JA scorer v5 frame scores
 - 长期研究：等 Boundary/CueQC 审计闭环稳定后，再评估 Qwen ASR boundary-token SFT / DPO / RL、长上下文 joint segmentation-transcription 和小模型蒸馏。
 
 ## 近期记录
+
+- 2026-06-25 Scorer v6 split 召回/F1 优化训练前准备：针对 v5 micro full 中 split F1 仍约 `0.56` 的问题，按 Grok 搜索和本地代码审计结论采用断兼容路线。active scorer schema bump 到 `speech_boundary_ja_mamba2_frame_boundary_scorer_v6`，decoder contract bump 到 `topographic_split_micro_resolver_v4`；dataset schema bump 到 `speech_boundary_ja_scorer_v6_native_dataset`。split target 从 hard-radius 二值帧改为 Gaussian boundary heatmap，metadata 写入 `split_boundary_label_mode/sigma/radius`；训练 loss 在 BCE/focal 外加入 split Tversky overlap loss，默认 `alpha=0.35/beta=0.65` 偏向减少 false negative。训练目标仍只有 `speech_prob/split_boundary_prob`，不把 drop 放回 scorer，也不新增 duration hard split。下一步：生成 4096 smoke v6 数据和 1.7B feature cache，训练 smoke scorer；通过后生成 32768 full 并训练正式 scorer，再用新 scorer 重新导出 refiner/pre-ASR CueQC downstream 数据。
 
 - 2026-06-25 Pre-ASR CueQC v7 共享 Qwen FeatureBundle 路线落地：针对 v6 scalar-only 输入难以区分短语义台词和低信息人声的问题，Pre-ASR CueQC 断兼容到 `cueqc_pre_asr_mamba_v7_binary` / `pre_asr_cueqc_features_v3`。运行时继续只提取一次 Qwen PTM/encoder frame features：Scorer v5 使用同源 frame features 做 `speech/split`，Boundary Refiner v6 使用 edge sequence window，Pre-ASR CueQC v7 在 PackedChunk 上读取 chunk-level pooled PTM embedding（整段 mean/std + 4-bin temporal mean）并与 scorer/refiner/micro scalar features 拼接。boundary cache 升到 v11，只缓存 PackedChunk 级 pooled embedding，不缓存完整 frame arrays；旧 v10 cache 自然 miss。v7 训练入口改为 `tools.asr.cueqc.export_pre_asr_v7_audit_candidates` / `compile_pre_asr_v7_features` / `train_pre_asr_v7_binary`，默认拒绝缺少 pooled PTM 的候选，防止用旧 v6 JSON 训练。旧 v6 checkpoint 和指标保留作历史对照，但不作为 active registry 目标；下一步必须用 current scorer+refiner workflow 重新导出 v7 candidates/features，再人工审计/广播明确簇并训练 v7。
 

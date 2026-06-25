@@ -24,7 +24,7 @@ from boundary.ja.model import (  # noqa: E402
     load_feature_frame_scorer_checkpoint,
     score_feature_frame_boundary_probabilities_batch,
 )
-from boundary.ja.train import scorer_v5_targets_from_record  # noqa: E402
+from boundary.ja.train import scorer_v6_targets_from_record  # noqa: E402
 
 
 SCHEMA = "speech_boundary_ja_scorer_dataset_output_summary_v1"
@@ -198,6 +198,8 @@ def summarize_checkpoint_by_dataset(
     speech_threshold: float,
     split_threshold: float,
     split_boundary_radius_frames: int,
+    split_boundary_sigma_frames: float,
+    split_target_mode: str,
 ) -> dict[str, Any]:
     records = read_jsonl(labels)
     rows = read_jsonl_rows(feature_manifest)
@@ -232,10 +234,12 @@ def summarize_checkpoint_by_dataset(
             frame_total = min(int(speech_probs.size), len(record.speech_frames))
             if frame_total <= 0:
                 continue
-            speech_labels, split_labels = scorer_v5_targets_from_record(
+            speech_labels, split_labels = scorer_v6_targets_from_record(
                 record,
                 frame_count=frame_total,
                 split_boundary_radius_frames=split_boundary_radius_frames,
+                split_boundary_sigma_frames=split_boundary_sigma_frames,
+                split_target_mode=split_target_mode,
             )
             example_type = str((record.boundary_metadata or {}).get("native_example_type") or "unknown")
             for group_name in ("ALL", example_type):
@@ -264,6 +268,8 @@ def summarize_checkpoint_by_dataset(
         },
         "target_config": {
             "split_boundary_radius_frames": int(split_boundary_radius_frames),
+            "split_boundary_sigma_frames": float(split_boundary_sigma_frames),
+            "split_target_mode": str(split_target_mode),
             "batch_size": int(batch_size),
             "max_batch_frames": int(max_batch_frames),
         },
@@ -276,7 +282,7 @@ def summarize_checkpoint_by_dataset(
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Summarize SpeechBoundary-JA scorer v5 checkpoint outputs by v5-native dataset group."
+        description="Summarize SpeechBoundary-JA scorer v6 checkpoint outputs by v6-native dataset group."
     )
     parser.add_argument("--checkpoint", required=True)
     parser.add_argument("--labels", required=True)
@@ -289,6 +295,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--speech-threshold", type=float, default=0.5)
     parser.add_argument("--split-threshold", type=float, default=0.5)
     parser.add_argument("--split-boundary-radius-frames", type=int, default=1)
+    parser.add_argument("--split-boundary-sigma-frames", type=float, default=1.0)
+    parser.add_argument("--split-target-mode", choices=["hard", "gaussian"], default="gaussian")
     args = parser.parse_args(argv)
     if args.batch_size <= 0:
         parser.error("--batch-size must be positive")
@@ -298,6 +306,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         parser.error("--max-examples must be non-negative")
     if args.split_boundary_radius_frames < 0:
         parser.error("--split-boundary-radius-frames must be non-negative")
+    if args.split_boundary_sigma_frames <= 0.0:
+        parser.error("--split-boundary-sigma-frames must be positive")
     if not args.output:
         args.output = (
             PROJECT_ROOT
@@ -323,6 +333,8 @@ def main(argv: list[str] | None = None) -> int:
         speech_threshold=float(args.speech_threshold),
         split_threshold=float(args.split_threshold),
         split_boundary_radius_frames=int(args.split_boundary_radius_frames),
+        split_boundary_sigma_frames=float(args.split_boundary_sigma_frames),
+        split_target_mode=str(args.split_target_mode),
     )
     print(f"summary={repo_display_path(project_path(args.output))}")
     groups = summary.get("groups", {})

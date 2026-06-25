@@ -378,7 +378,7 @@ def export_cueqc_cluster_seed_hardcases(
             ),
             "next_conversion": [
                 "run tools.boundary.prepare_cueqc_drop_hard_negative_sources",
-                "pass speech_boundary_negative_manifest.json to tools.boundary.ja.build_scorer_v5_native_dataset",
+                "pass speech_boundary_negative_manifest.json to tools.boundary.ja.build_scorer_v6_native_dataset",
             ],
         },
     }

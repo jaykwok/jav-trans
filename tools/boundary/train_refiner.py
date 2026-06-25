@@ -269,7 +269,7 @@ def train_refiner(
                 "start_delta_loss_weight": config.start_delta_loss_weight,
                 "end_delta_loss_weight": config.end_delta_loss_weight,
                 "delta_loss": "smooth_l1",
-                "source": "scorer_v5_island_edges",
+                "source": "scorer_v6_island_edges",
             },
             "boundary_delta_max_s": config.boundary_delta_max_s,
             "init_checkpoint": init_metadata,
@@ -711,10 +711,10 @@ def _validate_v6_edge_row(row: Mapping[str, Any], *, row_index: int) -> None:
     metadata = row.get("metadata")
     metadata_source = metadata.get("dataset_source") if isinstance(metadata, Mapping) else ""
     dataset_source = str(row.get("dataset_source") or metadata_source or "")
-    if dataset_source != "scorer_v5_predicted_island_edges":
+    if dataset_source != "scorer_v6_predicted_island_edges":
         raise ValueError(
             "boundary refiner v6 rows must use "
-            f"'scorer_v5_predicted_island_edges', got {dataset_source!r} at row {row_index}"
+            f"'scorer_v6_predicted_island_edges', got {dataset_source!r} at row {row_index}"
         )
     scorer_checkpoint = metadata.get("scorer_checkpoint") if isinstance(metadata, Mapping) else None
     if not isinstance(scorer_checkpoint, Mapping):

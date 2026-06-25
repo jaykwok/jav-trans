@@ -70,7 +70,7 @@ def write_jsonl(path: Path, rows: Iterable[Mapping[str, Any]]) -> int:
 def discover_latest_seed_candidates() -> Path:
     paths = sorted(
         (PROJECT_ROOT / "agents" / "temp").glob(
-            "*_scorer-v5-native-realneg-candidates-from-cluster-seed/cueqc_confirmed_drop_candidates.jsonl"
+            "*_scorer-v6-native-realneg-candidates-from-cluster-seed/cueqc_confirmed_drop_candidates.jsonl"
         )
     )
     if not paths:
@@ -462,7 +462,7 @@ def export_cueqc_seed_drop_background_spans(
             ),
             "next_conversion": [
                 "run tools.boundary.prepare_cueqc_drop_hard_negative_sources with --candidates background_span_candidates",
-                "pass speech_boundary_negative_manifest.json to tools.boundary.ja.build_scorer_v5_native_dataset",
+                "pass speech_boundary_negative_manifest.json to tools.boundary.ja.build_scorer_v6_native_dataset",
             ],
         },
     }

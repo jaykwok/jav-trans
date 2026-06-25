@@ -28,7 +28,7 @@ DEFAULT_ASR_BATCH_SIZE_BY_REPO_ENV = ",".join(
     f"{repo_id}={batch_size}"
     for repo_id, batch_size in DEFAULT_QWEN_ASR_BATCH_SIZE_BY_REPO.items()
 )
-DEFAULT_SPEECH_BOUNDARY_OPERATING_POINT = "qwen-mamba2-frame-boundary-scorer-v5"
+DEFAULT_SPEECH_BOUNDARY_OPERATING_POINT = "qwen-mamba2-frame-boundary-scorer-v6"
 
 
 @dataclass(frozen=True)
@@ -618,7 +618,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         dest="speech_boundary_scorer_checkpoint_by_repo",
         default=os.getenv("SPEECH_BOUNDARY_JA_SCORER_CHECKPOINT_BY_REPO", ""),
         help=(
-            "Optional repo-id scorer map: '<repo_id>=<speech_boundary_ja_frame_boundary_scorer_v5.pt>'"
+            "Optional repo-id scorer map: '<repo_id>=<speech_boundary_ja_frame_boundary_scorer_v6.pt>'"
             "[,<repo_id>=...]'. Empty uses the registered repo-id scorer when available."
         ),
     )

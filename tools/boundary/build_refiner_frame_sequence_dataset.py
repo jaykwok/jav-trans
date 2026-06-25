@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+import time
 from collections import Counter
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -35,7 +36,7 @@ from boundary.sequence_features import (
 )
 
 DATASET_SCHEMA = "boundary_edge_refiner_dataset_v6"
-DATASET_SOURCE = "scorer_v5_predicted_island_edges"
+DATASET_SOURCE = "scorer_v6_predicted_island_edges"
 
 
 @dataclass(frozen=True)

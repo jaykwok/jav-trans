@@ -74,7 +74,7 @@ def pack_speech_segments(
 ) -> list[PackedChunk]:
     """Convert scorer-produced speech islands into ASR chunks.
 
-    Scorer v5 is the only island splitter. The planner no longer creates
+    Scorer v6 is the only island splitter. The planner no longer creates
     duration-driven splits or secondary boundary candidates; Boundary Refiner v6
     may only adjust the start/end of already-planned island chunks.
     """
