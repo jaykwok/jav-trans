@@ -64,15 +64,52 @@ def _broadcast_cluster_labels(
     """
     decision_by_cluster: dict[str, str] = {}
     reason_by_cluster: dict[str, str] = {}
+    confirmed_merge_target_by_cluster: dict[str, str] = {}
     for row in cluster_labels:
+        schema = str(row.get("schema") or "").strip()
+        label_source = str(row.get("label_source") or row.get("source") or "").strip().lower()
+        if schema.startswith("cueqc_ai_suggestion") or label_source in {
+            "ai_suggestion",
+            "grok_suggestion",
+            "gemini_suggestion",
+            "llm_suggestion",
+        }:
+            continue
         cluster_id = str(row.get("cluster_id") or "").strip()
         seed_action = str(row.get("seed_action") or "").strip()
         decision = str(row.get("display_decision") or "").strip()
+        merge_action = str(row.get("merge_action") or "").strip()
+        merge_target = str(
+            row.get("merge_target_cluster_id")
+            or row.get("tail_merge_target_cluster_id")
+            or row.get("tail_merge_suggested_target_cluster_id")
+            or ""
+        ).strip()
+        merge_confirmed = row.get("merge_confirmed") is True or merge_action in {
+            "confirm_merge",
+            "confirmed_merge",
+        }
+        if cluster_id and merge_target and merge_confirmed and row.get("training_label_included") is not False:
+            confirmed_merge_target_by_cluster[cluster_id] = merge_target
         if seed_action != "use_seed" or row.get("training_label_included") is False:
             continue
         if cluster_id and decision:
             decision_by_cluster[cluster_id] = decision
             reason_by_cluster[cluster_id] = str(row.get("classification_reason") or "").strip()
+
+    def resolve_decision(cluster_id: str) -> tuple[str, str, str]:
+        decision = decision_by_cluster.get(cluster_id, "")
+        if decision:
+            return decision, cluster_id, "cluster_broadcast"
+        seen = {cluster_id}
+        target = confirmed_merge_target_by_cluster.get(cluster_id, "")
+        while target and target not in seen:
+            seen.add(target)
+            decision = decision_by_cluster.get(target, "")
+            if decision:
+                return decision, target, "cluster_confirmed_merge_broadcast"
+            target = confirmed_merge_target_by_cluster.get(target, "")
+        return "", "", ""
 
     expanded: list[dict[str, Any]] = []
     for row in clusters:
@@ -80,7 +117,7 @@ def _broadcast_cluster_labels(
         cluster_id = str(row.get("cluster_id") or "").strip()
         if not sample_id or not cluster_id:
             continue
-        cluster_decision = decision_by_cluster.get(cluster_id)
+        cluster_decision, decision_cluster_id, label_source = resolve_decision(cluster_id)
         if not cluster_decision:
             continue
         final_decision = _valid_label(cluster_decision, DISPLAY_DECISIONS, "")
@@ -91,9 +128,11 @@ def _broadcast_cluster_labels(
             "sample_id": sample_id,
             "cluster_id": cluster_id,
             "display_decision": final_decision,
-            "notes": reason_by_cluster.get(cluster_id, ""),
-            "label_source": "cluster_broadcast",
+            "notes": reason_by_cluster.get(decision_cluster_id, ""),
+            "label_source": label_source,
             "cluster_display_decision": cluster_decision,
+            "decision_cluster_id": decision_cluster_id,
+            "merged_into_cluster_id": decision_cluster_id if decision_cluster_id != cluster_id else "",
         })
     return expanded
 
@@ -178,9 +217,12 @@ def compile_records(
                 "notes": str(label.get("notes") or ""),
                 "label_source": str(label.get("label_source") or "manual"),
                 "cluster_display_decision": str(label.get("cluster_display_decision") or ""),
+                "decision_cluster_id": str(label.get("decision_cluster_id") or cluster_id),
+                "merged_into_cluster_id": str(label.get("merged_into_cluster_id") or ""),
                 "low_cluster_consistency": bool(low_consistency),
                 "cluster_agreement": float(cluster_info.get("agreement") or 0.0),
-                "coarse_cluster_seed": str(label.get("label_source") or "manual") == "cluster_broadcast",
+                "coarse_cluster_seed": str(label.get("label_source") or "manual")
+                in {"cluster_broadcast", "cluster_confirmed_merge_broadcast"},
             },
         }
         records.append(record)

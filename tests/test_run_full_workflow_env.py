@@ -73,7 +73,7 @@ def test_run_full_workflow_parse_args_uses_loaded_env(monkeypatch):
         "jaykwok/Qwen3-ASR-0.6B-JA-Anime-Galgame=64,"
         "jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame=32",
     )
-    boundary_mapping = "jaykwok/Qwen3-ASR-0.6B-JA-Anime-Galgame=src/boundary/checkpoints/boundary_edge_refiner_v7.jaykwok-Qwen3-ASR-0.6B-JA-Anime-Galgame.pt"
+    boundary_mapping = "jaykwok/Qwen3-ASR-0.6B-JA-Anime-Galgame=src/boundary/checkpoints/boundary_edge_refiner_v8_safe_tight.jaykwok-Qwen3-ASR-0.6B-JA-Anime-Galgame.pt"
     cueqc_mapping = "jaykwok/Qwen3-ASR-0.6B-JA-Anime-Galgame=src/asr/checkpoints/cueqc_mamba_v4_binary.jaykwok-Qwen3-ASR-0.6B-JA-Anime-Galgame.pt"
     scorer_mapping = "jaykwok/Qwen3-ASR-0.6B-JA-Anime-Galgame=agents/temp/scorer.pt"
     monkeypatch.setenv("BOUNDARY_REFINER_MODEL_PATH_BY_REPO", boundary_mapping)
@@ -119,7 +119,7 @@ def test_run_full_workflow_context_carries_boundary_env(monkeypatch, tmp_path):
     )
     monkeypatch.setenv("ASR_BATCH_SIZE", "auto")
     monkeypatch.setenv("ASR_BATCH_SIZE_BY_REPO", batch_table)
-    boundary_mapping = "jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame=src/boundary/checkpoints/boundary_edge_refiner_v7.jaykwok-Qwen3-ASR-1.7B-JA-Anime-Galgame.pt"
+    boundary_mapping = "jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame=src/boundary/checkpoints/boundary_edge_refiner_v8_safe_tight.jaykwok-Qwen3-ASR-1.7B-JA-Anime-Galgame.pt"
     cueqc_mapping = "jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame=src/asr/checkpoints/cueqc_mamba_v4_binary.jaykwok-Qwen3-ASR-1.7B-JA-Anime-Galgame.pt"
     scorer_mapping = "jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame=agents/temp/scorer.pt"
     monkeypatch.setenv("BOUNDARY_REFINER_MODEL_PATH_BY_REPO", boundary_mapping)
@@ -172,6 +172,8 @@ def test_run_full_workflow_context_carries_boundary_env(monkeypatch, tmp_path):
     assert ctx.advanced["BOUNDARY_REFINER_DEVICE"] == "cpu"
     assert ctx.advanced["SPEECH_BOUNDARY_JA_SPLIT_SCORE_QUANTILE"] == "0.45"
     assert ctx.advanced["SPEECH_BOUNDARY_JA_SPLIT_PROMINENCE_QUANTILE"] == "0.55"
+    assert "SPEECH_BOUNDARY_JA_SPLIT_MIN_PRIMARY_SCORE" not in ctx.advanced
+    assert "SPEECH_BOUNDARY_JA_DENSE_CUT_GAP_S" not in ctx.advanced
     assert "SPEECH_BOUNDARY_JA_SPLIT_THRESHOLD" not in ctx.advanced
     assert "SPEECH_BOUNDARY_JA_SPLIT_PROMINENCE" not in ctx.advanced
     assert ctx.advanced["PRE_ASR_CUEQC_ENABLED"] == "1"
@@ -210,6 +212,8 @@ def test_run_full_workflow_cli_batch_overrides_loaded_env(monkeypatch):
     assert run_full_workflow.os.environ["CUEQC_SHADOW_ENABLED"] == "0"
     assert run_full_workflow.os.environ["SPEECH_BOUNDARY_JA_SPEECH_ON_THRESHOLD"] == "0.7"
     assert run_full_workflow.os.environ["SPEECH_BOUNDARY_JA_SPEECH_OFF_THRESHOLD"] == "0.5"
+    assert "SPEECH_BOUNDARY_JA_SPLIT_MIN_PRIMARY_SCORE" not in run_full_workflow.os.environ
+    assert "SPEECH_BOUNDARY_JA_DENSE_CUT_GAP_S" not in run_full_workflow.os.environ
 
 
 def test_run_full_workflow_summary_uses_shadow_specific_cueqc_keys(tmp_path):

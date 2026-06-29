@@ -28,6 +28,14 @@ def _feature_names() -> list[str]:
         "gap_s",
         "left_duration_s",
         "right_duration_s",
+        "total_duration_s",
+        "left_center_s",
+        "right_center_s",
+        "gap_center_s",
+        "left_duration_ratio",
+        "right_duration_ratio",
+        "gap_duration_ratio",
+        "relative_gap_center",
         "left_ptm_mean_000",
         "gap_ptm_mean_000",
         "right_ptm_mean_000",
@@ -49,7 +57,7 @@ def _sequence_feature_metadata(feature_names: list[str]) -> dict:
     }
 
 
-def _write_v7_dataset(
+def _write_v8_dataset(
     path: Path,
     *,
     rows: int = 4,
@@ -62,13 +70,29 @@ def _write_v7_dataset(
         sequence = []
         targets = []
         weights = []
+        confidence_targets = []
+        confidence_weights = []
         for item_index in range(items_per_row):
             gap_s = 0.2 + 0.1 * item_index
+            left_duration_s = 1.0
+            right_duration_s = 0.8
+            total_duration_s = left_duration_s + gap_s + right_duration_s
+            left_center_s = left_duration_s * 0.5
+            gap_center_s = left_duration_s + gap_s * 0.5
+            right_center_s = left_duration_s + gap_s + right_duration_s * 0.5
             sequence.append(
                 [
                     gap_s,
-                    1.0,
-                    0.8,
+                    left_duration_s,
+                    right_duration_s,
+                    total_duration_s,
+                    left_center_s,
+                    right_center_s,
+                    gap_center_s,
+                    left_duration_s / total_duration_s,
+                    right_duration_s / total_duration_s,
+                    gap_s / total_duration_s,
+                    gap_center_s / total_duration_s,
                     0.1 * row_index,
                     0.2 * item_index,
                     0.3,
@@ -76,14 +100,18 @@ def _write_v7_dataset(
             )
             targets.append([0.02 * (item_index + 1), -0.03 * (row_index + 1)])
             weights.append([1.0, 0.6])
+            confidence_targets.append([1.0, 1.0])
+            confidence_weights.append([1.0, 0.6])
         payload = {
-            "schema": "boundary_edge_refiner_dataset_v7",
+            "schema": "boundary_edge_refiner_dataset_v8",
             "dataset_source": "scorer_v7_predicted_island_edges",
             "audio_id": f"seq-{row_index}",
             "feature_names": feature_names,
             "sequence_features": sequence,
             "sequence_boundary_delta_targets": targets,
             "sequence_boundary_delta_weights": weights,
+            "sequence_boundary_confidence_targets": confidence_targets,
+            "sequence_boundary_confidence_weights": confidence_weights,
             **_sequence_feature_metadata(feature_names),
         }
         if include_ptm_repo_id:
@@ -132,12 +160,12 @@ def _tiny_train_config(**overrides) -> TrainRefinerConfig:
     )
 
 
-def test_train_refiner_accepts_v7_delta_dataset(tmp_path):
+def test_train_refiner_accepts_v8_delta_dataset(tmp_path):
     pytest.importorskip("torch")
     transformers = pytest.importorskip("transformers")
     if not hasattr(transformers, "Mamba2Model"):
         pytest.skip("transformers.Mamba2Model is unavailable")
-    dataset = _write_v7_dataset(tmp_path / "sequence.jsonl", rows=4, items_per_row=3)
+    dataset = _write_v8_dataset(tmp_path / "sequence.jsonl", rows=4, items_per_row=3)
 
     metrics = train_refiner(
         dataset_paths=[dataset],
@@ -152,12 +180,20 @@ def test_train_refiner_accepts_v7_delta_dataset(tmp_path):
     assert metrics["train"]["start_delta_error"]["mae_s"] >= 0.0
     assert metrics["train"]["end_delta_error"]["mae_s"] >= 0.0
     edge_policy = metrics["loader_smoke"]["signature"]["metadata"]["edge_policy"]
-    assert edge_policy["delta_loss"] == "smooth_l1"
+    assert edge_policy["delta_loss"] == "smooth_l1_asymmetric"
     assert edge_policy["start_delta_loss_weight"] == 1.0
     assert edge_policy["end_delta_loss_weight"] == 0.6
     assert edge_policy["source"] == "scorer_v7_island_edges"
     smoke = metrics["loader_smoke"]["first_decision"]
-    assert set(smoke) == {"source", "start_refine_delta_s", "end_refine_delta_s"}
+    assert set(smoke) == {
+        "source",
+        "start_refine_delta_s",
+        "end_refine_delta_s",
+        "start_confidence",
+        "end_confidence",
+        "start_source",
+        "end_source",
+    }
 
 
 def test_train_refiner_rejects_dataset_without_ptm_repo_id(tmp_path):
@@ -165,7 +201,7 @@ def test_train_refiner_rejects_dataset_without_ptm_repo_id(tmp_path):
     transformers = pytest.importorskip("transformers")
     if not hasattr(transformers, "Mamba2Model"):
         pytest.skip("transformers.Mamba2Model is unavailable")
-    dataset = _write_v7_dataset(
+    dataset = _write_v8_dataset(
         tmp_path / "sequence.jsonl",
         rows=2,
         items_per_row=1,
@@ -185,7 +221,7 @@ def test_train_refiner_rejects_merge_era_fields(tmp_path):
     transformers = pytest.importorskip("transformers")
     if not hasattr(transformers, "Mamba2Model"):
         pytest.skip("transformers.Mamba2Model is unavailable")
-    dataset = _write_v7_dataset(tmp_path / "sequence-with-old-labels.jsonl", rows=1, items_per_row=1)
+    dataset = _write_v8_dataset(tmp_path / "sequence-with-old-labels.jsonl", rows=1, items_per_row=1)
     row = json.loads(dataset.read_text(encoding="utf-8").splitlines()[0])
     row["sequence_labels"] = [1]
     row["merge_positive"] = 1
@@ -199,12 +235,12 @@ def test_train_refiner_rejects_merge_era_fields(tmp_path):
         )
 
 
-def test_train_refiner_can_initialize_v7_checkpoint_and_freeze_backbone(tmp_path):
+def test_train_refiner_can_initialize_v8_checkpoint_and_freeze_backbone(tmp_path):
     pytest.importorskip("torch")
     transformers = pytest.importorskip("transformers")
     if not hasattr(transformers, "Mamba2Model"):
         pytest.skip("transformers.Mamba2Model is unavailable")
-    dataset = _write_v7_dataset(tmp_path / "init-sequence.jsonl")
+    dataset = _write_v8_dataset(tmp_path / "init-sequence.jsonl")
     base_config = _tiny_train_config()
 
     first = train_refiner(
@@ -229,7 +265,7 @@ def test_train_refiner_can_initialize_v7_checkpoint_and_freeze_backbone(tmp_path
     assert metadata["freeze_backbone"] is True
     assert metadata["preserve_init_normalization"] is True
     assert metadata["normalization_source"] == "init_checkpoint"
-    assert metadata["init_checkpoint"]["schema"] == "boundary_edge_refiner_v7"
+    assert metadata["init_checkpoint"]["schema"] == "boundary_edge_refiner_v8_safe_tight"
 
 
 def test_train_refiner_uses_streaming_tensor_loader(tmp_path, monkeypatch):
@@ -237,7 +273,7 @@ def test_train_refiner_uses_streaming_tensor_loader(tmp_path, monkeypatch):
     transformers = pytest.importorskip("transformers")
     if not hasattr(transformers, "Mamba2Model"):
         pytest.skip("transformers.Mamba2Model is unavailable")
-    dataset = _write_v7_dataset(tmp_path / "streaming-sequence.jsonl", rows=6, items_per_row=1)
+    dataset = _write_v8_dataset(tmp_path / "streaming-sequence.jsonl", rows=6, items_per_row=1)
 
     original_iter = train_refiner_module._iter_dataset_rows
     calls = {"count": 0}
@@ -259,12 +295,12 @@ def test_train_refiner_uses_streaming_tensor_loader(tmp_path, monkeypatch):
     assert calls["count"] == 2
 
 
-def test_train_refiner_reuses_v7_tensor_cache_without_jsonl_rescan(tmp_path, monkeypatch):
+def test_train_refiner_reuses_v8_tensor_cache_without_jsonl_rescan(tmp_path, monkeypatch):
     pytest.importorskip("torch")
     transformers = pytest.importorskip("transformers")
     if not hasattr(transformers, "Mamba2Model"):
         pytest.skip("transformers.Mamba2Model is unavailable")
-    dataset = _write_v7_dataset(tmp_path / "cache-sequence.jsonl", rows=6, items_per_row=1)
+    dataset = _write_v8_dataset(tmp_path / "cache-sequence.jsonl", rows=6, items_per_row=1)
     tensor_cache = tmp_path / "cache-sequence.tensor.pt"
 
     first = train_refiner(
@@ -404,12 +440,13 @@ def test_build_frame_sequence_dataset_trains_with_cached_features(tmp_path, monk
     rows = [json.loads(line) for line in output_jsonl.read_text(encoding="utf-8").splitlines()]
 
     assert "class_balance" not in summary
-    assert rows[0]["schema"] == "boundary_edge_refiner_dataset_v7"
+    assert rows[0]["schema"] == "boundary_edge_refiner_dataset_v8"
     assert "sequence_labels" not in rows[0]
     assert "gap_s" in rows[0]["feature_names"]
     assert "gap_merge_s" not in rows[0]["feature_names"]
     assert len(rows[0]["sequence_features"]) == 1
     assert len(rows[0]["sequence_boundary_delta_targets"]) == 1
+    assert len(rows[0]["sequence_boundary_confidence_targets"]) == 1
     assert rows[0]["sequence_boundary_delta_targets"][0] == pytest.approx([0.02, -0.02])
     assert rows[0]["metadata"]["ptm_repo_id"] == QWEN_ASR_17B_REPO_ID
     assert rows[0]["metadata"]["dataset_source"] == "scorer_v7_predicted_island_edges"
@@ -424,7 +461,7 @@ def test_build_frame_sequence_dataset_trains_with_cached_features(tmp_path, monk
     assert Path(metrics["checkpoint"]).exists()
     assert metrics["train_items"] + metrics["val_items"] == 1
     assert metrics["loader_smoke"]["decision_count"] == 1
-    assert metrics["loader_smoke"]["signature"]["metadata"]["runtime_adapter"] == "edge_sequence_v1"
+    assert metrics["loader_smoke"]["signature"]["metadata"]["runtime_adapter"] == "edge_sequence_v2"
     assert metrics["loader_smoke"]["signature"]["metadata"]["feature_schema"] == FRAME_SEQUENCE_FEATURE_SCHEMA
     assert metrics["loader_smoke"]["signature"]["metadata"]["ptm_repo_id"] == QWEN_ASR_17B_REPO_ID
     assert (

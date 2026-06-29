@@ -256,6 +256,9 @@ canvas {{
   background: #101614;
 }}
 .toolbar {{ display: flex; flex-wrap: wrap; gap: 8px; margin-top: 10px; }}
+.label-workbench {{ border: 1px solid var(--line); border-radius: 8px; background: #f7faf8; padding: 10px; margin: 8px 0 10px; }}
+.label-workbench .toolbar {{ margin-top: 0; }}
+.label-workbench .hint {{ margin: 8px 0 0; }}
 .kv {{
   display: grid;
   grid-template-columns: 135px minmax(0, 1fr);
@@ -339,18 +342,20 @@ textarea {{
     <div class="grid">
       <section class="panel">
         <audio id="audio" controls preload="metadata"></audio>
-        <canvas id="wave" width="1200" height="220"></canvas>
-        <div class="toolbar">
-          <button id="playPauseBtn">播放/暂停</button>
-          <button id="startBtn">设起点 [</button>
-          <button id="endBtn">设终点 ]</button>
-          <button id="allSpeechBtn">全段语音</button>
-          <button id="startToHereBtn">开头到当前点</button>
-          <button id="hereToEndBtn">当前点到末尾</button>{teacher_buttons}
-          <button class="danger" id="nonSpeechBtn">非语音</button>
-          <button id="reviewedBtn">标记已审</button>
+        <div class="label-workbench">
+          <div class="toolbar">
+            <button id="playPauseBtn">播放/暂停</button>
+            <button id="startBtn">设起点 [</button>
+            <button id="endBtn">设终点 ]</button>
+            <button id="allSpeechBtn">全段语音</button>
+            <button id="startToHereBtn">开头到当前点</button>
+            <button id="hereToEndBtn">当前点到末尾</button>{teacher_buttons}
+            <button class="danger" id="nonSpeechBtn">非语音</button>
+            <button id="reviewedBtn">标记已审</button>
+          </div>
+          <p class="hint">快捷键：空格播放/暂停，[ 设起点，] 设终点，A 全段语音，N 非语音，B 开头到当前点，E 当前点到末尾，J/K 上一条/下一条。快速审计优先使用四类结果：全段语音、非语音、开头到当前点、当前点到末尾；少数多段对白再用片段表格精修。只设起点时默认到音频末尾，只设终点时默认从音频开头开始。修改会自动缓存在当前浏览器。标注口径：凡是希望送入 ASR 并可能生成字幕的人声、拟声、短促发声都可标为语音；纯 BGM、静音、环境/机械声和无字幕价值残留标为非语音。背景音乐、底噪或环境声垫在对白下面时仍按可字幕化人声区间标为语音。</p>
         </div>
-        <p class="hint">快捷键：空格播放/暂停，[ 设起点，] 设终点，A 全段语音，N 非语音，B 开头到当前点，E 当前点到末尾，J/K 上一条/下一条。快速审计优先使用四类结果：全段语音、非语音、开头到当前点、当前点到末尾；少数多段对白再用片段表格精修。只设起点时默认到音频末尾，只设终点时默认从音频开头开始。修改会自动缓存在当前浏览器。标注口径：凡是希望送入 ASR 并可能生成字幕的人声、拟声、短促发声都可标为语音；纯 BGM、静音、环境/机械声和无字幕价值残留标为非语音。背景音乐、底噪或环境声垫在对白下面时仍按可字幕化人声区间标为语音。</p>
+        <canvas id="wave" width="1200" height="220"></canvas>
       </section>
 
       <aside class="panel">
@@ -406,7 +411,6 @@ let currentIndex = 0;
 let annotations = loadAnnotations();
 let pendingStart = null;
 let decodedPeaks = null;
-let saveHandle = null;
 
 const audio = document.getElementById("audio");
 const wave = document.getElementById("wave");
@@ -828,16 +832,17 @@ function jsonlText() {{
 
 async function saveJsonl() {{
   const text = jsonlText();
-  if ("showSaveFilePicker" in window) {{
-    saveHandle = saveHandle || await window.showSaveFilePicker({{
-      suggestedName: OUTPUT_JSONL_NAME,
-      types: [{{description: "JSONL 标注文件", accept: {{"application/jsonl": [".jsonl"], "text/plain": [".jsonl"]}}}}]
+  try {{
+    const response = await fetch("/__audit_api__/save-labels", {{
+      method: "POST",
+      headers: {{"Content-Type": "application/json"}},
+      body: JSON.stringify({{href: location.pathname, filename: OUTPUT_JSONL_NAME, content: text}})
     }});
-    const writable = await saveHandle.createWritable();
-    await writable.write(text);
-    await writable.close();
-    document.getElementById("savedText").textContent = "JSONL 已保存";
-  }} else {{
+    const payload = await response.json().catch(() => ({{}}));
+    if (!response.ok || !payload.ok) throw new Error(payload.error || `HTTP ${{response.status}}`);
+    document.getElementById("savedText").textContent = `JSONL 已保存到 ${{payload.path}}`;
+  }} catch (error) {{
+    document.getElementById("savedText").textContent = `保存到审计目录失败，已改为下载：${{error && error.message ? error.message : error}}`;
     downloadJsonl();
   }}
 }}

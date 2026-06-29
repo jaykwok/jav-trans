@@ -120,8 +120,8 @@ def test_qwen_checkpoint_path_mapping_uses_repo_id_keys(monkeypatch, tmp_path):
 def test_qwen_checkpoint_path_defaults_to_registry_when_env_is_absent(monkeypatch, tmp_path):
     from asr.backends import qwen
 
-    checkpoint = tmp_path / "boundary_edge_refiner_v7.jaykwok-Qwen3-ASR-1.7B-JA-Anime-Galgame.pt"
-    checkpoint.write_bytes(b"v6")
+    checkpoint = tmp_path / "boundary_edge_refiner_v8_safe_tight.jaykwok-Qwen3-ASR-1.7B-JA-Anime-Galgame.pt"
+    checkpoint.write_bytes(b"v8")
     monkeypatch.delenv("BOUNDARY_REFINER_MODEL_PATH_BY_REPO", raising=False)
 
     path = qwen.checkpoint_path_for_repo_env(
@@ -130,7 +130,7 @@ def test_qwen_checkpoint_path_defaults_to_registry_when_env_is_absent(monkeypatc
         default_mapping={ASR_17B_BACKEND: str(checkpoint)},
     )
 
-    assert path.endswith("boundary_edge_refiner_v7.jaykwok-Qwen3-ASR-1.7B-JA-Anime-Galgame.pt")
+    assert path.endswith("boundary_edge_refiner_v8_safe_tight.jaykwok-Qwen3-ASR-1.7B-JA-Anime-Galgame.pt")
 
 
 def test_qwen_checkpoint_path_auto_uses_registered_scorer(monkeypatch, tmp_path):

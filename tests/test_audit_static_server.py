@@ -96,6 +96,29 @@ def test_static_server_supports_range_requests(tmp_path: Path):
             raise AssertionError("invalid range did not return 416")
 
 
+def test_static_server_disables_html_cache_without_affecting_audio(tmp_path: Path):
+    root = tmp_path / "root"
+    audit_root = root / "agents" / "audits"
+    rm_root = root / "agents" / "rm" / "audit-deletions"
+    _write(audit_root / "sample" / "index.html", "<!doctype html><title>sample</title>")
+    _write(audit_root / "sample" / "audio.wav", b"0123456789")
+
+    with _server(root=root, audit_root=audit_root, rm_root=rm_root) as base_url:
+        status, headers, _body = _read(f"{base_url}/agents/audits/sample/index.html")
+        assert status == 200
+        assert headers["Cache-Control"] == "no-store, max-age=0"
+        assert headers["Pragma"] == "no-cache"
+        assert headers["Expires"] == "0"
+
+        status, headers, body = _read(
+            f"{base_url}/agents/audits/sample/audio.wav",
+            headers={"Range": "bytes=0-1"},
+        )
+        assert status == 206
+        assert body == b"01"
+        assert "Cache-Control" not in headers
+
+
 def test_static_server_treats_windows_range_abort_as_client_disconnect():
     assert isinstance(ConnectionAbortedError(), CLIENT_DISCONNECT_ERRORS)
 
@@ -127,3 +150,32 @@ def test_static_server_delete_api_moves_audit_and_rebuilds_nav(tmp_path: Path):
     assert len(moved) == 1
     assert (moved[0] / "index.html").exists()
     assert "old/index.html" not in (audit_root / "index.html").read_text(encoding="utf-8")
+
+
+def test_static_server_save_labels_api_writes_to_audit_dir(tmp_path: Path):
+    root = tmp_path / "root"
+    audit_root = root / "agents" / "audits"
+    rm_root = root / "agents" / "rm" / "audit-deletions"
+    index = _write(audit_root / "sample" / "index.html", "<!doctype html><title>sample</title>")
+    write_latest_audit_entry(audit_root=audit_root, latest_html=index, title="Sample")
+    write_audit_index(audit_root=audit_root, latest_html=index, latest_title="Sample")
+
+    with _server(root=root, audit_root=audit_root, rm_root=rm_root) as base_url:
+        request = Request(
+            f"{base_url}/__audit_api__/save-labels",
+            data=json.dumps(
+                {
+                    "href": "/agents/audits/sample/index.html",
+                    "filename": "cueqc_sample_labels.jsonl",
+                    "content": "{\"label\":\"keep\"}\n",
+                }
+            ).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urlopen(request, timeout=5) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+
+    assert payload["ok"] is True
+    assert payload["path"] == "agents/audits/sample/cueqc_sample_labels.jsonl"
+    assert (audit_root / "sample" / "cueqc_sample_labels.jsonl").read_text(encoding="utf-8") == "{\"label\":\"keep\"}\n"

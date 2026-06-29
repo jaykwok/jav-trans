@@ -397,51 +397,6 @@ def _select_peak_frames(
     ]
 
 
-def _split_peak_candidates_for_segment_selected(
-    segment: SpeechSegment,
-    *,
-    speech_probs: np.ndarray,
-    split_probs: np.ndarray,
-    frame_hop_s: float,
-    split_smooth_s: float,
-    split_nms_s: float,
-    split_snap_s: float,
-    min_split_segment_s: float,
-    split_score_quantile: float,
-    split_prominence_quantile: float,
-) -> list[_SplitPeakCandidate]:
-    candidates = _split_peak_candidates_for_segment(
-        segment,
-        speech_probs=speech_probs,
-        split_probs=split_probs,
-        frame_hop_s=frame_hop_s,
-        split_smooth_s=split_smooth_s,
-        split_snap_s=split_snap_s,
-        min_split_segment_s=min_split_segment_s,
-    )
-    if not candidates:
-        return []
-    nms_frames = max(1, int(round(max(0.0, split_nms_s) / frame_hop_s)))
-    score_floor = _quantile((candidate.score for candidate in candidates), split_score_quantile)
-    prominence_floor = _quantile(
-        (candidate.prominence for candidate in candidates),
-        split_prominence_quantile,
-    )
-    adaptive_candidates = [
-        candidate
-        for candidate in candidates
-        if candidate.score >= score_floor - 1e-6 and candidate.prominence >= prominence_floor - 1e-6
-    ]
-    return sorted(
-        _select_peak_candidates(
-            adaptive_candidates,
-            nms_frames=nms_frames,
-            rank_by_prominence=True,
-        ),
-        key=lambda item: int(item.frame),
-    )
-
-
 def _weak_split_peak_candidates_for_segment(
     candidates: Iterable[_SplitPeakCandidate],
     primary_candidates: Iterable[_SplitPeakCandidate],
@@ -467,36 +422,6 @@ def _weak_split_peak_candidates_for_segment(
     )
 
 
-def _split_peak_frames_for_segment(
-    segment: SpeechSegment,
-    *,
-    speech_probs: np.ndarray,
-    split_probs: np.ndarray,
-    frame_hop_s: float,
-    split_smooth_s: float,
-    split_nms_s: float,
-    split_snap_s: float,
-    min_split_segment_s: float,
-    split_score_quantile: float,
-    split_prominence_quantile: float,
-) -> list[int]:
-    return [
-        int(candidate.frame)
-        for candidate in _split_peak_candidates_for_segment_selected(
-            segment,
-            speech_probs=speech_probs,
-            split_probs=split_probs,
-            frame_hop_s=frame_hop_s,
-            split_smooth_s=split_smooth_s,
-            split_nms_s=split_nms_s,
-            split_snap_s=split_snap_s,
-            min_split_segment_s=min_split_segment_s,
-            split_score_quantile=split_score_quantile,
-            split_prominence_quantile=split_prominence_quantile,
-        )
-    ]
-
-
 def _split_segment_at_candidates(
     segment: SpeechSegment,
     split_candidates: Iterable[_SplitPeakCandidate],
@@ -517,6 +442,21 @@ def _split_segment_at_candidates(
         _cut_candidate_payload(candidate, frame_hop_s=frame_hop_s, kind="weak")
         for candidate in weak_candidates
     ]
+    if not candidates:
+        base_segment = _segment_with_split_metadata(
+            start=segment.start,
+            end=segment.end,
+            score=segment.score,
+            subtitle_min_duration_s=subtitle_min_duration_s,
+            left=None,
+            right=None,
+            weak_cut_candidates=_candidate_payloads_in_window(
+                weak_payloads,
+                start=segment.start,
+                end=segment.end,
+            ),
+        )
+        return [base_segment]
     parts: list[SpeechSegment] = []
     cursor = float(segment.start)
     left_candidate: _SplitPeakCandidate | None = None
@@ -1060,7 +1000,7 @@ def decode_frame_boundary_segments(
 ) -> FrameBoundaryDecodeResult:
     """Decode scorer v7 frame heads into speech islands.
 
-    This is intentionally shared by runtime and Boundary Refiner v7 dataset
+    This is intentionally shared by runtime and Boundary Refiner v8 dataset
     export so the refiner learns from exactly the same island contract it sees
     during inference.
     """

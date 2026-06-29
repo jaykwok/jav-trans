@@ -21,11 +21,11 @@ from boundary.sequence_features import (
 )
 
 
-PRE_ASR_CUEQC_SCHEMA = "cueqc_pre_asr_mamba_v9_binary"
-PRE_ASR_CUEQC_MODEL_ARCH = "cueqc_pre_asr_mamba_v9"
-PRE_ASR_CUEQC_DECISION_VERSION = "pre_asr_cueqc_v9_binary_v1"
-PRE_ASR_CUEQC_FEATURE_SCHEMA = "pre_asr_cueqc_features_v5"
-PRE_ASR_CUEQC_RUNTIME_ADAPTER = "pre_asr_planned_island_sequence_v1"
+PRE_ASR_CUEQC_SCHEMA = "cueqc_pre_asr_mamba_v10_binary"
+PRE_ASR_CUEQC_MODEL_ARCH = "cueqc_pre_asr_mamba_v10"
+PRE_ASR_CUEQC_DECISION_VERSION = "pre_asr_cueqc_v10_binary_v1"
+PRE_ASR_CUEQC_FEATURE_SCHEMA = "pre_asr_cueqc_features_v6"
+PRE_ASR_CUEQC_RUNTIME_ADAPTER = "pre_asr_planned_island_sequence_v2"
 PRE_ASR_CUEQC_IGNORE_LABEL = -100
 PRE_ASR_CUEQC_PTM_DIM = FrameSequenceFeatureConfig().max_ptm_dims
 PRE_ASR_CUEQC_PTM_BINS = 8
@@ -33,8 +33,15 @@ PRE_ASR_CUEQC_DEFAULT_DROP_THRESHOLD = 0.95
 
 PRE_ASR_CUEQC_SCALAR_FEATURE_NAMES = (
     "duration_s",
+    "raw_start_s",
+    "raw_end_s",
     "raw_duration_s",
+    "acoustic_start_s",
+    "acoustic_end_s",
+    "acoustic_duration_s",
     "refined_duration_s",
+    "raw_to_acoustic_start_shift_s",
+    "raw_to_acoustic_end_shift_s",
     "prev_gap_s",
     "next_gap_s",
     "speech_segment_count",
@@ -43,6 +50,34 @@ PRE_ASR_CUEQC_SCALAR_FEATURE_NAMES = (
     "boundary_score",
     "start_refine_delta_s",
     "end_refine_delta_s",
+    "refiner_pred_start_delta_s",
+    "refiner_pred_end_delta_s",
+    "refiner_applied_start_delta_s",
+    "refiner_applied_end_delta_s",
+    "refiner_abs_pred_start_delta_s",
+    "refiner_abs_pred_end_delta_s",
+    "refiner_abs_applied_start_delta_s",
+    "refiner_abs_applied_end_delta_s",
+    "refiner_start_confidence",
+    "refiner_end_confidence",
+    "refiner_confidence_min",
+    "refiner_confidence_mean",
+    "refiner_effective_start_delta_max_s",
+    "refiner_effective_end_delta_max_s",
+    "refiner_start_source_model",
+    "refiner_end_source_model",
+    "refiner_start_source_model_scaled",
+    "refiner_end_source_model_scaled",
+    "refiner_start_source_noop_low_confidence",
+    "refiner_end_source_noop_low_confidence",
+    "refiner_start_source_acoustic_fallback",
+    "refiner_end_source_acoustic_fallback",
+    "refiner_start_source_unknown",
+    "refiner_end_source_unknown",
+    "refiner_safety_clamp",
+    "refiner_safety_rollback",
+    "refiner_fallback_used",
+    "refiner_shared_boundary_adjusted",
     "trim_left_s",
     "trim_right_s",
     "trim_total_s",
@@ -69,6 +104,10 @@ PRE_ASR_CUEQC_SCALAR_FEATURE_NAMES = (
     "split_peak_top2",
     "split_peak_top1_prominence",
     "split_peak_top2_prominence",
+    "primary_cut_count",
+    "weak_cut_count",
+    "primary_cut_density",
+    "weak_cut_density",
     "subtitle_min_duration_s",
     "below_subtitle_min_duration",
     "micro_chunk_candidate",
@@ -197,15 +236,35 @@ def _bool_feature(value: Any) -> float:
     return 1.0 if bool(value) else 0.0
 
 
+def _source_feature(value: Any, token: str) -> float:
+    return 1.0 if str(value or "").strip() == token else 0.0
+
+
+def _source_unknown(value: Any, known: set[str]) -> float:
+    raw = str(value or "").strip()
+    return 1.0 if raw and raw not in known else 0.0
+
+
+def _contains_token(value: Any, token: str) -> float:
+    raw = str(value or "")
+    return 1.0 if token in {item.strip() for item in raw.split(",") if item.strip()} else 0.0
+
+
+def _cut_candidates_for_key(span: Any, key: str) -> list[dict[str, Any]]:
+    raw = _packed_value(span, key, [])
+    if not isinstance(raw, Sequence) or isinstance(raw, (str, bytes, bytearray)):
+        return []
+    values: list[dict[str, Any]] = []
+    for item in raw:
+        if isinstance(item, Mapping):
+            values.append(dict(item))
+    return values
+
+
 def _cut_candidates(span: Any) -> list[dict[str, Any]]:
     values: list[dict[str, Any]] = []
     for key in ("primary_cut_candidates", "weak_cut_candidates"):
-        raw = _packed_value(span, key, [])
-        if not isinstance(raw, Sequence) or isinstance(raw, (str, bytes, bytearray)):
-            continue
-        for item in raw:
-            if isinstance(item, Mapping):
-                values.append(dict(item))
+        values.extend(_cut_candidates_for_key(span, key))
     return values
 
 
@@ -283,7 +342,7 @@ def _pooled_ptm_values(
     if available:
         return values, True, schema, parsed_bins or PRE_ASR_CUEQC_PTM_BINS, expected_dim
     if require_ptm_pooling:
-        raise ValueError("Pre-ASR CueQC v9 requires chunk-level pooled PTM features")
+        raise ValueError("Pre-ASR CueQC v10 requires chunk-level pooled PTM features")
     return [0.0] * expected_dim, False, schema, parsed_bins, parsed_dim
 
 
@@ -350,17 +409,48 @@ def candidate_from_span(
     start = _safe_float(_packed_value(span, "start"))
     end = max(start, _safe_float(_packed_value(span, "end"), start))
     duration = max(0.0, end - start)
+    raw_start = _safe_float(_packed_value(span, "raw_start"), start)
+    raw_end = max(raw_start, _safe_float(_packed_value(span, "raw_end"), end))
+    raw_duration = max(0.0, _safe_float(_packed_value(span, "raw_duration"), raw_end - raw_start))
+    acoustic_start = _safe_float(_packed_value(span, "acoustic_start"), start)
+    acoustic_end = max(acoustic_start, _safe_float(_packed_value(span, "acoustic_end"), end))
+    acoustic_duration = max(
+        0.0,
+        _safe_float(_packed_value(span, "acoustic_duration"), acoustic_end - acoustic_start),
+    )
     pooled_values, pooled_available, pooling_schema, pooling_bins, pooling_dim = _pooled_ptm_values(
         span,
         require_ptm_pooling=require_ptm_pooling,
     )
-    start_delta = _safe_float(_packed_value(span, "boundary_start_refine_delta_s"))
-    end_delta = _safe_float(_packed_value(span, "boundary_end_refine_delta_s"))
+    start_delta = _safe_float(
+        _packed_value(
+            span,
+            "boundary_start_refine_delta_s",
+            _packed_value(span, "refiner_applied_start_delta_s"),
+        )
+    )
+    end_delta = _safe_float(
+        _packed_value(
+            span,
+            "boundary_end_refine_delta_s",
+            _packed_value(span, "refiner_applied_end_delta_s"),
+        )
+    )
+    pred_start_delta = _safe_float(_packed_value(span, "refiner_pred_start_delta_s"))
+    pred_end_delta = _safe_float(_packed_value(span, "refiner_pred_end_delta_s"))
+    applied_start_delta = _safe_float(_packed_value(span, "refiner_applied_start_delta_s"), start_delta)
+    applied_end_delta = _safe_float(_packed_value(span, "refiner_applied_end_delta_s"), end_delta)
+    start_confidence = _safe_float(_packed_value(span, "refiner_start_confidence"))
+    end_confidence = _safe_float(_packed_value(span, "refiner_end_confidence"))
+    start_source = str(_packed_value(span, "refiner_start_source", "") or "")
+    end_source = str(_packed_value(span, "refiner_end_source", "") or "")
+    safety_action = str(_packed_value(span, "refiner_safety_action", "") or "")
     trim_left = max(0.0, start_delta)
     trim_right = max(0.0, -end_delta)
     trim_total = trim_left + trim_right
-    raw_duration = duration + trim_total
     top1, top2, prom1, prom2, split_peak_count = _top_split_values(span)
+    primary_cut_count = len(_cut_candidates_for_key(span, "primary_cut_candidates"))
+    weak_cut_count = len(_cut_candidates_for_key(span, "weak_cut_candidates"))
     position, group_count = _planned_island_position(spans, index)
     micro_action = str(_packed_value(span, "micro_resolve_action", "") or "")
     micro_none = 1.0 if not micro_action else 0.0
@@ -374,8 +464,15 @@ def candidate_from_span(
     neighbor_right = _neighbor_features(spans, index, 1)
     features = {
         "duration_s": duration,
+        "raw_start_s": raw_start,
+        "raw_end_s": raw_end,
         "raw_duration_s": raw_duration,
+        "acoustic_start_s": acoustic_start,
+        "acoustic_end_s": acoustic_end,
+        "acoustic_duration_s": acoustic_duration,
         "refined_duration_s": duration,
+        "raw_to_acoustic_start_shift_s": acoustic_start - raw_start,
+        "raw_to_acoustic_end_shift_s": raw_end - acoustic_end,
         "prev_gap_s": _gap(spans, index, left=True),
         "next_gap_s": _gap(spans, index, left=False),
         "speech_segment_count": _sequence_count(_packed_value(span, "speech_segments", [])),
@@ -384,6 +481,58 @@ def candidate_from_span(
         "boundary_score": _safe_float(_packed_value(span, "boundary_score")),
         "start_refine_delta_s": start_delta,
         "end_refine_delta_s": end_delta,
+        "refiner_pred_start_delta_s": pred_start_delta,
+        "refiner_pred_end_delta_s": pred_end_delta,
+        "refiner_applied_start_delta_s": applied_start_delta,
+        "refiner_applied_end_delta_s": applied_end_delta,
+        "refiner_abs_pred_start_delta_s": abs(pred_start_delta),
+        "refiner_abs_pred_end_delta_s": abs(pred_end_delta),
+        "refiner_abs_applied_start_delta_s": abs(applied_start_delta),
+        "refiner_abs_applied_end_delta_s": abs(applied_end_delta),
+        "refiner_start_confidence": start_confidence,
+        "refiner_end_confidence": end_confidence,
+        "refiner_confidence_min": min(start_confidence, end_confidence),
+        "refiner_confidence_mean": (start_confidence + end_confidence) * 0.5,
+        "refiner_effective_start_delta_max_s": _safe_float(
+            _packed_value(span, "refiner_effective_start_delta_max_s")
+        ),
+        "refiner_effective_end_delta_max_s": _safe_float(
+            _packed_value(span, "refiner_effective_end_delta_max_s")
+        ),
+        "refiner_start_source_model": _source_feature(start_source, "model"),
+        "refiner_end_source_model": _source_feature(end_source, "model"),
+        "refiner_start_source_model_scaled": _source_feature(start_source, "model_scaled"),
+        "refiner_end_source_model_scaled": _source_feature(end_source, "model_scaled"),
+        "refiner_start_source_noop_low_confidence": _source_feature(
+            start_source,
+            "noop_low_confidence",
+        ),
+        "refiner_end_source_noop_low_confidence": _source_feature(
+            end_source,
+            "noop_low_confidence",
+        ),
+        "refiner_start_source_acoustic_fallback": _source_feature(
+            start_source,
+            "acoustic_fallback",
+        ),
+        "refiner_end_source_acoustic_fallback": _source_feature(
+            end_source,
+            "acoustic_fallback",
+        ),
+        "refiner_start_source_unknown": _source_unknown(
+            start_source,
+            {"model", "model_scaled", "noop_low_confidence", "acoustic_fallback"},
+        ),
+        "refiner_end_source_unknown": _source_unknown(
+            end_source,
+            {"model", "model_scaled", "noop_low_confidence", "acoustic_fallback"},
+        ),
+        "refiner_safety_clamp": _contains_token(safety_action, "clamp"),
+        "refiner_safety_rollback": _contains_token(safety_action, "rollback"),
+        "refiner_fallback_used": _bool_feature(_packed_value(span, "refiner_fallback_used")),
+        "refiner_shared_boundary_adjusted": _bool_feature(
+            _packed_value(span, "refiner_shared_boundary_adjusted")
+        ),
         "trim_left_s": trim_left,
         "trim_right_s": trim_right,
         "trim_total_s": trim_total,
@@ -416,6 +565,10 @@ def candidate_from_span(
         "split_peak_top2": top2,
         "split_peak_top1_prominence": prom1,
         "split_peak_top2_prominence": prom2,
+        "primary_cut_count": float(primary_cut_count),
+        "weak_cut_count": float(weak_cut_count),
+        "primary_cut_density": float(primary_cut_count) / max(duration, 1e-6),
+        "weak_cut_density": float(weak_cut_count) / max(duration, 1e-6),
         "subtitle_min_duration_s": _safe_float(_packed_value(span, "subtitle_min_duration_s")),
         "below_subtitle_min_duration": _bool_feature(
             _packed_value(span, "below_subtitle_min_duration", False)
@@ -452,6 +605,12 @@ def candidate_from_span(
         "index": index,
         "start": round(start, 6),
         "end": round(end, 6),
+        "raw_start": round(raw_start, 6),
+        "raw_end": round(raw_end, 6),
+        "raw_duration": round(raw_duration, 6),
+        "acoustic_start": round(acoustic_start, 6),
+        "acoustic_end": round(acoustic_end, 6),
+        "acoustic_duration": round(acoustic_duration, 6),
         "planned_island_id": _planned_island_key(span, index),
         "position_in_planned_island": position,
         "num_chunks_in_planned_island": group_count,
@@ -462,6 +621,14 @@ def candidate_from_span(
         "micro_resolve_reason": str(_packed_value(span, "micro_resolve_reason", "") or ""),
         "left_split_score": features["left_split_score"],
         "right_split_score": features["right_split_score"],
+        "refiner_start_confidence": start_confidence,
+        "refiner_end_confidence": end_confidence,
+        "refiner_start_source": start_source,
+        "refiner_end_source": end_source,
+        "refiner_safety_action": safety_action,
+        "refiner_safety_reason": str(_packed_value(span, "refiner_safety_reason", "") or ""),
+        "refiner_fallback_used": bool(features["refiner_fallback_used"]),
+        "refiner_shared_boundary_adjusted": bool(features["refiner_shared_boundary_adjusted"]),
         "features": features,
         "scalar_feature_names": list(PRE_ASR_CUEQC_SCALAR_FEATURE_NAMES),
         "ptm_bin_feature_names": list(PRE_ASR_CUEQC_PTM_BIN_FEATURE_NAMES),
@@ -538,7 +705,7 @@ def sequence_tensors(
     }
 
 
-class PreAsrCueQCMambaV9:
+class PreAsrCueQCMambaV10:
     def __new__(cls, *args: Any, **kwargs: Any):
         import torch
         from torch import nn
@@ -717,7 +884,7 @@ class PreAsrCueQC:
             raise ValueError("Pre-ASR CueQC model_config.ptm_dim does not match runtime")
         if config["scalar_dim"] != len(PRE_ASR_CUEQC_SCALAR_FEATURE_NAMES):
             raise ValueError("Pre-ASR CueQC model_config.scalar_dim does not match runtime")
-        self.model = PreAsrCueQCMambaV9(**config)
+        self.model = PreAsrCueQCMambaV10(**config)
         state = checkpoint.get("model_state_dict")
         if not isinstance(state, dict):
             raise ValueError("Pre-ASR CueQC checkpoint missing model_state_dict")
@@ -874,7 +1041,7 @@ class PreAsrCueQC:
                 reason = "model_keep_default" if not keep_veto else "keep_veto"
             decisions.append(
                 {
-                    "schema": "pre_asr_cueqc_decision_v1",
+                    "schema": "pre_asr_cueqc_decision_v2",
                     "decision_version": PRE_ASR_CUEQC_DECISION_VERSION,
                     "model_schema": PRE_ASR_CUEQC_SCHEMA,
                     "model_arch": PRE_ASR_CUEQC_MODEL_ARCH,

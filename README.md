@@ -124,20 +124,22 @@ Web 提交是否使用 CUDA 取决于后端服务进程是否能看到 GPU，而
      - topographic split peak / acoustic valley 生成 primary_cut_candidates
      - weak_cut_candidates 作为字幕布局和审计时间锚点
      - micro chunk resolver 合并过短且证据较弱的 split
-  -> Boundary Refiner v7
+  -> Boundary Refiner v8
      - 只修 start/end edge delta
+     - 输出 acoustic_start/acoustic_end 与 confidence/safety metadata
      - 不新增 chunk、不合并 chunk、不做 drop
   -> chunk packing / boundary-cache
-  -> 可选 Pre-ASR CueQC v9
+  -> 可选 Pre-ASR CueQC v10
      - keep_for_asr / drop_before_asr
-     - 复用 chunk-level pooled Qwen PTM features
+     - 复用 chunk-level pooled Qwen PTM features 和 Refiner v8 metadata
      - drop 的 chunk 不导出 wav、不进入 ASR
   -> ASR wav chunk export
   -> Qwen ASR text transcription
   -> Boundary chunk subtitle timing
-     - ASR 文本只负责显示
-     - 时间轴以 Boundary chunk 为准
-  -> 字幕 layout
+     - ASR 文本负责字幕文本
+     - acoustic timeline 来自 Boundary chunk / Refiner v8
+  -> Subtitle Layout v2
+     - acoustic/display 双时间轴
      - 20-frame 最小显示时间
      - 2-frame 最小间隔
      - 7s 最大显示 soft guard
@@ -149,7 +151,7 @@ Web 提交是否使用 CUDA 取决于后端服务进程是否能看到 GPU，而
 关键约束：
 
 - ASR chunk 切分只使用 scorer 的 primary acoustic cut candidates。
-- weak cut candidates 有明确时间点，但不直接强切 ASR chunk；它们用于字幕 layout、审计和后续训练。
+- weak cut candidates 有明确时间点，但不直接强切 ASR chunk；它们来自 NMS/primary 选择后未入选但仍有声学证据的切点，用于字幕 layout、审计和后续训练。
 - `20 / video_fps` 是字幕最短显示和 micro chunk 风险线，不是 runtime duration-only drop 阈值。
 - 7 秒是字幕显示 soft guard，不是 ASR chunk 上限。
 - Runtime 不使用具体词黑名单或时长启发式删除短促人声；是否进入 ASR 由 Pre-ASR CueQC 模型标签决定。
@@ -180,8 +182,8 @@ Web 提交是否使用 CUDA 取决于后端服务进程是否能看到 GPU，而
 | Output dim | `2` |
 | Output heads | `speech_prob`, `split_boundary_prob` |
 | Decoder contract | `topographic_split_micro_resolver_v5` |
-| Split training target | hard split core baseline；后续可切 core + ignore collar |
-| Split loss | weighted focal BCE；Tversky 只作为后续 precision-first 实验项 |
+| Split training target | Gaussian boundary heatmap，保留 hard label 作为离线对照入口 |
+| Split loss | weighted focal BCE；split 指标仍需结合 workflow/audit 判断 |
 
 `speech_prob` 负责找 speech frames；`split_boundary_prob` 负责找应切开的 acoustic boundary。Scorer 不做 keep/drop，也不承担字幕显示时长规则。
 
@@ -190,36 +192,39 @@ Decoder 会输出两类 acoustic cut：
 - `primary_cut_candidates`：高可信切点，用于 ASR chunk split。
 - `weak_cut_candidates`：弱证据切点，包含 `time_s/frame/score/prominence/speech_valley/strength`，透传到 chunk metadata、boundary cache、ASR chunk metadata 和字幕 layout。
 
-### Boundary Refiner v7
+Decoder 先按自适应 peak / valley 选 primary cut，并在 NMS 后保留未入选但仍有声学证据的 weak cut。之后 micro resolver 只处理 `<20/video_fps` 的过短中间段：比较左右 split 的 score、prominence 和 speech valley，删除证据较弱的一侧并把短段并入邻段；两侧证据接近时保留该短段并写入 micro metadata。Decoder 不做额外近邻合并，也不因短时长直接 drop。
+
+### Boundary Refiner v8
 
 | 项 | 内容 |
 | --- | --- |
-| Schema | `boundary_edge_refiner_v7` |
-| Runtime adapter | `edge_sequence_v1` |
+| Schema | `boundary_edge_refiner_v8_safe_tight` |
+| Feature schema | `edge_sequence_features_v2` |
+| Runtime adapter | `edge_sequence_v2` |
 | Backbone | `BoundarySequenceClassifier` + `transformers.Mamba2Model` wrapper |
 | Input | scorer 产出的 island edge 上下文特征；包含 left/right/gap 的 PTM/MFCC/timing 统计 |
-| Output dim | `2` |
-| Output heads | `start_delta_s`, `end_delta_s` |
-| Delta clamp | checkpoint metadata 中的 `boundary_delta_max_s` |
+| Output dim | `4` |
+| Output heads | `start_delta_s`, `end_delta_s`, `start_confidence`, `end_confidence` |
+| Delta clamp | dynamic clamp：`boundary_delta_max_s`、duration ratio、minimum duration safety |
 
-Boundary Refiner 只修 chunk 两端。它不学习中间切点、不新增 chunk、不合并 chunk、不做删除路由，也不学习 ASR padding/context budget。
+Boundary Refiner 只修 chunk 两端。它不学习中间切点、不新增 chunk、不合并 chunk、不做删除路由，也不学习 ASR padding/context budget。v8 会把 `raw_*`、`acoustic_*`、delta、confidence、source 和 safety 字段透传给 Pre-ASR CueQC 与字幕 layout。
 
-### Pre-ASR CueQC v9
+### Pre-ASR CueQC v10
 
 | 项 | 内容 |
 | --- | --- |
-| Schema | `cueqc_pre_asr_mamba_v9_binary` |
-| Model arch | `cueqc_pre_asr_mamba_v9` |
-| Feature schema | `pre_asr_cueqc_features_v5` |
-| Runtime adapter | `pre_asr_planned_island_sequence_v1` |
+| Schema | `cueqc_pre_asr_mamba_v10_binary` |
+| Model arch | `cueqc_pre_asr_mamba_v10` |
+| Feature schema | `pre_asr_cueqc_features_v6` |
+| Runtime adapter | `pre_asr_planned_island_sequence_v2` |
 | Runtime position | Boundary Refiner 后、wav chunk export 前 |
 | Architecture | chunk 内 PTM bins Bi-Mamba2 + planned-island chunk-level Bi-Mamba2 + binary head |
 | Output | `keep_for_asr`, `drop_before_asr` |
 | Decision | `p_drop >= PRE_ASR_CUEQC_DROP_THRESHOLD` 时 drop；低置信默认 keep |
 
-Pre-ASR CueQC 只看 ASR 前特征：duration、speech segment count、internal gap、refiner delta、scorer speech/split 分布、邻接 gap、micro chunk evidence，以及从共享 Qwen PTM/encoder frame features 池化得到的 chunk bin embedding。它禁止使用 ASR text、raw text、token trace、decoder stats、ASR confidence 和 subtitle timing。
+Pre-ASR CueQC 只看 ASR 前特征：duration、speech segment count、internal gap、Refiner v8 delta/confidence/safety、raw/acoustic timeline、scorer speech/split 分布、邻接 gap、micro chunk evidence、primary/weak cut density，以及从共享 Qwen PTM/encoder frame features 池化得到的 chunk bin embedding。它禁止使用 ASR text、raw text、token trace、decoder stats、ASR confidence 和 subtitle timing。
 
-v9 需要用 Scorer v7 + Boundary Refiner v7 workflow 重新导出候选并训练，不复用旧 checkpoint。默认仍关闭；开启前应先跑 no-translate workflow smoke / audit，确认 false-drop 风险可接受。
+v10 已用 Scorer v7 + Boundary Refiner v8 workflow 重新导出候选；训练需要 current 人工 keep/drop 标签，不复用旧 checkpoint 或旧候选标签。默认仍关闭；开启前应先跑 no-translate workflow smoke / audit，确认 false-drop 风险可接受。
 
 ### ASR-after CueQC shadow
 
@@ -392,7 +397,7 @@ uv run python -m <module> --help
 - `tools.audits.audit_nav`、`tools.audits.serve_static`、`tools.audits.serve_audits.ps1`、`tools.audits.serve_audits.sh`：维护和启动本地审计导航页。
 - `tools.audits.generate_cueqc_cluster_audit_html`：生成音频审计页，支持 chunk/context 播放、筛选排序和字幕对照。
 - `tools.audits.generate_cueqc_cluster_broadcast_html`：生成独立簇级 keep/drop 广播标注页；混簇/跳过只记录 abstain。
-- `tools.asr.cueqc.export_pre_asr_v9_audit_candidates`：从 current workflow `.timings.json` 导出 Pre-ASR CueQC v9 审计候选。
+- `tools.asr.cueqc.export_pre_asr_v10_audit_candidates`：从 current workflow `.timings.json` 导出 Pre-ASR CueQC v10 审计候选。
 
 命令行完整工作流 smoke：
 

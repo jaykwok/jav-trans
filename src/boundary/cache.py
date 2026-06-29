@@ -15,7 +15,7 @@ from boundary.base import SpeechSegment
 
 log = logging.getLogger(__name__)
 
-BOUNDARY_CACHE_VERSION = 11
+BOUNDARY_CACHE_VERSION = 12
 _AUDIO_SAMPLE_BYTES = 2 * 1024 * 1024
 _AUDIO_KEY_RE = re.compile(r"^[0-9a-fA-F]{8,40}$")
 
@@ -290,6 +290,12 @@ def _packed_chunk_to_dict(chunk: PackedChunk) -> dict:
         "island_count": chunk.island_count,
         "core_start": chunk.core_start,
         "core_end": chunk.core_end,
+        "raw_start": chunk.raw_start,
+        "raw_end": chunk.raw_end,
+        "raw_duration": chunk.raw_duration,
+        "acoustic_start": chunk.acoustic_start,
+        "acoustic_end": chunk.acoustic_end,
+        "acoustic_duration": chunk.acoustic_duration,
         "internal_gap_count": int(chunk.internal_gap_count),
         "internal_gap_max_s": float(chunk.internal_gap_max_s),
         "boundary_score": (
@@ -308,6 +314,20 @@ def _packed_chunk_to_dict(chunk: PackedChunk) -> dict:
             else float(chunk.boundary_end_refine_delta_s)
         ),
         "boundary_decision_source": chunk.boundary_decision_source,
+        "refiner_pred_start_delta_s": chunk.refiner_pred_start_delta_s,
+        "refiner_pred_end_delta_s": chunk.refiner_pred_end_delta_s,
+        "refiner_applied_start_delta_s": chunk.refiner_applied_start_delta_s,
+        "refiner_applied_end_delta_s": chunk.refiner_applied_end_delta_s,
+        "refiner_start_confidence": chunk.refiner_start_confidence,
+        "refiner_end_confidence": chunk.refiner_end_confidence,
+        "refiner_start_source": chunk.refiner_start_source,
+        "refiner_end_source": chunk.refiner_end_source,
+        "refiner_safety_action": chunk.refiner_safety_action,
+        "refiner_safety_reason": chunk.refiner_safety_reason,
+        "refiner_effective_start_delta_max_s": chunk.refiner_effective_start_delta_max_s,
+        "refiner_effective_end_delta_max_s": chunk.refiner_effective_end_delta_max_s,
+        "refiner_fallback_used": bool(chunk.refiner_fallback_used),
+        "refiner_shared_boundary_adjusted": bool(chunk.refiner_shared_boundary_adjusted),
         "scorer_speech_mean": chunk.scorer_speech_mean,
         "scorer_speech_max": chunk.scorer_speech_max,
         "scorer_speech_p90": chunk.scorer_speech_p90,
@@ -363,6 +383,18 @@ def _packed_chunk_from_dict(item: Any) -> PackedChunk:
         ),
         core_start=None if item.get("core_start") is None else float(item.get("core_start")),
         core_end=None if item.get("core_end") is None else float(item.get("core_end")),
+        raw_start=None if item.get("raw_start") is None else float(item.get("raw_start")),
+        raw_end=None if item.get("raw_end") is None else float(item.get("raw_end")),
+        raw_duration=None if item.get("raw_duration") is None else float(item.get("raw_duration")),
+        acoustic_start=(
+            None if item.get("acoustic_start") is None else float(item.get("acoustic_start"))
+        ),
+        acoustic_end=None if item.get("acoustic_end") is None else float(item.get("acoustic_end")),
+        acoustic_duration=(
+            None
+            if item.get("acoustic_duration") is None
+            else float(item.get("acoustic_duration"))
+        ),
         internal_gap_count=int(item.get("internal_gap_count") or 0),
         internal_gap_max_s=float(item.get("internal_gap_max_s") or 0.0),
         boundary_score=(
@@ -383,6 +415,54 @@ def _packed_chunk_from_dict(item: Any) -> PackedChunk:
             else float(item.get("boundary_end_refine_delta_s"))
         ),
         boundary_decision_source=str(item.get("boundary_decision_source") or ""),
+        refiner_pred_start_delta_s=(
+            None
+            if item.get("refiner_pred_start_delta_s") is None
+            else float(item.get("refiner_pred_start_delta_s"))
+        ),
+        refiner_pred_end_delta_s=(
+            None
+            if item.get("refiner_pred_end_delta_s") is None
+            else float(item.get("refiner_pred_end_delta_s"))
+        ),
+        refiner_applied_start_delta_s=(
+            None
+            if item.get("refiner_applied_start_delta_s") is None
+            else float(item.get("refiner_applied_start_delta_s"))
+        ),
+        refiner_applied_end_delta_s=(
+            None
+            if item.get("refiner_applied_end_delta_s") is None
+            else float(item.get("refiner_applied_end_delta_s"))
+        ),
+        refiner_start_confidence=(
+            None
+            if item.get("refiner_start_confidence") is None
+            else float(item.get("refiner_start_confidence"))
+        ),
+        refiner_end_confidence=(
+            None
+            if item.get("refiner_end_confidence") is None
+            else float(item.get("refiner_end_confidence"))
+        ),
+        refiner_start_source=str(item.get("refiner_start_source") or ""),
+        refiner_end_source=str(item.get("refiner_end_source") or ""),
+        refiner_safety_action=str(item.get("refiner_safety_action") or ""),
+        refiner_safety_reason=str(item.get("refiner_safety_reason") or ""),
+        refiner_effective_start_delta_max_s=(
+            None
+            if item.get("refiner_effective_start_delta_max_s") is None
+            else float(item.get("refiner_effective_start_delta_max_s"))
+        ),
+        refiner_effective_end_delta_max_s=(
+            None
+            if item.get("refiner_effective_end_delta_max_s") is None
+            else float(item.get("refiner_effective_end_delta_max_s"))
+        ),
+        refiner_fallback_used=bool(item.get("refiner_fallback_used", False)),
+        refiner_shared_boundary_adjusted=bool(
+            item.get("refiner_shared_boundary_adjusted", False)
+        ),
         scorer_speech_mean=(
             None if item.get("scorer_speech_mean") is None else float(item.get("scorer_speech_mean"))
         ),

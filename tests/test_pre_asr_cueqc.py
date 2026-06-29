@@ -13,7 +13,7 @@ from boundary.sequence_features import (
     FrameSequenceFeatureConfig,
     FrameSequenceFeatureProvider,
 )
-from tools.asr.cueqc.compile_pre_asr_v9_features import compile_features
+from tools.asr.cueqc.compile_pre_asr_v10_features import compile_features
 
 
 def _ptm_pool() -> list[float]:
@@ -183,13 +183,13 @@ def test_pre_asr_cueqc_requires_pooled_ptm_when_requested():
         pre_asr_cueqc.candidate_from_span(spans, 0, require_ptm_pooling=True)
 
 
-def test_pre_asr_cueqc_v9_model_forward_backward_ignores_padding():
+def test_pre_asr_cueqc_v10_model_forward_backward_ignores_padding():
     torch = pytest.importorskip("torch")
     transformers = pytest.importorskip("transformers")
     if not hasattr(transformers, "Mamba2Model"):
         pytest.skip("transformers.Mamba2Model is unavailable")
 
-    model = pre_asr_cueqc.PreAsrCueQCMambaV9(
+    model = pre_asr_cueqc.PreAsrCueQCMambaV10(
         ptm_dim=4,
         scalar_dim=3,
         hidden_size=16,

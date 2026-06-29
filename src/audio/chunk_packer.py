@@ -26,6 +26,12 @@ class PackedChunk:
     island_count: int | None = None
     core_start: float | None = None
     core_end: float | None = None
+    raw_start: float | None = None
+    raw_end: float | None = None
+    raw_duration: float | None = None
+    acoustic_start: float | None = None
+    acoustic_end: float | None = None
+    acoustic_duration: float | None = None
     internal_gap_count: int = 0
     internal_gap_max_s: float = 0.0
     boundary_score: float | None = None
@@ -34,6 +40,20 @@ class PackedChunk:
     boundary_start_refine_delta_s: float | None = None
     boundary_end_refine_delta_s: float | None = None
     boundary_decision_source: str = ""
+    refiner_pred_start_delta_s: float | None = None
+    refiner_pred_end_delta_s: float | None = None
+    refiner_applied_start_delta_s: float | None = None
+    refiner_applied_end_delta_s: float | None = None
+    refiner_start_confidence: float | None = None
+    refiner_end_confidence: float | None = None
+    refiner_start_source: str = ""
+    refiner_end_source: str = ""
+    refiner_safety_action: str = ""
+    refiner_safety_reason: str = ""
+    refiner_effective_start_delta_max_s: float | None = None
+    refiner_effective_end_delta_max_s: float | None = None
+    refiner_fallback_used: bool = False
+    refiner_shared_boundary_adjusted: bool = False
     scorer_speech_mean: float | None = None
     scorer_speech_max: float | None = None
     scorer_speech_p90: float | None = None
@@ -82,7 +102,7 @@ def pack_speech_segments(
     """Convert scorer-produced speech islands into ASR chunks.
 
     Scorer v7 is the only island splitter. The planner no longer creates
-    duration-driven splits or secondary boundary candidates; Boundary Refiner v7
+    duration-driven splits or secondary boundary candidates; Boundary Refiner v8
     may only adjust the start/end of already-planned island chunks.
     """
 
@@ -137,8 +157,10 @@ def _make_chunk(
     split_reason: str,
     boundary_decision: BoundaryDecision | None,
 ) -> PackedChunk:
-    core_start = islands[0].start
-    core_end = islands[-1].end
+    raw_start = islands[0].start
+    raw_end = islands[-1].end
+    core_start = raw_start
+    core_end = raw_end
     applied_start_delta_s = (
         previous_decision.start_refine_delta_s
         if previous_decision is not None
@@ -149,7 +171,7 @@ def _make_chunk(
         if boundary_decision is not None
         else None
     )
-    core_start, core_end = _apply_boundary_delta(
+    core_start, core_end, safety_action, safety_reason = _apply_boundary_delta(
         core_start,
         core_end,
         previous_core_end=previous_core_end,
@@ -180,6 +202,12 @@ def _make_chunk(
         speech_segments=[island.to_speech_segment() for island in islands],
         duration=end - start,
         split_reason=split_reason,
+        raw_start=raw_start,
+        raw_end=raw_end,
+        raw_duration=max(0.0, raw_end - raw_start),
+        acoustic_start=start,
+        acoustic_end=end,
+        acoustic_duration=max(0.0, end - start),
         core_start=core_start,
         core_end=core_end,
         internal_gap_count=_internal_gap_count(islands),
@@ -191,6 +219,32 @@ def _make_chunk(
         boundary_end_refine_delta_s=applied_end_delta_s,
         boundary_decision_source=(
             boundary_decision.source if boundary_decision is not None else ""
+        ),
+        refiner_pred_start_delta_s=_decision_float(previous_decision, "raw_start_refine_delta_s"),
+        refiner_pred_end_delta_s=_decision_float(boundary_decision, "raw_end_refine_delta_s"),
+        refiner_applied_start_delta_s=applied_start_delta_s,
+        refiner_applied_end_delta_s=applied_end_delta_s,
+        refiner_start_confidence=_decision_float(previous_decision, "start_confidence"),
+        refiner_end_confidence=_decision_float(boundary_decision, "end_confidence"),
+        refiner_start_source=_decision_str(previous_decision, "start_source"),
+        refiner_end_source=_decision_str(boundary_decision, "end_source"),
+        refiner_safety_action=safety_action,
+        refiner_safety_reason=safety_reason,
+        refiner_effective_start_delta_max_s=_decision_float(
+            previous_decision,
+            "effective_start_delta_max_s",
+        ),
+        refiner_effective_end_delta_max_s=_decision_float(
+            boundary_decision,
+            "effective_end_delta_max_s",
+        ),
+        refiner_fallback_used=(
+            _decision_bool(previous_decision, "fallback_used")
+            or _decision_bool(boundary_decision, "fallback_used")
+        ),
+        refiner_shared_boundary_adjusted=(
+            _decision_bool(previous_decision, "shared_boundary_adjusted")
+            or _decision_bool(boundary_decision, "shared_boundary_adjusted")
         ),
         subtitle_min_duration_s=subtitle_min_duration_s,
         below_subtitle_min_duration=(
@@ -225,6 +279,23 @@ def _first_float(values) -> float | None:
 def _max_float(values) -> float | None:
     finite = [float(value) for value in values if value is not None]
     return max(finite) if finite else None
+
+
+def _decision_float(decision: BoundaryDecision | None, name: str) -> float | None:
+    if decision is None:
+        return None
+    value = getattr(decision, name, None)
+    return None if value is None else float(value)
+
+
+def _decision_str(decision: BoundaryDecision | None, name: str) -> str:
+    if decision is None:
+        return ""
+    return str(getattr(decision, name, "") or "")
+
+
+def _decision_bool(decision: BoundaryDecision | None, name: str) -> bool:
+    return bool(decision is not None and getattr(decision, name, False))
 
 
 def _merge_cut_candidates(values) -> list[dict[str, Any]]:
@@ -276,7 +347,7 @@ def _apply_boundary_delta(
     previous_decision: BoundaryDecision | None,
     next_decision: BoundaryDecision | None,
     min_core_s: float,
-) -> tuple[float, float]:
+) -> tuple[float, float, str, str]:
     min_duration = max(0.0, float(min_core_s))
     start = float(core_start)
     end = float(core_end)
@@ -290,11 +361,20 @@ def _apply_boundary_delta(
         start += float(start_delta)
     if end_delta is not None:
         end += float(end_delta)
+    desired_start = start
+    desired_end = end
 
     left_limit = 0.0 if previous_core_end is None else float(previous_core_end)
     right_limit = float("inf") if next_core_start is None else float(next_core_start)
     start = max(left_limit, min(start, max(left_limit, right_limit - min_duration)))
     end = min(right_limit, max(end, start + min_duration))
+    reasons: list[str] = []
+    if abs(start - desired_start) > 1e-9:
+        reasons.append("start_clamped")
+    if abs(end - desired_end) > 1e-9:
+        reasons.append("end_clamped")
     if end < start:
         end = start
-    return start, end
+        reasons.append("invalid_duration_rollback")
+    action = "clamp" if reasons else ""
+    return start, end, action, ",".join(reasons)

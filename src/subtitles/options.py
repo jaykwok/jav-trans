@@ -20,6 +20,8 @@ def _env_bool(name: str, default: bool) -> bool:
 
 @dataclass(frozen=True)
 class SubtitleOptions:
+    layout_engine: str = "anchor_aware_dp_v2"
+    timing_model: str = "acoustic_display_dual_timeline_v1"
     max_display_duration_s: float = 7.0
     min_duration: float = 0.6
     reading_cps: float = 7.0
@@ -34,6 +36,12 @@ class SubtitleOptions:
     timing_polish_enabled: bool = True
     short_gap_collapse_s: float = 0.5
     linger_s: float = 0.45
+    weak_cut_snap_short_s: float = 0.25
+    weak_cut_snap_normal_s: float = 0.40
+    weak_cut_snap_long_s: float = 0.60
+    max_display_shift_from_acoustic_start_s: float = 0.15
+    max_display_shift_from_acoustic_end_s: float = 0.20
+    max_total_display_extension_s: float = 0.30
 
     @property
     def effective_video_fps(self) -> float:
@@ -70,6 +78,11 @@ class SubtitleOptions:
     @classmethod
     def from_env(cls) -> "SubtitleOptions":
         return cls(
+            layout_engine=os.getenv("SUBTITLE_LAYOUT_ENGINE", "anchor_aware_dp_v2").strip(),
+            timing_model=os.getenv(
+                "SUBTITLE_TIMING_MODEL",
+                "acoustic_display_dual_timeline_v1",
+            ).strip(),
             min_duration=float(
                 os.getenv(
                     "SUBTITLE_MIN_DURATION",
@@ -95,6 +108,30 @@ class SubtitleOptions:
                 float(os.getenv("SUBTITLE_SHORT_GAP_COLLAPSE_S", "0.5")),
             ),
             linger_s=max(0.0, float(os.getenv("SUBTITLE_LINGER_S", "0.45"))),
+            weak_cut_snap_short_s=max(
+                0.0,
+                float(os.getenv("SUBTITLE_WEAK_CUT_SNAP_SHORT_S", "0.25")),
+            ),
+            weak_cut_snap_normal_s=max(
+                0.0,
+                float(os.getenv("SUBTITLE_WEAK_CUT_SNAP_NORMAL_S", "0.40")),
+            ),
+            weak_cut_snap_long_s=max(
+                0.0,
+                float(os.getenv("SUBTITLE_WEAK_CUT_SNAP_LONG_S", "0.60")),
+            ),
+            max_display_shift_from_acoustic_start_s=max(
+                0.0,
+                float(os.getenv("SUBTITLE_MAX_DISPLAY_SHIFT_FROM_ACOUSTIC_START_S", "0.15")),
+            ),
+            max_display_shift_from_acoustic_end_s=max(
+                0.0,
+                float(os.getenv("SUBTITLE_MAX_DISPLAY_SHIFT_FROM_ACOUSTIC_END_S", "0.20")),
+            ),
+            max_total_display_extension_s=max(
+                0.0,
+                float(os.getenv("SUBTITLE_MAX_TOTAL_DISPLAY_EXTENSION_S", "0.30")),
+            ),
         )
 
     def signature(self) -> dict:

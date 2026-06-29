@@ -16,7 +16,7 @@ class _SequenceDenyRefiner:
         assert features == [[42.0]]
         return [
             BoundaryDecision(
-                source="edge_sequence_refiner_v7",
+                source="edge_sequence_refiner_v8",
                 start_refine_delta_s=0.0,
                 end_refine_delta_s=0.0,
             )
@@ -44,12 +44,12 @@ class _DeltaSequenceRefiner:
         assert features == [[1.0], [2.0]]
         return [
             BoundaryDecision(
-                source="edge_sequence_refiner_v7",
+                source="edge_sequence_refiner_v8",
                 start_refine_delta_s=-0.2,
                 end_refine_delta_s=-0.3,
             ),
             BoundaryDecision(
-                source="edge_sequence_refiner_v7",
+                source="edge_sequence_refiner_v8",
                 start_refine_delta_s=0.15,
                 end_refine_delta_s=0.25,
             ),
@@ -104,7 +104,7 @@ def test_sequence_refiner_scores_gap_without_merging():
     assert [(chunk.core_start, chunk.core_end) for chunk in chunks] == [(0.0, 2.0), (3.0, 5.0)]
     assert chunks[0].split_reason == "speech_island"
     assert chunks[0].boundary_score is None
-    assert chunks[0].boundary_decision_source == "edge_sequence_refiner_v7"
+    assert chunks[0].boundary_decision_source == "edge_sequence_refiner_v8"
     assert [(chunk.start, chunk.end) for chunk in chunks] == [(0.0, 2.0), (3.0, 5.0)]
 
 

@@ -369,9 +369,12 @@ code { background: #eef3ef; border-radius: 4px; padding: 1px 4px; }
         </select>
       </div>
       <div class="toolbar">
+        <button id="saveClusters" type="button">保存簇级标签</button>
         <button id="downloadClusters" type="button">下载簇级标签</button>
-        <button id="downloadBroadcast" class="primary" type="button">下载广播样本标签</button>
+        <button id="saveBroadcast" class="primary" type="button">保存广播样本标签</button>
+        <button id="downloadBroadcast" type="button">下载广播样本标签</button>
       </div>
+      <div class="status" id="saveStatus"></div>
       <div class="status" id="progressText"></div>
     </div>
     <div class="cluster-list" id="clusterList"></div>
@@ -723,12 +726,33 @@ function exportBroadcastRows() {
 }
 function downloadJsonl(filename, rows) {
   const text = rows.map(row => JSON.stringify(row)).join("\\n") + (rows.length ? "\\n" : "");
+  downloadText(filename, text);
+}
+function downloadText(filename, text) {
   const blob = new Blob([text], {type: "application/jsonl;charset=utf-8"});
   const a = document.createElement("a");
   a.href = URL.createObjectURL(blob);
   a.download = filename;
   a.click();
   URL.revokeObjectURL(a.href);
+}
+async function saveJsonl(filename, rows) {
+  const text = rows.map(row => JSON.stringify(row)).join("\\n") + (rows.length ? "\\n" : "");
+  const status = document.getElementById("saveStatus");
+  status.textContent = "正在保存...";
+  try {
+    const response = await fetch("/__audit_api__/save-labels", {
+      method: "POST",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({href: location.pathname, filename, content: text})
+    });
+    const payload = await response.json().catch(() => ({}));
+    if (!response.ok || !payload.ok) throw new Error(payload.error || `HTTP ${response.status}`);
+    status.textContent = "已保存到 " + payload.path;
+  } catch (error) {
+    status.textContent = "保存到审计目录失败，已改为下载：" + (error && error.message ? error.message : error);
+    downloadText(filename, text);
+  }
 }
 function updateProgress() {
   const counts = {keep: 0, drop: 0, mixed_skip: 0, skip: 0, unmarked: 0};
@@ -765,6 +789,8 @@ document.getElementById("clusterNotes").addEventListener("input", () => {
 });
 document.getElementById("downloadClusters").onclick = () => downloadJsonl("cueqc_cluster_labels.jsonl", exportClusterRows());
 document.getElementById("downloadBroadcast").onclick = () => downloadJsonl("cueqc_cluster_broadcast_labels.jsonl", exportBroadcastRows());
+document.getElementById("saveClusters").onclick = () => saveJsonl("cueqc_cluster_labels.jsonl", exportClusterRows()).catch(error => alert(error.message || error));
+document.getElementById("saveBroadcast").onclick = () => saveJsonl("cueqc_cluster_broadcast_labels.jsonl", exportBroadcastRows()).catch(error => alert(error.message || error));
 applyClusterFilters();
 updateProgress();
 </script>

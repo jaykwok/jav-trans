@@ -539,7 +539,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--boundary-refiner-model-path-by-repo",
         default=os.getenv("BOUNDARY_REFINER_MODEL_PATH_BY_REPO", ""),
-        help="Required repo-id checkpoint map: '<repo_id>=<boundary_edge_refiner_v7.pt>[,<repo_id>=...]'.",
+        help="Required repo-id checkpoint map: '<repo_id>=<boundary_edge_refiner_v8_safe_tight.pt>[,<repo_id>=...]'.",
     )
     parser.add_argument(
         "--cueqc-model-path-by-repo",
@@ -562,12 +562,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--pre-asr-cueqc-enabled",
         action=argparse.BooleanOptionalAction,
         default=_env_bool("PRE_ASR_CUEQC_ENABLED", False),
-        help="Run Pre-ASR CueQC v9 after Boundary Refiner and before ASR chunk export.",
+        help="Run Pre-ASR CueQC v10 after Boundary Refiner and before ASR chunk export.",
     )
     parser.add_argument(
         "--pre-asr-cueqc-model-path-by-repo",
         default=os.getenv("PRE_ASR_CUEQC_MODEL_PATH_BY_REPO", ""),
-        help="Optional repo-id checkpoint map: '<repo_id>=<cueqc_pre_asr_mamba_v9_binary.pt>[,<repo_id>=...]'.",
+        help="Optional repo-id checkpoint map: '<repo_id>=<cueqc_pre_asr_mamba_v10_binary.pt>[,<repo_id>=...]'.",
     )
     parser.add_argument("--pre-asr-cueqc-device", default=os.getenv("PRE_ASR_CUEQC_DEVICE", "auto"))
     parser.add_argument(

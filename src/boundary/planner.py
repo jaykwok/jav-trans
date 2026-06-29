@@ -14,7 +14,7 @@ class BoundaryPlannerConfig:
 
     def signature(self) -> dict:
         return {
-            "planner": "edge_sequence_island_planner_v7",
+            "planner": "edge_sequence_island_planner_v8",
             "frame_hop_s": self.frame_hop_s,
             "sequence_batch_size": self.sequence_batch_size,
         }
@@ -123,7 +123,7 @@ def _island_from_segment(segment: SpeechSegment) -> PlannedIsland:
         score=segment.score,
         boundary_score=segment.right_split_score,
         boundary_reason=segment.micro_resolve_reason,
-        boundary_source="micro_split_resolver" if segment.micro_resolve_reason else "",
+        boundary_source="split_resolver" if segment.micro_resolve_reason else "",
         subtitle_min_duration_s=segment.subtitle_min_duration_s,
         below_subtitle_min_duration=segment.below_subtitle_min_duration,
         micro_chunk_candidate=segment.micro_chunk_candidate,

@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import mimetypes
+import re
 import sys
 import time
 import webbrowser
@@ -17,8 +18,11 @@ from tools.audits.audit_nav import AUDIT_RM_ROOT, AUDIT_ROOT, PROJECT_ROOT, dele
 
 
 API_DELETE_AUDIT = "/__audit_api__/delete-audit"
+API_SAVE_LABELS = "/__audit_api__/save-labels"
 BODY_LIMIT_BYTES = 64 * 1024
+SAVE_LABELS_BODY_LIMIT_BYTES = 16 * 1024 * 1024
 COPY_CHUNK_BYTES = 1024 * 1024
+SAFE_LABEL_FILENAME_RE = re.compile(r"^[A-Za-z0-9_.-]+\.(?:jsonl|json|txt)$")
 CLIENT_DISCONNECT_ERRORS: tuple[type[OSError], ...] = (
     BrokenPipeError,
     ConnectionAbortedError,
@@ -100,6 +104,10 @@ def guess_content_type(path: Path) -> str:
     return "application/octet-stream"
 
 
+def should_disable_cache(content_type: str) -> bool:
+    return content_type.startswith("text/html")
+
+
 def _json_bytes(payload: dict[str, Any]) -> bytes:
     return json.dumps(payload, ensure_ascii=False).encode("utf-8")
 
@@ -113,12 +121,50 @@ def make_handler(
     root = root.resolve()
     audit_root = audit_root.resolve()
     rm_root = rm_root.resolve()
+    try:
+        audit_url_prefix = audit_root.relative_to(root).as_posix().strip("/")
+    except ValueError:
+        audit_url_prefix = "agents/audits"
+
+    def _audit_href_from_page_href(href: str) -> str:
+        if not href.strip():
+            raise ValueError("missing href")
+        if "://" in href:
+            raise ValueError(f"audit href must be relative or local path: {href}")
+        raw_path = unquote(urlsplit(href).path).replace("\\", "/").lstrip("/")
+        if raw_path.startswith(audit_url_prefix + "/"):
+            raw_path = raw_path[len(audit_url_prefix) + 1 :]
+        if not raw_path:
+            raise ValueError(f"invalid audit href: {href}")
+        return raw_path
+
+    def _resolve_label_target(*, href: str, filename: str) -> Path:
+        if not SAFE_LABEL_FILENAME_RE.match(filename):
+            raise ValueError(f"unsafe label filename: {filename}")
+        relative_href = _audit_href_from_page_href(href)
+        target = (audit_root / relative_href).resolve()
+        root_audit = audit_root.resolve()
+        try:
+            target.relative_to(root_audit)
+        except ValueError as exc:
+            raise ValueError(f"audit href escapes audit root: {href}") from exc
+        target_dir = target.parent if target.name == "index.html" or target.suffix else target
+        if target_dir == root_audit:
+            raise ValueError("refusing to save labels at audit root")
+        if not (target_dir / "index.html").exists():
+            raise FileNotFoundError(f"audit index not found: {target_dir / 'index.html'}")
+        label_path = (target_dir / filename).resolve()
+        try:
+            label_path.relative_to(target_dir.resolve())
+        except ValueError as exc:
+            raise ValueError(f"label path escapes audit directory: {filename}") from exc
+        return label_path
 
     class AuditStaticHandler(BaseHTTPRequestHandler):
         server_version = "JAVTransAuditStatic/1.0"
 
         def do_OPTIONS(self) -> None:  # noqa: N802
-            if urlsplit(self.path).path != API_DELETE_AUDIT:
+            if urlsplit(self.path).path not in {API_DELETE_AUDIT, API_SAVE_LABELS}:
                 self.send_error(HTTPStatus.NOT_FOUND)
                 return
             self.send_response(HTTPStatus.NO_CONTENT)
@@ -127,7 +173,11 @@ def make_handler(
             self.end_headers()
 
         def do_POST(self) -> None:  # noqa: N802
-            if urlsplit(self.path).path != API_DELETE_AUDIT:
+            api_path = urlsplit(self.path).path
+            if api_path == API_SAVE_LABELS:
+                self._handle_save_labels()
+                return
+            if api_path != API_DELETE_AUDIT:
                 self._send_json(HTTPStatus.NOT_FOUND, {"ok": False, "error": "not found"})
                 return
             try:
@@ -153,19 +203,52 @@ def make_handler(
             except Exception as exc:  # pragma: no cover - keeps the browser API readable.
                 self._send_json(HTTPStatus.INTERNAL_SERVER_ERROR, {"ok": False, "error": str(exc)})
 
+        def _handle_save_labels(self) -> None:
+            try:
+                payload = self._read_json_body(limit=SAVE_LABELS_BODY_LIMIT_BYTES)
+                href = payload.get("href")
+                filename = payload.get("filename")
+                content = payload.get("content")
+                if not isinstance(href, str) or not href.strip():
+                    self._send_json(HTTPStatus.BAD_REQUEST, {"ok": False, "error": "missing href"})
+                    return
+                if not isinstance(filename, str) or not filename.strip():
+                    self._send_json(HTTPStatus.BAD_REQUEST, {"ok": False, "error": "missing filename"})
+                    return
+                if not isinstance(content, str):
+                    self._send_json(HTTPStatus.BAD_REQUEST, {"ok": False, "error": "missing content"})
+                    return
+                target = _resolve_label_target(href=href, filename=filename.strip())
+                target.write_text(content, encoding="utf-8")
+                self.log_message("saved labels href=%s path=%s bytes=%d", href, target, len(content.encode("utf-8")))
+                self._send_json(
+                    HTTPStatus.OK,
+                    {
+                        "ok": True,
+                        "path": target.relative_to(root).as_posix(),
+                        "bytes": len(content.encode("utf-8")),
+                    },
+                )
+            except FileNotFoundError as exc:
+                self._send_json(HTTPStatus.NOT_FOUND, {"ok": False, "error": str(exc)})
+            except (json.JSONDecodeError, ValueError, PermissionError) as exc:
+                self._send_json(HTTPStatus.BAD_REQUEST, {"ok": False, "error": str(exc)})
+            except Exception as exc:  # pragma: no cover - keeps the browser API readable.
+                self._send_json(HTTPStatus.INTERNAL_SERVER_ERROR, {"ok": False, "error": str(exc)})
+
         def do_GET(self) -> None:  # noqa: N802
             self._serve_static(head_only=False)
 
         def do_HEAD(self) -> None:  # noqa: N802
             self._serve_static(head_only=True)
 
-        def _read_json_body(self) -> dict[str, Any]:
+        def _read_json_body(self, *, limit: int = BODY_LIMIT_BYTES) -> dict[str, Any]:
             raw_length = self.headers.get("Content-Length", "0")
             try:
                 length = int(raw_length)
             except ValueError as exc:
                 raise ValueError("invalid Content-Length") from exc
-            if length > BODY_LIMIT_BYTES:
+            if length > limit:
                 raise ValueError("request body too large")
             body = self.rfile.read(length) if length else b"{}"
             payload = json.loads(body.decode("utf-8") or "{}")
@@ -221,6 +304,10 @@ def make_handler(
                 start = requested_range.start
                 length = requested_range.length
             self.send_header("Content-Type", content_type)
+            if should_disable_cache(content_type):
+                self.send_header("Cache-Control", "no-store, max-age=0")
+                self.send_header("Pragma", "no-cache")
+                self.send_header("Expires", "0")
             self.send_header("Accept-Ranges", "bytes")
             self.send_header("Last-Modified", self.date_time_string(stat_result.st_mtime))
             self.end_headers()
@@ -279,6 +366,7 @@ def main(argv: list[str] | None = None) -> int:
     print(f"Audit navigation: {base_url}/agents/audits/index.html", flush=True)
     print(f"Latest audit entry: {base_url}/agents/audits/latest-audit.html", flush=True)
     print("Delete API: enabled at /__audit_api__/delete-audit", flush=True)
+    print("Save labels API: enabled at /__audit_api__/save-labels", flush=True)
     print("Range requests: enabled", flush=True)
     if args.open:
         webbrowser.open(f"{base_url}/agents/audits/index.html")

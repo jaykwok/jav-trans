@@ -19,8 +19,8 @@ from boundary.refiner import (
     LEARNED_REFINER_SCHEMA,
     LearnedBoundaryRefiner,
     build_learned_refiner_checkpoint,
+    load_edge_sequence_refiner_v8_checkpoint,
     load_learned_refiner_checkpoint,
-    load_edge_sequence_refiner_v7_checkpoint,
 )
 from boundary.sequence_features import (
     FRAME_SEQUENCE_FEATURE_SCHEMA,
@@ -77,8 +77,8 @@ __all__ = [
     "get_default_config",
     "get_feature_dim",
     "frame_sequence_feature_names",
+    "load_edge_sequence_refiner_v8_checkpoint",
     "load_learned_refiner_checkpoint",
-    "load_edge_sequence_refiner_v7_checkpoint",
     "normalize_boundary_backbone",
     "plan_boundary_chunks",
     "validate_sequence_features",

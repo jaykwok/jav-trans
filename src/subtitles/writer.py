@@ -22,6 +22,14 @@ _COMPACT_SPACE_RE = re.compile(r"\s+")
 _WRAP_PUNCTUATION = "，、。！？…"
 _SENTENCE_BOUNDARY_RE = re.compile(r"[。！？!?…；;，、,]\s*")
 
+
+def _safe_float(value, default: float = 0.0) -> float:
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return float(default)
+    return parsed if math.isfinite(parsed) else float(default)
+
 def _count_text_units(text: str, *, ascii_char_weight: float = 0.55) -> float:
     compact = _COMPACT_SPACE_RE.sub("", (text or "").strip())
     if not compact:
@@ -183,6 +191,15 @@ def _subtitle_max_display_duration_s(options: SubtitleOptions) -> float:
     return max(0.0, float(options.max_display_duration_s))
 
 
+def _weak_cut_snap_window_s(duration_s: float, options: SubtitleOptions) -> float:
+    duration = max(0.0, float(duration_s))
+    if duration <= 3.0:
+        return max(0.0, float(options.weak_cut_snap_short_s))
+    if duration <= _subtitle_max_display_duration_s(options):
+        return max(0.0, float(options.weak_cut_snap_normal_s))
+    return max(0.0, float(options.weak_cut_snap_long_s))
+
+
 def _text_for_timing(block: dict) -> str:
     return str(
         block.get("ja_text")
@@ -296,6 +313,246 @@ def _weak_cut_times(block: dict, *, start: float, end: float) -> list[float]:
     return sorted(set(times))
 
 
+def _anchor_times(block: dict, *, start: float, end: float) -> list[dict]:
+    anchors: list[dict] = []
+    for key, anchor_type in (
+        ("primary_cut_candidates", "primary_cut"),
+        ("weak_cut_candidates", "weak_cut"),
+    ):
+        for candidate in block.get(key) or []:
+            if not isinstance(candidate, dict):
+                continue
+            try:
+                time_s = float(candidate["time_s"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            if not start < time_s < end:
+                continue
+            anchors.append(
+                {
+                    "time_s": time_s,
+                    "anchor_type": anchor_type,
+                    "score": _safe_float(candidate.get("score"), 0.0),
+                    "prominence": _safe_float(candidate.get("prominence"), 0.0),
+                    "speech_valley": _safe_float(candidate.get("speech_valley"), 0.0),
+                    "strength": _safe_float(candidate.get("strength"), 0.0),
+                }
+            )
+    anchors.sort(
+        key=lambda item: (
+            float(item["time_s"]),
+            0 if item["anchor_type"] == "primary_cut" else 1,
+            -float(item.get("strength") or 0.0),
+        )
+    )
+    return anchors
+
+
+def _text_break_score(text: str, position: int) -> float:
+    if position <= 0 or position >= len(text):
+        return 0.0
+    previous = text[position - 1]
+    if previous in "。！？!?…":
+        return 0.0
+    if previous in "；;，、,":
+        return 0.15
+    if previous.isspace():
+        return 0.35
+    return 0.75
+
+
+def _candidate_text_positions_for_dp(text: str, *, split_count: int) -> list[int]:
+    raw = str(text or "")
+    if len(raw) <= 1:
+        return []
+    positions = set(_candidate_text_boundaries(raw))
+    for index in range(1, max(1, split_count) + 1):
+        position = _fallback_text_position(raw, index / float(split_count + 1))
+        if 0 < position < len(raw):
+            positions.add(position)
+    return sorted(position for position in positions if 0 < position < len(raw))
+
+
+def _choose_anchor_for_target(
+    anchors: list[dict],
+    *,
+    target: float,
+    snap_window_s: float,
+) -> tuple[float, str, float, float]:
+    available = [
+        anchor
+        for anchor in anchors
+        if abs(float(anchor["time_s"]) - target) <= snap_window_s
+    ]
+    if not available:
+        return target, "proportional_text", 0.0, 0.0
+    selected = min(
+        available,
+        key=lambda anchor: (
+            abs(float(anchor["time_s"]) - target),
+            0 if anchor["anchor_type"] == "primary_cut" else 1,
+            -float(anchor.get("strength") or 0.0),
+        ),
+    )
+    distance = abs(float(selected["time_s"]) - target)
+    strength = float(selected.get("strength") or selected.get("score") or 0.0)
+    return float(selected["time_s"]), str(selected["anchor_type"]), strength, distance
+
+
+def _long_display_dp_plan(
+    block: dict,
+    *,
+    options: SubtitleOptions,
+) -> dict | None:
+    start = float(block.get("start", 0.0))
+    end = max(start, float(block.get("end", start)))
+    duration = end - start
+    max_display_s = _subtitle_max_display_duration_s(options)
+    if max_display_s <= 0.0 or duration <= max_display_s:
+        return None
+    text = _text_for_timing(block)
+    if not text.strip():
+        return None
+    min_duration_s = _subtitle_min_duration_s(options)
+    split_count = max(1, int(math.ceil(duration / max_display_s)) - 1)
+    positions = _candidate_text_positions_for_dp(text, split_count=split_count)
+    if not positions:
+        return None
+    ratios_by_position = _text_unit_prefix_ratios(text, positions)
+    anchors = _anchor_times(block, start=start, end=end)
+    snap_window_s = _weak_cut_snap_window_s(duration, options)
+    nodes: list[dict] = [
+        {
+            "position": 0,
+            "time_s": start,
+            "ratio": 0.0,
+            "source": "start",
+            "anchor_strength": 0.0,
+            "snap_distance_s": 0.0,
+        }
+    ]
+    for position in positions:
+        ratio = ratios_by_position.get(position, 0.0)
+        target = start + duration * ratio
+        time_s, source, strength, distance = _choose_anchor_for_target(
+            anchors,
+            target=target,
+            snap_window_s=snap_window_s,
+        )
+        nodes.append(
+            {
+                "position": position,
+                "time_s": max(start, min(end, time_s)),
+                "ratio": ratio,
+                "source": source,
+                "anchor_strength": strength,
+                "snap_distance_s": distance,
+            }
+        )
+    for anchor in anchors:
+        anchor_ratio = (float(anchor["time_s"]) - start) / max(duration, 1e-6)
+        if positions:
+            position = min(
+                positions,
+                key=lambda item: (
+                    abs(ratios_by_position.get(item, 0.0) - anchor_ratio),
+                    _text_break_score(text, item),
+                    item,
+                ),
+            )
+        else:
+            position = _fallback_text_position(text, anchor_ratio)
+        if not 0 < position < len(text):
+            continue
+        target = start + duration * ratios_by_position.get(position, anchor_ratio)
+        nodes.append(
+            {
+                "position": position,
+                "time_s": float(anchor["time_s"]),
+                "ratio": ratios_by_position.get(position, anchor_ratio),
+                "source": str(anchor["anchor_type"]),
+                "anchor_strength": float(anchor.get("strength") or anchor.get("score") or 0.0),
+                "snap_distance_s": abs(float(anchor["time_s"]) - target),
+            }
+        )
+    nodes.append(
+        {
+            "position": len(text),
+            "time_s": end,
+            "ratio": 1.0,
+            "source": "end",
+            "anchor_strength": 0.0,
+            "snap_distance_s": 0.0,
+        }
+    )
+    nodes = sorted(nodes, key=lambda item: (int(item["position"]), float(item["time_s"])))
+
+    best: dict[int, tuple[float, int | None]] = {0: (0.0, None)}
+    for j in range(1, len(nodes)):
+        best_cost = float("inf")
+        best_prev: int | None = None
+        for i in range(0, j):
+            if i not in best:
+                continue
+            piece_start = float(nodes[i]["time_s"])
+            piece_end = float(nodes[j]["time_s"])
+            if piece_end <= piece_start:
+                continue
+            piece_duration = piece_end - piece_start
+            if piece_duration > max_display_s + 1e-6:
+                continue
+            piece_text = text[int(nodes[i]["position"]) : int(nodes[j]["position"])].strip()
+            if not piece_text:
+                continue
+            duration_penalty = 0.0
+            if piece_duration < min_duration_s:
+                duration_penalty += (min_duration_s - piece_duration) * 6.0
+            text_penalty = 0.0 if j == len(nodes) - 1 else _text_break_score(
+                text,
+                int(nodes[j]["position"]),
+            )
+            line_penalty = max(0.0, len(piece_text) - max(1, options.line_max_chars)) / max(
+                1.0,
+                float(options.line_max_chars),
+            )
+            anchor_bonus = 0.0
+            source = str(nodes[j]["source"])
+            if source == "primary_cut":
+                anchor_bonus = 1.20 + min(0.30, float(nodes[j]["anchor_strength"]) * 0.05)
+            elif source == "weak_cut":
+                anchor_bonus = 0.95 + min(0.25, float(nodes[j]["anchor_strength"]) * 0.05)
+            snap_penalty = min(1.0, float(nodes[j]["snap_distance_s"]) / max(snap_window_s, 1e-6)) * 0.15
+            transition_cost = (
+                1.0
+                + duration_penalty
+                + text_penalty
+                + line_penalty
+                + snap_penalty
+                - anchor_bonus
+            )
+            cost = best[i][0] + transition_cost
+            if cost < best_cost:
+                best_cost = cost
+                best_prev = i
+        if best_prev is not None:
+            best[j] = (best_cost, best_prev)
+    last = len(nodes) - 1
+    if last not in best:
+        return None
+    path: list[int] = []
+    cursor: int | None = last
+    while cursor is not None:
+        path.append(cursor)
+        cursor = best[cursor][1]
+    path.reverse()
+    if len(path) < 3:
+        return None
+    return {
+        "nodes": [nodes[index] for index in path],
+        "score": best[last][0],
+    }
+
+
 def _choose_display_split_times(
     block: dict,
     *,
@@ -311,6 +568,7 @@ def _choose_display_split_times(
     if duration <= 0.0 or max_display_s <= 0.0:
         return []
     min_duration_s = _subtitle_min_duration_s(options)
+    snap_window_s = _weak_cut_snap_window_s(duration, options)
     weak_times = _weak_cut_times(block, start=start, end=end)
     split_times: list[float] = []
     previous = start
@@ -326,6 +584,7 @@ def _choose_display_split_times(
                 time_s
                 for time_s in weak_times
                 if lower <= time_s <= upper and time_s not in split_times
+                and abs(time_s - target) <= snap_window_s
             ]
             chosen = min(available, key=lambda item: abs(item - target)) if available else min(max(target, lower), upper)
         split_times.append(chosen)
@@ -365,26 +624,22 @@ def _split_long_display_block(
     timing_text = _text_for_timing(block)
     if not timing_text.strip():
         return [dict(block)]
-    split_count = max(1, int(math.ceil((end - start) / max_display_s)) - 1)
-    timing_positions = _choose_text_split_positions(timing_text, split_count)
-    if len(timing_positions) != split_count:
+    plan = _long_display_dp_plan(block, options=options)
+    if plan is None:
+        return [dict(block)]
+    nodes = list(plan["nodes"])
+    timing_positions = [int(node["position"]) for node in nodes[1:-1]]
+    split_times = [float(node["time_s"]) for node in nodes[1:-1]]
+    if not timing_positions or len(timing_positions) != len(split_times):
         return [dict(block)]
     ratios = [
         _count_text_units(timing_text[:position]) / max(_count_text_units(timing_text), 1e-6)
         for position in timing_positions
     ]
-    split_times = _choose_display_split_times(block, text_ratios=ratios, options=options)
-    if len(split_times) != split_count:
-        return [dict(block)]
-    weak_times = _weak_cut_times(block, start=start, end=end)
-    split_source = (
-        "weak_cut_candidates"
-        if any(
-            any(abs(split_time - weak_time) <= 1e-3 for weak_time in weak_times)
-            for split_time in split_times
-        )
-        else "proportional_text"
-    )
+    split_sources = [str(node["source"]) for node in nodes[1:-1]]
+    split_source = "acoustic_anchor_dp" if any(
+        source in {"primary_cut", "weak_cut"} for source in split_sources
+    ) else "proportional_text_dp"
 
     boundaries = [start, *split_times, end]
     text_fields = {}
@@ -404,6 +659,12 @@ def _split_long_display_block(
         item = dict(block)
         item["start"] = piece_start
         item["end"] = max(piece_start + 0.05, piece_end)
+        item["acoustic_start"] = piece_start
+        item["acoustic_end"] = max(piece_start + 0.05, piece_end)
+        item["acoustic_duration"] = max(0.0, item["acoustic_end"] - item["acoustic_start"])
+        item["display_start"] = item["start"]
+        item["display_end"] = item["end"]
+        item["display_duration"] = max(0.0, item["display_end"] - item["display_start"])
         for key, pieces in text_fields.items():
             item[key] = pieces[index] if index < len(pieces) else ""
         item["words"] = [
@@ -423,6 +684,19 @@ def _split_long_display_block(
         )
         item["subtitle_layout_split"] = "max_display_duration"
         item["subtitle_layout_split_source"] = split_source
+        item["layout_engine"] = options.layout_engine
+        item["layout_version"] = "subtitle_layout_v2"
+        item["timing_model"] = options.timing_model
+        boundary_node = nodes[index + 1] if index + 1 < len(nodes) else None
+        boundary_source = str(boundary_node.get("source") or "") if boundary_node else ""
+        item["anchor_used"] = boundary_source in {"primary_cut", "weak_cut"}
+        item["anchor_type"] = boundary_source if item["anchor_used"] else ""
+        item["anchor_score"] = 0.0 if boundary_node is None else float(boundary_node.get("anchor_strength") or 0.0)
+        item["snap_distance_s"] = 0.0 if boundary_node is None else float(boundary_node.get("snap_distance_s") or 0.0)
+        item["snap_reason"] = "anchor_aware_dp_v2"
+        item["layout_score"] = float(plan.get("score") or 0.0)
+        item["text_break_type"] = "dp_text_boundary"
+        item["proportional_fallback_used"] = not item["anchor_used"]
         split_blocks.append(item)
     return split_blocks
 
@@ -475,30 +749,45 @@ def _word_start_anchor(words: list[dict]) -> float | None:
 
 def _subtitle_block_window(block: dict, words: list[dict]) -> tuple[float, float]:
     fallback_start = float(words[0]["start"]) if words else 0.0
-    try:
-        start = float(block.get("start", fallback_start))
-    except (TypeError, ValueError):
-        start = fallback_start
+    start = _safe_float(block.get("display_start", block.get("start")), fallback_start)
     word_anchor = _word_start_anchor(words)
     if word_anchor is not None:
         start = min(start, word_anchor)
 
     fallback_end = float(words[-1]["end"]) if words else start
-    try:
-        end = float(block.get("end", fallback_end))
-    except (TypeError, ValueError):
-        end = fallback_end
+    end = _safe_float(block.get("display_end", block.get("end")), fallback_end)
 
     return start, max(start, end)
+
+
+def _ensure_timeline_fields(block: dict) -> dict:
+    start = _safe_float(block.get("start"), 0.0)
+    end = max(start, _safe_float(block.get("end"), start))
+    acoustic_start = _safe_float(block.get("acoustic_start"), start)
+    acoustic_end = max(acoustic_start, _safe_float(block.get("acoustic_end"), end))
+    display_start = _safe_float(block.get("display_start"), start)
+    display_end = max(display_start, _safe_float(block.get("display_end"), end))
+    block["acoustic_start"] = acoustic_start
+    block["acoustic_end"] = acoustic_end
+    block["acoustic_duration"] = max(0.0, acoustic_end - acoustic_start)
+    block["display_start"] = display_start
+    block["display_end"] = display_end
+    block["display_duration"] = max(0.0, display_end - display_start)
+    block["start"] = display_start
+    block["end"] = display_end
+    return block
 
 
 def _copy_sorted_blocks(blocks: list[dict]) -> list[dict]:
     sortable: list[tuple[float, float, int, dict]] = []
     for index, block in enumerate(blocks):
-        copied = dict(block)
+        copied = _ensure_timeline_fields(dict(block))
         start, end = _subtitle_block_window(copied, _timed_words(copied))
         copied["start"] = start
         copied["end"] = end
+        copied["display_start"] = start
+        copied["display_end"] = end
+        copied["display_duration"] = max(0.0, end - start)
         sortable.append((start, end, index, copied))
     sortable.sort(key=lambda item: (item[0], item[1], item[2]))
     return [item[3] for item in sortable]
@@ -528,12 +817,18 @@ def _normalize_subtitle_timeline(
         nxt["end"] = next_end
 
         if current_end + gap_s <= next_start:
+            current["display_start"] = current_start
+            current["display_end"] = current_end
+            current["display_duration"] = max(0.0, current_end - current_start)
             index += 1
             continue
 
         limit_end = max(current_start, next_start - gap_s)
         if limit_end - current_start >= min_abs_s:
             current["end"] = limit_end
+            current["display_start"] = current_start
+            current["display_end"] = limit_end
+            current["display_duration"] = max(0.0, limit_end - current_start)
             index += 1
             continue
 
@@ -541,6 +836,9 @@ def _normalize_subtitle_timeline(
             current["end"] = max(current_start + 0.001, limit_end)
         else:
             current["end"] = current_start
+        current["display_start"] = current_start
+        current["display_end"] = current["end"]
+        current["display_duration"] = max(0.0, current["end"] - current_start)
         index += 1
 
     return normalized
@@ -577,9 +875,67 @@ def _polish_subtitle_timeline(
         elif linger_s > 0:
             end += linger_s
 
+        acoustic_end = _safe_float(block.get("acoustic_end"), end)
+        max_end_from_acoustic = acoustic_end + max(
+            0.0,
+            float(options.max_display_shift_from_acoustic_end_s),
+        )
+        end = min(end, max_end_from_acoustic)
         block["end"] = max(start + 0.05, end)
+        block["display_start"] = start
+        block["display_end"] = block["end"]
+        block["display_duration"] = max(0.0, block["display_end"] - block["display_start"])
 
     return polished
+
+
+def _finalize_layout_fields(
+    blocks: list[dict],
+    *,
+    options: SubtitleOptions,
+) -> list[dict]:
+    finalized: list[dict] = []
+    min_duration_s = _subtitle_min_duration_s(options)
+    max_display_s = _subtitle_max_display_duration_s(options)
+    for block in blocks:
+        item = _ensure_timeline_fields(dict(block))
+        display_start = _safe_float(item.get("start"), 0.0)
+        display_end = max(display_start, _safe_float(item.get("end"), display_start))
+        acoustic_start = _safe_float(item.get("acoustic_start"), display_start)
+        acoustic_end = max(acoustic_start, _safe_float(item.get("acoustic_end"), display_end))
+        item["start"] = display_start
+        item["end"] = display_end
+        item["display_start"] = display_start
+        item["display_end"] = display_end
+        item["display_duration"] = max(0.0, display_end - display_start)
+        item["acoustic_start"] = acoustic_start
+        item["acoustic_end"] = acoustic_end
+        item["acoustic_duration"] = max(0.0, acoustic_end - acoustic_start)
+        item["display_shift_start_s"] = display_start - acoustic_start
+        item["display_shift_end_s"] = display_end - acoustic_end
+        item["display_extension_total_s"] = max(0.0, acoustic_start - display_start) + max(
+            0.0,
+            display_end - acoustic_end,
+        )
+        item.setdefault("layout_engine", options.layout_engine)
+        item.setdefault("layout_version", "subtitle_layout_v2")
+        item.setdefault("timing_model", options.timing_model)
+        item["duration_violation"] = bool(
+            item["display_duration"] < min_duration_s
+            or (max_display_s > 0.0 and item["display_duration"] > max_display_s)
+        )
+        item["gap_violation"] = False
+        item["proportional_fallback_used"] = bool(item.get("proportional_fallback_used", False))
+        finalized.append(item)
+    for current, nxt in zip(finalized, finalized[1:]):
+        gap = _safe_float(nxt.get("display_start"), _safe_float(nxt.get("start"))) - _safe_float(
+            current.get("display_end"),
+            _safe_float(current.get("end")),
+        )
+        if gap < _subtitle_gap_s(options) - 1e-9:
+            current["gap_violation"] = True
+            nxt["gap_violation"] = True
+    return finalized
 
 
 def _prepare_subtitle_blocks(
@@ -594,12 +950,16 @@ def _prepare_subtitle_blocks(
         start, end = _resolve_subtitle_window(prepared, idx, options=options)
         prepared[idx - 1]["start"] = start
         prepared[idx - 1]["end"] = end
+        prepared[idx - 1]["display_start"] = start
+        prepared[idx - 1]["display_end"] = end
+        prepared[idx - 1]["display_duration"] = max(0.0, end - start)
     prepared = _copy_sorted_blocks(_split_long_display_blocks(prepared, options=options))
     prepared = _polish_subtitle_timeline(prepared, options=options)
     prepared = _copy_sorted_blocks(_split_long_display_blocks(prepared, options=options))
     # Reading-duration expansion can push a cue back into the next cue window.
     # Keep this final pass as the hard no-overlap, frame-gap guard for the cue plan.
     prepared = _normalize_subtitle_timeline(prepared, options=options)
+    prepared = _finalize_layout_fields(prepared, options=options)
     return prepared
 
 
@@ -635,10 +995,13 @@ def write_srt(
     path_obj.parent.mkdir(parents=True, exist_ok=True)
     with path_obj.open("w", encoding="utf-8") as f:
         for idx, block in enumerate(blocks, 1):
-            start = float(block.get("start", 0.0))
-            end = max(start + 0.05, float(block.get("end", start)))
+            start = _safe_float(block.get("display_start", block.get("start")), 0.0)
+            end = max(start + 0.05, _safe_float(block.get("display_end", block.get("end")), start))
             block["start"] = start
             block["end"] = end
+            block["display_start"] = start
+            block["display_end"] = end
+            block["display_duration"] = max(0.0, end - start)
 
             start_str = format_timestamp(start)
             end_str   = format_timestamp(end)
@@ -658,10 +1021,13 @@ def write_bilingual_srt(
     blocks = [dict(block) for block in blocks]
     with open(path, "w", encoding="utf-8") as f:
         for idx, block in enumerate(blocks, 1):
-            start = float(block.get("start", 0.0))
-            end = max(start + 0.05, float(block.get("end", start)))
+            start = _safe_float(block.get("display_start", block.get("start")), 0.0)
+            end = max(start + 0.05, _safe_float(block.get("display_end", block.get("end")), start))
             block["start"] = start
             block["end"] = end
+            block["display_start"] = start
+            block["display_end"] = end
+            block["display_duration"] = max(0.0, end - start)
 
             start_str = format_timestamp(start)
             end_str   = format_timestamp(end)

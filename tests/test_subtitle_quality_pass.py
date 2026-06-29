@@ -224,8 +224,8 @@ def test_timing_polish_preserves_natural_pause():
 
     prepared = subtitle.prepare_srt_blocks(blocks, options=options, mode="bilingual")
 
-    assert prepared[0]["end"] == pytest.approx(1.3)
-    assert prepared[1]["start"] - prepared[0]["end"] == pytest.approx(0.5)
+    assert prepared[0]["end"] == pytest.approx(1.2)
+    assert prepared[1]["start"] - prepared[0]["end"] == pytest.approx(0.6)
 
 
 def test_timing_polish_disabled_keeps_existing_alignment_end():

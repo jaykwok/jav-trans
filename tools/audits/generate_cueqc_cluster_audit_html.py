@@ -417,11 +417,17 @@ def rows_for_page(rows: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
         "audio",
         "audio_id",
         "audit_sampling_score",
+        "audit_sampling_roles",
+        "audit_risk_score",
         "chunk_index",
+        "cluster_centroid_distance",
         "cluster_confidence",
         "cluster_id",
         "cluster_label",
         "cluster_noise",
+        "cluster_outlier_rank",
+        "cluster_outlier_score",
+        "coarse_cluster_id",
         "confidence",
         "context_end",
         "context_start",
@@ -442,6 +448,13 @@ def rows_for_page(rows: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
         "micro_resolve_reason",
         "position",
         "pre_asr_cueqc",
+        "ptm_pooling_available",
+        "ptm_pooling_schema",
+        "ptm_pooling_dim",
+        "ptm_refined",
+        "ptm_refine_parent_cluster_id",
+        "ptm_refine_subcluster_id",
+        "ptm_refine_final_cluster_id",
         "qc",
         "raw_text",
         "sample_id",
@@ -451,6 +464,10 @@ def rows_for_page(rows: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
         "subtitle_window_start",
         "subtitle_min_duration_s",
         "below_subtitle_min_duration",
+        "tail_merged_from_cluster_id",
+        "tail_merge_suggested_target_cluster_id",
+        "tail_merge_suggestion_distance",
+        "tail_merge_requires_confirmation",
         "text",
         "text_features",
         "text_observation",
@@ -521,11 +538,12 @@ a {{ color: var(--accent); text-decoration: none; }}
 .audit-controls .wide {{ grid-column: 1 / -1; }}
 .control-grid {{ display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; }}
 .control-grid.three {{ grid-template-columns: repeat(3, minmax(0, 1fr)); }}
-.sample-list {{ border-top: 1px solid var(--line); }}
+.sample-list, .cluster-list {{ border-top: 1px solid var(--line); }}
 .sidebar-details {{ border-top: 1px solid var(--line); padding: 10px 12px; }}
 .sidebar-details .cluster-nav {{ margin-top: 10px; max-height: 280px; overflow: auto; padding-right: 4px; }}
 .item {{ padding: 10px 12px; border-bottom: 1px solid var(--line); cursor: pointer; }}
-.item.active, .item:hover {{ background: #eaf4f1; }}
+.item:hover {{ background: #eaf4f1; }}
+.item.active {{ background: #bfe7df; border-left: 4px solid var(--accent); padding-left: 8px; }}
 .item-title {{ display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }}
 .item-metrics {{ display: flex; gap: 6px; flex-wrap: wrap; margin-top: 4px; }}
 .badge {{ display: inline-block; border-radius: 999px; padding: 1px 7px; background: #eef3ef; color: var(--muted); font-size: 12px; }}
@@ -543,6 +561,10 @@ a {{ color: var(--accent); text-decoration: none; }}
 .text {{ white-space: pre-wrap; overflow-wrap: anywhere; font-size: 18px; }}
 .text-box {{ white-space: pre-wrap; overflow-wrap: anywhere; background: #f7faf8; border: 1px solid var(--line); border-radius: 6px; padding: 8px; min-height: 38px; }}
 .labels, .actions, .toolbar {{ display: flex; flex-wrap: wrap; gap: 8px; }}
+.sample-label-panel {{ margin-top: 10px; border: 1px solid var(--line); border-radius: 8px; padding: 10px; background: #f7faf8; }}
+.cluster-label-panel {{ margin-top: 10px; }}
+.sample-label-panel .label-heading {{ margin-bottom: 8px; }}
+.sample-label-actions {{ display: flex; flex-wrap: wrap; gap: 8px; margin-top: 8px; }}
 .label-block {{ border-top: 1px solid var(--line); padding-top: 10px; margin-top: 10px; }}
 .label-block:first-of-type {{ border-top: 0; padding-top: 0; margin-top: 0; }}
 .label-heading {{ display: flex; align-items: baseline; justify-content: space-between; gap: 8px; margin-bottom: 7px; }}
@@ -568,6 +590,8 @@ a {{ color: var(--accent); text-decoration: none; }}
 .cluster-nav-index {{ font-weight: 700; }}
 .cluster-nav-sub {{ margin-top: 4px; color: var(--muted); font-size: 12px; white-space: pre-wrap; overflow-wrap: anywhere; }}
 .cluster-detail-summary {{ color: var(--muted); font-size: 12px; white-space: pre-wrap; overflow-wrap: anywhere; }}
+.cluster-merge-suggestion {{ margin-top: 8px; padding: 8px; border: 1px dashed var(--line); border-radius: 6px; background: #fbfcfb; color: var(--muted); font-size: 12px; }}
+.cluster-merge-suggestion strong {{ color: var(--ink); }}
 .cluster-detail-fields {{ display: grid; gap: 8px; margin-top: 10px; }}
 .cluster-detail-fields textarea {{ min-height: 86px; }}
 .cluster-audio-list {{ display: grid; gap: 10px; max-height: min(78vh, 1200px); overflow: auto; padding-right: 4px; }}
@@ -617,8 +641,10 @@ code {{ background: #eef3ef; padding: 1px 4px; border-radius: 4px; }}
     <div class="head">
       <h1>{html.escape(title)}</h1>
       <div class="toolbar">
-        <button class="primary" id="downloadClusters">下载簇级标注 JSONL</button>
+        <button class="primary" id="saveClusters">保存簇级审计结果</button>
+        <button id="downloadClusters">下载簇级 JSONL</button>
       </div>
+      <p class="meta" id="clusterSaveStatus"></p>
       <p class="meta" id="clusterProgress"></p>
       <p class="meta" id="summaryLine"></p>
       <div class="audit-controls">
@@ -645,36 +671,20 @@ code {{ background: #eef3ef; padding: 1px 4px; border-radius: 4px; }}
             <option value="chunk_asc">chunk index ↑</option>
           </select>
           <select id="pageSize">
+            <option value="all">显示全部</option>
             <option value="200">显示 200</option>
             <option value="500">显示 500</option>
             <option value="1000">显示 1000</option>
-            <option value="all">显示全部</option>
           </select>
         </div>
       </div>
     </div>
-    <div class="sample-list" id="list"></div>
-    <details class="sidebar-details">
-      <summary>簇级导航</summary>
+    <div class="cluster-list" id="list"></div>
+    <div class="sidebar-details" hidden>
       <div class="cluster-nav" id="clusterNav"></div>
-    </details>
+    </div>
   </aside>
   <main class="main">
-    <section class="panel cluster-admin-panel">
-      <div class="label-heading">
-        <h2 id="clusterTitle">簇级粗标签</h2>
-        <span class="meta" id="clusterCount"></span>
-      </div>
-      <div class="cluster-detail-summary" id="clusterSummary"></div>
-      <div class="cluster-detail-fields">
-        <div class="label-heading"><span class="label-title">种子控制</span><span class="meta">只有“用作种子 + keep/drop”会进入 cold-start 训练</span></div>
-        <div class="labels" id="clusterSeedActionButtons"></div>
-        <div class="label-heading"><span class="label-title">训练标签</span><span class="meta">CueQC 训练目标仍只导出 keep/drop；混簇和跳过不导出标签</span></div>
-        <div class="labels" id="clusterDisplayButtons"></div>
-        <textarea id="activeClusterReason" placeholder="备注 / 原因（可选，不进训练）"></textarea>
-      </div>
-      <p class="meta cluster-status" id="clusterStatus"></p>
-    </section>
     <section class="panel cluster-admin-panel">
       <h3>全部音频</h3>
       <div class="cluster-audio-list" id="clusterAudioList"></div>
@@ -696,6 +706,23 @@ code {{ background: #eef3ef; padding: 1px 4px; border-radius: 4px; }}
           <button id="playContextBtn">播放上下文</button>
         </div>
         <audio id="media" controls preload="none"></audio>
+        <div class="sample-label-panel cluster-label-panel">
+          <div class="label-heading">
+            <span class="label-title" id="clusterTitle">簇级标签</span>
+            <span class="meta" id="clusterCount"></span>
+          </div>
+          <div class="cluster-detail-summary" id="clusterSummary"></div>
+          <div class="cluster-merge-suggestion" id="clusterMergeSuggestion"></div>
+          <div class="cluster-detail-fields">
+            <div class="label-heading"><span class="label-title">簇处理</span><span class="meta">明确簇才标 keep/drop，混簇直接跳过</span></div>
+            <div class="labels" id="clusterSeedActionButtons"></div>
+            <div class="label-heading"><span class="label-title">训练标签</span><span class="meta">只有“用作种子 + keep/drop”会广播到样本</span></div>
+            <div class="labels" id="clusterDisplayButtons"></div>
+            <textarea id="activeClusterReason" placeholder="备注 / 原因（可选，不进训练）"></textarea>
+          </div>
+          <p class="meta cluster-status" id="clusterStatus"></p>
+        </div>
+        <p class="meta" id="labelStatus">当前样本只用于试听和查看；训练标签来自上方簇级标签。</p>
         <div class="caption-preview" id="captionOverlay"></div>
         <div class="caption-meta" id="captionMeta"></div>
         <div class="timeline" id="timeline">
@@ -767,7 +794,6 @@ try {{
   localStorage.removeItem(LEGACY_STORAGE_KEY + ":custom-options");
   localStorage.removeItem(LEGACY_STORAGE_KEY + ":custom-group");
 }} catch (_) {{}}
-const DISPLAY = [{{value:"keep", label:"保留"}},{{value:"drop", label:"丢弃"}}];
 const CLUSTER_DISPLAY = [{{value:"keep", label:"保留（进入字幕）"}},{{value:"drop", label:"丢弃（不进入字幕）"}}];
 const CLUSTER_SEED_ACTIONS = [{{value:"use_seed", label:"用作种子"}},{{value:"mixed_skip", label:"混簇跳过"}},{{value:"skip", label:"跳过"}}];
 function clusterOrder(summary) {{
@@ -781,7 +807,6 @@ const CLUSTER_ENTRIES = [...SUMMARIES].sort((a, b) => clusterOrder(a) - clusterO
   displayId: `cluster_${{String(index).padStart(2, "0")}}`
 }}));
 const CLUSTER_BY_ID = new Map(CLUSTER_ENTRIES.map(entry => [entry.clusterId, entry]));
-let annotations = loadAnnotations();
 let clusterAnnotations = loadClusterAnnotations();
 let activeClusterId = loadActiveClusterId();
 let filtered = [...ROWS];
@@ -797,8 +822,6 @@ const timeline = document.getElementById("timeline");
 const chunkRange = document.getElementById("chunkRange");
 const subtitleWindowRange = document.getElementById("subtitleWindowRange");
 const cursor = document.getElementById("cursor");
-function loadAnnotations() {{ try {{ return JSON.parse(localStorage.getItem(STORAGE_KEY) || "{{}}"); }} catch (_) {{ return {{}}; }} }}
-function saveAnnotations() {{ localStorage.setItem(STORAGE_KEY, JSON.stringify(annotations)); }}
 function loadClusterAnnotations() {{ try {{ return JSON.parse(localStorage.getItem(CLUSTER_STORAGE_KEY) || "{{}}"); }} catch (_) {{ return {{}}; }} }}
 function saveClusterAnnotations() {{ localStorage.setItem(CLUSTER_STORAGE_KEY, JSON.stringify(clusterAnnotations)); }}
 function loadActiveClusterId() {{ try {{ return localStorage.getItem(CLUSTER_ACTIVE_KEY) || ""; }} catch (_) {{ return ""; }} }}
@@ -975,7 +998,10 @@ function clusterRows(clusterId) {{
   return ROWS.filter(row => row.cluster_id === clusterId);
 }}
 function clusterRowsForDisplay(clusterId) {{
-  return sortRows(clusterRows(clusterId));
+  const q = document.getElementById("search") ? document.getElementById("search").value.trim().toLowerCase() : "";
+  let rows = filtered.filter(row => row.cluster_id === clusterId);
+  if (q) rows = rows.filter(row => rowText(row).includes(q));
+  return sortRows(rows);
 }}
 function clusterExampleRows(summary, limit = 3) {{
   const clusterId = summary.cluster_id || "";
@@ -1006,7 +1032,15 @@ function clusterExampleRows(summary, limit = 3) {{
 function clusterSummaryText(summary) {{
   const obs = summary.text_observation_counts || {{}};
   const obsText = Object.entries(obs).map(([k, v]) => `${{k}}=${{v}}`).join(", ");
-  return `count=${{summary.count || 0}} · chars_avg=${{Number(summary.char_count_avg || 0).toFixed(2)}} · conf=${{Number(summary.confidence_avg || 0).toFixed(3)}} · text ${{obsText || "n/a"}}`;
+  const homo = summary.homogeneity_signals || {{}};
+  return `count=${{summary.count || 0}} · action=${{summary.review_action || homo.review_action || "review"}} · homo=${{Number(homo.score || 0).toFixed(3)}} · chars_avg=${{Number(summary.char_count_avg || 0).toFixed(2)}} · conf=${{Number(summary.confidence_avg || 0).toFixed(3)}} · dur=${{Number(summary.duration_median_s || 0).toFixed(2)}}/${{Number(summary.duration_max_s || 0).toFixed(2)}}s · risk=${{Number(summary.audit_risk_avg || 0).toFixed(3)}} · empty=${{Number(homo.empty_text_ratio || 0).toFixed(2)}} · p90=${{Number(homo.intra_distance_p90 || 0).toFixed(3)}} · outlier=${{Number(homo.outlier_ratio || 0).toFixed(2)}} · ptm=${{summary.ptm_refined_count || 0}} · tail_suggest=${{summary.tail_merge_suggestion_count || 0}} · text ${{obsText || "n/a"}}`;
+}}
+function primaryTailMergeSuggestion(summary) {{
+  const suggestions = Array.isArray(summary.tail_merge_suggestions) ? summary.tail_merge_suggestions : [];
+  return suggestions.length ? suggestions[0] : null;
+}}
+function clusterMergeConfirmed(ann) {{
+  return ann.merge_action === "confirm_merge" && Boolean(ann.merge_target_cluster_id || ann.tail_merge_target_cluster_id);
 }}
 function setClusterButtons(rootId, options, clusterId, key) {{
   const root = document.getElementById(rootId);
@@ -1025,6 +1059,26 @@ function setClusterButtons(rootId, options, clusterId, key) {{
     }};
     root.appendChild(btn);
   }}
+}}
+function setClusterMerge(clusterId, targetClusterId, confirmed) {{
+  const next = {{ ...(clusterAnnotations[clusterId] || {{}}) }};
+  if (confirmed && targetClusterId) {{
+    next.merge_action = "confirm_merge";
+    next.merge_confirmed = true;
+    next.merge_target_cluster_id = targetClusterId;
+    next.seed_action = "skip";
+    next.display_decision = "";
+  }} else {{
+    next.merge_action = "";
+    next.merge_confirmed = false;
+    next.merge_target_cluster_id = "";
+  }}
+  next.updated_at = new Date().toISOString();
+  clusterAnnotations[clusterId] = next;
+  saveClusterAnnotations();
+  updateClusterProgress();
+  renderClusterNav();
+  renderClusterDetail();
 }}
 function updateClusterAnnotation(clusterId, key, value) {{
   const next = {{ ...(clusterAnnotations[clusterId] || {{}}) }};
@@ -1060,7 +1114,7 @@ function clusterTrainingDecision(ann) {{
 function isClusterComplete(clusterId) {{
   const ann = clusterAnnotations[clusterId] || {{}};
   const action = clusterSeedAction(ann);
-  return ["mixed_skip", "skip"].includes(action) || Boolean(clusterTrainingDecision(ann));
+  return ["mixed_skip", "skip"].includes(action) || Boolean(clusterTrainingDecision(ann)) || clusterMergeConfirmed(ann);
 }}
 function updateClusterProgress() {{
   const complete = SUMMARIES.filter(summary => isClusterComplete(summary.cluster_id)).length;
@@ -1131,7 +1185,7 @@ function renderClusterAudioList(entry) {{
         <strong>${{escapeHtml(row.video_label || row.video_id || "")}} · chunk ${{escapeHtml(row.chunk_index)}} · ${{Number(row.duration_s || 0).toFixed(2)}}s</strong>
         <span class="meta">${{sampleId}}</span>
       </div>
-      <div class="cluster-audio-meta">${{fmt(row.start)}} - ${{fmt(row.end)}}${{info.audio_url ? "" : " · 音频缺失"}}${{info.vtt_url ? "" : " · 字幕缺失"}}</div>
+      <div class="cluster-audio-meta">${{fmt(row.start)}} - ${{fmt(row.end)}} · roles=${{escapeHtml((row.audit_sampling_roles || []).join(",") || "member")}} · score=${{Number(row.audit_sampling_score || 0).toFixed(3)}}${{info.audio_url ? "" : " · 音频缺失"}}${{info.vtt_url ? "" : " · 字幕缺失"}}</div>
       <div class="cluster-audio-actions">
         <button class="primary" type="button" data-play-sample="${{sampleId}}" data-play-mode="chunk"${{info.audio_url ? "" : " disabled"}}>播放 chunk</button>
         <button type="button" data-play-sample="${{sampleId}}" data-play-mode="context"${{info.audio_url ? "" : " disabled"}}>播放上下文</button>
@@ -1239,6 +1293,7 @@ function renderClusterDetail() {{
   if (count) count.textContent = `${{summary.count || 0}} 条 · ${{entry.clusterId}}`;
   const summaryNode = document.getElementById("clusterSummary");
   if (summaryNode) summaryNode.textContent = clusterSummaryText(summary);
+  renderClusterMergeSuggestion(entry, summary, ann);
   setClusterButtons("clusterSeedActionButtons", CLUSTER_SEED_ACTIONS, entry.clusterId, "seed_action");
   setClusterButtons("clusterDisplayButtons", CLUSTER_DISPLAY, entry.clusterId, "display_decision");
   const reasonInput = document.getElementById("activeClusterReason");
@@ -1254,14 +1309,38 @@ function renderClusterDetail() {{
   }}
   renderClusterAudioList(entry);
 }}
+function renderClusterMergeSuggestion(entry, summary, ann) {{
+  const root = document.getElementById("clusterMergeSuggestion");
+  if (!root) return;
+  const suggestion = primaryTailMergeSuggestion(summary);
+  if (!suggestion) {{
+    root.innerHTML = "无尾簇合并建议。";
+    return;
+  }}
+  const target = String(suggestion.target_cluster_id || "");
+  const confirmed = clusterMergeConfirmed(ann) && String(ann.merge_target_cluster_id || "") === target;
+  root.innerHTML = `
+    <div><strong>尾簇建议：</strong>${{escapeHtml(entry.clusterId)}} -> ${{escapeHtml(target || "(none)")}} · distance=${{Number(suggestion.mean_distance || 0).toFixed(4)}} · samples=${{suggestion.sample_count || 0}}</div>
+    <div class="toolbar" style="margin-top:6px">
+      <button type="button" id="confirmMergeBtn" class="${{confirmed ? "active" : ""}}">${{confirmed ? "已确认合并" : "确认合并到目标簇"}}</button>
+      <button type="button" id="clearMergeBtn">取消合并确认</button>
+    </div>
+    <div>未确认时只是审计提示，不改变 cluster_id，也不会进入训练广播。</div>
+  `;
+  const confirmBtn = document.getElementById("confirmMergeBtn");
+  if (confirmBtn) confirmBtn.onclick = () => setClusterMerge(entry.clusterId, target, true);
+  const clearBtn = document.getElementById("clearMergeBtn");
+  if (clearBtn) clearBtn.onclick = () => setClusterMerge(entry.clusterId, target, false);
+}}
 function selectSample(sampleId, autoplay = true) {{
   const row = ROWS.find(item => item.sample_id === sampleId);
   if (!row) return;
-  document.getElementById("search").value = "";
-  document.getElementById("cluster").value = row.cluster_id || "";
-  filtered = sortRows(ROWS.filter(item => item.cluster_id === row.cluster_id));
+  activeClusterId = row.cluster_id || activeClusterId;
+  saveActiveClusterId(activeClusterId);
   current = ROWS.indexOf(row);
   renderList();
+  renderClusterNav();
+  renderClusterDetail();
   renderCurrent(true);
   document.getElementById("sampleTitle").scrollIntoView({{block: "start"}});
   if (autoplay) setTimeout(() => playCurrent("chunk"), 0);
@@ -1339,7 +1418,7 @@ function setupFilters() {{
   fillSelect(
     "cluster",
     SUMMARIES.map(summary => ({{value: summary.cluster_id || "", label: `${{summary.cluster_id}} (${{summary.count || 0}})`}})),
-    "all duration buckets / clusters"
+    "all clusters"
   );
   fillSelect(
     "videoFilter",
@@ -1348,9 +1427,9 @@ function setupFilters() {{
   );
 }}
 function applyFilters() {{
-  const q = document.getElementById("search").value.trim().toLowerCase();
   const cluster = document.getElementById("cluster").value;
   const video = document.getElementById("videoFilter").value;
+  const q = document.getElementById("search") ? document.getElementById("search").value.trim().toLowerCase() : "";
   const minDuration = optionalNumberInput("minDuration");
   const maxDuration = optionalNumberInput("maxDuration");
   const minConfidence = optionalNumberInput("minConfidence");
@@ -1364,59 +1443,99 @@ function applyFilters() {{
     if (q && !rowText(row).includes(q)) return false;
     return true;
   }}));
-  if (cluster && CLUSTER_BY_ID.has(cluster) && cluster !== activeClusterId) {{
-    activeClusterId = cluster;
-    saveActiveClusterId(activeClusterId);
-    renderClusterNav();
-    renderClusterDetail();
+  let selectedRow = ROWS[current] || null;
+  if (!selectedRow || !filtered.includes(selectedRow)) {{
+    selectedRow = filtered[0] || ROWS[0] || null;
   }}
-  current = Math.max(0, ROWS.indexOf(filtered[0] || ROWS[0]));
+  current = Math.max(0, ROWS.indexOf(selectedRow || ROWS[0]));
+  if (selectedRow && selectedRow.cluster_id && selectedRow.cluster_id !== activeClusterId) {{
+    activeClusterId = selectedRow.cluster_id;
+    saveActiveClusterId(activeClusterId);
+  }}
   renderList();
+  renderClusterNav();
+  renderClusterDetail();
   renderCurrent(false);
+}}
+function clusterSearchText(entry) {{
+  const rows = filtered.filter(row => row.cluster_id === entry.clusterId);
+  const summary = entry.summary || {{}};
+  return [
+    entry.clusterId,
+    summary.cluster_label,
+    clusterSummaryText(summary),
+    ...rows.slice(0, 80).map(row => [row.sample_id, row.video_id, row.video_label, row.text, row.raw_text, row.text_preview].join(" "))
+  ].join("\\n").toLowerCase();
+}}
+function clustersForList() {{
+  const clusterFilter = document.getElementById("cluster") ? document.getElementById("cluster").value : "";
+  const q = document.getElementById("search") ? document.getElementById("search").value.trim().toLowerCase() : "";
+  const rowCounts = new Map();
+  for (const row of filtered) {{
+    rowCounts.set(row.cluster_id, (rowCounts.get(row.cluster_id) || 0) + 1);
+  }}
+  return CLUSTER_ENTRIES
+    .filter(entry => (!clusterFilter || entry.clusterId === clusterFilter) && rowCounts.has(entry.clusterId))
+    .filter(entry => !q || clusterSearchText(entry).includes(q))
+    .sort((a, b) => {{
+      const aCount = rowCounts.get(a.clusterId) || 0;
+      const bCount = rowCounts.get(b.clusterId) || 0;
+      const aMax = Math.max(0, ...filtered.filter(row => row.cluster_id === a.clusterId).map(row => rowNumber(row, "duration_s")));
+      const bMax = Math.max(0, ...filtered.filter(row => row.cluster_id === b.clusterId).map(row => rowNumber(row, "duration_s")));
+      const sortBy = document.getElementById("sortBy") ? document.getElementById("sortBy").value : "duration_desc";
+      if (sortBy === "confidence_desc") return Number(b.summary.confidence_avg || 0) - Number(a.summary.confidence_avg || 0) || bCount - aCount || a.clusterId.localeCompare(b.clusterId);
+      if (sortBy === "confidence_asc") return Number(a.summary.confidence_avg || 0) - Number(b.summary.confidence_avg || 0) || bCount - aCount || a.clusterId.localeCompare(b.clusterId);
+      if (sortBy === "duration_asc") return aMax - bMax || bCount - aCount || a.clusterId.localeCompare(b.clusterId);
+      if (sortBy === "duration_desc") return bMax - aMax || bCount - aCount || a.clusterId.localeCompare(b.clusterId);
+      return bCount - aCount || a.clusterId.localeCompare(b.clusterId);
+    }});
 }}
 function renderList() {{
   const root = document.getElementById("list");
   root.innerHTML = "";
   const limit = currentRenderLimit();
   const visibleRows = filtered.slice(0, limit);
+  const visibleClusterIds = new Set(filtered.map(row => row.cluster_id).filter(Boolean));
   for (const row of visibleRows) {{
+    const ann = clusterAnnotations[row.cluster_id] || {{}};
+    const seedAction = clusterSeedAction(ann);
+    const statusText = clusterTrainingDecision(ann)
+      ? (ann.display_decision === "drop" ? "种子:丢弃" : "种子:保留")
+      : (seedAction === "mixed_skip" ? "混簇跳过" : seedAction === "skip" ? "跳过" : "未标注");
     const div = document.createElement("div");
-    const textObs = textObservation(row);
     div.className = "item" + (ROWS[current] === row ? " active" : "");
     div.onclick = () => {{
+      activeClusterId = row.cluster_id || activeClusterId;
+      saveActiveClusterId(activeClusterId);
       current = ROWS.indexOf(row);
-      if (row.cluster_id && row.cluster_id !== activeClusterId) {{
-        activeClusterId = row.cluster_id;
-        saveActiveClusterId(activeClusterId);
-        renderClusterNav();
-        renderClusterDetail();
-      }}
       renderList();
+      renderClusterNav();
+      renderClusterDetail();
       renderCurrent(true);
     }};
     const badgeClass = row.cluster_noise ? "badge noise" : "badge";
-    div.innerHTML = `<div class="item-title"><strong>${{escapeHtml(row.cluster_id)}} · chunk ${{row.chunk_index}}</strong><span class="${{badgeClass}}">${{escapeHtml(row.video_label || row.video_id || "")}}</span></div>
-      <div class="meta">${{fmt(row.start)}}-${{fmt(row.end)}} · ${{Number(row.duration_s||0).toFixed(2)}}s · conf=${{rowConfidence(row).toFixed(3)}} · rank=${{escapeHtml(String(row.duration_rank ?? row.index ?? ""))}}</div>
+    const textObs = textObservation(row);
+    div.innerHTML = `<div class="item-title"><strong>${{escapeHtml(row.cluster_id || "")}} · chunk ${{escapeHtml(row.chunk_index ?? "")}}</strong><span class="${{badgeClass}}">${{escapeHtml(statusText)}}</span></div>
+      <div class="meta">${{escapeHtml(row.video_label || row.video_id || "")}} · ${{fmt(row.start)}}-${{fmt(row.end)}} · ${{Number(row.duration_s || 0).toFixed(2)}}s · conf=${{rowConfidence(row).toFixed(3)}}</div>
       <div class="item-metrics">
         <span class="badge">chars=${{escapeHtml(String(textObs.char_count ?? ""))}}</span>
         <span class="badge">cps=${{rowCharsPerSec(row).toFixed(2)}}</span>
-        <span class="badge">${{escapeHtml(row.alignment_quality || "align:n/a")}}</span>
-        <span class="badge">${{escapeHtml(row.alignment_issue_subtype || "issue:n/a")}}</span>
+        <span class="badge">roles=${{escapeHtml((row.audit_sampling_roles || []).join(",") || "member")}}</span>
       </div>
-      <div class="meta">${{escapeHtml(row.text_preview || row.text || "(empty)")}}</div>`;
+      <div class="meta">${{escapeHtml(row.text_preview || row.text || row.raw_text || "(empty)")}}</div>`;
     root.appendChild(div);
   }}
   if (visibleRows.length < filtered.length) {{
     const more = document.createElement("button");
     more.type = "button";
-    more.textContent = `当前显示 ${{visibleRows.length}} / ${{filtered.length}}，切换“显示数量”可查看更多`;
+    more.textContent = `当前显示 ${{visibleRows.length}} / ${{filtered.length}} 条，切换“显示数量”可查看更多`;
     more.onclick = () => {{
       document.getElementById("pageSize").value = "all";
       renderList();
     }};
     root.appendChild(more);
   }}
-  document.getElementById("summaryLine").textContent = `${{filtered.length}} / ${{ROWS.length}} samples · showing ${{visibleRows.length}} · ${{SUMMARIES.length}} clusters`;
+  document.getElementById("summaryLine").textContent = `${{filtered.length}} / ${{ROWS.length}} samples · ${{visibleClusterIds.size}} / ${{SUMMARIES.length}} clusters`;
 }}
 function fixedOptions(options) {{
   const merged = [];
@@ -1434,82 +1553,10 @@ function labelForValue(key, value, options) {{
   const found = fixedOptions(options).find(option => option.value === value);
   return found ? found.label : value;
 }}
-function setAnnotation(row, key, value, label) {{
-  const next = {{
-    ...(annotations[row.sample_id] || {{}}),
-    [key]: value,
-    [`${{key}}_zh`]: label || value,
-    updated_at: new Date().toISOString()
-  }};
-  annotations[row.sample_id] = {{
-    ...next
-  }};
-  saveAnnotations();
-}}
-function advanceFromRow(row) {{
-  const pos = filtered.indexOf(row);
-  if (pos >= 0 && pos < filtered.length - 1) {{
-    current = ROWS.indexOf(filtered[pos + 1]);
-    renderList();
-    renderCurrent(true);
-  }} else {{
-    renderCurrent(false);
-  }}
-}}
-function shouldAdvanceAfterRequiredLabels(row) {{
-  const ann = annotations[row.sample_id] || {{}};
-  return !!ann.display_decision;
-}}
-function markDropAndAdvance(row) {{
-  const existing = annotations[row.sample_id] || {{}};
-  annotations[row.sample_id] = {{
-    ...existing,
-    display_decision: "drop",
-    display_decision_zh: "丢弃",
-    terminal_decision: true,
-    terminal_reason: "display_drop",
-    updated_at: new Date().toISOString()
-  }};
-  saveAnnotations();
-  advanceFromRow(row);
-}}
-function setButtons(rootId, options, key) {{
-  const root = document.getElementById(rootId);
-  if (!root) return;
-  root.innerHTML = "";
-  const row = ROWS[current];
-  const ann = annotations[row.sample_id] || {{}};
-  for (const option of fixedOptions(options)) {{
-    const btn = document.createElement("button");
-    btn.textContent = option.label;
-    btn.title = `${{option.label}} / ${{option.value}}`;
-    const currentValue = key === "seed_action" ? clusterSeedAction(ann) : ann[key];
-    btn.className = currentValue === option.value ? "active" : "";
-    btn.onclick = () => {{
-      if (key === "display_decision" && option.value === "drop") {{
-        markDropAndAdvance(row);
-        return;
-      }}
-      setAnnotation(row, key, option.value, option.label);
-      if (shouldAdvanceAfterRequiredLabels(row)) {{
-        if ((annotations[row.sample_id] || {{}}).display_decision === "drop") {{
-          annotations[row.sample_id] = {{
-            ...(annotations[row.sample_id] || {{}}),
-            terminal_decision: true,
-            terminal_reason: "display_drop",
-            qc_ignored: true,
-            needs_quality_label: false,
-            updated_at: new Date().toISOString()
-          }};
-          saveAnnotations();
-        }}
-        advanceFromRow(row);
-      }} else {{
-        renderCurrent(false);
-      }}
-    }};
-    root.appendChild(btn);
-  }}
+function renderSampleLabelStatus(row) {{
+  const root = document.getElementById("labelStatus");
+  if (!root || !row) return;
+  root.textContent = "当前样本只用于试听和查看；训练标签请在上方簇级面板选择。";
 }}
 function setMediaForItem(row, seek) {{
   const videoId = row.video_id || "";
@@ -1552,10 +1599,29 @@ function setMetrics(row) {{
   const rows = [
     ["video", `${{row.video_label || ""}} · ${{row.video_id || ""}}`],
     ["cluster", `${{row.cluster_id}} · confidence=${{Number(row.cluster_confidence || 0).toFixed(3)}}`],
+    ["coldstart audit", JSON.stringify({{
+      roles: row.audit_sampling_roles || [],
+      sampling_score: row.audit_sampling_score,
+      risk_score: row.audit_risk_score,
+      centroid_distance: row.cluster_centroid_distance,
+      outlier_rank: row.cluster_outlier_rank,
+      outlier_score: row.cluster_outlier_score,
+      tail_merged_from: row.tail_merged_from_cluster_id || "",
+      tail_suggested_target: row.tail_merge_suggested_target_cluster_id || "",
+      tail_suggestion_distance: row.tail_merge_suggestion_distance,
+      tail_requires_confirmation: row.tail_merge_requires_confirmation
+    }})],
+    ["ptm refine", JSON.stringify({{
+      coarse_cluster_id: row.coarse_cluster_id || "",
+      refined: !!row.ptm_refined,
+      parent_cluster_id: row.ptm_refine_parent_cluster_id || "",
+      subcluster_id: row.ptm_refine_subcluster_id || "",
+      final_cluster_id: row.ptm_refine_final_cluster_id || row.cluster_id || ""
+    }})],
     ["sampling", `score=${{Number(row.audit_sampling_score ?? rowConfidence(row)).toFixed(3)}} · rank=${{row.duration_rank ?? row.index ?? ""}}`],
     ["chunk", `${{row.chunk_index}} · ${{fmt(row.start)}}-${{fmt(row.end)}}`],
     ["duration", `${{Number(row.duration_s || 0).toFixed(3)}}s · cps=${{rowCharsPerSec(row).toFixed(3)}}`],
-    ["pre_asr_v9", JSON.stringify({{
+    ["pre_asr_v10", JSON.stringify({{
       features: row.features || {{}},
       ptm_pooling_available: row.ptm_pooling_available,
       ptm_pooling_schema: row.ptm_pooling_schema,
@@ -1638,6 +1704,12 @@ function updateTimeline() {{
 function renderCurrent(seek) {{
   const row = ROWS[current];
   if (!row) return;
+  if (row.cluster_id && row.cluster_id !== activeClusterId) {{
+    activeClusterId = row.cluster_id;
+    saveActiveClusterId(activeClusterId);
+    renderClusterNav();
+    renderClusterDetail();
+  }}
   document.getElementById("sampleTitle").textContent = `${{row.cluster_id}} · ${{row.sample_id}}`;
   document.getElementById("sampleMeta").textContent = `${{row.video_label || row.video_id || ""}} · chunk ${{row.chunk_index}} · ${{fmt(row.start)}}-${{fmt(row.end)}} · duration ${{Number(row.duration_s||0).toFixed(3)}}s`;
   document.getElementById("text").textContent = row.text || row.raw_text || "(empty)";
@@ -1647,7 +1719,7 @@ function renderCurrent(seek) {{
   setMetrics(row);
   lastCueRenderKey = "";
   renderCueLists(row);
-  setButtons("displayButtons", DISPLAY, "display_decision");
+  renderSampleLabelStatus(row);
   updateTimeline();
   const legacy = document.querySelector(".legacy-ui");
   if (legacy && !legacy.hidden) renderClusterReview();
@@ -1687,6 +1759,7 @@ function exportClusterRows() {{
     const ann = clusterAnnotations[clusterId] || {{}};
     const seedAction = clusterSeedAction(ann);
     const trainingDecision = clusterTrainingDecision(ann);
+    const mergeConfirmed = clusterMergeConfirmed(ann);
     const examples = clusterExampleRows(summary, CLUSTER_EXAMPLES_PER_CLUSTER).map(row => ({{
       sample_id: row.sample_id,
       video_id: row.video_id,
@@ -1705,24 +1778,56 @@ function exportClusterRows() {{
       cluster_id: clusterId,
       display_decision: trainingDecision,
       seed_action: seedAction,
-      training_label_included: Boolean(trainingDecision),
+      training_label_included: Boolean(trainingDecision || mergeConfirmed),
+      merge_action: mergeConfirmed ? "confirm_merge" : "",
+      merge_confirmed: mergeConfirmed,
+      merge_target_cluster_id: mergeConfirmed ? (ann.merge_target_cluster_id || ann.tail_merge_target_cluster_id || "") : "",
       notes: ann.classification_reason || "",
       updated_at: ann.updated_at || "",
       count: summary.count || 0,
       char_count_avg: summary.char_count_avg || 0,
       confidence_avg: summary.confidence_avg || 0,
       text_observation_counts: summary.text_observation_counts || {{}},
+      homogeneity_signals: summary.homogeneity_signals || {{}},
+      review_action: summary.review_action || "",
+      tail_merge_suggestions: summary.tail_merge_suggestions || [],
       examples
     }};
   }});
 }}
 function downloadClusterJsonl() {{
-  const blob = new Blob([exportClusterRows().map(row => JSON.stringify(row)).join("\\n") + "\\n"], {{type:"application/jsonl;charset=utf-8"}});
+  downloadText("cueqc_cluster_labels.jsonl", exportClusterRows().map(row => JSON.stringify(row)).join("\\n") + "\\n");
+}}
+function downloadText(filename, text) {{
+  const blob = new Blob([text], {{type:"application/jsonl;charset=utf-8"}});
   const a = document.createElement("a");
   a.href = URL.createObjectURL(blob);
-  a.download = "cueqc_cluster_labels.jsonl";
+  a.download = filename;
   a.click();
   URL.revokeObjectURL(a.href);
+}}
+async function saveLabelsFile(filename, text, statusId) {{
+  const status = document.getElementById(statusId);
+  if (status) status.textContent = "正在保存...";
+  try {{
+    const response = await fetch("/__audit_api__/save-labels", {{
+      method: "POST",
+      headers: {{"Content-Type": "application/json"}},
+      body: JSON.stringify({{href: location.pathname, filename, content: text}})
+    }});
+    const payload = await response.json().catch(() => ({{}}));
+    if (!response.ok || !payload.ok) throw new Error(payload.error || `HTTP ${{response.status}}`);
+    if (status) status.textContent = `已保存到 ${{payload.path}} · ${{payload.bytes}} bytes`;
+  }} catch (error) {{
+    if (status) status.textContent = `保存到审计目录失败，已改为下载：${{error && error.message ? error.message : error}}`;
+    downloadText(filename, text);
+  }}
+}}
+function clusterJsonlText() {{
+  return exportClusterRows().map(row => JSON.stringify(row)).join("\\n") + "\\n";
+}}
+async function saveClusterJsonl() {{
+  await saveLabelsFile("cueqc_cluster_labels.jsonl", clusterJsonlText(), "clusterSaveStatus");
 }}
 document.getElementById("search").addEventListener("input", applyFilters);
 document.getElementById("cluster").addEventListener("change", applyFilters);
@@ -1735,6 +1840,7 @@ document.getElementById("sortBy").addEventListener("change", () => {{
 }});
 document.getElementById("pageSize").addEventListener("change", renderList);
 document.getElementById("downloadClusters").onclick = downloadClusterJsonl;
+document.getElementById("saveClusters").onclick = () => saveClusterJsonl().catch(error => alert(error.message || error));
 document.getElementById("playChunkBtn").onclick = () => playCurrent("chunk");
 document.getElementById("playContextBtn").onclick = () => playCurrent("context");
 document.getElementById("pauseBtn").onclick = () => media.pause();
@@ -1893,7 +1999,7 @@ def build_audit(
             "cluster_review_enabled": True,
             "cluster_review_group_count": len(summaries),
             "cluster_review_examples_per_cluster": 3,
-            "cluster_review_layout": "left_nav_single_cluster_inline_players_v4",
+            "cluster_review_layout": "left_cluster_list_player_inline_cluster_labels_v6",
             "cluster_review_audio_render_mode": "per_chunk_inline_audio",
             "cluster_audio_page_size": 80,
             "cluster_review_scope": "natural_clusters_including_noise",

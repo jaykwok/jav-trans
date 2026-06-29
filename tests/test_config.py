@@ -181,30 +181,36 @@ def test_pre_asr_cueqc_old_versions_removed_from_active_runtime_surface():
         ".env.example",
         "README.md",
         "tools/workflows/run_full_workflow.py",
-        "tools/asr/cueqc/compile_pre_asr_v9_features.py",
-        "tools/asr/cueqc/train_pre_asr_v9_binary.py",
-        "tools/asr/cueqc/export_pre_asr_v9_audit_candidates.py",
+        "tools/asr/cueqc/compile_pre_asr_v10_features.py",
+        "tools/asr/cueqc/train_pre_asr_v10_binary.py",
+        "tools/asr/cueqc/export_pre_asr_v10_audit_candidates.py",
     )
     retired_tokens = (
         "cueqc_pre_asr_mamba_v6",
         "cueqc_pre_asr_mamba_v8",
+        "cueqc_pre_asr_mamba_v9",
         "pre_asr_cueqc_features_v2",
         "pre_asr_cueqc_features_v4",
+        "pre_asr_cueqc_features_v5",
         "compile_pre_asr_v6",
         "compile_pre_asr_v8",
+        "compile_pre_asr_v9",
         "train_pre_asr_v6",
         "train_pre_asr_v8",
+        "train_pre_asr_v9",
         "export_pre_asr_v6",
         "export_pre_asr_v8",
+        "export_pre_asr_v9",
         "Pre-ASR CueQC v6",
         "Pre-ASR CueQC v8",
+        "Pre-ASR CueQC v9",
     )
     for relative_path in active_files:
         text = (ROOT / relative_path).read_text(encoding="utf-8")
         for token in retired_tokens:
             assert token not in text
     assert all(
-        "cueqc_pre_asr_mamba_v9_binary" in path
+        "cueqc_pre_asr_mamba_v10_binary" in path
         for path in qwen.DEFAULT_PRE_ASR_CUEQC_CHECKPOINT_BY_REPO.values()
     )
 

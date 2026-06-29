@@ -8,7 +8,7 @@ from typing import Sequence
 import numpy as np
 
 
-FRAME_SEQUENCE_FEATURE_SCHEMA = "edge_sequence_features_v1"
+FRAME_SEQUENCE_FEATURE_SCHEMA = "edge_sequence_features_v2"
 FRAME_SEQUENCE_FRAMES_SCHEMA = "speech_boundary_ja_sequence_feature_frames_v1"
 CHUNK_POOLED_PTM_SCHEMA = "pre_asr_chunk_pooled_ptm_v1"
 DEFAULT_CHUNK_POOLED_PTM_BINS = 4
@@ -202,6 +202,14 @@ def frame_sequence_feature_names(
         "gap_s",
         "left_duration_s",
         "right_duration_s",
+        "total_duration_s",
+        "left_center_s",
+        "right_center_s",
+        "gap_center_s",
+        "left_duration_ratio",
+        "right_duration_ratio",
+        "gap_duration_ratio",
+        "relative_gap_center",
     ]
     for region in ("left", "gap", "right"):
         names.extend(f"{region}_ptm_mean_{index:03d}" for index in range(ptm_dim))
@@ -338,6 +346,13 @@ def _boundary_window_sequence_features_from_arrays(
     if frame_hop_s <= 0:
         raise ValueError("frame_hop_s must be positive")
     gap_s = right_start_s - left_end_s
+    left_duration_s = max(0.0, left_end_s - left_start_s)
+    right_duration_s = max(0.0, right_end_s - right_start_s)
+    total_duration_s = max(0.0, float(duration_s))
+    gap_duration_s = max(0.0, gap_s)
+    left_center_s = (left_start_s + left_end_s) / 2.0
+    right_center_s = (right_start_s + right_end_s) / 2.0
+    gap_center_s = (left_end_s + right_start_s) / 2.0
     ranges = {
         "left": (max(0.0, left_end_s - config.left_context_s), left_end_s),
         "gap": (left_end_s, right_start_s),
@@ -345,8 +360,16 @@ def _boundary_window_sequence_features_from_arrays(
     }
     values = [
         float(gap_s),
-        float(max(0.0, left_end_s - left_start_s)),
-        float(max(0.0, right_end_s - right_start_s)),
+        float(left_duration_s),
+        float(right_duration_s),
+        float(total_duration_s),
+        float(left_center_s),
+        float(right_center_s),
+        float(gap_center_s),
+        _safe_ratio(left_duration_s, total_duration_s),
+        _safe_ratio(right_duration_s, total_duration_s),
+        _safe_ratio(gap_duration_s, total_duration_s),
+        _safe_ratio(gap_center_s, total_duration_s),
     ]
     for name in ("left", "gap", "right"):
         start_s, end_s = ranges[name]
@@ -356,6 +379,12 @@ def _boundary_window_sequence_features_from_arrays(
             start_s, end_s = ranges[name]
             values.extend(_stats_for_range(mfcc_used, frame_hop_s=frame_hop_s, start_s=start_s, end_s=end_s))
     return values
+
+
+def _safe_ratio(numerator: float, denominator: float) -> float:
+    if denominator <= 0.0:
+        return 0.0
+    return float(numerator) / float(denominator)
 
 
 def _frame_array(values: Sequence[Sequence[float]], *, name: str) -> np.ndarray:
