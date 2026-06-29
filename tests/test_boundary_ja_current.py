@@ -54,6 +54,7 @@ from boundary.ja.backend import (
 from boundary.ja.manifest import TrainingExample
 from boundary.ja.model import TinyFrameClassifier, load_feature_frame_scorer_checkpoint
 from boundary.ja.train import _feature_training_arrays
+from subtitles.options import BASE_FPS
 from tools.boundary.ja.build_feature_cache import (
     _combine_workflow_window_features,
     _workflow_window_starts,
@@ -585,15 +586,14 @@ def test_scorer_split_peak_selection_keeps_all_effective_peaks_after_nms():
         min_split_segment_s=0.1,
         split_score_quantile=0.0,
         split_prominence_quantile=0.0,
-        video_fps=240.0,
     )
     frame_total = 428
     split_probs = np.full(frame_total, 0.02, dtype=np.float32)
     for frame, value in (
         (35, 0.45),
-        (42, 0.44),
+        (45, 0.44),
         (61, 0.21),
-        (65, 0.32),
+        (72, 0.32),
         (109, 0.39),
         (146, 0.29),
         (326, 0.38),
@@ -630,7 +630,6 @@ def test_scorer_decoder_exports_primary_and_weak_cut_candidates():
         min_split_segment_s=0.1,
         split_score_quantile=0.75,
         split_prominence_quantile=0.0,
-        video_fps=24.0,
     )
     split_probs = np.full(100, 0.01, dtype=np.float32)
     split_probs[20] = 0.90
@@ -667,7 +666,6 @@ def test_micro_chunk_resolver_merges_middle_segment_into_left_when_left_split_we
         min_split_segment_s=0.1,
         split_score_quantile=0.0,
         split_prominence_quantile=0.0,
-        video_fps=24.0,
     )
     split_probs = np.full(30, 0.01, dtype=np.float32)
     split_probs[10] = 0.30
@@ -705,7 +703,6 @@ def test_micro_chunk_resolver_merges_middle_segment_into_right_when_right_split_
         min_split_segment_s=0.1,
         split_score_quantile=0.0,
         split_prominence_quantile=0.0,
-        video_fps=24.0,
     )
     split_probs = np.full(30, 0.01, dtype=np.float32)
     split_probs[10] = 0.80
@@ -741,7 +738,6 @@ def test_micro_chunk_resolver_preserves_balanced_short_middle_segment_for_model_
         min_split_segment_s=0.1,
         split_score_quantile=0.0,
         split_prominence_quantile=0.0,
-        video_fps=24.0,
     )
     split_probs = np.full(30, 0.01, dtype=np.float32)
     split_probs[10] = 0.80
@@ -760,7 +756,7 @@ def test_micro_chunk_resolver_preserves_balanced_short_middle_segment_for_model_
         (pytest.approx(1.5), 3.0),
     ]
     middle = result.segments[1]
-    assert middle.subtitle_min_duration_s == pytest.approx(20.0 / 24.0)
+    assert middle.subtitle_min_duration_s == pytest.approx(20.0 / BASE_FPS)
     assert middle.below_subtitle_min_duration is True
     assert middle.micro_chunk_candidate is True
     assert middle.micro_resolve_action == "preserve_micro_candidate"

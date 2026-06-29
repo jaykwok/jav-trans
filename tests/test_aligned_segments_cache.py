@@ -6,6 +6,7 @@ import pytest
 import main
 from pipeline import audio as pipeline_audio
 from pipeline.audio import get_audio_cache_key
+from subtitles.options import BASE_FPS
 from helpers import make_job_context, run_pipeline
 
 
@@ -41,20 +42,21 @@ def test_aligned_cache_signature_uses_full_subtitle_options(
     )
     _configure(monkeypatch)
     monkeypatch.setenv("BOUNDARY_FEATURE_FRAME_HOP_S", "0.02")
-    monkeypatch.setattr(pipeline_audio, "probe_video_fps", lambda _path: 25.0)
 
     expected = main.aligned_cache_expectations_for_ctx(
         ctx,
         backend_label="mock_asr",
-        video_fps=pipeline_audio.probe_video_fps(str(video_path)),
     )[1]
 
     assert expected["asr_stage_config"]["BOUNDARY_FEATURE_FRAME_HOP_S"] == "0.02"
     assert "BOUNDARY_FRAME_HOP_S" not in expected["asr_stage_config"]
     assert expected["subtitle"]["timeline_mode"] == "alignment"
-    assert expected["subtitle"]["video_fps"] == 25.0
-    assert expected["subtitle"]["effective_video_fps"] == 25.0
-    assert expected["subtitle"]["frame_gap_s"] == pytest.approx(2 / 25.0)
+    assert "video_fps" not in expected["subtitle"]
+    assert "effective_video_fps" not in expected["subtitle"]
+    assert expected["subtitle"]["base_fps"] == pytest.approx(BASE_FPS)
+    assert expected["subtitle"]["frame_duration_s"] == pytest.approx(1 / BASE_FPS)
+    assert expected["subtitle"]["frame_gap_s"] == pytest.approx(2 / BASE_FPS)
+    assert expected["subtitle"]["frame_min_duration_s"] == pytest.approx(20 / BASE_FPS)
     assert "display_policy" not in expected["subtitle"]
     assert "dense_cue_merge_enabled" not in expected["subtitle"]
 
@@ -108,7 +110,7 @@ def test_aligned_segments_written_with_audio_cache_key(monkeypatch, tmp_path):
     assert payload["backend"] == "mock_asr"
     assert payload["audio_cache_key"]
     assert payload["cache_stage"] == "ready"
-    assert payload["cache_signature"]["version"] == 8
+    assert payload["cache_signature"]["version"] == 9
     assert payload["cache_signature"]["subtitle"]["timeline_mode"] == "alignment"
 
     assert payload["segments"] == [{"start": 0.0, "end": 1.0, "text": "こんにちは"}]
@@ -212,7 +214,7 @@ def test_asr_alignment_stage_writes_resume_signature_e2e(monkeypatch, tmp_path):
         write for write in aligned_writes if write["cache_stage"] == "asr_alignment"
     )
     assert isinstance(asr_stage_write["cache_signature"], dict)
-    assert asr_stage_write["cache_signature"]["version"] == 8
+    assert asr_stage_write["cache_signature"]["version"] == 9
 
 
 def test_aligned_cache_signature_ignores_retired_display_policy_env(monkeypatch, tmp_path):
@@ -226,18 +228,15 @@ def test_aligned_cache_signature_ignores_retired_display_policy_env(monkeypatch,
         keep_temp_files=True,
     )
     _configure(monkeypatch)
-    monkeypatch.setattr(pipeline_audio, "probe_video_fps", lambda _path: 25.0)
 
     default_signature = main.aligned_cache_expectations_for_ctx(
         ctx,
         backend_label="mock_asr",
-        video_fps=25.0,
     )[1]
     monkeypatch.setenv("SUBTITLE_DISPLAY_POLICY", "readability")
     readability_signature = main.aligned_cache_expectations_for_ctx(
         ctx,
         backend_label="mock_asr",
-        video_fps=25.0,
     )[1]
 
     assert "display_policy" not in default_signature["subtitle"]

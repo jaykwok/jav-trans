@@ -23,7 +23,6 @@ def test_asr_stage_env_scope_reaches_cache_and_transcribe(monkeypatch, tmp_path)
     monkeypatch.setenv("ASR_CONTEXT", "process actor")
     monkeypatch.setenv("BOUNDARY_FEATURE_FRAME_HOP_S", "0.02")
     monkeypatch.setattr(main.torch.cuda, "is_available", lambda: False)
-    monkeypatch.setattr(pipeline_audio, "probe_video_fps", lambda _path: 60.0)
 
     seen = {}
 
@@ -102,9 +101,9 @@ def test_asr_stage_env_scope_reaches_cache_and_transcribe(monkeypatch, tmp_path)
         seen["cache_signature"]["asr_stage_config"]["BOUNDARY_FEATURE_FRAME_HOP_S"]
         == "0.02"
     )
-    assert seen["cache_signature"]["subtitle"]["video_fps"] == 60.0
-    assert seen["cache_signature"]["subtitle"]["effective_video_fps"] == 60.0
-    assert seen["cache_signature"]["subtitle"]["frame_gap_s"] == 2 / 60.0
+    assert "video_fps" not in seen["cache_signature"]["subtitle"]
+    assert "effective_video_fps" not in seen["cache_signature"]["subtitle"]
+    assert seen["cache_signature"]["subtitle"]["frame_gap_s"] == main.subtitle_module.SubtitleOptions().frame_gap_s
     assert "dense_cue_merge_enabled" not in seen["cache_signature"]["subtitle"]
     assert artifacts.backend_label == f"backend:{ASR_17B_BACKEND}"
     assert main.os.environ["ASR_BACKEND"] == ASR_06B_BACKEND
@@ -129,7 +128,6 @@ def test_asr_stage_env_scope_passes_boundary_refiner_flags(monkeypatch, tmp_path
         },
     )
     monkeypatch.setattr(main.torch.cuda, "is_available", lambda: False)
-    monkeypatch.setattr(pipeline_audio, "probe_video_fps", lambda _path: 30.0)
 
     seen = {}
 

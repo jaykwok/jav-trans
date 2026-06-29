@@ -140,8 +140,8 @@ Web 提交是否使用 CUDA 取决于后端服务进程是否能看到 GPU，而
      - acoustic timeline 来自 Boundary chunk / Refiner v8
   -> Subtitle Layout v2
      - acoustic/display 双时间轴
-     - 20-frame 最小显示时间
-     - 2-frame 最小间隔
+     - 20-frame 最小显示时间（固定 `24000/1001` 基准）
+     - 2-frame 最小间隔（固定 `24000/1001` 基准）
      - 7s 最大显示 soft guard
      - 长 cue 先按 ASR 文本断句，再吸附 weak cut，没有 weak cut 才比例估算
   -> 可选 LLM 翻译
@@ -152,7 +152,7 @@ Web 提交是否使用 CUDA 取决于后端服务进程是否能看到 GPU，而
 
 - ASR chunk 切分只使用 scorer 的 primary acoustic cut candidates。
 - weak cut candidates 有明确时间点，但不直接强切 ASR chunk；它们来自 NMS/primary 选择后未入选但仍有声学证据的切点，用于字幕 layout、审计和后续训练。
-- `20 / video_fps` 是字幕最短显示和 micro chunk 风险线，不是 runtime duration-only drop 阈值。
+- `20 / (24000/1001)` 是字幕最短显示和 micro chunk 风险线，不是 runtime duration-only drop 阈值。
 - 7 秒是字幕显示 soft guard，不是 ASR chunk 上限。
 - Runtime 不使用具体词黑名单或时长启发式删除短促人声；是否进入 ASR 由 Pre-ASR CueQC 模型标签决定。
 
@@ -192,7 +192,7 @@ Decoder 会输出两类 acoustic cut：
 - `primary_cut_candidates`：高可信切点，用于 ASR chunk split。
 - `weak_cut_candidates`：弱证据切点，包含 `time_s/frame/score/prominence/speech_valley/strength`，透传到 chunk metadata、boundary cache、ASR chunk metadata 和字幕 layout。
 
-Decoder 先按自适应 peak / valley 选 primary cut，并在 NMS 后保留未入选但仍有声学证据的 weak cut。之后 micro resolver 只处理 `<20/video_fps` 的过短中间段：比较左右 split 的 score、prominence 和 speech valley，删除证据较弱的一侧并把短段并入邻段；两侧证据接近时保留该短段并写入 micro metadata。Decoder 不做额外近邻合并，也不因短时长直接 drop。
+Decoder 先按自适应 peak / valley 选 primary cut，并在 NMS 后保留未入选但仍有声学证据的 weak cut。之后 micro resolver 只处理 `<20/(24000/1001)` 的过短中间段：比较左右 split 的 score、prominence 和 speech valley，删除证据较弱的一侧并把短段并入邻段；两侧证据接近时保留该短段并写入 micro metadata。Decoder 不做额外近邻合并，也不因短时长直接 drop。
 
 ### Boundary Refiner v8
 

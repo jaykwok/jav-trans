@@ -75,10 +75,44 @@ class _IndexSequenceFeatureProvider:
         raise AssertionError((left_start_s, left_end_s, right_start_s, right_end_s))
 
 
+class _StaticSequenceRefiner:
+    def __init__(self, deltas: list[tuple[float, float]]) -> None:
+        self.deltas = deltas
+        self.calls: list[list[list[float]]] = []
+        self.cursor = 0
+
+    def decide_sequence(self, features: list[list[float]]) -> list[BoundaryDecision]:
+        self.calls.append(features)
+        deltas = self.deltas[self.cursor : self.cursor + len(features)]
+        self.cursor += len(features)
+        return [
+            BoundaryDecision(
+                source="edge_sequence_refiner_v8",
+                start_refine_delta_s=start_delta,
+                end_refine_delta_s=end_delta,
+            )
+            for start_delta, end_delta in deltas
+        ]
+
+    def signature(self) -> dict:
+        return {"type": "static_sequence_refiner"}
+
+
+class _GapFeatureProvider:
+    def features_for_boundary(
+        self,
+        *,
+        left_start_s: float,
+        left_end_s: float,
+        right_start_s: float,
+        right_end_s: float,
+    ) -> list[float]:
+        return [right_start_s - left_end_s]
+
+
 def test_scorer_islands_stay_as_asr_chunks():
     chunks = pack_speech_segments(
         [_seg(5.0, 7.0), _seg(8.0, 9.0), _seg(10.0, 11.0)],
-        frame_hop_s=1.0,
     )
 
     assert [(chunk.core_start, chunk.core_end) for chunk in chunks] == [
@@ -96,7 +130,6 @@ def test_scorer_islands_stay_as_asr_chunks():
 def test_sequence_refiner_scores_gap_without_merging():
     chunks = pack_speech_segments(
         [_seg(0.0, 2.0), _seg(3.0, 5.0)],
-        frame_hop_s=1.0,
         sequence_boundary_refiner=_SequenceDenyRefiner(),
         sequence_feature_provider=_StaticSequenceFeatureProvider(),
     )
@@ -111,7 +144,6 @@ def test_sequence_refiner_scores_gap_without_merging():
 def test_sequence_refiner_boundary_delta_adjusts_only_chunk_edges():
     chunks = pack_speech_segments(
         [_seg(0.0, 1.0), _seg(1.4, 2.0), _seg(2.5, 3.0)],
-        frame_hop_s=1.0,
         sequence_boundary_refiner=_DeltaSequenceRefiner(),
         sequence_feature_provider=_IndexSequenceFeatureProvider(),
     )
@@ -131,7 +163,7 @@ def test_sequence_refiner_boundary_delta_adjusts_only_chunk_edges():
 
 
 def test_overlong_scorer_island_is_not_duration_split_by_packer():
-    chunks = pack_speech_segments([_seg(10.0, 75.0)], frame_hop_s=1.0)
+    chunks = pack_speech_segments([_seg(10.0, 75.0)])
 
     assert [(chunk.start, chunk.end, chunk.duration) for chunk in chunks] == [(10.0, 75.0, 65.0)]
     assert [[(seg.start, seg.end) for seg in chunk.speech_segments] for chunk in chunks] == [[(10.0, 75.0)]]
@@ -142,7 +174,31 @@ def test_empty_segments_return_empty_list():
 
 
 def test_single_segment_uses_core_window_without_padding():
-    chunks = pack_speech_segments([_seg(0.4, 1.0)], frame_hop_s=1.0)
+    chunks = pack_speech_segments([_seg(0.4, 1.0)])
 
     assert chunks[0].start == pytest.approx(0.4)
     assert chunks[0].end == pytest.approx(1.0)
+
+
+def test_sequence_refiner_batches_long_sequences():
+    refiner = _StaticSequenceRefiner([(0.0, 0.0), (0.0, 0.0), (0.0, 0.0)])
+
+    chunks = pack_speech_segments(
+        [_seg(0.0, 1.0), _seg(1.1, 2.0), _seg(2.1, 3.0), _seg(3.1, 4.0)],
+        sequence_boundary_refiner=refiner,
+        sequence_feature_provider=_GapFeatureProvider(),
+        sequence_batch_size=2,
+    )
+
+    assert [len(call) for call in refiner.calls] == [2, 1]
+    assert [(chunk.start, chunk.end) for chunk in chunks] == [
+        (0.0, 1.0),
+        (1.1, 2.0),
+        (2.1, 3.0),
+        (3.1, 4.0),
+    ]
+
+
+def test_pack_speech_segments_validates_sequence_batch_size():
+    with pytest.raises(ValueError, match="sequence_batch_size"):
+        pack_speech_segments([_seg(0.0, 1.0)], sequence_batch_size=0)

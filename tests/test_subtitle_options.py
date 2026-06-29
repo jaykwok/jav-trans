@@ -1,7 +1,7 @@
 import pytest
 
 from subtitles.options import SubtitleOptions
-from subtitles.options import FALLBACK_VIDEO_FPS
+from subtitles.options import BASE_FPS
 from subtitles import writer as subtitle
 
 
@@ -28,19 +28,12 @@ def test_subtitle_options_defaults_are_conservative():
     options = SubtitleOptions.from_env()
 
     assert options.max_display_duration_s == 7.0
-    assert options.effective_video_fps == FALLBACK_VIDEO_FPS
-    assert options.frame_gap_s == 2 / FALLBACK_VIDEO_FPS
+    assert options.frame_duration_s == pytest.approx(1 / BASE_FPS)
+    assert options.frame_gap_s == pytest.approx(2 / BASE_FPS)
+    assert options.frame_min_duration_s == pytest.approx(20 / BASE_FPS)
     assert options.timing_polish_enabled is True
     assert options.short_gap_collapse_s == 0.5
     assert options.linger_s == 0.45
-
-
-def test_subtitle_options_video_fps_falls_back_to_ntsc():
-    options = SubtitleOptions(video_fps=0)
-
-    assert options.effective_video_fps == FALLBACK_VIDEO_FPS
-    assert options.with_video_fps(None).effective_video_fps == FALLBACK_VIDEO_FPS
-    assert options.with_video_fps(24).frame_gap_s == pytest.approx(2 / 24)
 
 
 def test_write_srt_ignores_speaker_metadata(tmp_path):
@@ -80,7 +73,7 @@ def test_prepare_srt_blocks_timeline_mode_is_per_options(monkeypatch, tmp_path):
     )
 
     content = path.read_text(encoding="utf-8")
-    assert "00:00:00,000 --> 00:00:01,117" in content
+    assert "00:00:00,000 --> 00:00:01,284" in content
 
 
 def test_prepare_bilingual_keeps_adjacent_cues_separate(tmp_path):

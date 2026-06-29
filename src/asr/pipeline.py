@@ -434,7 +434,6 @@ def _build_processing_spans(
         return []
     packed = pack_speech_segments(
         segments,
-        frame_hop_s=cfg["feature_frame_hop_s"],
         sequence_boundary_refiner=sequence_boundary_refiner,
         sequence_feature_provider=sequence_feature_provider,
         sequence_batch_size=cfg["boundary_planner_sequence_batch_size"],
