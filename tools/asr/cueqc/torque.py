@@ -408,7 +408,7 @@ def torque_clustering(
         # --- initial layer: connect each point to its 1-nearest neighbour ---
         graph = sp.lil_matrix((n, n), dtype=np.float64)
         neiborloc: list[int] = [0] * n
-        dm_dense_rows = dm_sparse.toarray() if n <= 2048 else None
+        dm_dense_rows = dense_dm if dense_dm is not None else (dm_sparse.toarray() if n <= 2048 else None)
         for i in range(n):
             row = dm_dense_rows[i] if dm_dense_rows is not None else dm_sparse[i].toarray().ravel()
             row[i] = np.inf
@@ -440,19 +440,20 @@ def torque_clustering(
             community = new_community
             comm_num = len(community)
 
-            inter_dm = sp.lil_matrix((comm_num, comm_num), dtype=np.float64)
-            for i in range(comm_num):
-                for j in range(comm_num):
-                    if i != j:
-                        inter_dm[i, j] = _ps2psdist(community[i], community[j], dm_sparse)
-            inter_dm = inter_dm.tocsr()
-            inter_dense = inter_dm.toarray() if comm_num <= 2048 else None
+            point_to_comm = np.empty(n, dtype=np.int64)
+            for ci, members in enumerate(community):
+                point_to_comm[np.asarray(members, dtype=np.int64)] = ci
+            if dense_dm is not None:
+                inter_dense = _community_min_distance_matrix(dense_dm, point_to_comm, comm_num)
+            else:
+                inter_dense = _community_min_distance_matrix(dm_sparse.toarray(), point_to_comm, comm_num)
+            inter_dm = sp.csr_matrix(inter_dense)
 
             graph = sp.lil_matrix((comm_num, comm_num), dtype=np.float64)
             neiborloc2: list = [None] * comm_num
             sizes = np.array([len(c) for c in community])
             for i in range(comm_num):
-                row = inter_dense[i] if inter_dense is not None else inter_dm[i].toarray().ravel()
+                row = inter_dense[i]
                 row[i] = np.inf
                 order = np.argsort(row, kind="mergesort")
                 found = False

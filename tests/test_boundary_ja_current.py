@@ -556,7 +556,7 @@ def test_scorer_split_uses_adaptive_peaks_below_old_absolute_threshold(monkeypat
     frame_count = 600
     split_probs = np.full(frame_count, 0.05, dtype=np.float32)
     for peak in (50, 110, 170, 230, 290, 350, 410, 470, 530):
-        split_probs[peak - 1 : peak + 2] = [0.16, 0.28, 0.16]
+        split_probs[peak - 1 : peak + 2] = [0.16, 0.36, 0.16]
     result = decode_frame_boundary_segments(
         speech_probabilities=np.full(frame_count, 0.9, dtype=np.float32),
         split_probabilities=split_probs,

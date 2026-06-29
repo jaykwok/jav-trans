@@ -195,7 +195,7 @@ class _FakeSequenceRefiner:
     def decide_sequence(self, features: list[list[float]]) -> list[BoundaryDecision]:
         return [
             BoundaryDecision(
-                source="edge_sequence_refiner_v7",
+                source="edge_sequence_refiner_v8",
                 start_refine_delta_s=0.0,
                 end_refine_delta_s=0.0,
             )
@@ -203,7 +203,7 @@ class _FakeSequenceRefiner:
         ]
 
     def signature(self) -> dict:
-        return {"schema": "boundary_edge_refiner_v7", "type": "fake_sequence_refiner"}
+        return {"schema": "boundary_edge_refiner_v8_safe_tight", "type": "fake_sequence_refiner"}
 
 
 class _FakeSequenceFeatureProvider:
@@ -265,8 +265,8 @@ class _FakeCueQCRefiner:
 
 def _reload_pipeline(monkeypatch, tmp_path: Path, *, enable_cueqc: bool = False):
     asr_backend = "jaykwok/Qwen3-ASR-0.6B-JA-Anime-Galgame"
-    boundary_checkpoint = tmp_path / "boundary_edge_refiner_v7.jaykwok-Qwen3-ASR-0.6B-JA-Anime-Galgame.pt"
-    boundary_checkpoint.write_bytes(b"v6")
+    boundary_checkpoint = tmp_path / "boundary_edge_refiner_v8_safe_tight.jaykwok-Qwen3-ASR-0.6B-JA-Anime-Galgame.pt"
+    boundary_checkpoint.write_bytes(b"v8")
     monkeypatch.setenv("ASR_BACKEND", asr_backend)
     monkeypatch.setenv(
         "BOUNDARY_REFINER_MODEL_PATH_BY_REPO",
@@ -292,11 +292,11 @@ def _reload_pipeline(monkeypatch, tmp_path: Path, *, enable_cueqc: bool = False)
     monkeypatch.setattr(
         asr,
         "_boundary_refiner_runtime_adapter",
-        lambda _path: "edge_sequence_v1",
+        lambda _path: "edge_sequence_v2",
     )
     monkeypatch.setattr(
         asr,
-        "load_edge_sequence_refiner_v7_checkpoint",
+        "load_edge_sequence_refiner_v8_checkpoint",
         lambda *_args, **_kwargs: _FakeSequenceRefiner(),
     )
     monkeypatch.setattr(
@@ -349,7 +349,7 @@ def test_boundary_planner_emits_one_asr_chunk_per_speech_island(monkeypatch, tmp
     assert len(backend.audio_paths) == 10
     assert details["chunk_count"] == len(backend.audio_paths)
     assert details["boundary_signature"]["backend"] == "stub"
-    assert details["boundary_signature"]["boundary_pipeline"]["version"] == 7
+    assert details["boundary_signature"]["boundary_pipeline"]["version"] == 8
     assert all(
         "source_boundary.wav" not in str(Path(path).name) for path in backend.audio_paths
     )
@@ -442,7 +442,7 @@ def test_packed_chunk_metadata_uses_source_span_index_after_short_chunk_drop():
         boundary_source="cut",
         boundary_start_refine_delta_s=0.04,
         boundary_end_refine_delta_s=-0.03,
-        boundary_decision_source="edge_sequence_refiner_v7",
+        boundary_decision_source="edge_sequence_refiner_v8",
         subtitle_min_duration_s=20.0 / 24.0,
         below_subtitle_min_duration=False,
         micro_chunk_candidate=True,
@@ -492,7 +492,7 @@ def test_packed_chunk_metadata_uses_source_span_index_after_short_chunk_drop():
     assert chunk_infos[0]["boundary_score"] == 0.87
     assert chunk_infos[0]["boundary_start_refine_delta_s"] == 0.04
     assert chunk_infos[0]["boundary_end_refine_delta_s"] == -0.03
-    assert chunk_infos[0]["boundary_decision_source"] == "edge_sequence_refiner_v7"
+    assert chunk_infos[0]["boundary_decision_source"] == "edge_sequence_refiner_v8"
     assert chunk_infos[0]["subtitle_min_duration_s"] == 20.0 / 24.0
     assert chunk_infos[0]["micro_chunk_candidate"] is True
     assert chunk_infos[0]["micro_resolve_action"] == "merge_micro_into_left"

@@ -29,22 +29,22 @@ from asr.pre_asr_cueqc import (  # noqa: E402
     PRE_ASR_CUEQC_RUNTIME_ADAPTER,
     PRE_ASR_CUEQC_SCALAR_FEATURE_NAMES,
     PRE_ASR_CUEQC_SCHEMA,
-    PreAsrCueQCMambaV9,
+    PreAsrCueQCMambaV10,
     make_model_config,
 )
-from tools.asr.cueqc.compile_pre_asr_v9_features import (  # noqa: E402
+from tools.asr.cueqc.compile_pre_asr_v10_features import (  # noqa: E402
     FEATURE_BUNDLE_SCHEMA,
     project_path,
     repo_display_path,
 )
 
 
-METRICS_SCHEMA = "cueqc_pre_asr_mamba_v9_train_metrics"
+METRICS_SCHEMA = "cueqc_pre_asr_mamba_v10_train_metrics"
 DEFAULT_SWEEP_THRESHOLDS = (0.50, 0.60, 0.70, 0.80, 0.90, 0.95, 0.98, 0.99)
 
 
 def default_checkpoint_name(asr_repo_id: str) -> str:
-    return f"cueqc_pre_asr_mamba_v9_binary.{qwen_asr_repo_tag(asr_repo_id)}.pt"
+    return f"cueqc_pre_asr_mamba_v10_binary.{qwen_asr_repo_tag(asr_repo_id)}.pt"
 
 
 def file_sha256(path: Path) -> str:
@@ -64,7 +64,7 @@ def load_feature_bundle(path: Path) -> dict[str, Any]:
     if payload.get("schema") != FEATURE_BUNDLE_SCHEMA:
         raise ValueError(f"unsupported feature bundle schema: {payload.get('schema')!r}")
     if tuple(payload.get("feature_names") or ()) != PRE_ASR_CUEQC_SCALAR_FEATURE_NAMES:
-        raise ValueError("feature bundle feature_names do not match Pre-ASR CueQC v9 runtime")
+        raise ValueError("feature bundle feature_names do not match Pre-ASR CueQC v10 runtime")
     if payload.get("feature_schema") != PRE_ASR_CUEQC_FEATURE_SCHEMA:
         raise ValueError("feature bundle feature_schema mismatch")
     if payload.get("runtime_adapter") != PRE_ASR_CUEQC_RUNTIME_ADAPTER:
@@ -237,7 +237,7 @@ def train(
             "hidden_size": hidden_size,
         }
     )
-    model = PreAsrCueQCMambaV9(**model_config).to(dev)
+    model = PreAsrCueQCMambaV10(**model_config).to(dev)
     opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
     class_weights = torch.tensor(
         [float(drop_class_weight), float(keep_class_weight)],
@@ -354,7 +354,7 @@ def train(
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Train Pre-ASR CueQC v9 hierarchical Mamba2 binary checkpoint.")
+    parser = argparse.ArgumentParser(description="Train Pre-ASR CueQC v10 hierarchical Mamba2 binary checkpoint.")
     parser.add_argument("--features", required=True)
     parser.add_argument("--output-dir", required=True)
     parser.add_argument("--asr-repo-id", required=True)

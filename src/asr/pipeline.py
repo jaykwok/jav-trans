@@ -20,7 +20,7 @@ from boundary.sequence_features import (
 )
 from boundary.refiner import (
     file_sha1 as _boundary_refiner_file_sha1,
-    load_edge_sequence_refiner_v7_checkpoint,
+    load_edge_sequence_refiner_v8_checkpoint,
 )
 from asr import checkpoint as _checkpoint_module
 from asr import chunking as _chunking_module
@@ -144,9 +144,9 @@ def _boundary_refiner_runtime_adapter(path: Path | None) -> str:
             metadata_key="metadata.ptm_repo_id",
         )
         adapter = str(metadata.get("runtime_adapter") or "").strip()
-        if adapter == "edge_sequence_v1":
+        if adapter == "edge_sequence_v2":
             return adapter
-    raise ValueError("Boundary Refiner checkpoint must use metadata.runtime_adapter='edge_sequence_v1'")
+    raise ValueError("Boundary Refiner checkpoint must use metadata.runtime_adapter='edge_sequence_v2'")
 
 
 def _sequence_feature_provider_from_result(
@@ -194,7 +194,7 @@ def _required_sequence_feature_provider_from_result(
     )
     if provider is None:
         raise ValueError(
-            "edge_sequence_v1 Boundary Refiner requires "
+            "edge_sequence_v2 Boundary Refiner requires "
             f"{FRAME_SEQUENCE_FRAMES_SCHEMA} in SpeechBoundary-JA output"
         )
     return provider
@@ -364,7 +364,7 @@ def _build_processing_spans(
     cfg = _boundary_config()
     _set_last_boundary_cache_event(None)
 
-    needs_sequence_features = cfg["boundary_refiner_runtime_adapter"] == "edge_sequence_v1"
+    needs_sequence_features = cfg["boundary_refiner_runtime_adapter"] == "edge_sequence_v2"
     restore_sequence_export = (
         os.environ.get("SPEECH_BOUNDARY_JA_EXPORT_SEQUENCE_FEATURES")
         if needs_sequence_features
@@ -403,7 +403,7 @@ def _build_processing_spans(
     split_boundary_frame_scores = result.parameters.get("split_boundary_frame_scores")
     score_frame_hop_s = result.parameters.get("frame_hop_s")
     sequence_feature_frames = result.parameters.get("sequence_feature_frames")
-    sequence_boundary_refiner = load_edge_sequence_refiner_v7_checkpoint(
+    sequence_boundary_refiner = load_edge_sequence_refiner_v8_checkpoint(
         Path(cfg["boundary_refiner_model_path"]),
         device=cfg["boundary_refiner_device"],
         expected_ptm_repo_id=ASR_BACKEND,
@@ -424,8 +424,8 @@ def _build_processing_spans(
     runtime_boundary_signature = {
         **result_parameters,
         "boundary_pipeline": {
-            "version": 7,
-            "refiner_schema": "boundary_edge_refiner_v7",
+            "version": 8,
+            "refiner_schema": "boundary_edge_refiner_v8_safe_tight",
             "feature_frame_hop_s": cfg["feature_frame_hop_s"],
             "score_frame_hop_s": score_frame_hop_s,
             "feature_sources": {
@@ -443,7 +443,7 @@ def _build_processing_spans(
                 else None
             ),
             "boundary_planner": {
-                "planner": "edge_sequence_island_planner_v7",
+                "planner": "edge_sequence_island_planner_v8",
                 "sequence_batch_size": cfg["boundary_planner_sequence_batch_size"],
             },
         },
@@ -705,7 +705,7 @@ def _apply_pre_asr_cueqc(
         print(message, flush=True)
 
     report = {
-        "schema": "pre_asr_cueqc_report_v1",
+        "schema": "pre_asr_cueqc_report_v2",
         "enabled": _pre_asr_cueqc_module.enabled(),
         "candidate_count": len(spans),
         "drop_count": 0,
@@ -911,12 +911,32 @@ def _annotate_packed_chunks(
         chunk["speech_island_count"] = packed.island_count
         chunk["speech_internal_gap_count"] = packed.internal_gap_count
         chunk["speech_internal_gap_max_s"] = packed.internal_gap_max_s
+        chunk["raw_start"] = packed.raw_start
+        chunk["raw_end"] = packed.raw_end
+        chunk["raw_duration"] = packed.raw_duration
+        chunk["acoustic_start"] = packed.acoustic_start
+        chunk["acoustic_end"] = packed.acoustic_end
+        chunk["acoustic_duration"] = packed.acoustic_duration
         chunk["boundary_score"] = packed.boundary_score
         chunk["boundary_reason"] = packed.boundary_reason
         chunk["boundary_source"] = packed.boundary_source
         chunk["boundary_start_refine_delta_s"] = packed.boundary_start_refine_delta_s
         chunk["boundary_end_refine_delta_s"] = packed.boundary_end_refine_delta_s
         chunk["boundary_decision_source"] = packed.boundary_decision_source
+        chunk["refiner_pred_start_delta_s"] = packed.refiner_pred_start_delta_s
+        chunk["refiner_pred_end_delta_s"] = packed.refiner_pred_end_delta_s
+        chunk["refiner_applied_start_delta_s"] = packed.refiner_applied_start_delta_s
+        chunk["refiner_applied_end_delta_s"] = packed.refiner_applied_end_delta_s
+        chunk["refiner_start_confidence"] = packed.refiner_start_confidence
+        chunk["refiner_end_confidence"] = packed.refiner_end_confidence
+        chunk["refiner_start_source"] = packed.refiner_start_source
+        chunk["refiner_end_source"] = packed.refiner_end_source
+        chunk["refiner_safety_action"] = packed.refiner_safety_action
+        chunk["refiner_safety_reason"] = packed.refiner_safety_reason
+        chunk["refiner_effective_start_delta_max_s"] = packed.refiner_effective_start_delta_max_s
+        chunk["refiner_effective_end_delta_max_s"] = packed.refiner_effective_end_delta_max_s
+        chunk["refiner_fallback_used"] = packed.refiner_fallback_used
+        chunk["refiner_shared_boundary_adjusted"] = packed.refiner_shared_boundary_adjusted
         chunk["scorer_speech_mean"] = packed.scorer_speech_mean
         chunk["scorer_speech_max"] = packed.scorer_speech_max
         chunk["scorer_speech_p90"] = packed.scorer_speech_p90
@@ -958,7 +978,8 @@ def _annotate_packed_chunks(
             "boundary={boundary_reason} source={boundary_source} score={boundary_score} "
             "micro={micro_action} below_subtitle_min={below_min} "
             "delta=({start_delta},{end_delta}) "
-            "decision_source={decision_source}".format(
+            "decision_source={decision_source} "
+            "conf=({start_conf},{end_conf}) safety={safety}".format(
                 idx=idx,
                 duration=packed.duration,
                 count=len(packed.speech_segments),
@@ -975,6 +996,9 @@ def _annotate_packed_chunks(
                 start_delta=packed.boundary_start_refine_delta_s,
                 end_delta=packed.boundary_end_refine_delta_s,
                 decision_source=packed.boundary_decision_source,
+                start_conf=packed.refiner_start_confidence,
+                end_conf=packed.refiner_end_confidence,
+                safety=packed.refiner_safety_action,
             )
         )
 
@@ -1632,6 +1656,54 @@ def _transcribe_and_align_local(
                     chunk_indices.append(int(segment.get("source_chunk_index")))
                 except (TypeError, ValueError):
                     pass
+            try:
+                acoustic_start = float(segment.get("start", 0.0))
+                acoustic_end = max(acoustic_start, float(segment.get("end", acoustic_start)))
+            except (TypeError, ValueError):
+                acoustic_start = 0.0
+                acoustic_end = 0.0
+            segment["acoustic_start"] = acoustic_start
+            segment["acoustic_end"] = acoustic_end
+            segment["acoustic_duration"] = max(0.0, acoustic_end - acoustic_start)
+            source_chunks = [
+                chunks_by_index[index]
+                for index in list(dict.fromkeys(chunk_indices))
+                if index in chunks_by_index
+            ]
+            if source_chunks:
+                chunk_start_values = [
+                    float(chunk["acoustic_start"])
+                    for chunk in source_chunks
+                    if chunk.get("acoustic_start") is not None
+                ]
+                chunk_end_values = [
+                    float(chunk["acoustic_end"])
+                    for chunk in source_chunks
+                    if chunk.get("acoustic_end") is not None
+                ]
+                if chunk_start_values and chunk_end_values:
+                    segment["chunk_acoustic_start"] = min(chunk_start_values)
+                    segment["chunk_acoustic_end"] = max(chunk_end_values)
+                    segment["chunk_acoustic_duration"] = max(
+                        0.0,
+                        segment["chunk_acoustic_end"] - segment["chunk_acoustic_start"],
+                    )
+                for key in (
+                    "raw_start",
+                    "raw_end",
+                    "raw_duration",
+                    "refiner_start_confidence",
+                    "refiner_end_confidence",
+                    "refiner_start_source",
+                    "refiner_end_source",
+                    "refiner_safety_action",
+                    "refiner_safety_reason",
+                    "refiner_fallback_used",
+                    "refiner_shared_boundary_adjusted",
+                ):
+                    values = [chunk.get(key) for chunk in source_chunks if chunk.get(key) is not None]
+                    if values:
+                        segment[key] = values[0]
             shadows = [
                 cueqc_shadow_by_chunk[index]
                 for index in list(dict.fromkeys(chunk_indices))

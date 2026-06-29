@@ -212,6 +212,8 @@ def _asr_stage_env_for_video(ctx: JobContext, video_fps: float | None) -> dict[s
 
 
 _SUBTITLE_OPTION_KEYS = {
+    "SUBTITLE_LAYOUT_ENGINE",
+    "SUBTITLE_TIMING_MODEL",
     "MIN_SUBTITLE_DURATION",
     "SUBTITLE_MIN_DURATION",
     "SUBTITLE_READING_CPS",
@@ -225,6 +227,12 @@ _SUBTITLE_OPTION_KEYS = {
     "SUBTITLE_TIMING_POLISH_ENABLED",
     "SUBTITLE_SHORT_GAP_COLLAPSE_S",
     "SUBTITLE_LINGER_S",
+    "SUBTITLE_WEAK_CUT_SNAP_SHORT_S",
+    "SUBTITLE_WEAK_CUT_SNAP_NORMAL_S",
+    "SUBTITLE_WEAK_CUT_SNAP_LONG_S",
+    "SUBTITLE_MAX_DISPLAY_SHIFT_FROM_ACOUSTIC_START_S",
+    "SUBTITLE_MAX_DISPLAY_SHIFT_FROM_ACOUSTIC_END_S",
+    "SUBTITLE_MAX_TOTAL_DISPLAY_EXTENSION_S",
 
 
 
@@ -659,6 +667,12 @@ def _build_japanese_srt_blocks(segments: list[dict]) -> list[dict]:
             "zh_text": str(seg.get("text", "")),
             "words": list(seg.get("words") or []),
             "source_segment_ids": list(seg.get("source_segment_ids") or [idx]),
+            "acoustic_start": seg.get("acoustic_start", seg.get("start")),
+            "acoustic_end": seg.get("acoustic_end", seg.get("end")),
+            "acoustic_duration": seg.get("acoustic_duration"),
+            "chunk_acoustic_start": seg.get("chunk_acoustic_start"),
+            "chunk_acoustic_end": seg.get("chunk_acoustic_end"),
+            "chunk_acoustic_duration": seg.get("chunk_acoustic_duration"),
             "primary_cut_candidates": list(seg.get("primary_cut_candidates") or []),
             "weak_cut_candidates": list(seg.get("weak_cut_candidates") or []),
         }
@@ -1566,6 +1580,12 @@ def _run_translation_and_write_impl(
             "words": list(seg.get("words") or []),
             "cue_id": seg.get("cue_id"),
             "source_segment_ids": list(seg.get("source_segment_ids") or []),
+            "acoustic_start": seg.get("acoustic_start", seg.get("start")),
+            "acoustic_end": seg.get("acoustic_end", seg.get("end")),
+            "acoustic_duration": seg.get("acoustic_duration"),
+            "display_start": seg.get("display_start", seg.get("start")),
+            "display_end": seg.get("display_end", seg.get("end")),
+            "display_duration": seg.get("display_duration"),
             "raw_text": seg.get("raw_text", seg.get("ja_text") or seg.get("text", "")),
             "display_decision": seg.get("display_decision", "keep"),
             "raw_texts": list(seg.get("raw_texts") or []),

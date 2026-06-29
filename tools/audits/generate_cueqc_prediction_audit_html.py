@@ -349,6 +349,8 @@ button.danger { color: var(--danger); }
 .panel { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 14px; margin-bottom: 12px; }
 .grid { display: grid; grid-template-columns: minmax(0, 1fr) 320px; gap: 12px; }
 audio { width: 100%; margin: 8px 0 10px; }
+.label-workbench { border: 1px solid var(--line); border-radius: 8px; background: #f7faf8; padding: 10px; margin: 10px 0; }
+.label-workbench .tags { margin-top: 10px; }
 .caption { min-height: 52px; border: 1px solid var(--line); border-radius: 6px; background: #101614; color: #f5f5f0; padding: 10px; white-space: pre-wrap; overflow-wrap: anywhere; }
 .text-box, .cue-list { white-space: pre-wrap; overflow-wrap: anywhere; }
 .cue { border-bottom: 1px solid var(--line); padding: 6px 0; }
@@ -392,20 +394,10 @@ textarea { width: 100%; min-height: 70px; border: 1px solid var(--line); border-
         <button id="prevBtn">上一条</button>
         <button id="nextBtn">下一条</button>
         <button id="copyBtn">复制 JSONL</button>
-        <button id="downloadBtn" class="primary">导出 JSONL</button>
+        <button id="saveBtn" class="primary">保存审计结果</button>
+        <button id="downloadBtn">下载 JSONL</button>
       </div>
     </div>
-    <section class="panel">
-      <div class="labels">
-        <button data-label="drop_ok" class="primary">丢弃正确</button>
-        <button data-label="false_drop_keep" class="danger">误删应保留</button>
-        <button data-label="uncertain">不确定</button>
-      </div>
-      <div class="tags" style="margin-top:10px">
-%%REASON_TAG_BUTTONS%%
-      </div>
-      <p class="meta" id="labelStatus"></p>
-    </section>
     <div class="grid">
       <section class="panel">
         <audio id="media" controls preload="metadata"></audio>
@@ -416,6 +408,17 @@ textarea { width: 100%; min-height: 70px; border: 1px solid var(--line); border-
           <a id="vttLink" href="#">打开 VTT</a>
         </div>
         <p class="meta error" id="mediaError"></p>
+        <div class="label-workbench">
+          <div class="labels">
+            <button data-label="drop_ok" class="primary">丢弃正确</button>
+            <button data-label="false_drop_keep" class="danger">误删应保留</button>
+            <button data-label="uncertain">不确定</button>
+          </div>
+          <div class="tags">
+%%REASON_TAG_BUTTONS%%
+          </div>
+          <p class="meta" id="labelStatus"></p>
+        </div>
         <h3>当前字幕</h3>
         <div class="caption" id="captionText"></div>
       </section>
@@ -722,6 +725,22 @@ function downloadJsonl() {
   a.click();
   URL.revokeObjectURL(a.href);
 }
+async function saveJsonl() {
+  const text = exportJsonl();
+  try {
+    const response = await fetch("/__audit_api__/save-labels", {
+      method: "POST",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({href: location.pathname, filename: OUTPUT_NAME, content: text})
+    });
+    const payload = await response.json().catch(() => ({}));
+    if (!response.ok || !payload.ok) throw new Error(payload.error || `HTTP ${response.status}`);
+    document.getElementById("labelStatus").textContent = `已保存到 ${payload.path}`;
+  } catch (error) {
+    document.getElementById("labelStatus").textContent = `保存到审计目录失败，已改为下载：${error && error.message ? error.message : error}`;
+    downloadJsonl();
+  }
+}
 async function copyJsonl() {
   await navigator.clipboard.writeText(exportJsonl());
 }
@@ -738,6 +757,7 @@ document.getElementById("nextBtn").onclick = () => loadRow(currentIndex + 1);
 document.getElementById("playChunkBtn").onclick = () => playRange(ROWS[currentIndex].start, ROWS[currentIndex].end);
 document.getElementById("playContextBtn").onclick = () => playRange(ROWS[currentIndex].context_start, ROWS[currentIndex].context_end);
 document.getElementById("downloadBtn").onclick = downloadJsonl;
+document.getElementById("saveBtn").onclick = () => saveJsonl().catch(error => alert(error.message || error));
 document.getElementById("copyBtn").onclick = copyJsonl;
 document.getElementById("searchInput").oninput = renderList;
 document.getElementById("stateFilter").onchange = renderList;

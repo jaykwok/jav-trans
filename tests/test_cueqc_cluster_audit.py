@@ -35,6 +35,15 @@ def test_cueqc_cluster_audit_uses_explicit_media_root(tmp_path: Path):
                 "audio_id": "AAA.somehash",
                 "video_id": "AAA",
                 "cluster_id": "cluster_00",
+                "coarse_cluster_id": "cluster_00",
+                "ptm_refined": True,
+                "ptm_refine_parent_cluster_id": "cluster_00",
+                "ptm_refine_subcluster_id": "cluster_00",
+                "ptm_refine_final_cluster_id": "cluster_00",
+                "audit_sampling_roles": ["representative", "high_risk"],
+                "audit_sampling_score": 0.96,
+                "audit_risk_score": 0.74,
+                "cluster_centroid_distance": 0.12,
                 "chunk_index": 0,
                 "start": 0.0,
                 "end": 0.5,
@@ -44,7 +53,24 @@ def test_cueqc_cluster_audit_uses_explicit_media_root(tmp_path: Path):
             }
         ],
     )
-    _write_jsonl(summaries, [{"cluster_id": "cluster_00", "count": 1}])
+    _write_jsonl(
+        summaries,
+        [
+            {
+                "cluster_id": "cluster_00",
+                "count": 1,
+                "duration_max_s": 0.5,
+                "audit_risk_avg": 0.74,
+                "ptm_refined_count": 1,
+                "tail_merged_count": 0,
+                "homogeneity_signals": {"empty_text_ratio": 1.0},
+                "review_sample_plan": {
+                    "representative": [{"sample_id": "cueqc-AAA-chunk00000"}],
+                    "high_risk": [{"sample_id": "cueqc-AAA-chunk00000"}],
+                },
+            }
+        ],
+    )
 
     summary = audit.build_audit(
         clusters_jsonl=clusters,
@@ -65,6 +91,7 @@ def test_cueqc_cluster_audit_uses_explicit_media_root(tmp_path: Path):
     assert summary["cluster_review_audio_render_mode"] == "per_chunk_inline_audio"
     assert summary["cluster_seed_action_options"] == ["use_seed", "mixed_skip", "skip"]
     assert summary["cluster_training_label_rule"].startswith("only seed_action=use_seed")
+    assert "sample_label_export" not in summary
     assert "baseline_root" not in summary
     html = (tmp_path / "audit" / "index.html").read_text(encoding="utf-8")
     assert "playChunkBtn" in html
@@ -72,6 +99,9 @@ def test_cueqc_cluster_audit_uses_explicit_media_root(tmp_path: Path):
     assert "data-play-sample" in html
     assert "data-inline-audio" in html
     assert "clusterSeedActionButtons" in html
+    assert "saveClusters" in html
+    assert "cueqc_sample_labels.jsonl" not in html
+    assert "/__audit_api__/save-labels" in html
     assert "mixed_skip" in html
     assert "每条独立播放器" in html
     assert 'document.createElement("audio")' not in html
@@ -84,19 +114,26 @@ def test_cueqc_cluster_audit_uses_explicit_media_root(tmp_path: Path):
     assert 'optionalNumberInput("minDuration")' in html
     assert 'optionalNumberInput("maxDuration")' in html
     assert 'optionalNumberInput("minConfidence")' in html
-    assert "current = Math.max(0, ROWS.indexOf(filtered[0] || ROWS[0]));" in html
+    assert "selectedRow = filtered[0] || ROWS[0] || null;" in html
+    assert "const visibleRows = filtered.slice(0, limit);" in html
+    assert "div.className = \"item\" + (ROWS[current] === row ? \" active\" : \"\");" in html
+    assert "const pos = filtered.indexOf(ROWS[current]);" in html
     assert "if (!filtered.includes(ROWS[current]))" not in html
-    assert 'class="sample-list" id="list"' in html
+    assert 'class="cluster-list" id="list"' in html
     assert 'class="panel sample-detail-panel"' in html
     assert 'class="panel cluster-admin-panel"' in html
-    assert html.index('class="sample-list" id="list"') < html.index('id="clusterNav"')
+    assert 'class="sample-label-panel cluster-label-panel"' in html
+    assert html.index('class="cluster-list" id="list"') < html.index('id="clusterNav"')
+    assert html.index('<audio id="media" controls preload="none"></audio>') < html.index('id="clusterSeedActionButtons"')
+    assert html.index('id="clusterDisplayButtons"') < html.index('id="captionOverlay"')
     assert "current = ROWS.indexOf(examples[0]);" not in html
     assert 'document.getElementById("sortBy").addEventListener("change", () => {\n  applyFilters();\n});' in html
     assert "alignmentFilter" not in html
     assert "issueFilter" not in html
     assert "all alignment quality" not in html
     assert "all alignment issue" not in html
-    assert "row.cluster_id && row.cluster_id !== activeClusterId" in html
+    assert "clustersForList()" in html
+    assert "clusterRowsForDisplay(entry.clusterId)" in html
     assert "renderClusterDetail();" in html
     assert "fallbackFilter" not in html
     assert "all fallback subtype" not in html
@@ -107,3 +144,9 @@ def test_cueqc_cluster_audit_uses_explicit_media_root(tmp_path: Path):
     assert "context_subtitle_cues" not in html
     assert "keep" in html
     assert "drop" in html
+    assert "当前样本只用于试听和查看" in html
+    assert "coldstart audit" in html
+    assert "roles=" in html
+    assert "risk=" in html
+    assert "ptm refine" in html
+    assert "clusterRowsForDisplay(entry.clusterId)" in html

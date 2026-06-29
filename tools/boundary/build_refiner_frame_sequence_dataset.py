@@ -35,7 +35,7 @@ from boundary.sequence_features import (
     validate_sequence_features,
 )
 
-DATASET_SCHEMA = "boundary_edge_refiner_dataset_v7"
+DATASET_SCHEMA = "boundary_edge_refiner_dataset_v8"
 DATASET_SOURCE = "scorer_v7_predicted_island_edges"
 
 
@@ -376,6 +376,8 @@ def _sequence_row(
     sequence_features: list[list[float]] = []
     sequence_boundary_delta_targets: list[list[float]] = []
     sequence_boundary_delta_weights: list[list[float]] = []
+    sequence_boundary_confidence_targets: list[list[float]] = []
+    sequence_boundary_confidence_weights: list[list[float]] = []
     sequence_target_clipped: list[list[bool]] = []
     sequence_reasons: list[str] = []
     edge_alignments: list[dict[str, Any]] = []
@@ -413,6 +415,18 @@ def _sequence_row(
         )
         sequence_boundary_delta_targets.append([start_delta, end_delta])
         sequence_boundary_delta_weights.append([start_weight, end_weight])
+        sequence_boundary_confidence_targets.append(
+            [
+                1.0 if start_weight > 0.0 and not start_clipped else 0.0,
+                1.0 if end_weight > 0.0 and not end_clipped else 0.0,
+            ]
+        )
+        sequence_boundary_confidence_weights.append(
+            [
+                1.0 if start_weight > 0.0 else 0.0,
+                1.0 if end_weight > 0.0 else 0.0,
+            ]
+        )
         sequence_target_clipped.append([start_clipped, end_clipped])
         sequence_reasons.append(DATASET_SOURCE)
         gap_indexes.append(index)
@@ -469,6 +483,8 @@ def _sequence_row(
         "sequence_features": sequence_features,
         "sequence_boundary_delta_targets": sequence_boundary_delta_targets,
         "sequence_boundary_delta_weights": sequence_boundary_delta_weights,
+        "sequence_boundary_confidence_targets": sequence_boundary_confidence_targets,
+        "sequence_boundary_confidence_weights": sequence_boundary_confidence_weights,
         "sequence_target_clipped": sequence_target_clipped,
         "sequence_reasons": sequence_reasons,
         "gap_indexes": gap_indexes,
@@ -722,7 +738,7 @@ def _resolve_feature_path(row: Mapping[str, Any], manifest_path: Path) -> Path:
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Build scorer-driven edge-only sequence rows for Boundary Refiner v7."
+        description="Build scorer-driven edge-only sequence rows for Boundary Refiner v8."
     )
     parser.add_argument("--labels", action="append", required=True)
     parser.add_argument("--feature-manifest", action="append", required=True)
