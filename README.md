@@ -226,9 +226,19 @@ Pre-ASR CueQC 只看 ASR 前特征：duration、speech segment count、internal 
 
 v10 已用 Scorer v7 + Boundary Refiner v8 workflow 重新导出候选；训练需要 current 人工 keep/drop 标签，不复用旧 checkpoint 或旧候选标签。默认仍关闭；开启前应先跑 no-translate workflow smoke / audit，确认 false-drop 风险可接受。
 
-### ASR-after CueQC shadow
+### 离线 ASR-after CueQC v4
 
-ASR-after CueQC v4 只保留为显式 opt-in 的 shadow / hard-negative mining 工具，不参与默认 keep/drop。默认链路的删除路由应前置到 Pre-ASR CueQC。
+ASR-after CueQC v4 不属于默认 workflow，也不在主线 runtime 中运行。它只作为离线审计 / hard-negative mining 工具使用，输入来自已生成产物：
+
+```powershell
+$env:PYTHONIOENCODING="utf-8"
+uv run --no-sync python tools/asr/cueqc/export_candidates.py `
+  --aligned path/to/video.aligned_segments.json `
+  --transcript path/to/video.transcript.json `
+  --output agents/temp/YYYYMMDD_HHMMSS_cueqc-offline/candidates.jsonl
+```
+
+如果 `transcript.json` 与 `aligned_segments.json` 同目录同 stem，可省略 `--transcript`。默认运行不会读取 ASR-after CueQC checkpoint、不会捕获 ASR decoder stats，也不会把 shadow decision 写回字幕结果。
 
 ---
 
@@ -354,7 +364,7 @@ ASR_BATCH_SIZE_BY_REPO=jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame=8,jaykwok/Qwen3-A
 - `src/main.py`：主流程编排。
 - `src/core/`：配置和任务上下文。
 - `src/pipeline/`：音频、缓存、输出、质量报告和阶段日志。
-- `src/asr/`：ASR、Boundary 字幕时间轴分配、Pre-ASR CueQC / ASR-after shadow CueQC 和转写流程。
+- `src/asr/`：ASR、Boundary 字幕时间轴分配、Pre-ASR CueQC 和转写流程；ASR-after CueQC v4 仅保留为离线审计工具入口。
 - `src/boundary/`：Boundary Refiner checkpoint loader、edge-sequence Mamba2 adapter、core planner 和 boundary-cache。
 - `src/boundary/ja/`：SpeechBoundary-JA scorer、PTM/MFCC feature cache schema、训练数据 manifest 和 frame-score 训练工具。
 - `src/llm/`：翻译 prompt、cache、glossary、API patch 和 translator。

@@ -12,7 +12,6 @@ from asr.backends.registry import (
     current_asr_worker_mode,
 )
 from asr.backends.qwen import active_qwen_asr_model_id
-from asr.cueqc import runtime_signature as cueqc_runtime_signature
 from asr.pre_asr_cueqc import runtime_signature as pre_asr_cueqc_runtime_signature
 from asr.local_backend import ASR_DTYPE
 
@@ -121,7 +120,7 @@ def _get_asr_runtime_signature(
             sliding_context_segs = 2
     boundary_signature = _LAST_BOUNDARY_SIGNATURE if last_boundary_signature is None else last_boundary_signature
     return {
-        "version": 3,
+        "version": 4,
         "backend": current_asr_backend(),
         "worker_mode": current_asr_worker_mode(),
         "timestamp": {
@@ -168,7 +167,6 @@ def _get_asr_runtime_signature(
             "asr_repetition_penalty": _env_text("ASR_REPETITION_PENALTY", "1.05"),
         },
         "pre_asr_cueqc": pre_asr_cueqc_runtime_signature(),
-        "cueqc_shadow": cueqc_runtime_signature(),
         "boundary": boundary_signature if isinstance(boundary_signature, dict) else {},
     }
 

@@ -51,7 +51,7 @@ def test_web_smoke_summary_prefers_full_cueqc_decisions() -> None:
     assert summary["fallback_detail_top"] == {"worker pipe closed": 1}
 
 
-def test_web_smoke_submit_defaults_to_no_cueqc_shadow(monkeypatch, tmp_path) -> None:
+def test_web_smoke_submit_does_not_emit_asr_after_cueqc_runtime_env(monkeypatch, tmp_path) -> None:
     captured: dict[str, object] = {}
 
     def fake_http_json(method: str, url: str, payload: dict):
@@ -74,7 +74,8 @@ def test_web_smoke_submit_defaults_to_no_cueqc_shadow(monkeypatch, tmp_path) -> 
     assert rc == 0
     payload = captured["payload"]
     assert isinstance(payload, dict)
-    assert payload["advanced"]["CUEQC_SHADOW_ENABLED"] == "0"
+    assert "CUEQC_SHADOW_ENABLED" not in payload["advanced"]
     assert "CUEQC_MODEL_PATH_BY_REPO" not in payload["advanced"]
+    assert "CUEQC_INFERENCE_BATCH_SIZE" not in payload["advanced"]
     written = json.loads((tmp_path / "run" / "submit_payload.json").read_text(encoding="utf-8"))
-    assert written["advanced"]["CUEQC_SHADOW_ENABLED"] == "0"
+    assert "CUEQC_SHADOW_ENABLED" not in written["advanced"]

@@ -14,7 +14,6 @@ def _checkpoint_name(
     monkeypatch.setenv("ASR_BACKEND", asr_backend)
     monkeypatch.setenv("ASR_WORKER_MODE", "inproc")
     monkeypatch.setenv("ASR_CONTEXT", asr_context)
-    monkeypatch.setenv("CUEQC_SHADOW_ENABLED", "0")
 
     from asr import pipeline as asr
     asr = importlib.reload(asr)
@@ -80,7 +79,7 @@ def test_checkpoint_key_changes_with_asr_model_id_override(monkeypatch):
     assert default_key != tuned_key
 
 
-def test_checkpoint_key_changes_with_cueqc_drop_threshold(monkeypatch):
+def test_checkpoint_key_ignores_asr_after_cueqc_drop_threshold(monkeypatch):
     default_key = _checkpoint_name(
         monkeypatch,
         asr_backend=ASR_06B_BACKEND,
@@ -92,7 +91,7 @@ def test_checkpoint_key_changes_with_cueqc_drop_threshold(monkeypatch):
         asr_backend=ASR_06B_BACKEND,
     )
 
-    assert default_key != tuned_key
+    assert default_key == tuned_key
 
 
 def test_checkpoint_key_changes_with_asr_context(monkeypatch):

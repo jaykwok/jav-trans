@@ -18,13 +18,12 @@ SpeechBoundary-JA scorer v7 frame scores
 -> Boundary Refiner v8 safe-tight edge trim（start/end delta + confidence + dynamic clamp）
 -> Pre-ASR CueQC v10 keep_for_asr/drop_before_asr（chunk 内 PTM bins + planned-island chunk context + Refiner v8 metadata；已重导候选，等待 current 人工标签后训练，默认关闭）
 -> Qwen ASR speech-core chunks
--> optional CueQC v4 shadow / hard-negative mining
 -> Boundary chunk subtitle timing
 -> Subtitle Layout v2 acoustic/display dual timeline
 -> SRT / translation
 ```
 
-目标已经从“传统 VAD 高 recall”修正为“字幕边界可用”：Scorer v7 只负责 speech / split 两个 frame 任务，但模型结构改为 dual-branch-diff，speech 与 split 使用独立 projection 和独立 Bi-Mamba2；split 分支额外使用 local temporal conv adapter 与 mask-aware temporal diff feature，以降低 shared backbone 对 split peak precision 的拖累。Boundary Refiner v8 只修 island 两端，并输出 start/end delta、confidence、dynamic clamp 和 safety metadata，形成 acoustic timeline。Pre-ASR CueQC v10 在 ASR 前做 keep/drop 路由以减少无效 ASR，并复用同一次 Qwen PTM/encoder frame feature extraction，在 PackedChunk 上持久化 chunk-level pooled PTM bins。v10 使用 chunk 内 bin-level Bi-Mamba2 和 planned-island chunk-level Bi-Mamba2，只训练 `drop_before_asr/keep_for_asr`，输入包含 Refiner v8 confidence/safety/raw-acoustic timing metadata，但不使用 ASR text、token trace、decoder stats、ASR confidence 或 subtitle timing。Pre-ASR CueQC v10 已用 Scorer v7 + Boundary Refiner v8 workflow 重新导出 candidates；训练必须等待 current 人工 keep/drop 标签，不能复用 v6 标签或 checkpoint。CueQC v4 仅保留为 ASR 后显式 opt-in 的 shadow/对照和 hard-negative mining。三个 active 模型不互相兼容旧 checkpoint，不保留 alias；schema、repo id、feature hash 或文件存在性不匹配都必须 fail-fast。
+目标已经从“传统 VAD 高 recall”修正为“字幕边界可用”：Scorer v7 只负责 speech / split 两个 frame 任务，但模型结构改为 dual-branch-diff，speech 与 split 使用独立 projection 和独立 Bi-Mamba2；split 分支额外使用 local temporal conv adapter 与 mask-aware temporal diff feature，以降低 shared backbone 对 split peak precision 的拖累。Boundary Refiner v8 只修 island 两端，并输出 start/end delta、confidence、dynamic clamp 和 safety metadata，形成 acoustic timeline。Pre-ASR CueQC v10 在 ASR 前做 keep/drop 路由以减少无效 ASR，并复用同一次 Qwen PTM/encoder frame feature extraction，在 PackedChunk 上持久化 chunk-level pooled PTM bins。v10 使用 chunk 内 bin-level Bi-Mamba2 和 planned-island chunk-level Bi-Mamba2，只训练 `drop_before_asr/keep_for_asr`，输入包含 Refiner v8 confidence/safety/raw-acoustic timing metadata，但不使用 ASR text、token trace、decoder stats、ASR confidence 或 subtitle timing。Pre-ASR CueQC v10 已用 Scorer v7 + Boundary Refiner v8 workflow 重新导出 candidates；训练必须等待 current 人工 keep/drop 标签，不能复用 v6 标签或 checkpoint。ASR-after CueQC v4 不再属于默认 runtime / full workflow，只保留为离线审计和 hard-negative mining 工具，输入已生成的 `aligned_segments.json + transcript.json` 产物。三个 active 模型不互相兼容旧 checkpoint，不保留 alias；schema、repo id、feature hash 或文件存在性不匹配都必须 fail-fast。
 
 当前运行时只规划 speech core。Scorer v7 用 `speech_prob` 找 speech frames，用 `split_boundary_prob` 产生声学切点；decoder contract 是 `topographic_split_micro_resolver_v5`，输出 `primary_cut_candidates` 和 `weak_cut_candidates`，前者用于 ASR chunk split，后者透传到 `SpeechSegment` / `PackedChunk` / boundary cache / ASR chunk metadata / subtitle blocks，作为字幕布局和审计时间锚点。split peak 先按自适应 score/prominence quantile 和 NMS 选 primary cut；NMS 后未入选但仍有声学证据的候选保留为 weak cut。随后进入 micro chunk resolver：`20 / video_fps` 只作为字幕显示下限和 micro 风险线，若两个 split 夹出短 B 段则优先删除证据较弱的 split，把 B 合到 A 或 C；两侧证据接近时保留 B 并交给 Pre-ASR CueQC。运行时不再包含 dense-cut resolver，也不使用 minimum primary evidence floor；相邻短句即使字幕显示 gap 很短，也由 scorer primary cut + refiner 保持 ASR chunk 尽量接近单句。Boundary Refiner v8 checkpoint schema 是 `boundary_edge_refiner_v8_safe_tight`、runtime adapter 是 `edge_sequence_v2`，head 输出 `start_delta_s/end_delta_s/start_confidence/end_confidence`，不跨 island merge，不新增 chunk，不学习 ASR padding/context budget。Pre-ASR CueQC v10 checkpoint schema 是 `cueqc_pre_asr_mamba_v10_binary`，model arch 是 `cueqc_pre_asr_mamba_v10`，feature schema 是 `pre_asr_cueqc_features_v6`，runtime adapter 是 `pre_asr_planned_island_sequence_v2`。7 秒只作为字幕显示 soft guard：Subtitle Layout v2 处理 `>7s` cue 时先按 ASR 文本断句，再吸附到对应时间窗内的 weak cut；没有 weak cut 才 proportional fallback，不反向修改 ASR chunk。
 
@@ -41,7 +40,7 @@ SpeechBoundary-JA scorer v7 frame scores
 - `boundary candidates + 字幕级 planner duration split` -> `scorer adaptive split peak + edge trim`：切分由 scorer v7 的 `split_boundary_prob` 负责；Boundary Refiner v7 不做中间切点、不做 merge，也不保留 `target_chunk_s/max_core_chunk_s/min_chunk_s/max_splits_per_segment`。
 - `Boundary Refiner v7 edge_sequence_v1` -> `Boundary Refiner v8 edge_sequence_v2`：downstream 数据必须由 Scorer v7 输出重新导出；旧 v7 checkpoint 或 metadata 不匹配 v8 safe-tight contract 时直接报错。
 - `Pre-ASR CueQC v9` -> `Pre-ASR CueQC v10`：前置模型纳入 Refiner v8 confidence/safety/raw-acoustic timing metadata；旧 v9 checkpoint / feature bundle 不再作为 active contract。
-- `ASR-after active CueQC` -> `Pre-ASR CueQC v10 active + CueQC v4 shadow`：旧规则 QC 不再运行；前置模型负责节省 ASR，后置 v4 只用于对照、审计和 hard-negative mining。
+- `ASR-after active CueQC` -> `Pre-ASR CueQC v10 active + CueQC v4 offline audit`：旧规则 QC 不再运行；前置模型负责节省 ASR，后置 v4 从 runtime / full workflow 移出，只能离线读取已生成产物做审计和 hard-negative mining。
 - `单 checkpoint 路径` -> `repo-id registry + env override`：默认/推荐 Qwen ASR 是 `jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame`，0.6B 保留为低配置可选 backend。三个 Mamba checkpoint 都按 ASR repo id 自动解析；文件名只作人工 tag，归属以 checkpoint metadata 为准。
 
 ## 已否决/归档路线
@@ -63,12 +62,14 @@ SpeechBoundary-JA scorer v7 frame scores
 - 1.7B Scorer v7：32768 full 已训练完成；当前 checkpoint 指标 speech F1 `0.991928`、split F1 `0.502890`，需继续靠 workflow/audit 判断 split 观感而非只看 frame F1。
 - Boundary Refiner v8：已用 Scorer v7 predicted edge 重新导出 dataset 并训练完成；val start/end MAE `0.0913s/0.0895s`。
 - Pre-ASR CueQC v10：已断兼容到 `cueqc_pre_asr_mamba_v10_binary` / `pre_asr_cueqc_features_v6` / `pre_asr_planned_island_sequence_v2`，输入包含 chunk-level PTM bins、planned-island chunk context、Refiner v8 confidence/safety/raw-acoustic timing metadata；当前已从 Scorer v7 + Refiner v8 two-film workflow 导出 `8549` 条 v10 candidates，并用审计专用 `pre_asr_audit` feature space + compact PTM 二阶段 refine 生成 `90` 簇音频审计页。训练等待人工簇/样本标签，不复用 v6/v7/v8/v9 checkpoint 或旧标签。
-- ASR-after CueQC v4：仅保留 shadow/mining；当 Pre-ASR CueQC v10 false-drop gate 稳定后，删除后置 runtime 与训练入口。
+- ASR-after CueQC v4：仅保留离线审计/mining 工具；默认 runtime / full workflow 不再加载 checkpoint、不捕获 decoder stats、不写 shadow decision。
 - REAL-988：只作为最终测试集，不进入训练、pseudo pool 或 cold-start 聚类。
 - 0.6B 三模型：1.7B scorer/refiner/cueqc 完整通过后，再按相同 schema 独立重训 0.6B；不复用 1.7B checkpoint。
 - 长期研究：等 Boundary/CueQC 审计闭环稳定后，再评估 Qwen ASR boundary-token SFT / DPO / RL、长上下文 joint segmentation-transcription 和小模型蒸馏。
 
 ## 近期记录
+
+- 2026-06-29 ASR-after CueQC v4 从默认 workflow 分离：默认 `src/asr/pipeline.py` 不再 import / 调用 ASR 后 CueQC，不再捕获 ASR internals，不再向 `transcript_chunks`、segments、`asr_details` 或 runtime signature 写 `cueqc_shadow`。`tools.workflows.run_full_workflow` 和 Web smoke submit 不再暴露 `--cueqc-shadow-enabled` / `CUEQC_SHADOW_ENABLED` / `CUEQC_MODEL_PATH_BY_REPO` / `CUEQC_INFERENCE_BATCH_SIZE` 配置面；旧配置存在时不做 runtime 报错或清理 guard，只是 active code 不引用。v4 保留为离线审计 / hard-negative mining 工具：`tools/asr/cueqc/offline_candidates.py` 从已生成的 compact `aligned_segments.json` + sibling/显式 `transcript.json` 恢复候选，`export_candidates.py` 输出 JSONL 供后续 v4 feature/predict/audit 链路使用。同步把 sidecar `asr_details.transcript_chunks` / `pre_asr_candidates` 压缩为计数；完整 chunks 保留在 `transcript.json`，Pre-ASR 候选如需全量持久化使用 `PRE_ASR_CUEQC_EXPORT_CANDIDATES_PATH` JSONL。
 
 - 2026-06-29 dense-cut v6 回滚：用户审计 19/58 簇页后确认 dense-cut resolver 会把亲吻声、呻吟、呼吸等低信息短段串成长 chunk，出现十几秒、二十秒甚至更长的 ASR chunk；这违背“尽量一句一个 chunk，让 refiner 拿到精准边界”的前提。因此 active route 恢复到提问 near-zero-gap 问题前的 `topographic_split_micro_resolver_v5`：删除 dense-cut resolver、删除 `SPEECH_BOUNDARY_JA_SPLIT_MIN_PRIMARY_*` / `SPEECH_BOUNDARY_JA_DENSE_CUT_*` active runtime/cache/workflow 面、把 scorer v7 metadata.decoder 改回 v5 contract，字幕 display gap 继续保持 2 frames。dense-cut v6 产物和候选只保留作失败路线对照，不作为 current Pre-ASR v10 训练数据；后续 Pre-ASR 仍应基于 micro-only v5 + Refiner v8 重新导出候选并审计。
 

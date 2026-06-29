@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import re
 from pathlib import Path
 
 from asr.backends import qwen
@@ -137,7 +138,12 @@ def test_default_model_download_root_is_project_models():
     assert "BOUNDARY_CONTEXT_MAX_SPEECH_OVERLAP_S" not in config.DEFAULT_SETTINGS
     assert "MAX_SUBTITLE_DURATION" not in config.DEFAULT_SETTINGS
     assert config.DEFAULT_SETTINGS["ASR_SUBPROCESS_READY_TIMEOUT_S"] == "600"
-    assert config.DEFAULT_SETTINGS["CUEQC_SHADOW_ENABLED"] == "0"
+    assert "CUEQC_SHADOW_ENABLED" not in config.DEFAULT_SETTINGS
+    assert "CUEQC_DROP_THRESHOLD" not in config.DEFAULT_SETTINGS
+    assert "CUEQC_DEVICE" not in config.DEFAULT_SETTINGS
+    assert "CUEQC_EXPORT_CANDIDATES_PATH" not in config.DEFAULT_SETTINGS
+    assert "CUEQC_EXPORT_CANDIDATES_APPEND" not in config.DEFAULT_SETTINGS
+    assert "CUEQC_SHADOW_EMBED_CANDIDATES" not in config.DEFAULT_SETTINGS
     assert config.DEFAULT_SETTINGS["PRE_ASR_CUEQC_ENABLED"] == "0"
     assert config.DEFAULT_SETTINGS["PRE_ASR_CUEQC_DROP_THRESHOLD"] == "0.95"
     assert config.DEFAULT_SETTINGS["LLM_API_FORMAT"] == "chat"
@@ -213,6 +219,33 @@ def test_pre_asr_cueqc_old_versions_removed_from_active_runtime_surface():
         "cueqc_pre_asr_mamba_v10_binary" in path
         for path in qwen.DEFAULT_PRE_ASR_CUEQC_CHECKPOINT_BY_REPO.values()
     )
+
+
+def test_asr_after_cueqc_removed_from_active_runtime_surface():
+    active_files = (
+        "src/asr/pipeline.py",
+        "src/asr/checkpoint.py",
+        "src/core/config.py",
+        "tools/workflows/run_full_workflow.py",
+        "tools/web/smoke/submit_job.py",
+        ".env.example",
+        "README.md",
+    )
+    retired_patterns = (
+        r"(?<!PRE_ASR_)CUEQC_SHADOW_ENABLED",
+        r"(?<!PRE_ASR_)CUEQC_MODEL_PATH_BY_REPO",
+        r"(?<!PRE_ASR_)CUEQC_INFERENCE_BATCH_SIZE",
+        r"(?<!PRE_ASR_)CUEQC_EXPORT_CANDIDATES_PATH",
+        r"(?<!PRE_ASR_)CUEQC_SHADOW_EMBED_CANDIDATES",
+        r"--cueqc-shadow-enabled",
+        r"--cueqc-model-path-by-repo",
+        r"--cueqc-inference-batch-size",
+        r"cueqc_shadow",
+    )
+    for relative_path in active_files:
+        text = (ROOT / relative_path).read_text(encoding="utf-8")
+        for pattern in retired_patterns:
+            assert not re.search(pattern, text), f"{pattern} remains in {relative_path}"
 
 
 def test_frozen_path_defaults_resolve_to_runtime_root(monkeypatch, tmp_path):

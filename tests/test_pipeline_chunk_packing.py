@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib
+import json
 import sys
 import wave
 from pathlib import Path
@@ -242,27 +243,6 @@ class _FakeSequenceFeatureProvider:
         return [0.0] * len(self.chunk_pooled_ptm_feature_names(bins=bins))
 
 
-class _FakeCueQCRefiner:
-    def decide(self, candidates, *, asr_internals):
-        assert len(asr_internals) == len(candidates)
-        return [
-            {
-                "schema": "cueqc_shadow_v1",
-                "model_version": "cueqc_mamba_v4_binary",
-                "decision_version": "cueqc_display_binary_v1",
-                "mode": "cueqc_mamba_v4_binary",
-                "display_hint": "keep",
-                "cluster_id": "runtime-test",
-                "confidence": 0.99,
-                "display_prob_keep": 0.99,
-                "display_prob_drop": 0.01,
-                "drop_threshold": 0.85,
-                "reasons": ["cueqc_mamba_v4_binary:keep:p_drop=0.010:threshold=0.850"],
-            }
-            for _candidate in candidates
-        ]
-
-
 def _reload_pipeline(monkeypatch, tmp_path: Path, *, enable_cueqc: bool = False):
     asr_backend = "jaykwok/Qwen3-ASR-0.6B-JA-Anime-Galgame"
     boundary_checkpoint = tmp_path / "boundary_edge_refiner_v8_safe_tight.jaykwok-Qwen3-ASR-0.6B-JA-Anime-Galgame.pt"
@@ -275,16 +255,11 @@ def _reload_pipeline(monkeypatch, tmp_path: Path, *, enable_cueqc: bool = False)
     monkeypatch.setenv("BOUNDARY_FEATURE_FRAME_HOP_S", "0.02")
     monkeypatch.setenv("ASR_CHUNK_ROOT", str(tmp_path / "chunks"))
     monkeypatch.setenv("ASR_CHECKPOINT_ENABLED", "0")
-    monkeypatch.setenv("CUEQC_SHADOW_ENABLED", "1" if enable_cueqc else "0")
     if enable_cueqc:
-        cueqc_checkpoint = tmp_path / "cueqc_mamba_v4_binary.pt"
-        cueqc_checkpoint.write_bytes(b"placeholder")
-        monkeypatch.setenv(
-            "CUEQC_MODEL_PATH_BY_REPO",
-            f"{asr_backend}={cueqc_checkpoint}",
-        )
+        monkeypatch.setenv("CUEQC_SHADOW_ENABLED", "1")
     else:
-        monkeypatch.delenv("CUEQC_MODEL_PATH_BY_REPO", raising=False)
+        monkeypatch.delenv("CUEQC_SHADOW_ENABLED", raising=False)
+    monkeypatch.delenv("CUEQC_MODEL_PATH_BY_REPO", raising=False)
 
     from asr import pipeline as asr
 
@@ -304,8 +279,6 @@ def _reload_pipeline(monkeypatch, tmp_path: Path, *, enable_cueqc: bool = False)
         "_required_sequence_feature_provider_from_result",
         lambda *_args, **_kwargs: _FakeSequenceFeatureProvider(),
     )
-    if enable_cueqc:
-        monkeypatch.setattr(asr, "_cueqc_refiner_for", lambda _path, **_kwargs: _FakeCueQCRefiner())
     return asr
 
 
@@ -368,6 +341,24 @@ def test_pipeline_persists_pre_asr_candidates_before_transcription(monkeypatch, 
     assert candidates[0]["video_id"] == "source_boundary"
     assert candidates[0]["feature_names"]
     assert "text" not in " ".join(candidates[0]["feature_names"]).lower()
+
+
+def test_pipeline_exports_pre_asr_candidates_only_when_requested(monkeypatch, tmp_path):
+    export_path = tmp_path / "pre_asr_candidates.jsonl"
+    monkeypatch.setenv("PRE_ASR_CUEQC_EXPORT_CANDIDATES_PATH", str(export_path))
+    monkeypatch.setenv("PRE_ASR_CUEQC_EXPORT_CANDIDATES_APPEND", "0")
+
+    backend, _segments, log, _details = _run_transcription(monkeypatch, tmp_path)
+
+    rows = [
+        json.loads(line)
+        for line in export_path.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    assert len(rows) == len(backend.audio_paths)
+    assert rows[0]["sample_id"] == "preasr-source_boundary-chunk00000"
+    assert rows[0]["feature_names"]
+    assert any("Pre-ASR CueQC: exported candidates" in entry for entry in log)
 
 
 def test_empty_allowed_boundary_does_not_fallback_to_full_audio(monkeypatch, tmp_path):
@@ -622,7 +613,7 @@ def test_low_logprob_chunks_continue_without_legacy_adaptive_review(monkeypatch,
     assert all(chunk["text"] for chunk in details["transcript_chunks"])
 
 
-def test_cueqc_shadow_records_without_skipping_subtitle_timing(monkeypatch, tmp_path):
+def test_asr_after_cueqc_env_is_ignored_by_main_pipeline(monkeypatch, tmp_path):
     backend, segments, log, details = _run_transcription(
         monkeypatch,
         tmp_path,
@@ -631,82 +622,9 @@ def test_cueqc_shadow_records_without_skipping_subtitle_timing(monkeypatch, tmp_
 
     assert backend.finalized_payloads
     assert len(backend.finalized_payloads) == len(backend.audio_paths)
-    assert details["cueqc_shadow"]["shadow_only"] is False
-    assert details["cueqc_shadow"]["candidate_count"] == len(backend.audio_paths)
-    assert details["cueqc_shadow"]["counts"]["display_hint"] == {"keep": len(backend.audio_paths)}
+    assert "cueqc_shadow" not in details
     assert details["transcript_chunks"]
-    assert all("cueqc_shadow" in chunk for chunk in details["transcript_chunks"])
+    assert all("cueqc_shadow" not in chunk for chunk in details["transcript_chunks"])
     assert segments
-    assert all(segment.get("cueqc_shadow") for segment in segments)
-    assert any(entry.startswith("CueQC: candidates=") for entry in log)
-
-
-def test_cueqc_runtime_fallback_summary_is_logged_and_reported(monkeypatch, tmp_path):
-    asr = _reload_pipeline(monkeypatch, tmp_path)
-
-    class CaptureBackend:
-        def capture_asr_internals(self, chunks):
-            assert len(chunks) == 2
-            return [
-                {"ok": False, "error": "capture timeout"},
-                {"ok": True},
-            ]
-
-    class FakeRefiner:
-        def decide(self, candidates, *, asr_internals):
-            del asr_internals
-            return [
-                {
-                    "schema": "cueqc_shadow_v1",
-                    "model_version": "cueqc_mamba_v4_binary",
-                    "decision_version": "cueqc_display_binary_v1",
-                    "mode": "fallback_keep",
-                    "display_hint": "keep",
-                    "cluster_id": "runtime-test",
-                    "confidence": 1.0,
-                    "display_prob_keep": 1.0,
-                    "display_prob_drop": 0.0,
-                    "fallback_stage": "capture",
-                    "fallback_detail": "capture timeout",
-                    "reasons": ["cueqc_capture_error", "cueqc_capture_error:capture timeout"],
-                },
-                {
-                    "schema": "cueqc_shadow_v1",
-                    "model_version": "cueqc_mamba_v4_binary",
-                    "decision_version": "cueqc_display_binary_v1",
-                    "mode": "cueqc_mamba_v4_binary",
-                    "display_hint": "drop",
-                    "cluster_id": "runtime-test",
-                    "confidence": 0.95,
-                    "display_prob_keep": 0.05,
-                    "display_prob_drop": 0.95,
-                    "drop_threshold": 0.85,
-                    "reasons": ["cueqc_mamba_v4_binary:drop:p_drop=0.950:threshold=0.850"],
-                },
-            ]
-
-    candidates = [
-        {"chunk_index": 0, "start": 0.0, "end": 1.0, "duration_s": 1.0, "text": "あ"},
-        {"chunk_index": 1, "start": 1.0, "end": 2.0, "duration_s": 1.0, "text": "い"},
-    ]
-    log: list[str] = []
-
-    decisions = asr._apply_cueqc_v4_model(
-        refiner=FakeRefiner(),
-        candidates=candidates,
-        backend=CaptureBackend(),
-        audio_path=str(tmp_path / "source.wav"),
-        log=log,
-    )
-    report = asr._merge_cueqc_v4_decisions(
-        {"counts": {"display_hint": {"keep": 2}}, "decisions": []},
-        candidates,
-        decisions,
-    )
-
-    assert any("capture fallback candidates=1/2" in entry for entry in log)
-    assert any("fallback=1" in entry and "cueqc_capture_error" in entry for entry in log)
-    assert report["counts"]["display_hint"] == {"keep": 1, "drop": 1}
-    assert report["counts"]["fallback_stage"] == {"capture": 1}
-    assert report["counts"]["fallback_reason"] == {"cueqc_capture_error": 1}
-    assert report["fallback_summary"]["details"] == {"capture timeout": 1}
+    assert all("cueqc_shadow" not in segment for segment in segments)
+    assert not any(entry.startswith("CueQC:") for entry in log)

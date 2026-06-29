@@ -15,8 +15,6 @@ if str(SRC) not in sys.path:
 def _reload_pipeline(monkeypatch, tmp_path: Path):
     monkeypatch.setenv("ASR_CHUNK_ROOT", str(tmp_path / "chunks"))
     monkeypatch.setenv("ASR_SLIDING_CONTEXT_SEGS", "2")
-    monkeypatch.setenv("CUEQC_SHADOW_ENABLED", "0")
-    monkeypatch.delenv("CUEQC_MODEL_PATH_BY_REPO", raising=False)
     from asr import pipeline as asr
 
     return importlib.reload(asr)

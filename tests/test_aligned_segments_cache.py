@@ -85,7 +85,16 @@ def test_aligned_segments_written_with_audio_cache_key(monkeypatch, tmp_path):
         return (
             [{"start": 0.0, "end": 1.0, "text": "こんにちは"}],
             ["mock asr"],
-            {"transcript_chunks": [{"text": "こんにちは"}], "stage_timings": {}},
+            {
+                "transcript_chunks": [{"text": "こんにちは"}],
+                "pre_asr_candidates": [
+                    {
+                        "sample_id": "preasr-clip-chunk00000",
+                        "features": {"x": 1.0},
+                    }
+                ],
+                "stage_timings": {},
+            },
         )
 
     monkeypatch.setattr(pipeline_audio, "extract_audio", fake_extract_audio)
@@ -104,6 +113,17 @@ def test_aligned_segments_written_with_audio_cache_key(monkeypatch, tmp_path):
 
     assert payload["segments"] == [{"start": 0.0, "end": 1.0, "text": "こんにちは"}]
     assert payload["asr_log"] == ["mock asr"]
+    assert "transcript_chunks" not in payload["asr_details"]
+    assert "pre_asr_candidates" not in payload["asr_details"]
+    assert payload["asr_details"]["transcript_chunk_count"] == 1
+    assert payload["asr_details"]["pre_asr_candidate_count"] == 1
+    transcript = json.loads((temp_root / "clip" / "clip.transcript.json").read_text(encoding="utf-8"))
+    assert transcript["chunks"] == [{"text": "こんにちは"}]
+    timings = json.loads((temp_root / "clip" / "clip.timings.json").read_text(encoding="utf-8"))
+    assert "transcript_chunks" not in timings["asr_details"]
+    assert "pre_asr_candidates" not in timings["asr_details"]
+    assert timings["asr_details"]["transcript_chunk_count"] == 1
+    assert timings["asr_details"]["pre_asr_candidate_count"] == 1
     _assert_no_project_absolute_path(aligned_path.read_text(encoding="utf-8"))
 
 

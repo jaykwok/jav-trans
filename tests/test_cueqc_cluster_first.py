@@ -11,7 +11,8 @@ from asr import cueqc
 from boundary.sequence_features import FrameSequenceFeatureProvider
 from tools.asr.cueqc.cluster_candidates import _suggest_small_tail_merges, cluster_rows, main as cluster_main
 from tools.asr.cueqc.compile_training_set import _broadcast_cluster_labels, compile_records
-from tools.asr.cueqc.export_candidates import aligned_payload_to_candidates
+from tools.asr.cueqc.export_candidates import aligned_payload_to_candidates, main as export_candidates_main
+from tools.asr.cueqc.offline_candidates import infer_transcript_path
 from tools.asr.cueqc.torque import (
     _community_min_distance_matrix,
     _merge_layers_fast,
@@ -129,6 +130,86 @@ def test_cueqc_candidate_export_from_aligned_payload_preserves_required_fields(t
     assert rows[0]["cue_features"]["text_observation"]["char_count"] == 1
     assert "text_density" not in rows[0]["cue_features"]
     assert rows[1]["text_features"]["has_stable_vocabulary"] is True
+
+
+def test_cueqc_candidate_export_uses_compact_aligned_plus_transcript(tmp_path: Path):
+    source_audio = tmp_path / "clip.wav"
+    aligned = tmp_path / "clip.aligned_segments.json"
+    transcript = tmp_path / "clip.transcript.json"
+    output = tmp_path / "cueqc_candidates.jsonl"
+    summary = tmp_path / "summary.json"
+    aligned.write_text(
+        json.dumps(
+            {
+                "audio_path": str(source_audio),
+                "segments": [],
+                "asr_details": {
+                    "transcript_chunk_count": 2,
+                    "stage_timings": {},
+                },
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    transcript.write_text(
+        json.dumps(
+            {
+                "backend": "unit",
+                "audio_path": str(source_audio),
+                "chunks": [
+                    {
+                        "index": 0,
+                        "start": 0.0,
+                        "end": 0.5,
+                        "duration": 0.5,
+                        "text": "あ",
+                        "raw_text": "あ",
+                        "language": "Japanese",
+                    },
+                    {
+                        "index": 1,
+                        "start": 1.0,
+                        "end": 2.5,
+                        "duration": 1.5,
+                        "text": "大丈夫です",
+                        "raw_text": "大丈夫です",
+                        "language": "Japanese",
+                    },
+                ],
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
+    assert infer_transcript_path(aligned) == transcript
+    rc = export_candidates_main(
+        [
+            "--aligned",
+            str(aligned),
+            "--output",
+            str(output),
+            "--summary",
+            str(summary),
+            "--video-id",
+            "clip",
+        ]
+    )
+
+    rows = [
+        json.loads(line)
+        for line in output.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    summary_payload = json.loads(summary.read_text(encoding="utf-8"))
+    assert rc == 0
+    assert len(rows) == 2
+    assert rows[0]["sample_id"] == "cueqc-clip-chunk00000"
+    assert rows[0]["audio"]["path"] == str(source_audio.resolve())
+    assert rows[1]["text"] == "大丈夫です"
+    assert summary_payload["candidate_count"] == 2
+    assert summary_payload["source_transcript"] == str(transcript)
 
 
 def test_cueqc_torque_auto_clusters_separated_dense_embeddings():
