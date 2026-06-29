@@ -215,10 +215,7 @@ def test_pre_asr_cueqc_old_versions_removed_from_active_runtime_surface():
         text = (ROOT / relative_path).read_text(encoding="utf-8")
         for token in retired_tokens:
             assert token not in text
-    assert all(
-        "cueqc_pre_asr_mamba_v10_binary" in path
-        for path in qwen.DEFAULT_PRE_ASR_CUEQC_CHECKPOINT_BY_REPO.values()
-    )
+    assert qwen.DEFAULT_PRE_ASR_CUEQC_CHECKPOINT_BY_REPO == {}
 
 
 def test_asr_after_cueqc_removed_from_active_runtime_surface():

@@ -1,8 +1,5 @@
-import hashlib
 import json
-import os
 import re
-import sys
 
 from llm.glossary import normalize_glossary_text
 
@@ -14,67 +11,6 @@ _LEADING_ROLE_LABEL_RE = re.compile(
 )
 _JSON_OUTPUT_LABEL = "LLM JSON output"
 COMPACT_SYSTEM_PROMPT = False
-
-
-def _translator_global(name: str, default):
-    module = sys.modules.get("llm.translator")
-    if module is None:
-        return default
-    return getattr(module, name, default)
-
-
-def _compute_prompt_signature(
-    extra_glossary: str = "",
-    *,
-    glossary: str = "",
-    target_lang: str = "简体中文",
-    character_reference: str = "",
-) -> str:
-    prompt_version = _translator_global("PROMPT_VERSION", PROMPT_VERSION)
-    model_name_default = _translator_global("LLM_MODEL_NAME", "")
-    model_name = os.getenv("LLM_MODEL_NAME", model_name_default).strip()
-    compact = "1" if _translator_global("COMPACT_SYSTEM_PROMPT", COMPACT_SYSTEM_PROMPT) else "0"
-    normalized_glossary = normalize_glossary_text(glossary)
-    normalized_extra_glossary = normalize_glossary_text(extra_glossary)
-    payload = (
-        f"{prompt_version}\n{target_lang.strip()}\n{normalized_glossary}\n"
-        f"{normalized_extra_glossary}\n{(character_reference or '').strip()}\n"
-        f"{model_name}\ncompact={compact}"
-    )
-    return hashlib.sha1(payload.encode("utf-8")).hexdigest()[:12]
-
-
-def _translation_cache_key(
-    batch_index: int,
-    batch_segments: list[dict],
-    *,
-    extra_glossary: str = "",
-    glossary: str = "",
-    target_lang: str = "简体中文",
-    character_reference: str = "",
-) -> str:
-    source_payload = []
-    for seg in batch_segments:
-        start = _safe_float(seg.get("start"))
-        end = _safe_float(seg.get("end"))
-        source_payload.append(
-            {
-                "start": round(start, 3),
-                "end": round(end, 3),
-                "duration_sec": round(max(0.0, end - start), 3),
-                "ja": str(seg.get("ja_text") or seg.get("text") or seg.get("ja") or ""),
-            }
-        )
-    source_sig = hashlib.sha1(
-        json.dumps(source_payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
-    ).hexdigest()[:12]
-    prompt_sig = _compute_prompt_signature(
-        extra_glossary,
-        glossary=glossary,
-        target_lang=target_lang,
-        character_reference=character_reference,
-    )
-    return f"{prompt_sig}::{batch_index}::{source_sig}"
 
 
 def _normalize_source_text(text: str) -> str:

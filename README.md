@@ -169,7 +169,7 @@ Web 提交是否使用 CUDA 取决于后端服务进程是否能看到 GPU，而
 | 默认 ASR | `jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame` |
 | 低配置 ASR | `jaykwok/Qwen3-ASR-0.6B-JA-Anime-Galgame` |
 
-同一个 ASR repo id 也决定 SpeechBoundary-JA frozen feature 的来源，以及三个本地 checkpoint 的 registry key。checkpoint 文件名只是人工可读 tag，真正归属以 metadata 中的 repo id / schema / feature hash 为准。
+同一个 ASR repo id 也决定 SpeechBoundary-JA frozen feature 的来源，以及当前已训练的 SpeechBoundary-JA / Boundary Refiner checkpoint registry key。checkpoint 文件名只是人工可读 tag，真正归属以 metadata 中的 repo id / schema / feature hash 为准。Pre-ASR CueQC v10 尚未训练 promotion，默认 registry 为空；训练完成后再用 `PRE_ASR_CUEQC_MODEL_PATH_BY_REPO` 显式映射。
 
 ### SpeechBoundary-JA Scorer v7
 
@@ -224,7 +224,7 @@ Boundary Refiner 只修 chunk 两端。它不学习中间切点、不新增 chun
 
 Pre-ASR CueQC 只看 ASR 前特征：duration、speech segment count、internal gap、Refiner v8 delta/confidence/safety、raw/acoustic timeline、scorer speech/split 分布、邻接 gap、micro chunk evidence、primary/weak cut density，以及从共享 Qwen PTM/encoder frame features 池化得到的 chunk bin embedding。它禁止使用 ASR text、raw text、token trace、decoder stats、ASR confidence 和 subtitle timing。
 
-v10 已用 Scorer v7 + Boundary Refiner v8 workflow 重新导出候选；训练需要 current 人工 keep/drop 标签，不复用旧 checkpoint 或旧候选标签。默认仍关闭；开启前应先跑 no-translate workflow smoke / audit，确认 false-drop 风险可接受。
+v10 已用 Scorer v7 + Boundary Refiner v8 workflow 重新导出候选；训练需要 current 人工 keep/drop 标签，不复用旧 checkpoint 或旧候选标签。默认仍关闭且没有默认 checkpoint registry；开启前必须显式配置训练好的 `PRE_ASR_CUEQC_MODEL_PATH_BY_REPO`，并先跑 no-translate workflow smoke / audit，确认 false-drop 风险可接受。
 
 ### 离线 ASR-after CueQC v4
 
