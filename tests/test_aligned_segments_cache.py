@@ -127,6 +127,35 @@ def test_aligned_segments_written_with_audio_cache_key(monkeypatch, tmp_path):
     _assert_no_project_absolute_path(aligned_path.read_text(encoding="utf-8"))
 
 
+def test_asr_stage_aligned_payload_keeps_resume_signature(monkeypatch, tmp_path):
+    video_path = tmp_path / "clip.mp4"
+    video_path.write_bytes(b"fake-video")
+    ctx = make_job_context(
+        video_path,
+        tmp_path / "out",
+        tmp_path / "jobs",
+        skip_translation=True,
+        keep_temp_files=True,
+    )
+    _configure(monkeypatch)
+    signature = _cache_signature(ctx)
+
+    payload = main._aligned_segments_payload(
+        backend_label="mock_asr",
+        audio_path=str(tmp_path / "audio.wav"),
+        audio_cache_key="audio-key",
+        segments=[{"start": 0.0, "end": 1.0, "text": "こんにちは"}],
+        asr_details={},
+        asr_log=[],
+        cache_signature=signature,
+        subtitle_options=main._subtitle_options_for_ctx(ctx),
+        cache_stage="asr_alignment",
+    )
+
+    assert payload["cache_stage"] == "asr_alignment"
+    assert payload["cache_signature"] == signature
+
+
 def test_aligned_cache_signature_ignores_retired_display_policy_env(monkeypatch, tmp_path):
     video_path = tmp_path / "clip.mp4"
     video_path.write_bytes(b"fake-video")

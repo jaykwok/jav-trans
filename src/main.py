@@ -1029,7 +1029,7 @@ def run_asr_alignment(
                     segments=segments,
                     asr_details=asr_details,
                     asr_log=asr_log,
-                    cache_signature=None,
+                    cache_signature=aligned_cache_signature,
                     subtitle_options=subtitle_options,
                     cache_stage="asr_alignment",
                 ),

@@ -54,12 +54,14 @@ def test_run_full_workflow_boundary_threshold_defaults_match_training_eval(monke
     monkeypatch.delenv("SPEECH_BOUNDARY_JA_THRESHOLD", raising=False)
     monkeypatch.delenv("SPEECH_BOUNDARY_JA_SPEECH_ON_THRESHOLD", raising=False)
     monkeypatch.delenv("SPEECH_BOUNDARY_JA_SPEECH_OFF_THRESHOLD", raising=False)
+    monkeypatch.delenv("PRE_ASR_CUEQC_DROP_THRESHOLD", raising=False)
 
     args = run_full_workflow.parse_args(["--video", "sample.mp4"])
 
     assert args.speech_boundary_threshold == 0.5
     assert args.speech_boundary_speech_on_threshold == 0.5
     assert args.speech_boundary_speech_off_threshold == 0.5
+    assert args.pre_asr_cueqc_drop_threshold == 0.95
     assert not hasattr(args, "cueqc_shadow_enabled")
 
 

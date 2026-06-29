@@ -106,12 +106,12 @@ DEFAULT_SETTINGS: dict[str, str] = {
     "SPEECH_BOUNDARY_JA_FRAME_DILATION_S": "0.2",
     # 1 caches SpeechBoundary frame score -> Boundary Planner outputs separately from ASR generation settings.
     "BOUNDARY_CACHE_ENABLED": "1",
-    # Persistent boundary cache directory. Versioned as boundary-cache v11.
+    # Persistent boundary cache directory. Versioned as boundary-cache v12.
     "BOUNDARY_CACHE_DIR": "./tmp/cache/boundary",
 
     # --- Pre-ASR CueQC v10 hierarchical keep/drop router ---
-    # Disabled until a repo-matched v10 checkpoint is trained; when enabled it runs after
-    # Boundary Refiner and before wav chunk export / ASR.
+    # Disabled until a repo-matched v10 checkpoint is trained and explicitly mapped.
+    # When enabled it runs after Boundary Refiner and before wav chunk export / ASR.
     "PRE_ASR_CUEQC_ENABLED": "0",
     "PRE_ASR_CUEQC_MODEL_PATH_BY_REPO": "",
     "PRE_ASR_CUEQC_DEVICE": "auto",
