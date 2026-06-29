@@ -1,14 +1,13 @@
-"""CueQC Mamba v4 binary runtime adapter.
+"""CueQC Mamba v4 binary offline adapter.
 
 Loads a ``cueqc_mamba_v4_binary`` checkpoint, rebuilds
-``CueQCMambaV4Binary``, and exposes ``decide()`` that emits the runtime contract
-dict consumed by ``pipeline._run_cueqc_shadow``.
+``CueQCMambaV4Binary``, and exposes ``decide()`` for offline audit /
+hard-negative mining tools.
 
-The refiner never loads its own Qwen3-ASR — at runtime the caller passes an
-``AsrInternalsCapturer`` that wraps the already-loaded ``LocalAsrBackend.model``
-(see v4 binary §5.2: no second ASR model in VRAM). Per-candidate capture,
-feature, or inference failures fall back to ``keep``; model-level mapping/load
-failures are handled by the pipeline as hard job failures.
+The refiner never owns workflow routing. The caller supplies captured ASR
+internals, usually produced from already generated artifacts in an offline
+audit job. Per-candidate capture, feature, or inference failures fall back to
+``keep`` so mining can continue conservatively.
 """
 from __future__ import annotations
 

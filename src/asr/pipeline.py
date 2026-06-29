@@ -24,12 +24,10 @@ from boundary.refiner import (
 )
 from asr import checkpoint as _checkpoint_module
 from asr import chunking as _chunking_module
-from asr import cueqc as _cueqc_module
 from asr import pre_asr_cueqc as _pre_asr_cueqc_module
 from asr import transcribe as _transcribe_module
 from asr.backends.qwen import (
     DEFAULT_BOUNDARY_REFINER_CHECKPOINT_BY_REPO,
-    DEFAULT_CUEQC_CHECKPOINT_BY_REPO,
     checkpoint_path_for_repo_env,
     validate_checkpoint_repo_id,
 )
@@ -40,7 +38,6 @@ warnings.filterwarnings("ignore")
 _registry_module = importlib.reload(_registry_module)
 _chunking_module = importlib.reload(_chunking_module)
 _checkpoint_module = importlib.reload(_checkpoint_module)
-_cueqc_module = importlib.reload(_cueqc_module)
 _pre_asr_cueqc_module = importlib.reload(_pre_asr_cueqc_module)
 _transcribe_module = importlib.reload(_transcribe_module)
 _boundary_cache_module = importlib.reload(_boundary_cache_module)
@@ -57,36 +54,6 @@ _LAST_BOUNDARY_SIGNATURE: dict = _chunking_module._LAST_BOUNDARY_SIGNATURE
 _LAST_BOUNDARY_CACHE_EVENT: dict | None = None
 _ASR_SLIDING_CONTEXT_SEGS = _transcribe_module._ASR_SLIDING_CONTEXT_SEGS
 _ASR_CHECKPOINT_ENABLED = _transcribe_module._ASR_CHECKPOINT_ENABLED
-CUEQC_DECISION_VERSION = _cueqc_module.CUEQC_DECISION_VERSION
-CUEQC_MODEL_VERSION = _cueqc_module.CUEQC_MODEL_VERSION
-
-# CueQC Mamba v4 binary model is lazily loaded and cached per process.
-# ASR-internals capture is delegated to the backend (inline or subprocess
-# worker) via capture_asr_internals(), so the model is reused wherever it is
-# loaded — no second Qwen3-ASR in VRAM (v4 binary §5.2).
-_CUEQC_REFINER_CACHE: dict[str, object] = {}
-
-
-def _cueqc_refiner_for(path: str, *, expected_asr_repo_id: str | None = None):
-    """Lazily load + cache the CueQC v4 binary refiner for ``path``."""
-    if not path:
-        return None
-    cached = _CUEQC_REFINER_CACHE.get(path)
-    if cached is not None:
-        return cached
-    try:
-        from asr.cueqc_refiner import load_cueqc_mamba_checkpoint
-
-        device = os.getenv("CUEQC_DEVICE", "auto").strip() or "auto"
-        refiner = load_cueqc_mamba_checkpoint(
-            path,
-            device=device,
-            expected_asr_repo_id=expected_asr_repo_id,
-        )
-        _CUEQC_REFINER_CACHE[path] = refiner
-        return refiner
-    except Exception as exc:  # noqa: BLE001 - surface checkpoint/config errors clearly
-        raise RuntimeError(f"CueQC v4 binary checkpoint load failed for {path}: {exc!r}") from exc
 
 def _env_bool(name: str, default: str) -> bool:
     return os.getenv(name, default).strip().lower() in {"1", "true", "yes", "on"}
@@ -237,9 +204,6 @@ _build_initial_prompt_for_chunk = _transcribe_module._build_initial_prompt_for_c
 _postprocess_segments = _transcribe_module._postprocess_segments
 _repair_postprocessed_segment_windows = _transcribe_module._repair_postprocessed_segment_windows
 _group_words_to_segments = _transcribe_module._group_words_to_segments
-
-build_cueqc_candidates = _cueqc_module.build_candidates
-cueqc_enabled = _cueqc_module.cueqc_enabled
 
 
 def _sync_checkpoint_state() -> None:
@@ -574,6 +538,36 @@ def _pre_asr_candidates_with_decisions(candidates: list[dict], report: dict) -> 
             item["pre_asr_prob_keep"] = decision.get("prob_keep")
         annotated.append(item)
     return annotated
+
+
+def _write_pre_asr_candidates_if_requested(
+    candidates: list[dict],
+    *,
+    log: list[str],
+) -> None:
+    if not candidates:
+        return
+    output_path_raw = os.getenv("PRE_ASR_CUEQC_EXPORT_CANDIDATES_PATH", "").strip()
+    if not output_path_raw:
+        return
+    output_path = Path(output_path_raw).expanduser()
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    append = os.getenv("PRE_ASR_CUEQC_EXPORT_CANDIDATES_APPEND", "1").strip().lower() not in {
+        "0",
+        "false",
+        "no",
+        "off",
+    }
+    mode = "a" if append else "w"
+    with output_path.open(mode, encoding="utf-8") as handle:
+        for row in candidates:
+            handle.write(json.dumps(row, ensure_ascii=False, sort_keys=True) + "\n")
+    log.append(
+        "Pre-ASR CueQC: exported candidates path={path} count={count}".format(
+            path=_display_cache_path(str(output_path)),
+            count=len(candidates),
+        )
+    )
 
 
 def _score_stats_for_span(
@@ -1071,277 +1065,6 @@ def _record_cuda_memory(
     )
 
 
-def _empty_cueqc_shadow_report() -> dict:
-    return _cueqc_module.build_shadow_report([])
-
-
-def _write_cueqc_candidates_if_requested(
-    candidates: list[dict],
-    *,
-    log: list[str],
-) -> None:
-    if not candidates:
-        return
-    output_path_raw = os.getenv("CUEQC_EXPORT_CANDIDATES_PATH", "").strip()
-    if not output_path_raw:
-        return
-    output_path = Path(output_path_raw).expanduser()
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    append = os.getenv("CUEQC_EXPORT_CANDIDATES_APPEND", "1").strip().lower() not in {
-        "0",
-        "false",
-        "no",
-        "off",
-    }
-    mode = "a" if append else "w"
-    with output_path.open(mode, encoding="utf-8") as handle:
-        for row in candidates:
-            handle.write(json.dumps(row, ensure_ascii=False, sort_keys=True) + "\n")
-    log.append(
-        "CueQC shadow: exported candidates path={path} count={count}".format(
-            path=_display_cache_path(str(output_path)),
-            count=len(candidates),
-        )
-    )
-
-
-def _candidate_capture_window(
-    candidate: dict,
-    fallback_audio_path: str,
-) -> tuple[str, float, float]:
-    """Resolve the wav path and local capture window for a candidate.
-
-    Candidate ``audio.path`` normally points at the extracted chunk wav. In that
-    case the ASR-internals capture must use the chunk-local window
-    ``0..duration``. Passing the global movie timestamp into a chunk wav slices
-    past EOF and forces every v4 sample into fallback-keep.
-    """
-    audio = candidate.get("audio") if isinstance(candidate.get("audio"), dict) else {}
-    own = audio.get("path") or candidate.get("source_audio_path") or ""
-    if own and os.path.exists(str(own)):
-        duration = float(candidate.get("duration_s") or 0.0)
-        if duration <= 0.0:
-            start = float(candidate.get("start", 0.0))
-            end = float(candidate.get("end", start))
-            duration = max(0.0, end - start)
-        return str(own), 0.0, duration
-    start_s = float(candidate.get("start", 0.0))
-    end_s = float(candidate.get("end", start_s))
-    return str(fallback_audio_path) if fallback_audio_path else "", start_s, end_s
-
-
-def _top_counts(items: list[str], *, limit: int = 3) -> dict[str, int]:
-    counts: dict[str, int] = {}
-    for item in items:
-        key = str(item or "").strip() or "unknown"
-        counts[key] = counts.get(key, 0) + 1
-    return dict(sorted(counts.items(), key=lambda entry: (-entry[1], entry[0]))[:limit])
-
-
-def _cueqc_fallback_summary(decisions: list[dict]) -> dict:
-    fallback = [
-        item for item in decisions
-        if item.get("mode") != "cueqc_mamba_v4_binary"
-    ]
-    return {
-        "count": len(fallback),
-        "stages": _top_counts([str(item.get("fallback_stage") or "") for item in fallback]),
-        "reasons": _top_counts([
-            str((item.get("reasons") or [""])[0])
-            if isinstance(item.get("reasons"), list)
-            else str(item.get("reasons") or "")
-            for item in fallback
-        ]),
-        "details": _top_counts([str(item.get("fallback_detail") or "") for item in fallback if item.get("fallback_detail")]),
-    }
-
-
-def _apply_cueqc_v4_model(
-    *,
-    refiner,
-    candidates: list[dict],
-    backend,
-    audio_path: str,
-    log: list[str],
-) -> list[dict] | None:
-    """Run the v4 binary refiner over candidates, reusing the shared ASR model.
-
-    Captures ASR internals via ``backend.capture_asr_internals()`` which works in
-    both inline and subprocess worker modes (the capture runs where the model is
-    loaded). Returns one decision dict per candidate. Per-candidate capture or
-    inference failures are handled inside the refiner, but model-level capture
-    unavailability is fatal to the job.
-    """
-    if not candidates:
-        return []
-    if backend is None or not hasattr(backend, "capture_asr_internals"):
-        log.append("CueQC v4 binary: backend has no capture_asr_internals; cannot continue")
-        return None
-    capture_chunks = []
-    for cand in candidates:
-        path, start_s, end_s = _candidate_capture_window(cand, audio_path)
-        capture_chunks.append({
-            "path": path,
-            "text": str(cand.get("text") or ""),
-            "start_s": start_s,
-            "end_s": end_s,
-        })
-    try:
-        asr_internals = backend.capture_asr_internals(capture_chunks)
-    except Exception as exc:  # noqa: BLE001
-        log.append(f"CueQC v4 binary: capture failed ({exc!r}); cannot continue")
-        return None
-    if not isinstance(asr_internals, list) or len(asr_internals) != len(candidates):
-        log.append("CueQC v4 binary: capture count mismatch; cannot continue")
-        return None
-    capture_failed = [
-        str(item.get("error") or item.get("detail") or "")
-        for item in asr_internals
-        if not (isinstance(item, dict) and item.get("ok"))
-    ]
-    if capture_failed:
-        log.append(
-            "CueQC v4 binary: capture fallback candidates={failed}/{total} top_errors={errors}".format(
-                failed=len(capture_failed),
-                total=len(candidates),
-                errors=_top_counts(capture_failed),
-            )
-        )
-    try:
-        decisions = refiner.decide(candidates, asr_internals=asr_internals)
-    except Exception:
-        raise
-    drops = sum(1 for d in decisions if d.get("display_hint") == "drop")
-    fallback_summary = _cueqc_fallback_summary(decisions)
-    log.append(
-        "CueQC v4 binary: model decisions={decisions} drops={drops} fallback={fallback} "
-        "fallback_stages={stages} fallback_reasons={reasons} fallback_details={details}".format(
-            decisions=len(decisions),
-            drops=drops,
-            fallback=fallback_summary["count"],
-            stages=fallback_summary["stages"],
-            reasons=fallback_summary["reasons"],
-            details=fallback_summary["details"],
-        )
-    )
-    return decisions
-
-
-def _merge_cueqc_v4_decisions(
-    report: dict,
-    candidates: list[dict],
-    model_decisions: list[dict],
-) -> dict:
-    """Replace report decisions with v4 model decisions, keyed by chunk_index."""
-    decisions = []
-    for cand, dec in zip(candidates, model_decisions):
-        item = dict(dec)
-        item["chunk_index"] = cand.get("chunk_index")
-        decisions.append(item)
-    report = dict(report)
-    report["decisions"] = decisions
-    # Recompute display_hint counts for the shadow log line.
-    counts: dict[str, int] = {}
-    for dec in decisions:
-        key = str(dec.get("display_hint") or "keep")
-        counts[key] = counts.get(key, 0) + 1
-    existing_counts = dict(report.get("counts") or {})
-    existing_counts["display_hint"] = counts
-    fallback_summary = _cueqc_fallback_summary(decisions)
-    existing_counts["fallback_stage"] = fallback_summary["stages"]
-    existing_counts["fallback_reason"] = fallback_summary["reasons"]
-    report["counts"] = existing_counts
-    report["decision_source"] = "cueqc_mamba_v4_binary"
-    report["fallback_summary"] = fallback_summary
-    return report
-
-
-def _run_cueqc_shadow(
-    *,
-    audio_path: str,
-    chunk_infos: list[dict],
-    text_results: list[dict],
-    log: list[str],
-    backend=None,
-) -> tuple[dict, dict[int, dict]]:
-    if not cueqc_enabled():
-        return _empty_cueqc_shadow_report(), {}
-    try:
-        audio_id = Path(audio_path).stem
-        candidates = build_cueqc_candidates(
-            chunk_infos,
-            text_results,
-            audio_id=audio_id,
-            video_id=audio_id,
-        )
-        report = _cueqc_module.build_shadow_report(candidates)
-        if os.getenv("CUEQC_SHADOW_EMBED_CANDIDATES", "0").strip().lower() in {
-            "1",
-            "true",
-            "yes",
-            "on",
-        }:
-            report["candidates"] = candidates
-        _write_cueqc_candidates_if_requested(candidates, log=log)
-
-        # v4 binary is required when CueQC is enabled; checkpoint mapping/load
-        # failures should stop the job instead of falling back to old rules.
-        model_path = checkpoint_path_for_repo_env(
-            repo_id=ASR_BACKEND,
-            mapping_env="CUEQC_MODEL_PATH_BY_REPO",
-            default_mapping=DEFAULT_CUEQC_CHECKPOINT_BY_REPO,
-        )
-        refiner = _cueqc_refiner_for(model_path, expected_asr_repo_id=ASR_BACKEND) if model_path else None
-        if refiner is not None:
-            model_decisions = _apply_cueqc_v4_model(
-                refiner=refiner,
-                candidates=candidates,
-                backend=backend,
-                audio_path=audio_path,
-                log=log,
-            )
-            if model_decisions is None:
-                raise RuntimeError("CueQC v4 binary produced no model decisions")
-            report = _merge_cueqc_v4_decisions(report, candidates, model_decisions)
-
-        decision_by_chunk = {
-            int(item["chunk_index"]): {
-                key: value
-                for key, value in item.items()
-                if key
-                in {
-                    "schema",
-                    "schema_version",
-                    "model_version",
-                    "decision_version",
-                    "mode",
-                    "cluster_id",
-                    "display_hint",
-                    "confidence",
-                    "reasons",
-                    "display_prob_keep",
-                    "display_prob_drop",
-                    "drop_threshold",
-                    "fallback_stage",
-                    "fallback_detail",
-                }
-            }
-            for item in report.get("decisions", [])
-            if item.get("chunk_index") is not None
-        }
-        log.append(
-            "CueQC: candidates={count} display={display}".format(
-                count=report.get("candidate_count", 0),
-                display=dict((report.get("counts") or {}).get("display_hint") or {}),
-            )
-        )
-        return report, decision_by_chunk
-    except Exception as exc:
-        message = f"CueQC v4 binary failed; job cannot continue ({exc!r})"
-        log.append(message)
-        raise RuntimeError(message) from exc
-
-
 def _segment_alignment_outcome(segment: dict, outcomes: dict[int, dict]) -> dict:
     chunk_indices: list[int] = []
     for word in segment.get("words") or []:
@@ -1431,6 +1154,7 @@ def _transcribe_and_align_local(
             pre_asr_candidates,
             pre_asr_cueqc_report,
         )
+        _write_pre_asr_candidates_if_requested(pre_asr_candidates, log=log)
         chunk_dir, chunk_infos = _extract_wav_chunks(
             audio_path, _span_boundaries(chunk_spans), on_stage=on_stage
         )
@@ -1479,7 +1203,6 @@ def _transcribe_and_align_local(
                 "boundary_signature": dict(_LAST_BOUNDARY_SIGNATURE),
                 "pre_asr_cueqc": pre_asr_cueqc_report,
                 "pre_asr_candidates": pre_asr_candidates,
-                "cueqc_shadow": _empty_cueqc_shadow_report(),
             }
             return [], log, details
 
@@ -1527,19 +1250,6 @@ def _transcribe_and_align_local(
                 _with_alignment_window(chunk, text_result)
                 for chunk, text_result in zip(chunk_infos, text_results)
             ]
-            cueqc_shadow_report, cueqc_shadow_by_chunk = _run_cueqc_shadow(
-                audio_path=audio_path,
-                chunk_infos=chunk_infos,
-                text_results=text_results,
-                log=log,
-                backend=backend,
-            )
-            _record_cuda_memory(
-                log,
-                cuda_memory,
-                "cueqc_done",
-                elapsed_s=time.perf_counter() - total_started,
-            )
 
             unload_started = time.perf_counter()
             backend.unload_model(on_stage=on_stage)
@@ -1623,14 +1333,6 @@ def _transcribe_and_align_local(
                 text_results,
                 alignment_outcomes,
             )
-            for transcript_chunk in transcript_chunks:
-                try:
-                    chunk_index = int(transcript_chunk.get("index"))
-                except (TypeError, ValueError):
-                    continue
-                cueqc_shadow = cueqc_shadow_by_chunk.get(chunk_index)
-                if cueqc_shadow:
-                    transcript_chunk["cueqc_shadow"] = dict(cueqc_shadow)
         finally:
             backend.close()
 
@@ -1704,13 +1406,6 @@ def _transcribe_and_align_local(
                     values = [chunk.get(key) for chunk in source_chunks if chunk.get(key) is not None]
                     if values:
                         segment[key] = values[0]
-            shadows = [
-                cueqc_shadow_by_chunk[index]
-                for index in list(dict.fromkeys(chunk_indices))
-                if index in cueqc_shadow_by_chunk
-            ]
-            if shadows:
-                segment["cueqc_shadow"] = shadows[0] if len(shadows) == 1 else shadows
             primary_cut_candidates = _cut_candidates_for_segment(
                 segment,
                 chunks_by_index,
@@ -1760,7 +1455,6 @@ def _transcribe_and_align_local(
             "transcript_chunks": transcript_chunks,
             "pre_asr_cueqc": pre_asr_cueqc_report,
             "pre_asr_candidates": pre_asr_candidates,
-            "cueqc_shadow": cueqc_shadow_report,
             "stage_timings": timings,
             "cuda_memory": cuda_memory,
             "word_count": len(word_dicts),

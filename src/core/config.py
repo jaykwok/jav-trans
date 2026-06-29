@@ -116,18 +116,10 @@ DEFAULT_SETTINGS: dict[str, str] = {
     "PRE_ASR_CUEQC_MODEL_PATH_BY_REPO": "",
     "PRE_ASR_CUEQC_DEVICE": "auto",
     "PRE_ASR_CUEQC_DROP_THRESHOLD": "0.95",
+    # Optional JSONL export for cold-start clustering/training candidates.
+    "PRE_ASR_CUEQC_EXPORT_CANDIDATES_PATH": "",
+    "PRE_ASR_CUEQC_EXPORT_CANDIDATES_APPEND": "1",
 
-    # --- ASR-after CueQC v4 shadow / hard-negative mining ---
-    # Opt-in only; active keep/drop routing moved to Pre-ASR CueQC v10.
-    "CUEQC_SHADOW_ENABLED": "0",
-    # v4 binary remains a temporary shadow source; it no longer removes chunks.
-    "CUEQC_DROP_THRESHOLD": "0.85",
-    "CUEQC_DEVICE": "auto",
-    # Optional JSONL export path for cluster-first audit candidates.
-    "CUEQC_EXPORT_CANDIDATES_PATH": "",
-    "CUEQC_EXPORT_CANDIDATES_APPEND": "1",
-    # 0 keeps aligned cache compact; use export path for full candidate features.
-    "CUEQC_SHADOW_EMBED_CANDIDATES": "0",
     # --- Subtitle Timings ---
     # Minimum displayed subtitle duration in seconds.
     "MIN_SUBTITLE_DURATION": "0.6",

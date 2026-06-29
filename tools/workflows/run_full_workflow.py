@@ -203,12 +203,6 @@ def configure_env(args: argparse.Namespace) -> None:
     else:
         os.environ.pop("BOUNDARY_REFINER_MODEL_PATH_BY_REPO", None)
     os.environ["BOUNDARY_REFINER_DEVICE"] = args.boundary_refiner_device
-    if args.cueqc_model_path_by_repo.strip():
-        os.environ["CUEQC_MODEL_PATH_BY_REPO"] = args.cueqc_model_path_by_repo
-    else:
-        os.environ.pop("CUEQC_MODEL_PATH_BY_REPO", None)
-    os.environ["CUEQC_SHADOW_ENABLED"] = "1" if args.cueqc_shadow_enabled else "0"
-    os.environ["CUEQC_INFERENCE_BATCH_SIZE"] = str(args.cueqc_inference_batch_size)
     os.environ["PRE_ASR_CUEQC_ENABLED"] = "1" if args.pre_asr_cueqc_enabled else "0"
     if args.pre_asr_cueqc_model_path_by_repo.strip():
         os.environ["PRE_ASR_CUEQC_MODEL_PATH_BY_REPO"] = args.pre_asr_cueqc_model_path_by_repo
@@ -273,9 +267,6 @@ def build_context(*, args: argparse.Namespace, paths: RunPaths, video: Path):
         ),
         "BOUNDARY_REFINER_MODEL_PATH_BY_REPO": os.getenv("BOUNDARY_REFINER_MODEL_PATH_BY_REPO", ""),
         "BOUNDARY_REFINER_DEVICE": os.getenv("BOUNDARY_REFINER_DEVICE", "auto"),
-        "CUEQC_MODEL_PATH_BY_REPO": os.getenv("CUEQC_MODEL_PATH_BY_REPO", ""),
-        "CUEQC_SHADOW_ENABLED": "1" if args.cueqc_shadow_enabled else "0",
-        "CUEQC_INFERENCE_BATCH_SIZE": os.getenv("CUEQC_INFERENCE_BATCH_SIZE", "64"),
         "PRE_ASR_CUEQC_ENABLED": "1" if args.pre_asr_cueqc_enabled else "0",
         "PRE_ASR_CUEQC_MODEL_PATH_BY_REPO": os.getenv("PRE_ASR_CUEQC_MODEL_PATH_BY_REPO", ""),
         "PRE_ASR_CUEQC_DEVICE": os.getenv("PRE_ASR_CUEQC_DEVICE", "auto"),
@@ -448,8 +439,6 @@ def write_summary(paths: RunPaths, args: argparse.Namespace, results: list[dict[
         "speech_boundary_min_split_segment_s": args.speech_boundary_min_split_segment_s,
         "speech_boundary_scorer_checkpoint_by_repo": args.speech_boundary_scorer_checkpoint_by_repo,
         "asr_batch_size": args.asr_batch_size,
-        "cueqc_shadow_enabled": bool(args.cueqc_shadow_enabled),
-        "cueqc_inference_batch_size": args.cueqc_inference_batch_size,
         "pre_asr_cueqc_enabled": bool(args.pre_asr_cueqc_enabled),
         "pre_asr_cueqc_drop_threshold": args.pre_asr_cueqc_drop_threshold,
         "boundary_planner": {
@@ -475,7 +464,6 @@ def write_summary(paths: RunPaths, args: argparse.Namespace, results: list[dict[
             f"adaptive split decoder"
         ),
         f"- Pre-ASR CueQC: `{'on' if args.pre_asr_cueqc_enabled else 'off'}`",
-        f"- CueQC shadow: `{'on' if args.cueqc_shadow_enabled else 'off'}`",
         f"- Translation: `{'on' if args.translate else 'off'}`",
         f"- Runtime root: `{project_rel(paths.root)}`",
         "",
@@ -540,23 +528,6 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--boundary-refiner-model-path-by-repo",
         default=os.getenv("BOUNDARY_REFINER_MODEL_PATH_BY_REPO", ""),
         help="Required repo-id checkpoint map: '<repo_id>=<boundary_edge_refiner_v8_safe_tight.pt>[,<repo_id>=...]'.",
-    )
-    parser.add_argument(
-        "--cueqc-model-path-by-repo",
-        default=os.getenv("CUEQC_MODEL_PATH_BY_REPO", ""),
-        help="Required repo-id checkpoint map: '<repo_id>=<cueqc_mamba_v4_binary.pt>[,<repo_id>=...]'.",
-    )
-    parser.add_argument(
-        "--cueqc-shadow-enabled",
-        action=argparse.BooleanOptionalAction,
-        default=_env_bool("CUEQC_SHADOW_ENABLED", False),
-        help="Enable ASR-after CueQC v4 shadow decisions for audit/mining. It does not drop runtime chunks.",
-    )
-    parser.add_argument(
-        "--cueqc-inference-batch-size",
-        type=int,
-        default=_env_int("CUEQC_INFERENCE_BATCH_SIZE", 64),
-        help="CueQC v4 binary inference batch size.",
     )
     parser.add_argument(
         "--pre-asr-cueqc-enabled",
@@ -669,8 +640,6 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         parser.error("--speech-boundary-overlap-s must be non-negative and smaller than window")
     if args.boundary_planner_sequence_batch_size <= 0:
         parser.error("--boundary-planner-sequence-batch-size must be positive")
-    if args.cueqc_inference_batch_size <= 0:
-        parser.error("--cueqc-inference-batch-size must be positive")
     return args
 
 

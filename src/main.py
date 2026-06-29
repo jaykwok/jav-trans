@@ -340,7 +340,7 @@ def _aligned_segments_payload(
         "audio_path": audio_path,
         "audio_cache_key": audio_cache_key,
         "segments": segments,
-        "asr_details": asr_details,
+        "asr_details": _compact_asr_details_for_sidecar(asr_details),
         "asr_log": asr_log,
         "timeline_mode": subtitle_options.timeline_mode,
         "cache_stage": cache_stage,
@@ -348,6 +348,29 @@ def _aligned_segments_payload(
     if cache_signature is not None:
         payload["cache_signature"] = cache_signature
     return payload
+
+
+_ASR_DETAILS_LARGE_SIDECAR_KEYS = {
+    "transcript_chunks",
+    "pre_asr_candidates",
+}
+
+
+def _compact_asr_details_for_sidecar(asr_details: dict | None) -> dict:
+    if not isinstance(asr_details, dict):
+        return {}
+    compact = {
+        key: value
+        for key, value in asr_details.items()
+        if key not in _ASR_DETAILS_LARGE_SIDECAR_KEYS
+    }
+    transcript_chunks = asr_details.get("transcript_chunks")
+    if isinstance(transcript_chunks, list):
+        compact["transcript_chunk_count"] = len(transcript_chunks)
+    pre_asr_candidates = asr_details.get("pre_asr_candidates")
+    if isinstance(pre_asr_candidates, list):
+        compact["pre_asr_candidate_count"] = len(pre_asr_candidates)
+    return compact
 
 
 def _quality_report_dir_for_ctx(ctx: JobContext) -> Path | None:
@@ -1288,7 +1311,7 @@ def _run_translation_and_write_impl(
                 "backend": backend_label,
                 "counts": {"segments": 0, "blocks": 0},
                 "stage_timings": pipeline_timings,
-                "asr_details": asr_details,
+                "asr_details": _compact_asr_details_for_sidecar(asr_details),
                 "translation_request_timings": [],
                 "video_fps": {
                     "detected": video_fps,
@@ -1426,7 +1449,7 @@ def _run_translation_and_write_impl(
                     "blocks": len(srt_blocks),
                 },
                 "stage_timings": pipeline_timings,
-                "asr_details": asr_details,
+                "asr_details": _compact_asr_details_for_sidecar(asr_details),
                 "translation_request_timings": translation_request_timings,
                 "translation_api_retry_events": [],
                 "translation_skipped": True,
@@ -1696,7 +1719,7 @@ def _run_translation_and_write_impl(
                 "blocks": len(srt_blocks),
             },
             "stage_timings": pipeline_timings,
-            "asr_details": asr_details,
+            "asr_details": _compact_asr_details_for_sidecar(asr_details),
             "translation_request_timings": translation_request_timings,
             "translation_api_retry_events": translation_api_retry_events,
             "video_fps": {
