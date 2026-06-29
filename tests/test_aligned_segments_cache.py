@@ -156,6 +156,65 @@ def test_asr_stage_aligned_payload_keeps_resume_signature(monkeypatch, tmp_path)
     assert payload["cache_signature"] == signature
 
 
+def test_asr_alignment_stage_writes_resume_signature_e2e(monkeypatch, tmp_path):
+    # End-to-end guard for the resume fix: run the real ASR stage through
+    # run_pipeline and confirm the aligned_segments.json written at the
+    # asr_alignment stage (before translation overwrites it) carries a real
+    # cache_signature. If main.py ever regresses to writing None here, a job
+    # interrupted between ASR and translation can no longer be resumed.
+    video_path = tmp_path / "clip.mp4"
+    video_path.write_bytes(b"fake-video")
+    output_dir = tmp_path / "out"
+    temp_root = tmp_path / "jobs"
+
+    _configure(monkeypatch)
+    ctx = make_job_context(
+        video_path,
+        output_dir,
+        temp_root,
+        skip_translation=True,
+        keep_temp_files=True,
+    )
+
+    real_write_json = main._write_json
+    aligned_writes: list[dict] = []
+
+    def spy_write_json(path: str, payload: dict) -> None:
+        if str(path).endswith(".aligned_segments.json"):
+            aligned_writes.append(
+                {
+                    "cache_stage": payload.get("cache_stage"),
+                    "cache_signature": payload.get("cache_signature"),
+                }
+            )
+        return real_write_json(path, payload)
+
+    def fake_extract_audio(_video_path: str, out_path: str) -> None:
+        Path(out_path).parent.mkdir(parents=True, exist_ok=True)
+        Path(out_path).write_bytes(b"wav")
+
+    def fake_transcribe_and_align(_audio_path, _device, on_stage=None, include_details=False):
+        return (
+            [{"start": 0.0, "end": 1.0, "text": "こんにちは"}],
+            ["mock asr"],
+            {"transcript_chunks": [], "stage_timings": {}},
+        )
+
+    monkeypatch.setattr(main, "_write_json", spy_write_json)
+    monkeypatch.setattr(pipeline_audio, "extract_audio", fake_extract_audio)
+    monkeypatch.setattr(main.asr_module, "transcribe_and_align", fake_transcribe_and_align)
+
+    run_pipeline(video_path, ctx)
+
+    stages = {write["cache_stage"] for write in aligned_writes}
+    assert "asr_alignment" in stages
+    asr_stage_write = next(
+        write for write in aligned_writes if write["cache_stage"] == "asr_alignment"
+    )
+    assert isinstance(asr_stage_write["cache_signature"], dict)
+    assert asr_stage_write["cache_signature"]["version"] == 8
+
+
 def test_aligned_cache_signature_ignores_retired_display_policy_env(monkeypatch, tmp_path):
     video_path = tmp_path / "clip.mp4"
     video_path.write_bytes(b"fake-video")
