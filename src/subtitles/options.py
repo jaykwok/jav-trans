@@ -1,12 +1,11 @@
 from __future__ import annotations
 
-import math
 import os
 from dataclasses import dataclass
 from dataclasses import asdict
 
 
-FALLBACK_VIDEO_FPS = 30000 / 1001
+BASE_FPS = 24000 / 1001
 
 
 def _env_bool(name: str, default: bool) -> bool:
@@ -32,7 +31,6 @@ class SubtitleOptions:
     bilingual_secondary_weight: float = 0.4
     ascii_char_weight: float = 0.55
     line_max_chars: int = 25
-    video_fps: float = FALLBACK_VIDEO_FPS
     timing_polish_enabled: bool = True
     short_gap_collapse_s: float = 0.5
     linger_s: float = 0.45
@@ -44,16 +42,8 @@ class SubtitleOptions:
     max_total_display_extension_s: float = 0.30
 
     @property
-    def effective_video_fps(self) -> float:
-        try:
-            fps = float(self.video_fps)
-        except (TypeError, ValueError):
-            return FALLBACK_VIDEO_FPS
-        return fps if math.isfinite(fps) and fps > 0 else FALLBACK_VIDEO_FPS
-
-    @property
     def frame_duration_s(self) -> float:
-        return 1.0 / self.effective_video_fps
+        return 1.0 / BASE_FPS
 
     @property
     def frame_gap_s(self) -> float:
@@ -62,18 +52,6 @@ class SubtitleOptions:
     @property
     def frame_min_duration_s(self) -> float:
         return 20.0 * self.frame_duration_s
-
-    def with_video_fps(self, video_fps: float | None) -> "SubtitleOptions":
-        values = asdict(self)
-        if video_fps is None:
-            values["video_fps"] = FALLBACK_VIDEO_FPS
-        else:
-            try:
-                fps = float(video_fps)
-            except (TypeError, ValueError):
-                fps = FALLBACK_VIDEO_FPS
-            values["video_fps"] = fps if math.isfinite(fps) and fps > 0 else FALLBACK_VIDEO_FPS
-        return type(self)(**values)
 
     @classmethod
     def from_env(cls) -> "SubtitleOptions":

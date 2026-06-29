@@ -29,6 +29,7 @@ from boundary.ja.model import (
     load_feature_frame_scorer_checkpoint,
     score_feature_frame_boundary_probabilities,
 )
+from subtitles.options import BASE_FPS
 
 
 DEFAULT_PTM = "jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame"
@@ -817,10 +818,8 @@ def _split_segments_by_peaks(
 
 
 def _subtitle_min_duration_s_for_config(config: "SpeechBoundaryJaConfig") -> float:
-    fps = float(config.video_fps or 24.0)
-    if not np.isfinite(fps) or fps <= 0.0:
-        fps = 24.0
-    return 20.0 / fps
+    del config
+    return 20.0 / BASE_FPS
 
 
 def _range_normalize(values: np.ndarray, *, lower_pct: float = 20.0, upper_pct: float = 95.0) -> np.ndarray:
@@ -1073,7 +1072,6 @@ class SpeechBoundaryJaConfig:
     min_split_segment_s: float = 0.08
     split_score_quantile: float = 0.50
     split_prominence_quantile: float = 0.50
-    video_fps: float = 24.0
     export_sequence_features: bool = False
     sequence_feature_max_ptm_dims: int = 64
     no_download: bool = False
@@ -1113,7 +1111,6 @@ class SpeechBoundaryJaConfig:
                 "SPEECH_BOUNDARY_JA_SPLIT_PROMINENCE_QUANTILE",
                 "0.50",
             ),
-            video_fps=_env_float("SPEECH_BOUNDARY_JA_VIDEO_FPS", "24.0"),
             export_sequence_features=_env_bool("SPEECH_BOUNDARY_JA_EXPORT_SEQUENCE_FEATURES", "0"),
             sequence_feature_max_ptm_dims=max(
                 1,
@@ -1168,7 +1165,7 @@ class SpeechBoundaryJaBackend:
             "split_score_quantile": float(cfg.split_score_quantile),
             "split_prominence_quantile": float(cfg.split_prominence_quantile),
             "micro_chunk_resolver": "subtitle_min_duration_split_evidence_v1",
-            "micro_chunk_video_fps": float(cfg.video_fps),
+            "base_fps": float(BASE_FPS),
             "micro_chunk_min_duration_s": float(_subtitle_min_duration_s_for_config(cfg)),
             "export_sequence_features": bool(cfg.export_sequence_features),
             "sequence_feature_max_ptm_dims": int(cfg.sequence_feature_max_ptm_dims),

@@ -37,7 +37,6 @@ class AsrArtifacts:
     device: str
     backend_label: str
     video_duration_s: float | None
-    video_fps: float | None
     pipeline_started: float
     job_id: str
     aligned_cache_signature: dict | None = None
@@ -190,9 +189,6 @@ def load_translation_artifacts_snapshot(
         float(values["video_duration_s"])
         if values.get("video_duration_s") is not None
         else None
-    )
-    values["video_fps"] = (
-        float(values["video_fps"]) if values.get("video_fps") is not None else None
     )
     values["pipeline_started"] = time.perf_counter()
     values["audio_cache_key"] = str(values.get("audio_cache_key") or "")

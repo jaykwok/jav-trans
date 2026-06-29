@@ -11,7 +11,6 @@ from boundary.backbones import (
     normalize_boundary_backbone,
 )
 from boundary.base import SegmentationResult, SpeechBoundaryBackend, SpeechSegment
-from boundary.planner import BoundaryPlannerConfig, PlannedChunk, PlannedIsland, plan_boundary_chunks
 from boundary.refiner import (
     BoundaryDecision,
     DEFAULT_REFINER_CHECKPOINT_PATH,
@@ -50,7 +49,6 @@ def get_boundary_backend(name: str | None = None) -> SpeechBoundaryBackend:
 
 __all__ = [
     "BoundaryDecision",
-    "BoundaryPlannerConfig",
     "BoundarySequenceClassifier",
     "DualBranchDiffBoundarySequenceClassifier",
     "SegmentationResult",
@@ -64,8 +62,6 @@ __all__ = [
     "FrameSequenceFeatureProvider",
     "LEARNED_REFINER_SCHEMA",
     "LearnedBoundaryRefiner",
-    "PlannedChunk",
-    "PlannedIsland",
     "SplitBoundaryAdapter",
     "TinyMamba2BoundaryBackbone",
     "build_learned_refiner_checkpoint",
@@ -80,6 +76,5 @@ __all__ = [
     "load_edge_sequence_refiner_v8_checkpoint",
     "load_learned_refiner_checkpoint",
     "normalize_boundary_backbone",
-    "plan_boundary_chunks",
     "validate_sequence_features",
 ]

@@ -1,17 +1,71 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Sequence
+from typing import Any, Protocol, Sequence
 
-from boundary.planner import (
-    BoundarySequenceFeatureProvider,
-    BoundaryPlannerConfig,
-    PlannedChunk,
-    PlannedIsland,
-    plan_boundary_chunks,
-)
 from boundary.refiner import BoundaryDecision, SequenceBoundaryRefiner
 from boundary.base import SpeechSegment
+
+
+class BoundarySequenceFeatureProvider(Protocol):
+    def features_for_boundary(
+        self,
+        *,
+        left_start_s: float,
+        left_end_s: float,
+        right_start_s: float,
+        right_end_s: float,
+    ) -> list[float]: ...
+
+
+@dataclass(frozen=True)
+class _PlannedIsland:
+    start: float
+    end: float
+    score: float | None = None
+    boundary_score: float | None = None
+    boundary_reason: str = ""
+    boundary_source: str = ""
+    subtitle_min_duration_s: float | None = None
+    below_subtitle_min_duration: bool = False
+    micro_chunk_candidate: bool = False
+    micro_resolve_action: str = ""
+    micro_resolve_reason: str = ""
+    left_split_score: float | None = None
+    right_split_score: float | None = None
+    left_split_prominence: float | None = None
+    right_split_prominence: float | None = None
+    left_split_speech_valley: float | None = None
+    right_split_speech_valley: float | None = None
+    primary_cut_candidates: list[dict[str, Any]] | None = None
+    weak_cut_candidates: list[dict[str, Any]] | None = None
+
+    def to_speech_segment(self) -> SpeechSegment:
+        return SpeechSegment(
+            start=self.start,
+            end=self.end,
+            score=self.score,
+            subtitle_min_duration_s=self.subtitle_min_duration_s,
+            below_subtitle_min_duration=self.below_subtitle_min_duration,
+            micro_chunk_candidate=self.micro_chunk_candidate,
+            micro_resolve_action=self.micro_resolve_action,
+            micro_resolve_reason=self.micro_resolve_reason,
+            left_split_score=self.left_split_score,
+            right_split_score=self.right_split_score,
+            left_split_prominence=self.left_split_prominence,
+            right_split_prominence=self.right_split_prominence,
+            left_split_speech_valley=self.left_split_speech_valley,
+            right_split_speech_valley=self.right_split_speech_valley,
+            primary_cut_candidates=list(self.primary_cut_candidates or []),
+            weak_cut_candidates=list(self.weak_cut_candidates or []),
+        )
+
+
+@dataclass(frozen=True)
+class _PlannedChunk:
+    islands: list[_PlannedIsland]
+    split_reason: str
+    boundary_decision: BoundaryDecision | None = None
 
 
 @dataclass(frozen=True)
@@ -94,7 +148,6 @@ class PackingLayoutConfig:
 def pack_speech_segments(
     segments: Sequence[SpeechSegment],
     *,
-    frame_hop_s: float = 1.0 / 29.97,
     sequence_boundary_refiner: SequenceBoundaryRefiner | None = None,
     sequence_feature_provider: BoundarySequenceFeatureProvider | None = None,
     sequence_batch_size: int = 256,
@@ -106,21 +159,118 @@ def pack_speech_segments(
     may only adjust the start/end of already-planned island chunks.
     """
 
-    planner_config = BoundaryPlannerConfig(
-        frame_hop_s=frame_hop_s,
-        sequence_batch_size=sequence_batch_size,
-    )
-    planned = plan_boundary_chunks(
+    planned = _plan_boundary_chunks(
         segments,
-        config=planner_config,
         sequence_refiner=sequence_boundary_refiner,
         sequence_feature_provider=sequence_feature_provider,
+        sequence_batch_size=sequence_batch_size,
     )
     return _materialize_packed_chunks(planned, layout=PackingLayoutConfig())
 
 
+def _plan_boundary_chunks(
+    segments: Sequence[SpeechSegment],
+    *,
+    sequence_refiner: SequenceBoundaryRefiner | None = None,
+    sequence_feature_provider: BoundarySequenceFeatureProvider | None = None,
+    sequence_batch_size: int = 256,
+) -> list[_PlannedChunk]:
+    if sequence_batch_size <= 0:
+        raise ValueError("sequence_batch_size must be positive")
+    ordered = sorted(segments, key=lambda item: (item.start, item.end))
+    _validate_segments(ordered)
+    islands = [_island_from_segment(segment) for segment in ordered]
+    sequence_decisions = _precompute_sequence_decisions(
+        islands,
+        sequence_refiner=sequence_refiner,
+        sequence_feature_provider=sequence_feature_provider,
+        sequence_batch_size=sequence_batch_size,
+    )
+    chunks: list[_PlannedChunk] = []
+    for index, island in enumerate(islands):
+        decision = sequence_decisions[index] if index + 1 < len(islands) else None
+        chunks.append(
+            _PlannedChunk(
+                islands=[island],
+                split_reason=island.boundary_reason or "speech_island",
+                boundary_decision=decision,
+            )
+        )
+    return chunks
+
+
+def _validate_segments(segments: Sequence[SpeechSegment]) -> None:
+    for segment in segments:
+        if segment.end < segment.start:
+            raise ValueError("segment end must be greater than or equal to start")
+
+
+def _island_from_segment(segment: SpeechSegment) -> _PlannedIsland:
+    return _PlannedIsland(
+        start=segment.start,
+        end=segment.end,
+        score=segment.score,
+        boundary_score=segment.right_split_score,
+        boundary_reason=segment.micro_resolve_reason,
+        boundary_source="split_resolver" if segment.micro_resolve_reason else "",
+        subtitle_min_duration_s=segment.subtitle_min_duration_s,
+        below_subtitle_min_duration=segment.below_subtitle_min_duration,
+        micro_chunk_candidate=segment.micro_chunk_candidate,
+        micro_resolve_action=segment.micro_resolve_action,
+        micro_resolve_reason=segment.micro_resolve_reason,
+        left_split_score=segment.left_split_score,
+        right_split_score=segment.right_split_score,
+        left_split_prominence=segment.left_split_prominence,
+        right_split_prominence=segment.right_split_prominence,
+        left_split_speech_valley=segment.left_split_speech_valley,
+        right_split_speech_valley=segment.right_split_speech_valley,
+        primary_cut_candidates=list(segment.primary_cut_candidates or []),
+        weak_cut_candidates=list(segment.weak_cut_candidates or []),
+    )
+
+
+def _precompute_sequence_decisions(
+    islands: Sequence[_PlannedIsland],
+    *,
+    sequence_refiner: SequenceBoundaryRefiner | None,
+    sequence_feature_provider: BoundarySequenceFeatureProvider | None,
+    sequence_batch_size: int,
+) -> list[BoundaryDecision | None]:
+    if len(islands) < 2:
+        return []
+    if sequence_refiner is None or sequence_feature_provider is None:
+        return [None] * (len(islands) - 1)
+
+    features_by_gap: list[list[float]] = []
+    gap_indexes: list[int] = []
+    for index, (left, right) in enumerate(zip(islands, islands[1:])):
+        if right.start < left.end:
+            continue
+        features_by_gap.append(
+            sequence_feature_provider.features_for_boundary(
+                left_start_s=left.start,
+                left_end_s=left.end,
+                right_start_s=right.start,
+                right_end_s=right.end,
+            )
+        )
+        gap_indexes.append(index)
+
+    decisions: list[BoundaryDecision | None] = [None] * (len(islands) - 1)
+    if not features_by_gap:
+        return decisions
+    for start in range(0, len(features_by_gap), sequence_batch_size):
+        end = min(len(features_by_gap), start + sequence_batch_size)
+        sequence_decisions = sequence_refiner.decide_sequence(features_by_gap[start:end])
+        if len(sequence_decisions) != end - start:
+            raise ValueError("sequence boundary refiner returned a decision count mismatch")
+        for index, decision in zip(gap_indexes[start:end], sequence_decisions):
+            decisions[index] = decision
+    return decisions
+
+
 def _materialize_packed_chunks(
-    planned: Sequence[PlannedChunk],
+    planned: Sequence[_PlannedChunk],
     *,
     layout: PackingLayoutConfig,
 ) -> list[PackedChunk]:
@@ -148,7 +298,7 @@ def _materialize_packed_chunks(
 
 
 def _make_chunk(
-    islands: Sequence[PlannedIsland],
+    islands: Sequence[_PlannedIsland],
     *,
     layout: PackingLayoutConfig,
     previous_decision: BoundaryDecision | None,
@@ -321,7 +471,7 @@ def _merge_cut_candidates(values) -> list[dict[str, Any]]:
     ]
 
 
-def _internal_gap_count(islands: Sequence[PlannedIsland]) -> int:
+def _internal_gap_count(islands: Sequence[_PlannedIsland]) -> int:
     return sum(
         1
         for previous, current in zip(islands, islands[1:])
@@ -329,7 +479,7 @@ def _internal_gap_count(islands: Sequence[PlannedIsland]) -> int:
     )
 
 
-def _internal_gap_max_s(islands: Sequence[PlannedIsland]) -> float:
+def _internal_gap_max_s(islands: Sequence[_PlannedIsland]) -> float:
     if len(islands) < 2:
         return 0.0
     return max(

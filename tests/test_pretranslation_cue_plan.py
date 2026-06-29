@@ -1,9 +1,12 @@
 import json
 from pathlib import Path
 
+import pytest
+
 import main
 from helpers import make_job_context
 from pipeline.artifacts import AsrArtifacts
+from subtitles.options import SubtitleOptions
 
 
 def _artifacts(tmp_path: Path, segments: list[dict], *, bilingual: bool = False) -> AsrArtifacts:
@@ -36,7 +39,6 @@ def _artifacts(tmp_path: Path, segments: list[dict], *, bilingual: bool = False)
         device="cpu",
         backend_label="mock_asr",
         video_duration_s=3.0,
-        video_fps=25.0,
         pipeline_started=0.0,
         job_id="clip",
         aligned_cache_signature={"version": 2},
@@ -85,18 +87,19 @@ def test_translation_uses_pre_normalized_cues(monkeypatch, tmp_path):
 
     translated = seen["items"]
     assert len(translated) == 2
-    assert translated[0]["end"] == 0.92
-    assert translated[0]["end"] + (2 / 25.0) <= translated[1]["start"]
+    expected_end = translated[1]["start"] - SubtitleOptions().frame_gap_s
+    assert translated[0]["end"] == pytest.approx(expected_end)
+    assert translated[0]["end"] + SubtitleOptions().frame_gap_s <= translated[1]["start"]
     assert translated[0]["text"] == "あ"
     assert translated[1]["text"] == "い"
 
     srt_content = (tmp_path / "out" / "clip.srt").read_text(encoding="utf-8")
-    assert "00:00:00,000 --> 00:00:00,920" in srt_content
+    assert "00:00:00,000 --> 00:00:00,916" in srt_content
 
     sidecar = json.loads(
         (tmp_path / "jobs" / "clip" / "clip.bilingual.json").read_text(encoding="utf-8")
     )
-    assert sidecar["blocks"][0]["end"] == 0.92
+    assert sidecar["blocks"][0]["end"] == pytest.approx(expected_end)
     assert sidecar["blocks"][0]["zh_text"] == "zh-0"
 
     timings = json.loads(

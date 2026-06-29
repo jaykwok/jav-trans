@@ -1,7 +1,6 @@
 import os
 import json
 import logging
-import math
 import time
 import sys
 import warnings
@@ -69,6 +68,7 @@ import torch
 from asr import pipeline as asr_module
 from asr.manifest import build_asr_manifest
 from subtitles import writer as subtitle_module
+from subtitles.options import BASE_FPS
 from llm import translator as translator_module
 
 from rich.console import Console
@@ -199,16 +199,8 @@ def _asr_stage_env_overrides(ctx: JobContext) -> dict[str, str]:
     return overrides
 
 
-def _asr_stage_env_for_video(ctx: JobContext, video_fps: float | None) -> dict[str, str]:
-    overrides = _asr_stage_env_overrides(ctx)
-    try:
-        fps = float(video_fps) if video_fps is not None else 24.0
-    except (TypeError, ValueError):
-        fps = 24.0
-    if not math.isfinite(fps) or fps <= 0.0:
-        fps = 24.0
-    overrides["SPEECH_BOUNDARY_JA_VIDEO_FPS"] = f"{fps:.6f}"
-    return overrides
+def _asr_stage_env_for_ctx(ctx: JobContext) -> dict[str, str]:
+    return _asr_stage_env_overrides(ctx)
 
 
 _SUBTITLE_OPTION_KEYS = {
@@ -233,11 +225,6 @@ _SUBTITLE_OPTION_KEYS = {
     "SUBTITLE_MAX_DISPLAY_SHIFT_FROM_ACOUSTIC_START_S",
     "SUBTITLE_MAX_DISPLAY_SHIFT_FROM_ACOUSTIC_END_S",
     "SUBTITLE_MAX_TOTAL_DISPLAY_EXTENSION_S",
-
-
-
-
-
 }
 
 
@@ -252,12 +239,6 @@ def _subtitle_env_overrides(ctx: JobContext) -> dict[str, str]:
 def _subtitle_options_for_ctx(ctx: JobContext):
     with _temporary_env(_subtitle_env_overrides(ctx)):
         return subtitle_module.SubtitleOptions.from_env()
-
-
-def _subtitle_options_for_video(ctx: JobContext, video_fps: float | None):
-    return _subtitle_options_for_ctx(ctx).with_video_fps(video_fps)
-
-
 
 
 def _asr_runtime_signature_for_env() -> dict:
@@ -295,10 +276,12 @@ def _aligned_cache_signature_for_ctx(
     options = subtitle_options or _subtitle_options_for_ctx(ctx)
     asr_signature = _asr_runtime_signature_for_env()
     subtitle_signature = dict(options.signature())
-    subtitle_signature["effective_video_fps"] = options.effective_video_fps
+    subtitle_signature["base_fps"] = BASE_FPS
+    subtitle_signature["frame_duration_s"] = options.frame_duration_s
     subtitle_signature["frame_gap_s"] = options.frame_gap_s
+    subtitle_signature["frame_min_duration_s"] = options.frame_min_duration_s
     return {
-        "version": 8,
+        "version": 9,
         "backend_label": backend_label,
         "asr": asr_signature,
         "asr_stage_config": _asr_stage_config_signature_for_env(),
@@ -310,11 +293,10 @@ def aligned_cache_expectations_for_ctx(
     ctx: JobContext,
     *,
     backend_label: str | None = None,
-    video_fps: float | None = None,
 ) -> tuple[str, dict]:
-    with _temporary_env(_asr_stage_env_for_video(ctx, video_fps)):
+    with _temporary_env(_asr_stage_env_for_ctx(ctx)):
         resolved_backend_label = backend_label or asr_module.get_backend_label()
-        subtitle_options = _subtitle_options_for_video(ctx, video_fps)
+        subtitle_options = _subtitle_options_for_ctx(ctx)
         signature = _aligned_cache_signature_for_ctx(
             ctx,
             backend_label=resolved_backend_label,
@@ -778,8 +760,7 @@ def run_asr_alignment(
     events.set_current_job_id(job_id)
     _raise_if_cancelled(cancel_event)
     video_duration_s = audio_module.probe_video_duration_s(video_path)
-    video_fps = audio_module.probe_video_fps(video_path)
-    with _temporary_env(_asr_stage_env_for_video(effective_ctx, video_fps)):
+    with _temporary_env(_asr_stage_env_for_ctx(effective_ctx)):
         backend_label = asr_module.get_backend_label()
         if effective_ctx.run_log_enabled:
             logger, run_log_path = _setup_run_logger(job_id, backend_label, effective_ctx)
@@ -810,12 +791,7 @@ def run_asr_alignment(
         if run_log_path is not None:
             console.print(f"[dim]运行日志：{_project_relative(run_log_path)}[/dim]")
 
-        subtitle_options = _subtitle_options_for_video(effective_ctx, video_fps)
-        _log_stage(
-            logger,
-            f"video_fps={subtitle_options.effective_video_fps:.6f}"
-            f"{' fallback=29.97' if video_fps is None else ''}",
-        )
+        subtitle_options = _subtitle_options_for_ctx(effective_ctx)
         _log_stage(
             logger,
             "boundary_feature_frame_hop_s="
@@ -1112,7 +1088,6 @@ def run_asr_alignment(
         device=device,
         backend_label=backend_label,
         video_duration_s=video_duration_s,
-        video_fps=video_fps,
         pipeline_started=pipeline_started,
         job_id=job_id,
         aligned_cache_signature=aligned_cache_signature,
@@ -1167,7 +1142,6 @@ def _run_translation_and_write_impl(
     pipeline_started = artifacts.pipeline_started
     pipeline_timings = artifacts.pipeline_timings
     video_duration_s = artifacts.video_duration_s
-    video_fps = artifacts.video_fps
     video_filename = artifacts.video_stem
     aligned_segments_path = artifacts.aligned_segments_path
     logger = artifacts.logger
@@ -1181,13 +1155,12 @@ def _run_translation_and_write_impl(
     translation_cache_path = artifacts.translation_cache_path
     bilingual = artifacts.bilingual
     skip_translation = ctx.skip_translation
-    subtitle_options = _subtitle_options_for_video(ctx, video_fps)
+    subtitle_options = _subtitle_options_for_ctx(ctx)
     aligned_cache_signature = artifacts.aligned_cache_signature
     if aligned_cache_signature is None:
         _, aligned_cache_signature = aligned_cache_expectations_for_ctx(
             ctx,
             backend_label=backend_label,
-            video_fps=video_fps,
         )
     _raise_if_cancelled(cancel_event)
 
@@ -1264,11 +1237,6 @@ def _run_translation_and_write_impl(
             {
                 "blocks": srt_blocks,
                 "timeline_mode": subtitle_options.timeline_mode,
-                "video_fps": {
-                    "detected": video_fps,
-                    "effective": subtitle_options.effective_video_fps,
-                    "fallback": video_fps is None,
-                },
             },
         )
         output_paths.extend(
@@ -1313,11 +1281,6 @@ def _run_translation_and_write_impl(
                 "stage_timings": pipeline_timings,
                 "asr_details": _compact_asr_details_for_sidecar(asr_details),
                 "translation_request_timings": [],
-                "video_fps": {
-                    "detected": video_fps,
-                    "effective": subtitle_options.effective_video_fps,
-                    "fallback": video_fps is None,
-                },
                 "outputs": {
                     "job_temp_dir": job_temp_dir,
                     "srt": srt_path,
@@ -1396,11 +1359,6 @@ def _run_translation_and_write_impl(
                 "timeline_mode": subtitle_options.timeline_mode,
                 "blocks": srt_blocks,
                 "translation_skipped": True,
-                "video_fps": {
-                    "detected": video_fps,
-                    "effective": subtitle_options.effective_video_fps,
-                    "fallback": video_fps is None,
-                },
                 "translation_request_timings": translation_request_timings,
                 "translation_api_retry_events": [],
             },
@@ -1453,11 +1411,6 @@ def _run_translation_and_write_impl(
                 "translation_request_timings": translation_request_timings,
                 "translation_api_retry_events": [],
                 "translation_skipped": True,
-                "video_fps": {
-                    "detected": video_fps,
-                    "effective": subtitle_options.effective_video_fps,
-                    "fallback": video_fps is None,
-                },
                 "outputs": {
                     "job_temp_dir": job_temp_dir,
                     "srt": srt_path,
@@ -1667,11 +1620,6 @@ def _run_translation_and_write_impl(
             "backend": backend_label,
             "timeline_mode": subtitle_options.timeline_mode,
             "blocks": srt_blocks,
-            "video_fps": {
-                "detected": video_fps,
-                "effective": subtitle_options.effective_video_fps,
-                "fallback": video_fps is None,
-            },
             "translation_request_timings": translation_request_timings,
             "translation_api_retry_events": translation_api_retry_events,
         },
@@ -1722,11 +1670,6 @@ def _run_translation_and_write_impl(
             "asr_details": _compact_asr_details_for_sidecar(asr_details),
             "translation_request_timings": translation_request_timings,
             "translation_api_retry_events": translation_api_retry_events,
-            "video_fps": {
-                "detected": video_fps,
-                "effective": subtitle_options.effective_video_fps,
-                "fallback": video_fps is None,
-            },
             "outputs": {
                 "job_temp_dir": job_temp_dir,
                 "srt": srt_path,
