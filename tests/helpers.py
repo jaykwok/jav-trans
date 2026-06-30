@@ -6,8 +6,8 @@ import main
 from core.job_context import JobContext
 from pipeline.ids import sanitize_job_id
 
-ASR_06B_BACKEND = "jaykwok/Qwen3-ASR-0.6B-JA-Anime-Galgame"
-ASR_17B_BACKEND = "jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame"
+ASR_06B_BACKEND = "jaykwok/Qwen3-ASR-0.6B-JA-Anime-Galgame-hf"
+ASR_17B_BACKEND = "jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame-hf"
 
 
 def make_job_context(

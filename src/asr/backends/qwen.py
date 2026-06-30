@@ -5,8 +5,8 @@ from pathlib import Path
 
 from utils.runtime_paths import runtime_path
 
-QWEN_ASR_06B_REPO_ID = "jaykwok/Qwen3-ASR-0.6B-JA-Anime-Galgame"
-QWEN_ASR_17B_REPO_ID = "jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame"
+QWEN_ASR_06B_REPO_ID = "jaykwok/Qwen3-ASR-0.6B-JA-Anime-Galgame-hf"
+QWEN_ASR_17B_REPO_ID = "jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame-hf"
 QWEN_ASR_REPO_ID = QWEN_ASR_17B_REPO_ID
 
 DEFAULT_QWEN_ASR_BACKEND = QWEN_ASR_REPO_ID
@@ -21,32 +21,32 @@ DEFAULT_QWEN_ASR_BATCH_SIZE_BY_REPO: dict[str, int] = {
 DEFAULT_BOUNDARY_REFINER_CHECKPOINT_BY_REPO: dict[str, str] = {
     QWEN_ASR_17B_REPO_ID: (
         "src/boundary/checkpoints/"
-        "boundary_edge_refiner_v8_safe_tight.jaykwok-Qwen3-ASR-1.7B-JA-Anime-Galgame.pt"
+        "boundary_edge_refiner_v8_safe_tight.jaykwok-Qwen3-ASR-1.7B-JA-Anime-Galgame-hf.pt"
     ),
     QWEN_ASR_06B_REPO_ID: (
         "src/boundary/checkpoints/"
-        "boundary_edge_refiner_v8_safe_tight.jaykwok-Qwen3-ASR-0.6B-JA-Anime-Galgame.pt"
+        "boundary_edge_refiner_v8_safe_tight.jaykwok-Qwen3-ASR-0.6B-JA-Anime-Galgame-hf.pt"
     ),
 }
 DEFAULT_CUEQC_CHECKPOINT_BY_REPO: dict[str, str] = {
     QWEN_ASR_17B_REPO_ID: (
         "src/asr/checkpoints/"
-        "cueqc_mamba_v4_binary.jaykwok-Qwen3-ASR-1.7B-JA-Anime-Galgame.pt"
+        "cueqc_mamba_v4_binary.jaykwok-Qwen3-ASR-1.7B-JA-Anime-Galgame-hf.pt"
     ),
     QWEN_ASR_06B_REPO_ID: (
         "src/asr/checkpoints/"
-        "cueqc_mamba_v4_binary.jaykwok-Qwen3-ASR-0.6B-JA-Anime-Galgame.pt"
+        "cueqc_mamba_v4_binary.jaykwok-Qwen3-ASR-0.6B-JA-Anime-Galgame-hf.pt"
     ),
 }
 DEFAULT_PRE_ASR_CUEQC_CHECKPOINT_BY_REPO: dict[str, str] = {}
 DEFAULT_SPEECH_BOUNDARY_SCORER_CHECKPOINT_BY_REPO: dict[str, str] = {
     QWEN_ASR_17B_REPO_ID: (
         "src/boundary/ja/checkpoints/"
-        "speech_boundary_ja_frame_boundary_scorer_v7.jaykwok-Qwen3-ASR-1.7B-JA-Anime-Galgame.pt"
+        "speech_boundary_ja_frame_boundary_scorer_v7.jaykwok-Qwen3-ASR-1.7B-JA-Anime-Galgame-hf.pt"
     ),
     QWEN_ASR_06B_REPO_ID: (
         "src/boundary/ja/checkpoints/"
-        "speech_boundary_ja_frame_boundary_scorer_v7.jaykwok-Qwen3-ASR-0.6B-JA-Anime-Galgame.pt"
+        "speech_boundary_ja_frame_boundary_scorer_v7.jaykwok-Qwen3-ASR-0.6B-JA-Anime-Galgame-hf.pt"
     ),
 }
 
@@ -162,8 +162,6 @@ def validate_checkpoint_repo_id(
             f"{checkpoint_kind} checkpoint missing {metadata_key}; "
             "repo-id binding cannot be verified"
         )
-    if actual in QWEN_ASR_BACKEND_REPOS:
-        actual = qwen_asr_repo_id(actual)
     if actual != expected:
         raise ValueError(
             f"{checkpoint_kind} checkpoint {metadata_key}={actual!r} does not match "

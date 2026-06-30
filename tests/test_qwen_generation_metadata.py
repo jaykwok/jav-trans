@@ -23,7 +23,7 @@ def test_qwen_text_result_includes_generation_metadata(monkeypatch, tmp_path):
     assert result["asr_generation"]["backend"] == ASR_17B_BACKEND
     assert result["asr_generation"]["configured_max_new_tokens"] == local_backend.ASR_MAX_NEW_TOKENS
     assert result["asr_generation"]["model_max_target_positions"] is None
-    assert result["asr_generation"]["policy"] == "qwen_from_pretrained_limit"
+    assert result["asr_generation"]["policy"] == "native_transformers_generate"
     assert result["asr_generation"]["error_kind"] is None
     assert "ASR 输出模式: text_only" in log
 
@@ -42,18 +42,14 @@ def test_qwen_generation_metadata_records_timeout_kind(monkeypatch):
     assert metadata["error_detail"] == "worker timeout"
 
 
-def test_qwen_generation_safety_normalizes_inner_generation_config(monkeypatch):
+def test_qwen_generation_safety_normalizes_generation_config(monkeypatch):
     generation_config = SimpleNamespace(
         temperature=0.0,
         pad_token_id=None,
         eos_token_id=[151645, 151643],
         repetition_penalty=1.0,
     )
-    model = SimpleNamespace(
-        model=SimpleNamespace(
-            thinker=SimpleNamespace(generation_config=generation_config)
-        )
-    )
+    model = SimpleNamespace(generation_config=generation_config, config=SimpleNamespace())
     monkeypatch.setattr(local_backend, "ASR_REPETITION_PENALTY", 1.05)
 
     local_backend._apply_generation_safety(model)
@@ -80,7 +76,7 @@ def test_qwen_generation_safety_handles_direct_generation_config(monkeypatch):
     assert generation_config.repetition_penalty == 1.0
 
 
-def test_qwen_generation_safety_clears_default_temperature_with_nested_eos(monkeypatch):
+def test_qwen_generation_safety_clears_default_temperature_with_model_eos(monkeypatch):
     generation_config = SimpleNamespace(
         temperature=1.0,
         do_sample=False,
@@ -88,22 +84,15 @@ def test_qwen_generation_safety_clears_default_temperature_with_nested_eos(monke
         eos_token_id=None,
         repetition_penalty=1.0,
     )
-    thinker_config = SimpleNamespace(
+    model_config = SimpleNamespace(
         pad_token_id=None,
         eos_token_id=[151645, 151643],
     )
-    model = SimpleNamespace(
-        model=SimpleNamespace(
-            thinker=SimpleNamespace(
-                generation_config=generation_config,
-                config=thinker_config,
-            )
-        )
-    )
+    model = SimpleNamespace(generation_config=generation_config, config=model_config)
     monkeypatch.setattr(local_backend, "ASR_REPETITION_PENALTY", 1.0)
 
     local_backend._apply_generation_safety(model)
 
     assert generation_config.temperature is None
     assert generation_config.pad_token_id == 151645
-    assert thinker_config.pad_token_id == 151645
+    assert model_config.pad_token_id == 151645

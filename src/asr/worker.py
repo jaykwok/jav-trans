@@ -226,14 +226,17 @@ def _handle_capture_internals(parent_conn, msg, backend, capturer_cache: list):
         if not capturer_cache:
             from asr.asr_internals import AsrInternalsCapturer
 
-            wrapper = getattr(backend, "model", None)
-            if wrapper is None:
+            model = getattr(backend, "model", None)
+            processor = getattr(backend, "processor", None)
+            if model is None or processor is None:
                 _safe_send(parent_conn, {
                     "op": "result", "job_id": job_id, "internals": [],
                     "error": "backend has no loaded model",
                 })
                 return
-            capturer_cache.append(AsrInternalsCapturer(wrapper=wrapper))
+            capturer_cache.append(
+                AsrInternalsCapturer(model=model, processor=processor)
+            )
         capturer = capturer_cache[0]
         internals_list = []
         for chunk in chunks:
@@ -266,5 +269,4 @@ def _handle_capture_internals(parent_conn, msg, backend, capturer_cache: list):
 
 if __name__ == "__main__":
     raise SystemExit("asr_worker.main is intended to run under multiprocessing spawn.")
-
 

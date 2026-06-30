@@ -351,7 +351,7 @@ def test_compile_pre_asr_cueqc_features_ignores_text_columns(tmp_path: Path):
         chunk_paths=[str(chunks)],
         label_paths=[str(labels)],
         output=output,
-        asr_repo_id="jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame",
+        asr_repo_id="jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame-hf",
     )
 
     assert summary["chunk_count"] == 2
@@ -386,7 +386,7 @@ def test_compile_pre_asr_cueqc_features_reads_jsonl_chunk_candidates(tmp_path: P
         chunk_paths=[str(chunks)],
         label_paths=[str(labels)],
         output=output,
-        asr_repo_id="jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame",
+        asr_repo_id="jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame-hf",
     )
 
     assert summary["chunk_count"] == 2
@@ -421,7 +421,7 @@ def test_compile_pre_asr_cueqc_sample_labels_do_not_broadcast_by_cluster(tmp_pat
         chunk_paths=[str(chunks)],
         label_paths=[str(labels)],
         output=output,
-        asr_repo_id="jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame",
+        asr_repo_id="jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame-hf",
     )
     bundle = torch.load(output, map_location="cpu")
 
@@ -483,7 +483,7 @@ def test_compile_pre_asr_cueqc_broadcasts_cluster_examples_to_sample_ids(tmp_pat
         chunk_paths=[str(chunks)],
         label_paths=[str(labels)],
         output=output,
-        asr_repo_id="jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame",
+        asr_repo_id="jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame-hf",
     )
     bundle = torch.load(output, map_location="cpu")
 
@@ -545,7 +545,7 @@ def test_compile_pre_asr_cueqc_matches_video_chunk_and_cluster_id_labels(tmp_pat
         chunk_paths=[str(chunks)],
         label_paths=[str(labels)],
         output=output,
-        asr_repo_id="jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame",
+        asr_repo_id="jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame-hf",
     )
     bundle = torch.load(output, map_location="cpu")
 

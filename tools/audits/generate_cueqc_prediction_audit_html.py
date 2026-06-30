@@ -827,7 +827,7 @@ def build_audit(
     )
     output_dir.mkdir(parents=True, exist_ok=True)
     media_by_video, cues_by_video, aligned_by_video = discover_media(
-        archived_root=archived_root,
+        archived_roots=[archived_root],
         media_roots=media_roots,
         output_dir=output_dir,
         rows=rows,

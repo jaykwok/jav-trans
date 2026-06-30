@@ -244,8 +244,8 @@ class _FakeSequenceFeatureProvider:
 
 
 def _reload_pipeline(monkeypatch, tmp_path: Path, *, enable_cueqc: bool = False):
-    asr_backend = "jaykwok/Qwen3-ASR-0.6B-JA-Anime-Galgame"
-    boundary_checkpoint = tmp_path / "boundary_edge_refiner_v8_safe_tight.jaykwok-Qwen3-ASR-0.6B-JA-Anime-Galgame.pt"
+    asr_backend = "jaykwok/Qwen3-ASR-0.6B-JA-Anime-Galgame-hf"
+    boundary_checkpoint = tmp_path / "boundary_edge_refiner_v8_safe_tight.jaykwok-Qwen3-ASR-0.6B-JA-Anime-Galgame-hf.pt"
     boundary_checkpoint.write_bytes(b"v8")
     monkeypatch.setenv("ASR_BACKEND", asr_backend)
     monkeypatch.setenv(

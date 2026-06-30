@@ -17,16 +17,15 @@ SFT_OUTPUT_ROOT="${SFT_OUTPUT_ROOT:-$PROJECT_ROOT/datasets/train/qwen3-asr-ja-ga
 TRAIN_FILE="${TRAIN_FILE:-$SFT_OUTPUT_ROOT/qwen-sft/train.jsonl}"
 EVAL_FILE="${EVAL_FILE:-$SFT_OUTPUT_ROOT/qwen-sft/val.jsonl}"
 
-DEFAULT_MODEL_DIR="$PROJECT_ROOT/models/Qwen-Qwen3-ASR-1.7B"
+DEFAULT_MODEL_DIR="$PROJECT_ROOT/models/Qwen-Qwen3-ASR-1.7B-hf"
 if [[ -f "$DEFAULT_MODEL_DIR/config.json" ]]; then
   QWEN_MODEL_PATH="${QWEN_MODEL_PATH:-$DEFAULT_MODEL_DIR}"
 else
-  QWEN_MODEL_PATH="${QWEN_MODEL_PATH:-Qwen/Qwen3-ASR-1.7B}"
+  QWEN_MODEL_PATH="${QWEN_MODEL_PATH:-Qwen/Qwen3-ASR-1.7B-hf}"
 fi
 
-QWEN_SFT_SCRIPT_URL="${QWEN_SFT_SCRIPT_URL:-https://raw.githubusercontent.com/QwenLM/Qwen3-ASR/main/finetuning/qwen3_asr_sft.py}"
-QWEN_SFT_SCRIPT="${QWEN_SFT_SCRIPT:-$PROJECT_ROOT/agents/temp/qwen3_asr_sft.py}"
-QWEN_SFT_OUTPUT_DIR="${QWEN_SFT_OUTPUT_DIR:-$PROJECT_ROOT/datasets/train/qwen3-asr-ja-galgame/jaykwok-Qwen3-ASR-1.7B-JA-Anime-Galgame-full-sft}"
+QWEN_SFT_SCRIPT="${QWEN_SFT_SCRIPT:-$PROJECT_ROOT/tools/asr/qwen/train_qwen_asr_sft_hf.py}"
+QWEN_SFT_OUTPUT_DIR="${QWEN_SFT_OUTPUT_DIR:-$PROJECT_ROOT/datasets/train/qwen3-asr-ja-galgame/jaykwok-Qwen3-ASR-1.7B-JA-Anime-Galgame-hf-full-sft}"
 QWEN_SFT_LOG="${QWEN_SFT_LOG:-$PROJECT_ROOT/agents/temp/qwen3-asr-sft-cloud.run.log}"
 
 BATCH_SIZE="${BATCH_SIZE:-1}"
@@ -51,20 +50,16 @@ if [[ -n "$HF_ENDPOINT_VALUE" ]]; then
 fi
 
 if [[ "${INSTALL_QWEN_ASR_DEPS:-0}" == "1" ]]; then
-  uv pip install -U qwen-asr datasets librosa transformers
+  uv pip install -U datasets librosa
+  uv pip install -U "transformers @ git+https://github.com/huggingface/transformers.git"
   if [[ "${INSTALL_FLASH_ATTN:-0}" == "1" ]]; then
     MAX_JOBS="${MAX_JOBS:-4}" uv pip install -U flash-attn --no-build-isolation
   fi
 fi
 
 if [[ ! -f "$QWEN_SFT_SCRIPT" ]]; then
-  if [[ "${AUTO_DOWNLOAD_QWEN_SFT_SCRIPT:-1}" == "1" ]]; then
-    curl -L "$QWEN_SFT_SCRIPT_URL" -o "$QWEN_SFT_SCRIPT"
-  else
-    echo "Missing Qwen SFT script: $QWEN_SFT_SCRIPT" >&2
-    echo "Set AUTO_DOWNLOAD_QWEN_SFT_SCRIPT=1 or QWEN_SFT_SCRIPT=/path/to/qwen3_asr_sft.py." >&2
-    exit 2
-  fi
+  echo "Missing native Transformers SFT script: $QWEN_SFT_SCRIPT" >&2
+  exit 2
 fi
 
 if [[ ! -f "$TRAIN_FILE" ]]; then
@@ -97,8 +92,6 @@ if [[ -n "$EVAL_FILE" && -f "$EVAL_FILE" ]]; then
 fi
 if [[ -n "${RESUME_FROM:-}" ]]; then
   COMMON_ARGS+=(--resume_from "$RESUME_FROM")
-elif [[ "${RESUME:-0}" == "1" ]]; then
-  COMMON_ARGS+=(--resume 1)
 fi
 
 if [[ "$NPROC_PER_NODE" -gt 1 ]]; then

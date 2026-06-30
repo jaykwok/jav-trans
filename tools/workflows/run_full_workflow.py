@@ -194,7 +194,6 @@ def configure_env(args: argparse.Namespace) -> None:
         DEFAULT_ASR_BATCH_SIZE_BY_REPO_ENV,
     )
     os.environ["TRANSCRIPTION_TIMEOUT_S"] = str(args.transcription_timeout_s)
-    os.environ["TRANSCRIPTION_MAX_NEW_TOKENS"] = str(args.transcription_max_new_tokens)
     os.environ["ASR_MAX_NEW_TOKENS"] = str(args.asr_max_new_tokens)
     if args.boundary_feature_frame_hop_s is not None:
         os.environ["BOUNDARY_FEATURE_FRAME_HOP_S"] = str(args.boundary_feature_frame_hop_s)
@@ -258,7 +257,6 @@ def build_context(*, args: argparse.Namespace, paths: RunPaths, video: Path):
         "ASR_WORKER_MODE": args.asr_worker_mode,
         "ASR_CONTEXT": args.asr_context,
         "TRANSCRIPTION_TIMEOUT_S": str(args.transcription_timeout_s),
-        "TRANSCRIPTION_MAX_NEW_TOKENS": str(args.transcription_max_new_tokens),
         "ASR_MAX_NEW_TOKENS": str(args.asr_max_new_tokens),
         "ASR_BATCH_SIZE": args.asr_batch_size,
         "ASR_BATCH_SIZE_BY_REPO": os.getenv(
@@ -496,7 +494,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--label", default="speech_boundary_ja_qwen200k")
     parser.add_argument(
         "--asr-backend",
-        default=os.getenv("ASR_BACKEND", "jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame"),
+        default=os.getenv("ASR_BACKEND", "jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame-hf"),
     )
     parser.add_argument(
         "--asr-model-path",
@@ -507,7 +505,6 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--asr-attention", default=os.getenv("ASR_ATTENTION", "sdpa"))
     parser.add_argument("--asr-batch-size", default=os.getenv("ASR_BATCH_SIZE", "auto"))
     parser.add_argument("--asr-max-new-tokens", type=int, default=_env_int("ASR_MAX_NEW_TOKENS", 128))
-    parser.add_argument("--transcription-max-new-tokens", type=int, default=_env_int("TRANSCRIPTION_MAX_NEW_TOKENS", 128))
     parser.add_argument("--transcription-timeout-s", type=int, default=_env_int("TRANSCRIPTION_TIMEOUT_S", 300))
     parser.add_argument("--asr-context", default=os.getenv("ASR_CONTEXT", ""))
     parser.add_argument("--subtitle-mode", default="zh")

@@ -6,6 +6,7 @@ import re
 import time
 import uuid
 import wave
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
 
@@ -141,11 +142,7 @@ def _iter_generation_configs(model) -> list:
         if config is not None and not any(config is existing for existing in configs):
             configs.append(config)
 
-    for candidate in (
-        model,
-        getattr(model, "model", None),
-        getattr(getattr(model, "model", None), "thinker", None),
-    ):
+    for candidate in (model,):
         add_config(getattr(candidate, "generation_config", None))
         add_config(getattr(candidate, "config", None))
     return configs
@@ -177,15 +174,7 @@ def _normalize_deterministic_generation_config(model) -> None:
 
 def _apply_generation_safety(model) -> None:
     _normalize_deterministic_generation_config(model)
-    if ASR_REPETITION_PENALTY <= 1.0:
-        return
-    try:
-        # qwen-asr 0.0.6 exposes repetition control only through the underlying
-        # HF generation_config, so this intentionally touches a fragile wrapper
-        # internal and should be rechecked on qwen-asr upgrades.
-        model.model.thinker.generation_config.repetition_penalty = ASR_REPETITION_PENALTY
-    except Exception:
-        pass
+    model.generation_config.repetition_penalty = ASR_REPETITION_PENALTY
 
 
 def _asr_max_new_tokens() -> int:
@@ -230,7 +219,7 @@ def _qwen_generation_metadata(
         "model_id": active_qwen_asr_model_id(),
         "configured_max_new_tokens": _asr_max_new_tokens(),
         "model_max_target_positions": None,
-        "policy": "qwen_from_pretrained_limit",
+        "policy": "native_transformers_generate",
         "worker_mode": worker_mode,
         "error_kind": error_kind,
         "error_detail": error_detail,
@@ -265,6 +254,13 @@ class WorkerError(RuntimeError):
         self.kind = kind
         self.detail = detail
 
+
+@dataclass(frozen=True)
+class NativeAsrTranscription:
+    language: str | None
+    text: str
+
+
 class LocalAsrBackend:
     is_subprocess = False
     accepts_contexts = True
@@ -274,10 +270,11 @@ class LocalAsrBackend:
         self.dtype = _detect_dtype(self.device)
         self.attention = _detect_attention(self.device)
         self.model = None
+        self.processor = None
         self.request_batch_size = ASR_BATCH_SIZE
 
     def load(self, on_stage: Callable[[str], None] | None = None) -> None:
-        from qwen_asr import Qwen3ASRModel
+        from transformers import AutoModelForMultimodalLM, AutoProcessor
 
         if self.model is not None:
             return
@@ -291,14 +288,17 @@ class LocalAsrBackend:
         model_kwargs = {
             "dtype": self.dtype,
             "device_map": self.device,
-            "max_inference_batch_size": ASR_BATCH_SIZE,
-            "max_new_tokens": _asr_max_new_tokens(),
         }
 
         if self.attention and self.attention != "sdpa":
             model_kwargs["attn_implementation"] = self.attention
 
-        self.model = Qwen3ASRModel.from_pretrained(model_spec, **model_kwargs)
+        self.processor = AutoProcessor.from_pretrained(model_spec)
+        self.model = AutoModelForMultimodalLM.from_pretrained(
+            model_spec,
+            **model_kwargs,
+        )
+        self.model.eval()
         _apply_generation_safety(self.model)
 
     def unload_model(self, on_stage: Callable[[str], None] | None = None) -> None:
@@ -310,6 +310,7 @@ class LocalAsrBackend:
         except Exception:
             pass
         self.model = None
+        self.processor = None
         _clear_cuda_cache(self.device)
 
     def close(self) -> None:
@@ -369,22 +370,16 @@ class LocalAsrBackend:
             )
 
         _notify(on_stage, "ASR 文本转录中...")
-        transcribe_kwargs = {
-            "context": request_contexts,
-            "language": language_hint,
-            # Runtime timing comes from Boundary/speech-core chunk windows.
-            "return_time_stamps": False,
-        }
-
         asr_results = None
         executor = None
         timed_out = False
         try:
             executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
             future = executor.submit(
-                self.model.transcribe,
+                self._transcribe_native,
                 normalized_paths,
-                **transcribe_kwargs,
+                request_contexts,
+                language_hint,
             )
             try:
                 timeout_s = _transcription_timeout_s()
@@ -435,6 +430,55 @@ class LocalAsrBackend:
             _clear_cuda_cache(self.device)
         return payloads
 
+    def _transcribe_native(
+        self,
+        normalized_paths: list[str],
+        request_contexts: list[str],
+        language_hint: str | None,
+    ) -> list[NativeAsrTranscription]:
+        from asr.qwen_native import move_processor_inputs, prepare_transcription_inputs
+
+        if self.model is None or self.processor is None:
+            raise RuntimeError("ASR model is not loaded")
+
+        results: list[NativeAsrTranscription] = []
+        for start in range(0, len(normalized_paths), self.request_batch_size):
+            paths = normalized_paths[start : start + self.request_batch_size]
+            contexts = request_contexts[start : start + self.request_batch_size]
+            inputs = prepare_transcription_inputs(
+                self.processor,
+                audio=paths,
+                contexts=contexts,
+                language=language_hint,
+            )
+            moved = move_processor_inputs(
+                inputs,
+                device=self.device,
+                dtype=self.dtype,
+            )
+            generated_ids = self.model.generate(
+                **moved,
+                max_new_tokens=_asr_max_new_tokens(),
+                do_sample=False,
+            )
+            generated_suffix = generated_ids[:, moved["input_ids"].shape[1] :]
+            decoded = self.processor.batch_decode(
+                generated_suffix,
+                skip_special_tokens=True,
+                clean_up_tokenization_spaces=False,
+            )
+            parsed = self.processor.parse_output(decoded)
+            if isinstance(parsed, dict):
+                parsed = [parsed]
+            for item in parsed:
+                results.append(
+                    NativeAsrTranscription(
+                        language=str(item.get("language") or "").strip() or language_hint,
+                        text=str(item.get("transcription") or ""),
+                    )
+                )
+        return results
+
     def capture_asr_internals(self, chunks: list[dict], **_kwargs) -> list[dict]:
         """Capture ASR internals (encoder frames + token logits) in-process.
 
@@ -448,7 +492,10 @@ class LocalAsrBackend:
         try:
             from asr.asr_internals import AsrInternalsCapturer
 
-            capturer = AsrInternalsCapturer(wrapper=self.model)
+            capturer = AsrInternalsCapturer(
+                model=self.model,
+                processor=self.processor,
+            )
         except Exception:  # noqa: BLE001
             return [{"ok": False, "error": "capturer build failed"}] * len(chunks)
         out: list[dict] = []

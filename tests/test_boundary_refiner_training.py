@@ -117,12 +117,12 @@ def _write_v8_dataset(
         if include_ptm_repo_id:
             payload["metadata"] = {
                 "dataset_source": "scorer_v7_predicted_island_edges",
-                "ptm_repo_id": "jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame",
+                "ptm_repo_id": "jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame-hf",
                 "scorer_checkpoint": {
                     "schema": "speech_boundary_ja_mamba2_frame_boundary_scorer_v7",
                     "sha256": "unit-helper",
                     "metadata": {
-                        "ptm_repo_id": "jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame",
+                        "ptm_repo_id": "jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame-hf",
                     },
                 },
             }

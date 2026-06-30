@@ -66,16 +66,16 @@ def test_run_full_workflow_boundary_threshold_defaults_match_training_eval(monke
 
 
 def test_run_full_workflow_parse_args_uses_loaded_env(monkeypatch):
-    monkeypatch.setenv("ASR_BACKEND", "jaykwok/Qwen3-ASR-0.6B-JA-Anime-Galgame")
+    monkeypatch.setenv("ASR_BACKEND", "jaykwok/Qwen3-ASR-0.6B-JA-Anime-Galgame-hf")
     monkeypatch.setenv("ASR_MODEL_PATH", "")
     monkeypatch.setenv("ASR_BATCH_SIZE", "auto")
     monkeypatch.setenv(
         "ASR_BATCH_SIZE_BY_REPO",
-        "jaykwok/Qwen3-ASR-0.6B-JA-Anime-Galgame=64,"
-        "jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame=32",
+        "jaykwok/Qwen3-ASR-0.6B-JA-Anime-Galgame-hf=64,"
+        "jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame-hf=32",
     )
-    boundary_mapping = "jaykwok/Qwen3-ASR-0.6B-JA-Anime-Galgame=src/boundary/checkpoints/boundary_edge_refiner_v8_safe_tight.jaykwok-Qwen3-ASR-0.6B-JA-Anime-Galgame.pt"
-    scorer_mapping = "jaykwok/Qwen3-ASR-0.6B-JA-Anime-Galgame=agents/temp/scorer.pt"
+    boundary_mapping = "jaykwok/Qwen3-ASR-0.6B-JA-Anime-Galgame-hf=src/boundary/checkpoints/boundary_edge_refiner_v8_safe_tight.jaykwok-Qwen3-ASR-0.6B-JA-Anime-Galgame-hf.pt"
+    scorer_mapping = "jaykwok/Qwen3-ASR-0.6B-JA-Anime-Galgame-hf=agents/temp/scorer.pt"
     monkeypatch.setenv("BOUNDARY_REFINER_MODEL_PATH_BY_REPO", boundary_mapping)
     monkeypatch.setenv("CUEQC_MODEL_PATH_BY_REPO", "legacy=ignored")
     monkeypatch.setenv("CUEQC_SHADOW_ENABLED", "1")
@@ -97,7 +97,7 @@ def test_run_full_workflow_parse_args_uses_loaded_env(monkeypatch):
         ]
     )
 
-    assert args.asr_backend == "jaykwok/Qwen3-ASR-0.6B-JA-Anime-Galgame"
+    assert args.asr_backend == "jaykwok/Qwen3-ASR-0.6B-JA-Anime-Galgame-hf"
     assert args.asr_model_path == ""
     assert args.asr_batch_size == "auto"
     assert args.boundary_refiner_model_path_by_repo == boundary_mapping
@@ -114,13 +114,13 @@ def test_run_full_workflow_parse_args_uses_loaded_env(monkeypatch):
 
 def test_run_full_workflow_context_carries_boundary_env(monkeypatch, tmp_path):
     batch_table = (
-        "jaykwok/Qwen3-ASR-0.6B-JA-Anime-Galgame=32,"
-        "jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame=8"
+        "jaykwok/Qwen3-ASR-0.6B-JA-Anime-Galgame-hf=32,"
+        "jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame-hf=8"
     )
     monkeypatch.setenv("ASR_BATCH_SIZE", "auto")
     monkeypatch.setenv("ASR_BATCH_SIZE_BY_REPO", batch_table)
-    boundary_mapping = "jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame=src/boundary/checkpoints/boundary_edge_refiner_v8_safe_tight.jaykwok-Qwen3-ASR-1.7B-JA-Anime-Galgame.pt"
-    scorer_mapping = "jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame=agents/temp/scorer.pt"
+    boundary_mapping = "jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame-hf=src/boundary/checkpoints/boundary_edge_refiner_v8_safe_tight.jaykwok-Qwen3-ASR-1.7B-JA-Anime-Galgame-hf.pt"
+    scorer_mapping = "jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame-hf=agents/temp/scorer.pt"
     monkeypatch.setenv("BOUNDARY_REFINER_MODEL_PATH_BY_REPO", boundary_mapping)
     monkeypatch.setenv("CUEQC_MODEL_PATH_BY_REPO", "legacy=ignored")
     monkeypatch.setenv("CUEQC_SHADOW_ENABLED", "1")
@@ -186,8 +186,8 @@ def test_run_full_workflow_cli_batch_overrides_loaded_env(monkeypatch):
     monkeypatch.setenv("ASR_BATCH_SIZE", "auto")
     monkeypatch.setenv(
         "ASR_BATCH_SIZE_BY_REPO",
-        "jaykwok/Qwen3-ASR-0.6B-JA-Anime-Galgame=64,"
-        "jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame=32",
+        "jaykwok/Qwen3-ASR-0.6B-JA-Anime-Galgame-hf=64,"
+        "jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame-hf=32",
     )
     monkeypatch.delenv("CUEQC_SHADOW_ENABLED", raising=False)
     monkeypatch.delenv("CUEQC_MODEL_PATH_BY_REPO", raising=False)
@@ -198,7 +198,7 @@ def test_run_full_workflow_cli_batch_overrides_loaded_env(monkeypatch):
             "--video",
             "sample.mp4",
             "--asr-backend",
-            "jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame",
+            "jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame-hf",
             "--asr-batch-size",
             "12",
             "--speech-boundary-speech-on-threshold",
@@ -209,7 +209,7 @@ def test_run_full_workflow_cli_batch_overrides_loaded_env(monkeypatch):
     )
     run_full_workflow.configure_env(args)
 
-    assert run_full_workflow.os.environ["ASR_BACKEND"] == "jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame"
+    assert run_full_workflow.os.environ["ASR_BACKEND"] == "jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame-hf"
     assert run_full_workflow.os.environ["ASR_BATCH_SIZE"] == "12"
     assert not hasattr(args, "cueqc_shadow_enabled")
     assert not hasattr(args, "cueqc_model_path_by_repo")

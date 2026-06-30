@@ -36,7 +36,7 @@ DEFAULT_SETTINGS: dict[str, str] = {
 
     # --- ASR Model Settings ---
     # Transcription backend. Use the Hugging Face repo id as the stable key.
-    "ASR_BACKEND": "jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame",
+    "ASR_BACKEND": "jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame-hf",
     # Character cap for sliding ASR context prompt.
     "ASR_INITIAL_PROMPT_MAX_CHARS": "240",
     # Voice activity detection backend used before ASR chunking.
@@ -63,8 +63,8 @@ DEFAULT_SETTINGS: dict[str, str] = {
     # Defaults target low-config 0.6B fallback and 6GB-class 1.7B runs.
     "ASR_BATCH_SIZE": "auto",
     "ASR_BATCH_SIZE_BY_REPO": (
-        "jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame=32,"
-        "jaykwok/Qwen3-ASR-0.6B-JA-Anime-Galgame=64"
+        "jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame-hf=32,"
+        "jaykwok/Qwen3-ASR-0.6B-JA-Anime-Galgame-hf=64"
     ),
     # Max generated tokens configured when loading the Qwen ASR wrapper.
     "ASR_MAX_NEW_TOKENS": "128",

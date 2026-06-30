@@ -1,15 +1,15 @@
 """CueQC Mamba v4 binary ASR internals capture via teacher-forced forward.
 
 ``AsrInternalsCapturer`` extracts, for one ASR candidate, the two signal sources
-CueQC v4 binary needs values that the public ``qwen_asr.transcribe()`` API does not return:
+CueQC v4 binary needs values that the public transcription API does not return:
 
 * ``asr_frames``  — Qwen3-ASR encoder (audio-tower) hidden states for the chunk
 * token-level logprob / entropy / top1-top2 margin — via a single
   teacher-forced ``model(...)`` forward over ``prompt + generated_text_ids``
 
 Both training (offline) and runtime reuse this class so the feature pipeline is
-identical end-to-end. The capturer holds no model of its own when a wrapper is
-passed in — at runtime it reuses the already-loaded ``LocalAsrBackend.model``
+identical end-to-end. The capturer holds no model of its own when a model and
+processor are passed in — at runtime it reuses ``LocalAsrBackend.model``
 to avoid doubling VRAM.
 
 The teacher-forced logits reproduce the same positions ASR decoding produced
@@ -20,21 +20,9 @@ than a strict equivalence — re-evaluate then.
 from __future__ import annotations
 
 import os
-import sys
-import types
-from importlib.machinery import ModuleSpec
 from typing import Any
 
 import numpy as np
-
-# Torchcodec ships a broken DLL on this Windows env; stub it before torch loads
-# (mirrors cueqc_model.py / extract_features.py).
-if "torchcodec" not in sys.modules:
-    for _mod_name in ("torchcodec", "torchcodec.decoders"):
-        _stub = types.ModuleType(_mod_name)
-        _stub.__spec__ = ModuleSpec(_mod_name, loader=None)
-        _stub.__path__ = []
-        sys.modules[_mod_name] = _stub
 
 SAMPLE_RATE = 16000
 
@@ -42,8 +30,8 @@ SAMPLE_RATE = 16000
 def _qwen3_asr_audio_output_lengths(input_lengths):
     """Per-audio output frame length for the Qwen3-ASR audio tower.
 
-    Mirrors ``src/boundary/ja/features.py`` (originally from the qwen_asr
-    processor). Used to slice the flattened encoder hidden state back into
+    Mirrors ``src/boundary/ja/features.py``. Used to slice the flattened
+    encoder hidden state back into
     per-chunk sequences.
     """
     input_lengths_leave = input_lengths % 100
@@ -56,16 +44,17 @@ class AsrInternalsCapturer:
 
     Construct with either:
 
-    * ``wrapper=`` — a loaded ``qwen_asr.Qwen3ASRModel`` (runtime path, reuses
-      ``LocalAsrBackend.model`` to avoid a second model load).
-    * ``model_spec=`` — a repo id / local path to load its own wrapper (offline
+    * ``model=`` and ``processor=`` — loaded native Transformers objects
+      (runtime path, avoids a second model load).
+    * ``model_spec=`` — a repo id / local path to load its own model (offline
       feature extraction path).
     """
 
     def __init__(
         self,
         *,
-        wrapper: Any | None = None,
+        model: Any | None = None,
+        processor: Any | None = None,
         model_spec: str | None = None,
         device: str = "auto",
         dtype: str | None = None,
@@ -74,21 +63,19 @@ class AsrInternalsCapturer:
     ) -> None:
         import torch  # noqa: F401  (ensure import ordering)
 
-        if wrapper is None and model_spec is None:
-            raise ValueError("AsrInternalsCapturer requires wrapper= or model_spec=")
+        if model is None and model_spec is None:
+            raise ValueError("AsrInternalsCapturer requires model=/processor= or model_spec=")
 
-        if wrapper is None:
-            wrapper = self._load_wrapper(model_spec, device=device, dtype=dtype)
+        self.owns_model = model is None
+        if model is None:
+            model, processor = self._load_model(model_spec, device=device, dtype=dtype)
+        elif processor is None:
+            raise ValueError("processor= is required when model= is provided")
 
-        self.wrapper = wrapper
-        self.model = wrapper.model  # Qwen3ASRForConditionalGeneration (top-level: forward is a stub)
-        # The actual generative LM is the thinker; teacher-forced logits come
-        # from thinker.forward() (returns Qwen3ASRThinkerCausalLMOutputWithPast
-        # with .logits [B, T, vocab]). The top-level .forward() is unimplemented.
-        self.thinker = self.model.thinker
-        self.processor = wrapper.processor
-        self.device = getattr(wrapper, "device", None) or self._infer_device(self.model)
-        self.dtype = getattr(wrapper, "dtype", None) or self._infer_dtype(self.model)
+        self.model = model
+        self.processor = processor
+        self.device = self._infer_device(self.model)
+        self.dtype = self._infer_dtype(self.model)
 
         # Prompt configuration. Defaults follow LocalAsrBackend: language forced
         # to ASR_LANGUAGE (Japanese) and empty context unless overridden.
@@ -102,19 +89,20 @@ class AsrInternalsCapturer:
 
     # ------------------------------------------------------------------ setup
     @staticmethod
-    def _load_wrapper(model_spec: str, *, device: str, dtype: str | None):
-        from qwen_asr import Qwen3ASRModel
+    def _load_model(model_spec: str, *, device: str, dtype: str | None):
         import torch
+        from transformers import AutoModelForMultimodalLM, AutoProcessor
 
         if device == "auto":
             device = "cuda" if torch.cuda.is_available() else "cpu"
         model_kwargs: dict[str, Any] = {
             "dtype": AsrInternalsCapturer._resolve_dtype(dtype, device),
             "device_map": device,
-            "max_inference_batch_size": 1,
-            "max_new_tokens": 1,
         }
-        return Qwen3ASRModel.from_pretrained(model_spec, **model_kwargs)
+        processor = AutoProcessor.from_pretrained(model_spec)
+        model = AutoModelForMultimodalLM.from_pretrained(model_spec, **model_kwargs)
+        model.eval()
+        return model, processor
 
     @staticmethod
     def _resolve_dtype(dtype: str | None, device: str):
@@ -165,10 +153,12 @@ class AsrInternalsCapturer:
 
     # --------------------------------------------------------------- prompt
     def _build_prompt(self) -> str:
-        """Single-sourced prompt builder: reuse the wrapper's own method."""
-        return self.wrapper._build_text_prompt(
+        from asr.qwen_native import build_transcription_prompt
+
+        return build_transcription_prompt(
+            self.processor,
             context=self.context or "",
-            force_language=self.force_language,
+            language=self.force_language,
         )
 
     def _tokenize_generated(self, text: str) -> list[int]:
@@ -225,28 +215,25 @@ class AsrInternalsCapturer:
         attention_mask = torch.ones_like(full_input_ids)
 
         # Move audio inputs to model device/dtype.
-        feature_attention_mask = inputs["feature_attention_mask"].to(self.device)
+        input_features_mask = inputs["input_features_mask"].to(self.device)
         input_features = inputs["input_features"].to(device=self.device, dtype=self.dtype)
 
         with torch.inference_mode():
-            audio_features = self.thinker.get_audio_features(
+            audio_features = self.model.get_audio_features(
                 input_features=input_features,
-                feature_attention_mask=feature_attention_mask,
-            )  # [B, T_audio_raw, D_asr]; for batch=1 some versions return [T, D]
-            # Normalize to [B, T, D] then slice to the real (unpadded) length.
+                input_features_mask=input_features_mask,
+            ).pooler_output
             if audio_features.dim() == 2:
                 audio_features = audio_features.unsqueeze(0)
-            input_lengths = feature_attention_mask.sum(dim=1)
+            input_lengths = input_features_mask.sum(dim=1)
             out_len = int(_qwen3_asr_audio_output_lengths(input_lengths)[0].item())
             asr_frames = audio_features[0, :out_len].detach().float().cpu().numpy()
 
-            # Teacher-forced forward over prompt + generated ids, on the thinker
-            # (the top-level model.forward is an unimplemented stub).
-            outputs = self.thinker(
+            outputs = self.model(
                 input_ids=full_input_ids,
                 attention_mask=attention_mask,
                 input_features=input_features,
-                feature_attention_mask=feature_attention_mask,
+                input_features_mask=input_features_mask,
                 use_cache=False,
             )
             logits = outputs.logits  # [1, P+L, V]
@@ -292,11 +279,12 @@ class AsrInternalsCapturer:
         }
 
     def close(self) -> None:
-        """Release the wrapper only if this capturer owns it (offline path)."""
+        """Release model references owned by the offline path."""
         import torch
 
-        # Runtime path shares the wrapper with LocalAsrBackend; do not free it.
-        # Offline path loaded its own; let GC handle it. Empty CUDA cache.
+        if self.owns_model:
+            self.model = None
+            self.processor = None
         if self.device is not None and str(self.device).startswith("cuda"):
             torch.cuda.empty_cache()
 

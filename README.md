@@ -56,6 +56,7 @@ cd jav-trans
 uv venv
 uv pip install --upgrade pip
 uv pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu128
+uv pip install "transformers @ git+https://github.com/huggingface/transformers.git"
 uv pip install -r requirements.txt
 ```
 
@@ -166,8 +167,8 @@ Web 提交是否使用 CUDA 取决于后端服务进程是否能看到 GPU，而
 
 | 用途 | Repo id |
 | --- | --- |
-| 默认 ASR | `jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame` |
-| 低配置 ASR | `jaykwok/Qwen3-ASR-0.6B-JA-Anime-Galgame` |
+| 默认 ASR | `jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame-hf` |
+| 低配置 ASR | `jaykwok/Qwen3-ASR-0.6B-JA-Anime-Galgame-hf` |
 
 同一个 ASR repo id 也决定 SpeechBoundary-JA frozen feature 的来源，以及当前已训练的 SpeechBoundary-JA / Boundary Refiner checkpoint registry key。checkpoint 文件名只是人工可读 tag，真正归属以 metadata 中的 repo id / schema / feature hash 为准。Pre-ASR CueQC v10 尚未训练 promotion，默认 registry 为空；训练完成后再用 `PRE_ASR_CUEQC_MODEL_PATH_BY_REPO` 显式映射。
 
@@ -271,7 +272,7 @@ uv run --no-sync python tools/asr/cueqc/export_candidates.py `
 ## 字幕与文本策略
 
 - ASR 文本会做 Unicode NFKC、空白归一、换行折叠和展示安全处理。
-- `ASR_CONTEXT` 会传给 Qwen ASR 的 `context` 参数，用于演员名、系列名或领域词提示；它不作为字幕后处理删除规则。
+- `ASR_CONTEXT` 会写入 Qwen3-ASR 的 system prompt，用于演员名、系列名或领域词提示；它不作为字幕后处理删除规则。
 - 字幕时间轴来自 Boundary chunk；ASR 输出文本只负责显示，不驱动默认切分。
 - LLM 翻译前会先固定 cue plan，翻译不会重排时间轴。
 
@@ -336,19 +337,19 @@ model_param_device=cuda:*
 默认配置按 6GB 级显存目标设置：
 
 ```env
-ASR_BATCH_SIZE_BY_REPO=jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame=32,jaykwok/Qwen3-ASR-0.6B-JA-Anime-Galgame=64
+ASR_BATCH_SIZE_BY_REPO=jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame-hf=32,jaykwok/Qwen3-ASR-0.6B-JA-Anime-Galgame-hf=64
 ```
 
 8GB 本机可尝试：
 
 ```env
-ASR_BATCH_SIZE_BY_REPO=jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame=64,jaykwok/Qwen3-ASR-0.6B-JA-Anime-Galgame=128
+ASR_BATCH_SIZE_BY_REPO=jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame-hf=64,jaykwok/Qwen3-ASR-0.6B-JA-Anime-Galgame-hf=128
 ```
 
 如果仍然 OOM，优先降低：
 
 ```env
-ASR_BATCH_SIZE_BY_REPO=jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame=8,jaykwok/Qwen3-ASR-0.6B-JA-Anime-Galgame=24
+ASR_BATCH_SIZE_BY_REPO=jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame-hf=8,jaykwok/Qwen3-ASR-0.6B-JA-Anime-Galgame-hf=24
 ```
 
 ### 长任务怎么排查
@@ -421,7 +422,7 @@ uv run python -m tools.asr.convert_qwen3_asr_to_hf `
   --max-shard-size 2GB
 ```
 
-该工具只转换模型仓库格式，不改变训练权重语义。原生 Transformers 推理需要安装已支持 Qwen3-ASR 的 Transformers 版本；当前 qwen-asr wrapper 路径仍是项目默认 ASR runtime。
+该工具只转换模型仓库格式，不改变训练权重语义。项目 runtime 与 SFT 工具均使用支持 Qwen3-ASR 的原生 Transformers `-hf` 路径，不再依赖 `qwen-asr` 包。
 
 命令行完整工作流 smoke：
 

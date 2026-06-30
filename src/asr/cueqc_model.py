@@ -25,19 +25,6 @@ import torch.nn as nn
 def _install_mamba2_warning_filter() -> None:
     import warnings
 
-    # Torchcodec's DLL is broken on this Windows env; stub it so transformers'
-    # import_utils find_spec probe and torch.ops auto-load don't hard-fail.
-    if "torchcodec" not in __import__("sys").modules:
-        import sys
-        import types
-        from importlib.machinery import ModuleSpec
-
-        for _name in ("torchcodec", "torchcodec.decoders"):
-            _stub = types.ModuleType(_name)
-            _stub.__spec__ = ModuleSpec(_name, loader=None)
-            _stub.__path__ = []
-            sys.modules[_name] = _stub
-
     warnings.filterwarnings("ignore", message=".*Mamba2.*")
     warnings.filterwarnings("ignore", message=".*supports.*generation.*")
 
