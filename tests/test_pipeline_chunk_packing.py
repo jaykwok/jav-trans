@@ -361,6 +361,35 @@ def test_pipeline_exports_pre_asr_candidates_only_when_requested(monkeypatch, tm
     assert any("Pre-ASR CueQC: exported candidates" in entry for entry in log)
 
 
+def test_pipeline_export_candidates_append_disabled_only_overwrites_once(monkeypatch, tmp_path):
+    import asr.pipeline as asr
+
+    asr = importlib.reload(asr)
+    export_path = tmp_path / "pre_asr_candidates.jsonl"
+    monkeypatch.setenv("PRE_ASR_CUEQC_EXPORT_CANDIDATES_PATH", str(export_path))
+    monkeypatch.setenv("PRE_ASR_CUEQC_EXPORT_CANDIDATES_APPEND", "0")
+
+    first_log: list[str] = []
+    second_log: list[str] = []
+    asr._write_pre_asr_candidates_if_requested(
+        [{"sample_id": "first", "chunk_index": 0}],
+        log=first_log,
+    )
+    asr._write_pre_asr_candidates_if_requested(
+        [{"sample_id": "second", "chunk_index": 1}],
+        log=second_log,
+    )
+
+    rows = [
+        json.loads(line)
+        for line in export_path.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    assert [row["sample_id"] for row in rows] == ["first", "second"]
+    assert any("mode=w" in entry for entry in first_log)
+    assert any("mode=a" in entry for entry in second_log)
+
+
 def test_empty_allowed_boundary_does_not_fallback_to_full_audio(monkeypatch, tmp_path):
     asr = _reload_pipeline(monkeypatch, tmp_path)
     source = tmp_path / "source_empty_allowed.wav"
