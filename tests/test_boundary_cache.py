@@ -43,8 +43,8 @@ def _write_wav(path: Path, seconds: float = 2.0, sample_rate: int = 8000) -> Non
 
 
 def _set_boundary_refiner_mapping(monkeypatch, tmp_path: Path) -> None:
-    asr_backend = "jaykwok/Qwen3-ASR-0.6B-JA-Anime-Galgame"
-    checkpoint = tmp_path / "boundary_edge_refiner_v8_safe_tight.jaykwok-Qwen3-ASR-0.6B-JA-Anime-Galgame.pt"
+    asr_backend = "jaykwok/Qwen3-ASR-0.6B-JA-Anime-Galgame-hf"
+    checkpoint = tmp_path / "boundary_edge_refiner_v8_safe_tight.jaykwok-Qwen3-ASR-0.6B-JA-Anime-Galgame-hf.pt"
     checkpoint.write_bytes(b"v8")
     monkeypatch.setenv("ASR_BACKEND", asr_backend)
     monkeypatch.setenv(

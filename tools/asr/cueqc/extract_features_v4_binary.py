@@ -26,21 +26,11 @@ import json
 import os
 import re
 import sys
-import types
 from collections import OrderedDict
-from importlib.machinery import ModuleSpec
 from pathlib import Path
 from typing import Any
 
 import numpy as np
-
-# Torchcodec DLL stub (see cueqc_model.py for rationale).
-if "torchcodec" not in sys.modules:
-    for _mod_name in ("torchcodec", "torchcodec.decoders"):
-        _stub = types.ModuleType(_mod_name)
-        _stub.__spec__ = ModuleSpec(_mod_name, loader=None)
-        _stub.__path__ = []
-        sys.modules[_mod_name] = _stub
 
 # Blank HF_ENDPOINT breaks huggingface_hub; pop it so the default is used.
 if not (os.environ.get("HF_ENDPOINT") or "").strip():

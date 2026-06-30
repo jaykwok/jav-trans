@@ -110,11 +110,11 @@ def test_default_model_download_root_is_project_models():
     assert config.DEFAULT_SETTINGS["ASR_CHUNK_ROOT"] == "./tmp/chunks"
     assert "KEEP_TEMP_FILES" not in config.DEFAULT_SETTINGS
     assert config.DEFAULT_SETTINGS["ASR_CONTEXT"] == ""
-    assert config.DEFAULT_SETTINGS["ASR_BACKEND"] == "jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame"
+    assert config.DEFAULT_SETTINGS["ASR_BACKEND"] == "jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame-hf"
     assert config.DEFAULT_SETTINGS["ASR_MODEL_ID"] == ""
     assert config.DEFAULT_SETTINGS["ASR_BATCH_SIZE"] == "auto"
-    assert "Qwen3-ASR-0.6B-JA-Anime-Galgame=64" in config.DEFAULT_SETTINGS["ASR_BATCH_SIZE_BY_REPO"]
-    assert "Qwen3-ASR-1.7B-JA-Anime-Galgame=32" in config.DEFAULT_SETTINGS["ASR_BATCH_SIZE_BY_REPO"]
+    assert "Qwen3-ASR-0.6B-JA-Anime-Galgame-hf=64" in config.DEFAULT_SETTINGS["ASR_BATCH_SIZE_BY_REPO"]
+    assert "Qwen3-ASR-1.7B-JA-Anime-Galgame-hf=32" in config.DEFAULT_SETTINGS["ASR_BATCH_SIZE_BY_REPO"]
     assert "BOUNDARY_REFINER_MODEL_PATH_BY_REPO" not in config.DEFAULT_SETTINGS
     assert "CUEQC_MODEL_PATH_BY_REPO" not in config.DEFAULT_SETTINGS
     assert "SPEECH_BOUNDARY_JA_SCORER_CHECKPOINT_BY_REPO" in config.DEFAULT_SETTINGS

@@ -4,8 +4,8 @@ import { loadFormMemory, saveFormMemory, applyFormMemory } from './formMemory.js
 import { setActivePreset } from './presets.js';
 
 const _BACKEND_LABELS = {
-  'jaykwok/Qwen3-ASR-0.6B-JA-Anime-Galgame': 'Qwen3-ASR-0.6B-JA-Anime-Galgame（低配）',
-  'jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame': 'Qwen3-ASR-1.7B-JA-Anime-Galgame',
+  'jaykwok/Qwen3-ASR-0.6B-JA-Anime-Galgame-hf': 'Qwen3-ASR-0.6B-JA-Anime-Galgame-hf（低配）',
+  'jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame-hf': 'Qwen3-ASR-1.7B-JA-Anime-Galgame-hf',
 };
 const _SUBTITLE_MODE_LABELS = { zh: '中文字幕', bilingual: '中日双语' };
 

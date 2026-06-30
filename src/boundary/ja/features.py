@@ -129,7 +129,7 @@ def qwen3_asr_audio_output_lengths(input_lengths: Any) -> Any:
 class Qwen3AsrFeatureExtractor:
     def __init__(self, config: FeatureConfig) -> None:
         import torch
-        from qwen_asr import Qwen3ASRModel
+        from transformers import AutoModelForMultimodalLM, AutoProcessor
 
         self.config = config
         self.repo_id = qwen3_asr_repo_id(config.ptm)
@@ -150,14 +150,14 @@ class Qwen3AsrFeatureExtractor:
         model_kwargs: dict[str, Any] = {
             "dtype": self.torch_dtype,
             "device_map": str(self.device),
-            "max_inference_batch_size": 1,
-            "max_new_tokens": 1,
         }
         if config.attention and config.attention != "sdpa":
             model_kwargs["attn_implementation"] = config.attention
-        self.handle = Qwen3ASRModel.from_pretrained(self.model_path, **model_kwargs)
-        self.model = self.handle.model
-        self.processor = self.handle.processor
+        self.processor = AutoProcessor.from_pretrained(self.model_path)
+        self.model = AutoModelForMultimodalLM.from_pretrained(
+            self.model_path,
+            **model_kwargs,
+        )
         self.model.eval()
 
     def extract(self, audio: np.ndarray, *, sample_rate: int) -> np.ndarray:
@@ -170,12 +170,9 @@ class Qwen3AsrFeatureExtractor:
             return []
         if sample_rate != 16000:
             raise ValueError(f"Qwen3-ASR feature extraction expects 16kHz audio, got {sample_rate}")
-        prompt = self.handle._build_text_prompt(context="", force_language=self.config.language or None)
-        inputs = self.processor(
-            text=[prompt] * len(audios),
+        inputs = self.processor.apply_transcription_request(
             audio=[np.asarray(audio, dtype=np.float32) for audio in audios],
-            return_tensors="pt",
-            padding=True,
+            language=[self.config.language] * len(audios) if self.config.language else None,
         )
         moved = {}
         for key, value in inputs.items():
@@ -186,13 +183,13 @@ class Qwen3AsrFeatureExtractor:
                     moved[key] = value.to(device=self.device)
             else:
                 moved[key] = value
-        input_lengths = moved["feature_attention_mask"].sum(dim=1)
+        input_lengths = moved["input_features_mask"].sum(dim=1)
         output_lengths = qwen3_asr_audio_output_lengths(input_lengths).detach().cpu().tolist()
         with torch.inference_mode():
-            audio_features = self.model.thinker.get_audio_features(
+            audio_features = self.model.get_audio_features(
                 input_features=moved["input_features"],
-                feature_attention_mask=moved["feature_attention_mask"],
-            )
+                input_features_mask=moved["input_features_mask"],
+            ).pooler_output
             hidden = audio_features.detach().float().cpu().numpy()
         result: list[np.ndarray] = []
         offset = 0
@@ -207,7 +204,6 @@ class Qwen3AsrFeatureExtractor:
 
         self.model = None
         self.processor = None
-        self.handle = None
         if self.device.type == "cuda":
             torch.cuda.empty_cache()
 

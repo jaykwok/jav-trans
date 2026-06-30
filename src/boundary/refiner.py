@@ -22,7 +22,7 @@ LEARNED_REFINER_SCHEMA = "boundary_edge_refiner_v8_safe_tight"
 BOUNDARY_REFINER_MODEL_ARCH = "boundary_edge_refiner_v8_safe_tight"
 EDGE_SEQUENCE_RUNTIME_ADAPTER = "edge_sequence_v2"
 DEFAULT_REFINER_CHECKPOINT_PATH = Path(
-    "src/boundary/checkpoints/boundary_edge_refiner_v8_safe_tight.jaykwok-Qwen3-ASR-1.7B-JA-Anime-Galgame.pt"
+    "src/boundary/checkpoints/boundary_edge_refiner_v8_safe_tight.jaykwok-Qwen3-ASR-1.7B-JA-Anime-Galgame-hf.pt"
 )
 BOUNDARY_REFINER_OUTPUT_DIM = 4
 DEFAULT_BOUNDARY_DELTA_MAX_S = 0.5

@@ -25,7 +25,6 @@ def main() -> None:
                     "result_count": len(results),
                     "text": results[0].get("text") if results else "",
                     "request_batch_size": backend.request_batch_size,
-                    "align_batch_size": backend.align_batch_size,
                 },
                 ensure_ascii=False,
             )

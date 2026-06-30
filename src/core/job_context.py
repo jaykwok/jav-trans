@@ -5,7 +5,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 
-_DEFAULT_ASR_BACKEND = "jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame"
+_DEFAULT_ASR_BACKEND = "jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame-hf"
 _MAX_TRANSLATION_WORKERS = 64
 
 from core.config import DEFAULT_SETTINGS

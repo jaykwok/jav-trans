@@ -116,7 +116,6 @@ def run(args: argparse.Namespace) -> None:
     os.environ["ASR_DTYPE"] = args.dtype
     os.environ["ASR_ATTENTION"] = args.attention
     os.environ["ASR_BATCH_SIZE"] = str(args.batch_size)
-    os.environ["TRANSCRIPTION_MAX_NEW_TOKENS"] = str(args.max_new_tokens)
     os.environ["ASR_MAX_NEW_TOKENS"] = str(args.max_new_tokens)
     os.environ["TRANSCRIPTION_TIMEOUT_S"] = str(args.timeout_s)
     os.environ["ASR_LANGUAGE"] = args.language
@@ -207,7 +206,7 @@ def run(args: argparse.Namespace) -> None:
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Probe local Qwen3-ASR direct transcription on manifest audio/text.")
     parser.add_argument("--manifest", action="append", required=True)
-    parser.add_argument("--model-id", default="jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame")
+    parser.add_argument("--model-id", default="jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame-hf")
     parser.add_argument("--model-path", default="")
     parser.add_argument("--no-download", action="store_true")
     parser.add_argument("--device", default="cuda")

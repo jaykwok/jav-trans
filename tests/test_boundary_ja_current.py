@@ -456,7 +456,7 @@ def test_write_jsonl_and_bootstrap_backend_signature(tmp_path):
     cfg = SpeechBoundaryJaConfig()
 
     assert path.read_text(encoding="utf-8").strip()
-    assert DEFAULT_MODEL_PATH == "models/jaykwok-Qwen3-ASR-1.7B-JA-Anime-Galgame"
+    assert DEFAULT_MODEL_PATH == "models/jaykwok-Qwen3-ASR-1.7B-JA-Anime-Galgame-hf"
     assert DEFAULT_OPERATING_POINT == "qwen-mamba2-frame-boundary-scorer-v7"
     assert cfg.ptm == QWEN_ASR_REPO_ID
     assert cfg.threshold == 0.5

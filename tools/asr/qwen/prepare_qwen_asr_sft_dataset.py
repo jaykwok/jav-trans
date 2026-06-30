@@ -44,10 +44,6 @@ def normalized_text(value: Any) -> str:
     return " ".join(str(value or "").replace("\r", " ").replace("\n", " ").split()).strip()
 
 
-def qwen_asr_sft_text(*, transcript: str, language: str) -> str:
-    return f"language {language}<asr_text>{normalized_text(transcript)}"
-
-
 def source_slug(value: str) -> str:
     return "".join(ch if ch.isalnum() or ch in "._-" else "_" for ch in value).strip("_") or "source"
 
@@ -295,15 +291,18 @@ def process_rows(
         if not keep:
             skip_counts[reason] += 1
             continue
-        qwen_text = qwen_asr_sft_text(transcript=text, language=args.language)
         row_key = stable_row_key(source=plan.source_key, audio_id=audio_id, text=text)
-        sft_payload = {"audio": audio_path, "text": qwen_text}
+        sft_payload = {
+            "audio": audio_path,
+            "text": text,
+            "language": args.language,
+            "context": "",
+        }
         manifest_payload = {
             "row_key": row_key,
             "audio_id": audio_id,
             "audio": audio_path,
             "text": text,
-            "qwen_text": qwen_text,
             "language": args.language,
             "source": plan.dataset,
             "source_key": plan.source_key,
@@ -382,14 +381,17 @@ def append_hard_negatives(
         if not keep:
             skip_counts[reason] += 1
             continue
-        qwen_text = qwen_asr_sft_text(transcript="", language=args.language)
-        sft_payload = {"audio": audio_path, "text": qwen_text}
+        sft_payload = {
+            "audio": audio_path,
+            "text": "",
+            "language": args.language,
+            "context": "",
+        }
         manifest_payload = {
             "row_key": stable_row_key(source="hard-negative", audio_id=audio_id, text=""),
             "audio_id": audio_id,
             "audio": audio_path,
             "text": "",
-            "qwen_text": qwen_text,
             "language": args.language,
             "source": str(row.get("source") or "hard_negative"),
             "source_key": "hard-negative",
@@ -520,7 +522,7 @@ def run(args: argparse.Namespace) -> None:
         "hf_endpoint": args.hf_endpoint,
         "hf_audio_format": args.hf_audio_format,
         "metadata_dataset": args.metadata_dataset,
-        "qwen_text_format": "language <language><asr_text><transcript>",
+        "training_text_format": "raw transcript plus separate language/context fields",
     }
     summary_path = output_root / "qwen_sft_dataset_summary.json"
     summary_path.write_text(

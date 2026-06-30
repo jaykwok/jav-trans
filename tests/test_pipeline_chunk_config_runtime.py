@@ -14,7 +14,7 @@ def _reload_pipeline(monkeypatch):
 
 
 def test_chunk_config_reads_boundary_refiner_env_at_runtime(monkeypatch, tmp_path):
-    checkpoint = tmp_path / "boundary_edge_refiner_v8_safe_tight.jaykwok-Qwen3-ASR-0.6B-JA-Anime-Galgame.pt"
+    checkpoint = tmp_path / "boundary_edge_refiner_v8_safe_tight.jaykwok-Qwen3-ASR-0.6B-JA-Anime-Galgame-hf.pt"
     checkpoint.write_bytes(b"v8")
     monkeypatch.setenv(
         "BOUNDARY_REFINER_MODEL_PATH_BY_REPO",
@@ -34,7 +34,7 @@ def test_chunk_config_reads_boundary_refiner_env_at_runtime(monkeypatch, tmp_pat
 
 
 def test_chunk_config_reads_boundary_planner_env_at_runtime(monkeypatch, tmp_path):
-    checkpoint = tmp_path / "boundary_edge_refiner_v8_safe_tight.jaykwok-Qwen3-ASR-0.6B-JA-Anime-Galgame.pt"
+    checkpoint = tmp_path / "boundary_edge_refiner_v8_safe_tight.jaykwok-Qwen3-ASR-0.6B-JA-Anime-Galgame-hf.pt"
     checkpoint.write_bytes(b"v8")
     monkeypatch.setenv(
         "BOUNDARY_REFINER_MODEL_PATH_BY_REPO",
@@ -57,7 +57,7 @@ def test_chunk_config_reads_boundary_planner_env_at_runtime(monkeypatch, tmp_pat
 
 def test_chunk_config_rejects_boundary_refiner_repo_metadata_mismatch(monkeypatch, tmp_path):
     torch = pytest.importorskip("torch")
-    checkpoint = tmp_path / "boundary_edge_refiner_v8_safe_tight.jaykwok-Qwen3-ASR-0.6B-JA-Anime-Galgame.pt"
+    checkpoint = tmp_path / "boundary_edge_refiner_v8_safe_tight.jaykwok-Qwen3-ASR-0.6B-JA-Anime-Galgame-hf.pt"
     torch.save(
         {
             "metadata": {

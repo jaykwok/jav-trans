@@ -6,7 +6,7 @@ from pathlib import Path
 from tools.web.smoke.common import default_run_dir, http_json, write_json
 
 
-DEFAULT_ASR_BACKEND = "jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame"
+DEFAULT_ASR_BACKEND = "jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame-hf"
 
 
 def _parse_advanced(values: list[str]) -> dict[str, str]:

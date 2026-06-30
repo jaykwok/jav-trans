@@ -32,7 +32,7 @@ from boundary.ja.model import (
 from subtitles.options import BASE_FPS
 
 
-DEFAULT_PTM = "jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame"
+DEFAULT_PTM = "jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame-hf"
 DEFAULT_MODEL_PATH = qwen_asr_default_model_path(DEFAULT_PTM)
 DEFAULT_OPERATING_POINT = "qwen-mamba2-frame-boundary-scorer-v7"
 

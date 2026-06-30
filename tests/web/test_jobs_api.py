@@ -162,7 +162,7 @@ def _isolate_model_requirement_env(tmp_path, monkeypatch, *, boundary_no_downloa
         "ASR_MODEL_ID": "",
         "ASR_MODEL_PATH": "",
         "SPEECH_BOUNDARY_JA_PTM": config_routes.RECOMMENDED_ASR_BACKEND,
-        "SPEECH_BOUNDARY_JA_MODEL_PATH": "models/jaykwok-Qwen3-ASR-1.7B-JA-Anime-Galgame",
+        "SPEECH_BOUNDARY_JA_MODEL_PATH": "models/jaykwok-Qwen3-ASR-1.7B-JA-Anime-Galgame-hf",
         "SPEECH_BOUNDARY_JA_NO_DOWNLOAD": boundary_no_download,
     }
     for key, value in env_values.items():
@@ -179,7 +179,7 @@ async def _test_model_requirements_for_17b_include_boundary(tmp_path, monkeypatc
     ) as client:
         response = await client.get(
             "/api/model-requirements",
-            params={"asr_backend": "jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame"},
+            params={"asr_backend": "jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame-hf"},
         )
 
     assert response.status_code == 200
@@ -191,12 +191,12 @@ async def _test_model_requirements_for_17b_include_boundary(tmp_path, monkeypatc
         tuple(item["roles"]): item["repo_id"]
         for item in payload["required_models"]
     }
-    assert by_role[("asr", "boundary_feature")] == "jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame"
+    assert by_role[("asr", "boundary_feature")] == "jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame-hf"
 
 
 async def _test_model_requirements_dedupe_default_asr_and_boundary(tmp_path, monkeypatch):
     _isolate_model_requirement_env(tmp_path, monkeypatch)
-    local_model = tmp_path / "models" / "jaykwok-Qwen3-ASR-1.7B-JA-Anime-Galgame"
+    local_model = tmp_path / "models" / "jaykwok-Qwen3-ASR-1.7B-JA-Anime-Galgame-hf"
     local_model.mkdir(parents=True)
     (local_model / "config.json").write_text("{}", encoding="utf-8")
     (local_model / "model.safetensors").write_bytes(b"weights")
@@ -235,7 +235,7 @@ async def _test_model_requirements_marks_disabled_boundary_download(tmp_path, mo
     ) as client:
         response = await client.get(
             "/api/model-requirements",
-            params={"asr_backend": "jaykwok/Qwen3-ASR-0.6B-JA-Anime-Galgame"},
+            params={"asr_backend": "jaykwok/Qwen3-ASR-0.6B-JA-Anime-Galgame-hf"},
         )
 
     assert response.status_code == 200

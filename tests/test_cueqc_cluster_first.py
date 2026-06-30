@@ -804,10 +804,10 @@ def test_cueqc_torc_layer_preview_cli_writes_counts(tmp_path: Path):
 def test_cueqc_runtime_signature_is_v4_binary_shadow(monkeypatch, tmp_path: Path):
     checkpoint = tmp_path / "cueqc_mamba_v4_binary.pt"
     checkpoint.write_bytes(b"placeholder")
-    monkeypatch.setenv("ASR_BACKEND", "jaykwok/Qwen3-ASR-0.6B-JA-Anime-Galgame")
+    monkeypatch.setenv("ASR_BACKEND", "jaykwok/Qwen3-ASR-0.6B-JA-Anime-Galgame-hf")
     monkeypatch.setenv(
         "CUEQC_MODEL_PATH_BY_REPO",
-        f"jaykwok/Qwen3-ASR-0.6B-JA-Anime-Galgame={checkpoint}",
+        f"jaykwok/Qwen3-ASR-0.6B-JA-Anime-Galgame-hf={checkpoint}",
     )
     monkeypatch.setenv("CUEQC_SHADOW_ENABLED", "1")
 
