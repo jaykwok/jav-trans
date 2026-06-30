@@ -70,6 +70,20 @@ def test_pre_asr_cueqc_feature_schema_excludes_asr_text_fields():
         assert banned not in names
 
 
+def test_pre_asr_drop_threshold_env_rejects_invalid_value(monkeypatch):
+    monkeypatch.setenv("PRE_ASR_CUEQC_DROP_THRESHOLD", "0,95")
+
+    with pytest.raises(ValueError, match="PRE_ASR_CUEQC_DROP_THRESHOLD"):
+        pre_asr_cueqc._drop_threshold_from_env(0.95)
+
+
+def test_pre_asr_drop_threshold_env_rejects_out_of_range_value(monkeypatch):
+    monkeypatch.setenv("PRE_ASR_CUEQC_DROP_THRESHOLD", "1.5")
+
+    with pytest.raises(ValueError, match=r"\[0, 1\]"):
+        pre_asr_cueqc._drop_threshold_from_env(0.95)
+
+
 def test_pre_asr_cueqc_candidate_uses_numeric_chunk_features_only():
     spans = [
         {

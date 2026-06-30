@@ -84,10 +84,6 @@ def _subtitle_min_duration_s(options: SubtitleOptions) -> float:
     return max(float(options.min_duration), float(options.frame_min_duration_s))
 
 
-def _frames_to_seconds(frames: float, options: SubtitleOptions) -> float:
-    return max(0.0, float(frames)) * options.frame_duration_s
-
-
 def _resolve_subtitle_window(
     blocks: list[dict],
     idx: int,
@@ -804,7 +800,7 @@ def _normalize_subtitle_timeline(
         return normalized
 
     gap_s = _subtitle_gap_s(options)
-    min_abs_s = min(0.20, max(0.05, options.frame_min_duration_s))
+    min_abs_s = 0.20
     index = 0
     while index + 1 < len(normalized):
         current = normalized[index]

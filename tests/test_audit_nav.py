@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from datetime import datetime
 from pathlib import Path
 
 from tools.audits.audit_nav import (
@@ -189,3 +190,23 @@ def test_audit_index_uses_directory_timestamp_as_generated_time(tmp_path: Path):
 
     index = (audit_root / "index.html").read_text(encoding="utf-8")
     assert "生成：2026-06-29 20:00:00" in index
+
+
+def test_audit_index_converts_aware_summary_time_to_local_time(tmp_path: Path):
+    audit_root = tmp_path / "agents" / "audits"
+    index_html = _write_text(
+        audit_root / "aware-review" / "index.html",
+        "<!doctype html><title>review</title>",
+    )
+    (index_html.parent / "summary.json").write_text(
+        json.dumps({"title": "Aware", "generated_at": "2026-06-30T01:02:03Z"}),
+        encoding="utf-8",
+    )
+
+    write_audit_index(audit_root=audit_root, latest_html=index_html, latest_title="Aware")
+
+    expected = datetime.fromisoformat("2026-06-30T01:02:03+00:00").astimezone().strftime(
+        "%Y-%m-%d %H:%M:%S"
+    )
+    index = (audit_root / "index.html").read_text(encoding="utf-8")
+    assert f"生成：{expected}" in index

@@ -1104,11 +1104,28 @@ def runtime_signature() -> dict[str, Any]:
     }
 
 
+def _drop_threshold_from_env(default: float) -> float:
+    override = os.getenv("PRE_ASR_CUEQC_DROP_THRESHOLD", "").strip()
+    if not override:
+        return float(default)
+    try:
+        parsed = float(override)
+    except ValueError as exc:
+        raise ValueError(
+            "PRE_ASR_CUEQC_DROP_THRESHOLD must be a float in [0, 1], "
+            f"got {override!r}"
+        ) from exc
+    if not np.isfinite(parsed) or not 0.0 <= parsed <= 1.0:
+        raise ValueError(
+            "PRE_ASR_CUEQC_DROP_THRESHOLD must be a float in [0, 1], "
+            f"got {override!r}"
+        )
+    return parsed
+
+
 def load_active(*, expected_asr_repo_id: str | None = None) -> PreAsrCueQC:
     path = _checkpoint_path(expected_asr_repo_id)
     device = os.getenv("PRE_ASR_CUEQC_DEVICE", "auto").strip() or "auto"
     model = load_checkpoint(path, expected_asr_repo_id=expected_asr_repo_id, device=device)
-    override = os.getenv("PRE_ASR_CUEQC_DROP_THRESHOLD", "").strip()
-    if override:
-        model.drop_threshold = float(override)
+    model.drop_threshold = _drop_threshold_from_env(model.drop_threshold)
     return model
