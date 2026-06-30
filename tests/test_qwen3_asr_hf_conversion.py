@@ -37,6 +37,8 @@ def test_convert_qwen3_asr_non_hf_checkpoint_to_hf_layout(tmp_path: Path):
     save_file(
         {
             "thinker.audio_tower.weight": torch.arange(4, dtype=torch.float32).reshape(2, 2),
+            "thinker.audio_tower.proj1.weight": torch.ones(2, 2, dtype=torch.float32),
+            "thinker.audio_tower.proj2.bias": torch.ones(2, dtype=torch.float32),
             "thinker.model.embed_tokens.weight": torch.arange(6, dtype=torch.float32).reshape(3, 2),
         },
         source_dir / "model.safetensors",
@@ -58,8 +60,8 @@ def test_convert_qwen3_asr_non_hf_checkpoint_to_hf_layout(tmp_path: Path):
         max_shard_size_bytes=32,
     )
 
-    assert report["tensor_count"] == 2
-    assert report["key_rewrite"] == "thinker.* -> model.*"
+    assert report["tensor_count"] == 4
+    assert "thinker.model.* -> model.language_model.*" in report["key_rewrite"]
     assert (output_dir / "config.json").exists()
     assert (output_dir / "processor_config.json").exists()
 
@@ -69,7 +71,9 @@ def test_convert_qwen3_asr_non_hf_checkpoint_to_hf_layout(tmp_path: Path):
 
     assert set(tensors) == {
         "model.audio_tower.weight",
-        "model.model.embed_tokens.weight",
+        "model.multi_modal_projector.linear_1.weight",
+        "model.multi_modal_projector.linear_2.bias",
+        "model.language_model.embed_tokens.weight",
     }
     assert torch.equal(
         tensors["model.audio_tower.weight"],

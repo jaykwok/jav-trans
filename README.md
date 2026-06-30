@@ -407,7 +407,7 @@ uv run python -m <module> --help
 - `tools.audits.audit_nav`、`tools.audits.serve_static`、`tools.audits.serve_audits.ps1`、`tools.audits.serve_audits.sh`：维护和启动本地审计导航页。
 - `tools.audits.generate_cueqc_cluster_audit_html`：生成音频审计页，支持 chunk/context 播放、筛选排序和字幕对照。
 - `tools.audits.generate_cueqc_cluster_broadcast_html`：生成独立簇级 keep/drop 广播标注页；混簇/跳过只记录 abstain。
-- `tools.asr.convert_qwen3_asr_to_hf`：把基于非 `-hf` Qwen3-ASR fine-tune 的 `thinker.*` safetensors 权重迁移到 Transformers-native `-hf` layout（`model.*` key + `Qwen/Qwen3-ASR-*-hf` 模板文件）。
+- `tools.asr.convert_qwen3_asr_to_hf`：把基于非 `-hf` Qwen3-ASR fine-tune 的 safetensors 权重迁移到 Transformers-native `-hf` layout（`thinker.audio_tower.* -> model.audio_tower.*`、`thinker.audio_tower.proj{1,2}.* -> model.multi_modal_projector.linear_{1,2}.*`、`thinker.model.* -> model.language_model.*`，并复用 `Qwen/Qwen3-ASR-*-hf` 模板文件）。
 - `tools.asr.cueqc.export_pre_asr_v10_audit_candidates`：从 current workflow `.timings.json` 导出 Pre-ASR CueQC v10 审计候选。
 
 Qwen3-ASR `-hf` 转换示例：
