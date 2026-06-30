@@ -52,6 +52,7 @@ _ASR_CHUNK_ROOT = _chunking_module._ASR_CHUNK_ROOT
 _KEEP_ASR_CHUNKS = _chunking_module._KEEP_ASR_CHUNKS
 _LAST_BOUNDARY_SIGNATURE: dict = _chunking_module._LAST_BOUNDARY_SIGNATURE
 _LAST_BOUNDARY_CACHE_EVENT: dict | None = None
+# APPEND=0 overwrites once per export path in this process; later same-path writes append for multi-video workflows.
 _PRE_ASR_EXPORT_OVERWRITTEN_PATHS: set[str] = set()
 _ASR_SLIDING_CONTEXT_SEGS = _transcribe_module._ASR_SLIDING_CONTEXT_SEGS
 _ASR_CHECKPOINT_ENABLED = _transcribe_module._ASR_CHECKPOINT_ENABLED
