@@ -271,7 +271,7 @@ uv run --no-sync python tools/asr/cueqc/export_candidates.py `
 ## 字幕与文本策略
 
 - ASR 文本会做 Unicode NFKC、空白归一、换行折叠和展示安全处理。
-- `ASR_CONTEXT` / `ASR_HEAD_CONTEXT` 只作为 Qwen ASR 提示词，不作为字幕后处理删除规则。
+- `ASR_CONTEXT` 会传给 Qwen ASR 的 `context` 参数，用于演员名、系列名或领域词提示；它不作为字幕后处理删除规则。
 - 字幕时间轴来自 Boundary chunk；ASR 输出文本只负责显示，不驱动默认切分。
 - LLM 翻译前会先固定 cue plan，翻译不会重排时间轴。
 

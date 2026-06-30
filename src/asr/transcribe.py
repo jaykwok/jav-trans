@@ -41,7 +41,6 @@ def _emit_progress(on_stage: Callable[[str], None] | None, message: str) -> None
 _ASR_CONTEXT_RESET_GAP_S = float(os.getenv("ASR_CONTEXT_RESET_GAP_S", "0.5"))
 _ASR_SLIDING_CONTEXT_SEGS = max(0, int(os.getenv("ASR_SLIDING_CONTEXT_SEGS", "2")))
 _ASR_INITIAL_PROMPT_MAX_CHARS = int(os.getenv("ASR_INITIAL_PROMPT_MAX_CHARS", "240"))
-_ASR_HEAD_CONTEXT_MAX_START_S = float(os.getenv("ASR_HEAD_CONTEXT_MAX_START_S", "16"))
 _ASR_INVALID_SEGMENT_DURATION_S = float(
     os.getenv("ASR_INVALID_SEGMENT_DURATION", "0.1")
 )
@@ -74,8 +73,6 @@ def _asr_context() -> str:
     return os.getenv("ASR_CONTEXT", "").strip()
 
 
-def _asr_head_context() -> str:
-    return os.getenv("ASR_HEAD_CONTEXT", "").strip()
 _FRAGMENT_CONTINUATION_START_RE = re.compile(
     r"^(?:ます|ました|ません|です|でした|でしょう|ながら|ので|けど|から|たり|"
     r"程度|ところ|いる|いき|して|され|なり|効果|で[、,]?|に|を|が|は|も)"
@@ -781,19 +778,8 @@ def _build_transcript_chunks(
 
 
 def _build_ASR_CONTEXT_for_chunk(chunk: dict) -> str:
-    parts: list[str] = []
-    chunk_start = float(chunk.get("start", 0.0))
-    head_context = _asr_head_context()
     context = _asr_context()
-    try:
-        head_context_max_start_s = float(os.getenv("ASR_HEAD_CONTEXT_MAX_START_S", "16"))
-    except (TypeError, ValueError):
-        head_context_max_start_s = _ASR_HEAD_CONTEXT_MAX_START_S
-    if head_context and chunk_start <= head_context_max_start_s:
-        parts.append(head_context)
-    if context:
-        parts.append(context)
-    return "\n".join(part for part in parts if part)
+    return context
 
 
 def _backend_accepts_initial_prompts(backend: BaseAsrBackend) -> bool:

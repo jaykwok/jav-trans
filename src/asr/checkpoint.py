@@ -120,7 +120,7 @@ def _get_asr_runtime_signature(
             sliding_context_segs = 2
     boundary_signature = _LAST_BOUNDARY_SIGNATURE if last_boundary_signature is None else last_boundary_signature
     return {
-        "version": 4,
+        "version": 5,
         "backend": current_asr_backend(),
         "worker_mode": current_asr_worker_mode(),
         "timestamp": {
@@ -139,11 +139,6 @@ def _get_asr_runtime_signature(
         },
         "context": {
             "asr_context": _env_text("ASR_CONTEXT", ""),
-            "asr_head_context": _env_text("ASR_HEAD_CONTEXT", ""),
-            "asr_head_context_max_start_s": _env_text(
-                "ASR_HEAD_CONTEXT_MAX_START_S",
-                "16",
-            ),
             "sliding_context_segs": sliding_context_segs,
         },
         "generation": {
