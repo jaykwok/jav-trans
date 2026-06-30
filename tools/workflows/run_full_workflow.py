@@ -521,7 +521,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=None,
         help=(
             "Override Boundary feature/score grid hop in seconds. This is not video FPS; "
-            "subtitle frame timing is derived from each source video's real FPS."
+            "subtitle frame timing uses a fixed 24000/1001 base, independent of source FPS."
         ),
     )
     parser.add_argument(

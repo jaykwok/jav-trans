@@ -5,6 +5,8 @@ from dataclasses import dataclass
 from dataclasses import asdict
 
 
+# Fixed display-time baseline for frame-derived subtitle constraints.
+# This is not the source video FPS.
 BASE_FPS = 24000 / 1001
 
 
@@ -43,14 +45,17 @@ class SubtitleOptions:
 
     @property
     def frame_duration_s(self) -> float:
+        """Fixed 24000/1001 baseline frame duration used for display timing."""
         return 1.0 / BASE_FPS
 
     @property
     def frame_gap_s(self) -> float:
+        """Two baseline frames of display gap, independent of source FPS."""
         return 2.0 * self.frame_duration_s
 
     @property
     def frame_min_duration_s(self) -> float:
+        """Twenty baseline frames of minimum reading time, independent of source FPS."""
         return 20.0 * self.frame_duration_s
 
     @classmethod

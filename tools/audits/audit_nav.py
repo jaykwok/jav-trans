@@ -112,6 +112,8 @@ def _entry_title(index_path: Path, summary: Mapping[str, Any]) -> str:
 
 
 def _format_datetime(value: datetime) -> str:
+    if value.tzinfo is not None and value.utcoffset() is not None:
+        value = value.astimezone()
     return value.strftime("%Y-%m-%d %H:%M:%S")
 
 
