@@ -24,10 +24,6 @@ def _package_dir(name: str) -> Path:
     return Path(next(iter(spec.submodule_search_locations))).resolve()
 
 
-NAGISA_PACKAGE_DIR = _package_dir("nagisa")
-QWEN_ASR_PACKAGE_DIR = _package_dir("qwen_asr")
-
-
 def _require_path(path: str | Path, label: str) -> Path:
     candidate = Path(path).expanduser()
     if not candidate.is_absolute():
@@ -130,7 +126,6 @@ def _ffmpeg_binaries() -> list[tuple[str, str]]:
 
 datas = collect_data_files("webview", include_py_files=False)
 datas += copy_metadata("torchcodec")
-datas += copy_metadata("nagisa")
 datas += [
     (str(_require_path("src/web/static", "web static assets")), "src/web/static"),
     (str(_require_path("src/assets", "application assets")), "src/assets"),
@@ -142,25 +137,17 @@ datas += [
         str(_require_path("src/boundary/ja/checkpoints", "SpeechBoundary-JA scorer checkpoints")),
         "src/boundary/ja/checkpoints",
     ),
-    (
-        str(NAGISA_PACKAGE_DIR / "data"),
-        "nagisa/data",
-    ),
-    (
-        str(QWEN_ASR_PACKAGE_DIR / "inference" / "assets"),
-        "qwen_asr/inference/assets",
-    ),
 ]
 
 if not _env_bool("JAVTRANS_SKIP_MODELS"):
     datas += _collect_inference_model_dir(
-        "models/jaykwok-Qwen3-ASR-1.7B-JA-Anime-Galgame",
-        "models/jaykwok-Qwen3-ASR-1.7B-JA-Anime-Galgame",
+        "models/jaykwok-Qwen3-ASR-1.7B-JA-Anime-Galgame-hf",
+        "models/jaykwok-Qwen3-ASR-1.7B-JA-Anime-Galgame-hf",
         "bundled default 1.7B ASR / SpeechBoundary model",
     )
     datas += _collect_inference_model_dir(
-        "models/jaykwok-Qwen3-ASR-0.6B-JA-Anime-Galgame",
-        "models/jaykwok-Qwen3-ASR-0.6B-JA-Anime-Galgame",
+        "models/jaykwok-Qwen3-ASR-0.6B-JA-Anime-Galgame-hf",
+        "models/jaykwok-Qwen3-ASR-0.6B-JA-Anime-Galgame-hf",
         "bundled low-config 0.6B ASR / SpeechBoundary model",
     )
 
@@ -181,13 +168,6 @@ hiddenimports = [
     "httpx",
     "huggingface_hub",
     "openai",
-    "qwen_asr",
-    "mecab_system_eval",
-    "model",
-    "nagisa",
-    "nagisa_utils",
-    "prepro",
-    "tagger",
     "librosa",
     "soundfile",
     "scipy",
@@ -201,16 +181,15 @@ hiddenimports += collect_submodules(
     filter=lambda name: not name.startswith("webview.platforms.android"),
 )
 hiddenimports += collect_submodules("transformers.generation")
-hiddenimports += collect_submodules("nagisa")
-hiddenimports += collect_submodules("qwen_asr")
 hiddenimports += collect_submodules("torchcodec")
 hiddenimports += collect_submodules("transformers.models.mamba2")
 hiddenimports += collect_submodules("transformers.models.qwen2")
 hiddenimports += collect_submodules("transformers.models.qwen3")
+hiddenimports += collect_submodules("transformers.models.qwen3_asr")
 
 a = Analysis(
     [str(ROOT / "launcher.py")],
-    pathex=[str(ROOT / "src"), str(NAGISA_PACKAGE_DIR)],
+    pathex=[str(ROOT / "src")],
     binaries=binaries,
     datas=datas,
     hiddenimports=hiddenimports,

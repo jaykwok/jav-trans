@@ -1,4 +1,3 @@
-import inspect
 import logging
 import os
 import re
@@ -38,9 +37,6 @@ def _emit_progress(on_stage: Callable[[str], None] | None, message: str) -> None
         on_stage(message)
     print(message, flush=True)
 
-_ASR_CONTEXT_RESET_GAP_S = float(os.getenv("ASR_CONTEXT_RESET_GAP_S", "0.5"))
-_ASR_SLIDING_CONTEXT_SEGS = max(0, int(os.getenv("ASR_SLIDING_CONTEXT_SEGS", "2")))
-_ASR_INITIAL_PROMPT_MAX_CHARS = int(os.getenv("ASR_INITIAL_PROMPT_MAX_CHARS", "240"))
 _ASR_INVALID_SEGMENT_DURATION_S = float(
     os.getenv("ASR_INVALID_SEGMENT_DURATION", "0.1")
 )
@@ -66,17 +62,10 @@ _TRIVIAL_SEGMENT = re.compile(
     r"^[。！？…、\s,.!?・「」（）【】；：\-—–]+$"
 )
 _STRIP_PUNCT_RE = re.compile(r"[。！？…、,.!?・「」『』（）()【】\[\]\s~〜ー-]+")
-_SENTENCE_TERMINAL_RE = re.compile(r"[。！？!?…」』）)\]]$")
 
 
 def _asr_context() -> str:
     return os.getenv("ASR_CONTEXT", "").strip()
-
-
-_FRAGMENT_CONTINUATION_START_RE = re.compile(
-    r"^(?:ます|ました|ません|です|でした|でしょう|ながら|ので|けど|から|たり|"
-    r"程度|ところ|いる|いき|して|され|なり|効果|で[、,]?|に|を|が|は|も)"
-)
 
 
 def _current_asr_worker_mode() -> str:
@@ -240,8 +229,6 @@ def _transcribe_asr_chunks_text_only(
         return [], {"text_transcribe_s": 0.0}
 
     request_batch_size = max(1, int(getattr(backend, "request_batch_size", 1)))
-    supports_initial_prompts = _backend_accepts_initial_prompts(backend)
-    chunk_positions = {int(chunk["index"]): position for position, chunk in enumerate(chunks)}
     checkpoint_source = _get_asr_checkpoint_source(chunks, text_stage_label)
     checkpoint_path = _get_asr_checkpoint_path(checkpoint_source)
     run_id = uuid.uuid4().hex[:8]
@@ -348,16 +335,6 @@ def _transcribe_asr_chunks_text_only(
             "contexts": batch_contexts,
             "on_stage": on_stage,
         }
-        if supports_initial_prompts:
-            kwargs["initial_prompts"] = [
-                _build_initial_prompt_for_chunk(
-                    chunk,
-                    chunks,
-                    text_results_by_index,
-                    chunk_positions,
-                )
-                for chunk in batch_chunks
-            ]
         return backend.transcribe_texts(audio_paths, **kwargs)
 
     try:
@@ -780,89 +757,6 @@ def _build_transcript_chunks(
 def _build_ASR_CONTEXT_for_chunk(chunk: dict) -> str:
     context = _asr_context()
     return context
-
-
-def _backend_accepts_initial_prompts(backend: BaseAsrBackend) -> bool:
-    try:
-        return "initial_prompts" in inspect.signature(backend.transcribe_texts).parameters
-    except (TypeError, ValueError):
-        return False
-
-
-def _should_reset_sliding_context(previous: dict, current: dict) -> bool:
-    gap = float(current.get("start", 0.0)) - float(previous.get("end", 0.0))
-    return gap > _ASR_CONTEXT_RESET_GAP_S
-
-
-def _sliding_context_result_text(text_result: dict) -> str:
-    text = _clean_segment_text(str(text_result.get("text", "") or ""))
-    if not text:
-        return ""
-    if _is_low_value_text(text):
-        return ""
-    return text
-
-
-def _truncate_initial_prompt(prompt: str) -> str:
-    try:
-        max_chars = int(
-            os.getenv(
-                "ASR_INITIAL_PROMPT_MAX_CHARS",
-                str(_ASR_INITIAL_PROMPT_MAX_CHARS),
-            )
-        )
-    except (TypeError, ValueError):
-        max_chars = _ASR_INITIAL_PROMPT_MAX_CHARS
-    if max_chars <= 0:
-        return ""
-    if len(prompt) <= max_chars:
-        return prompt
-
-    cut_pos = len(prompt) - max_chars
-    truncated = prompt[cut_pos:]
-    # only advance to next word boundary when we cut mid-word
-    if cut_pos > 0 and not prompt[cut_pos - 1].isspace():
-        first_space = truncated.find(" ")
-        if first_space > 0 and first_space + 1 < len(truncated):
-            truncated = truncated[first_space + 1 :]
-    return truncated
-
-
-def _build_initial_prompt_for_chunk(
-    chunk: dict,
-    chunks: list[dict],
-    text_results_by_index: dict[int, dict],
-    chunk_positions: dict[int, int],
-) -> str | None:
-    if _ASR_SLIDING_CONTEXT_SEGS <= 0:
-        return None
-
-    chunk_index = int(chunk.get("index", 0))
-    position = chunk_positions.get(chunk_index)
-    if position is None or position <= 0:
-        return None
-
-    prompt_parts: list[str] = []
-    cursor = position - 1
-    while cursor >= 0 and len(prompt_parts) < _ASR_SLIDING_CONTEXT_SEGS:
-        previous_chunk = chunks[cursor]
-        next_chunk = chunks[cursor + 1]
-        if _should_reset_sliding_context(previous_chunk, next_chunk):
-            break
-
-        previous_index = int(previous_chunk.get("index", 0))
-        previous_result = text_results_by_index.get(previous_index)
-        if previous_result is None:
-            break
-
-        previous_text = _sliding_context_result_text(previous_result)
-        if previous_text:
-            prompt_parts.append(previous_text)
-        cursor -= 1
-
-    if not prompt_parts:
-        return None
-    return _truncate_initial_prompt("\n".join(reversed(prompt_parts)))
 
 
 def _postprocess_segments(segments: list[dict]) -> list[dict]:

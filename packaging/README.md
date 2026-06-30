@@ -17,8 +17,8 @@ It bundles:
 - repo-id tagged Boundary Refiner v8 checkpoints at `src/boundary/checkpoints/boundary_edge_refiner_v8_safe_tight.<repo-tag>.pt`
 - repo-id tagged SpeechBoundary-JA scorer v7 checkpoints at `src/boundary/ja/checkpoints/speech_boundary_ja_frame_boundary_scorer_v7.<repo-tag>.pt`
 - the bundled Hugging Face inference model directories:
-  - `jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame`
-  - `jaykwok/Qwen3-ASR-0.6B-JA-Anime-Galgame`
+  - `jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame-hf`
+  - `jaykwok/Qwen3-ASR-0.6B-JA-Anime-Galgame-hf`
 
 The build script prepares those two Hugging Face models before running
 PyInstaller. Training-only files such as `optimizer.pt`, scheduler state,

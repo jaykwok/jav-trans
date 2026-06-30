@@ -49,7 +49,6 @@ def load_audio_16k(path: str) -> np.ndarray:
 class Qwen3AsrNativeCollator:
     def __init__(self, processor: Any) -> None:
         self.processor = processor
-        self.asr_text_token_id = processor.tokenizer.convert_tokens_to_ids("<asr_text>")
         self.masked_token_ids = {
             processor.tokenizer.pad_token_id,
             processor.audio_token_id,
@@ -77,12 +76,15 @@ class Qwen3AsrNativeCollator:
             return_tensors="pt",
             padding=True,
         )
+        prompt_inputs = self.processor.tokenizer(
+            prompts,
+            add_special_tokens=False,
+            return_tensors="pt",
+            padding=True,
+        )
         labels = inputs["input_ids"].clone()
-        for row_index, token_ids in enumerate(inputs["input_ids"]):
-            marker_positions = (token_ids == self.asr_text_token_id).nonzero()
-            if marker_positions.numel() == 0:
-                raise ValueError("training prompt is missing <asr_text>")
-            response_start = int(marker_positions[-1].item()) + 1
+        for row_index in range(labels.shape[0]):
+            response_start = int(prompt_inputs["attention_mask"][row_index].sum().item())
             labels[row_index, :response_start] = -100
         labels[inputs["attention_mask"] == 0] = -100
         for token_id in self.masked_token_ids:

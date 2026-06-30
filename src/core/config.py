@@ -37,8 +37,6 @@ DEFAULT_SETTINGS: dict[str, str] = {
     # --- ASR Model Settings ---
     # Transcription backend. Use the Hugging Face repo id as the stable key.
     "ASR_BACKEND": "jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame-hf",
-    # Character cap for sliding ASR context prompt.
-    "ASR_INITIAL_PROMPT_MAX_CHARS": "240",
     # Voice activity detection backend used before ASR chunking.
     "ASR_BOUNDARY_BACKEND": "speech_boundary_ja",
     # Optional explicit HuggingFace model id override. Empty auto-selects by ASR_BACKEND.
@@ -74,8 +72,6 @@ DEFAULT_SETTINGS: dict[str, str] = {
     "ASR_REPETITION_PENALTY": "1.05",
 
     # --- Boundary Refiner / ASR Chunking ---
-    # Reset sliding ASR text context when adjacent chunks are separated by this gap.
-    "ASR_CONTEXT_RESET_GAP_S": "0.5",
     # Boundary Refiner is the current pre-ASR chunk planning path.
     # This is a feature-score grid fallback, not the source video frame rate.
     "BOUNDARY_FEATURE_FRAME_HOP_S": "0.02",

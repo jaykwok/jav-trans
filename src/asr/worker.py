@@ -43,10 +43,9 @@ class _MockAsrBackend:
         self,
         audio_paths,
         contexts=None,
-        initial_prompts=None,
         on_stage=None,
     ):
-        del initial_prompts, on_stage
+        del on_stage
         contexts = contexts or [""] * len(audio_paths)
         return [
             {
@@ -269,4 +268,3 @@ def _handle_capture_internals(parent_conn, msg, backend, capturer_cache: list):
 
 if __name__ == "__main__":
     raise SystemExit("asr_worker.main is intended to run under multiprocessing spawn.")
-

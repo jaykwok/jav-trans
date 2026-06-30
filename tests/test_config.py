@@ -164,6 +164,33 @@ def test_asr_chunk_min_duration_removed_from_active_config_surface():
     assert "ASR_CHUNK_MIN_DURATION_S" not in config.DEFAULT_SETTINGS
 
 
+def test_asr_sliding_text_context_removed_from_active_config_surface():
+    active_files = (
+        "src/asr/transcribe.py",
+        "src/asr/local_backend.py",
+        "src/asr/backends/base.py",
+        "src/asr/checkpoint.py",
+        "src/asr/pipeline.py",
+        "src/core/config.py",
+        "src/main.py",
+        ".env.example",
+        "README.md",
+    )
+    removed_terms = (
+        "ASR_SLIDING_CONTEXT_SEGS",
+        "ASR_CONTEXT_RESET_GAP_S",
+        "ASR_INITIAL_PROMPT_MAX_CHARS",
+        "initial_prompts",
+        "_build_initial_prompt_for_chunk",
+    )
+    for relative_path in active_files:
+        text = (ROOT / relative_path).read_text(encoding="utf-8")
+        for term in removed_terms:
+            assert term not in text
+    for term in removed_terms[:3]:
+        assert term not in config.DEFAULT_SETTINGS
+
+
 def test_subtitle_max_duration_clamp_removed_from_active_config_surface():
     active_files = (
         "src/core/config.py",

@@ -34,21 +34,6 @@ def test_checkpoint_key_changes_between_qwen_repo_backends(monkeypatch):
     assert default_key != large_key
 
 
-def test_checkpoint_key_changes_with_prompt_char_cap(monkeypatch):
-    default_key = _checkpoint_name(
-        monkeypatch,
-        asr_backend=ASR_06B_BACKEND,
-    )
-
-    monkeypatch.setenv("ASR_INITIAL_PROMPT_MAX_CHARS", "160")
-    tuned_key = _checkpoint_name(
-        monkeypatch,
-        asr_backend=ASR_06B_BACKEND,
-    )
-
-    assert default_key != tuned_key
-
-
 def test_checkpoint_key_changes_with_asr_model_id_override(monkeypatch):
     default_key = _checkpoint_name(
         monkeypatch,

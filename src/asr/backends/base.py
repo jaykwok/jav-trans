@@ -19,7 +19,6 @@ class BaseAsrBackend(Protocol):
         self,
         audio_paths: list[str],
         contexts: list[str] | None = None,
-        initial_prompts: list[str | None] | None = None,
         on_stage: Callable[[str], None] | None = None,
     ) -> list[dict[str, Any]]: ...
 

@@ -272,7 +272,7 @@ uv run --no-sync python tools/asr/cueqc/export_candidates.py `
 ## 字幕与文本策略
 
 - ASR 文本会做 Unicode NFKC、空白归一、换行折叠和展示安全处理。
-- `ASR_CONTEXT` 会写入 Qwen3-ASR 的 system prompt，用于演员名、系列名或领域词提示；它不作为字幕后处理删除规则。
+- `ASR_CONTEXT` 会作为 Qwen3-ASR system prompt 中的弱文本提示，用于演员名、系列名或领域词；它不是 hotword / 强制词表 API，也不作为字幕后处理删除规则。
 - 字幕时间轴来自 Boundary chunk；ASR 输出文本只负责显示，不驱动默认切分。
 - LLM 翻译前会先固定 cue plan，翻译不会重排时间轴。
 
@@ -408,7 +408,7 @@ uv run python -m <module> --help
 - `tools.audits.audit_nav`、`tools.audits.serve_static`、`tools.audits.serve_audits.ps1`、`tools.audits.serve_audits.sh`：维护和启动本地审计导航页。
 - `tools.audits.generate_cueqc_cluster_audit_html`：生成音频审计页，支持 chunk/context 播放、筛选排序和字幕对照。
 - `tools.audits.generate_cueqc_cluster_broadcast_html`：生成独立簇级 keep/drop 广播标注页；混簇/跳过只记录 abstain。
-- `tools.asr.convert_qwen3_asr_to_hf`：把基于非 `-hf` Qwen3-ASR fine-tune 的 safetensors 权重迁移到 Transformers-native `-hf` layout（`thinker.audio_tower.* -> model.audio_tower.*`、`thinker.audio_tower.proj{1,2}.* -> model.multi_modal_projector.linear_{1,2}.*`、`thinker.model.* -> model.language_model.*`，并复用 `Qwen/Qwen3-ASR-*-hf` 模板文件）。
+- `tools.asr.convert_qwen3_asr_to_hf`：把 legacy 非 `-hf` Qwen3-ASR fine-tune safetensors 权重迁移到 Transformers-native `-hf` layout（`thinker.audio_tower.* -> model.audio_tower.*`、`thinker.audio_tower.proj{1,2}.* -> model.multi_modal_projector.linear_{1,2}.*`、`thinker.model.* -> model.language_model.*`，并复用 `Qwen/Qwen3-ASR-*-hf` 模板文件）。
 - `tools.asr.cueqc.export_pre_asr_v10_audit_candidates`：从 current workflow `.timings.json` 导出 Pre-ASR CueQC v10 审计候选。
 
 Qwen3-ASR `-hf` 转换示例：
@@ -416,7 +416,7 @@ Qwen3-ASR `-hf` 转换示例：
 ```powershell
 $env:PYTHONIOENCODING='utf-8'
 uv run python -m tools.asr.convert_qwen3_asr_to_hf `
-  --source-model-dir models/jaykwok-Qwen3-ASR-1.7B-JA-Anime-Galgame `
+  --source-model-dir path/to/legacy-non-hf-qwen3-asr `
   --output-dir agents/temp/YYYYMMDD_HHMMSS_qwen3-asr-17b-ja-hf `
   --template-repo Qwen/Qwen3-ASR-1.7B-hf `
   --max-shard-size 2GB
