@@ -91,7 +91,9 @@ def test_cueqc_cluster_audit_uses_explicit_media_root(tmp_path: Path):
     assert summary["cluster_review_audio_render_mode"] == "per_chunk_inline_audio"
     assert summary["cluster_seed_action_options"] == ["use_seed", "mixed_skip", "skip"]
     assert summary["cluster_training_label_rule"].startswith("only seed_action=use_seed")
-    assert "sample_label_export" not in summary
+    assert summary["sample_label_export"] == "cueqc_sample_labels.jsonl"
+    assert summary["sample_label_schema"] == "cueqc_sample_label_v1"
+    assert "holdout_keep" in summary["sample_label_decision_options"]
     assert "baseline_root" not in summary
     html = (tmp_path / "audit" / "index.html").read_text(encoding="utf-8")
     assert "playChunkBtn" in html
@@ -99,8 +101,11 @@ def test_cueqc_cluster_audit_uses_explicit_media_root(tmp_path: Path):
     assert "data-play-sample" in html
     assert "data-inline-audio" in html
     assert "clusterSeedActionButtons" in html
+    assert "sampleLabelButtons" in html
     assert "saveClusters" in html
-    assert "cueqc_sample_labels.jsonl" not in html
+    assert "saveSamples" in html
+    assert "cueqc_sample_labels.jsonl" in html
+    assert "holdout_keep" in html
     assert "/__audit_api__/save-labels" in html
     assert "mixed_skip" in html
     assert "每条独立播放器" in html
@@ -144,7 +149,7 @@ def test_cueqc_cluster_audit_uses_explicit_media_root(tmp_path: Path):
     assert "context_subtitle_cues" not in html
     assert "keep" in html
     assert "drop" in html
-    assert "当前样本只用于试听和查看" in html
+    assert "逐条标签" in html
     assert "coldstart audit" in html
     assert "roles=" in html
     assert "risk=" in html
