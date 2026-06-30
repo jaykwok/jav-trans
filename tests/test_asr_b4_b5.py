@@ -14,7 +14,6 @@ if str(SRC) not in sys.path:
 
 def _reload_pipeline(monkeypatch, tmp_path: Path):
     monkeypatch.setenv("ASR_CHUNK_ROOT", str(tmp_path / "chunks"))
-    monkeypatch.setenv("ASR_SLIDING_CONTEXT_SEGS", "2")
     from asr import pipeline as asr
 
     return importlib.reload(asr)
@@ -29,36 +28,32 @@ def _write_wav(path: Path, seconds: float, sample_rate: int = 8000) -> None:
         writer.writeframes(b"\x00\x00" * int(sample_rate * seconds))
 
 
-def test_sliding_initial_prompts_reset_on_gap(monkeypatch, tmp_path):
+def test_asr_text_transcribe_passes_only_static_context(monkeypatch, tmp_path):
     asr = _reload_pipeline(monkeypatch, tmp_path)
     source = tmp_path / "source.wav"
-    _write_wav(source, 3.0)
+    _write_wav(source, 2.0)
+    monkeypatch.setenv("ASR_CONTEXT", "actor-name")
 
     chunks = [
-        {"index": 0, "start": 0.0, "end": 0.3, "path": str(tmp_path / "c0.wav"), "source_audio_path": str(source)},
-        {"index": 1, "start": 0.35, "end": 0.6, "path": str(tmp_path / "c1.wav"), "source_audio_path": str(source)},
-        {"index": 2, "start": 0.7, "end": 1.0, "path": str(tmp_path / "c2.wav"), "source_audio_path": str(source)},
-        {"index": 3, "start": 1.7, "end": 2.0, "path": str(tmp_path / "c3.wav"), "source_audio_path": str(source)},
-        {"index": 4, "start": 2.05, "end": 2.3, "path": str(tmp_path / "c4.wav"), "source_audio_path": str(source)},
-        {"index": 5, "start": 2.35, "end": 2.6, "path": str(tmp_path / "c5.wav"), "source_audio_path": str(source)},
+        {"index": 0, "start": 0.0, "end": 0.4, "path": str(tmp_path / "c0.wav"), "source_audio_path": str(source)},
+        {"index": 1, "start": 0.45, "end": 0.9, "path": str(tmp_path / "c1.wav"), "source_audio_path": str(source)},
     ]
 
     class FakeBackend:
         is_subprocess = False
         request_batch_size = 1
-        prompts: list[str | None] = []
-        texts = ["固有名詞A", "続きB", "続きC", "リセットD", "続きE", "続きF"]
+        contexts: list[str] = []
 
-        def transcribe_texts(self, audio_paths, contexts=None, initial_prompts=None, on_stage=None):
-            del audio_paths, contexts, on_stage
-            self.prompts.extend(initial_prompts or [])
-            index = len(self.prompts) - 1
-            text = self.texts[index]
+        def transcribe_texts(self, audio_paths, contexts=None, on_stage=None):
+            del audio_paths, on_stage
+            self.contexts.extend(contexts or [])
+            index = len(self.contexts) - 1
+            text = f"text-{index}"
             return [
                 {
                     "text": text,
                     "raw_text": text,
-                    "duration": 0.3,
+                    "duration": 0.4,
                     "language": "Japanese",
                     "normalized_path": str(tmp_path / f"c{index}.wav"),
                     "log": ["fake"],
@@ -72,12 +67,5 @@ def test_sliding_initial_prompts_reset_on_gap(monkeypatch, tmp_path):
         "ASR 文本转写",
     )
 
-    assert [result["text"] for result in results] == FakeBackend.texts
-    assert backend.prompts == [
-        None,
-        "固有名詞A",
-        "固有名詞A\n続きB",
-        None,
-        "リセットD",
-        "リセットD\n続きE",
-    ]
+    assert [result["text"] for result in results] == ["text-0", "text-1"]
+    assert backend.contexts == ["actor-name", "actor-name"]

@@ -111,16 +111,10 @@ def _json_or_text(value: str) -> dict | str:
 def _get_asr_runtime_signature(
     *,
     last_boundary_signature: dict | None = None,
-    sliding_context_segs: int | None = None,
 ) -> dict:
-    if sliding_context_segs is None:
-        try:
-            sliding_context_segs = max(0, int(os.getenv("ASR_SLIDING_CONTEXT_SEGS", "2")))
-        except (TypeError, ValueError):
-            sliding_context_segs = 2
     boundary_signature = _LAST_BOUNDARY_SIGNATURE if last_boundary_signature is None else last_boundary_signature
     return {
-        "version": 6,
+        "version": 7,
         "backend": current_asr_backend(),
         "worker_mode": current_asr_worker_mode(),
         "timestamp": {
@@ -139,14 +133,9 @@ def _get_asr_runtime_signature(
         },
         "context": {
             "asr_context": _env_text("ASR_CONTEXT", ""),
-            "sliding_context_segs": sliding_context_segs,
         },
         "generation": {
             "asr_max_new_tokens": _env_text("ASR_MAX_NEW_TOKENS", "128"),
-            "asr_initial_prompt_max_chars": _env_text(
-                "ASR_INITIAL_PROMPT_MAX_CHARS",
-                "240",
-            ),
             "asr_repetition_penalty": _env_text("ASR_REPETITION_PENALTY", "1.05"),
         },
         "pre_asr_cueqc": pre_asr_cueqc_runtime_signature(),
@@ -159,11 +148,9 @@ def _get_asr_checkpoint_path(
     *,
     last_boundary_signature: dict | None = None,
     chunk_root: Path | str | None = None,
-    sliding_context_segs: int | None = None,
 ) -> Path:
     runtime_signature = _get_asr_runtime_signature(
         last_boundary_signature=last_boundary_signature,
-        sliding_context_segs=sliding_context_segs,
     )
     key = hashlib.sha1(
         _signature_json(

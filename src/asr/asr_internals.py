@@ -164,8 +164,8 @@ class AsrInternalsCapturer:
     def _tokenize_generated(self, text: str) -> list[int]:
         """Tokenize the ASR-generated text (no special tokens) for teacher forcing.
 
-        The generated region sits after the prompt + ``language X<asr_text>`` tail.
-        We encode the raw text the same way the decoder would have produced it.
+        The generated region sits after the transcription prompt. We encode the
+        raw text the same way the decoder would have produced it.
         """
         tokenizer = self.processor.tokenizer
         ids = tokenizer.encode(text, add_special_tokens=False)

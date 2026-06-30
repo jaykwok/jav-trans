@@ -54,7 +54,6 @@ _LAST_BOUNDARY_SIGNATURE: dict = _chunking_module._LAST_BOUNDARY_SIGNATURE
 _LAST_BOUNDARY_CACHE_EVENT: dict | None = None
 # APPEND=0 overwrites once per export path in this process; later same-path writes append for multi-video workflows.
 _PRE_ASR_EXPORT_OVERWRITTEN_PATHS: set[str] = set()
-_ASR_SLIDING_CONTEXT_SEGS = _transcribe_module._ASR_SLIDING_CONTEXT_SEGS
 _ASR_CHECKPOINT_ENABLED = _transcribe_module._ASR_CHECKPOINT_ENABLED
 
 
@@ -200,10 +199,6 @@ _empty_segments_quarantine_placeholder = _transcribe_module._empty_segments_quar
 _align_TRANSCRIPTION_results = _transcribe_module._align_TRANSCRIPTION_results
 _build_transcript_chunks = _transcribe_module._build_transcript_chunks
 _build_ASR_CONTEXT_for_chunk = _transcribe_module._build_ASR_CONTEXT_for_chunk
-_backend_accepts_initial_prompts = _transcribe_module._backend_accepts_initial_prompts
-_should_reset_sliding_context = _transcribe_module._should_reset_sliding_context
-_sliding_context_result_text = _transcribe_module._sliding_context_result_text
-_build_initial_prompt_for_chunk = _transcribe_module._build_initial_prompt_for_chunk
 _postprocess_segments = _transcribe_module._postprocess_segments
 _repair_postprocessed_segment_windows = _transcribe_module._repair_postprocessed_segment_windows
 _group_words_to_segments = _transcribe_module._group_words_to_segments
@@ -218,7 +213,6 @@ def _get_asr_generation_checkpoint_signature() -> dict:
     _sync_checkpoint_state()
     return _checkpoint_module._get_asr_runtime_signature(
         last_boundary_signature=_LAST_BOUNDARY_SIGNATURE,
-        sliding_context_segs=_ASR_SLIDING_CONTEXT_SEGS
     )
 
 
@@ -226,7 +220,6 @@ def _get_asr_runtime_signature(last_boundary_signature: dict | None = None) -> d
     _sync_checkpoint_state()
     return _checkpoint_module._get_asr_runtime_signature(
         last_boundary_signature=_LAST_BOUNDARY_SIGNATURE if last_boundary_signature is None else last_boundary_signature,
-        sliding_context_segs=_ASR_SLIDING_CONTEXT_SEGS,
     )
 
 
@@ -236,7 +229,6 @@ def _get_asr_checkpoint_path(audio_path: str) -> Path:
         audio_path,
         last_boundary_signature=_LAST_BOUNDARY_SIGNATURE,
         chunk_root=_ASR_CHUNK_ROOT,
-        sliding_context_segs=_ASR_SLIDING_CONTEXT_SEGS,
     )
 
 

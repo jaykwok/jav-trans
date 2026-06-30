@@ -53,7 +53,7 @@ def _set_boundary_refiner_mapping(monkeypatch, tmp_path: Path) -> None:
     )
 
 
-def test_boundary_cache_key_ignores_asr_prompt_budget(monkeypatch, tmp_path):
+def test_boundary_cache_key_ignores_asr_generation_budget(monkeypatch, tmp_path):
     from boundary import cache as boundary_cache
 
     monkeypatch.setenv("BOUNDARY_CACHE_DIR", str(tmp_path / "boundary-cache"))
@@ -65,7 +65,6 @@ def test_boundary_cache_key_ignores_asr_prompt_budget(monkeypatch, tmp_path):
         boundary_signature={"backend": "speech_boundary_ja", "threshold": 0.35},
         boundary_config=_boundary_config(),
     )
-    monkeypatch.setenv("ASR_INITIAL_PROMPT_MAX_CHARS", "160")
     monkeypatch.setenv("ASR_MAX_NEW_TOKENS", "256")
     lookup_b = boundary_cache.build_cache_lookup(
         str(audio),
@@ -483,7 +482,7 @@ def test_pipeline_uses_boundary_scores_but_does_not_cache_score_arrays(monkeypat
     assert "split_boundary_frame_scores" not in payload
 
 
-def test_pipeline_uses_boundary_cache_for_prompt_budget_change(monkeypatch, tmp_path):
+def test_pipeline_uses_boundary_cache_for_asr_generation_budget_change(monkeypatch, tmp_path):
     _set_boundary_refiner_mapping(monkeypatch, tmp_path)
     monkeypatch.setenv("BOUNDARY_CACHE_DIR", str(tmp_path / "boundary-cache"))
     monkeypatch.setenv("BOUNDARY_FEATURE_FRAME_HOP_S", "0.02")
@@ -501,7 +500,7 @@ def test_pipeline_uses_boundary_cache_for_prompt_budget_change(monkeypatch, tmp_
     monkeypatch.setattr(boundary, "get_boundary_backend", lambda: backend)
 
     first = asr._build_processing_spans(str(audio))
-    monkeypatch.setenv("ASR_INITIAL_PROMPT_MAX_CHARS", "160")
+    monkeypatch.setenv("ASR_MAX_NEW_TOKENS", "256")
     second = asr._build_processing_spans(str(audio))
 
     assert backend.calls == 1

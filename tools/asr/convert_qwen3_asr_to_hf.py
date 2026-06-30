@@ -278,7 +278,7 @@ def _parse_size_bytes(value: str) -> int:
 
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="Convert qwen-asr Qwen3-ASR checkpoints to Transformers-native -hf layout."
+        description="Convert legacy non-HF Qwen3-ASR checkpoints to Transformers-native -hf layout."
     )
     parser.add_argument("--source-model-dir", required=True, type=Path)
     parser.add_argument("--output-dir", required=True, type=Path)
