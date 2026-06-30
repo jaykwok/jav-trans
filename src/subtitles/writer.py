@@ -800,8 +800,7 @@ def _normalize_subtitle_timeline(
         return normalized
 
     gap_s = _subtitle_gap_s(options)
-    # Minimum absolute display-duration floor when resolving unavoidable overlaps.
-    min_abs_s = 0.20
+    min_display_s = _subtitle_min_duration_s(options)
     index = 0
     while index + 1 < len(normalized):
         current = normalized[index]
@@ -821,21 +820,12 @@ def _normalize_subtitle_timeline(
             continue
 
         limit_end = max(current_start, next_start - gap_s)
-        if limit_end - current_start >= min_abs_s:
-            current["end"] = limit_end
-            current["display_start"] = current_start
-            current["display_end"] = limit_end
-            current["display_duration"] = max(0.0, limit_end - current_start)
-            index += 1
-            continue
-
-        if limit_end > current_start:
-            current["end"] = max(current_start + 0.001, limit_end)
-        else:
-            current["end"] = current_start
+        current["end"] = limit_end
         current["display_start"] = current_start
-        current["display_end"] = current["end"]
-        current["display_duration"] = max(0.0, current["end"] - current_start)
+        current["display_end"] = limit_end
+        current["display_duration"] = max(0.0, limit_end - current_start)
+        if limit_end - current_start < min_display_s:
+            current["duration_violation"] = True
         index += 1
 
     return normalized
