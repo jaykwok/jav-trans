@@ -120,7 +120,7 @@ def _get_asr_runtime_signature(
             sliding_context_segs = 2
     boundary_signature = _LAST_BOUNDARY_SIGNATURE if last_boundary_signature is None else last_boundary_signature
     return {
-        "version": 5,
+        "version": 6,
         "backend": current_asr_backend(),
         "worker_mode": current_asr_worker_mode(),
         "timestamp": {
@@ -143,21 +143,9 @@ def _get_asr_runtime_signature(
         },
         "generation": {
             "asr_max_new_tokens": _env_text("ASR_MAX_NEW_TOKENS", "128"),
-            "transcription_max_new_tokens": _env_text(
-                "TRANSCRIPTION_MAX_NEW_TOKENS",
-                _env_text("ASR_MAX_NEW_TOKENS", "128"),
-            ),
             "asr_initial_prompt_max_chars": _env_text(
                 "ASR_INITIAL_PROMPT_MAX_CHARS",
                 "240",
-            ),
-            "asr_initial_prompt_max_tokens": _env_text(
-                "ASR_INITIAL_PROMPT_MAX_TOKENS",
-                "180",
-            ),
-            "asr_min_effective_new_tokens": _env_text(
-                "ASR_MIN_EFFECTIVE_NEW_TOKENS",
-                "64",
             ),
             "asr_repetition_penalty": _env_text("ASR_REPETITION_PENALTY", "1.05"),
         },
@@ -353,10 +341,7 @@ def _build_quarantined_text_result(
         "segments": [],
         "asr_generation": {
             "backend": current_asr_backend(),
-            "configured_max_new_tokens": _env_text(
-                "TRANSCRIPTION_MAX_NEW_TOKENS",
-                _env_text("ASR_MAX_NEW_TOKENS", "128"),
-            ),
+            "configured_max_new_tokens": _env_text("ASR_MAX_NEW_TOKENS", "128"),
             "model_max_target_positions": None,
             "policy": "quarantined_result",
             "worker_mode": current_asr_worker_mode(),

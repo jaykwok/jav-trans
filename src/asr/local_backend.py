@@ -1,6 +1,5 @@
 import concurrent.futures
 import gc
-import inspect
 import multiprocessing as mp
 import os
 import re
@@ -35,10 +34,6 @@ def _resolve_asr_batch_size() -> int:
 
 ASR_BATCH_SIZE = _resolve_asr_batch_size()
 ASR_MAX_NEW_TOKENS = max(64, int(os.getenv("ASR_MAX_NEW_TOKENS", "128")))
-TRANSCRIPTION_MAX_NEW_TOKENS = max(
-    32,
-    int(os.getenv("TRANSCRIPTION_MAX_NEW_TOKENS", str(ASR_MAX_NEW_TOKENS))),
-)
 TRANSCRIPTION_TIMEOUT_S = float(os.getenv("TRANSCRIPTION_TIMEOUT_S", "180"))
 ASR_DTYPE = os.getenv("ASR_DTYPE", "auto").strip().lower()
 ASR_ATTN = os.getenv("ASR_ATTENTION", "auto").strip().lower()
@@ -185,21 +180,12 @@ def _apply_generation_safety(model) -> None:
     if ASR_REPETITION_PENALTY <= 1.0:
         return
     try:
+        # qwen-asr 0.0.6 exposes repetition control only through the underlying
+        # HF generation_config, so this intentionally touches a fragile wrapper
+        # internal and should be rechecked on qwen-asr upgrades.
         model.model.thinker.generation_config.repetition_penalty = ASR_REPETITION_PENALTY
     except Exception:
         pass
-
-
-def _callable_accepts_kwarg(func, name: str) -> bool:
-    try:
-        parameters = inspect.signature(func).parameters.values()
-    except (TypeError, ValueError):
-        return False
-    return any(
-        parameter.name == name
-        or parameter.kind == inspect.Parameter.VAR_KEYWORD
-        for parameter in parameters
-    )
 
 
 def _asr_max_new_tokens() -> int:
@@ -207,14 +193,6 @@ def _asr_max_new_tokens() -> int:
         return max(64, int(os.getenv("ASR_MAX_NEW_TOKENS", str(ASR_MAX_NEW_TOKENS))))
     except (TypeError, ValueError):
         return ASR_MAX_NEW_TOKENS
-
-
-def _transcription_max_new_tokens() -> int:
-    try:
-        fallback = str(_asr_max_new_tokens())
-        return max(32, int(os.getenv("TRANSCRIPTION_MAX_NEW_TOKENS", fallback)))
-    except (TypeError, ValueError):
-        return TRANSCRIPTION_MAX_NEW_TOKENS
 
 
 def _transcription_timeout_s() -> float:
@@ -250,9 +228,9 @@ def _qwen_generation_metadata(
     return {
         "backend": current_qwen_asr_backend(),
         "model_id": active_qwen_asr_model_id(),
-        "configured_max_new_tokens": _transcription_max_new_tokens(),
+        "configured_max_new_tokens": _asr_max_new_tokens(),
         "model_max_target_positions": None,
-        "policy": "qwen_transcribe_limit",
+        "policy": "qwen_from_pretrained_limit",
         "worker_mode": worker_mode,
         "error_kind": error_kind,
         "error_detail": error_detail,
@@ -397,8 +375,6 @@ class LocalAsrBackend:
             # Runtime timing comes from Boundary/speech-core chunk windows.
             "return_time_stamps": False,
         }
-        if _callable_accepts_kwarg(self.model.transcribe, "max_new_tokens"):
-            transcribe_kwargs["max_new_tokens"] = _transcription_max_new_tokens()
 
         asr_results = None
         executor = None
@@ -445,7 +421,7 @@ class LocalAsrBackend:
                     asr_result,
                     language_hint,
                 )
-                payload_log.append(f"ASR 文本生成上限: {_transcription_max_new_tokens()}")
+                payload_log.append(f"ASR 加载生成上限: {_asr_max_new_tokens()}")
                 payload["log"] = payload_log
                 payloads.append(payload)
         finally:

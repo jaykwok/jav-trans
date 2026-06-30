@@ -37,12 +37,8 @@ DEFAULT_SETTINGS: dict[str, str] = {
     # --- ASR Model Settings ---
     # Transcription backend. Use the Hugging Face repo id as the stable key.
     "ASR_BACKEND": "jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame",
-    # Character cap for sliding ASR context prompt before tokenizer-level budgeting.
+    # Character cap for sliding ASR context prompt.
     "ASR_INITIAL_PROMPT_MAX_CHARS": "240",
-    # Max prompt tokens kept before generation budgeting.
-    "ASR_INITIAL_PROMPT_MAX_TOKENS": "180",
-    # Minimum output budget preserved when prompt tokens compete with decoder context.
-    "ASR_MIN_EFFECTIVE_NEW_TOKENS": "64",
     # Voice activity detection backend used before ASR chunking.
     "ASR_BOUNDARY_BACKEND": "speech_boundary_ja",
     # Optional explicit HuggingFace model id override. Empty auto-selects by ASR_BACKEND.
@@ -70,10 +66,8 @@ DEFAULT_SETTINGS: dict[str, str] = {
         "jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame=32,"
         "jaykwok/Qwen3-ASR-0.6B-JA-Anime-Galgame=64"
     ),
-    # Max generated tokens per ASR chunk.
+    # Max generated tokens configured when loading the Qwen ASR wrapper.
     "ASR_MAX_NEW_TOKENS": "128",
-    # Subprocess transcription token cap; usually matches ASR_MAX_NEW_TOKENS.
-    "TRANSCRIPTION_MAX_NEW_TOKENS": "128",
     # Max seconds to wait for a subprocess ASR worker to load and report ready.
     "ASR_SUBPROCESS_READY_TIMEOUT_S": "600",
     # Generation penalty to reduce repeated ASR text.

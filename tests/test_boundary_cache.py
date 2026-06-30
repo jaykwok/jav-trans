@@ -66,8 +66,7 @@ def test_boundary_cache_key_ignores_asr_prompt_budget(monkeypatch, tmp_path):
         boundary_config=_boundary_config(),
     )
     monkeypatch.setenv("ASR_INITIAL_PROMPT_MAX_CHARS", "160")
-    monkeypatch.setenv("ASR_INITIAL_PROMPT_MAX_TOKENS", "64")
-    monkeypatch.setenv("ASR_MIN_EFFECTIVE_NEW_TOKENS", "96")
+    monkeypatch.setenv("ASR_MAX_NEW_TOKENS", "256")
     lookup_b = boundary_cache.build_cache_lookup(
         str(audio),
         boundary_signature={"backend": "speech_boundary_ja", "threshold": 0.35},
