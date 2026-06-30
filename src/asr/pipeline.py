@@ -52,8 +52,10 @@ _ASR_CHUNK_ROOT = _chunking_module._ASR_CHUNK_ROOT
 _KEEP_ASR_CHUNKS = _chunking_module._KEEP_ASR_CHUNKS
 _LAST_BOUNDARY_SIGNATURE: dict = _chunking_module._LAST_BOUNDARY_SIGNATURE
 _LAST_BOUNDARY_CACHE_EVENT: dict | None = None
+_PRE_ASR_EXPORT_OVERWRITTEN_PATHS: set[str] = set()
 _ASR_SLIDING_CONTEXT_SEGS = _transcribe_module._ASR_SLIDING_CONTEXT_SEGS
 _ASR_CHECKPOINT_ENABLED = _transcribe_module._ASR_CHECKPOINT_ENABLED
+
 
 def _env_bool(name: str, default: str) -> bool:
     return os.getenv(name, default).strip().lower() in {"1", "true", "yes", "on"}
@@ -551,20 +553,24 @@ def _write_pre_asr_candidates_if_requested(
         return
     output_path = Path(output_path_raw).expanduser()
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    append = os.getenv("PRE_ASR_CUEQC_EXPORT_CANDIDATES_APPEND", "1").strip().lower() not in {
+    append_requested = os.getenv("PRE_ASR_CUEQC_EXPORT_CANDIDATES_APPEND", "1").strip().lower() not in {
         "0",
         "false",
         "no",
         "off",
     }
-    mode = "a" if append else "w"
+    output_key = str(output_path.resolve())
+    mode = "a" if append_requested or output_key in _PRE_ASR_EXPORT_OVERWRITTEN_PATHS else "w"
     with output_path.open(mode, encoding="utf-8") as handle:
         for row in candidates:
             handle.write(json.dumps(row, ensure_ascii=False, sort_keys=True) + "\n")
+    if not append_requested:
+        _PRE_ASR_EXPORT_OVERWRITTEN_PATHS.add(output_key)
     log.append(
-        "Pre-ASR CueQC: exported candidates path={path} count={count}".format(
+        "Pre-ASR CueQC: exported candidates path={path} count={count} mode={mode}".format(
             path=_display_cache_path(str(output_path)),
             count=len(candidates),
+            mode=mode,
         )
     )
 
