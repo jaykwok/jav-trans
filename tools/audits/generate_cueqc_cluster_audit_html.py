@@ -440,6 +440,9 @@ def rows_for_page(rows: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
         "end",
         "features",
         "feature_names",
+        "focused_audit_bucket",
+        "focused_audit_role",
+        "focused_audit_split",
         "index",
         "labels",
         "media",
@@ -643,8 +646,11 @@ code {{ background: #eef3ef; padding: 1px 4px; border-radius: 4px; }}
       <div class="toolbar">
         <button class="primary" id="saveClusters">保存簇级审计结果</button>
         <button id="downloadClusters">下载簇级 JSONL</button>
+        <button class="primary" id="saveSamples">保存逐条审计结果</button>
+        <button id="downloadSamples">下载逐条 JSONL</button>
       </div>
       <p class="meta" id="clusterSaveStatus"></p>
+      <p class="meta" id="sampleSaveStatus"></p>
       <p class="meta" id="clusterProgress"></p>
       <p class="meta" id="summaryLine"></p>
       <div class="audit-controls">
@@ -722,7 +728,15 @@ code {{ background: #eef3ef; padding: 1px 4px; border-radius: 4px; }}
           </div>
           <p class="meta cluster-status" id="clusterStatus"></p>
         </div>
-        <p class="meta" id="labelStatus">当前样本只用于试听和查看；训练标签来自上方簇级标签。</p>
+        <div class="sample-label-panel">
+          <div class="label-heading">
+            <span class="label-title">逐条标签</span>
+            <span class="meta">风险样本、tail、holdout 用这里；不会广播全簇</span>
+          </div>
+          <div class="labels" id="sampleLabelButtons"></div>
+          <textarea id="activeSampleReason" placeholder="逐条备注 / 原因（可选）"></textarea>
+          <p class="meta" id="labelStatus">当前样本未标注。</p>
+        </div>
         <div class="caption-preview" id="captionOverlay"></div>
         <div class="caption-meta" id="captionMeta"></div>
         <div class="timeline" id="timeline">
@@ -786,6 +800,7 @@ const DATASET_ID = {dataset_id_json};
 const STORAGE_VERSION = "cluster-display-seed-v1";
 const STORAGE_KEY = `cueqc-cluster-audit:${{STORAGE_VERSION}}:${{DATASET_ID}}:${{location.pathname}}`;
 const CLUSTER_STORAGE_KEY = STORAGE_KEY + ":cluster-labels-v1";
+const SAMPLE_STORAGE_KEY = STORAGE_KEY + ":sample-labels-v1";
 const CLUSTER_EXAMPLES_PER_CLUSTER = 3;
 const CLUSTER_ACTIVE_KEY = STORAGE_KEY + ":cluster-active-v1";
 const LEGACY_STORAGE_KEY = "cueqc-cluster-audit:" + location.pathname;
@@ -796,6 +811,13 @@ try {{
 }} catch (_) {{}}
 const CLUSTER_DISPLAY = [{{value:"keep", label:"保留（进入字幕）"}},{{value:"drop", label:"丢弃（不进入字幕）"}}];
 const CLUSTER_SEED_ACTIONS = [{{value:"use_seed", label:"用作种子"}},{{value:"mixed_skip", label:"混簇跳过"}},{{value:"skip", label:"跳过"}}];
+const SAMPLE_DECISIONS = [
+  {{value:"sample_keep", label:"逐条保留"}},
+  {{value:"sample_drop", label:"逐条丢弃"}},
+  {{value:"holdout_keep", label:"Holdout 保留"}},
+  {{value:"holdout_drop", label:"Holdout 丢弃"}},
+  {{value:"uncertain", label:"不确定"}}
+];
 function clusterOrder(summary) {{
   const match = String(summary.cluster_id || "").match(/^cluster_(\\d+)$/);
   return match ? Number(match[1]) : 1000;
@@ -808,6 +830,7 @@ const CLUSTER_ENTRIES = [...SUMMARIES].sort((a, b) => clusterOrder(a) - clusterO
 }}));
 const CLUSTER_BY_ID = new Map(CLUSTER_ENTRIES.map(entry => [entry.clusterId, entry]));
 let clusterAnnotations = loadClusterAnnotations();
+let sampleAnnotations = loadSampleAnnotations();
 let activeClusterId = loadActiveClusterId();
 let filtered = [...ROWS];
 let current = 0;
@@ -824,6 +847,8 @@ const subtitleWindowRange = document.getElementById("subtitleWindowRange");
 const cursor = document.getElementById("cursor");
 function loadClusterAnnotations() {{ try {{ return JSON.parse(localStorage.getItem(CLUSTER_STORAGE_KEY) || "{{}}"); }} catch (_) {{ return {{}}; }} }}
 function saveClusterAnnotations() {{ localStorage.setItem(CLUSTER_STORAGE_KEY, JSON.stringify(clusterAnnotations)); }}
+function loadSampleAnnotations() {{ try {{ return JSON.parse(localStorage.getItem(SAMPLE_STORAGE_KEY) || "{{}}"); }} catch (_) {{ return {{}}; }} }}
+function saveSampleAnnotations() {{ localStorage.setItem(SAMPLE_STORAGE_KEY, JSON.stringify(sampleAnnotations)); }}
 function loadActiveClusterId() {{ try {{ return localStorage.getItem(CLUSTER_ACTIVE_KEY) || ""; }} catch (_) {{ return ""; }} }}
 function saveActiveClusterId(clusterId) {{ try {{ localStorage.setItem(CLUSTER_ACTIVE_KEY, clusterId || ""); }} catch (_) {{}} }}
 function escapeHtml(text) {{ return String(text || "").replace(/[&<>"']/g, ch => ({{"&":"&amp;","<":"&lt;",">":"&gt;","\\"":"&quot;","'":"&#39;"}}[ch])); }}
@@ -1553,10 +1578,43 @@ function labelForValue(key, value, options) {{
   const found = fixedOptions(options).find(option => option.value === value);
   return found ? found.label : value;
 }}
+function updateSampleAnnotation(sampleId, key, value) {{
+  if (!sampleId) return;
+  const next = {{ ...(sampleAnnotations[sampleId] || {{}}) }};
+  next[key] = value;
+  next.updated_at = new Date().toISOString();
+  sampleAnnotations[sampleId] = next;
+  saveSampleAnnotations();
+  renderSampleLabelStatus(ROWS[current]);
+  renderList();
+}}
 function renderSampleLabelStatus(row) {{
   const root = document.getElementById("labelStatus");
   if (!root || !row) return;
-  root.textContent = "当前样本只用于试听和查看；训练标签请在上方簇级面板选择。";
+  const sampleId = row.sample_id || "";
+  const ann = sampleAnnotations[sampleId] || {{}};
+  const buttons = document.getElementById("sampleLabelButtons");
+  if (buttons) {{
+    buttons.innerHTML = "";
+    for (const option of SAMPLE_DECISIONS) {{
+      const btn = document.createElement("button");
+      btn.type = "button";
+      btn.textContent = option.label;
+      btn.className = ann.manual_decision === option.value ? "active" : "";
+      btn.onclick = () => updateSampleAnnotation(sampleId, "manual_decision", option.value);
+      buttons.appendChild(btn);
+    }}
+  }}
+  const reason = document.getElementById("activeSampleReason");
+  if (reason) {{
+    reason.value = ann.notes || "";
+    reason.onchange = () => updateSampleAnnotation(sampleId, "notes", reason.value);
+  }}
+  const decision = ann.manual_decision
+    ? labelForValue("manual_decision", ann.manual_decision, SAMPLE_DECISIONS)
+    : "未标注";
+  const focused = [row.focused_audit_split, row.focused_audit_bucket, row.focused_audit_role].filter(Boolean).join(" / ");
+  root.textContent = `${{decision}} · ${{focused || "cluster sample"}} · ${{sampleId}}`;
 }}
 function setMediaForItem(row, seek) {{
   const videoId = row.video_id || "";
@@ -1753,6 +1811,39 @@ function playCurrent(mode) {{
     startPlayback();
   }}
 }}
+function exportSampleRows() {{
+  return Object.entries(sampleAnnotations)
+    .filter(([sampleId, ann]) => sampleId && ann && ann.manual_decision)
+    .map(([sampleId, ann]) => {{
+      const row = ROWS.find(item => item.sample_id === sampleId) || {{}};
+      const manualDecision = String(ann.manual_decision || "");
+      return {{
+        schema: "cueqc_sample_label_v1",
+        dataset_id: DATASET_ID,
+        sample_id: sampleId,
+        candidate_id: row.candidate_id || row.sample_id || sampleId,
+        video_id: row.video_id || "",
+        video_label: row.video_label || "",
+        cluster_id: row.cluster_id || "",
+        focused_audit_split: row.focused_audit_split || "",
+        focused_audit_bucket: row.focused_audit_bucket || "",
+        focused_audit_role: row.focused_audit_role || "",
+        manual_decision: manualDecision,
+        display_decision: manualDecision.endsWith("_keep") ? "keep" : manualDecision.endsWith("_drop") ? "drop" : "",
+        training_label_included: manualDecision === "sample_keep" || manualDecision === "sample_drop",
+        holdout_included: manualDecision === "holdout_keep" || manualDecision === "holdout_drop",
+        notes: ann.notes || "",
+        updated_at: ann.updated_at || "",
+        chunk_index: row.chunk_index,
+        start: row.start,
+        end: row.end,
+        duration_s: row.duration_s,
+        text: row.text,
+        raw_text: row.raw_text,
+        text_preview: row.text_preview
+      }};
+    }});
+}}
 function exportClusterRows() {{
   return SUMMARIES.map(summary => {{
     const clusterId = summary.cluster_id || "";
@@ -1798,6 +1889,12 @@ function exportClusterRows() {{
 function downloadClusterJsonl() {{
   downloadText("cueqc_cluster_labels.jsonl", exportClusterRows().map(row => JSON.stringify(row)).join("\\n") + "\\n");
 }}
+function sampleJsonlText() {{
+  return exportSampleRows().map(row => JSON.stringify(row)).join("\\n") + "\\n";
+}}
+function downloadSampleJsonl() {{
+  downloadText("cueqc_sample_labels.jsonl", sampleJsonlText());
+}}
 function downloadText(filename, text) {{
   const blob = new Blob([text], {{type:"application/jsonl;charset=utf-8"}});
   const a = document.createElement("a");
@@ -1829,6 +1926,9 @@ function clusterJsonlText() {{
 async function saveClusterJsonl() {{
   await saveLabelsFile("cueqc_cluster_labels.jsonl", clusterJsonlText(), "clusterSaveStatus");
 }}
+async function saveSampleJsonl() {{
+  await saveLabelsFile("cueqc_sample_labels.jsonl", sampleJsonlText(), "sampleSaveStatus");
+}}
 document.getElementById("search").addEventListener("input", applyFilters);
 document.getElementById("cluster").addEventListener("change", applyFilters);
 document.getElementById("videoFilter").addEventListener("change", applyFilters);
@@ -1841,6 +1941,8 @@ document.getElementById("sortBy").addEventListener("change", () => {{
 document.getElementById("pageSize").addEventListener("change", renderList);
 document.getElementById("downloadClusters").onclick = downloadClusterJsonl;
 document.getElementById("saveClusters").onclick = () => saveClusterJsonl().catch(error => alert(error.message || error));
+document.getElementById("downloadSamples").onclick = downloadSampleJsonl;
+document.getElementById("saveSamples").onclick = () => saveSampleJsonl().catch(error => alert(error.message || error));
 document.getElementById("playChunkBtn").onclick = () => playCurrent("chunk");
 document.getElementById("playContextBtn").onclick = () => playCurrent("context");
 document.getElementById("pauseBtn").onclick = () => media.pause();
@@ -2003,6 +2105,16 @@ def build_audit(
             "cluster_review_audio_render_mode": "per_chunk_inline_audio",
             "cluster_audio_page_size": 80,
             "cluster_review_scope": "natural_clusters_including_noise",
+            "sample_label_export": "cueqc_sample_labels.jsonl",
+            "sample_label_schema": "cueqc_sample_label_v1",
+            "sample_label_decision_options": [
+                "sample_keep",
+                "sample_drop",
+                "holdout_keep",
+                "holdout_drop",
+                "uncertain",
+            ],
+            "sample_training_label_rule": "sample_keep/sample_drop are sample-level training labels; holdout_keep/holdout_drop are validation-only; uncertain abstains",
             "training_label_fields": ["display_decision"],
         }
     )
