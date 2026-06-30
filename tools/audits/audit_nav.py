@@ -14,6 +14,13 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 AUDIT_ROOT = PROJECT_ROOT / "agents" / "audits"
 AUDIT_RM_ROOT = PROJECT_ROOT / "agents" / "rm" / "audit-deletions"
 AUDIT_SERVER_COMMAND = "tools/audits/serve_audits.ps1"
+AUDIT_TIMESTAMP_RE = re.compile(r"(?<!\d)(\d{8})[_-](\d{6})(?!\d)")
+SUMMARY_TIME_KEYS = (
+    "generated_at",
+    "created_at",
+    "exported_at",
+    "timestamp",
+)
 ANON_LABELS = {
     "NAMH-055": "匿名样片 A",
     "REAL-988": "匿名样片 B",
@@ -104,6 +111,60 @@ def _entry_title(index_path: Path, summary: Mapping[str, Any]) -> str:
     return anonymize_display_text(index_path.parent.name)
 
 
+def _format_datetime(value: datetime) -> str:
+    return value.strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _timestamp_from_text(value: str) -> str:
+    text = value.strip()
+    if not text:
+        return ""
+    match = AUDIT_TIMESTAMP_RE.search(text)
+    if match:
+        try:
+            parsed = datetime.strptime("".join(match.groups()), "%Y%m%d%H%M%S")
+        except ValueError:
+            return ""
+        return _format_datetime(parsed)
+    try:
+        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        return ""
+    return _format_datetime(parsed)
+
+
+def _summary_generated_time(summary: Mapping[str, Any]) -> str:
+    for key in SUMMARY_TIME_KEYS:
+        value = summary.get(key)
+        if value in (None, ""):
+            continue
+        if isinstance(value, (int, float)):
+            try:
+                return _format_datetime(datetime.fromtimestamp(float(value)))
+            except (OSError, OverflowError, ValueError):
+                continue
+        formatted = _timestamp_from_text(str(value))
+        if formatted:
+            return formatted
+    return ""
+
+
+def _entry_generated_time(
+    index_path: Path,
+    summary: Mapping[str, Any],
+    *,
+    mtime: float | None = None,
+) -> str:
+    summary_time = _summary_generated_time(summary)
+    if summary_time:
+        return summary_time
+    dir_time = _timestamp_from_text(index_path.parent.name)
+    if dir_time:
+        return dir_time
+    stat_time = _audit_entry_mtime(index_path) if mtime is None else mtime
+    return _format_datetime(datetime.fromtimestamp(stat_time))
+
+
 def _audit_entry_mtime(index_path: Path) -> float:
     candidates = [index_path, index_path.parent]
     for summary_path in (index_path.parent / "summary.json", index_path.with_suffix(".summary.json")):
@@ -118,13 +179,15 @@ def _discover_entries(audit_root: Path) -> list[dict[str, str]]:
         if index_path == audit_root / "index.html":
             continue
         summary = _summary_for(index_path)
+        mtime = _audit_entry_mtime(index_path)
         entries.append(
             {
                 "href": rel_url(index_path, from_dir=audit_root),
                 "title": _entry_title(index_path, summary),
                 "desc": _entry_desc(summary),
                 "dir": rel_url(index_path.parent, from_dir=audit_root),
-                "mtime": str(_audit_entry_mtime(index_path)),
+                "mtime": str(mtime),
+                "generated_at": _entry_generated_time(index_path, summary, mtime=mtime),
             }
         )
     entries.sort(key=lambda entry: float(entry["mtime"]), reverse=True)
@@ -135,13 +198,20 @@ def _card(entry: Mapping[str, str], *, latest_href: str) -> str:
     href = str(entry.get("href") or "")
     title = str(entry.get("title") or href)
     desc = str(entry.get("desc") or "审计页面")
+    generated_at = str(entry.get("generated_at") or "")
     badge = '<span class="badge">最新</span>' if href == latest_href else ""
     delete_label = f"删除 {title}"
+    generated_line = (
+        f'      <span class="entry-time">生成：{html.escape(generated_at)}</span>\n'
+        if generated_at
+        else ""
+    )
     return (
         f'  <div class="entry" data-href="{html.escape(href)}">\n'
         f'    <a class="entry-main" href="{html.escape(href)}">\n'
         f"      <strong>{html.escape(title)}{badge}</strong>\n"
         f"      <span>{html.escape(desc)}</span>\n"
+        f"{generated_line}"
         "    </a>\n"
         f'    <button class="delete-audit" type="button" data-href="{html.escape(href)}" '
         f'data-title="{html.escape(title)}" aria-label="{html.escape(delete_label)}">删除</button>\n'
@@ -322,10 +392,17 @@ def write_audit_index(
     if latest_html is not None:
         latest_href = rel_url(latest_html, from_dir=audit_root)
         latest_summary = _summary_for(latest_html)
+        latest_mtime = _audit_entry_mtime(latest_html)
         latest_entry = {
             "href": latest_href,
             "title": latest_title or latest_html.parent.name,
             "desc": _entry_desc(latest_summary) if latest_summary else "最新审计页",
+            "mtime": str(latest_mtime),
+            "generated_at": _entry_generated_time(
+                latest_html,
+                latest_summary,
+                mtime=latest_mtime,
+            ),
         }
         entries = [latest_entry, *[entry for entry in entries if entry["href"] != latest_href]]
     cards = "\n".join(_card(entry, latest_href=latest_href) for entry in entries)
@@ -374,6 +451,11 @@ h1 {{ margin: 0 0 18px; font-size: 24px; }}
   color: #0f766e;
 }}
 .entry span {{ color: #66706c; }}
+.entry-time {{
+  display: block;
+  margin-top: 2px;
+  font-size: 13px;
+}}
 .delete-audit {{
   border: 1px solid #efb5af;
   border-radius: 6px;

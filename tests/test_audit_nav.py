@@ -27,7 +27,14 @@ def test_audit_index_lists_latest_without_auto_refresh(tmp_path: Path):
         "<!doctype html><title>old</title>",
     )
     (latest_html.parent / "summary.json").write_text(
-        json.dumps({"review_item_count": 3, "video_label": "匿名样片 A"}, ensure_ascii=False),
+        json.dumps(
+            {
+                "review_item_count": 3,
+                "video_label": "匿名样片 A",
+                "created_at": "2026-06-30T01:02:03",
+            },
+            ensure_ascii=False,
+        ),
         encoding="utf-8",
     )
     (old_html.parent / "summary.json").write_text(
@@ -43,6 +50,7 @@ def test_audit_index_lists_latest_without_auto_refresh(tmp_path: Path):
     assert "speech-boundary-ja/latest-review" not in index
     assert "最新审计" in index
     assert "匿名样片 A" in index
+    assert "生成：2026-06-30 01:02:03" in index
     assert "old-review" in index
     assert "http-equiv" not in index
     assert "window.location" not in index
@@ -168,3 +176,16 @@ def test_audit_index_defaults_to_mtime_descending(tmp_path: Path):
 
     index = (audit_root / "index.html").read_text(encoding="utf-8")
     assert index.index('href="new-review/index.html"') < index.index('href="old-review/index.html"')
+
+
+def test_audit_index_uses_directory_timestamp_as_generated_time(tmp_path: Path):
+    audit_root = tmp_path / "agents" / "audits"
+    index_html = _write_text(
+        audit_root / "20260629_200000_review" / "index.html",
+        "<!doctype html><title>review</title>",
+    )
+
+    write_audit_index(audit_root=audit_root, latest_html=index_html, latest_title="Review")
+
+    index = (audit_root / "index.html").read_text(encoding="utf-8")
+    assert "生成：2026-06-29 20:00:00" in index
