@@ -29,6 +29,8 @@ SpeechBoundary-JA scorer v7 frame scores
 
 ## 路线修正
 
+- 2026-06-30 审计导航生成时间显示：`tools.audits.audit_nav` 的审计卡片新增“生成”时间，优先读取 summary 的 `generated_at/created_at/exported_at/timestamp`，没有显式字段时回退到审计目录名 `YYYYMMDD_HHMMSS` 前缀，最后才使用文件 mtime；用于区分多轮相近审计产物。已重建 `agents/audits/index.html` / `latest-audit.html`。
+
 - 2026-06-30 固定时间基准与 dead code 清理：所有“视频帧数规则”统一按 `BASE_FPS = 24000/1001` 换算为秒，`frame_gap_s = 2 / BASE_FPS`、`frame_min_duration_s = 20 / BASE_FPS`；视频实际 fps 不再参与 ASR 前切割、Pre-ASR、字幕 timing、aligned cache signature 或报告。删除 `probe_video_fps` 与 `SPEECH_BOUNDARY_JA_VIDEO_FPS` runtime 链路，aligned cache signature 升到 v9，boundary cache 升到 v13。`boundary.planner` 已从 active tree 移出，原 refiner edge batching / island materialization 内联到 `audio.chunk_packer`；本轮不新增 near-gap merge，不复活 dense-cut。
 
 - 2026-06-24 提交前全量代码审计：对 scorer v5 / Boundary Refiner v6 / Pre-ASR CueQC 断兼容改动做残留扫描，确认 active `src/` / `tools/` 不再输出旧 `fallback_type/fallback_subtype/fallback_window`、旧 scorer drop-gap、旧 split target/absolute threshold、ASR chunk min-duration 或 ASR-after active drop 语义。审计中修正了 Web smoke 与 workflow summary 仍把 ASR-after CueQC shadow 写成 `cueqc_enabled` / `stage_cueqc_drop_count` 的旧 active 口径，改为 `cueqc_shadow_enabled` / `stage_cueqc_shadow_drop_count`，避免后续脚本误判为 runtime drop。验证：`git diff --check`、核心 Python `py_compile`、重点回归 150 passed。
