@@ -59,12 +59,8 @@ DEFAULT_SETTINGS: dict[str, str] = {
     "ASR_LANGUAGE": "Japanese",
     # 1 forces the ASR language prompt instead of letting the model infer language.
     "ASR_FORCE_LANGUAGE": "1",
-    # Short recognition hint such as performer names or domain terms.
+    # Short recognition hint such as performer names or domain terms passed to Qwen ASR context.
     "ASR_CONTEXT": "",
-    # Optional extra prompt applied only near the start of the video.
-    "ASR_HEAD_CONTEXT": "",
-    # Latest segment start time, in seconds, that can receive ASR_HEAD_CONTEXT.
-    "ASR_HEAD_CONTEXT_MAX_START_S": "16",
 
     # --- Batch Size & Limits ---
     # ASR inference batch size. auto resolves by ASR_BACKEND repo id.
