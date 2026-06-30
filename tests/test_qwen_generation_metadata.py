@@ -21,8 +21,9 @@ def test_qwen_text_result_includes_generation_metadata(monkeypatch, tmp_path):
 
     assert result["text"] == "テスト"
     assert result["asr_generation"]["backend"] == ASR_17B_BACKEND
-    assert result["asr_generation"]["configured_max_new_tokens"] == local_backend.TRANSCRIPTION_MAX_NEW_TOKENS
+    assert result["asr_generation"]["configured_max_new_tokens"] == local_backend.ASR_MAX_NEW_TOKENS
     assert result["asr_generation"]["model_max_target_positions"] is None
+    assert result["asr_generation"]["policy"] == "qwen_from_pretrained_limit"
     assert result["asr_generation"]["error_kind"] is None
     assert "ASR 输出模式: text_only" in log
 

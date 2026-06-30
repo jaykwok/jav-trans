@@ -34,21 +34,6 @@ def test_checkpoint_key_changes_between_qwen_repo_backends(monkeypatch):
     assert default_key != large_key
 
 
-def test_checkpoint_key_changes_with_prompt_token_budget(monkeypatch):
-    default_key = _checkpoint_name(
-        monkeypatch,
-        asr_backend=ASR_06B_BACKEND,
-    )
-
-    monkeypatch.setenv("ASR_MIN_EFFECTIVE_NEW_TOKENS", "96")
-    tuned_key = _checkpoint_name(
-        monkeypatch,
-        asr_backend=ASR_06B_BACKEND,
-    )
-
-    assert default_key != tuned_key
-
-
 def test_checkpoint_key_changes_with_prompt_char_cap(monkeypatch):
     default_key = _checkpoint_name(
         monkeypatch,
@@ -116,7 +101,7 @@ def test_checkpoint_key_changes_with_qwen_generation_inputs(monkeypatch):
     )
 
     monkeypatch.setenv("ASR_LANGUAGE", "Japanese")
-    monkeypatch.setenv("TRANSCRIPTION_MAX_NEW_TOKENS", "256")
+    monkeypatch.setenv("ASR_MAX_NEW_TOKENS", "256")
     tuned_key = _checkpoint_name(
         monkeypatch,
         asr_backend=ASR_17B_BACKEND,
