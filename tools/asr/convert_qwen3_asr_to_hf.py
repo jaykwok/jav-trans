@@ -79,13 +79,28 @@ def _iter_source_tensors(source_model_dir: Path) -> list[TensorInfo]:
         for source_key, entry in header.items():
             if source_key == "__metadata__":
                 continue
-            if source_key.startswith("thinker."):
-                target_key = "model." + source_key[len("thinker.") :]
+            if source_key.startswith("thinker.audio_tower.proj1."):
+                target_key = "model.multi_modal_projector.linear_1." + source_key[
+                    len("thinker.audio_tower.proj1.") :
+                ]
+            elif source_key.startswith("thinker.audio_tower.proj2."):
+                target_key = "model.multi_modal_projector.linear_2." + source_key[
+                    len("thinker.audio_tower.proj2.") :
+                ]
+            elif source_key.startswith("thinker.audio_tower."):
+                target_key = "model.audio_tower." + source_key[
+                    len("thinker.audio_tower.") :
+                ]
+            elif source_key.startswith("thinker.model."):
+                target_key = "model.language_model." + source_key[
+                    len("thinker.model.") :
+                ]
             elif source_key.startswith("model."):
                 target_key = source_key
             else:
                 raise ValueError(
-                    f"Unexpected Qwen3-ASR tensor key {source_key!r}; expected thinker.* or model.*"
+                    f"Unexpected Qwen3-ASR tensor key {source_key!r}; expected thinker.audio_tower.*, "
+                    "thinker.model.*, or model.*"
                 )
             if target_key in seen_targets:
                 raise ValueError(f"Duplicate target tensor key after conversion: {target_key}")
@@ -238,7 +253,11 @@ def convert_qwen3_asr_checkpoint_to_hf(
             for index, shard in enumerate(shards, start=1)
         ],
         "copied_template_files": copied_template_files,
-        "key_rewrite": "thinker.* -> model.*",
+        "key_rewrite": (
+            "thinker.audio_tower.* -> model.audio_tower.*; "
+            "thinker.audio_tower.proj{1,2}.* -> model.multi_modal_projector.linear_{1,2}.*; "
+            "thinker.model.* -> model.language_model.*"
+        ),
     }
     if not dry_run:
         (output_dir / "conversion_report.json").write_text(
