@@ -437,6 +437,32 @@ def test_normalize_subtitle_timeline_locks_next_start_when_too_tight():
     assert prepared[0]["end"] <= prepared[1]["start"]
 
 
+def test_too_close_cues_keep_two_frame_gap_and_report_min_display_violation():
+    blocks = [
+        {
+            "start": 1.0,
+            "end": 1.03,
+            "ja_text": "前",
+            "zh_text": "前",
+        },
+        {
+            "start": 1.2,
+            "end": 1.6,
+            "ja_text": "次",
+            "zh_text": "下",
+        },
+    ]
+    options = SubtitleOptions()
+
+    prepared = subtitle.prepare_srt_blocks(blocks, options=options, mode="bilingual")
+
+    assert prepared[0]["end"] == pytest.approx(prepared[1]["start"] - options.frame_gap_s)
+    assert prepared[0]["display_duration"] < options.frame_min_duration_s
+    assert prepared[0]["duration_violation"] is True
+    assert prepared[0]["gap_violation"] is False
+    assert prepared[1]["gap_violation"] is False
+
+
 def test_write_bilingual_srt_returns_normalized_blocks(tmp_path):
     path = tmp_path / "normalized.srt"
     blocks = [
