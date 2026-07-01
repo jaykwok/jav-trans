@@ -303,7 +303,7 @@ async def pick_folder() -> dict[str, list[str]]:
     return {"paths": paths}
 
 
-@router.get("/open-video")
+@router.post("/open-video")
 async def open_video(job_id: str, path: str) -> dict[str, bool]:
     job = await get_job(job_id)
     if job is None:
@@ -320,7 +320,7 @@ async def open_video(job_id: str, path: str) -> dict[str, bool]:
     return {"ok": True}
 
 
-@router.get("/open-folder")
+@router.post("/open-folder")
 async def open_folder(job_id: str, path: str) -> dict[str, bool]:
     job = await get_job(job_id)
     if job is None:

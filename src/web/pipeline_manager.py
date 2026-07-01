@@ -627,6 +627,13 @@ async def update_job_progress(job_id: str, progress: dict[str, Any]) -> None:
 
 async def shutdown_executor() -> None:
     global _executor
+    # Signal in-flight ASR/translation tasks to bail at their next checkpoint.
+    # generate() itself is uninterruptible, so we don't block on the thread:
+    # the NVIDIA driver reclaims CUDA when the process exits, and these
+    # daemon=False threads are awaited by threading._shutdown on interpreter
+    # exit anyway. Setting cancel events just lets long batches finish sooner.
+    for event in _cancel_events.values():
+        event.set()
     _executor.shutdown(wait=False, cancel_futures=True)
     _executor = ThreadPoolExecutor(max_workers=_EXECUTOR_MAX_WORKERS)
 

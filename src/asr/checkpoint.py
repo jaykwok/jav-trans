@@ -52,13 +52,27 @@ def _is_timed_out_result(result: dict) -> bool:
     return any("TIMEOUT:" in entry for entry in result.get("log", []))
 
 
+def _is_quarantined_result(result: dict) -> bool:
+    # Circuit-breaker quarantined chunks must NOT be persisted as completed
+    # results: they carry empty text and must be re-transcribed on resume.
+    # Tagged via asr_generation.policy == "quarantined_result" (and a
+    # "QUARANTINED:" log line), distinct from timeout results.
+    generation = result.get("asr_generation")
+    if isinstance(generation, dict) and generation.get("policy") == "quarantined_result":
+        return True
+    return any(
+        isinstance(entry, str) and entry.startswith("QUARANTINED:")
+        for entry in result.get("log", [])
+    )
+
+
 def _checkpointable_text_results(
     text_results_by_index: dict[int, dict],
 ) -> dict[int, dict]:
     return {
         index: result
         for index, result in text_results_by_index.items()
-        if not _is_timed_out_result(result)
+        if not _is_timed_out_result(result) and not _is_quarantined_result(result)
     }
 
 
@@ -219,7 +233,7 @@ def _load_asr_checkpoint(
             continue
         if chunk_index not in chunk_by_index or not isinstance(value, dict):
             continue
-        if _is_timed_out_result(value):
+        if _is_timed_out_result(value) or _is_quarantined_result(value):
             continue
         saved_chunk_signature = (
             saved_signature.get(str(chunk_index))
