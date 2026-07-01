@@ -636,19 +636,19 @@ async def _test_open_routes_are_limited_to_job_paths(tmp_path, monkeypatch):
             transport=transport,
             base_url="http://test",
         ) as client:
-            allowed_video = await client.get(
+            allowed_video = await client.post(
                 "/api/open-video",
                 params={"job_id": job.id, "path": str(video_path)},
             )
-            blocked_video = await client.get(
+            blocked_video = await client.post(
                 "/api/open-video",
                 params={"job_id": job.id, "path": str(other_video)},
             )
-            allowed_folder = await client.get(
+            allowed_folder = await client.post(
                 "/api/open-folder",
                 params={"job_id": job.id, "path": "sample.srt"},
             )
-            blocked_folder = await client.get(
+            blocked_folder = await client.post(
                 "/api/open-folder",
                 params={"job_id": job.id, "path": str(unrelated_path)},
             )

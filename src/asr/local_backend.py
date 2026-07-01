@@ -49,6 +49,78 @@ _ASR_SUBPROCESS_READY_TIMEOUT_S = float(
     os.getenv("ASR_SUBPROCESS_READY_TIMEOUT_S", "600")
 )
 
+
+# --- Windows Job Object: kill the ASR subprocess if the parent dies abnormally
+# (kill -9 / segfault / OOM-killer / task-manager end). daemon=True only covers
+# graceful interpreter exit; a Job Object with JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+# makes the OS reap the child when the parent process vanishes. Best-effort: on
+# failure we fall back to the explicit _kill_child path on close(). ---
+if os.name == "nt":
+    import ctypes
+
+    _JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x2000
+    _JobObjectExtendedLimitInformation = 9
+
+    class _IO_COUNTERS(ctypes.Structure):
+        _fields_ = [
+            ("ReadOperationCount", ctypes.c_ulonglong),
+            ("WriteOperationCount", ctypes.c_ulonglong),
+            ("OtherOperationCount", ctypes.c_ulonglong),
+            ("ReadTransferCount", ctypes.c_ulonglong),
+            ("WriteTransferCount", ctypes.c_ulonglong),
+            ("OtherTransferCount", ctypes.c_ulonglong),
+        ]
+
+    class _JOBOBJECT_BASIC_LIMIT_INFORMATION(ctypes.Structure):
+        _fields_ = [
+            ("PerProcessUserTimeLimit", ctypes.c_int64),
+            ("PerJobUserTimeLimit", ctypes.c_int64),
+            ("LimitFlags", ctypes.c_uint32),
+            ("MinimumWorkingSetSize", ctypes.c_size_t),
+            ("MaximumWorkingSetSize", ctypes.c_size_t),
+            ("ActiveProcessLimit", ctypes.c_uint32),
+            ("Affinity", ctypes.c_size_t),
+            ("PriorityClass", ctypes.c_uint32),
+            ("SchedulingClass", ctypes.c_uint32),
+        ]
+
+    class _JOBOBJECT_EXTENDED_LIMIT_INFORMATION(ctypes.Structure):
+        _fields_ = [
+            ("BasicLimitInformation", _JOBOBJECT_BASIC_LIMIT_INFORMATION),
+            ("IoInfo", _IO_COUNTERS),
+            ("ProcessMemoryLimit", ctypes.c_size_t),
+            ("JobMemoryLimit", ctypes.c_size_t),
+            ("PeakProcessMemoryUsed", ctypes.c_size_t),
+            ("PeakJobMemoryUsed", ctypes.c_size_t),
+        ]
+
+    def _create_kill_on_close_job_object():
+        kernel32 = ctypes.windll.kernel32
+        job = kernel32.CreateJobObjectW(None, None)
+        if not job:
+            raise ctypes.WinError()
+        info = _JOBOBJECT_EXTENDED_LIMIT_INFORMATION()
+        info.BasicLimitInformation.LimitFlags = _JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+        ok = kernel32.SetInformationJobObject(
+            job,
+            _JobObjectExtendedLimitInformation,
+            ctypes.byref(info),
+            ctypes.sizeof(info),
+        )
+        if not ok:
+            raise ctypes.WinError()
+        return job
+
+    def _assign_process_to_job_object(job, process) -> None:
+        kernel32 = ctypes.windll.kernel32
+        # multiprocessing spawn Process keeps the Win32 process handle on its
+        # Popen object (process._popen._handle).
+        handle = getattr(getattr(process, "_popen", None), "_handle", None)
+        if not handle:
+            raise RuntimeError("subprocess has no win32 handle to assign")
+        if not kernel32.AssignProcessToJobObject(job, handle):
+            raise ctypes.WinError()
+
 def _get_wav_duration(audio_path: str) -> float:
     with wave.open(audio_path, "rb") as wav_file:
         frames = wav_file.getnframes()
@@ -229,8 +301,11 @@ def normalize_word_dicts(words: list[dict]) -> list[dict]:
             continue
         start = float(word.get("start", 0.0))
         end = float(word.get("end", 0.0))
-        if end < start:
-            end = start
+        if end <= start:
+            # Drop zero-width / inverted words (floating-point drift in
+            # proportional timing can produce them); downstream renderers
+            # already ignore words without a positive span.
+            continue
         normalized.append({"start": start, "end": end, "word": token})
     normalized.sort(key=lambda item: (item["start"], item["end"]))
     return normalized
@@ -369,6 +444,11 @@ class LocalAsrBackend:
             except concurrent.futures.TimeoutError:
                 timed_out = True
                 future.cancel()
+                # The native generate keeps running in the worker thread and
+                # cannot be interrupted. Drop our model reference so the next
+                # call reloads a fresh model instead of sharing this one with
+                # the zombie generate (PyTorch generate is not concurrency-safe).
+                self.model = None
                 _notify(
                     on_stage,
                     f"[WARN] ASR 超时 ({_transcription_timeout_s()}s)，跳过当前批次",
@@ -661,6 +741,7 @@ class SubprocessAsrBackend:
         self._ctx = mp.get_context("spawn")
         self._process = None
         self._conn = None
+        self._job_handle = None  # Windows Job Object handle (kill on parent death)
 
     def load(self, on_stage: Callable[[str], None] | None = None) -> None:
         self._ensure_worker(on_stage=on_stage)
@@ -683,6 +764,18 @@ class SubprocessAsrBackend:
 
         _notify(on_stage, "启动 ASR 子进程...")
         process.start()
+        # Best-effort: bind the subprocess to a kill-on-close Job Object so the
+        # OS reaps it if this parent dies abnormally (kill -9 / segfault / task
+        # manager). daemon=False cannot cover that. Non-Windows falls back to
+        # the explicit _kill_child on close() + the worker recv() EOF path.
+        self._job_handle = None
+        if os.name == "nt":
+            try:
+                job = _create_kill_on_close_job_object()
+                _assign_process_to_job_object(job, process)
+                self._job_handle = job
+            except Exception:
+                self._job_handle = None
         child_conn.close()
         self._process = process
         self._conn = parent_conn

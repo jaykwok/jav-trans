@@ -92,3 +92,22 @@ def test_checkpoint_key_changes_with_qwen_generation_inputs(monkeypatch):
 
     assert default_key != tuned_key
 
+
+def test_checkpoint_excludes_quarantined_results():
+    from asr.checkpoint import _checkpointable_text_results
+
+    text_results = {
+        0: {"text": "ok", "log": [], "asr_generation": {"policy": "ok"}},
+        1: {
+            "text": "",
+            "log": ["QUARANTINED: kind=timeout, respawn_count=3"],
+            "asr_generation": {"policy": "quarantined_result"},
+        },
+        2: {"text": "ok2", "log": ["TIMEOUT: 180s"], "asr_generation": {}},
+    }
+    filtered = _checkpointable_text_results(text_results)
+    # Quarantined (1) and timed-out (2) are excluded; only the clean result (0)
+    # persists, so quarantined chunks get re-transcribed on resume instead of
+    # being silently restored as empty completed results.
+    assert set(filtered.keys()) == {0}
+

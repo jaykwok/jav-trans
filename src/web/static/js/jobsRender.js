@@ -182,7 +182,7 @@ export function installJobAreaHandlers(fetchAllJobs, enableHfMirror) {
       const videoPath = job?.spec?.video_paths?.[0];
       if (videoPath) {
         try {
-          await fetch(`/api/open-video?job_id=${encodeURIComponent(play.dataset.play)}&path=${encodeURIComponent(videoPath)}`);
+          await fetch(`/api/open-video?job_id=${encodeURIComponent(play.dataset.play)}&path=${encodeURIComponent(videoPath)}`, { method: 'POST' });
         } catch {}
       }
       return;
@@ -192,7 +192,7 @@ export function installJobAreaHandlers(fetchAllJobs, enableHfMirror) {
       const card = folder.closest('.job-card');
       const jobId = card?.dataset?.id || '';
       try {
-        await fetch(`/api/open-folder?job_id=${encodeURIComponent(jobId)}&path=${encodeURIComponent(folder.dataset.folder)}`);
+        await fetch(`/api/open-folder?job_id=${encodeURIComponent(jobId)}&path=${encodeURIComponent(folder.dataset.folder)}`, { method: 'POST' });
       } catch {}
       return;
     }
