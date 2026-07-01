@@ -255,7 +255,6 @@ def build_context(*, args: argparse.Namespace, paths: RunPaths, video: Path):
         "ASR_BOUNDARY_BACKEND": "speech_boundary_ja",
         "ASR_MODEL_PATH": project_path_value(args.asr_model_path),
         "ASR_WORKER_MODE": args.asr_worker_mode,
-        "ASR_CONTEXT": args.asr_context,
         "TRANSCRIPTION_TIMEOUT_S": str(args.transcription_timeout_s),
         "ASR_MAX_NEW_TOKENS": str(args.asr_max_new_tokens),
         "ASR_BATCH_SIZE": args.asr_batch_size,
@@ -308,7 +307,6 @@ def build_context(*, args: argparse.Namespace, paths: RunPaths, video: Path):
     }
     spec = SimpleNamespace(
         asr_backend=args.asr_backend,
-        asr_context=args.asr_context,
         subtitle_mode=args.subtitle_mode,
         skip_translation=not args.translate,
         output_dir=str(paths.generated / job_id),
@@ -506,7 +504,6 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--asr-batch-size", default=os.getenv("ASR_BATCH_SIZE", "auto"))
     parser.add_argument("--asr-max-new-tokens", type=int, default=_env_int("ASR_MAX_NEW_TOKENS", 128))
     parser.add_argument("--transcription-timeout-s", type=int, default=_env_int("TRANSCRIPTION_TIMEOUT_S", 300))
-    parser.add_argument("--asr-context", default=os.getenv("ASR_CONTEXT", ""))
     parser.add_argument("--subtitle-mode", default="zh")
     parser.add_argument("--translate", action="store_true", help="Run LLM translation too. Default outputs Japanese SRT.")
     parser.add_argument("--target-lang", default=os.getenv("TARGET_LANG", "简体中文"))

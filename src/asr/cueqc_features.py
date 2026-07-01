@@ -218,7 +218,6 @@ def build_decoder_stats(
     is_punct = token_trace[:, idx["is_punctuation"]]
     is_special = token_trace[:, idx["is_special_token"]]
     is_language = token_trace[:, idx["is_language_token"]]
-    is_numeric = token_trace[:, idx["is_numeric_token"]]
     char_lens = token_trace[:, idx["token_char_len"]]
 
     n_tok = token_trace.shape[0]
@@ -239,7 +238,6 @@ def build_decoder_stats(
     punct_ratio = float(np.mean(is_punct)) if n_tok else 0.0
     special_ratio = float(np.mean(is_special)) if n_tok else 0.0
     language_ratio = float(np.mean(is_language)) if n_tok else 0.0
-    numeric_ratio = float(np.mean(is_numeric)) if n_tok else 0.0
 
     # Character-level repetition over the cleaned text.
     compact = "".join(ch for ch in text if ch.isalnum())
@@ -280,9 +278,9 @@ def build_decoder_stats(
         avg_token_duration,
         max_token_gap,
     ]
-    # numeric_ratio is folded into language_token_ratio column per schema
-    # (language_token_ratio is the dominant script signal; numeric is covered by
-    # the token trace). Keep the vector length exactly K_DEC.
+    # language_token_ratio captures the language-script token share (kana/kanji
+    # etc.). Numeric tokens stay available via the token trace's is_numeric_token
+    # column but are not duplicated as a decoder stat; vector length is fixed at K_DEC.
     assert len(stats) == K_DEC, f"decoder stats length {len(stats)} != {K_DEC}"
     return _clean_finite(np.array(stats, dtype=np.float32))
 

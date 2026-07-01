@@ -19,7 +19,6 @@ than a strict equivalence — re-evaluate then.
 """
 from __future__ import annotations
 
-import os
 from typing import Any
 
 import numpy as np
@@ -58,7 +57,6 @@ class AsrInternalsCapturer:
         model_spec: str | None = None,
         device: str = "auto",
         dtype: str | None = None,
-        context: str | None = None,
         force_language: str | None = None,
     ) -> None:
         import torch  # noqa: F401  (ensure import ordering)
@@ -78,8 +76,7 @@ class AsrInternalsCapturer:
         self.dtype = self._infer_dtype(self.model)
 
         # Prompt configuration. Defaults follow LocalAsrBackend: language forced
-        # to ASR_LANGUAGE (Japanese) and empty context unless overridden.
-        self.context = context if context is not None else os.getenv("ASR_CONTEXT", "").strip()
+        # to ASR_LANGUAGE (Japanese) unless overridden.
         if force_language is not None:
             self.force_language = force_language or None
         else:
@@ -157,7 +154,6 @@ class AsrInternalsCapturer:
 
         return build_transcription_prompt(
             self.processor,
-            context=self.context or "",
             language=self.force_language,
         )
 

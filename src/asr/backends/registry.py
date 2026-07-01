@@ -7,9 +7,6 @@ from asr.local_backend import LocalAsrBackend, SubprocessAsrBackend
 
 DEFAULT_ASR_BACKEND = DEFAULT_QWEN_ASR_BACKEND
 
-ASR_BACKEND = os.getenv("ASR_BACKEND", DEFAULT_ASR_BACKEND).strip() or DEFAULT_ASR_BACKEND
-_ASR_WORKER_MODE = os.getenv("ASR_WORKER_MODE", "subprocess").strip().lower()
-
 _QWEN_BACKENDS = set(QWEN_ASR_BACKEND_REPOS)
 _VALID_ASR_BACKENDS = set(_QWEN_BACKENDS)
 _VALID_ASR_WORKER_MODES = {"inproc", "subprocess"}

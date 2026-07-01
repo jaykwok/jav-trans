@@ -8,7 +8,6 @@ class BaseAsrBackend(Protocol):
     """Interface shared by in-process and subprocess ASR backends."""
 
     is_subprocess: bool
-    accepts_contexts: bool
     request_batch_size: int
 
     def load(self, on_stage: Callable[[str], None] | None = None) -> None: ...
@@ -18,7 +17,6 @@ class BaseAsrBackend(Protocol):
     def transcribe_texts(
         self,
         audio_paths: list[str],
-        contexts: list[str] | None = None,
         on_stage: Callable[[str], None] | None = None,
     ) -> list[dict[str, Any]]: ...
 

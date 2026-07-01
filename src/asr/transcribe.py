@@ -64,10 +64,6 @@ _TRIVIAL_SEGMENT = re.compile(
 _STRIP_PUNCT_RE = re.compile(r"[。！？…、,.!?・「」『』（）()【】\[\]\s~〜ー-]+")
 
 
-def _asr_context() -> str:
-    return os.getenv("ASR_CONTEXT", "").strip()
-
-
 def _current_asr_worker_mode() -> str:
     return current_asr_worker_mode()
 
@@ -109,11 +105,9 @@ def _word_backed_segment_text(words: list[dict]) -> str:
 
 
 def _alignment_window_from_chunk(
-    chunk: dict,
     *,
     duration: float,
 ) -> tuple[float, float, str]:
-    del chunk
     return 0.0, max(0.0, float(duration)), "chunk"
 
 
@@ -128,10 +122,7 @@ def _with_alignment_window(chunk: dict, text_result: dict) -> dict:
             0.0,
             float(chunk.get("end", 0.0)) - float(chunk.get("start", 0.0)),
         )
-    start_s, end_s, source = _alignment_window_from_chunk(
-        chunk,
-        duration=duration,
-    )
+    start_s, end_s, source = _alignment_window_from_chunk(duration=duration)
     result["alignment_window_start_s"] = round(start_s, 6)
     result["alignment_window_end_s"] = round(end_s, 6)
     result["alignment_window_source"] = source
@@ -184,9 +175,7 @@ def _alignment_outcome_for_chunk(
     chunk: dict,
     chunk_result: dict,
     chunk_words: list[dict],
-    chunk_log: list[str],
 ) -> dict:
-    del chunk_log
     text = str(chunk_result.get("text") or chunk_result.get("raw_text") or "").strip()
     alignment_mode = str(chunk_result.get("alignment_mode") or "").strip()
     align_error = str(chunk_result.get("align_error") or "").strip()
@@ -329,13 +318,8 @@ def _transcribe_asr_chunks_text_only(
         _save_progress_checkpoint()
 
     def _transcribe_batch(batch_chunks: list[dict]) -> list[dict]:
-        batch_contexts = [_build_ASR_CONTEXT_for_chunk(chunk) for chunk in batch_chunks]
         audio_paths = [chunk["path"] for chunk in batch_chunks]
-        kwargs = {
-            "contexts": batch_contexts,
-            "on_stage": on_stage,
-        }
-        return backend.transcribe_texts(audio_paths, **kwargs)
+        return backend.transcribe_texts(audio_paths, on_stage=on_stage)
 
     try:
         if not is_subprocess_backend:
@@ -754,11 +738,6 @@ def _build_transcript_chunks(
     return transcript_chunks
 
 
-def _build_ASR_CONTEXT_for_chunk(chunk: dict) -> str:
-    context = _asr_context()
-    return context
-
-
 def _postprocess_segments(segments: list[dict]) -> list[dict]:
     cleaned_segments: list[dict] = []
 
@@ -806,10 +785,6 @@ def _repair_postprocessed_segment_windows(segments: list[dict]) -> list[dict]:
         duration = end - start
         if duration <= _ASR_INVALID_SEGMENT_DURATION_S:
             target_end = start + _ASR_MIN_REPAIRED_SEGMENT_DURATION_S
-
-            if target_end - start <= _ASR_INVALID_SEGMENT_DURATION_S:
-                target_end = start + _ASR_MIN_REPAIRED_SEGMENT_DURATION_S
-
             end = max(end, target_end)
 
         repaired.append(

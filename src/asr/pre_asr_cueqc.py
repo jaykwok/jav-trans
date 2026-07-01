@@ -916,6 +916,7 @@ class PreAsrCueQC:
         self.drop_threshold = float(
             decision.get("drop_threshold", PRE_ASR_CUEQC_DEFAULT_DROP_THRESHOLD)
         )
+        self.inference_window_size = max(0, int(decision.get("inference_window_size") or 512))
         self.hard_keep_veto_enabled = bool(decision.get("hard_keep_veto", True))
         self.hard_drop_rule_enabled = bool(decision.get("hard_drop_rule", True))
         self.keep_veto_enabled = bool(decision.get("keep_veto", True))
@@ -934,6 +935,7 @@ class PreAsrCueQC:
             "path": str(self.path),
             "sha256": self.sha256,
             "drop_threshold": self.drop_threshold,
+            "inference_window_size": self.inference_window_size,
             "metadata": self.metadata,
         }
 
@@ -1008,18 +1010,66 @@ class PreAsrCueQC:
         bin_mask = np.asarray(tensors["bin_mask"], dtype=np.float32)
         chunk_mask = np.asarray(tensors["chunk_mask"], dtype=np.float32)
         with torch.inference_mode():
-            logits = self.model(
-                torch.from_numpy(ptm_bins).to(self.device),
-                torch.from_numpy(scalar).to(self.device),
-                chunk_mask=torch.from_numpy(chunk_mask).to(self.device),
-                bin_mask=torch.from_numpy(bin_mask).to(self.device),
-            )
+            ptm_t = torch.from_numpy(ptm_bins).to(self.device)
+            scalar_t = torch.from_numpy(scalar).to(self.device)
+            chunk_mask_t = torch.from_numpy(chunk_mask).to(self.device)
+            bin_mask_t = torch.from_numpy(bin_mask).to(self.device)
+            if self.inference_window_size > 0 and ptm_t.shape[1] > self.inference_window_size:
+                batch, max_chunks = tuple(chunk_mask_t.shape)
+                logits = torch.zeros((batch, max_chunks, 2), dtype=torch.float32, device=self.device)
+                counts = torch.zeros((batch, max_chunks, 1), dtype=torch.float32, device=self.device)
+                window = min(int(self.inference_window_size), int(max_chunks))
+                for group_index in range(int(batch)):
+                    length = int(chunk_mask_t[group_index].sum().detach().cpu().item())
+                    if length <= 0:
+                        continue
+                    for start in range(0, length, window):
+                        end = min(length, start + window)
+                        window_logits = self.model(
+                            ptm_t[group_index : group_index + 1, start:end],
+                            scalar_t[group_index : group_index + 1, start:end],
+                            chunk_mask=chunk_mask_t[group_index : group_index + 1, start:end],
+                            bin_mask=bin_mask_t[group_index : group_index + 1, start:end],
+                        )
+                        logits[group_index, start:end] += window_logits[0].float()
+                        counts[group_index, start:end] += 1.0
+                logits = logits / counts.clamp_min(1.0)
+            else:
+                logits = self.model(
+                    ptm_t,
+                    scalar_t,
+                    chunk_mask=chunk_mask_t,
+                    bin_mask=bin_mask_t,
+                )
             probs = torch.softmax(logits, dim=-1).float().cpu().numpy()
         positions = list(tensors["positions"])
         decisions: list[dict[str, Any]] = []
         for index, candidate in enumerate(candidates):
             group_index, chunk_index = positions[index]
             if group_index < 0 or chunk_index < 0:
+                # No model position resolved for this candidate (upstream grouping
+                # left it unassigned). Emit a conservative keep fallback so the
+                # returned list stays 1:1 with `candidates` and downstream
+                # positional write-back cannot desync.
+                decisions.append(
+                    {
+                        "schema": "pre_asr_cueqc_decision_v2",
+                        "decision_version": PRE_ASR_CUEQC_DECISION_VERSION,
+                        "model_schema": PRE_ASR_CUEQC_SCHEMA,
+                        "model_arch": PRE_ASR_CUEQC_MODEL_ARCH,
+                        "feature_schema": PRE_ASR_CUEQC_FEATURE_SCHEMA,
+                        "runtime_adapter": PRE_ASR_CUEQC_RUNTIME_ADAPTER,
+                        "index": int(candidate.get("index", index)),
+                        "route": "keep_for_asr",
+                        "confidence": 0.0,
+                        "prob_drop": 0.0,
+                        "prob_keep": 0.0,
+                        "drop_threshold": round(self.drop_threshold, 4),
+                        "reason": "no_model_position",
+                        "veto_reason": "",
+                        "hard_rule_reason": "",
+                    }
+                )
                 continue
             prob = probs[group_index, chunk_index]
             p_drop = float(prob[0])

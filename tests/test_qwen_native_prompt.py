@@ -29,13 +29,12 @@ class FakeProcessor:
         )
 
 
-def test_prepare_transcription_inputs_without_context_uses_official_helper():
+def test_prepare_transcription_inputs_uses_official_helper():
     processor = FakeProcessor()
 
     result = prepare_transcription_inputs(
         processor,
         audio=["a.wav"],
-        contexts=[""],
         language="Japanese",
     )
 
@@ -47,36 +46,24 @@ def test_prepare_transcription_inputs_without_context_uses_official_helper():
     assert processor.chat_template_request is None
 
 
-def test_prepare_transcription_inputs_with_context_uses_tokenized_chat_template():
+def test_prepare_transcription_inputs_has_no_context_branch():
     processor = FakeProcessor()
 
     result = prepare_transcription_inputs(
         processor,
         audio=["a.wav"],
-        contexts=["小那海あや"],
         language="Japanese",
     )
 
-    assert result == {"chat_template": True}
-    request = processor.chat_template_request
-    assert request["kwargs"] == {
-        "tokenize": True,
-        "add_generation_prompt": True,
-        "return_dict": True,
-        "processor_kwargs": {"padding": True},
-    }
-    messages = request["conversations"][0]
-    assert messages[0]["role"] == "system"
-    assert messages[0]["content"][0]["text"] == "Japanese\nContext hint: 小那海あや"
-    assert messages[1]["content"][0]["audio"] == "a.wav"
+    assert result == {"official": True}
+    assert processor.chat_template_request is None
 
 
 def test_build_transcription_prompt_does_not_use_legacy_language_prefill():
     prompt = build_transcription_prompt(
         FakeProcessor(),
-        context="小那海あや",
         language="Japanese",
     )
 
-    assert "Context hint: 小那海あや" in prompt
+    assert "Context hint:" not in prompt
     assert "language Japanese<asr_text>" not in prompt

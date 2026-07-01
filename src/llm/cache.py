@@ -34,25 +34,30 @@ def _translation_memory_jsonl_path(path: Path) -> Path:
 
 def _read_translation_cache_jsonl(path: Path) -> dict:
     cache: dict[str, list] = {}
-    try:
-        if not path.exists():
-            return {}
-        with path.open("r", encoding="utf-8") as reader:
-            for line in reader:
-                line = line.strip()
-                if not line:
-                    continue
-                item = json.loads(line)
-                if not isinstance(item, dict):
-                    continue
-                key = item.get("key")
-                value = item.get("value")
-                if isinstance(key, str) and isinstance(value, list):
-                    cache[key] = value
-        return cache
-    except Exception as exc:
-        _warn_translation_cache(f"JSONL load failed for {path}: {exc}")
+    if not path.exists():
         return {}
+    skipped = 0
+    with path.open("r", encoding="utf-8") as reader:
+        for line in reader:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                item = json.loads(line)
+            except json.JSONDecodeError:
+                # Skip a corrupted/partial line (e.g. a crash mid-append) but
+                # keep the rest of the cache intact instead of dropping it all.
+                skipped += 1
+                continue
+            if not isinstance(item, dict):
+                continue
+            key = item.get("key")
+            value = item.get("value")
+            if isinstance(key, str) and isinstance(value, list):
+                cache[key] = value
+    if skipped:
+        _warn_translation_cache(f"skipped {skipped} corrupt line(s) in {path}")
+    return cache
 
 
 def _save_cache_entry(path, batch_key, zh_texts, lock) -> None:
@@ -87,25 +92,28 @@ def _load_translation_memory(path) -> dict:
 
 def _read_translation_memory_jsonl(path: Path) -> dict:
     memory: dict[str, str] = {}
-    try:
-        if not path.exists():
-            return {}
-        with path.open("r", encoding="utf-8") as reader:
-            for line in reader:
-                line = line.strip()
-                if not line:
-                    continue
-                item = json.loads(line)
-                if not isinstance(item, dict):
-                    continue
-                key = item.get("key")
-                value = item.get("value")
-                if isinstance(key, str) and isinstance(value, str):
-                    memory[key] = value
-        return memory
-    except Exception as exc:
-        _warn_translation_cache(f"memory JSONL load failed for {path}: {exc}")
+    if not path.exists():
         return {}
+    skipped = 0
+    with path.open("r", encoding="utf-8") as reader:
+        for line in reader:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                item = json.loads(line)
+            except json.JSONDecodeError:
+                skipped += 1
+                continue
+            if not isinstance(item, dict):
+                continue
+            key = item.get("key")
+            value = item.get("value")
+            if isinstance(key, str) and isinstance(value, str):
+                memory[key] = value
+    if skipped:
+        _warn_translation_cache(f"skipped {skipped} corrupt line(s) in memory {path}")
+    return memory
 
 
 def _save_memory_entries(path, entries: list[tuple[str, str]], lock) -> None:

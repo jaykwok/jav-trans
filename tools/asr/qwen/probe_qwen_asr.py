@@ -139,9 +139,8 @@ def run(args: argparse.Namespace) -> None:
             for batch_start in range(0, len(rows), args.batch_size):
                 batch = rows[batch_start : batch_start + args.batch_size]
                 batch_paths = [str(row["audio"]) for row in batch]
-                batch_contexts = [args.context] * len(batch_paths)
                 batch_time = time.perf_counter()
-                results = backend.transcribe_texts(batch_paths, contexts=batch_contexts, on_stage=events.append)
+                results = backend.transcribe_texts(batch_paths, on_stage=events.append)
                 elapsed = time.perf_counter() - batch_time
                 for row, result in zip(batch, results, strict=True):
                     predicted = str(result.get("text") or result.get("raw_text") or "")
@@ -216,7 +215,6 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--max-new-tokens", type=int, default=128)
     parser.add_argument("--timeout-s", type=float, default=180.0)
     parser.add_argument("--language", default="Japanese")
-    parser.add_argument("--context", default="")
     parser.add_argument("--limit", type=int)
     parser.add_argument("--output-dir", required=True)
     return parser.parse_args(argv)

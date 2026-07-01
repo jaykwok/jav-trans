@@ -817,7 +817,6 @@ def run_pipeline_for_case(
     }
     ctx = JobContext(
         asr_backend=backend,
-        asr_context="",
         subtitle_mode="zh",
         skip_translation=skip_translation,
         target_lang="简体中文",

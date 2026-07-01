@@ -126,8 +126,6 @@ export async function loadSettings() {
       $('api-model-preview').textContent = '当前：' + s.model;
     }
     $('mirror-enabled').checked = s.hf_endpoint === 'https://hf-mirror.com';
-    const asrContext = $('r-asr-context');
-    if (asrContext) asrContext.value = s.asr_context || '';
 
     const effort = $('api-reasoning-effort');
     if (effort) effort.value = s.llm_reasoning_effort || 'xhigh';
@@ -171,7 +169,6 @@ export function readTranslationSettingsFromForm() {
 
 function buildSettingsBodyFromForm({ includeConnection = false, includeMirror = false } = {}) {
   const body = readTranslationSettingsFromForm();
-  body.asr_context = $('r-asr-context')?.value.trim() || '';
   if (includeConnection) {
     const apiKey = $('api-key').value.trim();
     const baseUrl = $('api-base-url').value.trim();

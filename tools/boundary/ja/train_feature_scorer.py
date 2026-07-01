@@ -83,6 +83,9 @@ def run(args: argparse.Namespace) -> None:
             threshold=args.threshold,
             split_threshold=args.split_threshold,
             max_eval_windows=args.max_eval_windows,
+            max_train_frames=args.max_train_frames,
+            max_eval_frames=args.max_eval_frames,
+            cuda_empty_cache_every=args.cuda_empty_cache_every,
             log_every=args.log_every,
         ),
         labels_path=str(labels_path),
@@ -156,6 +159,24 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--threshold", type=float, default=0.5)
     parser.add_argument("--split-threshold", type=float, default=0.5)
     parser.add_argument("--max-eval-windows", type=int, default=256)
+    parser.add_argument(
+        "--max-train-frames",
+        type=int,
+        default=0,
+        help="Randomly crop each training sequence to at most this many frames before GPU forward; 0 disables.",
+    )
+    parser.add_argument(
+        "--max-eval-frames",
+        type=int,
+        default=0,
+        help="Center-crop each eval sequence to at most this many frames before GPU forward; 0 disables.",
+    )
+    parser.add_argument(
+        "--cuda-empty-cache-every",
+        type=int,
+        default=0,
+        help="Call torch.cuda.empty_cache every N train/eval steps on CUDA; 0 disables.",
+    )
     parser.add_argument("--log-every", type=int, default=0, help="Print train progress every N steps; 0 disables.")
     args = parser.parse_args(argv)
     if args.max_steps <= 0:
@@ -208,6 +229,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         parser.error("--split-threshold must be in [0, 1]")
     if args.max_eval_windows <= 0:
         parser.error("--max-eval-windows must be positive")
+    if args.max_train_frames < 0:
+        parser.error("--max-train-frames must be non-negative")
+    if args.max_eval_frames < 0:
+        parser.error("--max-eval-frames must be non-negative")
+    if args.cuda_empty_cache_every < 0:
+        parser.error("--cuda-empty-cache-every must be non-negative")
     if args.log_every < 0:
         parser.error("--log-every must be non-negative")
     return args

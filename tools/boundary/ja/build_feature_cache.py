@@ -81,6 +81,35 @@ def _count_jsonl_rows(path: Path) -> int:
     return count
 
 
+def _count_unresolved_error_rows(path: Path, resolved_label_indexes: set[int]) -> int:
+    if not path.exists():
+        return 0
+    count = 0
+    with path.open("r", encoding="utf-8") as handle:
+        for line in handle:
+            if not line.strip():
+                continue
+            try:
+                row = json.loads(line)
+            except json.JSONDecodeError:
+                count += 1
+                continue
+            if not isinstance(row, Mapping):
+                count += 1
+                continue
+            label_index = row.get("label_index")
+            if label_index is None:
+                count += 1
+                continue
+            try:
+                if int(label_index) in resolved_label_indexes:
+                    continue
+            except (TypeError, ValueError):
+                pass
+            count += 1
+    return count
+
+
 def _stream_training_examples(
     *,
     labels_path: Path,
@@ -339,6 +368,31 @@ def _prepare_batch(
     return prepared, errors, time.perf_counter() - prepare_start
 
 
+def _extract_ptm_window_features(
+    *,
+    ptm_extractor: Any,
+    window_audios: list[np.ndarray],
+    sample_rate: int,
+    ptm_window_batch_size: int,
+) -> tuple[list[np.ndarray], int]:
+    if not window_audios:
+        return [], 0
+    window_batch_size = max(0, int(ptm_window_batch_size))
+    if window_batch_size <= 0 or window_batch_size >= len(window_audios):
+        return ptm_extractor.extract_batch(window_audios, sample_rate=sample_rate), 1
+    features: list[np.ndarray] = []
+    batch_count = 0
+    for start in range(0, len(window_audios), window_batch_size):
+        features.extend(
+            ptm_extractor.extract_batch(
+                window_audios[start : start + window_batch_size],
+                sample_rate=sample_rate,
+            )
+        )
+        batch_count += 1
+    return features, batch_count
+
+
 def run(args: argparse.Namespace) -> None:
     output_dir = Path(args.output_dir)
     feature_dir = output_dir / "features"
@@ -372,6 +426,8 @@ def run(args: argparse.Namespace) -> None:
         f"feature_cache_start selected={len(selected_examples)} examples={len(examples)} "
         f"device={args.device} dtype={args.dtype} ptm={args.ptm} "
         f"batch_size={args.batch_size} prepare_workers={args.prepare_workers} "
+        f"ptm_window_batch_size={args.ptm_window_batch_size} "
+        f"batch_log_every={args.batch_log_every} "
         f"feature_window_s={args.feature_window_s} feature_overlap_s={args.feature_overlap_s}",
         flush=True,
     )
@@ -392,7 +448,7 @@ def run(args: argparse.Namespace) -> None:
             flush=True,
         )
     skipped_count = _write_jsonl_file(skipped_path, skipped) if not args.resume else _write_jsonl_file(skipped_path, skipped)
-    error_count = _count_jsonl_rows(errors_path) if args.resume else 0
+    error_count = _count_unresolved_error_rows(errors_path, existing_indexes) if args.resume else 0
     try:
         first_parameter = next(ptm_extractor.model.parameters())
         actual_device = str(first_parameter.device)
@@ -471,12 +527,24 @@ def run(args: argparse.Namespace) -> None:
                     next_future: Future | None = None
                     if next_index < len(batch_starts):
                         next_future = submit_prepare(batch_starts[next_index])
-                    print(
-                        f"prepared_batch {batch_start + 1}-{batch_start + len(batch_examples)}/"
-                        f"{len(selected_examples)} prepared={len(prepared)} errors={len(prepare_errors)} "
-                        f"elapsed_s={prepare_elapsed_s:.2f}",
-                        flush=True,
+                    batch_number = batch_index + 1
+                    total_batches = len(batch_starts)
+                    batch_log_every = int(args.batch_log_every)
+                    log_batch = (
+                        batch_log_every > 0
+                        and (
+                            batch_number == 1
+                            or batch_number == total_batches
+                            or batch_number % batch_log_every == 0
+                        )
                     )
+                    if log_batch:
+                        print(
+                            f"prepared_batch {batch_start + 1}-{batch_start + len(batch_examples)}/"
+                            f"{len(selected_examples)} prepared={len(prepared)} errors={len(prepare_errors)} "
+                            f"elapsed_s={prepare_elapsed_s:.2f}",
+                            flush=True,
+                        )
                     for error in prepare_errors:
                         print(
                             f"error {int(error['index']) + 1}/{int(error['selected_count'])} "
@@ -500,9 +568,11 @@ def run(args: argparse.Namespace) -> None:
                         if not window_audios:
                             raise ValueError("prepared batch has no feature windows")
                         ptm_start = time.perf_counter()
-                        ptm_features = ptm_extractor.extract_batch(
-                            window_audios,
+                        ptm_features, ptm_window_batches = _extract_ptm_window_features(
+                            ptm_extractor=ptm_extractor,
+                            window_audios=window_audios,
                             sample_rate=int(prepared[0]["sample_rate"]),
+                            ptm_window_batch_size=int(args.ptm_window_batch_size),
                         )
                         ptm_elapsed_s = time.perf_counter() - ptm_start
                         ptm_by_item: dict[int, list[np.ndarray]] = {id(item): [] for item in prepared}
@@ -542,6 +612,7 @@ def run(args: argparse.Namespace) -> None:
                             _write_jsonl_row(manifest_handle, manifest_row)
                             manifest_handle.flush()
                             cached_count += 1
+                            existing_indexes.add(int(example.label_index))
                             label_quality_counts[str(example.label_quality)] += 1
                             log_every = max(1, int(args.log_every))
                             is_last = item["index"] + 1 >= len(selected_examples)
@@ -551,14 +622,16 @@ def run(args: argparse.Namespace) -> None:
                                     f"source={example.source} frames={cached.frame_count}",
                                     flush=True,
                                 )
-                        print(
-                            f"cached_batch {batch_start + 1}-{batch_start + len(batch_examples)}/"
-                            f"{len(selected_examples)} batch_size={len(prepared)} "
-                            f"elapsed_s={time.perf_counter() - batch_time:.2f} "
-                            f"ptm_elapsed_s={ptm_elapsed_s:.2f} write_elapsed_s={write_elapsed_s:.2f} "
-                            f"compressed={not args.no_compress}",
-                            flush=True,
-                        )
+                        if log_batch:
+                            print(
+                                f"cached_batch {batch_start + 1}-{batch_start + len(batch_examples)}/"
+                                f"{len(selected_examples)} batch_size={len(prepared)} "
+                                f"window_count={len(window_audios)} ptm_window_batches={ptm_window_batches} "
+                                f"elapsed_s={time.perf_counter() - batch_time:.2f} "
+                                f"ptm_elapsed_s={ptm_elapsed_s:.2f} write_elapsed_s={write_elapsed_s:.2f} "
+                                f"compressed={not args.no_compress}",
+                                flush=True,
+                            )
                     except Exception as exc:
                         batch_errors = []
                         for item in prepared:
@@ -587,6 +660,7 @@ def run(args: argparse.Namespace) -> None:
     finally:
         ptm_extractor.close()
 
+    error_count = _count_unresolved_error_rows(errors_path, existing_indexes)
     summary = {
         "labels": args.labels,
         "source_manifest": args.manifest,
@@ -604,6 +678,8 @@ def run(args: argparse.Namespace) -> None:
         "config": asdict(config),
         "feature_window_s": float(args.feature_window_s),
         "feature_overlap_s": float(args.feature_overlap_s),
+        "ptm_window_batch_size": int(args.ptm_window_batch_size),
+        "batch_log_every": int(args.batch_log_every),
     }
     summary_path.write_text(
         json.dumps(summary, ensure_ascii=False, indent=2, sort_keys=True),
@@ -648,6 +724,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--dtype", choices=["float16", "float32", "bfloat16"], default="float16")
     parser.add_argument("--batch-size", type=int, default=1)
     parser.add_argument(
+        "--ptm-window-batch-size",
+        type=int,
+        default=0,
+        help=(
+            "Maximum workflow audio windows per Qwen PTM forward pass. "
+            "0 preserves the historical behavior of forwarding all windows from an example batch together."
+        ),
+    )
+    parser.add_argument(
         "--prepare-workers",
         type=int,
         default=0,
@@ -660,6 +745,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--attention", default="sdpa", help="Attention implementation for Qwen3-ASR feature extraction.")
     parser.add_argument("--language", default="Japanese", help="Qwen3-ASR prompt language used when building audio features.")
     parser.add_argument("--log-every", type=int, default=1, help="Print one cached row every N examples; 1 logs every row.")
+    parser.add_argument(
+        "--batch-log-every",
+        type=int,
+        default=1,
+        help="Print prepared/cached batch diagnostics every N batches; 0 disables non-error batch diagnostics.",
+    )
     parser.add_argument("--resume", action="store_true", help="Append to existing feature_manifest.jsonl and skip cached label_index rows.")
     parser.add_argument("--output-dir", default=str(PROJECT_ROOT / "agents" / "temp" / "speech-boundary-ja" / "feature-cache"))
     args = parser.parse_args(argv)
@@ -671,6 +762,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         parser.error("--feature-overlap-s must be non-negative")
     if args.feature_overlap_s >= args.feature_window_s:
         parser.error("--feature-overlap-s must be smaller than --feature-window-s")
+    if args.batch_size <= 0:
+        parser.error("--batch-size must be positive")
+    if args.ptm_window_batch_size < 0:
+        parser.error("--ptm-window-batch-size must be non-negative")
+    if args.prepare_workers < 0:
+        parser.error("--prepare-workers must be non-negative")
+    if args.batch_log_every < 0:
+        parser.error("--batch-log-every must be non-negative")
     return args
 
 

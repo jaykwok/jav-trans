@@ -71,8 +71,8 @@ def test_settings_translation_fields_update_runtime_env(monkeypatch):
     asyncio.run(_test_settings_translation_fields_update_runtime_env(monkeypatch))
 
 
-def test_settings_asr_context_updates_runtime_env(monkeypatch):
-    asyncio.run(_test_settings_asr_context_updates_runtime_env(monkeypatch))
+def test_settings_ignores_removed_asr_context(monkeypatch):
+    asyncio.run(_test_settings_ignores_removed_asr_context(monkeypatch))
 
 
 def test_settings_env_file_quotes_multiline_values(tmp_path, monkeypatch):
@@ -348,13 +348,8 @@ async def _test_settings_translation_fields_update_runtime_env(monkeypatch):
     assert payload["llm_reasoning_effort"] == "medium"
 
 
-async def _test_settings_asr_context_updates_runtime_env(monkeypatch):
+async def _test_settings_ignores_removed_asr_context(monkeypatch):
     monkeypatch.delenv("ASR_CONTEXT", raising=False)
-    monkeypatch.setattr(
-        config_routes,
-        "_read_env_entry",
-        lambda key: (key == "ASR_CONTEXT", "旧演员"),
-    )
     monkeypatch.setattr(config_routes, "_update_env_file", lambda _changes: None)
 
     transport = httpx.ASGITransport(app=create_app())
@@ -366,13 +361,9 @@ async def _test_settings_asr_context_updates_runtime_env(monkeypatch):
             "/api/settings",
             json={"asr_context": "小那海"},
         )
-        assert response.status_code == 200
 
-        settings = await client.get("/api/settings")
-
-    assert os.environ["ASR_CONTEXT"] == "小那海"
-    assert settings.status_code == 200
-    assert settings.json()["asr_context"] == "小那海"
+    assert response.status_code == 200
+    assert "ASR_CONTEXT" not in os.environ
 
 
 async def _test_settings_env_file_quotes_multiline_values(tmp_path, monkeypatch):
@@ -551,7 +542,7 @@ async def _test_jobs_snapshot_saved_translation_settings(tmp_path, monkeypatch):
             assert response.status_code == 200
             spec = response.json()["spec"]
 
-        assert spec["asr_context"] == "小那海"
+        assert "asr_context" not in spec
         assert spec["translation_glossary"] == "ねこ-猫"
         assert spec["target_lang"] == "繁體中文"
         assert spec["llm_api_format"] == "responses"

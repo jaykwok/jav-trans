@@ -362,12 +362,25 @@ async def get_output_file(job_id: str, filename: str) -> FileResponse:
                 candidates.append(output_base / artifact_path)
                 candidates.append(PROJECT_ROOT / artifact_path)
 
+    output_root = output_base.resolve()
+    project_root = PROJECT_ROOT.resolve()
     for candidate in candidates:
         try:
             resolved = candidate.resolve()
         except OSError:
             continue
-        if resolved.is_file():
-            return FileResponse(resolved, filename=requested_name)
+        if not resolved.is_file():
+            continue
+        # Guard against path traversal: only serve files inside the job's output
+        # base or the project root, even if a persisted jobs.json artifact entry
+        # was tampered to point elsewhere.
+        try:
+            resolved.relative_to(output_root)
+        except ValueError:
+            try:
+                resolved.relative_to(project_root)
+            except ValueError:
+                continue
+        return FileResponse(resolved, filename=requested_name)
 
     raise HTTPException(status_code=404, detail="Output file not found")

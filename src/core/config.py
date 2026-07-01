@@ -48,13 +48,11 @@ DEFAULT_SETTINGS: dict[str, str] = {
     # Attention implementation. sdpa uses PyTorch scaled-dot-product attention.
     "ASR_ATTENTION": "sdpa",
 
-    # --- ASR Recognition Context & Generation ---
+    # --- ASR Language & Generation ---
     # Source audio language hint passed to ASR.
     "ASR_LANGUAGE": "Japanese",
     # 1 forces the ASR language prompt instead of letting the model infer language.
     "ASR_FORCE_LANGUAGE": "1",
-    # Short recognition hint such as performer names or domain terms passed to Qwen ASR context.
-    "ASR_CONTEXT": "",
 
     # --- Batch Size & Limits ---
     # ASR inference batch size. auto resolves by ASR_BACKEND repo id.

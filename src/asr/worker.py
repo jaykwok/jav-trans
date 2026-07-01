@@ -42,11 +42,9 @@ class _MockAsrBackend:
     def transcribe_texts(
         self,
         audio_paths,
-        contexts=None,
         on_stage=None,
     ):
         del on_stage
-        contexts = contexts or [""] * len(audio_paths)
         return [
             {
                 "text": "mock",
@@ -56,14 +54,13 @@ class _MockAsrBackend:
                 "normalized_path": path,
                 "log": [
                     "ASR worker mock result",
-                    f"context_len={len(context or '')}",
                 ],
             }
-            for path, context in zip(audio_paths, contexts)
+            for path in audio_paths
         ]
 
 
-def _extract_request(msg: dict[str, Any]) -> tuple[str, list[str], list[str]]:
+def _extract_request(msg: dict[str, Any]) -> tuple[str, list[str]]:
     job_id = str(msg.get("job_id") or "")
     chunks = msg.get("chunks")
     if not job_id:
@@ -72,7 +69,6 @@ def _extract_request(msg: dict[str, Any]) -> tuple[str, list[str], list[str]]:
         raise ValueError("chunks must be a list")
 
     paths: list[str] = []
-    contexts: list[str] = []
     for position, chunk in enumerate(chunks):
         if not isinstance(chunk, dict):
             raise ValueError(f"chunk {position} must be an object")
@@ -80,8 +76,7 @@ def _extract_request(msg: dict[str, Any]) -> tuple[str, list[str], list[str]]:
         if not path:
             raise ValueError(f"chunk {position} missing path")
         paths.append(str(path))
-        contexts.append(str(chunk.get("context") or ""))
-    return job_id, paths, contexts
+    return job_id, paths
 
 
 def main(parent_conn: Connection, backend_kwargs: dict[str, Any]) -> None:
@@ -177,7 +172,7 @@ def main(parent_conn: Connection, backend_kwargs: dict[str, Any]) -> None:
             raise SystemExit(1)
 
         try:
-            job_id, paths, contexts = _extract_request(msg)
+            job_id, paths = _extract_request(msg)
         except Exception as exc:
             if not _safe_send(
                 parent_conn,
@@ -192,7 +187,7 @@ def main(parent_conn: Connection, backend_kwargs: dict[str, Any]) -> None:
             continue
 
         try:
-            results = backend.transcribe_texts(paths, contexts=contexts, on_stage=None)
+            results = backend.transcribe_texts(paths, on_stage=None)
             if not _safe_send(
                 parent_conn,
                 {"op": "result", "job_id": job_id, "results": results},

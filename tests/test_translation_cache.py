@@ -117,14 +117,19 @@ def test_batched_translation_skips_cached_batches(monkeypatch, tmp_path):
     assert cache_path.exists()
 
 
-def test_load_translation_cache_warns_on_corrupt_jsonl(tmp_path, capsys):
+def test_load_translation_cache_skips_corrupt_jsonl_lines(tmp_path, capsys):
     cache_path = tmp_path / "translation_cache.jsonl"
-    cache_path.write_text("{not-json}\n", encoding="utf-8")
+    cache_path.write_text(
+        '{"key": "k1", "value": ["v1"]}\n{not-json}\n{"key": "k2", "value": ["v2"]}\n',
+        encoding="utf-8",
+    )
 
-    assert translator._load_translation_cache(cache_path) == {}
+    # Corrupt middle line is skipped; valid lines on both sides are preserved
+    # (previously a single bad line discarded the whole cache).
+    assert translator._load_translation_cache(cache_path) == {"k1": ["v1"], "k2": ["v2"]}
 
     captured = capsys.readouterr()
-    assert "[WARN] translation cache JSONL load failed" in captured.out
+    assert "[WARN] translation cache skipped" in captured.out
     assert str(cache_path) in captured.out
 
 

@@ -388,7 +388,7 @@ def compile_features(
         "runtime_adapter": PRE_ASR_CUEQC_RUNTIME_ADAPTER,
         "feature_names": list(PRE_ASR_CUEQC_SCALAR_FEATURE_NAMES),
         "all_feature_names": list(PRE_ASR_CUEQC_FEATURE_NAMES),
-        "ptm_bins": PRE_ASR_CUEQC_PTM_BINS,
+        "ptm_bin_count": PRE_ASR_CUEQC_PTM_BINS,
         "ptm_dim": PRE_ASR_CUEQC_PTM_DIM,
         "asr_repo_id": qwen_asr_repo_id(asr_repo_id),
         "created_at": datetime.now().isoformat(timespec="seconds"),
