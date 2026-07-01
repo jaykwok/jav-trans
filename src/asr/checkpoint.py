@@ -22,8 +22,6 @@ def _asr_generation_error_kind(kind: str) -> str:
         return normalized
     if normalized in {"crash", "protocol_error"}:
         return "worker_error"
-    if normalized:
-        return "quarantined"
     return "quarantined"
 
 
@@ -114,7 +112,7 @@ def _get_asr_runtime_signature(
 ) -> dict:
     boundary_signature = _LAST_BOUNDARY_SIGNATURE if last_boundary_signature is None else last_boundary_signature
     return {
-        "version": 7,
+        "version": 8,
         "backend": current_asr_backend(),
         "worker_mode": current_asr_worker_mode(),
         "timestamp": {
@@ -130,9 +128,6 @@ def _get_asr_runtime_signature(
         "language": {
             "asr_language": _env_text("ASR_LANGUAGE", "Japanese") or "Japanese",
             "asr_force_language": _env_lower("ASR_FORCE_LANGUAGE", "1"),
-        },
-        "context": {
-            "asr_context": _env_text("ASR_CONTEXT", ""),
         },
         "generation": {
             "asr_max_new_tokens": _env_text("ASR_MAX_NEW_TOKENS", "128"),

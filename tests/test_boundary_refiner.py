@@ -147,7 +147,7 @@ def test_tiny_mamba2_backbone_validates_head_shape():
     except (ImportError, AttributeError) as exc:
         pytest.skip(f"Mamba2Model is unavailable in this transformers build: {exc}")
 
-    with pytest.raises(ValueError, match="hidden_size \\* expand"):
+    with pytest.raises(ValueError, match="hidden_size \\* 2"):
         TinyMamba2BoundaryBackbone(
             input_dim=6,
             hidden_size=16,

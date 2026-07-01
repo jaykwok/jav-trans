@@ -19,7 +19,6 @@ class JobSpec(BaseModel):
     ] = "jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame-hf"
     subtitle_mode: Literal["zh", "bilingual"] = "zh"
     skip_translation: bool = False
-    asr_context: str = Field(default="", max_length=4000)
     keep_quality_report: bool = False
     translation_max_workers: int = Field(default=16, ge=1, le=MAX_TRANSLATION_WORKERS)
     target_lang: str | None = Field(default=None, max_length=64)
@@ -56,7 +55,6 @@ class SettingsRead(BaseModel):
     base_url: str
     model: str = ""
     hf_endpoint: str = ""
-    asr_context: str = ""
     translation_glossary: str = ""
     llm_api_format: Literal["chat", "responses"] = "chat"
     llm_reasoning_effort: Literal["medium", "xhigh"] = "xhigh"
@@ -68,7 +66,6 @@ class SettingsUpdate(BaseModel):
     base_url: str | None = None
     model: str | None = None
     hf_endpoint: str | None = None
-    asr_context: str | None = Field(default=None, max_length=4000)
     translation_glossary: str | None = None
     llm_api_format: Literal["chat", "responses"] | None = None
     llm_reasoning_effort: Literal["medium", "xhigh"] | None = None

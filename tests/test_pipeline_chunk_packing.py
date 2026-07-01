@@ -108,7 +108,6 @@ class _EmptyDisallowedSpeechBoundaryBackend:
 
 class _RecordingBackend:
     is_subprocess = False
-    accepts_contexts = True
     request_batch_size = 1
 
     def __init__(self) -> None:
@@ -125,8 +124,8 @@ class _RecordingBackend:
     def unload_model(self, on_stage=None) -> None:
         return None
 
-    def transcribe_texts(self, audio_paths, contexts=None, on_stage=None):
-        del contexts, on_stage
+    def transcribe_texts(self, audio_paths, on_stage=None):
+        del on_stage
         self.audio_paths.extend(audio_paths)
         results = []
         for index, path in enumerate(audio_paths):
@@ -170,8 +169,8 @@ class _RecordingBackend:
 
 
 class _LowLogprobBackend(_RecordingBackend):
-    def transcribe_texts(self, audio_paths, contexts=None, on_stage=None):
-        del contexts, on_stage
+    def transcribe_texts(self, audio_paths, on_stage=None):
+        del on_stage
         self.audio_paths.extend(audio_paths)
         return [
             {
@@ -590,7 +589,6 @@ def test_alignment_outcome_metadata_is_written_to_chunks_and_segments():
         chunk=chunk,
         chunk_result={**text_result, "alignment_mode": "boundary_proportional"},
         chunk_words=chunk_words,
-        chunk_log=[],
     )
     transcript = asr._build_transcript_chunks(
         [chunk],

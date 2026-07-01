@@ -4,6 +4,7 @@ import json
 from pathlib import Path
 
 import pytest
+import numpy as np
 
 from asr import pre_asr_cueqc
 from audio.chunk_packer import PackedChunk
@@ -14,6 +15,7 @@ from boundary.sequence_features import (
     FrameSequenceFeatureProvider,
 )
 from tools.asr.cueqc.compile_pre_asr_v10_features import compile_features
+from tools.asr.cueqc.train_pre_asr_v10_binary import _split_label_masks
 
 
 def _ptm_pool() -> list[float]:
@@ -363,6 +365,8 @@ def test_compile_pre_asr_cueqc_features_ignores_text_columns(tmp_path: Path):
 def test_compile_pre_asr_cueqc_features_reads_jsonl_chunk_candidates(tmp_path: Path):
     torch = pytest.importorskip("torch")
     del torch
+    from tools.asr.cueqc.train_pre_asr_v10_binary import load_feature_bundle
+
     chunks = tmp_path / "chunks.jsonl"
     labels = tmp_path / "labels.jsonl"
     output = tmp_path / "features.pt"
@@ -392,6 +396,12 @@ def test_compile_pre_asr_cueqc_features_reads_jsonl_chunk_candidates(tmp_path: P
     assert summary["chunk_count"] == 2
     assert summary["keep"] == 1
     assert summary["drop"] == 1
+    bundle = load_feature_bundle(output)
+    assert bundle["ptm_bin_count"] == pre_asr_cueqc.PRE_ASR_CUEQC_PTM_BINS
+    assert tuple(bundle["ptm_bins"].shape[-2:]) == (
+        pre_asr_cueqc.PRE_ASR_CUEQC_PTM_BINS,
+        pre_asr_cueqc.PRE_ASR_CUEQC_PTM_DIM,
+    )
 
 
 def test_compile_pre_asr_cueqc_sample_labels_do_not_broadcast_by_cluster(tmp_path: Path):
@@ -553,3 +563,34 @@ def test_compile_pre_asr_cueqc_matches_video_chunk_and_cluster_id_labels(tmp_pat
     assert summary["keep"] == 1
     assert summary["drop"] == 1
     assert [row["label"] for row in bundle["rows"]] == ["drop_before_asr", "keep_for_asr"]
+
+
+def test_pre_asr_training_chunk_stratified_split_samples_both_films():
+    y = np.asarray(
+        [
+            [0, 0, 1, 1, pre_asr_cueqc.PRE_ASR_CUEQC_IGNORE_LABEL, 0],
+            [1, 1, 0, 0, pre_asr_cueqc.PRE_ASR_CUEQC_IGNORE_LABEL, 1],
+        ],
+        dtype=np.int64,
+    )
+    chunk_mask = np.ones_like(y, dtype=np.float32)
+
+    train_mask, val_mask, summary = _split_label_masks(
+        y=y,
+        chunk_mask=chunk_mask,
+        group_rows=[
+            {"audio_id": "film-a", "planned_island_id": "sequence"},
+            {"audio_id": "film-b", "planned_island_id": "sequence"},
+        ],
+        split_mode="chunk_stratified",
+        val_ratio=0.4,
+        rng=np.random.default_rng(17),
+    )
+
+    assert summary["train_group_count"] == 2
+    assert summary["val_group_count"] == 2
+    assert summary["train_counts"]["drop"] > 0
+    assert summary["train_counts"]["keep"] > 0
+    assert summary["val_counts"]["drop"] > 0
+    assert summary["val_counts"]["keep"] > 0
+    assert not np.any(train_mask & val_mask)

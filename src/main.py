@@ -187,7 +187,6 @@ def _asr_stage_env_overrides(ctx: JobContext) -> dict[str, str]:
     asr_backend = str(ctx.asr_backend or "").strip()
     if asr_backend:
         overrides["ASR_BACKEND"] = asr_backend
-    overrides["ASR_CONTEXT"] = str(ctx.asr_context or "")
     return overrides
 
 
@@ -248,7 +247,6 @@ def _asr_stage_config_signature_for_env() -> dict:
         or name
         in {
             "ASR_BACKEND",
-            "ASR_CONTEXT",
             "ASR_WORKER_MODE",
         }
     }
@@ -1528,7 +1526,7 @@ def _run_translation_and_write_impl(
             global_context=global_context,
             target_lang=ctx.target_lang,
             glossary=ctx.translation_glossary,
-            character_reference=ctx.asr_context,
+            character_reference="",
             max_workers=ctx.translation_max_workers,
             reasoning_effort=ctx.llm_reasoning_effort,
             api_format=ctx.llm_api_format,

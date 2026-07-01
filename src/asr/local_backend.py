@@ -23,7 +23,6 @@ from asr.text_normalize import normalize_display_text, strip_text_punctuation
 ASR_MODEL_ID = active_qwen_asr_model_id()
 ASR_MODEL_PATH = active_qwen_asr_model_path()
 ASR_LANGUAGE = os.getenv("ASR_LANGUAGE", "Japanese").strip() or "Japanese"
-ASR_CONTEXT = os.getenv("ASR_CONTEXT", "").strip()
 
 
 def _resolve_asr_batch_size() -> int:
@@ -204,10 +203,6 @@ def _asr_force_language() -> bool:
     }
 
 
-def _asr_context() -> str:
-    return os.getenv("ASR_CONTEXT", ASR_CONTEXT).strip()
-
-
 def _qwen_generation_metadata(
     *,
     error_kind: str | None = None,
@@ -263,7 +258,6 @@ class NativeAsrTranscription:
 
 class LocalAsrBackend:
     is_subprocess = False
-    accepts_contexts = True
 
     def __init__(self, device: str):
         self.device = device if device.startswith("cuda") else "cpu"
@@ -348,7 +342,6 @@ class LocalAsrBackend:
     def transcribe_texts(
         self,
         audio_paths: list[str],
-        contexts: list[str] | None = None,
         on_stage: Callable[[str], None] | None = None,
     ) -> list[dict]:
         if self.model is None:
@@ -358,11 +351,6 @@ class LocalAsrBackend:
 
         normalized_paths = [str(Path(audio_path).resolve()) for audio_path in audio_paths]
         language_hint = _asr_language() if _asr_force_language() else None
-        request_contexts = contexts if contexts is not None else [_asr_context()] * len(normalized_paths)
-        if len(request_contexts) != len(normalized_paths):
-            raise ValueError(
-                f"context count mismatch: audio_paths={len(normalized_paths)}, contexts={len(request_contexts)}"
-            )
 
         _notify(on_stage, "ASR 文本转录中...")
         asr_results = None
@@ -373,7 +361,6 @@ class LocalAsrBackend:
             future = executor.submit(
                 self._transcribe_native,
                 normalized_paths,
-                request_contexts,
                 language_hint,
             )
             try:
@@ -428,7 +415,6 @@ class LocalAsrBackend:
     def _transcribe_native(
         self,
         normalized_paths: list[str],
-        request_contexts: list[str],
         language_hint: str | None,
     ) -> list[NativeAsrTranscription]:
         from asr.qwen_native import move_processor_inputs, prepare_transcription_inputs
@@ -439,11 +425,9 @@ class LocalAsrBackend:
         results: list[NativeAsrTranscription] = []
         for start in range(0, len(normalized_paths), self.request_batch_size):
             paths = normalized_paths[start : start + self.request_batch_size]
-            contexts = request_contexts[start : start + self.request_batch_size]
             inputs = prepare_transcription_inputs(
                 self.processor,
                 audio=paths,
-                contexts=contexts,
                 language=language_hint,
             )
             moved = move_processor_inputs(
@@ -533,7 +517,6 @@ class LocalAsrBackend:
             master_text or raw_master_text,
             timing_start,
             timing_end,
-            audio_path=normalized_path,
         )
         return self._build_finalize_output(
             word_dicts=normalize_word_dicts(word_dicts),
@@ -668,7 +651,6 @@ class SubprocessAsrBackend:
     """Run ASR text inference in a killable child process."""
 
     is_subprocess = True
-    accepts_contexts = True
 
     def __init__(self, device: str):
         self.device = device if device.startswith("cuda") else "cpu"
@@ -795,8 +777,12 @@ class SubprocessAsrBackend:
             try:
                 self._restart_worker(on_stage=on_stage)
             except Exception as restart_exc:
+                # Preserve the original error's kind so callers that branch on
+                # kind (timeout / oom / crash) are not misled into the crash
+                # path when the respawn itself fails.
+                original_kind = getattr(exc, "kind", None) or "crash"
                 raise WorkerError(
-                    "crash",
+                    original_kind,
                     f"worker respawn failed: {restart_exc!r}",
                 ) from exc
 
@@ -827,7 +813,6 @@ class SubprocessAsrBackend:
     def transcribe_texts(
         self,
         audio_paths: list[str],
-        contexts: list[str] | None = None,
         on_stage: Callable[[str], None] | None = None,
     ) -> list[dict]:
         if not audio_paths:
@@ -836,25 +821,13 @@ class SubprocessAsrBackend:
         self._ensure_worker(on_stage=on_stage)
         assert self._conn is not None
 
-        if contexts is None:
-            request_contexts = [_asr_context()] * len(audio_paths)
-        elif len(contexts) != len(audio_paths):
-            raise ValueError(
-                f"context count mismatch: audio_paths={len(audio_paths)}, contexts={len(contexts)}"
-            )
-        else:
-            request_contexts = contexts
-
         job_id = uuid.uuid4().hex[:8]
         chunks = [
             {
                 "path": str(Path(audio_path).resolve()),
-                "context": context,
                 "index": idx,
             }
-            for idx, (audio_path, context) in enumerate(
-                zip(audio_paths, request_contexts)
-            )
+            for idx, audio_path in enumerate(audio_paths)
         ]
 
         try:

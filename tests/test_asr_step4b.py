@@ -57,7 +57,7 @@ def main() -> None:
             self.request_batch_size = batch_size
             self.device = "cpu"
 
-        def transcribe_texts(self, audio_paths, contexts=None, on_stage=None):
+        def transcribe_texts(self, audio_paths, on_stage=None):
             outcome = self.outcomes.pop(0)
             if outcome == "timeout":
                 raise WorkerTimeoutError("injected timeout")
@@ -76,7 +76,7 @@ def main() -> None:
     class FakeInprocBackend:
         request_batch_size = 1
 
-        def transcribe_texts(self, audio_paths, contexts=None, on_stage=None):
+        def transcribe_texts(self, audio_paths, on_stage=None):
             return [
                 {
                     "text": "inproc-ok",

@@ -40,7 +40,20 @@ from tools.asr.cueqc.compile_pre_asr_v10_features import (  # noqa: E402
 
 
 METRICS_SCHEMA = "cueqc_pre_asr_mamba_v10_train_metrics"
-DEFAULT_SWEEP_THRESHOLDS = (0.50, 0.60, 0.70, 0.80, 0.90, 0.95, 0.98, 0.99)
+DEFAULT_SWEEP_THRESHOLDS = (
+    0.50,
+    0.60,
+    0.70,
+    0.80,
+    0.90,
+    0.95,
+    0.98,
+    0.99,
+    0.995,
+    0.999,
+    0.9995,
+    0.9999,
+)
 
 
 def default_checkpoint_name(asr_repo_id: str) -> str:
@@ -69,9 +82,16 @@ def load_feature_bundle(path: Path) -> dict[str, Any]:
         raise ValueError("feature bundle feature_schema mismatch")
     if payload.get("runtime_adapter") != PRE_ASR_CUEQC_RUNTIME_ADAPTER:
         raise ValueError("feature bundle runtime_adapter mismatch")
-    if int(payload.get("ptm_bins") or 0) != PRE_ASR_CUEQC_PTM_BINS:
+    ptm_tensor = payload.get("ptm_bins")
+    ptm_bin_count = payload.get("ptm_bin_count")
+    if ptm_bin_count is None and hasattr(ptm_tensor, "shape") and len(ptm_tensor.shape) >= 3:
+        ptm_bin_count = int(ptm_tensor.shape[2])
+    if int(ptm_bin_count or 0) != PRE_ASR_CUEQC_PTM_BINS:
         raise ValueError("feature bundle ptm_bins mismatch")
-    if int(payload.get("ptm_dim") or 0) != PRE_ASR_CUEQC_PTM_DIM:
+    ptm_dim = payload.get("ptm_dim")
+    if ptm_dim is None and hasattr(ptm_tensor, "shape") and len(ptm_tensor.shape) >= 4:
+        ptm_dim = int(ptm_tensor.shape[3])
+    if int(ptm_dim or 0) != PRE_ASR_CUEQC_PTM_DIM:
         raise ValueError("feature bundle ptm_dim mismatch")
     return dict(payload)
 
@@ -163,7 +183,7 @@ def _duration_matrix(bundle: Mapping[str, Any], scalar: Any) -> np.ndarray:
 def _threshold_sweep(probs: np.ndarray, y: np.ndarray, mask: np.ndarray, durations: np.ndarray) -> dict[str, Any]:
     valid_probs, valid_y, valid_durations = _valid_flat(probs, y, mask, durations)
     return {
-        f"{threshold:.2f}": classification_metrics(
+        f"{threshold:.4f}".rstrip("0").rstrip("."): classification_metrics(
             valid_probs,
             valid_y,
             valid_durations,
@@ -171,6 +191,265 @@ def _threshold_sweep(probs: np.ndarray, y: np.ndarray, mask: np.ndarray, duratio
         )
         for threshold in DEFAULT_SWEEP_THRESHOLDS
     }
+
+
+def _class_counts(y: np.ndarray, mask: np.ndarray) -> dict[str, int]:
+    valid = mask > 0
+    return {
+        "drop": int(np.sum((y == 0) & valid)),
+        "keep": int(np.sum((y == 1) & valid)),
+        "ambiguous_ignore": int(np.sum((y == PRE_ASR_CUEQC_IGNORE_LABEL) & valid)),
+    }
+
+
+def _group_label_counts(y: np.ndarray, mask: np.ndarray, group_rows: list[Mapping[str, Any]]) -> list[dict[str, Any]]:
+    out: list[dict[str, Any]] = []
+    for group_index in range(y.shape[0]):
+        group = dict(group_rows[group_index]) if group_index < len(group_rows) else {}
+        out.append(
+            {
+                "group_index": group_index,
+                "audio_id": str(group.get("audio_id") or ""),
+                "planned_island_id": str(group.get("planned_island_id") or ""),
+                **_class_counts(y[group_index : group_index + 1], mask[group_index : group_index + 1]),
+            }
+        )
+    return out
+
+
+def _split_label_masks(
+    *,
+    y: np.ndarray,
+    chunk_mask: np.ndarray,
+    group_rows: list[Mapping[str, Any]],
+    split_mode: str,
+    val_ratio: float,
+    rng: np.random.Generator,
+) -> tuple[np.ndarray, np.ndarray, dict[str, Any]]:
+    valid = (chunk_mask > 0) & ((y == 0) | (y == 1))
+    train = np.zeros_like(valid, dtype=bool)
+    val = np.zeros_like(valid, dtype=bool)
+    if split_mode == "group":
+        group_count = int(y.shape[0])
+        order = rng.permutation(group_count)
+        val_count = max(1, int(round(group_count * val_ratio))) if group_count >= 2 else 0
+        val_groups = set(int(item) for item in order[:val_count])
+        for group_index in range(group_count):
+            target = val if group_index in val_groups else train
+            target[group_index] = valid[group_index]
+        if not np.any(train & valid) and np.any(valid):
+            first = int(order[-1])
+            train[first] = valid[first]
+            val[first] = False
+    elif split_mode == "chunk_stratified":
+        for group_index in range(y.shape[0]):
+            for label_index in (0, 1):
+                positions = np.flatnonzero(valid[group_index] & (y[group_index] == label_index))
+                if positions.size == 0:
+                    continue
+                shuffled = rng.permutation(positions)
+                if shuffled.size <= 1:
+                    val_count = 0
+                else:
+                    val_count = int(round(shuffled.size * val_ratio))
+                    val_count = min(shuffled.size - 1, max(1, val_count))
+                if val_count:
+                    val[group_index, shuffled[:val_count]] = True
+                    train[group_index, shuffled[val_count:]] = True
+                else:
+                    train[group_index, shuffled] = True
+    else:
+        raise ValueError(f"unsupported split_mode: {split_mode!r}")
+    if not np.any(train & valid):
+        raise ValueError("training split has no definite keep/drop labels")
+    if not np.any(val & valid):
+        raise ValueError("validation split has no definite keep/drop labels")
+    train_group_count = int(np.sum(np.any(train, axis=1)))
+    val_group_count = int(np.sum(np.any(val, axis=1)))
+    summary = {
+        "mode": split_mode,
+        "val_ratio": float(val_ratio),
+        "train_group_count": train_group_count,
+        "val_group_count": val_group_count,
+        "all_group_count": int(y.shape[0]),
+        "train_counts": _class_counts(y, train),
+        "val_counts": _class_counts(y, val),
+        "all_counts": _class_counts(y, chunk_mask),
+        "groups_train": _group_label_counts(y, train, group_rows),
+        "groups_val": _group_label_counts(y, val, group_rows),
+    }
+    return train, val, summary
+
+
+def _balanced_anchor_positions(train_mask: np.ndarray, y: np.ndarray, device: Any) -> dict[int, Any]:
+    import torch
+
+    positions: dict[int, Any] = {}
+    for label_index in (0, 1):
+        raw = np.argwhere(train_mask & (y == label_index))
+        if raw.size:
+            positions[label_index] = torch.as_tensor(raw, dtype=torch.long, device=device)
+    if not positions:
+        raise ValueError("training split has no label positions")
+    return positions
+
+
+def _sample_balanced_anchors(
+    *,
+    positions_by_label: Mapping[int, Any],
+    batch_size: int,
+    device: Any,
+) -> Any:
+    import torch
+
+    available = sorted(int(label) for label in positions_by_label)
+    anchors = []
+    for offset in range(max(1, int(batch_size))):
+        if len(available) == 1:
+            label = available[0]
+        else:
+            label = available[int(torch.randint(0, len(available), (1,), device=device).item())]
+        positions = positions_by_label[label]
+        index = int(torch.randint(0, positions.shape[0], (1,), device=device).item())
+        anchors.append(positions[index])
+    return torch.stack(anchors, dim=0)
+
+
+def _window_batch(
+    *,
+    group_ids: Any,
+    ptm_bins: Any,
+    scalar: Any,
+    chunk_mask: Any,
+    bin_mask: Any,
+    y: Any,
+    sequence_window_size: int,
+) -> tuple[Any, Any, Any, Any, Any]:
+    if sequence_window_size <= 0 or int(ptm_bins.shape[1]) <= sequence_window_size:
+        return (
+            ptm_bins[group_ids],
+            scalar[group_ids],
+            chunk_mask[group_ids],
+            bin_mask[group_ids],
+            y[group_ids],
+        )
+    import torch
+
+    window = min(int(sequence_window_size), int(ptm_bins.shape[1]))
+    ptm_rows = []
+    scalar_rows = []
+    chunk_mask_rows = []
+    bin_mask_rows = []
+    y_rows = []
+    for raw_group_id in group_ids.detach().cpu().tolist():
+        group_id = int(raw_group_id)
+        length = int(chunk_mask[group_id].sum().detach().cpu().item())
+        if length <= window:
+            start = 0
+        else:
+            start = int(torch.randint(0, length - window + 1, (1,), device=group_ids.device).item())
+        end = start + window
+        ptm_rows.append(ptm_bins[group_id, start:end])
+        scalar_rows.append(scalar[group_id, start:end])
+        chunk_mask_rows.append(chunk_mask[group_id, start:end])
+        bin_mask_rows.append(bin_mask[group_id, start:end])
+        y_rows.append(y[group_id, start:end])
+    return (
+        torch.stack(ptm_rows, dim=0),
+        torch.stack(scalar_rows, dim=0),
+        torch.stack(chunk_mask_rows, dim=0),
+        torch.stack(bin_mask_rows, dim=0),
+        torch.stack(y_rows, dim=0),
+    )
+
+
+def _window_batch_from_anchors(
+    *,
+    anchor_positions: Any,
+    ptm_bins: Any,
+    scalar: Any,
+    chunk_mask: Any,
+    bin_mask: Any,
+    y: Any,
+    sequence_window_size: int,
+) -> tuple[Any, Any, Any, Any, Any]:
+    if sequence_window_size <= 0 or int(ptm_bins.shape[1]) <= sequence_window_size:
+        group_ids = anchor_positions[:, 0]
+        return (
+            ptm_bins[group_ids],
+            scalar[group_ids],
+            chunk_mask[group_ids],
+            bin_mask[group_ids],
+            y[group_ids],
+        )
+    import torch
+
+    window = min(int(sequence_window_size), int(ptm_bins.shape[1]))
+    ptm_rows = []
+    scalar_rows = []
+    chunk_mask_rows = []
+    bin_mask_rows = []
+    y_rows = []
+    for raw_group_id, raw_chunk_index in anchor_positions.detach().cpu().tolist():
+        group_id = int(raw_group_id)
+        chunk_index = int(raw_chunk_index)
+        length = int(chunk_mask[group_id].sum().detach().cpu().item())
+        if length <= window:
+            start = 0
+        else:
+            low = max(0, chunk_index - window + 1)
+            high = min(chunk_index, length - window)
+            if low <= high:
+                start = int(torch.randint(low, high + 1, (1,), device=anchor_positions.device).item())
+            else:
+                start = min(max(0, chunk_index - window // 2), length - window)
+        end = start + window
+        ptm_rows.append(ptm_bins[group_id, start:end])
+        scalar_rows.append(scalar[group_id, start:end])
+        chunk_mask_rows.append(chunk_mask[group_id, start:end])
+        bin_mask_rows.append(bin_mask[group_id, start:end])
+        y_rows.append(y[group_id, start:end])
+    return (
+        torch.stack(ptm_rows, dim=0),
+        torch.stack(scalar_rows, dim=0),
+        torch.stack(chunk_mask_rows, dim=0),
+        torch.stack(bin_mask_rows, dim=0),
+        torch.stack(y_rows, dim=0),
+    )
+
+
+def _predict_logits_windowed(
+    *,
+    model: Any,
+    ptm_bins: Any,
+    scalar: Any,
+    chunk_mask: Any,
+    bin_mask: Any,
+    sequence_window_size: int,
+) -> Any:
+    if sequence_window_size <= 0 or int(ptm_bins.shape[1]) <= sequence_window_size:
+        return model(ptm_bins, scalar, chunk_mask=chunk_mask, bin_mask=bin_mask)
+    import torch
+
+    group_count, max_chunks = tuple(chunk_mask.shape)
+    logits_all = torch.zeros((group_count, max_chunks, 2), dtype=torch.float32, device=ptm_bins.device)
+    counts = torch.zeros((group_count, max_chunks, 1), dtype=torch.float32, device=ptm_bins.device)
+    window = min(int(sequence_window_size), int(max_chunks))
+    for group_index in range(int(group_count)):
+        length = int(chunk_mask[group_index].sum().detach().cpu().item())
+        if length <= 0:
+            continue
+        for start in range(0, length, window):
+            end = min(length, start + window)
+            logits = model(
+                ptm_bins[group_index : group_index + 1, start:end],
+                scalar[group_index : group_index + 1, start:end],
+                chunk_mask=chunk_mask[group_index : group_index + 1, start:end],
+                bin_mask=bin_mask[group_index : group_index + 1, start:end],
+            )
+            logits_all[group_index, start:end] += logits[0].float()
+            counts[group_index, start:end] += 1.0
+    return logits_all / counts.clamp_min(1.0)
 
 
 def train(
@@ -188,6 +467,9 @@ def train(
     drop_threshold: float,
     keep_class_weight: float,
     drop_class_weight: float,
+    sequence_window_size: int,
+    split_mode: str,
+    val_ratio: float,
 ) -> dict[str, Any]:
     import torch
     import torch.nn.functional as F
@@ -212,15 +494,20 @@ def train(
     torch.manual_seed(seed)
     rng = np.random.default_rng(seed)
     group_count = int(scalar.shape[0])
-    order = rng.permutation(group_count)
-    val_count = max(1, int(round(group_count * 0.15))) if group_count >= 8 else max(1, group_count // 4)
-    val_idx = torch.as_tensor(order[:val_count], dtype=torch.long)
-    train_idx = torch.as_tensor(order[val_count:] if val_count < group_count else order, dtype=torch.long)
+    y_np = y.numpy()
+    mask_np = chunk_mask.numpy()
+    group_rows = [dict(item) for item in (bundle.get("groups") or []) if isinstance(item, Mapping)]
+    train_label_mask, val_label_mask, split_summary = _split_label_masks(
+        y=y_np,
+        chunk_mask=mask_np,
+        group_rows=group_rows,
+        split_mode=split_mode,
+        val_ratio=val_ratio,
+        rng=rng,
+    )
 
-    train_valid = chunk_mask[train_idx].bool()
-    if not torch.any((y[train_idx] != PRE_ASR_CUEQC_IGNORE_LABEL) & train_valid):
-        raise ValueError("training split has no definite keep/drop labels")
-    scalar_train = scalar[train_idx][train_valid]
+    train_label_mask_t = torch.from_numpy(train_label_mask)
+    scalar_train = scalar[train_label_mask_t]
     mean = scalar_train.mean(dim=0)
     std = scalar_train.std(dim=0).clamp_min(1e-6)
     scalar_norm = (scalar - mean.reshape(1, 1, -1)) / std.reshape(1, 1, -1)
@@ -244,25 +531,39 @@ def train(
         dtype=torch.float32,
         device=dev,
     )
-    train_idx = train_idx.to(dev)
     ptm_bins_d = ptm_bins.to(dev)
     scalar_d = scalar_norm.to(dev)
     chunk_mask_d = chunk_mask.to(dev)
     bin_mask_d = bin_mask.to(dev)
-    y_d = y.to(dev)
+    y_train = y.clone()
+    y_train[~train_label_mask_t] = PRE_ASR_CUEQC_IGNORE_LABEL
+    y_train_d = y_train.to(dev)
+    positions_by_label = _balanced_anchor_positions(train_label_mask, y_np, dev)
     batch_size = max(1, int(batch_size))
     for _step in range(max(1, int(steps))):
-        sample = torch.randint(0, train_idx.shape[0], (min(batch_size, train_idx.shape[0]),), device=dev)
-        group_ids = train_idx[sample]
+        anchor_positions = _sample_balanced_anchors(
+            positions_by_label=positions_by_label,
+            batch_size=batch_size,
+            device=dev,
+        )
+        batch_ptm, batch_scalar, batch_chunk_mask, batch_bin_mask, batch_y = _window_batch_from_anchors(
+            anchor_positions=anchor_positions,
+            ptm_bins=ptm_bins_d,
+            scalar=scalar_d,
+            chunk_mask=chunk_mask_d,
+            bin_mask=bin_mask_d,
+            y=y_train_d,
+            sequence_window_size=sequence_window_size,
+        )
         logits = model(
-            ptm_bins_d[group_ids],
-            scalar_d[group_ids],
-            chunk_mask=chunk_mask_d[group_ids],
-            bin_mask=bin_mask_d[group_ids],
+            batch_ptm,
+            batch_scalar,
+            chunk_mask=batch_chunk_mask,
+            bin_mask=batch_bin_mask,
         )
         loss = F.cross_entropy(
             logits.reshape(-1, 2),
-            y_d[group_ids].reshape(-1),
+            batch_y.reshape(-1),
             weight=class_weights,
             ignore_index=PRE_ASR_CUEQC_IGNORE_LABEL,
         )
@@ -272,23 +573,27 @@ def train(
 
     model.eval()
     with torch.inference_mode():
-        logits_all = model(
-            ptm_bins_d,
-            scalar_d,
+        logits_all = _predict_logits_windowed(
+            model=model,
+            ptm_bins=ptm_bins_d,
+            scalar=scalar_d,
             chunk_mask=chunk_mask_d,
             bin_mask=bin_mask_d,
+            sequence_window_size=sequence_window_size,
         )
         probs_all = torch.softmax(logits_all, dim=-1).float().cpu().numpy()
-    y_np = y.numpy()
-    mask_np = chunk_mask.numpy()
     durations = _duration_matrix(bundle, scalar)
-    val_mask = np.zeros((group_count,), dtype=bool)
-    val_mask[val_idx.numpy()] = True
+    train_probs, train_y, train_durations = _valid_flat(
+        probs_all,
+        y_np,
+        train_label_mask.astype(np.float32),
+        durations,
+    )
     val_probs, val_y, val_durations = _valid_flat(
-        probs_all[val_mask],
-        y_np[val_mask],
-        mask_np[val_mask],
-        durations[val_mask],
+        probs_all,
+        y_np,
+        val_label_mask.astype(np.float32),
+        durations,
     )
     all_probs, all_y, all_durations = _valid_flat(probs_all, y_np, mask_np, durations)
     created_at = datetime.now().isoformat(timespec="seconds")
@@ -298,20 +603,32 @@ def train(
         "features": repo_display_path(features_path),
         "feature_sha256": file_sha256(features_path),
         "asr_repo_id": selected_repo,
-        "train_group_count": int(train_idx.shape[0]),
-        "val_group_count": int(val_idx.shape[0]),
+        "split": split_summary,
+        "train_group_count": int(split_summary["train_group_count"]),
+        "val_group_count": int(split_summary["val_group_count"]),
         "all_group_count": group_count,
-        "class_counts": {
-            "drop": int(np.sum(y_np == 0)),
-            "keep": int(np.sum(y_np == 1)),
-            "ambiguous_ignore": int(np.sum((y_np == PRE_ASR_CUEQC_IGNORE_LABEL) & (mask_np > 0))),
-        },
+        "class_counts": _class_counts(y_np, mask_np),
         "class_weights": {
             "drop": float(drop_class_weight),
             "keep": float(keep_class_weight),
         },
+        "sequence_window_size": int(sequence_window_size),
+        "model_config": model_config,
         "drop_threshold": float(drop_threshold),
         "threshold_sweep": _threshold_sweep(probs_all, y_np, mask_np, durations),
+        "train_threshold_sweep": _threshold_sweep(
+            probs_all,
+            y_np,
+            train_label_mask.astype(np.float32),
+            durations,
+        ),
+        "val_threshold_sweep": _threshold_sweep(
+            probs_all,
+            y_np,
+            val_label_mask.astype(np.float32),
+            durations,
+        ),
+        "train": classification_metrics(train_probs, train_y, train_durations, threshold=drop_threshold),
         "val": classification_metrics(val_probs, val_y, val_durations, threshold=drop_threshold),
         "all": classification_metrics(all_probs, all_y, all_durations, threshold=drop_threshold),
     }
@@ -329,9 +646,10 @@ def train(
         "feature_std": std.cpu().numpy().astype(np.float32).tolist(),
         "decision_config": {
             "drop_threshold": float(drop_threshold),
-            "hard_keep_veto": True,
-            "hard_drop_rule": True,
-            "keep_veto": True,
+            "hard_keep_veto": False,
+            "hard_drop_rule": False,
+            "keep_veto": False,
+            "inference_window_size": int(sequence_window_size),
         },
         "metadata": {
             "asr_repo_id": selected_repo,
@@ -340,6 +658,9 @@ def train(
             "feature_bundle": repo_display_path(features_path),
             "feature_bundle_sha256": file_sha256(features_path),
             "trained_steps": int(steps),
+            "sequence_window_size": int(sequence_window_size),
+            "split_mode": str(split_mode),
+            "val_ratio": float(val_ratio),
             "created_at": created_at,
             "ignore_label": PRE_ASR_CUEQC_IGNORE_LABEL,
         },
@@ -368,6 +689,19 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--drop-threshold", type=float, default=PRE_ASR_CUEQC_DEFAULT_DROP_THRESHOLD)
     parser.add_argument("--drop-class-weight", type=float, default=1.0)
     parser.add_argument("--keep-class-weight", type=float, default=2.0)
+    parser.add_argument(
+        "--split-mode",
+        choices=("chunk_stratified", "group"),
+        default="chunk_stratified",
+        help="chunk_stratified samples train/test chunks within every group and label class; group keeps the old group-level split.",
+    )
+    parser.add_argument("--val-ratio", type=float, default=0.15)
+    parser.add_argument(
+        "--sequence-window-size",
+        type=int,
+        default=512,
+        help="Train and evaluate long planned-island sequences in fixed-size chunk windows; 0 disables windowing.",
+    )
     args = parser.parse_args(argv)
     if args.hidden_size <= 0:
         parser.error("--hidden-size must be positive")
@@ -379,6 +713,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         parser.error("--drop-threshold must be between 0 and 1")
     if args.drop_class_weight <= 0.0 or args.keep_class_weight <= 0.0:
         parser.error("class weights must be positive")
+    if not 0.0 < args.val_ratio < 1.0:
+        parser.error("--val-ratio must be in (0, 1)")
+    if args.sequence_window_size < 0:
+        parser.error("--sequence-window-size must be non-negative")
     return args
 
 
@@ -398,6 +736,9 @@ def main(argv: list[str] | None = None) -> int:
         drop_threshold=float(args.drop_threshold),
         keep_class_weight=float(args.keep_class_weight),
         drop_class_weight=float(args.drop_class_weight),
+        sequence_window_size=int(args.sequence_window_size),
+        split_mode=str(args.split_mode),
+        val_ratio=float(args.val_ratio),
     )
     print(
         "checkpoint={checkpoint} val_drop_f1={f1:.4f} val_keep_recall={keep:.4f}".format(

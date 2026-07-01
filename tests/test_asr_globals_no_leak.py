@@ -17,7 +17,6 @@ def test_asr_stage_env_restored_when_transcribe_raises(monkeypatch, tmp_path):
         output_dir,
         temp_root,
         asr_backend=ASR_17B_BACKEND,
-        asr_context="task context",
         skip_translation=True,
         keep_temp_files=True,
     )
@@ -36,7 +35,7 @@ def test_asr_stage_env_restored_when_transcribe_raises(monkeypatch, tmp_path):
 
     def fake_transcribe_and_align(_audio_path, _device, on_stage=None, include_details=False):
         assert main.os.environ["ASR_BACKEND"] == ASR_17B_BACKEND
-        assert main.os.environ["ASR_CONTEXT"] == "task context"
+        assert main.os.environ["ASR_CONTEXT"] == "process context"
         raise RuntimeError("forced ASR failure")
 
     monkeypatch.setattr(pipeline_audio, "extract_audio", fake_extract_audio)

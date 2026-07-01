@@ -91,8 +91,7 @@ def test_postprocess_does_not_hard_split_long_word_backed_segment():
     assert postprocessed[0]["text"] == text
 
 
-def test_postprocess_preserves_word_backed_context_actor_intro(monkeypatch):
-    monkeypatch.setenv("ASR_CONTEXT", "小那海あや")
+def test_postprocess_preserves_word_backed_actor_intro():
     words = [
         {"start": 10.46, "end": 10.86, "word": "...小那海", "source_chunk_index": 0},
         {"start": 10.86, "end": 10.86, "word": "あや", "source_chunk_index": 0},
@@ -111,8 +110,7 @@ def test_postprocess_preserves_word_backed_context_actor_intro(monkeypatch):
     ]
 
 
-def test_postprocess_does_not_drop_context_like_text_without_word_timing(monkeypatch):
-    monkeypatch.setenv("ASR_CONTEXT", "小那海あや")
+def test_postprocess_does_not_drop_actor_name_like_text_without_word_timing():
     segments = [
         {
             "start": 10.46,

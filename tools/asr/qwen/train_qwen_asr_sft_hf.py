@@ -61,7 +61,6 @@ class Qwen3AsrNativeCollator:
         prompts = [
             build_transcription_prompt(
                 self.processor,
-                context=str(row.get("context") or ""),
                 language=str(row.get("language") or "Japanese"),
             )
             for row in rows

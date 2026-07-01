@@ -89,7 +89,6 @@ def test_translate_segments_uses_task_character_reference(monkeypatch):
         system_prompts.append(messages[0]["content"])
         return _mock_json(0, expected_count)
 
-    monkeypatch.setattr(translator, "CHARACTER_FULL_NAME_REFERENCE", "Env Name")
     monkeypatch.setattr(translator, "_chat", fake_chat)
 
     translator.translate_segments(
@@ -103,7 +102,6 @@ def test_translate_segments_uses_task_character_reference(monkeypatch):
 
     assert system_prompts
     assert "Task Name" in system_prompts[0]
-    assert "Env Name" not in system_prompts[0]
 
 
 def test_character_name_guidance_is_conservative_for_unrelated_surnames():

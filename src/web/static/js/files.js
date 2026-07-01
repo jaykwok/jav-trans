@@ -100,7 +100,6 @@ export function installFiles() {
       video_paths:              paths,
       asr_backend:              $('r-backend').value,
       subtitle_mode:            $('r-mode').value,
-      asr_context:              $('r-asr-context').value.trim(),
       skip_translation:         $('r-skip-translation').checked,
       keep_quality_report:      $('t-quality-report').checked,
       translation_max_workers:  readTranslationMaxWorkers(),

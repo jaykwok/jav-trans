@@ -15,7 +15,6 @@ def test_asr_stage_env_scope_reaches_cache_and_transcribe(monkeypatch, tmp_path)
         output_dir,
         temp_root,
         asr_backend=ASR_17B_BACKEND,
-        asr_context="task actor",
         skip_translation=True,
         keep_temp_files=True,
     )
@@ -29,7 +28,6 @@ def test_asr_stage_env_scope_reaches_cache_and_transcribe(monkeypatch, tmp_path)
     def fake_get_backend_label():
         seen["backend_label_env"] = {
             "ASR_BACKEND": main.os.environ.get("ASR_BACKEND"),
-            "ASR_CONTEXT": main.os.environ.get("ASR_CONTEXT"),
             "BOUNDARY_FEATURE_FRAME_HOP_S": main.os.environ.get(
                 "BOUNDARY_FEATURE_FRAME_HOP_S"
             ),
@@ -46,7 +44,6 @@ def test_asr_stage_env_scope_reaches_cache_and_transcribe(monkeypatch, tmp_path)
         seen["cache_signature"] = expected_signature
         seen["cache_env"] = {
             "ASR_BACKEND": main.os.environ.get("ASR_BACKEND"),
-            "ASR_CONTEXT": main.os.environ.get("ASR_CONTEXT"),
             "BOUNDARY_FEATURE_FRAME_HOP_S": main.os.environ.get(
                 "BOUNDARY_FEATURE_FRAME_HOP_S"
             ),
@@ -60,7 +57,6 @@ def test_asr_stage_env_scope_reaches_cache_and_transcribe(monkeypatch, tmp_path)
     def fake_transcribe_and_align(_audio_path, _device, on_stage=None, include_details=False):
         seen["transcribe_env"] = {
             "ASR_BACKEND": main.os.environ.get("ASR_BACKEND"),
-            "ASR_CONTEXT": main.os.environ.get("ASR_CONTEXT"),
             "BOUNDARY_FEATURE_FRAME_HOP_S": main.os.environ.get(
                 "BOUNDARY_FEATURE_FRAME_HOP_S"
             ),
@@ -89,7 +85,6 @@ def test_asr_stage_env_scope_reaches_cache_and_transcribe(monkeypatch, tmp_path)
 
     expected_env = {
         "ASR_BACKEND": ASR_17B_BACKEND,
-        "ASR_CONTEXT": "task actor",
         "BOUNDARY_FEATURE_FRAME_HOP_S": "0.02",
     }
     assert seen["backend_label_env"] == expected_env

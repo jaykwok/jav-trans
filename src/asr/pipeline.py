@@ -198,7 +198,6 @@ _empty_alignment_placeholder = _transcribe_module._empty_alignment_placeholder
 _empty_segments_quarantine_placeholder = _transcribe_module._empty_segments_quarantine_placeholder
 _align_TRANSCRIPTION_results = _transcribe_module._align_TRANSCRIPTION_results
 _build_transcript_chunks = _transcribe_module._build_transcript_chunks
-_build_ASR_CONTEXT_for_chunk = _transcribe_module._build_ASR_CONTEXT_for_chunk
 _postprocess_segments = _transcribe_module._postprocess_segments
 _repair_postprocessed_segment_windows = _transcribe_module._repair_postprocessed_segment_windows
 _group_words_to_segments = _transcribe_module._group_words_to_segments
@@ -1298,7 +1297,6 @@ def _transcribe_and_align_local(
                     chunk=chunk,
                     chunk_result=chunk_result,
                     chunk_words=chunk_words,
-                    chunk_log=chunk_log,
                 )
                 alignment_outcomes[chunk_index] = outcome
                 for entry in chunk_log:

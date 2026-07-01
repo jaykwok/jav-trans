@@ -4,7 +4,6 @@ from asr import pipeline as asr
 
 class _NoFinalizeBackend:
     is_subprocess = False
-    accepts_contexts = True
     request_batch_size = 1
 
     def unload_model(self, on_stage=None):
@@ -53,8 +52,8 @@ def test_qwen_finalize_uses_boundary_chunk_timeline(monkeypatch):
     backend = local_backend.LocalAsrBackend("cpu")
     calls = []
 
-    def fake_boundary_timing(text, start, end, audio_path=None):
-        calls.append((text, start, end, audio_path))
+    def fake_boundary_timing(text, start, end):
+        calls.append((text, start, end))
         return (
             [{"word": text, "start": start, "end": end}],
             "boundary_proportional",
@@ -82,6 +81,6 @@ def test_qwen_finalize_uses_boundary_chunk_timeline(monkeypatch):
     chunk_result, chunk_log = prepared[0]
     assert chunk_result["words"] == [{"word": "テスト", "start": 2.0, "end": 8.0}]
     assert chunk_result["alignment_mode"] == "boundary_proportional"
-    assert calls == [("テスト", 2.0, 8.0, "missing.wav")]
+    assert calls == [("テスト", 2.0, 8.0)]
     assert any("Subtitle timing: boundary_chunk_timeline" in entry for entry in chunk_log)
     assert any("Subtitle timing window: speech_core" in entry for entry in chunk_log)

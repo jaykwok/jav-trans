@@ -41,7 +41,7 @@ class TinyMamba2BoundaryBackbone(nn.Module):
         if hidden_size <= 0:
             raise ValueError("hidden_size must be positive")
         if hidden_size * 2 != num_heads * head_dim:
-            raise ValueError("hidden_size * expand must equal num_heads * head_dim")
+            raise ValueError("hidden_size * 2 must equal num_heads * head_dim")
         self.bidirectional = bool(bidirectional)
         self.proj = nn.Linear(input_dim, hidden_size)
 
@@ -117,7 +117,7 @@ class Mamba2TemporalEncoder(nn.Module):
         if hidden_size <= 0:
             raise ValueError("hidden_size must be positive")
         if hidden_size * 2 != num_heads * head_dim:
-            raise ValueError("hidden_size * expand must equal num_heads * head_dim")
+            raise ValueError("hidden_size * 2 must equal num_heads * head_dim")
         self.bidirectional = bool(bidirectional)
 
         _install_mamba2_warning_filter()

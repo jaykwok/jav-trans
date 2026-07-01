@@ -93,6 +93,9 @@ class FeatureScorerTrainConfig:
     threshold: float = 0.5
     split_threshold: float = 0.5
     max_eval_windows: int = 256
+    max_train_frames: int = 0
+    max_eval_frames: int = 0
+    cuda_empty_cache_every: int = 0
     log_every: int = 0
 
 
@@ -267,6 +270,12 @@ def train_feature_frame_scorer(
         raise ValueError(f"model_arch must be {MAMBA2_FRAME_SCORER_MODEL_ARCH!r}")
     if config.split_adapter_kernel_size <= 0 or config.split_adapter_kernel_size % 2 == 0:
         raise ValueError("split_adapter_kernel_size must be a positive odd integer")
+    if config.max_train_frames < 0:
+        raise ValueError("max_train_frames must be non-negative")
+    if config.max_eval_frames < 0:
+        raise ValueError("max_eval_frames must be non-negative")
+    if config.cuda_empty_cache_every < 0:
+        raise ValueError("cuda_empty_cache_every must be non-negative")
 
     ptm_dim = int(rows[0]["ptm_dim"])
     mfcc_dim = int(rows[0]["mfcc_dim"])
@@ -328,6 +337,13 @@ def train_feature_frame_scorer(
         )
         if float(np.sum(weights)) <= 0.0:
             continue
+        features, labels, weights = crop_feature_training_tensors(
+            features=features,
+            labels=labels,
+            weights=weights,
+            max_frames=config.max_train_frames,
+            rng=rng,
+        )
         feature_tensor = torch.from_numpy(features).to(device).unsqueeze(0)
         label_tensor = torch.from_numpy(labels).to(device).unsqueeze(0)
         weight_tensor = torch.from_numpy(weights).to(device).unsqueeze(0)
@@ -349,6 +365,12 @@ def train_feature_frame_scorer(
         optimizer.zero_grad(set_to_none=True)
         loss.backward()
         optimizer.step()
+        if (
+            config.cuda_empty_cache_every > 0
+            and device.type == "cuda"
+            and (step + 1) % int(config.cuda_empty_cache_every) == 0
+        ):
+            torch.cuda.empty_cache()
         lossep.append(float(loss.detach().cpu()))
         current_step = step + 1
         if log_every > 0 and (current_step % log_every == 0 or current_step >= config.max_steps):
@@ -383,6 +405,8 @@ def train_feature_frame_scorer(
         split_tversky_alpha=config.split_tversky_alpha,
         split_tversky_beta=config.split_tversky_beta,
         focal_gamma=config.focal_gamma,
+        max_eval_frames=config.max_eval_frames,
+        cuda_empty_cache_every=config.cuda_empty_cache_every,
     )
     feature_hash, feature_hash_source = scorer_feature_hash(
         rows=rows,
@@ -787,6 +811,31 @@ def feature_training_tensors(
     )
 
 
+def crop_feature_training_tensors(
+    *,
+    features: np.ndarray,
+    labels: np.ndarray,
+    weights: np.ndarray,
+    max_frames: int,
+    rng: np.random.Generator | None = None,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    frame_total = int(features.shape[0])
+    limit = int(max_frames)
+    if limit <= 0 or frame_total <= limit:
+        return features, labels, weights
+    max_start = frame_total - limit
+    if rng is None:
+        start = max_start // 2
+    else:
+        start = int(rng.integers(0, max_start + 1))
+    end = start + limit
+    return (
+        np.ascontiguousarray(features[start:end], dtype=np.float32),
+        np.ascontiguousarray(labels[start:end], dtype=np.float32),
+        np.ascontiguousarray(weights[start:end], dtype=np.float32),
+    )
+
+
 def evaluate_feature_frame_scorer(
     *,
     model: Any,
@@ -809,6 +858,8 @@ def evaluate_feature_frame_scorer(
     split_tversky_alpha: float = 0.35,
     split_tversky_beta: float = 0.65,
     focal_gamma: float = 2.0,
+    max_eval_frames: int = 0,
+    cuda_empty_cache_every: int = 0,
 ) -> dict[str, float | int]:
     import torch
     speech_counts = empty_frame_counts()
@@ -831,6 +882,13 @@ def evaluate_feature_frame_scorer(
             )
             if float(np.sum(weights)) <= 0.0:
                 continue
+            features, labels, weights = crop_feature_training_tensors(
+                features=features,
+                labels=labels,
+                weights=weights,
+                max_frames=max_eval_frames,
+                rng=None,
+            )
             feature_tensor = torch.from_numpy(features).to(device).unsqueeze(0)
             label_tensor = torch.from_numpy(labels).to(device).unsqueeze(0)
             weight_tensor = torch.from_numpy(weights).to(device).unsqueeze(0)
@@ -867,6 +925,8 @@ def evaluate_feature_frame_scorer(
                     predictions=(probabilities[:, 1][split_mapk] >= float(split_threshold)).astype(np.float32),
                 )
             windows += 1
+            if cuda_empty_cache_every > 0 and device.type == "cuda" and windows % int(cuda_empty_cache_every) == 0:
+                torch.cuda.empty_cache()
     speech_metrics = metrics_from_frame_counts(counts=speech_counts, windows=windows, threshold=threshold)
     split_metrics = metrics_from_frame_counts(counts=split_counts, windows=windows, threshold=split_threshold)
     return {
@@ -1262,28 +1322,6 @@ def _pad_or_trim_audio(audio: np.ndarray, length: int) -> np.ndarray:
     padded = np.zeros(length, dtype=np.float32)
     padded[: audio.shape[0]] = audio
     return padded
-
-
-def _pad_or_trim_2d(values: np.ndarray, frame_count: int) -> np.ndarray:
-    if values.shape[0] >= frame_count:
-        return np.ascontiguousarray(values[:frame_count], dtype=np.float32)
-    padded = np.zeros((frame_count, values.shape[1]), dtype=np.float32)
-    padded[: values.shape[0]] = values
-    return padded
-
-
-def _pad_or_trim_1d(values: np.ndarray, frame_count: int) -> np.ndarray:
-    if values.shape[0] >= frame_count:
-        return np.ascontiguousarray(values[:frame_count], dtype=np.float32)
-    padded = np.zeros(frame_count, dtype=np.float32)
-    padded[: values.shape[0]] = values
-    return padded
-
-
-def _frame_mapk(actual_frames: int, frame_count: int) -> np.ndarray:
-    mapk = np.zeros(frame_count, dtype=np.float32)
-    mapk[: min(max(0, actual_frames), frame_count)] = 1.0
-    return mapk
 
 
 def _pad_or_trim_labels(labels: list[int], length: int) -> np.ndarray:

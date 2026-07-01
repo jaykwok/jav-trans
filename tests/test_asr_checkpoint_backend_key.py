@@ -9,11 +9,9 @@ def _checkpoint_name(
     monkeypatch,
     *,
     asr_backend: str,
-    asr_context: str = "",
 ) -> str:
     monkeypatch.setenv("ASR_BACKEND", asr_backend)
     monkeypatch.setenv("ASR_WORKER_MODE", "inproc")
-    monkeypatch.setenv("ASR_CONTEXT", asr_context)
 
     from asr import pipeline as asr
     asr = importlib.reload(asr)
@@ -64,19 +62,19 @@ def test_checkpoint_key_ignores_asr_after_cueqc_drop_threshold(monkeypatch):
     assert default_key == tuned_key
 
 
-def test_checkpoint_key_changes_with_asr_context(monkeypatch):
+def test_checkpoint_key_ignores_removed_asr_context_env(monkeypatch):
+    monkeypatch.setenv("ASR_CONTEXT", "actor-a")
     actor_a_key = _checkpoint_name(
         monkeypatch,
         asr_backend=ASR_17B_BACKEND,
-        asr_context="actor-a",
     )
+    monkeypatch.setenv("ASR_CONTEXT", "actor-b")
     actor_b_key = _checkpoint_name(
         monkeypatch,
         asr_backend=ASR_17B_BACKEND,
-        asr_context="actor-b",
     )
 
-    assert actor_a_key != actor_b_key
+    assert actor_a_key == actor_b_key
 
 
 def test_checkpoint_key_changes_with_qwen_generation_inputs(monkeypatch):

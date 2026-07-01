@@ -32,7 +32,6 @@ _SYSTEM_PROMPT_FULL = prompt_module._SYSTEM_PROMPT_FULL
 _SYSTEM_PROMPT_COMPACT = prompt_module._SYSTEM_PROMPT_COMPACT
 _JSON_OUTPUT_LABEL = prompt_module._JSON_OUTPUT_LABEL
 _normalize_source_text = prompt_module._normalize_source_text
-_warn_translation_cache = translation_cache._warn_translation_cache
 
 
 class RetryableTranslationFormatError(RuntimeError):
@@ -69,9 +68,6 @@ API_KEY = os.getenv("API_KEY", "").strip() or None
 LLM_MODEL_NAME = os.getenv("LLM_MODEL_NAME", "").strip()
 LLM_API_FORMAT = os.getenv("LLM_API_FORMAT", "chat").strip().lower() or "chat"
 LLM_REASONING_EFFORT = os.getenv("LLM_REASONING_EFFORT", "xhigh").strip() or "xhigh"
-CHARACTER_FULL_NAME_REFERENCE = (
-    os.getenv("ASR_CONTEXT", "").strip()
-)
 
 DEFAULT_TARGET_LANG = "简体中文"
 TRANSLATION_MAX_TOKENS = 384000
@@ -508,11 +504,7 @@ def translate_segments(
     effective_cache_path = cache_path or ""
     effective_target_lang = (target_lang or DEFAULT_TARGET_LANG).strip() or DEFAULT_TARGET_LANG
     effective_glossary = normalize_glossary_text(glossary)
-    effective_character_reference = (
-        CHARACTER_FULL_NAME_REFERENCE
-        if character_reference is None
-        else (character_reference or "").strip()
-    )
+    effective_character_reference = (character_reference or "").strip()
     previous_retry_events = getattr(_RETRY_CONTEXT, "events", None)
     retry_events: list[dict] = []
     _RETRY_CONTEXT.events = retry_events
@@ -1738,11 +1730,7 @@ def _build_translation_messages(
     glossary: str = "",
     character_reference: str | None = None,
 ) -> list[dict]:
-    effective_character_reference = (
-        CHARACTER_FULL_NAME_REFERENCE
-        if character_reference is None
-        else (character_reference or "").strip()
-    )
+    effective_character_reference = (character_reference or "").strip()
     system_prompt = _build_system_prompt(
         expected_count,
         effective_character_reference,

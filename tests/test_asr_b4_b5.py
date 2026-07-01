@@ -28,11 +28,10 @@ def _write_wav(path: Path, seconds: float, sample_rate: int = 8000) -> None:
         writer.writeframes(b"\x00\x00" * int(sample_rate * seconds))
 
 
-def test_asr_text_transcribe_passes_only_static_context(monkeypatch, tmp_path):
+def test_asr_text_transcribe_passes_only_audio_paths(monkeypatch, tmp_path):
     asr = _reload_pipeline(monkeypatch, tmp_path)
     source = tmp_path / "source.wav"
     _write_wav(source, 2.0)
-    monkeypatch.setenv("ASR_CONTEXT", "actor-name")
 
     chunks = [
         {"index": 0, "start": 0.0, "end": 0.4, "path": str(tmp_path / "c0.wav"), "source_audio_path": str(source)},
@@ -42,12 +41,12 @@ def test_asr_text_transcribe_passes_only_static_context(monkeypatch, tmp_path):
     class FakeBackend:
         is_subprocess = False
         request_batch_size = 1
-        contexts: list[str] = []
+        audio_paths: list[str] = []
 
-        def transcribe_texts(self, audio_paths, contexts=None, on_stage=None):
-            del audio_paths, on_stage
-            self.contexts.extend(contexts or [])
-            index = len(self.contexts) - 1
+        def transcribe_texts(self, audio_paths, on_stage=None):
+            del on_stage
+            self.audio_paths.extend(audio_paths)
+            index = len(self.audio_paths) - 1
             text = f"text-{index}"
             return [
                 {
@@ -68,4 +67,4 @@ def test_asr_text_transcribe_passes_only_static_context(monkeypatch, tmp_path):
     )
 
     assert [result["text"] for result in results] == ["text-0", "text-1"]
-    assert backend.contexts == ["actor-name", "actor-name"]
+    assert backend.audio_paths == [chunk["path"] for chunk in chunks]

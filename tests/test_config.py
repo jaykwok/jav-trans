@@ -69,14 +69,12 @@ def test_public_asr_config_loads_generic_names(monkeypatch, tmp_path):
         "DEFAULT_SETTINGS",
         {
             "ASR_MODEL_PATH": "./models/asr",
-            "ASR_CONTEXT": "sample-name",
             "ASR_BATCH_SIZE": "3",
         },
     )
     monkeypatch.setattr(config, "PRIVATE_ENV_PATH", private_path)
     for key in (
         "ASR_MODEL_PATH",
-        "ASR_CONTEXT",
         "ASR_BATCH_SIZE",
     ):
         monkeypatch.delenv(key, raising=False)
@@ -84,7 +82,6 @@ def test_public_asr_config_loads_generic_names(monkeypatch, tmp_path):
     config.load_config()
 
     assert os.environ["ASR_MODEL_PATH"] == "./models/asr"
-    assert os.environ["ASR_CONTEXT"] == "sample-name"
     assert os.environ["ASR_BATCH_SIZE"] == "3"
 
 
@@ -109,7 +106,7 @@ def test_default_model_download_root_is_project_models():
     assert config.DEFAULT_SETTINGS["JOB_TEMP_DIR"] == "./tmp/jobs"
     assert config.DEFAULT_SETTINGS["ASR_CHUNK_ROOT"] == "./tmp/chunks"
     assert "KEEP_TEMP_FILES" not in config.DEFAULT_SETTINGS
-    assert config.DEFAULT_SETTINGS["ASR_CONTEXT"] == ""
+    assert "ASR_CONTEXT" not in config.DEFAULT_SETTINGS
     assert config.DEFAULT_SETTINGS["ASR_BACKEND"] == "jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame-hf"
     assert config.DEFAULT_SETTINGS["ASR_MODEL_ID"] == ""
     assert config.DEFAULT_SETTINGS["ASR_BATCH_SIZE"] == "auto"

@@ -42,7 +42,7 @@ _state_lock = asyncio.Lock()
 _jobs_path = PROJECT_ROOT / "tmp" / "web" / "jobs.json"
 _FINISHED_STATUSES = {"done", "failed", "cancelled"}
 _RETRYABLE_STATUSES = {"failed", "cancelled"}
-_last_progress_write_ts: float = 0.0
+_last_progress_write_ts: dict[str, float] = {}
 
 _EVENT_STAGE_STATUS = {
     "translation": "translating",
@@ -218,10 +218,6 @@ def _normalize_llm_reasoning_effort(value: str) -> str:
 
 def _snapshot_translation_settings(spec: JobSpec) -> JobSpec:
     updates: dict[str, str] = {}
-
-    asr_context = getattr(spec, "asr_context", None)
-    if asr_context is None or not str(asr_context).strip():
-        updates["asr_context"] = _runtime_setting("ASR_CONTEXT", "")
 
     target_lang = getattr(spec, "target_lang", None)
     if target_lang is None or not str(target_lang).strip():
@@ -610,7 +606,6 @@ async def _eviction_loop() -> None:
 
 
 async def update_job_progress(job_id: str, progress: dict[str, Any]) -> None:
-    global _last_progress_write_ts
     async with _state_lock:
         job = _jobs.get(job_id)
         if job is None:
@@ -623,9 +618,11 @@ async def update_job_progress(job_id: str, progress: dict[str, Any]) -> None:
             if status and job.status not in _FINISHED_STATUSES:
                 job.status = status  # type: ignore[assignment]
         now = _time.monotonic()
-        if now - _last_progress_write_ts >= 2.0:
+        # Throttle disk persistence per job so one busy job cannot starve
+        # another job's progress from being written within the 2s window.
+        if now - _last_progress_write_ts.get(job_id, 0.0) >= 2.0:
             _write_jobs_unlocked()
-            _last_progress_write_ts = now
+            _last_progress_write_ts[job_id] = now
 
 
 async def shutdown_executor() -> None:

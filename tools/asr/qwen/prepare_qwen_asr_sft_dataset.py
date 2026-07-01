@@ -296,7 +296,6 @@ def process_rows(
             "audio": audio_path,
             "text": text,
             "language": args.language,
-            "context": "",
         }
         manifest_payload = {
             "row_key": row_key,
@@ -385,7 +384,6 @@ def append_hard_negatives(
             "audio": audio_path,
             "text": "",
             "language": args.language,
-            "context": "",
         }
         manifest_payload = {
             "row_key": stable_row_key(source="hard-negative", audio_id=audio_id, text=""),
@@ -522,7 +520,7 @@ def run(args: argparse.Namespace) -> None:
         "hf_endpoint": args.hf_endpoint,
         "hf_audio_format": args.hf_audio_format,
         "metadata_dataset": args.metadata_dataset,
-        "training_text_format": "raw transcript plus separate language/context fields",
+        "training_text_format": "raw transcript plus separate language field",
     }
     summary_path = output_root / "qwen_sft_dataset_summary.json"
     summary_path.write_text(

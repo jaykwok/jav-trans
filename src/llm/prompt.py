@@ -10,7 +10,6 @@ _LEADING_ROLE_LABEL_RE = re.compile(
     r"[A-Za-z][A-Za-z ._-]{0,20})\s*[：:]\s*"
 )
 _JSON_OUTPUT_LABEL = "LLM JSON output"
-COMPACT_SYSTEM_PROMPT = False
 
 
 def _normalize_source_text(text: str) -> str:

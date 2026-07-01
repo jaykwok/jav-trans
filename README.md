@@ -170,7 +170,7 @@ Web 提交是否使用 CUDA 取决于后端服务进程是否能看到 GPU，而
 | 默认 ASR | `jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame-hf` |
 | 低配置 ASR | `jaykwok/Qwen3-ASR-0.6B-JA-Anime-Galgame-hf` |
 
-同一个 ASR repo id 也决定 SpeechBoundary-JA frozen feature 的来源，以及当前已训练的 SpeechBoundary-JA / Boundary Refiner checkpoint registry key。checkpoint 文件名只是人工可读 tag，真正归属以 metadata 中的 repo id / schema / feature hash 为准。Pre-ASR CueQC v10 尚未训练 promotion，默认 registry 为空；训练完成后再用 `PRE_ASR_CUEQC_MODEL_PATH_BY_REPO` 显式映射。
+同一个 ASR repo id 也决定 SpeechBoundary-JA frozen feature 的来源，以及当前已训练的 SpeechBoundary-JA / Boundary Refiner checkpoint registry key。checkpoint 文件名只是人工可读 tag，真正归属以 metadata 中的 repo id / schema / feature hash 为准。Pre-ASR CueQC v10 已有训练候选，但尚未 promotion 到默认 registry；启用前必须用 `PRE_ASR_CUEQC_MODEL_PATH_BY_REPO` 显式映射并完成 false-drop 审计。
 
 ### SpeechBoundary-JA Scorer v7
 
@@ -225,7 +225,7 @@ Boundary Refiner 只修 chunk 两端。它不学习中间切点、不新增 chun
 
 Pre-ASR CueQC 只看 ASR 前特征：duration、speech segment count、internal gap、Refiner v8 delta/confidence/safety、raw/acoustic timeline、scorer speech/split 分布、邻接 gap、micro chunk evidence、primary/weak cut density，以及从共享 Qwen PTM/encoder frame features 池化得到的 chunk bin embedding。它禁止使用 ASR text、raw text、token trace、decoder stats、ASR confidence 和 subtitle timing。
 
-v10 已用 Scorer v7 + Boundary Refiner v8 workflow 重新导出候选；训练需要 current 人工 keep/drop 标签，不复用旧 checkpoint 或旧候选标签。默认仍关闭且没有默认 checkpoint registry；开启前必须显式配置训练好的 `PRE_ASR_CUEQC_MODEL_PATH_BY_REPO`，并先跑 no-translate workflow smoke / audit，确认 false-drop 风险可接受。
+v10 已用 Scorer v7 + Boundary Refiner v8 workflow 重新导出候选，并已有 Omni 弱标注训练候选 checkpoint；默认仍关闭且没有默认 checkpoint registry。开启前必须显式配置训练好的 `PRE_ASR_CUEQC_MODEL_PATH_BY_REPO`，并先跑 no-translate workflow smoke / audit，确认 false-drop 风险可接受。
 
 ### 离线 ASR-after CueQC v4
 
@@ -263,6 +263,8 @@ uv run --no-sync python tools/asr/cueqc/export_candidates.py `
 
 如果后台还有其他 CUDA 进程或出现 OOM，先退回更小 batch。
 
+ASR 默认在可被强杀的子进程里运行（`ASR_WORKER_MODE=subprocess`），单 chunk 超时/OOM 时整进程重启而不拖垮主进程；需要更直观的 traceback 时可切 `ASR_WORKER_MODE=inproc`（同进程推理，代价是超时后无法中断正在跑的 generate）。
+
 推理需要 ASR / SpeechBoundary-JA frozen feature Hugging Face 模型，以及与当前 repo id 匹配的本地 checkpoint。源码运行时如果本地没有 Hugging Face 模型，会按需下载到 `models/`。registry 缺失、覆盖映射未命中当前 repo id、文件不存在、schema 不匹配或 metadata 不匹配都会 fail-fast。
 
 训练时生成的 CUDA feature cache、synthetic WAV、sequence JSONL、tensor cache 和 `datasets/train/...` 产物都不是运行依赖，不随源码或 Windows release 打包。
@@ -272,7 +274,7 @@ uv run --no-sync python tools/asr/cueqc/export_candidates.py `
 ## 字幕与文本策略
 
 - ASR 文本会做 Unicode NFKC、空白归一、换行折叠和展示安全处理。
-- `ASR_CONTEXT` 会作为 Qwen3-ASR system prompt 中的弱文本提示，用于演员名、系列名或领域词；它不是 hotword / 强制词表 API，也不作为字幕后处理删除规则。
+- Qwen3-ASR runtime 始终使用 Transformers 官方 `apply_transcription_request(audio=..., language=...)` 路径，不提供演员名 / 人名 context 提示分支。
 - 字幕时间轴来自 Boundary chunk；ASR 输出文本只负责显示，不驱动默认切分。
 - LLM 翻译前会先固定 cue plan，翻译不会重排时间轴。
 
@@ -410,6 +412,7 @@ uv run python -m <module> --help
 - `tools.audits.generate_cueqc_cluster_broadcast_html`：生成独立簇级 keep/drop 广播标注页；混簇/跳过只记录 abstain。
 - `tools.asr.convert_qwen3_asr_to_hf`：把 legacy 非 `-hf` Qwen3-ASR fine-tune safetensors 权重迁移到 Transformers-native `-hf` layout（`thinker.audio_tower.* -> model.audio_tower.*`、`thinker.audio_tower.proj{1,2}.* -> model.multi_modal_projector.linear_{1,2}.*`、`thinker.model.* -> model.language_model.*`，并复用 `Qwen/Qwen3-ASR-*-hf` 模板文件）。
 - `tools.asr.cueqc.export_pre_asr_v10_audit_candidates`：从 current workflow `.timings.json` 导出 Pre-ASR CueQC v10 审计候选。
+- `tools.asr.cueqc.label_pre_asr_v10_with_omni`：离线调用 Qwen3.5-Omni-Flash 这类 omni 音频模型给 Pre-ASR v10 chunk 生成 `definite_drop/definite_keep/ambiguous_ignore` 弱标签，默认按 Qwen-Omni 官方兼容接口把 chunk 转为 16k mono MP3 并以 streaming `input_audio` 提交；`--audio-format ogg` 仅用于其他确认支持 OGG/Opus 的 endpoint 试验。
 
 Qwen3-ASR `-hf` 转换示例：
 

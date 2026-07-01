@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import threading
 from pathlib import Path
 from typing import Any, get_args
 
@@ -74,26 +75,35 @@ def _runtime_or_env_or_setting(key: str, fallback: str = "") -> str:
     return _setting(key) or fallback
 
 
+_ENV_FILE_LOCK = threading.Lock()
+
+
 def _update_env_file(updates: dict[str, str]) -> None:
     env_path = PROJECT_ROOT / ".env"
-    lines = (
-        env_path.read_text(encoding="utf-8").splitlines(keepends=True)
-        if env_path.exists()
-        else []
-    )
-    pending = dict(updates)
-    new_lines: list[str] = []
-    for line in lines:
-        stripped = line.strip()
-        if "=" in stripped and not stripped.startswith("#"):
-            k = stripped.split("=", 1)[0].strip()
-            if k in pending:
-                new_lines.append(_format_env_line(k, pending.pop(k)))
-                continue
-        new_lines.append(line if line.endswith("\n") else line + "\n")
-    for k, v in pending.items():
-        new_lines.append(_format_env_line(k, v))
-    env_path.write_text("".join(new_lines), encoding="utf-8")
+    # Serialize concurrent settings saves so they don't clobber each other's
+    # keys, and write atomically (tmp + replace) so a crash mid-write cannot
+    # leave a truncated .env.
+    with _ENV_FILE_LOCK:
+        lines = (
+            env_path.read_text(encoding="utf-8").splitlines(keepends=True)
+            if env_path.exists()
+            else []
+        )
+        pending = dict(updates)
+        new_lines: list[str] = []
+        for line in lines:
+            stripped = line.strip()
+            if "=" in stripped and not stripped.startswith("#"):
+                k = stripped.split("=", 1)[0].strip()
+                if k in pending:
+                    new_lines.append(_format_env_line(k, pending.pop(k)))
+                    continue
+            new_lines.append(line if line.endswith("\n") else line + "\n")
+        for k, v in pending.items():
+            new_lines.append(_format_env_line(k, v))
+        tmp_path = env_path.parent / f"{env_path.name}.tmp"
+        tmp_path.write_text("".join(new_lines), encoding="utf-8")
+        os.replace(tmp_path, env_path)
 
 
 def _mask_key(k: str) -> str:
@@ -292,7 +302,6 @@ async def get_settings() -> SettingsRead:
     base_url = _runtime_or_env_or_setting("OPENAI_COMPATIBILITY_BASE_URL")
     model = _runtime_or_env_or_setting("LLM_MODEL_NAME")
     hf_endpoint = _runtime_or_env_value("HF_ENDPOINT")
-    asr_context = _runtime_or_env_or_setting("ASR_CONTEXT")
     translation_glossary = _runtime_or_env_or_setting("TRANSLATION_GLOSSARY")
     llm_api_format = _runtime_or_env_or_setting("LLM_API_FORMAT", "chat")
     llm_reasoning_effort = _normalize_llm_reasoning_effort(
@@ -305,7 +314,6 @@ async def get_settings() -> SettingsRead:
         base_url=base_url,
         model=model,
         hf_endpoint=hf_endpoint,
-        asr_context=asr_context,
         translation_glossary=translation_glossary,
         llm_api_format=llm_api_format if llm_api_format in {"chat", "responses"} else "chat",
         llm_reasoning_effort=llm_reasoning_effort,
@@ -327,9 +335,6 @@ async def post_settings(update: SettingsUpdate) -> dict:
         os.environ["LLM_MODEL_NAME"] = update.model
     if update.hf_endpoint is not None:
         changes["HF_ENDPOINT"] = _sync_hf_endpoint(update.hf_endpoint)
-    if update.asr_context is not None:
-        changes["ASR_CONTEXT"] = update.asr_context
-        os.environ["ASR_CONTEXT"] = update.asr_context
     if update.translation_glossary is not None:
         changes["TRANSLATION_GLOSSARY"] = update.translation_glossary
         os.environ["TRANSLATION_GLOSSARY"] = update.translation_glossary

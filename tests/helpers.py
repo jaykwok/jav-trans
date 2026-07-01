@@ -17,7 +17,6 @@ def make_job_context(
     *,
     job_id: str | None = None,
     asr_backend: str = ASR_17B_BACKEND,
-    asr_context: str = "",
     subtitle_mode: str = "zh",
     skip_translation: bool = False,
     translation_max_workers: int = 4,
@@ -33,7 +32,6 @@ def make_job_context(
     job_temp_dir = Path(job_temp_root) / effective_job_id
     return JobContext(
         asr_backend=asr_backend,
-        asr_context=asr_context,
         subtitle_mode=subtitle_mode,
         skip_translation=skip_translation,
         target_lang="简体中文",

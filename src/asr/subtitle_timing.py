@@ -40,9 +40,7 @@ def build_boundary_word_timestamps(
     text: str,
     start: float,
     end: float,
-    audio_path: str | None = None,
 ) -> tuple[list[dict], str, dict]:
-    del audio_path
     cleaned = _clean_text(text)
     tokens = _tokenize(cleaned)
     if not tokens:
