@@ -8,7 +8,7 @@
 
 ## 路线总览
 
-当前主线是 **1.7B 五模型 ASR 前置链 + Subtitle Layout v2**：
+当前主线是 **按 ASR repo 独立绑定的 0.6B / 1.7B 五模型前置链 + Subtitle Layout v2**：
 
 ```text
 SpeechIslandScorer v8（speech only）
@@ -25,7 +25,7 @@ SpeechIslandScorer v8（speech only）
 
 这次改造的核心不是换阈值，而是把不可逆的结构决策放回正确顺序：先得到完整 speech core，再判断是否切，最后才精修 cut point。内部切点始终锚定原音频绝对时间轴，相邻 chunk 共用同一个 timestamp；Outer Refiner 不再分别修切点左右边缘，因此不会制造 gap、overlap 或累计漂移。
 
-五个 active checkpoint 均绑定 `jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame-hf`，旧 v7 双头 scorer、v8 refiner、v10 Pre-ASR schema 和 planner/packer API 不保留 alias。SpeechIslandScorer 输出维度为 1；Semantic Split 使用三分类和保守 runtime 门槛；Pre-ASR v11 在阈值 `0.95` 下运行，默认仍关闭，但 checkpoint 已进入 repo registry。ASR-after CueQC v4 只保留离线审计用途。
+0.6B 与 1.7B 各自拥有五个 repo-bound active checkpoint，不能跨 repo 复用。旧 v7 双头 scorer、v8 refiner、v10 Pre-ASR schema 和 planner/packer API 不保留 alias。SpeechIslandScorer 输出维度为 1；Semantic Split 使用三分类和保守 runtime 门槛；Pre-ASR v11 在阈值 `0.95` 下运行，默认仍关闭，但两个 repo 的 checkpoint 均已进入 registry。ASR-after CueQC v4 只保留离线审计用途。
 
 ## 路线修正
 
@@ -71,12 +71,16 @@ SpeechIslandScorer v8（speech only）
 - Pre-ASR CueQC v11 当前选择 anchor-only CE + explicit differences + gated temporal residual；后续只有在独立 holdout 明确改善时才调整结构或阈值。
 - ASR-after CueQC v4：仅保留离线审计/mining 工具；默认 runtime / full workflow 不再加载 checkpoint、不捕获 decoder stats、不写 shadow decision。
 - REAL-988：只作为最终测试集，不进入训练、pseudo pool 或 cold-start 聚类。
-- 0.6B 五模型：需要时按相同 schema 独立重训；不复用 1.7B checkpoint。
+- 继续补充跨影片独立 holdout，重点审计 0.6B Semantic Split 的 missed-cut 与 Pre-ASR CueQC 的 false-drop；不通过调高到极端阈值掩盖训练问题。
 - 长期研究：等 Boundary/CueQC 审计闭环稳定后，再评估 Qwen ASR boundary-token SFT / DPO / RL、长上下文 joint segmentation-transcription 和小模型蒸馏。
 
 ## 近期记录
 
-- 2026-07-02 五模型生产产物与 Web 对齐：确认 active runtime 不从 `agents/temp` 读取模型，五个 checkpoint 正式收敛为 `speech_island_scorer_v8`、`outer_edge_refiner_v1`、`semantic_split_model_v1`、`cut_edge_refiner_v1`、`pre_asr_cueqc_v11`，分别位于 `src/boundary/ja/checkpoints`、`src/boundary/checkpoints`、`src/asr/checkpoints`。所有 checkpoint 新增强制 `metadata.artifact` contract，包含 display name/version、pipeline stage/role、production filename、promotion time、self-contained 标记和 source training run；五个正式 loader 均通过 repo-id 与 artifact 校验。Web 阶段进度补齐 `boundary_cache -> speech_island_scorer -> outer_edge_refiner -> semantic_split_model -> cut_edge_refiner -> pre_asr_cueqc -> audio_chunk_export`，任一 `current/total` 完成时发出 done event；前端进度条与中文阶段名同步，SSE 对 skip/degraded/blocked 也主动刷新。0.6B 仍可通过 advanced mapping 使用，但标准界面明确标注“需自备五模型”，model-requirements API 逐项检查五个 checkpoint。重试按钮区分 ASR 前置链重试和翻译-only 重试，后端继续优先复用有效 boundary/ASR cache 或 translation artifact snapshot。
+- 2026-07-02 0.6B 五模型独立训练、promotion 与双模型族映射：没有复制或转换 1.7B embedding/checkpoint，使用 `jaykwok/Qwen3-ASR-0.6B-JA-Anime-Galgame-hf` 重新提取 32768 条 base feature cache，以及匿名 867/BONY 两部完整音频的 PTM+MFCC sequence features；新增 full-audio feature exporter、semantic candidate rehydration 工具和 feature-cache duration sorting。五个选定 checkpoint 已移出 `agents/temp`，正式放入 `src/boundary/ja/checkpoints`、`src/boundary/checkpoints`、`src/asr/checkpoints`，文件名均含 0.6B repo tag；metadata 记录 production filename、stage/role、source run、promotion time、repo binding 与 selected validation。验证指标：Scorer threshold `0.15` precision/recall `79.79/98.25%`；Outer start/end MAE `14.32/12.88ms`；Semantic Split `p_cut>=0.75` precision/recall `94.63/56.59%`、continue false-cut `0.16%`；Cut Refiner MAE/p90 `49.07/138.47ms`；Pre-ASR CueQC threshold `0.95` drop precision/recall `98.35/86.23%`、keep recall `94.87%`、false-drop `4/78`。
+- 2026-07-02 0.6B CueQC 时序残差结论：实际 cue 虽按时序输入，但本轮独立 holdout 不支持把 residual/Mamba 作为生产默认。fresh exact-final-chunk Omni 标签由 16kHz mono、32kbps MP3、最长 6s 音频输入生成，减少多模态 token；两片合计 keep/drop/ignore `516/1837/34`。temporal residual 5000-step 在 threshold `0.95` 的 keep recall 为 `85.90%`，local-only 5000-step 为 `89.74%`，local-only 1000-step 为 `93.59%`，最终选择 local-only 500-step 的 `94.87%`。因此新增 `temporal_residual_scale` checkpoint config：旧/1.7B checkpoint 默认 `1.0` 保持兼容，0.6B 正式 checkpoint 为 `0.0`；没有用更高阈值掩盖结构问题。Omni 调用仅对明确 `429/limit_requests` 做有限退避重试，其他错误继续直接抛出。
+- 2026-07-02 双 repo 自动选择：Qwen backend 的 SpeechIslandScorer、Outer Edge Refiner、Semantic Split、Cut Edge Refiner、Pre-ASR CueQC 五个默认 registry 均补齐 0.6B 项；Web 选择 0.6B/1.7B 后由同一个 repo id 驱动基础 ASR 与五模型路径，0.6B 不再显示“需自备五模型”。model-requirements API 和生产 artifact contract 测试同时覆盖两个 repo。分发审计同时发现 PyInstaller 只收集了 boundary checkpoint 目录，已补入 `src/asr/checkpoints`，避免 Windows 包缺少第五个 Pre-ASR CueQC 模型。
+
+- 2026-07-02 五模型生产产物与 Web 对齐（先完成 1.7B）：确认 active runtime 不从 `agents/temp` 读取模型，五个 checkpoint 正式收敛为 `speech_island_scorer_v8`、`outer_edge_refiner_v1`、`semantic_split_model_v1`、`cut_edge_refiner_v1`、`pre_asr_cueqc_v11`，分别位于 `src/boundary/ja/checkpoints`、`src/boundary/checkpoints`、`src/asr/checkpoints`。所有 checkpoint 新增强制 `metadata.artifact` contract，包含 display name/version、pipeline stage/role、production filename、promotion time、self-contained 标记和 source training run；五个正式 loader 均通过 repo-id 与 artifact 校验。Web 阶段进度补齐 `boundary_cache -> speech_island_scorer -> outer_edge_refiner -> semantic_split_model -> cut_edge_refiner -> pre_asr_cueqc -> audio_chunk_export`，任一 `current/total` 完成时发出 done event；前端进度条与中文阶段名同步，SSE 对 skip/degraded/blocked 也主动刷新。该阶段 0.6B 尚无默认 checkpoint，随后已由同日的 0.6B 独立训练与 registry 记录取代。重试按钮区分 ASR 前置链重试和翻译-only 重试，后端继续优先复用有效 boundary/ASR cache 或 translation artifact snapshot。
 
 - 2026-07-02 五模型最终完成审计：五个 promoted checkpoint 均可在 CPU 上通过正式 loader 加载并校验 repo id。SpeechIslandScorer 为单一 `speech_prob` head、`output_dim=1`、7000 steps；Outer Edge Refiner metadata 明确 `outer_edges_only=true`；Semantic Split 为 `cut/continue/unsure` 三分类；Cut Edge Refiner 明确 `shared_absolute_timestamp=true`；Pre-ASR CueQC v11 为 5000 steps、PTM128、sequence window 128、runtime threshold `0.95`。pipeline signature 顺序固定为 scorer -> outer -> split -> cut，CueQC 在最终 chunks 后、wav export/ASR 前运行。补齐 JobContext 对六个 `OUTER_/SEMANTIC_/CUT_` 设备与 checkpoint 映射键的任务级透传。最终全套 pytest `438 passed`，仅 4 条既有 SciPy sparse efficiency warning；`compileall` 与 `git diff --check` 通过。
 

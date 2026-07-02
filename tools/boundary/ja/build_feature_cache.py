@@ -422,6 +422,11 @@ def run(args: argparse.Namespace) -> None:
         language=args.language,
     )
     selected_examples = examples[: args.limit] if args.limit is not None else examples
+    if args.sort_by_duration:
+        selected_examples = sorted(
+            selected_examples,
+            key=lambda example: (float(example.duration_s), int(example.label_index)),
+        )
     print(
         f"feature_cache_start selected={len(selected_examples)} examples={len(examples)} "
         f"device={args.device} dtype={args.dtype} ptm={args.ptm} "
@@ -750,6 +755,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         type=int,
         default=1,
         help="Print prepared/cached batch diagnostics every N batches; 0 disables non-error batch diagnostics.",
+    )
+    parser.add_argument(
+        "--sort-by-duration",
+        action="store_true",
+        help="Group similarly sized examples to reduce padded PTM batch work.",
     )
     parser.add_argument("--resume", action="store_true", help="Append to existing feature_manifest.jsonl and skip cached label_index rows.")
     parser.add_argument("--output-dir", default=str(PROJECT_ROOT / "agents" / "temp" / "speech-boundary-ja" / "feature-cache"))

@@ -13,6 +13,7 @@ SRC_ROOT = PROJECT_ROOT / "src"
 if str(SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(SRC_ROOT))
 
+from asr.backends.qwen import qwen_asr_repo_tag  # noqa: E402
 from boundary.outer_refiner import (  # noqa: E402
     OUTER_EDGE_FEATURE_SCHEMA,
     OuterEdgeRefinerNetwork,
@@ -115,7 +116,9 @@ def run(args: argparse.Namespace) -> None:
     error = np.abs(output[:, :2] - target)
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
-    checkpoint_path = output_dir / "outer_edge_refiner_v1.pt"
+    checkpoint_path = output_dir / (
+        f"outer_edge_refiner_v1.{qwen_asr_repo_tag(args.ptm_repo_id)}.pt"
+    )
     torch.save(
         build_outer_edge_refiner_checkpoint(
             model=model,

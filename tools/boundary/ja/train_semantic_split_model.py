@@ -13,6 +13,7 @@ SRC_ROOT = PROJECT_ROOT / "src"
 if str(SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(SRC_ROOT))
 
+from asr.backends.qwen import qwen_asr_repo_tag  # noqa: E402
 from boundary.sequence_features import SPLIT_CANDIDATE_SCALAR_NAMES  # noqa: E402
 from boundary.split_model import (  # noqa: E402
     SEMANTIC_SPLIT_FEATURE_SCHEMA,
@@ -108,7 +109,9 @@ def run(args: argparse.Namespace) -> None:
     continue_recall = int(confusion[1, 1]) / max(1, int(confusion[1].sum()))
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
-    checkpoint_path = output_dir / "semantic_split_model_v1.pt"
+    checkpoint_path = output_dir / (
+        f"semantic_split_model_v1.{qwen_asr_repo_tag(args.ptm_repo_id)}.pt"
+    )
     normalization = {
         "frame_mean": frame_mean.tolist(),
         "frame_std": frame_std.tolist(),

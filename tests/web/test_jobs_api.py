@@ -249,7 +249,7 @@ async def _test_model_requirements_marks_disabled_boundary_download(tmp_path, mo
     assert boundary["download_enabled"] is False
     assert payload["needs_download"] is True
     assert payload["download_disabled"] is True
-    assert payload["checkpoint_missing_count"] == 5
+    assert payload["checkpoint_missing_count"] == 0
     assert payload["pipeline_ready"] is False
 
 async def _test_settings_hf_endpoint_updates_runtime_env(monkeypatch):
