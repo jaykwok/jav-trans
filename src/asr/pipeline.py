@@ -9,7 +9,7 @@ from typing import Any, Callable
 
 import numpy as np
 
-from audio.chunk_packer import PackedChunk, pack_speech_segments
+from audio.chunk_packer import PackedChunk
 from boundary import cache as _boundary_cache_module
 from boundary.sequence_features import (
     CHUNK_POOLED_PTM_SCHEMA,
@@ -18,18 +18,19 @@ from boundary.sequence_features import (
     FrameSequenceFeatureConfig,
     FrameSequenceFeatureProvider,
 )
-from boundary.refiner import (
-    file_sha1 as _boundary_refiner_file_sha1,
-    load_edge_sequence_refiner_v8_checkpoint,
-)
+from boundary.cut_refiner import load_cut_edge_refiner
+from boundary.outer_refiner import load_outer_edge_refiner
+from boundary.runtime_pipeline import build_semantic_boundary_chunks
+from boundary.split_model import load_semantic_split_verifier
 from asr import checkpoint as _checkpoint_module
 from asr import chunking as _chunking_module
 from asr import pre_asr_cueqc as _pre_asr_cueqc_module
 from asr import transcribe as _transcribe_module
 from asr.backends.qwen import (
-    DEFAULT_BOUNDARY_REFINER_CHECKPOINT_BY_REPO,
+    DEFAULT_OUTER_EDGE_REFINER_CHECKPOINT_BY_REPO,
+    DEFAULT_CUT_EDGE_REFINER_CHECKPOINT_BY_REPO,
+    DEFAULT_SEMANTIC_SPLIT_CHECKPOINT_BY_REPO,
     checkpoint_path_for_repo_env,
-    validate_checkpoint_repo_id,
 )
 from asr.backends import registry as _registry_module
 
@@ -70,52 +71,31 @@ def _env_int(name: str, default: str) -> int:
 
 
 def _boundary_config() -> dict:
-    refiner_path = checkpoint_path_for_repo_env(
+    outer_refiner_path = checkpoint_path_for_repo_env(
         repo_id=ASR_BACKEND,
-        mapping_env="BOUNDARY_REFINER_MODEL_PATH_BY_REPO",
-        default_mapping=DEFAULT_BOUNDARY_REFINER_CHECKPOINT_BY_REPO,
+        mapping_env="OUTER_EDGE_REFINER_MODEL_PATH_BY_REPO",
+        default_mapping=DEFAULT_OUTER_EDGE_REFINER_CHECKPOINT_BY_REPO,
     )
-    refiner_path_obj = Path(refiner_path).expanduser() if refiner_path else None
-    runtime_adapter = _boundary_refiner_runtime_adapter(refiner_path_obj)
+    split_model_path = checkpoint_path_for_repo_env(
+        repo_id=ASR_BACKEND,
+        mapping_env="SEMANTIC_SPLIT_MODEL_PATH_BY_REPO",
+        default_mapping=DEFAULT_SEMANTIC_SPLIT_CHECKPOINT_BY_REPO,
+    )
+    cut_refiner_path = checkpoint_path_for_repo_env(
+        repo_id=ASR_BACKEND,
+        mapping_env="CUT_EDGE_REFINER_MODEL_PATH_BY_REPO",
+        default_mapping=DEFAULT_CUT_EDGE_REFINER_CHECKPOINT_BY_REPO,
+    )
     return {
         "feature_frame_hop_s": _env_float("BOUNDARY_FEATURE_FRAME_HOP_S", "0.02"),
-        "boundary_refiner_model_path": refiner_path,
-        "boundary_refiner_model_sha1": (
-            _boundary_refiner_file_sha1(refiner_path_obj)
-            if refiner_path_obj is not None and refiner_path_obj.exists()
-            else ""
-        ),
-        "boundary_refiner_runtime_adapter": runtime_adapter,
-        "boundary_refiner_device": os.getenv("BOUNDARY_REFINER_DEVICE", "auto").strip()
+        "outer_edge_refiner_model_path": outer_refiner_path,
+        "semantic_split_model_path": split_model_path,
+        "cut_edge_refiner_model_path": cut_refiner_path,
+        "outer_edge_refiner_device": os.getenv("OUTER_EDGE_REFINER_DEVICE", "auto").strip()
         or "auto",
-        "boundary_planner_sequence_batch_size": _env_int(
-            "BOUNDARY_PLANNER_SEQUENCE_BATCH_SIZE", "256"
-        ),
+        "semantic_split_device": os.getenv("SEMANTIC_SPLIT_DEVICE", "auto").strip() or "auto",
+        "cut_edge_refiner_device": os.getenv("CUT_EDGE_REFINER_DEVICE", "auto").strip() or "auto",
     }
-
-
-def _boundary_refiner_runtime_adapter(path: Path | None) -> str:
-    if path is None or not path.exists():
-        raise FileNotFoundError(
-            "Boundary Refiner checkpoint is required for the selected ASR repo id"
-        )
-    import torch
-
-    payload = torch.load(path, map_location="cpu")
-    if not isinstance(payload, dict):
-        raise ValueError("Boundary refiner checkpoint must be a dict")
-    metadata = payload.get("metadata")
-    if isinstance(metadata, dict):
-        validate_checkpoint_repo_id(
-            metadata.get("ptm_repo_id"),
-            ASR_BACKEND,
-            checkpoint_kind="Boundary Refiner",
-            metadata_key="metadata.ptm_repo_id",
-        )
-        adapter = str(metadata.get("runtime_adapter") or "").strip()
-        if adapter == "edge_sequence_v2":
-            return adapter
-    raise ValueError("Boundary Refiner checkpoint must use metadata.runtime_adapter='edge_sequence_v2'")
 
 
 def _sequence_feature_provider_from_result(
@@ -146,7 +126,7 @@ def _sequence_feature_provider_from_result(
         config=FrameSequenceFeatureConfig(
             left_context_s=_env_float("BOUNDARY_FRAME_SEQUENCE_LEFT_CONTEXT_S", "0.60"),
             right_context_s=_env_float("BOUNDARY_FRAME_SEQUENCE_RIGHT_CONTEXT_S", "0.60"),
-            max_ptm_dims=_env_int("BOUNDARY_FRAME_SEQUENCE_MAX_PTM_DIMS", "64"),
+            max_ptm_dims=_env_int("BOUNDARY_FRAME_SEQUENCE_MAX_PTM_DIMS", "128"),
             include_mfcc=_env_bool("BOUNDARY_FRAME_SEQUENCE_INCLUDE_MFCC", "1"),
         ),
     )
@@ -318,29 +298,31 @@ def _boundary_cache_log_entry(event: dict | None) -> str | None:
 
 def _build_processing_spans(
     audio_path: str,
+    *,
+    on_stage: Callable[[str], None] | None = None,
 ) -> list[tuple[float, float]] | list[PackedChunk]:
+    def progress(label: str, current: int, total: int) -> None:
+        if on_stage is not None:
+            on_stage(f"{label} {current}/{total}")
+
     cfg = _boundary_config()
     _set_last_boundary_cache_event(None)
 
-    needs_sequence_features = cfg["boundary_refiner_runtime_adapter"] == "edge_sequence_v2"
-    restore_sequence_export = (
-        os.environ.get("SPEECH_BOUNDARY_JA_EXPORT_SEQUENCE_FEATURES")
-        if needs_sequence_features
-        else None
-    )
-    if needs_sequence_features:
-        os.environ["SPEECH_BOUNDARY_JA_EXPORT_SEQUENCE_FEATURES"] = "1"
+    restore_sequence_export = os.environ.get("SPEECH_BOUNDARY_JA_EXPORT_SEQUENCE_FEATURES")
+    os.environ["SPEECH_BOUNDARY_JA_EXPORT_SEQUENCE_FEATURES"] = "1"
     try:
         from boundary import get_boundary_backend
 
         boundary_backend = get_boundary_backend()
         boundary_signature = boundary_backend.signature()
+        progress("边界缓存", 0, 1)
         cached = _boundary_cache_module.load_processing_spans(
             audio_path,
             boundary_signature=boundary_signature,
             boundary_config=cfg,
         )
         if cached is not None:
+            progress("边界缓存", 1, 1)
             spans, runtime_boundary_signature, event = cached
             _set_last_boundary_signature(runtime_boundary_signature)
             _pipeline_logger.info(
@@ -351,59 +333,77 @@ def _build_processing_spans(
             _set_last_boundary_cache_event(event)
             return spans
 
+        progress("边界缓存", 1, 1)
+        progress("语音岛检测", 0, 1)
         result = boundary_backend.segment(audio_path)
+        progress("语音岛检测", 1, 1)
     finally:
         if restore_sequence_export is not None:
             os.environ["SPEECH_BOUNDARY_JA_EXPORT_SEQUENCE_FEATURES"] = restore_sequence_export
-        elif needs_sequence_features:
+        else:
             os.environ.pop("SPEECH_BOUNDARY_JA_EXPORT_SEQUENCE_FEATURES", None)
     frame_scores = result.parameters.get("frame_scores")
-    split_boundary_frame_scores = result.parameters.get("split_boundary_frame_scores")
+    candidate_frame_scores = result.parameters.get("candidate_frame_scores")
     score_frame_hop_s = result.parameters.get("frame_hop_s")
     sequence_feature_frames = result.parameters.get("sequence_feature_frames")
-    sequence_boundary_refiner = load_edge_sequence_refiner_v8_checkpoint(
-        Path(cfg["boundary_refiner_model_path"]),
-        device=cfg["boundary_refiner_device"],
+    outer_refiner = load_outer_edge_refiner(
+        Path(cfg["outer_edge_refiner_model_path"]),
+        device=cfg["outer_edge_refiner_device"],
+        expected_ptm_repo_id=ASR_BACKEND,
+    )
+    split_verifier = load_semantic_split_verifier(
+        Path(cfg["semantic_split_model_path"]),
+        device=cfg["semantic_split_device"],
+        expected_ptm_repo_id=ASR_BACKEND,
+    )
+    cut_refiner = load_cut_edge_refiner(
+        Path(cfg["cut_edge_refiner_model_path"]),
+        device=cfg["cut_edge_refiner_device"],
         expected_ptm_repo_id=ASR_BACKEND,
     )
     sequence_feature_provider = _required_sequence_feature_provider_from_result(
         sequence_feature_frames,
         duration_s=result.audio_duration_sec,
     )
-    sequence_feature_provider.validate_for_checkpoint(
-        sequence_boundary_refiner.feature_names,
-        sequence_boundary_refiner.feature_schema_hash,
-    )
+    speech_feature_export_path = os.getenv(
+        "SPEECH_ISLAND_FEATURE_EXPORT_PATH", ""
+    ).strip()
+    if speech_feature_export_path:
+        speech_feature_path = Path(speech_feature_export_path)
+        speech_feature_path.parent.mkdir(parents=True, exist_ok=True)
+        np.savez_compressed(
+            speech_feature_path,
+            ptm=np.asarray(sequence_feature_frames["ptm"], dtype=np.float32),
+            mfcc=np.asarray(sequence_feature_frames["mfcc"], dtype=np.float32),
+            frame_hop_s=np.asarray(
+                [sequence_feature_frames["frame_hop_s"]], dtype=np.float32
+            ),
+        )
     result_parameters = {
         key: value
         for key, value in result.parameters.items()
-        if key not in {"frame_scores", "split_boundary_frame_scores", "sequence_feature_frames"}
+        if key not in {"frame_scores", "candidate_frame_scores", "sequence_feature_frames"}
     }
     runtime_boundary_signature = {
         **result_parameters,
         "boundary_pipeline": {
-            "version": 8,
-            "refiner_schema": "boundary_edge_refiner_v8_safe_tight",
+            "version": 9,
+            "order": [
+                "speech_island_scorer",
+                "outer_edge_refiner",
+                "semantic_split_model",
+                "cut_edge_refiner",
+            ],
             "feature_frame_hop_s": cfg["feature_frame_hop_s"],
             "score_frame_hop_s": score_frame_hop_s,
             "feature_sources": {
                 "speech_scores": frame_scores is not None,
-                "split_boundary_scores": split_boundary_frame_scores is not None,
+                "acoustic_candidate_scores": candidate_frame_scores is not None,
             },
-            "sequence_boundary_refiner": (
-                sequence_boundary_refiner.signature()
-                if sequence_boundary_refiner is not None
-                else None
-            ),
-            "sequence_feature_provider": (
-                sequence_feature_provider.signature()
-                if sequence_feature_provider is not None
-                else None
-            ),
-            "boundary_planner": {
-                "planner": "edge_sequence_island_planner_v8",
-                "sequence_batch_size": cfg["boundary_planner_sequence_batch_size"],
-            },
+            "outer_edge_refiner": outer_refiner.signature(),
+            "semantic_split_model": split_verifier.signature(),
+            "cut_edge_refiner": cut_refiner.signature(),
+            "sequence_feature_provider": sequence_feature_provider.signature(),
         },
     }
     segments = result.segments
@@ -426,16 +426,32 @@ def _build_processing_spans(
             )
             _set_last_boundary_cache_event(event)
         return []
-    packed = pack_speech_segments(
-        segments,
-        sequence_boundary_refiner=sequence_boundary_refiner,
-        sequence_feature_provider=sequence_feature_provider,
-        sequence_batch_size=cfg["boundary_planner_sequence_batch_size"],
+    if frame_scores is None:
+        raise ValueError("semantic boundary pipeline requires speech frame scores")
+    split_audit_records: list[dict] | None = (
+        [] if os.getenv("SEMANTIC_SPLIT_FEATURE_EXPORT_PATH", "").strip() else None
     )
+    packed = build_semantic_boundary_chunks(
+        segments,
+        duration_s=result.audio_duration_sec,
+        speech_probabilities=frame_scores,
+        feature_provider=sequence_feature_provider,
+        outer_refiner=outer_refiner,
+        split_verifier=split_verifier,
+        cut_refiner=cut_refiner,
+        split_audit_records=split_audit_records,
+        on_stage=on_stage,
+    )
+    if split_audit_records is not None:
+        _write_semantic_split_feature_export(
+            Path(os.environ["SEMANTIC_SPLIT_FEATURE_EXPORT_PATH"]),
+            audio_path=audio_path,
+            records=split_audit_records,
+        )
     packed = _annotate_scorer_stats_on_packed_chunks(
         packed,
         frame_scores=frame_scores,
-        split_scores=split_boundary_frame_scores,
+        split_scores=candidate_frame_scores,
         frame_hop_s=float(score_frame_hop_s or cfg["feature_frame_hop_s"]),
     )
     packed = _annotate_pre_asr_ptm_pooling_on_packed_chunks(
@@ -459,6 +475,50 @@ def _build_processing_spans(
         )
         _set_last_boundary_cache_event(event)
     return packed
+
+
+def _write_semantic_split_feature_export(
+    path: Path,
+    *,
+    audio_path: str,
+    records: list[dict],
+) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    np.savez_compressed(
+        path,
+        frame_features=np.stack([row["frame_features"] for row in records]),
+        scalar_features=np.stack([row["scalar_features"] for row in records]),
+        proposal_times_s=np.asarray(
+            [row["candidate"]["time_s"] for row in records], dtype=np.float32
+        ),
+        core_starts_s=np.asarray([row["core_start"] for row in records], dtype=np.float32),
+        core_ends_s=np.asarray([row["core_end"] for row in records], dtype=np.float32),
+        accepted=np.asarray([row["accepted"] for row in records], dtype=np.bool_),
+        p_cut=np.asarray([row["p_cut"] for row in records], dtype=np.float32),
+        p_continue=np.asarray([row["p_continue"] for row in records], dtype=np.float32),
+        p_unsure=np.asarray([row["p_unsure"] for row in records], dtype=np.float32),
+    )
+    metadata_path = path.with_suffix(".jsonl")
+    with metadata_path.open("w", encoding="utf-8") as handle:
+        for index, row in enumerate(records):
+            handle.write(
+                json.dumps(
+                    {
+                        "index": index,
+                        "audio": audio_path,
+                        "core_start": row["core_start"],
+                        "core_end": row["core_end"],
+                        "accepted": row["accepted"],
+                        "label": row["label"],
+                        "p_cut": row["p_cut"],
+                        "p_continue": row["p_continue"],
+                        "p_unsure": row["p_unsure"],
+                        **row["candidate"],
+                    },
+                    ensure_ascii=False,
+                )
+                + "\n"
+            )
 
 
 def _span_boundaries(
@@ -702,12 +762,15 @@ def _apply_pre_asr_cueqc(
         "drop_count": 0,
         "decisions": [],
     }
+    _progress("Pre-ASR CueQC 0/1")
     if not spans:
+        _progress("Pre-ASR CueQC 1/1")
         return spans, report
     if not _pre_asr_cueqc_module.enabled():
         _progress(
             f"Pre-ASR CueQC disabled candidates={len(spans)} pass_to_asr={len(spans)}"
         )
+        _progress("Pre-ASR CueQC 1/1")
         return spans, report
     started = time.perf_counter()
     model = _pre_asr_cueqc_module.load_active(expected_asr_repo_id=ASR_BACKEND)
@@ -797,6 +860,7 @@ def _apply_pre_asr_cueqc(
             elapsed=elapsed,
         )
     )
+    _progress("Pre-ASR CueQC 1/1")
     return kept, report
 
 
@@ -821,6 +885,13 @@ def _normalize_cut_candidates(value: Any) -> list[dict[str, Any]]:
             continue
         if item.get("downgraded_from") is not None:
             candidate["downgraded_from"] = str(item.get("downgraded_from") or "")
+        for key in ("proposal_time_s", "p_cut", "p_continue", "p_unsure"):
+            if item.get(key) is not None:
+                candidate[key] = float(item[key])
+        if item.get("label") is not None:
+            candidate["label"] = str(item.get("label") or "")
+        if item.get("shared_absolute_timestamp") is not None:
+            candidate["shared_absolute_timestamp"] = bool(item["shared_absolute_timestamp"])
         candidates.append(candidate)
     return _dedupe_cut_candidates(candidates)
 
@@ -895,6 +966,8 @@ def _annotate_packed_chunks(
         if span_index < 0 or span_index >= len(packed_spans):
             continue
         packed = packed_spans[span_index]
+        chunk["source_abs_start"] = packed.source_abs_start
+        chunk["source_abs_end"] = packed.source_abs_end
         chunk["speech_segment_count"] = len(packed.speech_segments)
         chunk["boundary_split_reason"] = packed.split_reason
         chunk["boundary_parent_chunk_id"] = packed.parent_chunk_id
@@ -1136,7 +1209,7 @@ def _transcribe_and_align_local(
     try:
         _notify("分析静音并切分音频...")
         split_started = time.perf_counter()
-        chunk_spans = _build_processing_spans(audio_path)
+        chunk_spans = _build_processing_spans(audio_path, on_stage=on_stage)
         cache_log_entry = _boundary_cache_log_entry(_LAST_BOUNDARY_CACHE_EVENT)
         if cache_log_entry:
             log.append(cache_log_entry)

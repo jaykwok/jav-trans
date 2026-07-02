@@ -69,20 +69,17 @@ DEFAULT_SETTINGS: dict[str, str] = {
     # Generation penalty to reduce repeated ASR text.
     "ASR_REPETITION_PENALTY": "1.05",
 
-    # --- Boundary Refiner / ASR Chunking ---
-    # Boundary Refiner is the current pre-ASR chunk planning path.
+    # --- Semantic boundary pipeline / ASR Chunking ---
+    # Speech islands are refined first, then split decisions and shared cut timestamps.
     # This is a feature-score grid fallback, not the source video frame rate.
     "BOUNDARY_FEATURE_FRAME_HOP_S": "0.02",
-    "BOUNDARY_REFINER_DEVICE": "auto",
+    "OUTER_EDGE_REFINER_DEVICE": "auto",
+    "SEMANTIC_SPLIT_DEVICE": "auto",
+    "CUT_EDGE_REFINER_DEVICE": "auto",
     "BOUNDARY_FRAME_SEQUENCE_LEFT_CONTEXT_S": "0.60",
     "BOUNDARY_FRAME_SEQUENCE_RIGHT_CONTEXT_S": "0.60",
-    "BOUNDARY_FRAME_SEQUENCE_MAX_PTM_DIMS": "64",
+    "BOUNDARY_FRAME_SEQUENCE_MAX_PTM_DIMS": "128",
     "BOUNDARY_FRAME_SEQUENCE_INCLUDE_MFCC": "1",
-    # Speech core is the subtitle timing window. Keep it short for JAV dialogue.
-    "BOUNDARY_PLANNER_SEQUENCE_BATCH_SIZE": "256",
-    # 1 stores SpeechBoundary frame scores in the SpeechBoundary result. Boundary Refiner enables
-    # this at runtime even when this explicit diagnostics flag stays off.
-    "SPEECH_BOUNDARY_JA_EXPORT_FRAME_SCORES": "0",
     # Optional learned SpeechBoundary-JA Mamba2 scorer override. Empty uses the registered repo-id scorer when available; auto resolves the same registry explicitly.
     "SPEECH_BOUNDARY_JA_SCORER_CHECKPOINT_BY_REPO": "",
     "SPEECH_BOUNDARY_JA_SCORER_DEVICE": "auto",
@@ -90,12 +87,11 @@ DEFAULT_SETTINGS: dict[str, str] = {
     "SPEECH_BOUNDARY_JA_FRAME_DILATION_S": "0.2",
     # 1 caches SpeechBoundary frame score -> Boundary Planner outputs separately from ASR generation settings.
     "BOUNDARY_CACHE_ENABLED": "1",
-    # Persistent boundary cache directory. Versioned as boundary-cache v13.
+    # Persistent boundary cache directory. Versioned as boundary-cache v14.
     "BOUNDARY_CACHE_DIR": "./tmp/cache/boundary",
 
-    # --- Pre-ASR CueQC v10 hierarchical keep/drop router ---
-    # Disabled until a repo-matched v10 checkpoint is trained and explicitly mapped.
-    # When enabled it runs after Boundary Refiner and before wav chunk export / ASR.
+    # --- Pre-ASR CueQC v11 semantic chunk keep/drop router ---
+    # Disabled by default. When enabled it runs after final semantic chunks and before ASR.
     "PRE_ASR_CUEQC_ENABLED": "0",
     "PRE_ASR_CUEQC_MODEL_PATH_BY_REPO": "",
     "PRE_ASR_CUEQC_DEVICE": "auto",

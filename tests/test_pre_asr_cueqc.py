@@ -14,8 +14,8 @@ from boundary.sequence_features import (
     FrameSequenceFeatureConfig,
     FrameSequenceFeatureProvider,
 )
-from tools.asr.cueqc.compile_pre_asr_v10_features import compile_features
-from tools.asr.cueqc.train_pre_asr_v10_binary import _split_label_masks
+from tools.asr.cueqc.compile_pre_asr_v11_features import compile_features
+from tools.asr.cueqc.train_pre_asr_v11_binary import _split_label_masks
 
 
 def _ptm_pool() -> list[float]:
@@ -199,29 +199,25 @@ def test_pre_asr_cueqc_requires_pooled_ptm_when_requested():
         pre_asr_cueqc.candidate_from_span(spans, 0, require_ptm_pooling=True)
 
 
-def test_pre_asr_cueqc_v10_model_forward_backward_ignores_padding():
+def test_pre_asr_cueqc_v11_model_forward_backward_ignores_padding():
     torch = pytest.importorskip("torch")
     transformers = pytest.importorskip("transformers")
     if not hasattr(transformers, "Mamba2Model"):
         pytest.skip("transformers.Mamba2Model is unavailable")
 
-    model = pre_asr_cueqc.PreAsrCueQCMambaV10(
+    model = pre_asr_cueqc.PreAsrCueQCNetwork(
         ptm_dim=4,
         scalar_dim=3,
-        hidden_size=16,
-        bin_mamba_layers=1,
-        chunk_mamba_layers=1,
-        state_size=8,
-        num_heads=2,
-        head_dim=16,
-        n_groups=1,
-        chunk_size=4,
+        hidden_size=128,
+        temporal_layers=1,
         dropout=0.0,
     )
-    ptm_bins = torch.randn(1, 3, 2, 4)
+    token_count = pre_asr_cueqc.PRE_ASR_CUEQC_MODEL_PTM_TOKENS
+    ptm_bins = torch.randn(1, 3, token_count, 4)
     scalar = torch.randn(1, 3, 3)
     chunk_mask = torch.tensor([[1.0, 1.0, 0.0]])
-    bin_mask = torch.tensor([[[1.0, 1.0], [1.0, 0.0], [0.0, 0.0]]])
+    bin_mask = torch.ones(1, 3, token_count)
+    bin_mask[:, 2] = 0.0
     labels = torch.tensor([[1, 0, pre_asr_cueqc.PRE_ASR_CUEQC_IGNORE_LABEL]])
 
     logits = model(ptm_bins, scalar, chunk_mask=chunk_mask, bin_mask=bin_mask)
@@ -365,7 +361,7 @@ def test_compile_pre_asr_cueqc_features_ignores_text_columns(tmp_path: Path):
 def test_compile_pre_asr_cueqc_features_reads_jsonl_chunk_candidates(tmp_path: Path):
     torch = pytest.importorskip("torch")
     del torch
-    from tools.asr.cueqc.train_pre_asr_v10_binary import load_feature_bundle
+    from tools.asr.cueqc.train_pre_asr_v11_binary import load_feature_bundle
 
     chunks = tmp_path / "chunks.jsonl"
     labels = tmp_path / "labels.jsonl"
@@ -397,9 +393,12 @@ def test_compile_pre_asr_cueqc_features_reads_jsonl_chunk_candidates(tmp_path: P
     assert summary["keep"] == 1
     assert summary["drop"] == 1
     bundle = load_feature_bundle(output)
-    assert bundle["ptm_bin_count"] == pre_asr_cueqc.PRE_ASR_CUEQC_PTM_BINS
+    assert (
+        bundle["ptm_bin_count"]
+        == pre_asr_cueqc.PRE_ASR_CUEQC_MODEL_PTM_TOKENS
+    )
     assert tuple(bundle["ptm_bins"].shape[-2:]) == (
-        pre_asr_cueqc.PRE_ASR_CUEQC_PTM_BINS,
+        pre_asr_cueqc.PRE_ASR_CUEQC_MODEL_PTM_TOKENS,
         pre_asr_cueqc.PRE_ASR_CUEQC_PTM_DIM,
     )
 

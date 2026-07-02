@@ -15,7 +15,7 @@ from boundary.base import SpeechSegment
 
 log = logging.getLogger(__name__)
 
-BOUNDARY_CACHE_VERSION = 13
+BOUNDARY_CACHE_VERSION = 14
 _AUDIO_SAMPLE_BYTES = 2 * 1024 * 1024
 _AUDIO_KEY_RE = re.compile(r"^[0-9a-fA-F]{8,40}$")
 
@@ -45,13 +45,16 @@ _BOUNDARY_BACKEND_ENV_KEYS = (
 )
 _BOUNDARY_ENV_KEYS = (
     "BOUNDARY_FEATURE_FRAME_HOP_S",
-    "BOUNDARY_REFINER_MODEL_PATH_BY_REPO",
-    "BOUNDARY_REFINER_DEVICE",
+    "OUTER_EDGE_REFINER_MODEL_PATH_BY_REPO",
+    "SEMANTIC_SPLIT_MODEL_PATH_BY_REPO",
+    "CUT_EDGE_REFINER_MODEL_PATH_BY_REPO",
+    "OUTER_EDGE_REFINER_DEVICE",
+    "SEMANTIC_SPLIT_DEVICE",
+    "CUT_EDGE_REFINER_DEVICE",
     "BOUNDARY_FRAME_SEQUENCE_LEFT_CONTEXT_S",
     "BOUNDARY_FRAME_SEQUENCE_RIGHT_CONTEXT_S",
     "BOUNDARY_FRAME_SEQUENCE_MAX_PTM_DIMS",
     "BOUNDARY_FRAME_SEQUENCE_INCLUDE_MFCC",
-    "BOUNDARY_PLANNER_SEQUENCE_BATCH_SIZE",
 )
 
 
@@ -285,6 +288,8 @@ def _packed_chunk_to_dict(chunk: PackedChunk) -> dict:
         "end": float(chunk.end),
         "duration": float(chunk.duration),
         "split_reason": chunk.split_reason,
+        "source_abs_start": chunk.source_abs_start,
+        "source_abs_end": chunk.source_abs_end,
         "parent_chunk_id": chunk.parent_chunk_id,
         "island_id": chunk.island_id,
         "island_count": chunk.island_count,
@@ -372,6 +377,16 @@ def _packed_chunk_from_dict(item: Any) -> PackedChunk:
         duration=float(item.get("duration", float(item["end"]) - float(item["start"]))),
         speech_segments=segments,
         split_reason=str(item.get("split_reason") or "unknown"),
+        source_abs_start=(
+            float(item["start"])
+            if item.get("source_abs_start") is None
+            else float(item["source_abs_start"])
+        ),
+        source_abs_end=(
+            float(item["end"])
+            if item.get("source_abs_end") is None
+            else float(item["source_abs_end"])
+        ),
         parent_chunk_id=(
             None
             if item.get("parent_chunk_id") is None
@@ -666,6 +681,13 @@ def _cut_candidates_from_payload(value: Any) -> list[dict[str, Any]]:
             continue
         if item.get("downgraded_from") is not None:
             candidate["downgraded_from"] = str(item.get("downgraded_from") or "")
+        for key in ("proposal_time_s", "p_cut", "p_continue", "p_unsure"):
+            if item.get(key) is not None:
+                candidate[key] = float(item[key])
+        if item.get("label") is not None:
+            candidate["label"] = str(item.get("label") or "")
+        if item.get("shared_absolute_timestamp") is not None:
+            candidate["shared_absolute_timestamp"] = bool(item["shared_absolute_timestamp"])
         candidates.append(candidate)
     return candidates
 

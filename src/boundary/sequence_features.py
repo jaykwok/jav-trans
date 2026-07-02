@@ -12,6 +12,21 @@ FRAME_SEQUENCE_FEATURE_SCHEMA = "edge_sequence_features_v2"
 FRAME_SEQUENCE_FRAMES_SCHEMA = "speech_boundary_ja_sequence_feature_frames_v1"
 CHUNK_POOLED_PTM_SCHEMA = "pre_asr_chunk_pooled_ptm_v1"
 DEFAULT_CHUNK_POOLED_PTM_BINS = 4
+SPLIT_CANDIDATE_SCALAR_NAMES = (
+    "candidate_score",
+    "candidate_prominence",
+    "candidate_speech_valley",
+    "candidate_strength",
+    "core_duration_s",
+    "left_duration_s",
+    "right_duration_s",
+    "candidate_position_ratio",
+    "left_speech_mean",
+    "right_speech_mean",
+    "gap_speech_mean",
+    "left_speech_active_ratio",
+    "right_speech_active_ratio",
+)
 
 
 @dataclass(frozen=True)
@@ -134,6 +149,149 @@ class FrameSequenceFeatureProvider:
             mfcc_used=self._mfcc_used,
             config=self.config,
         )
+
+    def features_for_split_candidate(
+        self,
+        *,
+        core_start_s: float,
+        core_end_s: float,
+        candidate: dict,
+        speech_probabilities: Sequence[float],
+        left_context_s: float,
+        right_context_s: float,
+        gap_context_s: float,
+        left_bins: int,
+        gap_bins: int,
+        right_bins: int,
+        ptm_dim: int,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        candidate_s = float(candidate["time_s"])
+        frame_dim = min(int(ptm_dim), self._ptm_used_dim)
+        combined = np.concatenate(
+            (
+                self._ptm_used[:, :frame_dim],
+                self._mfcc_used,
+            ),
+            axis=1,
+        )
+        ranges = (
+            (
+                max(core_start_s, candidate_s - left_context_s),
+                max(core_start_s, candidate_s - gap_context_s),
+                left_bins,
+            ),
+            (
+                max(core_start_s, candidate_s - gap_context_s),
+                min(core_end_s, candidate_s + gap_context_s),
+                gap_bins,
+            ),
+            (
+                min(core_end_s, candidate_s + gap_context_s),
+                min(core_end_s, candidate_s + right_context_s),
+                right_bins,
+            ),
+        )
+        pooled = np.concatenate(
+            [
+                _pool_frame_bins(
+                    combined,
+                    frame_hop_s=self.frame_hop_s,
+                    start_s=start_s,
+                    end_s=end_s,
+                    bins=bins,
+                )
+                for start_s, end_s, bins in ranges
+            ],
+            axis=0,
+        )
+        speech = np.asarray(speech_probabilities, dtype=np.float32).reshape(-1)
+        left_speech = _frame_window(
+            speech,
+            frame_hop_s=self.frame_hop_s,
+            start_s=max(core_start_s, candidate_s - left_context_s),
+            end_s=candidate_s,
+        )
+        right_speech = _frame_window(
+            speech,
+            frame_hop_s=self.frame_hop_s,
+            start_s=candidate_s,
+            end_s=min(core_end_s, candidate_s + right_context_s),
+        )
+        gap_speech = _frame_window(
+            speech,
+            frame_hop_s=self.frame_hop_s,
+            start_s=max(core_start_s, candidate_s - gap_context_s),
+            end_s=min(core_end_s, candidate_s + gap_context_s),
+        )
+        core_duration = max(0.0, core_end_s - core_start_s)
+        scalar = np.asarray(
+            [
+                float(candidate.get("score") or 0.0),
+                float(candidate.get("prominence") or 0.0),
+                float(candidate.get("speech_valley") or 0.0),
+                float(candidate.get("strength") or 0.0),
+                core_duration,
+                max(0.0, candidate_s - core_start_s),
+                max(0.0, core_end_s - candidate_s),
+                (candidate_s - core_start_s) / core_duration if core_duration > 0.0 else 0.0,
+                _array_mean(left_speech),
+                _array_mean(right_speech),
+                _array_mean(gap_speech),
+                _active_ratio(left_speech),
+                _active_ratio(right_speech),
+            ],
+            dtype=np.float32,
+        )
+        return pooled, scalar
+
+    def features_for_outer_island(
+        self,
+        *,
+        start_s: float,
+        end_s: float,
+        speech_probabilities: Sequence[float],
+        context_s: float,
+        ptm_dim: int,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        start_frame = int(round(start_s / self.frame_hop_s))
+        end_frame = int(round(end_s / self.frame_hop_s))
+        context_frames = int(round(context_s / self.frame_hop_s))
+        used_ptm_dim = min(int(ptm_dim), self._ptm_used_dim)
+        combined = np.concatenate(
+            (self._ptm_used[:, :used_ptm_dim], self._mfcc_used),
+            axis=1,
+        )
+        pooled = np.concatenate(
+            (
+                _pool_frame_bins_by_index(
+                    combined, start_frame - context_frames, start_frame, 4
+                ),
+                _pool_frame_bins_by_index(
+                    combined, start_frame, start_frame + context_frames, 4
+                ),
+                _pool_frame_bins_by_index(
+                    combined, end_frame - context_frames, end_frame, 4
+                ),
+                _pool_frame_bins_by_index(
+                    combined, end_frame, end_frame + context_frames, 4
+                ),
+            ),
+            axis=0,
+        )
+        speech = np.asarray(speech_probabilities, dtype=np.float32).reshape(-1)
+        window = speech[max(0, start_frame) : min(speech.size, end_frame)]
+        scalar = np.asarray(
+            (
+                max(0.0, end_s - start_s),
+                (start_frame + end_frame) / max(1, 2 * speech.size),
+                _array_mean(window),
+                float(window.min()) if window.size else 0.0,
+                float(window.max()) if window.size else 0.0,
+                _active_ratio(window),
+            ),
+            dtype=np.float32,
+        )
+        return pooled, scalar
 
     def chunk_pooled_ptm_feature_names(
         self,
@@ -410,6 +568,68 @@ def _frame_bounds_for_range(
     lower = max(0, int(round(max(0.0, start_s) / frame_hop_s)))
     upper = min(int(frame_count), int(round(max(start_s, end_s) / frame_hop_s)))
     return lower, max(lower, upper)
+
+
+def _frame_window(
+    values: np.ndarray,
+    *,
+    frame_hop_s: float,
+    start_s: float,
+    end_s: float,
+) -> np.ndarray:
+    lower, upper = _frame_bounds_for_range(
+        int(values.shape[0]),
+        frame_hop_s=frame_hop_s,
+        start_s=start_s,
+        end_s=end_s,
+    )
+    return values[lower:upper]
+
+
+def _pool_frame_bins(
+    values: np.ndarray,
+    *,
+    frame_hop_s: float,
+    start_s: float,
+    end_s: float,
+    bins: int,
+) -> np.ndarray:
+    window = _frame_window(
+        values,
+        frame_hop_s=frame_hop_s,
+        start_s=start_s,
+        end_s=end_s,
+    )
+    return _pool_window_bins(window, dim=int(values.shape[1]), bins=bins)
+
+
+def _pool_frame_bins_by_index(
+    values: np.ndarray,
+    start: int,
+    end: int,
+    bins: int,
+) -> np.ndarray:
+    window = values[max(0, start) : min(values.shape[0], end)]
+    return _pool_window_bins(window, dim=int(values.shape[1]), bins=bins)
+
+
+def _pool_window_bins(window: np.ndarray, *, dim: int, bins: int) -> np.ndarray:
+    rows: list[np.ndarray] = []
+    for part in np.array_split(window, int(bins), axis=0):
+        rows.append(
+            part.mean(axis=0).astype(np.float32)
+            if part.shape[0]
+            else np.zeros(dim, dtype=np.float32)
+        )
+    return np.stack(rows)
+
+
+def _array_mean(values: np.ndarray) -> float:
+    return float(values.mean()) if values.size else 0.0
+
+
+def _active_ratio(values: np.ndarray) -> float:
+    return float((values >= 0.5).mean()) if values.size else 0.0
 
 
 def _stats_for_range(

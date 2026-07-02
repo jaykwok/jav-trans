@@ -164,6 +164,12 @@ _ASR_STAGE_ADVANCED_KEYS = {
     "KEEP_ASR_CHUNKS",
     "BOUNDARY_CACHE_DIR",
     "BOUNDARY_CACHE_ENABLED",
+    "OUTER_EDGE_REFINER_DEVICE",
+    "OUTER_EDGE_REFINER_MODEL_PATH_BY_REPO",
+    "SEMANTIC_SPLIT_DEVICE",
+    "SEMANTIC_SPLIT_MODEL_PATH_BY_REPO",
+    "CUT_EDGE_REFINER_DEVICE",
+    "CUT_EDGE_REFINER_MODEL_PATH_BY_REPO",
 }
 _ASR_STAGE_CACHE_NEUTRAL_KEYS = {
     "BOUNDARY_CACHE_DIR",
@@ -917,6 +923,19 @@ def run_asr_alignment(
                             "progress",
                             event_extra,
                         )
+                        if (
+                            int(event_extra.get("total") or 0) > 0
+                            and int(event_extra.get("current") or 0)
+                            >= int(event_extra["total"])
+                            and event_stage not in asr_event_done
+                        ):
+                            _emit_stage_event(
+                                video_path,
+                                event_stage,
+                                "done",
+                                event_extra,
+                            )
+                            asr_event_done.add(event_stage)
                     match = _ASR_PROGRESS_RE.search(msg)
                     if match:
                         raw_label = match.group("label")
@@ -962,7 +981,7 @@ def run_asr_alignment(
                         logger.exception("asr_alignment_failed")
                     raise
                 _raise_if_cancelled(cancel_event)
-                for event_stage in ("asr_text_transcribe", "subtitle_timing"):
+                for event_stage in tuple(asr_event_started):
                     if event_stage in asr_event_started and event_stage not in asr_event_done:
                         _emit_stage_event(
                             video_path,

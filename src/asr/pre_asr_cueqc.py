@@ -21,14 +21,22 @@ from boundary.sequence_features import (
 )
 
 
-PRE_ASR_CUEQC_SCHEMA = "cueqc_pre_asr_mamba_v10_binary"
-PRE_ASR_CUEQC_MODEL_ARCH = "cueqc_pre_asr_mamba_v10"
-PRE_ASR_CUEQC_DECISION_VERSION = "pre_asr_cueqc_v10_binary_v1"
-PRE_ASR_CUEQC_FEATURE_SCHEMA = "pre_asr_cueqc_features_v6"
-PRE_ASR_CUEQC_RUNTIME_ADAPTER = "pre_asr_planned_island_sequence_v2"
+PRE_ASR_CUEQC_SCHEMA = "cueqc_pre_asr_semantic_chunk_v11_binary"
+PRE_ASR_CUEQC_MODEL_ARCH = "cueqc_pre_asr_semantic_chunk_v11"
+PRE_ASR_CUEQC_DECISION_VERSION = "pre_asr_cueqc_v11_binary_v1"
+PRE_ASR_CUEQC_FEATURE_SCHEMA = "pre_asr_cueqc_features_v8"
+PRE_ASR_CUEQC_RUNTIME_ADAPTER = "pre_asr_semantic_chunk_sequence_v3"
+PRE_ASR_CUEQC_ARTIFACT = {
+    "name": "pre_asr_cueqc",
+    "display_name": "Pre-ASR CueQC",
+    "version": "v11",
+    "pipeline_stage": 5,
+    "pipeline_role": "final_chunk_keep_drop_routing",
+}
 PRE_ASR_CUEQC_IGNORE_LABEL = -100
-PRE_ASR_CUEQC_PTM_DIM = FrameSequenceFeatureConfig().max_ptm_dims
+PRE_ASR_CUEQC_PTM_DIM = 128
 PRE_ASR_CUEQC_PTM_BINS = 8
+PRE_ASR_CUEQC_MODEL_PTM_TOKENS = PRE_ASR_CUEQC_PTM_BINS + 2
 PRE_ASR_CUEQC_DEFAULT_DROP_THRESHOLD = 0.95
 
 PRE_ASR_CUEQC_SCALAR_FEATURE_NAMES = (
@@ -108,6 +116,11 @@ PRE_ASR_CUEQC_SCALAR_FEATURE_NAMES = (
     "weak_cut_count",
     "primary_cut_density",
     "weak_cut_density",
+    "semantic_p_cut_mean",
+    "semantic_p_cut_max",
+    "semantic_p_continue_mean",
+    "semantic_p_unsure_mean",
+    "semantic_unsure_ratio",
     "subtitle_min_duration_s",
     "below_subtitle_min_duration",
     "micro_chunk_candidate",
@@ -149,8 +162,12 @@ PRE_ASR_CUEQC_POOLED_PTM_FEATURE_NAMES = tuple(
     )
 )
 PRE_ASR_CUEQC_PTM_BIN_FEATURE_NAMES = tuple(
-    f"ptm_bin{bin_index:02d}_{dim_index:04d}"
-    for bin_index in range(PRE_ASR_CUEQC_PTM_BINS)
+    f"ptm_{token_name}_{dim_index:04d}"
+    for token_name in (
+        "global_mean",
+        "global_max",
+        *(f"bin{bin_index:02d}" for bin_index in range(PRE_ASR_CUEQC_PTM_BINS)),
+    )
     for dim_index in range(PRE_ASR_CUEQC_PTM_DIM)
 )
 PRE_ASR_CUEQC_FEATURE_NAMES = (
@@ -342,7 +359,7 @@ def _pooled_ptm_values(
     if available:
         return values, True, schema, parsed_bins or PRE_ASR_CUEQC_PTM_BINS, expected_dim
     if require_ptm_pooling:
-        raise ValueError("Pre-ASR CueQC v10 requires chunk-level pooled PTM features")
+        raise ValueError("Pre-ASR CueQC v11 requires chunk-level pooled PTM features")
     return [0.0] * expected_dim, False, schema, parsed_bins, parsed_dim
 
 
@@ -355,14 +372,13 @@ def ptm_bin_matrix(candidate: Mapping[str, Any]) -> tuple[np.ndarray, np.ndarray
     if len(pooled) != expected:
         pooled = [0.0] * expected
     dim = PRE_ASR_CUEQC_PTM_DIM
-    offset = dim * 2
-    values = np.asarray(pooled[offset : offset + PRE_ASR_CUEQC_PTM_BINS * dim], dtype=np.float32)
-    if values.size != PRE_ASR_CUEQC_PTM_BINS * dim:
-        values = np.zeros((PRE_ASR_CUEQC_PTM_BINS * dim,), dtype=np.float32)
-    matrix = values.reshape(PRE_ASR_CUEQC_PTM_BINS, dim)
+    values = np.asarray(pooled, dtype=np.float32)
+    if values.size != PRE_ASR_CUEQC_MODEL_PTM_TOKENS * dim:
+        values = np.zeros((PRE_ASR_CUEQC_MODEL_PTM_TOKENS * dim,), dtype=np.float32)
+    matrix = values.reshape(PRE_ASR_CUEQC_MODEL_PTM_TOKENS, dim)
     available = bool(candidate.get("ptm_pooling_available"))
-    mask = np.ones((PRE_ASR_CUEQC_PTM_BINS,), dtype=np.float32) if available else np.zeros(
-        (PRE_ASR_CUEQC_PTM_BINS,), dtype=np.float32
+    mask = np.ones((PRE_ASR_CUEQC_MODEL_PTM_TOKENS,), dtype=np.float32) if available else np.zeros(
+        (PRE_ASR_CUEQC_MODEL_PTM_TOKENS,), dtype=np.float32
     )
     return matrix, mask
 
@@ -451,6 +467,13 @@ def candidate_from_span(
     top1, top2, prom1, prom2, split_peak_count = _top_split_values(span)
     primary_cut_count = len(_cut_candidates_for_key(span, "primary_cut_candidates"))
     weak_cut_count = len(_cut_candidates_for_key(span, "weak_cut_candidates"))
+    semantic_candidates = (
+        _cut_candidates_for_key(span, "primary_cut_candidates")
+        + _cut_candidates_for_key(span, "weak_cut_candidates")
+    )
+    p_cut_values = [_safe_float(item.get("p_cut")) for item in semantic_candidates]
+    p_continue_values = [_safe_float(item.get("p_continue")) for item in semantic_candidates]
+    p_unsure_values = [_safe_float(item.get("p_unsure")) for item in semantic_candidates]
     position, group_count = _planned_island_position(spans, index)
     micro_action = str(_packed_value(span, "micro_resolve_action", "") or "")
     micro_none = 1.0 if not micro_action else 0.0
@@ -569,6 +592,22 @@ def candidate_from_span(
         "weak_cut_count": float(weak_cut_count),
         "primary_cut_density": float(primary_cut_count) / max(duration, 1e-6),
         "weak_cut_density": float(weak_cut_count) / max(duration, 1e-6),
+        "semantic_p_cut_mean": float(np.mean(p_cut_values)) if p_cut_values else 0.0,
+        "semantic_p_cut_max": max(p_cut_values, default=0.0),
+        "semantic_p_continue_mean": (
+            float(np.mean(p_continue_values)) if p_continue_values else 0.0
+        ),
+        "semantic_p_unsure_mean": (
+            float(np.mean(p_unsure_values)) if p_unsure_values else 0.0
+        ),
+        "semantic_unsure_ratio": (
+            sum(
+                1
+                for item in semantic_candidates
+                if str(item.get("label") or "") == "unsure"
+            )
+            / max(1, len(semantic_candidates))
+        ),
         "subtitle_min_duration_s": _safe_float(_packed_value(span, "subtitle_min_duration_s")),
         "below_subtitle_min_duration": _bool_feature(
             _packed_value(span, "below_subtitle_min_duration", False)
@@ -682,10 +721,10 @@ def sequence_tensors(
         dtype=np.float32,
     )
     bins = np.zeros(
-        (batch, max_chunks, PRE_ASR_CUEQC_PTM_BINS, PRE_ASR_CUEQC_PTM_DIM),
+        (batch, max_chunks, PRE_ASR_CUEQC_MODEL_PTM_TOKENS, PRE_ASR_CUEQC_PTM_DIM),
         dtype=np.float32,
     )
-    bin_mask = np.zeros((batch, max_chunks, PRE_ASR_CUEQC_PTM_BINS), dtype=np.float32)
+    bin_mask = np.zeros((batch, max_chunks, PRE_ASR_CUEQC_MODEL_PTM_TOKENS), dtype=np.float32)
     chunk_mask = np.zeros((batch, max_chunks), dtype=np.float32)
     positions: list[tuple[int, int]] = [(-1, -1)] * len(candidates)
     for group_index, group in enumerate(groups):
@@ -705,7 +744,7 @@ def sequence_tensors(
     }
 
 
-class PreAsrCueQCMambaV10:
+class PreAsrCueQCNetwork:
     def __new__(cls, *args: Any, **kwargs: Any):
         import torch
         from torch import nn
@@ -717,13 +756,7 @@ class PreAsrCueQCMambaV10:
                 ptm_dim: int,
                 scalar_dim: int,
                 hidden_size: int = 128,
-                bin_mamba_layers: int = 1,
-                chunk_mamba_layers: int = 1,
-                state_size: int = 32,
-                num_heads: int = 4,
-                head_dim: int = 64,
-                n_groups: int = 2,
-                chunk_size: int = 8,
+                temporal_layers: int = 2,
                 dropout: float = 0.1,
                 num_classes: int = 2,
             ) -> None:
@@ -731,16 +764,13 @@ class PreAsrCueQCMambaV10:
                 from boundary.backbones import TinyMamba2BoundaryBackbone
 
                 self.arch = PRE_ASR_CUEQC_MODEL_ARCH
-                self.bin_backbone = TinyMamba2BoundaryBackbone(
-                    input_dim=ptm_dim,
-                    hidden_size=hidden_size,
-                    num_layers=bin_mamba_layers,
-                    state_size=state_size,
-                    num_heads=num_heads,
-                    head_dim=head_dim,
-                    n_groups=n_groups,
-                    chunk_size=chunk_size,
-                    bidirectional=True,
+                self.ptm_encoder = nn.Sequential(
+                    nn.LayerNorm(ptm_dim * 4),
+                    nn.Linear(ptm_dim * 4, hidden_size * 2),
+                    nn.GELU(),
+                    nn.Dropout(dropout),
+                    nn.Linear(hidden_size * 2, hidden_size),
+                    nn.GELU(),
                 )
                 self.scalar_encoder = nn.Sequential(
                     nn.LayerNorm(scalar_dim),
@@ -751,47 +781,43 @@ class PreAsrCueQCMambaV10:
                     nn.GELU(),
                 )
                 self.chunk_fuse = nn.Sequential(
-                    nn.LayerNorm(self.bin_backbone.output_dim * 2 + hidden_size),
-                    nn.Linear(self.bin_backbone.output_dim * 2 + hidden_size, hidden_size),
+                    nn.LayerNorm(hidden_size * 2),
+                    nn.Linear(hidden_size * 2, hidden_size),
                     nn.GELU(),
                     nn.Dropout(dropout),
                 )
-                self.chunk_backbone = TinyMamba2BoundaryBackbone(
+                self.delta_encoder = nn.Sequential(
+                    nn.LayerNorm(hidden_size * 3),
+                    nn.Linear(hidden_size * 3, hidden_size),
+                    nn.GELU(),
+                )
+                self.temporal_backbone = TinyMamba2BoundaryBackbone(
                     input_dim=hidden_size,
                     hidden_size=hidden_size,
-                    num_layers=chunk_mamba_layers,
-                    state_size=state_size,
-                    num_heads=num_heads,
-                    head_dim=head_dim,
-                    n_groups=n_groups,
-                    chunk_size=chunk_size,
+                    num_layers=temporal_layers,
+                    state_size=32,
+                    num_heads=4,
+                    head_dim=64,
+                    n_groups=2,
+                    chunk_size=8,
                     bidirectional=True,
                 )
+                self.temporal_projection = nn.Linear(
+                    self.temporal_backbone.output_dim,
+                    hidden_size,
+                )
+                self.temporal_gate = nn.Sequential(
+                    nn.LayerNorm(hidden_size * 2),
+                    nn.Linear(hidden_size * 2, hidden_size),
+                    nn.Sigmoid(),
+                )
                 self.classifier = nn.Sequential(
-                    nn.LayerNorm(self.chunk_backbone.output_dim),
-                    nn.Linear(self.chunk_backbone.output_dim, hidden_size),
+                    nn.LayerNorm(hidden_size),
+                    nn.Linear(hidden_size, hidden_size),
                     nn.GELU(),
                     nn.Dropout(dropout),
                     nn.Linear(hidden_size, num_classes),
                 )
-
-            @staticmethod
-            def _masked_mean_pool(x: torch.Tensor, mask: torch.Tensor | None) -> torch.Tensor:
-                if mask is None:
-                    return x.mean(dim=1)
-                m = mask.unsqueeze(-1).to(dtype=x.dtype)
-                denom = m.sum(dim=1).clamp_min(1.0)
-                return (x * m).sum(dim=1) / denom
-
-            @staticmethod
-            def _masked_max_pool(x: torch.Tensor, mask: torch.Tensor | None) -> torch.Tensor:
-                if mask is None:
-                    return x.max(dim=1).values
-                valid = mask.unsqueeze(-1).bool()
-                filled = x.masked_fill(~valid, -1.0e4)
-                values = filled.max(dim=1).values
-                any_valid = valid.any(dim=1)
-                return torch.where(any_valid, values, torch.zeros_like(values))
 
             def forward(
                 self,
@@ -805,19 +831,50 @@ class PreAsrCueQCMambaV10:
                 if scalar_features.ndim != 3:
                     raise ValueError("scalar_features must have shape [batch, chunks, dim]")
                 batch, chunks, bins, dim = ptm_bins.shape
-                x = ptm_bins.reshape(batch * chunks, bins, dim)
-                bm = None if bin_mask is None else bin_mask.reshape(batch * chunks, bins).long()
-                bin_h = self.bin_backbone(x, attention_mask=bm)
-                mean_pool = self._masked_mean_pool(bin_h, bm)
-                max_pool = self._masked_max_pool(bin_h, bm)
-                bin_repr = torch.cat([mean_pool, max_pool], dim=-1)
+                global_mean = ptm_bins[:, :, 0]
+                global_max = ptm_bins[:, :, 1]
+                local = ptm_bins[:, :, 2:]
+                local_mean = local.mean(dim=2)
+                local_max = local.max(dim=2).values
+                ptm = torch.cat(
+                    (global_mean, global_max, local_mean, local_max),
+                    dim=-1,
+                ).reshape(batch * chunks, dim * 4)
+                ptm_repr = self.ptm_encoder(ptm)
                 scalar = scalar_features.reshape(batch * chunks, -1)
                 scalar_repr = self.scalar_encoder(scalar)
-                chunk_repr = self.chunk_fuse(torch.cat([bin_repr, scalar_repr], dim=-1))
-                chunk_repr = chunk_repr.reshape(batch, chunks, -1)
+                chunk_repr = self.chunk_fuse(
+                    torch.cat([ptm_repr, scalar_repr], dim=-1)
+                )
+                local_repr = chunk_repr.reshape(batch, chunks, -1)
+                previous = torch.cat(
+                    (torch.zeros_like(local_repr[:, :1]), local_repr[:, :-1]),
+                    dim=1,
+                )
+                following = torch.cat(
+                    (local_repr[:, 1:], torch.zeros_like(local_repr[:, :1])),
+                    dim=1,
+                )
+                delta_repr = self.delta_encoder(
+                    torch.cat(
+                        (
+                            local_repr,
+                            local_repr - previous,
+                            following - local_repr,
+                        ),
+                        dim=-1,
+                    )
+                )
                 cm = None if chunk_mask is None else chunk_mask.long()
-                ctx = self.chunk_backbone(chunk_repr, attention_mask=cm)
-                logits = self.classifier(ctx)
+                temporal = self.temporal_backbone(
+                    local_repr + delta_repr,
+                    attention_mask=cm,
+                )
+                temporal = self.temporal_projection(temporal)
+                gate = self.temporal_gate(
+                    torch.cat((local_repr, delta_repr), dim=-1)
+                )
+                logits = self.classifier(local_repr + gate * temporal)
                 if chunk_mask is not None:
                     logits = logits * chunk_mask.unsqueeze(-1).to(dtype=logits.dtype)
                 return logits
@@ -831,13 +888,7 @@ def make_model_config(config: Mapping[str, Any] | None = None) -> dict[str, Any]
         "ptm_dim": int(raw.get("ptm_dim") or PRE_ASR_CUEQC_PTM_DIM),
         "scalar_dim": int(raw.get("scalar_dim") or len(PRE_ASR_CUEQC_SCALAR_FEATURE_NAMES)),
         "hidden_size": int(raw.get("hidden_size") or 128),
-        "bin_mamba_layers": int(raw.get("bin_mamba_layers") or 1),
-        "chunk_mamba_layers": int(raw.get("chunk_mamba_layers") or 1),
-        "state_size": int(raw.get("state_size") or 32),
-        "num_heads": int(raw.get("num_heads") or 4),
-        "head_dim": int(raw.get("head_dim") or 64),
-        "n_groups": int(raw.get("n_groups") or 2),
-        "chunk_size": int(raw.get("chunk_size") or 8),
+        "temporal_layers": int(raw.get("temporal_layers") or 2),
         "dropout": float(raw.get("dropout", 0.1)),
         "num_classes": int(raw.get("num_classes") or 2),
     }
@@ -865,6 +916,14 @@ class PreAsrCueQC:
         if str(checkpoint.get("runtime_adapter") or "") != PRE_ASR_CUEQC_RUNTIME_ADAPTER:
             raise ValueError("Pre-ASR CueQC runtime_adapter does not match runtime")
         metadata = dict(checkpoint.get("metadata") or {})
+        artifact = metadata.get("artifact")
+        if not isinstance(artifact, dict):
+            raise ValueError("Pre-ASR CueQC metadata.artifact is required")
+        for key, expected in PRE_ASR_CUEQC_ARTIFACT.items():
+            if artifact.get(key) != expected:
+                raise ValueError(
+                    f"Pre-ASR CueQC metadata.artifact.{key} must be {expected!r}"
+                )
         if expected_asr_repo_id is not None:
             validate_checkpoint_repo_id(
                 str(metadata.get("asr_repo_id") or ""),
@@ -884,7 +943,7 @@ class PreAsrCueQC:
             raise ValueError("Pre-ASR CueQC model_config.ptm_dim does not match runtime")
         if config["scalar_dim"] != len(PRE_ASR_CUEQC_SCALAR_FEATURE_NAMES):
             raise ValueError("Pre-ASR CueQC model_config.scalar_dim does not match runtime")
-        self.model = PreAsrCueQCMambaV10(**config)
+        self.model = PreAsrCueQCNetwork(**config)
         state = checkpoint.get("model_state_dict")
         if not isinstance(state, dict):
             raise ValueError("Pre-ASR CueQC checkpoint missing model_state_dict")

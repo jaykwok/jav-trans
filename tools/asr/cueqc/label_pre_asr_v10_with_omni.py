@@ -544,6 +544,7 @@ def call_omni(
     base_url: str,
     timeout_s: float,
     store_stream_chunks: bool,
+    prompt: str = PROMPT,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     from openai import OpenAI
 
@@ -559,7 +560,7 @@ def call_omni(
             {
                 "role": "user",
                 "content": [
-                    {"type": "text", "text": PROMPT},
+                    {"type": "text", "text": prompt},
                     audio_content_part(audio_path, fmt=fmt, mode=audio_content_mode),
                 ],
             }

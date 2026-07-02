@@ -4,7 +4,7 @@ import { loadFormMemory, saveFormMemory, applyFormMemory } from './formMemory.js
 import { setActivePreset } from './presets.js';
 
 const _BACKEND_LABELS = {
-  'jaykwok/Qwen3-ASR-0.6B-JA-Anime-Galgame-hf': 'Qwen3-ASR-0.6B-JA-Anime-Galgame-hf（低配）',
+  'jaykwok/Qwen3-ASR-0.6B-JA-Anime-Galgame-hf': 'Qwen3-ASR-0.6B-JA-Anime-Galgame-hf（需自备五模型）',
   'jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame-hf': 'Qwen3-ASR-1.7B-JA-Anime-Galgame-hf',
 };
 const _SUBTITLE_MODE_LABELS = { zh: '中文字幕', bilingual: '中日双语' };
@@ -20,13 +20,16 @@ let _modelRequirementsRequestSeq = 0;
 function formatRequirementLabel(item) {
   const labels = Array.isArray(item.role_labels) ? item.role_labels.join('/') : '';
   const name = item.short_name || String(item.repo_id || '').split('/').pop() || item.repo_id || '';
+  if (labels === name) return labels;
   return labels ? `${labels} ${name}` : name;
 }
 
 function renderModelRequirements(payload) {
   const notice = $('model-requirements-notice');
   if (!notice) return;
-  const missing = (payload.required_models || []).filter(item => !item.present);
+  const missingModels = (payload.required_models || []).filter(item => !item.present);
+  const missingCheckpoints = (payload.required_checkpoints || []).filter(item => !item.present);
+  const missing = [...missingModels, ...missingCheckpoints];
   if (!missing.length) {
     notice.hidden = true;
     notice.textContent = '';
@@ -34,12 +37,16 @@ function renderModelRequirements(payload) {
   }
 
   let message;
-  if (payload.download_disabled && payload.needs_download) {
-    message = `当前配置缺少 ${payload.missing_count} 个模型；可自动下载的模型会在首次运行下载，已关闭自动下载的模型需要先准备。`;
+  if (missingCheckpoints.length && missingModels.length) {
+    message = `当前配置缺少 ${missingModels.length} 个基础模型和 ${missingCheckpoints.length} 个前置 checkpoint；基础模型可按配置下载，checkpoint 需要先准备。`;
+  } else if (missingCheckpoints.length) {
+    message = `当前 ASR 后端缺少 ${missingCheckpoints.length} 个前置 checkpoint，不能运行完整五模型链。`;
+  } else if (payload.download_disabled && payload.needs_download) {
+    message = `当前配置缺少 ${missingModels.length} 个模型；可自动下载的模型会在首次运行下载，已关闭自动下载的模型需要先准备。`;
   } else if (payload.download_disabled) {
-    message = '当前配置缺少模型文件，且已关闭自动下载，需要先准备本地模型。';
+    message = '当前配置缺少基础模型文件，且已关闭自动下载，需要先准备本地模型。';
   } else {
-    message = `首次使用该配置需要下载 ${payload.missing_count} 个模型；下载完成后会复用本地缓存。`;
+    message = `首次使用该配置需要下载 ${missingModels.length} 个模型；下载完成后会复用本地缓存。`;
   }
 
   const missingText = missing.map(formatRequirementLabel).join('、');

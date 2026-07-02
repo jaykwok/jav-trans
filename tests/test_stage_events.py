@@ -10,6 +10,7 @@ from rich.console import Console
 from core import events
 import main
 from pipeline import audio as pipeline_audio
+from pipeline.stage_log import _parse_asr_stage_event
 from helpers import make_job_context, run_pipeline
 
 
@@ -40,7 +41,16 @@ def _mock_minimal_pipeline(monkeypatch, segments: list[dict]) -> None:
     def fake_transcribe_and_align(_audio_path, _device, on_stage=None, include_details=False):
         assert include_details is True
         if on_stage:
-            on_stage("ASR 文本转写 1/1...")
+            for message in (
+                "语音岛检测 1/1",
+                "外边界精修 1/1",
+                "语义切分判断 1/1",
+                "内部切点精修 1/1",
+                "Pre-ASR CueQC 1/1",
+                "音频切块 1/1",
+                "ASR 文本转写 1/1",
+            ):
+                on_stage(message)
         return (
             segments,
             ["mock asr"],
@@ -88,6 +98,12 @@ def test_stage_events_memory_sink_records_pipeline_events(monkeypatch, tmp_path)
     assert ("audio_prepare", "done") in observed
     assert ("asr_text_transcribe", "start") in observed
     assert ("asr_text_transcribe", "done") in observed
+    assert ("speech_island_scorer", "done") in observed
+    assert ("outer_edge_refiner", "done") in observed
+    assert ("semantic_split_model", "done") in observed
+    assert ("cut_edge_refiner", "done") in observed
+    assert ("pre_asr_cueqc", "done") in observed
+    assert ("audio_chunk_export", "done") in observed
     assert ("write_output", "done") in observed
 
     for event in emitted:
@@ -122,3 +138,15 @@ def test_empty_stage_event_sink_is_silent(monkeypatch, tmp_path, capsys):
     assert "StageEvent" not in stdout
     assert "stage_start" not in stdout
     assert events.get_memory_events() == []
+
+
+def test_five_model_progress_labels_map_to_frontend_stages():
+    assert _parse_asr_stage_event("语音岛检测 1/1") == (
+        "speech_island_scorer",
+        {"label": "语音岛检测", "current": 1, "total": 1},
+    )
+    assert _parse_asr_stage_event("外边界精修 1/1")[0] == "outer_edge_refiner"
+    assert _parse_asr_stage_event("语义切分判断 3/8")[0] == "semantic_split_model"
+    assert _parse_asr_stage_event("内部切点精修 3/8")[0] == "cut_edge_refiner"
+    assert _parse_asr_stage_event("Pre-ASR CueQC 1/1")[0] == "pre_asr_cueqc"
+    assert _parse_asr_stage_event("音频切块 2/5")[0] == "audio_chunk_export"

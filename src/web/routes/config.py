@@ -10,7 +10,16 @@ from typing import Any, get_args
 import httpx
 from fastapi import APIRouter, HTTPException, Query
 
-from asr.backends.qwen import qwen_asr_default_model_path, qwen_asr_repo_id
+from asr.backends.qwen import (
+    DEFAULT_CUT_EDGE_REFINER_CHECKPOINT_BY_REPO,
+    DEFAULT_OUTER_EDGE_REFINER_CHECKPOINT_BY_REPO,
+    DEFAULT_PRE_ASR_CUEQC_CHECKPOINT_BY_REPO,
+    DEFAULT_SEMANTIC_SPLIT_CHECKPOINT_BY_REPO,
+    DEFAULT_SPEECH_BOUNDARY_SCORER_CHECKPOINT_BY_REPO,
+    checkpoint_path_for_repo_env,
+    qwen_asr_default_model_path,
+    qwen_asr_repo_id,
+)
 from core.config import DEFAULT_SETTINGS, load_config
 from utils import model_paths
 from utils.model_paths import PROJECT_ROOT, normalize_hf_endpoint
@@ -32,6 +41,38 @@ _MODEL_ROLE_LABELS = {
     "asr": "ASR",
     "boundary_feature": "Boundary",
 }
+_CHECKPOINT_SPECS = (
+    (
+        "speech_island_scorer",
+        "SpeechIslandScorer",
+        "SPEECH_BOUNDARY_JA_SCORER_CHECKPOINT_BY_REPO",
+        DEFAULT_SPEECH_BOUNDARY_SCORER_CHECKPOINT_BY_REPO,
+    ),
+    (
+        "outer_edge_refiner",
+        "Outer Edge Refiner",
+        "OUTER_EDGE_REFINER_MODEL_PATH_BY_REPO",
+        DEFAULT_OUTER_EDGE_REFINER_CHECKPOINT_BY_REPO,
+    ),
+    (
+        "semantic_split_model",
+        "Semantic Split Model",
+        "SEMANTIC_SPLIT_MODEL_PATH_BY_REPO",
+        DEFAULT_SEMANTIC_SPLIT_CHECKPOINT_BY_REPO,
+    ),
+    (
+        "cut_edge_refiner",
+        "Cut Edge Refiner",
+        "CUT_EDGE_REFINER_MODEL_PATH_BY_REPO",
+        DEFAULT_CUT_EDGE_REFINER_CHECKPOINT_BY_REPO,
+    ),
+    (
+        "pre_asr_cueqc",
+        "Pre-ASR CueQC",
+        "PRE_ASR_CUEQC_MODEL_PATH_BY_REPO",
+        DEFAULT_PRE_ASR_CUEQC_CHECKPOINT_BY_REPO,
+    ),
+)
 
 
 def _format_env_line(key: str, value: str) -> str:
@@ -184,6 +225,36 @@ def _merge_model_requirements(requirements: list[dict[str, Any]]) -> list[dict[s
     return merged
 
 
+def _checkpoint_requirements(repo_id: str) -> list[dict[str, Any]]:
+    requirements: list[dict[str, Any]] = []
+    for role, label, mapping_env, default_mapping in _CHECKPOINT_SPECS:
+        path = ""
+        error = ""
+        try:
+            path = checkpoint_path_for_repo_env(
+                repo_id=repo_id,
+                mapping_env=mapping_env,
+                default_mapping=default_mapping,
+                required=False,
+            )
+        except (FileNotFoundError, RuntimeError, ValueError) as exc:
+            error = str(exc)
+        requirements.append(
+            {
+                "roles": [role],
+                "role_labels": [label],
+                "repo_id": repo_id,
+                "short_name": label,
+                "local_path": path,
+                "present": bool(path),
+                "download_enabled": False,
+                "mapping_env": mapping_env,
+                "error": error,
+            }
+        )
+    return requirements
+
+
 def _sync_hf_endpoint(value: str) -> str:
     try:
         return normalize_hf_endpoint(value) or ""
@@ -286,13 +357,20 @@ async def get_model_requirements(
     ]
     requirements = _merge_model_requirements(requirements)
     missing = [item for item in requirements if not item["present"]]
+    checkpoint_requirements = _checkpoint_requirements(selected_asr_repo)
+    missing_checkpoints = [
+        item for item in checkpoint_requirements if not item["present"]
+    ]
     return {
         "asr_backend": backend,
         "required_models": requirements,
+        "required_checkpoints": checkpoint_requirements,
         "missing_count": len(missing),
+        "checkpoint_missing_count": len(missing_checkpoints),
         "needs_download": any(item["download_enabled"] for item in missing),
         "download_disabled": any(not item["download_enabled"] for item in missing),
         "all_present": not missing,
+        "pipeline_ready": not missing and not missing_checkpoints,
     }
 
 

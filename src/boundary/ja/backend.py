@@ -26,15 +26,15 @@ from boundary.ja.features import (
     is_low_frame_rate_ptm,
 )
 from boundary.ja.model import (
-    load_feature_frame_scorer_checkpoint,
-    score_feature_frame_boundary_probabilities,
+    load_speech_island_scorer_checkpoint,
+    score_speech_island_probabilities,
 )
 from subtitles.options import BASE_FPS
 
 
 DEFAULT_PTM = "jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame-hf"
 DEFAULT_MODEL_PATH = qwen_asr_default_model_path(DEFAULT_PTM)
-DEFAULT_OPERATING_POINT = "qwen-mamba2-frame-boundary-scorer-v7"
+DEFAULT_OPERATING_POINT = "qwen-mamba2-speech-island-scorer-v8"
 
 
 @dataclass(frozen=True)
@@ -757,7 +757,7 @@ def _resolve_micro_segments(
     ]
 
 
-def _split_segments_by_peaks(
+def _attach_split_proposals(
     segments: Iterable[SpeechSegment],
     *,
     speech_probs: np.ndarray,
@@ -773,7 +773,7 @@ def _split_segments_by_peaks(
             split_probs=split_probs,
             frame_hop_s=config.frame_hop_s,
             split_smooth_s=config.split_smooth_s,
-            split_snap_s=config.split_snap_s,
+            split_snap_s=0.0,
             min_split_segment_s=config.min_split_segment_s,
         )
         nms_frames = max(1, int(round(max(0.0, config.split_nms_s) / config.frame_hop_s)))
@@ -785,33 +785,42 @@ def _split_segments_by_peaks(
             (candidate.prominence for candidate in all_candidates),
             config.split_prominence_quantile,
         )
-        primary_pool = [
+        proposal_pool = [
             candidate
             for candidate in all_candidates
             if candidate.score >= score_floor - 1e-6
             and candidate.prominence >= prominence_floor - 1e-6
         ]
-        peaks = sorted(
+        proposals = sorted(
             _select_peak_candidates(
-                primary_pool,
+                proposal_pool,
                 nms_frames=nms_frames,
                 rank_by_prominence=True,
             ),
             key=lambda item: int(item.frame),
         )
-        weak_candidates = _weak_split_peak_candidates_for_segment(
-            all_candidates,
-            peaks,
-            nms_frames=nms_frames,
-        )
-        result.extend(
-            _split_segment_at_candidates(
-                segment,
-                peaks,
-                frame_hop_s=config.frame_hop_s,
-                min_split_segment_s=config.min_split_segment_s,
+        result.append(
+            _segment_with_split_metadata(
+                start=segment.start,
+                end=segment.end,
+                score=segment.score,
                 subtitle_min_duration_s=subtitle_min_duration_s,
-                weak_candidates=weak_candidates,
+                left=None,
+                right=None,
+                weak_cut_candidates=[
+                    {
+                        **_cut_candidate_payload(
+                            candidate,
+                            frame_hop_s=config.frame_hop_s,
+                            kind="proposal",
+                        ),
+                        "proposal_time_s": round(
+                            float(candidate.frame) * config.frame_hop_s,
+                            6,
+                        ),
+                    }
+                    for candidate in proposals
+                ],
             )
         )
     return result
@@ -893,8 +902,12 @@ def _bootstrap_frame_scores(
     if speech.size >= 3:
         smoothed = np.pad(speech, (1, 1), mode="edge")
         speech = ((smoothed[:-2] + smoothed[1:-1] + smoothed[2:]) / 3.0).astype(np.float32)
-    split = np.zeros_like(speech, dtype=np.float32)
-    return np.clip(speech, 0.0, 1.0), split
+    candidate = (
+        0.45 * (1.0 - energy)
+        + 0.25 * (1.0 - speech)
+        + 0.30 * mfcc_delta
+    ).astype(np.float32)
+    return np.clip(speech, 0.0, 1.0), np.clip(candidate, 0.0, 1.0)
 
 
 def frames_to_segments(
@@ -989,27 +1002,22 @@ def _speech_thresholds_for_config(
     return speech_on_threshold, speech_off_threshold
 
 
-def decode_frame_boundary_segments(
+def decode_speech_island_segments(
     *,
     speech_probabilities: np.ndarray,
-    split_probabilities: np.ndarray,
+    candidate_probabilities: np.ndarray,
     duration_s: float,
     config: "SpeechBoundaryJaConfig",
     threshold_override: float | None = None,
 ) -> FrameBoundaryDecodeResult:
-    """Decode scorer v7 frame heads into speech islands.
-
-    This is intentionally shared by runtime and Boundary Refiner v8 dataset
-    export so the refiner learns from exactly the same island contract it sees
-    during inference.
-    """
+    """Decode speech-only frame scores and attach non-binding cut proposals."""
 
     speech_on_threshold, speech_off_threshold = _speech_thresholds_for_config(
         config,
         threshold_override=threshold_override,
     )
     probabilities = np.asarray(speech_probabilities, dtype=np.float32).reshape(-1)
-    split_probs = np.asarray(split_probabilities, dtype=np.float32).reshape(-1)
+    candidate_probs = np.asarray(candidate_probabilities, dtype=np.float32).reshape(-1)
     raw_frames = _hysteresis_frames(
         probabilities,
         on_threshold=speech_on_threshold,
@@ -1030,14 +1038,14 @@ def decode_frame_boundary_segments(
         duration_s=duration_s,
         min_segment_s=config.min_segment_s,
     )
-    split_segments = _split_segments_by_peaks(
+    segments = _attach_split_proposals(
         coarse_segments,
         speech_probs=probabilities,
-        split_probs=split_probs,
+        split_probs=candidate_probs,
         config=config,
     )
     segments = filter_segments(
-        split_segments,
+        segments,
         duration_s=duration_s,
         min_segment_s=config.min_segment_s,
     )
@@ -1053,7 +1061,7 @@ def decode_frame_boundary_segments(
 
 @dataclass(frozen=True)
 class SpeechBoundaryJaConfig:
-    threshold: float = 0.5
+    threshold: float = 0.15
     speech_on_threshold: float | None = None
     speech_off_threshold: float | None = None
     frame_dilation_s: float = 0.2
@@ -1073,7 +1081,7 @@ class SpeechBoundaryJaConfig:
     split_score_quantile: float = 0.50
     split_prominence_quantile: float = 0.50
     export_sequence_features: bool = False
-    sequence_feature_max_ptm_dims: int = 64
+    sequence_feature_max_ptm_dims: int = 128
     no_download: bool = False
     scorer_checkpoint: str = ""
     scorer_checkpoint_repo_id: str = ""
@@ -1086,7 +1094,7 @@ class SpeechBoundaryJaConfig:
         model_path = os.getenv("SPEECH_BOUNDARY_JA_MODEL_PATH", "").strip() or qwen_asr_default_model_path(ptm)
         scorer_checkpoint = _scorer_checkpoint_from_env(ptm)
         return cls(
-            threshold=_env_float("SPEECH_BOUNDARY_JA_THRESHOLD", "0.5"),
+            threshold=_env_float("SPEECH_BOUNDARY_JA_THRESHOLD", "0.15"),
             speech_on_threshold=_env_optional_float("SPEECH_BOUNDARY_JA_SPEECH_ON_THRESHOLD"),
             speech_off_threshold=_env_optional_float("SPEECH_BOUNDARY_JA_SPEECH_OFF_THRESHOLD"),
             frame_dilation_s=_env_float("SPEECH_BOUNDARY_JA_FRAME_DILATION_S", "0.2"),
@@ -1114,7 +1122,7 @@ class SpeechBoundaryJaConfig:
             export_sequence_features=_env_bool("SPEECH_BOUNDARY_JA_EXPORT_SEQUENCE_FEATURES", "0"),
             sequence_feature_max_ptm_dims=max(
                 1,
-                int(_env_float("BOUNDARY_FRAME_SEQUENCE_MAX_PTM_DIMS", "64")),
+                int(_env_float("BOUNDARY_FRAME_SEQUENCE_MAX_PTM_DIMS", "128")),
             ),
             no_download=_env_bool("SPEECH_BOUNDARY_JA_NO_DOWNLOAD", "0"),
             scorer_checkpoint=scorer_checkpoint,
@@ -1124,7 +1132,7 @@ class SpeechBoundaryJaConfig:
 
 
 class SpeechBoundaryJaBackend:
-    name = "speech_boundary_ja_mamba2_frame_boundary_scorer_v7"
+    name = "speech_boundary_ja_mamba2_speech_island_scorer_v8"
 
     def __init__(self, config: SpeechBoundaryJaConfig | None = None) -> None:
         self.config = config or SpeechBoundaryJaConfig.from_env()
@@ -1142,7 +1150,7 @@ class SpeechBoundaryJaBackend:
         speech_on_threshold, speech_off_threshold = self._speech_thresholds(cfg)
         signature = {
             "backend": self.name,
-            "schema": "speech_boundary_ja_mamba2_frame_boundary_scorer_v7",
+            "schema": "speech_boundary_ja_mamba2_speech_island_scorer_v8",
             "threshold": float(cfg.threshold),
             "speech_threshold_mode": "hysteresis",
             "speech_on_threshold": float(speech_on_threshold),
@@ -1157,14 +1165,14 @@ class SpeechBoundaryJaBackend:
             "window_s": float(cfg.window_s),
             "overlap_s": float(cfg.overlap_s),
             "min_segment_s": float(cfg.min_segment_s),
-            "split_strategy": "adaptive_topographic_time_valley_peak",
+            "split_strategy": "candidate_proposal_only",
             "split_smooth_s": float(cfg.split_smooth_s),
             "split_nms_s": float(cfg.split_nms_s),
             "split_snap_s": float(cfg.split_snap_s),
             "min_split_segment_s": float(cfg.min_split_segment_s),
             "split_score_quantile": float(cfg.split_score_quantile),
             "split_prominence_quantile": float(cfg.split_prominence_quantile),
-            "micro_chunk_resolver": "subtitle_min_duration_split_evidence_v1",
+            "split_decision": "external_semantic_split_model_v1",
             "base_fps": float(BASE_FPS),
             "micro_chunk_min_duration_s": float(_subtitle_min_duration_s_for_config(cfg)),
             "export_sequence_features": bool(cfg.export_sequence_features),
@@ -1202,7 +1210,7 @@ class SpeechBoundaryJaBackend:
         device = _model_device(cfg.device)
         scorer_device = _model_device(cfg.scorer_device)
         scorer = (
-            load_feature_frame_scorer_checkpoint(cfg.scorer_checkpoint, device=scorer_device)
+            load_speech_island_scorer_checkpoint(cfg.scorer_checkpoint, device=scorer_device)
             if cfg.scorer_checkpoint.strip()
             else None
         )
@@ -1236,7 +1244,7 @@ class SpeechBoundaryJaBackend:
             "ptm_param_device": ptm_param_device,
             "ptm_param_dtype": ptm_param_dtype,
             "score_model": (
-                "mamba2_frame_boundary_scorer_v7" if scorer is not None else "bootstrap_energy_ptm_mfcc"
+                "mamba2_speech_island_scorer_v8" if scorer is not None else "bootstrap_energy_ptm_mfcc"
             ),
             "scorer_device": str(scorer_device) if scorer is not None else "",
         }
@@ -1278,7 +1286,7 @@ class SpeechBoundaryJaBackend:
                     resize_ptm=is_low_frame_rate_ptm(cfg.ptm),
                 )
                 if scorer is None:
-                    probs, split_probs = _bootstrap_frame_scores(
+                    probs, candidate_probs = _bootstrap_frame_scores(
                         audio=chunk,
                         sample_rate=sample_rate,
                         ptm=ptm,
@@ -1286,10 +1294,17 @@ class SpeechBoundaryJaBackend:
                         config=feature_config,
                     )
                 else:
-                    probs, split_probs = score_feature_frame_boundary_probabilities(
+                    probs = score_speech_island_probabilities(
                         scorer,
                         ptm=ptm,
                         mfcc=mfcc,
+                    )
+                    _, candidate_probs = _bootstrap_frame_scores(
+                        audio=chunk,
+                        sample_rate=sample_rate,
+                        ptm=ptm,
+                        mfcc=mfcc,
+                        config=feature_config,
                     )
                 window_start_s = start_sample / sample_rate
                 global_start = max(0, int(round(window_start_s / cfg.frame_hop_s)))
@@ -1299,7 +1314,7 @@ class SpeechBoundaryJaBackend:
                     continue
                 probability_sum[global_start:global_end] += probs[:local_end]
                 probability_count[global_start:global_end] += 1.0
-                split_probability_sum[global_start:global_end] += split_probs[:local_end]
+                split_probability_sum[global_start:global_end] += candidate_probs[:local_end]
                 split_probability_count[global_start:global_end] += 1.0
                 if cfg.export_sequence_features:
                     ptm_dim = min(int(ptm.shape[1]), int(cfg.sequence_feature_max_ptm_dims))
@@ -1324,15 +1339,15 @@ class SpeechBoundaryJaBackend:
                 out=np.zeros_like(probability_sum, dtype=np.float64),
                 where=probability_count > 0,
             ).astype(np.float32)
-            split_probabilities = np.divide(
+            candidate_probabilities = np.divide(
                 split_probability_sum,
                 np.maximum(split_probability_count, 1.0),
                 out=np.zeros_like(split_probability_sum, dtype=np.float64),
                 where=split_probability_count > 0,
             ).astype(np.float32)
-            decode = decode_frame_boundary_segments(
+            decode = decode_speech_island_segments(
                 speech_probabilities=probabilities,
-                split_probabilities=split_probabilities,
+                candidate_probabilities=candidate_probabilities,
                 duration_s=duration_s,
                 config=cfg,
                 threshold_override=threshold_override,
@@ -1354,16 +1369,16 @@ class SpeechBoundaryJaBackend:
                         "speech_off_threshold": float(speech_off_threshold),
                         "probability_mean": float(probabilities.mean()) if probabilities.size else 0.0,
                         "probability_max": float(probabilities.max()) if probabilities.size else 0.0,
-                        "split_boundary_probability_mean": (
-                            float(split_probabilities.mean()) if split_probabilities.size else 0.0
+                        "candidate_probability_mean": (
+                            float(candidate_probabilities.mean()) if candidate_probabilities.size else 0.0
                         ),
-                        "split_boundary_probability_max": (
-                            float(split_probabilities.max()) if split_probabilities.size else 0.0
+                        "candidate_probability_max": (
+                            float(candidate_probabilities.max()) if candidate_probabilities.size else 0.0
                         ),
                         "raw_speech_ratio": float(raw_frames.mean()) if raw_frames.size else 0.0,
                         "dilated_speech_ratio": float(dilated.mean()) if dilated.size else 0.0,
                         "coarse_segment_count": len(coarse_segments),
-                        "split_segment_count": len(segments),
+                        "speech_island_count": len(segments),
                         "uncovered_frame_ratio": float((probability_count <= 0).mean())
                         if probability_count.size
                         else 0.0,
@@ -1392,7 +1407,7 @@ class SpeechBoundaryJaBackend:
                 }
             if _env_bool("SPEECH_BOUNDARY_JA_EXPORT_FRAME_SCORES", "0") or cfg.export_sequence_features:
                 params["frame_scores"] = [float(value) for value in probabilities]
-                params["split_boundary_frame_scores"] = [float(value) for value in split_probabilities]
+                params["candidate_frame_scores"] = [float(value) for value in candidate_probabilities]
             return SegmentationResult(
                 segments=segments,
                 groups=groups,

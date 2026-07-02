@@ -322,6 +322,70 @@ class DualBranchDiffBoundarySequenceClassifier(nn.Module):
         return logits
 
 
+class SpeechIslandSequenceClassifier(nn.Module):
+    """Speech-only frame classifier used by SpeechIslandScorer v8."""
+
+    def __init__(
+        self,
+        *,
+        input_dim: int,
+        backbone: str = TRANSFORMERS_MAMBA2_BACKBONE,
+        hidden_size: int = 128,
+        num_layers: int = 2,
+        output_dim: int = 1,
+        **backbone_kwargs,
+    ) -> None:
+        super().__init__()
+        if input_dim <= 0:
+            raise ValueError("input_dim must be positive")
+        if output_dim != 1:
+            raise ValueError("speech island scorer requires output_dim=1")
+        self.backbone_name = normalize_boundary_backbone(backbone)
+        if "num_heads" not in backbone_kwargs:
+            backbone_kwargs["num_heads"] = 4
+        if "head_dim" not in backbone_kwargs:
+            num_heads = int(backbone_kwargs["num_heads"])
+            if (hidden_size * 2) % num_heads != 0:
+                raise ValueError("hidden_size * expand must be divisible by num_heads")
+            backbone_kwargs["head_dim"] = (hidden_size * 2) // num_heads
+        backbone_kwargs.setdefault("state_size", 32)
+        backbone_kwargs.setdefault("n_groups", 2)
+        backbone_kwargs.setdefault("chunk_size", 8)
+        backbone_kwargs.setdefault("conv_kernel", 4)
+        backbone_kwargs.setdefault("bidirectional", True)
+        self.model_config = {
+            "input_dim": input_dim,
+            "backbone": self.backbone_name,
+            "hidden_size": hidden_size,
+            "num_layers": num_layers,
+            "output_dim": output_dim,
+            **backbone_kwargs,
+        }
+        self.proj = nn.Linear(input_dim, hidden_size)
+        self.backbone = Mamba2TemporalEncoder(
+            hidden_size=hidden_size,
+            num_layers=num_layers,
+            **backbone_kwargs,
+        )
+        self.norm = nn.LayerNorm(self.backbone.output_dim)
+        self.head = nn.Linear(self.backbone.output_dim, 1)
+
+    def forward(
+        self,
+        features: torch.Tensor,
+        *,
+        attention_mask: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        hidden = self.backbone(
+            self.proj(features),
+            attention_mask=attention_mask,
+        )
+        logits = self.head(self.norm(hidden))
+        if attention_mask is not None:
+            logits = logits * attention_mask.unsqueeze(-1).to(logits.dtype)
+        return logits
+
+
 class BoundarySequenceClassifier(nn.Module):
     """Mamba2 frame/gap sequence classifier shared by training and runtime loading."""
 
