@@ -20,26 +20,27 @@ if str(SRC_ROOT) not in sys.path:
 
 from asr.backends.qwen import qwen_asr_repo_id, qwen_asr_repo_tag  # noqa: E402
 from asr.pre_asr_cueqc import (  # noqa: E402
+    PRE_ASR_CUEQC_ARTIFACT,
     PRE_ASR_CUEQC_DEFAULT_DROP_THRESHOLD,
     PRE_ASR_CUEQC_FEATURE_SCHEMA,
     PRE_ASR_CUEQC_IGNORE_LABEL,
+    PRE_ASR_CUEQC_MODEL_PTM_TOKENS,
     PRE_ASR_CUEQC_MODEL_ARCH,
-    PRE_ASR_CUEQC_PTM_BINS,
     PRE_ASR_CUEQC_PTM_DIM,
     PRE_ASR_CUEQC_RUNTIME_ADAPTER,
     PRE_ASR_CUEQC_SCALAR_FEATURE_NAMES,
     PRE_ASR_CUEQC_SCHEMA,
-    PreAsrCueQCMambaV10,
+    PreAsrCueQCNetwork,
     make_model_config,
 )
-from tools.asr.cueqc.compile_pre_asr_v10_features import (  # noqa: E402
+from tools.asr.cueqc.compile_pre_asr_v11_features import (  # noqa: E402
     FEATURE_BUNDLE_SCHEMA,
     project_path,
     repo_display_path,
 )
 
 
-METRICS_SCHEMA = "cueqc_pre_asr_mamba_v10_train_metrics"
+METRICS_SCHEMA = "cueqc_pre_asr_semantic_chunk_v11_train_metrics"
 DEFAULT_SWEEP_THRESHOLDS = (
     0.50,
     0.60,
@@ -57,7 +58,7 @@ DEFAULT_SWEEP_THRESHOLDS = (
 
 
 def default_checkpoint_name(asr_repo_id: str) -> str:
-    return f"cueqc_pre_asr_mamba_v10_binary.{qwen_asr_repo_tag(asr_repo_id)}.pt"
+    return f"pre_asr_cueqc_v11.{qwen_asr_repo_tag(asr_repo_id)}.pt"
 
 
 def file_sha256(path: Path) -> str:
@@ -77,7 +78,7 @@ def load_feature_bundle(path: Path) -> dict[str, Any]:
     if payload.get("schema") != FEATURE_BUNDLE_SCHEMA:
         raise ValueError(f"unsupported feature bundle schema: {payload.get('schema')!r}")
     if tuple(payload.get("feature_names") or ()) != PRE_ASR_CUEQC_SCALAR_FEATURE_NAMES:
-        raise ValueError("feature bundle feature_names do not match Pre-ASR CueQC v10 runtime")
+        raise ValueError("feature bundle feature_names do not match Pre-ASR CueQC v11 runtime")
     if payload.get("feature_schema") != PRE_ASR_CUEQC_FEATURE_SCHEMA:
         raise ValueError("feature bundle feature_schema mismatch")
     if payload.get("runtime_adapter") != PRE_ASR_CUEQC_RUNTIME_ADAPTER:
@@ -86,7 +87,7 @@ def load_feature_bundle(path: Path) -> dict[str, Any]:
     ptm_bin_count = payload.get("ptm_bin_count")
     if ptm_bin_count is None and hasattr(ptm_tensor, "shape") and len(ptm_tensor.shape) >= 3:
         ptm_bin_count = int(ptm_tensor.shape[2])
-    if int(ptm_bin_count or 0) != PRE_ASR_CUEQC_PTM_BINS:
+    if int(ptm_bin_count or 0) != PRE_ASR_CUEQC_MODEL_PTM_TOKENS:
         raise ValueError("feature bundle ptm_bins mismatch")
     ptm_dim = payload.get("ptm_dim")
     if ptm_dim is None and hasattr(ptm_tensor, "shape") and len(ptm_tensor.shape) >= 4:
@@ -229,7 +230,15 @@ def _split_label_masks(
     valid = (chunk_mask > 0) & ((y == 0) | (y == 1))
     train = np.zeros_like(valid, dtype=bool)
     val = np.zeros_like(valid, dtype=bool)
-    if split_mode == "group":
+    if split_mode == "role_holdout":
+        for group_index, group in enumerate(group_rows):
+            target = (
+                val
+                if str(group.get("dataset_role") or "") == "semantic"
+                else train
+            )
+            target[group_index] = valid[group_index]
+    elif split_mode == "group":
         group_count = int(y.shape[0])
         order = rng.permutation(group_count)
         val_count = max(1, int(round(group_count * val_ratio))) if group_count >= 2 else 0
@@ -375,12 +384,22 @@ def _window_batch_from_anchors(
 ) -> tuple[Any, Any, Any, Any, Any]:
     if sequence_window_size <= 0 or int(ptm_bins.shape[1]) <= sequence_window_size:
         group_ids = anchor_positions[:, 0]
+        target_rows = torch.full_like(
+            y[group_ids],
+            PRE_ASR_CUEQC_IGNORE_LABEL,
+        )
+        for row_index, (_group_id, chunk_index) in enumerate(
+            anchor_positions.detach().cpu().tolist()
+        ):
+            target_rows[row_index, int(chunk_index)] = y[
+                int(_group_id), int(chunk_index)
+            ]
         return (
             ptm_bins[group_ids],
             scalar[group_ids],
             chunk_mask[group_ids],
             bin_mask[group_ids],
-            y[group_ids],
+            target_rows,
         )
     import torch
 
@@ -408,7 +427,12 @@ def _window_batch_from_anchors(
         scalar_rows.append(scalar[group_id, start:end])
         chunk_mask_rows.append(chunk_mask[group_id, start:end])
         bin_mask_rows.append(bin_mask[group_id, start:end])
-        y_rows.append(y[group_id, start:end])
+        target = torch.full_like(
+            y[group_id, start:end],
+            PRE_ASR_CUEQC_IGNORE_LABEL,
+        )
+        target[chunk_index - start] = y[group_id, chunk_index]
+        y_rows.append(target)
     return (
         torch.stack(ptm_rows, dim=0),
         torch.stack(scalar_rows, dim=0),
@@ -470,6 +494,7 @@ def train(
     sequence_window_size: int,
     split_mode: str,
     val_ratio: float,
+    focal_gamma: float,
 ) -> dict[str, Any]:
     import torch
     import torch.nn.functional as F
@@ -482,7 +507,10 @@ def train(
     y = bundle["labels"].long()
     if scalar.ndim != 3 or scalar.shape[2] != len(PRE_ASR_CUEQC_SCALAR_FEATURE_NAMES):
         raise ValueError("scalar feature tensor shape mismatch")
-    if ptm_bins.ndim != 4 or ptm_bins.shape[2:] != (PRE_ASR_CUEQC_PTM_BINS, PRE_ASR_CUEQC_PTM_DIM):
+    if ptm_bins.ndim != 4 or ptm_bins.shape[2:] != (
+        PRE_ASR_CUEQC_MODEL_PTM_TOKENS,
+        PRE_ASR_CUEQC_PTM_DIM,
+    ):
         raise ValueError("ptm bin tensor shape mismatch")
     if y.shape != chunk_mask.shape or y.shape != scalar.shape[:2]:
         raise ValueError("label tensor shape mismatch")
@@ -524,7 +552,7 @@ def train(
             "hidden_size": hidden_size,
         }
     )
-    model = PreAsrCueQCMambaV10(**model_config).to(dev)
+    model = PreAsrCueQCNetwork(**model_config).to(dev)
     opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
     class_weights = torch.tensor(
         [float(drop_class_weight), float(keep_class_weight)],
@@ -561,12 +589,21 @@ def train(
             chunk_mask=batch_chunk_mask,
             bin_mask=batch_bin_mask,
         )
-        loss = F.cross_entropy(
-            logits.reshape(-1, 2),
-            batch_y.reshape(-1),
+        flat_logits = logits.reshape(-1, 2)
+        flat_targets = batch_y.reshape(-1)
+        active = flat_targets != PRE_ASR_CUEQC_IGNORE_LABEL
+        active_logits = flat_logits[active]
+        active_targets = flat_targets[active]
+        raw_loss = F.cross_entropy(
+            active_logits,
+            active_targets,
             weight=class_weights,
-            ignore_index=PRE_ASR_CUEQC_IGNORE_LABEL,
+            reduction="none",
         )
+        pt = torch.softmax(active_logits, dim=-1).gather(
+            1, active_targets.unsqueeze(1)
+        ).squeeze(1)
+        loss = (raw_loss * torch.pow(1.0 - pt, focal_gamma)).mean()
         opt.zero_grad(set_to_none=True)
         loss.backward()
         opt.step()
@@ -612,6 +649,7 @@ def train(
             "drop": float(drop_class_weight),
             "keep": float(keep_class_weight),
         },
+        "focal_gamma": float(focal_gamma),
         "sequence_window_size": int(sequence_window_size),
         "model_config": model_config,
         "drop_threshold": float(drop_threshold),
@@ -652,6 +690,7 @@ def train(
             "inference_window_size": int(sequence_window_size),
         },
         "metadata": {
+            "artifact": dict(PRE_ASR_CUEQC_ARTIFACT),
             "asr_repo_id": selected_repo,
             "feature_schema": PRE_ASR_CUEQC_FEATURE_SCHEMA,
             "runtime_adapter": PRE_ASR_CUEQC_RUNTIME_ADAPTER,
@@ -675,7 +714,7 @@ def train(
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Train Pre-ASR CueQC v10 hierarchical Mamba2 binary checkpoint.")
+    parser = argparse.ArgumentParser(description="Train Pre-ASR CueQC v11 hierarchical Mamba2 binary checkpoint.")
     parser.add_argument("--features", required=True)
     parser.add_argument("--output-dir", required=True)
     parser.add_argument("--asr-repo-id", required=True)
@@ -689,9 +728,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--drop-threshold", type=float, default=PRE_ASR_CUEQC_DEFAULT_DROP_THRESHOLD)
     parser.add_argument("--drop-class-weight", type=float, default=1.0)
     parser.add_argument("--keep-class-weight", type=float, default=2.0)
+    parser.add_argument("--focal-gamma", type=float, default=2.0)
     parser.add_argument(
         "--split-mode",
-        choices=("chunk_stratified", "group"),
+        choices=("chunk_stratified", "group", "role_holdout"),
         default="chunk_stratified",
         help="chunk_stratified samples train/test chunks within every group and label class; group keeps the old group-level split.",
     )
@@ -713,6 +753,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         parser.error("--drop-threshold must be between 0 and 1")
     if args.drop_class_weight <= 0.0 or args.keep_class_weight <= 0.0:
         parser.error("class weights must be positive")
+    if args.focal_gamma < 0.0:
+        parser.error("--focal-gamma must be non-negative")
     if not 0.0 < args.val_ratio < 1.0:
         parser.error("--val-ratio must be in (0, 1)")
     if args.sequence_window_size < 0:
@@ -739,6 +781,7 @@ def main(argv: list[str] | None = None) -> int:
         sequence_window_size=int(args.sequence_window_size),
         split_mode=str(args.split_mode),
         val_ratio=float(args.val_ratio),
+        focal_gamma=float(args.focal_gamma),
     )
     print(
         "checkpoint={checkpoint} val_drop_f1={f1:.4f} val_keep_recall={keep:.4f}".format(

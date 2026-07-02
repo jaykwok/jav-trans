@@ -115,12 +115,14 @@ def test_default_model_download_root_is_project_models():
     assert "BOUNDARY_REFINER_MODEL_PATH_BY_REPO" not in config.DEFAULT_SETTINGS
     assert "CUEQC_MODEL_PATH_BY_REPO" not in config.DEFAULT_SETTINGS
     assert "SPEECH_BOUNDARY_JA_SCORER_CHECKPOINT_BY_REPO" in config.DEFAULT_SETTINGS
-    assert qwen.QWEN_ASR_17B_REPO_ID in qwen.DEFAULT_BOUNDARY_REFINER_CHECKPOINT_BY_REPO
-    assert qwen.QWEN_ASR_06B_REPO_ID in qwen.DEFAULT_BOUNDARY_REFINER_CHECKPOINT_BY_REPO
+    assert qwen.QWEN_ASR_17B_REPO_ID in qwen.DEFAULT_OUTER_EDGE_REFINER_CHECKPOINT_BY_REPO
+    assert qwen.QWEN_ASR_06B_REPO_ID not in qwen.DEFAULT_OUTER_EDGE_REFINER_CHECKPOINT_BY_REPO
     assert qwen.QWEN_ASR_17B_REPO_ID in qwen.DEFAULT_CUEQC_CHECKPOINT_BY_REPO
     assert qwen.QWEN_ASR_06B_REPO_ID in qwen.DEFAULT_CUEQC_CHECKPOINT_BY_REPO
     assert qwen.QWEN_ASR_17B_REPO_ID in qwen.DEFAULT_SPEECH_BOUNDARY_SCORER_CHECKPOINT_BY_REPO
-    assert qwen.QWEN_ASR_06B_REPO_ID in qwen.DEFAULT_SPEECH_BOUNDARY_SCORER_CHECKPOINT_BY_REPO
+    assert qwen.QWEN_ASR_06B_REPO_ID not in qwen.DEFAULT_SPEECH_BOUNDARY_SCORER_CHECKPOINT_BY_REPO
+    assert qwen.QWEN_ASR_17B_REPO_ID in qwen.DEFAULT_PRE_ASR_CUEQC_CHECKPOINT_BY_REPO
+    assert qwen.QWEN_ASR_06B_REPO_ID not in qwen.DEFAULT_PRE_ASR_CUEQC_CHECKPOINT_BY_REPO
     assert "SPEECH_BOUNDARY_JA_SCORER_CHECKPOINT" not in config.DEFAULT_SETTINGS
     assert not any(key.startswith("ALIGN") for key in config.DEFAULT_SETTINGS)
     assert "BOUNDARY_REFINER_ENABLED" not in config.DEFAULT_SETTINGS
@@ -211,8 +213,8 @@ def test_pre_asr_cueqc_old_versions_removed_from_active_runtime_surface():
         ".env.example",
         "README.md",
         "tools/workflows/run_full_workflow.py",
-        "tools/asr/cueqc/compile_pre_asr_v10_features.py",
-        "tools/asr/cueqc/train_pre_asr_v10_binary.py",
+        "tools/asr/cueqc/compile_pre_asr_v11_features.py",
+        "tools/asr/cueqc/train_pre_asr_v11_binary.py",
         "tools/asr/cueqc/export_pre_asr_v10_audit_candidates.py",
     )
     retired_tokens = (
@@ -239,7 +241,7 @@ def test_pre_asr_cueqc_old_versions_removed_from_active_runtime_surface():
         text = (ROOT / relative_path).read_text(encoding="utf-8")
         for token in retired_tokens:
             assert token not in text
-    assert qwen.DEFAULT_PRE_ASR_CUEQC_CHECKPOINT_BY_REPO == {}
+    assert qwen.QWEN_ASR_17B_REPO_ID in qwen.DEFAULT_PRE_ASR_CUEQC_CHECKPOINT_BY_REPO
 
 
 def test_asr_after_cueqc_removed_from_active_runtime_surface():

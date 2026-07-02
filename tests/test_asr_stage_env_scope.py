@@ -118,7 +118,7 @@ def test_asr_stage_env_scope_passes_boundary_refiner_flags(monkeypatch, tmp_path
         skip_translation=True,
         keep_temp_files=True,
         advanced={
-            "BOUNDARY_REFINER_DEVICE": "cpu",
+            "OUTER_EDGE_REFINER_DEVICE": "cpu",
             "PRE_ASR_CUEQC_ENABLED": "0",
         },
     )
@@ -134,7 +134,7 @@ def test_asr_stage_env_scope_passes_boundary_refiner_flags(monkeypatch, tmp_path
         Path(out_path).write_bytes(b"wav")
 
     def fake_transcribe_and_align(_audio_path, _device, on_stage=None, include_details=False):
-        seen["device"] = main.os.environ.get("BOUNDARY_REFINER_DEVICE")
+        seen["device"] = main.os.environ.get("OUTER_EDGE_REFINER_DEVICE")
         seen["pre_asr_cueqc"] = main.os.environ.get("PRE_ASR_CUEQC_ENABLED")
         return (
             [{"start": 0.0, "end": 1.0, "text": "こんにちは"}],

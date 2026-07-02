@@ -23,6 +23,7 @@ from asr.pre_asr_cueqc import (  # noqa: E402
     PRE_ASR_CUEQC_FEATURE_NAMES,
     PRE_ASR_CUEQC_FEATURE_SCHEMA,
     PRE_ASR_CUEQC_IGNORE_LABEL,
+    PRE_ASR_CUEQC_MODEL_PTM_TOKENS,
     PRE_ASR_CUEQC_POOLED_PTM_FEATURE_NAMES,
     PRE_ASR_CUEQC_PTM_BINS,
     PRE_ASR_CUEQC_PTM_DIM,
@@ -34,7 +35,7 @@ from asr.pre_asr_cueqc import (  # noqa: E402
 )
 
 
-FEATURE_BUNDLE_SCHEMA = "cueqc_pre_asr_mamba_v10_features"
+FEATURE_BUNDLE_SCHEMA = "cueqc_pre_asr_semantic_chunk_v11_features"
 
 
 def project_path(value: str | Path) -> Path:
@@ -258,7 +259,7 @@ def candidate_for_chunk(chunks: list[dict[str, Any]], index: int) -> dict[str, A
         candidate = candidate_from_span(chunks, index, require_ptm_pooling=True)
     if not _has_required_ptm_pooling(candidate):
         raise ValueError(
-            "Pre-ASR CueQC v10 feature compilation requires chunk-level pooled PTM features"
+            "Pre-ASR CueQC v11 feature compilation requires chunk-level pooled PTM features"
         )
     return candidate
 
@@ -281,10 +282,10 @@ def _make_tensor_bundle(rows: list[dict[str, Any]], groups: list[list[int]]) -> 
         dtype=np.float32,
     )
     ptm_bins = np.zeros(
-        (group_count, max_chunks, PRE_ASR_CUEQC_PTM_BINS, PRE_ASR_CUEQC_PTM_DIM),
+        (group_count, max_chunks, PRE_ASR_CUEQC_MODEL_PTM_TOKENS, PRE_ASR_CUEQC_PTM_DIM),
         dtype=np.float32,
     )
-    bin_mask = np.zeros((group_count, max_chunks, PRE_ASR_CUEQC_PTM_BINS), dtype=np.float32)
+    bin_mask = np.zeros((group_count, max_chunks, PRE_ASR_CUEQC_MODEL_PTM_TOKENS), dtype=np.float32)
     chunk_mask = np.zeros((group_count, max_chunks), dtype=np.float32)
     labels = np.full((group_count, max_chunks), PRE_ASR_CUEQC_IGNORE_LABEL, dtype=np.int64)
     for group_index, row_indexes in enumerate(groups):
@@ -388,7 +389,7 @@ def compile_features(
         "runtime_adapter": PRE_ASR_CUEQC_RUNTIME_ADAPTER,
         "feature_names": list(PRE_ASR_CUEQC_SCALAR_FEATURE_NAMES),
         "all_feature_names": list(PRE_ASR_CUEQC_FEATURE_NAMES),
-        "ptm_bin_count": PRE_ASR_CUEQC_PTM_BINS,
+        "ptm_bin_count": PRE_ASR_CUEQC_MODEL_PTM_TOKENS,
         "ptm_dim": PRE_ASR_CUEQC_PTM_DIM,
         "asr_repo_id": qwen_asr_repo_id(asr_repo_id),
         "created_at": datetime.now().isoformat(timespec="seconds"),
@@ -401,7 +402,7 @@ def compile_features(
     output.parent.mkdir(parents=True, exist_ok=True)
     torch.save(bundle, output)
     summary = {
-        "schema": "cueqc_pre_asr_mamba_v10_feature_summary",
+        "schema": "cueqc_pre_asr_semantic_chunk_v11_feature_summary",
         "feature_bundle": repo_display_path(output),
         "feature_schema": PRE_ASR_CUEQC_FEATURE_SCHEMA,
         "runtime_adapter": PRE_ASR_CUEQC_RUNTIME_ADAPTER,
@@ -421,7 +422,7 @@ def compile_features(
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Compile Pre-ASR CueQC v10 planned-island features.")
+    parser = argparse.ArgumentParser(description="Compile Pre-ASR CueQC v11 semantic-chunk features.")
     parser.add_argument("--chunks", action="append", required=True, help="Workflow details/chunk JSON or JSONL.")
     parser.add_argument("--labels", action="append", required=True, help="JSON/JSONL labels with keep/drop/ignore.")
     parser.add_argument("--output", required=True)

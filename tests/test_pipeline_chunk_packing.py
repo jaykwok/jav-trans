@@ -8,7 +8,6 @@ from pathlib import Path
 
 from audio.chunk_packer import PackedChunk
 from boundary.base import SegmentationResult, SpeechSegment
-from boundary.refiner import BoundaryDecision
 from boundary.sequence_features import DEFAULT_CHUNK_POOLED_PTM_BINS, chunk_pooled_ptm_feature_names
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -50,7 +49,13 @@ class _StubSpeechBoundaryBackend:
             groups=[[segment] for segment in segments],
             method=self.name,
             audio_duration_sec=10.0,
-            parameters={"backend": self.name},
+            parameters={
+                "backend": self.name,
+                "frame_scores": [0.9] * 500,
+                "candidate_frame_scores": [0.1] * 500,
+                "frame_hop_s": 0.02,
+                "sequence_feature_frames": {"schema": "test"},
+            },
             processing_time_sec=0.0,
         )
 
@@ -188,22 +193,12 @@ class _LowLogprobBackend(_RecordingBackend):
         ]
 
 
-class _FakeSequenceRefiner:
-    feature_names = ("gap_s",)
-    feature_schema_hash = "test-feature-schema"
-
-    def decide_sequence(self, features: list[list[float]]) -> list[BoundaryDecision]:
-        return [
-            BoundaryDecision(
-                source="edge_sequence_refiner_v8",
-                start_refine_delta_s=0.0,
-                end_refine_delta_s=0.0,
-            )
-            for _ in features
-        ]
+class _FakeBoundaryModel:
+    def __init__(self, schema: str) -> None:
+        self.schema = schema
 
     def signature(self) -> dict:
-        return {"schema": "boundary_edge_refiner_v8_safe_tight", "type": "fake_sequence_refiner"}
+        return {"schema": self.schema, "type": "fake"}
 
 
 class _FakeSequenceFeatureProvider:
@@ -243,13 +238,24 @@ class _FakeSequenceFeatureProvider:
 
 
 def _reload_pipeline(monkeypatch, tmp_path: Path, *, enable_cueqc: bool = False):
-    asr_backend = "jaykwok/Qwen3-ASR-0.6B-JA-Anime-Galgame-hf"
-    boundary_checkpoint = tmp_path / "boundary_edge_refiner_v8_safe_tight.jaykwok-Qwen3-ASR-0.6B-JA-Anime-Galgame-hf.pt"
-    boundary_checkpoint.write_bytes(b"v8")
+    asr_backend = "jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame-hf"
+    outer_checkpoint = tmp_path / "outer.pt"
+    split_checkpoint = tmp_path / "split.pt"
+    cut_checkpoint = tmp_path / "cut.pt"
+    for path in (outer_checkpoint, split_checkpoint, cut_checkpoint):
+        path.write_bytes(b"checkpoint")
     monkeypatch.setenv("ASR_BACKEND", asr_backend)
     monkeypatch.setenv(
-        "BOUNDARY_REFINER_MODEL_PATH_BY_REPO",
-        f"{asr_backend}={boundary_checkpoint}",
+        "OUTER_EDGE_REFINER_MODEL_PATH_BY_REPO",
+        f"{asr_backend}={outer_checkpoint}",
+    )
+    monkeypatch.setenv(
+        "SEMANTIC_SPLIT_MODEL_PATH_BY_REPO",
+        f"{asr_backend}={split_checkpoint}",
+    )
+    monkeypatch.setenv(
+        "CUT_EDGE_REFINER_MODEL_PATH_BY_REPO",
+        f"{asr_backend}={cut_checkpoint}",
     )
     monkeypatch.setenv("BOUNDARY_FEATURE_FRAME_HOP_S", "0.02")
     monkeypatch.setenv("ASR_CHUNK_ROOT", str(tmp_path / "chunks"))
@@ -263,20 +269,30 @@ def _reload_pipeline(monkeypatch, tmp_path: Path, *, enable_cueqc: bool = False)
     from asr import pipeline as asr
 
     asr = importlib.reload(asr)
-    monkeypatch.setattr(
-        asr,
-        "_boundary_refiner_runtime_adapter",
-        lambda _path: "edge_sequence_v2",
-    )
-    monkeypatch.setattr(
-        asr,
-        "load_edge_sequence_refiner_v8_checkpoint",
-        lambda *_args, **_kwargs: _FakeSequenceRefiner(),
-    )
+    monkeypatch.setattr(asr, "load_outer_edge_refiner", lambda *_args, **_kwargs: _FakeBoundaryModel("outer_edge_refiner_v1"))
+    monkeypatch.setattr(asr, "load_semantic_split_verifier", lambda *_args, **_kwargs: _FakeBoundaryModel("semantic_split_verifier_v1"))
+    monkeypatch.setattr(asr, "load_cut_edge_refiner", lambda *_args, **_kwargs: _FakeBoundaryModel("cut_edge_refiner_v1"))
     monkeypatch.setattr(
         asr,
         "_required_sequence_feature_provider_from_result",
         lambda *_args, **_kwargs: _FakeSequenceFeatureProvider(),
+    )
+    monkeypatch.setattr(
+        asr,
+        "build_semantic_boundary_chunks",
+        lambda segments, **_kwargs: [
+            PackedChunk(
+                start=segment.start,
+                end=segment.end,
+                source_abs_start=segment.start,
+                source_abs_end=segment.end,
+                speech_segments=[segment],
+                duration=segment.end - segment.start,
+                split_reason="semantic_boundary",
+                boundary_source="speech_island",
+            )
+            for segment in segments
+        ],
     )
     return asr
 
@@ -321,7 +337,7 @@ def test_boundary_planner_emits_one_asr_chunk_per_speech_island(monkeypatch, tmp
     assert len(backend.audio_paths) == 10
     assert details["chunk_count"] == len(backend.audio_paths)
     assert details["boundary_signature"]["backend"] == "stub"
-    assert details["boundary_signature"]["boundary_pipeline"]["version"] == 8
+    assert details["boundary_signature"]["boundary_pipeline"]["version"] == 9
     assert all(
         "source_boundary.wav" not in str(Path(path).name) for path in backend.audio_paths
     )

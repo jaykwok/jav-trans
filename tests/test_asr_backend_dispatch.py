@@ -111,7 +111,7 @@ def test_qwen_checkpoint_path_mapping_uses_repo_id_keys(monkeypatch, tmp_path):
     checkpoint_17b.write_bytes(b"17b")
     monkeypatch.setenv("ASR_BACKEND", ASR_17B_BACKEND)
     monkeypatch.setenv(
-        "BOUNDARY_REFINER_MODEL_PATH_BY_REPO",
+        "OUTER_EDGE_REFINER_MODEL_PATH_BY_REPO",
         f"{ASR_06B_BACKEND}={checkpoint_06b},{ASR_17B_BACKEND}={checkpoint_17b}",
     )
 
@@ -119,7 +119,7 @@ def test_qwen_checkpoint_path_mapping_uses_repo_id_keys(monkeypatch, tmp_path):
     assert (
         qwen.checkpoint_path_for_repo_env(
             repo_id=ASR_17B_BACKEND,
-            mapping_env="BOUNDARY_REFINER_MODEL_PATH_BY_REPO",
+            mapping_env="OUTER_EDGE_REFINER_MODEL_PATH_BY_REPO",
         )
         == str(checkpoint_17b.resolve())
     )
@@ -128,26 +128,26 @@ def test_qwen_checkpoint_path_mapping_uses_repo_id_keys(monkeypatch, tmp_path):
 def test_qwen_checkpoint_path_defaults_to_registry_when_env_is_absent(monkeypatch, tmp_path):
     from asr.backends import qwen
 
-    checkpoint = tmp_path / "boundary_edge_refiner_v8_safe_tight.jaykwok-Qwen3-ASR-1.7B-JA-Anime-Galgame-hf.pt"
-    checkpoint.write_bytes(b"v8")
-    monkeypatch.delenv("BOUNDARY_REFINER_MODEL_PATH_BY_REPO", raising=False)
+    checkpoint = tmp_path / "outer_edge_refiner_v1.jaykwok-Qwen3-ASR-1.7B-JA-Anime-Galgame-hf.pt"
+    checkpoint.write_bytes(b"v1")
+    monkeypatch.delenv("OUTER_EDGE_REFINER_MODEL_PATH_BY_REPO", raising=False)
 
     path = qwen.checkpoint_path_for_repo_env(
         repo_id=ASR_17B_BACKEND,
-        mapping_env="BOUNDARY_REFINER_MODEL_PATH_BY_REPO",
+        mapping_env="OUTER_EDGE_REFINER_MODEL_PATH_BY_REPO",
         default_mapping={ASR_17B_BACKEND: str(checkpoint)},
     )
 
-    assert path.endswith("boundary_edge_refiner_v8_safe_tight.jaykwok-Qwen3-ASR-1.7B-JA-Anime-Galgame-hf.pt")
+    assert path.endswith("outer_edge_refiner_v1.jaykwok-Qwen3-ASR-1.7B-JA-Anime-Galgame-hf.pt")
 
 
 def test_qwen_checkpoint_path_auto_uses_registered_scorer(monkeypatch, tmp_path):
     from asr.backends import qwen
 
-    checkpoint_06b = tmp_path / "speech_boundary_ja_frame_boundary_scorer_v7.jaykwok-Qwen3-ASR-0.6B-JA-Anime-Galgame-hf.pt"
-    checkpoint_17b = tmp_path / "speech_boundary_ja_frame_boundary_scorer_v7.jaykwok-Qwen3-ASR-1.7B-JA-Anime-Galgame-hf.pt"
-    checkpoint_06b.write_bytes(b"v6-06b")
-    checkpoint_17b.write_bytes(b"v6-17b")
+    checkpoint_06b = tmp_path / "speech_island_scorer_v8.jaykwok-Qwen3-ASR-0.6B-JA-Anime-Galgame-hf.pt"
+    checkpoint_17b = tmp_path / "speech_island_scorer_v8.jaykwok-Qwen3-ASR-1.7B-JA-Anime-Galgame-hf.pt"
+    checkpoint_06b.write_bytes(b"v8-06b")
+    checkpoint_17b.write_bytes(b"v8-17b")
     monkeypatch.setenv("SPEECH_BOUNDARY_JA_SCORER_CHECKPOINT_BY_REPO", "auto")
 
     default_mapping = {
@@ -166,22 +166,22 @@ def test_qwen_checkpoint_path_auto_uses_registered_scorer(monkeypatch, tmp_path)
     )
 
     assert path_06b.endswith(
-        "speech_boundary_ja_frame_boundary_scorer_v7.jaykwok-Qwen3-ASR-0.6B-JA-Anime-Galgame-hf.pt"
+        "speech_island_scorer_v8.jaykwok-Qwen3-ASR-0.6B-JA-Anime-Galgame-hf.pt"
     )
     assert path_17b.endswith(
-        "speech_boundary_ja_frame_boundary_scorer_v7.jaykwok-Qwen3-ASR-1.7B-JA-Anime-Galgame-hf.pt"
+        "speech_island_scorer_v8.jaykwok-Qwen3-ASR-1.7B-JA-Anime-Galgame-hf.pt"
     )
 
 
 def test_qwen_checkpoint_path_mapping_requires_env(monkeypatch):
     from asr.backends import qwen
 
-    monkeypatch.delenv("BOUNDARY_REFINER_MODEL_PATH_BY_REPO", raising=False)
+    monkeypatch.delenv("OUTER_EDGE_REFINER_MODEL_PATH_BY_REPO", raising=False)
 
-    with pytest.raises(RuntimeError, match="BOUNDARY_REFINER_MODEL_PATH_BY_REPO is required"):
+    with pytest.raises(RuntimeError, match="OUTER_EDGE_REFINER_MODEL_PATH_BY_REPO is required"):
         qwen.checkpoint_path_for_repo_env(
             repo_id=ASR_17B_BACKEND,
-            mapping_env="BOUNDARY_REFINER_MODEL_PATH_BY_REPO",
+            mapping_env="OUTER_EDGE_REFINER_MODEL_PATH_BY_REPO",
         )
 
 
@@ -191,14 +191,14 @@ def test_qwen_checkpoint_path_mapping_requires_selected_repo(monkeypatch, tmp_pa
     checkpoint_06b = tmp_path / "06b.pt"
     checkpoint_06b.write_bytes(b"06b")
     monkeypatch.setenv(
-        "BOUNDARY_REFINER_MODEL_PATH_BY_REPO",
+        "OUTER_EDGE_REFINER_MODEL_PATH_BY_REPO",
         f"{ASR_06B_BACKEND}={checkpoint_06b}",
     )
 
     with pytest.raises(RuntimeError, match="has no checkpoint for ASR repo"):
         qwen.checkpoint_path_for_repo_env(
             repo_id=ASR_17B_BACKEND,
-            mapping_env="BOUNDARY_REFINER_MODEL_PATH_BY_REPO",
+            mapping_env="OUTER_EDGE_REFINER_MODEL_PATH_BY_REPO",
         )
 
 
@@ -207,26 +207,26 @@ def test_qwen_checkpoint_path_mapping_requires_existing_file(monkeypatch, tmp_pa
 
     missing = tmp_path / "missing.pt"
     monkeypatch.setenv(
-        "BOUNDARY_REFINER_MODEL_PATH_BY_REPO",
+        "OUTER_EDGE_REFINER_MODEL_PATH_BY_REPO",
         f"{ASR_17B_BACKEND}={missing}",
     )
 
     with pytest.raises(FileNotFoundError, match="does not exist"):
         qwen.checkpoint_path_for_repo_env(
             repo_id=ASR_17B_BACKEND,
-            mapping_env="BOUNDARY_REFINER_MODEL_PATH_BY_REPO",
+            mapping_env="OUTER_EDGE_REFINER_MODEL_PATH_BY_REPO",
         )
 
 
 def test_qwen_checkpoint_path_mapping_rejects_malformed_env(monkeypatch):
     from asr.backends import qwen
 
-    monkeypatch.setenv("BOUNDARY_REFINER_MODEL_PATH_BY_REPO", "not-a-mapping-entry")
+    monkeypatch.setenv("OUTER_EDGE_REFINER_MODEL_PATH_BY_REPO", "not-a-mapping-entry")
 
     with pytest.raises(RuntimeError, match="is malformed"):
         qwen.checkpoint_path_for_repo_env(
             repo_id=ASR_17B_BACKEND,
-            mapping_env="BOUNDARY_REFINER_MODEL_PATH_BY_REPO",
+            mapping_env="OUTER_EDGE_REFINER_MODEL_PATH_BY_REPO",
         )
 
 

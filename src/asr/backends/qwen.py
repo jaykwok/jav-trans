@@ -18,14 +18,22 @@ DEFAULT_QWEN_ASR_BATCH_SIZE_BY_REPO: dict[str, int] = {
     QWEN_ASR_06B_REPO_ID: 64,
     QWEN_ASR_REPO_ID: 32,
 }
-DEFAULT_BOUNDARY_REFINER_CHECKPOINT_BY_REPO: dict[str, str] = {
+DEFAULT_OUTER_EDGE_REFINER_CHECKPOINT_BY_REPO: dict[str, str] = {
     QWEN_ASR_17B_REPO_ID: (
         "src/boundary/checkpoints/"
-        "boundary_edge_refiner_v8_safe_tight.jaykwok-Qwen3-ASR-1.7B-JA-Anime-Galgame-hf.pt"
+        "outer_edge_refiner_v1.jaykwok-Qwen3-ASR-1.7B-JA-Anime-Galgame-hf.pt"
     ),
-    QWEN_ASR_06B_REPO_ID: (
+}
+DEFAULT_SEMANTIC_SPLIT_CHECKPOINT_BY_REPO: dict[str, str] = {
+    QWEN_ASR_17B_REPO_ID: (
         "src/boundary/checkpoints/"
-        "boundary_edge_refiner_v8_safe_tight.jaykwok-Qwen3-ASR-0.6B-JA-Anime-Galgame-hf.pt"
+        "semantic_split_model_v1.jaykwok-Qwen3-ASR-1.7B-JA-Anime-Galgame-hf.pt"
+    ),
+}
+DEFAULT_CUT_EDGE_REFINER_CHECKPOINT_BY_REPO: dict[str, str] = {
+    QWEN_ASR_17B_REPO_ID: (
+        "src/boundary/checkpoints/"
+        "cut_edge_refiner_v1.jaykwok-Qwen3-ASR-1.7B-JA-Anime-Galgame-hf.pt"
     ),
 }
 DEFAULT_CUEQC_CHECKPOINT_BY_REPO: dict[str, str] = {
@@ -38,15 +46,20 @@ DEFAULT_CUEQC_CHECKPOINT_BY_REPO: dict[str, str] = {
         "cueqc_mamba_v4_binary.jaykwok-Qwen3-ASR-0.6B-JA-Anime-Galgame-hf.pt"
     ),
 }
-DEFAULT_PRE_ASR_CUEQC_CHECKPOINT_BY_REPO: dict[str, str] = {}
+DEFAULT_PRE_ASR_CUEQC_CHECKPOINT_BY_REPO: dict[str, str] = {
+    QWEN_ASR_17B_REPO_ID: (
+        "src/asr/checkpoints/"
+        "pre_asr_cueqc_v11."
+        "jaykwok-Qwen3-ASR-1.7B-JA-Anime-Galgame-hf.pt"
+    ),
+}
+# The v8 registry contains only native speech-only checkpoints. Incompatible
+# v7 speech/split weights are not converted at load time.
 DEFAULT_SPEECH_BOUNDARY_SCORER_CHECKPOINT_BY_REPO: dict[str, str] = {
     QWEN_ASR_17B_REPO_ID: (
         "src/boundary/ja/checkpoints/"
-        "speech_boundary_ja_frame_boundary_scorer_v7.jaykwok-Qwen3-ASR-1.7B-JA-Anime-Galgame-hf.pt"
-    ),
-    QWEN_ASR_06B_REPO_ID: (
-        "src/boundary/ja/checkpoints/"
-        "speech_boundary_ja_frame_boundary_scorer_v7.jaykwok-Qwen3-ASR-0.6B-JA-Anime-Galgame-hf.pt"
+        "speech_island_scorer_v8."
+        "jaykwok-Qwen3-ASR-1.7B-JA-Anime-Galgame-hf.pt"
     ),
 }
 

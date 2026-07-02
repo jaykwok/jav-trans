@@ -28,7 +28,7 @@ DEFAULT_ASR_BATCH_SIZE_BY_REPO_ENV = ",".join(
     f"{repo_id}={batch_size}"
     for repo_id, batch_size in DEFAULT_QWEN_ASR_BATCH_SIZE_BY_REPO.items()
 )
-DEFAULT_SPEECH_BOUNDARY_OPERATING_POINT = "qwen-mamba2-frame-boundary-scorer-v7"
+DEFAULT_SPEECH_BOUNDARY_OPERATING_POINT = "qwen-mamba2-speech-island-scorer-v8"
 
 
 @dataclass(frozen=True)
@@ -197,11 +197,27 @@ def configure_env(args: argparse.Namespace) -> None:
     os.environ["ASR_MAX_NEW_TOKENS"] = str(args.asr_max_new_tokens)
     if args.boundary_feature_frame_hop_s is not None:
         os.environ["BOUNDARY_FEATURE_FRAME_HOP_S"] = str(args.boundary_feature_frame_hop_s)
-    if args.boundary_refiner_model_path_by_repo.strip():
-        os.environ["BOUNDARY_REFINER_MODEL_PATH_BY_REPO"] = args.boundary_refiner_model_path_by_repo
+    if args.outer_edge_refiner_model_path_by_repo.strip():
+        os.environ["OUTER_EDGE_REFINER_MODEL_PATH_BY_REPO"] = (
+            args.outer_edge_refiner_model_path_by_repo
+        )
     else:
-        os.environ.pop("BOUNDARY_REFINER_MODEL_PATH_BY_REPO", None)
-    os.environ["BOUNDARY_REFINER_DEVICE"] = args.boundary_refiner_device
+        os.environ.pop("OUTER_EDGE_REFINER_MODEL_PATH_BY_REPO", None)
+    if args.semantic_split_model_path_by_repo.strip():
+        os.environ["SEMANTIC_SPLIT_MODEL_PATH_BY_REPO"] = (
+            args.semantic_split_model_path_by_repo
+        )
+    else:
+        os.environ.pop("SEMANTIC_SPLIT_MODEL_PATH_BY_REPO", None)
+    if args.cut_edge_refiner_model_path_by_repo.strip():
+        os.environ["CUT_EDGE_REFINER_MODEL_PATH_BY_REPO"] = (
+            args.cut_edge_refiner_model_path_by_repo
+        )
+    else:
+        os.environ.pop("CUT_EDGE_REFINER_MODEL_PATH_BY_REPO", None)
+    os.environ["OUTER_EDGE_REFINER_DEVICE"] = args.outer_edge_refiner_device
+    os.environ["SEMANTIC_SPLIT_DEVICE"] = args.semantic_split_device
+    os.environ["CUT_EDGE_REFINER_DEVICE"] = args.cut_edge_refiner_device
     os.environ["PRE_ASR_CUEQC_ENABLED"] = "1" if args.pre_asr_cueqc_enabled else "0"
     if args.pre_asr_cueqc_model_path_by_repo.strip():
         os.environ["PRE_ASR_CUEQC_MODEL_PATH_BY_REPO"] = args.pre_asr_cueqc_model_path_by_repo
@@ -209,7 +225,6 @@ def configure_env(args: argparse.Namespace) -> None:
         os.environ.pop("PRE_ASR_CUEQC_MODEL_PATH_BY_REPO", None)
     os.environ["PRE_ASR_CUEQC_DEVICE"] = args.pre_asr_cueqc_device
     os.environ["PRE_ASR_CUEQC_DROP_THRESHOLD"] = str(args.pre_asr_cueqc_drop_threshold)
-    os.environ["BOUNDARY_PLANNER_SEQUENCE_BATCH_SIZE"] = str(args.boundary_planner_sequence_batch_size)
     os.environ["KEEP_ASR_CHUNKS"] = "1" if args.keep_asr_chunks else "0"
     os.environ["BOUNDARY_CACHE_ENABLED"] = "1" if args.boundary_cache else "0"
     os.environ["SPEECH_BOUNDARY_JA_THRESHOLD"] = str(args.speech_boundary_threshold)
@@ -262,13 +277,22 @@ def build_context(*, args: argparse.Namespace, paths: RunPaths, video: Path):
             "ASR_BATCH_SIZE_BY_REPO",
             DEFAULT_ASR_BATCH_SIZE_BY_REPO_ENV,
         ),
-        "BOUNDARY_REFINER_MODEL_PATH_BY_REPO": os.getenv("BOUNDARY_REFINER_MODEL_PATH_BY_REPO", ""),
-        "BOUNDARY_REFINER_DEVICE": os.getenv("BOUNDARY_REFINER_DEVICE", "auto"),
+        "OUTER_EDGE_REFINER_MODEL_PATH_BY_REPO": os.getenv(
+            "OUTER_EDGE_REFINER_MODEL_PATH_BY_REPO", ""
+        ),
+        "SEMANTIC_SPLIT_MODEL_PATH_BY_REPO": os.getenv(
+            "SEMANTIC_SPLIT_MODEL_PATH_BY_REPO", ""
+        ),
+        "CUT_EDGE_REFINER_MODEL_PATH_BY_REPO": os.getenv(
+            "CUT_EDGE_REFINER_MODEL_PATH_BY_REPO", ""
+        ),
+        "OUTER_EDGE_REFINER_DEVICE": os.getenv("OUTER_EDGE_REFINER_DEVICE", "auto"),
+        "SEMANTIC_SPLIT_DEVICE": os.getenv("SEMANTIC_SPLIT_DEVICE", "auto"),
+        "CUT_EDGE_REFINER_DEVICE": os.getenv("CUT_EDGE_REFINER_DEVICE", "auto"),
         "PRE_ASR_CUEQC_ENABLED": "1" if args.pre_asr_cueqc_enabled else "0",
         "PRE_ASR_CUEQC_MODEL_PATH_BY_REPO": os.getenv("PRE_ASR_CUEQC_MODEL_PATH_BY_REPO", ""),
         "PRE_ASR_CUEQC_DEVICE": os.getenv("PRE_ASR_CUEQC_DEVICE", "auto"),
         "PRE_ASR_CUEQC_DROP_THRESHOLD": str(args.pre_asr_cueqc_drop_threshold),
-        "BOUNDARY_PLANNER_SEQUENCE_BATCH_SIZE": os.getenv("BOUNDARY_PLANNER_SEQUENCE_BATCH_SIZE", "256"),
         "QUALITY_REPORT_ENABLED": "1",
         "QUALITY_REPORT_DIR": str(paths.root / "quality_reports"),
         "QC_HARD_FAIL": "0",
@@ -426,7 +450,7 @@ def write_summary(paths: RunPaths, args: argparse.Namespace, results: list[dict[
         "speech_boundary_speech_on_threshold": args.speech_boundary_speech_on_threshold,
         "speech_boundary_speech_off_threshold": args.speech_boundary_speech_off_threshold,
         "speech_boundary_frame_dilation_s": args.speech_boundary_frame_dilation_s,
-        "speech_boundary_split_strategy": "adaptive_topographic_time_valley_peak",
+        "speech_boundary_split_strategy": "acoustic_proposal_then_semantic_split",
         "speech_boundary_split_score_quantile": args.speech_boundary_split_score_quantile,
         "speech_boundary_split_prominence_quantile": args.speech_boundary_split_prominence_quantile,
         "speech_boundary_split_smooth_s": args.speech_boundary_split_smooth_s,
@@ -439,7 +463,12 @@ def write_summary(paths: RunPaths, args: argparse.Namespace, results: list[dict[
         "pre_asr_cueqc_drop_threshold": args.pre_asr_cueqc_drop_threshold,
         "boundary_planner": {
             "feature_frame_hop_s": args.boundary_feature_frame_hop_s,
-            "sequence_batch_size": args.boundary_planner_sequence_batch_size,
+            "order": [
+                "speech_island_scorer",
+                "outer_edge_refiner",
+                "semantic_split_model",
+                "cut_edge_refiner",
+            ],
         },
         "translate": bool(args.translate),
         "results": results,
@@ -457,7 +486,7 @@ def write_summary(paths: RunPaths, args: argparse.Namespace, results: list[dict[
             f"`{args.speech_boundary_speech_on_threshold:g}` / "
             f"`{args.speech_boundary_speech_off_threshold:g}`, "
             f"frame dilation `{args.speech_boundary_frame_dilation_s:g}s`, "
-            f"adaptive split decoder"
+            f"semantic split model"
         ),
         f"- Pre-ASR CueQC: `{'on' if args.pre_asr_cueqc_enabled else 'off'}`",
         f"- Translation: `{'on' if args.translate else 'off'}`",
@@ -519,20 +548,30 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         ),
     )
     parser.add_argument(
-        "--boundary-refiner-model-path-by-repo",
-        default=os.getenv("BOUNDARY_REFINER_MODEL_PATH_BY_REPO", ""),
-        help="Required repo-id checkpoint map: '<repo_id>=<boundary_edge_refiner_v8_safe_tight.pt>[,<repo_id>=...]'.",
+        "--outer-edge-refiner-model-path-by-repo",
+        default=os.getenv("OUTER_EDGE_REFINER_MODEL_PATH_BY_REPO", ""),
+        help="Optional repo-id checkpoint map for outer_edge_refiner_v1.",
+    )
+    parser.add_argument(
+        "--semantic-split-model-path-by-repo",
+        default=os.getenv("SEMANTIC_SPLIT_MODEL_PATH_BY_REPO", ""),
+        help="Optional repo-id checkpoint map for semantic_split_model_v1.",
+    )
+    parser.add_argument(
+        "--cut-edge-refiner-model-path-by-repo",
+        default=os.getenv("CUT_EDGE_REFINER_MODEL_PATH_BY_REPO", ""),
+        help="Optional repo-id checkpoint map for cut_edge_refiner_v1.",
     )
     parser.add_argument(
         "--pre-asr-cueqc-enabled",
         action=argparse.BooleanOptionalAction,
         default=_env_bool("PRE_ASR_CUEQC_ENABLED", False),
-        help="Run Pre-ASR CueQC v10 after Boundary Refiner and before ASR chunk export.",
+        help="Run Pre-ASR CueQC v11 after semantic boundary planning and before ASR export.",
     )
     parser.add_argument(
         "--pre-asr-cueqc-model-path-by-repo",
         default=os.getenv("PRE_ASR_CUEQC_MODEL_PATH_BY_REPO", ""),
-        help="Optional repo-id checkpoint map: '<repo_id>=<cueqc_pre_asr_mamba_v10_binary.pt>[,<repo_id>=...]'.",
+        help="Optional repo-id checkpoint map for cueqc_pre_asr_mamba_v11_binary.",
     )
     parser.add_argument("--pre-asr-cueqc-device", default=os.getenv("PRE_ASR_CUEQC_DEVICE", "auto"))
     parser.add_argument(
@@ -540,11 +579,21 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         type=float,
         default=_env_float("PRE_ASR_CUEQC_DROP_THRESHOLD", 0.95),
     )
-    parser.add_argument("--boundary-refiner-device", default=os.getenv("BOUNDARY_REFINER_DEVICE", "auto"))
-    parser.add_argument("--boundary-planner-sequence-batch-size", type=int, default=_env_int("BOUNDARY_PLANNER_SEQUENCE_BATCH_SIZE", 256))
+    parser.add_argument(
+        "--outer-edge-refiner-device",
+        default=os.getenv("OUTER_EDGE_REFINER_DEVICE", "auto"),
+    )
+    parser.add_argument(
+        "--semantic-split-device",
+        default=os.getenv("SEMANTIC_SPLIT_DEVICE", "auto"),
+    )
+    parser.add_argument(
+        "--cut-edge-refiner-device",
+        default=os.getenv("CUT_EDGE_REFINER_DEVICE", "auto"),
+    )
     parser.add_argument("--keep-asr-chunks", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--boundary-cache", action=argparse.BooleanOptionalAction, default=_env_bool("BOUNDARY_CACHE_ENABLED", True))
-    parser.add_argument("--speech-boundary-threshold", dest="speech_boundary_threshold", type=float, default=_env_float("SPEECH_BOUNDARY_JA_THRESHOLD", 0.5))
+    parser.add_argument("--speech-boundary-threshold", dest="speech_boundary_threshold", type=float, default=_env_float("SPEECH_BOUNDARY_JA_THRESHOLD", 0.15))
     parser.add_argument(
         "--speech-boundary-speech-on-threshold",
         dest="speech_boundary_speech_on_threshold",
@@ -583,7 +632,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         dest="speech_boundary_scorer_checkpoint_by_repo",
         default=os.getenv("SPEECH_BOUNDARY_JA_SCORER_CHECKPOINT_BY_REPO", ""),
         help=(
-            "Optional repo-id scorer map: '<repo_id>=<speech_boundary_ja_frame_boundary_scorer_v7.pt>'"
+            "Optional repo-id scorer map: '<repo_id>=<speech_island_scorer_v8.pt>'"
             "[,<repo_id>=...]'. Empty uses the registered repo-id scorer when available."
         ),
     )
@@ -632,8 +681,6 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         parser.error("--speech-boundary-window-s must be positive")
     if args.speech_boundary_overlap_s < 0 or args.speech_boundary_overlap_s >= args.speech_boundary_window_s:
         parser.error("--speech-boundary-overlap-s must be non-negative and smaller than window")
-    if args.boundary_planner_sequence_batch_size <= 0:
-        parser.error("--boundary-planner-sequence-batch-size must be positive")
     return args
 
 

@@ -187,6 +187,9 @@ async def _test_model_requirements_for_17b_include_boundary(tmp_path, monkeypatc
     assert payload["missing_count"] == 1
     assert payload["needs_download"] is True
     assert payload["download_disabled"] is False
+    assert payload["checkpoint_missing_count"] == 0
+    assert len(payload["required_checkpoints"]) == 5
+    assert all(item["present"] for item in payload["required_checkpoints"])
     by_role = {
         tuple(item["roles"]): item["repo_id"]
         for item in payload["required_models"]
@@ -246,6 +249,8 @@ async def _test_model_requirements_marks_disabled_boundary_download(tmp_path, mo
     assert boundary["download_enabled"] is False
     assert payload["needs_download"] is True
     assert payload["download_disabled"] is True
+    assert payload["checkpoint_missing_count"] == 5
+    assert payload["pipeline_ready"] is False
 
 async def _test_settings_hf_endpoint_updates_runtime_env(monkeypatch):
     monkeypatch.delenv("HF_ENDPOINT", raising=False)

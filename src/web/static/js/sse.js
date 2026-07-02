@@ -65,7 +65,10 @@ export function connectSSE() {
     const extra = ev.extra ? ' ' + Object.entries(ev.extra).map(([k, v]) => `${k}=${v}`).join(' ') : '';
     addLog(label + extra, cls);
 
-    if (ev.job_id && (phase === 'done' || phase === 'start' || phase === 'progress')) {
+    if (
+      ev.job_id
+      && ['start', 'progress', 'done', 'skip', 'degraded', 'blocked'].includes(phase)
+    ) {
       fetchJob(ev.job_id);
     }
   });
