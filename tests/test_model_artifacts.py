@@ -7,9 +7,10 @@ import pytest
 from asr.backends import qwen
 
 
-REPO_ID = qwen.QWEN_ASR_17B_REPO_ID
+REPO_IDS = (qwen.QWEN_ASR_06B_REPO_ID, qwen.QWEN_ASR_17B_REPO_ID)
 
 
+@pytest.mark.parametrize("repo_id", REPO_IDS)
 @pytest.mark.parametrize(
     ("mapping", "artifact_name", "stage", "repo_metadata_key"),
     [
@@ -46,13 +47,14 @@ REPO_ID = qwen.QWEN_ASR_17B_REPO_ID
     ],
 )
 def test_promoted_five_model_artifact_contract(
+    repo_id: str,
     mapping: dict[str, str],
     artifact_name: str,
     stage: int,
     repo_metadata_key: str,
 ) -> None:
     torch = pytest.importorskip("torch")
-    path = Path(mapping[REPO_ID])
+    path = Path(mapping[repo_id])
     assert path.is_file()
     assert "agents/temp" not in path.as_posix()
 
@@ -66,4 +68,11 @@ def test_promoted_five_model_artifact_contract(
     assert artifact["checkpoint_format_version"] == 1
     assert artifact["promoted"] is True
     assert artifact["self_contained"] is True
-    assert metadata[repo_metadata_key] == REPO_ID
+    assert metadata[repo_metadata_key] == repo_id
+
+
+def test_windows_bundle_includes_all_five_model_checkpoint_roots() -> None:
+    spec = Path("packaging/javtrans-web.spec").read_text(encoding="utf-8")
+    assert '"src/boundary/ja/checkpoints"' in spec
+    assert '"src/boundary/checkpoints"' in spec
+    assert '"src/asr/checkpoints"' in spec

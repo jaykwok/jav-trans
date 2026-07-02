@@ -492,6 +492,7 @@ def train(
     keep_class_weight: float,
     drop_class_weight: float,
     sequence_window_size: int,
+    temporal_residual_scale: float,
     split_mode: str,
     val_ratio: float,
     focal_gamma: float,
@@ -550,6 +551,7 @@ def train(
             "ptm_dim": PRE_ASR_CUEQC_PTM_DIM,
             "scalar_dim": len(PRE_ASR_CUEQC_SCALAR_FEATURE_NAMES),
             "hidden_size": hidden_size,
+            "temporal_residual_scale": temporal_residual_scale,
         }
     )
     model = PreAsrCueQCNetwork(**model_config).to(dev)
@@ -719,6 +721,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--output-dir", required=True)
     parser.add_argument("--asr-repo-id", required=True)
     parser.add_argument("--hidden-size", type=int, default=128)
+    parser.add_argument("--temporal-residual-scale", type=float, default=1.0)
     parser.add_argument("--steps", type=int, default=1000)
     parser.add_argument("--batch-size", type=int, default=64)
     parser.add_argument("--lr", type=float, default=3e-4)
@@ -779,6 +782,7 @@ def main(argv: list[str] | None = None) -> int:
         keep_class_weight=float(args.keep_class_weight),
         drop_class_weight=float(args.drop_class_weight),
         sequence_window_size=int(args.sequence_window_size),
+        temporal_residual_scale=float(args.temporal_residual_scale),
         split_mode=str(args.split_mode),
         val_ratio=float(args.val_ratio),
         focal_gamma=float(args.focal_gamma),

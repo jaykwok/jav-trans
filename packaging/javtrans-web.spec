@@ -137,6 +137,10 @@ datas += [
         str(_require_path("src/boundary/ja/checkpoints", "SpeechBoundary-JA scorer checkpoints")),
         "src/boundary/ja/checkpoints",
     ),
+    (
+        str(_require_path("src/asr/checkpoints", "Pre-ASR CueQC checkpoints")),
+        "src/asr/checkpoints",
+    ),
 ]
 
 if not _env_bool("JAVTRANS_SKIP_MODELS"):

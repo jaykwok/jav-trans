@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+import time
 from collections import Counter
 from pathlib import Path
 
@@ -87,6 +88,25 @@ def _clip_window(
     return clip_start, clip_start + max_clip_s
 
 
+def _call_omni_with_rate_limit_retry(**kwargs):
+    for attempt in range(6):
+        try:
+            return call_omni(**kwargs)
+        except Exception as exc:
+            message = str(exc).lower()
+            if "429" not in message and "limit_requests" not in message:
+                raise
+            if attempt == 5:
+                raise
+            delay_s = min(30, 5 * (attempt + 1))
+            print(
+                f"omni_rate_limited retry={attempt + 1}/5 delay_s={delay_s}",
+                flush=True,
+            )
+            time.sleep(delay_s)
+    raise AssertionError("unreachable")
+
+
 def run(args: argparse.Namespace) -> None:
     load_env_file(args.env_file)
     candidates: dict[str, dict] = {}
@@ -163,7 +183,7 @@ def run(args: argparse.Namespace) -> None:
             force=False,
         )
         try:
-            parsed, raw = call_omni(
+            parsed, raw = _call_omni_with_rate_limit_retry(
                 audio_path=clip_path,
                 fmt="mp3",
                 audio_content_mode=args.audio_content_mode,

@@ -232,6 +232,31 @@ def test_pre_asr_cueqc_v11_model_forward_backward_ignores_padding():
     assert torch.isfinite(loss)
 
 
+def test_pre_asr_cueqc_local_only_mode_and_legacy_default():
+    torch = pytest.importorskip("torch")
+    transformers = pytest.importorskip("transformers")
+    if not hasattr(transformers, "Mamba2Model"):
+        pytest.skip("transformers.Mamba2Model is unavailable")
+
+    assert pre_asr_cueqc.make_model_config({})["temporal_residual_scale"] == 1.0
+    model = pre_asr_cueqc.PreAsrCueQCNetwork(
+        ptm_dim=4,
+        scalar_dim=3,
+        hidden_size=128,
+        temporal_layers=1,
+        temporal_residual_scale=0.0,
+        dropout=0.0,
+    )
+    ptm_bins = torch.randn(1, 2, pre_asr_cueqc.PRE_ASR_CUEQC_MODEL_PTM_TOKENS, 4)
+    scalar = torch.randn(1, 2, 3)
+    mask = torch.tensor([[1.0, 0.0]])
+
+    logits = model(ptm_bins, scalar, chunk_mask=mask)
+
+    assert logits.shape == (1, 2, 2)
+    assert torch.count_nonzero(logits[:, 1]).item() == 0
+
+
 def test_pre_asr_cueqc_filters_before_wav_export(monkeypatch):
     from asr import pipeline as asr_pipeline
 

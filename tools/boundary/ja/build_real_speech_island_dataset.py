@@ -8,9 +8,6 @@ from pathlib import Path
 import numpy as np
 
 
-PTM_REPO_ID = "jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame-hf"
-
-
 def _read_jsonl(path: Path) -> list[dict]:
     with path.open("r", encoding="utf-8") as handle:
         return [json.loads(line) for line in handle if line.strip()]
@@ -101,7 +98,7 @@ def run(args: argparse.Namespace) -> None:
                 "label_index": record_index,
                 "label_quality": "supervised",
                 "mfcc_dim": mfcc.shape[1],
-                "ptm": PTM_REPO_ID,
+                "ptm": args.ptm_repo_id,
                 "ptm_dim": args.ptm_dim,
                 "source": "omni_real_speech_island_hard_negative_v1",
                 "speech_frame_count": int(labels[start:end].sum()),
@@ -151,6 +148,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--base-labels", required=True)
     parser.add_argument("--base-manifest", required=True)
     parser.add_argument("--output-dir", required=True)
+    parser.add_argument("--ptm-repo-id", required=True)
     parser.add_argument("--ptm-dim", type=int, default=128)
     parser.add_argument("--window-s", type=float, default=30.0)
     parser.add_argument("--keep-padding-s", type=float, default=0.08)

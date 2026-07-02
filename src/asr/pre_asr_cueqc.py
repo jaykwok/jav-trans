@@ -757,6 +757,7 @@ class PreAsrCueQCNetwork:
                 scalar_dim: int,
                 hidden_size: int = 128,
                 temporal_layers: int = 2,
+                temporal_residual_scale: float = 1.0,
                 dropout: float = 0.1,
                 num_classes: int = 2,
             ) -> None:
@@ -764,6 +765,7 @@ class PreAsrCueQCNetwork:
                 from boundary.backbones import TinyMamba2BoundaryBackbone
 
                 self.arch = PRE_ASR_CUEQC_MODEL_ARCH
+                self.temporal_residual_scale = float(temporal_residual_scale)
                 self.ptm_encoder = nn.Sequential(
                     nn.LayerNorm(ptm_dim * 4),
                     nn.Linear(ptm_dim * 4, hidden_size * 2),
@@ -847,6 +849,11 @@ class PreAsrCueQCNetwork:
                     torch.cat([ptm_repr, scalar_repr], dim=-1)
                 )
                 local_repr = chunk_repr.reshape(batch, chunks, -1)
+                if self.temporal_residual_scale <= 0.0:
+                    logits = self.classifier(local_repr)
+                    if chunk_mask is not None:
+                        logits = logits * chunk_mask.unsqueeze(-1).to(dtype=logits.dtype)
+                    return logits
                 previous = torch.cat(
                     (torch.zeros_like(local_repr[:, :1]), local_repr[:, :-1]),
                     dim=1,
@@ -874,7 +881,9 @@ class PreAsrCueQCNetwork:
                 gate = self.temporal_gate(
                     torch.cat((local_repr, delta_repr), dim=-1)
                 )
-                logits = self.classifier(local_repr + gate * temporal)
+                logits = self.classifier(
+                    local_repr + self.temporal_residual_scale * gate * temporal
+                )
                 if chunk_mask is not None:
                     logits = logits * chunk_mask.unsqueeze(-1).to(dtype=logits.dtype)
                 return logits
@@ -889,6 +898,7 @@ def make_model_config(config: Mapping[str, Any] | None = None) -> dict[str, Any]
         "scalar_dim": int(raw.get("scalar_dim") or len(PRE_ASR_CUEQC_SCALAR_FEATURE_NAMES)),
         "hidden_size": int(raw.get("hidden_size") or 128),
         "temporal_layers": int(raw.get("temporal_layers") or 2),
+        "temporal_residual_scale": float(raw.get("temporal_residual_scale", 1.0)),
         "dropout": float(raw.get("dropout", 0.1)),
         "num_classes": int(raw.get("num_classes") or 2),
     }
