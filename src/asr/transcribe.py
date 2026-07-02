@@ -236,6 +236,11 @@ def _transcribe_asr_chunks_text_only(
     is_subprocess_backend = _is_subprocess_backend(backend)
     respawn_count: defaultdict[int, int] = defaultdict(int)
     consecutive_failures = 0
+    # Kind of the most recent failure that incremented consecutive_failures.
+    # The OOM-branch circuit breaker reads this so it labels quarantine
+    # records with the failure that actually tripped the limit (timeout /
+    # crash / protocol_error), not a hardcoded "timeout".
+    last_failure_kind = "timeout"
     failure_records: list[dict] = []
     text_started = time.perf_counter()
 
@@ -383,6 +388,7 @@ def _transcribe_asr_chunks_text_only(
                     batch_text_results = _transcribe_batch(batch_chunks)
                 except WorkerTimeoutError as exc:
                     consecutive_failures += 1
+                    last_failure_kind = "timeout"
                     retry_chunks = _schedule_retries(
                         batch_chunks,
                         kind="timeout",
@@ -410,11 +416,18 @@ def _transcribe_asr_chunks_text_only(
                             chunk_index = int(chunk["index"])
                             if chunk_index in text_results_by_index:
                                 continue
-                            respawn_count[chunk_index] += 1
+                            # NOTE: do not pre-increment respawn_count here. Every
+                            # failure path below already accounts for the attempt --
+                            # _schedule_retries increments on retry (mirroring the
+                            # crash path), and the single-OOM branch increments
+                            # before direct quarantine. A pre-increment here used to
+                            # double-count, pushing OOM chunks into quarantine ~one
+                            # cycle earlier than crash chunks at the same MAX.
                             try:
                                 single_result = _transcribe_batch([chunk])
                             except WorkerTimeoutError as single_exc:
                                 consecutive_failures += 1
+                                last_failure_kind = "timeout"
                                 retry_chunks.extend(
                                     _schedule_retries(
                                         [chunk],
@@ -446,6 +459,7 @@ def _transcribe_asr_chunks_text_only(
                                     _save_progress_checkpoint()
                                 elif single_kind in {"crash", "protocol_error"}:
                                     consecutive_failures += 1
+                                    last_failure_kind = single_kind
                                     retry_chunks.extend(
                                         _schedule_retries(
                                             [chunk],
@@ -458,6 +472,7 @@ def _transcribe_asr_chunks_text_only(
                             else:
                                 _store_text_results([chunk], single_result)
                                 consecutive_failures = 0
+                                last_failure_kind = "timeout"
 
                         if (
                             consecutive_failures
@@ -465,7 +480,7 @@ def _transcribe_asr_chunks_text_only(
                         ):
                             _quarantine_many(
                                 retry_chunks + pending_chunks,
-                                kind="timeout",
+                                kind=last_failure_kind,
                                 detail="circuit breaker",
                             )
                             pending_chunks = []
@@ -475,6 +490,7 @@ def _transcribe_asr_chunks_text_only(
 
                     if failure_kind in {"crash", "protocol_error"}:
                         consecutive_failures += 1
+                        last_failure_kind = failure_kind
                         retry_chunks = _schedule_retries(
                             batch_chunks,
                             kind=failure_kind,
@@ -508,6 +524,7 @@ def _transcribe_asr_chunks_text_only(
                         ),
                     )
                     consecutive_failures = 0
+                    last_failure_kind = "timeout"
 
         timeout_count = sum(
             1 for result in text_results_by_index.values() if _is_timed_out_result(result)

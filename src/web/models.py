@@ -8,6 +8,18 @@ from pydantic import BaseModel, ConfigDict, Field
 MAX_TRANSLATION_WORKERS = 64
 
 
+def normalize_llm_api_format(value: str | None) -> str:
+    """Clamp an LLM API format to the supported set; default 'chat'."""
+    normalized = (value or "chat").strip().lower()
+    return normalized if normalized in {"chat", "responses"} else "chat"
+
+
+def normalize_llm_reasoning_effort(value: str | None) -> str:
+    """Clamp an LLM reasoning effort to the supported set; default 'xhigh'."""
+    normalized = (value or "xhigh").strip().lower()
+    return normalized if normalized in {"medium", "xhigh"} else "xhigh"
+
+
 class JobSpec(BaseModel):
     model_config = ConfigDict(extra="forbid")
 

@@ -13,7 +13,7 @@ from openai import OpenAI
 
 from core.config import load_config
 from llm import cache as translation_cache
-from llm.glossary import normalize_glossary_text
+from llm.glossary import normalize_glossary_text, parse_glossary_pairs
 from llm import patch as llm_patch
 from llm import prompt as prompt_module
 
@@ -76,6 +76,12 @@ TRANSLATION_TOP_P = 0.9
 COMPACT_SYSTEM_PROMPT = False
 TRANSLATION_API_RETRIES = 4
 TRANSLATION_BATCH_REPAIR_RETRIES = 2
+# Hard cap on requests a single batch may issue. The repair loop resets its
+# retry budget whenever the missing set shrinks, which can otherwise let a
+# pathological model (one-at-a-time progress) loop indefinitely. Hitting this
+# cap fails the batch via the normal failure path (best-effort partial results
+# are kept in batch_results but not persisted), bounding cost.
+TRANSLATION_BATCH_MAX_REQUESTS = 12
 TRANSLATION_API_BACKOFF_BASE_S = 1.5
 TRANSLATION_API_BACKOFF_MAX_S = 20.0
 TRANSLATION_PREFIX_WARMUP = True
@@ -364,17 +370,41 @@ def _format_global_glossary_terms(
 ) -> str:
     lines = []
     seen: set[str] = set()
-    normalized_glossary = normalize_glossary_text(glossary)
+    # Parse the project glossary into its ja keys and match exactly. Treating
+    # the whole glossary text as a haystack (substring `in`) would drop a
+    # global term whenever its ja appeared as a substring of any glossary pair
+    # (e.g. glossary "肉-肉棒" wrongly suppresses both "肉" and "肉棒").
+    glossary_ja_keys = {ja for ja, _zh in parse_glossary_pairs(glossary)}
     for item in terms:
         ja = str(item.get("ja", "")).strip()
         zh = str(item.get("zh", "")).strip()
         if not ja or not zh or ja in seen:
             continue
-        if normalized_glossary and ja in normalized_glossary:
+        if ja in glossary_ja_keys:
             continue
         seen.add(ja)
         lines.append(f"{ja}-{zh}")
     return "\n".join(lines)
+
+
+def _resolve_translation_extra_glossary(
+    segments: list[dict],
+    cache_path: str,
+    glossary: str,
+    *,
+    api_format: str | None,
+    cancel_event: threading.Event | None,
+) -> str:
+    if not cache_path:
+        return ""
+    all_ja_texts = [str(seg.get("text", "")) for seg in segments]
+    glossary_terms = extract_global_glossary(
+        all_ja_texts,
+        _global_glossary_cache_path_for_texts(cache_path, all_ja_texts),
+        api_format=api_format,
+        cancel_event=cancel_event,
+    )
+    return _format_global_glossary_terms(glossary_terms, glossary=glossary)
 
 
 def _global_glossary_cache_path_for_texts(
@@ -511,7 +541,7 @@ def translate_segments(
     try:
         _raise_if_cancelled(cancel_event)
         if effective_batch_size > 0 and len(segments) > effective_batch_size:
-            zh_texts, timings = _translate_segments_batched(
+            zh_texts, timings, worker_retry_events = _translate_segments_batched(
                 segments,
                 batch_size=effective_batch_size,
                 max_workers=effective_max_workers,
@@ -526,6 +556,7 @@ def translate_segments(
                 on_progress=on_progress,
                 cancel_event=cancel_event,
             )
+            retry_events.extend(worker_retry_events)
         else:
             zh_texts, timings = _translate_segments_single_request(
                 segments,
@@ -541,6 +572,46 @@ def translate_segments(
                 cancel_event=cancel_event,
             )
         _raise_if_cancelled(cancel_event)
+
+        def _persist_repaired_translation_cache(repaired_texts: list[str]) -> None:
+            # Write repaired texts back under the same batch_key entries the
+            # translation phase used, so subsequent runs reuse the repair.
+            if not effective_cache_path or not segments:
+                return
+            extra_glossary = _resolve_translation_extra_glossary(
+                segments,
+                effective_cache_path,
+                effective_glossary,
+                api_format=api_format,
+                cancel_event=cancel_event,
+            )
+            cache_kwargs = {
+                "extra_glossary": extra_glossary,
+                "glossary": effective_glossary,
+                "target_lang": effective_target_lang,
+                "character_reference": effective_character_reference,
+            }
+            if effective_batch_size > 0 and len(segments) > effective_batch_size:
+                for b_index, b_segments in enumerate(
+                    _split_into_batches(segments, effective_batch_size)
+                ):
+                    start = b_index * effective_batch_size
+                    local_texts = [
+                        repaired_texts[start + off]
+                        if start + off < len(repaired_texts)
+                        else ""
+                        for off in range(len(b_segments))
+                    ]
+                    batch_key = _translation_cache_key(b_index, b_segments, **cache_kwargs)
+                    _save_cache_entry(
+                        effective_cache_path, batch_key, local_texts, _cache_lock
+                    )
+            else:
+                batch_key = _translation_cache_key(0, segments, **cache_kwargs)
+                _save_cache_entry(
+                    effective_cache_path, batch_key, repaired_texts, _cache_lock
+                )
+
         zh_texts, repair_timing = _apply_translation_repair_pass(
             segments,
             zh_texts,
@@ -551,6 +622,7 @@ def translate_segments(
             api_format=api_format,
             on_progress=on_progress,
             cancel_event=cancel_event,
+            cache_writer=_persist_repaired_translation_cache,
         )
         _raise_if_cancelled(cancel_event)
         if repair_timing is not None:
@@ -626,19 +698,9 @@ def _translate_segments_single_request(
     source_payload = _serialize_segments(segments)
     expected_count = len(segments)
     request_usages: list[dict] = []
-    extra_glossary = ""
-    all_ja_texts = [str(seg.get("text", "")) for seg in segments]
-    if cache_path:
-        glossary_terms = extract_global_glossary(
-            all_ja_texts,
-            _global_glossary_cache_path_for_texts(cache_path, all_ja_texts),
-            api_format=api_format,
-            cancel_event=cancel_event,
-        )
-        extra_glossary = _format_global_glossary_terms(
-            glossary_terms,
-            glossary=glossary,
-        )
+    extra_glossary = _resolve_translation_extra_glossary(
+        segments, cache_path, glossary, api_format=api_format, cancel_event=cancel_event
+    )
 
     batch_key = ""
     translation_cache = _load_translation_cache(cache_path) if cache_path else {}
@@ -816,22 +878,9 @@ def _translate_segments_batched(
     started = time.perf_counter()
     batches = _split_into_batches(segments, batch_size)
     expected_total = len(segments)
-    extra_glossary = ""
-    all_ja_texts = [str(seg.get("text", "")) for seg in segments]
-    if cache_path:
-        glossary_terms = extract_global_glossary(
-            all_ja_texts,
-            _global_glossary_cache_path_for_texts(
-                cache_path,
-                all_ja_texts,
-            ),
-            api_format=api_format,
-            cancel_event=cancel_event,
-        )
-        extra_glossary = _format_global_glossary_terms(
-            glossary_terms,
-            glossary=glossary,
-        )
+    extra_glossary = _resolve_translation_extra_glossary(
+        segments, cache_path, glossary, api_format=api_format, cancel_event=cancel_event
+    )
     full_context = (
         global_context
         if global_context is not None
@@ -869,6 +918,7 @@ def _translate_segments_batched(
         else {}
     )
     pending_batches: list[tuple[int, list[dict]]] = []
+    worker_retry_events: list[dict] = []
     warmup_timing: dict | None = None
     exact_cache_hit_count = 0
     translation_memory_hit_count = 0
@@ -1018,7 +1068,6 @@ def _translate_segments_batched(
         warmup_messages = _build_batch_messages(
             [],
             full_context,
-            0,
             character_reference,
             0,
             **warmup_kwargs,
@@ -1079,8 +1128,15 @@ def _translate_segments_batched(
             }
             print(f"[WARN] translation prefix warmup failed: {exc}", flush=True)
 
-    def run_batch(batch_index: int, batch_segments: list[dict]) -> tuple[int, list[str | None], dict]:
+    def run_batch(batch_index: int, batch_segments: list[dict]) -> tuple[int, list[str | None], dict, list[dict]]:
         _raise_if_cancelled(cancel_event)
+        # Worker threads do not inherit the caller's thread-local retry events,
+        # so _record_api_retry_event would silently no-op. Bind a per-batch
+        # container here so retry signals are captured, then merge it back on
+        # the main thread. finally-cleanup is unnecessary because these
+        # ThreadPoolExecutor workers are scoped to this single batched call.
+        batch_retry_events: list[dict] = []
+        _RETRY_CONTEXT.events = batch_retry_events
         batch_started = time.perf_counter()
         batch_started_ts = time.time()
         worker_thread = threading.current_thread()
@@ -1118,7 +1174,6 @@ def _translate_segments_batched(
         messages = _build_batch_messages(
             requested_segments,
             full_context,
-            0,
             character_reference,
             len(requested_segments),
             batch_index=batch_index,
@@ -1163,6 +1218,13 @@ def _translate_segments_batched(
 
         while True:
             _raise_if_cancelled(cancel_event)
+            if request_count >= TRANSLATION_BATCH_MAX_REQUESTS:
+                raise RuntimeError(
+                    "Batch translation exceeded hard request cap "
+                    f"({TRANSLATION_BATCH_MAX_REQUESTS}): batch={batch_index}, "
+                    f"start_index={start_index}, size={expected_count}, "
+                    f"pending_ids={pending_ids[:50]}, error={last_retry_error}"
+                ) from last_retry_error
             if attempts_for_pending >= retry_limit_for_pending:
                 raise RuntimeError(
                     "Batch translation returned invalid or incomplete JSON after "
@@ -1190,7 +1252,6 @@ def _translate_segments_batched(
                     request_messages = _build_batch_messages(
                         pending_segments,
                         full_context,
-                        0,
                         character_reference,
                         request_expected_count,
                         batch_index=batch_index,
@@ -1303,7 +1364,7 @@ def _translate_segments_batched(
             "translation_memory_hit_count": expected_count - len(expected_ids),
             "cache_hit_type": "mixed" if len(expected_ids) < expected_count else "miss",
         }
-        return batch_index, batch_results, timing
+        return batch_index, batch_results, timing, batch_retry_events
 
     if pending_batches:
         with ThreadPoolExecutor(max_workers=min(max_workers, len(pending_batches))) as executor:
@@ -1328,7 +1389,8 @@ def _translate_segments_batched(
                         continue
                     for future in sorted(done, key=lambda item: futures[item]):
                         _raise_if_cancelled(cancel_event)
-                        batch_index, batch_results, timing = future.result()
+                        batch_index, batch_results, timing, batch_retry_events = future.result()
+                        worker_retry_events.extend(batch_retry_events)
                         timings_by_batch[batch_index] = timing
                         start_index = int(timing["start_index"])
                         segment_count = int(timing["segment_count"])
@@ -1425,7 +1487,7 @@ def _translate_segments_batched(
             "missing_indexes": [],
         }
     )
-    return [text or "" for text in zh_texts], timings
+    return [text or "" for text in zh_texts], timings, worker_retry_events
 
 
 def _apply_translation_repair_pass(
@@ -1439,6 +1501,7 @@ def _apply_translation_repair_pass(
     api_format: str | None = None,
     on_progress: Callable[[dict], None] | None = None,
     cancel_event: threading.Event | None = None,
+    cache_writer: Callable[[list[str]], None] | None = None,
 ) -> tuple[list[str], dict | None]:
     _raise_if_cancelled(cancel_event)
     repair_ids, reasons = _select_translation_repair_ids(segments, zh_texts)
@@ -1490,6 +1553,19 @@ def _apply_translation_repair_pass(
             if parsed[idx]:
                 repaired_texts[idx] = parsed[idx] or repaired_texts[idx]
                 repaired_count += 1
+        if repaired_count > 0 and cache_writer is not None:
+            # Persist repaired texts back into the translation cache so a re-run
+            # doesn't pay for the same repair again. Idempotent: _save_cache_entry
+            # appends and reads dedupe by last-write-wins per batch_key.
+            try:
+                cache_writer(repaired_texts)
+            except TranslationCancelledError:
+                raise
+            except Exception as exc:
+                print(
+                    f"[WARN] failed to persist repaired translation cache: {exc}",
+                    flush=True,
+                )
         timing = {
             "mode": "translation_repair_pass",
             "start_index": min(repair_ids),
@@ -1558,7 +1634,7 @@ def _select_translation_repair_ids(
             continue
         repair_ids.append(idx)
         reasons[idx] = list(dict.fromkeys(local_reasons))
-    repair_ids.sort(key=lambda idx: (_repair_candidate_priority(reasons[idx]), idx))
+    repair_ids.sort()
     return repair_ids, reasons
 
 
@@ -1586,12 +1662,6 @@ def _has_translation_length_mismatch(source: str, target: str) -> bool:
     )
 
 
-def _repair_candidate_priority(local_reasons: list[str]) -> int:
-    if "length_mismatch" in local_reasons:
-        return 0
-    return 0
-
-
 def _build_repair_messages(
     segments: list[dict],
     zh_texts: list[str],
@@ -1603,7 +1673,6 @@ def _build_repair_messages(
     character_reference: str,
 ) -> list[dict]:
     system_prompt = _build_system_prompt(
-        len(repair_ids),
         character_reference,
         target_lang=target_lang,
         glossary=glossary,
@@ -1697,11 +1766,9 @@ def _auto_translation_batch_size(segment_count: int, max_workers: int) -> int:
 
 
 _serialize_segments = prompt_module._serialize_segments
-_build_full_segments_summary = prompt_module._build_full_segments_summary
 
 
 def _build_system_prompt(
-    expected_count: int,
     character_reference: str,
     *,
     target_lang: str,
@@ -1710,14 +1777,11 @@ def _build_system_prompt(
     extra_glossary: str = "",
 ) -> str:
     return prompt_module._build_system_prompt(
-        expected_count,
         character_reference,
         target_lang=target_lang,
         glossary=glossary,
         compact=compact,
         extra_glossary=extra_glossary,
-        full_template=_SYSTEM_PROMPT_FULL,
-        compact_template=_SYSTEM_PROMPT_COMPACT,
     )
 
 
@@ -1732,7 +1796,6 @@ def _build_translation_messages(
 ) -> list[dict]:
     effective_character_reference = (character_reference or "").strip()
     system_prompt = _build_system_prompt(
-        expected_count,
         effective_character_reference,
         target_lang=target_lang,
         glossary=glossary,
@@ -1752,13 +1815,11 @@ def _build_translation_messages(
 
 
 _format_requested_ids = prompt_module._format_requested_ids
-_build_requested_ids_task = prompt_module._build_requested_ids_task
 
 
 def _build_batch_messages(
     batch_segments: list[dict],
-    full_segments_summary: str | list[dict],
-    batch_offset: int,
+    full_segments_summary: str,
     character_reference: str,
     expected_count: int,
     batch_index: int = 0,
@@ -1773,7 +1834,6 @@ def _build_batch_messages(
     return prompt_module._build_batch_messages(
         batch_segments,
         full_segments_summary,
-        batch_offset,
         character_reference,
         expected_count,
         batch_index=batch_index,
@@ -2130,16 +2190,11 @@ def _emit_stream_content_progress(
 
 def _build_responses_input(
     messages: list[dict],
-    *,
-    string_content: bool = False,
 ) -> list[dict]:
     response_input: list[dict] = []
     for message in messages:
         role = str(message.get("role") or "user")
         content = message.get("content", "")
-        if string_content:
-            response_input.append({"role": role, "content": str(content)})
-            continue
         response_input.append(
             {
                 "role": role,
@@ -2317,7 +2372,11 @@ def _chat_completions(
 
     _raise_if_cancelled(cancel_event)
     if finish_reason == "length":
-        raise RetryableTranslationFormatError(
+        # Terminal failure, not retryable: retrying with the same max_tokens
+        # hits the same truncation and only burns budget. Propagates as a
+        # non-RetryableTranslationFormatError so the batch is marked failed via
+        # the normal failure path. JSON-parse failures below stay retryable.
+        raise RuntimeError(
             f"{_JSON_OUTPUT_LABEL} response was cut off by max_tokens; "
             "increase TRANSLATION_MAX_TOKENS."
         )
@@ -2476,7 +2535,9 @@ def _chat_responses(
     if incomplete_response is not None:
         reason = _response_incomplete_reason(incomplete_response)
         if reason == "max_output_tokens":
-            raise RetryableTranslationFormatError(
+            # Terminal failure, not retryable: same max_output_tokens cap would
+            # truncate again. JSON-parse / other-reason failures stay retryable.
+            raise RuntimeError(
                 "OpenAI Responses API response was cut off by max_output_tokens; "
                 "increase TRANSLATION_MAX_TOKENS."
             )

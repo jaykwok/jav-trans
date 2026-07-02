@@ -2,7 +2,6 @@ import hashlib
 import json
 import os
 import re
-import sys
 import uuid
 import wave
 from pathlib import Path
@@ -182,12 +181,18 @@ def _chunk_checkpoint_signature(
     *,
     last_boundary_signature: dict | None = None,
 ) -> dict[str, dict[str, float | str]]:
-    boundary_signature = _LAST_BOUNDARY_SIGNATURE if last_boundary_signature is None else last_boundary_signature
+    # last_boundary_signature is accepted for interface symmetry with the
+    # checkpoint-path helpers but intentionally unused here: the previous
+    # "boundary_method" entry read boundary_signature.get("backend"), which
+    # never exists in the runtime boundary signature (it holds
+    # result.parameters + boundary_pipeline), so the value was always the
+    # default "unknown" -- pure noise. Chunk identity is fully captured by
+    # start/end plus the runtime-signature hash baked into the checkpoint
+    # filename, so the vestigial field and its stale-entry guard were removed.
     return {
         str(int(chunk["index"])): {
             "start": round(float(chunk.get("start", 0.0)), 3),
             "end": round(float(chunk.get("end", 0.0)), 3),
-            "boundary_method": boundary_signature.get("backend", "unknown"),
         }
         for chunk in chunks
     }
@@ -240,12 +245,6 @@ def _load_asr_checkpoint(
             if isinstance(saved_signature, dict)
             else None
         )
-        if isinstance(saved_chunk_signature, dict) and "boundary_method" not in saved_chunk_signature:
-            print(
-                f"[WARN] ASR checkpoint resume: chunk {chunk_index} missing boundary_method; skip stale checkpoint entry",
-                file=sys.stderr,
-            )
-            continue
         if (
             isinstance(saved_signature, dict)
             and saved_signature

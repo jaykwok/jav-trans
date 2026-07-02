@@ -39,9 +39,7 @@ class SubtitleOptions:
     weak_cut_snap_short_s: float = 0.25
     weak_cut_snap_normal_s: float = 0.40
     weak_cut_snap_long_s: float = 0.60
-    max_display_shift_from_acoustic_start_s: float = 0.15
     max_display_shift_from_acoustic_end_s: float = 0.20
-    max_total_display_extension_s: float = 0.30
 
     @property
     def frame_duration_s(self) -> float:
@@ -103,17 +101,9 @@ class SubtitleOptions:
                 0.0,
                 float(os.getenv("SUBTITLE_WEAK_CUT_SNAP_LONG_S", "0.60")),
             ),
-            max_display_shift_from_acoustic_start_s=max(
-                0.0,
-                float(os.getenv("SUBTITLE_MAX_DISPLAY_SHIFT_FROM_ACOUSTIC_START_S", "0.15")),
-            ),
             max_display_shift_from_acoustic_end_s=max(
                 0.0,
                 float(os.getenv("SUBTITLE_MAX_DISPLAY_SHIFT_FROM_ACOUSTIC_END_S", "0.20")),
-            ),
-            max_total_display_extension_s=max(
-                0.0,
-                float(os.getenv("SUBTITLE_MAX_TOTAL_DISPLAY_EXTENSION_S", "0.30")),
             ),
         )
 

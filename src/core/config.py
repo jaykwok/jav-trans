@@ -133,10 +133,6 @@ DEFAULT_SETTINGS: dict[str, str] = {
     "JOB_TEMP_DIR": "./tmp/jobs",
     # Root directory for transient ASR wav chunks and crash-resume checkpoints.
     "ASR_CHUNK_ROOT": "./tmp/chunks",
-    # 1 keeps optional quality reports requested by the web console.
-    "KEEP_QUALITY_REPORT": "0",
-    # Optional StageEvent sink: empty disables events; file:, tcp:, and memory are supported.
-    "STAGE_EVENT_SINK": "",
     # Internal TCP port used by the web console to receive StageEvent lines.
     "JAVTRANS_EVENTS_PORT": "17322",
     # Web console HTTP port used by launcher.py.
@@ -172,16 +168,10 @@ DEFAULT_SETTINGS: dict[str, str] = {
     # Maximum ASR generation overflow failures before quality report warning.
     "QC_MAX_ASR_GENERATION_OVERFLOWS": "0",
 
-    # 1 preserves word timestamps in final output artifacts.
-    "KEEP_WORD_TIMESTAMPS": "0",
-
     # --- Debug / Advanced ---
     # Test-only crash injection for translation resume tests.
     "_TEST_CRASH_TRANSLATION_BATCH": "",
 }
-
-
-STAGE_EVENT_SINK: str = os.getenv("STAGE_EVENT_SINK", "")
 
 
 def _coerce_default_value(key: str, value: str) -> str:

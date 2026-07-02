@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
@@ -15,6 +16,9 @@ from core.config import DEFAULT_SETTINGS, load_config
 from utils.runtime_paths import resource_root
 from web import broadcaster, pipeline_manager
 from web.routes import config, events as event_routes, files, jobs
+
+
+log = logging.getLogger(__name__)
 
 
 def _events_port() -> int:
@@ -39,6 +43,21 @@ async def _lifespan(_app: FastAPI) -> AsyncIterator[None]:
         listener_task = asyncio.create_task(
             broadcaster.tcp_listener("127.0.0.1", port)
         )
+
+        def _on_listener_done(task: asyncio.Task) -> None:
+            # Surface bind/port-in-use failures that would otherwise vanish
+            # as an unretrieved exception on a background task.
+            if task.cancelled():
+                return
+            exc = task.exception()
+            if exc is not None:
+                log.error(
+                    "SSE TCP listener on port %s failed",
+                    port,
+                    exc_info=exc,
+                )
+
+        listener_task.add_done_callback(_on_listener_done)
         await asyncio.sleep(0.05)
         events.configure_sink(f"tcp:127.0.0.1:{port}")
         await pipeline_manager.load_jobs()

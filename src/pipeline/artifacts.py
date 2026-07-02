@@ -190,7 +190,8 @@ def load_translation_artifacts_snapshot(
         if values.get("video_duration_s") is not None
         else None
     )
-    values["pipeline_started"] = time.perf_counter()
+    if values.get("pipeline_started") is None:
+        values["pipeline_started"] = time.perf_counter()
     values["audio_cache_key"] = str(values.get("audio_cache_key") or "")
     values["video_stem"] = str(values.get("video_stem") or snapshot_path.stem)
     values["device"] = str(values.get("device") or "cpu")

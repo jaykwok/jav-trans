@@ -1,8 +1,6 @@
 import { state, ACTIVE_STATUSES } from './state.js';
 import { renderJobs } from './jobsRender.js';
 
-export { ACTIVE_STATUSES };
-
 export async function fetchJob(id) {
   try {
     const r = await fetch(`/api/jobs/${id}`);

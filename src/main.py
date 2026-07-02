@@ -28,27 +28,7 @@ from pipeline.ids import sanitize_job_id
 from utils.model_paths import PROJECT_ROOT
 
 
-_ENV_OVERRIDE_KEYS = (
-    "JOB_TEMP_DIR",
-    "ASR_BACKEND",
-    "ASR_BOUNDARY_BACKEND",
-    "ASR_WORKER_MODE",
-    "ASR_MODEL_PATH",
-    "ASR_MODEL_ID",
-    "API_KEY",
-    "OPENAI_COMPATIBILITY_BASE_URL",
-    "QUALITY_REPORT_ENABLED",
-    "QUALITY_REPORT_DIR",
-    "QC_HARD_FAIL",
-    "_TEST_CRASH_TRANSLATION_BATCH",
-)
-_ENV_OVERRIDES = {
-    key: os.environ[key]
-    for key in _ENV_OVERRIDE_KEYS
-    if os.getenv(key)
-}
 load_config()
-os.environ.update(_ENV_OVERRIDES)
 
 for _stream in (sys.stdout, sys.stderr):
     try:
@@ -60,8 +40,6 @@ if os.getenv("HF_HOME"):
     os.environ["HF_HOME"] = os.path.abspath(os.getenv("HF_HOME"))
 if os.getenv("TORCH_HOME"):
     os.environ["TORCH_HOME"] = os.path.abspath(os.getenv("TORCH_HOME"))
-if os.getenv("HF_ENDPOINT"):
-    os.environ["HF_ENDPOINT"] = os.getenv("HF_ENDPOINT")
 
 import torch
 
@@ -734,6 +712,42 @@ def _print_timing_summary(stage_timings: dict, asr_details: dict) -> None:
 
 
 def run_asr_alignment(
+    video_path: str,
+    *,
+    ctx: JobContext,
+    job_id: str = "",
+    cache_job_id: str = "",
+    cancel_event=None,
+) -> AsrArtifacts:
+    # Reset per-run logger tracking so the finally below can tell whether THIS
+    # call created a run logger. On the success path ownership of the run
+    # logger's FileHandler transfers to the returned artifacts (and is released
+    # by run_translation_and_write); only the exception path leaks a handle.
+    events._thread_local.run_logger = None
+    artifacts: AsrArtifacts | None = None
+    try:
+        artifacts = _run_asr_alignment_impl(
+            video_path,
+            ctx=ctx,
+            job_id=job_id,
+            cache_job_id=cache_job_id,
+            cancel_event=cancel_event,
+        )
+        return artifacts
+    finally:
+        if artifacts is None:
+            # ASR re-raise / OOM / cancellation: artifacts was never built, so
+            # close the run logger FileHandler here to avoid accumulating
+            # Windows file locks. _close_artifacts_logger cannot be used because
+            # no artifacts instance exists on this path; these two helpers are
+            # exactly what it calls internally, and both are idempotent.
+            run_logger = getattr(events._thread_local, "run_logger", None)
+            if isinstance(run_logger, logging.Logger):
+                _close_run_logger(run_logger)
+                _clear_thread_run_logger(run_logger)
+
+
+def _run_asr_alignment_impl(
     video_path: str,
     *,
     ctx: JobContext,

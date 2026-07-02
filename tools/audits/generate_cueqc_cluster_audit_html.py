@@ -1621,7 +1621,8 @@ function setMediaForItem(row, seek) {{
   const info = MEDIA_BY_VIDEO[videoId] || {{}};
   const error = document.getElementById("mediaError");
   error.textContent = "";
-  if (activeVideo !== videoId) {{
+  const videoChanged = activeVideo !== videoId;
+  if (videoChanged) {{
     media.pause();
     media.innerHTML = "";
     if (info.audio_url) {{
@@ -1647,7 +1648,18 @@ function setMediaForItem(row, seek) {{
   document.getElementById("vttLink").href = info.vtt_url || "#";
   if (!info.audio_url) error.textContent = "音频文件未找到。";
   if (!info.vtt_url) error.textContent = [error.textContent, "字幕 VTT 未找到。"].filter(Boolean).join(" ");
-  if (seek && info.audio_url) media.currentTime = Number(row.start || 0);
+  // After a cross-video media.load(), readyState is 0 and an immediate seek is
+  // silently dropped (audio sits at 0:00). Mirror playCurrent: when the source
+  // just changed, wait for loadedmetadata before seeking; otherwise seek now.
+  if (seek && info.audio_url) {{
+    const target = Number(row.start || 0);
+    const doSeek = () => {{ try {{ media.currentTime = target; }} catch (_) {{}} }};
+    if (videoChanged && media.readyState < 1) {{
+      media.addEventListener("loadedmetadata", doSeek, {{ once: true }});
+    }} else {{
+      doSeek();
+    }}
+  }}
 }}
 function setMetrics(row) {{
   const tf = row.text_features || {{}};
