@@ -24,7 +24,6 @@ def test_user_prompt_uses_target_language_label():
 
 def test_system_prompt_does_not_authorize_asr_rewrites():
     prompt = translator._build_system_prompt(
-        expected_count=2,
         character_reference="小那海あや",
         target_lang="简体中文",
         glossary="",
@@ -40,7 +39,6 @@ def test_system_prompt_does_not_authorize_asr_rewrites():
 
 def test_system_prompt_fixes_requested_genital_terms_without_kikuka():
     prompt = translator._build_system_prompt(
-        expected_count=2,
         character_reference="",
         target_lang="简体中文",
         glossary="",

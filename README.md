@@ -416,6 +416,8 @@ uv run python -m <module> --help
 - `tools.audits.audit_nav`、`tools.audits.serve_static`、`tools.audits.serve_audits.ps1`、`tools.audits.serve_audits.sh`：维护和启动本地审计导航页。
 - `tools.audits.generate_cueqc_cluster_audit_html`：生成音频审计页，支持 chunk/context 播放、筛选排序和字幕对照。
 - `tools.audits.generate_cueqc_cluster_broadcast_html`：生成独立簇级 keep/drop 广播标注页；混簇/跳过只记录 abstain。
+- `tools.audits.generate_cueqc_prediction_audit_html`：根据 `cueqc_predictions.jsonl` 采样生成 CueQC 预测 false-drop 审计页，支持混采/高置信策略与字幕对照。
+- `tools.audits.generate_subtitle_ab_compare_audit_html`：生成整片旧/新字幕 A/B 对比审计页，用于评估边界或时间轴改动效果。
 - `tools.asr.convert_qwen3_asr_to_hf`：把 legacy 非 `-hf` Qwen3-ASR fine-tune safetensors 权重迁移到 Transformers-native `-hf` layout（`thinker.audio_tower.* -> model.audio_tower.*`、`thinker.audio_tower.proj{1,2}.* -> model.multi_modal_projector.linear_{1,2}.*`、`thinker.model.* -> model.language_model.*`，并复用 `Qwen/Qwen3-ASR-*-hf` 模板文件）。
 - `tools.asr.cueqc.export_semantic_boundary_candidates`：导出五段式 boundary runtime 的最终 semantic chunks。
 - `tools.asr.cueqc.label_semantic_pre_asr_with_omni`：为 Pre-ASR v11 生成 `definite_drop/definite_keep/ambiguous_ignore` 弱标签；上传前统一转为 16k mono 32kbps MP3，长音频使用保留语义中心的窗口。

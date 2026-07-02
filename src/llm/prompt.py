@@ -100,7 +100,6 @@ _SYSTEM_PROMPT_COMPACT = (
 
 
 def _build_system_prompt(
-    expected_count: int,
     character_reference: str,
     *,
     target_lang: str,
@@ -110,7 +109,6 @@ def _build_system_prompt(
     full_template: str | None = None,
     compact_template: str | None = None,
 ) -> str:
-    del expected_count
     name_guidance = _build_character_name_guidance(character_reference)
     template = (
         (compact_template or _SYSTEM_PROMPT_COMPACT)
@@ -150,7 +148,6 @@ def _build_translation_messages(
 ) -> list[dict]:
     if system_prompt is None:
         system_prompt = _build_system_prompt(
-            expected_count,
             (character_reference or "").strip(),
             target_lang=target_lang,
             glossary=glossary,
@@ -209,8 +206,7 @@ def _build_requested_ids_task(
 
 def _build_batch_messages(
     batch_segments: list[dict],
-    full_segments_summary: str | list[dict],
-    batch_offset: int,
+    full_segments_summary: str,
     character_reference: str,
     expected_count: int,
     batch_index: int = 0,
@@ -224,12 +220,9 @@ def _build_batch_messages(
     compact_system_prompt_enabled: bool = False,
 ) -> list[dict]:
     if requested_ids is None:
-        requested_ids = list(range(batch_offset, batch_offset + expected_count))
+        requested_ids = list(range(expected_count))
 
-    source_payload = source_payload_override or _serialize_segments(
-        batch_segments,
-        start_index=batch_offset,
-    )
+    source_payload = source_payload_override or _serialize_segments(batch_segments)
     messages = _build_translation_messages(
         source_payload=source_payload,
         expected_count=expected_count,
@@ -255,10 +248,9 @@ def _build_batch_messages(
         )
         return messages
 
-    if isinstance(full_segments_summary, str):
-        summary = full_segments_summary
-    else:
-        summary = _build_full_segments_summary(full_segments_summary)
+    # full_segments_summary is always a str at the call sites; the previous
+    # list-handling fallback (_build_full_segments_summary) was unreachable.
+    summary = full_segments_summary
     effective_target_lang = (target_lang or "简体中文").strip() or "简体中文"
 
     messages[0]["content"] = (

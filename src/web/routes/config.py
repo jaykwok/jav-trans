@@ -23,7 +23,13 @@ from asr.backends.qwen import (
 from core.config import DEFAULT_SETTINGS, load_config
 from utils import model_paths
 from utils.model_paths import PROJECT_ROOT, normalize_hf_endpoint
-from web.models import JobSpec, SettingsRead, SettingsUpdate
+from web.models import (
+    JobSpec,
+    SettingsRead,
+    SettingsUpdate,
+    normalize_llm_api_format as _normalize_llm_api_format,
+    normalize_llm_reasoning_effort as _normalize_llm_reasoning_effort,
+)
 
 
 router = APIRouter()
@@ -262,11 +268,6 @@ def _sync_hf_endpoint(value: str) -> str:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
 
 
-def _normalize_llm_reasoning_effort(value: str) -> str:
-    normalized = (value or "xhigh").strip().lower()
-    return normalized if normalized in {"medium", "xhigh"} else "xhigh"
-
-
 def _strip_llm_endpoint_path(base_url: str) -> str:
     normalized = (base_url or "").strip().rstrip("/")
     lower = normalized.lower()
@@ -393,7 +394,7 @@ async def get_settings() -> SettingsRead:
         model=model,
         hf_endpoint=hf_endpoint,
         translation_glossary=translation_glossary,
-        llm_api_format=llm_api_format if llm_api_format in {"chat", "responses"} else "chat",
+        llm_api_format=_normalize_llm_api_format(llm_api_format),
         llm_reasoning_effort=llm_reasoning_effort,
         target_lang=target_lang,
     )

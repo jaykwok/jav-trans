@@ -91,9 +91,14 @@ def read_srt(path: Path) -> list[dict[str, Any]]:
             lines = lines[1:]
         if not lines or "-->" not in lines[0]:
             continue
-        left, right = lines[0].split("-->", 1)
-        start = parse_timestamp(left)
-        end = parse_timestamp(right.split()[0])
+        # Tolerate malformed timestamps (empty `--> ` tail, unparsable values):
+        # skip the bad cue instead of aborting the whole audit build.
+        try:
+            left, right = lines[0].split("-->", 1)
+            start = parse_timestamp(left)
+            end = parse_timestamp(right.split()[0])
+        except (ValueError, IndexError):
+            continue
         cue_text = "\n".join(lines[1:]).strip()
         if end <= start:
             continue

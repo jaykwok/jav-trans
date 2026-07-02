@@ -46,21 +46,18 @@ def _webview_icon_arg() -> str | None:
 PORT = int(os.getenv("JAVTRANS_PORT", "17321"))
 EVENTS_PORT = int(os.getenv("JAVTRANS_EVENTS_PORT", "17322"))
 
-# Dirs to keep across runs (model caches, reusable state)
-_KEEP_DIRS = {
-    "tmp/cache/hf",
-    "tmp/cache/boundary",
-    "tmp/cache/audio-separator",
-    "tmp/web",          # keeps jobs.json + uploads; sub-cleanup below
-}
-
-# Globs inside tmp/ that are always safe to remove (one-time job artifacts)
+# Globs inside tmp/ that are always safe to remove (one-time run artifacts).
+# Coverage note: atexit cleanup is best-effort; it only sweeps these top-level
+# tmp/ entries plus tmp/web/jobs/<id>/audio/ (see below). It deliberately leaves
+# tmp/cache/ (model caches, reused across runs) and tmp/web/ (jobs.json + uploads)
+# untouched. The legacy names jobs_*/chunk_* never matched — runtime now writes
+# intermediate per-chunk audio under tmp/chunks/ and job state under tmp/web/jobs/.
 _CLEAN_GLOBS = [
-    "jobs_*",
-    "chunk_*",
-    "recovery_*",
-    "pytest_*",
-    "smoke_api_*",
+    "chunks",            # tmp/chunks/<id> — intermediate per-chunk audio segments
+    "asr_timeouts",      # tmp/asr_timeouts/ — ASR timeout diagnostic logs
+    "pytest",            # tmp/pytest/ — pytest tmp_path artifacts
+    "recovery_*",        # tmp/recovery_* — recovery state if present
+    "smoke_api_*",       # tmp/smoke_api_* — smoke-test artifacts if present
 ]
 
 

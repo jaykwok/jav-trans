@@ -6,6 +6,9 @@ import json
 
 
 _subscribers: list[asyncio.Queue[str]] = []
+# Strong refs for fire-and-forget progress tasks so they aren't GC'd before
+# completing (loop.create_task drops the ref otherwise).
+_pending_progress_tasks: set[asyncio.Task[None]] = set()
 
 
 async def subscribe() -> asyncio.Queue[str]:
@@ -55,7 +58,11 @@ def publish(event_line: str) -> None:
                 from web import pipeline_manager
 
                 loop = asyncio.get_running_loop()
-                loop.create_task(pipeline_manager.update_job_progress(job_id, progress))
+                task = loop.create_task(
+                    pipeline_manager.update_job_progress(job_id, progress)
+                )
+                _pending_progress_tasks.add(task)
+                task.add_done_callback(_pending_progress_tasks.discard)
             except RuntimeError:
                 pass
     for queue in list(_subscribers):

@@ -15,7 +15,7 @@ from boundary.base import SpeechSegment
 
 log = logging.getLogger(__name__)
 
-BOUNDARY_CACHE_VERSION = 14
+BOUNDARY_CACHE_VERSION = 15
 _AUDIO_SAMPLE_BYTES = 2 * 1024 * 1024
 _AUDIO_KEY_RE = re.compile(r"^[0-9a-fA-F]{8,40}$")
 
@@ -57,6 +57,20 @@ _BOUNDARY_ENV_KEYS = (
     "BOUNDARY_FRAME_SEQUENCE_INCLUDE_MFCC",
 )
 
+# Model checkpoint paths whose *content* must invalidate the cache when a file is
+# overwritten at the same path. Keys live in either boundary_config or
+# boundary_signature; they are fingerprinted by sha256 so a silent in-place model
+# swap can no longer reuse a stale cache entry.
+_BOUNDARY_CONFIG_CHECKPOINT_KEYS = (
+    "outer_edge_refiner_model_path",
+    "semantic_split_model_path",
+    "cut_edge_refiner_model_path",
+)
+_BOUNDARY_SIGNATURE_CHECKPOINT_KEYS = (
+    "model_path",
+    "scorer_checkpoint",
+)
+
 
 def cache_enabled() -> bool:
     return os.getenv("BOUNDARY_CACHE_ENABLED", "1").strip().lower() not in {
@@ -85,6 +99,7 @@ def build_cache_lookup(
         "boundary_backend_env": _env_signature(_BOUNDARY_BACKEND_ENV_KEYS),
         "boundary_config": _jsonable(boundary_config),
         "boundary_env": _env_signature(_BOUNDARY_ENV_KEYS),
+        "model_content": _model_content_fingerprint(boundary_config, boundary_signature),
     }
     digest = hashlib.sha1(_stable_json(signature).encode("utf-8")).hexdigest()[:16]
     audio_key = _safe_cache_component(str(audio["key"]))
@@ -241,6 +256,47 @@ def _sample_hash(path: Path) -> str:
 
 def _env_signature(names: Sequence[str]) -> dict[str, str]:
     return {name: os.getenv(name, "") for name in names if os.getenv(name, "") != ""}
+
+
+def _file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for block in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def _model_content_fingerprint(boundary_config: dict, boundary_signature: dict) -> dict[str, str]:
+    """sha256 of each referenced model checkpoint file.
+
+    The cache key historically depended only on model *paths*, so overwriting a
+    checkpoint at the same path silently reused a stale cache entry. Folding the
+    content hash of every checkpoint into the lookup signature makes such silent
+    swaps invalidate the cache. Missing paths (e.g. test fixtures) fall back to a
+    stable, path-sensitive sentinel so lookups remain deterministic.
+    """
+    config = _jsonable(boundary_config) if isinstance(boundary_config, dict) else {}
+    signature = _jsonable(boundary_signature) if isinstance(boundary_signature, dict) else {}
+    fingerprint: dict[str, str] = {}
+    for key in _BOUNDARY_CONFIG_CHECKPOINT_KEYS:
+        value = config.get(key)
+        if isinstance(value, str) and value:
+            fingerprint[key] = _checkpoint_content_token(value)
+    for key in _BOUNDARY_SIGNATURE_CHECKPOINT_KEYS:
+        value = signature.get(key)
+        if isinstance(value, str) and value:
+            fingerprint[key] = _checkpoint_content_token(value)
+    return fingerprint
+
+
+def _checkpoint_content_token(raw_path: str) -> str:
+    try:
+        path = Path(raw_path)
+        if path.is_file():
+            return _file_sha256(path)
+    except OSError:
+        pass
+    return f"missing:{raw_path}"
 
 
 def _stable_json(value: Any) -> str:

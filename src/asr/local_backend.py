@@ -1,5 +1,6 @@
 import concurrent.futures
 import gc
+import logging
 import multiprocessing as mp
 import os
 import re
@@ -19,6 +20,8 @@ from asr.backends.qwen import (
 )
 from asr.subtitle_timing import build_boundary_word_timestamps
 from asr.text_normalize import normalize_display_text, strip_text_punctuation
+
+logger = logging.getLogger(__name__)
 
 ASR_MODEL_ID = active_qwen_asr_model_id()
 ASR_MODEL_PATH = active_qwen_asr_model_path()
@@ -341,6 +344,13 @@ class LocalAsrBackend:
         self.model = None
         self.processor = None
         self.request_batch_size = ASR_BATCH_SIZE
+        # References to a previously timed-out in-proc generate that is
+        # still running (PyTorch generate cannot be hard-interrupted; see
+        # README). Kept so the next call can join the zombie before reusing
+        # or replacing self.model, preventing two models from coexisting in
+        # VRAM. See _join_zombie_worker.
+        self._zombie_future = None
+        self._zombie_executor = None
 
     def load(self, on_stage: Callable[[str], None] | None = None) -> None:
         from transformers import AutoModelForMultimodalLM, AutoProcessor
@@ -371,6 +381,15 @@ class LocalAsrBackend:
         _apply_generation_safety(self.model)
 
     def unload_model(self, on_stage: Callable[[str], None] | None = None) -> None:
+        # If a timed-out in-proc generate is still running, join it first;
+        # dropping self.model from under the zombie would let the next load
+        # double-allocate (VRAM OOM).
+        if not self._join_zombie_worker(on_stage=on_stage):
+            _notify(
+                on_stage,
+                "[WARN] ASR inproc 僵尸线程未结束，跳过卸载以防两模型同驻 OOM",
+            )
+            return
         if self.model is None:
             return
         _notify(on_stage, "卸载 ASR 文本模型...")
@@ -384,6 +403,72 @@ class LocalAsrBackend:
 
     def close(self) -> None:
         self.unload_model()
+
+    def _join_zombie_worker(
+        self,
+        *,
+        on_stage: Callable[[str], None] | None = None,
+    ) -> bool:
+        """Wait for a previously timed-out in-proc generate to finish.
+
+        PyTorch's native generate cannot be hard-interrupted mid-flight
+        (README: inproc 模式超时后无法中断正在跑的 generate), so a timed-out
+        transcribe leaves a worker thread running with the loaded model. If
+        we cleared self.model in that state the next load() would allocate a
+        second model while the zombie still holds the old one -> VRAM OOM.
+
+        We instead keep the zombie references on timeout and join here
+        (bounded by the transcription timeout) before any reuse/replace.
+        Returns True if no zombie is running (or it finished during the
+        wait); False if it is still running, in which case the caller must
+        NOT clear/replace self.model and must NOT allocate a second model.
+        """
+        future = self._zombie_future
+        if future is None:
+            return True
+        join_budget = _transcription_timeout_s()
+        _notify(
+            on_stage,
+            f"[WARN] 等待上一轮 ASR inproc 超时僵尸线程收尾 (上限 {join_budget}s)",
+        )
+        try:
+            future.result(timeout=join_budget)
+        except concurrent.futures.TimeoutError:
+            logger.warning(
+                "inproc ASR zombie generate still running after %ss join wait; "
+                "native generate cannot be hard-interrupted, keeping sole model "
+                "reference to avoid double-allocation VRAM OOM",
+                join_budget,
+            )
+            _notify(
+                on_stage,
+                "[WARN] 僵尸线程仍在运行，跳过本次操作以防两模型同驻 OOM",
+            )
+            return False
+        except Exception:
+            # Zombie generate raised; model state is unknown but the worker
+            # is done so clearing here has no concurrency risk.
+            logger.warning(
+                "inproc ASR zombie generate raised; will reload model on next load",
+                exc_info=True,
+            )
+            try:
+                del self.model
+            except Exception:
+                pass
+            self.model = None
+            self.processor = None
+
+        executor = self._zombie_executor
+        if executor is not None:
+            try:
+                executor.shutdown(wait=False)
+            except Exception:
+                pass
+        self._zombie_future = None
+        self._zombie_executor = None
+        _clear_cuda_cache(self.device)
+        return True
 
     def _build_text_result(
         self,
@@ -419,13 +504,46 @@ class LocalAsrBackend:
         audio_paths: list[str],
         on_stage: Callable[[str], None] | None = None,
     ) -> list[dict]:
+        language_hint = _asr_language() if _asr_force_language() else None
+
+        # If a prior in-proc generate timed out and is still running, join it
+        # (bounded) before touching the model -- never let load() spawn a
+        # second model while the zombie holds the old one (VRAM OOM).
+        if not self._join_zombie_worker(on_stage=on_stage):
+            timeout_s = _transcription_timeout_s()
+            _notify(
+                on_stage,
+                "[WARN] ASR inproc 僵尸线程未结束，跳过本批次以防两模型同驻 OOM",
+            )
+            return [
+                {
+                    "text": "",
+                    "raw_text": "",
+                    "duration": _get_wav_duration_or_zero(path),
+                    "language": language_hint or "Japanese",
+                    "normalized_path": str(Path(path).resolve()),
+                    "asr_generation": _qwen_generation_metadata(
+                        error_kind="timeout",
+                        error_detail=(
+                            f"skipped: inproc zombie still running after {timeout_s}s"
+                        ),
+                    ),
+                    "log": [
+                        (
+                            "TIMEOUT: skipped: inproc zombie still running "
+                            f"after {timeout_s}s"
+                        )
+                    ],
+                }
+                for path in audio_paths
+            ]
+
         if self.model is None:
             self.load(on_stage=on_stage)
         if not audio_paths:
             return []
 
         normalized_paths = [str(Path(audio_path).resolve()) for audio_path in audio_paths]
-        language_hint = _asr_language() if _asr_force_language() else None
 
         _notify(on_stage, "ASR 文本转录中...")
         asr_results = None
@@ -445,13 +563,23 @@ class LocalAsrBackend:
                 timed_out = True
                 future.cancel()
                 # The native generate keeps running in the worker thread and
-                # cannot be interrupted. Drop our model reference so the next
-                # call reloads a fresh model instead of sharing this one with
-                # the zombie generate (PyTorch generate is not concurrency-safe).
-                self.model = None
+                # cannot be hard-interrupted in-proc (see README). Keep the
+                # sole model reference and the running worker so the next call
+                # can join the zombie before reusing/reloading -- never drop
+                # self.model here, or load() would allocate a second model
+                # while the zombie still holds the old one (VRAM OOM).
+                self._zombie_future = future
+                self._zombie_executor = executor
+                logger.warning(
+                    "inproc ASR transcribe timed out after %ss; native generate "
+                    "cannot be hard-interrupted, deferring model reload until the "
+                    "zombie worker finishes (next call joins it)",
+                    _transcription_timeout_s(),
+                )
                 _notify(
                     on_stage,
-                    f"[WARN] ASR 超时 ({_transcription_timeout_s()}s)，跳过当前批次",
+                    f"[WARN] ASR 超时 ({_transcription_timeout_s()}s)，跳过当前批次"
+                    "（inproc 无法硬中断 generate）",
                 )
                 return [
                     {
@@ -546,6 +674,10 @@ class LocalAsrBackend:
         """
         if not chunks:
             return []
+        if not self._join_zombie_worker():
+            return [
+                {"ok": False, "error": "inproc zombie generate still running"}
+            ] * len(chunks)
         if self.model is None:
             self.load()
         try:

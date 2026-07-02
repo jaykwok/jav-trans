@@ -106,7 +106,6 @@ def test_translate_segments_uses_task_character_reference(monkeypatch):
 
 def test_character_name_guidance_is_conservative_for_unrelated_surnames():
     prompt = translator._build_system_prompt(
-        1,
         "小那海あや",
         target_lang="简体中文",
         glossary="",

@@ -2,7 +2,6 @@ from llm import translator
 def test_translation_glossary_empty_omits_glossary_section():
 
     prompt = translator._build_system_prompt(
-        expected_count=2,
         character_reference="",
         target_lang="简体中文",
         glossary="",
@@ -15,7 +14,6 @@ def test_translation_glossary_appends_user_terms():
     glossary = " 健太 - 男主 \n 小那海- 女主 "
 
     prompt = translator._build_system_prompt(
-        expected_count=2,
         character_reference="",
         target_lang="简体中文",
         glossary=glossary,

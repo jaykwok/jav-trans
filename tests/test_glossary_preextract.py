@@ -5,7 +5,6 @@ import pytest
 from llm import translator
 def test_extra_glossary_injected_into_system_prompt_and_batch_user_message():
     prompt = translator._build_system_prompt(
-        expected_count=2,
         character_reference="",
         target_lang="简体中文",
         glossary="",
@@ -17,7 +16,6 @@ def test_extra_glossary_injected_into_system_prompt_and_batch_user_message():
     messages = translator._build_batch_messages(
         [{"start": 0.0, "end": 1.0, "text": "あなた"}],
         "0: あなた",
-        0,
         "",
         1,
         target_lang="简体中文",

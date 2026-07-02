@@ -27,13 +27,32 @@ from pipeline.ids import sanitize_job_id
 import main as pipeline_main
 from main import run_asr_alignment, run_translation_and_write
 from utils.model_paths import PROJECT_ROOT
-from web.models import JobSpec, JobState
+from web.models import (
+    JobSpec,
+    JobState,
+    normalize_llm_api_format as _normalize_llm_api_format,
+    normalize_llm_reasoning_effort as _normalize_llm_reasoning_effort,
+)
 
 
 log = logging.getLogger(__name__)
 gpu_queue: asyncio.Queue[JobState] = asyncio.Queue()
 trans_queue: asyncio.Queue[tuple[JobState, Any]] = asyncio.Queue()
-_EXECUTOR_MAX_WORKERS = 4
+
+
+def _executor_max_workers() -> int:
+    # TRANSLATION_PARALLEL_VIDEOS drives how many translation_worker coroutines
+    # start; translation jobs plus the lone ASR worker all run_in_executor into
+    # this same pool, so size it to follow that env instead of silently capping
+    # it at 4. The +1 gives the ASR path a slot alongside translation workers.
+    try:
+        parallel = max(1, int(os.getenv("TRANSLATION_PARALLEL_VIDEOS", "2")))
+    except (TypeError, ValueError):
+        parallel = 2
+    return max(4, 1 + parallel)
+
+
+_EXECUTOR_MAX_WORKERS = _executor_max_workers()
 _executor = ThreadPoolExecutor(max_workers=_EXECUTOR_MAX_WORKERS)
 
 _jobs: dict[str, JobState] = {}
@@ -55,8 +74,11 @@ def _utc_now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="milliseconds")
 
 
-def _write_jobs_unlocked() -> None:
-    payload = [job.model_dump() for job in _jobs.values()]
+def _write_jobs_snapshot(snapshot: list[JobState]) -> None:
+    # Persist a pre-captured snapshot. Callers capture the snapshot inside
+    # _state_lock and call this outside the lock so the blocking dumps+replace
+    # does not extend the critical section.
+    payload = [job.model_dump() for job in snapshot]
     _jobs_path.parent.mkdir(parents=True, exist_ok=True)
     tmp_path = _jobs_path.with_name(f"{_jobs_path.name}.{os.getpid()}.tmp")
     tmp_path.write_text(
@@ -66,9 +88,8 @@ def _write_jobs_unlocked() -> None:
     tmp_path.replace(_jobs_path)
 
 
-async def _persist_jobs() -> None:
-    async with _state_lock:
-        _write_jobs_unlocked()
+def _write_jobs_unlocked() -> None:
+    _write_jobs_snapshot(list(_jobs.values()))
 
 
 _ACTIVE_STATUSES = {"queued", "asr", "translating", "writing"}
@@ -80,16 +101,25 @@ async def load_jobs() -> None:
         return
     try:
         payload = json.loads(_jobs_path.read_text(encoding="utf-8"))
-        if not isinstance(payload, list):
-            return
-        loaded = {
-            job.id: job
-            for item in payload
-            if isinstance(item, dict)
-            for job in [JobState.model_validate(item)]
-        }
     except Exception:
+        log.exception("Failed to read jobs state from %s", _jobs_path)
         return
+    if not isinstance(payload, list):
+        return
+    loaded: dict[str, JobState] = {}
+    for item in payload:
+        if not isinstance(item, dict):
+            continue
+        try:
+            job = JobState.model_validate(item)
+        except Exception as exc:
+            log.warning(
+                "Skipping malformed job record in %s: %s",
+                _jobs_path,
+                exc,
+            )
+            continue
+        loaded[job.id] = job
     async with _state_lock:
         _jobs.clear()
         _jobs.update(loaded)
@@ -113,6 +143,7 @@ async def _set_job(
     error: str | None = None,
     expected_cancel_event: threading.Event | None = None,
 ) -> JobState:
+    persist_snapshot: list[JobState] | None = None
     async with _state_lock:
         current = _jobs.get(job.id)
         if current is None:
@@ -133,8 +164,9 @@ async def _set_job(
         if error is not None:
             current.error = error
         _jobs[job.id] = current
-        _write_jobs_unlocked()
-        return current
+        persist_snapshot = list(_jobs.values())
+    _write_jobs_snapshot(persist_snapshot)
+    return current
 
 
 def _new_cancel_event() -> threading.Event:
@@ -202,18 +234,6 @@ def _runtime_setting(key: str, fallback: str = "") -> str:
     if key in os.environ:
         return os.environ.get(key, "").strip()
     return str(DEFAULT_SETTINGS.get(key, fallback)).strip()
-
-
-def _normalize_llm_api_format(value: str) -> str:
-    normalized = (value or "chat").strip().lower()
-    return normalized if normalized in {"chat", "responses"} else "chat"
-
-
-def _normalize_llm_reasoning_effort(value: str) -> str:
-    normalized = (value or "xhigh").strip().lower()
-    if normalized in {"medium", "xhigh"}:
-        return normalized
-    return "xhigh"
 
 
 def _snapshot_translation_settings(spec: JobSpec) -> JobSpec:
@@ -549,6 +569,7 @@ async def remove_job(job_id: str) -> bool:
         if job.status in _FINISHED_STATUSES:
             _jobs.pop(job_id, None)
             _cancel_events.pop(job_id, None)
+            _last_progress_write_ts.pop(job_id, None)
             _write_jobs_unlocked()
             remove_temp_for_job = job_id
 
@@ -570,6 +591,7 @@ async def remove_finished_jobs() -> int:
         for job_id in job_ids:
             _jobs.pop(job_id, None)
             _cancel_events.pop(job_id, None)
+            _last_progress_write_ts.pop(job_id, None)
         if job_ids:
             _write_jobs_unlocked()
     for job_id in job_ids:
@@ -592,6 +614,7 @@ async def evict_old_jobs(max_age_hours: int = 48) -> int:
         for job_id in job_ids:
             _jobs.pop(job_id, None)
             _cancel_events.pop(job_id, None)
+            _last_progress_write_ts.pop(job_id, None)
         if job_ids:
             _write_jobs_unlocked()
     for job_id in job_ids:
@@ -606,6 +629,7 @@ async def _eviction_loop() -> None:
 
 
 async def update_job_progress(job_id: str, progress: dict[str, Any]) -> None:
+    persist_snapshot: list[JobState] | None = None
     async with _state_lock:
         job = _jobs.get(job_id)
         if job is None:
@@ -621,8 +645,10 @@ async def update_job_progress(job_id: str, progress: dict[str, Any]) -> None:
         # Throttle disk persistence per job so one busy job cannot starve
         # another job's progress from being written within the 2s window.
         if now - _last_progress_write_ts.get(job_id, 0.0) >= 2.0:
-            _write_jobs_unlocked()
+            persist_snapshot = list(_jobs.values())
             _last_progress_write_ts[job_id] = now
+    if persist_snapshot is not None:
+        _write_jobs_snapshot(persist_snapshot)
 
 
 async def shutdown_executor() -> None:

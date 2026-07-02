@@ -239,37 +239,6 @@ def _fallback_text_position(text: str, ratio: float) -> int:
     return max(1, min(len(stripped) - 1, int(round(len(stripped) * ratio))))
 
 
-def _choose_text_split_positions(text: str, split_count: int) -> list[int]:
-    if split_count <= 0:
-        return []
-    stripped = str(text or "")
-    if len(stripped) <= 1:
-        return []
-    candidate_positions = _candidate_text_boundaries(stripped)
-    ratios_by_position = _text_unit_prefix_ratios(stripped, candidate_positions)
-    selected: list[int] = []
-    for index in range(1, split_count + 1):
-        target_ratio = index / float(split_count + 1)
-        available = [position for position in candidate_positions if position not in selected]
-        if available:
-            position = min(
-                available,
-                key=lambda item: (
-                    abs(ratios_by_position.get(item, 0.0) - target_ratio),
-                    item,
-                ),
-            )
-        else:
-            position = _fallback_text_position(stripped, target_ratio)
-            while position in selected and position + 1 < len(stripped):
-                position += 1
-            while position in selected and position > 1:
-                position -= 1
-        if 0 < position < len(stripped):
-            selected.append(position)
-    return sorted(set(selected))
-
-
 def _split_text_by_positions(text: str, positions: list[int]) -> list[str]:
     raw = str(text or "")
     if not positions:
@@ -547,45 +516,6 @@ def _long_display_dp_plan(
         "nodes": [nodes[index] for index in path],
         "score": best[last][0],
     }
-
-
-def _choose_display_split_times(
-    block: dict,
-    *,
-    text_ratios: list[float],
-    options: SubtitleOptions,
-) -> list[float]:
-    start = float(block["start"])
-    end = max(start, float(block["end"]))
-    if not text_ratios:
-        return []
-    duration = end - start
-    max_display_s = _subtitle_max_display_duration_s(options)
-    if duration <= 0.0 or max_display_s <= 0.0:
-        return []
-    min_duration_s = _subtitle_min_duration_s(options)
-    snap_window_s = _weak_cut_snap_window_s(duration, options)
-    weak_times = _weak_cut_times(block, start=start, end=end)
-    split_times: list[float] = []
-    previous = start
-    for index, ratio in enumerate(text_ratios):
-        remaining = len(text_ratios) - index
-        target = start + duration * max(0.0, min(1.0, ratio))
-        lower = max(previous + min_duration_s, end - max_display_s * (remaining + 1))
-        upper = min(end - min_duration_s * remaining, previous + max_display_s)
-        if upper <= lower:
-            chosen = max(previous + 0.05, min(target, end - 0.05 * remaining))
-        else:
-            available = [
-                time_s
-                for time_s in weak_times
-                if lower <= time_s <= upper and time_s not in split_times
-                and abs(time_s - target) <= snap_window_s
-            ]
-            chosen = min(available, key=lambda item: abs(item - target)) if available else min(max(target, lower), upper)
-        split_times.append(chosen)
-        previous = chosen
-    return sorted(time for time in split_times if start < time < end)
 
 
 def _filter_candidates_for_window(
@@ -980,7 +910,7 @@ def write_srt(
     blocks = [dict(block) for block in blocks]
     path_obj = Path(path)
     path_obj.parent.mkdir(parents=True, exist_ok=True)
-    with path_obj.open("w", encoding="utf-8") as f:
+    with path_obj.open("w", encoding="utf-8-sig") as f:
         for idx, block in enumerate(blocks, 1):
             start = _safe_float(block.get("display_start", block.get("start")), 0.0)
             end = max(start + 0.05, _safe_float(block.get("display_end", block.get("end")), start))
@@ -992,7 +922,11 @@ def write_srt(
 
             start_str = format_timestamp(start)
             end_str   = format_timestamp(end)
-            wrapped = _wrap_subtitle_text(block.get("zh_text", ""), options=options)
+            zh_text = str(block.get("zh_text", "")).strip()
+            if not zh_text:
+                logger.warning("Empty translated subtitle at index %s; using placeholder", idx)
+                zh_text = "「未翻译」"
+            wrapped = _wrap_subtitle_text(zh_text, options=options)
             f.write(f"{idx}\n{start_str} --> {end_str}\n{wrapped}\n\n")
     return blocks
 
@@ -1006,7 +940,7 @@ def write_bilingual_srt(
     """blocks: [{start, end, ja_text, zh_text}] — Japanese line above Chinese."""
     options = _coerce_options(options)
     blocks = [dict(block) for block in blocks]
-    with open(path, "w", encoding="utf-8") as f:
+    with open(path, "w", encoding="utf-8-sig") as f:
         for idx, block in enumerate(blocks, 1):
             start = _safe_float(block.get("display_start", block.get("start")), 0.0)
             end = max(start + 0.05, _safe_float(block.get("display_end", block.get("end")), start))

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import html
 import json
 import random
 import sys
@@ -784,11 +785,11 @@ def _page_html(
     )
     return (
         HTML_TEMPLATE
-        .replace("%%TITLE%%", title)
+        .replace("%%TITLE%%", html.escape(title))
         .replace("%%REASON_TAG_BUTTONS%%", reason_tag_buttons)
         .replace("%%ROWS_JSON%%", json_for_script(rows))
         .replace("%%CUES_JSON%%", json_for_script(cues_by_video))
-        .replace("%%DATASET_ID_JSON%%", json.dumps(dataset_id, ensure_ascii=False))
+        .replace("%%DATASET_ID_JSON%%", json_for_script(dataset_id))
         .replace("%%LABEL_SCHEMA%%", LABEL_SCHEMA)
     )
 

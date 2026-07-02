@@ -11,7 +11,9 @@ def _word(text: str, start: float, end: float) -> dict:
 
 
 def _cue_count(content: str) -> int:
-    return len(re.findall(r"^\d+$", content, flags=re.MULTILINE))
+    # write_srt / write_bilingual_srt emit a UTF-8 BOM for CJK player compat;
+    # strip it so the first cue index ("1") still matches.
+    return len(re.findall(r"^\d+$", content.lstrip("﻿"), flags=re.MULTILINE))
 
 
 def test_bilingual_srt_uses_placeholder_for_empty_translation(tmp_path, caplog):
