@@ -48,6 +48,9 @@ def test_aligned_cache_signature_uses_full_subtitle_options(
         backend_label="mock_asr",
     )[1]
 
+    assert "ASR_STAGE_WORKER_MODE" not in expected["asr_stage_config"]
+    assert "ASR_WORKER_MODE" not in expected["asr_stage_config"]
+    assert "ASR_BATCH_SIZE" not in expected["asr_stage_config"]
     assert expected["asr_stage_config"]["BOUNDARY_FEATURE_FRAME_HOP_S"] == "0.02"
     assert "BOUNDARY_FRAME_HOP_S" not in expected["asr_stage_config"]
     assert expected["subtitle"]["timeline_mode"] == "alignment"

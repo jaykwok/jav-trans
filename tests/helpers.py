@@ -30,6 +30,8 @@ def make_job_context(
     video = Path(video_path)
     effective_job_id = sanitize_job_id(job_id or video.stem)
     job_temp_dir = Path(job_temp_root) / effective_job_id
+    effective_advanced = {"ASR_STAGE_WORKER_MODE": "inproc"}
+    effective_advanced.update(dict(advanced or {}))
     return JobContext(
         asr_backend=asr_backend,
         subtitle_mode=subtitle_mode,
@@ -45,7 +47,7 @@ def make_job_context(
         keep_temp_files=keep_temp_files,
         run_log_enabled=run_log_enabled,
         run_log_dir=str(run_log_dir),
-        advanced=dict(advanced or {}),
+        advanced=effective_advanced,
     )
 
 

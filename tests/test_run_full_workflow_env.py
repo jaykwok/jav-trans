@@ -72,7 +72,7 @@ def test_run_full_workflow_parse_args_uses_loaded_env(monkeypatch):
     monkeypatch.setenv("ASR_BATCH_SIZE", "auto")
     monkeypatch.setenv(
         "ASR_BATCH_SIZE_BY_REPO",
-        "jaykwok/Qwen3-ASR-0.6B-JA-Anime-Galgame-hf=24,"
+        "jaykwok/Qwen3-ASR-0.6B-JA-Anime-Galgame-hf=12,"
         "jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame-hf=4",
     )
     outer_mapping = "jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame-hf=src/boundary/checkpoints/outer.pt"
@@ -103,6 +103,7 @@ def test_run_full_workflow_parse_args_uses_loaded_env(monkeypatch):
     )
 
     assert args.asr_backend == "jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame-hf"
+    assert args.asr_stage_worker_mode == "subprocess"
     assert args.asr_worker_mode == "inproc"
     assert args.asr_model_path == ""
     assert args.asr_batch_size == "auto"
@@ -176,6 +177,7 @@ def test_run_full_workflow_context_carries_boundary_env(monkeypatch, tmp_path):
     ctx = run_full_workflow.build_context(args=args, paths=paths, video=video)
 
     assert ctx.advanced["ASR_BATCH_SIZE"] == "auto"
+    assert ctx.advanced["ASR_STAGE_WORKER_MODE"] == "subprocess"
     assert ctx.advanced["ASR_WORKER_MODE"] == "inproc"
     assert ctx.advanced["ASR_BATCH_SIZE_BY_REPO"] == batch_table
     assert ctx.advanced["OUTER_EDGE_REFINER_MODEL_PATH_BY_REPO"] == outer_mapping
@@ -203,7 +205,7 @@ def test_run_full_workflow_cli_batch_overrides_loaded_env(monkeypatch):
     monkeypatch.setenv("ASR_WORKER_MODE", "subprocess")
     monkeypatch.setenv(
         "ASR_BATCH_SIZE_BY_REPO",
-        "jaykwok/Qwen3-ASR-0.6B-JA-Anime-Galgame-hf=24,"
+        "jaykwok/Qwen3-ASR-0.6B-JA-Anime-Galgame-hf=12,"
         "jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame-hf=4",
     )
     monkeypatch.delenv("CUEQC_SHADOW_ENABLED", raising=False)
@@ -227,6 +229,7 @@ def test_run_full_workflow_cli_batch_overrides_loaded_env(monkeypatch):
     run_full_workflow.configure_env(args)
 
     assert run_full_workflow.os.environ["ASR_BACKEND"] == "jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame-hf"
+    assert run_full_workflow.os.environ["ASR_STAGE_WORKER_MODE"] == "subprocess"
     assert run_full_workflow.os.environ["ASR_WORKER_MODE"] == "subprocess"
     assert run_full_workflow.os.environ["ASR_BATCH_SIZE"] == "12"
     assert not hasattr(args, "cueqc_shadow_enabled")

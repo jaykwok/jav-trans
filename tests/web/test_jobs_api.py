@@ -439,6 +439,7 @@ async def _test_settings_creates_env_file_on_first_save(tmp_path, monkeypatch):
     assert env_path.exists()
     text = env_path.read_text(encoding="utf-8")
     assert "# Defaults live in src/core/config.py" in text
+    assert "# ASR_STAGE_WORKER_MODE=subprocess" in text
     assert "# ASR_BATCH_SIZE_BY_REPO=" in text
     values = dotenv_values(env_path)
     assert values["API_KEY"] == "first-run-key"
