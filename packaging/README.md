@@ -7,7 +7,7 @@ with `uv venv` and installing dependencies:
 .\packaging\build_windows.ps1 -Clean
 ```
 
-The build creates `dist/JAVTrans/JAVTrans.exe` as an onedir PyInstaller package.
+The build creates `dist/jav-trans/jav-trans.exe` as an onedir PyInstaller package.
 It bundles:
 
 - the Python runtime and installed Python dependencies from the active uv-managed environment
@@ -53,7 +53,7 @@ selection the Web UI runs a short CUDA probe in a child process; if the driver i
 too old or CUDA cannot initialize, it shows a user-facing prompt to update the
 NVIDIA driver before running ASR.
 
-At runtime, writable files are created next to `JAVTrans.exe`:
+At runtime, writable files are created next to `jav-trans.exe`:
 
 - `.env` for persisted settings
 - `models/` for user-downloaded or user-replaced models
@@ -66,7 +66,7 @@ To create one local 7-Zip archive:
 .\packaging\archive_release.ps1
 ```
 
-The default output is `dist/release-assets/JAVTrans-windows-x64.7z`. The archive
+The default output is `dist/release-assets/jav-trans-windows-x64.7z`. The archive
 script creates a single `.7z` file and no split volumes. Publish this large
 Windows bundle through external storage such as a netdisk; GitHub Releases are
 expected to publish source code and release notes only.

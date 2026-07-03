@@ -7,6 +7,8 @@ from pathlib import Path
 
 import xxhash
 
+from utils.subprocess_tools import no_window_subprocess_kwargs
+
 _AUDIO_SAMPLE_RATE = max(8000, int(os.getenv("AUDIO_SAMPLE_RATE", "16000")))
 _AUDIO_CHANNELS = max(1, int(os.getenv("AUDIO_CHANNELS", "1")))
 _AUDIO_BASE_FILTER = os.getenv("AUDIO_FILTER", "highpass=f=70,lowpass=f=7600").strip()
@@ -114,7 +116,12 @@ def extract_audio(video_path: str, out_path: str) -> None:
     command.extend([out_path, "-loglevel", "error"])
     timeout_s = _audio_extract_timeout_s(video_path)
     try:
-        subprocess.run(command, check=True, timeout=timeout_s)
+        subprocess.run(
+            command,
+            check=True,
+            timeout=timeout_s,
+            **no_window_subprocess_kwargs(),
+        )
     except subprocess.TimeoutExpired as exc:
         raise TimeoutError(f"ffmpeg audio extraction timed out after {timeout_s:.1f}s: {video_path}") from exc
 
@@ -138,6 +145,7 @@ def probe_video_duration_s(video_path: str) -> float | None:
             text=True,
             encoding="utf-8",
             errors="replace",
+            **no_window_subprocess_kwargs(),
         )
         duration = float(completed.stdout.strip())
     except (OSError, subprocess.CalledProcessError, TypeError, ValueError):

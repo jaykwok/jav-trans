@@ -140,3 +140,83 @@ def test_short_core_prefers_continue_below_high_threshold():
         cut_refiner=_CutRefiner(),
     )
     assert len(chunks) == 1
+
+
+def test_split_inference_batches_candidates_without_cross_island_decision_leakage(monkeypatch):
+    class MultiOuterRefiner(_OuterRefiner):
+        def predict(self, *, frame_features, scalar_features):
+            assert frame_features.shape[0] == 2
+            return [
+                OuterEdgePrediction(0.0, 0.0, 0.9, 0.9),
+                OuterEdgePrediction(0.0, 0.0, 0.9, 0.9),
+            ]
+
+    class RecordingSplitVerifier(_SplitVerifier):
+        def __init__(self):
+            self.call_shapes = []
+
+        def decide(self, *, frame_features, scalar_features):
+            self.call_shapes.append((frame_features.shape, scalar_features.shape))
+            assert frame_features.shape[0] == 2
+            return [
+                SplitDecision("cut", 0.95, 0.03, 0.02),
+                SplitDecision("continue", 0.03, 0.95, 0.02),
+            ]
+
+    monkeypatch.setenv("SEMANTIC_SPLIT_INFERENCE_BATCH_SIZE", "128")
+    verifier = RecordingSplitVerifier()
+    provider = FrameSequenceFeatureProvider(
+        duration_s=20.0,
+        frame_hop_s=0.02,
+        ptm=np.zeros((1000, 4), dtype=np.float32),
+        mfcc=np.zeros((1000, 2), dtype=np.float32),
+        config=FrameSequenceFeatureConfig(max_ptm_dims=4),
+    )
+    segments = [
+        SpeechSegment(
+            start=0.0,
+            end=8.0,
+            weak_cut_candidates=[
+                {
+                    "kind": "proposal",
+                    "time_s": 4.0,
+                    "frame": 200,
+                    "score": 0.8,
+                    "prominence": 0.2,
+                    "speech_valley": 0.5,
+                    "strength": 1.5,
+                }
+            ],
+        ),
+        SpeechSegment(
+            start=10.0,
+            end=18.0,
+            weak_cut_candidates=[
+                {
+                    "kind": "proposal",
+                    "time_s": 14.0,
+                    "frame": 700,
+                    "score": 0.8,
+                    "prominence": 0.2,
+                    "speech_valley": 0.5,
+                    "strength": 1.5,
+                }
+            ],
+        ),
+    ]
+
+    chunks = build_semantic_boundary_chunks(
+        segments,
+        duration_s=20.0,
+        speech_probabilities=np.ones(1000, dtype=np.float32),
+        feature_provider=provider,
+        outer_refiner=MultiOuterRefiner(),
+        split_verifier=verifier,
+        cut_refiner=_CutRefiner(),
+    )
+
+    assert len(verifier.call_shapes) == 1
+    assert [round(chunk.start, 2) for chunk in chunks] == [0.0, 4.08, 10.0]
+    assert [round(chunk.end, 2) for chunk in chunks] == [4.08, 8.0, 18.0]
+    assert len(chunks[0].primary_cut_candidates) == 1
+    assert chunks[2].primary_cut_candidates == []

@@ -3,7 +3,7 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
-from utils.runtime_paths import runtime_path
+from utils.runtime_paths import resource_path, runtime_path
 
 QWEN_ASR_06B_REPO_ID = "jaykwok/Qwen3-ASR-0.6B-JA-Anime-Galgame-hf"
 QWEN_ASR_17B_REPO_ID = "jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame-hf"
@@ -174,13 +174,22 @@ def checkpoint_path_for_repo_env(
             f"{mapping_env} has no checkpoint for ASR repo {selected_repo!r}. "
             "Add a '<repo_id>=<checkpoint_path>' entry for the selected ASR backend."
         )
-    checkpoint_path = runtime_path(Path(path).expanduser())
-    if not checkpoint_path.exists() or not checkpoint_path.is_file():
-        raise FileNotFoundError(
-            f"{mapping_env} checkpoint for ASR repo {selected_repo!r} does not exist: "
-            f"{path} (resolved: {checkpoint_path})"
-        )
-    return str(checkpoint_path)
+    expanded_path = Path(path).expanduser()
+    candidate_paths = [runtime_path(expanded_path)]
+    if not expanded_path.is_absolute():
+        resource_candidate = resource_path(expanded_path)
+        if resource_candidate != candidate_paths[0]:
+            candidate_paths.append(resource_candidate)
+    for checkpoint_path in candidate_paths:
+        if checkpoint_path.exists() and checkpoint_path.is_file():
+            return str(checkpoint_path)
+    checked = ", ".join(str(candidate) for candidate in candidate_paths)
+    if not checked:
+        checked = str(runtime_path(expanded_path))
+    raise FileNotFoundError(
+        f"{mapping_env} checkpoint for ASR repo {selected_repo!r} does not exist: "
+        f"{path} (checked: {checked})"
+    )
 
 
 def validate_checkpoint_repo_id(

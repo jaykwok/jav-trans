@@ -11,6 +11,7 @@ from fastapi import APIRouter, HTTPException
 from starlette.responses import FileResponse
 
 from utils.model_paths import PROJECT_ROOT
+from utils.subprocess_tools import no_window_subprocess_kwargs
 from web.pipeline_manager import get_job
 from web.models import JobState
 
@@ -147,6 +148,7 @@ if ($dialog.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) {
         text=True,
         encoding="utf-8",
         errors="replace",
+        **no_window_subprocess_kwargs(),
     )
     if completed.returncode != 0:
         return []
@@ -179,6 +181,7 @@ if ($dialog.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) {
         text=True,
         encoding="utf-8",
         errors="replace",
+        **no_window_subprocess_kwargs(),
     )
     if completed.returncode != 0:
         return ""

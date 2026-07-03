@@ -10,7 +10,7 @@ def _extract_filter_arg(command: list[str]) -> str:
 def test_extract_audio_uses_dynaudnorm_by_default(monkeypatch, tmp_path):
     calls = []
 
-    def fake_run(command, check, timeout):
+    def fake_run(command, check, timeout, **kwargs):
         calls.append(command)
         assert check is True
         assert timeout == 30.0
@@ -30,7 +30,7 @@ def test_extract_audio_uses_dynaudnorm_by_default(monkeypatch, tmp_path):
 def test_extract_audio_can_disable_dynaudnorm(monkeypatch, tmp_path):
     calls = []
 
-    def fake_run(command, check, timeout):
+    def fake_run(command, check, timeout, **kwargs):
         calls.append(command)
         assert check is True
         assert timeout == 30.0
@@ -47,7 +47,7 @@ def test_extract_audio_can_disable_dynaudnorm(monkeypatch, tmp_path):
 
 
 def test_extract_audio_timeout_raises_clear_error(monkeypatch, tmp_path):
-    def fake_run(command, check, timeout):
+    def fake_run(command, check, timeout, **kwargs):
         raise pipeline_audio.subprocess.TimeoutExpired(command, timeout)
 
     monkeypatch.setenv("AUDIO_EXTRACT_TIMEOUT_S", "30")

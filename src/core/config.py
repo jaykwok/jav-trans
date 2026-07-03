@@ -100,6 +100,9 @@ DEFAULT_SETTINGS: dict[str, str] = {
     "BOUNDARY_FEATURE_FRAME_HOP_S": "0.02",
     "OUTER_EDGE_REFINER_DEVICE": "auto",
     "SEMANTIC_SPLIT_DEVICE": "auto",
+    # Semantic Split Verifier inference batch. The per-candidate temporal axis is
+    # inside each sample; this only batches independent candidates.
+    "SEMANTIC_SPLIT_INFERENCE_BATCH_SIZE": "128",
     "CUT_EDGE_REFINER_DEVICE": "auto",
     "BOUNDARY_FRAME_SEQUENCE_LEFT_CONTEXT_S": "0.60",
     "BOUNDARY_FRAME_SEQUENCE_RIGHT_CONTEXT_S": "0.60",
@@ -165,9 +168,9 @@ DEFAULT_SETTINGS: dict[str, str] = {
     # Persistent diagnostics root. Runtime creates one subdirectory per job id.
     "RUN_LOG_DIR": "./tmp/log",
     # Internal TCP port used by the web console to receive StageEvent lines.
-    "JAVTRANS_EVENTS_PORT": "17322",
+    "JAV_TRANS_EVENTS_PORT": "17322",
     # Web console HTTP port used by launcher.py.
-    "JAVTRANS_PORT": "17321",
+    "JAV_TRANS_PORT": "17321",
 
     # --- Audio ---
     # 1 applies dynamic normalization before ASR.

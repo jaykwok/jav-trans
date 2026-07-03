@@ -875,7 +875,7 @@ def write_html_report(path: Path, payload: dict) -> None:
 <html lang="zh-CN">
 <head>
   <meta charset="utf-8">
-  <title>JAVTrans Test Set Quality Eval</title>
+  <title>jav-trans Test Set Quality Eval</title>
   <style>
     body {{ font-family: system-ui, sans-serif; margin: 24px; color: #1f2933; }}
     table {{ border-collapse: collapse; width: 100%; font-size: 13px; }}
@@ -885,7 +885,7 @@ def write_html_report(path: Path, payload: dict) -> None:
   </style>
 </head>
 <body>
-  <h1>JAVTrans Test Set Quality Eval</h1>
+  <h1>jav-trans Test Set Quality Eval</h1>
   <h2>Summary</h2>
   <ul>{summary_items}</ul>
   <h2>Cases</h2>

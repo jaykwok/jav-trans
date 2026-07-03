@@ -5,6 +5,7 @@ import os
 import re
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from functools import lru_cache
@@ -32,6 +33,7 @@ from core.config import (
 from utils import model_paths
 from utils.model_paths import PROJECT_ROOT
 from utils.runtime_paths import is_frozen
+from utils.subprocess_tools import no_window_subprocess_kwargs
 from web.models import (
     JobSpec,
     SettingsRead,
@@ -136,7 +138,7 @@ _ENV_FILE_LOCK = threading.Lock()
 
 def _initial_env_template_lines() -> list[str]:
     return [
-        "# JAVTrans local overrides.\n",
+        "# jav-trans local overrides.\n",
         "# Defaults live in src/core/config.py. Keep these examples commented unless\n",
         "# you want to override the built-in runtime defaults on this machine.\n",
         "\n",
@@ -298,6 +300,21 @@ def _parse_probe_json(stdout: str) -> dict[str, Any] | None:
 def _cuda_environment_status() -> dict[str, Any]:
     env = dict(os.environ)
     env.setdefault("PYTHONIOENCODING", "utf-8")
+    probe_output_path: Path | None = None
+    if is_frozen():
+        try:
+            probe_dir = PROJECT_ROOT / "tmp"
+            probe_dir.mkdir(parents=True, exist_ok=True)
+            fd, path_text = tempfile.mkstemp(
+                prefix="cuda-probe-",
+                suffix=".json",
+                dir=probe_dir,
+            )
+        except OSError:
+            fd, path_text = tempfile.mkstemp(prefix="jav-trans-cuda-probe-", suffix=".json")
+        os.close(fd)
+        probe_output_path = Path(path_text)
+        env["JAV_TRANS_CUDA_PROBE_OUTPUT"] = str(probe_output_path)
     try:
         completed = subprocess.run(
             _cuda_probe_command(),
@@ -308,8 +325,11 @@ def _cuda_environment_status() -> dict[str, Any]:
             encoding="utf-8",
             errors="replace",
             timeout=20,
+            **no_window_subprocess_kwargs(),
         )
     except Exception as exc:  # noqa: BLE001 - diagnostic endpoint
+        if probe_output_path is not None:
+            probe_output_path.unlink(missing_ok=True)
         return {
             "status": "error",
             "ok": False,
@@ -317,6 +337,13 @@ def _cuda_environment_status() -> dict[str, Any]:
             "message": f"CUDA 环境检测无法启动：{type(exc).__name__}: {exc}",
         }
     payload = _parse_probe_json(completed.stdout)
+    if payload is None and probe_output_path is not None and probe_output_path.exists():
+        try:
+            payload = _parse_probe_json(probe_output_path.read_text(encoding="utf-8"))
+        except OSError:
+            payload = None
+    if probe_output_path is not None:
+        probe_output_path.unlink(missing_ok=True)
     if payload is None:
         detail = (completed.stderr or completed.stdout or "").strip()
         return {
