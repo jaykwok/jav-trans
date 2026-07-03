@@ -259,9 +259,9 @@ def test_local_backend_asr_batch_size_auto_and_numeric_override(monkeypatch):
 
     from asr import local_backend
 
-    reloaded = importlib.reload(local_backend)
-    assert reloaded.ASR_BATCH_SIZE == 32
+    # Batch size is resolved at call time (reads env on each call) so a
+    # persistent worker honors per-job / per-retry batch sizes without reload.
+    assert local_backend._resolve_asr_batch_size() == 32
 
     monkeypatch.setenv("ASR_BATCH_SIZE", "7")
-    reloaded = importlib.reload(local_backend)
-    assert reloaded.ASR_BATCH_SIZE == 7
+    assert local_backend._resolve_asr_batch_size() == 7

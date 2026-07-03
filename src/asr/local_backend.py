@@ -33,7 +33,6 @@ def _resolve_asr_batch_size() -> int:
     return max(1, int(raw))
 
 
-ASR_BATCH_SIZE = _resolve_asr_batch_size()
 ASR_MAX_NEW_TOKENS = max(64, int(os.getenv("ASR_MAX_NEW_TOKENS", "128")))
 TRANSCRIPTION_TIMEOUT_S = float(os.getenv("TRANSCRIPTION_TIMEOUT_S", "180"))
 ASR_DTYPE = os.getenv("ASR_DTYPE", "auto").strip().lower()
@@ -314,7 +313,9 @@ class LocalAsrBackend:
         self.attention = _detect_attention(self.device)
         self.model = None
         self.processor = None
-        self.request_batch_size = ASR_BATCH_SIZE
+        # Call-time resolution: reads ASR_BATCH_SIZE env at construction so a
+        # persistent worker honors per-job (and per-OOM-retry) batch sizes.
+        self.request_batch_size = _resolve_asr_batch_size()
         # References to a previously timed-out worker-local generate that is
         # still running (PyTorch generate cannot be hard-interrupted; see
         # README). Kept so the next call can join the zombie before reusing

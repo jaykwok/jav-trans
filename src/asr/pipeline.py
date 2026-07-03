@@ -44,7 +44,9 @@ _pre_asr_cueqc_module = importlib.reload(_pre_asr_cueqc_module)
 _transcribe_module = importlib.reload(_transcribe_module)
 _boundary_cache_module = importlib.reload(_boundary_cache_module)
 
-ASR_BACKEND = _registry_module.current_asr_backend()
+# Call-time backend resolution: reads ASR_BACKEND env at each call so a
+# persistent worker serves jobs with different backends without reloading.
+_current_asr_backend = _registry_module.current_asr_backend
 _QWEN_BACKENDS = _registry_module._QWEN_BACKENDS
 _VALID_ASR_BACKENDS = _registry_module._VALID_ASR_BACKENDS
 
@@ -71,17 +73,17 @@ def _env_int(name: str, default: str) -> int:
 
 def _boundary_config() -> dict:
     outer_refiner_path = checkpoint_path_for_repo_env(
-        repo_id=ASR_BACKEND,
+        repo_id=_current_asr_backend(),
         mapping_env="OUTER_EDGE_REFINER_MODEL_PATH_BY_REPO",
         default_mapping=DEFAULT_OUTER_EDGE_REFINER_CHECKPOINT_BY_REPO,
     )
     split_model_path = checkpoint_path_for_repo_env(
-        repo_id=ASR_BACKEND,
+        repo_id=_current_asr_backend(),
         mapping_env="SEMANTIC_SPLIT_MODEL_PATH_BY_REPO",
         default_mapping=DEFAULT_SEMANTIC_SPLIT_CHECKPOINT_BY_REPO,
     )
     cut_refiner_path = checkpoint_path_for_repo_env(
-        repo_id=ASR_BACKEND,
+        repo_id=_current_asr_backend(),
         mapping_env="CUT_EDGE_REFINER_MODEL_PATH_BY_REPO",
         default_mapping=DEFAULT_CUT_EDGE_REFINER_CHECKPOINT_BY_REPO,
     )
@@ -344,17 +346,17 @@ def _build_processing_spans(
     outer_refiner = load_outer_edge_refiner(
         Path(cfg["outer_edge_refiner_model_path"]),
         device=cfg["outer_edge_refiner_device"],
-        expected_ptm_repo_id=ASR_BACKEND,
+        expected_ptm_repo_id=_current_asr_backend(),
     )
     split_verifier = load_semantic_split_verifier(
         Path(cfg["semantic_split_model_path"]),
         device=cfg["semantic_split_device"],
-        expected_ptm_repo_id=ASR_BACKEND,
+        expected_ptm_repo_id=_current_asr_backend(),
     )
     cut_refiner = load_cut_edge_refiner(
         Path(cfg["cut_edge_refiner_model_path"]),
         device=cfg["cut_edge_refiner_device"],
-        expected_ptm_repo_id=ASR_BACKEND,
+        expected_ptm_repo_id=_current_asr_backend(),
     )
     sequence_feature_provider = _required_sequence_feature_provider_from_result(
         sequence_feature_frames,
@@ -768,7 +770,7 @@ def _apply_pre_asr_cueqc(
         _progress("Pre-ASR CueQC 1/1")
         return spans, report
     started = time.perf_counter()
-    model = _pre_asr_cueqc_module.load_active(expected_asr_repo_id=ASR_BACKEND)
+    model = _pre_asr_cueqc_module.load_active(expected_asr_repo_id=_current_asr_backend())
     candidates = candidates or [
         _pre_asr_cueqc_module.candidate_from_span(
             spans,
@@ -1145,27 +1147,36 @@ def _enforce_vram_budget_from_snapshot(snapshot: dict) -> None:
     budget_mb = _vram_budget_mb()
     if budget_mb <= 0.0:
         return
-    values: list[float] = []
-    for key in (
-        "max_reserved_mb",
-        "reserved_mb",
-        "max_allocated_mb",
-        "allocated_mb",
-    ):
+    # Enforce on peak *allocated* VRAM (the real working set that responds to
+    # batch size), not reserved. The caching allocator's reserved pool routinely
+    # fills dedicated VRAM on a 6GB card without spilling to shared memory, and
+    # it does not shrink when batch size is lowered, so a reserved-based budget
+    # false-positives and never converges under OOM-retry downshift. Allocated
+    # is reported in the message for diagnostics.
+    allocated_values: list[float] = []
+    reserved_values: list[float] = []
+    for key in ("max_allocated_mb", "allocated_mb"):
         try:
-            values.append(float(snapshot.get(key)))
+            allocated_values.append(float(snapshot.get(key)))
         except (TypeError, ValueError):
             continue
-    if not values:
+    for key in ("max_reserved_mb", "reserved_mb"):
+        try:
+            reserved_values.append(float(snapshot.get(key)))
+        except (TypeError, ValueError):
+            continue
+    if not allocated_values:
         return
-    peak_mb = max(values)
-    if peak_mb <= budget_mb:
+    peak_allocated = max(allocated_values)
+    if peak_allocated <= budget_mb:
         return
+    peak_reserved = max(reserved_values) if reserved_values else peak_allocated
     total_mb = snapshot.get("total_mb", "")
     stage = snapshot.get("stage", "")
     raise RuntimeError(
         "GPU VRAM budget exceeded: "
-        f"stage={stage} peak_mb={peak_mb:.1f} "
+        f"stage={stage} allocated_mb={peak_allocated:.1f} "
+        f"reserved_mb={peak_reserved:.1f} "
         f"budget_mb={budget_mb:.1f} total_mb={total_mb}"
     )
 
