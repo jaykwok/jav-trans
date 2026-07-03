@@ -55,13 +55,19 @@ DEFAULT_SETTINGS: dict[str, str] = {
     "ASR_FORCE_LANGUAGE": "1",
 
     # --- Batch Size & Limits ---
+    # Whole-ASR-stage execution mode. subprocess keeps CUDA out of the Web/main
+    # process while still running the model backend inproc inside that worker.
+    "ASR_STAGE_WORKER_MODE": "subprocess",
+    # 0 disables the coarse whole-stage timeout; per-batch ASR timeouts still apply.
+    "ASR_STAGE_WORKER_TIMEOUT_S": "0",
+    "ASR_STAGE_WORKER_READY_TIMEOUT_S": "60",
     # ASR inference batch size. auto resolves by ASR_BACKEND repo id.
-    # Defaults target 6GB-class cards. inproc avoids the extra CUDA context
-    # that subprocess mode keeps alive beside the main pipeline process.
+    # Defaults target 6GB-class cards. ASR_WORKER_MODE controls the model
+    # backend inside ASR_STAGE_WORKER_MODE=subprocess.
     "ASR_BATCH_SIZE": "auto",
     "ASR_BATCH_SIZE_BY_REPO": (
         "jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame-hf=4,"
-        "jaykwok/Qwen3-ASR-0.6B-JA-Anime-Galgame-hf=24"
+        "jaykwok/Qwen3-ASR-0.6B-JA-Anime-Galgame-hf=12"
     ),
     "ASR_WORKER_MODE_BY_REPO": (
         "jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame-hf=inproc,"

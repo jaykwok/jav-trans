@@ -111,8 +111,10 @@ def test_default_model_download_root_is_project_models():
     assert qwen.DEFAULT_QWEN_ASR_BACKEND == qwen.QWEN_ASR_17B_REPO_ID
     assert qwen.QWEN_ASR_REPO_ID == qwen.QWEN_ASR_17B_REPO_ID
     assert config.DEFAULT_SETTINGS["ASR_MODEL_ID"] == ""
+    assert config.DEFAULT_SETTINGS["ASR_STAGE_WORKER_MODE"] == "subprocess"
+    assert config.DEFAULT_SETTINGS["ASR_STAGE_WORKER_TIMEOUT_S"] == "0"
     assert config.DEFAULT_SETTINGS["ASR_BATCH_SIZE"] == "auto"
-    assert "Qwen3-ASR-0.6B-JA-Anime-Galgame-hf=24" in config.DEFAULT_SETTINGS["ASR_BATCH_SIZE_BY_REPO"]
+    assert "Qwen3-ASR-0.6B-JA-Anime-Galgame-hf=12" in config.DEFAULT_SETTINGS["ASR_BATCH_SIZE_BY_REPO"]
     assert "Qwen3-ASR-1.7B-JA-Anime-Galgame-hf=4" in config.DEFAULT_SETTINGS["ASR_BATCH_SIZE_BY_REPO"]
     assert "Qwen3-ASR-0.6B-JA-Anime-Galgame-hf=inproc" in config.DEFAULT_SETTINGS["ASR_WORKER_MODE_BY_REPO"]
     assert "Qwen3-ASR-1.7B-JA-Anime-Galgame-hf=inproc" in config.DEFAULT_SETTINGS["ASR_WORKER_MODE_BY_REPO"]

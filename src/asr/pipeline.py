@@ -1,4 +1,5 @@
 import importlib
+import gc
 import json
 import os
 import time
@@ -1135,6 +1136,24 @@ def _record_cuda_memory(
     )
 
 
+def _release_stage_gpu_cache(
+    log: list[str],
+    snapshots: list[dict],
+    stage: str,
+    *,
+    elapsed_s: float | None = None,
+) -> None:
+    gc.collect()
+    try:
+        import torch
+
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    except Exception:
+        pass
+    _record_cuda_memory(log, snapshots, stage, elapsed_s=elapsed_s)
+
+
 def _segment_alignment_outcome(segment: dict, outcomes: dict[int, dict]) -> dict:
     chunk_indices: list[int] = []
     for word in segment.get("words") or []:
@@ -1236,6 +1255,12 @@ def _transcribe_and_align_local(
             log,
             cuda_memory,
             "split_done",
+            elapsed_s=time.perf_counter() - total_started,
+        )
+        _release_stage_gpu_cache(
+            log,
+            cuda_memory,
+            "pre_asr_boundary_models_released",
             elapsed_s=time.perf_counter() - total_started,
         )
 
