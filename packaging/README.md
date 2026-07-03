@@ -46,6 +46,13 @@ WebView2 download page: https://developer.microsoft.com/en-us/microsoft-edge/web
 Use Evergreen Bootstrapper for online installs, or Evergreen Standalone
 Installer x64 for offline installs.
 
+The Windows package bundles the CUDA-enabled PyTorch runtime DLLs, but it does
+not bundle the NVIDIA display driver. The user's installed driver must support
+the CUDA runtime reported by the bundled PyTorch build. On startup/model
+selection the Web UI runs a short CUDA probe in a child process; if the driver is
+too old or CUDA cannot initialize, it shows a user-facing prompt to update the
+NVIDIA driver before running ASR.
+
 At runtime, writable files are created next to `JAVTrans.exe`:
 
 - `.env` for persisted settings

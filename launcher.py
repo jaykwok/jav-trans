@@ -3,6 +3,7 @@ import json
 import multiprocessing
 import os
 import shutil
+import subprocess
 import sys
 import threading
 import time
@@ -38,6 +39,7 @@ if _BIN_DIR.exists():
         os.environ["PATH"] = bin_text + (os.pathsep + current_path if current_path else "")
 
 _APP_ICON_PATH = _RESOURCE_ROOT / "src" / "assets" / "images" / "icon.ico"
+_CUDA_PROBE_CHILD = "--cuda-probe-child" in sys.argv
 
 
 def _webview_icon_arg() -> str | None:
@@ -83,6 +85,195 @@ def _cleanup_temp() -> None:
                 audio_dir = job_dir / "audio"
                 if audio_dir.exists():
                     shutil.rmtree(audio_dir, ignore_errors=True)
+
+
+def _version_tuple(value: str | None) -> tuple[int, ...]:
+    parts: list[int] = []
+    for token in str(value or "").split("."):
+        digits = "".join(ch for ch in token if ch.isdigit())
+        if not digits:
+            break
+        parts.append(int(digits))
+    return tuple(parts)
+
+
+def _find_nvidia_smi() -> str:
+    found = shutil.which("nvidia-smi")
+    if found:
+        return found
+    if os.name == "nt":
+        candidate = Path(os.environ.get("ProgramFiles", "C:\\Program Files"))
+        candidate = candidate / "NVIDIA Corporation" / "NVSMI" / "nvidia-smi.exe"
+        if candidate.exists():
+            return str(candidate)
+    return ""
+
+
+def _probe_nvidia_smi() -> dict:
+    exe = _find_nvidia_smi()
+    if not exe:
+        return {"available": False, "error": "nvidia-smi not found"}
+    result: dict = {"available": True, "path": exe}
+    try:
+        summary = subprocess.run(
+            [exe],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=5,
+        )
+        result["returncode"] = summary.returncode
+        if summary.returncode != 0:
+            result["error"] = (summary.stderr or summary.stdout).strip()
+        match = None
+        for line in (summary.stdout or "").splitlines():
+            if "CUDA Version:" in line:
+                match = line
+                break
+        if match:
+            import re
+
+            found = re.search(r"CUDA Version:\s*([0-9.]+)", match)
+            if found:
+                result["cuda_version"] = found.group(1)
+    except Exception as exc:  # noqa: BLE001 - diagnostic path
+        result["available"] = False
+        result["error"] = f"{type(exc).__name__}: {exc}"
+        return result
+
+    try:
+        query = subprocess.run(
+            [exe, "--query-gpu=name,driver_version", "--format=csv,noheader"],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=5,
+        )
+        devices = []
+        for line in (query.stdout or "").splitlines():
+            if not line.strip():
+                continue
+            name, _, driver = line.partition(",")
+            devices.append(
+                {
+                    "name": name.strip(),
+                    "driver_version": driver.strip(),
+                }
+            )
+        if devices:
+            result["devices"] = devices
+            result["driver_version"] = devices[0].get("driver_version", "")
+    except Exception as exc:  # noqa: BLE001 - optional diagnostic
+        result["query_error"] = f"{type(exc).__name__}: {exc}"
+    return result
+
+
+def _cuda_probe_payload() -> dict:
+    payload: dict = {
+        "status": "error",
+        "ok": False,
+        "code": "unknown",
+        "message": "CUDA 环境检测失败。",
+        "nvidia_smi": _probe_nvidia_smi(),
+    }
+    try:
+        import torch
+    except Exception as exc:  # noqa: BLE001 - user-facing diagnostic
+        payload.update(
+            {
+                "code": "torch_import_failed",
+                "message": f"PyTorch 运行时加载失败：{type(exc).__name__}: {exc}",
+            }
+        )
+        return payload
+
+    torch_cuda = str(getattr(torch.version, "cuda", "") or "")
+    payload.update(
+        {
+            "torch_version": str(getattr(torch, "__version__", "")),
+            "torch_cuda_version": torch_cuda,
+        }
+    )
+    if not torch_cuda:
+        payload.update(
+            {
+                "code": "cpu_torch",
+                "message": "当前打包/安装的是 CPU 版 PyTorch，无法使用 NVIDIA GPU 加速。",
+            }
+        )
+        return payload
+
+    cuda_available = False
+    cuda_error = ""
+    try:
+        cuda_available = bool(torch.cuda.is_available())
+    except Exception as exc:  # noqa: BLE001 - user-facing diagnostic
+        cuda_error = f"{type(exc).__name__}: {exc}"
+    payload["cuda_available"] = cuda_available
+    if cuda_error:
+        payload["cuda_error"] = cuda_error
+
+    smi = payload.get("nvidia_smi") if isinstance(payload.get("nvidia_smi"), dict) else {}
+    driver_cuda = str(smi.get("cuda_version") or "")
+    if not cuda_available and driver_cuda and _version_tuple(driver_cuda) < _version_tuple(torch_cuda):
+        payload.update(
+            {
+                "code": "driver_too_old",
+                "message": (
+                    f"NVIDIA 驱动最高支持 CUDA {driver_cuda}，但当前打包的 PyTorch "
+                    f"需要 CUDA {torch_cuda}。请更新 NVIDIA 显卡驱动后重启应用。"
+                ),
+            }
+        )
+        return payload
+
+    if not cuda_available:
+        if smi.get("available"):
+            message = (
+                f"检测到 NVIDIA 驱动，但 PyTorch CUDA {torch_cuda} 初始化失败。"
+                "请更新 NVIDIA 显卡驱动，或确认当前显卡/驱动支持该 CUDA runtime。"
+            )
+        else:
+            message = (
+                "未检测到可用 NVIDIA GPU 或 NVIDIA 驱动。"
+                f"当前打包的 PyTorch 需要 CUDA {torch_cuda}。"
+            )
+        if cuda_error:
+            message = f"{message} 原始错误：{cuda_error}"
+        payload.update({"code": "cuda_unavailable", "message": message})
+        return payload
+
+    devices = []
+    try:
+        for index in range(torch.cuda.device_count()):
+            props = torch.cuda.get_device_properties(index)
+            devices.append(
+                {
+                    "index": index,
+                    "name": torch.cuda.get_device_name(index),
+                    "capability": f"{props.major}.{props.minor}",
+                    "total_memory_mb": round(props.total_memory / 1024 / 1024, 1),
+                }
+            )
+    except Exception as exc:  # noqa: BLE001 - optional diagnostic
+        payload["device_query_error"] = f"{type(exc).__name__}: {exc}"
+    payload.update(
+        {
+            "status": "ok",
+            "ok": True,
+            "code": "ok",
+            "message": f"CUDA 可用，PyTorch CUDA runtime {torch_cuda}。",
+            "devices": devices,
+        }
+    )
+    return payload
+
+
+if _CUDA_PROBE_CHILD:
+    print(json.dumps(_cuda_probe_payload(), ensure_ascii=False), flush=True)
+    raise SystemExit(0)
 
 
 atexit.register(_cleanup_temp)
