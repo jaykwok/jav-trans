@@ -109,6 +109,17 @@ def _ffmpeg_binaries() -> list[tuple[str, str]]:
         _which_tool("ffmpeg.exe", "JAV_TRANS_FFMPEG_EXE"),
         _which_tool("ffprobe.exe", "JAV_TRANS_FFPROBE_EXE"),
     ]
+    shared_dll_patterns = ("avcodec-*.dll", "avformat-*.dll", "avutil-*.dll")
+    if not any(
+        all(any(tool.parent.glob(pattern)) for pattern in shared_dll_patterns)
+        for tool in tools
+    ):
+        raise SystemExit(
+            "FFmpeg Shared build required: the selected ffmpeg/ffprobe directory "
+            "must contain avcodec, avformat, and avutil DLLs. On Windows install "
+            "'winget install --id Gyan.FFmpeg.Shared --exact' and remove the "
+            "static-only Gyan.FFmpeg package."
+        )
     seen = set()
     bundled = []
     for tool in tools:

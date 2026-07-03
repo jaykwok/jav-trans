@@ -149,6 +149,10 @@ _ASR_STAGE_ADVANCED_KEYS = {
     "ASR_STAGE_WORKER_KILL_GRACE_S",
     "ASR_STAGE_WORKER_OOM_RETRY_LIMIT",
     "ASR_STAGE_WORKER_VRAM_BUDGET_MB",
+    "ASR_STAGE_WORKER_VRAM_RATIO",
+    "GPU_BATCH_PROFILE_ENABLED",
+    "GPU_BATCH_PROFILE_GROWTH_THRESHOLD",
+    "GPU_BATCH_PROFILE_PATH",
     "ASR_BOUNDARY_BACKEND",
     "ASR_LANGUAGE",
     "ASR_FORCE_LANGUAGE",
@@ -168,6 +172,7 @@ _ASR_STAGE_ADVANCED_KEYS = {
     "OUTER_EDGE_REFINER_DEVICE",
     "OUTER_EDGE_REFINER_MODEL_PATH_BY_REPO",
     "SEMANTIC_SPLIT_DEVICE",
+    "SEMANTIC_SPLIT_INFERENCE_BATCH_SIZE",
     "SEMANTIC_SPLIT_MODEL_PATH_BY_REPO",
     "CUT_EDGE_REFINER_DEVICE",
     "CUT_EDGE_REFINER_MODEL_PATH_BY_REPO",
@@ -180,9 +185,14 @@ _ASR_STAGE_CACHE_NEUTRAL_KEYS = {
     "ASR_STAGE_WORKER_READY_TIMEOUT_S",
     "ASR_STAGE_WORKER_TIMEOUT_S",
     "ASR_STAGE_WORKER_VRAM_BUDGET_MB",
+    "ASR_STAGE_WORKER_VRAM_RATIO",
+    "GPU_BATCH_PROFILE_ENABLED",
+    "GPU_BATCH_PROFILE_GROWTH_THRESHOLD",
+    "GPU_BATCH_PROFILE_PATH",
     "ASR_CHUNK_ROOT",
     "BOUNDARY_CACHE_DIR",
     "BOUNDARY_CACHE_ENABLED",
+    "SEMANTIC_SPLIT_INFERENCE_BATCH_SIZE",
     "KEEP_ASR_CHUNKS",
     "PRE_ASR_CUEQC_EXPORT_CANDIDATES_APPEND",
     "PRE_ASR_CUEQC_EXPORT_CANDIDATES_PATH",
@@ -1500,10 +1510,24 @@ def _run_translation_and_write_impl(
         pipeline_timings["translation_context_s"] = 0.0
         pipeline_timings["translation_s"] = 0.0
         translation_request_timings: list[dict] = []
+        cue_plan_started = time.perf_counter()
+        _log_stage(
+            logger,
+            f"stage_start subtitle_cue_plan segments={len(segments)}",
+        )
         srt_blocks, cue_summary = _prepare_translation_cues(
             segments,
             subtitle_options=subtitle_options,
             bilingual=False,
+        )
+        pipeline_timings["subtitle_cue_plan_s"] = (
+            time.perf_counter() - cue_plan_started
+        )
+        _log_stage(
+            logger,
+            "stage_done subtitle_cue_plan "
+            f"elapsed={pipeline_timings['subtitle_cue_plan_s']:.2f}s "
+            f"cues={len(srt_blocks)}",
         )
         asr_details["subtitle_cue_plan"] = _subtitle_cue_plan_summary(
             segments_before=len(segments),
@@ -1636,10 +1660,24 @@ def _run_translation_and_write_impl(
         return output_paths
 
     # 4. Global context for LLM
+    cue_plan_started = time.perf_counter()
+    _log_stage(
+        logger,
+        f"stage_start subtitle_cue_plan segments={len(segments)}",
+    )
     translation_segments, cue_summary = _prepare_translation_cues(
         segments,
         subtitle_options=subtitle_options,
         bilingual=bilingual,
+    )
+    pipeline_timings["subtitle_cue_plan_s"] = (
+        time.perf_counter() - cue_plan_started
+    )
+    _log_stage(
+        logger,
+        "stage_done subtitle_cue_plan "
+        f"elapsed={pipeline_timings['subtitle_cue_plan_s']:.2f}s "
+        f"cues={len(translation_segments)}",
     )
     asr_details["subtitle_cue_plan"] = _subtitle_cue_plan_summary(
         segments_before=len(segments),

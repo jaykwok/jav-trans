@@ -358,6 +358,18 @@ def _build_processing_spans(
         device=cfg["cut_edge_refiner_device"],
         expected_ptm_repo_id=_current_asr_backend(),
     )
+    _pipeline_logger.info(
+        "[boundary] semantic model devices "
+        "outer_requested=%s outer_actual=%s "
+        "split_requested=%s split_actual=%s "
+        "cut_requested=%s cut_actual=%s",
+        cfg["outer_edge_refiner_device"],
+        getattr(outer_refiner, "device", "unknown"),
+        cfg["semantic_split_device"],
+        getattr(split_verifier, "device", "unknown"),
+        cfg["cut_edge_refiner_device"],
+        getattr(cut_refiner, "device", "unknown"),
+    )
     sequence_feature_provider = _required_sequence_feature_provider_from_result(
         sequence_feature_frames,
         duration_s=result.audio_duration_sec,

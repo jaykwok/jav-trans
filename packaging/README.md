@@ -11,7 +11,8 @@ The build creates `dist/jav-trans/jav-trans.exe` as an onedir PyInstaller packag
 It bundles:
 
 - the Python runtime and installed Python dependencies from the active uv-managed environment
-- `ffmpeg.exe` and `ffprobe.exe` from `PATH`, or from `-FfmpegExe` / `-FfprobeExe`
+- `ffmpeg.exe`, `ffprobe.exe`, and FFmpeg runtime DLLs from the Shared build on
+  `PATH`, or from `-FfmpegExe` / `-FfprobeExe`
 - `src/assets/images/icon.png` for the in-app header, drop zone image, and PNG favicon
 - `src/assets/images/icon.ico` for the pywebview native window icon and packaged executable icon
 - repo-id tagged Outer Edge Refiner v1 checkpoints at `src/boundary/checkpoints/outer_edge_refiner_v1.<repo-tag>.pt`
@@ -26,6 +27,18 @@ The build script prepares those two Hugging Face models before running
 PyInstaller. Training-only files such as `optimizer.pt`, scheduler state,
 trainer state, RNG state, and `training_args.bin` are excluded from the package
 even if they exist in the local `models/` directories.
+
+On Windows, install the FFmpeg Shared package before building:
+
+```powershell
+winget uninstall --id Gyan.FFmpeg --exact
+winget install --id Gyan.FFmpeg.Shared --exact
+```
+
+The directory selected for `ffmpeg.exe` must also contain `avcodec-*.dll`,
+`avformat-*.dll`, and `avutil-*.dll`; TorchCodec cannot use the static-only
+`Gyan.FFmpeg` package. If multiple FFmpeg installations are present, pass the
+Shared executables explicitly with `-FfmpegExe` and `-FfprobeExe`.
 
 For a small development build only, pass `-SkipModels`. That skips model
 preparation and leaves the Hugging Face model directories out of the PyInstaller

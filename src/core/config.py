@@ -66,16 +66,17 @@ DEFAULT_SETTINGS: dict[str, str] = {
     "ASR_STAGE_WORKER_TIMEOUT_S": "0",
     "ASR_STAGE_WORKER_READY_TIMEOUT_S": "60",
     # On worker-level CUDA OOM, restart the GPU worker and retry with half batch size.
-    # Default 3 lets the built-in batch table fall to 1 before giving up.
-    "ASR_STAGE_WORKER_OOM_RETRY_LIMIT": "3",
-    # VRAM guard for 6GB cards. Enforced mid-pipeline on peak *allocated* VRAM
-    # (the real working set that responds to batch size); if exceeded the worker
-    # is treated as OOM and retried at lower batch before Windows spills to
-    # shared GPU memory. Keyed on allocated, not reserved -- the caching
-    # allocator's reserved pool routinely fills dedicated VRAM on a 6GB card
-    # without any spill, so reserved-based budgets false-positive and never
-    # converge under batch downshift.
-    "ASR_STAGE_WORKER_VRAM_BUDGET_MB": "5600",
+    # Default 6 also lets VRAM-scaled auto batches fall to 1 before giving up.
+    "ASR_STAGE_WORKER_OOM_RETRY_LIMIT": "6",
+    # "auto" resolves inside the CUDA-owner worker to physical VRAM * ratio.
+    # A numeric MB value remains available as an exact expert override.
+    "ASR_STAGE_WORKER_VRAM_BUDGET_MB": "auto",
+    "ASR_STAGE_WORKER_VRAM_RATIO": "0.95",
+    # Cross-job auto-batch learning. Successful jobs below the utilization
+    # threshold try +1 next time; OOM records an upper bound.
+    "GPU_BATCH_PROFILE_ENABLED": "1",
+    "GPU_BATCH_PROFILE_GROWTH_THRESHOLD": "0.80",
+    "GPU_BATCH_PROFILE_PATH": "./tmp/cache/gpu_batch_profiles.json",
     # Persistent-worker idle self-exit to shed CUDA state on long Web sessions:
     # the worker self-exits after this many seconds with no inbound request (0 =
     # never; default 300s). A per-job restart cadence is intentionally not
@@ -83,7 +84,8 @@ DEFAULT_SETTINGS: dict[str, str] = {
     # not accumulate across jobs.
     "ASR_STAGE_WORKER_MAX_IDLE_S": "300",
     # ASR inference batch size. auto resolves by ASR_BACKEND repo id.
-    # Defaults target 6GB-class cards.
+    # The repo table is the 5600MB baseline. In auto mode the worker scales it
+    # to the resolved VRAM budget, while an explicit ASR_BATCH_SIZE stays exact.
     "ASR_BATCH_SIZE": "auto",
     "ASR_BATCH_SIZE_BY_REPO": (
         "jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame-hf=4,"
@@ -102,7 +104,7 @@ DEFAULT_SETTINGS: dict[str, str] = {
     "SEMANTIC_SPLIT_DEVICE": "auto",
     # Semantic Split Verifier inference batch. The per-candidate temporal axis is
     # inside each sample; this only batches independent candidates.
-    "SEMANTIC_SPLIT_INFERENCE_BATCH_SIZE": "128",
+    "SEMANTIC_SPLIT_INFERENCE_BATCH_SIZE": "auto",
     "CUT_EDGE_REFINER_DEVICE": "auto",
     "BOUNDARY_FRAME_SEQUENCE_LEFT_CONTEXT_S": "0.60",
     "BOUNDARY_FRAME_SEQUENCE_RIGHT_CONTEXT_S": "0.60",

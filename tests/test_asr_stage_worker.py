@@ -34,6 +34,78 @@ def test_vram_budget_enforced_on_allocated_not_reserved(monkeypatch):
         )
 
 
+def test_auto_vram_budget_and_batch_scale_from_physical_memory(monkeypatch):
+    monkeypatch.setenv("GPU_BATCH_PROFILE_ENABLED", "0")
+    class _Properties:
+        total_memory = 8 * 1024 * 1024 * 1024
+
+    class _Cuda:
+        @staticmethod
+        def is_available():
+            return True
+
+        @staticmethod
+        def current_device():
+            return 0
+
+        @staticmethod
+        def get_device_properties(_index):
+            return _Properties()
+
+    class _Torch:
+        cuda = _Cuda()
+
+    env = {
+        "ASR_BACKEND": "jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame-hf",
+        "ASR_BATCH_SIZE": "auto",
+        "ASR_STAGE_WORKER_VRAM_BUDGET_MB": "auto",
+        "ASR_STAGE_WORKER_VRAM_RATIO": "0.95",
+    }
+    with gpu_worker._temporary_env(env):
+        tuning = gpu_worker._adaptive_runtime_tuning(_Torch(), env)
+        assert float(gpu_worker.os.environ["ASR_STAGE_WORKER_VRAM_BUDGET_MB"]) == pytest.approx(
+            8192 * 0.95,
+            abs=0.1,
+        )
+        assert gpu_worker.os.environ["ASR_BATCH_SIZE"] == "5"
+
+    assert tuning["physical_vram_mb"] == pytest.approx(8192.0)
+    assert tuning["vram_budget_source"] == "physical_vram_ratio"
+    assert tuning["asr_batch_source"] == "auto_scaled_from_vram"
+
+
+def test_boundary_oom_does_not_change_temporal_window():
+    env = {
+        "ASR_BATCH_SIZE": "4",
+        "SPEECH_BOUNDARY_JA_WINDOW_S": "20",
+    }
+    exc = gpu_worker.GpuWorkerError(
+        "oom",
+        "CUDA out of memory",
+        stage="speech_island_scorer",
+        runtime_tuning={"asr_batch_size": 4},
+    )
+
+    assert gpu_worker._oom_downshift(env, exc) is None
+    assert env["SPEECH_BOUNDARY_JA_WINDOW_S"] == "20"
+
+
+def test_terminal_oom_guidance_marks_06b_as_unsupported():
+    detail = gpu_worker._terminal_oom_detail(
+        env={
+            "ASR_BACKEND": "jaykwok/Qwen3-ASR-0.6B-JA-Anime-Galgame-hf",
+            "ASR_STAGE_WORKER_VRAM_BUDGET_MB": "4096",
+        },
+        detail="CUDA out of memory",
+        batch_size=1,
+        retry_records=[],
+    )
+
+    assert "0.6B 最低显存档" in detail
+    assert "当前硬件/可用显存下无法运行" in detail
+    assert "不会改用 CPU 或缩短时序窗口" in detail
+
+
 class _CudaTrap:
     def __getattr__(self, name):
         raise AssertionError(f"main process touched torch.cuda.{name}")
@@ -77,7 +149,8 @@ def test_unified_asr_stage_worker_does_not_touch_cuda_in_main(monkeypatch, tmp_p
     ):
         assert device == "auto"
         assert "ASR_STAGE_WORKER_MODE" not in env_overrides
-        assert env_overrides["ASR_STAGE_WORKER_VRAM_BUDGET_MB"] == "5600"
+        assert env_overrides["ASR_STAGE_WORKER_VRAM_BUDGET_MB"] == "auto"
+        assert env_overrides["ASR_STAGE_WORKER_VRAM_RATIO"] == "0.95"
         assert job_id == ctx.job_id
         assert cancel_requested is not None
         if on_stage is not None:

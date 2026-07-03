@@ -70,7 +70,14 @@ def serialize_asr_artifacts(artifacts: AsrArtifacts) -> dict:
         if name == "logger":
             continue
         value = getattr(artifacts, name)
-        if isinstance(value, Path):
+        if name == "asr_details" and isinstance(value, dict):
+            value = dict(value)
+            pre_asr_candidates = value.pop("pre_asr_candidates", None)
+            if isinstance(pre_asr_candidates, list):
+                value["pre_asr_candidate_count"] = len(pre_asr_candidates)
+        if name in ASR_ARTIFACT_PATH_FIELDS:
+            payload[name] = _project_relative(value)
+        elif isinstance(value, Path):
             payload[name] = str(value)
         else:
             payload[name] = value
@@ -98,22 +105,12 @@ def _project_relative(path: str | Path | None) -> str | None:
     return raw.replace("\\", "/")
 
 
-def _relativize_payload_paths(value):
-    if isinstance(value, dict):
-        return {key: _relativize_payload_paths(item) for key, item in value.items()}
-    if isinstance(value, list):
-        return [_relativize_payload_paths(item) for item in value]
-    if isinstance(value, str):
-        return _project_relative(value)
-    return value
-
-
 def _write_json_atomic(path: str | Path, payload: dict) -> None:
     target = Path(path)
     target.parent.mkdir(parents=True, exist_ok=True)
     tmp_path = target.with_name(f"{target.name}.{os.getpid()}.tmp")
     tmp_path.write_text(
-        json.dumps(_relativize_payload_paths(payload), ensure_ascii=False, indent=2),
+        json.dumps(payload, ensure_ascii=False, indent=2),
         encoding="utf-8",
     )
     tmp_path.replace(target)
