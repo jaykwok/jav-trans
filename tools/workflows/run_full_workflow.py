@@ -20,7 +20,11 @@ SRC_ROOT = PROJECT_ROOT / "src"
 if str(SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(SRC_ROOT))
 
-from asr.backends.qwen import DEFAULT_QWEN_ASR_BATCH_SIZE_BY_REPO, qwen_asr_default_model_path
+from asr.backends.qwen import (
+    DEFAULT_QWEN_ASR_BATCH_SIZE_BY_REPO,
+    qwen_asr_default_model_path,
+    qwen_asr_default_worker_mode,
+)
 from core.config import load_config
 
 
@@ -527,7 +531,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--asr-model-path",
         default=os.getenv("ASR_MODEL_PATH", ""),
     )
-    parser.add_argument("--asr-worker-mode", default=os.getenv("ASR_WORKER_MODE", "subprocess"))
+    parser.add_argument("--asr-worker-mode", default=os.getenv("ASR_WORKER_MODE", ""))
     parser.add_argument("--asr-dtype", default=os.getenv("ASR_DTYPE", "bfloat16"))
     parser.add_argument("--asr-attention", default=os.getenv("ASR_ATTENTION", "sdpa"))
     parser.add_argument("--asr-batch-size", default=os.getenv("ASR_BATCH_SIZE", "auto"))
@@ -641,8 +645,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         dest="speech_boundary_scorer_device",
         default=os.getenv("SPEECH_BOUNDARY_JA_SCORER_DEVICE", "auto"),
     )
-    parser.add_argument("--speech-boundary-window-s", dest="speech_boundary_window_s", type=float, default=_env_float("SPEECH_BOUNDARY_JA_WINDOW_S", 30.0))
-    parser.add_argument("--speech-boundary-overlap-s", dest="speech_boundary_overlap_s", type=float, default=_env_float("SPEECH_BOUNDARY_JA_OVERLAP_S", 5.0))
+    parser.add_argument("--speech-boundary-window-s", dest="speech_boundary_window_s", type=float, default=_env_float("SPEECH_BOUNDARY_JA_WINDOW_S", 20.0))
+    parser.add_argument("--speech-boundary-overlap-s", dest="speech_boundary_overlap_s", type=float, default=_env_float("SPEECH_BOUNDARY_JA_OVERLAP_S", 4.0))
     parser.add_argument("--speech-boundary-min-segment-s", dest="speech_boundary_min_segment_s", type=float, default=_env_float("SPEECH_BOUNDARY_JA_MIN_SEGMENT_S", 0.05))
     args = parser.parse_args(argv)
     if args.speech_boundary_speech_on_threshold is None:
@@ -653,6 +657,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         args.speech_boundary_ptm = args.asr_backend
     if not str(args.speech_boundary_model_path or "").strip():
         args.speech_boundary_model_path = qwen_asr_default_model_path(args.speech_boundary_ptm)
+    if not str(args.asr_worker_mode or "").strip():
+        args.asr_worker_mode = qwen_asr_default_worker_mode(args.asr_backend)
     if args.speech_boundary_threshold < 0:
         parser.error("--speech-boundary-threshold must be non-negative")
     if args.speech_boundary_speech_on_threshold < 0:

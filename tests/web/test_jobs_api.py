@@ -79,6 +79,10 @@ def test_settings_env_file_quotes_multiline_values(tmp_path, monkeypatch):
     asyncio.run(_test_settings_env_file_quotes_multiline_values(tmp_path, monkeypatch))
 
 
+def test_settings_creates_env_file_on_first_save(tmp_path, monkeypatch):
+    asyncio.run(_test_settings_creates_env_file_on_first_save(tmp_path, monkeypatch))
+
+
 def test_models_api_falls_back_to_v1_models(monkeypatch):
     asyncio.run(_test_models_api_falls_back_to_v1_models(monkeypatch))
 
@@ -395,6 +399,62 @@ async def _test_settings_env_file_quotes_multiline_values(tmp_path, monkeypatch)
     assert values["API_KEY"] == malicious_value
     assert values.get("OPENAI_COMPATIBILITY_BASE_URL") is None
     assert os.environ["API_KEY"] == malicious_value
+
+
+async def _test_settings_creates_env_file_on_first_save(tmp_path, monkeypatch):
+    from dotenv import dotenv_values
+
+    env_path = tmp_path / ".env"
+    assert not env_path.exists()
+    monkeypatch.setattr(config_routes, "PROJECT_ROOT", tmp_path)
+    for key in (
+        "API_KEY",
+        "OPENAI_COMPATIBILITY_BASE_URL",
+        "LLM_MODEL_NAME",
+        "TARGET_LANG",
+        "LLM_API_FORMAT",
+        "LLM_REASONING_EFFORT",
+    ):
+        monkeypatch.delenv(key, raising=False)
+
+    transport = httpx.ASGITransport(app=create_app())
+    async with httpx.AsyncClient(
+        transport=transport,
+        base_url="http://test",
+    ) as client:
+        response = await client.post(
+            "/api/settings",
+            json={
+                "api_key": "first-run-key",
+                "base_url": "https://api.example.test/v1",
+                "model": "translator-test",
+                "target_lang": "繁體中文",
+                "llm_api_format": "responses",
+                "llm_reasoning_effort": "medium",
+            },
+        )
+        settings = await client.get("/api/settings")
+
+    assert response.status_code == 200
+    assert env_path.exists()
+    text = env_path.read_text(encoding="utf-8")
+    assert "# Defaults live in src/core/config.py" in text
+    assert "# ASR_BATCH_SIZE_BY_REPO=" in text
+    values = dotenv_values(env_path)
+    assert values["API_KEY"] == "first-run-key"
+    assert values["OPENAI_COMPATIBILITY_BASE_URL"] == "https://api.example.test/v1"
+    assert values["LLM_MODEL_NAME"] == "translator-test"
+    assert values["TARGET_LANG"] == "繁體中文"
+    assert values["LLM_API_FORMAT"] == "responses"
+    assert values["LLM_REASONING_EFFORT"] == "medium"
+    assert "ASR_BACKEND" not in values
+    assert "ASR_BATCH_SIZE_BY_REPO" not in values
+    assert settings.status_code == 200
+    payload = settings.json()
+    assert payload["api_key_set"] is True
+    assert payload["base_url"] == "https://api.example.test/v1"
+    assert payload["model"] == "translator-test"
+    assert payload["target_lang"] == "繁體中文"
 
 
 async def _test_models_api_falls_back_to_v1_models(monkeypatch):

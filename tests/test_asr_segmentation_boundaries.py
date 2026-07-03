@@ -150,7 +150,6 @@ def test_removed_asr_post_split_runtime_knobs_are_absent():
         "_split_long_postprocessed_segments",
     )
     checked_paths = [
-        PROJECT_ROOT / ".env.example",
         PROJECT_ROOT / "src" / "asr" / "pipeline.py",
         PROJECT_ROOT / "src" / "asr" / "transcribe.py",
         PROJECT_ROOT / "src" / "core" / "config.py",

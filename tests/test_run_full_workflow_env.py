@@ -67,12 +67,13 @@ def test_run_full_workflow_boundary_threshold_defaults_match_training_eval(monke
 
 def test_run_full_workflow_parse_args_uses_loaded_env(monkeypatch):
     monkeypatch.setenv("ASR_BACKEND", "jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame-hf")
+    monkeypatch.setenv("ASR_WORKER_MODE", "")
     monkeypatch.setenv("ASR_MODEL_PATH", "")
     monkeypatch.setenv("ASR_BATCH_SIZE", "auto")
     monkeypatch.setenv(
         "ASR_BATCH_SIZE_BY_REPO",
-        "jaykwok/Qwen3-ASR-0.6B-JA-Anime-Galgame-hf=64,"
-        "jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame-hf=32",
+        "jaykwok/Qwen3-ASR-0.6B-JA-Anime-Galgame-hf=24,"
+        "jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame-hf=4",
     )
     outer_mapping = "jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame-hf=src/boundary/checkpoints/outer.pt"
     split_mapping = "jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame-hf=src/boundary/checkpoints/split.pt"
@@ -102,6 +103,7 @@ def test_run_full_workflow_parse_args_uses_loaded_env(monkeypatch):
     )
 
     assert args.asr_backend == "jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame-hf"
+    assert args.asr_worker_mode == "inproc"
     assert args.asr_model_path == ""
     assert args.asr_batch_size == "auto"
     assert args.outer_edge_refiner_model_path_by_repo == outer_mapping
@@ -124,6 +126,7 @@ def test_run_full_workflow_context_carries_boundary_env(monkeypatch, tmp_path):
         "jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame-hf=8"
     )
     monkeypatch.setenv("ASR_BATCH_SIZE", "auto")
+    monkeypatch.setenv("ASR_WORKER_MODE", "inproc")
     monkeypatch.setenv("ASR_BATCH_SIZE_BY_REPO", batch_table)
     outer_mapping = "jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame-hf=src/boundary/checkpoints/outer.pt"
     split_mapping = "jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame-hf=src/boundary/checkpoints/split.pt"
@@ -173,6 +176,7 @@ def test_run_full_workflow_context_carries_boundary_env(monkeypatch, tmp_path):
     ctx = run_full_workflow.build_context(args=args, paths=paths, video=video)
 
     assert ctx.advanced["ASR_BATCH_SIZE"] == "auto"
+    assert ctx.advanced["ASR_WORKER_MODE"] == "inproc"
     assert ctx.advanced["ASR_BATCH_SIZE_BY_REPO"] == batch_table
     assert ctx.advanced["OUTER_EDGE_REFINER_MODEL_PATH_BY_REPO"] == outer_mapping
     assert ctx.advanced["SEMANTIC_SPLIT_MODEL_PATH_BY_REPO"] == split_mapping
@@ -196,10 +200,11 @@ def test_run_full_workflow_context_carries_boundary_env(monkeypatch, tmp_path):
 
 def test_run_full_workflow_cli_batch_overrides_loaded_env(monkeypatch):
     monkeypatch.setenv("ASR_BATCH_SIZE", "auto")
+    monkeypatch.setenv("ASR_WORKER_MODE", "subprocess")
     monkeypatch.setenv(
         "ASR_BATCH_SIZE_BY_REPO",
-        "jaykwok/Qwen3-ASR-0.6B-JA-Anime-Galgame-hf=64,"
-        "jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame-hf=32",
+        "jaykwok/Qwen3-ASR-0.6B-JA-Anime-Galgame-hf=24,"
+        "jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame-hf=4",
     )
     monkeypatch.delenv("CUEQC_SHADOW_ENABLED", raising=False)
     monkeypatch.delenv("CUEQC_MODEL_PATH_BY_REPO", raising=False)
@@ -222,6 +227,7 @@ def test_run_full_workflow_cli_batch_overrides_loaded_env(monkeypatch):
     run_full_workflow.configure_env(args)
 
     assert run_full_workflow.os.environ["ASR_BACKEND"] == "jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame-hf"
+    assert run_full_workflow.os.environ["ASR_WORKER_MODE"] == "subprocess"
     assert run_full_workflow.os.environ["ASR_BATCH_SIZE"] == "12"
     assert not hasattr(args, "cueqc_shadow_enabled")
     assert not hasattr(args, "cueqc_model_path_by_repo")
@@ -271,7 +277,6 @@ def test_removed_split_env_is_absent_from_current_runtime_files():
         "SPEECH_BOUNDARY_JA_SPLIT_TARGET_S",
     )
     checked_paths = [
-        run_full_workflow.PROJECT_ROOT / ".env.example",
         run_full_workflow.PROJECT_ROOT / "src" / "boundary" / "cache.py",
         run_full_workflow.PROJECT_ROOT / "src" / "boundary" / "ja" / "backend.py",
         run_full_workflow.PROJECT_ROOT / "src" / "web" / "static" / "index.html",

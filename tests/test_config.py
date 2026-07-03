@@ -108,10 +108,16 @@ def test_default_model_download_root_is_project_models():
     assert "KEEP_TEMP_FILES" not in config.DEFAULT_SETTINGS
     assert "ASR_CONTEXT" not in config.DEFAULT_SETTINGS
     assert config.DEFAULT_SETTINGS["ASR_BACKEND"] == "jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame-hf"
+    assert qwen.DEFAULT_QWEN_ASR_BACKEND == qwen.QWEN_ASR_17B_REPO_ID
+    assert qwen.QWEN_ASR_REPO_ID == qwen.QWEN_ASR_17B_REPO_ID
     assert config.DEFAULT_SETTINGS["ASR_MODEL_ID"] == ""
     assert config.DEFAULT_SETTINGS["ASR_BATCH_SIZE"] == "auto"
-    assert "Qwen3-ASR-0.6B-JA-Anime-Galgame-hf=64" in config.DEFAULT_SETTINGS["ASR_BATCH_SIZE_BY_REPO"]
-    assert "Qwen3-ASR-1.7B-JA-Anime-Galgame-hf=32" in config.DEFAULT_SETTINGS["ASR_BATCH_SIZE_BY_REPO"]
+    assert "Qwen3-ASR-0.6B-JA-Anime-Galgame-hf=24" in config.DEFAULT_SETTINGS["ASR_BATCH_SIZE_BY_REPO"]
+    assert "Qwen3-ASR-1.7B-JA-Anime-Galgame-hf=4" in config.DEFAULT_SETTINGS["ASR_BATCH_SIZE_BY_REPO"]
+    assert "Qwen3-ASR-0.6B-JA-Anime-Galgame-hf=inproc" in config.DEFAULT_SETTINGS["ASR_WORKER_MODE_BY_REPO"]
+    assert "Qwen3-ASR-1.7B-JA-Anime-Galgame-hf=inproc" in config.DEFAULT_SETTINGS["ASR_WORKER_MODE_BY_REPO"]
+    assert config.DEFAULT_SETTINGS["SPEECH_BOUNDARY_JA_WINDOW_S"] == "20.0"
+    assert config.DEFAULT_SETTINGS["SPEECH_BOUNDARY_JA_OVERLAP_S"] == "4.0"
     assert "BOUNDARY_REFINER_MODEL_PATH_BY_REPO" not in config.DEFAULT_SETTINGS
     assert "CUEQC_MODEL_PATH_BY_REPO" not in config.DEFAULT_SETTINGS
     assert "SPEECH_BOUNDARY_JA_SCORER_CHECKPOINT_BY_REPO" in config.DEFAULT_SETTINGS
@@ -148,7 +154,7 @@ def test_default_model_download_root_is_project_models():
     assert "CUEQC_EXPORT_CANDIDATES_PATH" not in config.DEFAULT_SETTINGS
     assert "CUEQC_EXPORT_CANDIDATES_APPEND" not in config.DEFAULT_SETTINGS
     assert "CUEQC_SHADOW_EMBED_CANDIDATES" not in config.DEFAULT_SETTINGS
-    assert config.DEFAULT_SETTINGS["PRE_ASR_CUEQC_ENABLED"] == "0"
+    assert config.DEFAULT_SETTINGS["PRE_ASR_CUEQC_ENABLED"] == "1"
     assert config.DEFAULT_SETTINGS["PRE_ASR_CUEQC_DROP_THRESHOLD"] == "0.95"
     assert config.DEFAULT_SETTINGS["LLM_API_FORMAT"] == "chat"
 
@@ -159,7 +165,6 @@ def test_asr_chunk_min_duration_removed_from_active_config_surface():
         "src/boundary/cache.py",
         "src/core/config.py",
         "src/main.py",
-        ".env.example",
         "README.md",
     )
     for relative_path in active_files:
@@ -177,7 +182,6 @@ def test_asr_sliding_text_context_removed_from_active_config_surface():
         "src/asr/pipeline.py",
         "src/core/config.py",
         "src/main.py",
-        ".env.example",
         "README.md",
     )
     removed_terms = (
@@ -201,7 +205,6 @@ def test_subtitle_max_duration_clamp_removed_from_active_config_surface():
         "src/main.py",
         "src/subtitles/options.py",
         "src/subtitles/writer.py",
-        ".env.example",
         "README.md",
     )
     for relative_path in active_files:
@@ -215,7 +218,6 @@ def test_pre_asr_cueqc_old_versions_removed_from_active_runtime_surface():
         "src/asr/pre_asr_cueqc.py",
         "src/asr/backends/qwen.py",
         "src/core/config.py",
-        ".env.example",
         "README.md",
         "tools/workflows/run_full_workflow.py",
         "tools/asr/cueqc/compile_pre_asr_v11_features.py",
@@ -256,7 +258,6 @@ def test_asr_after_cueqc_removed_from_active_runtime_surface():
         "src/core/config.py",
         "tools/workflows/run_full_workflow.py",
         "tools/web/smoke/submit_job.py",
-        ".env.example",
         "README.md",
     )
     retired_patterns = (

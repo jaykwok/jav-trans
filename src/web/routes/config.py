@@ -125,6 +125,32 @@ def _runtime_or_env_or_setting(key: str, fallback: str = "") -> str:
 _ENV_FILE_LOCK = threading.Lock()
 
 
+def _initial_env_template_lines() -> list[str]:
+    return [
+        "# JAVTrans local overrides.\n",
+        "# Defaults live in src/core/config.py. Keep these examples commented unless\n",
+        "# you want to override the built-in runtime defaults on this machine.\n",
+        "\n",
+        "# --- ASR / VRAM tuning examples ---\n",
+        "# ASR_BACKEND=jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame-hf\n",
+        "# ASR_BACKEND=jaykwok/Qwen3-ASR-0.6B-JA-Anime-Galgame-hf\n",
+        "# ASR_WORKER_MODE=inproc\n",
+        "# ASR_BATCH_SIZE=auto\n",
+        "# ASR_BATCH_SIZE_BY_REPO=jaykwok/Qwen3-ASR-0.6B-JA-Anime-Galgame-hf=24,jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame-hf=4\n",
+        "# SPEECH_BOUNDARY_JA_WINDOW_S=20\n",
+        "# SPEECH_BOUNDARY_JA_OVERLAP_S=4\n",
+        "# PRE_ASR_CUEQC_ENABLED=1\n",
+        "# PRE_ASR_CUEQC_DROP_THRESHOLD=0.95\n",
+        "\n",
+        "# --- Model/cache examples ---\n",
+        "# HF_ENDPOINT=https://hf-mirror.com\n",
+        "# HF_HOME=./models\n",
+        "# TORCH_HOME=./tmp/cache/torch\n",
+        "\n",
+        "# --- Saved Web settings ---\n",
+    ]
+
+
 def _update_env_file(updates: dict[str, str]) -> None:
     env_path = PROJECT_ROOT / ".env"
     # Serialize concurrent settings saves so they don't clobber each other's
@@ -134,7 +160,7 @@ def _update_env_file(updates: dict[str, str]) -> None:
         lines = (
             env_path.read_text(encoding="utf-8").splitlines(keepends=True)
             if env_path.exists()
-            else []
+            else _initial_env_template_lines()
         )
         pending = dict(updates)
         new_lines: list[str] = []
@@ -413,7 +439,12 @@ async def post_settings(update: SettingsUpdate) -> dict:
         changes["LLM_MODEL_NAME"] = update.model
         os.environ["LLM_MODEL_NAME"] = update.model
     if update.hf_endpoint is not None:
-        changes["HF_ENDPOINT"] = _sync_hf_endpoint(update.hf_endpoint)
+        hf_endpoint = _sync_hf_endpoint(update.hf_endpoint)
+        changes["HF_ENDPOINT"] = hf_endpoint
+        if hf_endpoint:
+            os.environ["HF_ENDPOINT"] = hf_endpoint
+        else:
+            os.environ.pop("HF_ENDPOINT", None)
     if update.translation_glossary is not None:
         changes["TRANSLATION_GLOSSARY"] = update.translation_glossary
         os.environ["TRANSLATION_GLOSSARY"] = update.translation_glossary
