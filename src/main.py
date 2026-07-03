@@ -221,6 +221,7 @@ _ASR_STAGE_ENV_SNAPSHOT_KEYS = {
     "HF_XET_CACHE",
     "TORCH_HOME",
     "PYTORCH_CUDA_ALLOC_CONF",
+    "CUDA_VISIBLE_DEVICES",
 }
 
 
@@ -654,9 +655,13 @@ def _asr_details_stage_worker_mode(asr_details: dict | None) -> str:
 
 
 def _asr_details_cuda_skip_reason(asr_details: dict | None) -> str:
-    if _asr_details_stage_worker_mode(asr_details) in {"gpu_worker", "subprocess"}:
-        return "asr_stage_worker_subprocess"
-    return ""
+    # The ASR stage always runs in the unified GPU worker; the main/web process
+    # must never initialize CUDA -- not even torch.cuda.is_available() -- or it
+    # re-splits the CUDA context this refactor exists to consolidate. Skip
+    # unconditionally, including for asr_details loaded from a stale cache that
+    # predates the stage_worker tag (otherwise such a cache hit would init CUDA
+    # in the main process during write_output).
+    return "asr_stage_worker_subprocess"
 
 
 def _resolve_job_temp_dir(job_id: str) -> str:

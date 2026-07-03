@@ -31,9 +31,13 @@ DEFAULT_SETTINGS: dict[str, str] = {
     "HF_HOME": "./models",
     # torch.hub runtime cache; not a model directory and not part of models/.
     "TORCH_HOME": "./tmp/cache/torch",
-    # HuggingFace Hub endpoint. Set to https://hf-mirror.com for mainland China acceleration.
-    # Empty string means use the default huggingface.co. Takes effect on next app start.
+    # HuggingFace Hub endpoint override. Empty string means use the default huggingface.co.
     "HF_ENDPOINT": "",
+    # Optional network proxy. When host+port are set, load_config exports the
+    # standard HTTP_PROXY/HTTPS_PROXY/ALL_PROXY environment variables.
+    "PROXY_PROTOCOL": "http",
+    "PROXY_HOST": "",
+    "PROXY_PORT": "",
 
     # --- ASR Model Settings ---
     # Transcription backend. Use the Hugging Face repo id as the stable key.
@@ -64,9 +68,20 @@ DEFAULT_SETTINGS: dict[str, str] = {
     # On worker-level CUDA OOM, restart the GPU worker and retry with half batch size.
     # Default 3 lets the built-in batch table fall to 1 before giving up.
     "ASR_STAGE_WORKER_OOM_RETRY_LIMIT": "3",
-    # Soft OOM guard for 6GB cards: if worker-side peak reserved VRAM exceeds this
-    # budget, treat it as OOM before Windows falls back to shared GPU memory.
+    # VRAM guard for 6GB cards. Enforced mid-pipeline on peak *allocated* VRAM
+    # (the real working set that responds to batch size); if exceeded the worker
+    # is treated as OOM and retried at lower batch before Windows spills to
+    # shared GPU memory. Keyed on allocated, not reserved -- the caching
+    # allocator's reserved pool routinely fills dedicated VRAM on a 6GB card
+    # without any spill, so reserved-based budgets false-positive and never
+    # converge under batch downshift.
     "ASR_STAGE_WORKER_VRAM_BUDGET_MB": "5600",
+    # Persistent-worker idle self-exit to shed CUDA state on long Web sessions:
+    # the worker self-exits after this many seconds with no inbound request (0 =
+    # never; default 300s). A per-job restart cadence is intentionally not
+    # offered -- every job already gc+empty_cache's on completion, so VRAM does
+    # not accumulate across jobs.
+    "ASR_STAGE_WORKER_MAX_IDLE_S": "300",
     # ASR inference batch size. auto resolves by ASR_BACKEND repo id.
     # Defaults target 6GB-class cards.
     "ASR_BATCH_SIZE": "auto",
@@ -212,6 +227,49 @@ def _apply_values(values: dict[str, str], protected_keys: set[str]) -> None:
         os.environ[key] = value
 
 
+_PROXY_ENV_KEYS = (
+    "HTTP_PROXY",
+    "HTTPS_PROXY",
+    "ALL_PROXY",
+    "http_proxy",
+    "https_proxy",
+    "all_proxy",
+)
+_SUPPORTED_PROXY_PROTOCOLS = {"http", "https", "socks5"}
+
+
+def network_proxy_url_from_env() -> str:
+    protocol = os.getenv("PROXY_PROTOCOL", "http").strip().lower() or "http"
+    host = os.getenv("PROXY_HOST", "").strip()
+    port = os.getenv("PROXY_PORT", "").strip()
+    if not host or not port:
+        return ""
+    if protocol not in _SUPPORTED_PROXY_PROTOCOLS:
+        protocol = "http"
+    return f"{protocol}://{host}:{port}"
+
+
+def apply_network_proxy_environment(
+    proxy_url: str,
+    *,
+    clear_existing: bool = False,
+) -> None:
+    proxy_url = str(proxy_url or "").strip()
+    if proxy_url:
+        for key in _PROXY_ENV_KEYS:
+            os.environ[key] = proxy_url
+        return
+    if clear_existing:
+        for key in _PROXY_ENV_KEYS:
+            os.environ.pop(key, None)
+
+
+def sync_network_proxy_environment(*, clear_existing: bool = False) -> str:
+    proxy_url = network_proxy_url_from_env()
+    apply_network_proxy_environment(proxy_url, clear_existing=clear_existing)
+    return proxy_url
+
+
 def _load_private_env(path: Path, protected_keys: set[str]) -> None:
     """Load .env without clobbering protected process environment keys."""
 
@@ -238,3 +296,4 @@ def load_config(*, override_existing_env: bool = False) -> None:
     protected_keys = set() if override_existing_env else set(os.environ)
     _apply_values(DEFAULT_SETTINGS, protected_keys)
     _load_private_env(PRIVATE_ENV_PATH, protected_keys)
+    sync_network_proxy_environment(clear_existing=False)

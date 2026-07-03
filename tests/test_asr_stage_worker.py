@@ -2,9 +2,36 @@ from pathlib import Path
 
 import main
 import pytest
+from asr import pipeline as asr_pipeline
 from helpers import make_job_context
 from pipeline import audio as pipeline_audio
 from pipeline import gpu_worker
+
+
+def test_asr_details_cuda_skip_reason_always_skips_in_main():
+    # The main/web process must never own CUDA -- not even is_available() --
+    # including for asr_details loaded from a stale cache that lacks the
+    # stage_worker tag (which would otherwise re-split the CUDA context).
+    assert main._asr_details_cuda_skip_reason(None)
+    assert main._asr_details_cuda_skip_reason({})
+    assert main._asr_details_cuda_skip_reason({"stage_worker": {"mode": "gpu_worker"}})
+    assert main._asr_details_cuda_skip_reason({"stage_worker": {"mode": "subprocess"}})
+    assert main._asr_details_cuda_skip_reason({"stage_worker": {"mode": "unknown"}})
+
+
+def test_vram_budget_enforced_on_allocated_not_reserved(monkeypatch):
+    monkeypatch.setenv("ASR_STAGE_WORKER_VRAM_BUDGET_MB", "5600")
+    # Reserved over budget but allocated under it: must NOT raise. The caching
+    # allocator's reserved pool routinely fills dedicated VRAM on a 6GB card
+    # without spilling, so reserved must not trip the budget.
+    asr_pipeline._enforce_vram_budget_from_snapshot(
+        {"stage": "x", "max_reserved_mb": 6200.0, "max_allocated_mb": 4800.0}
+    )
+    # Allocated over budget: raises (classified as OOM upstream for retry).
+    with pytest.raises(RuntimeError, match="GPU VRAM budget exceeded"):
+        asr_pipeline._enforce_vram_budget_from_snapshot(
+            {"stage": "x", "max_reserved_mb": 6200.0, "max_allocated_mb": 5800.0}
+        )
 
 
 class _CudaTrap:
@@ -91,7 +118,11 @@ def test_unified_asr_stage_worker_does_not_touch_cuda_in_main(monkeypatch, tmp_p
     )
 
 
-def test_stage_worker_treats_vram_budget_excess_as_oom_retry(monkeypatch, tmp_path):
+def test_stage_worker_retries_with_lower_batch_on_hard_oom(monkeypatch, tmp_path):
+    # The OOM-retry/downshift path is driven by a HARD OOM reported by the
+    # worker (torch OOM or the allocated-based VRAM budget tripped mid-pipeline),
+    # not by retroactively discarding a successful result. On a hard OOM the
+    # client kills the worker, halves ASR_BATCH_SIZE, restarts and retries.
     monkeypatch.setenv("ASR_STAGE_WORKER_OOM_RETRY_LIMIT", "1")
     calls: list[dict] = []
     killed = {"count": 0}
@@ -106,22 +137,11 @@ def test_stage_worker_treats_vram_budget_excess_as_oom_retry(monkeypatch, tmp_pa
         on_stage=None,
         cancel_requested=None,
     ):
-        del self, audio_path, device, job_id, on_stage, cancel_requested
+        del audio_path, device, job_id, on_stage, cancel_requested
         calls.append(dict(env_overrides))
         if len(calls) == 1:
-            return (
-                [],
-                [],
-                {
-                    "cuda_memory": [
-                        {
-                            "stage": "asr_text_transcribe_done",
-                            "max_reserved_mb": 6200.0,
-                        }
-                    ],
-                    "stage_worker": {"mode": "gpu_worker"},
-                },
-            )
+            self._kill_child()
+            raise gpu_worker.GpuWorkerError("oom", "hard oom from worker")
         assert env_overrides["ASR_BATCH_SIZE"] == "6"
         return (
             [{"start": 0.0, "end": 1.0, "text": "ok"}],
@@ -130,7 +150,7 @@ def test_stage_worker_treats_vram_budget_excess_as_oom_retry(monkeypatch, tmp_pa
                 "cuda_memory": [
                     {
                         "stage": "asr_text_transcribe_done",
-                        "max_reserved_mb": 5200.0,
+                        "max_allocated_mb": 4800.0,
                     }
                 ],
                 "stage_worker": {"mode": "gpu_worker"},
@@ -161,10 +181,71 @@ def test_stage_worker_treats_vram_budget_excess_as_oom_retry(monkeypatch, tmp_pa
     assert details["stage_worker"]["oom_retries"][0]["next_batch_size"] == 6
 
 
+def test_stage_worker_keeps_successful_result_when_reserved_exceeds_budget(
+    monkeypatch, tmp_path
+):
+    # Regression guard for the VRAM-budget fix: a job that completes successfully
+    # must NOT be discarded just because the allocator's *reserved* pool exceeded
+    # the budget. Reserved routinely fills dedicated VRAM on a 6GB card without
+    # spilling and does not respond to batch downshift. Enforcement is
+    # allocated-based and happens mid-pipeline, never retroactively on success.
+    warned: list[str] = []
+
+    def fake_once(
+        self,
+        audio_path,
+        *,
+        device,
+        env_overrides,
+        job_id,
+        on_stage=None,
+        cancel_requested=None,
+    ):
+        del self, audio_path, device, job_id, cancel_requested
+        return (
+            [{"start": 0.0, "end": 1.0, "text": "ok"}],
+            ["ok"],
+            {
+                "cuda_memory": [
+                    {
+                        "stage": "asr_text_transcribe_done",
+                        "max_reserved_mb": 6200.0,
+                        "max_allocated_mb": 4800.0,
+                    }
+                ],
+                "stage_worker": {"mode": "gpu_worker"},
+            },
+        )
+
+    def fake_kill(self):
+        raise AssertionError("successful result must not kill/retry the worker")
+
+    monkeypatch.setattr(gpu_worker._GpuWorkerClient, "_transcribe_and_align_once", fake_once)
+    monkeypatch.setattr(gpu_worker._GpuWorkerClient, "_kill_child", fake_kill)
+
+    client = gpu_worker._GpuWorkerClient()
+    segments, _log, details = client.transcribe_and_align(
+        str(tmp_path / "audio.wav"),
+        env_overrides={
+            "ASR_BACKEND": "jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame-hf",
+            "ASR_BATCH_SIZE": "12",
+            "ASR_STAGE_WORKER_VRAM_BUDGET_MB": "5600",
+        },
+        on_stage=lambda message: warned.append(message),
+    )
+
+    assert segments[0]["text"] == "ok"
+    assert "oom_retries" not in details.get("stage_worker", {})
+    # A non-fatal warning surfaces the reserved spike (6200 > 5600) for logs.
+    assert any("reserved VRAM peaked" in message for message in warned)
+
+
 def test_stage_worker_stops_with_low_vram_guidance_when_batch_one_oom(
     monkeypatch,
     tmp_path,
 ):
+    # Persistent hard OOM down to batch=1 surfaces the low-VRAM guidance and
+    # stops the job instead of looping forever.
     monkeypatch.setenv("ASR_STAGE_WORKER_OOM_RETRY_LIMIT", "3")
     calls: list[dict] = []
     killed = {"count": 0}
@@ -179,21 +260,10 @@ def test_stage_worker_stops_with_low_vram_guidance_when_batch_one_oom(
         on_stage=None,
         cancel_requested=None,
     ):
-        del self, audio_path, device, job_id, on_stage, cancel_requested
+        del audio_path, device, job_id, on_stage, cancel_requested
         calls.append(dict(env_overrides))
-        return (
-            [],
-            [],
-            {
-                "cuda_memory": [
-                    {
-                        "stage": "asr_text_transcribe_done",
-                        "max_reserved_mb": 6200.0,
-                    }
-                ],
-                "stage_worker": {"mode": "gpu_worker"},
-            },
-        )
+        self._kill_child()
+        raise gpu_worker.GpuWorkerError("oom", "hard oom from worker")
 
     def fake_kill(self):
         del self

@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import atexit
 import gc
-import importlib
 import multiprocessing as mp
 import os
 import sys
@@ -121,22 +120,16 @@ def _clear_worker_cuda() -> None:
 
 
 def _load_asr_pipeline_for_request():
-    # These modules read ASR settings into module-level constants. Reload them
-    # after applying per-request env so a long-lived worker can handle changed
-    # model/batch/checkpoint settings without inheriting stale globals.
-    module_order = (
-        "asr.backends.qwen",
-        "asr.local_backend",
-        "asr.backends.registry",
-        "asr.pipeline",
-    )
-    for module_name in module_order:
-        module = sys.modules.get(module_name)
-        if module is not None:
-            importlib.reload(module)
+    # No per-request reload. The settings that vary per job (ASR_BACKEND,
+    # ASR_BATCH_SIZE, dtype/attention, boundary/pre-asr-cueqc flags) are all read
+    # from env at CALL time -- current_asr_backend(), _resolve_asr_batch_size(),
+    # _detect_dtype(), _boundary_config(), pre_asr_cueqc.enabled(), ... -- so a
+    # persistent worker picks up each job's _temporary_env without re-importing.
+    # The only env frozen at CUDA init (PYTORCH_CUDA_ALLOC_CONF,
+    # CUDA_VISIBLE_DEVICES) is handled by the client's restart-on-change.
     from asr import pipeline as asr_pipeline
 
-    return importlib.reload(asr_pipeline)
+    return asr_pipeline
 
 
 class GpuModelManager:
@@ -393,19 +386,27 @@ def _vram_budget_for_env(env: dict[str, str]) -> float:
         return 0.0
 
 
-def _cuda_peak_reserved_from_details(asr_details: dict[str, Any]) -> float | None:
+def _cuda_peak_mb_from_details(
+    asr_details: dict[str, Any],
+    *,
+    metric: str,
+) -> float | None:
+    """Peak VRAM (MB) across worker-reported snapshots for one metric.
+
+    metric="reserved"  -> max of max_reserved_mb / reserved_mb (allocator pool).
+    metric="allocated" -> max of max_allocated_mb / allocated_mb (working set).
+    """
+    keys = {
+        "reserved": ("max_reserved_mb", "reserved_mb"),
+        "allocated": ("max_allocated_mb", "allocated_mb"),
+    }[metric]
     values: list[float] = []
     snapshots = asr_details.get("cuda_memory")
     if isinstance(snapshots, list):
         for snapshot in snapshots:
             if not isinstance(snapshot, dict):
                 continue
-            for key in (
-                "max_reserved_mb",
-                "reserved_mb",
-                "max_allocated_mb",
-                "allocated_mb",
-            ):
+            for key in keys:
                 try:
                     values.append(float(snapshot.get(key)))
                 except (TypeError, ValueError):
@@ -413,16 +414,30 @@ def _cuda_peak_reserved_from_details(asr_details: dict[str, Any]) -> float | Non
     return round(max(values), 1) if values else None
 
 
-def _soft_oom_detail(asr_details: dict[str, Any], env: dict[str, str]) -> str:
+def _budget_exceeded_warning(
+    asr_details: dict[str, Any],
+    env: dict[str, str],
+) -> str:
+    """Non-fatal note when the allocator's *reserved* pool exceeded the budget.
+
+    A job that completed successfully is never retroactively turned into an OOM:
+    the reserved pool routinely fills dedicated VRAM on a 6GB card without any
+    spill to shared memory, and reserved does not respond to batch downshift.
+    Real enforcement is allocated-based and happens mid-pipeline
+    (asr/pipeline.py). This only surfaces the peak so it can be logged.
+    """
     budget_mb = _vram_budget_for_env(env)
     if budget_mb <= 0.0:
         return ""
-    peak_mb = _cuda_peak_reserved_from_details(asr_details)
-    if peak_mb is None or peak_mb <= budget_mb:
+    peak_reserved = _cuda_peak_mb_from_details(asr_details, metric="reserved")
+    if peak_reserved is None or peak_reserved <= budget_mb:
         return ""
+    peak_allocated = _cuda_peak_mb_from_details(asr_details, metric="allocated")
+    alloc_text = f"{peak_allocated:.0f}MB" if peak_allocated is not None else "n/a"
     return (
-        "GPU VRAM budget exceeded after worker result: "
-        f"peak_mb={peak_mb:.1f} budget_mb={budget_mb:.1f}"
+        f"GPU reserved VRAM peaked at {peak_reserved:.0f}MB "
+        f"(budget {budget_mb:.0f}MB, allocated peak {alloc_text}); "
+        "job completed successfully, no retry triggered."
     )
 
 
@@ -432,8 +447,21 @@ def worker_main(parent_conn: Connection) -> None:
     if not _safe_send(parent_conn, {"op": "ready", "pid": pid}):
         return
 
+    # Idle self-exit (read from the inherited process env, not per-job
+    # overrides -- this is a process-lifecycle knob, see config.py). When the
+    # worker has had no inbound request for MAX_IDLE_S seconds, exit so the next
+    # job starts from a clean CUDA state. The client detects the exit via
+    # is_alive() and restarts transparently on the next request. A per-job
+    # restart cadence is intentionally NOT provided: every job already does
+    # gc.collect() + empty_cache() on completion, so VRAM does not accumulate
+    # across jobs and a job counter would only add cold-start cost.
+    idle_timeout_s = _env_float("ASR_STAGE_WORKER_MAX_IDLE_S", 300.0)
+
     while True:
         try:
+            if idle_timeout_s > 0.0 and not parent_conn.poll(idle_timeout_s):
+                _clear_worker_cuda()
+                return
             msg = parent_conn.recv()
         except (EOFError, OSError):
             return
@@ -545,6 +573,12 @@ def worker_main(parent_conn: Connection) -> None:
             raise SystemExit(0)
 
 
+# Env read by CUDA only at runtime/driver init, so changing it on a *running*
+# persistent worker has no effect. The client restarts the worker when one of
+# these differs from the values it was started under.
+_CUDA_INIT_ENV_KEYS = ("PYTORCH_CUDA_ALLOC_CONF", "CUDA_VISIBLE_DEVICES")
+
+
 class _GpuWorkerClient:
     def __init__(self) -> None:
         self._ctx = mp.get_context("spawn")
@@ -552,6 +586,9 @@ class _GpuWorkerClient:
         self._conn = None
         self._job_handle = None
         self.kill_grace_s = _env_float("ASR_STAGE_WORKER_KILL_GRACE_S", 5.0)
+        # Snapshot of the CUDA-init-time env the live worker was started under,
+        # so we can restart it when a later job needs different alloc/device.
+        self._cuda_init_env: dict[str, str] | None = None
 
     def is_alive(self) -> bool:
         return (
@@ -603,13 +640,29 @@ class _GpuWorkerClient:
                 self._job_handle = None
                 self._close_conn()
 
+    def _effective_cuda_init_env(
+        self,
+        env_overrides: dict[str, str] | None,
+    ) -> dict[str, str]:
+        env_overrides = env_overrides or {}
+        result: dict[str, str] = {}
+        for key in _CUDA_INIT_ENV_KEYS:
+            if key in env_overrides:
+                result[key] = str(env_overrides[key])
+            else:
+                result[key] = os.environ.get(key, "")
+        return result
+
     def _start_worker(self) -> None:
         self._kill_child()
         parent_conn, child_conn = self._ctx.Pipe(duplex=True)
+        # daemon=True off-Windows so a SIGKILL'd/orphaned parent still reaps the
+        # GPU child (no Job Object there). Windows keeps daemon=False and relies
+        # on the kill-on-close Job Object assigned below.
         process = self._ctx.Process(
             target=worker_main,
             args=(child_conn,),
-            daemon=False,
+            daemon=(os.name != "nt"),
         )
         process.start()
         self._job_handle = None
@@ -672,6 +725,33 @@ class _GpuWorkerClient:
             return
         self._start_worker()
 
+    def _send_request(self, payload: dict[str, Any], env_overrides: dict[str, str] | None) -> None:
+        """Send a request, transparently restarting once if the pipe is dead.
+
+        A persistent worker can self-exit between jobs (idle timeout / max-jobs
+        cadence) or be killed by an OOM retry; rather than surfacing that as a
+        crash, restart and resend once before giving up. Also records the
+        CUDA-init-time env the (re)started worker is running under.
+        """
+        for attempt in range(2):
+            self._ensure_worker()
+            conn = self._conn
+            if conn is None:
+                continue
+            try:
+                conn.send(payload)
+                self._cuda_init_env = self._effective_cuda_init_env(env_overrides)
+                return
+            except (BrokenPipeError, EOFError, OSError) as exc:
+                exitcode = self._process.exitcode if self._process is not None else None
+                self._kill_child()
+                if attempt == 1:
+                    raise GpuWorkerError(
+                        "crash",
+                        f"ASR stage worker send failed exitcode={exitcode}: {exc!r}",
+                    ) from exc
+                # Loop: _ensure_worker starts a fresh worker and we resend.
+
     def _transcribe_and_align_once(
         self,
         audio_path: str,
@@ -682,8 +762,13 @@ class _GpuWorkerClient:
         on_stage: Callable[[str], None] | None = None,
         cancel_requested: Callable[[], bool] | None = None,
     ) -> tuple[list[dict], list[str], dict]:
-        self._ensure_worker()
-        assert self._conn is not None
+        # If CUDA-init-time env changed since the worker started (e.g. a new
+        # PYTORCH_CUDA_ALLOC_CONF), restart it: those keys are only read at CUDA
+        # runtime init and would otherwise be frozen for the worker's lifetime.
+        if self.is_alive() and self._cuda_init_env is not None:
+            if self._effective_cuda_init_env(env_overrides) != self._cuda_init_env:
+                self._kill_child()
+
         request_id = str(job_id or uuid.uuid4().hex[:8])
         payload = {
             "op": "transcribe_and_align",
@@ -692,15 +777,8 @@ class _GpuWorkerClient:
             "device": str(device or "auto"),
             "env": dict(env_overrides or {}),
         }
-        try:
-            self._conn.send(payload)
-        except (BrokenPipeError, EOFError, OSError) as exc:
-            exitcode = self._process.exitcode if self._process is not None else None
-            self._kill_child()
-            raise GpuWorkerError(
-                "crash",
-                f"ASR stage worker send failed exitcode={exitcode}: {exc!r}",
-            ) from exc
+        self._send_request(payload, env_overrides)
+        assert self._conn is not None
 
         timeout_s = _env_float("ASR_STAGE_WORKER_TIMEOUT_S", 0.0)
         deadline = time.monotonic() + timeout_s if timeout_s > 0 else None
@@ -802,10 +880,15 @@ class _GpuWorkerClient:
                     on_stage=on_stage,
                     cancel_requested=cancel_requested,
                 )
-                soft_oom = _soft_oom_detail(asr_details, current_env)
-                if soft_oom:
-                    self._kill_child()
-                    raise GpuWorkerError("oom", soft_oom)
+                # A successful result is final -- never discard it for a VRAM
+                # budget. Surface a non-fatal note if the reserved pool spiked,
+                # but keep the segments. Hard OOM is caught below / mid-pipeline.
+                warning = _budget_exceeded_warning(asr_details, current_env)
+                if warning and on_stage is not None:
+                    try:
+                        on_stage(warning)
+                    except BaseException:
+                        pass
                 if retry_records:
                     stage_worker = asr_details.setdefault("stage_worker", {})
                     if isinstance(stage_worker, dict):
