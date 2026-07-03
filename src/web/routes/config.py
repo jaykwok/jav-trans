@@ -3,7 +3,10 @@ from __future__ import annotations
 import json
 import os
 import re
+import subprocess
+import sys
 import threading
+from functools import lru_cache
 from pathlib import Path
 from typing import Any, get_args
 
@@ -23,6 +26,7 @@ from asr.backends.qwen import (
 from core.config import DEFAULT_SETTINGS, load_config
 from utils import model_paths
 from utils.model_paths import PROJECT_ROOT, normalize_hf_endpoint
+from utils.runtime_paths import is_frozen
 from web.models import (
     JobSpec,
     SettingsRead,
@@ -260,6 +264,70 @@ def _merge_model_requirements(requirements: list[dict[str, Any]]) -> list[dict[s
     return merged
 
 
+def _cuda_probe_command() -> list[str]:
+    if is_frozen():
+        return [sys.executable, "--cuda-probe-child"]
+    return [sys.executable, str(PROJECT_ROOT / "launcher.py"), "--cuda-probe-child"]
+
+
+def _parse_probe_json(stdout: str) -> dict[str, Any] | None:
+    text = (stdout or "").strip()
+    if not text:
+        return None
+    for line in reversed(text.splitlines()):
+        line = line.strip()
+        if not line.startswith("{"):
+            continue
+        try:
+            payload = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(payload, dict):
+            return payload
+    return None
+
+
+@lru_cache(maxsize=1)
+def _cuda_environment_status() -> dict[str, Any]:
+    env = dict(os.environ)
+    env.setdefault("PYTHONIOENCODING", "utf-8")
+    try:
+        completed = subprocess.run(
+            _cuda_probe_command(),
+            cwd=str(PROJECT_ROOT),
+            env=env,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=20,
+        )
+    except Exception as exc:  # noqa: BLE001 - diagnostic endpoint
+        return {
+            "status": "error",
+            "ok": False,
+            "code": "probe_failed",
+            "message": f"CUDA 环境检测无法启动：{type(exc).__name__}: {exc}",
+        }
+    payload = _parse_probe_json(completed.stdout)
+    if payload is None:
+        detail = (completed.stderr or completed.stdout or "").strip()
+        return {
+            "status": "error",
+            "ok": False,
+            "code": "probe_invalid_output",
+            "message": f"CUDA 环境检测没有返回有效结果。{detail}",
+        }
+    payload.setdefault("ok", payload.get("status") == "ok")
+    payload.setdefault("status", "ok" if payload.get("ok") else "error")
+    if completed.returncode != 0 and payload.get("ok"):
+        payload["status"] = "warning"
+        payload["ok"] = False
+    if completed.stderr.strip():
+        payload["stderr"] = completed.stderr.strip()
+    return payload
+
+
 def _checkpoint_requirements(repo_id: str) -> list[dict[str, Any]]:
     requirements: list[dict[str, Any]] = []
     for role, label, mapping_env, default_mapping in _CHECKPOINT_SPECS:
@@ -391,16 +459,19 @@ async def get_model_requirements(
     missing_checkpoints = [
         item for item in checkpoint_requirements if not item["present"]
     ]
+    cuda_status = _cuda_environment_status()
     return {
         "asr_backend": backend,
         "required_models": requirements,
         "required_checkpoints": checkpoint_requirements,
+        "cuda": cuda_status,
         "missing_count": len(missing),
         "checkpoint_missing_count": len(missing_checkpoints),
         "needs_download": any(item["download_enabled"] for item in missing),
         "download_disabled": any(not item["download_enabled"] for item in missing),
         "all_present": not missing,
-        "pipeline_ready": not missing and not missing_checkpoints,
+        "gpu_ready": bool(cuda_status.get("ok")),
+        "pipeline_ready": not missing and not missing_checkpoints and bool(cuda_status.get("ok")),
     }
 
 

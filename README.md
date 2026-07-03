@@ -78,6 +78,7 @@ PYTHONIOENCODING=utf-8 PYTHONPATH=src uv run python -m uvicorn web.app:create_ap
 ```
 
 Web 提交是否使用 CUDA 取决于后端服务进程是否能看到 GPU，而不是浏览器本身。完整 SpeechBoundary-JA / ASR smoke 应确认日志中出现 `cuda_available=True`、`device=cuda:0` 或 `actual_device=cuda`。
+Windows 打包版会自带 CUDA 版 PyTorch runtime，但仍需要用户本机 NVIDIA 驱动支持对应 CUDA runtime；Web 会在模型要求检查中提示驱动过旧或 CUDA 初始化失败。
 
 ---
 

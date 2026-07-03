@@ -59,6 +59,10 @@ def test_model_requirements_marks_disabled_boundary_download(tmp_path, monkeypat
     asyncio.run(_test_model_requirements_marks_disabled_boundary_download(tmp_path, monkeypatch))
 
 
+def test_model_requirements_includes_cuda_driver_warning(tmp_path, monkeypatch):
+    asyncio.run(_test_model_requirements_includes_cuda_driver_warning(tmp_path, monkeypatch))
+
+
 def test_settings_hf_endpoint_updates_runtime_env(monkeypatch):
     asyncio.run(_test_settings_hf_endpoint_updates_runtime_env(monkeypatch))
 
@@ -164,7 +168,13 @@ async def _test_config_lists_recommended_asr_backend_first(monkeypatch):
     assert set(payload["backends"]) == set(config_routes.BACKENDS)
 
 
-def _isolate_model_requirement_env(tmp_path, monkeypatch, *, boundary_no_download: str = "0") -> None:
+def _isolate_model_requirement_env(
+    tmp_path,
+    monkeypatch,
+    *,
+    boundary_no_download: str = "0",
+    cuda_status: dict | None = None,
+) -> None:
     models_root = tmp_path / "models"
     resource_root = tmp_path / "resource"
     monkeypatch.setattr(config_routes.model_paths, "PROJECT_ROOT", tmp_path)
@@ -181,6 +191,18 @@ def _isolate_model_requirement_env(tmp_path, monkeypatch, *, boundary_no_downloa
     }
     for key, value in env_values.items():
         monkeypatch.setenv(key, value)
+    monkeypatch.setattr(
+        config_routes,
+        "_cuda_environment_status",
+        lambda: cuda_status
+        or {
+            "status": "ok",
+            "ok": True,
+            "code": "ok",
+            "message": "CUDA 可用。",
+            "torch_cuda_version": "12.8",
+        },
+    )
 
 
 async def _test_model_requirements_for_17b_include_boundary(tmp_path, monkeypatch):
@@ -265,6 +287,47 @@ async def _test_model_requirements_marks_disabled_boundary_download(tmp_path, mo
     assert payload["download_disabled"] is True
     assert payload["checkpoint_missing_count"] == 0
     assert payload["pipeline_ready"] is False
+
+
+async def _test_model_requirements_includes_cuda_driver_warning(tmp_path, monkeypatch):
+    _isolate_model_requirement_env(
+        tmp_path,
+        monkeypatch,
+        cuda_status={
+            "status": "error",
+            "ok": False,
+            "code": "driver_too_old",
+            "message": "NVIDIA 驱动最高支持 CUDA 12.1，但当前打包的 PyTorch 需要 CUDA 12.8。",
+            "torch_cuda_version": "12.8",
+            "nvidia_smi": {
+                "cuda_version": "12.1",
+                "driver_version": "531.79",
+            },
+        },
+    )
+    local_model = tmp_path / "models" / "jaykwok-Qwen3-ASR-1.7B-JA-Anime-Galgame-hf"
+    local_model.mkdir(parents=True)
+    (local_model / "config.json").write_text("{}", encoding="utf-8")
+    (local_model / "model.safetensors").write_bytes(b"weights")
+
+    transport = httpx.ASGITransport(app=create_app())
+    async with httpx.AsyncClient(
+        transport=transport,
+        base_url="http://test",
+    ) as client:
+        response = await client.get(
+            "/api/model-requirements",
+            params={"asr_backend": config_routes.RECOMMENDED_ASR_BACKEND},
+        )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["missing_count"] == 0
+    assert payload["gpu_ready"] is False
+    assert payload["pipeline_ready"] is False
+    assert payload["cuda"]["code"] == "driver_too_old"
+    assert "CUDA 12.8" in payload["cuda"]["message"]
+
 
 async def _test_settings_hf_endpoint_updates_runtime_env(monkeypatch):
     monkeypatch.delenv("HF_ENDPOINT", raising=False)

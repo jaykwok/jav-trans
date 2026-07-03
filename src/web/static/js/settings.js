@@ -30,27 +30,43 @@ function renderModelRequirements(payload) {
   const missingModels = (payload.required_models || []).filter(item => !item.present);
   const missingCheckpoints = (payload.required_checkpoints || []).filter(item => !item.present);
   const missing = [...missingModels, ...missingCheckpoints];
-  if (!missing.length) {
+  const cuda = payload.cuda || {};
+  const cudaProblem = cuda.status && cuda.status !== 'ok';
+  if (!missing.length && !cudaProblem) {
     notice.hidden = true;
     notice.textContent = '';
     return;
   }
 
-  let message;
-  if (missingCheckpoints.length && missingModels.length) {
-    message = `当前配置缺少 ${missingModels.length} 个基础模型和 ${missingCheckpoints.length} 个前置 checkpoint；基础模型可按配置下载，checkpoint 需要先准备。`;
-  } else if (missingCheckpoints.length) {
-    message = `当前 ASR 后端缺少 ${missingCheckpoints.length} 个前置 checkpoint，不能运行完整五模型链。`;
-  } else if (payload.download_disabled && payload.needs_download) {
-    message = `当前配置缺少 ${missingModels.length} 个模型；可自动下载的模型会在首次运行下载，已关闭自动下载的模型需要先准备。`;
-  } else if (payload.download_disabled) {
-    message = '当前配置缺少基础模型文件，且已关闭自动下载，需要先准备本地模型。';
-  } else {
-    message = `首次使用该配置需要下载 ${missingModels.length} 个模型；下载完成后会复用本地缓存。`;
+  const sections = [];
+  if (missing.length) {
+    let message;
+    if (missingCheckpoints.length && missingModels.length) {
+      message = `当前配置缺少 ${missingModels.length} 个基础模型和 ${missingCheckpoints.length} 个前置 checkpoint；基础模型可按配置下载，checkpoint 需要先准备。`;
+    } else if (missingCheckpoints.length) {
+      message = `当前 ASR 后端缺少 ${missingCheckpoints.length} 个前置 checkpoint，不能运行完整五模型链。`;
+    } else if (payload.download_disabled && payload.needs_download) {
+      message = `当前配置缺少 ${missingModels.length} 个模型；可自动下载的模型会在首次运行下载，已关闭自动下载的模型需要先准备。`;
+    } else if (payload.download_disabled) {
+      message = '当前配置缺少基础模型文件，且已关闭自动下载，需要先准备本地模型。';
+    } else {
+      message = `首次使用该配置需要下载 ${missingModels.length} 个模型；下载完成后会复用本地缓存。`;
+    }
+    const missingText = missing.map(formatRequirementLabel).join('、');
+    sections.push(`${escHtml(message)}<br><strong>缺少：</strong>${escHtml(missingText)}`);
   }
 
-  const missingText = missing.map(formatRequirementLabel).join('、');
-  notice.innerHTML = `${escHtml(message)}<br><strong>缺少：</strong>${escHtml(missingText)}`;
+  if (cudaProblem) {
+    const smi = cuda.nvidia_smi || {};
+    const runtime = cuda.torch_cuda_version ? `PyTorch CUDA ${cuda.torch_cuda_version}` : '';
+    const driverCuda = smi.cuda_version ? `驱动 CUDA ${smi.cuda_version}` : '';
+    const driver = smi.driver_version ? `驱动 ${smi.driver_version}` : '';
+    const detail = [runtime, driverCuda, driver].filter(Boolean).join(' · ');
+    const message = cuda.message || 'CUDA 环境不可用，请更新 NVIDIA 显卡驱动后重启应用。';
+    sections.push(`${escHtml(message)}${detail ? `<br><strong>环境：</strong>${escHtml(detail)}` : ''}`);
+  }
+
+  notice.innerHTML = sections.join('<br>');
   notice.hidden = false;
 }
 

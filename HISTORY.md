@@ -29,6 +29,8 @@ SpeechIslandScorer v8（speech only）
 
 ## 路线修正
 
+- 2026-07-03 Windows 打包 CUDA 驱动兼容提示：确认 PyInstaller 包可自带 CUDA 版 PyTorch runtime DLL，但不能替代用户本机 NVIDIA display driver；驱动最高支持的 CUDA runtime 低于 bundled PyTorch `torch.version.cuda` 时，`torch.cuda` 会初始化失败。新增 `launcher.py --cuda-probe-child` 子进程探测路径，避免 Web 主进程触碰 CUDA；`/api/model-requirements` 合并 CUDA probe 结果并返回 `cuda/gpu_ready`，前端识别设置区在驱动过旧、未检测到 NVIDIA GPU 或 PyTorch CUDA 初始化失败时提示更新 NVIDIA 驱动/检查显卡环境。当前本机 `.venv` 估算：CUDA 版 `torch` 未压缩约 `4.09GiB`（`torch/lib` 约 `3.99GiB`），两个 HF 模型目录合计约 `5.28GiB`（1.7B 约 `3.81GiB`，0.6B 约 `1.47GiB`）；默认发布若用 `-SkipModels` 可省掉模型体积，但 torch/CUDA runtime 仍是包体主因。
+
 - 2026-07-03 本地诊断日志与阶段耗时落盘：确认 `tmp/web/jobs/<job_id>` / `tmp/jobs/<job_id>` 属于可清理的任务临时目录，不适合作为唯一查错入口；采用 `tmp/log/<job_id>/` 作为默认持久诊断目录。`RUN_LOG_ENABLED` 默认改为 `1`，`RUN_LOG_DIR=./tmp/log`，Web/CLI 普通任务默认写 `.run.log`；完成写出时仍在 job temp 写原 `.timings.json`，并同步一份到 `tmp/log/<job_id>/`，记录音频准备、Boundary/Pre-ASR/ASR、翻译、写出、总耗时、显存快照和翻译请求耗时。Web 完成任务的“其他文件”会包含 `.run.log` 与持久 `.timings.json`，即使默认清理 job temp，查错和后续性能优化数据仍保留；`.env` 首次保存模板增加注释掉的 `RUN_LOG_ENABLED/RUN_LOG_DIR` 供高级用户覆盖。
 
 - 2026-07-03 OOM 降级终止策略补充：`ASR_STAGE_WORKER_OOM_RETRY_LIMIT` 默认从 `1` 调整为 `3`，覆盖默认 batch 表的 `12→6→3→1` 与 `4→2→1` 自动降级路径。GPU worker 在软/硬 OOM 时仍优先杀掉当前 worker、释放 CUDA context 并降低 `ASR_BATCH_SIZE`；如果已经降到 `ASR_BATCH_SIZE=1` 仍然 OOM，立即停止任务，抛出面向 Web 的中文错误，提示“任务已停止”并建议在前端切换到 `jaykwok/Qwen3-ASR-0.6B-JA-Anime-Galgame-hf` 低显存档或关闭其他 GPU 占用。Web job error 展示改为优先使用异常 `detail`，避免把用户提示包进内部异常前缀。
