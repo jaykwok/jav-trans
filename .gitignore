@@ -1,7 +1,6 @@
 # Local secrets and environments
 .env
 .env.*
-!.env.example
 .venv/
 .claude/
 .codex/

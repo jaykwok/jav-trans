@@ -35,6 +35,24 @@ def test_qwen3_asr_repo_backend_dispatch_uses_subprocess_backend(monkeypatch):
     assert asr.get_backend_label() == f"{ASR_06B_BACKEND} (subprocess worker)"
 
 
+def test_qwen3_asr_default_worker_mode_is_inproc_for_6gb(monkeypatch):
+    monkeypatch.delenv("ASR_WORKER_MODE", raising=False)
+    monkeypatch.delenv("ASR_WORKER_MODE_BY_REPO", raising=False)
+    from asr import pipeline as asr
+
+    monkeypatch.setenv("ASR_BACKEND", ASR_06B_BACKEND)
+    asr = importlib.reload(asr)
+    backend_06b = asr._resolve_asr_backend("cpu")
+    assert backend_06b.is_subprocess is False
+    assert asr.get_backend_label() == f"{ASR_06B_BACKEND} (inproc)"
+
+    monkeypatch.setenv("ASR_BACKEND", ASR_17B_BACKEND)
+    asr = importlib.reload(asr)
+    backend_17b = asr._resolve_asr_backend("cpu")
+    assert backend_17b.is_subprocess is False
+    assert asr.get_backend_label() == f"{ASR_17B_BACKEND} (inproc)"
+
+
 def test_invalid_worker_mode_is_rejected(monkeypatch):
     asr = _reload_asr(monkeypatch, backend=ASR_17B_BACKEND, worker_mode="invalid")
 

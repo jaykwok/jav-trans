@@ -1,7 +1,11 @@
 import os
 
 from asr.backends.base import BaseAsrBackend
-from asr.backends.qwen import DEFAULT_QWEN_ASR_BACKEND, QWEN_ASR_BACKEND_REPOS
+from asr.backends.qwen import (
+    DEFAULT_QWEN_ASR_BACKEND,
+    QWEN_ASR_BACKEND_REPOS,
+    qwen_asr_default_worker_mode,
+)
 from asr.local_backend import LocalAsrBackend, SubprocessAsrBackend
 
 
@@ -17,7 +21,10 @@ def current_asr_backend() -> str:
 
 
 def current_asr_worker_mode() -> str:
-    return os.getenv("ASR_WORKER_MODE", "subprocess").strip().lower()
+    explicit = os.getenv("ASR_WORKER_MODE", "").strip().lower()
+    if explicit:
+        return explicit
+    return qwen_asr_default_worker_mode(current_asr_backend()).strip().lower()
 
 
 def get_backend_label() -> str:

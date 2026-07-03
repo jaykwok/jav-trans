@@ -56,11 +56,16 @@ DEFAULT_SETTINGS: dict[str, str] = {
 
     # --- Batch Size & Limits ---
     # ASR inference batch size. auto resolves by ASR_BACKEND repo id.
-    # Defaults target low-config 0.6B fallback and 6GB-class 1.7B runs.
+    # Defaults target 6GB-class cards. inproc avoids the extra CUDA context
+    # that subprocess mode keeps alive beside the main pipeline process.
     "ASR_BATCH_SIZE": "auto",
     "ASR_BATCH_SIZE_BY_REPO": (
-        "jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame-hf=32,"
-        "jaykwok/Qwen3-ASR-0.6B-JA-Anime-Galgame-hf=64"
+        "jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame-hf=4,"
+        "jaykwok/Qwen3-ASR-0.6B-JA-Anime-Galgame-hf=24"
+    ),
+    "ASR_WORKER_MODE_BY_REPO": (
+        "jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame-hf=inproc,"
+        "jaykwok/Qwen3-ASR-0.6B-JA-Anime-Galgame-hf=inproc"
     ),
     # Max generated tokens configured when loading the Qwen ASR wrapper.
     "ASR_MAX_NEW_TOKENS": "128",
@@ -80,6 +85,8 @@ DEFAULT_SETTINGS: dict[str, str] = {
     "BOUNDARY_FRAME_SEQUENCE_RIGHT_CONTEXT_S": "0.60",
     "BOUNDARY_FRAME_SEQUENCE_MAX_PTM_DIMS": "128",
     "BOUNDARY_FRAME_SEQUENCE_INCLUDE_MFCC": "1",
+    "SPEECH_BOUNDARY_JA_WINDOW_S": "20.0",
+    "SPEECH_BOUNDARY_JA_OVERLAP_S": "4.0",
     # Optional learned SpeechBoundary-JA Mamba2 scorer override. Empty uses the registered repo-id scorer when available; auto resolves the same registry explicitly.
     "SPEECH_BOUNDARY_JA_SCORER_CHECKPOINT_BY_REPO": "",
     "SPEECH_BOUNDARY_JA_SCORER_DEVICE": "auto",
@@ -91,8 +98,8 @@ DEFAULT_SETTINGS: dict[str, str] = {
     "BOUNDARY_CACHE_DIR": "./tmp/cache/boundary",
 
     # --- Pre-ASR CueQC v11 semantic chunk keep/drop router ---
-    # Disabled by default. When enabled it runs after final semantic chunks and before ASR.
-    "PRE_ASR_CUEQC_ENABLED": "0",
+    # Low-VRAM default: drop obvious non-speech chunks before ASR.
+    "PRE_ASR_CUEQC_ENABLED": "1",
     "PRE_ASR_CUEQC_MODEL_PATH_BY_REPO": "",
     "PRE_ASR_CUEQC_DEVICE": "auto",
     "PRE_ASR_CUEQC_DROP_THRESHOLD": "0.95",

@@ -25,9 +25,11 @@ SpeechIslandScorer v8（speech only）
 
 这次改造的核心不是换阈值，而是把不可逆的结构决策放回正确顺序：先得到完整 speech core，再判断是否切，最后才精修 cut point。内部切点始终锚定原音频绝对时间轴，相邻 chunk 共用同一个 timestamp；Outer Refiner 不再分别修切点左右边缘，因此不会制造 gap、overlap 或累计漂移。
 
-0.6B 与 1.7B 各自拥有五个 repo-bound active checkpoint，不能跨 repo 复用。旧 v7 双头 scorer、v8 refiner、v10 Pre-ASR schema 和 planner/packer API 不保留 alias。SpeechIslandScorer 输出维度为 1；Semantic Split 使用三分类和保守 runtime 门槛；Pre-ASR v11 在阈值 `0.95` 下运行，默认仍关闭，但两个 repo 的 checkpoint 均已进入 registry。ASR-after CueQC v4 只保留离线审计用途。
+0.6B 与 1.7B 各自拥有五个 repo-bound active checkpoint，不能跨 repo 复用。旧 v7 双头 scorer、v8 refiner、v10 Pre-ASR schema 和 planner/packer API 不保留 alias。SpeechIslandScorer 输出维度为 1；Semantic Split 使用三分类和保守 runtime 门槛；Pre-ASR v11 在阈值 `0.95` 下运行，6GB 默认配置启用，两个 repo 的 checkpoint 均已进入 registry。ASR-after CueQC v4 只保留离线审计用途。
 
 ## 路线修正
+
+- 2026-07-03 6GB VRAM workflow 实测与默认配置修正：匿名 867 样片完整 workflow 重跑确认旧 `1.7B batch=32 + SpeechBoundary window 30/5` 会把 `nvidia-smi` 推到约 `7.7GB`，进入共享显存后总耗时约 `458s`、ASR 文本转写约 `315s`，不适合 6GB。`1.7B batch=8 + window 20/4` 虽把 ASR 文本降到约 `87s`，但 subprocess 双 CUDA context 仍观测约 `7.6GB`；`1.7B batch=4 + window 20/4 + inproc` 完整链路约 `256s`，PyTorch peak reserved 约 `5198MB`，`nvidia-smi` 观测约 `5.55GB`，作为 1.7B 的 6GB 默认档。`0.6B batch=24 + window 20/4 + inproc` 完整链路约 `210s`，ASR 文本转写约 `75s`，`nvidia-smi` 轮询观测约 `4.7GB`，作为低配/更快档。最终产品默认仍为 `1.7B`，`0.6B` 只作为低配档；两档统一默认 `ASR_WORKER_MODE=inproc`，避免 subprocess 额外 CUDA context，显式高级配置仍可覆盖。默认 batch 表改为 `1.7B=4 / 0.6B=24`，SpeechBoundary window 改为 `20/4`，Pre-ASR CueQC 默认开启。`.env.example` 按用户要求从 active tree 删除；首次运行可以没有 `.env`，Web “翻译 API”保存 `API_KEY`、Base URL、模型、目标语言等时自动创建项目根目录 `.env`，并附带注释掉的 ASR / cache 可调示例供研究用户手动取消注释覆盖。验证：`tests/test_config.py tests/test_asr_backend_dispatch.py tests/test_run_full_workflow_env.py tests/web/test_jobs_api.py tests/test_asr_context_runtime.py tests/test_asr_segmentation_boundaries.py` 共 `69 passed`，`git diff --check` passed。
 
 - 2026-07-01 Qwen3-ASR actor/person-name context hint branch 断兼容删除：主 ASR runtime、ASR internals 捕获与 Qwen SFT prompt masking 均收敛到官方 Transformers `apply_transcription_request(audio=..., language=...)` / 同形态 prompt，不再构造 `Context hint:` system prompt，不再接受 `contexts` backend 参数，也不在 worker 协议中传 `context`。配置面删除 `ASR_CONTEXT` 默认值、`.env/.env.example`、Web 识别设置、settings API、JobSpec/JobContext、full workflow `--asr-context` 与 Omni 弱标注脚本 passthrough；ASR checkpoint/aligned-cache signature 不再受该变量扰动，翻译侧也不再从 `ASR_CONTEXT` 兜底生成 character reference。后续若需要人名表，应走独立翻译 glossary / character reference 设计，不再复用 ASR context。
 

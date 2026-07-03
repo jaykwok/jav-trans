@@ -696,8 +696,8 @@ class SpeechBoundaryJaConfig:
     device: str = "auto"
     dtype: str = "bfloat16"
     attention: str = "sdpa"
-    window_s: float = 30.0
-    overlap_s: float = 5.0
+    window_s: float = 20.0
+    overlap_s: float = 4.0
     min_segment_s: float = 0.05
     split_smooth_s: float = 0.08
     split_nms_s: float = 0.20
@@ -729,8 +729,8 @@ class SpeechBoundaryJaConfig:
             device=os.getenv("SPEECH_BOUNDARY_JA_DEVICE", "auto").strip() or "auto",
             dtype=os.getenv("SPEECH_BOUNDARY_JA_DTYPE", "bfloat16").strip() or "bfloat16",
             attention=os.getenv("SPEECH_BOUNDARY_JA_ATTENTION", "sdpa").strip() or "sdpa",
-            window_s=_env_float("SPEECH_BOUNDARY_JA_WINDOW_S", "30.0"),
-            overlap_s=_env_float("SPEECH_BOUNDARY_JA_OVERLAP_S", "5.0"),
+            window_s=_env_float("SPEECH_BOUNDARY_JA_WINDOW_S", "20.0"),
+            overlap_s=_env_float("SPEECH_BOUNDARY_JA_OVERLAP_S", "4.0"),
             min_segment_s=_env_float("SPEECH_BOUNDARY_JA_MIN_SEGMENT_S", "0.05"),
             split_smooth_s=_env_float("SPEECH_BOUNDARY_JA_SPLIT_SMOOTH_S", "0.08"),
             split_nms_s=_env_float("SPEECH_BOUNDARY_JA_SPLIT_NMS_S", "0.20"),
