@@ -1,5 +1,5 @@
 import { state } from './state.js';
-import { $, escHtml } from './util.js';
+import { $, escHtml, showToast } from './util.js';
 import { loadFormMemory, saveFormMemory, applyFormMemory } from './formMemory.js';
 import { setActivePreset } from './presets.js';
 
@@ -148,7 +148,19 @@ export async function loadSettings() {
       sel.disabled = false;
       $('api-model-preview').textContent = '当前：' + s.model;
     }
-    $('mirror-enabled').checked = s.hf_endpoint === 'https://hf-mirror.com';
+    const proxyProtocol = $('proxy-protocol');
+    if (proxyProtocol) proxyProtocol.value = s.proxy_protocol || 'http';
+    const proxyHost = $('proxy-host');
+    if (proxyHost) proxyHost.value = s.proxy_host || '';
+    const proxyPort = $('proxy-port');
+    if (proxyPort) proxyPort.value = s.proxy_port || '';
+    // Proxy is "on" exactly when a host and port are configured; reflect that
+    // in the enable switch and the summary status pill, and disable the fields
+    // when off so the state is obvious.
+    const proxyOn = !!(s.proxy_host && s.proxy_port);
+    const proxyEnabled = $('proxy-enabled');
+    if (proxyEnabled) proxyEnabled.checked = proxyOn;
+    updateProxyFieldsState();
 
     const effort = $('api-reasoning-effort');
     if (effort) effort.value = s.llm_reasoning_effort || 'xhigh';
@@ -190,7 +202,22 @@ export function readTranslationSettingsFromForm() {
   };
 }
 
-function buildSettingsBodyFromForm({ includeConnection = false, includeMirror = false } = {}) {
+function updateProxyFieldsState() {
+  const on = !!($('proxy-enabled')?.checked);
+  for (const id of ['proxy-protocol', 'proxy-host', 'proxy-port']) {
+    const el = $(id);
+    if (el) el.disabled = !on;
+  }
+  const testBtn = $('btn-proxy-test');
+  if (testBtn && !testBtn.dataset.testing) testBtn.disabled = !on;
+  const tag = $('proxy-status-tag');
+  if (tag) {
+    tag.textContent = on ? '已启用' : '未启用';
+    tag.dataset.on = on ? 'on' : 'off';
+  }
+}
+
+function buildSettingsBodyFromForm({ includeConnection = false, includeProxy = false } = {}) {
   const body = readTranslationSettingsFromForm();
   if (includeConnection) {
     const apiKey = $('api-key').value.trim();
@@ -200,8 +227,19 @@ function buildSettingsBodyFromForm({ includeConnection = false, includeMirror = 
     if (baseUrl) body.base_url = baseUrl;
     if (model) body.model = model;
   }
-  if (includeMirror) {
-    body.hf_endpoint = $('mirror-enabled').checked ? 'https://hf-mirror.com' : '';
+  if (includeProxy) {
+    // The enable switch is the single source of truth for on/off. Switch off
+    // -> clear host/port on save (the backend tears down the proxy). Switch on
+    // -> send the field values (port validated when present).
+    const enabled = !!$('proxy-enabled')?.checked;
+    const portText = ($('proxy-port')?.value || '').trim();
+    const parsedPort = portText ? Number(portText) : null;
+    if (enabled && portText && (!/^\d+$/.test(portText) || !Number.isInteger(parsedPort) || parsedPort < 1 || parsedPort > 65535)) {
+      throw new Error('代理端口必须是 1-65535 的数字');
+    }
+    body.proxy_protocol = $('proxy-protocol')?.value || 'http';
+    body.proxy_host = enabled ? ($('proxy-host')?.value || '').trim() : '';
+    body.proxy_port = enabled ? parsedPort : null;
   }
   return body;
 }
@@ -226,7 +264,7 @@ export async function saveSettingsBody(body) {
 export async function syncSettingsFromFormForSubmit() {
   const body = buildSettingsBodyFromForm({
     includeConnection: true,
-    includeMirror: true,
+    includeProxy: true,
   });
   await saveSettingsBody(body);
   saveFormMemory();
@@ -234,6 +272,63 @@ export async function syncSettingsFromFormForSubmit() {
 
 export function installSettingsPanel() {
   $('r-backend')?.addEventListener('change', refreshModelRequirements);
+
+  const saveProxySettings = async () => {
+    try {
+      await saveSettingsBody(buildSettingsBodyFromForm({ includeProxy: true }));
+      saveFormMemory();
+      const host = ($('proxy-host')?.value || '').trim();
+      const port = ($('proxy-port')?.value || '').trim();
+      showToast(host && port ? '代理设置已保存' : '代理设置已关闭');
+    } catch (e) {
+      showToast('保存代理设置失败：' + e.message);
+    }
+  };
+  for (const id of ['proxy-protocol', 'proxy-host', 'proxy-port']) {
+    const el = $(id);
+    if (el) el.addEventListener('change', saveProxySettings);
+  }
+  $('proxy-enabled')?.addEventListener('change', () => {
+    updateProxyFieldsState();
+    saveProxySettings();
+  });
+
+  const proxyTestBtn = $('btn-proxy-test');
+  proxyTestBtn?.addEventListener('click', async () => {
+    if (proxyTestBtn.disabled) return;
+    const resultEl = $('proxy-test-result');
+    const prevText = proxyTestBtn.textContent;
+    proxyTestBtn.dataset.testing = '1';
+    proxyTestBtn.disabled = true;
+    proxyTestBtn.textContent = '测试中…';
+    if (resultEl) { resultEl.textContent = ''; resultEl.className = 'proxy-test-result'; }
+    try {
+      // Apply the proxy to the runtime env first, then ask the backend to try
+      // reaching HuggingFace through it -- a wrong port fails loud here instead
+      // of silently hanging later model downloads.
+      await saveProxySettings();
+      const r = await fetch('/api/proxy-test', { method: 'POST' });
+      const data = await r.json().catch(() => ({}));
+      if (resultEl) {
+        if (data.ok) {
+          resultEl.textContent = `✓ 经代理连通 HuggingFace（${data.elapsed_ms ?? '?'}ms）`;
+          resultEl.className = 'proxy-test-result ok';
+        } else {
+          resultEl.textContent = '✗ ' + (data.error || '连接失败');
+          resultEl.className = 'proxy-test-result fail';
+        }
+      }
+    } catch (e) {
+      if (resultEl) {
+        resultEl.textContent = '✗ 测试失败：' + e.message;
+        resultEl.className = 'proxy-test-result fail';
+      }
+    } finally {
+      delete proxyTestBtn.dataset.testing;
+      proxyTestBtn.textContent = prevText;
+      updateProxyFieldsState();
+    }
+  });
 
   $('btn-show-key').addEventListener('click', () => {
     const inp = $('api-key');

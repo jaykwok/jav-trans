@@ -29,7 +29,7 @@
 
       <!-- Preset chips -->
       <div class="panel">
-        <div class="panel-title">预设</div>
+        <div class="panel-title">✨ 预设</div>
         <div class="preset-chips">
           <button class="preset-chip" data-preset="standard">标准</button>
           <button class="preset-chip preset-chip-custom" data-preset="custom">自定义</button>
@@ -38,7 +38,7 @@
 
       <!-- File picker -->
       <div class="panel">
-        <div class="panel-title">选择视频</div>
+        <div class="panel-title">📁 选择视频</div>
         <div class="drop-zone" id="drop-zone">
           <img class="drop-icon" src="/assets/images/icon.png" alt="" aria-hidden="true">
           <p><strong>点击选择（支持多选）</strong>或拖拽视频文件</p>
@@ -57,24 +57,61 @@
 
       <!-- Recognition settings -->
       <div class="panel">
-        <div class="panel-title">识别设置</div>
+        <div class="panel-title">🎯 识别设置</div>
         <div class="form-grid">
           <label class="field">
             <span>ASR 后端</span>
             <select id="r-backend"></select>
           </label>
           <div id="model-requirements-notice" class="model-requirements-notice" hidden></div>
-          <div class="toggle-row">
-            <span>hf-mirror.com 加速下载<br><span style="font-size:10px;color:var(--muted)">适合中国大陆用户，下次下载生效</span></span>
-            <label class="toggle"><input type="checkbox" id="mirror-enabled"><span class="slider"></span></label>
-          </div>
         </div>
+      </div>
+
+      <!-- Network proxy (collapsible, off by default) -->
+      <div class="panel">
+        <details class="panel-collapsible" id="panel-proxy">
+          <summary class="panel-title">
+            <span class="summary-label">
+              <span>🌐 网络代理</span>
+              <span class="status-tag" id="proxy-status-tag" data-on="off">未启用</span>
+            </span>
+          </summary>
+          <div class="form-grid">
+            <div class="toggle-row">
+              <span>启用代理（HuggingFace 模型下载加速）</span>
+              <label class="toggle"><input type="checkbox" id="proxy-enabled"><span class="slider"></span></label>
+            </div>
+            <div class="proxy-grid" id="proxy-fields">
+              <label class="field">
+                <span>协议</span>
+                <select id="proxy-protocol">
+                  <option value="http">http</option>
+                  <option value="https">https</option>
+                  <option value="socks5">socks5</option>
+                </select>
+              </label>
+              <label class="field">
+                <span>地址</span>
+                <input type="text" id="proxy-host" placeholder="127.0.0.1">
+              </label>
+              <label class="field">
+                <span>端口</span>
+                <input type="text" id="proxy-port" inputmode="numeric" pattern="[0-9]*" placeholder="7890">
+              </label>
+            </div>
+            <div class="proxy-actions">
+              <button class="btn-sm btn-outline" id="btn-proxy-test" type="button" disabled>测试连接</button>
+              <span class="proxy-test-result" id="proxy-test-result"></span>
+            </div>
+            <p class="field-hint">填好地址与端口并打开开关后生效；关闭开关保存即可禁用代理，无需清空字段。点「测试连接」可验证能否经代理访问 HuggingFace。</p>
+          </div>
+        </details>
       </div>
 
       <!-- Tuning (collapsible, custom mode only) -->
       <div class="panel" id="section-tuning">
         <details class="panel-collapsible" id="panel-tuning">
-          <summary class="panel-title">参数调优</summary>
+          <summary class="panel-title">⚙️ 参数调优</summary>
           <div class="form-grid">
             <label class="field">
               <span>字幕模式</span>
@@ -109,7 +146,7 @@
       <!-- Translation API (collapsible) -->
       <div class="panel">
         <details class="panel-collapsible" id="panel-translation">
-          <summary class="panel-title">翻译 API</summary>
+          <summary class="panel-title">🔑 翻译 API</summary>
           <div class="form-grid">
 
             <label class="field">

@@ -168,14 +168,10 @@ export function renderJobs() {
       const sizeStr = downloadedMb != null && dl.sizeMb ? `${downloadedMb}/${dl.sizeMb}MB` : '';
       const speedStr = dl.speedMb != null ? `${dl.speedMb.toFixed(1)}MB/s` : '';
       const info = [sizeStr, speedStr].filter(Boolean).join(' · ');
-      const slowDur = dl.slowSince ? Date.now() - dl.slowSince : 0;
-      const mirrorOn = document.getElementById('mirror-enabled')?.checked;
-      const showMirrorBtn = slowDur >= 5000 && !mirrorOn;
       progressSection = `
         <div class="dl-row">
           <span class="dl-label">↓ ${escHtml(fname)}</span>
           <span class="dl-info">${escHtml(info)}</span>
-          ${showMirrorBtn ? `<button class="btn-sm btn-enable-mirror" data-enable-mirror="${escHtml(id)}" title="切换到 hf-mirror.com，并重启当前下载">切到 hf-mirror 重试</button>` : ''}
         </div>
         <div class="dl-bar"><div class="dl-bar-fill" style="width:${dlPct}%"></div></div>`;
     }
@@ -203,12 +199,9 @@ export function renderJobs() {
   });
 }
 
-// fetchAllJobs and enableHfMirror are injected from main.js to avoid circular imports
-export function installJobAreaHandlers(fetchAllJobs, enableHfMirror) {
+// fetchAllJobs is injected from main.js to avoid circular imports
+export function installJobAreaHandlers(fetchAllJobs) {
   jobArea.addEventListener('click', async e => {
-    const mirror = e.target.closest('[data-enable-mirror]');
-    if (mirror) { await enableHfMirror(mirror.dataset.enableMirror || null); return; }
-
     const dl = e.target.closest('[data-dl]');
     if (dl) {
       const url = `/api/output/${encodeURIComponent(dl.dataset.dl)}/${encodeURIComponent(dl.dataset.file)}`;

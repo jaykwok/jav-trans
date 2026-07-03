@@ -6,6 +6,7 @@ import re
 import subprocess
 import sys
 import threading
+import time
 from functools import lru_cache
 from pathlib import Path
 from typing import Any, get_args
@@ -23,9 +24,13 @@ from asr.backends.qwen import (
     qwen_asr_default_model_path,
     qwen_asr_repo_id,
 )
-from core.config import DEFAULT_SETTINGS, load_config
+from core.config import (
+    DEFAULT_SETTINGS,
+    apply_network_proxy_environment,
+    load_config,
+)
 from utils import model_paths
-from utils.model_paths import PROJECT_ROOT, normalize_hf_endpoint
+from utils.model_paths import PROJECT_ROOT
 from utils.runtime_paths import is_frozen
 from web.models import (
     JobSpec,
@@ -148,9 +153,11 @@ def _initial_env_template_lines() -> list[str]:
         "# PRE_ASR_CUEQC_DROP_THRESHOLD=0.95\n",
         "\n",
         "# --- Model/cache examples ---\n",
-        "# HF_ENDPOINT=https://hf-mirror.com\n",
         "# HF_HOME=./models\n",
         "# TORCH_HOME=./tmp/cache/torch\n",
+        "# PROXY_PROTOCOL=http\n",
+        "# PROXY_HOST=127.0.0.1\n",
+        "# PROXY_PORT=7890\n",
         "# RUN_LOG_ENABLED=1\n",
         "# RUN_LOG_DIR=./tmp/log\n",
         "\n",
@@ -358,11 +365,67 @@ def _checkpoint_requirements(repo_id: str) -> list[dict[str, Any]]:
     return requirements
 
 
-def _sync_hf_endpoint(value: str) -> str:
+def _proxy_settings_from_runtime() -> tuple[str, str, int | None]:
+    protocol = _runtime_or_env_or_setting("PROXY_PROTOCOL", "http").lower()
+    if protocol not in {"http", "https", "socks5"}:
+        protocol = "http"
+    host = _runtime_or_env_or_setting("PROXY_HOST", "")
+    port_text = _runtime_or_env_or_setting("PROXY_PORT", "")
     try:
-        return normalize_hf_endpoint(value) or ""
-    except ValueError as exc:
-        raise HTTPException(status_code=422, detail=str(exc)) from exc
+        port = int(port_text) if str(port_text).strip() else None
+    except (TypeError, ValueError):
+        port = None
+    if port is not None and not (1 <= port <= 65535):
+        port = None
+    return protocol, host, port
+
+
+def _sync_proxy_settings(update: SettingsUpdate) -> dict[str, str] | None:
+    proxy_fields_present = any(
+        value is not None
+        for value in (update.proxy_protocol, update.proxy_host, update.proxy_port)
+    )
+    if not proxy_fields_present:
+        return None
+
+    current_protocol, current_host, current_port = _proxy_settings_from_runtime()
+    protocol = (update.proxy_protocol or current_protocol or "http").strip().lower()
+    if protocol not in {"http", "https", "socks5"}:
+        raise HTTPException(status_code=422, detail="proxy_protocol must be http, https, or socks5")
+    host = (
+        update.proxy_host.strip()
+        if update.proxy_host is not None
+        else current_host.strip()
+    )
+    port = update.proxy_port if update.proxy_port is not None else current_port
+    if not host or port is None:
+        os.environ["PROXY_PROTOCOL"] = protocol
+        os.environ["PROXY_HOST"] = ""
+        os.environ["PROXY_PORT"] = ""
+        apply_network_proxy_environment("", clear_existing=True)
+        return {
+            "PROXY_PROTOCOL": protocol,
+            "PROXY_HOST": "",
+            "PROXY_PORT": "",
+        }
+
+    os.environ["PROXY_PROTOCOL"] = protocol
+    os.environ["PROXY_HOST"] = host
+    os.environ["PROXY_PORT"] = str(port)
+    proxy_url = f"{protocol}://{host}:{port}"
+    apply_network_proxy_environment(proxy_url, clear_existing=True)
+    return {
+        "PROXY_PROTOCOL": protocol,
+        "PROXY_HOST": host,
+        "PROXY_PORT": str(port),
+    }
+
+
+def _clear_saved_hf_mirror_if_present(changes: dict[str, str]) -> None:
+    endpoint = _runtime_or_env_or_setting("HF_ENDPOINT", "").strip().rstrip("/")
+    if endpoint == "https://hf-mirror.com":
+        changes["HF_ENDPOINT"] = ""
+        os.environ.pop("HF_ENDPOINT", None)
 
 
 def _strip_llm_endpoint_path(base_url: str) -> str:
@@ -480,7 +543,7 @@ async def get_settings() -> SettingsRead:
     api_key = _runtime_or_env_value("API_KEY")
     base_url = _runtime_or_env_or_setting("OPENAI_COMPATIBILITY_BASE_URL")
     model = _runtime_or_env_or_setting("LLM_MODEL_NAME")
-    hf_endpoint = _runtime_or_env_value("HF_ENDPOINT")
+    proxy_protocol, proxy_host, proxy_port = _proxy_settings_from_runtime()
     translation_glossary = _runtime_or_env_or_setting("TRANSLATION_GLOSSARY")
     llm_api_format = _runtime_or_env_or_setting("LLM_API_FORMAT", "chat")
     llm_reasoning_effort = _normalize_llm_reasoning_effort(
@@ -492,7 +555,9 @@ async def get_settings() -> SettingsRead:
         api_key_preview=_mask_key(api_key),
         base_url=base_url,
         model=model,
-        hf_endpoint=hf_endpoint,
+        proxy_protocol=proxy_protocol,
+        proxy_host=proxy_host,
+        proxy_port=proxy_port,
         translation_glossary=translation_glossary,
         llm_api_format=_normalize_llm_api_format(llm_api_format),
         llm_reasoning_effort=llm_reasoning_effort,
@@ -512,13 +577,9 @@ async def post_settings(update: SettingsUpdate) -> dict:
     if update.model is not None:
         changes["LLM_MODEL_NAME"] = update.model
         os.environ["LLM_MODEL_NAME"] = update.model
-    if update.hf_endpoint is not None:
-        hf_endpoint = _sync_hf_endpoint(update.hf_endpoint)
-        changes["HF_ENDPOINT"] = hf_endpoint
-        if hf_endpoint:
-            os.environ["HF_ENDPOINT"] = hf_endpoint
-        else:
-            os.environ.pop("HF_ENDPOINT", None)
+    proxy_changes = _sync_proxy_settings(update)
+    if proxy_changes is not None:
+        changes.update(proxy_changes)
     if update.translation_glossary is not None:
         changes["TRANSLATION_GLOSSARY"] = update.translation_glossary
         os.environ["TRANSLATION_GLOSSARY"] = update.translation_glossary
@@ -537,8 +598,40 @@ async def post_settings(update: SettingsUpdate) -> dict:
         changes["TARGET_LANG"] = update.target_lang
         os.environ["TARGET_LANG"] = update.target_lang
     if changes:
+        _clear_saved_hf_mirror_if_present(changes)
         _update_env_file(changes)
     return {"ok": True}
+
+
+@router.post("/proxy-test")
+async def test_proxy_connection() -> dict:
+    """Verify the configured network proxy can actually reach HuggingFace.
+
+    httpx trusts HTTP(S)_PROXY/ALL_PROXY env by default; the proxy-settings
+    sync writes those into os.environ, so a plain client.get() exercises the
+    proxy. Any HTTP response (even 4xx) means the proxy transport works -- only
+    a connection-level failure (timeout / refused / bad auth) means the proxy is
+    broken. Used by the Web「测试连接」button so a wrong port fails loud instead
+    of silently hanging model downloads.
+    """
+    from core.config import network_proxy_url_from_env
+
+    proxy_url = network_proxy_url_from_env()
+    if not proxy_url:
+        return {"ok": False, "proxy_url": "", "error": "未启用代理，或地址/端口为空"}
+    started = time.monotonic()
+    try:
+        async with httpx.AsyncClient(timeout=8.0, follow_redirects=True) as client:
+            resp = await client.get("https://huggingface.co/")
+    except httpx.HTTPError as exc:
+        return {"ok": False, "proxy_url": proxy_url, "error": f"经代理连接失败：{exc}"}
+    elapsed_ms = int((time.monotonic() - started) * 1000)
+    return {
+        "ok": True,
+        "proxy_url": proxy_url,
+        "status_code": resp.status_code,
+        "elapsed_ms": elapsed_ms,
+    }
 
 
 @router.get("/models")

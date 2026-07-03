@@ -69,7 +69,7 @@ $env:PYTHONIOENCODING="utf-8"
 uv run --no-sync python launcher.py
 ```
 
-默认地址为 `http://127.0.0.1:17321`。首次运行可以没有 `.env`；打开页面后在“翻译 API”面板填写 API Key、Base URL、模型和目标语言，保存或提交任务时会自动写入项目根目录 `.env`。新建的 `.env` 只启用实际保存的本机值，ASR batch、后端、显存预算等研究项会以注释示例形式写入。国内网络下载 Hugging Face 模型较慢时，勾选 `hf-mirror.com 加速下载` 后也会写入 `.env`。
+默认地址为 `http://127.0.0.1:17321`。首次运行可以没有 `.env`；打开页面后在“翻译 API”面板填写 API Key、Base URL、模型和目标语言，保存或提交任务时会自动写入项目根目录 `.env`。新建的 `.env` 只启用实际保存的本机值，ASR batch、后端、显存预算等研究项会以注释示例形式写入。国内网络下载 Hugging Face 模型较慢时，可在“识别设置”里填写代理协议、地址和端口。
 
 Linux / WSL2 下如果只启动浏览器版 Web 服务，也可以直接运行：
 
@@ -240,7 +240,7 @@ uv run --no-sync python tools/asr/cueqc/export_candidates.py `
 - `API_KEY`
 - `OPENAI_COMPATIBILITY_BASE_URL`
 - `LLM_MODEL_NAME`
-- `HF_ENDPOINT`
+- 代理协议 / 地址 / 端口（可选，用于模型下载和 HTTP 请求）
 
 ASR 6GB 默认值已经内置。默认使用 `1.7B` 高质量模型；需要切到 `0.6B` 低配/更快档，或覆盖 batch / 显存预算时，再通过“参数调优”里的环境变量覆盖，或手动编辑首次保存后生成的 `.env`。
 
@@ -311,10 +311,12 @@ tools/audits/serve_audits.sh
 
 ### 模型下载慢
 
-设置：
+在 Web “识别设置”里填写代理，例如：
 
 ```env
-HF_ENDPOINT=https://hf-mirror.com
+PROXY_PROTOCOL=http
+PROXY_HOST=127.0.0.1
+PROXY_PORT=7890
 ```
 
 或提前把模型下载到 `models/` 对应目录。

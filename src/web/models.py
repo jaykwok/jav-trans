@@ -66,7 +66,9 @@ class SettingsRead(BaseModel):
     api_key_preview: str
     base_url: str
     model: str = ""
-    hf_endpoint: str = ""
+    proxy_protocol: Literal["http", "https", "socks5"] = "http"
+    proxy_host: str = ""
+    proxy_port: int | None = None
     translation_glossary: str = ""
     llm_api_format: Literal["chat", "responses"] = "chat"
     llm_reasoning_effort: Literal["medium", "xhigh"] = "xhigh"
@@ -77,7 +79,9 @@ class SettingsUpdate(BaseModel):
     api_key: str | None = None
     base_url: str | None = None
     model: str | None = None
-    hf_endpoint: str | None = None
+    proxy_protocol: Literal["http", "https", "socks5"] | None = None
+    proxy_host: str | None = Field(default=None, max_length=255)
+    proxy_port: int | None = Field(default=None, ge=1, le=65535)
     translation_glossary: str | None = None
     llm_api_format: Literal["chat", "responses"] | None = None
     llm_reasoning_effort: Literal["medium", "xhigh"] | None = None
