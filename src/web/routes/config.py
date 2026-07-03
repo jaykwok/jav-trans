@@ -137,7 +137,7 @@ def _initial_env_template_lines() -> list[str]:
         "# ASR_BATCH_SIZE=auto\n",
         "# ASR_BATCH_SIZE_BY_REPO=jaykwok/Qwen3-ASR-0.6B-JA-Anime-Galgame-hf=12,jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame-hf=4\n",
         "# ASR_STAGE_WORKER_VRAM_BUDGET_MB=5600\n",
-        "# ASR_STAGE_WORKER_OOM_RETRY_LIMIT=1\n",
+        "# ASR_STAGE_WORKER_OOM_RETRY_LIMIT=3\n",
         "# SPEECH_BOUNDARY_JA_WINDOW_S=20\n",
         "# SPEECH_BOUNDARY_JA_OVERLAP_S=4\n",
         "# PRE_ASR_CUEQC_ENABLED=1\n",

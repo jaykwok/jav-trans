@@ -250,7 +250,7 @@ ASR_BACKEND=jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame-hf
 ASR_BATCH_SIZE=auto
 ASR_BATCH_SIZE_BY_REPO=jaykwok/Qwen3-ASR-0.6B-JA-Anime-Galgame-hf=12,jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame-hf=4
 ASR_STAGE_WORKER_VRAM_BUDGET_MB=5600
-ASR_STAGE_WORKER_OOM_RETRY_LIMIT=1
+ASR_STAGE_WORKER_OOM_RETRY_LIMIT=3
 SPEECH_BOUNDARY_JA_WINDOW_S=20
 SPEECH_BOUNDARY_JA_OVERLAP_S=4
 PRE_ASR_CUEQC_ENABLED=1
@@ -258,7 +258,7 @@ PRE_ASR_CUEQC_ENABLED=1
 
 ASR stage 固定由统一 GPU worker 持有 CUDA：Boundary/PTM feature extraction、Pre-ASR CueQC、ASR 和对齐都在同一个 GPU owner 进程里顺序执行，Web / 调度主进程只做任务编排、缓存索引和输出写入。OOM、CUDA 状态异常或超过 `ASR_STAGE_WORKER_VRAM_BUDGET_MB` 时会杀掉 worker，不会把 Web 主进程一起带崩。
 
-`ASR_STAGE_WORKER_VRAM_BUDGET_MB=5600` 是 6GB 卡的软 OOM 线。即使 PyTorch 没抛 `OutOfMemoryError`，只要 worker 侧 peak reserved/allocated 超过预算，就按 OOM 处理并按 `ASR_STAGE_WORKER_OOM_RETRY_LIMIT` 重启 worker、降低 batch 后重跑，避免 Windows 进入共享显存后严重变慢。
+`ASR_STAGE_WORKER_VRAM_BUDGET_MB=5600` 是 6GB 卡的软 OOM 线。即使 PyTorch 没抛 `OutOfMemoryError`，只要 worker 侧 peak reserved/allocated 超过预算，就按 OOM 处理并按 `ASR_STAGE_WORKER_OOM_RETRY_LIMIT` 重启 worker、降低 batch 后重跑，避免 Windows 进入共享显存后严重变慢。默认会从内置 batch 逐步降到 `ASR_BATCH_SIZE=1`；如果 batch=1 仍 OOM，任务会停止，Web 任务卡会提示切换到 `0.6B` 低显存档。
 
 推理需要 ASR / SpeechBoundary-JA frozen feature Hugging Face 模型，以及与当前 repo id 匹配的本地 checkpoint。源码运行时如果本地没有 Hugging Face 模型，会按需下载到 `models/`。registry 缺失、覆盖映射未命中当前 repo id、文件不存在、schema 不匹配或 metadata 不匹配都会 fail-fast。
 
