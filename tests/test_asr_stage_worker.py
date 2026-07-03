@@ -1,6 +1,7 @@
 from pathlib import Path
 
 import main
+import pytest
 from helpers import make_job_context
 from pipeline import audio as pipeline_audio
 from pipeline import gpu_worker
@@ -158,3 +159,64 @@ def test_stage_worker_treats_vram_budget_excess_as_oom_retry(monkeypatch, tmp_pa
     assert len(calls) == 2
     assert details["stage_worker"]["oom_retries"][0]["previous_batch_size"] == 12
     assert details["stage_worker"]["oom_retries"][0]["next_batch_size"] == 6
+
+
+def test_stage_worker_stops_with_low_vram_guidance_when_batch_one_oom(
+    monkeypatch,
+    tmp_path,
+):
+    monkeypatch.setenv("ASR_STAGE_WORKER_OOM_RETRY_LIMIT", "3")
+    calls: list[dict] = []
+    killed = {"count": 0}
+
+    def fake_once(
+        self,
+        audio_path,
+        *,
+        device,
+        env_overrides,
+        job_id,
+        on_stage=None,
+        cancel_requested=None,
+    ):
+        del self, audio_path, device, job_id, on_stage, cancel_requested
+        calls.append(dict(env_overrides))
+        return (
+            [],
+            [],
+            {
+                "cuda_memory": [
+                    {
+                        "stage": "asr_text_transcribe_done",
+                        "max_reserved_mb": 6200.0,
+                    }
+                ],
+                "stage_worker": {"mode": "gpu_worker"},
+            },
+        )
+
+    def fake_kill(self):
+        del self
+        killed["count"] += 1
+
+    monkeypatch.setattr(gpu_worker._GpuWorkerClient, "_transcribe_and_align_once", fake_once)
+    monkeypatch.setattr(gpu_worker._GpuWorkerClient, "_kill_child", fake_kill)
+
+    client = gpu_worker._GpuWorkerClient()
+    with pytest.raises(gpu_worker.GpuWorkerError) as exc_info:
+        client.transcribe_and_align(
+            str(tmp_path / "audio.wav"),
+            env_overrides={
+                "ASR_BACKEND": "jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame-hf",
+                "ASR_BATCH_SIZE": "4",
+                "ASR_STAGE_WORKER_VRAM_BUDGET_MB": "5600",
+            },
+        )
+
+    assert exc_info.value.kind == "oom"
+    assert [call["ASR_BATCH_SIZE"] for call in calls] == ["4", "2", "1"]
+    assert killed["count"] == 3
+    assert "ASR_BATCH_SIZE 已降到 1" in exc_info.value.detail
+    assert "任务已停止" in exc_info.value.detail
+    assert "0.6B" in exc_info.value.detail
+    assert "jaykwok/Qwen3-ASR-0.6B-JA-Anime-Galgame-hf" in exc_info.value.detail

@@ -61,7 +61,8 @@ DEFAULT_SETTINGS: dict[str, str] = {
     "ASR_STAGE_WORKER_TIMEOUT_S": "0",
     "ASR_STAGE_WORKER_READY_TIMEOUT_S": "60",
     # On worker-level CUDA OOM, restart the GPU worker and retry with half batch size.
-    "ASR_STAGE_WORKER_OOM_RETRY_LIMIT": "1",
+    # Default 3 lets the built-in batch table fall to 1 before giving up.
+    "ASR_STAGE_WORKER_OOM_RETRY_LIMIT": "3",
     # Soft OOM guard for 6GB cards: if worker-side peak reserved VRAM exceeds this
     # budget, treat it as OOM before Windows falls back to shared GPU memory.
     "ASR_STAGE_WORKER_VRAM_BUDGET_MB": "5600",

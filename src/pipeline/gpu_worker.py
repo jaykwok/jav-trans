@@ -27,6 +27,9 @@ class GpuWorkerTimeoutError(GpuWorkerError):
         super().__init__("timeout", detail)
 
 
+LOW_VRAM_ASR_BACKEND = "jaykwok/Qwen3-ASR-0.6B-JA-Anime-Galgame-hf"
+
+
 def _env_float(name: str, default: float) -> float:
     raw = os.getenv(name, str(default)).strip()
     if not raw:
@@ -334,6 +337,47 @@ def _downshift_asr_batch_env(env: dict[str, str]) -> tuple[dict[str, str], int, 
     updated = dict(env)
     updated["ASR_BATCH_SIZE"] = str(lowered)
     return updated, current, lowered
+
+
+def _terminal_oom_detail(
+    *,
+    env: dict[str, str],
+    detail: str,
+    batch_size: int | None,
+    retry_records: list[dict[str, Any]],
+    retry_limit_exhausted: bool = False,
+) -> str:
+    backend = str(env.get("ASR_BACKEND") or os.getenv("ASR_BACKEND", "")).strip()
+    budget_mb = _vram_budget_for_env(env)
+    retry_summary = ""
+    if retry_records:
+        steps = [
+            f"{record.get('previous_batch_size')}->{record.get('next_batch_size')}"
+            for record in retry_records
+        ]
+        retry_summary = f" 已尝试降 batch：{', '.join(steps)}。"
+    budget_text = f" 当前显存预算为 {budget_mb:.0f}MB。" if budget_mb > 0 else ""
+    if batch_size is not None and batch_size <= 1:
+        headline = "GPU 显存不足：ASR_BATCH_SIZE 已降到 1 后仍然 OOM，任务已停止。"
+    elif retry_limit_exhausted:
+        headline = "GPU 显存不足：OOM 自动降 batch 重试次数已用尽，任务已停止。"
+    else:
+        headline = "GPU 显存不足：无法继续降低 ASR_BATCH_SIZE，任务已停止。"
+
+    if LOW_VRAM_ASR_BACKEND not in backend:
+        action = (
+            "建议在前端将 ASR 后端切换为 0.6B 低显存档 "
+            f"({LOW_VRAM_ASR_BACKEND}) 后重试；也可以关闭其他占用 GPU 的程序。"
+        )
+    else:
+        action = (
+            "当前已经是 0.6B 低显存档；建议关闭其他占用 GPU 的程序，"
+            "或降低显存预算/检查是否有异常共享显存占用后重试。"
+        )
+    return (
+        f"{headline}{retry_summary}{budget_text}{action} "
+        f"原始错误：{detail}"
+    )
 
 
 def _vram_budget_for_env(env: dict[str, str]) -> float:
@@ -744,7 +788,7 @@ class _GpuWorkerClient:
         on_stage: Callable[[str], None] | None = None,
         cancel_requested: Callable[[], bool] | None = None,
     ) -> tuple[list[dict], list[str], dict]:
-        retry_limit = max(0, _env_int("ASR_STAGE_WORKER_OOM_RETRY_LIMIT", 1))
+        retry_limit = max(0, _env_int("ASR_STAGE_WORKER_OOM_RETRY_LIMIT", 3))
         attempt = 0
         retry_records: list[dict[str, Any]] = []
         current_env = dict(env_overrides or {})
@@ -768,11 +812,32 @@ class _GpuWorkerClient:
                         stage_worker["oom_retries"] = list(retry_records)
                 return segments, asr_log, asr_details
             except GpuWorkerError as exc:
-                if str(getattr(exc, "kind", "")) != "oom" or attempt >= retry_limit:
+                if str(getattr(exc, "kind", "")) != "oom":
                     raise
                 lowered = _downshift_asr_batch_env(current_env)
                 if lowered is None:
-                    raise
+                    batch_size = _effective_asr_batch_size(current_env)
+                    raise GpuWorkerError(
+                        "oom",
+                        _terminal_oom_detail(
+                            env=current_env,
+                            detail=str(getattr(exc, "detail", exc)),
+                            batch_size=batch_size,
+                            retry_records=retry_records,
+                        ),
+                    ) from exc
+                if attempt >= retry_limit:
+                    batch_size = _effective_asr_batch_size(current_env)
+                    raise GpuWorkerError(
+                        "oom",
+                        _terminal_oom_detail(
+                            env=current_env,
+                            detail=str(getattr(exc, "detail", exc)),
+                            batch_size=batch_size,
+                            retry_records=retry_records,
+                            retry_limit_exhausted=True,
+                        ),
+                    ) from exc
                 next_env, previous_batch, next_batch = lowered
                 attempt += 1
                 retry_records.append(

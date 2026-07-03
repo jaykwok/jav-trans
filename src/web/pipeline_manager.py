@@ -178,6 +178,13 @@ def _is_pipeline_cancelled(exc: BaseException) -> bool:
     return bool(cancelled_type is not None and isinstance(exc, cancelled_type))
 
 
+def _public_error_message(exc: BaseException) -> str:
+    detail = getattr(exc, "detail", None)
+    if isinstance(detail, str) and detail.strip():
+        return detail.strip()
+    return str(exc)
+
+
 def _resume_cache_job_id(job: JobState) -> str:
     resume_from = getattr(job.spec, "resume_from_job_id", "").strip()
     if not resume_from:
@@ -410,7 +417,7 @@ async def gpu_worker() -> None:
                 await _set_job(
                     job,
                     status="failed",
-                    error=str(exc),
+                    error=_public_error_message(exc),
                     expected_cancel_event=cancel_event,
                 )
         finally:
@@ -479,7 +486,7 @@ async def translation_worker() -> None:
                 await _set_job(
                     job,
                     status="failed",
-                    error=str(exc),
+                    error=_public_error_message(exc),
                     expected_cancel_event=cancel_event,
                 )
         finally:

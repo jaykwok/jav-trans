@@ -95,6 +95,16 @@ def test_jobs_api_retry_cancelled_job(tmp_path, monkeypatch):
     asyncio.run(_test_jobs_api_retry_cancelled_job(tmp_path, monkeypatch))
 
 
+def test_public_error_message_prefers_exception_detail():
+    class DetailError(RuntimeError):
+        detail = "GPU 显存不足：请切换到 0.6B"
+
+        def __str__(self) -> str:
+            return "oom: internal wrapper"
+
+    assert pm._public_error_message(DetailError()) == "GPU 显存不足：请切换到 0.6B"
+
+
 def test_jobs_api_rejects_invalid_job_spec(tmp_path, monkeypatch):
     asyncio.run(_test_jobs_api_rejects_invalid_job_spec(tmp_path, monkeypatch))
 

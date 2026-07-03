@@ -113,7 +113,7 @@ def test_default_model_download_root_is_project_models():
     assert config.DEFAULT_SETTINGS["ASR_MODEL_ID"] == ""
     assert "ASR_STAGE_WORKER_MODE" not in config.DEFAULT_SETTINGS
     assert config.DEFAULT_SETTINGS["ASR_STAGE_WORKER_TIMEOUT_S"] == "0"
-    assert config.DEFAULT_SETTINGS["ASR_STAGE_WORKER_OOM_RETRY_LIMIT"] == "1"
+    assert config.DEFAULT_SETTINGS["ASR_STAGE_WORKER_OOM_RETRY_LIMIT"] == "3"
     assert config.DEFAULT_SETTINGS["ASR_STAGE_WORKER_VRAM_BUDGET_MB"] == "5600"
     assert config.DEFAULT_SETTINGS["ASR_BATCH_SIZE"] == "auto"
     assert "Qwen3-ASR-0.6B-JA-Anime-Galgame-hf=12" in config.DEFAULT_SETTINGS["ASR_BATCH_SIZE_BY_REPO"]
