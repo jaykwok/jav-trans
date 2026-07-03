@@ -2,7 +2,7 @@ import { state } from './state.js';
 import { $, showToast } from './util.js';
 import { saveFormMemory, loadFormMemory } from './formMemory.js';
 
-const CUSTOM_PRESET_KEY = 'javtrans.customPreset.v1';
+const CUSTOM_PRESET_KEY = 'jav-trans.customPreset.v1';
 
 export const TUNING_FIELDS = {
   'r-mode':                    'zh',

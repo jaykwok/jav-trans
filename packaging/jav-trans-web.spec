@@ -106,8 +106,8 @@ def _which_tool(name: str, env_name: str) -> Path:
 
 def _ffmpeg_binaries() -> list[tuple[str, str]]:
     tools = [
-        _which_tool("ffmpeg.exe", "JAVTRANS_FFMPEG_EXE"),
-        _which_tool("ffprobe.exe", "JAVTRANS_FFPROBE_EXE"),
+        _which_tool("ffmpeg.exe", "JAV_TRANS_FFMPEG_EXE"),
+        _which_tool("ffprobe.exe", "JAV_TRANS_FFPROBE_EXE"),
     ]
     seen = set()
     bundled = []
@@ -122,6 +122,27 @@ def _ffmpeg_binaries() -> list[tuple[str, str]]:
                 seen.add(dll_key)
                 bundled.append((str(dll.resolve()), "bin"))
     return bundled
+
+
+def _torchcodec_binaries() -> list[tuple[str, str]]:
+    package_root = _package_dir("torchcodec")
+    patterns = [
+        "libtorchcodec_core*.dll",
+        "libtorchcodec_custom_ops*.dll",
+        "libtorchcodec_pybind_ops*.pyd",
+    ]
+    collected = []
+    seen = set()
+    for pattern in patterns:
+        for file_path in package_root.glob(pattern):
+            key = str(file_path.resolve()).lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            collected.append((str(file_path.resolve()), "torchcodec"))
+    if not any("libtorchcodec_custom_ops" in Path(source).name for source, _dest in collected):
+        raise SystemExit("torchcodec custom ops DLLs not found; reinstall torchcodec in .venv")
+    return collected
 
 
 datas = collect_data_files("webview", include_py_files=False)
@@ -143,7 +164,7 @@ datas += [
     ),
 ]
 
-if not _env_bool("JAVTRANS_SKIP_MODELS"):
+if not _env_bool("JAV_TRANS_SKIP_MODELS"):
     datas += _collect_inference_model_dir(
         "models/jaykwok-Qwen3-ASR-1.7B-JA-Anime-Galgame-hf",
         "models/jaykwok-Qwen3-ASR-1.7B-JA-Anime-Galgame-hf",
@@ -156,6 +177,7 @@ if not _env_bool("JAVTRANS_SKIP_MODELS"):
     )
 
 binaries = _ffmpeg_binaries()
+binaries += _torchcodec_binaries()
 
 hiddenimports = [
     "uvicorn.lifespan.on",
@@ -214,7 +236,7 @@ exe = EXE(
     a.scripts,
     [],
     exclude_binaries=True,
-    name="JAVTrans",
+    name="jav-trans",
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
@@ -236,5 +258,5 @@ coll = COLLECT(
     strip=False,
     upx=False,
     upx_exclude=[],
-    name="JAVTrans",
+    name="jav-trans",
 )

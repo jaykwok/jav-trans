@@ -1,7 +1,7 @@
 param(
-    [string]$SourceDir = "dist/JAVTrans",
+    [string]$SourceDir = "dist/jav-trans",
     [string]$OutputDir = "dist/release-assets",
-    [string]$ArchiveName = "JAVTrans-windows-x64.7z",
+    [string]$ArchiveName = "jav-trans-windows-x64.7z",
     [int]$Threads = [Environment]::ProcessorCount
 )
 

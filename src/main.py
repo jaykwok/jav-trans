@@ -465,7 +465,7 @@ def _setup_run_logger(
     safe_backend = _run_log_component(backend_label, max_chars=40)
     stamp = time.strftime("%Y%m%d_%H%M%S")
     log_path = log_dir / f"{stamp}_{safe_job_id}_{safe_backend}.run.log"
-    logger_name = f"javtrans.run.{job_id}.{stamp}"
+    logger_name = f"jav-trans.run.{job_id}.{stamp}"
     logger = logging.getLogger(logger_name)
     logger.setLevel(logging.INFO)
     logger.propagate = False

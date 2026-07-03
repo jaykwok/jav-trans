@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass, replace
 from typing import Callable, Sequence
 
@@ -49,16 +50,20 @@ def build_semantic_boundary_chunks(
     )
     progress("外边界精修", 1, 1)
 
-    prepared: list[tuple] = []
+    proposal_groups: list[list[dict]] = []
+    split_feature_groups: list[np.ndarray] = []
+    split_scalar_groups: list[np.ndarray] = []
+    split_decision_groups: list[list[SplitDecision]] = []
+    split_inputs: list[tuple[int, np.ndarray, np.ndarray]] = []
     split_total = max(1, len(refined))
     progress("语义切分判断", 0, split_total)
-    for segment, core_start, core_end, outer_prediction in refined:
+    for group_index, (segment, core_start, core_end, _outer_prediction) in enumerate(refined):
         proposals = [
             dict(candidate)
             for candidate in segment.weak_cut_candidates
             if core_start < float(candidate["time_s"]) < core_end
         ]
-        decisions, frame_features, scalar_features = _split_decisions(
+        frame_features, scalar_features = _split_features(
             proposals,
             core_start=core_start,
             core_end=core_end,
@@ -66,6 +71,41 @@ def build_semantic_boundary_chunks(
             provider=feature_provider,
             verifier=split_verifier,
         )
+        proposal_groups.append(proposals)
+        split_feature_groups.append(frame_features)
+        split_scalar_groups.append(scalar_features)
+        split_decision_groups.append([])
+        for row_index in range(frame_features.shape[0]):
+            split_inputs.append(
+                (
+                    group_index,
+                    frame_features[row_index],
+                    scalar_features[row_index],
+                )
+            )
+
+    if split_inputs:
+        all_frames = np.stack([item[1] for item in split_inputs])
+        all_scalars = np.stack([item[2] for item in split_inputs])
+        all_decisions = _batched_split_decisions(
+            split_verifier,
+            frame_features=all_frames,
+            scalar_features=all_scalars,
+        )
+        for (group_index, _frames, _scalars), decision in zip(split_inputs, all_decisions):
+            split_decision_groups[group_index].append(decision)
+
+    prepared: list[tuple] = []
+    for index, (
+        segment,
+        core_start,
+        core_end,
+        outer_prediction,
+    ) in enumerate(refined):
+        proposals = proposal_groups[index]
+        decisions = split_decision_groups[index]
+        frame_features = split_feature_groups[index]
+        scalar_features = split_scalar_groups[index]
         accepted = _accepted_proposals(
             proposals,
             decisions,
@@ -192,7 +232,7 @@ def _refine_outer_edges(
     return result
 
 
-def _split_decisions(
+def _split_features(
     proposals,
     *,
     core_start,
@@ -200,11 +240,9 @@ def _split_decisions(
     speech,
     provider,
     verifier,
-) -> tuple[list[SplitDecision], np.ndarray, np.ndarray]:
+) -> tuple[np.ndarray, np.ndarray]:
     if not proposals:
-        return [], np.empty((0, 0, 0), dtype=np.float32), np.empty(
-            (0, 0), dtype=np.float32
-        )
+        return np.empty((0, 0, 0), dtype=np.float32), np.empty((0, 0), dtype=np.float32)
     feature_rows: list[np.ndarray] = []
     scalar_rows: list[np.ndarray] = []
     cfg = verifier.feature_config
@@ -226,14 +264,34 @@ def _split_decisions(
         scalar_rows.append(scalars)
     frame_array = np.stack(feature_rows)
     scalar_array = np.stack(scalar_rows)
-    return (
-        verifier.decide(
-            frame_features=frame_array,
-            scalar_features=scalar_array,
-        ),
-        frame_array,
-        scalar_array,
-    )
+    return frame_array, scalar_array
+
+
+def _semantic_split_inference_batch_size() -> int:
+    raw = os.getenv("SEMANTIC_SPLIT_INFERENCE_BATCH_SIZE", "128").strip()
+    try:
+        return max(1, int(raw))
+    except ValueError:
+        return 128
+
+
+def _batched_split_decisions(
+    verifier,
+    *,
+    frame_features: np.ndarray,
+    scalar_features: np.ndarray,
+) -> list[SplitDecision]:
+    batch_size = _semantic_split_inference_batch_size()
+    decisions: list[SplitDecision] = []
+    for start in range(0, frame_features.shape[0], batch_size):
+        end = min(frame_features.shape[0], start + batch_size)
+        decisions.extend(
+            verifier.decide(
+                frame_features=frame_features[start:end],
+                scalar_features=scalar_features[start:end],
+            )
+        )
+    return decisions
 
 
 def _accepted_proposals(

@@ -10,7 +10,7 @@ def is_frozen() -> bool:
 
 
 def runtime_root() -> Path:
-    override = os.getenv("JAVTRANS_RUNTIME_ROOT", "").strip()
+    override = os.getenv("JAV_TRANS_RUNTIME_ROOT", "").strip()
     if override:
         return Path(override).expanduser().resolve()
     if is_frozen():
@@ -19,7 +19,7 @@ def runtime_root() -> Path:
 
 
 def resource_root() -> Path:
-    override = os.getenv("JAVTRANS_RESOURCE_ROOT", "").strip()
+    override = os.getenv("JAV_TRANS_RESOURCE_ROOT", "").strip()
     if override:
         return Path(override).expanduser().resolve()
     if is_frozen():

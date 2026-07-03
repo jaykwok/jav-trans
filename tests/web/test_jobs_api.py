@@ -16,6 +16,7 @@ if str(_SRC_WEB) not in _web_package.__path__:
 from web.app import create_app
 from web import pipeline_manager as pm
 from web.routes import config as config_routes
+from web.routes import files as files_routes
 
 
 async def _drain_queue(queue: asyncio.Queue) -> None:
@@ -61,6 +62,65 @@ def test_model_requirements_marks_disabled_boundary_download(tmp_path, monkeypat
 
 def test_model_requirements_includes_cuda_driver_warning(tmp_path, monkeypatch):
     asyncio.run(_test_model_requirements_includes_cuda_driver_warning(tmp_path, monkeypatch))
+
+
+def test_cuda_environment_status_reads_frozen_probe_file(tmp_path, monkeypatch):
+    config_routes._cuda_environment_status.cache_clear()
+    monkeypatch.setattr(config_routes, "is_frozen", lambda: True)
+    monkeypatch.setattr(config_routes, "PROJECT_ROOT", tmp_path)
+
+    def fake_run(command, *, env, **kwargs):
+        Path(env["JAV_TRANS_CUDA_PROBE_OUTPUT"]).write_text(
+            '{"status":"ok","ok":true,"code":"ok","message":"file result"}',
+            encoding="utf-8",
+        )
+        return config_routes.subprocess.CompletedProcess(command, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(config_routes.subprocess, "run", fake_run)
+
+    try:
+        payload = config_routes._cuda_environment_status()
+    finally:
+        config_routes._cuda_environment_status.cache_clear()
+
+    assert payload["ok"] is True
+    assert payload["code"] == "ok"
+    assert payload["message"] == "file result"
+    assert not list((tmp_path / "tmp").glob("cuda-probe-*.json"))
+
+
+def test_windows_picker_subprocesses_hide_console(monkeypatch):
+    calls: list[dict] = []
+
+    monkeypatch.setattr(
+        files_routes,
+        "no_window_subprocess_kwargs",
+        lambda: {"creationflags": 0x08000000},
+    )
+
+    def fake_run(command, **kwargs):
+        calls.append({"command": command, **kwargs})
+        return files_routes.subprocess.CompletedProcess(
+            command,
+            0,
+            stdout="D:\\Videos\\sample.mp4\nD:\\Videos\\sample.mkv\n",
+            stderr="",
+        )
+
+    monkeypatch.setattr(files_routes.subprocess, "run", fake_run)
+
+    assert files_routes._pick_files_windows() == [
+        "D:\\Videos\\sample.mp4",
+        "D:\\Videos\\sample.mkv",
+    ]
+    assert files_routes._pick_folder_windows() == "D:\\Videos\\sample.mp4\nD:\\Videos\\sample.mkv"
+
+    assert len(calls) == 2
+    for call in calls:
+        assert call["command"][0] == "powershell"
+        assert call["creationflags"] == 0x08000000
+        assert call["check"] is False
+        assert call["capture_output"] is True
 
 
 def test_settings_proxy_updates_runtime_env(monkeypatch):

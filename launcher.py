@@ -7,6 +7,7 @@ import subprocess
 import sys
 import threading
 import time
+import traceback
 from pathlib import Path
 
 multiprocessing.freeze_support()
@@ -19,8 +20,8 @@ _RESOURCE_ROOT = (
 )
 _ROOT = Path(sys.executable).resolve().parent if _FROZEN else _RESOURCE_ROOT
 
-os.environ.setdefault("JAVTRANS_RUNTIME_ROOT", str(_ROOT))
-os.environ.setdefault("JAVTRANS_RESOURCE_ROOT", str(_RESOURCE_ROOT))
+os.environ.setdefault("JAV_TRANS_RUNTIME_ROOT", str(_ROOT))
+os.environ.setdefault("JAV_TRANS_RESOURCE_ROOT", str(_RESOURCE_ROOT))
 os.environ.setdefault("PYTHONIOENCODING", "utf-8")
 os.environ.setdefault("HF_HOME", str(_ROOT / "models"))
 os.environ.setdefault("HF_HUB_CACHE", str(_ROOT / "tmp" / "cache" / "hf" / "hub"))
@@ -31,6 +32,8 @@ for _SRC in (_RESOURCE_ROOT / "src", _ROOT / "src"):
     if _SRC.exists() and str(_SRC) not in sys.path:
         sys.path.insert(0, str(_SRC))
 
+from utils.subprocess_tools import no_window_subprocess_kwargs
+
 _BIN_DIR = _RESOURCE_ROOT / "bin"
 if _BIN_DIR.exists():
     current_path = os.environ.get("PATH", "")
@@ -40,13 +43,14 @@ if _BIN_DIR.exists():
 
 _APP_ICON_PATH = _RESOURCE_ROOT / "src" / "assets" / "images" / "icon.ico"
 _CUDA_PROBE_CHILD = "--cuda-probe-child" in sys.argv
+_SMOKE_IMPORTS = "--smoke-imports" in sys.argv
 
 
 def _webview_icon_arg() -> str | None:
     return str(_APP_ICON_PATH) if _APP_ICON_PATH.exists() else None
 
-PORT = int(os.getenv("JAVTRANS_PORT", "17321"))
-EVENTS_PORT = int(os.getenv("JAVTRANS_EVENTS_PORT", "17322"))
+PORT = int(os.getenv("JAV_TRANS_PORT", "17321"))
+EVENTS_PORT = int(os.getenv("JAV_TRANS_EVENTS_PORT", "17322"))
 
 # Globs inside tmp/ that are always safe to remove (one-time run artifacts).
 # Coverage note: atexit cleanup is best-effort; it only sweeps these top-level
@@ -122,6 +126,7 @@ def _probe_nvidia_smi() -> dict:
             encoding="utf-8",
             errors="replace",
             timeout=5,
+            **no_window_subprocess_kwargs(),
         )
         result["returncode"] = summary.returncode
         if summary.returncode != 0:
@@ -150,6 +155,7 @@ def _probe_nvidia_smi() -> dict:
             encoding="utf-8",
             errors="replace",
             timeout=5,
+            **no_window_subprocess_kwargs(),
         )
         devices = []
         for line in (query.stdout or "").splitlines():
@@ -271,9 +277,48 @@ def _cuda_probe_payload() -> dict:
     return payload
 
 
+def _write_or_print_json(payload: dict, *, output_env: str) -> None:
+    payload_text = json.dumps(payload, ensure_ascii=False)
+    output_path = os.getenv(output_env, "").strip()
+    if output_path:
+        Path(output_path).expanduser().write_text(payload_text, encoding="utf-8")
+    else:
+        print(payload_text, flush=True)
+
+
 if _CUDA_PROBE_CHILD:
-    print(json.dumps(_cuda_probe_payload(), ensure_ascii=False), flush=True)
+    _write_or_print_json(_cuda_probe_payload(), output_env="JAV_TRANS_CUDA_PROBE_OUTPUT")
     raise SystemExit(0)
+
+
+if _SMOKE_IMPORTS:
+    try:
+        import torchcodec
+        from torchcodec._core import core_library_path, ffmpeg_major_version
+
+        _write_or_print_json(
+            {
+                "status": "ok",
+                "ok": True,
+                "torchcodec_version": getattr(torchcodec, "__version__", ""),
+                "torchcodec_ffmpeg_major_version": ffmpeg_major_version,
+                "torchcodec_core_library_path": str(core_library_path),
+            },
+            output_env="JAV_TRANS_SMOKE_OUTPUT",
+        )
+        raise SystemExit(0)
+    except Exception as exc:  # noqa: BLE001 - packaging smoke must report all import failures
+        _write_or_print_json(
+            {
+                "status": "error",
+                "ok": False,
+                "error_type": type(exc).__name__,
+                "error": str(exc),
+                "traceback": traceback.format_exc(),
+            },
+            output_env="JAV_TRANS_SMOKE_OUTPUT",
+        )
+        raise SystemExit(1)
 
 
 atexit.register(_cleanup_temp)
@@ -283,7 +328,7 @@ def _run_server() -> None:
     import uvicorn
     from web.app import create_app
 
-    os.environ.setdefault("JAVTRANS_EVENTS_PORT", str(EVENTS_PORT))
+    os.environ.setdefault("JAV_TRANS_EVENTS_PORT", str(EVENTS_PORT))
     uvicorn.run(
         create_app(),
         host="127.0.0.1",
@@ -319,7 +364,7 @@ if __name__ == "__main__":
             window.dom.document.events.drop += DOMEventHandler(_on_drop, True, False)
 
         win = webview.create_window(
-            "JAVTrans",
+            "jav-trans",
             f"http://127.0.0.1:{PORT}",
             width=1280,
             height=820,

@@ -25,8 +25,8 @@ def _events_port() -> int:
     try:
         return int(
             os.getenv(
-                "JAVTRANS_EVENTS_PORT",
-                DEFAULT_SETTINGS.get("JAVTRANS_EVENTS_PORT", "17322"),
+                "JAV_TRANS_EVENTS_PORT",
+                DEFAULT_SETTINGS.get("JAV_TRANS_EVENTS_PORT", "17322"),
             )
         )
     except ValueError:
@@ -78,7 +78,7 @@ async def _lifespan(_app: FastAPI) -> AsyncIterator[None]:
 
 
 def create_app() -> FastAPI:
-    app = FastAPI(title="JAVTrans Web", lifespan=_lifespan)
+    app = FastAPI(title="jav-trans Web", lifespan=_lifespan)
     app.include_router(jobs.router, prefix="/api")
     app.include_router(event_routes.router, prefix="/api")
     app.include_router(files.router, prefix="/api")

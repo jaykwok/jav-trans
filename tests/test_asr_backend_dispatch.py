@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib
+from pathlib import Path
 
 import pytest
 
@@ -146,6 +147,37 @@ def test_qwen_checkpoint_path_defaults_to_registry_when_env_is_absent(monkeypatc
     )
 
     assert path.endswith("outer_edge_refiner_v1.jaykwok-Qwen3-ASR-1.7B-JA-Anime-Galgame-hf.pt")
+
+
+def test_qwen_checkpoint_path_defaults_fall_back_to_resource_root(monkeypatch, tmp_path):
+    from asr.backends import qwen
+
+    runtime_root = tmp_path / "runtime"
+    resource_root = tmp_path / "resource"
+    relative = Path("src/boundary/checkpoints/outer_edge_refiner_v1.test.pt")
+    checkpoint = resource_root / relative
+    checkpoint.parent.mkdir(parents=True)
+    checkpoint.write_bytes(b"bundled")
+
+    def fake_runtime_path(path: Path) -> Path:
+        candidate = Path(path)
+        return candidate.resolve() if candidate.is_absolute() else (runtime_root / candidate).resolve()
+
+    def fake_resource_path(path: Path) -> Path:
+        candidate = Path(path)
+        return candidate.resolve() if candidate.is_absolute() else (resource_root / candidate).resolve()
+
+    monkeypatch.delenv("OUTER_EDGE_REFINER_MODEL_PATH_BY_REPO", raising=False)
+    monkeypatch.setattr(qwen, "runtime_path", fake_runtime_path)
+    monkeypatch.setattr(qwen, "resource_path", fake_resource_path)
+
+    path = qwen.checkpoint_path_for_repo_env(
+        repo_id=ASR_17B_BACKEND,
+        mapping_env="OUTER_EDGE_REFINER_MODEL_PATH_BY_REPO",
+        default_mapping={ASR_17B_BACKEND: relative.as_posix()},
+    )
+
+    assert path == str(checkpoint.resolve())
 
 
 def test_qwen_checkpoint_path_auto_uses_registered_scorer(monkeypatch, tmp_path):

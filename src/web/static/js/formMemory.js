@@ -1,6 +1,6 @@
 import { state } from './state.js';
 
-const FORM_MEMORY_KEY = 'javtrans.formMemory.v3';
+const FORM_MEMORY_KEY = 'jav-trans.formMemory.v3';
 const FORM_MEMORY_EXCLUDED = new Set(['api-key']);
 const FORM_MEMORY_SELECTOR = 'input[id], select[id], textarea[id]';
 

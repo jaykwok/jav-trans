@@ -1,4 +1,4 @@
-# JAVTrans History
+# jav-trans History
 
 本文件记录实验过程、idea 来源、调试坑、失败路线、指标和参考来源。README 只保留新用户使用说明、当前工作流和当前状态。
 
@@ -28,6 +28,10 @@ SpeechIslandScorer v8（speech only）
 0.6B 与 1.7B 各自拥有五个 repo-bound active checkpoint，不能跨 repo 复用。旧 v7 双头 scorer、v8 refiner、v10 Pre-ASR schema 和 planner/packer API 不保留 alias。SpeechIslandScorer 输出维度为 1；Semantic Split 使用三分类和保守 runtime 门槛；Pre-ASR v11 在阈值 `0.95` 下运行，6GB 默认配置启用，两个 repo 的 checkpoint 均已进入 registry。ASR-after CueQC v4 只保留离线审计用途。
 
 ## 路线修正
+
+- 2026-07-03 Windows 完整 exe 打包 smoke：使用 `.venv` + `uv run` + `packaging/build_windows.ps1 -Clean` 生成 `dist/jav-trans/jav-trans.exe`，完整 onedir 包约 `10.0GiB`，已包含两个 HF 模型、CUDA 版 PyTorch runtime、FFmpeg shared DLL、Boundary 五模型 checkpoint 与 Pre-ASR CueQC v11 checkpoint。打包预检发现 PATH 里的 WinGet FFmpeg 是 static/full build，`torchcodec` 需要 shared FFmpeg DLL；最终按用户要求改用本机已安装的 `Gyan.FFmpeg.Shared`（`ffmpeg-8.1.2-full_build-shared/bin`）显式传给打包脚本，`torchcodec` import 与 PyInstaller DLL 收集均通过。用户复核指出 checkpoint 运行侧缺失：根因是 PyInstaller onedir 把数据放入 `_internal/src/.../checkpoints`，但 `checkpoint_path_for_repo_env()` 只按 exe 同级 runtime root 解析相对路径；已改为相对 checkpoint 先查 runtime root，再回退 resource root `_internal`。同时修复 windowed exe 的 `--cuda-probe-child` stdout 不可捕获问题，冻结包改用临时 JSON 文件回传 CUDA probe 结果；打包 exe probe smoke 返回 CUDA 12.8 / RTX 4060 Ti。按用户要求断兼容重命名：窗口标题、Web 标题、PyInstaller exe/onedir、归档默认名迁到 `jav-trans`，运行配置前缀由 `JAVTRANS_*` 改为 `JAV_TRANS_*`；`-Clean` 会把旧输出目录移动到 `agents/rm/` 后重新生成。回归：`tests/test_asr_backend_dispatch.py tests/web/test_jobs_api.py` 通过。
+
+- 2026-07-03 打包版运行日志回查与 headless / split batch 修正：用户提供的 `tmp/log/8b232e52541043c6b48e1e5f67fd1742` 显示本轮没有进入有效 ASR 性能测试，任务在第一批 `ASR 文本转写 4/346 batch=1 size=4 start` 后立即崩溃；根因是 PyInstaller 包缺少 `torchcodec/libtorchcodec_custom_ops8.dll`，报错为 `ImportError: No spec found for libtorchcodec_custom_ops8`，不是用户安装的 shared FFmpeg 路径问题。已在 spec 显式收集 `libtorchcodec_core*.dll`、`libtorchcodec_custom_ops*.dll`、`libtorchcodec_pybind_ops*.pyd`，并新增 `launcher.py --smoke-imports` 用于打包后无 UI 验证 torchcodec import。日志阶段耗时：audio prepare `14.47s`，语音岛检测 `61.5s`，外边界精修 `25.8s`，语义切分判断 `196.6s`（1070 个 island / candidate group），内部切点精修 `1.3s`，音频切块 `0.4s`，ASR 模型加载到首批开始约 `3.1s`。优化结论：当前可安全放大的不是 ASR batch（该日志未跑到 ASR），而是 Semantic Split Verifier 的候选级推理 batch；已新增 `SEMANTIC_SPLIT_INFERENCE_BATCH_SIZE=128` 默认值并跨 island 汇总候选批量推理。安全边界：Mamba 的时间轴仍是单个候选样本内部 `[bins, dim]`，batch 维只并行独立候选；accept/min-gap 仍逐 island 执行，不跨 island 泄漏决策；Cut Refiner 和 Pre-ASR CueQC 暂不做跨序列 batching，避免破坏时序语义。Windows 子进程黑窗方面，ffmpeg/ffprobe、nvidia-smi、CUDA probe、Windows picker powershell 均使用 `CREATE_NO_WINDOW`，Windows 打开文件/目录仍走 `os.startfile`，不是 cmd 子进程。源码 smoke：shared FFmpeg 8 下 `uv run python launcher.py --smoke-imports` 通过。
 
 - 2026-07-03 Windows 打包 CUDA 驱动兼容提示：确认 PyInstaller 包可自带 CUDA 版 PyTorch runtime DLL，但不能替代用户本机 NVIDIA display driver；驱动最高支持的 CUDA runtime 低于 bundled PyTorch `torch.version.cuda` 时，`torch.cuda` 会初始化失败。新增 `launcher.py --cuda-probe-child` 子进程探测路径，避免 Web 主进程触碰 CUDA；`/api/model-requirements` 合并 CUDA probe 结果并返回 `cuda/gpu_ready`，前端识别设置区在驱动过旧、未检测到 NVIDIA GPU 或 PyTorch CUDA 初始化失败时提示更新 NVIDIA 驱动/检查显卡环境。当前本机 `.venv` 估算：CUDA 版 `torch` 未压缩约 `4.09GiB`（`torch/lib` 约 `3.99GiB`），两个 HF 模型目录合计约 `5.28GiB`（1.7B 约 `3.81GiB`，0.6B 约 `1.47GiB`）；默认发布若用 `-SkipModels` 可省掉模型体积，但 torch/CUDA runtime 仍是包体主因。
 
