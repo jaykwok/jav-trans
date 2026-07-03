@@ -63,8 +63,16 @@ def test_model_requirements_includes_cuda_driver_warning(tmp_path, monkeypatch):
     asyncio.run(_test_model_requirements_includes_cuda_driver_warning(tmp_path, monkeypatch))
 
 
-def test_settings_hf_endpoint_updates_runtime_env(monkeypatch):
-    asyncio.run(_test_settings_hf_endpoint_updates_runtime_env(monkeypatch))
+def test_settings_proxy_updates_runtime_env(monkeypatch):
+    asyncio.run(_test_settings_proxy_updates_runtime_env(monkeypatch))
+
+
+def test_proxy_test_reports_unconfigured_when_no_proxy(monkeypatch):
+    asyncio.run(_test_proxy_test_reports_unconfigured(monkeypatch))
+
+
+def test_proxy_test_ok_when_reachable(monkeypatch):
+    asyncio.run(_test_proxy_test_ok_when_reachable(monkeypatch))
 
 
 def test_settings_llm_api_format_updates_runtime_env(monkeypatch):
@@ -329,8 +337,20 @@ async def _test_model_requirements_includes_cuda_driver_warning(tmp_path, monkey
     assert "CUDA 12.8" in payload["cuda"]["message"]
 
 
-async def _test_settings_hf_endpoint_updates_runtime_env(monkeypatch):
-    monkeypatch.delenv("HF_ENDPOINT", raising=False)
+async def _test_settings_proxy_updates_runtime_env(monkeypatch):
+    for key in (
+        "PROXY_PROTOCOL",
+        "PROXY_HOST",
+        "PROXY_PORT",
+        "HTTP_PROXY",
+        "HTTPS_PROXY",
+        "ALL_PROXY",
+        "http_proxy",
+        "https_proxy",
+        "all_proxy",
+    ):
+        monkeypatch.delenv(key, raising=False)
+    monkeypatch.setenv("HF_ENDPOINT", "https://hf-mirror.com")
     monkeypatch.setattr(config_routes, "_update_env_file", lambda _changes: None)
 
     transport = httpx.ASGITransport(app=create_app())
@@ -340,26 +360,94 @@ async def _test_settings_hf_endpoint_updates_runtime_env(monkeypatch):
     ) as client:
         response = await client.post(
             "/api/settings",
-            json={"hf_endpoint": "https://hf-mirror.com/"},
+            json={
+                "proxy_protocol": "http",
+                "proxy_host": "127.0.0.1",
+                "proxy_port": 7890,
+            },
         )
         assert response.status_code == 200
-        assert os.environ["HF_ENDPOINT"] == "https://hf-mirror.com"
+        assert os.environ["PROXY_PROTOCOL"] == "http"
+        assert os.environ["PROXY_HOST"] == "127.0.0.1"
+        assert os.environ["PROXY_PORT"] == "7890"
+        assert os.environ["HTTP_PROXY"] == "http://127.0.0.1:7890"
+        assert os.environ["HTTPS_PROXY"] == "http://127.0.0.1:7890"
+        assert os.environ["ALL_PROXY"] == "http://127.0.0.1:7890"
+        assert "HF_ENDPOINT" not in os.environ
 
-        invalid = await client.post(
-            "/api/settings",
-            json={"hf_endpoint": "hf-mirror.com"},
-        )
-        assert invalid.status_code == 422
-        assert "HF_ENDPOINT must be empty or a full URL" in invalid.text
-        assert os.environ["HF_ENDPOINT"] == "https://hf-mirror.com"
+        current = await client.get("/api/settings")
+        assert current.status_code == 200
+        payload = current.json()
+        assert payload["proxy_protocol"] == "http"
+        assert payload["proxy_host"] == "127.0.0.1"
+        assert payload["proxy_port"] == 7890
 
         cleared = await client.post(
             "/api/settings",
-            json={"hf_endpoint": ""},
+            json={"proxy_host": "", "proxy_port": None},
         )
 
     assert cleared.status_code == 200
-    assert "HF_ENDPOINT" not in os.environ
+    assert os.environ["PROXY_HOST"] == ""
+    assert os.environ["PROXY_PORT"] == ""
+    assert "HTTP_PROXY" not in os.environ
+    assert "HTTPS_PROXY" not in os.environ
+    assert "ALL_PROXY" not in os.environ
+
+
+async def _test_proxy_test_reports_unconfigured(monkeypatch):
+    for key in ("PROXY_HOST", "PROXY_PORT", "PROXY_PROTOCOL"):
+        monkeypatch.delenv(key, raising=False)
+
+    transport = httpx.ASGITransport(app=create_app())
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.post("/api/proxy-test")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["ok"] is False
+    assert payload["proxy_url"] == ""
+    assert "未启用" in payload["error"]
+
+
+class _FakeProxyResponse:
+    status_code = 200
+
+
+class _FakeProxyClient:
+    def __init__(self, *args, **kwargs):
+        self.kwargs = kwargs
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *exc):
+        return False
+
+    async def get(self, url):
+        self.requested_url = url
+        return _FakeProxyResponse()
+
+
+async def _test_proxy_test_ok_when_reachable(monkeypatch):
+    monkeypatch.setenv("PROXY_PROTOCOL", "http")
+    monkeypatch.setenv("PROXY_HOST", "127.0.0.1")
+    monkeypatch.setenv("PROXY_PORT", "7890")
+    # Capture the real client BEFORE patching so the ASGI test client below is
+    # unaffected; the route uses config_routes.httpx.AsyncClient (patched).
+    original_async_client = httpx.AsyncClient
+    monkeypatch.setattr(config_routes.httpx, "AsyncClient", _FakeProxyClient)
+
+    transport = httpx.ASGITransport(app=create_app())
+    async with original_async_client(transport=transport, base_url="http://test") as client:
+        response = await client.post("/api/proxy-test")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["ok"] is True
+    assert payload["status_code"] == 200
+    assert payload["proxy_url"] == "http://127.0.0.1:7890"
+    assert isinstance(payload["elapsed_ms"], int)
 
 
 async def _test_settings_llm_api_format_updates_runtime_env(monkeypatch):

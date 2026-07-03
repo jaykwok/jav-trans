@@ -321,6 +321,34 @@ textarea {
 
 .form-grid { display: flex; flex-direction: column; gap: 11px; }
 
+.proxy-grid {
+  display: grid;
+  grid-template-columns: 82px 1fr 78px;
+  gap: 8px;
+  align-items: end;
+}
+.proxy-grid .field { gap: 4px; }
+.proxy-grid :is(input, select):disabled { opacity: 0.4; cursor: not-allowed; }
+
+/* Collapsible summary: title + live status pill, arrow stays on the far right */
+.summary-label { display: inline-flex; align-items: center; gap: 8px; }
+.status-tag {
+  font-size: 10px; font-weight: 600; letter-spacing: 0; text-transform: none;
+  padding: 2px 9px; border-radius: var(--radius-pill);
+  border: 1px solid var(--border); color: var(--muted);
+  background: rgba(255, 255, 255, 0.04);
+}
+.status-tag[data-on="on"] {
+  color: var(--success);
+  border-color: rgba(74, 222, 128, 0.32);
+  background: var(--success-soft);
+}
+.field-hint { margin: 2px 0 0; font-size: 11px; line-height: 1.5; color: var(--muted); }
+.proxy-actions { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.proxy-test-result { font-size: 12px; color: var(--muted); }
+.proxy-test-result.ok { color: var(--success); }
+.proxy-test-result.fail { color: var(--error); }
+
 .model-requirements-notice {
   color: var(--warn);
   background: var(--warn-soft);
