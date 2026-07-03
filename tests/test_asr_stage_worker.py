@@ -3,6 +3,7 @@ from pathlib import Path
 import main
 from helpers import make_job_context
 from pipeline import audio as pipeline_audio
+from pipeline import gpu_worker
 
 
 class _CudaTrap:
@@ -14,7 +15,7 @@ class _TorchTrap:
     cuda = _CudaTrap()
 
 
-def test_asr_stage_worker_mode_does_not_touch_cuda_in_main(monkeypatch, tmp_path):
+def test_unified_asr_stage_worker_does_not_touch_cuda_in_main(monkeypatch, tmp_path):
     video_path = tmp_path / "clip.mp4"
     video_path.write_bytes(b"fake-video")
     ctx = make_job_context(
@@ -23,7 +24,6 @@ def test_asr_stage_worker_mode_does_not_touch_cuda_in_main(monkeypatch, tmp_path
         tmp_path / "jobs",
         skip_translation=True,
         keep_temp_files=True,
-        advanced={"ASR_STAGE_WORKER_MODE": "subprocess"},
     )
 
     monkeypatch.setattr(main, "torch", _TorchTrap())
@@ -48,7 +48,8 @@ def test_asr_stage_worker_mode_does_not_touch_cuda_in_main(monkeypatch, tmp_path
         cancel_requested=None,
     ):
         assert device == "auto"
-        assert env_overrides["ASR_STAGE_WORKER_MODE"] == "subprocess"
+        assert "ASR_STAGE_WORKER_MODE" not in env_overrides
+        assert env_overrides["ASR_STAGE_WORKER_VRAM_BUDGET_MB"] == "5600"
         assert job_id == ctx.job_id
         assert cancel_requested is not None
         if on_stage is not None:
@@ -58,7 +59,11 @@ def test_asr_stage_worker_mode_does_not_touch_cuda_in_main(monkeypatch, tmp_path
             ["mock asr"],
             {
                 "device": "cuda:0",
-                "stage_worker": {"mode": "subprocess", "pid": 1234},
+                "stage_worker": {
+                    "mode": "gpu_worker",
+                    "process_model": "persistent_subprocess",
+                    "pid": 1234,
+                },
                 "transcript_chunks": [],
                 "stage_timings": {},
             },
@@ -78,8 +83,78 @@ def test_asr_stage_worker_mode_does_not_touch_cuda_in_main(monkeypatch, tmp_path
     )
 
     assert artifacts.device == "cuda:0"
-    assert artifacts.asr_details["stage_worker"]["mode"] == "subprocess"
+    assert artifacts.asr_details["stage_worker"]["mode"] == "gpu_worker"
     assert all(
         snapshot.get("skipped")
         for snapshot in artifacts.asr_details["pipeline_cuda_memory"]
     )
+
+
+def test_stage_worker_treats_vram_budget_excess_as_oom_retry(monkeypatch, tmp_path):
+    monkeypatch.setenv("ASR_STAGE_WORKER_OOM_RETRY_LIMIT", "1")
+    calls: list[dict] = []
+    killed = {"count": 0}
+
+    def fake_once(
+        self,
+        audio_path,
+        *,
+        device,
+        env_overrides,
+        job_id,
+        on_stage=None,
+        cancel_requested=None,
+    ):
+        del self, audio_path, device, job_id, on_stage, cancel_requested
+        calls.append(dict(env_overrides))
+        if len(calls) == 1:
+            return (
+                [],
+                [],
+                {
+                    "cuda_memory": [
+                        {
+                            "stage": "asr_text_transcribe_done",
+                            "max_reserved_mb": 6200.0,
+                        }
+                    ],
+                    "stage_worker": {"mode": "gpu_worker"},
+                },
+            )
+        assert env_overrides["ASR_BATCH_SIZE"] == "6"
+        return (
+            [{"start": 0.0, "end": 1.0, "text": "ok"}],
+            ["ok"],
+            {
+                "cuda_memory": [
+                    {
+                        "stage": "asr_text_transcribe_done",
+                        "max_reserved_mb": 5200.0,
+                    }
+                ],
+                "stage_worker": {"mode": "gpu_worker"},
+            },
+        )
+
+    def fake_kill(self):
+        del self
+        killed["count"] += 1
+
+    monkeypatch.setattr(gpu_worker._GpuWorkerClient, "_transcribe_and_align_once", fake_once)
+    monkeypatch.setattr(gpu_worker._GpuWorkerClient, "_kill_child", fake_kill)
+
+    client = gpu_worker._GpuWorkerClient()
+    segments, _log, details = client.transcribe_and_align(
+        str(tmp_path / "audio.wav"),
+        env_overrides={
+            "ASR_BACKEND": "jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame-hf",
+            "ASR_BATCH_SIZE": "12",
+            "ASR_STAGE_WORKER_VRAM_BUDGET_MB": "5600",
+        },
+    )
+
+    assert segments[0]["text"] == "ok"
+    assert killed["count"] == 1
+    assert len(calls) == 2
+    assert details["stage_worker"]["oom_retries"][0]["previous_batch_size"] == 12
+    assert details["stage_worker"]["oom_retries"][0]["next_batch_size"] == 6

@@ -45,10 +45,8 @@ _transcribe_module = importlib.reload(_transcribe_module)
 _boundary_cache_module = importlib.reload(_boundary_cache_module)
 
 ASR_BACKEND = _registry_module.current_asr_backend()
-_ASR_WORKER_MODE = _registry_module.current_asr_worker_mode()
 _QWEN_BACKENDS = _registry_module._QWEN_BACKENDS
 _VALID_ASR_BACKENDS = _registry_module._VALID_ASR_BACKENDS
-_VALID_ASR_WORKER_MODES = _registry_module._VALID_ASR_WORKER_MODES
 
 _ASR_CHUNK_ROOT = _chunking_module._ASR_CHUNK_ROOT
 _KEEP_ASR_CHUNKS = _chunking_module._KEEP_ASR_CHUNKS
@@ -153,14 +151,10 @@ def _required_sequence_feature_provider_from_result(
 get_backend_label = _registry_module.get_backend_label
 _resolve_asr_backend = _registry_module._resolve_asr_backend
 _create_asr_backend = _registry_module._create_asr_backend
-_is_subprocess_backend = _registry_module._is_subprocess_backend
-
 _is_timed_out_result = _checkpoint_module._is_timed_out_result
 _checkpointable_text_results = _checkpoint_module._checkpointable_text_results
 _delete_path_for_cleanup = _checkpoint_module._delete_path_for_cleanup
 _get_asr_checkpoint_source = _checkpoint_module._get_asr_checkpoint_source
-_build_quarantined_text_result = _checkpoint_module._build_quarantined_text_result
-_quarantine_failed_chunks = _checkpoint_module._quarantine_failed_chunks
 
 _get_wav_duration = _chunking_module._get_wav_duration
 _extract_wav_chunks = _chunking_module._extract_wav_chunks
@@ -1134,6 +1128,46 @@ def _record_cuda_memory(
             total=snapshot.get("total_mb"),
         )
     )
+    _enforce_vram_budget_from_snapshot(snapshot)
+
+
+def _vram_budget_mb() -> float:
+    raw = os.getenv("ASR_STAGE_WORKER_VRAM_BUDGET_MB", "0").strip().lower()
+    if raw in {"", "0", "false", "no", "off", "none"}:
+        return 0.0
+    try:
+        return max(0.0, float(raw))
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _enforce_vram_budget_from_snapshot(snapshot: dict) -> None:
+    budget_mb = _vram_budget_mb()
+    if budget_mb <= 0.0:
+        return
+    values: list[float] = []
+    for key in (
+        "max_reserved_mb",
+        "reserved_mb",
+        "max_allocated_mb",
+        "allocated_mb",
+    ):
+        try:
+            values.append(float(snapshot.get(key)))
+        except (TypeError, ValueError):
+            continue
+    if not values:
+        return
+    peak_mb = max(values)
+    if peak_mb <= budget_mb:
+        return
+    total_mb = snapshot.get("total_mb", "")
+    stage = snapshot.get("stage", "")
+    raise RuntimeError(
+        "GPU VRAM budget exceeded: "
+        f"stage={stage} peak_mb={peak_mb:.1f} "
+        f"budget_mb={budget_mb:.1f} total_mb={total_mb}"
+    )
 
 
 def _release_stage_gpu_cache(
@@ -1152,6 +1186,21 @@ def _release_stage_gpu_cache(
     except Exception:
         pass
     _record_cuda_memory(log, snapshots, stage, elapsed_s=elapsed_s)
+
+
+def _model_lifecycle_event(
+    model_manager: Any | None,
+    *,
+    stage: str,
+    action: str,
+    on_stage: Callable[[str], None] | None = None,
+) -> None:
+    if model_manager is not None:
+        hook = getattr(model_manager, "lifecycle_event", None)
+        if callable(hook):
+            hook(stage=stage, action=action)
+    if on_stage is not None:
+        on_stage(f"GPU model manager {stage} {action}")
 
 
 def _segment_alignment_outcome(segment: dict, outcomes: dict[int, dict]) -> dict:
@@ -1211,6 +1260,7 @@ def _transcribe_and_align_local(
     audio_path: str,
     device: str,
     on_stage: Callable[[str], None] | None = None,
+    model_manager: Any | None = None,
 ) -> tuple[list[dict], list[str], dict]:
     def _notify(message: str) -> None:
         if on_stage:
@@ -1228,6 +1278,12 @@ def _transcribe_and_align_local(
     try:
         _notify("分析静音并切分音频...")
         split_started = time.perf_counter()
+        _model_lifecycle_event(
+            model_manager,
+            stage="boundary",
+            action="load",
+            on_stage=on_stage,
+        )
         chunk_spans = _build_processing_spans(audio_path, on_stage=on_stage)
         cache_log_entry = _boundary_cache_log_entry(_LAST_BOUNDARY_CACHE_EVENT)
         if cache_log_entry:
@@ -1244,6 +1300,12 @@ def _transcribe_and_align_local(
             pre_asr_cueqc_report,
         )
         _write_pre_asr_candidates_if_requested(pre_asr_candidates, log=log)
+        _model_lifecycle_event(
+            model_manager,
+            stage="boundary_pre_asr",
+            action="unload",
+            on_stage=on_stage,
+        )
         chunk_dir, chunk_infos = _extract_wav_chunks(
             audio_path, _span_boundaries(chunk_spans), on_stage=on_stage
         )
@@ -1305,6 +1367,12 @@ def _transcribe_and_align_local(
         word_dicts: list[dict] = []
         try:
             load_started = time.perf_counter()
+            _model_lifecycle_event(
+                model_manager,
+                stage="asr",
+                action="load_exclusive",
+                on_stage=on_stage,
+            )
             backend.load(on_stage=on_stage)
             load_elapsed = time.perf_counter() - load_started
             _record_stage_timing(
@@ -1348,6 +1416,12 @@ def _transcribe_and_align_local(
 
             unload_started = time.perf_counter()
             backend.unload_model(on_stage=on_stage)
+            _model_lifecycle_event(
+                model_manager,
+                stage="asr",
+                action="unload",
+                on_stage=on_stage,
+            )
             unload_elapsed = time.perf_counter() - unload_started
             _record_stage_timing(
                 log,
@@ -1599,11 +1673,13 @@ def transcribe_and_align(
     device: str,
     on_stage: Callable[[str], None] | None = None,
     include_details: bool = False,
+    model_manager: Any | None = None,
 ) -> tuple[list[dict], list[str]] | tuple[list[dict], list[str], dict]:
     segments, log, details = _transcribe_and_align_local(
         audio_path,
         device,
         on_stage=on_stage,
+        model_manager=model_manager,
     )
     if include_details:
         return segments, log, details

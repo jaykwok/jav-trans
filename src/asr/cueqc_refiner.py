@@ -241,8 +241,8 @@ class CueQCRefinerV4Binary:
 
         Two capture modes (worker-agnostic):
         * ``asr_internals`` — pre-captured internals list (one per candidate),
-          produced by ``backend.capture_asr_internals(...)`` (handles both inline
-          and subprocess worker modes). Preferred at runtime.
+          produced by ``backend.capture_asr_internals(...)`` inside the unified
+          GPU worker. Preferred at runtime.
         * ``capturer`` — an ``AsrInternalsCapturer`` for offline/legacy capture.
           Used only when ``asr_internals`` is not provided.
 

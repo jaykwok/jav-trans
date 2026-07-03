@@ -8,34 +8,34 @@ from asr.backends.base import BaseAsrBackend
 from helpers import ASR_06B_BACKEND, ASR_17B_BACKEND
 
 
-def _reload_asr(monkeypatch, *, backend: str, worker_mode: str):
+def _reload_asr(monkeypatch, *, backend: str):
     monkeypatch.setenv("ASR_BACKEND", backend)
-    monkeypatch.setenv("ASR_WORKER_MODE", worker_mode)
     from asr import pipeline as asr
     return importlib.reload(asr)
 
 
-def test_qwen3_asr_repo_backend_dispatch_uses_local_backend(monkeypatch):
-    asr = _reload_asr(monkeypatch, backend=ASR_17B_BACKEND, worker_mode="inproc")
+def test_qwen3_asr_repo_backend_dispatch_uses_gpu_worker_local_backend(monkeypatch):
+    asr = _reload_asr(monkeypatch, backend=ASR_17B_BACKEND)
     backend = asr._resolve_asr_backend("cpu")
 
     assert type(backend).__name__ == "LocalAsrBackend"
     assert isinstance(backend, BaseAsrBackend)
     assert backend.is_subprocess is False
-    assert asr.get_backend_label() == f"{ASR_17B_BACKEND} (inproc)"
+    assert asr.get_backend_label() == ASR_17B_BACKEND
 
 
-def test_qwen3_asr_repo_backend_dispatch_uses_subprocess_backend(monkeypatch):
-    asr = _reload_asr(monkeypatch, backend=ASR_06B_BACKEND, worker_mode="subprocess")
+def test_legacy_asr_worker_mode_env_is_ignored(monkeypatch):
+    monkeypatch.setenv("ASR_WORKER_MODE", "subprocess")
+    asr = _reload_asr(monkeypatch, backend=ASR_06B_BACKEND)
     backend = asr._resolve_asr_backend("cpu")
 
     assert isinstance(backend, BaseAsrBackend)
-    assert type(backend).__name__ == "SubprocessAsrBackend"
-    assert backend.is_subprocess is True
-    assert asr.get_backend_label() == f"{ASR_06B_BACKEND} (subprocess worker)"
+    assert type(backend).__name__ == "LocalAsrBackend"
+    assert backend.is_subprocess is False
+    assert asr.get_backend_label() == ASR_06B_BACKEND
 
 
-def test_qwen3_asr_default_worker_mode_is_inproc_for_6gb(monkeypatch):
+def test_qwen3_asr_default_runtime_mode_is_gpu_worker(monkeypatch):
     monkeypatch.delenv("ASR_WORKER_MODE", raising=False)
     monkeypatch.delenv("ASR_WORKER_MODE_BY_REPO", raising=False)
     from asr import pipeline as asr
@@ -44,28 +44,17 @@ def test_qwen3_asr_default_worker_mode_is_inproc_for_6gb(monkeypatch):
     asr = importlib.reload(asr)
     backend_06b = asr._resolve_asr_backend("cpu")
     assert backend_06b.is_subprocess is False
-    assert asr.get_backend_label() == f"{ASR_06B_BACKEND} (inproc)"
+    assert asr.get_backend_label() == ASR_06B_BACKEND
 
     monkeypatch.setenv("ASR_BACKEND", ASR_17B_BACKEND)
     asr = importlib.reload(asr)
     backend_17b = asr._resolve_asr_backend("cpu")
     assert backend_17b.is_subprocess is False
-    assert asr.get_backend_label() == f"{ASR_17B_BACKEND} (inproc)"
-
-
-def test_invalid_worker_mode_is_rejected(monkeypatch):
-    asr = _reload_asr(monkeypatch, backend=ASR_17B_BACKEND, worker_mode="invalid")
-
-    try:
-        asr._resolve_asr_backend("cpu")
-    except ValueError as exc:
-        assert "Unsupported ASR_WORKER_MODE" in str(exc)
-    else:
-        raise AssertionError("ValueError was not raised")
+    assert asr.get_backend_label() == ASR_17B_BACKEND
 
 
 def test_invalid_asr_backend_is_rejected(monkeypatch):
-    asr = _reload_asr(monkeypatch, backend="unknown_backend", worker_mode="inproc")
+    asr = _reload_asr(monkeypatch, backend="unknown_backend")
 
     try:
         asr._resolve_asr_backend("cpu")
@@ -77,7 +66,7 @@ def test_invalid_asr_backend_is_rejected(monkeypatch):
 
 def test_internal_asr_backend_names_are_rejected(monkeypatch):
     invalid_name = "local" + "_asr"
-    asr = _reload_asr(monkeypatch, backend=invalid_name, worker_mode="inproc")
+    asr = _reload_asr(monkeypatch, backend=invalid_name)
 
     try:
         asr._resolve_asr_backend("cpu")
@@ -89,7 +78,7 @@ def test_internal_asr_backend_names_are_rejected(monkeypatch):
 
 
 def test_short_qwen_backend_aliases_are_rejected(monkeypatch):
-    asr = _reload_asr(monkeypatch, backend="qwen3-asr-0.6b", worker_mode="inproc")
+    asr = _reload_asr(monkeypatch, backend="qwen3-asr-0.6b")
 
     try:
         asr._resolve_asr_backend("cpu")
@@ -102,7 +91,7 @@ def test_short_qwen_backend_aliases_are_rejected(monkeypatch):
 
 def test_legacy_non_hf_repo_id_is_rejected(monkeypatch):
     legacy_repo = ASR_17B_BACKEND.removesuffix("-hf")
-    asr = _reload_asr(monkeypatch, backend=legacy_repo, worker_mode="inproc")
+    asr = _reload_asr(monkeypatch, backend=legacy_repo)
 
     with pytest.raises(ValueError, match="Unsupported ASR_BACKEND"):
         asr._resolve_asr_backend("cpu")

@@ -33,13 +33,28 @@ def test_asr_stage_env_restored_when_transcribe_raises(monkeypatch, tmp_path):
         Path(out_path).parent.mkdir(parents=True, exist_ok=True)
         Path(out_path).write_bytes(b"wav")
 
-    def fake_transcribe_and_align(_audio_path, _device, on_stage=None, include_details=False):
-        assert main.os.environ["ASR_BACKEND"] == ASR_17B_BACKEND
-        assert main.os.environ["ASR_CONTEXT"] == "process context"
+    def fake_transcribe_and_align(
+        _audio_path,
+        *,
+        device="auto",
+        env_overrides=None,
+        job_id="",
+        on_stage=None,
+        cancel_requested=None,
+    ):
+        assert device == "auto"
+        assert env_overrides["ASR_BACKEND"] == ASR_17B_BACKEND
+        assert "ASR_CONTEXT" not in env_overrides
+        assert job_id
+        assert cancel_requested is not None
         raise RuntimeError("forced ASR failure")
 
     monkeypatch.setattr(pipeline_audio, "extract_audio", fake_extract_audio)
-    monkeypatch.setattr(main.asr_module, "transcribe_and_align", fake_transcribe_and_align)
+    monkeypatch.setattr(
+        main.asr_stage_worker_module,
+        "transcribe_and_align",
+        fake_transcribe_and_align,
+    )
 
     with pytest.raises(RuntimeError, match="forced ASR failure"):
         main.run_asr_alignment(

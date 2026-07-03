@@ -23,7 +23,6 @@ if str(SRC_ROOT) not in sys.path:
 from asr.backends.qwen import (
     DEFAULT_QWEN_ASR_BATCH_SIZE_BY_REPO,
     qwen_asr_default_model_path,
-    qwen_asr_default_worker_mode,
 )
 from core.config import load_config
 
@@ -185,12 +184,13 @@ def _env_optional_float(key: str) -> float | None:
 
 
 def configure_env(args: argparse.Namespace) -> None:
+    os.environ.pop("ASR_STAGE_WORKER_MODE", None)
+    os.environ.pop("ASR_WORKER_MODE", None)
+    os.environ.pop("ASR_WORKER_MODE_BY_REPO", None)
     os.environ["ASR_BACKEND"] = args.asr_backend
     os.environ["ASR_BOUNDARY_BACKEND"] = "speech_boundary_ja"
     os.environ["ASR_MODEL_PATH"] = project_path_value(args.asr_model_path)
     os.environ["ASR_MODEL_ID"] = ""
-    os.environ["ASR_STAGE_WORKER_MODE"] = args.asr_stage_worker_mode
-    os.environ["ASR_WORKER_MODE"] = args.asr_worker_mode
     os.environ["ASR_DTYPE"] = args.asr_dtype
     os.environ["ASR_ATTENTION"] = args.asr_attention
     os.environ["ASR_BATCH_SIZE"] = str(args.asr_batch_size)
@@ -274,8 +274,6 @@ def build_context(*, args: argparse.Namespace, paths: RunPaths, video: Path):
         "ASR_BACKEND": args.asr_backend,
         "ASR_BOUNDARY_BACKEND": "speech_boundary_ja",
         "ASR_MODEL_PATH": project_path_value(args.asr_model_path),
-        "ASR_STAGE_WORKER_MODE": args.asr_stage_worker_mode,
-        "ASR_WORKER_MODE": args.asr_worker_mode,
         "TRANSCRIPTION_TIMEOUT_S": str(args.transcription_timeout_s),
         "ASR_MAX_NEW_TOKENS": str(args.asr_max_new_tokens),
         "ASR_BATCH_SIZE": args.asr_batch_size,
@@ -533,12 +531,6 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--asr-model-path",
         default=os.getenv("ASR_MODEL_PATH", ""),
     )
-    parser.add_argument(
-        "--asr-stage-worker-mode",
-        choices=("inproc", "subprocess"),
-        default=os.getenv("ASR_STAGE_WORKER_MODE", "subprocess"),
-    )
-    parser.add_argument("--asr-worker-mode", default=os.getenv("ASR_WORKER_MODE", ""))
     parser.add_argument("--asr-dtype", default=os.getenv("ASR_DTYPE", "bfloat16"))
     parser.add_argument("--asr-attention", default=os.getenv("ASR_ATTENTION", "sdpa"))
     parser.add_argument("--asr-batch-size", default=os.getenv("ASR_BATCH_SIZE", "auto"))
@@ -664,10 +656,6 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         args.speech_boundary_ptm = args.asr_backend
     if not str(args.speech_boundary_model_path or "").strip():
         args.speech_boundary_model_path = qwen_asr_default_model_path(args.speech_boundary_ptm)
-    if not str(args.asr_worker_mode or "").strip():
-        args.asr_worker_mode = qwen_asr_default_worker_mode(args.asr_backend)
-    if args.asr_stage_worker_mode not in {"inproc", "subprocess"}:
-        parser.error("--asr-stage-worker-mode must be inproc or subprocess")
     if args.speech_boundary_threshold < 0:
         parser.error("--speech-boundary-threshold must be non-negative")
     if args.speech_boundary_speech_on_threshold < 0:

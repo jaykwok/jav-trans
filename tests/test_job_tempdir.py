@@ -31,8 +31,19 @@ def test_job_tempdir_groups_temp_outputs_and_keeps_srt_at_output_root(monkeypatc
         Path(out_path).parent.mkdir(parents=True, exist_ok=True)
         Path(out_path).write_bytes(b"")
 
-    def fake_transcribe_and_align(audio_path, _device, on_stage=None, include_details=False):
-        assert include_details is True
+    def fake_transcribe_and_align(
+        audio_path,
+        *,
+        device="auto",
+        env_overrides=None,
+        job_id="",
+        on_stage=None,
+        cancel_requested=None,
+    ):
+        assert device == "auto"
+        assert env_overrides is not None
+        assert job_id
+        assert cancel_requested is not None
         assert Path(audio_path).parent == temp_root / "sample" / "audio"
         return (
             [{"start": 0.0, "end": 1.0, "text": "こんにちは"}],
@@ -41,7 +52,11 @@ def test_job_tempdir_groups_temp_outputs_and_keeps_srt_at_output_root(monkeypatc
         )
 
     monkeypatch.setattr(pipeline_audio, "extract_audio", fake_extract_audio)
-    monkeypatch.setattr(main.asr_module, "transcribe_and_align", fake_transcribe_and_align)
+    monkeypatch.setattr(
+        main.asr_stage_worker_module,
+        "transcribe_and_align",
+        fake_transcribe_and_align,
+    )
     monkeypatch.setattr(
         main.translator_module,
         "translate_segments",
@@ -99,8 +114,19 @@ def test_run_log_is_written_only_when_enabled(monkeypatch, tmp_path):
         Path(out_path).parent.mkdir(parents=True, exist_ok=True)
         Path(out_path).write_bytes(b"")
 
-    def fake_transcribe_and_align(_audio_path, _device, on_stage=None, include_details=False):
-        assert include_details is True
+    def fake_transcribe_and_align(
+        _audio_path,
+        *,
+        device="auto",
+        env_overrides=None,
+        job_id="",
+        on_stage=None,
+        cancel_requested=None,
+    ):
+        assert device == "auto"
+        assert env_overrides is not None
+        assert job_id
+        assert cancel_requested is not None
         if on_stage:
             on_stage("ASR mock")
         return (
@@ -110,7 +136,11 @@ def test_run_log_is_written_only_when_enabled(monkeypatch, tmp_path):
         )
 
     monkeypatch.setattr(pipeline_audio, "extract_audio", fake_extract_audio)
-    monkeypatch.setattr(main.asr_module, "transcribe_and_align", fake_transcribe_and_align)
+    monkeypatch.setattr(
+        main.asr_stage_worker_module,
+        "transcribe_and_align",
+        fake_transcribe_and_align,
+    )
     monkeypatch.setattr(
         main.translator_module,
         "translate_segments",
@@ -180,8 +210,19 @@ def test_successful_run_cleans_job_temp_by_default(monkeypatch, tmp_path):
         Path(out_path).parent.mkdir(parents=True, exist_ok=True)
         Path(out_path).write_bytes(b"")
 
-    def fake_transcribe_and_align(_audio_path, _device, on_stage=None, include_details=False):
-        assert include_details is True
+    def fake_transcribe_and_align(
+        _audio_path,
+        *,
+        device="auto",
+        env_overrides=None,
+        job_id="",
+        on_stage=None,
+        cancel_requested=None,
+    ):
+        assert device == "auto"
+        assert env_overrides is not None
+        assert job_id
+        assert cancel_requested is not None
         return (
             [{"start": 0.0, "end": 1.0, "text": "こんにちは"}],
             [],
@@ -189,7 +230,11 @@ def test_successful_run_cleans_job_temp_by_default(monkeypatch, tmp_path):
         )
 
     monkeypatch.setattr(pipeline_audio, "extract_audio", fake_extract_audio)
-    monkeypatch.setattr(main.asr_module, "transcribe_and_align", fake_transcribe_and_align)
+    monkeypatch.setattr(
+        main.asr_stage_worker_module,
+        "transcribe_and_align",
+        fake_transcribe_and_align,
+    )
 
     run_pipeline(video_path, ctx)
 
@@ -221,9 +266,20 @@ def test_advanced_asr_stage_env_is_task_scoped(monkeypatch, tmp_path):
         Path(out_path).parent.mkdir(parents=True, exist_ok=True)
         Path(out_path).write_bytes(b"")
 
-    def fake_transcribe_and_align(_audio_path, _device, on_stage=None, include_details=False):
-        assert main.os.environ["OUTER_EDGE_REFINER_DEVICE"] == "cpu"
-        assert main.os.environ["ASR_BATCH_SIZE"] == "12"
+    def fake_transcribe_and_align(
+        _audio_path,
+        *,
+        device="auto",
+        env_overrides=None,
+        job_id="",
+        on_stage=None,
+        cancel_requested=None,
+    ):
+        assert device == "auto"
+        assert env_overrides["OUTER_EDGE_REFINER_DEVICE"] == "cpu"
+        assert env_overrides["ASR_BATCH_SIZE"] == "12"
+        assert job_id
+        assert cancel_requested is not None
         return (
             [{"start": 0.0, "end": 1.0, "text": "こんにちは"}],
             [],
@@ -231,7 +287,11 @@ def test_advanced_asr_stage_env_is_task_scoped(monkeypatch, tmp_path):
         )
 
     monkeypatch.setattr(pipeline_audio, "extract_audio", fake_extract_audio)
-    monkeypatch.setattr(main.asr_module, "transcribe_and_align", fake_transcribe_and_align)
+    monkeypatch.setattr(
+        main.asr_stage_worker_module,
+        "transcribe_and_align",
+        fake_transcribe_and_align,
+    )
 
     run_pipeline(video_path, ctx)
 

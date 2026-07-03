@@ -15,7 +15,7 @@ from boundary.base import SpeechSegment
 
 log = logging.getLogger(__name__)
 
-BOUNDARY_CACHE_VERSION = 15
+BOUNDARY_CACHE_VERSION = 16
 _AUDIO_SAMPLE_BYTES = 2 * 1024 * 1024
 _AUDIO_KEY_RE = re.compile(r"^[0-9a-fA-F]{8,40}$")
 

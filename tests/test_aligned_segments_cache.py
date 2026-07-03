@@ -84,9 +84,20 @@ def test_aligned_segments_written_with_audio_cache_key(monkeypatch, tmp_path):
         Path(out_path).parent.mkdir(parents=True, exist_ok=True)
         Path(out_path).write_bytes(b"wav")
 
-    def fake_transcribe_and_align(_audio_path, _device, on_stage=None, include_details=False):
+    def fake_transcribe_and_align(
+        _audio_path,
+        *,
+        device="auto",
+        env_overrides=None,
+        job_id="",
+        on_stage=None,
+        cancel_requested=None,
+    ):
         calls["asr"] += 1
-        assert include_details is True
+        assert device == "auto"
+        assert env_overrides is not None
+        assert job_id
+        assert cancel_requested is not None
         return (
             [{"start": 0.0, "end": 1.0, "text": "こんにちは"}],
             ["mock asr"],
@@ -103,7 +114,11 @@ def test_aligned_segments_written_with_audio_cache_key(monkeypatch, tmp_path):
         )
 
     monkeypatch.setattr(pipeline_audio, "extract_audio", fake_extract_audio)
-    monkeypatch.setattr(main.asr_module, "transcribe_and_align", fake_transcribe_and_align)
+    monkeypatch.setattr(
+        main.asr_stage_worker_module,
+        "transcribe_and_align",
+        fake_transcribe_and_align,
+    )
 
     run_pipeline(video_path, ctx)
 
@@ -198,7 +213,15 @@ def test_asr_alignment_stage_writes_resume_signature_e2e(monkeypatch, tmp_path):
         Path(out_path).parent.mkdir(parents=True, exist_ok=True)
         Path(out_path).write_bytes(b"wav")
 
-    def fake_transcribe_and_align(_audio_path, _device, on_stage=None, include_details=False):
+    def fake_transcribe_and_align(
+        _audio_path,
+        *,
+        device="auto",
+        env_overrides=None,
+        job_id="",
+        on_stage=None,
+        cancel_requested=None,
+    ):
         return (
             [{"start": 0.0, "end": 1.0, "text": "こんにちは"}],
             ["mock asr"],
@@ -207,7 +230,11 @@ def test_asr_alignment_stage_writes_resume_signature_e2e(monkeypatch, tmp_path):
 
     monkeypatch.setattr(main, "_write_json", spy_write_json)
     monkeypatch.setattr(pipeline_audio, "extract_audio", fake_extract_audio)
-    monkeypatch.setattr(main.asr_module, "transcribe_and_align", fake_transcribe_and_align)
+    monkeypatch.setattr(
+        main.asr_stage_worker_module,
+        "transcribe_and_align",
+        fake_transcribe_and_align,
+    )
 
     run_pipeline(video_path, ctx)
 
@@ -287,7 +314,7 @@ def test_aligned_segments_cache_hit_skips_asr(monkeypatch, tmp_path):
         ),
     )
     monkeypatch.setattr(
-        main.asr_module,
+        main.asr_stage_worker_module,
         "transcribe_and_align",
         lambda *_args, **_kwargs: (_ for _ in ()).throw(
             AssertionError("ASR should be skipped on aligned cache hit")
@@ -336,7 +363,15 @@ def test_aligned_segments_cache_miss_when_signature_missing(monkeypatch, tmp_pat
         Path(out_path).parent.mkdir(parents=True, exist_ok=True)
         Path(out_path).write_bytes(b"wav")
 
-    def fake_transcribe_and_align(_audio_path, _device, on_stage=None, include_details=False):
+    def fake_transcribe_and_align(
+        _audio_path,
+        *,
+        device="auto",
+        env_overrides=None,
+        job_id="",
+        on_stage=None,
+        cancel_requested=None,
+    ):
         calls["asr"] += 1
         return (
             [{"start": 0.0, "end": 1.0, "text": "fresh"}],
@@ -345,7 +380,11 @@ def test_aligned_segments_cache_miss_when_signature_missing(monkeypatch, tmp_pat
         )
 
     monkeypatch.setattr(pipeline_audio, "extract_audio", fake_extract_audio)
-    monkeypatch.setattr(main.asr_module, "transcribe_and_align", fake_transcribe_and_align)
+    monkeypatch.setattr(
+        main.asr_stage_worker_module,
+        "transcribe_and_align",
+        fake_transcribe_and_align,
+    )
 
     run_pipeline(video_path, ctx)
 
@@ -389,7 +428,15 @@ def test_aligned_segments_cache_miss_when_audio_key_changes(monkeypatch, tmp_pat
         Path(out_path).parent.mkdir(parents=True, exist_ok=True)
         Path(out_path).write_bytes(b"wav")
 
-    def fake_transcribe_and_align(_audio_path, _device, on_stage=None, include_details=False):
+    def fake_transcribe_and_align(
+        _audio_path,
+        *,
+        device="auto",
+        env_overrides=None,
+        job_id="",
+        on_stage=None,
+        cancel_requested=None,
+    ):
         calls["asr"] += 1
         return (
             [{"start": 0.0, "end": 1.0, "text": "fresh"}],
@@ -398,7 +445,11 @@ def test_aligned_segments_cache_miss_when_audio_key_changes(monkeypatch, tmp_pat
         )
 
     monkeypatch.setattr(pipeline_audio, "extract_audio", fake_extract_audio)
-    monkeypatch.setattr(main.asr_module, "transcribe_and_align", fake_transcribe_and_align)
+    monkeypatch.setattr(
+        main.asr_stage_worker_module,
+        "transcribe_and_align",
+        fake_transcribe_and_align,
+    )
 
     run_pipeline(video_path, ctx)
 

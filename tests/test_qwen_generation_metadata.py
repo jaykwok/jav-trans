@@ -33,11 +33,10 @@ def test_qwen_generation_metadata_records_timeout_kind(monkeypatch):
     metadata = local_backend._qwen_generation_metadata(
         error_kind="timeout",
         error_detail="worker timeout",
-        worker_mode="subprocess",
     )
 
     assert metadata["backend"] == ASR_17B_BACKEND
-    assert metadata["worker_mode"] == "subprocess"
+    assert metadata["worker_mode"] == "gpu_worker"
     assert metadata["error_kind"] == "timeout"
     assert metadata["error_detail"] == "worker timeout"
 

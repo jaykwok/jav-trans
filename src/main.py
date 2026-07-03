@@ -143,10 +143,11 @@ _ASR_STAGE_ADVANCED_PREFIXES = (
     "SPEECH_BOUNDARY_JA_",
 )
 _ASR_STAGE_ADVANCED_KEYS = {
-    "ASR_STAGE_WORKER_MODE",
     "ASR_STAGE_WORKER_TIMEOUT_S",
     "ASR_STAGE_WORKER_READY_TIMEOUT_S",
     "ASR_STAGE_WORKER_KILL_GRACE_S",
+    "ASR_STAGE_WORKER_OOM_RETRY_LIMIT",
+    "ASR_STAGE_WORKER_VRAM_BUDGET_MB",
     "ASR_BOUNDARY_BACKEND",
     "ASR_LANGUAGE",
     "ASR_FORCE_LANGUAGE",
@@ -156,8 +157,6 @@ _ASR_STAGE_ADVANCED_KEYS = {
     "ASR_ATTENTION",
     "ASR_MAX_NEW_TOKENS",
     "ASR_REPETITION_PENALTY",
-    "ASR_WORKER_MODE",
-    "ASR_WORKER_MODE_BY_REPO",
     "TRANSCRIPTION_TIMEOUT_S",
     "ASR_BATCH_SIZE",
     "ASR_BATCH_SIZE_BY_REPO",
@@ -176,11 +175,10 @@ _ASR_STAGE_CACHE_NEUTRAL_KEYS = {
     "ASR_BATCH_SIZE",
     "ASR_BATCH_SIZE_BY_REPO",
     "ASR_STAGE_WORKER_KILL_GRACE_S",
-    "ASR_STAGE_WORKER_MODE",
+    "ASR_STAGE_WORKER_OOM_RETRY_LIMIT",
     "ASR_STAGE_WORKER_READY_TIMEOUT_S",
     "ASR_STAGE_WORKER_TIMEOUT_S",
-    "ASR_WORKER_MODE",
-    "ASR_WORKER_MODE_BY_REPO",
+    "ASR_STAGE_WORKER_VRAM_BUDGET_MB",
     "ASR_CHUNK_ROOT",
     "BOUNDARY_CACHE_DIR",
     "BOUNDARY_CACHE_ENABLED",
@@ -214,7 +212,6 @@ def _asr_stage_env_for_ctx(ctx: JobContext) -> dict[str, str]:
     return _asr_stage_env_overrides(ctx)
 
 
-_VALID_ASR_STAGE_WORKER_MODES = {"inproc", "subprocess"}
 _ASR_STAGE_ENV_SNAPSHOT_KEYS = {
     "ASR_BACKEND",
     "HF_HOME",
@@ -224,26 +221,6 @@ _ASR_STAGE_ENV_SNAPSHOT_KEYS = {
     "TORCH_HOME",
     "PYTORCH_CUDA_ALLOC_CONF",
 }
-
-
-def _asr_stage_worker_mode_for_ctx(ctx: JobContext) -> str:
-    mode = _ctx_value(
-        ctx,
-        "ASR_STAGE_WORKER_MODE",
-        DEFAULT_SETTINGS.get("ASR_STAGE_WORKER_MODE", "subprocess"),
-    ).strip().lower()
-    if not mode:
-        mode = "subprocess"
-    if mode not in _VALID_ASR_STAGE_WORKER_MODES:
-        raise ValueError(
-            f"Unsupported ASR_STAGE_WORKER_MODE={mode!r}; "
-            f"expected one of {sorted(_VALID_ASR_STAGE_WORKER_MODES)}"
-        )
-    return mode
-
-
-def _asr_stage_uses_subprocess_worker(ctx: JobContext) -> bool:
-    return _asr_stage_worker_mode_for_ctx(ctx) == "subprocess"
 
 
 def _asr_stage_env_snapshot_for_ctx(ctx: JobContext) -> dict[str, str]:
@@ -316,7 +293,6 @@ def _asr_stage_config_signature_for_env() -> dict:
         or name
         in {
             "ASR_BACKEND",
-            "ASR_WORKER_MODE",
         }
     }
     return {
@@ -621,7 +597,7 @@ def _asr_details_stage_worker_mode(asr_details: dict | None) -> str:
 
 
 def _asr_details_cuda_skip_reason(asr_details: dict | None) -> str:
-    if _asr_details_stage_worker_mode(asr_details) == "subprocess":
+    if _asr_details_stage_worker_mode(asr_details) in {"gpu_worker", "subprocess"}:
         return "asr_stage_worker_subprocess"
     return ""
 
@@ -884,8 +860,6 @@ def _run_asr_alignment_impl(
     _raise_if_cancelled(cancel_event)
     video_duration_s = audio_module.probe_video_duration_s(video_path)
     with _temporary_env(_asr_stage_env_for_ctx(effective_ctx)):
-        asr_stage_worker_mode = _asr_stage_worker_mode_for_ctx(effective_ctx)
-        use_asr_stage_worker = asr_stage_worker_mode == "subprocess"
         backend_label = asr_module.get_backend_label()
         if effective_ctx.run_log_enabled:
             logger, run_log_path = _setup_run_logger(job_id, backend_label, effective_ctx)
@@ -893,27 +867,13 @@ def _run_asr_alignment_impl(
 
         _log_stage(logger, f"run_start video={_project_relative(video_path)}")
         _log_stage(logger, f"backend={backend_label}")
-        _log_stage(logger, f"asr_stage_worker_mode={asr_stage_worker_mode}")
+        _log_stage(logger, "asr_stage_worker=unified_gpu_worker")
         _log_stage(
             logger,
             f"skip_translation={effective_ctx.skip_translation}",
         )
-        cuda_skip_reason = (
-            "asr_stage_worker_subprocess" if use_asr_stage_worker else ""
-        )
-        if use_asr_stage_worker:
-            _log_stage(logger, "cuda_diagnostics=worker_process")
-        else:
-            _log_stage(
-                logger,
-                f"cuda_available={torch.cuda.is_available()} device_count={torch.cuda.device_count()}",
-            )
-            if torch.cuda.is_available():
-                _log_stage(logger, f"cuda_device={torch.cuda.get_device_name(0)}")
-                try:
-                    torch.cuda.reset_peak_memory_stats()
-                except Exception:
-                    pass
+        cuda_skip_reason = "asr_stage_worker_subprocess"
+        _log_stage(logger, "cuda_diagnostics=worker_process")
         _record_pipeline_cuda_memory(
             pipeline_cuda_memory,
             "run_start",
@@ -1014,9 +974,7 @@ def _run_asr_alignment_impl(
         )
 
         # 2. ASR text-only transcription, model unload, then Boundary subtitle timing.
-        device = "auto" if use_asr_stage_worker else (
-            "cuda:0" if torch.cuda.is_available() else "cpu"
-        )
+        device = "auto"
         _log_stage(logger, f"device={device}")
         _raise_if_cancelled(cancel_event)
 
@@ -1109,29 +1067,20 @@ def _run_asr_alignment_impl(
                     )
 
                 try:
-                    if use_asr_stage_worker:
-                        segments, asr_log, asr_details = (
-                            asr_stage_worker_module.transcribe_and_align(
-                                audio_path,
-                                device=device,
-                                env_overrides=_asr_stage_env_snapshot_for_ctx(
-                                    effective_ctx
-                                ),
-                                job_id=job_id,
-                                on_stage=_on_stage,
-                                cancel_requested=lambda: _cancel_requested(cancel_event),
-                            )
-                        )
-                        device = str(asr_details.get("device") or device)
-                        _log_stage(logger, f"stage_worker_device={device}")
-                    else:
-                        segments, asr_log, asr_details = asr_module.transcribe_and_align(
+                    segments, asr_log, asr_details = (
+                        asr_stage_worker_module.transcribe_and_align(
                             audio_path,
-                            device,
+                            device=device,
+                            env_overrides=_asr_stage_env_snapshot_for_ctx(
+                                effective_ctx
+                            ),
+                            job_id=job_id,
                             on_stage=_on_stage,
-                            include_details=True,
+                            cancel_requested=lambda: _cancel_requested(cancel_event),
                         )
-                        asr_details.setdefault("stage_worker", {"mode": "inproc"})
+                    )
+                    device = str(asr_details.get("device") or device)
+                    _log_stage(logger, f"stage_worker_device={device}")
                 except Exception as exc:
                     _log_stage(logger, f"stage_blocked asr_alignment error={exc!r}")
                     if logger is not None:
