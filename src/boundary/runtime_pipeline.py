@@ -36,7 +36,12 @@ def build_semantic_boundary_chunks(
     on_stage: Callable[[str], None] | None = None,
 ) -> list[PackedChunk]:
     def progress(label: str, current: int, total: int) -> None:
-        if on_stage is not None:
+        interval = max(1, int(total) // 100)
+        if on_stage is not None and (
+            current <= 0
+            or current >= total
+            or current % interval == 0
+        ):
             on_stage(f"{label} {current}/{total}")
 
     speech = np.asarray(speech_probabilities, dtype=np.float32)
@@ -268,7 +273,9 @@ def _split_features(
 
 
 def _semantic_split_inference_batch_size() -> int:
-    raw = os.getenv("SEMANTIC_SPLIT_INFERENCE_BATCH_SIZE", "128").strip()
+    raw = os.getenv("SEMANTIC_SPLIT_INFERENCE_BATCH_SIZE", "auto").strip().lower()
+    if raw in {"", "auto"}:
+        return 128
     try:
         return max(1, int(raw))
     except ValueError:

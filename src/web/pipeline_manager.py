@@ -293,7 +293,21 @@ def _run_asr_alignment(job: JobState, cancel_event=None):
             cancel_event=cancel_event,
         )
         if isinstance(artifacts, AsrArtifacts):
+            snapshot_started = _time.perf_counter()
+            pipeline_main._log_stage(
+                artifacts.logger,
+                "stage_start translation_handoff_snapshot",
+            )
             write_translation_artifacts_snapshot(artifacts)
+            snapshot_elapsed = _time.perf_counter() - snapshot_started
+            artifacts.pipeline_timings["translation_handoff_snapshot_s"] = (
+                snapshot_elapsed
+            )
+            pipeline_main._log_stage(
+                artifacts.logger,
+                "stage_done translation_handoff_snapshot elapsed=%.2fs"
+                % snapshot_elapsed,
+            )
         return artifacts
     finally:
         _hf_progress.set_current_job_id("")

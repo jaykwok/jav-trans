@@ -33,6 +33,7 @@ for _SRC in (_RESOURCE_ROOT / "src", _ROOT / "src"):
         sys.path.insert(0, str(_SRC))
 
 from utils.subprocess_tools import no_window_subprocess_kwargs
+from utils.ffmpeg_runtime import configure_ffmpeg_shared_runtime
 
 _BIN_DIR = _RESOURCE_ROOT / "bin"
 if _BIN_DIR.exists():
@@ -40,6 +41,8 @@ if _BIN_DIR.exists():
     bin_text = str(_BIN_DIR)
     if bin_text not in current_path.split(os.pathsep):
         os.environ["PATH"] = bin_text + (os.pathsep + current_path if current_path else "")
+
+_FFMPEG_SHARED_DIRECTORIES = configure_ffmpeg_shared_runtime()
 
 _APP_ICON_PATH = _RESOURCE_ROOT / "src" / "assets" / "images" / "icon.ico"
 _CUDA_PROBE_CHILD = "--cuda-probe-child" in sys.argv

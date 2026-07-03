@@ -60,6 +60,7 @@ class FrameSequenceFeatureProvider:
     _mfcc_dim: int = field(init=False, repr=False)
     _ptm_used: np.ndarray = field(init=False, repr=False)
     _mfcc_used: np.ndarray = field(init=False, repr=False)
+    _combined_cache: dict[int, np.ndarray] = field(init=False, repr=False)
 
     def __post_init__(self) -> None:
         ptm_array = _frame_array(self.ptm, name="ptm")
@@ -75,6 +76,21 @@ class FrameSequenceFeatureProvider:
         object.__setattr__(self, "_mfcc_dim", int(mfcc_array.shape[1]))
         object.__setattr__(self, "_ptm_used", ptm_array[:frame_count, :ptm_used_dim])
         object.__setattr__(self, "_mfcc_used", mfcc_array[:frame_count])
+        object.__setattr__(self, "_combined_cache", {})
+
+    def _combined_features(self, ptm_dim: int) -> np.ndarray:
+        frame_dim = min(int(ptm_dim), self._ptm_used_dim)
+        cached = self._combined_cache.get(frame_dim)
+        if cached is None:
+            cached = np.concatenate(
+                (
+                    self._ptm_used[:, :frame_dim],
+                    self._mfcc_used,
+                ),
+                axis=1,
+            )
+            self._combined_cache[frame_dim] = cached
+        return cached
 
     def frame_dims(self) -> tuple[int, int, int]:
         return self._frame_count, self._ptm_used_dim, self._mfcc_dim
@@ -167,13 +183,7 @@ class FrameSequenceFeatureProvider:
     ) -> tuple[np.ndarray, np.ndarray]:
         candidate_s = float(candidate["time_s"])
         frame_dim = min(int(ptm_dim), self._ptm_used_dim)
-        combined = np.concatenate(
-            (
-                self._ptm_used[:, :frame_dim],
-                self._mfcc_used,
-            ),
-            axis=1,
-        )
+        combined = self._combined_features(frame_dim)
         ranges = (
             (
                 max(core_start_s, candidate_s - left_context_s),
@@ -257,10 +267,7 @@ class FrameSequenceFeatureProvider:
         end_frame = int(round(end_s / self.frame_hop_s))
         context_frames = int(round(context_s / self.frame_hop_s))
         used_ptm_dim = min(int(ptm_dim), self._ptm_used_dim)
-        combined = np.concatenate(
-            (self._ptm_used[:, :used_ptm_dim], self._mfcc_used),
-            axis=1,
-        )
+        combined = self._combined_features(used_ptm_dim)
         pooled = np.concatenate(
             (
                 _pool_frame_bins_by_index(

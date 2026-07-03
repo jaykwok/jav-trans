@@ -196,7 +196,11 @@ def save_processing_spans(
         tmp_path = path.with_name(f"{path.name}.{os.getpid()}.tmp")
         try:
             tmp_path.write_text(
-                json.dumps(payload, ensure_ascii=False, indent=2),
+                json.dumps(
+                    payload,
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                ),
                 encoding="utf-8",
             )
             tmp_path.replace(path)
