@@ -3,30 +3,22 @@ import os
 import re
 import time
 import uuid
-from collections import defaultdict
 from pathlib import Path
 from typing import Callable
 
 from asr.backends.base import BaseAsrBackend
-from asr.backends.registry import current_asr_worker_mode, _is_subprocess_backend
+from asr.backends.registry import current_asr_worker_mode
 from asr.alignment_quality import classify_alignment_quality
 from asr.checkpoint import (
-    _build_quarantined_text_result,
     _checkpointable_text_results,
     _delete_path_for_cleanup,
     _get_asr_checkpoint_path,
     _get_asr_checkpoint_source,
     _is_timed_out_result,
     _load_asr_checkpoint,
-    _quarantine_failed_chunks,
     _save_asr_checkpoint,
 )
-from asr.local_backend import (
-    LocalAsrBackend,
-    SubprocessAsrBackend,
-    WorkerError,
-    WorkerTimeoutError,
-)
+from asr.local_backend import LocalAsrBackend
 
 
 logger = logging.getLogger(__name__)
@@ -44,14 +36,6 @@ _ASR_MIN_REPAIRED_SEGMENT_DURATION_S = float(
     os.getenv("ASR_MIN_REPAIRED_SEGMENT_DURATION", "0.6")
 )
 _ASR_CHECKPOINT_INTERVAL = max(1, int(os.getenv("ASR_CHECKPOINT_INTERVAL", "50")))
-_ASR_SUBPROCESS_RESPAWN_MAX = max(
-    0,
-    int(os.getenv("ASR_SUBPROCESS_RESPAWN_MAX", "2")),
-)
-_ASR_SUBPROCESS_CONSECUTIVE_TIMEOUT_LIMIT = max(
-    1,
-    int(os.getenv("ASR_SUBPROCESS_CONSECUTIVE_TIMEOUT_LIMIT", "3")),
-)
 _ASR_CHECKPOINT_ENABLED = os.getenv("ASR_CHECKPOINT_ENABLED", "1").strip().lower() not in {
     "0",
     "false",
@@ -66,6 +50,53 @@ _STRIP_PUNCT_RE = re.compile(r"[。！？…、,.!?・「」『』（）()【】
 
 def _current_asr_worker_mode() -> str:
     return current_asr_worker_mode()
+
+
+def _vram_budget_mb() -> float:
+    raw = os.getenv("ASR_STAGE_WORKER_VRAM_BUDGET_MB", "0").strip().lower()
+    if raw in {"", "0", "false", "no", "off", "none"}:
+        return 0.0
+    try:
+        return max(0.0, float(raw))
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _enforce_vram_budget(stage: str, on_stage: Callable[[str], None] | None) -> None:
+    budget_mb = _vram_budget_mb()
+    if budget_mb <= 0.0:
+        return
+    try:
+        import torch
+
+        if not torch.cuda.is_available():
+            return
+        device_index = torch.cuda.current_device()
+        scale = 1024 * 1024
+        peak_mb = max(
+            torch.cuda.max_memory_reserved(device_index),
+            torch.cuda.memory_reserved(device_index),
+            torch.cuda.max_memory_allocated(device_index),
+            torch.cuda.memory_allocated(device_index),
+        ) / scale
+        if peak_mb <= budget_mb:
+            return
+        try:
+            _free_bytes, total_bytes = torch.cuda.mem_get_info(device_index)
+            total_mb = round(total_bytes / scale, 1)
+        except Exception:
+            total_mb = ""
+    except Exception as exc:
+        if "GPU VRAM budget exceeded" in str(exc):
+            raise
+        return
+    detail = (
+        "GPU VRAM budget exceeded: "
+        f"stage={stage} peak_mb={peak_mb:.1f} "
+        f"budget_mb={budget_mb:.1f} total_mb={total_mb}"
+    )
+    _emit_progress(on_stage, f"[WARN] {detail}")
+    raise RuntimeError(detail)
 
 
 class ASRWorkerSystemError(RuntimeError):
@@ -209,7 +240,7 @@ def _alignment_outcome_for_chunk(
 
 
 def _transcribe_asr_chunks_text_only(
-    backend: LocalAsrBackend | SubprocessAsrBackend,
+    backend: LocalAsrBackend,
     chunks: list[dict],
     text_stage_label: str,
     on_stage: Callable[[str], None] | None = None,
@@ -233,15 +264,6 @@ def _transcribe_asr_chunks_text_only(
     processed_since_checkpoint = 0
     completed = False
     final_checkpoint_saved = False
-    is_subprocess_backend = _is_subprocess_backend(backend)
-    respawn_count: defaultdict[int, int] = defaultdict(int)
-    consecutive_failures = 0
-    # Kind of the most recent failure that incremented consecutive_failures.
-    # The OOM-branch circuit breaker reads this so it labels quarantine
-    # records with the failure that actually tripped the limit (timeout /
-    # crash / protocol_error), not a hardcoded "timeout".
-    last_failure_kind = "timeout"
-    failure_records: list[dict] = []
     text_started = time.perf_counter()
 
     def _save_progress_checkpoint() -> None:
@@ -268,277 +290,51 @@ def _transcribe_asr_chunks_text_only(
         processed_since_checkpoint += len(batch_text_results)
         _save_progress_checkpoint()
 
-    def _quarantine_chunk(chunk: dict, *, kind: str, detail: str) -> None:
-        nonlocal processed_since_checkpoint
-        chunk_index = int(chunk["index"])
-        if chunk_index in text_results_by_index:
-            return
-        count = int(respawn_count[chunk_index])
-        text_results_by_index[chunk_index] = _build_quarantined_text_result(
-            chunk,
-            kind=kind,
-            detail=detail,
-            respawn_count=count,
-            run_id=run_id,
-        )
-        failure_records.append(
-            {
-                "index": chunk_index,
-                "kind": kind,
-                "detail": detail,
-                "respawn_count": count,
-                "run_id": run_id,
-                "worker_mode": _current_asr_worker_mode(),
-            }
-        )
-        processed_since_checkpoint += 1
-
-    def _schedule_retries(
-        failed_chunks: list[dict],
-        *,
-        kind: str,
-        detail: str,
-    ) -> list[dict]:
-        retry_chunks: list[dict] = []
-        for chunk in failed_chunks:
-            chunk_index = int(chunk["index"])
-            if chunk_index in text_results_by_index:
-                continue
-            respawn_count[chunk_index] += 1
-            if respawn_count[chunk_index] > _ASR_SUBPROCESS_RESPAWN_MAX:
-                _quarantine_chunk(chunk, kind=kind, detail=detail)
-            else:
-                retry_chunks.append(chunk)
-        _save_progress_checkpoint()
-        return retry_chunks
-
-    def _quarantine_many(
-        failed_chunks: list[dict],
-        *,
-        kind: str,
-        detail: str,
-    ) -> None:
-        for chunk in failed_chunks:
-            _quarantine_chunk(chunk, kind=kind, detail=detail)
-        _save_progress_checkpoint()
-
     def _transcribe_batch(batch_chunks: list[dict]) -> list[dict]:
         audio_paths = [chunk["path"] for chunk in batch_chunks]
         return backend.transcribe_texts(audio_paths, on_stage=on_stage)
 
     try:
-        if not is_subprocess_backend:
-            for batch_start in range(0, len(chunks), request_batch_size):
-                batch_chunks = chunks[batch_start : batch_start + request_batch_size]
-                pending_chunks = [
-                    chunk
-                    for chunk in batch_chunks
-                    if int(chunk["index"]) not in text_results_by_index
-                ]
-                batch_end = batch_start + len(batch_chunks)
-                batch_number = batch_start // request_batch_size + 1
-                batch_started = time.perf_counter()
-                _emit_progress(
-                    on_stage,
-                    (
-                        f"{text_stage_label} {batch_end}/{len(chunks)} "
-                        f"batch={batch_number} size={len(pending_chunks)} start"
-                    ),
-                )
-                if not pending_chunks:
-                    continue
-
-                batch_text_results = _transcribe_batch(pending_chunks)
-                _store_text_results(pending_chunks, batch_text_results)
-                batch_elapsed = time.perf_counter() - batch_started
-                _emit_progress(
-                    on_stage,
-                    (
-                        f"{text_stage_label} {len(text_results_by_index)}/{len(chunks)} "
-                        f"batch={batch_number} size={len(batch_text_results)} done "
-                        f"elapsed={batch_elapsed:.2f}s "
-                        f"sec_per_chunk={batch_elapsed / max(len(batch_text_results), 1):.3f}"
-                    ),
-                )
-        else:
+        for batch_start in range(0, len(chunks), request_batch_size):
+            batch_chunks = chunks[batch_start : batch_start + request_batch_size]
             pending_chunks = [
-                chunk for chunk in chunks if int(chunk["index"]) not in text_results_by_index
+                chunk
+                for chunk in batch_chunks
+                if int(chunk["index"]) not in text_results_by_index
             ]
-            total_batches = max(
-                1,
-                (len(pending_chunks) + request_batch_size - 1) // request_batch_size,
+            batch_end = batch_start + len(batch_chunks)
+            batch_number = batch_start // request_batch_size + 1
+            batch_started = time.perf_counter()
+            _emit_progress(
+                on_stage,
+                (
+                    f"{text_stage_label} {batch_end}/{len(chunks)} "
+                    f"batch={batch_number} size={len(pending_chunks)} start"
+                ),
             )
-            batch_number = 0
-            while pending_chunks:
-                batch_chunks = pending_chunks[:request_batch_size]
-                pending_chunks = pending_chunks[request_batch_size:]
-                batch_number += 1
-                batch_target = min(len(text_results_by_index) + len(batch_chunks), len(chunks))
-                batch_started = time.perf_counter()
-                _emit_progress(
-                    on_stage,
-                    (
-                        f"{text_stage_label} {batch_target}/{len(chunks)} "
-                        f"batch={batch_number}/{total_batches} "
-                        f"size={len(batch_chunks)} start"
-                    ),
-                )
+            if not pending_chunks:
+                continue
 
-                try:
-                    batch_text_results = _transcribe_batch(batch_chunks)
-                except WorkerTimeoutError as exc:
-                    consecutive_failures += 1
-                    last_failure_kind = "timeout"
-                    retry_chunks = _schedule_retries(
-                        batch_chunks,
-                        kind="timeout",
-                        detail=str(getattr(exc, "detail", str(exc))),
-                    )
-                    if (
-                        consecutive_failures
-                        >= _ASR_SUBPROCESS_CONSECUTIVE_TIMEOUT_LIMIT
-                    ):
-                        _quarantine_many(
-                            retry_chunks + pending_chunks,
-                            kind="timeout",
-                            detail="circuit breaker",
-                        )
-                        pending_chunks = []
-                        break
-                    pending_chunks = retry_chunks + pending_chunks
-                    continue
-                except WorkerError as exc:
-                    failure_kind = str(getattr(exc, "kind", "crash") or "crash")
-                    failure_detail = str(getattr(exc, "detail", str(exc)) or str(exc))
-                    if failure_kind == "oom":
-                        retry_chunks: list[dict] = []
-                        for chunk in batch_chunks:
-                            chunk_index = int(chunk["index"])
-                            if chunk_index in text_results_by_index:
-                                continue
-                            # NOTE: do not pre-increment respawn_count here. Every
-                            # failure path below already accounts for the attempt --
-                            # _schedule_retries increments on retry (mirroring the
-                            # crash path), and the single-OOM branch increments
-                            # before direct quarantine. A pre-increment here used to
-                            # double-count, pushing OOM chunks into quarantine ~one
-                            # cycle earlier than crash chunks at the same MAX.
-                            try:
-                                single_result = _transcribe_batch([chunk])
-                            except WorkerTimeoutError as single_exc:
-                                consecutive_failures += 1
-                                last_failure_kind = "timeout"
-                                retry_chunks.extend(
-                                    _schedule_retries(
-                                        [chunk],
-                                        kind="timeout",
-                                        detail=str(
-                                            getattr(
-                                                single_exc,
-                                                "detail",
-                                                str(single_exc),
-                                            )
-                                        ),
-                                    )
-                                )
-                            except WorkerError as single_exc:
-                                single_kind = str(
-                                    getattr(single_exc, "kind", "crash") or "crash"
-                                )
-                                single_detail = str(
-                                    getattr(single_exc, "detail", str(single_exc))
-                                    or str(single_exc)
-                                )
-                                if single_kind == "oom":
-                                    respawn_count[chunk_index] += 1
-                                    _quarantine_chunk(
-                                        chunk,
-                                        kind="oom",
-                                        detail=single_detail,
-                                    )
-                                    _save_progress_checkpoint()
-                                elif single_kind in {"crash", "protocol_error"}:
-                                    consecutive_failures += 1
-                                    last_failure_kind = single_kind
-                                    retry_chunks.extend(
-                                        _schedule_retries(
-                                            [chunk],
-                                            kind=single_kind,
-                                            detail=single_detail,
-                                        )
-                                    )
-                                else:
-                                    raise
-                            else:
-                                _store_text_results([chunk], single_result)
-                                consecutive_failures = 0
-                                last_failure_kind = "timeout"
-
-                        if (
-                            consecutive_failures
-                            >= _ASR_SUBPROCESS_CONSECUTIVE_TIMEOUT_LIMIT
-                        ):
-                            _quarantine_many(
-                                retry_chunks + pending_chunks,
-                                kind=last_failure_kind,
-                                detail="circuit breaker",
-                            )
-                            pending_chunks = []
-                            break
-                        pending_chunks = retry_chunks + pending_chunks
-                        continue
-
-                    if failure_kind in {"crash", "protocol_error"}:
-                        consecutive_failures += 1
-                        last_failure_kind = failure_kind
-                        retry_chunks = _schedule_retries(
-                            batch_chunks,
-                            kind=failure_kind,
-                            detail=failure_detail,
-                        )
-                        if (
-                            consecutive_failures
-                            >= _ASR_SUBPROCESS_CONSECUTIVE_TIMEOUT_LIMIT
-                        ):
-                            _quarantine_many(
-                                retry_chunks + pending_chunks,
-                                kind=failure_kind,
-                                detail="circuit breaker",
-                            )
-                            pending_chunks = []
-                            break
-                        pending_chunks = retry_chunks + pending_chunks
-                        continue
-                    raise
-                else:
-                    _store_text_results(batch_chunks, batch_text_results)
-                    batch_elapsed = time.perf_counter() - batch_started
-                    _emit_progress(
-                        on_stage,
-                        (
-                            f"{text_stage_label} {len(text_results_by_index)}/{len(chunks)} "
-                            f"batch={batch_number}/{total_batches} "
-                            f"size={len(batch_text_results)} done "
-                            f"elapsed={batch_elapsed:.2f}s "
-                            f"sec_per_chunk={batch_elapsed / max(len(batch_text_results), 1):.3f}"
-                        ),
-                    )
-                    consecutive_failures = 0
-                    last_failure_kind = "timeout"
+            batch_text_results = _transcribe_batch(pending_chunks)
+            _enforce_vram_budget(
+                f"{text_stage_label}_batch_{batch_number}",
+                on_stage,
+            )
+            _store_text_results(pending_chunks, batch_text_results)
+            batch_elapsed = time.perf_counter() - batch_started
+            _emit_progress(
+                on_stage,
+                (
+                    f"{text_stage_label} {len(text_results_by_index)}/{len(chunks)} "
+                    f"batch={batch_number} size={len(batch_text_results)} done "
+                    f"elapsed={batch_elapsed:.2f}s "
+                    f"sec_per_chunk={batch_elapsed / max(len(batch_text_results), 1):.3f}"
+                ),
+            )
 
         timeout_count = sum(
             1 for result in text_results_by_index.values() if _is_timed_out_result(result)
         )
-        if failure_records:
-            quarantine_paths = _quarantine_failed_chunks(
-                checkpoint_source,
-                chunks,
-                failure_records,
-                run_id=run_id,
-                worker_mode=_current_asr_worker_mode(),
-            )
-            if quarantine_paths and on_stage:
-                on_stage(f"ASR quarantine 已写入 {len(quarantine_paths)} 个记录")
         checkpointable_results = _checkpointable_text_results(text_results_by_index)
         completed = len(checkpointable_results) >= len(chunks)
         if timeout_count:
@@ -571,23 +367,11 @@ def _transcribe_asr_chunks_text_only(
                 run_id=run_id,
             )
 
-    if is_subprocess_backend:
-        missing_indices = [
-            int(chunk["index"])
-            for chunk in chunks
-            if int(chunk["index"]) not in text_results_by_index
-        ]
-        if missing_indices:
-            raise ASRWorkerSystemError(
-                f"subprocess ASR missing text results for chunks: {missing_indices[:10]}"
-            )
-        text_results = [text_results_by_index[int(chunk["index"])] for chunk in chunks]
-    else:
-        text_results = [
-            text_results_by_index[int(chunk["index"])]
-            for chunk in chunks
-            if int(chunk["index"]) in text_results_by_index
-        ]
+    text_results = [
+        text_results_by_index[int(chunk["index"])]
+        for chunk in chunks
+        if int(chunk["index"]) in text_results_by_index
+    ]
 
     text_elapsed = time.perf_counter() - text_started
     return text_results, {"text_transcribe_s": text_elapsed}
@@ -672,7 +456,7 @@ def _align_TRANSCRIPTION_results(
             "alignment_s": time.perf_counter() - align_started
         }
 
-    if _is_subprocess_backend(backend) or getattr(backend, "model", None) is not None:
+    if getattr(backend, "model", None) is not None:
         backend.unload_model(on_stage=on_stage)
 
     if on_stage:

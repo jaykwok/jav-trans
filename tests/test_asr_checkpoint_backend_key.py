@@ -11,7 +11,6 @@ def _checkpoint_name(
     asr_backend: str,
 ) -> str:
     monkeypatch.setenv("ASR_BACKEND", asr_backend)
-    monkeypatch.setenv("ASR_WORKER_MODE", "inproc")
 
     from asr import pipeline as asr
     asr = importlib.reload(asr)
@@ -110,4 +109,3 @@ def test_checkpoint_excludes_quarantined_results():
     # persists, so quarantined chunks get re-transcribed on resume instead of
     # being silently restored as empty completed results.
     assert set(filtered.keys()) == {0}
-

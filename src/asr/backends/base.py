@@ -5,7 +5,7 @@ from typing import Any, Callable, Protocol, runtime_checkable
 
 @runtime_checkable
 class BaseAsrBackend(Protocol):
-    """Interface shared by in-process and subprocess ASR backends."""
+    """Interface for ASR model execution inside the unified GPU worker."""
 
     is_subprocess: bool
     request_batch_size: int

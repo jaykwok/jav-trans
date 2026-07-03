@@ -8,12 +8,29 @@ from pathlib import Path
 
 from audio.chunk_packer import PackedChunk
 from boundary.base import SegmentationResult, SpeechSegment
-from boundary.sequence_features import DEFAULT_CHUNK_POOLED_PTM_BINS, chunk_pooled_ptm_feature_names
+from boundary.sequence_features import (
+    CHUNK_POOLED_PTM_SCHEMA,
+    DEFAULT_CHUNK_POOLED_PTM_BINS,
+    chunk_pooled_ptm_feature_names,
+)
 
 ROOT = Path(__file__).resolve().parents[1]
 SRC = ROOT / "src"
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
+
+from asr.pre_asr_cueqc import PRE_ASR_CUEQC_PTM_BINS, PRE_ASR_CUEQC_PTM_DIM
+
+
+def _pre_asr_ptm_feature_names() -> list[str]:
+    return chunk_pooled_ptm_feature_names(
+        ptm_dim=PRE_ASR_CUEQC_PTM_DIM,
+        bins=PRE_ASR_CUEQC_PTM_BINS,
+    )
+
+
+def _pre_asr_ptm_values() -> list[float]:
+    return [0.0] * len(_pre_asr_ptm_feature_names())
 
 
 def _write_wav(path: Path, seconds: float, sample_rate: int = 8000) -> None:
@@ -222,16 +239,19 @@ class _FakeSequenceFeatureProvider:
     def chunk_pooled_ptm_feature_names(
         self,
         *,
-        bins: int = DEFAULT_CHUNK_POOLED_PTM_BINS,
+        bins: int = PRE_ASR_CUEQC_PTM_BINS,
     ) -> list[str]:
-        return chunk_pooled_ptm_feature_names(ptm_dim=64, bins=bins)
+        return chunk_pooled_ptm_feature_names(
+            ptm_dim=PRE_ASR_CUEQC_PTM_DIM,
+            bins=bins,
+        )
 
     def chunk_pooled_ptm_features(
         self,
         *,
         start_s: float,
         end_s: float,
-        bins: int = DEFAULT_CHUNK_POOLED_PTM_BINS,
+        bins: int = PRE_ASR_CUEQC_PTM_BINS,
     ) -> list[float]:
         del start_s, end_s
         return [0.0] * len(self.chunk_pooled_ptm_feature_names(bins=bins))
@@ -290,6 +310,10 @@ def _reload_pipeline(monkeypatch, tmp_path: Path, *, enable_cueqc: bool = False)
                 duration=segment.end - segment.start,
                 split_reason="semantic_boundary",
                 boundary_source="speech_island",
+                pre_asr_ptm_pooling_schema=CHUNK_POOLED_PTM_SCHEMA,
+                pre_asr_ptm_pooling_bins=PRE_ASR_CUEQC_PTM_BINS,
+                pre_asr_ptm_pooling_dim=len(_pre_asr_ptm_feature_names()),
+                pre_asr_ptm_pooled_features=_pre_asr_ptm_values(),
             )
             for segment in segments
         ],

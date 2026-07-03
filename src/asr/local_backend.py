@@ -1,11 +1,9 @@
 import concurrent.futures
 import gc
 import logging
-import multiprocessing as mp
 import os
 import re
 import time
-import uuid
 import wave
 from dataclasses import dataclass
 from pathlib import Path
@@ -47,17 +45,11 @@ ASR_FORCE_LANGUAGE = os.getenv("ASR_FORCE_LANGUAGE", "1").strip().lower() not in
     "no",
     "off",
 }
-_ASR_SUBPROCESS_KILL_GRACE_S = float(os.getenv("ASR_SUBPROCESS_KILL_GRACE_S", "5"))
-_ASR_SUBPROCESS_READY_TIMEOUT_S = float(
-    os.getenv("ASR_SUBPROCESS_READY_TIMEOUT_S", "600")
-)
-
-
-# --- Windows Job Object: kill the ASR subprocess if the parent dies abnormally
+# --- Windows Job Object: kill the GPU worker if the parent dies abnormally
 # (kill -9 / segfault / OOM-killer / task-manager end). daemon=True only covers
 # graceful interpreter exit; a Job Object with JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
 # makes the OS reap the child when the parent process vanishes. Best-effort: on
-# failure we fall back to the explicit _kill_child path on close(). ---
+# failure we fall back to the caller's explicit kill path on close(). ---
 if os.name == "nt":
     import ctypes
 
@@ -141,13 +133,6 @@ def _get_wav_duration_or_zero(audio_path: str) -> float:
 def _notify(on_stage: Callable[[str], None] | None, message: str) -> None:
     if on_stage:
         on_stage(message)
-
-
-def _payload_has_timeout_log(payload: dict) -> bool:
-    log = payload.get("log", [])
-    if isinstance(log, str):
-        return "TIMEOUT:" in log
-    return any("TIMEOUT:" in str(entry) for entry in log)
 
 
 def _clear_cuda_cache(device: str) -> None:
@@ -282,7 +267,7 @@ def _qwen_generation_metadata(
     *,
     error_kind: str | None = None,
     error_detail: str = "",
-    worker_mode: str = "inproc",
+    worker_mode: str = "gpu_worker",
 ) -> dict:
     return {
         "backend": current_qwen_asr_backend(),
@@ -314,20 +299,6 @@ def normalize_word_dicts(words: list[dict]) -> list[dict]:
     return normalized
 
 
-class WorkerTimeoutError(RuntimeError):
-    def __init__(self, detail: str = "ASR worker timed out"):
-        super().__init__(detail)
-        self.kind = "timeout"
-        self.detail = detail
-
-
-class WorkerError(RuntimeError):
-    def __init__(self, kind: str, detail: str):
-        super().__init__(f"{kind}: {detail}")
-        self.kind = kind
-        self.detail = detail
-
-
 @dataclass(frozen=True)
 class NativeAsrTranscription:
     language: str | None
@@ -344,7 +315,7 @@ class LocalAsrBackend:
         self.model = None
         self.processor = None
         self.request_batch_size = ASR_BATCH_SIZE
-        # References to a previously timed-out in-proc generate that is
+        # References to a previously timed-out worker-local generate that is
         # still running (PyTorch generate cannot be hard-interrupted; see
         # README). Kept so the next call can join the zombie before reusing
         # or replacing self.model, preventing two models from coexisting in
@@ -381,13 +352,13 @@ class LocalAsrBackend:
         _apply_generation_safety(self.model)
 
     def unload_model(self, on_stage: Callable[[str], None] | None = None) -> None:
-        # If a timed-out in-proc generate is still running, join it first;
-        # dropping self.model from under the zombie would let the next load
-        # double-allocate (VRAM OOM).
+        # If a timed-out generate is still running inside the GPU worker, join
+        # it first; dropping self.model from under the zombie would let the
+        # next load double-allocate.
         if not self._join_zombie_worker(on_stage=on_stage):
             _notify(
                 on_stage,
-                "[WARN] ASR inproc 僵尸线程未结束，跳过卸载以防两模型同驻 OOM",
+                "[WARN] ASR generate 僵尸线程未结束，跳过卸载以防两模型同驻 OOM",
             )
             return
         if self.model is None:
@@ -409,13 +380,12 @@ class LocalAsrBackend:
         *,
         on_stage: Callable[[str], None] | None = None,
     ) -> bool:
-        """Wait for a previously timed-out in-proc generate to finish.
+        """Wait for a previously timed-out generate thread to finish.
 
-        PyTorch's native generate cannot be hard-interrupted mid-flight
-        (README: inproc 模式超时后无法中断正在跑的 generate), so a timed-out
-        transcribe leaves a worker thread running with the loaded model. If
-        we cleared self.model in that state the next load() would allocate a
-        second model while the zombie still holds the old one -> VRAM OOM.
+        PyTorch's native generate cannot be hard-interrupted mid-flight, so a
+        timed-out transcribe leaves a worker thread running with the loaded
+        model. If we cleared self.model in that state the next load() would
+        allocate a second model while the zombie still holds the old one.
 
         We instead keep the zombie references on timeout and join here
         (bounded by the transcription timeout) before any reuse/replace.
@@ -429,13 +399,13 @@ class LocalAsrBackend:
         join_budget = _transcription_timeout_s()
         _notify(
             on_stage,
-            f"[WARN] 等待上一轮 ASR inproc 超时僵尸线程收尾 (上限 {join_budget}s)",
+            f"[WARN] 等待上一轮 ASR generate 超时僵尸线程收尾 (上限 {join_budget}s)",
         )
         try:
             future.result(timeout=join_budget)
         except concurrent.futures.TimeoutError:
             logger.warning(
-                "inproc ASR zombie generate still running after %ss join wait; "
+                "ASR zombie generate still running after %ss join wait; "
                 "native generate cannot be hard-interrupted, keeping sole model "
                 "reference to avoid double-allocation VRAM OOM",
                 join_budget,
@@ -449,7 +419,7 @@ class LocalAsrBackend:
             # Zombie generate raised; model state is unknown but the worker
             # is done so clearing here has no concurrency risk.
             logger.warning(
-                "inproc ASR zombie generate raised; will reload model on next load",
+                "ASR zombie generate raised; will reload model on next load",
                 exc_info=True,
             )
             try:
@@ -506,14 +476,14 @@ class LocalAsrBackend:
     ) -> list[dict]:
         language_hint = _asr_language() if _asr_force_language() else None
 
-        # If a prior in-proc generate timed out and is still running, join it
+        # If a prior generate timed out and is still running, join it
         # (bounded) before touching the model -- never let load() spawn a
         # second model while the zombie holds the old one (VRAM OOM).
         if not self._join_zombie_worker(on_stage=on_stage):
             timeout_s = _transcription_timeout_s()
             _notify(
                 on_stage,
-                "[WARN] ASR inproc 僵尸线程未结束，跳过本批次以防两模型同驻 OOM",
+                "[WARN] ASR generate 僵尸线程未结束，跳过本批次以防两模型同驻 OOM",
             )
             return [
                 {
@@ -525,12 +495,12 @@ class LocalAsrBackend:
                     "asr_generation": _qwen_generation_metadata(
                         error_kind="timeout",
                         error_detail=(
-                            f"skipped: inproc zombie still running after {timeout_s}s"
+                            f"skipped: zombie generate still running after {timeout_s}s"
                         ),
                     ),
                     "log": [
                         (
-                            "TIMEOUT: skipped: inproc zombie still running "
+                            "TIMEOUT: skipped: zombie generate still running "
                             f"after {timeout_s}s"
                         )
                     ],
@@ -563,7 +533,7 @@ class LocalAsrBackend:
                 timed_out = True
                 future.cancel()
                 # The native generate keeps running in the worker thread and
-                # cannot be hard-interrupted in-proc (see README). Keep the
+                # cannot be hard-interrupted. Keep the
                 # sole model reference and the running worker so the next call
                 # can join the zombie before reusing/reloading -- never drop
                 # self.model here, or load() would allocate a second model
@@ -571,7 +541,7 @@ class LocalAsrBackend:
                 self._zombie_future = future
                 self._zombie_executor = executor
                 logger.warning(
-                    "inproc ASR transcribe timed out after %ss; native generate "
+                    "ASR transcribe timed out after %ss; native generate "
                     "cannot be hard-interrupted, deferring model reload until the "
                     "zombie worker finishes (next call joins it)",
                     _transcription_timeout_s(),
@@ -579,7 +549,7 @@ class LocalAsrBackend:
                 _notify(
                     on_stage,
                     f"[WARN] ASR 超时 ({_transcription_timeout_s()}s)，跳过当前批次"
-                    "（inproc 无法硬中断 generate）",
+                    "（native generate 无法硬中断）",
                 )
                 return [
                     {
@@ -667,7 +637,7 @@ class LocalAsrBackend:
         return results
 
     def capture_asr_internals(self, chunks: list[dict], **_kwargs) -> list[dict]:
-        """Capture ASR internals (encoder frames + token logits) in-process.
+        """Capture ASR internals (encoder frames + token logits) in this backend.
 
         Reuses this backend's loaded Qwen3-ASR (no second model load). Each
         chunk: {path, text, start_s, end_s}. Returns one dict per chunk.
@@ -676,7 +646,7 @@ class LocalAsrBackend:
             return []
         if not self._join_zombie_worker():
             return [
-                {"ok": False, "error": "inproc zombie generate still running"}
+                {"ok": False, "error": "zombie generate still running"}
             ] * len(chunks)
         if self.model is None:
             self.load()
@@ -841,368 +811,6 @@ class LocalAsrBackend:
                 )
             )
         return finalized
-
-    def finalize_text_result(
-        self,
-        text_result: dict,
-        on_stage: Callable[[str], None] | None = None,
-    ) -> tuple[dict, list[str]]:
-        return self.finalize_text_results([text_result], on_stage=on_stage)[0]
-
-    def transcribe_to_words(
-        self,
-        audio_path: str,
-        on_stage: Callable[[str], None] | None = None,
-    ) -> tuple[dict, list[str]]:
-        text_result = self.transcribe_texts([audio_path], on_stage=on_stage)[0]
-        self.unload_model(on_stage=on_stage)
-        return self.finalize_text_result(text_result, on_stage=on_stage)
-
-
-class SubprocessAsrBackend:
-    """Run ASR text inference in a killable child process."""
-
-    is_subprocess = True
-
-    def __init__(self, device: str):
-        self.device = device if device.startswith("cuda") else "cpu"
-        self.request_batch_size = ASR_BATCH_SIZE
-        self.kill_grace_s = _ASR_SUBPROCESS_KILL_GRACE_S
-        self.ready_timeout_s = _ASR_SUBPROCESS_READY_TIMEOUT_S
-        self.model = None
-        self._ctx = mp.get_context("spawn")
-        self._process = None
-        self._conn = None
-        self._job_handle = None  # Windows Job Object handle (kill on parent death)
-
-    def load(self, on_stage: Callable[[str], None] | None = None) -> None:
-        self._ensure_worker(on_stage=on_stage)
-
-    def _ensure_worker(self, on_stage: Callable[[str], None] | None = None) -> None:
-        if self._process is not None and self._process.is_alive() and self._conn is not None:
-            return
-        self._start_worker(on_stage=on_stage)
-
-    def _start_worker(self, on_stage: Callable[[str], None] | None = None) -> None:
-        from asr.worker import main as worker_main
-
-        self._close_conn()
-        parent_conn, child_conn = self._ctx.Pipe(duplex=True)
-        process = self._ctx.Process(
-            target=worker_main,
-            args=(child_conn, {"device": self.device}),
-            daemon=False,
-        )
-
-        _notify(on_stage, "启动 ASR 子进程...")
-        process.start()
-        # Best-effort: bind the subprocess to a kill-on-close Job Object so the
-        # OS reaps it if this parent dies abnormally (kill -9 / segfault / task
-        # manager). daemon=False cannot cover that. Non-Windows falls back to
-        # the explicit _kill_child on close() + the worker recv() EOF path.
-        self._job_handle = None
-        if os.name == "nt":
-            try:
-                job = _create_kill_on_close_job_object()
-                _assign_process_to_job_object(job, process)
-                self._job_handle = job
-            except Exception:
-                self._job_handle = None
-        child_conn.close()
-        self._process = process
-        self._conn = parent_conn
-
-        deadline = time.monotonic() + self.ready_timeout_s
-        while True:
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                self._kill_child()
-                raise WorkerError(
-                    "crash",
-                    f"worker ready timeout after {self.ready_timeout_s}s",
-                )
-            if parent_conn.poll(min(0.5, remaining)):
-                break
-            if process.exitcode is not None:
-                exitcode = process.exitcode
-                self._kill_child()
-                raise WorkerError("crash", f"worker exited before ready: {exitcode}")
-
-        try:
-            message = parent_conn.recv()
-        except EOFError as exc:
-            exitcode = process.exitcode
-            self._kill_child()
-            raise WorkerError("crash", f"worker exited before ready: {exitcode}") from exc
-
-        if not isinstance(message, dict):
-            self._kill_child()
-            raise WorkerError("protocol_error", "ready message is not a dict")
-
-        if message.get("op") == "error":
-            kind = str(message.get("kind") or "crash")
-            detail = str(message.get("detail") or "worker failed during startup")
-            self._kill_child()
-            raise WorkerError(kind, detail)
-
-        if message.get("op") != "ready":
-            self._kill_child()
-            raise WorkerError("protocol_error", f"unexpected ready message: {message!r}")
-
-        pid = message.get("pid")
-        if not isinstance(pid, int):
-            self._kill_child()
-            raise WorkerError("protocol_error", f"invalid ready pid: {pid!r}")
-
-        _notify(on_stage, f"ASR 子进程就绪 pid={pid}")
-
-    def _close_conn(self) -> None:
-        if self._conn is not None:
-            try:
-                self._conn.close()
-            except Exception:
-                pass
-        self._conn = None
-
-    def _kill_child(self) -> None:
-        process = self._process
-        self._process = None
-
-        if process is not None:
-            try:
-                if process.is_alive():
-                    process.terminate()
-                    process.join(self.kill_grace_s)
-                if process.is_alive():
-                    process.kill()
-                    process.join(5)
-                if process.is_alive():
-                    process.join(1)
-            except Exception:
-                pass
-
-        self._close_conn()
-        _clear_cuda_cache(self.device)
-
-    def _restart_worker(self, on_stage: Callable[[str], None] | None = None) -> None:
-        self._kill_child()
-        self._start_worker(on_stage=on_stage)
-
-    def _raise_after_worker_restart(
-        self,
-        exc: WorkerTimeoutError | WorkerError,
-        cause: BaseException | None = None,
-        on_stage: Callable[[str], None] | None = None,
-    ) -> None:
-        try:
-            if cause is not None:
-                raise exc from cause
-            raise exc
-        finally:
-            try:
-                self._restart_worker(on_stage=on_stage)
-            except Exception as restart_exc:
-                # Preserve the original error's kind so callers that branch on
-                # kind (timeout / oom / crash) are not misled into the crash
-                # path when the respawn itself fails.
-                original_kind = getattr(exc, "kind", None) or "crash"
-                raise WorkerError(
-                    original_kind,
-                    f"worker respawn failed: {restart_exc!r}",
-                ) from exc
-
-    def unload_model(self, on_stage: Callable[[str], None] | None = None) -> None:
-        if self._process is None:
-            return
-
-        _notify(on_stage, "关闭 ASR 子进程...")
-        conn = self._conn
-        process = self._process
-        try:
-            if conn is not None and process is not None and process.is_alive():
-                conn.send({"op": "shutdown"})
-                process.join(5)
-        except Exception:
-            pass
-        finally:
-            if process is not None and process.is_alive():
-                self._kill_child()
-            else:
-                self._process = None
-                self._close_conn()
-                _clear_cuda_cache(self.device)
-
-    def close(self) -> None:
-        self.unload_model()
-
-    def transcribe_texts(
-        self,
-        audio_paths: list[str],
-        on_stage: Callable[[str], None] | None = None,
-    ) -> list[dict]:
-        if not audio_paths:
-            return []
-
-        self._ensure_worker(on_stage=on_stage)
-        assert self._conn is not None
-
-        job_id = uuid.uuid4().hex[:8]
-        chunks = [
-            {
-                "path": str(Path(audio_path).resolve()),
-                "index": idx,
-            }
-            for idx, audio_path in enumerate(audio_paths)
-        ]
-
-        try:
-            self._conn.send({"op": "transcribe", "job_id": job_id, "chunks": chunks})
-        except (BrokenPipeError, EOFError, OSError) as exc:
-            exitcode = self._process.exitcode if self._process is not None else None
-            failure = WorkerError(
-                "crash",
-                f"worker send failed exitcode={exitcode}: {exc!r}",
-            )
-            self._raise_after_worker_restart(failure, cause=exc, on_stage=on_stage)
-        timeout_s = _transcription_timeout_s()
-        deadline = time.monotonic() + timeout_s
-
-        while True:
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                detail = f"worker timeout after {timeout_s}s"
-                self._raise_after_worker_restart(
-                    WorkerTimeoutError(detail),
-                    on_stage=on_stage,
-                )
-            if not self._conn.poll(min(1.0, remaining)):
-                exitcode = self._process.exitcode if self._process is not None else None
-                if exitcode is not None:
-                    self._raise_after_worker_restart(
-                        WorkerError(
-                            "crash",
-                            f"worker exited before result exitcode={exitcode}",
-                        ),
-                        on_stage=on_stage,
-                    )
-                continue
-
-            try:
-                message = self._conn.recv()
-            except EOFError as exc:
-                exitcode = self._process.exitcode if self._process is not None else None
-                failure = WorkerError(
-                    "crash",
-                    f"worker pipe closed exitcode={exitcode}",
-                )
-                self._raise_after_worker_restart(failure, cause=exc, on_stage=on_stage)
-
-            if not isinstance(message, dict):
-                self._raise_after_worker_restart(
-                    WorkerError("protocol_error", "worker message is not a dict"),
-                    on_stage=on_stage,
-                )
-
-            if str(message.get("job_id") or "") != job_id:
-                continue
-
-            op = message.get("op")
-            if op == "result":
-                results = message.get("results")
-                if not isinstance(results, list) or len(results) != len(audio_paths):
-                    self._raise_after_worker_restart(
-                        WorkerError(
-                            "protocol_error",
-                            "worker result count does not match request",
-                        ),
-                        on_stage=on_stage,
-                    )
-                if any(
-                    isinstance(result, dict) and _payload_has_timeout_log(result)
-                    for result in results
-                ):
-                    self._raise_after_worker_restart(
-                        WorkerTimeoutError("worker returned TIMEOUT payload"),
-                        on_stage=on_stage,
-                    )
-                for result in results:
-                    if isinstance(result, dict) and isinstance(
-                        result.get("asr_generation"),
-                        dict,
-                    ):
-                        result["asr_generation"]["worker_mode"] = "subprocess"
-                return results
-
-            if op == "error":
-                kind = str(message.get("kind") or "crash")
-                detail = str(message.get("detail") or "worker error")
-                self._raise_after_worker_restart(
-                    WorkerError(kind, detail),
-                    on_stage=on_stage,
-                )
-
-            self._raise_after_worker_restart(
-                WorkerError("protocol_error", f"unexpected worker op: {op}"),
-                on_stage=on_stage,
-            )
-
-    def capture_asr_internals(
-        self,
-        chunks: list[dict],
-        *,
-        timeout_s: float | None = None,
-    ) -> list[dict]:
-        """Capture ASR internals (encoder frames + token logits) in the worker.
-
-        Each chunk: {path, text, start_s, end_s}. Returns one dict per chunk
-        with asr_frames/token_logprobs/... or {ok: False, error: ...}. The
-        capture reuses the worker's loaded Qwen3-ASR (no second model load).
-        """
-        if not chunks:
-            return []
-        self._ensure_worker()
-        assert self._conn is not None
-        job_id = uuid.uuid4().hex[:8]
-        payload = [
-            {
-                "path": str(c.get("path") or ""),
-                "text": str(c.get("text") or ""),
-                "start_s": float(c.get("start_s") or 0.0),
-                "end_s": float(c.get("end_s") or c.get("start_s") or 0.0),
-            }
-            for c in chunks
-        ]
-        try:
-            self._conn.send({"op": "capture_internals", "job_id": job_id, "chunks": payload})
-        except (BrokenPipeError, EOFError, OSError):
-            return [{"ok": False, "error": "worker send failed"}] * len(chunks)
-        deadline = time.monotonic() + (timeout_s or 600.0)
-        while True:
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                return [{"ok": False, "error": "capture timeout"}] * len(chunks)
-            if not self._conn.poll(min(1.0, remaining)):
-                continue
-            try:
-                message = self._conn.recv()
-            except EOFError:
-                return [{"ok": False, "error": "worker pipe closed"}] * len(chunks)
-            if not isinstance(message, dict) or str(message.get("job_id") or "") != job_id:
-                continue
-            if message.get("op") == "result":
-                internals = message.get("internals")
-                if isinstance(internals, list) and len(internals) == len(chunks):
-                    return internals
-                return [{"ok": False, "error": "count mismatch"}] * len(chunks)
-            if message.get("op") == "error":
-                return [{"ok": False, "error": str(message.get("detail") or "worker error")}] * len(chunks)
-
-    def finalize_text_results(
-        self,
-        text_results: list[dict],
-        on_stage: Callable[[str], None] | None = None,
-    ) -> list[tuple[dict, list[str]]]:
-        return LocalAsrBackend(self.device).finalize_text_results(text_results, on_stage=on_stage)
 
     def finalize_text_result(
         self,

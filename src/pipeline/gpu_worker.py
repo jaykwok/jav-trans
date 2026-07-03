@@ -37,6 +37,16 @@ def _env_float(name: str, default: float) -> float:
         return default
 
 
+def _env_int(name: str, default: int) -> int:
+    raw = os.getenv(name, str(default)).strip()
+    if not raw:
+        return default
+    try:
+        return int(float(raw))
+    except (TypeError, ValueError):
+        return default
+
+
 def _safe_send(conn: Connection, message: dict[str, Any]) -> bool:
     try:
         conn.send(message)
@@ -56,6 +66,8 @@ def _is_oom_error(exc: BaseException, torch_module: Any | None) -> bool:
     detail = repr(exc).lower()
     return (
         ("out of memory" in detail and ("cuda" in detail or "gpu" in detail))
+        or "gpu vram budget exceeded" in detail
+        or "vram budget exceeded" in detail
         or "cumemalloc" in detail
     )
 
@@ -124,6 +136,121 @@ def _load_asr_pipeline_for_request():
     return importlib.reload(asr_pipeline)
 
 
+class GpuModelManager:
+    """Owns GPU lifecycle boundaries inside the unified worker process."""
+
+    def __init__(
+        self,
+        *,
+        pid: int,
+        on_stage: Callable[[str], None] | None = None,
+    ) -> None:
+        self.pid = int(pid)
+        self.on_stage = on_stage
+        self.events: list[dict[str, Any]] = []
+
+    def _record(self, *, stage: str, action: str, **extra: Any) -> None:
+        event = {
+            "ts": round(time.time(), 3),
+            "stage": str(stage),
+            "action": str(action),
+        }
+        event.update(extra)
+        self.events.append(event)
+
+    def reset_cuda_state(self, *, reason: str) -> dict[str, Any]:
+        gc.collect()
+        snapshot: dict[str, Any] = {"reason": reason, "cuda_available": False}
+        try:
+            import torch
+
+            snapshot["cuda_available"] = bool(torch.cuda.is_available())
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+                device_index = torch.cuda.current_device()
+                scale = 1024 * 1024
+                free_bytes, total_bytes = torch.cuda.mem_get_info(device_index)
+                snapshot.update(
+                    {
+                        "device_index": int(device_index),
+                        "allocated_mb": round(
+                            torch.cuda.memory_allocated(device_index) / scale,
+                            1,
+                        ),
+                        "reserved_mb": round(
+                            torch.cuda.memory_reserved(device_index) / scale,
+                            1,
+                        ),
+                        "free_mb": round(free_bytes / scale, 1),
+                        "total_mb": round(total_bytes / scale, 1),
+                    }
+                )
+        except Exception as exc:  # noqa: BLE001 - diagnostics only
+            snapshot["error"] = f"{type(exc).__name__}: {exc}"
+        self._record(stage="cuda", action="reset", **snapshot)
+        return snapshot
+
+    def lifecycle_event(self, *, stage: str, action: str) -> None:
+        stage = str(stage)
+        action = str(action)
+        if stage == "asr" and action == "load_exclusive":
+            self.reset_cuda_state(reason="before_asr_exclusive_load")
+        self._record(stage=stage, action=action)
+        if action == "unload":
+            self.reset_cuda_state(reason=f"after_{stage}_unload")
+
+    def run_transcribe_and_align(
+        self,
+        *,
+        audio_path: str,
+        requested_device: str,
+        mock: bool,
+    ) -> tuple[list[dict], list[str], dict]:
+        self.reset_cuda_state(reason="before_request")
+        device = _resolve_device(requested_device)
+        try:
+            import torch
+
+            if device.startswith("cuda") and torch.cuda.is_available():
+                torch.cuda.reset_peak_memory_stats()
+        except Exception:
+            pass
+
+        if mock:
+            if self.on_stage is not None:
+                self.on_stage("ASR stage worker mock")
+            segments, asr_log, asr_details = _mock_result(
+                audio_path,
+                device,
+                pid=self.pid,
+            )
+        else:
+            asr_pipeline = _load_asr_pipeline_for_request()
+            segments, asr_log, asr_details = asr_pipeline.transcribe_and_align(
+                audio_path,
+                device,
+                on_stage=self.on_stage,
+                include_details=True,
+                model_manager=self,
+            )
+            asr_details = dict(asr_details or {})
+
+        self.reset_cuda_state(reason="after_request")
+        asr_details.setdefault("device", device)
+        asr_details["stage_worker"] = {
+            "mode": "gpu_worker",
+            "process_model": "persistent_subprocess",
+            "pid": self.pid,
+            "mock": bool(mock),
+            "gpu_owner": True,
+            "model_manager": {
+                "policy": "sequential_exclusive",
+                "events": list(self.events),
+            },
+        }
+        return segments, asr_log, asr_details
+
+
 def _mock_result(audio_path: str, device: str, *, pid: int) -> tuple[list[dict], list[str], dict]:
     segments = [
         {
@@ -145,12 +272,114 @@ def _mock_result(audio_path: str, device: str, *, pid: int) -> tuple[list[dict],
         "word_count": 1,
         "segment_count": 1,
         "stage_worker": {
-            "mode": "subprocess",
+            "mode": "gpu_worker",
+            "process_model": "persistent_subprocess",
             "pid": pid,
             "mock": True,
         },
     }
     return segments, log, details
+
+
+def _parse_batch_mapping(raw: str) -> dict[str, int]:
+    mapping: dict[str, int] = {}
+    for item in str(raw or "").split(","):
+        item = item.strip()
+        if not item or "=" not in item:
+            continue
+        repo_id, value = item.rsplit("=", 1)
+        try:
+            mapping[repo_id.strip()] = max(1, int(float(value.strip())))
+        except (TypeError, ValueError):
+            continue
+    return mapping
+
+
+def _effective_asr_batch_size(env: dict[str, str]) -> int | None:
+    raw = str(env.get("ASR_BATCH_SIZE") or os.getenv("ASR_BATCH_SIZE", "auto")).strip()
+    if raw and raw.lower() != "auto":
+        try:
+            return max(1, int(float(raw)))
+        except (TypeError, ValueError):
+            return None
+    try:
+        from asr.backends.qwen import (
+            DEFAULT_QWEN_ASR_BATCH_SIZE_BY_REPO,
+            qwen_asr_repo_id,
+        )
+
+        backend = str(env.get("ASR_BACKEND") or os.getenv("ASR_BACKEND", "")).strip()
+        repo_id = qwen_asr_repo_id(backend or None)
+        mapping = dict(DEFAULT_QWEN_ASR_BATCH_SIZE_BY_REPO)
+        mapping.update(
+            _parse_batch_mapping(
+                str(
+                    env.get("ASR_BATCH_SIZE_BY_REPO")
+                    or os.getenv("ASR_BATCH_SIZE_BY_REPO", "")
+                )
+            )
+        )
+        return max(1, int(mapping[repo_id]))
+    except Exception:
+        return None
+
+
+def _downshift_asr_batch_env(env: dict[str, str]) -> tuple[dict[str, str], int, int] | None:
+    current = _effective_asr_batch_size(env)
+    if current is None or current <= 1:
+        return None
+    lowered = max(1, current // 2)
+    if lowered >= current:
+        return None
+    updated = dict(env)
+    updated["ASR_BATCH_SIZE"] = str(lowered)
+    return updated, current, lowered
+
+
+def _vram_budget_for_env(env: dict[str, str]) -> float:
+    raw = str(
+        env.get("ASR_STAGE_WORKER_VRAM_BUDGET_MB")
+        or os.getenv("ASR_STAGE_WORKER_VRAM_BUDGET_MB", "0")
+    ).strip().lower()
+    if raw in {"", "0", "false", "no", "off", "none"}:
+        return 0.0
+    try:
+        return max(0.0, float(raw))
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _cuda_peak_reserved_from_details(asr_details: dict[str, Any]) -> float | None:
+    values: list[float] = []
+    snapshots = asr_details.get("cuda_memory")
+    if isinstance(snapshots, list):
+        for snapshot in snapshots:
+            if not isinstance(snapshot, dict):
+                continue
+            for key in (
+                "max_reserved_mb",
+                "reserved_mb",
+                "max_allocated_mb",
+                "allocated_mb",
+            ):
+                try:
+                    values.append(float(snapshot.get(key)))
+                except (TypeError, ValueError):
+                    continue
+    return round(max(values), 1) if values else None
+
+
+def _soft_oom_detail(asr_details: dict[str, Any], env: dict[str, str]) -> str:
+    budget_mb = _vram_budget_for_env(env)
+    if budget_mb <= 0.0:
+        return ""
+    peak_mb = _cuda_peak_reserved_from_details(asr_details)
+    if peak_mb is None or peak_mb <= budget_mb:
+        return ""
+    return (
+        "GPU VRAM budget exceeded after worker result: "
+        f"peak_mb={peak_mb:.1f} budget_mb={budget_mb:.1f}"
+    )
 
 
 def worker_main(parent_conn: Connection) -> None:
@@ -214,16 +443,10 @@ def worker_main(parent_conn: Connection) -> None:
         torch_module = None
         try:
             with _temporary_env(env):
-                device = _resolve_device(requested_device)
                 try:
                     import torch as imported_torch
 
                     torch_module = imported_torch
-                    try:
-                        if device.startswith("cuda") and torch_module.cuda.is_available():
-                            torch_module.cuda.reset_peak_memory_stats()
-                    except Exception:
-                        pass
                 except Exception:
                     torch_module = None
 
@@ -243,28 +466,12 @@ def worker_main(parent_conn: Connection) -> None:
                     "yes",
                     "on",
                 }
-                if mock:
-                    _on_stage("ASR stage worker mock")
-                    segments, asr_log, asr_details = _mock_result(
-                        audio_path,
-                        device,
-                        pid=pid,
-                    )
-                else:
-                    asr_pipeline = _load_asr_pipeline_for_request()
-                    segments, asr_log, asr_details = asr_pipeline.transcribe_and_align(
-                        audio_path,
-                        device,
-                        on_stage=_on_stage,
-                        include_details=True,
-                    )
-                    asr_details = dict(asr_details or {})
-                    asr_details["stage_worker"] = {
-                        "mode": "subprocess",
-                        "pid": pid,
-                        "mock": False,
-                    }
-                    asr_details.setdefault("device", device)
+                model_manager = GpuModelManager(pid=pid, on_stage=_on_stage)
+                segments, asr_log, asr_details = model_manager.run_transcribe_and_align(
+                    audio_path=audio_path,
+                    requested_device=requested_device,
+                    mock=mock,
+                )
 
                 _clear_worker_cuda()
                 if not _safe_send(
@@ -275,7 +482,7 @@ def worker_main(parent_conn: Connection) -> None:
                         "segments": segments,
                         "asr_log": asr_log,
                         "asr_details": asr_details,
-                        "device": str(asr_details.get("device") or device),
+                        "device": str(asr_details.get("device") or "auto"),
                     },
                 ):
                     return
@@ -421,7 +628,7 @@ class _GpuWorkerClient:
             return
         self._start_worker()
 
-    def transcribe_and_align(
+    def _transcribe_and_align_once(
         self,
         audio_path: str,
         *,
@@ -526,6 +733,63 @@ class _GpuWorkerClient:
 
             self._kill_child()
             raise GpuWorkerError("protocol_error", f"unexpected worker op: {op}")
+
+    def transcribe_and_align(
+        self,
+        audio_path: str,
+        *,
+        device: str = "auto",
+        env_overrides: dict[str, str] | None = None,
+        job_id: str = "",
+        on_stage: Callable[[str], None] | None = None,
+        cancel_requested: Callable[[], bool] | None = None,
+    ) -> tuple[list[dict], list[str], dict]:
+        retry_limit = max(0, _env_int("ASR_STAGE_WORKER_OOM_RETRY_LIMIT", 1))
+        attempt = 0
+        retry_records: list[dict[str, Any]] = []
+        current_env = dict(env_overrides or {})
+        while True:
+            try:
+                segments, asr_log, asr_details = self._transcribe_and_align_once(
+                    audio_path,
+                    device=device,
+                    env_overrides=current_env,
+                    job_id=job_id,
+                    on_stage=on_stage,
+                    cancel_requested=cancel_requested,
+                )
+                soft_oom = _soft_oom_detail(asr_details, current_env)
+                if soft_oom:
+                    self._kill_child()
+                    raise GpuWorkerError("oom", soft_oom)
+                if retry_records:
+                    stage_worker = asr_details.setdefault("stage_worker", {})
+                    if isinstance(stage_worker, dict):
+                        stage_worker["oom_retries"] = list(retry_records)
+                return segments, asr_log, asr_details
+            except GpuWorkerError as exc:
+                if str(getattr(exc, "kind", "")) != "oom" or attempt >= retry_limit:
+                    raise
+                lowered = _downshift_asr_batch_env(current_env)
+                if lowered is None:
+                    raise
+                next_env, previous_batch, next_batch = lowered
+                attempt += 1
+                retry_records.append(
+                    {
+                        "attempt": attempt,
+                        "previous_batch_size": previous_batch,
+                        "next_batch_size": next_batch,
+                        "detail": str(getattr(exc, "detail", exc)),
+                    }
+                )
+                current_env = next_env
+                if on_stage is not None:
+                    on_stage(
+                        "GPU worker OOM; restarting worker and lowering "
+                        f"ASR_BATCH_SIZE {previous_batch}->{next_batch}"
+                    )
+                continue
 
 
 _GLOBAL_WORKER: _GpuWorkerClient | None = None

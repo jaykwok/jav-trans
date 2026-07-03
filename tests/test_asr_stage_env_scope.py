@@ -54,14 +54,24 @@ def test_asr_stage_env_scope_reaches_cache_and_transcribe(monkeypatch, tmp_path)
         Path(out_path).parent.mkdir(parents=True, exist_ok=True)
         Path(out_path).write_bytes(b"wav")
 
-    def fake_transcribe_and_align(_audio_path, _device, on_stage=None, include_details=False):
+    def fake_transcribe_and_align(
+        _audio_path,
+        *,
+        device="auto",
+        env_overrides=None,
+        job_id="",
+        on_stage=None,
+        cancel_requested=None,
+    ):
         seen["transcribe_env"] = {
-            "ASR_BACKEND": main.os.environ.get("ASR_BACKEND"),
-            "BOUNDARY_FEATURE_FRAME_HOP_S": main.os.environ.get(
+            "ASR_BACKEND": env_overrides.get("ASR_BACKEND"),
+            "BOUNDARY_FEATURE_FRAME_HOP_S": env_overrides.get(
                 "BOUNDARY_FEATURE_FRAME_HOP_S"
             ),
         }
-        assert include_details is True
+        assert device == "auto"
+        assert job_id
+        assert cancel_requested is not None
         return (
             [{"start": 0.0, "end": 1.0, "text": "こんにちは"}],
             ["mock asr"],
@@ -75,7 +85,11 @@ def test_asr_stage_env_scope_reaches_cache_and_transcribe(monkeypatch, tmp_path)
         fake_try_load_aligned_segments,
     )
     monkeypatch.setattr(pipeline_audio, "extract_audio", fake_extract_audio)
-    monkeypatch.setattr(main.asr_module, "transcribe_and_align", fake_transcribe_and_align)
+    monkeypatch.setattr(
+        main.asr_stage_worker_module,
+        "transcribe_and_align",
+        fake_transcribe_and_align,
+    )
 
     artifacts = main.run_asr_alignment(
         str(video_path),
@@ -133,9 +147,20 @@ def test_asr_stage_env_scope_passes_boundary_refiner_flags(monkeypatch, tmp_path
         Path(out_path).parent.mkdir(parents=True, exist_ok=True)
         Path(out_path).write_bytes(b"wav")
 
-    def fake_transcribe_and_align(_audio_path, _device, on_stage=None, include_details=False):
-        seen["device"] = main.os.environ.get("OUTER_EDGE_REFINER_DEVICE")
-        seen["pre_asr_cueqc"] = main.os.environ.get("PRE_ASR_CUEQC_ENABLED")
+    def fake_transcribe_and_align(
+        _audio_path,
+        *,
+        device="auto",
+        env_overrides=None,
+        job_id="",
+        on_stage=None,
+        cancel_requested=None,
+    ):
+        seen["device"] = env_overrides.get("OUTER_EDGE_REFINER_DEVICE")
+        seen["pre_asr_cueqc"] = env_overrides.get("PRE_ASR_CUEQC_ENABLED")
+        assert device == "auto"
+        assert job_id
+        assert cancel_requested is not None
         return (
             [{"start": 0.0, "end": 1.0, "text": "こんにちは"}],
             ["mock asr"],
@@ -143,7 +168,11 @@ def test_asr_stage_env_scope_passes_boundary_refiner_flags(monkeypatch, tmp_path
         )
 
     monkeypatch.setattr(pipeline_audio, "extract_audio", fake_extract_audio)
-    monkeypatch.setattr(main.asr_module, "transcribe_and_align", fake_transcribe_and_align)
+    monkeypatch.setattr(
+        main.asr_stage_worker_module,
+        "transcribe_and_align",
+        fake_transcribe_and_align,
+    )
 
     main.run_asr_alignment(
         str(video_path),
@@ -197,9 +226,19 @@ def test_boundary_cache_dir_reaches_transcribe_but_not_aligned_signature(
         Path(out_path).parent.mkdir(parents=True, exist_ok=True)
         Path(out_path).write_bytes(b"wav")
 
-    def fake_transcribe_and_align(_audio_path, _device, on_stage=None, include_details=False):
-        seen["transcribe_cache_dir"] = main.os.environ.get("BOUNDARY_CACHE_DIR")
-        assert include_details is True
+    def fake_transcribe_and_align(
+        _audio_path,
+        *,
+        device="auto",
+        env_overrides=None,
+        job_id="",
+        on_stage=None,
+        cancel_requested=None,
+    ):
+        seen["transcribe_cache_dir"] = env_overrides.get("BOUNDARY_CACHE_DIR")
+        assert device == "auto"
+        assert job_id
+        assert cancel_requested is not None
         return (
             [{"start": 0.0, "end": 1.0, "text": "こんにちは"}],
             ["mock asr"],
@@ -212,7 +251,11 @@ def test_boundary_cache_dir_reaches_transcribe_but_not_aligned_signature(
         fake_try_load_aligned_segments,
     )
     monkeypatch.setattr(pipeline_audio, "extract_audio", fake_extract_audio)
-    monkeypatch.setattr(main.asr_module, "transcribe_and_align", fake_transcribe_and_align)
+    monkeypatch.setattr(
+        main.asr_stage_worker_module,
+        "transcribe_and_align",
+        fake_transcribe_and_align,
+    )
 
     main.run_asr_alignment(str(video_path), ctx=ctx, job_id=ctx.job_id)
 

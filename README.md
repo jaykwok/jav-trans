@@ -69,7 +69,7 @@ $env:PYTHONIOENCODING="utf-8"
 uv run --no-sync python launcher.py
 ```
 
-默认地址为 `http://127.0.0.1:17321`。首次运行可以没有 `.env`；打开页面后在“翻译 API”面板填写 API Key、Base URL、模型和目标语言，保存或提交任务时会自动写入项目根目录 `.env`。新建的 `.env` 只启用实际保存的本机值，ASR batch、后端、worker mode 等研究项会以注释示例形式写入。国内网络下载 Hugging Face 模型较慢时，勾选 `hf-mirror.com 加速下载` 后也会写入 `.env`。
+默认地址为 `http://127.0.0.1:17321`。首次运行可以没有 `.env`；打开页面后在“翻译 API”面板填写 API Key、Base URL、模型和目标语言，保存或提交任务时会自动写入项目根目录 `.env`。新建的 `.env` 只启用实际保存的本机值，ASR batch、后端、显存预算等研究项会以注释示例形式写入。国内网络下载 Hugging Face 模型较慢时，勾选 `hf-mirror.com 加速下载` 后也会写入 `.env`。
 
 Linux / WSL2 下如果只启动浏览器版 Web 服务，也可以直接运行：
 
@@ -241,24 +241,24 @@ uv run --no-sync python tools/asr/cueqc/export_candidates.py `
 - `LLM_MODEL_NAME`
 - `HF_ENDPOINT`
 
-ASR 6GB 默认值已经内置。默认使用 `1.7B` 高质量模型；需要切到 `0.6B` 低配/更快档，或覆盖 batch / worker mode 时，再通过“参数调优”里的环境变量覆盖，或手动编辑首次保存后生成的 `.env`。
+ASR 6GB 默认值已经内置。默认使用 `1.7B` 高质量模型；需要切到 `0.6B` 低配/更快档，或覆盖 batch / 显存预算时，再通过“参数调优”里的环境变量覆盖，或手动编辑首次保存后生成的 `.env`。
 
 6GB 默认配置：
 
 ```env
 ASR_BACKEND=jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame-hf
-ASR_STAGE_WORKER_MODE=subprocess
-ASR_WORKER_MODE=inproc
 ASR_BATCH_SIZE=auto
 ASR_BATCH_SIZE_BY_REPO=jaykwok/Qwen3-ASR-0.6B-JA-Anime-Galgame-hf=12,jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame-hf=4
+ASR_STAGE_WORKER_VRAM_BUDGET_MB=5600
+ASR_STAGE_WORKER_OOM_RETRY_LIMIT=1
 SPEECH_BOUNDARY_JA_WINDOW_S=20
 SPEECH_BOUNDARY_JA_OVERLAP_S=4
 PRE_ASR_CUEQC_ENABLED=1
 ```
 
-`ASR_STAGE_WORKER_MODE=subprocess` 表示整个 GPU ASR stage 由独立 worker 持有 CUDA：Boundary/PTM feature extraction、Pre-ASR CueQC、ASR 和对齐都在同一个 GPU owner 进程里执行，Web / 调度主进程只做任务编排、缓存索引和输出写入。OOM 或 CUDA 状态异常时可以杀掉 worker，不会把 Web 主进程一起带崩。
+ASR stage 固定由统一 GPU worker 持有 CUDA：Boundary/PTM feature extraction、Pre-ASR CueQC、ASR 和对齐都在同一个 GPU owner 进程里顺序执行，Web / 调度主进程只做任务编排、缓存索引和输出写入。OOM、CUDA 状态异常或超过 `ASR_STAGE_WORKER_VRAM_BUDGET_MB` 时会杀掉 worker，不会把 Web 主进程一起带崩。
 
-`ASR_WORKER_MODE=inproc` 只控制 stage worker 内部的 ASR 模型 backend。默认不再让 ASR backend 额外启动第二个 subprocess，避免在 stage worker 之外再创建一个 CUDA context。高显存机器如果更看重 ASR generate 的二级隔离，可手动设 `ASR_WORKER_MODE=subprocess`，但 6GB 上通常不建议这样做。
+`ASR_STAGE_WORKER_VRAM_BUDGET_MB=5600` 是 6GB 卡的软 OOM 线。即使 PyTorch 没抛 `OutOfMemoryError`，只要 worker 侧 peak reserved/allocated 超过预算，就按 OOM 处理并按 `ASR_STAGE_WORKER_OOM_RETRY_LIMIT` 重启 worker、降低 batch 后重跑，避免 Windows 进入共享显存后严重变慢。
 
 推理需要 ASR / SpeechBoundary-JA frozen feature Hugging Face 模型，以及与当前 repo id 匹配的本地 checkpoint。源码运行时如果本地没有 Hugging Face 模型，会按需下载到 `models/`。registry 缺失、覆盖映射未命中当前 repo id、文件不存在、schema 不匹配或 metadata 不匹配都会 fail-fast。
 
@@ -335,9 +335,8 @@ model_param_device=cuda:*
 
 ```env
 ASR_BACKEND=jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame-hf
-ASR_STAGE_WORKER_MODE=subprocess
-ASR_WORKER_MODE=inproc
 ASR_BATCH_SIZE_BY_REPO=jaykwok/Qwen3-ASR-0.6B-JA-Anime-Galgame-hf=12,jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame-hf=4
+ASR_STAGE_WORKER_VRAM_BUDGET_MB=5600
 SPEECH_BOUNDARY_JA_WINDOW_S=20
 SPEECH_BOUNDARY_JA_OVERLAP_S=4
 ```
@@ -352,8 +351,6 @@ ASR_BATCH_SIZE=2
 
 ```env
 ASR_BACKEND=jaykwok/Qwen3-ASR-0.6B-JA-Anime-Galgame-hf
-ASR_STAGE_WORKER_MODE=subprocess
-ASR_WORKER_MODE=inproc
 ASR_BATCH_SIZE=auto
 ```
 

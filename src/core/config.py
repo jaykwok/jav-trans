@@ -55,28 +55,25 @@ DEFAULT_SETTINGS: dict[str, str] = {
     "ASR_FORCE_LANGUAGE": "1",
 
     # --- Batch Size & Limits ---
-    # Whole-ASR-stage execution mode. subprocess keeps CUDA out of the Web/main
-    # process while still running the model backend inproc inside that worker.
-    "ASR_STAGE_WORKER_MODE": "subprocess",
+    # The ASR stage always runs in the unified GPU worker process; the Web/main
+    # process only orchestrates and must not own CUDA.
     # 0 disables the coarse whole-stage timeout; per-batch ASR timeouts still apply.
     "ASR_STAGE_WORKER_TIMEOUT_S": "0",
     "ASR_STAGE_WORKER_READY_TIMEOUT_S": "60",
+    # On worker-level CUDA OOM, restart the GPU worker and retry with half batch size.
+    "ASR_STAGE_WORKER_OOM_RETRY_LIMIT": "1",
+    # Soft OOM guard for 6GB cards: if worker-side peak reserved VRAM exceeds this
+    # budget, treat it as OOM before Windows falls back to shared GPU memory.
+    "ASR_STAGE_WORKER_VRAM_BUDGET_MB": "5600",
     # ASR inference batch size. auto resolves by ASR_BACKEND repo id.
-    # Defaults target 6GB-class cards. ASR_WORKER_MODE controls the model
-    # backend inside ASR_STAGE_WORKER_MODE=subprocess.
+    # Defaults target 6GB-class cards.
     "ASR_BATCH_SIZE": "auto",
     "ASR_BATCH_SIZE_BY_REPO": (
         "jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame-hf=4,"
         "jaykwok/Qwen3-ASR-0.6B-JA-Anime-Galgame-hf=12"
     ),
-    "ASR_WORKER_MODE_BY_REPO": (
-        "jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame-hf=inproc,"
-        "jaykwok/Qwen3-ASR-0.6B-JA-Anime-Galgame-hf=inproc"
-    ),
     # Max generated tokens configured when loading the Qwen ASR wrapper.
     "ASR_MAX_NEW_TOKENS": "128",
-    # Max seconds to wait for a subprocess ASR worker to load and report ready.
-    "ASR_SUBPROCESS_READY_TIMEOUT_S": "600",
     # Generation penalty to reduce repeated ASR text.
     "ASR_REPETITION_PENALTY": "1.05",
 
@@ -100,7 +97,7 @@ DEFAULT_SETTINGS: dict[str, str] = {
     "SPEECH_BOUNDARY_JA_FRAME_DILATION_S": "0.2",
     # 1 caches SpeechBoundary frame score -> Boundary Planner outputs separately from ASR generation settings.
     "BOUNDARY_CACHE_ENABLED": "1",
-    # Persistent boundary cache directory. Versioned as boundary-cache v14.
+    # Persistent boundary cache directory. Versioned by src/boundary/cache.py.
     "BOUNDARY_CACHE_DIR": "./tmp/cache/boundary",
 
     # --- Pre-ASR CueQC v11 semantic chunk keep/drop router ---

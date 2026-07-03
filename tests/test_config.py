@@ -111,13 +111,14 @@ def test_default_model_download_root_is_project_models():
     assert qwen.DEFAULT_QWEN_ASR_BACKEND == qwen.QWEN_ASR_17B_REPO_ID
     assert qwen.QWEN_ASR_REPO_ID == qwen.QWEN_ASR_17B_REPO_ID
     assert config.DEFAULT_SETTINGS["ASR_MODEL_ID"] == ""
-    assert config.DEFAULT_SETTINGS["ASR_STAGE_WORKER_MODE"] == "subprocess"
+    assert "ASR_STAGE_WORKER_MODE" not in config.DEFAULT_SETTINGS
     assert config.DEFAULT_SETTINGS["ASR_STAGE_WORKER_TIMEOUT_S"] == "0"
+    assert config.DEFAULT_SETTINGS["ASR_STAGE_WORKER_OOM_RETRY_LIMIT"] == "1"
+    assert config.DEFAULT_SETTINGS["ASR_STAGE_WORKER_VRAM_BUDGET_MB"] == "5600"
     assert config.DEFAULT_SETTINGS["ASR_BATCH_SIZE"] == "auto"
     assert "Qwen3-ASR-0.6B-JA-Anime-Galgame-hf=12" in config.DEFAULT_SETTINGS["ASR_BATCH_SIZE_BY_REPO"]
     assert "Qwen3-ASR-1.7B-JA-Anime-Galgame-hf=4" in config.DEFAULT_SETTINGS["ASR_BATCH_SIZE_BY_REPO"]
-    assert "Qwen3-ASR-0.6B-JA-Anime-Galgame-hf=inproc" in config.DEFAULT_SETTINGS["ASR_WORKER_MODE_BY_REPO"]
-    assert "Qwen3-ASR-1.7B-JA-Anime-Galgame-hf=inproc" in config.DEFAULT_SETTINGS["ASR_WORKER_MODE_BY_REPO"]
+    assert "ASR_WORKER_MODE_BY_REPO" not in config.DEFAULT_SETTINGS
     assert config.DEFAULT_SETTINGS["SPEECH_BOUNDARY_JA_WINDOW_S"] == "20.0"
     assert config.DEFAULT_SETTINGS["SPEECH_BOUNDARY_JA_OVERLAP_S"] == "4.0"
     assert "BOUNDARY_REFINER_MODEL_PATH_BY_REPO" not in config.DEFAULT_SETTINGS
@@ -149,7 +150,7 @@ def test_default_model_download_root_is_project_models():
     assert "BOUNDARY_PLANNER_MAX_PADDED_CHUNK_S" not in config.DEFAULT_SETTINGS
     assert "BOUNDARY_CONTEXT_MAX_SPEECH_OVERLAP_S" not in config.DEFAULT_SETTINGS
     assert "MAX_SUBTITLE_DURATION" not in config.DEFAULT_SETTINGS
-    assert config.DEFAULT_SETTINGS["ASR_SUBPROCESS_READY_TIMEOUT_S"] == "600"
+    assert "ASR_SUBPROCESS_READY_TIMEOUT_S" not in config.DEFAULT_SETTINGS
     assert "CUEQC_SHADOW_ENABLED" not in config.DEFAULT_SETTINGS
     assert "CUEQC_DROP_THRESHOLD" not in config.DEFAULT_SETTINGS
     assert "CUEQC_DEVICE" not in config.DEFAULT_SETTINGS

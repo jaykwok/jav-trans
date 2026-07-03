@@ -94,8 +94,19 @@ def _patch_pipeline(
         Path(out_path).parent.mkdir(parents=True, exist_ok=True)
         Path(out_path).write_bytes(b"fake-wav")
 
-    def fake_transcribe_and_align(_audio_path, _device, on_stage=None, include_details=False):
-        assert include_details is True
+    def fake_transcribe_and_align(
+        _audio_path,
+        *,
+        device="auto",
+        env_overrides=None,
+        job_id="",
+        on_stage=None,
+        cancel_requested=None,
+    ):
+        assert device == "auto"
+        assert env_overrides is not None
+        assert job_id
+        assert cancel_requested is not None
         if on_stage:
             on_stage("ASR mock")
         return (
@@ -105,7 +116,11 @@ def _patch_pipeline(
         )
 
     monkeypatch.setattr(pipeline_audio, "extract_audio", fake_extract_audio)
-    monkeypatch.setattr(main.asr_module, "transcribe_and_align", fake_transcribe_and_align)
+    monkeypatch.setattr(
+        main.asr_stage_worker_module,
+        "transcribe_and_align",
+        fake_transcribe_and_align,
+    )
     return ctx
 
 
