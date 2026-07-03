@@ -5,6 +5,7 @@ import time
 import sys
 import warnings
 import hashlib
+import shutil
 from contextlib import contextmanager
 from pathlib import Path
 
@@ -457,9 +458,9 @@ def _setup_run_logger(
     backend_label: str,
     ctx: JobContext,
 ) -> tuple[logging.Logger, Path]:
-    log_dir = _run_log_dir(ctx)
-    log_dir.mkdir(parents=True, exist_ok=True)
     safe_job_id = _run_log_component(job_id, max_chars=48)
+    log_dir = _run_log_dir(ctx) / safe_job_id
+    log_dir.mkdir(parents=True, exist_ok=True)
     safe_backend = _run_log_component(backend_label, max_chars=40)
     stamp = time.strftime("%Y%m%d_%H%M%S")
     log_path = log_dir / f"{stamp}_{safe_job_id}_{safe_backend}.run.log"
@@ -496,6 +497,62 @@ def _close_artifacts_logger(artifacts: "AsrArtifacts") -> None:
     _close_run_logger(logger)
     _clear_thread_run_logger(logger)
     artifacts.logger = None
+
+
+def _persistent_timings_path(
+    timings_path: str,
+    run_log_path: Path | None,
+) -> Path | None:
+    if run_log_path is None:
+        return None
+    return Path(run_log_path).parent / Path(timings_path).name
+
+
+def _diagnostic_output_paths(
+    *,
+    timings_path: str,
+    run_log_path: Path | None,
+) -> dict[str, str | None]:
+    persistent_timings = _persistent_timings_path(timings_path, run_log_path)
+    return {
+        "run_log": str(run_log_path) if run_log_path else None,
+        "timings_log": str(persistent_timings) if persistent_timings else None,
+    }
+
+
+def _append_unique_output_path(output_paths: list[str], path: str | Path | None) -> None:
+    if path is None:
+        return
+    text = str(path)
+    if text and text not in output_paths:
+        output_paths.append(text)
+
+
+def _write_timings_with_diagnostics(
+    *,
+    timings_path: str,
+    payload: dict,
+    run_log_path: Path | None,
+    output_paths: list[str],
+    logger: logging.Logger | None,
+) -> None:
+    _write_json(timings_path, payload)
+    if run_log_path is None:
+        _append_unique_output_path(output_paths, timings_path)
+        return
+    _append_unique_output_path(output_paths, run_log_path)
+    persistent_timings = _persistent_timings_path(timings_path, run_log_path)
+    if persistent_timings is None:
+        _append_unique_output_path(output_paths, timings_path)
+        return
+    try:
+        if Path(timings_path).resolve() != persistent_timings.resolve():
+            persistent_timings.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(timings_path, persistent_timings)
+        _append_unique_output_path(output_paths, persistent_timings)
+    except Exception as exc:  # noqa: BLE001 - diagnostics must not fail jobs
+        _log_stage(logger, f"diagnostics_timings_copy_failed error={exc!r}")
+        _append_unique_output_path(output_paths, timings_path)
 
 
 _event_ts = stage_log_module._event_ts
@@ -1387,34 +1444,40 @@ def _run_translation_and_write_impl(
             enabled=_ctx_flag(ctx, "QUALITY_REPORT_ENABLED"),
             glossary=ctx.translation_glossary,
         )
-        _write_json(
-            timings_path,
-            {
-                "video_path": video_path,
-                "audio_path": audio_path,
-                "audio_cached": audio_cached,
-                "job_id": job_id,
+        timings_payload = {
+            "video_path": video_path,
+            "audio_path": audio_path,
+            "audio_cached": audio_cached,
+            "job_id": job_id,
+            "job_temp_dir": job_temp_dir,
+            "device": device,
+            "backend": backend_label,
+            "counts": {"segments": 0, "blocks": 0},
+            "stage_timings": pipeline_timings,
+            "asr_details": _compact_asr_details_for_sidecar(asr_details),
+            "translation_request_timings": [],
+            "outputs": {
                 "job_temp_dir": job_temp_dir,
-                "device": device,
-                "backend": backend_label,
-                "counts": {"segments": 0, "blocks": 0},
-                "stage_timings": pipeline_timings,
-                "asr_details": _compact_asr_details_for_sidecar(asr_details),
-                "translation_request_timings": [],
-                "outputs": {
-                    "job_temp_dir": job_temp_dir,
-                    "srt": srt_path,
-                    "asr_manifest": asr_manifest_path,
-                    "transcript_json": transcript_path,
-                    "aligned_segments_json": aligned_segments_path,
-                    "bilingual_json": bilingual_json_path,
-                    "quality_report": quality_report_path,
-                    "run_log": str(run_log_path) if run_log_path else None,
-                },
-                "asr_log": asr_log,
+                "srt": srt_path,
+                "asr_manifest": asr_manifest_path,
+                "transcript_json": transcript_path,
+                "aligned_segments_json": aligned_segments_path,
+                "bilingual_json": bilingual_json_path,
+                "quality_report": quality_report_path,
+                **_diagnostic_output_paths(
+                    timings_path=timings_path,
+                    run_log_path=run_log_path,
+                ),
             },
+            "asr_log": asr_log,
+        }
+        _write_timings_with_diagnostics(
+            timings_path=timings_path,
+            payload=timings_payload,
+            run_log_path=run_log_path,
+            output_paths=output_paths,
+            logger=logger,
         )
-        output_paths.append(timings_path)
         if quality_report_path:
             output_paths.append(quality_report_path)
         artifacts.quality_report_path = quality_report_path or ""
@@ -1511,41 +1574,47 @@ def _run_translation_and_write_impl(
             enabled=_ctx_flag(ctx, "QUALITY_REPORT_ENABLED"),
             glossary=ctx.translation_glossary,
         )
-        _write_json(
-            timings_path,
-            {
-                "video_path": video_path,
-                "audio_path": audio_path,
-                "audio_cached": audio_cached,
-                "job_id": job_id,
-                "job_temp_dir": job_temp_dir,
-                "device": device,
-                "backend": backend_label,
-                "counts": {
-                    "transcript_chunks": len(asr_details.get("transcript_chunks", [])),
-                    "segments": len(segments),
-                    "translation_cues": len(srt_blocks),
-                    "blocks": len(srt_blocks),
-                },
-                "stage_timings": pipeline_timings,
-                "asr_details": _compact_asr_details_for_sidecar(asr_details),
-                "translation_request_timings": translation_request_timings,
-                "translation_api_retry_events": [],
-                "translation_skipped": True,
-                "outputs": {
-                    "job_temp_dir": job_temp_dir,
-                    "srt": srt_path,
-                    "asr_manifest": asr_manifest_path,
-                    "transcript_json": transcript_path,
-                    "aligned_segments_json": aligned_segments_path,
-                    "bilingual_json": bilingual_json_path,
-                    "quality_report": quality_report_path,
-                    "run_log": str(run_log_path) if run_log_path else None,
-                },
-                "asr_log": asr_log,
+        timings_payload = {
+            "video_path": video_path,
+            "audio_path": audio_path,
+            "audio_cached": audio_cached,
+            "job_id": job_id,
+            "job_temp_dir": job_temp_dir,
+            "device": device,
+            "backend": backend_label,
+            "counts": {
+                "transcript_chunks": len(asr_details.get("transcript_chunks", [])),
+                "segments": len(segments),
+                "translation_cues": len(srt_blocks),
+                "blocks": len(srt_blocks),
             },
+            "stage_timings": pipeline_timings,
+            "asr_details": _compact_asr_details_for_sidecar(asr_details),
+            "translation_request_timings": translation_request_timings,
+            "translation_api_retry_events": [],
+            "translation_skipped": True,
+            "outputs": {
+                "job_temp_dir": job_temp_dir,
+                "srt": srt_path,
+                "asr_manifest": asr_manifest_path,
+                "transcript_json": transcript_path,
+                "aligned_segments_json": aligned_segments_path,
+                "bilingual_json": bilingual_json_path,
+                "quality_report": quality_report_path,
+                **_diagnostic_output_paths(
+                    timings_path=timings_path,
+                    run_log_path=run_log_path,
+                ),
+            },
+            "asr_log": asr_log,
+        }
+        _write_timings_with_diagnostics(
+            timings_path=timings_path,
+            payload=timings_payload,
+            run_log_path=run_log_path,
+            output_paths=output_paths,
+            logger=logger,
         )
-        output_paths.append(timings_path)
         if quality_report_path:
             output_paths.append(quality_report_path)
         artifacts.quality_report_path = quality_report_path or ""
@@ -1772,40 +1841,46 @@ def _run_translation_and_write_impl(
         glossary=ctx.translation_glossary,
     )
 
-    _write_json(
-        timings_path,
-        {
-            "video_path": video_path,
-            "audio_path": audio_path,
-            "audio_cached": audio_cached,
-            "job_id": job_id,
-            "job_temp_dir": job_temp_dir,
-            "device": device,
-            "backend": backend_label,
-            "counts": {
-                "transcript_chunks": len(asr_details.get("transcript_chunks", [])),
-                "segments": len(segments),
-                "translation_cues": len(translation_segments),
-                "blocks": len(srt_blocks),
-            },
-            "stage_timings": pipeline_timings,
-            "asr_details": _compact_asr_details_for_sidecar(asr_details),
-            "translation_request_timings": translation_request_timings,
-            "translation_api_retry_events": translation_api_retry_events,
-            "outputs": {
-                "job_temp_dir": job_temp_dir,
-                "srt": srt_path,
-                "asr_manifest": asr_manifest_path,
-                "transcript_json": transcript_path,
-                "aligned_segments_json": aligned_segments_path,
-                "bilingual_json": bilingual_json_path,
-                "quality_report": quality_report_path,
-                "run_log": str(run_log_path) if run_log_path else None,
-            },
-            "asr_log": asr_log,
+    timings_payload = {
+        "video_path": video_path,
+        "audio_path": audio_path,
+        "audio_cached": audio_cached,
+        "job_id": job_id,
+        "job_temp_dir": job_temp_dir,
+        "device": device,
+        "backend": backend_label,
+        "counts": {
+            "transcript_chunks": len(asr_details.get("transcript_chunks", [])),
+            "segments": len(segments),
+            "translation_cues": len(translation_segments),
+            "blocks": len(srt_blocks),
         },
+        "stage_timings": pipeline_timings,
+        "asr_details": _compact_asr_details_for_sidecar(asr_details),
+        "translation_request_timings": translation_request_timings,
+        "translation_api_retry_events": translation_api_retry_events,
+        "outputs": {
+            "job_temp_dir": job_temp_dir,
+            "srt": srt_path,
+            "asr_manifest": asr_manifest_path,
+            "transcript_json": transcript_path,
+            "aligned_segments_json": aligned_segments_path,
+            "bilingual_json": bilingual_json_path,
+            "quality_report": quality_report_path,
+            **_diagnostic_output_paths(
+                timings_path=timings_path,
+                run_log_path=run_log_path,
+            ),
+        },
+        "asr_log": asr_log,
+    }
+    _write_timings_with_diagnostics(
+        timings_path=timings_path,
+        payload=timings_payload,
+        run_log_path=run_log_path,
+        output_paths=output_paths,
+        logger=logger,
     )
-    output_paths.append(timings_path)
     if quality_report_path:
         output_paths.append(quality_report_path)
     artifacts.quality_report_path = quality_report_path or ""

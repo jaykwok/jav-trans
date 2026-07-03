@@ -156,7 +156,7 @@ def test_run_log_is_written_only_when_enabled(monkeypatch, tmp_path):
     )
     logger = artifacts.logger
     assert logger is not None
-    main.run_translation_and_write(
+    output_paths = main.run_translation_and_write(
         str(video_path),
         artifacts,
         ctx=ctx,
@@ -170,14 +170,24 @@ def test_run_log_is_written_only_when_enabled(monkeypatch, tmp_path):
         (temp_root / "sample" / "sample.timings.json").read_text(encoding="utf-8")
     )
     run_log = Path(timings["outputs"]["run_log"])
-    assert run_log.parent == log_dir.relative_to(main.PROJECT_ROOT)
-    run_log_path = main.PROJECT_ROOT / run_log
+    run_log_path = run_log if run_log.is_absolute() else main.PROJECT_ROOT / run_log
+    assert run_log_path.parent == log_dir / "sample"
     assert run_log_path.is_file()
     content = run_log_path.read_text(encoding="utf-8")
     assert "run_start" in content
     assert "stage_start audio_prepare" in content
     assert "run_done" in content
     _assert_no_project_absolute_path(content)
+
+    timings_log = Path(timings["outputs"]["timings_log"])
+    timings_log_path = (
+        timings_log if timings_log.is_absolute() else main.PROJECT_ROOT / timings_log
+    )
+    assert timings_log_path.parent == log_dir / "sample"
+    assert timings_log_path.is_file()
+    assert json.loads(timings_log_path.read_text(encoding="utf-8"))["job_id"] == "sample"
+    assert str(run_log_path) in output_paths
+    assert str(timings_log_path) in output_paths
 
 
 def test_run_log_filename_components_are_bounded():

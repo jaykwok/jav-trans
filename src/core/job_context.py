@@ -73,7 +73,7 @@ class JobContext:
     output_dir: str | None
     keep_quality_report: bool
     keep_temp_files: bool
-    run_log_enabled: bool = False
+    run_log_enabled: bool = True
     run_log_dir: str = "./tmp/log"
     llm_api_format: str = "chat"
     llm_reasoning_effort: str = "xhigh"
@@ -125,11 +125,18 @@ class JobContext:
             keep_temp_files=bool(getattr(spec, "keep_temp_files", False)),
             run_log_enabled=_flag(
                 advanced.get("RUN_LOG_ENABLED"),
-                bool(getattr(spec, "run_log_enabled", False)),
+                _flag(
+                    getattr(spec, "run_log_enabled", None),
+                    _flag(_setting("RUN_LOG_ENABLED", "1"), True),
+                ),
             ),
             run_log_dir=advanced.get(
                 "RUN_LOG_DIR",
-                str(getattr(spec, "run_log_dir", "./tmp/log") or "./tmp/log"),
+                str(
+                    getattr(spec, "run_log_dir", None)
+                    or _setting("RUN_LOG_DIR", "./tmp/log")
+                    or "./tmp/log"
+                ),
             ),
             llm_api_format=_llm_api_format(
                 _translation_setting(

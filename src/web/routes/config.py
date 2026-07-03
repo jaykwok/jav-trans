@@ -147,6 +147,8 @@ def _initial_env_template_lines() -> list[str]:
         "# HF_ENDPOINT=https://hf-mirror.com\n",
         "# HF_HOME=./models\n",
         "# TORCH_HOME=./tmp/cache/torch\n",
+        "# RUN_LOG_ENABLED=1\n",
+        "# RUN_LOG_DIR=./tmp/log\n",
         "\n",
         "# --- Saved Web settings ---\n",
     ]

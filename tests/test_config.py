@@ -3,8 +3,10 @@ from __future__ import annotations
 import os
 import re
 from pathlib import Path
+from types import SimpleNamespace
 
 from asr.backends import qwen
+from core.job_context import JobContext
 from core import config
 
 
@@ -105,6 +107,8 @@ def test_default_model_download_root_is_project_models():
     assert config.DEFAULT_SETTINGS["TORCH_HOME"] == "./tmp/cache/torch"
     assert config.DEFAULT_SETTINGS["JOB_TEMP_DIR"] == "./tmp/jobs"
     assert config.DEFAULT_SETTINGS["ASR_CHUNK_ROOT"] == "./tmp/chunks"
+    assert config.DEFAULT_SETTINGS["RUN_LOG_ENABLED"] == "1"
+    assert config.DEFAULT_SETTINGS["RUN_LOG_DIR"] == "./tmp/log"
     assert "KEEP_TEMP_FILES" not in config.DEFAULT_SETTINGS
     assert "ASR_CONTEXT" not in config.DEFAULT_SETTINGS
     assert config.DEFAULT_SETTINGS["ASR_BACKEND"] == "jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame-hf"
@@ -160,6 +164,31 @@ def test_default_model_download_root_is_project_models():
     assert config.DEFAULT_SETTINGS["PRE_ASR_CUEQC_ENABLED"] == "1"
     assert config.DEFAULT_SETTINGS["PRE_ASR_CUEQC_DROP_THRESHOLD"] == "0.95"
     assert config.DEFAULT_SETTINGS["LLM_API_FORMAT"] == "chat"
+
+
+def test_job_context_defaults_runtime_logs_from_config(monkeypatch, tmp_path):
+    monkeypatch.delenv("RUN_LOG_ENABLED", raising=False)
+    monkeypatch.delenv("RUN_LOG_DIR", raising=False)
+
+    ctx = JobContext.from_spec(
+        SimpleNamespace(),
+        job_id="job-1",
+        job_temp_dir=str(tmp_path / "jobs" / "job-1"),
+        cache_path=str(tmp_path / "jobs" / "job-1" / "translation_cache.jsonl"),
+    )
+
+    assert ctx.run_log_enabled is True
+    assert ctx.run_log_dir == "./tmp/log"
+
+    disabled = JobContext.from_spec(
+        SimpleNamespace(advanced={"RUN_LOG_ENABLED": "0", "RUN_LOG_DIR": "./custom-log"}),
+        job_id="job-2",
+        job_temp_dir=str(tmp_path / "jobs" / "job-2"),
+        cache_path=str(tmp_path / "jobs" / "job-2" / "translation_cache.jsonl"),
+    )
+
+    assert disabled.run_log_enabled is False
+    assert disabled.run_log_dir == "./custom-log"
 
 
 def test_asr_chunk_min_duration_removed_from_active_config_surface():
