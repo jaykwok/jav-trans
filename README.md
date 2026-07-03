@@ -283,7 +283,7 @@ ASR stage 固定由统一 GPU worker 持有 CUDA：Boundary/PTM feature extracti
 - `tmp/chunks/`：ASR wav chunk 和 crash-resume checkpoint 的一次性运行目录。
 - `tmp/cache/boundary/`：SpeechBoundary-JA frame score 到 Boundary Refiner 输出的 boundary-cache。
 - `tmp/cache/torch/`、`tmp/cache/hf/`：torch / Hugging Face 运行缓存。
-- `tmp/log/`：启用运行日志后的任务日志。
+- `tmp/log/<job_id>/`：默认启用的本地诊断目录；包含 `.run.log` 和持久化 `.timings.json`。
 - `datasets/`：本地训练、验证、测试数据归档，默认 ignored；不参与普通推理和 release 打包。
 - `agents/temp/`：研究脚本、smoke、临时日志和中间产物。
 - `agents/audits/`：可长期复查的本地审计页，默认 ignored，不随 `git push` 发布。
@@ -356,7 +356,7 @@ ASR_BATCH_SIZE=auto
 
 ### 长任务怎么排查
 
-启用运行日志后，日志会写入 `tmp/log/` 或任务输出目录。反馈问题时请保留 `.run.log`、质量报告和对应 SRT。
+运行日志默认写入 `tmp/log/<job_id>/`。`.run.log` 便于查错，`.timings.json` 记录音频准备、Boundary/Pre-ASR/ASR、翻译、写出等阶段耗时和显存快照；Web 完成任务后也会把这两个文件列在“其他文件”里。反馈问题时请保留 `.run.log`、`.timings.json`、质量报告和对应 SRT。
 
 ---
 

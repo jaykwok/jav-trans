@@ -14,6 +14,7 @@ _FROZEN_PATH_KEYS = {
     "TORCH_HOME",
     "JOB_TEMP_DIR",
     "ASR_CHUNK_ROOT",
+    "RUN_LOG_DIR",
     "QUALITY_REPORT_DIR",
 }
 
@@ -144,6 +145,10 @@ DEFAULT_SETTINGS: dict[str, str] = {
     "JOB_TEMP_DIR": "./tmp/jobs",
     # Root directory for transient ASR wav chunks and crash-resume checkpoints.
     "ASR_CHUNK_ROOT": "./tmp/chunks",
+    # 1 writes per-job run logs and persistent timing sidecars under RUN_LOG_DIR.
+    "RUN_LOG_ENABLED": "1",
+    # Persistent diagnostics root. Runtime creates one subdirectory per job id.
+    "RUN_LOG_DIR": "./tmp/log",
     # Internal TCP port used by the web console to receive StageEvent lines.
     "JAVTRANS_EVENTS_PORT": "17322",
     # Web console HTTP port used by launcher.py.

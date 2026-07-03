@@ -152,7 +152,7 @@ def resolve_run_log(paths: RunPaths, job_id: str, artifacts=None) -> Path | None
     candidates: list[Path] = []
     if artifacts is not None and getattr(artifacts, "run_log_path", None):
         candidates.append(Path(artifacts.run_log_path))
-    candidates.extend(sorted(paths.run_logs.glob(f"*_{job_id}_*.run.log")))
+    candidates.extend(sorted(paths.run_logs.glob(f"**/*_{job_id}_*.run.log")))
     existing = [path for path in candidates if path.exists()]
     if not existing:
         return None
