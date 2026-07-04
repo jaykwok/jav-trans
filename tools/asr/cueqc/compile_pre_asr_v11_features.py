@@ -118,8 +118,15 @@ def read_chunk_document(path: Path) -> tuple[str, list[dict[str, Any]]]:
             payload = read_json_or_jsonl(path)
     else:
         payload = read_json_or_jsonl(path)
+    chunks = extract_chunks(payload)
     audio_id = infer_audio_id(path, payload if isinstance(payload, Mapping) else None)
-    return audio_id, extract_chunks(payload)
+    if chunks:
+        embedded_audio_id = str(
+            chunks[0].get("audio_id") or chunks[0].get("video_id") or ""
+        ).strip()
+        if embedded_audio_id:
+            audio_id = embedded_audio_id
+    return audio_id, chunks
 
 
 def label_keys(row: Mapping[str, Any]) -> list[str]:

@@ -1,36 +1,35 @@
 import { state } from './state.js';
 import { $ } from './util.js';
 import { addLog } from './log.js';
-import { fileList, btnAddFolder, btnSubmit, dropZone } from './dom.js';
+import { btnAddFolder, btnSubmit, dropZone } from './dom.js';
 import { fetchAllJobs } from './jobsApi.js';
+import { renderJobs } from './jobsRender.js';
 import { readTranslationSettingsFromForm, syncSettingsFromFormForSubmit } from './settings.js';
 
+let nextPendingId = 1;
+
 function addPathsToState(paths) {
+  let added = 0;
   for (const p of paths) {
     const name = p.split(/[\\/]/).pop();
-    if (!state.files.find(x => x.path === p))
-      state.files.push({ type: 'path', name, size: -1, path: p });
+    if (!state.files.find(x => x.path === p)) {
+      state.files.push({
+        type: 'path',
+        name,
+        size: -1,
+        path: p,
+        pendingId: `pending-${nextPendingId++}`,
+      });
+      added += 1;
+    }
   }
-  renderFiles();
+  renderPendingSelection();
+  if (added) addLog(`已添加 ${added} 个待开始任务`, 'stage-progress');
 }
 
-function renderFiles() {
-  fileList.innerHTML = '';
-  state.files.forEach((f, i) => {
-    const chip = document.createElement('div');
-    chip.className = 'file-chip';
-    const name = document.createElement('span');
-    name.className = 'fname';
-    name.title = f.path || '';
-    name.textContent = f.name || f.path || '';
-    const remove = document.createElement('span');
-    remove.className = 'rm';
-    remove.dataset.i = String(i);
-    remove.textContent = '✕';
-    chip.append(name, remove);
-    fileList.appendChild(chip);
-  });
+function renderPendingSelection() {
   btnSubmit.disabled = state.files.length === 0;
+  renderJobs();
 }
 
 function readTranslationMaxWorkers() {
@@ -63,12 +62,8 @@ async function pickFolder() {
 }
 
 export function installFiles() {
-  fileList.addEventListener('click', e => {
-    const rm = e.target.closest('.rm');
-    if (rm) { state.files.splice(+rm.dataset.i, 1); renderFiles(); }
-  });
-
   btnAddFolder.addEventListener('click', pickFolder);
+  window.addEventListener('pending-files-changed', renderPendingSelection);
 
   window.__pywebviewDrop = function(paths) {
     addPathsToState(paths);
@@ -92,9 +87,11 @@ export function installFiles() {
   btnSubmit.addEventListener('click', async () => {
     if (!state.files.length) return;
     btnSubmit.disabled = true;
-    btnSubmit.textContent = '处理中…';
+    btnSubmit.textContent = '启动中…';
 
-    const paths = state.files.map(f => f.path);
+    const pendingEntries = [...state.files];
+    const paths = pendingEntries.map(f => f.path);
+    const pendingIds = new Set(pendingEntries.map(f => f.pendingId));
 
     const spec = {
       video_paths:              paths,
@@ -128,14 +125,14 @@ export function installFiles() {
       });
       if (!r.ok) throw new Error(await r.text());
       const { ids } = await r.json();
-      addLog(`提交 ${ids.length} 个任务：${ids.join(', ')}`, 'stage-start');
-      state.files = [];
-      renderFiles();
+      addLog(`开始 ${ids.length} 个任务：${ids.join(', ')}`, 'stage-start');
+      state.files = state.files.filter(f => !pendingIds.has(f.pendingId));
+      renderPendingSelection();
       await fetchAllJobs();
     } catch (e) {
-      alert('提交失败：' + e.message);
+      alert('启动失败：' + e.message);
     }
     btnSubmit.disabled = state.files.length === 0;
-    btnSubmit.textContent = '提交任务';
+    btnSubmit.textContent = '开始任务';
   });
 }

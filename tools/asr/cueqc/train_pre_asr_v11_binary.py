@@ -232,9 +232,10 @@ def _split_label_masks(
     val = np.zeros_like(valid, dtype=bool)
     if split_mode == "role_holdout":
         for group_index, group in enumerate(group_rows):
+            role = str(group.get("dataset_role") or "").strip().lower()
             target = (
                 val
-                if str(group.get("dataset_role") or "") == "semantic"
+                if role in {"semantic", "val", "validation", "holdout"}
                 else train
             )
             target[group_index] = valid[group_index]
@@ -301,6 +302,49 @@ def _balanced_anchor_positions(train_mask: np.ndarray, y: np.ndarray, device: An
     if not positions:
         raise ValueError("training split has no label positions")
     return positions
+
+
+def _matching_group_indexes(
+    group_rows: list[Mapping[str, Any]],
+    audio_ids: list[str],
+) -> set[int]:
+    wanted = {str(item).strip() for item in audio_ids if str(item).strip()}
+    if not wanted:
+        return set()
+    return {
+        index
+        for index, group in enumerate(group_rows)
+        if str(group.get("audio_id") or "") in wanted
+    }
+
+
+def _boost_anchor_positions(
+    positions_by_label: dict[int, Any],
+    *,
+    group_indexes: set[int],
+    boost: int,
+) -> dict[int, Any]:
+    if not group_indexes or int(boost) <= 1:
+        return positions_by_label
+    import torch
+
+    out: dict[int, Any] = {}
+    for label, positions in positions_by_label.items():
+        selected = torch.zeros(
+            positions.shape[0],
+            dtype=torch.bool,
+            device=positions.device,
+        )
+        for group_index in group_indexes:
+            selected |= positions[:, 0] == int(group_index)
+        hard_positions = positions[selected]
+        if hard_positions.numel():
+            positions = torch.cat(
+                [positions, *([hard_positions] * (int(boost) - 1))],
+                dim=0,
+            )
+        out[int(label)] = positions
+    return out
 
 
 def _sample_balanced_anchors(
@@ -382,6 +426,8 @@ def _window_batch_from_anchors(
     y: Any,
     sequence_window_size: int,
 ) -> tuple[Any, Any, Any, Any, Any]:
+    import torch
+
     if sequence_window_size <= 0 or int(ptm_bins.shape[1]) <= sequence_window_size:
         group_ids = anchor_positions[:, 0]
         target_rows = torch.full_like(
@@ -401,8 +447,6 @@ def _window_batch_from_anchors(
             bin_mask[group_ids],
             target_rows,
         )
-    import torch
-
     window = min(int(sequence_window_size), int(ptm_bins.shape[1]))
     ptm_rows = []
     scalar_rows = []
@@ -496,6 +540,10 @@ def train(
     split_mode: str,
     val_ratio: float,
     focal_gamma: float,
+    init_checkpoint: Path | None,
+    force_train_audio_ids: list[str],
+    anchor_boost_audio_ids: list[str],
+    anchor_boost: int,
 ) -> dict[str, Any]:
     import torch
     import torch.nn.functional as F
@@ -534,11 +582,77 @@ def train(
         val_ratio=val_ratio,
         rng=rng,
     )
+    force_train_groups = _matching_group_indexes(group_rows, force_train_audio_ids)
+    for group_index in force_train_groups:
+        valid = (mask_np[group_index] > 0) & (
+            (y_np[group_index] == 0) | (y_np[group_index] == 1)
+        )
+        train_label_mask[group_index, valid] = True
+        val_label_mask[group_index, valid] = False
+    if force_train_groups:
+        split_summary.update(
+            {
+                "forced_train_audio_ids": sorted(
+                    str(group_rows[index].get("audio_id") or "")
+                    for index in force_train_groups
+                ),
+                "train_group_count": int(np.sum(np.any(train_label_mask, axis=1))),
+                "val_group_count": int(np.sum(np.any(val_label_mask, axis=1))),
+                "train_counts": _class_counts(y_np, train_label_mask),
+                "val_counts": _class_counts(y_np, val_label_mask),
+                "groups_train": _group_label_counts(
+                    y_np, train_label_mask, group_rows
+                ),
+                "groups_val": _group_label_counts(
+                    y_np, val_label_mask, group_rows
+                ),
+            }
+        )
 
     train_label_mask_t = torch.from_numpy(train_label_mask)
-    scalar_train = scalar[train_label_mask_t]
-    mean = scalar_train.mean(dim=0)
-    std = scalar_train.std(dim=0).clamp_min(1e-6)
+    init_payload: dict[str, Any] | None = None
+    if init_checkpoint is not None:
+        raw_init = torch.load(
+            init_checkpoint,
+            map_location="cpu",
+            weights_only=False,
+        )
+        if not isinstance(raw_init, Mapping):
+            raise ValueError("init checkpoint must be a mapping")
+        init_payload = dict(raw_init)
+        if init_payload.get("schema") != PRE_ASR_CUEQC_SCHEMA:
+            raise ValueError("init checkpoint schema mismatch")
+        if init_payload.get("arch") != PRE_ASR_CUEQC_MODEL_ARCH:
+            raise ValueError("init checkpoint architecture mismatch")
+        if tuple(init_payload.get("feature_names") or ()) != PRE_ASR_CUEQC_SCALAR_FEATURE_NAMES:
+            raise ValueError("init checkpoint feature_names mismatch")
+        init_metadata = init_payload.get("metadata")
+        if isinstance(init_metadata, Mapping):
+            init_repo = qwen_asr_repo_id(
+                str(init_metadata.get("asr_repo_id") or selected_repo)
+            )
+            if init_repo != selected_repo:
+                raise ValueError(
+                    f"init checkpoint asr_repo_id={init_repo!r} does not match "
+                    f"{selected_repo!r}"
+                )
+        mean = torch.as_tensor(
+            init_payload.get("feature_mean"),
+            dtype=torch.float32,
+        )
+        std = torch.as_tensor(
+            init_payload.get("feature_std"),
+            dtype=torch.float32,
+        )
+        if mean.shape != (len(PRE_ASR_CUEQC_SCALAR_FEATURE_NAMES),):
+            raise ValueError("init checkpoint feature_mean shape mismatch")
+        if std.shape != mean.shape:
+            raise ValueError("init checkpoint feature_std shape mismatch")
+        std = std.clamp_min(1e-6)
+    else:
+        scalar_train = scalar[train_label_mask_t]
+        mean = scalar_train.mean(dim=0)
+        std = scalar_train.std(dim=0).clamp_min(1e-6)
     scalar_norm = (scalar - mean.reshape(1, 1, -1)) / std.reshape(1, 1, -1)
     scalar_norm = torch.nan_to_num(scalar_norm, nan=0.0, posinf=0.0, neginf=0.0)
 
@@ -546,15 +660,20 @@ def train(
     if normalized_device == "auto":
         normalized_device = "cuda" if torch.cuda.is_available() else "cpu"
     dev = torch.device(normalized_device)
-    model_config = make_model_config(
-        {
-            "ptm_dim": PRE_ASR_CUEQC_PTM_DIM,
-            "scalar_dim": len(PRE_ASR_CUEQC_SCALAR_FEATURE_NAMES),
-            "hidden_size": hidden_size,
-            "temporal_residual_scale": temporal_residual_scale,
-        }
-    )
+    if init_payload is not None:
+        model_config = make_model_config(init_payload.get("model_config"))
+    else:
+        model_config = make_model_config(
+            {
+                "ptm_dim": PRE_ASR_CUEQC_PTM_DIM,
+                "scalar_dim": len(PRE_ASR_CUEQC_SCALAR_FEATURE_NAMES),
+                "hidden_size": hidden_size,
+                "temporal_residual_scale": temporal_residual_scale,
+            }
+        )
     model = PreAsrCueQCNetwork(**model_config).to(dev)
+    if init_payload is not None:
+        model.load_state_dict(init_payload["model_state_dict"], strict=True)
     opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
     class_weights = torch.tensor(
         [float(drop_class_weight), float(keep_class_weight)],
@@ -569,6 +688,15 @@ def train(
     y_train[~train_label_mask_t] = PRE_ASR_CUEQC_IGNORE_LABEL
     y_train_d = y_train.to(dev)
     positions_by_label = _balanced_anchor_positions(train_label_mask, y_np, dev)
+    anchor_boost_groups = _matching_group_indexes(
+        group_rows,
+        anchor_boost_audio_ids,
+    )
+    positions_by_label = _boost_anchor_positions(
+        positions_by_label,
+        group_indexes=anchor_boost_groups,
+        boost=anchor_boost,
+    )
     batch_size = max(1, int(batch_size))
     for _step in range(max(1, int(steps))):
         anchor_positions = _sample_balanced_anchors(
@@ -653,6 +781,20 @@ def train(
         },
         "focal_gamma": float(focal_gamma),
         "sequence_window_size": int(sequence_window_size),
+        "init_checkpoint": (
+            repo_display_path(init_checkpoint)
+            if init_checkpoint is not None
+            else None
+        ),
+        "force_train_audio_ids": sorted(
+            str(group_rows[index].get("audio_id") or "")
+            for index in force_train_groups
+        ),
+        "anchor_boost_audio_ids": sorted(
+            str(group_rows[index].get("audio_id") or "")
+            for index in anchor_boost_groups
+        ),
+        "anchor_boost": int(anchor_boost),
         "model_config": model_config,
         "drop_threshold": float(drop_threshold),
         "threshold_sweep": _threshold_sweep(probs_all, y_np, mask_np, durations),
@@ -704,6 +846,25 @@ def train(
             "val_ratio": float(val_ratio),
             "created_at": created_at,
             "ignore_label": PRE_ASR_CUEQC_IGNORE_LABEL,
+            "init_checkpoint": (
+                repo_display_path(init_checkpoint)
+                if init_checkpoint is not None
+                else ""
+            ),
+            "init_checkpoint_sha256": (
+                file_sha256(init_checkpoint)
+                if init_checkpoint is not None
+                else ""
+            ),
+            "force_train_audio_ids": sorted(
+                str(group_rows[index].get("audio_id") or "")
+                for index in force_train_groups
+            ),
+            "anchor_boost_audio_ids": sorted(
+                str(group_rows[index].get("audio_id") or "")
+                for index in anchor_boost_groups
+            ),
+            "anchor_boost": int(anchor_boost),
         },
         "model_state_dict": model.cpu().state_dict(),
     }
@@ -732,6 +893,23 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--drop-class-weight", type=float, default=1.0)
     parser.add_argument("--keep-class-weight", type=float, default=2.0)
     parser.add_argument("--focal-gamma", type=float, default=2.0)
+    parser.add_argument(
+        "--init-checkpoint",
+        help="Fine-tune from an existing compatible v11 checkpoint and preserve its normalization.",
+    )
+    parser.add_argument(
+        "--force-train-audio-id",
+        action="append",
+        default=[],
+        help="Keep all definite labels for this audio_id in training rather than validation.",
+    )
+    parser.add_argument(
+        "--anchor-boost-audio-id",
+        action="append",
+        default=[],
+        help="Oversample labeled anchors belonging to this audio_id.",
+    )
+    parser.add_argument("--anchor-boost", type=int, default=1)
     parser.add_argument(
         "--split-mode",
         choices=("chunk_stratified", "group", "role_holdout"),
@@ -762,6 +940,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         parser.error("--val-ratio must be in (0, 1)")
     if args.sequence_window_size < 0:
         parser.error("--sequence-window-size must be non-negative")
+    if args.anchor_boost <= 0:
+        parser.error("--anchor-boost must be positive")
     return args
 
 
@@ -786,6 +966,14 @@ def main(argv: list[str] | None = None) -> int:
         split_mode=str(args.split_mode),
         val_ratio=float(args.val_ratio),
         focal_gamma=float(args.focal_gamma),
+        init_checkpoint=(
+            project_path(args.init_checkpoint)
+            if args.init_checkpoint
+            else None
+        ),
+        force_train_audio_ids=list(args.force_train_audio_id),
+        anchor_boost_audio_ids=list(args.anchor_boost_audio_id),
+        anchor_boost=int(args.anchor_boost),
     )
     print(
         "checkpoint={checkpoint} val_drop_f1={f1:.4f} val_keep_recall={keep:.4f}".format(

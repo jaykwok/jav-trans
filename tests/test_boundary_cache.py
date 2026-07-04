@@ -71,6 +71,27 @@ def test_boundary_cache_key_changes_with_any_boundary_model(tmp_path, monkeypatc
     assert original["digest"] != changed["digest"]
 
 
+def test_delete_boundary_cache_variants_for_audio_key(tmp_path, monkeypatch) -> None:
+    from boundary import cache as boundary_cache
+
+    root = tmp_path / "boundary-cache"
+    root.mkdir()
+    monkeypatch.setenv("BOUNDARY_CACHE_DIR", str(root))
+    matching = [
+        root / "abcdef12.first.json",
+        root / "abcdef12.second.json",
+        root / "abcdef12.second.json.123.tmp",
+    ]
+    unrelated = root / "12345678.first.json"
+    for path in [*matching, unrelated]:
+        path.write_text("{}", encoding="utf-8")
+
+    assert boundary_cache.delete_for_audio_cache_key("ABCDEF12") == 3
+    assert all(not path.exists() for path in matching)
+    assert unrelated.exists()
+    assert boundary_cache.delete_for_audio_cache_key("../boundary-cache") == 0
+
+
 def test_boundary_cache_round_trips_shared_absolute_cut_metadata(monkeypatch, tmp_path) -> None:
     from boundary import cache as boundary_cache
 

@@ -16,6 +16,7 @@ from typing import Any
 from core import events
 from core.config import DEFAULT_SETTINGS
 from core.job_context import JobContext
+from boundary.cache import delete_for_audio_cache_key
 from pipeline.artifacts import (
     AsrArtifacts,
     load_translation_artifacts_snapshot,
@@ -23,6 +24,7 @@ from pipeline.artifacts import (
 )
 from pipeline.aligned_cache import try_load_aligned_segments
 from pipeline.audio import get_audio_cache_key
+from pipeline.cleanup import cleanup_asr_checkpoints
 from pipeline.ids import sanitize_job_id
 import main as pipeline_main
 from main import run_asr_alignment, run_translation_and_write
@@ -231,6 +233,34 @@ def _remove_job_temp_dir(job_id: str) -> None:
         return
     if path.is_dir():
         shutil.rmtree(path, ignore_errors=True)
+
+
+def _job_audio_cache_keys(job: JobState) -> set[str]:
+    keys: set[str] = set()
+    for video_path in job.spec.video_paths:
+        try:
+            keys.add(get_audio_cache_key(video_path))
+        except OSError:
+            pass
+    audio_dir = Path(_job_temp_dir(job.id)) / "audio"
+    if audio_dir.is_dir():
+        for audio_path in audio_dir.glob("*.wav"):
+            candidate = audio_path.stem.rsplit(".", 1)[-1].strip().lower()
+            if candidate:
+                keys.add(candidate)
+    return keys
+
+
+def _remove_job_caches(job: JobState) -> None:
+    for audio_cache_key in _job_audio_cache_keys(job):
+        delete_for_audio_cache_key(audio_cache_key)
+    chunk_root = Path(
+        os.getenv("ASR_CHUNK_ROOT", PROJECT_ROOT / "tmp" / "chunks")
+    ).resolve()
+    cleanup_asr_checkpoints(
+        Path(_job_temp_dir(job.id)),
+        chunk_root.parent,
+    )
 
 
 def _translation_cache_path(job_id: str) -> str:
@@ -582,7 +612,7 @@ async def retry_job(job_id: str) -> JobState | None:
 
 
 async def remove_job(job_id: str) -> bool:
-    remove_temp_for_job: str | None = None
+    removed_job: JobState | None = None
     async with _state_lock:
         job = _jobs.get(job_id)
         if job is None:
@@ -592,32 +622,34 @@ async def remove_job(job_id: str) -> bool:
             _cancel_events.pop(job_id, None)
             _last_progress_write_ts.pop(job_id, None)
             _write_jobs_unlocked()
-            remove_temp_for_job = job_id
+            removed_job = job
 
-    if remove_temp_for_job is not None:
-        _remove_job_temp_dir(remove_temp_for_job)
+    if removed_job is not None:
+        _remove_job_caches(removed_job)
+        _remove_job_temp_dir(removed_job.id)
         return True
 
     return await cancel_job(job_id)
 
 
 async def remove_finished_jobs() -> int:
-    job_ids: list[str] = []
+    removed_jobs: list[JobState] = []
     async with _state_lock:
-        job_ids = [
-            job_id
-            for job_id, job in _jobs.items()
+        removed_jobs = [
+            job
+            for job in _jobs.values()
             if job.status in _FINISHED_STATUSES
         ]
-        for job_id in job_ids:
-            _jobs.pop(job_id, None)
-            _cancel_events.pop(job_id, None)
-            _last_progress_write_ts.pop(job_id, None)
-        if job_ids:
+        for job in removed_jobs:
+            _jobs.pop(job.id, None)
+            _cancel_events.pop(job.id, None)
+            _last_progress_write_ts.pop(job.id, None)
+        if removed_jobs:
             _write_jobs_unlocked()
-    for job_id in job_ids:
-        _remove_job_temp_dir(job_id)
-    return len(job_ids)
+    for job in removed_jobs:
+        _remove_job_caches(job)
+        _remove_job_temp_dir(job.id)
+    return len(removed_jobs)
 
 
 async def evict_old_jobs(max_age_hours: int = 48) -> int:

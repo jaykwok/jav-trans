@@ -469,12 +469,22 @@ def _setup_run_logger(
     backend_label: str,
     ctx: JobContext,
 ) -> tuple[logging.Logger, Path]:
-    safe_job_id = _run_log_component(job_id, max_chars=48)
-    log_dir = _run_log_dir(ctx) / safe_job_id
-    log_dir.mkdir(parents=True, exist_ok=True)
-    safe_backend = _run_log_component(backend_label, max_chars=40)
+    run_log_root = _run_log_dir(ctx)
     stamp = time.strftime("%Y%m%d_%H%M%S")
-    log_path = log_dir / f"{stamp}_{safe_job_id}_{safe_backend}.run.log"
+    # Leave headroom below legacy Windows MAX_PATH. The root can itself be
+    # user-configured and deep, so fixed per-component limits are insufficient.
+    fixed_chars = len(str(run_log_root)) + 2 + len(stamp) + 1 + len(".run.log")
+    available_chars = max(24, 240 - fixed_chars)
+    job_chars = min(48, max(12, available_chars - 12))
+    backend_chars = min(40, max(12, available_chars - job_chars))
+    safe_job_id = _run_log_component(job_id, max_chars=job_chars)
+    log_dir = run_log_root / safe_job_id
+    log_dir.mkdir(parents=True, exist_ok=True)
+    safe_backend = _run_log_component(backend_label, max_chars=backend_chars)
+    # The parent directory already identifies the job. Repeating the job id in
+    # the filename can push packaged Windows runs past MAX_PATH even though
+    # each individual component is bounded.
+    log_path = log_dir / f"{stamp}_{safe_backend}.run.log"
     logger_name = f"jav-trans.run.{job_id}.{stamp}"
     logger = logging.getLogger(logger_name)
     logger.setLevel(logging.INFO)

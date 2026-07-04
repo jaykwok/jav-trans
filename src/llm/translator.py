@@ -2296,7 +2296,7 @@ def _chat_completions(
     _raise_if_cancelled(cancel_event)
     model_name = os.getenv("LLM_MODEL_NAME", LLM_MODEL_NAME).strip()
     if not model_name:
-        raise RuntimeError("请先在「翻译设置」中获取并选择翻译模型，再提交任务")
+        raise RuntimeError("请先在「翻译设置」中获取并选择翻译模型，再开始任务")
     request = {
         "model": model_name,
         "messages": messages,
@@ -2406,7 +2406,7 @@ def _chat_responses(
     _raise_if_cancelled(cancel_event)
     model_name = os.getenv("LLM_MODEL_NAME", LLM_MODEL_NAME).strip()
     if not model_name:
-        raise RuntimeError("请先在「翻译设置」中获取并选择翻译模型，再提交任务")
+        raise RuntimeError("请先在「翻译设置」中获取并选择翻译模型，再开始任务")
 
     effective_reasoning_effort = (
         _normalize_reasoning_effort(

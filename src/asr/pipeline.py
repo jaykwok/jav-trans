@@ -321,6 +321,11 @@ def _build_processing_spans(
         if cached is not None:
             progress("边界缓存", 1, 1)
             spans, runtime_boundary_signature, event = cached
+            if on_stage is not None:
+                on_stage(
+                    "边界缓存命中：已复用 SpeechIsland/Outer/Split/Cut 结果，"
+                    "本次未执行四个边界模型"
+                )
             _set_last_boundary_signature(runtime_boundary_signature)
             _pipeline_logger.info(
                 "[boundary-cache] hit path=%s digest=%s",

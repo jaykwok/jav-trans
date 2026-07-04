@@ -129,20 +129,38 @@ def run(args: argparse.Namespace) -> None:
         )
         if args.prepare_only:
             continue
-        parsed, raw = call_omni(
-            audio_path=clip_path,
-            fmt="mp3",
-            audio_content_mode=args.audio_content_mode,
-            model=model,
-            api_key=api_key,
-            base_url=base_url,
-            timeout_s=args.timeout_s,
-            store_stream_chunks=False,
-            prompt=PROMPT,
-        )
+        try:
+            parsed, raw = call_omni(
+                audio_path=clip_path,
+                fmt="mp3",
+                audio_content_mode=args.audio_content_mode,
+                model=model,
+                api_key=api_key,
+                base_url=base_url,
+                timeout_s=args.timeout_s,
+                store_stream_chunks=False,
+                prompt=PROMPT,
+            )
+        except Exception as exc:  # noqa: BLE001
+            parsed = {
+                "label": "unsure",
+                "confidence": 0.0,
+                "left_complete": False,
+                "right_complete": False,
+                "merged_better": False,
+                "flags": ["api_error"],
+                "reason": f"Omni request failed: {exc}",
+            }
+            raw = {"error": repr(exc)}
         omni_label = _normalized_label(parsed.get("label"))
         confidence = min(1.0, max(0.0, float(parsed.get("confidence") or 0.0)))
         label = omni_label if confidence >= args.confidence else "unsure"
+        if label == "cut" and (
+            not bool(parsed.get("left_complete"))
+            or not bool(parsed.get("right_complete"))
+            or bool(parsed.get("merged_better"))
+        ):
+            label = "unsure"
         result = {
             "schema": "semantic_split_omni_label_v1",
             "index": index,

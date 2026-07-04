@@ -285,6 +285,13 @@ def _transcribe_asr_chunks_text_only(
 
     def _store_text_results(batch_chunks: list[dict], batch_text_results: list[dict]) -> None:
         nonlocal processed_since_checkpoint
+        if len(batch_text_results) != len(batch_chunks):
+            raise RuntimeError(
+                "ASR batch result count mismatch: "
+                f"expected={len(batch_chunks)} actual={len(batch_text_results)}; "
+                "refusing to continue because positional pairing would shift "
+                "subsequent subtitle timestamps"
+            )
         for chunk, text_result in zip(batch_chunks, batch_text_results):
             text_results_by_index[int(chunk["index"])] = text_result
         processed_since_checkpoint += len(batch_text_results)

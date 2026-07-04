@@ -87,7 +87,7 @@ $env:PYTHONIOENCODING="utf-8"
 uv run --no-sync python launcher.py
 ```
 
-默认地址为 `http://127.0.0.1:17321`。首次运行可以没有 `.env`；打开页面后在“翻译 API”面板填写 API Key、Base URL、模型和目标语言，保存或提交任务时会自动写入项目根目录 `.env`。新建的 `.env` 只启用实际保存的本机值，ASR batch、后端、显存预算等研究项会以注释示例形式写入。国内网络下载 Hugging Face 模型较慢时，可在“识别设置”里填写代理协议、地址和端口。
+默认地址为 `http://127.0.0.1:17321`。首次运行可以没有 `.env`；打开页面后在“翻译 API”面板填写 API Key、Base URL、模型和目标语言，保存或开始任务时会自动写入项目根目录 `.env`。新建的 `.env` 只启用实际保存的本机值，ASR batch、后端、显存预算等研究项会以注释示例形式写入。国内网络下载 Hugging Face 模型较慢时，可在“识别设置”里填写代理协议、地址和端口。
 
 Linux / WSL2 下如果只启动浏览器版 Web 服务，也可以直接运行：
 
@@ -105,8 +105,10 @@ Windows 打包版会自带 CUDA 版 PyTorch runtime，但仍需要用户本机 N
 1. 打开网页控制台。
 2. 选择视频文件。
 3. 选择字幕模式、ASR 后端和翻译设置。
-4. 提交任务。
+4. 选中的视频会立即进入右侧“待开始”列表；确认后点击“开始任务”。
 5. 在输出目录查看 SRT、质量报告和日志。
+
+任务正常完成后会保留可复用的 Boundary cache；从右侧任务列表删除已结束任务时，会同时清理该视频的全部 Boundary cache 变体、未完成的 ASR checkpoint 和任务临时目录。运行中的任务第一次删除只执行取消，进入“已取消”后再次删除才会清理缓存。
 
 勾选“不翻译（仅日文字幕）”时，流水线仍会执行边界规划、可选 Pre-ASR CueQC、ASR 和 Boundary chunk 字幕时间轴生成，但跳过 LLM 翻译，最终输出 `<视频名>.ja.srt`。这是验证本地边界 / ASR / 字幕时间轴链路的推荐 smoke 模式。
 
@@ -223,7 +225,7 @@ Scorer 只负责高召回找 speech island。acoustic valley 可以生成候选�
 
 Cue 按原始时序送入模型。`1.7B` 训练使用 sequence window，但只对平衡采样的 anchor 计算 loss；显式差分帮助 Mamba 建模邻接变化。`0.6B` 的独立 holdout 显示时序残差会降低 keep recall，因此正式 checkpoint 将 `temporal_residual_scale` 设为 `0`，保留 local branch。模型禁止使用 ASR text、token trace、decoder stats、ASR confidence 和 subtitle timing。
 
-当前 `1.7B` checkpoint 已进入默认 registry，6GB 默认配置会启用 Pre-ASR CueQC。held-out operating point 在阈值 `0.95` 下为 drop precision `98.13%`、drop recall `92.92%`、semantic keep recall `95.06%`。
+当前 `1.7B` checkpoint 已进入默认 registry，6GB 默认配置会启用 Pre-ASR CueQC。30 部随机视频、按视频隔离的 v2 holdout 在阈值 `0.95` 下为 accuracy `84.21%`、drop precision `87.85%`、drop recall `85.95%`、semantic keep recall `81.51%`；匿名样片 C 全量 Omni 真值回归为 semantic keep recall `100%`、drop recall `98.01%`。相较旧 checkpoint，新模型优先降低 false-drop，不通过后处理时长或文本启发式补救。
 
 `0.6B` 五模型也已进入默认 registry，独立验证结果如下：
 
@@ -436,15 +438,23 @@ uv run python -m <module> --help
 常用入口：
 
 - `tools.workflows.run_full_workflow`：命令行完整工作流 smoke。
+- `tools.workflows.promote_torch_checkpoint`：把训练 checkpoint 晋升为自包含 production artifact，补齐分发 contract、验证指标和可选 Pre-ASR drop threshold。
 - `tools.web.smoke.start_server` / `submit_job` / `poll_job` / `summarize_job`：Web 服务 smoke 和任务汇总。
 - `tools.audits.audit_nav`、`tools.audits.serve_static`、`tools.audits.serve_audits.ps1`、`tools.audits.serve_audits.sh`：维护和启动本地审计导航页。
 - `tools.audits.generate_cueqc_cluster_audit_html`：生成音频审计页，支持 chunk/context 播放、筛选排序和字幕对照。
 - `tools.audits.generate_cueqc_cluster_broadcast_html`：生成独立簇级 keep/drop 广播标注页；混簇/跳过只记录 abstain。
 - `tools.audits.generate_cueqc_prediction_audit_html`：根据 `cueqc_predictions.jsonl` 采样生成 CueQC 预测 false-drop 审计页，支持混采/高置信策略与字幕对照。
 - `tools.audits.generate_subtitle_ab_compare_audit_html`：生成整片旧/新字幕 A/B 对比审计页，用于评估边界或时间轴改动效果。
+- `tools.audits.compare_pre_asr_route_coverage`：比较多个 Pre-ASR route JSONL 对参考 SRT cue 的时间覆盖；仅作覆盖诊断，不把旧 ASR 文本当真值。
 - `tools.asr.convert_qwen3_asr_to_hf`：把 legacy 非 `-hf` Qwen3-ASR fine-tune safetensors 权重迁移到 Transformers-native `-hf` layout（`thinker.audio_tower.* -> model.audio_tower.*`、`thinker.audio_tower.proj{1,2}.* -> model.multi_modal_projector.linear_{1,2}.*`、`thinker.model.* -> model.language_model.*`，并复用 `Qwen/Qwen3-ASR-*-hf` 模板文件）。
 - `tools.asr.cueqc.export_semantic_boundary_candidates`：导出五段式 boundary runtime 的最终 semantic chunks。
 - `tools.asr.cueqc.label_semantic_pre_asr_with_omni`：为 Pre-ASR v11 生成 `definite_drop/definite_keep/ambiguous_ignore` 弱标签；上传前统一转为 16k mono 32kbps MP3，长音频使用保留语义中心的窗口。
+- `tools.asr.cueqc.evaluate_pre_asr_route`：用指定 checkpoint/threshold 重放 Pre-ASR candidates，导出逐 chunk route、长 chunk 分布和指定时间区间诊断。
+- `tools.boundary.ja.merge_semantic_split_datasets`：按来源角色和 repeat 权重合并多个 Semantic Split NPZ。
+- `tools.datasets.prepare_joint_boundary_omni_dataset`：从视频库分层随机抽取窗口，生成运行时同滤镜的 16k PCM WAV、仅供 Omni 的 16k/32kbps MP3，以及 Split/Pre-ASR 训练特征。
+- `tools.datasets.label_joint_boundary_preasr_with_omni`：每个音频窗口只调用一次 Omni，同时标注 Split `cut/continue/unsure` 与 Pre-ASR `keep/drop/ambiguous`。
+- `tools.datasets.compile_joint_boundary_preasr_dataset`：按 `video_id` 隔离 train/val，编译 Split NPZ、Pre-ASR PT bundle 和数据集说明。
+- `tools.datasets.evaluate_joint_boundary_preasr_checkpoints`：在联合数据集上按视频级 train/val 评估 Split 与 Pre-ASR checkpoint，并扫描 Pre-ASR threshold。
 
 Qwen3-ASR `-hf` 转换示例：
 

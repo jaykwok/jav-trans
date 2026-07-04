@@ -15,7 +15,10 @@ from boundary.sequence_features import (
     FrameSequenceFeatureProvider,
 )
 from tools.asr.cueqc.compile_pre_asr_v11_features import compile_features
-from tools.asr.cueqc.train_pre_asr_v11_binary import _split_label_masks
+from tools.asr.cueqc.train_pre_asr_v11_binary import (
+    _split_label_masks,
+    _window_batch_from_anchors,
+)
 
 
 def _ptm_pool() -> list[float]:
@@ -418,6 +421,7 @@ def test_compile_pre_asr_cueqc_features_reads_jsonl_chunk_candidates(tmp_path: P
     assert summary["keep"] == 1
     assert summary["drop"] == 1
     bundle = load_feature_bundle(output)
+    assert bundle["groups"][0]["audio_id"] == "AAA"
     assert (
         bundle["ptm_bin_count"]
         == pre_asr_cueqc.PRE_ASR_CUEQC_MODEL_PTM_TOKENS
@@ -618,3 +622,26 @@ def test_pre_asr_training_chunk_stratified_split_samples_both_films():
     assert summary["val_counts"]["drop"] > 0
     assert summary["val_counts"]["keep"] > 0
     assert not np.any(train_mask & val_mask)
+
+
+def test_pre_asr_anchor_batch_supports_pre_windowed_bundle():
+    import torch
+
+    labels = torch.tensor([[0, 1, -100], [1, 0, -100]])
+    anchors = torch.tensor([[0, 1], [1, 0]])
+    ptm = torch.zeros((2, 3, 2, 4))
+    scalar = torch.zeros((2, 3, 5))
+    chunk_mask = torch.tensor([[1, 1, 0], [1, 1, 0]], dtype=torch.bool)
+    bin_mask = torch.ones((2, 3, 2), dtype=torch.bool)
+
+    *_, targets = _window_batch_from_anchors(
+        anchor_positions=anchors,
+        ptm_bins=ptm,
+        scalar=scalar,
+        chunk_mask=chunk_mask,
+        bin_mask=bin_mask,
+        y=labels,
+        sequence_window_size=3,
+    )
+
+    assert targets.tolist() == [[-100, 1, -100], [1, -100, -100]]
