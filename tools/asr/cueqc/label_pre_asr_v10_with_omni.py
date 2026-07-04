@@ -545,6 +545,7 @@ def call_omni(
     timeout_s: float,
     store_stream_chunks: bool,
     prompt: str = PROMPT,
+    max_tokens: int = 256,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     from openai import OpenAI
 
@@ -555,7 +556,7 @@ def call_omni(
     stream = client.chat.completions.create(
         model=model,
         temperature=0,
-        max_tokens=256,
+        max_tokens=max(1, int(max_tokens)),
         messages=[
             {
                 "role": "user",

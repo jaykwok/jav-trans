@@ -347,6 +347,25 @@ async def open_folder(job_id: str, path: str) -> dict[str, bool]:
     return {"ok": True}
 
 
+@router.post("/open-artifact")
+async def open_artifact(job_id: str, path: str) -> dict[str, bool]:
+    job = await get_job(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="Job not found")
+    target = _resolve_authorized_artifact_path(job, path)
+    if target is None:
+        raise HTTPException(status_code=403, detail="Artifact is not part of this job")
+    if not target.is_file():
+        raise HTTPException(status_code=404, detail="Artifact file not found")
+    if os.name == "nt":
+        os.startfile(str(target))  # type: ignore[attr-defined]
+    elif sys.platform == "darwin":
+        subprocess.Popen(["open", str(target)])
+    else:
+        subprocess.Popen(["xdg-open", str(target)])
+    return {"ok": True}
+
+
 @router.get("/output/{job_id}/{filename}")
 async def get_output_file(job_id: str, filename: str) -> FileResponse:
     job = await get_job(job_id)

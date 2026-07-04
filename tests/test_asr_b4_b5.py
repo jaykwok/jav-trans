@@ -5,6 +5,8 @@ import sys
 import wave
 from pathlib import Path
 
+import pytest
+
 
 ROOT = Path(__file__).resolve().parents[1]
 SRC = ROOT / "src"
@@ -68,3 +70,43 @@ def test_asr_text_transcribe_passes_only_audio_paths(monkeypatch, tmp_path):
 
     assert [result["text"] for result in results] == ["text-0", "text-1"]
     assert backend.audio_paths == [chunk["path"] for chunk in chunks]
+
+
+def test_asr_text_transcribe_rejects_short_batch_results(monkeypatch, tmp_path):
+    asr = _reload_pipeline(monkeypatch, tmp_path)
+    source = tmp_path / "source.wav"
+    _write_wav(source, 2.0)
+    chunks = [
+        {
+            "index": index,
+            "start": index * 0.5,
+            "end": index * 0.5 + 0.4,
+            "path": str(tmp_path / f"c{index}.wav"),
+            "source_audio_path": str(source),
+        }
+        for index in range(2)
+    ]
+
+    class ShortBatchBackend:
+        is_subprocess = False
+        request_batch_size = 2
+
+        def transcribe_texts(self, audio_paths, on_stage=None):
+            del audio_paths, on_stage
+            return [
+                {
+                    "text": "only-one-result",
+                    "raw_text": "only-one-result",
+                    "duration": 0.4,
+                    "language": "Japanese",
+                    "normalized_path": str(tmp_path / "c0.wav"),
+                    "log": ["fake"],
+                }
+            ]
+
+    with pytest.raises(RuntimeError, match="ASR batch result count mismatch"):
+        asr._transcribe_asr_chunks_text_only(
+            ShortBatchBackend(),
+            chunks,
+            "ASR 文本转写",
+        )

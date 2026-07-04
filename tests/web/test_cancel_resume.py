@@ -418,6 +418,10 @@ def test_remove_finished_job_deletes_job_temp_dir(tmp_path, monkeypatch):
     asyncio.run(_test_remove_finished_job_deletes_job_temp_dir(tmp_path, monkeypatch))
 
 
+def test_remove_finished_job_deletes_video_boundary_caches(tmp_path, monkeypatch):
+    asyncio.run(_test_remove_finished_job_deletes_video_boundary_caches(tmp_path, monkeypatch))
+
+
 async def _test_remove_finished_job_deletes_job_temp_dir(tmp_path, monkeypatch):
     monkeypatch.setattr(pm, "_jobs_path", tmp_path / "jobs.json")
     monkeypatch.setattr(pm, "_job_temp_dir", lambda job_id: str(tmp_path / "jobs" / job_id))
@@ -440,6 +444,39 @@ async def _test_remove_finished_job_deletes_job_temp_dir(tmp_path, monkeypatch):
 
     assert await pm.remove_job(job.id)
     assert not temp_dir.exists()
+    await _reset_pm_state()
+
+
+async def _test_remove_finished_job_deletes_video_boundary_caches(tmp_path, monkeypatch):
+    monkeypatch.setattr(pm, "_jobs_path", tmp_path / "jobs.json")
+    monkeypatch.setattr(pm, "_job_temp_dir", lambda job_id: str(tmp_path / "jobs" / job_id))
+    monkeypatch.setattr(pm, "get_audio_cache_key", lambda _path: "abcdef12")
+    cache_root = tmp_path / "boundary-cache"
+    cache_root.mkdir()
+    monkeypatch.setenv("BOUNDARY_CACHE_DIR", str(cache_root))
+    matching = cache_root / "abcdef12.runtime.json"
+    unrelated = cache_root / "12345678.runtime.json"
+    matching.write_text("{}", encoding="utf-8")
+    unrelated.write_text("{}", encoding="utf-8")
+    await _reset_pm_state()
+
+    job = JobState(
+        id="done-cache-job",
+        spec=JobSpec(video_paths=["sample.mp4"]),
+        created_at="2026-05-04T00:00:00.000+00:00",
+        status="done",
+        current_stage="done",
+    )
+    temp_dir = Path(pm._job_temp_dir(job.id))
+    temp_dir.mkdir(parents=True)
+    async with pm._state_lock:
+        pm._jobs[job.id] = job
+        pm._cancel_events[job.id] = threading.Event()
+        pm._write_jobs_unlocked()
+
+    assert await pm.remove_job(job.id)
+    assert not matching.exists()
+    assert unrelated.exists()
     await _reset_pm_state()
 
 

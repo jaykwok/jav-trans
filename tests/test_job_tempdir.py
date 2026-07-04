@@ -201,6 +201,25 @@ def test_run_log_filename_components_are_bounded():
     assert "-" in component
 
 
+def test_run_log_filename_does_not_repeat_long_job_id(tmp_path):
+    ctx = make_job_context(
+        tmp_path / "sample.mp4",
+        tmp_path / "out",
+        tmp_path / "jobs",
+        run_log_enabled=True,
+        run_log_dir=tmp_path / ("nested-" * 12),
+    )
+    job_id = "FJIN-059_" + "joint-trained-validation_" * 5
+    backend = "jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame-hf"
+
+    logger, log_path = main._setup_run_logger(job_id, backend, ctx)
+    try:
+        assert main._run_log_component(job_id, max_chars=48) not in log_path.name
+        assert log_path.is_file()
+    finally:
+        main._close_run_logger(logger)
+
+
 def test_successful_run_cleans_job_temp_by_default(monkeypatch, tmp_path):
     output_dir = tmp_path / "out"
     temp_root = tmp_path / "jobs"

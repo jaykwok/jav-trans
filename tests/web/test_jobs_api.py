@@ -937,6 +937,14 @@ async def _test_open_routes_are_limited_to_job_paths(tmp_path, monkeypatch):
                 "/api/open-folder",
                 params={"job_id": job.id, "path": "sample.srt"},
             )
+            allowed_artifact = await client.post(
+                "/api/open-artifact",
+                params={"job_id": job.id, "path": "sample.srt"},
+            )
+            blocked_artifact = await client.post(
+                "/api/open-artifact",
+                params={"job_id": job.id, "path": str(unrelated_path)},
+            )
             blocked_folder = await client.post(
                 "/api/open-folder",
                 params={"job_id": job.id, "path": str(unrelated_path)},
@@ -945,9 +953,12 @@ async def _test_open_routes_are_limited_to_job_paths(tmp_path, monkeypatch):
         assert allowed_video.status_code == 200
         assert blocked_video.status_code == 403
         assert allowed_folder.status_code == 200
+        assert allowed_artifact.status_code == 200
+        assert blocked_artifact.status_code == 403
         assert blocked_folder.status_code == 403
         open_kind = "startfile" if os.name == "nt" else "popen"
         assert (open_kind, str(video_path.resolve())) in opened
+        assert (open_kind, str(artifact_path.resolve())) in opened
         assert (open_kind, str(output_dir.resolve())) in opened
     finally:
         await _reset_pm_state()

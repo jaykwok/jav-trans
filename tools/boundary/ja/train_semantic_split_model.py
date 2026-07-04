@@ -39,30 +39,53 @@ def run(args: argparse.Namespace) -> None:
         indexes = rng.permutation(labels.size)
         val_mask[indexes[: max(1, labels.size // 10)]] = True
         train_mask = ~val_mask
-    frame_mean = frames[train_mask].mean(axis=(0, 1))
-    frame_std = frames[train_mask].std(axis=(0, 1))
-    scalar_mean = scalars[train_mask].mean(axis=0)
-    scalar_std = scalars[train_mask].std(axis=0)
+    init_payload = None
+    if args.init_checkpoint:
+        init_payload = torch.load(
+            args.init_checkpoint,
+            map_location="cpu",
+            weights_only=False,
+        )
+        init_normalization = dict(init_payload.get("normalization") or {})
+        frame_mean = np.asarray(init_normalization["frame_mean"], dtype=np.float32)
+        frame_std = np.asarray(init_normalization["frame_std"], dtype=np.float32)
+        scalar_mean = np.asarray(init_normalization["scalar_mean"], dtype=np.float32)
+        scalar_std = np.asarray(init_normalization["scalar_std"], dtype=np.float32)
+    else:
+        frame_mean = frames[train_mask].mean(axis=(0, 1))
+        frame_std = frames[train_mask].std(axis=(0, 1))
+        scalar_mean = scalars[train_mask].mean(axis=0)
+        scalar_std = scalars[train_mask].std(axis=0)
     frames = (frames - frame_mean) / np.maximum(frame_std, 1e-6)
     scalars = (scalars - scalar_mean) / np.maximum(scalar_std, 1e-6)
-    model_config = {
-        "frame_dim": int(frames.shape[2]),
-        "scalar_dim": int(scalars.shape[1]),
-        "hidden_size": args.hidden_size,
-        "num_layers": args.num_layers,
-        "state_size": 32,
-        "num_heads": 4,
-        "head_dim": 64,
-        "n_groups": 2,
-        "conv_kernel": 4,
-        "chunk_size": 8,
-        "bidirectional": True,
-        "output_dim": 3,
-    }
+    model_config = (
+        dict(init_payload["model_config"])
+        if init_payload is not None
+        else {
+            "frame_dim": int(frames.shape[2]),
+            "scalar_dim": int(scalars.shape[1]),
+            "hidden_size": args.hidden_size,
+            "num_layers": args.num_layers,
+            "state_size": 32,
+            "num_heads": 4,
+            "head_dim": 64,
+            "n_groups": 2,
+            "conv_kernel": 4,
+            "chunk_size": 8,
+            "bidirectional": True,
+            "output_dim": 3,
+        }
+    )
+    if int(model_config["frame_dim"]) != int(frames.shape[2]):
+        raise ValueError("init checkpoint frame_dim does not match the dataset")
+    if int(model_config["scalar_dim"]) != int(scalars.shape[1]):
+        raise ValueError("init checkpoint scalar_dim does not match the dataset")
     device = torch.device(args.device)
     torch.manual_seed(args.seed)
     rng = np.random.default_rng(args.seed)
     model = SemanticSplitVerifierNetwork(**model_config).to(device)
+    if init_payload is not None:
+        model.load_state_dict(init_payload["model_state_dict"])
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.learning_rate)
     train_indexes = np.flatnonzero(train_mask)
     class_weights = torch.tensor(
@@ -71,8 +94,35 @@ def run(args: argparse.Namespace) -> None:
         device=device,
     )
     losses: list[float] = []
+    train_indexes_by_label = {
+        label_index: np.flatnonzero(train_mask & (labels == label_index))
+        for label_index in range(len(SEMANTIC_SPLIT_LABELS))
+    }
+    available_train_labels = [
+        label_index
+        for label_index, indexes in train_indexes_by_label.items()
+        if indexes.size
+    ]
     for step in range(args.max_steps):
-        batch_indexes = rng.choice(train_indexes, size=args.batch_size, replace=True)
+        if args.sampling_mode == "class_balanced":
+            sampled_labels = rng.choice(
+                available_train_labels,
+                size=args.batch_size,
+                replace=True,
+            )
+            batch_indexes = np.asarray(
+                [
+                    rng.choice(train_indexes_by_label[int(label_index)])
+                    for label_index in sampled_labels
+                ],
+                dtype=np.int64,
+            )
+        else:
+            batch_indexes = rng.choice(
+                train_indexes,
+                size=args.batch_size,
+                replace=True,
+            )
         frame_tensor = torch.from_numpy(frames[batch_indexes]).to(device)
         scalar_tensor = torch.from_numpy(scalars[batch_indexes]).to(device)
         label_tensor = torch.from_numpy(labels[batch_indexes]).to(device)
@@ -140,6 +190,8 @@ def run(args: argparse.Namespace) -> None:
                 "dataset": str(Path(args.dataset)),
                 "trained_steps": args.max_steps,
                 "class_weights": class_weights.detach().cpu().tolist(),
+                "sampling_mode": args.sampling_mode,
+                "init_checkpoint": str(args.init_checkpoint or ""),
             },
         ),
         checkpoint_path,
@@ -152,6 +204,7 @@ def run(args: argparse.Namespace) -> None:
         "accuracy": float((predicted == truth).mean()),
         "cut_precision": cut_precision,
         "continue_recall": continue_recall,
+        "sampling_mode": args.sampling_mode,
         "confusion_expected_rows_predicted_columns": confusion.tolist(),
         "checkpoint": str(checkpoint_path),
     }
@@ -179,9 +232,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--cut-weight", type=float, default=1.0)
     parser.add_argument("--continue-weight", type=float, default=1.5)
     parser.add_argument("--unsure-weight", type=float, default=0.75)
+    parser.add_argument(
+        "--sampling-mode",
+        choices=("uniform", "class_balanced"),
+        default="uniform",
+    )
     parser.add_argument("--seed", type=int, default=13)
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--log-every", type=int, default=100)
+    parser.add_argument("--init-checkpoint", default="")
     return parser.parse_args()
 
 

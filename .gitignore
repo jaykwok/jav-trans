@@ -16,7 +16,7 @@ __pycache__/
 
 # Agent and run artifacts
 agents/
-datasets/
+/datasets/
 log/
 reports/
 subtitle_qc/output/

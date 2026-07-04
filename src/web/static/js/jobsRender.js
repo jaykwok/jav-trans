@@ -4,7 +4,7 @@ import { jobArea, jobAreaHeader, emptyState, btnClearDone } from './dom.js';
 import { addLog } from './log.js';
 
 const STATUS_LABEL = {
-  queued: '排队中', asr: 'ASR转写', translating: '翻译中',
+  pending: '待开始', queued: '排队中', asr: 'ASR转写', translating: '翻译中',
   writing: '写入中', done: '完成', failed: '失败', cancelled: '已取消',
 };
 
@@ -66,13 +66,18 @@ function jobTitle(job) {
 
 export function renderJobs() {
   const ids = Object.keys(state.jobs);
-  emptyState.style.display = ids.length ? 'none' : 'flex';
+  const pendingFiles = state.files;
+  emptyState.style.display = ids.length || pendingFiles.length ? 'none' : 'flex';
 
   const hasClearable = ids.some(id => CLEARABLE.has(state.jobs[id].status));
   jobAreaHeader.style.display = hasClearable ? 'flex' : 'none';
 
+  const visibleIds = new Set([
+    ...ids,
+    ...pendingFiles.map(file => file.pendingId),
+  ]);
   [...jobArea.querySelectorAll('.job-card')].forEach(el => {
-    if (!state.jobs[el.dataset.id]) el.remove();
+    if (!visibleIds.has(el.dataset.id)) el.remove();
   });
 
   ids.forEach(id => {
@@ -95,7 +100,9 @@ export function renderJobs() {
       ? Math.min(1, Math.max(0, current / total))
       : null;
     let pct = STAGE_PCT[activeStage] ?? PROGRESS_PCT[job.status] ?? 0;
-    if (activeStage === 'translation' && translatedRatio != null) {
+    if (job.status === 'done') {
+      pct = 100;
+    } else if (activeStage === 'translation' && translatedRatio != null) {
       pct = Math.round(76 + translatedRatio * 19);
     } else if (activeStage === 'asr_text_transcribe' && itemRatio != null) {
       pct = Math.round(43 + itemRatio * 20);
@@ -127,7 +134,7 @@ export function renderJobs() {
 
     const srtBtns = srtArtifacts.map(p => {
       const name = p.split(/[\\/]/).pop() || '';
-      return `<button class="btn-sm btn-dl" data-dl="${escHtml(id)}" data-file="${escHtml(name)}" title="${escHtml(name)}">⬇ ${escHtml(name)}</button>`;
+      return `<button class="btn-sm btn-open-artifact" data-open-artifact="${escHtml(id)}" data-file="${escHtml(name)}" title="用系统默认程序打开 ${escHtml(name)}">↗ ${escHtml(name)}</button>`;
     }).join('');
 
     const otherSection = otherArtifacts.length ? `
@@ -197,11 +204,51 @@ export function renderJobs() {
     // Keep the visual order aligned with the API's FIFO job order.
     jobArea.appendChild(card);
   });
+
+  pendingFiles.forEach(file => {
+    let card = jobArea.querySelector(`.job-card[data-id="${file.pendingId}"]`);
+    if (!card) {
+      card = document.createElement('div');
+      card.className = 'job-card job-card-pending';
+      card.dataset.id = file.pendingId;
+    }
+    const title = file.name || file.path || file.pendingId;
+    card.innerHTML = `
+      <div class="job-header">
+        <span class="job-title" title="${escHtml(file.path || title)}">${escHtml(title)}</span>
+        <span class="badge badge-pending">${STATUS_LABEL.pending}</span>
+      </div>
+      <div class="progress-bar"><div class="progress-fill pending" style="width:0%"></div></div>
+      <div class="job-footer">
+        <span class="job-stage">等待点击“开始任务”</span>
+        <button class="btn-sm btn-remove" data-remove-pending="${escHtml(file.pendingId)}" title="移出待开始列表">✕ 删除</button>
+      </div>`;
+    jobArea.appendChild(card);
+  });
 }
 
 // fetchAllJobs is injected from main.js to avoid circular imports
 export function installJobAreaHandlers(fetchAllJobs) {
   jobArea.addEventListener('click', async e => {
+    const pending = e.target.closest('[data-remove-pending]');
+    if (pending) {
+      state.files = state.files.filter(file => file.pendingId !== pending.dataset.removePending);
+      window.dispatchEvent(new Event('pending-files-changed'));
+      return;
+    }
+    const openArtifact = e.target.closest('[data-open-artifact]');
+    if (openArtifact) {
+      try {
+        const r = await fetch(
+          `/api/open-artifact?job_id=${encodeURIComponent(openArtifact.dataset.openArtifact)}&path=${encodeURIComponent(openArtifact.dataset.file)}`,
+          { method: 'POST' },
+        );
+        if (!r.ok) alert('打开字幕失败：' + await r.text());
+      } catch (error) {
+        alert('打开字幕失败：' + error.message);
+      }
+      return;
+    }
     const dl = e.target.closest('[data-dl]');
     if (dl) {
       const url = `/api/output/${encodeURIComponent(dl.dataset.dl)}/${encodeURIComponent(dl.dataset.file)}`;

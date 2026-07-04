@@ -15,7 +15,12 @@ from boundary.base import SpeechSegment
 
 log = logging.getLogger(__name__)
 
-BOUNDARY_CACHE_VERSION = 16
+# v17 invalidates v16 artifacts after the semantic Split batching and shared
+# sequence-feature matrix changes. Those changes intentionally preserve model
+# semantics, but reusing a cache produced by an intermediate implementation
+# makes a fresh job skip PTM entirely and prevents the new path from being
+# verified.
+BOUNDARY_CACHE_VERSION = 17
 _AUDIO_SAMPLE_BYTES = 2 * 1024 * 1024
 _AUDIO_KEY_RE = re.compile(r"^[0-9a-fA-F]{8,40}$")
 
@@ -83,6 +88,26 @@ def cache_enabled() -> bool:
 
 def cache_root() -> Path:
     return Path(os.getenv("BOUNDARY_CACHE_DIR", Path("tmp") / "cache" / "boundary")).resolve()
+
+
+def delete_for_audio_cache_key(audio_cache_key: str) -> int:
+    """Delete every Boundary cache variant produced for one extracted audio."""
+    key = str(audio_cache_key or "").strip().lower()
+    if _AUDIO_KEY_RE.fullmatch(key) is None:
+        return 0
+    root = cache_root()
+    if not root.is_dir():
+        return 0
+    removed = 0
+    for path in root.glob(f"{key}.*"):
+        if not path.is_file():
+            continue
+        try:
+            path.unlink()
+            removed += 1
+        except OSError:
+            log.warning("[boundary-cache] delete failed: %s", path, exc_info=True)
+    return removed
 
 
 def build_cache_lookup(
