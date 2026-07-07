@@ -149,6 +149,61 @@ def test_pre_asr_cueqc_candidate_includes_micro_numeric_features():
     assert candidate["features"]["left_split_score"] == 0.8
 
 
+def test_pre_asr_cueqc_v9_appends_split_edge_soft_features():
+    spans = [
+        PackedChunk(
+            start=0.0,
+            end=0.6,
+            speech_segments=[SpeechSegment(0.0, 0.6)],
+            duration=0.6,
+            split_reason="semantic_split_model",
+            primary_cut_candidates=[
+                {
+                    "kind": "primary",
+                    "time_s": 0.0,
+                    "proposal_time_s": 0.02,
+                    "p_cut": 0.91,
+                    "p_continue": 0.06,
+                    "p_unsure": 0.03,
+                    "role": "noise_to_speech",
+                    "p_role": 0.88,
+                    "noise_isolation_bracket": True,
+                    "bracket_pair_id": "noise-bracket-0.000000-0.600000",
+                },
+                {
+                    "kind": "primary",
+                    "time_s": 0.6,
+                    "proposal_time_s": 0.58,
+                    "p_cut": 0.94,
+                    "p_continue": 0.04,
+                    "p_unsure": 0.02,
+                    "role": "speech_to_noise",
+                    "p_role": 0.9,
+                    "noise_isolation_bracket": True,
+                    "bracket_pair_id": "noise-bracket-0.000000-0.600000",
+                },
+            ],
+            **_ptm_pooling_fields(),
+        )
+    ]
+
+    candidate = pre_asr_cueqc.candidate_from_span(spans, 0)
+
+    assert pre_asr_cueqc.PRE_ASR_CUEQC_FEATURE_SCHEMA == "pre_asr_cueqc_features_v9"
+    assert pre_asr_cueqc.PRE_ASR_CUEQC_SCALAR_FEATURE_NAMES[
+        : len(pre_asr_cueqc.PRE_ASR_CUEQC_V8_SCALAR_FEATURE_NAMES)
+    ] == pre_asr_cueqc.PRE_ASR_CUEQC_V8_SCALAR_FEATURE_NAMES
+    assert candidate["schema"] == "pre_asr_cueqc_features_v9"
+    assert candidate["pre_asr_split_edge_pair_id"] == "noise-bracket-0.000000-0.600000"
+    assert candidate["pre_asr_split_edges"]["left"]["kind"] == "split_cut"
+    assert candidate["pre_asr_split_edges"]["right"]["role"] == "speech_to_noise"
+    assert candidate["features"]["left_edge_is_split_cut"] == 1.0
+    assert candidate["features"]["right_edge_p_cut"] == pytest.approx(0.94)
+    assert candidate["features"]["left_edge_role_noise_to_speech"] == 1.0
+    assert candidate["features"]["right_edge_role_speech_to_noise"] == 1.0
+    assert candidate["features"]["left_right_same_noise_pair"] == 1.0
+
+
 def test_pre_asr_cueqc_candidate_uses_chunk_pooled_ptm_embedding():
     spans = [
         PackedChunk(

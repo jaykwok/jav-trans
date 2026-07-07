@@ -24,8 +24,8 @@ from boundary.sequence_features import (
 PRE_ASR_CUEQC_SCHEMA = "cueqc_pre_asr_semantic_chunk_v11_binary"
 PRE_ASR_CUEQC_MODEL_ARCH = "cueqc_pre_asr_semantic_chunk_v11"
 PRE_ASR_CUEQC_DECISION_VERSION = "pre_asr_cueqc_v11_binary_v1"
-PRE_ASR_CUEQC_FEATURE_SCHEMA = "pre_asr_cueqc_features_v8"
-PRE_ASR_CUEQC_RUNTIME_ADAPTER = "pre_asr_semantic_chunk_sequence_v3"
+PRE_ASR_CUEQC_FEATURE_SCHEMA = "pre_asr_cueqc_features_v9"
+PRE_ASR_CUEQC_RUNTIME_ADAPTER = "pre_asr_semantic_chunk_sequence_v4"
 PRE_ASR_CUEQC_ARTIFACT = {
     "name": "pre_asr_cueqc",
     "display_name": "Pre-ASR CueQC",
@@ -39,7 +39,7 @@ PRE_ASR_CUEQC_PTM_BINS = 8
 PRE_ASR_CUEQC_MODEL_PTM_TOKENS = PRE_ASR_CUEQC_PTM_BINS + 2
 PRE_ASR_CUEQC_DEFAULT_DROP_THRESHOLD = 0.95
 
-PRE_ASR_CUEQC_SCALAR_FEATURE_NAMES = (
+PRE_ASR_CUEQC_V8_SCALAR_FEATURE_NAMES = (
     "duration_s",
     "raw_start_s",
     "raw_end_s",
@@ -154,6 +154,44 @@ PRE_ASR_CUEQC_SCALAR_FEATURE_NAMES = (
     "next_below_subtitle_min_duration",
     "prev_micro_chunk_candidate",
     "next_micro_chunk_candidate",
+)
+PRE_ASR_CUEQC_SPLIT_EDGE_ROLES = (
+    "none",
+    "speech_to_speech",
+    "speech_to_noise",
+    "noise_to_speech",
+)
+PRE_ASR_CUEQC_V9_SCALAR_FEATURE_NAMES = (
+    "left_edge_is_split_cut",
+    "right_edge_is_split_cut",
+    "left_edge_is_island_edge",
+    "right_edge_is_island_edge",
+    "left_edge_noise_isolation_bracket",
+    "right_edge_noise_isolation_bracket",
+    "left_edge_p_cut",
+    "right_edge_p_cut",
+    "left_edge_p_continue",
+    "right_edge_p_continue",
+    "left_edge_p_unsure",
+    "right_edge_p_unsure",
+    "left_edge_p_role",
+    "right_edge_p_role",
+    "left_edge_role_none",
+    "right_edge_role_none",
+    "left_edge_role_speech_to_speech",
+    "right_edge_role_speech_to_speech",
+    "left_edge_role_speech_to_noise",
+    "right_edge_role_speech_to_noise",
+    "left_edge_role_noise_to_speech",
+    "right_edge_role_noise_to_speech",
+    "left_edge_role_unknown",
+    "right_edge_role_unknown",
+    "left_right_same_noise_pair",
+    "left_right_split_edge_gap_s",
+)
+PRE_ASR_CUEQC_SCALAR_FEATURE_NAMES = (
+    PRE_ASR_CUEQC_V8_SCALAR_FEATURE_NAMES
+    + PRE_ASR_CUEQC_V9_SCALAR_FEATURE_NAMES
 )
 PRE_ASR_CUEQC_POOLED_PTM_FEATURE_NAMES = tuple(
     chunk_pooled_ptm_feature_names(
@@ -300,6 +338,96 @@ def _top_split_values(span: Any) -> tuple[float, float, float, float, int]:
     return top1, top2, prom1, prom2, len(scored)
 
 
+def _boundary_primary_cut(span: Any, boundary_time: float) -> dict[str, Any] | None:
+    candidates = _cut_candidates_for_key(span, "primary_cut_candidates")
+    matches: list[dict[str, Any]] = []
+    for item in candidates:
+        try:
+            time_s = float(item.get("time_s"))
+        except (TypeError, ValueError):
+            continue
+        if abs(time_s - boundary_time) <= 1e-6:
+            matches.append(item)
+    if not matches:
+        return None
+    matches.sort(
+        key=lambda item: (
+            _safe_float(item.get("p_cut")),
+            _safe_float(item.get("p_role")),
+        ),
+        reverse=True,
+    )
+    return dict(matches[0])
+
+
+def _split_edge_payload(span: Any, boundary_time: float) -> dict[str, Any]:
+    cut = _boundary_primary_cut(span, boundary_time)
+    if cut is None:
+        return {
+            "kind": "island_edge",
+            "time_s": round(boundary_time, 6),
+            "proposal_time_s": round(boundary_time, 6),
+            "p_cut": 0.0,
+            "p_continue": 0.0,
+            "p_unsure": 0.0,
+            "role": "none",
+            "p_role": 0.0,
+            "noise_isolation_bracket": False,
+            "bracket_pair_id": "",
+        }
+    return {
+        "kind": "split_cut",
+        "time_s": round(_safe_float(cut.get("time_s"), boundary_time), 6),
+        "proposal_time_s": round(_safe_float(cut.get("proposal_time_s"), boundary_time), 6),
+        "p_cut": _safe_float(cut.get("p_cut")),
+        "p_continue": _safe_float(cut.get("p_continue")),
+        "p_unsure": _safe_float(cut.get("p_unsure")),
+        "role": str(cut.get("role") or "none"),
+        "p_role": _safe_float(cut.get("p_role")),
+        "noise_isolation_bracket": bool(cut.get("noise_isolation_bracket")),
+        "bracket_pair_id": str(cut.get("bracket_pair_id") or ""),
+    }
+
+
+def _split_edge_features(
+    *,
+    prefix: str,
+    edge: Mapping[str, Any],
+) -> dict[str, float]:
+    role = str(edge.get("role") or "none")
+    values = {
+        f"{prefix}_edge_is_split_cut": 1.0 if edge.get("kind") == "split_cut" else 0.0,
+        f"{prefix}_edge_is_island_edge": 1.0 if edge.get("kind") == "island_edge" else 0.0,
+        f"{prefix}_edge_noise_isolation_bracket": _bool_feature(
+            edge.get("noise_isolation_bracket")
+        ),
+        f"{prefix}_edge_p_cut": _safe_float(edge.get("p_cut")),
+        f"{prefix}_edge_p_continue": _safe_float(edge.get("p_continue")),
+        f"{prefix}_edge_p_unsure": _safe_float(edge.get("p_unsure")),
+        f"{prefix}_edge_p_role": _safe_float(edge.get("p_role")),
+    }
+    for known_role in PRE_ASR_CUEQC_SPLIT_EDGE_ROLES:
+        values[f"{prefix}_edge_role_{known_role}"] = 1.0 if role == known_role else 0.0
+    values[f"{prefix}_edge_role_unknown"] = (
+        1.0 if role not in PRE_ASR_CUEQC_SPLIT_EDGE_ROLES else 0.0
+    )
+    return values
+
+
+def _split_edge_pair_features(left: Mapping[str, Any], right: Mapping[str, Any]) -> dict[str, float]:
+    left_pair = str(left.get("bracket_pair_id") or "")
+    right_pair = str(right.get("bracket_pair_id") or "")
+    same_pair = bool(left_pair and right_pair and left_pair == right_pair)
+    return {
+        "left_right_same_noise_pair": 1.0 if same_pair else 0.0,
+        "left_right_split_edge_gap_s": (
+            abs(_safe_float(right.get("time_s")) - _safe_float(left.get("time_s")))
+            if left.get("kind") == "split_cut" and right.get("kind") == "split_cut"
+            else 0.0
+        ),
+    }
+
+
 def _planned_island_key(span: Any, index: int) -> str:
     for key in ("planned_island_id", "parent_chunk_id", "island_id"):
         value = _packed_value(span, key)
@@ -439,6 +567,8 @@ def candidate_from_span(
         0.0,
         _safe_float(_packed_value(span, "acoustic_duration"), acoustic_end - acoustic_start),
     )
+    left_split_edge = _split_edge_payload(span, start)
+    right_split_edge = _split_edge_payload(span, end)
     pooled_values, pooled_available, pooling_schema, pooling_bins, pooling_dim = _pooled_ptm_values(
         span,
         require_ptm_pooling=require_ptm_pooling,
@@ -639,6 +769,9 @@ def candidate_from_span(
         "num_chunks_in_planned_island": float(group_count),
         "is_first_chunk": 1.0 if position == 0 else 0.0,
         "is_last_chunk": 1.0 if position + 1 >= group_count else 0.0,
+        **_split_edge_features(prefix="left", edge=left_split_edge),
+        **_split_edge_features(prefix="right", edge=right_split_edge),
+        **_split_edge_pair_features(left_split_edge, right_split_edge),
         **neighbor_left,
         **neighbor_right,
     }
@@ -673,6 +806,16 @@ def candidate_from_span(
         "refiner_safety_reason": str(_packed_value(span, "refiner_safety_reason", "") or ""),
         "refiner_fallback_used": bool(features["refiner_fallback_used"]),
         "refiner_shared_boundary_adjusted": bool(features["refiner_shared_boundary_adjusted"]),
+        "pre_asr_split_edges": {
+            "left": left_split_edge,
+            "right": right_split_edge,
+        },
+        "pre_asr_split_edge_pair_id": (
+            left_split_edge["bracket_pair_id"]
+            if left_split_edge["bracket_pair_id"]
+            and left_split_edge["bracket_pair_id"] == right_split_edge["bracket_pair_id"]
+            else ""
+        ),
         "features": features,
         "scalar_feature_names": list(PRE_ASR_CUEQC_SCALAR_FEATURE_NAMES),
         "ptm_bin_feature_names": list(PRE_ASR_CUEQC_PTM_BIN_FEATURE_NAMES),
@@ -685,10 +828,14 @@ def candidate_from_span(
     }
 
 
-def scalar_vector(candidate: Mapping[str, Any]) -> np.ndarray:
+def scalar_vector(
+    candidate: Mapping[str, Any],
+    *,
+    feature_names: Sequence[str] = PRE_ASR_CUEQC_SCALAR_FEATURE_NAMES,
+) -> np.ndarray:
     features = candidate.get("features") if isinstance(candidate.get("features"), Mapping) else {}
     return np.asarray(
-        [_safe_float(features.get(name)) for name in PRE_ASR_CUEQC_SCALAR_FEATURE_NAMES],
+        [_safe_float(features.get(name)) for name in feature_names],
         dtype=np.float32,
     )
 
@@ -717,12 +864,14 @@ def planned_island_sequences(
 
 def sequence_tensors(
     candidates: Sequence[Mapping[str, Any]],
+    *,
+    scalar_feature_names: Sequence[str] = PRE_ASR_CUEQC_SCALAR_FEATURE_NAMES,
 ) -> dict[str, np.ndarray | list[tuple[int, int]]]:
     groups = planned_island_sequences(candidates)
     batch = len(groups)
     max_chunks = max((len(group) for group in groups), default=0)
     scalar = np.zeros(
-        (batch, max_chunks, len(PRE_ASR_CUEQC_SCALAR_FEATURE_NAMES)),
+        (batch, max_chunks, len(scalar_feature_names)),
         dtype=np.float32,
     )
     bins = np.zeros(
@@ -734,7 +883,10 @@ def sequence_tensors(
     positions: list[tuple[int, int]] = [(-1, -1)] * len(candidates)
     for group_index, group in enumerate(groups):
         for chunk_index, (original_index, candidate) in enumerate(group):
-            scalar[group_index, chunk_index] = scalar_vector(candidate)
+            scalar[group_index, chunk_index] = scalar_vector(
+                candidate,
+                feature_names=scalar_feature_names,
+            )
             matrix, mask = ptm_bin_matrix(candidate)
             bins[group_index, chunk_index] = matrix
             bin_mask[group_index, chunk_index] = mask
@@ -947,8 +1099,16 @@ class PreAsrCueQC:
                 metadata_key="metadata.asr_repo_id",
             )
         feature_names = tuple(str(item) for item in checkpoint.get("feature_names") or ())
-        if feature_names != PRE_ASR_CUEQC_SCALAR_FEATURE_NAMES:
-            raise ValueError("Pre-ASR CueQC scalar feature_names do not match runtime schema")
+        if not feature_names:
+            raise ValueError("Pre-ASR CueQC checkpoint feature_names must not be empty")
+        unknown_feature_names = [
+            name for name in feature_names if name not in PRE_ASR_CUEQC_SCALAR_FEATURE_NAMES
+        ]
+        if unknown_feature_names:
+            raise ValueError(
+                "Pre-ASR CueQC checkpoint feature_names contain unknown v9 fields: "
+                + ", ".join(unknown_feature_names[:5])
+            )
         lowered = " ".join(PRE_ASR_CUEQC_FEATURE_NAMES).lower()
         if any(token in lowered for token in _BANNED_FEATURE_TOKENS):
             raise ValueError("Pre-ASR CueQC feature schema must not contain ASR text/token/decoder fields")
@@ -956,7 +1116,7 @@ class PreAsrCueQC:
         config = make_model_config(checkpoint.get("model_config"))
         if config["ptm_dim"] != PRE_ASR_CUEQC_PTM_DIM:
             raise ValueError("Pre-ASR CueQC model_config.ptm_dim does not match runtime")
-        if config["scalar_dim"] != len(PRE_ASR_CUEQC_SCALAR_FEATURE_NAMES):
+        if config["scalar_dim"] != len(feature_names):
             raise ValueError("Pre-ASR CueQC model_config.scalar_dim does not match runtime")
         self.model = PreAsrCueQCNetwork(**config)
         state = checkpoint.get("model_state_dict")
@@ -974,17 +1134,16 @@ class PreAsrCueQC:
         self.sha256 = _file_sha256(path)
         self.metadata = metadata
         self.config = config
+        self.scalar_feature_names = feature_names
         self.mean = np.asarray(
-            checkpoint.get("feature_mean", [0.0] * len(PRE_ASR_CUEQC_SCALAR_FEATURE_NAMES)),
+            checkpoint.get("feature_mean", [0.0] * len(feature_names)),
             dtype=np.float32,
         )
         self.std = np.asarray(
-            checkpoint.get("feature_std", [1.0] * len(PRE_ASR_CUEQC_SCALAR_FEATURE_NAMES)),
+            checkpoint.get("feature_std", [1.0] * len(feature_names)),
             dtype=np.float32,
         )
-        if self.mean.shape[0] != len(PRE_ASR_CUEQC_SCALAR_FEATURE_NAMES) or self.std.shape[0] != len(
-            PRE_ASR_CUEQC_SCALAR_FEATURE_NAMES
-        ):
+        if self.mean.shape[0] != len(feature_names) or self.std.shape[0] != len(feature_names):
             raise ValueError("Pre-ASR CueQC scalar normalization shape mismatch")
         decision = dict(checkpoint.get("decision_config") or {})
         self.drop_threshold = float(
@@ -1010,6 +1169,7 @@ class PreAsrCueQC:
             "sha256": self.sha256,
             "drop_threshold": self.drop_threshold,
             "inference_window_size": self.inference_window_size,
+            "feature_names": list(self.scalar_feature_names),
             "metadata": self.metadata,
         }
 
@@ -1073,7 +1233,10 @@ class PreAsrCueQC:
 
         if not candidates:
             return []
-        tensors = sequence_tensors(candidates)
+        tensors = sequence_tensors(
+            candidates,
+            scalar_feature_names=self.scalar_feature_names,
+        )
         scalar = np.asarray(tensors["scalar_features"], dtype=np.float32)
         scalar = (scalar - self.mean.reshape(1, 1, -1)) / np.maximum(
             self.std.reshape(1, 1, -1),

@@ -365,11 +365,19 @@ def test_noise_isolation_bracket_exempts_min_spacing():
     middle = chunks[1]
     assert round(middle.end - middle.start, 2) == 0.6
     assert middle.primary_cut_candidates[0]["noise_isolation_bracket"] is True
+    assert middle.primary_cut_candidates[0]["bracket_pair_id"]
     assert {
         candidate["role"]
         for chunk in chunks
         for candidate in chunk.primary_cut_candidates
     } == {"speech_to_noise", "noise_to_speech"}
+    pair_ids = {
+        candidate["bracket_pair_id"]
+        for chunk in chunks
+        for candidate in chunk.primary_cut_candidates
+        if candidate.get("noise_isolation_bracket")
+    }
+    assert len(pair_ids) == 1
 
 
 def test_close_cuts_without_bracket_roles_keep_min_spacing():
