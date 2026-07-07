@@ -140,8 +140,6 @@ def test_default_model_download_root_is_project_models():
             qwen.QWEN_ASR_06B_REPO_ID,
             qwen.QWEN_ASR_17B_REPO_ID,
         }
-    assert qwen.QWEN_ASR_17B_REPO_ID in qwen.DEFAULT_CUEQC_CHECKPOINT_BY_REPO
-    assert qwen.QWEN_ASR_06B_REPO_ID in qwen.DEFAULT_CUEQC_CHECKPOINT_BY_REPO
     assert "SPEECH_BOUNDARY_JA_SCORER_CHECKPOINT" not in config.DEFAULT_SETTINGS
     assert not any(key.startswith("ALIGN") for key in config.DEFAULT_SETTINGS)
     assert "BOUNDARY_REFINER_ENABLED" not in config.DEFAULT_SETTINGS

@@ -612,10 +612,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Speech deactivation threshold. Defaults to --speech-boundary-threshold.",
     )
     parser.add_argument("--speech-boundary-frame-dilation-s", dest="speech_boundary_frame_dilation_s", type=float, default=_env_float("SPEECH_BOUNDARY_JA_FRAME_DILATION_S", 0.2))
-    parser.add_argument("--speech-boundary-split-score-quantile", dest="speech_boundary_split_score_quantile", type=float, default=_env_float("SPEECH_BOUNDARY_JA_SPLIT_SCORE_QUANTILE", 0.50))
-    parser.add_argument("--speech-boundary-split-prominence-quantile", dest="speech_boundary_split_prominence_quantile", type=float, default=_env_float("SPEECH_BOUNDARY_JA_SPLIT_PROMINENCE_QUANTILE", 0.50))
+    parser.add_argument("--speech-boundary-split-score-quantile", dest="speech_boundary_split_score_quantile", type=float, default=_env_float("SPEECH_BOUNDARY_JA_SPLIT_SCORE_QUANTILE", 0.10))
+    parser.add_argument("--speech-boundary-split-prominence-quantile", dest="speech_boundary_split_prominence_quantile", type=float, default=_env_float("SPEECH_BOUNDARY_JA_SPLIT_PROMINENCE_QUANTILE", 0.10))
     parser.add_argument("--speech-boundary-split-smooth-s", dest="speech_boundary_split_smooth_s", type=float, default=_env_float("SPEECH_BOUNDARY_JA_SPLIT_SMOOTH_S", 0.08))
-    parser.add_argument("--speech-boundary-split-nms-s", dest="speech_boundary_split_nms_s", type=float, default=_env_float("SPEECH_BOUNDARY_JA_SPLIT_NMS_S", 0.20))
+    parser.add_argument("--speech-boundary-split-nms-s", dest="speech_boundary_split_nms_s", type=float, default=_env_float("SPEECH_BOUNDARY_JA_SPLIT_NMS_S", 0.12))
     parser.add_argument("--speech-boundary-split-snap-s", dest="speech_boundary_split_snap_s", type=float, default=_env_float("SPEECH_BOUNDARY_JA_SPLIT_SNAP_S", 0.10))
     parser.add_argument("--speech-boundary-min-split-segment-s", dest="speech_boundary_min_split_segment_s", type=float, default=_env_float("SPEECH_BOUNDARY_JA_MIN_SPLIT_SEGMENT_S", 0.08))
     parser.add_argument(

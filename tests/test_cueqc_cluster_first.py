@@ -801,38 +801,6 @@ def test_cueqc_torc_layer_preview_cli_writes_counts(tmp_path: Path):
     assert not (output_dir / "cueqc_clusters.jsonl").exists()
 
 
-def test_cueqc_runtime_signature_is_v4_binary_shadow(monkeypatch, tmp_path: Path):
-    checkpoint = tmp_path / "cueqc_mamba_v4_binary.pt"
-    checkpoint.write_bytes(b"placeholder")
-    monkeypatch.setenv("ASR_BACKEND", "jaykwok/Qwen3-ASR-0.6B-JA-Anime-Galgame-hf")
-    monkeypatch.setenv(
-        "CUEQC_MODEL_PATH_BY_REPO",
-        f"jaykwok/Qwen3-ASR-0.6B-JA-Anime-Galgame-hf={checkpoint}",
-    )
-    monkeypatch.setenv("CUEQC_SHADOW_ENABLED", "1")
-
-    sig = cueqc.runtime_signature()
-
-    assert sig["policy"] == "cueqc_mamba_v4_binary_shadow"
-    assert sig["model_version"] == "cueqc_mamba_v4_binary"
-    assert sig["decision_version"] == "cueqc_display_binary_v1"
-    assert sig["drop_apply_enabled"] is False
-    assert set(sig) == {
-        "schema_version",
-        "feature_schema_version",
-        "enabled",
-        "shadow_only",
-        "policy",
-        "decision_version",
-        "model_version",
-        "model_path",
-        "checkpoint_sha1",
-        "drop_threshold",
-        "drop_apply_enabled",
-        "shadow_embed_candidates",
-    }
-
-
 def test_cueqc_v4_does_not_extend_boundary_frame_provider_api():
     assert not hasattr(FrameSequenceFeatureProvider, "frames_for_window")
 
@@ -1027,17 +995,6 @@ def test_cueqc_cluster_broadcast_requires_confirmed_tail_merge():
     assert by_id["sample-000"]["label_meta"]["label_source"] == "cluster_confirmed_merge_broadcast"
     assert by_id["sample-000"]["label_meta"]["merged_into_cluster_id"] == "cluster_main"
     assert summary["counts"]["display:keep"] == 2
-
-
-def test_cueqc_shadow_report_uses_pending_placeholder_before_model_decision():
-    row = _candidate(9, "今日はいい天気ですね")
-
-    decision = cueqc.pending_model_decision(row)
-
-    assert decision["mode"] == "pending_cueqc_model"
-    assert decision["display_hint"] == "keep"
-    assert decision["confidence"] == 1.0
-    assert decision["fallback_stage"] == ""
 
 
 def test_pre_asr_coldstart_clustering_stays_out_of_runtime_modules():

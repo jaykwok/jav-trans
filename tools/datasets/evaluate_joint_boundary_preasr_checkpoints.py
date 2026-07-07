@@ -17,6 +17,7 @@ for value in (PROJECT_ROOT, SRC_ROOT):
         sys.path.insert(0, str(value))
 
 from asr.pre_asr_cueqc import load_checkpoint as load_pre_asr  # noqa: E402
+from boundary.sequence_store import load_sequence_arrays  # noqa: E402
 from boundary.split_model import load_semantic_split_verifier  # noqa: E402
 from tools.asr.cueqc.compile_pre_asr_v11_features import (  # noqa: E402
     candidate_for_chunk,
@@ -73,7 +74,7 @@ def _evaluate_split(
     device: str,
     repo_id: str,
 ) -> dict[str, Any]:
-    bundle = np.load(dataset / "semantic_split" / "features.npz")
+    bundle = load_sequence_arrays(dataset / "semantic_split" / "features.npz")
     model = load_semantic_split_verifier(
         checkpoint,
         device=device,

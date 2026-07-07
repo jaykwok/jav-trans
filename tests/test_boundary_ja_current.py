@@ -45,3 +45,49 @@ def test_decoder_uses_high_recall_default_threshold() -> None:
     config = SpeechBoundaryJaConfig()
     assert config.threshold == 0.15
     assert config.sequence_feature_max_ptm_dims == 128
+
+
+def test_proposal_checkpoint_without_mapping_keeps_bootstrap(monkeypatch) -> None:
+    from boundary.ja.backend import _proposal_checkpoint_from_env
+
+    monkeypatch.delenv(
+        "SPEECH_BOUNDARY_JA_PROPOSAL_CHECKPOINT_BY_REPO", raising=False
+    )
+    # Pin the registry default mapping to empty: with neither env nor registry
+    # entry the repo stays on bootstrap candidates (split-v1 chains only).
+    monkeypatch.setattr(
+        "boundary.ja.backend.DEFAULT_SPEECH_BOUNDARY_PROPOSAL_CHECKPOINT_BY_REPO",
+        {},
+    )
+    assert (
+        _proposal_checkpoint_from_env("jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame-hf")
+        == ""
+    )
+    assert SpeechBoundaryJaConfig().proposal_checkpoint == ""
+
+
+def test_proposal_checkpoint_env_maps_by_repo(monkeypatch, tmp_path) -> None:
+    from boundary.ja.backend import _proposal_checkpoint_from_env
+
+    repo_id = "jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame-hf"
+    checkpoint = tmp_path / "boundary_proposal_scorer_v1.pt"
+    checkpoint.write_bytes(b"")
+    monkeypatch.setenv(
+        "SPEECH_BOUNDARY_JA_PROPOSAL_CHECKPOINT_BY_REPO",
+        f"{repo_id}={checkpoint}",
+    )
+    assert _proposal_checkpoint_from_env(repo_id) == str(checkpoint)
+
+
+def test_signature_candidate_source_tracks_proposal_checkpoint() -> None:
+    from boundary.ja.backend import SpeechBoundaryJaBackend
+
+    bootstrap = SpeechBoundaryJaBackend(
+        config=SpeechBoundaryJaConfig(proposal_checkpoint="")
+    )
+    assert bootstrap.signature()["candidate_source"] == "bootstrap_energy_ptm_mfcc_v1"
+
+    learned = SpeechBoundaryJaBackend(
+        config=SpeechBoundaryJaConfig(proposal_checkpoint="proposal.pt")
+    )
+    assert learned.signature()["candidate_source"] == "learned_boundary_proposal_v1"

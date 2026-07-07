@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import importlib
 
+import numpy as np
+
 from helpers import ASR_06B_BACKEND, ASR_17B_BACKEND
 
 
@@ -90,6 +92,25 @@ def test_checkpoint_key_changes_with_qwen_generation_inputs(monkeypatch):
     )
 
     assert default_key != tuned_key
+
+
+def test_checkpoint_key_accepts_numpy_boundary_signature(monkeypatch):
+    monkeypatch.setenv("ASR_BACKEND", ASR_17B_BACKEND)
+
+    from asr import pipeline as asr
+    asr = importlib.reload(asr)
+    asr._set_last_boundary_signature(
+        {
+            "backend": "speech_boundary_ja",
+            "threshold": np.float32(0.2),
+            "diagnostic_scores": np.asarray([0.1, 0.2], dtype=np.float32),
+        }
+    )
+
+    checkpoint_name = asr._get_asr_checkpoint_path("sample.wav").name
+
+    assert checkpoint_name.startswith("asr_checkpoint_")
+    assert checkpoint_name.endswith(".json")
 
 
 def test_checkpoint_excludes_quarantined_results():

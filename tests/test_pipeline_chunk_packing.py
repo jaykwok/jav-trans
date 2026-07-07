@@ -6,6 +6,8 @@ import sys
 import wave
 from pathlib import Path
 
+import numpy as np
+
 from audio.chunk_packer import PackedChunk
 from boundary.base import SegmentationResult, SpeechSegment
 from boundary.sequence_features import (
@@ -166,9 +168,6 @@ class _RecordingBackend:
                 }
             )
         return results
-
-    def capture_asr_internals(self, chunks):
-        return [{"ok": True} for _chunk in chunks]
 
     def finalize_text_results(self, text_results, on_stage=None):
         del on_stage
@@ -398,6 +397,67 @@ def test_pipeline_exports_pre_asr_candidates_only_when_requested(monkeypatch, tm
     assert rows[0]["sample_id"] == "preasr-source_boundary-chunk00000"
     assert rows[0]["feature_names"]
     assert any("Pre-ASR CueQC: exported candidates" in entry for entry in log)
+
+
+def test_pre_asr_candidates_accept_numpy_pooled_features(monkeypatch, tmp_path):
+    asr = _reload_pipeline(monkeypatch, tmp_path)
+    source = tmp_path / "source_boundary.wav"
+    values = np.asarray(_pre_asr_ptm_values(), dtype=np.float32)
+    span = PackedChunk(
+        start=0.0,
+        end=0.8,
+        source_abs_start=0.0,
+        source_abs_end=0.8,
+        speech_segments=[SpeechSegment(0.0, 0.8, 0.9)],
+        duration=0.8,
+        split_reason="semantic_boundary",
+        boundary_source="speech_island",
+        pre_asr_ptm_pooling_schema=CHUNK_POOLED_PTM_SCHEMA,
+        pre_asr_ptm_pooling_bins=PRE_ASR_CUEQC_PTM_BINS,
+        pre_asr_ptm_pooling_dim=len(values),
+        pre_asr_ptm_pooled_features=values,
+    )
+
+    candidates = asr._pre_asr_candidates_for_spans(str(source), [span])
+
+    assert isinstance(candidates[0]["pre_asr_ptm_pooled_features"], list)
+    assert candidates[0]["ptm_pooling_available"] is True
+    json.dumps(candidates, ensure_ascii=False)
+
+
+def test_pre_asr_candidate_export_sanitizes_numpy_values(monkeypatch, tmp_path):
+    import asr.pipeline as asr
+
+    asr = importlib.reload(asr)
+    export_path = tmp_path / "pre_asr_candidates.jsonl"
+    monkeypatch.setenv("PRE_ASR_CUEQC_EXPORT_CANDIDATES_PATH", str(export_path))
+    monkeypatch.setenv("PRE_ASR_CUEQC_EXPORT_CANDIDATES_APPEND", "0")
+    log: list[str] = []
+
+    asr._write_pre_asr_candidates_if_requested(
+        [{"sample_id": "numpy", "scores": np.asarray([0.25, 0.75], dtype=np.float32)}],
+        log=log,
+    )
+
+    row = json.loads(export_path.read_text(encoding="utf-8").strip())
+    assert row["scores"] == [0.25, 0.75]
+    assert any("Pre-ASR CueQC: exported candidates" in entry for entry in log)
+
+
+def test_json_payload_summarizes_large_numpy_arrays(monkeypatch, tmp_path):
+    asr = _reload_pipeline(monkeypatch, tmp_path)
+    payload = asr._json_payload(
+        {
+            "small": np.asarray([1.0, 2.0], dtype=np.float32),
+            "large": np.ones((65, 65), dtype=np.float32),
+        }
+    )
+
+    assert payload["small"] == [1.0, 2.0]
+    assert payload["large"]["array_type"] == "ndarray"
+    assert payload["large"]["dtype"] == "float32"
+    assert payload["large"]["shape"] == [65, 65]
+    assert len(payload["large"]["sha256"]) == 64
 
 
 def test_pipeline_export_candidates_append_disabled_only_overwrites_once(monkeypatch, tmp_path):

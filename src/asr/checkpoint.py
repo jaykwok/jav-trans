@@ -5,6 +5,7 @@ import re
 import uuid
 import wave
 from pathlib import Path
+from typing import Any
 
 from asr.backends.registry import (
     current_asr_backend,
@@ -105,8 +106,43 @@ def _env_lower(name: str, default: str = "") -> str:
     return _env_text(name, default).lower()
 
 
+def _jsonable(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {
+            str(key): _jsonable(item)
+            for key, item in sorted(value.items(), key=lambda pair: str(pair[0]))
+        }
+    if isinstance(value, (list, tuple, set)):
+        return [_jsonable(item) for item in value]
+    if isinstance(value, Path):
+        return str(value)
+    if isinstance(value, (str, int, bool)) or value is None:
+        return value
+    if isinstance(value, float):
+        return value if value == value and value not in {float("inf"), float("-inf")} else None
+    try:
+        import numpy as np
+
+        if isinstance(value, np.generic):
+            return _jsonable(value.item())
+        if isinstance(value, np.ndarray):
+            if value.ndim == 0:
+                return _jsonable(value.item())
+            array = np.ascontiguousarray(value)
+            digest = hashlib.sha256(array.tobytes()).hexdigest()
+            return {
+                "array_type": "ndarray",
+                "dtype": str(array.dtype),
+                "shape": [int(item) for item in array.shape],
+                "sha256": digest,
+            }
+    except Exception:
+        pass
+    return str(value)
+
+
 def _signature_json(payload: dict) -> str:
-    return json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return json.dumps(_jsonable(payload), ensure_ascii=False, sort_keys=True, separators=(",", ":"))
 
 
 def _json_or_text(value: str) -> dict | str:
@@ -147,7 +183,7 @@ def _get_asr_runtime_signature(
             "asr_repetition_penalty": _env_text("ASR_REPETITION_PENALTY", "1.05"),
         },
         "pre_asr_cueqc": pre_asr_cueqc_runtime_signature(),
-        "boundary": boundary_signature if isinstance(boundary_signature, dict) else {},
+        "boundary": _jsonable(boundary_signature) if isinstance(boundary_signature, dict) else {},
     }
 
 
@@ -295,7 +331,7 @@ def _save_asr_checkpoint(
             chunks,
             last_boundary_signature=last_boundary_signature,
         ),
-        "results": {str(key): value for key, value in sorted(results_by_index.items())},
+        "results": _jsonable({str(key): value for key, value in sorted(results_by_index.items())}),
     }
     if run_id:
         payload["run_id"] = run_id
@@ -304,7 +340,7 @@ def _save_asr_checkpoint(
     )
     try:
         with open(tmp_path, "w", encoding="utf-8") as writer:
-            json.dump(payload, writer, ensure_ascii=False)
+            json.dump(_jsonable(payload), writer, ensure_ascii=False)
         tmp_path.replace(checkpoint_path)
     finally:
         _delete_path_for_cleanup(tmp_path)
