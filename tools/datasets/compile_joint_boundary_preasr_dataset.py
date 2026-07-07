@@ -24,7 +24,7 @@ from boundary.sequence_store import (  # noqa: E402
     StreamingFrameWriter,
     save_sequence_dataset,
 )
-from tools.asr.cueqc.compile_pre_asr_v11_features import (  # noqa: E402
+from tools.asr.cueqc.compile_pre_asr_v12_features import (  # noqa: E402
     compile_features,
     normalize_label,
 )
@@ -341,7 +341,7 @@ def _write_dataset_card(
         "- `omni_mp3_32k/`: 实际提交给 Omni 的 32 kbps MP3，每个窗口一次请求。",
         "- `annotations/omni_joint/`: 请求、原始响应与逐窗口联合标签。",
         "- `semantic_split/`: 切点标签与可直接训练的 `features.npz`。",
-        "- `pre_asr/`: keep/drop/unsure 标签、分类 WAV 切片与 v11 `features.pt`。",
+        "- `pre_asr/`: keep/drop/unsure 标签、分类 WAV 切片与 v12 `features.pt`。",
         "- `features/<window_id>/`: 每个窗口的原始 Split / PTM / Pre-ASR 特征。",
         "",
         "## Counts",

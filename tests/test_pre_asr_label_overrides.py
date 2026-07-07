@@ -6,7 +6,7 @@ from pathlib import Path
 import pytest
 
 from asr.pre_asr_cueqc import PRE_ASR_CUEQC_IGNORE_LABEL
-from tools.asr.cueqc.compile_pre_asr_v11_features import read_labels
+from tools.asr.cueqc.compile_pre_asr_v12_features import read_labels
 from tools.datasets.build_pre_asr_label_overrides import build_overrides
 from tools.datasets.compile_joint_boundary_preasr_dataset import (
     _pre_asr_override_summary,
