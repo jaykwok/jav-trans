@@ -15,12 +15,9 @@ from boundary.base import SpeechSegment
 
 log = logging.getLogger(__name__)
 
-# v17 invalidates v16 artifacts after the semantic Split batching and shared
-# sequence-feature matrix changes. Those changes intentionally preserve model
-# semantics, but reusing a cache produced by an intermediate implementation
-# makes a fresh job skip PTM entirely and prevents the new path from being
-# verified.
-BOUNDARY_CACHE_VERSION = 17
+# v18 invalidates v17 artifacts because Pre-ASR CueQC v9 consumes split-edge
+# soft decisions and bracket-pair metadata stored on packed chunks.
+BOUNDARY_CACHE_VERSION = 18
 _AUDIO_SAMPLE_BYTES = 2 * 1024 * 1024
 _AUDIO_KEY_RE = re.compile(r"^[0-9a-fA-F]{8,40}$")
 

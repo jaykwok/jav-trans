@@ -657,6 +657,7 @@ def _accepted_proposals(
     selected: list[tuple[dict, SplitDecision]] = []
     brackets: set[int] = set()
     for candidate, decision in accepted:
+        candidate = dict(candidate)
         time_s = float(candidate["time_s"])
         edge_gap = min(abs(time_s - core_start), abs(time_s - core_end))
         if edge_gap < config.min_chunk_after_split_s:
@@ -684,6 +685,11 @@ def _accepted_proposals(
         )
         if not _is_noise_bracket_pair(first_role, second_role):
             continue
+        pair_start = min(partner_time, time_s)
+        pair_end = max(partner_time, time_s)
+        pair_id = f"noise-bracket-{pair_start:.6f}-{pair_end:.6f}"
+        partner_candidate["bracket_pair_id"] = pair_id
+        candidate["bracket_pair_id"] = pair_id
         brackets.add(near[0])
         brackets.add(len(selected))
         selected.append((candidate, decision))
@@ -807,6 +813,8 @@ def _materialize_chunks(
                 "p_cut": decision.p_cut,
                 "p_continue": decision.p_continue,
                 "p_unsure": decision.p_unsure,
+                "role": decision.role,
+                "p_role": decision.p_role,
             }
         )
     boundaries = [core_start, *(float(item["time_s"]) for item in cuts), core_end]
