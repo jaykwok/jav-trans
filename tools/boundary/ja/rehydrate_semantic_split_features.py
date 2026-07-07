@@ -20,6 +20,8 @@ from boundary.ja.model import (  # noqa: E402
 from boundary.sequence_features import (  # noqa: E402
     FrameSequenceFeatureConfig,
     FrameSequenceFeatureProvider,
+    load_ptm_projection,
+    parse_extra_context_scales,
 )
 
 
@@ -76,6 +78,8 @@ def run(args: argparse.Namespace) -> None:
     ]
     frame_rows: list[np.ndarray] = []
     scalar_rows: list[np.ndarray] = []
+    extra_context_scales = parse_extra_context_scales(args.extra_context_scales)
+    ptm_projection = load_ptm_projection(args.ptm_projection)
     for row in rows:
         frames, scalars = provider.features_for_split_candidate(
             core_start_s=float(row["core_start"]),
@@ -89,6 +93,13 @@ def run(args: argparse.Namespace) -> None:
             gap_bins=4,
             right_bins=8,
             ptm_dim=args.ptm_dim,
+            extra_context_scales=extra_context_scales,
+            ptm_projection_mean=(
+                ptm_projection["mean"] if ptm_projection else None
+            ),
+            ptm_projection_components=(
+                ptm_projection["components"] if ptm_projection else None
+            ),
         )
         frame_rows.append(frames)
         scalar_rows.append(scalars)
@@ -126,6 +137,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--ptm-repo-id", required=True)
     parser.add_argument("--output", required=True)
     parser.add_argument("--ptm-dim", type=int, default=128)
+    parser.add_argument("--extra-context-scales", default="3.2:4,6.4:4")
+    parser.add_argument("--ptm-projection", default="")
     parser.add_argument("--device", default="cuda")
     return parser.parse_args()
 

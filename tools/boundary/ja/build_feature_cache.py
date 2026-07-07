@@ -33,6 +33,7 @@ from boundary.ja import (
     write_feature_cache,
 )
 from audio.loading import load_audio_16k_mono
+from boundary.gpu_safety import apply_vram_safety_cap
 
 
 def _write_jsonl_row(handle: Any, row: Mapping[str, Any]) -> None:
@@ -394,6 +395,7 @@ def _extract_ptm_window_features(
 
 
 def run(args: argparse.Namespace) -> None:
+    apply_vram_safety_cap()
     output_dir = Path(args.output_dir)
     feature_dir = output_dir / "features"
     output_dir.mkdir(parents=True, exist_ok=True)

@@ -10,8 +10,15 @@ from audio.chunk_packer import PackedChunk
 from boundary.base import SpeechSegment
 from boundary.cut_refiner import CutEdgeRefiner
 from boundary.outer_refiner import OuterEdgeRefiner
-from boundary.sequence_features import FrameSequenceFeatureProvider
-from boundary.split_model import SemanticSplitVerifier, SplitDecision
+from boundary.sequence_features import (
+    FrameSequenceFeatureProvider,
+    ptm_projection_digest,
+)
+from boundary.split_model import (
+    SemanticSplitIslandVerifier,
+    SemanticSplitVerifier,
+    SplitDecision,
+)
 
 
 @dataclass(frozen=True)
@@ -22,6 +29,31 @@ class SemanticBoundaryConfig:
     min_chunk_after_split_s: float = 1.2
 
 
+def _effective_semantic_config(
+    split_verifier,
+    config: SemanticBoundaryConfig,
+) -> SemanticBoundaryConfig:
+    """Prefer the calibrated decision_config embedded in a v2 checkpoint."""
+
+    decision = getattr(split_verifier, "decision_config", None)
+    if not isinstance(decision, dict) or not decision:
+        return config
+    return SemanticBoundaryConfig(
+        short_core_max_s=float(
+            decision.get("short_core_max_s", config.short_core_max_s)
+        ),
+        short_core_cut_threshold=float(
+            decision.get("short_core_cut_threshold", config.short_core_cut_threshold)
+        ),
+        normal_cut_threshold=float(
+            decision.get("normal_cut_threshold", config.normal_cut_threshold)
+        ),
+        min_chunk_after_split_s=float(
+            decision.get("min_chunk_after_split_s", config.min_chunk_after_split_s)
+        ),
+    )
+
+
 def build_semantic_boundary_chunks(
     segments: Sequence[SpeechSegment],
     *,
@@ -29,7 +61,7 @@ def build_semantic_boundary_chunks(
     speech_probabilities: Sequence[float],
     feature_provider: FrameSequenceFeatureProvider,
     outer_refiner: OuterEdgeRefiner,
-    split_verifier: SemanticSplitVerifier,
+    split_verifier: SemanticSplitVerifier | SemanticSplitIslandVerifier,
     cut_refiner: CutEdgeRefiner,
     config: SemanticBoundaryConfig = SemanticBoundaryConfig(),
     split_audit_records: list[dict] | None = None,
@@ -45,6 +77,7 @@ def build_semantic_boundary_chunks(
             on_stage(f"{label} {current}/{total}")
 
     speech = np.asarray(speech_probabilities, dtype=np.float32)
+    config = _effective_semantic_config(split_verifier, config)
     progress("外边界精修", 0, 1)
     refined = _refine_outer_edges(
         segments,
@@ -55,62 +88,58 @@ def build_semantic_boundary_chunks(
     )
     progress("外边界精修", 1, 1)
 
-    proposal_groups: list[list[dict]] = []
-    split_feature_groups: list[np.ndarray] = []
-    split_scalar_groups: list[np.ndarray] = []
-    split_decision_groups: list[list[SplitDecision]] = []
-    split_inputs: list[tuple[int, np.ndarray, np.ndarray]] = []
     split_total = max(1, len(refined))
     progress("语义切分判断", 0, split_total)
-    for group_index, (segment, core_start, core_end, _outer_prediction) in enumerate(refined):
-        proposals = [
-            dict(candidate)
-            for candidate in segment.weak_cut_candidates
-            if core_start < float(candidate["time_s"]) < core_end
-        ]
-        frame_features, scalar_features = _split_features(
+    prepared: list[tuple] = []
+
+    def append_audit_records(
+        *,
+        proposals,
+        decisions,
+        frame_features,
+        scalar_features,
+        core_start,
+        core_end,
+        accepted,
+    ) -> None:
+        if split_audit_records is None:
+            return
+        accepted_times = {
+            round(float(candidate["time_s"]), 6)
+            for candidate, _decision in accepted
+        }
+        for candidate, decision, frames, scalars in zip(
             proposals,
-            core_start=core_start,
-            core_end=core_end,
-            speech=speech,
-            provider=feature_provider,
-            verifier=split_verifier,
-        )
-        proposal_groups.append(proposals)
-        split_feature_groups.append(frame_features)
-        split_scalar_groups.append(scalar_features)
-        split_decision_groups.append([])
-        for row_index in range(frame_features.shape[0]):
-            split_inputs.append(
-                (
-                    group_index,
-                    frame_features[row_index],
-                    scalar_features[row_index],
-                )
+            decisions,
+            frame_features,
+            scalar_features,
+        ):
+            split_audit_records.append(
+                {
+                    "candidate": dict(candidate),
+                    "core_start": core_start,
+                    "core_end": core_end,
+                    "accepted": round(float(candidate["time_s"]), 6)
+                    in accepted_times,
+                    "label": decision.label,
+                    "p_cut": decision.p_cut,
+                    "p_continue": decision.p_continue,
+                    "p_unsure": decision.p_unsure,
+                    "frame_features": frames,
+                    "scalar_features": scalars,
+                }
             )
 
-    if split_inputs:
-        all_frames = np.stack([item[1] for item in split_inputs])
-        all_scalars = np.stack([item[2] for item in split_inputs])
-        all_decisions = _batched_split_decisions(
-            split_verifier,
-            frame_features=all_frames,
-            scalar_features=all_scalars,
-        )
-        for (group_index, _frames, _scalars), decision in zip(split_inputs, all_decisions):
-            split_decision_groups[group_index].append(decision)
-
-    prepared: list[tuple] = []
-    for index, (
+    def finish_group(
+        *,
         segment,
         core_start,
         core_end,
         outer_prediction,
-    ) in enumerate(refined):
-        proposals = proposal_groups[index]
-        decisions = split_decision_groups[index]
-        frame_features = split_feature_groups[index]
-        scalar_features = split_scalar_groups[index]
+        proposals,
+        decisions,
+        audit_chunks=(),
+    ) -> None:
         accepted = _accepted_proposals(
             proposals,
             decisions,
@@ -118,32 +147,16 @@ def build_semantic_boundary_chunks(
             core_end=core_end,
             config=config,
         )
-        if split_audit_records is not None:
-            accepted_times = {
-                round(float(candidate["time_s"]), 6)
-                for candidate, _decision in accepted
-            }
-            for candidate, decision, frames, scalars in zip(
-                proposals,
-                decisions,
-                frame_features,
-                scalar_features,
-            ):
-                split_audit_records.append(
-                    {
-                        "candidate": dict(candidate),
-                        "core_start": core_start,
-                        "core_end": core_end,
-                        "accepted": round(float(candidate["time_s"]), 6)
-                        in accepted_times,
-                        "label": decision.label,
-                        "p_cut": decision.p_cut,
-                        "p_continue": decision.p_continue,
-                        "p_unsure": decision.p_unsure,
-                        "frame_features": frames,
-                        "scalar_features": scalars,
-                    }
-                )
+        for audit_proposals, audit_decisions, audit_frames, audit_scalars in audit_chunks:
+            append_audit_records(
+                proposals=audit_proposals,
+                decisions=audit_decisions,
+                frame_features=audit_frames,
+                scalar_features=audit_scalars,
+                core_start=core_start,
+                core_end=core_end,
+                accepted=accepted,
+            )
         prepared.append(
             (
                 segment,
@@ -156,6 +169,199 @@ def build_semantic_boundary_chunks(
             )
         )
         progress("语义切分判断", len(prepared), split_total)
+
+    if hasattr(split_verifier, "decide_islands"):
+        cap = _semantic_split_island_candidate_cap()
+        pending: list[tuple] = []
+        pending_candidates = 0
+
+        def flush_pending() -> None:
+            nonlocal pending, pending_candidates
+            if not pending:
+                return
+            decision_groups = _batched_island_split_decisions(
+                split_verifier,
+                frame_feature_groups=[item[5] for item in pending],
+                scalar_feature_groups=[item[6] for item in pending],
+            )
+            for item, decisions in zip(pending, decision_groups):
+                (
+                    segment,
+                    core_start,
+                    core_end,
+                    outer_prediction,
+                    proposals,
+                    frame_features,
+                    scalar_features,
+                ) = item
+                audit_chunks = (
+                    ((proposals, decisions, frame_features, scalar_features),)
+                    if split_audit_records is not None
+                    else ()
+                )
+                finish_group(
+                    segment=segment,
+                    core_start=core_start,
+                    core_end=core_end,
+                    outer_prediction=outer_prediction,
+                    proposals=proposals,
+                    decisions=decisions,
+                    audit_chunks=audit_chunks,
+                )
+            pending = []
+            pending_candidates = 0
+
+        for segment, core_start, core_end, outer_prediction in refined:
+            proposals = [
+                dict(candidate)
+                for candidate in segment.weak_cut_candidates
+                if core_start < float(candidate["time_s"]) < core_end
+            ]
+            if not proposals:
+                flush_pending()
+                finish_group(
+                    segment=segment,
+                    core_start=core_start,
+                    core_end=core_end,
+                    outer_prediction=outer_prediction,
+                    proposals=proposals,
+                    decisions=[],
+                )
+                continue
+            if len(proposals) > cap:
+                flush_pending()
+                decisions: list[SplitDecision] = []
+                audit_chunks = []
+                for start in range(0, len(proposals), cap):
+                    slab = proposals[start : start + cap]
+                    frame_features, scalar_features = _split_features(
+                        slab,
+                        core_start=core_start,
+                        core_end=core_end,
+                        speech=speech,
+                        provider=feature_provider,
+                        verifier=split_verifier,
+                    )
+                    slab_decisions = _batched_island_split_decisions(
+                        split_verifier,
+                        frame_feature_groups=[frame_features],
+                        scalar_feature_groups=[scalar_features],
+                    )[0]
+                    decisions.extend(slab_decisions)
+                    if split_audit_records is not None:
+                        audit_chunks.append(
+                            (slab, slab_decisions, frame_features, scalar_features)
+                        )
+                finish_group(
+                    segment=segment,
+                    core_start=core_start,
+                    core_end=core_end,
+                    outer_prediction=outer_prediction,
+                    proposals=proposals,
+                    decisions=decisions,
+                    audit_chunks=audit_chunks,
+                )
+                continue
+            if pending and pending_candidates + len(proposals) > cap:
+                flush_pending()
+            frame_features, scalar_features = _split_features(
+                proposals,
+                core_start=core_start,
+                core_end=core_end,
+                speech=speech,
+                provider=feature_provider,
+                verifier=split_verifier,
+            )
+            pending.append(
+                (
+                    segment,
+                    core_start,
+                    core_end,
+                    outer_prediction,
+                    proposals,
+                    frame_features,
+                    scalar_features,
+                )
+            )
+            pending_candidates += len(proposals)
+        flush_pending()
+    else:
+        proposal_groups: list[list[dict]] = []
+        split_feature_groups: list[np.ndarray] = []
+        split_scalar_groups: list[np.ndarray] = []
+        split_decision_groups: list[list[SplitDecision]] = []
+        split_inputs: list[tuple[int, np.ndarray, np.ndarray]] = []
+        for group_index, (
+            segment,
+            core_start,
+            core_end,
+            _outer_prediction,
+        ) in enumerate(refined):
+            proposals = [
+                dict(candidate)
+                for candidate in segment.weak_cut_candidates
+                if core_start < float(candidate["time_s"]) < core_end
+            ]
+            frame_features, scalar_features = _split_features(
+                proposals,
+                core_start=core_start,
+                core_end=core_end,
+                speech=speech,
+                provider=feature_provider,
+                verifier=split_verifier,
+            )
+            proposal_groups.append(proposals)
+            split_feature_groups.append(frame_features)
+            split_scalar_groups.append(scalar_features)
+            split_decision_groups.append([])
+            for row_index in range(frame_features.shape[0]):
+                split_inputs.append(
+                    (
+                        group_index,
+                        frame_features[row_index],
+                        scalar_features[row_index],
+                    )
+                )
+        if split_inputs:
+            all_frames = np.stack([item[1] for item in split_inputs])
+            all_scalars = np.stack([item[2] for item in split_inputs])
+            all_decisions = _batched_split_decisions(
+                split_verifier,
+                frame_features=all_frames,
+                scalar_features=all_scalars,
+            )
+            for (group_index, _frames, _scalars), decision in zip(
+                split_inputs,
+                all_decisions,
+            ):
+                split_decision_groups[group_index].append(decision)
+        for index, (
+            segment,
+            core_start,
+            core_end,
+            outer_prediction,
+        ) in enumerate(refined):
+            finish_group(
+                segment=segment,
+                core_start=core_start,
+                core_end=core_end,
+                outer_prediction=outer_prediction,
+                proposals=proposal_groups[index],
+                decisions=split_decision_groups[index],
+                audit_chunks=(
+                    (
+                        (
+                            proposal_groups[index],
+                            split_decision_groups[index],
+                            split_feature_groups[index],
+                            split_scalar_groups[index],
+                        ),
+                    )
+                    if split_audit_records is not None
+                    else ()
+                ),
+            )
+
     if not refined:
         progress("语义切分判断", 1, 1)
 
@@ -251,6 +457,28 @@ def _split_features(
     feature_rows: list[np.ndarray] = []
     scalar_rows: list[np.ndarray] = []
     cfg = verifier.feature_config
+    projection = cfg.get("ptm_projection") or None
+    projection_mean = (
+        np.asarray(projection["mean"], dtype=np.float32)
+        if projection is not None
+        else None
+    )
+    projection_components = (
+        np.asarray(projection["components"], dtype=np.float32)
+        if projection is not None
+        else None
+    )
+    if projection is not None and provider.has_pre_projected_ptm:
+        expected_digest = str(projection.get("digest") or "") or ptm_projection_digest(
+            projection_mean, projection_components
+        )
+        if provider.ptm_projected_digest != expected_digest:
+            raise ValueError(
+                "semantic split ptm projection mismatch: runtime payload digest "
+                f"{provider.ptm_projected_digest or '(empty)'} != checkpoint digest "
+                f"{expected_digest}; point SPEECH_BOUNDARY_JA_SEQUENCE_PTM_PROJECTION "
+                "at the projection npz this checkpoint was trained with"
+            )
     for candidate in proposals:
         frames, scalars = provider.features_for_split_candidate(
             core_start_s=core_start,
@@ -264,6 +492,9 @@ def _split_features(
             gap_bins=int(cfg["gap_bins"]),
             right_bins=int(cfg["right_bins"]),
             ptm_dim=int(cfg["ptm_dim"]),
+            extra_context_scales=tuple(cfg.get("extra_context_scales") or ()),
+            ptm_projection_mean=projection_mean,
+            ptm_projection_components=projection_components,
         )
         feature_rows.append(frames)
         scalar_rows.append(scalars)
@@ -301,6 +532,109 @@ def _batched_split_decisions(
     return decisions
 
 
+_MAX_ISLAND_BATCH_CANDIDATES = 256
+
+
+def _semantic_split_island_candidate_cap() -> int:
+    raw = os.getenv("SEMANTIC_SPLIT_ISLAND_MAX_CANDIDATES", "").strip()
+    if not raw:
+        return _MAX_ISLAND_BATCH_CANDIDATES
+    try:
+        return max(1, int(raw))
+    except ValueError:
+        return _MAX_ISLAND_BATCH_CANDIDATES
+
+
+def _release_cuda_cache_for_verifier(verifier) -> None:
+    if not str(getattr(verifier, "device", "")).startswith("cuda"):
+        return
+    try:
+        import torch
+
+        torch.cuda.empty_cache()
+    except Exception:
+        return
+
+
+def _batched_island_split_decisions(
+    verifier,
+    *,
+    frame_feature_groups: Sequence[np.ndarray],
+    scalar_feature_groups: Sequence[np.ndarray],
+) -> list[list[SplitDecision]]:
+    """Batch whole islands; VRAM is bounded by both island count and candidates.
+
+    A single island with more than ``_MAX_ISLAND_BATCH_CANDIDATES`` candidates
+    is split into contiguous candidate slabs (each run as its own forward) and
+    the per-candidate decisions are merged back in order; otherwise the
+    island-sequence Mamba2 forward over an oversized island allocates an SSM
+    states tensor that OOMs the GPU on multi-minute audio. The slab boundary
+    costs the island encoder cross-slab context, which is acceptable for islands
+    long enough to exceed the cap and is the only way to keep the forward
+    bounded by candidate count rather than island length."""
+
+    max_islands = _semantic_split_inference_batch_size()
+    cap = _semantic_split_island_candidate_cap()
+
+    # Expand oversized islands into contiguous candidate slabs; each slab keeps
+    # its originating island index so decisions merge back in candidate order.
+    slabs: list[tuple[int, np.ndarray, np.ndarray]] = []
+    for island_index, (frames, scalars) in enumerate(
+        zip(frame_feature_groups, scalar_feature_groups)
+    ):
+        count = int(frames.shape[0])
+        if count <= cap:
+            slabs.append((island_index, frames, scalars))
+            continue
+        for start in range(0, count, cap):
+            end = min(count, start + cap)
+            slabs.append((island_index, frames[start:end], scalars[start:end]))
+
+    slab_decisions: list[list[SplitDecision]] = [[] for _ in slabs]
+    batch: list[tuple[int, np.ndarray, np.ndarray]] = []
+    batch_max_count = 0
+
+    def flush() -> None:
+        nonlocal batch, batch_max_count
+        if not batch:
+            return
+        slab_indexes = [item[0] for item in batch]
+        decisions = verifier.decide_islands(
+            island_frame_features=[item[1] for item in batch],
+            island_scalar_features=[item[2] for item in batch],
+        )
+        for slab_index, slab_decision in zip(slab_indexes, decisions):
+            slab_decisions[slab_index] = slab_decision
+        _release_cuda_cache_for_verifier(verifier)
+        batch = []
+        batch_max_count = 0
+
+    for slab_index, (_island_index, frames, scalars) in enumerate(slabs):
+        count = int(frames.shape[0])
+        padded_cost = max(batch_max_count, count) * (len(batch) + 1)
+        if batch and (
+            len(batch) >= max_islands or padded_cost > cap
+        ):
+            flush()
+        batch.append((slab_index, frames, scalars))
+        batch_max_count = max(batch_max_count, count)
+    flush()
+
+    results: list[list[SplitDecision]] = [[] for _ in frame_feature_groups]
+    for slab_index, (island_index, _frames, _scalars) in enumerate(slabs):
+        results[island_index].extend(slab_decisions[slab_index])
+    return results
+
+
+def _is_noise_bracket_pair(
+    earlier_role: str,
+    later_role: str,
+) -> bool:
+    """A speech_to_noise cut followed by noise_to_speech isolates one noise run."""
+
+    return earlier_role == "speech_to_noise" and later_role == "noise_to_speech"
+
+
 def _accepted_proposals(
     proposals,
     decisions,
@@ -320,13 +654,49 @@ def _accepted_proposals(
         if decision.label == "cut" and decision.p_cut >= threshold
     ]
     accepted.sort(key=lambda item: item[1].p_cut, reverse=True)
-    selected = []
+    selected: list[tuple[dict, SplitDecision]] = []
+    brackets: set[int] = set()
     for candidate, decision in accepted:
         time_s = float(candidate["time_s"])
-        anchors = [core_start, core_end, *(float(item[0]["time_s"]) for item in selected)]
-        if min(abs(time_s - anchor) for anchor in anchors) >= config.min_chunk_after_split_s:
+        edge_gap = min(abs(time_s - core_start), abs(time_s - core_end))
+        if edge_gap < config.min_chunk_after_split_s:
+            continue
+        near = [
+            index
+            for index, (existing, _decision) in enumerate(selected)
+            if abs(time_s - float(existing["time_s"]))
+            < config.min_chunk_after_split_s
+        ]
+        if not near:
             selected.append((candidate, decision))
-    return sorted(selected, key=lambda item: float(item[0]["time_s"]))
+            continue
+        # Min-spacing exemption: exactly one nearby accepted cut whose role
+        # forms a speech_to_noise -> noise_to_speech bracket with this one, so
+        # the short run in between becomes its own chunk for CueQC to drop.
+        if len(near) != 1 or near[0] in brackets:
+            continue
+        partner_candidate, partner_decision = selected[near[0]]
+        partner_time = float(partner_candidate["time_s"])
+        first_role, second_role = (
+            (partner_decision.role, decision.role)
+            if partner_time < time_s
+            else (decision.role, partner_decision.role)
+        )
+        if not _is_noise_bracket_pair(first_role, second_role):
+            continue
+        brackets.add(near[0])
+        brackets.add(len(selected))
+        selected.append((candidate, decision))
+    bracket_times = {
+        round(float(selected[index][0]["time_s"]), 6) for index in brackets
+    }
+    result = []
+    for candidate, decision in selected:
+        entry = dict(candidate)
+        if round(float(candidate["time_s"]), 6) in bracket_times:
+            entry["noise_isolation_bracket"] = True
+        result.append((entry, decision))
+    return sorted(result, key=lambda item: float(item[0]["time_s"]))
 
 
 def _refine_cuts(
@@ -371,9 +741,16 @@ def _refine_cuts(
     )
     result = []
     cursor = core_start
+    previous_bracket = False
     for (candidate, decision), cut_time in zip(accepted, refined):
         cut = float(cut_time)
-        if cut - cursor < min_chunk_s or core_end - cut < min_chunk_s:
+        is_bracket = bool(candidate.get("noise_isolation_bracket"))
+        spacing_exempt = is_bracket and previous_bracket and result
+        if cut <= cursor:
+            continue
+        if (cut - cursor < min_chunk_s and not spacing_exempt) or (
+            core_end - cut < min_chunk_s
+        ):
             continue
         result.append(
             {
@@ -386,10 +763,13 @@ def _refine_cuts(
                 "p_cut": decision.p_cut,
                 "p_continue": decision.p_continue,
                 "p_unsure": decision.p_unsure,
+                "role": decision.role,
+                "p_role": decision.p_role,
                 "shared_absolute_timestamp": True,
             }
         )
         cursor = cut
+        previous_bracket = is_bracket
     return result
 
 

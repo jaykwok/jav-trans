@@ -1,5 +1,6 @@
 import importlib
 import gc
+import hashlib
 import json
 import os
 import time
@@ -16,13 +17,18 @@ from boundary.sequence_features import (
     CHUNK_POOLED_PTM_SCHEMA,
     DEFAULT_CHUNK_POOLED_PTM_BINS,
     FRAME_SEQUENCE_FRAMES_SCHEMA,
+    PTM_PROJECTION_SCHEMA,
     FrameSequenceFeatureConfig,
     FrameSequenceFeatureProvider,
+    ptm_projection_digest,
 )
 from boundary.cut_refiner import load_cut_edge_refiner
 from boundary.outer_refiner import load_outer_edge_refiner
 from boundary.runtime_pipeline import build_semantic_boundary_chunks
-from boundary.split_model import load_semantic_split_verifier
+from boundary.split_model import (
+    load_semantic_split_feature_config,
+    load_semantic_split_verifier,
+)
 from asr import checkpoint as _checkpoint_module
 from asr import chunking as _chunking_module
 from asr import pre_asr_cueqc as _pre_asr_cueqc_module
@@ -57,6 +63,7 @@ _LAST_BOUNDARY_CACHE_EVENT: dict | None = None
 # APPEND=0 overwrites once per export path in this process; later same-path writes append for multi-video workflows.
 _PRE_ASR_EXPORT_OVERWRITTEN_PATHS: set[str] = set()
 _ASR_CHECKPOINT_ENABLED = _transcribe_module._ASR_CHECKPOINT_ENABLED
+_JSON_PAYLOAD_INLINE_ARRAY_LIMIT = 4096
 
 
 def _env_bool(name: str, default: str) -> bool:
@@ -99,6 +106,85 @@ def _boundary_config() -> dict:
     }
 
 
+def _require_learned_candidates_for_island_split(
+    split_verifier,
+    boundary_parameters,
+) -> None:
+    """Refuse to run a v2 (island-sequence) split model over bootstrap
+    candidates. v2 checkpoints are trained on learned-proposer candidates;
+    the energy-valley bootstrap is only a dataset-bootstrapping tool and a
+    legitimate runtime source solely for split-v1 chains."""
+
+    if not hasattr(split_verifier, "decide_islands"):
+        return
+    if str((boundary_parameters or {}).get("proposal_checkpoint") or "").strip():
+        return
+    raise RuntimeError(
+        "Semantic Split v2 requires learned boundary-proposal candidates, but "
+        "the boundary backend produced bootstrap energy-valley candidates (no "
+        "proposal checkpoint resolved for this ASR repo). Promote the "
+        "BoundaryProposalScorer checkpoint or set "
+        "SPEECH_BOUNDARY_JA_PROPOSAL_CHECKPOINT_BY_REPO; bootstrap candidates "
+        "are not a valid input distribution for v2 split checkpoints."
+    )
+
+
+_split_projection_npz_cache: dict[tuple[str, int, int], str] = {}
+
+
+def _split_checkpoint_projection_npz(checkpoint_path: Path) -> str:
+    """Materialize the split checkpoint's embedded PTM projection as an npz
+    next to the checkpoint and return its path ('' when the checkpoint has no
+    projection). The checkpoint is the single source of truth: the boundary
+    backend pre-projects sequence features with exactly this basis."""
+
+    try:
+        stat = checkpoint_path.stat()
+    except OSError:
+        return ""
+    cache_key = (str(checkpoint_path), stat.st_mtime_ns, stat.st_size)
+    cached = _split_projection_npz_cache.get(cache_key)
+    if cached is not None and (not cached or Path(cached).exists()):
+        return cached
+    try:
+        feature_config = load_semantic_split_feature_config(checkpoint_path)
+    except Exception:
+        # The authoritative error surfaces in load_semantic_split_verifier;
+        # a projection-trained checkpoint that slips through here still fails
+        # loudly downstream (provider refuses to project capped-dim frames).
+        _pipeline_logger.debug(
+            "[boundary] split checkpoint feature_config unreadable: %s",
+            checkpoint_path,
+            exc_info=True,
+        )
+        _split_projection_npz_cache[cache_key] = ""
+        return ""
+    projection = feature_config.get("ptm_projection") or None
+    if projection is None:
+        _split_projection_npz_cache[cache_key] = ""
+        return ""
+    mean = np.asarray(projection["mean"], dtype=np.float32)
+    components = np.asarray(projection["components"], dtype=np.float32)
+    digest = str(projection.get("digest") or "") or ptm_projection_digest(
+        mean, components
+    )
+    npz_path = checkpoint_path.with_name(
+        f"{checkpoint_path.stem}.ptm_projection.{digest[:16]}.npz"
+    )
+    if not npz_path.exists():
+        tmp_path = npz_path.with_name(npz_path.name + f".tmp{os.getpid()}")
+        np.savez(
+            tmp_path,
+            schema=np.asarray(PTM_PROJECTION_SCHEMA),
+            mean=mean,
+            components=components,
+        )
+        # np.savez appends .npz to paths without the suffix.
+        os.replace(f"{tmp_path}.npz", npz_path)
+    _split_projection_npz_cache[cache_key] = str(npz_path)
+    return str(npz_path)
+
+
 def _sequence_feature_provider_from_result(
     payload,
     *,
@@ -111,7 +197,7 @@ def _sequence_feature_provider_from_result(
     ptm = payload.get("ptm")
     mfcc = payload.get("mfcc")
     frame_hop_s = payload.get("frame_hop_s")
-    if not isinstance(ptm, list) or not isinstance(mfcc, list):
+    if not isinstance(ptm, (list, np.ndarray)) or not isinstance(mfcc, (list, np.ndarray)):
         return None
     try:
         hop = float(frame_hop_s)
@@ -119,11 +205,16 @@ def _sequence_feature_provider_from_result(
         return None
     if hop <= 0.0:
         return None
+    ptm_projected = payload.get("ptm_projected")
+    if not isinstance(ptm_projected, (list, np.ndarray)):
+        ptm_projected = None
     return FrameSequenceFeatureProvider(
         duration_s=float(duration_s),
         frame_hop_s=hop,
         ptm=ptm,
         mfcc=mfcc,
+        ptm_projected=ptm_projected,
+        ptm_projected_digest=str(payload.get("ptm_projection_digest") or ""),
         config=FrameSequenceFeatureConfig(
             left_context_s=_env_float("BOUNDARY_FRAME_SEQUENCE_LEFT_CONTEXT_S", "0.60"),
             right_context_s=_env_float("BOUNDARY_FRAME_SEQUENCE_RIGHT_CONTEXT_S", "0.60"),
@@ -280,6 +371,35 @@ def _display_cache_path(path: str) -> str:
         return str(path)
 
 
+def _json_payload(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {
+            str(key): _json_payload(item)
+            for key, item in sorted(value.items(), key=lambda pair: str(pair[0]))
+        }
+    if isinstance(value, (list, tuple, set)):
+        return [_json_payload(item) for item in value]
+    if isinstance(value, np.ndarray):
+        if value.ndim > 0 and value.size > _JSON_PAYLOAD_INLINE_ARRAY_LIMIT:
+            array = np.ascontiguousarray(value)
+            return {
+                "array_type": "ndarray",
+                "dtype": str(array.dtype),
+                "shape": [int(item) for item in array.shape],
+                "sha256": hashlib.sha256(array.tobytes()).hexdigest(),
+            }
+        return _json_payload(value.tolist())
+    if isinstance(value, np.generic):
+        return _json_payload(value.item())
+    if isinstance(value, Path):
+        return str(value)
+    if isinstance(value, (str, int, bool)) or value is None:
+        return value
+    if isinstance(value, float):
+        return value if np.isfinite(value) else None
+    return str(value)
+
+
 def _boundary_cache_log_entry(event: dict | None) -> str | None:
     if not event:
         return None
@@ -307,6 +427,16 @@ def _build_processing_spans(
 
     restore_sequence_export = os.environ.get("SPEECH_BOUNDARY_JA_EXPORT_SEQUENCE_FEATURES")
     os.environ["SPEECH_BOUNDARY_JA_EXPORT_SEQUENCE_FEATURES"] = "1"
+    restore_sequence_projection = os.environ.get(
+        "SPEECH_BOUNDARY_JA_SEQUENCE_PTM_PROJECTION"
+    )
+    split_projection_npz = _split_checkpoint_projection_npz(
+        Path(cfg["semantic_split_model_path"])
+    )
+    if split_projection_npz:
+        os.environ["SPEECH_BOUNDARY_JA_SEQUENCE_PTM_PROJECTION"] = split_projection_npz
+    else:
+        os.environ.pop("SPEECH_BOUNDARY_JA_SEQUENCE_PTM_PROJECTION", None)
     try:
         from boundary import get_boundary_backend
 
@@ -344,6 +474,12 @@ def _build_processing_spans(
             os.environ["SPEECH_BOUNDARY_JA_EXPORT_SEQUENCE_FEATURES"] = restore_sequence_export
         else:
             os.environ.pop("SPEECH_BOUNDARY_JA_EXPORT_SEQUENCE_FEATURES", None)
+        if restore_sequence_projection is not None:
+            os.environ["SPEECH_BOUNDARY_JA_SEQUENCE_PTM_PROJECTION"] = (
+                restore_sequence_projection
+            )
+        else:
+            os.environ.pop("SPEECH_BOUNDARY_JA_SEQUENCE_PTM_PROJECTION", None)
     frame_scores = result.parameters.get("frame_scores")
     candidate_frame_scores = result.parameters.get("candidate_frame_scores")
     score_frame_hop_s = result.parameters.get("frame_hop_s")
@@ -358,6 +494,7 @@ def _build_processing_spans(
         device=cfg["semantic_split_device"],
         expected_ptm_repo_id=_current_asr_backend(),
     )
+    _require_learned_candidates_for_island_split(split_verifier, result.parameters)
     cut_refiner = load_cut_edge_refiner(
         Path(cfg["cut_edge_refiner_model_path"]),
         device=cfg["cut_edge_refiner_device"],
@@ -385,14 +522,22 @@ def _build_processing_spans(
     if speech_feature_export_path:
         speech_feature_path = Path(speech_feature_export_path)
         speech_feature_path.parent.mkdir(parents=True, exist_ok=True)
-        np.savez_compressed(
-            speech_feature_path,
-            ptm=np.asarray(sequence_feature_frames["ptm"], dtype=np.float32),
-            mfcc=np.asarray(sequence_feature_frames["mfcc"], dtype=np.float32),
-            frame_hop_s=np.asarray(
+        speech_feature_arrays = {
+            "ptm": np.asarray(sequence_feature_frames["ptm"], dtype=np.float32),
+            "mfcc": np.asarray(sequence_feature_frames["mfcc"], dtype=np.float32),
+            "frame_hop_s": np.asarray(
                 [sequence_feature_frames["frame_hop_s"]], dtype=np.float32
             ),
-        )
+        }
+        exported_ptm_projected = sequence_feature_frames.get("ptm_projected")
+        if exported_ptm_projected is not None:
+            speech_feature_arrays["ptm_projected"] = np.asarray(
+                exported_ptm_projected, dtype=np.float32
+            )
+            speech_feature_arrays["ptm_projection_digest"] = np.asarray(
+                [str(sequence_feature_frames.get("ptm_projection_digest") or "")]
+            )
+        np.savez_compressed(speech_feature_path, **speech_feature_arrays)
     result_parameters = {
         key: value
         for key, value in result.parameters.items()
@@ -498,37 +643,54 @@ def _write_semantic_split_feature_export(
     records: list[dict],
 ) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    np.savez_compressed(
-        path,
-        frame_features=np.stack([row["frame_features"] for row in records]),
-        scalar_features=np.stack([row["scalar_features"] for row in records]),
-        proposal_times_s=np.asarray(
-            [row["candidate"]["time_s"] for row in records], dtype=np.float32
-        ),
-        core_starts_s=np.asarray([row["core_start"] for row in records], dtype=np.float32),
-        core_ends_s=np.asarray([row["core_end"] for row in records], dtype=np.float32),
-        accepted=np.asarray([row["accepted"] for row in records], dtype=np.bool_),
-        p_cut=np.asarray([row["p_cut"] for row in records], dtype=np.float32),
-        p_continue=np.asarray([row["p_continue"] for row in records], dtype=np.float32),
-        p_unsure=np.asarray([row["p_unsure"] for row in records], dtype=np.float32),
-    )
+    if records:
+        np.savez_compressed(
+            path,
+            frame_features=np.stack([row["frame_features"] for row in records]),
+            scalar_features=np.stack([row["scalar_features"] for row in records]),
+            proposal_times_s=np.asarray(
+                [row["candidate"]["time_s"] for row in records], dtype=np.float32
+            ),
+            core_starts_s=np.asarray([row["core_start"] for row in records], dtype=np.float32),
+            core_ends_s=np.asarray([row["core_end"] for row in records], dtype=np.float32),
+            accepted=np.asarray([row["accepted"] for row in records], dtype=np.bool_),
+            p_cut=np.asarray([row["p_cut"] for row in records], dtype=np.float32),
+            p_continue=np.asarray([row["p_continue"] for row in records], dtype=np.float32),
+            p_unsure=np.asarray([row["p_unsure"] for row in records], dtype=np.float32),
+        )
+    else:
+        # Silence/music-only windows can legitimately produce zero candidates.
+        np.savez_compressed(
+            path,
+            frame_features=np.zeros((0, 0, 0), dtype=np.float32),
+            scalar_features=np.zeros((0, 0), dtype=np.float32),
+            proposal_times_s=np.zeros(0, dtype=np.float32),
+            core_starts_s=np.zeros(0, dtype=np.float32),
+            core_ends_s=np.zeros(0, dtype=np.float32),
+            accepted=np.zeros(0, dtype=np.bool_),
+            p_cut=np.zeros(0, dtype=np.float32),
+            p_continue=np.zeros(0, dtype=np.float32),
+            p_unsure=np.zeros(0, dtype=np.float32),
+        )
     metadata_path = path.with_suffix(".jsonl")
     with metadata_path.open("w", encoding="utf-8") as handle:
         for index, row in enumerate(records):
             handle.write(
                 json.dumps(
-                    {
-                        "index": index,
-                        "audio": audio_path,
-                        "core_start": row["core_start"],
-                        "core_end": row["core_end"],
-                        "accepted": row["accepted"],
-                        "label": row["label"],
-                        "p_cut": row["p_cut"],
-                        "p_continue": row["p_continue"],
-                        "p_unsure": row["p_unsure"],
-                        **row["candidate"],
-                    },
+                    _json_payload(
+                        {
+                            "index": index,
+                            "audio": audio_path,
+                            "core_start": row["core_start"],
+                            "core_end": row["core_end"],
+                            "accepted": row["accepted"],
+                            "label": row["label"],
+                            "p_cut": row["p_cut"],
+                            "p_continue": row["p_continue"],
+                            "p_unsure": row["p_unsure"],
+                            **row["candidate"],
+                        }
+                    ),
                     ensure_ascii=False,
                 )
                 + "\n"
@@ -570,15 +732,17 @@ def _pre_asr_candidates_for_spans(
         end = float(candidate.get("end", start))
         sample_id = f"preasr-{audio_id}-chunk{chunk_index:05d}"
         candidates.append(
-            {
-                **candidate,
-                "sample_id": sample_id,
-                "candidate_id": sample_id,
-                "audio_id": audio_id,
-                "video_id": audio_id,
-                "chunk_index": chunk_index,
-                "duration_s": round(max(0.0, end - start), 6),
-            }
+            _json_payload(
+                {
+                    **candidate,
+                    "sample_id": sample_id,
+                    "candidate_id": sample_id,
+                    "audio_id": audio_id,
+                    "video_id": audio_id,
+                    "chunk_index": chunk_index,
+                    "duration_s": round(max(0.0, end - start), 6),
+                }
+            )
         )
     return candidates
 
@@ -603,7 +767,7 @@ def _pre_asr_candidates_with_decisions(candidates: list[dict], report: dict) -> 
             item["pre_asr_route"] = str(decision.get("route") or "")
             item["pre_asr_prob_drop"] = decision.get("prob_drop")
             item["pre_asr_prob_keep"] = decision.get("prob_keep")
-        annotated.append(item)
+        annotated.append(_json_payload(item))
     return annotated
 
 
@@ -629,7 +793,9 @@ def _write_pre_asr_candidates_if_requested(
     mode = "a" if append_requested or output_key in _PRE_ASR_EXPORT_OVERWRITTEN_PATHS else "w"
     with output_path.open(mode, encoding="utf-8") as handle:
         for row in candidates:
-            handle.write(json.dumps(row, ensure_ascii=False, sort_keys=True) + "\n")
+            handle.write(
+                json.dumps(_json_payload(row), ensure_ascii=False, sort_keys=True) + "\n"
+            )
     if not append_requested:
         _PRE_ASR_EXPORT_OVERWRITTEN_PATHS.add(output_key)
     log.append(
@@ -1374,7 +1540,7 @@ def _transcribe_and_align_local(
                 total_elapsed,
             )
             log.append("边界系统未检测到可处理语音块，跳过 ASR")
-            details = {
+            details = _json_payload({
                 "backend": get_backend_label(),
                 "audio_path": audio_path,
                 "device": device,
@@ -1388,7 +1554,7 @@ def _transcribe_and_align_local(
                 "boundary_signature": dict(_LAST_BOUNDARY_SIGNATURE),
                 "pre_asr_cueqc": pre_asr_cueqc_report,
                 "pre_asr_candidates": pre_asr_candidates,
-            }
+            })
             return [], log, details
 
         backend = _resolve_asr_backend(device)
@@ -1643,7 +1809,7 @@ def _transcribe_and_align_local(
         )
         log.append(f"过滤后保留字幕: {len(segments)}")
 
-        details = {
+        details = _json_payload({
             "backend": get_backend_label(),
             "audio_path": audio_path,
             "device": device,
@@ -1689,7 +1855,7 @@ def _transcribe_and_align_local(
                     }
                 )
             },
-        }
+        })
         return segments, log, details
     finally:
         if chunk_dir is not None and chunk_dir.exists() and not _KEEP_ASR_CHUNKS:

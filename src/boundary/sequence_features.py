@@ -29,6 +29,63 @@ SPLIT_CANDIDATE_SCALAR_NAMES = (
 )
 
 
+PTM_PROJECTION_SCHEMA = "speech_boundary_ja_ptm_projection_v1"
+
+
+def parse_extra_context_scales(raw: str) -> list[dict]:
+    """Parse ``"3.2:4,6.4:4"`` into split-candidate extra-scale dicts; "" disables."""
+
+    scales: list[dict] = []
+    for part in (raw or "").split(","):
+        part = part.strip()
+        if not part:
+            continue
+        seconds_text, _, bins_text = part.partition(":")
+        seconds = float(seconds_text)
+        bins = int(bins_text or 4)
+        if seconds <= 0 or bins <= 0:
+            raise ValueError(f"invalid context scale: {part!r}")
+        scales.append(
+            {
+                "left_context_s": seconds,
+                "right_context_s": seconds,
+                "left_bins": bins,
+                "right_bins": bins,
+            }
+        )
+    return scales
+
+
+def ptm_projection_digest(mean: np.ndarray, components: np.ndarray) -> str:
+    """Stable identity for one projection basis, comparable across processes."""
+
+    import hashlib
+
+    digest = hashlib.sha256()
+    digest.update(np.ascontiguousarray(mean, dtype=np.float32).tobytes())
+    digest.update(np.ascontiguousarray(components, dtype=np.float32).tobytes())
+    return digest.hexdigest()
+
+
+def load_ptm_projection(path: str) -> dict | None:
+    """Load a variance-preserving PTM projection npz (compute_ptm_projection.py)."""
+
+    if not path:
+        return None
+    bundle = np.load(path)
+    if str(bundle["schema"]) != PTM_PROJECTION_SCHEMA:
+        raise ValueError(f"unknown ptm projection schema: {path}")
+    mean = np.asarray(bundle["mean"], dtype=np.float32)
+    components = np.asarray(bundle["components"], dtype=np.float32)
+    return {
+        "schema": str(bundle["schema"]),
+        "source": str(path),
+        "mean": mean,
+        "components": components,
+        "digest": ptm_projection_digest(mean, components),
+    }
+
+
 @dataclass(frozen=True)
 class FrameSequenceFeatureConfig:
     left_context_s: float = 0.60
@@ -53,14 +110,18 @@ class FrameSequenceFeatureProvider:
     ptm: Sequence[Sequence[float]]
     mfcc: Sequence[Sequence[float]]
     config: FrameSequenceFeatureConfig = FrameSequenceFeatureConfig()
+    ptm_projected: Sequence[Sequence[float]] | None = None
+    ptm_projected_digest: str = ""
     _ptm_array: np.ndarray = field(init=False, repr=False)
     _mfcc_array: np.ndarray = field(init=False, repr=False)
+    _ptm_projected_array: np.ndarray | None = field(init=False, repr=False)
     _frame_count: int = field(init=False, repr=False)
     _ptm_used_dim: int = field(init=False, repr=False)
     _mfcc_dim: int = field(init=False, repr=False)
     _ptm_used: np.ndarray = field(init=False, repr=False)
     _mfcc_used: np.ndarray = field(init=False, repr=False)
     _combined_cache: dict[int, np.ndarray] = field(init=False, repr=False)
+    _projected_ptm_cache: dict[int, np.ndarray] = field(init=False, repr=False)
 
     def __post_init__(self) -> None:
         ptm_array = _frame_array(self.ptm, name="ptm")
@@ -69,14 +130,28 @@ class FrameSequenceFeatureProvider:
         if frame_count <= 0:
             raise ValueError("edge sequence features require at least one frame")
         ptm_used_dim = min(int(ptm_array.shape[1]), int(self.config.max_ptm_dims))
+        projected_array: np.ndarray | None = None
+        if self.ptm_projected is not None:
+            projected_array = _frame_array(self.ptm_projected, name="ptm_projected")
+            if int(projected_array.shape[0]) < frame_count:
+                raise ValueError(
+                    "ptm_projected has fewer frames than ptm/mfcc: "
+                    f"{projected_array.shape[0]} < {frame_count}"
+                )
         object.__setattr__(self, "_ptm_array", ptm_array)
         object.__setattr__(self, "_mfcc_array", mfcc_array)
+        object.__setattr__(self, "_ptm_projected_array", projected_array)
         object.__setattr__(self, "_frame_count", frame_count)
         object.__setattr__(self, "_ptm_used_dim", ptm_used_dim)
         object.__setattr__(self, "_mfcc_dim", int(mfcc_array.shape[1]))
         object.__setattr__(self, "_ptm_used", ptm_array[:frame_count, :ptm_used_dim])
         object.__setattr__(self, "_mfcc_used", mfcc_array[:frame_count])
         object.__setattr__(self, "_combined_cache", {})
+        object.__setattr__(self, "_projected_ptm_cache", {})
+
+    @property
+    def has_pre_projected_ptm(self) -> bool:
+        return self._ptm_projected_array is not None
 
     def _combined_features(self, ptm_dim: int) -> np.ndarray:
         frame_dim = min(int(ptm_dim), self._ptm_used_dim)
@@ -90,6 +165,60 @@ class FrameSequenceFeatureProvider:
                 axis=1,
             )
             self._combined_cache[frame_dim] = cached
+        return cached
+
+    def _combined_projected_features(
+        self,
+        *,
+        projection_mean: np.ndarray,
+        projection_components: np.ndarray,
+    ) -> np.ndarray:
+        """PTM projected through a variance-preserving basis instead of a
+        leading-dim slice. Uses the FULL cached PTM dim, so max_ptm_dims does
+        not truncate the projection input. Cached per projection identity."""
+
+        key = -1 - id(projection_components)
+        cached = self._combined_cache.get(key)
+        if cached is None:
+            projected = self._projected_ptm_features(
+                projection_mean=projection_mean,
+                projection_components=projection_components,
+            )
+            cached = np.concatenate((projected, self._mfcc_used), axis=1)
+            self._combined_cache[key] = cached
+        return cached
+
+    def _projected_ptm_features(
+        self,
+        *,
+        projection_mean: np.ndarray,
+        projection_components: np.ndarray,
+    ) -> np.ndarray:
+        components = np.asarray(projection_components, dtype=np.float32)
+        if self._ptm_projected_array is not None:
+            projected = self._ptm_projected_array[: self._frame_count]
+            if int(projected.shape[1]) != int(components.shape[0]):
+                raise ValueError(
+                    "pre-projected ptm dim mismatch: payload has "
+                    f"{projected.shape[1]}, projection outputs "
+                    f"{components.shape[0]}"
+                )
+            return projected
+        key = id(projection_components)
+        cached = self._projected_ptm_cache.get(key)
+        if cached is None:
+            full = self._ptm_array[: self._frame_count]
+            mean = np.asarray(projection_mean, dtype=np.float32).reshape(1, -1)
+            if mean.shape[1] != full.shape[1] or components.shape[1] != full.shape[1]:
+                raise ValueError(
+                    "ptm projection dim mismatch: projection expects "
+                    f"{components.shape[1]}, provider has {full.shape[1]}. "
+                    "At runtime the backend must pre-project sequence "
+                    "features (set SPEECH_BOUNDARY_JA_SEQUENCE_PTM_PROJECTION "
+                    "to the training projection npz)."
+                )
+            cached = (full - mean) @ components.T
+            self._projected_ptm_cache[key] = cached
         return cached
 
     def frame_dims(self) -> tuple[int, int, int]:
@@ -180,11 +309,22 @@ class FrameSequenceFeatureProvider:
         gap_bins: int,
         right_bins: int,
         ptm_dim: int,
+        extra_context_scales: Sequence[dict] = (),
+        ptm_projection_mean: np.ndarray | None = None,
+        ptm_projection_components: np.ndarray | None = None,
     ) -> tuple[np.ndarray, np.ndarray]:
         candidate_s = float(candidate["time_s"])
-        frame_dim = min(int(ptm_dim), self._ptm_used_dim)
-        combined = self._combined_features(frame_dim)
-        ranges = (
+        if ptm_projection_components is not None:
+            if ptm_projection_mean is None:
+                raise ValueError("ptm projection requires both mean and components")
+            ptm_values = self._projected_ptm_features(
+                projection_mean=ptm_projection_mean,
+                projection_components=ptm_projection_components,
+            )
+        else:
+            frame_dim = min(int(ptm_dim), self._ptm_used_dim)
+            ptm_values = self._ptm_used[:, :frame_dim]
+        ranges = [
             (
                 max(core_start_s, candidate_s - left_context_s),
                 max(core_start_s, candidate_s - gap_context_s),
@@ -200,11 +340,33 @@ class FrameSequenceFeatureProvider:
                 min(core_end_s, candidate_s + right_context_s),
                 right_bins,
             ),
-        )
+        ]
+        # Coarser context scales append after the base bins so the base layout
+        # (and v1-warm-started encoders) keep their positions.
+        for scale in extra_context_scales:
+            scale_left_s = float(scale["left_context_s"])
+            scale_right_s = float(scale["right_context_s"])
+            scale_left_bins = int(scale["left_bins"])
+            scale_right_bins = int(scale["right_bins"])
+            ranges.append(
+                (
+                    max(core_start_s, candidate_s - scale_left_s),
+                    max(core_start_s, candidate_s - gap_context_s),
+                    scale_left_bins,
+                )
+            )
+            ranges.append(
+                (
+                    min(core_end_s, candidate_s + gap_context_s),
+                    min(core_end_s, candidate_s + scale_right_s),
+                    scale_right_bins,
+                )
+            )
         pooled = np.concatenate(
             [
-                _pool_frame_bins(
-                    combined,
+                _pool_feature_bins(
+                    ptm_values,
+                    self._mfcc_used,
                     frame_hop_s=self.frame_hop_s,
                     start_s=start_s,
                     end_s=end_s,
@@ -267,20 +429,20 @@ class FrameSequenceFeatureProvider:
         end_frame = int(round(end_s / self.frame_hop_s))
         context_frames = int(round(context_s / self.frame_hop_s))
         used_ptm_dim = min(int(ptm_dim), self._ptm_used_dim)
-        combined = self._combined_features(used_ptm_dim)
+        ptm_values = self._ptm_used[:, :used_ptm_dim]
         pooled = np.concatenate(
             (
-                _pool_frame_bins_by_index(
-                    combined, start_frame - context_frames, start_frame, 4
+                _pool_feature_bins_by_index(
+                    ptm_values, self._mfcc_used, start_frame - context_frames, start_frame, 4
                 ),
-                _pool_frame_bins_by_index(
-                    combined, start_frame, start_frame + context_frames, 4
+                _pool_feature_bins_by_index(
+                    ptm_values, self._mfcc_used, start_frame, start_frame + context_frames, 4
                 ),
-                _pool_frame_bins_by_index(
-                    combined, end_frame - context_frames, end_frame, 4
+                _pool_feature_bins_by_index(
+                    ptm_values, self._mfcc_used, end_frame - context_frames, end_frame, 4
                 ),
-                _pool_frame_bins_by_index(
-                    combined, end_frame, end_frame + context_frames, 4
+                _pool_feature_bins_by_index(
+                    ptm_values, self._mfcc_used, end_frame, end_frame + context_frames, 4
                 ),
             ),
             axis=0,
@@ -591,6 +753,52 @@ def _frame_window(
         end_s=end_s,
     )
     return values[lower:upper]
+
+
+def _pool_feature_bins(
+    ptm_values: np.ndarray,
+    mfcc_values: np.ndarray,
+    *,
+    frame_hop_s: float,
+    start_s: float,
+    end_s: float,
+    bins: int,
+) -> np.ndarray:
+    return np.concatenate(
+        (
+            _pool_frame_bins(
+                ptm_values,
+                frame_hop_s=frame_hop_s,
+                start_s=start_s,
+                end_s=end_s,
+                bins=bins,
+            ),
+            _pool_frame_bins(
+                mfcc_values,
+                frame_hop_s=frame_hop_s,
+                start_s=start_s,
+                end_s=end_s,
+                bins=bins,
+            ),
+        ),
+        axis=1,
+    )
+
+
+def _pool_feature_bins_by_index(
+    ptm_values: np.ndarray,
+    mfcc_values: np.ndarray,
+    start: int,
+    end: int,
+    bins: int,
+) -> np.ndarray:
+    return np.concatenate(
+        (
+            _pool_frame_bins_by_index(ptm_values, start, end, bins),
+            _pool_frame_bins_by_index(mfcc_values, start, end, bins),
+        ),
+        axis=1,
+    )
 
 
 def _pool_frame_bins(

@@ -9,7 +9,11 @@ from boundary.backbones import (
 from boundary.base import SegmentationResult, SpeechBoundaryBackend, SpeechSegment
 from boundary.cut_refiner import CutEdgeRefiner, load_cut_edge_refiner
 from boundary.outer_refiner import OuterEdgeRefiner, load_outer_edge_refiner
-from boundary.split_model import SemanticSplitVerifier, load_semantic_split_verifier
+from boundary.split_model import (
+    SemanticSplitIslandVerifier,
+    SemanticSplitVerifier,
+    load_semantic_split_verifier,
+)
 from boundary.sequence_features import (
     FRAME_SEQUENCE_FEATURE_SCHEMA,
     FRAME_SEQUENCE_FRAMES_SCHEMA,
@@ -41,6 +45,7 @@ __all__ = [
     "Mamba2TemporalEncoder",
     "OuterEdgeRefiner",
     "SegmentationResult",
+    "SemanticSplitIslandVerifier",
     "SemanticSplitVerifier",
     "SpeechIslandSequenceClassifier",
     "SpeechBoundaryBackend",

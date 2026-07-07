@@ -345,10 +345,7 @@ def _pooled_ptm_values(
         parsed_dim = None if dim is None else int(dim)
     except (TypeError, ValueError):
         parsed_dim = None
-    values: list[float] = []
-    if isinstance(raw_values, Sequence) and not isinstance(raw_values, (str, bytes, bytearray)):
-        for item in raw_values:
-            values.append(_safe_float(item))
+    values = _numeric_list(raw_values)
     expected_dim = len(PRE_ASR_CUEQC_POOLED_PTM_FEATURE_NAMES)
     available = (
         schema == CHUNK_POOLED_PTM_SCHEMA
@@ -365,9 +362,7 @@ def _pooled_ptm_values(
 
 def ptm_bin_matrix(candidate: Mapping[str, Any]) -> tuple[np.ndarray, np.ndarray]:
     raw_pooled = candidate.get("pre_asr_ptm_pooled_features")
-    pooled: list[float] = []
-    if isinstance(raw_pooled, Sequence) and not isinstance(raw_pooled, (str, bytes, bytearray)):
-        pooled = [_safe_float(item) for item in raw_pooled]
+    pooled = _numeric_list(raw_pooled)
     expected = len(PRE_ASR_CUEQC_POOLED_PTM_FEATURE_NAMES)
     if len(pooled) != expected:
         pooled = [0.0] * expected
@@ -381,6 +376,16 @@ def ptm_bin_matrix(candidate: Mapping[str, Any]) -> tuple[np.ndarray, np.ndarray
         (PRE_ASR_CUEQC_MODEL_PTM_TOKENS,), dtype=np.float32
     )
     return matrix, mask
+
+
+def _numeric_list(value: Any) -> list[float]:
+    if isinstance(value, (str, bytes, bytearray)):
+        return []
+    if isinstance(value, np.ndarray):
+        return [_safe_float(item) for item in value.reshape(-1).tolist()]
+    if isinstance(value, Sequence):
+        return [_safe_float(item) for item in value]
+    return []
 
 
 def _neighbor_features(spans: Sequence[Any], index: int, offset: int) -> dict[str, float]:

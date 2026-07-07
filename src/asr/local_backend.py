@@ -637,51 +637,6 @@ class LocalAsrBackend:
                 )
         return results
 
-    def capture_asr_internals(self, chunks: list[dict], **_kwargs) -> list[dict]:
-        """Capture ASR internals (encoder frames + token logits) in this backend.
-
-        Reuses this backend's loaded Qwen3-ASR (no second model load). Each
-        chunk: {path, text, start_s, end_s}. Returns one dict per chunk.
-        """
-        if not chunks:
-            return []
-        if not self._join_zombie_worker():
-            return [
-                {"ok": False, "error": "zombie generate still running"}
-            ] * len(chunks)
-        if self.model is None:
-            self.load()
-        try:
-            from asr.asr_internals import AsrInternalsCapturer
-
-            capturer = AsrInternalsCapturer(
-                model=self.model,
-                processor=self.processor,
-            )
-        except Exception:  # noqa: BLE001
-            return [{"ok": False, "error": "capturer build failed"}] * len(chunks)
-        out: list[dict] = []
-        for chunk in chunks:
-            path = str(chunk.get("path") or "")
-            text = str(chunk.get("text") or "")
-            start_s = float(chunk.get("start_s") or 0.0)
-            end_s = float(chunk.get("end_s") or start_s)
-            try:
-                internals = capturer.extract(path, text, start_s=start_s, end_s=end_s)
-                out.append({
-                    "ok": True,
-                    "asr_frames": internals["asr_frames"],
-                    "token_logprobs": internals["token_logprobs"],
-                    "token_entropies": internals["token_entropies"],
-                    "token_top1_top2_margins": internals["token_top1_top2_margins"],
-                    "token_ids": internals["token_ids"],
-                    "decoded_tokens": internals.get("decoded_tokens") or [],
-                    "has_timestamps": bool(internals.get("has_timestamps", False)),
-                })
-            except Exception as exc:  # noqa: BLE001
-                out.append({"ok": False, "error": repr(exc)})
-        return out
-
     def _use_boundary_timing_result(
         self,
         *,

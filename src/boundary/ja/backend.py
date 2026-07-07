@@ -8,6 +8,7 @@ from typing import Any, Iterable
 import numpy as np
 
 from asr.backends.qwen import (
+    DEFAULT_SPEECH_BOUNDARY_PROPOSAL_CHECKPOINT_BY_REPO,
     DEFAULT_SPEECH_BOUNDARY_SCORER_CHECKPOINT_BY_REPO,
     checkpoint_path_for_repo_env,
     current_qwen_asr_backend,
@@ -29,6 +30,8 @@ from boundary.ja.model import (
     load_speech_island_scorer_checkpoint,
     score_speech_island_probabilities,
 )
+from boundary.ja.proposal import load_boundary_proposal_checkpoint
+from boundary.sequence_features import load_ptm_projection
 from subtitles.options import BASE_FPS
 
 
@@ -122,6 +125,23 @@ def _scorer_checkpoint_from_env(ptm: str) -> str:
         repo_id=ptm,
         mapping_env="SPEECH_BOUNDARY_JA_SCORER_CHECKPOINT_BY_REPO",
         default_mapping=DEFAULT_SPEECH_BOUNDARY_SCORER_CHECKPOINT_BY_REPO,
+        required=bool(raw_mapping),
+    )
+
+
+def _proposal_checkpoint_from_env(ptm: str) -> str:
+    """Learned candidate source, resolved from env or the registry default
+    mapping. Empty keeps the bootstrap heuristic — legitimate only while the
+    repo's split model is v1; the ASR pipeline hard-errors if a v2 split model
+    would consume bootstrap candidates."""
+
+    raw_mapping = os.getenv(
+        "SPEECH_BOUNDARY_JA_PROPOSAL_CHECKPOINT_BY_REPO", ""
+    ).strip()
+    return checkpoint_path_for_repo_env(
+        repo_id=ptm,
+        mapping_env="SPEECH_BOUNDARY_JA_PROPOSAL_CHECKPOINT_BY_REPO",
+        default_mapping=DEFAULT_SPEECH_BOUNDARY_PROPOSAL_CHECKPOINT_BY_REPO,
         required=bool(raw_mapping),
     )
 
@@ -700,17 +720,19 @@ class SpeechBoundaryJaConfig:
     overlap_s: float = 4.0
     min_segment_s: float = 0.05
     split_smooth_s: float = 0.08
-    split_nms_s: float = 0.20
+    split_nms_s: float = 0.12
     split_snap_s: float = 0.10
     min_split_segment_s: float = 0.08
-    split_score_quantile: float = 0.50
-    split_prominence_quantile: float = 0.50
+    split_score_quantile: float = 0.10
+    split_prominence_quantile: float = 0.10
     export_sequence_features: bool = False
     sequence_feature_max_ptm_dims: int = 128
+    sequence_ptm_projection: str = ""
     no_download: bool = False
     scorer_checkpoint: str = ""
     scorer_checkpoint_repo_id: str = ""
     scorer_device: str = "auto"
+    proposal_checkpoint: str = ""
 
     @classmethod
     def from_env(cls) -> "SpeechBoundaryJaConfig":
@@ -733,26 +755,30 @@ class SpeechBoundaryJaConfig:
             overlap_s=_env_float("SPEECH_BOUNDARY_JA_OVERLAP_S", "4.0"),
             min_segment_s=_env_float("SPEECH_BOUNDARY_JA_MIN_SEGMENT_S", "0.05"),
             split_smooth_s=_env_float("SPEECH_BOUNDARY_JA_SPLIT_SMOOTH_S", "0.08"),
-            split_nms_s=_env_float("SPEECH_BOUNDARY_JA_SPLIT_NMS_S", "0.20"),
+            split_nms_s=_env_float("SPEECH_BOUNDARY_JA_SPLIT_NMS_S", "0.12"),
             split_snap_s=_env_float("SPEECH_BOUNDARY_JA_SPLIT_SNAP_S", "0.10"),
             min_split_segment_s=_env_float("SPEECH_BOUNDARY_JA_MIN_SPLIT_SEGMENT_S", "0.08"),
             split_score_quantile=_env_float(
                 "SPEECH_BOUNDARY_JA_SPLIT_SCORE_QUANTILE",
-                "0.50",
+                "0.10",
             ),
             split_prominence_quantile=_env_float(
                 "SPEECH_BOUNDARY_JA_SPLIT_PROMINENCE_QUANTILE",
-                "0.50",
+                "0.10",
             ),
             export_sequence_features=_env_bool("SPEECH_BOUNDARY_JA_EXPORT_SEQUENCE_FEATURES", "0"),
             sequence_feature_max_ptm_dims=max(
                 1,
                 int(_env_float("BOUNDARY_FRAME_SEQUENCE_MAX_PTM_DIMS", "128")),
             ),
+            sequence_ptm_projection=os.getenv(
+                "SPEECH_BOUNDARY_JA_SEQUENCE_PTM_PROJECTION", ""
+            ).strip(),
             no_download=_env_bool("SPEECH_BOUNDARY_JA_NO_DOWNLOAD", "0"),
             scorer_checkpoint=scorer_checkpoint,
             scorer_checkpoint_repo_id=ptm if scorer_checkpoint else "",
             scorer_device=os.getenv("SPEECH_BOUNDARY_JA_SCORER_DEVICE", "auto").strip() or "auto",
+            proposal_checkpoint=_proposal_checkpoint_from_env(ptm),
         )
 
 
@@ -761,6 +787,16 @@ class SpeechBoundaryJaBackend:
 
     def __init__(self, config: SpeechBoundaryJaConfig | None = None) -> None:
         self.config = config or SpeechBoundaryJaConfig.from_env()
+        self._sequence_ptm_projection: dict | None = None
+        self._sequence_ptm_projection_loaded = False
+
+    def _load_sequence_ptm_projection(self) -> dict | None:
+        if not self._sequence_ptm_projection_loaded:
+            self._sequence_ptm_projection = load_ptm_projection(
+                self.config.sequence_ptm_projection.strip()
+            )
+            self._sequence_ptm_projection_loaded = True
+        return self._sequence_ptm_projection
 
     @staticmethod
     def _speech_thresholds(
@@ -773,6 +809,7 @@ class SpeechBoundaryJaBackend:
     def signature(self) -> dict:
         cfg = self.config
         speech_on_threshold, speech_off_threshold = self._speech_thresholds(cfg)
+        sequence_projection = self._load_sequence_ptm_projection()
         signature = {
             "backend": self.name,
             "schema": "speech_boundary_ja_mamba2_speech_island_scorer_v8",
@@ -791,6 +828,11 @@ class SpeechBoundaryJaBackend:
             "overlap_s": float(cfg.overlap_s),
             "min_segment_s": float(cfg.min_segment_s),
             "split_strategy": "candidate_proposal_only",
+            "candidate_source": (
+                "learned_boundary_proposal_v1"
+                if cfg.proposal_checkpoint.strip()
+                else "bootstrap_energy_ptm_mfcc_v1"
+            ),
             "split_smooth_s": float(cfg.split_smooth_s),
             "split_nms_s": float(cfg.split_nms_s),
             "split_snap_s": float(cfg.split_snap_s),
@@ -802,6 +844,9 @@ class SpeechBoundaryJaBackend:
             "micro_chunk_min_duration_s": float(_subtitle_min_duration_s_for_config(cfg)),
             "export_sequence_features": bool(cfg.export_sequence_features),
             "sequence_feature_max_ptm_dims": int(cfg.sequence_feature_max_ptm_dims),
+            "sequence_ptm_projection_digest": (
+                str(sequence_projection["digest"]) if sequence_projection else ""
+            ),
             "scorer_checkpoint": "",
             "operating_point": DEFAULT_OPERATING_POINT,
             "allow_empty": True,
@@ -842,6 +887,14 @@ class SpeechBoundaryJaBackend:
         if scorer is not None:
             _validate_scorer_checkpoint_repo(scorer, cfg.scorer_checkpoint_repo_id or cfg.ptm)
         scorer_signature = scorer.signature() if scorer is not None else None
+        proposal = (
+            load_boundary_proposal_checkpoint(
+                cfg.proposal_checkpoint, device=scorer_device
+            )
+            if cfg.proposal_checkpoint.strip()
+            else None
+        )
+        proposal_signature = proposal.signature() if proposal is not None else None
         speech_on_threshold, speech_off_threshold = self._speech_thresholds(
             cfg,
             threshold_override=threshold_override,
@@ -894,6 +947,12 @@ class SpeechBoundaryJaBackend:
             sequence_ptm_sum: np.ndarray | None = None
             sequence_mfcc_sum: np.ndarray | None = None
             sequence_feature_count: np.ndarray | None = None
+            sequence_ptm_projected_sum: np.ndarray | None = None
+            sequence_projection = (
+                self._load_sequence_ptm_projection()
+                if cfg.export_sequence_features
+                else None
+            )
             window_samples = max(1, int(round(cfg.window_s * sample_rate)))
             stride_samples = max(1, int(round((cfg.window_s - cfg.overlap_s) * sample_rate)))
             starts = list(range(0, max(1, len(audio)), stride_samples))
@@ -924,6 +983,14 @@ class SpeechBoundaryJaBackend:
                         ptm=ptm,
                         mfcc=mfcc,
                     )
+                    candidate_probs = None
+                if proposal is not None:
+                    candidate_probs = score_speech_island_probabilities(
+                        proposal,
+                        ptm=ptm,
+                        mfcc=mfcc,
+                    )
+                elif candidate_probs is None:
                     _, candidate_probs = _bootstrap_frame_scores(
                         audio=chunk,
                         sample_rate=sample_rate,
@@ -948,15 +1015,51 @@ class SpeechBoundaryJaBackend:
                         sequence_ptm_sum = np.zeros((total_frames, ptm_dim), dtype=np.float64)
                         sequence_mfcc_sum = np.zeros((total_frames, mfcc_dim), dtype=np.float64)
                         sequence_feature_count = np.zeros(total_frames, dtype=np.float32)
+                        if sequence_projection is not None:
+                            projection_in_dim = int(sequence_projection["mean"].shape[0])
+                            if int(ptm.shape[1]) != projection_in_dim:
+                                raise ValueError(
+                                    "SPEECH_BOUNDARY_JA_SEQUENCE_PTM_PROJECTION expects "
+                                    f"{projection_in_dim}-dim ptm frames, extractor "
+                                    f"produced {int(ptm.shape[1])}"
+                                )
+                            sequence_ptm_projected_sum = np.zeros(
+                                (
+                                    total_frames,
+                                    int(sequence_projection["components"].shape[0]),
+                                ),
+                                dtype=np.float64,
+                            )
                     sequence_ptm_sum[global_start:global_end] += ptm[:local_end, :ptm_dim]
                     sequence_mfcc_sum[global_start:global_end] += mfcc[:local_end, :mfcc_dim]
                     sequence_feature_count[global_start:global_end] += 1.0
+                    if sequence_ptm_projected_sum is not None:
+                        # Projection is affine and overlap weights sum to 1, so
+                        # averaging per-window projections equals projecting the
+                        # averaged full-dim frames (which are never materialized).
+                        centered = (
+                            ptm[:local_end].astype(np.float64)
+                            - sequence_projection["mean"]
+                        )
+                        sequence_ptm_projected_sum[global_start:global_end] += (
+                            centered @ sequence_projection["components"].T
+                        )
                 print(
                     "[boundary] speech_boundary_ja window "
                     f"{window_index + 1}/{len(starts)} start={window_start_s:.1f}s "
                     f"frames={local_end}",
                     flush=True,
                 )
+                # The promoted chain runs two Mamba2 forwards per window
+                # (scorer + learned proposer); on WDDM the caching allocator's
+                # reserved memory grows across hundreds of windows and commits
+                # shared system RAM. This periodic drop bounds fragmentation
+                # so the loop itself completes (it cannot free the in-scope
+                # scorer/proposer weights — that release happens in the
+                # finally below, after the loop, before the chunk builder
+                # runs). v1 ran one forward/window and did not hit this.
+                if device.type == "cuda" and window_index and window_index % 16 == 0:
+                    torch.cuda.empty_cache()
 
             probabilities = np.divide(
                 probability_sum,
@@ -1013,6 +1116,8 @@ class SpeechBoundaryJaBackend:
             )
             if scorer_signature is not None:
                 params["scorer_checkpoint"] = scorer_signature
+            if proposal_signature is not None:
+                params["proposal_checkpoint"] = proposal_signature
             if (
                 cfg.export_sequence_features
                 and sequence_ptm_sum is not None
@@ -1022,14 +1127,26 @@ class SpeechBoundaryJaBackend:
                 counts = np.maximum(sequence_feature_count.reshape(-1, 1), 1.0)
                 sequence_ptm = (sequence_ptm_sum / counts).astype(np.float32)
                 sequence_mfcc = (sequence_mfcc_sum / counts).astype(np.float32)
-                params["sequence_feature_frames"] = {
+                sequence_payload: dict[str, Any] = {
                     "schema": "speech_boundary_ja_sequence_feature_frames_v1",
                     "frame_hop_s": float(cfg.frame_hop_s),
-                    "ptm": sequence_ptm.tolist(),
-                    "mfcc": sequence_mfcc.tolist(),
+                    "ptm": sequence_ptm,
+                    "mfcc": sequence_mfcc,
                     "ptm_dim": int(sequence_ptm.shape[1]),
                     "mfcc_dim": int(sequence_mfcc.shape[1]),
                 }
+                if sequence_ptm_projected_sum is not None:
+                    sequence_ptm_projected = (
+                        sequence_ptm_projected_sum / counts
+                    ).astype(np.float32)
+                    sequence_payload["ptm_projected"] = sequence_ptm_projected
+                    sequence_payload["ptm_projected_dim"] = int(
+                        sequence_ptm_projected.shape[1]
+                    )
+                    sequence_payload["ptm_projection_digest"] = str(
+                        sequence_projection["digest"]
+                    )
+                params["sequence_feature_frames"] = sequence_payload
             if _env_bool("SPEECH_BOUNDARY_JA_EXPORT_FRAME_SCORES", "0") or cfg.export_sequence_features:
                 params["frame_scores"] = [float(value) for value in probabilities]
                 params["candidate_frame_scores"] = [float(value) for value in candidate_probabilities]
@@ -1045,5 +1162,19 @@ class SpeechBoundaryJaBackend:
             close = getattr(ptm_extractor, "close", None)
             if callable(close):
                 close()
+            # The scorer + learned proposer are locals loaded for the window
+            # loop; they are only dereferenced when segment() returns, which
+            # is AFTER this finally runs. The mid-loop empty_cache above
+            # cannot release them (still in scope), so on WDDM their reserved
+            # GPU memory — backed by shared system RAM — survives into the
+            # downstream chunk builder and OOMs the (386580,168) feature
+            # build on 16GB-RAM hosts. Dereference them explicitly here, then
+            # collect + drop the cache, so the OS reclaims that commit before
+            # segment() hands control back. (v1 ran one forward/window and
+            # stayed well under the ceiling; the promoted chain runs two.)
+            del scorer, proposal
+            import gc
+            gc.collect()
             if device.type == "cuda":
+                torch.cuda.synchronize()
                 torch.cuda.empty_cache()

@@ -2,55 +2,19 @@ from __future__ import annotations
 
 import hashlib
 import math
-import os
 import re
-from collections import Counter
 from pathlib import Path
 from typing import Any, Iterable, Mapping
 
-from asr.backends.qwen import (
-    DEFAULT_CUEQC_CHECKPOINT_BY_REPO,
-    checkpoint_path_for_repo_env,
-    current_qwen_asr_backend,
-)
-
 
 CUEQC_FEATURE_SCHEMA_VERSION = 1
-CUEQC_SHADOW_SCHEMA_VERSION = 1
-CUEQC_DECISION_VERSION = "cueqc_display_binary_v1"
-CUEQC_MODEL_VERSION = "cueqc_mamba_v4_binary"
 
-_FALSE_VALUES = {"0", "false", "no", "off", "disabled"}
-_TRUE_VALUES = {"1", "true", "yes", "on", "enabled"}
 _COMPACT_TEXT_RE = re.compile(r"[^0-9A-Za-z\u3040-\u30ff\u3400-\u9fff]+")
 _PUNCT_RE = re.compile(
     r"[\s\u3000\u3001\u3002\uff01\uff1f\uff0c\uff0e,.!?~\u301c"
     r"\u30fc\u2010-\u2015\u300c\u300d\u300e\u300f()\[\]{}]+"
 )
 _KANA_RE = re.compile(r"^[\u3040-\u30ff]+$")
-
-
-def _env_bool(name: str, default: bool) -> bool:
-    value = os.getenv(name, "").strip().lower()
-    if not value:
-        return default
-    if value in _FALSE_VALUES:
-        return False
-    if value in _TRUE_VALUES:
-        return True
-    return default
-
-
-def _env_text(name: str, default: str = "") -> str:
-    return os.getenv(name, default).strip()
-
-
-def _active_cueqc_checkpoint_path() -> str:
-    return checkpoint_path_for_repo_env(
-        repo_id=current_qwen_asr_backend(),
-        mapping_env="CUEQC_MODEL_PATH_BY_REPO",
-        default_mapping=DEFAULT_CUEQC_CHECKPOINT_BY_REPO,
-    )
 
 
 def _optional_float(value: Any) -> float | None:
@@ -434,87 +398,6 @@ def build_candidates(
             )
         )
     return candidates
-
-
-def pending_model_decision(candidate: Mapping[str, Any]) -> dict[str, Any]:
-    return {
-        "schema": "cueqc_shadow_v1",
-        "schema_version": CUEQC_SHADOW_SCHEMA_VERSION,
-        "model_version": CUEQC_MODEL_VERSION,
-        "decision_version": CUEQC_DECISION_VERSION,
-        "mode": "pending_cueqc_model",
-        "cluster_id": candidate.get("cluster_id", "unclustered"),
-        "display_hint": "keep",
-        "confidence": 1.0,
-        "display_prob_keep": 1.0,
-        "display_prob_drop": 0.0,
-        "fallback_stage": "",
-        "fallback_detail": "",
-        "reasons": ["cueqc_model_pending"],
-    }
-
-
-def build_shadow_report(candidates: list[Mapping[str, Any]]) -> dict[str, Any]:
-    decisions = []
-    for candidate in candidates:
-        decision = pending_model_decision(candidate)
-        decisions.append(
-            {
-                "sample_id": candidate.get("sample_id", ""),
-                "chunk_index": candidate.get("chunk_index"),
-                "start": candidate.get("start"),
-                "end": candidate.get("end"),
-                "text_preview": candidate.get("text_preview", ""),
-                **decision,
-            }
-        )
-    return {
-        "schema": "cueqc_shadow_report_v1",
-        "enabled": cueqc_enabled(),
-        "shadow_only": False,
-        "feature_schema_version": CUEQC_FEATURE_SCHEMA_VERSION,
-        "decision_version": CUEQC_DECISION_VERSION,
-        "model_version": CUEQC_MODEL_VERSION,
-        "candidate_count": len(candidates),
-        "decisions": decisions,
-        "counts": {
-            "display_hint": dict(Counter(str(item.get("display_hint") or "") for item in decisions)),
-        },
-    }
-
-
-def cueqc_enabled() -> bool:
-    return _env_bool("CUEQC_SHADOW_ENABLED", False)
-
-
-def runtime_signature() -> dict[str, Any]:
-    checkpoint = _active_cueqc_checkpoint_path() if cueqc_enabled() else ""
-    checkpoint_hash = ""
-    if checkpoint:
-        path = Path(checkpoint).expanduser()
-        if path.exists() and path.is_file():
-            try:
-                hasher = hashlib.sha1()
-                with path.open("rb") as handle:
-                    for block in iter(lambda: handle.read(1024 * 1024), b""):
-                        hasher.update(block)
-                checkpoint_hash = hasher.hexdigest()
-            except Exception:
-                checkpoint_hash = ""
-    return {
-        "schema_version": CUEQC_SHADOW_SCHEMA_VERSION,
-        "feature_schema_version": CUEQC_FEATURE_SCHEMA_VERSION,
-        "enabled": cueqc_enabled(),
-        "shadow_only": True,
-        "policy": "cueqc_mamba_v4_binary_shadow",
-        "decision_version": CUEQC_DECISION_VERSION,
-        "model_version": CUEQC_MODEL_VERSION,
-        "model_path": checkpoint,
-        "checkpoint_sha1": checkpoint_hash,
-        "drop_threshold": _env_text("CUEQC_DROP_THRESHOLD", "0.85"),
-        "drop_apply_enabled": False,
-        "shadow_embed_candidates": _env_bool("CUEQC_SHADOW_EMBED_CANDIDATES", False),
-    }
 
 
 def numeric_feature_vector(candidate: Mapping[str, Any]) -> list[float]:

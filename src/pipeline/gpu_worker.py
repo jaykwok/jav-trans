@@ -500,6 +500,49 @@ def _auto_batch_setting(
     }
 
 
+def _apply_worker_vram_allocator_cap(
+    torch_module: Any,
+    *,
+    total_mb: float,
+    budget_mb: float,
+) -> float | None:
+    """Keep the CUDA worker below the physical-VRAM soft budget.
+
+    Windows WDDM can satisfy CUDA allocations from shared system memory after
+    dedicated VRAM is exhausted. The stage snapshot budget catches that after a
+    stage, but the allocator fraction makes the offending allocation fail at
+    the boundary instead of running slowly in shared memory.
+    """
+
+    if total_mb <= 0.0 or budget_mb <= 0.0:
+        return None
+    cuda = getattr(torch_module, "cuda", None)
+    if cuda is None:
+        return None
+    try:
+        if not cuda.is_available():
+            return None
+    except Exception:
+        return None
+    setter = getattr(cuda, "set_per_process_memory_fraction", None)
+    if not callable(setter):
+        return None
+    fraction = min(1.0, max(0.1, float(budget_mb) / float(total_mb)))
+    try:
+        device_count_fn = getattr(cuda, "device_count", None)
+        if callable(device_count_fn):
+            device_indexes = range(max(1, int(device_count_fn())))
+        else:
+            current_device_fn = getattr(cuda, "current_device", None)
+            current = int(current_device_fn()) if callable(current_device_fn) else 0
+            device_indexes = (current,)
+        for device_index in device_indexes:
+            setter(fraction, device_index)
+    except Exception:
+        return None
+    return fraction
+
+
 def _adaptive_runtime_tuning(torch_module: Any, env: dict[str, str]) -> dict[str, Any]:
     """Resolve auto VRAM budget and ASR batch inside the CUDA owner process."""
     total_mb = _physical_vram_mb(torch_module)
@@ -521,6 +564,11 @@ def _adaptive_runtime_tuning(torch_module: Any, env: dict[str, str]) -> dict[str
         except (TypeError, ValueError):
             budget_mb = 0.0
         budget_source = "explicit"
+    allocator_fraction = _apply_worker_vram_allocator_cap(
+        torch_module,
+        total_mb=total_mb,
+        budget_mb=budget_mb,
+    )
 
     raw_batch = str(
         env.get("ASR_BATCH_SIZE") or os.getenv("ASR_BATCH_SIZE", "auto")
@@ -583,6 +631,11 @@ def _adaptive_runtime_tuning(torch_module: Any, env: dict[str, str]) -> dict[str
         "vram_ratio": round(ratio, 4),
         "vram_budget_mb": round(budget_mb, 1),
         "vram_budget_source": budget_source,
+        "vram_allocator_fraction": (
+            round(float(allocator_fraction), 4)
+            if allocator_fraction is not None
+            else None
+        ),
         "asr_batch_size": effective_batch,
         "asr_batch_source": batch_source,
         "semantic_split_batch_size": semantic_batch,

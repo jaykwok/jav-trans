@@ -36,6 +36,8 @@ def test_vram_budget_enforced_on_allocated_not_reserved(monkeypatch):
 
 def test_auto_vram_budget_and_batch_scale_from_physical_memory(monkeypatch):
     monkeypatch.setenv("GPU_BATCH_PROFILE_ENABLED", "0")
+    allocator_calls: list[tuple[float, int]] = []
+
     class _Properties:
         total_memory = 8 * 1024 * 1024 * 1024
 
@@ -51,6 +53,10 @@ def test_auto_vram_budget_and_batch_scale_from_physical_memory(monkeypatch):
         @staticmethod
         def get_device_properties(_index):
             return _Properties()
+
+        @staticmethod
+        def set_per_process_memory_fraction(fraction, device):
+            allocator_calls.append((fraction, device))
 
     class _Torch:
         cuda = _Cuda()
@@ -71,7 +77,63 @@ def test_auto_vram_budget_and_batch_scale_from_physical_memory(monkeypatch):
 
     assert tuning["physical_vram_mb"] == pytest.approx(8192.0)
     assert tuning["vram_budget_source"] == "physical_vram_ratio"
+    assert tuning["vram_allocator_fraction"] == pytest.approx(0.95)
+    assert len(allocator_calls) == 1
+    assert allocator_calls[0][0] == pytest.approx(0.95)
+    assert allocator_calls[0][1] == 0
     assert tuning["asr_batch_source"] == "auto_scaled_from_vram"
+
+
+def test_explicit_vram_budget_sets_worker_allocator_fraction(monkeypatch):
+    monkeypatch.setenv("GPU_BATCH_PROFILE_ENABLED", "0")
+    allocator_calls: list[tuple[float, int]] = []
+
+    class _Properties:
+        total_memory = 8 * 1024 * 1024 * 1024
+
+    class _Cuda:
+        @staticmethod
+        def is_available():
+            return True
+
+        @staticmethod
+        def device_count():
+            return 1
+
+        @staticmethod
+        def current_device():
+            return 0
+
+        @staticmethod
+        def get_device_properties(_index):
+            return _Properties()
+
+        @staticmethod
+        def get_device_name(_index):
+            return "Fake GPU"
+
+        @staticmethod
+        def set_per_process_memory_fraction(fraction, device):
+            allocator_calls.append((fraction, device))
+
+    class _Torch:
+        cuda = _Cuda()
+
+    env = {
+        "ASR_BACKEND": "jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame-hf",
+        "ASR_BATCH_SIZE": "auto",
+        "ASR_STAGE_WORKER_VRAM_BUDGET_MB": "4096",
+        "ASR_STAGE_WORKER_VRAM_RATIO": "0.95",
+    }
+    with gpu_worker._temporary_env(env):
+        tuning = gpu_worker._adaptive_runtime_tuning(_Torch(), env)
+
+    assert tuning["vram_budget_source"] == "explicit"
+    assert tuning["vram_budget_mb"] == pytest.approx(4096.0)
+    assert tuning["vram_allocator_fraction"] == pytest.approx(0.5)
+    assert len(allocator_calls) == 1
+    assert allocator_calls[0][0] == pytest.approx(0.5)
+    assert allocator_calls[0][1] == 0
 
 
 def test_boundary_oom_does_not_change_temporal_window():

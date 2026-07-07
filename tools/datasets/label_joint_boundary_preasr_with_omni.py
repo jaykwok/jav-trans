@@ -30,7 +30,7 @@ from tools.asr.cueqc.label_pre_asr_v10_with_omni import (  # noqa: E402
 )
 
 
-PROMPT_VERSION = "joint_boundary_preasr_omni_v1"
+PROMPT_VERSION = "joint_boundary_preasr_omni_v2"
 JOINT_SCHEMA = "joint_boundary_preasr_omni_label_v1"
 
 
@@ -137,7 +137,7 @@ def _build_prompt(
         }
         for position, row in enumerate(chunk_items)
     ]
-    return f"""你是日语 ASR 边界与语义声音联合标注器。只听这一个音频，一次完成两类标注。
+    return f"""你是日语 ASR 边界与语义声音联合标注器。只听这一个音频，一次完成三类标注。
 音频时间范围为 0.000 到 {duration_s:.3f} 秒；下列时间都相对此音频。
 
 任务 A：逐个判断 split_candidates 的候选切点。
@@ -145,6 +145,9 @@ def _build_prompt(
 - continue：同一句内部停顿、喘息、拖音、重复、呻吟或短静音；合并更自然。
 - unsure：无法可靠判断。
 - 不要仅因静音、喘息或说话人变化就切。cut 必须同时满足 left_complete=true、right_complete=true、merged_better=false。
+
+任务 A2：报告漏掉的句界。如果音频中存在明显的语义句界，但 split_candidates 里 ±0.30 秒内没有任何候选，
+把它的时间（三位小数）加入 missed_boundaries 并给出 confidence；没有漏掉的句界就返回空数组。
 
 任务 B：逐个判断 runtime_chunks 是否应送入 ASR。
 - keep：至少包含一个可辨认且有词义的日语词或短句。
@@ -160,6 +163,9 @@ runtime_chunks={json.dumps(chunk_payload, ensure_ascii=False, separators=(",", "
 {{
   "split_decisions":[
     {{"id":"s000","label":"cut|continue|unsure","confidence":0.0,"left_complete":false,"right_complete":false,"merged_better":true,"flags":[]}}
+  ],
+  "missed_boundaries":[
+    {{"time_s":0.000,"confidence":0.0}}
   ],
   "chunk_decisions":[
     {{"id":"p000","label":"keep|drop|unsure","confidence":0.0,"semantic_speech_detected":false,"flags":[]}}
@@ -241,6 +247,44 @@ def _normalize_chunk_decision(
     }
 
 
+def _normalize_missed_boundaries(
+    value: Any,
+    *,
+    duration_s: float,
+    confidence_threshold: float,
+) -> list[dict[str, Any]]:
+    """Keep in-window missed-boundary reports; drop junk and low confidence."""
+
+    if not isinstance(value, list):
+        return []
+    rows: list[dict[str, Any]] = []
+    seen: set[int] = set()
+    for item in value:
+        if not isinstance(item, Mapping):
+            continue
+        try:
+            time_s = float(item.get("time_s"))
+        except (TypeError, ValueError):
+            continue
+        if not 0.0 < time_s < duration_s:
+            continue
+        confidence = _confidence(item.get("confidence"))
+        if confidence < confidence_threshold:
+            continue
+        key = int(round(time_s * 1000.0))
+        if key in seen:
+            continue
+        seen.add(key)
+        rows.append(
+            {
+                "time_s": round(time_s, 3),
+                "confidence": confidence,
+                "flags": [str(flag) for flag in (item.get("flags") or [])],
+            }
+        )
+    return sorted(rows, key=lambda row: row["time_s"])
+
+
 def _call_with_retry(
     *,
     audio_path: Path,
@@ -251,13 +295,14 @@ def _call_with_retry(
     audio_content_mode: str,
     timeout_s: float,
     max_tokens: int,
+    audio_fmt: str = "wav",
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     last_error: BaseException | None = None
     for attempt in range(6):
         try:
             return call_omni(
                 audio_path=audio_path,
-                fmt="mp3",
+                fmt=audio_fmt,
                 audio_content_mode=audio_content_mode,
                 model=model,
                 api_key=api_key,
@@ -341,8 +386,14 @@ def _process_window(
             "chunk_count": len(chunk_rows),
         }
     try:
+        # Upload the training-grade WAV directly: Qwen3.5-Omni encodes audio at
+        # a fixed token rate (independent of bitrate), so the 32k MP3 resample
+        # cost no tokens and only low-passed/quantized the breathy/whisper
+        # textures that matter for keep/drop. WAV also keeps the Omni label and
+        # the training feature on the exact same audio.
+        omni_audio_path = Path(row["audio_wav"])
         parsed, raw = _call_with_retry(
-            audio_path=Path(row["omni_mp3_32k"]),
+            audio_path=omni_audio_path,
             prompt=prompt,
             model=model,
             api_key=api_key,
@@ -350,6 +401,7 @@ def _process_window(
             audio_content_mode=audio_content_mode,
             timeout_s=timeout_s,
             max_tokens=max_tokens,
+            audio_fmt="wav",
         )
     except Exception as exc:  # noqa: BLE001
         _write_json(
@@ -367,6 +419,20 @@ def _process_window(
         }
     split_by_id = _response_by_id(parsed.get("split_decisions"))
     chunk_by_id = _response_by_id(parsed.get("chunk_decisions"))
+    missed_boundaries = [
+        {
+            "schema": "joint_split_missed_boundary_v1",
+            "window_id": window_id,
+            "prompt_version": PROMPT_VERSION,
+            "model": model,
+            **missed,
+        }
+        for missed in _normalize_missed_boundaries(
+            parsed.get("missed_boundaries"),
+            duration_s=float(row["duration_s"]),
+            confidence_threshold=split_confidence,
+        )
+    ]
     split_labels: list[dict[str, Any]] = []
     for position, candidate in enumerate(split_rows):
         item_id = f"s{position:03d}"
@@ -444,9 +510,8 @@ def _process_window(
                 "prompt_version": PROMPT_VERSION,
                 "audio": str(segment_path.resolve()),
                 "audio_format": "wav",
-                "omni_request_audio": str(Path(row["omni_mp3_32k"]).resolve()),
-                "omni_request_audio_format": "mp3",
-                "omni_request_audio_bitrate": "32k",
+                "omni_request_audio": str(omni_audio_path.resolve()),
+                "omni_request_audio_format": "wav",
                 "feature_schema": str(candidate.get("feature_schema") or ""),
                 "runtime_adapter": str(candidate.get("runtime_adapter") or ""),
             }
@@ -461,6 +526,7 @@ def _process_window(
         "training_audio_wav": str(Path(row["audio_wav"]).resolve()),
         "split_labels": split_labels,
         "pre_asr_labels": pre_asr_labels,
+        "missed_boundaries": missed_boundaries,
         "response_usage": raw.get("usage"),
         "response_finish_reasons": raw.get("finish_reasons"),
     }
@@ -482,14 +548,18 @@ def _process_window(
     }
 
 
-def _collect_completed(output: Path) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+def _collect_completed(
+    output: Path,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
     split_rows: list[dict[str, Any]] = []
     pre_asr_rows: list[dict[str, Any]] = []
+    missed_rows: list[dict[str, Any]] = []
     for path in sorted((output / "joint_labels").glob("*.json")):
         payload = json.loads(path.read_text(encoding="utf-8"))
         split_rows.extend(payload.get("split_labels") or [])
         pre_asr_rows.extend(payload.get("pre_asr_labels") or [])
-    return split_rows, pre_asr_rows
+        missed_rows.extend(payload.get("missed_boundaries") or [])
+    return split_rows, pre_asr_rows, missed_rows
 
 
 def run(args: argparse.Namespace) -> None:
@@ -547,10 +617,12 @@ def run(args: argparse.Namespace) -> None:
                 f"error={result.get('error', '')}",
                 flush=True,
             )
-    split_rows, pre_asr_rows = _collect_completed(output)
+    split_rows, pre_asr_rows, missed_rows = _collect_completed(output)
     _write_jsonl(output / "split_labels.jsonl", split_rows)
     _write_jsonl(output / "pre_asr_labels.jsonl", pre_asr_rows)
+    _write_jsonl(output / "missed_boundaries.jsonl", missed_rows)
     _write_jsonl(dataset / "semantic_split" / "labels.jsonl", split_rows)
+    _write_jsonl(dataset / "semantic_split" / "missed_boundaries.jsonl", missed_rows)
     _write_jsonl(dataset / "pre_asr" / "labels.jsonl", pre_asr_rows)
     split_counts = Counter(str(row["label"]) for row in split_rows)
     pre_asr_counts = Counter(str(row["label"]) for row in pre_asr_rows)
@@ -568,10 +640,13 @@ def run(args: argparse.Namespace) -> None:
             "errors_this_run": len(errors),
             "split_label_count": len(split_rows),
             "split_labels": dict(split_counts),
+            "missed_boundary_count": len(missed_rows),
+            "missed_boundary_window_count": len(
+                {str(item.get("window_id")) for item in missed_rows}
+            ),
             "pre_asr_label_count": len(pre_asr_rows),
             "pre_asr_labels": dict(pre_asr_counts),
-            "omni_audio_format": "mp3",
-            "omni_audio_bitrate": "32k",
+            "omni_audio_format": "wav",
             "training_audio_format": "wav",
             "sample_rate": 16000,
             "model": model,
