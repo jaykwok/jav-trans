@@ -18,7 +18,12 @@ if str(PROJECT_ROOT) not in sys.path:
 if str(SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(SRC_ROOT))
 
-from asr.backends.qwen import qwen_asr_repo_id, qwen_asr_repo_tag  # noqa: E402
+from asr.backends.qwen import (  # noqa: E402
+    DEFAULT_SEMANTIC_SPLIT_CHECKPOINT_BY_REPO,
+    checkpoint_path_for_repo_env,
+    qwen_asr_repo_id,
+    qwen_asr_repo_tag,
+)
 from asr.pre_asr_cueqc import (  # noqa: E402
     PRE_ASR_CUEQC_ARTIFACT,
     PRE_ASR_CUEQC_DEFAULT_DROP_THRESHOLD,
@@ -40,7 +45,7 @@ from tools.asr.cueqc.compile_pre_asr_v11_features import (  # noqa: E402
 )
 
 
-METRICS_SCHEMA = "cueqc_pre_asr_semantic_chunk_v11_train_metrics"
+METRICS_SCHEMA = "cueqc_pre_asr_semantic_chunk_v12_train_metrics"
 DEFAULT_SWEEP_THRESHOLDS = (
     0.50,
     0.60,
@@ -58,7 +63,7 @@ DEFAULT_SWEEP_THRESHOLDS = (
 
 
 def default_checkpoint_name(asr_repo_id: str) -> str:
-    return f"pre_asr_cueqc_v11.{qwen_asr_repo_tag(asr_repo_id)}.pt"
+    return f"pre_asr_cueqc_v12.{qwen_asr_repo_tag(asr_repo_id)}.pt"
 
 
 def file_sha256(path: Path) -> str:
@@ -67,6 +72,16 @@ def file_sha256(path: Path) -> str:
         for block in iter(lambda: handle.read(1024 * 1024), b""):
             h.update(block)
     return h.hexdigest()
+
+
+def active_semantic_split_checkpoint(asr_repo_id: str) -> Path:
+    return Path(
+        checkpoint_path_for_repo_env(
+            repo_id=asr_repo_id,
+            mapping_env="SEMANTIC_SPLIT_MODEL_PATH_BY_REPO",
+            default_mapping=DEFAULT_SEMANTIC_SPLIT_CHECKPOINT_BY_REPO,
+        )
+    )
 
 
 def load_feature_bundle(path: Path) -> dict[str, Any]:
@@ -78,7 +93,7 @@ def load_feature_bundle(path: Path) -> dict[str, Any]:
     if payload.get("schema") != FEATURE_BUNDLE_SCHEMA:
         raise ValueError(f"unsupported feature bundle schema: {payload.get('schema')!r}")
     if tuple(payload.get("feature_names") or ()) != PRE_ASR_CUEQC_SCALAR_FEATURE_NAMES:
-        raise ValueError("feature bundle feature_names do not match Pre-ASR CueQC v11 runtime")
+        raise ValueError("feature bundle feature_names do not match Pre-ASR CueQC v12 runtime")
     if payload.get("feature_schema") != PRE_ASR_CUEQC_FEATURE_SCHEMA:
         raise ValueError("feature bundle feature_schema mismatch")
     if payload.get("runtime_adapter") != PRE_ASR_CUEQC_RUNTIME_ADAPTER:
@@ -544,6 +559,7 @@ def train(
     force_train_audio_ids: list[str],
     anchor_boost_audio_ids: list[str],
     anchor_boost: int,
+    semantic_split_checkpoint: Path | None,
 ) -> dict[str, Any]:
     import torch
     import torch.nn.functional as F
@@ -564,6 +580,10 @@ def train(
     if y.shape != chunk_mask.shape or y.shape != scalar.shape[:2]:
         raise ValueError("label tensor shape mismatch")
     selected_repo = qwen_asr_repo_id(asr_repo_id)
+    split_checkpoint_path = semantic_split_checkpoint or active_semantic_split_checkpoint(selected_repo)
+    if not split_checkpoint_path.exists():
+        raise FileNotFoundError(f"semantic split checkpoint not found: {split_checkpoint_path}")
+    split_checkpoint_sha256 = file_sha256(split_checkpoint_path)
     bundle_repo = qwen_asr_repo_id(str(bundle.get("asr_repo_id") or selected_repo))
     if bundle_repo != selected_repo:
         raise ValueError(f"feature bundle asr_repo_id={bundle_repo!r} does not match {selected_repo!r}")
@@ -770,6 +790,8 @@ def train(
         "features": repo_display_path(features_path),
         "feature_sha256": file_sha256(features_path),
         "asr_repo_id": selected_repo,
+        "semantic_split_checkpoint": repo_display_path(split_checkpoint_path),
+        "semantic_split_weights_sha256": split_checkpoint_sha256,
         "split": split_summary,
         "train_group_count": int(split_summary["train_group_count"]),
         "val_group_count": int(split_summary["val_group_count"]),
@@ -823,6 +845,7 @@ def train(
         "feature_schema": PRE_ASR_CUEQC_FEATURE_SCHEMA,
         "runtime_adapter": PRE_ASR_CUEQC_RUNTIME_ADAPTER,
         "feature_names": list(PRE_ASR_CUEQC_SCALAR_FEATURE_NAMES),
+        "semantic_split_weights_sha256": split_checkpoint_sha256,
         "model_config": model_config,
         "feature_mean": mean.cpu().numpy().astype(np.float32).tolist(),
         "feature_std": std.cpu().numpy().astype(np.float32).tolist(),
@@ -831,6 +854,7 @@ def train(
             "hard_keep_veto": False,
             "hard_drop_rule": False,
             "keep_veto": False,
+            "model_only": True,
             "inference_window_size": int(sequence_window_size),
         },
         "metadata": {
@@ -840,6 +864,8 @@ def train(
             "runtime_adapter": PRE_ASR_CUEQC_RUNTIME_ADAPTER,
             "feature_bundle": repo_display_path(features_path),
             "feature_bundle_sha256": file_sha256(features_path),
+            "semantic_split_checkpoint": repo_display_path(split_checkpoint_path),
+            "semantic_split_weights_sha256": split_checkpoint_sha256,
             "trained_steps": int(steps),
             "sequence_window_size": int(sequence_window_size),
             "split_mode": str(split_mode),
@@ -877,7 +903,7 @@ def train(
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Train Pre-ASR CueQC v11 hierarchical Mamba2 binary checkpoint.")
+    parser = argparse.ArgumentParser(description="Train Pre-ASR CueQC v12 hierarchical Mamba2 binary checkpoint.")
     parser.add_argument("--features", required=True)
     parser.add_argument("--output-dir", required=True)
     parser.add_argument("--asr-repo-id", required=True)
@@ -895,7 +921,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--focal-gamma", type=float, default=2.0)
     parser.add_argument(
         "--init-checkpoint",
-        help="Fine-tune from an existing compatible v11 checkpoint and preserve its normalization.",
+        help="Fine-tune from an existing compatible v12 checkpoint and preserve its normalization.",
+    )
+    parser.add_argument(
+        "--semantic-split-checkpoint",
+        help="Semantic Split checkpoint whose sha256 must be embedded in the v12 checkpoint; defaults to the active repo mapping.",
     )
     parser.add_argument(
         "--force-train-audio-id",
@@ -969,6 +999,11 @@ def main(argv: list[str] | None = None) -> int:
         init_checkpoint=(
             project_path(args.init_checkpoint)
             if args.init_checkpoint
+            else None
+        ),
+        semantic_split_checkpoint=(
+            project_path(args.semantic_split_checkpoint)
+            if args.semantic_split_checkpoint
             else None
         ),
         force_train_audio_ids=list(args.force_train_audio_id),

@@ -569,12 +569,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--pre-asr-cueqc-enabled",
         action=argparse.BooleanOptionalAction,
         default=_env_bool("PRE_ASR_CUEQC_ENABLED", False),
-        help="Run Pre-ASR CueQC v11 after semantic boundary planning and before ASR export.",
+        help="Run Pre-ASR CueQC v12 after semantic boundary planning and before ASR export.",
     )
     parser.add_argument(
         "--pre-asr-cueqc-model-path-by-repo",
         default=os.getenv("PRE_ASR_CUEQC_MODEL_PATH_BY_REPO", ""),
-        help="Optional repo-id checkpoint map for cueqc_pre_asr_mamba_v11_binary.",
+        help="Optional repo-id checkpoint map for cueqc_pre_asr_semantic_chunk_v12_binary.",
     )
     parser.add_argument("--pre-asr-cueqc-device", default=os.getenv("PRE_ASR_CUEQC_DEVICE", "auto"))
     parser.add_argument(

@@ -35,7 +35,7 @@ from asr.pre_asr_cueqc import (  # noqa: E402
 )
 
 
-FEATURE_BUNDLE_SCHEMA = "cueqc_pre_asr_semantic_chunk_v11_features"
+FEATURE_BUNDLE_SCHEMA = "cueqc_pre_asr_semantic_chunk_v12_features"
 
 
 def project_path(value: str | Path) -> Path:
@@ -80,6 +80,12 @@ def extract_chunks(payload: Any) -> list[dict[str, Any]]:
         value = payload.get(key)
         if isinstance(value, list):
             return [dict(row) for row in value if isinstance(row, Mapping)]
+    if (
+        ("candidate_id" in payload or "sample_id" in payload or "id" in payload)
+        and "start" in payload
+        and "end" in payload
+    ):
+        return [dict(payload)]
     details = payload.get("details")
     if isinstance(details, Mapping):
         return extract_chunks(details)
@@ -127,6 +133,29 @@ def read_chunk_document(path: Path) -> tuple[str, list[dict[str, Any]]]:
         if embedded_audio_id:
             audio_id = embedded_audio_id
     return audio_id, chunks
+
+
+def expand_chunk_paths(paths: Iterable[str]) -> list[Path]:
+    expanded: list[Path] = []
+    for raw_path in paths:
+        path = project_path(raw_path)
+        try:
+            rows = read_json_or_jsonl(path)
+        except (UnicodeDecodeError, json.JSONDecodeError, ValueError):
+            expanded.append(path)
+            continue
+        manifest_paths = [
+            str(row.get("pre_asr_candidates") or "").strip()
+            for row in rows
+            if isinstance(row, Mapping)
+            and isinstance(row.get("pre_asr_candidates"), (str, Path))
+        ]
+        manifest_paths = [value for value in manifest_paths if value]
+        if manifest_paths and len(manifest_paths) == len(rows):
+            expanded.extend(project_path(value) for value in manifest_paths)
+        else:
+            expanded.append(path)
+    return expanded
 
 
 def label_keys(row: Mapping[str, Any]) -> list[str]:
@@ -266,7 +295,7 @@ def candidate_for_chunk(chunks: list[dict[str, Any]], index: int) -> dict[str, A
         candidate = candidate_from_span(chunks, index, require_ptm_pooling=True)
     if not _has_required_ptm_pooling(candidate):
         raise ValueError(
-            "Pre-ASR CueQC v11 feature compilation requires chunk-level pooled PTM features"
+            "Pre-ASR CueQC v12 feature compilation requires chunk-level pooled PTM features"
         )
     return candidate
 
@@ -324,10 +353,10 @@ def compile_features(
     import torch
 
     labels = read_labels(label_paths)
+    expanded_chunk_paths = expand_chunk_paths(chunk_paths)
     rows: list[dict[str, Any]] = []
     group_map: dict[tuple[str, str, str], list[int]] = {}
-    for raw_path in chunk_paths:
-        path = project_path(raw_path)
+    for path in expanded_chunk_paths:
         source = repo_display_path(path)
         audio_id, chunks = read_chunk_document(path)
         for index, chunk in enumerate(chunks):
@@ -402,14 +431,14 @@ def compile_features(
         "created_at": datetime.now().isoformat(timespec="seconds"),
         "rows": row_payload,
         "groups": group_payload,
-        "source_files": [repo_display_path(project_path(path)) for path in chunk_paths],
+        "source_files": [repo_display_path(path) for path in expanded_chunk_paths],
         "label_files": [repo_display_path(project_path(path)) for path in label_paths],
         **bundle_tensors,
     }
     output.parent.mkdir(parents=True, exist_ok=True)
     torch.save(bundle, output)
     summary = {
-        "schema": "cueqc_pre_asr_semantic_chunk_v11_feature_summary",
+        "schema": "cueqc_pre_asr_semantic_chunk_v12_feature_summary",
         "feature_bundle": repo_display_path(output),
         "feature_schema": PRE_ASR_CUEQC_FEATURE_SCHEMA,
         "runtime_adapter": PRE_ASR_CUEQC_RUNTIME_ADAPTER,
@@ -429,7 +458,7 @@ def compile_features(
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Compile Pre-ASR CueQC v11 semantic-chunk features.")
+    parser = argparse.ArgumentParser(description="Compile Pre-ASR CueQC v12 semantic-chunk features.")
     parser.add_argument("--chunks", action="append", required=True, help="Workflow details/chunk JSON or JSONL.")
     parser.add_argument("--labels", action="append", required=True, help="JSON/JSONL labels with keep/drop/ignore.")
     parser.add_argument("--output", required=True)

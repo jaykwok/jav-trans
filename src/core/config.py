@@ -122,7 +122,7 @@ DEFAULT_SETTINGS: dict[str, str] = {
     # Persistent boundary cache directory. Versioned by src/boundary/cache.py.
     "BOUNDARY_CACHE_DIR": "./tmp/cache/boundary",
 
-    # --- Pre-ASR CueQC v11 semantic chunk keep/drop router ---
+    # --- Pre-ASR CueQC v12 semantic chunk keep/drop router ---
     # Low-VRAM default: drop obvious non-speech chunks before ASR.
     "PRE_ASR_CUEQC_ENABLED": "1",
     "PRE_ASR_CUEQC_MODEL_PATH_BY_REPO": "",

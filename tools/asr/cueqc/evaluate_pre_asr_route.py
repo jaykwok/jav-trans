@@ -16,7 +16,7 @@ for value in (ROOT, SRC):
         sys.path.insert(0, str(value))
 
 from asr.pre_asr_cueqc import load_checkpoint  # noqa: E402
-from tools.asr.cueqc.compile_pre_asr_v11_features import (  # noqa: E402
+from tools.asr.cueqc.compile_pre_asr_v12_features import (  # noqa: E402
     candidate_for_chunk,
     read_chunk_document,
 )
@@ -92,7 +92,7 @@ def evaluate_route(
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Evaluate a Pre-ASR v11 checkpoint on exported runtime candidates."
+        description="Evaluate a Pre-ASR v12 checkpoint on exported runtime candidates."
     )
     parser.add_argument("--candidates", type=Path, required=True)
     parser.add_argument("--checkpoint", type=Path, required=True)

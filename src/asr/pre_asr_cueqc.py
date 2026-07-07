@@ -9,6 +9,7 @@ import numpy as np
 
 from asr.backends.qwen import (
     DEFAULT_PRE_ASR_CUEQC_CHECKPOINT_BY_REPO,
+    DEFAULT_SEMANTIC_SPLIT_CHECKPOINT_BY_REPO,
     checkpoint_path_for_repo_env,
     current_qwen_asr_backend,
     validate_checkpoint_repo_id,
@@ -21,15 +22,15 @@ from boundary.sequence_features import (
 )
 
 
-PRE_ASR_CUEQC_SCHEMA = "cueqc_pre_asr_semantic_chunk_v11_binary"
-PRE_ASR_CUEQC_MODEL_ARCH = "cueqc_pre_asr_semantic_chunk_v11"
-PRE_ASR_CUEQC_DECISION_VERSION = "pre_asr_cueqc_v11_binary_v1"
+PRE_ASR_CUEQC_SCHEMA = "cueqc_pre_asr_semantic_chunk_v12_binary"
+PRE_ASR_CUEQC_MODEL_ARCH = "cueqc_pre_asr_semantic_chunk_v12"
+PRE_ASR_CUEQC_DECISION_VERSION = "pre_asr_cueqc_v12_binary_v1"
 PRE_ASR_CUEQC_FEATURE_SCHEMA = "pre_asr_cueqc_features_v9"
 PRE_ASR_CUEQC_RUNTIME_ADAPTER = "pre_asr_semantic_chunk_sequence_v4"
 PRE_ASR_CUEQC_ARTIFACT = {
     "name": "pre_asr_cueqc",
     "display_name": "Pre-ASR CueQC",
-    "version": "v11",
+    "version": "v12",
     "pipeline_stage": 5,
     "pipeline_role": "final_chunk_keep_drop_routing",
 }
@@ -235,6 +236,14 @@ def _checkpoint_path(repo_id: str | None = None) -> str:
         repo_id=repo_id or current_qwen_asr_backend(),
         mapping_env="PRE_ASR_CUEQC_MODEL_PATH_BY_REPO",
         default_mapping=DEFAULT_PRE_ASR_CUEQC_CHECKPOINT_BY_REPO,
+    )
+
+
+def _semantic_split_checkpoint_path(repo_id: str | None = None) -> str:
+    return checkpoint_path_for_repo_env(
+        repo_id=repo_id or current_qwen_asr_backend(),
+        mapping_env="SEMANTIC_SPLIT_MODEL_PATH_BY_REPO",
+        default_mapping=DEFAULT_SEMANTIC_SPLIT_CHECKPOINT_BY_REPO,
     )
 
 
@@ -462,9 +471,24 @@ def _pooled_ptm_values(
     require_ptm_pooling: bool,
 ) -> tuple[list[float], bool, str, int | None, int | None]:
     raw_values = _packed_value(span, "pre_asr_ptm_pooled_features", [])
-    schema = str(_packed_value(span, "pre_asr_ptm_pooling_schema", "") or "")
-    bins = _packed_value(span, "pre_asr_ptm_pooling_bins")
-    dim = _packed_value(span, "pre_asr_ptm_pooling_dim")
+    schema = str(
+        _packed_value(
+            span,
+            "pre_asr_ptm_pooling_schema",
+            _packed_value(span, "ptm_pooling_schema", ""),
+        )
+        or ""
+    )
+    bins = _packed_value(
+        span,
+        "pre_asr_ptm_pooling_bins",
+        _packed_value(span, "ptm_pooling_bins"),
+    )
+    dim = _packed_value(
+        span,
+        "pre_asr_ptm_pooling_dim",
+        _packed_value(span, "ptm_pooling_dim"),
+    )
     try:
         parsed_bins = None if bins is None else int(bins)
     except (TypeError, ValueError):
@@ -484,7 +508,7 @@ def _pooled_ptm_values(
     if available:
         return values, True, schema, parsed_bins or PRE_ASR_CUEQC_PTM_BINS, expected_dim
     if require_ptm_pooling:
-        raise ValueError("Pre-ASR CueQC v11 requires chunk-level pooled PTM features")
+        raise ValueError("Pre-ASR CueQC v12 requires chunk-level pooled PTM features")
     return [0.0] * expected_dim, False, schema, parsed_bins, parsed_dim
 
 
@@ -1150,9 +1174,15 @@ class PreAsrCueQC:
             decision.get("drop_threshold", PRE_ASR_CUEQC_DEFAULT_DROP_THRESHOLD)
         )
         self.inference_window_size = max(0, int(decision.get("inference_window_size") or 512))
-        self.hard_keep_veto_enabled = bool(decision.get("hard_keep_veto", True))
-        self.hard_drop_rule_enabled = bool(decision.get("hard_drop_rule", True))
-        self.keep_veto_enabled = bool(decision.get("keep_veto", True))
+        self.hard_keep_veto_enabled = bool(decision.get("hard_keep_veto", False))
+        self.hard_drop_rule_enabled = bool(decision.get("hard_drop_rule", False))
+        self.keep_veto_enabled = bool(decision.get("keep_veto", False))
+        if (
+            self.hard_keep_veto_enabled
+            or self.hard_drop_rule_enabled
+            or self.keep_veto_enabled
+        ):
+            raise ValueError("Pre-ASR CueQC v12/v9 checkpoints must disable hard rules")
         self.hard_keep_min_duration_s = float(decision.get("hard_keep_min_duration_s", 0.80))
         self.high_speech_p90 = float(decision.get("high_speech_p90", 0.85))
         self.high_active_ratio = float(decision.get("high_active_ratio", 0.50))
@@ -1415,4 +1445,14 @@ def load_active(*, expected_asr_repo_id: str | None = None) -> PreAsrCueQC:
     device = os.getenv("PRE_ASR_CUEQC_DEVICE", "auto").strip() or "auto"
     model = load_checkpoint(path, expected_asr_repo_id=expected_asr_repo_id, device=device)
     model.drop_threshold = _drop_threshold_from_env(model.drop_threshold)
+    split_sha = str(model.metadata.get("semantic_split_weights_sha256") or "")
+    if not split_sha:
+        raise ValueError("Pre-ASR CueQC v12 metadata.semantic_split_weights_sha256 is required")
+    split_path = Path(_semantic_split_checkpoint_path(expected_asr_repo_id))
+    active_sha = _file_sha256(split_path)
+    if active_sha != split_sha:
+        raise ValueError(
+            "Pre-ASR CueQC v12 split checkpoint sha mismatch: "
+            f"checkpoint expects {split_sha}, active split {split_path} is {active_sha}"
+        )
     return model

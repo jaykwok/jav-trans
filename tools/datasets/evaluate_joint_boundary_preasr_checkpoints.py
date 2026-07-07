@@ -19,7 +19,7 @@ for value in (PROJECT_ROOT, SRC_ROOT):
 from asr.pre_asr_cueqc import load_checkpoint as load_pre_asr  # noqa: E402
 from boundary.sequence_store import load_sequence_arrays  # noqa: E402
 from boundary.split_model import load_semantic_split_verifier  # noqa: E402
-from tools.asr.cueqc.compile_pre_asr_v11_features import (  # noqa: E402
+from tools.asr.cueqc.compile_pre_asr_v12_features import (  # noqa: E402
     candidate_for_chunk,
     label_for_chunk,
     read_chunk_document,

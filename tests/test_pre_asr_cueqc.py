@@ -14,8 +14,8 @@ from boundary.sequence_features import (
     FrameSequenceFeatureConfig,
     FrameSequenceFeatureProvider,
 )
-from tools.asr.cueqc.compile_pre_asr_v11_features import compile_features
-from tools.asr.cueqc.train_pre_asr_v11_binary import (
+from tools.asr.cueqc.compile_pre_asr_v12_features import compile_features
+from tools.asr.cueqc.train_pre_asr_v12_binary import (
     _split_label_masks,
     _window_batch_from_anchors,
 )
@@ -257,7 +257,7 @@ def test_pre_asr_cueqc_requires_pooled_ptm_when_requested():
         pre_asr_cueqc.candidate_from_span(spans, 0, require_ptm_pooling=True)
 
 
-def test_pre_asr_cueqc_v11_model_forward_backward_ignores_padding():
+def test_pre_asr_cueqc_v12_model_forward_backward_ignores_padding():
     torch = pytest.importorskip("torch")
     transformers = pytest.importorskip("transformers")
     if not hasattr(transformers, "Mamba2Model"):
@@ -313,6 +313,81 @@ def test_pre_asr_cueqc_local_only_mode_and_legacy_default():
 
     assert logits.shape == (1, 2, 2)
     assert torch.count_nonzero(logits[:, 1]).item() == 0
+
+
+def _tiny_v12_checkpoint(tmp_path: Path, *, hard_rules: bool = False, split_sha: str = "") -> Path:
+    torch = pytest.importorskip("torch")
+    transformers = pytest.importorskip("transformers")
+    if not hasattr(transformers, "Mamba2Model"):
+        pytest.skip("transformers.Mamba2Model is unavailable")
+
+    feature_names = list(pre_asr_cueqc.PRE_ASR_CUEQC_SCALAR_FEATURE_NAMES[:3])
+    model = pre_asr_cueqc.PreAsrCueQCNetwork(
+        ptm_dim=pre_asr_cueqc.PRE_ASR_CUEQC_PTM_DIM,
+        scalar_dim=len(feature_names),
+        hidden_size=128,
+        temporal_layers=1,
+        temporal_residual_scale=0.0,
+        dropout=0.0,
+    )
+    payload = {
+        "schema": pre_asr_cueqc.PRE_ASR_CUEQC_SCHEMA,
+        "arch": pre_asr_cueqc.PRE_ASR_CUEQC_MODEL_ARCH,
+        "feature_schema": pre_asr_cueqc.PRE_ASR_CUEQC_FEATURE_SCHEMA,
+        "runtime_adapter": pre_asr_cueqc.PRE_ASR_CUEQC_RUNTIME_ADAPTER,
+        "feature_names": feature_names,
+        "model_config": {
+            "ptm_dim": pre_asr_cueqc.PRE_ASR_CUEQC_PTM_DIM,
+            "scalar_dim": len(feature_names),
+            "hidden_size": 128,
+            "temporal_layers": 1,
+            "temporal_residual_scale": 0.0,
+            "dropout": 0.0,
+            "num_classes": 2,
+        },
+        "feature_mean": [0.0] * len(feature_names),
+        "feature_std": [1.0] * len(feature_names),
+        "decision_config": {
+            "drop_threshold": 0.95,
+            "hard_keep_veto": hard_rules,
+            "hard_drop_rule": False,
+            "keep_veto": False,
+            "inference_window_size": 128,
+        },
+        "metadata": {
+            "artifact": dict(pre_asr_cueqc.PRE_ASR_CUEQC_ARTIFACT),
+            "asr_repo_id": "jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame-hf",
+            "semantic_split_weights_sha256": split_sha,
+        },
+        "model_state_dict": model.state_dict(),
+    }
+    path = tmp_path / "pre_asr_cueqc_v12.pt"
+    torch.save(payload, path)
+    return path
+
+
+def test_pre_asr_cueqc_v12_rejects_enabled_hard_rules(tmp_path: Path):
+    checkpoint = _tiny_v12_checkpoint(tmp_path, hard_rules=True)
+
+    with pytest.raises(ValueError, match="must disable hard rules"):
+        pre_asr_cueqc.load_checkpoint(checkpoint, device="cpu")
+
+
+def test_pre_asr_cueqc_load_active_validates_split_sha(monkeypatch, tmp_path: Path):
+    split = tmp_path / "split.pt"
+    split.write_bytes(b"active split")
+    checkpoint = _tiny_v12_checkpoint(tmp_path, split_sha="0" * 64)
+    monkeypatch.setattr(pre_asr_cueqc, "_checkpoint_path", lambda _repo_id=None: str(checkpoint))
+    monkeypatch.setattr(
+        pre_asr_cueqc,
+        "_semantic_split_checkpoint_path",
+        lambda _repo_id=None: str(split),
+    )
+
+    with pytest.raises(ValueError, match="split checkpoint sha mismatch"):
+        pre_asr_cueqc.load_active(
+            expected_asr_repo_id="jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame-hf"
+        )
 
 
 def test_pre_asr_cueqc_filters_before_wav_export(monkeypatch):
@@ -444,7 +519,7 @@ def test_compile_pre_asr_cueqc_features_ignores_text_columns(tmp_path: Path):
 def test_compile_pre_asr_cueqc_features_reads_jsonl_chunk_candidates(tmp_path: Path):
     torch = pytest.importorskip("torch")
     del torch
-    from tools.asr.cueqc.train_pre_asr_v11_binary import load_feature_bundle
+    from tools.asr.cueqc.train_pre_asr_v12_binary import load_feature_bundle
 
     chunks = tmp_path / "chunks.jsonl"
     labels = tmp_path / "labels.jsonl"
@@ -485,6 +560,72 @@ def test_compile_pre_asr_cueqc_features_reads_jsonl_chunk_candidates(tmp_path: P
         pre_asr_cueqc.PRE_ASR_CUEQC_MODEL_PTM_TOKENS,
         pre_asr_cueqc.PRE_ASR_CUEQC_PTM_DIM,
     )
+
+
+def test_compile_pre_asr_cueqc_features_expands_source_windows_manifest(tmp_path: Path):
+    torch = pytest.importorskip("torch")
+    manifest = tmp_path / "source_windows.jsonl"
+    chunks = tmp_path / "features" / "w00" / "pre_asr_candidates.jsonl"
+    labels = tmp_path / "labels.jsonl"
+    output = tmp_path / "features.pt"
+    chunks.parent.mkdir(parents=True)
+    rows = [_pre_asr_candidate(0, video_id="AAA"), _pre_asr_candidate(1, video_id="AAA")]
+    chunks.write_text(
+        "\n".join(json.dumps(row, ensure_ascii=False) for row in rows) + "\n",
+        encoding="utf-8",
+    )
+    manifest.write_text(
+        json.dumps({"window_id": "w00", "pre_asr_candidates": str(chunks)}, ensure_ascii=False)
+        + "\n",
+        encoding="utf-8",
+    )
+    labels.write_text(
+        "\n".join(
+            [
+                json.dumps({"sample_id": "preasr-AAA-chunk00000", "label": "keep"}),
+                json.dumps({"sample_id": "preasr-AAA-chunk00001", "label": "drop"}),
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    summary = compile_features(
+        chunk_paths=[str(manifest)],
+        label_paths=[str(labels)],
+        output=output,
+        asr_repo_id="jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame-hf",
+    )
+
+    assert summary["chunk_count"] == 2
+    bundle = torch.load(output, map_location="cpu")
+    assert bundle["source_files"][0].replace("/", "\\").endswith(
+        "features\\w00\\pre_asr_candidates.jsonl"
+    )
+
+
+def test_compile_pre_asr_cueqc_features_reads_single_object_candidate_file(tmp_path: Path):
+    torch = pytest.importorskip("torch")
+    chunks = tmp_path / "single_candidate.jsonl"
+    labels = tmp_path / "labels.jsonl"
+    output = tmp_path / "features.pt"
+    row = _pre_asr_candidate(0, video_id="AAA")
+    chunks.write_text(json.dumps(row, ensure_ascii=False) + "\n", encoding="utf-8")
+    labels.write_text(
+        json.dumps({"sample_id": "preasr-AAA-chunk00000", "label": "drop"}) + "\n",
+        encoding="utf-8",
+    )
+
+    summary = compile_features(
+        chunk_paths=[str(chunks)],
+        label_paths=[str(labels)],
+        output=output,
+        asr_repo_id="jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame-hf",
+    )
+    bundle = torch.load(output, map_location="cpu")
+
+    assert summary["chunk_count"] == 1
+    assert bundle["rows"][0]["id"] == "preasr-AAA-chunk00000"
 
 
 def test_compile_pre_asr_cueqc_sample_labels_do_not_broadcast_by_cluster(tmp_path: Path):
