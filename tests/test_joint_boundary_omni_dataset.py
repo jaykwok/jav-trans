@@ -17,6 +17,10 @@ from tools.datasets.label_joint_boundary_preasr_with_omni import (
 from tools.datasets.prepare_joint_boundary_omni_dataset import _window_starts
 
 
+def _disabled_cache() -> joint_omni.OmniResponseCache:
+    return joint_omni.OmniResponseCache(None)
+
+
 def test_v3_prompts_keep_omni_requests_single_task() -> None:
     split_prompt = _build_split_prompt(
         [
@@ -146,6 +150,7 @@ def test_prepare_only_writes_separate_single_task_requests(
         prepare_only=True,
         label_task="both",
         rate_limiter=None,
+        response_cache=_disabled_cache(),
     )
 
     assert result["request_count"] == 2
@@ -239,6 +244,7 @@ def test_prepare_only_can_run_one_label_task(
         prepare_only=True,
         label_task="pre_asr",
         rate_limiter=None,
+        response_cache=_disabled_cache(),
     )
     split_result = joint_omni._process_window(
         row,
@@ -258,6 +264,7 @@ def test_prepare_only_can_run_one_label_task(
         prepare_only=True,
         label_task="split",
         rate_limiter=None,
+        response_cache=_disabled_cache(),
     )
 
     assert pre_asr_result["request_count"] == 1
@@ -332,6 +339,7 @@ def test_empty_pre_asr_audio_api_error_becomes_drop(
         prepare_only=False,
         label_task="pre_asr",
         rate_limiter=None,
+        response_cache=_disabled_cache(),
     )
     payload = json.loads(
         (tmp_path / "out" / "joint_labels" / "w01.json").read_text(
@@ -347,12 +355,154 @@ def test_empty_pre_asr_audio_api_error_becomes_drop(
     assert label["local_fallback"] == "empty_audio_to_definite_drop"
 
 
+def test_pre_asr_response_cache_reuses_successful_chunk(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    calls = {"count": 0}
+
+    def fake_slice_audio_clip(**kwargs):
+        output_path = Path(kwargs["output_path"])
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_bytes(b"same deterministic wav")
+
+    def fake_call_with_retry(**kwargs):
+        calls["count"] += 1
+        return (
+            {
+                "label": "keep",
+                "confidence": 0.95,
+                "semantic_speech_detected": True,
+                "flags": ["speech"],
+                "reason": "有语义语音",
+            },
+            {"usage": {"prompt_tokens": 12}, "finish_reasons": ["stop"]},
+        )
+
+    split_path = tmp_path / "split.jsonl"
+    chunk_path = tmp_path / "chunks.jsonl"
+    audio_path = tmp_path / "window.wav"
+    mp3_path = tmp_path / "window.mp3"
+    split_path.write_text("", encoding="utf-8")
+    audio_path.write_bytes(b"wav")
+    mp3_path.write_bytes(b"mp3")
+    chunk_path.write_text(
+        json.dumps(
+            {
+                "sample_id": "s1",
+                "candidate_id": "c1",
+                "audio_id": "a1",
+                "video_id": "v1",
+                "chunk_index": 0,
+                "start": 0.0,
+                "end": 1.0,
+                "duration_s": 1.0,
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    row = {
+        "window_id": "w01",
+        "duration_s": 3.0,
+        "audio_wav": str(audio_path),
+        "omni_mp3_32k": str(mp3_path),
+        "semantic_split_metadata": str(split_path),
+        "pre_asr_candidates": str(chunk_path),
+    }
+    cache = joint_omni.OmniResponseCache(tmp_path / "response_cache")
+    monkeypatch.setattr(joint_omni, "slice_audio_clip", fake_slice_audio_clip)
+    monkeypatch.setattr(joint_omni, "_call_with_retry", fake_call_with_retry)
+
+    for output_name in ("out1", "out2"):
+        result = joint_omni._process_window(
+            row,
+            output=tmp_path / output_name,
+            segments_root=tmp_path / output_name / "segments",
+            split_limit=10,
+            chunk_limit=10,
+            split_confidence=0.8,
+            keep_confidence=0.8,
+            drop_confidence=0.9,
+            model="qwen3.5-omni-flash",
+            api_key="",
+            base_url="",
+            audio_content_mode="input_audio",
+            timeout_s=1.0,
+            max_tokens=256,
+            prepare_only=False,
+            label_task="pre_asr",
+            rate_limiter=None,
+            response_cache=cache,
+        )
+        assert result["chunk_count"] == 1
+
+    second_raw = json.loads(
+        (
+            tmp_path
+            / "out2"
+            / "raw_responses"
+            / "pre_asr"
+            / "c1.json"
+        ).read_text(encoding="utf-8")
+    )
+    assert calls["count"] == 1
+    assert second_raw["response_cache"]["event"] == "hit"
+
+
+def test_response_cache_key_changes_with_audio_or_prompt(tmp_path: Path) -> None:
+    cache = joint_omni.OmniResponseCache(tmp_path / "response_cache")
+    first_audio = tmp_path / "first.wav"
+    second_audio = tmp_path / "second.wav"
+    first_audio.write_bytes(b"first")
+    second_audio.write_bytes(b"second")
+
+    first = cache.key_payload(
+        audio_path=first_audio,
+        prompt="same prompt",
+        request_kind="pre_asr_chunk",
+        model="qwen3.5-omni-flash",
+        audio_content_mode="input_audio",
+        audio_fmt="wav",
+        max_tokens=256,
+    )
+    changed_audio = cache.key_payload(
+        audio_path=second_audio,
+        prompt="same prompt",
+        request_kind="pre_asr_chunk",
+        model="qwen3.5-omni-flash",
+        audio_content_mode="input_audio",
+        audio_fmt="wav",
+        max_tokens=256,
+    )
+    changed_prompt = cache.key_payload(
+        audio_path=first_audio,
+        prompt="changed prompt",
+        request_kind="pre_asr_chunk",
+        model="qwen3.5-omni-flash",
+        audio_content_mode="input_audio",
+        audio_fmt="wav",
+        max_tokens=256,
+    )
+
+    assert first["cache_key"] != changed_audio["cache_key"]
+    assert first["cache_key"] != changed_prompt["cache_key"]
+
+
 def test_cli_defaults_do_not_write_dataset_labels() -> None:
     args = joint_omni.parse_args([])
 
     assert args.label_task == "both"
     assert args.write_dataset_labels is False
     assert args.max_requests_per_minute == 0.0
+    assert args.response_cache_dir == ""
+    assert args.no_response_cache is False
+
+
+def test_cli_can_disable_response_cache() -> None:
+    args = joint_omni.parse_args(["--no-response-cache"])
+
+    assert args.no_response_cache is True
 
 
 def test_rate_limiter_spaces_requests(monkeypatch) -> None:

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import random
@@ -35,6 +36,7 @@ from tools.asr.cueqc.label_pre_asr_v10_with_omni import (  # noqa: E402
 LEGACY_JOINT_PROMPT_VERSION = "joint_boundary_preasr_omni_v2"
 PROMPT_VERSION = "joint_boundary_preasr_omni_v3_separate"
 JOINT_SCHEMA = "joint_boundary_preasr_omni_label_v1"
+RESPONSE_CACHE_SCHEMA = "omni_response_cache_v1"
 
 
 class RequestRateLimiter:
@@ -56,6 +58,129 @@ class RequestRateLimiter:
             self._next_allowed = max(now, self._next_allowed) + self.interval_s
         if wait_s > 0.0:
             time.sleep(wait_s)
+
+
+class OmniResponseCache:
+    def __init__(self, root: Path | None) -> None:
+        self.root = root
+        self._lock = threading.Lock()
+
+    @property
+    def enabled(self) -> bool:
+        return self.root is not None
+
+    def key_payload(
+        self,
+        *,
+        audio_path: Path,
+        prompt: str,
+        request_kind: str,
+        model: str,
+        audio_content_mode: str,
+        audio_fmt: str,
+        max_tokens: int,
+    ) -> dict[str, Any]:
+        prompt_sha256 = hashlib.sha256(prompt.encode("utf-8")).hexdigest()
+        audio_sha256 = _sha256_file(audio_path)
+        payload = {
+            "schema": RESPONSE_CACHE_SCHEMA,
+            "prompt_version": PROMPT_VERSION,
+            "request_kind": request_kind,
+            "model": model,
+            "audio_content_mode": audio_content_mode,
+            "audio_format": audio_fmt,
+            "max_tokens": int(max_tokens),
+            "prompt_sha256": prompt_sha256,
+            "audio_sha256": audio_sha256,
+        }
+        payload["cache_key"] = hashlib.sha256(
+            json.dumps(payload, ensure_ascii=False, sort_keys=True).encode("utf-8")
+        ).hexdigest()
+        return payload
+
+    def _path(self, request_kind: str, cache_key: str) -> Path:
+        assert self.root is not None
+        return self.root / request_kind / f"{cache_key}.json"
+
+    def load(
+        self,
+        *,
+        audio_path: Path,
+        prompt: str,
+        request_kind: str,
+        model: str,
+        audio_content_mode: str,
+        audio_fmt: str,
+        max_tokens: int,
+    ) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]] | None:
+        if not self.enabled:
+            return None
+        key_payload = self.key_payload(
+            audio_path=audio_path,
+            prompt=prompt,
+            request_kind=request_kind,
+            model=model,
+            audio_content_mode=audio_content_mode,
+            audio_fmt=audio_fmt,
+            max_tokens=max_tokens,
+        )
+        path = self._path(request_kind, str(key_payload["cache_key"]))
+        if not path.exists():
+            return None
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        if (
+            payload.get("schema") != RESPONSE_CACHE_SCHEMA
+            or payload.get("key") != key_payload
+        ):
+            raise RuntimeError(f"stale or corrupt Omni response cache entry: {path}")
+        return (
+            dict(payload.get("parsed") or {}),
+            dict(payload.get("response") or {}),
+            {
+                "event": "hit",
+                "cache_key": str(key_payload["cache_key"]),
+                "path": str(path.resolve()),
+            },
+        )
+
+    def save(
+        self,
+        *,
+        audio_path: Path,
+        prompt: str,
+        request_kind: str,
+        model: str,
+        audio_content_mode: str,
+        audio_fmt: str,
+        max_tokens: int,
+        parsed: Mapping[str, Any],
+        response: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        if not self.enabled:
+            return {"event": "disabled"}
+        key_payload = self.key_payload(
+            audio_path=audio_path,
+            prompt=prompt,
+            request_kind=request_kind,
+            model=model,
+            audio_content_mode=audio_content_mode,
+            audio_fmt=audio_fmt,
+            max_tokens=max_tokens,
+        )
+        path = self._path(request_kind, str(key_payload["cache_key"]))
+        payload = {
+            "schema": RESPONSE_CACHE_SCHEMA,
+            "key": key_payload,
+            "parsed": dict(parsed),
+            "response": dict(response),
+        }
+        with self._lock:
+            _write_json(path, payload)
+        return {
+            "event": "miss",
+            "cache_key": str(key_payload["cache_key"]),
+            "path": str(path.resolve()),
+        }
 
 
 def _read_jsonl(path: Path) -> list[dict[str, Any]]:
@@ -136,6 +261,14 @@ def _select_chunk_rows(
     rng.shuffle(pool)
     selected.extend(pool[: limit - len(selected)])
     return sorted(selected, key=lambda row: int(row["chunk_index"]))
+
+
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for block in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
 
 
 def _build_prompt(
@@ -436,6 +569,58 @@ def _call_with_retry(
     raise last_error
 
 
+def _call_with_cache(
+    *,
+    audio_path: Path,
+    prompt: str,
+    request_kind: str,
+    model: str,
+    api_key: str,
+    base_url: str,
+    audio_content_mode: str,
+    timeout_s: float,
+    max_tokens: int,
+    audio_fmt: str,
+    rate_limiter: RequestRateLimiter | None,
+    response_cache: OmniResponseCache,
+) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
+    cached = response_cache.load(
+        audio_path=audio_path,
+        prompt=prompt,
+        request_kind=request_kind,
+        model=model,
+        audio_content_mode=audio_content_mode,
+        audio_fmt=audio_fmt,
+        max_tokens=max_tokens,
+    )
+    if cached is not None:
+        return cached
+    parsed, raw = _call_with_retry(
+        audio_path=audio_path,
+        prompt=prompt,
+        model=model,
+        api_key=api_key,
+        base_url=base_url,
+        audio_content_mode=audio_content_mode,
+        timeout_s=timeout_s,
+        max_tokens=max_tokens,
+        audio_fmt=audio_fmt,
+        rate_limiter=rate_limiter,
+    )
+    cache_event = response_cache.save(
+        audio_path=audio_path,
+        prompt=prompt,
+        request_kind=request_kind,
+        model=model,
+        audio_content_mode=audio_content_mode,
+        audio_fmt=audio_fmt,
+        max_tokens=max_tokens,
+        parsed=parsed,
+        response=raw,
+    )
+    return parsed, raw, cache_event
+
+
 def _process_window(
     row: dict[str, Any],
     *,
@@ -455,6 +640,7 @@ def _process_window(
     prepare_only: bool,
     label_task: str,
     rate_limiter: RequestRateLimiter | None,
+    response_cache: OmniResponseCache,
 ) -> dict[str, Any]:
     window_id = str(row["window_id"])
     split_rows = _select_split_rows(
@@ -498,9 +684,10 @@ def _process_window(
         )
         if not prepare_only:
             try:
-                parsed, raw = _call_with_retry(
+                parsed, raw, cache_event = _call_with_cache(
                     audio_path=window_audio_path,
                     prompt=prompt,
+                    request_kind="split_candidates",
                     model=model,
                     api_key=api_key,
                     base_url=base_url,
@@ -509,6 +696,7 @@ def _process_window(
                     max_tokens=max_tokens,
                     audio_fmt="wav",
                     rate_limiter=rate_limiter,
+                    response_cache=response_cache,
                 )
             except Exception as exc:  # noqa: BLE001
                 errors.append(
@@ -546,6 +734,7 @@ def _process_window(
                     {
                         "request_kind": "split_candidates",
                         "usage": raw.get("usage"),
+                        "response_cache": cache_event,
                     }
                 )
                 response_finish_reasons.append(
@@ -561,6 +750,7 @@ def _process_window(
                         "window_id": window_id,
                         "parsed": parsed,
                         "response": raw,
+                        "response_cache": cache_event,
                     },
                 )
     pre_asr_labels: list[dict[str, Any]] = []
@@ -602,9 +792,10 @@ def _process_window(
             continue
         try:
             empty_audio_api_reject = False
-            parsed, raw = _call_with_retry(
+            parsed, raw, cache_event = _call_with_cache(
                 audio_path=request_audio,
                 prompt=prompt,
+                request_kind="pre_asr_chunk",
                 model=model,
                 api_key=api_key,
                 base_url=base_url,
@@ -613,6 +804,7 @@ def _process_window(
                 max_tokens=max_tokens,
                 audio_fmt="wav",
                 rate_limiter=rate_limiter,
+                response_cache=response_cache,
             )
         except Exception as exc:  # noqa: BLE001
             if not is_empty_audio_api_error(exc):
@@ -643,6 +835,17 @@ def _process_window(
                 "error": str(exc),
                 "local_fallback": "empty_audio_to_definite_drop",
             }
+            cache_event = response_cache.save(
+                audio_path=request_audio,
+                prompt=prompt,
+                request_kind="pre_asr_chunk",
+                model=model,
+                audio_content_mode=audio_content_mode,
+                audio_fmt="wav",
+                max_tokens=max_tokens,
+                parsed=parsed,
+                response=raw,
+            )
         decision = _normalize_chunk_decision(
             parsed,
             keep_confidence=keep_confidence,
@@ -710,6 +913,7 @@ def _process_window(
                 "request_kind": "pre_asr_chunk",
                 "prompt_id": item_id,
                 "usage": raw.get("usage"),
+                "response_cache": cache_event,
             }
         )
         response_finish_reasons.append(
@@ -728,6 +932,7 @@ def _process_window(
                 "prompt_id": item_id,
                 "parsed": parsed,
                 "response": raw,
+                "response_cache": cache_event,
             },
         )
     if prepare_only:
@@ -803,6 +1008,18 @@ def _collect_completed(
     return split_rows, pre_asr_rows, missed_rows
 
 
+def _collect_response_cache_events(output: Path) -> dict[str, int]:
+    counts: Counter[str] = Counter()
+    for path in sorted((output / "joint_labels").glob("*.json")):
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        for item in payload.get("response_usage") or []:
+            response_cache = item.get("response_cache") or {}
+            event = str(response_cache.get("event") or "")
+            if event:
+                counts[event] += 1
+    return dict(counts)
+
+
 def _task_units(label_task: str) -> dict[str, str]:
     if label_task == "pre_asr":
         return {
@@ -844,6 +1061,12 @@ def run(args: argparse.Namespace) -> None:
     if not args.prepare_only and not api_key:
         raise RuntimeError("Omni API key is missing")
     rate_limiter = RequestRateLimiter(args.max_requests_per_minute)
+    response_cache_root = (
+        None
+        if args.no_response_cache
+        else Path(args.response_cache_dir or output / "response_cache")
+    )
+    response_cache = OmniResponseCache(response_cache_root)
     results: list[dict[str, Any]] = []
     with ThreadPoolExecutor(max_workers=max(1, args.workers)) as executor:
         futures = {
@@ -866,6 +1089,7 @@ def run(args: argparse.Namespace) -> None:
                 prepare_only=args.prepare_only,
                 label_task=args.label_task,
                 rate_limiter=rate_limiter,
+                response_cache=response_cache,
             ): str(row["window_id"])
             for row in selected
         }
@@ -898,6 +1122,14 @@ def run(args: argparse.Namespace) -> None:
                 "label_task": args.label_task,
                 **_task_units(args.label_task),
                 "max_requests_per_minute": args.max_requests_per_minute,
+                "response_cache": {
+                    "enabled": response_cache.enabled,
+                    "root": (
+                        str(response_cache.root.resolve())
+                        if response_cache.root is not None
+                        else ""
+                    ),
+                },
                 "single_request_per_window": False,
                 "request_granularity": {
                     "split": "one_window_split_task_per_request",
@@ -958,6 +1190,15 @@ def run(args: argparse.Namespace) -> None:
             "label_task": args.label_task,
             **_task_units(args.label_task),
             "max_requests_per_minute": args.max_requests_per_minute,
+            "response_cache": {
+                "enabled": response_cache.enabled,
+                "root": (
+                    str(response_cache.root.resolve())
+                    if response_cache.root is not None
+                    else ""
+                ),
+                "events": _collect_response_cache_events(output),
+            },
             "write_dataset_labels": bool(args.write_dataset_labels),
             "single_request_per_window": False,
             "request_granularity": {
@@ -1028,6 +1269,20 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--audio-content-mode",
         default=os.getenv("OMNI_AUDIO_CONTENT_MODE", "input_audio"),
+    )
+    parser.add_argument(
+        "--response-cache-dir",
+        default="",
+        help=(
+            "Reusable Omni response cache directory. Defaults to "
+            "<output-dir>/response_cache. The cache key includes prompt/model/"
+            "audio hashes, so prompt or audio changes do not hit stale entries."
+        ),
+    )
+    parser.add_argument(
+        "--no-response-cache",
+        action="store_true",
+        help="Disable request-level Omni response cache.",
     )
     args = parser.parse_args(argv)
     if args.max_split_candidates <= 0 or args.max_runtime_chunks <= 0:
