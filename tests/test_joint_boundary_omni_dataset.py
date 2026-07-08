@@ -145,6 +145,7 @@ def test_prepare_only_writes_separate_single_task_requests(
         max_tokens=256,
         prepare_only=True,
         label_task="both",
+        rate_limiter=None,
     )
 
     assert result["request_count"] == 2
@@ -237,6 +238,7 @@ def test_prepare_only_can_run_one_label_task(
         max_tokens=256,
         prepare_only=True,
         label_task="pre_asr",
+        rate_limiter=None,
     )
     split_result = joint_omni._process_window(
         row,
@@ -255,6 +257,7 @@ def test_prepare_only_can_run_one_label_task(
         max_tokens=256,
         prepare_only=True,
         label_task="split",
+        rate_limiter=None,
     )
 
     assert pre_asr_result["request_count"] == 1
@@ -266,11 +269,110 @@ def test_prepare_only_can_run_one_label_task(
     assert not (tmp_path / "split_out" / "requests" / "pre_asr").exists()
 
 
+def test_empty_pre_asr_audio_api_error_becomes_drop(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    def fake_slice_audio_clip(**kwargs):
+        output_path = Path(kwargs["output_path"])
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_bytes(b"wav")
+
+    def fake_call_with_retry(**kwargs):
+        raise RuntimeError("The audio is empty")
+
+    split_path = tmp_path / "split.jsonl"
+    chunk_path = tmp_path / "chunks.jsonl"
+    audio_path = tmp_path / "window.wav"
+    mp3_path = tmp_path / "window.mp3"
+    split_path.write_text("", encoding="utf-8")
+    audio_path.write_bytes(b"wav")
+    mp3_path.write_bytes(b"mp3")
+    chunk_path.write_text(
+        json.dumps(
+            {
+                "sample_id": "s1",
+                "candidate_id": "c1",
+                "audio_id": "a1",
+                "video_id": "v1",
+                "chunk_index": 0,
+                "start": 0.0,
+                "end": 0.01,
+                "duration_s": 0.01,
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(joint_omni, "slice_audio_clip", fake_slice_audio_clip)
+    monkeypatch.setattr(joint_omni, "_call_with_retry", fake_call_with_retry)
+
+    result = joint_omni._process_window(
+        {
+            "window_id": "w01",
+            "duration_s": 3.0,
+            "audio_wav": str(audio_path),
+            "omni_mp3_32k": str(mp3_path),
+            "semantic_split_metadata": str(split_path),
+            "pre_asr_candidates": str(chunk_path),
+        },
+        output=tmp_path / "out",
+        segments_root=tmp_path / "segments",
+        split_limit=10,
+        chunk_limit=10,
+        split_confidence=0.8,
+        keep_confidence=0.8,
+        drop_confidence=0.9,
+        model="qwen3.5-omni-flash",
+        api_key="",
+        base_url="",
+        audio_content_mode="input_audio",
+        timeout_s=1.0,
+        max_tokens=256,
+        prepare_only=False,
+        label_task="pre_asr",
+        rate_limiter=None,
+    )
+    payload = json.loads(
+        (tmp_path / "out" / "joint_labels" / "w01.json").read_text(
+            encoding="utf-8"
+        )
+    )
+
+    assert "error" not in result
+    assert result["chunk_count"] == 1
+    label = payload["pre_asr_labels"][0]
+    assert label["label"] == "definite_drop"
+    assert label["training_label_included"] is True
+    assert label["local_fallback"] == "empty_audio_to_definite_drop"
+
+
 def test_cli_defaults_do_not_write_dataset_labels() -> None:
     args = joint_omni.parse_args([])
 
     assert args.label_task == "both"
     assert args.write_dataset_labels is False
+    assert args.max_requests_per_minute == 0.0
+
+
+def test_rate_limiter_spaces_requests(monkeypatch) -> None:
+    now = {"value": 10.0}
+    sleeps: list[float] = []
+
+    monkeypatch.setattr(joint_omni.time, "monotonic", lambda: now["value"])
+
+    def fake_sleep(seconds: float) -> None:
+        sleeps.append(seconds)
+        now["value"] += seconds
+
+    monkeypatch.setattr(joint_omni.time, "sleep", fake_sleep)
+
+    limiter = joint_omni.RequestRateLimiter(30.0)
+    limiter.acquire()
+    limiter.acquire()
+    limiter.acquire()
+
+    assert sleeps == [2.0, 2.0]
 
 
 def test_invalid_cut_semantics_become_unsure() -> None:

@@ -6,6 +6,7 @@ import json
 import os
 import random
 import sys
+import threading
 import time
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -23,6 +24,7 @@ from tools.asr.cueqc.label_pre_asr_v10_with_omni import (  # noqa: E402
     DEFAULT_ENV_FILE,
     call_omni,
     first_env_value,
+    is_empty_audio_api_error,
     load_env_file,
     normalize_omni_label,
     slice_audio_clip,
@@ -33,6 +35,27 @@ from tools.asr.cueqc.label_pre_asr_v10_with_omni import (  # noqa: E402
 LEGACY_JOINT_PROMPT_VERSION = "joint_boundary_preasr_omni_v2"
 PROMPT_VERSION = "joint_boundary_preasr_omni_v3_separate"
 JOINT_SCHEMA = "joint_boundary_preasr_omni_label_v1"
+
+
+class RequestRateLimiter:
+    def __init__(self, requests_per_minute: float) -> None:
+        self.interval_s = 60.0 / requests_per_minute if requests_per_minute > 0 else 0.0
+        self._lock = threading.Lock()
+        self._next_allowed = 0.0
+
+    @property
+    def enabled(self) -> bool:
+        return self.interval_s > 0.0
+
+    def acquire(self) -> None:
+        if not self.enabled:
+            return
+        with self._lock:
+            now = time.monotonic()
+            wait_s = max(0.0, self._next_allowed - now)
+            self._next_allowed = max(now, self._next_allowed) + self.interval_s
+        if wait_s > 0.0:
+            time.sleep(wait_s)
 
 
 def _read_jsonl(path: Path) -> list[dict[str, Any]]:
@@ -374,10 +397,13 @@ def _call_with_retry(
     timeout_s: float,
     max_tokens: int,
     audio_fmt: str = "wav",
+    rate_limiter: RequestRateLimiter | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     last_error: BaseException | None = None
     for attempt in range(6):
         try:
+            if rate_limiter is not None:
+                rate_limiter.acquire()
             return call_omni(
                 audio_path=audio_path,
                 fmt=audio_fmt,
@@ -392,6 +418,8 @@ def _call_with_retry(
             )
         except Exception as exc:  # noqa: BLE001
             last_error = exc
+            if is_empty_audio_api_error(exc):
+                break
             message = str(exc).lower()
             if (
                 "429" in message
@@ -426,6 +454,7 @@ def _process_window(
     max_tokens: int,
     prepare_only: bool,
     label_task: str,
+    rate_limiter: RequestRateLimiter | None,
 ) -> dict[str, Any]:
     window_id = str(row["window_id"])
     split_rows = _select_split_rows(
@@ -479,6 +508,7 @@ def _process_window(
                     timeout_s=timeout_s,
                     max_tokens=max_tokens,
                     audio_fmt="wav",
+                    rate_limiter=rate_limiter,
                 )
             except Exception as exc:  # noqa: BLE001
                 errors.append(
@@ -571,6 +601,7 @@ def _process_window(
         if prepare_only:
             continue
         try:
+            empty_audio_api_reject = False
             parsed, raw = _call_with_retry(
                 audio_path=request_audio,
                 prompt=prompt,
@@ -581,18 +612,37 @@ def _process_window(
                 timeout_s=timeout_s,
                 max_tokens=max_tokens,
                 audio_fmt="wav",
+                rate_limiter=rate_limiter,
             )
         except Exception as exc:  # noqa: BLE001
-            errors.append(
-                {
-                    "request_kind": "pre_asr_chunk",
-                    "request": str(request_path.resolve()),
-                    "candidate_id": candidate_id,
-                    "prompt_id": item_id,
-                    "error": f"{type(exc).__name__}: {exc}",
-                }
-            )
-            continue
+            if not is_empty_audio_api_error(exc):
+                errors.append(
+                    {
+                        "request_kind": "pre_asr_chunk",
+                        "request": str(request_path.resolve()),
+                        "candidate_id": candidate_id,
+                        "prompt_id": item_id,
+                        "error": f"{type(exc).__name__}: {exc}",
+                    }
+                )
+                continue
+            empty_audio_api_reject = True
+            parsed = {
+                "label": "drop",
+                "confidence": 1.0,
+                "semantic_speech_detected": False,
+                "flags": ["short_fragment"],
+                "reason": (
+                    "Qwen-Omni API reported the audio is empty; mark this "
+                    "too-short/undecodable chunk as drop."
+                ),
+            }
+            raw = {
+                "stream": True,
+                "content": "",
+                "error": str(exc),
+                "local_fallback": "empty_audio_to_definite_drop",
+            }
         decision = _normalize_chunk_decision(
             parsed,
             keep_confidence=keep_confidence,
@@ -613,46 +663,48 @@ def _process_window(
             sample_rate=16000,
             force=False,
         )
-        pre_asr_labels.append(
-            {
-                "schema": "pre_asr_omni_label_v1",
-                "sample_id": str(candidate["sample_id"]),
-                "candidate_id": str(candidate["candidate_id"]),
-                "audio_id": str(candidate["audio_id"]),
-                "video_id": str(candidate["video_id"]),
-                "window_id": window_id,
-                "chunk_index": int(candidate["chunk_index"]),
-                "start": float(candidate["start"]),
-                "end": float(candidate["end"]),
-                "duration_s": float(candidate["duration_s"]),
-                "label": segment_label,
-                "display_decision": (
-                    "keep"
-                    if segment_label == "definite_keep"
-                    else "drop"
-                    if segment_label == "definite_drop"
-                    else "ambiguous_ignore"
-                ),
-                "training_label_included": segment_label
-                in {"definite_keep", "definite_drop"},
-                "label_source": f"omni:{model}",
-                "omni_label": decision["omni_label"],
-                "omni_confidence": decision["confidence"],
-                "omni_semantic_speech_detected": decision[
-                    "semantic_speech_detected"
-                ],
-                "omni_flags": decision["flags"],
-                "prompt_id": item_id,
-                "prompt_version": PROMPT_VERSION,
-                "audio": str(segment_path.resolve()),
-                "audio_format": "wav",
-                "omni_request_audio": str(request_audio.resolve()),
-                "omni_request_audio_format": "wav",
-                "omni_request_audio_scope": "chunk",
-                "feature_schema": str(candidate.get("feature_schema") or ""),
-                "runtime_adapter": str(candidate.get("runtime_adapter") or ""),
-            }
-        )
+        label_row = {
+            "schema": "pre_asr_omni_label_v1",
+            "sample_id": str(candidate["sample_id"]),
+            "candidate_id": str(candidate["candidate_id"]),
+            "audio_id": str(candidate["audio_id"]),
+            "video_id": str(candidate["video_id"]),
+            "window_id": window_id,
+            "chunk_index": int(candidate["chunk_index"]),
+            "start": float(candidate["start"]),
+            "end": float(candidate["end"]),
+            "duration_s": float(candidate["duration_s"]),
+            "label": segment_label,
+            "display_decision": (
+                "keep"
+                if segment_label == "definite_keep"
+                else "drop"
+                if segment_label == "definite_drop"
+                else "ambiguous_ignore"
+            ),
+            "training_label_included": segment_label
+            in {"definite_keep", "definite_drop"},
+            "label_source": f"omni:{model}",
+            "omni_label": decision["omni_label"],
+            "omni_confidence": decision["confidence"],
+            "omni_semantic_speech_detected": decision[
+                "semantic_speech_detected"
+            ],
+            "omni_flags": decision["flags"],
+            "omni_reason": str(parsed.get("reason") or ""),
+            "prompt_id": item_id,
+            "prompt_version": PROMPT_VERSION,
+            "audio": str(segment_path.resolve()),
+            "audio_format": "wav",
+            "omni_request_audio": str(request_audio.resolve()),
+            "omni_request_audio_format": "wav",
+            "omni_request_audio_scope": "chunk",
+            "feature_schema": str(candidate.get("feature_schema") or ""),
+            "runtime_adapter": str(candidate.get("runtime_adapter") or ""),
+        }
+        if empty_audio_api_reject:
+            label_row["local_fallback"] = "empty_audio_to_definite_drop"
+        pre_asr_labels.append(label_row)
         response_usage.append(
             {
                 "request_kind": "pre_asr_chunk",
@@ -772,7 +824,7 @@ def run(args: argparse.Namespace) -> None:
     load_env_file(args.env_file)
     dataset = Path(args.dataset_dir)
     output = Path(args.output_dir or dataset / "annotations" / "omni_joint")
-    segments_root = dataset / "pre_asr" / "audio_wav"
+    segments_root = output / "pre_asr" / "audio_wav"
     output.mkdir(parents=True, exist_ok=True)
     windows = _read_jsonl(dataset / "source_windows.jsonl")
     completed = {
@@ -791,6 +843,7 @@ def run(args: argparse.Namespace) -> None:
     _url_name, base_url = first_env_value(DEFAULT_BASE_URL_ENV_CANDIDATES)
     if not args.prepare_only and not api_key:
         raise RuntimeError("Omni API key is missing")
+    rate_limiter = RequestRateLimiter(args.max_requests_per_minute)
     results: list[dict[str, Any]] = []
     with ThreadPoolExecutor(max_workers=max(1, args.workers)) as executor:
         futures = {
@@ -812,6 +865,7 @@ def run(args: argparse.Namespace) -> None:
                 max_tokens=args.max_tokens,
                 prepare_only=args.prepare_only,
                 label_task=args.label_task,
+                rate_limiter=rate_limiter,
             ): str(row["window_id"])
             for row in selected
         }
@@ -843,6 +897,7 @@ def run(args: argparse.Namespace) -> None:
                 "request_mode": "separate_single_task",
                 "label_task": args.label_task,
                 **_task_units(args.label_task),
+                "max_requests_per_minute": args.max_requests_per_minute,
                 "single_request_per_window": False,
                 "request_granularity": {
                     "split": "one_window_split_task_per_request",
@@ -902,6 +957,7 @@ def run(args: argparse.Namespace) -> None:
             "request_mode": "separate_single_task",
             "label_task": args.label_task,
             **_task_units(args.label_task),
+            "max_requests_per_minute": args.max_requests_per_minute,
             "write_dataset_labels": bool(args.write_dataset_labels),
             "single_request_per_window": False,
             "request_granularity": {
@@ -942,6 +998,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--drop-confidence", type=float, default=0.90)
     parser.add_argument("--timeout-s", type=float, default=180.0)
     parser.add_argument("--max-tokens", type=int, default=4096)
+    parser.add_argument(
+        "--max-requests-per-minute",
+        type=float,
+        default=0.0,
+        help=(
+            "Process-wide Omni request start rate limit shared by workers; "
+            "0 disables explicit RPM limiting."
+        ),
+    )
     parser.add_argument("--prepare-only", action="store_true")
     parser.add_argument(
         "--label-task",
@@ -969,6 +1034,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         parser.error("candidate limits must be positive")
     if args.workers <= 0:
         parser.error("--workers must be positive")
+    if args.max_requests_per_minute < 0:
+        parser.error("--max-requests-per-minute must be non-negative")
     return args
 
 
