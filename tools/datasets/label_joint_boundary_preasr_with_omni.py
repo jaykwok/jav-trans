@@ -425,6 +425,7 @@ def _process_window(
     timeout_s: float,
     max_tokens: int,
     prepare_only: bool,
+    label_task: str,
 ) -> dict[str, Any]:
     window_id = str(row["window_id"])
     split_rows = _select_split_rows(
@@ -445,7 +446,9 @@ def _process_window(
     response_finish_reasons: list[dict[str, Any]] = []
     errors: list[dict[str, Any]] = []
     split_labels: list[dict[str, Any]] = []
-    if split_rows:
+    run_split = label_task in {"split", "both"}
+    run_pre_asr = label_task in {"pre_asr", "both"}
+    if run_split and split_rows:
         prompt = _build_split_prompt(
             duration_s=float(row["duration_s"]),
             split_items=split_rows,
@@ -531,7 +534,7 @@ def _process_window(
                     },
                 )
     pre_asr_labels: list[dict[str, Any]] = []
-    for position, candidate in enumerate(chunk_rows):
+    for position, candidate in enumerate(chunk_rows if run_pre_asr else []):
         item_id = f"p{position:03d}"
         candidate_id = str(candidate["candidate_id"])
         request_audio = (
@@ -681,7 +684,8 @@ def _process_window(
             "prepared": True,
             "split_count": len(split_rows),
             "chunk_count": len(chunk_rows),
-            "request_count": (1 if split_rows else 0) + len(chunk_rows),
+            "request_count": (1 if run_split and split_rows else 0)
+            + (len(chunk_rows) if run_pre_asr else 0),
         }
     if errors:
         _write_json(
@@ -691,6 +695,7 @@ def _process_window(
                 "window_id": window_id,
                 "prompt_version": PROMPT_VERSION,
                 "request_mode": "separate_single_task",
+                "label_task": label_task,
                 "errors": errors,
                 "partial_split_count": len(split_labels),
                 "partial_pre_asr_count": len(pre_asr_labels),
@@ -710,6 +715,7 @@ def _process_window(
         "prompt_version": PROMPT_VERSION,
         "model": model,
         "request_mode": "separate_single_task",
+        "label_task": label_task,
         "request_dirs": {
             "split": str((output / "requests" / "split").resolve()),
             "pre_asr": str((output / "requests" / "pre_asr").resolve()),
@@ -743,6 +749,23 @@ def _collect_completed(
         pre_asr_rows.extend(payload.get("pre_asr_labels") or [])
         missed_rows.extend(payload.get("missed_boundaries") or [])
     return split_rows, pre_asr_rows, missed_rows
+
+
+def _task_units(label_task: str) -> dict[str, str]:
+    if label_task == "pre_asr":
+        return {
+            "request_unit": "pre_asr_chunk",
+            "label_unit": "pre_asr_chunk",
+        }
+    if label_task == "split":
+        return {
+            "request_unit": "source_window_with_split_candidates",
+            "label_unit": "split_candidate",
+        }
+    return {
+        "request_unit": "mixed_single_task_request",
+        "label_unit": "mixed",
+    }
 
 
 def run(args: argparse.Namespace) -> None:
@@ -788,6 +811,7 @@ def run(args: argparse.Namespace) -> None:
                 timeout_s=args.timeout_s,
                 max_tokens=args.max_tokens,
                 prepare_only=args.prepare_only,
+                label_task=args.label_task,
             ): str(row["window_id"])
             for row in selected
         }
@@ -817,6 +841,8 @@ def run(args: argparse.Namespace) -> None:
                 "prompt_version": PROMPT_VERSION,
                 "legacy_joint_prompt_version": LEGACY_JOINT_PROMPT_VERSION,
                 "request_mode": "separate_single_task",
+                "label_task": args.label_task,
+                **_task_units(args.label_task),
                 "single_request_per_window": False,
                 "request_granularity": {
                     "split": "one_window_split_task_per_request",
@@ -832,12 +858,19 @@ def run(args: argparse.Namespace) -> None:
         )
         return
     split_rows, pre_asr_rows, missed_rows = _collect_completed(output)
-    _write_jsonl(output / "split_labels.jsonl", split_rows)
-    _write_jsonl(output / "pre_asr_labels.jsonl", pre_asr_rows)
-    _write_jsonl(output / "missed_boundaries.jsonl", missed_rows)
-    _write_jsonl(dataset / "semantic_split" / "labels.jsonl", split_rows)
-    _write_jsonl(dataset / "semantic_split" / "missed_boundaries.jsonl", missed_rows)
-    _write_jsonl(dataset / "pre_asr" / "labels.jsonl", pre_asr_rows)
+    if args.label_task in {"split", "both"}:
+        _write_jsonl(output / "split_labels.jsonl", split_rows)
+        _write_jsonl(output / "missed_boundaries.jsonl", missed_rows)
+        if args.write_dataset_labels:
+            _write_jsonl(dataset / "semantic_split" / "labels.jsonl", split_rows)
+            _write_jsonl(
+                dataset / "semantic_split" / "missed_boundaries.jsonl",
+                missed_rows,
+            )
+    if args.label_task in {"pre_asr", "both"}:
+        _write_jsonl(output / "pre_asr_labels.jsonl", pre_asr_rows)
+        if args.write_dataset_labels:
+            _write_jsonl(dataset / "pre_asr" / "labels.jsonl", pre_asr_rows)
     split_counts = Counter(str(row["label"]) for row in split_rows)
     pre_asr_counts = Counter(str(row["label"]) for row in pre_asr_rows)
     errors = [row for row in results if row.get("error")]
@@ -867,6 +900,9 @@ def run(args: argparse.Namespace) -> None:
             "prompt_version": PROMPT_VERSION,
             "legacy_joint_prompt_version": LEGACY_JOINT_PROMPT_VERSION,
             "request_mode": "separate_single_task",
+            "label_task": args.label_task,
+            **_task_units(args.label_task),
+            "write_dataset_labels": bool(args.write_dataset_labels),
             "single_request_per_window": False,
             "request_granularity": {
                 "split": "one_window_split_task_per_request",
@@ -883,7 +919,7 @@ def run(args: argparse.Namespace) -> None:
     )
 
 
-def parse_args() -> argparse.Namespace:
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
             "Label semantic split candidates and Pre-ASR chunks with separate "
@@ -908,10 +944,27 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-tokens", type=int, default=4096)
     parser.add_argument("--prepare-only", action="store_true")
     parser.add_argument(
+        "--label-task",
+        choices=("pre_asr", "split", "both"),
+        default="both",
+        help=(
+            "Run one labeling task. Use separate pre_asr and split runs for "
+            "long-lived v3 baselines."
+        ),
+    )
+    parser.add_argument(
+        "--write-dataset-labels",
+        action="store_true",
+        help=(
+            "Also write task labels into dataset semantic_split/pre_asr labels. "
+            "Keep this off for smoke, resume, and immutable baseline runs."
+        ),
+    )
+    parser.add_argument(
         "--audio-content-mode",
         default=os.getenv("OMNI_AUDIO_CONTENT_MODE", "input_audio"),
     )
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
     if args.max_split_candidates <= 0 or args.max_runtime_chunks <= 0:
         parser.error("candidate limits must be positive")
     if args.workers <= 0:

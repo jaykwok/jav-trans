@@ -144,6 +144,7 @@ def test_prepare_only_writes_separate_single_task_requests(
         timeout_s=1.0,
         max_tokens=256,
         prepare_only=True,
+        label_task="both",
     )
 
     assert result["request_count"] == 2
@@ -169,6 +170,107 @@ def test_prepare_only_writes_separate_single_task_requests(
     assert pre_asr_request["audio_scope"] == "chunk"
     assert "split_candidates=" not in pre_asr_request["prompt"]
     assert "split_decisions" not in pre_asr_request["prompt"]
+
+
+def test_prepare_only_can_run_one_label_task(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    def fake_slice_audio_clip(**kwargs):
+        output_path = Path(kwargs["output_path"])
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_bytes(b"wav")
+
+    split_path = tmp_path / "split.jsonl"
+    chunk_path = tmp_path / "chunks.jsonl"
+    audio_path = tmp_path / "window.wav"
+    mp3_path = tmp_path / "window.mp3"
+    audio_path.write_bytes(b"wav")
+    mp3_path.write_bytes(b"mp3")
+    split_path.write_text(
+        json.dumps(
+            {"index": 1, "time_s": 1.0, "label": "continue", "p_cut": 0.2}
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    chunk_path.write_text(
+        json.dumps(
+            {
+                "sample_id": "s1",
+                "candidate_id": "c1",
+                "audio_id": "a1",
+                "video_id": "v1",
+                "chunk_index": 0,
+                "start": 0.0,
+                "end": 1.0,
+                "duration_s": 1.0,
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    row = {
+        "window_id": "w01",
+        "duration_s": 3.0,
+        "audio_wav": str(audio_path),
+        "omni_mp3_32k": str(mp3_path),
+        "semantic_split_metadata": str(split_path),
+        "pre_asr_candidates": str(chunk_path),
+    }
+    monkeypatch.setattr(joint_omni, "slice_audio_clip", fake_slice_audio_clip)
+
+    pre_asr_result = joint_omni._process_window(
+        row,
+        output=tmp_path / "pre_asr_out",
+        segments_root=tmp_path / "segments",
+        split_limit=10,
+        chunk_limit=10,
+        split_confidence=0.8,
+        keep_confidence=0.8,
+        drop_confidence=0.9,
+        model="qwen3.5-omni-flash",
+        api_key="",
+        base_url="",
+        audio_content_mode="input_audio",
+        timeout_s=1.0,
+        max_tokens=256,
+        prepare_only=True,
+        label_task="pre_asr",
+    )
+    split_result = joint_omni._process_window(
+        row,
+        output=tmp_path / "split_out",
+        segments_root=tmp_path / "segments",
+        split_limit=10,
+        chunk_limit=10,
+        split_confidence=0.8,
+        keep_confidence=0.8,
+        drop_confidence=0.9,
+        model="qwen3.5-omni-flash",
+        api_key="",
+        base_url="",
+        audio_content_mode="input_audio",
+        timeout_s=1.0,
+        max_tokens=256,
+        prepare_only=True,
+        label_task="split",
+    )
+
+    assert pre_asr_result["request_count"] == 1
+    assert not (tmp_path / "pre_asr_out" / "requests" / "split").exists()
+    assert (tmp_path / "pre_asr_out" / "requests" / "pre_asr" / "c1.json").exists()
+
+    assert split_result["request_count"] == 1
+    assert (tmp_path / "split_out" / "requests" / "split" / "w01.json").exists()
+    assert not (tmp_path / "split_out" / "requests" / "pre_asr").exists()
+
+
+def test_cli_defaults_do_not_write_dataset_labels() -> None:
+    args = joint_omni.parse_args([])
+
+    assert args.label_task == "both"
+    assert args.write_dataset_labels is False
 
 
 def test_invalid_cut_semantics_become_unsure() -> None:
