@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from tools.datasets.label_joint_boundary_preasr_with_omni import (
-    PROMPT_VERSION,
+    LEGACY_JOINT_PROMPT_VERSION,
     _build_prompt,
     _normalize_missed_boundaries,
 )
@@ -9,7 +9,7 @@ from tools.datasets.label_joint_boundary_preasr_with_omni import (
 
 def test_prompt_v2_requests_missed_boundaries() -> None:
     prompt = _build_prompt([], [], duration_s=75.0)
-    assert PROMPT_VERSION == "joint_boundary_preasr_omni_v2"
+    assert LEGACY_JOINT_PROMPT_VERSION == "joint_boundary_preasr_omni_v2"
     assert "missed_boundaries" in prompt
     assert "任务 A2" in prompt
 

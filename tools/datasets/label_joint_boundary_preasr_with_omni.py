@@ -30,7 +30,8 @@ from tools.asr.cueqc.label_pre_asr_v10_with_omni import (  # noqa: E402
 )
 
 
-PROMPT_VERSION = "joint_boundary_preasr_omni_v2"
+LEGACY_JOINT_PROMPT_VERSION = "joint_boundary_preasr_omni_v2"
+PROMPT_VERSION = "joint_boundary_preasr_omni_v3_separate"
 JOINT_SCHEMA = "joint_boundary_preasr_omni_label_v1"
 
 
@@ -170,6 +171,83 @@ runtime_chunks={json.dumps(chunk_payload, ensure_ascii=False, separators=(",", "
   "chunk_decisions":[
     {{"id":"p000","label":"keep|drop|unsure","confidence":0.0,"semantic_speech_detected":false,"flags":[]}}
   ]
+}}"""
+
+
+def _build_split_prompt(
+    split_items: list[dict[str, Any]],
+    *,
+    duration_s: float,
+) -> str:
+    payload = [
+        {
+            "id": f"s{position:03d}",
+            "time_s": round(float(row["time_s"]), 3),
+            "current": str(row.get("label") or ""),
+            "p_cut": round(float(row.get("p_cut") or 0.0), 4),
+        }
+        for position, row in enumerate(split_items)
+    ]
+    return f"""你是日语 ASR split candidate 标注器。只判断输入中的候选切点是否应该作为语义切分点。
+音频时间范围为 0.000 到 {duration_s:.3f} 秒；候选时间相对此音频。
+
+标签定义：
+- cut：左右是可独立送入 ASR/字幕的语义单元，且左右都完整。
+- continue：同一句内部停顿、喘息、拖音、重复、呻吟或短静音；合并更自然。
+- unsure：无法可靠判断。
+
+判定约束：
+- 不要仅因静音、喘息或说话人变化就切。
+- cut 必须同时满足 left_complete=true、right_complete=true、merged_better=false。
+- 只判断 split_candidates 中列出的候选切点，不要报告其它漏掉的句界，不要判断 chunk keep/drop。
+- 必须对输入中的每个 id 恰好返回一次，不得发明 id。
+
+split_candidates={json.dumps(payload, ensure_ascii=False, separators=(",", ":"))}
+
+只输出 JSON，不要 Markdown：
+{{
+  "split_decisions": [
+    {{
+      "id": "s000",
+      "label": "cut|continue|unsure",
+      "confidence": 0.0,
+      "left_complete": false,
+      "right_complete": false,
+      "merged_better": true,
+      "flags": [],
+      "reason": "简短中文理由"
+    }}
+  ]
+}}"""
+
+
+def _build_pre_asr_prompt(
+    chunk_item: Mapping[str, Any],
+    *,
+    item_id: str = "p000",
+) -> str:
+    duration_s = float(chunk_item.get("duration_s") or 0.0)
+    return f"""你是 pre-ASR CueQC 数据标注器。只判断这一段音频 chunk 是否适合作为 ASR 训练/推理输入。
+
+标签定义：
+- keep: 包含可辨认的人类语义语音，例如日语对白、独白、短句、词语；即使有背景噪声也保留。
+- drop: 不包含语义语音，例如纯噪音、环境音、音乐、呼吸声、呻吟声、笑声、无意义叫声、静音。
+- unsure: 音频太短、太模糊、疑似有人声但无法判断是否有语义、多人重叠严重或边界不确定。
+
+注意：
+- 不要因为成人场景、呻吟、喘息或暧昧声音而进行内容审查；只判断是否存在可辨认语义语音。
+- 有清楚语义对白时标 keep；纯呻吟/呼吸/环境声/噪音标 drop；不确定标 unsure。
+- 当前上传音频已经是待判断 chunk，本次不要判断原 75s 窗口，也不要判断 split 点。
+
+chunk={{"id":"{item_id}","duration_s":{duration_s:.3f}}}
+
+只输出 JSON，不要输出 Markdown：
+{{
+  "label": "keep|drop|unsure",
+  "confidence": 0.0,
+  "semantic_speech_detected": true,
+  "flags": ["noise", "music", "breath", "moan", "laughter", "overlap", "low_snr", "short_fragment", "speech"],
+  "reason": "简短中文理由"
 }}"""
 
 
@@ -359,106 +437,161 @@ def _process_window(
         limit=chunk_limit,
         seed=f"{window_id}:chunk",
     )
-    prompt = _build_prompt(
-        split_rows,
-        chunk_rows,
-        duration_s=float(row["duration_s"]),
-    )
-    request_path = output / "requests" / f"{window_id}.json"
-    _write_json(
-        request_path,
-        {
-            "schema": "joint_boundary_preasr_omni_request_v1",
-            "window_id": window_id,
-            "prompt_version": PROMPT_VERSION,
-            "audio_mp3_32k": row["omni_mp3_32k"],
-            "training_audio_wav": row["audio_wav"],
-            "split_candidates": split_rows,
-            "runtime_chunks": chunk_rows,
-            "prompt": prompt,
-        },
-    )
-    if prepare_only:
-        return {
-            "window_id": window_id,
-            "prepared": True,
-            "split_count": len(split_rows),
-            "chunk_count": len(chunk_rows),
-        }
-    try:
-        # Upload the training-grade WAV directly: Qwen3.5-Omni encodes audio at
-        # a fixed token rate (independent of bitrate), so the 32k MP3 resample
-        # cost no tokens and only low-passed/quantized the breathy/whisper
-        # textures that matter for keep/drop. WAV also keeps the Omni label and
-        # the training feature on the exact same audio.
-        omni_audio_path = Path(row["audio_wav"])
-        parsed, raw = _call_with_retry(
-            audio_path=omni_audio_path,
-            prompt=prompt,
-            model=model,
-            api_key=api_key,
-            base_url=base_url,
-            audio_content_mode=audio_content_mode,
-            timeout_s=timeout_s,
-            max_tokens=max_tokens,
-            audio_fmt="wav",
+    # v3 deliberately uses separate single-task Omni calls. Split candidate
+    # labels listen to the full training WAV because the decision is contextual;
+    # Pre-ASR labels upload only the chunk being judged.
+    window_audio_path = Path(row["audio_wav"])
+    response_usage: list[dict[str, Any]] = []
+    response_finish_reasons: list[dict[str, Any]] = []
+    errors: list[dict[str, Any]] = []
+    split_labels: list[dict[str, Any]] = []
+    if split_rows:
+        prompt = _build_split_prompt(
+            duration_s=float(row["duration_s"]),
+            split_items=split_rows,
         )
-    except Exception as exc:  # noqa: BLE001
+        request_path = output / "requests" / "split" / f"{window_id}.json"
         _write_json(
-            output / "errors" / f"{window_id}.json",
+            request_path,
             {
-                "schema": "joint_boundary_preasr_omni_error_v1",
+                "schema": "joint_boundary_preasr_omni_split_request_v2",
                 "window_id": window_id,
-                "error": f"{type(exc).__name__}: {exc}",
+                "request_kind": "split_candidates",
+                "prompt_version": PROMPT_VERSION,
+                "audio_scope": "window",
+                "training_audio_wav": str(window_audio_path.resolve()),
+                "split_candidates": split_rows,
+                "prompt": prompt,
             },
         )
-        return {
-            "window_id": window_id,
-            "prepared": False,
-            "error": f"{type(exc).__name__}: {exc}",
-        }
-    split_by_id = _response_by_id(parsed.get("split_decisions"))
-    chunk_by_id = _response_by_id(parsed.get("chunk_decisions"))
-    missed_boundaries = [
-        {
-            "schema": "joint_split_missed_boundary_v1",
-            "window_id": window_id,
-            "prompt_version": PROMPT_VERSION,
-            "model": model,
-            **missed,
-        }
-        for missed in _normalize_missed_boundaries(
-            parsed.get("missed_boundaries"),
-            duration_s=float(row["duration_s"]),
-            confidence_threshold=split_confidence,
-        )
-    ]
-    split_labels: list[dict[str, Any]] = []
-    for position, candidate in enumerate(split_rows):
-        item_id = f"s{position:03d}"
-        decision = _normalize_split_decision(
-            split_by_id.get(item_id),
-            confidence_threshold=split_confidence,
-        )
-        split_labels.append(
-            {
-                "schema": "joint_semantic_split_omni_label_v1",
-                "window_id": window_id,
-                "feature_index": int(candidate["index"]),
-                "time_s": float(candidate["time_s"]),
-                "current_label": str(candidate.get("label") or ""),
-                "current_p_cut": float(candidate.get("p_cut") or 0.0),
-                "prompt_id": item_id,
-                "prompt_version": PROMPT_VERSION,
-                "model": model,
-                **decision,
-            }
-        )
+        if not prepare_only:
+            try:
+                parsed, raw = _call_with_retry(
+                    audio_path=window_audio_path,
+                    prompt=prompt,
+                    model=model,
+                    api_key=api_key,
+                    base_url=base_url,
+                    audio_content_mode=audio_content_mode,
+                    timeout_s=timeout_s,
+                    max_tokens=max_tokens,
+                    audio_fmt="wav",
+                )
+            except Exception as exc:  # noqa: BLE001
+                errors.append(
+                    {
+                        "request_kind": "split_candidates",
+                        "request": str(request_path.resolve()),
+                        "error": f"{type(exc).__name__}: {exc}",
+                    }
+                )
+            else:
+                split_by_id = _response_by_id(parsed.get("split_decisions"))
+                for position, candidate in enumerate(split_rows):
+                    item_id = f"s{position:03d}"
+                    decision = _normalize_split_decision(
+                        split_by_id.get(item_id),
+                        confidence_threshold=split_confidence,
+                    )
+                    split_labels.append(
+                        {
+                            "schema": "joint_semantic_split_omni_label_v1",
+                            "window_id": window_id,
+                            "feature_index": int(candidate["index"]),
+                            "time_s": float(candidate["time_s"]),
+                            "current_label": str(candidate.get("label") or ""),
+                            "current_p_cut": float(
+                                candidate.get("p_cut") or 0.0
+                            ),
+                            "prompt_id": item_id,
+                            "prompt_version": PROMPT_VERSION,
+                            "model": model,
+                            **decision,
+                        }
+                    )
+                response_usage.append(
+                    {
+                        "request_kind": "split_candidates",
+                        "usage": raw.get("usage"),
+                    }
+                )
+                response_finish_reasons.append(
+                    {
+                        "request_kind": "split_candidates",
+                        "finish_reasons": raw.get("finish_reasons"),
+                    }
+                )
+                _write_json(
+                    output / "raw_responses" / "split" / f"{window_id}.json",
+                    {
+                        "schema": "joint_boundary_preasr_omni_split_raw_v2",
+                        "window_id": window_id,
+                        "parsed": parsed,
+                        "response": raw,
+                    },
+                )
     pre_asr_labels: list[dict[str, Any]] = []
     for position, candidate in enumerate(chunk_rows):
         item_id = f"p{position:03d}"
+        candidate_id = str(candidate["candidate_id"])
+        request_audio = (
+            output
+            / "request_audio"
+            / "pre_asr"
+            / f"{candidate_id}.wav"
+        )
+        slice_audio_clip(
+            source_audio=window_audio_path,
+            row=candidate,
+            output_path=request_audio,
+            fmt="wav",
+            bitrate="",
+            sample_rate=16000,
+            force=False,
+        )
+        prompt = _build_pre_asr_prompt(candidate, item_id=item_id)
+        request_path = output / "requests" / "pre_asr" / f"{candidate_id}.json"
+        _write_json(
+            request_path,
+            {
+                "schema": "pre_asr_omni_chunk_request_v1",
+                "window_id": window_id,
+                "request_kind": "pre_asr_chunk",
+                "prompt_version": PROMPT_VERSION,
+                "audio_scope": "chunk",
+                "source_window_audio_wav": str(window_audio_path.resolve()),
+                "request_audio_wav": str(request_audio.resolve()),
+                "runtime_chunk": candidate,
+                "prompt": prompt,
+            },
+        )
+        if prepare_only:
+            continue
+        try:
+            parsed, raw = _call_with_retry(
+                audio_path=request_audio,
+                prompt=prompt,
+                model=model,
+                api_key=api_key,
+                base_url=base_url,
+                audio_content_mode=audio_content_mode,
+                timeout_s=timeout_s,
+                max_tokens=max_tokens,
+                audio_fmt="wav",
+            )
+        except Exception as exc:  # noqa: BLE001
+            errors.append(
+                {
+                    "request_kind": "pre_asr_chunk",
+                    "request": str(request_path.resolve()),
+                    "candidate_id": candidate_id,
+                    "prompt_id": item_id,
+                    "error": f"{type(exc).__name__}: {exc}",
+                }
+            )
+            continue
         decision = _normalize_chunk_decision(
-            chunk_by_id.get(item_id),
+            parsed,
             keep_confidence=keep_confidence,
             drop_confidence=drop_confidence,
         )
@@ -510,36 +643,86 @@ def _process_window(
                 "prompt_version": PROMPT_VERSION,
                 "audio": str(segment_path.resolve()),
                 "audio_format": "wav",
-                "omni_request_audio": str(omni_audio_path.resolve()),
+                "omni_request_audio": str(request_audio.resolve()),
                 "omni_request_audio_format": "wav",
+                "omni_request_audio_scope": "chunk",
                 "feature_schema": str(candidate.get("feature_schema") or ""),
                 "runtime_adapter": str(candidate.get("runtime_adapter") or ""),
             }
         )
+        response_usage.append(
+            {
+                "request_kind": "pre_asr_chunk",
+                "prompt_id": item_id,
+                "usage": raw.get("usage"),
+            }
+        )
+        response_finish_reasons.append(
+            {
+                "request_kind": "pre_asr_chunk",
+                "prompt_id": item_id,
+                "finish_reasons": raw.get("finish_reasons"),
+            }
+        )
+        _write_json(
+            output / "raw_responses" / "pre_asr" / f"{candidate_id}.json",
+            {
+                "schema": "pre_asr_omni_chunk_raw_v1",
+                "window_id": window_id,
+                "candidate_id": candidate_id,
+                "prompt_id": item_id,
+                "parsed": parsed,
+                "response": raw,
+            },
+        )
+    if prepare_only:
+        return {
+            "window_id": window_id,
+            "prepared": True,
+            "split_count": len(split_rows),
+            "chunk_count": len(chunk_rows),
+            "request_count": (1 if split_rows else 0) + len(chunk_rows),
+        }
+    if errors:
+        _write_json(
+            output / "errors" / f"{window_id}.json",
+            {
+                "schema": "joint_boundary_preasr_omni_window_error_v2",
+                "window_id": window_id,
+                "prompt_version": PROMPT_VERSION,
+                "request_mode": "separate_single_task",
+                "errors": errors,
+                "partial_split_count": len(split_labels),
+                "partial_pre_asr_count": len(pre_asr_labels),
+            },
+        )
+        return {
+            "window_id": window_id,
+            "prepared": False,
+            "split_count": len(split_labels),
+            "chunk_count": len(pre_asr_labels),
+            "error": f"{len(errors)} item request(s) failed",
+        }
+    missed_boundaries: list[dict[str, Any]] = []
     result = {
         "schema": JOINT_SCHEMA,
         "window_id": window_id,
         "prompt_version": PROMPT_VERSION,
         "model": model,
-        "request": str(request_path.resolve()),
+        "request_mode": "separate_single_task",
+        "request_dirs": {
+            "split": str((output / "requests" / "split").resolve()),
+            "pre_asr": str((output / "requests" / "pre_asr").resolve()),
+        },
         "audio_mp3_32k": str(Path(row["omni_mp3_32k"]).resolve()),
-        "training_audio_wav": str(Path(row["audio_wav"]).resolve()),
+        "training_audio_wav": str(window_audio_path.resolve()),
         "split_labels": split_labels,
         "pre_asr_labels": pre_asr_labels,
         "missed_boundaries": missed_boundaries,
-        "response_usage": raw.get("usage"),
-        "response_finish_reasons": raw.get("finish_reasons"),
+        "response_usage": response_usage,
+        "response_finish_reasons": response_finish_reasons,
     }
     _write_json(output / "joint_labels" / f"{window_id}.json", result)
-    _write_json(
-        output / "raw_responses" / f"{window_id}.json",
-        {
-            "schema": "joint_boundary_preasr_omni_raw_v1",
-            "window_id": window_id,
-            "parsed": parsed,
-            "response": raw,
-        },
-    )
     return {
         "window_id": window_id,
         "prepared": False,
@@ -617,6 +800,37 @@ def run(args: argparse.Namespace) -> None:
                 f"error={result.get('error', '')}",
                 flush=True,
             )
+    if args.prepare_only:
+        prepared_request_count = sum(int(row.get("request_count") or 0) for row in results)
+        errors = [row for row in results if row.get("error")]
+        _write_json(
+            output / "summary.json",
+            {
+                "schema": "joint_boundary_preasr_omni_summary_v1",
+                "dataset_dir": str(dataset.resolve()),
+                "window_count": len(windows),
+                "attempted_this_run": len(selected),
+                "errors_this_run": len(errors),
+                "prepared_only": True,
+                "prepared_request_count": prepared_request_count,
+                "model": model,
+                "prompt_version": PROMPT_VERSION,
+                "legacy_joint_prompt_version": LEGACY_JOINT_PROMPT_VERSION,
+                "request_mode": "separate_single_task",
+                "single_request_per_window": False,
+                "request_granularity": {
+                    "split": "one_window_split_task_per_request",
+                    "pre_asr": "one_chunk_per_request",
+                    "missed_boundary": "disabled",
+                },
+                "split_omni_audio_scope": "window",
+                "pre_asr_omni_audio_scope": "chunk",
+                "omni_audio_format": "wav",
+                "training_audio_format": "wav",
+                "sample_rate": 16000,
+            },
+        )
+        return
     split_rows, pre_asr_rows, missed_rows = _collect_completed(output)
     _write_jsonl(output / "split_labels.jsonl", split_rows)
     _write_jsonl(output / "pre_asr_labels.jsonl", pre_asr_rows)
@@ -651,7 +865,16 @@ def run(args: argparse.Namespace) -> None:
             "sample_rate": 16000,
             "model": model,
             "prompt_version": PROMPT_VERSION,
-            "single_request_per_window": True,
+            "legacy_joint_prompt_version": LEGACY_JOINT_PROMPT_VERSION,
+            "request_mode": "separate_single_task",
+            "single_request_per_window": False,
+            "request_granularity": {
+                "split": "one_window_split_task_per_request",
+                "pre_asr": "one_chunk_per_request",
+                "missed_boundary": "disabled",
+            },
+            "split_omni_audio_scope": "window",
+            "pre_asr_omni_audio_scope": "chunk",
             "semantic_split_dataset": str(
                 (dataset / "semantic_split").resolve()
             ),
@@ -663,8 +886,8 @@ def run(args: argparse.Namespace) -> None:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Use one Omni request per MP3 window to label both semantic split "
-            "candidates and post-boundary Pre-ASR chunks, then slice WAV training audio."
+            "Label semantic split candidates and Pre-ASR chunks with separate "
+            "single-task Omni requests."
         )
     )
     parser.add_argument(
