@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -514,6 +516,23 @@ def test_compile_pre_asr_cueqc_features_ignores_text_columns(tmp_path: Path):
     assert summary["keep"] == 1
     assert summary["drop"] == 1
     assert "text" not in " ".join(summary["feature_names"]).lower()
+
+
+def test_pre_asr_v12_wrappers_run_as_script_paths():
+    root = Path(__file__).resolve().parents[1]
+    for script in (
+        root / "tools" / "asr" / "cueqc" / "compile_pre_asr_v12_features.py",
+        root / "tools" / "asr" / "cueqc" / "train_pre_asr_v12_binary.py",
+    ):
+        result = subprocess.run(
+            [sys.executable, str(script), "--help"],
+            cwd=root,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+        )
+        assert result.returncode == 0, result.stderr
 
 
 def test_compile_pre_asr_cueqc_features_reads_jsonl_chunk_candidates(tmp_path: Path):
