@@ -95,6 +95,7 @@ def evaluate_false_drop_audit(
     *,
     manifest_rows: Iterable[Mapping[str, Any]],
     verdict_rows: Iterable[Mapping[str, Any]],
+    allow_extra_verdicts: bool = False,
 ) -> dict[str, Any]:
     targets = [dict(row) for row in manifest_rows if _is_long_false_drop_row(row)]
     target_by_id = {candidate_id(row): row for row in targets}
@@ -138,7 +139,7 @@ def evaluate_false_drop_audit(
     ]
     complete = (
         not missing_ids
-        and not unexpected_ids
+        and (allow_extra_verdicts or not unexpected_ids)
         and not duplicate_verdicts
         and not unknown_verdicts
         and len(reviewed_ids) == len(target_ids)
@@ -153,6 +154,8 @@ def evaluate_false_drop_audit(
         "missing_candidates": missing_ids,
         "unexpected_count": len(unexpected_ids),
         "unexpected_candidates": unexpected_ids,
+        "allow_extra_verdicts": bool(allow_extra_verdicts),
+        "extra_verdicts_ignored_count": len(unexpected_ids) if allow_extra_verdicts else 0,
         "duplicate_verdict_count": len(duplicate_verdicts),
         "duplicate_verdict_candidates": sorted(duplicate_verdicts),
         "invalid_verdict_count": len(unknown_verdicts),
@@ -172,7 +175,13 @@ def evaluate_false_drop_audit(
     }
 
 
-def evaluate_paths(*, manifest: Path, verdicts: Path | Iterable[Path], output: Path | None) -> dict[str, Any]:
+def evaluate_paths(
+    *,
+    manifest: Path,
+    verdicts: Path | Iterable[Path],
+    output: Path | None,
+    allow_extra_verdicts: bool = False,
+) -> dict[str, Any]:
     verdict_paths = [verdicts] if isinstance(verdicts, Path) else list(verdicts)
     verdict_rows: list[dict[str, Any]] = []
     for path in verdict_paths:
@@ -180,6 +189,7 @@ def evaluate_paths(*, manifest: Path, verdicts: Path | Iterable[Path], output: P
     summary = evaluate_false_drop_audit(
         manifest_rows=read_jsonl(manifest),
         verdict_rows=verdict_rows,
+        allow_extra_verdicts=allow_extra_verdicts,
     )
     summary.update(
         {
@@ -206,6 +216,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=[],
         help="Manual verdict JSONL. May be repeated; defaults to <audit-dir>/manual_verdicts.jsonl.",
     )
+    parser.add_argument(
+        "--allow-extra-verdicts",
+        action="store_true",
+        help="Allow verdict files to contain reviewed candidates outside the target manifest.",
+    )
     parser.add_argument("--output", default="")
     return parser.parse_args(argv)
 
@@ -216,7 +231,12 @@ def main(argv: list[str] | None = None) -> int:
     manifest = project_path(args.manifest) if args.manifest else audit_dir / "manifest.jsonl"
     verdicts = [project_path(path) for path in args.verdicts] if args.verdicts else [audit_dir / "manual_verdicts.jsonl"]
     output = project_path(args.output) if args.output else audit_dir / "gate_summary.json"
-    summary = evaluate_paths(manifest=manifest, verdicts=verdicts, output=output)
+    summary = evaluate_paths(
+        manifest=manifest,
+        verdicts=verdicts,
+        output=output,
+        allow_extra_verdicts=bool(args.allow_extra_verdicts),
+    )
     print(json.dumps(summary, ensure_ascii=False, indent=2, sort_keys=True))
     return 0 if summary["gate_pass"] else 1
 

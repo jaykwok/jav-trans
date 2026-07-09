@@ -133,3 +133,19 @@ def test_false_drop_audit_gate_accepts_multiple_verdict_files(tmp_path: Path) ->
     assert len(summary["verdicts"]) == 2
     assert summary["verdicts"][0].endswith("manual_verdicts_round1.jsonl")
     assert summary["verdicts"][1].endswith("manual_verdicts_round2.jsonl")
+
+
+def test_false_drop_audit_gate_can_allow_extra_verdicts() -> None:
+    summary = evaluate_false_drop_audit(
+        manifest_rows=[_manifest_row("preasr-vid-w00-chunk00001")],
+        verdict_rows=[
+            _verdict("preasr-vid-w00-chunk00001", "drop"),
+            _verdict("preasr-vid-w00-chunk99999", "keep"),
+        ],
+        allow_extra_verdicts=True,
+    )
+
+    assert summary["complete"] is True
+    assert summary["promote_allowed"] is True
+    assert summary["unexpected_candidates"] == ["preasr-vid-w00-chunk99999"]
+    assert summary["extra_verdicts_ignored_count"] == 1
