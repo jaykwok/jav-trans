@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 from pathlib import Path
 
 from tools.datasets.analyze_split_duration_pressure_operating_point import (
@@ -66,7 +67,9 @@ def test_duration_pressure_only_splits_overlong_chunks(tmp_path: Path) -> None:
     summary = analyze_duration_pressure(
         reexport_dir=_make_reexport(tmp_path),
         floors=[0.50],
-        long_chunk_min_s=15.0,
+        duration_pressure_log_median=math.log(10.0),
+        duration_pressure_log_mad=math.log(14.0 / 10.0) / (1.4826 * 2.0),
+        duration_pressure_z=2.0,
         min_chunk_after_split_s=1.2,
         pure_adaptive_policy={
             "abs_floor": 0.50,
@@ -88,7 +91,9 @@ def test_export_duration_pressure_writes_summary(tmp_path: Path) -> None:
         reexport_dir=_make_reexport(tmp_path),
         output_dir=tmp_path / "out",
         floors=[0.50],
-        long_chunk_min_s=15.0,
+        duration_pressure_log_median=math.log(10.0),
+        duration_pressure_log_mad=math.log(14.0 / 10.0) / (1.4826 * 2.0),
+        duration_pressure_z=2.0,
         min_chunk_after_split_s=1.2,
         pure_adaptive_policy={
             "abs_floor": 0.50,
@@ -99,5 +104,10 @@ def test_export_duration_pressure_writes_summary(tmp_path: Path) -> None:
 
     stored = json.loads((tmp_path / "out" / "summary.json").read_text(encoding="utf-8"))
     assert stored["schema"] == "split_duration_pressure_operating_point_summary_v1"
+    assert stored["duration_pressure_trigger_s"] == 14.0
+    assert stored["duration_pressure_calibration"]["mode"] == "log_median_mad"
+    assert stored["duration_pressure_calibration"]["score_formula"] == (
+        "(log(duration_s) - log_median) / (1.4826 * log_mad)"
+    )
     assert stored["duration_pressure_variant"]["0.50"]["new_cuts"] == 1
     assert summary["output_dir"].endswith("out")

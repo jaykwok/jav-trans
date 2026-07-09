@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import statistics
 import sys
 from pathlib import Path
@@ -106,14 +107,68 @@ def _quantile_99(values: list[float]) -> float | None:
     return round(statistics.quantiles(values, n=100)[98], 3)
 
 
+def _calibrate_duration_pressure(
+    durations: list[float],
+    *,
+    log_median: float | None,
+    log_mad: float | None,
+    z: float,
+) -> dict[str, Any]:
+    values = [float(value) for value in durations if math.isfinite(float(value)) and float(value) > 0.0]
+    log_values = [math.log(value) for value in values]
+    calibrated_from_reexport = log_median is None or log_mad is None
+    if log_median is None:
+        if not values:
+            raise ValueError("cannot calibrate duration pressure without positive durations")
+        log_median = statistics.median(log_values)
+    if log_mad is None:
+        if not values:
+            raise ValueError("cannot calibrate duration pressure MAD without positive durations")
+        log_mad = statistics.median(abs(value - float(log_median)) for value in log_values)
+    if log_mad <= 0.0:
+        raise ValueError("duration pressure log MAD must be positive")
+    scaled_log_mad = 1.4826 * float(log_mad)
+    trigger_s = math.exp(float(log_median) + float(z) * scaled_log_mad)
+    return {
+        "schema": "split_duration_pressure_calibration_v1",
+        "mode": "log_median_mad",
+        "score_formula": "(log(duration_s) - log_median) / (1.4826 * log_mad)",
+        "log_median": round(float(log_median), 9),
+        "log_mad": round(float(log_mad), 9),
+        "scaled_log_mad": round(scaled_log_mad, 9),
+        "z": round(float(z), 6),
+        "effective_trigger_s": round(trigger_s, 6),
+        "calibrated_from_reexport": calibrated_from_reexport,
+    }
+
+
 def analyze_duration_pressure(
     *,
     reexport_dir: Path,
     floors: list[float],
-    long_chunk_min_s: float,
+    duration_pressure_log_median: float | None,
+    duration_pressure_log_mad: float | None,
+    duration_pressure_z: float,
     min_chunk_after_split_s: float,
     pure_adaptive_policy: Mapping[str, float],
 ) -> dict[str, Any]:
+    all_durations: list[float] = []
+    for feature_dir in _feature_dirs(reexport_dir):
+        candidate_path = feature_dir / "pre_asr_candidates.jsonl"
+        if not candidate_path.exists():
+            continue
+        for chunk in read_jsonl(candidate_path):
+            start = safe_float(chunk.get("start"))
+            end = safe_float(chunk.get("end"), start)
+            all_durations.append(safe_float(chunk.get("duration_s"), end - start))
+
+    calibration = _calibrate_duration_pressure(
+        all_durations,
+        log_median=duration_pressure_log_median,
+        log_mad=duration_pressure_log_mad,
+        z=duration_pressure_z,
+    )
+    duration_pressure_trigger_s = float(calibration["effective_trigger_s"])
     long_chunks: list[dict[str, Any]] = []
     adaptive_new_in_long = 0
     adaptive_new_in_short = 0
@@ -141,7 +196,7 @@ def analyze_duration_pressure(
             start = safe_float(chunk.get("start"))
             end = safe_float(chunk.get("end"), start)
             duration = safe_float(chunk.get("duration_s"), end - start)
-            if duration < long_chunk_min_s:
+            if duration < duration_pressure_trigger_s:
                 continue
             candidates = _internal_cut_candidates(
                 split_rows,
@@ -157,6 +212,10 @@ def analyze_duration_pressure(
                     "start": start,
                     "end": end,
                     "duration": duration,
+                    "duration_pressure_score": (
+                        (math.log(duration) - float(calibration["log_median"]))
+                        / float(calibration["scaled_log_mad"])
+                    ),
                     "candidates": candidates,
                     "max_p": max_p,
                 }
@@ -182,7 +241,7 @@ def analyze_duration_pressure(
                 end = safe_float(chunk.get("end"), start)
                 if start + min_chunk_after_split_s <= time_s <= end - min_chunk_after_split_s:
                     duration = safe_float(chunk.get("duration_s"), end - start)
-                    if duration >= long_chunk_min_s:
+                    if duration >= duration_pressure_trigger_s:
                         adaptive_new_in_long += 1
                     else:
                         adaptive_new_in_short += 1
@@ -200,7 +259,7 @@ def analyze_duration_pressure(
                     start=float(chunk["start"]),
                     end=float(chunk["end"]),
                     floor=floor,
-                    long_chunk_min_s=long_chunk_min_s,
+                    long_chunk_min_s=duration_pressure_trigger_s,
                     min_chunk_after_split_s=min_chunk_after_split_s,
                 )
                 bucket["new_cuts"] += len(cuts)
@@ -210,7 +269,7 @@ def analyze_duration_pressure(
                 for seg_start, seg_end in zip(bounds, bounds[1:]):
                     duration = seg_end - seg_start
                     durations.append(duration)
-                    if duration >= long_chunk_min_s:
+                    if duration >= duration_pressure_trigger_s:
                         bucket["residual_long_segments"] += 1
                         bucket["residual_max_s"] = max(bucket["residual_max_s"], duration)
 
@@ -231,7 +290,9 @@ def analyze_duration_pressure(
     return {
         "schema": SUMMARY_SCHEMA,
         "reexport_dir": repo_rel(reexport_dir),
-        "long_chunk_min_s": float(long_chunk_min_s),
+        "duration_pressure_calibration": calibration,
+        "duration_pressure_trigger_s": duration_pressure_trigger_s,
+        "long_chunk_min_s": duration_pressure_trigger_s,
         "min_chunk_after_split_s": float(min_chunk_after_split_s),
         "long_chunk_count": len(long_chunks),
         "ceiling": ceiling,
@@ -240,6 +301,7 @@ def analyze_duration_pressure(
                 "candidate_id": str(chunk["candidate_id"]),
                 "window": str(chunk["window"]),
                 "duration_s": round(float(chunk["duration"]), 2),
+                "duration_pressure_score": round(float(chunk["duration_pressure_score"]), 4),
                 "max_internal_p_cut": round(float(chunk["max_p"]), 4),
             }
             for chunk in sorted(unfixable, key=lambda item: -float(item["duration"]))
@@ -259,14 +321,18 @@ def export_duration_pressure(
     reexport_dir: Path,
     output_dir: Path,
     floors: list[float],
-    long_chunk_min_s: float,
+    duration_pressure_log_median: float | None,
+    duration_pressure_log_mad: float | None,
+    duration_pressure_z: float,
     min_chunk_after_split_s: float,
     pure_adaptive_policy: Mapping[str, float],
 ) -> dict[str, Any]:
     summary = analyze_duration_pressure(
         reexport_dir=reexport_dir,
         floors=floors,
-        long_chunk_min_s=long_chunk_min_s,
+        duration_pressure_log_median=duration_pressure_log_median,
+        duration_pressure_log_mad=duration_pressure_log_mad,
+        duration_pressure_z=duration_pressure_z,
         min_chunk_after_split_s=min_chunk_after_split_s,
         pure_adaptive_policy=pure_adaptive_policy,
     )
@@ -288,7 +354,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--reexport-dir", required=True)
     parser.add_argument("--output-dir", required=True)
     parser.add_argument("--floors", type=_parse_floats, default=[0.45, 0.50, 0.55])
-    parser.add_argument("--long-chunk-min-s", type=float, default=15.0)
+    parser.add_argument("--duration-pressure-log-median", type=float)
+    parser.add_argument("--duration-pressure-log-mad", type=float)
+    parser.add_argument("--duration-pressure-z", type=float, default=3.0)
     parser.add_argument("--min-chunk-after-split-s", type=float, default=1.2)
     parser.add_argument("--adaptive-abs-floor", type=float, default=0.50)
     parser.add_argument("--adaptive-percentile-floor", type=float, default=0.90)
@@ -302,7 +370,9 @@ def main(argv: list[str] | None = None) -> int:
         reexport_dir=project_path(args.reexport_dir),
         output_dir=project_path(args.output_dir),
         floors=list(args.floors),
-        long_chunk_min_s=float(args.long_chunk_min_s),
+        duration_pressure_log_median=args.duration_pressure_log_median,
+        duration_pressure_log_mad=args.duration_pressure_log_mad,
+        duration_pressure_z=float(args.duration_pressure_z),
         min_chunk_after_split_s=float(args.min_chunk_after_split_s),
         pure_adaptive_policy={
             "abs_floor": float(args.adaptive_abs_floor),
