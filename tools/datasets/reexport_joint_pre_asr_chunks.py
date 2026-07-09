@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 from collections import Counter
 from datetime import datetime
@@ -155,6 +156,27 @@ def run(args: argparse.Namespace) -> None:
     )
 
     applied_ratio = apply_vram_safety_cap()
+    duration_pressure_config = {
+        "enabled": bool(args.duration_pressure_enabled),
+        "log_median": float(args.duration_pressure_log_median),
+        "log_mad": float(args.duration_pressure_log_mad),
+        "z": float(args.duration_pressure_z),
+        "floor": float(args.duration_pressure_floor),
+    }
+    if duration_pressure_config["enabled"]:
+        os.environ["SEMANTIC_SPLIT_DURATION_PRESSURE_ENABLED"] = "1"
+        os.environ["SEMANTIC_SPLIT_DURATION_PRESSURE_LOG_MEDIAN"] = str(
+            duration_pressure_config["log_median"]
+        )
+        os.environ["SEMANTIC_SPLIT_DURATION_PRESSURE_LOG_MAD"] = str(
+            duration_pressure_config["log_mad"]
+        )
+        os.environ["SEMANTIC_SPLIT_DURATION_PRESSURE_Z"] = str(
+            duration_pressure_config["z"]
+        )
+        os.environ["SEMANTIC_SPLIT_DURATION_PRESSURE_FLOOR"] = str(
+            duration_pressure_config["floor"]
+        )
     output_dir = project_path(args.output_dir) if args.output_dir else (
         PROJECT_ROOT
         / "agents"
@@ -181,6 +203,7 @@ def run(args: argparse.Namespace) -> None:
         "output_dir": str(output_dir.resolve()),
         "source_windows": str((output_dir / "source_windows.jsonl").resolve()),
         "vram_safety_ratio": applied_ratio,
+        "semantic_split_duration_pressure": duration_pressure_config,
         "selected_window_count": len(selected_rows),
         **collect_summary,
         **reexport_summary,
@@ -200,6 +223,11 @@ def parse_args() -> argparse.Namespace:
         help="Defaults to agents/temp/<timestamp>_pre-asr-chunk-reexport/.",
     )
     parser.add_argument("--max-windows", type=int, default=None)
+    parser.add_argument("--duration-pressure-enabled", action="store_true")
+    parser.add_argument("--duration-pressure-log-median", type=float, default=0.0)
+    parser.add_argument("--duration-pressure-log-mad", type=float, default=0.0)
+    parser.add_argument("--duration-pressure-z", type=float, default=0.0)
+    parser.add_argument("--duration-pressure-floor", type=float, default=0.50)
     return parser.parse_args()
 
 

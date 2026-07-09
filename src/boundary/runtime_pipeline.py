@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import math
 from dataclasses import dataclass, replace
 from typing import Callable, Sequence
 
@@ -27,6 +28,19 @@ class SemanticBoundaryConfig:
     short_core_cut_threshold: float = 0.90
     normal_cut_threshold: float = 0.75
     min_chunk_after_split_s: float = 1.2
+    duration_pressure_enabled: bool = False
+    duration_pressure_log_median: float = 0.0
+    duration_pressure_log_mad: float = 0.0
+    duration_pressure_z: float = 0.0
+    duration_pressure_floor: float = 0.50
+
+
+def _decision_bool(value, default: bool) -> bool:
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return default
+    return str(value).strip().lower() in {"1", "true", "yes", "on"}
 
 
 def _effective_semantic_config(
@@ -38,6 +52,7 @@ def _effective_semantic_config(
     decision = getattr(split_verifier, "decision_config", None)
     if not isinstance(decision, dict) or not decision:
         return config
+    pressure_from_config = bool(config.duration_pressure_enabled)
     return SemanticBoundaryConfig(
         short_core_max_s=float(
             decision.get("short_core_max_s", config.short_core_max_s)
@@ -50,6 +65,34 @@ def _effective_semantic_config(
         ),
         min_chunk_after_split_s=float(
             decision.get("min_chunk_after_split_s", config.min_chunk_after_split_s)
+        ),
+        duration_pressure_enabled=pressure_from_config
+        or _decision_bool(decision.get("duration_pressure_enabled"), False),
+        duration_pressure_log_median=float(
+            config.duration_pressure_log_median
+            if pressure_from_config
+            else decision.get(
+                "duration_pressure_log_median", config.duration_pressure_log_median
+            )
+        ),
+        duration_pressure_log_mad=float(
+            config.duration_pressure_log_mad
+            if pressure_from_config
+            else decision.get(
+                "duration_pressure_log_mad", config.duration_pressure_log_mad
+            )
+        ),
+        duration_pressure_z=float(
+            config.duration_pressure_z
+            if pressure_from_config
+            else decision.get("duration_pressure_z", config.duration_pressure_z)
+        ),
+        duration_pressure_floor=float(
+            config.duration_pressure_floor
+            if pressure_from_config
+            else decision.get(
+                "duration_pressure_floor", config.duration_pressure_floor
+            )
         ),
     )
 
@@ -104,8 +147,8 @@ def build_semantic_boundary_chunks(
     ) -> None:
         if split_audit_records is None:
             return
-        accepted_times = {
-            round(float(candidate["time_s"]), 6)
+        accepted_by_time = {
+            round(float(candidate["time_s"]), 6): dict(candidate)
             for candidate, _decision in accepted
         }
         for candidate, decision, frames, scalars in zip(
@@ -114,13 +157,14 @@ def build_semantic_boundary_chunks(
             frame_features,
             scalar_features,
         ):
+            accepted_candidate = accepted_by_time.get(round(float(candidate["time_s"]), 6))
             split_audit_records.append(
                 {
                     "candidate": dict(candidate),
                     "core_start": core_start,
                     "core_end": core_end,
-                    "accepted": round(float(candidate["time_s"]), 6)
-                    in accepted_times,
+                    "accepted": accepted_candidate is not None,
+                    "accepted_candidate": accepted_candidate or {},
                     "label": decision.label,
                     "p_cut": decision.p_cut,
                     "p_continue": decision.p_continue,
@@ -635,24 +679,28 @@ def _is_noise_bracket_pair(
     return earlier_role == "speech_to_noise" and later_role == "noise_to_speech"
 
 
-def _accepted_proposals(
-    proposals,
-    decisions,
+def _duration_pressure_score(duration_s: float, config: SemanticBoundaryConfig) -> float:
+    scaled_log_mad = 1.4826 * float(config.duration_pressure_log_mad)
+    if scaled_log_mad <= 0.0:
+        raise ValueError("duration pressure log MAD must be positive when enabled")
+    return (math.log(float(duration_s)) - float(config.duration_pressure_log_median)) / scaled_log_mad
+
+
+def _duration_pressure_trigger_s(config: SemanticBoundaryConfig) -> float:
+    return math.exp(
+        float(config.duration_pressure_log_median)
+        + float(config.duration_pressure_z) * 1.4826 * float(config.duration_pressure_log_mad)
+    )
+
+
+def _select_spaced_cut_candidates(
+    candidates,
     *,
     core_start,
     core_end,
-    config,
+    min_chunk_after_split_s: float,
 ):
-    threshold = (
-        config.short_core_cut_threshold
-        if core_end - core_start <= config.short_core_max_s
-        else config.normal_cut_threshold
-    )
-    accepted = [
-        (candidate, decision)
-        for candidate, decision in zip(proposals, decisions)
-        if decision.label == "cut" and decision.p_cut >= threshold
-    ]
+    accepted = list(candidates)
     accepted.sort(key=lambda item: item[1].p_cut, reverse=True)
     selected: list[tuple[dict, SplitDecision]] = []
     brackets: set[int] = set()
@@ -660,13 +708,13 @@ def _accepted_proposals(
         candidate = dict(candidate)
         time_s = float(candidate["time_s"])
         edge_gap = min(abs(time_s - core_start), abs(time_s - core_end))
-        if edge_gap < config.min_chunk_after_split_s:
+        if edge_gap < min_chunk_after_split_s:
             continue
         near = [
             index
             for index, (existing, _decision) in enumerate(selected)
             if abs(time_s - float(existing["time_s"]))
-            < config.min_chunk_after_split_s
+            < min_chunk_after_split_s
         ]
         if not near:
             selected.append((candidate, decision))
@@ -703,6 +751,100 @@ def _accepted_proposals(
             entry["noise_isolation_bracket"] = True
         result.append((entry, decision))
     return sorted(result, key=lambda item: float(item[0]["time_s"]))
+
+
+def _add_duration_pressure_cuts(
+    selected,
+    proposals,
+    decisions,
+    *,
+    core_start,
+    core_end,
+    config: SemanticBoundaryConfig,
+):
+    if not config.duration_pressure_enabled:
+        return selected
+    trigger_s = _duration_pressure_trigger_s(config)
+    selected_by_time = {
+        round(float(candidate["time_s"]), 6) for candidate, _decision in selected
+    }
+    floor_pool = [
+        (dict(candidate), decision)
+        for candidate, decision in zip(proposals, decisions)
+        if decision.label == "cut"
+        and decision.p_cut >= float(config.duration_pressure_floor)
+        and round(float(candidate["time_s"]), 6) not in selected_by_time
+    ]
+    if not floor_pool:
+        return selected
+    result = list(selected)
+    while True:
+        added: list[tuple[dict, SplitDecision]] = []
+        bounds = sorted([float(core_start), *(float(item[0]["time_s"]) for item in result), float(core_end)])
+        for seg_start, seg_end in zip(bounds, bounds[1:]):
+            duration_s = seg_end - seg_start
+            if duration_s < trigger_s:
+                continue
+            score = _duration_pressure_score(duration_s, config)
+            if score < float(config.duration_pressure_z):
+                continue
+            eligible = [
+                (candidate, decision)
+                for candidate, decision in floor_pool
+                if round(float(candidate["time_s"]), 6) not in selected_by_time
+                and seg_start + config.min_chunk_after_split_s
+                <= float(candidate["time_s"])
+                <= seg_end - config.min_chunk_after_split_s
+            ]
+            if not eligible:
+                continue
+            candidate, decision = max(eligible, key=lambda item: item[1].p_cut)
+            entry = {
+                **candidate,
+                "duration_pressure_acceptance": True,
+                "duration_pressure_score": score,
+                "duration_pressure_trigger_s": trigger_s,
+                "duration_pressure_floor": float(config.duration_pressure_floor),
+            }
+            added.append((entry, decision))
+            selected_by_time.add(round(float(candidate["time_s"]), 6))
+        if not added:
+            break
+        result.extend(added)
+    return sorted(result, key=lambda item: float(item[0]["time_s"]))
+
+
+def _accepted_proposals(
+    proposals,
+    decisions,
+    *,
+    core_start,
+    core_end,
+    config,
+):
+    threshold = (
+        config.short_core_cut_threshold
+        if core_end - core_start <= config.short_core_max_s
+        else config.normal_cut_threshold
+    )
+    accepted = _select_spaced_cut_candidates(
+        [
+            (candidate, decision)
+            for candidate, decision in zip(proposals, decisions)
+            if decision.label == "cut" and decision.p_cut >= threshold
+        ],
+        core_start=core_start,
+        core_end=core_end,
+        min_chunk_after_split_s=config.min_chunk_after_split_s,
+    )
+    return _add_duration_pressure_cuts(
+        accepted,
+        proposals,
+        decisions,
+        core_start=core_start,
+        core_end=core_end,
+        config=config,
+    )
 
 
 def _refine_cuts(

@@ -15,9 +15,9 @@ from boundary.base import SpeechSegment
 
 log = logging.getLogger(__name__)
 
-# v18 invalidates v17 artifacts because Pre-ASR CueQC v9 consumes split-edge
-# soft decisions and bracket-pair metadata stored on packed chunks.
-BOUNDARY_CACHE_VERSION = 18
+# v19 invalidates v18 artifacts because Split duration-pressure acceptance can
+# change packed chunk boundaries without changing model checkpoint content.
+BOUNDARY_CACHE_VERSION = 19
 _AUDIO_SAMPLE_BYTES = 2 * 1024 * 1024
 _AUDIO_KEY_RE = re.compile(r"^[0-9a-fA-F]{8,40}$")
 
@@ -58,6 +58,11 @@ _BOUNDARY_ENV_KEYS = (
     "BOUNDARY_FRAME_SEQUENCE_RIGHT_CONTEXT_S",
     "BOUNDARY_FRAME_SEQUENCE_MAX_PTM_DIMS",
     "BOUNDARY_FRAME_SEQUENCE_INCLUDE_MFCC",
+    "SEMANTIC_SPLIT_DURATION_PRESSURE_ENABLED",
+    "SEMANTIC_SPLIT_DURATION_PRESSURE_LOG_MEDIAN",
+    "SEMANTIC_SPLIT_DURATION_PRESSURE_LOG_MAD",
+    "SEMANTIC_SPLIT_DURATION_PRESSURE_Z",
+    "SEMANTIC_SPLIT_DURATION_PRESSURE_FLOOR",
 )
 
 # Model checkpoint paths whose *content* must invalidate the cache when a file is

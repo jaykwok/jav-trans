@@ -46,6 +46,11 @@ SEMANTIC_SPLIT_V2_DEFAULT_DECISION = {
     "short_core_cut_threshold": 0.90,
     "normal_cut_threshold": 0.75,
     "min_chunk_after_split_s": 1.2,
+    "duration_pressure_enabled": False,
+    "duration_pressure_log_median": 0.0,
+    "duration_pressure_log_mad": 0.0,
+    "duration_pressure_z": 0.0,
+    "duration_pressure_floor": 0.50,
 }
 
 

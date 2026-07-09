@@ -4,7 +4,7 @@ import numpy as np
 
 from boundary.base import SpeechSegment
 from boundary.outer_refiner import OuterEdgePrediction
-from boundary.runtime_pipeline import build_semantic_boundary_chunks
+from boundary.runtime_pipeline import SemanticBoundaryConfig, build_semantic_boundary_chunks
 from boundary.sequence_features import FrameSequenceFeatureConfig, FrameSequenceFeatureProvider
 from boundary.split_model import SplitDecision
 
@@ -139,6 +139,105 @@ def test_short_core_prefers_continue_below_high_threshold():
         split_verifier=ShortSplit(),
         cut_refiner=_CutRefiner(),
     )
+    assert len(chunks) == 1
+
+
+def test_duration_pressure_accepts_best_internal_cut_for_overlong_chunk():
+    class PressureSplit(_SplitVerifier):
+        def decide(self, *, frame_features, scalar_features):
+            return [SplitDecision("cut", 0.62, 0.30, 0.08)]
+
+    provider = FrameSequenceFeatureProvider(
+        duration_s=22.0,
+        frame_hop_s=0.02,
+        ptm=np.zeros((1100, 4), dtype=np.float32),
+        mfcc=np.zeros((1100, 2), dtype=np.float32),
+        config=FrameSequenceFeatureConfig(max_ptm_dims=4),
+    )
+    segment = SpeechSegment(
+        start=0.0,
+        end=20.0,
+        weak_cut_candidates=[
+            {
+                "kind": "proposal",
+                "time_s": 10.0,
+                "frame": 500,
+                "score": 0.8,
+                "prominence": 0.2,
+                "speech_valley": 0.5,
+                "strength": 1.5,
+            }
+        ],
+    )
+
+    chunks = build_semantic_boundary_chunks(
+        [segment],
+        duration_s=22.0,
+        speech_probabilities=np.ones(1100, dtype=np.float32),
+        feature_provider=provider,
+        outer_refiner=_OuterRefiner(),
+        split_verifier=PressureSplit(),
+        cut_refiner=_CutRefiner(),
+        config=SemanticBoundaryConfig(
+            duration_pressure_enabled=True,
+            duration_pressure_log_median=np.log(10.0),
+            duration_pressure_log_mad=np.log(14.0 / 10.0) / (1.4826 * 2.0),
+            duration_pressure_z=2.0,
+            duration_pressure_floor=0.50,
+        ),
+    )
+
+    assert len(chunks) == 2
+    assert chunks[0].end == chunks[1].start == 10.08
+    assert chunks[0].primary_cut_candidates[0]["duration_pressure_acceptance"] is True
+    assert chunks[0].primary_cut_candidates[0]["p_cut"] == 0.62
+
+
+def test_duration_pressure_does_not_accept_below_trigger():
+    class PressureSplit(_SplitVerifier):
+        def decide(self, *, frame_features, scalar_features):
+            return [SplitDecision("cut", 0.62, 0.30, 0.08)]
+
+    provider = FrameSequenceFeatureProvider(
+        duration_s=14.0,
+        frame_hop_s=0.02,
+        ptm=np.zeros((700, 4), dtype=np.float32),
+        mfcc=np.zeros((700, 2), dtype=np.float32),
+        config=FrameSequenceFeatureConfig(max_ptm_dims=4),
+    )
+    segment = SpeechSegment(
+        start=0.0,
+        end=12.0,
+        weak_cut_candidates=[
+            {
+                "kind": "proposal",
+                "time_s": 6.0,
+                "frame": 300,
+                "score": 0.8,
+                "prominence": 0.2,
+                "speech_valley": 0.5,
+                "strength": 1.5,
+            }
+        ],
+    )
+
+    chunks = build_semantic_boundary_chunks(
+        [segment],
+        duration_s=14.0,
+        speech_probabilities=np.ones(700, dtype=np.float32),
+        feature_provider=provider,
+        outer_refiner=_OuterRefiner(),
+        split_verifier=PressureSplit(),
+        cut_refiner=_CutRefiner(),
+        config=SemanticBoundaryConfig(
+            duration_pressure_enabled=True,
+            duration_pressure_log_median=np.log(10.0),
+            duration_pressure_log_mad=np.log(14.0 / 10.0) / (1.4826 * 2.0),
+            duration_pressure_z=2.0,
+            duration_pressure_floor=0.50,
+        ),
+    )
+
     assert len(chunks) == 1
 
 
