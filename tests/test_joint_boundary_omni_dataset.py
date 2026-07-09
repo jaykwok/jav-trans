@@ -355,6 +355,107 @@ def test_empty_pre_asr_audio_api_error_becomes_drop(
     assert label["local_fallback"] == "empty_audio_to_definite_drop"
 
 
+def test_api_moderation_rejected_pre_asr_chunk_becomes_ignore(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    def fake_slice_audio_clip(**kwargs):
+        output_path = Path(kwargs["output_path"])
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_bytes(b"wav")
+
+    errors = iter(
+        [
+            RuntimeError(
+                'data: {"error":{"code":"data_inspection_failed",'
+                '"message":"Input audio data may contain inappropriate content."}}'
+            ),
+            RuntimeError("Output data may contain inappropriate content."),
+        ]
+    )
+
+    def fake_call_with_retry(**kwargs):
+        raise next(errors)
+
+    split_path = tmp_path / "split.jsonl"
+    chunk_path = tmp_path / "chunks.jsonl"
+    audio_path = tmp_path / "window.wav"
+    mp3_path = tmp_path / "window.mp3"
+    split_path.write_text("", encoding="utf-8")
+    audio_path.write_bytes(b"wav")
+    mp3_path.write_bytes(b"mp3")
+    chunk_path.write_text(
+        "\n".join(
+            json.dumps(
+                {
+                    "sample_id": f"s{index}",
+                    "candidate_id": f"c{index}",
+                    "audio_id": "a1",
+                    "video_id": "v1",
+                    "chunk_index": index,
+                    "start": float(index),
+                    "end": float(index + 1),
+                    "duration_s": 1.0,
+                }
+            )
+            for index in range(2)
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(joint_omni, "slice_audio_clip", fake_slice_audio_clip)
+    monkeypatch.setattr(joint_omni, "_call_with_retry", fake_call_with_retry)
+
+    result = joint_omni._process_window(
+        {
+            "window_id": "w01",
+            "duration_s": 3.0,
+            "audio_wav": str(audio_path),
+            "omni_mp3_32k": str(mp3_path),
+            "semantic_split_metadata": str(split_path),
+            "pre_asr_candidates": str(chunk_path),
+        },
+        output=tmp_path / "out",
+        segments_root=tmp_path / "segments",
+        split_limit=10,
+        chunk_limit=10,
+        split_confidence=0.8,
+        keep_confidence=0.8,
+        drop_confidence=0.9,
+        model="qwen3.5-omni-flash",
+        api_key="",
+        base_url="",
+        audio_content_mode="input_audio",
+        timeout_s=1.0,
+        max_tokens=256,
+        prepare_only=False,
+        label_task="pre_asr",
+        rate_limiter=None,
+        response_cache=_disabled_cache(),
+    )
+    payload = json.loads(
+        (tmp_path / "out" / "joint_labels" / "w01.json").read_text(
+            encoding="utf-8"
+        )
+    )
+
+    assert "error" not in result
+    labels = payload["pre_asr_labels"]
+    assert [label["label"] for label in labels] == [
+        "ambiguous_ignore",
+        "ambiguous_ignore",
+    ]
+    assert [label["training_label_included"] for label in labels] == [False, False]
+    assert [label["local_fallback"] for label in labels] == [
+        "api_moderation_reject_to_ambiguous_ignore",
+        "api_moderation_reject_to_ambiguous_ignore",
+    ]
+    assert [label["omni_flags"] for label in labels] == [
+        ["api_rejected"],
+        ["api_rejected"],
+    ]
+
+
 def test_pre_asr_response_cache_reuses_successful_chunk(
     tmp_path: Path,
     monkeypatch,
