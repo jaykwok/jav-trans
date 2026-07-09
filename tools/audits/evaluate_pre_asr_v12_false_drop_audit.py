@@ -172,15 +172,19 @@ def evaluate_false_drop_audit(
     }
 
 
-def evaluate_paths(*, manifest: Path, verdicts: Path, output: Path | None) -> dict[str, Any]:
+def evaluate_paths(*, manifest: Path, verdicts: Path | Iterable[Path], output: Path | None) -> dict[str, Any]:
+    verdict_paths = [verdicts] if isinstance(verdicts, Path) else list(verdicts)
+    verdict_rows: list[dict[str, Any]] = []
+    for path in verdict_paths:
+        verdict_rows.extend(read_jsonl(path))
     summary = evaluate_false_drop_audit(
         manifest_rows=read_jsonl(manifest),
-        verdict_rows=read_jsonl(verdicts),
+        verdict_rows=verdict_rows,
     )
     summary.update(
         {
             "manifest": repo_rel(manifest),
-            "verdicts": repo_rel(verdicts),
+            "verdicts": [repo_rel(path) for path in verdict_paths],
         }
     )
     if output:
@@ -196,7 +200,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default="agents/audits/20260709_122906_pre-asr-v12-v3-train-long-false-drop-audit",
     )
     parser.add_argument("--manifest", default="")
-    parser.add_argument("--verdicts", default="")
+    parser.add_argument(
+        "--verdicts",
+        action="append",
+        default=[],
+        help="Manual verdict JSONL. May be repeated; defaults to <audit-dir>/manual_verdicts.jsonl.",
+    )
     parser.add_argument("--output", default="")
     return parser.parse_args(argv)
 
@@ -205,7 +214,7 @@ def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
     audit_dir = project_path(args.audit_dir)
     manifest = project_path(args.manifest) if args.manifest else audit_dir / "manifest.jsonl"
-    verdicts = project_path(args.verdicts) if args.verdicts else audit_dir / "manual_verdicts.jsonl"
+    verdicts = [project_path(path) for path in args.verdicts] if args.verdicts else [audit_dir / "manual_verdicts.jsonl"]
     output = project_path(args.output) if args.output else audit_dir / "gate_summary.json"
     summary = evaluate_paths(manifest=manifest, verdicts=verdicts, output=output)
     print(json.dumps(summary, ensure_ascii=False, indent=2, sort_keys=True))

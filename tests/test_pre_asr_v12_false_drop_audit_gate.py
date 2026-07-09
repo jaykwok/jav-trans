@@ -102,3 +102,34 @@ def test_false_drop_audit_gate_requires_exact_manifest_closure(tmp_path: Path) -
     assert summary["missing_candidates"] == ["preasr-vid-w00-chunk00002"]
     assert summary["unexpected_candidates"] == ["preasr-vid-w00-chunk99999"]
     assert stored["schema"] == "pre_asr_v12_false_drop_audit_gate_summary_v1"
+
+
+def test_false_drop_audit_gate_accepts_multiple_verdict_files(tmp_path: Path) -> None:
+    manifest = _write_jsonl(
+        tmp_path / "manifest.jsonl",
+        [
+            _manifest_row("preasr-vid-w00-chunk00001"),
+            _manifest_row("preasr-vid-w00-chunk00002"),
+        ],
+    )
+    first_verdicts = _write_jsonl(
+        tmp_path / "manual_verdicts_round1.jsonl",
+        [_verdict("preasr-vid-w00-chunk00001", "drop")],
+    )
+    second_verdicts = _write_jsonl(
+        tmp_path / "manual_verdicts_round2.jsonl",
+        [_verdict("preasr-vid-w00-chunk00002", "unsure")],
+    )
+
+    summary = evaluate_paths(
+        manifest=manifest,
+        verdicts=[first_verdicts, second_verdicts],
+        output=tmp_path / "gate_summary.json",
+    )
+
+    assert summary["complete"] is True
+    assert summary["promote_allowed"] is True
+    assert summary["manual_verdict_counts"] == {"drop": 1, "unsure": 1}
+    assert len(summary["verdicts"]) == 2
+    assert summary["verdicts"][0].endswith("manual_verdicts_round1.jsonl")
+    assert summary["verdicts"][1].endswith("manual_verdicts_round2.jsonl")
