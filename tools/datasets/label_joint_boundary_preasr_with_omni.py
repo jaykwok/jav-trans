@@ -621,6 +621,20 @@ def _call_with_cache(
     return parsed, raw, cache_event
 
 
+def is_data_inspection_failed(exc: BaseException) -> bool:
+    message = str(exc).lower()
+    return "data_inspection_failed" in message
+
+
+def is_api_moderation_reject(exc: BaseException) -> bool:
+    message = str(exc).lower()
+    return (
+        is_data_inspection_failed(exc)
+        or "output data may contain inappropriate content" in message
+        or "input audio data may contain inappropriate content" in message
+    )
+
+
 def _process_window(
     row: dict[str, Any],
     *,
@@ -790,8 +804,8 @@ def _process_window(
         )
         if prepare_only:
             continue
+        local_fallback = ""
         try:
-            empty_audio_api_reject = False
             parsed, raw, cache_event = _call_with_cache(
                 audio_path=request_audio,
                 prompt=prompt,
@@ -807,7 +821,43 @@ def _process_window(
                 response_cache=response_cache,
             )
         except Exception as exc:  # noqa: BLE001
-            if not is_empty_audio_api_error(exc):
+            if is_empty_audio_api_error(exc):
+                local_fallback = "empty_audio_to_definite_drop"
+                parsed = {
+                    "label": "drop",
+                    "confidence": 1.0,
+                    "semantic_speech_detected": False,
+                    "flags": ["short_fragment"],
+                    "reason": (
+                        "Qwen-Omni API reported the audio is empty; mark this "
+                        "too-short/undecodable chunk as drop."
+                    ),
+                }
+                raw = {
+                    "stream": True,
+                    "content": "",
+                    "error": str(exc),
+                    "local_fallback": local_fallback,
+                }
+            elif is_api_moderation_reject(exc):
+                local_fallback = "api_moderation_reject_to_ambiguous_ignore"
+                parsed = {
+                    "label": "unsure",
+                    "confidence": 1.0,
+                    "semantic_speech_detected": False,
+                    "flags": ["api_rejected"],
+                    "reason": (
+                        "Qwen-Omni API rejected this chunk with moderation; "
+                        "exclude it from training."
+                    ),
+                }
+                raw = {
+                    "stream": True,
+                    "content": "",
+                    "error": str(exc),
+                    "local_fallback": local_fallback,
+                }
+            else:
                 errors.append(
                     {
                         "request_kind": "pre_asr_chunk",
@@ -818,23 +868,6 @@ def _process_window(
                     }
                 )
                 continue
-            empty_audio_api_reject = True
-            parsed = {
-                "label": "drop",
-                "confidence": 1.0,
-                "semantic_speech_detected": False,
-                "flags": ["short_fragment"],
-                "reason": (
-                    "Qwen-Omni API reported the audio is empty; mark this "
-                    "too-short/undecodable chunk as drop."
-                ),
-            }
-            raw = {
-                "stream": True,
-                "content": "",
-                "error": str(exc),
-                "local_fallback": "empty_audio_to_definite_drop",
-            }
             cache_event = response_cache.save(
                 audio_path=request_audio,
                 prompt=prompt,
@@ -905,8 +938,8 @@ def _process_window(
             "feature_schema": str(candidate.get("feature_schema") or ""),
             "runtime_adapter": str(candidate.get("runtime_adapter") or ""),
         }
-        if empty_audio_api_reject:
-            label_row["local_fallback"] = "empty_audio_to_definite_drop"
+        if local_fallback:
+            label_row["local_fallback"] = local_fallback
         pre_asr_labels.append(label_row)
         response_usage.append(
             {
