@@ -199,7 +199,7 @@ class Mamba2TemporalEncoder(nn.Module):
 
 
 class SpeechIslandSequenceClassifier(nn.Module):
-    """Speech-only frame classifier used by SpeechIslandScorer v8."""
+    """Shared frame encoder used by single-head and dual-head boundary models."""
 
     def __init__(
         self,
@@ -214,8 +214,8 @@ class SpeechIslandSequenceClassifier(nn.Module):
         super().__init__()
         if input_dim <= 0:
             raise ValueError("input_dim must be positive")
-        if output_dim != 1:
-            raise ValueError("speech island scorer requires output_dim=1")
+        if output_dim <= 0:
+            raise ValueError("output_dim must be positive")
         self.backbone_name = normalize_boundary_backbone(backbone)
         if "num_heads" not in backbone_kwargs:
             backbone_kwargs["num_heads"] = 4
@@ -244,7 +244,7 @@ class SpeechIslandSequenceClassifier(nn.Module):
             **backbone_kwargs,
         )
         self.norm = nn.LayerNorm(self.backbone.output_dim)
-        self.head = nn.Linear(self.backbone.output_dim, 1)
+        self.head = nn.Linear(self.backbone.output_dim, output_dim)
 
     def forward(
         self,
