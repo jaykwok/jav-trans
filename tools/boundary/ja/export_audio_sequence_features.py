@@ -16,6 +16,7 @@ if str(SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(SRC_ROOT))
 
 from audio.loading import load_audio_16k_mono  # noqa: E402
+from boundary.gpu_safety import apply_vram_safety_cap  # noqa: E402
 from boundary.ja.features import FeatureConfig, build_ptm_feature_extractor, extract_mfcc  # noqa: E402
 from tools.boundary.ja.build_feature_cache import (  # noqa: E402
     _combine_workflow_window_features,
@@ -25,6 +26,7 @@ from tools.boundary.ja.build_feature_cache import (  # noqa: E402
 
 
 def run(args: argparse.Namespace) -> None:
+    vram_safety_ratio = apply_vram_safety_cap()
     audio, sample_rate = load_audio_16k_mono(args.audio)
     config = FeatureConfig(
         ptm=args.ptm,
@@ -98,6 +100,8 @@ def run(args: argparse.Namespace) -> None:
         "window_count": len(windows),
         "ptm_batch_count": batch_count,
         "feature_coverage_ratio": float(bundle["feature_coverage_ratio"]),
+        "vram_safety_ratio": vram_safety_ratio,
+        "shared_vram_budget": False,
         "output": str(output),
     }
     output.with_suffix(".summary.json").write_text(
