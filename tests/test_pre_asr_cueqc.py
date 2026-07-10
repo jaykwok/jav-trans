@@ -893,3 +893,50 @@ def test_pre_asr_candidate_anchor_boost_rejects_missing_id():
             [{"row_ids": ["candidate-a"]}],
             ["candidate-missing"],
         )
+
+
+def test_pre_asr_valid_prefix_temporal_is_padding_invariant():
+    import torch
+
+    torch.manual_seed(17)
+    model = pre_asr_cueqc.PreAsrCueQCNetwork(
+        ptm_dim=128,
+        scalar_dim=len(pre_asr_cueqc.PRE_ASR_CUEQC_SCALAR_FEATURE_NAMES),
+        hidden_size=128,
+        valid_prefix_temporal=True,
+        dropout=0.0,
+    )
+    model.eval()
+    valid_length = 3
+    padded_length = 7
+    ptm = torch.randn(2, valid_length, 10, 128)
+    scalar = torch.randn(
+        2,
+        valid_length,
+        len(pre_asr_cueqc.PRE_ASR_CUEQC_SCALAR_FEATURE_NAMES),
+    )
+    valid_mask = torch.ones(2, valid_length)
+    bin_mask = torch.ones(2, valid_length, 10)
+    padded_ptm = torch.zeros(2, padded_length, 10, 128)
+    padded_scalar = torch.randn(
+        2,
+        padded_length,
+        len(pre_asr_cueqc.PRE_ASR_CUEQC_SCALAR_FEATURE_NAMES),
+    )
+    padded_chunk_mask = torch.zeros(2, padded_length)
+    padded_bin_mask = torch.zeros(2, padded_length, 10)
+    padded_ptm[:, :valid_length] = ptm
+    padded_scalar[:, :valid_length] = scalar
+    padded_chunk_mask[:, :valid_length] = 1
+    padded_bin_mask[:, :valid_length] = 1
+
+    with torch.inference_mode():
+        trimmed_logits = model(ptm, scalar, valid_mask, bin_mask)
+        padded_logits = model(
+            padded_ptm,
+            padded_scalar,
+            padded_chunk_mask,
+            padded_bin_mask,
+        )[:, :valid_length]
+
+    assert torch.allclose(trimmed_logits, padded_logits, atol=1e-5, rtol=1e-5)

@@ -939,6 +939,7 @@ class PreAsrCueQCNetwork:
                 hidden_size: int = 128,
                 temporal_layers: int = 2,
                 temporal_residual_scale: float = 1.0,
+                valid_prefix_temporal: bool = False,
                 dropout: float = 0.1,
                 num_classes: int = 2,
             ) -> None:
@@ -947,6 +948,7 @@ class PreAsrCueQCNetwork:
 
                 self.arch = PRE_ASR_CUEQC_MODEL_ARCH
                 self.temporal_residual_scale = float(temporal_residual_scale)
+                self.valid_prefix_temporal = bool(valid_prefix_temporal)
                 self.ptm_encoder = nn.Sequential(
                     nn.LayerNorm(ptm_dim * 4),
                     nn.Linear(ptm_dim * 4, hidden_size * 2),
@@ -984,6 +986,7 @@ class PreAsrCueQCNetwork:
                     n_groups=2,
                     chunk_size=8,
                     bidirectional=True,
+                    valid_prefix_bidirectional=self.valid_prefix_temporal,
                 )
                 self.temporal_projection = nn.Linear(
                     self.temporal_backbone.output_dim,
@@ -1030,6 +1033,8 @@ class PreAsrCueQCNetwork:
                     torch.cat([ptm_repr, scalar_repr], dim=-1)
                 )
                 local_repr = chunk_repr.reshape(batch, chunks, -1)
+                if self.valid_prefix_temporal and chunk_mask is not None:
+                    local_repr = local_repr * chunk_mask.unsqueeze(-1).to(local_repr.dtype)
                 if self.temporal_residual_scale <= 0.0:
                     logits = self.classifier(local_repr)
                     if chunk_mask is not None:
@@ -1053,6 +1058,8 @@ class PreAsrCueQCNetwork:
                         dim=-1,
                     )
                 )
+                if self.valid_prefix_temporal and chunk_mask is not None:
+                    delta_repr = delta_repr * chunk_mask.unsqueeze(-1).to(delta_repr.dtype)
                 cm = None if chunk_mask is None else chunk_mask.long()
                 temporal = self.temporal_backbone(
                     local_repr + delta_repr,
@@ -1080,6 +1087,7 @@ def make_model_config(config: Mapping[str, Any] | None = None) -> dict[str, Any]
         "hidden_size": int(raw.get("hidden_size") or 128),
         "temporal_layers": int(raw.get("temporal_layers") or 2),
         "temporal_residual_scale": float(raw.get("temporal_residual_scale", 1.0)),
+        "valid_prefix_temporal": bool(raw.get("valid_prefix_temporal", False)),
         "dropout": float(raw.get("dropout", 0.1)),
         "num_classes": int(raw.get("num_classes") or 2),
     }

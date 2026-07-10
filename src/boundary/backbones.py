@@ -34,6 +34,7 @@ class TinyMamba2BoundaryBackbone(nn.Module):
         n_groups: int = 4,
         chunk_size: int = 64,
         bidirectional: bool = True,
+        valid_prefix_bidirectional: bool = False,
     ) -> None:
         super().__init__()
         if input_dim <= 0:
@@ -43,6 +44,7 @@ class TinyMamba2BoundaryBackbone(nn.Module):
         if hidden_size * 2 != num_heads * head_dim:
             raise ValueError("hidden_size * 2 must equal num_heads * head_dim")
         self.bidirectional = bool(bidirectional)
+        self.valid_prefix_bidirectional = bool(valid_prefix_bidirectional)
         self.proj = nn.Linear(input_dim, hidden_size)
 
         _install_mamba2_warning_filter()
@@ -79,6 +81,8 @@ class TinyMamba2BoundaryBackbone(nn.Module):
         if features.ndim != 3:
             raise ValueError("features must have shape [batch, time, dim]")
         hidden = self.proj(features)
+        if self.valid_prefix_bidirectional and attention_mask is not None:
+            hidden = hidden * attention_mask.unsqueeze(-1).to(hidden.dtype)
         forward = self.forward_model(
             inputs_embeds=hidden,
             attention_mask=attention_mask,
@@ -86,15 +90,38 @@ class TinyMamba2BoundaryBackbone(nn.Module):
         ).last_hidden_state
         if self.backward_model is None:
             return self.norm(forward)
-        reversed_hidden = torch.flip(hidden, dims=[1])
-        reversed_mask = None if attention_mask is None else torch.flip(attention_mask, dims=[1])
+        if self.valid_prefix_bidirectional and attention_mask is not None:
+            reversed_hidden = self._reverse_valid_prefix(hidden, attention_mask)
+            reversed_mask = attention_mask
+        else:
+            reversed_hidden = torch.flip(hidden, dims=[1])
+            reversed_mask = None if attention_mask is None else torch.flip(attention_mask, dims=[1])
         backward = self.backward_model(
             inputs_embeds=reversed_hidden,
             attention_mask=reversed_mask,
             use_cache=False,
         ).last_hidden_state
-        backward = torch.flip(backward, dims=[1])
-        return self.norm(torch.cat([forward, backward], dim=-1))
+        if self.valid_prefix_bidirectional and attention_mask is not None:
+            backward = self._reverse_valid_prefix(backward, attention_mask)
+        else:
+            backward = torch.flip(backward, dims=[1])
+        output = self.norm(torch.cat([forward, backward], dim=-1))
+        if self.valid_prefix_bidirectional and attention_mask is not None:
+            output = output * attention_mask.unsqueeze(-1).to(output.dtype)
+        return output
+
+    @staticmethod
+    def _reverse_valid_prefix(tensor: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
+        batch, length = tuple(attention_mask.shape)
+        positions = torch.arange(length, device=tensor.device).reshape(1, length)
+        valid_lengths = attention_mask.to(dtype=torch.long).sum(dim=1, keepdim=True)
+        reverse_positions = torch.where(
+            positions < valid_lengths,
+            valid_lengths - 1 - positions,
+            positions,
+        )
+        gather_index = reverse_positions.reshape(batch, length, 1).expand_as(tensor)
+        return torch.gather(tensor, dim=1, index=gather_index)
 
 
 class Mamba2TemporalEncoder(nn.Module):
