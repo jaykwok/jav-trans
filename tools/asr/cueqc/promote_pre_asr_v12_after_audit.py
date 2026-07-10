@@ -28,6 +28,10 @@ DEFAULT_AUDIT_GATE = (
     "gate_summary.json"
 )
 V12_SCHEMA = "cueqc_pre_asr_semantic_chunk_v12_binary"
+V12_ARCH = "cueqc_pre_asr_semantic_chunk_v12"
+V12_FEATURE_SCHEMA = "pre_asr_cueqc_features_v9"
+V12_RUNTIME_ADAPTER = "pre_asr_semantic_chunk_sequence_v4"
+ACTIVE_POOLING_SCHEMA = "pre_asr_chunk_pooled_ptm_v1"
 
 
 def project_path(value: str | Path) -> Path:
@@ -124,6 +128,13 @@ def validate_candidate_checkpoint(path: Path, *, asr_repo_id: str) -> dict[str, 
     schema = str(payload.get("schema") or "").strip()
     if schema != V12_SCHEMA:
         raise ValueError(f"candidate checkpoint schema must be {V12_SCHEMA!r}, got {schema!r}")
+    arch = str(payload.get("arch") or "").strip()
+    if arch != V12_ARCH:
+        raise ValueError(f"candidate checkpoint arch must be {V12_ARCH!r}, got {arch!r}")
+    if str(payload.get("feature_schema") or "") != V12_FEATURE_SCHEMA:
+        raise ValueError("candidate checkpoint feature_schema is not active v9")
+    if str(payload.get("runtime_adapter") or "") != V12_RUNTIME_ADAPTER:
+        raise ValueError("candidate checkpoint runtime_adapter is not active v4")
     metadata = payload.get("metadata")
     if not isinstance(metadata, Mapping):
         raise ValueError("candidate checkpoint missing metadata")
@@ -135,10 +146,34 @@ def validate_candidate_checkpoint(path: Path, *, asr_repo_id: str) -> dict[str, 
     split_sha = str(payload.get("semantic_split_weights_sha256") or metadata.get("semantic_split_weights_sha256") or "")
     if not split_sha:
         raise ValueError("candidate checkpoint missing semantic_split_weights_sha256")
+    model_config = dict(payload.get("model_config") or {})
+    required_model_config = {
+        "valid_prefix_temporal": True,
+        "ptm_encoder_mode": "token_attention",
+        "semantic_auxiliary": True,
+        "late_fusion": True,
+    }
+    for key, expected in required_model_config.items():
+        if model_config.get(key) != expected:
+            raise ValueError(f"candidate checkpoint model_config.{key} must be {expected!r}")
+    pooling_schemas = [str(item) for item in metadata.get("ptm_pooling_schemas") or ()]
+    if pooling_schemas != [ACTIVE_POOLING_SCHEMA]:
+        raise ValueError(
+            f"candidate checkpoint ptm_pooling_schemas must be {[ACTIVE_POOLING_SCHEMA]!r}"
+        )
+    decision = dict(payload.get("decision_config") or {})
+    if not bool(decision.get("model_only")):
+        raise ValueError("candidate checkpoint must be model_only")
+    for key in ("hard_keep_veto", "hard_drop_rule", "keep_veto"):
+        if bool(decision.get(key)):
+            raise ValueError(f"candidate checkpoint decision_config.{key} must be false")
     return {
         "schema": schema,
+        "arch": arch,
         "asr_repo_id": actual_repo,
         "semantic_split_weights_sha256": split_sha,
+        "model_config": required_model_config,
+        "ptm_pooling_schemas": pooling_schemas,
     }
 
 
@@ -149,15 +184,23 @@ def build_selected_validation(
     audit_gate_path: Path,
     audit_gate: Mapping[str, Any],
 ) -> dict[str, Any]:
+    model_validation = validate_model_gate(model_gate)
+    audit_validation = validate_audit_gate(audit_gate)
+    if float(model_validation["long_false_drop_min_s"]) != 0.0:
+        raise ValueError("promotion requires an all-false-drop audit with min duration 0.0")
+    if int(model_validation["long_false_drop_count"]) != int(
+        audit_validation["target_manifest_count"]
+    ):
+        raise ValueError("model and manual audit false-drop target counts do not match")
     return {
         "schema": "pre_asr_cueqc_v12_selected_validation_v1",
         "model_gate": {
             "path": repo_rel(model_gate_path),
-            **validate_model_gate(model_gate),
+            **model_validation,
         },
         "manual_false_drop_audit": {
             "path": repo_rel(audit_gate_path),
-            **validate_audit_gate(audit_gate),
+            **audit_validation,
         },
     }
 
@@ -215,7 +258,7 @@ def promote_after_audit(
         selected_validation=selected_validation,
         drop_threshold=threshold,
         promotion_reason=(
-            "D7 v12 model gate passed and manual long false-drop audit found no "
+            "D7 v12 model gate passed and manual all-false-drop audit found no "
             "confirmed semantic keep deletion."
         ),
         promoted_at=datetime.now(timezone.utc).isoformat(),

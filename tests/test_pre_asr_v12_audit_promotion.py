@@ -24,8 +24,8 @@ def _model_gate(*, drop_pass: bool = True, keep_pass: bool = True) -> dict:
             "drop_recall_pass": drop_pass,
             "keep_recall_pass": keep_pass,
             "min_drop_recall": 0.98,
-            "long_false_drop_count": 32,
-            "long_false_drop_min_s": 0.8,
+            "long_false_drop_count": 22,
+            "long_false_drop_min_s": 0.0,
         },
         "v12": {
             "drop_recall": 0.983,
@@ -41,9 +41,9 @@ def _audit_gate(*, complete: bool = True, promote_allowed: bool = True, keep_del
         "schema": "pre_asr_v12_false_drop_audit_gate_summary_v1",
         "complete": complete,
         "promote_allowed": promote_allowed,
-        "target_manifest_count": 32,
-        "reviewed_target_count": 32 if complete else 31,
-        "manual_verdict_counts": {"drop": 31, "unsure": 1},
+        "target_manifest_count": 22,
+        "reviewed_target_count": 22 if complete else 21,
+        "manual_verdict_counts": {"drop": 21, "unsure": 1},
         "true_semantic_keep_deletion_count": keep_deletions,
         "uncertain_count": 1,
     }
@@ -61,13 +61,28 @@ def _write_checkpoint(path: Path, *, repo_id: str = REPO_ID, schema: str = V12_S
     torch.save(
         {
             "schema": schema,
+            "arch": "cueqc_pre_asr_semantic_chunk_v12",
+            "feature_schema": "pre_asr_cueqc_features_v9",
+            "runtime_adapter": "pre_asr_semantic_chunk_sequence_v4",
+            "model_config": {
+                "valid_prefix_temporal": True,
+                "ptm_encoder_mode": "token_attention",
+                "semantic_auxiliary": True,
+                "late_fusion": True,
+            },
             "metadata": {
                 "asr_repo_id": repo_id,
                 "semantic_split_weights_sha256": "a" * 64,
                 "artifact": {"name": "pre_asr_cueqc"},
+                "ptm_pooling_schemas": ["pre_asr_chunk_pooled_ptm_v1"],
             },
             "semantic_split_weights_sha256": "a" * 64,
-            "decision_config": {"model_only": True},
+            "decision_config": {
+                "model_only": True,
+                "hard_keep_veto": False,
+                "hard_drop_rule": False,
+                "keep_veto": False,
+            },
             "model_state_dict": {"weight": torch.tensor([1.0])},
         },
         path,
