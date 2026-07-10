@@ -940,6 +940,9 @@ class PreAsrCueQCNetwork:
                 temporal_layers: int = 2,
                 temporal_residual_scale: float = 1.0,
                 valid_prefix_temporal: bool = False,
+                ptm_encoder_mode: str = "summary_mlp",
+                semantic_auxiliary: bool = False,
+                late_fusion: bool = False,
                 dropout: float = 0.1,
                 num_classes: int = 2,
             ) -> None:
@@ -949,14 +952,54 @@ class PreAsrCueQCNetwork:
                 self.arch = PRE_ASR_CUEQC_MODEL_ARCH
                 self.temporal_residual_scale = float(temporal_residual_scale)
                 self.valid_prefix_temporal = bool(valid_prefix_temporal)
-                self.ptm_encoder = nn.Sequential(
-                    nn.LayerNorm(ptm_dim * 4),
-                    nn.Linear(ptm_dim * 4, hidden_size * 2),
-                    nn.GELU(),
-                    nn.Dropout(dropout),
-                    nn.Linear(hidden_size * 2, hidden_size),
-                    nn.GELU(),
-                )
+                self.ptm_encoder_mode = str(ptm_encoder_mode)
+                self.semantic_auxiliary = bool(semantic_auxiliary)
+                self.late_fusion = bool(late_fusion)
+                if self.ptm_encoder_mode == "summary_mlp":
+                    self.ptm_encoder = nn.Sequential(
+                        nn.LayerNorm(ptm_dim * 4),
+                        nn.Linear(ptm_dim * 4, hidden_size * 2),
+                        nn.GELU(),
+                        nn.Dropout(dropout),
+                        nn.Linear(hidden_size * 2, hidden_size),
+                        nn.GELU(),
+                    )
+                    self.ptm_token_projection = None
+                    self.ptm_token_encoder = None
+                    self.ptm_token_pool = None
+                    self.ptm_position_embedding = None
+                elif self.ptm_encoder_mode == "token_attention":
+                    self.ptm_encoder = None
+                    self.ptm_token_projection = nn.Sequential(
+                        nn.LayerNorm(ptm_dim),
+                        nn.Linear(ptm_dim, hidden_size),
+                        nn.GELU(),
+                    )
+                    token_layer = nn.TransformerEncoderLayer(
+                        d_model=hidden_size,
+                        nhead=4,
+                        dim_feedforward=hidden_size * 2,
+                        dropout=dropout,
+                        activation="gelu",
+                        batch_first=True,
+                        norm_first=True,
+                    )
+                    self.ptm_token_encoder = nn.TransformerEncoder(
+                        token_layer,
+                        num_layers=1,
+                        enable_nested_tensor=False,
+                    )
+                    self.ptm_token_pool = nn.Sequential(
+                        nn.LayerNorm(hidden_size * 2),
+                        nn.Linear(hidden_size * 2, hidden_size),
+                        nn.GELU(),
+                    )
+                    self.ptm_position_embedding = nn.Parameter(
+                        torch.zeros(1, PRE_ASR_CUEQC_MODEL_PTM_TOKENS, hidden_size)
+                    )
+                    nn.init.normal_(self.ptm_position_embedding, std=0.02)
+                else:
+                    raise ValueError(f"unsupported ptm_encoder_mode: {self.ptm_encoder_mode!r}")
                 self.scalar_encoder = nn.Sequential(
                     nn.LayerNorm(scalar_dim),
                     nn.Linear(scalar_dim, hidden_size),
@@ -1004,6 +1047,64 @@ class PreAsrCueQCNetwork:
                     nn.Dropout(dropout),
                     nn.Linear(hidden_size, num_classes),
                 )
+                if self.semantic_auxiliary or self.late_fusion:
+                    self.semantic_classifier = nn.Sequential(
+                        nn.LayerNorm(hidden_size),
+                        nn.Linear(hidden_size, hidden_size),
+                        nn.GELU(),
+                        nn.Dropout(dropout),
+                        nn.Linear(hidden_size, num_classes),
+                    )
+                else:
+                    self.semantic_classifier = None
+                if self.late_fusion:
+                    self.semantic_fusion_gate = nn.Sequential(
+                        nn.LayerNorm(hidden_size * 2),
+                        nn.Linear(hidden_size * 2, 1),
+                        nn.Sigmoid(),
+                    )
+                    nn.init.constant_(self.semantic_fusion_gate[1].bias, 1.0)
+                else:
+                    self.semantic_fusion_gate = None
+
+            def _encode_ptm(
+                self,
+                ptm_bins: torch.Tensor,
+                bin_mask: torch.Tensor | None,
+            ) -> torch.Tensor:
+                batch, chunks, bins, dim = ptm_bins.shape
+                if self.ptm_encoder_mode == "summary_mlp":
+                    global_mean = ptm_bins[:, :, 0]
+                    global_max = ptm_bins[:, :, 1]
+                    local = ptm_bins[:, :, 2:]
+                    local_mean = local.mean(dim=2)
+                    local_max = local.max(dim=2).values
+                    ptm = torch.cat(
+                        (global_mean, global_max, local_mean, local_max),
+                        dim=-1,
+                    ).reshape(batch * chunks, dim * 4)
+                    return self.ptm_encoder(ptm)
+
+                tokens = ptm_bins.reshape(batch * chunks, bins, dim)
+                token_mask = (
+                    torch.ones((batch * chunks, bins), dtype=torch.bool, device=ptm_bins.device)
+                    if bin_mask is None
+                    else bin_mask.reshape(batch * chunks, bins) > 0
+                )
+                safe_mask = token_mask.clone()
+                empty = ~safe_mask.any(dim=1)
+                safe_mask[empty, 0] = True
+                encoded = self.ptm_token_projection(tokens)
+                encoded = encoded + self.ptm_position_embedding[:, :bins]
+                encoded = self.ptm_token_encoder(
+                    encoded,
+                    src_key_padding_mask=~safe_mask,
+                )
+                weights = safe_mask.unsqueeze(-1).to(encoded.dtype)
+                pooled_mean = (encoded * weights).sum(dim=1) / weights.sum(dim=1).clamp_min(1.0)
+                pooled_max = encoded.masked_fill(~safe_mask.unsqueeze(-1), -torch.inf).max(dim=1).values
+                pooled_max = torch.where(empty.unsqueeze(-1), torch.zeros_like(pooled_max), pooled_max)
+                return self.ptm_token_pool(torch.cat((pooled_mean, pooled_max), dim=-1))
 
             def forward(
                 self,
@@ -1011,22 +1112,14 @@ class PreAsrCueQCNetwork:
                 scalar_features: torch.Tensor,
                 chunk_mask: torch.Tensor | None = None,
                 bin_mask: torch.Tensor | None = None,
-            ) -> torch.Tensor:
+                return_auxiliary: bool = False,
+            ) -> torch.Tensor | tuple[torch.Tensor, dict[str, torch.Tensor]]:
                 if ptm_bins.ndim != 4:
                     raise ValueError("ptm_bins must have shape [batch, chunks, bins, dim]")
                 if scalar_features.ndim != 3:
                     raise ValueError("scalar_features must have shape [batch, chunks, dim]")
-                batch, chunks, bins, dim = ptm_bins.shape
-                global_mean = ptm_bins[:, :, 0]
-                global_max = ptm_bins[:, :, 1]
-                local = ptm_bins[:, :, 2:]
-                local_mean = local.mean(dim=2)
-                local_max = local.max(dim=2).values
-                ptm = torch.cat(
-                    (global_mean, global_max, local_mean, local_max),
-                    dim=-1,
-                ).reshape(batch * chunks, dim * 4)
-                ptm_repr = self.ptm_encoder(ptm)
+                batch, chunks, _bins, _dim = ptm_bins.shape
+                ptm_repr = self._encode_ptm(ptm_bins, bin_mask)
                 scalar = scalar_features.reshape(batch * chunks, -1)
                 scalar_repr = self.scalar_encoder(scalar)
                 chunk_repr = self.chunk_fuse(
@@ -1036,9 +1129,27 @@ class PreAsrCueQCNetwork:
                 if self.valid_prefix_temporal and chunk_mask is not None:
                     local_repr = local_repr * chunk_mask.unsqueeze(-1).to(local_repr.dtype)
                 if self.temporal_residual_scale <= 0.0:
-                    logits = self.classifier(local_repr)
+                    context_logits = self.classifier(local_repr)
+                    semantic_logits = (
+                        self.semantic_classifier(ptm_repr).reshape(batch, chunks, -1)
+                        if self.semantic_classifier is not None
+                        else context_logits
+                    )
+                    if self.late_fusion:
+                        semantic_repr = ptm_repr.reshape(batch, chunks, -1)
+                        gate = self.semantic_fusion_gate(
+                            torch.cat((semantic_repr, local_repr), dim=-1)
+                        )
+                        logits = gate * semantic_logits + (1.0 - gate) * context_logits
+                    else:
+                        logits = context_logits
                     if chunk_mask is not None:
                         logits = logits * chunk_mask.unsqueeze(-1).to(dtype=logits.dtype)
+                    if return_auxiliary:
+                        return logits, {
+                            "semantic_logits": semantic_logits,
+                            "local_context_logits": context_logits,
+                        }
                     return logits
                 previous = torch.cat(
                     (torch.zeros_like(local_repr[:, :1]), local_repr[:, :-1]),
@@ -1069,11 +1180,31 @@ class PreAsrCueQCNetwork:
                 gate = self.temporal_gate(
                     torch.cat((local_repr, delta_repr), dim=-1)
                 )
-                logits = self.classifier(
-                    local_repr + self.temporal_residual_scale * gate * temporal
+                contextual_repr = local_repr + self.temporal_residual_scale * gate * temporal
+                context_logits = self.classifier(contextual_repr)
+                semantic_logits = (
+                    self.semantic_classifier(ptm_repr).reshape(batch, chunks, -1)
+                    if self.semantic_classifier is not None
+                    else context_logits
                 )
+                if self.late_fusion:
+                    semantic_repr = ptm_repr.reshape(batch, chunks, -1)
+                    semantic_weight = self.semantic_fusion_gate(
+                        torch.cat((semantic_repr, contextual_repr), dim=-1)
+                    )
+                    logits = semantic_weight * semantic_logits + (1.0 - semantic_weight) * context_logits
+                else:
+                    logits = context_logits
                 if chunk_mask is not None:
                     logits = logits * chunk_mask.unsqueeze(-1).to(dtype=logits.dtype)
+                    semantic_logits = semantic_logits * chunk_mask.unsqueeze(-1).to(dtype=logits.dtype)
+                    context_logits = context_logits * chunk_mask.unsqueeze(-1).to(dtype=logits.dtype)
+                if return_auxiliary:
+                    return logits, {
+                        "semantic_logits": semantic_logits,
+                        "local_context_logits": self.classifier(local_repr),
+                        "context_logits": context_logits,
+                    }
                 return logits
 
         return _Model(*args, **kwargs)
@@ -1088,6 +1219,9 @@ def make_model_config(config: Mapping[str, Any] | None = None) -> dict[str, Any]
         "temporal_layers": int(raw.get("temporal_layers") or 2),
         "temporal_residual_scale": float(raw.get("temporal_residual_scale", 1.0)),
         "valid_prefix_temporal": bool(raw.get("valid_prefix_temporal", False)),
+        "ptm_encoder_mode": str(raw.get("ptm_encoder_mode") or "summary_mlp"),
+        "semantic_auxiliary": bool(raw.get("semantic_auxiliary", False)),
+        "late_fusion": bool(raw.get("late_fusion", False)),
         "dropout": float(raw.get("dropout", 0.1)),
         "num_classes": int(raw.get("num_classes") or 2),
     }

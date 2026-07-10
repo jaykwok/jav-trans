@@ -255,13 +255,50 @@ def _metrics(rows: list[dict[str, Any]], prediction_key: str) -> dict[str, Any]:
 
 def run(args: argparse.Namespace) -> dict[str, Any]:
     bundle_path = _project_path(args.features)
+    legacy_bundle_path = (
+        _project_path(args.legacy_features)
+        if getattr(args, "legacy_features", "")
+        else bundle_path
+    )
     v12_path = _project_path(args.v12_checkpoint)
     legacy_path = _project_path(args.legacy_v11_checkpoint)
     output_dir = _project_path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     bundle = _read_bundle(bundle_path)
+    legacy_bundle = _read_bundle(legacy_bundle_path)
     v12_checkpoint = _read_checkpoint(v12_path)
     legacy_checkpoint = _read_checkpoint(legacy_path)
+    bundle_row_ids = [
+        str(row_id)
+        for group in bundle.get("groups") or ()
+        for row_id in group.get("row_ids") or ()
+    ]
+    legacy_row_ids = [
+        str(row_id)
+        for group in legacy_bundle.get("groups") or ()
+        for row_id in group.get("row_ids") or ()
+    ]
+    if legacy_row_ids != bundle_row_ids:
+        raise ValueError("legacy feature bundle candidate order does not match v12 bundle")
+    expected_ptm_digest = str(
+        (v12_checkpoint.get("metadata") or {}).get("ptm_projection_digest") or ""
+    )
+    actual_ptm_digest = str(bundle.get("ptm_projection_digest") or "")
+    if expected_ptm_digest and expected_ptm_digest != actual_ptm_digest:
+        raise ValueError(
+            "v12 checkpoint PTM projection digest does not match feature bundle: "
+            f"{expected_ptm_digest} != {actual_ptm_digest}"
+        )
+    expected_pooling_schemas = [
+        str(item)
+        for item in (v12_checkpoint.get("metadata") or {}).get("ptm_pooling_schemas") or ()
+    ]
+    actual_pooling_schemas = [str(item) for item in bundle.get("ptm_pooling_schemas") or ()]
+    if expected_pooling_schemas and expected_pooling_schemas != actual_pooling_schemas:
+        raise ValueError(
+            "v12 checkpoint PTM pooling schema does not match feature bundle: "
+            f"{expected_pooling_schemas} != {actual_pooling_schemas}"
+        )
     bundle_feature_names = tuple(str(item) for item in bundle.get("feature_names") or ())
     labels = bundle["labels"].detach().cpu().numpy()
     mask = bundle["chunk_mask"].detach().cpu().numpy() > 0
@@ -272,7 +309,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
 
     v12_probs = _predict_probs(bundle=bundle, checkpoint=v12_checkpoint, device=args.device)
     legacy_probs = _predict_probs(
-        bundle=bundle,
+        bundle=legacy_bundle,
         checkpoint=legacy_checkpoint,
         device=args.device,
     )
@@ -358,6 +395,11 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     summary = {
         "schema": SUMMARY_SCHEMA,
         "features": str(bundle_path.relative_to(ROOT) if bundle_path.is_relative_to(ROOT) else bundle_path),
+        "legacy_features": str(
+            legacy_bundle_path.relative_to(ROOT)
+            if legacy_bundle_path.is_relative_to(ROOT)
+            else legacy_bundle_path
+        ),
         "v12_checkpoint": str(v12_path.relative_to(ROOT) if v12_path.is_relative_to(ROOT) else v12_path),
         "legacy_v11_checkpoint": str(
             legacy_path.relative_to(ROOT) if legacy_path.is_relative_to(ROOT) else legacy_path
@@ -416,6 +458,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         description="Gate a Pre-ASR CueQC v12 candidate against explicit v11 legacy replay."
     )
     parser.add_argument("--features", required=True)
+    parser.add_argument(
+        "--legacy-features",
+        default="",
+        help="Optional legacy replay bundle when v12 changes PTM representation.",
+    )
     parser.add_argument("--v12-checkpoint", required=True)
     parser.add_argument("--legacy-v11-checkpoint", required=True)
     parser.add_argument("--output-dir", required=True)

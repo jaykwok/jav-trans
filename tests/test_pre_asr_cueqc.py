@@ -841,6 +841,32 @@ def test_pre_asr_training_chunk_stratified_split_samples_both_films():
     assert not np.any(train_mask & val_mask)
 
 
+def test_pre_asr_training_video_group_split_keeps_windows_together():
+    y = np.asarray([[0, 1], [0, 1], [0, 1], [0, 1]], dtype=np.int64)
+    chunk_mask = np.ones_like(y, dtype=np.float32)
+    groups = [
+        {"audio_id": "video-a-w00", "video_id": "video-a"},
+        {"audio_id": "video-a-w01", "video_id": "video-a"},
+        {"audio_id": "video-b-w00", "video_id": "video-b"},
+        {"audio_id": "video-b-w01", "video_id": "video-b"},
+    ]
+
+    train_mask, val_mask, summary = _split_label_masks(
+        y=y,
+        chunk_mask=chunk_mask,
+        group_rows=groups,
+        split_mode="video_group",
+        val_ratio=0.5,
+        rng=np.random.default_rng(17),
+    )
+
+    assert summary["train_group_count"] == 2
+    assert summary["val_group_count"] == 2
+    assert bool(val_mask[0].any()) == bool(val_mask[1].any())
+    assert bool(val_mask[2].any()) == bool(val_mask[3].any())
+    assert not np.any(train_mask & val_mask)
+
+
 def test_pre_asr_anchor_batch_supports_pre_windowed_bundle():
     import torch
 
@@ -940,3 +966,51 @@ def test_pre_asr_valid_prefix_temporal_is_padding_invariant():
         )[:, :valid_length]
 
     assert torch.allclose(trimmed_logits, padded_logits, atol=1e-5, rtol=1e-5)
+
+
+def test_pre_asr_token_attention_auxiliary_is_padding_invariant():
+    import torch
+
+    torch.manual_seed(23)
+    scalar_dim = len(pre_asr_cueqc.PRE_ASR_CUEQC_SCALAR_FEATURE_NAMES)
+    model = pre_asr_cueqc.PreAsrCueQCNetwork(
+        ptm_dim=128,
+        scalar_dim=scalar_dim,
+        hidden_size=128,
+        valid_prefix_temporal=True,
+        ptm_encoder_mode="token_attention",
+        semantic_auxiliary=True,
+        late_fusion=True,
+        dropout=0.0,
+    )
+    model.eval()
+    ptm = torch.randn(2, 3, 10, 128)
+    scalar = torch.randn(2, 3, scalar_dim)
+    mask = torch.ones(2, 3)
+    bin_mask = torch.ones(2, 3, 10)
+    padded_ptm = torch.zeros(2, 6, 10, 128)
+    padded_scalar = torch.randn(2, 6, scalar_dim)
+    padded_mask = torch.zeros(2, 6)
+    padded_bin_mask = torch.zeros(2, 6, 10)
+    padded_ptm[:, :3] = ptm
+    padded_scalar[:, :3] = scalar
+    padded_mask[:, :3] = 1
+    padded_bin_mask[:, :3] = 1
+
+    with torch.inference_mode():
+        trimmed, auxiliary = model(
+            ptm,
+            scalar,
+            mask,
+            bin_mask,
+            return_auxiliary=True,
+        )
+        padded = model(
+            padded_ptm,
+            padded_scalar,
+            padded_mask,
+            padded_bin_mask,
+        )[:, :3]
+
+    assert auxiliary["semantic_logits"].shape == (2, 3, 2)
+    assert torch.allclose(trimmed, padded, atol=1e-5, rtol=1e-5)
