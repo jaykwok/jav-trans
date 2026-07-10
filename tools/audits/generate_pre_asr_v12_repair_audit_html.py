@@ -41,7 +41,7 @@ DEFAULT_LONG_FALSE_DROP_PATHS = (
 POOL_LABELS = {
     "A1_t050_residual_false_keep": "A1 t=0.50 残余 false-keep 全审",
     "A2_t095_exclusive_false_keep_sample": "A2 t=0.95 独有 false-keep 抽审",
-    "B_low_threshold_long_false_drop": "B 低阈值长 false-drop 全审",
+    "B_low_threshold_long_false_drop": "B false-drop 全审",
 }
 VERDICT_TO_LABEL = {
     "drop": "definite_drop",

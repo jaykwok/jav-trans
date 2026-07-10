@@ -230,15 +230,30 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         for row in _source_windows(source_window_paths)
         if str(row.get("video_id") or "") in holdout_video_ids
     }
+    all_definite_candidate_ids = [str(row["candidate_id"]) for row in exact_definite]
+    all_manual_video_ids = {
+        str(row["video_id"])
+        for row in corpus
+        if row["label"] in {"definite_keep", "definite_drop"}
+    }
+    all_manual_audio_ids = {
+        str(row["window_id"])
+        for row in _source_windows(source_window_paths)
+        if str(row.get("video_id") or "") in all_manual_video_ids
+    }
 
     train_ids_path = output_dir / "train_anchor_candidate_ids.txt"
     train_audio_path = output_dir / "force_train_audio_ids.txt"
     holdout_ids_path = output_dir / "holdout_candidate_ids.txt"
     holdout_audio_path = output_dir / "force_val_audio_ids.txt"
+    all_candidate_ids_path = output_dir / "all_definite_candidate_ids.txt"
+    all_audio_ids_path = output_dir / "all_manual_video_audio_ids.txt"
     _write_ids(train_ids_path, train_anchor_ids)
     _write_ids(train_audio_path, train_audio_ids)
     _write_ids(holdout_ids_path, holdout_candidate_ids)
     _write_ids(holdout_audio_path, holdout_audio_ids)
+    _write_ids(all_candidate_ids_path, all_definite_candidate_ids)
+    _write_ids(all_audio_ids_path, all_manual_audio_ids)
 
     summary.update(
         {
@@ -252,10 +267,15 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             "holdout_candidate_count": len(holdout_candidate_ids),
             "holdout_video_count": len(holdout_video_ids),
             "holdout_audio_count": len(holdout_audio_ids),
+            "all_definite_candidate_count": len(all_definite_candidate_ids),
+            "all_manual_video_count": len(all_manual_video_ids),
+            "all_manual_video_audio_count": len(all_manual_audio_ids),
             "train_anchor_candidate_ids": str(train_ids_path),
             "force_train_audio_ids": str(train_audio_path),
             "holdout_candidate_ids": str(holdout_ids_path),
             "force_val_audio_ids": str(holdout_audio_path),
+            "all_definite_candidate_ids": str(all_candidate_ids_path),
+            "all_manual_video_audio_ids": str(all_audio_ids_path),
             "unmatched_current_candidates": str(unmatched_path),
             "manual_projection_policy": "boundary_match_only; changed spans become ambiguous_ignore",
         }

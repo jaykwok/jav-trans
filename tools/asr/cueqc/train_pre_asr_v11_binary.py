@@ -254,16 +254,35 @@ def _split_label_masks(
                 else train
             )
             target[group_index] = valid[group_index]
-    elif split_mode == "group":
+    elif split_mode in {"group", "video_group"}:
         group_count = int(y.shape[0])
-        order = rng.permutation(group_count)
-        val_count = max(1, int(round(group_count * val_ratio))) if group_count >= 2 else 0
-        val_groups = set(int(item) for item in order[:val_count])
+        if split_mode == "video_group":
+            video_ids = [
+                str(group.get("video_id") or group.get("audio_id") or index)
+                for index, group in enumerate(group_rows)
+            ]
+            unique_videos = sorted(set(video_ids))
+            order = rng.permutation(len(unique_videos))
+            val_count = (
+                max(1, int(round(len(unique_videos) * val_ratio)))
+                if len(unique_videos) >= 2
+                else 0
+            )
+            val_videos = {unique_videos[int(item)] for item in order[:val_count]}
+            val_groups = {
+                index for index, video_id in enumerate(video_ids) if video_id in val_videos
+            }
+            fallback_order = rng.permutation(group_count)
+        else:
+            order = rng.permutation(group_count)
+            val_count = max(1, int(round(group_count * val_ratio))) if group_count >= 2 else 0
+            val_groups = set(int(item) for item in order[:val_count])
+            fallback_order = order
         for group_index in range(group_count):
             target = val if group_index in val_groups else train
             target[group_index] = valid[group_index]
         if not np.any(train & valid) and np.any(valid):
-            first = int(order[-1])
+            first = int(fallback_order[-1])
             train[first] = valid[first]
             val[first] = False
     elif split_mode == "chunk_stratified":
@@ -592,6 +611,10 @@ def train(
     force_val_audio_ids: list[str] | None = None,
     anchor_boost_candidate_ids: list[str] | None = None,
     valid_prefix_temporal: bool = False,
+    ptm_encoder_mode: str = "summary_mlp",
+    semantic_auxiliary: bool = False,
+    semantic_aux_loss_weight: float = 0.0,
+    late_fusion: bool = False,
 ) -> dict[str, Any]:
     import torch
     import torch.nn.functional as F
@@ -619,6 +642,8 @@ def train(
     bundle_repo = qwen_asr_repo_id(str(bundle.get("asr_repo_id") or selected_repo))
     if bundle_repo != selected_repo:
         raise ValueError(f"feature bundle asr_repo_id={bundle_repo!r} does not match {selected_repo!r}")
+    ptm_projection_digest = str(bundle.get("ptm_projection_digest") or "")
+    ptm_pooling_schemas = [str(item) for item in bundle.get("ptm_pooling_schemas") or ()]
 
     torch.manual_seed(seed)
     rng = np.random.default_rng(seed)
@@ -743,6 +768,9 @@ def train(
                 "hidden_size": hidden_size,
                 "temporal_residual_scale": temporal_residual_scale,
                 "valid_prefix_temporal": bool(valid_prefix_temporal),
+                "ptm_encoder_mode": str(ptm_encoder_mode),
+                "semantic_auxiliary": bool(semantic_auxiliary),
+                "late_fusion": bool(late_fusion),
             }
         )
     model = PreAsrCueQCNetwork(**model_config).to(dev)
@@ -792,12 +820,18 @@ def train(
             y=y_train_d,
             sequence_window_size=sequence_window_size,
         )
-        logits = model(
+        model_output = model(
             batch_ptm,
             batch_scalar,
             chunk_mask=batch_chunk_mask,
             bin_mask=batch_bin_mask,
+            return_auxiliary=bool(semantic_auxiliary),
         )
+        if isinstance(model_output, tuple):
+            logits, auxiliary = model_output
+        else:
+            logits = model_output
+            auxiliary = {}
         flat_logits = logits.reshape(-1, 2)
         flat_targets = batch_y.reshape(-1)
         active = flat_targets != PRE_ASR_CUEQC_IGNORE_LABEL
@@ -813,6 +847,21 @@ def train(
             1, active_targets.unsqueeze(1)
         ).squeeze(1)
         loss = (raw_loss * torch.pow(1.0 - pt, focal_gamma)).mean()
+        if semantic_auxiliary and semantic_aux_loss_weight > 0.0:
+            semantic_logits = auxiliary["semantic_logits"].reshape(-1, 2)[active]
+            semantic_raw_loss = F.cross_entropy(
+                semantic_logits,
+                active_targets,
+                weight=class_weights,
+                reduction="none",
+            )
+            semantic_pt = torch.softmax(semantic_logits, dim=-1).gather(
+                1, active_targets.unsqueeze(1)
+            ).squeeze(1)
+            semantic_loss = (
+                semantic_raw_loss * torch.pow(1.0 - semantic_pt, focal_gamma)
+            ).mean()
+            loss = loss + float(semantic_aux_loss_weight) * semantic_loss
         opt.zero_grad(set_to_none=True)
         loss.backward()
         opt.step()
@@ -851,6 +900,8 @@ def train(
         "asr_repo_id": selected_repo,
         "semantic_split_checkpoint": repo_display_path(split_checkpoint_path),
         "semantic_split_weights_sha256": split_checkpoint_sha256,
+        "ptm_projection_digest": ptm_projection_digest,
+        "ptm_pooling_schemas": ptm_pooling_schemas,
         "split": split_summary,
         "train_group_count": int(split_summary["train_group_count"]),
         "val_group_count": int(split_summary["val_group_count"]),
@@ -862,6 +913,10 @@ def train(
         },
         "focal_gamma": float(focal_gamma),
         "valid_prefix_temporal": bool(model_config["valid_prefix_temporal"]),
+        "ptm_encoder_mode": str(model_config["ptm_encoder_mode"]),
+        "semantic_auxiliary": bool(model_config["semantic_auxiliary"]),
+        "semantic_aux_loss_weight": float(semantic_aux_loss_weight),
+        "late_fusion": bool(model_config["late_fusion"]),
         "sequence_window_size": int(sequence_window_size),
         "init_checkpoint": (
             repo_display_path(init_checkpoint)
@@ -934,6 +989,8 @@ def train(
             "feature_bundle_sha256": file_sha256(features_path),
             "semantic_split_checkpoint": repo_display_path(split_checkpoint_path),
             "semantic_split_weights_sha256": split_checkpoint_sha256,
+            "ptm_projection_digest": ptm_projection_digest,
+            "ptm_pooling_schemas": ptm_pooling_schemas,
             "trained_steps": int(steps),
             "sequence_window_size": int(sequence_window_size),
             "split_mode": str(split_mode),
@@ -968,6 +1025,10 @@ def train(
             ),
             "anchor_boost": int(anchor_boost),
             "valid_prefix_temporal": bool(model_config["valid_prefix_temporal"]),
+            "ptm_encoder_mode": str(model_config["ptm_encoder_mode"]),
+            "semantic_auxiliary": bool(model_config["semantic_auxiliary"]),
+            "semantic_aux_loss_weight": float(semantic_aux_loss_weight),
+            "late_fusion": bool(model_config["late_fusion"]),
         },
         "model_state_dict": model.cpu().state_dict(),
     }
@@ -1001,6 +1062,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         action="store_true",
         help="Use padding-invariant valid-prefix masking and bidirectional reversal.",
     )
+    parser.add_argument(
+        "--ptm-encoder-mode",
+        choices=("summary_mlp", "token_attention"),
+        default="summary_mlp",
+    )
+    parser.add_argument("--semantic-auxiliary", action="store_true")
+    parser.add_argument("--semantic-aux-loss-weight", type=float, default=0.0)
+    parser.add_argument("--late-fusion", action="store_true")
     parser.add_argument(
         "--init-checkpoint",
         help="Fine-tune from an existing compatible v12 checkpoint and preserve its normalization.",
@@ -1054,7 +1123,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--anchor-boost", type=int, default=1)
     parser.add_argument(
         "--split-mode",
-        choices=("chunk_stratified", "group", "role_holdout"),
+        choices=("chunk_stratified", "group", "video_group", "role_holdout"),
         default="chunk_stratified",
         help="chunk_stratified samples train/test chunks within every group and label class; group keeps the old group-level split.",
     )
@@ -1078,6 +1147,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         parser.error("class weights must be positive")
     if args.focal_gamma < 0.0:
         parser.error("--focal-gamma must be non-negative")
+    if args.semantic_aux_loss_weight < 0.0:
+        parser.error("--semantic-aux-loss-weight must be non-negative")
+    if args.semantic_aux_loss_weight > 0.0 and not args.semantic_auxiliary:
+        parser.error("--semantic-aux-loss-weight requires --semantic-auxiliary")
+    if args.late_fusion and not args.semantic_auxiliary:
+        parser.error("--late-fusion requires --semantic-auxiliary")
     if not 0.0 < args.val_ratio < 1.0:
         parser.error("--val-ratio must be in (0, 1)")
     if args.sequence_window_size < 0:
@@ -1145,6 +1220,10 @@ def main(argv: list[str] | None = None) -> int:
             *_read_id_files(list(args.anchor_boost_candidate_id_file)),
         ],
         valid_prefix_temporal=bool(args.valid_prefix_temporal),
+        ptm_encoder_mode=str(args.ptm_encoder_mode),
+        semantic_auxiliary=bool(args.semantic_auxiliary),
+        semantic_aux_loss_weight=float(args.semantic_aux_loss_weight),
+        late_fusion=bool(args.late_fusion),
     )
     print(
         "checkpoint={checkpoint} val_drop_f1={f1:.4f} val_keep_recall={keep:.4f}".format(

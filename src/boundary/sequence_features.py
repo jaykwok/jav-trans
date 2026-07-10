@@ -11,6 +11,7 @@ import numpy as np
 FRAME_SEQUENCE_FEATURE_SCHEMA = "edge_sequence_features_v2"
 FRAME_SEQUENCE_FRAMES_SCHEMA = "speech_boundary_ja_sequence_feature_frames_v1"
 CHUNK_POOLED_PTM_SCHEMA = "pre_asr_chunk_pooled_ptm_v1"
+CHUNK_PROJECTED_PTM_SCHEMA = "pre_asr_chunk_projected_ptm_v2"
 DEFAULT_CHUNK_POOLED_PTM_BINS = 4
 SPLIT_CANDIDATE_SCALAR_NAMES = (
     "candidate_score",
@@ -495,6 +496,44 @@ class FrameSequenceFeatureProvider:
     ) -> list[float]:
         return _chunk_pooled_ptm_features_from_array(
             self._ptm_used,
+            frame_hop_s=self.frame_hop_s,
+            start_s=start_s,
+            end_s=end_s,
+            bins=bins,
+        )
+
+    def chunk_pooled_projected_ptm_signature(
+        self,
+        *,
+        bins: int = DEFAULT_CHUNK_POOLED_PTM_BINS,
+    ) -> dict:
+        if self._ptm_projected_array is None or not self.ptm_projected_digest:
+            raise ValueError("projected PTM pooling requires projected frames and digest")
+        dim = int(self._ptm_projected_array.shape[1])
+        names = chunk_pooled_ptm_feature_names(ptm_dim=dim, bins=bins)
+        return {
+            "schema": CHUNK_PROJECTED_PTM_SCHEMA,
+            "bins": int(bins),
+            "ptm_used_dim": dim,
+            "feature_dim": len(names),
+            "feature_names_hash": hashlib.sha1(
+                json.dumps(names, separators=(",", ":")).encode("utf-8")
+            ).hexdigest(),
+            "frame_hop_s": float(self.frame_hop_s),
+            "ptm_projection_digest": str(self.ptm_projected_digest),
+        }
+
+    def chunk_pooled_projected_ptm_features(
+        self,
+        *,
+        start_s: float,
+        end_s: float,
+        bins: int = DEFAULT_CHUNK_POOLED_PTM_BINS,
+    ) -> list[float]:
+        if self._ptm_projected_array is None or not self.ptm_projected_digest:
+            raise ValueError("projected PTM pooling requires projected frames and digest")
+        return _chunk_pooled_ptm_features_from_array(
+            self._ptm_projected_array[: self._frame_count],
             frame_hop_s=self.frame_hop_s,
             start_s=start_s,
             end_s=end_s,

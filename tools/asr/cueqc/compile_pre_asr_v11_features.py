@@ -308,6 +308,14 @@ def _group_key(source: str, audio_id: str, candidate: Mapping[str, Any]) -> tupl
     )
 
 
+def _source_video_id(candidate: Mapping[str, Any], audio_id: str) -> str:
+    explicit = str(candidate.get("source_video_id") or "").strip()
+    if explicit:
+        return explicit
+    value = str(candidate.get("video_id") or audio_id)
+    return re.sub(r"-w\d+$", "", value)
+
+
 def _make_tensor_bundle(rows: list[dict[str, Any]], groups: list[list[int]]) -> dict[str, Any]:
     import torch
 
@@ -374,6 +382,7 @@ def compile_features(
                     "id": rid,
                     "source": source,
                     "audio_id": audio_id,
+                    "video_id": _source_video_id(candidate, audio_id),
                     "planned_island_id": str(candidate.get("planned_island_id") or "sequence"),
                     "chunk_index": int(candidate["index"]),
                     "start": candidate["start"],
@@ -403,6 +412,23 @@ def compile_features(
             groups.append(row_indexes)
     if not groups:
         raise ValueError("no definite labeled Pre-ASR CueQC examples were compiled")
+    projection_digests = {
+        str(rows[row_index]["candidate"].get("ptm_projection_digest") or "")
+        for group in groups
+        for row_index in group
+        if str(rows[row_index]["candidate"].get("ptm_projection_digest") or "")
+    }
+    if len(projection_digests) > 1:
+        raise ValueError(f"multiple PTM projection digests in feature bundle: {sorted(projection_digests)}")
+    ptm_projection_digest = next(iter(projection_digests), "")
+    pooling_schemas = sorted(
+        {
+            str(rows[row_index]["candidate"].get("ptm_pooling_schema") or "")
+            for group in groups
+            for row_index in group
+            if str(rows[row_index]["candidate"].get("ptm_pooling_schema") or "")
+        }
+    )
     bundle_tensors = _make_tensor_bundle(rows, groups)
     y = bundle_tensors["labels"].numpy()
     row_payload = [
@@ -415,6 +441,7 @@ def compile_features(
             "group_index": group_index,
             "row_ids": [rows[row_index]["id"] for row_index in group],
             "audio_id": rows[group[0]]["audio_id"],
+            "video_id": rows[group[0]]["video_id"],
             "planned_island_id": rows[group[0]]["planned_island_id"],
         }
         for group_index, group in enumerate(groups)
@@ -428,6 +455,8 @@ def compile_features(
         "ptm_bin_count": PRE_ASR_CUEQC_MODEL_PTM_TOKENS,
         "ptm_dim": PRE_ASR_CUEQC_PTM_DIM,
         "asr_repo_id": qwen_asr_repo_id(asr_repo_id),
+        "ptm_pooling_schemas": pooling_schemas,
+        "ptm_projection_digest": ptm_projection_digest,
         "created_at": datetime.now().isoformat(timespec="seconds"),
         "rows": row_payload,
         "groups": group_payload,
@@ -444,6 +473,8 @@ def compile_features(
         "runtime_adapter": PRE_ASR_CUEQC_RUNTIME_ADAPTER,
         "feature_names": list(PRE_ASR_CUEQC_SCALAR_FEATURE_NAMES),
         "asr_repo_id": qwen_asr_repo_id(asr_repo_id),
+        "ptm_pooling_schemas": pooling_schemas,
+        "ptm_projection_digest": ptm_projection_digest,
         "group_count": int(len(groups)),
         "chunk_count": int(np.sum(y != PRE_ASR_CUEQC_IGNORE_LABEL)),
         "keep": int(np.sum(y == 1)),
