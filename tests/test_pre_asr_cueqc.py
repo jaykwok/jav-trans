@@ -18,6 +18,8 @@ from boundary.sequence_features import (
 )
 from tools.asr.cueqc.compile_pre_asr_v12_features import compile_features
 from tools.asr.cueqc.train_pre_asr_v12_binary import (
+    _boost_anchor_positions,
+    _matching_candidate_positions,
     _split_label_masks,
     _window_batch_from_anchors,
 )
@@ -860,3 +862,34 @@ def test_pre_asr_anchor_batch_supports_pre_windowed_bundle():
     )
 
     assert targets.tolist() == [[-100, 1, -100], [1, -100, -100]]
+
+
+def test_pre_asr_candidate_anchor_boost_is_exact():
+    import torch
+
+    groups = [
+        {"row_ids": ["candidate-a", "candidate-b"]},
+        {"row_ids": ["candidate-c"]},
+    ]
+    positions = {1: torch.tensor([[0, 0], [0, 1], [1, 0]])}
+    selected = _matching_candidate_positions(groups, ["candidate-b"])
+
+    boosted = _boost_anchor_positions(
+        positions,
+        group_indexes=set(),
+        candidate_positions=selected,
+        boost=3,
+    )
+
+    assert selected == {(0, 1)}
+    assert boosted[1].tolist().count([0, 1]) == 3
+    assert boosted[1].tolist().count([0, 0]) == 1
+    assert boosted[1].tolist().count([1, 0]) == 1
+
+
+def test_pre_asr_candidate_anchor_boost_rejects_missing_id():
+    with pytest.raises(ValueError, match="candidate-missing"):
+        _matching_candidate_positions(
+            [{"row_ids": ["candidate-a"]}],
+            ["candidate-missing"],
+        )
