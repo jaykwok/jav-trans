@@ -58,7 +58,7 @@ DEFAULT_PRE_ASR_CUEQC_CHECKPOINT_BY_REPO: dict[str, str] = {
     ),
     QWEN_ASR_17B_REPO_ID: (
         "src/asr/checkpoints/"
-        "pre_asr_cueqc_v11."
+        "pre_asr_cueqc_v12."
         "jaykwok-Qwen3-ASR-1.7B-JA-Anime-Galgame-hf.pt"
     ),
 }

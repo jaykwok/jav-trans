@@ -135,7 +135,19 @@ def test_promote_after_audit_writes_promoted_checkpoint(tmp_path: Path) -> None:
 
     payload = torch.load(output, map_location="cpu", weights_only=False)
     assert summary["promoted"] is True
-    assert payload["metadata"]["artifact"]["version"] == "v12"
+    assert payload["metadata"]["artifact"] == {
+        "name": "pre_asr_cueqc",
+        "display_name": "Pre-ASR CueQC",
+        "version": "v12",
+        "pipeline_stage": 5,
+        "pipeline_role": "final_chunk_keep_drop_routing",
+        "checkpoint_format_version": 1,
+        "production_filename": "production.pt",
+        "promoted": True,
+        "promoted_at": payload["metadata"]["artifact"]["promoted_at"],
+        "self_contained": True,
+        "source_training_run": "agents/temp/train",
+    }
     assert payload["metadata"]["selected_validation"]["model_gate"]["drop_recall"] == pytest.approx(0.983)
     assert payload["decision_config"]["drop_threshold"] == 0.5
 
