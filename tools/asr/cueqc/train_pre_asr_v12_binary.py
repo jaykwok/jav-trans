@@ -9,6 +9,8 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from tools.asr.cueqc.train_pre_asr_v11_binary import (
+    _boost_anchor_positions,
+    _matching_candidate_positions,
     _split_label_masks,
     _window_batch_from_anchors,
     load_feature_bundle,
@@ -17,6 +19,8 @@ from tools.asr.cueqc.train_pre_asr_v11_binary import (
 )
 
 __all__ = [
+    "_boost_anchor_positions",
+    "_matching_candidate_positions",
     "_split_label_masks",
     "_window_batch_from_anchors",
     "load_feature_bundle",

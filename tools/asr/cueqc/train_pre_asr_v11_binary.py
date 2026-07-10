@@ -333,13 +333,38 @@ def _matching_group_indexes(
     }
 
 
+def _matching_candidate_positions(
+    group_rows: list[Mapping[str, Any]],
+    candidate_ids: list[str],
+) -> set[tuple[int, int]]:
+    wanted = {str(item).strip() for item in candidate_ids if str(item).strip()}
+    if not wanted:
+        return set()
+    positions = {
+        (group_index, chunk_index)
+        for group_index, group in enumerate(group_rows)
+        for chunk_index, row_id in enumerate(group.get("row_ids") or ())
+        if str(row_id) in wanted
+    }
+    found = {
+        str((group_rows[group_index].get("row_ids") or [])[chunk_index])
+        for group_index, chunk_index in positions
+    }
+    missing = sorted(wanted - found)
+    if missing:
+        raise ValueError(f"anchor candidate_ids not found in feature bundle: {missing}")
+    return positions
+
+
 def _boost_anchor_positions(
     positions_by_label: dict[int, Any],
     *,
     group_indexes: set[int],
+    candidate_positions: set[tuple[int, int]] | None = None,
     boost: int,
 ) -> dict[int, Any]:
-    if not group_indexes or int(boost) <= 1:
+    candidate_positions = candidate_positions or set()
+    if (not group_indexes and not candidate_positions) or int(boost) <= 1:
         return positions_by_label
     import torch
 
@@ -352,6 +377,10 @@ def _boost_anchor_positions(
         )
         for group_index in group_indexes:
             selected |= positions[:, 0] == int(group_index)
+        for group_index, chunk_index in candidate_positions:
+            selected |= (positions[:, 0] == int(group_index)) & (
+                positions[:, 1] == int(chunk_index)
+            )
         hard_positions = positions[selected]
         if hard_positions.numel():
             positions = torch.cat(
@@ -560,6 +589,8 @@ def train(
     anchor_boost_audio_ids: list[str],
     anchor_boost: int,
     semantic_split_checkpoint: Path | None,
+    force_val_audio_ids: list[str] | None = None,
+    anchor_boost_candidate_ids: list[str] | None = None,
 ) -> dict[str, Any]:
     import torch
     import torch.nn.functional as F
@@ -603,18 +634,39 @@ def train(
         rng=rng,
     )
     force_train_groups = _matching_group_indexes(group_rows, force_train_audio_ids)
+    force_val_groups = _matching_group_indexes(group_rows, force_val_audio_ids or [])
+    overlap_groups = force_train_groups & force_val_groups
+    if overlap_groups:
+        overlap_ids = sorted(
+            str(group_rows[index].get("audio_id") or "") for index in overlap_groups
+        )
+        raise ValueError(f"audio_ids forced into both train and validation: {overlap_ids}")
     for group_index in force_train_groups:
         valid = (mask_np[group_index] > 0) & (
             (y_np[group_index] == 0) | (y_np[group_index] == 1)
         )
         train_label_mask[group_index, valid] = True
         val_label_mask[group_index, valid] = False
-    if force_train_groups:
+    for group_index in force_val_groups:
+        valid = (mask_np[group_index] > 0) & (
+            (y_np[group_index] == 0) | (y_np[group_index] == 1)
+        )
+        train_label_mask[group_index, valid] = False
+        val_label_mask[group_index, valid] = True
+    if force_train_groups or force_val_groups:
+        if not np.any(train_label_mask):
+            raise ValueError("forced split leaves no training labels")
+        if not np.any(val_label_mask):
+            raise ValueError("forced split leaves no validation labels")
         split_summary.update(
             {
                 "forced_train_audio_ids": sorted(
                     str(group_rows[index].get("audio_id") or "")
                     for index in force_train_groups
+                ),
+                "forced_val_audio_ids": sorted(
+                    str(group_rows[index].get("audio_id") or "")
+                    for index in force_val_groups
                 ),
                 "train_group_count": int(np.sum(np.any(train_label_mask, axis=1))),
                 "val_group_count": int(np.sum(np.any(val_label_mask, axis=1))),
@@ -712,9 +764,14 @@ def train(
         group_rows,
         anchor_boost_audio_ids,
     )
+    anchor_boost_candidates = _matching_candidate_positions(
+        group_rows,
+        anchor_boost_candidate_ids or [],
+    )
     positions_by_label = _boost_anchor_positions(
         positions_by_label,
         group_indexes=anchor_boost_groups,
+        candidate_positions=anchor_boost_candidates,
         boost=anchor_boost,
     )
     batch_size = max(1, int(batch_size))
@@ -812,9 +869,17 @@ def train(
             str(group_rows[index].get("audio_id") or "")
             for index in force_train_groups
         ),
+        "force_val_audio_ids": sorted(
+            str(group_rows[index].get("audio_id") or "")
+            for index in force_val_groups
+        ),
         "anchor_boost_audio_ids": sorted(
             str(group_rows[index].get("audio_id") or "")
             for index in anchor_boost_groups
+        ),
+        "anchor_boost_candidate_ids": sorted(
+            str((group_rows[group_index].get("row_ids") or [])[chunk_index])
+            for group_index, chunk_index in anchor_boost_candidates
         ),
         "anchor_boost": int(anchor_boost),
         "model_config": model_config,
@@ -886,9 +951,17 @@ def train(
                 str(group_rows[index].get("audio_id") or "")
                 for index in force_train_groups
             ),
+            "force_val_audio_ids": sorted(
+                str(group_rows[index].get("audio_id") or "")
+                for index in force_val_groups
+            ),
             "anchor_boost_audio_ids": sorted(
                 str(group_rows[index].get("audio_id") or "")
                 for index in anchor_boost_groups
+            ),
+            "anchor_boost_candidate_ids": sorted(
+                str((group_rows[group_index].get("row_ids") or [])[chunk_index])
+                for group_index, chunk_index in anchor_boost_candidates
             ),
             "anchor_boost": int(anchor_boost),
         },
@@ -934,10 +1007,40 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Keep all definite labels for this audio_id in training rather than validation.",
     )
     parser.add_argument(
+        "--force-train-audio-id-file",
+        action="append",
+        default=[],
+        help="Text file containing one force-train audio_id per line.",
+    )
+    parser.add_argument(
+        "--force-val-audio-id",
+        action="append",
+        default=[],
+        help="Keep all definite labels for this audio_id in validation.",
+    )
+    parser.add_argument(
+        "--force-val-audio-id-file",
+        action="append",
+        default=[],
+        help="Text file containing one force-validation audio_id per line.",
+    )
+    parser.add_argument(
         "--anchor-boost-audio-id",
         action="append",
         default=[],
         help="Oversample labeled anchors belonging to this audio_id.",
+    )
+    parser.add_argument(
+        "--anchor-boost-candidate-id",
+        action="append",
+        default=[],
+        help="Oversample only the labeled anchor with this candidate_id.",
+    )
+    parser.add_argument(
+        "--anchor-boost-candidate-id-file",
+        action="append",
+        default=[],
+        help="Text file containing one anchor candidate_id per line.",
     )
     parser.add_argument("--anchor-boost", type=int, default=1)
     parser.add_argument(
@@ -975,6 +1078,18 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     return args
 
 
+def _read_id_files(paths: list[str]) -> list[str]:
+    values: list[str] = []
+    for raw_path in paths:
+        path = project_path(raw_path)
+        values.extend(
+            line.strip()
+            for line in path.read_text(encoding="utf-8").splitlines()
+            if line.strip() and not line.lstrip().startswith("#")
+        )
+    return values
+
+
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
     metrics = train(
@@ -1006,9 +1121,20 @@ def main(argv: list[str] | None = None) -> int:
             if args.semantic_split_checkpoint
             else None
         ),
-        force_train_audio_ids=list(args.force_train_audio_id),
+        force_train_audio_ids=[
+            *args.force_train_audio_id,
+            *_read_id_files(list(args.force_train_audio_id_file)),
+        ],
         anchor_boost_audio_ids=list(args.anchor_boost_audio_id),
         anchor_boost=int(args.anchor_boost),
+        force_val_audio_ids=[
+            *args.force_val_audio_id,
+            *_read_id_files(list(args.force_val_audio_id_file)),
+        ],
+        anchor_boost_candidate_ids=[
+            *args.anchor_boost_candidate_id,
+            *_read_id_files(list(args.anchor_boost_candidate_id_file)),
+        ],
     )
     print(
         "checkpoint={checkpoint} val_drop_f1={f1:.4f} val_keep_recall={keep:.4f}".format(
