@@ -591,6 +591,7 @@ def train(
     semantic_split_checkpoint: Path | None,
     force_val_audio_ids: list[str] | None = None,
     anchor_boost_candidate_ids: list[str] | None = None,
+    valid_prefix_temporal: bool = False,
 ) -> dict[str, Any]:
     import torch
     import torch.nn.functional as F
@@ -741,6 +742,7 @@ def train(
                 "scalar_dim": len(PRE_ASR_CUEQC_SCALAR_FEATURE_NAMES),
                 "hidden_size": hidden_size,
                 "temporal_residual_scale": temporal_residual_scale,
+                "valid_prefix_temporal": bool(valid_prefix_temporal),
             }
         )
     model = PreAsrCueQCNetwork(**model_config).to(dev)
@@ -859,6 +861,7 @@ def train(
             "keep": float(keep_class_weight),
         },
         "focal_gamma": float(focal_gamma),
+        "valid_prefix_temporal": bool(model_config["valid_prefix_temporal"]),
         "sequence_window_size": int(sequence_window_size),
         "init_checkpoint": (
             repo_display_path(init_checkpoint)
@@ -964,6 +967,7 @@ def train(
                 for group_index, chunk_index in anchor_boost_candidates
             ),
             "anchor_boost": int(anchor_boost),
+            "valid_prefix_temporal": bool(model_config["valid_prefix_temporal"]),
         },
         "model_state_dict": model.cpu().state_dict(),
     }
@@ -992,6 +996,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--drop-class-weight", type=float, default=1.0)
     parser.add_argument("--keep-class-weight", type=float, default=2.0)
     parser.add_argument("--focal-gamma", type=float, default=2.0)
+    parser.add_argument(
+        "--valid-prefix-temporal",
+        action="store_true",
+        help="Use padding-invariant valid-prefix masking and bidirectional reversal.",
+    )
     parser.add_argument(
         "--init-checkpoint",
         help="Fine-tune from an existing compatible v12 checkpoint and preserve its normalization.",
@@ -1135,6 +1144,7 @@ def main(argv: list[str] | None = None) -> int:
             *args.anchor_boost_candidate_id,
             *_read_id_files(list(args.anchor_boost_candidate_id_file)),
         ],
+        valid_prefix_temporal=bool(args.valid_prefix_temporal),
     )
     print(
         "checkpoint={checkpoint} val_drop_f1={f1:.4f} val_keep_recall={keep:.4f}".format(
