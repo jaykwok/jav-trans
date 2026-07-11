@@ -179,17 +179,17 @@ def build_audit(
     <div class="track-selector" role="group" aria-label="选择单一字幕轨道">
       <button type="button" class="track-button" data-track="forced" aria-pressed="{'true' if default_track == 'forced' else 'false'}">Forced</button>
       <button type="button" class="track-button" data-track="omni" aria-pressed="{'true' if default_track == 'omni' else 'false'}">Omni</button>
-      <button type="button" class="track-button" data-track="fused" aria-pressed="{'true' if default_track == 'fused' else 'false'}">Fused</button>
+      <button type="button" class="track-button" data-track="fused" aria-pressed="{'true' if default_track == 'fused' else 'false'}">Selected</button>
     </div>
   </div>
   <div class="lanes">
     <div class="lane-label">Forced</div>{_lane(forced_units, duration_s=duration_s, kind='forced')}
     <div class="lane-label">Omni</div>{_lane(omni_units, duration_s=duration_s, kind='omni')}
-    <div class="lane-label">Fused</div>{_lane(fused_units, duration_s=duration_s, kind='fused')}
+    <div class="lane-label">Selected</div>{_lane(fused_units, duration_s=duration_s, kind='fused')}
   </div>
   <div class="table-wrap">
     <table>
-      <thead><tr><th>ID</th><th>Text</th><th>Forced time</th><th>F score</th><th>Omni</th><th>Omni time</th><th>O conf</th><th>Fusion</th><th>start Δ</th><th>end Δ</th></tr></thead>
+      <thead><tr><th>ID</th><th>Text</th><th>Forced time</th><th>F score</th><th>Omni</th><th>Omni time</th><th>O conf</th><th>Selection</th><th>start Δ</th><th>end Δ</th></tr></thead>
       <tbody>{_unit_rows(forced_units, omni_units, fused_units)}</tbody>
     </table>
   </div>
