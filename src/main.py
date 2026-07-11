@@ -694,6 +694,23 @@ def _resolve_job_temp_dir(job_id: str) -> str:
     return str((path / sanitize_job_id(job_id)).resolve())
 
 
+def _materialize_cached_file(source: str | Path, destination: str | Path) -> bool:
+    source_path = Path(source).resolve()
+    destination_path = Path(destination).resolve()
+    if source_path == destination_path:
+        return source_path.is_file()
+    if not source_path.is_file():
+        return False
+    destination_path.parent.mkdir(parents=True, exist_ok=True)
+    if destination_path.exists():
+        return destination_path.is_file()
+    try:
+        os.link(source_path, destination_path)
+    except OSError:
+        shutil.copy2(source_path, destination_path)
+    return True
+
+
 def _asr_checkpoint_root() -> Path:
     try:
         return Path(
@@ -977,16 +994,23 @@ def _run_asr_alignment_impl(
             "subtitle_frame_gap_s="
             f"{subtitle_options.frame_gap_s:.6f}",
         )
-        if cache_job_id != job_id:
-            job_temp_dir = _resolve_job_temp_dir(cache_job_id)
-        elif effective_ctx.job_temp_dir:
+        if effective_ctx.job_temp_dir:
             job_temp_dir = str(Path(effective_ctx.job_temp_dir).expanduser().resolve())
         else:
             job_temp_dir = _resolve_job_temp_dir(job_id)
+        cache_temp_dir = (
+            str((Path(job_temp_dir).parent / cache_job_id).resolve())
+            if cache_job_id != job_id
+            else job_temp_dir
+        )
         os.makedirs(job_temp_dir, exist_ok=True)
         _log_stage(logger, f"job_temp_dir={_project_relative(job_temp_dir)}")
         if cache_job_id != job_id:
-            _log_stage(logger, f"resume_from_job_id={cache_job_id}")
+            _log_stage(
+                logger,
+                "resume_from_job_id="
+                f"{cache_job_id} cache_temp_dir={_project_relative(cache_temp_dir)}",
+            )
         aligned_cache_signature = _aligned_cache_signature_for_ctx(
             effective_ctx,
             backend_label=backend_label,
@@ -996,11 +1020,20 @@ def _run_asr_alignment_impl(
         os.makedirs(audio_dir, exist_ok=True)
         audio_cache_key = audio_module.get_audio_cache_key(video_path)
         audio_path = os.path.join(audio_dir, f"{video_name}.{audio_cache_key}.wav")
+        cache_audio_path = os.path.join(
+            cache_temp_dir,
+            "audio",
+            f"{video_name}.{audio_cache_key}.wav",
+        )
         aligned_segments_path = os.path.join(
             job_temp_dir, f"{video_filename}.aligned_segments.json"
         )
+        cache_aligned_segments_path = os.path.join(
+            cache_temp_dir,
+            f"{video_filename}.aligned_segments.json",
+        )
         aligned_cache = aligned_cache_module.try_load_aligned_segments(
-            aligned_segments_path,
+            cache_aligned_segments_path,
             audio_cache_key,
             backend_label,
             aligned_cache_signature,
@@ -1018,15 +1051,42 @@ def _run_asr_alignment_impl(
             segments = aligned_cache["segments"]
             asr_log = [str(item) for item in aligned_cache.get("asr_log", [])]
             asr_details = dict(aligned_cache.get("asr_details", {}))
-            audio_cached = True
+            audio_cached = audio_cached or _materialize_cached_file(
+                cache_audio_path,
+                audio_path,
+            )
+            if not audio_cached:
+                audio_module.extract_audio(video_path, audio_path)
+                audio_cached = False
+            if cache_aligned_segments_path != aligned_segments_path:
+                _write_json(
+                    aligned_segments_path,
+                    _aligned_segments_payload(
+                        backend_label=backend_label,
+                        audio_path=audio_path,
+                        audio_cache_key=audio_cache_key,
+                        segments=segments,
+                        asr_details=asr_details,
+                        asr_log=asr_log,
+                        cache_signature=aligned_cache_signature,
+                        subtitle_options=subtitle_options,
+                        cache_stage="resume_materialized",
+                    ),
+                )
             _log_stage(
                 logger,
-                f"aligned_cache_hit path={_project_relative(aligned_segments_path)}",
+                "aligned_cache_hit source="
+                f"{_project_relative(cache_aligned_segments_path)} "
+                f"materialized={_project_relative(aligned_segments_path)}",
             )
             console.print(
                 f"[green]命中 aligned_segments cache，跳过音频提取与 ASR：{_project_relative(aligned_segments_path)}[/green]"
             )
-        elif os.path.exists(audio_path):
+        elif os.path.exists(audio_path) or _materialize_cached_file(
+            cache_audio_path,
+            audio_path,
+        ):
+            audio_cached = True
             _log_stage(logger, f"audio_cache_hit path={_project_relative(audio_path)}")
             console.print(f"[dim]跳过提取：使用已缓存音频 {_project_relative(audio_path)}[/dim]")
         else:

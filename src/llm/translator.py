@@ -1367,7 +1367,8 @@ def _translate_segments_batched(
         return batch_index, batch_results, timing, batch_retry_events
 
     if pending_batches:
-        with ThreadPoolExecutor(max_workers=min(max_workers, len(pending_batches))) as executor:
+        executor = ThreadPoolExecutor(max_workers=min(max_workers, len(pending_batches)))
+        try:
             _raise_if_cancelled(cancel_event)
             pending_by_index = {
                 batch_index: batch for batch_index, batch in pending_batches
@@ -1446,16 +1447,19 @@ def _translate_segments_batched(
                                 for pending_future in futures:
                                     if pending_future is not future:
                                         pending_future.cancel()
-                                executor.shutdown(wait=False, cancel_futures=True)
                                 raise SystemExit(1)
                         if on_batch_done:
                             _raise_if_cancelled(cancel_event)
                             on_batch_done(timing)
-            except Exception:
-                for pending_future in futures:
-                    pending_future.cancel()
-                executor.shutdown(wait=False, cancel_futures=True)
+            except BaseException:
                 raise
+        except BaseException:
+            for pending_future in futures:
+                pending_future.cancel()
+            executor.shutdown(wait=False, cancel_futures=True)
+            raise
+        else:
+            executor.shutdown(wait=True)
 
     _raise_if_cancelled(cancel_event)
     missing = _missing_indexes(zh_texts)
