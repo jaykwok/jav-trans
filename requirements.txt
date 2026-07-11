@@ -2,7 +2,6 @@ torch
 torchaudio
 rich
 transformers>=5.13.0
-nagisa>=0.3.0
 accelerate
 numpy
 scipy
