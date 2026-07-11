@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import sys
 from collections import defaultdict
 from pathlib import Path
@@ -50,6 +51,23 @@ from boundary.split_model import (  # noqa: E402
 
 IGNORE_ID = -100
 CORE_DURATION_SCALAR_INDEX = SPLIT_CANDIDATE_SCALAR_NAMES.index("core_duration_s")
+
+
+def build_lr_scheduler(optimizer, *, schedule: str, warmup_steps: int, max_steps: int):
+    """Build a scheduler whose LambdaLR callback returns an LR multiplier."""
+
+    if schedule != "cosine":
+        return None
+
+    import torch
+
+    def _lr_multiplier(step: int) -> float:
+        if step < warmup_steps:
+            return (step + 1) / max(1, warmup_steps)
+        progress = (step - warmup_steps) / max(1, max_steps - warmup_steps)
+        return 0.5 * (1 + math.cos(math.pi * min(1.0, progress)))
+
+    return torch.optim.lr_scheduler.LambdaLR(optimizer, _lr_multiplier)
 
 
 def load_island_dataset(path: Path) -> dict[str, Any]:
@@ -487,8 +505,6 @@ def _init_from_checkpoint(model, path: str) -> dict[str, int]:
 
 
 def run(args: argparse.Namespace) -> None:
-    import math
-
     import torch
     import torch.nn.functional as F
 
@@ -585,19 +601,12 @@ def run(args: argparse.Namespace) -> None:
         [p for p in model.parameters() if p.requires_grad],
         lr=args.learning_rate,
     )
-    scheduler = None
-    if args.lr_schedule == "cosine":
-        import torch
-
-        def _lr_at(step: int) -> float:
-            if step < args.warmup_steps:
-                return args.learning_rate * (step + 1) / max(1, args.warmup_steps)
-            progress = (step - args.warmup_steps) / max(
-                1, args.max_steps - args.warmup_steps
-            )
-            return args.learning_rate * 0.5 * (1 + math.cos(math.pi * progress))
-
-        scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, _lr_at)
+    scheduler = build_lr_scheduler(
+        optimizer,
+        schedule=args.lr_schedule,
+        warmup_steps=args.warmup_steps,
+        max_steps=args.max_steps,
+    )
     cut_groups = [
         name
         for name in train_names

@@ -8,16 +8,16 @@
 
 ## 路线总览
 
-当前主线是 **按 ASR repo 独立绑定的五阶段前置链（1.7B 额外启用 learned proposal scorer）+ Subtitle Layout v2**：
+当前主线是 **按 ASR repo 独立绑定的五阶段前置链（0.6B/1.7B 均启用 learned proposal scorer）+ Subtitle Layout v2**：
 
 ```text
 SpeechIslandScorer v8（speech only）
 -> speech hysteresis islands
--> Boundary Proposal Scorer v1（当前 1.7B learned proposals；0.6B 暂用 acoustic proposals）
+-> Boundary Proposal Scorer v1（按 ASR repo 独立绑定）
 -> Outer Edge Refiner v1（只修整条 island 的 start/end）
--> Semantic Split Verifier v1（cut / continue / unsure）
+-> Semantic Split Verifier v2（full PTM 学习投影；cut / continue / unsure）
 -> Cut Edge Refiner v1（一个 shared absolute cut timestamp）
--> Pre-ASR CueQC v11（local representation + neighbor differences + Mamba temporal context）
+-> Pre-ASR CueQC v12（model-only；token attention + semantic auxiliary + late fusion）
 -> Qwen ASR speech-core chunks
 -> Boundary chunk subtitle timing
 -> Subtitle Layout v2 acoustic/display dual timeline
@@ -26,9 +26,11 @@ SpeechIslandScorer v8（speech only）
 
 这次改造的核心不是换阈值，而是把不可逆的结构决策放回正确顺序：先得到完整 speech core，再判断是否切，最后才精修 cut point。内部切点始终锚定原音频绝对时间轴，相邻 chunk 共用同一个 timestamp；Outer Refiner 不再分别修切点左右边缘，因此不会制造 gap、overlap 或累计漂移。
 
-0.6B 仍是五个 repo-bound active checkpoint；1.7B 当前有六个生产 artifact（五阶段模型 + learned Boundary Proposal Scorer），不能跨 repo 复用。旧 v7 双头 scorer、v8 refiner、v10 Pre-ASR schema 和 planner/packer API 不保留 alias。SpeechIslandScorer 输出维度为 1；Semantic Split 使用三分类和保守 runtime 门槛；1.7B Split v2 要求 learned proposal candidates，不能回退 bootstrap acoustic candidates；Pre-ASR v11 在阈值 `0.95` 下运行，6GB 默认配置启用，两个 repo 的 checkpoint 均已进入 registry。ASR-after CueQC v4 已于 2026-07-05 整链移除（决策模型/refiner/工具链，`cueqc.py` 仅保留特征库供 pre-ASR 数据工具使用）。
+0.6B 与 1.7B 均为六个 repo-bound production artifact（五阶段模型 + learned Boundary Proposal Scorer），不能跨 repo 复用。旧 v7 双头 scorer、v8 refiner、v10 Pre-ASR schema 和 planner/packer API 不保留 alias。SpeechIslandScorer 输出维度为 1；两个 repo 的 Split v2 都要求 learned proposal candidates，不能回退 bootstrap acoustic candidates；Pre-ASR v12 为 model-only，规则 veto/fallback 关闭。ASR-after CueQC v4 已于 2026-07-05 整链移除（决策模型/refiner/工具链，`cueqc.py` 仅保留特征库供 pre-ASR 数据工具使用）。
 
 ## 路线修正
+
+- 2026-07-11 Stage G 0.6B 全链完成并整链晋升：0.6B PTM 实际维度为 `1024`，Split 按 full PTM→trainable `1024→128` 投影→deploy fold 执行，不截取前 128 维；修复 cosine scheduler 把绝对 LR 当 multiplier 导致有效 LR约 `4e-8` 的 bug。Proposer v1 runtime-equivalent recall `98.9818%`；Split v2 pooled-real F1 `0.62420`、pair isolation `0.872`、continue false-cut `0.04320`，均优于显式 v1 replay 的 `0.50881/0.328/0.07942`。全量重导出 `685/685` 窗、`13757` chunks；跨 repo 投影 unmatched `79.91%`，因此全量执行 0.6B Pre-ASR-only Omni。首轮供应端 `403 AccessDenied.Unpurchased` 后增量恢复，严格 verifier 最终 `13757/13757`、missing/duplicate/unexpected `0`，labels drop `9612` / keep `4141` / ignore `4`；工具现清理成功窗口 stale error，verifier区分 unresolved/stale。CueQC v12 使用 token attention + semantic auxiliary `0.5` + late fusion + valid-prefix、video-group split、keep/anchor weight `4`、4000 steps；t=0.50 gate drop/keep recall `0.99404/0.99853`，6条全量 false-drop 人工审计为 drop `4` / keep `2`。两条 keep 的概率 `0.54246/0.62388` 与四条 drop 的 `>=0.96954` 存在清晰间隔，阈值收紧到 `0.625` 后 drop/keep recall `0.98975/0.99902`，剩余4条均为已审人工 drop，人工 gate通过。联合校准保持 CueQC `0.625`、Split normal `0.75`，short `0.90→0.875`，改判 `3/17301=0.0173%`，无需 D′；duration pressure保持 median `-0.066219935`、MAD `1.052416507`、z `1.7`、floor `0.50`。受控 boundary artifact promotion 后 Split SHA `84e6e92e...81d1` 已同步绑定 CueQC；proposer/Split v2/CueQC v12 三份 0.6B 工件原子切入 registry，active GPU单窗口 smoke成功。训练 dedicated VRAM约 `2.1GB < 7779MiB` cap，未观察 shared spill/soft OOM；未跟踪 batch Omni draft不纳入提交。
 
 - 2026-07-10 Stage F Proposer+Scorer 双头训练完成但 gate 否决，现役双 checkpoint 保持不变：首版未提交 trainer 错把两个 teacher 的旧 `ptm_dim=128` 当成新模型输入契约，实际执行 `ptm[:, :128]`；用户指出后立即停止该路线。正式双头 schema 改为外部输入 `raw PTM 2048 + MFCC 40`，模型内 trainable `Linear(2048→128,bias=True)` 后接共享 speech/proposal 双头；投影初始化折叠 SpeechIslandScorer v8 的前 128 维 normalization，使 step-0 speech 输出与 teacher 数值等价，但训练可更新后 1920 维（20-step smoke 后对应 245760 个权重全部非零），旧前 128 切片仅留在显式 teacher-distillation 输入。原 two-film speech hard-negative 数据混有 328 个仅 128 维真实窗口并重复 20992 行，未过滤样本；从两部匿名样片完整 WAV 重提 full PTM（`agents/temp/20260710_225100_stage-f-speech-full-ptm-sequences/`，166410+329835 帧，均写 `vram_safety_ratio=0.95`），按原 label window 坐标 hydration 到 `agents/temp/20260710_225600_stage-f-speech-full-ptm-hydrated/`，53760 行统一 2048 维。重提前缀与旧 compact 同帧 MAE 约 2.4e-4~3.4e-4、p99 约 0.0015~0.0030，±1 帧 MAE 高近一个数量级，确认坐标正确；max 0.09486 属 bf16/batch 数值尾部。12k 正式训练 `agents/temp/20260710_225800_stage-f-dual-head-full-ptm-train/` 首次用长期 36GB `np.memmap` 读取时在 step≈2200 触发物理 RAM soft OOM：15508.3MiB > 15494.6MiB（0.95×物理 RAM），按纪律硬停；缓存格式保持不变，读取改为 offset `np.fromfile`、构建改普通 seek/write 后重跑完成，RSS peak 2216.7MiB、物理 RAM used peak 6466.9MiB，CUDA allocated/reserved peak 2202.3/7530.0MiB < 7778.1MiB cap，shared VRAM 不计预算。训练 frame gate：speech F1 0.99588（teacher 0.99508），proposal recall 0.95447（teacher 0.95184）。正式 runtime-equivalent gate `agents/temp/20260710_233300_stage-f-dual-head-runtime-gate/` 在 hardmix val 420 窗用同 20s/4s overlap、smooth/NMS/snap/quantile 解码：dual eligible proposal recall 98.7395%（通过 >98%，legacy 99.1597%），speech mask Jaccard 99.3925%；但 ±1 帧候选匹配 recall/precision 仅 25.7994%/27.9830%、candidate Jaccard 15.5047%、candidate count churn 7.8036%、island count churn 14.4788%，违反 Stage F 候选位置一致性 gate。结论 `promote_allowed=false` / `stop_reason=candidate_position_inconsistency`：不接 runtime、不改 registry、不做下游 Split/CueQC 漂移重放，继续保留 SpeechIslandScorer v8 + BoundaryProposalScorer v1 现役路径并进入 Stage G。新增 full-PTM hydration、offset cache、双头 checkpoint/训练/gate 工具及契约测试；未跟踪 batch Omni draft 不纳入本阶段。
 - 2026-07-07 Stage D.4/D.5 开始落地（断兼容，v9 soft handoff）：Pre-ASR CueQC feature schema 从 `pre_asr_cueqc_features_v8` 升到 `pre_asr_cueqc_features_v9`，runtime adapter 从 `pre_asr_semantic_chunk_sequence_v3` 升到 `v4`；v9 保持 v8 标量特征为严格前缀，并在尾部追加左右 split edge soft context（`p_cut/p_continue/p_unsure`、structural role、`p_role`、island-edge sentinel、noise-isolation bracket 与 pair id 特征）。runtime 侧 accepted bracket cut 写入同一个 `bracket_pair_id`，weak cut 也携带 `role/p_role`；Pre-ASR candidate 顶层同步写 `pre_asr_split_edges` 供审计与后续投影排查。Boundary cache 断兼容升为 v18，旧 v17 cache 不迁移，避免缺少 split-edge soft 字段的 packed chunks 被复用。loader 已改为从 checkpoint 读取 scalar feature names（仍要求当前 active schema 匹配，不做 v8 silent migration），为 D.6 v12 checkpoint 与 D.7 显式 legacy replay 分流做准备。

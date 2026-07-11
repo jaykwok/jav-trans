@@ -1019,6 +1019,9 @@ def _process_window(
         "response_finish_reasons": response_finish_reasons,
     }
     _write_json(output / "joint_labels" / f"{window_id}.json", result)
+    error_path = output / "errors" / f"{window_id}.json"
+    if error_path.exists():
+        error_path.unlink()
     return {
         "window_id": window_id,
         "prepared": False,

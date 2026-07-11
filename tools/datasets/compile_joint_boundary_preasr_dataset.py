@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import re
 import sys
 from collections import Counter, deque
 from concurrent.futures import ThreadPoolExecutor
@@ -32,6 +33,12 @@ from tools.asr.cueqc.compile_pre_asr_v12_features import (  # noqa: E402
 
 SPLIT_LABEL_IDS = {"cut": 0, "continue": 1, "unsure": 2}
 IGNORE_ID = -100
+
+
+def _variant_npz_path(path: Path, variant: str) -> Path:
+    if not variant:
+        return path
+    return path.with_name(f"{path.stem}.{variant}{path.suffix}")
 
 
 def _read_jsonl(path: Path) -> list[dict[str, Any]]:
@@ -69,6 +76,8 @@ def _compile_split(
     labels: list[dict[str, Any]],
     val_percent: int,
     load_workers: int = 6,
+    feature_variant: str = "",
+    output_variant: str = "",
 ) -> dict[str, Any]:
     """Emit whole-island candidate sequences.
 
@@ -85,7 +94,8 @@ def _compile_split(
             grouped.setdefault(str(row["window_id"]), {})[
                 int(row["feature_index"])
             ] = row
-    output = dataset / "semantic_split" / "features.npz"
+    output_name = f"features.{output_variant}.npz" if output_variant else "features.npz"
+    output = dataset / "semantic_split" / output_name
     output.parent.mkdir(parents=True, exist_ok=True)
     # Frames stream to the sidecar .frames.npy: a full-dim (2048-PTM) compile
     # cannot hold an np.stack of every row on a 16GB box.
@@ -110,7 +120,15 @@ def _compile_split(
     def _load_window_arrays(window: dict[str, Any]) -> dict[str, np.ndarray]:
         # Per-window npz are zlib-compressed; decompressing in worker threads
         # (zlib releases the GIL) keeps the single writer thread fed.
-        with np.load(window["semantic_split_features"]) as handle:
+        feature_path = _variant_npz_path(
+            Path(str(window["semantic_split_features"])), feature_variant
+        )
+        if not feature_path.exists():
+            raise FileNotFoundError(
+                f"semantic split feature variant {feature_variant!r} missing: "
+                f"{feature_path}"
+            )
+        with np.load(feature_path) as handle:
             return {key: np.asarray(handle[key]) for key in handle.files}
 
     pool = ThreadPoolExecutor(max_workers=load_workers)
@@ -202,7 +220,8 @@ def _compile_split(
         "partition_unit": "video_id",
         "val_percent": val_percent,
     }
-    _write_json(dataset / "semantic_split" / "summary.json", summary)
+    summary_name = f"summary.{output_variant}.json" if output_variant else "summary.json"
+    _write_json(dataset / "semantic_split" / summary_name, summary)
     return summary
 
 
@@ -370,7 +389,7 @@ def run(args: argparse.Namespace) -> None:
         raise ValueError("source_windows.jsonl is empty")
     if not split_labels:
         raise ValueError("semantic_split/labels.jsonl is empty")
-    if not pre_asr_labels_path.exists():
+    if not args.split_only and not pre_asr_labels_path.exists():
         raise ValueError("pre_asr/labels.jsonl is missing")
     split_summary = _compile_split(
         dataset=dataset,
@@ -378,7 +397,12 @@ def run(args: argparse.Namespace) -> None:
         labels=split_labels,
         val_percent=args.val_percent,
         load_workers=args.load_workers,
+        feature_variant=args.semantic_split_feature_variant,
+        output_variant=args.semantic_split_output_variant,
     )
+    if args.split_only:
+        print(json.dumps({"semantic_split": split_summary["count"]}, ensure_ascii=False))
+        return
     override_paths: list[Path] = []
     for raw in args.pre_asr_label_overrides or []:
         path = Path(raw)
@@ -429,6 +453,21 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--val-percent", type=int, default=20)
     parser.add_argument(
+        "--semantic-split-feature-variant",
+        default="",
+        help="Read per-window semantic_split_features.<variant>.npz artifacts.",
+    )
+    parser.add_argument(
+        "--semantic-split-output-variant",
+        default="",
+        help="Write semantic_split/features.<variant>.npz instead of the canonical output.",
+    )
+    parser.add_argument(
+        "--split-only",
+        action="store_true",
+        help="Compile only Semantic Split and leave Pre-ASR artifacts untouched.",
+    )
+    parser.add_argument(
         "--pre-asr-label-overrides",
         action="append",
         default=None,
@@ -445,8 +484,16 @@ def parse_args() -> argparse.Namespace:
         help="Window-npz decompression threads feeding the frame writer.",
     )
     args = parser.parse_args()
+    if args.semantic_split_feature_variant and not args.semantic_split_output_variant:
+        args.semantic_split_output_variant = args.semantic_split_feature_variant
     if not 1 <= args.val_percent <= 50:
         parser.error("--val-percent must be between 1 and 50")
+    for value in (
+        args.semantic_split_feature_variant,
+        args.semantic_split_output_variant,
+    ):
+        if value and not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", value):
+            parser.error(f"invalid semantic split variant: {value!r}")
     return args
 
 

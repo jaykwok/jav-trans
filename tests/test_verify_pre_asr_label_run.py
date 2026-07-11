@@ -101,3 +101,33 @@ def test_verify_run_reports_missing_candidate(tmp_path: Path) -> None:
     assert summary["complete"] is False
     assert summary["missing_candidate_id_count"] == 1
     assert summary["missing_candidate_ids_sample"] == ["preasr-w00-chunk00001"]
+
+
+def test_verify_run_ignores_stale_error_for_completed_window(tmp_path: Path) -> None:
+    dataset = _dataset(tmp_path)
+    output = tmp_path / "output"
+    _write_json(
+        output / "joint_labels" / "w00.json",
+        {
+            "window_id": "w00",
+            "pre_asr_labels": [
+                {
+                    "candidate_id": "preasr-w00-chunk00000",
+                    "label": "definite_drop",
+                    "training_label_included": True,
+                },
+                {
+                    "candidate_id": "preasr-w00-chunk00001",
+                    "label": "definite_keep",
+                    "training_label_included": True,
+                },
+            ],
+        },
+    )
+    _write_json(output / "errors" / "w00.json", {"window_id": "w00"})
+
+    summary = verify_run(dataset_dir=dataset, output_dir=output)
+
+    assert summary["complete"] is True
+    assert summary["error_count"] == 0
+    assert summary["stale_error_count"] == 1

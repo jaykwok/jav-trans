@@ -67,3 +67,32 @@ def test_compile_split_emits_whole_islands_with_ignore_context(tmp_path: Path) -
     assert summary["labeled_count"] == 1
     assert summary["context_only_count"] == 1
     assert summary["group_count"] == 1
+
+
+def test_compile_split_reads_and_writes_named_variant(tmp_path: Path) -> None:
+    canonical = tmp_path / "w0" / "semantic_split_features.npz"
+    canonical.parent.mkdir(parents=True)
+    _write_window_bundle(canonical)
+    variant = canonical.with_name("semantic_split_features.06b.npz")
+    _write_window_bundle(variant)
+    windows = [
+        {
+            "window_id": "w0",
+            "video_id": "vid0",
+            "semantic_split_features": str(canonical),
+        }
+    ]
+    labels = [{"window_id": "w0", "feature_index": 1, "label": "cut"}]
+
+    summary = _compile_split(
+        dataset=tmp_path,
+        windows=windows,
+        labels=labels,
+        val_percent=20,
+        feature_variant="06b",
+        output_variant="06b",
+    )
+
+    assert summary["output"].endswith("features.06b.npz")
+    assert (tmp_path / "semantic_split" / "features.06b.npz").exists()
+    assert (tmp_path / "semantic_split" / "summary.06b.json").exists()

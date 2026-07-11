@@ -904,10 +904,11 @@ def build_audit(
     cut_audio: bool = True,
     force: bool = False,
     refresh_nav: bool = False,
+    false_drop_only: bool = False,
 ) -> dict[str, Any]:
     output_dir.mkdir(parents=True, exist_ok=True)
-    t050_rows = read_jsonl(t050_paired_jsonl)
-    t095_rows = read_jsonl(t095_paired_jsonl)
+    t050_rows = [] if false_drop_only else read_jsonl(t050_paired_jsonl)
+    t095_rows = [] if false_drop_only else read_jsonl(t095_paired_jsonl)
     long_rows_by_path = {str(path): read_jsonl(path) for path in long_false_drop_jsonls}
     selected, pool_summary = select_repair_pools(
         t050_rows=t050_rows,
@@ -945,6 +946,7 @@ def build_audit(
         "source_windows": project_rel(source_windows_jsonl),
         "t050_paired": project_rel(t050_paired_jsonl),
         "t095_paired": project_rel(t095_paired_jsonl),
+        "false_drop_only": false_drop_only,
         "long_false_drop_jsonls": [project_rel(path) for path in long_false_drop_jsonls],
         "a2_limit": a2_limit,
         "seed": seed,
@@ -987,6 +989,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--skip-audio-cut", action="store_true")
     parser.add_argument("--force", action="store_true")
     parser.add_argument("--refresh-nav", action="store_true")
+    parser.add_argument(
+        "--false-drop-only",
+        action="store_true",
+        help="Build only the supplied false-drop manifests; do not load historical A1/A2 defaults.",
+    )
     return parser.parse_args(argv)
 
 
@@ -1011,6 +1018,7 @@ def main(argv: list[str] | None = None) -> int:
         cut_audio=not args.skip_audio_cut,
         force=args.force,
         refresh_nav=args.refresh_nav,
+        false_drop_only=args.false_drop_only,
     )
     print(json.dumps(summary, ensure_ascii=False, indent=2, sort_keys=True))
     return 0

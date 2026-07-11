@@ -7,6 +7,7 @@ from boundary.sequence_features import parse_extra_context_scales
 from tools.datasets.refresh_joint_split_features import (
     expected_bins,
     rebuild_npz_arrays,
+    variant_npz_path,
 )
 
 
@@ -47,3 +48,11 @@ def test_rebuild_rejects_row_count_mismatch() -> None:
     scalars = [np.zeros(13, dtype=np.float32)] * 2
     with pytest.raises(ValueError, match="row count mismatch"):
         rebuild_npz_arrays(original, frames, scalars)
+
+
+def test_variant_npz_path_keeps_canonical_artifact_untouched(tmp_path) -> None:
+    source = tmp_path / "semantic_split_features.npz"
+    assert variant_npz_path(source, "06b") == (
+        tmp_path / "semantic_split_features.06b.npz"
+    )
+    assert variant_npz_path(source, "") == source

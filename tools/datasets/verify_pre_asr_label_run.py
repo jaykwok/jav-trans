@@ -73,11 +73,13 @@ def _raw_response_count(output_dir: Path) -> int:
     return sum(1 for _path in raw_dir.rglob("*.json"))
 
 
-def _error_count(output_dir: Path) -> int:
+def _error_count(output_dir: Path, *, completed_windows: set[str]) -> tuple[int, int]:
     errors_dir = output_dir / "errors"
     if not errors_dir.exists():
-        return 0
-    return sum(1 for _path in errors_dir.glob("*.json"))
+        return 0, 0
+    paths = list(errors_dir.glob("*.json"))
+    unresolved = sum(1 for path in paths if path.stem not in completed_windows)
+    return unresolved, len(paths) - unresolved
 
 
 def verify_run(*, dataset_dir: Path, output_dir: Path) -> dict[str, Any]:
@@ -112,13 +114,17 @@ def verify_run(*, dataset_dir: Path, output_dir: Path) -> dict[str, Any]:
     unexpected_ids = sorted(set(label_candidate_ids) - expected_candidate_set)
     pre_asr_labels_jsonl = output_dir / "pre_asr_labels.jsonl"
     jsonl_count = len(read_jsonl(pre_asr_labels_jsonl)) if pre_asr_labels_jsonl.exists() else 0
+    error_count, stale_error_count = _error_count(
+        output_dir,
+        completed_windows=completed_windows,
+    )
     complete = (
         len(completed_windows) == len(source_windows)
         and len(pre_asr_labels) == len(expected_candidate_ids)
         and not duplicate_ids
         and not missing_ids
         and not unexpected_ids
-        and _error_count(output_dir) == 0
+        and error_count == 0
     )
     return {
         "schema": SUMMARY_SCHEMA,
@@ -130,7 +136,8 @@ def verify_run(*, dataset_dir: Path, output_dir: Path) -> dict[str, Any]:
         "pre_asr_label_count": len(pre_asr_labels),
         "pre_asr_labels_jsonl_count": jsonl_count,
         "raw_response_count": _raw_response_count(output_dir),
-        "error_count": _error_count(output_dir),
+        "error_count": error_count,
+        "stale_error_count": stale_error_count,
         "training_label_included_count": included_count,
         "training_label_excluded_count": len(pre_asr_labels) - included_count,
         "label_counts": dict(sorted(label_counts.items())),
