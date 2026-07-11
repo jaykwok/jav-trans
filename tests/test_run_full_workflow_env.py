@@ -61,7 +61,7 @@ def test_run_full_workflow_boundary_threshold_defaults_match_training_eval(monke
     assert args.speech_boundary_threshold == 0.15
     assert args.speech_boundary_speech_on_threshold == 0.15
     assert args.speech_boundary_speech_off_threshold == 0.15
-    assert args.pre_asr_cueqc_drop_threshold == 0.95
+    assert args.pre_asr_cueqc_drop_threshold is None
     assert not hasattr(args, "cueqc_shadow_enabled")
 
 
@@ -242,6 +242,17 @@ def test_run_full_workflow_cli_batch_overrides_loaded_env(monkeypatch):
     assert run_full_workflow.os.environ["SPEECH_BOUNDARY_JA_SPEECH_OFF_THRESHOLD"] == "0.5"
     assert "SPEECH_BOUNDARY_JA_SPLIT_MIN_PRIMARY_SCORE" not in run_full_workflow.os.environ
     assert "SPEECH_BOUNDARY_JA_DENSE_CUT_GAP_S" not in run_full_workflow.os.environ
+
+
+def test_run_full_workflow_unset_cueqc_threshold_uses_checkpoint(monkeypatch):
+    monkeypatch.setattr(run_full_workflow, "load_config", lambda: None)
+    monkeypatch.delenv("PRE_ASR_CUEQC_DROP_THRESHOLD", raising=False)
+    args = run_full_workflow.parse_args(["--video", "sample.mp4"])
+
+    run_full_workflow.configure_env(args)
+
+    assert args.pre_asr_cueqc_drop_threshold is None
+    assert "PRE_ASR_CUEQC_DROP_THRESHOLD" not in run_full_workflow.os.environ
 
 
 def test_run_full_workflow_summary_uses_pre_asr_cueqc_only(tmp_path):

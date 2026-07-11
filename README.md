@@ -130,16 +130,15 @@ Windows 打包版会自带 CUDA 版 PyTorch runtime，但仍需要用户本机 N
   -> Outer Edge Refiner v1
      - 只修整条 speech island 的 start/end
   -> Boundary Proposal / Semantic Split
-     - 1.7B 当前使用 learned proposer v1 + Semantic Split v2
-     - 0.6B 暂保留 acoustic proposals + Semantic Split v1
+     - 0.6B / 1.7B 均使用 repo-bound learned proposer v1 + Semantic Split v2
      - 对 core 内候选判断 cut / continue / unsure
   -> Cut Edge Refiner v1
      - 只精修已确认候选
      - 相邻 chunk 共用一个 source absolute cut timestamp
   -> chunk packing / boundary-cache
-  -> 可选 Pre-ASR CueQC v11
+  -> 可选 Pre-ASR CueQC v12
      - keep_for_asr / drop_before_asr
-     - local PTM 表征 + 前后差分 + Mamba 时序上下文
+     - PTM token attention + semantic auxiliary + late fusion + valid-prefix temporal
      - drop 的 chunk 不导出 wav、不进入 ASR
   -> ASR wav chunk export
   -> Qwen ASR text transcription
@@ -163,6 +162,7 @@ Windows 打包版会自带 CUDA 版 PyTorch runtime，但仍需要用户本机 N
 - `20 / (24000/1001)` 是字幕最短显示和 micro chunk 风险线，不是 runtime duration-only drop 阈值。
 - 7 秒是字幕显示 soft guard，不是 ASR chunk 上限。
 - Runtime 不使用具体词黑名单或时长启发式删除短促人声；是否进入 ASR 由 Pre-ASR CueQC 模型标签决定。
+- Split v2 与 CueQC v12 不提供 bootstrap candidate、旧 schema 或 hard-rule fallback；不兼容工件会直接报错。
 
 ---
 
@@ -177,7 +177,7 @@ Windows 打包版会自带 CUDA 版 PyTorch runtime，但仍需要用户本机 N
 | 默认高质量 ASR | `jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame-hf` |
 | 低配 / 更快 ASR | `jaykwok/Qwen3-ASR-0.6B-JA-Anime-Galgame-hf` |
 
-同一个 ASR repo id 决定 frozen PTM feature 和前置链 checkpoint registry key。`0.6B` 仍是五阶段 checkpoint；当前 `1.7B` 在五阶段链基础上额外绑定 Boundary Proposal Scorer，与 Split v2 一起作为同 repo 的生产 artifact，不能跨 repo 复用或转换权重。
+同一个 ASR repo id 决定 frozen PTM feature 和前置链 checkpoint registry key。`0.6B` 与 `1.7B` 都绑定六个生产 artifact（五阶段模型 + Boundary Proposal Scorer），不能跨 repo 复用或转换权重。
 
 生产 checkpoint 均为自包含文件，不从 `agents/temp` 加载：
 
@@ -185,10 +185,10 @@ Windows 打包版会自带 CUDA 版 PyTorch runtime，但仍需要用户本机 N
 | --- | --- |
 | SpeechIslandScorer | `src/boundary/ja/checkpoints/speech_island_scorer_v8.<repo-tag>.pt` |
 | Outer Edge Refiner | `src/boundary/checkpoints/outer_edge_refiner_v1.<repo-tag>.pt` |
-| Boundary Proposal Scorer | `src/boundary/ja/checkpoints/boundary_proposal_scorer_v1.<repo-tag>.pt`（当前 1.7B） |
-| Semantic Split Model | `src/boundary/checkpoints/semantic_split_model_v1/v2.<repo-tag>.pt` |
+| Boundary Proposal Scorer | `src/boundary/ja/checkpoints/boundary_proposal_scorer_v1.<repo-tag>.pt` |
+| Semantic Split Model | `src/boundary/checkpoints/semantic_split_model_v2.<repo-tag>.pt` |
 | Cut Edge Refiner | `src/boundary/checkpoints/cut_edge_refiner_v1.<repo-tag>.pt` |
-| Pre-ASR CueQC | `src/asr/checkpoints/pre_asr_cueqc_v11.<repo-tag>.pt` |
+| Pre-ASR CueQC | `src/asr/checkpoints/pre_asr_cueqc_v12.<repo-tag>.pt` |
 
 每个文件的 `metadata.artifact` 记录生产文件名、模型角色、流水线序号、训练 run、promotion 时间和 repo 绑定。Web 页面会显示前置链独立阶段进度，并在切换 `0.6B` / `1.7B` 时按 repo id 自动选择同系列 checkpoint。
 
@@ -208,38 +208,39 @@ Scorer 只负责高召回找 speech island。acoustic valley 可以生成候选�
 
 | 模型 | Schema / runtime adapter | 职责 |
 | --- | --- | --- |
-| Boundary Proposal Scorer | `speech_boundary_ja_boundary_proposal_scorer_v1` | 1.7B learned split-candidate proposal source |
+| Boundary Proposal Scorer | `speech_boundary_ja_boundary_proposal_scorer_v1` | repo-bound learned split-candidate proposal source |
 | Outer Edge Refiner | `outer_edge_refiner_v1` / `speech_island_outer_edges_v1` | 只修整条 island 的 start/end |
-| Semantic Split | `semantic_split_verifier_v1/v2` / `candidate_cut_continue_unsure_v1` or `island_candidate_sequence_cut_v1` | 判断 `cut/continue/unsure` |
+| Semantic Split | `semantic_split_verifier_v2` / `island_candidate_sequence_cut_v1` | 判断 `cut/continue/unsure` |
 | Cut Edge Refiner | `cut_edge_refiner_v1` / `shared_absolute_cut_v1` | 精修已确认 cut 的共享绝对时间戳 |
 
-短 core（`<=6s`）需要 `p_cut>=0.90`，其余候选需要 `p_cut>=0.75`，切分后单侧至少 `1.2s`。1.7B Split v2 从 checkpoint 内读取校准阈值，并要求 learned proposal candidates；如果 v2 会落到 bootstrap acoustic candidates，runtime 会硬报错。Outer Refiner 不处理内部边界，Split Model 不移动时间轴，Cut Refiner 不决定是否切。
+Split v2 从 repo-bound checkpoint 读取校准阈值和 log-MAD duration pressure。当前 normal threshold 为 `0.75`；short-core threshold 为 1.7B `0.775`、0.6B `0.875`；切分后单侧至少 `1.2s`。如果 v2 会落到 bootstrap acoustic candidates，runtime 会硬报错。Outer Refiner 不处理内部边界，Split Model 不移动时间轴，Cut Refiner 不决定是否切。
 
-### Pre-ASR CueQC v11
+### Pre-ASR CueQC v12
 
 | 项 | 内容 |
 | --- | --- |
-| Schema | `cueqc_pre_asr_semantic_chunk_v11_binary` |
-| Model arch | `cueqc_pre_asr_semantic_chunk_v11` |
+| Schema | `cueqc_pre_asr_semantic_chunk_v12_binary` |
+| Model arch | `cueqc_pre_asr_semantic_chunk_v12` |
 | Feature schema | `pre_asr_cueqc_features_v9` |
 | Runtime adapter | `pre_asr_semantic_chunk_sequence_v4` |
-| Architecture | repo-specific: `1.7B` 使用 local + neighbor differences + gated Mamba；`0.6B` 使用验证更稳的 local-only |
+| Architecture | PTM token attention + semantic auxiliary + late fusion + padding-invariant valid-prefix temporal |
 | Output | `keep_for_asr`, `drop_before_asr` |
-| Decision | `p_drop >= 0.95` 时 drop；低置信默认 keep |
+| Decision | 从 repo-bound checkpoint 读取：1.7B `0.50`、0.6B `0.625`；低置信默认 keep |
 
-Cue 按原始时序送入模型。`1.7B` 训练使用 sequence window，但只对平衡采样的 anchor 计算 loss；显式差分帮助 Mamba 建模邻接变化。`0.6B` 的独立 holdout 显示时序残差会降低 keep recall，因此正式 checkpoint 将 `temporal_residual_scale` 设为 `0`，保留 local branch。模型禁止使用 ASR text、token trace、decoder stats、ASR confidence 和 subtitle timing。
+Cue 按原始时序送入模型，valid-prefix 模式保证不同 padding 长度不会改变同一候选概率。模型禁止使用 ASR text、token trace、decoder stats、ASR confidence 和 subtitle timing；`hard_keep_veto`、`hard_drop_rule`、`keep_veto` 均关闭，不提供规则回退。
 
-当前 `1.7B` checkpoint 已进入默认 registry，6GB 默认配置会启用 Pre-ASR CueQC。30 部随机视频、按视频隔离的 v2 holdout 在阈值 `0.95` 下为 accuracy `84.21%`、drop precision `87.85%`、drop recall `85.95%`、semantic keep recall `81.51%`；匿名样片 C 全量 Omni 真值回归为 semantic keep recall `100%`、drop recall `98.01%`。相较旧 checkpoint，新模型优先降低 false-drop，不通过后处理时长或文本启发式补救。
+两个 repo 的 v12 checkpoint 均已进入默认 registry。1.7B 最终 gate 在阈值 `0.50` 下 drop recall `99.42%`、keep recall `100%`；0.6B 在阈值 `0.625` 下 drop recall `98.98%`、keep recall `99.90%`。所有被模型删除但真值为 keep 的候选均经过人工审计闭合。
 
-`0.6B` 五模型也已进入默认 registry，独立验证结果如下：
+`0.6B` 六个生产 artifact 已整链进入默认 registry，独立验证结果如下：
 
 | 模型 | 选定 operating point / held-out 指标 |
 | --- | --- |
 | SpeechIslandScorer | threshold `0.15`：precision `79.79%`、recall `98.25%` |
 | Outer Edge Refiner | start/end MAE `14.32/12.88ms` |
-| Semantic Split | `p_cut>=0.75`：cut precision `94.63%`、cut recall `56.59%`、continue false-cut `0.16%` |
+| Boundary Proposal Scorer | runtime-equivalent eligible proposal recall `98.98%` |
+| Semantic Split v2 | pooled-real cut F1 `62.42%`、pair isolation `87.2%`、continue false-cut `4.32%` |
 | Cut Edge Refiner | MAE `49.07ms`、p90 `138.47ms` |
-| Pre-ASR CueQC | threshold `0.95`：drop precision `98.35%`、drop recall `86.23%`、keep recall `94.87%`、false-drop `4/78` |
+| Pre-ASR CueQC v12 | threshold `0.625`：drop recall `98.98%`、keep recall `99.90%`，剩余 false-drop 全部人工判定为 drop |
 
 ### 离线字幕候选导出（审计/标注用）
 
@@ -283,11 +284,15 @@ SPEECH_BOUNDARY_JA_WINDOW_S=20
 SPEECH_BOUNDARY_JA_OVERLAP_S=4
 SEMANTIC_SPLIT_INFERENCE_BATCH_SIZE=auto
 PRE_ASR_CUEQC_ENABLED=1
+# 留空时使用当前 ASR repo 对应 v12 checkpoint 的 decision_config。
+PRE_ASR_CUEQC_DROP_THRESHOLD=
 ```
 
 ASR stage 固定由统一 GPU worker 持有 CUDA：Boundary/PTM feature extraction、Pre-ASR CueQC、ASR 和对齐都在同一个 GPU owner 进程里顺序执行，Web / 调度主进程只做任务编排、缓存索引和输出写入。OOM、CUDA 状态异常或超过 `ASR_STAGE_WORKER_VRAM_BUDGET_MB` 时会杀掉 worker，不会把 Web 主进程一起带崩。
 
-`ASR_STAGE_WORKER_VRAM_BUDGET_MB=auto` 会在唯一 CUDA worker 内读取物理显存，并以 `ASR_STAGE_WORKER_VRAM_RATIO=0.95` 计算软 OOM 线；例如 8GB 卡约为 7.6GB。也可以把该项改为明确的 MB 数。软 OOM 依据 peak allocated（reserved 只记录警告），以避免 Windows 进入共享显存后严重变慢。
+`ASR_STAGE_WORKER_VRAM_BUDGET_MB=auto` 会按物理 dedicated VRAM × `0.95` 计算软 OOM 线；RTX 4060 Ti `8188MiB` 的 cap 为约 `7779MiB`。shared VRAM 不算可用空间，发生 shared spill 即视为 soft OOM。CPU 数据处理同样以物理 RAM × `0.95` 为 OOM 线，长数据默认 streaming/memmap。
+
+Boundary cache 当前版本为 `v18`；旧 cache 不迁移。cache 签名包含 repo-bound 模型路径和运行配置，不兼容缓存会直接 miss。
 
 `ASR_BATCH_SIZE=auto` 以 5600MB 下的 repo 默认表为基线，按上述显存预算比例放缩初始 batch。ASR 发生硬/软 OOM 时会重启 worker、batch 减半，并从 Boundary cache 和 ASR checkpoint 续跑；降到 1 仍 OOM 才停止。SpeechBoundary 的 Qwen PTM 使用固定 20 秒时序窗口：窗口长度会影响 embedding、重叠平均和 scorer 结果，因此不会被当作 batch 自动放缩。
 
@@ -460,7 +465,7 @@ uv run python -m <module> --help
 - `tools.boundary.ja.evaluate_semantic_split_expert_fusion`：离线扫描主 Split 模型与 structural expert 的概率融合，分别报告 argmax 和 runtime cut threshold 指标。
 - `tools.datasets.export_omni_drop_negative_manifest`：从联合 Omni 标签导出严格 definite-drop WAV，按原视频 hash 隔离 hardmix train/val/test。
 - `tools.datasets.prepare_joint_boundary_omni_dataset`：从视频库分层随机抽取窗口，生成运行时同滤镜的 16k PCM WAV、仅供 Omni 的 16k/32kbps MP3，以及 Split/Pre-ASR 训练特征。
-- `tools.datasets.label_joint_boundary_preasr_with_omni`：每个音频窗口只调用一次 Omni，同时标注 Split `cut/continue/unsure` 与 Pre-ASR `keep/drop/ambiguous`。
+- `tools.datasets.label_joint_boundary_preasr_with_omni`：按单一任务调用 Omni；Split 每次只判断一个窗口的候选切点，Pre-ASR 每次只判断一个最终 chunk，两个标签任务不合并请求。
 - `tools.datasets.compile_joint_boundary_preasr_dataset`：按 `video_id` 隔离 train/val，编译 Split NPZ、Pre-ASR PT bundle 和数据集说明。
 - `tools.datasets.evaluate_joint_boundary_preasr_checkpoints`：在联合数据集上按视频级 train/val 评估 Split 与 Pre-ASR checkpoint，并扫描 Pre-ASR threshold。
 

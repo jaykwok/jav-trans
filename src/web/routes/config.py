@@ -156,7 +156,7 @@ def _initial_env_template_lines() -> list[str]:
         "# SPEECH_BOUNDARY_JA_WINDOW_S=20\n",
         "# SPEECH_BOUNDARY_JA_OVERLAP_S=4\n",
         "# PRE_ASR_CUEQC_ENABLED=1\n",
-        "# PRE_ASR_CUEQC_DROP_THRESHOLD=0.95\n",
+        "# PRE_ASR_CUEQC_DROP_THRESHOLD=0.625\n",
         "\n",
         "# --- Model/cache examples ---\n",
         "# HF_HOME=./models\n",

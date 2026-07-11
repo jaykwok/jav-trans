@@ -229,7 +229,12 @@ def configure_env(args: argparse.Namespace) -> None:
     else:
         os.environ.pop("PRE_ASR_CUEQC_MODEL_PATH_BY_REPO", None)
     os.environ["PRE_ASR_CUEQC_DEVICE"] = args.pre_asr_cueqc_device
-    os.environ["PRE_ASR_CUEQC_DROP_THRESHOLD"] = str(args.pre_asr_cueqc_drop_threshold)
+    if args.pre_asr_cueqc_drop_threshold is None:
+        os.environ.pop("PRE_ASR_CUEQC_DROP_THRESHOLD", None)
+    else:
+        os.environ["PRE_ASR_CUEQC_DROP_THRESHOLD"] = str(
+            args.pre_asr_cueqc_drop_threshold
+        )
     os.environ["KEEP_ASR_CHUNKS"] = "1" if args.keep_asr_chunks else "0"
     os.environ["BOUNDARY_CACHE_ENABLED"] = "1" if args.boundary_cache else "0"
     os.environ["SPEECH_BOUNDARY_JA_THRESHOLD"] = str(args.speech_boundary_threshold)
@@ -296,7 +301,11 @@ def build_context(*, args: argparse.Namespace, paths: RunPaths, video: Path):
         "PRE_ASR_CUEQC_ENABLED": "1" if args.pre_asr_cueqc_enabled else "0",
         "PRE_ASR_CUEQC_MODEL_PATH_BY_REPO": os.getenv("PRE_ASR_CUEQC_MODEL_PATH_BY_REPO", ""),
         "PRE_ASR_CUEQC_DEVICE": os.getenv("PRE_ASR_CUEQC_DEVICE", "auto"),
-        "PRE_ASR_CUEQC_DROP_THRESHOLD": str(args.pre_asr_cueqc_drop_threshold),
+        "PRE_ASR_CUEQC_DROP_THRESHOLD": (
+            ""
+            if args.pre_asr_cueqc_drop_threshold is None
+            else str(args.pre_asr_cueqc_drop_threshold)
+        ),
         "QUALITY_REPORT_ENABLED": "1",
         "QUALITY_REPORT_DIR": str(paths.root / "quality_reports"),
         "QC_HARD_FAIL": "0",
@@ -580,7 +589,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--pre-asr-cueqc-drop-threshold",
         type=float,
-        default=_env_float("PRE_ASR_CUEQC_DROP_THRESHOLD", 0.95),
+        default=_env_optional_float("PRE_ASR_CUEQC_DROP_THRESHOLD"),
+        help="Optional runtime override. Unset uses the active checkpoint decision_config.",
     )
     parser.add_argument(
         "--outer-edge-refiner-device",
@@ -678,7 +688,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         value = getattr(args, name)
         if not 0.0 <= value <= 1.0:
             parser.error(f"--{name.replace('_', '-')} must be between 0 and 1")
-    if not 0.0 <= args.pre_asr_cueqc_drop_threshold <= 1.0:
+    if (
+        args.pre_asr_cueqc_drop_threshold is not None
+        and not 0.0 <= args.pre_asr_cueqc_drop_threshold <= 1.0
+    ):
         parser.error("--pre-asr-cueqc-drop-threshold must be between 0 and 1")
     if args.speech_boundary_window_s <= 0:
         parser.error("--speech-boundary-window-s must be positive")
