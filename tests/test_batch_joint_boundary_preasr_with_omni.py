@@ -97,6 +97,7 @@ def test_prepare_shards_requests_and_disables_thinking(
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     assert manifest["model"] == "qwen3.5-omni-plus"
     assert manifest["enable_thinking"] is False
+    assert len(manifest["prepared_sha256"]) == 64
     assert manifest["exported_count"] == 3
     assert [shard["request_count"] for shard in manifest["shards"]] == [2, 1]
     lines = (batch_dir / "requests-00000.jsonl").read_text(encoding="utf-8").splitlines()
@@ -180,3 +181,181 @@ def test_submit_status_and_download_are_manifest_resumable(
     assert shard["batch_id"] == "batch-1"
     assert shard["status"] == "completed"
     assert Path(shard["output_path"]).read_bytes().startswith(b'{"custom_id":"c1"')
+
+
+def test_submit_recovers_uncertain_create_without_duplicate(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    input_path = tmp_path / "requests-00000.jsonl"
+    input_path.write_text('{"custom_id":"c1"}\n', encoding="utf-8")
+    manifest_path = tmp_path / "manifest.json"
+    manifest = {
+        "schema": batch_omni.BATCH_MANIFEST_SCHEMA,
+        "batch_dir": str(tmp_path),
+        "prompt_version": "prompt-v1",
+        "model": "qwen3.5-omni-plus",
+        "shards": [
+            {
+                "index": 0,
+                "input_path": str(input_path),
+                "sha256": batch_omni._sha256(input_path),
+                "request_count": 1,
+                "status": "submitting",
+                "input_file_id": "file-input",
+                "batch_id": "",
+                "create_attempted": True,
+            }
+        ],
+    }
+    manifest["prepared_sha256"] = batch_omni._prepared_manifest_sha256(manifest)
+    submission_key = batch_omni._submission_key(manifest, manifest["shards"][0])
+    manifest["shards"][0]["submission_key"] = submission_key
+    batch_omni._save_manifest(manifest_path, manifest)
+
+    class FakeFiles:
+        def create(self, **_kwargs):
+            raise AssertionError("resume must not upload again")
+
+    class FakeBatches:
+        def list(self, **_kwargs):
+            return {
+                "data": [
+                    {
+                        "id": "batch-existing",
+                        "status": "validating",
+                        "input_file_id": "file-input",
+                        "metadata": {"submission_key": submission_key},
+                    }
+                ]
+            }
+
+        def create(self, **_kwargs):
+            raise AssertionError("resume must not create a duplicate batch")
+
+    monkeypatch.setattr(
+        batch_omni,
+        "_provider_client",
+        lambda _args: SimpleNamespace(files=FakeFiles(), batches=FakeBatches()),
+    )
+    args = argparse.Namespace(
+        manifest=str(manifest_path),
+        env_file="",
+        base_url="",
+        timeout_s=1.0,
+        task_name="smoke",
+        completion_window="24h",
+    )
+
+    batch_omni.submit_batch(args)
+
+    stored = json.loads(manifest_path.read_text(encoding="utf-8"))
+    assert stored["shards"][0]["batch_id"] == "batch-existing"
+
+
+def test_submit_persists_upload_and_create_intent_before_remote_create(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    input_path = tmp_path / "requests-00000.jsonl"
+    input_path.write_text('{"custom_id":"c1"}\n', encoding="utf-8")
+    manifest_path = tmp_path / "manifest.json"
+    batch_omni._save_manifest(
+        manifest_path,
+        {
+            "schema": batch_omni.BATCH_MANIFEST_SCHEMA,
+            "prompt_version": "prompt-v1",
+            "model": "qwen3.5-omni-plus",
+            "shards": [
+                {
+                    "index": 0,
+                    "input_path": str(input_path),
+                    "sha256": batch_omni._sha256(input_path),
+                    "request_count": 1,
+                    "input_file_id": "",
+                    "batch_id": "",
+                }
+            ],
+        },
+    )
+
+    class FakeFiles:
+        def create(self, **_kwargs):
+            return SimpleNamespace(id="file-persisted")
+
+    class FakeBatches:
+        def create(self, **_kwargs):
+            raise TimeoutError("provider outcome unknown")
+
+    monkeypatch.setattr(
+        batch_omni,
+        "_provider_client",
+        lambda _args: SimpleNamespace(files=FakeFiles(), batches=FakeBatches()),
+    )
+    args = argparse.Namespace(
+        manifest=str(manifest_path),
+        env_file="",
+        base_url="",
+        timeout_s=1.0,
+        task_name="smoke",
+        completion_window="24h",
+    )
+
+    with pytest.raises(TimeoutError, match="outcome unknown"):
+        batch_omni.submit_batch(args)
+
+    stored = json.loads(manifest_path.read_text(encoding="utf-8"))
+    shard = stored["shards"][0]
+    assert shard["input_file_id"] == "file-persisted"
+    assert shard["create_attempted"] is True
+    assert len(shard["submission_key"]) == 64
+
+
+def test_submit_stops_when_uncertain_create_cannot_be_reconciled(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    input_path = tmp_path / "requests-00000.jsonl"
+    input_path.write_text('{"custom_id":"c1"}\n', encoding="utf-8")
+    manifest_path = tmp_path / "manifest.json"
+    manifest = {
+        "schema": batch_omni.BATCH_MANIFEST_SCHEMA,
+        "prompt_version": "prompt-v1",
+        "model": "qwen3.5-omni-plus",
+        "shards": [
+            {
+                "index": 0,
+                "input_path": str(input_path),
+                "sha256": batch_omni._sha256(input_path),
+                "request_count": 1,
+                "input_file_id": "file-input",
+                "batch_id": "",
+                "create_attempted": True,
+            }
+        ],
+    }
+    batch_omni._save_manifest(manifest_path, manifest)
+
+    class FakeBatches:
+        def list(self, **_kwargs):
+            return {"data": []}
+
+        def create(self, **_kwargs):
+            raise AssertionError("uncertain resume must not create again")
+
+    monkeypatch.setattr(
+        batch_omni,
+        "_provider_client",
+        lambda _args: SimpleNamespace(files=SimpleNamespace(), batches=FakeBatches()),
+    )
+    args = argparse.Namespace(
+        manifest=str(manifest_path),
+        env_file="",
+        base_url="",
+        timeout_s=1.0,
+        task_name="smoke",
+        completion_window="24h",
+    )
+
+    with pytest.raises(RuntimeError, match="refusing duplicate submission"):
+        batch_omni.submit_batch(args)

@@ -657,22 +657,23 @@ async def evict_old_jobs(max_age_hours: int = 48) -> int:
 
     cutoff = datetime.now(timezone.utc) - timedelta(hours=max_age_hours)
     cutoff_str = cutoff.isoformat(timespec="milliseconds")
-    job_ids: list[str] = []
+    removed_jobs: list[JobState] = []
     async with _state_lock:
-        job_ids = [
-            job_id
-            for job_id, job in _jobs.items()
+        removed_jobs = [
+            job
+            for job in _jobs.values()
             if job.status in _FINISHED_STATUSES and job.created_at < cutoff_str
         ]
-        for job_id in job_ids:
-            _jobs.pop(job_id, None)
-            _cancel_events.pop(job_id, None)
-            _last_progress_write_ts.pop(job_id, None)
-        if job_ids:
+        for job in removed_jobs:
+            _jobs.pop(job.id, None)
+            _cancel_events.pop(job.id, None)
+            _last_progress_write_ts.pop(job.id, None)
+        if removed_jobs:
             _write_jobs_unlocked()
-    for job_id in job_ids:
-        _remove_job_temp_dir(job_id)
-    return len(job_ids)
+    for job in removed_jobs:
+        _remove_job_caches(job)
+        _remove_job_temp_dir(job.id)
+    return len(removed_jobs)
 
 
 async def _eviction_loop() -> None:

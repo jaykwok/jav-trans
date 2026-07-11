@@ -79,6 +79,69 @@ def _save_manifest(path: Path, manifest: Mapping[str, Any]) -> None:
     _write_json(path, dict(manifest))
 
 
+def _prepared_manifest_sha256(manifest: Mapping[str, Any]) -> str:
+    payload = {
+        "schema": manifest.get("schema"),
+        "export_schema": manifest.get("export_schema"),
+        "model": manifest.get("model"),
+        "prompt_version": manifest.get("prompt_version"),
+        "audio_content_mode": manifest.get("audio_content_mode"),
+        "max_tokens": manifest.get("max_tokens"),
+        "shards": [
+            {
+                "index": shard.get("index"),
+                "sha256": shard.get("sha256"),
+                "request_count": shard.get("request_count"),
+            }
+            for shard in manifest.get("shards", [])
+        ],
+    }
+    encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
+def _submission_key(manifest: Mapping[str, Any], shard: Mapping[str, Any]) -> str:
+    prepared_sha = str(manifest.get("prepared_sha256") or _prepared_manifest_sha256(manifest))
+    raw = f"{prepared_sha}:{int(shard['index'])}:{shard['sha256']}"
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+def _iter_remote_batches(client: Any) -> Iterable[dict[str, Any]]:
+    page = client.batches.list(limit=100)
+    while page is not None:
+        if isinstance(page, Mapping):
+            rows = page.get("data", [])
+        else:
+            rows = getattr(page, "data", [])
+        for row in rows or []:
+            yield _object_dict(row)
+        has_next = getattr(page, "has_next_page", None)
+        if not callable(has_next) or not has_next():
+            return
+        get_next = getattr(page, "get_next_page", None)
+        if not callable(get_next):
+            return
+        page = get_next()
+
+
+def _find_submitted_batch(
+    client: Any,
+    *,
+    input_file_id: str,
+    submission_key: str,
+) -> dict[str, Any] | None:
+    for payload in _iter_remote_batches(client):
+        metadata = payload.get("metadata")
+        if not isinstance(metadata, Mapping):
+            continue
+        if (
+            str(payload.get("input_file_id") or "") == input_file_id
+            and str(metadata.get("submission_key") or "") == submission_key
+        ):
+            return payload
+    return None
+
+
 def _resolve_batch_model(requested: str) -> str:
     model = requested.strip() or DEFAULT_BATCH_MODEL
     if model not in SUPPORTED_BATCH_OMNI_MODELS:
@@ -348,12 +411,16 @@ def prepare_batch(args: argparse.Namespace) -> None:
         },
         "shards": shards,
     }
+    manifest["prepared_sha256"] = _prepared_manifest_sha256(manifest)
     _save_manifest(manifest_path, manifest)
 
 
 def submit_batch(args: argparse.Namespace) -> None:
     manifest_path = Path(args.manifest)
     manifest = _load_manifest(manifest_path)
+    if not manifest.get("prepared_sha256"):
+        manifest["prepared_sha256"] = _prepared_manifest_sha256(manifest)
+        _save_manifest(manifest_path, manifest)
     client = _provider_client(args)
     for shard in manifest["shards"]:
         if shard.get("batch_id"):
@@ -361,9 +428,39 @@ def submit_batch(args: argparse.Namespace) -> None:
         input_path = Path(shard["input_path"])
         if _sha256(input_path) != shard["sha256"]:
             raise RuntimeError(f"prepared shard changed after validation: {input_path}")
-        with input_path.open("rb") as handle:
-            uploaded = client.files.create(file=handle, purpose="batch")
-        input_file_id = str(uploaded.id)
+        input_file_id = str(shard.get("input_file_id") or "")
+        if not input_file_id:
+            with input_path.open("rb") as handle:
+                uploaded = client.files.create(file=handle, purpose="batch")
+            input_file_id = str(uploaded.id)
+            shard.update({"input_file_id": input_file_id, "status": "uploaded"})
+            _save_manifest(manifest_path, manifest)
+        submission_key = str(shard.get("submission_key") or _submission_key(manifest, shard))
+        shard["submission_key"] = submission_key
+        if shard.get("create_attempted"):
+            existing = _find_submitted_batch(
+                client,
+                input_file_id=input_file_id,
+                submission_key=submission_key,
+            )
+            if existing is None:
+                _save_manifest(manifest_path, manifest)
+                raise RuntimeError(
+                    "Batch create outcome is unknown and no matching remote task was found; "
+                    f"refusing duplicate submission for shard {shard['index']}. "
+                    "Retry status reconciliation after the provider list becomes consistent."
+                )
+            shard.update(
+                {
+                    "batch_id": str(existing["id"]),
+                    "status": str(existing.get("status") or "submitted"),
+                    "provider": existing,
+                }
+            )
+            _save_manifest(manifest_path, manifest)
+            continue
+        shard.update({"create_attempted": True, "status": "submitting"})
+        _save_manifest(manifest_path, manifest)
         batch = client.batches.create(
             input_file_id=input_file_id,
             endpoint="/v1/chat/completions",
@@ -371,7 +468,8 @@ def submit_batch(args: argparse.Namespace) -> None:
             metadata={
                 "ds_name": f"{args.task_name}-s{int(shard['index']):05d}",
                 "ds_description": "Pre-ASR CueQC one-chunk one-label Batch job",
-                "manifest_sha256": _sha256(manifest_path),
+                "prepared_manifest_sha256": str(manifest["prepared_sha256"]),
+                "submission_key": submission_key,
                 "prompt_version": str(manifest["prompt_version"]),
             },
         )

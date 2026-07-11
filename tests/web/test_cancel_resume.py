@@ -488,6 +488,10 @@ def test_remove_finished_jobs_deletes_temp_dirs_outside_state_lock(tmp_path, mon
     asyncio.run(_test_remove_finished_jobs_deletes_temp_dirs_outside_state_lock(tmp_path, monkeypatch))
 
 
+def test_evict_old_jobs_deletes_caches_outside_state_lock(tmp_path, monkeypatch):
+    asyncio.run(_test_evict_old_jobs_deletes_caches_outside_state_lock(tmp_path, monkeypatch))
+
+
 async def _test_cancel_active_job_keeps_job_temp_dir_for_retry(tmp_path, monkeypatch):
     monkeypatch.setattr(pm, "_jobs_path", tmp_path / "jobs.json")
     monkeypatch.setattr(pm, "_job_temp_dir", lambda job_id: str(tmp_path / "jobs" / job_id))
@@ -540,6 +544,40 @@ async def _test_remove_finished_jobs_deletes_temp_dirs_outside_state_lock(tmp_pa
         pm._write_jobs_unlocked()
 
     assert await pm.remove_finished_jobs() == 1
+    assert removed == [job.id]
+    assert await pm.get_job(job.id) is None
+    await _reset_pm_state()
+
+
+async def _test_evict_old_jobs_deletes_caches_outside_state_lock(tmp_path, monkeypatch):
+    monkeypatch.setattr(pm, "_jobs_path", tmp_path / "jobs.json")
+    await _reset_pm_state()
+    cleaned: list[str] = []
+    removed: list[str] = []
+
+    def fake_remove_job_caches(job: JobState) -> None:
+        assert not pm._state_lock.locked()
+        cleaned.append(job.id)
+
+    def fake_remove_job_temp_dir(job_id: str) -> None:
+        assert not pm._state_lock.locked()
+        removed.append(job_id)
+
+    monkeypatch.setattr(pm, "_remove_job_caches", fake_remove_job_caches)
+    monkeypatch.setattr(pm, "_remove_job_temp_dir", fake_remove_job_temp_dir)
+    job = JobState(
+        id="expired-job",
+        spec=JobSpec(video_paths=["sample.mp4"]),
+        created_at="2020-01-01T00:00:00.000+00:00",
+        status="done",
+        current_stage="done",
+    )
+    async with pm._state_lock:
+        pm._jobs[job.id] = job
+        pm._write_jobs_unlocked()
+
+    assert await pm.evict_old_jobs(max_age_hours=1) == 1
+    assert cleaned == [job.id]
     assert removed == [job.id]
     assert await pm.get_job(job.id) is None
     await _reset_pm_state()
