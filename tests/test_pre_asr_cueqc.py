@@ -397,7 +397,7 @@ def test_pre_asr_cueqc_load_active_validates_split_sha(monkeypatch, tmp_path: Pa
 def test_pre_asr_cueqc_load_active_rejects_explicit_v11_checkpoint(monkeypatch):
     repo_id = "jaykwok/Qwen3-ASR-0.6B-JA-Anime-Galgame-hf"
     legacy = (
-        "src/asr/checkpoints/"
+        "src/checkpoints/jaykwok-Qwen3-ASR-0.6B-JA-Anime-Galgame-hf/"
         "pre_asr_cueqc_v11.jaykwok-Qwen3-ASR-0.6B-JA-Anime-Galgame-hf.pt"
     )
     monkeypatch.setenv("PRE_ASR_CUEQC_ENABLED", "1")

@@ -76,9 +76,9 @@ def test_run_full_workflow_parse_args_uses_loaded_env(monkeypatch):
         "jaykwok/Qwen3-ASR-0.6B-JA-Anime-Galgame-hf=12,"
         "jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame-hf=4",
     )
-    outer_mapping = "jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame-hf=src/boundary/checkpoints/outer.pt"
-    split_mapping = "jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame-hf=src/boundary/checkpoints/split.pt"
-    cut_mapping = "jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame-hf=src/boundary/checkpoints/cut.pt"
+    outer_mapping = "jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame-hf=src/checkpoints/test-repo/outer.pt"
+    split_mapping = "jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame-hf=src/checkpoints/test-repo/split.pt"
+    cut_mapping = "jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame-hf=src/checkpoints/test-repo/cut.pt"
     scorer_mapping = "jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame-hf=agents/temp/scorer.pt"
     monkeypatch.setenv("OUTER_EDGE_REFINER_MODEL_PATH_BY_REPO", outer_mapping)
     monkeypatch.setenv("SEMANTIC_SPLIT_MODEL_PATH_BY_REPO", split_mapping)
@@ -131,9 +131,9 @@ def test_run_full_workflow_context_carries_boundary_env(monkeypatch, tmp_path):
     )
     monkeypatch.setenv("ASR_BATCH_SIZE", "auto")
     monkeypatch.setenv("ASR_BATCH_SIZE_BY_REPO", batch_table)
-    outer_mapping = "jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame-hf=src/boundary/checkpoints/outer.pt"
-    split_mapping = "jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame-hf=src/boundary/checkpoints/split.pt"
-    cut_mapping = "jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame-hf=src/boundary/checkpoints/cut.pt"
+    outer_mapping = "jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame-hf=src/checkpoints/test-repo/outer.pt"
+    split_mapping = "jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame-hf=src/checkpoints/test-repo/split.pt"
+    cut_mapping = "jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame-hf=src/checkpoints/test-repo/cut.pt"
     scorer_mapping = "jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame-hf=agents/temp/scorer.pt"
     monkeypatch.setenv("OUTER_EDGE_REFINER_MODEL_PATH_BY_REPO", outer_mapping)
     monkeypatch.setenv("SEMANTIC_SPLIT_MODEL_PATH_BY_REPO", split_mapping)

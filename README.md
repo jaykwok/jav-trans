@@ -168,93 +168,22 @@ Windows 打包版会自带 CUDA 版 PyTorch runtime，但仍需要用户本机 N
 
 ## 模型架构
 
-### Qwen ASR backend
+提供两个完整且互不混用的模型档：
 
-默认模型族使用 Qwen3 ASR 日语 Anime / Galgame checkpoint：
+- `jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame-hf`：默认高质量档。
+- `jaykwok/Qwen3-ASR-0.6B-JA-Anime-Galgame-hf`：低显存、更快档。
 
-| 用途 | Repo id |
-| --- | --- |
-| 默认高质量 ASR | `jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame-hf` |
-| 低配 / 更快 ASR | `jaykwok/Qwen3-ASR-0.6B-JA-Anime-Galgame-hf` |
+每个档位都绑定自己的 Speech Island、边界候选、边缘精修、Semantic Split、Cut Refiner 和 Pre-ASR CueQC。运行时根据 ASR repo id 自动选择整套模型，不能跨档混用。
 
-同一个 ASR repo id 决定 frozen PTM feature 和前置链 checkpoint registry key。`0.6B` 与 `1.7B` 都绑定六个生产 artifact（五阶段模型 + Boundary Proposal Scorer），不能跨 repo 复用或转换权重。
+所有小模型统一放在：
 
-生产 checkpoint 均为自包含文件，不从 `agents/temp` 加载：
-
-| 模型 | 正式目录与文件名 |
-| --- | --- |
-| SpeechIslandScorer | `src/boundary/ja/checkpoints/speech_island_scorer_v8.<repo-tag>.pt` |
-| Outer Edge Refiner | `src/boundary/checkpoints/outer_edge_refiner_v1.<repo-tag>.pt` |
-| Boundary Proposal Scorer | `src/boundary/ja/checkpoints/boundary_proposal_scorer_v1.<repo-tag>.pt` |
-| Semantic Split Model | `src/boundary/checkpoints/semantic_split_model_v2.<repo-tag>.pt` |
-| Cut Edge Refiner | `src/boundary/checkpoints/cut_edge_refiner_v1.<repo-tag>.pt` |
-| Pre-ASR CueQC | `src/asr/checkpoints/pre_asr_cueqc_v12.<repo-tag>.pt` |
-
-每个文件的 `metadata.artifact` 记录生产文件名、模型角色、流水线序号、训练 run、promotion 时间和 repo 绑定。Web 页面会显示前置链独立阶段进度，并在切换 `0.6B` / `1.7B` 时按 repo id 自动选择同系列 checkpoint。
-
-### SpeechIslandScorer v8
-
-| 项 | 内容 |
-| --- | --- |
-| Schema | `speech_boundary_ja_mamba2_speech_island_scorer_v8` |
-| Model type | `mamba2_speech_island_scorer` |
-| Input | 128 维 Qwen PTM frame features + MFCC |
-| Output | `speech_prob` |
-| Decoder | `speech_hysteresis_islands_v1` |
-
-Scorer 只负责高召回找 speech island。acoustic valley 可以生成候选区域，但不会直接产生最终切分。
-
-### Semantic boundary models
-
-| 模型 | Schema / runtime adapter | 职责 |
-| --- | --- | --- |
-| Boundary Proposal Scorer | `speech_boundary_ja_boundary_proposal_scorer_v1` | repo-bound learned split-candidate proposal source |
-| Outer Edge Refiner | `outer_edge_refiner_v1` / `speech_island_outer_edges_v1` | 只修整条 island 的 start/end |
-| Semantic Split | `semantic_split_verifier_v2` / `island_candidate_sequence_cut_v1` | 判断 `cut/continue/unsure` |
-| Cut Edge Refiner | `cut_edge_refiner_v1` / `shared_absolute_cut_v1` | 精修已确认 cut 的共享绝对时间戳 |
-
-Split v2 从 repo-bound checkpoint 读取校准阈值和 log-MAD duration pressure。当前 normal threshold 为 `0.75`；short-core threshold 为 1.7B `0.775`、0.6B `0.875`；切分后单侧至少 `1.2s`。如果 v2 会落到 bootstrap acoustic candidates，runtime 会硬报错。Outer Refiner 不处理内部边界，Split Model 不移动时间轴，Cut Refiner 不决定是否切。
-
-### Pre-ASR CueQC v12
-
-| 项 | 内容 |
-| --- | --- |
-| Schema | `cueqc_pre_asr_semantic_chunk_v12_binary` |
-| Model arch | `cueqc_pre_asr_semantic_chunk_v12` |
-| Feature schema | `pre_asr_cueqc_features_v9` |
-| Runtime adapter | `pre_asr_semantic_chunk_sequence_v4` |
-| Architecture | PTM token attention + semantic auxiliary + late fusion + padding-invariant valid-prefix temporal |
-| Output | `keep_for_asr`, `drop_before_asr` |
-| Decision | 从 repo-bound checkpoint 读取：1.7B `0.50`、0.6B `0.625`；低置信默认 keep |
-
-Cue 按原始时序送入模型，valid-prefix 模式保证不同 padding 长度不会改变同一候选概率。模型禁止使用 ASR text、token trace、decoder stats、ASR confidence 和 subtitle timing；`hard_keep_veto`、`hard_drop_rule`、`keep_veto` 均关闭，不提供规则回退。
-
-两个 repo 的 v12 checkpoint 均已进入默认 registry。1.7B 最终 gate 在阈值 `0.50` 下 drop recall `99.42%`、keep recall `100%`；0.6B 在阈值 `0.625` 下 drop recall `98.98%`、keep recall `99.90%`。所有被模型删除但真值为 keep 的候选均经过人工审计闭合。
-
-`0.6B` 六个生产 artifact 已整链进入默认 registry，独立验证结果如下：
-
-| 模型 | 选定 operating point / held-out 指标 |
-| --- | --- |
-| SpeechIslandScorer | threshold `0.15`：precision `79.79%`、recall `98.25%` |
-| Outer Edge Refiner | start/end MAE `14.32/12.88ms` |
-| Boundary Proposal Scorer | runtime-equivalent eligible proposal recall `98.98%` |
-| Semantic Split v2 | pooled-real cut F1 `62.42%`、pair isolation `87.2%`、continue false-cut `4.32%` |
-| Cut Edge Refiner | MAE `49.07ms`、p90 `138.47ms` |
-| Pre-ASR CueQC v12 | threshold `0.625`：drop recall `98.98%`、keep recall `99.90%`，剩余 false-drop 全部人工判定为 drop |
-
-### 离线字幕候选导出（审计/标注用）
-
-ASR-after CueQC v4 决策模型已移除（不属于 workflow，runtime 从不调用）。`export_candidates.py` 保留为离线候选导出工具，供审计页与标注流程使用，输入来自已生成产物：
-
-```powershell
-$env:PYTHONIOENCODING="utf-8"
-uv run --no-sync python tools/asr/cueqc/export_candidates.py `
-  --aligned path/to/video.aligned_segments.json `
-  --transcript path/to/video.transcript.json `
-  --output agents/temp/YYYYMMDD_HHMMSS_cueqc-offline/candidates.jsonl
+```text
+src/checkpoints/
+├── jaykwok-Qwen3-ASR-0.6B-JA-Anime-Galgame-hf/
+└── jaykwok-Qwen3-ASR-1.7B-JA-Anime-Galgame-hf/
 ```
 
-如果 `transcript.json` 与 `aligned_segments.json` 同目录同 stem，可省略 `--transcript`。
+当前 active 链使用 Split v2 和 CueQC v12，旧版本只供显式离线重放。不存在规则 fallback、旧路径 alias 或静默迁移；模型缺失、repo 不匹配或 schema 不兼容都会直接报错。实验指标、训练过程和版本决策见 `HISTORY.md`。
 
 ---
 
@@ -447,55 +376,18 @@ uv run python -m <module> --help
 常用入口：
 
 - `tools.workflows.run_full_workflow`：命令行完整工作流 smoke。
-- `tools.workflows.promote_torch_checkpoint`：把训练 checkpoint 晋升为自包含 production artifact，补齐分发 contract、验证指标和可选 Pre-ASR drop threshold。
 - `tools.web.smoke.start_server` / `submit_job` / `poll_job` / `summarize_job`：Web 服务 smoke 和任务汇总。
-- `tools.audits.audit_nav`、`tools.audits.serve_static`、`tools.audits.serve_audits.ps1`、`tools.audits.serve_audits.sh`：维护和启动本地审计导航页。
-- `tools.audits.generate_cueqc_cluster_audit_html`：生成音频审计页，支持 chunk/context 播放、筛选排序和字幕对照。
-- `tools.audits.generate_cueqc_cluster_broadcast_html`：生成独立簇级 keep/drop 广播标注页；混簇/跳过只记录 abstain。
-- `tools.audits.generate_cueqc_prediction_audit_html`：根据 `cueqc_predictions.jsonl` 采样生成 CueQC 预测 false-drop 审计页，支持混采/高置信策略与字幕对照。
-- `tools.audits.generate_subtitle_ab_compare_audit_html`：生成整片旧/新字幕 A/B 对比审计页，用于评估边界或时间轴改动效果。
-- `tools.audits.compare_pre_asr_route_coverage`：比较多个 Pre-ASR route JSONL 对参考 SRT cue 的时间覆盖；仅作覆盖诊断，不把旧 ASR 文本当真值。
-- `tools.asr.convert_qwen3_asr_to_hf`：把 legacy 非 `-hf` Qwen3-ASR fine-tune safetensors 权重迁移到 Transformers-native `-hf` layout（`thinker.audio_tower.* -> model.audio_tower.*`、`thinker.audio_tower.proj{1,2}.* -> model.multi_modal_projector.linear_{1,2}.*`、`thinker.model.* -> model.language_model.*`，并复用 `Qwen/Qwen3-ASR-*-hf` 模板文件）。
-- `tools.asr.cueqc.export_semantic_boundary_candidates`：导出五段式 boundary runtime 的最终 semantic chunks。
-- `tools.asr.cueqc.label_semantic_pre_asr_with_omni`：为 Pre-ASR v11 生成 `definite_drop/definite_keep/ambiguous_ignore` 弱标签；上传前统一转为 16k mono 32kbps MP3，长音频使用保留语义中心的窗口。
-- `tools.asr.cueqc.evaluate_pre_asr_route`：用指定 checkpoint/threshold 重放 Pre-ASR candidates，导出逐 chunk route、长 chunk 分布和指定时间区间诊断。
-- `tools.boundary.ja.build_galgame_synthetic_timeline`：生成精确时间轴训练音频；`binary_hardmix` 模式按左闭右开区间采样 `1=语义语音/0=独立噪声` 序列，支持连续噪声并隔离 source partition。
-- `tools.boundary.ja.build_runtime_semantic_split_dataset`：用当前生产 Scorer 的真实 weak-cut proposals 和正式 runtime feature provider 编译 Semantic Split 数据，同时报告候选覆盖率。
-- `tools.boundary.ja.merge_semantic_split_datasets`：按来源角色、repeat 权重及可选 label/partition 分层 fraction 合并多个 Semantic Split NPZ。
-- `tools.boundary.ja.evaluate_semantic_split_expert_fusion`：离线扫描主 Split 模型与 structural expert 的概率融合，分别报告 argmax 和 runtime cut threshold 指标。
-- `tools.datasets.export_omni_drop_negative_manifest`：从联合 Omni 标签导出严格 definite-drop WAV，按原视频 hash 隔离 hardmix train/val/test。
-- `tools.datasets.prepare_joint_boundary_omni_dataset`：从视频库分层随机抽取窗口，生成运行时同滤镜的 16k PCM WAV、仅供 Omni 的 16k/32kbps MP3，以及 Split/Pre-ASR 训练特征。
-- `tools.datasets.label_joint_boundary_preasr_with_omni`：按单一任务调用 Omni；Split 每次只判断一个窗口的候选切点，Pre-ASR 每次只判断一个最终 chunk，两个标签任务不合并请求。
-- `tools.datasets.batch_joint_boundary_preasr_with_omni`：阿里云百炼 OpenAI-compatible Batch 的 Pre-ASR 全量标注入口，提供 `prepare/submit/status/download/import/resume`，按官方 50k 请求、500MB 文件、6MB 单行限制自动分片并用 `custom_id` 回连。Batch 当前使用北京区支持的 `qwen3.5-omni-plus`；实时 `qwen3.5-omni-flash` 只用于 smoke/少量修复，二者标签不得未经 A/B 审计直接混合。
-- `tools.datasets.compile_joint_boundary_preasr_dataset`：按 `video_id` 隔离 train/val，编译 Split NPZ、Pre-ASR PT bundle 和数据集说明。
-- `tools.datasets.evaluate_joint_boundary_preasr_checkpoints`：在联合数据集上按视频级 train/val 评估 Split 与 Pre-ASR checkpoint，并扫描 Pre-ASR threshold。
+- `tools.audits.audit_nav` / `serve_audits.ps1` / `serve_audits.sh`：审计页导航与本地服务。
+- `tools.datasets.label_joint_boundary_preasr_with_omni`：实时 Omni 小规模标注。
+- `tools.datasets.batch_joint_boundary_preasr_with_omni`：Omni Batch 全量标注。
+- `tools.workflows.promote_torch_checkpoint`：晋升生产 checkpoint。
 
-Qwen3-ASR `-hf` 转换示例：
-
-```powershell
-$env:PYTHONIOENCODING='utf-8'
-uv run python -m tools.asr.convert_qwen3_asr_to_hf `
-  --source-model-dir path/to/legacy-non-hf-qwen3-asr `
-  --output-dir agents/temp/YYYYMMDD_HHMMSS_qwen3-asr-17b-ja-hf `
-  --template-repo Qwen/Qwen3-ASR-1.7B-hf `
-  --max-shard-size 2GB
-```
-
-该工具只转换模型仓库格式，不改变训练权重语义。项目 runtime 与 SFT 工具均使用支持 Qwen3-ASR 的原生 Transformers `-hf` 路径，不再依赖 `qwen-asr` 包。
+其余训练、数据集和审计工具直接通过 `uv run python -m <module> --help` 查看；实验流程与指标放在 `HISTORY.md`。
 
 命令行完整工作流 smoke：
 
 ```powershell
 uv run python -m tools.workflows.run_full_workflow --video video/<your-video>.mp4 --task-name 20260617_191654_cli-smoke --label smoke
-```
-
-Web smoke：
-
-```powershell
-uv run python -m tools.web.smoke.start_server --run-dir agents/temp/20260617_191654_web-smoke
-uv run python -m tools.web.smoke.submit_job --video-path video/<your-video>.mp4 --output-dir video --run-dir agents/temp/20260617_191654_web-smoke
-uv run python -m tools.web.smoke.poll_job --job-id-file agents/temp/20260617_191654_web-smoke/job_id.txt --run-dir agents/temp/20260617_191654_web-smoke --interval-seconds 300
-uv run python -m tools.web.smoke.summarize_job --job-id <job_id> --run-dir agents/temp/20260617_191654_web-smoke
 ```
 
 训练、诊断、实验记录和动态计划不在 README 展开；见 [HISTORY.md](HISTORY.md)。

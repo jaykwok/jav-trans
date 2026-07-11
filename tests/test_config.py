@@ -178,6 +178,17 @@ def test_active_boundary_pre_asr_registry_is_breaking_v2_v12_only() -> None:
         "pre_asr_cueqc_v12." in path
         for path in qwen.DEFAULT_PRE_ASR_CUEQC_CHECKPOINT_BY_REPO.values()
     )
+    active_mappings = (
+        qwen.DEFAULT_SPEECH_BOUNDARY_SCORER_CHECKPOINT_BY_REPO,
+        qwen.DEFAULT_SPEECH_BOUNDARY_PROPOSAL_CHECKPOINT_BY_REPO,
+        qwen.DEFAULT_OUTER_EDGE_REFINER_CHECKPOINT_BY_REPO,
+        qwen.DEFAULT_SEMANTIC_SPLIT_CHECKPOINT_BY_REPO,
+        qwen.DEFAULT_CUT_EDGE_REFINER_CHECKPOINT_BY_REPO,
+        qwen.DEFAULT_PRE_ASR_CUEQC_CHECKPOINT_BY_REPO,
+    )
+    for mapping in active_mappings:
+        for repo_id, path in mapping.items():
+            assert path.startswith(f"src/checkpoints/{qwen.qwen_asr_repo_tag(repo_id)}/")
 
 
 def test_job_context_defaults_runtime_logs_from_config(monkeypatch, tmp_path):

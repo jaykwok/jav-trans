@@ -30,21 +30,21 @@ REPO_ID = "jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame-hf"
     ("relative_path", "schema", "feature_schema", "runtime_adapter"),
     [
         (
-            "src/boundary/checkpoints/outer_edge_refiner_v1."
+            "src/checkpoints/jaykwok-Qwen3-ASR-1.7B-JA-Anime-Galgame-hf/outer_edge_refiner_v1."
             "jaykwok-Qwen3-ASR-1.7B-JA-Anime-Galgame-hf.pt",
             OUTER_EDGE_REFINER_SCHEMA,
             OUTER_EDGE_FEATURE_SCHEMA,
             OUTER_EDGE_REFINER_RUNTIME_ADAPTER,
         ),
         (
-            "src/boundary/checkpoints/semantic_split_model_v1."
+            "src/checkpoints/jaykwok-Qwen3-ASR-1.7B-JA-Anime-Galgame-hf/semantic_split_model_v1."
             "jaykwok-Qwen3-ASR-1.7B-JA-Anime-Galgame-hf.pt",
             SEMANTIC_SPLIT_SCHEMA,
             SEMANTIC_SPLIT_FEATURE_SCHEMA,
             SEMANTIC_SPLIT_RUNTIME_ADAPTER,
         ),
         (
-            "src/boundary/checkpoints/cut_edge_refiner_v1."
+            "src/checkpoints/jaykwok-Qwen3-ASR-1.7B-JA-Anime-Galgame-hf/cut_edge_refiner_v1."
             "jaykwok-Qwen3-ASR-1.7B-JA-Anime-Galgame-hf.pt",
             CUT_EDGE_REFINER_SCHEMA,
             CUT_EDGE_FEATURE_SCHEMA,
@@ -72,7 +72,7 @@ def test_semantic_split_checkpoint_is_three_class() -> None:
     torch = pytest.importorskip("torch")
     checkpoint = (
         ROOT
-        / "src/boundary/checkpoints/semantic_split_model_v1."
+        / "src/checkpoints/jaykwok-Qwen3-ASR-1.7B-JA-Anime-Galgame-hf/semantic_split_model_v1."
         "jaykwok-Qwen3-ASR-1.7B-JA-Anime-Galgame-hf.pt"
     )
     payload = torch.load(checkpoint, map_location="cpu", weights_only=False)

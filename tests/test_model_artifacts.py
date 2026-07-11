@@ -73,9 +73,10 @@ def test_promoted_five_model_artifact_contract(
 
 def test_windows_bundle_includes_all_five_model_checkpoint_roots() -> None:
     spec = Path("packaging/jav-trans-web.spec").read_text(encoding="utf-8")
-    assert '"src/boundary/ja/checkpoints"' in spec
-    assert '"src/boundary/checkpoints"' in spec
-    assert '"src/asr/checkpoints"' in spec
+    assert '"src/checkpoints"' in spec
+    assert '"src/boundary/ja/checkpoints"' not in spec
+    assert '"src/boundary/checkpoints"' not in spec
+    assert '"src/asr/checkpoints"' not in spec
     assert "libtorchcodec_custom_ops*.dll" in spec
     assert "_torchcodec_binaries()" in spec
 

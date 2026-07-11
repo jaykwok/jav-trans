@@ -15,10 +15,7 @@ It bundles:
   `PATH`, or from `-FfmpegExe` / `-FfprobeExe`
 - `src/assets/images/icon.png` for the in-app header, drop zone image, and PNG favicon
 - `src/assets/images/icon.ico` for the pywebview native window icon and packaged executable icon
-- repo-id tagged Outer Edge Refiner v1 checkpoints at `src/boundary/checkpoints/outer_edge_refiner_v1.<repo-tag>.pt`
-- repo-id tagged Semantic Split Model v1 checkpoints at `src/boundary/checkpoints/semantic_split_model_v1.<repo-tag>.pt`
-- repo-id tagged Cut Edge Refiner v1 checkpoints at `src/boundary/checkpoints/cut_edge_refiner_v1.<repo-tag>.pt`
-- repo-id tagged SpeechIslandScorer v8 checkpoints at `src/boundary/ja/checkpoints/speech_island_scorer_v8.<repo-tag>.pt`
+- all repo-bound small models under `src/checkpoints/<repo-tag>/`
 - the bundled Hugging Face inference model directories:
   - `jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame-hf`
   - `jaykwok/Qwen3-ASR-0.6B-JA-Anime-Galgame-hf`
@@ -44,13 +41,9 @@ For a small development build only, pass `-SkipModels`. That skips model
 preparation and leaves the Hugging Face model directories out of the PyInstaller
 package. Do not use `-SkipModels` for user-facing Windows builds.
 
-The PyInstaller spec treats the repo-id tagged Boundary Refiner,
-SpeechBoundary-JA scorer, and Pre-ASR CueQC checkpoint directories as required
-data directories. A build should fail if those checkpoint directories are
-missing, because normal inference does not regenerate them. Pre-ASR CueQC v11 is
-bundled as a required checkpoint at `src/asr/checkpoints/`, with both `0.6B` and
-`1.7B` `pre_asr_cueqc_v11.<repo-tag>.pt` files. It still defaults to off at
-runtime; enable it with `PRE_ASR_CUEQC_ENABLED=1`.
+The PyInstaller spec treats `src/checkpoints/` as required data. It contains one
+directory per supported ASR repo and includes both active models and explicit
+offline replay checkpoints. Normal inference does not regenerate these files.
 
 It does not bundle Microsoft Edge WebView2. Users still need the WebView2
 runtime, which is already present on most supported Windows systems. If the app

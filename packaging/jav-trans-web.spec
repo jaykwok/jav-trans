@@ -161,18 +161,7 @@ datas += copy_metadata("torchcodec")
 datas += [
     (str(_require_path("src/web/static", "web static assets")), "src/web/static"),
     (str(_require_path("src/assets", "application assets")), "src/assets"),
-    (
-        str(_require_path("src/boundary/checkpoints", "Boundary Refiner checkpoints")),
-        "src/boundary/checkpoints",
-    ),
-    (
-        str(_require_path("src/boundary/ja/checkpoints", "SpeechBoundary-JA scorer checkpoints")),
-        "src/boundary/ja/checkpoints",
-    ),
-    (
-        str(_require_path("src/asr/checkpoints", "Pre-ASR CueQC checkpoints")),
-        "src/asr/checkpoints",
-    ),
+    (str(_require_path("src/checkpoints", "repo-bound small models")), "src/checkpoints"),
 ]
 
 if not _env_bool("JAV_TRANS_SKIP_MODELS"):

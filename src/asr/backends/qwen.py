@@ -14,77 +14,46 @@ QWEN_ASR_BACKEND_REPOS: dict[str, str] = {
     QWEN_ASR_06B_REPO_ID: QWEN_ASR_06B_REPO_ID,
     QWEN_ASR_17B_REPO_ID: QWEN_ASR_17B_REPO_ID,
 }
+SMALL_MODEL_CHECKPOINT_ROOT = Path("src/checkpoints")
+
+
+def repo_checkpoint_path(repo_id: str, model_name: str, version: str) -> str:
+    repo_tag = repo_id.replace("/", "-")
+    filename = f"{model_name}_{version}.{repo_tag}.pt"
+    return (SMALL_MODEL_CHECKPOINT_ROOT / repo_tag / filename).as_posix()
+
+
 DEFAULT_QWEN_ASR_BATCH_SIZE_BY_REPO: dict[str, int] = {
     QWEN_ASR_06B_REPO_ID: 12,
     QWEN_ASR_17B_REPO_ID: 4,
 }
 DEFAULT_OUTER_EDGE_REFINER_CHECKPOINT_BY_REPO: dict[str, str] = {
-    QWEN_ASR_06B_REPO_ID: (
-        "src/boundary/checkpoints/"
-        "outer_edge_refiner_v1.jaykwok-Qwen3-ASR-0.6B-JA-Anime-Galgame-hf.pt"
-    ),
-    QWEN_ASR_17B_REPO_ID: (
-        "src/boundary/checkpoints/"
-        "outer_edge_refiner_v1.jaykwok-Qwen3-ASR-1.7B-JA-Anime-Galgame-hf.pt"
-    ),
+    repo_id: repo_checkpoint_path(repo_id, "outer_edge_refiner", "v1")
+    for repo_id in QWEN_ASR_BACKEND_REPOS
 }
 DEFAULT_SEMANTIC_SPLIT_CHECKPOINT_BY_REPO: dict[str, str] = {
-    QWEN_ASR_06B_REPO_ID: (
-        "src/boundary/checkpoints/"
-        "semantic_split_model_v2.jaykwok-Qwen3-ASR-0.6B-JA-Anime-Galgame-hf.pt"
-    ),
-    QWEN_ASR_17B_REPO_ID: (
-        "src/boundary/checkpoints/"
-        "semantic_split_model_v2.jaykwok-Qwen3-ASR-1.7B-JA-Anime-Galgame-hf.pt"
-    ),
+    repo_id: repo_checkpoint_path(repo_id, "semantic_split_model", "v2")
+    for repo_id in QWEN_ASR_BACKEND_REPOS
 }
 DEFAULT_CUT_EDGE_REFINER_CHECKPOINT_BY_REPO: dict[str, str] = {
-    QWEN_ASR_06B_REPO_ID: (
-        "src/boundary/checkpoints/"
-        "cut_edge_refiner_v1.jaykwok-Qwen3-ASR-0.6B-JA-Anime-Galgame-hf.pt"
-    ),
-    QWEN_ASR_17B_REPO_ID: (
-        "src/boundary/checkpoints/"
-        "cut_edge_refiner_v1.jaykwok-Qwen3-ASR-1.7B-JA-Anime-Galgame-hf.pt"
-    ),
+    repo_id: repo_checkpoint_path(repo_id, "cut_edge_refiner", "v1")
+    for repo_id in QWEN_ASR_BACKEND_REPOS
 }
 DEFAULT_PRE_ASR_CUEQC_CHECKPOINT_BY_REPO: dict[str, str] = {
-    QWEN_ASR_06B_REPO_ID: (
-        "src/asr/checkpoints/"
-        "pre_asr_cueqc_v12."
-        "jaykwok-Qwen3-ASR-0.6B-JA-Anime-Galgame-hf.pt"
-    ),
-    QWEN_ASR_17B_REPO_ID: (
-        "src/asr/checkpoints/"
-        "pre_asr_cueqc_v12."
-        "jaykwok-Qwen3-ASR-1.7B-JA-Anime-Galgame-hf.pt"
-    ),
+    repo_id: repo_checkpoint_path(repo_id, "pre_asr_cueqc", "v12")
+    for repo_id in QWEN_ASR_BACKEND_REPOS
 }
 # The v8 registry contains only native speech-only checkpoints. Incompatible
 # v7 speech/split weights are not converted at load time.
 DEFAULT_SPEECH_BOUNDARY_SCORER_CHECKPOINT_BY_REPO: dict[str, str] = {
-    QWEN_ASR_06B_REPO_ID: (
-        "src/boundary/ja/checkpoints/"
-        "speech_island_scorer_v8."
-        "jaykwok-Qwen3-ASR-0.6B-JA-Anime-Galgame-hf.pt"
-    ),
-    QWEN_ASR_17B_REPO_ID: (
-        "src/boundary/ja/checkpoints/"
-        "speech_island_scorer_v8."
-        "jaykwok-Qwen3-ASR-1.7B-JA-Anime-Galgame-hf.pt"
-    ),
+    repo_id: repo_checkpoint_path(repo_id, "speech_island_scorer", "v8")
+    for repo_id in QWEN_ASR_BACKEND_REPOS
 }
 # Learned boundary-proposal candidate source. Both active Split v2 chains are
 # bound to a repo-specific proposer; bootstrap candidates are not accepted.
 DEFAULT_SPEECH_BOUNDARY_PROPOSAL_CHECKPOINT_BY_REPO: dict[str, str] = {
-    QWEN_ASR_06B_REPO_ID: (
-        "src/boundary/ja/checkpoints/"
-        "boundary_proposal_scorer_v1.jaykwok-Qwen3-ASR-0.6B-JA-Anime-Galgame-hf.pt"
-    ),
-    QWEN_ASR_17B_REPO_ID: (
-        "src/boundary/ja/checkpoints/"
-        "boundary_proposal_scorer_v1.jaykwok-Qwen3-ASR-1.7B-JA-Anime-Galgame-hf.pt"
-    ),
+    repo_id: repo_checkpoint_path(repo_id, "boundary_proposal_scorer", "v1")
+    for repo_id in QWEN_ASR_BACKEND_REPOS
 }
 
 
