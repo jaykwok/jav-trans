@@ -155,13 +155,13 @@ def test_omni_missing_duplicate_and_malformed_units_become_unmatched() -> None:
     assert all(row["confidence"] == 0.0 for row in normalized)
 
 
-def test_fusion_classifies_consensus_conflict_and_single_teacher_cases() -> None:
+def test_fusion_uses_omni_as_primary_and_forced_as_validation() -> None:
     kwargs = {
         "omni_min_confidence": 0.8,
         "agreement_tolerance_s": 0.32,
     }
 
-    consensus = fuse_unit(_forced_unit(), _omni_unit(), **kwargs)
+    agreement = fuse_unit(_forced_unit(), _omni_unit(), **kwargs)
     conflict = fuse_unit(
         _forced_unit(),
         _omni_unit(start_s=2.0, end_s=2.4),
@@ -174,14 +174,17 @@ def test_fusion_classifies_consensus_conflict_and_single_teacher_cases() -> None
         **kwargs,
     )
 
-    assert consensus["source"] == "forced_omni_consensus"
-    assert consensus["trainable"] is True
-    assert conflict["source"] == "forced_omni_conflict"
+    assert agreement["source"] == "omni_primary_forced_agree"
+    assert agreement["trainable"] is True
+    assert agreement["start_s"] == 1.08
+    assert agreement["end_s"] == 1.48
+    assert conflict["source"] == "omni_primary_forced_conflict"
+    assert conflict["review_required"] is True
     assert forced_only["source"] == "forced_only_review"
-    assert omni_only["source"] == "omni_only_review"
+    assert omni_only["source"] == "omni_primary_unchecked"
+    assert omni_only["trainable"] is True
     assert not conflict["trainable"]
     assert not forced_only["trainable"]
-    assert not omni_only["trainable"]
 
 
 def test_fusion_summary_closes_source_and_trainable_counts(tmp_path: Path) -> None:
@@ -238,7 +241,8 @@ def test_fusion_summary_closes_source_and_trainable_counts(tmp_path: Path) -> No
         )
     )
 
-    assert summary["source_counts"] == {"forced_omni_consensus": 2}
+    assert summary["source_counts"] == {"omni_primary_forced_agree": 2}
+    assert summary["selection_policy"] == "omni_primary_forced_validation"
     assert summary["trainable_item_count"] == 1
     assert row["trainable_coverage"] == 1.0
     assert row["absolute_display_start_s"] > 10.0
@@ -282,7 +286,7 @@ def test_timeline_audit_contains_audio_and_three_teacher_lanes(tmp_path: Path) -
                         "start_s": 1.04,
                         "end_s": 1.44,
                         "trainable": True,
-                        "source": "forced_omni_consensus",
+                        "source": "omni_primary_forced_agree",
                         "forced_score": 0.9,
                         "omni_confidence": 0.95,
                         "start_delta_s": 0.08,
@@ -314,4 +318,4 @@ def test_timeline_audit_contains_audio_and_three_teacher_lanes(tmp_path: Path) -
     assert 'data-track="fused"' in page
     assert 'class="lane-label">Forced' in page
     assert 'class="lane-label">Omni' in page
-    assert 'class="lane-label">Fused' in page
+    assert 'class="lane-label">Selected' in page

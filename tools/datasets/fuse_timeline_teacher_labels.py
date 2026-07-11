@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Any
 
 
-SCHEMA = "timeline_teacher_fused_label_v1"
+SCHEMA = "timeline_teacher_fused_label_v2"
 
 
 def _read_jsonl(path: Path) -> list[dict[str, Any]]:
@@ -46,22 +46,32 @@ def fuse_unit(
     )
     source = "unresolved"
     trainable = False
+    review_required = False
+    teacher_agreement = "unresolved"
     start_s = end_s = 0.0
     start_delta = end_delta = None
-    if forced_ready and omni_ready:
-        start_delta = abs(float(forced["start_s"]) - float(omni["start_s"]))
-        end_delta = abs(float(forced["end_s"]) - float(omni["end_s"]))
-        if max(start_delta, end_delta) <= agreement_tolerance_s:
-            start_s = (float(forced["start_s"]) + float(omni["start_s"])) / 2.0
-            end_s = (float(forced["end_s"]) + float(omni["end_s"])) / 2.0
-            source = "forced_omni_consensus"
-            trainable = True
+    if omni_ready:
+        start_s = float(omni["start_s"])
+        end_s = float(omni["end_s"])
+        if forced_ready:
+            start_delta = abs(float(forced["start_s"]) - start_s)
+            end_delta = abs(float(forced["end_s"]) - end_s)
+            if max(start_delta, end_delta) <= agreement_tolerance_s:
+                source = "omni_primary_forced_agree"
+                teacher_agreement = "agree"
+                trainable = True
+            else:
+                source = "omni_primary_forced_conflict"
+                teacher_agreement = "conflict"
+                review_required = True
         else:
-            source = "forced_omni_conflict"
+            source = "omni_primary_unchecked"
+            teacher_agreement = "forced_missing"
+            trainable = True
     elif forced_ready:
         source = "forced_only_review"
-    elif omni_ready:
-        source = "omni_only_review"
+        teacher_agreement = "omni_missing"
+        review_required = True
     return {
         "unit_id": forced["unit_id"],
         "text": forced["text"],
@@ -69,6 +79,8 @@ def fuse_unit(
         "end_s": end_s,
         "source": source,
         "trainable": trainable,
+        "review_required": review_required,
+        "teacher_agreement": teacher_agreement,
         "forced_score": forced_score,
         "omni_confidence": omni_confidence,
         "start_delta_s": start_delta,
@@ -141,7 +153,8 @@ def fuse(
         encoding="utf-8",
     )
     summary = {
-        "schema": "timeline_teacher_fusion_summary_v1",
+        "schema": "timeline_teacher_fusion_summary_v2",
+        "selection_policy": "omni_primary_forced_validation",
         "item_count": len(rows),
         "trainable_item_count": trainable_items,
         "source_counts": source_counts,
