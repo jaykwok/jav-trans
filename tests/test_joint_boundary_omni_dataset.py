@@ -313,6 +313,9 @@ def test_empty_pre_asr_audio_api_error_becomes_drop(
     )
     monkeypatch.setattr(joint_omni, "slice_audio_clip", fake_slice_audio_clip)
     monkeypatch.setattr(joint_omni, "_call_with_retry", fake_call_with_retry)
+    stale_error = tmp_path / "out" / "errors" / "w01.json"
+    stale_error.parent.mkdir(parents=True, exist_ok=True)
+    stale_error.write_text("{}\n", encoding="utf-8")
 
     result = joint_omni._process_window(
         {
@@ -353,6 +356,7 @@ def test_empty_pre_asr_audio_api_error_becomes_drop(
     assert label["label"] == "definite_drop"
     assert label["training_label_included"] is True
     assert label["local_fallback"] == "empty_audio_to_definite_drop"
+    assert not stale_error.exists()
 
 
 def test_api_moderation_rejected_pre_asr_chunk_becomes_ignore(

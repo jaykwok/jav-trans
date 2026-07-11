@@ -9,6 +9,7 @@ import torch
 
 from boundary.split_model import load_semantic_split_verifier
 from tools.boundary.ja.train_semantic_split_island_model import (
+    build_lr_scheduler,
     calibrate_thresholds,
     island_batches,
     load_island_dataset,
@@ -91,6 +92,27 @@ def test_island_batches_respect_candidate_cap() -> None:
         ["a", "b", "c"], groups, batch_islands=8, max_batch_candidates=8
     )
     assert [len(batch) for batch in batches] == [2, 1]
+
+
+def test_cosine_scheduler_uses_lr_multipliers() -> None:
+    parameter = torch.nn.Parameter(torch.zeros(()))
+    optimizer = torch.optim.AdamW([parameter], lr=2e-4)
+    scheduler = build_lr_scheduler(
+        optimizer,
+        schedule="cosine",
+        warmup_steps=2,
+        max_steps=6,
+    )
+
+    assert scheduler is not None
+    assert optimizer.param_groups[0]["lr"] == 1e-4
+    optimizer.step()
+    scheduler.step()
+    assert optimizer.param_groups[0]["lr"] == 2e-4
+    for _ in range(5):
+        optimizer.step()
+        scheduler.step()
+    assert optimizer.param_groups[0]["lr"] == 0.0
 
 
 def test_trainer_smoke_produces_calibrated_v2_checkpoint(tmp_path: Path) -> None:

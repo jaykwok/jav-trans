@@ -279,6 +279,7 @@ def _reload_pipeline(monkeypatch, tmp_path: Path, *, enable_cueqc: bool = False)
     monkeypatch.setenv("BOUNDARY_FEATURE_FRAME_HOP_S", "0.02")
     monkeypatch.setenv("ASR_CHUNK_ROOT", str(tmp_path / "chunks"))
     monkeypatch.setenv("ASR_CHECKPOINT_ENABLED", "0")
+    monkeypatch.setenv("PRE_ASR_CUEQC_ENABLED", "0")
     if enable_cueqc:
         monkeypatch.setenv("CUEQC_SHADOW_ENABLED", "1")
     else:

@@ -49,6 +49,12 @@ from tools.boundary.ja.build_feature_cache import (  # noqa: E402
 BACKUP_SUFFIX = ".pre_refresh.npz"
 
 
+def variant_npz_path(path: Path, variant: str) -> Path:
+    if not variant:
+        return path
+    return path.with_name(f"{path.stem}.{variant}{path.suffix}")
+
+
 def expected_bins(extra_context_scales: list[Mapping[str, Any]]) -> int:
     return 20 + sum(
         int(scale["left_bins"]) + int(scale["right_bins"])
@@ -193,6 +199,7 @@ def run(args: argparse.Namespace) -> None:
         "extra_context_scales": args.extra_context_scales,
         "ptm_projection": args.ptm_projection,
         "target_bins": target_bins,
+        "feature_variant": args.feature_variant,
         "datasets": [],
     }
     try:
@@ -202,11 +209,13 @@ def run(args: argparse.Namespace) -> None:
             refreshed = skipped = empty = 0
             started = time.perf_counter()
             for index, row in enumerate(rows):
-                npz_path = Path(str(row["semantic_split_features"]))
+                source_npz_path = Path(str(row["semantic_split_features"]))
+                npz_path = variant_npz_path(source_npz_path, args.feature_variant)
                 meta_path = Path(str(row["semantic_split_metadata"]))
-                if not npz_path.exists() or not meta_path.exists():
-                    raise FileNotFoundError(f"missing split artifacts: {npz_path}")
-                with np.load(npz_path) as handle:
+                if not source_npz_path.exists() or not meta_path.exists():
+                    raise FileNotFoundError(f"missing split artifacts: {source_npz_path}")
+                load_path = npz_path if npz_path.exists() else source_npz_path
+                with np.load(load_path) as handle:
                     original = {key: np.asarray(handle[key]) for key in handle.files}
                 frame_shape = original["frame_features"].shape
                 if frame_shape[0] == 0:
@@ -276,9 +285,10 @@ def run(args: argparse.Namespace) -> None:
                     frame_rows.append(frames)
                     scalar_rows.append(scalars)
                 arrays = rebuild_npz_arrays(original, frame_rows, scalar_rows)
-                backup = npz_path.with_name(npz_path.stem + BACKUP_SUFFIX)
-                if not backup.exists():
-                    shutil.copy2(npz_path, backup)
+                if not args.feature_variant:
+                    backup = npz_path.with_name(npz_path.stem + BACKUP_SUFFIX)
+                    if not backup.exists():
+                        shutil.copy2(npz_path, backup)
                 np.savez_compressed(npz_path, **arrays)
                 refreshed += 1
                 if args.log_every and (index + 1) % args.log_every == 0:
@@ -319,6 +329,14 @@ def parse_args() -> argparse.Namespace:
         )
     )
     parser.add_argument("--dataset", action="append", required=True)
+    parser.add_argument(
+        "--feature-variant",
+        default="",
+        help=(
+            "Write sibling semantic_split_features.<variant>.npz artifacts "
+            "instead of replacing the canonical feature files."
+        ),
+    )
     parser.add_argument("--scorer-checkpoint", required=True)
     parser.add_argument("--ptm-repo-id", required=True)
     parser.add_argument("--model-path", required=True)

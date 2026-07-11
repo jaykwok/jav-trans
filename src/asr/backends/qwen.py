@@ -31,10 +31,8 @@ DEFAULT_OUTER_EDGE_REFINER_CHECKPOINT_BY_REPO: dict[str, str] = {
 DEFAULT_SEMANTIC_SPLIT_CHECKPOINT_BY_REPO: dict[str, str] = {
     QWEN_ASR_06B_REPO_ID: (
         "src/boundary/checkpoints/"
-        "semantic_split_model_v1.jaykwok-Qwen3-ASR-0.6B-JA-Anime-Galgame-hf.pt"
+        "semantic_split_model_v2.jaykwok-Qwen3-ASR-0.6B-JA-Anime-Galgame-hf.pt"
     ),
-    # 1.7B promoted to Split v2 (island-sequence, learned-projector deploy
-    # checkpoint). 0.6B stays on v1 until its full chain is retrained in G.
     QWEN_ASR_17B_REPO_ID: (
         "src/boundary/checkpoints/"
         "semantic_split_model_v2.jaykwok-Qwen3-ASR-1.7B-JA-Anime-Galgame-hf.pt"
@@ -53,7 +51,7 @@ DEFAULT_CUT_EDGE_REFINER_CHECKPOINT_BY_REPO: dict[str, str] = {
 DEFAULT_PRE_ASR_CUEQC_CHECKPOINT_BY_REPO: dict[str, str] = {
     QWEN_ASR_06B_REPO_ID: (
         "src/asr/checkpoints/"
-        "pre_asr_cueqc_v11."
+        "pre_asr_cueqc_v12."
         "jaykwok-Qwen3-ASR-0.6B-JA-Anime-Galgame-hf.pt"
     ),
     QWEN_ASR_17B_REPO_ID: (
@@ -76,12 +74,13 @@ DEFAULT_SPEECH_BOUNDARY_SCORER_CHECKPOINT_BY_REPO: dict[str, str] = {
         "jaykwok-Qwen3-ASR-1.7B-JA-Anime-Galgame-hf.pt"
     ),
 }
-# Learned boundary-proposal candidate source. 1.7B is promoted to the learned
-# proposer alongside its Split v2 checkpoint (the ASR pipeline hard-errors if a
-# v2 split model would consume bootstrap candidates). 0.6B has no proposer yet
-# and keeps the bootstrap energy-valley heuristic, which is legitimate only
-# while its split model stays v1; the 0.6B proposer is added in stage G.
+# Learned boundary-proposal candidate source. Both active Split v2 chains are
+# bound to a repo-specific proposer; bootstrap candidates are not accepted.
 DEFAULT_SPEECH_BOUNDARY_PROPOSAL_CHECKPOINT_BY_REPO: dict[str, str] = {
+    QWEN_ASR_06B_REPO_ID: (
+        "src/boundary/ja/checkpoints/"
+        "boundary_proposal_scorer_v1.jaykwok-Qwen3-ASR-0.6B-JA-Anime-Galgame-hf.pt"
+    ),
     QWEN_ASR_17B_REPO_ID: (
         "src/boundary/ja/checkpoints/"
         "boundary_proposal_scorer_v1.jaykwok-Qwen3-ASR-1.7B-JA-Anime-Galgame-hf.pt"

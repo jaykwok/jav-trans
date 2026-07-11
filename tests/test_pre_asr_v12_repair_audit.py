@@ -148,3 +148,34 @@ def test_build_repair_audit_writes_manifest_summary_and_save_labels_page(tmp_pat
     assert "chunk" in html
     assert "context" in html
     assert "physical dedicated VRAM * 0.95" in stored_summary["oom_discipline"]["gpu_oom_definition"]
+
+
+def test_build_false_drop_only_skips_historical_paired_pools(tmp_path: Path) -> None:
+    audio_path = tmp_path / "source.wav"
+    audio_path.write_bytes(b"RIFF")
+    source_windows = _write_jsonl(
+        tmp_path / "source_windows.jsonl",
+        [{"window_id": "vid-w00", "video_id": "vid", "audio_wav": str(audio_path)}],
+    )
+    paired = _write_jsonl(
+        tmp_path / "paired.jsonl",
+        [_paired("vid-w00", 1, truth="drop", prediction="keep", prob_drop=0.1)],
+    )
+    false_drop = _write_jsonl(
+        tmp_path / "false_drops.jsonl",
+        [_paired("vid-w00", 2, truth="keep", prediction="drop", prob_drop=0.8)],
+    )
+
+    summary = audit.build_audit(
+        source_windows_jsonl=source_windows,
+        t050_paired_jsonl=paired,
+        t095_paired_jsonl=paired,
+        long_false_drop_jsonls=[false_drop],
+        output_dir=tmp_path / "audit",
+        cut_audio=False,
+        false_drop_only=True,
+    )
+
+    assert summary["false_drop_only"] is True
+    assert summary["review_item_count"] == 1
+    assert summary["pool_counts"] == {"B_low_threshold_long_false_drop": 1}
