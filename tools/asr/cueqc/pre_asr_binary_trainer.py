@@ -38,7 +38,7 @@ from asr.pre_asr_cueqc import (  # noqa: E402
     PreAsrCueQCNetwork,
     make_model_config,
 )
-from tools.asr.cueqc.compile_pre_asr_v11_features import (  # noqa: E402
+from tools.asr.cueqc.pre_asr_feature_compiler import (  # noqa: E402
     FEATURE_BUNDLE_SCHEMA,
     project_path,
     repo_display_path,

@@ -904,7 +904,7 @@ def sequence_tensors(
     )
     bin_mask = np.zeros((batch, max_chunks, PRE_ASR_CUEQC_MODEL_PTM_TOKENS), dtype=np.float32)
     chunk_mask = np.zeros((batch, max_chunks), dtype=np.float32)
-    positions: list[tuple[int, int]] = [(-1, -1)] * len(candidates)
+    positions: list[tuple[int, int] | None] = [None] * len(candidates)
     for group_index, group in enumerate(groups):
         for chunk_index, (original_index, candidate) in enumerate(group):
             scalar[group_index, chunk_index] = scalar_vector(
@@ -916,12 +916,14 @@ def sequence_tensors(
             bin_mask[group_index, chunk_index] = mask
             chunk_mask[group_index, chunk_index] = 1.0
             positions[original_index] = (group_index, chunk_index)
+    if any(position is None for position in positions):
+        raise RuntimeError("Pre-ASR CueQC sequence planning left candidates unassigned")
     return {
         "scalar_features": scalar,
         "ptm_bins": bins,
         "bin_mask": bin_mask,
         "chunk_mask": chunk_mask,
-        "positions": positions,
+        "positions": [position for position in positions if position is not None],
     }
 
 
@@ -1455,31 +1457,6 @@ class PreAsrCueQC:
         decisions: list[dict[str, Any]] = []
         for index, candidate in enumerate(candidates):
             group_index, chunk_index = positions[index]
-            if group_index < 0 or chunk_index < 0:
-                # No model position resolved for this candidate (upstream grouping
-                # left it unassigned). Emit a conservative keep fallback so the
-                # returned list stays 1:1 with `candidates` and downstream
-                # positional write-back cannot desync.
-                decisions.append(
-                    {
-                        "schema": "pre_asr_cueqc_decision_v2",
-                        "decision_version": PRE_ASR_CUEQC_DECISION_VERSION,
-                        "model_schema": PRE_ASR_CUEQC_SCHEMA,
-                        "model_arch": PRE_ASR_CUEQC_MODEL_ARCH,
-                        "feature_schema": PRE_ASR_CUEQC_FEATURE_SCHEMA,
-                        "runtime_adapter": PRE_ASR_CUEQC_RUNTIME_ADAPTER,
-                        "index": int(candidate.get("index", index)),
-                        "route": "keep_for_asr",
-                        "confidence": 0.0,
-                        "prob_drop": 0.0,
-                        "prob_keep": 0.0,
-                        "drop_threshold": round(self.drop_threshold, 4),
-                        "reason": "no_model_position",
-                        "veto_reason": "",
-                        "hard_rule_reason": "",
-                    }
-                )
-                continue
             prob = probs[group_index, chunk_index]
             p_drop = float(prob[0])
             p_keep = float(prob[1])

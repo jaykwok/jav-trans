@@ -3,7 +3,7 @@
 
 This is an offline weak-labeling tool. It does not change runtime workflow:
 
-* Pre-ASR CueQC v10 training remains binary: ``0 = definite_drop`` and
+* Pre-ASR CueQC training remains binary: ``0 = definite_drop`` and
   ``1 = definite_keep``.
 * ``ambiguous_ignore`` is written for unsure / low-confidence omni output and
   compiles to ``-100`` ignore labels.

@@ -91,3 +91,4 @@ def test_signature_candidate_source_tracks_proposal_checkpoint() -> None:
         config=SpeechBoundaryJaConfig(proposal_checkpoint="proposal.pt")
     )
     assert learned.signature()["candidate_source"] == "learned_boundary_proposal_v1"
+    assert learned.signature()["split_decision"] == "external_semantic_split_model_v2"

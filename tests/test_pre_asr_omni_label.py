@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from tools.asr.cueqc import label_pre_asr_v10_with_omni as omni_label
+from tools.asr.cueqc import label_pre_asr_with_omni as omni_label
 
 
 def test_training_label_from_omni_maps_to_existing_v10_labels():

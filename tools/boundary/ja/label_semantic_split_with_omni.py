@@ -18,7 +18,7 @@ if str(PROJECT_ROOT) not in sys.path:
 if str(SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(SRC_ROOT))
 
-from tools.asr.cueqc.label_pre_asr_v10_with_omni import (  # noqa: E402
+from tools.asr.cueqc.label_pre_asr_with_omni import (  # noqa: E402
     DEFAULT_API_KEY_ENV_CANDIDATES,
     DEFAULT_BASE_URL_ENV_CANDIDATES,
     DEFAULT_ENV_FILE,

@@ -277,9 +277,8 @@ def test_pre_asr_cueqc_old_versions_removed_from_active_runtime_surface():
         "src/core/config.py",
         "README.md",
         "tools/workflows/run_full_workflow.py",
-        "tools/asr/cueqc/compile_pre_asr_v11_features.py",
-        "tools/asr/cueqc/train_pre_asr_v11_binary.py",
-        "tools/asr/cueqc/export_pre_asr_v10_audit_candidates.py",
+        "tools/asr/cueqc/pre_asr_feature_compiler.py",
+        "tools/asr/cueqc/pre_asr_binary_trainer.py",
     )
     retired_tokens = (
         "cueqc_pre_asr_mamba_v6",

@@ -404,7 +404,7 @@ def test_pre_asr_cueqc_load_active_rejects_explicit_v11_checkpoint(monkeypatch):
     monkeypatch.setenv("PRE_ASR_CUEQC_DEVICE", "cpu")
     monkeypatch.setenv("PRE_ASR_CUEQC_MODEL_PATH_BY_REPO", f"{repo_id}={legacy}")
 
-    with pytest.raises(ValueError, match="unsupported Pre-ASR CueQC schema"):
+    with pytest.raises(FileNotFoundError, match="does not exist"):
         pre_asr_cueqc.load_active(expected_asr_repo_id=repo_id)
 
 
@@ -853,6 +853,12 @@ def test_pre_asr_training_chunk_stratified_split_samples_both_films():
     assert summary["val_counts"]["drop"] > 0
     assert summary["val_counts"]["keep"] > 0
     assert not np.any(train_mask & val_mask)
+
+
+def test_sequence_tensor_contract_rejects_unassigned_candidates(monkeypatch):
+    monkeypatch.setattr(pre_asr_cueqc, "planned_island_sequences", lambda _rows: [])
+    with pytest.raises(RuntimeError, match="left candidates unassigned"):
+        pre_asr_cueqc.sequence_tensors([{"candidate_id": "missing"}])
 
 
 def test_pre_asr_training_video_group_split_keeps_windows_together():

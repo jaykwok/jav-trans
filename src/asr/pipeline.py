@@ -4,7 +4,6 @@ import hashlib
 import json
 import os
 import time
-import warnings
 from dataclasses import replace
 from pathlib import Path
 from typing import Any, Callable
@@ -41,8 +40,6 @@ from asr.backends.qwen import (
 )
 from asr.backends import registry as _registry_module
 from pipeline import memory_safety as _memory_safety_module
-
-warnings.filterwarnings("ignore")
 
 _registry_module = importlib.reload(_registry_module)
 _chunking_module = importlib.reload(_chunking_module)
