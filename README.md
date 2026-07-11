@@ -76,9 +76,10 @@ cd jav-trans
 uv venv
 uv pip install --upgrade pip
 uv pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu128
-uv pip install "transformers @ git+https://github.com/huggingface/transformers.git"
 uv pip install -r requirements.txt
 ```
+
+Qwen3-ASR 原生支持要求 `transformers>=5.13.0`，已由 `requirements.txt` 安装稳定版，无需从 GitHub 源码安装。
 
 启动网页控制台：
 

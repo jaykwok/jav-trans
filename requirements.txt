@@ -1,10 +1,7 @@
 torch
 torchaudio
 rich
-# transformers >=5.13 (native qwen3_asr support). Not on PyPI yet — install
-# from source before `uv pip install -r requirements.txt`:
-#     pip install git+https://github.com/huggingface/transformers
-# transformers
+transformers>=5.13.0
 accelerate
 numpy
 scipy
