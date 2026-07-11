@@ -286,7 +286,11 @@ def normalize_word_dicts(words: list[dict]) -> list[dict]:
             # proportional timing can produce them); downstream renderers
             # already ignore words without a positive span.
             continue
-        normalized.append({"start": start, "end": end, "word": token})
+        item = {"start": start, "end": end, "word": token}
+        timestamp_kind = str(word.get("timestamp_kind") or "").strip()
+        if timestamp_kind:
+            item["timestamp_kind"] = timestamp_kind
+        normalized.append(item)
     normalized.sort(key=lambda item: (item["start"], item["end"]))
     return normalized
 

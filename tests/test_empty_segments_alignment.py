@@ -57,7 +57,10 @@ def test_qwen_finalize_uses_boundary_chunk_timeline(monkeypatch):
         return (
             [{"word": text, "start": start, "end": end}],
             "boundary_proportional",
-            {"timing_source": "boundary_chunk"},
+            {
+                "timing_source": "synthetic_boundary_proportional",
+                "word_timestamps_real": False,
+            },
         )
 
     monkeypatch.setattr(local_backend, "build_boundary_word_timestamps", fake_boundary_timing)

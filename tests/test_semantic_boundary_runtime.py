@@ -4,7 +4,12 @@ import numpy as np
 
 from boundary.base import SpeechSegment
 from boundary.outer_refiner import OuterEdgePrediction
-from boundary.runtime_pipeline import SemanticBoundaryConfig, build_semantic_boundary_chunks
+from boundary.runtime_pipeline import (
+    SemanticBoundaryConfig,
+    build_semantic_boundary_chunks,
+    effective_semantic_config,
+    semantic_config_payload,
+)
 from boundary.sequence_features import FrameSequenceFeatureConfig, FrameSequenceFeatureProvider
 from boundary.split_model import SplitDecision
 
@@ -65,6 +70,27 @@ class _CutRefiner:
         core_end_s,
     ):
         return proposal_times_s + 0.08
+
+
+def test_effective_semantic_config_reports_checkpoint_decision() -> None:
+    verifier = _SplitVerifier()
+    verifier.decision_config = {
+        "normal_cut_threshold": 0.75,
+        "short_core_cut_threshold": 0.775,
+        "duration_pressure_enabled": True,
+        "duration_pressure_log_median": -0.1,
+        "duration_pressure_log_mad": 1.05,
+        "duration_pressure_z": 1.7,
+        "duration_pressure_floor": 0.5,
+    }
+
+    resolved = effective_semantic_config(verifier, SemanticBoundaryConfig())
+    payload = semantic_config_payload(resolved)
+
+    assert payload["decision_mode"] == "threshold"
+    assert payload["duration_pressure_enabled"] is True
+    assert payload["duration_pressure_z"] == 1.7
+    assert payload["short_core_cut_threshold"] == 0.775
 
 
 def test_internal_cut_uses_one_shared_absolute_timestamp():

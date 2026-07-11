@@ -171,6 +171,31 @@ def test_prepare_srt_blocks_anchors_start_to_first_timed_word():
     assert prepared[0]["start"] == pytest.approx(10.0)
 
 
+def test_prepare_srt_blocks_does_not_anchor_to_synthetic_proportional_words():
+    blocks = [
+        {
+            "start": 10.35,
+            "end": 11.2,
+            "ja_text": "小那海あやです",
+            "zh_text": "我是小那海绫",
+            "words": [
+                {
+                    **_word("小那海あやです", 10.0, 11.2),
+                    "timestamp_kind": "synthetic_proportional",
+                }
+            ],
+        }
+    ]
+
+    prepared = subtitle.prepare_srt_blocks(
+        blocks,
+        options=SubtitleOptions(),
+        mode="bilingual",
+    )
+
+    assert prepared[0]["start"] == pytest.approx(10.35)
+
+
 def test_prepare_srt_blocks_preserves_earliest_word_start_anchor_without_merge():
     blocks = [
         {
