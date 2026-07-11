@@ -127,7 +127,8 @@ DEFAULT_SETTINGS: dict[str, str] = {
     "PRE_ASR_CUEQC_ENABLED": "1",
     "PRE_ASR_CUEQC_MODEL_PATH_BY_REPO": "",
     "PRE_ASR_CUEQC_DEVICE": "auto",
-    "PRE_ASR_CUEQC_DROP_THRESHOLD": "0.95",
+    # Empty means use the repo-bound v12 checkpoint decision_config.
+    "PRE_ASR_CUEQC_DROP_THRESHOLD": "",
     # Optional JSONL export for cold-start clustering/training candidates.
     "PRE_ASR_CUEQC_EXPORT_CANDIDATES_PATH": "",
     "PRE_ASR_CUEQC_EXPORT_CANDIDATES_APPEND": "1",

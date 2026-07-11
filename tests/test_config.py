@@ -161,8 +161,23 @@ def test_default_model_download_root_is_project_models():
     assert "CUEQC_EXPORT_CANDIDATES_APPEND" not in config.DEFAULT_SETTINGS
     assert "CUEQC_SHADOW_EMBED_CANDIDATES" not in config.DEFAULT_SETTINGS
     assert config.DEFAULT_SETTINGS["PRE_ASR_CUEQC_ENABLED"] == "1"
-    assert config.DEFAULT_SETTINGS["PRE_ASR_CUEQC_DROP_THRESHOLD"] == "0.95"
+    assert config.DEFAULT_SETTINGS["PRE_ASR_CUEQC_DROP_THRESHOLD"] == ""
     assert config.DEFAULT_SETTINGS["LLM_API_FORMAT"] == "chat"
+
+
+def test_active_boundary_pre_asr_registry_is_breaking_v2_v12_only() -> None:
+    assert set(qwen.DEFAULT_SPEECH_BOUNDARY_PROPOSAL_CHECKPOINT_BY_REPO) == {
+        qwen.QWEN_ASR_06B_REPO_ID,
+        qwen.QWEN_ASR_17B_REPO_ID,
+    }
+    assert all(
+        "semantic_split_model_v2." in path
+        for path in qwen.DEFAULT_SEMANTIC_SPLIT_CHECKPOINT_BY_REPO.values()
+    )
+    assert all(
+        "pre_asr_cueqc_v12." in path
+        for path in qwen.DEFAULT_PRE_ASR_CUEQC_CHECKPOINT_BY_REPO.values()
+    )
 
 
 def test_job_context_defaults_runtime_logs_from_config(monkeypatch, tmp_path):

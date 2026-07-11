@@ -394,6 +394,20 @@ def test_pre_asr_cueqc_load_active_validates_split_sha(monkeypatch, tmp_path: Pa
         )
 
 
+def test_pre_asr_cueqc_load_active_rejects_explicit_v11_checkpoint(monkeypatch):
+    repo_id = "jaykwok/Qwen3-ASR-0.6B-JA-Anime-Galgame-hf"
+    legacy = (
+        "src/asr/checkpoints/"
+        "pre_asr_cueqc_v11.jaykwok-Qwen3-ASR-0.6B-JA-Anime-Galgame-hf.pt"
+    )
+    monkeypatch.setenv("PRE_ASR_CUEQC_ENABLED", "1")
+    monkeypatch.setenv("PRE_ASR_CUEQC_DEVICE", "cpu")
+    monkeypatch.setenv("PRE_ASR_CUEQC_MODEL_PATH_BY_REPO", f"{repo_id}={legacy}")
+
+    with pytest.raises(ValueError, match="unsupported Pre-ASR CueQC schema"):
+        pre_asr_cueqc.load_active(expected_asr_repo_id=repo_id)
+
+
 def test_pre_asr_cueqc_filters_before_wav_export(monkeypatch):
     from asr import pipeline as asr_pipeline
 
