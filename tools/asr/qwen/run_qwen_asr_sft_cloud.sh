@@ -51,7 +51,7 @@ fi
 
 if [[ "${INSTALL_QWEN_ASR_DEPS:-0}" == "1" ]]; then
   uv pip install -U datasets librosa
-  uv pip install -U "transformers @ git+https://github.com/huggingface/transformers.git"
+  uv pip install -U "transformers>=5.13.0"
   if [[ "${INSTALL_FLASH_ATTN:-0}" == "1" ]]; then
     MAX_JOBS="${MAX_JOBS:-4}" uv pip install -U flash-attn --no-build-isolation
   fi
