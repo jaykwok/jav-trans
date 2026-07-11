@@ -6,6 +6,8 @@
 
 ---
 
+- 2026-07-11 Web 任务条终态文案修复：任务完成后后端 `status=done`，但 `progress.stage/current_stage` 会保留最后的 `write_output` 供诊断与重试判断；前端原先优先渲染残留 stage，导致 100% 的任务条仍显示“写入字幕”。展示阶段现在对 `done/failed/cancelled` 终态优先，完成显示“已完成”并隐藏旧阶段计数；重试路径继续独立读取原始 stage，不改变失败任务的 ASR/翻译重试分流。验证：`node --check` 通过，相关 Web 回归 `27 passed`，全量 pytest `692 passed, 4 warnings`。
+
 - 2026-07-11 repo 显存下限与 auto-batch v2：完整 CUDA 链在任何模型加载前按 ASR repo 检查物理 dedicated VRAM，0.6B 下限 `4096MiB`、1.7B 下限 `6144MiB`；有效 allocator/OOM cap 仍为物理显存×`0.95`，shared VRAM、显式放大 budget 与 CPU fallback 都不能补足物理显存。修正 worker 初始化曾宽泛吞掉 adaptive tuning 异常的问题，显存契约和配置错误现在原样终止。`gpu_batch_profiles.json` schema 断兼容升为 v2，ASR chunk batch 与 Semantic Split candidate batch 从成功 `+1` 改为记录 `safe_batch/unsafe_batch` 后的有界二分探测；无 OOM 上界时向阶段 max 折半推进，OOM 仍在当前任务减半并从 cache/checkpoint 恢复。旧 v1 profile 不迁移；20 秒 PTM 窗口及其他没有独立可恢复 batch 旋钮的执行形状不变。验证：聚焦回归 `78 passed`，全量 pytest `692 passed, 4 warnings`，warnings 为既有 SciPy sparse efficiency；compileall 与 `git diff --check` 通过。
 
 ## 路线总览

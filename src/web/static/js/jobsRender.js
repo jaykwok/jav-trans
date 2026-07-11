@@ -13,7 +13,7 @@ const STAGE_LABEL = {
   asr:                 'ASR 转写',
   translating:         '翻译中',
   writing:             '写入字幕',
-  done:                '完成',
+  done:                '已完成',
   failed:              '失败',
   cancelled:           '已取消',
   audio_prepare:       '音频提取',
@@ -92,7 +92,8 @@ export function renderJobs() {
     const expected = job.progress?.expected ?? job.progress?.extra?.expected;
     const current = job.progress?.current ?? job.progress?.extra?.current;
     const total = job.progress?.total ?? job.progress?.extra?.total;
-    const activeStage = job.progress?.stage || job.current_stage || job.status;
+    const terminalStage = CLEARABLE.has(job.status) ? job.status : null;
+    const activeStage = terminalStage || job.progress?.stage || job.current_stage || job.status;
     const translatedRatio = translated != null && expected
       ? Math.min(1, Math.max(0, translated / expected))
       : null;
@@ -112,7 +113,9 @@ export function renderJobs() {
     pct = clampPct(pct);
     const fillClass = job.status === 'done' ? ' done' : job.status === 'failed' ? ' error' : '';
     const stage = STAGE_LABEL[activeStage] ?? STAGE_LABEL[job.status] ?? activeStage;
-    const progressInfo = translated != null
+    const progressInfo = terminalStage
+      ? ''
+      : translated != null
       ? ` ${translated}/${expected ?? '?'}`
       : current != null ? ` ${current}/${total ?? '?'}` : '';
 
