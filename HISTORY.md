@@ -6,6 +6,10 @@
 
 ---
 
+- 2026-07-11 Split v3 timeline teacher Stage 2 smoke：Forced Aligner 严格改用 Hugging Face 模型卡公开调用方式：`AutoProcessor` + `AutoModelForTokenClassification`，16k audio array 与固定 ASR transcript 直接送入 `prepare_forced_aligner_inputs`，`BatchFeature.to(device,dtype)` 后单次 NAR forward，`decode_forced_alignment` 只传 `timestamp_token_id`。仍保留物理 VRAM×`0.95` cap、串行 GPU 与 batch 总时长约束；3/3 FJIN held-out 样本成功，官网 API 与此前输出的锚点逐字段一致。模型卡没有定义对齐置信度，因此 timestamp logits 的 max-softmax 改名为未校准 `alignment_score`，只用于审计，不再用 `0.55` 硬门控；融合 gate 改为有效 Forced 时间戳 + Omni `confidence>=0.8` + start/end 最大偏差 `<=0.32s`。Omni timeline 请求只对 Forced 提供的固定 unit 做 audio-text alignment，不转录、不改文、不判断 Split/CueQC；首次 smoke 发现默认 audio content mode 写成公共封装不支持的 `data_url`，已改为 `input_audio`，另发现 15 unit 响应被默认 256 output tokens 截断，timeline 单任务 cap 提高为 4096。真实 3 条 smoke 共 `20` units：`14` consensus、`5` conflict、`1` Omni-only review，`2/3` item 达到 `>=60%` trainable coverage；审计页 `agents/audits/20260711_210403_timeline-teacher-fusion-smoke/` 已加入导航，播放器内可切换且只能激活 Forced/Omni/Fused 一条字幕轨道，播放时只显示当前命中的单个 unit，空白区清空。FJIN-059/NAMH-055 在数据准备入口硬限制为 `split=heldout`，不能进入训练分区。
+
+- 2026-07-11 Forced Aligner HF 架构纠正与旧缓存清理：离线 timeline teacher 固定使用 Transformers 5.13 兼容的 `Qwen/Qwen3-ForcedAligner-0.6B-hf`（`Qwen3ASRForTokenClassification`）；误下载的非 HF `Qwen/Qwen3-ForcedAligner-0.6B` 权重未生成任何标签，已从项目模型缓存永久移除并释放 `1,840,013,409` bytes。旧失败 smoke 空目录与用户级残留 metadata 同步清理；正式 workflow 仍不加载 Forced Aligner。
+
 - 2026-07-11 Split cut-eager Stage 1 replay：冻结 FJIN 当前 no-word-timeline 基线 `336` segments，chunk duration p50/p90/p95/p99/max=`3.274/7.222/10.382/16.949/28.152s`，`75` 段超过 5 秒、`29` 段超过 8 秒。新增正式只读工具 `tools/datasets/analyze_split_cut_eager_operating_point.py`，在同一 residual candidates 上比较 current runtime、binary gate `p_cut>=0.5` 与三类概率 argmax。真实输出 `agents/temp/20260711_200110_fjin-split-cut-eager-v2-replay/summary.json`：argmax 将 p95 降到 `4.523s`、cut recall `86.67%`，但 matched Omni truth precision 仅 `44.83%`，same-sentence/short-pause/breath false-cut rate `17.02%`；未过 precision `>=90%` 与句内停顿误切 `<=2%` gate，禁止直接把 v2 runtime 改成 cut-eager，下一步必须用 hard cases 重训 Split v3。timings 现记录 checkpoint+env 合并后的 effective Split config，修复此前输出 raw env false 而实际 checkpoint 已启用 duration pressure 的诊断错位。`boundary_proportional` 生成的比例词时间显式标为 `synthetic_proportional` / `word_timestamps_real=false`，字幕层不再把它当真实 word start anchor。后续按用户修正采用 teacher-only 时间轴闭环：Forced Aligner 仅离线提供部分词锚点，Omni 仅对固定 ASR 文本做 audio-text alignment，二者融合后训练 Split/轻量 display 模型；正式 workflow 不加载 Forced Aligner。
 
 - 2026-07-11 Web 状态持久化并发修复与 LLM effort 默认收敛：多个 translation worker 会并发写 `jobs.json`，旧实现用固定 `<pid>.tmp`，首先发生临时文件互相覆盖；改为 UUID 临时文件后又稳定复现 Windows 目标文件短占用导致的 `WinError 5`。持久化现使用进程内写锁、每次唯一临时文件，并仅对 `PermissionError` 做 5 次短退避 replace，其他错误原样失败；`test_pipeline_workers_overlap` 连续 4 次通过。按用户要求，配置、JobContext、translator、Web API/model、设置页默认 reasoning effort 全部从 `xhigh` 收敛为 `medium`，显式 `xhigh` 仍保留。
@@ -1597,7 +1601,7 @@ v1.23 后置修正 first-pass：
 - Qwen3-ASR finetuning: <https://github.com/QwenLM/Qwen3-ASR/tree/main/finetuning>
 - Qwen3-ASR-0.6B: <https://huggingface.co/Qwen/Qwen3-ASR-0.6B>
 - Qwen3-ASR-1.7B: <https://huggingface.co/Qwen/Qwen3-ASR-1.7B>
-- Qwen3-ForcedAligner-0.6B: <https://huggingface.co/Qwen/Qwen3-ForcedAligner-0.6B>
+- Qwen3-ForcedAligner-0.6B-hf: <https://huggingface.co/Qwen/Qwen3-ForcedAligner-0.6B-hf>
 - 本项目 Qwen3-ASR-0.6B SFT: <https://huggingface.co/jaykwok/Qwen3-ASR-0.6B-JA-Anime-Galgame>
 - 本项目 Qwen3-ASR-1.7B SFT: <https://huggingface.co/jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame>
 - AVA-Speech VAD: <https://huggingface.co/datasets/nccratliri/vad-human-ava-speech>
