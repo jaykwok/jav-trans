@@ -466,6 +466,7 @@ uv run python -m <module> --help
 - `tools.datasets.export_omni_drop_negative_manifest`：从联合 Omni 标签导出严格 definite-drop WAV，按原视频 hash 隔离 hardmix train/val/test。
 - `tools.datasets.prepare_joint_boundary_omni_dataset`：从视频库分层随机抽取窗口，生成运行时同滤镜的 16k PCM WAV、仅供 Omni 的 16k/32kbps MP3，以及 Split/Pre-ASR 训练特征。
 - `tools.datasets.label_joint_boundary_preasr_with_omni`：按单一任务调用 Omni；Split 每次只判断一个窗口的候选切点，Pre-ASR 每次只判断一个最终 chunk，两个标签任务不合并请求。
+- `tools.datasets.batch_joint_boundary_preasr_with_omni`：阿里云百炼 OpenAI-compatible Batch 的 Pre-ASR 全量标注入口，提供 `prepare/submit/status/download/import/resume`，按官方 50k 请求、500MB 文件、6MB 单行限制自动分片并用 `custom_id` 回连。Batch 当前使用北京区支持的 `qwen3.5-omni-plus`；实时 `qwen3.5-omni-flash` 只用于 smoke/少量修复，二者标签不得未经 A/B 审计直接混合。
 - `tools.datasets.compile_joint_boundary_preasr_dataset`：按 `video_id` 隔离 train/val，编译 Split NPZ、Pre-ASR PT bundle 和数据集说明。
 - `tools.datasets.evaluate_joint_boundary_preasr_checkpoints`：在联合数据集上按视频级 train/val 评估 Split 与 Pre-ASR checkpoint，并扫描 Pre-ASR threshold。
 
