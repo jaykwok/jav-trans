@@ -110,6 +110,18 @@ def test_qwen_asr_batch_size_auto_uses_repo_table(monkeypatch):
     assert qwen.qwen_asr_default_batch_size(ASR_17B_BACKEND) == 32
 
 
+def test_qwen_asr_minimum_physical_vram_uses_repo_table(monkeypatch):
+    from asr.backends import qwen
+
+    monkeypatch.setenv(
+        "ASR_MIN_PHYSICAL_VRAM_MB_BY_REPO",
+        f"{ASR_06B_BACKEND}=4096,{ASR_17B_BACKEND}=6144",
+    )
+
+    assert qwen.qwen_asr_min_physical_vram_mb(ASR_06B_BACKEND) == 4096
+    assert qwen.qwen_asr_min_physical_vram_mb(ASR_17B_BACKEND) == 6144
+
+
 def test_qwen_checkpoint_path_mapping_uses_repo_id_keys(monkeypatch, tmp_path):
     from asr.backends import qwen
 

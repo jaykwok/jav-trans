@@ -72,6 +72,10 @@ DEFAULT_SETTINGS: dict[str, str] = {
     # A numeric MB value remains available as an exact expert override.
     "ASR_STAGE_WORKER_VRAM_BUDGET_MB": "auto",
     "ASR_STAGE_WORKER_VRAM_RATIO": "0.95",
+    "ASR_MIN_PHYSICAL_VRAM_MB_BY_REPO": (
+        "jaykwok/Qwen3-ASR-0.6B-JA-Anime-Galgame-hf=4096,"
+        "jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame-hf=6144"
+    ),
     "ASR_STAGE_WORKER_RAM_RATIO": "0.95",
     # PDH shared-memory counters move in small WDDM bookkeeping increments.
     # auto uses max(16MiB, physical VRAM * 0.2%) as a measurement deadband,
@@ -79,7 +83,8 @@ DEFAULT_SETTINGS: dict[str, str] = {
     "ASR_STAGE_WORKER_SHARED_VRAM_TOLERANCE_MB": "auto",
     "ASR_STAGE_WORKER_HEARTBEAT_S": "10",
     # Cross-job auto-batch learning. Successful jobs below the utilization
-    # threshold try +1 next time; OOM records an upper bound.
+    # threshold probe between the safe batch and current upper bound; OOM
+    # records the unsafe bound.
     "GPU_BATCH_PROFILE_ENABLED": "1",
     "GPU_BATCH_PROFILE_GROWTH_THRESHOLD": "0.80",
     "GPU_BATCH_PROFILE_PATH": "./tmp/cache/gpu_batch_profiles.json",
