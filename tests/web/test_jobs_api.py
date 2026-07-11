@@ -662,6 +662,7 @@ async def _test_settings_creates_env_file_on_first_save(tmp_path, monkeypatch):
     assert "# Defaults live in src/core/config.py" in text
     assert "# ASR_STAGE_WORKER_VRAM_BUDGET_MB=auto" in text
     assert "# ASR_STAGE_WORKER_VRAM_RATIO=0.95" in text
+    assert "# ASR_MIN_PHYSICAL_VRAM_MB_BY_REPO=" in text
     assert "# ASR_STAGE_WORKER_MODE=subprocess" not in text
     assert "# ASR_BATCH_SIZE_BY_REPO=" in text
     values = dotenv_values(env_path)

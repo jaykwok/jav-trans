@@ -27,6 +27,10 @@ DEFAULT_QWEN_ASR_BATCH_SIZE_BY_REPO: dict[str, int] = {
     QWEN_ASR_06B_REPO_ID: 12,
     QWEN_ASR_17B_REPO_ID: 4,
 }
+DEFAULT_QWEN_ASR_MIN_PHYSICAL_VRAM_MB_BY_REPO: dict[str, int] = {
+    QWEN_ASR_06B_REPO_ID: 4096,
+    QWEN_ASR_17B_REPO_ID: 6144,
+}
 DEFAULT_OUTER_EDGE_REFINER_CHECKPOINT_BY_REPO: dict[str, str] = {
     repo_id: repo_checkpoint_path(repo_id, "outer_edge_refiner", "v1")
     for repo_id in QWEN_ASR_BACKEND_REPOS
@@ -222,3 +226,31 @@ def qwen_asr_batch_size_by_repo() -> dict[str, int]:
 def qwen_asr_default_batch_size(backend: str | None = None) -> int:
     repo_id = qwen_asr_repo_id(backend)
     return qwen_asr_batch_size_by_repo()[repo_id]
+
+
+def qwen_asr_min_physical_vram_mb_by_repo() -> dict[str, int]:
+    raw = os.getenv("ASR_MIN_PHYSICAL_VRAM_MB_BY_REPO", "").strip()
+    if not raw:
+        return dict(DEFAULT_QWEN_ASR_MIN_PHYSICAL_VRAM_MB_BY_REPO)
+    mapping = dict(DEFAULT_QWEN_ASR_MIN_PHYSICAL_VRAM_MB_BY_REPO)
+    for item in raw.split(","):
+        item = item.strip()
+        if not item or "=" not in item:
+            raise ValueError(
+                "Invalid ASR_MIN_PHYSICAL_VRAM_MB_BY_REPO entry "
+                f"{item!r}; expected '<repo_id>=<positive_int>'"
+            )
+        repo_id, value = item.rsplit("=", 1)
+        repo_id = repo_id.strip()
+        if repo_id not in QWEN_ASR_BACKEND_REPOS:
+            raise ValueError(
+                f"Invalid ASR_MIN_PHYSICAL_VRAM_MB_BY_REPO repo {repo_id!r}; "
+                f"expected one of {sorted(QWEN_ASR_BACKEND_REPOS)}"
+            )
+        mapping[repo_id] = max(1, int(value.strip()))
+    return mapping
+
+
+def qwen_asr_min_physical_vram_mb(backend: str | None = None) -> int:
+    repo_id = qwen_asr_repo_id(backend)
+    return qwen_asr_min_physical_vram_mb_by_repo()[repo_id]

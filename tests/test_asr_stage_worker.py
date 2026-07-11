@@ -180,6 +180,48 @@ def test_auto_vram_budget_and_batch_scale_from_physical_memory(monkeypatch):
     assert tuning["asr_batch_source"] == "auto_scaled_from_vram"
 
 
+@pytest.mark.parametrize(
+    ("backend", "minimum_mb"),
+    [
+        ("jaykwok/Qwen3-ASR-0.6B-JA-Anime-Galgame-hf", 4096),
+        ("jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame-hf", 6144),
+    ],
+)
+def test_repo_physical_vram_floor_accepts_exact_minimum(backend, minimum_mb):
+    result = gpu_worker._enforce_min_physical_vram(
+        total_mb=minimum_mb,
+        env={"ASR_BACKEND": backend},
+    )
+
+    assert result["repo_id"] == backend
+    assert result["minimum_physical_vram_mb"] == minimum_mb
+
+
+@pytest.mark.parametrize(
+    ("backend", "minimum_mb"),
+    [
+        ("jaykwok/Qwen3-ASR-0.6B-JA-Anime-Galgame-hf", 4096),
+        ("jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame-hf", 6144),
+    ],
+)
+def test_repo_physical_vram_floor_rejects_lower_card_without_fallback(
+    backend,
+    minimum_mb,
+):
+    with pytest.raises(RuntimeError, match="CPU fallback is disabled") as exc_info:
+        gpu_worker._enforce_min_physical_vram(
+            total_mb=minimum_mb - 1,
+            env={
+                "ASR_BACKEND": backend,
+                "ASR_STAGE_WORKER_VRAM_BUDGET_MB": "99999",
+            },
+        )
+
+    detail = str(exc_info.value)
+    assert "Shared VRAM" in detail
+    assert f"required_mb={minimum_mb}" in detail
+
+
 def test_explicit_vram_budget_sets_worker_allocator_fraction(monkeypatch):
     monkeypatch.setenv("GPU_BATCH_PROFILE_ENABLED", "0")
     allocator_calls: list[tuple[float, int]] = []

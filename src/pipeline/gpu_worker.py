@@ -377,6 +377,25 @@ def _gpu_device_name(torch_module: Any) -> str:
         return ""
 
 
+def _enforce_min_physical_vram(
+    *,
+    total_mb: float,
+    env: dict[str, str],
+) -> dict[str, Any]:
+    from asr.backends.qwen import qwen_asr_min_physical_vram_mb, qwen_asr_repo_id
+
+    backend = str(env.get("ASR_BACKEND") or os.getenv("ASR_BACKEND", "")).strip()
+    repo_id = qwen_asr_repo_id(backend or None)
+    minimum_mb = float(qwen_asr_min_physical_vram_mb(repo_id))
+    if total_mb < minimum_mb:
+        raise RuntimeError(
+            "Physical dedicated VRAM below supported minimum: "
+            f"repo={repo_id} detected_mb={total_mb:.0f} required_mb={minimum_mb:.0f}. "
+            "Shared VRAM and an explicit worker budget do not count; CPU fallback is disabled."
+        )
+    return {"repo_id": repo_id, "minimum_physical_vram_mb": round(minimum_mb, 1)}
+
+
 class _CudaStageMemoryTracker:
     def __init__(self, torch_module: Any) -> None:
         self.torch = torch_module
@@ -548,10 +567,20 @@ def _apply_worker_vram_allocator_cap(
     return fraction
 
 
-def _adaptive_runtime_tuning(torch_module: Any, env: dict[str, str]) -> dict[str, Any]:
+def _adaptive_runtime_tuning(
+    torch_module: Any,
+    env: dict[str, str],
+    *,
+    enforce_minimum: bool = True,
+) -> dict[str, Any]:
     """Resolve auto VRAM budget and ASR batch inside the CUDA owner process."""
     total_mb = _physical_vram_mb(torch_module)
     device_name = _gpu_device_name(torch_module)
+    minimum_contract = (
+        _enforce_min_physical_vram(total_mb=total_mb, env=env)
+        if enforce_minimum
+        else {}
+    )
     ratio = min(1.0, max(0.1, _env_float("ASR_STAGE_WORKER_VRAM_RATIO", 0.95)))
     raw_budget = str(
         env.get("ASR_STAGE_WORKER_VRAM_BUDGET_MB")
@@ -633,6 +662,9 @@ def _adaptive_runtime_tuning(torch_module: Any, env: dict[str, str]) -> dict[str
     return {
         "device_name": device_name,
         "physical_vram_mb": round(total_mb, 1),
+        "minimum_physical_vram_mb": minimum_contract.get(
+            "minimum_physical_vram_mb"
+        ),
         "vram_ratio": round(ratio, 4),
         "vram_budget_mb": round(budget_mb, 1),
         "vram_budget_source": budget_source,
@@ -1008,12 +1040,16 @@ def worker_main(parent_conn: Connection) -> None:
                     _ensure_torchcodec_runtime(ffmpeg_shared_directories)
                 try:
                     import torch as imported_torch
-
+                except ImportError:
+                    imported_torch = None
+                if imported_torch is not None:
                     torch_module = imported_torch
-                    runtime_tuning = _adaptive_runtime_tuning(torch_module, env)
+                    runtime_tuning = _adaptive_runtime_tuning(
+                        torch_module,
+                        env,
+                        enforce_minimum=not mock,
+                    )
                     stage_memory = _CudaStageMemoryTracker(torch_module)
-                except Exception:
-                    torch_module = None
 
                 def _on_stage(message: str) -> None:
                     nonlocal active_stage

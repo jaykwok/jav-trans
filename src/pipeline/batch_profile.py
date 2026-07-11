@@ -11,8 +11,8 @@ from typing import Any, Mapping
 from utils.runtime_paths import runtime_path
 
 
-PROFILE_SCHEMA = "gpu_inference_batch_profiles_v1"
-PROFILE_VERSION = 1
+PROFILE_SCHEMA = "gpu_inference_batch_profiles_v2"
+PROFILE_VERSION = 2
 _LOCK = threading.RLock()
 
 
@@ -126,27 +126,29 @@ def record_success(
         payload = _load_payload()
         old = payload["profiles"].get(key)
         entry = dict(old) if isinstance(old, dict) else {}
-        previous_safe = max(0, int(entry.get("max_safe_batch") or 0))
-        max_safe = max(previous_safe, batch)
-        unsafe_raw = entry.get("min_oom_batch")
+        previous_safe = max(0, int(entry.get("safe_batch") or 0))
+        safe_batch = max(previous_safe, batch)
+        unsafe_raw = entry.get("unsafe_batch")
         try:
-            min_oom = max(1, int(unsafe_raw)) if unsafe_raw is not None else None
+            unsafe_batch = max(1, int(unsafe_raw)) if unsafe_raw is not None else None
         except (TypeError, ValueError):
-            min_oom = None
-        if min_oom is not None and batch >= min_oom:
-            min_oom = None
+            unsafe_batch = None
+        if unsafe_batch is not None and batch >= unsafe_batch:
+            unsafe_batch = None
 
-        recommended = max_safe
+        recommended = safe_batch
         if utilization < growth_threshold():
-            recommended = max_safe + 1
-        if min_oom is not None:
-            recommended = min(recommended, max(1, min_oom - 1))
+            upper = unsafe_batch if unsafe_batch is not None else maximum + 1
+            if upper - safe_batch > 1:
+                recommended = (safe_batch + upper) // 2
+        if unsafe_batch is not None:
+            recommended = min(recommended, max(1, unsafe_batch - 1))
         recommended = max(1, min(maximum, recommended))
         entry.update(
             {
                 "identity": dict(identity),
-                "max_safe_batch": max_safe,
-                "min_oom_batch": min_oom,
+                "safe_batch": safe_batch,
+                "unsafe_batch": unsafe_batch,
                 "recommended_batch": recommended,
                 "last_batch": batch,
                 "last_peak_allocated_mb": round(peak, 1),
@@ -176,22 +178,29 @@ def record_oom(
         payload = _load_payload()
         old = payload["profiles"].get(key)
         entry = dict(old) if isinstance(old, dict) else {}
-        previous_oom = entry.get("min_oom_batch")
+        previous_oom = entry.get("unsafe_batch")
         try:
-            min_oom = min(batch, int(previous_oom)) if previous_oom is not None else batch
+            unsafe_batch = (
+                min(batch, int(previous_oom)) if previous_oom is not None else batch
+            )
         except (TypeError, ValueError):
-            min_oom = batch
+            unsafe_batch = batch
         try:
-            max_safe = max(0, int(entry.get("max_safe_batch") or 0))
+            safe_batch = max(0, int(entry.get("safe_batch") or 0))
         except (TypeError, ValueError):
-            max_safe = 0
-        recommended = max_safe if max_safe > 0 else max(1, batch - 1)
-        recommended = min(recommended, max(1, min_oom - 1), maximum)
+            safe_batch = 0
+        if safe_batch > 0 and unsafe_batch - safe_batch > 1:
+            recommended = (safe_batch + unsafe_batch) // 2
+        elif safe_batch > 0:
+            recommended = safe_batch
+        else:
+            recommended = max(1, batch // 2)
+        recommended = min(recommended, max(1, unsafe_batch - 1), maximum)
         entry.update(
             {
                 "identity": dict(identity),
-                "max_safe_batch": max_safe,
-                "min_oom_batch": min_oom,
+                "safe_batch": safe_batch,
+                "unsafe_batch": unsafe_batch,
                 "recommended_batch": max(1, recommended),
                 "last_batch": batch,
                 "last_result": "oom",

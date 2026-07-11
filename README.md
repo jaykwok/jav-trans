@@ -207,6 +207,7 @@ ASR_BATCH_SIZE=auto
 ASR_BATCH_SIZE_BY_REPO=jaykwok/Qwen3-ASR-0.6B-JA-Anime-Galgame-hf=12,jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame-hf=4
 ASR_STAGE_WORKER_VRAM_BUDGET_MB=auto
 ASR_STAGE_WORKER_VRAM_RATIO=0.95
+ASR_MIN_PHYSICAL_VRAM_MB_BY_REPO=jaykwok/Qwen3-ASR-0.6B-JA-Anime-Galgame-hf=4096,jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame-hf=6144
 ASR_STAGE_WORKER_RAM_RATIO=0.95
 ASR_STAGE_WORKER_HEARTBEAT_S=10
 ASR_STAGE_WORKER_OOM_RETRY_LIMIT=6
@@ -222,7 +223,7 @@ PRE_ASR_CUEQC_DROP_THRESHOLD=
 
 ASR stage 固定由统一 GPU worker 持有 CUDA：Boundary/PTM feature extraction、Pre-ASR CueQC、ASR 和对齐都在同一个 GPU owner 进程里顺序执行，Web / 调度主进程只做任务编排、缓存索引和输出写入。OOM、CUDA 状态异常或超过 `ASR_STAGE_WORKER_VRAM_BUDGET_MB` 时会杀掉 worker，不会把 Web 主进程一起带崩。
 
-`ASR_STAGE_WORKER_VRAM_BUDGET_MB=auto` 按物理 dedicated VRAM × `0.95` 计算软 OOM 线；RTX 4060 Ti `8188MiB` 的 cap 约为 `7779MiB`。Windows worker 使用 PDH 记录 CUDA 空载时的 shared VRAM 基线；自动检测死区为 `max(16MiB, 物理显存×0.2%)`，用于过滤 WDDM 计数器的 4MiB 级记账抖动，不属于可用 shared 预算，超过死区仍立即视为 soft OOM。监控不可用会直接停止。物理 RAM 使用按 `total-available` 计算，超过 `total × ASR_STAGE_WORKER_RAM_RATIO`（默认 `0.95`）同样停止。
+`ASR_STAGE_WORKER_VRAM_BUDGET_MB=auto` 按物理 dedicated VRAM × `0.95` 计算软 OOM 线；RTX 4060 Ti `8188MiB` 的 cap 约为 `7779MiB`。完整推理链要求 0.6B 至少 `4096MiB`、1.7B 至少 `6144MiB` 物理 dedicated VRAM，并在模型加载前检查；shared VRAM、显式放大的 worker budget 和 CPU fallback 都不能绕过。Windows worker 使用 PDH 记录 CUDA 空载时的 shared VRAM 基线；自动检测死区为 `max(16MiB, 物理显存×0.2%)`，用于过滤 WDDM 计数器的 4MiB 级记账抖动，不属于可用 shared 预算，超过死区仍立即视为 soft OOM。监控不可用会直接停止。物理 RAM 使用按 `total-available` 计算，超过 `total × ASR_STAGE_WORKER_RAM_RATIO`（默认 `0.95`）同样停止。
 
 GPU worker 默认每 10 秒输出一次当前阶段、总耗时和静默时长心跳。字幕 cue plan 会单独记录 timeline normalize、两轮 anchor-aware DP、polish 和 finalize 进度。
 
@@ -230,7 +231,7 @@ Boundary cache 当前版本为 `v18`；旧 cache 不迁移。cache 签名包含 
 
 `ASR_BATCH_SIZE=auto` 以 5600MB 下的 repo 默认表为基线，按显存预算比例放缩初始 batch。ASR text batch 与 Semantic Split candidate batch 发生 GPU OOM 时会重启 worker、降低对应 batch 并从 cache/checkpoint 续跑；SpeechBoundary/PTM、Outer/Cut Refiner、Pre-ASR CueQC 的执行形状不会为规避 OOM 而改变，OOM 时直接停止。RAM OOM 也直接停止，不伪装成可由 GPU batch 修复的问题。
 
-auto batch 会在 `tmp/cache/gpu_batch_profiles.json` 按 GPU、模型和推理配置跨任务学习。一个任务成功且该阶段 peak allocated 低于预算的 `80%` 时，下个任务尝试 `+1`；OOM 会记录不安全上界并降低 batch。当前覆盖 ASR chunk batch 与 Semantic Split 独立候选 batch。显式数字 batch 不参与学习；Speech scorer/PTM 的时序窗口、Pre-ASR planned-island 序列，以及 Outer/Cut 的既有执行形状不会为了学习而改变。
+auto batch 会在 `tmp/cache/gpu_batch_profiles.json` 按 GPU、模型和推理配置跨任务学习。v2 profile 记录已验证安全 batch 与 OOM 不安全上界：阶段 peak allocated 低于预算 `80%` 时，在两者之间二分探测；尚无 OOM 上界时则向当前阶段上限折半推进，OOM 后本次任务仍先减半恢复。当前覆盖 ASR chunk batch 与 Semantic Split 独立候选 batch。显式数字 batch 不参与学习；Speech scorer/PTM 的 20 秒时序窗口、Pre-ASR planned-island 序列，以及 Outer/Cut 的既有执行形状不会为了学习而改变。旧 v1 profile 不迁移，会自动从当前启发式基线重新学习。
 
 推理需要 ASR / SpeechBoundary-JA frozen feature Hugging Face 模型，以及与当前 repo id 匹配的本地 checkpoint。源码运行时如果本地没有 Hugging Face 模型，会按需下载到 `models/`。registry 缺失、覆盖映射未命中当前 repo id、文件不存在、schema 不匹配或 metadata 不匹配都会 fail-fast。
 
@@ -301,7 +302,7 @@ actual_device=cuda
 model_param_device=cuda:*
 ```
 
-受限 sandbox、错误的 PyTorch wheel、驱动问题或从非 GPU 环境启动 Web 服务都可能导致 CPU fallback。
+受限 sandbox、错误的 PyTorch wheel、驱动问题或从非 GPU 环境启动 Web 服务都会使 CUDA 启动检查失败；正式工作流不会转到 CPU 继续执行。
 
 ### 显存不足
 
@@ -312,6 +313,7 @@ ASR_BACKEND=jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame-hf
 ASR_BATCH_SIZE_BY_REPO=jaykwok/Qwen3-ASR-0.6B-JA-Anime-Galgame-hf=12,jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame-hf=4
 ASR_STAGE_WORKER_VRAM_BUDGET_MB=auto
 ASR_STAGE_WORKER_VRAM_RATIO=0.95
+ASR_MIN_PHYSICAL_VRAM_MB_BY_REPO=jaykwok/Qwen3-ASR-0.6B-JA-Anime-Galgame-hf=4096,jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame-hf=6144
 ASR_STAGE_WORKER_RAM_RATIO=0.95
 ASR_STAGE_WORKER_HEARTBEAT_S=10
 SPEECH_BOUNDARY_JA_WINDOW_S=20
