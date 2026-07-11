@@ -1388,18 +1388,28 @@ def _enforce_vram_budget_from_snapshot(snapshot: dict) -> None:
         shared_vram_mb = float(snapshot.get("shared_vram_mb") or 0.0)
     except (TypeError, ValueError):
         shared_vram_mb = 0.0
-    try:
-        shared_tolerance_mb = max(
-            0.0,
-            float(os.getenv("ASR_STAGE_WORKER_SHARED_VRAM_TOLERANCE_MB", "0")),
-        )
-    except ValueError:
-        shared_tolerance_mb = 0.0
+    shared_tolerance_raw = os.getenv(
+        "ASR_STAGE_WORKER_SHARED_VRAM_TOLERANCE_MB",
+        "auto",
+    ).strip().lower()
+    if shared_tolerance_raw in {"", "auto"}:
+        try:
+            total_mb = max(0.0, float(snapshot.get("total_mb") or 0.0))
+        except (TypeError, ValueError):
+            total_mb = 0.0
+        shared_tolerance_mb = max(16.0, total_mb * 0.002)
+    else:
+        try:
+            shared_tolerance_mb = max(0.0, float(shared_tolerance_raw))
+        except ValueError:
+            shared_tolerance_mb = 16.0
     if shared_vram_mb > shared_tolerance_mb:
         raise RuntimeError(
             "GPU shared VRAM spill detected: "
             f"stage={snapshot.get('stage', '')} shared_vram_mb={shared_vram_mb:.3f} "
-            f"tolerance_mb={shared_tolerance_mb:.3f}"
+            f"raw_mb={snapshot.get('shared_vram_raw_mb', '')} "
+            f"baseline_mb={snapshot.get('shared_vram_baseline_mb', '')} "
+            f"measurement_deadband_mb={shared_tolerance_mb:.3f}"
         )
     try:
         physical_ram_used_mb = float(snapshot.get("physical_ram_used_mb"))

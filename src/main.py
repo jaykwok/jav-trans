@@ -150,6 +150,7 @@ _ASR_STAGE_ADVANCED_KEYS = {
     "ASR_STAGE_WORKER_VRAM_RATIO",
     "ASR_STAGE_WORKER_RAM_RATIO",
     "ASR_STAGE_WORKER_SHARED_VRAM_TOLERANCE_MB",
+    "ASR_STAGE_WORKER_HEARTBEAT_S",
     "GPU_BATCH_PROFILE_ENABLED",
     "GPU_BATCH_PROFILE_GROWTH_THRESHOLD",
     "GPU_BATCH_PROFILE_PATH",
@@ -188,6 +189,7 @@ _ASR_STAGE_CACHE_NEUTRAL_KEYS = {
     "ASR_STAGE_WORKER_VRAM_RATIO",
     "ASR_STAGE_WORKER_RAM_RATIO",
     "ASR_STAGE_WORKER_SHARED_VRAM_TOLERANCE_MB",
+    "ASR_STAGE_WORKER_HEARTBEAT_S",
     "GPU_BATCH_PROFILE_ENABLED",
     "GPU_BATCH_PROFILE_GROWTH_THRESHOLD",
     "GPU_BATCH_PROFILE_PATH",
@@ -849,6 +851,7 @@ def _prepare_translation_cues(
     *,
     subtitle_options,
     bilingual: bool,
+    on_stage=None,
 ) -> tuple[list[dict], dict]:
     source_blocks = _build_japanese_srt_blocks(segments)
     mode = "bilingual" if bilingual else "srt"
@@ -856,6 +859,7 @@ def _prepare_translation_cues(
         source_blocks,
         options=subtitle_options,
         mode=mode,
+        on_stage=on_stage,
     )
     normalized: list[dict] = []
     for cue_id, cue in enumerate(cues):
@@ -1589,6 +1593,10 @@ def _run_translation_and_write_impl(
             segments,
             subtitle_options=subtitle_options,
             bilingual=False,
+            on_stage=lambda stage, current, total: _log_stage(
+                logger,
+                f"subtitle_cue_plan stage={stage} {current}/{total}",
+            ),
         )
         pipeline_timings["subtitle_cue_plan_s"] = (
             time.perf_counter() - cue_plan_started
@@ -1739,6 +1747,10 @@ def _run_translation_and_write_impl(
         segments,
         subtitle_options=subtitle_options,
         bilingual=bilingual,
+        on_stage=lambda stage, current, total: _log_stage(
+            logger,
+            f"subtitle_cue_plan stage={stage} {current}/{total}",
+        ),
     )
     pipeline_timings["subtitle_cue_plan_s"] = (
         time.perf_counter() - cue_plan_started

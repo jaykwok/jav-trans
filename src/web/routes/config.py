@@ -150,6 +150,7 @@ def _initial_env_template_lines() -> list[str]:
         "# ASR_STAGE_WORKER_VRAM_BUDGET_MB=auto\n",
         "# ASR_STAGE_WORKER_VRAM_RATIO=0.95\n",
         "# ASR_STAGE_WORKER_RAM_RATIO=0.95\n",
+        "# ASR_STAGE_WORKER_HEARTBEAT_S=10\n",
         "# GPU_BATCH_PROFILE_ENABLED=1\n",
         "# GPU_BATCH_PROFILE_GROWTH_THRESHOLD=0.80\n",
         "# SEMANTIC_SPLIT_INFERENCE_BATCH_SIZE=auto\n",

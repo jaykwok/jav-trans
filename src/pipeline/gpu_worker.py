@@ -1315,6 +1315,11 @@ class _GpuWorkerClient:
 
         timeout_s = _env_float("ASR_STAGE_WORKER_TIMEOUT_S", 0.0)
         deadline = time.monotonic() + timeout_s if timeout_s > 0 else None
+        heartbeat_s = max(0.0, _env_float("ASR_STAGE_WORKER_HEARTBEAT_S", 10.0))
+        request_started = time.monotonic()
+        last_stage_at = request_started
+        last_heartbeat_at = request_started
+        last_stage_message = "GPU worker request accepted"
 
         while True:
             if cancel_requested is not None and cancel_requested():
@@ -1337,6 +1342,19 @@ class _GpuWorkerClient:
                         "crash",
                         f"ASR stage worker exited before result exitcode={exitcode}",
                     )
+                now = time.monotonic()
+                if (
+                    heartbeat_s > 0.0
+                    and on_stage is not None
+                    and now - last_heartbeat_at >= heartbeat_s
+                ):
+                    on_stage(
+                        "阶段心跳 "
+                        f"current={last_stage_message} "
+                        f"elapsed={now - request_started:.1f}s "
+                        f"idle={now - last_stage_at:.1f}s"
+                    )
+                    last_heartbeat_at = now
                 continue
 
             try:
@@ -1357,9 +1375,12 @@ class _GpuWorkerClient:
 
             op = message.get("op")
             if op == "stage":
+                last_stage_message = str(message.get("message") or "")
+                last_stage_at = time.monotonic()
+                last_heartbeat_at = last_stage_at
                 if on_stage is not None:
                     try:
-                        on_stage(str(message.get("message") or ""))
+                        on_stage(last_stage_message)
                     except BaseException:
                         self._kill_child()
                         raise
