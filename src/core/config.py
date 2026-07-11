@@ -166,7 +166,7 @@ DEFAULT_SETTINGS: dict[str, str] = {
     # OpenAI-compatible API surface for translation requests. Valid values: chat, responses.
     "LLM_API_FORMAT": "chat",
     # Reasoning effort parameter for models that support it. Valid values: medium, xhigh.
-    "LLM_REASONING_EFFORT": "xhigh",
+    "LLM_REASONING_EFFORT": "medium",
     # Final subtitle language.
     "TARGET_LANG": "简体中文",
     # Comma-separated Japanese-to-Chinese term mapping injected into translation prompts.

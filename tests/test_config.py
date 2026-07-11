@@ -109,6 +109,7 @@ def test_default_model_download_root_is_project_models():
     assert config.DEFAULT_SETTINGS["ASR_CHUNK_ROOT"] == "./tmp/chunks"
     assert config.DEFAULT_SETTINGS["RUN_LOG_ENABLED"] == "1"
     assert config.DEFAULT_SETTINGS["RUN_LOG_DIR"] == "./tmp/log"
+    assert config.DEFAULT_SETTINGS["LLM_REASONING_EFFORT"] == "medium"
     assert "KEEP_TEMP_FILES" not in config.DEFAULT_SETTINGS
     assert "ASR_CONTEXT" not in config.DEFAULT_SETTINGS
     assert config.DEFAULT_SETTINGS["ASR_BACKEND"] == "jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame-hf"

@@ -581,7 +581,7 @@ async def get_settings() -> SettingsRead:
     translation_glossary = _runtime_or_env_or_setting("TRANSLATION_GLOSSARY")
     llm_api_format = _runtime_or_env_or_setting("LLM_API_FORMAT", "chat")
     llm_reasoning_effort = _normalize_llm_reasoning_effort(
-        _runtime_or_env_or_setting("LLM_REASONING_EFFORT", "xhigh")
+        _runtime_or_env_or_setting("LLM_REASONING_EFFORT", "medium")
     )
     target_lang = _runtime_or_env_or_setting("TARGET_LANG", "简体中文")
     return SettingsRead(

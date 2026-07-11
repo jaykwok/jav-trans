@@ -15,9 +15,9 @@ def normalize_llm_api_format(value: str | None) -> str:
 
 
 def normalize_llm_reasoning_effort(value: str | None) -> str:
-    """Clamp an LLM reasoning effort to the supported set; default 'xhigh'."""
-    normalized = (value or "xhigh").strip().lower()
-    return normalized if normalized in {"medium", "xhigh"} else "xhigh"
+    """Clamp an LLM reasoning effort to the supported set; default 'medium'."""
+    normalized = (value or "medium").strip().lower()
+    return normalized if normalized in {"medium", "xhigh"} else "medium"
 
 
 class JobSpec(BaseModel):
@@ -71,7 +71,7 @@ class SettingsRead(BaseModel):
     proxy_port: int | None = None
     translation_glossary: str = ""
     llm_api_format: Literal["chat", "responses"] = "chat"
-    llm_reasoning_effort: Literal["medium", "xhigh"] = "xhigh"
+    llm_reasoning_effort: Literal["medium", "xhigh"] = "medium"
     target_lang: str = "简体中文"
 
 

@@ -578,6 +578,27 @@ async def _test_settings_translation_fields_update_runtime_env(monkeypatch):
     assert payload["llm_reasoning_effort"] == "medium"
 
 
+def test_reasoning_effort_frontend_and_models_default_to_medium():
+    from web.models import SettingsRead, normalize_llm_reasoning_effort
+
+    project_root = Path(__file__).resolve().parents[2]
+    index = (project_root / "src" / "web" / "static" / "index.html").read_text(
+        encoding="utf-8"
+    )
+    settings_js = (
+        project_root / "src" / "web" / "static" / "js" / "settings.js"
+    ).read_text(encoding="utf-8")
+
+    assert '<option value="medium" selected>medium</option>' in index
+    assert "s.llm_reasoning_effort || 'medium'" in settings_js
+    assert normalize_llm_reasoning_effort(None) == "medium"
+    assert SettingsRead(
+        api_key_set=False,
+        api_key_preview="",
+        base_url="",
+    ).llm_reasoning_effort == "medium"
+
+
 async def _test_settings_ignores_removed_asr_context(monkeypatch):
     monkeypatch.delenv("ASR_CONTEXT", raising=False)
     monkeypatch.setattr(config_routes, "_update_env_file", lambda _changes: None)
