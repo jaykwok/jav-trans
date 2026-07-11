@@ -6,6 +6,7 @@ import hashlib
 import json
 import random
 import sys
+import unicodedata
 from pathlib import Path
 from typing import Any
 
@@ -17,7 +18,8 @@ if str(PROJECT_ROOT) not in sys.path:
 from tools.asr.cueqc.label_pre_asr_with_omni import slice_audio_clip  # noqa: E402
 
 
-SCHEMA = "timeline_teacher_item_v1"
+SCHEMA = "timeline_teacher_item_v2"
+UNITIZER = "unicode_punctuation_clauses_v1"
 HELD_OUT_SOURCE_IDS = frozenset({"FJIN-059", "NAMH-055"})
 
 
@@ -26,6 +28,27 @@ def validate_partition(*, source_id: str, split: str) -> None:
     if any(normalized_source.startswith(item) for item in HELD_OUT_SOURCE_IDS):
         if split.strip().lower() != "heldout":
             raise ValueError(f"{source_id} is a held-out gate and must use split=heldout")
+
+
+def split_text_units(transcript: str) -> list[dict[str, str]]:
+    text_units = []
+    buffer: list[str] = []
+
+    def flush() -> None:
+        text = "".join(buffer).strip()
+        buffer.clear()
+        if text:
+            text_units.append({"unit_id": f"u{len(text_units):04d}", "text": text})
+
+    for char in transcript:
+        if char.isspace() or unicodedata.category(char).startswith("P"):
+            flush()
+        else:
+            buffer.append(char)
+    flush()
+    if not text_units:
+        raise ValueError(f"transcript produced no alignable text units: {transcript!r}")
+    return text_units
 
 
 def _read_json(path: Path) -> dict[str, Any]:
@@ -111,6 +134,7 @@ def prepare(
         end = float(segment.get("chunk_acoustic_end", segment["end"]))
         item_id = _item_id(source_id, segment)
         audio_path = audio_dir / f"{item_id}.wav"
+        transcript = str(segment.get("text") or "").strip()
         slice_audio_clip(
             source_audio=source_audio,
             row={"start": start, "end": end, "duration_s": end - start},
@@ -130,7 +154,9 @@ def prepare(
                 "absolute_start_s": start,
                 "absolute_end_s": end,
                 "duration_s": end - start,
-                "transcript": str(segment.get("text") or "").strip(),
+                "transcript": transcript,
+                "text_units": split_text_units(transcript),
+                "unitizer": UNITIZER,
                 "audio_path": str(audio_path),
                 "alignment_mode": str(segment.get("alignment_mode") or ""),
             }
@@ -141,7 +167,8 @@ def prepare(
         encoding="utf-8",
     )
     summary = {
-        "schema": "timeline_teacher_dataset_summary_v1",
+        "schema": "timeline_teacher_dataset_summary_v2",
+        "unitizer": UNITIZER,
         "source": str(aligned_segments_path),
         "source_audio": str(source_audio),
         "source_id": source_id,

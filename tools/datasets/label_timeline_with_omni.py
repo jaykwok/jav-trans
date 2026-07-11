@@ -24,8 +24,8 @@ from tools.asr.cueqc.label_pre_asr_with_omni import (  # noqa: E402
 )
 
 
-SCHEMA = "timeline_omni_alignment_label_v1"
-PROMPT_VERSION = "timeline_audio_text_alignment_v1"
+SCHEMA = "timeline_omni_alignment_label_v2"
+PROMPT_VERSION = "timeline_audio_text_alignment_v2_direct"
 DEFAULT_AUDIO_CONTENT_MODE = "input_audio"
 DEFAULT_MAX_TOKENS = 4096
 
@@ -42,17 +42,14 @@ def _by_id(path: Path) -> dict[str, dict[str, Any]]:
     return {str(row["item_id"]): row for row in _read_jsonl(path)}
 
 
-def build_prompt(forced_row: dict[str, Any]) -> str:
-    units = [
-        {"unit_id": unit["unit_id"], "text": unit["text"]}
-        for unit in forced_row.get("word_units") or []
-    ]
+def build_prompt(item: dict[str, Any]) -> str:
+    units = list(item.get("text_units") or [])
     return f"""你是音频与固定文本的时间轴对齐标注器。本次唯一任务是：把给定文本单元对齐到音频时间，不做转录。
 
 硬约束：
 - 不要改写、纠错、补充或删除文本。
 - 不判断字幕是否保留，不判断切分点，不做内容审查。
-- start_s/end_s 使用当前音频片段内的秒数，范围 0 到 {float(forced_row['duration_s']):.3f}。
+- start_s/end_s 使用当前音频片段内的秒数，范围 0 到 {float(item['duration_s']):.3f}。
 - 能明确听到并对应时标 matched；无法可靠对应时标 unmatched。
 - 每个 unit_id 必须且只能返回一次，顺序保持不变。
 - 同一句中的停顿、喘息或拖音不属于任何文本单元，不要强行匹配。
@@ -123,14 +120,13 @@ def _normalize_units(
 
 def run(args: argparse.Namespace) -> dict[str, Any]:
     load_env_file(args.env_file)
-    forced_rows = _read_jsonl(Path(args.forced_labels))
-    item_index = _by_id(Path(args.items))
+    items = _read_jsonl(Path(args.items))
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     labels_path = output_dir / "omni_timeline_labels.jsonl"
     raw_path = output_dir / "omni_raw_responses.jsonl"
     existing = set(_by_id(labels_path)) if labels_path.exists() else set()
-    pending = [row for row in forced_rows if str(row["item_id"]) not in existing]
+    pending = [row for row in items if str(row["item_id"]) not in existing]
     if args.limit > 0:
         pending = pending[: args.limit]
     _model_name, configured_model = first_env_value(("OMNI_MODEL", "QWEN_OMNI_MODEL"))
@@ -138,10 +134,11 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     _key_name, api_key = first_env_value(DEFAULT_API_KEY_ENV_CANDIDATES)
     _url_name, base_url = first_env_value(DEFAULT_BASE_URL_ENV_CANDIDATES)
     processed = 0
-    for forced_row in pending:
-        item_id = str(forced_row["item_id"])
-        item = item_index[item_id]
-        expected = list(forced_row.get("word_units") or [])
+    for item in pending:
+        if item.get("schema") != "timeline_teacher_item_v2":
+            raise ValueError(f"unsupported timeline teacher item schema: {item.get('schema')!r}")
+        item_id = str(item["item_id"])
+        expected = list(item.get("text_units") or [])
         try:
             parsed, raw = call_omni(
                 audio_path=Path(item["audio_path"]),
@@ -152,7 +149,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 base_url=base_url,
                 timeout_s=args.timeout_s,
                 store_stream_chunks=False,
-                prompt=build_prompt(forced_row),
+                prompt=build_prompt(item),
                 max_tokens=args.max_tokens,
             )
         except Exception as exc:  # noqa: BLE001
@@ -163,15 +160,16 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         units = _normalize_units(
             parsed,
             expected,
-            duration_s=float(forced_row["duration_s"]),
+            duration_s=float(item["duration_s"]),
         )
         payload = {
             "schema": SCHEMA,
             "item_id": item_id,
-            "source_id": forced_row["source_id"],
-            "source_chunk_index": forced_row["source_chunk_index"],
-            "duration_s": forced_row["duration_s"],
-            "transcript": forced_row["transcript"],
+            "source_id": item["source_id"],
+            "source_chunk_index": item["source_chunk_index"],
+            "duration_s": item["duration_s"],
+            "transcript": item["transcript"],
+            "unitizer": item["unitizer"],
             "audio_path": item["audio_path"],
             "model": model,
             "prompt_version": PROMPT_VERSION,
@@ -195,7 +193,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         if args.rpm > 0:
             time.sleep(60.0 / args.rpm)
     summary = {
-        "schema": "timeline_omni_alignment_summary_v1",
+        "schema": "timeline_omni_alignment_summary_v2",
         "model": model,
         "prompt_version": PROMPT_VERSION,
         "max_tokens": args.max_tokens,
@@ -213,7 +211,6 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--items", required=True)
-    parser.add_argument("--forced-labels", required=True)
     parser.add_argument("--output-dir", required=True)
     parser.add_argument("--model", default="")
     parser.add_argument("--env-file", default=str(DEFAULT_ENV_FILE))

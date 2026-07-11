@@ -6,6 +6,8 @@
 
 ---
 
+- 2026-07-11 Timeline teacher 最终收敛为 Omni-only：用户试听确认 Forced Aligner 与此前生产退役时的问题一致，会出现匹配缺失/系统偏移，因此彻底取消融合、校验和 Forced unit 来源。`timeline_teacher_item_v2` 使用零依赖 `unicode_punctuation_clauses_v1`，只按 ASR 文本已有 Unicode 标点切短语；`timeline_omni_alignment_label_v2` 直接对固定短语做单任务 audio-text alignment，Omni matched start/end 即最终 teacher 时间，unmatched 单独复核，不再存在 Selected/Forced conflict 过滤。3 条 FJIN held-out smoke 共 `7` 个短语，Omni matched `6`：长样本 `见なきゃいけない / 父さん / 母さん / 俺と母さんの関係は` 为 `4/4`，唯一 unmatched 是另一短样本开头 Omni 自身判断听不到的 `は`。退役 `label_timeline_with_forced_aligner.py`、`fuse_timeline_teacher_labels.py` 和三轨审计器，新增单轨 `generate_omni_timeline_audit_html.py`；旧文件先移入 `agents/rm/20260711_212531_retired-forced-aligner-timeline-fusion/`。删除 `Qwen3-ForcedAligner-0.6B-hf` 模型缓存及相关 smoke，连同旧 v1/fusion 产物释放约 `1.87GB`；卸载仅由该路线引入的 `nagisa/dynet38/cython/six`，`uv pip check` 通过。另有 `41` 个 2026-06 旧 pytest 目录带不可读 ACL，当前账户与工具提升模式均无管理员令牌，无法在确认内容前安全删除，暂保留。
+
 - 2026-07-11 Timeline teacher 人工审计后的 Omni-primary 修正：用户在单轨跟随字幕页试听后确认 Omni 时间轴明显最准，原先对 Forced/Omni 时间取平均会把正确 Omni 边界向 Forced 系统偏差方向移动。融合 schema 断兼容升为 `timeline_teacher_fused_label_v2`，selection policy 固定为 `omni_primary_forced_validation`：高置信 matched Omni 原始 start/end 直接作为训练时间，Forced 只记录 agree/conflict/missing；agree 可训练，明确 conflict 进入 review 且不训练，Forced 无有效锚点不再否决高置信 Omni。3 条 smoke 重放得到 `14` agree、`5` conflict、`1` forced-missing，`15/20` units 可训练、`3/3` items 达到覆盖率，逐项验证所有 trainable selected timestamps 与 Omni 完全相等（mismatch=`0`）。审计页第三轨改名为 `Selected`，避免继续暗示数值平均。
 
 - 2026-07-11 Split v3 timeline teacher Stage 2 smoke：Forced Aligner 严格改用 Hugging Face 模型卡公开调用方式：`AutoProcessor` + `AutoModelForTokenClassification`，16k audio array 与固定 ASR transcript 直接送入 `prepare_forced_aligner_inputs`，`BatchFeature.to(device,dtype)` 后单次 NAR forward，`decode_forced_alignment` 只传 `timestamp_token_id`。仍保留物理 VRAM×`0.95` cap、串行 GPU 与 batch 总时长约束；3/3 FJIN held-out 样本成功，官网 API 与此前输出的锚点逐字段一致。模型卡没有定义对齐置信度，因此 timestamp logits 的 max-softmax 改名为未校准 `alignment_score`，只用于审计，不再用 `0.55` 硬门控；融合 gate 改为有效 Forced 时间戳 + Omni `confidence>=0.8` + start/end 最大偏差 `<=0.32s`。Omni timeline 请求只对 Forced 提供的固定 unit 做 audio-text alignment，不转录、不改文、不判断 Split/CueQC；首次 smoke 发现默认 audio content mode 写成公共封装不支持的 `data_url`，已改为 `input_audio`，另发现 15 unit 响应被默认 256 output tokens 截断，timeline 单任务 cap 提高为 4096。真实 3 条 smoke 共 `20` units：`14` consensus、`5` conflict、`1` Omni-only review，`2/3` item 达到 `>=60%` trainable coverage；审计页 `agents/audits/20260711_210403_timeline-teacher-fusion-smoke/` 已加入导航，播放器内可切换且只能激活 Forced/Omni/Fused 一条字幕轨道，播放时只显示当前命中的单个 unit，空白区清空。FJIN-059/NAMH-055 在数据准备入口硬限制为 `split=heldout`，不能进入训练分区。
@@ -1603,7 +1605,6 @@ v1.23 后置修正 first-pass：
 - Qwen3-ASR finetuning: <https://github.com/QwenLM/Qwen3-ASR/tree/main/finetuning>
 - Qwen3-ASR-0.6B: <https://huggingface.co/Qwen/Qwen3-ASR-0.6B>
 - Qwen3-ASR-1.7B: <https://huggingface.co/Qwen/Qwen3-ASR-1.7B>
-- Qwen3-ForcedAligner-0.6B-hf: <https://huggingface.co/Qwen/Qwen3-ForcedAligner-0.6B-hf>
 - 本项目 Qwen3-ASR-0.6B SFT: <https://huggingface.co/jaykwok/Qwen3-ASR-0.6B-JA-Anime-Galgame>
 - 本项目 Qwen3-ASR-1.7B SFT: <https://huggingface.co/jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame>
 - AVA-Speech VAD: <https://huggingface.co/datasets/nccratliri/vad-human-ava-speech>
