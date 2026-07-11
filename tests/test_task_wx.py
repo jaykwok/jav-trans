@@ -23,7 +23,7 @@ def test_aggregate_timeout_fragments_writes_summary_and_removes_fragments(monkey
         )
         fragments.append(path)
 
-    monkeypatch.setattr(asr, "_ASR_CHUNK_ROOT", chunk_root)
+    monkeypatch.setenv("ASR_CHUNK_ROOT", str(chunk_root))
 
     summary_path = asr.aggregate_timeout_fragments(job_id)
 

@@ -8,9 +8,7 @@ def _cleanup_job_temp(job_temp_dir: Path, translation_cache_path: str = "") -> N
     cleanup_job_temp(
         str(job_temp_dir),
         translation_cache_path,
-        checkpoint_root=Path(getattr(asr, "_ASR_CHUNK_ROOT", Path("tmp") / "chunks"))
-        .resolve()
-        .parent,
+        checkpoint_root=asr.current_asr_chunk_root().parent,
     )
 def test_cleanup_job_temp_removes_wav_json_and_keeps_srt(tmp_path):
     job_dir = tmp_path / "job"
@@ -64,7 +62,7 @@ def test_runtime_ephemeral_cleanup_keeps_reusable_caches(tmp_path, monkeypatch):
     (hf_cache / "cache.bin").write_bytes(b"cache")
 
     monkeypatch.setenv("JOB_TEMP_DIR", str(jobs))
-    monkeypatch.setattr(asr, "_ASR_CHUNK_ROOT", chunks)
+    monkeypatch.setenv("ASR_CHUNK_ROOT", str(chunks))
 
     cleanup_runtime_ephemeral_temp(
         job_temp_root=jobs,

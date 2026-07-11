@@ -16,3 +16,4 @@ pywebview
 python-multipart
 httpx
 xxhash
+psutil

@@ -34,6 +34,41 @@ def test_vram_budget_enforced_on_allocated_not_reserved(monkeypatch):
         )
 
 
+def test_shared_vram_spill_is_soft_oom(monkeypatch):
+    monkeypatch.setenv("ASR_STAGE_WORKER_VRAM_BUDGET_MB", "5600")
+    monkeypatch.setenv("ASR_STAGE_WORKER_SHARED_VRAM_TOLERANCE_MB", "0")
+    with pytest.raises(RuntimeError, match="shared VRAM spill"):
+        asr_pipeline._enforce_vram_budget_from_snapshot(
+            {
+                "stage": "split_done",
+                "shared_vram_mb": 0.001,
+                "physical_ram_used_mb": 1000.0,
+                "physical_ram_budget_mb": 15000.0,
+                "max_allocated_mb": 4800.0,
+            }
+        )
+
+
+def test_physical_ram_ratio_is_hard_oom(monkeypatch):
+    monkeypatch.setenv("ASR_STAGE_WORKER_VRAM_BUDGET_MB", "5600")
+    with pytest.raises(RuntimeError, match="Physical RAM budget exceeded"):
+        asr_pipeline._enforce_vram_budget_from_snapshot(
+            {
+                "stage": "pre_asr_cueqc",
+                "shared_vram_mb": 0.0,
+                "physical_ram_used_mb": 15201.0,
+                "physical_ram_budget_mb": 15200.0,
+                "max_allocated_mb": 4800.0,
+            }
+        )
+
+
+def test_ram_oom_is_not_gpu_batch_retry():
+    error = RuntimeError("Physical RAM budget exceeded: used_mb=10 budget_mb=9")
+    assert gpu_worker._is_ram_oom_error(error)
+    assert not gpu_worker._is_oom_error(error, None)
+
+
 def test_auto_vram_budget_and_batch_scale_from_physical_memory(monkeypatch):
     monkeypatch.setenv("GPU_BATCH_PROFILE_ENABLED", "0")
     allocator_calls: list[tuple[float, int]] = []

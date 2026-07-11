@@ -40,6 +40,7 @@ from asr.backends.qwen import (
     checkpoint_path_for_repo_env,
 )
 from asr.backends import registry as _registry_module
+from pipeline import memory_safety as _memory_safety_module
 
 warnings.filterwarnings("ignore")
 
@@ -56,14 +57,15 @@ _current_asr_backend = _registry_module.current_asr_backend
 _QWEN_BACKENDS = _registry_module._QWEN_BACKENDS
 _VALID_ASR_BACKENDS = _registry_module._VALID_ASR_BACKENDS
 
-_ASR_CHUNK_ROOT = _chunking_module._ASR_CHUNK_ROOT
-_KEEP_ASR_CHUNKS = _chunking_module._KEEP_ASR_CHUNKS
 _LAST_BOUNDARY_SIGNATURE: dict = _chunking_module._LAST_BOUNDARY_SIGNATURE
 _LAST_BOUNDARY_CACHE_EVENT: dict | None = None
 # APPEND=0 overwrites once per export path in this process; later same-path writes append for multi-video workflows.
 _PRE_ASR_EXPORT_OVERWRITTEN_PATHS: set[str] = set()
-_ASR_CHECKPOINT_ENABLED = _transcribe_module._ASR_CHECKPOINT_ENABLED
 _JSON_PAYLOAD_INLINE_ARRAY_LIMIT = 4096
+
+
+def current_asr_chunk_root() -> Path:
+    return _chunking_module.current_asr_chunk_root()
 
 
 def _env_bool(name: str, default: str) -> bool:
@@ -287,7 +289,6 @@ _group_words_to_segments = _transcribe_module._group_words_to_segments
 
 
 def _sync_checkpoint_state() -> None:
-    _checkpoint_module._ASR_CHUNK_ROOT = _ASR_CHUNK_ROOT
     _checkpoint_module._LAST_BOUNDARY_SIGNATURE = _LAST_BOUNDARY_SIGNATURE
 
 
@@ -310,7 +311,7 @@ def _get_asr_checkpoint_path(audio_path: str) -> Path:
     return _checkpoint_module._get_asr_checkpoint_path(
         audio_path,
         last_boundary_signature=_LAST_BOUNDARY_SIGNATURE,
-        chunk_root=_ASR_CHUNK_ROOT,
+        chunk_root=_chunking_module.current_asr_chunk_root(),
     )
 
 
@@ -335,7 +336,7 @@ def _load_asr_checkpoint(
         chunks,
         run_id=run_id,
         last_boundary_signature=_LAST_BOUNDARY_SIGNATURE,
-        checkpoint_enabled=_ASR_CHECKPOINT_ENABLED,
+        checkpoint_enabled=_transcribe_module._asr_checkpoint_enabled(),
     )
 
 
@@ -354,7 +355,7 @@ def _save_asr_checkpoint(
         text_results_by_index,
         run_id=run_id,
         last_boundary_signature=_LAST_BOUNDARY_SIGNATURE,
-        checkpoint_enabled=_ASR_CHECKPOINT_ENABLED,
+        checkpoint_enabled=_transcribe_module._asr_checkpoint_enabled(),
     )
 
 
@@ -1342,6 +1343,11 @@ def _cuda_memory_snapshot(stage: str, *, elapsed_s: float | None = None) -> dict
         )
     except Exception as exc:  # noqa: BLE001 - diagnostics must not break ASR
         snapshot["error"] = f"{type(exc).__name__}: {exc}"
+    snapshot.update(
+        _memory_safety_module.runtime_memory_snapshot(
+            require_shared_vram=bool(snapshot.get("cuda_available")),
+        )
+    )
     return snapshot
 
 
@@ -1354,6 +1360,7 @@ def _record_cuda_memory(
 ) -> None:
     snapshot = _cuda_memory_snapshot(stage, elapsed_s=elapsed_s)
     snapshots.append(snapshot)
+    _enforce_vram_budget_from_snapshot(snapshot)
     if not snapshot.get("cuda_available"):
         return
     log.append(
@@ -1367,7 +1374,6 @@ def _record_cuda_memory(
             total=snapshot.get("total_mb"),
         )
     )
-    _enforce_vram_budget_from_snapshot(snapshot)
 
 
 def _vram_budget_mb() -> float:
@@ -1381,6 +1387,35 @@ def _vram_budget_mb() -> float:
 
 
 def _enforce_vram_budget_from_snapshot(snapshot: dict) -> None:
+    try:
+        shared_vram_mb = float(snapshot.get("shared_vram_mb") or 0.0)
+    except (TypeError, ValueError):
+        shared_vram_mb = 0.0
+    try:
+        shared_tolerance_mb = max(
+            0.0,
+            float(os.getenv("ASR_STAGE_WORKER_SHARED_VRAM_TOLERANCE_MB", "0")),
+        )
+    except ValueError:
+        shared_tolerance_mb = 0.0
+    if shared_vram_mb > shared_tolerance_mb:
+        raise RuntimeError(
+            "GPU shared VRAM spill detected: "
+            f"stage={snapshot.get('stage', '')} shared_vram_mb={shared_vram_mb:.3f} "
+            f"tolerance_mb={shared_tolerance_mb:.3f}"
+        )
+    try:
+        physical_ram_used_mb = float(snapshot.get("physical_ram_used_mb"))
+        physical_ram_budget_mb = float(snapshot.get("physical_ram_budget_mb"))
+    except (TypeError, ValueError):
+        physical_ram_used_mb = 0.0
+        physical_ram_budget_mb = 0.0
+    if physical_ram_budget_mb > 0.0 and physical_ram_used_mb > physical_ram_budget_mb:
+        raise RuntimeError(
+            "Physical RAM budget exceeded: "
+            f"stage={snapshot.get('stage', '')} used_mb={physical_ram_used_mb:.1f} "
+            f"budget_mb={physical_ram_budget_mb:.1f}"
+        )
     budget_mb = _vram_budget_mb()
     if budget_mb <= 0.0:
         return
@@ -1912,7 +1947,11 @@ def _transcribe_and_align_local(
         })
         return segments, log, details
     finally:
-        if chunk_dir is not None and chunk_dir.exists() and not _KEEP_ASR_CHUNKS:
+        if (
+            chunk_dir is not None
+            and chunk_dir.exists()
+            and not _chunking_module.keep_asr_chunks()
+        ):
             _delete_path_for_cleanup(chunk_dir)
 
 

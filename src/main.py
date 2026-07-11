@@ -150,6 +150,8 @@ _ASR_STAGE_ADVANCED_KEYS = {
     "ASR_STAGE_WORKER_OOM_RETRY_LIMIT",
     "ASR_STAGE_WORKER_VRAM_BUDGET_MB",
     "ASR_STAGE_WORKER_VRAM_RATIO",
+    "ASR_STAGE_WORKER_RAM_RATIO",
+    "ASR_STAGE_WORKER_SHARED_VRAM_TOLERANCE_MB",
     "GPU_BATCH_PROFILE_ENABLED",
     "GPU_BATCH_PROFILE_GROWTH_THRESHOLD",
     "GPU_BATCH_PROFILE_PATH",
@@ -186,6 +188,8 @@ _ASR_STAGE_CACHE_NEUTRAL_KEYS = {
     "ASR_STAGE_WORKER_TIMEOUT_S",
     "ASR_STAGE_WORKER_VRAM_BUDGET_MB",
     "ASR_STAGE_WORKER_VRAM_RATIO",
+    "ASR_STAGE_WORKER_RAM_RATIO",
+    "ASR_STAGE_WORKER_SHARED_VRAM_TOLERANCE_MB",
     "GPU_BATCH_PROFILE_ENABLED",
     "GPU_BATCH_PROFILE_GROWTH_THRESHOLD",
     "GPU_BATCH_PROFILE_PATH",
@@ -712,12 +716,7 @@ def _materialize_cached_file(source: str | Path, destination: str | Path) -> boo
 
 
 def _asr_checkpoint_root() -> Path:
-    try:
-        return Path(
-            getattr(asr_module, "_ASR_CHUNK_ROOT", Path("tmp") / "chunks")
-        ).resolve().parent
-    except Exception:
-        return Path("tmp")
+    return asr_module.current_asr_chunk_root().parent
 
 
 def _resolve_project_runtime_path(raw_path: str | Path) -> Path:
@@ -739,7 +738,7 @@ def _cleanup_pipeline_temp(job_temp_dir: str, audio_path: str, translation_cache
     )
     cleanup_module.cleanup_runtime_ephemeral_temp(
         job_temp_root=os.getenv("JOB_TEMP_DIR", "tmp/jobs") or "tmp/jobs",
-        asr_chunk_root=getattr(asr_module, "_ASR_CHUNK_ROOT", Path("tmp") / "chunks"),
+        asr_chunk_root=asr_module.current_asr_chunk_root(),
         project_root=PROJECT_ROOT,
     )
 
@@ -1051,13 +1050,16 @@ def _run_asr_alignment_impl(
             segments = aligned_cache["segments"]
             asr_log = [str(item) for item in aligned_cache.get("asr_log", [])]
             asr_details = dict(aligned_cache.get("asr_details", {}))
-            audio_cached = audio_cached or _materialize_cached_file(
-                cache_audio_path,
-                audio_path,
-            )
-            if not audio_cached:
-                audio_module.extract_audio(video_path, audio_path)
-                audio_cached = False
+            if cache_job_id != job_id:
+                audio_cached = audio_cached or _materialize_cached_file(
+                    cache_audio_path,
+                    audio_path,
+                )
+                if not audio_cached:
+                    audio_module.extract_audio(video_path, audio_path)
+                    audio_cached = False
+            else:
+                audio_cached = True
             if cache_aligned_segments_path != aligned_segments_path:
                 _write_json(
                     aligned_segments_path,

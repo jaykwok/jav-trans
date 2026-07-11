@@ -6,16 +6,20 @@ from pathlib import Path
 from typing import Callable
 
 
-_KEEP_ASR_CHUNKS = os.getenv("KEEP_ASR_CHUNKS", "").strip().lower() in {
-    "1",
-    "true",
-    "yes",
-    "on",
-}
-_ASR_CHUNK_ROOT = Path(
-    os.getenv("ASR_CHUNK_ROOT", Path("tmp") / "chunks")
-).resolve()
 _LAST_BOUNDARY_SIGNATURE: dict = {}
+
+
+def current_asr_chunk_root() -> Path:
+    return Path(os.getenv("ASR_CHUNK_ROOT", Path("tmp") / "chunks")).resolve()
+
+
+def keep_asr_chunks() -> bool:
+    return os.getenv("KEEP_ASR_CHUNKS", "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
 
 
 def _get_wav_duration(audio_path: str) -> float:
@@ -30,7 +34,7 @@ def _extract_wav_chunks(
     spans: list[tuple[float, float]],
     on_stage: Callable[[str], None] | None = None,
 ) -> tuple[Path, list[dict]]:
-    root = _ASR_CHUNK_ROOT
+    root = current_asr_chunk_root()
     root.mkdir(parents=True, exist_ok=True)
     source_audio_path = str(Path(audio_path).resolve())
     safe_prefix = re.sub(r"[^A-Za-z0-9_.-]+", "_", Path(audio_path).stem)

@@ -11,9 +11,7 @@ from helpers import make_job_context, run_pipeline
 
 
 def _cleanup_job_temp(job_temp_dir: Path) -> None:
-    chunk_root = Path(
-        getattr(main.asr_module, "_ASR_CHUNK_ROOT", Path("tmp") / "chunks")
-    )
+    chunk_root = main.asr_module.current_asr_chunk_root()
     cleanup_job_temp(
         str(job_temp_dir),
         checkpoint_root=chunk_root.resolve().parent,
@@ -79,12 +77,7 @@ def _patch_pipeline(
         keep_temp_files=True,
     )
     monkeypatch.setattr(main.torch.cuda, "is_available", lambda: False)
-    monkeypatch.setattr(
-        main.asr_module,
-        "_ASR_CHUNK_ROOT",
-        tmp_path / "asr_root" / "chunks",
-        raising=False,
-    )
+    monkeypatch.setenv("ASR_CHUNK_ROOT", str(tmp_path / "asr_root" / "chunks"))
     monkeypatch.setattr(main.asr_module, "get_backend_label", lambda: "mock_asr")
 
     monkeypatch.setattr(main.translator_module, "_request_backoff_sleep", lambda *_args: None)
@@ -154,12 +147,7 @@ def test_cleanup_removes_translation_cache_and_matching_asr_checkpoint(monkeypat
     )
 
     monkeypatch.setenv("TRANSLATION_CACHE_PATH", str(cache_path))
-    monkeypatch.setattr(
-        main.asr_module,
-        "_ASR_CHUNK_ROOT",
-        checkpoint_root / "chunks",
-        raising=False,
-    )
+    monkeypatch.setenv("ASR_CHUNK_ROOT", str(checkpoint_root / "chunks"))
 
     _cleanup_job_temp(job_dir)
 
