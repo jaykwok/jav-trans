@@ -208,6 +208,7 @@ ASR_BATCH_SIZE_BY_REPO=jaykwok/Qwen3-ASR-0.6B-JA-Anime-Galgame-hf=12,jaykwok/Qwe
 ASR_STAGE_WORKER_VRAM_BUDGET_MB=auto
 ASR_STAGE_WORKER_VRAM_RATIO=0.95
 ASR_STAGE_WORKER_RAM_RATIO=0.95
+ASR_STAGE_WORKER_HEARTBEAT_S=10
 ASR_STAGE_WORKER_OOM_RETRY_LIMIT=6
 GPU_BATCH_PROFILE_ENABLED=1
 GPU_BATCH_PROFILE_GROWTH_THRESHOLD=0.80
@@ -221,7 +222,9 @@ PRE_ASR_CUEQC_DROP_THRESHOLD=
 
 ASR stage 固定由统一 GPU worker 持有 CUDA：Boundary/PTM feature extraction、Pre-ASR CueQC、ASR 和对齐都在同一个 GPU owner 进程里顺序执行，Web / 调度主进程只做任务编排、缓存索引和输出写入。OOM、CUDA 状态异常或超过 `ASR_STAGE_WORKER_VRAM_BUDGET_MB` 时会杀掉 worker，不会把 Web 主进程一起带崩。
 
-`ASR_STAGE_WORKER_VRAM_BUDGET_MB=auto` 按物理 dedicated VRAM × `0.95` 计算软 OOM 线；RTX 4060 Ti `8188MiB` 的 cap 约为 `7779MiB`。Windows worker 使用 PDH 记录 CUDA 空载时的 shared VRAM 基线，之后任何正增长都视为 shared spill/soft OOM；监控不可用会直接停止。物理 RAM 使用按 `total-available` 计算，超过 `total × ASR_STAGE_WORKER_RAM_RATIO`（默认 `0.95`）同样停止。
+`ASR_STAGE_WORKER_VRAM_BUDGET_MB=auto` 按物理 dedicated VRAM × `0.95` 计算软 OOM 线；RTX 4060 Ti `8188MiB` 的 cap 约为 `7779MiB`。Windows worker 使用 PDH 记录 CUDA 空载时的 shared VRAM 基线；自动检测死区为 `max(16MiB, 物理显存×0.2%)`，用于过滤 WDDM 计数器的 4MiB 级记账抖动，不属于可用 shared 预算，超过死区仍立即视为 soft OOM。监控不可用会直接停止。物理 RAM 使用按 `total-available` 计算，超过 `total × ASR_STAGE_WORKER_RAM_RATIO`（默认 `0.95`）同样停止。
+
+GPU worker 默认每 10 秒输出一次当前阶段、总耗时和静默时长心跳。字幕 cue plan 会单独记录 timeline normalize、两轮 anchor-aware DP、polish 和 finalize 进度。
 
 Boundary cache 当前版本为 `v18`；旧 cache 不迁移。cache 签名包含 repo-bound 模型路径和运行配置，不兼容缓存会直接 miss。
 
@@ -310,6 +313,7 @@ ASR_BATCH_SIZE_BY_REPO=jaykwok/Qwen3-ASR-0.6B-JA-Anime-Galgame-hf=12,jaykwok/Qwe
 ASR_STAGE_WORKER_VRAM_BUDGET_MB=auto
 ASR_STAGE_WORKER_VRAM_RATIO=0.95
 ASR_STAGE_WORKER_RAM_RATIO=0.95
+ASR_STAGE_WORKER_HEARTBEAT_S=10
 SPEECH_BOUNDARY_JA_WINDOW_S=20
 SPEECH_BOUNDARY_JA_OVERLAP_S=4
 ```

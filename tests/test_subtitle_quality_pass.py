@@ -121,6 +121,32 @@ def test_prepare_srt_blocks_sorts_and_removes_overlap_with_frame_gap():
     assert prepared[0]["end"] + options.frame_gap_s <= prepared[1]["start"]
 
 
+def test_prepare_srt_blocks_reports_dp_stage_progress():
+    events: list[tuple[str, int, int]] = []
+    blocks = [
+        {
+            "start": 0.0,
+            "end": 20.0,
+            "ja_text": "長い字幕です。" * 20,
+            "zh_text": "很长的字幕。" * 20,
+        }
+    ]
+
+    subtitle.prepare_srt_blocks(
+        blocks,
+        options=SubtitleOptions(max_display_duration_s=6.0),
+        mode="bilingual",
+        on_stage=lambda stage, current, total: events.append(
+            (stage, current, total)
+        ),
+    )
+
+    assert ("layout_dp_pass1", 0, 1) in events
+    assert ("layout_dp_pass1", 1, 1) in events
+    assert any(stage == "layout_dp_pass2" for stage, _current, _total in events)
+    assert events[-1] == ("layout_finalize", 1, 1)
+
+
 def test_prepare_srt_blocks_anchors_start_to_first_timed_word():
     blocks = [
         {

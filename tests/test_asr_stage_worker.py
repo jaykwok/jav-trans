@@ -49,6 +49,67 @@ def test_shared_vram_spill_is_soft_oom(monkeypatch):
         )
 
 
+def test_shared_vram_auto_deadband_ignores_pdh_granularity_but_catches_spill(
+    monkeypatch,
+):
+    monkeypatch.setenv("ASR_STAGE_WORKER_VRAM_BUDGET_MB", "5600")
+    monkeypatch.setenv("ASR_STAGE_WORKER_SHARED_VRAM_TOLERANCE_MB", "auto")
+    base = {
+        "stage": "split_done",
+        "total_mb": 8188.0,
+        "physical_ram_used_mb": 1000.0,
+        "physical_ram_budget_mb": 15000.0,
+        "max_allocated_mb": 4800.0,
+    }
+    asr_pipeline._enforce_vram_budget_from_snapshot(
+        {**base, "shared_vram_mb": 4.0}
+    )
+    with pytest.raises(RuntimeError, match="measurement_deadband_mb"):
+        asr_pipeline._enforce_vram_budget_from_snapshot(
+            {**base, "shared_vram_mb": 20.0}
+        )
+
+
+def test_stage_worker_emits_heartbeat_while_provider_is_silent(monkeypatch, tmp_path):
+    import time
+    from types import SimpleNamespace
+
+    class FakeConnection:
+        def __init__(self):
+            self.poll_count = 0
+
+        def poll(self, _wait_s):
+            self.poll_count += 1
+            if self.poll_count == 1:
+                time.sleep(0.02)
+                return False
+            return True
+
+        def recv(self):
+            return {
+                "op": "result",
+                "job_id": "heartbeat-job",
+                "segments": [],
+                "asr_log": [],
+                "asr_details": {},
+            }
+
+    client = gpu_worker._GpuWorkerClient()
+    client._conn = FakeConnection()
+    client._process = SimpleNamespace(is_alive=lambda: True, exitcode=None)
+    monkeypatch.setattr(client, "_send_request", lambda *_args, **_kwargs: None)
+    monkeypatch.setenv("ASR_STAGE_WORKER_HEARTBEAT_S", "0.01")
+    messages: list[str] = []
+
+    client._transcribe_and_align_once(
+        str(tmp_path / "audio.wav"),
+        job_id="heartbeat-job",
+        on_stage=messages.append,
+    )
+
+    assert any(message.startswith("阶段心跳 ") for message in messages)
+
+
 def test_physical_ram_ratio_is_hard_oom(monkeypatch):
     monkeypatch.setenv("ASR_STAGE_WORKER_VRAM_BUDGET_MB", "5600")
     with pytest.raises(RuntimeError, match="Physical RAM budget exceeded"):

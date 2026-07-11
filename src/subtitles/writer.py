@@ -3,7 +3,7 @@ import re
 import logging
 import math
 from pathlib import Path
-from typing import Literal
+from typing import Callable, Literal
 
 from subtitles.options import SubtitleOptions
 
@@ -631,11 +631,18 @@ def _split_long_display_blocks(
     blocks: list[dict],
     *,
     options: SubtitleOptions | None = None,
+    progress: Callable[[int, int], None] | None = None,
 ) -> list[dict]:
     options = _coerce_options(options)
     split: list[dict] = []
-    for block in blocks:
+    total = len(blocks)
+    interval = max(1, total // 100)
+    if progress is not None:
+        progress(0, total)
+    for index, block in enumerate(blocks, start=1):
         split.extend(_split_long_display_block(block, options=options))
+        if progress is not None and (index >= total or index % interval == 0):
+            progress(index, total)
     return split
 
 
@@ -859,8 +866,14 @@ def _prepare_subtitle_blocks(
     blocks: list[dict],
     *,
     options: SubtitleOptions | None = None,
+    on_stage: Callable[[str, int, int], None] | None = None,
 ) -> list[dict]:
     options = _coerce_options(options)
+    def stage(name: str, current: int, total: int) -> None:
+        if on_stage is not None:
+            on_stage(name, current, total)
+
+    stage("timeline_normalize", 0, 1)
     prepared = _copy_sorted_blocks(blocks)
     prepared = _normalize_subtitle_timeline(prepared, options=options)
     for idx in range(1, len(prepared) + 1):
@@ -870,13 +883,29 @@ def _prepare_subtitle_blocks(
         prepared[idx - 1]["display_start"] = start
         prepared[idx - 1]["display_end"] = end
         prepared[idx - 1]["display_duration"] = max(0.0, end - start)
-    prepared = _copy_sorted_blocks(_split_long_display_blocks(prepared, options=options))
+    stage("timeline_normalize", 1, 1)
+    prepared = _copy_sorted_blocks(
+        _split_long_display_blocks(
+            prepared,
+            options=options,
+            progress=lambda current, total: stage("layout_dp_pass1", current, total),
+        )
+    )
+    stage("timeline_polish", 0, 1)
     prepared = _polish_subtitle_timeline(prepared, options=options)
-    prepared = _copy_sorted_blocks(_split_long_display_blocks(prepared, options=options))
+    stage("timeline_polish", 1, 1)
+    prepared = _copy_sorted_blocks(
+        _split_long_display_blocks(
+            prepared,
+            options=options,
+            progress=lambda current, total: stage("layout_dp_pass2", current, total),
+        )
+    )
     # Reading-duration expansion can push a cue back into the next cue window.
     # Keep this final pass as the hard no-overlap, frame-gap guard for the cue plan.
     prepared = _normalize_subtitle_timeline(prepared, options=options)
     prepared = _finalize_layout_fields(prepared, options=options)
+    stage("layout_finalize", 1, 1)
     return prepared
 
 
@@ -885,6 +914,7 @@ def prepare_srt_blocks(
     *,
     options: SubtitleOptions | None = None,
     mode: Literal["srt", "bilingual"] = "srt",
+    on_stage: Callable[[str, int, int], None] | None = None,
 ) -> list[dict]:
     """Return the stable cue plan to translate and write as SRT."""
     options = _coerce_options(options)
@@ -892,6 +922,7 @@ def prepare_srt_blocks(
     return _prepare_subtitle_blocks(
         blocks,
         options=options,
+        on_stage=on_stage,
     )
 
 
