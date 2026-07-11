@@ -567,7 +567,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--semantic-split-model-path-by-repo",
         default=os.getenv("SEMANTIC_SPLIT_MODEL_PATH_BY_REPO", ""),
-        help="Optional repo-id checkpoint map for semantic_split_model_v1.",
+        help="Optional repo-id checkpoint map for semantic_split_model_v2.",
     )
     parser.add_argument(
         "--cut-edge-refiner-model-path-by-repo",

@@ -3,13 +3,11 @@ import json
 import logging
 import time
 import sys
-import warnings
 import hashlib
 import shutil
 from contextlib import contextmanager
 from pathlib import Path
 
-warnings.filterwarnings("ignore")
 os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
 os.environ["HF_HUB_DISABLE_SYMLINKS_WARNING"] = "1"
 

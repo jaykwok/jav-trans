@@ -13,7 +13,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[3]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from tools.asr.cueqc.compile_pre_asr_v11_features import project_path  # noqa: E402
+from tools.asr.cueqc.pre_asr_feature_compiler import project_path  # noqa: E402
 
 
 def _read_jsonl(path: Path) -> list[dict[str, Any]]:

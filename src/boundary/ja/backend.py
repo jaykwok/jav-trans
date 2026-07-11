@@ -839,7 +839,7 @@ class SpeechBoundaryJaBackend:
             "min_split_segment_s": float(cfg.min_split_segment_s),
             "split_score_quantile": float(cfg.split_score_quantile),
             "split_prominence_quantile": float(cfg.split_prominence_quantile),
-            "split_decision": "external_semantic_split_model_v1",
+            "split_decision": "external_semantic_split_model_v2",
             "base_fps": float(BASE_FPS),
             "micro_chunk_min_duration_s": float(_subtitle_min_duration_s_for_config(cfg)),
             "export_sequence_features": bool(cfg.export_sequence_features),

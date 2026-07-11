@@ -8,7 +8,7 @@ ROOT = Path(__file__).resolve().parents[3]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from tools.asr.cueqc.compile_pre_asr_v11_features import (
+from tools.asr.cueqc.pre_asr_feature_compiler import (
     candidate_for_chunk,
     compile_features,
     expand_chunk_paths,

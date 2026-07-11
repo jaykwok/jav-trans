@@ -17,7 +17,6 @@ from boundary.sequence_features import (
 )
 from boundary.split_model import (
     SemanticSplitIslandVerifier,
-    SemanticSplitVerifier,
     SplitDecision,
 )
 
@@ -104,7 +103,7 @@ def build_semantic_boundary_chunks(
     speech_probabilities: Sequence[float],
     feature_provider: FrameSequenceFeatureProvider,
     outer_refiner: OuterEdgeRefiner,
-    split_verifier: SemanticSplitVerifier | SemanticSplitIslandVerifier,
+    split_verifier: SemanticSplitIslandVerifier,
     cut_refiner: CutEdgeRefiner,
     config: SemanticBoundaryConfig = SemanticBoundaryConfig(),
     split_audit_records: list[dict] | None = None,
@@ -330,81 +329,7 @@ def build_semantic_boundary_chunks(
             pending_candidates += len(proposals)
         flush_pending()
     else:
-        proposal_groups: list[list[dict]] = []
-        split_feature_groups: list[np.ndarray] = []
-        split_scalar_groups: list[np.ndarray] = []
-        split_decision_groups: list[list[SplitDecision]] = []
-        split_inputs: list[tuple[int, np.ndarray, np.ndarray]] = []
-        for group_index, (
-            segment,
-            core_start,
-            core_end,
-            _outer_prediction,
-        ) in enumerate(refined):
-            proposals = [
-                dict(candidate)
-                for candidate in segment.weak_cut_candidates
-                if core_start < float(candidate["time_s"]) < core_end
-            ]
-            frame_features, scalar_features = _split_features(
-                proposals,
-                core_start=core_start,
-                core_end=core_end,
-                speech=speech,
-                provider=feature_provider,
-                verifier=split_verifier,
-            )
-            proposal_groups.append(proposals)
-            split_feature_groups.append(frame_features)
-            split_scalar_groups.append(scalar_features)
-            split_decision_groups.append([])
-            for row_index in range(frame_features.shape[0]):
-                split_inputs.append(
-                    (
-                        group_index,
-                        frame_features[row_index],
-                        scalar_features[row_index],
-                    )
-                )
-        if split_inputs:
-            all_frames = np.stack([item[1] for item in split_inputs])
-            all_scalars = np.stack([item[2] for item in split_inputs])
-            all_decisions = _batched_split_decisions(
-                split_verifier,
-                frame_features=all_frames,
-                scalar_features=all_scalars,
-            )
-            for (group_index, _frames, _scalars), decision in zip(
-                split_inputs,
-                all_decisions,
-            ):
-                split_decision_groups[group_index].append(decision)
-        for index, (
-            segment,
-            core_start,
-            core_end,
-            outer_prediction,
-        ) in enumerate(refined):
-            finish_group(
-                segment=segment,
-                core_start=core_start,
-                core_end=core_end,
-                outer_prediction=outer_prediction,
-                proposals=proposal_groups[index],
-                decisions=split_decision_groups[index],
-                audit_chunks=(
-                    (
-                        (
-                            proposal_groups[index],
-                            split_decision_groups[index],
-                            split_feature_groups[index],
-                            split_scalar_groups[index],
-                        ),
-                    )
-                    if split_audit_records is not None
-                    else ()
-                ),
-            )
+        raise TypeError("Semantic Split runtime requires a v2 island verifier")
 
     if not refined:
         progress("语义切分判断", 1, 1)
@@ -555,25 +480,6 @@ def _semantic_split_inference_batch_size() -> int:
         return max(1, int(raw))
     except ValueError:
         return 128
-
-
-def _batched_split_decisions(
-    verifier,
-    *,
-    frame_features: np.ndarray,
-    scalar_features: np.ndarray,
-) -> list[SplitDecision]:
-    batch_size = _semantic_split_inference_batch_size()
-    decisions: list[SplitDecision] = []
-    for start in range(0, frame_features.shape[0], batch_size):
-        end = min(frame_features.shape[0], start + batch_size)
-        decisions.extend(
-            verifier.decide(
-                frame_features=frame_features[start:end],
-                scalar_features=scalar_features[start:end],
-            )
-        )
-    return decisions
 
 
 _MAX_ISLAND_BATCH_CANDIDATES = 256

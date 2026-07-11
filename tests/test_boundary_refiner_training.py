@@ -17,8 +17,8 @@ from boundary.outer_refiner import (
 from boundary.split_model import (
     SEMANTIC_SPLIT_FEATURE_SCHEMA,
     SEMANTIC_SPLIT_LABELS,
-    SEMANTIC_SPLIT_RUNTIME_ADAPTER,
-    SEMANTIC_SPLIT_SCHEMA,
+    SEMANTIC_SPLIT_V2_RUNTIME_ADAPTER,
+    SEMANTIC_SPLIT_V2_SCHEMA,
 )
 
 
@@ -37,11 +37,11 @@ REPO_ID = "jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame-hf"
             OUTER_EDGE_REFINER_RUNTIME_ADAPTER,
         ),
         (
-            "src/checkpoints/jaykwok-Qwen3-ASR-1.7B-JA-Anime-Galgame-hf/semantic_split_model_v1."
+            "src/checkpoints/jaykwok-Qwen3-ASR-1.7B-JA-Anime-Galgame-hf/semantic_split_model_v2."
             "jaykwok-Qwen3-ASR-1.7B-JA-Anime-Galgame-hf.pt",
-            SEMANTIC_SPLIT_SCHEMA,
+            SEMANTIC_SPLIT_V2_SCHEMA,
             SEMANTIC_SPLIT_FEATURE_SCHEMA,
-            SEMANTIC_SPLIT_RUNTIME_ADAPTER,
+            SEMANTIC_SPLIT_V2_RUNTIME_ADAPTER,
         ),
         (
             "src/checkpoints/jaykwok-Qwen3-ASR-1.7B-JA-Anime-Galgame-hf/cut_edge_refiner_v1."
@@ -68,14 +68,14 @@ def test_promoted_boundary_checkpoint_contract(
     assert payload["metadata"]["ptm_repo_id"] == REPO_ID
 
 
-def test_semantic_split_checkpoint_is_three_class() -> None:
+def test_semantic_split_checkpoint_has_v2_label_contract() -> None:
     torch = pytest.importorskip("torch")
     checkpoint = (
         ROOT
-        / "src/checkpoints/jaykwok-Qwen3-ASR-1.7B-JA-Anime-Galgame-hf/semantic_split_model_v1."
+        / "src/checkpoints/jaykwok-Qwen3-ASR-1.7B-JA-Anime-Galgame-hf/semantic_split_model_v2."
         "jaykwok-Qwen3-ASR-1.7B-JA-Anime-Galgame-hf.pt"
     )
     payload = torch.load(checkpoint, map_location="cpu", weights_only=False)
 
+    assert payload["schema"] == SEMANTIC_SPLIT_V2_SCHEMA
     assert tuple(payload["metadata"]["labels"]) == SEMANTIC_SPLIT_LABELS
-    assert payload["model_config"]["output_dim"] == 3

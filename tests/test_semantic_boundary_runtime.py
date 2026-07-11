@@ -31,6 +31,21 @@ class _SplitVerifier:
     def decide(self, *, frame_features, scalar_features):
         return [SplitDecision("cut", 0.95, 0.03, 0.02)]
 
+    def decide_islands(self, *, island_frame_features, island_scalar_features):
+        counts = [int(frames.shape[0]) for frames in island_frame_features]
+        if not any(counts):
+            return [[] for _count in counts]
+        flat = self.decide(
+            frame_features=np.concatenate(island_frame_features, axis=0),
+            scalar_features=np.concatenate(island_scalar_features, axis=0),
+        )
+        groups = []
+        offset = 0
+        for count in counts:
+            groups.append(flat[offset : offset + count])
+            offset += count
+        return groups
+
 
 class _CutRefiner:
     feature_config = {

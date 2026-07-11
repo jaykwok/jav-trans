@@ -18,7 +18,7 @@ for root in (PROJECT_ROOT, SRC_ROOT):
         sys.path.insert(0, str(root))
 
 from asr.pre_asr_cueqc import PreAsrCueQCNetwork, make_model_config  # noqa: E402
-from tools.asr.cueqc.compile_pre_asr_v11_features import project_path  # noqa: E402
+from tools.asr.cueqc.pre_asr_feature_compiler import project_path  # noqa: E402
 
 
 def _read_jsonl(path: Path) -> list[dict[str, Any]]:

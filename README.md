@@ -207,6 +207,7 @@ ASR_BATCH_SIZE=auto
 ASR_BATCH_SIZE_BY_REPO=jaykwok/Qwen3-ASR-0.6B-JA-Anime-Galgame-hf=12,jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame-hf=4
 ASR_STAGE_WORKER_VRAM_BUDGET_MB=auto
 ASR_STAGE_WORKER_VRAM_RATIO=0.95
+ASR_STAGE_WORKER_RAM_RATIO=0.95
 ASR_STAGE_WORKER_OOM_RETRY_LIMIT=6
 GPU_BATCH_PROFILE_ENABLED=1
 GPU_BATCH_PROFILE_GROWTH_THRESHOLD=0.80
@@ -220,11 +221,11 @@ PRE_ASR_CUEQC_DROP_THRESHOLD=
 
 ASR stage 固定由统一 GPU worker 持有 CUDA：Boundary/PTM feature extraction、Pre-ASR CueQC、ASR 和对齐都在同一个 GPU owner 进程里顺序执行，Web / 调度主进程只做任务编排、缓存索引和输出写入。OOM、CUDA 状态异常或超过 `ASR_STAGE_WORKER_VRAM_BUDGET_MB` 时会杀掉 worker，不会把 Web 主进程一起带崩。
 
-`ASR_STAGE_WORKER_VRAM_BUDGET_MB=auto` 会按物理 dedicated VRAM × `0.95` 计算软 OOM 线；RTX 4060 Ti `8188MiB` 的 cap 为约 `7779MiB`。shared VRAM 不算可用空间，发生 shared spill 即视为 soft OOM。CPU 数据处理同样以物理 RAM × `0.95` 为 OOM 线，长数据默认 streaming/memmap。
+`ASR_STAGE_WORKER_VRAM_BUDGET_MB=auto` 按物理 dedicated VRAM × `0.95` 计算软 OOM 线；RTX 4060 Ti `8188MiB` 的 cap 约为 `7779MiB`。Windows worker 使用 PDH 记录 CUDA 空载时的 shared VRAM 基线，之后任何正增长都视为 shared spill/soft OOM；监控不可用会直接停止。物理 RAM 使用按 `total-available` 计算，超过 `total × ASR_STAGE_WORKER_RAM_RATIO`（默认 `0.95`）同样停止。
 
 Boundary cache 当前版本为 `v18`；旧 cache 不迁移。cache 签名包含 repo-bound 模型路径和运行配置，不兼容缓存会直接 miss。
 
-`ASR_BATCH_SIZE=auto` 以 5600MB 下的 repo 默认表为基线，按上述显存预算比例放缩初始 batch。ASR 发生硬/软 OOM 时会重启 worker、batch 减半，并从 Boundary cache 和 ASR checkpoint 续跑；降到 1 仍 OOM 才停止。SpeechBoundary 的 Qwen PTM 使用固定 20 秒时序窗口：窗口长度会影响 embedding、重叠平均和 scorer 结果，因此不会被当作 batch 自动放缩。
+`ASR_BATCH_SIZE=auto` 以 5600MB 下的 repo 默认表为基线，按显存预算比例放缩初始 batch。ASR text batch 与 Semantic Split candidate batch 发生 GPU OOM 时会重启 worker、降低对应 batch 并从 cache/checkpoint 续跑；SpeechBoundary/PTM、Outer/Cut Refiner、Pre-ASR CueQC 的执行形状不会为规避 OOM 而改变，OOM 时直接停止。RAM OOM 也直接停止，不伪装成可由 GPU batch 修复的问题。
 
 auto batch 会在 `tmp/cache/gpu_batch_profiles.json` 按 GPU、模型和推理配置跨任务学习。一个任务成功且该阶段 peak allocated 低于预算的 `80%` 时，下个任务尝试 `+1`；OOM 会记录不安全上界并降低 batch。当前覆盖 ASR chunk batch 与 Semantic Split 独立候选 batch。显式数字 batch 不参与学习；Speech scorer/PTM 的时序窗口、Pre-ASR planned-island 序列，以及 Outer/Cut 的既有执行形状不会为了学习而改变。
 
@@ -308,6 +309,7 @@ ASR_BACKEND=jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame-hf
 ASR_BATCH_SIZE_BY_REPO=jaykwok/Qwen3-ASR-0.6B-JA-Anime-Galgame-hf=12,jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame-hf=4
 ASR_STAGE_WORKER_VRAM_BUDGET_MB=auto
 ASR_STAGE_WORKER_VRAM_RATIO=0.95
+ASR_STAGE_WORKER_RAM_RATIO=0.95
 SPEECH_BOUNDARY_JA_WINDOW_S=20
 SPEECH_BOUNDARY_JA_OVERLAP_S=4
 ```
@@ -338,7 +340,7 @@ ASR_BATCH_SIZE=auto
 - `src/main.py`：主流程编排。
 - `src/core/`：配置和任务上下文。
 - `src/pipeline/`：音频、缓存、输出、质量报告和阶段日志。
-- `src/asr/`：ASR、Boundary 字幕时间轴分配、Pre-ASR CueQC 和转写流程；ASR-after CueQC v4 仅保留为离线审计工具入口。
+- `src/asr/`：ASR、Boundary 字幕时间轴分配、Pre-ASR CueQC 和转写流程。
 - `src/boundary/`：Boundary Refiner checkpoint loader、edge-sequence Mamba2 adapter、core planner 和 boundary-cache。
 - `src/boundary/ja/`：SpeechBoundary-JA scorer、PTM/MFCC feature cache schema、训练数据 manifest 和 frame-score 训练工具。
 - `src/llm/`：翻译 prompt、cache、glossary、API patch 和 translator。
