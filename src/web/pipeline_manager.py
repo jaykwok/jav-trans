@@ -64,6 +64,7 @@ _jobs_path = PROJECT_ROOT / "tmp" / "web" / "jobs.json"
 _FINISHED_STATUSES = {"done", "failed", "cancelled"}
 _RETRYABLE_STATUSES = {"failed", "cancelled"}
 _last_progress_write_ts: dict[str, float] = {}
+_jobs_write_lock = threading.Lock()
 
 _EVENT_STAGE_STATUS = {
     "translation": "translating",
@@ -81,13 +82,23 @@ def _write_jobs_snapshot(snapshot: list[JobState]) -> None:
     # _state_lock and call this outside the lock so the blocking dumps+replace
     # does not extend the critical section.
     payload = [job.model_dump() for job in snapshot]
-    _jobs_path.parent.mkdir(parents=True, exist_ok=True)
-    tmp_path = _jobs_path.with_name(f"{_jobs_path.name}.{os.getpid()}.tmp")
-    tmp_path.write_text(
-        json.dumps(payload, ensure_ascii=False, indent=2),
-        encoding="utf-8",
-    )
-    tmp_path.replace(_jobs_path)
+    with _jobs_write_lock:
+        _jobs_path.parent.mkdir(parents=True, exist_ok=True)
+        tmp_path = _jobs_path.with_name(
+            f"{_jobs_path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp"
+        )
+        tmp_path.write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        for attempt in range(5):
+            try:
+                tmp_path.replace(_jobs_path)
+                break
+            except PermissionError:
+                if attempt >= 4:
+                    raise
+                _time.sleep(0.02 * (attempt + 1))
 
 
 def _write_jobs_unlocked() -> None:
@@ -291,7 +302,7 @@ def _snapshot_translation_settings(spec: JobSpec) -> JobSpec:
     reasoning_effort = getattr(spec, "llm_reasoning_effort", None)
     if reasoning_effort is None or not str(reasoning_effort).strip():
         updates["llm_reasoning_effort"] = _normalize_llm_reasoning_effort(
-            _runtime_setting("LLM_REASONING_EFFORT", "xhigh")
+            _runtime_setting("LLM_REASONING_EFFORT", "medium")
         )
 
     return spec.model_copy(update=updates) if updates else spec

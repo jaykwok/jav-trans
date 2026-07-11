@@ -163,7 +163,7 @@ export async function loadSettings() {
     updateProxyFieldsState();
 
     const effort = $('api-reasoning-effort');
-    if (effort) effort.value = s.llm_reasoning_effort || 'xhigh';
+    if (effort) effort.value = s.llm_reasoning_effort || 'medium';
     const apiFormat = $('api-format');
     if (apiFormat) apiFormat.value = s.llm_api_format || 'chat';
     const targetLang = $('api-target-lang');
@@ -194,7 +194,7 @@ export function readTranslationSettingsFromForm() {
   };
 
   return {
-    llm_reasoning_effort: $('api-reasoning-effort').value || 'xhigh',
+    llm_reasoning_effort: $('api-reasoning-effort').value || 'medium',
     llm_api_format:       $('api-format').value || 'chat',
     target_lang:          $('api-target-lang').value || '简体中文',
     translation_glossary: ($('api-glossary').value || '')

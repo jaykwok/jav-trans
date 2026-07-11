@@ -53,10 +53,10 @@ def _llm_api_format(value: str) -> str:
 
 
 def _llm_reasoning_effort(value: str) -> str:
-    normalized = (value or "xhigh").strip().lower()
+    normalized = (value or "medium").strip().lower()
     if normalized in {"medium", "xhigh"}:
         return normalized
-    return "xhigh"
+    return "medium"
 
 
 @dataclass
@@ -76,7 +76,7 @@ class JobContext:
     run_log_enabled: bool = True
     run_log_dir: str = "./tmp/log"
     llm_api_format: str = "chat"
-    llm_reasoning_effort: str = "xhigh"
+    llm_reasoning_effort: str = "medium"
     advanced: dict[str, str] = field(default_factory=dict)
 
     @classmethod
@@ -153,7 +153,7 @@ class JobContext:
                     advanced,
                     "LLM_REASONING_EFFORT",
                     "llm_reasoning_effort",
-                    "xhigh",
+                    "medium",
                 )
             ),
             advanced=advanced,

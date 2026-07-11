@@ -67,7 +67,7 @@ OPENAI_COMPATIBILITY_BASE_URL = (
 API_KEY = os.getenv("API_KEY", "").strip() or None
 LLM_MODEL_NAME = os.getenv("LLM_MODEL_NAME", "").strip()
 LLM_API_FORMAT = os.getenv("LLM_API_FORMAT", "chat").strip().lower() or "chat"
-LLM_REASONING_EFFORT = os.getenv("LLM_REASONING_EFFORT", "xhigh").strip() or "xhigh"
+LLM_REASONING_EFFORT = os.getenv("LLM_REASONING_EFFORT", "medium").strip() or "medium"
 
 DEFAULT_TARGET_LANG = "简体中文"
 TRANSLATION_MAX_TOKENS = 384000
@@ -158,11 +158,11 @@ def _llm_api_format(api_format: str | None = None) -> str:
     return _normalize_llm_api_format(value)
 
 
-def _normalize_reasoning_effort(value: str | None, fallback: str = "xhigh") -> str:
-    normalized = (value or fallback or "xhigh").strip().lower()
+def _normalize_reasoning_effort(value: str | None, fallback: str = "medium") -> str:
+    normalized = (value or fallback or "medium").strip().lower()
     if normalized in {"medium", "xhigh"}:
         return normalized
-    return fallback if fallback in {"medium", "xhigh"} else "xhigh"
+    return fallback if fallback in {"medium", "xhigh"} else "medium"
 
 
 def _normalize_openai_compat_base_url(base_url: str | None) -> str | None:
