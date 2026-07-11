@@ -6,6 +6,8 @@
 
 ---
 
+- 2026-07-11 Split cut-eager Stage 1 replay：冻结 FJIN 当前 no-word-timeline 基线 `336` segments，chunk duration p50/p90/p95/p99/max=`3.274/7.222/10.382/16.949/28.152s`，`75` 段超过 5 秒、`29` 段超过 8 秒。新增正式只读工具 `tools/datasets/analyze_split_cut_eager_operating_point.py`，在同一 residual candidates 上比较 current runtime、binary gate `p_cut>=0.5` 与三类概率 argmax。真实输出 `agents/temp/20260711_200110_fjin-split-cut-eager-v2-replay/summary.json`：argmax 将 p95 降到 `4.523s`、cut recall `86.67%`，但 matched Omni truth precision 仅 `44.83%`，same-sentence/short-pause/breath false-cut rate `17.02%`；未过 precision `>=90%` 与句内停顿误切 `<=2%` gate，禁止直接把 v2 runtime 改成 cut-eager，下一步必须用 hard cases 重训 Split v3。timings 现记录 checkpoint+env 合并后的 effective Split config，修复此前输出 raw env false 而实际 checkpoint 已启用 duration pressure 的诊断错位。`boundary_proportional` 生成的比例词时间显式标为 `synthetic_proportional` / `word_timestamps_real=false`，字幕层不再把它当真实 word start anchor。后续按用户修正采用 teacher-only 时间轴闭环：Forced Aligner 仅离线提供部分词锚点，Omni 仅对固定 ASR 文本做 audio-text alignment，二者融合后训练 Split/轻量 display 模型；正式 workflow 不加载 Forced Aligner。
+
 - 2026-07-11 Web 状态持久化并发修复与 LLM effort 默认收敛：多个 translation worker 会并发写 `jobs.json`，旧实现用固定 `<pid>.tmp`，首先发生临时文件互相覆盖；改为 UUID 临时文件后又稳定复现 Windows 目标文件短占用导致的 `WinError 5`。持久化现使用进程内写锁、每次唯一临时文件，并仅对 `PermissionError` 做 5 次短退避 replace，其他错误原样失败；`test_pipeline_workers_overlap` 连续 4 次通过。按用户要求，配置、JobContext、translator、Web API/model、设置页默认 reasoning effort 全部从 `xhigh` 收敛为 `medium`，显式 `xhigh` 仍保留。
 
 - 2026-07-11 Web 任务条终态文案修复：任务完成后后端 `status=done`，但 `progress.stage/current_stage` 会保留最后的 `write_output` 供诊断与重试判断；前端原先优先渲染残留 stage，导致 100% 的任务条仍显示“写入字幕”。展示阶段现在对 `done/failed/cancelled` 终态优先，完成显示“已完成”并隐藏旧阶段计数；重试路径继续独立读取原始 stage，不改变失败任务的 ASR/翻译重试分流。验证：`node --check` 通过，相关 Web 回归 `27 passed`，全量 pytest `692 passed, 4 warnings`。

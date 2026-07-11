@@ -31,7 +31,14 @@ def _build_tokens_over_window(tokens: list[str], start: float, end: float) -> li
             if idx == len(tokens) - 1
             else min(clipped_end, cursor + total_duration * (weight / total_chars))
         )
-        words.append({"start": cursor, "end": max(cursor, token_end), "word": token})
+        words.append(
+            {
+                "start": cursor,
+                "end": max(cursor, token_end),
+                "word": token,
+                "timestamp_kind": "synthetic_proportional",
+            }
+        )
         cursor = token_end
     return words
 
@@ -44,9 +51,15 @@ def build_boundary_word_timestamps(
     cleaned = _clean_text(text)
     tokens = _tokenize(cleaned)
     if not tokens:
-        return [], "empty", {"timing_source": "boundary_chunk"}
+        return [], "empty", {
+            "timing_source": "synthetic_boundary_proportional",
+            "word_timestamps_real": False,
+        }
     return (
         _build_tokens_over_window(tokens, start, end),
         "boundary_proportional",
-        {"timing_source": "boundary_chunk"},
+        {
+            "timing_source": "synthetic_boundary_proportional",
+            "word_timestamps_real": False,
+        },
     )

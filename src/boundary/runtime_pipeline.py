@@ -42,7 +42,7 @@ def _decision_bool(value, default: bool) -> bool:
     return str(value).strip().lower() in {"1", "true", "yes", "on"}
 
 
-def _effective_semantic_config(
+def effective_semantic_config(
     split_verifier,
     config: SemanticBoundaryConfig,
 ) -> SemanticBoundaryConfig:
@@ -96,6 +96,21 @@ def _effective_semantic_config(
     )
 
 
+def semantic_config_payload(config: SemanticBoundaryConfig) -> dict[str, float | bool | str]:
+    return {
+        "decision_mode": "threshold",
+        "short_core_max_s": float(config.short_core_max_s),
+        "short_core_cut_threshold": float(config.short_core_cut_threshold),
+        "normal_cut_threshold": float(config.normal_cut_threshold),
+        "min_chunk_after_split_s": float(config.min_chunk_after_split_s),
+        "duration_pressure_enabled": bool(config.duration_pressure_enabled),
+        "duration_pressure_log_median": float(config.duration_pressure_log_median),
+        "duration_pressure_log_mad": float(config.duration_pressure_log_mad),
+        "duration_pressure_z": float(config.duration_pressure_z),
+        "duration_pressure_floor": float(config.duration_pressure_floor),
+    }
+
+
 def build_semantic_boundary_chunks(
     segments: Sequence[SpeechSegment],
     *,
@@ -119,7 +134,7 @@ def build_semantic_boundary_chunks(
             on_stage(f"{label} {current}/{total}")
 
     speech = np.asarray(speech_probabilities, dtype=np.float32)
-    config = _effective_semantic_config(split_verifier, config)
+    config = effective_semantic_config(split_verifier, config)
     progress("外边界精修", 0, 1)
     refined = _refine_outer_edges(
         segments,

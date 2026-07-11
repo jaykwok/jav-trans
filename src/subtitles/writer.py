@@ -673,6 +673,7 @@ def _word_start_anchor(words: list[dict]) -> float | None:
     timed = [
         word
         for word in words
+        if str(word.get("timestamp_kind") or "") != "synthetic_proportional"
         if float(word.get("end", word.get("start", 0.0))) > float(word.get("start", 0.0))
     ]
     if not timed:

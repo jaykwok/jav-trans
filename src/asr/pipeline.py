@@ -23,7 +23,12 @@ from boundary.sequence_features import (
 )
 from boundary.cut_refiner import load_cut_edge_refiner
 from boundary.outer_refiner import load_outer_edge_refiner
-from boundary.runtime_pipeline import SemanticBoundaryConfig, build_semantic_boundary_chunks
+from boundary.runtime_pipeline import (
+    SemanticBoundaryConfig,
+    build_semantic_boundary_chunks,
+    effective_semantic_config,
+    semantic_config_payload,
+)
 from boundary.split_model import (
     load_semantic_split_feature_config,
     load_semantic_split_verifier,
@@ -556,6 +561,23 @@ def _build_processing_spans(
         for key, value in result.parameters.items()
         if key not in {"frame_scores", "candidate_frame_scores", "sequence_feature_frames"}
     }
+    requested_semantic_config = SemanticBoundaryConfig(
+        duration_pressure_enabled=bool(
+            cfg["semantic_split_duration_pressure_enabled"]
+        ),
+        duration_pressure_log_median=float(
+            cfg["semantic_split_duration_pressure_log_median"]
+        ),
+        duration_pressure_log_mad=float(
+            cfg["semantic_split_duration_pressure_log_mad"]
+        ),
+        duration_pressure_z=float(cfg["semantic_split_duration_pressure_z"]),
+        duration_pressure_floor=float(cfg["semantic_split_duration_pressure_floor"]),
+    )
+    resolved_semantic_config = effective_semantic_config(
+        split_verifier,
+        requested_semantic_config,
+    )
     runtime_boundary_signature = {
         **result_parameters,
         "boundary_pipeline": {
@@ -576,23 +598,9 @@ def _build_processing_spans(
             "semantic_split_model": split_verifier.signature(),
             "cut_edge_refiner": cut_refiner.signature(),
             "sequence_feature_provider": sequence_feature_provider.signature(),
-            "semantic_boundary_config": {
-                "duration_pressure_enabled": bool(
-                    cfg["semantic_split_duration_pressure_enabled"]
-                ),
-                "duration_pressure_log_median": float(
-                    cfg["semantic_split_duration_pressure_log_median"]
-                ),
-                "duration_pressure_log_mad": float(
-                    cfg["semantic_split_duration_pressure_log_mad"]
-                ),
-                "duration_pressure_z": float(
-                    cfg["semantic_split_duration_pressure_z"]
-                ),
-                "duration_pressure_floor": float(
-                    cfg["semantic_split_duration_pressure_floor"]
-                ),
-            },
+            "semantic_boundary_config": semantic_config_payload(
+                resolved_semantic_config
+            ),
         },
     }
     segments = result.segments
@@ -628,21 +636,7 @@ def _build_processing_spans(
         outer_refiner=outer_refiner,
         split_verifier=split_verifier,
         cut_refiner=cut_refiner,
-        config=SemanticBoundaryConfig(
-            duration_pressure_enabled=bool(
-                cfg["semantic_split_duration_pressure_enabled"]
-            ),
-            duration_pressure_log_median=float(
-                cfg["semantic_split_duration_pressure_log_median"]
-            ),
-            duration_pressure_log_mad=float(
-                cfg["semantic_split_duration_pressure_log_mad"]
-            ),
-            duration_pressure_z=float(cfg["semantic_split_duration_pressure_z"]),
-            duration_pressure_floor=float(
-                cfg["semantic_split_duration_pressure_floor"]
-            ),
-        ),
+        config=resolved_semantic_config,
         split_audit_records=split_audit_records,
         on_stage=on_stage,
     )
