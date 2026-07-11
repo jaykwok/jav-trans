@@ -29,22 +29,30 @@ def _emit_progress(on_stage: Callable[[str], None] | None, message: str) -> None
         on_stage(message)
     print(message, flush=True)
 
-_ASR_INVALID_SEGMENT_DURATION_S = float(
-    os.getenv("ASR_INVALID_SEGMENT_DURATION", "0.1")
-)
-_ASR_MIN_REPAIRED_SEGMENT_DURATION_S = float(
-    os.getenv("ASR_MIN_REPAIRED_SEGMENT_DURATION", "0.6")
-)
-_ASR_CHECKPOINT_INTERVAL = max(1, int(os.getenv("ASR_CHECKPOINT_INTERVAL", "50")))
-_ASR_CHECKPOINT_ENABLED = os.getenv("ASR_CHECKPOINT_ENABLED", "1").strip().lower() not in {
-    "0",
-    "false",
-    "no",
-    "off",
-}
 _TRIVIAL_SEGMENT = re.compile(
     r"^[。！？…、\s,.!?・「」（）【】；：\-—–]+$"
 )
+
+
+def _asr_checkpoint_enabled() -> bool:
+    return os.getenv("ASR_CHECKPOINT_ENABLED", "1").strip().lower() not in {
+        "0",
+        "false",
+        "no",
+        "off",
+    }
+
+
+def _asr_checkpoint_interval() -> int:
+    return max(1, int(os.getenv("ASR_CHECKPOINT_INTERVAL", "50")))
+
+
+def _asr_invalid_segment_duration_s() -> float:
+    return float(os.getenv("ASR_INVALID_SEGMENT_DURATION", "0.1"))
+
+
+def _asr_min_repaired_segment_duration_s() -> float:
+    return float(os.getenv("ASR_MIN_REPAIRED_SEGMENT_DURATION", "0.6"))
 _STRIP_PUNCT_RE = re.compile(r"[。！？…、,.!?・「」『』（）()【】\[\]\s~〜ー-]+")
 
 
@@ -268,7 +276,7 @@ def _transcribe_asr_chunks_text_only(
 
     def _save_progress_checkpoint() -> None:
         nonlocal processed_since_checkpoint
-        if processed_since_checkpoint < _ASR_CHECKPOINT_INTERVAL:
+        if processed_since_checkpoint < _asr_checkpoint_interval():
             return
         _save_asr_checkpoint(
             checkpoint_path,
@@ -361,7 +369,7 @@ def _transcribe_asr_chunks_text_only(
             _delete_path_for_cleanup(checkpoint_path)
     finally:
         if (
-            _ASR_CHECKPOINT_ENABLED
+            _asr_checkpoint_enabled()
             and not completed
             and not final_checkpoint_saved
             and processed_since_checkpoint > 0
@@ -591,8 +599,8 @@ def _repair_postprocessed_segment_windows(segments: list[dict]) -> list[dict]:
             repaired[-1]["end"] = max(float(repaired[-1]["start"]), start)
 
         duration = end - start
-        if duration <= _ASR_INVALID_SEGMENT_DURATION_S:
-            target_end = start + _ASR_MIN_REPAIRED_SEGMENT_DURATION_S
+        if duration <= _asr_invalid_segment_duration_s():
+            target_end = start + _asr_min_repaired_segment_duration_s()
             end = max(end, target_end)
 
         repaired.append(
@@ -612,8 +620,8 @@ def _repair_postprocessed_segment_windows(segments: list[dict]) -> list[dict]:
         end = float(segment["end"])
         if non_overlapping and start < float(non_overlapping[-1]["end"]):
             non_overlapping[-1]["end"] = max(float(non_overlapping[-1]["start"]), start)
-        if end - start <= _ASR_INVALID_SEGMENT_DURATION_S:
-            end = start + _ASR_MIN_REPAIRED_SEGMENT_DURATION_S
+        if end - start <= _asr_invalid_segment_duration_s():
+            end = start + _asr_min_repaired_segment_duration_s()
         non_overlapping.append(
             {
                 "start": start,

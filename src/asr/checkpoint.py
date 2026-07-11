@@ -13,7 +13,6 @@ from asr.backends.registry import (
 )
 from asr.backends.qwen import active_qwen_asr_model_id
 from asr.pre_asr_cueqc import runtime_signature as pre_asr_cueqc_runtime_signature
-from asr.local_backend import ASR_DTYPE
 
 
 def _asr_generation_error_kind(kind: str) -> str:
@@ -26,9 +25,6 @@ def _asr_generation_error_kind(kind: str) -> str:
 
 
 _LAST_BOUNDARY_SIGNATURE: dict = {}
-_ASR_CHUNK_ROOT = Path(
-    os.getenv("ASR_CHUNK_ROOT", Path("tmp") / "chunks")
-).resolve()
 
 
 def _checkpoint_enabled(enabled: bool | None = None) -> bool:
@@ -45,7 +41,7 @@ def _checkpoint_enabled(enabled: bool | None = None) -> bool:
 def _current_chunk_root(chunk_root: Path | str | None = None) -> Path:
     if chunk_root is not None:
         return Path(chunk_root).resolve()
-    return Path(os.getenv("ASR_CHUNK_ROOT", _ASR_CHUNK_ROOT)).resolve()
+    return Path(os.getenv("ASR_CHUNK_ROOT", Path("tmp") / "chunks")).resolve()
 
 
 def _is_timed_out_result(result: dict) -> bool:
@@ -171,7 +167,7 @@ def _get_asr_runtime_signature(
             "asr_model_id": _env_text("ASR_MODEL_ID", ""),
             "resolved_asr_model_id": active_qwen_asr_model_id(),
             "asr_model_path": _env_text("ASR_MODEL_PATH", ""),
-            "asr_dtype": _env_lower("ASR_DTYPE", ASR_DTYPE),
+            "asr_dtype": _env_lower("ASR_DTYPE", "auto"),
             "asr_attention": _env_lower("ASR_ATTENTION", "auto"),
         },
         "language": {
@@ -404,7 +400,7 @@ def _quarantine_failed_chunks(
         return []
 
     chunk_by_index = {int(chunk["index"]): chunk for chunk in chunks}
-    out_dir = _ASR_CHUNK_ROOT.parent / "asr_timeouts"
+    out_dir = _current_chunk_root().parent / "asr_timeouts"
     out_dir.mkdir(parents=True, exist_ok=True)
     written: list[Path] = []
 
@@ -430,7 +426,7 @@ def _quarantine_failed_chunks(
             "start": float(chunk.get("start", 0.0)),
             "end": float(chunk.get("end", 0.0)),
             "model": active_qwen_asr_model_id(),
-            "dtype": ASR_DTYPE,
+            "dtype": _env_lower("ASR_DTYPE", "auto"),
             "timeout_s": float(os.getenv("TRANSCRIPTION_TIMEOUT_S", "180")),
             "respawn_count": int(record.get("respawn_count", 0)),
             "failure_kind": str(record.get("kind") or "crash"),
@@ -454,7 +450,7 @@ def aggregate_timeout_fragments(job_id: str) -> Path | None:
     if not normalized_job_id:
         return None
 
-    out_dir = _ASR_CHUNK_ROOT.parent / "asr_timeouts"
+    out_dir = _current_chunk_root().parent / "asr_timeouts"
     if not out_dir.exists() or not out_dir.is_dir():
         return None
 

@@ -21,8 +21,6 @@ from asr.text_normalize import normalize_display_text, strip_text_punctuation
 
 logger = logging.getLogger(__name__)
 
-ASR_MODEL_ID = active_qwen_asr_model_id()
-ASR_MODEL_PATH = active_qwen_asr_model_path()
 ASR_LANGUAGE = os.getenv("ASR_LANGUAGE", "Japanese").strip() or "Japanese"
 
 
@@ -35,15 +33,6 @@ def _resolve_asr_batch_size() -> int:
 
 ASR_MAX_NEW_TOKENS = max(64, int(os.getenv("ASR_MAX_NEW_TOKENS", "128")))
 TRANSCRIPTION_TIMEOUT_S = float(os.getenv("TRANSCRIPTION_TIMEOUT_S", "180"))
-ASR_DTYPE = os.getenv("ASR_DTYPE", "auto").strip().lower()
-ASR_ATTN = os.getenv("ASR_ATTENTION", "auto").strip().lower()
-ASR_REPETITION_PENALTY = float(os.getenv("ASR_REPETITION_PENALTY", "1.05"))
-ASR_FORCE_LANGUAGE = os.getenv("ASR_FORCE_LANGUAGE", "1").strip().lower() not in {
-    "0",
-    "false",
-    "no",
-    "off",
-}
 # --- Windows Job Object: kill the GPU worker if the parent dies abnormally
 # (kill -9 / segfault / OOM-killer / task-manager end). daemon=True only covers
 # graceful interpreter exit; a Job Object with JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
@@ -150,11 +139,12 @@ def _clear_cuda_cache(device: str) -> None:
 def _detect_dtype(device: str):
     import torch
 
-    if ASR_DTYPE == "float32":
+    dtype = os.getenv("ASR_DTYPE", "auto").strip().lower()
+    if dtype == "float32":
         return torch.float32
-    if ASR_DTYPE == "float16":
+    if dtype == "float16":
         return torch.float16
-    if ASR_DTYPE in {"bf16", "bfloat16"}:
+    if dtype in {"bf16", "bfloat16"}:
         return torch.bfloat16
     if device.startswith("cuda"):
         return torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
@@ -162,8 +152,9 @@ def _detect_dtype(device: str):
 
 
 def _detect_attention(device: str) -> str:
-    if ASR_ATTN != "auto":
-        return ASR_ATTN
+    attention = os.getenv("ASR_ATTENTION", "auto").strip().lower()
+    if attention != "auto":
+        return attention
     if not device.startswith("cuda"):
         return "sdpa"
     try:
@@ -232,7 +223,9 @@ def _normalize_deterministic_generation_config(model) -> None:
 
 def _apply_generation_safety(model) -> None:
     _normalize_deterministic_generation_config(model)
-    model.generation_config.repetition_penalty = ASR_REPETITION_PENALTY
+    model.generation_config.repetition_penalty = float(
+        os.getenv("ASR_REPETITION_PENALTY", "1.05")
+    )
 
 
 def _asr_max_new_tokens() -> int:

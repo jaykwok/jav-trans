@@ -88,7 +88,12 @@ def _is_oom_error(exc: BaseException, torch_module: Any | None) -> bool:
         or "gpu vram budget exceeded" in detail
         or "vram budget exceeded" in detail
         or "cumemalloc" in detail
+        or "shared vram spill" in detail
     )
+
+
+def _is_ram_oom_error(exc: BaseException) -> bool:
+    return "physical ram budget exceeded" in repr(exc).lower()
 
 
 @contextmanager
@@ -1075,7 +1080,13 @@ def worker_main(parent_conn: Connection) -> None:
                 ):
                     return
         except Exception as exc:
-            kind = "oom" if _is_oom_error(exc, torch_module) else "crash"
+            kind = (
+                "ram_oom"
+                if _is_ram_oom_error(exc)
+                else "oom"
+                if _is_oom_error(exc, torch_module)
+                else "crash"
+            )
             if stage_memory is not None:
                 stage_memory.finish()
             if kind == "oom" and active_stage:

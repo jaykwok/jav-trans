@@ -49,7 +49,7 @@ def test_qwen_generation_safety_normalizes_generation_config(monkeypatch):
         repetition_penalty=1.0,
     )
     model = SimpleNamespace(generation_config=generation_config, config=SimpleNamespace())
-    monkeypatch.setattr(local_backend, "ASR_REPETITION_PENALTY", 1.05)
+    monkeypatch.setenv("ASR_REPETITION_PENALTY", "1.05")
 
     local_backend._apply_generation_safety(model)
 
@@ -66,7 +66,7 @@ def test_qwen_generation_safety_handles_direct_generation_config(monkeypatch):
         repetition_penalty=1.0,
     )
     model = SimpleNamespace(generation_config=generation_config)
-    monkeypatch.setattr(local_backend, "ASR_REPETITION_PENALTY", 1.0)
+    monkeypatch.setenv("ASR_REPETITION_PENALTY", "1.0")
 
     local_backend._apply_generation_safety(model)
 
@@ -88,7 +88,7 @@ def test_qwen_generation_safety_clears_default_temperature_with_model_eos(monkey
         eos_token_id=[151645, 151643],
     )
     model = SimpleNamespace(generation_config=generation_config, config=model_config)
-    monkeypatch.setattr(local_backend, "ASR_REPETITION_PENALTY", 1.0)
+    monkeypatch.setenv("ASR_REPETITION_PENALTY", "1.0")
 
     local_backend._apply_generation_safety(model)
 
