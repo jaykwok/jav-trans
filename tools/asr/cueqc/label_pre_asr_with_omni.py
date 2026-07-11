@@ -545,7 +545,10 @@ def call_omni(
     timeout_s: float,
     store_stream_chunks: bool,
     prompt: str = PROMPT,
+    system_prompt: str = "",
     max_tokens: int = 256,
+    enable_thinking: bool | None = None,
+    thinking_budget: int = 0,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     from openai import OpenAI
 
@@ -553,22 +556,33 @@ def call_omni(
     if base_url:
         client_kwargs["base_url"] = base_url
     client = OpenAI(**client_kwargs)
+    messages: list[dict[str, Any]] = []
+    if system_prompt:
+        messages.append({"role": "system", "content": system_prompt})
+    messages.append(
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": prompt},
+                audio_content_part(audio_path, fmt=fmt, mode=audio_content_mode),
+            ],
+        }
+    )
+    request_kwargs: dict[str, Any] = {}
+    if enable_thinking is not None:
+        extra_body: dict[str, Any] = {"enable_thinking": bool(enable_thinking)}
+        if enable_thinking and thinking_budget > 0:
+            extra_body["thinking_budget"] = int(thinking_budget)
+        request_kwargs["extra_body"] = extra_body
     stream = client.chat.completions.create(
         model=model,
         temperature=0,
         max_tokens=max(1, int(max_tokens)),
-        messages=[
-            {
-                "role": "user",
-                "content": [
-                    {"type": "text", "text": prompt},
-                    audio_content_part(audio_path, fmt=fmt, mode=audio_content_mode),
-                ],
-            }
-        ],
+        messages=messages,
         modalities=["text"],
         stream=True,
         stream_options={"include_usage": True},
+        **request_kwargs,
     )
     text_parts: list[str] = []
     chunks: list[dict[str, Any]] = []
