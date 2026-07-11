@@ -92,6 +92,70 @@ def test_job_tempdir_groups_temp_outputs_and_keeps_srt_at_output_root(monkeypatc
     _assert_no_project_absolute_path((job_dir / "sample.asr_manifest.json").read_text(encoding="utf-8"))
 
 
+def test_resume_materializes_cache_into_current_job_directory(monkeypatch, tmp_path):
+    output_dir = tmp_path / "out"
+    temp_root = tmp_path / "jobs"
+    video_path = tmp_path / "sample.mp4"
+    video_path.write_bytes(b"fake-video")
+    ctx = make_job_context(
+        video_path,
+        output_dir,
+        temp_root,
+        job_id="new-job",
+        skip_translation=True,
+        keep_temp_files=True,
+    )
+    old_dir = temp_root / "old-job"
+    cache_key = pipeline_audio.get_audio_cache_key(str(video_path))
+    old_audio = old_dir / "audio" / f"sample.{cache_key}.wav"
+    old_audio.parent.mkdir(parents=True)
+    old_audio.write_bytes(b"cached-audio")
+    old_aligned = old_dir / "sample.aligned_segments.json"
+    old_aligned.write_text("{}", encoding="utf-8")
+    monkeypatch.setattr(main.torch.cuda, "is_available", lambda: False)
+    monkeypatch.setattr(main.audio_module, "probe_video_duration_s", lambda _path: 1.0)
+    monkeypatch.setattr(
+        main.aligned_cache_module,
+        "try_load_aligned_segments",
+        lambda path, *_args: {
+            "segments": [{"start": 0.0, "end": 1.0, "text": "こんにちは"}],
+            "asr_details": {"transcript_chunks": []},
+            "asr_log": ["cached"],
+        }
+        if Path(path) == old_aligned
+        else None,
+    )
+    monkeypatch.setattr(
+        main.asr_stage_worker_module,
+        "transcribe_and_align",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("valid resume cache must skip ASR")
+        ),
+    )
+    monkeypatch.setattr(
+        pipeline_audio,
+        "extract_audio",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("cached audio must be materialized")
+        ),
+    )
+
+    artifacts = main.run_asr_alignment(
+        str(video_path),
+        ctx=ctx,
+        job_id=ctx.job_id,
+        cache_job_id="old-job",
+    )
+
+    new_dir = temp_root / "new-job"
+    assert Path(artifacts.job_temp_dir) == new_dir.resolve()
+    assert Path(artifacts.audio_path).read_bytes() == b"cached-audio"
+    assert Path(artifacts.aligned_segments_path).parent == new_dir.resolve()
+    assert Path(artifacts.aligned_segments_path).is_file()
+    assert old_audio.is_file()
+    assert old_aligned.is_file()
+
+
 def test_run_log_is_written_only_when_enabled(monkeypatch, tmp_path):
     output_dir = tmp_path / "out"
     temp_root = tmp_path / "jobs"
