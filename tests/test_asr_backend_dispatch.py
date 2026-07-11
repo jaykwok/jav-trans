@@ -154,7 +154,7 @@ def test_qwen_checkpoint_path_defaults_fall_back_to_resource_root(monkeypatch, t
 
     runtime_root = tmp_path / "runtime"
     resource_root = tmp_path / "resource"
-    relative = Path("src/boundary/checkpoints/outer_edge_refiner_v1.test.pt")
+    relative = Path("src/checkpoints/test-repo/outer_edge_refiner_v1.test.pt")
     checkpoint = resource_root / relative
     checkpoint.parent.mkdir(parents=True)
     checkpoint.write_bytes(b"bundled")
