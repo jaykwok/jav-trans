@@ -26,25 +26,32 @@ from tools.asr.cueqc.label_pre_asr_with_omni import (  # noqa: E402
 
 SCHEMA = "semantic_split_v3_speech_island_label_v1"
 SELECTION_SCHEMA = "semantic_split_v3_speech_island_selection_v1"
-PROMPT_VERSION = "semantic_split_v3_omni_plus_speech_island_v1"
+PROMPT_VERSION = "semantic_split_v3_omni_plus_speech_island_cut_eager_v2"
 DEFAULT_MODEL = "qwen3.5-omni-plus"
 TARGET_DURATIONS_S = (2.0, 5.0, 9.0, 14.0, 35.0)
 
-SYSTEM_PROMPT = """你是日语 ASR Semantic Split 数据标注器。本次唯一任务是：在上传的一个完整 speech island 内，找出全部应该分开的语义 utterance 边界。
+SYSTEM_PROMPT = """你是日语 ASR Semantic Split 数据标注器。本次唯一任务是：在上传的一个完整 speech island 内，找出全部适合拆成短而自然的 ASR/字幕单元的边界。
 
 speech island 的起止已经由上游声学模型确定。你不需要判断 speech/non-speech，也不要转录、改写或总结音频。
 
+目标粒度：
+- 不要求左右都是语法上的完整长句。自然短句、分句、独立语块、感叹、称呼、应答和话轮都可以独立成字幕。
+- 优先把长 island 拆成较短、单一表达意图的单元，减少整段字幕过早显示。
+- 时长不是硬规则；是否切取决于语义与自然停顿，而不是固定秒数。
+
 应输出 cut 的条件：
-- 边界左右紧邻的语音分别能独立送入 ASR，并能独立显示为自然字幕语义单元。
-- 完整句结束后进入下一句、完整问答之间、完整话轮切换，通常可以切。
+- 自然停顿前后的紧邻语音都能被听懂，并可分别作为自然 ASR/字幕单元，即使它们只是短句或分句。
+- 说完一个表达意图后进入下一个表达、问答之间、独立回应、话轮切换，应切。
+- 短暂停顿可以是切点：只要停顿位于可独立显示的语块边界，而不是词法或句法连接内部。
 
 不得输出 cut 的情况：
-- 同一句内部的短暂停顿、呼吸、喘息、呻吟、笑声、拖音、犹豫或重复。
-- 名词/主语与助词之间、助词与谓语之间、词语或活用连接内部。
-- 仅因为静音、噪声、音色变化、情绪变化或 speaker change；除非紧邻左右语义都独立完整。
+- 词语内部、名词/主语与助词之间、助词与其支配成分之间、活用或固定搭配连接内部。
+- 左侧或右侧只是明显未完成的半个词、助词、助动词，单独送入 ASR 会失去可理解内容。
+- 同一自然语块内部仅因呼吸、喘息、呻吟、笑声、拖音、犹豫或重复出现短暂停顿。
+- 仅因为静音、噪声、音色变化、情绪变化或 speaker change；仍需确认它同时是自然语块边界。
 - island 的 0 秒起点和 duration_s 终点不是内部切点，不要返回。
 
-必须返回 island 内全部语义切点，按 time_s 严格升序。没有切点时 cuts 返回空数组。时间单位为相对 island 起点的秒。
+必须主动搜索并返回 island 内全部自然语块切点，按 time_s 严格升序。不要因为整段属于同一主题或同一句复句就合并成过长单元。没有合适切点时 cuts 才返回空数组。时间单位为相对 island 起点的秒，尽量落在实际停顿或语音边缘中心。
 
 只输出 JSON，不要 Markdown：
 {

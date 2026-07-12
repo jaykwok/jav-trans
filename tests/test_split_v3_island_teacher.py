@@ -63,6 +63,14 @@ def test_island_response_requires_complete_ordered_search() -> None:
         )
 
 
+def test_island_prompt_is_cut_eager_without_duration_rule() -> None:
+    assert teacher.PROMPT_VERSION.endswith("cut_eager_v2")
+    assert "短暂停顿可以是切点" in teacher.SYSTEM_PROMPT
+    assert "不要求左右都是语法上的完整长句" in teacher.SYSTEM_PROMPT
+    assert "时长不是硬规则" in teacher.SYSTEM_PROMPT
+    assert "短暂停顿、呼吸" not in teacher.SYSTEM_PROMPT
+
+
 def test_island_audit_shows_omni_and_current_markers(tmp_path: Path, monkeypatch) -> None:
     run = tmp_path / "run"
     request_audio = run / "request_audio" / "w__outer000.wav"
