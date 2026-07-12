@@ -26,7 +26,7 @@ from tools.asr.cueqc.label_pre_asr_with_omni import (  # noqa: E402
 
 SCHEMA = "semantic_split_v3_speech_island_label_v1"
 SELECTION_SCHEMA = "semantic_split_v3_speech_island_selection_v1"
-PROMPT_VERSION = "semantic_split_v3_omni_plus_speech_island_cut_eager_v2"
+PROMPT_VERSION = "semantic_split_v3_omni_plus_speech_island_cut_eager_complete_v3"
 DEFAULT_MODEL = "qwen3.5-omni-plus"
 TARGET_DURATIONS_S = (2.0, 5.0, 9.0, 14.0, 35.0)
 
@@ -52,6 +52,11 @@ speech island 的起止已经由上游声学模型确定。你不需要判断 sp
 - island 的 0 秒起点和 duration_s 终点不是内部切点，不要返回。
 
 必须主动搜索并返回 island 内全部自然语块切点，按 time_s 严格升序。不要因为整段属于同一主题或同一句复句就合并成过长单元。没有合适切点时 cuts 才返回空数组。时间单位为相对 island 起点的秒，尽量落在实际停顿或语音边缘中心。
+
+完整性复核（仍然只做语义切分这一项任务）：
+- 在形成最终 JSON 前，先按时间从头到尾检查每次表达意图、独立短句、应答和话轮的结束位置。
+- 再从尾到头复核一遍相邻语块，确认没有因为后半段较长、切点较密或非语言发声穿插而遗漏自然边界。
+- 复核只用于补齐遗漏，不得降低上述句法保护，也不得为了增加数量制造切点。
 
 只输出 JSON，不要 Markdown：
 {
