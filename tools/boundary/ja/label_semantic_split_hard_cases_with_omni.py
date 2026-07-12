@@ -34,7 +34,7 @@ DEFAULT_THINKING_BUDGET = 1024
 DEFAULT_MAX_ATTEMPTS = 6
 CLIP_RADIUS_S = 4.0
 HARD_CASE_CATEGORIES = (
-    "known_cut_with_leading_silence",
+    "known_same_sentence_false_cut",
     "false_cut_risk",
     "false_continue_risk",
     "high_p_continue",
@@ -274,7 +274,7 @@ def prepare_hard_cases(args: argparse.Namespace) -> list[dict[str, Any]]:
     if args.heldout_source_audio:
         output_dir = Path(args.output_dir)
         clip_start = max(0.0, float(args.heldout_center_s) - 4.0)
-        clip_path = output_dir / "request_audio" / "FJIN-059-known-cut-leading-silence.wav"
+        clip_path = output_dir / "request_audio" / "FJIN-059-known-same-sentence.wav"
         slice_audio_clip(
             source_audio=Path(args.heldout_source_audio),
             row={"start": clip_start, "end": clip_start + 8.0, "duration_s": 8.0},
@@ -286,14 +286,14 @@ def prepare_hard_cases(args: argparse.Namespace) -> list[dict[str, Any]]:
         )
         heldout = {
             "schema": SELECTION_SCHEMA,
-            "window_id": "FJIN-059-known-cut-leading-silence-23.538",
+            "window_id": "FJIN-059-known-same-sentence-23.538",
             "partition": "heldout",
             "trainable": False,
             "audio_path": str(clip_path),
             "duration_s": 8.0,
             "source_video_id": "FJIN-059",
             "source_start_s": clip_start,
-            "categories": ["known_cut_with_leading_silence"],
+            "categories": ["known_same_sentence_false_cut"],
             "max_p_cut": 0.0,
             "long_residual_count": 0,
             "candidates": [
@@ -306,9 +306,9 @@ def prepare_hard_cases(args: argparse.Namespace) -> list[dict[str, Any]]:
                     "legacy_label": "",
                     "legacy_confidence": 0.0,
                     "legacy_flags": [],
-                    "hard_case_categories": ["known_cut_with_leading_silence"],
-                    "expected_gate_label": "cut",
-                    "description": "valid sentence boundary followed by about 1.8s leading silence",
+                    "hard_case_categories": ["known_same_sentence_false_cut"],
+                    "expected_gate_label": "continue",
+                    "description": "known same-sentence boundary around 男子は一週間; must not cut",
                 }
             ],
         }

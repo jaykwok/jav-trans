@@ -120,6 +120,28 @@ def test_split_v3_hard_case_selection_covers_false_cut_and_long_residual(tmp_pat
     assert all("long_residual" in row["hard_case_categories"] for row in candidates.values())
 
 
+def test_split_v3_heldout_is_known_same_sentence_continue(tmp_path: Path, monkeypatch) -> None:
+    args = _args(tmp_path)
+    source = tmp_path / "heldout.wav"
+    source.write_bytes(b"wav")
+    args.heldout_source_audio = str(source)
+
+    def fake_slice(**kwargs):
+        output = kwargs["output_path"]
+        output.parent.mkdir(parents=True, exist_ok=True)
+        output.write_bytes(b"wav")
+        return output
+
+    monkeypatch.setattr(labeler, "slice_audio_clip", fake_slice)
+    heldout = labeler.prepare_hard_cases(args)[0]
+    candidate = heldout["candidates"][0]
+
+    assert heldout["window_id"] == "FJIN-059-known-same-sentence-23.538"
+    assert heldout["categories"] == ["known_same_sentence_false_cut"]
+    assert candidate["expected_gate_label"] == "continue"
+    assert candidate["hard_case_categories"] == ["known_same_sentence_false_cut"]
+
+
 def test_split_v3_prompt_does_not_leak_model_scores_or_labels(tmp_path: Path) -> None:
     item = labeler.prepare_hard_cases(_args(tmp_path))[0]
     candidates = {row["feature_index"]: row for row in item["candidates"]}
