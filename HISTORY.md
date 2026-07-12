@@ -6,6 +6,7 @@
 
 ---
 
+- 2026-07-12 Split v3 teacher 路线改为自然 speech island：人工指出固定 `candidate±4s` 即使 clamp 也会在任意位置截断紧邻 utterance，使 Omni 的“左右是否完整”判断混入人工裁窗伪影。新实验单位改为 Scorer + Outer Refiner 输出的完整 speech core；从 re-export 的连续 Split chunks 还原 Split 前 Outer island（共享边界连续的 chunks 合组，存在声学间隙才开新组），Omni Plus 单次只做“找出 island 内全部语义切点”，不接收 proposer 候选、`p_cut` 或现役标签。首轮严格遵守每实验 `5` 样本 smoke，按时长覆盖 `2.00/5.00/9.01/14.00/35.24s`，请求 `5/5` 成功、无重试，分别返回 `0/0/0/6/7` 个切点。专用审计页以红线显示 Omni 切点、蓝线显示现役 accepted cuts，点击标记跨点试听；人工确认前不扩大标注。per-candidate `±4s` 产物保留为失败路线诊断，不进入新 teacher 数据集。
 - 2026-07-12 Split v3 审计交互修正：人工反馈连续播放 `±4s` clip 时无法直观看出唯一候选切点，容易误解为让模型在整段 8 秒内自行找切点。审计页新增候选红线、实际左右上下文秒数，以及“只听切点前 / 跨点听 ±1s / 只听切点后”三种播放方式；开始任一音频时自动暂停其他卡片，避免混播。模型请求与标签不变，`4s` 仍只是待人工校准的默认半径；若审计显示远处上下文干扰，再对同一候选补跑 `3s` A/B。
 - 2026-07-12 Split v3 smoke 预算修正：`--max-windows 100` 在 per-candidate 模式下会展开成 `2351` 次请求，既不适合作为 prompt 校准 smoke，也会让前几个多候选窗口主导样本。labeler 新增 `--max-total-candidates`（`0` 为全量），采用窗口 round-robin 截断；正式校准使用 `--max-windows 100 --max-total-candidates 100`，使约 `100` 个窗口各贡献首个高优先级候选。全量标注仍保持默认不设总候选上限。
 - 2026-07-12 Split v3 Plus 首轮 per-candidate smoke 中止：`±4s`、thinking `1024` 的 held-out 首条把匿名 held-out 在 `23.538s` 高置信判为 `continue`，与已确认的句内边界结论一致；但 labeler 仍残留旧的 `known_cut_with_leading_silence` / expected `cut` 硬编码。为避免错误 gate 污染后续 `2351` 条付费标注，在 `27` 条时停止任务，产物只留作失败诊断，不进入训练。探针断兼容更名为 `known_same_sentence_false_cut`，expected 改为 `continue`，后续使用新输出目录重跑。
