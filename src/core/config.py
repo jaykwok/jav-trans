@@ -167,6 +167,14 @@ DEFAULT_SETTINGS: dict[str, str] = {
     "LLM_API_FORMAT": "chat",
     # Reasoning effort parameter for models that support it. Valid values: medium, xhigh.
     "LLM_REASONING_EFFORT": "medium",
+    # Sampling temperature for translation. Higher = more colloquial/varied; the
+    # JSON-format retry loop tolerates the extra variance. Read at import time; a
+    # change requires a restart (not hot-reloaded by the web settings page).
+    "LLM_TEMPERATURE": "0.6",
+    # Subtitles per translation request, independent of worker count. Smaller
+    # batches trade throughput for higher per-line quality (less long-output
+    # decay). Clamped to [8, 400]. Read at import time; restart to apply.
+    "TRANSLATION_BATCH_SIZE": "64",
     # Final subtitle language.
     "TARGET_LANG": "简体中文",
     # Comma-separated Japanese-to-Chinese term mapping injected into translation prompts.

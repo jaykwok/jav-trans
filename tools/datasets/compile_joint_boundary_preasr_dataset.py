@@ -33,6 +33,25 @@ from tools.asr.cueqc.compile_pre_asr_v12_features import (  # noqa: E402
 
 SPLIT_LABEL_IDS = {"cut": 0, "continue": 1, "unsure": 2}
 IGNORE_ID = -100
+# Split v3 trains only on per-candidate centered-clip Omni labels. Rows from
+# retired teachers (window-batched joint split, single_task v2, flat v1) must
+# hard-fail here rather than silently mix annotation geometries.
+SPLIT_ALLOWED_PROMPT_VERSIONS = {"semantic_split_v3_omni_plus_centered_clip_v3"}
+
+
+def _reject_foreign_split_labels(labels: list[dict[str, Any]]) -> None:
+    foreign: Counter[str] = Counter(
+        str(row.get("prompt_version") or "<missing>")
+        for row in labels
+        if str(row.get("prompt_version") or "") not in SPLIT_ALLOWED_PROMPT_VERSIONS
+    )
+    if foreign:
+        raise ValueError(
+            "semantic_split/labels.jsonl contains split labels from a retired "
+            f"teacher contract; only {sorted(SPLIT_ALLOWED_PROMPT_VERSIONS)} may "
+            "be compiled into Split v3 training data. Offending prompt_version "
+            f"counts: {dict(foreign)}"
+        )
 
 
 def _variant_npz_path(path: Path, variant: str) -> Path:
@@ -88,6 +107,7 @@ def _compile_split(
     """
 
     window_by_id = {str(row["window_id"]): row for row in windows}
+    _reject_foreign_split_labels(labels)
     grouped: dict[str, dict[int, dict[str, Any]]] = {}
     for row in labels:
         if str(row.get("label") or "") in SPLIT_LABEL_IDS:

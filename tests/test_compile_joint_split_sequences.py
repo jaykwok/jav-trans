@@ -6,6 +6,10 @@ import numpy as np
 
 from tools.datasets.compile_joint_boundary_preasr_dataset import _compile_split
 
+import pytest
+
+VALID_SPLIT_PROMPT_VERSION = "semantic_split_v3_omni_plus_centered_clip_v3"
+
 
 def _write_window_bundle(path: Path) -> None:
     np.savez(
@@ -42,6 +46,7 @@ def test_compile_split_emits_whole_islands_with_ignore_context(tmp_path: Path) -
             "left_complete": True,
             "right_complete": True,
             "merged_better": False,
+            "prompt_version": VALID_SPLIT_PROMPT_VERSION,
         }
     ]
 
@@ -82,7 +87,14 @@ def test_compile_split_reads_and_writes_named_variant(tmp_path: Path) -> None:
             "semantic_split_features": str(canonical),
         }
     ]
-    labels = [{"window_id": "w0", "feature_index": 1, "label": "cut"}]
+    labels = [
+        {
+            "window_id": "w0",
+            "feature_index": 1,
+            "label": "cut",
+            "prompt_version": VALID_SPLIT_PROMPT_VERSION,
+        }
+    ]
 
     summary = _compile_split(
         dataset=tmp_path,
@@ -96,3 +108,54 @@ def test_compile_split_reads_and_writes_named_variant(tmp_path: Path) -> None:
     assert summary["output"].endswith("features.06b.npz")
     assert (tmp_path / "semantic_split" / "features.06b.npz").exists()
     assert (tmp_path / "semantic_split" / "summary.06b.json").exists()
+
+
+def test_compile_split_rejects_retired_teacher_labels(tmp_path: Path) -> None:
+    bundle_path = tmp_path / "w0" / "semantic_split_features.npz"
+    bundle_path.parent.mkdir(parents=True)
+    _write_window_bundle(bundle_path)
+    windows = [
+        {
+            "window_id": "w0",
+            "video_id": "vid0",
+            "semantic_split_features": str(bundle_path),
+        }
+    ]
+    labels = [
+        {
+            "window_id": "w0",
+            "feature_index": 1,
+            "label": "cut",
+            "prompt_version": "joint_boundary_preasr_omni_v3_separate",
+        }
+    ]
+
+    with pytest.raises(ValueError, match="retired teacher contract"):
+        _compile_split(
+            dataset=tmp_path,
+            windows=windows,
+            labels=labels,
+            val_percent=20,
+        )
+
+
+def test_compile_split_rejects_labels_without_prompt_version(tmp_path: Path) -> None:
+    bundle_path = tmp_path / "w0" / "semantic_split_features.npz"
+    bundle_path.parent.mkdir(parents=True)
+    _write_window_bundle(bundle_path)
+    windows = [
+        {
+            "window_id": "w0",
+            "video_id": "vid0",
+            "semantic_split_features": str(bundle_path),
+        }
+    ]
+    labels = [{"window_id": "w0", "feature_index": 1, "label": "cut"}]
+
+    with pytest.raises(ValueError, match="retired teacher contract"):
+        _compile_split(
+            dataset=tmp_path,
+            windows=windows,
+            labels=labels,
+            val_percent=20,
+        )

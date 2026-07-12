@@ -32,7 +32,7 @@ def publish(event_line: str) -> None:
         event = None
     if isinstance(event, dict):
         job_id = str(event.get("job_id", "") or "")
-        if job_id:
+        if job_id and event.get("stage") != "timing_summary":
             progress = {
                 "stage": event.get("stage"),
                 "phase": event.get("phase"),

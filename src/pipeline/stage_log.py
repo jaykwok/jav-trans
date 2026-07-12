@@ -29,6 +29,21 @@ _ASR_STAGE_MAP = {
     "字幕时间轴": "subtitle_timing",
 }
 
+_TIMING_SUMMARY_ROWS = (
+    ("音频准备", "audio_prepare_s", "pipeline"),
+    ("语音边界与音频切块", "split_s", "asr"),
+    ("ASR 模型加载", "asr_model_load_s", "asr"),
+    ("ASR 文本转写", "asr_text_transcribe_s", "asr"),
+    ("ASR 模型卸载", "asr_model_unload_s", "asr"),
+    ("字幕时间轴", "alignment_s", "asr"),
+    ("字幕分段", "subtitle_segment_s", "asr"),
+    ("字幕 Cue Plan", "subtitle_cue_plan_s", "pipeline"),
+    ("翻译上下文", "translation_context_s", "pipeline"),
+    ("翻译", "translation_s", "pipeline"),
+    ("输出写入", "write_output_s", "pipeline"),
+    ("总计", "pipeline_total_s", "pipeline"),
+)
+
 
 def _event_ts() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="milliseconds")
@@ -178,29 +193,48 @@ def _add_timing_row(table: Table, label: str, seconds: float | None) -> None:
     table.add_row(label, f"{seconds:.2f}s")
 
 
+def _timing_summary_rows(stage_timings: dict, asr_details: dict) -> list[dict]:
+    asr_stage_timings = asr_details.get("stage_timings", {}) if asr_details else {}
+    asr_skipped = (
+        "asr_alignment_total_s" in stage_timings
+        and float(stage_timings.get("asr_alignment_total_s") or 0.0) == 0.0
+    )
+    rows: list[dict] = []
+    for label, key, source in _TIMING_SUMMARY_ROWS:
+        if source == "asr":
+            value = 0.0 if asr_skipped else asr_stage_timings.get(key)
+        else:
+            value = stage_timings.get(key)
+        if value is None:
+            continue
+        rows.append({"label": label, "key": key, "seconds": round(float(value), 2)})
+    return rows
+
+
 def _print_timing_summary(console, stage_timings: dict, asr_details: dict) -> None:
     table = Table(title="阶段耗时", show_lines=False)
     table.add_column("阶段")
     table.add_column("耗时", justify="right")
 
-    asr_stage_timings = asr_details.get("stage_timings", {}) if asr_details else {}
-    for label, key in (
-        ("音频准备", "audio_prepare_s"),
-        ("ASR 模型加载", "asr_model_load_s"),
-        ("ASR 文本转写", "asr_text_transcribe_s"),
-        ("ASR 模型卸载", "asr_model_unload_s"),
-        ("字幕时间轴", "alignment_s"),
-        ("字幕时间轴模型卸载", "alignment_model_unload_s"),
-        ("字幕分段", "subtitle_segment_s"),
-        ("ASR+字幕时间轴", "asr_alignment_total_s"),
-        ("翻译恢复快照", "translation_handoff_snapshot_s"),
-        ("字幕 Cue Plan", "subtitle_cue_plan_s"),
-        ("翻译上下文", "translation_context_s"),
-        ("翻译", "translation_s"),
-        ("输出写入", "write_output_s"),
-        ("总计", "pipeline_total_s"),
-    ):
-        seconds = stage_timings.get(key, asr_stage_timings.get(key))
-        _add_timing_row(table, label, seconds)
+    rows = _timing_summary_rows(stage_timings, asr_details)
+    for row in rows:
+        _add_timing_row(table, str(row["label"]), float(row["seconds"]))
 
     console.print(table)
+    _emit_stage_event(
+        None,
+        "timing_summary",
+        "done",
+        {
+            "title": "阶段耗时",
+            "rows": rows,
+            "total_s": next(
+                (
+                    row["seconds"]
+                    for row in rows
+                    if row["key"] == "pipeline_total_s"
+                ),
+                None,
+            ),
+        },
+    )

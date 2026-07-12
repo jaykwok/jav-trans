@@ -10,7 +10,7 @@ from rich.console import Console
 from core import events
 import main
 from pipeline import audio as pipeline_audio
-from pipeline.stage_log import _parse_asr_stage_event
+from pipeline.stage_log import _parse_asr_stage_event, _timing_summary_rows
 from helpers import make_job_context, run_pipeline
 
 
@@ -120,6 +120,7 @@ def test_stage_events_memory_sink_records_pipeline_events(monkeypatch, tmp_path)
     assert ("pre_asr_cueqc", "done") in observed
     assert ("audio_chunk_export", "done") in observed
     assert ("write_output", "done") in observed
+    assert ("timing_summary", "done") in observed
 
     for event in emitted:
         datetime.fromisoformat(event["ts"])
@@ -165,3 +166,43 @@ def test_five_model_progress_labels_map_to_frontend_stages():
     assert _parse_asr_stage_event("内部切点精修 3/8")[0] == "cut_edge_refiner"
     assert _parse_asr_stage_event("Pre-ASR CueQC 1/1")[0] == "pre_asr_cueqc"
     assert _parse_asr_stage_event("音频切块 2/5")[0] == "audio_chunk_export"
+
+
+def test_timing_summary_matches_current_non_overlapping_pipeline_stages():
+    rows = _timing_summary_rows(
+        {
+            "audio_prepare_s": 1.0,
+            "asr_alignment_total_s": 20.0,
+            "translation_handoff_snapshot_s": 0.2,
+            "subtitle_cue_plan_s": 2.0,
+            "translation_context_s": 3.0,
+            "translation_s": 4.0,
+            "write_output_s": 5.0,
+            "pipeline_total_s": 35.0,
+        },
+        {
+            "stage_timings": {
+                "split_s": 6.0,
+                "asr_model_load_s": 1.0,
+                "asr_text_transcribe_s": 8.0,
+                "asr_model_unload_s": 1.0,
+                "alignment_s": 3.0,
+                "subtitle_segment_s": 1.0,
+            }
+        },
+    )
+
+    keys = [row["key"] for row in rows]
+    assert "split_s" in keys
+    assert "asr_alignment_total_s" not in keys
+    assert "translation_handoff_snapshot_s" not in keys
+    assert keys[-1] == "pipeline_total_s"
+
+
+def test_timing_summary_zeros_cached_asr_stages():
+    rows = _timing_summary_rows(
+        {"audio_prepare_s": 0.1, "asr_alignment_total_s": 0.0},
+        {"stage_timings": {"split_s": 99.0, "asr_text_transcribe_s": 88.0}},
+    )
+
+    assert {row["seconds"] for row in rows if row["key"] in {"split_s", "asr_text_transcribe_s"}} == {0.0}

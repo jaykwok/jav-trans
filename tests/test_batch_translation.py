@@ -47,14 +47,40 @@ def test_split_into_batches():
     assert len(translator._split_into_batches(_segments(450), 200)) == 3
 
 
-def test_auto_translation_batch_size_uses_window_overlap_and_workers():
+def test_auto_translation_batch_size_is_worker_independent():
+    # 0 segments -> no batch; otherwise min(count, TRANSLATION_BATCH_SIZE),
+    # independent of worker count. Derive expectations from the module constant
+    # so a local .env override of TRANSLATION_BATCH_SIZE doesn't break the test.
+    cap = translator.TRANSLATION_BATCH_SIZE
+    assert 8 <= cap <= 400
     assert translator._auto_translation_batch_size(0, 4) == 0
-    assert translator._auto_translation_batch_size(10, 4) == 10
-    assert translator._auto_translation_batch_size(100, 1) == 100
-    assert translator._auto_translation_batch_size(100, 4) == 100
-    assert translator._auto_translation_batch_size(450, 1) == 115
-    assert translator._auto_translation_batch_size(450, 4) == 385
-    assert translator._auto_translation_batch_size(5000, 8) == 400
+    assert translator._auto_translation_batch_size(5, 4) == 5
+    assert translator._auto_translation_batch_size(cap + 100, 1) == cap
+    assert translator._auto_translation_batch_size(cap + 100, 16) == cap
+    # Worker count must not change the batch size.
+    assert translator._auto_translation_batch_size(
+        5000, 1
+    ) == translator._auto_translation_batch_size(5000, 32)
+
+
+def test_env_float_falls_back_on_bad_value(monkeypatch):
+    monkeypatch.setenv("LLM_TEMPERATURE", "0.8")
+    assert translator._env_float("LLM_TEMPERATURE", 0.6) == 0.8
+    monkeypatch.setenv("LLM_TEMPERATURE", "not-a-number")
+    assert translator._env_float("LLM_TEMPERATURE", 0.6) == 0.6
+    monkeypatch.delenv("LLM_TEMPERATURE", raising=False)
+    assert translator._env_float("LLM_TEMPERATURE", 0.6) == 0.6
+
+
+def test_env_int_clamped_bounds_and_fallback(monkeypatch):
+    monkeypatch.setenv("TRANSLATION_BATCH_SIZE", "32")
+    assert translator._env_int_clamped("TRANSLATION_BATCH_SIZE", 64, 8, 400) == 32
+    monkeypatch.setenv("TRANSLATION_BATCH_SIZE", "5000")
+    assert translator._env_int_clamped("TRANSLATION_BATCH_SIZE", 64, 8, 400) == 400
+    monkeypatch.setenv("TRANSLATION_BATCH_SIZE", "1")
+    assert translator._env_int_clamped("TRANSLATION_BATCH_SIZE", 64, 8, 400) == 8
+    monkeypatch.setenv("TRANSLATION_BATCH_SIZE", "garbage")
+    assert translator._env_int_clamped("TRANSLATION_BATCH_SIZE", 64, 8, 400) == 64
 
 
 def test_translate_segments_single_request_when_below_threshold(monkeypatch):
