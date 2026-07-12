@@ -311,6 +311,10 @@ def test_split_v3_audit_prioritizes_disagreements_and_has_manual_controls(
     assert "cut</button>" in page
     assert "continue</button>" in page
     assert ".join('\\n')+'\\n'" in page
+    assert "只听切点前" in page
+    assert "跨点听 ±1s" in page
+    assert "只听切点后" in page
+    assert "红线 = 唯一候选切点" in page
 
 
 def test_split_v3_audit_evaluation_applies_ninety_percent_gates(tmp_path: Path) -> None:
