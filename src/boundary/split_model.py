@@ -391,7 +391,7 @@ class SemanticSplitIslandVerifier:
             rows: list[SplitDecision] = []
             for position in range(count):
                 p_gate = float(gate[index, position])
-                a_cut, a_continue, a_unsure = (
+                _, a_continue, a_unsure = (
                     float(aux[index, position, 0]),
                     float(aux[index, position, 1]),
                     float(aux[index, position, 2]),

@@ -1016,7 +1016,6 @@ def _cluster_homogeneity(
         speech_std = _std(speech_values)
         distance_consensus = max(0.0, min(1.0, 1.0 - p90 / 1.5))
         compactness = max(0.0, min(1.0, 1.0 - p50 / 1.2))
-        dispersion_score = max(0.0, min(1.0, 1.0 - min(1.0, duration_cv)))
         score = (
             0.34 * distance_consensus
             + 0.22 * compactness

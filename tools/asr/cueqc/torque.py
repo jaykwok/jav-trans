@@ -396,7 +396,6 @@ def torque_clustering(
 
     with np.errstate(all="ignore"):
         link_adj = sp.lil_matrix((n, n), dtype=np.float64)
-        dataloc = np.arange(n, dtype=np.int64)
         community: list[list[int]] = [[int(i)] for i in range(n)]
         commu_dm = dm_sparse
         cutlinkpower_all: list[np.ndarray] = []
@@ -456,7 +455,6 @@ def torque_clustering(
                 row = inter_dense[i]
                 row[i] = np.inf
                 order = np.argsort(row, kind="mergesort")
-                found = False
                 for j in order:
                     if j == i:
                         continue
@@ -465,7 +463,6 @@ def torque_clustering(
                         graph[i, j] = 1
                         graph[j, i] = 1
                         neiborloc2[i] = int(j)
-                        found = True
                         break
             graph = graph.tocsr()
             _, bins = connected_components(graph, directed=False)

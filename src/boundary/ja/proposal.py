@@ -9,7 +9,6 @@ from boundary.ja.model import checkpoint_sha256
 
 BOUNDARY_PROPOSAL_SCORER_SCHEMA = "speech_boundary_ja_boundary_proposal_scorer_v1"
 BOUNDARY_PROPOSAL_SCORER_MODEL_TYPE = "mamba2_boundary_proposal_scorer"
-BOUNDARY_PROPOSAL_SCORER_MODEL_ARCH = "v1-boundary-proposal"
 BOUNDARY_PROPOSAL_SCORER_OUTPUT_DIM = 1
 BOUNDARY_PROPOSAL_SCORER_OUTPUT_HEADS = ("boundary_prob",)
 BOUNDARY_PROPOSAL_SCORER_ARTIFACT = {

@@ -214,7 +214,6 @@ def _workflow_window_starts(
         raise ValueError("--feature-overlap-s must be non-negative")
     if overlap_s >= window_s:
         raise ValueError("--feature-overlap-s must be smaller than --feature-window-s")
-    window_samples = max(1, int(round(window_s * sample_rate)))
     stride_samples = max(1, int(round((window_s - overlap_s) * sample_rate)))
     return list(range(0, max(1, int(sample_count)), stride_samples))
 

@@ -16,8 +16,6 @@ from asr.backends.qwen import (
 )
 from boundary.sequence_features import (
     CHUNK_POOLED_PTM_SCHEMA,
-    DEFAULT_CHUNK_POOLED_PTM_BINS,
-    FrameSequenceFeatureConfig,
     chunk_pooled_ptm_feature_names,
 )
 

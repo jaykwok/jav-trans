@@ -68,10 +68,6 @@ def materialize_from_dataset(
                 manifest_rows.append(dict(existing_row))
                 continue
             audio, sample_rate = sample_hf_audio_16k_mono(example)
-            audio_obj = example.get("audio")
-            audio_path = ""
-            if isinstance(audio_obj, dict):
-                audio_path = str(audio_obj.get("path") or "")
             audio_id = str(
                 example.get("__key__")
                 or example.get("id")

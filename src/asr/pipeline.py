@@ -14,7 +14,6 @@ from audio.chunk_packer import PackedChunk
 from boundary import cache as _boundary_cache_module
 from boundary.sequence_features import (
     CHUNK_POOLED_PTM_SCHEMA,
-    DEFAULT_CHUNK_POOLED_PTM_BINS,
     FRAME_SEQUENCE_FRAMES_SCHEMA,
     PTM_PROJECTION_SCHEMA,
     FrameSequenceFeatureConfig,
@@ -292,13 +291,6 @@ _group_words_to_segments = _transcribe_module._group_words_to_segments
 
 def _sync_checkpoint_state() -> None:
     _checkpoint_module._LAST_BOUNDARY_SIGNATURE = _LAST_BOUNDARY_SIGNATURE
-
-
-def _get_asr_generation_checkpoint_signature() -> dict:
-    _sync_checkpoint_state()
-    return _checkpoint_module._get_asr_runtime_signature(
-        last_boundary_signature=_LAST_BOUNDARY_SIGNATURE,
-    )
 
 
 def _get_asr_runtime_signature(last_boundary_signature: dict | None = None) -> dict:

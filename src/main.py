@@ -1,5 +1,4 @@
 import os
-import json
 import logging
 import time
 import sys
@@ -12,7 +11,7 @@ os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
 os.environ["HF_HUB_DISABLE_SYMLINKS_WARNING"] = "1"
 
 from core import events
-from core.config import DEFAULT_SETTINGS, load_config
+from core.config import load_config
 from core.job_context import JobContext
 from asr import noise as asr_noise_module
 from pipeline import aligned_cache as aligned_cache_module
@@ -102,20 +101,6 @@ def _ctx_value(ctx: JobContext, name: str, default: str = "") -> str:
     return os.getenv(name, default).strip()
 
 
-def _ctx_float(ctx: JobContext, name: str, default: float) -> float:
-    try:
-        return float(_ctx_value(ctx, name, str(default)))
-    except (TypeError, ValueError):
-        return default
-
-
-def _ctx_int(ctx: JobContext, name: str, default: int) -> int:
-    try:
-        return int(float(_ctx_value(ctx, name, str(default))))
-    except (TypeError, ValueError):
-        return default
-
-
 def _ctx_flag(ctx: JobContext, name: str, default: bool = False) -> bool:
     raw = ctx.advanced.get(name)
     if raw is not None:
@@ -125,13 +110,6 @@ def _ctx_flag(ctx: JobContext, name: str, default: bool = False) -> bool:
     if name == "QUALITY_REPORT_ENABLED":
         return ctx.keep_quality_report
     return default
-
-
-def _ctx_env_flag(ctx: JobContext, name: str, default: bool = False) -> bool:
-    raw = ctx.advanced.get(name)
-    if raw is None:
-        raw = os.getenv(name, "1" if default else "0")
-    return str(raw).strip().lower() in {"1", "true", "yes", "on"}
 
 
 _ASR_STAGE_ADVANCED_PREFIXES = (
@@ -595,10 +573,6 @@ def _project_relative(path: str | Path | None) -> str | None:
     return output_writer_module.project_relative(path, project_root=PROJECT_ROOT)
 
 
-def _project_relative_required(path: str | Path) -> str:
-    return _project_relative(path) or ""
-
-
 _log_timing_snapshot = stage_log_module._log_timing_snapshot
 
 
@@ -669,15 +643,6 @@ def _record_pipeline_cuda_memory(
             total=snapshot.get("total_mb"),
         ),
     )
-
-
-def _asr_details_stage_worker_mode(asr_details: dict | None) -> str:
-    if not isinstance(asr_details, dict):
-        return ""
-    stage_worker = asr_details.get("stage_worker")
-    if not isinstance(stage_worker, dict):
-        return ""
-    return str(stage_worker.get("mode") or "").strip().lower()
 
 
 def _asr_details_cuda_skip_reason(asr_details: dict | None) -> str:
@@ -754,48 +719,6 @@ def _write_json(path: str, payload: dict) -> None:
 
 def _write_json_atomic(path: str | Path, payload: dict) -> None:
     output_writer_module.write_json_atomic(path, payload, project_root=PROJECT_ROOT)
-
-
-def _relativize_payload_paths(value):
-    return output_writer_module.relativize_payload_paths(
-        value,
-        project_root=PROJECT_ROOT,
-    )
-
-
-def _timings_payload(
-    *,
-    video_path: str,
-    audio_path: str,
-    audio_cached: bool,
-    job_id: str,
-    job_temp_dir: str,
-    device: str,
-    backend: str,
-    counts: dict,
-    stage_timings: dict,
-    asr_details: dict,
-    translation_request_timings: list[dict],
-    translation_api_retry_events: list[dict],
-    outputs: dict,
-    asr_log: list[str],
-) -> dict:
-    return output_writer_module.timings_payload(
-        video_path=video_path,
-        audio_path=audio_path,
-        audio_cached=audio_cached,
-        job_id=job_id,
-        job_temp_dir=job_temp_dir,
-        device=device,
-        backend=backend,
-        counts=counts,
-        stage_timings=stage_timings,
-        asr_details=asr_details,
-        translation_request_timings=translation_request_timings,
-        translation_api_retry_events=translation_api_retry_events,
-        outputs=outputs,
-        asr_log=asr_log,
-    )
 
 
 def _write_quality_report_for_ctx(
@@ -1413,7 +1336,6 @@ def _run_translation_and_write_impl(
     aligned_segments_path = artifacts.aligned_segments_path
     logger = artifacts.logger
     run_log_path = artifacts.run_log_path
-    output_dir = artifacts.output_dir
     srt_path = artifacts.srt_path
     transcript_path = artifacts.transcript_path
     asr_manifest_path = artifacts.asr_manifest_path
