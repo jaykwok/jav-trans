@@ -75,7 +75,7 @@ cd jav-trans
 
 uv venv
 uv pip install --upgrade pip
-uv pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu128
+uv pip install torch torchaudio --index-url https://download.pytorch.org/whl/cu128
 uv pip install -r requirements.txt
 ```
 
@@ -227,7 +227,7 @@ ASR stage 固定由统一 GPU worker 持有 CUDA：Boundary/PTM feature extracti
 
 GPU worker 默认每 10 秒输出一次当前阶段、总耗时和静默时长心跳。字幕 cue plan 会单独记录 timeline normalize、两轮 anchor-aware DP、polish 和 finalize 进度。
 
-Boundary cache 当前版本为 `v18`；旧 cache 不迁移。cache 签名包含 repo-bound 模型路径和运行配置，不兼容缓存会直接 miss。
+Boundary cache 当前版本为 `v19`；旧 cache 不迁移。cache 签名包含 repo-bound 模型路径和运行配置，不兼容缓存会直接 miss。
 
 `ASR_BATCH_SIZE=auto` 以 5600MB 下的 repo 默认表为基线，按显存预算比例放缩初始 batch。ASR text batch 与 Semantic Split candidate batch 发生 GPU OOM 时会重启 worker、降低对应 batch 并从 cache/checkpoint 续跑；SpeechBoundary/PTM、Outer/Cut Refiner、Pre-ASR CueQC 的执行形状不会为规避 OOM 而改变，OOM 时直接停止。RAM OOM 也直接停止，不伪装成可由 GPU batch 修复的问题。
 
