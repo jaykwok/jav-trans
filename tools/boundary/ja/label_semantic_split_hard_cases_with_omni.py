@@ -213,6 +213,36 @@ def _select_windows(rows: list[dict[str, Any]], limit: int) -> list[dict[str, An
     return selected
 
 
+def _limit_total_candidates(
+    windows: list[dict[str, Any]], limit: int
+) -> list[dict[str, Any]]:
+    """Round-robin candidates so a smoke budget covers many windows."""
+    if limit <= 0:
+        return windows
+    selected: list[dict[str, Any]] = []
+    candidate_lists = [list(row.get("candidates") or []) for row in windows]
+    positions = [0] * len(windows)
+    kept: list[list[dict[str, Any]]] = [[] for _ in windows]
+    total = 0
+    while total < limit:
+        added = False
+        for index, candidates in enumerate(candidate_lists):
+            if positions[index] >= len(candidates):
+                continue
+            kept[index].append(candidates[positions[index]])
+            positions[index] += 1
+            total += 1
+            added = True
+            if total >= limit:
+                break
+        if not added:
+            break
+    for row, candidates in zip(windows, kept, strict=True):
+        if candidates:
+            selected.append({**row, "candidates": candidates})
+    return selected
+
+
 def prepare_hard_cases(args: argparse.Namespace) -> list[dict[str, Any]]:
     reexport_dir = Path(args.reexport_dir)
     legacy = _legacy_index(Path(args.legacy_labels))
@@ -313,6 +343,7 @@ def prepare_hard_cases(args: argparse.Namespace) -> list[dict[str, Any]]:
             ],
         }
         selected = [heldout, *selected[: max(0, int(args.max_windows) - 1)]] if args.max_windows > 0 else [heldout, *selected]
+    selected = _limit_total_candidates(selected, int(args.max_total_candidates))
     _write_jsonl(Path(args.output_dir) / "selected_windows.jsonl", selected)
     return selected
 
@@ -622,6 +653,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--output-dir", required=True)
     parser.add_argument("--max-windows", type=int, default=100)
     parser.add_argument("--max-candidates-per-window", type=int, default=24)
+    parser.add_argument(
+        "--max-total-candidates",
+        type=int,
+        default=0,
+        help="Bound total requests using round-robin window coverage; 0 means unlimited.",
+    )
     parser.add_argument("--long-residual-min-s", type=float, default=8.0)
     parser.add_argument("--confidence-floor", type=float, default=0.80)
     parser.add_argument("--model", default="")
@@ -645,6 +682,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     args = parser.parse_args(argv)
     if args.max_candidates_per_window <= 0 or args.max_candidates_per_window > 24:
         parser.error("--max-candidates-per-window must be in [1, 24]")
+    if args.max_total_candidates < 0:
+        parser.error("--max-total-candidates must be >= 0")
     if args.max_attempts <= 0 or args.rpm < 0 or args.thinking_budget < 0:
         parser.error("retry/rpm/thinking settings are invalid")
     if not 0.5 <= args.clip_radius_s <= 20.0:

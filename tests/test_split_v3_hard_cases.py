@@ -87,6 +87,7 @@ def _args(tmp_path: Path) -> argparse.Namespace:
         output_dir=str(tmp_path / "out"),
         max_windows=100,
         max_candidates_per_window=24,
+        max_total_candidates=0,
         long_residual_min_s=8.0,
         confidence_floor=0.8,
         model="qwen3.5-omni-plus",
@@ -239,6 +240,23 @@ def test_split_v3_clip_radius_is_cli_adjustable() -> None:
     # Radius participates in clip geometry: narrower radius, tighter clip.
     assert labeler._clip_bounds(6.0, 10.0, radius_s=3.0) == (3.0, 9.0)
     assert labeler._clip_bounds(6.0, 10.0, radius_s=4.0) == (2.0, 10.0)
+
+
+def test_split_v3_total_candidate_limit_round_robins_windows() -> None:
+    windows = [
+        {"window_id": "a", "candidates": [{"id": "a1"}, {"id": "a2"}]},
+        {"window_id": "b", "candidates": [{"id": "b1"}, {"id": "b2"}]},
+        {"window_id": "c", "candidates": [{"id": "c1"}, {"id": "c2"}]},
+    ]
+
+    limited = labeler._limit_total_candidates(windows, 4)
+
+    assert [row["window_id"] for row in limited] == ["a", "b", "c"]
+    assert [[item["id"] for item in row["candidates"]] for row in limited] == [
+        ["a1", "a2"],
+        ["b1"],
+        ["c1"],
+    ]
 
 
 def test_split_v3_audit_prioritizes_disagreements_and_has_manual_controls(
