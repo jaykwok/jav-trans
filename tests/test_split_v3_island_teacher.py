@@ -81,6 +81,11 @@ def test_island_audit_shows_omni_and_current_markers(tmp_path: Path, monkeypatch
     _write_jsonl(selected, [{"island_id": "w#outer000", "candidates": [{"relative_time_s": 2.0, "accepted": True}]}])
     _write_jsonl(labels, [{"island_id": "w#outer000", "duration_s": 5.0, "cuts": [{"time_s": 3.0}], "reason": "test"}])
     monkeypatch.setattr(audit, "update_audit_entrypoints", lambda **_kwargs: None)
+    monkeypatch.setattr(
+        audit,
+        "_build_segmented_audio",
+        lambda **kwargs: kwargs["output"].write_bytes(b"segmented"),
+    )
 
     summary = audit.build_audit(selected=selected, labels=labels, output_dir=tmp_path / "audit")
     page = (tmp_path / "audit" / "index.html").read_text(encoding="utf-8")
@@ -91,4 +96,7 @@ def test_island_audit_shows_omni_and_current_markers(tmp_path: Path, monkeypatch
     assert "Omni 整体正确" in page
     assert "裁决对象：Omni 红线" in page
     assert "现役 accepted（仅对照）" in page
+    assert "原始 speech island" in page
+    assert "块间静音 1 秒" in page
+    assert "segmented_audio" in page
     assert "manual_verdicts.jsonl" in page

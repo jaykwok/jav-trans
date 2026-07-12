@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import subprocess
 import sys
 from pathlib import Path
 from typing import Any
@@ -19,6 +20,45 @@ def _read_jsonl(path: Path) -> list[dict[str, Any]]:
     if not path.exists():
         return []
     return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
+
+
+def _build_segmented_audio(
+    *, source: Path, output: Path, duration_s: float, cuts: list[float]
+) -> None:
+    output.parent.mkdir(parents=True, exist_ok=True)
+    bounds = [0.0, *cuts, float(duration_s)]
+    filters = []
+    inputs = []
+    for index, (start, end) in enumerate(zip(bounds, bounds[1:])):
+        filters.append(
+            f"[0:a]atrim=start={start:.6f}:end={end:.6f},asetpts=PTS-STARTPTS[p{index}]"
+        )
+        inputs.append(f"[p{index}]")
+        if index + 1 < len(bounds) - 1:
+            filters.append(f"anullsrc=r=16000:cl=mono:d=1[s{index}]")
+            inputs.append(f"[s{index}]")
+    filters.append(f"{''.join(inputs)}concat=n={len(inputs)}:v=0:a=1[out]")
+    subprocess.run(
+        [
+            "ffmpeg",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-y",
+            "-i",
+            str(source),
+            "-filter_complex",
+            ";".join(filters),
+            "-map",
+            "[out]",
+            "-ac",
+            "1",
+            "-ar",
+            "16000",
+            str(output),
+        ],
+        check=True,
+    )
 
 
 def build_audit(
@@ -44,6 +84,14 @@ def build_audit(
         target_audio.parent.mkdir(parents=True, exist_ok=True)
         if not target_audio.exists():
             target_audio.write_bytes(request_audio.read_bytes())
+        omni_cut_times = [float(cut["time_s"]) for cut in label["cuts"]]
+        segmented_audio = output_dir / "audio" / f"{source.stem}__omni-v2-segmented.wav"
+        _build_segmented_audio(
+            source=target_audio,
+            output=segmented_audio,
+            duration_s=float(label["duration_s"]),
+            cuts=omni_cut_times,
+        )
         accepted = sorted(
             {
                 round(float(candidate["relative_time_s"]), 3)
@@ -55,6 +103,7 @@ def build_audit(
             {
                 **label,
                 "audio": target_audio.relative_to(output_dir).as_posix(),
+                "segmented_audio": segmented_audio.relative_to(output_dir).as_posix(),
                 "current_accepted_cuts": accepted,
                 "baseline_omni_cuts": [
                     float(cut["time_s"])
@@ -71,7 +120,7 @@ def build_audit(
 <body><header><strong>Split v3 Speech Island Smoke · 5 samples</strong> <span>裁决对象：Omni 红线；现役蓝线仅供对照</span> <button id="save">保存裁决</button> <span id="status"></span></header><main id="list"></main>
 <script>const rows={payload};const key='split-v3-island-smoke-v1';const ann=JSON.parse(localStorage.getItem(key)||'{{}}');let active=null;
 function esc(s){{return String(s??'').replace(/[&<>"']/g,c=>({{'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}}[c]));}}function playAt(a,t){{if(active&&active!==a)active.pause();active=a;a.currentTime=Math.max(0,t-1);const end=Math.min(a.duration||1e9,t+1);const stop=()=>{{if(a.currentTime>=end){{a.pause();a.removeEventListener('timeupdate',stop)}}}};a.addEventListener('timeupdate',stop);a.play();}}
-function render(){{const list=document.getElementById('list');list.innerHTML='';for(const row of rows){{const a=ann[row.island_id]||{{verdict:'',note:''}};const el=document.createElement('article');if(a.verdict)el.classList.add('done');const dur=Number(row.duration_s);const omni=(row.cuts||[]).map(x=>Number(x.time_s));const baseline=(row.baseline_omni_cuts||[]).map(Number);const current=(row.current_accepted_cuts||[]).map(Number);const marks=[...omni.map(t=>`<button class="mark omni" data-t="${{t}}" title="Omni v2 ${{t.toFixed(3)}}s" style="left:${{t/dur*100}}%"></button>`),...baseline.map(t=>`<button class="mark baseline" data-t="${{t}}" title="Omni v1 ${{t.toFixed(3)}}s" style="left:${{t/dur*100}}%"></button>`),...current.map(t=>`<button class="mark current" data-t="${{t}}" title="现役 ${{t.toFixed(3)}}s" style="left:${{t/dur*100}}%"></button>`)].join('');el.innerHTML=`<strong>${{esc(row.island_id)}}</strong><div class="meta"><span>时长 ${{dur.toFixed(2)}}s</span><span>Omni v2 cuts=${{omni.length}}</span><span>v1 cuts=${{baseline.length}}</span><span>现役 cuts=${{current.length}}</span></div><audio controls preload="metadata" src="${{esc(row.audio)}}"></audio><div class="timeline">${{marks}}</div><div class="legend"><span><i class="swatch" style="background:#b42318"></i>Omni v2（裁决对象）</span><span><i class="swatch" style="background:#c56a00"></i>Omni v1 保守版（仅对照）</span><span><i class="swatch" style="background:#1769aa"></i>现役 accepted（仅对照）</span><span>点击竖线跨点试听 ±1s</span></div><div class="verdict"><button data-v="correct">Omni 整体正确</button><button data-v="missed_cut">Omni 有漏切</button><button data-v="false_cut">Omni 有误切</button><button data-v="timing_error">Omni 时间不准</button><button data-v="unsure">无法判断</button><input class="note" placeholder="指出具体秒数" value="${{esc(a.note)}}"></div><pre>${{esc(JSON.stringify({{omni_v2_cuts:row.cuts,omni_v1_cuts:baseline,current_accepted_cuts:current,reason:row.reason}},null,2))}}</pre>`;const audio=el.querySelector('audio');audio.onplay=()=>{{if(active&&active!==audio)active.pause();active=audio}};el.querySelectorAll('.mark').forEach(b=>b.onclick=()=>playAt(audio,Number(b.dataset.t)));el.querySelectorAll('[data-v]').forEach(b=>{{if(b.dataset.v===a.verdict)b.classList.add('active');b.onclick=()=>{{ann[row.island_id]={{verdict:b.dataset.v,note:el.querySelector('.note').value,updated_at:new Date().toISOString()}};localStorage.setItem(key,JSON.stringify(ann));render()}}}});el.querySelector('.note').onchange=e=>{{ann[row.island_id]={{...(ann[row.island_id]||{{verdict:'',note:''}}),note:e.target.value,updated_at:new Date().toISOString()}};localStorage.setItem(key,JSON.stringify(ann))}};list.appendChild(el)}}document.getElementById('status').textContent=`已审 ${{Object.values(ann).filter(x=>x.verdict).length}} / ${{rows.length}}`;}}
+function render(){{const list=document.getElementById('list');list.innerHTML='';for(const row of rows){{const a=ann[row.island_id]||{{verdict:'',note:''}};const el=document.createElement('article');if(a.verdict)el.classList.add('done');const dur=Number(row.duration_s);const omni=(row.cuts||[]).map(x=>Number(x.time_s));const baseline=(row.baseline_omni_cuts||[]).map(Number);const current=(row.current_accepted_cuts||[]).map(Number);const marks=[...omni.map(t=>`<button class="mark omni" data-t="${{t}}" title="Omni v2 ${{t.toFixed(3)}}s" style="left:${{t/dur*100}}%"></button>`),...baseline.map(t=>`<button class="mark baseline" data-t="${{t}}" title="Omni v1 ${{t.toFixed(3)}}s" style="left:${{t/dur*100}}%"></button>`),...current.map(t=>`<button class="mark current" data-t="${{t}}" title="现役 ${{t.toFixed(3)}}s" style="left:${{t/dur*100}}%"></button>`)].join('');el.innerHTML=`<strong>${{esc(row.island_id)}}</strong><div class="meta"><span>时长 ${{dur.toFixed(2)}}s</span><span>Omni v2 cuts=${{omni.length}}</span><span>v1 cuts=${{baseline.length}}</span><span>现役 cuts=${{current.length}}</span></div><div><strong>原始 speech island</strong><audio class="original-audio" controls preload="metadata" src="${{esc(row.audio)}}"></audio></div><div><strong>按 Omni v2 切割后顺序播放（块间静音 1 秒）</strong><audio class="segmented-audio" controls preload="metadata" src="${{esc(row.segmented_audio)}}"></audio></div><div class="timeline">${{marks}}</div><div class="legend"><span><i class="swatch" style="background:#b42318"></i>Omni v2（裁决对象）</span><span><i class="swatch" style="background:#c56a00"></i>Omni v1 保守版（仅对照）</span><span><i class="swatch" style="background:#1769aa"></i>现役 accepted（仅对照）</span><span>点击竖线在原始音频跨点试听 ±1s</span></div><div class="verdict"><button data-v="correct">Omni 整体正确</button><button data-v="missed_cut">Omni 有漏切</button><button data-v="false_cut">Omni 有误切</button><button data-v="timing_error">Omni 时间不准</button><button data-v="unsure">无法判断</button><input class="note" placeholder="指出具体秒数" value="${{esc(a.note)}}"></div><pre>${{esc(JSON.stringify({{omni_v2_cuts:row.cuts,omni_v1_cuts:baseline,current_accepted_cuts:current,reason:row.reason}},null,2))}}</pre>`;const audio=el.querySelector('.original-audio');el.querySelectorAll('audio').forEach(player=>player.onplay=()=>{{if(active&&active!==player)active.pause();active=player}});el.querySelectorAll('.mark').forEach(b=>b.onclick=()=>playAt(audio,Number(b.dataset.t)));el.querySelectorAll('[data-v]').forEach(b=>{{if(b.dataset.v===a.verdict)b.classList.add('active');b.onclick=()=>{{ann[row.island_id]={{verdict:b.dataset.v,note:el.querySelector('.note').value,updated_at:new Date().toISOString()}};localStorage.setItem(key,JSON.stringify(ann));el.querySelectorAll('[data-v]').forEach(x=>x.classList.toggle('active',x===b));el.classList.add('done');document.getElementById('status').textContent=`已审 ${{Object.values(ann).filter(x=>x.verdict).length}} / ${{rows.length}}`;}}}});el.querySelector('.note').onchange=e=>{{ann[row.island_id]={{...(ann[row.island_id]||{{verdict:'',note:''}}),note:e.target.value,updated_at:new Date().toISOString()}};localStorage.setItem(key,JSON.stringify(ann))}};list.appendChild(el)}}document.getElementById('status').textContent=`已审 ${{Object.values(ann).filter(x=>x.verdict).length}} / ${{rows.length}}`;}}
 document.getElementById('save').onclick=async()=>{{const content=rows.filter(r=>ann[r.island_id]?.verdict).map(r=>JSON.stringify({{schema:'semantic_split_v3_island_manual_verdict_v1',island_id:r.island_id,verdict:ann[r.island_id].verdict,note:ann[r.island_id].note||'',updated_at:ann[r.island_id].updated_at}})).join('\\n')+'\\n';const res=await fetch('/__audit_api__/save-labels',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{href:location.pathname,filename:'manual_verdicts.jsonl',content}})}});const out=await res.json();document.getElementById('status').textContent=out.ok?'已保存到 '+out.path:'保存失败: '+out.error}};render();</script></body></html>"""
     index_path = output_dir / "index.html"
     index_path.write_text(page, encoding="utf-8")
