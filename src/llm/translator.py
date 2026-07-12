@@ -70,9 +70,29 @@ LLM_API_FORMAT = os.getenv("LLM_API_FORMAT", "chat").strip().lower() or "chat"
 LLM_REASONING_EFFORT = os.getenv("LLM_REASONING_EFFORT", "medium").strip() or "medium"
 
 DEFAULT_TARGET_LANG = "简体中文"
+
+
+def _env_float(name: str, default: float) -> float:
+    try:
+        return float(os.getenv(name, "").strip() or default)
+    except (TypeError, ValueError):
+        return default
+
+
+def _env_int_clamped(name: str, default: int, low: int, high: int) -> int:
+    try:
+        value = int(os.getenv(name, "").strip() or default)
+    except (TypeError, ValueError):
+        value = default
+    return max(low, min(high, value))
+
+
 TRANSLATION_MAX_TOKENS = 384000
-TRANSLATION_TEMPERATURE = 0.2
+TRANSLATION_TEMPERATURE = _env_float("LLM_TEMPERATURE", 0.6)
 TRANSLATION_TOP_P = 0.9
+# Worker-independent request granularity. Env override (restart required);
+# clamped to a sane range so a bad value never produces 0-length or huge batches.
+TRANSLATION_BATCH_SIZE = _env_int_clamped("TRANSLATION_BATCH_SIZE", 64, 8, 400)
 COMPACT_SYSTEM_PROMPT = False
 TRANSLATION_API_RETRIES = 4
 TRANSLATION_BATCH_REPAIR_RETRIES = 2
@@ -1761,12 +1781,7 @@ def _auto_translation_batch_size(segment_count: int, max_workers: int) -> int:
     count = max(0, int(segment_count))
     if count <= 0:
         return 0
-    workers = max(1, int(max_workers))
-    context_window_cues = 25
-    context_overlap_cues = 10
-    stride_cues = max(1, context_window_cues - context_overlap_cues)
-    batch_size = context_window_cues + stride_cues * workers * 6
-    return min(count, max(context_window_cues, min(400, batch_size)))
+    return min(count, TRANSLATION_BATCH_SIZE)
 
 
 _serialize_segments = prompt_module._serialize_segments

@@ -1,12 +1,28 @@
 import json
 
 from llm import translator
-def test_prompt_version_is_v28():
-    assert translator.PROMPT_VERSION == "v2.8"
+def test_prompt_version_is_v29():
+    assert translator.PROMPT_VERSION == "v2.9"
 
 
 def test_system_prompt_no_male_prefix_example():
     assert "男：" not in translator._SYSTEM_PROMPT_FULL
+
+
+def test_system_prompt_tone_is_scene_conditional():
+    # The unconditional whole-film flirtation directive was removed; tone must be
+    # scene-conditional (explicit for sexual scenes, plain for the rest).
+    full = translator._SYSTEM_PROMPT_FULL
+    assert "本片译文要体现主动撩拨的语气" not in full
+    assert "情欲场景" in full
+    assert "非情欲对白" in full
+
+
+def test_system_prompt_includes_style_examples():
+    # Few-shot JA->ZH style pairs guide register better than abstract rules.
+    full = translator._SYSTEM_PROMPT_FULL
+    assert "风格示例" in full
+    assert " → " in full
 
 
 def test_user_prompt_uses_target_language_label():

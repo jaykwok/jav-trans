@@ -20,6 +20,17 @@ export function connectSSE() {
 
     const phase = ev.phase ?? '';
 
+    if (ev.stage === 'timing_summary' && phase === 'done') {
+      const rows = Array.isArray(ev.extra?.rows) ? ev.extra.rows : [];
+      addLog(ev.extra?.title || '阶段耗时', 'stage-done');
+      rows.forEach(row => {
+        const seconds = Number(row?.seconds);
+        if (!row?.label || !Number.isFinite(seconds)) return;
+        addLog(`  ${row.label}：${seconds.toFixed(2)}s`, 'stage-done');
+      });
+      return;
+    }
+
     if (ev.stage === 'model_download' && ev.job_id) {
       const job = state.jobs[ev.job_id];
       if (job) {

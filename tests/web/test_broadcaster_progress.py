@@ -36,6 +36,44 @@ def test_translation_progress_promotes_counts_to_job_progress(tmp_path, monkeypa
     asyncio.run(_test_translation_progress_promotes_counts_to_job_progress(tmp_path, monkeypatch))
 
 
+def test_timing_summary_does_not_replace_job_progress(tmp_path, monkeypatch):
+    asyncio.run(_test_timing_summary_does_not_replace_job_progress(tmp_path, monkeypatch))
+
+
+async def _test_timing_summary_does_not_replace_job_progress(tmp_path, monkeypatch):
+    monkeypatch.setattr(pm, "_jobs_path", tmp_path / "jobs.json")
+    await _reset_pm_state()
+    job = JobState(
+        id="timing-job",
+        spec=JobSpec(video_paths=["sample.mp4"]),
+        created_at="2026-05-04T00:00:00.000+00:00",
+        status="writing",
+        current_stage="write_output",
+    )
+    async with pm._state_lock:
+        pm._jobs[job.id] = job
+        pm._write_jobs_unlocked()
+
+    broadcaster.publish(
+        json.dumps(
+            {
+                "job_id": job.id,
+                "video": "sample.mp4",
+                "stage": "timing_summary",
+                "phase": "done",
+                "extra": {"rows": [{"label": "总计", "seconds": 12.3}]},
+            },
+            ensure_ascii=False,
+        )
+    )
+    await asyncio.sleep(0)
+
+    current = await pm.get_job(job.id)
+    assert current is not None
+    assert current.current_stage == "write_output"
+    await _reset_pm_state()
+
+
 async def _test_translation_progress_promotes_counts_to_job_progress(tmp_path, monkeypatch):
     monkeypatch.setattr(pm, "_jobs_path", tmp_path / "jobs.json")
     await _reset_pm_state()
