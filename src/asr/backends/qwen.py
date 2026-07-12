@@ -112,10 +112,6 @@ def repo_path_mapping(raw: str) -> dict[str, str]:
     return mapping
 
 
-def repo_path_mapping_env(mapping: dict[str, str]) -> str:
-    return ",".join(f"{repo_id}={path}" for repo_id, path in mapping.items())
-
-
 def checkpoint_path_for_repo_env(
     *,
     repo_id: str | None,

@@ -1,4 +1,3 @@
-import os
 import re
 import logging
 import math
@@ -262,20 +261,6 @@ def _split_text_by_ratios(text: str, ratios: list[float]) -> list[str]:
         if 0 < position < len(raw):
             positions.append(position)
     return _split_text_by_positions(raw, sorted(set(positions)))
-
-
-def _weak_cut_times(block: dict, *, start: float, end: float) -> list[float]:
-    times: list[float] = []
-    for candidate in block.get("weak_cut_candidates") or []:
-        if not isinstance(candidate, dict):
-            continue
-        try:
-            time_s = float(candidate["time_s"])
-        except (KeyError, TypeError, ValueError):
-            continue
-        if start < time_s < end:
-            times.append(time_s)
-    return sorted(set(times))
 
 
 def _anchor_times(block: dict, *, start: float, end: float) -> list[dict]:

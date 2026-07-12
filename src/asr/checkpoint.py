@@ -15,15 +15,6 @@ from asr.backends.qwen import active_qwen_asr_model_id
 from asr.pre_asr_cueqc import runtime_signature as pre_asr_cueqc_runtime_signature
 
 
-def _asr_generation_error_kind(kind: str) -> str:
-    normalized = str(kind or "").strip().lower()
-    if normalized in {"timeout", "oom"}:
-        return normalized
-    if normalized in {"crash", "protocol_error"}:
-        return "worker_error"
-    return "quarantined"
-
-
 _LAST_BOUNDARY_SIGNATURE: dict = {}
 
 
@@ -139,16 +130,6 @@ def _jsonable(value: Any) -> Any:
 
 def _signature_json(payload: dict) -> str:
     return json.dumps(_jsonable(payload), ensure_ascii=False, sort_keys=True, separators=(",", ":"))
-
-
-def _json_or_text(value: str) -> dict | str:
-    if not value:
-        return ""
-    try:
-        parsed = json.loads(value)
-    except Exception:
-        return value
-    return parsed if isinstance(parsed, dict) else value
 
 
 def _get_asr_runtime_signature(
@@ -340,108 +321,6 @@ def _save_asr_checkpoint(
         tmp_path.replace(checkpoint_path)
     finally:
         _delete_path_for_cleanup(tmp_path)
-
-
-def _build_quarantined_text_result(
-    chunk: dict,
-    *,
-    kind: str,
-    detail: str,
-    respawn_count: int,
-    run_id: str | None = None,
-) -> dict:
-    normalized_path = str(Path(chunk["path"]).resolve())
-    try:
-        duration = _get_wav_duration(normalized_path)
-    except Exception:
-        duration = max(
-            0.0,
-            float(chunk.get("end", 0.0)) - float(chunk.get("start", 0.0)),
-        )
-
-    return {
-        "text": "",
-        "raw_text": "",
-        "duration": duration,
-        "language": "Japanese",
-        "normalized_path": normalized_path,
-        "segments": [],
-        "asr_generation": {
-            "backend": current_asr_backend(),
-            "configured_max_new_tokens": _env_text("ASR_MAX_NEW_TOKENS", "128"),
-            "model_max_target_positions": None,
-            "policy": "quarantined_result",
-            "worker_mode": current_asr_worker_mode(),
-            "error_kind": _asr_generation_error_kind(kind),
-            "failure_kind": str(kind or "").strip().lower(),
-            "error_detail": str(detail or ""),
-            "respawn_count": int(respawn_count),
-            "run_id": run_id or "",
-        },
-        "log": [
-            (
-                "QUARANTINED: "
-                f"kind={kind}, respawn_count={respawn_count}, "
-                f"run_id={run_id or ''}, detail={detail}"
-            )
-        ],
-    }
-
-
-def _quarantine_failed_chunks(
-    checkpoint_source: str,
-    chunks: list[dict],
-    failure_records: list[dict],
-    *,
-    run_id: str | None = None,
-    worker_mode: str | None = None,
-) -> list[Path]:
-    if not failure_records:
-        return []
-
-    chunk_by_index = {int(chunk["index"]): chunk for chunk in chunks}
-    out_dir = _current_chunk_root().parent / "asr_timeouts"
-    out_dir.mkdir(parents=True, exist_ok=True)
-    written: list[Path] = []
-
-    for record in failure_records:
-        try:
-            chunk_index = int(record["index"])
-        except (KeyError, TypeError, ValueError):
-            continue
-        chunk = chunk_by_index.get(chunk_index)
-        if chunk is None:
-            continue
-
-        record_run_id = str(record.get("run_id") or run_id or "unknown")
-        chunk_key = hashlib.sha1(
-            f"{checkpoint_source}|{chunk_index}".encode()
-        ).hexdigest()[:10]
-        target = out_dir / f"timeouts_{chunk_key}_{record_run_id}.json"
-        tmp_path = target.with_name(f"{target.name}.{uuid.uuid4().hex[:8]}.tmp")
-        payload = {
-            "run_id": record_run_id,
-            "audio_path": checkpoint_source,
-            "chunk_index": chunk_index,
-            "start": float(chunk.get("start", 0.0)),
-            "end": float(chunk.get("end", 0.0)),
-            "model": active_qwen_asr_model_id(),
-            "dtype": _env_lower("ASR_DTYPE", "auto"),
-            "timeout_s": float(os.getenv("TRANSCRIPTION_TIMEOUT_S", "180")),
-            "respawn_count": int(record.get("respawn_count", 0)),
-            "failure_kind": str(record.get("kind") or "crash"),
-            "last_error": str(record.get("detail", "")),
-            "worker_mode": str(record.get("worker_mode") or worker_mode or current_asr_worker_mode()),
-        }
-        try:
-            with open(tmp_path, "w", encoding="utf-8") as writer:
-                json.dump(payload, writer, ensure_ascii=False, indent=2)
-            tmp_path.replace(target)
-            written.append(target)
-        except Exception:
-            _delete_path_for_cleanup(tmp_path)
-
-    return written
 
 
 def aggregate_timeout_fragments(job_id: str) -> Path | None:

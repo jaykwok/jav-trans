@@ -385,7 +385,6 @@ def build_candidates(
 ) -> list[dict[str, Any]]:
     candidates: list[dict[str, Any]] = []
     for position, (chunk, text_result) in enumerate(zip(chunks, text_results)):
-        chunk_index = _safe_int(chunk.get("index"), position)
         candidates.append(
             build_candidate(
                 chunk=chunk,
@@ -406,7 +405,6 @@ def numeric_feature_vector(candidate: Mapping[str, Any]) -> list[float]:
         if isinstance(candidate.get("text_features"), Mapping)
         else {}
     )
-    cue_features = candidate.get("cue_features") if isinstance(candidate.get("cue_features"), Mapping) else {}
     adjacency = candidate.get("adjacency") if isinstance(candidate.get("adjacency"), Mapping) else {}
     repeat = (
         text_features_payload.get("repeat_profile")

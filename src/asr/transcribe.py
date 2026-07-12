@@ -3,11 +3,9 @@ import os
 import re
 import time
 import uuid
-from pathlib import Path
 from typing import Callable
 
 from asr.backends.base import BaseAsrBackend
-from asr.backends.registry import current_asr_worker_mode
 from asr.alignment_quality import classify_alignment_quality
 from asr.checkpoint import (
     _checkpointable_text_results,
@@ -54,10 +52,6 @@ def _asr_invalid_segment_duration_s() -> float:
 def _asr_min_repaired_segment_duration_s() -> float:
     return float(os.getenv("ASR_MIN_REPAIRED_SEGMENT_DURATION", "0.6"))
 _STRIP_PUNCT_RE = re.compile(r"[。！？…、,.!?・「」『』（）()【】\[\]\s~〜ー-]+")
-
-
-def _current_asr_worker_mode() -> str:
-    return current_asr_worker_mode()
 
 
 def _vram_budget_mb() -> float:

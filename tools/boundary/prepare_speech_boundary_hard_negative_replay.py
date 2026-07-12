@@ -7,7 +7,7 @@ import sys
 from collections import Counter
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Iterable, Mapping, Sequence
+from typing import Any, Mapping, Sequence
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -272,7 +272,6 @@ def prepare_hard_negative_replay(
     for index, labels in enumerate(anchor_labels):
         manifest = anchor_manifests[index] if anchor_manifests else None
         anchors.append(label_summary(labels, manifest))
-    anchor_records = sum(int(item["records"]) for item in anchors)
     anchor_trainable = sum(int(item["trainable_examples"]) for item in anchors)
     anchor_positive_frames = sum(int(item["speech_frame_count"]) for item in anchors)
     negative_trainable = int(negative["trainable_examples"])
