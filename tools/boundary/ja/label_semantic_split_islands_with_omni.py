@@ -160,12 +160,15 @@ def collect_islands(reexport_dir: Path) -> list[dict[str, Any]]:
 
 
 def select_smoke_islands(
-    islands: list[dict[str, Any]], limit: int
+    islands: list[dict[str, Any]],
+    limit: int,
+    *,
+    target_durations_s: tuple[float, ...] = TARGET_DURATIONS_S,
 ) -> list[dict[str, Any]]:
     pool = [row for row in islands if row["candidates"]]
     if limit <= 0 or limit >= len(pool):
         return sorted(pool, key=lambda row: (row["duration_s"], row["island_id"]))
-    targets = list(TARGET_DURATIONS_S[:limit])
+    targets = list(target_durations_s[:limit])
     if limit > len(targets):
         low = min(row["duration_s"] for row in pool)
         high = max(row["duration_s"] for row in pool)
@@ -178,7 +181,7 @@ def select_smoke_islands(
             (item for item in pool if item["island_id"] not in used),
             key=lambda item: (
                 abs(float(item["duration_s"]) - target),
-                -sum(bool(c["accepted"]) for c in item["candidates"]),
+                -sum(bool(c.get("accepted")) for c in item["candidates"]),
                 str(item["island_id"]),
             ),
         )
@@ -215,8 +218,24 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     if selected_path.exists() and args.resume_selection:
         selected = _read_jsonl(selected_path)
     else:
+        excluded_ids = {
+            str(row["island_id"])
+            for path in args.exclude_selection
+            for row in _read_jsonl(Path(path))
+        }
+        targets = tuple(
+            float(value.strip())
+            for value in str(args.duration_targets).split(",")
+            if value.strip()
+        )
         selected = select_smoke_islands(
-            collect_islands(Path(args.reexport_dir)), int(args.max_islands)
+            [
+                row
+                for row in collect_islands(Path(args.reexport_dir))
+                if str(row["island_id"]) not in excluded_ids
+            ],
+            int(args.max_islands),
+            target_durations_s=targets,
         )
         selected_path.write_text(
             "".join(json.dumps(row, ensure_ascii=False) + "\n" for row in selected),
@@ -322,6 +341,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--reexport-dir", required=True)
     parser.add_argument("--output-dir", required=True)
     parser.add_argument("--max-islands", type=int, default=5)
+    parser.add_argument(
+        "--duration-targets",
+        default=",".join(str(value) for value in TARGET_DURATIONS_S),
+        help="Comma-separated island durations used for deterministic smoke selection.",
+    )
+    parser.add_argument(
+        "--exclude-selection",
+        action="append",
+        default=[],
+        help="selected_islands.jsonl whose island IDs must not be reused.",
+    )
     parser.add_argument("--model", default=DEFAULT_MODEL)
     parser.add_argument("--env-file", default=str(DEFAULT_ENV_FILE))
     parser.add_argument("--rpm", type=float, default=60.0)
@@ -334,6 +364,16 @@ def parse_args() -> argparse.Namespace:
     args = parser.parse_args()
     if args.max_islands <= 0 or args.max_attempts <= 0 or args.rpm < 0:
         parser.error("invalid island count, attempts, or RPM")
+    try:
+        targets = [
+            float(value.strip())
+            for value in str(args.duration_targets).split(",")
+            if value.strip()
+        ]
+    except ValueError:
+        parser.error("--duration-targets must contain comma-separated numbers")
+    if len(targets) < args.max_islands or any(value <= 0 for value in targets):
+        parser.error("--duration-targets must provide one positive target per island")
     return args
 
 
