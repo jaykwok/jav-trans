@@ -29,6 +29,7 @@ def test_teacher_contract_is_candidate_classification_without_timestamps() -> No
     assert "end_s" not in teacher.SOURCE_GATE_PROMPT
     assert teacher.DEFAULT_PROJECTION.suffix == ".pt"
     assert "Qwen3-ASR-1.7B" in str(teacher.DEFAULT_PROJECTION)
+    assert teacher.DEFAULT_REQUEST_MODE == "single"
 
 
 def test_learned_farthest_medoid_selection_and_cells_are_deterministic() -> None:

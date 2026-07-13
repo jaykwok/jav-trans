@@ -37,6 +37,7 @@ SCHEMA = "semantic_source_candidate_teacher_v2"
 SELECTION_SCHEMA = "semantic_source_learned_candidate_selection_v2"
 PROMPT_VERSION = "semantic_source_hierarchical_candidate_marker_v2"
 DEFAULT_MODEL = "qwen3.5-omni-plus"
+DEFAULT_REQUEST_MODE = "single"
 LABELS = ("discardable", "semantic_target", "unsure")
 SOURCE_LABELS = ("discardable", "contains_semantic", "unsure")
 DEFAULT_PROJECTION = (
@@ -540,6 +541,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     raw_path = output / "omni_raw_responses.jsonl"
     existing = {str(row["sample_id"]) for row in _rows(labels_path)}
     fallback_samples = 0
+    single_request_samples = 0
     for sample in selected:
         sample_id = str(sample["sample_id"])
         if sample_id in existing:
@@ -567,37 +569,45 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 "source_gate": source_gate,
             }
         else:
-            try:
-                if args.request_mode == "single":
-                    raise RuntimeError("single request mode selected")
-                validation_error = None
-                for _attempt in range(int(args.max_attempts)):
-                    parsed, raw = _call_multi(
-                        sample=sample,
-                        model=model,
-                        api_key=api_key,
-                        base_url=base_url,
-                        timeout_s=float(args.timeout_s),
-                        thinking_budget=int(args.thinking_budget),
-                    )
-                    try:
-                        classified = _validate(parsed, sample)
-                        validation_error = None
-                        break
-                    except ValueError as error:
-                        validation_error = error
-                if validation_error is not None:
-                    raise validation_error
-            except ValueError:
-                raise
-            except Exception as multi_error:
-                fallback_samples += 1
+            if args.request_mode == "multi":
+                try:
+                    validation_error = None
+                    for _attempt in range(int(args.max_attempts)):
+                        parsed, raw = _call_multi(
+                            sample=sample,
+                            model=model,
+                            api_key=api_key,
+                            base_url=base_url,
+                            timeout_s=float(args.timeout_s),
+                            thinking_budget=int(args.thinking_budget),
+                        )
+                        try:
+                            classified = _validate(parsed, sample)
+                            validation_error = None
+                            break
+                        except ValueError as error:
+                            validation_error = error
+                    if validation_error is not None:
+                        raise validation_error
+                except ValueError:
+                    raise
+                except Exception as multi_error:
+                    fallback_samples += 1
+                    classified = []
+                    raw = {
+                        "multi_audio": False,
+                        "multi_audio_error": repr(multi_error),
+                        "responses": [],
+                    }
+            else:
+                single_request_samples += 1
                 classified = []
                 raw = {
                     "multi_audio": False,
-                    "multi_audio_error": repr(multi_error),
+                    "request_mode": "single",
                     "responses": [],
                 }
+            if not classified:
                 for candidate in sample["candidates"]:
                     prompt = json.dumps(
                         {
@@ -671,6 +681,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "labeled_samples": len(_rows(labels_path)),
         "candidate_count": sum(len(row["candidates"]) for row in selected),
         "fallback_samples": fallback_samples,
+        "single_request_samples": single_request_samples,
         "labels": str(labels_path),
     }
     (output / "summary.json").write_text(
@@ -695,7 +706,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--thinking-budget", type=int, default=1024)
     parser.add_argument("--request-interval-s", type=float, default=1.0)
     parser.add_argument("--max-attempts", type=int, default=3)
-    parser.add_argument("--request-mode", choices=("multi", "single"), default="multi")
+    parser.add_argument(
+        "--request-mode",
+        choices=("multi", "single"),
+        default=DEFAULT_REQUEST_MODE,
+    )
     parser.add_argument(
         "--resume-selection", action=argparse.BooleanOptionalAction, default=True
     )
