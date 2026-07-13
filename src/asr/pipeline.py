@@ -226,6 +226,9 @@ def _sequence_feature_provider_from_result(
     ptm_projected = payload.get("ptm_projected")
     if not isinstance(ptm_projected, (list, np.ndarray)):
         ptm_projected = None
+    semantic_ptm_projected = payload.get("semantic_ptm_projected")
+    if not isinstance(semantic_ptm_projected, (list, np.ndarray)):
+        semantic_ptm_projected = None
     return FrameSequenceFeatureProvider(
         duration_s=float(duration_s),
         frame_hop_s=hop,
@@ -233,6 +236,8 @@ def _sequence_feature_provider_from_result(
         mfcc=mfcc,
         ptm_projected=ptm_projected,
         ptm_projected_digest=str(payload.get("ptm_projection_digest") or ""),
+        semantic_ptm_projected=semantic_ptm_projected,
+        semantic_scorer_sha256=str(payload.get("semantic_scorer_sha256") or ""),
         config=FrameSequenceFeatureConfig(
             left_context_s=_env_float("BOUNDARY_FRAME_SEQUENCE_LEFT_CONTEXT_S", "0.60"),
             right_context_s=_env_float("BOUNDARY_FRAME_SEQUENCE_RIGHT_CONTEXT_S", "0.60"),
