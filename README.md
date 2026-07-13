@@ -87,7 +87,7 @@ uv pip install torch torchaudio --index-url https://download.pytorch.org/whl/cu1
 uv pip install -r requirements.txt
 ```
 
-Qwen3-ASR 原生支持要求 `transformers>=5.13.0`，已由 `requirements.txt` 安装稳定版，无需从 GitHub 源码安装。
+Qwen3-ASR 原生支持要求 `transformers>=5.13.0`（由 `requirements.txt` 安装）。
 
 启动网页控制台：
 
@@ -192,7 +192,7 @@ src/checkpoints/
 └── jaykwok-Qwen3-ASR-1.7B-JA-Anime-Galgame-hf/
 ```
 
-当前 active 链使用 Split v2 和 CueQC v12，旧版本只供显式离线重放。不存在规则 fallback、旧路径 alias 或静默迁移；模型缺失、repo 不匹配或 schema 不兼容都会直接报错。实验指标、训练过程和版本决策见 `HISTORY.md`。
+当前 active 链使用 Split v2 和 CueQC v12。模型缺失、repo 不匹配或 schema 不兼容都会直接报错（无规则 fallback、无静默迁移）。实验指标与版本决策见 `HISTORY.md`。
 
 ---
 
@@ -235,11 +235,11 @@ ASR stage 固定由统一 GPU worker 持有 CUDA：Boundary/PTM feature extracti
 
 GPU worker 默认每 10 秒输出一次当前阶段、总耗时和静默时长心跳。字幕 cue plan 会单独记录 timeline normalize、两轮 anchor-aware DP、polish 和 finalize 进度。
 
-Boundary cache 当前版本为 `v19`；旧 cache 不迁移。cache 签名包含 repo-bound 模型路径和运行配置，不兼容缓存会直接 miss。
+Boundary cache 当前版本为 `v19`。cache 签名包含 repo-bound 模型路径和运行配置，不兼容缓存会直接 miss。
 
 `ASR_BATCH_SIZE=auto` 以 5600MB 下的 repo 默认表为基线，按显存预算比例放缩初始 batch。ASR text batch 与 Semantic Split candidate batch 发生 GPU OOM 时会重启 worker、降低对应 batch 并从 cache/checkpoint 续跑；SpeechBoundary/PTM、Outer/Cut Refiner、Pre-ASR CueQC 的执行形状不会为规避 OOM 而改变，OOM 时直接停止。RAM OOM 也直接停止，不伪装成可由 GPU batch 修复的问题。
 
-auto batch 会在 `tmp/cache/gpu_batch_profiles.json` 按 GPU、模型和推理配置跨任务学习。v2 profile 记录已验证安全 batch 与 OOM 不安全上界：阶段 peak allocated 低于预算 `80%` 时，在两者之间二分探测；尚无 OOM 上界时则向当前阶段上限折半推进，OOM 后本次任务仍先减半恢复。当前覆盖 ASR chunk batch 与 Semantic Split 独立候选 batch。显式数字 batch 不参与学习；Speech scorer/PTM 的 20 秒时序窗口、Pre-ASR planned-island 序列，以及 Outer/Cut 的既有执行形状不会为了学习而改变。旧 v1 profile 不迁移，会自动从当前启发式基线重新学习。
+auto batch 会在 `tmp/cache/gpu_batch_profiles.json` 按 GPU、模型和推理配置跨任务学习。v2 profile 记录已验证安全 batch 与 OOM 不安全上界：阶段 peak allocated 低于预算 `80%` 时，在两者之间二分探测；尚无 OOM 上界时则向当前阶段上限折半推进，OOM 后本次任务仍先减半恢复。当前覆盖 ASR chunk batch 与 Semantic Split 独立候选 batch。显式数字 batch 不参与学习；Speech scorer/PTM 的 20 秒时序窗口、Pre-ASR planned-island 序列，以及 Outer/Cut 的既有执行形状不会为了学习而改变。
 
 推理需要 ASR / SpeechBoundary-JA frozen feature Hugging Face 模型，以及与当前 repo id 匹配的本地 checkpoint。源码运行时如果本地没有 Hugging Face 模型，会按需下载到 `models/`。registry 缺失、覆盖映射未命中当前 repo id、文件不存在、schema 不匹配或 metadata 不匹配都会 fail-fast。
 
