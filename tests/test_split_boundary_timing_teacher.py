@@ -34,7 +34,12 @@ def test_timing_teacher_requires_safe_order() -> None:
 def test_timing_audit_has_four_time_references_and_two_players(tmp_path, monkeypatch) -> None:
     labels = tmp_path / "labels.jsonl"
     labels.write_text(
-        '{"boundary_id":"i#b000","island_id":"i","duration_s":5,"coarse_time_s":2,"projected_time_s":2.1,"refined_time_s":1.9,"left_speech_end_s":2.2,"safe_cut_time_s":2.3,"right_speech_start_s":2.4,"confidence":0.9,"flags":[],"reason":"ok"}\n',
+        '{"boundary_id":"i#b001","island_id":"i","duration_s":5,"coarse_time_s":2,"projected_time_s":2.1,"refined_time_s":1.9,"left_speech_end_s":2.2,"safe_cut_time_s":2.3,"right_speech_start_s":2.4,"confidence":0.9,"flags":[],"reason":"ok"}\n',
+        encoding="utf-8",
+    )
+    semantic = tmp_path / "semantic.jsonl"
+    semantic.write_text(
+        '{"island_id":"i","cuts":[{"time_s":1.0},{"time_s":2.0},{"time_s":4.0}]}\n',
         encoding="utf-8",
     )
     audio_dir = tmp_path / "audio"
@@ -47,7 +52,12 @@ def test_timing_audit_has_four_time_references_and_two_players(tmp_path, monkeyp
     )
     monkeypatch.setattr(audit, "update_audit_entrypoints", lambda **_kwargs: None)
 
-    audit.build_audit(labels=labels, request_audio_dir=audio_dir, output_dir=tmp_path / "audit")
+    audit.build_audit(
+        labels=labels,
+        semantic_labels=semantic,
+        request_audio_dir=audio_dir,
+        output_dir=tmp_path / "audit",
+    )
     page = (tmp_path / "audit" / "index.html").read_text(encoding="utf-8")
 
     assert "Timing safe（裁决）" in page
@@ -55,3 +65,4 @@ def test_timing_audit_has_four_time_references_and_two_players(tmp_path, monkeyp
     assert "Proposer" in page
     assert "Active Refiner" in page
     assert page.count("<audio") == 2
+    assert "其余语义切点全部保留" in page
