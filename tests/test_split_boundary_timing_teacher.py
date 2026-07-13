@@ -60,9 +60,10 @@ def test_timing_audit_has_four_time_references_and_two_players(tmp_path, monkeyp
     )
     page = (tmp_path / "audit" / "index.html").read_text(encoding="utf-8")
 
-    assert "Timing safe（裁决）" in page
-    assert "Omni semantic" in page
-    assert "Proposer" in page
-    assert "Active Refiner" in page
+    assert "只显示当前最终切点集合" in page
+    assert "当前全部切点" in page
+    assert "本卡目标 safe cut" in page
+    assert "Omni semantic" not in page
+    assert "Active Refiner" not in page
     assert page.count("<audio") == 2
-    assert "其余语义切点全部保留" in page
+    assert "当前切点总数" in page
