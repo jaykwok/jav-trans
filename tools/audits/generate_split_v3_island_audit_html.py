@@ -84,8 +84,6 @@ def build_audit(
             return "Omni v1 conservative"
         if version.endswith("candidate_projection_v1"):
             return "Projected proposer cuts"
-        if version.endswith("candidate_projection_cut_refiner_v1"):
-            return "Cut Refiner timestamps"
         return fallback
 
     current_name = display_name(label_rows, "Omni current")
