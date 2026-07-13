@@ -33,8 +33,8 @@ def test_safe_zone_response_requires_exact_four_class_candidate_sequence() -> No
     assert [row["label"] for row in rows] == ["left_clipped", "safe"]
     with pytest.raises(ValueError, match="candidate ids"):
         teacher._validate({"boundary_id": boundary["boundary_id"], "candidates": [{"candidate_id": "c01", "label": "safe", "confidence": 0.8}]}, boundary)
-    with pytest.raises(ValueError, match="monotonic"):
-        teacher._validate({"boundary_id": boundary["boundary_id"], "candidates": [{"candidate_id": "c00", "label": "right_clipped", "confidence": 0.9}, {"candidate_id": "c01", "label": "left_clipped", "confidence": 0.8}]}, boundary)
+    non_monotonic = teacher._validate({"boundary_id": boundary["boundary_id"], "candidates": [{"candidate_id": "c00", "label": "safe", "confidence": 0.9}, {"candidate_id": "c01", "label": "left_clipped", "confidence": 0.8}]}, boundary)
+    assert [row["label"] for row in non_monotonic] == ["safe", "left_clipped"]
 
 
 def test_prompt_has_no_transcript_or_timestamp_teacher() -> None:
@@ -42,7 +42,8 @@ def test_prompt_has_no_transcript_or_timestamp_teacher() -> None:
     assert "不要输出时间戳" in teacher.SYSTEM_PROMPT
     assert "left_clipped" in teacher.SYSTEM_PROMPT
     assert "句尾 mora 零容忍" in teacher.SYSTEM_PROMPT
-    assert "left_clipped，随后" in teacher.SYSTEM_PROMPT
+    assert "允许出现多个分离的 safe 区" in teacher.SYSTEM_PROMPT
+    assert "可听人声" in teacher.SYSTEM_PROMPT
 
 
 def test_audit_only_shows_current_candidate_plans(tmp_path: Path, monkeypatch) -> None:

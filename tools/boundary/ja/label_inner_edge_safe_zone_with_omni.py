@@ -28,7 +28,7 @@ from tools.asr.cueqc.label_pre_asr_with_omni import (  # noqa: E402
 
 SCHEMA = "inner_edge_safe_zone_teacher_v1"
 SELECTION_SCHEMA = "inner_edge_safe_zone_selection_v1"
-PROMPT_VERSION = "inner_edge_safe_zone_omni_plus_monotonic_v2"
+PROMPT_VERSION = "inner_edge_safe_zone_omni_plus_independent_v3"
 DEFAULT_MODEL = "qwen3.5-omni-plus"
 LABELS = {"left_clipped", "safe", "right_clipped", "unsure"}
 DEFAULT_BOUNDARIES = (
@@ -41,17 +41,17 @@ DEFAULT_BOUNDARIES = (
 
 SYSTEM_PROMPT = """你是日语语音内部安全区标注器。每次请求只处理一个已经确认语义上应该切开的 boundary。不要重新判断语义是否可切，不要转录，不要输出时间戳。
 
-同一请求中的候选全部属于同一个 target semantic boundary，并严格按时间从早到晚排列。必须联合比较整组候选，只追踪这一个 target boundary；即使更早处本身也是静音，只要它位于目标左语义单元完成之前，仍是 left_clipped，不能误判为另一个 safe boundary。
+同一请求中的候选全部来自同一个 target semantic boundary 的自适应邻域，并按时间从早到晚排列。为了复用一次请求中的音频上下文，每个候选仍必须独立按其插入点附近的实际声学状态分类；不得为了让整组标签看起来平滑或单调而改写单个候选。
 
 每个候选音频都由同一原始 speech island 在一个 proposer candidate 处分成“左段 + 1 秒静音 + 右段”，然后按原顺序拼接。只判断插入静音的位置是否完整保留 target boundary 两侧的语音：
-- left_clipped：候选太早，目标左语义单元尚未完整留在左段（可能只缺最后 mora，也可能整个目标左语义单元仍在右段）。
+- left_clipped：静音插入点切断了紧邻其左侧正在继续的语音，左段缺少该语音的结尾。
 - safe：切点位于明确内部非语音区，左右语音都完整。
-- right_clipped：候选太晚，目标右语义单元的开头已被留在左段，右段缺失句首。
+- right_clipped：静音插入点切断了紧邻其右侧已经开始的语音，右段缺少该语音的开头。
 - unsure：连续语音、重叠语音、音质不足或无法可靠判断。
 
-除 unsure 外，整组标签必须随候选从早到晚保持单调：零个或多个 left_clipped，随后零个或多个连续 safe，最后零个或多个 right_clipped。绝不能从 safe/right_clipped 回到 left_clipped，也不能出现两个分离的 safe 区。
+同一邻域允许出现多个分离的 safe 区，中间也可能夹着 clipped 候选；这是合法标签，不要强制单调。safe 是否连续只由下游 event 聚合器检查，若 safe 非连续会整体 abstain。
 
-例：若 c00/c01 还没保留完整左句，c02/c03 位于同一安全停顿，c04 已吃掉右句开头，则输出 left_clipped,left_clipped,safe,safe,right_clipped。
+纯背景音乐、机械声或无声可视为非语音；但只要存在可听人声，即使它较远、嘈杂、不是主要说话人或可能无需翻译，也不能宣称为明确非语音区。无法确认人声边缘时判 unsure，不要硬编台词或强制选择 clipped/safe。
 
 日语句尾 mora 零容忍，尤其注意「ね、よ、な、か、の、わ、です、ます」的弱读、气声和拖长。不要因为 1 秒静音听感更自然就判 safe；只依据静音插入点两侧是否保留完整语音。
 
@@ -146,10 +146,6 @@ def _validate(parsed: dict[str, Any], boundary: dict[str, Any]) -> list[dict[str
         confidence = float(row.get("confidence"))
         if not 0.0 <= confidence <= 1.0:
             raise ValueError("confidence must be in [0, 1]")
-    ranks = {"left_clipped": 0, "safe": 1, "right_clipped": 2}
-    definite = [ranks[str(row["label"])] for row in rows if str(row["label"]) != "unsure"]
-    if definite != sorted(definite):
-        raise ValueError("definite labels must be monotonic left_clipped -> safe -> right_clipped")
     return rows
 
 
