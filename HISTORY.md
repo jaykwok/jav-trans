@@ -6,6 +6,7 @@
 
 ---
 
+- 2026-07-13 Speech-island v3 新长样本人工 gate 与 proposer 投影 smoke：第二轮 5 条裁决为 `3 correct / 2 timing_error`，无漏切、无误切，说明语义 cut 集合可用但 Omni 直接秒坐标不应成为 runtime 边界。对同一 5 条共 `34` 个 Omni cuts 做严格升序、一候选只用一次的最近 proposer candidate 投影，`34/34` 成功、冲突 `0`，平均绝对位移 `106ms`、最大 `454ms`。生成第三轮 5 样本投影审计：红线及第二播放器使用 projected proposer cuts，橙线为原始 Omni v3，蓝线为现役 accepted；若人工 timing gate 通过，再把该投影契约用于全量 teacher 数据，若仍失败则接入 Cut Refiner 重定位而不再修改语义 prompt。
 - 2026-07-13 Speech-island completeness v3 二轮 smoke：首轮 v3 人工复审 `5/5 correct`，包括 v2 唯一漏切的 35.237s island，故 prompt 语义进入独立样本复验。遵守“每次实验仅 5 样本”，labeler 增加 deterministic `--duration-targets` 与可重复 `--exclude-selection`，排除已见 5 条后选择约 `15/20/25/30/45s` 的新长 island，实际 `14.998/19.976/24.951/29.987/44.899s`。Omni Plus v3 请求 `5/5` 成功、无失败，切点数 `2/5/3/11/13`；生成原始/切后块间 1s 静音双播放器审计页，人工确认前不扩大。
 - 2026-07-12 Speech-island cut-eager v2 人工 gate 与 completeness v3：5 条人工裁决为 `4 correct / 1 missed_cut`，唯一失败是 35.237s island，故 v2 smoke 未通过（样本级 80%，且明确存在漏切）。v3 保持切分定义不变，只要求最终 JSON 前正向扫描全部表达/应答/话轮，再从尾到头复核长段、密集边界和非语言穿插造成的遗漏；相同 5 island、thinking 1024 重跑，前四条切点数严格不变 `0/0/3/6`，35.237s 从 `13` 增至 `16`，说明改动集中于长 island 完整性而未扩大短中样本过切。新审计页以自动解析的版本名显示 v3 红线和 v2 橙线，仍提供原始/块间 1s 静音重组双播放器；等待 5 条人工复审后再决定 prompt 晋升。
 - 2026-07-12 Speech-island 审计播放改进：人工反馈裁决按钮无响应，且逐个点击切点不易感知整体分段节奏。按钮处理改为原地更新 active/done 状态并持久化，不再点击后重建整页。每个 island 新增第二条真实 WAV：按 Omni v2 cuts 顺序切开原音频，并在相邻块间插入精确 `1s` 静音后 concat；第一条播放器保留原始完整 island，任一播放器启动时暂停其他音频。ffprobe 验证重组时长严格闭合为 `原时长 + cut_count × 1s`：9.006s/3 cuts→12.006s，14.001s/6→20.001s，35.237s/13→48.237s。页面 JavaScript 语法检查与 HTTP 200 均通过。

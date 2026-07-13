@@ -109,7 +109,7 @@ def test_island_audit_shows_omni_and_current_markers(tmp_path: Path, monkeypatch
     assert summary["item_count"] == 1
     assert "Omni" in page
     assert "现役 accepted" in page
-    assert "Omni 整体正确" in page
+    assert "${esc(currentName)} 整体正确" in page
     assert "裁决对象：Omni current 红线" in page
     assert "现役 accepted（仅对照）" in page
     assert "原始 speech island" in page
