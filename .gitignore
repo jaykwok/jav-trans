@@ -69,3 +69,6 @@ dist/
 
 # Claude Code project instructions are local to this workspace.
 CLAUDE.md
+
+# Local MCP/infra deployment notes (not published)
+grok-search-mcp部署文档.md
