@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import subprocess
 import sys
@@ -19,13 +20,7 @@ for root in (PROJECT_ROOT, SRC_ROOT):
         sys.path.insert(0, str(root))
 
 from asr.backends.qwen import QWEN_ASR_17B_REPO_ID, qwen_asr_repo_tag  # noqa: E402
-from boundary.gpu_safety import apply_vram_safety_cap  # noqa: E402
 from boundary.ja.features import load_cached_feature  # noqa: E402
-from boundary.ja.model import (  # noqa: E402
-    LEGACY_SPEECH_ISLAND_SCORER_SCHEMA,
-    SpeechIslandScorerBundle,
-    load_speech_island_scorer_checkpoint,
-)
 from tools.asr.cueqc.label_pre_asr_with_omni import (  # noqa: E402
     DEFAULT_API_KEY_ENV_CANDIDATES,
     DEFAULT_BASE_URL_ENV_CANDIDATES,
@@ -39,17 +34,17 @@ from tools.asr.cueqc.label_pre_asr_with_omni import (  # noqa: E402
 
 
 SCHEMA = "semantic_source_candidate_teacher_v2"
-SELECTION_SCHEMA = "semantic_source_learned_candidate_selection_v1"
+SELECTION_SCHEMA = "semantic_source_learned_candidate_selection_v2"
 PROMPT_VERSION = "semantic_source_hierarchical_candidate_marker_v2"
 DEFAULT_MODEL = "qwen3.5-omni-plus"
 LABELS = ("discardable", "semantic_target", "unsure")
 SOURCE_LABELS = ("discardable", "contains_semantic", "unsure")
-DEFAULT_SCORER = (
+DEFAULT_PROJECTION = (
     PROJECT_ROOT
     / "src"
     / "checkpoints"
     / qwen_asr_repo_tag(QWEN_ASR_17B_REPO_ID)
-    / f"speech_island_scorer_v8.{qwen_asr_repo_tag(QWEN_ASR_17B_REPO_ID)}.pt"
+    / f"semantic_split_model_v2.{qwen_asr_repo_tag(QWEN_ASR_17B_REPO_ID)}.pt"
 )
 
 SYSTEM_PROMPT = """你是日语隔离 source utterance 的语义候选分类器。每次请求只处理一个短 source utterance 中的 5–9 个已给定声学候选；不要输出时间戳，不要重新划分区间。
@@ -88,40 +83,39 @@ def _rows(path: Path) -> list[dict[str, Any]]:
         return [json.loads(line) for line in handle if line.strip()]
 
 
+def load_task_aware_projection(path: Path) -> tuple[np.ndarray, np.ndarray, str]:
+    if path.suffix.lower() == ".npz":
+        payload = np.load(path, allow_pickle=False)
+        projection = payload
+    else:
+        import torch
+
+        checkpoint = torch.load(path, map_location="cpu", weights_only=False)
+        projection = dict(checkpoint["feature_config"]["ptm_projection"])
+    mean = np.asarray(projection["mean"], dtype=np.float32).reshape(-1)
+    components = np.asarray(projection["components"], dtype=np.float32)
+    digest = hashlib.sha256()
+    digest.update(mean.tobytes())
+    digest.update(components.tobytes())
+    return mean, components, digest.hexdigest()
+
+
 def learned_frame_embeddings(
-    bundle: SpeechIslandScorerBundle,
     *,
     ptm: np.ndarray,
-    mfcc: np.ndarray,
-) -> tuple[np.ndarray, np.ndarray]:
-    import torch
-
-    if bundle.schema != LEGACY_SPEECH_ISLAND_SCORER_SCHEMA:
-        raise ValueError("candidate proposal requires the promoted legacy binary scorer")
-    frame_total = min(int(ptm.shape[0]), int(mfcc.shape[0]))
-    features = np.concatenate(
-        [
-            np.asarray(ptm[:frame_total, : bundle.ptm_dim], dtype=np.float32),
-            np.asarray(mfcc[:frame_total], dtype=np.float32),
-        ],
-        axis=1,
-    )
-    mean = np.asarray(bundle.normalization["feature_mean"], dtype=np.float32)
-    std = np.maximum(
-        np.asarray(bundle.normalization["feature_std"], dtype=np.float32), 1e-6
-    )
-    normalized = np.ascontiguousarray((features - mean) / std, dtype=np.float32)
-    with torch.inference_mode():
-        values = torch.from_numpy(normalized).unsqueeze(0).to(bundle.device)
-        mask = torch.ones((1, frame_total), dtype=torch.long, device=bundle.device)
-        hidden = bundle.model.backbone(
-            bundle.model.proj(values), attention_mask=mask
+    projection_mean: np.ndarray,
+    projection_components: np.ndarray,
+) -> np.ndarray:
+    values = np.asarray(ptm, dtype=np.float32)
+    if values.ndim != 2 or values.shape[1] != projection_mean.size:
+        raise ValueError(
+            "candidate proposal requires full PTM matching the learned projection input"
         )
-        hidden = bundle.model.norm(hidden)[0]
-        probabilities = torch.sigmoid(bundle.model.head(hidden)[:, 0])
-    return (
-        np.ascontiguousarray(hidden.detach().cpu().numpy(), dtype=np.float32),
-        np.ascontiguousarray(probabilities.detach().cpu().numpy(), dtype=np.float32),
+    if projection_components.shape[1] != projection_mean.size:
+        raise ValueError("learned projection component width does not match its mean")
+    return np.ascontiguousarray(
+        (values - projection_mean) @ projection_components.T,
+        dtype=np.float32,
     )
 
 
@@ -188,7 +182,10 @@ def select_candidates(
     *,
     samples: list[dict[str, Any]],
     feature_rows: list[dict[str, Any]],
-    scorer: SpeechIslandScorerBundle,
+    projection_mean: np.ndarray,
+    projection_components: np.ndarray,
+    projection_sha256: str,
+    projection_path: Path,
     candidate_count: int,
 ) -> list[dict[str, Any]]:
     by_audio = {str(row["audio_id"]): row for row in feature_rows}
@@ -196,9 +193,11 @@ def select_candidates(
     for sample in samples:
         sample_id = str(sample["sample_id"])
         feature_row = by_audio[sample_id]
-        ptm, mfcc = load_cached_feature(Path(str(feature_row["feature_path"])))
-        embeddings, old_probabilities = learned_frame_embeddings(
-            scorer, ptm=ptm, mfcc=mfcc
+        ptm, _mfcc = load_cached_feature(Path(str(feature_row["feature_path"])))
+        embeddings = learned_frame_embeddings(
+            ptm=ptm,
+            projection_mean=projection_mean,
+            projection_components=projection_components,
         )
         frame_hop_s = float(feature_row.get("frame_hop_s") or 0.02)
         frame_indexes = select_candidate_frames(embeddings, candidate_count)
@@ -207,10 +206,6 @@ def select_candidates(
             frame_hop_s=frame_hop_s,
             duration_s=float(sample["duration_s"]),
         )
-        for cell in cells:
-            cell["proposal_speech_probability"] = float(
-                old_probabilities[cell["feature_index"]]
-            )
         selected.append(
             {
                 "schema": SELECTION_SCHEMA,
@@ -222,8 +217,9 @@ def select_candidates(
                 "reference_text": str(sample["reference_text"]),
                 "feature_path": str(feature_row["feature_path"]),
                 "frame_hop_s": frame_hop_s,
-                "proposal_scorer_sha256": scorer.sha256,
-                "selection_mode": "learned_hidden_farthest_medoid_v1",
+                "proposal_projection_sha256": projection_sha256,
+                "proposal_projection_path": str(projection_path),
+                "selection_mode": "learned_full_ptm_projection_farthest_medoid_v2",
                 "candidates": cells,
             }
         )
@@ -466,14 +462,17 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     if selected_path.exists() and args.resume_selection:
         selected = _rows(selected_path)
     else:
-        apply_vram_safety_cap(0.95)
-        scorer = load_speech_island_scorer_checkpoint(
-            args.proposal_scorer, device=args.proposal_device
+        projection_path = Path(args.proposal_projection)
+        projection_mean, projection_components, projection_sha256 = (
+            load_task_aware_projection(projection_path)
         )
         selected = select_candidates(
             samples=_rows(Path(args.samples)),
             feature_rows=_rows(Path(args.feature_manifest)),
-            scorer=scorer,
+            projection_mean=projection_mean,
+            projection_components=projection_components,
+            projection_sha256=projection_sha256,
+            projection_path=projection_path,
             candidate_count=int(args.candidate_count),
         )
     materialize_candidate_audio(selected, output)
@@ -645,7 +644,8 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             "reference_text": sample["reference_text"],
             "source_gate": source_gate,
             "selection_mode": sample["selection_mode"],
-            "proposal_scorer_sha256": sample["proposal_scorer_sha256"],
+            "proposal_projection_sha256": sample["proposal_projection_sha256"],
+            "proposal_projection_path": sample["proposal_projection_path"],
             "candidates": [
                 {**candidate, **by_id[str(candidate["candidate_id"])]}
                 for candidate in sample["candidates"]
@@ -687,8 +687,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--samples", required=True)
     parser.add_argument("--feature-manifest", required=True)
     parser.add_argument("--output-dir", required=True)
-    parser.add_argument("--proposal-scorer", default=str(DEFAULT_SCORER))
-    parser.add_argument("--proposal-device", default="cuda")
+    parser.add_argument("--proposal-projection", default=str(DEFAULT_PROJECTION))
     parser.add_argument("--candidate-count", type=int, default=9)
     parser.add_argument("--model", default="")
     parser.add_argument("--env-file", default=str(DEFAULT_ENV_FILE))
