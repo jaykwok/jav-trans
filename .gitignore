@@ -8,6 +8,7 @@
 
 # Python/runtime caches
 __pycache__/
+.uv-cache/
 *.py[cod]
 *$py.class
 .pytest_cache/

@@ -306,21 +306,7 @@ model_param_device=cuda:*
 
 ### 显存不足
 
-默认配置按 6GB 级显存目标设置，优先使用 1.7B 高质量档：
-
-```env
-ASR_BACKEND=jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame-hf
-ASR_BATCH_SIZE_BY_REPO=jaykwok/Qwen3-ASR-0.6B-JA-Anime-Galgame-hf=12,jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame-hf=4
-ASR_STAGE_WORKER_VRAM_BUDGET_MB=auto
-ASR_STAGE_WORKER_VRAM_RATIO=0.95
-ASR_MIN_PHYSICAL_VRAM_MB_BY_REPO=jaykwok/Qwen3-ASR-0.6B-JA-Anime-Galgame-hf=4096,jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame-hf=6144
-ASR_STAGE_WORKER_RAM_RATIO=0.95
-ASR_STAGE_WORKER_HEARTBEAT_S=10
-SPEECH_BOUNDARY_JA_WINDOW_S=20
-SPEECH_BOUNDARY_JA_OVERLAP_S=4
-```
-
-如果仍然 OOM，先降低当前模型 batch：
+默认配置已按 6GB 级显存目标设置（见上文「默认配置」）。如果仍然 OOM，先降低当前模型 batch：
 
 ```env
 ASR_BATCH_SIZE=2
