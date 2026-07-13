@@ -67,9 +67,5 @@ dist/
 *.tar
 *.tar.*
 
-# Agent coordination docs are local to this workspace.
-AGENTS.md
+# Claude Code project instructions are local to this workspace.
 CLAUDE.md
-GEMINI.md
-plan.md
-grok-search-mcp部署文档.md
