@@ -55,6 +55,8 @@ from boundary.ja.manifest import (
     write_training_manifest,
 )
 from boundary.ja.model import (
+    LEGACY_SPEECH_ISLAND_SCORER_SCHEMA,
+    SPEECH_ISLAND_SCORER_LABELS,
     SPEECH_ISLAND_SCORER_MODEL_ARCH,
     SPEECH_ISLAND_SCORER_OUTPUT_DIM,
     SPEECH_ISLAND_SCORER_SCHEMA,
@@ -67,6 +69,10 @@ from boundary.ja.model import (
     load_speech_island_scorer_checkpoint,
     score_speech_island_probabilities,
     score_speech_island_probabilities_batch,
+    score_semantic_speech_class_probabilities,
+    score_semantic_speech_class_probabilities_batch,
+    score_semantic_speech_outputs,
+    score_semantic_speech_outputs_batch,
 )
 from boundary.ja.speech_train import (
     SpeechIslandTrainConfig,
@@ -102,8 +108,10 @@ __all__ = [
     "SpeechIslandTrainConfig",
     "SpeechIslandTrainMetrics",
     "SPEECH_ISLAND_SCORER_OUTPUT_DIM",
+    "SPEECH_ISLAND_SCORER_LABELS",
     "SPEECH_ISLAND_SCORER_MODEL_ARCH",
     "SPEECH_ISLAND_SCORER_SCHEMA",
+    "LEGACY_SPEECH_ISLAND_SCORER_SCHEMA",
     "SpeechIslandScorerBundle",
     "build_speech_island_scorer_model",
     "build_speech_island_scorer_checkpoint",
@@ -131,6 +139,10 @@ __all__ = [
     "stable_hf_audio_id",
     "score_speech_island_probabilities",
     "score_speech_island_probabilities_batch",
+    "score_semantic_speech_class_probabilities",
+    "score_semantic_speech_class_probabilities_batch",
+    "score_semantic_speech_outputs",
+    "score_semantic_speech_outputs_batch",
     "with_frame_weights",
     "TinyFrameClassifier",
     "train_speech_island_scorer",

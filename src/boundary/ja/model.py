@@ -8,16 +8,23 @@ from typing import Any, Sequence
 import numpy as np
 
 
-SPEECH_ISLAND_SCORER_SCHEMA = "speech_boundary_ja_mamba2_speech_island_scorer_v8"
-SPEECH_ISLAND_SCORER_MODEL_TYPE = "mamba2_speech_island_scorer"
-SPEECH_ISLAND_SCORER_MODEL_ARCH = "v8-speech-island"
-SPEECH_ISLAND_SCORER_OUTPUT_DIM = 1
-SPEECH_ISLAND_SCORER_OUTPUT_HEADS = ("speech_prob",)
-SPEECH_ISLAND_SCORER_DECODER = "speech_hysteresis_islands_v1"
+LEGACY_SPEECH_ISLAND_SCORER_SCHEMA = "speech_boundary_ja_mamba2_speech_island_scorer_v8"
+LEGACY_SPEECH_ISLAND_SCORER_MODEL_TYPE = "mamba2_speech_island_scorer"
+LEGACY_SPEECH_ISLAND_SCORER_MODEL_ARCH = "v8-speech-island"
+LEGACY_SPEECH_ISLAND_SCORER_OUTPUT_HEADS = ("speech_prob",)
+LEGACY_SPEECH_ISLAND_SCORER_DECODER = "speech_hysteresis_islands_v1"
+
+SPEECH_ISLAND_SCORER_SCHEMA = "semantic_speech_scorer_v9"
+SPEECH_ISLAND_SCORER_MODEL_TYPE = "mamba2_semantic_speech_scorer"
+SPEECH_ISLAND_SCORER_MODEL_ARCH = "semantic-speech-frame-mamba-v1"
+SPEECH_ISLAND_SCORER_LABELS = ("discardable", "semantic_target", "unsure")
+SPEECH_ISLAND_SCORER_OUTPUT_DIM = len(SPEECH_ISLAND_SCORER_LABELS)
+SPEECH_ISLAND_SCORER_OUTPUT_HEADS = SPEECH_ISLAND_SCORER_LABELS
+SPEECH_ISLAND_SCORER_DECODER = "argmax_semantic_or_unsure_islands_v1"
 SPEECH_ISLAND_SCORER_ARTIFACT = {
-    "name": "speech_island_scorer",
-    "display_name": "SpeechIslandScorer",
-    "version": "v8",
+    "name": "semantic_speech_scorer",
+    "display_name": "Semantic Speech Scorer",
+    "version": "v9",
     "pipeline_stage": 1,
     "pipeline_role": "speech_island_detection",
 }
@@ -35,41 +42,195 @@ def _bool_config(value: Any) -> bool:
     return bool(value)
 
 
-def _validate_metadata(metadata: dict[str, Any]) -> None:
+def _artifact_contract(schema: str) -> dict[str, Any]:
+    if schema == SPEECH_ISLAND_SCORER_SCHEMA:
+        return SPEECH_ISLAND_SCORER_ARTIFACT
+    if schema == LEGACY_SPEECH_ISLAND_SCORER_SCHEMA:
+        return {
+            "name": "speech_island_scorer",
+            "display_name": "SpeechIslandScorer",
+            "version": "v8",
+            "pipeline_stage": 1,
+            "pipeline_role": "speech_island_detection",
+        }
+    raise ValueError(f"unsupported scorer checkpoint schema: {schema!r}")
+
+
+def _output_contract(schema: str) -> tuple[tuple[str, ...], str, int, str, str]:
+    if schema == SPEECH_ISLAND_SCORER_SCHEMA:
+        return (
+            SPEECH_ISLAND_SCORER_OUTPUT_HEADS,
+            SPEECH_ISLAND_SCORER_DECODER,
+            SPEECH_ISLAND_SCORER_OUTPUT_DIM,
+            SPEECH_ISLAND_SCORER_MODEL_ARCH,
+            SPEECH_ISLAND_SCORER_MODEL_TYPE,
+        )
+    if schema == LEGACY_SPEECH_ISLAND_SCORER_SCHEMA:
+        return (
+            LEGACY_SPEECH_ISLAND_SCORER_OUTPUT_HEADS,
+            LEGACY_SPEECH_ISLAND_SCORER_DECODER,
+            1,
+            LEGACY_SPEECH_ISLAND_SCORER_MODEL_ARCH,
+            LEGACY_SPEECH_ISLAND_SCORER_MODEL_TYPE,
+        )
+    raise ValueError(f"unsupported scorer checkpoint schema: {schema!r}")
+
+
+def _validate_metadata(metadata: dict[str, Any], *, schema: str) -> None:
     artifact = metadata.get("artifact")
     if not isinstance(artifact, dict):
         raise ValueError("Speech island scorer checkpoint metadata.artifact is required")
-    for key, expected in SPEECH_ISLAND_SCORER_ARTIFACT.items():
+    for key, expected in _artifact_contract(schema).items():
         if artifact.get(key) != expected:
             raise ValueError(
                 f"Speech island scorer metadata.artifact.{key} must be {expected!r}"
             )
+    expected_heads, expected_decoder, _output_dim, _model_arch, _model_type = _output_contract(schema)
     heads = tuple(str(item) for item in (metadata.get("output_heads") or ()))
-    if heads != SPEECH_ISLAND_SCORER_OUTPUT_HEADS:
+    if heads != expected_heads:
         raise ValueError(
             "Speech island scorer checkpoint metadata.output_heads must be "
-            f"{list(SPEECH_ISLAND_SCORER_OUTPUT_HEADS)!r}; got {list(heads)!r}"
+            f"{list(expected_heads)!r}; got {list(heads)!r}"
         )
     decoder = str(metadata.get("decoder") or "")
-    if decoder != SPEECH_ISLAND_SCORER_DECODER:
+    if decoder != expected_decoder:
         raise ValueError(
             "Speech island scorer checkpoint metadata.decoder must be "
-            f"{SPEECH_ISLAND_SCORER_DECODER!r}; got {decoder!r}"
+            f"{expected_decoder!r}; got {decoder!r}"
         )
+
+
+class SemanticSpeechScorerNetwork:
+    """Task-aware full-PTM projector followed by a semantic frame encoder."""
+
+    def __new__(
+        cls,
+        *,
+        raw_ptm_dim: int,
+        projected_ptm_dim: int,
+        mfcc_dim: int,
+        hidden_size: int = 128,
+        num_layers: int = 2,
+        state_size: int = 32,
+        num_heads: int = 4,
+        head_dim: int = 64,
+        n_groups: int = 2,
+        conv_kernel: int = 4,
+        chunk_size: int = 8,
+        bidirectional: bool = True,
+        output_dim: int = SPEECH_ISLAND_SCORER_OUTPUT_DIM,
+        mfcc_mean: Sequence[float] = (),
+        mfcc_std: Sequence[float] = (),
+        **_unused: Any,
+    ):
+        import torch
+        from torch import nn
+
+        from boundary.backbones import SpeechIslandSequenceClassifier
+
+        if output_dim != SPEECH_ISLAND_SCORER_OUTPUT_DIM:
+            raise ValueError(
+                f"Semantic Speech Scorer requires output_dim={SPEECH_ISLAND_SCORER_OUTPUT_DIM}"
+            )
+
+        class _Network(nn.Module):
+            def __init__(self) -> None:
+                super().__init__()
+                self.raw_ptm_dim = int(raw_ptm_dim)
+                self.projected_ptm_dim = int(projected_ptm_dim)
+                self.mfcc_dim = int(mfcc_dim)
+                self.ptm_projector = nn.Linear(
+                    self.raw_ptm_dim,
+                    self.projected_ptm_dim,
+                    bias=True,
+                )
+                if len(mfcc_mean) != self.mfcc_dim or len(mfcc_std) != self.mfcc_dim:
+                    raise ValueError("semantic scorer MFCC normalization length mismatch")
+                self.register_buffer(
+                    "mfcc_mean",
+                    torch.tensor(mfcc_mean, dtype=torch.float32).reshape(1, 1, -1),
+                )
+                self.register_buffer(
+                    "mfcc_std",
+                    torch.tensor(mfcc_std, dtype=torch.float32).reshape(1, 1, -1),
+                )
+                self.encoder = SpeechIslandSequenceClassifier(
+                    input_dim=self.projected_ptm_dim + self.mfcc_dim,
+                    hidden_size=hidden_size,
+                    num_layers=num_layers,
+                    output_dim=output_dim,
+                    state_size=state_size,
+                    num_heads=num_heads,
+                    head_dim=head_dim,
+                    n_groups=n_groups,
+                    conv_kernel=conv_kernel,
+                    chunk_size=chunk_size,
+                    bidirectional=bidirectional,
+                )
+
+            def project_ptm(self, ptm: torch.Tensor) -> torch.Tensor:
+                if ptm.ndim != 3 or int(ptm.shape[-1]) != self.raw_ptm_dim:
+                    raise ValueError(
+                        "semantic scorer PTM input must have shape "
+                        f"[batch,frames,{self.raw_ptm_dim}]"
+                    )
+                return self.ptm_projector(ptm)
+
+            def forward(
+                self,
+                ptm: torch.Tensor,
+                mfcc: torch.Tensor,
+                *,
+                attention_mask: torch.Tensor | None = None,
+            ) -> torch.Tensor:
+                if mfcc.ndim != 3 or int(mfcc.shape[-1]) != self.mfcc_dim:
+                    raise ValueError(
+                        "semantic scorer MFCC input must have shape "
+                        f"[batch,frames,{self.mfcc_dim}]"
+                    )
+                if ptm.shape[:2] != mfcc.shape[:2]:
+                    raise ValueError("semantic scorer PTM/MFCC frame shapes differ")
+                features = torch.cat(
+                    (
+                        self.project_ptm(ptm),
+                        (mfcc - self.mfcc_mean) / self.mfcc_std.clamp_min(1e-6),
+                    ),
+                    dim=-1,
+                )
+                return self.encoder(features, attention_mask=attention_mask)
+
+        return _Network()
 
 
 def build_speech_island_scorer_model(*, schema: str, model_config: dict[str, Any]):
     if schema == SPEECH_ISLAND_SCORER_SCHEMA:
+        for key in (
+            "raw_ptm_dim",
+            "projected_ptm_dim",
+            "mfcc_dim",
+            "hidden_size",
+            "num_layers",
+        ):
+            if key not in model_config:
+                raise ValueError(f"Semantic scorer checkpoint missing model_config.{key}")
+        if str(model_config.get("model_arch") or "") != SPEECH_ISLAND_SCORER_MODEL_ARCH:
+            raise ValueError(
+                "Semantic scorer model_arch must be "
+                f"{SPEECH_ISLAND_SCORER_MODEL_ARCH!r}"
+            )
+        return SemanticSpeechScorerNetwork(**model_config)
+    if schema == LEGACY_SPEECH_ISLAND_SCORER_SCHEMA:
         from boundary.backbones import TRANSFORMERS_MAMBA2_BACKBONE, SpeechIslandSequenceClassifier
 
         for key in ("input_dim", "hidden_size", "num_layers"):
             if key not in model_config:
                 raise ValueError(f"Mamba2 scorer checkpoint missing model_config.{key}")
+        _heads, _decoder, expected_output_dim, expected_model_arch, _model_type = _output_contract(schema)
         model_arch = str(model_config.get("model_arch") or "")
-        if model_arch != SPEECH_ISLAND_SCORER_MODEL_ARCH:
+        if model_arch != expected_model_arch:
             raise ValueError(
                 "Speech island scorer checkpoint model_config.model_arch must be "
-                f"{SPEECH_ISLAND_SCORER_MODEL_ARCH!r}; got {model_arch!r}"
+                f"{expected_model_arch!r}; got {model_arch!r}"
             )
         backbone_kwargs: dict[str, Any] = {
             "state_size": int(model_config.get("state_size", 32)),
@@ -84,9 +245,9 @@ def build_speech_island_scorer_model(*, schema: str, model_config: dict[str, Any
         if "output_dim" not in model_config:
             raise ValueError("Speech island scorer checkpoint missing model_config.output_dim")
         output_dim = int(model_config["output_dim"])
-        if output_dim != SPEECH_ISLAND_SCORER_OUTPUT_DIM:
+        if output_dim != expected_output_dim:
             raise ValueError(
-                f"Speech island scorer requires output_dim={SPEECH_ISLAND_SCORER_OUTPUT_DIM}, "
+                f"Speech island scorer requires output_dim={expected_output_dim}, "
                 f"got {output_dim}"
             )
         return SpeechIslandSequenceClassifier(
@@ -99,7 +260,7 @@ def build_speech_island_scorer_model(*, schema: str, model_config: dict[str, Any
         )
     raise ValueError(
         f"unsupported scorer checkpoint schema: {schema!r}; "
-        f"expected {SPEECH_ISLAND_SCORER_SCHEMA!r}"
+        f"expected {SPEECH_ISLAND_SCORER_SCHEMA!r} or {LEGACY_SPEECH_ISLAND_SCORER_SCHEMA!r}"
     )
 
 
@@ -148,7 +309,15 @@ class SpeechIslandScorerBundle:
 
     @property
     def ptm_dim(self) -> int:
+        if self.schema == SPEECH_ISLAND_SCORER_SCHEMA:
+            return int(self.model_config["raw_ptm_dim"])
         return int(self.model_config["ptm_dim"])
+
+    @property
+    def projected_ptm_dim(self) -> int:
+        if self.schema == SPEECH_ISLAND_SCORER_SCHEMA:
+            return int(self.model_config["projected_ptm_dim"])
+        return self.ptm_dim
 
     @property
     def mfcc_dim(self) -> int:
@@ -156,14 +325,23 @@ class SpeechIslandScorerBundle:
 
     @property
     def input_dim(self) -> int:
+        if self.schema == SPEECH_ISLAND_SCORER_SCHEMA:
+            return self.ptm_dim + self.mfcc_dim
         return int(self.model_config["input_dim"])
+
+    @property
+    def labels(self) -> tuple[str, ...]:
+        return _output_contract(self.schema)[0]
 
     def signature(self) -> dict[str, Any]:
         model_config: dict[str, Any] = {
-            "ptm_dim": self.ptm_dim,
+            "raw_ptm_dim": self.ptm_dim,
+            "projected_ptm_dim": self.projected_ptm_dim,
             "mfcc_dim": self.mfcc_dim,
             "input_dim": self.input_dim,
         }
+        if self.schema == LEGACY_SPEECH_ISLAND_SCORER_SCHEMA:
+            model_config["ptm_dim"] = self.ptm_dim
         for key in (
             "model_arch",
             "hidden_size",
@@ -177,6 +355,7 @@ class SpeechIslandScorerBundle:
             "conv_kernel",
             "bidirectional",
             "output_dim",
+            "projection_type",
         ):
             if key in self.model_config:
                 value = self.model_config[key]
@@ -192,9 +371,13 @@ class SpeechIslandScorerBundle:
                 "operating_point": str(self.metadata.get("operating_point") or ""),
                 "ptm_repo_id": str(self.metadata.get("ptm_repo_id") or ""),
                 "trained_steps": int(self.metadata.get("trained_steps") or 0),
-                "labels": str(self.metadata.get("labels") or ""),
                 "feature_manifest": str(self.metadata.get("feature_manifest") or ""),
                 "output_heads": list(self.metadata.get("output_heads") or ()),
+                "labels": (
+                    list(self.metadata.get("labels") or ())
+                    if isinstance(self.metadata.get("labels"), (list, tuple))
+                    else str(self.metadata.get("labels") or "")
+                ),
                 "decoder": str(self.metadata.get("decoder") or ""),
                 "artifact": dict(self.metadata.get("artifact") or {}),
             },
@@ -217,26 +400,31 @@ def build_speech_island_scorer_checkpoint(
     metadata: dict[str, Any] | None = None,
     schema: str = SPEECH_ISLAND_SCORER_SCHEMA,
 ) -> dict[str, Any]:
-    if schema != SPEECH_ISLAND_SCORER_SCHEMA:
+    if schema not in {SPEECH_ISLAND_SCORER_SCHEMA, LEGACY_SPEECH_ISLAND_SCORER_SCHEMA}:
         raise ValueError(
             f"unsupported scorer checkpoint schema: {schema!r}; "
-            f"expected {SPEECH_ISLAND_SCORER_SCHEMA!r}"
+            f"expected {SPEECH_ISLAND_SCORER_SCHEMA!r} or "
+            f"{LEGACY_SPEECH_ISLAND_SCORER_SCHEMA!r}"
         )
-    if int(model_config.get("output_dim", 0)) != SPEECH_ISLAND_SCORER_OUTPUT_DIM:
+    heads, decoder, output_dim, _model_arch, model_type = _output_contract(schema)
+    if int(model_config.get("output_dim", 0)) != output_dim:
         raise ValueError(
-            f"Speech island scorer checkpoint requires output_dim={SPEECH_ISLAND_SCORER_OUTPUT_DIM}"
+            f"Speech island scorer checkpoint requires output_dim={output_dim}"
         )
     metadata_dict = dict(metadata or {})
     metadata_dict["artifact"] = {
-        **SPEECH_ISLAND_SCORER_ARTIFACT,
+        **_artifact_contract(schema),
         **dict(metadata_dict.get("artifact") or {}),
     }
-    metadata_dict.setdefault("output_heads", list(SPEECH_ISLAND_SCORER_OUTPUT_HEADS))
-    metadata_dict.setdefault("decoder", SPEECH_ISLAND_SCORER_DECODER)
-    _validate_metadata(metadata_dict)
+    metadata_dict.setdefault("output_heads", list(heads))
+    metadata_dict.setdefault("decoder", decoder)
+    if schema == SPEECH_ISLAND_SCORER_SCHEMA:
+        metadata_dict.setdefault("labels", list(SPEECH_ISLAND_SCORER_LABELS))
+        metadata_dict.setdefault("decision_mode", "argmax")
+    _validate_metadata(metadata_dict, schema=schema)
     return {
         "schema": schema,
-        "model_type": SPEECH_ISLAND_SCORER_MODEL_TYPE,
+        "model_type": model_type,
         "model_config": dict(model_config),
         "normalization": dict(normalization),
         "metadata": metadata_dict,
@@ -261,30 +449,38 @@ def load_speech_island_scorer_checkpoint(
     if not isinstance(payload, dict):
         raise ValueError(f"invalid scorer checkpoint payload: {checkpoint_path}")
     schema = str(payload.get("schema") or "")
-    if schema != SPEECH_ISLAND_SCORER_SCHEMA:
+    if schema not in {SPEECH_ISLAND_SCORER_SCHEMA, LEGACY_SPEECH_ISLAND_SCORER_SCHEMA}:
         raise ValueError(
             f"unsupported scorer checkpoint schema: {payload.get('schema')!r}; "
-            f"expected {SPEECH_ISLAND_SCORER_SCHEMA!r}"
+            f"expected {SPEECH_ISLAND_SCORER_SCHEMA!r} or "
+            f"{LEGACY_SPEECH_ISLAND_SCORER_SCHEMA!r}"
         )
+    _heads, _decoder, _output_dim, _model_arch, expected_model_type = _output_contract(schema)
     model_type = str(payload.get("model_type") or "")
-    if model_type != SPEECH_ISLAND_SCORER_MODEL_TYPE:
+    if model_type != expected_model_type:
         raise ValueError(
             f"unsupported scorer checkpoint model_type: {payload.get('model_type')!r}; "
-            f"expected {SPEECH_ISLAND_SCORER_MODEL_TYPE!r}"
+            f"expected {expected_model_type!r}"
         )
     model_config = dict(payload.get("model_config") or {})
-    for key in ("ptm_dim", "mfcc_dim", "input_dim"):
+    required_config = (
+        ("raw_ptm_dim", "projected_ptm_dim", "mfcc_dim")
+        if schema == SPEECH_ISLAND_SCORER_SCHEMA
+        else ("ptm_dim", "mfcc_dim", "input_dim")
+    )
+    for key in required_config:
         if key not in model_config:
             raise ValueError(f"scorer checkpoint missing model_config.{key}")
-    if int(model_config["input_dim"]) != int(model_config["ptm_dim"]) + int(model_config["mfcc_dim"]):
+    if schema == LEGACY_SPEECH_ISLAND_SCORER_SCHEMA and int(model_config["input_dim"]) != int(model_config["ptm_dim"]) + int(model_config["mfcc_dim"]):
         raise ValueError("scorer checkpoint input_dim does not match ptm_dim + mfcc_dim")
     metadata = dict(payload.get("metadata") or {})
-    _validate_metadata(metadata)
+    _validate_metadata(metadata, schema=schema)
     normalization = dict(payload.get("normalization") or {})
-    mean = list(normalization.get("feature_mean") or [])
-    std = list(normalization.get("feature_std") or [])
-    if len(mean) != int(model_config["input_dim"]) or len(std) != int(model_config["input_dim"]):
-        raise ValueError("scorer checkpoint normalization length does not match input_dim")
+    if schema == LEGACY_SPEECH_ISLAND_SCORER_SCHEMA:
+        mean = list(normalization.get("feature_mean") or [])
+        std = list(normalization.get("feature_std") or [])
+        if len(mean) != int(model_config["input_dim"]) or len(std) != int(model_config["input_dim"]):
+            raise ValueError("scorer checkpoint normalization length does not match input_dim")
     model = build_speech_island_scorer_model(schema=schema, model_config=model_config)
     state = payload.get("model_state_dict")
     if not isinstance(state, dict):
@@ -330,9 +526,9 @@ def score_speech_island_probabilities_batch(
     pairs = list(feature_pairs)
     if not pairs:
         return []
-    if int(bundle.model_config.get("output_dim", 0)) != SPEECH_ISLAND_SCORER_OUTPUT_DIM:
+    if int(bundle.model_config.get("output_dim", 0)) != 1:
         raise ValueError(
-            f"scorer expected output_dim={SPEECH_ISLAND_SCORER_OUTPUT_DIM}, "
+            "legacy speech/proposal scorer expected output_dim=1, "
             f"got {bundle.model_config.get('output_dim')}"
         )
     mean = np.asarray(bundle.normalization["feature_mean"], dtype=np.float32)
@@ -379,10 +575,10 @@ def score_speech_island_probabilities_batch(
         attention_mask = torch.from_numpy(mask).to(bundle.device)
         logits = bundle.model(tensor, attention_mask=attention_mask)
         probabilities = torch.sigmoid(logits).detach().cpu().numpy().astype(np.float32)
-    if probabilities.ndim != 3 or probabilities.shape[2] != SPEECH_ISLAND_SCORER_OUTPUT_DIM:
+    if probabilities.ndim != 3 or probabilities.shape[2] != 1:
         raise ValueError(
             "speech island scorer probabilities must have shape "
-            f"[batch, frames, {SPEECH_ISLAND_SCORER_OUTPUT_DIM}]"
+            "[batch, frames, 1]"
         )
     outputs: list[np.ndarray] = []
     for index, length in enumerate(lengths):
@@ -395,3 +591,121 @@ def score_speech_island_probabilities_batch(
             np.ascontiguousarray(probabilities[index, :length, 0], dtype=np.float32)
         )
     return outputs
+
+
+def score_semantic_speech_class_probabilities(
+    bundle: SpeechIslandScorerBundle,
+    *,
+    ptm: np.ndarray,
+    mfcc: np.ndarray,
+) -> np.ndarray:
+    scored = score_semantic_speech_class_probabilities_batch(
+        bundle,
+        feature_pairs=[(ptm, mfcc)],
+    )
+    if not scored:
+        return np.zeros((0, SPEECH_ISLAND_SCORER_OUTPUT_DIM), dtype=np.float32)
+    return scored[0]
+
+
+def score_semantic_speech_outputs(
+    bundle: SpeechIslandScorerBundle,
+    *,
+    ptm: np.ndarray,
+    mfcc: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    scored = score_semantic_speech_outputs_batch(
+        bundle,
+        feature_pairs=[(ptm, mfcc)],
+    )
+    if not scored:
+        return (
+            np.zeros((0, SPEECH_ISLAND_SCORER_OUTPUT_DIM), dtype=np.float32),
+            np.zeros((0, bundle.projected_ptm_dim), dtype=np.float32),
+        )
+    return scored[0]
+
+
+def score_semantic_speech_class_probabilities_batch(
+    bundle: SpeechIslandScorerBundle,
+    *,
+    feature_pairs: Sequence[tuple[np.ndarray, np.ndarray]],
+) -> list[np.ndarray]:
+    return [
+        probabilities
+        for probabilities, _projected in score_semantic_speech_outputs_batch(
+            bundle,
+            feature_pairs=feature_pairs,
+        )
+    ]
+
+
+def score_semantic_speech_outputs_batch(
+    bundle: SpeechIslandScorerBundle,
+    *,
+    feature_pairs: Sequence[tuple[np.ndarray, np.ndarray]],
+) -> list[tuple[np.ndarray, np.ndarray]]:
+    import torch
+
+    if bundle.schema != SPEECH_ISLAND_SCORER_SCHEMA:
+        raise ValueError(
+            f"semantic speech scoring requires {SPEECH_ISLAND_SCORER_SCHEMA!r}"
+        )
+    pairs = list(feature_pairs)
+    if not pairs:
+        return []
+    lengths: list[int] = []
+    ptm_rows: list[np.ndarray] = []
+    mfcc_rows: list[np.ndarray] = []
+    for ptm, mfcc in pairs:
+        frame_total = min(int(ptm.shape[0]), int(mfcc.shape[0]))
+        if int(ptm.shape[1]) != bundle.ptm_dim:
+            raise ValueError(
+                f"semantic scorer expected raw_ptm_dim={bundle.ptm_dim}, got {int(ptm.shape[1])}"
+            )
+        if int(mfcc.shape[1]) != bundle.mfcc_dim:
+            raise ValueError(
+                f"scorer expected mfcc_dim={bundle.mfcc_dim}, got {int(mfcc.shape[1])}"
+            )
+        lengths.append(frame_total)
+        ptm_rows.append(np.asarray(ptm[:frame_total], dtype=np.float32))
+        mfcc_rows.append(np.asarray(mfcc[:frame_total], dtype=np.float32))
+    max_len = max(lengths, default=0)
+    if max_len <= 0:
+        return [
+            (
+                np.zeros((0, SPEECH_ISLAND_SCORER_OUTPUT_DIM), dtype=np.float32),
+                np.zeros((0, bundle.projected_ptm_dim), dtype=np.float32),
+            )
+            for _ in ptm_rows
+        ]
+    ptm_batch = np.zeros(
+        (len(ptm_rows), max_len, bundle.ptm_dim), dtype=np.float32
+    )
+    mfcc_batch = np.zeros(
+        (len(mfcc_rows), max_len, bundle.mfcc_dim), dtype=np.float32
+    )
+    mask = np.zeros((len(ptm_rows), max_len), dtype=np.int64)
+    for index, (ptm, mfcc) in enumerate(zip(ptm_rows, mfcc_rows, strict=True)):
+        ptm_batch[index, : ptm.shape[0]] = ptm
+        mfcc_batch[index, : mfcc.shape[0]] = mfcc
+        mask[index, : ptm.shape[0]] = 1
+    with torch.inference_mode():
+        ptm_tensor = torch.from_numpy(ptm_batch).to(bundle.device)
+        mfcc_tensor = torch.from_numpy(mfcc_batch).to(bundle.device)
+        attention_mask = torch.from_numpy(mask).to(bundle.device)
+        projected = bundle.model.project_ptm(ptm_tensor)
+        logits = bundle.model(
+            ptm_tensor,
+            mfcc_tensor,
+            attention_mask=attention_mask,
+        )
+        probabilities = torch.softmax(logits, dim=-1).detach().cpu().numpy().astype(np.float32)
+        projected_values = projected.detach().cpu().numpy().astype(np.float32)
+    return [
+        (
+            np.ascontiguousarray(probabilities[index, :length], dtype=np.float32),
+            np.ascontiguousarray(projected_values[index, :length], dtype=np.float32),
+        )
+        for index, length in enumerate(lengths)
+    ]

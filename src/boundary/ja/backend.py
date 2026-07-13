@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import time
 from dataclasses import dataclass, replace
+from pathlib import Path
 from typing import Any, Iterable
 
 import numpy as np
@@ -10,6 +11,7 @@ import numpy as np
 from asr.backends.qwen import (
     DEFAULT_SPEECH_BOUNDARY_PROPOSAL_CHECKPOINT_BY_REPO,
     DEFAULT_SPEECH_BOUNDARY_SCORER_CHECKPOINT_BY_REPO,
+    QWEN_ASR_17B_REPO_ID,
     checkpoint_path_for_repo_env,
     current_qwen_asr_backend,
     qwen_asr_default_model_path,
@@ -27,7 +29,11 @@ from boundary.ja.features import (
     is_low_frame_rate_ptm,
 )
 from boundary.ja.model import (
+    SPEECH_ISLAND_SCORER_LABELS,
+    SPEECH_ISLAND_SCORER_SCHEMA,
+    LEGACY_SPEECH_ISLAND_SCORER_SCHEMA,
     load_speech_island_scorer_checkpoint,
+    score_semantic_speech_outputs,
     score_speech_island_probabilities,
 )
 from boundary.ja.proposal import load_boundary_proposal_checkpoint
@@ -612,8 +618,59 @@ class FrameBoundaryDecodeResult:
     coarse_segments: list[SpeechSegment]
     raw_frames: np.ndarray
     dilated_frames: np.ndarray
-    speech_on_threshold: float
-    speech_off_threshold: float
+    speech_on_threshold: float | None
+    speech_off_threshold: float | None
+    decision_mode: str = "threshold_hysteresis"
+    class_labels: tuple[str, ...] = ()
+
+
+def decode_semantic_speech_island_segments(
+    *,
+    class_probabilities: np.ndarray,
+    candidate_probabilities: np.ndarray,
+    duration_s: float,
+    config: "SpeechBoundaryJaConfig",
+) -> FrameBoundaryDecodeResult:
+    """Decode v9 classes by learned competition, without scalar thresholds."""
+
+    probabilities = np.asarray(class_probabilities, dtype=np.float32)
+    if probabilities.ndim != 2 or probabilities.shape[1] != len(
+        SPEECH_ISLAND_SCORER_LABELS
+    ):
+        raise ValueError(
+            "semantic speech probabilities must have shape "
+            f"[frames, {len(SPEECH_ISLAND_SCORER_LABELS)}]"
+        )
+    candidate_probs = np.asarray(candidate_probabilities, dtype=np.float32).reshape(-1)
+    total = min(int(probabilities.shape[0]), int(candidate_probs.size))
+    probabilities = probabilities[:total]
+    candidate_probs = candidate_probs[:total]
+    labels = np.argmax(probabilities, axis=1)
+    discardable_index = SPEECH_ISLAND_SCORER_LABELS.index("discardable")
+    raw_frames = (labels != discardable_index).astype(np.int8)
+    retained_probabilities = 1.0 - probabilities[:, discardable_index]
+    coarse_segments = frames_to_segments(
+        raw_frames,
+        frame_hop_s=config.frame_hop_s,
+        duration_s=duration_s,
+        scores=retained_probabilities,
+    )
+    segments = _attach_split_proposals(
+        coarse_segments,
+        speech_probs=retained_probabilities,
+        split_probs=candidate_probs,
+        config=config,
+    )
+    return FrameBoundaryDecodeResult(
+        segments=segments,
+        coarse_segments=coarse_segments,
+        raw_frames=raw_frames,
+        dilated_frames=raw_frames.copy(),
+        speech_on_threshold=None,
+        speech_off_threshold=None,
+        decision_mode="argmax_semantic_or_unsure",
+        class_labels=SPEECH_ISLAND_SCORER_LABELS,
+    )
 
 
 def _speech_thresholds_for_config(
@@ -783,12 +840,23 @@ class SpeechBoundaryJaConfig:
 
 
 class SpeechBoundaryJaBackend:
-    name = "speech_boundary_ja_mamba2_speech_island_scorer_v8"
-
     def __init__(self, config: SpeechBoundaryJaConfig | None = None) -> None:
         self.config = config or SpeechBoundaryJaConfig.from_env()
         self._sequence_ptm_projection: dict | None = None
         self._sequence_ptm_projection_loaded = False
+
+    @property
+    def name(self) -> str:
+        if self._uses_semantic_v9():
+            return "speech_boundary_ja_semantic_speech_scorer_v9"
+        return "speech_boundary_ja_mamba2_speech_island_scorer_v8"
+
+    def _uses_semantic_v9(self) -> bool:
+        checkpoint_name = Path(self.config.scorer_checkpoint).name
+        return (
+            self.config.ptm == QWEN_ASR_17B_REPO_ID
+            and checkpoint_name.startswith("semantic_speech_scorer_v9.")
+        )
 
     def _load_sequence_ptm_projection(self) -> dict | None:
         if not self._sequence_ptm_projection_loaded:
@@ -808,16 +876,15 @@ class SpeechBoundaryJaBackend:
 
     def signature(self) -> dict:
         cfg = self.config
-        speech_on_threshold, speech_off_threshold = self._speech_thresholds(cfg)
+        semantic_v9 = self._uses_semantic_v9()
         sequence_projection = self._load_sequence_ptm_projection()
         signature = {
             "backend": self.name,
-            "schema": "speech_boundary_ja_mamba2_speech_island_scorer_v8",
-            "threshold": float(cfg.threshold),
-            "speech_threshold_mode": "hysteresis",
-            "speech_on_threshold": float(speech_on_threshold),
-            "speech_off_threshold": float(speech_off_threshold),
-            "frame_dilation_s": float(cfg.frame_dilation_s),
+            "schema": (
+                SPEECH_ISLAND_SCORER_SCHEMA
+                if semantic_v9
+                else LEGACY_SPEECH_ISLAND_SCORER_SCHEMA
+            ),
             "frame_hop_s": float(cfg.frame_hop_s),
             "ptm": cfg.ptm,
             "model_path": cfg.model_path,
@@ -826,7 +893,6 @@ class SpeechBoundaryJaBackend:
             "attention": cfg.attention,
             "window_s": float(cfg.window_s),
             "overlap_s": float(cfg.overlap_s),
-            "min_segment_s": float(cfg.min_segment_s),
             "split_strategy": "candidate_proposal_only",
             "candidate_source": (
                 "learned_boundary_proposal_v1"
@@ -848,9 +914,41 @@ class SpeechBoundaryJaBackend:
                 str(sequence_projection["digest"]) if sequence_projection else ""
             ),
             "scorer_checkpoint": "",
-            "operating_point": DEFAULT_OPERATING_POINT,
+            "operating_point": (
+                "semantic-speech-high-recall-argmax-v9"
+                if semantic_v9
+                else DEFAULT_OPERATING_POINT
+            ),
             "allow_empty": True,
         }
+        if semantic_v9:
+            signature.update(
+                {
+                    "speech_threshold_mode": "argmax_semantic_or_unsure",
+                    "semantic_speech_labels": list(SPEECH_ISLAND_SCORER_LABELS),
+                    "discardable_classes": [
+                        "breath",
+                        "moan",
+                        "kiss",
+                        "laughter",
+                        "nonlexical_vocalization",
+                        "background_voice",
+                        "music_or_environment",
+                    ],
+                }
+            )
+        else:
+            speech_on_threshold, speech_off_threshold = self._speech_thresholds(cfg)
+            signature.update(
+                {
+                    "threshold": float(cfg.threshold),
+                    "speech_threshold_mode": "hysteresis",
+                    "speech_on_threshold": float(speech_on_threshold),
+                    "speech_off_threshold": float(speech_off_threshold),
+                    "frame_dilation_s": float(cfg.frame_dilation_s),
+                    "min_segment_s": float(cfg.min_segment_s),
+                }
+            )
         scorer_checkpoint = cfg.scorer_checkpoint.strip()
         if scorer_checkpoint:
             signature["scorer_checkpoint"] = scorer_checkpoint
@@ -886,6 +984,7 @@ class SpeechBoundaryJaBackend:
         )
         if scorer is not None:
             _validate_scorer_checkpoint_repo(scorer, cfg.scorer_checkpoint_repo_id or cfg.ptm)
+        semantic_scorer = scorer is not None and scorer.schema == SPEECH_ISLAND_SCORER_SCHEMA
         scorer_signature = scorer.signature() if scorer is not None else None
         proposal = (
             load_boundary_proposal_checkpoint(
@@ -922,7 +1021,11 @@ class SpeechBoundaryJaBackend:
             "ptm_param_device": ptm_param_device,
             "ptm_param_dtype": ptm_param_dtype,
             "score_model": (
-                "mamba2_speech_island_scorer_v8" if scorer is not None else "bootstrap_energy_ptm_mfcc"
+                "semantic_speech_scorer_v9"
+                if semantic_scorer
+                else "mamba2_speech_island_scorer_v8"
+                if scorer is not None
+                else "bootstrap_energy_ptm_mfcc"
             ),
             "scorer_device": str(scorer_device) if scorer is not None else "",
         }
@@ -940,10 +1043,23 @@ class SpeechBoundaryJaBackend:
             audio, sample_rate = load_audio_16k_mono(audio_path)
             duration_s = float(len(audio) / sample_rate) if sample_rate else 0.0
             total_frames = frame_count(duration_s, cfg.frame_hop_s)
-            probability_sum = np.zeros(total_frames, dtype=np.float64)
+            probability_sum = np.zeros(
+                (total_frames, len(SPEECH_ISLAND_SCORER_LABELS))
+                if semantic_scorer
+                else total_frames,
+                dtype=np.float64,
+            )
             probability_count = np.zeros(total_frames, dtype=np.float32)
             split_probability_sum = np.zeros(total_frames, dtype=np.float64)
             split_probability_count = np.zeros(total_frames, dtype=np.float32)
+            semantic_projection_sum = (
+                np.zeros(
+                    (total_frames, scorer.projected_ptm_dim),
+                    dtype=np.float64,
+                )
+                if semantic_scorer
+                else None
+            )
             sequence_ptm_sum: np.ndarray | None = None
             sequence_mfcc_sum: np.ndarray | None = None
             sequence_feature_count: np.ndarray | None = None
@@ -977,6 +1093,13 @@ class SpeechBoundaryJaBackend:
                         mfcc=mfcc,
                         config=feature_config,
                     )
+                elif semantic_scorer:
+                    probs, semantic_projected = score_semantic_speech_outputs(
+                        scorer,
+                        ptm=ptm,
+                        mfcc=mfcc,
+                    )
+                    candidate_probs = None
                 else:
                     probs = score_speech_island_probabilities(
                         scorer,
@@ -1000,12 +1123,17 @@ class SpeechBoundaryJaBackend:
                     )
                 window_start_s = start_sample / sample_rate
                 global_start = max(0, int(round(window_start_s / cfg.frame_hop_s)))
-                global_end = min(total_frames, global_start + probs.size)
+                probability_frames = int(probs.shape[0])
+                global_end = min(total_frames, global_start + probability_frames)
                 local_end = max(0, global_end - global_start)
                 if local_end <= 0:
                     continue
                 probability_sum[global_start:global_end] += probs[:local_end]
                 probability_count[global_start:global_end] += 1.0
+                if semantic_projection_sum is not None:
+                    semantic_projection_sum[global_start:global_end] += (
+                        semantic_projected[:local_end]
+                    )
                 split_probability_sum[global_start:global_end] += candidate_probs[:local_end]
                 split_probability_count[global_start:global_end] += 1.0
                 if cfg.export_sequence_features:
@@ -1061,11 +1189,16 @@ class SpeechBoundaryJaBackend:
                 if device.type == "cuda" and window_index and window_index % 16 == 0:
                     torch.cuda.empty_cache()
 
+            probability_denominator = np.maximum(probability_count, 1.0)
+            probability_coverage = probability_count > 0
+            if semantic_scorer:
+                probability_denominator = probability_denominator.reshape(-1, 1)
+                probability_coverage = probability_coverage.reshape(-1, 1)
             probabilities = np.divide(
                 probability_sum,
-                np.maximum(probability_count, 1.0),
+                probability_denominator,
                 out=np.zeros_like(probability_sum, dtype=np.float64),
-                where=probability_count > 0,
+                where=probability_coverage,
             ).astype(np.float32)
             candidate_probabilities = np.divide(
                 split_probability_sum,
@@ -1073,13 +1206,24 @@ class SpeechBoundaryJaBackend:
                 out=np.zeros_like(split_probability_sum, dtype=np.float64),
                 where=split_probability_count > 0,
             ).astype(np.float32)
-            decode = decode_speech_island_segments(
-                speech_probabilities=probabilities,
-                candidate_probabilities=candidate_probabilities,
-                duration_s=duration_s,
-                config=cfg,
-                threshold_override=threshold_override,
-            )
+            if semantic_scorer:
+                decode = decode_semantic_speech_island_segments(
+                    class_probabilities=probabilities,
+                    candidate_probabilities=candidate_probabilities,
+                    duration_s=duration_s,
+                    config=cfg,
+                )
+                discardable_index = SPEECH_ISLAND_SCORER_LABELS.index("discardable")
+                retained_probabilities = 1.0 - probabilities[:, discardable_index]
+            else:
+                decode = decode_speech_island_segments(
+                    speech_probabilities=probabilities,
+                    candidate_probabilities=candidate_probabilities,
+                    duration_s=duration_s,
+                    config=cfg,
+                    threshold_override=threshold_override,
+                )
+                retained_probabilities = probabilities
             raw_frames = decode.raw_frames
             dilated = decode.dilated_frames
             coarse_segments = decode.coarse_segments
@@ -1092,11 +1236,11 @@ class SpeechBoundaryJaBackend:
                         "duration_s": duration_s,
                         "frames": int(total_frames),
                         "windows": len(starts),
-                        "speech_threshold_mode": "hysteresis",
-                        "speech_on_threshold": float(speech_on_threshold),
-                        "speech_off_threshold": float(speech_off_threshold),
-                        "probability_mean": float(probabilities.mean()) if probabilities.size else 0.0,
-                        "probability_max": float(probabilities.max()) if probabilities.size else 0.0,
+                        "speech_threshold_mode": decode.decision_mode,
+                        "speech_on_threshold": decode.speech_on_threshold,
+                        "speech_off_threshold": decode.speech_off_threshold,
+                        "probability_mean": float(retained_probabilities.mean()) if retained_probabilities.size else 0.0,
+                        "probability_max": float(retained_probabilities.max()) if retained_probabilities.size else 0.0,
                         "candidate_probability_mean": (
                             float(candidate_probabilities.mean()) if candidate_probabilities.size else 0.0
                         ),
@@ -1116,6 +1260,14 @@ class SpeechBoundaryJaBackend:
             )
             if scorer_signature is not None:
                 params["scorer_checkpoint"] = scorer_signature
+            if semantic_scorer:
+                predicted_classes = np.argmax(probabilities, axis=1)
+                params["semantic_speech_class_stats"] = {
+                    label: float((predicted_classes == index).mean())
+                    if predicted_classes.size
+                    else 0.0
+                    for index, label in enumerate(SPEECH_ISLAND_SCORER_LABELS)
+                }
             if proposal_signature is not None:
                 params["proposal_checkpoint"] = proposal_signature
             if (
@@ -1135,6 +1287,18 @@ class SpeechBoundaryJaBackend:
                     "ptm_dim": int(sequence_ptm.shape[1]),
                     "mfcc_dim": int(sequence_mfcc.shape[1]),
                 }
+                if semantic_projection_sum is not None and scorer_signature is not None:
+                    semantic_projected_frames = (
+                        semantic_projection_sum
+                        / np.maximum(probability_count.reshape(-1, 1), 1.0)
+                    ).astype(np.float32)
+                    sequence_payload["semantic_ptm_projected"] = semantic_projected_frames
+                    sequence_payload["semantic_ptm_projected_dim"] = int(
+                        semantic_projected_frames.shape[1]
+                    )
+                    sequence_payload["semantic_scorer_sha256"] = str(
+                        scorer_signature.get("sha256") or ""
+                    )
                 if sequence_ptm_projected_sum is not None:
                     sequence_ptm_projected = (
                         sequence_ptm_projected_sum / counts
@@ -1148,7 +1312,9 @@ class SpeechBoundaryJaBackend:
                     )
                 params["sequence_feature_frames"] = sequence_payload
             if _env_bool("SPEECH_BOUNDARY_JA_EXPORT_FRAME_SCORES", "0") or cfg.export_sequence_features:
-                params["frame_scores"] = [float(value) for value in probabilities]
+                params["frame_scores"] = [float(value) for value in retained_probabilities]
+                if semantic_scorer:
+                    params["semantic_speech_class_probabilities"] = probabilities
                 params["candidate_frame_scores"] = [float(value) for value in candidate_probabilities]
             return SegmentationResult(
                 segments=segments,

@@ -113,9 +113,12 @@ class FrameSequenceFeatureProvider:
     config: FrameSequenceFeatureConfig = FrameSequenceFeatureConfig()
     ptm_projected: Sequence[Sequence[float]] | None = None
     ptm_projected_digest: str = ""
+    semantic_ptm_projected: Sequence[Sequence[float]] | None = None
+    semantic_scorer_sha256: str = ""
     _ptm_array: np.ndarray = field(init=False, repr=False)
     _mfcc_array: np.ndarray = field(init=False, repr=False)
     _ptm_projected_array: np.ndarray | None = field(init=False, repr=False)
+    _semantic_ptm_projected_array: np.ndarray | None = field(init=False, repr=False)
     _frame_count: int = field(init=False, repr=False)
     _ptm_used_dim: int = field(init=False, repr=False)
     _mfcc_dim: int = field(init=False, repr=False)
@@ -139,9 +142,25 @@ class FrameSequenceFeatureProvider:
                     "ptm_projected has fewer frames than ptm/mfcc: "
                     f"{projected_array.shape[0]} < {frame_count}"
                 )
+        semantic_projected_array: np.ndarray | None = None
+        if self.semantic_ptm_projected is not None:
+            semantic_projected_array = _frame_array(
+                self.semantic_ptm_projected,
+                name="semantic_ptm_projected",
+            )
+            if int(semantic_projected_array.shape[0]) < frame_count:
+                raise ValueError(
+                    "semantic_ptm_projected has fewer frames than ptm/mfcc: "
+                    f"{semantic_projected_array.shape[0]} < {frame_count}"
+                )
         object.__setattr__(self, "_ptm_array", ptm_array)
         object.__setattr__(self, "_mfcc_array", mfcc_array)
         object.__setattr__(self, "_ptm_projected_array", projected_array)
+        object.__setattr__(
+            self,
+            "_semantic_ptm_projected_array",
+            semantic_projected_array,
+        )
         object.__setattr__(self, "_frame_count", frame_count)
         object.__setattr__(self, "_ptm_used_dim", ptm_used_dim)
         object.__setattr__(self, "_mfcc_dim", int(mfcc_array.shape[1]))
@@ -462,6 +481,64 @@ class FrameSequenceFeatureProvider:
             dtype=np.float32,
         )
         return pooled, scalar
+
+    def features_for_outer_island_v2(
+        self,
+        *,
+        start_s: float,
+        end_s: float,
+        semantic_class_probabilities: np.ndarray,
+        expected_semantic_scorer_sha256: str,
+    ) -> np.ndarray:
+        """Return every frame in the scorer island for learned full-island edges."""
+
+        start_frame = max(0, int(round(start_s / self.frame_hop_s)))
+        end_frame = min(
+            int(self._ptm_used.shape[0]),
+            int(self._mfcc_used.shape[0]),
+            int(round(end_s / self.frame_hop_s)),
+        )
+        semantic_dim = (
+            int(self._semantic_ptm_projected_array.shape[1])
+            if self._semantic_ptm_projected_array is not None
+            else 0
+        )
+        if end_frame <= start_frame:
+            return np.zeros(
+                (
+                    0,
+                    semantic_dim
+                    + int(self._mfcc_used.shape[1])
+                    + int(np.asarray(semantic_class_probabilities).shape[1])
+                    + 1,
+                ),
+                dtype=np.float32,
+            )
+        scorer = np.asarray(semantic_class_probabilities, dtype=np.float32)
+        if scorer.ndim != 2 or scorer.shape[0] < end_frame:
+            raise ValueError(
+                "semantic_class_probabilities must cover the full outer island"
+            )
+        if self._semantic_ptm_projected_array is None:
+            raise ValueError("Outer Edge Refiner v2 requires learned semantic PTM frames")
+        if self.semantic_scorer_sha256 != str(expected_semantic_scorer_sha256):
+            raise ValueError("Outer Edge Refiner v2 semantic scorer SHA mismatch")
+        frame_total = end_frame - start_frame
+        position = (
+            np.arange(frame_total, dtype=np.float32) / max(1, frame_total - 1)
+        ).reshape(-1, 1)
+        return np.ascontiguousarray(
+            np.concatenate(
+                (
+                    self._semantic_ptm_projected_array[start_frame:end_frame],
+                    self._mfcc_used[start_frame:end_frame],
+                    scorer[start_frame:end_frame],
+                    position,
+                ),
+                axis=1,
+            ),
+            dtype=np.float32,
+        )
 
     def chunk_pooled_ptm_feature_names(
         self,

@@ -2,20 +2,33 @@ from __future__ import annotations
 
 import numpy as np
 
-from boundary.ja.backend import SpeechBoundaryJaConfig, decode_speech_island_segments
+from boundary.ja.backend import (
+    SpeechBoundaryJaBackend,
+    SpeechBoundaryJaConfig,
+    decode_semantic_speech_island_segments,
+    decode_speech_island_segments,
+)
 from boundary.ja.model import (
+    LEGACY_SPEECH_ISLAND_SCORER_SCHEMA,
     SPEECH_ISLAND_SCORER_DECODER,
+    SPEECH_ISLAND_SCORER_LABELS,
     SPEECH_ISLAND_SCORER_OUTPUT_DIM,
     SPEECH_ISLAND_SCORER_OUTPUT_HEADS,
     SPEECH_ISLAND_SCORER_SCHEMA,
 )
 
 
-def test_speech_island_scorer_has_one_speech_head() -> None:
-    assert SPEECH_ISLAND_SCORER_SCHEMA.endswith("speech_island_scorer_v8")
-    assert SPEECH_ISLAND_SCORER_OUTPUT_DIM == 1
-    assert SPEECH_ISLAND_SCORER_OUTPUT_HEADS == ("speech_prob",)
-    assert SPEECH_ISLAND_SCORER_DECODER == "speech_hysteresis_islands_v1"
+def test_17b_semantic_speech_scorer_uses_three_way_argmax() -> None:
+    assert SPEECH_ISLAND_SCORER_SCHEMA == "semantic_speech_scorer_v9"
+    assert SPEECH_ISLAND_SCORER_OUTPUT_DIM == 3
+    assert SPEECH_ISLAND_SCORER_OUTPUT_HEADS == (
+        "discardable",
+        "semantic_target",
+        "unsure",
+    )
+    assert SPEECH_ISLAND_SCORER_LABELS == SPEECH_ISLAND_SCORER_OUTPUT_HEADS
+    assert SPEECH_ISLAND_SCORER_DECODER == "argmax_semantic_or_unsure_islands_v1"
+    assert LEGACY_SPEECH_ISLAND_SCORER_SCHEMA.endswith("speech_island_scorer_v8")
 
 
 def test_decoder_attaches_proposals_without_splitting_speech_island() -> None:
@@ -41,10 +54,48 @@ def test_decoder_attaches_proposals_without_splitting_speech_island() -> None:
     assert result.segments[0].weak_cut_candidates
 
 
-def test_decoder_uses_high_recall_default_threshold() -> None:
-    config = SpeechBoundaryJaConfig()
-    assert config.threshold == 0.15
-    assert config.sequence_feature_max_ptm_dims == 128
+def test_semantic_decoder_keeps_target_and_unsure_but_drops_music() -> None:
+    probabilities = np.asarray(
+        [
+            [0.9, 0.05, 0.05],
+            [0.1, 0.8, 0.1],
+            [0.1, 0.1, 0.8],
+            [0.8, 0.1, 0.1],
+        ],
+        dtype=np.float32,
+    )
+    result = decode_semantic_speech_island_segments(
+        class_probabilities=probabilities,
+        candidate_probabilities=np.zeros(4, dtype=np.float32),
+        duration_s=0.08,
+        config=SpeechBoundaryJaConfig(frame_hop_s=0.02),
+    )
+
+    assert result.decision_mode == "argmax_semantic_or_unsure"
+    assert result.speech_on_threshold is None
+    assert result.raw_frames.tolist() == [0, 1, 1, 0]
+    assert result.dilated_frames.tolist() == [0, 1, 1, 0]
+    assert [(item.start, item.end) for item in result.segments] == [(0.02, 0.06)]
+
+
+def test_17b_signature_has_no_fixed_speech_threshold_but_06b_stays_legacy() -> None:
+    config_17b = SpeechBoundaryJaConfig(
+        scorer_checkpoint=(
+            "semantic_speech_scorer_v9."
+            "jaykwok-Qwen3-ASR-1.7B-JA-Anime-Galgame-hf.pt"
+        )
+    )
+    signature_17b = SpeechBoundaryJaBackend(config=config_17b).signature()
+    assert signature_17b["speech_threshold_mode"] == "argmax_semantic_or_unsure"
+    assert "threshold" not in signature_17b
+    assert "frame_dilation_s" not in signature_17b
+
+    config_06b = SpeechBoundaryJaConfig(
+        ptm="jaykwok/Qwen3-ASR-0.6B-JA-Anime-Galgame-hf"
+    )
+    signature_06b = SpeechBoundaryJaBackend(config=config_06b).signature()
+    assert signature_06b["schema"] == LEGACY_SPEECH_ISLAND_SCORER_SCHEMA
+    assert signature_06b["threshold"] == 0.15
 
 
 def test_proposal_checkpoint_without_mapping_keeps_bootstrap(monkeypatch) -> None:
