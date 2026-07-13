@@ -16,7 +16,10 @@ if str(SRC_ROOT) not in sys.path:
 
 from asr.backends.qwen import QWEN_ASR_17B_REPO_ID, qwen_asr_repo_tag  # noqa: E402
 from boundary.gpu_safety import apply_vram_safety_cap  # noqa: E402
-from boundary.ja.model import SPEECH_ISLAND_SCORER_LABELS  # noqa: E402
+from boundary.ja.model import (  # noqa: E402
+    SPEECH_ISLAND_MEMBERSHIP_LABELS,
+    SPEECH_ISLAND_SCORER_LABELS,
+)
 from boundary.outer_refiner_v2 import (  # noqa: E402
     FullIslandOuterEdgeNetwork,
     build_outer_edge_refiner_v2_checkpoint,
@@ -166,8 +169,15 @@ def run(args: argparse.Namespace) -> None:
             model_config=model_config,
             feature_config={
                 "semantic_projected_ptm_dim": args.semantic_projected_ptm_dim,
-                "mfcc_dim": int(first.shape[1]) - args.semantic_projected_ptm_dim - len(SPEECH_ISLAND_SCORER_LABELS) - 1,
+                "mfcc_dim": int(first.shape[1])
+                - args.semantic_projected_ptm_dim
+                - len(SPEECH_ISLAND_SCORER_LABELS)
+                - len(SPEECH_ISLAND_MEMBERSHIP_LABELS)
+                - 1,
                 "semantic_probability_dim": len(SPEECH_ISLAND_SCORER_LABELS),
+                "source_membership_probability_dim": len(
+                    SPEECH_ISLAND_MEMBERSHIP_LABELS
+                ),
                 "relative_position_dim": 1,
                 "frame_hop_s": args.frame_hop_s,
                 "context": "full_scorer_island",
