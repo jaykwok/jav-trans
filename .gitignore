@@ -72,3 +72,6 @@ CLAUDE.md
 
 # Local MCP/infra deployment notes (not published)
 grok-search-mcp部署文档.md
+
+# uv lock is a regenerated stub; requirements.txt is the source of truth
+uv.lock
