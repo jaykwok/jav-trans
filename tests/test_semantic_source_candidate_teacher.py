@@ -27,6 +27,8 @@ def test_teacher_contract_is_candidate_classification_without_timestamps() -> No
     assert "不要输出时间戳" in teacher.SOURCE_GATE_PROMPT
     assert "start_s" not in teacher.SOURCE_GATE_PROMPT
     assert "end_s" not in teacher.SOURCE_GATE_PROMPT
+    assert teacher.DEFAULT_PROJECTION.suffix == ".pt"
+    assert "Qwen3-ASR-1.7B" in str(teacher.DEFAULT_PROJECTION)
 
 
 def test_learned_farthest_medoid_selection_and_cells_are_deterministic() -> None:
@@ -51,6 +53,24 @@ def test_learned_farthest_medoid_selection_and_cells_are_deterministic() -> None
         row["context_start_s"] < row["marker_s"] < row["context_end_s"]
         for row in cells
     )
+
+
+def test_candidate_projection_uses_full_ptm_tail_not_front128() -> None:
+    ptm = np.zeros((2, 2048), dtype=np.float32)
+    ptm[1, 2047] = 3.0
+    mean = np.zeros(2048, dtype=np.float32)
+    components = np.zeros((2, 2048), dtype=np.float32)
+    components[0, 2047] = 2.0
+
+    projected = teacher.learned_frame_embeddings(
+        ptm=ptm,
+        projection_mean=mean,
+        projection_components=components,
+    )
+
+    assert projected.shape == (2, 2)
+    assert projected[0, 0] == 0.0
+    assert projected[1, 0] == 6.0
 
 
 def test_validation_requires_exact_candidate_order_and_three_classes() -> None:
@@ -125,7 +145,7 @@ def test_audit_explains_marker_and_has_no_timing_editor(tmp_path: Path) -> None:
                     "confidence": 0.9,
                     "reason": "可辨短词",
                 },
-                "selection_mode": "learned_hidden_farthest_medoid_v1",
+                "selection_mode": "learned_full_ptm_projection_farthest_medoid_v2",
                 "candidates": [
                     {
                         "candidate_id": "c00",
@@ -165,14 +185,15 @@ def test_audit_explains_marker_and_has_no_timing_editor(tmp_path: Path) -> None:
     assert "不显示旧切点" in page
     assert "页面不允许修改时间" in page
     assert "source gate=" in page
+    assert "learned full-PTM 2048→128 projection" in page
     assert "候选行不是 chunk" in page
     assert "membership 输出 1 个 coarse island" in page
     assert "Layer 1 · content 证据" in page
     assert "Layer 2 · source membership / Outer" in page
     assert "Layer 3 · 本样本 Split 期望（只约束本例）" in page
     assert "只约束本例：最多两块" in page
-    assert "semantic-source-candidate-smoke5-v4" in page
+    assert "semantic-source-candidate-audit-v5" in page
     assert 'data-field="start_s"' not in page
     assert 'data-field="end_s"' not in page
-    assert "semantic_source_candidate_manual_verdict_v4" in page
+    assert "semantic_source_candidate_manual_verdict_v5" in page
     assert re.search(r"<script>[\s\S]+</script>", page)
