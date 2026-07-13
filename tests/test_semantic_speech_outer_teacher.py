@@ -77,5 +77,8 @@ def test_audit_explains_timeline_and_editable_labels(tmp_path: Path) -> None:
     assert "彩色长条是时间轴，不是进度条" in page
     assert "喘息、呻吟、亲吻声、笑声" in page
     assert "通过（含我的修正）" in page
+    assert "▶ 仅此区间" in page
+    assert "Number(start)-0.8" not in page
+    assert "Number(end)+0.8" not in page
     assert "semantic-speech-outer-smoke5-v1" in page
     assert re.search(r"<script>[\s\S]+</script>", page)
