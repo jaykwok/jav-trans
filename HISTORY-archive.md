@@ -1,6 +1,12 @@
-# HISTORY 归档：FusionVAD-JA / Forced Alignment 历史迭代记录
+# HISTORY 归档
 
-本文件收纳从 HISTORY.md 迁出的已沉淀实验迭代记录：FusionVAD-JA 版本迭代（v0 → v1.18）与 Forced Alignment / Chunk Packing 的 R14–R19 阶段流水账。内容原样保留（含原 `<details>` 折叠结构）。
+本文件收纳从 [HISTORY.md](HISTORY.md) 迁出的已沉淀或被取代的历史实验记录，保持主文件聚焦于活跃路线与近期决策。内容原样保留（含原 `<details>` 折叠结构），仅做位置迁移，未改写事实。
+
+收录的归档段：
+
+- **FusionVAD-JA 版本记录（v0 → v1.18）与 Forced Alignment / Chunk Packing R14–R19**：早期 VAD 与 chunk packing 的版本迭代流水账，已被当前的 SpeechIslandScorer + 语义切分管线取代。
+- **旧实验记录（2026-06-18 SpeechBoundary-JA v3 训练流水账）**：v3 frame-boundary scorer 的阈值 / 数据 / 训练迭代细节，已被 v8 speech-island scorer 取代。
+- **Qwen3-ASR SFT 路线（早期云端训练记录）**：1.7B / 0.6B full SFT 的云端训练配置与踩坑记录；线上 `jaykwok/Qwen3-ASR-*-JA-Anime-Galgame-hf` 即该自训链路的发布产物，自训工具 `tools/asr/qwen/` 仍活跃保留。
 
 ---
 
