@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
+PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$PROJECT_ROOT"
 
 if [[ ! -d ".venv" ]]; then
@@ -24,7 +24,7 @@ else
   QWEN_MODEL_PATH="${QWEN_MODEL_PATH:-Qwen/Qwen3-ASR-1.7B-hf}"
 fi
 
-QWEN_SFT_SCRIPT="${QWEN_SFT_SCRIPT:-$PROJECT_ROOT/tools/asr/qwen/train_qwen_asr_sft_hf.py}"
+QWEN_SFT_SCRIPT="${QWEN_SFT_SCRIPT:-$PROJECT_ROOT/tools/sft/train_qwen_asr_sft_hf.py}"
 QWEN_SFT_OUTPUT_DIR="${QWEN_SFT_OUTPUT_DIR:-$PROJECT_ROOT/datasets/train/qwen3-asr-ja-galgame/jaykwok-Qwen3-ASR-1.7B-JA-Anime-Galgame-hf-full-sft}"
 QWEN_SFT_LOG="${QWEN_SFT_LOG:-$PROJECT_ROOT/agents/temp/qwen3-asr-sft-cloud.run.log}"
 
@@ -64,7 +64,7 @@ fi
 
 if [[ ! -f "$TRAIN_FILE" ]]; then
   echo "Missing train file: $TRAIN_FILE" >&2
-  echo "Run tools/asr/qwen/prepare_qwen_asr_cloud_assets.sh first." >&2
+  echo "Run tools/sft/prepare_qwen_asr_cloud_assets.sh first." >&2
   exit 2
 fi
 

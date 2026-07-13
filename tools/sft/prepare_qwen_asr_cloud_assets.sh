@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
+PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$PROJECT_ROOT"
 
 if [[ ! -d ".venv" ]]; then
@@ -64,7 +64,7 @@ fi
 uv run --no-sync huggingface-cli download "${MODEL_ARGS[@]}"
 
 SFT_ARGS=(
-  tools/asr/qwen/prepare_qwen_asr_sft_dataset.py
+  tools/sft/prepare_qwen_asr_sft_dataset.py
   --mode "$SFT_MODE"
   --output-root "$SFT_OUTPUT_ROOT"
   --hf-cache-dir "$HF_CACHE_DIR"
