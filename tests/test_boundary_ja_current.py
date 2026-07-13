@@ -10,6 +10,7 @@ from boundary.ja.backend import (
 )
 from boundary.ja.model import (
     LEGACY_SPEECH_ISLAND_SCORER_SCHEMA,
+    SPEECH_ISLAND_MEMBERSHIP_LABELS,
     SPEECH_ISLAND_SCORER_DECODER,
     SPEECH_ISLAND_SCORER_LABELS,
     SPEECH_ISLAND_SCORER_OUTPUT_DIM,
@@ -18,16 +19,24 @@ from boundary.ja.model import (
 )
 
 
-def test_17b_semantic_speech_scorer_uses_three_way_argmax() -> None:
+def test_17b_semantic_speech_scorer_separates_content_and_membership() -> None:
     assert SPEECH_ISLAND_SCORER_SCHEMA == "semantic_speech_scorer_v9"
-    assert SPEECH_ISLAND_SCORER_OUTPUT_DIM == 3
+    assert SPEECH_ISLAND_SCORER_OUTPUT_DIM == 6
     assert SPEECH_ISLAND_SCORER_OUTPUT_HEADS == (
+        "content.discardable",
+        "content.semantic_target",
+        "content.unsure",
+        "membership.outside",
+        "membership.inside",
+        "membership.unsure",
+    )
+    assert SPEECH_ISLAND_SCORER_LABELS == (
         "discardable",
         "semantic_target",
         "unsure",
     )
-    assert SPEECH_ISLAND_SCORER_LABELS == SPEECH_ISLAND_SCORER_OUTPUT_HEADS
-    assert SPEECH_ISLAND_SCORER_DECODER == "argmax_semantic_or_unsure_islands_v1"
+    assert SPEECH_ISLAND_MEMBERSHIP_LABELS == ("outside", "inside", "unsure")
+    assert SPEECH_ISLAND_SCORER_DECODER == "argmax_source_membership_islands_v1"
     assert LEGACY_SPEECH_ISLAND_SCORER_SCHEMA.endswith("speech_island_scorer_v8")
 
 
@@ -54,28 +63,32 @@ def test_decoder_attaches_proposals_without_splitting_speech_island() -> None:
     assert result.segments[0].weak_cut_candidates
 
 
-def test_semantic_decoder_keeps_target_and_unsure_but_drops_music() -> None:
-    probabilities = np.asarray(
+def test_semantic_decoder_does_not_split_on_internal_discardable_content() -> None:
+    content_probabilities = np.asarray(
         [
+            [0.1, 0.8, 0.1],
             [0.9, 0.05, 0.05],
             [0.1, 0.8, 0.1],
-            [0.1, 0.1, 0.8],
-            [0.8, 0.1, 0.1],
         ],
         dtype=np.float32,
     )
+    membership_probabilities = np.asarray(
+        [[0.05, 0.9, 0.05]] * 3,
+        dtype=np.float32,
+    )
     result = decode_semantic_speech_island_segments(
-        class_probabilities=probabilities,
-        candidate_probabilities=np.zeros(4, dtype=np.float32),
-        duration_s=0.08,
+        content_class_probabilities=content_probabilities,
+        membership_class_probabilities=membership_probabilities,
+        candidate_probabilities=np.zeros(3, dtype=np.float32),
+        duration_s=0.06,
         config=SpeechBoundaryJaConfig(frame_hop_s=0.02),
     )
 
-    assert result.decision_mode == "argmax_semantic_or_unsure"
+    assert result.decision_mode == "argmax_source_membership"
     assert result.speech_on_threshold is None
-    assert result.raw_frames.tolist() == [0, 1, 1, 0]
-    assert result.dilated_frames.tolist() == [0, 1, 1, 0]
-    assert [(item.start, item.end) for item in result.segments] == [(0.02, 0.06)]
+    assert result.raw_frames.tolist() == [1, 1, 1]
+    assert result.dilated_frames.tolist() == [1, 1, 1]
+    assert [(item.start, item.end) for item in result.segments] == [(0.0, 0.06)]
 
 
 def test_17b_signature_has_no_fixed_speech_threshold_but_06b_stays_legacy() -> None:
@@ -86,7 +99,7 @@ def test_17b_signature_has_no_fixed_speech_threshold_but_06b_stays_legacy() -> N
         )
     )
     signature_17b = SpeechBoundaryJaBackend(config=config_17b).signature()
-    assert signature_17b["speech_threshold_mode"] == "argmax_semantic_or_unsure"
+    assert signature_17b["speech_threshold_mode"] == "argmax_source_membership"
     assert "threshold" not in signature_17b
     assert "frame_dilation_s" not in signature_17b
 

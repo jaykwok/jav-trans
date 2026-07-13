@@ -18,6 +18,7 @@ from boundary.gpu_safety import apply_vram_safety_cap  # noqa: E402
 from boundary.ja.dataset import effective_frame_weights, read_jsonl  # noqa: E402
 from boundary.ja.features import load_cached_feature  # noqa: E402
 from boundary.ja.model import (  # noqa: E402
+    SPEECH_ISLAND_MEMBERSHIP_LABELS,
     SPEECH_ISLAND_SCORER_LABELS,
     load_speech_island_scorer_checkpoint,
     score_semantic_speech_outputs,
@@ -58,7 +59,7 @@ def run(args: argparse.Namespace) -> None:
     manifest_rows: list[dict] = []
     missed_target_sources = 0
     target_index = SPEECH_ISLAND_SCORER_LABELS.index("semantic_target")
-    discardable_index = SPEECH_ISLAND_SCORER_LABELS.index("discardable")
+    outside_index = SPEECH_ISLAND_MEMBERSHIP_LABELS.index("outside")
     for row_index, row in enumerate(rows):
         record = records[int(row["label_index"])]
         ptm, mfcc = load_cached_feature(Path(str(row["feature_path"])))
@@ -69,15 +70,19 @@ def run(args: argparse.Namespace) -> None:
         )
         if total <= 0:
             continue
-        probabilities, semantic_projected = score_semantic_speech_outputs(
+        (
+            probabilities,
+            membership_probabilities,
+            semantic_projected,
+        ) = score_semantic_speech_outputs(
             scorer,
             ptm=ptm[:total],
             mfcc=mfcc[:total],
         )
         truth = _class_indexes(record, total=total)
         weights = np.asarray(effective_frame_weights(record)[:total], dtype=np.float32)
-        predicted = np.argmax(probabilities, axis=1)
-        islands = _runs(predicted != discardable_index)
+        predicted_membership = np.argmax(membership_probabilities, axis=1)
+        islands = _runs(predicted_membership != outside_index)
         if not islands and np.any(truth == target_index):
             missed_target_sources += 1
         for island_index, (start, end) in enumerate(islands):
@@ -90,6 +95,7 @@ def run(args: argparse.Namespace) -> None:
                     semantic_projected[start:end],
                     mfcc[start:end],
                     probabilities[start:end],
+                    membership_probabilities[start:end],
                     position,
                 ),
                 axis=1,
@@ -132,6 +138,7 @@ def run(args: argparse.Namespace) -> None:
         "target_island_count": sum(bool(row["contains_target"]) for row in manifest_rows),
         "missed_target_source_count": missed_target_sources,
         "labels": list(SPEECH_ISLAND_SCORER_LABELS),
+        "membership_labels": list(SPEECH_ISLAND_MEMBERSHIP_LABELS),
         "decision_mode": "argmax",
         "manifest": str(manifest_path),
     }

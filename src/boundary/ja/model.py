@@ -16,17 +16,22 @@ LEGACY_SPEECH_ISLAND_SCORER_DECODER = "speech_hysteresis_islands_v1"
 
 SPEECH_ISLAND_SCORER_SCHEMA = "semantic_speech_scorer_v9"
 SPEECH_ISLAND_SCORER_MODEL_TYPE = "mamba2_semantic_speech_scorer"
-SPEECH_ISLAND_SCORER_MODEL_ARCH = "semantic-speech-frame-mamba-v1"
+SPEECH_ISLAND_SCORER_MODEL_ARCH = "semantic-source-membership-mamba-v1"
 SPEECH_ISLAND_SCORER_LABELS = ("discardable", "semantic_target", "unsure")
-SPEECH_ISLAND_SCORER_OUTPUT_DIM = len(SPEECH_ISLAND_SCORER_LABELS)
-SPEECH_ISLAND_SCORER_OUTPUT_HEADS = SPEECH_ISLAND_SCORER_LABELS
-SPEECH_ISLAND_SCORER_DECODER = "argmax_semantic_or_unsure_islands_v1"
+SPEECH_ISLAND_MEMBERSHIP_LABELS = ("outside", "inside", "unsure")
+SPEECH_ISLAND_SCORER_CONTENT_DIM = len(SPEECH_ISLAND_SCORER_LABELS)
+SPEECH_ISLAND_SCORER_MEMBERSHIP_DIM = len(SPEECH_ISLAND_MEMBERSHIP_LABELS)
+SPEECH_ISLAND_SCORER_OUTPUT_HEADS = tuple(
+    f"content.{label}" for label in SPEECH_ISLAND_SCORER_LABELS
+) + tuple(f"membership.{label}" for label in SPEECH_ISLAND_MEMBERSHIP_LABELS)
+SPEECH_ISLAND_SCORER_OUTPUT_DIM = len(SPEECH_ISLAND_SCORER_OUTPUT_HEADS)
+SPEECH_ISLAND_SCORER_DECODER = "argmax_source_membership_islands_v1"
 SPEECH_ISLAND_SCORER_ARTIFACT = {
     "name": "semantic_speech_scorer",
     "display_name": "Semantic Speech Scorer",
     "version": "v9",
     "pipeline_stage": 1,
-    "pipeline_role": "speech_island_detection",
+    "pipeline_role": "semantic_source_membership_detection",
 }
 
 
@@ -419,7 +424,11 @@ def build_speech_island_scorer_checkpoint(
     metadata_dict.setdefault("output_heads", list(heads))
     metadata_dict.setdefault("decoder", decoder)
     if schema == SPEECH_ISLAND_SCORER_SCHEMA:
-        metadata_dict.setdefault("labels", list(SPEECH_ISLAND_SCORER_LABELS))
+        metadata_dict.setdefault("labels", list(SPEECH_ISLAND_SCORER_OUTPUT_HEADS))
+        metadata_dict.setdefault("content_labels", list(SPEECH_ISLAND_SCORER_LABELS))
+        metadata_dict.setdefault(
+            "membership_labels", list(SPEECH_ISLAND_MEMBERSHIP_LABELS)
+        )
         metadata_dict.setdefault("decision_mode", "argmax")
     _validate_metadata(metadata_dict, schema=schema)
     return {
@@ -604,7 +613,7 @@ def score_semantic_speech_class_probabilities(
         feature_pairs=[(ptm, mfcc)],
     )
     if not scored:
-        return np.zeros((0, SPEECH_ISLAND_SCORER_OUTPUT_DIM), dtype=np.float32)
+        return np.zeros((0, SPEECH_ISLAND_SCORER_CONTENT_DIM), dtype=np.float32)
     return scored[0]
 
 
@@ -613,14 +622,15 @@ def score_semantic_speech_outputs(
     *,
     ptm: np.ndarray,
     mfcc: np.ndarray,
-) -> tuple[np.ndarray, np.ndarray]:
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     scored = score_semantic_speech_outputs_batch(
         bundle,
         feature_pairs=[(ptm, mfcc)],
     )
     if not scored:
         return (
-            np.zeros((0, SPEECH_ISLAND_SCORER_OUTPUT_DIM), dtype=np.float32),
+            np.zeros((0, SPEECH_ISLAND_SCORER_CONTENT_DIM), dtype=np.float32),
+            np.zeros((0, SPEECH_ISLAND_SCORER_MEMBERSHIP_DIM), dtype=np.float32),
             np.zeros((0, bundle.projected_ptm_dim), dtype=np.float32),
         )
     return scored[0]
@@ -633,7 +643,7 @@ def score_semantic_speech_class_probabilities_batch(
 ) -> list[np.ndarray]:
     return [
         probabilities
-        for probabilities, _projected in score_semantic_speech_outputs_batch(
+        for probabilities, _membership, _projected in score_semantic_speech_outputs_batch(
             bundle,
             feature_pairs=feature_pairs,
         )
@@ -644,7 +654,7 @@ def score_semantic_speech_outputs_batch(
     bundle: SpeechIslandScorerBundle,
     *,
     feature_pairs: Sequence[tuple[np.ndarray, np.ndarray]],
-) -> list[tuple[np.ndarray, np.ndarray]]:
+) -> list[tuple[np.ndarray, np.ndarray, np.ndarray]]:
     import torch
 
     if bundle.schema != SPEECH_ISLAND_SCORER_SCHEMA:
@@ -674,7 +684,8 @@ def score_semantic_speech_outputs_batch(
     if max_len <= 0:
         return [
             (
-                np.zeros((0, SPEECH_ISLAND_SCORER_OUTPUT_DIM), dtype=np.float32),
+                np.zeros((0, SPEECH_ISLAND_SCORER_CONTENT_DIM), dtype=np.float32),
+                np.zeros((0, SPEECH_ISLAND_SCORER_MEMBERSHIP_DIM), dtype=np.float32),
                 np.zeros((0, bundle.projected_ptm_dim), dtype=np.float32),
             )
             for _ in ptm_rows
@@ -700,11 +711,27 @@ def score_semantic_speech_outputs_batch(
             mfcc_tensor,
             attention_mask=attention_mask,
         )
-        probabilities = torch.softmax(logits, dim=-1).detach().cpu().numpy().astype(np.float32)
+        content_logits = logits[..., :SPEECH_ISLAND_SCORER_CONTENT_DIM]
+        membership_logits = logits[..., SPEECH_ISLAND_SCORER_CONTENT_DIM:]
+        content_probabilities = (
+            torch.softmax(content_logits, dim=-1).detach().cpu().numpy().astype(np.float32)
+        )
+        membership_probabilities = (
+            torch.softmax(membership_logits, dim=-1)
+            .detach()
+            .cpu()
+            .numpy()
+            .astype(np.float32)
+        )
         projected_values = projected.detach().cpu().numpy().astype(np.float32)
     return [
         (
-            np.ascontiguousarray(probabilities[index, :length], dtype=np.float32),
+            np.ascontiguousarray(
+                content_probabilities[index, :length], dtype=np.float32
+            ),
+            np.ascontiguousarray(
+                membership_probabilities[index, :length], dtype=np.float32
+            ),
             np.ascontiguousarray(projected_values[index, :length], dtype=np.float32),
         )
         for index, length in enumerate(lengths)

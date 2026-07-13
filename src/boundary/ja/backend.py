@@ -29,6 +29,7 @@ from boundary.ja.features import (
     is_low_frame_rate_ptm,
 )
 from boundary.ja.model import (
+    SPEECH_ISLAND_MEMBERSHIP_LABELS,
     SPEECH_ISLAND_SCORER_LABELS,
     SPEECH_ISLAND_SCORER_SCHEMA,
     LEGACY_SPEECH_ISLAND_SCORER_SCHEMA,
@@ -626,14 +627,16 @@ class FrameBoundaryDecodeResult:
 
 def decode_semantic_speech_island_segments(
     *,
-    class_probabilities: np.ndarray,
+    content_class_probabilities: np.ndarray,
+    membership_class_probabilities: np.ndarray,
     candidate_probabilities: np.ndarray,
     duration_s: float,
     config: "SpeechBoundaryJaConfig",
 ) -> FrameBoundaryDecodeResult:
-    """Decode v9 classes by learned competition, without scalar thresholds."""
+    """Group v9 islands by learned source membership, not content-class runs."""
 
-    probabilities = np.asarray(class_probabilities, dtype=np.float32)
+    probabilities = np.asarray(content_class_probabilities, dtype=np.float32)
+    membership = np.asarray(membership_class_probabilities, dtype=np.float32)
     if probabilities.ndim != 2 or probabilities.shape[1] != len(
         SPEECH_ISLAND_SCORER_LABELS
     ):
@@ -641,14 +644,26 @@ def decode_semantic_speech_island_segments(
             "semantic speech probabilities must have shape "
             f"[frames, {len(SPEECH_ISLAND_SCORER_LABELS)}]"
         )
+    if membership.ndim != 2 or membership.shape[1] != len(
+        SPEECH_ISLAND_MEMBERSHIP_LABELS
+    ):
+        raise ValueError(
+            "semantic source membership probabilities must have shape "
+            f"[frames, {len(SPEECH_ISLAND_MEMBERSHIP_LABELS)}]"
+        )
     candidate_probs = np.asarray(candidate_probabilities, dtype=np.float32).reshape(-1)
-    total = min(int(probabilities.shape[0]), int(candidate_probs.size))
+    total = min(
+        int(probabilities.shape[0]),
+        int(membership.shape[0]),
+        int(candidate_probs.size),
+    )
     probabilities = probabilities[:total]
+    membership = membership[:total]
     candidate_probs = candidate_probs[:total]
-    labels = np.argmax(probabilities, axis=1)
-    discardable_index = SPEECH_ISLAND_SCORER_LABELS.index("discardable")
-    raw_frames = (labels != discardable_index).astype(np.int8)
-    retained_probabilities = 1.0 - probabilities[:, discardable_index]
+    membership_labels = np.argmax(membership, axis=1)
+    outside_index = SPEECH_ISLAND_MEMBERSHIP_LABELS.index("outside")
+    raw_frames = (membership_labels != outside_index).astype(np.int8)
+    retained_probabilities = 1.0 - membership[:, outside_index]
     coarse_segments = frames_to_segments(
         raw_frames,
         frame_hop_s=config.frame_hop_s,
@@ -668,8 +683,8 @@ def decode_semantic_speech_island_segments(
         dilated_frames=raw_frames.copy(),
         speech_on_threshold=None,
         speech_off_threshold=None,
-        decision_mode="argmax_semantic_or_unsure",
-        class_labels=SPEECH_ISLAND_SCORER_LABELS,
+        decision_mode="argmax_source_membership",
+        class_labels=SPEECH_ISLAND_MEMBERSHIP_LABELS,
     )
 
 
@@ -924,8 +939,11 @@ class SpeechBoundaryJaBackend:
         if semantic_v9:
             signature.update(
                 {
-                    "speech_threshold_mode": "argmax_semantic_or_unsure",
-                    "semantic_speech_labels": list(SPEECH_ISLAND_SCORER_LABELS),
+                    "speech_threshold_mode": "argmax_source_membership",
+                    "semantic_content_labels": list(SPEECH_ISLAND_SCORER_LABELS),
+                    "source_membership_labels": list(
+                        SPEECH_ISLAND_MEMBERSHIP_LABELS
+                    ),
                     "discardable_classes": [
                         "breath",
                         "moan",
@@ -1050,6 +1068,14 @@ class SpeechBoundaryJaBackend:
                 dtype=np.float64,
             )
             probability_count = np.zeros(total_frames, dtype=np.float32)
+            membership_probability_sum = (
+                np.zeros(
+                    (total_frames, len(SPEECH_ISLAND_MEMBERSHIP_LABELS)),
+                    dtype=np.float64,
+                )
+                if semantic_scorer
+                else None
+            )
             split_probability_sum = np.zeros(total_frames, dtype=np.float64)
             split_probability_count = np.zeros(total_frames, dtype=np.float32)
             semantic_projection_sum = (
@@ -1094,7 +1120,11 @@ class SpeechBoundaryJaBackend:
                         config=feature_config,
                     )
                 elif semantic_scorer:
-                    probs, semantic_projected = score_semantic_speech_outputs(
+                    (
+                        probs,
+                        membership_probs,
+                        semantic_projected,
+                    ) = score_semantic_speech_outputs(
                         scorer,
                         ptm=ptm,
                         mfcc=mfcc,
@@ -1130,6 +1160,10 @@ class SpeechBoundaryJaBackend:
                     continue
                 probability_sum[global_start:global_end] += probs[:local_end]
                 probability_count[global_start:global_end] += 1.0
+                if membership_probability_sum is not None:
+                    membership_probability_sum[global_start:global_end] += (
+                        membership_probs[:local_end]
+                    )
                 if semantic_projection_sum is not None:
                     semantic_projection_sum[global_start:global_end] += (
                         semantic_projected[:local_end]
@@ -1207,14 +1241,25 @@ class SpeechBoundaryJaBackend:
                 where=split_probability_count > 0,
             ).astype(np.float32)
             if semantic_scorer:
+                membership_probabilities = np.divide(
+                    membership_probability_sum,
+                    probability_denominator,
+                    out=np.zeros_like(
+                        membership_probability_sum, dtype=np.float64
+                    ),
+                    where=probability_coverage,
+                ).astype(np.float32)
                 decode = decode_semantic_speech_island_segments(
-                    class_probabilities=probabilities,
+                    content_class_probabilities=probabilities,
+                    membership_class_probabilities=membership_probabilities,
                     candidate_probabilities=candidate_probabilities,
                     duration_s=duration_s,
                     config=cfg,
                 )
-                discardable_index = SPEECH_ISLAND_SCORER_LABELS.index("discardable")
-                retained_probabilities = 1.0 - probabilities[:, discardable_index]
+                outside_index = SPEECH_ISLAND_MEMBERSHIP_LABELS.index("outside")
+                retained_probabilities = (
+                    1.0 - membership_probabilities[:, outside_index]
+                )
             else:
                 decode = decode_speech_island_segments(
                     speech_probabilities=probabilities,
@@ -1268,6 +1313,17 @@ class SpeechBoundaryJaBackend:
                     else 0.0
                     for index, label in enumerate(SPEECH_ISLAND_SCORER_LABELS)
                 }
+                predicted_membership = np.argmax(
+                    membership_probabilities, axis=1
+                )
+                params["semantic_source_membership_stats"] = {
+                    label: float((predicted_membership == index).mean())
+                    if predicted_membership.size
+                    else 0.0
+                    for index, label in enumerate(
+                        SPEECH_ISLAND_MEMBERSHIP_LABELS
+                    )
+                }
             if proposal_signature is not None:
                 params["proposal_checkpoint"] = proposal_signature
             if (
@@ -1315,6 +1371,9 @@ class SpeechBoundaryJaBackend:
                 params["frame_scores"] = [float(value) for value in retained_probabilities]
                 if semantic_scorer:
                     params["semantic_speech_class_probabilities"] = probabilities
+                    params["semantic_source_membership_probabilities"] = (
+                        membership_probabilities
+                    )
                 params["candidate_frame_scores"] = [float(value) for value in candidate_probabilities]
             return SegmentationResult(
                 segments=segments,

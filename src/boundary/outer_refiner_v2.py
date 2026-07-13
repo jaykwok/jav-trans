@@ -15,7 +15,7 @@ from boundary.ja.model import SPEECH_ISLAND_SCORER_LABELS
 OUTER_EDGE_REFINER_V2_SCHEMA = "outer_edge_refiner_v2"
 OUTER_EDGE_REFINER_V2_MODEL_ARCH = "full_island_semantic_edges_mamba_v1"
 OUTER_EDGE_REFINER_V2_RUNTIME_ADAPTER = "paired_outer_edges_v2"
-OUTER_EDGE_REFINER_V2_FEATURE_SCHEMA = "full_island_semantic_edge_features_v1"
+OUTER_EDGE_REFINER_V2_FEATURE_SCHEMA = "full_island_semantic_edge_features_v2"
 OUTER_EDGE_REFINER_V2_ARTIFACT = {
     "name": "outer_edge_refiner",
     "display_name": "Outer Edge Refiner",

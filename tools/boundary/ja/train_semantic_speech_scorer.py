@@ -44,6 +44,10 @@ def run(args: argparse.Namespace) -> None:
             discardable_weight=args.discardable_weight,
             semantic_target_weight=args.semantic_target_weight,
             unsure_weight=args.unsure_weight,
+            membership_outside_weight=args.membership_outside_weight,
+            membership_inside_weight=args.membership_inside_weight,
+            membership_unsure_weight=args.membership_unsure_weight,
+            membership_loss_weight=args.membership_loss_weight,
             focal_gamma=args.focal_gamma,
             max_train_frames=args.max_train_frames,
             max_eval_frames=args.max_eval_frames,
@@ -85,6 +89,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--discardable-weight", type=float, default=1.0)
     parser.add_argument("--semantic-target-weight", type=float, default=3.0)
     parser.add_argument("--unsure-weight", type=float, default=1.5)
+    parser.add_argument("--membership-outside-weight", type=float, default=1.0)
+    parser.add_argument("--membership-inside-weight", type=float, default=2.0)
+    parser.add_argument("--membership-unsure-weight", type=float, default=1.5)
+    parser.add_argument("--membership-loss-weight", type=float, default=1.0)
     parser.add_argument("--focal-gamma", type=float, default=2.0)
     parser.add_argument("--max-train-frames", type=int, default=1024)
     parser.add_argument("--max-eval-frames", type=int, default=1024)

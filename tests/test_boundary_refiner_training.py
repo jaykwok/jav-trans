@@ -48,7 +48,7 @@ def test_outer_v2_is_full_island_argmax_without_delta_cap() -> None:
     assert OUTER_EDGE_REFINER_V2_SCHEMA == "outer_edge_refiner_v2"
     assert OUTER_EDGE_REFINER_V2_MODEL_ARCH == "full_island_semantic_edges_mamba_v1"
     assert OUTER_EDGE_REFINER_V2_RUNTIME_ADAPTER == "paired_outer_edges_v2"
-    assert OUTER_EDGE_REFINER_V2_FEATURE_SCHEMA == "full_island_semantic_edge_features_v1"
+    assert OUTER_EDGE_REFINER_V2_FEATURE_SCHEMA == "full_island_semantic_edge_features_v2"
 
     prediction = decode_outer_edge_probabilities(
         _outer_probabilities(

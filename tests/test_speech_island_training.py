@@ -5,7 +5,7 @@ import pytest
 
 from boundary.ja.speech_train import _crop, _normalize
 from boundary.ja.dataset import LabelRecord
-from boundary.ja.semantic_speech_train import _class_indexes
+from boundary.ja.semantic_speech_train import _class_indexes, _membership_indexes
 from boundary.ja.model import SemanticSpeechScorerNetwork
 
 
@@ -37,7 +37,12 @@ def test_speech_training_normalization_uses_checkpoint_statistics() -> None:
     assert normalized[0].tolist() == pytest.approx([1.0, 2.0])
 
 
-def _record(*, semantic_frames=None) -> LabelRecord:
+def _record(*, semantic_frames=None, membership_frames=None) -> LabelRecord:
+    metadata = {}
+    if semantic_frames is not None:
+        metadata["semantic_class_frames"] = semantic_frames
+    if membership_frames is not None:
+        metadata["semantic_membership_frames"] = membership_frames
     return LabelRecord(
         audio_id="sample",
         source="test",
@@ -47,9 +52,7 @@ def _record(*, semantic_frames=None) -> LabelRecord:
         frame_hop_s=0.02,
         speech_frames=[0, 1, 1],
         label_quality="supervised",
-        boundary_metadata=(
-            {} if semantic_frames is None else {"semantic_class_frames": semantic_frames}
-        ),
+        boundary_metadata=metadata,
     )
 
 
@@ -61,6 +64,17 @@ def test_semantic_speech_v9_requires_explicit_three_class_frames() -> None:
         _record(
             semantic_frames=["discardable", "semantic_target", "unsure"]
         ),
+        total=3,
+    )
+    assert indexes.tolist() == [0, 1, 2]
+
+
+def test_semantic_speech_v9_requires_separate_source_membership_frames() -> None:
+    with pytest.raises(ValueError, match="must not be derived from content-class runs"):
+        _membership_indexes(_record(), total=3)
+
+    indexes = _membership_indexes(
+        _record(membership_frames=["outside", "inside", "unsure"]),
         total=3,
     )
     assert indexes.tolist() == [0, 1, 2]
@@ -93,3 +107,5 @@ def test_semantic_speech_v9_uses_trainable_full_ptm_projection() -> None:
     ptm[0, 0, 7] = 3.0
     projected = model.project_ptm(ptm)
     assert projected[0, 0, 0].item() == pytest.approx(3.0)
+    logits = model(ptm, torch.zeros((1, 1, 2)))
+    assert tuple(logits.shape) == (1, 1, 6)
