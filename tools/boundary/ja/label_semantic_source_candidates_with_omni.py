@@ -537,6 +537,11 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         with source_gate_path.open("a", encoding="utf-8") as handle:
             handle.write(json.dumps(gate, ensure_ascii=False) + "\n")
         source_gates[sample_id] = gate
+        print(
+            f"source_gate={len(source_gates)}/{len(selected)} "
+            f"sample_id={sample_id} label={gate['label']}",
+            flush=True,
+        )
     labels_path = output / "candidate_labels.jsonl"
     raw_path = output / "omni_raw_responses.jsonl"
     existing = {str(row["sample_id"]) for row in _rows(labels_path)}
@@ -671,6 +676,24 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 )
                 + "\n"
             )
+        existing.add(sample_id)
+        print(
+            f"candidate_labels={len(existing)}/{len(selected)} "
+            f"sample_id={sample_id} source_gate={source_gate['label']} "
+            f"request_mode={'propagated' if source_gate['label'] != 'contains_semantic' else args.request_mode}",
+            flush=True,
+        )
+    raw_rows = _rows(raw_path)
+    fallback_samples = sum(
+        1
+        for row in raw_rows
+        if dict(row.get("response") or {}).get("multi_audio_error")
+    )
+    single_request_samples = sum(
+        1
+        for row in raw_rows
+        if dict(row.get("response") or {}).get("request_mode") == "single"
+    )
     summary = {
         "schema": "semantic_source_candidate_teacher_summary_v2",
         "selected_samples": len(selected),
