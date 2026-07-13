@@ -72,6 +72,21 @@ def test_island_prompt_is_cut_eager_without_duration_rule() -> None:
     assert "短暂停顿、呼吸" not in teacher.SYSTEM_PROMPT
 
 
+def test_island_smoke_selection_uses_requested_duration_targets() -> None:
+    islands = [
+        {"island_id": f"i{duration}", "duration_s": float(duration), "candidates": [{}]}
+        for duration in (2, 5, 10, 15, 20, 25, 30, 45)
+    ]
+
+    selected = teacher.select_smoke_islands(
+        islands,
+        5,
+        target_durations_s=(15.0, 20.0, 25.0, 30.0, 45.0),
+    )
+
+    assert [row["duration_s"] for row in selected] == [15.0, 20.0, 25.0, 30.0, 45.0]
+
+
 def test_island_audit_shows_omni_and_current_markers(tmp_path: Path, monkeypatch) -> None:
     run = tmp_path / "run"
     request_audio = run / "request_audio" / "w__outer000.wav"
