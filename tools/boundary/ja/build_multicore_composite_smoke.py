@@ -42,46 +42,34 @@ def _write_jsonl(path: Path, rows: Iterable[dict[str, Any]]) -> None:
             handle.write(json.dumps(row, ensure_ascii=False) + "\n")
 
 
-def _load_span(path: Path, start_s: float, end_s: float) -> tuple[np.ndarray, int, int]:
+def _load_full_clip(path: Path) -> np.ndarray:
     audio, sample_rate = load_audio_16k_mono(str(path))
     if sample_rate != SAMPLE_RATE:
         raise ValueError(f"expected 16 kHz normalized audio: {path}")
-    start = max(0, int(round(start_s * sample_rate)))
-    end = min(len(audio), int(round(end_s * sample_rate)))
-    if end <= start:
-        raise ValueError(f"empty semantic span: {path} {start_s:.3f}-{end_s:.3f}")
-    return np.ascontiguousarray(audio[start:end], dtype=np.float32), start, end
+    if not len(audio):
+        raise ValueError(f"empty semantic core clip: {path}")
+    return np.ascontiguousarray(audio, dtype=np.float32)
 
 
-def load_semantic_cores(path: Path) -> list[dict[str, Any]]:
+def load_full_clip_semantic_cores(path: Path) -> list[dict[str, Any]]:
     cores: list[dict[str, Any]] = []
     for source in _rows(path):
-        units = {str(unit["unit_id"]): unit for unit in source["text_units"]}
-        for alignment in source["semantic_alignments"]:
-            if alignment["status"] != "matched":
-                continue
-            unit_id = str(alignment["unit_id"])
-            unit = units[unit_id]
-            audio, source_start_sample, source_end_sample = _load_span(
-                Path(source["audio"]),
-                float(alignment["start_s"]),
-                float(alignment["end_s"]),
-            )
-            cores.append(
-                {
-                    "core_id": f"{source['sample_id']}:{unit_id}",
-                    "source_sample_id": str(source["sample_id"]),
-                    "source_audio": str(source["audio"]),
-                    "source_start_s": source_start_sample / SAMPLE_RATE,
-                    "source_end_s": source_end_sample / SAMPLE_RATE,
-                    "teacher_start_s": float(alignment["start_s"]),
-                    "teacher_end_s": float(alignment["end_s"]),
-                    "source_start_sample": source_start_sample,
-                    "source_end_sample": source_end_sample,
-                    "text": str(unit["text"]),
-                    "audio": audio,
-                }
-            )
+        audio = _load_full_clip(Path(source["audio"]))
+        cores.append(
+            {
+                "core_id": f"{source['sample_id']}:full_clip",
+                "source_sample_id": str(source["sample_id"]),
+                "source_audio": str(source["audio"]),
+                "source": str(source.get("source") or ""),
+                "source_start_s": 0.0,
+                "source_end_s": len(audio) / SAMPLE_RATE,
+                "source_start_sample": 0,
+                "source_end_sample": int(len(audio)),
+                "text": str(source["reference_text"]),
+                "audio": audio,
+                "timing_source": "full_clip_sample_extent_v1",
+            }
+        )
     cores.sort(key=lambda row: row["core_id"])
     if not cores:
         raise ValueError("multi-core smoke requires matched semantic cores")
@@ -321,11 +309,13 @@ def _core_copy(core: dict[str, Any], *, start_sample: int, end_sample: int) -> d
         "start_s": start_sample / SAMPLE_RATE,
         "end_s": end_sample / SAMPLE_RATE,
         "source_audio": core["source_audio"],
+        "source": core.get("source"),
         "core_library_audio": core.get("core_library_audio"),
         "source_start_sample": core["source_start_sample"],
         "source_end_sample": core["source_end_sample"],
         "source_start_s": core["source_start_s"],
         "source_end_s": core["source_end_s"],
+        "timing_source": core["timing_source"],
     }
 
 
@@ -467,7 +457,7 @@ def _overlap_composite(
 
 def build_smoke(
     *,
-    semantic_labels: Path,
+    semantic_core_samples: Path,
     overlay_manifest: Path,
     gap_duration_pool: Path,
     snr_reference_manifest: Path,
@@ -475,7 +465,7 @@ def build_smoke(
     seed: int,
 ) -> dict[str, Any]:
     rng = np.random.default_rng(seed)
-    cores = load_semantic_cores(semantic_labels)
+    cores = load_full_clip_semantic_cores(semantic_core_samples)
     selected_cores = select_unique_recipe_cores(cores)
     output_dir.mkdir(parents=True, exist_ok=True)
     core_dir = output_dir / "semantic_cores"
@@ -500,8 +490,7 @@ def build_smoke(
                 "source_end_sample": core["source_end_sample"],
                 "source_start_s": core["source_start_s"],
                 "source_end_s": core["source_end_s"],
-                "teacher_start_s": core["teacher_start_s"],
-                "teacher_end_s": core["teacher_end_s"],
+                "timing_source": core["timing_source"],
             }
         )
     core_library_path = output_dir / "semantic_core_library.jsonl"
@@ -714,7 +703,8 @@ def build_smoke(
                 "duration_s": len(recipe["mixed"]) / SAMPLE_RATE,
                 "audit_focus": recipe["audit_focus"],
                 "sampling_axes": recipe["sampling_axes"],
-                "semantic_core_source": str(semantic_labels),
+                "semantic_core_source": str(semantic_core_samples),
+                "semantic_core_timing_contract": "full_clip_sample_extent_v1",
                 "overlay_manifest": str(overlay_manifest),
                 "overlay": recipe["overlay"],
                 **recipe["truth"],
@@ -757,6 +747,7 @@ def build_smoke(
         "all_semantic_cores_have_simultaneous_overlay": True,
         "semantic_core_library": str(core_library_path),
         "semantic_core_count": len(core_library_rows),
+        "semantic_core_timing_contract": "full_clip_sample_extent_v1",
         "selected_core_ids": used_core_ids,
         "selected_unique_core_count": len(core_use_counts),
         "max_core_use_count": max(core_use_counts.values()),
@@ -778,7 +769,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Build the fixed five-sample semantic Split/Inner additive-overlay smoke."
     )
-    parser.add_argument("--semantic-labels", required=True)
+    parser.add_argument("--semantic-core-samples", required=True)
     parser.add_argument("--overlay-manifest", required=True)
     parser.add_argument("--gap-duration-pool", required=True)
     parser.add_argument("--snr-reference-manifest", required=True)
@@ -792,7 +783,7 @@ if __name__ == "__main__":
     print(
         json.dumps(
             build_smoke(
-                semantic_labels=Path(args.semantic_labels),
+                semantic_core_samples=Path(args.semantic_core_samples),
                 overlay_manifest=Path(args.overlay_manifest),
                 gap_duration_pool=Path(args.gap_duration_pool),
                 snr_reference_manifest=Path(args.snr_reference_manifest),
