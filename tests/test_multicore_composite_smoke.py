@@ -223,8 +223,11 @@ def test_multicore_audit_keeps_split_and_inner_distinct(tmp_path: Path) -> None:
     assert "overlay 合格" in page
     assert "可听且无字幕语义" in page
     assert "不可听/过强/含清楚词语" in page
-    assert "Semantic Split" in page
-    assert "Inner edge" in page
+    assert "语义边界：应不应该分句" in page
+    assert "声学安全区：能不能真正切" in page
+    assert "绿色长条只是 core 的完整跨度，不是 Split 标签" in page
+    assert "safe/abstain 结论正确" in page
+    assert "语义上虽应分句，但波形不能安全切；保持单 chunk" in page
     assert "overlap abstain" in page
     assert "not_applicable" in page
     assert "semantic_split_multicore_additive_overlay_manual_verdict_v2" in page
