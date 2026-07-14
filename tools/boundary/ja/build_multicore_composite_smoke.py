@@ -23,8 +23,9 @@ from tools.boundary.ja.build_galgame_synthetic_timeline import (  # noqa: E402
 )
 
 
-SCHEMA = "semantic_split_multicore_composite_smoke_v1"
-SUMMARY_SCHEMA = "semantic_split_multicore_composite_smoke_summary_v1"
+SCHEMA = "semantic_split_multicore_additive_overlay_smoke_v2"
+SUMMARY_SCHEMA = "semantic_split_multicore_additive_overlay_smoke_summary_v2"
+OVERLAY_SCHEMA = "semantic_core_additive_overlay_v1"
 SAMPLE_RATE = 16000
 
 
@@ -101,6 +102,40 @@ def load_gap_quantiles(path: Path) -> dict[str, float]:
     }
 
 
+def load_snr_quantiles(path: Path) -> dict[str, Any]:
+    values: list[float] = []
+    with path.open("r", encoding="utf-8-sig") as handle:
+        for line in handle:
+            if not line.strip():
+                continue
+            row = json.loads(line)
+            detail = row.get("background_mix") or (row.get("augmentation") or {}).get(
+                "background_mix"
+            )
+            if (
+                not isinstance(detail, dict)
+                or detail.get("enabled") is False
+                or detail.get("skipped")
+            ):
+                continue
+            value = detail.get("snr_db")
+            if value is not None and np.isfinite(float(value)):
+                values.append(float(value))
+    if not values:
+        raise ValueError("SNR reference manifest has no enabled background mixes")
+    array = np.asarray(values, dtype=np.float64)
+    return {
+        "q15": float(np.quantile(array, 0.15)),
+        "q35": float(np.quantile(array, 0.35)),
+        "q50": float(np.quantile(array, 0.50)),
+        "q65": float(np.quantile(array, 0.65)),
+        "q85": float(np.quantile(array, 0.85)),
+        "source": str(path),
+        "count": int(array.size),
+        "derivation": "empirical_hardmix_background_snr_quantiles_v1",
+    }
+
+
 def _negative_matches(row: dict[str, Any], flags: set[str]) -> bool:
     values = {
         str(row.get("background_type") or "").lower(),
@@ -109,7 +144,7 @@ def _negative_matches(row: dict[str, Any], flags: set[str]) -> bool:
     return any(any(flag in value for value in values) for flag in flags)
 
 
-def select_negative_rows(
+def select_overlay_rows(
     path: Path, *, min_duration_s: float
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     rows = [
@@ -121,7 +156,10 @@ def select_negative_rows(
     ]
     music = sorted(
         (row for row in rows if _negative_matches(row, {"music", "bgm"})),
-        key=lambda row: str(row.get("audio_id") or row["audio"]),
+        key=lambda row: (
+            -float(row.get("duration_s") or 0.0),
+            str(row.get("audio_id") or row["audio"]),
+        ),
     )
     vocal = sorted(
         (
@@ -129,14 +167,20 @@ def select_negative_rows(
             for row in rows
             if _negative_matches(row, {"breathing", "moaning", "kissing"})
         ),
-        key=lambda row: str(row.get("audio_id") or row["audio"]),
+        key=lambda row: (
+            -float(row.get("duration_s") or 0.0),
+            str(row.get("audio_id") or row["audio"]),
+        ),
     )
     if len(music) < 2 or not vocal:
-        raise ValueError("negative manifest needs two music rows and one vocal row")
+        raise ValueError("overlay manifest needs two music rows and one vocal row")
     return [music[0], music[1], vocal[0]], {
         "manifest": str(path),
         "music_audio_ids": [str(music[0]["audio_id"]), str(music[1]["audio_id"])],
+        "music_durations_s": [float(music[0]["duration_s"]), float(music[1]["duration_s"])],
         "vocal_audio_id": str(vocal[0]["audio_id"]),
+        "vocal_duration_s": float(vocal[0]["duration_s"]),
+        "selection": "longest_train_assets_per_overlay_type_v1",
     }
 
 
@@ -146,13 +190,6 @@ def _rms(audio: np.ndarray) -> float:
     return float(np.sqrt(np.mean(np.square(audio.astype(np.float64, copy=False)))))
 
 
-def _scale_rms(audio: np.ndarray, target_rms: float) -> np.ndarray:
-    current = _rms(audio)
-    if current <= 1e-8 or target_rms <= 0.0:
-        return audio.astype(np.float32, copy=False)
-    return (audio * (target_rms / current)).astype(np.float32, copy=False)
-
-
 def _limit(audio: np.ndarray) -> np.ndarray:
     peak = float(np.max(np.abs(audio))) if audio.size else 0.0
     if peak > 0.98:
@@ -160,18 +197,103 @@ def _limit(audio: np.ndarray) -> np.ndarray:
     return np.ascontiguousarray(audio, dtype=np.float32)
 
 
-def _negative_audio(
+def _overlay_audio(
     row: dict[str, Any], *, duration_s: float, rng: np.random.Generator
-) -> np.ndarray:
+) -> tuple[np.ndarray, dict[str, Any]]:
     audio, sample_rate = load_audio_16k_mono(str(row["audio"]))
     if sample_rate != SAMPLE_RATE:
         raise ValueError("negative audio must normalize to 16 kHz")
-    values, _offset = crop_or_tile_audio(
+    values, offset = crop_or_tile_audio(
         audio,
         samples=max(1, int(round(duration_s * sample_rate))),
         rng=rng,
     )
-    return values
+    return values, {
+        "audio_id": str(row.get("audio_id") or Path(str(row["audio"])).stem),
+        "source_audio": str(row["audio"]),
+        "source_partition": str(row.get("source_partition") or "train"),
+        "background_type": str(row.get("background_type") or "unknown"),
+        "omni_flags": [str(value) for value in row.get("omni_flags") or []],
+        "source_offset_sample": int(offset),
+        "source_offset_s": offset / SAMPLE_RATE,
+        "source_sample_count": int(len(audio)),
+        "source_duration_s": len(audio) / SAMPLE_RATE,
+        "rendered_sample_count": int(len(values)),
+        "rendered_duration_s": len(values) / SAMPLE_RATE,
+        "tiled": bool(len(audio) < len(values)),
+    }
+
+
+def _semantic_rms(audio: np.ndarray, core_spans: list[dict[str, Any]]) -> float:
+    pieces = [
+        audio[int(core["start_sample"]) : int(core["end_sample"])]
+        for core in core_spans
+        if int(core["end_sample"]) > int(core["start_sample"])
+    ]
+    return _rms(np.concatenate(pieces)) if pieces else _rms(audio)
+
+
+def _mix_additive_overlay(
+    clean: np.ndarray,
+    overlay: np.ndarray,
+    *,
+    core_spans: list[dict[str, Any]],
+    target_snr_db: float,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, dict[str, Any]]:
+    clean = np.ascontiguousarray(clean, dtype=np.float32)
+    overlay = np.ascontiguousarray(overlay, dtype=np.float32)
+    if clean.shape != overlay.shape:
+        raise ValueError("clean and overlay audio must have identical sample counts")
+    semantic_rms = _semantic_rms(clean, core_spans)
+    source_overlay_rms = _rms(overlay)
+    if semantic_rms <= 1e-8 or source_overlay_rms <= 1e-8:
+        raise ValueError("clean semantic core and overlay must both have non-zero RMS")
+    target_overlay_rms = semantic_rms / (10.0 ** (target_snr_db / 20.0))
+    overlay_scale = target_overlay_rms / source_overlay_rms
+    scaled_overlay = overlay * overlay_scale
+    mix = clean + scaled_overlay
+    peak_before = float(np.max(np.abs(mix))) if mix.size else 0.0
+    limiter_gain = min(1.0, 0.98 / peak_before) if peak_before > 0.0 else 1.0
+    clean_component = np.ascontiguousarray(clean * limiter_gain, dtype=np.float32)
+    overlay_component = np.ascontiguousarray(scaled_overlay * limiter_gain, dtype=np.float32)
+    mixed = np.ascontiguousarray(clean_component + overlay_component, dtype=np.float32)
+    achieved_snr_db = 20.0 * np.log10(
+        _semantic_rms(clean_component, core_spans) / max(_rms(overlay_component), 1e-12)
+    )
+    return clean_component, overlay_component, mixed, {
+        "target_snr_db": float(target_snr_db),
+        "achieved_snr_db": float(achieved_snr_db),
+        "semantic_reference_rms": float(semantic_rms),
+        "source_overlay_rms": float(source_overlay_rms),
+        "overlay_scale": float(overlay_scale),
+        "mix_peak_before_limiter": peak_before,
+        "shared_limiter_gain": float(limiter_gain),
+    }
+
+
+def _switched_overlay(
+    first: np.ndarray,
+    second: np.ndarray,
+    *,
+    crossfade_s: float,
+) -> tuple[np.ndarray, dict[str, Any]]:
+    if first.shape != second.shape:
+        raise ValueError("switched overlays must have identical sample counts")
+    size = first.size
+    midpoint = size // 2
+    fade = min(max(1, int(round(crossfade_s * SAMPLE_RATE))), midpoint, size - midpoint)
+    start = midpoint - fade // 2
+    end = start + fade
+    bed = first.copy()
+    phase = np.linspace(0.0, np.pi / 2.0, fade, dtype=np.float32)
+    bed[start:end] = first[start:end] * np.cos(phase) + second[start:end] * np.sin(phase)
+    bed[end:] = second[end:]
+    return np.ascontiguousarray(bed, dtype=np.float32), {
+        "switch_sample": int(midpoint),
+        "switch_s": midpoint / SAMPLE_RATE,
+        "crossfade_sample_count": int(fade),
+        "crossfade_s": fade / SAMPLE_RATE,
+    }
 
 
 def _core_copy(core: dict[str, Any], *, start_sample: int, end_sample: int) -> dict[str, Any]:
@@ -327,39 +449,12 @@ def _overlap_composite(
     }
 
 
-def _background_switch(
-    signal: np.ndarray,
-    first: np.ndarray,
-    second: np.ndarray,
-    *,
-    crossfade_s: float,
-    snr_db: float,
-) -> tuple[np.ndarray, dict[str, Any]]:
-    size = signal.size
-    first = np.resize(first, size).astype(np.float32, copy=False)
-    second = np.resize(second, size).astype(np.float32, copy=False)
-    midpoint = size // 2
-    fade = min(max(1, int(round(crossfade_s * SAMPLE_RATE))), midpoint, size - midpoint)
-    start = midpoint - fade // 2
-    end = start + fade
-    bed = first.copy()
-    phase = np.linspace(0.0, np.pi / 2.0, fade, dtype=np.float32)
-    bed[start:end] = first[start:end] * np.cos(phase) + second[start:end] * np.sin(phase)
-    bed[end:] = second[end:]
-    target = _rms(signal) / (10.0 ** (snr_db / 20.0))
-    bed = _scale_rms(bed, target)
-    return _limit(signal + bed), {
-        "switch_s": midpoint / SAMPLE_RATE,
-        "crossfade_s": fade / SAMPLE_RATE,
-        "snr_db": snr_db,
-    }
-
-
 def build_smoke(
     *,
     semantic_labels: Path,
-    negative_manifest: Path,
+    overlay_manifest: Path,
     gap_duration_pool: Path,
+    snr_reference_manifest: Path,
     output_dir: Path,
     seed: int,
 ) -> dict[str, Any]:
@@ -395,11 +490,12 @@ def build_smoke(
     core_library_path = output_dir / "semantic_core_library.jsonl"
     _write_jsonl(core_library_path, core_library_rows)
     quantiles = load_gap_quantiles(gap_duration_pool)
-    negative_rows, negative_selection = select_negative_rows(
-        negative_manifest,
+    overlay_rows, overlay_selection = select_overlay_rows(
+        overlay_manifest,
         min_duration_s=quantiles["q50"],
     )
-    music_a, music_b, vocal = negative_rows
+    snr_quantiles = load_snr_quantiles(snr_reference_manifest)
+    music_a, music_b, vocal = overlay_rows
     core_rms = float(np.median([_rms(core["audio"]) for core in cores]))
     longest_index = max(range(len(cores)), key=lambda index: len(cores[index]["audio"]))
     long_core = cores[longest_index]
@@ -423,149 +519,196 @@ def build_smoke(
         max(core_rms * 0.006, 1e-6),
         max(1, int(round(quantiles["q25"] * SAMPLE_RATE))),
     ).astype(np.float32)
-    music_gap = _scale_rms(
-        _negative_audio(music_a, duration_s=quantiles["q50"], rng=rng),
-        core_rms * 0.35,
-    )
-    vocal_gap = _scale_rms(
-        _negative_audio(vocal, duration_s=quantiles["q50"], rng=rng),
-        core_rms * 0.65,
-    )
+    long_room = rng.normal(
+        0.0,
+        max(core_rms * 0.006, 1e-6),
+        max(1, int(round(quantiles["q50"] * SAMPLE_RATE))),
+    ).astype(np.float32)
 
-    recipes: list[tuple[str, str, np.ndarray, dict[str, Any], dict[str, Any]]] = []
-    audio, truth = _safe_composite(
-        sample_id="mc01_silence_safe",
+    recipes: list[dict[str, Any]] = []
+
+    def add_overlay_recipe(
+        *,
+        sample_id: str,
+        focus: str,
+        clean: np.ndarray,
+        truth: dict[str, Any],
+        axes: dict[str, Any],
+        source_rows: list[dict[str, Any]],
+        snr_quantile: str,
+        switch: bool = False,
+    ) -> None:
+        source_details: list[dict[str, Any]] = []
+        beds: list[np.ndarray] = []
+        for source_row in source_rows:
+            bed, source_detail = _overlay_audio(
+                source_row,
+                duration_s=len(clean) / SAMPLE_RATE,
+                rng=rng,
+            )
+            beds.append(bed)
+            source_details.append(source_detail)
+        switch_detail = None
+        if switch:
+            overlay, switch_detail = _switched_overlay(
+                beds[0],
+                beds[1],
+                crossfade_s=quantiles["q25"],
+            )
+        else:
+            overlay = beds[0]
+        clean_component, overlay_component, mixed, mix_detail = _mix_additive_overlay(
+            clean,
+            overlay,
+            core_spans=truth["core_spans"],
+            target_snr_db=float(snr_quantiles[snr_quantile]),
+        )
+        recipes.append(
+            {
+                "sample_id": sample_id,
+                "audit_focus": focus,
+                "clean": clean_component,
+                "overlay_audio": overlay_component,
+                "mixed": mixed,
+                "truth": truth,
+                "sampling_axes": {
+                    **axes,
+                    "overlay_axis": "switch" if switch else "continuous",
+                    "snr_quantile": snr_quantile,
+                },
+                "overlay": {
+                    "schema": OVERLAY_SCHEMA,
+                    "mode": "additive_full_duration",
+                    "start_sample": 0,
+                    "end_sample": int(len(clean)),
+                    "start_s": 0.0,
+                    "end_s": len(clean) / SAMPLE_RATE,
+                    "sources": source_details,
+                    "snr_reference": {
+                        "quantile": snr_quantile,
+                        "manifest": str(snr_reference_manifest),
+                        "derivation": snr_quantiles["derivation"],
+                    },
+                    "mix": mix_detail,
+                    "switch": switch_detail,
+                    "semantic_timeline_effect": "none",
+                    "overlay_transitions_create_semantic_events": False,
+                },
+            }
+        )
+
+    clean, truth = _safe_composite(
+        sample_id="ov01_music_over_two_core_safe",
         cores=[medium_left, medium_right],
         gaps=[("low_room_tone", silence, {"duration_quantile": "q25"})],
     )
-    recipes.append(
-        (
-            "mc01_silence_safe",
-            "两个独立 semantic cores，中间为低 room tone；Split 应 cut，Inner 应给连续 safe gap。",
-            audio,
-            truth,
-            {"core_count": 2, "gap_axis": "low_room_tone", "speaker_axis": "cross_source"},
-        )
+    add_overlay_recipe(
+        sample_id="ov01_music_over_two_core_safe",
+        focus="BGM 与两个 semantic cores 全程同时可听；core 语义必须完整，gap 仍是可移除的 semantic-safe 区间。",
+        clean=clean,
+        truth=truth,
+        axes={"core_count": 2, "gap_axis": "low_room_tone", "speaker_axis": "cross_source"},
+        source_rows=[music_a],
+        snr_quantile="q85",
     )
 
-    audio, truth = _safe_composite(
-        sample_id="mc02_music_gap_three_core",
+    clean, truth = _safe_composite(
+        sample_id="ov02_music_over_three_core_two_safe",
         cores=[short_core, medium_left, medium_right],
         gaps=[
-            (
-                "music",
-                music_gap,
-                {
-                    "duration_quantile": "q50",
-                    "audio_id": music_a["audio_id"],
-                    "source_audio": music_a["audio"],
-                },
-            ),
+            ("low_room_tone", long_room, {"duration_quantile": "q50"}),
             ("low_room_tone", short_room, {"duration_quantile": "q25"}),
         ],
     )
-    recipes.append(
-        (
-            "mc02_music_gap_three_core",
-            "三个独立 cores，分别由真实 music gap 与低 room tone 分隔；验证多 event 与两段 safe gap。",
-            audio,
-            truth,
-            {"core_count": 3, "gap_axis": "music+room", "speaker_axis": "cross_source"},
-        )
+    add_overlay_recipe(
+        sample_id="ov02_music_over_three_core_two_safe",
+        focus="BGM 覆盖三个 semantic cores 与两个 gap；两个 Split events 都来自语义 core 关系，而不是背景变化。",
+        clean=clean,
+        truth=truth,
+        axes={"core_count": 3, "gap_axis": "two_room_gaps", "speaker_axis": "cross_source"},
+        source_rows=[music_b],
+        snr_quantile="q50",
     )
 
-    audio, truth = _safe_composite(
-        sample_id="mc03_nonsemantic_vocal_gap",
+    clean, truth = _safe_composite(
+        sample_id="ov03_vocal_over_two_core_safe",
         cores=[medium_right, short_core],
-        gaps=[
-            (
-                "nonsemantic_vocal",
-                vocal_gap,
-                {
-                    "duration_quantile": "q50",
-                    "audio_id": vocal["audio_id"],
-                    "background_type": vocal.get("background_type"),
-                    "source_audio": vocal["audio"],
-                },
-            )
-        ],
+        gaps=[("low_room_tone", long_room, {"duration_quantile": "q50"})],
     )
-    recipes.append(
-        (
-            "mc03_nonsemantic_vocal_gap",
-            "两个独立 cores，中间为真实 definite-drop 呼吸/呻吟；按产品语义应移除，但必须人工确认无清楚词语。",
-            audio,
-            truth,
-            {"core_count": 2, "gap_axis": "nonsemantic_vocal", "speaker_axis": "cross_source"},
-        )
+    add_overlay_recipe(
+        sample_id="ov03_vocal_over_two_core_safe",
+        focus="definite-drop 呼吸/呻吟与两个 semantic cores 同时可听；不得把它当字幕语义，且不能遮坏清楚台词。",
+        clean=clean,
+        truth=truth,
+        axes={"core_count": 2, "gap_axis": "room_under_vocal_overlay", "speaker_axis": "cross_source"},
+        source_rows=[vocal],
+        snr_quantile="q15",
     )
 
-    audio, truth = _overlap_composite(
-        sample_id="mc04_overlap_abstain",
+    clean, truth = _overlap_composite(
+        sample_id="ov04_music_over_overlap_abstain",
         left=medium_left,
         right=medium_right,
         overlap_s=0.18,
     )
-    recipes.append(
-        (
-            "mc04_overlap_abstain",
-            "两个独立 cores 发生 equal-power overlap；Split 语义上应 cut，但 Inner 必须 abstain 并保持单 chunk。",
-            audio,
-            truth,
-            {"core_count": 2, "gap_axis": "overlap", "speaker_axis": "cross_source"},
-        )
+    add_overlay_recipe(
+        sample_id="ov04_music_over_overlap_abstain",
+        focus="两个 semantic cores 在 BGM 下发生重叠；Split 有语义 event，但 Inner 无安全区，必须 abstain。",
+        clean=clean,
+        truth=truth,
+        axes={"core_count": 2, "gap_axis": "overlap", "speaker_axis": "cross_source"},
+        source_rows=[music_a],
+        snr_quantile="q65",
     )
 
     single = np.asarray(long_core["audio"], dtype=np.float32)
-    bg_a = _negative_audio(music_a, duration_s=len(single) / SAMPLE_RATE, rng=rng)
-    bg_b = _negative_audio(music_b, duration_s=len(single) / SAMPLE_RATE, rng=rng)
-    audio, bg_detail = _background_switch(
-        single,
-        bg_a,
-        bg_b,
-        crossfade_s=quantiles["q25"],
-        snr_db=12.0,
-    )
     truth = {
         "core_spans": [_core_copy(long_core, start_sample=0, end_sample=len(single))],
         "gap_spans": [],
         "semantic_events": [],
         "continue_control": True,
-        "background_switch": {
-            **bg_detail,
-            "first_audio_id": music_a["audio_id"],
-            "second_audio_id": music_b["audio_id"],
-        },
     }
-    recipes.append(
-        (
-            "mc05_single_core_bgm_switch_continue",
-            "单一 maximal semantic core 内连续 BGM 发生 crossfade 切换；所有候选均应 continue，不得把背景变化当语义边界。",
-            audio,
-            truth,
-            {"core_count": 1, "gap_axis": "bgm_switch_inside_core", "speaker_axis": "single_source"},
-        )
+    add_overlay_recipe(
+        sample_id="ov05_bgm_switch_over_single_core_continue",
+        focus="单一 maximal semantic core 与两种 BGM 同时可听；BGM crossfade 不得产生 Split event。",
+        clean=single,
+        truth=truth,
+        axes={"core_count": 1, "gap_axis": "none", "speaker_axis": "single_source"},
+        source_rows=[music_a, music_b],
+        snr_quantile="q35",
+        switch=True,
     )
 
-    audio_dir = output_dir / "audio"
-    audio_dir.mkdir(parents=True, exist_ok=True)
+    clean_dir = output_dir / "audio" / "clean"
+    overlay_dir = output_dir / "audio" / "overlay"
+    mixed_dir = output_dir / "audio" / "mixed"
+    for directory in (clean_dir, overlay_dir, mixed_dir):
+        directory.mkdir(parents=True, exist_ok=True)
     manifest_rows: list[dict[str, Any]] = []
-    for sample_id, focus, audio, truth, axes in recipes:
-        audio_path = audio_dir / f"{sample_id}.wav"
-        sf.write(str(audio_path), audio, SAMPLE_RATE, subtype="PCM_16")
+    for recipe in recipes:
+        sample_id = str(recipe["sample_id"])
+        clean_path = clean_dir / f"{sample_id}.wav"
+        overlay_path = overlay_dir / f"{sample_id}.wav"
+        mixed_path = mixed_dir / f"{sample_id}.wav"
+        sf.write(str(clean_path), recipe["clean"], SAMPLE_RATE, subtype="PCM_16")
+        sf.write(str(overlay_path), recipe["overlay_audio"], SAMPLE_RATE, subtype="PCM_16")
+        sf.write(str(mixed_path), recipe["mixed"], SAMPLE_RATE, subtype="PCM_16")
         manifest_rows.append(
             {
                 "schema": SCHEMA,
                 "sample_id": sample_id,
-                "audio": str(audio_path),
+                "clean_audio": str(clean_path),
+                "overlay_audio": str(overlay_path),
+                "mixed_audio": str(mixed_path),
                 "sample_rate": SAMPLE_RATE,
-                "sample_count": int(len(audio)),
-                "duration_s": len(audio) / SAMPLE_RATE,
-                "audit_focus": focus,
-                "sampling_axes": axes,
+                "sample_count": int(len(recipe["mixed"])),
+                "duration_s": len(recipe["mixed"]) / SAMPLE_RATE,
+                "audit_focus": recipe["audit_focus"],
+                "sampling_axes": recipe["sampling_axes"],
                 "semantic_core_source": str(semantic_labels),
-                "negative_manifest": str(negative_manifest),
-                **truth,
+                "overlay_manifest": str(overlay_manifest),
+                "overlay": recipe["overlay"],
+                **recipe["truth"],
             }
         )
     manifest_path = output_dir / "multicore_composite_smoke.jsonl"
@@ -589,7 +732,11 @@ def build_smoke(
         ),
         "continue_control_count": sum(bool(row["continue_control"]) for row in manifest_rows),
         "gap_duration_quantiles": quantiles,
-        "negative_selection": negative_selection,
+        "snr_quantiles": snr_quantiles,
+        "target_snr_quantiles": [row["sampling_axes"]["snr_quantile"] for row in manifest_rows],
+        "overlay_selection": overlay_selection,
+        "overlay_mode": "additive_full_duration",
+        "all_semantic_cores_have_simultaneous_overlay": True,
         "semantic_core_library": str(core_library_path),
         "semantic_core_count": len(core_library_rows),
         "coordinate_contract": "dual_coordinates_float_seconds_model_interface_exact_sample_offsets_v1",
@@ -606,11 +753,12 @@ def build_smoke(
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Build the fixed five-sample semantic Split/Inner multi-core composition smoke."
+        description="Build the fixed five-sample semantic Split/Inner additive-overlay smoke."
     )
     parser.add_argument("--semantic-labels", required=True)
-    parser.add_argument("--negative-manifest", required=True)
+    parser.add_argument("--overlay-manifest", required=True)
     parser.add_argument("--gap-duration-pool", required=True)
+    parser.add_argument("--snr-reference-manifest", required=True)
     parser.add_argument("--output-dir", required=True)
     parser.add_argument("--seed", type=int, default=20260714)
     return parser.parse_args()
@@ -622,8 +770,9 @@ if __name__ == "__main__":
         json.dumps(
             build_smoke(
                 semantic_labels=Path(args.semantic_labels),
-                negative_manifest=Path(args.negative_manifest),
+                overlay_manifest=Path(args.overlay_manifest),
                 gap_duration_pool=Path(args.gap_duration_pool),
+                snr_reference_manifest=Path(args.snr_reference_manifest),
                 output_dir=Path(args.output_dir),
                 seed=int(args.seed),
             ),
