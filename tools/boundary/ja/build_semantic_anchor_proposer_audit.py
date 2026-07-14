@@ -82,18 +82,25 @@ def adaptive_event_regions(row: dict[str, Any]) -> list[dict[str, Any]]:
         if event.get("status") == "matched"
     ]
     anchors = [
-        (float(event["interval_start_s"]) + float(event["interval_end_s"])) / 2.0
+        float(event["coarse_anchor_s"])
+        if event.get("coarse_anchor_s") is not None
+        else (
+            float(event["interval_start_s"]) + float(event["interval_end_s"])
+        )
+        / 2.0
         for event in events
     ]
+    blockers = sorted(
+        float(item["time_s"]) for item in row.get("region_blocker_anchors") or []
+    )
+    all_anchors = sorted([*anchors, *blockers])
     duration_s = float(row["duration_s"])
     result: list[dict[str, Any]] = []
     for index, (event, anchor_s) in enumerate(zip(events, anchors, strict=True)):
-        region_start_s = 0.0 if index == 0 else (anchors[index - 1] + anchor_s) / 2.0
-        region_end_s = (
-            duration_s
-            if index + 1 == len(events)
-            else (anchor_s + anchors[index + 1]) / 2.0
-        )
+        previous = max((value for value in all_anchors if value < anchor_s), default=None)
+        following = min((value for value in all_anchors if value > anchor_s), default=None)
+        region_start_s = 0.0 if previous is None else (previous + anchor_s) / 2.0
+        region_end_s = duration_s if following is None else (anchor_s + following) / 2.0
         if not 0.0 <= region_start_s < region_end_s <= duration_s:
             raise ValueError(f"invalid adaptive event region for {row['sample_id']}")
         result.append(
@@ -102,7 +109,7 @@ def adaptive_event_regions(row: dict[str, Any]) -> list[dict[str, Any]]:
                 "coarse_anchor_s": anchor_s,
                 "region_start_s": region_start_s,
                 "region_end_s": region_end_s,
-                "region_contract": "adjacent_semantic_anchor_midpoints_with_source_edges_v1",
+                "region_contract": "adjacent_semantic_or_blocker_anchor_midpoints_with_source_edges_v2",
             }
         )
     return result
@@ -352,6 +359,18 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         labels = [by_id[sample_id] for sample_id in selected_ids]
     if not labels:
         raise ValueError("no semantic timeline labels selected")
+    requested_event_keys = set(args.event_key or [])
+    if requested_event_keys:
+        labels = [
+            row
+            for row in labels
+            if any(
+                f"{row['sample_id']}__{event['event_id']}" in requested_event_keys
+                for event in row.get("semantic_events") or []
+            )
+        ]
+        if not labels:
+            raise ValueError("no requested semantic events found")
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     projection_path = Path(args.ptm_projection)
@@ -389,6 +408,9 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         )[0]
         units = {item["unit_id"]: item for item in row["text_units"]}
         for event in adaptive_event_regions(row):
+            event_key = f"{row['sample_id']}__{event['event_id']}"
+            if requested_event_keys and event_key not in requested_event_keys:
+                continue
             frames = select_stratified_proposer_frames(
                 probabilities,
                 region_start_s=float(event["region_start_s"]),
@@ -409,7 +431,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             event_rows.append(
                 {
                     "schema": SCHEMA,
-                    "event_key": f"{row['sample_id']}__{event['event_id']}",
+                    "event_key": event_key,
                     "sample_id": str(row["sample_id"]),
                     "event_id": str(event["event_id"]),
                     "audio": str(row["audio"]),
@@ -477,6 +499,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--proposer-checkpoint", required=True)
     parser.add_argument("--ptm-projection", default=str(DEFAULT_PROJECTION))
     parser.add_argument("--sample-id", action="append", default=[])
+    parser.add_argument("--event-key", action="append", default=[])
     parser.add_argument("--candidate-count", type=int, default=9)
     parser.add_argument("--ptm", default=QWEN_ASR_17B_REPO_ID)
     parser.add_argument("--model-path", required=True)
