@@ -45,8 +45,8 @@ from tools.boundary.ja.label_semantic_source_candidates_with_omni import (  # no
 )
 
 
-SCHEMA = "semantic_anchor_learned_proposer_audit_v1"
-SUMMARY_SCHEMA = "semantic_anchor_learned_proposer_audit_summary_v1"
+SCHEMA = "semantic_anchor_learned_proposer_audit_v2"
+SUMMARY_SCHEMA = "semantic_anchor_learned_proposer_audit_summary_v2"
 DEFAULT_PROJECTION = PROJECT_ROOT / (
     "src/checkpoints/jaykwok-Qwen3-ASR-1.7B-JA-Anime-Galgame-hf/"
     "semantic_split_model_v2.jaykwok-Qwen3-ASR-1.7B-JA-Anime-Galgame-hf."
@@ -249,16 +249,35 @@ def _materialize_audio(rows: list[dict[str, Any]], output_dir: Path) -> None:
         row["region_audio"] = str(original)
         for candidate in row["candidates"]:
             marker = int(round(float(candidate["time_s"]) * sample_rate)) - region_start
-            marked = np.concatenate(
-                (
-                    region[:marker],
-                    np.zeros(sample_rate, dtype=np.float32),
-                    region[marker:],
+            marker = max(0, min(marker, region.size))
+            left_path = event_dir / f"{candidate['candidate_id']}__left.wav"
+            right_path = event_dir / f"{candidate['candidate_id']}__right.wav"
+            tick_path = event_dir / f"{candidate['candidate_id']}__tick.wav"
+            _write_wav(left_path, region[:marker], sample_rate)
+            _write_wav(right_path, region[marker:], sample_rate)
+
+            # The tick locates the candidate without shifting the waveform.
+            # Hard left/right previews remain the actual label evidence.
+            tick_audio = np.array(region, copy=True)
+            tick_samples = max(1, int(round(0.012 * sample_rate)))
+            tick_start = max(0, min(marker - tick_samples // 2, tick_audio.size))
+            tick_end = min(tick_audio.size, tick_start + tick_samples)
+            if tick_end > tick_start:
+                phase = np.arange(tick_end - tick_start, dtype=np.float32) / sample_rate
+                envelope = np.hanning((tick_end - tick_start) * 2)[
+                    : tick_end - tick_start
+                ].astype(np.float32)
+                tick = 0.18 * np.sin(2.0 * np.pi * 1800.0 * phase) * envelope
+                tick_audio[tick_start:tick_end] = np.clip(
+                    tick_audio[tick_start:tick_end] + tick, -1.0, 1.0
                 )
+            _write_wav(tick_path, tick_audio, sample_rate)
+            candidate["left_audio"] = str(left_path)
+            candidate["right_audio"] = str(right_path)
+            candidate["tick_audio"] = str(tick_path)
+            candidate["preview_contract"] = (
+                "hard_left_end_plus_hard_right_start_with_noninserting_tick_v1"
             )
-            path = event_dir / f"{candidate['candidate_id']}__marked.wav"
-            _write_wav(path, marked, sample_rate)
-            candidate["marked_audio"] = str(path)
 
 
 def _relative_copy(path: Path, *, audit_dir: Path, destination: Path) -> str:
@@ -286,32 +305,34 @@ def build_audit_html(
         )
         copied["candidates"] = []
         for candidate in row["candidates"]:
-            copied["candidates"].append(
-                {
-                    **candidate,
-                    "marked_audio": _relative_copy(
-                        Path(candidate["marked_audio"]),
-                        audit_dir=audit_dir,
-                        destination=(
-                            audit_dir
-                            / "audio"
-                            / event_key
-                            / f"{candidate['candidate_id']}__marked.wav"
-                        ),
+            copied_candidate = dict(candidate)
+            for field, suffix in (
+                ("left_audio", "left.wav"),
+                ("right_audio", "right.wav"),
+                ("tick_audio", "tick.wav"),
+            ):
+                copied_candidate[field] = _relative_copy(
+                    Path(candidate[field]),
+                    audit_dir=audit_dir,
+                    destination=(
+                        audit_dir
+                        / "audio"
+                        / event_key
+                        / f"{candidate['candidate_id']}__{suffix}"
                     ),
-                }
-            )
+                )
+            copied["candidates"].append(copied_candidate)
         payload_rows.append(copied)
 
     payload = json.dumps(payload_rows, ensure_ascii=False).replace("</", "<\\/")
     page = f"""<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Semantic Anchor Learned-Proposer Audit</title>
 <style>body{{margin:0;background:#f3f5f7;color:#20242a;font-family:Segoe UI,Arial,sans-serif}}header{{position:sticky;top:0;z-index:5;background:#fff;border-bottom:1px solid #cbd2da;padding:12px 18px}}main{{max-width:1180px;margin:18px auto;padding:0 14px}}article,.help{{background:#fff;border:1px solid #cbd2da;border-radius:8px;padding:15px;margin:0 0 16px}}article.done{{border-left:6px solid #1b7a3a}}.help{{border-left:6px solid #1769aa}}.texts{{display:grid;grid-template-columns:1fr 1fr;gap:10px}}.text{{background:#f6f8fa;border:1px solid #d7dde3;border-radius:6px;padding:10px}}audio{{width:100%}}table{{width:100%;border-collapse:collapse}}th,td{{border:1px solid #d6dce3;padding:7px;vertical-align:top}}button,textarea{{font:inherit}}button{{padding:6px 9px;margin:2px}}button.active{{background:#1769aa;color:#fff}}button.safe.active{{background:#1b7a3a}}button.unsure.active{{background:#9a6700}}textarea{{width:100%;min-height:55px;box-sizing:border-box}}code{{background:#eef1f4;padding:2px 4px;border-radius:3px}}small{{color:#59616a}}@media(max-width:760px){{.texts{{grid-template-columns:1fr}}table{{font-size:12px}}}}</style></head><body>
-<header><strong>Semantic Anchor → Learned Proposer 候选审计</strong>　<button id="save">保存全部裁决</button> <span id="status"></span></header><main><section class="help"><h2>这页只验证候选覆盖，不审 Omni 浮点秒数</h2><p>Omni 时间只作为粗锚点。候选来自 full PTM2048 经 repo-bound 任务学习型 <code>Linear(2048→128)</code> 投影后训练的 Proposer；不是 PCA、不是前 128 截断、不是能量最低点规则。每个音频在候选处插入 1 秒静音。</p><p><b>切早：</b>左侧语义还没说完；<b>安全：</b>左侧已经完整结束且右侧尚未开始；<b>切晚：</b>右侧语义已经开始；<b>不确定：</b>重叠、连续语音或听不清。一个 event 至少出现一个人工 safe，才算候选覆盖。</p></section><div id="list"></div></main><script>
-const rows={payload};const key='semantic-anchor-learned-proposer-audit-v1:'+location.pathname;const ann=JSON.parse(localStorage.getItem(key)||'{{}}');let active=null;
+<header><strong>Semantic Anchor → Learned Proposer 候选审计</strong>　<button id="save">保存全部裁决</button> <span id="status"></span></header><main><section class="help"><h2>这页只验证候选覆盖，不审 Omni 浮点秒数</h2><p>Omni 时间只作为粗锚点。候选来自 full PTM2048 经 repo-bound 任务学习型 <code>Linear(2048→128)</code> 投影后训练的 Proposer；不是 PCA、不是前 128 截断、不是能量最低点规则。</p><p>试听不再插入 1 秒静音：<b>左侧硬截断</b>精确结束在候选点，<b>右侧硬起播</b>精确从候选点开始；<b>定位 tick</b>只在原邻域叠加 12ms 短音，不改变时间轴，也不作为裁决依据。</p><p><b>切早：</b>左侧语义还没说完；<b>安全：</b>左侧已经完整结束且右侧尚未开始；<b>切晚：</b>右侧语义已经开始；<b>不确定：</b>重叠、连续语音或听不清。一个 event 至少出现一个人工 safe，才算候选覆盖。</p></section><div id="list"></div></main><script>
+const rows={payload};const key='semantic-anchor-learned-proposer-audit-v2:'+location.pathname;const ann=JSON.parse(localStorage.getItem(key)||'{{}}');let active=null;
 function esc(s){{return String(s??'').replace(/[&<>"']/g,c=>({{'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}}[c]));}}function ensure(r){{ann[r.event_key]??={{labels:{{}},note:''}};return ann[r.event_key];}}function persist(){{localStorage.setItem(key,JSON.stringify(ann));status();}}function complete(r,a){{return r.candidates.every(c=>a.labels[c.candidate_id]);}}function covered(r,a){{return Object.values(a.labels).includes('safe');}}function status(){{const done=rows.filter(r=>complete(r,ensure(r))).length,cover=rows.filter(r=>covered(r,ensure(r))).length;document.getElementById('status').textContent=`逐候选完成 ${{done}}/${{rows.length}} · safe覆盖 ${{cover}}/${{rows.length}}`;}}function play(el){{if(active&&active!==el)active.pause();active=el;}}
 function choice(a,c,label,text,cls=''){{return `<button data-cid="${{c.candidate_id}}" data-label="${{label}}" class="${{cls}} ${{a.labels[c.candidate_id]===label?'active':''}}">${{text}}</button>`;}}
-function render(){{const root=document.getElementById('list');root.innerHTML='';for(const r of rows){{const a=ensure(r),card=document.createElement('article');if(complete(r,a))card.classList.add('done');const candidates=r.candidates.map(c=>`<tr><td><b>${{esc(c.candidate_id)}}</b><br>${{Number(c.time_s).toFixed(3)}}s<br><small>p=${{Number(c.proposer_probability).toFixed(4)}}</small></td><td><audio controls preload="metadata" src="${{esc(c.marked_audio)}}"></audio></td><td>${{choice(a,c,'left_clipped','切早')}}${{choice(a,c,'safe','安全','safe')}}${{choice(a,c,'right_clipped','切晚')}}${{choice(a,c,'unsure','不确定','unsure')}}</td></tr>`).join('');card.innerHTML=`<h2>${{esc(r.event_key)}}</h2><div class="texts"><div class="text"><b>左侧应完整保留</b><br>${{esc(r.left_text)}}</div><div class="text"><b>右侧应完整保留</b><br>${{esc(r.right_text)}}</div></div><p><b>粗锚点：</b>${{Number(r.coarse_anchor_s).toFixed(3)}}s；<b>自适应邻域：</b>${{Number(r.region_start_s).toFixed(3)}}–${{Number(r.region_end_s).toFixed(3)}}s</p><small>projection SHA256=${{esc(r.projection_file_sha256)}}<br>proposer SHA256=${{esc(r.proposer_sha256)}}</small><p><b>完整 source</b></p><audio controls preload="metadata" src="${{esc(r.full_audio)}}"></audio><p><b>未插静音的当前邻域</b></p><audio controls preload="metadata" src="${{esc(r.region_audio)}}"></audio><table><thead><tr><th>候选</th><th>插入 1 秒静音试听</th><th>人工标签</th></tr></thead><tbody>${{candidates}}</tbody></table><label><b>备注</b><textarea>${{esc(a.note)}}</textarea></label>`;card.querySelectorAll('audio').forEach(x=>x.onplay=()=>play(x));card.querySelectorAll('[data-cid]').forEach(b=>b.onclick=()=>{{a.labels[b.dataset.cid]=b.dataset.label;a.updated_at=new Date().toISOString();persist();render();}});card.querySelector('textarea').onchange=e=>{{a.note=e.target.value;a.updated_at=new Date().toISOString();persist();}};root.appendChild(card);}}status();}}
-document.getElementById('save').onclick=async()=>{{const content=rows.map(r=>{{const a=ensure(r),labels=r.candidates.map(c=>({{candidate_id:c.candidate_id,time_s:c.time_s,proposer_probability:c.proposer_probability,label:a.labels[c.candidate_id]||'unreviewed'}}));return JSON.stringify({{schema:'semantic_anchor_learned_proposer_manual_verdict_v1',event_key:r.event_key,sample_id:r.sample_id,event_id:r.event_id,coarse_anchor_s:r.coarse_anchor_s,region_start_s:r.region_start_s,region_end_s:r.region_end_s,candidates:labels,complete:complete(r,a),safe_covered:covered(r,a),note:a.note||'',updated_at:a.updated_at||new Date().toISOString()}});}}).join('\\n')+'\\n';const res=await fetch('/__audit_api__/save-labels',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{href:location.pathname,filename:'manual_verdicts.jsonl',content}})}});const out=await res.json();document.getElementById('status').textContent=out.ok?'已保存到 '+out.path:'保存失败: '+out.error;}};render();
+function render(){{const root=document.getElementById('list');root.innerHTML='';for(const r of rows){{const a=ensure(r),card=document.createElement('article');if(complete(r,a))card.classList.add('done');const candidates=r.candidates.map(c=>`<tr><td><b>${{esc(c.candidate_id)}}</b><br>${{Number(c.time_s).toFixed(3)}}s<br><small>p=${{Number(c.proposer_probability).toFixed(4)}}</small></td><td><small>左侧硬截断</small><audio controls preload="metadata" src="${{esc(c.left_audio)}}"></audio><small>右侧硬起播</small><audio controls preload="metadata" src="${{esc(c.right_audio)}}"></audio><small>原邻域 + 12ms 定位 tick</small><audio controls preload="metadata" src="${{esc(c.tick_audio)}}"></audio></td><td>${{choice(a,c,'left_clipped','切早')}}${{choice(a,c,'safe','安全','safe')}}${{choice(a,c,'right_clipped','切晚')}}${{choice(a,c,'unsure','不确定','unsure')}}</td></tr>`).join('');card.innerHTML=`<h2>${{esc(r.event_key)}}</h2><div class="texts"><div class="text"><b>左侧应完整保留</b><br>${{esc(r.left_text)}}</div><div class="text"><b>右侧应完整保留</b><br>${{esc(r.right_text)}}</div></div><p><b>粗锚点：</b>${{Number(r.coarse_anchor_s).toFixed(3)}}s；<b>自适应邻域：</b>${{Number(r.region_start_s).toFixed(3)}}–${{Number(r.region_end_s).toFixed(3)}}s</p><small>projection SHA256=${{esc(r.projection_file_sha256)}}<br>proposer SHA256=${{esc(r.proposer_sha256)}}</small><p><b>完整 source</b></p><audio controls preload="metadata" src="${{esc(r.full_audio)}}"></audio><p><b>当前邻域原音频</b></p><audio controls preload="metadata" src="${{esc(r.region_audio)}}"></audio><table><thead><tr><th>候选</th><th>无时移边界试听</th><th>人工标签</th></tr></thead><tbody>${{candidates}}</tbody></table><label><b>备注</b><textarea>${{esc(a.note)}}</textarea></label>`;card.querySelectorAll('audio').forEach(x=>x.onplay=()=>play(x));card.querySelectorAll('[data-cid]').forEach(b=>b.onclick=()=>{{a.labels[b.dataset.cid]=b.dataset.label;a.updated_at=new Date().toISOString();persist();render();}});card.querySelector('textarea').onchange=e=>{{a.note=e.target.value;a.updated_at=new Date().toISOString();persist();}};root.appendChild(card);}}status();}}
+document.getElementById('save').onclick=async()=>{{const content=rows.map(r=>{{const a=ensure(r),labels=r.candidates.map(c=>({{candidate_id:c.candidate_id,time_s:c.time_s,proposer_probability:c.proposer_probability,label:a.labels[c.candidate_id]||'unreviewed'}}));return JSON.stringify({{schema:'semantic_anchor_learned_proposer_manual_verdict_v2',event_key:r.event_key,sample_id:r.sample_id,event_id:r.event_id,coarse_anchor_s:r.coarse_anchor_s,region_start_s:r.region_start_s,region_end_s:r.region_end_s,candidates:labels,complete:complete(r,a),safe_covered:covered(r,a),note:a.note||'',updated_at:a.updated_at||new Date().toISOString()}});}}).join('\\n')+'\\n';const res=await fetch('/__audit_api__/save-labels',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{href:location.pathname,filename:'manual_verdicts.jsonl',content}})}});const out=await res.json();document.getElementById('status').textContent=out.ok?'已保存到 '+out.path:'保存失败: '+out.error;}};render();
 </script></body></html>"""
     index = audit_dir / "index.html"
     index.write_text(page, encoding="utf-8")
