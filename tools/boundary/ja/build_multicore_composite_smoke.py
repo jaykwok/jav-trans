@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+from collections import Counter
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -82,9 +83,24 @@ def load_semantic_cores(path: Path) -> list[dict[str, Any]]:
                 }
             )
     cores.sort(key=lambda row: row["core_id"])
-    if len(cores) < 4:
-        raise ValueError("multi-core smoke requires at least four matched semantic cores")
+    if not cores:
+        raise ValueError("multi-core smoke requires matched semantic cores")
     return cores
+
+
+def select_unique_recipe_cores(cores: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    required = 10
+    if len(cores) < required:
+        raise ValueError(
+            f"additive-overlay smoke requires at least {required} unique approved semantic cores; got {len(cores)}"
+        )
+    ordered = sorted(cores, key=lambda core: (len(core["audio"]), str(core["core_id"])))
+    indices = np.rint(np.linspace(0, len(ordered) - 1, num=required)).astype(np.int64)
+    selected = [ordered[int(index)] for index in indices]
+    core_ids = [str(core["core_id"]) for core in selected]
+    if len(set(core_ids)) != required:
+        raise RuntimeError("duration-stratified core selection produced duplicate core ids")
+    return selected
 
 
 def load_gap_quantiles(path: Path) -> dict[str, float]:
@@ -460,6 +476,7 @@ def build_smoke(
 ) -> dict[str, Any]:
     rng = np.random.default_rng(seed)
     cores = load_semantic_cores(semantic_labels)
+    selected_cores = select_unique_recipe_cores(cores)
     output_dir.mkdir(parents=True, exist_ok=True)
     core_dir = output_dir / "semantic_cores"
     core_dir.mkdir(parents=True, exist_ok=True)
@@ -496,18 +513,10 @@ def build_smoke(
     )
     snr_quantiles = load_snr_quantiles(snr_reference_manifest)
     music_a, music_b, vocal = overlay_rows
-    core_rms = float(np.median([_rms(core["audio"]) for core in cores]))
-    longest_index = max(range(len(cores)), key=lambda index: len(cores[index]["audio"]))
-    long_core = cores[longest_index]
-    remaining = [core for index, core in enumerate(cores) if index != longest_index]
-    shortest_index = min(
-        range(len(remaining)), key=lambda index: len(remaining[index]["audio"])
+    core_rms = float(np.median([_rms(core["audio"]) for core in selected_cores]))
+    short_core, core_1, core_2, core_3, core_4, core_5, core_6, core_7, core_8, long_core = (
+        selected_cores
     )
-    short_core = remaining[shortest_index]
-    medium_cores = [
-        core for index, core in enumerate(remaining) if index != shortest_index
-    ]
-    medium_left, medium_right = medium_cores[:2]
 
     silence = rng.normal(
         0.0,
@@ -599,7 +608,7 @@ def build_smoke(
 
     clean, truth = _safe_composite(
         sample_id="ov01_music_over_two_core_safe",
-        cores=[medium_left, medium_right],
+        cores=[core_1, core_5],
         gaps=[("low_room_tone", silence, {"duration_quantile": "q25"})],
     )
     add_overlay_recipe(
@@ -614,7 +623,7 @@ def build_smoke(
 
     clean, truth = _safe_composite(
         sample_id="ov02_music_over_three_core_two_safe",
-        cores=[short_core, medium_left, medium_right],
+        cores=[short_core, core_4, core_7],
         gaps=[
             ("low_room_tone", long_room, {"duration_quantile": "q50"}),
             ("low_room_tone", short_room, {"duration_quantile": "q25"}),
@@ -632,7 +641,7 @@ def build_smoke(
 
     clean, truth = _safe_composite(
         sample_id="ov03_vocal_over_two_core_safe",
-        cores=[medium_right, short_core],
+        cores=[core_2, core_6],
         gaps=[("low_room_tone", long_room, {"duration_quantile": "q50"})],
     )
     add_overlay_recipe(
@@ -647,8 +656,8 @@ def build_smoke(
 
     clean, truth = _overlap_composite(
         sample_id="ov04_music_over_overlap_abstain",
-        left=medium_left,
-        right=medium_right,
+        left=core_3,
+        right=core_8,
         overlap_s=0.18,
     )
     add_overlay_recipe(
@@ -713,6 +722,15 @@ def build_smoke(
         )
     manifest_path = output_dir / "multicore_composite_smoke.jsonl"
     _write_jsonl(manifest_path, manifest_rows)
+    used_core_ids = [
+        str(core["core_id"])
+        for row in manifest_rows
+        for core in row["core_spans"]
+    ]
+    core_use_counts = Counter(used_core_ids)
+    reused_core_ids = sorted(core_id for core_id, count in core_use_counts.items() if count > 1)
+    if reused_core_ids:
+        raise RuntimeError(f"semantic core reuse is forbidden: {reused_core_ids}")
     summary = {
         "schema": SUMMARY_SCHEMA,
         "seed": int(seed),
@@ -739,6 +757,11 @@ def build_smoke(
         "all_semantic_cores_have_simultaneous_overlay": True,
         "semantic_core_library": str(core_library_path),
         "semantic_core_count": len(core_library_rows),
+        "selected_core_ids": used_core_ids,
+        "selected_unique_core_count": len(core_use_counts),
+        "max_core_use_count": max(core_use_counts.values()),
+        "reused_core_ids": reused_core_ids,
+        "core_reuse_policy": "each_core_id_at_most_once_per_generated_dataset_v1",
         "coordinate_contract": "dual_coordinates_float_seconds_model_interface_exact_sample_offsets_v1",
         "training_ready": False,
         "training_blocker": "fixed five-sample manual audit is required before proposer replay or dataset expansion",
