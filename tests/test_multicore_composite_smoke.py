@@ -35,6 +35,8 @@ def _write_inputs(tmp_path: Path, *, core_count: int = 10) -> tuple[Path, Path, 
                 "audio": str(audio),
                 "source": f"fixture:{index}",
                 "reference_text": f"semantic text {index}",
+                "atomic_semantic_unit": True,
+                "semantic_unit_count": 1,
             }
         )
     labels.write_text(
@@ -101,6 +103,27 @@ def test_multicore_smoke_rejects_core_reuse_pressure(tmp_path: Path) -> None:
         tmp_path, core_count=9
     )
     with pytest.raises(ValueError, match="at least 10 unique approved semantic cores"):
+        build_smoke(
+            semantic_core_samples=core_samples,
+            overlay_manifest=overlay_manifest,
+            gap_duration_pool=gap_pool,
+            snr_reference_manifest=snr_reference,
+            output_dir=tmp_path / "smoke",
+            seed=7,
+        )
+
+
+def test_multicore_smoke_rejects_natural_multiunit_clip_as_atomic_core(
+    tmp_path: Path,
+) -> None:
+    core_samples, overlay_manifest, gap_pool, snr_reference = _write_inputs(tmp_path)
+    rows = _rows(core_samples)
+    rows[0]["atomic_semantic_unit"] = False
+    rows[0]["semantic_unit_count"] = 2
+    core_samples.write_text(
+        "".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8"
+    )
+    with pytest.raises(ValueError, match="only accepts one semantic unit per full clip"):
         build_smoke(
             semantic_core_samples=core_samples,
             overlay_manifest=overlay_manifest,
@@ -196,7 +219,13 @@ def test_multicore_smoke_covers_split_safe_abstain_and_continue(tmp_path: Path) 
     assert all(row["source_start_sample"] == 0 for row in core_library)
     assert all(row["source_end_sample"] == row["sample_count"] for row in core_library)
     assert all(row["timing_source"] == "full_clip_sample_extent_v1" for row in core_library)
+    assert all(row["atomic_semantic_unit"] is True for row in core_library)
+    assert all(row["semantic_unit_count"] == 1 for row in core_library)
     assert summary["semantic_core_timing_contract"] == "full_clip_sample_extent_v1"
+    assert (
+        summary["semantic_core_content_contract"]
+        == "one_atomic_semantic_unit_per_full_clip_v1"
+    )
 
 
 def test_multicore_audit_keeps_split_and_inner_distinct(tmp_path: Path) -> None:
