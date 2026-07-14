@@ -54,6 +54,12 @@ def _load_full_clip(path: Path) -> np.ndarray:
 def load_full_clip_semantic_cores(path: Path) -> list[dict[str, Any]]:
     cores: list[dict[str, Any]] = []
     for source in _rows(path):
+        if source.get("atomic_semantic_unit") is not True or int(
+            source.get("semantic_unit_count") or 0
+        ) != 1:
+            raise ValueError(
+                f"atomic core pool only accepts one semantic unit per full clip: {source.get('sample_id')}"
+            )
         audio = _load_full_clip(Path(source["audio"]))
         cores.append(
             {
@@ -68,6 +74,8 @@ def load_full_clip_semantic_cores(path: Path) -> list[dict[str, Any]]:
                 "text": str(source["reference_text"]),
                 "audio": audio,
                 "timing_source": "full_clip_sample_extent_v1",
+                "atomic_semantic_unit": True,
+                "semantic_unit_count": 1,
             }
         )
     cores.sort(key=lambda row: row["core_id"])
@@ -491,6 +499,8 @@ def build_smoke(
                 "source_start_s": core["source_start_s"],
                 "source_end_s": core["source_end_s"],
                 "timing_source": core["timing_source"],
+                "atomic_semantic_unit": core["atomic_semantic_unit"],
+                "semantic_unit_count": core["semantic_unit_count"],
             }
         )
     core_library_path = output_dir / "semantic_core_library.jsonl"
@@ -748,6 +758,7 @@ def build_smoke(
         "semantic_core_library": str(core_library_path),
         "semantic_core_count": len(core_library_rows),
         "semantic_core_timing_contract": "full_clip_sample_extent_v1",
+        "semantic_core_content_contract": "one_atomic_semantic_unit_per_full_clip_v1",
         "selected_core_ids": used_core_ids,
         "selected_unique_core_count": len(core_use_counts),
         "max_core_use_count": max(core_use_counts.values()),
