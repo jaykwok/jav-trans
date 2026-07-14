@@ -7,6 +7,7 @@ import pytest
 
 from tools.audits.generate_semantic_source_text_alignment_audit_html import (
     build_audit,
+    membership_review_required,
 )
 from tools.boundary.ja import label_semantic_source_text_alignment_with_omni as teacher
 
@@ -92,6 +93,7 @@ def test_validation_keeps_text_exact_and_contains_semantic_alignment() -> None:
     assert validated["keep_span"]["end_s"] == 2.6
     assert validated["keep_span"]["derivation"] == "matched_semantic_envelope_v1"
     assert validated["keep_span"]["bridged_internal_gap_count"] == 0
+    assert membership_review_required({**validated}) is False
 
 
 def test_validation_rejects_text_rewrite_and_alignment_id_drift() -> None:
@@ -238,6 +240,7 @@ def test_membership_envelope_only_bridges_internal_semantic_gaps() -> None:
         "confidence": 0.8,
         "reason": "由 matched semantic timeline 的最早 start 与最晚 end 确定性派生；只桥接内部空洞，不吸收两侧非语义声音。",
     }
+    assert membership_review_required({**validated}) is True
 
 
 def test_old_model_keep_span_cannot_expand_derived_membership() -> None:
@@ -329,6 +332,9 @@ def test_audit_separates_three_verdicts_and_explains_membership(tmp_path: Path) 
     assert "不是 Omni 的额外判断" in page
     assert "只允许桥接语义区间之间的内部空洞" in page
     assert "绝不向两侧吸收亲吻声" in page
+    assert "membership 自动去重" in page
+    assert "derived_from_timeline" in page
+    assert "全部必要项通过" in page
     assert "不显示旧切点" in page
     assert "text_verdict" in page
     assert "timeline_verdict" in page
