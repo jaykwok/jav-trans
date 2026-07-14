@@ -70,7 +70,8 @@ def test_prompt_runs_two_stages_in_one_request() -> None:
     assert "第一步" in teacher.SYSTEM_PROMPT
     assert "第二步" in teacher.SYSTEM_PROMPT
     assert "依次直接拼接后必须逐字符等于" in teacher.SYSTEM_PROMPT
-    assert "不要把连续的正常词句按单词切碎" in teacher.SYSTEM_PROMPT
+    assert "不要把连续的正常词句按单词或句号切碎" in teacher.SYSTEM_PROMPT
+    assert "禁止相邻两个 text_unit 使用相同 kind" in teacher.SYSTEM_PROMPT
     assert "附属非语义声音" in teacher.SYSTEM_PROMPT
     assert "排除仅有 BGM" in teacher.SYSTEM_PROMPT
     assert "不得使用固定秒数 margin" in teacher.SYSTEM_PROMPT
@@ -82,6 +83,13 @@ def test_prompt_runs_two_stages_in_one_request() -> None:
         "split_reference_text_by_semantic_kind",
         "align_semantic_units_and_assign_keep_span",
     ]
+    assert prompt["text_unit_contract"] == "maximal_contiguous_kind_runs"
+    retry_prompt = json.loads(
+        teacher.build_prompt(_sample(), validation_feedback="merge maximal kind runs")
+    )
+    assert retry_prompt["previous_response_validation_error"] == (
+        "merge maximal kind runs"
+    )
 
 
 def test_validation_keeps_text_exact_and_contains_semantic_alignment() -> None:
@@ -104,19 +112,56 @@ def test_validation_rejects_text_rewrite_and_alignment_id_drift() -> None:
         teacher.validate_response(response, _sample())
 
 
-def test_validation_rejects_overlap_and_keep_span_that_clips_semantics() -> None:
-    sample = {**_sample(), "reference_text": "好き、平気"}
+def test_validation_rejects_adjacent_units_with_the_same_kind() -> None:
     response = _response()
     response["text_units"] = [
         {
             "unit_id": "u00",
-            "text": "好き、",
+            "text": "んちゅぷ",
+            "kind": "nonsemantic",
+            "confidence": 0.95,
+            "reason": "kiss",
+        },
+        {
+            "unit_id": "u01",
+            "text": "…",
+            "kind": "nonsemantic",
+            "confidence": 0.95,
+            "reason": "pause",
+        },
+        {
+            "unit_id": "u02",
+            "text": "好き",
+            "kind": "semantic",
+            "confidence": 0.95,
+            "reason": "word",
+        },
+    ]
+    response["semantic_alignments"][0]["unit_id"] = "u02"
+    with pytest.raises(ValueError, match="merge maximal kind runs"):
+        teacher.validate_response(response, _sample())
+
+
+def test_validation_rejects_overlap_and_keep_span_that_clips_semantics() -> None:
+    sample = {**_sample(), "reference_text": "好き…平気"}
+    response = _response()
+    response["text_units"] = [
+        {
+            "unit_id": "u00",
+            "text": "好き",
             "kind": "semantic",
             "confidence": 0.9,
             "reason": "word",
         },
         {
             "unit_id": "u01",
+            "text": "…",
+            "kind": "nonsemantic",
+            "confidence": 0.9,
+            "reason": "pause",
+        },
+        {
+            "unit_id": "u02",
             "text": "平気",
             "kind": "semantic",
             "confidence": 0.9,
@@ -133,7 +178,7 @@ def test_validation_rejects_overlap_and_keep_span_that_clips_semantics() -> None
             "reason": "word",
         },
         {
-            "unit_id": "u01",
+            "unit_id": "u02",
             "status": "matched",
             "start_s": 1.7,
             "end_s": 2.2,

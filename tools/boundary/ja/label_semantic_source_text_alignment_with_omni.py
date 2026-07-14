@@ -25,7 +25,7 @@ from tools.asr.cueqc.label_pre_asr_with_omni import (
 
 SCHEMA = "semantic_source_text_alignment_teacher_v1"
 SUMMARY_SCHEMA = "semantic_source_text_alignment_summary_v1"
-PROMPT_VERSION = "semantic_source_text_then_audio_alignment_v1"
+PROMPT_VERSION = "semantic_source_text_then_audio_alignment_v2_maximal_kind_runs"
 DEFAULT_MODEL = "qwen3.5-omni-plus"
 TEXT_KINDS = ("semantic", "nonsemantic", "unsure")
 ALIGNMENT_STATUSES = ("matched", "not_audible", "unsure")
@@ -46,7 +46,7 @@ SYSTEM_PROMPT = """你是日语短 source utterance 的离线监督标注器。�
 - semantic：清楚的词、助词、应答词或句子，具有语言语义和字幕价值。
 - nonsemantic：文本中表示喘息、呻吟、亲吻声、笑声、无意义叫声、短促非词拟声或拉长音的部分。
 - unsure：仅当该文本片段本身无法可靠判断是否是词语时使用。
-- 不要把连续的正常词句按单词切碎；只在 semantic / nonsemantic / unsure 类别发生变化时拆开。标点和省略号必须保留在相邻原文片段中。
+- 不要把连续的正常词句按单词或句号切碎；只在 semantic / nonsemantic / unsure 类别发生变化时拆开。禁止相邻两个 text_unit 使用相同 kind；若相邻片段 kind 相同，必须合并成一个最大连续 unit。标点和省略号必须保留在相邻原文片段中。
 - 所有 unit.text 依次直接拼接后必须逐字符等于原始 reference_text；禁止改写、纠错、补充、删除或重排。
 
 第二步：结合完整音频做对齐与上下文归属。
@@ -102,17 +102,24 @@ def _append(path: Path, row: dict[str, Any]) -> None:
         handle.write(json.dumps(row, ensure_ascii=False) + "\n")
 
 
-def build_prompt(sample: dict[str, Any]) -> str:
+def build_prompt(sample: dict[str, Any], *, validation_feedback: str = "") -> str:
+    payload = {
+        "sample_id": str(sample["sample_id"]),
+        "duration_s": round(float(sample["duration_s"]), 6),
+        "reference_text": str(sample["reference_text"]),
+        "text_unit_contract": "maximal_contiguous_kind_runs",
+        "task_order": [
+            "split_reference_text_by_semantic_kind",
+            "align_semantic_units_and_assign_keep_span",
+        ],
+    }
+    if validation_feedback:
+        payload["previous_response_validation_error"] = validation_feedback
+        payload["retry_instruction"] = (
+            "Correct the schema error while preserving the original audio and reference text."
+        )
     return json.dumps(
-        {
-            "sample_id": str(sample["sample_id"]),
-            "duration_s": round(float(sample["duration_s"]), 6),
-            "reference_text": str(sample["reference_text"]),
-            "task_order": [
-                "split_reference_text_by_semantic_kind",
-                "align_semantic_units_and_assign_keep_span",
-            ],
-        },
+        payload,
         ensure_ascii=False,
         separators=(",", ":"),
     )
@@ -165,6 +172,10 @@ def validate_response(
         kind = str(raw.get("kind") or "")
         if kind not in TEXT_KINDS:
             raise ValueError("invalid text unit kind")
+        if units and units[-1]["kind"] == kind:
+            raise ValueError(
+                "adjacent text units must not share a kind; merge maximal kind runs"
+            )
         units.append(
             {
                 "unit_id": unit_id,
@@ -314,7 +325,10 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     for position, sample in enumerate(pending, start=1):
         sample_id = str(sample["sample_id"])
         validation_error: Exception | None = None
+        validation_feedback = ""
         for attempt in range(1, int(args.max_attempts) + 1):
+            parsed: dict[str, Any] | None = None
+            raw: dict[str, Any] | None = None
             try:
                 parsed, raw = call_omni(
                     audio_path=Path(sample["audio"]),
@@ -325,7 +339,9 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                     base_url=base_url,
                     timeout_s=float(args.timeout_s),
                     store_stream_chunks=False,
-                    prompt=build_prompt(sample),
+                    prompt=build_prompt(
+                        sample, validation_feedback=validation_feedback
+                    ),
                     system_prompt=SYSTEM_PROMPT,
                     max_tokens=int(args.max_tokens),
                     enable_thinking=True,
@@ -335,12 +351,17 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 validation_error = None
             except Exception as error:  # noqa: BLE001
                 validation_error = error
+                validation_feedback = (
+                    str(error) if isinstance(error, ValueError) else ""
+                )
                 _append(
                     raw_path,
                     {
                         "sample_id": sample_id,
                         "attempt": attempt,
                         "error": repr(error),
+                        "parsed": parsed,
+                        "response": raw,
                     },
                 )
                 if attempt < int(args.max_attempts):
