@@ -23,10 +23,10 @@ def _write_wave(path: Path, *, frequency: float, duration_s: float = 2.0) -> Non
     sf.write(path, audio, SAMPLE_RATE, subtype="PCM_16")
 
 
-def _write_inputs(tmp_path: Path) -> tuple[Path, Path, Path, Path]:
+def _write_inputs(tmp_path: Path, *, core_count: int = 10) -> tuple[Path, Path, Path, Path]:
     labels = tmp_path / "semantic_labels.jsonl"
     label_rows = []
-    for index in range(4):
+    for index in range(core_count):
         audio = tmp_path / f"core-source-{index}.wav"
         _write_wave(audio, frequency=220.0 + index * 30.0)
         label_rows.append(
@@ -110,6 +110,21 @@ def _rows(path: Path) -> list[dict]:
     return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
 
 
+def test_multicore_smoke_rejects_core_reuse_pressure(tmp_path: Path) -> None:
+    labels, overlay_manifest, gap_pool, snr_reference = _write_inputs(
+        tmp_path, core_count=9
+    )
+    with pytest.raises(ValueError, match="at least 10 unique approved semantic cores"):
+        build_smoke(
+            semantic_labels=labels,
+            overlay_manifest=overlay_manifest,
+            gap_duration_pool=gap_pool,
+            snr_reference_manifest=snr_reference,
+            output_dir=tmp_path / "smoke",
+            seed=7,
+        )
+
+
 def test_multicore_smoke_covers_split_safe_abstain_and_continue(tmp_path: Path) -> None:
     labels, overlay_manifest, gap_pool, snr_reference = _write_inputs(tmp_path)
     output = tmp_path / "smoke"
@@ -135,6 +150,9 @@ def test_multicore_smoke_covers_split_safe_abstain_and_continue(tmp_path: Path) 
     assert summary["overlay_mode"] == "additive_full_duration"
     assert summary["all_semantic_cores_have_simultaneous_overlay"] is True
     assert summary["snr_quantiles"]["count"] == 6
+    assert summary["selected_unique_core_count"] == 10
+    assert summary["max_core_use_count"] == 1
+    assert summary["reused_core_ids"] == []
 
     assert len(by_id["ov02_music_over_three_core_two_safe"]["semantic_events"]) == 2
     overlap = by_id["ov04_music_over_overlap_abstain"]
@@ -181,8 +199,12 @@ def test_multicore_smoke_covers_split_safe_abstain_and_continue(tmp_path: Path) 
                 event["event_interval_end_sample"] / SAMPLE_RATE
             )
 
+    used_core_ids = [core["core_id"] for row in rows for core in row["core_spans"]]
+    assert len(used_core_ids) == 10
+    assert len(set(used_core_ids)) == 10
+
     core_library = _rows(output / "semantic_core_library.jsonl")
-    assert len(core_library) == 4
+    assert len(core_library) == 10
     assert all(row["duration_s"] == row["sample_count"] / SAMPLE_RATE for row in core_library)
 
 
