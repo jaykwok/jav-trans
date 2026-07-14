@@ -33,22 +33,8 @@ def _write_inputs(tmp_path: Path, *, core_count: int = 10) -> tuple[Path, Path, 
             {
                 "sample_id": f"source-{index}",
                 "audio": str(audio),
-                "text_units": [
-                    {
-                        "unit_id": "u00",
-                        "text": f"semantic text {index}",
-                        "kind": "semantic",
-                    }
-                ],
-                "semantic_alignments": [
-                    {
-                        "unit_id": "u00",
-                        "status": "matched",
-                        "start_s": 0.1,
-                        "end_s": 1.9,
-                        "confidence": 1.0,
-                    }
-                ],
+                "source": f"fixture:{index}",
+                "reference_text": f"semantic text {index}",
             }
         )
     labels.write_text(
@@ -111,12 +97,12 @@ def _rows(path: Path) -> list[dict]:
 
 
 def test_multicore_smoke_rejects_core_reuse_pressure(tmp_path: Path) -> None:
-    labels, overlay_manifest, gap_pool, snr_reference = _write_inputs(
+    core_samples, overlay_manifest, gap_pool, snr_reference = _write_inputs(
         tmp_path, core_count=9
     )
     with pytest.raises(ValueError, match="at least 10 unique approved semantic cores"):
         build_smoke(
-            semantic_labels=labels,
+            semantic_core_samples=core_samples,
             overlay_manifest=overlay_manifest,
             gap_duration_pool=gap_pool,
             snr_reference_manifest=snr_reference,
@@ -126,10 +112,10 @@ def test_multicore_smoke_rejects_core_reuse_pressure(tmp_path: Path) -> None:
 
 
 def test_multicore_smoke_covers_split_safe_abstain_and_continue(tmp_path: Path) -> None:
-    labels, overlay_manifest, gap_pool, snr_reference = _write_inputs(tmp_path)
+    core_samples, overlay_manifest, gap_pool, snr_reference = _write_inputs(tmp_path)
     output = tmp_path / "smoke"
     summary = build_smoke(
-        semantic_labels=labels,
+        semantic_core_samples=core_samples,
         overlay_manifest=overlay_manifest,
         gap_duration_pool=gap_pool,
         snr_reference_manifest=snr_reference,
@@ -187,6 +173,7 @@ def test_multicore_smoke_covers_split_safe_abstain_and_continue(tmp_path: Path) 
         for core in row["core_spans"]:
             assert core["start_s"] == core["start_sample"] / SAMPLE_RATE
             assert core["end_s"] == core["end_sample"] / SAMPLE_RATE
+            assert core["timing_source"] == "full_clip_sample_extent_v1"
         for gap in row["gap_spans"]:
             assert gap["start_s"] == gap["start_sample"] / SAMPLE_RATE
             assert gap["end_s"] == gap["end_sample"] / SAMPLE_RATE
@@ -206,13 +193,17 @@ def test_multicore_smoke_covers_split_safe_abstain_and_continue(tmp_path: Path) 
     core_library = _rows(output / "semantic_core_library.jsonl")
     assert len(core_library) == 10
     assert all(row["duration_s"] == row["sample_count"] / SAMPLE_RATE for row in core_library)
+    assert all(row["source_start_sample"] == 0 for row in core_library)
+    assert all(row["source_end_sample"] == row["sample_count"] for row in core_library)
+    assert all(row["timing_source"] == "full_clip_sample_extent_v1" for row in core_library)
+    assert summary["semantic_core_timing_contract"] == "full_clip_sample_extent_v1"
 
 
 def test_multicore_audit_keeps_split_and_inner_distinct(tmp_path: Path) -> None:
-    labels, overlay_manifest, gap_pool, snr_reference = _write_inputs(tmp_path)
+    core_samples, overlay_manifest, gap_pool, snr_reference = _write_inputs(tmp_path)
     output = tmp_path / "smoke"
     build_smoke(
-        semantic_labels=labels,
+        semantic_core_samples=core_samples,
         overlay_manifest=overlay_manifest,
         gap_duration_pool=gap_pool,
         snr_reference_manifest=snr_reference,
