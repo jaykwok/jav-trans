@@ -42,8 +42,8 @@ body{{margin:0;background:#f2f4f7;color:#20242a;font-family:Segoe UI,Arial,sans-
 <main><section class="help"><h2>审计目标：semantic core 与背景/噪声必须同时可听</h2><div class="panels">
 <div class="panel"><h3>1 · 语义完整可懂</h3><p>先听 clean，再听 mixed。mixed 中所有绿色 semantic cores 的字句必须完整、清楚，不能被混音或拼接遮坏。</p></div>
 <div class="panel"><h3>2 · overlay 合格</h3><p>mixed 中必须确实可听到橙色 overlay、强度不过弱也不过强，并且 overlay 本身不能含清楚可字幕词语。noise-only 只用于辨认来源。</p></div>
-<div class="panel"><h3>3 · Semantic Split</h3><p>独立 cores 之间是 <code>cut</code>；单一 maximal core 内的 BGM switch 是 <code>continue</code>。overlay 的开始、循环或切换不产生语义 event。</p></div>
-<div class="panel"><h3>4 · Inner edge</h3><p>蓝色是无 semantic speech 的可移除区，哪怕其中仍有 BGM/非语义声音；红色 overlap 必须 abstain。无 event 时自动 not_applicable。</p></div>
+<div class="panel"><h3>3 · 语义边界：应不应该分句</h3><p>只判断左右是不是两个可以独立成字幕的完整语义。不同 cores 之间应为 <code>cut</code>；单一 core 内即使 BGM、呻吟或背景发生变化也应 <code>continue</code>。绿色长条只是 core 的完整跨度，不是 Split 标签。</p></div>
+<div class="panel"><h3>4 · 声学安全区：能不能真正切</h3><p>只在第 3 项确认“语义上应该分句”后检查波形。蓝色表示两句话之间存在没有 semantic speech 的可移除区，可用 paired edges 真正切开；红色表示两句声音重叠或没有安全区，必须 abstain 并保持一个 chunk。</p></div>
 </div><p>每条 overlay 的 SNR 来自既有 hardmix 背景混音经验分布的分位数，不使用单一固定阈值。相邻 event 的试听上下文按 event 代表点中点自适应分区，互不重叠。人工 5/5 前禁止扩 100 条、跑 proposer 或训练。</p></section><div id="list"></div></main>
 <script>
 const rows={payload};
@@ -79,17 +79,19 @@ function coreRows(row,ids){{
 }}
 function eventRows(row,ids){{
   const contexts=eventContexts(row);
-  if(!contexts.length)return '<tr><td colspan="6"><b>无 semantic event：</b>单一 maximal semantic core；BGM switch 全部 continue。</td></tr>';
+  if(!contexts.length)return '<tr><td colspan="6"><b>语义层不分句：</b>这是单一 maximal semantic core；BGM、呻吟或背景变化都不能单独制造 Split event，因此声学切割也不适用。</td></tr>';
   return contexts.map(function(item){{
     const event=item.event;
     const inner=event.inner_target;
-    const paired=inner.status==='safe'?span(inner.left_speech_end_s,inner.right_speech_start_s):'保持单 chunk';
-    return `<tr><td>${{esc(event.event_id)}}</td><td>${{esc(event.semantic_decision)}}</td><td>${{span(event.event_interval_start_s,event.event_interval_end_s)}}</td><td>${{esc(inner.status)}} / ${{esc(inner.gap_kind)}}</td><td>${{paired}}</td><td>${{span(item.start,item.end)}}<br><button data-audio="${{ids.clean}}" data-play-start="${{item.start}}" data-play-end="${{item.end}}">clean 上下文</button><button data-audio="${{ids.mixed}}" data-play-start="${{item.start}}" data-play-end="${{item.end}}">mixed 上下文</button></td></tr>`;
+    const semanticMeaning=event.semantic_decision==='cut'?'左右是独立完整语义：应该分句':'仍属同一语义：不应分句';
+    const acousticMeaning=inner.status==='safe'?'存在连续安全区：允许真正切开':'没有安全区/存在重叠：abstain';
+    const paired=inner.status==='safe'?`左句结束 ${{Number(inner.left_speech_end_s).toFixed(3)}}s；右句开始 ${{Number(inner.right_speech_start_s).toFixed(3)}}s；移除中间区间`:'语义上虽应分句，但波形不能安全切；保持单 chunk';
+    return `<tr><td>${{esc(event.event_id)}}</td><td><b>${{esc(event.semantic_decision)}}</b><br>${{semanticMeaning}}</td><td>${{span(event.event_interval_start_s,event.event_interval_end_s)}}</td><td><b>${{esc(inner.status)}}</b> / ${{esc(inner.gap_kind)}}<br>${{acousticMeaning}}</td><td>${{paired}}</td><td>${{span(item.start,item.end)}}<br><button data-audio="${{ids.clean}}" data-play-start="${{item.start}}" data-play-end="${{item.end}}">clean 上下文</button><button data-audio="${{ids.mixed}}" data-play-start="${{item.start}}" data-play-end="${{item.end}}">mixed 上下文</button></td></tr>`;
   }}).join('');
 }}
 function innerPanel(row,a){{
-  if(!row.inner_review_required)return '<div class="panel"><h3>4 · Inner</h3><p><b>自动去重：</b>无 semantic event，Inner=not_applicable。</p></div>';
-  return `<div class="panel"><h3>4 · Inner safe/abstain</h3><div class="verdict">${{verdict('Inner 通过','inner_verdict','approve',a)}}${{verdict('Inner 不通过','inner_verdict','reject',a)}}</div></div>`;
+  if(!row.inner_review_required)return '<div class="panel"><h3>4 · 声学安全区</h3><p><b>不适用：</b>第 3 项没有语义分句事件，所以不需要寻找切割波形的位置。</p></div>';
+  return `<div class="panel"><h3>4 · 声学安全区：能不能真的切</h3><p>核对每个语义事件是“存在 safe gap，可以切”还是“重叠/无安全区，必须 abstain”。</p><div class="verdict">${{verdict('safe/abstain 结论正确','inner_verdict','approve',a)}}${{verdict('声学结论不正确','inner_verdict','reject',a)}}</div></div>`;
 }}
 function bindCard(card,a){{
   for(const button of card.querySelectorAll('[data-field]'))button.onclick=function(){{a[button.dataset.field]=button.dataset.value;a.updated_at=new Date().toISOString();persist();render();}};
@@ -110,7 +112,7 @@ function render(){{
     const ids={{clean:'clean-'+row.sample_id,overlay:'overlay-'+row.sample_id,mixed:'mixed-'+row.sample_id}};
     const overlay=row.overlay;
     const sourceText=overlay.sources.map(function(source){{return `${{source.audio_id}} / ${{source.background_type}} / ${{source.source_partition}} / ${{Number(source.source_duration_s).toFixed(2)}}s${{source.tiled?'（循环）':''}}`;}}).join('；');
-    card.innerHTML=`<h2>${{esc(row.sample_id)}}</h2><p><b>审计重点：</b>${{esc(row.audit_focus)}}</p><small>axes=${{esc(JSON.stringify(row.sampling_axes))}}；overlay=${{esc(sourceText)}}；target/achieved SNR=${{Number(overlay.mix.target_snr_db).toFixed(2)}}/${{Number(overlay.mix.achieved_snr_db).toFixed(2)}} dB</small><div class="audio-grid"><div><b>Clean composite</b><audio id="${{ids.clean}}" controls preload="metadata" src="${{esc(row.clean_audio)}}"></audio></div><div><b>Mixed（训练输入）</b><audio id="${{ids.mixed}}" controls preload="metadata" src="${{esc(row.mixed_audio)}}"></audio></div><div><b>Overlay-only（检查可听度与语义泄漏）</b><audio id="${{ids.overlay}}" controls preload="metadata" src="${{esc(row.overlay_audio)}}"></audio></div></div>${{timeline(row)}}<table><thead><tr><th>core</th><th>可信文本</th><th>精确 span</th><th>clean / mixed 对照</th></tr></thead><tbody>${{coreRows(row,ids)}}</tbody></table><h3>事件真值</h3><table><thead><tr><th>event</th><th>Split</th><th>event interval</th><th>Inner</th><th>paired edges</th><th>不重叠自适应上下文</th></tr></thead><tbody>${{eventRows(row,ids)}}</tbody></table><div class="panels"><div class="panel"><h3>1 · 语义完整可懂</h3><div class="verdict">${{verdict('语义通过','intelligibility_verdict','approve',a)}}${{verdict('语义不通过','intelligibility_verdict','reject',a)}}</div></div><div class="panel"><h3>2 · Overlay 合格</h3><div class="verdict">${{verdict('可听且无字幕语义','overlay_audibility_verdict','approve',a)}}${{verdict('不可听/过强/含清楚词语','overlay_audibility_verdict','reject',a)}}</div></div><div class="panel"><h3>3 · Semantic Split</h3><div class="verdict">${{verdict('Split 通过','split_verdict','approve',a)}}${{verdict('Split 不通过','split_verdict','reject',a)}}</div></div>${{innerPanel(row,a)}}</div><label><b>备注</b><textarea placeholder="指出语义遮蔽、overlay 强弱/语义泄漏、event、safe gap 或合成伪影">${{esc(a.note)}}</textarea></label>`;
+    card.innerHTML=`<h2>${{esc(row.sample_id)}}</h2><p><b>审计重点：</b>${{esc(row.audit_focus)}}</p><small>axes=${{esc(JSON.stringify(row.sampling_axes))}}；overlay=${{esc(sourceText)}}；target/achieved SNR=${{Number(overlay.mix.target_snr_db).toFixed(2)}}/${{Number(overlay.mix.achieved_snr_db).toFixed(2)}} dB</small><div class="audio-grid"><div><b>Clean composite</b><audio id="${{ids.clean}}" controls preload="metadata" src="${{esc(row.clean_audio)}}"></audio></div><div><b>Mixed（训练输入）</b><audio id="${{ids.mixed}}" controls preload="metadata" src="${{esc(row.mixed_audio)}}"></audio></div><div><b>Overlay-only（检查可听度与语义泄漏）</b><audio id="${{ids.overlay}}" controls preload="metadata" src="${{esc(row.overlay_audio)}}"></audio></div></div>${{timeline(row)}}<table><thead><tr><th>core</th><th>可信文本</th><th>精确 span</th><th>clean / mixed 对照</th></tr></thead><tbody>${{coreRows(row,ids)}}</tbody></table><h3>两层事件真值</h3><table><thead><tr><th>event</th><th>第 3 项：语义上应不应该分句</th><th>事件邻域</th><th>第 4 项：声学上能不能切</th><th>实际处理</th><th>不重叠自适应上下文</th></tr></thead><tbody>${{eventRows(row,ids)}}</tbody></table><div class="panels"><div class="panel"><h3>1 · 语义完整可懂</h3><div class="verdict">${{verdict('语义通过','intelligibility_verdict','approve',a)}}${{verdict('语义不通过','intelligibility_verdict','reject',a)}}</div></div><div class="panel"><h3>2 · Overlay 合格</h3><div class="verdict">${{verdict('可听且无字幕语义','overlay_audibility_verdict','approve',a)}}${{verdict('不可听/过强/含清楚词语','overlay_audibility_verdict','reject',a)}}</div></div><div class="panel"><h3>3 · 语义边界：应不应该分句</h3><p>只核对左右完整文本是否应成为两条字幕，不判断具体切点。</p><div class="verdict">${{verdict('语义 cut/continue 正确','split_verdict','approve',a)}}${{verdict('语义边界不正确','split_verdict','reject',a)}}</div></div>${{innerPanel(row,a)}}</div><label><b>备注</b><textarea placeholder="指出语义遮蔽、overlay 强弱/语义泄漏、语义分句、safe/abstain 或合成伪影">${{esc(a.note)}}</textarea></label>`;
     bindCard(card,a);
     root.appendChild(card);
   }}
