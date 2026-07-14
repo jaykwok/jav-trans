@@ -28,9 +28,14 @@ from boundary.backbones import SpeechIslandSequenceClassifier  # noqa: E402
 from boundary.gpu_safety import apply_vram_safety_cap  # noqa: E402
 from boundary.ja.dataset import read_jsonl  # noqa: E402
 from boundary.ja.features import load_cached_feature  # noqa: E402
+from boundary.ja.model import checkpoint_sha256  # noqa: E402
 from boundary.ja.proposal import build_boundary_proposal_checkpoint  # noqa: E402
 from tools.boundary.ja.build_runtime_semantic_split_dataset import (  # noqa: E402
     semantic_split_truth_boundaries,
+)
+from tools.boundary.ja.label_semantic_source_candidates_with_omni import (  # noqa: E402
+    learned_frame_embeddings,
+    load_task_aware_projection,
 )
 
 
@@ -51,13 +56,32 @@ def boundary_target_frames(
     return targets
 
 
-def _training_arrays(row, records, *, ptm_dim: int, radius_frames: int):
+def _training_arrays(
+    row,
+    records,
+    *,
+    ptm_dim: int,
+    radius_frames: int,
+    projection_mean: np.ndarray | None = None,
+    projection_components: np.ndarray | None = None,
+):
     record = records[int(row["label_index"])]
     ptm, mfcc = load_cached_feature(Path(str(row["feature_path"])))
     total = min(int(ptm.shape[0]), int(mfcc.shape[0]))
-    features = np.concatenate(
-        (ptm[:total, :ptm_dim], mfcc[:total]), axis=1
-    ).astype(np.float32)
+    ptm_values = np.asarray(ptm[:total], dtype=np.float32)
+    if projection_mean is not None and projection_components is not None:
+        ptm_values = learned_frame_embeddings(
+            ptm=ptm_values,
+            projection_mean=projection_mean,
+            projection_components=projection_components,
+        )
+    else:
+        ptm_values = ptm_values[:, :ptm_dim]
+    if int(ptm_values.shape[1]) != int(ptm_dim):
+        raise ValueError(
+            f"proposal PTM feature dim {ptm_values.shape[1]} != requested {ptm_dim}"
+        )
+    features = np.concatenate((ptm_values, mfcc[:total]), axis=1).astype(np.float32)
     boundaries = [
         float(item["time_s"])
         for item in semantic_split_truth_boundaries(
@@ -99,6 +123,21 @@ def run(args: argparse.Namespace) -> None:
     if not val_rows:
         raise ValueError("no val-partition rows for proposal training")
     ptm_dim = int(args.ptm_dim)
+    projection_mean: np.ndarray | None = None
+    projection_components: np.ndarray | None = None
+    projection_digest = ""
+    projection_file_sha256 = ""
+    projection_path = ""
+    if args.ptm_projection:
+        projection_path = str(Path(args.ptm_projection))
+        projection_mean, projection_components, projection_digest = (
+            load_task_aware_projection(Path(args.ptm_projection))
+        )
+        projection_file_sha256 = checkpoint_sha256(Path(args.ptm_projection))
+        if int(projection_components.shape[0]) != ptm_dim:
+            raise ValueError(
+                "--ptm-dim must match the learned projection output dimension"
+            )
     mfcc_dim = int(rows[0]["mfcc_dim"])
     input_dim = ptm_dim + mfcc_dim
 
@@ -109,7 +148,12 @@ def run(args: argparse.Namespace) -> None:
     frame_total = 0
     for row in sample_rows:
         features, _targets, _partition = _training_arrays(
-            row, records, ptm_dim=ptm_dim, radius_frames=args.boundary_radius_frames
+            row,
+            records,
+            ptm_dim=ptm_dim,
+            radius_frames=args.boundary_radius_frames,
+            projection_mean=projection_mean,
+            projection_components=projection_components,
         )
         feature_sum += features.sum(axis=0)
         square_sum += np.square(features).sum(axis=0)
@@ -150,7 +194,12 @@ def run(args: argparse.Namespace) -> None:
     for step in range(1, args.max_steps + 1):
         row = train_rows[int(rng.integers(0, len(train_rows)))]
         features, targets, _partition = _training_arrays(
-            row, records, ptm_dim=ptm_dim, radius_frames=args.boundary_radius_frames
+            row,
+            records,
+            ptm_dim=ptm_dim,
+            radius_frames=args.boundary_radius_frames,
+            projection_mean=projection_mean,
+            projection_components=projection_components,
         )
         if features.shape[0] > args.max_train_frames:
             start = int(rng.integers(0, features.shape[0] - args.max_train_frames + 1))
@@ -193,6 +242,8 @@ def run(args: argparse.Namespace) -> None:
                 records,
                 ptm_dim=ptm_dim,
                 radius_frames=args.boundary_radius_frames,
+                projection_mean=projection_mean,
+                projection_components=projection_components,
             )
             features = (features - mean32) / std32
             logits = model(torch.from_numpy(features).unsqueeze(0).to(device))
@@ -224,6 +275,14 @@ def run(args: argparse.Namespace) -> None:
                 "boundary_radius_frames": args.boundary_radius_frames,
                 "positive_weight": args.positive_weight,
                 "focal_gamma": args.focal_gamma,
+                "ptm_projection_path": projection_path,
+                "ptm_projection_digest": projection_digest,
+                "ptm_projection_file_sha256": projection_file_sha256,
+                "ptm_projection_contract": (
+                    "task_aware_linear_2048_to_128"
+                    if projection_path
+                    else "legacy_front_slice"
+                ),
             },
         ),
         checkpoint_path,
@@ -237,6 +296,9 @@ def run(args: argparse.Namespace) -> None:
         "train_windows": len(train_rows),
         "val_windows": min(len(val_rows), args.max_eval_windows),
         "checkpoint": str(checkpoint_path),
+        "ptm_projection_path": projection_path,
+        "ptm_projection_digest": projection_digest,
+        "ptm_projection_file_sha256": projection_file_sha256,
     }
     (output_dir / "metrics.json").write_text(
         json.dumps(metrics, ensure_ascii=False, indent=2, sort_keys=True),
@@ -253,6 +315,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--feature-manifest", required=True)
     parser.add_argument("--output-dir", required=True)
     parser.add_argument("--ptm-dim", type=int, default=128)
+    parser.add_argument(
+        "--ptm-projection",
+        default="",
+        help=(
+            "Task-aware learned Linear(2048->128) deploy projection. When set, "
+            "raw cached PTM is projected before proposal training; PCA/front-128 "
+            "features are not used."
+        ),
+    )
     parser.add_argument("--max-steps", type=int, default=3000)
     parser.add_argument("--learning-rate", type=float, default=2e-4)
     parser.add_argument("--hidden-size", type=int, default=128)

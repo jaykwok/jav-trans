@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import numpy as np
 import pytest
+from types import SimpleNamespace
 
 torch = pytest.importorskip("torch")
 
@@ -13,7 +14,10 @@ from boundary.ja.proposal import (
     build_boundary_proposal_checkpoint,
     load_boundary_proposal_checkpoint,
 )
-from tools.boundary.ja.train_boundary_proposal_scorer import boundary_target_frames
+from tools.boundary.ja.train_boundary_proposal_scorer import (
+    _training_arrays,
+    boundary_target_frames,
+)
 
 PTM_DIM = 4
 MFCC_DIM = 3
@@ -142,3 +146,37 @@ def test_boundary_target_frames_marks_radius_and_clips_edges() -> None:
     )
 
     assert targets.tolist() == [1.0, 1.0, 0.0, 0.0, 1.0, 1.0, 1.0, 0.0]
+
+
+def test_training_arrays_use_learned_full_ptm_projection(tmp_path) -> None:
+    feature_path = tmp_path / "features.npz"
+    ptm = np.zeros((3, 8), dtype=np.float32)
+    ptm[:, 7] = np.asarray([1.0, 2.0, 3.0], dtype=np.float32)
+    mfcc = np.zeros((3, 2), dtype=np.float32)
+    np.savez(feature_path, ptm=ptm, mfcc=mfcc)
+    projection = np.zeros((2, 8), dtype=np.float32)
+    projection[0, 7] = 2.0
+    records = [
+        SimpleNamespace(
+            boundary_metadata={
+                "source_partition": "train",
+                "semantic_split_boundaries": [{"time_s": 0.02}],
+            },
+            duration_s=0.06,
+            frame_hop_s=0.02,
+        )
+    ]
+
+    features, targets, partition = _training_arrays(
+        {"label_index": 0, "feature_path": str(feature_path)},
+        records,
+        ptm_dim=2,
+        radius_frames=0,
+        projection_mean=np.zeros(8, dtype=np.float32),
+        projection_components=projection,
+    )
+
+    assert features[:, 0].tolist() == [2.0, 4.0, 6.0]
+    assert features.shape == (3, 4)
+    assert targets.tolist() == [0.0, 1.0, 0.0]
+    assert partition == "train"
