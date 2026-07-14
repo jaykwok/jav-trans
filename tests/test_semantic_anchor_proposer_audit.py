@@ -49,6 +49,17 @@ def test_adaptive_regions_use_neighbor_anchor_midpoints_and_source_edges() -> No
     assert regions[1]["region_end_s"] == 10.0
 
 
+def test_adaptive_regions_use_manual_outer_blockers() -> None:
+    row = _timeline_row()
+    row["region_blocker_anchors"] = [{"time_s": 5.5, "scope": "outer_only"}]
+
+    regions = adaptive_event_regions(row)
+
+    assert regions[0]["region_end_s"] == 3.85
+    assert regions[1]["region_start_s"] == 6.25
+    assert regions[0]["region_contract"].endswith("source_edges_v2")
+
+
 def test_stratified_candidates_use_proposer_argmax_without_threshold() -> None:
     probabilities = np.zeros(50, dtype=np.float32)
     expected = [1, 12, 24, 35, 48]
