@@ -35,7 +35,7 @@ def evaluate(*, items: Path, verdicts: Path, output: Path) -> dict[str, Any]:
         if item.get("schema") != ITEM_SCHEMA:
             raise ValueError("incompatible Inner edge audit item schema")
         verdict = verdict_by_id.get(str(item["subisland_id"])) or {}
-        prediction = item.get("bootstrap_prediction") or {}
+        prediction = item.get("model_prediction") or item.get("bootstrap_prediction") or {}
         for edge in ("start", "end"):
             if not item.get(f"{edge}_requires_inner"):
                 continue
@@ -46,6 +46,16 @@ def evaluate(*, items: Path, verdicts: Path, output: Path) -> dict[str, Any]:
                 complete_edges += 1
             if str(prediction.get(f"{edge}_action") or "") == "abstain":
                 model_abstain_edges += 1
+    formal_model_gate = bool(item_rows) and all(
+        row.get("teacher_usage") == "formal_inner_model_heldout_evaluation"
+        for row in item_rows
+    )
+    promotion_ready = (
+        formal_model_gate
+        and complete_edges == required_edges
+        and counts["correct"] == required_edges
+        and model_abstain_edges == 0
+    )
     summary = {
         "schema": SUMMARY_SCHEMA,
         "subisland_count": len(item_rows),
@@ -59,8 +69,14 @@ def evaluate(*, items: Path, verdicts: Path, output: Path) -> dict[str, Any]:
         "edge_cleanup_pass": complete_edges == required_edges
         and counts["clipped"] == 0
         and counts["too_wide"] == 0,
+        "formal_inner_checkpoint_gate": formal_model_gate,
+        "formal_inner_promotion_ready": promotion_ready,
         "bootstrap_inner_promotion_ready": False,
-        "bootstrap_reason": "Outer v2 preview is not an independently trained Inner checkpoint",
+        "bootstrap_reason": (
+            "not_applicable_formal_inner_checkpoint"
+            if formal_model_gate
+            else "Outer v2 preview is not an independently trained Inner checkpoint"
+        ),
     }
     output.parent.mkdir(parents=True, exist_ok=True)
     output.write_text(
