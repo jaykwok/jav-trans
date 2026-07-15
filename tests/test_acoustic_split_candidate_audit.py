@@ -90,6 +90,8 @@ def test_page_is_audio_only_and_explains_inner_responsibility(tmp_path: Path) ->
     assert "不提供文本、Omni 时间轴或旧切点" in page
     assert "provisional speech sub-island" in page
     assert "Inner Refiner" in page
+    assert "同一静音块里的多个候选全部标" in page
+    assert "one-sided speech" in page
     assert "不重叠试听区间" in page
     assert "split" in page and "continue" in page and "unsure" in page
     assert "acoustic_split_candidate_manual_verdict_v1" in page
