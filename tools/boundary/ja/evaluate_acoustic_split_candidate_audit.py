@@ -45,20 +45,16 @@ def evaluate(*, items: Path, verdicts: Path, output: Path) -> dict[str, Any]:
         }
         labels: list[str] = []
         inner_verdicts: list[str] = []
-        inner_complete = True
         for candidate in item["candidates"]:
             verdict_candidate = candidate_by_id.get(str(candidate["candidate_id"])) or {}
             label = str(verdict_candidate.get("label") or "unreviewed")
             inner_verdict = str(verdict_candidate.get("inner_verdict") or "not_reviewed")
             labels.append(label)
             inner_verdicts.append(inner_verdict)
-            if label == "split" and candidate.get("bootstrap_inner"):
-                inner_complete = inner_complete and inner_verdict in ALLOWED_INNER_VERDICTS
         coverage = str(verdict.get("coverage") or "unreviewed")
         complete = (
             all(label in ALLOWED_LABELS for label in labels)
             and coverage in ALLOWED_COVERAGE
-            and inner_complete
         )
         complete_sources += int(complete)
         if complete:

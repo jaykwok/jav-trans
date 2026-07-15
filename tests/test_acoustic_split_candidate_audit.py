@@ -88,8 +88,9 @@ def test_page_is_audio_only_and_explains_inner_responsibility(tmp_path: Path) ->
     ).read_text(encoding="utf-8")
 
     assert "不提供文本、Omni 时间轴或旧切点" in page
-    assert "provisional split" in page
+    assert "先闭合 Split" in page
     assert "bootstrap Inner" in page
+    assert "先由 CueQC v13" in page
     assert "同一静音块里的多个候选全部标" in page
     assert "one-sided speech" in page
     assert "bootstrap_preview_only_not_training_truth" not in page
@@ -139,7 +140,8 @@ def test_page_shows_bootstrap_inner_spans_without_making_them_truth(
     assert "精修左 sub-island" in page
     assert "removed gap" in page
     assert "精修右 sub-island" in page
-    assert "若 Split 应成立但 bootstrap 结果截语音" in page
+    assert "若 Split 应成立但当前预览截语音" in page
+    assert "不是本页完成条件" in page
     assert "inner_verdict" in page
 
 
@@ -262,7 +264,7 @@ def test_gate_does_not_turn_missing_or_unsure_into_continue(tmp_path: Path) -> N
     assert summary["training_ready"] is False
 
 
-def test_gate_requires_separate_inner_review_for_bootstrapped_split(
+def test_gate_keeps_bootstrap_inner_review_optional_for_split_training(
     tmp_path: Path,
 ) -> None:
     items = tmp_path / "items.jsonl"
@@ -298,8 +300,9 @@ def test_gate_requires_separate_inner_review_for_bootstrapped_split(
         items=items, verdicts=verdicts, output=tmp_path / "incomplete.json"
     )
 
-    assert incomplete["complete_source_count"] == 0
-    assert incomplete["training_ready"] is False
+    assert incomplete["complete_source_count"] == 1
+    assert incomplete["training_ready"] is True
+    assert incomplete["bootstrap_inner_review_complete"] is False
 
     reviewed = dict(base)
     reviewed["candidates"] = [
