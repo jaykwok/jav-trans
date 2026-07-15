@@ -107,9 +107,11 @@ def test_page_explains_same_gap_vs_new_gap(tmp_path: Path) -> None:
         update_latest=False,
     ).read_text(encoding="utf-8")
 
-    assert "同一 gap" in page
-    assert "新 gap" in page
-    assert "不重审 Split、CueQC 或 Inner" in page
+    assert "两个时间点之间有没有恢复真实 speech" in page
+    assert "中间无 speech＝同一 gap" in page
+    assert "中间有 speech＝两个 gap" in page
+    assert "只播放两点之间" in page
+    assert "这不是重复审核样本" in page
     assert ".join('\\n')+'\\n'" in page
 
 
