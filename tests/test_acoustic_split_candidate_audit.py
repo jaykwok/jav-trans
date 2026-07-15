@@ -88,15 +88,59 @@ def test_page_is_audio_only_and_explains_inner_responsibility(tmp_path: Path) ->
     ).read_text(encoding="utf-8")
 
     assert "不提供文本、Omni 时间轴或旧切点" in page
-    assert "provisional speech sub-island" in page
-    assert "Inner Refiner" in page
+    assert "provisional split" in page
+    assert "bootstrap Inner" in page
     assert "同一静音块里的多个候选全部标" in page
     assert "one-sided speech" in page
-    assert "不重叠试听区间" in page
+    assert "bootstrap_preview_only_not_training_truth" not in page
     assert "split" in page and "continue" in page and "unsure" in page
     assert "acoustic_split_candidate_manual_verdict_v1" in page
     assert "reference_text" not in page
     assert ".join('\\n')+'\\n'" in page
+
+
+def test_page_shows_bootstrap_inner_spans_without_making_them_truth(
+    tmp_path: Path,
+) -> None:
+    audio = tmp_path / "sample.wav"
+    audio.write_bytes(b"RIFF")
+    rows = [
+        {
+            "sample_id": "s1",
+            "audio": str(audio),
+            "duration_s": 3.0,
+            "outer_checkpoint_sha256": "outer-sha",
+            "proposer_sha256": "proposer-sha",
+            "projection_digest": "projection-digest",
+            "candidates": [
+                {
+                    "candidate_id": "c00",
+                    "time_s": 1.5,
+                    "context_start_s": 1.0,
+                    "context_end_s": 2.0,
+                    "proposer_probability": 0.8,
+                    "bootstrap_inner": {
+                        "status": "refined",
+                        "left_end_s": 1.2,
+                        "right_start_s": 1.8,
+                        "removed_gap_start_s": 1.2,
+                        "removed_gap_end_s": 1.8,
+                        "removed_gap_duration_s": 0.6,
+                    },
+                }
+            ],
+        }
+    ]
+
+    page = build_audit_html(
+        rows=rows, output_dir=tmp_path / "audit", update_latest=False
+    ).read_text(encoding="utf-8")
+
+    assert "精修左 sub-island" in page
+    assert "removed gap" in page
+    assert "精修右 sub-island" in page
+    assert "若 Split 应成立但 bootstrap 结果截语音" in page
+    assert "inner_verdict" in page
 
 
 def test_page_refreshes_audit_navigation_with_index_path(
@@ -216,3 +260,57 @@ def test_gate_does_not_turn_missing_or_unsure_into_continue(tmp_path: Path) -> N
     assert summary["label_counts"] == {"unsure": 1}
     assert summary["manual_fixed_gate_pass"] is False
     assert summary["training_ready"] is False
+
+
+def test_gate_requires_separate_inner_review_for_bootstrapped_split(
+    tmp_path: Path,
+) -> None:
+    items = tmp_path / "items.jsonl"
+    verdicts = tmp_path / "verdicts.jsonl"
+    _write_jsonl(
+        items,
+        [
+            {
+                "schema": "acoustic_split_candidate_audit_v1",
+                "sample_id": "s1",
+                "candidates": [
+                    {
+                        "candidate_id": "c00",
+                        "bootstrap_inner": {"status": "refined"},
+                    },
+                    {"candidate_id": "c01"},
+                ],
+            }
+        ],
+    )
+    base = {
+        "schema": "acoustic_split_candidate_manual_verdict_v1",
+        "sample_id": "s1",
+        "coverage": "complete",
+        "candidates": [
+            {"candidate_id": "c00", "label": "split"},
+            {"candidate_id": "c01", "label": "continue"},
+        ],
+    }
+    _write_jsonl(verdicts, [base])
+
+    incomplete = evaluate(
+        items=items, verdicts=verdicts, output=tmp_path / "incomplete.json"
+    )
+
+    assert incomplete["complete_source_count"] == 0
+    assert incomplete["training_ready"] is False
+
+    reviewed = dict(base)
+    reviewed["candidates"] = [
+        {"candidate_id": "c00", "label": "split", "inner_verdict": "correct"},
+        {"candidate_id": "c01", "label": "continue"},
+    ]
+    _write_jsonl(verdicts, [reviewed])
+    complete = evaluate(
+        items=items, verdicts=verdicts, output=tmp_path / "complete.json"
+    )
+
+    assert complete["complete_source_count"] == 1
+    assert complete["bootstrap_inner_verdict_counts"] == {"correct": 1}
+    assert complete["training_ready"] is True
