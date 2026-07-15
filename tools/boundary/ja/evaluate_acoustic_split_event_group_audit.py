@@ -40,6 +40,7 @@ def evaluate(*, items: Path, verdicts: Path, output_dir: Path) -> dict[str, Any]
         if item.get("schema") != ITEM_SCHEMA:
             raise ValueError("incompatible event grouping item schema")
         sample_id = str(item["sample_id"])
+        source_audio = (items.parent / str(item["audio"])).resolve()
         verdict = verdict_by_id.get(sample_id) or {}
         decisions = {
             str(row["link_id"]): str(row.get("decision") or "unreviewed")
@@ -105,7 +106,7 @@ def evaluate(*, items: Path, verdicts: Path, output_dir: Path) -> dict[str, Any]
                     "schema": "provisional_speech_subisland_v1",
                     "sample_id": sample_id,
                     "subisland_id": f"{sample_id}__s{index:02d}",
-                    "audio": str(item["audio"]),
+                    "audio": str(source_audio),
                     "start_s": float(start_s),
                     "end_s": float(end_s),
                     "duration_s": float(end_s) - float(start_s),
