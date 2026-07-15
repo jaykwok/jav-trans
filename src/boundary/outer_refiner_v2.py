@@ -13,9 +13,9 @@ from boundary.ja.model import SPEECH_ISLAND_SCORER_LABELS
 
 
 OUTER_EDGE_REFINER_V2_SCHEMA = "outer_edge_refiner_v2"
-OUTER_EDGE_REFINER_V2_MODEL_ARCH = "full_island_semantic_edges_mamba_v1"
+OUTER_EDGE_REFINER_V2_MODEL_ARCH = "full_island_learned_ptm_edges_mamba_v2"
 OUTER_EDGE_REFINER_V2_RUNTIME_ADAPTER = "paired_outer_edges_v2"
-OUTER_EDGE_REFINER_V2_FEATURE_SCHEMA = "full_island_semantic_edge_features_v2"
+OUTER_EDGE_REFINER_V2_FEATURE_SCHEMA = "full_island_raw_ptm_edge_features_v3"
 OUTER_EDGE_REFINER_V2_ARTIFACT = {
     "name": "outer_edge_refiner",
     "display_name": "Outer Edge Refiner",
@@ -29,7 +29,10 @@ class FullIslandOuterEdgeNetwork:
     def __new__(
         cls,
         *,
-        input_dim: int,
+        ptm_input_dim: int = 2048,
+        ptm_projected_dim: int = 128,
+        mfcc_dim: int = 40,
+        position_dim: int = 1,
         hidden_size: int = 128,
         num_layers: int = 2,
         state_size: int = 32,
@@ -51,7 +54,15 @@ class FullIslandOuterEdgeNetwork:
         class _Network(nn.Module):
             def __init__(self) -> None:
                 super().__init__()
-                self.frame_proj = nn.Linear(input_dim, hidden_size)
+                self.ptm_input_dim = int(ptm_input_dim)
+                self.mfcc_dim = int(mfcc_dim)
+                self.position_dim = int(position_dim)
+                self.ptm_projector = nn.Linear(
+                    ptm_input_dim, ptm_projected_dim, bias=True
+                )
+                self.frame_proj = nn.Linear(
+                    ptm_projected_dim + mfcc_dim + position_dim, hidden_size
+                )
                 self.encoder = Mamba2TemporalEncoder(
                     hidden_size=hidden_size,
                     num_layers=num_layers,
@@ -69,7 +80,17 @@ class FullIslandOuterEdgeNetwork:
                 )
 
             def forward(self, frame_features):
-                encoded = self.encoder(self.frame_proj(frame_features))
+                import torch
+
+                ptm_end = self.ptm_input_dim
+                mfcc_end = ptm_end + self.mfcc_dim
+                ptm = self.ptm_projector(frame_features[..., :ptm_end])
+                auxiliaries = frame_features[..., ptm_end : mfcc_end + self.position_dim]
+                encoded = self.encoder(
+                    self.frame_proj(
+                        torch.cat((nn.functional.gelu(ptm), auxiliaries), dim=-1)
+                    )
+                )
                 return self.head(encoded)
 
         return _Network()

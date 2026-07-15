@@ -487,10 +487,9 @@ class FrameSequenceFeatureProvider:
         *,
         start_s: float,
         end_s: float,
-        semantic_class_probabilities: np.ndarray,
-        expected_semantic_scorer_sha256: str,
+        raw_ptm_dim: int,
     ) -> np.ndarray:
-        """Return every frame in the scorer island for learned full-island edges."""
+        """Return raw PTM2048 + MFCC frames for learned full-island edges."""
 
         start_frame = max(0, int(round(start_s / self.frame_hop_s)))
         end_frame = min(
@@ -498,31 +497,16 @@ class FrameSequenceFeatureProvider:
             int(self._mfcc_used.shape[0]),
             int(round(end_s / self.frame_hop_s)),
         )
-        semantic_dim = (
-            int(self._semantic_ptm_projected_array.shape[1])
-            if self._semantic_ptm_projected_array is not None
-            else 0
-        )
         if end_frame <= start_frame:
             return np.zeros(
                 (
                     0,
-                    semantic_dim
-                    + int(self._mfcc_used.shape[1])
-                    + int(np.asarray(semantic_class_probabilities).shape[1])
-                    + 1,
+                    int(raw_ptm_dim) + int(self._mfcc_used.shape[1]) + 1,
                 ),
                 dtype=np.float32,
             )
-        scorer = np.asarray(semantic_class_probabilities, dtype=np.float32)
-        if scorer.ndim != 2 or scorer.shape[0] < end_frame:
-            raise ValueError(
-                "semantic_class_probabilities must cover the full outer island"
-            )
-        if self._semantic_ptm_projected_array is None:
-            raise ValueError("Outer Edge Refiner v2 requires learned semantic PTM frames")
-        if self.semantic_scorer_sha256 != str(expected_semantic_scorer_sha256):
-            raise ValueError("Outer Edge Refiner v2 semantic scorer SHA mismatch")
+        if int(self._ptm_used.shape[1]) < int(raw_ptm_dim):
+            raise ValueError("Outer Edge Refiner v2 requires full raw PTM frames")
         frame_total = end_frame - start_frame
         position = (
             np.arange(frame_total, dtype=np.float32) / max(1, frame_total - 1)
@@ -530,9 +514,8 @@ class FrameSequenceFeatureProvider:
         return np.ascontiguousarray(
             np.concatenate(
                 (
-                    self._semantic_ptm_projected_array[start_frame:end_frame],
+                    self._ptm_used[start_frame:end_frame, : int(raw_ptm_dim)],
                     self._mfcc_used[start_frame:end_frame],
-                    scorer[start_frame:end_frame],
                     position,
                 ),
                 axis=1,

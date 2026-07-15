@@ -4,6 +4,7 @@ import numpy as np
 
 from boundary.base import SpeechSegment
 from boundary.outer_refiner import OuterEdgePrediction
+from boundary.outer_refiner_v2 import OuterEdgeRefinerV2
 from boundary.runtime_pipeline import (
     SemanticBoundaryConfig,
     build_semantic_boundary_chunks,
@@ -70,6 +71,17 @@ class _CutRefiner:
         core_end_s,
     ):
         return proposal_times_s + 0.08
+
+
+class _OuterV2Logits:
+    def __call__(self, frames):
+        import torch
+
+        logits = torch.full((frames.shape[0], frames.shape[1], 3), -6.0)
+        logits[..., 0] = 6.0
+        logits[:, 1:3, 0] = -6.0
+        logits[:, 1:3, 1] = 6.0
+        return logits
 
 
 def test_effective_semantic_config_reports_checkpoint_decision() -> None:
@@ -142,6 +154,48 @@ def test_internal_cut_uses_one_shared_absolute_timestamp():
         "内部切点精修 0/1",
         "内部切点精修 1/1",
     ]
+
+
+def test_outer_v2_materializes_paired_edges_and_probability_metadata() -> None:
+    provider = FrameSequenceFeatureProvider(
+        duration_s=0.08,
+        frame_hop_s=0.02,
+        ptm=np.zeros((4, 2048), dtype=np.float32),
+        mfcc=np.zeros((4, 40), dtype=np.float32),
+        config=FrameSequenceFeatureConfig(max_ptm_dims=2048),
+    )
+    outer = OuterEdgeRefinerV2(
+        path="outer-v2.pt",
+        sha256="sha",
+        model=_OuterV2Logits(),
+        model_config={},
+        feature_config={"raw_ptm_dim": 2048},
+        normalization={
+            "feature_mean": [0.0] * 2089,
+            "feature_std": [1.0] * 2089,
+        },
+        metadata={},
+        device="cpu",
+    )
+
+    chunks = build_semantic_boundary_chunks(
+        [SpeechSegment(start=0.0, end=0.08)],
+        duration_s=0.08,
+        speech_probabilities=np.ones(4, dtype=np.float32),
+        feature_provider=provider,
+        outer_refiner=outer,
+        split_verifier=_SplitVerifier(),
+        cut_refiner=_CutRefiner(),
+    )
+
+    assert len(chunks) == 1
+    assert chunks[0].start == 0.02
+    assert chunks[0].end == 0.06
+    assert chunks[0].boundary_decision_source == "outer_edge_refiner_v2"
+    assert chunks[0].boundary_start_refine_delta_s == 0.02
+    assert np.isclose(chunks[0].boundary_end_refine_delta_s, -0.02)
+    assert chunks[0].refiner_start_confidence > 0.99
+    assert chunks[0].refiner_end_confidence > 0.99
 
 
 def test_short_core_prefers_continue_below_high_threshold():

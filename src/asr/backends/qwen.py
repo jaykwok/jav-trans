@@ -32,8 +32,12 @@ DEFAULT_QWEN_ASR_MIN_PHYSICAL_VRAM_MB_BY_REPO: dict[str, int] = {
     QWEN_ASR_17B_REPO_ID: 6144,
 }
 DEFAULT_OUTER_EDGE_REFINER_CHECKPOINT_BY_REPO: dict[str, str] = {
-    repo_id: repo_checkpoint_path(repo_id, "outer_edge_refiner", "v1")
-    for repo_id in QWEN_ASR_BACKEND_REPOS
+    QWEN_ASR_06B_REPO_ID: repo_checkpoint_path(
+        QWEN_ASR_06B_REPO_ID, "outer_edge_refiner", "v1"
+    ),
+    QWEN_ASR_17B_REPO_ID: repo_checkpoint_path(
+        QWEN_ASR_17B_REPO_ID, "outer_edge_refiner", "v2"
+    ),
 }
 DEFAULT_SEMANTIC_SPLIT_CHECKPOINT_BY_REPO: dict[str, str] = {
     repo_id: repo_checkpoint_path(repo_id, "semantic_split_model", "v2")

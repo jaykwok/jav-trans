@@ -161,6 +161,21 @@ def test_qwen_checkpoint_path_defaults_to_registry_when_env_is_absent(monkeypatc
     assert path.endswith("outer_edge_refiner_v1.jaykwok-Qwen3-ASR-1.7B-JA-Anime-Galgame-hf.pt")
 
 
+def test_default_outer_registry_promotes_only_17b() -> None:
+    from asr.backends import qwen
+
+    assert qwen.DEFAULT_OUTER_EDGE_REFINER_CHECKPOINT_BY_REPO[
+        ASR_06B_BACKEND
+    ].endswith(
+        "outer_edge_refiner_v1.jaykwok-Qwen3-ASR-0.6B-JA-Anime-Galgame-hf.pt"
+    )
+    assert qwen.DEFAULT_OUTER_EDGE_REFINER_CHECKPOINT_BY_REPO[
+        ASR_17B_BACKEND
+    ].endswith(
+        "outer_edge_refiner_v2.jaykwok-Qwen3-ASR-1.7B-JA-Anime-Galgame-hf.pt"
+    )
+
+
 def test_qwen_checkpoint_path_defaults_fall_back_to_resource_root(monkeypatch, tmp_path):
     from asr.backends import qwen
 

@@ -47,6 +47,7 @@ from tools.boundary.ja.label_semantic_source_candidates_with_omni import (  # no
 
 SCHEMA = "semantic_anchor_learned_proposer_audit_v2"
 SUMMARY_SCHEMA = "semantic_anchor_learned_proposer_audit_summary_v2"
+OUTER_REFINED_AUDIO_CONTRACT = "learned_outer_refined_island_v1"
 DEFAULT_PROJECTION = PROJECT_ROOT / (
     "src/checkpoints/jaykwok-Qwen3-ASR-1.7B-JA-Anime-Galgame-hf/"
     "semantic_split_model_v2.jaykwok-Qwen3-ASR-1.7B-JA-Anime-Galgame-hf."
@@ -65,6 +66,19 @@ def _write_jsonl(path: Path, rows: Iterable[dict[str, Any]]) -> None:
     with path.open("w", encoding="utf-8") as handle:
         for row in rows:
             handle.write(json.dumps(row, ensure_ascii=False) + "\n")
+
+
+def validate_outer_refined_inputs(rows: list[dict[str, Any]]) -> None:
+    invalid = [
+        str(row.get("sample_id") or "")
+        for row in rows
+        if row.get("audio_contract") != OUTER_REFINED_AUDIO_CONTRACT
+    ]
+    if invalid:
+        raise ValueError(
+            "semantic/inner candidates require learned Outer-refined islands: "
+            + ", ".join(invalid)
+        )
 
 
 def _file_sha256(path: Path) -> str:
@@ -359,6 +373,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         labels = [by_id[sample_id] for sample_id in selected_ids]
     if not labels:
         raise ValueError("no semantic timeline labels selected")
+    validate_outer_refined_inputs(labels)
     requested_event_keys = set(args.event_key or [])
     if requested_event_keys:
         labels = [

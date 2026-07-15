@@ -184,6 +184,12 @@ def test_active_boundary_pre_asr_registry_is_breaking_v2_v12_only() -> None:
         "pre_asr_cueqc_v12." in path
         for path in qwen.DEFAULT_PRE_ASR_CUEQC_CHECKPOINT_BY_REPO.values()
     )
+    assert "outer_edge_refiner_v1." in qwen.DEFAULT_OUTER_EDGE_REFINER_CHECKPOINT_BY_REPO[
+        qwen.QWEN_ASR_06B_REPO_ID
+    ]
+    assert "outer_edge_refiner_v2." in qwen.DEFAULT_OUTER_EDGE_REFINER_CHECKPOINT_BY_REPO[
+        qwen.QWEN_ASR_17B_REPO_ID
+    ]
     active_mappings = (
         qwen.DEFAULT_SPEECH_BOUNDARY_SCORER_CHECKPOINT_BY_REPO,
         qwen.DEFAULT_SPEECH_BOUNDARY_PROPOSAL_CHECKPOINT_BY_REPO,

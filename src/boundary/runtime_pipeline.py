@@ -11,6 +11,7 @@ from audio.chunk_packer import PackedChunk
 from boundary.base import SpeechSegment
 from boundary.cut_refiner import CutEdgeRefiner
 from boundary.outer_refiner import OuterEdgeRefiner
+from boundary.outer_refiner_v2 import OuterEdgeRefinerV2, PairedOuterEdgePrediction
 from boundary.sequence_features import (
     FrameSequenceFeatureProvider,
     ptm_projection_digest,
@@ -117,7 +118,7 @@ def build_semantic_boundary_chunks(
     duration_s: float,
     speech_probabilities: Sequence[float],
     feature_provider: FrameSequenceFeatureProvider,
-    outer_refiner: OuterEdgeRefiner,
+    outer_refiner: OuterEdgeRefiner | OuterEdgeRefinerV2,
     split_verifier: SemanticSplitIslandVerifier,
     cut_refiner: CutEdgeRefiner,
     config: SemanticBoundaryConfig = SemanticBoundaryConfig(),
@@ -397,6 +398,33 @@ def _refine_outer_edges(
     provider,
     refiner,
 ):
+    if isinstance(refiner, OuterEdgeRefinerV2):
+        frame_feature_groups = [
+            provider.features_for_outer_island_v2(
+                start_s=segment.start,
+                end_s=segment.end,
+                raw_ptm_dim=int(refiner.feature_config["raw_ptm_dim"]),
+            )
+            for segment in segments
+        ]
+        predictions = refiner.predict_islands(
+            frame_feature_groups=frame_feature_groups,
+            raw_spans=[(float(segment.start), float(segment.end)) for segment in segments],
+            frame_hop_s=float(provider.frame_hop_s),
+        )
+        return [
+            (
+                segment,
+                max(0.0, min(float(prediction.start_s), duration_s)),
+                max(
+                    max(0.0, min(float(prediction.start_s), duration_s)),
+                    min(float(prediction.end_s), duration_s),
+                ),
+                prediction,
+            )
+            for segment, prediction in zip(segments, predictions)
+        ]
+
     feature_rows: list[np.ndarray] = []
     scalar_rows: list[np.ndarray] = []
     for segment in segments:
@@ -854,6 +882,18 @@ def _materialize_chunks(
     decisions,
     outer_prediction,
 ):
+    if isinstance(outer_prediction, PairedOuterEdgePrediction):
+        outer_decision_source = "outer_edge_refiner_v2"
+        outer_start_confidence = float(
+            outer_prediction.start_probabilities["semantic_target"]
+        )
+        outer_end_confidence = float(
+            outer_prediction.end_probabilities["semantic_target"]
+        )
+    else:
+        outer_decision_source = "outer_edge_refiner_v1"
+        outer_start_confidence = float(outer_prediction.start_confidence)
+        outer_end_confidence = float(outer_prediction.end_confidence)
     decision_by_time = {
         round(float(candidate["time_s"]), 6): decision
         for candidate, decision in zip(proposals, decisions)
@@ -928,13 +968,13 @@ def _materialize_chunks(
                     else None
                 ),
                 boundary_decision_source=(
-                    "outer_edge_refiner_v1" if not primary else "shared_absolute_cut_v1"
+                    outer_decision_source if not primary else "shared_absolute_cut_v1"
                 ),
                 refiner_start_confidence=(
-                    outer_prediction.start_confidence if index == 0 else None
+                    outer_start_confidence if index == 0 else None
                 ),
                 refiner_end_confidence=(
-                    outer_prediction.end_confidence
+                    outer_end_confidence
                     if index + 1 == len(boundaries) - 1
                     else None
                 ),
