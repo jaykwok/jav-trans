@@ -24,6 +24,13 @@ from boundary.outer_refiner_v2 import (
     OUTER_EDGE_REFINER_V2_SCHEMA,
     decode_outer_edge_probabilities,
 )
+from boundary.inner_refiner_v1 import (
+    FullSubislandInnerEdgeNetwork,
+    INNER_EDGE_REFINER_V1_FEATURE_SCHEMA,
+    INNER_EDGE_REFINER_V1_MODEL_ARCH,
+    INNER_EDGE_REFINER_V1_RUNTIME_ADAPTER,
+    INNER_EDGE_REFINER_V1_SCHEMA,
+)
 from boundary.sequence_features import (
     FrameSequenceFeatureConfig,
     FrameSequenceFeatureProvider,
@@ -93,6 +100,18 @@ def test_outer_v2_ptm_2048_to_128_projection_is_trainable() -> None:
     assert model.ptm_projector.out_features == 128
     assert model.ptm_projector.weight.requires_grad is True
     assert model.ptm_projector.bias.requires_grad is True
+
+
+def test_inner_v1_is_independent_paired_subisland_checkpoint_contract() -> None:
+    assert INNER_EDGE_REFINER_V1_SCHEMA == "inner_edge_refiner_v1"
+    assert INNER_EDGE_REFINER_V1_MODEL_ARCH == "subisland_learned_ptm_edges_mamba_v1"
+    assert INNER_EDGE_REFINER_V1_RUNTIME_ADAPTER == "paired_inner_edges_v1"
+    assert INNER_EDGE_REFINER_V1_FEATURE_SCHEMA == "subisland_raw_ptm_edge_features_v1"
+
+    model = FullSubislandInnerEdgeNetwork()
+    assert model.ptm_projector.in_features == 2048
+    assert model.ptm_projector.out_features == 128
+    assert model.ptm_projector.weight.requires_grad is True
 
 
 def test_outer_v2_runtime_uses_raw_ptm_tail_dims_before_learned_projection() -> None:

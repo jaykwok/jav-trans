@@ -4,11 +4,40 @@ import numpy as np
 import pytest
 
 from tools.boundary.ja.build_galgame_synthetic_timeline import (
+    load_excluded_source_audio_ids,
     parse_args,
     sample_binary_hardmix_layout,
     sample_half_open_int,
     stable_source_partition,
 )
+
+
+def test_source_exclusion_ledger_reads_dataset_source_ids(tmp_path) -> None:
+    manifest = tmp_path / "used.jsonl"
+    manifest.write_text(
+        "".join(
+            (
+                '{"source_audio_ids":["a","b"]}\n',
+                '{"boundary_metadata":{"source_audio_ids":["c"]}}\n',
+            )
+        ),
+        encoding="utf-8",
+    )
+
+    assert load_excluded_source_audio_ids([str(manifest)]) == {"a", "b", "c"}
+
+    args = parse_args(
+        [
+            "--manifest",
+            "unused.json",
+            "--exclude-source-manifest",
+            str(manifest),
+            "--exclude-source-audio-id",
+            "d",
+        ]
+    )
+    assert args.exclude_source_manifest == [str(manifest)]
+    assert args.exclude_source_audio_id == ["d"]
 
 
 def test_half_open_integer_sampling_never_reaches_upper_bound() -> None:
