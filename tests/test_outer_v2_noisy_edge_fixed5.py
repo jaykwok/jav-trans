@@ -74,6 +74,13 @@ def test_select_empirical_edge_assets_is_unique_and_kind_disjoint(tmp_path: Path
     selected_ids = [row["audio_id"] for values in selected.values() for row in values]
     assert len(set(selected_ids)) == 10
 
+    excluded = {selected["vocal"][0]["audio_id"], selected["noise"][0]["audio_id"]}
+    reselection = select_empirical_edge_assets(rows, excluded_audio_ids=excluded)
+    reselected_ids = {
+        row["audio_id"] for values in reselection.values() for row in values
+    }
+    assert reselected_ids.isdisjoint(excluded)
+
 
 def test_build_noisy_edge_fixed5_uses_each_core_and_negative_once(tmp_path: Path) -> None:
     semantic_rows = []

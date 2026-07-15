@@ -108,15 +108,20 @@ def canonical_negative_categories(row: dict[str, Any]) -> tuple[str, ...]:
 
 
 def select_empirical_edge_assets(
-    rows: list[dict[str, Any]], *, count_per_kind: int = 5
+    rows: list[dict[str, Any]],
+    *,
+    count_per_kind: int = 5,
+    excluded_audio_ids: set[str] | None = None,
 ) -> dict[str, list[dict[str, Any]]]:
     if count_per_kind != len(VOCAL_CATEGORY_FLAGS):
         raise ValueError("noisy-edge fixed-5 requires one asset per vocal category")
+    excluded = excluded_audio_ids or set()
     valid = [
         row
         for row in rows
         if str(row.get("source") or "") == "omni_definite_drop"
         and str(row.get("source_partition") or "train") == "train"
+        and str(row.get("audio_id") or "") not in excluded
         and Path(str(row.get("audio") or "")).is_file()
         and float(row.get("duration_s") or 0.0) > 0.0
     ]
@@ -199,13 +204,25 @@ def _asset_metadata(row: dict[str, Any], *, side: str, kind: str) -> dict[str, A
 
 
 def build(args: argparse.Namespace) -> dict[str, Any]:
-    semantic_rows = _rows(Path(args.semantic_timeline_labels))
+    excluded_semantic_ids = set(
+        str(value) for value in getattr(args, "exclude_semantic_sample_id", [])
+    )
+    semantic_rows = [
+        row
+        for row in _rows(Path(args.semantic_timeline_labels))
+        if str(row["sample_id"]) not in excluded_semantic_ids
+    ]
     if len(semantic_rows) != 5:
         raise ValueError(f"noisy-edge fixed audit requires exactly 5 semantic sources; got {len(semantic_rows)}")
     sample_ids = [str(row["sample_id"]) for row in semantic_rows]
     if len(set(sample_ids)) != 5:
         raise ValueError("semantic sources must be unique")
-    assets = select_empirical_edge_assets(_rows(Path(args.negative_manifest)))
+    excluded_edge_ids = set(
+        str(value) for value in getattr(args, "exclude_edge_audio_id", [])
+    )
+    assets = select_empirical_edge_assets(
+        _rows(Path(args.negative_manifest)), excluded_audio_ids=excluded_edge_ids
+    )
     output_dir = Path(args.output_dir)
     audio_dir = output_dir / "audio"
     audio_dir.mkdir(parents=True, exist_ok=True)
@@ -263,7 +280,10 @@ def build(args: argparse.Namespace) -> dict[str, Any]:
         )
         if transition:
             transitions.append(transition)
-        audio_id = f"outerv2-edge-noise-{index + 1:02d}"
+        sample_id_prefix = str(
+            getattr(args, "sample_id_prefix", "outerv2-edge-noise")
+        )
+        audio_id = f"{sample_id_prefix}-{index + 1:02d}"
         audio_path = audio_dir / f"{audio_id}.wav"
         sf.write(str(audio_path), composite, SAMPLE_RATE, subtype="PCM_16")
         duration_s = len(composite) / SAMPLE_RATE
@@ -281,7 +301,7 @@ def build(args: argparse.Namespace) -> dict[str, Any]:
         }
         timeline_rows.append(
             {
-                "schema": SCHEMA,
+                "schema": str(getattr(args, "schema", SCHEMA)),
                 "sample_id": audio_id,
                 "source_sample_id": str(semantic["sample_id"]),
                 "audio": str(audio_path),
@@ -312,7 +332,7 @@ def build(args: argparse.Namespace) -> dict[str, Any]:
         feature_label_rows.append(
             {
                 "audio_id": audio_id,
-                "source": SCHEMA,
+                "source": str(getattr(args, "schema", SCHEMA)),
                 "duration_s": duration_s,
                 "frame_hop_s": FRAME_HOP_S,
                 "label_quality": "supervised",
@@ -327,12 +347,14 @@ def build(args: argparse.Namespace) -> dict[str, Any]:
     _write_jsonl(timeline_path, timeline_rows)
     _write_jsonl(feature_labels_path, feature_label_rows)
     summary = {
-        "schema": SCHEMA,
+        "schema": str(getattr(args, "schema", SCHEMA)),
         "sample_count": len(timeline_rows),
         "semantic_source_count": len(set(sample_ids)),
         "max_semantic_source_use_count": 1,
         "edge_asset_count": len(used_assets),
         "max_edge_asset_use_count": 1,
+        "excluded_semantic_sample_ids": sorted(excluded_semantic_ids),
+        "excluded_edge_audio_ids": sorted(excluded_edge_ids),
         "edge_selection": "empirical_vocal_category_stratified_plus_noise_quantiles_v1",
         "crossfade_ms": [args.crossfade_ms_min, args.crossfade_ms_max],
         "timeline_labels": str(timeline_path),
@@ -350,6 +372,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--semantic-timeline-labels", required=True)
     parser.add_argument("--negative-manifest", required=True)
     parser.add_argument("--output-dir", required=True)
+    parser.add_argument("--exclude-semantic-sample-id", action="append", default=[])
+    parser.add_argument("--exclude-edge-audio-id", action="append", default=[])
+    parser.add_argument("--sample-id-prefix", default="outerv2-edge-noise")
+    parser.add_argument("--schema", default=SCHEMA)
     parser.add_argument("--seed", type=int, default=15)
     parser.add_argument("--crossfade-ms-min", type=float, default=5.0)
     parser.add_argument("--crossfade-ms-max", type=float, default=30.0)
