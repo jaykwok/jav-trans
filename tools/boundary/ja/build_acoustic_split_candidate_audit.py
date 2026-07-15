@@ -31,6 +31,7 @@ from boundary.ja.model import (  # noqa: E402
     score_speech_island_probabilities_batch,
 )
 from boundary.ja.proposal import load_boundary_proposal_checkpoint  # noqa: E402
+from boundary.outer_refiner_v2 import load_outer_edge_refiner_v2  # noqa: E402
 from tools.audits.audit_nav import update_audit_entrypoints  # noqa: E402
 from tools.boundary.ja.build_semantic_anchor_proposer_audit import (  # noqa: E402
     select_stratified_proposer_frames,
@@ -46,6 +47,7 @@ SUMMARY_SCHEMA = "acoustic_split_candidate_audit_summary_v1"
 VERDICT_SCHEMA = "acoustic_split_candidate_manual_verdict_v1"
 OUTER_AUDIO_CONTRACT = "learned_outer_refined_island_v1"
 ALLOWED_LABELS = ("split", "continue", "unsure")
+INNER_REVIEW_LABELS = ("correct", "clipped", "too_wide", "abstain", "unsure")
 
 
 def _rows(path: Path) -> list[dict[str, Any]]:
@@ -112,6 +114,113 @@ def candidate_contexts(times_s: list[float], *, duration_s: float) -> list[dict[
             }
         )
     return contexts
+
+
+def _edge_frame_features(ptm: np.ndarray, mfcc: np.ndarray) -> np.ndarray:
+    total = min(int(ptm.shape[0]), int(mfcc.shape[0]))
+    if total <= 0:
+        return np.zeros((0, 2089), dtype=np.float32)
+    position = (
+        np.arange(total, dtype=np.float32) / max(1, total - 1)
+    ).reshape(-1, 1)
+    return np.concatenate(
+        (
+            np.asarray(ptm[:total], dtype=np.float32),
+            np.asarray(mfcc[:total], dtype=np.float32),
+            position,
+        ),
+        axis=1,
+    )
+
+
+def bootstrap_inner_edges(
+    *,
+    rows: list[dict[str, Any]],
+    checkpoint: Path,
+    ptm_repo_id: str,
+    device: str,
+) -> str:
+    """Apply Outer v2 independently to both provisional candidate sides.
+
+    The checkpoint is only a bootstrap visualization for manual review.  It is
+    not treated as an Inner training target.
+    """
+
+    model = load_outer_edge_refiner_v2(
+        checkpoint,
+        device=device,
+        expected_ptm_repo_id=ptm_repo_id,
+    )
+    for row in rows:
+        feature_path = PROJECT_ROOT / str(row["feature_path"])
+        with np.load(feature_path, allow_pickle=False) as payload:
+            ptm = np.asarray(payload["ptm"], dtype=np.float32)
+            mfcc = np.asarray(payload["mfcc"], dtype=np.float32)
+        frame_hop_s = float(row.get("frame_hop_s") or 0.02)
+        source_span = dict(row["source_span"])
+        outer_start_frame = max(0, int(round(float(source_span["start_s"]) / frame_hop_s)))
+        outer_end_frame = min(
+            ptm.shape[0], int(round(float(source_span["end_s"]) / frame_hop_s))
+        )
+        for candidate in row["candidates"]:
+            candidate_frame = max(
+                outer_start_frame + 1,
+                min(
+                    outer_end_frame - 1,
+                    outer_start_frame
+                    + int(round(float(candidate["time_s"]) / frame_hop_s)),
+                ),
+            )
+            left_features = _edge_frame_features(
+                ptm[outer_start_frame:candidate_frame],
+                mfcc[outer_start_frame:candidate_frame],
+            )
+            right_features = _edge_frame_features(
+                ptm[candidate_frame:outer_end_frame],
+                mfcc[candidate_frame:outer_end_frame],
+            )
+            if left_features.shape[0] < 2 or right_features.shape[0] < 2:
+                candidate["bootstrap_inner"] = {
+                    "status": "abstain",
+                    "reason": "provisional_side_too_short",
+                    "checkpoint_sha256": model.sha256,
+                }
+                continue
+            left_duration = float(left_features.shape[0]) * frame_hop_s
+            right_duration = float(right_features.shape[0]) * frame_hop_s
+            left_prediction, right_prediction = model.predict_islands(
+                frame_feature_groups=[left_features, right_features],
+                raw_spans=[(0.0, left_duration), (0.0, right_duration)],
+                frame_hop_s=frame_hop_s,
+            )
+            candidate_time = float(candidate["time_s"])
+            left_end = min(candidate_time, float(left_prediction.end_s))
+            right_start = min(
+                float(row["duration_s"]),
+                candidate_time + float(right_prediction.start_s),
+            )
+            abstain_reasons = [
+                reason
+                for reason in (
+                    str(left_prediction.abstain_reason or ""),
+                    str(right_prediction.abstain_reason or ""),
+                )
+                if reason
+            ]
+            candidate["bootstrap_inner"] = {
+                "status": "abstain" if abstain_reasons else "refined",
+                "reason": ";".join(abstain_reasons),
+                "left_end_s": left_end,
+                "right_start_s": right_start,
+                "removed_gap_start_s": left_end,
+                "removed_gap_end_s": right_start,
+                "removed_gap_duration_s": max(0.0, right_start - left_end),
+                "left_end_action": str(left_prediction.end_action),
+                "right_start_action": str(right_prediction.start_action),
+                "checkpoint_sha256": model.sha256,
+                "teacher_usage": "bootstrap_preview_only_not_training_truth",
+            }
+    return model.sha256
 
 
 def select_fixed_sources(scored_rows: list[dict[str, Any]], *, count: int) -> list[dict[str, Any]]:
@@ -229,6 +338,9 @@ def _score_rows(
                     "audio": str(row["audio"]),
                     "duration_s": duration_s,
                     "audio_contract": OUTER_AUDIO_CONTRACT,
+                    "feature_path": str(feature_row["feature_path"]),
+                    "frame_hop_s": float(feature_row.get("frame_hop_s") or 0.02),
+                    "source_span": dict(row["source_span"]),
                     "outer_checkpoint_sha256": str(row["outer_prediction"]["checkpoint_sha256"]),
                     "projection_digest": projection_digest,
                     "projection_file_sha256": _file_sha256(projection_path),
@@ -260,18 +372,21 @@ def build_audit_html(
     payload = json.dumps(rows, ensure_ascii=False).replace("</", "<\\/")
     html = f"""<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><title>Acoustic Split v3 fixed audit</title><style>
 body{{margin:0;background:#0d1117;color:#e6edf3;font-family:system-ui}}header{{position:sticky;top:0;z-index:2;padding:12px 18px;background:#161b22;border-bottom:1px solid #30363d}}main{{max-width:1200px;margin:auto;padding:16px}}article{{padding:16px;margin:14px 0;background:#161b22;border:1px solid #30363d;border-radius:10px}}article.done{{border-color:#2ea043}}.help{{background:#10233f;padding:14px;border-radius:10px}}table{{width:100%;border-collapse:collapse}}th,td{{padding:8px;border-bottom:1px solid #30363d;text-align:left}}button{{margin:3px;padding:6px 10px;background:#21262d;color:#e6edf3;border:1px solid #484f58;border-radius:6px}}button.active{{background:#1f6feb;border-color:#58a6ff}}button.split.active{{background:#238636}}button.continue.active{{background:#9e6a03}}button.unsure.active{{background:#8250df}}audio{{width:100%}}small{{color:#8b949e}}textarea{{width:100%;min-height:60px;background:#0d1117;color:#e6edf3}}.coverage{{margin-top:10px;padding-top:10px;border-top:1px solid #30363d}}
-</style></head><body><header><strong>Acoustic Split v3 · actual Outer v2 island fixed-{len(rows)}</strong> <button id="save">保存全部裁决</button> <span id="status"></span></header><main><section class="help"><h2>只判断是否值得拆成两个 provisional speech sub-island</h2><p>本页不提供文本、Omni 时间轴或旧切点。候选来自独立学习型 BoundaryProposalScorer；它只负责高召回枚举，不是最终切点。</p><p><b>split：</b>此处存在足够明确的 utterance/韵律停顿，值得逻辑拆开；不要求候选秒数正好落在安全边缘。<b>continue：</b>同一句/同一连续 utterance 内的短停顿、犹豫或换气，不应拆。<b>unsure：</b>听不清、连续重叠或难以稳定判断。</p><p><b>静音/杂音块：</b>若两侧都有真实 speech 且应成为两个 sub-island，则落在同一静音块里的多个候选全部标 <code>split</code>，连续 split run 最终只形成一个 event；静音本身不会成为 chunk。若两侧仍是同一句的短暂停顿则标 <code>continue</code>。若只有一侧有 speech、另一侧只是尾部/前导杂音，这是 Scorer/Outer 问题，标 <code>unsure</code> 并备注“one-sided speech”，不要伪造内部 split。</p><p>每个候选的前侧和后侧播放区间由相邻候选中点划分，彼此不重叠。Inner Refiner 后续仍从原 island 上精修相邻 sub-island 的 end/start，本页不裁精确边缘。</p></section><div id="list"></div></main><script>
+</style></head><body><header><strong>Acoustic Split v3 · actual Outer v2 island fixed-{len(rows)}</strong> <button id="save">保存全部裁决</button> <span id="status"></span></header><main><section class="help"><h2>先看 provisional split，再看 bootstrap Inner 精修结果</h2><p>本页不提供文本、Omni 时间轴或旧切点。候选来自独立学习型 BoundaryProposalScorer；它只负责高召回枚举，不是最终切点。</p><p><b>split：</b>此处存在足够明确的 utterance/韵律停顿，值得逻辑拆开。<b>continue：</b>同一句/同一连续 utterance 内的短停顿、犹豫或换气，不应拆。<b>unsure：</b>听不清、连续重叠或难以稳定判断。</p><p><b>bootstrap Inner：</b>现役 Outer v2 分别对候选左右 provisional sub-island 向内精修，仅用于预览最终链路，不是 Inner 训练真值。若 Split 应成立但 bootstrap 结果截语音或残留杂音，Split 仍标 <code>split</code>，并单独把 Inner 质量标为 clipped/too_wide/abstain。</p><p><b>静音/杂音块：</b>若两侧都有真实 speech 且应成为两个 sub-island，则落在同一静音块里的多个候选全部标 <code>split</code>，连续 split run 最终只形成一个 event；removed gap 不会成为 chunk。若两侧仍是同一句的短暂停顿则标 <code>continue</code>。若只有一侧有 speech、另一侧只是尾部/前导杂音，这是 Scorer/Outer 问题，标 <code>unsure</code> 并备注“one-sided speech”。</p></section><div id="list"></div></main><script>
 const rows={payload};const key='acoustic-split-candidate-audit-v1:'+location.pathname;const ann=JSON.parse(localStorage.getItem(key)||'{{}}');let timer=null,active=null;
 function esc(s){{return String(s??'').replace(/[&<>"']/g,c=>({{'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}}[c]));}}
-function ensure(r){{ann[r.sample_id]??={{labels:{{}},coverage:'',note:''}};return ann[r.sample_id];}}
-function complete(r,a){{return r.candidates.every(c=>a.labels[c.candidate_id])&&Boolean(a.coverage);}}
+function ensure(r){{ann[r.sample_id]??={{labels:{{}},inner:{{}},coverage:'',note:''}};ann[r.sample_id].labels??={{}};ann[r.sample_id].inner??={{}};return ann[r.sample_id];}}
+function hasBootstrapAttempt(c){{return Boolean(c.bootstrap_inner);}}
+function hasBootstrap(c){{return Boolean(c.bootstrap_inner&&c.bootstrap_inner.left_end_s!=null&&c.bootstrap_inner.right_start_s!=null&&Number.isFinite(Number(c.bootstrap_inner.left_end_s))&&Number.isFinite(Number(c.bootstrap_inner.right_start_s)));}}
+function complete(r,a){{return r.candidates.every(c=>a.labels[c.candidate_id]&&(a.labels[c.candidate_id]!=='split'||!hasBootstrapAttempt(c)||a.inner[c.candidate_id]))&&Boolean(a.coverage);}}
 function persist(){{localStorage.setItem(key,JSON.stringify(ann));status();}}
 function status(){{const done=rows.filter(r=>complete(r,ensure(r))).length;document.getElementById('status').textContent=`完成 ${{done}}/${{rows.length}}`;}}
 function play(audio,start,end){{if(active&&active!==audio)active.pause();active=audio;if(timer)clearTimeout(timer);audio.currentTime=Math.max(0,Number(start));audio.play();timer=setTimeout(()=>audio.pause(),Math.max(1,(Number(end)-Number(start))*1000));}}
 function choice(a,c,label,text){{return `<button data-cid="${{esc(c.candidate_id)}}" data-label="${{label}}" class="${{label}} ${{a.labels[c.candidate_id]===label?'active':''}}">${{text}}</button>`;}}
+function innerChoice(a,c,label,text){{return `<button data-inner-cid="${{esc(c.candidate_id)}}" data-inner-label="${{label}}" class="${{a.inner[c.candidate_id]===label?'active':''}}">${{text}}</button>`;}}
 function coverage(a,value,text){{return `<button data-coverage="${{value}}" class="${{a.coverage===value?'active':''}}">${{text}}</button>`;}}
-function render(){{const root=document.getElementById('list');root.innerHTML='';for(const r of rows){{const a=ensure(r),card=document.createElement('article');if(complete(r,a))card.classList.add('done');const audioId='audio-'+r.sample_id;const body=r.candidates.map(c=>`<tr><td><b>${{esc(c.candidate_id)}}</b><br>${{Number(c.time_s).toFixed(3)}}s<br><small>p=${{Number(c.proposer_probability).toFixed(4)}}</small></td><td><button data-play-start="${{c.context_start_s}}" data-play-end="${{c.time_s}}">播放前侧</button><button data-play-start="${{c.time_s}}" data-play-end="${{c.context_end_s}}">播放后侧</button><button data-play-start="${{c.context_start_s}}" data-play-end="${{c.context_end_s}}">连续播放</button><br><small>${{Number(c.context_start_s).toFixed(3)}}–${{Number(c.time_s).toFixed(3)}}–${{Number(c.context_end_s).toFixed(3)}}s</small></td><td>${{choice(a,c,'split','split')}}${{choice(a,c,'continue','continue')}}${{choice(a,c,'unsure','unsure')}}</td></tr>`).join('');card.innerHTML=`<h2>${{esc(r.sample_id)}} · ${{Number(r.duration_s).toFixed(3)}}s</h2><small>Outer v2=${{esc(r.outer_checkpoint_sha256.slice(0,12))}} · proposer=${{esc(r.proposer_sha256.slice(0,12))}} · learned projection=${{esc(r.projection_digest.slice(0,12))}}</small><p><b>完整 Outer v2 island</b></p><audio id="${{esc(audioId)}}" controls preload="metadata" src="${{esc(r.audio)}}"></audio><table><thead><tr><th>候选</th><th>不重叠试听区间</th><th>是否逻辑拆分</th></tr></thead><tbody>${{body}}</tbody></table><div class="coverage"><b>候选覆盖：</b>${{coverage(a,'complete','所有实际可分停顿均有候选')}}${{coverage(a,'missed','存在漏掉的可分停顿')}}${{coverage(a,'unsure','不确定')}}</div><label><b>备注</b><textarea placeholder="指出漏候选、句内短暂停顿或其他问题">${{esc(a.note)}}</textarea></label>`;const audio=card.querySelector('audio');card.querySelectorAll('[data-play-start]').forEach(b=>b.onclick=()=>play(audio,b.dataset.playStart,b.dataset.playEnd));card.querySelectorAll('[data-cid]').forEach(b=>b.onclick=()=>{{a.labels[b.dataset.cid]=b.dataset.label;a.updated_at=new Date().toISOString();persist();render();}});card.querySelectorAll('[data-coverage]').forEach(b=>b.onclick=()=>{{a.coverage=b.dataset.coverage;a.updated_at=new Date().toISOString();persist();render();}});card.querySelector('textarea').onchange=e=>{{a.note=e.target.value;a.updated_at=new Date().toISOString();persist();}};root.appendChild(card);}}status();}}
-document.getElementById('save').onclick=async()=>{{const content=rows.map(r=>{{const a=ensure(r);return JSON.stringify({{schema:'{VERDICT_SCHEMA}',sample_id:r.sample_id,coverage:a.coverage||'unreviewed',candidates:r.candidates.map(c=>({{candidate_id:c.candidate_id,time_s:c.time_s,proposer_probability:c.proposer_probability,label:a.labels[c.candidate_id]||'unreviewed'}})),complete:complete(r,a),note:a.note||'',updated_at:a.updated_at||new Date().toISOString()}});}}).join('\\n')+'\\n';const res=await fetch('/__audit_api__/save-labels',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{href:location.pathname,filename:'manual_verdicts.jsonl',content}})}});const out=await res.json();document.getElementById('status').textContent=out.ok?'已保存到 '+out.path:'保存失败: '+out.error;}};render();
+function render(){{const root=document.getElementById('list');root.innerHTML='';for(const r of rows){{const a=ensure(r),card=document.createElement('article');if(complete(r,a))card.classList.add('done');const audioId='audio-'+r.sample_id;const body=r.candidates.map(c=>{{const b=c.bootstrap_inner||{{}},innerButtons=hasBootstrapAttempt(c)?`<div><b>bootstrap Inner：</b>${{innerChoice(a,c,'correct','正确')}}${{innerChoice(a,c,'clipped','截语音')}}${{innerChoice(a,c,'too_wide','残留杂音')}}${{innerChoice(a,c,'abstain','失败')}}${{innerChoice(a,c,'unsure','不确定')}}</div>`:'',preview=hasBootstrap(c)?`<button data-play-start="0" data-play-end="${{b.left_end_s}}">精修左 sub-island</button><button data-play-start="${{b.removed_gap_start_s}}" data-play-end="${{b.removed_gap_end_s}}">removed gap</button><button data-play-start="${{b.right_start_s}}" data-play-end="${{r.duration_s}}">精修右 sub-island</button><br><small>left.end=${{Number(b.left_end_s).toFixed(3)}}s · right.start=${{Number(b.right_start_s).toFixed(3)}}s · gap=${{Number(b.removed_gap_duration_s).toFixed(3)}}s · ${{esc(b.status)}}</small>${{innerButtons}}`:`<small>bootstrap Inner: ${{esc(b.status||'disabled')}} ${{esc(b.reason||'')}}</small>${{innerButtons}}`;return `<tr><td><b>${{esc(c.candidate_id)}}</b><br>${{Number(c.time_s).toFixed(3)}}s<br><small>p=${{Number(c.proposer_probability).toFixed(4)}}</small></td><td><button data-play-start="${{c.context_start_s}}" data-play-end="${{c.time_s}}">候选前侧</button><button data-play-start="${{c.time_s}}" data-play-end="${{c.context_end_s}}">候选后侧</button><button data-play-start="${{c.context_start_s}}" data-play-end="${{c.context_end_s}}">候选连续</button><br><small>${{Number(c.context_start_s).toFixed(3)}}–${{Number(c.time_s).toFixed(3)}}–${{Number(c.context_end_s).toFixed(3)}}s</small></td><td>${{preview}}</td><td>${{choice(a,c,'split','split')}}${{choice(a,c,'continue','continue')}}${{choice(a,c,'unsure','unsure')}}</td></tr>`;}}).join('');card.innerHTML=`<h2>${{esc(r.sample_id)}} · ${{Number(r.duration_s).toFixed(3)}}s</h2><small>Outer v2=${{esc(r.outer_checkpoint_sha256.slice(0,12))}} · proposer=${{esc(r.proposer_sha256.slice(0,12))}} · learned projection=${{esc(r.projection_digest.slice(0,12))}}</small><p><b>完整 Outer v2 island</b></p><audio id="${{esc(audioId)}}" controls preload="metadata" src="${{esc(r.audio)}}"></audio><table><thead><tr><th>候选</th><th>原候选上下文</th><th>bootstrap Inner 实际结果</th><th>Split 标签</th></tr></thead><tbody>${{body}}</tbody></table><div class="coverage"><b>候选覆盖：</b>${{coverage(a,'complete','所有实际可分停顿均有候选')}}${{coverage(a,'missed','存在漏掉的可分停顿')}}${{coverage(a,'unsure','不确定')}}</div><label><b>备注</b><textarea placeholder="指出漏候选、句内短暂停顿或 Inner 精修问题">${{esc(a.note)}}</textarea></label>`;const audio=card.querySelector('audio');card.querySelectorAll('[data-play-start]').forEach(b=>b.onclick=()=>play(audio,b.dataset.playStart,b.dataset.playEnd));card.querySelectorAll('[data-cid]').forEach(b=>b.onclick=()=>{{a.labels[b.dataset.cid]=b.dataset.label;a.updated_at=new Date().toISOString();persist();render();}});card.querySelectorAll('[data-inner-cid]').forEach(b=>b.onclick=()=>{{a.inner[b.dataset.innerCid]=b.dataset.innerLabel;a.updated_at=new Date().toISOString();persist();render();}});card.querySelectorAll('[data-coverage]').forEach(b=>b.onclick=()=>{{a.coverage=b.dataset.coverage;a.updated_at=new Date().toISOString();persist();render();}});card.querySelector('textarea').onchange=e=>{{a.note=e.target.value;a.updated_at=new Date().toISOString();persist();}};root.appendChild(card);}}status();}}
+document.getElementById('save').onclick=async()=>{{const content=rows.map(r=>{{const a=ensure(r);return JSON.stringify({{schema:'{VERDICT_SCHEMA}',sample_id:r.sample_id,coverage:a.coverage||'unreviewed',candidates:r.candidates.map(c=>({{candidate_id:c.candidate_id,time_s:c.time_s,proposer_probability:c.proposer_probability,label:a.labels[c.candidate_id]||'unreviewed',inner_verdict:a.inner[c.candidate_id]||'not_reviewed',bootstrap_inner:c.bootstrap_inner||null}})),complete:complete(r,a),note:a.note||'',updated_at:a.updated_at||new Date().toISOString()}});}}).join('\\n')+'\\n';const res=await fetch('/__audit_api__/save-labels',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{href:location.pathname,filename:'manual_verdicts.jsonl',content}})}});const out=await res.json();document.getElementById('status').textContent=out.ok?'已保存到 '+out.path:'保存失败: '+out.error;}};render();
 </script></body></html>"""
     page = output_dir / "index.html"
     page.write_text(html, encoding="utf-8")
@@ -288,6 +403,8 @@ def build_audit(
     feature_manifest: Path,
     projection_path: Path,
     proposer_path: Path,
+    inner_bootstrap_checkpoint: Path | None,
+    ptm_repo_id: str,
     output_dir: Path,
     count: int,
     device: str,
@@ -303,6 +420,14 @@ def build_audit(
         device=device,
     )
     selected = select_fixed_sources(scored, count=count)
+    bootstrap_sha256 = ""
+    if inner_bootstrap_checkpoint is not None:
+        bootstrap_sha256 = bootstrap_inner_edges(
+            rows=selected,
+            checkpoint=inner_bootstrap_checkpoint,
+            ptm_repo_id=ptm_repo_id,
+            device=device,
+        )
     _copy_audio(selected, output_dir)
     items_path = output_dir / "audit_items.jsonl"
     _write_jsonl(items_path, selected)
@@ -320,6 +445,13 @@ def build_audit(
         "projection_sha256": _file_sha256(projection_path),
         "proposer_path": str(proposer_path),
         "proposer_sha256": checkpoint_sha256(proposer_path),
+        "inner_bootstrap_checkpoint": (
+            str(inner_bootstrap_checkpoint) if inner_bootstrap_checkpoint else ""
+        ),
+        "inner_bootstrap_sha256": bootstrap_sha256,
+        "inner_bootstrap_usage": (
+            "preview_only_not_training_truth" if inner_bootstrap_checkpoint else "disabled"
+        ),
         "items": str(items_path),
         "page": str(page),
     }
@@ -335,6 +467,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--feature-manifest", required=True)
     parser.add_argument("--projection", required=True)
     parser.add_argument("--proposer-checkpoint", required=True)
+    parser.add_argument("--inner-bootstrap-checkpoint", default="")
+    parser.add_argument(
+        "--ptm-repo-id",
+        default="jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame-hf",
+    )
     parser.add_argument("--output-dir", required=True)
     parser.add_argument("--count", type=int, default=5)
     parser.add_argument("--device", default="cpu")
@@ -354,6 +491,12 @@ if __name__ == "__main__":
                 feature_manifest=Path(args.feature_manifest),
                 projection_path=Path(args.projection),
                 proposer_path=Path(args.proposer_checkpoint),
+                inner_bootstrap_checkpoint=(
+                    Path(args.inner_bootstrap_checkpoint)
+                    if args.inner_bootstrap_checkpoint
+                    else None
+                ),
+                ptm_repo_id=str(args.ptm_repo_id),
                 output_dir=Path(args.output_dir),
                 count=int(args.count),
                 device=str(args.device),
