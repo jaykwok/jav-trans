@@ -77,6 +77,42 @@ def test_page_separates_outer_owned_and_inner_edges(tmp_path: Path) -> None:
     assert ".join('\\n')+'\\n'" in page
 
 
+def test_noisy_edge_page_marks_both_edges_as_inner_and_names_pollution(tmp_path: Path) -> None:
+    page = build_page(
+        rows=[
+            {
+                "sample_id": "s",
+                "subisland_id": "s__inner",
+                "audio": "audio.wav",
+                "raw_start_s": 0.0,
+                "raw_end_s": 2.0,
+                "refined_start_s": 0.4,
+                "refined_end_s": 1.6,
+                "start_requires_inner": True,
+                "end_requires_inner": True,
+                "reference_text": "台詞",
+                "edge_noise": {
+                    "leading": {"background_type": "breathing"},
+                    "trailing": {"background_type": "kissing_sound"},
+                },
+                "bootstrap_prediction": {
+                    "start_action": "refined",
+                    "end_action": "refined",
+                    "abstain_reason": "",
+                },
+            }
+        ],
+        output_dir=tmp_path / "audit",
+        update_latest=False,
+        noisy_edge_mode=True,
+    ).read_text(encoding="utf-8")
+
+    assert "判别性 Inner gate" in page
+    assert "inner-noisy-edge-audit-v1" in page
+    assert "breathing" in page
+    assert "kissing_sound" in page
+
+
 def test_evaluator_enforces_zero_clipping(tmp_path: Path) -> None:
     items = tmp_path / "items.jsonl"
     verdicts = tmp_path / "verdicts.jsonl"
