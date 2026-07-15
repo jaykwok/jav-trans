@@ -79,6 +79,23 @@ def load_valid_manifest_rows(paths: list[str] | None, *, role: str) -> tuple[lis
     return valid, skipped
 
 
+def load_excluded_source_audio_ids(paths: list[str] | None) -> set[str]:
+    excluded: set[str] = set()
+    for manifest_path in paths or []:
+        for row in load_manifest_rows(Path(manifest_path)):
+            metadata = dict(row.get("boundary_metadata") or {})
+            excluded.update(
+                str(value)
+                for value in (
+                    row.get("source_audio_ids")
+                    or metadata.get("source_audio_ids")
+                    or []
+                )
+                if str(value)
+            )
+    return excluded
+
+
 def crop_or_tile_audio(
     audio: np.ndarray,
     *,
@@ -929,6 +946,21 @@ def build_synthetic_timeline(args: argparse.Namespace) -> None:
     audio_dir.mkdir(parents=True, exist_ok=True)
     rng = np.random.default_rng(args.seed)
     source_rows, skipped = valid_source_rows(load_manifest_rows(Path(args.manifest)))
+    source_rows_before_exclusion = len(source_rows)
+    excluded_source_audio_ids = load_excluded_source_audio_ids(
+        getattr(args, "exclude_source_manifest", None)
+    )
+    excluded_source_audio_ids.update(
+        str(value)
+        for value in (getattr(args, "exclude_source_audio_id", None) or [])
+        if str(value)
+    )
+    source_rows = [
+        row
+        for row in source_rows
+        if str(row.get("audio_id") or Path(str(row["audio"])).stem)
+        not in excluded_source_audio_ids
+    ]
     negative_rows, negative_skipped = load_valid_manifest_rows(args.negative_manifest, role="negative_gap")
     background_rows, background_skipped = load_valid_manifest_rows(args.background_manifest, role="background")
     skipped.extend(negative_skipped)
@@ -1758,6 +1790,8 @@ def build_synthetic_timeline(args: argparse.Namespace) -> None:
         "manifest": str(Path(args.manifest)),
         "records": len(records),
         "source_rows": len(source_rows),
+        "source_rows_before_exclusion": source_rows_before_exclusion,
+        "excluded_source_audio_id_count": len(excluded_source_audio_ids),
         "negative_rows": len(negative_rows),
         "background_rows": len(background_rows),
         "skipped": len(skipped),
@@ -1806,6 +1840,9 @@ def build_synthetic_timeline(args: argparse.Namespace) -> None:
             "shuffle": args.shuffle,
             "reuse_sources": args.reuse_sources,
             "randomize_speech_order": args.randomize_speech_order,
+            "exclude_source_manifest": list(
+                getattr(args, "exclude_source_manifest", None) or []
+            ),
             "cut_point_max_gap_s": args.cut_point_max_gap_s,
             "long_gap_boundary_min_s": args.long_gap_boundary_min_s,
             "trim_head_s": args.trim_head_s,
@@ -1865,6 +1902,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         description="Build exact-timeline supervised VAD clips by concatenating Galgame speech islands and synthetic gaps."
     )
     parser.add_argument("--manifest", required=True, help="hf_audio_manifest.json from materialized Galgame audio.")
+    parser.add_argument(
+        "--exclude-source-manifest",
+        action="append",
+        help=(
+            "JSON/JSONL generated dataset manifest whose source_audio_ids are "
+            "excluded before sampling. Repeatable."
+        ),
+    )
+    parser.add_argument("--exclude-source-audio-id", action="append")
     parser.add_argument("--count", type=int, default=256)
     parser.add_argument("--limit", type=int, help="Optional source row limit before synthesis.")
     parser.add_argument(
