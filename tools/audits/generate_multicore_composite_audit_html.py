@@ -78,9 +78,9 @@ function coreRows(row,ids){{
   }}).join('');
 }}
 function eventRows(row,ids){{
-  const contexts=eventContexts(row);
-  if(!contexts.length)return '<tr><td colspan="6"><b>语义层不分句：</b>这是单一 maximal semantic core；BGM、呻吟或背景变化都不能单独制造 Split event，因此声学切割也不适用。</td></tr>';
-  return contexts.map(function(item){{
+  const eventItems=eventContexts(row);
+  if(!eventItems.length)return '<tr><td colspan="6"><b>语义层不分句：</b>这是单一 maximal semantic core；BGM、呻吟或背景变化都不能单独制造 Split event，因此声学切割也不适用。</td></tr>';
+  return eventItems.map(function(item){{
     const event=item.event;
     const inner=event.inner_target;
     const semanticMeaning=event.semantic_decision==='cut'?'左右是独立完整语义：应该分句':'仍属同一语义：不应分句';
