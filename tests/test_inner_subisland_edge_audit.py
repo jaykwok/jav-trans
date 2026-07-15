@@ -10,6 +10,7 @@ from tools.boundary.ja.build_inner_subisland_edge_audit import (
     edge_features,
     edge_ownership,
 )
+from tools.boundary.ja.build_inner_v1_heldout_hardcase_audit import select_hardcases
 from tools.boundary.ja.evaluate_inner_subisland_edge_audit import evaluate
 
 
@@ -147,4 +148,71 @@ def test_evaluator_enforces_zero_clipping(tmp_path: Path) -> None:
 
     assert summary["manual_gate_complete"] is True
     assert summary["zero_clipping_pass"] is False
+    assert summary["bootstrap_inner_promotion_ready"] is False
+
+
+def test_formal_inner_hardcase_selection_covers_inward_outward_and_abstain() -> None:
+    rows = [
+        {
+            "audio_id": f"s{index}",
+            "start_inward_s": float(index == 0) * 2.0,
+            "end_inward_s": float(index == 1) * 3.0 + float(index == 2),
+            "start_outward_s": float(index == 3) * 4.0,
+            "end_outward_s": 0.0,
+            "abstain_reason": "no_semantic_target" if index == 4 else "",
+        }
+        for index in range(6)
+    ]
+
+    selected = select_hardcases(rows)
+
+    assert [role for role, _row in selected] == [
+        "worst_start_inward",
+        "worst_end_inward",
+        "next_worst_inward",
+        "worst_start_outward",
+        "model_abstain",
+    ]
+    assert len({row["audio_id"] for _role, row in selected}) == 5
+
+
+def test_formal_inner_gate_can_promote_only_all_correct_non_abstain(tmp_path: Path) -> None:
+    items = tmp_path / "formal-items.jsonl"
+    verdicts = tmp_path / "formal-verdicts.jsonl"
+    _write(
+        items,
+        [
+            {
+                "schema": "inner_subisland_edge_audit_item_v1",
+                "subisland_id": "formal",
+                "start_requires_inner": True,
+                "end_requires_inner": True,
+                "teacher_usage": "formal_inner_model_heldout_evaluation",
+                "model_prediction": {
+                    "start_action": "refined",
+                    "end_action": "refined",
+                },
+            }
+        ],
+    )
+    _write(
+        verdicts,
+        [
+            {
+                "schema": "inner_subisland_edge_manual_verdict_v1",
+                "subisland_id": "formal",
+                "start_verdict": "correct",
+                "end_verdict": "correct",
+            }
+        ],
+    )
+
+    summary = evaluate(
+        items=items,
+        verdicts=verdicts,
+        output=tmp_path / "formal-summary.json",
+    )
+
+    assert summary["formal_inner_checkpoint_gate"] is True
+    assert summary["formal_inner_promotion_ready"] is True
     assert summary["bootstrap_inner_promotion_ready"] is False
