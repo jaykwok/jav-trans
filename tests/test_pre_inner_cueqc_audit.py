@@ -75,9 +75,9 @@ def test_evaluator_routes_drop_whole_and_preserves_unsure(tmp_path: Path) -> Non
     _write(
         items,
         [
-            {"schema": "pre_inner_cueqc_audit_item_v1", "sample_id": "s", "subisland_id": "keep", "start_s": 0.0, "end_s": 1.0, "duration_s": 1.0},
-            {"schema": "pre_inner_cueqc_audit_item_v1", "sample_id": "s", "subisland_id": "drop", "start_s": 1.0, "end_s": 2.0, "duration_s": 1.0},
-            {"schema": "pre_inner_cueqc_audit_item_v1", "sample_id": "s", "subisland_id": "unsure", "start_s": 2.0, "end_s": 3.0, "duration_s": 1.0},
+            {"schema": "pre_inner_cueqc_audit_item_v1", "sample_id": "s", "subisland_id": "keep", "audio": "audio.wav", "start_s": 0.0, "end_s": 1.0, "duration_s": 1.0},
+            {"schema": "pre_inner_cueqc_audit_item_v1", "sample_id": "s", "subisland_id": "drop", "audio": "audio.wav", "start_s": 1.0, "end_s": 2.0, "duration_s": 1.0},
+            {"schema": "pre_inner_cueqc_audit_item_v1", "sample_id": "s", "subisland_id": "unsure", "audio": "audio.wav", "start_s": 2.0, "end_s": 3.0, "duration_s": 1.0},
         ],
     )
     _write(
