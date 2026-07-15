@@ -43,6 +43,7 @@ def evaluate(*, items: Path, verdicts: Path, output_dir: Path) -> dict[str, Any]
         if item.get("schema") != ITEM_SCHEMA:
             raise ValueError("incompatible pre-Inner CueQC item schema")
         verdict = verdict_by_id.get(str(item["subisland_id"])) or {}
+        source_audio = (items.parent / str(item["audio"])).resolve()
         label = str(verdict.get("label") or "unreviewed")
         is_complete = label in ALLOWED_LABELS
         complete += int(is_complete)
@@ -50,6 +51,7 @@ def evaluate(*, items: Path, verdicts: Path, output_dir: Path) -> dict[str, Any]
             counts[label] += 1
         routed = {
             **item,
+            "audio": str(source_audio),
             "cueqc_label": label,
             "cueqc_note": str(verdict.get("note") or ""),
             "runtime_route": (
