@@ -14,16 +14,9 @@ if str(SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(SRC_ROOT))
 
 from asr.backends.qwen import QWEN_ASR_17B_REPO_ID  # noqa: E402
-from boundary.gpu_safety import apply_vram_safety_cap  # noqa: E402
 from boundary.ja.dataset import effective_frame_weights, read_jsonl  # noqa: E402
 from boundary.ja.features import load_cached_feature  # noqa: E402
-from boundary.ja.model import (  # noqa: E402
-    SPEECH_ISLAND_MEMBERSHIP_LABELS,
-    SPEECH_ISLAND_SCORER_LABELS,
-    load_speech_island_scorer_checkpoint,
-    score_semantic_speech_outputs,
-)
-from boundary.ja.semantic_speech_train import _class_indexes  # noqa: E402
+from boundary.ja.model import SPEECH_ISLAND_SCORER_LABELS  # noqa: E402
 from boundary.outer_refiner_v2 import OUTER_EDGE_REFINER_V2_FEATURE_SCHEMA  # noqa: E402
 
 
@@ -32,34 +25,17 @@ def _rows(path: Path) -> list[dict]:
         return [json.loads(line) for line in handle if line.strip()]
 
 
-def _runs(active: np.ndarray) -> list[tuple[int, int]]:
-    result: list[tuple[int, int]] = []
-    start: int | None = None
-    for index, value in enumerate(np.append(np.asarray(active, dtype=bool), False)):
-        if value and start is None:
-            start = index
-        elif not value and start is not None:
-            result.append((start, index))
-            start = None
-    return result
-
-
 def run(args: argparse.Namespace) -> None:
-    apply_vram_safety_cap(0.95)
     records = read_jsonl(Path(args.labels))
     rows = _rows(Path(args.feature_manifest))
     if not rows or str(rows[0].get("ptm") or "") != QWEN_ASR_17B_REPO_ID:
         raise ValueError("Outer Edge Refiner v2 dataset is 1.7B-only")
-    scorer = load_speech_island_scorer_checkpoint(
-        args.scorer_checkpoint, device=args.device
-    )
     output_dir = Path(args.output_dir)
     feature_dir = output_dir / "islands"
     feature_dir.mkdir(parents=True, exist_ok=True)
     manifest_rows: list[dict] = []
-    missed_target_sources = 0
     target_index = SPEECH_ISLAND_SCORER_LABELS.index("semantic_target")
-    outside_index = SPEECH_ISLAND_MEMBERSHIP_LABELS.index("outside")
+    discardable_index = SPEECH_ISLAND_SCORER_LABELS.index("discardable")
     for row_index, row in enumerate(rows):
         record = records[int(row["label_index"])]
         ptm, mfcc = load_cached_feature(Path(str(row["feature_path"])))
@@ -70,57 +46,36 @@ def run(args: argparse.Namespace) -> None:
         )
         if total <= 0:
             continue
-        (
-            probabilities,
-            membership_probabilities,
-            semantic_projected,
-        ) = score_semantic_speech_outputs(
-            scorer,
-            ptm=ptm[:total],
-            mfcc=mfcc[:total],
-        )
-        truth = _class_indexes(record, total=total)
+        if int(ptm.shape[1]) != 2048:
+            raise ValueError("Outer Edge Refiner v2 requires full PTM2048 features")
+        truth = np.where(
+            np.asarray(record.speech_frames[:total], dtype=np.int64) > 0,
+            target_index,
+            discardable_index,
+        ).astype(np.int64)
         weights = np.asarray(effective_frame_weights(record)[:total], dtype=np.float32)
-        predicted_membership = np.argmax(membership_probabilities, axis=1)
-        islands = _runs(predicted_membership != outside_index)
-        if not islands and np.any(truth == target_index):
-            missed_target_sources += 1
-        for island_index, (start, end) in enumerate(islands):
-            frame_total = end - start
-            position = (
-                np.arange(frame_total, dtype=np.float32) / max(1, frame_total - 1)
-            ).reshape(-1, 1)
-            features = np.concatenate(
-                (
-                    semantic_projected[start:end],
-                    mfcc[start:end],
-                    probabilities[start:end],
-                    membership_probabilities[start:end],
-                    position,
-                ),
-                axis=1,
-            ).astype(np.float32)
-            feature_path = feature_dir / f"row{row_index:06d}_island{island_index:03d}.npz"
-            np.savez_compressed(
-                feature_path,
-                features=features,
-                labels=truth[start:end].astype(np.int64),
-                weights=weights[start:end],
-                scorer_probabilities=probabilities[start:end],
-            )
-            metadata = dict(record.boundary_metadata or {})
-            manifest_rows.append(
-                {
-                    "schema": OUTER_EDGE_REFINER_V2_FEATURE_SCHEMA,
-                    "audio_id": record.audio_id,
-                    "feature_path": str(feature_path),
-                    "start_frame": start,
-                    "end_frame": end,
-                    "frame_hop_s": float(record.frame_hop_s),
-                    "partition": str(metadata.get("source_partition") or "train"),
-                    "contains_target": bool(np.any(truth[start:end] == target_index)),
-                }
-            )
+        feature_path = feature_dir / f"row{row_index:06d}_island000.npz"
+        np.savez(
+            feature_path,
+            labels=truth,
+            weights=weights,
+        )
+        metadata = dict(record.boundary_metadata or {})
+        manifest_rows.append(
+            {
+                "schema": OUTER_EDGE_REFINER_V2_FEATURE_SCHEMA,
+                "audio_id": record.audio_id,
+                "feature_path": str(feature_path),
+                "source_feature_path": str(row["feature_path"]),
+                "start_frame": 0,
+                "end_frame": total,
+                "frame_hop_s": float(record.frame_hop_s),
+                "partition": str(metadata.get("source_partition") or "train"),
+                "contains_target": bool(np.any(truth == target_index)),
+                "pipeline_entry_stage": "outer_edge_refiner_v2",
+                "entry_contract": "confirmed_high_recall_full_island_v1",
+            }
+        )
         if args.log_every and (row_index + 1) % args.log_every == 0:
             print(
                 f"outer_v2_dataset={row_index + 1}/{len(rows)} islands={len(manifest_rows)}",
@@ -136,10 +91,11 @@ def run(args: argparse.Namespace) -> None:
         "source_count": len(rows),
         "island_count": len(manifest_rows),
         "target_island_count": sum(bool(row["contains_target"]) for row in manifest_rows),
-        "missed_target_source_count": missed_target_sources,
         "labels": list(SPEECH_ISLAND_SCORER_LABELS),
-        "membership_labels": list(SPEECH_ISLAND_MEMBERSHIP_LABELS),
         "decision_mode": "argmax",
+        "ptm_projection": "checkpoint_learned_linear_2048_to_128",
+        "pipeline_entry_stage": "outer_edge_refiner_v2",
+        "entry_contract": "confirmed_high_recall_full_island_v1",
         "manifest": str(manifest_path),
     }
     (output_dir / "summary.json").write_text(
@@ -153,9 +109,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Build 1.7B full-island Outer v2 data.")
     parser.add_argument("--labels", required=True)
     parser.add_argument("--feature-manifest", required=True)
-    parser.add_argument("--scorer-checkpoint", required=True)
     parser.add_argument("--output-dir", required=True)
-    parser.add_argument("--device", default="cuda")
     parser.add_argument("--log-every", type=int, default=100)
     return parser.parse_args()
 

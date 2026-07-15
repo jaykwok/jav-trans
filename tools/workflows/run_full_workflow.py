@@ -562,7 +562,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--outer-edge-refiner-model-path-by-repo",
         default=os.getenv("OUTER_EDGE_REFINER_MODEL_PATH_BY_REPO", ""),
-        help="Optional repo-id checkpoint map for outer_edge_refiner_v1.",
+        help="Optional repo-id checkpoint map for the repo-bound Outer Edge Refiner.",
     )
     parser.add_argument(
         "--semantic-split-model-path-by-repo",

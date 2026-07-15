@@ -7,6 +7,7 @@ import wave
 from pathlib import Path
 
 import numpy as np
+import torch
 
 from audio.chunk_packer import PackedChunk
 from boundary.base import SegmentationResult, SpeechSegment
@@ -261,7 +262,8 @@ def _reload_pipeline(monkeypatch, tmp_path: Path, *, enable_cueqc: bool = False)
     outer_checkpoint = tmp_path / "outer.pt"
     split_checkpoint = tmp_path / "split.pt"
     cut_checkpoint = tmp_path / "cut.pt"
-    for path in (outer_checkpoint, split_checkpoint, cut_checkpoint):
+    torch.save({"schema": "outer_edge_refiner_v1"}, outer_checkpoint)
+    for path in (split_checkpoint, cut_checkpoint):
         path.write_bytes(b"checkpoint")
     monkeypatch.setenv("ASR_BACKEND", asr_backend)
     monkeypatch.setenv(

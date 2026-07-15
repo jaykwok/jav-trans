@@ -501,6 +501,9 @@ def build_smoke(
                 "timing_source": core["timing_source"],
                 "atomic_semantic_unit": core["atomic_semantic_unit"],
                 "semantic_unit_count": core["semantic_unit_count"],
+                "pipeline_entry_stage": "outer_edge_refiner_v2",
+                "scorer_bypassed": True,
+                "scorer_bypass_contract": "confirmed_semantic_source_is_already_a_high_recall_island_v1",
             }
         )
     core_library_path = output_dir / "semantic_core_library.jsonl"
@@ -717,6 +720,8 @@ def build_smoke(
                 "semantic_core_timing_contract": "full_clip_sample_extent_v1",
                 "overlay_manifest": str(overlay_manifest),
                 "overlay": recipe["overlay"],
+                "pipeline_entry_stage": "semantic_speech_scorer",
+                "scorer_required": True,
                 **recipe["truth"],
             }
         )
@@ -755,6 +760,8 @@ def build_smoke(
         "overlay_selection": overlay_selection,
         "overlay_mode": "additive_full_duration",
         "all_semantic_cores_have_simultaneous_overlay": True,
+        "clean_core_pipeline_entry_stage": "outer_edge_refiner_v2",
+        "composite_pipeline_entry_stage": "semantic_speech_scorer",
         "semantic_core_library": str(core_library_path),
         "semantic_core_count": len(core_library_rows),
         "semantic_core_timing_contract": "full_clip_sample_extent_v1",

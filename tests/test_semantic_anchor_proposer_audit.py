@@ -11,12 +11,14 @@ from tools.boundary.ja.build_semantic_anchor_proposer_audit import (
     adaptive_event_regions,
     build_audit_html,
     select_stratified_proposer_frames,
+    validate_outer_refined_inputs,
 )
 
 
 def _timeline_row() -> dict:
     return {
         "sample_id": "s1",
+        "audio_contract": "learned_outer_refined_island_v1",
         "duration_s": 10.0,
         "semantic_events": [
             {
@@ -37,6 +39,15 @@ def _timeline_row() -> dict:
             },
         ],
     }
+
+
+def test_candidate_builder_requires_learned_outer_refined_island() -> None:
+    validate_outer_refined_inputs([_timeline_row()])
+
+    row = _timeline_row()
+    row.pop("audio_contract")
+    with np.testing.assert_raises_regex(ValueError, "Outer-refined islands"):
+        validate_outer_refined_inputs([row])
 
 
 def test_adaptive_regions_use_neighbor_anchor_midpoints_and_source_edges() -> None:

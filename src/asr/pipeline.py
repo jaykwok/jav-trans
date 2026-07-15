@@ -22,6 +22,7 @@ from boundary.sequence_features import (
 )
 from boundary.cut_refiner import load_cut_edge_refiner
 from boundary.outer_refiner import load_outer_edge_refiner
+from boundary.outer_refiner_v2 import load_outer_edge_refiner_v2
 from boundary.runtime_pipeline import (
     SemanticBoundaryConfig,
     build_semantic_boundary_chunks,
@@ -439,9 +440,23 @@ def _build_processing_spans(
 
     cfg = _boundary_config()
     _set_last_boundary_cache_event(None)
+    outer_checkpoint_path = Path(cfg["outer_edge_refiner_model_path"])
+    import torch
+
+    outer_schema = str(
+        torch.load(outer_checkpoint_path, map_location="cpu", weights_only=False).get(
+            "schema"
+        )
+        or ""
+    )
 
     restore_sequence_export = os.environ.get("SPEECH_BOUNDARY_JA_EXPORT_SEQUENCE_FEATURES")
     os.environ["SPEECH_BOUNDARY_JA_EXPORT_SEQUENCE_FEATURES"] = "1"
+    restore_sequence_max_ptm_dims = os.environ.get(
+        "BOUNDARY_FRAME_SEQUENCE_MAX_PTM_DIMS"
+    )
+    if outer_schema == "outer_edge_refiner_v2":
+        os.environ["BOUNDARY_FRAME_SEQUENCE_MAX_PTM_DIMS"] = "2048"
     restore_sequence_projection = os.environ.get(
         "SPEECH_BOUNDARY_JA_SEQUENCE_PTM_PROJECTION"
     )
@@ -489,6 +504,12 @@ def _build_processing_spans(
             os.environ["SPEECH_BOUNDARY_JA_EXPORT_SEQUENCE_FEATURES"] = restore_sequence_export
         else:
             os.environ.pop("SPEECH_BOUNDARY_JA_EXPORT_SEQUENCE_FEATURES", None)
+        if restore_sequence_max_ptm_dims is not None:
+            os.environ["BOUNDARY_FRAME_SEQUENCE_MAX_PTM_DIMS"] = (
+                restore_sequence_max_ptm_dims
+            )
+        else:
+            os.environ.pop("BOUNDARY_FRAME_SEQUENCE_MAX_PTM_DIMS", None)
         if restore_sequence_projection is not None:
             os.environ["SPEECH_BOUNDARY_JA_SEQUENCE_PTM_PROJECTION"] = (
                 restore_sequence_projection
@@ -499,11 +520,18 @@ def _build_processing_spans(
     candidate_frame_scores = result.parameters.get("candidate_frame_scores")
     score_frame_hop_s = result.parameters.get("frame_hop_s")
     sequence_feature_frames = result.parameters.get("sequence_feature_frames")
-    outer_refiner = load_outer_edge_refiner(
-        Path(cfg["outer_edge_refiner_model_path"]),
-        device=cfg["outer_edge_refiner_device"],
-        expected_ptm_repo_id=_current_asr_backend(),
-    )
+    if outer_schema == "outer_edge_refiner_v2":
+        outer_refiner = load_outer_edge_refiner_v2(
+            outer_checkpoint_path,
+            device=cfg["outer_edge_refiner_device"],
+            expected_ptm_repo_id=_current_asr_backend(),
+        )
+    else:
+        outer_refiner = load_outer_edge_refiner(
+            outer_checkpoint_path,
+            device=cfg["outer_edge_refiner_device"],
+            expected_ptm_repo_id=_current_asr_backend(),
+        )
     split_verifier = load_semantic_split_verifier(
         Path(cfg["semantic_split_model_path"]),
         device=cfg["semantic_split_device"],
