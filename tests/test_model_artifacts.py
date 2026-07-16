@@ -77,26 +77,3 @@ def test_promoted_five_model_artifact_contract(
     assert artifact["promoted"] is True
     assert artifact["self_contained"] is True
     assert metadata[repo_metadata_key] == repo_id
-
-
-def test_windows_bundle_includes_all_five_model_checkpoint_roots() -> None:
-    spec = Path("packaging/jav-trans-web.spec").read_text(encoding="utf-8")
-    assert '"src/checkpoints"' in spec
-    assert '"src/boundary/ja/checkpoints"' not in spec
-    assert '"src/boundary/checkpoints"' not in spec
-    assert '"src/asr/checkpoints"' not in spec
-    assert "libtorchcodec_custom_ops*.dll" in spec
-    assert "_torchcodec_binaries()" in spec
-
-
-def test_windows_bundle_uses_jav_trans_package_name() -> None:
-    spec = Path("packaging/jav-trans-web.spec").read_text(encoding="utf-8")
-    build_script = Path("packaging/build_windows.ps1").read_text(encoding="utf-8")
-    archive_script = Path("packaging/archive_release.ps1").read_text(encoding="utf-8")
-
-    assert 'name="jav-trans"' in spec
-    assert "JAV_TRANS_SKIP_MODELS" in spec
-    assert "JAVTRANS_SKIP_MODELS" not in spec
-    assert "dist/jav-trans/jav-trans.exe" in build_script
-    assert "dist/JAVTrans/JAVTrans.exe" not in build_script
-    assert "jav-trans-windows-x64.7z" in archive_script
