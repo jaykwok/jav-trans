@@ -30,7 +30,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[3]
 DEFAULT_TWO_FILM_STEMS = ("BONY-173", "867HTTM-0045")
 PROMPT_VERSION = "pre_asr_omni_label_v1"
 LABEL_SCHEMA = "pre_asr_omni_label_v1"
-DEFAULT_ENV_FILE = "~/.config/qwen/.env"
+DEFAULT_ENV_FILE = "~/.config/omni/.env"
 DEFAULT_API_KEY_ENV_CANDIDATES = (
     "OMNI_API_KEY",
     "DASHSCOPE_API_KEY",

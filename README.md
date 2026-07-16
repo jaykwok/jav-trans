@@ -186,6 +186,11 @@ src/checkpoints/
 - `API_KEY`
 - `OPENAI_COMPATIBILITY_BASE_URL`
 - `LLM_MODEL_NAME`
+
+离线音频多模态 teacher 工具使用独立的 provider-neutral 配置
+`~/.config/omni/.env`。常用键为 `OMNI_MODEL`、`OMNI_API_KEY` 和
+`OMNI_BASE_URL`；因此可在不改代码的情况下切换 Qwen Omni、Doubao
+SeedPro 等兼容音频输入的 OpenAI-compatible endpoint。
 - 代理协议 / 地址 / 端口（可选，用于模型下载和 HTTP 请求）
 
 ASR 显存自适应默认值已经内置。默认使用 `1.7B` 高质量模型；需要切到 `0.6B` 低配/更快档，或覆盖 batch / 显存预算时，再通过“参数调优”里的环境变量覆盖，或手动编辑首次保存后生成的 `.env`。
