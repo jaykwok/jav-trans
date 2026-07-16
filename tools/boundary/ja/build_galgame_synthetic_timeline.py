@@ -61,6 +61,33 @@ def valid_source_rows(rows: list[dict[str, Any]]) -> tuple[list[dict[str, Any]],
     return valid, skipped
 
 
+def require_source_schema(
+    rows: list[dict[str, Any]], required_schema: str | None
+) -> None:
+    if not required_schema:
+        return
+    incompatible = sum(str(row.get("schema") or "") != required_schema for row in rows)
+    if incompatible:
+        raise ValueError(
+            f"source manifest has {incompatible} rows outside required schema "
+            f"{required_schema!r}"
+        )
+
+
+def summarize_source_usage(detail_rows: list[dict[str, Any]]) -> dict[str, int]:
+    counts = Counter(
+        str(source.get("source_audio_id") or "")
+        for row in detail_rows
+        for source in row.get("sources") or []
+        if str(source.get("source_audio_id") or "")
+    )
+    return {
+        "source_core_use_count": sum(counts.values()),
+        "unique_source_core_count": len(counts),
+        "max_source_core_use_count": max(counts.values(), default=0),
+    }
+
+
 def load_valid_manifest_rows(paths: list[str] | None, *, role: str) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     valid: list[dict[str, Any]] = []
     skipped: list[dict[str, Any]] = []
@@ -946,6 +973,7 @@ def build_synthetic_timeline(args: argparse.Namespace) -> None:
     audio_dir.mkdir(parents=True, exist_ok=True)
     rng = np.random.default_rng(args.seed)
     source_rows, skipped = valid_source_rows(load_manifest_rows(Path(args.manifest)))
+    require_source_schema(source_rows, getattr(args, "require_source_schema", None))
     source_rows_before_exclusion = len(source_rows)
     excluded_source_audio_ids = load_excluded_source_audio_ids(
         getattr(args, "exclude_source_manifest", None)
@@ -1786,6 +1814,7 @@ def build_synthetic_timeline(args: argparse.Namespace) -> None:
     speech_frames = sum(sum(int(value) for value in record.speech_frames) for record in records)
     cut_point_count = sum(len(row.get("cut_point_segments") or []) for row in boundary_rows)
     utterance_boundary_count = sum(len(row.get("utterance_boundaries") or []) for row in boundary_rows)
+    source_usage = summarize_source_usage(detail_rows)
     summary = {
         "manifest": str(Path(args.manifest)),
         "records": len(records),
@@ -1809,6 +1838,9 @@ def build_synthetic_timeline(args: argparse.Namespace) -> None:
         "random_speech_order_enabled": bool(args.randomize_speech_order),
         "utterance_boundary_count": utterance_boundary_count,
         "cut_point_segment_count": cut_point_count,
+        **source_usage,
+        "unused_source_core_count": len(source_rows)
+        - source_usage["unique_source_core_count"],
         "labels": str(labels_path),
         "output_manifest": str(manifest_path),
         "boundary_manifest": str(boundary_manifest_path),
@@ -1840,6 +1872,7 @@ def build_synthetic_timeline(args: argparse.Namespace) -> None:
             "shuffle": args.shuffle,
             "reuse_sources": args.reuse_sources,
             "randomize_speech_order": args.randomize_speech_order,
+            "require_source_schema": getattr(args, "require_source_schema", None),
             "exclude_source_manifest": list(
                 getattr(args, "exclude_source_manifest", None) or []
             ),
@@ -1902,6 +1935,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         description="Build exact-timeline supervised VAD clips by concatenating Galgame speech islands and synthetic gaps."
     )
     parser.add_argument("--manifest", required=True, help="hf_audio_manifest.json from materialized Galgame audio.")
+    parser.add_argument(
+        "--require-source-schema",
+        help="Reject source rows outside this approved inventory schema.",
+    )
     parser.add_argument(
         "--exclude-source-manifest",
         action="append",

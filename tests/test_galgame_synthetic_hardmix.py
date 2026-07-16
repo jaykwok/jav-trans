@@ -8,6 +8,8 @@ from tools.boundary.ja.build_galgame_synthetic_timeline import (
     parse_args,
     sample_binary_hardmix_layout,
     sample_half_open_int,
+    require_source_schema,
+    summarize_source_usage,
     stable_source_partition,
 )
 
@@ -38,6 +40,33 @@ def test_source_exclusion_ledger_reads_dataset_source_ids(tmp_path) -> None:
     )
     assert args.exclude_source_manifest == [str(manifest)]
     assert args.exclude_source_audio_id == ["d"]
+
+
+def test_source_schema_gate_accepts_only_approved_inventory() -> None:
+    require_source_schema(
+        [{"schema": "galgame_approved_semantic_core_v1"}],
+        "galgame_approved_semantic_core_v1",
+    )
+    with pytest.raises(ValueError, match="outside required schema"):
+        require_source_schema(
+            [{"schema": "galgame_approved_semantic_core_v1"}, {"audio_id": "raw"}],
+            "galgame_approved_semantic_core_v1",
+        )
+
+
+def test_source_usage_summary_exposes_any_core_reuse() -> None:
+    summary = summarize_source_usage(
+        [
+            {"sources": [{"source_audio_id": "a"}]},
+            {"sources": [{"source_audio_id": "b"}, {"source_audio_id": "a"}]},
+        ]
+    )
+
+    assert summary == {
+        "source_core_use_count": 3,
+        "unique_source_core_count": 2,
+        "max_source_core_use_count": 2,
+    }
 
 
 def test_half_open_integer_sampling_never_reaches_upper_bound() -> None:

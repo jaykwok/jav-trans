@@ -19,6 +19,7 @@ def promote_checkpoint(
     pipeline_role: str,
     source_training_run: str,
     selected_validation: dict[str, Any] | None = None,
+    metadata_updates: dict[str, Any] | None = None,
     drop_threshold: float | None = None,
     promotion_reason: str = "",
     promoted_at: str | None = None,
@@ -27,6 +28,8 @@ def promote_checkpoint(
 
     payload = torch.load(input_path, map_location="cpu", weights_only=False)
     metadata = dict(payload.get("metadata") or {})
+    if metadata_updates is not None:
+        metadata.update(metadata_updates)
     timestamp = promoted_at or datetime.now(timezone.utc).isoformat()
     metadata["artifact"] = {
         **dict(metadata.get("artifact") or {}),
@@ -71,6 +74,15 @@ def _read_selected_validation(path: Path | None) -> dict[str, Any] | None:
     return value
 
 
+def _read_metadata_json(value: str) -> dict[str, Any] | None:
+    if not value:
+        return None
+    payload = json.loads(value)
+    if not isinstance(payload, dict):
+        raise ValueError("--metadata-json must contain a JSON object")
+    return payload
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
@@ -87,6 +99,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--pipeline-role", required=True)
     parser.add_argument("--source-training-run", required=True)
     parser.add_argument("--selected-validation-file", type=Path)
+    parser.add_argument("--metadata-json", default="")
     parser.add_argument("--drop-threshold", type=float)
     parser.add_argument("--promotion-reason", default="")
     return parser.parse_args()
@@ -104,6 +117,7 @@ def main() -> None:
         pipeline_role=args.pipeline_role,
         source_training_run=args.source_training_run,
         selected_validation=_read_selected_validation(args.selected_validation_file),
+        metadata_updates=_read_metadata_json(args.metadata_json),
         drop_threshold=args.drop_threshold,
         promotion_reason=args.promotion_reason,
     )

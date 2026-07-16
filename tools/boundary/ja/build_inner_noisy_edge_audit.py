@@ -20,6 +20,7 @@ for root in (PROJECT_ROOT, SRC_ROOT):
         sys.path.insert(0, str(root))
 
 from boundary.outer_refiner_v2 import load_outer_edge_refiner_v2  # noqa: E402
+from boundary.inner_refiner_v1 import load_inner_edge_refiner_v1  # noqa: E402
 from tools.boundary.ja.build_inner_subisland_edge_audit import (  # noqa: E402
     ITEM_SCHEMA,
     build_page,
@@ -50,11 +51,18 @@ def build(args: argparse.Namespace) -> dict[str, Any]:
         str(row.get("sample_id") or row["audio_id"]): row
         for row in _rows(Path(args.feature_manifest))
     }
-    model = load_outer_edge_refiner_v2(
-        args.checkpoint,
-        device=args.device,
-        expected_ptm_repo_id=args.ptm_repo_id,
-    )
+    if args.formal_inner:
+        model = load_inner_edge_refiner_v1(
+            args.checkpoint,
+            device=args.device,
+            expected_ptm_repo_id=args.ptm_repo_id,
+        )
+    else:
+        model = load_outer_edge_refiner_v2(
+            args.checkpoint,
+            device=args.device,
+            expected_ptm_repo_id=args.ptm_repo_id,
+        )
     output_dir = Path(args.output_dir)
     audio_dir = output_dir / "audio"
     audio_dir.mkdir(parents=True, exist_ok=True)
@@ -68,16 +76,24 @@ def build(args: argparse.Namespace) -> dict[str, Any]:
             mfcc = np.asarray(payload["mfcc"], dtype=np.float32)
         frame_hop_s = float(feature_row.get("frame_hop_s") or 0.02)
         total = min(int(feature_row["frame_count"]), ptm.shape[0], mfcc.shape[0])
-        prediction = model.predict_islands(
-            frame_feature_groups=[edge_features(ptm[:total], mfcc[:total])],
-            raw_spans=[(0.0, float(row["duration_s"]))],
-            frame_hop_s=frame_hop_s,
+        prediction_kwargs = {
+            "frame_feature_groups": [edge_features(ptm[:total], mfcc[:total])],
+            "raw_spans": [(0.0, float(row["duration_s"]))],
+            "frame_hop_s": frame_hop_s,
+        }
+        prediction = (
+            model.predict_subislands(**prediction_kwargs)
+            if args.formal_inner
+            else model.predict_islands(**prediction_kwargs)
         )[0]
         source_audio = Path(str(row["audio"]))
         target_audio = audio_dir / f"{sample_id}{source_audio.suffix.lower() or '.wav'}"
         shutil.copyfile(source_audio, target_audio)
-        items.append(
-            {
+        prediction_payload = {
+            **asdict(prediction),
+            "class_probabilities": None,
+        }
+        item = {
                 "schema": ITEM_SCHEMA,
                 "audit_mode": "known_core_empirical_noisy_edges_v1",
                 "sample_id": sample_id,
@@ -93,14 +109,19 @@ def build(args: argparse.Namespace) -> dict[str, Any]:
                 "reference_text": str(row.get("reference_text") or ""),
                 "known_semantic_core_span": row.get("semantic_core_span"),
                 "edge_noise": row.get("edge_noise"),
-                "bootstrap_prediction": {
-                    **asdict(prediction),
-                    "class_probabilities": None,
-                },
-                "bootstrap_checkpoint_sha256": model.sha256,
-                "teacher_usage": "bootstrap_preview_only_not_training_truth",
+                "teacher_usage": (
+                    "formal_inner_model_heldout_evaluation"
+                    if args.formal_inner
+                    else "bootstrap_preview_only_not_training_truth"
+                ),
             }
-        )
+        if args.formal_inner:
+            item["model_prediction"] = prediction_payload
+            item["checkpoint_sha256"] = model.sha256
+        else:
+            item["bootstrap_prediction"] = prediction_payload
+            item["bootstrap_checkpoint_sha256"] = model.sha256
+        items.append(item)
     items_path = output_dir / "inner_items.jsonl"
     _write(items_path, items)
     page = build_page(
@@ -108,6 +129,7 @@ def build(args: argparse.Namespace) -> dict[str, Any]:
         output_dir=output_dir,
         update_latest=not args.no_update_latest,
         noisy_edge_mode=True,
+        formal_inner_mode=args.formal_inner,
     )
     summary = {
         "schema": SUMMARY_SCHEMA,
@@ -115,11 +137,17 @@ def build(args: argparse.Namespace) -> dict[str, Any]:
         "owned_start_count": len(items),
         "owned_end_count": len(items),
         "known_edge_pollution_count": len(items) * 2,
-        "bootstrap_checkpoint_sha256": model.sha256,
-        "bootstrap_usage": "preview_only_not_training_truth",
+        "checkpoint_usage": (
+            "formal_inner_model_heldout_evaluation"
+            if args.formal_inner
+            else "preview_only_not_training_truth"
+        ),
         "items": str(items_path),
         "page": str(page),
     }
+    summary[
+        "checkpoint_sha256" if args.formal_inner else "bootstrap_checkpoint_sha256"
+    ] = model.sha256
     (output_dir / "summary.json").write_text(
         json.dumps(summary, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
     )
@@ -134,6 +162,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--ptm-repo-id", required=True)
     parser.add_argument("--output-dir", required=True)
     parser.add_argument("--device", default="cpu")
+    parser.add_argument("--formal-inner", action="store_true")
     parser.add_argument("--no-update-latest", action="store_true")
     return parser.parse_args()
 

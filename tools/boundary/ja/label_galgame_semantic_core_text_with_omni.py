@@ -64,6 +64,19 @@ def _append(path: Path, row: dict[str, Any]) -> None:
         handle.write(json.dumps(row, ensure_ascii=False) + "\n")
 
 
+def load_excluded_candidate_audio_ids(paths: list[str] | None) -> set[str]:
+    excluded: set[str] = set()
+    for manifest_path in paths or []:
+        for row in load_manifest_rows(Path(manifest_path)):
+            audio_id = str(
+                row.get("audio_id")
+                or (Path(str(row["audio"])).stem if row.get("audio") else "")
+            )
+            if audio_id:
+                excluded.add(audio_id)
+    return excluded
+
+
 def select_candidates(
     rows: list[dict[str, Any]],
     *,
@@ -162,6 +175,32 @@ def call_text_teacher(
     }
 
 
+def is_provider_data_inspection_rejection(error: Exception) -> bool:
+    value = str(error).lower()
+    return "data_inspection_failed" in value
+
+
+def teacher_label_row(
+    *,
+    source: dict[str, Any],
+    label: str,
+    model: str,
+    decision_source: str,
+) -> dict[str, Any]:
+    return {
+        "schema": SCHEMA,
+        "prompt_version": PROMPT_VERSION,
+        "model": model,
+        "audio_id": str(source["audio_id"]),
+        "audio": str(source["audio"]),
+        "duration_s": float(source["duration_s"]),
+        "reference_text": str(source["text"]),
+        "source": str(source.get("input") or source.get("source") or ""),
+        "label": label,
+        "decision_source": decision_source,
+    }
+
+
 def select_audit_rows(rows: list[dict[str, Any]], *, count: int, seed: int) -> list[dict[str, Any]]:
     rng = np.random.default_rng(seed)
     selected: list[dict[str, Any]] = []
@@ -224,6 +263,10 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         raise ValueError("Omni API key is not configured")
     source_rows, skipped = valid_source_rows(load_manifest_rows(Path(args.manifest)))
     excluded = load_excluded_source_audio_ids(args.exclude_source_manifest)
+    excluded_candidate_ids = load_excluded_candidate_audio_ids(
+        args.exclude_candidate_manifest
+    )
+    excluded.update(excluded_candidate_ids)
     excluded.update(str(value) for value in (args.exclude_source_audio_id or []))
     candidates = select_candidates(
         source_rows,
@@ -280,17 +323,12 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                     },
                 )
                 for source, label in validated:
-                    row = {
-                        "schema": SCHEMA,
-                        "prompt_version": PROMPT_VERSION,
-                        "model": model,
-                        "audio_id": str(source["audio_id"]),
-                        "audio": str(source["audio"]),
-                        "duration_s": float(source["duration_s"]),
-                        "reference_text": str(source["text"]),
-                        "source": str(source.get("input") or source.get("source") or ""),
-                        "label": label,
-                    }
+                    row = teacher_label_row(
+                        source=source,
+                        label=label,
+                        model=model,
+                        decision_source="teacher_response",
+                    )
                     _append(labels_path, row)
                     existing[row["audio_id"]] = row
                 print(
@@ -311,6 +349,42 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                         "error": repr(error),
                     },
                 )
+                if is_provider_data_inspection_rejection(error):
+                    for source in batch:
+                        row = teacher_label_row(
+                            source=source,
+                            label="unsure",
+                            model=model,
+                            decision_source="provider_data_inspection_rejected",
+                        )
+                        _append(labels_path, row)
+                        existing[row["audio_id"]] = row
+                    print(
+                        f"semantic_core_text={len(existing)}/{len(candidates)} "
+                        f"batch={batch_index + 1} model={model} "
+                        "provider_data_inspection_rejected=true",
+                        flush=True,
+                    )
+                    last_error = None
+                    break
+                if attempt == args.max_attempts and isinstance(error, ValueError):
+                    for source in batch:
+                        row = teacher_label_row(
+                            source=source,
+                            label="unsure",
+                            model=model,
+                            decision_source="teacher_schema_failed_after_retries",
+                        )
+                        _append(labels_path, row)
+                        existing[row["audio_id"]] = row
+                    print(
+                        f"semantic_core_text={len(existing)}/{len(candidates)} "
+                        f"batch={batch_index + 1} model={model} "
+                        "teacher_schema_failed_after_retries=true",
+                        flush=True,
+                    )
+                    last_error = None
+                    break
                 if attempt < args.max_attempts:
                     time.sleep(min(8.0, float(attempt)))
         if last_error is not None:
@@ -319,6 +393,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             time.sleep(args.request_interval_s)
     labels = _rows(labels_path)
     counts = Counter(str(row["label"]) for row in labels)
+    decision_counts = Counter(str(row.get("decision_source") or "legacy") for row in labels)
     audit_rows = select_audit_rows(labels, count=args.audit_count, seed=args.seed)
     page = build_audit(rows=audit_rows, output_dir=Path(args.audit_output_dir))
     summary = {
@@ -328,7 +403,9 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "candidate_count": len(candidates),
         "labeled_count": len(labels),
         "label_counts": {label: counts[label] for label in LABELS},
+        "decision_source_counts": dict(sorted(decision_counts.items())),
         "excluded_source_audio_id_count": len(excluded),
+        "excluded_candidate_audio_id_count": len(excluded_candidate_ids),
         "invalid_source_count": len(skipped),
         "labels": str(labels_path),
         "audit_page": str(page),
@@ -349,6 +426,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument("--seed", type=int, default=20260718)
     parser.add_argument("--exclude-source-manifest", action="append")
+    parser.add_argument(
+        "--exclude-candidate-manifest",
+        action="append",
+        help=(
+            "JSON/JSONL candidate or source-sample manifest whose top-level "
+            "audio_id (or audio filename stem) values are excluded. Repeatable."
+        ),
+    )
     parser.add_argument("--exclude-source-audio-id", action="append")
     parser.add_argument("--model", default="")
     parser.add_argument("--env-file", default=str(DEFAULT_ENV_FILE))
