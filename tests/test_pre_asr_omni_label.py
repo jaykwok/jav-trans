@@ -6,6 +6,11 @@ from pathlib import Path
 from tools.asr.cueqc import label_pre_asr_with_omni as omni_label
 
 
+def test_default_omni_env_file_is_provider_neutral() -> None:
+    assert omni_label.DEFAULT_ENV_FILE == "~/.config/omni/.env"
+    assert "qwen" not in omni_label.DEFAULT_ENV_FILE.lower()
+
+
 def test_training_label_from_omni_maps_to_existing_v10_labels():
     assert (
         omni_label.training_label_from_omni(
