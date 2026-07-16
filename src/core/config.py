@@ -108,7 +108,8 @@ DEFAULT_SETTINGS: dict[str, str] = {
     "ASR_REPETITION_PENALTY": "1.05",
 
     # --- Semantic boundary pipeline / ASR Chunking ---
-    # Speech islands are refined first, then split decisions and shared cut timestamps.
+    # 1.7B: Outer v2 -> Acoustic Split v3 -> CueQC v13 -> Inner v1.
+    # 0.6B remains on the legacy Split v2 / Cut v1 chain.
     # This is a feature-score grid fallback, not the source video frame rate.
     "BOUNDARY_FEATURE_FRAME_HOP_S": "0.02",
     "OUTER_EDGE_REFINER_DEVICE": "auto",
@@ -117,6 +118,7 @@ DEFAULT_SETTINGS: dict[str, str] = {
     # inside each sample; this only batches independent candidates.
     "SEMANTIC_SPLIT_INFERENCE_BATCH_SIZE": "auto",
     "CUT_EDGE_REFINER_DEVICE": "auto",
+    "INNER_EDGE_REFINER_DEVICE": "auto",
     "BOUNDARY_FRAME_SEQUENCE_LEFT_CONTEXT_S": "0.60",
     "BOUNDARY_FRAME_SEQUENCE_RIGHT_CONTEXT_S": "0.60",
     "BOUNDARY_FRAME_SEQUENCE_MAX_PTM_DIMS": "128",

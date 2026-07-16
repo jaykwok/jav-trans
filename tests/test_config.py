@@ -138,7 +138,6 @@ def test_default_model_download_root_is_project_models():
     for mapping in (
         qwen.DEFAULT_OUTER_EDGE_REFINER_CHECKPOINT_BY_REPO,
         qwen.DEFAULT_SEMANTIC_SPLIT_CHECKPOINT_BY_REPO,
-        qwen.DEFAULT_CUT_EDGE_REFINER_CHECKPOINT_BY_REPO,
         qwen.DEFAULT_SPEECH_BOUNDARY_SCORER_CHECKPOINT_BY_REPO,
         qwen.DEFAULT_PRE_ASR_CUEQC_CHECKPOINT_BY_REPO,
     ):
@@ -146,6 +145,12 @@ def test_default_model_download_root_is_project_models():
             qwen.QWEN_ASR_06B_REPO_ID,
             qwen.QWEN_ASR_17B_REPO_ID,
         }
+    assert set(qwen.DEFAULT_CUT_EDGE_REFINER_CHECKPOINT_BY_REPO) == {
+        qwen.QWEN_ASR_06B_REPO_ID
+    }
+    assert set(qwen.DEFAULT_INNER_EDGE_REFINER_CHECKPOINT_BY_REPO) == {
+        qwen.QWEN_ASR_17B_REPO_ID
+    }
     assert "SPEECH_BOUNDARY_JA_SCORER_CHECKPOINT" not in config.DEFAULT_SETTINGS
     assert not any(key.startswith("ALIGN") for key in config.DEFAULT_SETTINGS)
     assert "BOUNDARY_REFINER_ENABLED" not in config.DEFAULT_SETTINGS
@@ -171,15 +176,17 @@ def test_default_model_download_root_is_project_models():
     assert config.DEFAULT_SETTINGS["LLM_API_FORMAT"] == "chat"
 
 
-def test_active_boundary_pre_asr_registry_is_breaking_v2_v12_only() -> None:
+def test_active_boundary_registry_splits_17b_v10_from_06b_legacy() -> None:
     assert set(qwen.DEFAULT_SPEECH_BOUNDARY_PROPOSAL_CHECKPOINT_BY_REPO) == {
         qwen.QWEN_ASR_06B_REPO_ID,
         qwen.QWEN_ASR_17B_REPO_ID,
     }
-    assert all(
-        "semantic_split_model_v2." in path
-        for path in qwen.DEFAULT_SEMANTIC_SPLIT_CHECKPOINT_BY_REPO.values()
-    )
+    assert "semantic_split_model_v2." in qwen.DEFAULT_SEMANTIC_SPLIT_CHECKPOINT_BY_REPO[
+        qwen.QWEN_ASR_06B_REPO_ID
+    ]
+    assert "semantic_split_model_v3." in qwen.DEFAULT_SEMANTIC_SPLIT_CHECKPOINT_BY_REPO[
+        qwen.QWEN_ASR_17B_REPO_ID
+    ]
     assert all(
         "pre_asr_cueqc_v12." in path
         for path in qwen.DEFAULT_PRE_ASR_CUEQC_CHECKPOINT_BY_REPO.values()
@@ -190,12 +197,15 @@ def test_active_boundary_pre_asr_registry_is_breaking_v2_v12_only() -> None:
     assert "outer_edge_refiner_v2." in qwen.DEFAULT_OUTER_EDGE_REFINER_CHECKPOINT_BY_REPO[
         qwen.QWEN_ASR_17B_REPO_ID
     ]
+    assert qwen.QWEN_ASR_17B_REPO_ID not in qwen.DEFAULT_CUT_EDGE_REFINER_CHECKPOINT_BY_REPO
+    assert qwen.QWEN_ASR_06B_REPO_ID not in qwen.DEFAULT_INNER_EDGE_REFINER_CHECKPOINT_BY_REPO
     active_mappings = (
         qwen.DEFAULT_SPEECH_BOUNDARY_SCORER_CHECKPOINT_BY_REPO,
         qwen.DEFAULT_SPEECH_BOUNDARY_PROPOSAL_CHECKPOINT_BY_REPO,
         qwen.DEFAULT_OUTER_EDGE_REFINER_CHECKPOINT_BY_REPO,
         qwen.DEFAULT_SEMANTIC_SPLIT_CHECKPOINT_BY_REPO,
         qwen.DEFAULT_CUT_EDGE_REFINER_CHECKPOINT_BY_REPO,
+        qwen.DEFAULT_INNER_EDGE_REFINER_CHECKPOINT_BY_REPO,
         qwen.DEFAULT_PRE_ASR_CUEQC_CHECKPOINT_BY_REPO,
     )
     for mapping in active_mappings:

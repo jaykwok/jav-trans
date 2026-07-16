@@ -28,6 +28,16 @@ class PackedChunk:
     acoustic_start: float | None = None
     acoustic_end: float | None = None
     acoustic_duration: float | None = None
+    display_start: float | None = None
+    display_end: float | None = None
+    display_duration: float | None = None
+    boundary_pipeline_version: int | None = None
+    semantic_event_ids: list[str] | None = None
+    semantic_event_probabilities: list[dict[str, float]] | None = None
+    inner_edge_prediction: dict[str, Any] | None = None
+    paired_inner_edges: dict[str, Any] | None = None
+    removed_gap_spans: list[dict[str, Any]] | None = None
+    removed_gap_duration_s: float = 0.0
     internal_gap_count: int = 0
     internal_gap_max_s: float = 0.0
     boundary_score: float | None = None

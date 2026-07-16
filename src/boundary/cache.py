@@ -15,9 +15,9 @@ from boundary.base import SpeechSegment
 
 log = logging.getLogger(__name__)
 
-# v19 invalidates v18 artifacts because Split duration-pressure acceptance can
-# change packed chunk boundaries without changing model checkpoint content.
-BOUNDARY_CACHE_VERSION = 19
+# v20 adds explicit semantic-event, paired-inner-edge, removed-gap, and display
+# span metadata. v19 shared-cut payloads are not reused.
+BOUNDARY_CACHE_VERSION = 20
 _AUDIO_SAMPLE_BYTES = 2 * 1024 * 1024
 _AUDIO_KEY_RE = re.compile(r"^[0-9a-fA-F]{8,40}$")
 
@@ -51,9 +51,11 @@ _BOUNDARY_ENV_KEYS = (
     "OUTER_EDGE_REFINER_MODEL_PATH_BY_REPO",
     "SEMANTIC_SPLIT_MODEL_PATH_BY_REPO",
     "CUT_EDGE_REFINER_MODEL_PATH_BY_REPO",
+    "INNER_EDGE_REFINER_MODEL_PATH_BY_REPO",
     "OUTER_EDGE_REFINER_DEVICE",
     "SEMANTIC_SPLIT_DEVICE",
     "CUT_EDGE_REFINER_DEVICE",
+    "INNER_EDGE_REFINER_DEVICE",
     "BOUNDARY_FRAME_SEQUENCE_LEFT_CONTEXT_S",
     "BOUNDARY_FRAME_SEQUENCE_RIGHT_CONTEXT_S",
     "BOUNDARY_FRAME_SEQUENCE_MAX_PTM_DIMS",
@@ -73,6 +75,7 @@ _BOUNDARY_CONFIG_CHECKPOINT_KEYS = (
     "outer_edge_refiner_model_path",
     "semantic_split_model_path",
     "cut_edge_refiner_model_path",
+    "inner_edge_refiner_model_path",
 )
 _BOUNDARY_SIGNATURE_CHECKPOINT_KEYS = (
     "model_path",
@@ -389,6 +392,18 @@ def _packed_chunk_to_dict(chunk: PackedChunk) -> dict:
         "acoustic_start": chunk.acoustic_start,
         "acoustic_end": chunk.acoustic_end,
         "acoustic_duration": chunk.acoustic_duration,
+        "display_start": chunk.display_start,
+        "display_end": chunk.display_end,
+        "display_duration": chunk.display_duration,
+        "boundary_pipeline_version": chunk.boundary_pipeline_version,
+        "semantic_event_ids": _jsonable(chunk.semantic_event_ids or []),
+        "semantic_event_probabilities": _jsonable(
+            chunk.semantic_event_probabilities or []
+        ),
+        "inner_edge_prediction": _jsonable(chunk.inner_edge_prediction or {}),
+        "paired_inner_edges": _jsonable(chunk.paired_inner_edges or {}),
+        "removed_gap_spans": _jsonable(chunk.removed_gap_spans or []),
+        "removed_gap_duration_s": float(chunk.removed_gap_duration_s),
         "internal_gap_count": int(chunk.internal_gap_count),
         "internal_gap_max_s": float(chunk.internal_gap_max_s),
         "boundary_score": (
@@ -498,6 +513,44 @@ def _packed_chunk_from_dict(item: Any) -> PackedChunk:
             if item.get("acoustic_duration") is None
             else float(item.get("acoustic_duration"))
         ),
+        display_start=(
+            None if item.get("display_start") is None else float(item.get("display_start"))
+        ),
+        display_end=(
+            None if item.get("display_end") is None else float(item.get("display_end"))
+        ),
+        display_duration=(
+            None
+            if item.get("display_duration") is None
+            else float(item.get("display_duration"))
+        ),
+        boundary_pipeline_version=(
+            None
+            if item.get("boundary_pipeline_version") is None
+            else int(item.get("boundary_pipeline_version"))
+        ),
+        semantic_event_ids=[str(value) for value in item.get("semantic_event_ids", [])],
+        semantic_event_probabilities=[
+            dict(value)
+            for value in item.get("semantic_event_probabilities", [])
+            if isinstance(value, dict)
+        ],
+        inner_edge_prediction=(
+            dict(item["inner_edge_prediction"])
+            if isinstance(item.get("inner_edge_prediction"), dict)
+            else None
+        ),
+        paired_inner_edges=(
+            dict(item["paired_inner_edges"])
+            if isinstance(item.get("paired_inner_edges"), dict)
+            else None
+        ),
+        removed_gap_spans=[
+            dict(value)
+            for value in item.get("removed_gap_spans", [])
+            if isinstance(value, dict)
+        ],
+        removed_gap_duration_s=float(item.get("removed_gap_duration_s") or 0.0),
         internal_gap_count=int(item.get("internal_gap_count") or 0),
         internal_gap_max_s=float(item.get("internal_gap_max_s") or 0.0),
         boundary_score=(

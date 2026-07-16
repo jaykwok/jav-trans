@@ -39,6 +39,12 @@ REPO_IDS = (qwen.QWEN_ASR_06B_REPO_ID, qwen.QWEN_ASR_17B_REPO_ID)
             "ptm_repo_id",
         ),
         (
+            qwen.DEFAULT_INNER_EDGE_REFINER_CHECKPOINT_BY_REPO,
+            "inner_edge_refiner",
+            5,
+            "ptm_repo_id",
+        ),
+        (
             qwen.DEFAULT_PRE_ASR_CUEQC_CHECKPOINT_BY_REPO,
             "pre_asr_cueqc",
             5,
@@ -54,6 +60,8 @@ def test_promoted_five_model_artifact_contract(
     repo_metadata_key: str,
 ) -> None:
     torch = pytest.importorskip("torch")
+    if repo_id not in mapping:
+        pytest.skip("model is intentionally not active for this ASR repo")
     path = Path(mapping[repo_id])
     assert path.is_file()
     assert "agents/temp" not in path.as_posix()

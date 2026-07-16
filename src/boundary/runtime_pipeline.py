@@ -10,6 +10,7 @@ import numpy as np
 from audio.chunk_packer import PackedChunk
 from boundary.base import SpeechSegment
 from boundary.cut_refiner import CutEdgeRefiner
+from boundary.inner_refiner_v1 import InnerEdgeRefinerV1
 from boundary.outer_refiner import OuterEdgeRefiner
 from boundary.outer_refiner_v2 import OuterEdgeRefinerV2, PairedOuterEdgePrediction
 from boundary.sequence_features import (
@@ -17,8 +18,10 @@ from boundary.sequence_features import (
     ptm_projection_digest,
 )
 from boundary.split_model import (
+    AcousticSplitV3Planner,
     SemanticSplitIslandVerifier,
     SplitDecision,
+    aggregate_cut_event_runs,
 )
 
 
@@ -110,6 +113,361 @@ def semantic_config_payload(config: SemanticBoundaryConfig) -> dict[str, float |
         "duration_pressure_z": float(config.duration_pressure_z),
         "duration_pressure_floor": float(config.duration_pressure_floor),
     }
+
+
+def build_acoustic_split_v3_provisional_chunks(
+    segments: Sequence[SpeechSegment],
+    *,
+    duration_s: float,
+    speech_probabilities: Sequence[float],
+    feature_provider: FrameSequenceFeatureProvider,
+    outer_refiner: OuterEdgeRefinerV2,
+    split_planner: AcousticSplitV3Planner,
+    on_stage: Callable[[str], None] | None = None,
+) -> list[PackedChunk]:
+    """Build provisional sub-islands without timing thresholds or Cut v1."""
+
+    speech = np.asarray(speech_probabilities, dtype=np.float32)
+    if on_stage is not None:
+        on_stage("外边界精修 0/1")
+    refined = _refine_outer_edges(
+        segments,
+        duration_s=duration_s,
+        speech=speech,
+        provider=feature_provider,
+        refiner=outer_refiner,
+    )
+    if on_stage is not None:
+        on_stage("外边界精修 1/1")
+
+    prepared: list[tuple] = []
+    for segment, core_start, core_end, outer_prediction in refined:
+        proposals = [
+            dict(candidate)
+            for candidate in segment.weak_cut_candidates
+            if core_start < float(candidate["time_s"]) < core_end
+        ]
+        if proposals:
+            frame_features, scalar_features = _split_features(
+                proposals,
+                core_start=core_start,
+                core_end=core_end,
+                speech=speech,
+                provider=feature_provider,
+                verifier=split_planner,
+            )
+            decisions = split_planner.decide_islands(
+                island_frame_features=[frame_features],
+                island_scalar_features=[scalar_features],
+            )[0]
+        else:
+            decisions = []
+        events = aggregate_cut_event_runs(
+            candidate_times_s=[float(candidate["time_s"]) for candidate in proposals],
+            decisions=decisions,
+            event_id_prefix=f"island-{len(prepared):04d}",
+        )
+        prepared.append(
+            (
+                segment,
+                core_start,
+                core_end,
+                outer_prediction,
+                proposals,
+                decisions,
+                events,
+            )
+        )
+
+    chunks: list[PackedChunk] = []
+    for island_index, (
+        segment,
+        core_start,
+        core_end,
+        outer_prediction,
+        proposals,
+        decisions,
+        events,
+    ) in enumerate(prepared):
+        event_rows = []
+        for event in events:
+            decision = decisions[event.representative_index]
+            candidate = proposals[event.representative_index]
+            event_rows.append(
+                {
+                    "event_id": event.event_id,
+                    "time_s": event.representative_time_s,
+                    "frame": int(candidate["frame"]),
+                    "candidate_start_index": event.candidate_start_index,
+                    "candidate_end_index": event.candidate_end_index,
+                    "representative_index": event.representative_index,
+                    "p_cut": decision.p_cut,
+                    "p_continue": decision.p_continue,
+                    "p_unsure": decision.p_unsure,
+                    "score": float(candidate.get("score") or 0.0),
+                    "prominence": float(candidate.get("prominence") or 0.0),
+                    "speech_valley": float(candidate.get("speech_valley") or 0.0),
+                }
+            )
+        event_by_time = {
+            round(float(row["time_s"]), 6): row for row in event_rows
+        }
+        boundaries = [core_start, *(row["time_s"] for row in event_rows), core_end]
+        decision_by_index = {
+            index: decision for index, decision in enumerate(decisions)
+        }
+        weak = [
+            {
+                **candidate,
+                "kind": "weak",
+                "label": decision_by_index[index].label,
+                "p_cut": decision_by_index[index].p_cut,
+                "p_continue": decision_by_index[index].p_continue,
+                "p_unsure": decision_by_index[index].p_unsure,
+            }
+            for index, candidate in enumerate(proposals)
+            if index not in {event.representative_index for event in events}
+        ]
+        for piece_index, (start, end) in enumerate(zip(boundaries, boundaries[1:])):
+            adjacent = [
+                dict(event_by_time[key])
+                for key in (round(float(start), 6), round(float(end), 6))
+                if key in event_by_time
+            ]
+            piece = replace(
+                segment,
+                start=float(start),
+                end=float(end),
+                primary_cut_candidates=adjacent,
+                weak_cut_candidates=[
+                    dict(item) for item in weak if start < float(item["time_s"]) < end
+                ],
+            )
+            chunks.append(
+                PackedChunk(
+                    start=float(start),
+                    end=float(end),
+                    duration=float(end - start),
+                    speech_segments=[piece],
+                    split_reason="acoustic_split_v3" if events else "speech_core",
+                    source_abs_start=float(start),
+                    source_abs_end=float(end),
+                    parent_chunk_id=island_index,
+                    island_id=piece_index,
+                    island_count=len(boundaries) - 1,
+                    core_start=float(start),
+                    core_end=float(end),
+                    raw_start=float(segment.start) if piece_index == 0 else float(start),
+                    raw_end=(
+                        float(segment.end)
+                        if piece_index + 1 == len(boundaries) - 1
+                        else float(end)
+                    ),
+                    raw_duration=(
+                        (
+                            float(segment.end)
+                            if piece_index + 1 == len(boundaries) - 1
+                            else float(end)
+                        )
+                        - (float(segment.start) if piece_index == 0 else float(start))
+                    ),
+                    acoustic_start=float(start),
+                    acoustic_end=float(end),
+                    acoustic_duration=float(end - start),
+                    display_start=float(start),
+                    display_end=float(end),
+                    display_duration=float(end - start),
+                    boundary_pipeline_version=10,
+                    semantic_event_ids=[row["event_id"] for row in adjacent],
+                    semantic_event_probabilities=[
+                        {
+                            "p_cut": float(row["p_cut"]),
+                            "p_continue": float(row["p_continue"]),
+                            "p_unsure": float(row["p_unsure"]),
+                        }
+                        for row in adjacent
+                    ],
+                    boundary_source=(
+                        "acoustic_split_v3" if adjacent else "outer_edge_refiner_v2"
+                    ),
+                    boundary_decision_source=(
+                        "acoustic_candidate_event_runs_v1"
+                        if adjacent
+                        else "outer_edge_refiner_v2"
+                    ),
+                    boundary_start_refine_delta_s=(
+                        outer_prediction.start_delta_s if piece_index == 0 else None
+                    ),
+                    boundary_end_refine_delta_s=(
+                        outer_prediction.end_delta_s
+                        if piece_index + 1 == len(boundaries) - 1
+                        else None
+                    ),
+                    primary_cut_candidates=adjacent,
+                    weak_cut_candidates=piece.weak_cut_candidates,
+                )
+            )
+    return chunks
+
+
+def annotate_inner_edge_predictions(
+    chunks: Sequence[PackedChunk],
+    *,
+    feature_provider: FrameSequenceFeatureProvider,
+    inner_refiner: InnerEdgeRefinerV1,
+) -> list[PackedChunk]:
+    """Predict paired sub-island edges without applying or dropping chunks."""
+
+    if not chunks:
+        return []
+    raw_ptm_dim = int(
+        inner_refiner.feature_config.get("raw_ptm_dim")
+        or inner_refiner.model_config.get("ptm_input_dim")
+        or 0
+    )
+    feature_groups = [
+        feature_provider.features_for_outer_island_v2(
+            start_s=float(chunk.start),
+            end_s=float(chunk.end),
+            raw_ptm_dim=raw_ptm_dim,
+        )
+        for chunk in chunks
+    ]
+    predictions = inner_refiner.predict_subislands(
+        frame_feature_groups=feature_groups,
+        raw_spans=[(float(chunk.start), float(chunk.end)) for chunk in chunks],
+        frame_hop_s=float(feature_provider.frame_hop_s),
+    )
+    return [
+        replace(
+            chunk,
+            inner_edge_prediction={
+                "schema": "paired_inner_edges_v1_prediction",
+                "start_s": float(prediction.start_s),
+                "end_s": float(prediction.end_s),
+                "start_action": prediction.start_action,
+                "end_action": prediction.end_action,
+                "abstain_reason": prediction.abstain_reason,
+                "start_probabilities": dict(prediction.start_probabilities),
+                "end_probabilities": dict(prediction.end_probabilities),
+            },
+        )
+        for chunk, prediction in zip(chunks, predictions)
+    ]
+
+
+def apply_paired_inner_edges_after_cueqc(
+    chunks: Sequence[PackedChunk],
+) -> list[PackedChunk]:
+    """Apply adjacent kept-subisland edges; abstain merges instead of forcing."""
+
+    result: list[PackedChunk] = []
+    for chunk in chunks:
+        if not result:
+            result.append(chunk)
+            continue
+        left = result[-1]
+        consecutive = (
+            left.parent_chunk_id is not None
+            and left.parent_chunk_id == chunk.parent_chunk_id
+            and left.island_id is not None
+            and chunk.island_id is not None
+            and chunk.island_id == left.island_id + 1
+        )
+        if not consecutive:
+            result.append(chunk)
+            continue
+        left_prediction = dict(left.inner_edge_prediction or {})
+        right_prediction = dict(chunk.inner_edge_prediction or {})
+        left_action = str(left_prediction.get("end_action") or "abstain")
+        right_action = str(right_prediction.get("start_action") or "abstain")
+        left_end = float(left_prediction.get("end_s") or left.end)
+        right_start = float(right_prediction.get("start_s") or chunk.start)
+        shared_event_ids = sorted(
+            set(left.semantic_event_ids or []) & set(chunk.semantic_event_ids or [])
+        )
+        if left_action == "refined" and right_action == "refined" and left_end <= right_start:
+            gap = {
+                "event_ids": shared_event_ids,
+                "start": left_end,
+                "end": right_start,
+                "duration": right_start - left_end,
+            }
+            result[-1] = replace(
+                left,
+                end=left_end,
+                duration=left_end - left.start,
+                source_abs_end=left_end,
+                acoustic_end=left_end,
+                acoustic_duration=left_end - float(left.acoustic_start or left.start),
+                display_end=left_end,
+                display_duration=left_end - float(left.display_start or left.start),
+                paired_inner_edges={
+                    "event_ids": shared_event_ids,
+                    "left_speech_end": left_end,
+                    "right_speech_start": right_start,
+                    "action": "safe",
+                },
+                removed_gap_spans=[*(left.removed_gap_spans or []), gap],
+                removed_gap_duration_s=left.removed_gap_duration_s + gap["duration"],
+            )
+            result.append(
+                replace(
+                    chunk,
+                    start=right_start,
+                    duration=chunk.end - right_start,
+                    source_abs_start=right_start,
+                    acoustic_start=right_start,
+                    acoustic_duration=float(chunk.acoustic_end or chunk.end) - right_start,
+                    display_start=right_start,
+                    display_duration=float(chunk.display_end or chunk.end) - right_start,
+                    paired_inner_edges={
+                        "event_ids": shared_event_ids,
+                        "left_speech_end": left_end,
+                        "right_speech_start": right_start,
+                        "action": "safe",
+                    },
+                    removed_gap_spans=[*(chunk.removed_gap_spans or []), gap],
+                    removed_gap_duration_s=chunk.removed_gap_duration_s + gap["duration"],
+                )
+            )
+            continue
+        merged_start = min(float(left.start), float(chunk.start))
+        merged_end = max(float(left.end), float(chunk.end))
+        result[-1] = replace(
+            left,
+            start=merged_start,
+            end=merged_end,
+            duration=merged_end - merged_start,
+            source_abs_start=merged_start,
+            source_abs_end=merged_end,
+            acoustic_start=merged_start,
+            acoustic_end=merged_end,
+            acoustic_duration=merged_end - merged_start,
+            display_start=merged_start,
+            display_end=merged_end,
+            display_duration=merged_end - merged_start,
+            speech_segments=[*left.speech_segments, *chunk.speech_segments],
+            semantic_event_ids=sorted(
+                set(left.semantic_event_ids or []) | set(chunk.semantic_event_ids or [])
+            ),
+            paired_inner_edges={
+                "event_ids": shared_event_ids,
+                "action": "abstain_merge",
+                "left_action": left_action,
+                "right_action": right_action,
+                "reason": "+".join(
+                    value
+                    for value in (
+                        str(left_prediction.get("abstain_reason") or ""),
+                        str(right_prediction.get("abstain_reason") or ""),
+                        "overlap" if left_end > right_start else "",
+                    )
+                    if value
+                ),
+            },
+        )
+    return result
 
 
 def build_semantic_boundary_chunks(
