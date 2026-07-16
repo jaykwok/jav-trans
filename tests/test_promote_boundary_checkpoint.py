@@ -4,7 +4,7 @@ from pathlib import Path
 
 import pytest
 
-from boundary.split_model import SEMANTIC_SPLIT_V2_SCHEMA
+from boundary.split_model import SEMANTIC_SPLIT_V2_SCHEMA, SEMANTIC_SPLIT_V3_SCHEMA
 from boundary.outer_refiner_v2 import OUTER_EDGE_REFINER_V2_SCHEMA
 from tools.boundary.ja.promote_boundary_checkpoint import promote_checkpoint
 
@@ -60,3 +60,29 @@ def test_promote_boundary_checkpoint_supports_outer_v2(tmp_path: Path) -> None:
     assert summary["weights_unchanged"] is True
     assert payload["metadata"]["artifact"]["version"] == "v2"
     assert payload["metadata"]["artifact"]["pipeline_stage"] == 2
+
+
+def test_promote_boundary_checkpoint_supports_split_v3(tmp_path: Path) -> None:
+    torch = pytest.importorskip("torch")
+    source = tmp_path / "candidate.pt"
+    output = tmp_path / "semantic_split_model_v3.repo.pt"
+    torch.save(
+        {
+            "schema": SEMANTIC_SPLIT_V3_SCHEMA,
+            "metadata": {"artifact": {"name": "semantic_split_model"}},
+            "model_state_dict": {"weight": torch.tensor([[5.0, 6.0]])},
+        },
+        source,
+    )
+
+    promote_checkpoint(
+        checkpoint=source,
+        output=output,
+        source_training_run="agents/temp/split-v3-train",
+    )
+    payload = torch.load(output, map_location="cpu", weights_only=False)
+
+    assert payload["metadata"]["artifact"]["version"] == "v3"
+    assert payload["metadata"]["artifact"]["pipeline_role"] == (
+        "acoustic_boundary_event_planner"
+    )
