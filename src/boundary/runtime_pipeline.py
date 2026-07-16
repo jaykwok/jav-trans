@@ -827,7 +827,14 @@ def _split_features(
     feature_rows: list[np.ndarray] = []
     scalar_rows: list[np.ndarray] = []
     cfg = verifier.feature_config
-    projection = cfg.get("ptm_projection") or None
+    projection_payload = cfg.get("ptm_projection") or None
+    projection = (
+        projection_payload
+        if isinstance(projection_payload, dict)
+        and "mean" in projection_payload
+        and "components" in projection_payload
+        else None
+    )
     projection_mean = (
         np.asarray(projection["mean"], dtype=np.float32)
         if projection is not None

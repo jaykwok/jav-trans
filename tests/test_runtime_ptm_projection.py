@@ -241,6 +241,19 @@ def test_pipeline_provider_accepts_ndarray_and_projected_payload() -> None:
     assert legacy is not None
     assert not legacy.has_pre_projected_ptm
 
+    raw = _sequence_feature_provider_from_result(
+        {
+            "schema": "speech_boundary_ja_sequence_feature_frames_v1",
+            "frame_hop_s": HOP_S,
+            "ptm": ptm,
+            "mfcc": mfcc,
+        },
+        duration_s=FRAMES * HOP_S,
+        max_ptm_dims=FULL_DIM,
+    )
+    assert raw is not None
+    assert raw.signature()["ptm_used_dim"] == FULL_DIM
+
 
 def _verifier_with_projection(
     mean: np.ndarray, components: np.ndarray, digest: str

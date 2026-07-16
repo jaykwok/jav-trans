@@ -58,8 +58,8 @@ models/*
 # Build/package outputs
 build/
 dist/
+packaging/
 *.spec
-!packaging/*.spec
 *.7z
 *.7z.*
 *.zip

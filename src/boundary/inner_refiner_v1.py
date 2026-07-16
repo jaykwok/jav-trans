@@ -70,8 +70,31 @@ class InnerEdgeRefinerV1:
         predictions: list[PairedOuterEdgePrediction] = []
         with torch.inference_mode():
             for features, (raw_start, raw_end) in zip(frame_feature_groups, raw_spans):
+                values = np.asarray(features, dtype=np.float32)
+                if values.shape[0] == 0:
+                    probabilities = {
+                        label: 0.0 for label in SPEECH_ISLAND_SCORER_LABELS
+                    }
+                    predictions.append(
+                        PairedOuterEdgePrediction(
+                            raw_start_s=float(raw_start),
+                            raw_end_s=float(raw_end),
+                            start_s=float(raw_start),
+                            end_s=float(raw_end),
+                            start_action="abstain",
+                            end_action="abstain",
+                            abstain_reason="no_feature_frames",
+                            start_probabilities=probabilities,
+                            end_probabilities=probabilities,
+                            class_probabilities=np.zeros(
+                                (0, len(SPEECH_ISLAND_SCORER_LABELS)),
+                                dtype=np.float32,
+                            ),
+                        )
+                    )
+                    continue
                 normalized = (
-                    np.asarray(features, dtype=np.float32) - mean
+                    values - mean
                 ) / np.maximum(std, 1e-6)
                 logits = self.model(
                     torch.from_numpy(np.ascontiguousarray(normalized))

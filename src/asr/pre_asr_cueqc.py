@@ -8,24 +8,44 @@ from typing import Any, Mapping, Sequence
 import numpy as np
 
 from asr.backends.qwen import (
+    DEFAULT_INNER_EDGE_REFINER_CHECKPOINT_BY_REPO,
     DEFAULT_PRE_ASR_CUEQC_CHECKPOINT_BY_REPO,
     DEFAULT_SEMANTIC_SPLIT_CHECKPOINT_BY_REPO,
+    QWEN_ASR_06B_REPO_ID,
     checkpoint_path_for_repo_env,
     current_qwen_asr_backend,
     validate_checkpoint_repo_id,
 )
 from boundary.sequence_features import (
+    CHUNK_LEARNED_PROJECTED_PTM_SCHEMA,
+    CHUNK_PROJECTED_PTM_SCHEMA,
     CHUNK_POOLED_PTM_SCHEMA,
     chunk_pooled_ptm_feature_names,
 )
 
 
-PRE_ASR_CUEQC_SCHEMA = "cueqc_pre_asr_semantic_chunk_v12_binary"
-PRE_ASR_CUEQC_MODEL_ARCH = "cueqc_pre_asr_semantic_chunk_v12"
-PRE_ASR_CUEQC_DECISION_VERSION = "pre_asr_cueqc_v12_binary_v1"
-PRE_ASR_CUEQC_FEATURE_SCHEMA = "pre_asr_cueqc_features_v9"
-PRE_ASR_CUEQC_RUNTIME_ADAPTER = "pre_asr_semantic_chunk_sequence_v4"
+PRE_ASR_CUEQC_SCHEMA = "cueqc_pre_asr_semantic_chunk_v13"
+PRE_ASR_CUEQC_MODEL_ARCH = "cueqc_pre_asr_semantic_chunk_v13"
+PRE_ASR_CUEQC_DECISION_VERSION = "pre_asr_cueqc_v13_argmax_v1"
+PRE_ASR_CUEQC_FEATURE_SCHEMA = "pre_asr_cueqc_features_v10"
+PRE_ASR_CUEQC_RUNTIME_ADAPTER = "pre_asr_provisional_subisland_sequence_v5"
 PRE_ASR_CUEQC_ARTIFACT = {
+    "name": "pre_asr_cueqc",
+    "display_name": "Pre-ASR CueQC",
+    "version": "v13",
+    "pipeline_stage": 5,
+    "pipeline_role": "provisional_subisland_keep_drop_unsure_routing",
+}
+PRE_ASR_CUEQC_LABELS = ("drop", "keep", "unsure")
+PRE_ASR_CUEQC_LABEL_TO_INDEX = {
+    label: index for index, label in enumerate(PRE_ASR_CUEQC_LABELS)
+}
+PRE_ASR_CUEQC_LEGACY_SCHEMA = "cueqc_pre_asr_semantic_chunk_v12_binary"
+PRE_ASR_CUEQC_LEGACY_MODEL_ARCH = "cueqc_pre_asr_semantic_chunk_v12"
+PRE_ASR_CUEQC_LEGACY_DECISION_VERSION = "pre_asr_cueqc_v12_binary_v1"
+PRE_ASR_CUEQC_LEGACY_FEATURE_SCHEMA = "pre_asr_cueqc_features_v9"
+PRE_ASR_CUEQC_LEGACY_RUNTIME_ADAPTER = "pre_asr_semantic_chunk_sequence_v4"
+PRE_ASR_CUEQC_LEGACY_ARTIFACT = {
     "name": "pre_asr_cueqc",
     "display_name": "Pre-ASR CueQC",
     "version": "v12",
@@ -243,6 +263,37 @@ def _semantic_split_checkpoint_path(repo_id: str | None = None) -> str:
         mapping_env="SEMANTIC_SPLIT_MODEL_PATH_BY_REPO",
         default_mapping=DEFAULT_SEMANTIC_SPLIT_CHECKPOINT_BY_REPO,
     )
+
+
+def _inner_edge_refiner_checkpoint_path(repo_id: str | None = None) -> str:
+    return checkpoint_path_for_repo_env(
+        repo_id=repo_id or current_qwen_asr_backend(),
+        mapping_env="INNER_EDGE_REFINER_MODEL_PATH_BY_REPO",
+        default_mapping=DEFAULT_INNER_EDGE_REFINER_CHECKPOINT_BY_REPO,
+    )
+
+
+def _runtime_contract(repo_id: str | None = None) -> dict[str, Any]:
+    selected = repo_id or current_qwen_asr_backend()
+    if selected == QWEN_ASR_06B_REPO_ID:
+        return {
+            "schema": PRE_ASR_CUEQC_LEGACY_SCHEMA,
+            "arch": PRE_ASR_CUEQC_LEGACY_MODEL_ARCH,
+            "decision_version": PRE_ASR_CUEQC_LEGACY_DECISION_VERSION,
+            "feature_schema": PRE_ASR_CUEQC_LEGACY_FEATURE_SCHEMA,
+            "runtime_adapter": PRE_ASR_CUEQC_LEGACY_RUNTIME_ADAPTER,
+            "artifact": PRE_ASR_CUEQC_LEGACY_ARTIFACT,
+            "num_classes": 2,
+        }
+    return {
+        "schema": PRE_ASR_CUEQC_SCHEMA,
+        "arch": PRE_ASR_CUEQC_MODEL_ARCH,
+        "decision_version": PRE_ASR_CUEQC_DECISION_VERSION,
+        "feature_schema": PRE_ASR_CUEQC_FEATURE_SCHEMA,
+        "runtime_adapter": PRE_ASR_CUEQC_RUNTIME_ADAPTER,
+        "artifact": PRE_ASR_CUEQC_ARTIFACT,
+        "num_classes": len(PRE_ASR_CUEQC_LABELS),
+    }
 
 
 def _file_sha256(path: Path) -> str:
@@ -497,8 +548,20 @@ def _pooled_ptm_values(
         parsed_dim = None
     values = _numeric_list(raw_values)
     expected_dim = len(PRE_ASR_CUEQC_POOLED_PTM_FEATURE_NAMES)
+    boundary_pipeline_version = int(
+        _safe_float(_packed_value(span, "boundary_pipeline_version"), 0.0)
+    )
+    allowed_schemas = (
+        {CHUNK_LEARNED_PROJECTED_PTM_SCHEMA}
+        if boundary_pipeline_version == 10
+        else {
+            CHUNK_POOLED_PTM_SCHEMA,
+            CHUNK_PROJECTED_PTM_SCHEMA,
+            CHUNK_LEARNED_PROJECTED_PTM_SCHEMA,
+        }
+    )
     available = (
-        schema == CHUNK_POOLED_PTM_SCHEMA
+        schema in allowed_schemas
         and len(values) == expected_dim
         and (parsed_bins is None or parsed_bins == PRE_ASR_CUEQC_PTM_BINS)
         and (parsed_dim is None or parsed_dim == expected_dim)
@@ -506,7 +569,7 @@ def _pooled_ptm_values(
     if available:
         return values, True, schema, parsed_bins or PRE_ASR_CUEQC_PTM_BINS, expected_dim
     if require_ptm_pooling:
-        raise ValueError("Pre-ASR CueQC v12 requires chunk-level pooled PTM features")
+        raise ValueError("Pre-ASR CueQC requires chunk-level learned-projection PTM features")
     return [0.0] * expected_dim, False, schema, parsed_bins, parsed_dim
 
 
@@ -577,6 +640,19 @@ def candidate_from_span(
     require_ptm_pooling: bool = False,
 ) -> dict[str, Any]:
     span = spans[index]
+    boundary_pipeline_version = int(
+        _safe_float(_packed_value(span, "boundary_pipeline_version"), 0.0)
+    )
+    feature_schema = (
+        PRE_ASR_CUEQC_FEATURE_SCHEMA
+        if boundary_pipeline_version == 10
+        else PRE_ASR_CUEQC_LEGACY_FEATURE_SCHEMA
+    )
+    runtime_adapter = (
+        PRE_ASR_CUEQC_RUNTIME_ADAPTER
+        if boundary_pipeline_version == 10
+        else PRE_ASR_CUEQC_LEGACY_RUNTIME_ADAPTER
+    )
     start = _safe_float(_packed_value(span, "start"))
     end = max(start, _safe_float(_packed_value(span, "end"), start))
     duration = max(0.0, end - start)
@@ -798,9 +874,10 @@ def candidate_from_span(
         **neighbor_right,
     }
     return {
-        "schema": PRE_ASR_CUEQC_FEATURE_SCHEMA,
-        "feature_schema": PRE_ASR_CUEQC_FEATURE_SCHEMA,
-        "runtime_adapter": PRE_ASR_CUEQC_RUNTIME_ADAPTER,
+        "schema": feature_schema,
+        "feature_schema": feature_schema,
+        "runtime_adapter": runtime_adapter,
+        "boundary_pipeline_version": boundary_pipeline_version,
         "index": index,
         "start": round(start, 6),
         "end": round(end, 6),
@@ -846,6 +923,9 @@ def candidate_from_span(
         "ptm_pooling_available": pooled_available,
         "ptm_pooling_bins": pooling_bins,
         "ptm_pooling_dim": pooling_dim,
+        "ptm_projection_digest": str(
+            _packed_value(span, "pre_asr_ptm_projection_digest", "") or ""
+        ),
         "pre_asr_ptm_pooled_features": pooled_values,
     }
 
@@ -944,7 +1024,7 @@ class PreAsrCueQCNetwork:
                 semantic_auxiliary: bool = False,
                 late_fusion: bool = False,
                 dropout: float = 0.1,
-                num_classes: int = 2,
+                num_classes: int = len(PRE_ASR_CUEQC_LABELS),
             ) -> None:
                 super().__init__()
                 from boundary.backbones import TinyMamba2BoundaryBackbone
@@ -1223,7 +1303,7 @@ def make_model_config(config: Mapping[str, Any] | None = None) -> dict[str, Any]
         "semantic_auxiliary": bool(raw.get("semantic_auxiliary", False)),
         "late_fusion": bool(raw.get("late_fusion", False)),
         "dropout": float(raw.get("dropout", 0.1)),
-        "num_classes": int(raw.get("num_classes") or 2),
+        "num_classes": int(raw.get("num_classes") or len(PRE_ASR_CUEQC_LABELS)),
     }
 
 
@@ -1238,21 +1318,22 @@ class PreAsrCueQC:
     ) -> None:
         import torch
 
+        contract = _runtime_contract(expected_asr_repo_id)
         schema = str(checkpoint.get("schema") or "")
-        if schema != PRE_ASR_CUEQC_SCHEMA:
+        if schema != contract["schema"]:
             raise ValueError(f"unsupported Pre-ASR CueQC schema: {schema!r}")
         arch = str(checkpoint.get("arch") or "")
-        if arch != PRE_ASR_CUEQC_MODEL_ARCH:
+        if arch != contract["arch"]:
             raise ValueError(f"unsupported Pre-ASR CueQC arch: {arch!r}")
-        if str(checkpoint.get("feature_schema") or "") != PRE_ASR_CUEQC_FEATURE_SCHEMA:
+        if str(checkpoint.get("feature_schema") or "") != contract["feature_schema"]:
             raise ValueError("Pre-ASR CueQC feature_schema does not match runtime")
-        if str(checkpoint.get("runtime_adapter") or "") != PRE_ASR_CUEQC_RUNTIME_ADAPTER:
+        if str(checkpoint.get("runtime_adapter") or "") != contract["runtime_adapter"]:
             raise ValueError("Pre-ASR CueQC runtime_adapter does not match runtime")
         metadata = dict(checkpoint.get("metadata") or {})
         artifact = metadata.get("artifact")
         if not isinstance(artifact, dict):
             raise ValueError("Pre-ASR CueQC metadata.artifact is required")
-        for key, expected in PRE_ASR_CUEQC_ARTIFACT.items():
+        for key, expected in contract["artifact"].items():
             if artifact.get(key) != expected:
                 raise ValueError(
                     f"Pre-ASR CueQC metadata.artifact.{key} must be {expected!r}"
@@ -1272,18 +1353,22 @@ class PreAsrCueQC:
         ]
         if unknown_feature_names:
             raise ValueError(
-                "Pre-ASR CueQC checkpoint feature_names contain unknown v9 fields: "
+                "Pre-ASR CueQC checkpoint feature_names contain unknown fields: "
                 + ", ".join(unknown_feature_names[:5])
             )
         lowered = " ".join(PRE_ASR_CUEQC_FEATURE_NAMES).lower()
         if any(token in lowered for token in _BANNED_FEATURE_TOKENS):
             raise ValueError("Pre-ASR CueQC feature schema must not contain ASR text/token/decoder fields")
 
-        config = make_model_config(checkpoint.get("model_config"))
+        raw_model_config = dict(checkpoint.get("model_config") or {})
+        raw_model_config.setdefault("num_classes", int(contract["num_classes"]))
+        config = make_model_config(raw_model_config)
         if config["ptm_dim"] != PRE_ASR_CUEQC_PTM_DIM:
             raise ValueError("Pre-ASR CueQC model_config.ptm_dim does not match runtime")
         if config["scalar_dim"] != len(feature_names):
             raise ValueError("Pre-ASR CueQC model_config.scalar_dim does not match runtime")
+        if config["num_classes"] != int(contract["num_classes"]):
+            raise ValueError("Pre-ASR CueQC model_config.num_classes does not match runtime")
         self.model = PreAsrCueQCNetwork(**config)
         state = checkpoint.get("model_state_dict")
         if not isinstance(state, dict):
@@ -1300,6 +1385,7 @@ class PreAsrCueQC:
         self.sha256 = _file_sha256(path)
         self.metadata = metadata
         self.config = config
+        self.contract = contract
         self.scalar_feature_names = feature_names
         self.mean = np.asarray(
             checkpoint.get("feature_mean", [0.0] * len(feature_names)),
@@ -1312,6 +1398,12 @@ class PreAsrCueQC:
         if self.mean.shape[0] != len(feature_names) or self.std.shape[0] != len(feature_names):
             raise ValueError("Pre-ASR CueQC scalar normalization shape mismatch")
         decision = dict(checkpoint.get("decision_config") or {})
+        self.decision_mode = str(
+            decision.get("decision_mode")
+            or ("drop_threshold" if config["num_classes"] == 2 else "argmax")
+        )
+        if config["num_classes"] == 3 and self.decision_mode != "argmax":
+            raise ValueError("Pre-ASR CueQC v13 decision_mode must be argmax")
         self.drop_threshold = float(
             decision.get("drop_threshold", PRE_ASR_CUEQC_DEFAULT_DROP_THRESHOLD)
         )
@@ -1324,7 +1416,7 @@ class PreAsrCueQC:
             or self.hard_drop_rule_enabled
             or self.keep_veto_enabled
         ):
-            raise ValueError("Pre-ASR CueQC v12/v9 checkpoints must disable hard rules")
+            raise ValueError("Pre-ASR CueQC checkpoints must disable hard rules")
         self.hard_keep_min_duration_s = float(decision.get("hard_keep_min_duration_s", 0.80))
         self.high_speech_p90 = float(decision.get("high_speech_p90", 0.85))
         self.high_active_ratio = float(decision.get("high_active_ratio", 0.50))
@@ -1332,18 +1424,21 @@ class PreAsrCueQC:
         self.very_low_active_ratio = float(decision.get("very_low_active_ratio", 0.05))
 
     def signature(self) -> dict[str, Any]:
-        return {
-            "schema": PRE_ASR_CUEQC_SCHEMA,
-            "arch": PRE_ASR_CUEQC_MODEL_ARCH,
-            "feature_schema": PRE_ASR_CUEQC_FEATURE_SCHEMA,
-            "runtime_adapter": PRE_ASR_CUEQC_RUNTIME_ADAPTER,
+        signature = {
+            "schema": self.contract["schema"],
+            "arch": self.contract["arch"],
+            "feature_schema": self.contract["feature_schema"],
+            "runtime_adapter": self.contract["runtime_adapter"],
             "path": str(self.path),
             "sha256": self.sha256,
-            "drop_threshold": self.drop_threshold,
+            "decision_mode": self.decision_mode,
             "inference_window_size": self.inference_window_size,
             "feature_names": list(self.scalar_feature_names),
             "metadata": self.metadata,
         }
+        if self.config["num_classes"] == 2:
+            signature["drop_threshold"] = self.drop_threshold
+        return signature
 
     @staticmethod
     def _feature(candidate: Mapping[str, Any], name: str) -> float:
@@ -1425,7 +1520,11 @@ class PreAsrCueQC:
             bin_mask_t = torch.from_numpy(bin_mask).to(self.device)
             if self.inference_window_size > 0 and ptm_t.shape[1] > self.inference_window_size:
                 batch, max_chunks = tuple(chunk_mask_t.shape)
-                logits = torch.zeros((batch, max_chunks, 2), dtype=torch.float32, device=self.device)
+                logits = torch.zeros(
+                    (batch, max_chunks, int(self.config["num_classes"])),
+                    dtype=torch.float32,
+                    device=self.device,
+                )
                 counts = torch.zeros((batch, max_chunks, 1), dtype=torch.float32, device=self.device)
                 window = min(int(self.inference_window_size), int(max_chunks))
                 for group_index in range(int(batch)):
@@ -1458,6 +1557,36 @@ class PreAsrCueQC:
             prob = probs[group_index, chunk_index]
             p_drop = float(prob[0])
             p_keep = float(prob[1])
+            if self.config["num_classes"] == 3:
+                p_unsure = float(prob[2])
+                label_index = int(np.argmax(prob))
+                label = PRE_ASR_CUEQC_LABELS[label_index]
+                decisions.append(
+                    {
+                        "schema": "pre_asr_cueqc_decision_v3",
+                        "decision_version": self.contract["decision_version"],
+                        "model_schema": self.contract["schema"],
+                        "model_arch": self.contract["arch"],
+                        "feature_schema": self.contract["feature_schema"],
+                        "runtime_adapter": self.contract["runtime_adapter"],
+                        "index": int(candidate.get("index", index)),
+                        "route": (
+                            "drop_before_asr"
+                            if label == "drop"
+                            else "keep_for_asr"
+                            if label == "keep"
+                            else "unsure_for_asr"
+                        ),
+                        "label": label,
+                        "confidence": round(float(prob[label_index]), 4),
+                        "prob_drop": round(p_drop, 4),
+                        "prob_keep": round(p_keep, 4),
+                        "prob_unsure": round(p_unsure, 4),
+                        "decision_mode": "argmax",
+                        "reason": f"model_argmax_{label}",
+                    }
+                )
+                continue
             hard_keep = self._hard_keep_veto(candidate)
             hard_drop = "" if hard_keep else self._hard_drop_rule(candidate)
             keep_veto = "" if hard_keep or hard_drop else self._keep_veto(candidate)
@@ -1476,11 +1605,11 @@ class PreAsrCueQC:
             decisions.append(
                 {
                     "schema": "pre_asr_cueqc_decision_v2",
-                    "decision_version": PRE_ASR_CUEQC_DECISION_VERSION,
-                    "model_schema": PRE_ASR_CUEQC_SCHEMA,
-                    "model_arch": PRE_ASR_CUEQC_MODEL_ARCH,
-                    "feature_schema": PRE_ASR_CUEQC_FEATURE_SCHEMA,
-                    "runtime_adapter": PRE_ASR_CUEQC_RUNTIME_ADAPTER,
+                    "decision_version": self.contract["decision_version"],
+                    "model_schema": self.contract["schema"],
+                    "model_arch": self.contract["arch"],
+                    "feature_schema": self.contract["feature_schema"],
+                    "runtime_adapter": self.contract["runtime_adapter"],
                     "index": int(candidate.get("index", index)),
                     "route": "drop_before_asr" if drop else "keep_for_asr",
                     "confidence": round(p_drop if drop else p_keep, 4),
@@ -1518,24 +1647,29 @@ def load_checkpoint(
 
 
 def runtime_signature() -> dict[str, Any]:
+    contract = _runtime_contract()
     if not enabled():
         return {
-            "schema": PRE_ASR_CUEQC_SCHEMA,
-            "arch": PRE_ASR_CUEQC_MODEL_ARCH,
+            "schema": contract["schema"],
+            "arch": contract["arch"],
             "enabled": False,
-            "feature_schema": PRE_ASR_CUEQC_FEATURE_SCHEMA,
-            "runtime_adapter": PRE_ASR_CUEQC_RUNTIME_ADAPTER,
+            "feature_schema": contract["feature_schema"],
+            "runtime_adapter": contract["runtime_adapter"],
         }
     checkpoint = _checkpoint_path()
-    return {
-        "schema": PRE_ASR_CUEQC_SCHEMA,
-        "arch": PRE_ASR_CUEQC_MODEL_ARCH,
+    signature = {
+        "schema": contract["schema"],
+        "arch": contract["arch"],
         "enabled": True,
-        "feature_schema": PRE_ASR_CUEQC_FEATURE_SCHEMA,
-        "runtime_adapter": PRE_ASR_CUEQC_RUNTIME_ADAPTER,
+        "feature_schema": contract["feature_schema"],
+        "runtime_adapter": contract["runtime_adapter"],
         "model_path": checkpoint,
-        "drop_threshold": os.getenv("PRE_ASR_CUEQC_DROP_THRESHOLD", ""),
     }
+    if contract["num_classes"] == 2:
+        signature["drop_threshold"] = os.getenv("PRE_ASR_CUEQC_DROP_THRESHOLD", "")
+    else:
+        signature["decision_mode"] = "argmax"
+    return signature
 
 
 def _drop_threshold_from_env(default: float) -> float:
@@ -1561,15 +1695,29 @@ def load_active(*, expected_asr_repo_id: str | None = None) -> PreAsrCueQC:
     path = _checkpoint_path(expected_asr_repo_id)
     device = os.getenv("PRE_ASR_CUEQC_DEVICE", "auto").strip() or "auto"
     model = load_checkpoint(path, expected_asr_repo_id=expected_asr_repo_id, device=device)
-    model.drop_threshold = _drop_threshold_from_env(model.drop_threshold)
+    if model.config["num_classes"] == 2:
+        model.drop_threshold = _drop_threshold_from_env(model.drop_threshold)
     split_sha = str(model.metadata.get("semantic_split_weights_sha256") or "")
     if not split_sha:
-        raise ValueError("Pre-ASR CueQC v12 metadata.semantic_split_weights_sha256 is required")
+        raise ValueError("Pre-ASR CueQC metadata.semantic_split_weights_sha256 is required")
     split_path = Path(_semantic_split_checkpoint_path(expected_asr_repo_id))
     active_sha = _file_sha256(split_path)
     if active_sha != split_sha:
         raise ValueError(
-            "Pre-ASR CueQC v12 split checkpoint sha mismatch: "
+            "Pre-ASR CueQC split checkpoint sha mismatch: "
             f"checkpoint expects {split_sha}, active split {split_path} is {active_sha}"
         )
+    if model.config["num_classes"] == 3:
+        inner_sha = str(model.metadata.get("inner_edge_refiner_weights_sha256") or "")
+        if not inner_sha:
+            raise ValueError(
+                "Pre-ASR CueQC v13 metadata.inner_edge_refiner_weights_sha256 is required"
+            )
+        inner_path = Path(_inner_edge_refiner_checkpoint_path(expected_asr_repo_id))
+        active_inner_sha = _file_sha256(inner_path)
+        if active_inner_sha != inner_sha:
+            raise ValueError(
+                "Pre-ASR CueQC v13 inner checkpoint sha mismatch: "
+                f"checkpoint expects {inner_sha}, active inner {inner_path} is {active_inner_sha}"
+            )
     return model

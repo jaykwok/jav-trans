@@ -466,6 +466,7 @@ def _packed_chunk_to_dict(chunk: PackedChunk) -> dict:
         "pre_asr_ptm_pooling_bins": chunk.pre_asr_ptm_pooling_bins,
         "pre_asr_ptm_pooling_dim": chunk.pre_asr_ptm_pooling_dim,
         "pre_asr_ptm_pooled_features": _jsonable(chunk.pre_asr_ptm_pooled_features or []),
+        "pre_asr_ptm_projection_digest": chunk.pre_asr_ptm_projection_digest,
         "speech_segments": _segments_to_payload(chunk.speech_segments),
     }
 
@@ -714,6 +715,9 @@ def _packed_chunk_from_dict(item: Any) -> PackedChunk:
         ),
         pre_asr_ptm_pooled_features=_float_list_from_payload(
             item.get("pre_asr_ptm_pooled_features")
+        ),
+        pre_asr_ptm_projection_digest=str(
+            item.get("pre_asr_ptm_projection_digest") or ""
         ),
     )
 

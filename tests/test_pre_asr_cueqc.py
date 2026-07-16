@@ -12,12 +12,12 @@ from asr import pre_asr_cueqc
 from audio.chunk_packer import PackedChunk
 from boundary.base import SpeechSegment
 from boundary.sequence_features import (
-    CHUNK_POOLED_PTM_SCHEMA,
+    CHUNK_LEARNED_PROJECTED_PTM_SCHEMA,
     FrameSequenceFeatureConfig,
     FrameSequenceFeatureProvider,
 )
-from tools.asr.cueqc.compile_pre_asr_v12_features import compile_features
-from tools.asr.cueqc.train_pre_asr_v12_binary import (
+from tools.asr.cueqc.pre_asr_feature_compiler import compile_features
+from tools.asr.cueqc.pre_asr_binary_trainer import (
     _boost_anchor_positions,
     _matching_candidate_positions,
     _split_label_masks,
@@ -35,10 +35,11 @@ def _ptm_pool() -> list[float]:
 def _ptm_pooling_fields() -> dict:
     values = _ptm_pool()
     return {
-        "pre_asr_ptm_pooling_schema": CHUNK_POOLED_PTM_SCHEMA,
+        "pre_asr_ptm_pooling_schema": CHUNK_LEARNED_PROJECTED_PTM_SCHEMA,
         "pre_asr_ptm_pooling_bins": pre_asr_cueqc.PRE_ASR_CUEQC_PTM_BINS,
         "pre_asr_ptm_pooling_dim": len(values),
         "pre_asr_ptm_pooled_features": values,
+        "pre_asr_ptm_projection_digest": "learned-projection-sha",
     }
 
 
@@ -50,6 +51,7 @@ def _pre_asr_candidate(index: int, *, video_id: str = "AAA", cluster_id: str = "
                 "end": float(index) + 0.5,
                 "scorer_speech_mean": 0.8,
                 "scorer_split_p90": 0.2,
+                "boundary_pipeline_version": 10,
                 **_ptm_pooling_fields(),
             }
         ],
@@ -104,6 +106,7 @@ def test_pre_asr_cueqc_candidate_uses_numeric_chunk_features_only():
             "asr_confidence": 0.1,
             "scorer_speech_mean": 0.8,
             "scorer_split_p90": 0.2,
+            "boundary_pipeline_version": 10,
         }
     ]
 
@@ -126,6 +129,7 @@ def test_pre_asr_cueqc_candidate_includes_micro_numeric_features():
             speech_segments=[SpeechSegment(0.0, 0.5)],
             duration=0.5,
             split_reason="unit",
+            boundary_pipeline_version=10,
             subtitle_min_duration_s=20.0 / 24.0,
             below_subtitle_min_duration=True,
             micro_chunk_candidate=True,
@@ -153,7 +157,7 @@ def test_pre_asr_cueqc_candidate_includes_micro_numeric_features():
     assert candidate["features"]["left_split_score"] == 0.8
 
 
-def test_pre_asr_cueqc_v9_appends_split_edge_soft_features():
+def test_pre_asr_cueqc_v10_preserves_split_edge_soft_features():
     spans = [
         PackedChunk(
             start=0.0,
@@ -161,6 +165,7 @@ def test_pre_asr_cueqc_v9_appends_split_edge_soft_features():
             speech_segments=[SpeechSegment(0.0, 0.6)],
             duration=0.6,
             split_reason="semantic_split_model",
+            boundary_pipeline_version=10,
             primary_cut_candidates=[
                 {
                     "kind": "primary",
@@ -193,11 +198,11 @@ def test_pre_asr_cueqc_v9_appends_split_edge_soft_features():
 
     candidate = pre_asr_cueqc.candidate_from_span(spans, 0)
 
-    assert pre_asr_cueqc.PRE_ASR_CUEQC_FEATURE_SCHEMA == "pre_asr_cueqc_features_v9"
+    assert pre_asr_cueqc.PRE_ASR_CUEQC_FEATURE_SCHEMA == "pre_asr_cueqc_features_v10"
     assert pre_asr_cueqc.PRE_ASR_CUEQC_SCALAR_FEATURE_NAMES[
         : len(pre_asr_cueqc.PRE_ASR_CUEQC_V8_SCALAR_FEATURE_NAMES)
     ] == pre_asr_cueqc.PRE_ASR_CUEQC_V8_SCALAR_FEATURE_NAMES
-    assert candidate["schema"] == "pre_asr_cueqc_features_v9"
+    assert candidate["schema"] == "pre_asr_cueqc_features_v10"
     assert candidate["pre_asr_split_edge_pair_id"] == "noise-bracket-0.000000-0.600000"
     assert candidate["pre_asr_split_edges"]["left"]["kind"] == "split_cut"
     assert candidate["pre_asr_split_edges"]["right"]["role"] == "speech_to_noise"
@@ -224,7 +229,7 @@ def test_pre_asr_cueqc_candidate_uses_chunk_pooled_ptm_embedding():
     vector = pre_asr_cueqc.feature_vector(candidate)
 
     assert candidate["ptm_pooling_available"] is True
-    assert candidate["ptm_pooling_schema"] == CHUNK_POOLED_PTM_SCHEMA
+    assert candidate["ptm_pooling_schema"] == CHUNK_LEARNED_PROJECTED_PTM_SCHEMA
     assert vector.shape[0] == len(pre_asr_cueqc.PRE_ASR_CUEQC_FEATURE_NAMES)
     assert vector[-1] == pytest.approx(_ptm_pool()[-1])
 
@@ -257,11 +262,11 @@ def test_pre_asr_cueqc_requires_pooled_ptm_when_requested():
         )
     ]
 
-    with pytest.raises(ValueError, match="requires chunk-level pooled PTM"):
+    with pytest.raises(ValueError, match="requires chunk-level learned-projection PTM"):
         pre_asr_cueqc.candidate_from_span(spans, 0, require_ptm_pooling=True)
 
 
-def test_pre_asr_cueqc_v12_model_forward_backward_ignores_padding():
+def test_pre_asr_cueqc_v13_model_forward_backward_ignores_padding():
     torch = pytest.importorskip("torch")
     transformers = pytest.importorskip("transformers")
     if not hasattr(transformers, "Mamba2Model"):
@@ -284,13 +289,13 @@ def test_pre_asr_cueqc_v12_model_forward_backward_ignores_padding():
 
     logits = model(ptm_bins, scalar, chunk_mask=chunk_mask, bin_mask=bin_mask)
     loss = torch.nn.functional.cross_entropy(
-        logits.reshape(-1, 2),
+        logits.reshape(-1, 3),
         labels.reshape(-1),
         ignore_index=pre_asr_cueqc.PRE_ASR_CUEQC_IGNORE_LABEL,
     )
     loss.backward()
 
-    assert logits.shape == (1, 3, 2)
+    assert logits.shape == (1, 3, 3)
     assert torch.isfinite(loss)
 
 
@@ -315,11 +320,17 @@ def test_pre_asr_cueqc_local_only_mode_and_legacy_default():
 
     logits = model(ptm_bins, scalar, chunk_mask=mask)
 
-    assert logits.shape == (1, 2, 2)
+    assert logits.shape == (1, 2, 3)
     assert torch.count_nonzero(logits[:, 1]).item() == 0
 
 
-def _tiny_v12_checkpoint(tmp_path: Path, *, hard_rules: bool = False, split_sha: str = "") -> Path:
+def _tiny_v13_checkpoint(
+    tmp_path: Path,
+    *,
+    hard_rules: bool = False,
+    split_sha: str = "",
+    inner_sha: str = "",
+) -> Path:
     torch = pytest.importorskip("torch")
     transformers = pytest.importorskip("transformers")
     if not hasattr(transformers, "Mamba2Model"):
@@ -333,6 +344,7 @@ def _tiny_v12_checkpoint(tmp_path: Path, *, hard_rules: bool = False, split_sha:
         temporal_layers=1,
         temporal_residual_scale=0.0,
         dropout=0.0,
+        num_classes=3,
     )
     payload = {
         "schema": pre_asr_cueqc.PRE_ASR_CUEQC_SCHEMA,
@@ -347,12 +359,12 @@ def _tiny_v12_checkpoint(tmp_path: Path, *, hard_rules: bool = False, split_sha:
             "temporal_layers": 1,
             "temporal_residual_scale": 0.0,
             "dropout": 0.0,
-            "num_classes": 2,
+            "num_classes": 3,
         },
         "feature_mean": [0.0] * len(feature_names),
         "feature_std": [1.0] * len(feature_names),
         "decision_config": {
-            "drop_threshold": 0.95,
+            "decision_mode": "argmax",
             "hard_keep_veto": hard_rules,
             "hard_drop_rule": False,
             "keep_veto": False,
@@ -362,16 +374,17 @@ def _tiny_v12_checkpoint(tmp_path: Path, *, hard_rules: bool = False, split_sha:
             "artifact": dict(pre_asr_cueqc.PRE_ASR_CUEQC_ARTIFACT),
             "asr_repo_id": "jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame-hf",
             "semantic_split_weights_sha256": split_sha,
+            "inner_edge_refiner_weights_sha256": inner_sha,
         },
         "model_state_dict": model.state_dict(),
     }
-    path = tmp_path / "pre_asr_cueqc_v12.pt"
+    path = tmp_path / "pre_asr_cueqc_v13.pt"
     torch.save(payload, path)
     return path
 
 
-def test_pre_asr_cueqc_v12_rejects_enabled_hard_rules(tmp_path: Path):
-    checkpoint = _tiny_v12_checkpoint(tmp_path, hard_rules=True)
+def test_pre_asr_cueqc_v13_rejects_enabled_hard_rules(tmp_path: Path):
+    checkpoint = _tiny_v13_checkpoint(tmp_path, hard_rules=True)
 
     with pytest.raises(ValueError, match="must disable hard rules"):
         pre_asr_cueqc.load_checkpoint(checkpoint, device="cpu")
@@ -380,17 +393,50 @@ def test_pre_asr_cueqc_v12_rejects_enabled_hard_rules(tmp_path: Path):
 def test_pre_asr_cueqc_load_active_validates_split_sha(monkeypatch, tmp_path: Path):
     split = tmp_path / "split.pt"
     split.write_bytes(b"active split")
-    checkpoint = _tiny_v12_checkpoint(tmp_path, split_sha="0" * 64)
+    inner = tmp_path / "inner.pt"
+    inner.write_bytes(b"active inner")
+    checkpoint = _tiny_v13_checkpoint(
+        tmp_path,
+        split_sha="0" * 64,
+        inner_sha=pre_asr_cueqc._file_sha256(inner),
+    )
     monkeypatch.setattr(pre_asr_cueqc, "_checkpoint_path", lambda _repo_id=None: str(checkpoint))
     monkeypatch.setattr(
         pre_asr_cueqc,
         "_semantic_split_checkpoint_path",
         lambda _repo_id=None: str(split),
     )
+    monkeypatch.setattr(
+        pre_asr_cueqc,
+        "_inner_edge_refiner_checkpoint_path",
+        lambda _repo_id=None: str(inner),
+    )
 
     with pytest.raises(ValueError, match="split checkpoint sha mismatch"):
         pre_asr_cueqc.load_active(
             expected_asr_repo_id="jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame-hf"
+        )
+
+
+def test_pre_asr_cueqc_17b_rejects_v12_checkpoint(tmp_path: Path):
+    torch = pytest.importorskip("torch")
+    checkpoint = _tiny_v13_checkpoint(tmp_path)
+    payload = torch.load(checkpoint, map_location="cpu", weights_only=False)
+    payload["schema"] = pre_asr_cueqc.PRE_ASR_CUEQC_LEGACY_SCHEMA
+    payload["arch"] = pre_asr_cueqc.PRE_ASR_CUEQC_LEGACY_MODEL_ARCH
+    payload["feature_schema"] = pre_asr_cueqc.PRE_ASR_CUEQC_LEGACY_FEATURE_SCHEMA
+    payload["runtime_adapter"] = pre_asr_cueqc.PRE_ASR_CUEQC_LEGACY_RUNTIME_ADAPTER
+    payload["metadata"]["artifact"] = dict(
+        pre_asr_cueqc.PRE_ASR_CUEQC_LEGACY_ARTIFACT
+    )
+    legacy = tmp_path / "pre_asr_cueqc_v12.pt"
+    torch.save(payload, legacy)
+
+    with pytest.raises(ValueError, match="unsupported Pre-ASR CueQC schema"):
+        pre_asr_cueqc.load_checkpoint(
+            legacy,
+            device="cpu",
+            expected_asr_repo_id="jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame-hf",
         )
 
 
@@ -534,11 +580,11 @@ def test_compile_pre_asr_cueqc_features_ignores_text_columns(tmp_path: Path):
     assert "text" not in " ".join(summary["feature_names"]).lower()
 
 
-def test_pre_asr_v12_wrappers_run_as_script_paths():
+def test_pre_asr_v13_wrappers_run_as_script_paths():
     root = Path(__file__).resolve().parents[1]
     for script in (
-        root / "tools" / "asr" / "cueqc" / "compile_pre_asr_v12_features.py",
-        root / "tools" / "asr" / "cueqc" / "train_pre_asr_v12_binary.py",
+        root / "tools" / "asr" / "cueqc" / "compile_pre_asr_v13_features.py",
+        root / "tools" / "asr" / "cueqc" / "train_pre_asr_v13.py",
     ):
         result = subprocess.run(
             [sys.executable, str(script), "--help"],
@@ -554,7 +600,7 @@ def test_pre_asr_v12_wrappers_run_as_script_paths():
 def test_compile_pre_asr_cueqc_features_reads_jsonl_chunk_candidates(tmp_path: Path):
     torch = pytest.importorskip("torch")
     del torch
-    from tools.asr.cueqc.train_pre_asr_v12_binary import load_feature_bundle
+    from tools.asr.cueqc.pre_asr_binary_trainer import load_feature_bundle
 
     chunks = tmp_path / "chunks.jsonl"
     labels = tmp_path / "labels.jsonl"
@@ -1032,5 +1078,5 @@ def test_pre_asr_token_attention_auxiliary_is_padding_invariant():
             padded_bin_mask,
         )[:, :3]
 
-    assert auxiliary["semantic_logits"].shape == (2, 3, 2)
+    assert auxiliary["semantic_logits"].shape == (2, 3, 3)
     assert torch.allclose(trimmed, padded, atol=1e-5, rtol=1e-5)

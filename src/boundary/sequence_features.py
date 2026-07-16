@@ -12,6 +12,7 @@ FRAME_SEQUENCE_FEATURE_SCHEMA = "edge_sequence_features_v2"
 FRAME_SEQUENCE_FRAMES_SCHEMA = "speech_boundary_ja_sequence_feature_frames_v1"
 CHUNK_POOLED_PTM_SCHEMA = "pre_asr_chunk_pooled_ptm_v1"
 CHUNK_PROJECTED_PTM_SCHEMA = "pre_asr_chunk_projected_ptm_v2"
+CHUNK_LEARNED_PROJECTED_PTM_SCHEMA = "pre_asr_chunk_learned_projected_ptm_v3"
 DEFAULT_CHUNK_POOLED_PTM_BINS = 4
 SPLIT_CANDIDATE_SCALAR_NAMES = (
     "candidate_score",
@@ -594,6 +595,113 @@ class FrameSequenceFeatureProvider:
             raise ValueError("projected PTM pooling requires projected frames and digest")
         return _chunk_pooled_ptm_features_from_array(
             self._ptm_projected_array[: self._frame_count],
+            frame_hop_s=self.frame_hop_s,
+            start_s=start_s,
+            end_s=end_s,
+            bins=bins,
+        )
+
+    def chunk_pooled_learned_ptm_signature(
+        self,
+        *,
+        bins: int = DEFAULT_CHUNK_POOLED_PTM_BINS,
+    ) -> dict:
+        if (
+            self._semantic_ptm_projected_array is None
+            or not self.semantic_scorer_sha256
+        ):
+            raise ValueError(
+                "learned PTM pooling requires scorer-projected frames and checkpoint sha"
+            )
+        dim = int(self._semantic_ptm_projected_array.shape[1])
+        names = chunk_pooled_ptm_feature_names(ptm_dim=dim, bins=bins)
+        return {
+            "schema": CHUNK_LEARNED_PROJECTED_PTM_SCHEMA,
+            "bins": int(bins),
+            "ptm_used_dim": dim,
+            "feature_dim": len(names),
+            "feature_names_hash": hashlib.sha1(
+                json.dumps(names, separators=(",", ":")).encode("utf-8")
+            ).hexdigest(),
+            "frame_hop_s": float(self.frame_hop_s),
+            "ptm_projection_digest": str(self.semantic_scorer_sha256),
+            "projection_source": "learned_speech_island_scorer",
+        }
+
+    def chunk_pooled_learned_ptm_features(
+        self,
+        *,
+        start_s: float,
+        end_s: float,
+        bins: int = DEFAULT_CHUNK_POOLED_PTM_BINS,
+    ) -> list[float]:
+        if (
+            self._semantic_ptm_projected_array is None
+            or not self.semantic_scorer_sha256
+        ):
+            raise ValueError(
+                "learned PTM pooling requires scorer-projected frames and checkpoint sha"
+            )
+        return _chunk_pooled_ptm_features_from_array(
+            self._semantic_ptm_projected_array[: self._frame_count],
+            frame_hop_s=self.frame_hop_s,
+            start_s=start_s,
+            end_s=end_s,
+            bins=bins,
+        )
+
+    def chunk_pooled_checkpoint_linear_ptm_signature(
+        self,
+        *,
+        projection_weight: np.ndarray,
+        projection_digest: str,
+        bins: int = DEFAULT_CHUNK_POOLED_PTM_BINS,
+    ) -> dict:
+        weight = np.asarray(projection_weight, dtype=np.float32)
+        if weight.ndim != 2 or int(weight.shape[1]) != int(self._ptm_array.shape[1]):
+            raise ValueError(
+                "checkpoint PTM projection width does not match full PTM frames"
+            )
+        if not projection_digest:
+            raise ValueError("checkpoint PTM projection digest is required")
+        dim = int(weight.shape[0])
+        names = chunk_pooled_ptm_feature_names(ptm_dim=dim, bins=bins)
+        return {
+            "schema": CHUNK_LEARNED_PROJECTED_PTM_SCHEMA,
+            "bins": int(bins),
+            "ptm_used_dim": dim,
+            "feature_dim": len(names),
+            "feature_names_hash": hashlib.sha1(
+                json.dumps(names, separators=(",", ":")).encode("utf-8")
+            ).hexdigest(),
+            "frame_hop_s": float(self.frame_hop_s),
+            "ptm_projection_digest": str(projection_digest),
+            "projection_source": "semantic_split_v3_checkpoint_linear",
+        }
+
+    def chunk_pooled_checkpoint_linear_ptm_features(
+        self,
+        *,
+        projection_weight: np.ndarray,
+        start_s: float,
+        end_s: float,
+        bins: int = DEFAULT_CHUNK_POOLED_PTM_BINS,
+    ) -> list[float]:
+        weight = np.asarray(projection_weight, dtype=np.float32)
+        if weight.ndim != 2 or int(weight.shape[1]) != int(self._ptm_array.shape[1]):
+            raise ValueError(
+                "checkpoint PTM projection width does not match full PTM frames"
+            )
+        key = id(projection_weight)
+        projected = self._projected_ptm_cache.get(key)
+        if projected is None:
+            projected = np.ascontiguousarray(
+                self._ptm_array[: self._frame_count] @ weight.T,
+                dtype=np.float32,
+            )
+            self._projected_ptm_cache[key] = projected
+        return _chunk_pooled_ptm_features_from_array(
+            projected,
             frame_hop_s=self.frame_hop_s,
             start_s=start_s,
             end_s=end_s,

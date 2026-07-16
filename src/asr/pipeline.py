@@ -13,6 +13,7 @@ import numpy as np
 from audio.chunk_packer import PackedChunk
 from boundary import cache as _boundary_cache_module
 from boundary.sequence_features import (
+    CHUNK_LEARNED_PROJECTED_PTM_SCHEMA,
     CHUNK_POOLED_PTM_SCHEMA,
     FRAME_SEQUENCE_FRAMES_SCHEMA,
     PTM_PROJECTION_SCHEMA,
@@ -224,6 +225,7 @@ def _sequence_feature_provider_from_result(
     payload,
     *,
     duration_s: float,
+    max_ptm_dims: int | None = None,
 ) -> FrameSequenceFeatureProvider | None:
     if not isinstance(payload, dict):
         return None
@@ -258,7 +260,11 @@ def _sequence_feature_provider_from_result(
         config=FrameSequenceFeatureConfig(
             left_context_s=_env_float("BOUNDARY_FRAME_SEQUENCE_LEFT_CONTEXT_S", "0.60"),
             right_context_s=_env_float("BOUNDARY_FRAME_SEQUENCE_RIGHT_CONTEXT_S", "0.60"),
-            max_ptm_dims=_env_int("BOUNDARY_FRAME_SEQUENCE_MAX_PTM_DIMS", "128"),
+            max_ptm_dims=(
+                int(max_ptm_dims)
+                if max_ptm_dims is not None
+                else _env_int("BOUNDARY_FRAME_SEQUENCE_MAX_PTM_DIMS", "128")
+            ),
             include_mfcc=_env_bool("BOUNDARY_FRAME_SEQUENCE_INCLUDE_MFCC", "1"),
         ),
     )
@@ -268,10 +274,12 @@ def _required_sequence_feature_provider_from_result(
     payload,
     *,
     duration_s: float,
+    max_ptm_dims: int | None = None,
 ) -> FrameSequenceFeatureProvider:
     provider = _sequence_feature_provider_from_result(
         payload,
         duration_s=duration_s,
+        max_ptm_dims=max_ptm_dims,
     )
     if provider is None:
         raise ValueError(
@@ -466,12 +474,37 @@ def _build_processing_spans(
         or ""
     )
     split_checkpoint_path = Path(cfg["semantic_split_model_path"])
-    split_schema = str(
-        torch.load(split_checkpoint_path, map_location="cpu", weights_only=False).get(
-            "schema"
-        )
-        or ""
+    split_checkpoint_payload = torch.load(
+        split_checkpoint_path, map_location="cpu", weights_only=False
     )
+    split_schema = str(split_checkpoint_payload.get("schema") or "")
+    cueqc_ptm_projection_weight: np.ndarray | None = None
+    cueqc_ptm_projection_digest = ""
+    if split_schema == SEMANTIC_SPLIT_V3_SCHEMA:
+        projection_weight = (
+            split_checkpoint_payload.get("model_state_dict") or {}
+        ).get("ptm_projector.weight")
+        if projection_weight is None:
+            raise ValueError(
+                "Semantic Split v3 checkpoint is missing learned ptm_projector.weight"
+            )
+        cueqc_ptm_projection_weight = np.ascontiguousarray(
+            projection_weight.detach().cpu().float().numpy(), dtype=np.float32
+        )
+        if cueqc_ptm_projection_weight.shape != (128, 2048):
+            raise ValueError(
+                "CueQC v13 requires learned Linear(2048->128) Split projection"
+            )
+        cueqc_ptm_projection_digest = hashlib.sha256(
+            cueqc_ptm_projection_weight.tobytes()
+        ).hexdigest()
+        cfg = {
+            **cfg,
+            "pre_asr_cueqc_feature_schema": _pre_asr_cueqc_module.PRE_ASR_CUEQC_FEATURE_SCHEMA,
+            "pre_asr_ptm_projection": "semantic_split_v3_checkpoint_linear_2048_to_128",
+            "pre_asr_ptm_projection_digest": cueqc_ptm_projection_digest,
+        }
+    del split_checkpoint_payload
 
     restore_sequence_export = os.environ.get("SPEECH_BOUNDARY_JA_EXPORT_SEQUENCE_FEATURES")
     os.environ["SPEECH_BOUNDARY_JA_EXPORT_SEQUENCE_FEATURES"] = "1"
@@ -597,6 +630,12 @@ def _build_processing_spans(
     sequence_feature_provider = _required_sequence_feature_provider_from_result(
         sequence_feature_frames,
         duration_s=result.audio_duration_sec,
+        max_ptm_dims=(
+            2048
+            if outer_schema == "outer_edge_refiner_v2"
+            or split_schema == SEMANTIC_SPLIT_V3_SCHEMA
+            else None
+        ),
     )
     speech_feature_export_path = os.getenv(
         "SPEECH_ISLAND_FEATURE_EXPORT_PATH", ""
@@ -751,6 +790,8 @@ def _build_processing_spans(
     packed = _annotate_pre_asr_ptm_pooling_on_packed_chunks(
         packed,
         sequence_feature_provider=sequence_feature_provider,
+        learned_projection_weight=cueqc_ptm_projection_weight,
+        learned_projection_digest=cueqc_ptm_projection_digest,
     )
     event = _boundary_cache_module.save_processing_spans(
         audio_path,
@@ -1039,26 +1080,58 @@ def _annotate_pre_asr_ptm_pooling_on_packed_chunks(
     spans: list[tuple[float, float]] | list[PackedChunk],
     *,
     sequence_feature_provider: FrameSequenceFeatureProvider,
+    learned_projection_weight: np.ndarray | None = None,
+    learned_projection_digest: str = "",
 ) -> list[tuple[float, float]] | list[PackedChunk]:
     if not spans or not all(isinstance(span, PackedChunk) for span in spans):
         return spans
-    feature_names = sequence_feature_provider.chunk_pooled_ptm_feature_names(
-        bins=_pre_asr_cueqc_module.PRE_ASR_CUEQC_PTM_BINS
+    use_learned_projection = all(
+        int(getattr(span, "boundary_pipeline_version", 0) or 0) == 10
+        for span in spans
     )
+    if use_learned_projection:
+        if learned_projection_weight is None:
+            raise ValueError("CueQC v13 learned PTM projection weight is required")
+        signature = (
+            sequence_feature_provider.chunk_pooled_checkpoint_linear_ptm_signature(
+                projection_weight=learned_projection_weight,
+                projection_digest=learned_projection_digest,
+                bins=_pre_asr_cueqc_module.PRE_ASR_CUEQC_PTM_BINS,
+            )
+        )
+    else:
+        signature = sequence_feature_provider.chunk_pooled_ptm_signature(
+            bins=_pre_asr_cueqc_module.PRE_ASR_CUEQC_PTM_BINS
+        )
     annotated: list[PackedChunk] = []
     for span in spans:
-        values = sequence_feature_provider.chunk_pooled_ptm_features(
-            start_s=span.start,
-            end_s=span.end,
-            bins=_pre_asr_cueqc_module.PRE_ASR_CUEQC_PTM_BINS,
-        )
+        if use_learned_projection:
+            values = sequence_feature_provider.chunk_pooled_checkpoint_linear_ptm_features(
+                projection_weight=learned_projection_weight,
+                start_s=span.start,
+                end_s=span.end,
+                bins=_pre_asr_cueqc_module.PRE_ASR_CUEQC_PTM_BINS,
+            )
+        else:
+            values = sequence_feature_provider.chunk_pooled_ptm_features(
+                start_s=span.start,
+                end_s=span.end,
+                bins=_pre_asr_cueqc_module.PRE_ASR_CUEQC_PTM_BINS,
+            )
         annotated.append(
             replace(
                 span,
-                pre_asr_ptm_pooling_schema=CHUNK_POOLED_PTM_SCHEMA,
+                pre_asr_ptm_pooling_schema=(
+                    CHUNK_LEARNED_PROJECTED_PTM_SCHEMA
+                    if use_learned_projection
+                    else CHUNK_POOLED_PTM_SCHEMA
+                ),
                 pre_asr_ptm_pooling_bins=_pre_asr_cueqc_module.PRE_ASR_CUEQC_PTM_BINS,
-                pre_asr_ptm_pooling_dim=len(feature_names),
+                pre_asr_ptm_pooling_dim=int(signature["feature_dim"]),
                 pre_asr_ptm_pooled_features=values,
+                pre_asr_ptm_projection_digest=str(
+                    signature.get("ptm_projection_digest") or ""
+                ),
             )
         )
     return annotated
@@ -1078,7 +1151,7 @@ def _apply_pre_asr_cueqc(
         print(message, flush=True)
 
     report = {
-        "schema": "pre_asr_cueqc_report_v2",
+        "schema": "pre_asr_cueqc_report_v3",
         "enabled": _pre_asr_cueqc_module.enabled(),
         "candidate_count": len(spans),
         "drop_count": 0,
@@ -1105,9 +1178,9 @@ def _apply_pre_asr_cueqc(
         for index in range(len(spans))
     ]
     _progress(
-        "Pre-ASR CueQC keep/drop route start candidates={candidates} drop_threshold={threshold}".format(
+        "Pre-ASR CueQC route start candidates={candidates} decision_mode={mode}".format(
             candidates=len(candidates),
-            threshold=getattr(model, "drop_threshold", ""),
+            mode=getattr(model, "decision_mode", ""),
         )
     )
     decisions = model.decide(candidates)
@@ -1132,7 +1205,12 @@ def _apply_pre_asr_cueqc(
         if decision.get("route") == "drop_before_asr"
     }
     kept = [span for index, span in enumerate(spans) if index not in drop_indexes]
-    keep_count = len(kept)
+    keep_count = sum(
+        1 for decision in decisions if decision.get("route") == "keep_for_asr"
+    )
+    unsure_count = sum(
+        1 for decision in decisions if decision.get("route") == "unsure_for_asr"
+    )
     drop_count = len(drop_indexes)
     confidences = sorted(
         float(decision.get("confidence"))
@@ -1156,6 +1234,7 @@ def _apply_pre_asr_cueqc(
             "candidate_count": len(spans),
             "drop_count": drop_count,
             "keep_count": keep_count,
+            "unsure_count": unsure_count,
             **confidence_stats,
             "model": model.signature(),
             "decisions": decisions,
@@ -1164,8 +1243,8 @@ def _apply_pre_asr_cueqc(
     elapsed = time.perf_counter() - started
     _progress(
         (
-            "Pre-ASR CueQC keep/drop route done candidates={candidates} decisions={decisions} "
-            "keep_for_asr={keep} drop_before_asr={drop} pass_to_asr={pass_to_asr} "
+            "Pre-ASR CueQC route done candidates={candidates} decisions={decisions} "
+            "keep_for_asr={keep} unsure_for_asr={unsure} drop_before_asr={drop} pass_to_asr={pass_to_asr} "
             "confidence_min={confidence_min} confidence_p10={confidence_p10} "
             "confidence_p50={confidence_p50} confidence_mean={confidence_mean} "
             "elapsed={elapsed:.2f}s"
@@ -1173,8 +1252,9 @@ def _apply_pre_asr_cueqc(
             candidates=len(spans),
             decisions=len(decisions),
             keep=keep_count,
+            unsure=unsure_count,
             drop=drop_count,
-            pass_to_asr=keep_count,
+            pass_to_asr=len(kept),
             confidence_min=confidence_stats.get("confidence_min", ""),
             confidence_p10=confidence_stats.get("confidence_p10", ""),
             confidence_p50=confidence_stats.get("confidence_p50", ""),
@@ -1377,6 +1457,7 @@ def _annotate_packed_chunks(
         chunk["pre_asr_ptm_pooling_bins"] = packed.pre_asr_ptm_pooling_bins
         chunk["pre_asr_ptm_pooling_dim"] = packed.pre_asr_ptm_pooling_dim
         chunk["pre_asr_ptm_pooled_features"] = list(packed.pre_asr_ptm_pooled_features or [])
+        chunk["pre_asr_ptm_projection_digest"] = packed.pre_asr_ptm_projection_digest
         log.append(
             "[chunk] idx={idx} dur={duration:.1f} speech_segment_count={count} "
             "reason={reason} "
