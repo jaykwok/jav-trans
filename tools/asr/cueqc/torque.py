@@ -12,7 +12,7 @@ Reference:
 
 License: CC BY-NC-SA 4.0 (academic and research use only; commercial use
 prohibited). Attribution to Jie Yang is retained here and in the project
-HISTORY.md. The upstream MATLAB/.p core is obfuscated; this module reproduces
+docs/HISTORY.md. The upstream MATLAB/.p core is obfuscated; this module reproduces
 the algorithmic behaviour documented in the paper and the readable helpers
 (mindisttwinsloc / ps2psdist / Qac / inipd) shipped alongside it.
 
