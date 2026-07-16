@@ -37,6 +37,7 @@ def test_promote_torch_checkpoint_completes_artifact_contract(tmp_path: Path):
         pipeline_role="final_chunk_keep_drop_routing",
         source_training_run="agents/temp/example",
         selected_validation={"keep_recall": 0.9},
+        metadata_updates={"teacher_checkpoint_sha256": "teacher-sha"},
         drop_threshold=0.95,
         promotion_reason="test",
         promoted_at="2026-07-04T00:00:00+00:00",
@@ -50,6 +51,7 @@ def test_promote_torch_checkpoint_completes_artifact_contract(tmp_path: Path):
     assert artifact["self_contained"] is True
     assert artifact["source_training_run"] == "agents/temp/example"
     assert payload["metadata"]["selected_validation"] == {"keep_recall": 0.9}
+    assert payload["metadata"]["teacher_checkpoint_sha256"] == "teacher-sha"
     assert payload["decision_config"] == {
         "inference_window_size": 128,
         "drop_threshold": 0.95,
