@@ -17,6 +17,7 @@ from fastapi import APIRouter, HTTPException, Query
 
 from asr.backends.qwen import (
     DEFAULT_CUT_EDGE_REFINER_CHECKPOINT_BY_REPO,
+    DEFAULT_INNER_EDGE_REFINER_CHECKPOINT_BY_REPO,
     DEFAULT_OUTER_EDGE_REFINER_CHECKPOINT_BY_REPO,
     DEFAULT_PRE_ASR_CUEQC_CHECKPOINT_BY_REPO,
     DEFAULT_SEMANTIC_SPLIT_CHECKPOINT_BY_REPO,
@@ -82,6 +83,12 @@ _CHECKPOINT_SPECS = (
         "Cut Edge Refiner",
         "CUT_EDGE_REFINER_MODEL_PATH_BY_REPO",
         DEFAULT_CUT_EDGE_REFINER_CHECKPOINT_BY_REPO,
+    ),
+    (
+        "inner_edge_refiner",
+        "Inner Edge Refiner",
+        "INNER_EDGE_REFINER_MODEL_PATH_BY_REPO",
+        DEFAULT_INNER_EDGE_REFINER_CHECKPOINT_BY_REPO,
     ),
     (
         "pre_asr_cueqc",

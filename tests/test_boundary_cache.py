@@ -31,6 +31,7 @@ def _write_wav(path: Path, seconds: float = 2.0, sample_rate: int = 8000) -> Non
 def test_boundary_cache_key_ignores_asr_generation_budget(monkeypatch, tmp_path) -> None:
     from boundary import cache as boundary_cache
 
+    assert boundary_cache.BOUNDARY_CACHE_VERSION == 20
     monkeypatch.setenv("BOUNDARY_CACHE_DIR", str(tmp_path / "boundary-cache"))
     audio = tmp_path / "sample.wav"
     _write_wav(audio)
@@ -151,3 +152,60 @@ def test_boundary_cache_round_trips_shared_absolute_cut_metadata(monkeypatch, tm
     assert chunks[0].boundary_source == "shared_absolute_cut"
     assert chunks[0].primary_cut_candidates[0]["time_s"] == pytest.approx(2.5)
     assert chunks[0].pre_asr_ptm_pooled_features == pytest.approx([0.1, 0.2])
+
+
+def test_boundary_cache_v20_round_trips_paired_inner_edge_metadata(
+    monkeypatch, tmp_path
+) -> None:
+    from boundary import cache as boundary_cache
+
+    monkeypatch.setenv("BOUNDARY_CACHE_DIR", str(tmp_path / "boundary-cache"))
+    audio = tmp_path / "sample.wav"
+    _write_wav(audio)
+    chunk = PackedChunk(
+        start=1.2,
+        end=2.7,
+        duration=1.5,
+        speech_segments=[SpeechSegment(1.2, 2.7, 0.9)],
+        split_reason="acoustic_split_v3",
+        acoustic_start=1.2,
+        acoustic_end=2.7,
+        acoustic_duration=1.5,
+        display_start=1.25,
+        display_end=2.65,
+        display_duration=1.4,
+        boundary_pipeline_version=10,
+        semantic_event_ids=["event-001"],
+        semantic_event_probabilities=[
+            {"p_cut": 0.96, "p_continue": 0.03, "p_unsure": 0.01}
+        ],
+        paired_inner_edges={
+            "event_ids": ["event-001"],
+            "left_speech_end": 2.7,
+            "right_speech_start": 3.0,
+            "action": "safe",
+        },
+        removed_gap_spans=[{"start": 2.7, "end": 3.0, "duration": 0.3}],
+        removed_gap_duration_s=0.3,
+    )
+    signature = {"backend": "speech_island_v8"}
+    boundary_cache.save_processing_spans(
+        str(audio),
+        boundary_signature=signature,
+        boundary_config=_boundary_config(),
+        processing_spans=[chunk],
+        runtime_boundary_signature={"boundary_pipeline": {"version": 10}},
+    )
+
+    loaded = boundary_cache.load_processing_spans(
+        str(audio),
+        boundary_signature=signature,
+        boundary_config=_boundary_config(),
+    )
+    assert loaded is not None
+    restored = loaded[0][0]
+    assert restored.boundary_pipeline_version == 10
+    assert restored.semantic_event_ids == ["event-001"]
+    assert restored.paired_inner_edges["action"] == "safe"
+    assert restored.removed_gap_duration_s == pytest.approx(0.3)
+    assert restored.display_start == pytest.approx(1.25)

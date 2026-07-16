@@ -40,12 +40,22 @@ DEFAULT_OUTER_EDGE_REFINER_CHECKPOINT_BY_REPO: dict[str, str] = {
     ),
 }
 DEFAULT_SEMANTIC_SPLIT_CHECKPOINT_BY_REPO: dict[str, str] = {
-    repo_id: repo_checkpoint_path(repo_id, "semantic_split_model", "v2")
-    for repo_id in QWEN_ASR_BACKEND_REPOS
+    QWEN_ASR_06B_REPO_ID: repo_checkpoint_path(
+        QWEN_ASR_06B_REPO_ID, "semantic_split_model", "v2"
+    ),
+    QWEN_ASR_17B_REPO_ID: repo_checkpoint_path(
+        QWEN_ASR_17B_REPO_ID, "semantic_split_model", "v3"
+    ),
 }
 DEFAULT_CUT_EDGE_REFINER_CHECKPOINT_BY_REPO: dict[str, str] = {
-    repo_id: repo_checkpoint_path(repo_id, "cut_edge_refiner", "v1")
-    for repo_id in QWEN_ASR_BACKEND_REPOS
+    QWEN_ASR_06B_REPO_ID: repo_checkpoint_path(
+        QWEN_ASR_06B_REPO_ID, "cut_edge_refiner", "v1"
+    ),
+}
+DEFAULT_INNER_EDGE_REFINER_CHECKPOINT_BY_REPO: dict[str, str] = {
+    QWEN_ASR_17B_REPO_ID: repo_checkpoint_path(
+        QWEN_ASR_17B_REPO_ID, "inner_edge_refiner", "v1"
+    ),
 }
 DEFAULT_PRE_ASR_CUEQC_CHECKPOINT_BY_REPO: dict[str, str] = {
     repo_id: repo_checkpoint_path(repo_id, "pre_asr_cueqc", "v12")
