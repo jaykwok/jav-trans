@@ -90,3 +90,4 @@ class PackedChunk:
     pre_asr_ptm_pooling_bins: int | None = None
     pre_asr_ptm_pooling_dim: int | None = None
     pre_asr_ptm_pooled_features: list[float] | None = None
+    pre_asr_ptm_projection_digest: str = ""

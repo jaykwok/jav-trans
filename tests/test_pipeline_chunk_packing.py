@@ -263,8 +263,8 @@ def _reload_pipeline(monkeypatch, tmp_path: Path, *, enable_cueqc: bool = False)
     split_checkpoint = tmp_path / "split.pt"
     cut_checkpoint = tmp_path / "cut.pt"
     torch.save({"schema": "outer_edge_refiner_v1"}, outer_checkpoint)
-    for path in (split_checkpoint, cut_checkpoint):
-        path.write_bytes(b"checkpoint")
+    torch.save({"schema": "semantic_split_verifier_v2"}, split_checkpoint)
+    torch.save({"schema": "cut_edge_refiner_v1"}, cut_checkpoint)
     monkeypatch.setenv("ASR_BACKEND", asr_backend)
     monkeypatch.setenv(
         "OUTER_EDGE_REFINER_MODEL_PATH_BY_REPO",

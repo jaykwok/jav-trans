@@ -19,12 +19,12 @@ def _write(path: Path, rows: list[dict]) -> None:
     )
 
 
-def test_partition_must_be_contiguous() -> None:
-    with pytest.raises(ValueError, match="contiguous"):
+def test_partition_must_not_overlap() -> None:
+    with pytest.raises(ValueError, match="overlap"):
         validate_partition(
             [
                 {"sample_id": "s", "start_s": 0.0, "end_s": 1.0},
-                {"sample_id": "s", "start_s": 1.2, "end_s": 2.0},
+                {"sample_id": "s", "start_s": 0.8, "end_s": 2.0},
             ]
         )
 
@@ -36,8 +36,8 @@ def test_builder_keeps_whole_subisland_contract(tmp_path: Path) -> None:
     _write(
         subislands,
         [
-            {"sample_id": "s", "subisland_id": "s__s00", "audio": str(audio), "start_s": 0.0, "end_s": 1.0, "duration_s": 1.0},
-            {"sample_id": "s", "subisland_id": "s__s01", "audio": str(audio), "start_s": 1.0, "end_s": 2.0, "duration_s": 1.0},
+            {"sample_id": "s", "subisland_id": "s__s00", "audio": str(audio), "start_s": 0.2, "end_s": 1.2, "duration_s": 1.0},
+            {"sample_id": "s", "subisland_id": "s__s01", "audio": str(audio), "start_s": 1.2, "end_s": 2.2, "duration_s": 1.0},
         ],
     )
 
@@ -45,6 +45,23 @@ def test_builder_keeps_whole_subisland_contract(tmp_path: Path) -> None:
 
     assert len(rows) == 2
     assert rows[0]["decision_contract"] == "whole_provisional_subisland_content_before_inner_v1"
+
+
+def test_builder_allows_gaps_between_distinct_scorer_islands(tmp_path: Path) -> None:
+    audio = tmp_path / "source.wav"
+    audio.write_bytes(b"audio")
+    subislands = tmp_path / "subislands.jsonl"
+    _write(
+        subislands,
+        [
+            {"sample_id": "s", "subisland_id": "s0", "audio": str(audio), "start_s": 0.2, "end_s": 1.0, "duration_s": 0.8},
+            {"sample_id": "s", "subisland_id": "s1", "audio": str(audio), "start_s": 2.0, "end_s": 3.0, "duration_s": 1.0},
+        ],
+    )
+
+    rows = build_items(subislands=subislands, output_dir=tmp_path / "audit")
+
+    assert len(rows) == 2
 
 
 def test_page_explains_keep_even_when_edges_are_wide(tmp_path: Path) -> None:

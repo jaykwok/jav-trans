@@ -578,19 +578,19 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--pre-asr-cueqc-enabled",
         action=argparse.BooleanOptionalAction,
         default=_env_bool("PRE_ASR_CUEQC_ENABLED", False),
-        help="Run Pre-ASR CueQC v12 after semantic boundary planning and before ASR export.",
+        help="Run repo-bound Pre-ASR CueQC (1.7B v13, 0.6B legacy v12) before ASR export.",
     )
     parser.add_argument(
         "--pre-asr-cueqc-model-path-by-repo",
         default=os.getenv("PRE_ASR_CUEQC_MODEL_PATH_BY_REPO", ""),
-        help="Optional repo-id checkpoint map for cueqc_pre_asr_semantic_chunk_v12_binary.",
+        help="Optional repo-id checkpoint map for the repo-bound Pre-ASR CueQC checkpoint.",
     )
     parser.add_argument("--pre-asr-cueqc-device", default=os.getenv("PRE_ASR_CUEQC_DEVICE", "auto"))
     parser.add_argument(
         "--pre-asr-cueqc-drop-threshold",
         type=float,
         default=_env_optional_float("PRE_ASR_CUEQC_DROP_THRESHOLD"),
-        help="Optional runtime override. Unset uses the active checkpoint decision_config.",
+        help="Legacy v12-only runtime threshold override; CueQC v13 always uses argmax.",
     )
     parser.add_argument(
         "--outer-edge-refiner-device",

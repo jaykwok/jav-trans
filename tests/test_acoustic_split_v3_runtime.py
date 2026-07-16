@@ -22,6 +22,11 @@ class _Planner:
         "gap_bins": 4,
         "right_bins": 8,
         "ptm_dim": 4,
+        "ptm_projection": {
+            "kind": "learned_linear_in_checkpoint",
+            "input_dim": 4,
+            "output_dim": 2,
+        },
         "extra_context_scales": [],
     }
 

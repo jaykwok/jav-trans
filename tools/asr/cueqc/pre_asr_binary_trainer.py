@@ -19,14 +19,15 @@ if str(SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(SRC_ROOT))
 
 from asr.backends.qwen import (  # noqa: E402
+    DEFAULT_INNER_EDGE_REFINER_CHECKPOINT_BY_REPO,
     DEFAULT_SEMANTIC_SPLIT_CHECKPOINT_BY_REPO,
+    QWEN_ASR_17B_REPO_ID,
     checkpoint_path_for_repo_env,
     qwen_asr_repo_id,
     qwen_asr_repo_tag,
 )
 from asr.pre_asr_cueqc import (  # noqa: E402
     PRE_ASR_CUEQC_ARTIFACT,
-    PRE_ASR_CUEQC_DEFAULT_DROP_THRESHOLD,
     PRE_ASR_CUEQC_FEATURE_SCHEMA,
     PRE_ASR_CUEQC_IGNORE_LABEL,
     PRE_ASR_CUEQC_MODEL_PTM_TOKENS,
@@ -43,27 +44,14 @@ from tools.asr.cueqc.pre_asr_feature_compiler import (  # noqa: E402
     project_path,
     repo_display_path,
 )
+from boundary.gpu_safety import apply_vram_safety_cap  # noqa: E402
 
 
-METRICS_SCHEMA = "cueqc_pre_asr_semantic_chunk_v12_train_metrics"
-DEFAULT_SWEEP_THRESHOLDS = (
-    0.50,
-    0.60,
-    0.70,
-    0.80,
-    0.90,
-    0.95,
-    0.98,
-    0.99,
-    0.995,
-    0.999,
-    0.9995,
-    0.9999,
-)
+METRICS_SCHEMA = "cueqc_pre_asr_semantic_chunk_v13_train_metrics"
 
 
 def default_checkpoint_name(asr_repo_id: str) -> str:
-    return f"pre_asr_cueqc_v12.{qwen_asr_repo_tag(asr_repo_id)}.pt"
+    return f"pre_asr_cueqc_v13.{qwen_asr_repo_tag(asr_repo_id)}.pt"
 
 
 def file_sha256(path: Path) -> str:
@@ -84,6 +72,16 @@ def active_semantic_split_checkpoint(asr_repo_id: str) -> Path:
     )
 
 
+def active_inner_edge_refiner_checkpoint(asr_repo_id: str) -> Path:
+    return Path(
+        checkpoint_path_for_repo_env(
+            repo_id=asr_repo_id,
+            mapping_env="INNER_EDGE_REFINER_MODEL_PATH_BY_REPO",
+            default_mapping=DEFAULT_INNER_EDGE_REFINER_CHECKPOINT_BY_REPO,
+        )
+    )
+
+
 def load_feature_bundle(path: Path) -> dict[str, Any]:
     import torch
 
@@ -93,7 +91,7 @@ def load_feature_bundle(path: Path) -> dict[str, Any]:
     if payload.get("schema") != FEATURE_BUNDLE_SCHEMA:
         raise ValueError(f"unsupported feature bundle schema: {payload.get('schema')!r}")
     if tuple(payload.get("feature_names") or ()) != PRE_ASR_CUEQC_SCALAR_FEATURE_NAMES:
-        raise ValueError("feature bundle feature_names do not match Pre-ASR CueQC v12 runtime")
+        raise ValueError("feature bundle feature_names do not match Pre-ASR CueQC v13 runtime")
     if payload.get("feature_schema") != PRE_ASR_CUEQC_FEATURE_SCHEMA:
         raise ValueError("feature bundle feature_schema mismatch")
     if payload.get("runtime_adapter") != PRE_ASR_CUEQC_RUNTIME_ADAPTER:
@@ -126,8 +124,6 @@ def classification_metrics(
     probs: np.ndarray,
     y: np.ndarray,
     durations: np.ndarray,
-    *,
-    threshold: float,
 ) -> dict[str, float]:
     if probs.size == 0:
         return {
@@ -135,6 +131,7 @@ def classification_metrics(
             "drop_recall": 0.0,
             "drop_f1": 0.0,
             "semantic_keep_recall": 0.0,
+            "unsure_recall": 0.0,
             "false_drop_rate": 0.0,
             "false_drop_count": 0.0,
             "false_drop_duration_s": 0.0,
@@ -149,18 +146,27 @@ def classification_metrics(
             "fn": 0.0,
             "tn": 0.0,
         }
-    p_drop = probs[:, 0]
-    pred_drop = p_drop >= threshold
+    predicted = np.argmax(probs, axis=1)
+    pred_drop = predicted == 0
+    pred_keep = predicted == 1
     true_drop = y == 0
     true_keep = y == 1
+    true_unsure = y == 2
     tp = int(np.sum(pred_drop & true_drop))
-    fp = int(np.sum(pred_drop & true_keep))
+    fp = int(np.sum(pred_drop & ~true_drop))
     fn = int(np.sum(~pred_drop & true_drop))
-    tn = int(np.sum(~pred_drop & true_keep))
+    tn = int(np.sum(pred_keep & true_keep))
     precision = tp / (tp + fp) if tp + fp else 0.0
     recall = tp / (tp + fn) if tp + fn else 0.0
     f1 = (2 * precision * recall / (precision + recall)) if precision + recall else 0.0
-    keep_recall = tn / (tn + fp) if tn + fp else 0.0
+    keep_total = int(np.sum(true_keep))
+    keep_recall = tn / keep_total if keep_total else 0.0
+    unsure_total = int(np.sum(true_unsure))
+    unsure_recall = (
+        int(np.sum((predicted == 2) & true_unsure)) / unsure_total
+        if unsure_total
+        else 0.0
+    )
     false_drop_duration = float(np.sum(durations[pred_drop & true_keep]))
     false_keep_duration = float(np.sum(durations[~pred_drop & true_drop]))
     drop_duration = float(np.sum(durations[pred_drop]))
@@ -170,8 +176,9 @@ def classification_metrics(
         "drop_recall": recall,
         "drop_f1": f1,
         "semantic_keep_recall": keep_recall,
-        "false_drop_rate": fp / max(1, int(np.sum(true_keep))),
-        "false_drop_count": float(fp),
+        "unsure_recall": unsure_recall,
+        "false_drop_rate": int(np.sum(pred_drop & true_keep)) / max(1, keep_total),
+        "false_drop_count": float(np.sum(pred_drop & true_keep)),
         "false_drop_duration_s": false_drop_duration,
         "false_keep_count": float(fn),
         "false_keep_duration_s": false_keep_duration,
@@ -196,24 +203,12 @@ def _duration_matrix(bundle: Mapping[str, Any], scalar: Any) -> np.ndarray:
     return scalar[:, :, index].detach().cpu().numpy().astype(np.float32)
 
 
-def _threshold_sweep(probs: np.ndarray, y: np.ndarray, mask: np.ndarray, durations: np.ndarray) -> dict[str, Any]:
-    valid_probs, valid_y, valid_durations = _valid_flat(probs, y, mask, durations)
-    return {
-        f"{threshold:.4f}".rstrip("0").rstrip("."): classification_metrics(
-            valid_probs,
-            valid_y,
-            valid_durations,
-            threshold=threshold,
-        )
-        for threshold in DEFAULT_SWEEP_THRESHOLDS
-    }
-
-
 def _class_counts(y: np.ndarray, mask: np.ndarray) -> dict[str, int]:
     valid = mask > 0
     return {
         "drop": int(np.sum((y == 0) & valid)),
         "keep": int(np.sum((y == 1) & valid)),
+        "unsure": int(np.sum((y == 2) & valid)),
         "ambiguous_ignore": int(np.sum((y == PRE_ASR_CUEQC_IGNORE_LABEL) & valid)),
     }
 
@@ -242,7 +237,7 @@ def _split_label_masks(
     val_ratio: float,
     rng: np.random.Generator,
 ) -> tuple[np.ndarray, np.ndarray, dict[str, Any]]:
-    valid = (chunk_mask > 0) & ((y == 0) | (y == 1))
+    valid = (chunk_mask > 0) & ((y == 0) | (y == 1) | (y == 2))
     train = np.zeros_like(valid, dtype=bool)
     val = np.zeros_like(valid, dtype=bool)
     if split_mode == "role_holdout":
@@ -287,7 +282,7 @@ def _split_label_masks(
             val[first] = False
     elif split_mode == "chunk_stratified":
         for group_index in range(y.shape[0]):
-            for label_index in (0, 1):
+            for label_index in (0, 1, 2):
                 positions = np.flatnonzero(valid[group_index] & (y[group_index] == label_index))
                 if positions.size == 0:
                     continue
@@ -305,9 +300,9 @@ def _split_label_masks(
     else:
         raise ValueError(f"unsupported split_mode: {split_mode!r}")
     if not np.any(train & valid):
-        raise ValueError("training split has no definite keep/drop labels")
+        raise ValueError("training split has no CueQC labels")
     if not np.any(val & valid):
-        raise ValueError("validation split has no definite keep/drop labels")
+        raise ValueError("validation split has no CueQC labels")
     train_group_count = int(np.sum(np.any(train, axis=1)))
     val_group_count = int(np.sum(np.any(val, axis=1)))
     summary = {
@@ -329,7 +324,7 @@ def _balanced_anchor_positions(train_mask: np.ndarray, y: np.ndarray, device: An
     import torch
 
     positions: dict[int, Any] = {}
-    for label_index in (0, 1):
+    for label_index in (0, 1, 2):
         raw = np.argwhere(train_mask & (y == label_index))
         if raw.size:
             positions[label_index] = torch.as_tensor(raw, dtype=torch.long, device=device)
@@ -595,9 +590,9 @@ def train(
     weight_decay: float,
     seed: int,
     device: str,
-    drop_threshold: float,
     keep_class_weight: float,
     drop_class_weight: float,
+    unsure_class_weight: float,
     sequence_window_size: int,
     temporal_residual_scale: float,
     split_mode: str,
@@ -608,6 +603,7 @@ def train(
     anchor_boost_audio_ids: list[str],
     anchor_boost: int,
     semantic_split_checkpoint: Path | None,
+    inner_edge_refiner_checkpoint: Path | None,
     force_val_audio_ids: list[str] | None = None,
     anchor_boost_candidate_ids: list[str] | None = None,
     valid_prefix_temporal: bool = False,
@@ -619,6 +615,7 @@ def train(
     import torch
     import torch.nn.functional as F
 
+    apply_vram_safety_cap(0.95)
     bundle = load_feature_bundle(features_path)
     scalar = bundle["scalar_features"].float()
     ptm_bins = bundle["ptm_bins"].float()
@@ -635,10 +632,21 @@ def train(
     if y.shape != chunk_mask.shape or y.shape != scalar.shape[:2]:
         raise ValueError("label tensor shape mismatch")
     selected_repo = qwen_asr_repo_id(asr_repo_id)
+    if selected_repo != QWEN_ASR_17B_REPO_ID:
+        raise ValueError("CueQC v13 training is restricted to the 1.7B repo")
     split_checkpoint_path = semantic_split_checkpoint or active_semantic_split_checkpoint(selected_repo)
     if not split_checkpoint_path.exists():
         raise FileNotFoundError(f"semantic split checkpoint not found: {split_checkpoint_path}")
     split_checkpoint_sha256 = file_sha256(split_checkpoint_path)
+    inner_checkpoint_path = (
+        inner_edge_refiner_checkpoint
+        or active_inner_edge_refiner_checkpoint(selected_repo)
+    )
+    if not inner_checkpoint_path.exists():
+        raise FileNotFoundError(
+            f"inner edge refiner checkpoint not found: {inner_checkpoint_path}"
+        )
+    inner_checkpoint_sha256 = file_sha256(inner_checkpoint_path)
     bundle_repo = qwen_asr_repo_id(str(bundle.get("asr_repo_id") or selected_repo))
     if bundle_repo != selected_repo:
         raise ValueError(f"feature bundle asr_repo_id={bundle_repo!r} does not match {selected_repo!r}")
@@ -669,13 +677,17 @@ def train(
         raise ValueError(f"audio_ids forced into both train and validation: {overlap_ids}")
     for group_index in force_train_groups:
         valid = (mask_np[group_index] > 0) & (
-            (y_np[group_index] == 0) | (y_np[group_index] == 1)
+            (y_np[group_index] == 0)
+            | (y_np[group_index] == 1)
+            | (y_np[group_index] == 2)
         )
         train_label_mask[group_index, valid] = True
         val_label_mask[group_index, valid] = False
     for group_index in force_val_groups:
         valid = (mask_np[group_index] > 0) & (
-            (y_np[group_index] == 0) | (y_np[group_index] == 1)
+            (y_np[group_index] == 0)
+            | (y_np[group_index] == 1)
+            | (y_np[group_index] == 2)
         )
         train_label_mask[group_index, valid] = False
         val_label_mask[group_index, valid] = True
@@ -771,6 +783,7 @@ def train(
                 "ptm_encoder_mode": str(ptm_encoder_mode),
                 "semantic_auxiliary": bool(semantic_auxiliary),
                 "late_fusion": bool(late_fusion),
+                "num_classes": 3,
             }
         )
     model = PreAsrCueQCNetwork(**model_config).to(dev)
@@ -778,7 +791,11 @@ def train(
         model.load_state_dict(init_payload["model_state_dict"], strict=True)
     opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
     class_weights = torch.tensor(
-        [float(drop_class_weight), float(keep_class_weight)],
+        [
+            float(drop_class_weight),
+            float(keep_class_weight),
+            float(unsure_class_weight),
+        ],
         dtype=torch.float32,
         device=dev,
     )
@@ -832,7 +849,7 @@ def train(
         else:
             logits = model_output
             auxiliary = {}
-        flat_logits = logits.reshape(-1, 2)
+        flat_logits = logits.reshape(-1, 3)
         flat_targets = batch_y.reshape(-1)
         active = flat_targets != PRE_ASR_CUEQC_IGNORE_LABEL
         active_logits = flat_logits[active]
@@ -848,7 +865,7 @@ def train(
         ).squeeze(1)
         loss = (raw_loss * torch.pow(1.0 - pt, focal_gamma)).mean()
         if semantic_auxiliary and semantic_aux_loss_weight > 0.0:
-            semantic_logits = auxiliary["semantic_logits"].reshape(-1, 2)[active]
+            semantic_logits = auxiliary["semantic_logits"].reshape(-1, 3)[active]
             semantic_raw_loss = F.cross_entropy(
                 semantic_logits,
                 active_targets,
@@ -900,6 +917,8 @@ def train(
         "asr_repo_id": selected_repo,
         "semantic_split_checkpoint": repo_display_path(split_checkpoint_path),
         "semantic_split_weights_sha256": split_checkpoint_sha256,
+        "inner_edge_refiner_checkpoint": repo_display_path(inner_checkpoint_path),
+        "inner_edge_refiner_weights_sha256": inner_checkpoint_sha256,
         "ptm_projection_digest": ptm_projection_digest,
         "ptm_pooling_schemas": ptm_pooling_schemas,
         "split": split_summary,
@@ -910,6 +929,7 @@ def train(
         "class_weights": {
             "drop": float(drop_class_weight),
             "keep": float(keep_class_weight),
+            "unsure": float(unsure_class_weight),
         },
         "focal_gamma": float(focal_gamma),
         "valid_prefix_temporal": bool(model_config["valid_prefix_temporal"]),
@@ -941,23 +961,10 @@ def train(
         ),
         "anchor_boost": int(anchor_boost),
         "model_config": model_config,
-        "drop_threshold": float(drop_threshold),
-        "threshold_sweep": _threshold_sweep(probs_all, y_np, mask_np, durations),
-        "train_threshold_sweep": _threshold_sweep(
-            probs_all,
-            y_np,
-            train_label_mask.astype(np.float32),
-            durations,
-        ),
-        "val_threshold_sweep": _threshold_sweep(
-            probs_all,
-            y_np,
-            val_label_mask.astype(np.float32),
-            durations,
-        ),
-        "train": classification_metrics(train_probs, train_y, train_durations, threshold=drop_threshold),
-        "val": classification_metrics(val_probs, val_y, val_durations, threshold=drop_threshold),
-        "all": classification_metrics(all_probs, all_y, all_durations, threshold=drop_threshold),
+        "decision_mode": "argmax",
+        "train": classification_metrics(train_probs, train_y, train_durations),
+        "val": classification_metrics(val_probs, val_y, val_durations),
+        "all": classification_metrics(all_probs, all_y, all_durations),
     }
 
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -969,11 +976,12 @@ def train(
         "runtime_adapter": PRE_ASR_CUEQC_RUNTIME_ADAPTER,
         "feature_names": list(PRE_ASR_CUEQC_SCALAR_FEATURE_NAMES),
         "semantic_split_weights_sha256": split_checkpoint_sha256,
+        "inner_edge_refiner_weights_sha256": inner_checkpoint_sha256,
         "model_config": model_config,
         "feature_mean": mean.cpu().numpy().astype(np.float32).tolist(),
         "feature_std": std.cpu().numpy().astype(np.float32).tolist(),
         "decision_config": {
-            "drop_threshold": float(drop_threshold),
+            "decision_mode": "argmax",
             "hard_keep_veto": False,
             "hard_drop_rule": False,
             "keep_veto": False,
@@ -989,6 +997,8 @@ def train(
             "feature_bundle_sha256": file_sha256(features_path),
             "semantic_split_checkpoint": repo_display_path(split_checkpoint_path),
             "semantic_split_weights_sha256": split_checkpoint_sha256,
+            "inner_edge_refiner_checkpoint": repo_display_path(inner_checkpoint_path),
+            "inner_edge_refiner_weights_sha256": inner_checkpoint_sha256,
             "ptm_projection_digest": ptm_projection_digest,
             "ptm_pooling_schemas": ptm_pooling_schemas,
             "trained_steps": int(steps),
@@ -1041,7 +1051,7 @@ def train(
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Train Pre-ASR CueQC v12 hierarchical Mamba2 binary checkpoint.")
+    parser = argparse.ArgumentParser(description="Train Pre-ASR CueQC v13 hierarchical Mamba2 argmax checkpoint.")
     parser.add_argument("--features", required=True)
     parser.add_argument("--output-dir", required=True)
     parser.add_argument("--asr-repo-id", required=True)
@@ -1053,9 +1063,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--weight-decay", type=float, default=0.01)
     parser.add_argument("--seed", type=int, default=17)
     parser.add_argument("--device", default="auto")
-    parser.add_argument("--drop-threshold", type=float, default=PRE_ASR_CUEQC_DEFAULT_DROP_THRESHOLD)
     parser.add_argument("--drop-class-weight", type=float, default=1.0)
     parser.add_argument("--keep-class-weight", type=float, default=2.0)
+    parser.add_argument("--unsure-class-weight", type=float, default=1.0)
     parser.add_argument("--focal-gamma", type=float, default=2.0)
     parser.add_argument(
         "--valid-prefix-temporal",
@@ -1072,11 +1082,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--late-fusion", action="store_true")
     parser.add_argument(
         "--init-checkpoint",
-        help="Fine-tune from an existing compatible v12 checkpoint and preserve its normalization.",
+        help="Fine-tune from an existing compatible v13 checkpoint and preserve its normalization.",
     )
     parser.add_argument(
         "--semantic-split-checkpoint",
-        help="Semantic Split checkpoint whose sha256 must be embedded in the v12 checkpoint; defaults to the active repo mapping.",
+        help="Semantic Split checkpoint whose sha256 must be embedded in the v13 checkpoint; defaults to the active repo mapping.",
+    )
+    parser.add_argument(
+        "--inner-edge-refiner-checkpoint",
+        help="Inner Edge Refiner checkpoint whose sha256 must be embedded in the v13 checkpoint; defaults to the active repo mapping.",
     )
     parser.add_argument(
         "--force-train-audio-id",
@@ -1141,9 +1155,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         parser.error("--steps must be positive")
     if args.batch_size <= 0:
         parser.error("--batch-size must be positive")
-    if not 0.0 <= args.drop_threshold <= 1.0:
-        parser.error("--drop-threshold must be between 0 and 1")
-    if args.drop_class_weight <= 0.0 or args.keep_class_weight <= 0.0:
+    if (
+        args.drop_class_weight <= 0.0
+        or args.keep_class_weight <= 0.0
+        or args.unsure_class_weight <= 0.0
+    ):
         parser.error("class weights must be positive")
     if args.focal_gamma < 0.0:
         parser.error("--focal-gamma must be non-negative")
@@ -1187,9 +1203,9 @@ def main(argv: list[str] | None = None) -> int:
         weight_decay=float(args.weight_decay),
         seed=int(args.seed),
         device=str(args.device),
-        drop_threshold=float(args.drop_threshold),
         keep_class_weight=float(args.keep_class_weight),
         drop_class_weight=float(args.drop_class_weight),
+        unsure_class_weight=float(args.unsure_class_weight),
         sequence_window_size=int(args.sequence_window_size),
         temporal_residual_scale=float(args.temporal_residual_scale),
         split_mode=str(args.split_mode),
@@ -1203,6 +1219,11 @@ def main(argv: list[str] | None = None) -> int:
         semantic_split_checkpoint=(
             project_path(args.semantic_split_checkpoint)
             if args.semantic_split_checkpoint
+            else None
+        ),
+        inner_edge_refiner_checkpoint=(
+            project_path(args.inner_edge_refiner_checkpoint)
+            if args.inner_edge_refiner_checkpoint
             else None
         ),
         force_train_audio_ids=[

@@ -18,7 +18,11 @@ if str(PROJECT_ROOT) not in sys.path:
 if str(SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(SRC_ROOT))
 
-from asr.backends.qwen import current_qwen_asr_backend, qwen_asr_repo_id  # noqa: E402
+from asr.backends.qwen import (  # noqa: E402
+    QWEN_ASR_17B_REPO_ID,
+    current_qwen_asr_backend,
+    qwen_asr_repo_id,
+)
 from asr.pre_asr_cueqc import (  # noqa: E402
     PRE_ASR_CUEQC_FEATURE_NAMES,
     PRE_ASR_CUEQC_FEATURE_SCHEMA,
@@ -34,7 +38,7 @@ from asr.pre_asr_cueqc import (  # noqa: E402
 )
 
 
-FEATURE_BUNDLE_SCHEMA = "cueqc_pre_asr_semantic_chunk_v12_features"
+FEATURE_BUNDLE_SCHEMA = "cueqc_pre_asr_semantic_chunk_v13_features"
 
 
 def project_path(value: str | Path) -> Path:
@@ -159,7 +163,7 @@ def expand_chunk_paths(paths: Iterable[str]) -> list[Path]:
 
 def label_keys(row: Mapping[str, Any]) -> list[str]:
     keys: list[str] = []
-    for key in ("sample_id", "candidate_id", "id"):
+    for key in ("subisland_id", "sample_id", "candidate_id", "id"):
         value = str(row.get(key) or "").strip()
         if value:
             keys.append(value)
@@ -220,6 +224,8 @@ def normalize_label(row: Mapping[str, Any]) -> int | None:
         return 1
     if raw in {"drop", "drop_before_asr", "0", "negative", "definite_drop"}:
         return 0
+    if raw in {"unsure", "unsure_for_asr", "abstain", "uncertain", "2"}:
+        return 2
     if raw in {"ignore", "skip", "ambiguous", "ambiguous_ignore", str(PRE_ASR_CUEQC_IGNORE_LABEL)}:
         return PRE_ASR_CUEQC_IGNORE_LABEL
     return None
@@ -248,7 +254,13 @@ def read_labels(paths: Iterable[str]) -> dict[str, dict[str, Any]]:
 
 
 def row_id(audio_id: str, chunk: Mapping[str, Any], index: int) -> str:
-    explicit = str(chunk.get("sample_id") or chunk.get("candidate_id") or chunk.get("id") or "").strip()
+    explicit = str(
+        chunk.get("subisland_id")
+        or chunk.get("sample_id")
+        or chunk.get("candidate_id")
+        or chunk.get("id")
+        or ""
+    ).strip()
     if explicit:
         return explicit
     chunk_index = chunk.get("chunk_index", chunk.get("index", index))
@@ -286,15 +298,19 @@ def _has_required_ptm_pooling(candidate: Mapping[str, Any]) -> bool:
 
 def candidate_for_chunk(chunks: list[dict[str, Any]], index: int) -> dict[str, Any]:
     chunk = chunks[index]
-    features = chunk.get("features")
-    feature_names = tuple(str(item) for item in chunk.get("feature_names") or ())
+    embedded = chunk.get("pre_asr_candidate")
+    source = dict(embedded) if isinstance(embedded, Mapping) else chunk
+    features = source.get("features")
+    feature_names = tuple(str(item) for item in source.get("feature_names") or ())
     if isinstance(features, Mapping) and feature_names == PRE_ASR_CUEQC_FEATURE_NAMES:
-        candidate = dict(chunk)
+        candidate = dict(source)
     else:
         candidate = candidate_from_span(chunks, index, require_ptm_pooling=True)
+    candidate.setdefault("sample_id", str(chunk.get("subisland_id") or ""))
+    candidate.setdefault("source_sample_id", str(chunk.get("sample_id") or ""))
     if not _has_required_ptm_pooling(candidate):
         raise ValueError(
-            "Pre-ASR CueQC v12 feature compilation requires chunk-level pooled PTM features"
+            "Pre-ASR CueQC v13 feature compilation requires chunk-level pooled PTM features"
         )
     return candidate
 
@@ -359,6 +375,9 @@ def compile_features(
 ) -> dict[str, Any]:
     import torch
 
+    selected_repo = qwen_asr_repo_id(asr_repo_id)
+    if selected_repo != QWEN_ASR_17B_REPO_ID:
+        raise ValueError("CueQC v13 feature compilation is restricted to the 1.7B repo")
     labels = read_labels(label_paths)
     expanded_chunk_paths = expand_chunk_paths(chunk_paths)
     rows: list[dict[str, Any]] = []
@@ -382,6 +401,11 @@ def compile_features(
                     "source": source,
                     "audio_id": audio_id,
                     "video_id": _source_video_id(candidate, audio_id),
+                    "dataset_role": str(
+                        chunk.get("source_partition")
+                        or (label or {}).get("source_partition")
+                        or ""
+                    ),
                     "planned_island_id": str(candidate.get("planned_island_id") or "sequence"),
                     "chunk_index": int(candidate["index"]),
                     "start": candidate["start"],
@@ -392,6 +416,8 @@ def compile_features(
                         if label_index == 1
                         else "drop_before_asr"
                         if label_index == 0
+                        else "unsure_for_asr"
+                        if label_index == 2
                         else "ambiguous_ignore"
                     ),
                     "label_source": ""
@@ -407,7 +433,7 @@ def compile_features(
             )
     groups: list[list[int]] = []
     for row_indexes in group_map.values():
-        if any(int(rows[row_index]["label_index"]) in (0, 1) for row_index in row_indexes):
+        if any(int(rows[row_index]["label_index"]) in (0, 1, 2) for row_index in row_indexes):
             groups.append(row_indexes)
     if not groups:
         raise ValueError("no definite labeled Pre-ASR CueQC examples were compiled")
@@ -442,6 +468,7 @@ def compile_features(
             "audio_id": rows[group[0]]["audio_id"],
             "video_id": rows[group[0]]["video_id"],
             "planned_island_id": rows[group[0]]["planned_island_id"],
+            "dataset_role": rows[group[0]]["dataset_role"],
         }
         for group_index, group in enumerate(groups)
     ]
@@ -453,7 +480,7 @@ def compile_features(
         "all_feature_names": list(PRE_ASR_CUEQC_FEATURE_NAMES),
         "ptm_bin_count": PRE_ASR_CUEQC_MODEL_PTM_TOKENS,
         "ptm_dim": PRE_ASR_CUEQC_PTM_DIM,
-        "asr_repo_id": qwen_asr_repo_id(asr_repo_id),
+        "asr_repo_id": selected_repo,
         "ptm_pooling_schemas": pooling_schemas,
         "ptm_projection_digest": ptm_projection_digest,
         "created_at": datetime.now().isoformat(timespec="seconds"),
@@ -466,18 +493,19 @@ def compile_features(
     output.parent.mkdir(parents=True, exist_ok=True)
     torch.save(bundle, output)
     summary = {
-        "schema": "cueqc_pre_asr_semantic_chunk_v12_feature_summary",
+        "schema": "cueqc_pre_asr_semantic_chunk_v13_feature_summary",
         "feature_bundle": repo_display_path(output),
         "feature_schema": PRE_ASR_CUEQC_FEATURE_SCHEMA,
         "runtime_adapter": PRE_ASR_CUEQC_RUNTIME_ADAPTER,
         "feature_names": list(PRE_ASR_CUEQC_SCALAR_FEATURE_NAMES),
-        "asr_repo_id": qwen_asr_repo_id(asr_repo_id),
+        "asr_repo_id": selected_repo,
         "ptm_pooling_schemas": pooling_schemas,
         "ptm_projection_digest": ptm_projection_digest,
         "group_count": int(len(groups)),
         "chunk_count": int(np.sum(y != PRE_ASR_CUEQC_IGNORE_LABEL)),
         "keep": int(np.sum(y == 1)),
         "drop": int(np.sum(y == 0)),
+        "unsure": int(np.sum(y == 2)),
         "ambiguous_ignore": int(np.sum((y == PRE_ASR_CUEQC_IGNORE_LABEL) & (bundle_tensors["chunk_mask"].numpy() > 0))),
     }
     output.with_suffix(".summary.json").write_text(
@@ -488,7 +516,7 @@ def compile_features(
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Compile Pre-ASR CueQC v12 semantic-chunk features.")
+    parser = argparse.ArgumentParser(description="Compile Pre-ASR CueQC v13 provisional-subisland features.")
     parser.add_argument("--chunks", action="append", required=True, help="Workflow details/chunk JSON or JSONL.")
     parser.add_argument("--labels", action="append", required=True, help="JSON/JSONL labels with keep/drop/ignore.")
     parser.add_argument("--output", required=True)
