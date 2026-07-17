@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Project exact unique-core spans onto new Runtime v10 provisional chunks."""
+"""Project exact unique-core spans onto new Runtime v11 provisional chunks."""
 from __future__ import annotations
 
 import argparse
@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Any, Iterable
 
 
-SCHEMA = "cueqc_v13_runtime_chunk_label_v1"
+SCHEMA = "cueqc_v13_runtime_v11_exact_core_label_v2"
 SUMMARY_SCHEMA = "cueqc_v13_runtime_chunk_label_summary_v1"
 SAMPLE_RATE = 16000
 
@@ -72,9 +72,7 @@ def project(
                 "label": label,
                 "label_source": "exact_unique_semantic_core_sample_intersection_v1",
                 "semantic_core_overlaps": overlaps,
-                "pre_asr_candidate": chunk.get("pre_asr_candidate"),
                 "semantic_event_ids": list(chunk.get("semantic_event_ids") or []),
-                "inner_edge_prediction": dict(chunk.get("inner_edge_prediction") or {}),
             }
         )
     _write(output, result)

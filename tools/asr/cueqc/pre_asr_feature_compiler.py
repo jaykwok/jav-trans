@@ -240,12 +240,13 @@ def read_labels(paths: Iterable[str]) -> dict[str, dict[str, Any]]:
     for raw_path in paths:
         path = project_path(raw_path)
         for row in read_json_or_jsonl(path):
-            teacher_label = raw_label(row)
+            canonical_label = raw_label(row)
+            teacher_label = str(row.get("teacher_label") or canonical_label).strip().lower()
             value = normalize_label(row)
             if value is None:
                 continue
             ignore_reason = ""
-            if teacher_label in {"unsure", "unsure_for_asr", "abstain", "uncertain", "2"}:
+            if canonical_label in {"unsure", "unsure_for_asr", "abstain", "uncertain", "2"}:
                 ignore_reason = "teacher_unsure"
             if row.get("training_label_included") is False:
                 value = PRE_ASR_CUEQC_IGNORE_LABEL
@@ -405,14 +406,21 @@ def compile_features(
                 PRE_ASR_CUEQC_IGNORE_LABEL if label is None else int(label["label_index"])
             )
             group_key = _group_key(source, audio_id, candidate)
+            candidate_audio_id = str(
+                candidate.get("audio_id")
+                or candidate.get("video_id")
+                or chunk.get("sample_id")
+                or audio_id
+            )
             row_index = len(rows)
             group_map.setdefault(group_key, []).append(row_index)
             rows.append(
                 {
                     "id": rid,
                     "source": source,
-                    "audio_id": audio_id,
-                    "video_id": _source_video_id(candidate, audio_id),
+                    "audio_id": candidate_audio_id,
+                    "audio": str(chunk.get("audio") or candidate.get("audio") or ""),
+                    "video_id": _source_video_id(candidate, candidate_audio_id),
                     "dataset_role": str(
                         chunk.get("source_partition")
                         or (label or {}).get("source_partition")
@@ -433,6 +441,10 @@ def compile_features(
                         else "ambiguous_ignore"
                     ),
                     "teacher_label": "" if label is None else str(label.get("teacher_label") or ""),
+                    "canonical_label": "" if label is None else raw_label(label),
+                    "exact_core_label": ""
+                    if label is None
+                    else str(label.get("exact_core_label") or ""),
                     "training_ignore_reason": ""
                     if label is None
                     else str(label.get("training_ignore_reason") or ""),
@@ -560,12 +572,14 @@ def main(argv: list[str] | None = None) -> int:
         asr_repo_id=str(args.asr_repo_id),
     )
     print(
-        "features={feature_bundle} groups={group_count} keep={keep} drop={drop} ignore={ignore}".format(
+        "features={feature_bundle} groups={group_count} keep={keep} drop={drop} "
+        "teacher_unsure_ignored={teacher_unsure_ignored} ambiguous_ignore={ambiguous_ignore}".format(
             feature_bundle=summary["feature_bundle"],
             group_count=summary["group_count"],
             keep=summary["keep"],
             drop=summary["drop"],
-            ignore=summary["ambiguous_ignore"],
+            teacher_unsure_ignored=summary["teacher_unsure_ignored"],
+            ambiguous_ignore=summary["ambiguous_ignore"],
         )
     )
     return 0

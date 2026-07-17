@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 from pathlib import Path
 
 import pytest
@@ -98,3 +99,47 @@ def test_split_v4_candidate_is_binary_argmax_and_excludes_unsure() -> None:
         "continue": 1,
         "ignore": 24,
     }
+
+
+def test_17b_cueqc_v13_is_binary_argmax_without_threshold_and_binds_split_inner() -> None:
+    torch = pytest.importorskip("torch")
+    path = Path(qwen.DEFAULT_PRE_ASR_CUEQC_CHECKPOINT_BY_REPO[qwen.QWEN_ASR_17B_REPO_ID])
+    payload = torch.load(path, map_location="cpu", weights_only=False)
+    decision = payload["decision_config"]
+    metadata = payload["metadata"]
+    split_path = Path(
+        qwen.DEFAULT_SEMANTIC_SPLIT_CHECKPOINT_BY_REPO[qwen.QWEN_ASR_17B_REPO_ID]
+    )
+    inner_path = Path(
+        qwen.DEFAULT_INNER_EDGE_REFINER_CHECKPOINT_BY_REPO[qwen.QWEN_ASR_17B_REPO_ID]
+    )
+
+    assert payload["schema"] == "cueqc_pre_asr_semantic_chunk_v13"
+    assert payload["model_config"]["num_classes"] == 2
+    assert decision["decision_mode"] == "argmax"
+    assert "drop_threshold" not in decision
+    assert decision["model_only"] is True
+    assert decision["hard_keep_veto"] is False
+    assert decision["hard_drop_rule"] is False
+    assert decision["keep_veto"] is False
+    assert metadata["training_labels"] == ["drop", "keep"]
+    assert metadata["excluded_training_labels"] == ["unsure"]
+    assert metadata["excluded_training_label_count"] >= 0
+    assert payload["semantic_split_weights_sha256"] == hashlib.sha256(
+        split_path.read_bytes()
+    ).hexdigest()
+    assert payload["inner_edge_refiner_weights_sha256"] == hashlib.sha256(
+        inner_path.read_bytes()
+    ).hexdigest()
+
+
+def test_06b_cueqc_v12_keeps_legacy_threshold_contract_without_inner_binding() -> None:
+    torch = pytest.importorskip("torch")
+    path = Path(qwen.DEFAULT_PRE_ASR_CUEQC_CHECKPOINT_BY_REPO[qwen.QWEN_ASR_06B_REPO_ID])
+    payload = torch.load(path, map_location="cpu", weights_only=False)
+
+    assert payload["schema"] == "cueqc_pre_asr_semantic_chunk_v12_binary"
+    assert payload["model_config"]["num_classes"] == 2
+    assert payload["decision_config"]["drop_threshold"] == 0.625
+    assert payload["decision_config"].get("decision_mode", "drop_threshold") == "drop_threshold"
+    assert "inner_edge_refiner_weights_sha256" not in payload

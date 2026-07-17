@@ -82,7 +82,8 @@ def test_page_explains_keep_even_when_edges_are_wide(tmp_path: Path) -> None:
 
     assert "即使前后静音很宽" in page
     assert "整块没有目标语音" in page
-    assert "运行时显式保留并进入 Inner" in page
+    assert "只保留在 teacher/data 审计层" in page
+    assert "runtime 模型不会输出 unsure" in page
     assert ".join('\\n')+'\\n'" in page
 
 

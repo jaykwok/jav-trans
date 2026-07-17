@@ -379,6 +379,8 @@ def _cuda_environment_status() -> dict[str, Any]:
 def _checkpoint_requirements(repo_id: str) -> list[dict[str, Any]]:
     requirements: list[dict[str, Any]] = []
     for role, label, mapping_env, default_mapping in _CHECKPOINT_SPECS:
+        if repo_id not in default_mapping:
+            continue
         path = ""
         error = ""
         try:

@@ -108,6 +108,18 @@ def load_feature_bundle(path: Path) -> dict[str, Any]:
         ptm_dim = int(ptm_tensor.shape[3])
     if int(ptm_dim or 0) != PRE_ASR_CUEQC_PTM_DIM:
         raise ValueError("feature bundle ptm_dim mismatch")
+    labels = payload.get("labels")
+    if labels is None or not hasattr(labels, "detach"):
+        raise ValueError("feature bundle labels tensor is missing")
+    observed_labels = {
+        int(item) for item in labels.detach().cpu().reshape(-1).tolist()
+    }
+    allowed_labels = {0, 1, 2, PRE_ASR_CUEQC_IGNORE_LABEL}
+    if not observed_labels.issubset(allowed_labels):
+        raise ValueError(
+            "feature bundle contains unsupported training labels: "
+            f"{sorted(observed_labels - allowed_labels)}"
+        )
     return dict(payload)
 
 
@@ -207,6 +219,87 @@ def _class_counts(y: np.ndarray, mask: np.ndarray) -> dict[str, int]:
         "excluded_unsure": int(np.sum((y == 2) & valid)),
         "ambiguous_ignore": int(np.sum((y == PRE_ASR_CUEQC_IGNORE_LABEL) & valid)),
     }
+
+
+def _excluded_training_label_count(bundle: Mapping[str, Any], y: np.ndarray) -> int:
+    """Count canonical unsure rows plus legacy bundle rows encoded as class 2."""
+    canonical_unsure = int(bundle.get("teacher_unsure_ignored") or 0)
+    legacy_unsure = int(np.sum(y == 2))
+    return canonical_unsure + legacy_unsure
+
+
+def _prediction_rows(
+    *,
+    bundle: Mapping[str, Any],
+    group_rows: list[Mapping[str, Any]],
+    y: np.ndarray,
+    chunk_mask: np.ndarray,
+    train_mask: np.ndarray,
+    val_mask: np.ndarray,
+    probabilities: np.ndarray,
+) -> list[dict[str, Any]]:
+    metadata_by_id = {
+        str(row.get("id") or ""): dict(row)
+        for row in bundle.get("rows") or ()
+        if isinstance(row, Mapping) and str(row.get("id") or "")
+    }
+    result: list[dict[str, Any]] = []
+    for group_index, group in enumerate(group_rows):
+        row_ids = list(group.get("row_ids") or ())
+        for chunk_index, raw_id in enumerate(row_ids):
+            if chunk_index >= y.shape[1] or chunk_mask[group_index, chunk_index] <= 0:
+                continue
+            row_id = str(raw_id)
+            metadata = metadata_by_id.get(row_id, {})
+            target = int(y[group_index, chunk_index])
+            if target in (0, 1):
+                truth_label = PRE_ASR_CUEQC_LABELS[target]
+            elif target == 2 or metadata.get("training_ignore_reason") == "teacher_unsure":
+                truth_label = "unsure"
+            else:
+                truth_label = "ignore"
+            probability = probabilities[group_index, chunk_index]
+            prediction_index = int(np.argmax(probability))
+            prediction = PRE_ASR_CUEQC_LABELS[prediction_index]
+            split_membership = (
+                "train"
+                if train_mask[group_index, chunk_index]
+                else "holdout"
+                if val_mask[group_index, chunk_index]
+                else "excluded"
+            )
+            result.append(
+                {
+                    "schema": "cueqc_v13_binary_prediction_v1",
+                    "row_id": row_id,
+                    "audio_id": str(metadata.get("audio_id") or group.get("audio_id") or ""),
+                    "video_id": str(metadata.get("video_id") or group.get("video_id") or ""),
+                    "planned_island_id": str(
+                        metadata.get("planned_island_id")
+                        or group.get("planned_island_id")
+                        or ""
+                    ),
+                    "audio": str(metadata.get("audio") or ""),
+                    "start_s": float(metadata.get("start") or 0.0),
+                    "end_s": float(metadata.get("end") or 0.0),
+                    "source_partition": str(
+                        metadata.get("dataset_role") or group.get("dataset_role") or ""
+                    ),
+                    "split_membership": split_membership,
+                    "truth_label": truth_label,
+                    "teacher_label": str(metadata.get("teacher_label") or ""),
+                    "exact_core_label": str(metadata.get("exact_core_label") or ""),
+                    "training_ignore_reason": str(
+                        metadata.get("training_ignore_reason") or ""
+                    ),
+                    "prediction": prediction,
+                    "prob_drop": float(probability[0]),
+                    "prob_keep": float(probability[1]),
+                    "false_drop": prediction == "drop" and truth_label == "keep",
+                    "included_in_metrics": truth_label in PRE_ASR_CUEQC_LABELS,
+                }
+            )
+    return result
 
 
 def _group_label_counts(y: np.ndarray, mask: np.ndarray, group_rows: list[Mapping[str, Any]]) -> list[dict[str, Any]]:
@@ -682,6 +775,7 @@ def train(
     group_count = int(scalar.shape[0])
     y_np = y.numpy()
     mask_np = chunk_mask.numpy()
+    excluded_training_label_count = _excluded_training_label_count(bundle, y_np)
     group_rows = [dict(item) for item in (bundle.get("groups") or []) if isinstance(item, Mapping)]
     train_label_mask, val_label_mask, split_summary = _split_label_masks(
         y=y_np,
@@ -980,13 +1074,28 @@ def train(
         "decision_mode": "argmax",
         "training_labels": list(PRE_ASR_CUEQC_LABELS),
         "excluded_training_labels": ["unsure"],
-        "excluded_training_label_count": int(np.sum((y_np == 2) & (mask_np > 0))),
+        "excluded_training_label_count": excluded_training_label_count,
         "train": classification_metrics(train_probs, train_y, train_durations),
         "val": classification_metrics(val_probs, val_y, val_durations),
         "all": classification_metrics(all_probs, all_y, all_durations),
     }
 
     output_dir.mkdir(parents=True, exist_ok=True)
+    prediction_rows = _prediction_rows(
+        bundle=bundle,
+        group_rows=group_rows,
+        y=y_np,
+        chunk_mask=mask_np,
+        train_mask=train_label_mask,
+        val_mask=val_label_mask,
+        probabilities=probs_all,
+    )
+    predictions_path = output_dir / "predictions.jsonl"
+    predictions_path.write_text(
+        "".join(json.dumps(row, ensure_ascii=False) + "\n" for row in prediction_rows),
+        encoding="utf-8",
+    )
+    metrics["predictions"] = repo_display_path(predictions_path)
     checkpoint_path = output_dir / default_checkpoint_name(selected_repo)
     checkpoint = {
         "schema": PRE_ASR_CUEQC_SCHEMA,
@@ -1028,9 +1137,7 @@ def train(
             "ignore_label": PRE_ASR_CUEQC_IGNORE_LABEL,
             "training_labels": list(PRE_ASR_CUEQC_LABELS),
             "excluded_training_labels": ["unsure"],
-            "excluded_training_label_count": int(
-                np.sum((y_np == 2) & (mask_np > 0))
-            ),
+            "excluded_training_label_count": excluded_training_label_count,
             "init_checkpoint": (
                 repo_display_path(init_checkpoint)
                 if init_checkpoint is not None

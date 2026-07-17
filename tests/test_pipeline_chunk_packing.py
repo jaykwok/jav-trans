@@ -256,6 +256,17 @@ class _FakeSequenceFeatureProvider:
         del start_s, end_s
         return [0.0] * len(self.chunk_pooled_ptm_feature_names(bins=bins))
 
+    def chunk_pooled_ptm_signature(
+        self,
+        *,
+        bins: int = PRE_ASR_CUEQC_PTM_BINS,
+    ) -> dict:
+        return {
+            "schema": CHUNK_POOLED_PTM_SCHEMA,
+            "bins": bins,
+            "feature_dim": len(self.chunk_pooled_ptm_feature_names(bins=bins)),
+        }
+
 
 def _reload_pipeline(monkeypatch, tmp_path: Path, *, enable_cueqc: bool = False):
     asr_backend = "jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame-hf"
