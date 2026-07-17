@@ -29,14 +29,14 @@ from boundary.runtime_pipeline import (
     SemanticBoundaryConfig,
     annotate_inner_edge_predictions,
     apply_paired_inner_edges_after_cueqc,
-    build_acoustic_split_v3_provisional_chunks,
+    build_acoustic_split_v4_provisional_chunks,
     build_semantic_boundary_chunks,
     effective_semantic_config,
     semantic_config_payload,
 )
 from boundary.split_model import (
-    SEMANTIC_SPLIT_V3_SCHEMA,
-    load_acoustic_split_v3_planner,
+    SEMANTIC_SPLIT_V4_SCHEMA,
+    load_acoustic_split_v4_planner,
     load_semantic_split_feature_config,
     load_semantic_split_verifier,
 )
@@ -51,6 +51,8 @@ from asr.backends.qwen import (
     DEFAULT_SEMANTIC_SPLIT_CHECKPOINT_BY_REPO,
     checkpoint_path_for_repo_env,
 )
+
+ACOUSTIC_SPLIT_SCHEMAS = {SEMANTIC_SPLIT_V4_SCHEMA}
 from asr.backends import registry as _registry_module
 from pipeline import memory_safety as _memory_safety_module
 
@@ -480,13 +482,13 @@ def _build_processing_spans(
     split_schema = str(split_checkpoint_payload.get("schema") or "")
     cueqc_ptm_projection_weight: np.ndarray | None = None
     cueqc_ptm_projection_digest = ""
-    if split_schema == SEMANTIC_SPLIT_V3_SCHEMA:
+    if split_schema in ACOUSTIC_SPLIT_SCHEMAS:
         projection_weight = (
             split_checkpoint_payload.get("model_state_dict") or {}
         ).get("ptm_projector.weight")
         if projection_weight is None:
             raise ValueError(
-                "Semantic Split v3 checkpoint is missing learned ptm_projector.weight"
+                "Semantic Split v4 checkpoint is missing learned ptm_projector.weight"
             )
         cueqc_ptm_projection_weight = np.ascontiguousarray(
             projection_weight.detach().cpu().float().numpy(), dtype=np.float32
@@ -501,7 +503,7 @@ def _build_processing_spans(
         cfg = {
             **cfg,
             "pre_asr_cueqc_feature_schema": _pre_asr_cueqc_module.PRE_ASR_CUEQC_FEATURE_SCHEMA,
-            "pre_asr_ptm_projection": "semantic_split_v3_checkpoint_linear_2048_to_128",
+            "pre_asr_ptm_projection": "semantic_split_v4_checkpoint_linear_2048_to_128",
             "pre_asr_ptm_projection_digest": cueqc_ptm_projection_digest,
         }
     del split_checkpoint_payload
@@ -511,14 +513,14 @@ def _build_processing_spans(
     restore_sequence_max_ptm_dims = os.environ.get(
         "BOUNDARY_FRAME_SEQUENCE_MAX_PTM_DIMS"
     )
-    if outer_schema == "outer_edge_refiner_v2" or split_schema == SEMANTIC_SPLIT_V3_SCHEMA:
+    if outer_schema == "outer_edge_refiner_v2" or split_schema in ACOUSTIC_SPLIT_SCHEMAS:
         os.environ["BOUNDARY_FRAME_SEQUENCE_MAX_PTM_DIMS"] = "2048"
     restore_sequence_projection = os.environ.get(
         "SPEECH_BOUNDARY_JA_SEQUENCE_PTM_PROJECTION"
     )
     split_projection_npz = (
         ""
-        if split_schema == SEMANTIC_SPLIT_V3_SCHEMA
+        if split_schema in ACOUSTIC_SPLIT_SCHEMAS
         else _split_checkpoint_projection_npz(split_checkpoint_path)
     )
     if split_projection_npz:
@@ -587,10 +589,10 @@ def _build_processing_spans(
             device=cfg["outer_edge_refiner_device"],
             expected_ptm_repo_id=_current_asr_backend(),
         )
-    if split_schema == SEMANTIC_SPLIT_V3_SCHEMA:
+    if split_schema in ACOUSTIC_SPLIT_SCHEMAS:
         if outer_schema != "outer_edge_refiner_v2":
-            raise ValueError("Acoustic Split v3 requires Outer Edge Refiner v2")
-        split_verifier = load_acoustic_split_v3_planner(
+            raise ValueError("Acoustic Split v4 requires Outer Edge Refiner v2")
+        split_verifier = load_acoustic_split_v4_planner(
             split_checkpoint_path,
             device=cfg["semantic_split_device"],
             expected_ptm_repo_id=_current_asr_backend(),
@@ -633,7 +635,7 @@ def _build_processing_spans(
         max_ptm_dims=(
             2048
             if outer_schema == "outer_edge_refiner_v2"
-            or split_schema == SEMANTIC_SPLIT_V3_SCHEMA
+            or split_schema in ACOUSTIC_SPLIT_SCHEMAS
             else None
         ),
     )
@@ -679,24 +681,24 @@ def _build_processing_spans(
     )
     resolved_semantic_config = (
         requested_semantic_config
-        if split_schema == SEMANTIC_SPLIT_V3_SCHEMA
+        if split_schema in ACOUSTIC_SPLIT_SCHEMAS
         else effective_semantic_config(split_verifier, requested_semantic_config)
     )
     runtime_boundary_signature = {
         **result_parameters,
         "boundary_pipeline": {
-            "version": 10 if split_schema == SEMANTIC_SPLIT_V3_SCHEMA else 9,
+            "version": 11 if split_schema == SEMANTIC_SPLIT_V4_SCHEMA else 9,
             "order": (
                 [
                     "speech_island_scorer",
                     "outer_edge_refiner_v2",
-                    "acoustic_split_v3",
+                    "acoustic_split_v4",
                     "provisional_subislands",
                     "pre_asr_cueqc_v13",
                     "inner_edge_refiner_v1",
                     "chunk_extraction",
                 ]
-                if split_schema == SEMANTIC_SPLIT_V3_SCHEMA
+                if split_schema in ACOUSTIC_SPLIT_SCHEMAS
                 else [
                     "speech_island_scorer",
                     "outer_edge_refiner",
@@ -717,7 +719,7 @@ def _build_processing_spans(
             "sequence_feature_provider": sequence_feature_provider.signature(),
             "semantic_boundary_config": (
                 {"decision_mode": "argmax_cut"}
-                if split_schema == SEMANTIC_SPLIT_V3_SCHEMA
+                if split_schema in ACOUSTIC_SPLIT_SCHEMAS
                 else semantic_config_payload(resolved_semantic_config)
             ),
         },
@@ -747,8 +749,8 @@ def _build_processing_spans(
     split_audit_records: list[dict] | None = (
         [] if os.getenv("SEMANTIC_SPLIT_FEATURE_EXPORT_PATH", "").strip() else None
     )
-    if split_schema == SEMANTIC_SPLIT_V3_SCHEMA:
-        packed = build_acoustic_split_v3_provisional_chunks(
+    if split_schema in ACOUSTIC_SPLIT_SCHEMAS:
+        packed = build_acoustic_split_v4_provisional_chunks(
             segments,
             duration_s=result.audio_duration_sec,
             speech_probabilities=frame_scores,
@@ -1086,7 +1088,7 @@ def _annotate_pre_asr_ptm_pooling_on_packed_chunks(
     if not spans or not all(isinstance(span, PackedChunk) for span in spans):
         return spans
     use_learned_projection = all(
-        int(getattr(span, "boundary_pipeline_version", 0) or 0) == 10
+        int(getattr(span, "boundary_pipeline_version", 0) or 0) == 11
         for span in spans
     )
     if use_learned_projection:
@@ -1208,9 +1210,6 @@ def _apply_pre_asr_cueqc(
     keep_count = sum(
         1 for decision in decisions if decision.get("route") == "keep_for_asr"
     )
-    unsure_count = sum(
-        1 for decision in decisions if decision.get("route") == "unsure_for_asr"
-    )
     drop_count = len(drop_indexes)
     confidences = sorted(
         float(decision.get("confidence"))
@@ -1234,7 +1233,6 @@ def _apply_pre_asr_cueqc(
             "candidate_count": len(spans),
             "drop_count": drop_count,
             "keep_count": keep_count,
-            "unsure_count": unsure_count,
             **confidence_stats,
             "model": model.signature(),
             "decisions": decisions,
@@ -1244,7 +1242,7 @@ def _apply_pre_asr_cueqc(
     _progress(
         (
             "Pre-ASR CueQC route done candidates={candidates} decisions={decisions} "
-            "keep_for_asr={keep} unsure_for_asr={unsure} drop_before_asr={drop} pass_to_asr={pass_to_asr} "
+            "keep_for_asr={keep} drop_before_asr={drop} pass_to_asr={pass_to_asr} "
             "confidence_min={confidence_min} confidence_p10={confidence_p10} "
             "confidence_p50={confidence_p50} confidence_mean={confidence_mean} "
             "elapsed={elapsed:.2f}s"
@@ -1252,7 +1250,6 @@ def _apply_pre_asr_cueqc(
             candidates=len(spans),
             decisions=len(decisions),
             keep=keep_count,
-            unsure=unsure_count,
             drop=drop_count,
             pass_to_asr=len(kept),
             confidence_min=confidence_stats.get("confidence_min", ""),
@@ -1488,9 +1485,9 @@ def _annotate_packed_chunks(
                 safety=packed.refiner_safety_action,
             )
         )
-        if packed.boundary_pipeline_version == 10:
+        if packed.boundary_pipeline_version == 11:
             log.append(
-                "[boundary-v10] idx={idx} events={events} inner={inner} "
+                "[boundary-v11] idx={idx} events={events} inner={inner} "
                 "removed_gap_s={gap:.3f} acoustic=({astart:.3f},{aend:.3f}) "
                 "display=({dstart:.3f},{dend:.3f})".format(
                     idx=idx,
@@ -1795,7 +1792,7 @@ def _transcribe_and_align_local(
             chunk_spans
             and all(isinstance(span, PackedChunk) for span in chunk_spans)
             and any(
-                span.boundary_pipeline_version == 10
+                span.boundary_pipeline_version == 11
                 for span in chunk_spans
                 if isinstance(span, PackedChunk)
             )

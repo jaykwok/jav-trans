@@ -26,7 +26,7 @@ from boundary.sequence_features import (
 
 PRE_ASR_CUEQC_SCHEMA = "cueqc_pre_asr_semantic_chunk_v13"
 PRE_ASR_CUEQC_MODEL_ARCH = "cueqc_pre_asr_semantic_chunk_v13"
-PRE_ASR_CUEQC_DECISION_VERSION = "pre_asr_cueqc_v13_argmax_v1"
+PRE_ASR_CUEQC_DECISION_VERSION = "pre_asr_cueqc_v13_binary_argmax_v2"
 PRE_ASR_CUEQC_FEATURE_SCHEMA = "pre_asr_cueqc_features_v10"
 PRE_ASR_CUEQC_RUNTIME_ADAPTER = "pre_asr_provisional_subisland_sequence_v5"
 PRE_ASR_CUEQC_ARTIFACT = {
@@ -34,9 +34,9 @@ PRE_ASR_CUEQC_ARTIFACT = {
     "display_name": "Pre-ASR CueQC",
     "version": "v13",
     "pipeline_stage": 5,
-    "pipeline_role": "provisional_subisland_keep_drop_unsure_routing",
+    "pipeline_role": "provisional_subisland_keep_drop_argmax_routing",
 }
-PRE_ASR_CUEQC_LABELS = ("drop", "keep", "unsure")
+PRE_ASR_CUEQC_LABELS = ("drop", "keep")
 PRE_ASR_CUEQC_LABEL_TO_INDEX = {
     label: index for index, label in enumerate(PRE_ASR_CUEQC_LABELS)
 }
@@ -553,7 +553,7 @@ def _pooled_ptm_values(
     )
     allowed_schemas = (
         {CHUNK_LEARNED_PROJECTED_PTM_SCHEMA}
-        if boundary_pipeline_version == 10
+        if boundary_pipeline_version == 11
         else {
             CHUNK_POOLED_PTM_SCHEMA,
             CHUNK_PROJECTED_PTM_SCHEMA,
@@ -645,12 +645,12 @@ def candidate_from_span(
     )
     feature_schema = (
         PRE_ASR_CUEQC_FEATURE_SCHEMA
-        if boundary_pipeline_version == 10
+        if boundary_pipeline_version == 11
         else PRE_ASR_CUEQC_LEGACY_FEATURE_SCHEMA
     )
     runtime_adapter = (
         PRE_ASR_CUEQC_RUNTIME_ADAPTER
-        if boundary_pipeline_version == 10
+        if boundary_pipeline_version == 11
         else PRE_ASR_CUEQC_LEGACY_RUNTIME_ADAPTER
     )
     start = _safe_float(_packed_value(span, "start"))
@@ -1384,6 +1384,15 @@ class PreAsrCueQC:
         self.path = path
         self.sha256 = _file_sha256(path)
         self.metadata = metadata
+        if contract["schema"] == PRE_ASR_CUEQC_SCHEMA:
+            if tuple(metadata.get("training_labels") or ()) != PRE_ASR_CUEQC_LABELS:
+                raise ValueError("Pre-ASR CueQC v13 training_labels must be drop/keep")
+            if tuple(metadata.get("excluded_training_labels") or ()) != ("unsure",):
+                raise ValueError("Pre-ASR CueQC v13 must exclude unsure from training")
+            if "excluded_training_label_count" not in metadata:
+                raise ValueError(
+                    "Pre-ASR CueQC v13 metadata.excluded_training_label_count is required"
+                )
         self.config = config
         self.contract = contract
         self.scalar_feature_names = feature_names
@@ -1398,11 +1407,13 @@ class PreAsrCueQC:
         if self.mean.shape[0] != len(feature_names) or self.std.shape[0] != len(feature_names):
             raise ValueError("Pre-ASR CueQC scalar normalization shape mismatch")
         decision = dict(checkpoint.get("decision_config") or {})
-        self.decision_mode = str(
-            decision.get("decision_mode")
-            or ("drop_threshold" if config["num_classes"] == 2 else "argmax")
+        default_decision_mode = (
+            "argmax"
+            if contract["schema"] == PRE_ASR_CUEQC_SCHEMA
+            else "drop_threshold"
         )
-        if config["num_classes"] == 3 and self.decision_mode != "argmax":
+        self.decision_mode = str(decision.get("decision_mode") or default_decision_mode)
+        if contract["schema"] == PRE_ASR_CUEQC_SCHEMA and self.decision_mode != "argmax":
             raise ValueError("Pre-ASR CueQC v13 decision_mode must be argmax")
         self.drop_threshold = float(
             decision.get("drop_threshold", PRE_ASR_CUEQC_DEFAULT_DROP_THRESHOLD)
@@ -1436,7 +1447,7 @@ class PreAsrCueQC:
             "feature_names": list(self.scalar_feature_names),
             "metadata": self.metadata,
         }
-        if self.config["num_classes"] == 2:
+        if self.decision_mode == "drop_threshold":
             signature["drop_threshold"] = self.drop_threshold
         return signature
 
@@ -1557,8 +1568,7 @@ class PreAsrCueQC:
             prob = probs[group_index, chunk_index]
             p_drop = float(prob[0])
             p_keep = float(prob[1])
-            if self.config["num_classes"] == 3:
-                p_unsure = float(prob[2])
+            if self.decision_mode == "argmax":
                 label_index = int(np.argmax(prob))
                 label = PRE_ASR_CUEQC_LABELS[label_index]
                 decisions.append(
@@ -1574,14 +1584,11 @@ class PreAsrCueQC:
                             "drop_before_asr"
                             if label == "drop"
                             else "keep_for_asr"
-                            if label == "keep"
-                            else "unsure_for_asr"
                         ),
                         "label": label,
                         "confidence": round(float(prob[label_index]), 4),
                         "prob_drop": round(p_drop, 4),
                         "prob_keep": round(p_keep, 4),
-                        "prob_unsure": round(p_unsure, 4),
                         "decision_mode": "argmax",
                         "reason": f"model_argmax_{label}",
                     }
@@ -1665,7 +1672,7 @@ def runtime_signature() -> dict[str, Any]:
         "runtime_adapter": contract["runtime_adapter"],
         "model_path": checkpoint,
     }
-    if contract["num_classes"] == 2:
+    if contract["schema"] == PRE_ASR_CUEQC_LEGACY_SCHEMA:
         signature["drop_threshold"] = os.getenv("PRE_ASR_CUEQC_DROP_THRESHOLD", "")
     else:
         signature["decision_mode"] = "argmax"
@@ -1695,7 +1702,7 @@ def load_active(*, expected_asr_repo_id: str | None = None) -> PreAsrCueQC:
     path = _checkpoint_path(expected_asr_repo_id)
     device = os.getenv("PRE_ASR_CUEQC_DEVICE", "auto").strip() or "auto"
     model = load_checkpoint(path, expected_asr_repo_id=expected_asr_repo_id, device=device)
-    if model.config["num_classes"] == 2:
+    if model.contract["schema"] == PRE_ASR_CUEQC_LEGACY_SCHEMA:
         model.drop_threshold = _drop_threshold_from_env(model.drop_threshold)
     split_sha = str(model.metadata.get("semantic_split_weights_sha256") or "")
     if not split_sha:
@@ -1707,7 +1714,7 @@ def load_active(*, expected_asr_repo_id: str | None = None) -> PreAsrCueQC:
             "Pre-ASR CueQC split checkpoint sha mismatch: "
             f"checkpoint expects {split_sha}, active split {split_path} is {active_sha}"
         )
-    if model.config["num_classes"] == 3:
+    if model.contract["schema"] == PRE_ASR_CUEQC_SCHEMA:
         inner_sha = str(model.metadata.get("inner_edge_refiner_weights_sha256") or "")
         if not inner_sha:
             raise ValueError(

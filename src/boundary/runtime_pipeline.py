@@ -18,7 +18,7 @@ from boundary.sequence_features import (
     ptm_projection_digest,
 )
 from boundary.split_model import (
-    AcousticSplitV3Planner,
+    AcousticSplitV4Planner,
     SemanticSplitIslandVerifier,
     SplitDecision,
     aggregate_cut_event_runs,
@@ -115,17 +115,22 @@ def semantic_config_payload(config: SemanticBoundaryConfig) -> dict[str, float |
     }
 
 
-def build_acoustic_split_v3_provisional_chunks(
+def build_acoustic_split_v4_provisional_chunks(
     segments: Sequence[SpeechSegment],
     *,
     duration_s: float,
     speech_probabilities: Sequence[float],
     feature_provider: FrameSequenceFeatureProvider,
     outer_refiner: OuterEdgeRefinerV2,
-    split_planner: AcousticSplitV3Planner,
+    split_planner: AcousticSplitV4Planner,
     on_stage: Callable[[str], None] | None = None,
 ) -> list[PackedChunk]:
     """Build provisional sub-islands without timing thresholds or Cut v1."""
+
+    split_signature = split_planner.signature()
+    split_source = "acoustic_split_v4"
+    split_adapter = str(split_signature.get("runtime_adapter") or "")
+    pipeline_version = 11
 
     speech = np.asarray(speech_probabilities, dtype=np.float32)
     if on_stage is not None:
@@ -249,7 +254,7 @@ def build_acoustic_split_v3_provisional_chunks(
                     end=float(end),
                     duration=float(end - start),
                     speech_segments=[piece],
-                    split_reason="acoustic_split_v3" if events else "speech_core",
+                    split_reason=split_source if events else "speech_core",
                     source_abs_start=float(start),
                     source_abs_end=float(end),
                     parent_chunk_id=island_index,
@@ -277,7 +282,7 @@ def build_acoustic_split_v3_provisional_chunks(
                     display_start=float(start),
                     display_end=float(end),
                     display_duration=float(end - start),
-                    boundary_pipeline_version=10,
+                    boundary_pipeline_version=pipeline_version,
                     semantic_event_ids=[row["event_id"] for row in adjacent],
                     semantic_event_probabilities=[
                         {
@@ -288,10 +293,10 @@ def build_acoustic_split_v3_provisional_chunks(
                         for row in adjacent
                     ],
                     boundary_source=(
-                        "acoustic_split_v3" if adjacent else "outer_edge_refiner_v2"
+                        split_source if adjacent else "outer_edge_refiner_v2"
                     ),
                     boundary_decision_source=(
-                        "acoustic_candidate_event_runs_v1"
+                        split_adapter
                         if adjacent
                         else "outer_edge_refiner_v2"
                     ),

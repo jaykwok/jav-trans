@@ -15,7 +15,7 @@ for root in (PROJECT_ROOT, PROJECT_ROOT / "src"):
         sys.path.insert(0, str(root))
 
 from asr.backends.qwen import QWEN_ASR_17B_REPO_ID, qwen_asr_repo_tag  # noqa: E402
-from asr.pre_asr_cueqc import PRE_ASR_CUEQC_ARTIFACT  # noqa: E402
+from asr.pre_asr_cueqc import PRE_ASR_CUEQC_LEGACY_ARTIFACT  # noqa: E402
 from tools.workflows.promote_torch_checkpoint import promote_checkpoint  # noqa: E402
 
 SUMMARY_SCHEMA = "pre_asr_cueqc_v12_audit_gated_promotion_summary_v1"
@@ -250,11 +250,11 @@ def promote_after_audit(
     payload = promote_checkpoint(
         input_path=candidate_checkpoint,
         output_path=output_checkpoint,
-        artifact_name=str(PRE_ASR_CUEQC_ARTIFACT["name"]),
-        display_name=str(PRE_ASR_CUEQC_ARTIFACT["display_name"]),
-        version=str(PRE_ASR_CUEQC_ARTIFACT["version"]),
-        pipeline_stage=int(PRE_ASR_CUEQC_ARTIFACT["pipeline_stage"]),
-        pipeline_role=str(PRE_ASR_CUEQC_ARTIFACT["pipeline_role"]),
+        artifact_name=str(PRE_ASR_CUEQC_LEGACY_ARTIFACT["name"]),
+        display_name=str(PRE_ASR_CUEQC_LEGACY_ARTIFACT["display_name"]),
+        version=str(PRE_ASR_CUEQC_LEGACY_ARTIFACT["version"]),
+        pipeline_stage=int(PRE_ASR_CUEQC_LEGACY_ARTIFACT["pipeline_stage"]),
+        pipeline_role=str(PRE_ASR_CUEQC_LEGACY_ARTIFACT["pipeline_role"]),
         source_training_run=source_training_run,
         selected_validation=selected_validation,
         drop_threshold=threshold,

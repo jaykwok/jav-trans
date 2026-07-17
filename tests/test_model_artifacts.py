@@ -77,3 +77,24 @@ def test_promoted_five_model_artifact_contract(
     assert artifact["promoted"] is True
     assert artifact["self_contained"] is True
     assert metadata[repo_metadata_key] == repo_id
+
+
+def test_split_v4_candidate_is_binary_argmax_and_excludes_unsure() -> None:
+    torch = pytest.importorskip("torch")
+    path = Path(
+        "src/checkpoints/jaykwok-Qwen3-ASR-1.7B-JA-Anime-Galgame-hf/"
+        "semantic_split_model_v4.jaykwok-Qwen3-ASR-1.7B-JA-Anime-Galgame-hf.pt"
+    )
+    payload = torch.load(path, map_location="cpu", weights_only=False)
+    assert payload["schema"] == "semantic_split_model_v4"
+    assert payload["model_config"]["aux_label_dim"] == 2
+    assert payload["decision_config"] == {"decision_mode": "binary_argmax_cut"}
+    assert payload["metadata"]["training_labels"] == ["cut", "continue"]
+    assert payload["metadata"]["excluded_training_labels"] == ["unsure"]
+    assert payload["metadata"]["excluded_training_label_count"] == 27388
+    assert payload["metadata"]["manual_label_overrides"]["override_count"] == 33
+    assert payload["metadata"]["manual_label_overrides"]["training_label_counts"] == {
+        "cut": 8,
+        "continue": 1,
+        "ignore": 24,
+    }

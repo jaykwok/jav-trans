@@ -18,10 +18,13 @@ from boundary.sequence_features import (
 )
 from tools.asr.cueqc.pre_asr_feature_compiler import compile_features
 from tools.asr.cueqc.pre_asr_binary_trainer import (
+    _apply_forced_group_splits,
     _boost_anchor_positions,
     _matching_candidate_positions,
+    _predict_logits_windowed,
     _split_label_masks,
     _window_batch_from_anchors,
+    classification_metrics,
 )
 
 
@@ -51,7 +54,7 @@ def _pre_asr_candidate(index: int, *, video_id: str = "AAA", cluster_id: str = "
                 "end": float(index) + 0.5,
                 "scorer_speech_mean": 0.8,
                 "scorer_split_p90": 0.2,
-                "boundary_pipeline_version": 10,
+                "boundary_pipeline_version": 11,
                 **_ptm_pooling_fields(),
             }
         ],
@@ -106,7 +109,7 @@ def test_pre_asr_cueqc_candidate_uses_numeric_chunk_features_only():
             "asr_confidence": 0.1,
             "scorer_speech_mean": 0.8,
             "scorer_split_p90": 0.2,
-            "boundary_pipeline_version": 10,
+            "boundary_pipeline_version": 11,
         }
     ]
 
@@ -129,7 +132,7 @@ def test_pre_asr_cueqc_candidate_includes_micro_numeric_features():
             speech_segments=[SpeechSegment(0.0, 0.5)],
             duration=0.5,
             split_reason="unit",
-            boundary_pipeline_version=10,
+            boundary_pipeline_version=11,
             subtitle_min_duration_s=20.0 / 24.0,
             below_subtitle_min_duration=True,
             micro_chunk_candidate=True,
@@ -165,7 +168,7 @@ def test_pre_asr_cueqc_v10_preserves_split_edge_soft_features():
             speech_segments=[SpeechSegment(0.0, 0.6)],
             duration=0.6,
             split_reason="semantic_split_model",
-            boundary_pipeline_version=10,
+            boundary_pipeline_version=11,
             primary_cut_candidates=[
                 {
                     "kind": "primary",
@@ -289,13 +292,13 @@ def test_pre_asr_cueqc_v13_model_forward_backward_ignores_padding():
 
     logits = model(ptm_bins, scalar, chunk_mask=chunk_mask, bin_mask=bin_mask)
     loss = torch.nn.functional.cross_entropy(
-        logits.reshape(-1, 3),
+        logits.reshape(-1, 2),
         labels.reshape(-1),
         ignore_index=pre_asr_cueqc.PRE_ASR_CUEQC_IGNORE_LABEL,
     )
     loss.backward()
 
-    assert logits.shape == (1, 3, 3)
+    assert logits.shape == (1, 3, 2)
     assert torch.isfinite(loss)
 
 
@@ -320,7 +323,7 @@ def test_pre_asr_cueqc_local_only_mode_and_legacy_default():
 
     logits = model(ptm_bins, scalar, chunk_mask=mask)
 
-    assert logits.shape == (1, 2, 3)
+    assert logits.shape == (1, 2, 2)
     assert torch.count_nonzero(logits[:, 1]).item() == 0
 
 
@@ -344,7 +347,7 @@ def _tiny_v13_checkpoint(
         temporal_layers=1,
         temporal_residual_scale=0.0,
         dropout=0.0,
-        num_classes=3,
+        num_classes=2,
     )
     payload = {
         "schema": pre_asr_cueqc.PRE_ASR_CUEQC_SCHEMA,
@@ -359,7 +362,7 @@ def _tiny_v13_checkpoint(
             "temporal_layers": 1,
             "temporal_residual_scale": 0.0,
             "dropout": 0.0,
-            "num_classes": 3,
+            "num_classes": 2,
         },
         "feature_mean": [0.0] * len(feature_names),
         "feature_std": [1.0] * len(feature_names),
@@ -375,6 +378,9 @@ def _tiny_v13_checkpoint(
             "asr_repo_id": "jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame-hf",
             "semantic_split_weights_sha256": split_sha,
             "inner_edge_refiner_weights_sha256": inner_sha,
+            "training_labels": ["drop", "keep"],
+            "excluded_training_labels": ["unsure"],
+            "excluded_training_label_count": 0,
         },
         "model_state_dict": model.state_dict(),
     }
@@ -643,6 +649,58 @@ def test_compile_pre_asr_cueqc_features_reads_jsonl_chunk_candidates(tmp_path: P
     )
 
 
+def test_compile_pre_asr_cueqc_preserves_selected_teacher_unsure_only(
+    tmp_path: Path,
+) -> None:
+    torch = pytest.importorskip("torch")
+    included = tmp_path / "included.jsonl"
+    excluded = tmp_path / "excluded.jsonl"
+    labels = tmp_path / "labels.jsonl"
+    output = tmp_path / "features.pt"
+    included.write_text(
+        "\n".join(
+            json.dumps(row, ensure_ascii=False)
+            for row in [
+                _pre_asr_candidate(0, video_id="AAA"),
+                _pre_asr_candidate(1, video_id="AAA"),
+            ]
+        )
+        + "\n",
+        "utf-8",
+    )
+    excluded.write_text(
+        json.dumps(_pre_asr_candidate(0, video_id="BBB"), ensure_ascii=False) + "\n",
+        "utf-8",
+    )
+    labels.write_text(
+        "\n".join(
+            [
+                json.dumps({"sample_id": "preasr-AAA-chunk00000", "label": "keep"}),
+                json.dumps({"sample_id": "preasr-AAA-chunk00001", "label": "unsure"}),
+                json.dumps({"sample_id": "preasr-BBB-chunk00000", "label": "unsure"}),
+            ]
+        )
+        + "\n",
+        "utf-8",
+    )
+
+    summary = compile_features(
+        chunk_paths=[str(included), str(excluded)],
+        label_paths=[str(labels)],
+        output=output,
+        asr_repo_id="jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame-hf",
+    )
+    bundle = torch.load(output, map_location="cpu", weights_only=False)
+
+    assert summary["chunk_count"] == 1
+    assert summary["teacher_unsure_ignored"] == 1
+    assert summary["ambiguous_ignore"] == 0
+    unsure_row = next(row for row in bundle["rows"] if row["teacher_label"] == "unsure")
+    assert unsure_row["label"] == "teacher_unsure_ignored"
+    assert unsure_row["training_ignore_reason"] == "teacher_unsure"
+    assert bundle["teacher_unsure_ignored"] == 1
+
+
 def test_compile_pre_asr_cueqc_features_expands_source_windows_manifest(tmp_path: Path):
     torch = pytest.importorskip("torch")
     manifest = tmp_path / "source_windows.jsonl"
@@ -901,6 +959,99 @@ def test_pre_asr_training_chunk_stratified_split_samples_both_films():
     assert not np.any(train_mask & val_mask)
 
 
+def test_pre_asr_training_role_holdout_keeps_val_and_test_out_of_train():
+    y = np.asarray([[0, 1, 2], [0, 1, 2], [0, 1, 2]], dtype=np.int64)
+    chunk_mask = np.ones_like(y, dtype=np.float32)
+
+    train_mask, val_mask, summary = _split_label_masks(
+        y=y,
+        chunk_mask=chunk_mask,
+        group_rows=[
+            {"audio_id": "train", "dataset_role": "train"},
+            {"audio_id": "val", "dataset_role": "val"},
+            {"audio_id": "test", "dataset_role": "test"},
+        ],
+        split_mode="role_holdout",
+        val_ratio=0.15,
+        rng=np.random.default_rng(17),
+    )
+
+    assert np.array_equal(train_mask[0], [True, True, False])
+    assert not np.any(train_mask[1:])
+    assert not np.any(val_mask[0])
+    assert np.array_equal(val_mask[1:], [[True, True, False], [True, True, False]])
+    assert summary["train_counts"]["excluded_unsure"] == 0
+    assert summary["val_counts"]["excluded_unsure"] == 0
+    assert summary["all_counts"]["excluded_unsure"] == 3
+
+
+def test_pre_asr_forced_group_splits_never_restore_teacher_unsure() -> None:
+    y = np.asarray([[0, 1, 2, -100], [0, 1, 2, -100]], dtype=np.int64)
+    chunk_mask = np.ones_like(y, dtype=np.float32)
+    train = np.asarray(
+        [[False, False, False, False], [True, True, False, False]],
+        dtype=bool,
+    )
+    val = np.asarray(
+        [[True, True, False, False], [False, False, False, False]],
+        dtype=bool,
+    )
+
+    _apply_forced_group_splits(
+        train=train,
+        val=val,
+        y=y,
+        chunk_mask=chunk_mask,
+        force_train_groups={0},
+        force_val_groups={1},
+    )
+
+    assert np.array_equal(train, [[True, True, False, False], [False, False, False, False]])
+    assert np.array_equal(val, [[False, False, False, False], [True, True, False, False]])
+
+
+def test_pre_asr_v13_metrics_exclude_teacher_unsure() -> None:
+    probs = np.asarray(
+        [
+            [0.8, 0.2],
+            [0.1, 0.9],
+            [0.1, 0.9],
+            [0.6, 0.4],
+        ],
+        dtype=np.float32,
+    )
+    labels = np.asarray([0, 1, 2, 1], dtype=np.int64)
+    durations = np.ones((4,), dtype=np.float32)
+
+    metrics = classification_metrics(probs, labels, durations)
+
+    assert metrics["drop_recall"] == 1.0
+    assert metrics["semantic_keep_recall"] == 0.5
+    assert metrics["false_drop_count"] == 1.0
+
+
+def test_pre_asr_v13_windowed_prediction_is_binary() -> None:
+    torch = pytest.importorskip("torch")
+
+    class BinaryModel:
+        def __call__(self, ptm_bins, scalar, *, chunk_mask, bin_mask):
+            del scalar, chunk_mask, bin_mask
+            batch, chunks = ptm_bins.shape[:2]
+            return torch.ones((batch, chunks, 2), dtype=torch.float32)
+
+    logits = _predict_logits_windowed(
+        model=BinaryModel(),
+        ptm_bins=torch.zeros((1, 5, 10, 128), dtype=torch.float32),
+        scalar=torch.zeros((1, 5, 140), dtype=torch.float32),
+        chunk_mask=torch.ones((1, 5), dtype=torch.float32),
+        bin_mask=torch.ones((1, 5, 10), dtype=torch.float32),
+        sequence_window_size=2,
+    )
+
+    assert logits.shape == (1, 5, 2)
+    assert torch.all(logits == 1.0)
+
+
 def test_sequence_tensor_contract_rejects_unassigned_candidates(monkeypatch):
     monkeypatch.setattr(pre_asr_cueqc, "planned_island_sequences", lambda _rows: [])
     with pytest.raises(RuntimeError, match="left candidates unassigned"):
@@ -1078,5 +1229,5 @@ def test_pre_asr_token_attention_auxiliary_is_padding_invariant():
             padded_bin_mask,
         )[:, :3]
 
-    assert auxiliary["semantic_logits"].shape == (2, 3, 3)
+    assert auxiliary["semantic_logits"].shape == (2, 3, 2)
     assert torch.allclose(trimmed, padded, atol=1e-5, rtol=1e-5)

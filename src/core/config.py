@@ -108,7 +108,7 @@ DEFAULT_SETTINGS: dict[str, str] = {
     "ASR_REPETITION_PENALTY": "1.05",
 
     # --- Semantic boundary pipeline / ASR Chunking ---
-    # 1.7B: Outer v2 -> Acoustic Split v3 -> CueQC v13 -> Inner v1.
+    # 1.7B: Outer v2 -> Acoustic Split v4 binary -> CueQC v13 binary -> Inner v1.
     # 0.6B remains on the legacy Split v2 / Cut v1 chain.
     # This is a feature-score grid fallback, not the source video frame rate.
     "BOUNDARY_FEATURE_FRAME_HOP_S": "0.02",

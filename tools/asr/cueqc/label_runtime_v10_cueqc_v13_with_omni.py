@@ -161,6 +161,33 @@ def _retry(callable_, *, attempts: int = 6):
     raise AssertionError("unreachable")
 
 
+def _multi_audio_unsupported(exc: Exception) -> bool:
+    message = str(exc).lower()
+    return any(
+        token in message
+        for token in (
+            "multiple audio inputs are not supported",
+            "multiple input_audio",
+            "only one audio",
+            "at most one audio",
+            "single audio only",
+            "does not support multiple audio",
+        )
+    )
+
+
+def _moderation_rejected(exc: Exception) -> bool:
+    message = str(exc).lower()
+    return any(
+        token in message
+        for token in (
+            "data_inspection_failed",
+            "inappropriate content",
+            "content moderation",
+        )
+    )
+
+
 def _reference_context(
     row: dict[str, Any], source: dict[str, Any] | None
 ) -> str:
@@ -274,7 +301,8 @@ def run(args: argparse.Namespace) -> None:
                 responses.update(batch_responses)
                 _append(raw_path, {"schema": "cueqc_v13_omni_batch_raw_v1", **raw})
             except Exception as exc:
-                if not is_empty_audio_api_error(exc):
+                disable_batch_mode = _multi_audio_unsupported(exc)
+                if disable_batch_mode:
                     batch_mode = False
                 _append(
                     raw_path,
@@ -282,6 +310,7 @@ def run(args: argparse.Namespace) -> None:
                         "schema": "cueqc_v13_omni_batch_fallback_v1",
                         "error": str(exc),
                         "fallback": "single_audio_requests",
+                        "batch_mode_disabled": disable_batch_mode,
                     },
                 )
         for item_id, clip, reference in clips:
@@ -303,17 +332,28 @@ def run(args: argparse.Namespace) -> None:
                     )
                 )
             except Exception as exc:
-                if not is_empty_audio_api_error(exc):
+                if _moderation_rejected(exc):
+                    parsed = {
+                        "label": "unsure",
+                        "confidence": 1.0,
+                        "flags": ["moderation_rejected"],
+                    }
+                    raw = {
+                        "error": str(exc),
+                        "local_route": "moderation_rejection_to_unsure",
+                    }
+                elif not is_empty_audio_api_error(exc):
                     raise
-                parsed = {
-                    "label": "drop",
-                    "confidence": 1.0,
-                    "flags": ["empty_audio"],
-                }
-                raw = {
-                    "error": str(exc),
-                    "local_route": "empty_audio_to_drop",
-                }
+                else:
+                    parsed = {
+                        "label": "drop",
+                        "confidence": 1.0,
+                        "flags": ["empty_audio"],
+                    }
+                    raw = {
+                        "error": str(exc),
+                        "local_route": "empty_audio_to_drop",
+                    }
             responses[item_id] = parsed
             _append(
                 raw_path,

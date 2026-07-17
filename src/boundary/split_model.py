@@ -17,17 +17,18 @@ SEMANTIC_SPLIT_FEATURE_SCHEMA = "semantic_split_candidate_features_v1"
 SEMANTIC_SPLIT_V2_SCHEMA = "semantic_split_verifier_v2"
 SEMANTIC_SPLIT_V2_MODEL_ARCH = "island_candidate_sequence_v1"
 SEMANTIC_SPLIT_V2_RUNTIME_ADAPTER = "island_candidate_sequence_cut_v1"
-SEMANTIC_SPLIT_V3_SCHEMA = "semantic_split_model_v3"
-SEMANTIC_SPLIT_V3_MODEL_ARCH = "acoustic_candidate_sequence_mamba_v1"
-SEMANTIC_SPLIT_V3_RUNTIME_ADAPTER = "acoustic_candidate_event_runs_v1"
-SEMANTIC_SPLIT_V3_ARTIFACT = {
+SEMANTIC_SPLIT_V4_SCHEMA = "semantic_split_model_v4"
+SEMANTIC_SPLIT_V4_MODEL_ARCH = "acoustic_candidate_sequence_mamba_binary_v1"
+SEMANTIC_SPLIT_V4_RUNTIME_ADAPTER = "acoustic_candidate_binary_event_runs_v2"
+SEMANTIC_SPLIT_V4_ARTIFACT = {
     "name": "semantic_split_model",
     "display_name": "Acoustic Split Model",
-    "version": "v3",
+    "version": "v4",
     "pipeline_stage": 3,
-    "pipeline_role": "acoustic_boundary_event_planner",
+    "pipeline_role": "acoustic_binary_boundary_event_planner",
 }
-SEMANTIC_SPLIT_V3_DECISION = {"decision_mode": "argmax_cut"}
+SEMANTIC_SPLIT_V4_DECISION = {"decision_mode": "binary_argmax_cut"}
+SEMANTIC_SPLIT_TRAINING_LABELS = ("cut", "continue")
 SEMANTIC_SPLIT_STRUCTURAL_ROLES = (
     "none",
     "speech_to_speech",
@@ -115,8 +116,8 @@ class IslandCandidateSequenceNetwork:
             )
         if ptm_input_dim and ptm_input_dim < ptm_projected_dim:
             raise ValueError("ptm_input_dim must be >= ptm_projected_dim")
-        if aux_label_dim != len(SEMANTIC_SPLIT_LABELS):
-            raise ValueError("island split network requires aux_label_dim=3")
+        if aux_label_dim not in (2, len(SEMANTIC_SPLIT_LABELS)):
+            raise ValueError("island split network requires aux_label_dim=2 or 3")
         if structural_role_dim != len(SEMANTIC_SPLIT_STRUCTURAL_ROLES):
             raise ValueError("island split network requires structural_role_dim=4")
         if omni_aux_dim != len(SEMANTIC_SPLIT_OMNI_AUX_NAMES):
@@ -442,8 +443,8 @@ class SemanticSplitIslandVerifier:
 
 
 @dataclass(frozen=True)
-class AcousticSplitV3Planner:
-    """v3 acoustic planner using direct cut/continue/unsure argmax labels."""
+class AcousticSplitV4Planner:
+    """v4 acoustic planner using binary cut/continue argmax only."""
 
     path: str
     sha256: str
@@ -456,13 +457,13 @@ class AcousticSplitV3Planner:
 
     @property
     def decision_config(self) -> dict[str, str]:
-        return dict(SEMANTIC_SPLIT_V3_DECISION)
+        return dict(SEMANTIC_SPLIT_V4_DECISION)
 
     def signature(self) -> dict[str, Any]:
         return {
-            "schema": SEMANTIC_SPLIT_V3_SCHEMA,
-            "model_arch": SEMANTIC_SPLIT_V3_MODEL_ARCH,
-            "runtime_adapter": SEMANTIC_SPLIT_V3_RUNTIME_ADAPTER,
+            "schema": SEMANTIC_SPLIT_V4_SCHEMA,
+            "model_arch": SEMANTIC_SPLIT_V4_MODEL_ARCH,
+            "runtime_adapter": SEMANTIC_SPLIT_V4_RUNTIME_ADAPTER,
             "path": self.path,
             "sha256": self.sha256,
             "model_config": self.model_config,
@@ -521,6 +522,8 @@ class AcousticSplitV3Planner:
             probabilities = (
                 torch.softmax(outputs["label"], dim=-1).detach().cpu().numpy()
             )
+        if probabilities.shape[-1] != len(SEMANTIC_SPLIT_TRAINING_LABELS):
+            raise RuntimeError("Acoustic Split v4 model emitted a non-binary output head")
         decisions: list[list[SplitDecision]] = []
         for island_index, count in enumerate(counts):
             rows: list[SplitDecision] = []
@@ -529,10 +532,10 @@ class AcousticSplitV3Planner:
                 label_index = int(np.argmax(row))
                 rows.append(
                     SplitDecision(
-                        label=SEMANTIC_SPLIT_LABELS[label_index],
+                        label=SEMANTIC_SPLIT_TRAINING_LABELS[label_index],
                         p_cut=float(row[0]),
                         p_continue=float(row[1]),
-                        p_unsure=float(row[2]),
+                        p_unsure=0.0,
                     )
                 )
             decisions.append(rows)
@@ -544,7 +547,7 @@ class AcousticSplitV3Planner:
         candidate_times_by_island: Sequence[Sequence[float]],
         island_frame_features: Sequence[np.ndarray],
         island_scalar_features: Sequence[np.ndarray],
-        event_id_prefix: str = "split-v3",
+        event_id_prefix: str = "split-v4",
     ) -> list[list[SplitEvent]]:
         decisions = self.decide_islands(
             island_frame_features=island_frame_features,
@@ -568,7 +571,7 @@ def aggregate_cut_event_runs(
     *,
     candidate_times_s: Sequence[float],
     decisions: Sequence[SplitDecision],
-    event_id_prefix: str = "split-v3",
+    event_id_prefix: str = "split-v4",
 ) -> list[SplitEvent]:
     """Collapse each consecutive argmax=cut run into one acoustic event."""
 
@@ -635,47 +638,46 @@ def load_semantic_split_verifier(
     )
 
 
-def load_acoustic_split_v3_planner(
+def load_acoustic_split_v4_planner(
     path: str | Path,
     *,
     device: str = "auto",
     expected_ptm_repo_id: str | None = None,
-) -> AcousticSplitV3Planner:
+) -> AcousticSplitV4Planner:
     import torch
 
     checkpoint_path = Path(path)
     payload = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
-    if payload.get("schema") != SEMANTIC_SPLIT_V3_SCHEMA:
+    if payload.get("schema") != SEMANTIC_SPLIT_V4_SCHEMA:
         raise ValueError(
             f"unsupported Acoustic Split Model schema: {payload.get('schema')!r}; "
-            f"expected {SEMANTIC_SPLIT_V3_SCHEMA!r}"
+            f"expected {SEMANTIC_SPLIT_V4_SCHEMA!r}"
         )
-    if payload.get("model_arch") != SEMANTIC_SPLIT_V3_MODEL_ARCH:
+    if payload.get("model_arch") != SEMANTIC_SPLIT_V4_MODEL_ARCH:
         raise ValueError(
-            f"Acoustic Split v3 model must use {SEMANTIC_SPLIT_V3_MODEL_ARCH!r}"
+            f"Acoustic Split v4 model must use {SEMANTIC_SPLIT_V4_MODEL_ARCH!r}"
         )
     metadata = dict(payload.get("metadata") or {})
-    feature_config = dict(payload.get("feature_config") or {})
+    if tuple(metadata.get("training_labels") or ()) != SEMANTIC_SPLIT_TRAINING_LABELS:
+        raise ValueError("Acoustic Split v4 training_labels must be cut/continue")
+    if tuple(metadata.get("excluded_training_labels") or ()) != ("unsure",):
+        raise ValueError("Acoustic Split v4 must exclude unsure from training")
     model_config = dict(payload.get("model_config") or {})
+    if int(model_config.get("aux_label_dim") or 0) != 2:
+        raise ValueError("Acoustic Split v4 requires a binary output head")
     model = IslandCandidateSequenceNetwork(**model_config)
     model.load_state_dict(payload["model_state_dict"])
     actual_device = _model_device(device)
     model.to(actual_device).eval()
     if expected_ptm_repo_id is not None:
         validate_checkpoint_repo_id(
-            metadata.get("ptm_repo_id"),
-            expected_ptm_repo_id,
-            checkpoint_kind="Acoustic Split Model",
-            metadata_key="metadata.ptm_repo_id",
+            metadata.get("ptm_repo_id"), expected_ptm_repo_id,
+            checkpoint_kind="Acoustic Split Model", metadata_key="metadata.ptm_repo_id",
         )
-    return AcousticSplitV3Planner(
-        path=str(checkpoint_path),
-        sha256=_sha256(checkpoint_path),
-        model=model,
-        model_config=model_config,
-        feature_config=feature_config,
-        normalization=dict(payload.get("normalization") or {}),
-        metadata=metadata,
+    return AcousticSplitV4Planner(
+        path=str(checkpoint_path), sha256=_sha256(checkpoint_path), model=model,
+        model_config=model_config, feature_config=dict(payload.get("feature_config") or {}),
+        normalization=dict(payload.get("normalization") or {}), metadata=metadata,
         device=str(actual_device),
     )
 
@@ -784,29 +786,24 @@ def build_semantic_split_island_checkpoint(
     }
 
 
-def build_acoustic_split_v3_checkpoint(
-    *,
-    model: Any,
-    model_config: dict[str, Any],
-    feature_config: dict[str, Any],
-    normalization: dict[str, Any],
-    metadata: dict[str, Any],
+def build_acoustic_split_v4_checkpoint(
+    *, model: Any, model_config: dict[str, Any], feature_config: dict[str, Any],
+    normalization: dict[str, Any], metadata: dict[str, Any],
 ) -> dict[str, Any]:
     return {
-        "schema": SEMANTIC_SPLIT_V3_SCHEMA,
-        "model_arch": SEMANTIC_SPLIT_V3_MODEL_ARCH,
-        "model_config": dict(model_config),
-        "feature_config": {
-            **feature_config,
-            "schema": SEMANTIC_SPLIT_FEATURE_SCHEMA,
-        },
+        "schema": SEMANTIC_SPLIT_V4_SCHEMA,
+        "model_arch": SEMANTIC_SPLIT_V4_MODEL_ARCH,
+        "model_config": {**model_config, "aux_label_dim": 2},
+        "feature_config": {**feature_config, "schema": SEMANTIC_SPLIT_FEATURE_SCHEMA},
         "normalization": dict(normalization),
-        "decision_config": dict(SEMANTIC_SPLIT_V3_DECISION),
+        "decision_config": dict(SEMANTIC_SPLIT_V4_DECISION),
         "metadata": {
             **metadata,
-            "artifact": dict(SEMANTIC_SPLIT_V3_ARTIFACT),
-            "runtime_adapter": SEMANTIC_SPLIT_V3_RUNTIME_ADAPTER,
-            "labels": list(SEMANTIC_SPLIT_LABELS),
+            "artifact": dict(SEMANTIC_SPLIT_V4_ARTIFACT),
+            "runtime_adapter": SEMANTIC_SPLIT_V4_RUNTIME_ADAPTER,
+            "canonical_labels": list(SEMANTIC_SPLIT_LABELS),
+            "training_labels": list(SEMANTIC_SPLIT_TRAINING_LABELS),
+            "excluded_training_labels": ["unsure"],
         },
         "model_state_dict": model.state_dict(),
     }

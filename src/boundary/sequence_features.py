@@ -676,7 +676,7 @@ class FrameSequenceFeatureProvider:
             ).hexdigest(),
             "frame_hop_s": float(self.frame_hop_s),
             "ptm_projection_digest": str(projection_digest),
-            "projection_source": "semantic_split_v3_checkpoint_linear",
+            "projection_source": "semantic_split_v4_checkpoint_linear",
         }
 
     def chunk_pooled_checkpoint_linear_ptm_features(

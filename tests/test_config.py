@@ -184,7 +184,7 @@ def test_active_boundary_registry_splits_17b_v10_from_06b_legacy() -> None:
     assert "semantic_split_model_v2." in qwen.DEFAULT_SEMANTIC_SPLIT_CHECKPOINT_BY_REPO[
         qwen.QWEN_ASR_06B_REPO_ID
     ]
-    assert "semantic_split_model_v3." in qwen.DEFAULT_SEMANTIC_SPLIT_CHECKPOINT_BY_REPO[
+    assert "semantic_split_model_v4." in qwen.DEFAULT_SEMANTIC_SPLIT_CHECKPOINT_BY_REPO[
         qwen.QWEN_ASR_17B_REPO_ID
     ]
     assert "pre_asr_cueqc_v12." in qwen.DEFAULT_PRE_ASR_CUEQC_CHECKPOINT_BY_REPO[
