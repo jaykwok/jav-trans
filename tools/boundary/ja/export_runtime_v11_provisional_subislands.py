@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-"""Export actual Runtime v10 provisional sub-islands for a fixed audit pool."""
+"""Export actual Runtime v11 provisional sub-islands for a fixed source pool."""
 from __future__ import annotations
 
 import argparse
 import gc
+import hashlib
 import json
 import sys
 from pathlib import Path
@@ -16,11 +17,13 @@ for root in (PROJECT_ROOT, SRC_ROOT):
         sys.path.insert(0, str(root))
 
 from asr.pipeline import (  # noqa: E402
+    _boundary_config,
     _build_processing_spans,
     _pre_asr_candidates_for_spans,
 )
 from audio.chunk_packer import PackedChunk  # noqa: E402
 from boundary.gpu_safety import apply_vram_safety_cap  # noqa: E402
+from boundary.split_model import SEMANTIC_SPLIT_V4_RUNTIME_ADAPTER  # noqa: E402
 
 
 def _rows(path: Path) -> list[dict[str, Any]]:
@@ -41,12 +44,42 @@ def resolve_audio_path(*, value: str, items_path: Path) -> Path:
     return resolved.resolve()
 
 
+def _sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for block in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def validate_binary_split_chunk(chunk: PackedChunk, *, sample_id: str) -> None:
+    if chunk.boundary_pipeline_version != 11:
+        raise ValueError(f"{sample_id}: expected Boundary pipeline version 11")
+    weak = list(chunk.weak_cut_candidates or [])
+    if any(str(row.get("label") or "") not in {"cut", "continue"} for row in weak):
+        raise ValueError(f"{sample_id}: Split v4 candidate emitted a non-binary label")
+    if any(float(row.get("p_unsure") or 0.0) != 0.0 for row in weak):
+        raise ValueError(f"{sample_id}: Split v4 candidate emitted p_unsure")
+    if chunk.boundary_decision_source == SEMANTIC_SPLIT_V4_RUNTIME_ADAPTER:
+        return
+    if (
+        chunk.boundary_source == "outer_edge_refiner_v2"
+        and chunk.boundary_decision_source == "outer_edge_refiner_v2"
+        and not chunk.semantic_event_ids
+        and not chunk.primary_cut_candidates
+    ):
+        return
+    raise ValueError(f"{sample_id}: expected binary Split v4 runtime adapter")
+
+
 def run(args: argparse.Namespace) -> None:
     apply_vram_safety_cap(0.95)
     sources: dict[str, tuple[Path, dict[str, Any]]] = {}
     items_path = Path(args.audit_items).resolve()
     for row in _rows(items_path):
         sample_id = str(row["sample_id"])
+        if sample_id in sources:
+            raise ValueError(f"duplicate source sample_id: {sample_id}")
         try:
             audio = resolve_audio_path(value=str(row["audio"]), items_path=items_path)
         except FileNotFoundError as exc:
@@ -63,27 +96,37 @@ def run(args: argparse.Namespace) -> None:
     completed_sources = {str(row["sample_id"]) for row in exported}
     if not args.resume:
         output.write_text("", encoding="utf-8")
+    boundary_config = _boundary_config()
+    split_checkpoint = Path(boundary_config["semantic_split_model_path"])
+    outer_checkpoint = Path(boundary_config["outer_edge_refiner_model_path"])
+    inner_checkpoint = Path(boundary_config["inner_edge_refiner_model_path"])
+    split_sha256 = _sha256(split_checkpoint)
+    if args.expected_split_sha256 and split_sha256 != args.expected_split_sha256:
+        raise ValueError(
+            "active Split checkpoint SHA mismatch: "
+            f"expected {args.expected_split_sha256}, got {split_sha256}"
+        )
     for source_index, (sample_id, source_item) in enumerate(
         sorted(sources.items()), start=1
     ):
         audio, source_row = source_item
         if sample_id in completed_sources:
             print(
-                f"runtime_v10_provisional={source_index}/{len(sources)} "
+                f"runtime_v11_provisional={source_index}/{len(sources)} "
                 f"sample={sample_id} status=resume_skip",
                 flush=True,
             )
             continue
         print(
-            f"runtime_v10_provisional={source_index}/{len(sources)} sample={sample_id}",
+            f"runtime_v11_provisional={source_index}/{len(sources)} sample={sample_id}",
             flush=True,
         )
         spans = _build_processing_spans(str(audio))
         if not all(isinstance(span, PackedChunk) for span in spans):
-            raise ValueError(f"{sample_id}: Runtime v10 did not return PackedChunk rows")
+            raise ValueError(f"{sample_id}: Runtime v11 did not return PackedChunk rows")
         chunks = [span for span in spans if isinstance(span, PackedChunk)]
-        if any(chunk.boundary_pipeline_version != 10 for chunk in chunks):
-            raise ValueError(f"{sample_id}: expected Boundary pipeline version 10")
+        for chunk in chunks:
+            validate_binary_split_chunk(chunk, sample_id=sample_id)
         candidates = _pre_asr_candidates_for_spans(str(audio), chunks)
         if len(candidates) != len(chunks):
             raise ValueError(f"{sample_id}: candidate/chunk count mismatch")
@@ -91,12 +134,12 @@ def run(args: argparse.Namespace) -> None:
         for index, chunk in enumerate(chunks):
             source_rows.append(
                 {
-                    "schema": "runtime_v10_provisional_subisland_v1",
+                    "schema": "runtime_v11_provisional_subisland_v1",
                     "sample_id": sample_id,
                     "source_partition": str(
                         source_row.get("source_partition") or "train"
                     ),
-                    "subisland_id": f"{sample_id}__v10s{index:02d}",
+                    "subisland_id": f"{sample_id}__v11s{index:02d}",
                     "audio": str(audio),
                     "start_s": float(chunk.start),
                     "end_s": float(chunk.end),
@@ -139,9 +182,41 @@ def run(args: argparse.Namespace) -> None:
         except Exception:
             pass
     summary = {
-        "schema": "runtime_v10_provisional_export_summary_v1",
+        "schema": "runtime_v11_provisional_export_summary_v1",
         "source_count": len(sources),
         "subisland_count": len(exported),
+        "partition_counts": {
+            partition: sum(
+                str(row.get("source_partition") or "train") == partition
+                for _audio, row in sources.values()
+            )
+            for partition in ("train", "val", "test")
+        },
+        "unique_core_count": len(
+            {
+                str(core["core_id"])
+                for _audio, row in sources.values()
+                for core in row.get("core_spans") or []
+            }
+        ),
+        "max_core_use": max(
+            (
+                sum(
+                    str(candidate.get("core_id")) == str(core["core_id"])
+                    for _audio, candidate_row in sources.values()
+                    for candidate in candidate_row.get("core_spans") or []
+                )
+                for _audio, row in sources.values()
+                for core in row.get("core_spans") or []
+            ),
+            default=0,
+        ),
+        "boundary_pipeline_version": 11,
+        "split_runtime_adapter": SEMANTIC_SPLIT_V4_RUNTIME_ADAPTER,
+        "split_checkpoint": str(split_checkpoint),
+        "split_checkpoint_sha256": split_sha256,
+        "outer_checkpoint_sha256": _sha256(outer_checkpoint),
+        "inner_checkpoint_sha256": _sha256(inner_checkpoint),
         "output": str(output),
     }
     output.with_suffix(".summary.json").write_text(
@@ -157,6 +232,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output", required=True)
     parser.add_argument("--max-sources", type=int, default=0)
     parser.add_argument("--resume", action="store_true")
+    parser.add_argument("--expected-split-sha256", default="")
     return parser.parse_args()
 
 

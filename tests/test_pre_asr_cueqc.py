@@ -16,11 +16,13 @@ from boundary.sequence_features import (
     FrameSequenceFeatureConfig,
     FrameSequenceFeatureProvider,
 )
-from tools.asr.cueqc.pre_asr_feature_compiler import compile_features
+from tools.asr.cueqc.pre_asr_feature_compiler import compile_features, read_labels
 from tools.asr.cueqc.pre_asr_binary_trainer import (
     _apply_forced_group_splits,
     _boost_anchor_positions,
+    _excluded_training_label_count,
     _matching_candidate_positions,
+    _prediction_rows,
     _predict_logits_windowed,
     _split_label_masks,
     _window_batch_from_anchors,
@@ -586,6 +588,31 @@ def test_compile_pre_asr_cueqc_features_ignores_text_columns(tmp_path: Path):
     assert "text" not in " ".join(summary["feature_names"]).lower()
 
 
+def test_pre_asr_compiler_preserves_raw_teacher_after_manual_override(
+    tmp_path: Path,
+) -> None:
+    labels = tmp_path / "canonical.jsonl"
+    labels.write_text(
+        json.dumps(
+            {
+                "subisland_id": "item",
+                "teacher_label": "unsure",
+                "label": "drop",
+                "manual_override_applied": True,
+            }
+        )
+        + "\n",
+        "utf-8",
+    )
+
+    compiled = read_labels([str(labels)])["item"]
+
+    assert compiled["label_index"] == 0
+    assert compiled["teacher_label"] == "unsure"
+    assert compiled["training_label_included"] is True
+    assert compiled["training_ignore_reason"] == ""
+
+
 def test_pre_asr_v13_wrappers_run_as_script_paths():
     root = Path(__file__).resolve().parents[1]
     for script in (
@@ -647,6 +674,77 @@ def test_compile_pre_asr_cueqc_features_reads_jsonl_chunk_candidates(tmp_path: P
         pre_asr_cueqc.PRE_ASR_CUEQC_MODEL_PTM_TOKENS,
         pre_asr_cueqc.PRE_ASR_CUEQC_PTM_DIM,
     )
+
+
+def test_pre_asr_feature_bundle_rejects_non_binary_training_class(tmp_path: Path):
+    torch = pytest.importorskip("torch")
+    from tools.asr.cueqc.pre_asr_binary_trainer import load_feature_bundle
+
+    path = tmp_path / "invalid-labels.pt"
+    torch.save(
+        {
+            "schema": "cueqc_pre_asr_semantic_chunk_v13_features",
+            "feature_schema": pre_asr_cueqc.PRE_ASR_CUEQC_FEATURE_SCHEMA,
+            "runtime_adapter": pre_asr_cueqc.PRE_ASR_CUEQC_RUNTIME_ADAPTER,
+            "feature_names": list(pre_asr_cueqc.PRE_ASR_CUEQC_SCALAR_FEATURE_NAMES),
+            "ptm_bin_count": pre_asr_cueqc.PRE_ASR_CUEQC_MODEL_PTM_TOKENS,
+            "ptm_dim": pre_asr_cueqc.PRE_ASR_CUEQC_PTM_DIM,
+            "ptm_bins": torch.zeros(
+                1,
+                1,
+                pre_asr_cueqc.PRE_ASR_CUEQC_MODEL_PTM_TOKENS,
+                pre_asr_cueqc.PRE_ASR_CUEQC_PTM_DIM,
+            ),
+            "labels": torch.tensor([[3]]),
+        },
+        path,
+    )
+
+    with pytest.raises(ValueError, match="unsupported training labels: \\[3\\]"):
+        load_feature_bundle(path)
+
+
+def test_compile_pre_asr_cueqc_keeps_per_row_source_identity_in_combined_jsonl(
+    tmp_path: Path,
+) -> None:
+    torch = pytest.importorskip("torch")
+    chunks = tmp_path / "runtime_v11_provisional.jsonl"
+    labels = tmp_path / "labels.jsonl"
+    output = tmp_path / "features.pt"
+    source_rows = []
+    for index, (video_id, partition) in enumerate((("AAA", "train"), ("BBB", "test"))):
+        candidate = _pre_asr_candidate(index, video_id=video_id)
+        source_rows.append(
+            {
+                "schema": "runtime_v11_provisional_subisland_v1",
+                "sample_id": video_id,
+                "subisland_id": f"{video_id}__v11s00",
+                "source_partition": partition,
+                "pre_asr_candidate": candidate,
+            }
+        )
+    chunks.write_text(
+        "".join(json.dumps(row, ensure_ascii=False) + "\n" for row in source_rows),
+        "utf-8",
+    )
+    labels.write_text(
+        "".join(
+            json.dumps({"subisland_id": row["subisland_id"], "label": "keep"}) + "\n"
+            for row in source_rows
+        ),
+        "utf-8",
+    )
+
+    compile_features(
+        chunk_paths=[str(chunks)],
+        label_paths=[str(labels)],
+        output=output,
+        asr_repo_id="jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame-hf",
+    )
+    bundle = torch.load(output, map_location="cpu", weights_only=False)
+
+    assert [group["audio_id"] for group in bundle["groups"]] == ["AAA", "BBB"]
+    assert [group["dataset_role"] for group in bundle["groups"]] == ["train", "test"]
 
 
 def test_compile_pre_asr_cueqc_preserves_selected_teacher_unsure_only(
@@ -983,6 +1081,53 @@ def test_pre_asr_training_role_holdout_keeps_val_and_test_out_of_train():
     assert summary["train_counts"]["excluded_unsure"] == 0
     assert summary["val_counts"]["excluded_unsure"] == 0
     assert summary["all_counts"]["excluded_unsure"] == 3
+
+
+def test_pre_asr_excluded_training_count_includes_canonical_and_legacy_unsure():
+    y = np.asarray([[0, 1, 2, -100], [2, -100, 1, 0]], dtype=np.int64)
+
+    assert _excluded_training_label_count(
+        {"teacher_unsure_ignored": 3},
+        y,
+    ) == 5
+
+
+def test_pre_asr_prediction_rows_keep_unsure_out_of_metrics_and_runtime_labels():
+    rows = _prediction_rows(
+        bundle={
+            "rows": [
+                {"id": "a", "teacher_label": "keep", "dataset_role": "train"},
+                {
+                    "id": "b",
+                    "teacher_label": "unsure",
+                    "canonical_label": "unsure",
+                    "exact_core_label": "keep",
+                    "training_ignore_reason": "teacher_unsure",
+                    "dataset_role": "test",
+                },
+            ]
+        },
+        group_rows=[
+            {
+                "audio_id": "source",
+                "dataset_role": "train",
+                "row_ids": ["a", "b"],
+            }
+        ],
+        y=np.asarray([[1, -100]], dtype=np.int64),
+        chunk_mask=np.ones((1, 2), dtype=np.float32),
+        train_mask=np.asarray([[True, False]]),
+        val_mask=np.asarray([[False, False]]),
+        probabilities=np.asarray([[[0.8, 0.2], [0.9, 0.1]]], dtype=np.float32),
+    )
+
+    assert [row["prediction"] for row in rows] == ["drop", "drop"]
+    assert rows[0]["false_drop"] is True
+    assert rows[0]["included_in_metrics"] is True
+    assert rows[1]["truth_label"] == "unsure"
+    assert rows[1]["included_in_metrics"] is False
+    assert rows[1]["split_membership"] == "excluded"
+    assert all(row["prediction"] in {"drop", "keep"} for row in rows)
 
 
 def test_pre_asr_forced_group_splits_never_restore_teacher_unsure() -> None:

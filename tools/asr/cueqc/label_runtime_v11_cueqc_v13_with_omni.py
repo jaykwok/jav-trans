@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Label Runtime v10 provisional chunks independently for CueQC v13."""
+"""Label Runtime v11 provisional chunks independently for CueQC v13."""
 from __future__ import annotations
 
 import argparse
@@ -29,8 +29,8 @@ from tools.asr.cueqc.label_pre_asr_with_omni import (
 
 
 SCHEMA = "cueqc_v13_omni_chunk_label_v1"
-PROMPT_VERSION = "cueqc_v13_runtime_chunk_text_hint_audio_decision_v3"
-PROMPT = """你是 CueQC v13 的音频标注器。每个音频都是实际 Runtime v10 在 Inner 修边之前导出的独立 provisional chunk。
+PROMPT_VERSION = "cueqc_v13_runtime_v11_chunk_text_hint_audio_decision_v4"
+PROMPT = """你是 CueQC v13 的音频标注器。每个音频都是实际 Runtime v11 在 Inner 修边之前导出的独立 provisional chunk。
 
 必须按以下顺序判断：
 1. 先仔细寻找任何可辨认的日语词、短语、对白或有词义的发声。词语可能很短，也可能嵌在哭声、喘息、呻吟、亲吻声或噪声中。
@@ -64,6 +64,22 @@ def _append(path: Path, row: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("a", encoding="utf-8") as handle:
         handle.write(json.dumps(row, ensure_ascii=False) + "\n")
+
+
+def _validate_runtime_rows(rows: list[dict[str, Any]]) -> None:
+    seen: set[str] = set()
+    for row in rows:
+        item_id = str(row.get("subisland_id") or "").strip()
+        if not item_id or item_id in seen:
+            raise ValueError(f"duplicate or missing Runtime v11 subisland_id: {item_id!r}")
+        seen.add(item_id)
+        if row.get("schema") != "runtime_v11_provisional_subisland_v1":
+            raise ValueError("CueQC v13 teacher requires fresh Runtime v11 chunks")
+        candidate = row.get("pre_asr_candidate") or {}
+        if int(candidate.get("boundary_pipeline_version") or 0) != 11:
+            raise ValueError("CueQC v13 teacher requires Boundary pipeline version 11")
+        if candidate.get("schema") != "pre_asr_cueqc_features_v10":
+            raise ValueError("CueQC v13 teacher requires the current feature schema")
 
 
 def _normalize_label(value: Any) -> str:
@@ -230,7 +246,9 @@ def run(args: argparse.Namespace) -> None:
     labels_path = output_dir / "labels.jsonl"
     raw_path = output_dir / "raw_responses.jsonl"
     existing = {str(row["subisland_id"]) for row in _rows(labels_path)}
-    rows = [row for row in _rows(Path(args.runtime_chunks)) if str(row["subisland_id"]) not in existing]
+    runtime_rows = _rows(Path(args.runtime_chunks))
+    _validate_runtime_rows(runtime_rows)
+    rows = [row for row in runtime_rows if str(row["subisland_id"]) not in existing]
     sources = (
         {str(row["sample_id"]): row for row in _rows(Path(args.source_manifest))}
         if args.source_manifest
@@ -383,7 +401,7 @@ def run(args: argparse.Namespace) -> None:
                     "confidence": _confidence(response.get("confidence")),
                     "lexical_evidence": str(response.get("lexical_evidence") or ""),
                     "flags": list(flags) if isinstance(flags, list) else [],
-                    "label_source": "omni_text_hint_audio_decision_independent_runtime_chunk_v3",
+                    "label_source": "omni_text_hint_audio_decision_independent_runtime_v11_chunk_v4",
                     "parent_label_inherited": False,
                 },
             )

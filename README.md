@@ -167,7 +167,7 @@ Web 会在模型要求检查中提示驱动过旧或 CUDA 初始化失败。
 - `jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame-hf`：默认高质量档。
 - `jaykwok/Qwen3-ASR-0.6B-JA-Anime-Galgame-hf`：低显存、更快档。
 
-每个档位都绑定自己的 Speech Island、边界候选、边缘精修、Semantic Split、Cut Refiner 和 Pre-ASR CueQC。运行时根据 ASR repo id 自动选择整套模型，不能跨档混用。
+1.7B 绑定自己的 Speech Island、边界候选、Outer、Acoustic Split、Pre-ASR CueQC 与 Inner；0.6B legacy 绑定自己的 Speech Island、边界候选、Outer、Semantic Split、Cut Refiner 与 Pre-ASR CueQC。运行时根据 ASR repo id 自动选择整套模型，不能跨档混用。
 
 所有小模型统一放在：
 

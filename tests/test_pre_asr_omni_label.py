@@ -3,6 +3,8 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pytest
+
 from tools.asr.cueqc import label_pre_asr_with_omni as omni_label
 
 
@@ -12,7 +14,7 @@ def test_default_omni_env_file_is_provider_neutral() -> None:
 
 
 def test_runtime_batch_parse_error_does_not_disable_multi_audio() -> None:
-    from tools.asr.cueqc import label_runtime_v10_cueqc_v13_with_omni as runtime
+    from tools.asr.cueqc import label_runtime_v11_cueqc_v13_with_omni as runtime
 
     assert not runtime._multi_audio_unsupported(
         ValueError("Expecting ',' delimiter: line 55 column 6")
@@ -24,6 +26,24 @@ def test_runtime_batch_parse_error_does_not_disable_multi_audio() -> None:
         ValueError("data_inspection_failed: Input audio data may contain inappropriate content")
     )
     assert not runtime._moderation_rejected(ValueError("The audio is empty"))
+
+
+def test_runtime_v11_teacher_rejects_old_runtime_chunks() -> None:
+    from tools.asr.cueqc import label_runtime_v11_cueqc_v13_with_omni as runtime
+
+    with pytest.raises(ValueError, match="fresh Runtime v11"):
+        runtime._validate_runtime_rows(
+            [
+                {
+                    "schema": "runtime_v10_provisional_subisland_v1",
+                    "subisland_id": "old",
+                    "pre_asr_candidate": {
+                        "boundary_pipeline_version": 10,
+                        "schema": "pre_asr_cueqc_features_v9",
+                    },
+                }
+            ]
+        )
 
 
 def test_training_label_from_omni_maps_to_existing_v10_labels():
