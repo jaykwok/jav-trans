@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Evaluate a repo-bound Acoustic Split v3 checkpoint with event-run gates."""
+"""Evaluate a repo-bound Acoustic Split v4 binary checkpoint with event-run gates."""
 from __future__ import annotations
 
 import argparse
@@ -15,8 +15,8 @@ for root in (PROJECT_ROOT, SRC_ROOT):
     if str(root) not in sys.path:
         sys.path.insert(0, str(root))
 
-from boundary.split_model import load_acoustic_split_v3_planner  # noqa: E402
-from tools.boundary.ja.train_acoustic_split_v3_model import (  # noqa: E402
+from boundary.split_model import load_acoustic_split_v4_planner  # noqa: E402
+from tools.boundary.ja.train_acoustic_split_v4_model import (  # noqa: E402
     evaluate,
     gate_passes,
     partition_group_names,
@@ -29,7 +29,7 @@ from tools.boundary.ja.train_semantic_split_island_model import (  # noqa: E402
 def run(args: argparse.Namespace) -> None:
     import torch
 
-    planner = load_acoustic_split_v3_planner(
+    planner = load_acoustic_split_v4_planner(
         args.checkpoint,
         device=args.device,
         expected_ptm_repo_id=args.ptm_repo_id,
@@ -57,10 +57,10 @@ def run(args: argparse.Namespace) -> None:
     if args.dataset_summary:
         proposal_summary = json.loads(Path(args.dataset_summary).read_text("utf-8"))
     payload = {
-        "schema": "semantic_split_model_v3_event_gate_metrics_v1",
+        "schema": "semantic_split_model_v4_event_gate_metrics_v1",
         "checkpoint": planner.signature(),
         "dataset": str(Path(args.dataset)),
-        "decision_mode": "argmax_cut",
+        "decision_mode": "binary_argmax_cut",
         "event_contract": "consecutive_argmax_cut_run",
         "event_match": "ordered_candidate_truth_basin_no_time_threshold",
         "proposal_coverage": proposal_summary.get(

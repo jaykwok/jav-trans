@@ -30,6 +30,7 @@ from asr.pre_asr_cueqc import (  # noqa: E402
     PRE_ASR_CUEQC_ARTIFACT,
     PRE_ASR_CUEQC_FEATURE_SCHEMA,
     PRE_ASR_CUEQC_IGNORE_LABEL,
+    PRE_ASR_CUEQC_LABELS,
     PRE_ASR_CUEQC_MODEL_PTM_TOKENS,
     PRE_ASR_CUEQC_MODEL_ARCH,
     PRE_ASR_CUEQC_PTM_DIM,
@@ -116,7 +117,7 @@ def _valid_flat(
     mask: np.ndarray,
     durations: np.ndarray,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    valid = (mask > 0) & (y != PRE_ASR_CUEQC_IGNORE_LABEL)
+    valid = (mask > 0) & np.isin(y, (0, 1))
     return probs[valid], y[valid], durations[valid]
 
 
@@ -125,13 +126,16 @@ def classification_metrics(
     y: np.ndarray,
     durations: np.ndarray,
 ) -> dict[str, float]:
+    binary = np.isin(y, (0, 1))
+    probs = probs[binary]
+    y = y[binary]
+    durations = durations[binary]
     if probs.size == 0:
         return {
             "drop_precision": 0.0,
             "drop_recall": 0.0,
             "drop_f1": 0.0,
             "semantic_keep_recall": 0.0,
-            "unsure_recall": 0.0,
             "false_drop_rate": 0.0,
             "false_drop_count": 0.0,
             "false_drop_duration_s": 0.0,
@@ -151,7 +155,6 @@ def classification_metrics(
     pred_keep = predicted == 1
     true_drop = y == 0
     true_keep = y == 1
-    true_unsure = y == 2
     tp = int(np.sum(pred_drop & true_drop))
     fp = int(np.sum(pred_drop & ~true_drop))
     fn = int(np.sum(~pred_drop & true_drop))
@@ -161,12 +164,6 @@ def classification_metrics(
     f1 = (2 * precision * recall / (precision + recall)) if precision + recall else 0.0
     keep_total = int(np.sum(true_keep))
     keep_recall = tn / keep_total if keep_total else 0.0
-    unsure_total = int(np.sum(true_unsure))
-    unsure_recall = (
-        int(np.sum((predicted == 2) & true_unsure)) / unsure_total
-        if unsure_total
-        else 0.0
-    )
     false_drop_duration = float(np.sum(durations[pred_drop & true_keep]))
     false_keep_duration = float(np.sum(durations[~pred_drop & true_drop]))
     drop_duration = float(np.sum(durations[pred_drop]))
@@ -176,7 +173,6 @@ def classification_metrics(
         "drop_recall": recall,
         "drop_f1": f1,
         "semantic_keep_recall": keep_recall,
-        "unsure_recall": unsure_recall,
         "false_drop_rate": int(np.sum(pred_drop & true_keep)) / max(1, keep_total),
         "false_drop_count": float(np.sum(pred_drop & true_keep)),
         "false_drop_duration_s": false_drop_duration,
@@ -208,7 +204,7 @@ def _class_counts(y: np.ndarray, mask: np.ndarray) -> dict[str, int]:
     return {
         "drop": int(np.sum((y == 0) & valid)),
         "keep": int(np.sum((y == 1) & valid)),
-        "unsure": int(np.sum((y == 2) & valid)),
+        "excluded_unsure": int(np.sum((y == 2) & valid)),
         "ambiguous_ignore": int(np.sum((y == PRE_ASR_CUEQC_IGNORE_LABEL) & valid)),
     }
 
@@ -237,7 +233,7 @@ def _split_label_masks(
     val_ratio: float,
     rng: np.random.Generator,
 ) -> tuple[np.ndarray, np.ndarray, dict[str, Any]]:
-    valid = (chunk_mask > 0) & ((y == 0) | (y == 1) | (y == 2))
+    valid = (chunk_mask > 0) & ((y == 0) | (y == 1))
     train = np.zeros_like(valid, dtype=bool)
     val = np.zeros_like(valid, dtype=bool)
     if split_mode == "role_holdout":
@@ -245,7 +241,7 @@ def _split_label_masks(
             role = str(group.get("dataset_role") or "").strip().lower()
             target = (
                 val
-                if role in {"semantic", "val", "validation", "holdout"}
+                if role in {"semantic", "val", "validation", "test", "holdout"}
                 else train
             )
             target[group_index] = valid[group_index]
@@ -282,7 +278,7 @@ def _split_label_masks(
             val[first] = False
     elif split_mode == "chunk_stratified":
         for group_index in range(y.shape[0]):
-            for label_index in (0, 1, 2):
+            for label_index in (0, 1):
                 positions = np.flatnonzero(valid[group_index] & (y[group_index] == label_index))
                 if positions.size == 0:
                     continue
@@ -320,11 +316,36 @@ def _split_label_masks(
     return train, val, summary
 
 
+def _apply_forced_group_splits(
+    *,
+    train: np.ndarray,
+    val: np.ndarray,
+    y: np.ndarray,
+    chunk_mask: np.ndarray,
+    force_train_groups: set[int],
+    force_val_groups: set[int],
+) -> None:
+    """Move only binary CueQC labels when manually overriding data partitions."""
+
+    for group_index in force_train_groups:
+        valid = (chunk_mask[group_index] > 0) & np.isin(
+            y[group_index], (0, 1)
+        )
+        train[group_index, valid] = True
+        val[group_index, valid] = False
+    for group_index in force_val_groups:
+        valid = (chunk_mask[group_index] > 0) & np.isin(
+            y[group_index], (0, 1)
+        )
+        train[group_index, valid] = False
+        val[group_index, valid] = True
+
+
 def _balanced_anchor_positions(train_mask: np.ndarray, y: np.ndarray, device: Any) -> dict[int, Any]:
     import torch
 
     positions: dict[int, Any] = {}
-    for label_index in (0, 1, 2):
+    for label_index in (0, 1):
         raw = np.argwhere(train_mask & (y == label_index))
         if raw.size:
             positions[label_index] = torch.as_tensor(raw, dtype=torch.long, device=device)
@@ -558,7 +579,11 @@ def _predict_logits_windowed(
     import torch
 
     group_count, max_chunks = tuple(chunk_mask.shape)
-    logits_all = torch.zeros((group_count, max_chunks, 2), dtype=torch.float32, device=ptm_bins.device)
+    logits_all = torch.zeros(
+        (group_count, max_chunks, len(PRE_ASR_CUEQC_LABELS)),
+        dtype=torch.float32,
+        device=ptm_bins.device,
+    )
     counts = torch.zeros((group_count, max_chunks, 1), dtype=torch.float32, device=ptm_bins.device)
     window = min(int(sequence_window_size), int(max_chunks))
     for group_index in range(int(group_count)):
@@ -592,7 +617,6 @@ def train(
     device: str,
     keep_class_weight: float,
     drop_class_weight: float,
-    unsure_class_weight: float,
     sequence_window_size: int,
     temporal_residual_scale: float,
     split_mode: str,
@@ -675,22 +699,14 @@ def train(
             str(group_rows[index].get("audio_id") or "") for index in overlap_groups
         )
         raise ValueError(f"audio_ids forced into both train and validation: {overlap_ids}")
-    for group_index in force_train_groups:
-        valid = (mask_np[group_index] > 0) & (
-            (y_np[group_index] == 0)
-            | (y_np[group_index] == 1)
-            | (y_np[group_index] == 2)
-        )
-        train_label_mask[group_index, valid] = True
-        val_label_mask[group_index, valid] = False
-    for group_index in force_val_groups:
-        valid = (mask_np[group_index] > 0) & (
-            (y_np[group_index] == 0)
-            | (y_np[group_index] == 1)
-            | (y_np[group_index] == 2)
-        )
-        train_label_mask[group_index, valid] = False
-        val_label_mask[group_index, valid] = True
+    _apply_forced_group_splits(
+        train=train_label_mask,
+        val=val_label_mask,
+        y=y_np,
+        chunk_mask=mask_np,
+        force_train_groups=force_train_groups,
+        force_val_groups=force_val_groups,
+    )
     if force_train_groups or force_val_groups:
         if not np.any(train_label_mask):
             raise ValueError("forced split leaves no training labels")
@@ -734,6 +750,8 @@ def train(
             raise ValueError("init checkpoint schema mismatch")
         if init_payload.get("arch") != PRE_ASR_CUEQC_MODEL_ARCH:
             raise ValueError("init checkpoint architecture mismatch")
+        if int((init_payload.get("model_config") or {}).get("num_classes") or 0) != 2:
+            raise ValueError("init checkpoint must use the binary CueQC v13 head")
         if tuple(init_payload.get("feature_names") or ()) != PRE_ASR_CUEQC_SCALAR_FEATURE_NAMES:
             raise ValueError("init checkpoint feature_names mismatch")
         init_metadata = init_payload.get("metadata")
@@ -783,7 +801,7 @@ def train(
                 "ptm_encoder_mode": str(ptm_encoder_mode),
                 "semantic_auxiliary": bool(semantic_auxiliary),
                 "late_fusion": bool(late_fusion),
-                "num_classes": 3,
+                "num_classes": 2,
             }
         )
     model = PreAsrCueQCNetwork(**model_config).to(dev)
@@ -794,7 +812,6 @@ def train(
         [
             float(drop_class_weight),
             float(keep_class_weight),
-            float(unsure_class_weight),
         ],
         dtype=torch.float32,
         device=dev,
@@ -849,9 +866,9 @@ def train(
         else:
             logits = model_output
             auxiliary = {}
-        flat_logits = logits.reshape(-1, 3)
+        flat_logits = logits.reshape(-1, 2)
         flat_targets = batch_y.reshape(-1)
-        active = flat_targets != PRE_ASR_CUEQC_IGNORE_LABEL
+        active = (flat_targets == 0) | (flat_targets == 1)
         active_logits = flat_logits[active]
         active_targets = flat_targets[active]
         raw_loss = F.cross_entropy(
@@ -865,7 +882,7 @@ def train(
         ).squeeze(1)
         loss = (raw_loss * torch.pow(1.0 - pt, focal_gamma)).mean()
         if semantic_auxiliary and semantic_aux_loss_weight > 0.0:
-            semantic_logits = auxiliary["semantic_logits"].reshape(-1, 3)[active]
+            semantic_logits = auxiliary["semantic_logits"].reshape(-1, 2)[active]
             semantic_raw_loss = F.cross_entropy(
                 semantic_logits,
                 active_targets,
@@ -929,7 +946,6 @@ def train(
         "class_weights": {
             "drop": float(drop_class_weight),
             "keep": float(keep_class_weight),
-            "unsure": float(unsure_class_weight),
         },
         "focal_gamma": float(focal_gamma),
         "valid_prefix_temporal": bool(model_config["valid_prefix_temporal"]),
@@ -962,6 +978,9 @@ def train(
         "anchor_boost": int(anchor_boost),
         "model_config": model_config,
         "decision_mode": "argmax",
+        "training_labels": list(PRE_ASR_CUEQC_LABELS),
+        "excluded_training_labels": ["unsure"],
+        "excluded_training_label_count": int(np.sum((y_np == 2) & (mask_np > 0))),
         "train": classification_metrics(train_probs, train_y, train_durations),
         "val": classification_metrics(val_probs, val_y, val_durations),
         "all": classification_metrics(all_probs, all_y, all_durations),
@@ -1007,6 +1026,11 @@ def train(
             "val_ratio": float(val_ratio),
             "created_at": created_at,
             "ignore_label": PRE_ASR_CUEQC_IGNORE_LABEL,
+            "training_labels": list(PRE_ASR_CUEQC_LABELS),
+            "excluded_training_labels": ["unsure"],
+            "excluded_training_label_count": int(
+                np.sum((y_np == 2) & (mask_np > 0))
+            ),
             "init_checkpoint": (
                 repo_display_path(init_checkpoint)
                 if init_checkpoint is not None
@@ -1065,7 +1089,6 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--device", default="auto")
     parser.add_argument("--drop-class-weight", type=float, default=1.0)
     parser.add_argument("--keep-class-weight", type=float, default=2.0)
-    parser.add_argument("--unsure-class-weight", type=float, default=1.0)
     parser.add_argument("--focal-gamma", type=float, default=2.0)
     parser.add_argument(
         "--valid-prefix-temporal",
@@ -1158,7 +1181,6 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     if (
         args.drop_class_weight <= 0.0
         or args.keep_class_weight <= 0.0
-        or args.unsure_class_weight <= 0.0
     ):
         parser.error("class weights must be positive")
     if args.focal_gamma < 0.0:
@@ -1205,7 +1227,6 @@ def main(argv: list[str] | None = None) -> int:
         device=str(args.device),
         keep_class_weight=float(args.keep_class_weight),
         drop_class_weight=float(args.drop_class_weight),
-        unsure_class_weight=float(args.unsure_class_weight),
         sequence_window_size=int(args.sequence_window_size),
         temporal_residual_scale=float(args.temporal_residual_scale),
         split_mode=str(args.split_mode),

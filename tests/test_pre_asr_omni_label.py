@@ -11,6 +11,21 @@ def test_default_omni_env_file_is_provider_neutral() -> None:
     assert "qwen" not in omni_label.DEFAULT_ENV_FILE.lower()
 
 
+def test_runtime_batch_parse_error_does_not_disable_multi_audio() -> None:
+    from tools.asr.cueqc import label_runtime_v10_cueqc_v13_with_omni as runtime
+
+    assert not runtime._multi_audio_unsupported(
+        ValueError("Expecting ',' delimiter: line 55 column 6")
+    )
+    assert runtime._multi_audio_unsupported(
+        ValueError("Only one audio input is supported")
+    )
+    assert runtime._moderation_rejected(
+        ValueError("data_inspection_failed: Input audio data may contain inappropriate content")
+    )
+    assert not runtime._moderation_rejected(ValueError("The audio is empty"))
+
+
 def test_training_label_from_omni_maps_to_existing_v10_labels():
     assert (
         omni_label.training_label_from_omni(

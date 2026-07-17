@@ -167,17 +167,17 @@ def test_boundary_cache_v20_round_trips_paired_inner_edge_metadata(
         end=2.7,
         duration=1.5,
         speech_segments=[SpeechSegment(1.2, 2.7, 0.9)],
-        split_reason="acoustic_split_v3",
+        split_reason="acoustic_split_v4",
         acoustic_start=1.2,
         acoustic_end=2.7,
         acoustic_duration=1.5,
         display_start=1.25,
         display_end=2.65,
         display_duration=1.4,
-        boundary_pipeline_version=10,
+        boundary_pipeline_version=11,
         semantic_event_ids=["event-001"],
         semantic_event_probabilities=[
-            {"p_cut": 0.96, "p_continue": 0.03, "p_unsure": 0.01}
+            {"p_cut": 0.96, "p_continue": 0.04, "p_unsure": 0.0}
         ],
         paired_inner_edges={
             "event_ids": ["event-001"],
@@ -194,7 +194,7 @@ def test_boundary_cache_v20_round_trips_paired_inner_edge_metadata(
         boundary_signature=signature,
         boundary_config=_boundary_config(),
         processing_spans=[chunk],
-        runtime_boundary_signature={"boundary_pipeline": {"version": 10}},
+        runtime_boundary_signature={"boundary_pipeline": {"version": 11}},
     )
 
     loaded = boundary_cache.load_processing_spans(
@@ -204,7 +204,7 @@ def test_boundary_cache_v20_round_trips_paired_inner_edge_metadata(
     )
     assert loaded is not None
     restored = loaded[0][0]
-    assert restored.boundary_pipeline_version == 10
+    assert restored.boundary_pipeline_version == 11
     assert restored.semantic_event_ids == ["event-001"]
     assert restored.paired_inner_edges["action"] == "safe"
     assert restored.removed_gap_duration_s == pytest.approx(0.3)

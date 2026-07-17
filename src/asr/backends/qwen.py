@@ -44,7 +44,7 @@ DEFAULT_SEMANTIC_SPLIT_CHECKPOINT_BY_REPO: dict[str, str] = {
         QWEN_ASR_06B_REPO_ID, "semantic_split_model", "v2"
     ),
     QWEN_ASR_17B_REPO_ID: repo_checkpoint_path(
-        QWEN_ASR_17B_REPO_ID, "semantic_split_model", "v3"
+        QWEN_ASR_17B_REPO_ID, "semantic_split_model", "v4"
     ),
 }
 DEFAULT_CUT_EDGE_REFINER_CHECKPOINT_BY_REPO: dict[str, str] = {

@@ -5,15 +5,15 @@ import pytest
 import torch
 
 from boundary.split_model import (
-    SEMANTIC_SPLIT_V3_MODEL_ARCH,
-    SEMANTIC_SPLIT_V3_RUNTIME_ADAPTER,
-    SEMANTIC_SPLIT_V3_SCHEMA,
+    SEMANTIC_SPLIT_V4_MODEL_ARCH,
+    SEMANTIC_SPLIT_V4_RUNTIME_ADAPTER,
+    SEMANTIC_SPLIT_V4_SCHEMA,
     IslandCandidateSequenceNetwork,
     SplitDecision,
     aggregate_cut_event_runs,
-    build_acoustic_split_v3_checkpoint,
+    build_acoustic_split_v4_checkpoint,
     build_semantic_split_island_checkpoint,
-    load_acoustic_split_v3_planner,
+    load_acoustic_split_v4_planner,
     load_semantic_split_verifier,
 )
 
@@ -60,56 +60,12 @@ def _feature_config() -> dict:
     }
 
 
-def test_v3_checkpoint_direct_argmax_contract(tmp_path) -> None:
-    torch.manual_seed(17)
-    model = IslandCandidateSequenceNetwork(**_model_config())
-    path = tmp_path / "semantic_split_model_v3.test.pt"
-    torch.save(
-        build_acoustic_split_v3_checkpoint(
-            model=model,
-            model_config=_model_config(),
-            feature_config=_feature_config(),
-            normalization=_normalization(),
-            metadata={"ptm_repo_id": "repo/1.7b"},
-        ),
-        path,
-    )
-    planner = load_acoustic_split_v3_planner(path, device="cpu")
-    signature = planner.signature()
-    assert signature["schema"] == SEMANTIC_SPLIT_V3_SCHEMA
-    assert signature["model_arch"] == SEMANTIC_SPLIT_V3_MODEL_ARCH
-    assert signature["runtime_adapter"] == SEMANTIC_SPLIT_V3_RUNTIME_ADAPTER
-    assert signature["decision_config"] == {"decision_mode": "argmax_cut"}
-
-    rng = np.random.default_rng(3)
-    decisions = planner.decide_islands(
-        island_frame_features=[
-            rng.normal(size=(4, BINS, FRAME_DIM)).astype(np.float32)
-        ],
-        island_scalar_features=[
-            rng.normal(size=(4, SCALAR_DIM)).astype(np.float32)
-        ],
-    )[0]
-    assert len(decisions) == 4
-    for decision in decisions:
-        assert decision.label in ("cut", "continue", "unsure")
-        assert decision.p_cut + decision.p_continue + decision.p_unsure == pytest.approx(
-            1.0, abs=1e-5
-        )
-        probabilities = {
-            "cut": decision.p_cut,
-            "continue": decision.p_continue,
-            "unsure": decision.p_unsure,
-        }
-        assert decision.label == max(probabilities, key=probabilities.get)
-
-
 def test_cut_runs_emit_one_event_at_highest_probability() -> None:
     decisions = [
         SplitDecision("continue", 0.1, 0.8, 0.1),
         SplitDecision("cut", 0.70, 0.2, 0.1),
         SplitDecision("cut", 0.92, 0.05, 0.03),
-        SplitDecision("unsure", 0.2, 0.3, 0.5),
+        SplitDecision("continue", 0.2, 0.8, 0.0),
         SplitDecision("cut", 0.81, 0.1, 0.09),
     ]
     events = aggregate_cut_event_runs(
@@ -125,21 +81,55 @@ def test_cut_runs_emit_one_event_at_highest_probability() -> None:
     assert events[1].representative_index == 4
 
 
-def test_v2_and_v3_loaders_do_not_alias_schemas(tmp_path) -> None:
+def test_v4_checkpoint_is_binary_argmax_only(tmp_path) -> None:
+    config = {**_model_config(), "aux_label_dim": 2}
+    model = IslandCandidateSequenceNetwork(**config)
+    v4 = tmp_path / "v4.pt"
+    torch.save(
+        build_acoustic_split_v4_checkpoint(
+            model=model,
+            model_config=config,
+            feature_config=_feature_config(),
+            normalization=_normalization(),
+            metadata={"ptm_repo_id": "repo/1.7b", "excluded_training_label_count": 7},
+        ),
+        v4,
+    )
+    planner = load_acoustic_split_v4_planner(v4, device="cpu")
+    signature = planner.signature()
+    assert signature["schema"] == SEMANTIC_SPLIT_V4_SCHEMA
+    assert signature["model_arch"] == SEMANTIC_SPLIT_V4_MODEL_ARCH
+    assert signature["runtime_adapter"] == SEMANTIC_SPLIT_V4_RUNTIME_ADAPTER
+    assert signature["decision_config"] == {"decision_mode": "binary_argmax_cut"}
+    decisions = planner.decide_islands(
+        island_frame_features=[np.zeros((2, BINS, FRAME_DIM), dtype=np.float32)],
+        island_scalar_features=[np.zeros((2, SCALAR_DIM), dtype=np.float32)],
+    )[0]
+    assert all(row.label in ("cut", "continue") for row in decisions)
+    assert all(row.p_unsure == 0.0 for row in decisions)
+    assert all(
+        row.p_cut + row.p_continue == pytest.approx(1.0, abs=1e-5)
+        for row in decisions
+    )
+
+
+def test_v4_loader_rejects_legacy_three_class_and_v2_schemas(tmp_path) -> None:
     model = IslandCandidateSequenceNetwork(**_model_config())
     v3 = tmp_path / "v3.pt"
     torch.save(
-        build_acoustic_split_v3_checkpoint(
-            model=model,
-            model_config=_model_config(),
-            feature_config=_feature_config(),
-            normalization=_normalization(),
-            metadata={"ptm_repo_id": "repo/1.7b"},
-        ),
+        {
+            "schema": "semantic_split_model_v3",
+            "model_arch": "acoustic_candidate_sequence_mamba_v1",
+            "model_config": {**_model_config(), "aux_label_dim": 3},
+            "metadata": {"ptm_repo_id": "repo/1.7b"},
+            "model_state_dict": model.state_dict(),
+        },
         v3,
     )
     with pytest.raises(ValueError, match="semantic_split_verifier_v2"):
         load_semantic_split_verifier(v3, device="cpu")
+    with pytest.raises(ValueError, match="semantic_split_model_v4"):
+        load_acoustic_split_v4_planner(v3, device="cpu")
 
     v2 = tmp_path / "v2.pt"
     torch.save(
@@ -152,5 +142,5 @@ def test_v2_and_v3_loaders_do_not_alias_schemas(tmp_path) -> None:
         ),
         v2,
     )
-    with pytest.raises(ValueError, match="semantic_split_model_v3"):
-        load_acoustic_split_v3_planner(v2, device="cpu")
+    with pytest.raises(ValueError, match="semantic_split_model_v4"):
+        load_acoustic_split_v4_planner(v2, device="cpu")

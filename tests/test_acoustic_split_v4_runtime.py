@@ -7,7 +7,7 @@ from boundary.outer_refiner_v2 import PairedOuterEdgePrediction
 from audio.chunk_packer import PackedChunk
 from boundary.runtime_pipeline import (
     apply_paired_inner_edges_after_cueqc,
-    build_acoustic_split_v3_provisional_chunks,
+    build_acoustic_split_v4_provisional_chunks,
 )
 from boundary.sequence_features import FrameSequenceFeatureConfig, FrameSequenceFeatureProvider
 from boundary.split_model import SplitDecision
@@ -30,14 +30,20 @@ class _Planner:
         "extra_context_scales": [],
     }
 
+    def signature(self):
+        return {
+            "schema": "semantic_split_model_v4",
+            "runtime_adapter": "acoustic_candidate_binary_event_runs_v2",
+        }
+
     def decide_islands(self, *, island_frame_features, island_scalar_features):
         assert island_frame_features[0].shape[0] == 5
         return [[
-            SplitDecision("continue", 0.1, 0.8, 0.1),
-            SplitDecision("cut", 0.7, 0.2, 0.1),
-            SplitDecision("cut", 0.9, 0.05, 0.05),
-            SplitDecision("continue", 0.1, 0.8, 0.1),
-            SplitDecision("cut", 0.8, 0.1, 0.1),
+            SplitDecision("continue", 0.1, 0.9, 0.0),
+            SplitDecision("cut", 0.7, 0.3, 0.0),
+            SplitDecision("cut", 0.9, 0.1, 0.0),
+            SplitDecision("continue", 0.1, 0.9, 0.0),
+            SplitDecision("cut", 0.8, 0.2, 0.0),
         ]]
 
 
@@ -53,7 +59,7 @@ def _proposal(time_s: float) -> dict:
     }
 
 
-def test_v3_runtime_builds_events_without_duration_thresholds(monkeypatch) -> None:
+def test_v4_runtime_builds_events_without_duration_thresholds(monkeypatch) -> None:
     prediction = PairedOuterEdgePrediction(
         raw_start_s=0.0,
         raw_end_s=8.0,
@@ -88,7 +94,7 @@ def test_v3_runtime_builds_events_without_duration_thresholds(monkeypatch) -> No
         mfcc=np.zeros((400, 2), dtype=np.float32),
         config=FrameSequenceFeatureConfig(max_ptm_dims=4),
     )
-    chunks = build_acoustic_split_v3_provisional_chunks(
+    chunks = build_acoustic_split_v4_provisional_chunks(
         [segment],
         duration_s=8.0,
         speech_probabilities=np.ones(400, dtype=np.float32),
@@ -107,8 +113,8 @@ def test_v3_runtime_builds_events_without_duration_thresholds(monkeypatch) -> No
         "island-0000-event-000",
         "island-0000-event-001",
     ]
-    assert chunks[0].boundary_pipeline_version == 10
-    assert chunks[0].boundary_decision_source == "acoustic_candidate_event_runs_v1"
+    assert chunks[0].boundary_pipeline_version == 11
+    assert chunks[0].boundary_decision_source == "acoustic_candidate_binary_event_runs_v2"
     assert chunks[0].display_start == chunks[0].acoustic_start
     assert chunks[0].primary_cut_candidates[0]["p_cut"] == 0.9
     assert all(
@@ -129,7 +135,7 @@ def _inner_chunk(
         end=end,
         duration=end - start,
         speech_segments=[],
-        split_reason="acoustic_split_v3",
+        split_reason="acoustic_split_v4",
         parent_chunk_id=0,
         island_id=island_id,
         island_count=2,

@@ -212,20 +212,24 @@ def label_items(row: Mapping[str, Any]) -> list[dict[str, Any]]:
     return items
 
 
-def normalize_label(row: Mapping[str, Any]) -> int | None:
-    raw = str(
+def raw_label(row: Mapping[str, Any]) -> str:
+    return str(
         row.get("label")
         or row.get("route")
         or row.get("decision")
         or row.get("display_decision")
         or ""
     ).strip().lower()
+
+
+def normalize_label(row: Mapping[str, Any]) -> int | None:
+    raw = raw_label(row)
     if raw in {"keep", "keep_for_asr", "1", "positive", "definite_keep"}:
         return 1
     if raw in {"drop", "drop_before_asr", "0", "negative", "definite_drop"}:
         return 0
     if raw in {"unsure", "unsure_for_asr", "abstain", "uncertain", "2"}:
-        return 2
+        return PRE_ASR_CUEQC_IGNORE_LABEL
     if raw in {"ignore", "skip", "ambiguous", "ambiguous_ignore", str(PRE_ASR_CUEQC_IGNORE_LABEL)}:
         return PRE_ASR_CUEQC_IGNORE_LABEL
     return None
@@ -236,14 +240,22 @@ def read_labels(paths: Iterable[str]) -> dict[str, dict[str, Any]]:
     for raw_path in paths:
         path = project_path(raw_path)
         for row in read_json_or_jsonl(path):
+            teacher_label = raw_label(row)
             value = normalize_label(row)
             if value is None:
                 continue
+            ignore_reason = ""
+            if teacher_label in {"unsure", "unsure_for_asr", "abstain", "uncertain", "2"}:
+                ignore_reason = "teacher_unsure"
             if row.get("training_label_included") is False:
                 value = PRE_ASR_CUEQC_IGNORE_LABEL
+                ignore_reason = ignore_reason or "training_label_excluded"
             for source_item in label_items(row):
                 item = dict(source_item)
                 item["label_index"] = value
+                item["teacher_label"] = teacher_label
+                item["training_label_included"] = value != PRE_ASR_CUEQC_IGNORE_LABEL
+                item["training_ignore_reason"] = ignore_reason
                 cluster_id = str(item.get("cluster_id") or "").strip()
                 item_keys = label_keys(item)
                 if cluster_id and not item_keys:
@@ -416,10 +428,14 @@ def compile_features(
                         if label_index == 1
                         else "drop_before_asr"
                         if label_index == 0
-                        else "unsure_for_asr"
-                        if label_index == 2
+                        else "teacher_unsure_ignored"
+                        if (label or {}).get("training_ignore_reason") == "teacher_unsure"
                         else "ambiguous_ignore"
                     ),
+                    "teacher_label": "" if label is None else str(label.get("teacher_label") or ""),
+                    "training_ignore_reason": ""
+                    if label is None
+                    else str(label.get("training_ignore_reason") or ""),
                     "label_source": ""
                     if label is None
                     else str(
@@ -433,7 +449,7 @@ def compile_features(
             )
     groups: list[list[int]] = []
     for row_indexes in group_map.values():
-        if any(int(rows[row_index]["label_index"]) in (0, 1, 2) for row_index in row_indexes):
+        if any(int(rows[row_index]["label_index"]) in (0, 1) for row_index in row_indexes):
             groups.append(row_indexes)
     if not groups:
         raise ValueError("no definite labeled Pre-ASR CueQC examples were compiled")
@@ -456,10 +472,14 @@ def compile_features(
     )
     bundle_tensors = _make_tensor_bundle(rows, groups)
     y = bundle_tensors["labels"].numpy()
+    selected_rows = [rows[row_index] for group in groups for row_index in group]
+    teacher_unsure_ignored = sum(
+        row.get("training_ignore_reason") == "teacher_unsure"
+        for row in selected_rows
+    )
     row_payload = [
         {key: value for key, value in row.items() if key != "candidate"}
-        for group in groups
-        for row in (rows[row_index] for row_index in group)
+        for row in selected_rows
     ]
     group_payload = [
         {
@@ -483,6 +503,7 @@ def compile_features(
         "asr_repo_id": selected_repo,
         "ptm_pooling_schemas": pooling_schemas,
         "ptm_projection_digest": ptm_projection_digest,
+        "teacher_unsure_ignored": teacher_unsure_ignored,
         "created_at": datetime.now().isoformat(timespec="seconds"),
         "rows": row_payload,
         "groups": group_payload,
@@ -505,8 +526,14 @@ def compile_features(
         "chunk_count": int(np.sum(y != PRE_ASR_CUEQC_IGNORE_LABEL)),
         "keep": int(np.sum(y == 1)),
         "drop": int(np.sum(y == 0)),
-        "unsure": int(np.sum(y == 2)),
-        "ambiguous_ignore": int(np.sum((y == PRE_ASR_CUEQC_IGNORE_LABEL) & (bundle_tensors["chunk_mask"].numpy() > 0))),
+        "teacher_unsure_ignored": teacher_unsure_ignored,
+        "ambiguous_ignore": int(
+            np.sum(
+                (y == PRE_ASR_CUEQC_IGNORE_LABEL)
+                & (bundle_tensors["chunk_mask"].numpy() > 0)
+            )
+            - teacher_unsure_ignored
+        ),
     }
     output.with_suffix(".summary.json").write_text(
         json.dumps(summary, ensure_ascii=False, indent=2, sort_keys=True) + "\n",

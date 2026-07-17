@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Train Acoustic Split v3 with direct cut/continue/unsure argmax decisions."""
+"""Train Acoustic Split v4 with binary cut/continue argmax decisions."""
 from __future__ import annotations
 
 import argparse
@@ -28,9 +28,9 @@ from boundary.sequence_features import (  # noqa: E402
 from boundary.sequence_store import chunked_frame_stats  # noqa: E402
 from boundary.split_model import (  # noqa: E402
     SEMANTIC_SPLIT_FEATURE_SCHEMA,
-    SEMANTIC_SPLIT_LABELS,
+    SEMANTIC_SPLIT_TRAINING_LABELS,
     IslandCandidateSequenceNetwork,
-    build_acoustic_split_v3_checkpoint,
+    build_acoustic_split_v4_checkpoint,
 )
 from tools.boundary.ja.train_semantic_split_island_model import (  # noqa: E402
     _pair_loss,
@@ -41,6 +41,64 @@ from tools.boundary.ja.train_semantic_split_island_model import (  # noqa: E402
 
 
 IGNORE_ID = -100
+LABEL_ID = {"cut": 0, "continue": 1, "ignore": IGNORE_ID}
+
+
+def _jsonl(path: Path) -> list[dict[str, Any]]:
+    return [
+        json.loads(line)
+        for line in path.read_text("utf-8").splitlines()
+        if line.strip()
+    ]
+
+
+def apply_manual_label_overrides(
+    data: dict[str, Any], *, metadata_path: Path, overrides_path: Path
+) -> dict[str, Any]:
+    metadata = _jsonl(metadata_path)
+    if len(metadata) != int(data["labels"].shape[0]):
+        raise ValueError("Split metadata row count does not match dataset labels")
+    index_by_key: dict[tuple[str, float], int] = {}
+    for index, row in enumerate(metadata):
+        key = (str(row["audio_id"]), round(float(row["time_s"]), 6))
+        if key in index_by_key:
+            raise ValueError(f"duplicate Split metadata key: {key}")
+        index_by_key[key] = index
+    labels = np.asarray(data["labels"]).copy()
+    partitions = np.asarray(data["partitions"], dtype="<U16").copy()
+    group_by_index: dict[int, str] = {}
+    for group_name, indexes in data["groups"].items():
+        for index in indexes.tolist():
+            group_by_index[int(index)] = str(group_name)
+    corrected_groups: set[str] = set()
+    counts = {"cut": 0, "continue": 0, "ignore": 0}
+    changed = 0
+    for row in _jsonl(overrides_path):
+        key = (str(row["audio_id"]), round(float(row["time_s"]), 6))
+        if key not in index_by_key:
+            raise ValueError(f"manual Split override does not match dataset: {key}")
+        training_label = str(row.get("training_label") or "")
+        if training_label not in LABEL_ID:
+            raise ValueError(f"unsupported Split training override: {training_label!r}")
+        index = index_by_key[key]
+        value = LABEL_ID[training_label]
+        changed += int(int(labels[index]) != value)
+        labels[index] = value
+        counts[training_label] += 1
+        group_name = group_by_index[index]
+        corrected_groups.add(group_name)
+    for group_name in corrected_groups:
+        partitions[data["groups"][group_name]] = "train"
+    data["labels"] = labels
+    data["partitions"] = partitions
+    return {
+        "path": str(overrides_path),
+        "override_count": sum(counts.values()),
+        "changed_label_count": changed,
+        "training_label_counts": counts,
+        "forced_train_groups": sorted(corrected_groups),
+        "forced_train_group_count": len(corrected_groups),
+    }
 
 
 def partition_group_names(data: dict[str, Any]) -> dict[str, list[str]]:
@@ -76,7 +134,7 @@ def initialize_from_v2_checkpoint(
     raw_frame_std: np.ndarray,
     ptm_dim: int,
 ) -> dict[str, Any]:
-    """Warm-start v3 while embedding v2's learned affine PTM projection."""
+    """Warm-start v4 while embedding v2's learned affine PTM projection."""
 
     import torch
 
@@ -105,7 +163,7 @@ def initialize_from_v2_checkpoint(
     )
     projected_dim = int(components.shape[0])
     if components.shape != (projected_dim, ptm_dim):
-        raise ValueError("v2 PTM projection dimensions do not match v3 input")
+        raise ValueError("v2 PTM projection dimensions do not match v4 input")
     raw_mean = np.asarray(raw_frame_mean, dtype=np.float64)
     raw_std = np.maximum(np.asarray(raw_frame_std, dtype=np.float64), 1e-6)
     projector_weight = (
@@ -149,12 +207,12 @@ def initialize_from_v2_checkpoint(
 
 
 def _classification_metrics(truth: np.ndarray, predicted: np.ndarray) -> dict[str, Any]:
-    matrix = np.zeros((3, 3), dtype=np.int64)
+    matrix = np.zeros((2, 2), dtype=np.int64)
     for expected, actual in zip(truth.tolist(), predicted.tolist()):
-        if expected in (0, 1, 2):
+        if expected in (0, 1):
             matrix[expected, actual] += 1
     rows: dict[str, dict[str, float | int]] = {}
-    for index, label in enumerate(SEMANTIC_SPLIT_LABELS):
+    for index, label in enumerate(SEMANTIC_SPLIT_TRAINING_LABELS):
         tp = int(matrix[index, index])
         fp = int(matrix[:, index].sum() - tp)
         fn = int(matrix[index, :].sum() - tp)
@@ -193,7 +251,7 @@ def event_run_counts(truth: np.ndarray, predicted: np.ndarray) -> dict[str, int]
     exact = sum(event in set(truth_events) for event in predicted_events)
     truth_basins: list[set[int]] = [set() for _ in truth_events]
     for position, label in enumerate(truth.tolist()):
-        if label == 1 or not truth_events:
+        if label != 0 or not truth_events:
             continue
         nearest = min(
             range(len(truth_events)),
@@ -265,6 +323,7 @@ def evaluate(
                 scalar_mean=normalization["scalar_mean"],
                 scalar_std=normalization["scalar_std"],
             )
+            labels[labels == 2] = IGNORE_ID
             logits = model(
                 frames.to(device), scalars.to(device), mask.to(device)
             )["label"]
@@ -273,12 +332,14 @@ def evaluate(
                 count = int(data["groups"][name].size)
                 truth = labels[row, :count].numpy()
                 predicted = probabilities[row, :count].argmax(axis=-1)
-                valid = truth != IGNORE_ID
+                valid = np.isin(truth, (0, 1))
                 truth_rows.append(truth[valid])
                 predicted_rows.append(predicted[valid])
                 probability_rows.append(probabilities[row, :count][valid])
 
-                event_counts = event_run_counts(truth, predicted)
+                event_predicted_labels = predicted.copy()
+                event_predicted_labels[~valid] = IGNORE_ID
+                event_counts = event_run_counts(truth, event_predicted_labels)
                 event_truth += event_counts["truth"]
                 event_predicted += event_counts["predicted"]
                 event_exact += event_counts["exact"]
@@ -289,7 +350,7 @@ def evaluate(
     metrics = _classification_metrics(truth, predicted)
     metrics["mean_probability"] = {
         label: float(probabilities[:, index].mean())
-        for index, label in enumerate(SEMANTIC_SPLIT_LABELS)
+        for index, label in enumerate(SEMANTIC_SPLIT_TRAINING_LABELS)
     }
     metrics["event_runs"] = {
         "truth": event_truth,
@@ -320,11 +381,31 @@ def run(args: argparse.Namespace) -> None:
 
     apply_vram_safety_cap()
     data = load_island_dataset(Path(args.dataset))
+    manual_override_summary = None
+    if args.label_overrides:
+        if not args.metadata:
+            raise ValueError("--metadata is required with --label-overrides")
+        manual_override_summary = apply_manual_label_overrides(
+            data,
+            metadata_path=Path(args.metadata),
+            overrides_path=Path(args.label_overrides),
+        )
     partitions = partition_group_names(data)
-    train_names = partitions["train"]
+    train_names_base = partitions["train"]
+    train_names = list(train_names_base)
+    if manual_override_summary and args.manual_group_repeat > 1:
+        train_names.extend(
+            manual_override_summary["forced_train_groups"]
+            * (int(args.manual_group_repeat) - 1)
+        )
     rng = np.random.default_rng(args.seed)
     torch.manual_seed(args.seed)
-    train_rows = np.concatenate([data["groups"][name] for name in train_names])
+    train_rows_all = np.concatenate(
+        [data["groups"][name] for name in train_names_base]
+    )
+    train_rows = train_rows_all[np.isin(data["labels"][train_rows_all], (0, 1))]
+    if train_rows.size == 0:
+        raise ValueError("Split v4 training partition has no cut/continue labels")
     frame_mean, frame_std = chunked_frame_stats(data["frames"], train_rows)
     normalization = {
         "frame_mean": frame_mean,
@@ -363,6 +444,7 @@ def run(args: argparse.Namespace) -> None:
         "ptm_input_dim": args.ptm_dim,
         "ptm_projected_dim": args.ptm_projector_dim,
         "ptm_projector_residual": False,
+        "aux_label_dim": 2,
     }
     device = torch.device(args.device)
     model = IslandCandidateSequenceNetwork(**model_config).to(device)
@@ -382,9 +464,7 @@ def run(args: argparse.Namespace) -> None:
         optimizer, warmup_steps=args.warmup_steps, max_steps=args.max_steps
     )
     class_weights = torch.tensor(
-        [args.cut_weight, args.continue_weight, args.unsure_weight],
-        dtype=torch.float32,
-        device=device,
+        [args.cut_weight, args.continue_weight], dtype=torch.float32, device=device
     )
     losses: list[float] = []
     best_score = -1.0
@@ -425,11 +505,12 @@ def run(args: argparse.Namespace) -> None:
             scalar_mean=normalization["scalar_mean"],
             scalar_std=normalization["scalar_std"],
         )
+        labels[labels == 2] = IGNORE_ID
         model_outputs = model(
             frames.to(device), scalars.to(device), mask.to(device)
         )
         label_logits = model_outputs["label"]
-        flat_logits = label_logits.reshape(-1, len(SEMANTIC_SPLIT_LABELS))
+        flat_logits = label_logits.reshape(-1, len(SEMANTIC_SPLIT_TRAINING_LABELS))
         flat_labels = labels.to(device).reshape(-1)
         raw = F.cross_entropy(
             flat_logits,
@@ -446,9 +527,11 @@ def run(args: argparse.Namespace) -> None:
         else:
             raw = raw[valid]
         loss = raw.mean()
+        role_targets = roles.to(device).clone()
+        role_targets[labels.to(device) == IGNORE_ID] = IGNORE_ID
         role_loss = F.cross_entropy(
             model_outputs["role"].reshape(-1, 4),
-            roles.to(device).reshape(-1),
+            role_targets.reshape(-1),
             ignore_index=IGNORE_ID,
         )
         pair_term = _pair_loss(
@@ -466,7 +549,7 @@ def run(args: argparse.Namespace) -> None:
         losses.append(float(loss.detach().cpu()))
         if args.log_every and step % args.log_every == 0:
             print(
-                f"acoustic_split_v3_train={step}/{args.max_steps} "
+                f"acoustic_split_v4_train={step}/{args.max_steps} "
                 f"loss={losses[-1]:.6f} avg={np.mean(losses[-args.log_every:]):.6f}",
                 flush=True,
             )
@@ -494,7 +577,7 @@ def run(args: argparse.Namespace) -> None:
             )
             score = float(event_f1 + 0.25 * cont["recall"])
             print(
-                f"acoustic_split_v3_eval step={step} "
+                f"acoustic_split_v4_eval step={step} "
                 f"cut_P={cut['precision']:.4f} cut_R={cut['recall']:.4f} "
                 f"event_P={events['basin_precision']:.4f} "
                 f"event_R={events['basin_recall']:.4f} "
@@ -526,10 +609,10 @@ def run(args: argparse.Namespace) -> None:
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     checkpoint_path = output_dir / (
-        f"semantic_split_model_v3.{qwen_asr_repo_tag(args.ptm_repo_id)}.pt"
+        f"semantic_split_model_v4.{qwen_asr_repo_tag(args.ptm_repo_id)}.pt"
     )
     torch.save(
-        build_acoustic_split_v3_checkpoint(
+        build_acoustic_split_v4_checkpoint(
             model=model,
             model_config=model_config,
             feature_config={
@@ -556,13 +639,17 @@ def run(args: argparse.Namespace) -> None:
                 "dataset": str(Path(args.dataset)),
                 "trained_steps": args.max_steps,
                 "best_step": best_step,
-                "training_decision": "direct_three_class_argmax",
+                "training_decision": "binary_argmax_cut",
+                "excluded_training_label_count": int(
+                    np.sum(~np.isin(data["labels"], (0, 1)))
+                ),
+                "manual_label_overrides": manual_override_summary,
+                "manual_group_repeat": int(args.manual_group_repeat),
                 "timing_output": "semantic_event_only",
                 "init_report": init_report,
                 "loss": {
                     "cut_weight": args.cut_weight,
                     "continue_weight": args.continue_weight,
-                    "unsure_weight": args.unsure_weight,
                     "focal_gamma": args.focal_gamma,
                     "role_aux_weight": args.role_aux_weight,
                     "pair_loss_weight": args.pair_loss_weight,
@@ -572,12 +659,14 @@ def run(args: argparse.Namespace) -> None:
         checkpoint_path,
     )
     metrics = {
-        "schema": "semantic_split_model_v3_training_metrics",
-        "decision_mode": "argmax_cut",
+        "schema": "semantic_split_model_v4_training_metrics",
+        "decision_mode": "binary_argmax_cut",
         "train_group_count": len(partitions["train"]),
         "val_group_count": len(partitions["val"]),
         "test_group_count": len(partitions["test"]),
         "best_step": best_step,
+        "manual_label_overrides": manual_override_summary,
+        "manual_group_repeat": int(args.manual_group_repeat),
         "mean_train_loss": float(np.mean(losses)),
         "val": best_val,
         "test": test,
@@ -595,6 +684,14 @@ def run(args: argparse.Namespace) -> None:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--dataset", required=True)
+    parser.add_argument("--metadata", default="")
+    parser.add_argument("--label-overrides", default="")
+    parser.add_argument(
+        "--manual-group-repeat",
+        type=int,
+        default=32,
+        help="Repeat manually corrected training groups without changing held-out groups.",
+    )
     parser.add_argument("--output-dir", required=True)
     parser.add_argument(
         "--ptm-repo-id",
@@ -615,7 +712,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dropout", type=float, default=0.1)
     parser.add_argument("--cut-weight", type=float, default=3.0)
     parser.add_argument("--continue-weight", type=float, default=1.0)
-    parser.add_argument("--unsure-weight", type=float, default=0.5)
     parser.add_argument("--focal-gamma", type=float, default=1.5)
     parser.add_argument("--role-aux-weight", type=float, default=0.3)
     parser.add_argument("--pair-loss-weight", type=float, default=0.3)
@@ -633,6 +729,8 @@ def parse_args() -> argparse.Namespace:
     args = parser.parse_args()
     if args.ptm_projector_dim <= 0 or args.ptm_projector_dim >= args.ptm_dim:
         parser.error("--ptm-projector-dim must be between 1 and ptm-dim-1")
+    if args.manual_group_repeat <= 0:
+        parser.error("--manual-group-repeat must be positive")
     return args
 
 
