@@ -73,6 +73,12 @@ def validate_dataset_rows(rows: Sequence[dict[str, Any]]) -> dict[str, Any]:
             raise ValueError("Scorer v10 row_role must be speech/all_background")
         if partition not in PARTITIONS:
             raise ValueError(f"Scorer v10 row has invalid partition: {partition!r}")
+        if row.get("boundary_serialization_contract_id") != (
+            SPEECH_ISLAND_SCORER_V10_DATASET_CONTRACT[
+                "boundary_serialization_contract_id"
+            ]
+        ):
+            raise ValueError("Scorer v10 rows require the central Boundary contract")
         if row.get("input_distribution") != SPEECH_ISLAND_SCORER_V10_DATASET_CONTRACT[
             "input_distribution"
         ]:

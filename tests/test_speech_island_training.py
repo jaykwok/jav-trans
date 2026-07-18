@@ -229,6 +229,7 @@ def _scorer_v10_row(
     source: str, core: str | None, partition: str, *, row_role: str = "speech"
 ) -> dict:
     return {
+        "boundary_serialization_contract_id": "boundary_acoustic_binary_v12",
         "source_id": source,
         "core_ids": [] if core is None else [core],
         "background_id": source if core is None else "",
@@ -254,6 +255,10 @@ def test_binary_speech_v10_dataset_contract_freezes_source_and_core() -> None:
         validate_scorer_v10_rows([*rows, _scorer_v10_row("s1", "c4", "train")])
     with pytest.raises(ValueError, match="max core use"):
         validate_scorer_v10_rows([*rows, _scorer_v10_row("s4", "c1", "train")])
+    missing_contract = dict(rows[0])
+    missing_contract.pop("boundary_serialization_contract_id")
+    with pytest.raises(ValueError, match="central Boundary contract"):
+        validate_scorer_v10_rows([missing_contract, *rows[1:]])
 
 
 def test_binary_speech_v10_unsure_is_excluded_from_normalization_and_presence(

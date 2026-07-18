@@ -26,13 +26,29 @@ The builder and loader reject non-2048 PTM, non-128 projection, non-40 MFCC, non
 
 ## Dataset audit
 
-The frozen `source_manifest_stratified1024.jsonl` is useful only as an identity/partition base: it has `1024 sources / 2048 unique cores / max core use=1` and source partitions `870 train / 103 val / 51 test`. It is not a Scorer training manifest:
+The first version of this audit was too strict when it treated the frozen `source_manifest_stratified1024.jsonl` as identity-only. The corrected responsibility is important: Galgame, especially NSFW material, is real target speech and closely matches the JAV acoustic domain. The selected cores came from the teacher-approved semantic-core inventory. For the coarse Scorer task, their exact composition extents are valid positive `speech` supervision; this does not reinstate the rejected Inner assumption that every arbitrary Galgame clip is already a precisely trimmed acoustic semantic core.
 
-- every selected source is a two-core semantic composite, so no partition has an all-background full-source control;
-- its `core_spans` are exact composition/sample extents, not independently verified frame-level speech boundaries; labeling every frame inside them as speech would repeat the rejected arbitrary-full-clip assumption;
-- the Inner v2 frame manifest contains post-old-chain sub-islands, not full Scorer inputs, so it has Scorer/Outer/Split selection bias and cannot repair the missing full-source negatives.
+The fixed1024 sources already contain the required hard distribution:
 
-The new validator therefore requires one frozen full-source row per source, explicit `row_role=speech|all_background`, unique semantic `core_ids` only on speech rows, unique `background_id` on all-background rows, fixed source/core partitions and max core use 1. Each partition must contain both roles. Canonical labels must come from a new auditable frame teacher/annotation pass; unsure is retained in the label asset but excluded from normalization, loss, metrics and gate.
+- `1024 sources / 2048 unique cores / max core use=1`, partitioned `870 train / 103 val / 51 test`;
+- two Galgame speech cores per source, with exact sample coordinates;
+- partitioned high-confidence CueQC/Omni `definite_drop` assets in the central negative unit and both gaps, including moaning, breathing, kissing, crying, music, impact and other JAV-domain negatives;
+- additive real-negative overlays on 504 selected sources. An overlay does not change a core frame from speech when clear target speech is still present.
+
+`compile_speech_island_scorer_v10_canonical.py` now turns those exact spans into canonical frames and adds strict all-background controls from the same frozen negative pool. A frame whose exact 20 ms cell crosses two differently labelled sample spans becomes `unsure`; no wider boundary band is invented. The prepare result at `agents/temp/20260718_230743_scorer-v10-fixed1024-canonical-prepare/` is:
+
+| item | result |
+| --- | --- |
+| sources | `2671` |
+| unique cores / max use | `2048 / 1` |
+| speech rows train/val/test | `870 / 103 / 51` |
+| all-background rows train/val/test | `1234 / 210 / 203` |
+| canonical frames | `speech 496546 / background 144326 / unsure 2022` |
+| background identities / videos | `1647 / 148` |
+
+The compiler rejects background video/asset or core identity crossing partitions, non-strict negative assets, missing audio, missing/old central contracts and non-1.7B/non-PTM2048 feature caches. The 1542 background assets reused as augmentation and isolated controls remain inside the same frozen partition; this is reported explicitly and creates no train/held-out crossing. `unsure` remains in canonical assets but is zero-weighted for feature-cache statistics and maps to `-100` for normalization, loss, metrics and gate. Finalization also requires a passing manual-gate summary bound to the exact canonical manifest SHA, so merely generating the audit page cannot unlock a trainer manifest.
+
+This is a canonical source plan, not a trained dataset claim. Raw 1.7B PTM2048+MFCC40 feature cache and the final trainer manifest do not exist yet.
 
 ## Plumbing smoke
 
@@ -40,4 +56,6 @@ The new validator therefore requires one frozen full-source row per source, expl
 
 ## Human audit status
 
-No listening verdict is claimed because no real v10 prediction set exists. After a real canonical smoke, the existing `tools/audits` HTML/navigation framework must generate playable/saveable pages for every prediction-drop/truth-keep case, all held-out hard cases and every greater-than-8-second residual. Numeric gates are capped at 95%; zero clipping and zero true-speech deletion require saved human verdicts before promotion.
+The canonical fixed24 page at `agents/audits/20260718_231220_scorer-v10-canonical-data-fixed24/` contains four speech and four all-background controls from every partition. It is playable and saves `speech_scorer_v10_canonical_manual_verdict_v1`; its status is deliberately `pending`, and no listening verdict is claimed.
+
+After a real v10 model exists, the same audit framework must generate pages for every prediction-drop/truth-speech case, all held-out hard cases, edge clipping and every greater-than-8-second residual. Numeric gates are capped at 95%; zero clipping and zero true-speech deletion require saved human verdicts before promotion.
