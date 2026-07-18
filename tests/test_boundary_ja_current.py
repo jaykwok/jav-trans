@@ -8,6 +8,7 @@ from boundary.ja.backend import (
     SpeechBoundaryJaConfig,
     decode_semantic_speech_island_segments,
     decode_speech_island_segments,
+    require_current_runtime_scorer,
 )
 from boundary.ja.model import (
     SPEECH_ISLAND_SCORER_V8_SCHEMA,
@@ -109,6 +110,20 @@ def test_17b_signature_has_no_fixed_speech_threshold_and_06b_is_retired() -> Non
     )
     with pytest.raises(RuntimeError, match="pending_binary_retrain"):
         SpeechBoundaryJaBackend(config=config_06b)
+
+
+def test_v8_threshold_scorer_is_audit_only_for_current_runtime() -> None:
+    class _V8:
+        schema = SPEECH_ISLAND_SCORER_V8_SCHEMA
+
+    with pytest.raises(RuntimeError, match="pending_binary_scorer_audit"):
+        require_current_runtime_scorer(_V8())
+
+    class _V9:
+        schema = SPEECH_ISLAND_SCORER_SCHEMA
+
+    with pytest.raises(RuntimeError, match="pending_binary_scorer_audit"):
+        require_current_runtime_scorer(_V9())
 
 
 def test_proposal_checkpoint_without_mapping_keeps_bootstrap(monkeypatch) -> None:

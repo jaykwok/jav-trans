@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import numpy as np
+import pytest
 from pathlib import Path
 
 from tools.boundary.ja.train_acoustic_split_v4_model import (
@@ -61,6 +62,54 @@ def test_partition_groups_keep_test_out_of_training() -> None:
         "train": ["train-a"],
         "val": ["val-a"],
     }
+
+
+def test_partition_groups_reject_source_identity_leakage() -> None:
+    data = {
+        "groups": {
+            "source-a|island0000": np.asarray([0]),
+            "source-a|island0001": np.asarray([1]),
+            "source-b|island0000": np.asarray([2]),
+            "source-c|island0000": np.asarray([3]),
+        },
+        "partitions": np.asarray(["train", "val", "val", "test"]),
+    }
+    with pytest.raises(ValueError, match="source 'source-a' crosses"):
+        partition_group_names(data)
+
+
+def test_manual_override_moves_every_island_from_source_to_train(tmp_path: Path) -> None:
+    metadata = tmp_path / "metadata.jsonl"
+    metadata.write_text(
+        '\n'.join([
+            '{"audio_id":"a","time_s":1.0}',
+            '{"audio_id":"a","time_s":2.0}',
+            '{"audio_id":"b","time_s":3.0}',
+        ]) + '\n',
+        encoding="utf-8",
+    )
+    overrides = tmp_path / "overrides.jsonl"
+    overrides.write_text(
+        '{"audio_id":"a","time_s":1.0,"training_label":"cut"}\n',
+        encoding="utf-8",
+    )
+    data = {
+        "labels": np.asarray([1, 1, 0]),
+        "partitions": np.asarray(["test", "test", "val"]),
+        "groups": {
+            "a|island0000": np.asarray([0]),
+            "a|island0001": np.asarray([1]),
+            "b|island0000": np.asarray([2]),
+        },
+    }
+    summary = apply_manual_label_overrides(
+        data, metadata_path=metadata, overrides_path=overrides
+    )
+    assert data["partitions"].tolist() == ["train", "train", "val"]
+    assert summary["forced_train_groups"] == [
+        "a|island0000",
+        "a|island0001",
+    ]
 
 
 def test_numeric_gate_uses_direct_argmax_metrics() -> None:

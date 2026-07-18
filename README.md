@@ -115,11 +115,10 @@ Web 会在模型要求检查中提示驱动过旧或 CUDA 初始化失败。
   -> Shared Qwen feature extraction
      - Qwen ASR repo 对应的 frozen PTM/encoder frame features
      - MFCC / timing numeric features
-  -> SpeechIslandScorer v8
-     - 仅输出 dense speech_prob
-     - speech hysteresis 生成高召回 speech islands
-  -> BoundaryProposalScorer v1
-     - 学习型高召回 acoustic cut candidate proposal
+  -> Speech-island scorer（1.7B binary-argmax v10 待审计/重训）
+     - Scorer v8 仅保留为 threshold/hysteresis 审计参考，不进入当前生产 runtime
+  -> BoundaryProposalScorer v1（候选源审计中）
+     - 学习型高召回 acoustic candidate source，不做 final cut decision
   -> 按 ASR repo 进入互不混用的边界链
      - 1.7B：Outer Edge Refiner v3（当前待架构/数据审计，未注册生产 checkpoint）
        -> Acoustic Split v4 binary argmax
@@ -127,7 +126,7 @@ Web 会在模型要求检查中提示驱动过旧或 CUDA 初始化失败。
        -> Pre-ASR CueQC v13 binary argmax
        -> Inner Edge Refiner v2 binary acoustic core
        -> chunk packing / boundary-cache
-     - 0.6B：Boundary 小模型待按同一二分类合同全量重训，当前不提供完整工作流
+     - 0.6B：空 registry placeholder 保持不动，暂不训练或修改
      - drop 的 chunk 不导出 wav、不进入 ASR
   -> ASR wav chunk export
   -> Qwen ASR text transcription
@@ -151,7 +150,7 @@ Web 会在模型要求检查中提示驱动过旧或 CUDA 初始化失败。
 - `20 / (24000/1001)` 是字幕最短显示和 micro chunk 风险线，不是 runtime duration-only drop 阈值。
 - 7 秒是字幕显示 soft guard，不是 ASR chunk 上限。
 - Runtime 不使用具体词黑名单或时长启发式删除短促人声；是否进入 ASR 由 Pre-ASR CueQC 模型标签决定。
-- 1.7B Split v4 与 CueQC v13 只使用二分类 argmax，不读取 runtime threshold，不提供旧三分类 alias 或规则 fallback。
+- 1.7B Split v4、CueQC v13 与 Inner v2 只使用二分类 argmax，不读取 runtime threshold，不提供旧三分类 alias 或规则 fallback。Scorer v8 的 threshold/hysteresis 路径仅用于离线审计；当前 segment runtime 会明确拒绝它，等待二分类 Scorer v10。
 - 1.7B Outer registry 当前为空；选择该档会在模型加载前明确报告 `pending_outer_v3_audit`。
 - 0.6B Boundary registry 当前为空；选择该档会在模型加载前明确报告 `pending_binary_retrain`。
 
@@ -162,9 +161,9 @@ Web 会在模型要求检查中提示驱动过旧或 CUDA 初始化失败。
 当前 registry 保留一个待完成 Outer 审计的 1.7B 模型档，以及一个待全量重训的 0.6B ASR repo：
 
 - `jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame-hf`：默认高质量档。
-- `jaykwok/Qwen3-ASR-0.6B-JA-Anime-Galgame-hf`：仅保留 ASR repo，占位等待 Boundary 全链重训。
+- `jaykwok/Qwen3-ASR-0.6B-JA-Anime-Galgame-hf`：仅保留 ASR repo 与空 Boundary registry placeholder；全链重训留作未来 backlog，本轮不训练、不修改。
 
-1.7B 绑定 Speech Island、边界候选、Outer、Acoustic Split、Pre-ASR CueQC 与 binary acoustic Inner。0.6B 的旧小模型已退役，后续复用 1.7B canonical labels 与固定 partition，重新提取 0.6B PTM features 后从头训练；不会借用 1.7B feature cache、投影或 checkpoint。
+1.7B 绑定待审计的 binary Speech-island scorer、边界候选、Outer、Acoustic Split、Pre-ASR CueQC 与 binary acoustic Inner。0.6B 的旧小模型已退役并保持空 placeholder；未来 backlog 若重启，必须重新提取 0.6B PTM features 并从头训练，不借用 1.7B feature cache、投影或 checkpoint。
 
 所有小模型统一放在：
 
@@ -299,7 +298,7 @@ model_param_device=cuda:*
 ASR_BATCH_SIZE=2
 ```
 
-0.6B Boundary 全链重训和晋升前不能用于完整工作流。
+0.6B Boundary registry 当前保持空 placeholder，不能用于完整工作流；全链重训留作未来 backlog。
 
 ### 长任务怎么排查
 

@@ -12,6 +12,35 @@ from boundary.sequence_store import load_sequence_arrays
 IGNORE_ID = -100
 
 
+def source_id_from_group_id(group_id: str) -> str:
+    """Return the frozen source identity shared by all islands of one source."""
+
+    value = str(group_id)
+    marker = "|island"
+    return value.split(marker, 1)[0] if marker in value else value
+
+
+def validate_source_partition_isolation(data: dict[str, Any]) -> None:
+    """Require every island from one source to stay in exactly one partition."""
+
+    source_partitions: dict[str, set[str]] = defaultdict(set)
+    for group_id, indexes in data["groups"].items():
+        partitions = set(data["partitions"][indexes].astype(str).tolist())
+        if len(partitions) != 1:
+            raise ValueError(f"group {group_id!r} crosses dataset partitions")
+        source_partitions[source_id_from_group_id(group_id)].update(partitions)
+    leaked = {
+        source_id: sorted(partitions)
+        for source_id, partitions in source_partitions.items()
+        if len(partitions) != 1
+    }
+    if leaked:
+        source_id = sorted(leaked)[0]
+        raise ValueError(
+            f"source {source_id!r} crosses dataset partitions: {leaked[source_id]}"
+        )
+
+
 def load_island_dataset(path: Path) -> dict[str, Any]:
     bundle = load_sequence_arrays(path)
     required = (

@@ -7,6 +7,10 @@ import pytest
 
 from asr.backends import qwen
 from boundary.contracts import ACOUSTIC_BINARY_V12_CONTRACT
+from boundary.ja.proposal import (
+    BOUNDARY_PROPOSAL_CANDIDATE_ROLE,
+    load_boundary_proposal_checkpoint,
+)
 
 
 REPO_IDS = (qwen.QWEN_ASR_06B_REPO_ID, qwen.QWEN_ASR_17B_REPO_ID)
@@ -100,6 +104,18 @@ def test_split_v4_candidate_is_binary_argmax_and_excludes_unsure() -> None:
         "continue": 1,
         "ignore": 24,
     }
+
+
+def test_proposal_v1_is_explicitly_non_binding() -> None:
+    path = Path(
+        qwen.DEFAULT_SPEECH_BOUNDARY_PROPOSAL_CHECKPOINT_BY_REPO[
+            qwen.QWEN_ASR_17B_REPO_ID
+        ]
+    )
+    bundle = load_boundary_proposal_checkpoint(path, device="cpu")
+    signature = bundle.signature()
+    assert signature["candidate_role"] == BOUNDARY_PROPOSAL_CANDIDATE_ROLE
+    assert signature["makes_final_cut_decisions"] is False
 
 
 def test_17b_inner_v2_declares_binary_serialization_contract() -> None:

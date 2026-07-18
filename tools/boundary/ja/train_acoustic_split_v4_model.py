@@ -37,6 +37,8 @@ from tools.boundary.ja.acoustic_split_v4_dataset import (  # noqa: E402
     load_island_dataset,
     pad_batch,
     pair_loss,
+    source_id_from_group_id,
+    validate_source_partition_isolation,
 )
 
 
@@ -70,7 +72,7 @@ def apply_manual_label_overrides(
     for group_name, indexes in data["groups"].items():
         for index in indexes.tolist():
             group_by_index[int(index)] = str(group_name)
-    corrected_groups: set[str] = set()
+    corrected_sources: set[str] = set()
     counts = {"cut": 0, "continue": 0, "ignore": 0}
     changed = 0
     for row in _jsonl(overrides_path):
@@ -86,7 +88,12 @@ def apply_manual_label_overrides(
         labels[index] = value
         counts[training_label] += 1
         group_name = group_by_index[index]
-        corrected_groups.add(group_name)
+        corrected_sources.add(source_id_from_group_id(group_name))
+    corrected_groups = {
+        group_name
+        for group_name in data["groups"]
+        if source_id_from_group_id(group_name) in corrected_sources
+    }
     for group_name in corrected_groups:
         partitions[data["groups"][group_name]] = "train"
     data["labels"] = labels
@@ -102,6 +109,7 @@ def apply_manual_label_overrides(
 
 
 def partition_group_names(data: dict[str, Any]) -> dict[str, list[str]]:
+    validate_source_partition_isolation(data)
     result: dict[str, list[str]] = defaultdict(list)
     for name, indexes in sorted(data["groups"].items()):
         partitions = set(data["partitions"][indexes].tolist())

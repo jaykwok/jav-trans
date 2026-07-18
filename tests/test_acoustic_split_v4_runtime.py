@@ -169,4 +169,6 @@ def test_binary_inner_v2_applies_acoustic_core_and_drops_all_background() -> Non
     assert len(chunks) == 1
     assert (chunks[0].start, chunks[0].end) == (0.4, 2.6)
     assert (chunks[0].acoustic_start, chunks[0].acoustic_end) == (0.4, 2.6)
+    assert (chunks[0].display_start, chunks[0].display_end) == (0.0, 3.0)
+    assert chunks[0].display_duration == 3.0
     assert chunks[0].paired_inner_edges["action"] == "binary_core"
