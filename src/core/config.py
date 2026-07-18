@@ -77,10 +77,6 @@ DEFAULT_SETTINGS: dict[str, str] = {
         "jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame-hf=6144"
     ),
     "ASR_STAGE_WORKER_RAM_RATIO": "0.95",
-    # PDH shared-memory counters move in small WDDM bookkeeping increments.
-    # auto uses max(16MiB, physical VRAM * 0.2%) as a measurement deadband,
-    # not as usable shared-VRAM budget.
-    "ASR_STAGE_WORKER_SHARED_VRAM_TOLERANCE_MB": "auto",
     "ASR_STAGE_WORKER_HEARTBEAT_S": "10",
     # Cross-job auto-batch learning. Successful jobs below the utilization
     # threshold probe between the safe batch and current upper bound; OOM

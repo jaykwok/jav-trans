@@ -36,7 +36,6 @@ def test_vram_budget_enforced_on_allocated_not_reserved(monkeypatch):
 
 def test_shared_vram_spill_is_soft_oom(monkeypatch):
     monkeypatch.setenv("ASR_STAGE_WORKER_VRAM_BUDGET_MB", "5600")
-    monkeypatch.setenv("ASR_STAGE_WORKER_SHARED_VRAM_TOLERANCE_MB", "0")
     with pytest.raises(RuntimeError, match="shared VRAM spill"):
         asr_pipeline._enforce_vram_budget_from_snapshot(
             {
@@ -49,11 +48,8 @@ def test_shared_vram_spill_is_soft_oom(monkeypatch):
         )
 
 
-def test_shared_vram_auto_deadband_ignores_pdh_granularity_but_catches_spill(
-    monkeypatch,
-):
+def test_shared_vram_any_positive_spill_is_soft_oom(monkeypatch):
     monkeypatch.setenv("ASR_STAGE_WORKER_VRAM_BUDGET_MB", "5600")
-    monkeypatch.setenv("ASR_STAGE_WORKER_SHARED_VRAM_TOLERANCE_MB", "auto")
     base = {
         "stage": "split_done",
         "total_mb": 8188.0,
@@ -61,12 +57,9 @@ def test_shared_vram_auto_deadband_ignores_pdh_granularity_but_catches_spill(
         "physical_ram_budget_mb": 15000.0,
         "max_allocated_mb": 4800.0,
     }
-    asr_pipeline._enforce_vram_budget_from_snapshot(
-        {**base, "shared_vram_mb": 4.0}
-    )
-    with pytest.raises(RuntimeError, match="measurement_deadband_mb"):
+    with pytest.raises(RuntimeError, match="shared VRAM spill"):
         asr_pipeline._enforce_vram_budget_from_snapshot(
-            {**base, "shared_vram_mb": 20.0}
+            {**base, "shared_vram_mb": 0.001}
         )
 
 

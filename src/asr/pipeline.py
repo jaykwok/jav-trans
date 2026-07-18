@@ -27,7 +27,8 @@ from boundary.outer_refiner_v3 import load_outer_edge_refiner_v3
 from boundary.runtime_pipeline import (
     annotate_inner_edge_predictions,
     apply_binary_inner_edges_after_cueqc,
-    build_acoustic_split_v4_provisional_chunks,
+    build_acoustic_split_v4_provisional_chunks_from_refined,
+    refine_outer_islands,
 )
 from boundary.split_model import (
     SEMANTIC_SPLIT_V4_SCHEMA,
@@ -64,6 +65,7 @@ _VALID_ASR_BACKENDS = _registry_module._VALID_ASR_BACKENDS
 
 _LAST_BOUNDARY_SIGNATURE: dict = _chunking_module._LAST_BOUNDARY_SIGNATURE
 _LAST_BOUNDARY_CACHE_EVENT: dict | None = None
+_LAST_BOUNDARY_STAGE_MEMORY: list[dict] = []
 # APPEND=0 overwrites once per export path in this process; later same-path writes append for multi-video workflows.
 _PRE_ASR_EXPORT_OVERWRITTEN_PATHS: set[str] = set()
 _JSON_PAYLOAD_INLINE_ARRAY_LIMIT = 4096
@@ -361,6 +363,31 @@ def _boundary_cache_log_entry(event: dict | None) -> str | None:
     return None
 
 
+def _release_boundary_model_stage(stage: str) -> dict:
+    """Release one boundary model before the next stage is loaded."""
+
+    gc.collect()
+    try:
+        import torch
+
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+            torch.cuda.empty_cache()
+    except Exception:
+        pass
+    snapshot = _cuda_memory_snapshot(stage)
+    _enforce_vram_budget_from_snapshot(snapshot)
+    _LAST_BOUNDARY_STAGE_MEMORY.append(snapshot)
+    _pipeline_logger.info(
+        "[boundary] stage released stage=%s allocated=%s reserved=%s shared=%s",
+        stage,
+        snapshot.get("allocated_mb", 0.0),
+        snapshot.get("reserved_mb", 0.0),
+        snapshot.get("shared_vram_mb", 0.0),
+    )
+    return snapshot
+
+
 def _build_processing_spans(
     audio_path: str,
     *,
@@ -372,6 +399,7 @@ def _build_processing_spans(
 
     cfg = _boundary_config()
     _set_last_boundary_cache_event(None)
+    _LAST_BOUNDARY_STAGE_MEMORY.clear()
     outer_checkpoint_path = Path(cfg["outer_edge_refiner_model_path"])
     import torch
 
@@ -470,34 +498,7 @@ def _build_processing_spans(
     candidate_frame_scores = result.parameters.get("candidate_frame_scores")
     score_frame_hop_s = result.parameters.get("frame_hop_s")
     sequence_feature_frames = result.parameters.get("sequence_feature_frames")
-    outer_refiner = load_outer_edge_refiner_v3(
-        outer_checkpoint_path,
-        device=cfg["outer_edge_refiner_device"],
-        expected_ptm_repo_id=_current_asr_backend(),
-    )
-    split_verifier = load_acoustic_split_v4_planner(
-        split_checkpoint_path,
-        device=cfg["semantic_split_device"],
-        expected_ptm_repo_id=_current_asr_backend(),
-    )
-    inner_refiner = load_inner_edge_refiner_v2(
-        inner_checkpoint_path,
-        device=cfg["inner_edge_refiner_device"],
-        expected_ptm_repo_id=_current_asr_backend(),
-    )
     _require_learned_split_candidates(result.parameters)
-    _pipeline_logger.info(
-        "[boundary] semantic model devices "
-        "outer_requested=%s outer_actual=%s "
-        "split_requested=%s split_actual=%s "
-        "inner_requested=%s inner_actual=%s",
-        cfg["outer_edge_refiner_device"],
-        getattr(outer_refiner, "device", "unknown"),
-        cfg["semantic_split_device"],
-        getattr(split_verifier, "device", "unknown"),
-        cfg["inner_edge_refiner_device"],
-        getattr(inner_refiner, "device", "disabled"),
-    )
     sequence_feature_provider = _required_sequence_feature_provider_from_result(
         sequence_feature_frames,
         duration_s=result.audio_duration_sec,
@@ -528,8 +529,89 @@ def _build_processing_spans(
     result_parameters = {
         key: value
         for key, value in result.parameters.items()
-        if key not in {"frame_scores", "candidate_frame_scores", "sequence_feature_frames"}
+        if key not in {
+            "frame_scores",
+            "candidate_frame_scores",
+            "sequence_feature_frames",
+            "stage_memory_diagnostics",
+        }
     }
+    _LAST_BOUNDARY_STAGE_MEMORY.extend(
+        dict(row) for row in result.parameters.get("stage_memory_diagnostics") or ()
+    )
+    segments = result.segments
+    if segments and frame_scores is None:
+        raise ValueError("semantic boundary pipeline requires speech frame scores")
+    outer_refiner = load_outer_edge_refiner_v3(
+        outer_checkpoint_path,
+        device=cfg["outer_edge_refiner_device"],
+        expected_ptm_repo_id=_current_asr_backend(),
+    )
+    try:
+        outer_signature = outer_refiner.signature()
+        _pipeline_logger.info(
+            "[boundary] outer model requested=%s actual=%s",
+            cfg["outer_edge_refiner_device"],
+            getattr(outer_refiner, "device", "unknown"),
+        )
+        if on_stage is not None:
+            on_stage("外边界精修 0/1")
+        refined = refine_outer_islands(
+            segments,
+            duration_s=result.audio_duration_sec,
+            feature_provider=sequence_feature_provider,
+            outer_refiner=outer_refiner,
+        ) if segments else []
+        if on_stage is not None:
+            on_stage("外边界精修 1/1")
+    finally:
+        outer_refiner = None
+        _release_boundary_model_stage("outer_released")
+
+    split_verifier = load_acoustic_split_v4_planner(
+        split_checkpoint_path,
+        device=cfg["semantic_split_device"],
+        expected_ptm_repo_id=_current_asr_backend(),
+    )
+    try:
+        split_signature = split_verifier.signature()
+        _pipeline_logger.info(
+            "[boundary] split model requested=%s actual=%s",
+            cfg["semantic_split_device"],
+            getattr(split_verifier, "device", "unknown"),
+        )
+        packed = build_acoustic_split_v4_provisional_chunks_from_refined(
+            refined,
+            speech_probabilities=frame_scores,
+            feature_provider=sequence_feature_provider,
+            split_planner=split_verifier,
+        ) if refined else []
+    finally:
+        refined = []
+        split_verifier = None
+        _release_boundary_model_stage("split_released")
+
+    inner_refiner = load_inner_edge_refiner_v2(
+        inner_checkpoint_path,
+        device=cfg["inner_edge_refiner_device"],
+        expected_ptm_repo_id=_current_asr_backend(),
+    )
+    try:
+        inner_signature = inner_refiner.signature()
+        _pipeline_logger.info(
+            "[boundary] inner model requested=%s actual=%s",
+            cfg["inner_edge_refiner_device"],
+            getattr(inner_refiner, "device", "unknown"),
+        )
+        packed = annotate_inner_edge_predictions(
+            packed,
+            feature_provider=sequence_feature_provider,
+            inner_refiner=inner_refiner,
+        ) if packed else []
+    finally:
+        inner_refiner = None
+        _release_boundary_model_stage("inner_released")
+
     runtime_boundary_signature = {
         **result_parameters,
         "boundary_pipeline": {
@@ -549,14 +631,13 @@ def _build_processing_spans(
                 "speech_scores": frame_scores is not None,
                 "acoustic_candidate_scores": candidate_frame_scores is not None,
             },
-            "outer_edge_refiner": outer_refiner.signature(),
-            "semantic_split_model": split_verifier.signature(),
-            "inner_edge_refiner": inner_refiner.signature(),
+            "outer_edge_refiner": outer_signature,
+            "semantic_split_model": split_signature,
+            "inner_edge_refiner": inner_signature,
             "sequence_feature_provider": sequence_feature_provider.signature(),
             "semantic_boundary_config": {"decision_mode": "argmax_cut"},
         },
     }
-    segments = result.segments
     _set_last_boundary_signature(runtime_boundary_signature)
     if not segments:
         event = _boundary_cache_module.save_processing_spans(
@@ -576,22 +657,6 @@ def _build_processing_spans(
             )
             _set_last_boundary_cache_event(event)
         return []
-    if frame_scores is None:
-        raise ValueError("semantic boundary pipeline requires speech frame scores")
-    packed = build_acoustic_split_v4_provisional_chunks(
-        segments,
-        duration_s=result.audio_duration_sec,
-        speech_probabilities=frame_scores,
-        feature_provider=sequence_feature_provider,
-        outer_refiner=outer_refiner,
-        split_planner=split_verifier,
-        on_stage=on_stage,
-    )
-    packed = annotate_inner_edge_predictions(
-        packed,
-        feature_provider=sequence_feature_provider,
-        inner_refiner=inner_refiner,
-    )
     packed = _annotate_scorer_stats_on_packed_chunks(
         packed,
         frame_scores=frame_scores,
@@ -911,7 +976,14 @@ def _apply_pre_asr_cueqc(
             mode=getattr(model, "decision_mode", ""),
         )
     )
-    decisions = model.decide(candidates)
+    try:
+        decisions = model.decide(candidates)
+        model_signature = model.signature()
+    finally:
+        model = None
+        cueqc_memory_after_release = _release_boundary_model_stage(
+            "cueqc_released"
+        )
     candidate_by_index = {
         int(candidate.get("index", index)): candidate
         for index, candidate in enumerate(candidates)
@@ -960,7 +1032,8 @@ def _apply_pre_asr_cueqc(
             "drop_count": drop_count,
             "keep_count": keep_count,
             **confidence_stats,
-            "model": model.signature(),
+            "model": model_signature,
+            "memory_after_release": cueqc_memory_after_release,
             "decisions": decisions,
         }
     )
@@ -1250,6 +1323,11 @@ def _cuda_memory_snapshot(stage: str, *, elapsed_s: float | None = None) -> dict
 
         snapshot["cuda_available"] = bool(torch.cuda.is_available())
         if not torch.cuda.is_available():
+            snapshot.update(
+                _memory_safety_module.runtime_memory_snapshot(
+                    require_shared_vram=False,
+                )
+            )
             return snapshot
         device_index = torch.cuda.current_device()
         free_bytes, total_bytes = torch.cuda.mem_get_info(device_index)
@@ -1316,28 +1394,12 @@ def _enforce_vram_budget_from_snapshot(snapshot: dict) -> None:
         shared_vram_mb = float(snapshot.get("shared_vram_mb") or 0.0)
     except (TypeError, ValueError):
         shared_vram_mb = 0.0
-    shared_tolerance_raw = os.getenv(
-        "ASR_STAGE_WORKER_SHARED_VRAM_TOLERANCE_MB",
-        "auto",
-    ).strip().lower()
-    if shared_tolerance_raw in {"", "auto"}:
-        try:
-            total_mb = max(0.0, float(snapshot.get("total_mb") or 0.0))
-        except (TypeError, ValueError):
-            total_mb = 0.0
-        shared_tolerance_mb = max(16.0, total_mb * 0.002)
-    else:
-        try:
-            shared_tolerance_mb = max(0.0, float(shared_tolerance_raw))
-        except ValueError:
-            shared_tolerance_mb = 16.0
-    if shared_vram_mb > shared_tolerance_mb:
+    if shared_vram_mb > 0.0:
         raise RuntimeError(
             "GPU shared VRAM spill detected: "
             f"stage={snapshot.get('stage', '')} shared_vram_mb={shared_vram_mb:.3f} "
             f"raw_mb={snapshot.get('shared_vram_raw_mb', '')} "
-            f"baseline_mb={snapshot.get('shared_vram_baseline_mb', '')} "
-            f"measurement_deadband_mb={shared_tolerance_mb:.3f}"
+            f"baseline_mb={snapshot.get('shared_vram_baseline_mb', '')}"
         )
     try:
         physical_ram_used_mb = float(snapshot.get("physical_ram_used_mb"))
@@ -1503,6 +1565,7 @@ def _transcribe_and_align_local(
             on_stage=on_stage,
         )
         chunk_spans = _build_processing_spans(audio_path, on_stage=on_stage)
+        cuda_memory.extend(dict(row) for row in _LAST_BOUNDARY_STAGE_MEMORY)
         _release_stage_gpu_cache(
             log,
             cuda_memory,
@@ -1519,6 +1582,9 @@ def _transcribe_and_align_local(
             candidates=pre_asr_candidates,
             on_stage=on_stage,
         )
+        cueqc_release_memory = pre_asr_cueqc_report.get("memory_after_release")
+        if isinstance(cueqc_release_memory, dict):
+            cuda_memory.append(dict(cueqc_release_memory))
         if chunk_spans and all(isinstance(span, PackedChunk) for span in chunk_spans):
             chunk_spans = apply_binary_inner_edges_after_cueqc(chunk_spans)
         pre_asr_candidates = _pre_asr_candidates_with_decisions(

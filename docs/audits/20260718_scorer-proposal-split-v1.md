@@ -41,8 +41,8 @@ The previous trainer only guaranteed group-level partition isolation. It now rej
 
 ## Shared workflow blockers
 
-- Outer v3 remains an explicit `pending_outer_v3_audit` placeholder, so no end-to-end promotion is implied.
-- Scorer/Proposal are loaded together in the backend window loop; downstream Outer/Split/Inner are also loaded together in `_build_processing_spans`. A later workflow pass must make stage scopes explicit, release models/tensors between stages, and record allocated/reserved/shared VRAM under the `0.95` physical-cap rule.
+- Outer v3 now has audited candidate plumbing, but its registry remains empty with status `pending_outer_v3_audit`; no end-to-end promotion is implied.
+- The current audit-only Scorer v8/v9 path now releases a rejected scorer before returning; the downstream path loads and releases Outer, Split and Inner one at a time, with stage memory diagnostics kept outside the functional cache signature. CueQC also releases its model before postprocessing. A future successful Scorer v10 implementation must still split Scorer and Proposal inference into independent scopes; no old scorer can reach that path because runtime remains fail-fast.
 - Inner v2 now preserves provisional display timestamps while changing acoustic/ASR timestamps. This is covered by a focused regression test.
 - Scorer and Proposal batch scoring was checked on production checkpoints: singleton versus padded batch outputs preserve order and argmax, with max probability delta below `6e-8` on the smoke vectors.
 

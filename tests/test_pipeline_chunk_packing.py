@@ -320,6 +320,8 @@ def _reload_pipeline(monkeypatch, tmp_path: Path, *, enable_cueqc: bool = False)
     from asr import pipeline as asr
 
     asr = importlib.reload(asr)
+    boundary_stage_events: list[str] = []
+    asr._test_boundary_stage_events = boundary_stage_events
     monkeypatch.setattr(
         asr,
         "require_boundary_pipeline_ready",
@@ -328,17 +330,26 @@ def _reload_pipeline(monkeypatch, tmp_path: Path, *, enable_cueqc: bool = False)
     monkeypatch.setattr(
         asr,
         "load_outer_edge_refiner_v3",
-        lambda *_args, **_kwargs: _FakeBoundaryModel("outer_edge_refiner_v3"),
+        lambda *_args, **_kwargs: (
+            boundary_stage_events.append("outer_load")
+            or _FakeBoundaryModel("outer_edge_refiner_v3")
+        ),
     )
     monkeypatch.setattr(
         asr,
         "load_acoustic_split_v4_planner",
-        lambda *_args, **_kwargs: _FakeBoundaryModel("semantic_split_model_v4"),
+        lambda *_args, **_kwargs: (
+            boundary_stage_events.append("split_load")
+            or _FakeBoundaryModel("semantic_split_model_v4")
+        ),
     )
     monkeypatch.setattr(
         asr,
         "load_inner_edge_refiner_v2",
-        lambda *_args, **_kwargs: _FakeBoundaryModel("inner_edge_refiner_v2"),
+        lambda *_args, **_kwargs: (
+            boundary_stage_events.append("inner_load")
+            or _FakeBoundaryModel("inner_edge_refiner_v2")
+        ),
     )
     monkeypatch.setattr(
         asr,
@@ -347,8 +358,13 @@ def _reload_pipeline(monkeypatch, tmp_path: Path, *, enable_cueqc: bool = False)
     )
     monkeypatch.setattr(
         asr,
-        "build_acoustic_split_v4_provisional_chunks",
-        lambda segments, **_kwargs: [
+        "refine_outer_islands",
+        lambda segments, **_kwargs: list(segments),
+    )
+    monkeypatch.setattr(
+        asr,
+        "build_acoustic_split_v4_provisional_chunks_from_refined",
+        lambda refined, **_kwargs: [
             PackedChunk(
                 start=segment.start,
                 end=segment.end,
@@ -370,7 +386,7 @@ def _reload_pipeline(monkeypatch, tmp_path: Path, *, enable_cueqc: bool = False)
                 pre_asr_ptm_pooling_dim=len(_pre_asr_ptm_feature_names()),
                 pre_asr_ptm_pooled_features=_pre_asr_ptm_values(),
             )
-            for segment in segments
+            for segment in refined
         ],
     )
     monkeypatch.setattr(
@@ -383,6 +399,18 @@ def _reload_pipeline(monkeypatch, tmp_path: Path, *, enable_cueqc: bool = False)
         "_annotate_pre_asr_ptm_pooling_on_packed_chunks",
         lambda spans, **_kwargs: spans,
     )
+    def release_boundary_stage(stage):
+        boundary_stage_events.append(stage)
+        snapshot = {
+            "stage": stage,
+            "allocated_mb": 0.0,
+            "reserved_mb": 0.0,
+            "shared_vram_mb": 0.0,
+        }
+        asr._LAST_BOUNDARY_STAGE_MEMORY.append(snapshot)
+        return snapshot
+
+    monkeypatch.setattr(asr, "_release_boundary_model_stage", release_boundary_stage)
     return asr
 
 
@@ -438,6 +466,41 @@ def test_boundary_planner_emits_one_asr_chunk_per_speech_island(monkeypatch, tmp
     assert any("[chunk] idx=0" in entry and "speech_segment_count=1" in entry for entry in log)
 
 
+def test_boundary_models_load_and_release_in_strict_stage_order(monkeypatch, tmp_path):
+    asr = _reload_pipeline(monkeypatch, tmp_path)
+    monkeypatch.setattr(
+        asr._boundary_cache_module,
+        "load_processing_spans",
+        lambda *_args, **_kwargs: None,
+    )
+    source = tmp_path / "source_stage_lifecycle.wav"
+    _write_wav(source, seconds=12.0)
+
+    import boundary
+
+    monkeypatch.setattr(
+        boundary, "get_boundary_backend", lambda: _StubSpeechBoundaryBackend()
+    )
+    spans = asr._build_processing_spans(str(source))
+
+    assert len(spans) == 10
+    assert asr._test_boundary_stage_events == [
+        "outer_load",
+        "outer_released",
+        "split_load",
+        "split_released",
+        "inner_load",
+        "inner_released",
+    ]
+    assert "stage_memory_after_release" not in asr._LAST_BOUNDARY_SIGNATURE[
+        "boundary_pipeline"
+    ]
+    stage_memory = asr._LAST_BOUNDARY_STAGE_MEMORY
+    assert [row["stage"] for row in stage_memory] == [
+        "outer_released", "split_released", "inner_released"
+    ]
+
+
 def test_pipeline_persists_pre_asr_candidates_before_transcription(monkeypatch, tmp_path):
     backend, _segments, _log, details = _run_transcription(monkeypatch, tmp_path)
 
@@ -447,6 +510,35 @@ def test_pipeline_persists_pre_asr_candidates_before_transcription(monkeypatch, 
     assert candidates[0]["video_id"] == "source_boundary"
     assert candidates[0]["feature_names"]
     assert "text" not in " ".join(candidates[0]["feature_names"]).lower()
+
+
+def test_pre_asr_cueqc_model_is_released_before_postprocessing(monkeypatch, tmp_path):
+    asr = _reload_pipeline(monkeypatch, tmp_path)
+
+    class _CueQC:
+        decision_mode = "argmax"
+
+        def decide(self, _candidates):
+            return [{"index": 0, "route": "keep_for_asr", "confidence": 0.9}]
+
+        def signature(self):
+            return {"schema": "cueqc_pre_asr_semantic_chunk_v13"}
+
+    monkeypatch.setattr(asr._pre_asr_cueqc_module, "enabled", lambda: True)
+    monkeypatch.setattr(
+        asr._pre_asr_cueqc_module, "load_active", lambda **_kwargs: _CueQC()
+    )
+    spans = [(0.0, 1.0)]
+    kept, report = asr._apply_pre_asr_cueqc(
+        spans,
+        log=[],
+        candidates=[{"index": 0, "sample_id": "cueqc-stage"}],
+    )
+
+    assert kept == spans
+    assert report["model"]["schema"] == "cueqc_pre_asr_semantic_chunk_v13"
+    assert report["memory_after_release"]["stage"] == "cueqc_released"
+    assert asr._test_boundary_stage_events == ["cueqc_released"]
 
 
 def test_pipeline_exports_pre_asr_candidates_only_when_requested(monkeypatch, tmp_path):

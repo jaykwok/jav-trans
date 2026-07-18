@@ -124,7 +124,6 @@ def test_default_model_download_root_is_project_models():
     minimum_vram_table = config.DEFAULT_SETTINGS["ASR_MIN_PHYSICAL_VRAM_MB_BY_REPO"]
     assert "Qwen3-ASR-0.6B-JA-Anime-Galgame-hf=4096" in minimum_vram_table
     assert "Qwen3-ASR-1.7B-JA-Anime-Galgame-hf=6144" in minimum_vram_table
-    assert config.DEFAULT_SETTINGS["ASR_STAGE_WORKER_SHARED_VRAM_TOLERANCE_MB"] == "auto"
     assert config.DEFAULT_SETTINGS["ASR_STAGE_WORKER_HEARTBEAT_S"] == "10"
     assert config.DEFAULT_SETTINGS["ASR_BATCH_SIZE"] == "auto"
     assert "Qwen3-ASR-0.6B-JA-Anime-Galgame-hf=12" in config.DEFAULT_SETTINGS["ASR_BATCH_SIZE_BY_REPO"]

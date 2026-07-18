@@ -151,6 +151,7 @@ Web 会在模型要求检查中提示驱动过旧或 CUDA 初始化失败。
 - 7 秒是字幕显示 soft guard，不是 ASR chunk 上限。
 - Runtime 不使用具体词黑名单或时长启发式删除短促人声；是否进入 ASR 由 Pre-ASR CueQC 模型标签决定。
 - 1.7B Split v4、CueQC v13 与 Inner v2 只使用二分类 argmax，不读取 runtime threshold，不提供旧三分类 alias 或规则 fallback。Scorer v8 的 threshold/hysteresis 路径仅用于离线审计；当前 segment runtime 会明确拒绝它，等待二分类 Scorer v10。
+- Boundary 阶段按 Outer、Split、Inner、CueQC 的独立生命周期串行释放模型；allocated/reserved/shared VRAM 只写运行诊断，不参与 cache 签名。显式 CUDA 请求不可用时直接报错，不回退 CPU；任何正 shared VRAM spill 都是 soft OOM。
 - 1.7B Outer registry 当前为空；选择该档会在模型加载前明确报告 `pending_outer_v3_audit`。
 - 0.6B Boundary registry 当前为空；选择该档会在模型加载前明确报告 `pending_binary_retrain`。
 
@@ -215,7 +216,7 @@ PRE_ASR_CUEQC_ENABLED=1
 
 ASR stage 固定由统一 GPU worker 持有 CUDA：Boundary/PTM feature extraction、Pre-ASR CueQC、ASR 和对齐都在同一个 GPU owner 进程里顺序执行，Web / 调度主进程只做任务编排、缓存索引和输出写入。OOM、CUDA 状态异常或超过 `ASR_STAGE_WORKER_VRAM_BUDGET_MB` 时会杀掉 worker，不会把 Web 主进程一起带崩。
 
-`ASR_STAGE_WORKER_VRAM_BUDGET_MB=auto` 按物理 dedicated VRAM × `0.95` 计算软 OOM 线；RTX 4060 Ti `8188MiB` 的 cap 约为 `7779MiB`。当前 1.7B 完整推理链要求至少 `6144MiB` 物理 dedicated VRAM，并在模型加载前检查；shared VRAM、显式放大的 worker budget 和 CPU fallback 都不能绕过。Windows worker 使用 PDH 记录 CUDA 空载时的 shared VRAM 基线；自动检测死区为 `max(16MiB, 物理显存×0.2%)`，用于过滤 WDDM 计数器的 4MiB 级记账抖动，不属于可用 shared 预算，超过死区仍立即视为 soft OOM。监控不可用会直接停止。物理 RAM 使用按 `total-available` 计算，超过 `total × ASR_STAGE_WORKER_RAM_RATIO`（默认 `0.95`）同样停止。
+`ASR_STAGE_WORKER_VRAM_BUDGET_MB=auto` 按物理 dedicated VRAM × `0.95` 计算软 OOM 线；RTX 4060 Ti `8188MiB` 的 cap 约为 `7779MiB`。当前 1.7B 完整推理链要求至少 `6144MiB` 物理 dedicated VRAM，并在模型加载前检查；shared VRAM 不计入可用预算，任何正的基线增量都立即视为 soft OOM，显式放大的 worker budget 和 CPU fallback 都不能绕过。监控不可用会直接停止。物理 RAM 使用按 `total-available` 计算，超过 `total × ASR_STAGE_WORKER_RAM_RATIO`（默认 `0.95`）同样停止。
 
 GPU worker 默认每 10 秒输出一次当前阶段、总耗时和静默时长心跳。字幕 cue plan 会单独记录 timeline normalize、两轮 anchor-aware DP、polish 和 finalize 进度。
 

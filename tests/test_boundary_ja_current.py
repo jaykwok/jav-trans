@@ -126,6 +126,16 @@ def test_v8_threshold_scorer_is_audit_only_for_current_runtime() -> None:
         require_current_runtime_scorer(_V9())
 
 
+def test_boundary_explicit_cuda_request_never_falls_back_to_cpu(monkeypatch) -> None:
+    import torch
+    from boundary.ja.backend import _model_device
+
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+    with pytest.raises(RuntimeError, match="CPU fallback is disabled"):
+        _model_device("cuda")
+    assert str(_model_device("auto")) == "cpu"
+
+
 def test_proposal_checkpoint_without_mapping_keeps_bootstrap(monkeypatch) -> None:
     from boundary.ja.backend import _proposal_checkpoint_from_env
 
