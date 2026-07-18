@@ -6,12 +6,14 @@ import pytest
 from boundary.ja.backend import (
     SpeechBoundaryJaBackend,
     SpeechBoundaryJaConfig,
+    decode_binary_speech_island_segments,
     decode_semantic_speech_island_segments,
     decode_speech_island_segments,
     require_current_runtime_scorer,
 )
 from boundary.ja.model import (
     SPEECH_ISLAND_SCORER_V8_SCHEMA,
+    SPEECH_ISLAND_SCORER_V10_SCHEMA,
     SPEECH_ISLAND_MEMBERSHIP_LABELS,
     SPEECH_ISLAND_SCORER_DECODER,
     SPEECH_ISLAND_SCORER_LABELS,
@@ -93,6 +95,31 @@ def test_semantic_decoder_does_not_split_on_internal_discardable_content() -> No
     assert [(item.start, item.end) for item in result.segments] == [(0.0, 0.06)]
 
 
+def test_binary_v10_decoder_uses_argmax_without_threshold_or_dilation() -> None:
+    probabilities = np.asarray(
+        [[0.6, 0.4], [0.49, 0.51], [0.2, 0.8], [0.7, 0.3]],
+        dtype=np.float32,
+    )
+    result = decode_binary_speech_island_segments(
+        class_probabilities=probabilities,
+        candidate_probabilities=np.zeros(4, dtype=np.float32),
+        duration_s=0.08,
+        config=SpeechBoundaryJaConfig(
+            threshold=0.99,
+            frame_dilation_s=10.0,
+            min_segment_s=10.0,
+            frame_hop_s=0.02,
+        ),
+    )
+
+    assert result.decision_mode == "binary_frame_argmax"
+    assert result.speech_on_threshold is None
+    assert result.speech_off_threshold is None
+    assert result.raw_frames.tolist() == [0, 1, 1, 0]
+    assert result.dilated_frames.tolist() == [0, 1, 1, 0]
+    assert [(row.start, row.end) for row in result.segments] == [(0.02, 0.06)]
+
+
 def test_17b_signature_has_no_fixed_speech_threshold_and_06b_is_retired() -> None:
     config_17b = SpeechBoundaryJaConfig(
         scorer_checkpoint=(
@@ -124,6 +151,12 @@ def test_v8_threshold_scorer_is_audit_only_for_current_runtime() -> None:
 
     with pytest.raises(RuntimeError, match="pending_binary_scorer_audit"):
         require_current_runtime_scorer(_V9())
+
+    class _V10Candidate:
+        schema = SPEECH_ISLAND_SCORER_V10_SCHEMA
+
+    with pytest.raises(RuntimeError, match="pending_binary_scorer_audit"):
+        require_current_runtime_scorer(_V10Candidate())
 
 
 def test_boundary_explicit_cuda_request_never_falls_back_to_cpu(monkeypatch) -> None:

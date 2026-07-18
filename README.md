@@ -117,6 +117,7 @@ Web 会在模型要求检查中提示驱动过旧或 CUDA 初始化失败。
      - MFCC / timing numeric features
   -> Speech-island scorer（1.7B binary-argmax v10 待审计/重训）
      - Scorer v8 仅保留为 threshold/hysteresis 审计参考，不进入当前生产 runtime
+     - v10 schema/model/trainer plumbing 已完成；等待含 all-background control 的冻结 full-source canonical 数据与人工 gate
   -> BoundaryProposalScorer v1（候选源审计中）
      - 学习型高召回 acoustic candidate source，不做 final cut decision
   -> 按 ASR repo 进入互不混用的边界链
@@ -164,7 +165,7 @@ Web 会在模型要求检查中提示驱动过旧或 CUDA 初始化失败。
 - `jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame-hf`：默认高质量档。
 - `jaykwok/Qwen3-ASR-0.6B-JA-Anime-Galgame-hf`：仅保留 ASR repo 与空 Boundary registry placeholder；全链重训留作未来 backlog，本轮不训练、不修改。
 
-1.7B 绑定待重构的 binary Speech-island scorer、高召回边界候选、待真实数据训练的 Outer、Acoustic Split、Pre-ASR CueQC 与 binary acoustic Inner。0.6B 的旧小模型已退役并保持空 placeholder；未来 backlog 若重启，必须重新提取 0.6B PTM features 并从头训练，不借用 1.7B feature cache、投影或 checkpoint。
+1.7B 绑定已完成合同 plumbing、待真实 canonical 数据训练的 binary Speech-island scorer、高召回边界候选、待真实 Scorer 输出训练的 Outer、Acoustic Split、Pre-ASR CueQC 与 binary acoustic Inner。0.6B 的旧小模型已退役并保持空 placeholder；未来 backlog 若重启，必须重新提取 0.6B PTM features 并从头训练，不借用 1.7B feature cache、投影或 checkpoint。
 
 所有小模型统一放在：
 
