@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Project exact unique-core spans onto new Runtime v11 provisional chunks."""
+"""Project exact unique-core spans onto new Runtime v12 provisional chunks."""
 from __future__ import annotations
 
 import argparse
@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Any, Iterable
 
 
-SCHEMA = "cueqc_v13_runtime_v11_exact_core_label_v2"
+SCHEMA = "cueqc_v13_runtime_v12_exact_core_label_v2"
 SUMMARY_SCHEMA = "cueqc_v13_runtime_chunk_label_summary_v1"
 SAMPLE_RATE = 16000
 

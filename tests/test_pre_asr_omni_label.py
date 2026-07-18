@@ -14,7 +14,7 @@ def test_default_omni_env_file_is_provider_neutral() -> None:
 
 
 def test_runtime_batch_parse_error_does_not_disable_multi_audio() -> None:
-    from tools.asr.cueqc import label_runtime_v11_cueqc_v13_with_omni as runtime
+    from tools.asr.cueqc import label_runtime_v12_cueqc_v13_with_omni as runtime
 
     assert not runtime._multi_audio_unsupported(
         ValueError("Expecting ',' delimiter: line 55 column 6")
@@ -28,17 +28,17 @@ def test_runtime_batch_parse_error_does_not_disable_multi_audio() -> None:
     assert not runtime._moderation_rejected(ValueError("The audio is empty"))
 
 
-def test_runtime_v11_teacher_rejects_old_runtime_chunks() -> None:
-    from tools.asr.cueqc import label_runtime_v11_cueqc_v13_with_omni as runtime
+def test_runtime_v12_teacher_rejects_old_runtime_chunks() -> None:
+    from tools.asr.cueqc import label_runtime_v12_cueqc_v13_with_omni as runtime
 
-    with pytest.raises(ValueError, match="fresh Runtime v11"):
+    with pytest.raises(ValueError, match="fresh Runtime v12"):
         runtime._validate_runtime_rows(
             [
                 {
                     "schema": "runtime_v10_provisional_subisland_v1",
                     "subisland_id": "old",
                     "pre_asr_candidate": {
-                        "boundary_pipeline_version": 10,
+                        "boundary_contract_id": "retired-boundary-contract",
                         "schema": "pre_asr_cueqc_features_v9",
                     },
                 }

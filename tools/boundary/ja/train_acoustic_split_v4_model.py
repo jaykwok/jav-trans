@@ -32,11 +32,11 @@ from boundary.split_model import (  # noqa: E402
     IslandCandidateSequenceNetwork,
     build_acoustic_split_v4_checkpoint,
 )
-from tools.boundary.ja.train_semantic_split_island_model import (  # noqa: E402
-    _pair_loss,
-    _pad_batch,
+from tools.boundary.ja.acoustic_split_v4_dataset import (  # noqa: E402
     island_batches,
     load_island_dataset,
+    pad_batch,
+    pair_loss,
 )
 
 
@@ -124,86 +124,6 @@ def build_lr_scheduler(optimizer, *, warmup_steps: int, max_steps: int):
         return 0.5 * (1.0 + math.cos(math.pi * min(1.0, progress)))
 
     return torch.optim.lr_scheduler.LambdaLR(optimizer, multiplier)
-
-
-def initialize_from_v2_checkpoint(
-    model,
-    path: Path,
-    *,
-    raw_frame_mean: np.ndarray,
-    raw_frame_std: np.ndarray,
-    ptm_dim: int,
-) -> dict[str, Any]:
-    """Warm-start v4 while embedding v2's learned affine PTM projection."""
-
-    import torch
-
-    payload = torch.load(path, map_location="cpu", weights_only=False)
-    state = payload["model_state_dict"]
-    own = model.state_dict()
-    loaded = 0
-    for key, value in state.items():
-        if key in own and own[key].shape == value.shape:
-            own[key] = value
-            loaded += 1
-    old_segments = state.get("segment_embedding")
-    if old_segments is not None and "segment_embedding" in own:
-        count = min(int(old_segments.shape[0]), int(own["segment_embedding"].shape[0]))
-        own["segment_embedding"][:count] = old_segments[:count]
-    model.load_state_dict(own)
-
-    feature_config = dict(payload.get("feature_config") or {})
-    projection = dict(feature_config.get("ptm_projection") or {})
-    components = np.asarray(projection["components"], dtype=np.float64)
-    projection_mean = np.asarray(projection["mean"], dtype=np.float64)
-    old_normalization = dict(payload["normalization"])
-    old_mean = np.asarray(old_normalization["frame_mean"], dtype=np.float64)
-    old_std = np.maximum(
-        np.asarray(old_normalization["frame_std"], dtype=np.float64), 1e-6
-    )
-    projected_dim = int(components.shape[0])
-    if components.shape != (projected_dim, ptm_dim):
-        raise ValueError("v2 PTM projection dimensions do not match v4 input")
-    raw_mean = np.asarray(raw_frame_mean, dtype=np.float64)
-    raw_std = np.maximum(np.asarray(raw_frame_std, dtype=np.float64), 1e-6)
-    projector_weight = (
-        components * raw_std[:ptm_dim][None, :] / old_std[:projected_dim, None]
-    )
-    ptm_offset = (
-        components @ (raw_mean[:ptm_dim] - projection_mean)
-        - old_mean[:projected_dim]
-    ) / old_std[:projected_dim]
-
-    mfcc_dim = int(raw_mean.size - ptm_dim)
-    old_mfcc_mean = old_mean[projected_dim : projected_dim + mfcc_dim]
-    old_mfcc_std = old_std[projected_dim : projected_dim + mfcc_dim]
-    mfcc_scale = raw_std[ptm_dim:] / old_mfcc_std
-    mfcc_offset = (raw_mean[ptm_dim:] - old_mfcc_mean) / old_mfcc_std
-    with torch.no_grad():
-        model.ptm_projector.weight.copy_(
-            torch.from_numpy(projector_weight.astype(np.float32)).to(
-                model.ptm_projector.weight.device
-            )
-        )
-        frame_weight = model.frame_proj.weight
-        old_mfcc_weight = frame_weight[:, projected_dim:].clone()
-        frame_weight[:, projected_dim:].mul_(
-            torch.from_numpy(mfcc_scale.astype(np.float32)).to(frame_weight.device)[
-                None, :
-            ]
-        )
-        model.frame_proj.bias.add_(
-            frame_weight[:, :projected_dim]
-            @ torch.from_numpy(ptm_offset.astype(np.float32)).to(frame_weight.device)
-            + old_mfcc_weight
-            @ torch.from_numpy(mfcc_offset.astype(np.float32)).to(frame_weight.device)
-        )
-    return {
-        "path": str(path),
-        "loaded_tensors": loaded,
-        "embedded_projection": "learned_v2_linear_then_trainable",
-        "projected_dim": projected_dim,
-    }
 
 
 def _classification_metrics(truth: np.ndarray, predicted: np.ndarray) -> dict[str, Any]:
@@ -315,7 +235,7 @@ def evaluate(
             batch_islands=batch_islands,
             max_batch_candidates=max_batch_candidates,
         ):
-            frames, scalars, mask, labels, *_rest = _pad_batch(
+            frames, scalars, mask, labels, *_rest = pad_batch(
                 data,
                 batch,
                 frame_mean=normalization["frame_mean"],
@@ -444,21 +364,10 @@ def run(args: argparse.Namespace) -> None:
         "ptm_input_dim": args.ptm_dim,
         "ptm_projected_dim": args.ptm_projector_dim,
         "ptm_projector_residual": False,
-        "aux_label_dim": 2,
+        "num_classes": 2,
     }
     device = torch.device(args.device)
     model = IslandCandidateSequenceNetwork(**model_config).to(device)
-    init_report = (
-        initialize_from_v2_checkpoint(
-            model,
-            Path(args.init_v2_checkpoint),
-            raw_frame_mean=normalization["frame_mean"],
-            raw_frame_std=normalization["frame_std"],
-            ptm_dim=args.ptm_dim,
-        )
-        if args.init_v2_checkpoint
-        else None
-    )
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.learning_rate)
     scheduler = build_lr_scheduler(
         optimizer, warmup_steps=args.warmup_steps, max_steps=args.max_steps
@@ -497,7 +406,7 @@ def run(args: argparse.Namespace) -> None:
 
     for step in range(1, args.max_steps + 1):
         model.train()
-        frames, scalars, mask, labels, roles, pairs, *_rest = _pad_batch(
+        frames, scalars, mask, labels, roles, pairs = pad_batch(
             data,
             sample_batch(),
             frame_mean=normalization["frame_mean"],
@@ -534,7 +443,7 @@ def run(args: argparse.Namespace) -> None:
             role_targets.reshape(-1),
             ignore_index=IGNORE_ID,
         )
-        pair_term = _pair_loss(
+        pair_term = pair_loss(
             torch.softmax(label_logits, dim=-1)[..., 0],
             labels.to(device),
             pairs.to(device),
@@ -646,7 +555,6 @@ def run(args: argparse.Namespace) -> None:
                 "manual_label_overrides": manual_override_summary,
                 "manual_group_repeat": int(args.manual_group_repeat),
                 "timing_output": "semantic_event_only",
-                "init_report": init_report,
                 "loss": {
                     "cut_weight": args.cut_weight,
                     "continue_weight": args.continue_weight,
@@ -715,7 +623,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--focal-gamma", type=float, default=1.5)
     parser.add_argument("--role-aux-weight", type=float, default=0.3)
     parser.add_argument("--pair-loss-weight", type=float, default=0.3)
-    parser.add_argument("--init-v2-checkpoint", default="")
     parser.add_argument(
         "--shuffle-block-groups",
         type=int,

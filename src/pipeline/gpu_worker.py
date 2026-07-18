@@ -42,7 +42,7 @@ LOW_VRAM_ASR_BACKEND = "jaykwok/Qwen3-ASR-0.6B-JA-Anime-Galgame-hf"
 _PROFILE_MARKER_SUFFIX = "__PROFILE_ACTIVE"
 _PROFILE_STAGE_BY_SETTING = {
     "ASR_BATCH_SIZE": "asr_text_transcribe",
-    "SEMANTIC_SPLIT_INFERENCE_BATCH_SIZE": "semantic_split_model",
+    "ACOUSTIC_SPLIT_MAX_BATCH_CANDIDATES": "semantic_split_model",
 }
 
 
@@ -638,8 +638,8 @@ def _adaptive_runtime_tuning(
             )
 
     semantic_raw = str(
-        env.get("SEMANTIC_SPLIT_INFERENCE_BATCH_SIZE")
-        or os.getenv("SEMANTIC_SPLIT_INFERENCE_BATCH_SIZE", "auto")
+        env.get("ACOUSTIC_SPLIT_MAX_BATCH_CANDIDATES")
+        or os.getenv("ACOUSTIC_SPLIT_MAX_BATCH_CANDIDATES", "auto")
     ).strip().lower()
     semantic_identity = _profile_identity(
         stage="semantic_split_model",
@@ -649,15 +649,15 @@ def _adaptive_runtime_tuning(
         env=env,
     )
     semantic_batch, semantic_profile = _auto_batch_setting(
-        setting="SEMANTIC_SPLIT_INFERENCE_BATCH_SIZE",
+        setting="ACOUSTIC_SPLIT_MAX_BATCH_CANDIDATES",
         stage="semantic_split_model",
         raw_value=semantic_raw,
         base_batch=128,
         scale=scale,
         identity=semantic_identity,
     )
-    batch_profiles["SEMANTIC_SPLIT_INFERENCE_BATCH_SIZE"] = semantic_profile
-    os.environ["SEMANTIC_SPLIT_INFERENCE_BATCH_SIZE"] = str(semantic_batch)
+    batch_profiles["ACOUSTIC_SPLIT_MAX_BATCH_CANDIDATES"] = semantic_profile
+    os.environ["ACOUSTIC_SPLIT_MAX_BATCH_CANDIDATES"] = str(semantic_batch)
 
     return {
         "device_name": device_name,
@@ -675,7 +675,7 @@ def _adaptive_runtime_tuning(
         ),
         "asr_batch_size": effective_batch,
         "asr_batch_source": batch_source,
-        "semantic_split_batch_size": semantic_batch,
+        "acoustic_split_max_batch_candidates": semantic_batch,
         "batch_profiles": batch_profiles,
     }
 
@@ -775,8 +775,6 @@ def _oom_stage_from_message(message: str) -> str:
         return "semantic_split_model"
     if "外边界" in text:
         return "outer_edge_refiner"
-    if "内部切点" in text:
-        return "cut_edge_refiner"
     return ""
 
 
@@ -801,7 +799,6 @@ def _oom_downshift(
     if stage in {
         "speech_island_scorer",
         "outer_edge_refiner",
-        "cut_edge_refiner",
         "pre_asr_cueqc",
     } or "stage=split_done" in detail or "stage=pre_asr_boundary" in detail:
         # Boundary/PTM inputs are temporal. Shrinking the 20-second window would
@@ -847,7 +844,7 @@ def _terminal_oom_detail(
             "GPU 显存不足：OOM 出现在 SpeechBoundary/PTM 时序推理；"
             "为避免缩短窗口改变推理结果，任务已停止。"
         )
-    elif failed_setting == "SEMANTIC_SPLIT_INFERENCE_BATCH_SIZE":
+    elif failed_setting == "ACOUSTIC_SPLIT_MAX_BATCH_CANDIDATES":
         headline = (
             "GPU 显存不足：Semantic Split batch 已降到 1 后仍然 OOM，"
             "任务已停止。"
@@ -1073,7 +1070,8 @@ def worker_main(parent_conn: Connection) -> None:
                     "GPU batch tuning "
                     f"asr={runtime_tuning.get('asr_batch_size')} "
                     f"asr_source={runtime_tuning.get('asr_batch_source')} "
-                    f"semantic_split={runtime_tuning.get('semantic_split_batch_size')} "
+                    "acoustic_split_max_batch_candidates="
+                    f"{runtime_tuning.get('acoustic_split_max_batch_candidates')} "
                     f"budget_mb={runtime_tuning.get('vram_budget_mb')}"
                 )
                 model_manager = GpuModelManager(
@@ -1502,13 +1500,12 @@ class _GpuWorkerClient:
                         _effective_asr_batch_size(current_env)
                     )
                     failed_setting = (
-                        "SEMANTIC_SPLIT_INFERENCE_BATCH_SIZE"
+                        "ACOUSTIC_SPLIT_MAX_BATCH_CANDIDATES"
                         if exc.stage == "semantic_split_model"
                         else "SPEECH_BOUNDARY_JA_WINDOW_S"
                         if exc.stage in {
                             "speech_island_scorer",
                             "outer_edge_refiner",
-                            "cut_edge_refiner",
                             "pre_asr_cueqc",
                         }
                         or "stage=split_done" in str(exc.detail or "").lower()

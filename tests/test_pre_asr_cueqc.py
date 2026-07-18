@@ -11,6 +11,7 @@ import numpy as np
 from asr import pre_asr_cueqc
 from audio.chunk_packer import PackedChunk
 from boundary.base import SpeechSegment
+from boundary.contracts import ACOUSTIC_BINARY_V12_CONTRACT
 from boundary.sequence_features import (
     CHUNK_LEARNED_PROJECTED_PTM_SCHEMA,
     FrameSequenceFeatureConfig,
@@ -56,7 +57,7 @@ def _pre_asr_candidate(index: int, *, video_id: str = "AAA", cluster_id: str = "
                 "end": float(index) + 0.5,
                 "scorer_speech_mean": 0.8,
                 "scorer_split_p90": 0.2,
-                "boundary_pipeline_version": 11,
+                "boundary_contract_id": ACOUSTIC_BINARY_V12_CONTRACT.contract_id,
                 **_ptm_pooling_fields(),
             }
         ],
@@ -86,20 +87,6 @@ def test_pre_asr_cueqc_feature_schema_excludes_asr_text_fields():
         assert banned not in names
 
 
-def test_pre_asr_drop_threshold_env_rejects_invalid_value(monkeypatch):
-    monkeypatch.setenv("PRE_ASR_CUEQC_DROP_THRESHOLD", "0,95")
-
-    with pytest.raises(ValueError, match="PRE_ASR_CUEQC_DROP_THRESHOLD"):
-        pre_asr_cueqc._drop_threshold_from_env(0.95)
-
-
-def test_pre_asr_drop_threshold_env_rejects_out_of_range_value(monkeypatch):
-    monkeypatch.setenv("PRE_ASR_CUEQC_DROP_THRESHOLD", "1.5")
-
-    with pytest.raises(ValueError, match=r"\[0, 1\]"):
-        pre_asr_cueqc._drop_threshold_from_env(0.95)
-
-
 def test_pre_asr_cueqc_candidate_uses_numeric_chunk_features_only():
     spans = [
         {
@@ -111,7 +98,7 @@ def test_pre_asr_cueqc_candidate_uses_numeric_chunk_features_only():
             "asr_confidence": 0.1,
             "scorer_speech_mean": 0.8,
             "scorer_split_p90": 0.2,
-            "boundary_pipeline_version": 11,
+            "boundary_contract_id": ACOUSTIC_BINARY_V12_CONTRACT.contract_id,
         }
     ]
 
@@ -134,7 +121,7 @@ def test_pre_asr_cueqc_candidate_includes_micro_numeric_features():
             speech_segments=[SpeechSegment(0.0, 0.5)],
             duration=0.5,
             split_reason="unit",
-            boundary_pipeline_version=11,
+            boundary_contract_id=ACOUSTIC_BINARY_V12_CONTRACT.contract_id,
             subtitle_min_duration_s=20.0 / 24.0,
             below_subtitle_min_duration=True,
             micro_chunk_candidate=True,
@@ -170,7 +157,7 @@ def test_pre_asr_cueqc_v10_preserves_split_edge_soft_features():
             speech_segments=[SpeechSegment(0.0, 0.6)],
             duration=0.6,
             split_reason="semantic_split_model",
-            boundary_pipeline_version=11,
+            boundary_contract_id=ACOUSTIC_BINARY_V12_CONTRACT.contract_id,
             primary_cut_candidates=[
                 {
                     "kind": "primary",
@@ -226,6 +213,7 @@ def test_pre_asr_cueqc_candidate_uses_chunk_pooled_ptm_embedding():
             speech_segments=[SpeechSegment(0.0, 1.0)],
             duration=1.0,
             split_reason="unit",
+            boundary_contract_id=ACOUSTIC_BINARY_V12_CONTRACT.contract_id,
             **_ptm_pooling_fields(),
         )
     ]
@@ -264,6 +252,7 @@ def test_pre_asr_cueqc_requires_pooled_ptm_when_requested():
             speech_segments=[SpeechSegment(0.0, 1.0)],
             duration=1.0,
             split_reason="unit",
+            boundary_contract_id=ACOUSTIC_BINARY_V12_CONTRACT.contract_id,
         )
     ]
 
@@ -380,6 +369,9 @@ def _tiny_v13_checkpoint(
             "asr_repo_id": "jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame-hf",
             "semantic_split_weights_sha256": split_sha,
             "inner_edge_refiner_weights_sha256": inner_sha,
+            "boundary_serialization_contract_id": (
+                ACOUSTIC_BINARY_V12_CONTRACT.contract_id
+            ),
             "training_labels": ["drop", "keep"],
             "excluded_training_labels": ["unsure"],
             "excluded_training_label_count": 0,
@@ -396,6 +388,96 @@ def test_pre_asr_cueqc_v13_rejects_enabled_hard_rules(tmp_path: Path):
 
     with pytest.raises(ValueError, match="must disable hard rules"):
         pre_asr_cueqc.load_checkpoint(checkpoint, device="cpu")
+
+
+def test_pre_asr_cueqc_inference_batches_independent_planned_islands(tmp_path: Path):
+    torch = pytest.importorskip("torch")
+    checkpoint = _tiny_v13_checkpoint(tmp_path)
+    runtime = pre_asr_cueqc.load_checkpoint(checkpoint, device="cpu")
+
+    class RecordingModel:
+        def __init__(self) -> None:
+            self.batch_sizes: list[int] = []
+
+        def __call__(self, ptm_bins, scalar_features, *, chunk_mask, bin_mask):
+            del scalar_features, chunk_mask, bin_mask
+            self.batch_sizes.append(int(ptm_bins.shape[0]))
+            logits = torch.zeros(
+                (ptm_bins.shape[0], ptm_bins.shape[1], 2),
+                dtype=torch.float32,
+                device=ptm_bins.device,
+            )
+            logits[..., 1] = 1.0
+            return logits
+
+    recorder = RecordingModel()
+    runtime.model = recorder
+    candidates = []
+    for index in range(130):
+        candidate = _pre_asr_candidate(index)
+        candidate["planned_island_id"] = f"island-{index:04d}"
+        candidates.append(candidate)
+
+    decisions = runtime.decide(candidates)
+
+    assert recorder.batch_sizes == [64, 64, 2]
+    assert [row["index"] for row in decisions] == list(range(130))
+    assert {row["label"] for row in decisions} == {"keep"}
+
+
+def test_pre_asr_cueqc_group_batch_planner_respects_padding_budget() -> None:
+    mask = np.zeros((6, 100), dtype=np.float32)
+    for group_index, length in enumerate((2, 2, 100, 3, 3, 3)):
+        mask[group_index, :length] = 1.0
+
+    batches = pre_asr_cueqc.inference_group_batches(
+        mask,
+        max_groups=4,
+        max_padded_chunks=12,
+    )
+
+    assert batches == [(0, 2, 2), (2, 3, 100), (3, 6, 3)]
+    assert [index for start, end, _used in batches for index in range(start, end)] == list(
+        range(6)
+    )
+
+
+def test_pre_asr_cueqc_v13_keeps_one_long_island_sequence_intact(tmp_path: Path):
+    torch = pytest.importorskip("torch")
+    checkpoint = _tiny_v13_checkpoint(tmp_path)
+    payload = torch.load(checkpoint, map_location="cpu", weights_only=False)
+    payload["decision_config"]["inference_window_size"] = 8
+    torch.save(payload, checkpoint)
+    runtime = pre_asr_cueqc.load_checkpoint(checkpoint, device="cpu")
+
+    class RecordingModel:
+        def __init__(self) -> None:
+            self.shapes: list[tuple[int, int]] = []
+
+        def __call__(self, ptm_bins, scalar_features, *, chunk_mask, bin_mask):
+            del scalar_features, chunk_mask, bin_mask
+            self.shapes.append((int(ptm_bins.shape[0]), int(ptm_bins.shape[1])))
+            logits = torch.zeros(
+                (ptm_bins.shape[0], ptm_bins.shape[1], 2),
+                dtype=torch.float32,
+                device=ptm_bins.device,
+            )
+            logits[..., 1] = 1.0
+            return logits
+
+    recorder = RecordingModel()
+    runtime.model = recorder
+    candidates = []
+    for index in range(513):
+        candidate = _pre_asr_candidate(index)
+        candidate["planned_island_id"] = "one-long-island"
+        candidates.append(candidate)
+
+    decisions = runtime.decide(candidates)
+
+    assert recorder.shapes == [(1, 513)]
+    assert len(decisions) == 513
+    assert "inference_window_size" not in runtime.signature()
 
 
 def test_pre_asr_cueqc_load_active_validates_split_sha(monkeypatch, tmp_path: Path):
@@ -426,17 +508,11 @@ def test_pre_asr_cueqc_load_active_validates_split_sha(monkeypatch, tmp_path: Pa
         )
 
 
-def test_pre_asr_cueqc_17b_rejects_v12_checkpoint(tmp_path: Path):
+def test_pre_asr_cueqc_17b_rejects_retired_schema(tmp_path: Path):
     torch = pytest.importorskip("torch")
     checkpoint = _tiny_v13_checkpoint(tmp_path)
     payload = torch.load(checkpoint, map_location="cpu", weights_only=False)
-    payload["schema"] = pre_asr_cueqc.PRE_ASR_CUEQC_LEGACY_SCHEMA
-    payload["arch"] = pre_asr_cueqc.PRE_ASR_CUEQC_LEGACY_MODEL_ARCH
-    payload["feature_schema"] = pre_asr_cueqc.PRE_ASR_CUEQC_LEGACY_FEATURE_SCHEMA
-    payload["runtime_adapter"] = pre_asr_cueqc.PRE_ASR_CUEQC_LEGACY_RUNTIME_ADAPTER
-    payload["metadata"]["artifact"] = dict(
-        pre_asr_cueqc.PRE_ASR_CUEQC_LEGACY_ARTIFACT
-    )
+    payload["schema"] = "cueqc_pre_asr_semantic_chunk_v12"
     legacy = tmp_path / "pre_asr_cueqc_v12.pt"
     torch.save(payload, legacy)
 
@@ -448,18 +524,9 @@ def test_pre_asr_cueqc_17b_rejects_v12_checkpoint(tmp_path: Path):
         )
 
 
-def test_pre_asr_cueqc_load_active_rejects_explicit_v11_checkpoint(monkeypatch):
-    repo_id = "jaykwok/Qwen3-ASR-0.6B-JA-Anime-Galgame-hf"
-    legacy = (
-        "src/checkpoints/jaykwok-Qwen3-ASR-0.6B-JA-Anime-Galgame-hf/"
-        "pre_asr_cueqc_v11.jaykwok-Qwen3-ASR-0.6B-JA-Anime-Galgame-hf.pt"
-    )
-    monkeypatch.setenv("PRE_ASR_CUEQC_ENABLED", "1")
-    monkeypatch.setenv("PRE_ASR_CUEQC_DEVICE", "cpu")
-    monkeypatch.setenv("PRE_ASR_CUEQC_MODEL_PATH_BY_REPO", f"{repo_id}={legacy}")
-
-    with pytest.raises(FileNotFoundError, match="does not exist"):
-        pre_asr_cueqc.load_active(expected_asr_repo_id=repo_id)
+def test_pre_asr_cueqc_exposes_no_legacy_checkpoint_contract() -> None:
+    assert not hasattr(pre_asr_cueqc, "PRE_ASR_CUEQC_LEGACY_SCHEMA")
+    assert not hasattr(pre_asr_cueqc, "PRE_ASR_CUEQC_LEGACY_ARTIFACT")
 
 
 def test_pre_asr_cueqc_filters_before_wav_export(monkeypatch):
@@ -472,6 +539,7 @@ def test_pre_asr_cueqc_filters_before_wav_export(monkeypatch):
             speech_segments=[SpeechSegment(0.0, 1.0)],
             duration=1.0,
             split_reason="unit",
+            boundary_contract_id=ACOUSTIC_BINARY_V12_CONTRACT.contract_id,
             **_ptm_pooling_fields(),
         ),
         PackedChunk(
@@ -480,6 +548,7 @@ def test_pre_asr_cueqc_filters_before_wav_export(monkeypatch):
             speech_segments=[SpeechSegment(1.2, 2.0)],
             duration=0.8,
             split_reason="unit",
+            boundary_contract_id=ACOUSTIC_BINARY_V12_CONTRACT.contract_id,
             **_ptm_pooling_fields(),
         ),
     ]
@@ -547,6 +616,7 @@ def test_compile_pre_asr_cueqc_features_ignores_text_columns(tmp_path: Path):
                         "raw_text": "ignored",
                         "scorer_speech_mean": 0.9,
                         "scorer_split_p90": 0.1,
+                        "boundary_contract_id": ACOUSTIC_BINARY_V12_CONTRACT.contract_id,
                         **_ptm_pooling_fields(),
                     },
                     {
@@ -556,6 +626,7 @@ def test_compile_pre_asr_cueqc_features_ignores_text_columns(tmp_path: Path):
                         "decoder_stats": {"ignored": True},
                         "scorer_speech_mean": 0.2,
                         "scorer_split_p90": 0.0,
+                        "boundary_contract_id": ACOUSTIC_BINARY_V12_CONTRACT.contract_id,
                         **_ptm_pooling_fields(),
                     },
                 ]
@@ -708,7 +779,7 @@ def test_compile_pre_asr_cueqc_keeps_per_row_source_identity_in_combined_jsonl(
     tmp_path: Path,
 ) -> None:
     torch = pytest.importorskip("torch")
-    chunks = tmp_path / "runtime_v11_provisional.jsonl"
+    chunks = tmp_path / "runtime_v12_provisional.jsonl"
     labels = tmp_path / "labels.jsonl"
     output = tmp_path / "features.pt"
     source_rows = []
@@ -716,9 +787,9 @@ def test_compile_pre_asr_cueqc_keeps_per_row_source_identity_in_combined_jsonl(
         candidate = _pre_asr_candidate(index, video_id=video_id)
         source_rows.append(
             {
-                "schema": "runtime_v11_provisional_subisland_v1",
+                "schema": "runtime_v12_provisional_subisland_v1",
                 "sample_id": video_id,
-                "subisland_id": f"{video_id}__v11s00",
+                "subisland_id": f"{video_id}__v12s00",
                 "source_partition": partition,
                 "pre_asr_candidate": candidate,
             }

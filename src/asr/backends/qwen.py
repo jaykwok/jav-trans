@@ -32,50 +32,60 @@ DEFAULT_QWEN_ASR_MIN_PHYSICAL_VRAM_MB_BY_REPO: dict[str, int] = {
     QWEN_ASR_17B_REPO_ID: 6144,
 }
 DEFAULT_OUTER_EDGE_REFINER_CHECKPOINT_BY_REPO: dict[str, str] = {
-    QWEN_ASR_06B_REPO_ID: repo_checkpoint_path(
-        QWEN_ASR_06B_REPO_ID, "outer_edge_refiner", "v1"
-    ),
-    QWEN_ASR_17B_REPO_ID: repo_checkpoint_path(
-        QWEN_ASR_17B_REPO_ID, "outer_edge_refiner", "v2"
-    ),
+    QWEN_ASR_06B_REPO_ID: "",
+    QWEN_ASR_17B_REPO_ID: "",
 }
 DEFAULT_SEMANTIC_SPLIT_CHECKPOINT_BY_REPO: dict[str, str] = {
-    QWEN_ASR_06B_REPO_ID: repo_checkpoint_path(
-        QWEN_ASR_06B_REPO_ID, "semantic_split_model", "v2"
-    ),
+    QWEN_ASR_06B_REPO_ID: "",
     QWEN_ASR_17B_REPO_ID: repo_checkpoint_path(
         QWEN_ASR_17B_REPO_ID, "semantic_split_model", "v4"
     ),
 }
-DEFAULT_CUT_EDGE_REFINER_CHECKPOINT_BY_REPO: dict[str, str] = {
-    QWEN_ASR_06B_REPO_ID: repo_checkpoint_path(
-        QWEN_ASR_06B_REPO_ID, "cut_edge_refiner", "v1"
-    ),
-}
 DEFAULT_INNER_EDGE_REFINER_CHECKPOINT_BY_REPO: dict[str, str] = {
+    # 0.6B intentionally has no Inner checkpoint until it is retrained against
+    # the binary acoustic-core contract. An empty value is the explicit
+    # registry placeholder; runtime must not borrow the 1.7B artifact.
+    QWEN_ASR_06B_REPO_ID: "",
     QWEN_ASR_17B_REPO_ID: repo_checkpoint_path(
-        QWEN_ASR_17B_REPO_ID, "inner_edge_refiner", "v1"
+        QWEN_ASR_17B_REPO_ID, "inner_edge_refiner", "v2"
     ),
 }
 DEFAULT_PRE_ASR_CUEQC_CHECKPOINT_BY_REPO: dict[str, str] = {
-    QWEN_ASR_06B_REPO_ID: repo_checkpoint_path(
-        QWEN_ASR_06B_REPO_ID, "pre_asr_cueqc", "v12"
-    ),
+    QWEN_ASR_06B_REPO_ID: "",
     QWEN_ASR_17B_REPO_ID: repo_checkpoint_path(
         QWEN_ASR_17B_REPO_ID, "pre_asr_cueqc", "v13"
     ),
 }
+BOUNDARY_PIPELINE_STATUS_BY_REPO: dict[str, str] = {
+    QWEN_ASR_06B_REPO_ID: "pending_binary_retrain",
+    QWEN_ASR_17B_REPO_ID: "pending_outer_v3_audit",
+}
+
+
+def require_boundary_pipeline_ready(repo_id: str | None = None) -> str:
+    selected = qwen_asr_repo_id(repo_id or current_qwen_asr_backend())
+    status = BOUNDARY_PIPELINE_STATUS_BY_REPO[selected]
+    if status != "ready":
+        raise RuntimeError(
+            f"Boundary pipeline for ASR repo {selected!r} is {status}; "
+            "the complete repo-bound Boundary chain is not available"
+        )
+    return selected
 # The v8 registry contains only native speech-only checkpoints. Incompatible
 # v7 speech/split weights are not converted at load time.
 DEFAULT_SPEECH_BOUNDARY_SCORER_CHECKPOINT_BY_REPO: dict[str, str] = {
-    repo_id: repo_checkpoint_path(repo_id, "speech_island_scorer", "v8")
-    for repo_id in QWEN_ASR_BACKEND_REPOS
+    QWEN_ASR_06B_REPO_ID: "",
+    QWEN_ASR_17B_REPO_ID: repo_checkpoint_path(
+        QWEN_ASR_17B_REPO_ID, "speech_island_scorer", "v8"
+    ),
 }
-# Learned boundary-proposal candidate source. Both active Split v2 chains are
-# bound to a repo-specific proposer; bootstrap candidates are not accepted.
+# Learned boundary-proposal candidate source for the 1.7B Split v4 chain.
+# The 0.6B entry stays empty until its complete binary chain is retrained.
 DEFAULT_SPEECH_BOUNDARY_PROPOSAL_CHECKPOINT_BY_REPO: dict[str, str] = {
-    repo_id: repo_checkpoint_path(repo_id, "boundary_proposal_scorer", "v1")
-    for repo_id in QWEN_ASR_BACKEND_REPOS
+    QWEN_ASR_06B_REPO_ID: "",
+    QWEN_ASR_17B_REPO_ID: repo_checkpoint_path(
+        QWEN_ASR_17B_REPO_ID, "boundary_proposal_scorer", "v1"
+    ),
 }
 
 

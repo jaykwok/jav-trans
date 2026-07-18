@@ -116,7 +116,6 @@ def test_stage_events_memory_sink_records_pipeline_events(monkeypatch, tmp_path)
     assert ("speech_island_scorer", "done") in observed
     assert ("outer_edge_refiner", "done") in observed
     assert ("semantic_split_model", "done") in observed
-    assert ("cut_edge_refiner", "done") in observed
     assert ("pre_asr_cueqc", "done") in observed
     assert ("audio_chunk_export", "done") in observed
     assert ("write_output", "done") in observed
@@ -163,7 +162,6 @@ def test_five_model_progress_labels_map_to_frontend_stages():
     )
     assert _parse_asr_stage_event("外边界精修 1/1")[0] == "outer_edge_refiner"
     assert _parse_asr_stage_event("语义切分判断 3/8")[0] == "semantic_split_model"
-    assert _parse_asr_stage_event("内部切点精修 3/8")[0] == "cut_edge_refiner"
     assert _parse_asr_stage_event("Pre-ASR CueQC 1/1")[0] == "pre_asr_cueqc"
     assert _parse_asr_stage_event("音频切块 2/5")[0] == "audio_chunk_export"
 

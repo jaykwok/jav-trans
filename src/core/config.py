@@ -108,20 +108,19 @@ DEFAULT_SETTINGS: dict[str, str] = {
     "ASR_REPETITION_PENALTY": "1.05",
 
     # --- Semantic boundary pipeline / ASR Chunking ---
-    # 1.7B: Outer v2 -> Acoustic Split v4 binary -> CueQC v13 binary -> Inner v1.
-    # 0.6B remains on the legacy Split v2 / Cut v1 chain.
+    # 1.7B: Outer v3 placeholder -> Acoustic Split v4 binary -> CueQC v13 binary -> Inner v2.
+    # 0.6B Boundary is intentionally unavailable pending full binary retraining.
     # This is a feature-score grid fallback, not the source video frame rate.
     "BOUNDARY_FEATURE_FRAME_HOP_S": "0.02",
     "OUTER_EDGE_REFINER_DEVICE": "auto",
     "SEMANTIC_SPLIT_DEVICE": "auto",
-    # Semantic Split Verifier inference batch. The per-candidate temporal axis is
-    # inside each sample; this only batches independent candidates.
-    "SEMANTIC_SPLIT_INFERENCE_BATCH_SIZE": "auto",
-    "CUT_EDGE_REFINER_DEVICE": "auto",
+    # Whole-island Split v4 batches are bounded by padded candidate slots.
+    # Candidate sequences remain intact; this changes execution shape only.
+    "ACOUSTIC_SPLIT_MAX_BATCH_CANDIDATES": "auto",
     "INNER_EDGE_REFINER_DEVICE": "auto",
     "BOUNDARY_FRAME_SEQUENCE_LEFT_CONTEXT_S": "0.60",
     "BOUNDARY_FRAME_SEQUENCE_RIGHT_CONTEXT_S": "0.60",
-    "BOUNDARY_FRAME_SEQUENCE_MAX_PTM_DIMS": "128",
+    "BOUNDARY_FRAME_SEQUENCE_MAX_PTM_DIMS": "2048",
     "BOUNDARY_FRAME_SEQUENCE_INCLUDE_MFCC": "1",
     "SPEECH_BOUNDARY_JA_WINDOW_S": "20.0",
     "SPEECH_BOUNDARY_JA_OVERLAP_S": "4.0",
@@ -135,13 +134,11 @@ DEFAULT_SETTINGS: dict[str, str] = {
     # Persistent boundary cache directory. Versioned by src/boundary/cache.py.
     "BOUNDARY_CACHE_DIR": "./tmp/cache/boundary",
 
-    # --- Pre-ASR CueQC v12 semantic chunk keep/drop router ---
+    # --- Pre-ASR CueQC v13 binary semantic chunk router ---
     # Low-VRAM default: drop obvious non-speech chunks before ASR.
     "PRE_ASR_CUEQC_ENABLED": "1",
     "PRE_ASR_CUEQC_MODEL_PATH_BY_REPO": "",
     "PRE_ASR_CUEQC_DEVICE": "auto",
-    # Empty means use the repo-bound v12 checkpoint decision_config.
-    "PRE_ASR_CUEQC_DROP_THRESHOLD": "",
     # Optional JSONL export for cold-start clustering/training candidates.
     "PRE_ASR_CUEQC_EXPORT_CANDIDATES_PATH": "",
     "PRE_ASR_CUEQC_EXPORT_CANDIDATES_APPEND": "1",

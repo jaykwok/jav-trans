@@ -14,42 +14,35 @@ from audio.chunk_packer import PackedChunk
 from boundary import cache as _boundary_cache_module
 from boundary.sequence_features import (
     CHUNK_LEARNED_PROJECTED_PTM_SCHEMA,
-    CHUNK_POOLED_PTM_SCHEMA,
     FRAME_SEQUENCE_FRAMES_SCHEMA,
-    PTM_PROJECTION_SCHEMA,
     FrameSequenceFeatureConfig,
     FrameSequenceFeatureProvider,
-    ptm_projection_digest,
 )
-from boundary.cut_refiner import load_cut_edge_refiner
-from boundary.inner_refiner_v1 import load_inner_edge_refiner_v1
-from boundary.outer_refiner import load_outer_edge_refiner
-from boundary.outer_refiner_v2 import load_outer_edge_refiner_v2
+from boundary.contracts import ACOUSTIC_BINARY_V12_CONTRACT
+from boundary.inner_refiner_v2 import (
+    INNER_EDGE_REFINER_V2_SCHEMA,
+    load_inner_edge_refiner_v2,
+)
+from boundary.outer_refiner_v3 import load_outer_edge_refiner_v3
 from boundary.runtime_pipeline import (
-    SemanticBoundaryConfig,
     annotate_inner_edge_predictions,
-    apply_paired_inner_edges_after_cueqc,
+    apply_binary_inner_edges_after_cueqc,
     build_acoustic_split_v4_provisional_chunks,
-    build_semantic_boundary_chunks,
-    effective_semantic_config,
-    semantic_config_payload,
 )
 from boundary.split_model import (
     SEMANTIC_SPLIT_V4_SCHEMA,
     load_acoustic_split_v4_planner,
-    load_semantic_split_feature_config,
-    load_semantic_split_verifier,
 )
 from asr import checkpoint as _checkpoint_module
 from asr import chunking as _chunking_module
 from asr import pre_asr_cueqc as _pre_asr_cueqc_module
 from asr import transcribe as _transcribe_module
 from asr.backends.qwen import (
-    DEFAULT_CUT_EDGE_REFINER_CHECKPOINT_BY_REPO,
     DEFAULT_INNER_EDGE_REFINER_CHECKPOINT_BY_REPO,
     DEFAULT_OUTER_EDGE_REFINER_CHECKPOINT_BY_REPO,
     DEFAULT_SEMANTIC_SPLIT_CHECKPOINT_BY_REPO,
     checkpoint_path_for_repo_env,
+    require_boundary_pipeline_ready,
 )
 
 ACOUSTIC_SPLIT_SCHEMAS = {SEMANTIC_SPLIT_V4_SCHEMA}
@@ -93,134 +86,47 @@ def _env_int(name: str, default: str) -> int:
 
 
 def _boundary_config() -> dict:
+    selected_repo = require_boundary_pipeline_ready(_current_asr_backend())
     outer_refiner_path = checkpoint_path_for_repo_env(
-        repo_id=_current_asr_backend(),
+        repo_id=selected_repo,
         mapping_env="OUTER_EDGE_REFINER_MODEL_PATH_BY_REPO",
         default_mapping=DEFAULT_OUTER_EDGE_REFINER_CHECKPOINT_BY_REPO,
     )
     split_model_path = checkpoint_path_for_repo_env(
-        repo_id=_current_asr_backend(),
+        repo_id=selected_repo,
         mapping_env="SEMANTIC_SPLIT_MODEL_PATH_BY_REPO",
         default_mapping=DEFAULT_SEMANTIC_SPLIT_CHECKPOINT_BY_REPO,
     )
-    cut_refiner_path = checkpoint_path_for_repo_env(
-        repo_id=_current_asr_backend(),
-        mapping_env="CUT_EDGE_REFINER_MODEL_PATH_BY_REPO",
-        default_mapping=DEFAULT_CUT_EDGE_REFINER_CHECKPOINT_BY_REPO,
-        required=False,
-    )
     inner_refiner_path = checkpoint_path_for_repo_env(
-        repo_id=_current_asr_backend(),
+        repo_id=selected_repo,
         mapping_env="INNER_EDGE_REFINER_MODEL_PATH_BY_REPO",
         default_mapping=DEFAULT_INNER_EDGE_REFINER_CHECKPOINT_BY_REPO,
-        required=False,
     )
     return {
         "feature_frame_hop_s": _env_float("BOUNDARY_FEATURE_FRAME_HOP_S", "0.02"),
         "outer_edge_refiner_model_path": outer_refiner_path,
         "semantic_split_model_path": split_model_path,
-        "cut_edge_refiner_model_path": cut_refiner_path,
         "inner_edge_refiner_model_path": inner_refiner_path,
         "outer_edge_refiner_device": os.getenv("OUTER_EDGE_REFINER_DEVICE", "auto").strip()
         or "auto",
         "semantic_split_device": os.getenv("SEMANTIC_SPLIT_DEVICE", "auto").strip() or "auto",
-        "cut_edge_refiner_device": os.getenv("CUT_EDGE_REFINER_DEVICE", "auto").strip() or "auto",
         "inner_edge_refiner_device": os.getenv("INNER_EDGE_REFINER_DEVICE", "auto").strip() or "auto",
-        "semantic_split_duration_pressure_enabled": _env_bool(
-            "SEMANTIC_SPLIT_DURATION_PRESSURE_ENABLED", "0"
-        ),
-        "semantic_split_duration_pressure_log_median": _env_float(
-            "SEMANTIC_SPLIT_DURATION_PRESSURE_LOG_MEDIAN", "0.0"
-        ),
-        "semantic_split_duration_pressure_log_mad": _env_float(
-            "SEMANTIC_SPLIT_DURATION_PRESSURE_LOG_MAD", "0.0"
-        ),
-        "semantic_split_duration_pressure_z": _env_float(
-            "SEMANTIC_SPLIT_DURATION_PRESSURE_Z", "0.0"
-        ),
-        "semantic_split_duration_pressure_floor": _env_float(
-            "SEMANTIC_SPLIT_DURATION_PRESSURE_FLOOR", "0.50"
-        ),
     }
 
 
-def _require_learned_candidates_for_island_split(
-    split_verifier,
-    boundary_parameters,
-) -> None:
-    """Refuse to run a v2 (island-sequence) split model over bootstrap
-    candidates. v2 checkpoints are trained on learned-proposer candidates;
-    the energy-valley bootstrap is only a dataset-bootstrapping tool and a
-    legitimate runtime source solely for split-v1 chains."""
+def _require_learned_split_candidates(boundary_parameters) -> None:
+    """Require the learned proposal distribution consumed by Split v4."""
 
-    if not hasattr(split_verifier, "decide_islands"):
-        return
     if str((boundary_parameters or {}).get("proposal_checkpoint") or "").strip():
         return
     raise RuntimeError(
-        "Semantic Split v2 requires learned boundary-proposal candidates, but "
+        "Acoustic Split v4 requires learned boundary-proposal candidates, but "
         "the boundary backend produced bootstrap energy-valley candidates (no "
         "proposal checkpoint resolved for this ASR repo). Promote the "
         "BoundaryProposalScorer checkpoint or set "
         "SPEECH_BOUNDARY_JA_PROPOSAL_CHECKPOINT_BY_REPO; bootstrap candidates "
-        "are not a valid input distribution for v2 split checkpoints."
+        "are not a valid input distribution for Split v4."
     )
-
-
-_split_projection_npz_cache: dict[tuple[str, int, int], str] = {}
-
-
-def _split_checkpoint_projection_npz(checkpoint_path: Path) -> str:
-    """Materialize the split checkpoint's embedded PTM projection as an npz
-    next to the checkpoint and return its path ('' when the checkpoint has no
-    projection). The checkpoint is the single source of truth: the boundary
-    backend pre-projects sequence features with exactly this basis."""
-
-    try:
-        stat = checkpoint_path.stat()
-    except OSError:
-        return ""
-    cache_key = (str(checkpoint_path), stat.st_mtime_ns, stat.st_size)
-    cached = _split_projection_npz_cache.get(cache_key)
-    if cached is not None and (not cached or Path(cached).exists()):
-        return cached
-    try:
-        feature_config = load_semantic_split_feature_config(checkpoint_path)
-    except Exception:
-        # The authoritative error surfaces in load_semantic_split_verifier;
-        # a projection-trained checkpoint that slips through here still fails
-        # loudly downstream (provider refuses to project capped-dim frames).
-        _pipeline_logger.debug(
-            "[boundary] split checkpoint feature_config unreadable: %s",
-            checkpoint_path,
-            exc_info=True,
-        )
-        _split_projection_npz_cache[cache_key] = ""
-        return ""
-    projection = feature_config.get("ptm_projection") or None
-    if projection is None:
-        _split_projection_npz_cache[cache_key] = ""
-        return ""
-    mean = np.asarray(projection["mean"], dtype=np.float32)
-    components = np.asarray(projection["components"], dtype=np.float32)
-    digest = str(projection.get("digest") or "") or ptm_projection_digest(
-        mean, components
-    )
-    npz_path = checkpoint_path.with_name(
-        f"{checkpoint_path.stem}.ptm_projection.{digest[:16]}.npz"
-    )
-    if not npz_path.exists():
-        tmp_path = npz_path.with_name(npz_path.name + f".tmp{os.getpid()}")
-        np.savez(
-            tmp_path,
-            schema=np.asarray(PTM_PROJECTION_SCHEMA),
-            mean=mean,
-            components=components,
-        )
-        # np.savez appends .npz to paths without the suffix.
-        os.replace(f"{tmp_path}.npz", npz_path)
-    _split_projection_npz_cache[cache_key] = str(npz_path)
-    return str(npz_path)
 
 
 def _sequence_feature_provider_from_result(
@@ -480,32 +386,38 @@ def _build_processing_spans(
         split_checkpoint_path, map_location="cpu", weights_only=False
     )
     split_schema = str(split_checkpoint_payload.get("schema") or "")
-    cueqc_ptm_projection_weight: np.ndarray | None = None
-    cueqc_ptm_projection_digest = ""
-    if split_schema in ACOUSTIC_SPLIT_SCHEMAS:
-        projection_weight = (
-            split_checkpoint_payload.get("model_state_dict") or {}
-        ).get("ptm_projector.weight")
-        if projection_weight is None:
-            raise ValueError(
-                "Semantic Split v4 checkpoint is missing learned ptm_projector.weight"
-            )
-        cueqc_ptm_projection_weight = np.ascontiguousarray(
-            projection_weight.detach().cpu().float().numpy(), dtype=np.float32
+    if split_schema != SEMANTIC_SPLIT_V4_SCHEMA:
+        raise ValueError("current Boundary contract requires Acoustic Split v4")
+    if outer_schema != "outer_edge_refiner_v3":
+        raise ValueError("current Boundary contract requires Outer Edge Refiner v3")
+    inner_checkpoint_path = Path(cfg["inner_edge_refiner_model_path"])
+    inner_schema = str(
+        torch.load(inner_checkpoint_path, map_location="cpu", weights_only=False).get(
+            "schema"
         )
-        if cueqc_ptm_projection_weight.shape != (128, 2048):
-            raise ValueError(
-                "CueQC v13 requires learned Linear(2048->128) Split projection"
-            )
-        cueqc_ptm_projection_digest = hashlib.sha256(
-            cueqc_ptm_projection_weight.tobytes()
-        ).hexdigest()
-        cfg = {
-            **cfg,
-            "pre_asr_cueqc_feature_schema": _pre_asr_cueqc_module.PRE_ASR_CUEQC_FEATURE_SCHEMA,
-            "pre_asr_ptm_projection": "semantic_split_v4_checkpoint_linear_2048_to_128",
-            "pre_asr_ptm_projection_digest": cueqc_ptm_projection_digest,
-        }
+        or ""
+    )
+    if inner_schema != INNER_EDGE_REFINER_V2_SCHEMA:
+        raise ValueError("current Boundary contract requires binary Inner v2")
+    projection_weight = (split_checkpoint_payload.get("model_state_dict") or {}).get(
+        "ptm_projector.weight"
+    )
+    if projection_weight is None:
+        raise ValueError("Semantic Split v4 checkpoint is missing ptm_projector.weight")
+    cueqc_ptm_projection_weight = np.ascontiguousarray(
+        projection_weight.detach().cpu().float().numpy(), dtype=np.float32
+    )
+    if cueqc_ptm_projection_weight.shape != (128, 2048):
+        raise ValueError("CueQC v13 requires learned Linear(2048->128) Split projection")
+    cueqc_ptm_projection_digest = hashlib.sha256(
+        cueqc_ptm_projection_weight.tobytes()
+    ).hexdigest()
+    cfg = {
+        **cfg,
+        "pre_asr_cueqc_feature_schema": _pre_asr_cueqc_module.PRE_ASR_CUEQC_FEATURE_SCHEMA,
+        "pre_asr_ptm_projection": "semantic_split_v4_checkpoint_linear_2048_to_128",
+        "pre_asr_ptm_projection_digest": cueqc_ptm_projection_digest,
+    }
     del split_checkpoint_payload
 
     restore_sequence_export = os.environ.get("SPEECH_BOUNDARY_JA_EXPORT_SEQUENCE_FEATURES")
@@ -513,20 +425,7 @@ def _build_processing_spans(
     restore_sequence_max_ptm_dims = os.environ.get(
         "BOUNDARY_FRAME_SEQUENCE_MAX_PTM_DIMS"
     )
-    if outer_schema == "outer_edge_refiner_v2" or split_schema in ACOUSTIC_SPLIT_SCHEMAS:
-        os.environ["BOUNDARY_FRAME_SEQUENCE_MAX_PTM_DIMS"] = "2048"
-    restore_sequence_projection = os.environ.get(
-        "SPEECH_BOUNDARY_JA_SEQUENCE_PTM_PROJECTION"
-    )
-    split_projection_npz = (
-        ""
-        if split_schema in ACOUSTIC_SPLIT_SCHEMAS
-        else _split_checkpoint_projection_npz(split_checkpoint_path)
-    )
-    if split_projection_npz:
-        os.environ["SPEECH_BOUNDARY_JA_SEQUENCE_PTM_PROJECTION"] = split_projection_npz
-    else:
-        os.environ.pop("SPEECH_BOUNDARY_JA_SEQUENCE_PTM_PROJECTION", None)
+    os.environ["BOUNDARY_FRAME_SEQUENCE_MAX_PTM_DIMS"] = "2048"
     try:
         from boundary import get_boundary_backend
 
@@ -567,77 +466,42 @@ def _build_processing_spans(
             )
         else:
             os.environ.pop("BOUNDARY_FRAME_SEQUENCE_MAX_PTM_DIMS", None)
-        if restore_sequence_projection is not None:
-            os.environ["SPEECH_BOUNDARY_JA_SEQUENCE_PTM_PROJECTION"] = (
-                restore_sequence_projection
-            )
-        else:
-            os.environ.pop("SPEECH_BOUNDARY_JA_SEQUENCE_PTM_PROJECTION", None)
     frame_scores = result.parameters.get("frame_scores")
     candidate_frame_scores = result.parameters.get("candidate_frame_scores")
     score_frame_hop_s = result.parameters.get("frame_hop_s")
     sequence_feature_frames = result.parameters.get("sequence_feature_frames")
-    if outer_schema == "outer_edge_refiner_v2":
-        outer_refiner = load_outer_edge_refiner_v2(
-            outer_checkpoint_path,
-            device=cfg["outer_edge_refiner_device"],
-            expected_ptm_repo_id=_current_asr_backend(),
-        )
-    else:
-        outer_refiner = load_outer_edge_refiner(
-            outer_checkpoint_path,
-            device=cfg["outer_edge_refiner_device"],
-            expected_ptm_repo_id=_current_asr_backend(),
-        )
-    if split_schema in ACOUSTIC_SPLIT_SCHEMAS:
-        if outer_schema != "outer_edge_refiner_v2":
-            raise ValueError("Acoustic Split v4 requires Outer Edge Refiner v2")
-        split_verifier = load_acoustic_split_v4_planner(
-            split_checkpoint_path,
-            device=cfg["semantic_split_device"],
-            expected_ptm_repo_id=_current_asr_backend(),
-        )
-        inner_refiner = load_inner_edge_refiner_v1(
-            Path(cfg["inner_edge_refiner_model_path"]),
-            device=cfg["inner_edge_refiner_device"],
-            expected_ptm_repo_id=_current_asr_backend(),
-        )
-        cut_refiner = None
-    else:
-        split_verifier = load_semantic_split_verifier(
-            split_checkpoint_path,
-            device=cfg["semantic_split_device"],
-            expected_ptm_repo_id=_current_asr_backend(),
-        )
-        inner_refiner = None
-        cut_refiner = load_cut_edge_refiner(
-            Path(cfg["cut_edge_refiner_model_path"]),
-            device=cfg["cut_edge_refiner_device"],
-            expected_ptm_repo_id=_current_asr_backend(),
-        )
-    _require_learned_candidates_for_island_split(split_verifier, result.parameters)
+    outer_refiner = load_outer_edge_refiner_v3(
+        outer_checkpoint_path,
+        device=cfg["outer_edge_refiner_device"],
+        expected_ptm_repo_id=_current_asr_backend(),
+    )
+    split_verifier = load_acoustic_split_v4_planner(
+        split_checkpoint_path,
+        device=cfg["semantic_split_device"],
+        expected_ptm_repo_id=_current_asr_backend(),
+    )
+    inner_refiner = load_inner_edge_refiner_v2(
+        inner_checkpoint_path,
+        device=cfg["inner_edge_refiner_device"],
+        expected_ptm_repo_id=_current_asr_backend(),
+    )
+    _require_learned_split_candidates(result.parameters)
     _pipeline_logger.info(
         "[boundary] semantic model devices "
         "outer_requested=%s outer_actual=%s "
         "split_requested=%s split_actual=%s "
-        "cut_requested=%s cut_actual=%s inner_actual=%s",
+        "inner_requested=%s inner_actual=%s",
         cfg["outer_edge_refiner_device"],
         getattr(outer_refiner, "device", "unknown"),
         cfg["semantic_split_device"],
         getattr(split_verifier, "device", "unknown"),
-        cfg["cut_edge_refiner_device"],
-        getattr(cut_refiner, "device", "disabled"),
+        cfg["inner_edge_refiner_device"],
         getattr(inner_refiner, "device", "disabled"),
     )
     sequence_feature_provider = _required_sequence_feature_provider_from_result(
         sequence_feature_frames,
         duration_s=result.audio_duration_sec,
-        max_ptm_dims=(
-            2048
-            if outer_schema == "outer_edge_refiner_v2"
-            or split_schema in ACOUSTIC_SPLIT_SCHEMAS
-            else None
-        ),
+        max_ptm_dims=2048,
     )
     speech_feature_export_path = os.getenv(
         "SPEECH_ISLAND_FEATURE_EXPORT_PATH", ""
@@ -666,46 +530,19 @@ def _build_processing_spans(
         for key, value in result.parameters.items()
         if key not in {"frame_scores", "candidate_frame_scores", "sequence_feature_frames"}
     }
-    requested_semantic_config = SemanticBoundaryConfig(
-        duration_pressure_enabled=bool(
-            cfg["semantic_split_duration_pressure_enabled"]
-        ),
-        duration_pressure_log_median=float(
-            cfg["semantic_split_duration_pressure_log_median"]
-        ),
-        duration_pressure_log_mad=float(
-            cfg["semantic_split_duration_pressure_log_mad"]
-        ),
-        duration_pressure_z=float(cfg["semantic_split_duration_pressure_z"]),
-        duration_pressure_floor=float(cfg["semantic_split_duration_pressure_floor"]),
-    )
-    resolved_semantic_config = (
-        requested_semantic_config
-        if split_schema in ACOUSTIC_SPLIT_SCHEMAS
-        else effective_semantic_config(split_verifier, requested_semantic_config)
-    )
     runtime_boundary_signature = {
         **result_parameters,
         "boundary_pipeline": {
-            "version": 11 if split_schema == SEMANTIC_SPLIT_V4_SCHEMA else 9,
-            "order": (
-                [
-                    "speech_island_scorer",
-                    "outer_edge_refiner_v2",
-                    "acoustic_split_v4",
-                    "provisional_subislands",
-                    "pre_asr_cueqc_v13",
-                    "inner_edge_refiner_v1",
-                    "chunk_extraction",
-                ]
-                if split_schema in ACOUSTIC_SPLIT_SCHEMAS
-                else [
-                    "speech_island_scorer",
-                    "outer_edge_refiner",
-                    "semantic_split_model",
-                    "cut_edge_refiner",
-                ]
-            ),
+            "contract_id": ACOUSTIC_BINARY_V12_CONTRACT.contract_id,
+            "order": [
+                "speech_island_scorer",
+                "outer_edge_refiner_v3",
+                "acoustic_split_v4",
+                "provisional_subislands",
+                "pre_asr_cueqc_v13",
+                inner_schema,
+                "chunk_extraction",
+            ],
             "feature_frame_hop_s": cfg["feature_frame_hop_s"],
             "score_frame_hop_s": score_frame_hop_s,
             "feature_sources": {
@@ -714,14 +551,9 @@ def _build_processing_spans(
             },
             "outer_edge_refiner": outer_refiner.signature(),
             "semantic_split_model": split_verifier.signature(),
-            "cut_edge_refiner": cut_refiner.signature() if cut_refiner else None,
-            "inner_edge_refiner": inner_refiner.signature() if inner_refiner else None,
+            "inner_edge_refiner": inner_refiner.signature(),
             "sequence_feature_provider": sequence_feature_provider.signature(),
-            "semantic_boundary_config": (
-                {"decision_mode": "argmax_cut"}
-                if split_schema in ACOUSTIC_SPLIT_SCHEMAS
-                else semantic_config_payload(resolved_semantic_config)
-            ),
+            "semantic_boundary_config": {"decision_mode": "argmax_cut"},
         },
     }
     segments = result.segments
@@ -746,43 +578,20 @@ def _build_processing_spans(
         return []
     if frame_scores is None:
         raise ValueError("semantic boundary pipeline requires speech frame scores")
-    split_audit_records: list[dict] | None = (
-        [] if os.getenv("SEMANTIC_SPLIT_FEATURE_EXPORT_PATH", "").strip() else None
+    packed = build_acoustic_split_v4_provisional_chunks(
+        segments,
+        duration_s=result.audio_duration_sec,
+        speech_probabilities=frame_scores,
+        feature_provider=sequence_feature_provider,
+        outer_refiner=outer_refiner,
+        split_planner=split_verifier,
+        on_stage=on_stage,
     )
-    if split_schema in ACOUSTIC_SPLIT_SCHEMAS:
-        packed = build_acoustic_split_v4_provisional_chunks(
-            segments,
-            duration_s=result.audio_duration_sec,
-            speech_probabilities=frame_scores,
-            feature_provider=sequence_feature_provider,
-            outer_refiner=outer_refiner,
-            split_planner=split_verifier,
-            on_stage=on_stage,
-        )
-        packed = annotate_inner_edge_predictions(
-            packed,
-            feature_provider=sequence_feature_provider,
-            inner_refiner=inner_refiner,
-        )
-    else:
-        packed = build_semantic_boundary_chunks(
-            segments,
-            duration_s=result.audio_duration_sec,
-            speech_probabilities=frame_scores,
-            feature_provider=sequence_feature_provider,
-            outer_refiner=outer_refiner,
-            split_verifier=split_verifier,
-            cut_refiner=cut_refiner,
-            config=resolved_semantic_config,
-            split_audit_records=split_audit_records,
-            on_stage=on_stage,
-        )
-    if split_audit_records is not None:
-        _write_semantic_split_feature_export(
-            Path(os.environ["SEMANTIC_SPLIT_FEATURE_EXPORT_PATH"]),
-            audio_path=audio_path,
-            records=split_audit_records,
-        )
+    packed = annotate_inner_edge_predictions(
+        packed,
+        feature_provider=sequence_feature_provider,
+        inner_refiner=inner_refiner,
+    )
     packed = _annotate_scorer_stats_on_packed_chunks(
         packed,
         frame_scores=frame_scores,
@@ -812,74 +621,6 @@ def _build_processing_spans(
         )
         _set_last_boundary_cache_event(event)
     return packed
-
-
-def _write_semantic_split_feature_export(
-    path: Path,
-    *,
-    audio_path: str,
-    records: list[dict],
-) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    if records:
-        np.savez_compressed(
-            path,
-            frame_features=np.stack([row["frame_features"] for row in records]),
-            scalar_features=np.stack([row["scalar_features"] for row in records]),
-            proposal_times_s=np.asarray(
-                [row["candidate"]["time_s"] for row in records], dtype=np.float32
-            ),
-            core_starts_s=np.asarray([row["core_start"] for row in records], dtype=np.float32),
-            core_ends_s=np.asarray([row["core_end"] for row in records], dtype=np.float32),
-            accepted=np.asarray([row["accepted"] for row in records], dtype=np.bool_),
-            p_cut=np.asarray([row["p_cut"] for row in records], dtype=np.float32),
-            p_continue=np.asarray([row["p_continue"] for row in records], dtype=np.float32),
-            p_unsure=np.asarray([row["p_unsure"] for row in records], dtype=np.float32),
-        )
-    else:
-        # Silence/music-only windows can legitimately produce zero candidates.
-        np.savez_compressed(
-            path,
-            frame_features=np.zeros((0, 0, 0), dtype=np.float32),
-            scalar_features=np.zeros((0, 0), dtype=np.float32),
-            proposal_times_s=np.zeros(0, dtype=np.float32),
-            core_starts_s=np.zeros(0, dtype=np.float32),
-            core_ends_s=np.zeros(0, dtype=np.float32),
-            accepted=np.zeros(0, dtype=np.bool_),
-            p_cut=np.zeros(0, dtype=np.float32),
-            p_continue=np.zeros(0, dtype=np.float32),
-            p_unsure=np.zeros(0, dtype=np.float32),
-        )
-    metadata_path = path.with_suffix(".jsonl")
-    with metadata_path.open("w", encoding="utf-8") as handle:
-        for index, row in enumerate(records):
-            handle.write(
-                json.dumps(
-                    _json_payload(
-                        {
-                            "index": index,
-                            "audio": audio_path,
-                            "core_start": row["core_start"],
-                            "core_end": row["core_end"],
-                            "accepted": row["accepted"],
-                            "label": row["label"],
-                            "p_cut": row["p_cut"],
-                            "p_continue": row["p_continue"],
-                            "p_unsure": row["p_unsure"],
-                            **{
-                                key: value
-                                for key, value in dict(
-                                    row.get("accepted_candidate") or {}
-                                ).items()
-                                if key.startswith("duration_pressure_")
-                            },
-                            **row["candidate"],
-                        }
-                    ),
-                    ensure_ascii=False,
-                )
-                + "\n"
-            )
 
 
 def _span_boundaries(
@@ -1087,47 +828,32 @@ def _annotate_pre_asr_ptm_pooling_on_packed_chunks(
 ) -> list[tuple[float, float]] | list[PackedChunk]:
     if not spans or not all(isinstance(span, PackedChunk) for span in spans):
         return spans
-    use_learned_projection = all(
-        int(getattr(span, "boundary_pipeline_version", 0) or 0) == 11
+    if not all(
+        ACOUSTIC_BINARY_V12_CONTRACT.matches(
+            getattr(span, "boundary_contract_id", "")
+        )
         for span in spans
+    ):
+        raise ValueError("Pre-ASR pooling received an unsupported Boundary contract")
+    if learned_projection_weight is None:
+        raise ValueError("CueQC v13 learned PTM projection weight is required")
+    signature = sequence_feature_provider.chunk_pooled_checkpoint_linear_ptm_signature(
+        projection_weight=learned_projection_weight,
+        projection_digest=learned_projection_digest,
+        bins=_pre_asr_cueqc_module.PRE_ASR_CUEQC_PTM_BINS,
     )
-    if use_learned_projection:
-        if learned_projection_weight is None:
-            raise ValueError("CueQC v13 learned PTM projection weight is required")
-        signature = (
-            sequence_feature_provider.chunk_pooled_checkpoint_linear_ptm_signature(
-                projection_weight=learned_projection_weight,
-                projection_digest=learned_projection_digest,
-                bins=_pre_asr_cueqc_module.PRE_ASR_CUEQC_PTM_BINS,
-            )
-        )
-    else:
-        signature = sequence_feature_provider.chunk_pooled_ptm_signature(
-            bins=_pre_asr_cueqc_module.PRE_ASR_CUEQC_PTM_BINS
-        )
     annotated: list[PackedChunk] = []
     for span in spans:
-        if use_learned_projection:
-            values = sequence_feature_provider.chunk_pooled_checkpoint_linear_ptm_features(
-                projection_weight=learned_projection_weight,
-                start_s=span.start,
-                end_s=span.end,
-                bins=_pre_asr_cueqc_module.PRE_ASR_CUEQC_PTM_BINS,
-            )
-        else:
-            values = sequence_feature_provider.chunk_pooled_ptm_features(
-                start_s=span.start,
-                end_s=span.end,
-                bins=_pre_asr_cueqc_module.PRE_ASR_CUEQC_PTM_BINS,
-            )
+        values = sequence_feature_provider.chunk_pooled_checkpoint_linear_ptm_features(
+            projection_weight=learned_projection_weight,
+            start_s=span.start,
+            end_s=span.end,
+            bins=_pre_asr_cueqc_module.PRE_ASR_CUEQC_PTM_BINS,
+        )
         annotated.append(
             replace(
                 span,
-                pre_asr_ptm_pooling_schema=(
-                    CHUNK_LEARNED_PROJECTED_PTM_SCHEMA
-                    if use_learned_projection
-                    else CHUNK_POOLED_PTM_SCHEMA
-                ),
+                pre_asr_ptm_pooling_schema=CHUNK_LEARNED_PROJECTED_PTM_SCHEMA,
                 pre_asr_ptm_pooling_bins=_pre_asr_cueqc_module.PRE_ASR_CUEQC_PTM_BINS,
                 pre_asr_ptm_pooling_dim=int(signature["feature_dim"]),
                 pre_asr_ptm_pooled_features=values,
@@ -1392,7 +1118,7 @@ def _annotate_packed_chunks(
         chunk["display_start"] = packed.display_start
         chunk["display_end"] = packed.display_end
         chunk["display_duration"] = packed.display_duration
-        chunk["boundary_pipeline_version"] = packed.boundary_pipeline_version
+        chunk["boundary_contract_id"] = packed.boundary_contract_id
         chunk["semantic_event_ids"] = list(packed.semantic_event_ids or [])
         chunk["semantic_event_probabilities"] = list(
             packed.semantic_event_probabilities or []
@@ -1485,21 +1211,20 @@ def _annotate_packed_chunks(
                 safety=packed.refiner_safety_action,
             )
         )
-        if packed.boundary_pipeline_version == 11:
-            log.append(
-                "[boundary-v11] idx={idx} events={events} inner={inner} "
-                "removed_gap_s={gap:.3f} acoustic=({astart:.3f},{aend:.3f}) "
-                "display=({dstart:.3f},{dend:.3f})".format(
-                    idx=idx,
-                    events=len(packed.semantic_event_ids or []),
-                    inner=(packed.paired_inner_edges or {}).get("action", "pending"),
-                    gap=packed.removed_gap_duration_s,
-                    astart=float(packed.acoustic_start or packed.start),
-                    aend=float(packed.acoustic_end or packed.end),
-                    dstart=float(packed.display_start or packed.start),
-                    dend=float(packed.display_end or packed.end),
-                )
+        log.append(
+            "[boundary-v12] idx={idx} events={events} inner={inner} "
+            "removed_gap_s={gap:.3f} acoustic=({astart:.3f},{aend:.3f}) "
+            "display=({dstart:.3f},{dend:.3f})".format(
+                idx=idx,
+                events=len(packed.semantic_event_ids or []),
+                inner=(packed.paired_inner_edges or {}).get("action", "pending"),
+                gap=packed.removed_gap_duration_s,
+                astart=float(packed.acoustic_start or packed.start),
+                aend=float(packed.acoustic_end or packed.end),
+                dstart=float(packed.display_start or packed.start),
+                dend=float(packed.display_end or packed.end),
             )
+        )
 
 
 def _record_stage_timing(
@@ -1778,6 +1503,12 @@ def _transcribe_and_align_local(
             on_stage=on_stage,
         )
         chunk_spans = _build_processing_spans(audio_path, on_stage=on_stage)
+        _release_stage_gpu_cache(
+            log,
+            cuda_memory,
+            "boundary_models_released_before_pre_asr_cueqc",
+            elapsed_s=time.perf_counter() - total_started,
+        )
         cache_log_entry = _boundary_cache_log_entry(_LAST_BOUNDARY_CACHE_EVENT)
         if cache_log_entry:
             log.append(cache_log_entry)
@@ -1788,16 +1519,8 @@ def _transcribe_and_align_local(
             candidates=pre_asr_candidates,
             on_stage=on_stage,
         )
-        if (
-            chunk_spans
-            and all(isinstance(span, PackedChunk) for span in chunk_spans)
-            and any(
-                span.boundary_pipeline_version == 11
-                for span in chunk_spans
-                if isinstance(span, PackedChunk)
-            )
-        ):
-            chunk_spans = apply_paired_inner_edges_after_cueqc(chunk_spans)
+        if chunk_spans and all(isinstance(span, PackedChunk) for span in chunk_spans):
+            chunk_spans = apply_binary_inner_edges_after_cueqc(chunk_spans)
         pre_asr_candidates = _pre_asr_candidates_with_decisions(
             pre_asr_candidates,
             pre_asr_cueqc_report,

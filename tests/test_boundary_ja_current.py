@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import numpy as np
+import pytest
 
 from boundary.ja.backend import (
     SpeechBoundaryJaBackend,
@@ -9,7 +10,7 @@ from boundary.ja.backend import (
     decode_speech_island_segments,
 )
 from boundary.ja.model import (
-    LEGACY_SPEECH_ISLAND_SCORER_SCHEMA,
+    SPEECH_ISLAND_SCORER_V8_SCHEMA,
     SPEECH_ISLAND_MEMBERSHIP_LABELS,
     SPEECH_ISLAND_SCORER_DECODER,
     SPEECH_ISLAND_SCORER_LABELS,
@@ -37,7 +38,7 @@ def test_17b_semantic_speech_scorer_separates_content_and_membership() -> None:
     )
     assert SPEECH_ISLAND_MEMBERSHIP_LABELS == ("outside", "inside", "unsure")
     assert SPEECH_ISLAND_SCORER_DECODER == "argmax_source_membership_islands_v1"
-    assert LEGACY_SPEECH_ISLAND_SCORER_SCHEMA.endswith("speech_island_scorer_v8")
+    assert SPEECH_ISLAND_SCORER_V8_SCHEMA.endswith("speech_island_scorer_v8")
 
 
 def test_decoder_attaches_proposals_without_splitting_speech_island() -> None:
@@ -91,7 +92,7 @@ def test_semantic_decoder_does_not_split_on_internal_discardable_content() -> No
     assert [(item.start, item.end) for item in result.segments] == [(0.0, 0.06)]
 
 
-def test_17b_signature_has_no_fixed_speech_threshold_but_06b_stays_legacy() -> None:
+def test_17b_signature_has_no_fixed_speech_threshold_and_06b_is_retired() -> None:
     config_17b = SpeechBoundaryJaConfig(
         scorer_checkpoint=(
             "semantic_speech_scorer_v9."
@@ -106,9 +107,8 @@ def test_17b_signature_has_no_fixed_speech_threshold_but_06b_stays_legacy() -> N
     config_06b = SpeechBoundaryJaConfig(
         ptm="jaykwok/Qwen3-ASR-0.6B-JA-Anime-Galgame-hf"
     )
-    signature_06b = SpeechBoundaryJaBackend(config=config_06b).signature()
-    assert signature_06b["schema"] == LEGACY_SPEECH_ISLAND_SCORER_SCHEMA
-    assert signature_06b["threshold"] == 0.15
+    with pytest.raises(RuntimeError, match="pending_binary_retrain"):
+        SpeechBoundaryJaBackend(config=config_06b)
 
 
 def test_proposal_checkpoint_without_mapping_keeps_bootstrap(monkeypatch) -> None:
@@ -117,8 +117,7 @@ def test_proposal_checkpoint_without_mapping_keeps_bootstrap(monkeypatch) -> Non
     monkeypatch.delenv(
         "SPEECH_BOUNDARY_JA_PROPOSAL_CHECKPOINT_BY_REPO", raising=False
     )
-    # Pin the registry default mapping to empty: with neither env nor registry
-    # entry the repo stays on bootstrap candidates (split-v1 chains only).
+    # Pin the registry default mapping to empty for offline bootstrap coverage.
     monkeypatch.setattr(
         "boundary.ja.backend.DEFAULT_SPEECH_BOUNDARY_PROPOSAL_CHECKPOINT_BY_REPO",
         {},

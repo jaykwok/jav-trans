@@ -214,27 +214,14 @@ def configure_env(args: argparse.Namespace) -> None:
         )
     else:
         os.environ.pop("SEMANTIC_SPLIT_MODEL_PATH_BY_REPO", None)
-    if args.cut_edge_refiner_model_path_by_repo.strip():
-        os.environ["CUT_EDGE_REFINER_MODEL_PATH_BY_REPO"] = (
-            args.cut_edge_refiner_model_path_by_repo
-        )
-    else:
-        os.environ.pop("CUT_EDGE_REFINER_MODEL_PATH_BY_REPO", None)
     os.environ["OUTER_EDGE_REFINER_DEVICE"] = args.outer_edge_refiner_device
     os.environ["SEMANTIC_SPLIT_DEVICE"] = args.semantic_split_device
-    os.environ["CUT_EDGE_REFINER_DEVICE"] = args.cut_edge_refiner_device
     os.environ["PRE_ASR_CUEQC_ENABLED"] = "1" if args.pre_asr_cueqc_enabled else "0"
     if args.pre_asr_cueqc_model_path_by_repo.strip():
         os.environ["PRE_ASR_CUEQC_MODEL_PATH_BY_REPO"] = args.pre_asr_cueqc_model_path_by_repo
     else:
         os.environ.pop("PRE_ASR_CUEQC_MODEL_PATH_BY_REPO", None)
     os.environ["PRE_ASR_CUEQC_DEVICE"] = args.pre_asr_cueqc_device
-    if args.pre_asr_cueqc_drop_threshold is None:
-        os.environ.pop("PRE_ASR_CUEQC_DROP_THRESHOLD", None)
-    else:
-        os.environ["PRE_ASR_CUEQC_DROP_THRESHOLD"] = str(
-            args.pre_asr_cueqc_drop_threshold
-        )
     os.environ["KEEP_ASR_CHUNKS"] = "1" if args.keep_asr_chunks else "0"
     os.environ["BOUNDARY_CACHE_ENABLED"] = "1" if args.boundary_cache else "0"
     os.environ["SPEECH_BOUNDARY_JA_THRESHOLD"] = str(args.speech_boundary_threshold)
@@ -292,20 +279,11 @@ def build_context(*, args: argparse.Namespace, paths: RunPaths, video: Path):
         "SEMANTIC_SPLIT_MODEL_PATH_BY_REPO": os.getenv(
             "SEMANTIC_SPLIT_MODEL_PATH_BY_REPO", ""
         ),
-        "CUT_EDGE_REFINER_MODEL_PATH_BY_REPO": os.getenv(
-            "CUT_EDGE_REFINER_MODEL_PATH_BY_REPO", ""
-        ),
         "OUTER_EDGE_REFINER_DEVICE": os.getenv("OUTER_EDGE_REFINER_DEVICE", "auto"),
         "SEMANTIC_SPLIT_DEVICE": os.getenv("SEMANTIC_SPLIT_DEVICE", "auto"),
-        "CUT_EDGE_REFINER_DEVICE": os.getenv("CUT_EDGE_REFINER_DEVICE", "auto"),
         "PRE_ASR_CUEQC_ENABLED": "1" if args.pre_asr_cueqc_enabled else "0",
         "PRE_ASR_CUEQC_MODEL_PATH_BY_REPO": os.getenv("PRE_ASR_CUEQC_MODEL_PATH_BY_REPO", ""),
         "PRE_ASR_CUEQC_DEVICE": os.getenv("PRE_ASR_CUEQC_DEVICE", "auto"),
-        "PRE_ASR_CUEQC_DROP_THRESHOLD": (
-            ""
-            if args.pre_asr_cueqc_drop_threshold is None
-            else str(args.pre_asr_cueqc_drop_threshold)
-        ),
         "QUALITY_REPORT_ENABLED": "1",
         "QUALITY_REPORT_DIR": str(paths.root / "quality_reports"),
         "QC_HARD_FAIL": "0",
@@ -473,14 +451,14 @@ def write_summary(paths: RunPaths, args: argparse.Namespace, results: list[dict[
         "speech_boundary_scorer_checkpoint_by_repo": args.speech_boundary_scorer_checkpoint_by_repo,
         "asr_batch_size": args.asr_batch_size,
         "pre_asr_cueqc_enabled": bool(args.pre_asr_cueqc_enabled),
-        "pre_asr_cueqc_drop_threshold": args.pre_asr_cueqc_drop_threshold,
         "boundary_planner": {
             "feature_frame_hop_s": args.boundary_feature_frame_hop_s,
             "order": [
                 "speech_island_scorer",
-                "outer_edge_refiner",
-                "semantic_split_model",
-                "cut_edge_refiner",
+                "outer_edge_refiner_v3",
+                "acoustic_split_v4",
+                "pre_asr_cueqc_v13",
+                "inner_edge_refiner_v2",
             ],
         },
         "translate": bool(args.translate),
@@ -567,18 +545,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--semantic-split-model-path-by-repo",
         default=os.getenv("SEMANTIC_SPLIT_MODEL_PATH_BY_REPO", ""),
-        help="Optional repo-id checkpoint map for semantic_split_model_v2.",
-    )
-    parser.add_argument(
-        "--cut-edge-refiner-model-path-by-repo",
-        default=os.getenv("CUT_EDGE_REFINER_MODEL_PATH_BY_REPO", ""),
-        help="Optional repo-id checkpoint map for cut_edge_refiner_v1.",
+        help="Optional repo-id checkpoint map for Acoustic Split v4.",
     )
     parser.add_argument(
         "--pre-asr-cueqc-enabled",
         action=argparse.BooleanOptionalAction,
         default=_env_bool("PRE_ASR_CUEQC_ENABLED", False),
-        help="Run repo-bound Pre-ASR CueQC (1.7B v13, 0.6B legacy v12) before ASR export.",
+        help="Run the current repo-bound binary Pre-ASR CueQC before ASR export.",
     )
     parser.add_argument(
         "--pre-asr-cueqc-model-path-by-repo",
@@ -587,22 +560,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("--pre-asr-cueqc-device", default=os.getenv("PRE_ASR_CUEQC_DEVICE", "auto"))
     parser.add_argument(
-        "--pre-asr-cueqc-drop-threshold",
-        type=float,
-        default=_env_optional_float("PRE_ASR_CUEQC_DROP_THRESHOLD"),
-        help="Legacy v12-only runtime threshold override; CueQC v13 always uses argmax.",
-    )
-    parser.add_argument(
         "--outer-edge-refiner-device",
         default=os.getenv("OUTER_EDGE_REFINER_DEVICE", "auto"),
     )
     parser.add_argument(
         "--semantic-split-device",
         default=os.getenv("SEMANTIC_SPLIT_DEVICE", "auto"),
-    )
-    parser.add_argument(
-        "--cut-edge-refiner-device",
-        default=os.getenv("CUT_EDGE_REFINER_DEVICE", "auto"),
     )
     parser.add_argument("--keep-asr-chunks", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--boundary-cache", action=argparse.BooleanOptionalAction, default=_env_bool("BOUNDARY_CACHE_ENABLED", True))
@@ -688,11 +651,6 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         value = getattr(args, name)
         if not 0.0 <= value <= 1.0:
             parser.error(f"--{name.replace('_', '-')} must be between 0 and 1")
-    if (
-        args.pre_asr_cueqc_drop_threshold is not None
-        and not 0.0 <= args.pre_asr_cueqc_drop_threshold <= 1.0
-    ):
-        parser.error("--pre-asr-cueqc-drop-threshold must be between 0 and 1")
     if args.speech_boundary_window_s <= 0:
         parser.error("--speech-boundary-window-s must be positive")
     if args.speech_boundary_overlap_s < 0 or args.speech_boundary_overlap_s >= args.speech_boundary_window_s:

@@ -11,7 +11,9 @@ import torch
 
 from audio.chunk_packer import PackedChunk
 from boundary.base import SegmentationResult, SpeechSegment
+from boundary.contracts import ACOUSTIC_BINARY_V12_CONTRACT
 from boundary.sequence_features import (
+    CHUNK_LEARNED_PROJECTED_PTM_SCHEMA,
     CHUNK_POOLED_PTM_SCHEMA,
     DEFAULT_CHUNK_POOLED_PTM_BINS,
     chunk_pooled_ptm_feature_names,
@@ -75,6 +77,7 @@ class _StubSpeechBoundaryBackend:
                 "candidate_frame_scores": [0.1] * 500,
                 "frame_hop_s": 0.02,
                 "sequence_feature_frames": {"schema": "test"},
+                "proposal_checkpoint": {"path": "proposal.pt", "sha256": "test"},
             },
             processing_time_sec=0.0,
         )
@@ -99,7 +102,11 @@ class _EmptyAllowedSpeechBoundaryBackend:
             groups=[],
             method=self.name,
             audio_duration_sec=10.0,
-            parameters={"backend": self.name, "allow_empty": True},
+            parameters={
+                "backend": self.name,
+                "allow_empty": True,
+                "proposal_checkpoint": {"path": "proposal.pt", "sha256": "test"},
+            },
             processing_time_sec=0.0,
         )
 
@@ -123,7 +130,10 @@ class _EmptyDisallowedSpeechBoundaryBackend:
             groups=[],
             method=self.name,
             audio_duration_sec=10.0,
-            parameters={"backend": self.name},
+            parameters={
+                "backend": self.name,
+                "proposal_checkpoint": {"path": "proposal.pt", "sha256": "test"},
+            },
             processing_time_sec=0.0,
         )
 
@@ -272,10 +282,18 @@ def _reload_pipeline(monkeypatch, tmp_path: Path, *, enable_cueqc: bool = False)
     asr_backend = "jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame-hf"
     outer_checkpoint = tmp_path / "outer.pt"
     split_checkpoint = tmp_path / "split.pt"
-    cut_checkpoint = tmp_path / "cut.pt"
-    torch.save({"schema": "outer_edge_refiner_v1"}, outer_checkpoint)
-    torch.save({"schema": "semantic_split_verifier_v2"}, split_checkpoint)
-    torch.save({"schema": "cut_edge_refiner_v1"}, cut_checkpoint)
+    inner_checkpoint = tmp_path / "inner.pt"
+    torch.save({"schema": "outer_edge_refiner_v3"}, outer_checkpoint)
+    torch.save(
+        {
+            "schema": "semantic_split_model_v4",
+            "model_state_dict": {
+                "ptm_projector.weight": torch.zeros((128, 2048))
+            },
+        },
+        split_checkpoint,
+    )
+    torch.save({"schema": "inner_edge_refiner_v2"}, inner_checkpoint)
     monkeypatch.setenv("ASR_BACKEND", asr_backend)
     monkeypatch.setenv(
         "OUTER_EDGE_REFINER_MODEL_PATH_BY_REPO",
@@ -286,8 +304,8 @@ def _reload_pipeline(monkeypatch, tmp_path: Path, *, enable_cueqc: bool = False)
         f"{asr_backend}={split_checkpoint}",
     )
     monkeypatch.setenv(
-        "CUT_EDGE_REFINER_MODEL_PATH_BY_REPO",
-        f"{asr_backend}={cut_checkpoint}",
+        "INNER_EDGE_REFINER_MODEL_PATH_BY_REPO",
+        f"{asr_backend}={inner_checkpoint}",
     )
     monkeypatch.setenv("BOUNDARY_FEATURE_FRAME_HOP_S", "0.02")
     monkeypatch.setenv("ASR_CHUNK_ROOT", str(tmp_path / "chunks"))
@@ -302,9 +320,26 @@ def _reload_pipeline(monkeypatch, tmp_path: Path, *, enable_cueqc: bool = False)
     from asr import pipeline as asr
 
     asr = importlib.reload(asr)
-    monkeypatch.setattr(asr, "load_outer_edge_refiner", lambda *_args, **_kwargs: _FakeBoundaryModel("outer_edge_refiner_v1"))
-    monkeypatch.setattr(asr, "load_semantic_split_verifier", lambda *_args, **_kwargs: _FakeBoundaryModel("semantic_split_verifier_v1"))
-    monkeypatch.setattr(asr, "load_cut_edge_refiner", lambda *_args, **_kwargs: _FakeBoundaryModel("cut_edge_refiner_v1"))
+    monkeypatch.setattr(
+        asr,
+        "require_boundary_pipeline_ready",
+        lambda _repo_id: asr_backend,
+    )
+    monkeypatch.setattr(
+        asr,
+        "load_outer_edge_refiner_v3",
+        lambda *_args, **_kwargs: _FakeBoundaryModel("outer_edge_refiner_v3"),
+    )
+    monkeypatch.setattr(
+        asr,
+        "load_acoustic_split_v4_planner",
+        lambda *_args, **_kwargs: _FakeBoundaryModel("semantic_split_model_v4"),
+    )
+    monkeypatch.setattr(
+        asr,
+        "load_inner_edge_refiner_v2",
+        lambda *_args, **_kwargs: _FakeBoundaryModel("inner_edge_refiner_v2"),
+    )
     monkeypatch.setattr(
         asr,
         "_required_sequence_feature_provider_from_result",
@@ -312,7 +347,7 @@ def _reload_pipeline(monkeypatch, tmp_path: Path, *, enable_cueqc: bool = False)
     )
     monkeypatch.setattr(
         asr,
-        "build_semantic_boundary_chunks",
+        "build_acoustic_split_v4_provisional_chunks",
         lambda segments, **_kwargs: [
             PackedChunk(
                 start=segment.start,
@@ -322,14 +357,31 @@ def _reload_pipeline(monkeypatch, tmp_path: Path, *, enable_cueqc: bool = False)
                 speech_segments=[segment],
                 duration=segment.end - segment.start,
                 split_reason="semantic_boundary",
+                boundary_contract_id=ACOUSTIC_BINARY_V12_CONTRACT.contract_id,
                 boundary_source="speech_island",
-                pre_asr_ptm_pooling_schema=CHUNK_POOLED_PTM_SCHEMA,
+                inner_edge_prediction={
+                    "schema": ACOUSTIC_BINARY_V12_CONTRACT.inner_prediction_schema,
+                    "action": "refined",
+                    "start_s": segment.start,
+                    "end_s": segment.end,
+                },
+                pre_asr_ptm_pooling_schema=CHUNK_LEARNED_PROJECTED_PTM_SCHEMA,
                 pre_asr_ptm_pooling_bins=PRE_ASR_CUEQC_PTM_BINS,
                 pre_asr_ptm_pooling_dim=len(_pre_asr_ptm_feature_names()),
                 pre_asr_ptm_pooled_features=_pre_asr_ptm_values(),
             )
             for segment in segments
         ],
+    )
+    monkeypatch.setattr(
+        asr,
+        "annotate_inner_edge_predictions",
+        lambda chunks, **_kwargs: chunks,
+    )
+    monkeypatch.setattr(
+        asr,
+        "_annotate_pre_asr_ptm_pooling_on_packed_chunks",
+        lambda spans, **_kwargs: spans,
     )
     return asr
 
@@ -374,7 +426,9 @@ def test_boundary_planner_emits_one_asr_chunk_per_speech_island(monkeypatch, tmp
     assert len(backend.audio_paths) == 10
     assert details["chunk_count"] == len(backend.audio_paths)
     assert details["boundary_signature"]["backend"] == "stub"
-    assert details["boundary_signature"]["boundary_pipeline"]["version"] == 9
+    assert details["boundary_signature"]["boundary_pipeline"]["contract_id"] == (
+        ACOUSTIC_BINARY_V12_CONTRACT.contract_id
+    )
     assert all(
         "source_boundary.wav" not in str(Path(path).name) for path in backend.audio_paths
     )
@@ -426,7 +480,8 @@ def test_pre_asr_candidates_accept_numpy_pooled_features(monkeypatch, tmp_path):
         duration=0.8,
         split_reason="semantic_boundary",
         boundary_source="speech_island",
-        pre_asr_ptm_pooling_schema=CHUNK_POOLED_PTM_SCHEMA,
+        boundary_contract_id=ACOUSTIC_BINARY_V12_CONTRACT.contract_id,
+        pre_asr_ptm_pooling_schema=CHUNK_LEARNED_PROJECTED_PTM_SCHEMA,
         pre_asr_ptm_pooling_bins=PRE_ASR_CUEQC_PTM_BINS,
         pre_asr_ptm_pooling_dim=len(values),
         pre_asr_ptm_pooled_features=values,

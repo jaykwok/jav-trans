@@ -1,7 +1,42 @@
 [project]
 name = "jav-trans"
 version = "0.1.0"
-requires-python = ">=3.13"
+requires-python = ">=3.14"
+dependencies = [
+    "accelerate",
+    "fastapi",
+    "huggingface-hub>=0.25",
+    "httpx",
+    "librosa",
+    "numpy",
+    "openai",
+    "psutil",
+    "python-dotenv",
+    "python-multipart",
+    "pywebview",
+    "rich",
+    "scipy",
+    "soundfile",
+    "torch>=2.13.0",
+    "transformers>=5.13.0",
+    "uvicorn[standard]",
+    "xxhash",
+]
+
+[dependency-groups]
+dev = [
+    "pyinstaller",
+    "pytest",
+    "scikit-learn",
+]
+
+[tool.uv.sources]
+torch = { index = "pytorch-cu132" }
+
+[[tool.uv.index]]
+name = "pytorch-cu132"
+url = "https://download.pytorch.org/whl/cu132"
+explicit = true
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

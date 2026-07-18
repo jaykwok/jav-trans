@@ -12,10 +12,9 @@ from boundary.split_model import (
     SplitDecision,
     aggregate_cut_event_runs,
     build_acoustic_split_v4_checkpoint,
-    build_semantic_split_island_checkpoint,
     load_acoustic_split_v4_planner,
-    load_semantic_split_verifier,
 )
+from boundary.contracts import ACOUSTIC_BINARY_V12_CONTRACT
 
 
 FRAME_DIM = 6
@@ -82,7 +81,7 @@ def test_cut_runs_emit_one_event_at_highest_probability() -> None:
 
 
 def test_v4_checkpoint_is_binary_argmax_only(tmp_path) -> None:
-    config = {**_model_config(), "aux_label_dim": 2}
+    config = {**_model_config(), "num_classes": 2}
     model = IslandCandidateSequenceNetwork(**config)
     v4 = tmp_path / "v4.pt"
     torch.save(
@@ -96,10 +95,17 @@ def test_v4_checkpoint_is_binary_argmax_only(tmp_path) -> None:
         v4,
     )
     planner = load_acoustic_split_v4_planner(v4, device="cpu")
+    assert not any(
+        key.startswith(("gate_head.", "omni_head.", "offset_head."))
+        for key in model.state_dict()
+    )
     signature = planner.signature()
     assert signature["schema"] == SEMANTIC_SPLIT_V4_SCHEMA
     assert signature["model_arch"] == SEMANTIC_SPLIT_V4_MODEL_ARCH
     assert signature["runtime_adapter"] == SEMANTIC_SPLIT_V4_RUNTIME_ADAPTER
+    assert signature["boundary_serialization_contract_id"] == (
+        ACOUSTIC_BINARY_V12_CONTRACT.contract_id
+    )
     assert signature["decision_config"] == {"decision_mode": "binary_argmax_cut"}
     decisions = planner.decide_islands(
         island_frame_features=[np.zeros((2, BINS, FRAME_DIM), dtype=np.float32)],
@@ -111,6 +117,39 @@ def test_v4_checkpoint_is_binary_argmax_only(tmp_path) -> None:
         row.p_cut + row.p_continue == pytest.approx(1.0, abs=1e-5)
         for row in decisions
     )
+    groups = [
+        np.zeros((2, BINS, FRAME_DIM), dtype=np.float32),
+        np.zeros((1, BINS, FRAME_DIM), dtype=np.float32),
+        np.zeros((3, BINS, FRAME_DIM), dtype=np.float32),
+    ]
+    scalars = [np.zeros((len(group), SCALAR_DIM), dtype=np.float32) for group in groups]
+    unbatched = planner.decide_islands(
+        island_frame_features=groups,
+        island_scalar_features=scalars,
+        max_padded_candidates=100,
+    )
+    bounded = planner.decide_islands(
+        island_frame_features=groups,
+        island_scalar_features=scalars,
+        max_padded_candidates=3,
+    )
+    assert [[row.label for row in group] for group in bounded] == [
+        [row.label for row in group] for group in unbatched
+    ]
+    assert [
+        probability
+        for group in bounded
+        for row in group
+        for probability in (row.p_cut, row.p_continue)
+    ] == pytest.approx(
+        [
+            probability
+            for group in unbatched
+            for row in group
+            for probability in (row.p_cut, row.p_continue)
+        ],
+        abs=1e-6,
+    )
 
 
 def test_v4_loader_rejects_legacy_three_class_and_v2_schemas(tmp_path) -> None:
@@ -120,27 +159,34 @@ def test_v4_loader_rejects_legacy_three_class_and_v2_schemas(tmp_path) -> None:
         {
             "schema": "semantic_split_model_v3",
             "model_arch": "acoustic_candidate_sequence_mamba_v1",
-            "model_config": {**_model_config(), "aux_label_dim": 3},
+            "model_config": {**_model_config(), "num_classes": 3},
             "metadata": {"ptm_repo_id": "repo/1.7b"},
             "model_state_dict": model.state_dict(),
         },
         v3,
     )
-    with pytest.raises(ValueError, match="semantic_split_verifier_v2"):
-        load_semantic_split_verifier(v3, device="cpu")
     with pytest.raises(ValueError, match="semantic_split_model_v4"):
         load_acoustic_split_v4_planner(v3, device="cpu")
 
     v2 = tmp_path / "v2.pt"
-    torch.save(
-        build_semantic_split_island_checkpoint(
-            model=model,
-            model_config=_model_config(),
-            feature_config=_feature_config(),
-            normalization=_normalization(),
-            metadata={"ptm_repo_id": "repo/1.7b"},
-        ),
-        v2,
-    )
+    torch.save({"schema": "semantic_split_verifier_v2"}, v2)
     with pytest.raises(ValueError, match="semantic_split_model_v4"):
         load_acoustic_split_v4_planner(v2, device="cpu")
+
+    retired_arch = tmp_path / "retired-arch.pt"
+    torch.save(
+        {
+            "schema": SEMANTIC_SPLIT_V4_SCHEMA,
+            "model_arch": "acoustic_candidate_sequence_mamba_binary_v1",
+            "model_config": {**_model_config(), "num_classes": 2},
+            "metadata": {
+                "ptm_repo_id": "repo/1.7b",
+                "training_labels": ["cut", "continue"],
+                "excluded_training_labels": ["unsure"],
+            },
+            "model_state_dict": model.state_dict(),
+        },
+        retired_arch,
+    )
+    with pytest.raises(ValueError, match="model_arch"):
+        load_acoustic_split_v4_planner(retired_arch, device="cpu")

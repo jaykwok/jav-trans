@@ -1185,16 +1185,17 @@ def run(args: argparse.Namespace) -> None:
         _write_jsonl(output / "split_labels.jsonl", split_rows)
         _write_jsonl(output / "missed_boundaries.jsonl", missed_rows)
         if args.write_dataset_labels:
-            # Split v3 training labels must come from the per-candidate hard-case
+            # Acoustic Split canonical labels must come from the per-candidate
+            # centered-clip teacher
             # labeler (centered clip + thinking). This window-batched, no-thinking
             # split path stays available for smoke/legacy-signal runs, but writing
             # its labels into the shared training set would mix two annotation
-            # geometries and inject noise into Split v3. Hard-fail instead.
+            # geometries and inject noise into Acoustic Split. Hard-fail instead.
             raise RuntimeError(
                 "refusing to write window-batched split labels into "
-                f"{dataset / 'semantic_split' / 'labels.jsonl'}: Split v3 training "
+                f"{dataset / 'semantic_split' / 'labels.jsonl'}: Acoustic Split training "
                 "labels must be produced by "
-                "tools/boundary/ja/label_semantic_split_hard_cases_with_omni.py "
+                "tools/boundary/ja/label_acoustic_split_canonical_candidates_with_omni.py "
                 "(per-candidate). Re-run with --label-task pre_asr, or drop "
                 "--write-dataset-labels to keep this as a smoke/legacy-signal run."
             )

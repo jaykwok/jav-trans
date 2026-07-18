@@ -43,8 +43,8 @@ def test_forward_accepts_full_dim_frames() -> None:
     scalars = torch.randn(2, 3, SCALARS)
     mask = torch.ones(2, 3)
     outputs = model(frames, scalars, mask)
-    assert outputs["gate"].shape == (2, 3)
-    assert outputs["offset"].shape == (2, 3)
+    assert outputs["label"].shape == (2, 3, 2)
+    assert outputs["role"].shape == (2, 3, 4)
 
 
 def test_forward_rejects_wrong_full_dim() -> None:
@@ -94,7 +94,7 @@ def test_residual_forward_matches_linear_at_init() -> None:
     with torch.no_grad():
         out_b = linear(frames, scalars, mask)
         out_a = residual(frames, scalars, mask)
-    for key in ("gate", "offset", "label"):
+    for key in ("label", "role"):
         torch.testing.assert_close(out_a[key], out_b[key], atol=1e-6, rtol=1e-5)
 
 

@@ -158,7 +158,7 @@ def test_multicore_smoke_covers_split_safe_abstain_and_continue(tmp_path: Path) 
     assert summary["overlay_selection"]["music_audio_ids"] == ["music-a", "music-b"]
     assert summary["overlay_mode"] == "additive_full_duration"
     assert summary["all_semantic_cores_have_simultaneous_overlay"] is True
-    assert summary["clean_core_pipeline_entry_stage"] == "outer_edge_refiner_v2"
+    assert summary["clean_core_pipeline_entry_stage"] == "outer_edge_refiner_v3"
     assert summary["composite_pipeline_entry_stage"] == "semantic_speech_scorer"
     assert summary["snr_quantiles"]["count"] == 6
     assert summary["selected_unique_core_count"] == 10
@@ -225,7 +225,7 @@ def test_multicore_smoke_covers_split_safe_abstain_and_continue(tmp_path: Path) 
     assert all(row["timing_source"] == "full_clip_sample_extent_v1" for row in core_library)
     assert all(row["atomic_semantic_unit"] is True for row in core_library)
     assert all(row["semantic_unit_count"] == 1 for row in core_library)
-    assert all(row["pipeline_entry_stage"] == "outer_edge_refiner_v2" for row in core_library)
+    assert all(row["pipeline_entry_stage"] == "outer_edge_refiner_v3" for row in core_library)
     assert all(row["scorer_bypassed"] is True for row in core_library)
     assert summary["semantic_core_timing_contract"] == "full_clip_sample_extent_v1"
     assert (

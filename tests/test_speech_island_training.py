@@ -3,10 +3,20 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from boundary.ja.speech_train import _crop, _normalize
+from boundary.ja.speech_train import (
+    SPEECH_ISLAND_TRAINING_OUTPUT_DIM,
+    SPEECH_ISLAND_TRAINING_SCHEMA,
+    _crop,
+    _normalize,
+)
 from boundary.ja.dataset import LabelRecord
 from boundary.ja.semantic_speech_train import _class_indexes, _membership_indexes
 from boundary.ja.model import SemanticSpeechScorerNetwork
+
+
+def test_speech_island_trainer_is_bound_to_v8_single_logit_contract() -> None:
+    assert SPEECH_ISLAND_TRAINING_SCHEMA.endswith("speech_island_scorer_v8")
+    assert SPEECH_ISLAND_TRAINING_OUTPUT_DIM == 1
 
 
 def test_speech_training_crop_keeps_features_labels_and_weights_aligned() -> None:

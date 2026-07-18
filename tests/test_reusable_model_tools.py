@@ -38,7 +38,6 @@ def test_promote_torch_checkpoint_completes_artifact_contract(tmp_path: Path):
         source_training_run="agents/temp/example",
         selected_validation={"keep_recall": 0.9},
         metadata_updates={"teacher_checkpoint_sha256": "teacher-sha"},
-        drop_threshold=0.95,
         promotion_reason="test",
         promoted_at="2026-07-04T00:00:00+00:00",
     )
@@ -52,10 +51,7 @@ def test_promote_torch_checkpoint_completes_artifact_contract(tmp_path: Path):
     assert artifact["source_training_run"] == "agents/temp/example"
     assert payload["metadata"]["selected_validation"] == {"keep_recall": 0.9}
     assert payload["metadata"]["teacher_checkpoint_sha256"] == "teacher-sha"
-    assert payload["decision_config"] == {
-        "inference_window_size": 128,
-        "drop_threshold": 0.95,
-    }
+    assert payload["decision_config"] == {"inference_window_size": 128}
     assert payload["model_state_dict"]["weight"].tolist() == [1.0]
 
 
@@ -89,22 +85,3 @@ def test_compare_pre_asr_route_coverage_reports_uncovered_semantic_cues(
     assert result["uncovered_cues"] == 2
     assert result["semantic_uncovered_cues"] == 1
     assert result["semantic_uncovered"][0]["text"] == "次の台詞"
-
-
-def test_promote_torch_checkpoint_rejects_invalid_threshold(tmp_path: Path):
-    torch = pytest.importorskip("torch")
-    source = tmp_path / "trained.pt"
-    torch.save({"metadata": {}, "model_state_dict": {}}, source)
-
-    with pytest.raises(ValueError, match="between 0 and 1"):
-        promote_checkpoint(
-            input_path=source,
-            output_path=tmp_path / "production.pt",
-            artifact_name="model",
-            display_name="Model",
-            version="v1",
-            pipeline_stage=1,
-            pipeline_role="test",
-            source_training_run="run",
-            drop_threshold=1.1,
-        )
