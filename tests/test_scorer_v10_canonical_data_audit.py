@@ -55,6 +55,11 @@ def test_scorer_v10_canonical_audit_is_playable_and_saveable(tmp_path: Path) -> 
     assert "/__audit_api__/save-labels" in page
     assert "contains_target_speech" in page
     assert ".join('\\n')+'\\n'" in page
+    assert '<button type="button" class="span' in page
+    assert 'data-play-start="${s.start_s}" data-play-end="${s.end_s}"' in page
+    assert "function playExact(audio,button,start,end)" in page
+    assert "if(audio.currentTime>=end)stopPlayback()" in page
+    assert "再次点击同一条会立即停止" in page
 
     verdicts = output / "manual_verdicts.jsonl"
     manifest = [
