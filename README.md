@@ -23,7 +23,7 @@ jav-trans 是一个面向 Windows + NVIDIA 显卡的本地 JAV 字幕生成工�
 当前设计把职责拆开：
 
 - Speech Island Scorer 以高召回检测可能包含语义人声的 island。
-- Outer Edge Refiner v3 预留为整条 island 的外边界模型；架构、数据和人工 gate 回看完成前仅为不可执行占位。
+- Outer Edge Refiner v3 预留为整条 island 的二分类 acoustic outer-core 模型；schema/runtime/trainer plumbing 已完成审计，但实际 post-Scorer-v10 数据、训练和人工 gate 未完成，registry 仍为空。
 - Acoustic Split v4 只学习 `cut/continue`，按二分类 argmax 生成内部 event，不输出最终边缘；teacher/data 层的 `unsure` 仅用于审计并从训练排除。
 - Pre-ASR CueQC v13 对 provisional sub-island 做 `keep/drop` 二分类 argmax 路由；teacher/data 层可以保留 `unsure`，但模型不会输出它。
 - Inner Edge Refiner v2 对 CueQC 保留的 sub-island 做逐帧二分类 argmax，裁成送入 ASR 的 acoustic semantic core。
@@ -120,7 +120,7 @@ Web 会在模型要求检查中提示驱动过旧或 CUDA 初始化失败。
   -> BoundaryProposalScorer v1（候选源审计中）
      - 学习型高召回 acoustic candidate source，不做 final cut decision
   -> 按 ASR repo 进入互不混用的边界链
-     - 1.7B：Outer Edge Refiner v3（当前待架构/数据审计，未注册生产 checkpoint）
+     - 1.7B：Outer Edge Refiner v3（合同 plumbing 已审计；等待实际 Scorer-v10 数据，未注册生产 checkpoint）
        -> Acoustic Split v4 binary argmax
        -> provisional sub-islands
        -> Pre-ASR CueQC v13 binary argmax
@@ -163,7 +163,7 @@ Web 会在模型要求检查中提示驱动过旧或 CUDA 初始化失败。
 - `jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame-hf`：默认高质量档。
 - `jaykwok/Qwen3-ASR-0.6B-JA-Anime-Galgame-hf`：仅保留 ASR repo 与空 Boundary registry placeholder；全链重训留作未来 backlog，本轮不训练、不修改。
 
-1.7B 绑定待审计的 binary Speech-island scorer、边界候选、Outer、Acoustic Split、Pre-ASR CueQC 与 binary acoustic Inner。0.6B 的旧小模型已退役并保持空 placeholder；未来 backlog 若重启，必须重新提取 0.6B PTM features 并从头训练，不借用 1.7B feature cache、投影或 checkpoint。
+1.7B 绑定待重构的 binary Speech-island scorer、高召回边界候选、待真实数据训练的 Outer、Acoustic Split、Pre-ASR CueQC 与 binary acoustic Inner。0.6B 的旧小模型已退役并保持空 placeholder；未来 backlog 若重启，必须重新提取 0.6B PTM features 并从头训练，不借用 1.7B feature cache、投影或 checkpoint。
 
 所有小模型统一放在：
 
@@ -173,7 +173,7 @@ src/checkpoints/
 └── jaykwok-Qwen3-ASR-1.7B-JA-Anime-Galgame-hf/
 ```
 
-1.7B 的目标 Boundary pipeline 为 Boundary contract `boundary_acoustic_binary_v12`：Outer v3 → Acoustic Split v4 binary → provisional sub-islands → CueQC v13 binary → Inner v2 binary acoustic core → Chunk/ASR。Outer v3 审计完成前不提供生产工作流；模型缺失、repo 不匹配、contract id 不兼容或选择尚未重训的 0.6B 都会直接报错（无规则 fallback、无静默迁移）。实验指标与版本决策见 [docs/HISTORY.md](docs/HISTORY.md)。
+1.7B 的目标 Boundary pipeline 为 Boundary contract `boundary_acoustic_binary_v12`：Outer v3 → Acoustic Split v4 binary → provisional sub-islands → CueQC v13 binary → Inner v2 binary acoustic core → Chunk/ASR。Outer v3 仅完成合同 plumbing，必须等 Scorer v10 实际输出分布上的训练与人工 gate 后才可注册；模型缺失、repo 不匹配、contract id 不兼容或选择尚未重训的 0.6B 都会直接报错（无规则 fallback、无静默迁移）。实验指标与版本决策见 [docs/HISTORY.md](docs/HISTORY.md)。
 
 ---
 
