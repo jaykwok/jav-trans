@@ -4,6 +4,10 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from boundary.contracts import (
+    ACOUSTIC_BINARY_V12_CONTRACT,
+    require_boundary_contract_id,
+)
 from boundary.ja.model import checkpoint_sha256
 
 
@@ -57,6 +61,9 @@ class BoundaryProposalScorerBundle:
         return {
             "schema": self.schema,
             "model_type": self.model_type,
+            "boundary_serialization_contract_id": require_boundary_contract_id(
+                self.metadata.get("boundary_serialization_contract_id")
+            ),
             "path": self.path,
             "sha256": self.sha256,
             "model_config": {
@@ -82,6 +89,10 @@ def build_boundary_proposal_checkpoint(
     if int(model_config.get("output_dim", 0)) != BOUNDARY_PROPOSAL_SCORER_OUTPUT_DIM:
         raise ValueError("boundary proposal scorer requires output_dim=1")
     metadata_dict = dict(metadata or {})
+    metadata_dict.setdefault(
+        "boundary_serialization_contract_id",
+        ACOUSTIC_BINARY_V12_CONTRACT.contract_id,
+    )
     metadata_dict["artifact"] = {
         **BOUNDARY_PROPOSAL_SCORER_ARTIFACT,
         **dict(metadata_dict.get("artifact") or {}),
@@ -134,6 +145,9 @@ def load_boundary_proposal_checkpoint(
     if int(model_config.get("output_dim", 0)) != BOUNDARY_PROPOSAL_SCORER_OUTPUT_DIM:
         raise ValueError("proposal checkpoint requires output_dim=1")
     metadata = dict(payload.get("metadata") or {})
+    require_boundary_contract_id(
+        metadata.get("boundary_serialization_contract_id")
+    )
     artifact = metadata.get("artifact")
     if not isinstance(artifact, dict):
         raise ValueError("proposal checkpoint metadata.artifact is required")

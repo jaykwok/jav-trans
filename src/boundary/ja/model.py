@@ -7,12 +7,17 @@ from typing import Any, Sequence
 
 import numpy as np
 
+from boundary.contracts import (
+    ACOUSTIC_BINARY_V12_CONTRACT,
+    require_boundary_contract_id,
+)
 
-LEGACY_SPEECH_ISLAND_SCORER_SCHEMA = "speech_boundary_ja_mamba2_speech_island_scorer_v8"
-LEGACY_SPEECH_ISLAND_SCORER_MODEL_TYPE = "mamba2_speech_island_scorer"
-LEGACY_SPEECH_ISLAND_SCORER_MODEL_ARCH = "v8-speech-island"
-LEGACY_SPEECH_ISLAND_SCORER_OUTPUT_HEADS = ("speech_prob",)
-LEGACY_SPEECH_ISLAND_SCORER_DECODER = "speech_hysteresis_islands_v1"
+
+SPEECH_ISLAND_SCORER_V8_SCHEMA = "speech_boundary_ja_mamba2_speech_island_scorer_v8"
+SPEECH_ISLAND_SCORER_V8_MODEL_TYPE = "mamba2_speech_island_scorer"
+SPEECH_ISLAND_SCORER_V8_MODEL_ARCH = "v8-speech-island"
+SPEECH_ISLAND_SCORER_V8_OUTPUT_HEADS = ("speech_prob",)
+SPEECH_ISLAND_SCORER_V8_DECODER = "speech_hysteresis_islands_v1"
 
 SPEECH_ISLAND_SCORER_SCHEMA = "semantic_speech_scorer_v9"
 SPEECH_ISLAND_SCORER_MODEL_TYPE = "mamba2_semantic_speech_scorer"
@@ -50,7 +55,7 @@ def _bool_config(value: Any) -> bool:
 def _artifact_contract(schema: str) -> dict[str, Any]:
     if schema == SPEECH_ISLAND_SCORER_SCHEMA:
         return SPEECH_ISLAND_SCORER_ARTIFACT
-    if schema == LEGACY_SPEECH_ISLAND_SCORER_SCHEMA:
+    if schema == SPEECH_ISLAND_SCORER_V8_SCHEMA:
         return {
             "name": "speech_island_scorer",
             "display_name": "SpeechIslandScorer",
@@ -70,18 +75,21 @@ def _output_contract(schema: str) -> tuple[tuple[str, ...], str, int, str, str]:
             SPEECH_ISLAND_SCORER_MODEL_ARCH,
             SPEECH_ISLAND_SCORER_MODEL_TYPE,
         )
-    if schema == LEGACY_SPEECH_ISLAND_SCORER_SCHEMA:
+    if schema == SPEECH_ISLAND_SCORER_V8_SCHEMA:
         return (
-            LEGACY_SPEECH_ISLAND_SCORER_OUTPUT_HEADS,
-            LEGACY_SPEECH_ISLAND_SCORER_DECODER,
+            SPEECH_ISLAND_SCORER_V8_OUTPUT_HEADS,
+            SPEECH_ISLAND_SCORER_V8_DECODER,
             1,
-            LEGACY_SPEECH_ISLAND_SCORER_MODEL_ARCH,
-            LEGACY_SPEECH_ISLAND_SCORER_MODEL_TYPE,
+            SPEECH_ISLAND_SCORER_V8_MODEL_ARCH,
+            SPEECH_ISLAND_SCORER_V8_MODEL_TYPE,
         )
     raise ValueError(f"unsupported scorer checkpoint schema: {schema!r}")
 
 
 def _validate_metadata(metadata: dict[str, Any], *, schema: str) -> None:
+    require_boundary_contract_id(
+        metadata.get("boundary_serialization_contract_id")
+    )
     artifact = metadata.get("artifact")
     if not isinstance(artifact, dict):
         raise ValueError("Speech island scorer checkpoint metadata.artifact is required")
@@ -224,7 +232,7 @@ def build_speech_island_scorer_model(*, schema: str, model_config: dict[str, Any
                 f"{SPEECH_ISLAND_SCORER_MODEL_ARCH!r}"
             )
         return SemanticSpeechScorerNetwork(**model_config)
-    if schema == LEGACY_SPEECH_ISLAND_SCORER_SCHEMA:
+    if schema == SPEECH_ISLAND_SCORER_V8_SCHEMA:
         from boundary.backbones import TRANSFORMERS_MAMBA2_BACKBONE, SpeechIslandSequenceClassifier
 
         for key in ("input_dim", "hidden_size", "num_layers"):
@@ -265,7 +273,7 @@ def build_speech_island_scorer_model(*, schema: str, model_config: dict[str, Any
         )
     raise ValueError(
         f"unsupported scorer checkpoint schema: {schema!r}; "
-        f"expected {SPEECH_ISLAND_SCORER_SCHEMA!r} or {LEGACY_SPEECH_ISLAND_SCORER_SCHEMA!r}"
+        f"expected {SPEECH_ISLAND_SCORER_SCHEMA!r} or {SPEECH_ISLAND_SCORER_V8_SCHEMA!r}"
     )
 
 
@@ -345,7 +353,7 @@ class SpeechIslandScorerBundle:
             "mfcc_dim": self.mfcc_dim,
             "input_dim": self.input_dim,
         }
-        if self.schema == LEGACY_SPEECH_ISLAND_SCORER_SCHEMA:
+        if self.schema == SPEECH_ISLAND_SCORER_V8_SCHEMA:
             model_config["ptm_dim"] = self.ptm_dim
         for key in (
             "model_arch",
@@ -369,6 +377,9 @@ class SpeechIslandScorerBundle:
         return {
             "schema": self.schema,
             "model_type": self.model_type,
+            "boundary_serialization_contract_id": require_boundary_contract_id(
+                self.metadata.get("boundary_serialization_contract_id")
+            ),
             "path": self.path,
             "sha256": self.sha256,
             "model_config": model_config,
@@ -405,11 +416,11 @@ def build_speech_island_scorer_checkpoint(
     metadata: dict[str, Any] | None = None,
     schema: str = SPEECH_ISLAND_SCORER_SCHEMA,
 ) -> dict[str, Any]:
-    if schema not in {SPEECH_ISLAND_SCORER_SCHEMA, LEGACY_SPEECH_ISLAND_SCORER_SCHEMA}:
+    if schema not in {SPEECH_ISLAND_SCORER_SCHEMA, SPEECH_ISLAND_SCORER_V8_SCHEMA}:
         raise ValueError(
             f"unsupported scorer checkpoint schema: {schema!r}; "
             f"expected {SPEECH_ISLAND_SCORER_SCHEMA!r} or "
-            f"{LEGACY_SPEECH_ISLAND_SCORER_SCHEMA!r}"
+            f"{SPEECH_ISLAND_SCORER_V8_SCHEMA!r}"
         )
     heads, decoder, output_dim, _model_arch, model_type = _output_contract(schema)
     if int(model_config.get("output_dim", 0)) != output_dim:
@@ -417,6 +428,10 @@ def build_speech_island_scorer_checkpoint(
             f"Speech island scorer checkpoint requires output_dim={output_dim}"
         )
     metadata_dict = dict(metadata or {})
+    metadata_dict.setdefault(
+        "boundary_serialization_contract_id",
+        ACOUSTIC_BINARY_V12_CONTRACT.contract_id,
+    )
     metadata_dict["artifact"] = {
         **_artifact_contract(schema),
         **dict(metadata_dict.get("artifact") or {}),
@@ -458,11 +473,11 @@ def load_speech_island_scorer_checkpoint(
     if not isinstance(payload, dict):
         raise ValueError(f"invalid scorer checkpoint payload: {checkpoint_path}")
     schema = str(payload.get("schema") or "")
-    if schema not in {SPEECH_ISLAND_SCORER_SCHEMA, LEGACY_SPEECH_ISLAND_SCORER_SCHEMA}:
+    if schema not in {SPEECH_ISLAND_SCORER_SCHEMA, SPEECH_ISLAND_SCORER_V8_SCHEMA}:
         raise ValueError(
             f"unsupported scorer checkpoint schema: {payload.get('schema')!r}; "
             f"expected {SPEECH_ISLAND_SCORER_SCHEMA!r} or "
-            f"{LEGACY_SPEECH_ISLAND_SCORER_SCHEMA!r}"
+            f"{SPEECH_ISLAND_SCORER_V8_SCHEMA!r}"
         )
     _heads, _decoder, _output_dim, _model_arch, expected_model_type = _output_contract(schema)
     model_type = str(payload.get("model_type") or "")
@@ -480,12 +495,12 @@ def load_speech_island_scorer_checkpoint(
     for key in required_config:
         if key not in model_config:
             raise ValueError(f"scorer checkpoint missing model_config.{key}")
-    if schema == LEGACY_SPEECH_ISLAND_SCORER_SCHEMA and int(model_config["input_dim"]) != int(model_config["ptm_dim"]) + int(model_config["mfcc_dim"]):
+    if schema == SPEECH_ISLAND_SCORER_V8_SCHEMA and int(model_config["input_dim"]) != int(model_config["ptm_dim"]) + int(model_config["mfcc_dim"]):
         raise ValueError("scorer checkpoint input_dim does not match ptm_dim + mfcc_dim")
     metadata = dict(payload.get("metadata") or {})
     _validate_metadata(metadata, schema=schema)
     normalization = dict(payload.get("normalization") or {})
-    if schema == LEGACY_SPEECH_ISLAND_SCORER_SCHEMA:
+    if schema == SPEECH_ISLAND_SCORER_V8_SCHEMA:
         mean = list(normalization.get("feature_mean") or [])
         std = list(normalization.get("feature_std") or [])
         if len(mean) != int(model_config["input_dim"]) or len(std) != int(model_config["input_dim"]):

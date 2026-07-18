@@ -4,40 +4,24 @@ from pathlib import Path
 
 import pytest
 
-from asr.pipeline import _require_learned_candidates_for_island_split
+from asr.pipeline import _require_learned_split_candidates
 from boundary.ja.backend import _proposal_checkpoint_from_env
 
 REPO_17B = "jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame-hf"
 REPO_06B = "jaykwok/Qwen3-ASR-0.6B-JA-Anime-Galgame-hf"
 
 
-class _IslandVerifier:
-    def decide_islands(self):  # pragma: no cover - marker method only
-        raise NotImplementedError
-
-
-class _FlatVerifier:
-    pass
-
-
 def test_island_split_with_bootstrap_candidates_raises() -> None:
     with pytest.raises(RuntimeError, match="bootstrap"):
-        _require_learned_candidates_for_island_split(_IslandVerifier(), {})
+        _require_learned_split_candidates({})
     with pytest.raises(RuntimeError, match="bootstrap"):
-        _require_learned_candidates_for_island_split(
-            _IslandVerifier(), {"proposal_checkpoint": ""}
-        )
+        _require_learned_split_candidates({"proposal_checkpoint": ""})
 
 
 def test_island_split_with_learned_candidates_passes() -> None:
-    _require_learned_candidates_for_island_split(
-        _IslandVerifier(),
+    _require_learned_split_candidates(
         {"proposal_checkpoint": {"path": "x.pt", "sha256": "abc"}},
     )
-
-
-def test_v1_split_keeps_bootstrap_candidates() -> None:
-    _require_learned_candidates_for_island_split(_FlatVerifier(), {})
 
 
 def test_proposal_checkpoint_empty_default_keeps_bootstrap(
@@ -63,7 +47,7 @@ def test_proposal_checkpoint_default_mapping_resolves_per_repo(
     )
     resolved = _proposal_checkpoint_from_env(REPO_17B)
     assert Path(resolved) == checkpoint
-    # A repo without a promoted proposer stays on bootstrap (split v1 chains).
+    # A repo without a promoted proposer remains unavailable to Split v4.
     assert _proposal_checkpoint_from_env(REPO_06B) == ""
 
 

@@ -11,16 +11,17 @@ from asr.backends.qwen import (
     DEFAULT_INNER_EDGE_REFINER_CHECKPOINT_BY_REPO,
     DEFAULT_PRE_ASR_CUEQC_CHECKPOINT_BY_REPO,
     DEFAULT_SEMANTIC_SPLIT_CHECKPOINT_BY_REPO,
-    QWEN_ASR_06B_REPO_ID,
     checkpoint_path_for_repo_env,
     current_qwen_asr_backend,
     validate_checkpoint_repo_id,
 )
 from boundary.sequence_features import (
     CHUNK_LEARNED_PROJECTED_PTM_SCHEMA,
-    CHUNK_PROJECTED_PTM_SCHEMA,
-    CHUNK_POOLED_PTM_SCHEMA,
     chunk_pooled_ptm_feature_names,
+)
+from boundary.contracts import (
+    ACOUSTIC_BINARY_V12_CONTRACT,
+    require_boundary_contract_id,
 )
 
 
@@ -40,23 +41,12 @@ PRE_ASR_CUEQC_LABELS = ("drop", "keep")
 PRE_ASR_CUEQC_LABEL_TO_INDEX = {
     label: index for index, label in enumerate(PRE_ASR_CUEQC_LABELS)
 }
-PRE_ASR_CUEQC_LEGACY_SCHEMA = "cueqc_pre_asr_semantic_chunk_v12_binary"
-PRE_ASR_CUEQC_LEGACY_MODEL_ARCH = "cueqc_pre_asr_semantic_chunk_v12"
-PRE_ASR_CUEQC_LEGACY_DECISION_VERSION = "pre_asr_cueqc_v12_binary_v1"
-PRE_ASR_CUEQC_LEGACY_FEATURE_SCHEMA = "pre_asr_cueqc_features_v9"
-PRE_ASR_CUEQC_LEGACY_RUNTIME_ADAPTER = "pre_asr_semantic_chunk_sequence_v4"
-PRE_ASR_CUEQC_LEGACY_ARTIFACT = {
-    "name": "pre_asr_cueqc",
-    "display_name": "Pre-ASR CueQC",
-    "version": "v12",
-    "pipeline_stage": 5,
-    "pipeline_role": "final_chunk_keep_drop_routing",
-}
 PRE_ASR_CUEQC_IGNORE_LABEL = -100
+PRE_ASR_CUEQC_INFERENCE_GROUP_BATCH_SIZE = 64
+PRE_ASR_CUEQC_INFERENCE_MAX_PADDED_CHUNKS = 4096
 PRE_ASR_CUEQC_PTM_DIM = 128
 PRE_ASR_CUEQC_PTM_BINS = 8
 PRE_ASR_CUEQC_MODEL_PTM_TOKENS = PRE_ASR_CUEQC_PTM_BINS + 2
-PRE_ASR_CUEQC_DEFAULT_DROP_THRESHOLD = 0.95
 
 PRE_ASR_CUEQC_V8_SCALAR_FEATURE_NAMES = (
     "duration_s",
@@ -274,17 +264,7 @@ def _inner_edge_refiner_checkpoint_path(repo_id: str | None = None) -> str:
 
 
 def _runtime_contract(repo_id: str | None = None) -> dict[str, Any]:
-    selected = repo_id or current_qwen_asr_backend()
-    if selected == QWEN_ASR_06B_REPO_ID:
-        return {
-            "schema": PRE_ASR_CUEQC_LEGACY_SCHEMA,
-            "arch": PRE_ASR_CUEQC_LEGACY_MODEL_ARCH,
-            "decision_version": PRE_ASR_CUEQC_LEGACY_DECISION_VERSION,
-            "feature_schema": PRE_ASR_CUEQC_LEGACY_FEATURE_SCHEMA,
-            "runtime_adapter": PRE_ASR_CUEQC_LEGACY_RUNTIME_ADAPTER,
-            "artifact": PRE_ASR_CUEQC_LEGACY_ARTIFACT,
-            "num_classes": 2,
-        }
+    del repo_id
     return {
         "schema": PRE_ASR_CUEQC_SCHEMA,
         "arch": PRE_ASR_CUEQC_MODEL_ARCH,
@@ -548,18 +528,8 @@ def _pooled_ptm_values(
         parsed_dim = None
     values = _numeric_list(raw_values)
     expected_dim = len(PRE_ASR_CUEQC_POOLED_PTM_FEATURE_NAMES)
-    boundary_pipeline_version = int(
-        _safe_float(_packed_value(span, "boundary_pipeline_version"), 0.0)
-    )
-    allowed_schemas = (
-        {CHUNK_LEARNED_PROJECTED_PTM_SCHEMA}
-        if boundary_pipeline_version == 11
-        else {
-            CHUNK_POOLED_PTM_SCHEMA,
-            CHUNK_PROJECTED_PTM_SCHEMA,
-            CHUNK_LEARNED_PROJECTED_PTM_SCHEMA,
-        }
-    )
+    require_boundary_contract_id(_packed_value(span, "boundary_contract_id", ""))
+    allowed_schemas = {CHUNK_LEARNED_PROJECTED_PTM_SCHEMA}
     available = (
         schema in allowed_schemas
         and len(values) == expected_dim
@@ -640,18 +610,8 @@ def candidate_from_span(
     require_ptm_pooling: bool = False,
 ) -> dict[str, Any]:
     span = spans[index]
-    boundary_pipeline_version = int(
-        _safe_float(_packed_value(span, "boundary_pipeline_version"), 0.0)
-    )
-    feature_schema = (
-        PRE_ASR_CUEQC_FEATURE_SCHEMA
-        if boundary_pipeline_version == 11
-        else PRE_ASR_CUEQC_LEGACY_FEATURE_SCHEMA
-    )
-    runtime_adapter = (
-        PRE_ASR_CUEQC_RUNTIME_ADAPTER
-        if boundary_pipeline_version == 11
-        else PRE_ASR_CUEQC_LEGACY_RUNTIME_ADAPTER
+    boundary_contract_id = require_boundary_contract_id(
+        _packed_value(span, "boundary_contract_id", "")
     )
     start = _safe_float(_packed_value(span, "start"))
     end = max(start, _safe_float(_packed_value(span, "end"), start))
@@ -874,10 +834,10 @@ def candidate_from_span(
         **neighbor_right,
     }
     return {
-        "schema": feature_schema,
-        "feature_schema": feature_schema,
-        "runtime_adapter": runtime_adapter,
-        "boundary_pipeline_version": boundary_pipeline_version,
+        "schema": PRE_ASR_CUEQC_FEATURE_SCHEMA,
+        "feature_schema": PRE_ASR_CUEQC_FEATURE_SCHEMA,
+        "runtime_adapter": PRE_ASR_CUEQC_RUNTIME_ADAPTER,
+        "boundary_contract_id": boundary_contract_id,
         "index": index,
         "start": round(start, 6),
         "end": round(end, 6),
@@ -1003,6 +963,40 @@ def sequence_tensors(
         "chunk_mask": chunk_mask,
         "positions": [position for position in positions if position is not None],
     }
+
+
+def inference_group_batches(
+    chunk_mask: np.ndarray,
+    *,
+    max_groups: int = PRE_ASR_CUEQC_INFERENCE_GROUP_BATCH_SIZE,
+    max_padded_chunks: int = PRE_ASR_CUEQC_INFERENCE_MAX_PADDED_CHUNKS,
+) -> list[tuple[int, int, int]]:
+    """Plan contiguous whole-group batches under a padded chunk budget."""
+
+    mask = np.asarray(chunk_mask)
+    if mask.ndim != 2:
+        raise ValueError("chunk_mask must have shape [groups,chunks]")
+    group_limit = max(1, int(max_groups))
+    padded_limit = max(1, int(max_padded_chunks))
+    lengths = np.sum(mask > 0, axis=1).astype(np.int64)
+    batches: list[tuple[int, int, int]] = []
+    start = 0
+    while start < int(mask.shape[0]):
+        end = start
+        used_chunks = 0
+        while end < int(mask.shape[0]) and end - start < group_limit:
+            candidate_max = max(used_chunks, int(lengths[end]))
+            padded_chunks = candidate_max * (end - start + 1)
+            if end > start and padded_chunks > padded_limit:
+                break
+            used_chunks = candidate_max
+            end += 1
+        if end == start:
+            end = start + 1
+            used_chunks = int(lengths[start])
+        batches.append((start, end, used_chunks))
+        start = end
+    return batches
 
 
 class PreAsrCueQCNetwork:
@@ -1384,15 +1378,17 @@ class PreAsrCueQC:
         self.path = path
         self.sha256 = _file_sha256(path)
         self.metadata = metadata
-        if contract["schema"] == PRE_ASR_CUEQC_SCHEMA:
-            if tuple(metadata.get("training_labels") or ()) != PRE_ASR_CUEQC_LABELS:
-                raise ValueError("Pre-ASR CueQC v13 training_labels must be drop/keep")
-            if tuple(metadata.get("excluded_training_labels") or ()) != ("unsure",):
-                raise ValueError("Pre-ASR CueQC v13 must exclude unsure from training")
-            if "excluded_training_label_count" not in metadata:
-                raise ValueError(
-                    "Pre-ASR CueQC v13 metadata.excluded_training_label_count is required"
-                )
+        require_boundary_contract_id(
+            metadata.get("boundary_serialization_contract_id")
+        )
+        if tuple(metadata.get("training_labels") or ()) != PRE_ASR_CUEQC_LABELS:
+            raise ValueError("Pre-ASR CueQC v13 training_labels must be drop/keep")
+        if tuple(metadata.get("excluded_training_labels") or ()) != ("unsure",):
+            raise ValueError("Pre-ASR CueQC v13 must exclude unsure from training")
+        if "excluded_training_label_count" not in metadata:
+            raise ValueError(
+                "Pre-ASR CueQC v13 metadata.excluded_training_label_count is required"
+            )
         self.config = config
         self.contract = contract
         self.scalar_feature_names = feature_names
@@ -1407,32 +1403,16 @@ class PreAsrCueQC:
         if self.mean.shape[0] != len(feature_names) or self.std.shape[0] != len(feature_names):
             raise ValueError("Pre-ASR CueQC scalar normalization shape mismatch")
         decision = dict(checkpoint.get("decision_config") or {})
-        default_decision_mode = (
-            "argmax"
-            if contract["schema"] == PRE_ASR_CUEQC_SCHEMA
-            else "drop_threshold"
-        )
-        self.decision_mode = str(decision.get("decision_mode") or default_decision_mode)
-        if contract["schema"] == PRE_ASR_CUEQC_SCHEMA and self.decision_mode != "argmax":
+        self.decision_mode = str(decision.get("decision_mode") or "")
+        if self.decision_mode != "argmax":
             raise ValueError("Pre-ASR CueQC v13 decision_mode must be argmax")
-        self.drop_threshold = float(
-            decision.get("drop_threshold", PRE_ASR_CUEQC_DEFAULT_DROP_THRESHOLD)
-        )
-        self.inference_window_size = max(0, int(decision.get("inference_window_size") or 512))
-        self.hard_keep_veto_enabled = bool(decision.get("hard_keep_veto", False))
-        self.hard_drop_rule_enabled = bool(decision.get("hard_drop_rule", False))
-        self.keep_veto_enabled = bool(decision.get("keep_veto", False))
-        if (
-            self.hard_keep_veto_enabled
-            or self.hard_drop_rule_enabled
-            or self.keep_veto_enabled
+        self.inference_group_batch_size = PRE_ASR_CUEQC_INFERENCE_GROUP_BATCH_SIZE
+        self.inference_max_padded_chunks = PRE_ASR_CUEQC_INFERENCE_MAX_PADDED_CHUNKS
+        if any(
+            bool(decision.get(name, False))
+            for name in ("hard_keep_veto", "hard_drop_rule", "keep_veto")
         ):
             raise ValueError("Pre-ASR CueQC checkpoints must disable hard rules")
-        self.hard_keep_min_duration_s = float(decision.get("hard_keep_min_duration_s", 0.80))
-        self.high_speech_p90 = float(decision.get("high_speech_p90", 0.85))
-        self.high_active_ratio = float(decision.get("high_active_ratio", 0.50))
-        self.very_low_speech_p90 = float(decision.get("very_low_speech_p90", 0.05))
-        self.very_low_active_ratio = float(decision.get("very_low_active_ratio", 0.05))
 
     def signature(self) -> dict[str, Any]:
         signature = {
@@ -1440,71 +1420,18 @@ class PreAsrCueQC:
             "arch": self.contract["arch"],
             "feature_schema": self.contract["feature_schema"],
             "runtime_adapter": self.contract["runtime_adapter"],
+            "boundary_serialization_contract_id": require_boundary_contract_id(
+                self.metadata.get("boundary_serialization_contract_id")
+            ),
             "path": str(self.path),
             "sha256": self.sha256,
             "decision_mode": self.decision_mode,
-            "inference_window_size": self.inference_window_size,
+            "inference_group_batch_size": self.inference_group_batch_size,
+            "inference_max_padded_chunks": self.inference_max_padded_chunks,
             "feature_names": list(self.scalar_feature_names),
             "metadata": self.metadata,
         }
-        if self.decision_mode == "drop_threshold":
-            signature["drop_threshold"] = self.drop_threshold
         return signature
-
-    @staticmethod
-    def _feature(candidate: Mapping[str, Any], name: str) -> float:
-        features = candidate.get("features") if isinstance(candidate.get("features"), Mapping) else {}
-        return _safe_float(features.get(name))
-
-    def _hard_keep_veto(self, candidate: Mapping[str, Any]) -> str:
-        if not self.hard_keep_veto_enabled:
-            return ""
-        duration = self._feature(candidate, "refined_duration_s") or self._feature(candidate, "duration_s")
-        if duration >= self.hard_keep_min_duration_s:
-            return "duration_at_or_above_hard_keep_min"
-        speech_p90 = self._feature(candidate, "scorer_speech_p90")
-        active05 = self._feature(candidate, "scorer_speech_active_ratio_05")
-        if speech_p90 >= self.high_speech_p90 and active05 >= self.high_active_ratio:
-            return "high_stable_speech"
-        if bool(candidate.get("micro_chunk_candidate")):
-            left_score = self._feature(candidate, "left_split_score")
-            right_score = self._feature(candidate, "right_split_score")
-            if left_score >= 0.75 and right_score >= 0.75:
-                return "strong_micro_split_evidence"
-        prev_p90 = self._feature(candidate, "prev_scorer_speech_p90")
-        next_p90 = self._feature(candidate, "next_scorer_speech_p90")
-        if prev_p90 >= 0.70 and next_p90 >= 0.70:
-            return "between_strong_speech_neighbors"
-        return ""
-
-    def _hard_drop_rule(self, candidate: Mapping[str, Any]) -> str:
-        if not self.hard_drop_rule_enabled:
-            return ""
-        duration = self._feature(candidate, "refined_duration_s") or self._feature(candidate, "duration_s")
-        speech_p90 = self._feature(candidate, "scorer_speech_p90")
-        active05 = self._feature(candidate, "scorer_speech_active_ratio_05")
-        if (
-            duration < 0.12
-            and speech_p90 < self.very_low_speech_p90
-            and active05 < self.very_low_active_ratio
-            and not bool(candidate.get("micro_chunk_candidate"))
-        ):
-            return "very_short_very_low_speech"
-        return ""
-
-    def _keep_veto(self, candidate: Mapping[str, Any]) -> str:
-        if not self.keep_veto_enabled:
-            return ""
-        speech_p90 = self._feature(candidate, "scorer_speech_p90")
-        active05 = self._feature(candidate, "scorer_speech_active_ratio_05")
-        if speech_p90 >= self.high_speech_p90 and active05 >= self.high_active_ratio:
-            return "high_stable_speech"
-        duration = self._feature(candidate, "refined_duration_s") or self._feature(candidate, "duration_s")
-        subtitle_min = self._feature(candidate, "subtitle_min_duration_s")
-        speech_mean = self._feature(candidate, "scorer_speech_mean")
-        if subtitle_min > 0.0 and duration >= subtitle_min and speech_mean >= 0.20:
-            return "display_duration_with_speech"
-        return ""
 
     def decide(self, candidates: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
         import torch
@@ -1524,43 +1451,42 @@ class PreAsrCueQC:
         ptm_bins = np.asarray(tensors["ptm_bins"], dtype=np.float32)
         bin_mask = np.asarray(tensors["bin_mask"], dtype=np.float32)
         chunk_mask = np.asarray(tensors["chunk_mask"], dtype=np.float32)
+        batch, max_chunks = tuple(chunk_mask.shape)
+        probs = np.zeros(
+            (batch, max_chunks, int(self.config["num_classes"])),
+            dtype=np.float32,
+        )
         with torch.inference_mode():
-            ptm_t = torch.from_numpy(ptm_bins).to(self.device)
-            scalar_t = torch.from_numpy(scalar).to(self.device)
-            chunk_mask_t = torch.from_numpy(chunk_mask).to(self.device)
-            bin_mask_t = torch.from_numpy(bin_mask).to(self.device)
-            if self.inference_window_size > 0 and ptm_t.shape[1] > self.inference_window_size:
-                batch, max_chunks = tuple(chunk_mask_t.shape)
-                logits = torch.zeros(
-                    (batch, max_chunks, int(self.config["num_classes"])),
-                    dtype=torch.float32,
-                    device=self.device,
+            group_batches = inference_group_batches(
+                chunk_mask,
+                max_groups=self.inference_group_batch_size,
+                max_padded_chunks=self.inference_max_padded_chunks,
+            )
+            for group_start, group_end, used_chunks in group_batches:
+                batch_mask = chunk_mask[group_start:group_end]
+                if used_chunks <= 0:
+                    continue
+                ptm_t = torch.from_numpy(
+                    ptm_bins[group_start:group_end, :used_chunks]
+                ).to(self.device)
+                scalar_t = torch.from_numpy(
+                    scalar[group_start:group_end, :used_chunks]
+                ).to(self.device)
+                chunk_mask_t = torch.from_numpy(batch_mask[:, :used_chunks]).to(
+                    self.device
                 )
-                counts = torch.zeros((batch, max_chunks, 1), dtype=torch.float32, device=self.device)
-                window = min(int(self.inference_window_size), int(max_chunks))
-                for group_index in range(int(batch)):
-                    length = int(chunk_mask_t[group_index].sum().detach().cpu().item())
-                    if length <= 0:
-                        continue
-                    for start in range(0, length, window):
-                        end = min(length, start + window)
-                        window_logits = self.model(
-                            ptm_t[group_index : group_index + 1, start:end],
-                            scalar_t[group_index : group_index + 1, start:end],
-                            chunk_mask=chunk_mask_t[group_index : group_index + 1, start:end],
-                            bin_mask=bin_mask_t[group_index : group_index + 1, start:end],
-                        )
-                        logits[group_index, start:end] += window_logits[0].float()
-                        counts[group_index, start:end] += 1.0
-                logits = logits / counts.clamp_min(1.0)
-            else:
+                bin_mask_t = torch.from_numpy(
+                    bin_mask[group_start:group_end, :used_chunks]
+                ).to(self.device)
                 logits = self.model(
                     ptm_t,
                     scalar_t,
                     chunk_mask=chunk_mask_t,
                     bin_mask=bin_mask_t,
                 )
-            probs = torch.softmax(logits, dim=-1).float().cpu().numpy()
+                probs[group_start:group_end, :used_chunks] = (
+                    torch.softmax(logits, dim=-1).float().cpu().numpy()
+                )
         positions = list(tensors["positions"])
         decisions: list[dict[str, Any]] = []
         for index, candidate in enumerate(candidates):
@@ -1568,64 +1494,24 @@ class PreAsrCueQC:
             prob = probs[group_index, chunk_index]
             p_drop = float(prob[0])
             p_keep = float(prob[1])
-            if self.decision_mode == "argmax":
-                label_index = int(np.argmax(prob))
-                label = PRE_ASR_CUEQC_LABELS[label_index]
-                decisions.append(
-                    {
-                        "schema": "pre_asr_cueqc_decision_v3",
-                        "decision_version": self.contract["decision_version"],
-                        "model_schema": self.contract["schema"],
-                        "model_arch": self.contract["arch"],
-                        "feature_schema": self.contract["feature_schema"],
-                        "runtime_adapter": self.contract["runtime_adapter"],
-                        "index": int(candidate.get("index", index)),
-                        "route": (
-                            "drop_before_asr"
-                            if label == "drop"
-                            else "keep_for_asr"
-                        ),
-                        "label": label,
-                        "confidence": round(float(prob[label_index]), 4),
-                        "prob_drop": round(p_drop, 4),
-                        "prob_keep": round(p_keep, 4),
-                        "decision_mode": "argmax",
-                        "reason": f"model_argmax_{label}",
-                    }
-                )
-                continue
-            hard_keep = self._hard_keep_veto(candidate)
-            hard_drop = "" if hard_keep else self._hard_drop_rule(candidate)
-            keep_veto = "" if hard_keep or hard_drop else self._keep_veto(candidate)
-            if hard_keep:
-                drop = False
-                reason = "hard_keep_veto"
-            elif hard_drop:
-                drop = True
-                reason = "hard_drop_rule"
-            elif p_drop >= self.drop_threshold and not keep_veto:
-                drop = True
-                reason = "model_drop_threshold"
-            else:
-                drop = False
-                reason = "model_keep_default" if not keep_veto else "keep_veto"
+            label_index = int(np.argmax(prob))
+            label = PRE_ASR_CUEQC_LABELS[label_index]
             decisions.append(
                 {
-                    "schema": "pre_asr_cueqc_decision_v2",
+                    "schema": "pre_asr_cueqc_decision_v3",
                     "decision_version": self.contract["decision_version"],
                     "model_schema": self.contract["schema"],
                     "model_arch": self.contract["arch"],
                     "feature_schema": self.contract["feature_schema"],
                     "runtime_adapter": self.contract["runtime_adapter"],
                     "index": int(candidate.get("index", index)),
-                    "route": "drop_before_asr" if drop else "keep_for_asr",
-                    "confidence": round(p_drop if drop else p_keep, 4),
+                    "route": "drop_before_asr" if label == "drop" else "keep_for_asr",
+                    "label": label,
+                    "confidence": round(float(prob[label_index]), 4),
                     "prob_drop": round(p_drop, 4),
                     "prob_keep": round(p_keep, 4),
-                    "drop_threshold": round(self.drop_threshold, 4),
-                    "reason": reason,
-                    "veto_reason": keep_veto or hard_keep,
-                    "hard_rule_reason": hard_drop,
+                    "decision_mode": "argmax",
+                    "reason": f"model_argmax_{label}",
                 }
             )
         return decisions
@@ -1672,38 +1558,14 @@ def runtime_signature() -> dict[str, Any]:
         "runtime_adapter": contract["runtime_adapter"],
         "model_path": checkpoint,
     }
-    if contract["schema"] == PRE_ASR_CUEQC_LEGACY_SCHEMA:
-        signature["drop_threshold"] = os.getenv("PRE_ASR_CUEQC_DROP_THRESHOLD", "")
-    else:
-        signature["decision_mode"] = "argmax"
+    signature["decision_mode"] = "argmax"
     return signature
-
-
-def _drop_threshold_from_env(default: float) -> float:
-    override = os.getenv("PRE_ASR_CUEQC_DROP_THRESHOLD", "").strip()
-    if not override:
-        return float(default)
-    try:
-        parsed = float(override)
-    except ValueError as exc:
-        raise ValueError(
-            "PRE_ASR_CUEQC_DROP_THRESHOLD must be a float in [0, 1], "
-            f"got {override!r}"
-        ) from exc
-    if not np.isfinite(parsed) or not 0.0 <= parsed <= 1.0:
-        raise ValueError(
-            "PRE_ASR_CUEQC_DROP_THRESHOLD must be a float in [0, 1], "
-            f"got {override!r}"
-        )
-    return parsed
 
 
 def load_active(*, expected_asr_repo_id: str | None = None) -> PreAsrCueQC:
     path = _checkpoint_path(expected_asr_repo_id)
     device = os.getenv("PRE_ASR_CUEQC_DEVICE", "auto").strip() or "auto"
     model = load_checkpoint(path, expected_asr_repo_id=expected_asr_repo_id, device=device)
-    if model.contract["schema"] == PRE_ASR_CUEQC_LEGACY_SCHEMA:
-        model.drop_threshold = _drop_threshold_from_env(model.drop_threshold)
     split_sha = str(model.metadata.get("semantic_split_weights_sha256") or "")
     if not split_sha:
         raise ValueError("Pre-ASR CueQC metadata.semantic_split_weights_sha256 is required")
@@ -1714,17 +1576,16 @@ def load_active(*, expected_asr_repo_id: str | None = None) -> PreAsrCueQC:
             "Pre-ASR CueQC split checkpoint sha mismatch: "
             f"checkpoint expects {split_sha}, active split {split_path} is {active_sha}"
         )
-    if model.contract["schema"] == PRE_ASR_CUEQC_SCHEMA:
-        inner_sha = str(model.metadata.get("inner_edge_refiner_weights_sha256") or "")
-        if not inner_sha:
-            raise ValueError(
-                "Pre-ASR CueQC v13 metadata.inner_edge_refiner_weights_sha256 is required"
-            )
-        inner_path = Path(_inner_edge_refiner_checkpoint_path(expected_asr_repo_id))
-        active_inner_sha = _file_sha256(inner_path)
-        if active_inner_sha != inner_sha:
-            raise ValueError(
-                "Pre-ASR CueQC v13 inner checkpoint sha mismatch: "
-                f"checkpoint expects {inner_sha}, active inner {inner_path} is {active_inner_sha}"
-            )
+    inner_sha = str(model.metadata.get("inner_edge_refiner_weights_sha256") or "")
+    if not inner_sha:
+        raise ValueError(
+            "Pre-ASR CueQC v13 metadata.inner_edge_refiner_weights_sha256 is required"
+        )
+    inner_path = Path(_inner_edge_refiner_checkpoint_path(expected_asr_repo_id))
+    active_inner_sha = _file_sha256(inner_path)
+    if active_inner_sha != inner_sha:
+        raise ValueError(
+            "Pre-ASR CueQC v13 inner checkpoint sha mismatch: "
+            f"checkpoint expects {inner_sha}, active inner {inner_path} is {active_inner_sha}"
+        )
     return model

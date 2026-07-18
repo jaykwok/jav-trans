@@ -31,7 +31,7 @@ class PackedChunk:
     display_start: float | None = None
     display_end: float | None = None
     display_duration: float | None = None
-    boundary_pipeline_version: int | None = None
+    boundary_contract_id: str = ""
     semantic_event_ids: list[str] | None = None
     semantic_event_probabilities: list[dict[str, float]] | None = None
     inner_edge_prediction: dict[str, Any] | None = None

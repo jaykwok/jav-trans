@@ -6,6 +6,7 @@ import torch
 from torch import nn
 
 TRANSFORMERS_MAMBA2_BACKBONE = "transformers.Mamba2Model"
+MAMBA2_STATEFUL_INFERENCE_CHUNK_FRAMES = 1024
 
 
 class _Mamba2FastPathWarningFilter(logging.Filter):
@@ -139,13 +140,17 @@ class Mamba2TemporalEncoder(nn.Module):
         conv_kernel: int = 4,
         chunk_size: int = 8,
         bidirectional: bool = True,
+        inference_chunk_size: int = MAMBA2_STATEFUL_INFERENCE_CHUNK_FRAMES,
     ) -> None:
         super().__init__()
         if hidden_size <= 0:
             raise ValueError("hidden_size must be positive")
         if hidden_size * 2 != num_heads * head_dim:
             raise ValueError("hidden_size * 2 must equal num_heads * head_dim")
+        if inference_chunk_size < 0:
+            raise ValueError("inference_chunk_size must be non-negative")
         self.bidirectional = bool(bidirectional)
+        self.inference_chunk_size = int(inference_chunk_size)
 
         _install_mamba2_warning_filter()
         from transformers import Mamba2Config, Mamba2Model
@@ -180,22 +185,65 @@ class Mamba2TemporalEncoder(nn.Module):
     ) -> torch.Tensor:
         if hidden.ndim != 3:
             raise ValueError("hidden must have shape [batch, time, dim]")
-        forward = self.forward_model(
-            inputs_embeds=hidden,
+        forward = self._run_direction(
+            self.forward_model,
+            hidden,
             attention_mask=attention_mask,
-            use_cache=False,
-        ).last_hidden_state
+        )
         if self.backward_model is None:
             return self.norm(forward)
         reversed_hidden = torch.flip(hidden, dims=[1])
         reversed_mask = None if attention_mask is None else torch.flip(attention_mask, dims=[1])
-        backward = self.backward_model(
-            inputs_embeds=reversed_hidden,
+        backward = self._run_direction(
+            self.backward_model,
+            reversed_hidden,
             attention_mask=reversed_mask,
-            use_cache=False,
-        ).last_hidden_state
+        )
         backward = torch.flip(backward, dims=[1])
         return self.norm(torch.cat([forward, backward], dim=-1))
+
+    def _run_direction(
+        self,
+        model: nn.Module,
+        hidden: torch.Tensor,
+        *,
+        attention_mask: torch.Tensor | None,
+    ) -> torch.Tensor:
+        """Run one causal direction with exact recurrent state across chunks.
+
+        The pure-PyTorch Mamba2 path materializes very large temporary tensors
+        for long sequences. During evaluation, carry the model's convolution
+        and recurrent cache across bounded chunks. This is the same causal scan
+        as one full call; no frames or context are discarded. Training keeps the
+        original full-sequence graph.
+        """
+
+        chunk_size = self.inference_chunk_size
+        if self.training or chunk_size <= 0 or hidden.shape[1] <= chunk_size:
+            return model(
+                inputs_embeds=hidden,
+                attention_mask=attention_mask,
+                use_cache=False,
+            ).last_hidden_state
+
+        from transformers.cache_utils import DynamicCache
+
+        cache = DynamicCache(config=model.config)
+        outputs: list[torch.Tensor] = []
+        for start in range(0, hidden.shape[1], chunk_size):
+            end = min(hidden.shape[1], start + chunk_size)
+            chunk_mask = (
+                None if attention_mask is None else attention_mask[:, start:end]
+            )
+            result = model(
+                inputs_embeds=hidden[:, start:end],
+                attention_mask=chunk_mask,
+                cache_params=cache,
+                use_cache=True,
+            )
+            cache = result.cache_params
+            outputs.append(result.last_hidden_state)
+        return torch.cat(outputs, dim=1)
 
 
 class SpeechIslandSequenceClassifier(nn.Module):

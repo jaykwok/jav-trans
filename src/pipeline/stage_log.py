@@ -10,7 +10,7 @@ from rich.table import Table
 
 
 _ASR_PROGRESS_RE = re.compile(
-    r"(?P<label>边界缓存|语音岛检测|外边界精修|语义切分判断|内部切点精修|"
+    r"(?P<label>边界缓存|语音岛检测|外边界精修|语义切分判断|"
     r"Pre-ASR CueQC|音频切块|ASR 文本转写|字幕时间轴)"
     r"\s+(?P<current>\d+)/(?P<total>\d+)"
 )
@@ -22,7 +22,6 @@ _ASR_STAGE_MAP = {
     "语音岛检测": "speech_island_scorer",
     "外边界精修": "outer_edge_refiner",
     "语义切分判断": "semantic_split_model",
-    "内部切点精修": "cut_edge_refiner",
     "Pre-ASR CueQC": "pre_asr_cueqc",
     "音频切块": "audio_chunk_export",
     "ASR 文本转写": "asr_text_transcribe",

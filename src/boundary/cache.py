@@ -12,12 +12,15 @@ from typing import Any, Sequence
 
 from audio.chunk_packer import PackedChunk
 from boundary.base import SpeechSegment
+from boundary.contracts import (
+    ACOUSTIC_BINARY_V12_CONTRACT,
+    require_boundary_contract_id,
+)
 
 log = logging.getLogger(__name__)
 
-# v20 adds explicit semantic-event, paired-inner-edge, removed-gap, and display
-# span metadata. v19 shared-cut payloads are not reused.
-BOUNDARY_CACHE_VERSION = 20
+# Cache compatibility follows the serialization contract id only.
+BOUNDARY_CACHE_CONTRACT_ID = ACOUSTIC_BINARY_V12_CONTRACT.contract_id
 _AUDIO_SAMPLE_BYTES = 2 * 1024 * 1024
 _AUDIO_KEY_RE = re.compile(r"^[0-9a-fA-F]{8,40}$")
 
@@ -50,21 +53,14 @@ _BOUNDARY_ENV_KEYS = (
     "BOUNDARY_FEATURE_FRAME_HOP_S",
     "OUTER_EDGE_REFINER_MODEL_PATH_BY_REPO",
     "SEMANTIC_SPLIT_MODEL_PATH_BY_REPO",
-    "CUT_EDGE_REFINER_MODEL_PATH_BY_REPO",
     "INNER_EDGE_REFINER_MODEL_PATH_BY_REPO",
     "OUTER_EDGE_REFINER_DEVICE",
     "SEMANTIC_SPLIT_DEVICE",
-    "CUT_EDGE_REFINER_DEVICE",
     "INNER_EDGE_REFINER_DEVICE",
     "BOUNDARY_FRAME_SEQUENCE_LEFT_CONTEXT_S",
     "BOUNDARY_FRAME_SEQUENCE_RIGHT_CONTEXT_S",
     "BOUNDARY_FRAME_SEQUENCE_MAX_PTM_DIMS",
     "BOUNDARY_FRAME_SEQUENCE_INCLUDE_MFCC",
-    "SEMANTIC_SPLIT_DURATION_PRESSURE_ENABLED",
-    "SEMANTIC_SPLIT_DURATION_PRESSURE_LOG_MEDIAN",
-    "SEMANTIC_SPLIT_DURATION_PRESSURE_LOG_MAD",
-    "SEMANTIC_SPLIT_DURATION_PRESSURE_Z",
-    "SEMANTIC_SPLIT_DURATION_PRESSURE_FLOOR",
 )
 
 # Model checkpoint paths whose *content* must invalidate the cache when a file is
@@ -74,7 +70,6 @@ _BOUNDARY_ENV_KEYS = (
 _BOUNDARY_CONFIG_CHECKPOINT_KEYS = (
     "outer_edge_refiner_model_path",
     "semantic_split_model_path",
-    "cut_edge_refiner_model_path",
     "inner_edge_refiner_model_path",
 )
 _BOUNDARY_SIGNATURE_CHECKPOINT_KEYS = (
@@ -124,7 +119,7 @@ def build_cache_lookup(
 ) -> dict:
     audio = _audio_metadata(audio_path)
     signature = {
-        "boundary_cache_version": BOUNDARY_CACHE_VERSION,
+        "boundary_contract_id": BOUNDARY_CACHE_CONTRACT_ID,
         "audio": audio,
         "boundary_backend": _jsonable(boundary_signature),
         "boundary_backend_env": _env_signature(_BOUNDARY_BACKEND_ENV_KEYS),
@@ -162,7 +157,7 @@ def load_processing_spans(
         payload = json.loads(path.read_text(encoding="utf-8"))
         if not isinstance(payload, dict):
             return None
-        if payload.get("boundary_cache_version") != BOUNDARY_CACHE_VERSION:
+        if payload.get("boundary_contract_id") != BOUNDARY_CACHE_CONTRACT_ID:
             return None
         if _stable_json(payload.get("signature")) != _stable_json(lookup["signature"]):
             return None
@@ -212,7 +207,7 @@ def save_processing_spans(
         path.parent.mkdir(parents=True, exist_ok=True)
         span_kind = _span_kind(processing_spans)
         payload = {
-            "boundary_cache_version": BOUNDARY_CACHE_VERSION,
+            "boundary_contract_id": BOUNDARY_CACHE_CONTRACT_ID,
             "created_at": time.time(),
             "signature": lookup["signature"],
             "runtime_boundary_signature": _jsonable(runtime_boundary_signature),
@@ -374,6 +369,7 @@ def _processing_spans_to_payload(
 
 
 def _packed_chunk_to_dict(chunk: PackedChunk) -> dict:
+    contract_id = require_boundary_contract_id(chunk.boundary_contract_id)
     return {
         "start": float(chunk.start),
         "end": float(chunk.end),
@@ -395,7 +391,7 @@ def _packed_chunk_to_dict(chunk: PackedChunk) -> dict:
         "display_start": chunk.display_start,
         "display_end": chunk.display_end,
         "display_duration": chunk.display_duration,
-        "boundary_pipeline_version": chunk.boundary_pipeline_version,
+        "boundary_contract_id": contract_id,
         "semantic_event_ids": _jsonable(chunk.semantic_event_ids or []),
         "semantic_event_probabilities": _jsonable(
             chunk.semantic_event_probabilities or []
@@ -525,10 +521,8 @@ def _packed_chunk_from_dict(item: Any) -> PackedChunk:
             if item.get("display_duration") is None
             else float(item.get("display_duration"))
         ),
-        boundary_pipeline_version=(
-            None
-            if item.get("boundary_pipeline_version") is None
-            else int(item.get("boundary_pipeline_version"))
+        boundary_contract_id=require_boundary_contract_id(
+            item.get("boundary_contract_id")
         ),
         semantic_event_ids=[str(value) for value in item.get("semantic_event_ids", [])],
         semantic_event_probabilities=[

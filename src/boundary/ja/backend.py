@@ -32,7 +32,7 @@ from boundary.ja.model import (
     SPEECH_ISLAND_MEMBERSHIP_LABELS,
     SPEECH_ISLAND_SCORER_LABELS,
     SPEECH_ISLAND_SCORER_SCHEMA,
-    LEGACY_SPEECH_ISLAND_SCORER_SCHEMA,
+    SPEECH_ISLAND_SCORER_V8_SCHEMA,
     load_speech_island_scorer_checkpoint,
     score_semantic_speech_outputs,
     score_speech_island_probabilities,
@@ -138,9 +138,8 @@ def _scorer_checkpoint_from_env(ptm: str) -> str:
 
 def _proposal_checkpoint_from_env(ptm: str) -> str:
     """Learned candidate source, resolved from env or the registry default
-    mapping. Empty keeps the bootstrap heuristic — legitimate only while the
-    repo's split model is v1; the ASR pipeline hard-errors if a v2 split model
-    would consume bootstrap candidates."""
+    mapping. Empty remains available for offline dataset bootstrapping; the
+    production Split v4 pipeline rejects that input distribution."""
 
     raw_mapping = os.getenv(
         "SPEECH_BOUNDARY_JA_PROPOSAL_CHECKPOINT_BY_REPO", ""
@@ -857,6 +856,10 @@ class SpeechBoundaryJaConfig:
 class SpeechBoundaryJaBackend:
     def __init__(self, config: SpeechBoundaryJaConfig | None = None) -> None:
         self.config = config or SpeechBoundaryJaConfig.from_env()
+        if qwen_asr_repo_id(self.config.ptm) != QWEN_ASR_17B_REPO_ID:
+            raise RuntimeError(
+                "pending_binary_retrain: the 0.6B Boundary implementation was retired"
+            )
         self._sequence_ptm_projection: dict | None = None
         self._sequence_ptm_projection_loaded = False
 
@@ -898,7 +901,7 @@ class SpeechBoundaryJaBackend:
             "schema": (
                 SPEECH_ISLAND_SCORER_SCHEMA
                 if semantic_v9
-                else LEGACY_SPEECH_ISLAND_SCORER_SCHEMA
+                else SPEECH_ISLAND_SCORER_V8_SCHEMA
             ),
             "frame_hop_s": float(cfg.frame_hop_s),
             "ptm": cfg.ptm,

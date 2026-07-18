@@ -55,7 +55,7 @@ from boundary.ja.manifest import (
     write_training_manifest,
 )
 from boundary.ja.model import (
-    LEGACY_SPEECH_ISLAND_SCORER_SCHEMA,
+    SPEECH_ISLAND_SCORER_V8_SCHEMA,
     SPEECH_ISLAND_SCORER_LABELS,
     SPEECH_ISLAND_SCORER_MODEL_ARCH,
     SPEECH_ISLAND_SCORER_OUTPUT_DIM,
@@ -111,7 +111,7 @@ __all__ = [
     "SPEECH_ISLAND_SCORER_LABELS",
     "SPEECH_ISLAND_SCORER_MODEL_ARCH",
     "SPEECH_ISLAND_SCORER_SCHEMA",
-    "LEGACY_SPEECH_ISLAND_SCORER_SCHEMA",
+    "SPEECH_ISLAND_SCORER_V8_SCHEMA",
     "SpeechIslandScorerBundle",
     "build_speech_island_scorer_model",
     "build_speech_island_scorer_checkpoint",

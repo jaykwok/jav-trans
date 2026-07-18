@@ -21,7 +21,7 @@ from tools.boundary.ja.train_acoustic_split_v4_model import (  # noqa: E402
     gate_passes,
     partition_group_names,
 )
-from tools.boundary.ja.train_semantic_split_island_model import (  # noqa: E402
+from tools.boundary.ja.acoustic_split_v4_dataset import (  # noqa: E402
     load_island_dataset,
 )
 

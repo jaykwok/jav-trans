@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Sequence
@@ -9,16 +10,17 @@ import numpy as np
 
 from asr.backends.qwen import validate_checkpoint_repo_id
 from boundary.backbones import Mamba2TemporalEncoder
+from boundary.contracts import (
+    ACOUSTIC_BINARY_V12_CONTRACT,
+    require_boundary_contract_id,
+)
 
 
 SEMANTIC_SPLIT_LABELS = ("cut", "continue", "unsure")
 SEMANTIC_SPLIT_FEATURE_SCHEMA = "semantic_split_candidate_features_v1"
 
-SEMANTIC_SPLIT_V2_SCHEMA = "semantic_split_verifier_v2"
-SEMANTIC_SPLIT_V2_MODEL_ARCH = "island_candidate_sequence_v1"
-SEMANTIC_SPLIT_V2_RUNTIME_ADAPTER = "island_candidate_sequence_cut_v1"
 SEMANTIC_SPLIT_V4_SCHEMA = "semantic_split_model_v4"
-SEMANTIC_SPLIT_V4_MODEL_ARCH = "acoustic_candidate_sequence_mamba_binary_v1"
+SEMANTIC_SPLIT_V4_MODEL_ARCH = "acoustic_candidate_sequence_mamba_binary_v2"
 SEMANTIC_SPLIT_V4_RUNTIME_ADAPTER = "acoustic_candidate_binary_event_runs_v2"
 SEMANTIC_SPLIT_V4_ARTIFACT = {
     "name": "semantic_split_model",
@@ -35,29 +37,10 @@ SEMANTIC_SPLIT_STRUCTURAL_ROLES = (
     "speech_to_noise",
     "noise_to_speech",
 )
-SEMANTIC_SPLIT_OMNI_AUX_NAMES = ("left_complete", "right_complete", "merged_better")
-SEMANTIC_SPLIT_V2_ARTIFACT = {
-    "name": "semantic_split_model",
-    "display_name": "Semantic Split Model",
-    "version": "v2",
-    "pipeline_stage": 3,
-    "pipeline_role": "cut_continue_unsure_decision",
-}
-SEMANTIC_SPLIT_V2_DEFAULT_DECISION = {
-    "short_core_max_s": 6.0,
-    "short_core_cut_threshold": 0.90,
-    "normal_cut_threshold": 0.75,
-    "min_chunk_after_split_s": 1.2,
-    "duration_pressure_enabled": False,
-    "duration_pressure_log_median": 0.0,
-    "duration_pressure_log_mad": 0.0,
-    "duration_pressure_z": 0.0,
-    "duration_pressure_floor": 0.50,
-}
 
 
 class IslandCandidateSequenceNetwork:
-    """v2 island-level candidate-sequence network factory.
+    """Binary acoustic cut/continue candidate-sequence network factory.
 
     Encodes every candidate with a per-candidate frame stack
     (``frame_proj`` -> bidirectional Mamba2 over bins -> mean pool + scalar arm)
@@ -65,13 +48,9 @@ class IslandCandidateSequenceNetwork:
     bidirectional Mamba2 over the ordered candidates of one speech island and
     emits per-candidate heads:
 
-    - ``gate``: deployment-aligned binary cut logit
-    - ``label``: cut / continue / unsure auxiliary logits
+    - ``label``: cut / continue logits used directly by runtime argmax
     - ``role``: structural-role auxiliary logits (none / speech_to_speech /
       speech_to_noise / noise_to_speech)
-    - ``omni``: left_complete / right_complete / merged_better auxiliary logits
-    - ``offset``: regression of (truth cut time - candidate time) in seconds,
-      supervised only on rows with precise truth (hardmix); Omni rows mask
     """
 
     def __new__(
@@ -90,9 +69,8 @@ class IslandCandidateSequenceNetwork:
         chunk_size: int = 8,
         bidirectional: bool = True,
         dropout: float = 0.1,
-        aux_label_dim: int = 3,
+        num_classes: int = 2,
         structural_role_dim: int = 4,
-        omni_aux_dim: int = 3,
         left_bins: int = 8,
         gap_bins: int = 4,
         right_bins: int = 8,
@@ -116,12 +94,10 @@ class IslandCandidateSequenceNetwork:
             )
         if ptm_input_dim and ptm_input_dim < ptm_projected_dim:
             raise ValueError("ptm_input_dim must be >= ptm_projected_dim")
-        if aux_label_dim not in (2, len(SEMANTIC_SPLIT_LABELS)):
-            raise ValueError("island split network requires aux_label_dim=2 or 3")
+        if num_classes != len(SEMANTIC_SPLIT_TRAINING_LABELS):
+            raise ValueError("Acoustic Split network requires num_classes=2")
         if structural_role_dim != len(SEMANTIC_SPLIT_STRUCTURAL_ROLES):
             raise ValueError("island split network requires structural_role_dim=4")
-        if omni_aux_dim != len(SEMANTIC_SPLIT_OMNI_AUX_NAMES):
-            raise ValueError("island split network requires omni_aux_dim=3")
         if left_bins <= 0 or gap_bins <= 0 or right_bins <= 0:
             raise ValueError("left/gap/right bins must be positive")
         scale_bins = [(int(pair[0]), int(pair[1])) for pair in extra_scale_bins]
@@ -214,11 +190,8 @@ class IslandCandidateSequenceNetwork:
                     nn.GELU(),
                     nn.Dropout(dropout),
                 )
-                self.gate_head = nn.Linear(hidden_size, 1)
-                self.label_head = nn.Linear(hidden_size, aux_label_dim)
+                self.label_head = nn.Linear(hidden_size, num_classes)
                 self.role_head = nn.Linear(hidden_size, structural_role_dim)
-                self.omni_head = nn.Linear(hidden_size, omni_aux_dim)
-                self.offset_head = nn.Linear(hidden_size, 1)
 
             def forward(self, frame_features, scalar_features, candidate_mask):
                 if frame_features.ndim != 4:
@@ -300,11 +273,8 @@ class IslandCandidateSequenceNetwork:
                 )
                 joint = self.trunk(torch.cat((fused, island_encoded), dim=-1))
                 return {
-                    "gate": self.gate_head(joint).squeeze(-1),
                     "label": self.label_head(joint),
                     "role": self.role_head(joint),
-                    "omni": self.omni_head(joint),
-                    "offset": self.offset_head(joint).squeeze(-1),
                 }
 
         return _Network()
@@ -332,117 +302,6 @@ class SplitEvent:
 
 
 @dataclass(frozen=True)
-class SemanticSplitIslandVerifier:
-    """v2 verifier: joint decisions over the ordered candidates of one island."""
-
-    path: str
-    sha256: str
-    model: Any
-    model_config: dict[str, Any]
-    feature_config: dict[str, Any]
-    normalization: dict[str, Any]
-    decision_config: dict[str, Any]
-    metadata: dict[str, Any]
-    device: str
-
-    def signature(self) -> dict[str, Any]:
-        return {
-            "schema": SEMANTIC_SPLIT_V2_SCHEMA,
-            "model_arch": SEMANTIC_SPLIT_V2_MODEL_ARCH,
-            "runtime_adapter": SEMANTIC_SPLIT_V2_RUNTIME_ADAPTER,
-            "path": self.path,
-            "sha256": self.sha256,
-            "model_config": self.model_config,
-            "feature_config": self.feature_config,
-            "decision_config": self.decision_config,
-            "metadata": self.metadata,
-        }
-
-    def decide_islands(
-        self,
-        *,
-        island_frame_features: Sequence[np.ndarray],
-        island_scalar_features: Sequence[np.ndarray],
-    ) -> list[list[SplitDecision]]:
-        import torch
-
-        if len(island_frame_features) != len(island_scalar_features):
-            raise ValueError("island frame/scalar feature counts must match")
-        counts = [int(np.asarray(frames).shape[0]) for frames in island_frame_features]
-        max_count = max(counts, default=0)
-        if max_count <= 0:
-            return [[] for _count in counts]
-        frame_mean = np.asarray(self.normalization["frame_mean"], dtype=np.float32)
-        frame_std = np.maximum(
-            np.asarray(self.normalization["frame_std"], dtype=np.float32), 1e-6
-        )
-        scalar_mean = np.asarray(self.normalization["scalar_mean"], dtype=np.float32)
-        scalar_std = np.maximum(
-            np.asarray(self.normalization["scalar_std"], dtype=np.float32), 1e-6
-        )
-        first = np.asarray(island_frame_features[counts.index(max_count)], dtype=np.float32)
-        bins, frame_dim = int(first.shape[1]), int(first.shape[2])
-        scalar_dim = int(np.asarray(island_scalar_features[counts.index(max_count)]).shape[1])
-        frames = np.zeros((len(counts), max_count, bins, frame_dim), dtype=np.float32)
-        scalars = np.zeros((len(counts), max_count, scalar_dim), dtype=np.float32)
-        mask = np.zeros((len(counts), max_count), dtype=np.int64)
-        for index, count in enumerate(counts):
-            if count <= 0:
-                continue
-            island_frames = np.asarray(island_frame_features[index], dtype=np.float32)
-            island_scalars = np.asarray(island_scalar_features[index], dtype=np.float32)
-            frames[index, :count] = (island_frames - frame_mean) / frame_std
-            scalars[index, :count] = (island_scalars - scalar_mean) / scalar_std
-            mask[index, :count] = 1
-        with torch.inference_mode():
-            outputs = self.model(
-                torch.from_numpy(frames).to(self.device),
-                torch.from_numpy(scalars).to(self.device),
-                torch.from_numpy(mask).to(self.device),
-            )
-            gate = torch.sigmoid(outputs["gate"]).detach().cpu().numpy()
-            aux = (
-                torch.softmax(outputs["label"], dim=-1).detach().cpu().numpy()
-            )
-            role = (
-                torch.softmax(outputs["role"], dim=-1).detach().cpu().numpy()
-            )
-            offset = outputs["offset"].detach().cpu().numpy()
-        decisions: list[list[SplitDecision]] = []
-        for index, count in enumerate(counts):
-            rows: list[SplitDecision] = []
-            for position in range(count):
-                p_gate = float(gate[index, position])
-                _, a_continue, a_unsure = (
-                    float(aux[index, position, 0]),
-                    float(aux[index, position, 1]),
-                    float(aux[index, position, 2]),
-                )
-                residual = max(0.0, 1.0 - p_gate)
-                denominator = max(a_continue + a_unsure, 1e-6)
-                if p_gate >= 0.5:
-                    label = "cut"
-                elif a_continue >= a_unsure:
-                    label = "continue"
-                else:
-                    label = "unsure"
-                role_index = int(np.argmax(role[index, position]))
-                rows.append(
-                    SplitDecision(
-                        label=label,
-                        p_cut=p_gate,
-                        p_continue=residual * a_continue / denominator,
-                        p_unsure=residual * a_unsure / denominator,
-                        role=SEMANTIC_SPLIT_STRUCTURAL_ROLES[role_index],
-                        p_role=float(role[index, position, role_index]),
-                        offset_s=float(offset[index, position]),
-                    )
-                )
-            decisions.append(rows)
-        return decisions
-
-
-@dataclass(frozen=True)
 class AcousticSplitV4Planner:
     """v4 acoustic planner using binary cut/continue argmax only."""
 
@@ -464,6 +323,9 @@ class AcousticSplitV4Planner:
             "schema": SEMANTIC_SPLIT_V4_SCHEMA,
             "model_arch": SEMANTIC_SPLIT_V4_MODEL_ARCH,
             "runtime_adapter": SEMANTIC_SPLIT_V4_RUNTIME_ADAPTER,
+            "boundary_serialization_contract_id": require_boundary_contract_id(
+                self.metadata.get("boundary_serialization_contract_id")
+            ),
             "path": self.path,
             "sha256": self.sha256,
             "model_config": self.model_config,
@@ -477,68 +339,46 @@ class AcousticSplitV4Planner:
         *,
         island_frame_features: Sequence[np.ndarray],
         island_scalar_features: Sequence[np.ndarray],
+        max_padded_candidates: int | None = None,
     ) -> list[list[SplitDecision]]:
         import torch
 
         if len(island_frame_features) != len(island_scalar_features):
             raise ValueError("island frame/scalar feature counts must match")
         counts = [int(np.asarray(frames).shape[0]) for frames in island_frame_features]
-        max_count = max(counts, default=0)
-        if max_count <= 0:
-            return [[] for _count in counts]
-        frame_mean = np.asarray(self.normalization["frame_mean"], dtype=np.float32)
-        frame_std = np.maximum(
-            np.asarray(self.normalization["frame_std"], dtype=np.float32), 1e-6
-        )
-        scalar_mean = np.asarray(self.normalization["scalar_mean"], dtype=np.float32)
-        scalar_std = np.maximum(
-            np.asarray(self.normalization["scalar_std"], dtype=np.float32), 1e-6
-        )
-        exemplar = counts.index(max_count)
-        first = np.asarray(island_frame_features[exemplar], dtype=np.float32)
-        bins, frame_dim = int(first.shape[1]), int(first.shape[2])
-        scalar_dim = int(
-            np.asarray(island_scalar_features[exemplar], dtype=np.float32).shape[1]
-        )
-        frames = np.zeros((len(counts), max_count, bins, frame_dim), dtype=np.float32)
-        scalars = np.zeros((len(counts), max_count, scalar_dim), dtype=np.float32)
-        mask = np.zeros((len(counts), max_count), dtype=np.int64)
+        if max_padded_candidates is None:
+            raw_limit = os.getenv("ACOUSTIC_SPLIT_MAX_BATCH_CANDIDATES", "auto").strip()
+            max_padded_candidates = 128 if raw_limit in {"", "auto"} else int(raw_limit)
+        if max_padded_candidates <= 0:
+            raise ValueError("max_padded_candidates must be positive")
+
+        decisions: list[list[SplitDecision]] = [[] for _count in counts]
+        start = 0
+        current_max = 0
         for index, count in enumerate(counts):
-            if count <= 0:
-                continue
-            frames[index, :count] = (
-                np.asarray(island_frame_features[index], dtype=np.float32) - frame_mean
-            ) / frame_std
-            scalars[index, :count] = (
-                np.asarray(island_scalar_features[index], dtype=np.float32) - scalar_mean
-            ) / scalar_std
-            mask[index, :count] = 1
-        with torch.inference_mode():
-            outputs = self.model(
-                torch.from_numpy(frames).to(self.device),
-                torch.from_numpy(scalars).to(self.device),
-                torch.from_numpy(mask).to(self.device),
-            )
-            probabilities = (
-                torch.softmax(outputs["label"], dim=-1).detach().cpu().numpy()
-            )
-        if probabilities.shape[-1] != len(SEMANTIC_SPLIT_TRAINING_LABELS):
-            raise RuntimeError("Acoustic Split v4 model emitted a non-binary output head")
-        decisions: list[list[SplitDecision]] = []
-        for island_index, count in enumerate(counts):
-            rows: list[SplitDecision] = []
-            for position in range(count):
-                row = probabilities[island_index, position]
-                label_index = int(np.argmax(row))
-                rows.append(
-                    SplitDecision(
-                        label=SEMANTIC_SPLIT_TRAINING_LABELS[label_index],
-                        p_cut=float(row[0]),
-                        p_continue=float(row[1]),
-                        p_unsure=0.0,
-                    )
+            proposed_max = max(current_max, count)
+            proposed_width = index - start + 1
+            if start < index and proposed_max * proposed_width > max_padded_candidates:
+                _fill_split_batch(
+                    self,
+                    start,
+                    index,
+                    island_frame_features,
+                    island_scalar_features,
+                    decisions,
                 )
-            decisions.append(rows)
+                start = index
+                current_max = 0
+            current_max = max(current_max, count)
+        if start < len(counts):
+            _fill_split_batch(
+                self,
+                start,
+                len(counts),
+                island_frame_features,
+                island_scalar_features,
+                decisions,
+            )
         return decisions
 
     def plan_events(
@@ -565,6 +405,72 @@ class AcousticSplitV4Planner:
                 zip(candidate_times_by_island, decisions)
             )
         ]
+
+
+def _fill_split_batch(
+    planner: AcousticSplitV4Planner,
+    start: int,
+    end: int,
+    island_frame_features: Sequence[np.ndarray],
+    island_scalar_features: Sequence[np.ndarray],
+    decisions: list[list[SplitDecision]],
+) -> None:
+    import torch
+
+    frame_groups = island_frame_features[start:end]
+    scalar_groups = island_scalar_features[start:end]
+    counts = [int(np.asarray(frames).shape[0]) for frames in frame_groups]
+    max_count = max(counts, default=0)
+    if max_count <= 0:
+        return
+    frame_mean = np.asarray(planner.normalization["frame_mean"], dtype=np.float32)
+    frame_std = np.maximum(
+        np.asarray(planner.normalization["frame_std"], dtype=np.float32), 1e-6
+    )
+    scalar_mean = np.asarray(planner.normalization["scalar_mean"], dtype=np.float32)
+    scalar_std = np.maximum(
+        np.asarray(planner.normalization["scalar_std"], dtype=np.float32), 1e-6
+    )
+    exemplar = counts.index(max_count)
+    first = np.asarray(frame_groups[exemplar], dtype=np.float32)
+    bins, frame_dim = int(first.shape[1]), int(first.shape[2])
+    scalar_dim = int(np.asarray(scalar_groups[exemplar]).shape[1])
+    frames = np.zeros((len(counts), max_count, bins, frame_dim), dtype=np.float32)
+    scalars = np.zeros((len(counts), max_count, scalar_dim), dtype=np.float32)
+    mask = np.zeros((len(counts), max_count), dtype=np.int64)
+    for index, count in enumerate(counts):
+        if count <= 0:
+            continue
+        frames[index, :count] = (
+            np.asarray(frame_groups[index], dtype=np.float32) - frame_mean
+        ) / frame_std
+        scalars[index, :count] = (
+            np.asarray(scalar_groups[index], dtype=np.float32) - scalar_mean
+        ) / scalar_std
+        mask[index, :count] = 1
+    with torch.inference_mode():
+        outputs = planner.model(
+            torch.from_numpy(frames).to(planner.device),
+            torch.from_numpy(scalars).to(planner.device),
+            torch.from_numpy(mask).to(planner.device),
+        )
+        probabilities = torch.softmax(outputs["label"], dim=-1).detach().cpu().numpy()
+    if probabilities.shape[-1] != len(SEMANTIC_SPLIT_TRAINING_LABELS):
+        raise RuntimeError("Acoustic Split v4 model emitted a non-binary output head")
+    for island_index, count in enumerate(counts):
+        rows: list[SplitDecision] = []
+        for position in range(count):
+            row = probabilities[island_index, position]
+            label_index = int(np.argmax(row))
+            rows.append(
+                SplitDecision(
+                    label=SEMANTIC_SPLIT_TRAINING_LABELS[label_index],
+                    p_cut=float(row[0]),
+                    p_continue=float(row[1]),
+                    p_unsure=0.0,
+                )
+            )
+        decisions[start + island_index] = rows
 
 
 def aggregate_cut_event_runs(
@@ -604,40 +510,6 @@ def aggregate_cut_event_runs(
     return events
 
 
-def load_semantic_split_feature_config(path: str | Path) -> dict[str, Any]:
-    """Read only feature_config from a split checkpoint, without building the
-    model or moving weights to a device (cheap enough for the boundary-cache
-    signature path)."""
-
-    import torch
-
-    payload = torch.load(Path(path), map_location="cpu", weights_only=False)
-    return dict(payload.get("feature_config") or {})
-
-
-def load_semantic_split_verifier(
-    path: str | Path,
-    *,
-    device: str = "auto",
-    expected_ptm_repo_id: str | None = None,
-) -> "SemanticSplitIslandVerifier":
-    import torch
-
-    checkpoint_path = Path(path)
-    payload = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
-    if payload.get("schema") != SEMANTIC_SPLIT_V2_SCHEMA:
-        raise ValueError(
-            f"unsupported Semantic Split Model schema: {payload.get('schema')!r}; "
-            f"expected {SEMANTIC_SPLIT_V2_SCHEMA!r}"
-        )
-    return _load_island_verifier(
-        payload,
-        checkpoint_path=checkpoint_path,
-        device=device,
-        expected_ptm_repo_id=expected_ptm_repo_id,
-    )
-
-
 def load_acoustic_split_v4_planner(
     path: str | Path,
     *,
@@ -655,15 +527,19 @@ def load_acoustic_split_v4_planner(
         )
     if payload.get("model_arch") != SEMANTIC_SPLIT_V4_MODEL_ARCH:
         raise ValueError(
-            f"Acoustic Split v4 model must use {SEMANTIC_SPLIT_V4_MODEL_ARCH!r}"
+            "Acoustic Split v4 model_arch must be "
+            f"{SEMANTIC_SPLIT_V4_MODEL_ARCH!r}"
         )
     metadata = dict(payload.get("metadata") or {})
+    require_boundary_contract_id(
+        metadata.get("boundary_serialization_contract_id")
+    )
     if tuple(metadata.get("training_labels") or ()) != SEMANTIC_SPLIT_TRAINING_LABELS:
         raise ValueError("Acoustic Split v4 training_labels must be cut/continue")
     if tuple(metadata.get("excluded_training_labels") or ()) != ("unsure",):
         raise ValueError("Acoustic Split v4 must exclude unsure from training")
     model_config = dict(payload.get("model_config") or {})
-    if int(model_config.get("aux_label_dim") or 0) != 2:
+    if int(model_config.get("num_classes") or 0) != 2:
         raise ValueError("Acoustic Split v4 requires a binary output head")
     model = IslandCandidateSequenceNetwork(**model_config)
     model.load_state_dict(payload["model_state_dict"])
@@ -682,110 +558,6 @@ def load_acoustic_split_v4_planner(
     )
 
 
-def _load_island_verifier(
-    payload: dict[str, Any],
-    *,
-    checkpoint_path: Path,
-    device: str,
-    expected_ptm_repo_id: str | None,
-) -> "SemanticSplitIslandVerifier":
-    if payload.get("model_arch") != SEMANTIC_SPLIT_V2_MODEL_ARCH:
-        raise ValueError(
-            f"Semantic Split v2 model must use {SEMANTIC_SPLIT_V2_MODEL_ARCH!r}"
-        )
-    metadata = dict(payload.get("metadata") or {})
-    artifact = metadata.get("artifact")
-    if not isinstance(artifact, dict):
-        raise ValueError("Semantic Split v2 metadata.artifact is required")
-    for key, expected in SEMANTIC_SPLIT_V2_ARTIFACT.items():
-        if artifact.get(key) != expected:
-            raise ValueError(
-                f"Semantic Split v2 metadata.artifact.{key} must be {expected!r}"
-            )
-    if metadata.get("runtime_adapter") != SEMANTIC_SPLIT_V2_RUNTIME_ADAPTER:
-        raise ValueError(
-            "Semantic Split v2 metadata.runtime_adapter must be "
-            f"{SEMANTIC_SPLIT_V2_RUNTIME_ADAPTER!r}"
-        )
-    if tuple(metadata.get("labels") or ()) != SEMANTIC_SPLIT_LABELS:
-        raise ValueError(f"Semantic Split v2 labels must be {SEMANTIC_SPLIT_LABELS!r}")
-    if tuple(metadata.get("structural_roles") or ()) != SEMANTIC_SPLIT_STRUCTURAL_ROLES:
-        raise ValueError(
-            "Semantic Split v2 structural_roles must be "
-            f"{SEMANTIC_SPLIT_STRUCTURAL_ROLES!r}"
-        )
-    feature_config = dict(payload.get("feature_config") or {})
-    if feature_config.get("schema") != SEMANTIC_SPLIT_FEATURE_SCHEMA:
-        raise ValueError(
-            f"Semantic Split v2 feature schema must be {SEMANTIC_SPLIT_FEATURE_SCHEMA!r}"
-        )
-    model_config = dict(payload.get("model_config") or {})
-    model = IslandCandidateSequenceNetwork(**model_config)
-    model.load_state_dict(payload["model_state_dict"])
-    actual_device = _model_device(device)
-    model.to(actual_device).eval()
-    if expected_ptm_repo_id is not None:
-        validate_checkpoint_repo_id(
-            metadata.get("ptm_repo_id"),
-            expected_ptm_repo_id,
-            checkpoint_kind="Semantic Split Model",
-            metadata_key="metadata.ptm_repo_id",
-        )
-    decision_config = {
-        **SEMANTIC_SPLIT_V2_DEFAULT_DECISION,
-        **dict(payload.get("decision_config") or {}),
-    }
-    return SemanticSplitIslandVerifier(
-        path=str(checkpoint_path),
-        sha256=_sha256(checkpoint_path),
-        model=model,
-        model_config=model_config,
-        feature_config=feature_config,
-        normalization=dict(payload.get("normalization") or {}),
-        decision_config=decision_config,
-        metadata=metadata,
-        device=str(actual_device),
-    )
-
-
-def build_semantic_split_island_checkpoint(
-    *,
-    model: Any,
-    model_config: dict[str, Any],
-    feature_config: dict[str, Any],
-    normalization: dict[str, Any],
-    metadata: dict[str, Any],
-    decision_config: dict[str, Any] | None = None,
-) -> dict[str, Any]:
-    artifact = {
-        **SEMANTIC_SPLIT_V2_ARTIFACT,
-        **dict(metadata.get("artifact") or {}),
-    }
-    return {
-        "schema": SEMANTIC_SPLIT_V2_SCHEMA,
-        "model_arch": SEMANTIC_SPLIT_V2_MODEL_ARCH,
-        "model_config": dict(model_config),
-        "feature_config": {
-            **feature_config,
-            "schema": SEMANTIC_SPLIT_FEATURE_SCHEMA,
-        },
-        "normalization": dict(normalization),
-        "decision_config": {
-            **SEMANTIC_SPLIT_V2_DEFAULT_DECISION,
-            **dict(decision_config or {}),
-        },
-        "metadata": {
-            **metadata,
-            "artifact": artifact,
-            "runtime_adapter": SEMANTIC_SPLIT_V2_RUNTIME_ADAPTER,
-            "labels": list(SEMANTIC_SPLIT_LABELS),
-            "structural_roles": list(SEMANTIC_SPLIT_STRUCTURAL_ROLES),
-            "omni_aux_names": list(SEMANTIC_SPLIT_OMNI_AUX_NAMES),
-        },
-        "model_state_dict": model.state_dict(),
-    }
-
-
 def build_acoustic_split_v4_checkpoint(
     *, model: Any, model_config: dict[str, Any], feature_config: dict[str, Any],
     normalization: dict[str, Any], metadata: dict[str, Any],
@@ -793,12 +565,15 @@ def build_acoustic_split_v4_checkpoint(
     return {
         "schema": SEMANTIC_SPLIT_V4_SCHEMA,
         "model_arch": SEMANTIC_SPLIT_V4_MODEL_ARCH,
-        "model_config": {**model_config, "aux_label_dim": 2},
+        "model_config": {**model_config, "num_classes": 2},
         "feature_config": {**feature_config, "schema": SEMANTIC_SPLIT_FEATURE_SCHEMA},
         "normalization": dict(normalization),
         "decision_config": dict(SEMANTIC_SPLIT_V4_DECISION),
         "metadata": {
             **metadata,
+            "boundary_serialization_contract_id": (
+                ACOUSTIC_BINARY_V12_CONTRACT.contract_id
+            ),
             "artifact": dict(SEMANTIC_SPLIT_V4_ARTIFACT),
             "runtime_adapter": SEMANTIC_SPLIT_V4_RUNTIME_ADAPTER,
             "canonical_labels": list(SEMANTIC_SPLIT_LABELS),

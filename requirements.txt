@@ -1,5 +1,4 @@
-torch
-torchaudio
+torch>=2.13.0
 rich
 transformers>=5.13.0
 accelerate

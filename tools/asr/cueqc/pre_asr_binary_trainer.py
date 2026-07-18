@@ -1114,7 +1114,6 @@ def train(
             "hard_drop_rule": False,
             "keep_veto": False,
             "model_only": True,
-            "inference_window_size": int(sequence_window_size),
         },
         "metadata": {
             "artifact": dict(PRE_ASR_CUEQC_ARTIFACT),

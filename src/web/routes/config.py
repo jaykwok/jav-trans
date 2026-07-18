@@ -16,7 +16,7 @@ import httpx
 from fastapi import APIRouter, HTTPException, Query
 
 from asr.backends.qwen import (
-    DEFAULT_CUT_EDGE_REFINER_CHECKPOINT_BY_REPO,
+    BOUNDARY_PIPELINE_STATUS_BY_REPO,
     DEFAULT_INNER_EDGE_REFINER_CHECKPOINT_BY_REPO,
     DEFAULT_OUTER_EDGE_REFINER_CHECKPOINT_BY_REPO,
     DEFAULT_PRE_ASR_CUEQC_CHECKPOINT_BY_REPO,
@@ -77,12 +77,6 @@ _CHECKPOINT_SPECS = (
         "Semantic Split Model",
         "SEMANTIC_SPLIT_MODEL_PATH_BY_REPO",
         DEFAULT_SEMANTIC_SPLIT_CHECKPOINT_BY_REPO,
-    ),
-    (
-        "cut_edge_refiner",
-        "Cut Edge Refiner",
-        "CUT_EDGE_REFINER_MODEL_PATH_BY_REPO",
-        DEFAULT_CUT_EDGE_REFINER_CHECKPOINT_BY_REPO,
     ),
     (
         "inner_edge_refiner",
@@ -161,12 +155,11 @@ def _initial_env_template_lines() -> list[str]:
         "# ASR_STAGE_WORKER_HEARTBEAT_S=10\n",
         "# GPU_BATCH_PROFILE_ENABLED=1\n",
         "# GPU_BATCH_PROFILE_GROWTH_THRESHOLD=0.80\n",
-        "# SEMANTIC_SPLIT_INFERENCE_BATCH_SIZE=auto\n",
+        "# ACOUSTIC_SPLIT_MAX_BATCH_CANDIDATES=auto\n",
         "# ASR_STAGE_WORKER_OOM_RETRY_LIMIT=6\n",
         "# SPEECH_BOUNDARY_JA_WINDOW_S=20\n",
         "# SPEECH_BOUNDARY_JA_OVERLAP_S=4\n",
         "# PRE_ASR_CUEQC_ENABLED=1\n",
-        "# PRE_ASR_CUEQC_DROP_THRESHOLD=0.625\n",
         "\n",
         "# --- Model/cache examples ---\n",
         "# HF_HOME=./models\n",
@@ -377,9 +370,24 @@ def _cuda_environment_status() -> dict[str, Any]:
 
 
 def _checkpoint_requirements(repo_id: str) -> list[dict[str, Any]]:
+    boundary_status = BOUNDARY_PIPELINE_STATUS_BY_REPO[repo_id]
+    if boundary_status != "ready":
+        return [
+            {
+                "roles": ["boundary_pipeline"],
+                "role_labels": ["Boundary Pipeline"],
+                "repo_id": repo_id,
+                "short_name": "Boundary Pipeline",
+                "local_path": "",
+                "present": False,
+                "download_enabled": False,
+                "mapping_env": "",
+                "error": boundary_status,
+            }
+        ]
     requirements: list[dict[str, Any]] = []
     for role, label, mapping_env, default_mapping in _CHECKPOINT_SPECS:
-        if repo_id not in default_mapping:
+        if not default_mapping.get(repo_id):
             continue
         path = ""
         error = ""

@@ -17,7 +17,7 @@ for root in (PROJECT_ROOT, SRC_ROOT):
 
 from boundary.split_model import load_acoustic_split_v4_planner  # noqa: E402
 from tools.boundary.ja.train_acoustic_split_v4_model import _pad_batch  # noqa: E402
-from tools.boundary.ja.train_semantic_split_island_model import load_island_dataset  # noqa: E402
+from tools.boundary.ja.acoustic_split_v4_dataset import load_island_dataset  # noqa: E402
 
 
 def _rows(path: Path) -> list[dict]:

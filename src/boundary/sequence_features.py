@@ -362,8 +362,8 @@ class FrameSequenceFeatureProvider:
                 right_bins,
             ),
         ]
-        # Coarser context scales append after the base bins so the base layout
-        # (and v1-warm-started encoders) keep their positions.
+        # Coarser context scales append after the base bins so the base feature
+        # coordinates remain stable across scale configurations.
         for scale in extra_context_scales:
             scale_left_s = float(scale["left_context_s"])
             scale_right_s = float(scale["right_context_s"])
@@ -442,52 +442,6 @@ class FrameSequenceFeatureProvider:
         *,
         start_s: float,
         end_s: float,
-        speech_probabilities: Sequence[float],
-        context_s: float,
-        ptm_dim: int,
-    ) -> tuple[np.ndarray, np.ndarray]:
-        start_frame = int(round(start_s / self.frame_hop_s))
-        end_frame = int(round(end_s / self.frame_hop_s))
-        context_frames = int(round(context_s / self.frame_hop_s))
-        used_ptm_dim = min(int(ptm_dim), self._ptm_used_dim)
-        ptm_values = self._ptm_used[:, :used_ptm_dim]
-        pooled = np.concatenate(
-            (
-                _pool_feature_bins_by_index(
-                    ptm_values, self._mfcc_used, start_frame - context_frames, start_frame, 4
-                ),
-                _pool_feature_bins_by_index(
-                    ptm_values, self._mfcc_used, start_frame, start_frame + context_frames, 4
-                ),
-                _pool_feature_bins_by_index(
-                    ptm_values, self._mfcc_used, end_frame - context_frames, end_frame, 4
-                ),
-                _pool_feature_bins_by_index(
-                    ptm_values, self._mfcc_used, end_frame, end_frame + context_frames, 4
-                ),
-            ),
-            axis=0,
-        )
-        speech = np.asarray(speech_probabilities, dtype=np.float32).reshape(-1)
-        window = speech[max(0, start_frame) : min(speech.size, end_frame)]
-        scalar = np.asarray(
-            (
-                max(0.0, end_s - start_s),
-                (start_frame + end_frame) / max(1, 2 * speech.size),
-                _array_mean(window),
-                float(window.min()) if window.size else 0.0,
-                float(window.max()) if window.size else 0.0,
-                _active_ratio(window),
-            ),
-            dtype=np.float32,
-        )
-        return pooled, scalar
-
-    def features_for_outer_island_v2(
-        self,
-        *,
-        start_s: float,
-        end_s: float,
         raw_ptm_dim: int,
     ) -> np.ndarray:
         """Return raw PTM2048 + MFCC frames for learned full-island edges."""
@@ -507,7 +461,7 @@ class FrameSequenceFeatureProvider:
                 dtype=np.float32,
             )
         if int(self._ptm_used.shape[1]) < int(raw_ptm_dim):
-            raise ValueError("Outer Edge Refiner v2 requires full raw PTM frames")
+            raise ValueError("Outer Edge Refiner requires full raw PTM frames")
         frame_total = end_frame - start_frame
         position = (
             np.arange(frame_total, dtype=np.float32) / max(1, frame_total - 1)

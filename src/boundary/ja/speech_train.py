@@ -11,12 +11,14 @@ import numpy as np
 from boundary.ja.dataset import LabelRecord, effective_frame_weights
 from boundary.ja.features import load_cached_feature
 from boundary.ja.model import (
-    SPEECH_ISLAND_SCORER_MODEL_ARCH,
-    SPEECH_ISLAND_SCORER_OUTPUT_DIM,
-    SPEECH_ISLAND_SCORER_SCHEMA,
+    SPEECH_ISLAND_SCORER_V8_MODEL_ARCH,
+    SPEECH_ISLAND_SCORER_V8_SCHEMA,
     build_speech_island_scorer_checkpoint,
     build_speech_island_scorer_model,
 )
+
+SPEECH_ISLAND_TRAINING_SCHEMA = SPEECH_ISLAND_SCORER_V8_SCHEMA
+SPEECH_ISLAND_TRAINING_OUTPUT_DIM = 1
 
 
 @dataclass(frozen=True)
@@ -108,12 +110,12 @@ def train_speech_island_scorer(
         "conv_kernel": config.conv_kernel,
         "chunk_size": config.chunk_size,
         "bidirectional": config.bidirectional,
-        "model_arch": SPEECH_ISLAND_SCORER_MODEL_ARCH,
-        "output_dim": SPEECH_ISLAND_SCORER_OUTPUT_DIM,
+        "model_arch": SPEECH_ISLAND_SCORER_V8_MODEL_ARCH,
+        "output_dim": SPEECH_ISLAND_TRAINING_OUTPUT_DIM,
     }
     device = torch.device(config.device)
     model = build_speech_island_scorer_model(
-        schema=SPEECH_ISLAND_SCORER_SCHEMA,
+        schema=SPEECH_ISLAND_TRAINING_SCHEMA,
         model_config=model_config,
     ).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=config.learning_rate)
@@ -171,6 +173,7 @@ def train_speech_island_scorer(
     checkpoint_path = output_dir / checkpoint_name
     torch.save(
         build_speech_island_scorer_checkpoint(
+            schema=SPEECH_ISLAND_TRAINING_SCHEMA,
             model=model,
             model_config=model_config,
             normalization=normalization,
@@ -187,7 +190,7 @@ def train_speech_island_scorer(
     )
     metrics_path = output_dir / "train_metrics.json"
     metrics = SpeechIslandTrainMetrics(
-        schema=SPEECH_ISLAND_SCORER_SCHEMA,
+        schema=SPEECH_ISLAND_TRAINING_SCHEMA,
         steps=config.max_steps,
         loss=float(np.mean(losses)),
         eval_loss=float(evaluation["loss"]),

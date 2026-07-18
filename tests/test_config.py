@@ -145,10 +145,8 @@ def test_default_model_download_root_is_project_models():
             qwen.QWEN_ASR_06B_REPO_ID,
             qwen.QWEN_ASR_17B_REPO_ID,
         }
-    assert set(qwen.DEFAULT_CUT_EDGE_REFINER_CHECKPOINT_BY_REPO) == {
-        qwen.QWEN_ASR_06B_REPO_ID
-    }
     assert set(qwen.DEFAULT_INNER_EDGE_REFINER_CHECKPOINT_BY_REPO) == {
+        qwen.QWEN_ASR_06B_REPO_ID,
         qwen.QWEN_ASR_17B_REPO_ID
     }
     assert "SPEECH_BOUNDARY_JA_SCORER_CHECKPOINT" not in config.DEFAULT_SETTINGS
@@ -172,46 +170,43 @@ def test_default_model_download_root_is_project_models():
     assert "CUEQC_EXPORT_CANDIDATES_APPEND" not in config.DEFAULT_SETTINGS
     assert "CUEQC_SHADOW_EMBED_CANDIDATES" not in config.DEFAULT_SETTINGS
     assert config.DEFAULT_SETTINGS["PRE_ASR_CUEQC_ENABLED"] == "1"
-    assert config.DEFAULT_SETTINGS["PRE_ASR_CUEQC_DROP_THRESHOLD"] == ""
     assert config.DEFAULT_SETTINGS["LLM_API_FORMAT"] == "chat"
 
 
-def test_active_boundary_registry_splits_17b_v10_from_06b_legacy() -> None:
+def test_boundary_registry_keeps_06b_and_17b_pending_placeholders() -> None:
     assert set(qwen.DEFAULT_SPEECH_BOUNDARY_PROPOSAL_CHECKPOINT_BY_REPO) == {
         qwen.QWEN_ASR_06B_REPO_ID,
         qwen.QWEN_ASR_17B_REPO_ID,
     }
-    assert "semantic_split_model_v2." in qwen.DEFAULT_SEMANTIC_SPLIT_CHECKPOINT_BY_REPO[
-        qwen.QWEN_ASR_06B_REPO_ID
-    ]
     assert "semantic_split_model_v4." in qwen.DEFAULT_SEMANTIC_SPLIT_CHECKPOINT_BY_REPO[
         qwen.QWEN_ASR_17B_REPO_ID
-    ]
-    assert "pre_asr_cueqc_v12." in qwen.DEFAULT_PRE_ASR_CUEQC_CHECKPOINT_BY_REPO[
-        qwen.QWEN_ASR_06B_REPO_ID
     ]
     assert "pre_asr_cueqc_v13." in qwen.DEFAULT_PRE_ASR_CUEQC_CHECKPOINT_BY_REPO[
         qwen.QWEN_ASR_17B_REPO_ID
     ]
-    assert "outer_edge_refiner_v1." in qwen.DEFAULT_OUTER_EDGE_REFINER_CHECKPOINT_BY_REPO[
-        qwen.QWEN_ASR_06B_REPO_ID
-    ]
-    assert "outer_edge_refiner_v2." in qwen.DEFAULT_OUTER_EDGE_REFINER_CHECKPOINT_BY_REPO[
+    assert qwen.DEFAULT_OUTER_EDGE_REFINER_CHECKPOINT_BY_REPO[
         qwen.QWEN_ASR_17B_REPO_ID
-    ]
-    assert qwen.QWEN_ASR_17B_REPO_ID not in qwen.DEFAULT_CUT_EDGE_REFINER_CHECKPOINT_BY_REPO
-    assert qwen.QWEN_ASR_06B_REPO_ID not in qwen.DEFAULT_INNER_EDGE_REFINER_CHECKPOINT_BY_REPO
+    ] == ""
+    assert qwen.BOUNDARY_PIPELINE_STATUS_BY_REPO[qwen.QWEN_ASR_06B_REPO_ID] == (
+        "pending_binary_retrain"
+    )
+    assert qwen.BOUNDARY_PIPELINE_STATUS_BY_REPO[qwen.QWEN_ASR_17B_REPO_ID] == (
+        "pending_outer_v3_audit"
+    )
     active_mappings = (
         qwen.DEFAULT_SPEECH_BOUNDARY_SCORER_CHECKPOINT_BY_REPO,
         qwen.DEFAULT_SPEECH_BOUNDARY_PROPOSAL_CHECKPOINT_BY_REPO,
         qwen.DEFAULT_OUTER_EDGE_REFINER_CHECKPOINT_BY_REPO,
         qwen.DEFAULT_SEMANTIC_SPLIT_CHECKPOINT_BY_REPO,
-        qwen.DEFAULT_CUT_EDGE_REFINER_CHECKPOINT_BY_REPO,
         qwen.DEFAULT_INNER_EDGE_REFINER_CHECKPOINT_BY_REPO,
         qwen.DEFAULT_PRE_ASR_CUEQC_CHECKPOINT_BY_REPO,
     )
     for mapping in active_mappings:
+        assert mapping[qwen.QWEN_ASR_06B_REPO_ID] == ""
+    for mapping in active_mappings:
         for repo_id, path in mapping.items():
+            if not path:
+                continue
             assert path.startswith(f"src/checkpoints/{qwen.qwen_asr_repo_tag(repo_id)}/")
 
 

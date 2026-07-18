@@ -3,10 +3,11 @@ from __future__ import annotations
 import numpy as np
 
 from boundary.base import SpeechSegment
-from boundary.outer_refiner_v2 import PairedOuterEdgePrediction
+from boundary.binary_edge_refiner import BinaryEdgePrediction
+from boundary.contracts import ACOUSTIC_BINARY_V12_CONTRACT
 from audio.chunk_packer import PackedChunk
 from boundary.runtime_pipeline import (
-    apply_paired_inner_edges_after_cueqc,
+    apply_binary_inner_edges_after_cueqc,
     build_acoustic_split_v4_provisional_chunks,
 )
 from boundary.sequence_features import FrameSequenceFeatureConfig, FrameSequenceFeatureProvider
@@ -22,11 +23,6 @@ class _Planner:
         "gap_bins": 4,
         "right_bins": 8,
         "ptm_dim": 4,
-        "ptm_projection": {
-            "kind": "learned_linear_in_checkpoint",
-            "input_dim": 4,
-            "output_dim": 2,
-        },
         "extra_context_scales": [],
     }
 
@@ -60,7 +56,7 @@ def _proposal(time_s: float) -> dict:
 
 
 def test_v4_runtime_builds_events_without_duration_thresholds(monkeypatch) -> None:
-    prediction = PairedOuterEdgePrediction(
+    prediction = BinaryEdgePrediction(
         raw_start_s=0.0,
         raw_end_s=8.0,
         start_s=0.2,
@@ -70,7 +66,7 @@ def test_v4_runtime_builds_events_without_duration_thresholds(monkeypatch) -> No
         abstain_reason="",
         start_probabilities={},
         end_probabilities={},
-        class_probabilities=np.zeros((1, 3), dtype=np.float32),
+        class_probabilities=np.zeros((1, 2), dtype=np.float32),
     )
     segment = SpeechSegment(
         start=0.0,
@@ -113,7 +109,7 @@ def test_v4_runtime_builds_events_without_duration_thresholds(monkeypatch) -> No
         "island-0000-event-000",
         "island-0000-event-001",
     ]
-    assert chunks[0].boundary_pipeline_version == 11
+    assert chunks[0].boundary_contract_id == ACOUSTIC_BINARY_V12_CONTRACT.contract_id
     assert chunks[0].boundary_decision_source == "acoustic_candidate_binary_event_runs_v2"
     assert chunks[0].display_start == chunks[0].acoustic_start
     assert chunks[0].primary_cut_candidates[0]["p_cut"] == 0.9
@@ -147,53 +143,30 @@ def _inner_chunk(
         display_start=start,
         display_end=end,
         display_duration=end - start,
+        boundary_contract_id=ACOUSTIC_BINARY_V12_CONTRACT.contract_id,
         semantic_event_ids=["event-0"],
         inner_edge_prediction=prediction,
     )
 
 
-def test_paired_inner_edges_remove_only_explicit_safe_gap() -> None:
-    chunks = apply_paired_inner_edges_after_cueqc(
-        [
-            _inner_chunk(
-                0.0,
-                3.0,
-                0,
-                {"end_s": 2.7, "end_action": "refined"},
-            ),
-            _inner_chunk(
-                3.0,
-                6.0,
-                1,
-                {"start_s": 3.2, "start_action": "refined"},
-            ),
-        ]
-    )
-    assert [(chunk.start, chunk.end) for chunk in chunks] == [(0.0, 2.7), (3.2, 6.0)]
-    assert chunks[0].removed_gap_spans == [
-        {"event_ids": ["event-0"], "start": 2.7, "end": 3.2, "duration": 0.5}
-    ]
-    assert chunks[0].paired_inner_edges["action"] == "safe"
-
-
-def test_paired_inner_edge_abstain_merges_without_rule_fallback() -> None:
-    chunks = apply_paired_inner_edges_after_cueqc(
-        [
-            _inner_chunk(
-                0.0,
-                3.0,
-                0,
-                {"end_s": 2.8, "end_action": "abstain", "abstain_reason": "unsure"},
-            ),
-            _inner_chunk(
-                3.0,
-                6.0,
-                1,
-                {"start_s": 3.1, "start_action": "refined"},
-            ),
-        ]
-    )
+def test_binary_inner_v2_applies_acoustic_core_and_drops_all_background() -> None:
+    chunks = apply_binary_inner_edges_after_cueqc([
+        _inner_chunk(
+            0.0, 3.0, 0,
+            {
+                "schema": "binary_acoustic_inner_edges_v2_prediction",
+                "action": "refined", "start_s": 0.4, "end_s": 2.6,
+            },
+        ),
+        _inner_chunk(
+            3.0, 6.0, 1,
+            {
+                "schema": "binary_acoustic_inner_edges_v2_prediction",
+                "action": "drop", "start_s": 3.0, "end_s": 6.0,
+            },
+        ),
+    ])
     assert len(chunks) == 1
-    assert (chunks[0].start, chunks[0].end) == (0.0, 6.0)
-    assert chunks[0].paired_inner_edges["action"] == "abstain_merge"
-    assert chunks[0].removed_gap_spans in (None, [])
+    assert (chunks[0].start, chunks[0].end) == (0.4, 2.6)
+    assert (chunks[0].acoustic_start, chunks[0].acoustic_end) == (0.4, 2.6)
+    assert chunks[0].paired_inner_edges["action"] == "binary_core"

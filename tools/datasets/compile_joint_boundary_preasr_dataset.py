@@ -25,31 +25,35 @@ from boundary.sequence_store import (  # noqa: E402
     StreamingFrameWriter,
     save_sequence_dataset,
 )
-from tools.asr.cueqc.compile_pre_asr_v12_features import (  # noqa: E402
+from tools.asr.cueqc.pre_asr_feature_compiler import (  # noqa: E402
     compile_features,
     normalize_label,
+)
+from tools.boundary.ja.acoustic_split_teacher_contracts import (  # noqa: E402
+    APPROVED_SPLIT_TEACHER_PROMPT_VERSIONS,
 )
 
 
 SPLIT_LABEL_IDS = {"cut": 0, "continue": 1, "unsure": 2}
 IGNORE_ID = -100
-# Split v3 trains only on per-candidate centered-clip Omni labels. Rows from
-# retired teachers (window-batched joint split, single_task v2, flat v1) must
-# hard-fail here rather than silently mix annotation geometries.
-SPLIT_ALLOWED_PROMPT_VERSIONS = {"semantic_split_v3_omni_plus_centered_clip_v3"}
+# Acoustic Split trains only on approved per-candidate centered-clip labels.
+# Other teacher geometries hard-fail rather than silently entering the binary
+# model's canonical data layer.
 
 
 def _reject_foreign_split_labels(labels: list[dict[str, Any]]) -> None:
     foreign: Counter[str] = Counter(
         str(row.get("prompt_version") or "<missing>")
         for row in labels
-        if str(row.get("prompt_version") or "") not in SPLIT_ALLOWED_PROMPT_VERSIONS
+        if str(row.get("prompt_version") or "")
+        not in APPROVED_SPLIT_TEACHER_PROMPT_VERSIONS
     )
     if foreign:
         raise ValueError(
             "semantic_split/labels.jsonl contains split labels from a retired "
-            f"teacher contract; only {sorted(SPLIT_ALLOWED_PROMPT_VERSIONS)} may "
-            "be compiled into Split v3 training data. Offending prompt_version "
+            "teacher contract; only approved centered-candidate provenance "
+            f"{sorted(APPROVED_SPLIT_TEACHER_PROMPT_VERSIONS)} may be compiled "
+            "into Acoustic Split training data. Offending prompt_version "
             f"counts: {dict(foreign)}"
         )
 
