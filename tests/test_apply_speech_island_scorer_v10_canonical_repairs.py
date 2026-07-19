@@ -182,3 +182,40 @@ def test_apply_repairs_quarantines_assets_and_preserves_unsure(tmp_path: Path) -
     assert len(summary["replacement_audit_source_ids"]) == 3
     assert "val-speech" in summary["replacement_audit_source_ids"]
     assert summary["feature_cache_ready"] is False
+
+
+def test_apply_repairs_accepts_source_quarantine_gate(tmp_path: Path) -> None:
+    sources = [
+        _source("train-speech", "train", role="speech", core_ids=["train-core"]),
+        _source("train-background", "train", role="all_background", background_id="train-bg"),
+        _source("val-speech", "val", role="speech", core_ids=["val-core"]),
+        _source("val-background", "val", role="all_background", background_id="val-bg"),
+        _source("val-clean-background", "val", role="all_background", background_id="val-clean-bg"),
+        _source("test-speech", "test", role="speech", core_ids=["test-core"]),
+        _source("test-background", "test", role="all_background", background_id="test-bg"),
+    ]
+    canonical = tmp_path / "canonical.jsonl"
+    _write_jsonl(canonical, sources)
+    gate = tmp_path / "gate.json"
+    gate.write_text(
+        json.dumps(
+            {
+                "schema": "speech_scorer_v10_canonical_manual_gate_v1",
+                "canonical_sources_sha256": hashlib.sha256(canonical.read_bytes()).hexdigest(),
+                "complete": True,
+                "canonical_recompile_ready": True,
+                "quarantined_background_ids": ["val-bg"],
+            }
+        ),
+        encoding="utf-8",
+    )
+    summary = apply_repairs(
+        canonical_sources=canonical,
+        repair_gate=gate,
+        output_dir=tmp_path / "corrected",
+    )
+    assert summary["dropped_source_count"] == 1
+    assert summary["dataset"]["partition_role_counts"]["val"] == {
+        "all_background": 1,
+        "speech": 1,
+    }

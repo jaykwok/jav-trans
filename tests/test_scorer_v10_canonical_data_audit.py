@@ -26,6 +26,9 @@ def test_scorer_v10_canonical_audit_is_playable_and_saveable(tmp_path: Path) -> 
                     "duration_s": 0.1,
                     "sample_rate": 16000,
                     "core_ids": [f"core-{partition}"] if role == "speech" else [],
+                    "background_id": (
+                        f"background-{partition}" if role == "all_background" else ""
+                    ),
                     "canonical_spans": [
                         {
                             "start_sample": 0,
@@ -89,10 +92,24 @@ def test_scorer_v10_canonical_audit_is_playable_and_saveable(tmp_path: Path) -> 
     assert gate["complete"] is True
     assert gate["manual_gate_pass"] is True
 
-    saved = verdicts.read_text(encoding="utf-8").replace(
-        '"verdict": "correct"', '"verdict": "contains_target_speech"', 1
+    rejected_rows = [
+        {
+            "schema": "speech_scorer_v10_canonical_manual_verdict_v1",
+            "source_id": row["source_id"],
+            "verdict": "correct",
+        }
+        for row in manifest
+    ]
+    first_background = next(
+        row["source_id"] for row in manifest if row["row_role"] == "all_background"
     )
-    verdicts.write_text(saved, encoding="utf-8")
+    for row in rejected_rows:
+        row["verdict"] = (
+            "contains_target_speech" if row["source_id"] == first_background else "correct"
+        )
+    verdicts.write_text(
+        "".join(json.dumps(row) + "\n" for row in rejected_rows), encoding="utf-8"
+    )
     rejected = evaluate(
         audit_manifest=output / "audit_manifest.jsonl",
         audit_summary=output / "summary.json",
@@ -101,6 +118,8 @@ def test_scorer_v10_canonical_audit_is_playable_and_saveable(tmp_path: Path) -> 
     )
     assert rejected["manual_gate_pass"] is False
     assert rejected["risk_count"] == 1
+    assert rejected["canonical_recompile_ready"] is True
+    assert rejected["quarantined_background_ids"]
 
     targeted = tmp_path / "targeted"
     targeted_index = build_audit(

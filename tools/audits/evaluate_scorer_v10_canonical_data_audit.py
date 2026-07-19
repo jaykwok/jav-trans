@@ -44,6 +44,34 @@ def evaluate(
     )
     complete = set(verdicts) == set(targets) and counts["unreviewed"] == 0
     manual_gate_pass = complete and counts["correct"] == len(targets)
+    canonical_path = Path(str(summary.get("canonical_sources") or ""))
+    canonical = {
+        str(row["source_id"]): row for row in _rows(canonical_path)
+    }
+    quarantined_background_ids: set[str] = set()
+    unsupported_risk_source_ids: list[str] = []
+    for source_id in targets:
+        verdict = str(verdicts.get(source_id, {}).get("verdict") or "unreviewed")
+        if verdict in {"correct", "unreviewed"}:
+            continue
+        source = canonical.get(source_id)
+        if (
+            source is not None
+            and source.get("row_role") == "all_background"
+            and verdict == "contains_target_speech"
+        ):
+            background_id = str(source.get("background_id") or "")
+            if background_id:
+                quarantined_background_ids.add(background_id)
+            else:
+                unsupported_risk_source_ids.append(source_id)
+        else:
+            unsupported_risk_source_ids.append(source_id)
+    canonical_recompile_ready = (
+        complete
+        and bool(quarantined_background_ids)
+        and not unsupported_risk_source_ids
+    )
     result = {
         "schema": GATE_SCHEMA,
         "canonical_sources": str(summary.get("canonical_sources") or ""),
@@ -54,6 +82,9 @@ def evaluate(
         "verdict_counts": dict(sorted(counts.items())),
         "complete": complete,
         "risk_count": len(targets) - counts["correct"],
+        "quarantined_background_ids": sorted(quarantined_background_ids),
+        "unsupported_risk_source_ids": sorted(unsupported_risk_source_ids),
+        "canonical_recompile_ready": canonical_recompile_ready,
         "manual_gate_pass": manual_gate_pass,
         "training_manifest_allowed": manual_gate_pass,
         "promotion_ready": False,

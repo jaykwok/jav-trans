@@ -32,6 +32,7 @@ from tools.boundary.ja.compile_speech_island_scorer_v10_canonical import (  # no
 
 
 GATE_SCHEMA = "speech_scorer_v10_canonical_span_repair_gate_v1"
+SOURCE_GATE_SCHEMA = "speech_scorer_v10_canonical_manual_gate_v1"
 DECISION_SCHEMA = "speech_scorer_v10_canonical_span_repair_item_v1"
 SUMMARY_SCHEMA = "speech_scorer_v10_corrected_canonical_summary_v1"
 FRAME_HOP_S = 0.02
@@ -44,7 +45,7 @@ def _rows(path: Path) -> list[dict[str, Any]]:
 
 def _load_gate(path: Path, *, canonical_sources: Path) -> dict[str, Any]:
     gate = json.loads(path.read_text(encoding="utf-8-sig"))
-    if gate.get("schema") != GATE_SCHEMA:
+    if gate.get("schema") not in {GATE_SCHEMA, SOURCE_GATE_SCHEMA}:
         raise ValueError("invalid Scorer v10 canonical span-repair gate schema")
     canonical_sha256 = hashlib.sha256(canonical_sources.read_bytes()).hexdigest()
     if gate.get("canonical_sources_sha256") != canonical_sha256:
@@ -60,19 +61,21 @@ def apply_repairs(
     repair_gate: Path,
     output_dir: Path,
     previous_audit_manifest: Path | None = None,
+    previous_summary: Path | None = None,
 ) -> dict[str, Any]:
     gate = _load_gate(repair_gate, canonical_sources=canonical_sources)
-    decisions_path = Path(str(gate.get("decisions") or ""))
     decisions: dict[str, dict[str, Any]] = {}
-    for row in _rows(decisions_path):
-        if row.get("schema") != DECISION_SCHEMA:
-            raise ValueError("invalid Scorer v10 canonical span-repair decision schema")
-        span_id = str(row.get("span_id") or "")
-        if not span_id or span_id in decisions:
-            raise ValueError("span-repair decisions require unique span_id values")
-        if str(row.get("verdict") or "") not in CANONICAL_LABELS:
-            raise ValueError("span-repair decision has an invalid canonical label")
-        decisions[span_id] = row
+    decisions_value = str(gate.get("decisions") or "")
+    if decisions_value:
+        for row in _rows(Path(decisions_value)):
+            if row.get("schema") != DECISION_SCHEMA:
+                raise ValueError("invalid Scorer v10 canonical span-repair decision schema")
+            span_id = str(row.get("span_id") or "")
+            if not span_id or span_id in decisions:
+                raise ValueError("span-repair decisions require unique span_id values")
+            if str(row.get("verdict") or "") not in CANONICAL_LABELS:
+                raise ValueError("span-repair decision has an invalid canonical label")
+            decisions[span_id] = row
 
     quarantined_background_ids = {
         str(value) for value in gate.get("quarantined_background_ids") or ()
@@ -81,11 +84,22 @@ def apply_repairs(
     dropped: list[dict[str, Any]] = []
     changed_spans: list[dict[str, Any]] = []
     ignored_core_ids: set[str] = set()
+    if previous_summary is not None:
+        previous = json.loads(previous_summary.read_text(encoding="utf-8-sig"))
+        ignored_core_ids.update(str(value) for value in previous.get("ignored_core_ids") or ())
+        quarantined_background_ids.update(
+            str(value) for value in previous.get("quarantined_background_ids") or ()
+        )
     for original in _rows(canonical_sources):
         row = copy.deepcopy(original)
         source_id = str(row["source_id"])
         row_role = str(row["row_role"])
         row_background_ids = {str(value) for value in row.get("background_source_ids") or ()}
+        ignored_core_ids.update(
+            str(value.get("core_id") or "")
+            for value in row.get("ignored_core_ids") or ()
+            if value.get("core_id")
+        )
         matched_quarantine = sorted(row_background_ids & quarantined_background_ids)
         if matched_quarantine:
             dropped.append(
@@ -334,6 +348,7 @@ def apply_repairs(
         "repair_source_ids": repair_source_ids,
         "replacement_audit_source_ids": replacement_audit_source_ids,
         "previous_audit_manifest": str(previous_audit_manifest or ""),
+        "previous_summary": str(previous_summary or ""),
         "canonical_frame_counts": dict(label_counts),
         "dataset": dataset_summary,
         "canonical_sources": str(sources_path),
@@ -358,6 +373,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--canonical-sources", required=True)
     parser.add_argument("--repair-gate", required=True)
     parser.add_argument("--previous-audit-manifest", default="")
+    parser.add_argument("--previous-summary", default="")
     parser.add_argument("--output-dir", required=True)
     return parser.parse_args()
 
@@ -374,6 +390,9 @@ if __name__ == "__main__":
                     Path(args.previous_audit_manifest)
                     if args.previous_audit_manifest
                     else None
+                ),
+                previous_summary=(
+                    Path(args.previous_summary) if args.previous_summary else None
                 ),
             ),
             ensure_ascii=False,
