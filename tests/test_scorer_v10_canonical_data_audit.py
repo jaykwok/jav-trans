@@ -101,3 +101,15 @@ def test_scorer_v10_canonical_audit_is_playable_and_saveable(tmp_path: Path) -> 
     )
     assert rejected["manual_gate_pass"] is False
     assert rejected["risk_count"] == 1
+
+    targeted = tmp_path / "targeted"
+    targeted_index = build_audit(
+        canonical_sources=canonical,
+        output_dir=targeted,
+        source_ids=["test-speech", "train-all_background"],
+    )
+    targeted_summary = json.loads(
+        (targeted / "summary.json").read_text(encoding="utf-8")
+    )
+    assert targeted_summary["review_item_count"] == 2
+    assert "test-speech" in targeted_index.read_text(encoding="utf-8")

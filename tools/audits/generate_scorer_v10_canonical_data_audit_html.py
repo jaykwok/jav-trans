@@ -117,11 +117,25 @@ def select_audit_rows(
 
 
 def build_audit(
-    *, canonical_sources: Path, output_dir: Path, per_role_partition: int = 4
+    *,
+    canonical_sources: Path,
+    output_dir: Path,
+    per_role_partition: int = 4,
+    source_ids: Sequence[str] | None = None,
 ) -> Path:
-    selected = select_audit_rows(
-        _rows(canonical_sources), per_role_partition=per_role_partition
-    )
+    canonical_rows = _rows(canonical_sources)
+    if source_ids:
+        by_id = {str(row["source_id"]): row for row in canonical_rows}
+        missing = [source_id for source_id in source_ids if source_id not in by_id]
+        if missing:
+            raise ValueError(f"canonical audit source ids are missing: {missing[:3]}")
+        if len(source_ids) != len(set(source_ids)):
+            raise ValueError("canonical audit source ids must be unique")
+        selected = [by_id[source_id] for source_id in source_ids]
+    else:
+        selected = select_audit_rows(
+            canonical_rows, per_role_partition=per_role_partition
+        )
     audio_dir = output_dir / "audio"
     audio_dir.mkdir(parents=True, exist_ok=True)
     payload: list[dict[str, Any]] = []
@@ -195,6 +209,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--canonical-sources", required=True)
     parser.add_argument("--output-dir", required=True)
     parser.add_argument("--per-role-partition", type=int, default=4)
+    parser.add_argument("--source-id", action="append", default=[])
     return parser.parse_args()
 
 
@@ -205,5 +220,6 @@ if __name__ == "__main__":
             canonical_sources=Path(args.canonical_sources),
             output_dir=Path(args.output_dir),
             per_role_partition=args.per_role_partition,
+            source_ids=args.source_id or None,
         )
     )
