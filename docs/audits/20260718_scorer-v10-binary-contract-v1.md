@@ -56,6 +56,8 @@ This is a canonical source plan, not a trained dataset claim. Raw 1.7B PTM2048+M
 
 ## Human audit status
 
-The canonical fixed24 page at `agents/audits/20260718_231220_scorer-v10-canonical-data-fixed24/` contains four speech and four all-background controls from every partition. It is playable and saves `speech_scorer_v10_canonical_manual_verdict_v1`; its status is deliberately `pending`, and no listening verdict is claimed.
+The canonical fixed24 page at `agents/audits/20260718_231220_scorer-v10-canonical-data-fixed24/` contains four speech and four all-background controls from every partition. Its manual gate is complete but failed: `correct=18 / contains_target_speech=3 / speech_in_background=1 / background_in_speech=1 / unsure=1`, so `manual_gate_pass=false` and no feature/training manifest is allowed. Three confirmed all-background assets are quarantined; one also occurs in another speech composite.
+
+The follow-up page at `agents/audits/20260719_095522_scorer-v10-canonical-span-repair15/` contains the 15 exact spans from the three failed/unsure speech sources. Every span plays without context and requires an independent `speech/background/unsure` verdict. Its evaluator can only produce quarantine/recompile decisions; it cannot unlock training. Raw PTM2048 caching remains paused until corrected canonical sources pass a replacement audit.
 
 After a real v10 model exists, the same audit framework must generate pages for every prediction-drop/truth-speech case, all held-out hard cases, edge clipping and every greater-than-8-second residual. Numeric gates are capped at 95%; zero clipping and zero true-speech deletion require saved human verdicts before promotion.
