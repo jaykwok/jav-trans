@@ -29,6 +29,7 @@ from tools.boundary.ja.train_speech_island_scorer_v10_binary import (
     parse_args as parse_scorer_v10_args,
     predicted_run_structure,
     release_gate_fields as scorer_v10_release_gate_fields,
+    speech_continuity_auxiliary_loss,
     summarize_partition_labels,
     validate_dataset_rows as validate_scorer_v10_rows,
 )
@@ -347,3 +348,28 @@ def test_binary_speech_v10_numeric_gate_requires_heldout_continuity() -> None:
         {**metrics, "speech_run_continuity": 0.95},
         {**metrics, "speech_run_continuity": 0.95},
     ) is True
+
+
+def test_binary_speech_v10_continuity_auxiliary_only_penalizes_inside_speech() -> None:
+    torch = pytest.importorskip("torch")
+    target = torch.tensor([[1, 1, 1, 0, -100, 1]], dtype=torch.long)
+    stable = torch.tensor(
+        [
+            [
+                [0.0, 2.0],
+                [0.0, 2.0],
+                [0.0, 2.0],
+                [2.0, 0.0],
+                [8.0, -8.0],
+                [-8.0, 8.0],
+            ]
+        ]
+    )
+    unstable = stable.clone()
+    unstable[0, 1] = torch.tensor([2.0, 0.0])
+    stable_loss, stable_pairs = speech_continuity_auxiliary_loss(stable, target)
+    unstable_loss, unstable_pairs = speech_continuity_auxiliary_loss(unstable, target)
+    assert stable_pairs.item() == 2
+    assert unstable_pairs.item() == 2
+    assert stable_loss.item() == pytest.approx(0.0)
+    assert unstable_loss.item() > 0.0

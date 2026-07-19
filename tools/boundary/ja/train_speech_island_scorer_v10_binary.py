@@ -293,6 +293,31 @@ def predicted_run_structure(predicted_speech) -> dict[str, int]:
     }
 
 
+def speech_continuity_auxiliary_loss(logits, target):
+    """Penalize learned speech-probability jumps only inside true speech runs."""
+
+    import torch
+
+    if logits.ndim != 3 or logits.shape[-1] != 2:
+        raise ValueError("Scorer v10 continuity logits must have shape [batch,frames,2]")
+    if target.shape != logits.shape[:2]:
+        raise ValueError("Scorer v10 continuity target shape mismatch")
+    speech_probability = torch.softmax(logits, dim=-1)[..., 1]
+    adjacent_speech = (
+        (target[:, :-1] == 1)
+        & (target[:, 1:] == 1)
+        & (target[:, :-1] != IGNORE_INDEX)
+        & (target[:, 1:] != IGNORE_INDEX)
+    )
+    pair_count = adjacent_speech.sum()
+    squared_delta = torch.square(
+        speech_probability[:, 1:] - speech_probability[:, :-1]
+    )
+    loss = (squared_delta * adjacent_speech.to(squared_delta.dtype)).sum()
+    loss = loss / pair_count.to(squared_delta.dtype).clamp_min(1.0)
+    return loss, pair_count
+
+
 def evaluate(model, rows, device, *, max_padded_frames: int, tolerance_frames: int):
     import torch
 
@@ -457,6 +482,9 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     import torch
     import torch.nn.functional as F
 
+    if args.continuity_weight < 0.0:
+        raise ValueError("--continuity-weight must be non-negative")
+
     if args.ptm_repo_id != QWEN_ASR_17B_REPO_ID:
         raise ValueError("Scorer v10 is 1.7B-only")
     if args.max_steps <= 0 or args.eval_interval <= 0:
@@ -612,6 +640,8 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     best_step = 0
     best_state = None
     losses: list[float] = []
+    primary_losses: list[float] = []
+    continuity_losses: list[float] = []
     started = time.monotonic()
     for step in range(1, args.max_steps + 1):
         if (step - 1) % len(train_batches) == 0:
@@ -631,11 +661,19 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             torch.as_tensor(args.speech_weight, device=device),
         )
         weights = source_weights.to(device) * class_weights
-        loss = (loss_rows[valid] * weights[valid]).sum() / weights[valid].sum().clamp_min(1e-6)
+        primary_loss = (loss_rows[valid] * weights[valid]).sum() / weights[
+            valid
+        ].sum().clamp_min(1e-6)
+        continuity_loss, continuity_pair_count = speech_continuity_auxiliary_loss(
+            logits, target
+        )
+        loss = primary_loss + float(args.continuity_weight) * continuity_loss
         optimizer.zero_grad(set_to_none=True)
         loss.backward()
         optimizer.step()
         losses.append(float(loss.detach().cpu()))
+        primary_losses.append(float(primary_loss.detach().cpu()))
+        continuity_losses.append(float(continuity_loss.detach().cpu()))
         step_memory = _memory_snapshot(device, stage=f"train_step_{step}")
         _update_peak_memory(memory_peak, step_memory)
         if step % args.eval_interval == 0 or step == args.max_steps:
@@ -698,6 +736,11 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                     "background": args.background_weight,
                     "speech": args.speech_weight,
                 },
+                "continuity_auxiliary": {
+                    "kind": "speech_probability_adjacent_total_variation_v1",
+                    "weight": float(args.continuity_weight),
+                    "runtime_effect": "none_binary_argmax_unchanged",
+                },
             },
             schema=SPEECH_ISLAND_SCORER_V10_SCHEMA,
         ),
@@ -710,6 +753,8 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "checkpoint_sha256": hashlib.sha256(checkpoint.read_bytes()).hexdigest(),
         "best_step": best_step,
         "mean_train_loss": float(np.mean(losses)),
+        "mean_primary_loss": float(np.mean(primary_losses)),
+        "mean_continuity_loss": float(np.mean(continuity_losses)),
         "val": val,
         "test": test,
         "dataset": dataset_summary,
@@ -718,7 +763,12 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         **release_gate_fields(numeric_gate_pass_value),
         "training_initialization": "random",
         "seed": args.seed,
-        "loss": "weighted_cross_entropy",
+        "loss": (
+            "weighted_cross_entropy"
+            if args.continuity_weight == 0.0
+            else "weighted_cross_entropy+speech_probability_adjacent_total_variation_v1"
+        ),
+        "continuity_weight": float(args.continuity_weight),
         "decision_mode": "binary_frame_argmax",
         "memory_snapshots": memory_snapshots,
         "memory_peak": memory_peak,
@@ -728,7 +778,9 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         json.dumps(summary, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
         encoding="utf-8",
     )
-    del optimizer, model, best_state, logits, target, valid, loss_rows, class_weights, weights, loss
+    del optimizer, model, best_state, logits, target, valid, loss_rows
+    del class_weights, weights
+    del loss, primary_loss, continuity_loss, continuity_pair_count
     gc.collect()
     if device.type == "cuda":
         torch.cuda.synchronize(device)
@@ -760,6 +812,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--weight-decay", type=float, default=1e-4)
     parser.add_argument("--background-weight", type=float, default=1.0)
     parser.add_argument("--speech-weight", type=float, default=1.0)
+    parser.add_argument("--continuity-weight", type=float, default=0.0)
     parser.add_argument("--hidden-size", type=int, default=128)
     parser.add_argument("--num-layers", type=int, default=2)
     parser.add_argument("--seed", type=int, default=17)
