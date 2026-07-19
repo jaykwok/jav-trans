@@ -117,7 +117,7 @@ Web 会在模型要求检查中提示驱动过旧或 CUDA 初始化失败。
      - MFCC / timing numeric features
   -> Speech-island scorer（1.7B binary-argmax v10 待审计/重训）
      - Scorer v8 仅保留为 threshold/hysteresis 审计参考，不进入当前生产 runtime
-     - v10 schema/model/trainer 与 fixed1024 canonical compiler 已完成；corrected r2 canonical 已通过完整人工证据链与 raw PTM2048 CUDA smoke，full cache/训练/晋升仍未完成
+     - v10 schema/model/trainer 与 fixed1024 canonical compiler 已完成；corrected r2 canonical、full raw PTM2048 cache 与真实数据 1-step CUDA trainer smoke 均通过，full training/模型 gate/晋升仍未完成
   -> BoundaryProposalScorer v1（候选源审计中）
      - 学习型高召回 acoustic candidate source，不做 final cut decision
   -> 按 ASR repo 进入互不混用的边界链

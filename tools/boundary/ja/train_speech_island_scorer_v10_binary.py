@@ -31,7 +31,10 @@ from boundary.ja.model import (  # noqa: E402
     BinarySpeechIslandScorerNetwork,
     build_speech_island_scorer_checkpoint,
 )
-from pipeline.memory_safety import runtime_memory_snapshot  # noqa: E402
+from pipeline.memory_safety import (  # noqa: E402
+    reset_shared_vram_baseline,
+    runtime_memory_snapshot,
+)
 
 
 PARTITIONS = ("train", "val", "test")
@@ -270,34 +273,38 @@ def evaluate(model, rows, device, *, max_padded_frames: int, tolerance_frames: i
     with torch.inference_mode():
         for batch in frame_budget_batches(rows, max_padded_frames=max_padded_frames):
             ptm, mfcc, labels, _weights, mask = pad_batch(batch)
-            probabilities = torch.softmax(
+            predictions = torch.argmax(
                 model(ptm.to(device), mfcc.to(device), attention_mask=mask.to(device)),
                 dim=-1,
-            ).cpu().numpy()
+            )
+            labels_device = labels.to(device)
             for index, row in enumerate(batch):
                 length = int(row["frame_count"])
-                truth = labels[index, :length].numpy()
+                truth_cpu = labels[index, :length].numpy()
+                truth = labels_device[index, :length]
                 valid = truth != IGNORE_INDEX
-                predicted = np.argmax(probabilities[index, :length], axis=1)
-                tp += int(np.sum((predicted == 1) & (truth == 1) & valid))
-                fp += int(np.sum((predicted == 1) & (truth == 0) & valid))
-                fn += int(np.sum((predicted == 0) & (truth == 1) & valid))
-                truth_runs = _runs(truth == 1)
+                predicted = predictions[index, :length]
+                tp += int(torch.sum((predicted == 1) & (truth == 1) & valid).item())
+                fp += int(torch.sum((predicted == 1) & (truth == 0) & valid).item())
+                fn += int(torch.sum((predicted == 0) & (truth == 1) & valid).item())
+                truth_runs = _runs(truth_cpu == 1)
                 if not truth_runs:
                     background_rows += 1
-                    background_drops += int(not np.any((predicted == 1) & valid))
+                    background_drops += int(
+                        not bool(torch.any((predicted == 1) & valid).item())
+                    )
                     continue
                 speech_rows += 1
                 for start, end in truth_runs:
                     speech_runs += 1
-                    predicted_run = np.flatnonzero(
+                    predicted_run = torch.nonzero(
                         (predicted[start:end] == 1) & valid[start:end]
-                    )
-                    if not predicted_run.size:
+                    ).flatten()
+                    if not predicted_run.numel():
                         true_speech_deletions += 1
                         continue
-                    predicted_start = start + int(predicted_run[0])
-                    predicted_end = start + int(predicted_run[-1])
+                    predicted_start = start + int(predicted_run[0].item())
+                    predicted_end = start + int(predicted_run[-1].item())
                     start_error = abs(predicted_start - start)
                     end_error = abs(predicted_end - (end - 1))
                     start_errors.append(start_error)
@@ -319,7 +326,7 @@ def evaluate(model, rows, device, *, max_padded_frames: int, tolerance_frames: i
     }
 
 
-def _memory_snapshot(device) -> dict[str, Any]:
+def _memory_snapshot(device, *, stage: str) -> dict[str, Any]:
     import torch
 
     snapshot = runtime_memory_snapshot(require_shared_vram=device.type == "cuda")
@@ -332,12 +339,40 @@ def _memory_snapshot(device) -> dict[str, Any]:
         snapshot.update(
             cuda_allocated_mb=round(torch.cuda.memory_allocated(device) / 2**20, 3),
             cuda_reserved_mb=round(torch.cuda.memory_reserved(device) / 2**20, 3),
+            cuda_max_allocated_mb=round(
+                torch.cuda.max_memory_allocated(device) / 2**20, 3
+            ),
+            cuda_max_reserved_mb=round(
+                torch.cuda.max_memory_reserved(device) / 2**20, 3
+            ),
         )
     if snapshot["physical_ram_used_mb"] > snapshot["physical_ram_budget_mb"]:
         raise MemoryError("Scorer v10 exceeded the 0.95 physical RAM budget")
     if device.type == "cuda" and float(snapshot.get("shared_vram_mb") or 0.0) > 0.0:
-        raise MemoryError("Scorer v10 shared VRAM spill is a soft OOM")
+        raise MemoryError(
+            "Scorer v10 shared VRAM spill is a soft OOM: "
+            f"shared_vram_mb={float(snapshot.get('shared_vram_mb') or 0.0):.3f} "
+            f"raw_mb={snapshot.get('shared_vram_raw_mb')} "
+            f"baseline_mb={snapshot.get('shared_vram_baseline_mb')}"
+        )
+    snapshot["stage"] = stage
     return snapshot
+
+
+def _update_peak_memory(
+    peak: dict[str, float], snapshot: dict[str, Any]
+) -> None:
+    for key in (
+        "physical_ram_used_mb",
+        "shared_vram_mb",
+        "cuda_allocated_mb",
+        "cuda_reserved_mb",
+        "cuda_max_allocated_mb",
+        "cuda_max_reserved_mb",
+    ):
+        value = snapshot.get(key)
+        if isinstance(value, (int, float)):
+            peak[key] = max(float(value), float(peak.get(key, 0.0)))
 
 
 def release_gate_fields(numeric_gate_pass: bool) -> dict[str, Any]:
@@ -394,20 +429,120 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     device = torch.device(args.device)
     if device.type == "cuda" and not torch.cuda.is_available():
         raise RuntimeError("Scorer v10 requested CUDA but CUDA is unavailable")
-    _memory_snapshot(device)
-    model = BinarySpeechIslandScorerNetwork(**model_config).to(device)
-    optimizer = torch.optim.AdamW(
-        model.parameters(), lr=args.learning_rate, weight_decay=args.weight_decay
-    )
+    del first_ptm, first_mfcc, _labels, _weights
+    if device.type == "cuda":
+        torch.cuda.init()
+        context_warmup = torch.ones(1, device=device)
+        context_warmup.add_(1.0)
+        torch.cuda.synchronize(device)
+        del context_warmup
+        torch.cuda.empty_cache()
+        gc.collect()
+        torch.cuda.reset_peak_memory_stats(device)
+    memory_snapshots: list[dict[str, Any]] = [
+        _memory_snapshot(device, stage="context_baseline")
+    ]
+    memory_peak: dict[str, float] = {}
+    _update_peak_memory(memory_peak, memory_snapshots[-1])
     rng = np.random.default_rng(args.seed)
     train_batches = frame_budget_batches(
         by_partition["train"], max_padded_frames=args.max_batch_frames
     )
+    if device.type == "cuda":
+        torch.manual_seed(args.seed)
+        torch.cuda.manual_seed_all(args.seed)
+        warmup_model = BinarySpeechIslandScorerNetwork(**model_config).to(device)
+        warmup_optimizer = torch.optim.AdamW(
+            warmup_model.parameters(),
+            lr=args.learning_rate,
+            weight_decay=args.weight_decay,
+        )
+        warmup_batch = max(
+            train_batches,
+            key=lambda batch: max(int(row["frame_count"]) for row in batch)
+            * len(batch),
+        )
+        warmup_ptm, warmup_mfcc, warmup_labels, warmup_source_weights, warmup_mask = (
+            pad_batch(warmup_batch)
+        )
+        warmup_model.train()
+        warmup_logits = warmup_model(
+            warmup_ptm.to(device),
+            warmup_mfcc.to(device),
+            attention_mask=warmup_mask.to(device),
+        )
+        warmup_target = warmup_labels.to(device)
+        warmup_valid = warmup_target != IGNORE_INDEX
+        warmup_loss_rows = F.cross_entropy(
+            warmup_logits.transpose(1, 2),
+            warmup_target,
+            reduction="none",
+            ignore_index=IGNORE_INDEX,
+        )
+        warmup_class_weights = torch.where(
+            warmup_target == 0,
+            torch.as_tensor(args.background_weight, device=device),
+            torch.as_tensor(args.speech_weight, device=device),
+        )
+        warmup_weights = warmup_source_weights.to(device) * warmup_class_weights
+        warmup_loss = (
+            warmup_loss_rows[warmup_valid] * warmup_weights[warmup_valid]
+        ).sum() / warmup_weights[warmup_valid].sum().clamp_min(1e-6)
+        warmup_optimizer.zero_grad(set_to_none=True)
+        warmup_loss.backward()
+        warmup_optimizer.step()
+        eval_warmup_val = evaluate(
+            warmup_model,
+            by_partition["val"],
+            device,
+            max_padded_frames=args.max_batch_frames,
+            tolerance_frames=int(round(args.tolerance_s / args.frame_hop_s)),
+        )
+        eval_warmup_test = evaluate(
+            warmup_model,
+            by_partition["test"],
+            device,
+            max_padded_frames=args.max_batch_frames,
+            tolerance_frames=int(round(args.tolerance_s / args.frame_hop_s)),
+        )
+        torch.cuda.synchronize(device)
+        del (
+            warmup_optimizer,
+            warmup_model,
+            warmup_ptm,
+            warmup_mfcc,
+            warmup_labels,
+            warmup_source_weights,
+            warmup_mask,
+            warmup_logits,
+            warmup_target,
+            warmup_valid,
+            warmup_loss_rows,
+            warmup_class_weights,
+            warmup_weights,
+            warmup_loss,
+            eval_warmup_val,
+            eval_warmup_test,
+        )
+        gc.collect()
+        torch.cuda.empty_cache()
+        execution_baseline = reset_shared_vram_baseline(required=True)
+        execution_baseline["stage"] = "execution_baseline"
+        memory_snapshots.append(execution_baseline)
+        torch.cuda.reset_peak_memory_stats(device)
+    torch.manual_seed(args.seed)
+    if device.type == "cuda":
+        torch.cuda.manual_seed_all(args.seed)
+    model = BinarySpeechIslandScorerNetwork(**model_config).to(device)
+    optimizer = torch.optim.AdamW(
+        model.parameters(), lr=args.learning_rate, weight_decay=args.weight_decay
+    )
+    memory_snapshots.append(_memory_snapshot(device, stage="model_initialized"))
+    _update_peak_memory(memory_peak, memory_snapshots[-1])
     best_score = (-1.0, -1.0, -1.0)
     best_step = 0
     best_state = None
     losses: list[float] = []
-    memory_snapshots: list[dict[str, Any]] = []
     started = time.monotonic()
     for step in range(1, args.max_steps + 1):
         if (step - 1) % len(train_batches) == 0:
@@ -432,6 +567,8 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         loss.backward()
         optimizer.step()
         losses.append(float(loss.detach().cpu()))
+        step_memory = _memory_snapshot(device, stage=f"train_step_{step}")
+        _update_peak_memory(memory_peak, step_memory)
         if step % args.eval_interval == 0 or step == args.max_steps:
             val = evaluate(
                 model,
@@ -440,7 +577,10 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 max_padded_frames=args.max_batch_frames,
                 tolerance_frames=int(round(args.tolerance_s / args.frame_hop_s)),
             )
-            memory_snapshots.append(_memory_snapshot(device))
+            memory_snapshots.append(
+                _memory_snapshot(device, stage=f"validation_step_{step}")
+            )
+            _update_peak_memory(memory_peak, memory_snapshots[-1])
             score = (
                 float(val["true_speech_deletion_count"] == 0),
                 min(val["start_coverage"], val["end_coverage"], val["background_drop_recall"]),
@@ -455,8 +595,12 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     model.load_state_dict(best_state)
     val = evaluate(model, by_partition["val"], device, max_padded_frames=args.max_batch_frames,
                    tolerance_frames=int(round(args.tolerance_s / args.frame_hop_s)))
+    memory_snapshots.append(_memory_snapshot(device, stage="final_validation"))
+    _update_peak_memory(memory_peak, memory_snapshots[-1])
     test = evaluate(model, by_partition["test"], device, max_padded_frames=args.max_batch_frames,
                     tolerance_frames=int(round(args.tolerance_s / args.frame_hop_s)))
+    memory_snapshots.append(_memory_snapshot(device, stage="final_test"))
+    _update_peak_memory(memory_peak, memory_snapshots[-1])
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     checkpoint = output_dir / f"speech_island_scorer_v10.{qwen_asr_repo_tag(args.ptm_repo_id)}.pt"
@@ -471,6 +615,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 "dataset_summary": dataset_summary,
                 "trained_steps": args.max_steps,
                 "best_step": best_step,
+                "seed": args.seed,
                 "canonical_label_counts": dict(canonical_counts),
                 "excluded_training_count": int(canonical_counts["unsure"]),
                 "training_initialization": "random",
@@ -506,9 +651,11 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "excluded_training_count": int(canonical_counts["unsure"]),
         **release_gate_fields(numeric_gate_pass),
         "training_initialization": "random",
+        "seed": args.seed,
         "loss": "weighted_cross_entropy",
         "decision_mode": "binary_frame_argmax",
         "memory_snapshots": memory_snapshots,
+        "memory_peak": memory_peak,
         "elapsed_s": time.monotonic() - started,
     }
     (output_dir / "summary.json").write_text(
@@ -520,7 +667,9 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     if device.type == "cuda":
         torch.cuda.synchronize(device)
         torch.cuda.empty_cache()
-    summary["memory_after_release"] = _memory_snapshot(device)
+    summary["memory_after_release"] = _memory_snapshot(
+        device, stage="post_release"
+    )
     (output_dir / "summary.json").write_text(
         json.dumps(summary, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
         encoding="utf-8",

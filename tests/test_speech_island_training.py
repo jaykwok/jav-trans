@@ -24,6 +24,7 @@ from boundary.ja.model import (
 import tools.boundary.ja.train_speech_island_scorer_v10_binary as scorer_v10_trainer
 from tools.boundary.ja.train_speech_island_scorer_v10_binary import (
     compute_mfcc_normalization,
+    frame_budget_batches as scorer_v10_frame_budget_batches,
     parse_args as parse_scorer_v10_args,
     release_gate_fields as scorer_v10_release_gate_fields,
     summarize_partition_labels,
@@ -299,4 +300,19 @@ def test_binary_speech_v10_trainer_has_no_legacy_tuning_surface() -> None:
     assert not hasattr(args, "focal_gamma")
     assert not hasattr(args, "threshold")
     assert not hasattr(args, "projected_ptm_dim")
+    assert args.seed == 17
     assert scorer_v10_release_gate_fields(True)["promotion_ready"] is False
+
+
+def test_binary_speech_v10_batches_by_padded_frame_budget_without_truncation() -> None:
+    rows = [
+        {"source_id": "short-a", "frame_count": 3},
+        {"source_id": "short-b", "frame_count": 4},
+        {"source_id": "long", "frame_count": 11},
+    ]
+    batches = scorer_v10_frame_budget_batches(rows, max_padded_frames=10)
+    assert [[row["source_id"] for row in batch] for batch in batches] == [
+        ["short-a", "short-b"],
+        ["long"],
+    ]
+    assert batches[-1][0]["frame_count"] == 11
