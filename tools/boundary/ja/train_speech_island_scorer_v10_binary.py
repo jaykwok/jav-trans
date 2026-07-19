@@ -260,6 +260,39 @@ def _runs(values: np.ndarray) -> list[tuple[int, int]]:
     return runs
 
 
+def predicted_run_structure(predicted_speech) -> dict[str, int]:
+    """Count learned argmax islands inside one canonical speech run."""
+
+    import torch
+
+    values = predicted_speech.to(dtype=torch.bool).reshape(-1)
+    if not values.numel():
+        return {
+            "predicted_run_count": 0,
+            "continuous": 0,
+            "fragmented": 0,
+            "internal_drop_gap_count": 0,
+            "internal_drop_frame_count": 0,
+        }
+    previous = torch.cat(
+        (torch.zeros(1, dtype=torch.bool, device=values.device), values[:-1])
+    )
+    run_count = int(torch.sum(values & ~previous).item())
+    present = torch.nonzero(values).flatten()
+    internal_drop_frames = 0
+    if present.numel():
+        first = int(present[0].item())
+        last = int(present[-1].item())
+        internal_drop_frames = int(torch.sum(~values[first : last + 1]).item())
+    return {
+        "predicted_run_count": run_count,
+        "continuous": int(run_count == 1),
+        "fragmented": int(run_count > 1),
+        "internal_drop_gap_count": max(0, run_count - 1),
+        "internal_drop_frame_count": internal_drop_frames,
+    }
+
+
 def evaluate(model, rows, device, *, max_padded_frames: int, tolerance_frames: int):
     import torch
 
@@ -267,6 +300,9 @@ def evaluate(model, rows, device, *, max_padded_frames: int, tolerance_frames: i
     speech_runs = start_hits = end_hits = true_speech_deletions = 0
     tp = fp = fn = 0
     background_drops = 0
+    continuous_speech_runs = fragmented_speech_runs = 0
+    predicted_runs_within_truth = 0
+    internal_drop_gap_count = internal_drop_frame_count = 0
     start_errors: list[int] = []
     end_errors: list[int] = []
     model.eval()
@@ -300,6 +336,14 @@ def evaluate(model, rows, device, *, max_padded_frames: int, tolerance_frames: i
                     predicted_run = torch.nonzero(
                         (predicted[start:end] == 1) & valid[start:end]
                     ).flatten()
+                    structure = predicted_run_structure(
+                        (predicted[start:end] == 1) & valid[start:end]
+                    )
+                    continuous_speech_runs += structure["continuous"]
+                    fragmented_speech_runs += structure["fragmented"]
+                    predicted_runs_within_truth += structure["predicted_run_count"]
+                    internal_drop_gap_count += structure["internal_drop_gap_count"]
+                    internal_drop_frame_count += structure["internal_drop_frame_count"]
                     if not predicted_run.numel():
                         true_speech_deletions += 1
                         continue
@@ -323,6 +367,13 @@ def evaluate(model, rows, device, *, max_padded_frames: int, tolerance_frames: i
         "speech_recall": tp / max(tp + fn, 1),
         "background_drop_recall": background_drops / max(background_rows, 1),
         "true_speech_deletion_count": true_speech_deletions,
+        "continuous_speech_run_count": continuous_speech_runs,
+        "fragmented_speech_run_count": fragmented_speech_runs,
+        "speech_run_continuity": continuous_speech_runs / max(speech_runs, 1),
+        "predicted_run_count_within_truth": predicted_runs_within_truth,
+        "prediction_to_truth_run_ratio": predicted_runs_within_truth / max(speech_runs, 1),
+        "internal_drop_gap_count": internal_drop_gap_count,
+        "internal_drop_frame_count": internal_drop_frame_count,
     }
 
 
@@ -382,6 +433,24 @@ def release_gate_fields(numeric_gate_pass: bool) -> dict[str, Any]:
         "promotion_ready": False,
         "manual_zero_clipping_gate": "required_before_promotion",
     }
+
+
+def numeric_gate_pass(val: dict[str, Any], test: dict[str, Any]) -> bool:
+    return (
+        min(
+            val["start_coverage"],
+            val["end_coverage"],
+            test["start_coverage"],
+            test["end_coverage"],
+            val["background_drop_recall"],
+            test["background_drop_recall"],
+            val["speech_run_continuity"],
+            test["speech_run_continuity"],
+        )
+        >= 0.95
+        and val["true_speech_deletion_count"] == 0
+        and test["true_speech_deletion_count"] == 0
+    )
 
 
 def run(args: argparse.Namespace) -> dict[str, Any]:
@@ -583,7 +652,12 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             _update_peak_memory(memory_peak, memory_snapshots[-1])
             score = (
                 float(val["true_speech_deletion_count"] == 0),
-                min(val["start_coverage"], val["end_coverage"], val["background_drop_recall"]),
+                min(
+                    val["start_coverage"],
+                    val["end_coverage"],
+                    val["background_drop_recall"],
+                    val["speech_run_continuity"],
+                ),
                 val["speech_recall"],
             )
             if score > best_score:
@@ -619,7 +693,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 "canonical_label_counts": dict(canonical_counts),
                 "excluded_training_count": int(canonical_counts["unsure"]),
                 "training_initialization": "random",
-                "checkpoint_selection": "val_binary_speech_edge_300ms_coverage_v1",
+                "checkpoint_selection": "val_binary_speech_edge_continuity_300ms_coverage_v2",
                 "class_weights": {
                     "background": args.background_weight,
                     "speech": args.speech_weight,
@@ -629,17 +703,9 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         ),
         checkpoint,
     )
-    numeric_gate_pass = (
-        min(
-            val["start_coverage"], val["end_coverage"], test["start_coverage"],
-            test["end_coverage"], val["background_drop_recall"],
-            test["background_drop_recall"],
-        ) >= 0.95
-        and val["true_speech_deletion_count"] == 0
-        and test["true_speech_deletion_count"] == 0
-    )
+    numeric_gate_pass_value = numeric_gate_pass(val, test)
     summary = {
-        "schema": "speech_island_scorer_v10_binary_training_summary_v1",
+        "schema": "speech_island_scorer_v10_binary_training_summary_v2",
         "checkpoint": str(checkpoint),
         "checkpoint_sha256": hashlib.sha256(checkpoint.read_bytes()).hexdigest(),
         "best_step": best_step,
@@ -649,7 +715,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "dataset": dataset_summary,
         "canonical_label_counts": dict(canonical_counts),
         "excluded_training_count": int(canonical_counts["unsure"]),
-        **release_gate_fields(numeric_gate_pass),
+        **release_gate_fields(numeric_gate_pass_value),
         "training_initialization": "random",
         "seed": args.seed,
         "loss": "weighted_cross_entropy",

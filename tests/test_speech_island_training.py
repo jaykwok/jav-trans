@@ -25,7 +25,9 @@ import tools.boundary.ja.train_speech_island_scorer_v10_binary as scorer_v10_tra
 from tools.boundary.ja.train_speech_island_scorer_v10_binary import (
     compute_mfcc_normalization,
     frame_budget_batches as scorer_v10_frame_budget_batches,
+    numeric_gate_pass as scorer_v10_numeric_gate_pass,
     parse_args as parse_scorer_v10_args,
+    predicted_run_structure,
     release_gate_fields as scorer_v10_release_gate_fields,
     summarize_partition_labels,
     validate_dataset_rows as validate_scorer_v10_rows,
@@ -316,3 +318,32 @@ def test_binary_speech_v10_batches_by_padded_frame_budget_without_truncation() -
         ["long"],
     ]
     assert batches[-1][0]["frame_count"] == 11
+
+
+def test_binary_speech_v10_continuity_counts_internal_argmax_holes() -> None:
+    torch = pytest.importorskip("torch")
+    structure = predicted_run_structure(
+        torch.tensor([1, 1, 0, 1, 0, 0, 1, 1], dtype=torch.bool)
+    )
+    assert structure == {
+        "predicted_run_count": 3,
+        "continuous": 0,
+        "fragmented": 1,
+        "internal_drop_gap_count": 2,
+        "internal_drop_frame_count": 3,
+    }
+
+
+def test_binary_speech_v10_numeric_gate_requires_heldout_continuity() -> None:
+    metrics = {
+        "start_coverage": 0.99,
+        "end_coverage": 0.99,
+        "background_drop_recall": 0.96,
+        "speech_run_continuity": 0.94,
+        "true_speech_deletion_count": 0,
+    }
+    assert scorer_v10_numeric_gate_pass(metrics, metrics) is False
+    assert scorer_v10_numeric_gate_pass(
+        {**metrics, "speech_run_continuity": 0.95},
+        {**metrics, "speech_run_continuity": 0.95},
+    ) is True

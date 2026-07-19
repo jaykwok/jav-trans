@@ -9,6 +9,7 @@ from tools.audits.generate_scorer_v10_prediction_audit_html import build_audit
 from tools.audits.score_scorer_v10_checkpoint_audit import (
     _select_audit_rows,
     _span_rows,
+    summarize_prediction_continuity,
 )
 
 
@@ -105,3 +106,36 @@ def test_prediction_audit_html_is_exact_span_and_saveable(tmp_path: Path) -> Non
     assert 'preload="metadata"' not in page
     assert "speech_scorer_v10_prediction_manual_verdict_v1" in page
     assert (index.parent / "audio" / "item-000.wav").is_file()
+
+
+def test_checkpoint_continuity_summary_rejects_fragmented_heldout_runs() -> None:
+    row = {
+        "source_id": "val-fragmented",
+        "partition": "val",
+        "row_role": "speech",
+        "truth_spans": [
+            {"label": "truth_speech", "start_frame": 0, "end_frame": 10}
+        ],
+        "prediction_spans": [
+            {"label": "model_speech", "start_frame": 0, "end_frame": 2},
+            {"label": "model_speech", "start_frame": 3, "end_frame": 5},
+            {"label": "model_speech", "start_frame": 7, "end_frame": 10},
+        ],
+    }
+    summary = summarize_prediction_continuity([row])
+    assert summary["val"] == {
+        "speech_row_count": 1,
+        "truth_run_count": 1,
+        "continuous_truth_run_count": 0,
+        "fragmented_truth_run_count": 1,
+        "speech_run_continuity": 0.0,
+        "predicted_run_count_within_truth": 3,
+        "prediction_to_truth_run_ratio": 3.0,
+        "internal_drop_gap_count": 2,
+        "internal_drop_frame_count": 3,
+        "max_internal_drop_gap_frames": 2,
+        "predicted_run_under_100ms_count": 3,
+        "predicted_run_under_200ms_count": 3,
+        "predicted_run_under_500ms_count": 3,
+    }
+    assert summary["heldout_continuity_gate_pass"] is False

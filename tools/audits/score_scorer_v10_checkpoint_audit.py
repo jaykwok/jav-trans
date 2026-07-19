@@ -61,6 +61,127 @@ def _span_rows(values: np.ndarray, *, label: str) -> list[dict[str, Any]]:
     ]
 
 
+def _row_continuity_from_spans(row: dict[str, Any]) -> dict[str, Any]:
+    truth_spans = sorted(
+        (
+            span
+            for span in row.get("truth_spans", [])
+            if span.get("label") == "truth_speech"
+        ),
+        key=lambda span: (int(span["start_frame"]), int(span["end_frame"])),
+    )
+    prediction_spans = sorted(
+        row.get("prediction_spans", []),
+        key=lambda span: (int(span["start_frame"]), int(span["end_frame"])),
+    )
+    predictions_overlapping_truth = [
+        span
+        for span in prediction_spans
+        if any(
+            int(span["end_frame"]) > int(truth["start_frame"])
+            and int(span["start_frame"]) < int(truth["end_frame"])
+            for truth in truth_spans
+        )
+    ]
+    predicted_duration_frames = [
+        int(span["end_frame"]) - int(span["start_frame"])
+        for span in predictions_overlapping_truth
+    ]
+    continuous = fragmented = predicted_runs = 0
+    internal_gaps: list[int] = []
+    for truth in truth_spans:
+        truth_start = int(truth["start_frame"])
+        truth_end = int(truth["end_frame"])
+        overlaps = [
+            span
+            for span in prediction_spans
+            if int(span["end_frame"]) > truth_start
+            and int(span["start_frame"]) < truth_end
+        ]
+        predicted_runs += len(overlaps)
+        continuous += int(len(overlaps) == 1)
+        fragmented += int(len(overlaps) > 1)
+        for left, right in zip(overlaps, overlaps[1:]):
+            internal_gaps.append(
+                max(0, int(right["start_frame"]) - int(left["end_frame"]))
+            )
+    truth_run_count = len(truth_spans)
+    return {
+        "truth_run_count": truth_run_count,
+        "continuous_truth_run_count": continuous,
+        "fragmented_truth_run_count": fragmented,
+        "predicted_run_count_within_truth": predicted_runs,
+        "speech_run_continuity": continuous / max(truth_run_count, 1),
+        "prediction_to_truth_run_ratio": predicted_runs / max(truth_run_count, 1),
+        "internal_drop_gap_count": len(internal_gaps),
+        "internal_drop_frame_count": sum(internal_gaps),
+        "max_internal_drop_gap_frames": max(internal_gaps, default=0),
+        "predicted_run_under_100ms_count": sum(
+            duration < 5 for duration in predicted_duration_frames
+        ),
+        "predicted_run_under_200ms_count": sum(
+            duration < 10 for duration in predicted_duration_frames
+        ),
+        "predicted_run_under_500ms_count": sum(
+            duration < 25 for duration in predicted_duration_frames
+        ),
+    }
+
+
+def summarize_prediction_continuity(rows: Iterable[dict[str, Any]]) -> dict[str, Any]:
+    materialized = list(rows)
+    result: dict[str, Any] = {}
+    for partition in ("train", "val", "test", "all"):
+        selected = [
+            row
+            for row in materialized
+            if row.get("row_role") == "speech"
+            and (partition == "all" or row.get("partition") == partition)
+        ]
+        metrics = [_row_continuity_from_spans(row) for row in selected]
+        truth_runs = sum(int(item["truth_run_count"]) for item in metrics)
+        continuous = sum(int(item["continuous_truth_run_count"]) for item in metrics)
+        fragmented = sum(int(item["fragmented_truth_run_count"]) for item in metrics)
+        predicted_runs = sum(
+            int(item["predicted_run_count_within_truth"]) for item in metrics
+        )
+        result[partition] = {
+            "speech_row_count": len(selected),
+            "truth_run_count": truth_runs,
+            "continuous_truth_run_count": continuous,
+            "fragmented_truth_run_count": fragmented,
+            "speech_run_continuity": continuous / max(truth_runs, 1),
+            "predicted_run_count_within_truth": predicted_runs,
+            "prediction_to_truth_run_ratio": predicted_runs / max(truth_runs, 1),
+            "internal_drop_gap_count": sum(
+                int(item["internal_drop_gap_count"]) for item in metrics
+            ),
+            "internal_drop_frame_count": sum(
+                int(item["internal_drop_frame_count"]) for item in metrics
+            ),
+            "max_internal_drop_gap_frames": max(
+                (int(item["max_internal_drop_gap_frames"]) for item in metrics),
+                default=0,
+            ),
+            "predicted_run_under_100ms_count": sum(
+                int(item["predicted_run_under_100ms_count"]) for item in metrics
+            ),
+            "predicted_run_under_200ms_count": sum(
+                int(item["predicted_run_under_200ms_count"]) for item in metrics
+            ),
+            "predicted_run_under_500ms_count": sum(
+                int(item["predicted_run_under_500ms_count"]) for item in metrics
+            ),
+        }
+    result["gate_threshold"] = 0.95
+    result["heldout_continuity_gate_pass"] = min(
+        float(result["val"]["speech_run_continuity"]),
+        float(result["test"]["speech_run_continuity"]),
+    ) >= 0.95
+    result["short_run_counts_are_diagnostic_only"] = True
+    return result
+
+
 def _memory_check(*, stage: str, device: str) -> dict[str, Any]:
     import torch
 
@@ -127,6 +248,10 @@ def _score_row(bundle: Any, row: dict[str, Any]) -> dict[str, Any]:
     false_negative_frames = int(np.sum((truth == 1) & (predicted == 0) & valid))
     false_positive_frames = int(np.sum((truth == 0) & (predicted == 1) & valid))
     prediction_spans = _span_rows(predicted_speech & valid, label="model_speech")
+    truth_spans = [
+        *_span_rows((truth == 1) & valid, label="truth_speech"),
+        *_span_rows((truth == 0) & valid, label="truth_background"),
+    ]
     max_predicted_speech_run_s = max(
         (span["end_s"] - span["start_s"] for span in prediction_spans),
         default=0.0,
@@ -144,7 +269,7 @@ def _score_row(bundle: Any, row: dict[str, Any]) -> dict[str, Any]:
         category = "long_residual"
     else:
         category = "normal"
-    return {
+    result = {
         "source_id": row["source_id"],
         "audio": row["audio"],
         "partition": row["partition"],
@@ -159,12 +284,11 @@ def _score_row(bundle: Any, row: dict[str, Any]) -> dict[str, Any]:
         "max_predicted_speech_run_s": max_predicted_speech_run_s,
         "edge_errors": edge_errors,
         "category": category,
-        "truth_spans": [
-            *_span_rows((truth == 1) & valid, label="truth_speech"),
-            *_span_rows((truth == 0) & valid, label="truth_background"),
-        ],
+        "truth_spans": truth_spans,
         "prediction_spans": prediction_spans,
     }
+    result.update(_row_continuity_from_spans(result))
+    return result
 
 
 def _select_audit_rows(rows: Iterable[dict[str, Any]], *, max_items: int) -> list[dict[str, Any]]:
@@ -237,7 +361,7 @@ def score_checkpoint(
         for row in selected:
             handle.write(json.dumps(row, ensure_ascii=False, sort_keys=True) + "\n")
     summary = {
-        "schema": "speech_scorer_v10_checkpoint_audit_summary_v1",
+        "schema": "speech_scorer_v10_checkpoint_audit_summary_v2",
         "checkpoint": str(checkpoint),
         "dataset_manifest": str(dataset_manifest),
         "row_count": len(predictions),
@@ -250,6 +374,7 @@ def score_checkpoint(
             row["false_negative_frames"] > 0 for row in predictions if row["row_role"] == "speech"
         ),
         "true_speech_deletion_rows": sum(row["true_speech_deletions"] > 0 for row in predictions),
+        "continuity": summarize_prediction_continuity(predictions),
         "memory_snapshots": memory_snapshots,
         "predictions": str(predictions_path),
         "audit_selection": str(selected_path),
