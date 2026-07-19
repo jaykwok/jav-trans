@@ -6,7 +6,7 @@ from contextlib import contextmanager
 from http.server import ThreadingHTTPServer
 from pathlib import Path
 from urllib.error import HTTPError
-from urllib.request import Request, urlopen
+from urllib.request import HTTPRedirectHandler, Request, build_opener, urlopen
 
 from tools.audits.audit_nav import write_audit_index, write_latest_audit_entry
 from tools.audits.serve_static import CLIENT_DISCONNECT_ERRORS, make_handler, parse_range_header, resolve_url_path
@@ -39,6 +39,11 @@ def _read(url: str, *, headers: dict[str, str] | None = None):
     request = Request(url, headers=headers or {})
     with urlopen(request, timeout=5) as response:
         return response.status, dict(response.headers), response.read()
+
+
+class _NoRedirect(HTTPRedirectHandler):
+    def http_error_308(self, request, response, code, message, headers):
+        return response
 
 
 def test_parse_range_header_supports_full_and_suffix_ranges():
@@ -117,6 +122,19 @@ def test_static_server_disables_html_cache_without_affecting_audio(tmp_path: Pat
         assert status == 206
         assert body == b"01"
         assert "Cache-Control" not in headers
+
+
+def test_static_server_redirects_directory_without_trailing_slash(tmp_path: Path):
+    root = tmp_path / "root"
+    audit_root = root / "agents" / "audits"
+    rm_root = root / "agents" / "rm" / "audit-deletions"
+    _write(audit_root / "sample" / "index.html", "<!doctype html><title>sample</title>")
+
+    with _server(root=root, audit_root=audit_root, rm_root=rm_root) as base_url:
+        request = Request(f"{base_url}/agents/audits/sample", method="GET")
+        with build_opener(_NoRedirect()).open(request, timeout=5) as response:
+            assert response.status == 308
+            assert response.headers["Location"] == "/agents/audits/sample/"
 
 
 def test_static_server_treats_windows_range_abort_as_client_disconnect():

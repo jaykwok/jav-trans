@@ -269,6 +269,17 @@ def make_handler(
                 self.send_error(HTTPStatus.FORBIDDEN, str(exc))
                 return
             if target.is_dir():
+                requested_path = urlsplit(self.path).path
+                if not requested_path.endswith("/"):
+                    location = requested_path + "/"
+                    query = urlsplit(self.path).query
+                    if query:
+                        location += "?" + query
+                    self.send_response(HTTPStatus.PERMANENT_REDIRECT)
+                    self.send_header("Location", location)
+                    self.send_header("Content-Length", "0")
+                    self.end_headers()
+                    return
                 index = target / "index.html"
                 if index.exists():
                     target = index

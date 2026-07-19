@@ -101,5 +101,7 @@ def test_prediction_audit_html_is_exact_span_and_saveable(tmp_path: Path) -> Non
     index = build_audit(selection=selection, output_dir=tmp_path / "audit")
     page = index.read_text(encoding="utf-8")
     assert "playExact" in page
+    assert '<audio controls preload="none"' in page
+    assert 'preload="metadata"' not in page
     assert "speech_scorer_v10_prediction_manual_verdict_v1" in page
     assert (index.parent / "audio" / "item-000.wav").is_file()
