@@ -46,3 +46,23 @@ def test_runtime_shared_vram_reports_growth_over_process_baseline(monkeypatch):
     assert second["shared_vram_baseline_mb"] == 74.0
     assert second["shared_vram_raw_mb"] == 79.5
     assert second["shared_vram_mb"] == 5.5
+
+
+def test_reset_shared_vram_baseline_starts_a_new_execution_scope(monkeypatch):
+    values = iter((74.0, 78.0, 78.0))
+    monkeypatch.setattr(
+        memory_safety,
+        "shared_vram_snapshot",
+        lambda **_kwargs: {
+            "shared_vram_mb": next(values),
+            "shared_vram_monitor": "fake",
+        },
+    )
+    monkeypatch.setattr(memory_safety, "physical_ram_snapshot", lambda _ratio: {})
+    memory_safety._SHARED_VRAM_BASELINE_BY_PID.clear()
+    assert memory_safety.runtime_memory_snapshot()["shared_vram_mb"] == 0.0
+    reset = memory_safety.reset_shared_vram_baseline(required=True)
+    assert reset["shared_vram_raw_mb"] == 78.0
+    assert reset["shared_vram_baseline_mb"] == 78.0
+    assert reset["shared_vram_mb"] == 0.0
+    assert memory_safety.runtime_memory_snapshot()["shared_vram_mb"] == 0.0

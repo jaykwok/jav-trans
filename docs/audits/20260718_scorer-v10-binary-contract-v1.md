@@ -66,4 +66,10 @@ Replacement7 found one additional contaminated val all-background asset (`correc
 
 The final page at `agents/audits/20260719_103542_scorer-v10-corrected-replacement2/` is complete at `2/2 correct`. A combined evidence-chain gate binds the original fixed24 failure, span-repair15, corrected r1, replacement7 quarantine, corrected r2 and replacement2 by schema, SHA and exact target IDs. It passes with `feature_cache_allowed=true / training_manifest_allowed=true`; this authorizes raw PTM2048 caching and later manifest finalization only. It does not claim a trained Scorer v10, a model gate or production promotion.
 
+## Raw feature-cache smoke
+
+The CUDA/bfloat16 raw PTM2048 smoke at `agents/temp/20260719_111207_scorer-v10-raw-ptm2048-cache-smoke/` cached one 18.9-second canonical source as `945×2048 PTM + 945×40 MFCC` with zero errors. Peak CUDA allocated/reserved was `4039.861/4100 MiB`; physical RAM stayed below its 0.95 budget. Windows PDH reports a fixed CUDA context/Qwen execution raw shared baseline (`76→78 MiB`), while model load, the real canonical forward and post-model-release growth against the warmed execution baseline were all exactly `0.0 MiB`.
+
+Batch equivalence was checked on the same two sources. Sending both variable-length windows through one padded bfloat16 PTM forward preserved order and shapes but changed raw PTM values (`max abs delta=0.0390335`), so that optimization is rejected. CPU grouping with `ptm_window_batch_size=1` keeps every complete window in an independent PTM forward and is byte-identical to batch size 1 for PTM and MFCC. Full caching must use this singleton PTM path; it may not shorten visible context or use global-max padding.
+
 After a real v10 model exists, the same audit framework must generate pages for every prediction-drop/truth-speech case, all held-out hard cases, edge clipping and every greater-than-8-second residual. Numeric gates are capped at 95%; zero clipping and zero true-speech deletion require saved human verdicts before promotion.

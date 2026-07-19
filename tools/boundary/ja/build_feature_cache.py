@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import gc
 import json
 import math
 import os
@@ -34,6 +35,63 @@ from boundary.ja import (
 )
 from audio.loading import load_audio_16k_mono
 from boundary.gpu_safety import apply_vram_safety_cap
+from pipeline.memory_safety import reset_shared_vram_baseline, runtime_memory_snapshot
+
+
+def _validate_cache_memory_snapshot(
+    snapshot: Mapping[str, Any], *, require_shared_vram: bool
+) -> None:
+    used_mb = float(snapshot.get("physical_ram_used_mb") or 0.0)
+    budget_mb = float(snapshot.get("physical_ram_budget_mb") or 0.0)
+    if budget_mb > 0.0 and used_mb > budget_mb:
+        raise MemoryError(
+            "feature cache exceeded the 0.95 physical RAM budget: "
+            f"used_mb={used_mb:.1f} budget_mb={budget_mb:.1f}"
+        )
+    shared_mb = snapshot.get("shared_vram_mb")
+    if require_shared_vram and not isinstance(shared_mb, (int, float)):
+        raise RuntimeError("feature cache shared VRAM monitor is unavailable")
+    if require_shared_vram and float(shared_mb or 0.0) > 0.0:
+        raise MemoryError(
+            "feature cache shared VRAM spill is a soft OOM: "
+            f"shared_vram_mb={float(shared_mb):.3f}"
+        )
+
+
+def _cache_memory_snapshot(
+    *, stage: str, uses_cuda: bool, validate: bool = True
+) -> dict[str, Any]:
+    snapshot = runtime_memory_snapshot(require_shared_vram=uses_cuda)
+    if uses_cuda:
+        import torch
+
+        scale = 1024 * 1024
+        snapshot.update(
+            cuda_allocated_mb=round(torch.cuda.memory_allocated() / scale, 3),
+            cuda_reserved_mb=round(torch.cuda.memory_reserved() / scale, 3),
+            cuda_max_allocated_mb=round(torch.cuda.max_memory_allocated() / scale, 3),
+            cuda_max_reserved_mb=round(torch.cuda.max_memory_reserved() / scale, 3),
+        )
+    snapshot["stage"] = stage
+    if validate:
+        _validate_cache_memory_snapshot(snapshot, require_shared_vram=uses_cuda)
+    return snapshot
+
+
+def _update_peak_memory(
+    peak: dict[str, float], snapshot: Mapping[str, Any]
+) -> None:
+    for key in (
+        "physical_ram_used_mb",
+        "shared_vram_mb",
+        "cuda_allocated_mb",
+        "cuda_reserved_mb",
+        "cuda_max_allocated_mb",
+        "cuda_max_reserved_mb",
+    ):
+        value = snapshot.get(key)
+        if isinstance(value, (int, float)):
+            peak[key] = max(float(value), float(peak.get(key, 0.0)))
 
 
 def _write_jsonl_row(handle: Any, row: Mapping[str, Any]) -> None:
@@ -395,6 +453,27 @@ def _extract_ptm_window_features(
 
 def run(args: argparse.Namespace) -> None:
     apply_vram_safety_cap()
+    uses_cuda = args.device != "cpu"
+    if uses_cuda:
+        import torch
+
+        torch.cuda.init()
+        warmup = torch.ones(1, device="cuda")
+        warmup.add_(1.0)
+        torch.cuda.synchronize()
+        del warmup
+        torch.cuda.empty_cache()
+        gc.collect()
+        torch.cuda.reset_peak_memory_stats()
+    memory_diagnostics: dict[str, Any] = {
+        "preload": _cache_memory_snapshot(stage="preload", uses_cuda=uses_cuda),
+        "runtime_peak": {},
+    }
+    print(
+        "memory_snapshot="
+        + json.dumps(memory_diagnostics["preload"], ensure_ascii=False, sort_keys=True),
+        flush=True,
+    )
     output_dir = Path(args.output_dir)
     feature_dir = output_dir / "features"
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -437,7 +516,7 @@ def run(args: argparse.Namespace) -> None:
         f"feature_window_s={args.feature_window_s} feature_overlap_s={args.feature_overlap_s}",
         flush=True,
     )
-    ptm_extractor = build_ptm_feature_extractor(config)
+    ptm_extractor = None
     manifest_path = output_dir / "feature_manifest.jsonl"
     skipped_path = output_dir / "feature_skipped.jsonl"
     errors_path = output_dir / "feature_errors.jsonl"
@@ -456,6 +535,7 @@ def run(args: argparse.Namespace) -> None:
     skipped_count = _write_jsonl_file(skipped_path, skipped) if not args.resume else _write_jsonl_file(skipped_path, skipped)
     error_count = _count_unresolved_error_rows(errors_path, existing_indexes) if args.resume else 0
     try:
+        ptm_extractor = build_ptm_feature_extractor(config)
         first_parameter = next(ptm_extractor.model.parameters())
         actual_device = str(first_parameter.device)
         model_path = getattr(ptm_extractor, "model_path", "")
@@ -478,6 +558,43 @@ def run(args: argparse.Namespace) -> None:
                 )
             except Exception as exc:
                 print(f"cuda_memory_check_error={exc}", flush=True)
+        del first_parameter
+        if uses_cuda:
+            import torch
+
+            warmup_features = ptm_extractor.extract_batch(
+                [np.zeros(16000, dtype=np.float32)], sample_rate=16000
+            )
+            del warmup_features
+            torch.cuda.synchronize()
+            torch.cuda.empty_cache()
+            memory_diagnostics["execution_baseline"] = reset_shared_vram_baseline(
+                required=True
+            )
+            memory_diagnostics["execution_baseline"]["stage"] = "execution_baseline"
+            print(
+                "memory_snapshot="
+                + json.dumps(
+                    memory_diagnostics["execution_baseline"],
+                    ensure_ascii=False,
+                    sort_keys=True,
+                ),
+                flush=True,
+            )
+            torch.cuda.reset_peak_memory_stats()
+        memory_diagnostics["post_load"] = _cache_memory_snapshot(
+            stage="post_load", uses_cuda=uses_cuda
+        )
+        _update_peak_memory(
+            memory_diagnostics["runtime_peak"], memory_diagnostics["post_load"]
+        )
+        print(
+            "memory_snapshot="
+            + json.dumps(
+                memory_diagnostics["post_load"], ensure_ascii=False, sort_keys=True
+            ),
+            flush=True,
+        )
         batch_size = max(1, int(args.batch_size))
         prepare_workers = max(0, int(args.prepare_workers))
         batch_starts = list(range(0, len(selected_examples), batch_size))
@@ -659,12 +776,51 @@ def run(args: argparse.Namespace) -> None:
                             f"{len(selected_examples)} error={exc}",
                             flush=True,
                         )
+                    batch_memory = _cache_memory_snapshot(
+                        stage=f"batch_{batch_number}", uses_cuda=uses_cuda
+                    )
+                    _update_peak_memory(
+                        memory_diagnostics["runtime_peak"], batch_memory
+                    )
+                    if log_batch:
+                        print(
+                            "memory_snapshot="
+                            + json.dumps(
+                                batch_memory, ensure_ascii=False, sort_keys=True
+                            ),
+                            flush=True,
+                        )
                     future = next_future
         finally:
             if executor is not None:
                 executor.shutdown(wait=True)
     finally:
-        ptm_extractor.close()
+        if ptm_extractor is not None:
+            ptm_extractor.close()
+            ptm_extractor = None
+        gc.collect()
+        if uses_cuda:
+            import torch
+
+            torch.cuda.empty_cache()
+            try:
+                torch.cuda.ipc_collect()
+            except RuntimeError:
+                pass
+        memory_diagnostics["post_release"] = _cache_memory_snapshot(
+            stage="post_release",
+            uses_cuda=uses_cuda,
+            validate=sys.exc_info()[0] is None,
+        )
+        print(
+            "memory_snapshot="
+            + json.dumps(
+                memory_diagnostics["post_release"],
+                ensure_ascii=False,
+                sort_keys=True,
+            ),
+            flush=True,
+        )
 
     error_count = _count_unresolved_error_rows(errors_path, existing_indexes)
     summary = {
@@ -686,6 +842,7 @@ def run(args: argparse.Namespace) -> None:
         "feature_overlap_s": float(args.feature_overlap_s),
         "ptm_window_batch_size": int(args.ptm_window_batch_size),
         "batch_log_every": int(args.batch_log_every),
+        "memory_diagnostics": memory_diagnostics,
     }
     summary_path.write_text(
         json.dumps(summary, ensure_ascii=False, indent=2, sort_keys=True),

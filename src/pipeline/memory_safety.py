@@ -142,6 +142,24 @@ def shared_vram_snapshot(*, pid: int | None = None, required: bool = False) -> d
     }
 
 
+def reset_shared_vram_baseline(
+    *, pid: int | None = None, required: bool = False
+) -> dict[str, Any]:
+    process_id = int(pid or os.getpid())
+    snapshot = shared_vram_snapshot(pid=process_id, required=required)
+    raw_shared_mb = snapshot.get("shared_vram_mb")
+    if isinstance(raw_shared_mb, (int, float)):
+        baseline_mb = float(raw_shared_mb)
+        _SHARED_VRAM_BASELINE_BY_PID[process_id] = baseline_mb
+        return {
+            **snapshot,
+            "shared_vram_raw_mb": round(baseline_mb, 3),
+            "shared_vram_baseline_mb": round(baseline_mb, 3),
+            "shared_vram_mb": 0.0,
+        }
+    return snapshot
+
+
 def runtime_memory_snapshot(*, require_shared_vram: bool = False) -> dict[str, Any]:
     try:
         ratio = float(os.getenv("ASR_STAGE_WORKER_RAM_RATIO", "0.95"))
