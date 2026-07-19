@@ -43,6 +43,15 @@ def test_checkpoint_audit_span_rows_and_selection_include_required_residuals() -
             "false_positive_frames": 2,
         },
         {
+            "source_id": "train-partial-fn",
+            "partition": "train",
+            "category": "speech_edge_or_partial",
+            "true_speech_deletions": 0,
+            "max_predicted_speech_run_s": 1.0,
+            "false_negative_frames": 1,
+            "false_positive_frames": 0,
+        },
+        {
             "source_id": "test-long",
             "partition": "test",
             "category": "normal",
@@ -54,7 +63,7 @@ def test_checkpoint_audit_span_rows_and_selection_include_required_residuals() -
     ]
     assert {
         row["source_id"] for row in _select_audit_rows(rows, max_items=0)
-    } == {"train-delete", "val-bg", "test-long"}
+    } == {"train-delete", "val-bg", "train-partial-fn", "test-long"}
 
 
 def test_prediction_audit_html_is_exact_span_and_saveable(tmp_path: Path) -> None:

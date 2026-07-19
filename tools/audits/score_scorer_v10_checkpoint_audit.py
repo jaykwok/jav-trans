@@ -172,6 +172,7 @@ def _select_audit_rows(rows: Iterable[dict[str, Any]], *, max_items: int) -> lis
         row
         for row in rows
         if row["true_speech_deletions"] > 0
+        or row["false_negative_frames"] > 0
         or (
             row["partition"] in {"val", "test"}
             and (
