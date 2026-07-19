@@ -181,8 +181,15 @@ def test_prepare_rejects_background_video_partition_leakage(tmp_path: Path) -> N
         )
 
 
+@pytest.mark.parametrize(
+    "gate_schema",
+    [
+        "speech_scorer_v10_canonical_manual_gate_v1",
+        "speech_scorer_v10_corrected_canonical_manual_gate_v1",
+    ],
+)
 def test_finalize_requires_raw_17b_features_and_replays_trainer_contract(
-    tmp_path: Path,
+    tmp_path: Path, gate_schema: str
 ) -> None:
     _summary, prepared = _prepare_fixture(tmp_path)
     sources = [
@@ -218,11 +225,12 @@ def test_finalize_requires_raw_17b_features_and_replays_trainer_contract(
     gate_summary.write_text(
         json.dumps(
             {
-                "schema": "speech_scorer_v10_canonical_manual_gate_v1",
+                "schema": gate_schema,
                 "canonical_sources_sha256": hashlib.sha256(
                     (prepared / "canonical_sources.jsonl").read_bytes()
                 ).hexdigest(),
                 "manual_gate_pass": True,
+                "training_manifest_allowed": True,
             }
         ),
         encoding="utf-8",
@@ -263,6 +271,7 @@ def test_finalize_rejects_pending_manual_gate(tmp_path: Path) -> None:
                     (prepared / "canonical_sources.jsonl").read_bytes()
                 ).hexdigest(),
                 "manual_gate_pass": False,
+                "training_manifest_allowed": False,
             }
         ),
         encoding="utf-8",

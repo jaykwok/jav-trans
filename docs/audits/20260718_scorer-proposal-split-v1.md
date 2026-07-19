@@ -20,7 +20,7 @@ The dataset has `53,760` manifest rows but only `33,096` unique audio/feature pa
 
 The existing experimental v9 is not an acceptable drop-in: its membership head is `outside/inside/unsure` and runtime treats every non-`outside` argmax as retained. It is therefore still a three-state teacher/runtime alias, not the required binary argmax contract.
 
-The replacement contract is a new repo-bound two-logit scorer (v10): `background/speech` argmax, unsure mapped to ignore in training only, raw PTM2048 with a checkpoint-owned Linear128, MFCC40 and relative position, bidirectional sequence context, no sigmoid operating threshold, no dilation, no duration rule and no fallback. The follow-up canonical audit has now compiled fixed1024 Galgame speech cores plus partitioned CueQC/Omni definite-drop gaps, overlays and all-background controls; raw PTM2048 cache, fixed24 listening verdicts and training remain pending. No training was started in this stage.
+The replacement contract is a new repo-bound two-logit scorer (v10): `background/speech` argmax, unsure mapped to ignore in training only, raw PTM2048 with a checkpoint-owned Linear128, MFCC40 and relative position, bidirectional sequence context, no sigmoid operating threshold, no dilation, no duration rule and no fallback. The fixed1024 canonical audit compiled Galgame speech cores plus partitioned CueQC/Omni definite-drop gaps, overlays and all-background controls, then quarantined four contaminated background assets and their affected composites through two replacement rounds. Corrected r2 now passes the complete listening evidence chain at `2665 sources / 2042 definite cores / max core use=1`; raw PTM2048 cache and training have not started.
 
 ## Proposal
 
@@ -48,4 +48,4 @@ The previous trainer only guaranteed group-level partition isolation. It now rej
 
 ### Decision
 
-Do not train or alter 0.6B. Do not promote Scorer v8, experimental v9, or Proposal v1 as a new decision chain. Continue with the 1.7B Scorer v10 fixed24 canonical listening gate and raw PTM2048 cache, then train/gate v10 before regenerating the actual Outer v3 distribution.
+Do not train or alter 0.6B. Do not promote Scorer v8, experimental v9, or Proposal v1 as a new decision chain. Continue with a resource-checked 1.7B Scorer v10 raw PTM2048 cache smoke and full cache, then train/gate v10 before regenerating the actual Outer v3 distribution.

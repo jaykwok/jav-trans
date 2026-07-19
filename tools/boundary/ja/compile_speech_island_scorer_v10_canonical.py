@@ -474,13 +474,18 @@ def finalize_dataset(
     output_dir: Path,
 ) -> dict[str, Any]:
     gate = json.loads(manual_gate_summary.read_text(encoding="utf-8-sig"))
-    if gate.get("schema") != "speech_scorer_v10_canonical_manual_gate_v1":
+    if gate.get("schema") not in {
+        "speech_scorer_v10_canonical_manual_gate_v1",
+        "speech_scorer_v10_corrected_canonical_manual_gate_v1",
+    }:
         raise ValueError("Scorer v10 canonical finalize requires the manual gate schema")
     canonical_sha256 = hashlib.sha256(canonical_sources.read_bytes()).hexdigest()
     if gate.get("canonical_sources_sha256") != canonical_sha256:
         raise ValueError("Scorer v10 canonical manual gate is bound to another manifest")
     if gate.get("manual_gate_pass") is not True:
         raise ValueError("Scorer v10 canonical manual gate has not passed")
+    if gate.get("training_manifest_allowed") is not True:
+        raise ValueError("Scorer v10 canonical gate does not authorize a training manifest")
     sources = _read_jsonl(canonical_sources)
     dataset_summary = _validate_sources(sources)
     features: dict[str, dict[str, Any]] = {}
