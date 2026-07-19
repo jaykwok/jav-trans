@@ -4,7 +4,7 @@
 
 ## Decision
 
-Scorer v10 的断兼容 schema、两 logit模型、argmax decoder、严格 dataset validator 和 random-init trainer plumbing 可以保留；production registry 与 `segment()` 继续 fail-fast 为 `pending_binary_scorer_audit`。没有启动 GPU 或真实训练，也没有可晋升 checkpoint。
+Scorer v10 的断兼容 schema、两 logit模型、argmax decoder、严格 dataset validator 和 random-init trainer plumbing 已完成真实 full training；checkpoint candidate 存在但 numeric/manual gate 未通过，production registry 与 `segment()` 继续 fail-fast 为 `pending_binary_scorer_audit`。
 
 ## Why v8/v9 cannot continue
 
@@ -48,7 +48,7 @@ The fixed1024 sources already contain the required hard distribution:
 
 The compiler rejects background video/asset or core identity crossing partitions, non-strict negative assets, missing audio, missing/old central contracts and non-1.7B/non-PTM2048 feature caches. The 1542 background assets reused as augmentation and isolated controls remain inside the same frozen partition; this is reported explicitly and creates no train/held-out crossing. `unsure` remains in canonical assets but is zero-weighted for feature-cache statistics and maps to `-100` for normalization, loss, metrics and gate. Finalization also requires a passing manual-gate summary bound to the exact canonical manifest SHA, so merely generating the audit page cannot unlock a trainer manifest.
 
-This is now a manually gated canonical source plan, not a trained-dataset or model claim. Raw 1.7B PTM2048+MFCC40 feature cache and the final trainer manifest do not exist yet.
+This is now a manually gated canonical source plan with a completed raw cache and trainer manifest; it is not a model-promotion claim. The full checkpoint candidate remains gate-failed.
 
 ## Plumbing smoke
 
@@ -76,6 +76,10 @@ Batch equivalence was checked on the same two sources. Sending both variable-len
 
 The full cache was finalized into `agents/temp/20260719_112128_scorer-v10-corrected-r2-training-manifest/` with `2665` rows, `2042` unique cores, max core use `1`, and `2064` unsure frames excluded from normalization/loss/metrics. A one-step CUDA smoke at `agents/temp/20260719_114236_scorer-v10-real-canonical-train-smoke-s1/` used the actual manifest, random initialization (`seed=17`), weighted cross entropy and binary argmax. It had zero true-speech deletion in the short smoke (`val start/end=100/98.51%`, `test=100/95.10%`) but is explicitly `numeric_gate_pass=false / gate_pass=false / promotion_ready=false` and is not a production checkpoint.
 
-The trainer now warms the exact forward/backward/loss/evaluator paths, then resets only the execution shared-memory baseline. It computes evaluator metrics with GPU argmax and scalar transfers instead of copying full prediction arrays to CPU. The first `max_batch_frames=4096` full-run attempt was rejected by CUDA OOM on a `7×578` shuffled batch; no CPU fallback or enlarged config was used. With frame budget `1024` (rows above the budget remain complete singletons), both the ordinary smoke and a seed `975` smoke forcing the maximum `1643`-frame singleton passed: shared increment remained `0.0 MiB`, and the long-singleton smoke peak CUDA reserved was `4082 MiB`. Full training still requires a serial 3000-step run followed by held-out, >8-second residual and zero-clipping/zero-true-speech-deletion human audit; no registry promotion is implied.
+The trainer now warms the exact forward/backward/loss/evaluator paths, then resets only the execution shared-memory baseline. It computes evaluator metrics with GPU argmax and scalar transfers instead of copying full prediction arrays to CPU. The first `max_batch_frames=4096` full-run attempt was rejected by CUDA OOM on a `7×578` shuffled batch; no CPU fallback or enlarged config was used. With frame budget `1024` (rows above the budget remain complete singletons), both the ordinary smoke and a seed `975` smoke forcing the maximum `1643`-frame singleton passed: shared increment remained `0.0 MiB`, and the long-singleton smoke peak CUDA reserved was `4082 MiB`.
+
+Full 3000-step training completed at `agents/temp/20260719_115127_scorer-v10-corrected-r2-train-full-frame1024/`, checkpoint SHA256=`509d35e4179456f5c9b0cd42957a4c23cb7767ee093909ce631dee70495da2c5`, best step=`2750`. Test start/end coverage=`100/99.02%`, background-drop recall=`95.54%`; val=`99.00/98.01%`, background-drop recall=`92.75%`; true-speech deletion was zero on both partitions. The val background-drop miss keeps `numeric_gate_pass=false / gate_pass=false / promotion_ready=false`.
+
+Singleton checkpoint audit at `agents/temp/20260719_115933_scorer-v10-checkpoint-audit/` scored all `2665` rows with zero shared increment. It found one row-level true-speech deletion, `24` val/test all-background false-keeps, `100` val/test speech edge/partial rows and `15` predicted speech runs longer than 8 seconds. The exact-span page `agents/audits/20260719_120643_scorer-v10-prediction-residuals-frame1024/` contains `140` selected cards and saves `speech_scorer_v10_prediction_manual_verdict_v1`; all manual verdicts remain pending.
 
 After a real v10 model exists, the same audit framework must generate pages for every prediction-drop/truth-speech case, all held-out hard cases, edge clipping and every greater-than-8-second residual. Numeric gates are capped at 95%; zero clipping and zero true-speech deletion require saved human verdicts before promotion.
