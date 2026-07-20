@@ -296,8 +296,19 @@ render();
     )
 
 
-def build_audit(*, selection: Path, output_dir: Path) -> Path:
+def build_audit(
+    *,
+    selection: Path,
+    output_dir: Path,
+    source_ids: set[str] | None = None,
+) -> Path:
     rows = _rows(selection)
+    if source_ids is not None:
+        available = {str(row.get("source_id") or "") for row in rows}
+        missing = sorted(source_ids - available)
+        if missing:
+            raise ValueError(f"Scorer v10 prediction audit source filter is missing: {missing}")
+        rows = [row for row in rows if str(row.get("source_id") or "") in source_ids]
     if not rows:
         raise ValueError("Scorer v10 prediction audit selection is empty")
     category_priority = {
@@ -332,6 +343,8 @@ def build_audit(*, selection: Path, output_dir: Path) -> Path:
     payload: list[dict[str, Any]] = []
     for index, row in enumerate(rows):
         source = Path(str(row["audio"]))
+        if not source.is_file() and not source.is_absolute():
+            source = selection.parent / source
         if not source.is_file():
             raise ValueError(f"Scorer v10 audit audio is missing: {source}")
         destination = audio_dir / f"item-{index:03d}{source.suffix.lower()}"
@@ -382,6 +395,7 @@ def build_audit(*, selection: Path, output_dir: Path) -> Path:
         "review_item_count": len(payload),
         "category_counts": dict(Counter(str(row["category"]) for row in payload)),
         "selection": str(selection),
+        "source_filter": sorted(source_ids or ()),
         "audit_manifest": str(manifest),
         "selection_contract": (
             CHECKPOINT_AB_REMAINING_DROP_CONTRACT
@@ -411,9 +425,16 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--selection", required=True)
     parser.add_argument("--output-dir", required=True)
+    parser.add_argument("--only-source-id", action="append", default=[])
     return parser.parse_args()
 
 
 if __name__ == "__main__":
     args = parse_args()
-    print(build_audit(selection=Path(args.selection), output_dir=Path(args.output_dir)))
+    print(
+        build_audit(
+            selection=Path(args.selection),
+            output_dir=Path(args.output_dir),
+            source_ids=set(args.only_source_id) if args.only_source_id else None,
+        )
+    )

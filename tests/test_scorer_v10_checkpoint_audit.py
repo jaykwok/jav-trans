@@ -160,6 +160,54 @@ def test_prediction_audit_html_is_exact_span_and_saveable(tmp_path: Path) -> Non
         assert parsed.returncode == 0, parsed.stderr
 
 
+def test_prediction_audit_filters_source_and_resolves_selection_relative_audio(
+    tmp_path: Path,
+) -> None:
+    audio_dir = tmp_path / "audio"
+    audio_dir.mkdir()
+    (audio_dir / "item.wav").write_bytes(b"RIFF-test")
+    selection = tmp_path / "selection.jsonl"
+    rows = []
+    for source_id in ("keep", "skip"):
+        rows.append(
+            {
+                "source_id": source_id,
+                "partition": "test",
+                "row_role": "all_background",
+                "category": "background_false_keep",
+                "audio": "audio/item.wav",
+                "duration_s": 1.0,
+                "false_negative_frames": 0,
+                "false_positive_frames": 1,
+                "max_predicted_speech_run_s": 0.1,
+                "truth_spans": [
+                    {"label": "truth_background", "start_s": 0.0, "end_s": 1.0}
+                ],
+                "prediction_spans": [
+                    {"label": "model_speech", "start_s": 0.4, "end_s": 0.5}
+                ],
+                "true_speech_deletions": 0,
+            }
+        )
+    selection.write_text(
+        "".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8"
+    )
+
+    output = tmp_path / "audit-filtered"
+    build_audit(selection=selection, output_dir=output, source_ids={"keep"})
+    manifest = [
+        json.loads(line)
+        for line in (output / "audit_manifest.jsonl")
+        .read_text(encoding="utf-8")
+        .splitlines()
+    ]
+    summary = json.loads((output / "summary.json").read_text(encoding="utf-8"))
+
+    assert [row["source_id"] for row in manifest] == ["keep"]
+    assert summary["source_filter"] == ["keep"]
+    assert (output / "audio" / "item-000.wav").is_file()
+
+
 def test_prediction_audit_derives_exact_truth_drop_spans() -> None:
     row = {
         "truth_spans": [
