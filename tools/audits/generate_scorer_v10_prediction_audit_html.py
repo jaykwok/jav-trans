@@ -20,6 +20,9 @@ from tools.audits.audit_nav import update_audit_entrypoints  # noqa: E402
 FRAME_HOP_S = 0.02
 SUMMARY_SCHEMA = "speech_scorer_v10_prediction_audit_summary_v2"
 VERDICT_SCHEMA = "speech_scorer_v10_prediction_manual_verdict_v2"
+CHECKPOINT_AB_EXTRA_DROP_CONTRACT = (
+    "candidate_extra_false_negative_vs_baseline_v1"
+)
 
 
 def _rows(path: Path) -> list[dict[str, Any]]:
@@ -81,6 +84,46 @@ def truth_drop_spans(row: dict[str, Any]) -> list[dict[str, Any]]:
     return dropped
 
 
+def audit_truth_drop_spans(row: dict[str, Any]) -> list[dict[str, Any]]:
+    """Return either the full drop set or a validated checkpoint-A/B subset."""
+
+    computed = truth_drop_spans(row)
+    override = row.get("audit_truth_drop_spans")
+    if override is None:
+        return computed
+    if row.get("audit_truth_drop_contract") != CHECKPOINT_AB_EXTRA_DROP_CONTRACT:
+        raise ValueError("Scorer v10 audit truth-drop override requires the A/B contract")
+    if not isinstance(override, list) or not override:
+        raise ValueError("Scorer v10 A/B audit truth-drop override must not be empty")
+    frame_count = int(row.get("frame_count") or 0)
+    if frame_count <= 0:
+        raise ValueError("Scorer v10 A/B audit rows require frame_count")
+    allowed = [False] * frame_count
+    for span in computed:
+        for index in range(int(span["start_frame"]), int(span["end_frame"])):
+            allowed[index] = True
+    normalized: list[dict[str, Any]] = []
+    previous_end = -1
+    for span in sorted(override, key=lambda item: (int(item["start_frame"]), int(item["end_frame"]))):
+        start = int(span["start_frame"])
+        end = int(span["end_frame"])
+        if start < 0 or end <= start or end > frame_count or start < previous_end:
+            raise ValueError("Scorer v10 A/B audit truth-drop spans are invalid or overlapping")
+        if not all(allowed[start:end]):
+            raise ValueError("Scorer v10 A/B audit truth-drop span is not a candidate drop")
+        normalized.append(
+            {
+                "label": "truth_speech_model_background",
+                "start_frame": start,
+                "end_frame": end,
+                "start_s": start * FRAME_HOP_S,
+                "end_s": end * FRAME_HOP_S,
+            }
+        )
+        previous_end = end
+    return normalized
+
+
 def _render_page(payload: list[dict[str, Any]]) -> str:
     encoded = (
         json.dumps(payload, ensure_ascii=False)
@@ -89,6 +132,15 @@ def _render_page(payload: list[dict[str, Any]]) -> str:
         .replace("\u2029", "\\u2029")
     )
     schema = json.dumps(VERDICT_SCHEMA)
+    checkpoint_ab_mode = all(
+        row.get("audit_truth_drop_contract") == CHECKPOINT_AB_EXTRA_DROP_CONTRACT
+        for row in payload
+    )
+    scope_note = (
+        "<div><b>本页 A/B 合同：</b>红色只显示新候选相对 baseline 新增的 canonical-speech drop 差集；旧候选已经出现过的红段不在本页重复审计。蓝色仍是新候选完整实际输出。</div>"
+        if checkpoint_ab_mode
+        else ""
+    )
     return (
         """<!doctype html>
 <html lang="zh-CN">
@@ -128,6 +180,7 @@ small{color:var(--muted)}h2{font-size:18px;margin:0 0 4px;overflow-wrap:anywhere
 </header>
 <main>
   <section>
+    __SCOPE_NOTE__
     <div><b>实际工作流：</b>蓝色是 Scorer 二分类 argmax=speech，会成为独立 downstream island；不做 threshold、gap merge 或时长规则。红色是 canonical truth_speech 中被模型判为 background、实际不会送出的精确区间。绿色/黄色是完整 canonical speech/background，整条 source 播放器只用于判断上下文。</div>
     <div><b>播放合同：</b>每个色条只播放自身 start–end 后立即停止，不添加上下文。点击原生播放器可听整条 source。只需选择按钮，不要求备注。</div>
     <div class="guide">
@@ -197,8 +250,10 @@ function render(){
   for(const row of rows){
     if(filter!=='all'&&row.category!==filter)continue;
     const state=ensure(row),card=document.createElement('article');card.dataset.auditId=row.audit_id;if(state.verdict)card.classList.add('done');
-    const dropped=(row.truth_drop_spans||[]).length?`<h3>实际未送出（红色：truth_speech ∩ model_background）</h3><div class="track">${spans(row,row.truth_drop_spans)}</div>`:'';
-    card.innerHTML=`<h2>${esc(row.source_id)}</h2><small>${esc(row.partition)} / ${esc(row.row_role)} / ${esc(row.category)} / duration=${Number(row.duration_s).toFixed(2)}s / FN=${row.false_negative_frames} / FP=${row.false_positive_frames} / max model run=${Number(row.max_predicted_speech_run_s).toFixed(2)}s</small><h3>整条 source（仅供完整上下文）</h3><audio controls preload="none" src="${esc(row.audio)}"></audio><h3>canonical（绿色 speech / 黄色 background）</h3><div class="track">${spans(row,row.truth_spans)}</div>${dropped}<h3>实际候选工作流输出（蓝色 argmax=speech）</h3><div class="track">${spans(row,row.prediction_spans)}</div><div class="choices">${choices(row).map(choice=>`<button type="button" data-v="${choice[0]}" class="${riskVerdict(choice[0])?'risk ':''}${state.verdict===choice[0]?'active':''}">${choice[1]}</button>`).join('')}</div>`;
+    const isCheckpointAb=row.audit_truth_drop_contract==='candidate_extra_false_negative_vs_baseline_v1';
+    const dropped=(row.truth_drop_spans||[]).length?`<h3>${isCheckpointAb?'新候选额外未送出（红色：candidate drop - baseline drop）':'实际未送出（红色：truth_speech ∩ model_background）'}</h3><div class="track">${spans(row,row.truth_drop_spans)}</div>`:'';
+    const extraFn=row.candidate_extra_false_negative_frames==null?'':` / new FN=${row.candidate_extra_false_negative_frames}`;
+    card.innerHTML=`<h2>${esc(row.source_id)}</h2><small>${esc(row.partition)} / ${esc(row.row_role)} / ${esc(row.category)} / duration=${Number(row.duration_s).toFixed(2)}s / FN=${row.false_negative_frames}${extraFn} / FP=${row.false_positive_frames} / max model run=${Number(row.max_predicted_speech_run_s).toFixed(2)}s</small><h3>整条 source（仅供完整上下文）</h3><audio controls preload="none" src="${esc(row.audio)}"></audio><h3>canonical（绿色 speech / 黄色 background）</h3><div class="track">${spans(row,row.truth_spans)}</div>${dropped}<h3>实际候选工作流输出（蓝色 argmax=speech）</h3><div class="track">${spans(row,row.prediction_spans)}</div><div class="choices">${choices(row).map(choice=>`<button type="button" data-v="${choice[0]}" class="${riskVerdict(choice[0])?'risk ':''}${state.verdict===choice[0]?'active':''}">${choice[1]}</button>`).join('')}</div>`;
     const audio=card.querySelector('audio');
     audio.addEventListener('play',()=>{if(activeAudio&&activeAudio!==audio)stopPlayback();activeAudio=audio;});
     audio.addEventListener('ended',stopPlayback);
@@ -225,6 +280,7 @@ render();
 </html>"""
         .replace("__ROWS__", encoded)
         .replace("__VERDICT_SCHEMA__", schema)
+        .replace("__SCOPE_NOTE__", scope_note)
     )
 
 
@@ -280,7 +336,7 @@ def build_audit(*, selection: Path, output_dir: Path) -> Path:
                 "category": category,
                 "audit_id": f"{category}:{row['source_id']}",
                 "audio": destination.relative_to(output_dir).as_posix(),
-                "truth_drop_spans": truth_drop_spans(row),
+                "truth_drop_spans": audit_truth_drop_spans(row),
             }
         )
     page = _render_page(payload)
@@ -291,16 +347,28 @@ def build_audit(*, selection: Path, output_dir: Path) -> Path:
         "".join(json.dumps(row, ensure_ascii=False) + "\n" for row in payload),
         encoding="utf-8",
     )
+    checkpoint_ab_mode = all(
+        row.get("audit_truth_drop_contract") == CHECKPOINT_AB_EXTRA_DROP_CONTRACT
+        for row in payload
+    )
     summary = {
         "schema": SUMMARY_SCHEMA,
-        "title": "Scorer v10 prediction residual audit",
+        "title": (
+            "Scorer v10 checkpoint A/B extra-drop audit"
+            if checkpoint_ab_mode
+            else "Scorer v10 prediction residual audit"
+        ),
         "review_item_count": len(payload),
         "category_counts": dict(Counter(str(row["category"]) for row in payload)),
         "selection": str(selection),
         "audit_manifest": str(manifest),
         "selection_contract": (
-            "all_truth_keep_model_drop_rows_plus_all_heldout_hard_cases_"
-            "plus_all_over_8s_residuals"
+            CHECKPOINT_AB_EXTRA_DROP_CONTRACT
+            if checkpoint_ab_mode
+            else (
+                "all_truth_keep_model_drop_rows_plus_all_heldout_hard_cases_"
+                "plus_all_over_8s_residuals"
+            )
         ),
         "exact_truth_drop_playback": True,
         "manual_verdict_schema": VERDICT_SCHEMA,

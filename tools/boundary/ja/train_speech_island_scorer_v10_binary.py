@@ -299,6 +299,48 @@ def predicted_run_structure(predicted_speech) -> dict[str, int]:
     }
 
 
+def internal_background_run_structure(
+    canonical_labels: np.ndarray, predicted_speech: np.ndarray
+) -> dict[str, int]:
+    """Measure argmax false keeps inside speech-bracketed background runs."""
+
+    canonical = np.asarray(canonical_labels, dtype=np.int64).reshape(-1)
+    predicted = np.asarray(predicted_speech, dtype=bool).reshape(-1)
+    if canonical.shape != predicted.shape:
+        raise ValueError("Scorer v10 internal-background arrays must have equal shape")
+    run_count = fully_dropped = false_keep_frames = false_keep_islands = 0
+    for start, end in _runs(canonical == 0):
+        if not np.any(canonical[:start] == 1) or not np.any(canonical[end:] == 1):
+            continue
+        run_count += 1
+        run_prediction = predicted[start:end]
+        false_keep_frames += int(np.sum(run_prediction))
+        islands = len(_runs(run_prediction))
+        false_keep_islands += islands
+        fully_dropped += int(islands == 0)
+    independent_false_keep_frames = 0
+    independent_false_keep_islands = 0
+    for start, end in _runs(predicted):
+        if not np.all(canonical[start:end] == 0):
+            continue
+        if not np.any(canonical[:start] == 1) or not np.any(canonical[end:] == 1):
+            continue
+        independent_false_keep_islands += 1
+        independent_false_keep_frames += end - start
+    return {
+        "internal_background_run_count": run_count,
+        "fully_dropped_internal_background_run_count": fully_dropped,
+        "internal_background_false_keep_frame_count": false_keep_frames,
+        "internal_background_false_keep_island_count": false_keep_islands,
+        "independent_internal_background_false_keep_frame_count": (
+            independent_false_keep_frames
+        ),
+        "independent_internal_background_false_keep_island_count": (
+            independent_false_keep_islands
+        ),
+    }
+
+
 def speech_continuity_auxiliary_loss(logits, target):
     """Penalize learned speech-probability jumps only inside true speech runs."""
 
@@ -356,6 +398,39 @@ def sequence_worst_frame_auxiliary_loss(logits, target, canonical_labels):
     return torch.stack(terms).mean(), len(terms)
 
 
+def internal_background_run_worst_frame_auxiliary_loss(
+    logits, target, canonical_labels
+):
+    """Focus on hard background runs bracketed by canonical speech.
+
+    This is a training-only learned loss.  It does not merge short islands or
+    introduce a duration/threshold rule at runtime.
+    """
+
+    import torch
+    import torch.nn.functional as F
+
+    if logits.ndim != 3 or logits.shape[-1] != 2:
+        raise ValueError(
+            "Scorer v10 internal-background logits must have shape [batch,frames,2]"
+        )
+    if target.shape != logits.shape[:2] or canonical_labels.shape != target.shape:
+        raise ValueError("Scorer v10 internal-background target shape mismatch")
+    terms = []
+    for index in range(int(logits.shape[0])):
+        labels_cpu = canonical_labels[index].numpy()
+        for start, end in _runs(labels_cpu == 0):
+            if not np.any(labels_cpu[:start] == 1) or not np.any(labels_cpu[end:] == 1):
+                continue
+            losses = F.cross_entropy(
+                logits[index, start:end], target[index, start:end], reduction="none"
+            )
+            terms.append(torch.max(losses))
+    if not terms:
+        return logits.sum() * 0.0, 0
+    return torch.stack(terms).mean(), len(terms)
+
+
 def evaluate(model, rows, device, *, max_padded_frames: int, tolerance_frames: int):
     import torch
 
@@ -366,6 +441,12 @@ def evaluate(model, rows, device, *, max_padded_frames: int, tolerance_frames: i
     continuous_speech_runs = fragmented_speech_runs = 0
     predicted_runs_within_truth = 0
     internal_drop_gap_count = internal_drop_frame_count = 0
+    internal_background_run_count = 0
+    fully_dropped_internal_background_run_count = 0
+    internal_background_false_keep_frame_count = 0
+    internal_background_false_keep_island_count = 0
+    independent_internal_background_false_keep_frame_count = 0
+    independent_internal_background_false_keep_island_count = 0
     start_errors: list[int] = []
     end_errors: list[int] = []
     model.eval()
@@ -383,6 +464,32 @@ def evaluate(model, rows, device, *, max_padded_frames: int, tolerance_frames: i
                 truth = labels_device[index, :length]
                 valid = truth != IGNORE_INDEX
                 predicted = predictions[index, :length]
+                internal_background = internal_background_run_structure(
+                    truth_cpu,
+                    predicted.detach().cpu().numpy() == 1,
+                )
+                internal_background_run_count += internal_background[
+                    "internal_background_run_count"
+                ]
+                fully_dropped_internal_background_run_count += internal_background[
+                    "fully_dropped_internal_background_run_count"
+                ]
+                internal_background_false_keep_frame_count += internal_background[
+                    "internal_background_false_keep_frame_count"
+                ]
+                internal_background_false_keep_island_count += internal_background[
+                    "internal_background_false_keep_island_count"
+                ]
+                independent_internal_background_false_keep_frame_count += (
+                    internal_background[
+                        "independent_internal_background_false_keep_frame_count"
+                    ]
+                )
+                independent_internal_background_false_keep_island_count += (
+                    internal_background[
+                        "independent_internal_background_false_keep_island_count"
+                    ]
+                )
                 tp += int(torch.sum((predicted == 1) & (truth == 1) & valid).item())
                 fp += int(torch.sum((predicted == 1) & (truth == 0) & valid).item())
                 fn += int(torch.sum((predicted == 0) & (truth == 1) & valid).item())
@@ -437,6 +544,26 @@ def evaluate(model, rows, device, *, max_padded_frames: int, tolerance_frames: i
         "prediction_to_truth_run_ratio": predicted_runs_within_truth / max(speech_runs, 1),
         "internal_drop_gap_count": internal_drop_gap_count,
         "internal_drop_frame_count": internal_drop_frame_count,
+        "internal_background_run_count": internal_background_run_count,
+        "fully_dropped_internal_background_run_count": (
+            fully_dropped_internal_background_run_count
+        ),
+        "internal_background_run_drop_recall": (
+            fully_dropped_internal_background_run_count
+            / max(internal_background_run_count, 1)
+        ),
+        "internal_background_false_keep_frame_count": (
+            internal_background_false_keep_frame_count
+        ),
+        "internal_background_false_keep_island_count": (
+            internal_background_false_keep_island_count
+        ),
+        "independent_internal_background_false_keep_frame_count": (
+            independent_internal_background_false_keep_frame_count
+        ),
+        "independent_internal_background_false_keep_island_count": (
+            independent_internal_background_false_keep_island_count
+        ),
     }
 
 
@@ -516,6 +643,44 @@ def numeric_gate_pass(val: dict[str, Any], test: dict[str, Any]) -> bool:
     )
 
 
+def checkpoint_selection_score(metrics: dict[str, Any]) -> tuple[float, ...]:
+    """Prefer safe checkpoints, then learned removal of independent false keeps."""
+
+    safety_floor = min(
+        float(metrics["start_coverage"]),
+        float(metrics["end_coverage"]),
+        float(metrics["background_drop_recall"]),
+        float(metrics["speech_run_continuity"]),
+    )
+    zero_deletion = float(int(metrics["true_speech_deletion_count"]) == 0)
+    safety_gate_pass = float(
+        zero_deletion == 1.0 and safety_floor >= 0.95
+    )
+    false_keep_islands = float(
+        metrics["independent_internal_background_false_keep_island_count"]
+    )
+    false_keep_frames = float(
+        metrics["independent_internal_background_false_keep_frame_count"]
+    )
+    if safety_gate_pass:
+        return (
+            zero_deletion,
+            safety_gate_pass,
+            -false_keep_islands,
+            -false_keep_frames,
+            safety_floor,
+            float(metrics["speech_recall"]),
+        )
+    return (
+        zero_deletion,
+        safety_gate_pass,
+        safety_floor,
+        -false_keep_islands,
+        -false_keep_frames,
+        float(metrics["speech_recall"]),
+    )
+
+
 def run(args: argparse.Namespace) -> dict[str, Any]:
     import torch
     import torch.nn.functional as F
@@ -524,6 +689,10 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         raise ValueError("--continuity-weight must be non-negative")
     if args.worst_frame_weight < 0.0:
         raise ValueError("--worst-frame-weight must be non-negative")
+    if args.internal_background_worst_frame_weight < 0.0:
+        raise ValueError(
+            "--internal-background-worst-frame-weight must be non-negative"
+        )
 
     if args.ptm_repo_id != QWEN_ASR_17B_REPO_ID:
         raise ValueError("Scorer v10 is 1.7B-only")
@@ -633,10 +802,17 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         warmup_worst_loss, warmup_worst_terms = sequence_worst_frame_auxiliary_loss(
             warmup_logits, warmup_target, warmup_labels
         )
+        warmup_internal_background_loss, warmup_internal_background_terms = (
+            internal_background_run_worst_frame_auxiliary_loss(
+                warmup_logits, warmup_target, warmup_labels
+            )
+        )
         warmup_loss = (
             warmup_loss
             + float(args.continuity_weight) * warmup_continuity_loss
             + float(args.worst_frame_weight) * warmup_worst_loss
+            + float(args.internal_background_worst_frame_weight)
+            * warmup_internal_background_loss
         )
         warmup_optimizer.zero_grad(set_to_none=True)
         warmup_loss.backward()
@@ -675,6 +851,8 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             warmup_continuity_pairs,
             warmup_worst_loss,
             warmup_worst_terms,
+            warmup_internal_background_loss,
+            warmup_internal_background_terms,
             eval_warmup_val,
             eval_warmup_test,
         )
@@ -693,13 +871,15 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     )
     memory_snapshots.append(_memory_snapshot(device, stage="model_initialized"))
     _update_peak_memory(memory_peak, memory_snapshots[-1])
-    best_score = (-1.0, -1.0, -1.0)
+    best_score: tuple[float, ...] | None = None
     best_step = 0
     best_state = None
     losses: list[float] = []
     primary_losses: list[float] = []
     continuity_losses: list[float] = []
     worst_frame_losses: list[float] = []
+    internal_background_worst_frame_losses: list[float] = []
+    validation_history: list[dict[str, Any]] = []
     started = time.monotonic()
     for step in range(1, args.max_steps + 1):
         if (step - 1) % len(train_batches) == 0:
@@ -728,10 +908,17 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         worst_frame_loss, worst_frame_term_count = sequence_worst_frame_auxiliary_loss(
             logits, target, labels
         )
+        internal_background_worst_frame_loss, internal_background_term_count = (
+            internal_background_run_worst_frame_auxiliary_loss(
+                logits, target, labels
+            )
+        )
         loss = (
             primary_loss
             + float(args.continuity_weight) * continuity_loss
             + float(args.worst_frame_weight) * worst_frame_loss
+            + float(args.internal_background_worst_frame_weight)
+            * internal_background_worst_frame_loss
         )
         optimizer.zero_grad(set_to_none=True)
         loss.backward()
@@ -740,6 +927,9 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         primary_losses.append(float(primary_loss.detach().cpu()))
         continuity_losses.append(float(continuity_loss.detach().cpu()))
         worst_frame_losses.append(float(worst_frame_loss.detach().cpu()))
+        internal_background_worst_frame_losses.append(
+            float(internal_background_worst_frame_loss.detach().cpu())
+        )
         step_memory = _memory_snapshot(device, stage=f"train_step_{step}")
         _update_peak_memory(memory_peak, step_memory)
         if step % args.eval_interval == 0 or step == args.max_steps:
@@ -754,17 +944,11 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 _memory_snapshot(device, stage=f"validation_step_{step}")
             )
             _update_peak_memory(memory_peak, memory_snapshots[-1])
-            score = (
-                float(val["true_speech_deletion_count"] == 0),
-                min(
-                    val["start_coverage"],
-                    val["end_coverage"],
-                    val["background_drop_recall"],
-                    val["speech_run_continuity"],
-                ),
-                val["speech_recall"],
+            score = checkpoint_selection_score(val)
+            validation_history.append(
+                {"step": step, "selection_score": list(score), **val}
             )
-            if score > best_score:
+            if best_score is None or score > best_score:
                 best_score = score
                 best_step = step
                 best_state = {key: value.detach().cpu().clone() for key, value in model.state_dict().items()}
@@ -797,7 +981,9 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 "canonical_label_counts": dict(canonical_counts),
                 "excluded_training_count": int(canonical_counts["unsure"]),
                 "training_initialization": "random",
-                "checkpoint_selection": "val_binary_speech_edge_continuity_300ms_coverage_v2",
+                "checkpoint_selection": (
+                    "val_95pct_safety_then_independent_internal_background_false_keep_v3"
+                ),
                 "class_weights": {
                     "background": args.background_weight,
                     "speech": args.speech_weight,
@@ -810,6 +996,11 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 "worst_frame_auxiliary": {
                     "kind": "speech_run_and_background_source_worst_frame_ce_v1",
                     "weight": float(args.worst_frame_weight),
+                    "runtime_effect": "none_binary_argmax_unchanged",
+                },
+                "internal_background_worst_frame_auxiliary": {
+                    "kind": "speech_bracketed_background_run_worst_frame_ce_v1",
+                    "weight": float(args.internal_background_worst_frame_weight),
                     "runtime_effect": "none_binary_argmax_unchanged",
                 },
             },
@@ -827,6 +1018,9 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "mean_primary_loss": float(np.mean(primary_losses)),
         "mean_continuity_loss": float(np.mean(continuity_losses)),
         "mean_worst_frame_loss": float(np.mean(worst_frame_losses)),
+        "mean_internal_background_worst_frame_loss": float(
+            np.mean(internal_background_worst_frame_losses)
+        ),
         "val": val,
         "test": test,
         "dataset": dataset_summary,
@@ -848,11 +1042,23 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                     if args.worst_frame_weight > 0.0
                     else []
                 ),
+                *(
+                    ["speech_bracketed_background_run_worst_frame_ce_v1"]
+                    if args.internal_background_worst_frame_weight > 0.0
+                    else []
+                ),
             ]
         ),
         "continuity_weight": float(args.continuity_weight),
         "worst_frame_weight": float(args.worst_frame_weight),
+        "internal_background_worst_frame_weight": float(
+            args.internal_background_worst_frame_weight
+        ),
         "max_batch_rows": int(args.max_batch_rows),
+        "checkpoint_selection": (
+            "val_95pct_safety_then_independent_internal_background_false_keep_v3"
+        ),
+        "validation_history": validation_history,
         "decision_mode": "binary_frame_argmax",
         "memory_snapshots": memory_snapshots,
         "memory_peak": memory_peak,
@@ -866,6 +1072,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     del class_weights, weights
     del loss, primary_loss, continuity_loss, continuity_pair_count
     del worst_frame_loss, worst_frame_term_count
+    del internal_background_worst_frame_loss, internal_background_term_count
     gc.collect()
     if device.type == "cuda":
         torch.cuda.synchronize(device)
@@ -900,6 +1107,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--speech-weight", type=float, default=1.0)
     parser.add_argument("--continuity-weight", type=float, default=0.0)
     parser.add_argument("--worst-frame-weight", type=float, default=0.0)
+    parser.add_argument(
+        "--internal-background-worst-frame-weight", type=float, default=0.0
+    )
     parser.add_argument("--hidden-size", type=int, default=128)
     parser.add_argument("--num-layers", type=int, default=2)
     parser.add_argument("--seed", type=int, default=17)

@@ -4,7 +4,7 @@
 
 ## Decision
 
-Scorer v10 的断兼容 schema、两 logit 模型、argmax decoder、严格 dataset validator 和 random-init trainer plumbing 已完成真实 full training。当前最佳 checkpoint 在 corrected-r2 上通过 numeric gate，但 corrected-r3 的 replacement、zero-clipping 与 residual 人工 gate 仍 pending；production registry 与 `segment()` 继续 fail-fast 为 `pending_binary_scorer_audit`。
+Scorer v10 的断兼容 schema、两 logit 模型、argmax decoder、严格 dataset validator 和 random-init trainer plumbing 已完成真实 full training。原 numeric checkpoint 的 corrected-r3 人工 gate 已完成并确认一处真语音截断，因此被否决。新的 internal-background A/B checkpoint 减少独立背景假岛，但新增/扩大 29 个 speech-drop source，差集人工页仍 pending；production registry 与 `segment()` 继续 fail-fast 为 `pending_binary_scorer_audit`。
 
 ## Why v8/v9 cannot continue
 
@@ -19,7 +19,7 @@ Scorer v8 是单 sigmoid logit，历史高召回依赖 `0.15/0.20` hysteresis th
 | model | raw PTM2048 -> checkpoint-owned trainable Linear128 + MFCC40 + relative forward/backward position -> valid-prefix bidirectional Mamba2 -> Linear(2) |
 | decision | two-logit softmax frame argmax; contiguous speech frames form coarse islands; all-background drops the source |
 | runtime rules | no sigmoid operating point, hysteresis, dilation, minimum-duration filter, hard veto or fallback |
-| initialization/loss | random initialization; weighted cross entropy baseline only; no warm-start/Focal/boundary band surface |
+| initialization/loss | random initialization; weighted cross entropy plus explicitly configured training-only run losses; no warm-start/Focal/boundary band |
 | batching | valid-prefix padded batches preserve source order, probabilities within `1e-5`, and exact argmax |
 
 The builder and loader reject non-2048 PTM, non-128 projection, non-40 MFCC, non-position2, missing valid-prefix masking, non-random initialization, wrong labels, wrong dataset contract and missing/retired central contract IDs. The pure decoder ignores threshold, dilation and minimum-duration config values.
@@ -118,4 +118,27 @@ Because corrected-r2 and r3 have a byte-identical audio manifest, the existing P
 | shared VRAM increment | `0 MiB` |
 | peak CUDA allocated / reserved | `571.375 / 1062 MiB` |
 
-The formal selection is complete at `321/321`: all `36/36` prediction-drop/truth-keep rows, all `277/277` >8-second rows, and every held-out hard case. The page `agents/audits/20260720_162315_scorer-v10-r3-residuals-final321/` saves `speech_scorer_v10_prediction_manual_verdict_v2`. It shows exact red `truth_speech ∩ model_background` spans, complete canonical and actual blue argmax timelines at absolute positions, and whole-source context without changing runtime segmentation. A separate page `agents/audits/20260720_162315_scorer-v10-r3-fragmentation-gap1/` contains the one remaining 60 ms internal gap. Both pages are pending; no human result is inferred from numeric metrics, and no checkpoint promotion is authorized.
+The formal selection is complete at `321/321`: all `36/36` prediction-drop/truth-keep rows, all `277/277` >8-second rows, and every held-out hard case. The page `agents/audits/20260720_162315_scorer-v10-r3-residuals-final321/` saves `speech_scorer_v10_prediction_manual_verdict_v2`. It shows exact red `truth_speech ∩ model_background` spans, complete canonical and actual blue argmax timelines at absolute positions, and whole-source context without changing runtime segmentation. A separate page `agents/audits/20260720_162315_scorer-v10-r3-fragmentation-gap1/` contains the one remaining 60 ms internal gap.
+
+Both pages are now complete. Residual verdicts are `acceptable_long_residual=78 / missed_background_or_gap=194 / canonical_should_be_background=35 / canonical_contains_target_speech=6 / model_false_keep=7 / true_speech_clipped=1`; unsure is zero. The gap page confirms that `000973 0.52–0.58s` is part of the same ASR unit. The old candidate therefore fails the manual zero-clipping gate. The 35 exact red spans may be changed to background, while the six all-background sources require exact per-island speech repair rather than inheriting speech across the full source.
+
+## Internal background false-keep A/B
+
+The 194 `missed_background_or_gap` rows are not 194 semantic-subject failures. Event-level inspection found 193 rows with a background-only model-speech island bracketed by canonical speech. Across those rows there are 441 complete background-only islands; 439 were already pure background in the corrected-r2 training labels. This exposed a loss-aggregation blind spot: `speech_run_and_background_source_worst_frame_ce_v1` focuses on speech runs whenever a source contains speech and only applies its background term to all-background sources, so internal negative runs received only frame-averaged CE.
+
+The trainer now provides `speech_bracketed_background_run_worst_frame_ce_v1`. It is training-only and uses canonical topology, not duration: a background run is eligible only when canonical speech exists on both sides. Runtime remains two-logit frame argmax, without a short-island rule, threshold, merge or veto. Evaluation separately reports all background leakage and complete argmax speech islands lying wholly inside speech-bracketed background. Checkpoint selection first requires zero deletion and the existing start/end/background/continuity safety floor of 95%; only among passing validation steps does it minimize independent false-keep islands and frames.
+
+The strict full A/B kept corrected-r2, seed 17, random initialization, frame budget 1024, max packed rows 8, worst-frame weight 0.10 and 5000 steps fixed. The candidate changed only internal-background weight to 0.01 and enabled the already-defined speech-run continuity loss at 1.0. Its SHA256 is `ec7b1c8895c40bb1fae19f85947b795325656735bebc9d0a5cbaedc8c1aa4f58`; it is experimental and not registered.
+
+| r2 held-out metric | old numeric candidate | internal-background A/B |
+| --- | ---: | ---: |
+| val independent background islands | 89 | 72 |
+| test independent background islands | 35 | 24 |
+| val/test independent-island frames | 373 / 82 | 276 / 77 |
+| val/test speech continuity | 96.02 / 98.04% | 95.52 / 97.06% |
+| val/test speech precision | 95.81 / 95.76% | 97.03 / 96.51% |
+| val/test background drop | 96.62 / 97.03% | 95.65 / 97.52% |
+| val/test true speech deletion | 0 / 0 | 0 / 0 |
+| shared VRAM spill | 0 MiB | 0 MiB |
+
+On the same corrected-r3 diagnostic manifest, independent internal-background islands fall from `1651` to `1000`, frames from `8262` to `5144`, and total island duration from `165.24s` to `102.88s`. The known `000973` clipping is removed. However, candidate-vs-baseline frame differencing finds 29 sources with 191 newly dropped canonical-speech frames. The audit at `agents/audits/20260720_200040_scorer-v10-internal-bg-ab-extra-drop29/` displays only that exact red difference while retaining the candidate's complete blue output and whole-source playback. It must be completed before the A/B candidate can replace the rejected old candidate or before remaining tiny islands may be delegated to CueQC.

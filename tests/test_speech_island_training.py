@@ -23,13 +23,16 @@ from boundary.ja.model import (
 )
 import tools.boundary.ja.train_speech_island_scorer_v10_binary as scorer_v10_trainer
 from tools.boundary.ja.train_speech_island_scorer_v10_binary import (
+    checkpoint_selection_score,
     compute_mfcc_normalization,
     frame_budget_batches as scorer_v10_frame_budget_batches,
+    internal_background_run_structure,
     numeric_gate_pass as scorer_v10_numeric_gate_pass,
     parse_args as parse_scorer_v10_args,
     predicted_run_structure,
     release_gate_fields as scorer_v10_release_gate_fields,
     speech_continuity_auxiliary_loss,
+    internal_background_run_worst_frame_auxiliary_loss,
     sequence_worst_frame_auxiliary_loss,
     summarize_partition_labels,
     validate_dataset_rows as validate_scorer_v10_rows,
@@ -363,6 +366,62 @@ def test_binary_speech_v10_numeric_gate_requires_heldout_continuity() -> None:
     ) is True
 
 
+def test_binary_speech_v10_checkpoint_selection_minimizes_false_keeps_after_safety() -> None:
+    safe = {
+        "start_coverage": 0.95,
+        "end_coverage": 0.96,
+        "background_drop_recall": 0.97,
+        "speech_run_continuity": 0.98,
+        "speech_recall": 0.99,
+        "true_speech_deletion_count": 0,
+        "independent_internal_background_false_keep_island_count": 4,
+        "independent_internal_background_false_keep_frame_count": 10,
+    }
+    higher_safety_more_false_keeps = {
+        **safe,
+        "start_coverage": 0.99,
+        "independent_internal_background_false_keep_island_count": 5,
+    }
+    unsafe_fewer_false_keeps = {
+        **safe,
+        "start_coverage": 0.94,
+        "independent_internal_background_false_keep_island_count": 0,
+    }
+
+    assert checkpoint_selection_score(safe) > checkpoint_selection_score(
+        higher_safety_more_false_keeps
+    )
+    assert checkpoint_selection_score(safe) > checkpoint_selection_score(
+        unsafe_fewer_false_keeps
+    )
+
+
+def test_binary_speech_v10_internal_background_structure_is_topology_based() -> None:
+    result = internal_background_run_structure(
+        np.asarray([0, 1, 1, 0, 0, 1, 1, 0, -100]),
+        np.asarray([1, 1, 1, 0, 1, 1, 1, 1, 1], dtype=bool),
+    )
+
+    assert result == {
+        "internal_background_run_count": 1,
+        "fully_dropped_internal_background_run_count": 0,
+        "internal_background_false_keep_frame_count": 1,
+        "internal_background_false_keep_island_count": 1,
+        "independent_internal_background_false_keep_frame_count": 0,
+        "independent_internal_background_false_keep_island_count": 0,
+    }
+
+
+def test_binary_speech_v10_internal_background_structure_counts_independent_islands() -> None:
+    result = internal_background_run_structure(
+        np.asarray([1, 1, 0, 0, 0, 1, 1]),
+        np.asarray([1, 1, 0, 1, 0, 1, 1], dtype=bool),
+    )
+
+    assert result["independent_internal_background_false_keep_frame_count"] == 1
+    assert result["independent_internal_background_false_keep_island_count"] == 1
+
+
 def test_binary_speech_v10_continuity_auxiliary_only_penalizes_inside_speech() -> None:
     torch = pytest.importorskip("torch")
     target = torch.tensor([[1, 1, 1, 0, -100, 1]], dtype=torch.long)
@@ -400,3 +459,30 @@ def test_binary_speech_v10_worst_frame_auxiliary_covers_runs_and_background() ->
     loss, term_count = sequence_worst_frame_auxiliary_loss(logits, labels, labels)
     assert term_count == 3
     assert loss.item() > 0.0
+
+
+def test_binary_speech_v10_internal_background_auxiliary_only_covers_bracketed_runs() -> None:
+    torch = pytest.importorskip("torch")
+    labels = torch.tensor(
+        [
+            [0, 1, 1, 0, 0, 1, 1, 0, -100],
+            [0, 0, 0, 0, -100, -100, -100, -100, -100],
+        ],
+        dtype=torch.long,
+    )
+    logits = torch.zeros((2, 9, 2), dtype=torch.float32)
+    logits[..., 0] = 2.0
+    logits[..., 1] = 0.0
+    logits[0, 3] = torch.tensor([0.0, 2.0])
+    logits[0, 0] = torch.tensor([0.0, 8.0])
+    logits[0, 7] = torch.tensor([0.0, 8.0])
+    logits[1, 1] = torch.tensor([0.0, 8.0])
+
+    loss, term_count = internal_background_run_worst_frame_auxiliary_loss(
+        logits, labels, labels
+    )
+
+    assert term_count == 1
+    assert loss.item() == pytest.approx(
+        torch.nn.functional.cross_entropy(logits[0, 3:4], labels[0, 3:4]).item()
+    )
