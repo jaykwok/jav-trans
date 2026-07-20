@@ -135,6 +135,43 @@ def test_prediction_manual_gate_can_pass_residuals_but_not_promote_alone(
     ]
 
 
+def test_prediction_manual_gate_blocks_same_asr_unit_fragmentation(
+    tmp_path: Path,
+) -> None:
+    summary, manifest, targets = _fixture(tmp_path)
+    choices = [
+        "canonical_should_be_background",
+        "same_asr_unit_fragmented",
+        "acceptable_long_residual",
+        "canonical_contains_target_speech",
+    ]
+    verdicts = tmp_path / "manual_verdicts.jsonl"
+    _write_jsonl(
+        verdicts,
+        [
+            {**target, "schema": VERDICT_SCHEMA, "verdict": verdict}
+            for target, verdict in zip(targets, choices, strict=True)
+        ],
+    )
+
+    result = evaluate(
+        audit_summary=summary,
+        audit_manifest=manifest,
+        manual_verdicts=verdicts,
+        output=tmp_path / "gate.json",
+    )
+
+    assert result["zero_clipping_violation_count"] == 0
+    assert result["workflow_continuity_issue_count"] == 1
+    assert result["workflow_continuity_issue_ids"] == [
+        "speech_edge_or_partial:edge"
+    ]
+    assert result["workflow_continuity_pass"] is False
+    assert "manual_workflow_continuity_issue" in result[
+        "checkpoint_promotion_blockers"
+    ]
+
+
 def test_prediction_manual_gate_rejects_category_mismatched_verdict(
     tmp_path: Path,
 ) -> None:

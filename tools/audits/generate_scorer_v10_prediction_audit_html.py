@@ -194,7 +194,7 @@ small{color:var(--muted)}h2{font-size:18px;margin:0 0 4px;overflow-wrap:anywhere
     <div><b>播放合同：</b>每个色条只播放自身 start–end 后立即停止，不添加上下文。点击原生播放器可听整条 source。只需选择按钮，不要求备注。</div>
     <div class="guide">
       <div><b>speech_deletion</b>：优先听红条；判断是真语音被整段删除，还是 canonical 应改为 background。</div>
-      <div><b>speech_edge_or_partial</b>：优先听红条；判断是否截掉真语音/尾音，还是标签边缘过宽。</div>
+      <div><b>speech_edge_or_partial</b>：优先听红条；区分真语音/尾音被截、纯停顿却打断同一 ASR 单元，以及可安全切开的 background。</div>
       <div><b>long_residual</b>：听蓝条并用整条 source 判断；确认是否含应独立 drop 的背景/非语义段。</div>
       <div><b>background_false_keep</b>：听蓝条；判断模型是否误留背景，或 all-background canonical 漏了目标语音。</div>
     </div>
@@ -242,12 +242,12 @@ function choices(row){
   if(row.category==='background_false_keep')return [['model_false_keep','确实全是背景/非语义，模型误留'],['canonical_contains_target_speech','含目标语音，canonical all-background 错'],['unsure','不确定']];
   if(row.category==='speech_deletion')return [['true_speech_deleted','红段是真语音，模型整段删除'],['canonical_should_be_background','红段可 drop，canonical 应为 background'],['unsure','不确定']];
   if(row.category==='long_residual')return [['acceptable_long_residual','蓝色长段整体可保留'],['missed_background_or_gap','蓝段内含应独立 drop 的背景/非语义'],['true_speech_edge_clipped','实际仍有真语音边缘被截'],['unsure','不确定']];
-  return [['true_speech_clipped','红段含真语音/尾音，模型截断'],['canonical_should_be_background','红段可 drop，canonical 边缘过宽'],['unsure','不确定']];
+  return [['true_speech_clipped','红段含发音/尾音，模型截断'],['same_asr_unit_fragmented','红段可为停顿，但左右属同一 ASR 单元，切开有害'],['canonical_should_be_background','红段可作 background，切开符合工作流'],['unsure','不确定']];
 }
 function spans(row,list){return [...(list||[])].sort((a,b)=>a.start_s-b.start_s||a.end_s-b.end_s).map(span=>`<button type="button" class="span ${esc(span.label)}" style="left:${Math.max(0,100*span.start_s/row.duration_s)}%;width:${Math.max(.3,100*(span.end_s-span.start_s)/row.duration_s)}%" data-start="${span.start_s}" data-end="${span.end_s}">${esc(span.label)} ${Number(span.start_s).toFixed(2)}–${Number(span.end_s).toFixed(2)}s</button>`).join('');}
 function saveLocal(){localStorage.setItem(key,JSON.stringify(ann));}
 function updateStatus(){document.getElementById('status').textContent=`已裁决 ${rows.filter(row=>ensure(row).verdict).length}/${rows.length}`;}
-function riskVerdict(value){return ['model_false_keep','true_speech_deleted','true_speech_clipped','true_speech_edge_clipped','missed_background_or_gap'].includes(value);}
+function riskVerdict(value){return ['model_false_keep','true_speech_deleted','true_speech_clipped','true_speech_edge_clipped','same_asr_unit_fragmented','missed_background_or_gap'].includes(value);}
 function setVerdict(card,row,value){
   const state=ensure(row);state.verdict=value;state.updated_at=new Date().toISOString();saveLocal();
   card.classList.add('done');

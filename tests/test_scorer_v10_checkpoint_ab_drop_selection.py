@@ -224,6 +224,7 @@ def test_checkpoint_ab_selection_carries_only_exact_audited_background_frames(
     page = _render_page([selected])
     assert "尚未被此前逐段人工确认为 background" in page
     assert "不继承整条 source 结论" in page
+    assert "红段可为停顿，但左右属同一 ASR 单元，切开有害" in page
 
 
 def test_checkpoint_ab_selection_does_not_carry_true_speech_verdict(

@@ -19,7 +19,7 @@ from tools.audits.generate_scorer_v10_prediction_audit_html import (  # noqa: E4
 )
 
 
-RESULT_SCHEMA = "speech_scorer_v10_prediction_manual_gate_v2"
+RESULT_SCHEMA = "speech_scorer_v10_prediction_manual_gate_v3"
 CATEGORY_VERDICTS = {
     "speech_deletion": {
         "true_speech_deleted",
@@ -29,6 +29,7 @@ CATEGORY_VERDICTS = {
     },
     "speech_edge_or_partial": {
         "true_speech_clipped",
+        "same_asr_unit_fragmented",
         "canonical_should_be_background",
         "unsure",
         "unreviewed",
@@ -56,6 +57,7 @@ BACKGROUND_BEHAVIOR_VERDICTS = {
     "model_false_keep",
     "missed_background_or_gap",
 }
+WORKFLOW_CONTINUITY_VERDICTS = {"same_asr_unit_fragmented"}
 CANONICAL_REPAIR_VERDICTS = {
     "canonical_should_be_background",
     "canonical_contains_target_speech",
@@ -138,6 +140,11 @@ def evaluate(
         for audit_id, row in verdicts.items()
         if str(row.get("verdict") or "") in BACKGROUND_BEHAVIOR_VERDICTS
     )
+    workflow_continuity_ids = sorted(
+        audit_id
+        for audit_id, row in verdicts.items()
+        if str(row.get("verdict") or "") in WORKFLOW_CONTINUITY_VERDICTS
+    )
     canonical_repair_ids = sorted(
         audit_id
         for audit_id, row in verdicts.items()
@@ -159,12 +166,16 @@ def evaluate(
     background_behavior_pass = (
         review_complete and not background_behavior_ids and not unsure_ids
     )
+    workflow_continuity_pass = (
+        review_complete and not workflow_continuity_ids and not unsure_ids
+    )
     canonical_consistency_pass = (
         review_complete and not canonical_repair_ids and not unsure_ids
     )
     residual_gate_pass = (
         zero_clipping_pass
         and background_behavior_pass
+        and workflow_continuity_pass
         and canonical_consistency_pass
     )
     result = {
@@ -189,6 +200,9 @@ def evaluate(
         "background_behavior_issue_count": len(background_behavior_ids),
         "background_behavior_issue_ids": background_behavior_ids,
         "background_behavior_pass": background_behavior_pass,
+        "workflow_continuity_issue_count": len(workflow_continuity_ids),
+        "workflow_continuity_issue_ids": workflow_continuity_ids,
+        "workflow_continuity_pass": workflow_continuity_pass,
         "canonical_repair_required": bool(canonical_repair_ids),
         "canonical_repair_count": len(canonical_repair_ids),
         "canonical_repair_ids": canonical_repair_ids,
@@ -203,6 +217,11 @@ def evaluate(
                 []
                 if not background_behavior_ids
                 else ["manual_background_behavior_issue"]
+            ),
+            *(
+                []
+                if not workflow_continuity_ids
+                else ["manual_workflow_continuity_issue"]
             ),
             *([] if not canonical_repair_ids else ["canonical_repair_and_rescore_required"]),
             "separate_fragmentation_gate_required",
