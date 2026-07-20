@@ -23,6 +23,9 @@ VERDICT_SCHEMA = "speech_scorer_v10_prediction_manual_verdict_v2"
 CHECKPOINT_AB_EXTRA_DROP_CONTRACT = (
     "candidate_extra_false_negative_vs_baseline_v1"
 )
+CHECKPOINT_AB_REMAINING_DROP_CONTRACT = (
+    "candidate_extra_false_negative_vs_baseline_excluding_audited_background_v1"
+)
 
 
 def _rows(path: Path) -> list[dict[str, Any]]:
@@ -91,7 +94,10 @@ def audit_truth_drop_spans(row: dict[str, Any]) -> list[dict[str, Any]]:
     override = row.get("audit_truth_drop_spans")
     if override is None:
         return computed
-    if row.get("audit_truth_drop_contract") != CHECKPOINT_AB_EXTRA_DROP_CONTRACT:
+    if row.get("audit_truth_drop_contract") not in {
+        CHECKPOINT_AB_EXTRA_DROP_CONTRACT,
+        CHECKPOINT_AB_REMAINING_DROP_CONTRACT,
+    }:
         raise ValueError("Scorer v10 audit truth-drop override requires the A/B contract")
     if not isinstance(override, list) or not override:
         raise ValueError("Scorer v10 A/B audit truth-drop override must not be empty")
@@ -132,15 +138,18 @@ def _render_page(payload: list[dict[str, Any]]) -> str:
         .replace("\u2029", "\\u2029")
     )
     schema = json.dumps(VERDICT_SCHEMA)
-    checkpoint_ab_mode = all(
-        row.get("audit_truth_drop_contract") == CHECKPOINT_AB_EXTRA_DROP_CONTRACT
-        for row in payload
-    )
-    scope_note = (
-        "<div><b>本页 A/B 合同：</b>红色只显示新候选相对 baseline 新增的 canonical-speech drop 差集；旧候选已经出现过的红段不在本页重复审计。蓝色仍是新候选完整实际输出。</div>"
-        if checkpoint_ab_mode
-        else ""
-    )
+    contracts = {row.get("audit_truth_drop_contract") for row in payload}
+    checkpoint_ab_mode = contracts <= {
+        CHECKPOINT_AB_EXTRA_DROP_CONTRACT,
+        CHECKPOINT_AB_REMAINING_DROP_CONTRACT,
+    }
+    remaining_drop_mode = contracts == {CHECKPOINT_AB_REMAINING_DROP_CONTRACT}
+    if remaining_drop_mode:
+        scope_note = "<div><b>本页 A/B 合同：</b>红色只显示新候选相对 baseline 新增、且尚未被此前逐段人工确认为 background 的 canonical-speech drop。已试听 background 区间仅按精确帧交集排除，不继承整条 source 结论；蓝色仍是新候选完整实际输出。</div>"
+    elif checkpoint_ab_mode:
+        scope_note = "<div><b>本页 A/B 合同：</b>红色只显示新候选相对 baseline 新增的 canonical-speech drop 差集；旧候选已经出现过的红段不在本页重复审计。蓝色仍是新候选完整实际输出。</div>"
+    else:
+        scope_note = ""
     return (
         """<!doctype html>
 <html lang="zh-CN">
@@ -250,10 +259,13 @@ function render(){
   for(const row of rows){
     if(filter!=='all'&&row.category!==filter)continue;
     const state=ensure(row),card=document.createElement('article');card.dataset.auditId=row.audit_id;if(state.verdict)card.classList.add('done');
-    const isCheckpointAb=row.audit_truth_drop_contract==='candidate_extra_false_negative_vs_baseline_v1';
-    const dropped=(row.truth_drop_spans||[]).length?`<h3>${isCheckpointAb?'新候选额外未送出（红色：candidate drop - baseline drop）':'实际未送出（红色：truth_speech ∩ model_background）'}</h3><div class="track">${spans(row,row.truth_drop_spans)}</div>`:'';
+    const isRemainingAb=row.audit_truth_drop_contract==='candidate_extra_false_negative_vs_baseline_excluding_audited_background_v1';
+    const isCheckpointAb=isRemainingAb||row.audit_truth_drop_contract==='candidate_extra_false_negative_vs_baseline_v1';
+    const dropTitle=isRemainingAb?'尚未人工确认的新增未送出（红色：remaining candidate drop）':(isCheckpointAb?'新候选额外未送出（红色：candidate drop - baseline drop）':'实际未送出（红色：truth_speech ∩ model_background）');
+    const dropped=(row.truth_drop_spans||[]).length?`<h3>${dropTitle}</h3><div class="track">${spans(row,row.truth_drop_spans)}</div>`:'';
     const extraFn=row.candidate_extra_false_negative_frames==null?'':` / new FN=${row.candidate_extra_false_negative_frames}`;
-    card.innerHTML=`<h2>${esc(row.source_id)}</h2><small>${esc(row.partition)} / ${esc(row.row_role)} / ${esc(row.category)} / duration=${Number(row.duration_s).toFixed(2)}s / FN=${row.false_negative_frames}${extraFn} / FP=${row.false_positive_frames} / max model run=${Number(row.max_predicted_speech_run_s).toFixed(2)}s</small><h3>整条 source（仅供完整上下文）</h3><audio controls preload="none" src="${esc(row.audio)}"></audio><h3>canonical（绿色 speech / 黄色 background）</h3><div class="track">${spans(row,row.truth_spans)}</div>${dropped}<h3>实际候选工作流输出（蓝色 argmax=speech）</h3><div class="track">${spans(row,row.prediction_spans)}</div><div class="choices">${choices(row).map(choice=>`<button type="button" data-v="${choice[0]}" class="${riskVerdict(choice[0])?'risk ':''}${state.verdict===choice[0]?'active':''}">${choice[1]}</button>`).join('')}</div>`;
+    const reviewFn=row.candidate_extra_false_negative_frames_requiring_review==null?'':` / review FN=${row.candidate_extra_false_negative_frames_requiring_review} / carried bg=${row.candidate_extra_false_negative_frames_carried_as_background||0}`;
+    card.innerHTML=`<h2>${esc(row.source_id)}</h2><small>${esc(row.partition)} / ${esc(row.row_role)} / ${esc(row.category)} / duration=${Number(row.duration_s).toFixed(2)}s / FN=${row.false_negative_frames}${extraFn}${reviewFn} / FP=${row.false_positive_frames} / max model run=${Number(row.max_predicted_speech_run_s).toFixed(2)}s</small><h3>整条 source（仅供完整上下文）</h3><audio controls preload="none" src="${esc(row.audio)}"></audio><h3>canonical（绿色 speech / 黄色 background）</h3><div class="track">${spans(row,row.truth_spans)}</div>${dropped}<h3>实际候选工作流输出（蓝色 argmax=speech）</h3><div class="track">${spans(row,row.prediction_spans)}</div><div class="choices">${choices(row).map(choice=>`<button type="button" data-v="${choice[0]}" class="${riskVerdict(choice[0])?'risk ':''}${state.verdict===choice[0]?'active':''}">${choice[1]}</button>`).join('')}</div>`;
     const audio=card.querySelector('audio');
     audio.addEventListener('play',()=>{if(activeAudio&&activeAudio!==audio)stopPlayback();activeAudio=audio;});
     audio.addEventListener('ended',stopPlayback);
@@ -348,26 +360,39 @@ def build_audit(*, selection: Path, output_dir: Path) -> Path:
         encoding="utf-8",
     )
     checkpoint_ab_mode = all(
-        row.get("audit_truth_drop_contract") == CHECKPOINT_AB_EXTRA_DROP_CONTRACT
+        row.get("audit_truth_drop_contract")
+        in {CHECKPOINT_AB_EXTRA_DROP_CONTRACT, CHECKPOINT_AB_REMAINING_DROP_CONTRACT}
+        for row in payload
+    )
+    remaining_drop_mode = all(
+        row.get("audit_truth_drop_contract") == CHECKPOINT_AB_REMAINING_DROP_CONTRACT
         for row in payload
     )
     summary = {
         "schema": SUMMARY_SCHEMA,
         "title": (
-            "Scorer v10 checkpoint A/B extra-drop audit"
-            if checkpoint_ab_mode
-            else "Scorer v10 prediction residual audit"
+            "Scorer v10 checkpoint A/B remaining extra-drop audit"
+            if remaining_drop_mode
+            else (
+                "Scorer v10 checkpoint A/B extra-drop audit"
+                if checkpoint_ab_mode
+                else "Scorer v10 prediction residual audit"
+            )
         ),
         "review_item_count": len(payload),
         "category_counts": dict(Counter(str(row["category"]) for row in payload)),
         "selection": str(selection),
         "audit_manifest": str(manifest),
         "selection_contract": (
-            CHECKPOINT_AB_EXTRA_DROP_CONTRACT
-            if checkpoint_ab_mode
+            CHECKPOINT_AB_REMAINING_DROP_CONTRACT
+            if remaining_drop_mode
             else (
-                "all_truth_keep_model_drop_rows_plus_all_heldout_hard_cases_"
-                "plus_all_over_8s_residuals"
+                CHECKPOINT_AB_EXTRA_DROP_CONTRACT
+                if checkpoint_ab_mode
+                else (
+                    "all_truth_keep_model_drop_rows_plus_all_heldout_hard_cases_"
+                    "plus_all_over_8s_residuals"
+                )
             )
         ),
         "exact_truth_drop_playback": True,
