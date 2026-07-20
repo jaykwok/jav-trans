@@ -29,11 +29,33 @@ from pipeline.memory_safety import (  # noqa: E402
 
 IGNORE_INDEX = -100
 FRAME_HOP_S = 0.02
+TRAINING_ROW_SCHEMA = "speech_scorer_v10_binary_training_row_v1"
+DIAGNOSTIC_ROW_SCHEMA = "speech_scorer_v10_binary_diagnostic_row_v1"
 
 
 def _rows(path: Path) -> list[dict[str, Any]]:
     with path.open("r", encoding="utf-8-sig") as handle:
         return [json.loads(line) for line in handle if line.strip()]
+
+
+def _validate_score_rows(rows: Iterable[dict[str, Any]]) -> str:
+    materialized = list(rows)
+    if not materialized:
+        raise ValueError("Scorer checkpoint audit dataset is empty")
+    schemas = {str(row.get("schema") or "") for row in materialized}
+    if schemas == {TRAINING_ROW_SCHEMA}:
+        if any(row.get("diagnostic_only") for row in materialized):
+            raise ValueError("Scorer training rows cannot be diagnostic-only")
+        return "training_manifest"
+    if schemas == {DIAGNOSTIC_ROW_SCHEMA}:
+        if any(
+            row.get("diagnostic_only") is not True
+            or row.get("training_manifest_allowed") is not False
+            for row in materialized
+        ):
+            raise ValueError("Scorer diagnostic rows require a strict read-only contract")
+        return "diagnostic_rescore_manifest"
+    raise ValueError("Scorer checkpoint audit rejects mixed or unknown row schemas")
 
 
 def _runs(values: np.ndarray) -> list[tuple[int, int]]:
@@ -297,22 +319,36 @@ def _select_audit_rows(rows: Iterable[dict[str, Any]], *, max_items: int) -> lis
         for row in rows
         if row["true_speech_deletions"] > 0
         or row["false_negative_frames"] > 0
+        or float(row["max_predicted_speech_run_s"]) > 8.0
         or (
             row["partition"] in {"val", "test"}
-            and (
-                row["category"] != "normal"
-                or row["max_predicted_speech_run_s"] > 8.0
-            )
+            and row["category"] != "normal"
         )
     ]
+    category_priority = {
+        "speech_deletion": 0,
+        "speech_edge_or_partial": 1,
+        "long_residual": 2,
+        "background_false_keep": 3,
+        "normal": 4,
+    }
+    partition_priority = {"val": 0, "test": 1, "train": 2}
+
+    def audit_category_priority(row: dict[str, Any]) -> int:
+        category = str(row["category"])
+        if category == "normal" and float(row["max_predicted_speech_run_s"]) > 8.0:
+            category = "long_residual"
+        return category_priority.get(category, 5)
+
     candidates.sort(
         key=lambda row: (
-            row["category"] == "background_false_keep",
-            row["true_speech_deletions"] > 0,
-            row["false_negative_frames"] + row["false_positive_frames"],
-            float(row.get("duration_s") or 0.0),
-        ),
-        reverse=True,
+            audit_category_priority(row),
+            partition_priority.get(str(row.get("partition") or ""), 3),
+            -int(row["false_negative_frames"]),
+            -int(row["false_positive_frames"]),
+            -float(row.get("duration_s") or 0.0),
+            str(row["source_id"]),
+        )
     )
     return candidates[:max_items] if max_items > 0 else candidates
 
@@ -324,6 +360,7 @@ def score_checkpoint(
 
     output_dir.mkdir(parents=True, exist_ok=True)
     rows = _rows(dataset_manifest)
+    dataset_mode = _validate_score_rows(rows)
     if device.startswith("cuda"):
         torch.cuda.init()
         warmup = torch.ones(1, device=device)
@@ -356,6 +393,7 @@ def score_checkpoint(
         for row in predictions:
             handle.write(json.dumps(row, ensure_ascii=False, sort_keys=True) + "\n")
     selected = _select_audit_rows(predictions, max_items=max_audit_items)
+    required_selection = _select_audit_rows(predictions, max_items=0)
     selected_path = output_dir / "audit_selection.jsonl"
     with selected_path.open("w", encoding="utf-8") as handle:
         for row in selected:
@@ -364,8 +402,16 @@ def score_checkpoint(
         "schema": "speech_scorer_v10_checkpoint_audit_summary_v2",
         "checkpoint": str(checkpoint),
         "dataset_manifest": str(dataset_manifest),
+        "dataset_mode": dataset_mode,
+        "training_manifest_allowed": dataset_mode == "training_manifest",
         "row_count": len(predictions),
         "selected_count": len(selected),
+        "required_selection_count": len(required_selection),
+        "audit_selection_complete": len(selected) == len(required_selection),
+        "audit_selection_contract": (
+            "all_truth_keep_model_drop_rows_plus_all_heldout_hard_cases_"
+            "plus_all_over_8s_residuals"
+        ),
         "category_counts": {
             category: sum(row["category"] == category for row in predictions)
             for category in sorted({row["category"] for row in predictions})
@@ -374,6 +420,18 @@ def score_checkpoint(
             row["false_negative_frames"] > 0 for row in predictions if row["row_role"] == "speech"
         ),
         "true_speech_deletion_rows": sum(row["true_speech_deletions"] > 0 for row in predictions),
+        "over_8s_residual_rows": sum(
+            float(row["max_predicted_speech_run_s"]) > 8.0
+            for row in predictions
+        ),
+        "selected_over_8s_residual_rows": sum(
+            float(row["max_predicted_speech_run_s"]) > 8.0
+            for row in selected
+        ),
+        "selected_prediction_drop_truth_keep_rows": sum(
+            row["row_role"] == "speech" and row["false_negative_frames"] > 0
+            for row in selected
+        ),
         "continuity": summarize_prediction_continuity(predictions),
         "memory_snapshots": memory_snapshots,
         "predictions": str(predictions_path),

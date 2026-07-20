@@ -30,6 +30,7 @@ from tools.boundary.ja.train_speech_island_scorer_v10_binary import (
     predicted_run_structure,
     release_gate_fields as scorer_v10_release_gate_fields,
     speech_continuity_auxiliary_loss,
+    sequence_worst_frame_auxiliary_loss,
     summarize_partition_labels,
     validate_dataset_rows as validate_scorer_v10_rows,
 )
@@ -233,6 +234,7 @@ def _scorer_v10_row(
     source: str, core: str | None, partition: str, *, row_role: str = "speech"
 ) -> dict:
     return {
+        "schema": "speech_scorer_v10_binary_training_row_v1",
         "boundary_serialization_contract_id": "boundary_acoustic_binary_v12",
         "source_id": source,
         "core_ids": [] if core is None else [core],
@@ -263,6 +265,9 @@ def test_binary_speech_v10_dataset_contract_freezes_source_and_core() -> None:
     missing_contract.pop("boundary_serialization_contract_id")
     with pytest.raises(ValueError, match="central Boundary contract"):
         validate_scorer_v10_rows([missing_contract, *rows[1:]])
+    diagnostic = {**rows[0], "schema": "speech_scorer_v10_binary_diagnostic_row_v1", "diagnostic_only": True}
+    with pytest.raises(ValueError, match="rejects diagnostic"):
+        validate_scorer_v10_rows([diagnostic, *rows[1:]])
 
 
 def test_binary_speech_v10_unsure_is_excluded_from_normalization_and_presence(
@@ -321,6 +326,14 @@ def test_binary_speech_v10_batches_by_padded_frame_budget_without_truncation() -
     assert batches[-1][0]["frame_count"] == 11
 
 
+def test_binary_speech_v10_frame_budget_can_limit_packed_row_count() -> None:
+    rows = [{"frame_count": 2, "source_id": str(index)} for index in range(9)]
+    batches = scorer_v10_frame_budget_batches(
+        rows, max_padded_frames=1024, max_batch_rows=4
+    )
+    assert [len(batch) for batch in batches] == [4, 4, 1]
+
+
 def test_binary_speech_v10_continuity_counts_internal_argmax_holes() -> None:
     torch = pytest.importorskip("torch")
     structure = predicted_run_structure(
@@ -373,3 +386,17 @@ def test_binary_speech_v10_continuity_auxiliary_only_penalizes_inside_speech() -
     assert unstable_pairs.item() == 2
     assert stable_loss.item() == pytest.approx(0.0)
     assert unstable_loss.item() > 0.0
+
+
+def test_binary_speech_v10_worst_frame_auxiliary_covers_runs_and_background() -> None:
+    torch = pytest.importorskip("torch")
+    labels = torch.tensor([[1, 1, 0, 1, 1], [0, 0, -100, 0, 0]], dtype=torch.long)
+    logits = torch.tensor(
+        [
+            [[0.0, 2.0], [2.0, 0.0], [2.0, 0.0], [0.0, 2.0], [0.0, 2.0]],
+            [[2.0, 0.0], [0.0, 2.0], [9.0, -9.0], [2.0, 0.0], [2.0, 0.0]],
+        ]
+    )
+    loss, term_count = sequence_worst_frame_auxiliary_loss(logits, labels, labels)
+    assert term_count == 3
+    assert loss.item() > 0.0

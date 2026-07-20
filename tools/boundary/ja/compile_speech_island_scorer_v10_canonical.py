@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+from fractions import Fraction
 import hashlib
 import json
 import math
@@ -80,14 +81,21 @@ def canonical_frame_labels(
     if not spans:
         raise ValueError(f"canonical source has no spans: {source.get('source_id')}")
     labels = np.full(count, CANONICAL_LABELS["unsure"], dtype=np.int64)
+    hop_samples = Fraction(str(frame_hop_s)) * sample_rate
     for frame_index in range(count):
-        frame_start = frame_index * frame_hop_s
-        frame_end = min(duration_s, (frame_index + 1) * frame_hop_s)
+        frame_start_sample = min(
+            sample_count, int(round(frame_index * hop_samples))
+        )
+        frame_end_sample = min(
+            sample_count, int(round((frame_index + 1) * hop_samples))
+        )
+        if frame_end_sample <= frame_start_sample:
+            raise ValueError("canonical frame projection produced an empty sample cell")
         observed = {
             str(span["label"])
             for span in spans
-            if min(frame_end, int(span["end_sample"]) / sample_rate)
-            > max(frame_start, int(span["start_sample"]) / sample_rate)
+            if min(frame_end_sample, int(span["end_sample"]))
+            > max(frame_start_sample, int(span["start_sample"]))
         }
         if not observed:
             raise ValueError(

@@ -39,6 +39,7 @@ from pipeline.memory_safety import (  # noqa: E402
 
 PARTITIONS = ("train", "val", "test")
 IGNORE_INDEX = -100
+TRAINING_ROW_SCHEMA = "speech_scorer_v10_binary_training_row_v1"
 
 
 def _read_rows(path: Path) -> list[dict[str, Any]]:
@@ -55,6 +56,8 @@ def validate_dataset_rows(rows: Sequence[dict[str, Any]]) -> dict[str, Any]:
     background_ids: set[str] = set()
     partition_counts: Counter[str] = Counter()
     for row in rows:
+        if row.get("schema") != TRAINING_ROW_SCHEMA or row.get("diagnostic_only"):
+            raise ValueError("Scorer v10 training rejects diagnostic/non-training rows")
         source_id = str(row.get("source_id") or "")
         partition = str(row.get("partition") or "")
         core_ids = [str(value) for value in row.get("core_ids") or ()]
@@ -205,7 +208,7 @@ def compute_mfcc_normalization(rows: Sequence[dict[str, Any]]) -> dict[str, list
 
 
 def frame_budget_batches(
-    rows: Sequence[dict[str, Any]], *, max_padded_frames: int
+    rows: Sequence[dict[str, Any]], *, max_padded_frames: int, max_batch_rows: int = 0
 ) -> list[list[dict[str, Any]]]:
     if max_padded_frames <= 0:
         raise ValueError("max_padded_frames must be positive")
@@ -215,7 +218,10 @@ def frame_budget_batches(
     maximum = 0
     for row in ordered:
         proposed = max(maximum, int(row["frame_count"]))
-        if batch and proposed * (len(batch) + 1) > max_padded_frames:
+        if batch and (
+            proposed * (len(batch) + 1) > max_padded_frames
+            or (max_batch_rows > 0 and len(batch) >= max_batch_rows)
+        ):
             result.append(batch)
             batch = []
             maximum = 0
@@ -316,6 +322,38 @@ def speech_continuity_auxiliary_loss(logits, target):
     loss = (squared_delta * adjacent_speech.to(squared_delta.dtype)).sum()
     loss = loss / pair_count.to(squared_delta.dtype).clamp_min(1.0)
     return loss, pair_count
+
+
+def sequence_worst_frame_auxiliary_loss(logits, target, canonical_labels):
+    """Focus training on the hardest frame per speech run/background source."""
+
+    import torch
+    import torch.nn.functional as F
+
+    if logits.ndim != 3 or logits.shape[-1] != 2:
+        raise ValueError("Scorer v10 worst-frame logits must have shape [batch,frames,2]")
+    if target.shape != logits.shape[:2] or canonical_labels.shape != target.shape:
+        raise ValueError("Scorer v10 worst-frame target shape mismatch")
+    terms = []
+    for index in range(int(logits.shape[0])):
+        labels_cpu = canonical_labels[index].numpy()
+        speech_runs = _runs(labels_cpu == 1)
+        if speech_runs:
+            for start, end in speech_runs:
+                losses = F.cross_entropy(
+                    logits[index, start:end], target[index, start:end], reduction="none"
+                )
+                terms.append(torch.max(losses))
+            continue
+        background = target[index] == 0
+        if bool(torch.any(background).item()):
+            losses = F.cross_entropy(
+                logits[index][background], target[index][background], reduction="none"
+            )
+            terms.append(torch.max(losses))
+    if not terms:
+        return logits.sum() * 0.0, 0
+    return torch.stack(terms).mean(), len(terms)
 
 
 def evaluate(model, rows, device, *, max_padded_frames: int, tolerance_frames: int):
@@ -484,6 +522,8 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
 
     if args.continuity_weight < 0.0:
         raise ValueError("--continuity-weight must be non-negative")
+    if args.worst_frame_weight < 0.0:
+        raise ValueError("--worst-frame-weight must be non-negative")
 
     if args.ptm_repo_id != QWEN_ASR_17B_REPO_ID:
         raise ValueError("Scorer v10 is 1.7B-only")
@@ -543,7 +583,9 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     _update_peak_memory(memory_peak, memory_snapshots[-1])
     rng = np.random.default_rng(args.seed)
     train_batches = frame_budget_batches(
-        by_partition["train"], max_padded_frames=args.max_batch_frames
+        by_partition["train"],
+        max_padded_frames=args.max_batch_frames,
+        max_batch_rows=args.max_batch_rows,
     )
     if device.type == "cuda":
         torch.manual_seed(args.seed)
@@ -585,6 +627,17 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         warmup_loss = (
             warmup_loss_rows[warmup_valid] * warmup_weights[warmup_valid]
         ).sum() / warmup_weights[warmup_valid].sum().clamp_min(1e-6)
+        warmup_continuity_loss, warmup_continuity_pairs = (
+            speech_continuity_auxiliary_loss(warmup_logits, warmup_target)
+        )
+        warmup_worst_loss, warmup_worst_terms = sequence_worst_frame_auxiliary_loss(
+            warmup_logits, warmup_target, warmup_labels
+        )
+        warmup_loss = (
+            warmup_loss
+            + float(args.continuity_weight) * warmup_continuity_loss
+            + float(args.worst_frame_weight) * warmup_worst_loss
+        )
         warmup_optimizer.zero_grad(set_to_none=True)
         warmup_loss.backward()
         warmup_optimizer.step()
@@ -618,6 +671,10 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             warmup_class_weights,
             warmup_weights,
             warmup_loss,
+            warmup_continuity_loss,
+            warmup_continuity_pairs,
+            warmup_worst_loss,
+            warmup_worst_terms,
             eval_warmup_val,
             eval_warmup_test,
         )
@@ -642,6 +699,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     losses: list[float] = []
     primary_losses: list[float] = []
     continuity_losses: list[float] = []
+    worst_frame_losses: list[float] = []
     started = time.monotonic()
     for step in range(1, args.max_steps + 1):
         if (step - 1) % len(train_batches) == 0:
@@ -667,13 +725,21 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         continuity_loss, continuity_pair_count = speech_continuity_auxiliary_loss(
             logits, target
         )
-        loss = primary_loss + float(args.continuity_weight) * continuity_loss
+        worst_frame_loss, worst_frame_term_count = sequence_worst_frame_auxiliary_loss(
+            logits, target, labels
+        )
+        loss = (
+            primary_loss
+            + float(args.continuity_weight) * continuity_loss
+            + float(args.worst_frame_weight) * worst_frame_loss
+        )
         optimizer.zero_grad(set_to_none=True)
         loss.backward()
         optimizer.step()
         losses.append(float(loss.detach().cpu()))
         primary_losses.append(float(primary_loss.detach().cpu()))
         continuity_losses.append(float(continuity_loss.detach().cpu()))
+        worst_frame_losses.append(float(worst_frame_loss.detach().cpu()))
         step_memory = _memory_snapshot(device, stage=f"train_step_{step}")
         _update_peak_memory(memory_peak, step_memory)
         if step % args.eval_interval == 0 or step == args.max_steps:
@@ -741,6 +807,11 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                     "weight": float(args.continuity_weight),
                     "runtime_effect": "none_binary_argmax_unchanged",
                 },
+                "worst_frame_auxiliary": {
+                    "kind": "speech_run_and_background_source_worst_frame_ce_v1",
+                    "weight": float(args.worst_frame_weight),
+                    "runtime_effect": "none_binary_argmax_unchanged",
+                },
             },
             schema=SPEECH_ISLAND_SCORER_V10_SCHEMA,
         ),
@@ -755,6 +826,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "mean_train_loss": float(np.mean(losses)),
         "mean_primary_loss": float(np.mean(primary_losses)),
         "mean_continuity_loss": float(np.mean(continuity_losses)),
+        "mean_worst_frame_loss": float(np.mean(worst_frame_losses)),
         "val": val,
         "test": test,
         "dataset": dataset_summary,
@@ -763,12 +835,24 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         **release_gate_fields(numeric_gate_pass_value),
         "training_initialization": "random",
         "seed": args.seed,
-        "loss": (
-            "weighted_cross_entropy"
-            if args.continuity_weight == 0.0
-            else "weighted_cross_entropy+speech_probability_adjacent_total_variation_v1"
+        "loss": "+".join(
+            [
+                "weighted_cross_entropy",
+                *(
+                    ["speech_probability_adjacent_total_variation_v1"]
+                    if args.continuity_weight > 0.0
+                    else []
+                ),
+                *(
+                    ["speech_run_and_background_source_worst_frame_ce_v1"]
+                    if args.worst_frame_weight > 0.0
+                    else []
+                ),
+            ]
         ),
         "continuity_weight": float(args.continuity_weight),
+        "worst_frame_weight": float(args.worst_frame_weight),
+        "max_batch_rows": int(args.max_batch_rows),
         "decision_mode": "binary_frame_argmax",
         "memory_snapshots": memory_snapshots,
         "memory_peak": memory_peak,
@@ -781,6 +865,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     del optimizer, model, best_state, logits, target, valid, loss_rows
     del class_weights, weights
     del loss, primary_loss, continuity_loss, continuity_pair_count
+    del worst_frame_loss, worst_frame_term_count
     gc.collect()
     if device.type == "cuda":
         torch.cuda.synchronize(device)
@@ -808,11 +893,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--max-steps", type=int, default=3000)
     parser.add_argument("--eval-interval", type=int, default=250)
     parser.add_argument("--max-batch-frames", type=int, default=4096)
+    parser.add_argument("--max-batch-rows", type=int, default=0)
     parser.add_argument("--learning-rate", type=float, default=2e-4)
     parser.add_argument("--weight-decay", type=float, default=1e-4)
     parser.add_argument("--background-weight", type=float, default=1.0)
     parser.add_argument("--speech-weight", type=float, default=1.0)
     parser.add_argument("--continuity-weight", type=float, default=0.0)
+    parser.add_argument("--worst-frame-weight", type=float, default=0.0)
     parser.add_argument("--hidden-size", type=int, default=128)
     parser.add_argument("--num-layers", type=int, default=2)
     parser.add_argument("--seed", type=int, default=17)

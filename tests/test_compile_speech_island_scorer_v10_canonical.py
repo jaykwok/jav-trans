@@ -158,6 +158,24 @@ def test_exact_mixed_frame_maps_to_unsure_without_a_boundary_band() -> None:
     ]
 
 
+def test_exact_frame_boundary_is_not_float_overlap_unsure() -> None:
+    source = {
+        "source_id": "exact-frame-boundary",
+        "sample_rate": 1000,
+        "sample_count": 60,
+        "canonical_spans": [
+            {"start_sample": 0, "end_sample": 20, "label": "speech"},
+            {"start_sample": 20, "end_sample": 60, "label": "background"},
+        ],
+    }
+    labels = canonical_frame_labels(source, frame_hop_s=0.02)
+    assert labels.tolist() == [
+        CANONICAL_LABELS["speech"],
+        CANONICAL_LABELS["background"],
+        CANONICAL_LABELS["background"],
+    ]
+
+
 def test_prepare_rejects_background_video_partition_leakage(tmp_path: Path) -> None:
     negatives = [_negative(tmp_path, partition) for partition in ("train", "val", "test")]
     negatives[1]["video_id"] = negatives[0]["video_id"]

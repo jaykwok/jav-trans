@@ -4,7 +4,7 @@
 
 ## Decision
 
-Scorer v10 的断兼容 schema、两 logit模型、argmax decoder、严格 dataset validator 和 random-init trainer plumbing 已完成真实 full training；checkpoint candidate 存在但 numeric/manual gate 未通过，production registry 与 `segment()` 继续 fail-fast 为 `pending_binary_scorer_audit`。
+Scorer v10 的断兼容 schema、两 logit 模型、argmax decoder、严格 dataset validator 和 random-init trainer plumbing 已完成真实 full training。当前最佳 checkpoint 在 corrected-r2 上通过 numeric gate，但 corrected-r3 的 replacement、zero-clipping 与 residual 人工 gate 仍 pending；production registry 与 `segment()` 继续 fail-fast 为 `pending_binary_scorer_audit`。
 
 ## Why v8/v9 cannot continue
 
@@ -89,3 +89,33 @@ A strict full A/B then compared the same data, seed, 3000 steps and frame budget
 The new baseline was then scored row-by-row at `agents/temp/20260719_232035_scorer-v10-continuity-baseline2250-checkpoint-audit/`. The reproducible composition join at `agents/temp/20260719_235624_scorer-v10-fragmentation-distribution-audit/` shows that additive overlay, not clean core speech, dominates the remaining failure: overlay/clean fragmented-row rates are `29.86/6.62%` on train, `31.25/11.32%` on val and `21.74/3.57%` on test. Train overlays below 12 dB reach `42.53%`. Val has 43 of 63 internal gaps in the middle 80% of a core, so an Outer edge refiner cannot recover them. Breathing, non-speech vocalization and kissing-like overlay types are prominent hard cases. The tool writes 158 train-only diagnostic hardcases and 27 held-out audit cases to separate files; it does not duplicate cores, repartition sources or alter the training manifest. Since both the old and new candidates already fail numeric gates, completing the old 720-card manual page cannot promote either checkpoint and may be paused until a numerically viable model exists.
 
 After a real v10 model exists, the same audit framework must generate pages for every prediction-drop/truth-speech case, all held-out hard cases, edge clipping and every greater-than-8-second residual. Numeric gates are capped at 95%; zero clipping and zero true-speech deletion require saved human verdicts before promotion.
+
+## Corrected-r3 diagnostic rescore
+
+The fragmentation audit was evaluated against the actual downstream workflow: each binary argmax speech run is an independent Scorer island, and neither Proposal, Outer, Split nor CueQC reconnects islands. The 61 internal gaps were reviewed `61/61`: one is the same ASR unit and therefore a real model fragmentation; 29 require at least one nonsemantic side to remain independently droppable; six contain two independent target-speech events; and 25 local clusters are not speech core. There were no unsure verdicts.
+
+Those topology decisions yielded 155 atomic intervals. Constraint propagation resolved 116; the reviewer completed the remaining 39 at `agents/audits/20260720_143410_scorer-v10-fragment-atomic-repair39/`. The final atomic labels are `background=115 / speech=40 / unsure=0`, with no relation violations. Applying them produced corrected-r3 without deleting sources or cores and without changing audio bytes or partitions:
+
+| item | corrected-r3 |
+| --- | --- |
+| sources / cores / max core use | `2665 / 2042 / 1` |
+| affected sources / cores | `32 / 33` |
+| changed atomic spans | `115 -> background` |
+| canonical frames | `speech 495089 / background 143491 / unsure 2058` |
+| canonical SHA256 | `f88d4cfc20fb46077f357ca15bc8c3368938ecfebfbc21728e50b4d957480f1a` |
+
+The canonical frame projector now uses `Fraction` plus integer sample-domain boundaries. This fixes exact 20 ms endpoints that binary floating-point could previously classify as a mixed/unsure frame.
+
+Because corrected-r2 and r3 have a byte-identical audio manifest, the existing PTM2048/MFCC40 values may be reused for checkpoint diagnosis only. Every r3 diagnostic row has `diagnostic_only=true / training_manifest_allowed=false`, and the trainer rejects it. Three repeated full rescoring runs produced the identical predictions SHA256 `d483d9ddd14307e8bbf6dd10701f7486ef94f7dc42d7fe0131bfceadf56a19f0`. The final 2665-row result is:
+
+| metric | r3 result |
+| --- | --- |
+| train / val / test continuity | `99.54 / 97.58 / 100%` |
+| internal gaps | `1 train / 0 val / 0 test` |
+| prediction-drop/truth-keep rows | `36` |
+| whole truth-run deletions | `12` |
+| rows with a model speech run >8s | `277` |
+| shared VRAM increment | `0 MiB` |
+| peak CUDA allocated / reserved | `571.375 / 1062 MiB` |
+
+The formal selection is complete at `321/321`: all `36/36` prediction-drop/truth-keep rows, all `277/277` >8-second rows, and every held-out hard case. The page `agents/audits/20260720_162315_scorer-v10-r3-residuals-final321/` saves `speech_scorer_v10_prediction_manual_verdict_v2`. It shows exact red `truth_speech ∩ model_background` spans, complete canonical and actual blue argmax timelines at absolute positions, and whole-source context without changing runtime segmentation. A separate page `agents/audits/20260720_162315_scorer-v10-r3-fragmentation-gap1/` contains the one remaining 60 ms internal gap. Both pages are pending; no human result is inferred from numeric metrics, and no checkpoint promotion is authorized.
