@@ -21,6 +21,10 @@ from tools.audits.generate_scorer_v10_background_speech_repair_audit_html import
     MANUAL_VERDICT_SCHEMA,
     SUMMARY_SCHEMA,
 )
+from tools.audits.evaluate_scorer_v10_background_source_recheck import (
+    OVERRIDE_SCHEMA as SOURCE_RECHECK_OVERRIDE_SCHEMA,
+    RESULT_SCHEMA as SOURCE_RECHECK_RESULT_SCHEMA,
+)
 
 
 RESULT_SCHEMA = "speech_scorer_v10_background_speech_repair_manual_gate_v1"
@@ -50,6 +54,84 @@ def _sha256(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
+def _load_source_recheck_exclusions(
+    *,
+    source_recheck_gate: Path | None,
+    summary: dict[str, Any],
+) -> tuple[set[str], dict[str, Any] | None]:
+    if source_recheck_gate is None:
+        return set(), None
+    gate = json.loads(source_recheck_gate.read_text(encoding="utf-8-sig"))
+    if gate.get("schema") != SOURCE_RECHECK_RESULT_SCHEMA:
+        raise ValueError("invalid Scorer background source recheck gate schema")
+    if (
+        gate.get("manual_review_complete") is not True
+        or gate.get("canonical_override_ready") is not True
+        or gate.get("background_speech_repair_exclusion_allowed") is not True
+    ):
+        raise ValueError("Scorer background source recheck gate is incomplete")
+    evidence = dict(gate.get("evidence") or {})
+    required_evidence = {
+        "original_prediction_audit_manifest",
+        "original_prediction_manual_verdicts",
+        "recheck_summary",
+        "recheck_audit_manifest",
+        "recheck_manual_verdicts",
+        "overrides",
+    }
+    if set(evidence) != required_evidence:
+        raise ValueError("Scorer background source recheck evidence is incomplete")
+    for key in sorted(required_evidence):
+        item = dict(evidence[key] or {})
+        path = Path(str(item.get("path") or ""))
+        if not path.is_file() or _sha256(path) != str(item.get("sha256") or ""):
+            raise ValueError(f"Scorer background source recheck evidence changed: {key}")
+    original_manifest = dict(evidence["original_prediction_audit_manifest"])
+    original_verdicts = dict(evidence["original_prediction_manual_verdicts"])
+    if Path(str(original_manifest["path"])).resolve() != Path(
+        str(summary["prediction_audit_manifest"])
+    ).resolve() or str(original_manifest["sha256"]) != str(
+        summary["prediction_audit_manifest_sha256"]
+    ):
+        raise ValueError("source recheck is bound to another prediction manifest")
+    if Path(str(original_verdicts["path"])).resolve() != Path(
+        str(summary["prediction_manual_verdicts"])
+    ).resolve() or str(original_verdicts["sha256"]) != str(
+        summary["prediction_manual_verdicts_sha256"]
+    ):
+        raise ValueError("source recheck is bound to another prediction verdict set")
+
+    overrides_path = Path(str(gate.get("overrides") or ""))
+    if overrides_path.resolve() != Path(
+        str(dict(evidence["overrides"])["path"])
+    ).resolve():
+        raise ValueError("source recheck override path differs from its evidence")
+    overrides = _rows(overrides_path)
+    if len(overrides) != int(gate.get("override_count") or -1):
+        raise ValueError("source recheck override count mismatch")
+    exclusions: set[str] = set()
+    for row in overrides:
+        source_id = str(row.get("source_id") or "")
+        if (
+            row.get("schema") != SOURCE_RECHECK_OVERRIDE_SCHEMA
+            or row.get("override_action") != "withdraw_canonical_contains_target_speech"
+            or row.get("canonical_action") != "retain_all_background"
+            or row.get("exclude_from_background_speech_repair") is not True
+            or str(row.get("original_verdict") or "")
+            != "canonical_contains_target_speech"
+            or str(row.get("replacement_verdict") or "") != "model_false_keep"
+            or not source_id
+            or source_id in exclusions
+        ):
+            raise ValueError("invalid Scorer background source recheck override")
+        exclusions.add(source_id)
+    if sorted(exclusions) != sorted(
+        str(value) for value in gate.get("overridden_source_ids") or ()
+    ):
+        raise ValueError("source recheck overridden source ids mismatch")
+    return exclusions, gate
+
+
 def _core_id(
     *, source_id: str, event_index: int, start_sample: int, end_sample: int
 ) -> str:
@@ -66,6 +148,7 @@ def evaluate(
     audit_manifest: Path,
     manual_verdicts: Path,
     output: Path,
+    source_recheck_gate: Path | None = None,
 ) -> dict[str, Any]:
     summary = json.loads(audit_summary.read_text(encoding="utf-8-sig"))
     if summary.get("schema") != SUMMARY_SCHEMA:
@@ -128,6 +211,18 @@ def evaluate(
             ):
                 raise ValueError(f"background speech repair link identity mismatch: {source_id}")
 
+    source_recheck_exclusions, source_recheck = _load_source_recheck_exclusions(
+        source_recheck_gate=source_recheck_gate,
+        summary=summary,
+    )
+    unknown_source_rechecks = sorted(
+        source_recheck_exclusions - set(islands_by_source)
+    )
+    if unknown_source_rechecks:
+        raise ValueError(
+            f"source recheck does not belong to this repair audit: {unknown_source_rechecks}"
+        )
+
     verdicts: dict[str, dict[str, Any]] = {}
     for row in _rows(manual_verdicts):
         if row.get("schema") != MANUAL_VERDICT_SCHEMA:
@@ -181,7 +276,11 @@ def evaluate(
                     "verdict": verdict,
                 }
             )
-        if source_target_count == 0:
+        if source_id in source_recheck_exclusions and source_target_count != 0:
+            raise ValueError(
+                f"source recheck exclusion still has target speech islands: {source_id}"
+            )
+        if source_target_count == 0 and source_id not in source_recheck_exclusions:
             source_without_target_ids.append(source_id)
         for link in links:
             left_id = str(link["left_island_id"])
@@ -222,6 +321,8 @@ def evaluate(
     events: list[dict[str, Any]] = []
     if repair_ready:
         for source_id in sorted(islands_by_source):
+            if source_id in source_recheck_exclusions:
+                continue
             islands = islands_by_source[source_id]
             links = links_by_source[source_id]
             current: dict[str, Any] | None = None
@@ -313,11 +414,20 @@ def evaluate(
         "boundary_followup_ids": sorted(boundary_followup_ids),
         "source_without_target_count": len(source_without_target_ids),
         "source_without_target_ids": sorted(source_without_target_ids),
+        "source_recheck_gate": str(source_recheck_gate or ""),
+        "source_recheck_gate_sha256": (
+            _sha256(source_recheck_gate) if source_recheck_gate is not None else ""
+        ),
+        "source_recheck_exclusion_count": len(source_recheck_exclusions),
+        "source_recheck_exclusion_ids": sorted(source_recheck_exclusions),
+        "repair_source_count": len(islands_by_source) - len(source_recheck_exclusions),
         "verdict_counts": dict(sorted(verdict_counts.items())),
         "manual_review_complete": manual_review_complete,
         "repair_event_count": len(events),
         "repair_events": str(events_path),
+        "repair_events_sha256": _sha256(events_path),
         "decisions": str(decisions_path),
+        "decisions_sha256": _sha256(decisions_path),
         "canonical_repair_ready": repair_ready,
         "training_manifest_allowed": False,
         "checkpoint_promotion_authorized": False,
@@ -334,6 +444,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--audit-summary", required=True)
     parser.add_argument("--audit-manifest", required=True)
     parser.add_argument("--manual-verdicts", required=True)
+    parser.add_argument("--source-recheck-gate", default="")
     parser.add_argument("--output", required=True)
     return parser.parse_args()
 
@@ -347,6 +458,9 @@ if __name__ == "__main__":
                 audit_manifest=Path(args.audit_manifest),
                 manual_verdicts=Path(args.manual_verdicts),
                 output=Path(args.output),
+                source_recheck_gate=(
+                    Path(args.source_recheck_gate) if args.source_recheck_gate else None
+                ),
             ),
             ensure_ascii=False,
         )
