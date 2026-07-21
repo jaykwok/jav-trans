@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 from pathlib import Path
 import re
@@ -10,6 +11,9 @@ import pytest
 
 from boundary.contracts import ACOUSTIC_BINARY_V12_CONTRACT
 from tools.audits.evaluate_scorer_v10_full_source_span_audit import evaluate
+from tools.audits.evaluate_scorer_v10_prediction_audit import (
+    RESULT_SCHEMA as PREDICTION_GATE_SCHEMA,
+)
 from tools.audits.generate_scorer_v10_full_source_span_audit_html import (
     ITEM_SCHEMA,
     MANUAL_VERDICT_SCHEMA,
@@ -17,7 +21,11 @@ from tools.audits.generate_scorer_v10_full_source_span_audit_html import (
 )
 
 
-def _write_selection(tmp_path: Path) -> tuple[Path, str]:
+def _sha256(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def _write_selection(tmp_path: Path) -> tuple[Path, Path, str]:
     source_id = "scorer-bg-source"
     audio_dir = tmp_path / "audio"
     audio_dir.mkdir()
@@ -26,6 +34,7 @@ def _write_selection(tmp_path: Path) -> tuple[Path, str]:
     selection.write_text(
         json.dumps(
             {
+                "audit_id": f"background_false_keep:{source_id}",
                 "source_id": source_id,
                 "partition": "train",
                 "row_role": "all_background",
@@ -47,17 +56,41 @@ def _write_selection(tmp_path: Path) -> tuple[Path, str]:
         + "\n",
         encoding="utf-8",
     )
-    return selection, source_id
+    summary = tmp_path / "prediction_summary.json"
+    summary.write_text("{}\n", encoding="utf-8")
+    verdicts = tmp_path / "prediction_verdicts.jsonl"
+    verdicts.write_text("{}\n", encoding="utf-8")
+    gate = tmp_path / "prediction_gate.json"
+    gate.write_text(
+        json.dumps(
+            {
+                "schema": PREDICTION_GATE_SCHEMA,
+                "audit_summary": str(summary),
+                "audit_summary_sha256": _sha256(summary),
+                "audit_manifest": str(selection),
+                "audit_manifest_sha256": _sha256(selection),
+                "manual_verdicts": str(verdicts),
+                "manual_verdicts_sha256": _sha256(verdicts),
+                "manual_review_complete": True,
+                "canonical_repair_ids": [
+                    f"background_false_keep:{source_id}"
+                ],
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    return selection, gate, source_id
 
 
 def test_full_source_span_page_has_no_model_seed_and_saves_complete_truth(
     tmp_path: Path,
 ) -> None:
-    selection, source_id = _write_selection(tmp_path)
+    selection, gate, source_id = _write_selection(tmp_path)
     index = build_audit(
         prediction_audit_manifest=selection,
+        prediction_manual_gate=gate,
         output_dir=tmp_path / "audit",
-        source_ids={source_id},
     )
     page = index.read_text(encoding="utf-8")
     assert "本页不显示模型输出" in page
@@ -67,6 +100,8 @@ def test_full_source_span_page_has_no_model_seed_and_saves_complete_truth(
     assert "未完成时不会写文件" in page
     assert "拒绝保存：还有" in page
     assert "save.disabled=pending!==0" in page
+    assert "顶部显示全部 source 已确认后才能保存" in page
+    assert "达到 2/2" not in page
     assert "model_speech" not in page
     assert "prediction_spans" not in page
     assert "漏检" not in page
@@ -92,6 +127,7 @@ def test_full_source_span_page_has_no_model_seed_and_saves_complete_truth(
     ]
     summary = json.loads((index.parent / "summary.json").read_text(encoding="utf-8"))
     assert summary["model_output_used_as_annotation_seed"] is False
+    assert summary["prediction_manual_gate_sha256"] == _sha256(gate)
     assert (
         summary["boundary_serialization_contract_id"]
         == ACOUSTIC_BINARY_V12_CONTRACT.contract_id
@@ -121,12 +157,12 @@ def test_full_source_span_page_has_no_model_seed_and_saves_complete_truth(
 
 
 def test_full_source_span_gate_requires_gap_free_coverage(tmp_path: Path) -> None:
-    selection, source_id = _write_selection(tmp_path)
+    selection, gate, source_id = _write_selection(tmp_path)
     audit_dir = tmp_path / "audit"
     build_audit(
         prediction_audit_manifest=selection,
+        prediction_manual_gate=gate,
         output_dir=audit_dir,
-        source_ids={source_id},
     )
     verdicts = tmp_path / "manual_verdicts.jsonl"
     verdicts.write_text(
@@ -217,12 +253,12 @@ def test_full_source_span_gate_requires_gap_free_coverage(tmp_path: Path) -> Non
 
 
 def test_full_source_span_gate_keeps_unreviewed_rows_pending(tmp_path: Path) -> None:
-    selection, source_id = _write_selection(tmp_path)
+    selection, gate, source_id = _write_selection(tmp_path)
     audit_dir = tmp_path / "audit"
     build_audit(
         prediction_audit_manifest=selection,
+        prediction_manual_gate=gate,
         output_dir=audit_dir,
-        source_ids={source_id},
     )
     verdicts = tmp_path / "manual_verdicts.jsonl"
     verdicts.write_text(
@@ -253,3 +289,17 @@ def test_full_source_span_gate_keeps_unreviewed_rows_pending(tmp_path: Path) -> 
     assert gate["manual_gate_passed"] is False
     assert gate["canonical_recompile_allowed"] is False
     assert gate["unreviewed_source_ids"] == [source_id]
+
+
+def test_full_source_span_page_rejects_tampered_prediction_evidence(
+    tmp_path: Path,
+) -> None:
+    selection, gate, _source_id = _write_selection(tmp_path)
+    selection.write_text(selection.read_text(encoding="utf-8") + "\n", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="evidence SHA mismatch"):
+        build_audit(
+            prediction_audit_manifest=selection,
+            prediction_manual_gate=gate,
+            output_dir=tmp_path / "audit",
+        )

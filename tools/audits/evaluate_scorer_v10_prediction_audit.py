@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 from collections import Counter
+import hashlib
 import json
 from pathlib import Path
 import sys
@@ -67,6 +68,10 @@ CANONICAL_REPAIR_VERDICTS = {
 def _rows(path: Path) -> list[dict[str, Any]]:
     with path.open("r", encoding="utf-8-sig") as handle:
         return [json.loads(line) for line in handle if line.strip()]
+
+
+def _sha256(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
 def evaluate(
@@ -181,8 +186,11 @@ def evaluate(
     result = {
         "schema": RESULT_SCHEMA,
         "audit_summary": str(audit_summary),
+        "audit_summary_sha256": _sha256(audit_summary),
         "audit_manifest": str(audit_manifest),
+        "audit_manifest_sha256": _sha256(audit_manifest),
         "manual_verdicts": str(manual_verdicts),
+        "manual_verdicts_sha256": _sha256(manual_verdicts),
         "audit_item_count": len(targets),
         "manual_verdict_count": len(verdicts),
         "missing_count": len(missing_ids),

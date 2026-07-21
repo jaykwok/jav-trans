@@ -25,6 +25,7 @@ FRAME_HOP_S = 0.02
 SUMMARY_SCHEMA = "speech_scorer_v10_full_source_span_audit_summary_v1"
 ITEM_SCHEMA = "speech_scorer_v10_full_source_span_audit_item_v1"
 MANUAL_VERDICT_SCHEMA = "speech_scorer_v10_full_source_span_manual_verdict_v1"
+PREDICTION_GATE_SCHEMA = "speech_scorer_v10_prediction_manual_gate_v3"
 
 
 def _rows(path: Path) -> list[dict[str, Any]]:
@@ -67,7 +68,7 @@ button,input{font:inherit}button{padding:7px 10px;border:1px solid #69737e;borde
 <main>
 <section>
   <div><b>本页不显示模型输出：</b>没有蓝条、Proposal、ASR 文本或旧 all-background 分段；它们均不得成为人工真值候选。</div>
-  <div><b>标注方式：</b>从头到尾听完整条 source，添加所有目标语音区间；听不清或标签不确定的区间添加为 unsure。每条添加完后必须点击“已从头听到尾，以上区间完整”，顶部达到 2/2 后才能保存。时间自动对齐到 Scorer 的 20ms frame。</div>
+  <div><b>标注方式：</b>从头到尾听完整条 source，添加所有目标语音区间；听不清或标签不确定的区间添加为 unsure。每条添加完后必须点击“已从头听到尾，以上区间完整”，顶部显示全部 source 已确认后才能保存。时间自动对齐到 Scorer 的 20ms frame。</div>
   <div><b>background 合同：</b>未标出的差集只有在勾选“已从头听到尾”后才成为 background。unsure 会保留在 canonical，并在 normalization、split、loss、metrics 和 gate 中映射为 ignore=-100。</div>
   <div><b>禁止补救：</b>不按时长合并、不扩大边界、不使用 runtime threshold，也不因为 CueQC 可能删除短片段而忽略 Scorer 漏召回。</div>
 </section>
@@ -107,22 +108,52 @@ document.getElementById('save').onclick=async()=>{const pending=rows.filter(row=
 def build_audit(
     *,
     prediction_audit_manifest: Path,
+    prediction_manual_gate: Path,
     output_dir: Path,
-    source_ids: set[str],
 ) -> Path:
-    if not source_ids:
-        raise ValueError("full-source span audit requires explicit source ids")
+    gate = json.loads(prediction_manual_gate.read_text(encoding="utf-8-sig"))
+    if gate.get("schema") != PREDICTION_GATE_SCHEMA:
+        raise ValueError("invalid Scorer v10 prediction manual gate schema")
+    if gate.get("manual_review_complete") is not True:
+        raise ValueError("prediction manual review is incomplete")
+    if Path(str(gate.get("audit_manifest") or "")).resolve() != (
+        prediction_audit_manifest.resolve()
+    ):
+        raise ValueError("prediction manual gate does not bind the audit manifest")
+    for field, path in (
+        ("audit_manifest_sha256", prediction_audit_manifest),
+        ("audit_summary_sha256", Path(str(gate.get("audit_summary") or ""))),
+        ("manual_verdicts_sha256", Path(str(gate.get("manual_verdicts") or ""))),
+    ):
+        if not path.is_file() or str(gate.get(field) or "") != _sha256(path):
+            raise ValueError(f"prediction manual gate evidence SHA mismatch: {field}")
+    repair_audit_ids = {
+        str(value) for value in gate.get("canonical_repair_ids") or []
+    }
+    if not repair_audit_ids:
+        raise ValueError("prediction manual gate has no canonical repair sources")
+
     selected: list[dict[str, Any]] = []
-    available: set[str] = set()
+    source_ids: set[str] = set()
     seen: set[str] = set()
+    seen_audit_ids: set[str] = set()
     for row in _rows(prediction_audit_manifest):
+        audit_id = str(row.get("audit_id") or "")
         source_id = str(row.get("source_id") or "")
-        if not source_id or source_id in seen:
-            raise ValueError("prediction audit manifest requires unique source ids")
+        if (
+            not audit_id
+            or not source_id
+            or source_id in seen
+            or audit_id in seen_audit_ids
+        ):
+            raise ValueError(
+                "prediction audit manifest requires unique audit and source ids"
+            )
         seen.add(source_id)
-        available.add(source_id)
-        if source_id not in source_ids:
+        seen_audit_ids.add(audit_id)
+        if audit_id not in repair_audit_ids:
             continue
+        source_ids.add(source_id)
         if (
             str(row.get("row_role") or "") != "all_background"
             or str(row.get("category") or "") != "background_false_keep"
@@ -136,7 +167,7 @@ def build_audit(
         if abs(duration_s - expected_duration) > FRAME_HOP_S + 1e-9:
             raise ValueError(f"full-source duration/frame mismatch: {source_id}")
         selected.append(row)
-    missing = sorted(source_ids - available)
+    missing = sorted(repair_audit_ids - seen_audit_ids)
     if missing:
         raise ValueError(f"full-source audit sources are missing: {missing}")
     if len(selected) != len(source_ids):
@@ -190,6 +221,8 @@ def build_audit(
         ),
         "prediction_audit_manifest": str(prediction_audit_manifest),
         "prediction_audit_manifest_sha256": _sha256(prediction_audit_manifest),
+        "prediction_manual_gate": str(prediction_manual_gate),
+        "prediction_manual_gate_sha256": _sha256(prediction_manual_gate),
         "source_count": len(payload),
         "partition_counts": dict(Counter(row["partition"] for row in payload)),
         "source_ids": [row["source_id"] for row in payload],
@@ -215,8 +248,8 @@ def build_audit(
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--prediction-audit-manifest", required=True)
+    parser.add_argument("--prediction-manual-gate", required=True)
     parser.add_argument("--output-dir", required=True)
-    parser.add_argument("--only-source-id", action="append", default=[])
     return parser.parse_args()
 
 
@@ -225,7 +258,7 @@ if __name__ == "__main__":
     print(
         build_audit(
             prediction_audit_manifest=Path(args.prediction_audit_manifest),
+            prediction_manual_gate=Path(args.prediction_manual_gate),
             output_dir=Path(args.output_dir),
-            source_ids=set(args.only_source_id),
         )
     )

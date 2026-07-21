@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 from pathlib import Path
 
@@ -97,6 +98,15 @@ def test_prediction_manual_gate_classifies_model_and_canonical_blockers(
         output=tmp_path / "gate.json",
     )
     assert result["manual_review_complete"] is True
+    assert result["audit_summary_sha256"] == hashlib.sha256(
+        summary.read_bytes()
+    ).hexdigest()
+    assert result["audit_manifest_sha256"] == hashlib.sha256(
+        manifest.read_bytes()
+    ).hexdigest()
+    assert result["manual_verdicts_sha256"] == hashlib.sha256(
+        verdicts.read_bytes()
+    ).hexdigest()
     assert result["zero_clipping_violation_count"] == 1
     assert result["background_behavior_issue_count"] == 1
     assert result["canonical_repair_count"] == 2
