@@ -4,6 +4,9 @@ import hashlib
 import json
 from pathlib import Path
 
+import numpy as np
+import soundfile as sf
+
 from tools.audits.evaluate_scorer_v10_canonical_r4_replacement_audit import (
     RESULT_SCHEMA,
     evaluate,
@@ -23,7 +26,7 @@ def _write_jsonl(path: Path, rows: list[dict]) -> None:
 
 def test_canonical_r4_replacement_page_and_gate(tmp_path: Path) -> None:
     audio = tmp_path / "audio.wav"
-    audio.write_bytes(b"RIFF-audit")
+    sf.write(audio, np.linspace(-0.2, 0.2, 640, dtype=np.float32), 16000)
     canonical = tmp_path / "canonical.jsonl"
     _write_jsonl(
         canonical,
@@ -117,7 +120,10 @@ def test_canonical_r4_replacement_page_and_gate(tmp_path: Path) -> None:
 
     assert summary["schema"] == SUMMARY_SCHEMA
     assert summary["review_item_count"] == 1
-    assert "直接播放/停止" in page
+    assert summary["standalone_exact_clip_playback"] is True
+    assert summary["standalone_clip_count"] >= 2
+    assert "独立 WAV" in page
+    assert "源事件非目标语音（整组撤销）" in page
     assert "完整 island" in page
     assert 'preload="none"' in page
 
@@ -149,3 +155,18 @@ def test_canonical_r4_replacement_page_and_gate(tmp_path: Path) -> None:
     assert result["canonical_repair_pass"] is True
     assert result["feature_cache_relabel_allowed"] is True
     assert result["training_manifest_allowed"] is False
+
+    invalid_verdicts = output / "manual_verdicts.invalid.jsonl"
+    invalid = json.loads(verdicts.read_text(encoding="utf-8"))
+    invalid["verdict"] = "source_event_not_target"
+    _write_jsonl(invalid_verdicts, [invalid])
+    invalid_result = evaluate(
+        audit_summary=output / "summary.json",
+        audit_manifest=output / "audit_manifest.jsonl",
+        manual_verdicts=invalid_verdicts,
+        output=output / "manual_gate.invalid.json",
+    )
+    assert invalid_result["manual_review_complete"] is True
+    assert invalid_result["canonical_repair_pass"] is False
+    assert invalid_result["source_event_repair_count"] == 1
+    assert invalid_result["feature_cache_relabel_allowed"] is False

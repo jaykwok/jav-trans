@@ -22,9 +22,10 @@ from tools.audits.generate_scorer_v10_canonical_r4_replacement_audit_html import
 )
 
 
-RESULT_SCHEMA = "speech_scorer_v10_canonical_r4_replacement_manual_gate_v1"
+RESULT_SCHEMA = "speech_scorer_v10_canonical_r4_replacement_manual_gate_v2"
 VERDICTS = {
     "repair_speech_correct",
+    "source_event_not_target",
     "not_target_after_render",
     "boundary_incomplete",
     "unsure",
@@ -109,10 +110,35 @@ def evaluate(
         for item_id, row in verdicts.items()
         if row.get("verdict") in {"not_target_after_render", "boundary_incomplete"}
     )
+    items_by_event: dict[str, list[str]] = {}
+    for item_id, target in targets.items():
+        items_by_event.setdefault(str(target["event_id"]), []).append(item_id)
+    source_event_repair_ids: list[str] = []
+    source_event_repair_item_ids: list[str] = []
+    for event_id, item_ids in items_by_event.items():
+        values = {
+            str(verdicts.get(item_id, {}).get("verdict") or "missing")
+            for item_id in item_ids
+        }
+        if "source_event_not_target" not in values:
+            continue
+        if values != {"source_event_not_target"}:
+            raise ValueError(
+                f"source-event rejection must cover its complete placement group: {event_id}"
+            )
+        source_event_repair_ids.append(event_id)
+        source_event_repair_item_ids.extend(item_ids)
     counts = Counter(str(row.get("verdict") or "unreviewed") for row in verdicts.values())
     complete = not missing_ids and not unreviewed_ids
-    passed = complete and not unsure_ids and not rejected_ids and all(
-        row.get("verdict") == "repair_speech_correct" for row in verdicts.values()
+    passed = (
+        complete
+        and not unsure_ids
+        and not rejected_ids
+        and not source_event_repair_ids
+        and all(
+            row.get("verdict") == "repair_speech_correct"
+            for row in verdicts.values()
+        )
     )
     result = {
         "schema": RESULT_SCHEMA,
@@ -134,6 +160,10 @@ def evaluate(
         "unsure_ids": unsure_ids,
         "repair_followup_count": len(rejected_ids),
         "repair_followup_ids": rejected_ids,
+        "source_event_repair_count": len(source_event_repair_ids),
+        "source_event_repair_ids": sorted(source_event_repair_ids),
+        "source_event_repair_item_count": len(source_event_repair_item_ids),
+        "source_event_repair_item_ids": sorted(source_event_repair_item_ids),
         "manual_review_complete": complete,
         "canonical_repair_pass": passed,
         "feature_cache_relabel_allowed": passed,

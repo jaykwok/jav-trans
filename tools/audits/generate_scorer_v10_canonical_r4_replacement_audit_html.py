@@ -10,6 +10,8 @@ from pathlib import Path
 import sys
 from typing import Any
 
+import soundfile as sf
+
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 if str(PROJECT_ROOT) not in sys.path:
@@ -22,10 +24,10 @@ from tools.boundary.ja.apply_speech_island_scorer_v10_canonical_r4_repairs impor
 )
 
 
-SUMMARY_SCHEMA = "speech_scorer_v10_canonical_r4_replacement_audit_summary_v1"
-ITEM_SCHEMA = "speech_scorer_v10_canonical_r4_replacement_audit_item_v1"
+SUMMARY_SCHEMA = "speech_scorer_v10_canonical_r4_replacement_audit_summary_v2"
+ITEM_SCHEMA = "speech_scorer_v10_canonical_r4_replacement_audit_item_v2"
 MANUAL_VERDICT_SCHEMA = (
-    "speech_scorer_v10_canonical_r4_replacement_manual_verdict_v1"
+    "speech_scorer_v10_canonical_r4_replacement_manual_verdict_v2"
 )
 
 
@@ -55,20 +57,22 @@ audio{{width:100%;margin:5px 0}}button{{font:inherit;padding:6px 9px;margin:3px;
 </style></head><body>
 <header><strong>1.7B Scorer v10 · canonical r4 replacement audit</strong><button id="next">下一个未裁决</button><button id="stop">停止播放</button><button id="save">保存裁决</button><span id="status"></span></header>
 <main><section>
-<div><b>审计对象：</b>5 个原 all-background control 与其 6 个 active composite 依赖，共 19 个精确 crop/tile occurrence。每条都来自已人工确认的 source repair event；这里复核它经过裁剪、循环平铺或 additive mix 后，实际听感是否仍是目标语音且边界完整。</div>
-<div><b>播放合同：</b>“源事件”“实际映射”“实际改标签区间”和绿色/黄色 canonical 条都只播放自己的 start–end，到点立即停止，不添加上下文。最下面的完整 island 播放器只用于判断整句/整段关系。</div>
-<div><b>标签：</b>“映射语音正确”表示 r4 处理可保留；“渲染后不是目标语音”表示该 occurrence 不能据此新增 speech；“边界不完整”表示 crop/tile 只留下截断残片，需精确返修。黄色改绿为 0 的 occurrence 本来就在已有 speech 内，不会重复创建 core，但仍需确认依赖映射。</div>
+<div><b>审计对象：</b>5 个原 all-background control 与其 6 个 active composite 依赖，共 19 个精确 crop/tile occurrence。先判断原 source event 本身是否为目标语音，再判断它经过裁剪、循环平铺或 additive mix 后是否仍完整有效。</div>
+<div><b>播放合同：</b>“源事件”“实际映射”“实际改标签区间”和绿色/黄色 canonical 条现在都是物理裁好的独立 WAV，从 0 播到文件结尾，不再依赖浏览器 seek，也不添加任何上下文。最下面的完整 island 播放器只用于判断整句/整段关系。</div>
+<div><b>标签：</b>如果源 event 本身就不是目标语音，选“源事件非目标语音（整组撤销）”，同一 event 的 control、crop、tile 和 overlay occurrence 会一次性全部标记；不要逐条选“渲染后不是目标语音”。后者只用于源 event 正确、但某个具体渲染 occurrence 因裁剪/混音已不再构成目标语音的情况。</div>
 </section><div id="list"></div></main>
 <script>
-const rows={encoded};const verdictSchema={verdict_schema};const key='scorer-v10-canonical-r4-replacement-v1:'+location.pathname;const ann=JSON.parse(localStorage.getItem(key)||'{{}}');let activeAudio=null,activeButton=null,activeStop=null;
+const rows={encoded};const verdictSchema={verdict_schema};const key='scorer-v10-canonical-r4-replacement-v2:'+location.pathname;const ann=JSON.parse(localStorage.getItem(key)||'{{}}');let activeClipButton=null,activeClipAudio=null;
 function esc(s){{return String(s??'').replace(/[&<>"']/g,c=>({{'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}}[c]));}}
 function ensure(r){{ann[r.item_id]??={{verdict:'',updated_at:''}};return ann[r.item_id];}}
-function stopPlayback(){{if(activeAudio&&activeStop)activeAudio.removeEventListener('timeupdate',activeStop);if(activeAudio)activeAudio.pause();if(activeButton)activeButton.classList.remove('playing');activeAudio=null;activeButton=null;activeStop=null;}}
-function pauseOtherAudio(except){{document.querySelectorAll('audio').forEach(a=>{{if(a!==except&&!a.paused)a.pause();}});}}
-function playExact(audio,button,start,end){{if(activeAudio===audio&&activeButton===button&&!audio.paused){{stopPlayback();return;}}stopPlayback();pauseOtherAudio(audio);activeAudio=audio;activeButton=button;button.classList.add('playing');const begin=()=>{{audio.currentTime=start;activeStop=()=>{{if(audio.currentTime>=end)stopPlayback();}};audio.addEventListener('timeupdate',activeStop);audio.play();}};if(audio.readyState<1){{audio.addEventListener('loadedmetadata',begin,{{once:true}});audio.load();}}else begin();}}
+function clearClipState(){{if(activeClipButton)activeClipButton.classList.remove('playing');activeClipButton=null;activeClipAudio=null;}}
+function stopPlayback(){{document.querySelectorAll('audio').forEach(a=>a.pause());clearClipState();}}
+function pauseOtherAudio(except){{document.querySelectorAll('audio').forEach(a=>{{if(a!==except&&!a.paused)a.pause();}});if(activeClipAudio&&activeClipAudio!==except)clearClipState();}}
+function playClip(audio,button,src){{if(activeClipAudio===audio&&activeClipButton===button&&!audio.paused){{audio.pause();clearClipState();return;}}pauseOtherAudio(audio);audio.src=src;audio.currentTime=0;button.classList.add('playing');activeClipButton=button;activeClipAudio=audio;audio.play();}}
 function pct(v,d){{return Math.max(0,Math.min(100,100*v/d));}}function span(a,b){{return `${{Number(a).toFixed(3)}}–${{Number(b).toFixed(3)}}s`;}}
-function verdictButtons(a){{const values=[['repair_speech_correct','映射语音正确',false],['not_target_after_render','渲染后不是目标语音',true],['boundary_incomplete','边界不完整',true],['unsure','不确定',true]];return values.map(v=>`<button data-v="${{v[0]}}" class="${{v[2]?'risk ':''}}${{a.verdict===v[0]?'active':''}}">${{v[1]}}</button>`).join('');}}
-function render(){{stopPlayback();const root=document.getElementById('list');root.innerHTML='';for(const r of rows){{const a=ensure(r),card=document.createElement('article');card.id='item-'+r.item_index;if(a.verdict==='repair_speech_correct')card.classList.add('done');const bars=r.canonical_spans.map(s=>`<button type="button" class="span ${{s.label}}" style="left:${{pct(s.start_s,r.target_duration_s)}}%;width:${{Math.max(.2,pct(s.end_s-s.start_s,r.target_duration_s))}}%" data-target-start="${{s.start_s}}" data-target-end="${{s.end_s}}" title="${{esc(s.label_source)}} ${{span(s.start_s,s.end_s)}}">${{esc(s.label)}}</button>`).join('');const changes=r.background_label_change_ranges.map((s,i)=>`<button type="button" data-target-start="${{s.start_s}}" data-target-end="${{s.end_s}}">改标签 ${{i+1}} · ${{span(s.start_s,s.end_s)}}</button>`).join('')||'<small>该 occurrence 全部落在已有 speech 内，没有新增 core。</small>';card.innerHTML=`<h2>${{esc(r.item_id)}}</h2><small>${{esc(r.partition)}} / ${{esc(r.role)}} / mapped=${{span(r.mapped_start_s,r.mapped_end_s)}} / changed=${{r.background_label_change_sample_count}} samples / already-speech=${{r.already_speech_sample_count}} samples</small><div class="exact"><div><b>原 source repair event</b><audio class="source-audio" preload="none" src="${{esc(r.source_audio)}}"></audio><button type="button" data-source-start="${{r.source_event_start_s}}" data-source-end="${{r.source_event_end_s}}">直接播放/停止 · ${{span(r.source_event_start_s,r.source_event_end_s)}}</button></div><div class="mapped"><b>实际 crop/tile/mix 后 occurrence</b><audio class="target-exact-audio" preload="none" src="${{esc(r.target_audio)}}"></audio><button type="button" data-target-start="${{r.mapped_start_s}}" data-target-end="${{r.mapped_end_s}}">直接播放/停止 · ${{span(r.mapped_start_s,r.mapped_end_s)}}</button></div><div class="changed"><b>实际 background→speech 子区间</b>${{changes}}</div></div><div class="track">${{bars}}</div><div>${{verdictButtons(a)}}</div><h3>实际候选工作流完整 island</h3><audio class="target-full-audio" controls preload="none" src="${{esc(r.target_audio)}}"></audio>`;const sourceAudio=card.querySelector('.source-audio'),targetAudio=card.querySelector('.target-exact-audio');card.querySelectorAll('[data-source-start]').forEach(b=>b.onclick=()=>playExact(sourceAudio,b,Number(b.dataset.sourceStart),Number(b.dataset.sourceEnd)));card.querySelectorAll('[data-target-start]').forEach(b=>b.onclick=()=>playExact(targetAudio,b,Number(b.dataset.targetStart),Number(b.dataset.targetEnd)));card.querySelectorAll('[data-v]').forEach(b=>b.onclick=()=>{{a.verdict=b.dataset.v;a.updated_at=new Date().toISOString();localStorage.setItem(key,JSON.stringify(ann));render();}});card.querySelector('.target-full-audio').addEventListener('play',e=>{{stopPlayback();pauseOtherAudio(e.currentTarget);}});root.appendChild(card);}}document.getElementById('status').textContent=`已裁决 ${{rows.filter(r=>ensure(r).verdict).length}}/${{rows.length}}`;}}
+function verdictButtons(a){{const values=[['repair_speech_correct','映射语音正确',false],['source_event_not_target','源事件非目标语音（整组撤销）',true],['not_target_after_render','仅此渲染后不是目标语音',true],['boundary_incomplete','边界不完整',true],['unsure','不确定',true]];return values.map(v=>`<button data-v="${{v[0]}}" class="${{v[2]?'risk ':''}}${{a.verdict===v[0]?'active':''}}">${{v[1]}}</button>`).join('');}}
+function setVerdict(r,value){{const now=new Date().toISOString();if(value==='source_event_not_target'){{rows.filter(x=>x.event_id===r.event_id).forEach(x=>{{const a=ensure(x);a.verdict=value;a.updated_at=now;}});}}else{{const group=rows.filter(x=>x.event_id===r.event_id);if(group.some(x=>ensure(x).verdict==='source_event_not_target'))group.forEach(x=>{{const a=ensure(x);a.verdict='';a.updated_at=now;}});const a=ensure(r);a.verdict=value;a.updated_at=now;}}localStorage.setItem(key,JSON.stringify(ann));render();}}
+function render(){{stopPlayback();const root=document.getElementById('list');root.innerHTML='';for(const r of rows){{const a=ensure(r),card=document.createElement('article');card.id='item-'+r.item_index;if(['repair_speech_correct','source_event_not_target'].includes(a.verdict))card.classList.add('done');const bars=r.canonical_spans.map(s=>`<button type="button" class="span ${{s.label}}" style="left:${{pct(s.start_s,r.target_duration_s)}}%;width:${{Math.max(.2,pct(s.end_s-s.start_s,r.target_duration_s))}}%" data-clip="${{esc(s.clip_audio)}}" title="${{esc(s.label_source)}} ${{span(s.start_s,s.end_s)}}">${{esc(s.label)}}</button>`).join('');const changes=r.background_label_change_ranges.map((s,i)=>`<div><small>改标签 ${{i+1}} · ${{span(s.start_s,s.end_s)}}</small><audio controls preload="none" src="${{esc(s.clip_audio)}}"></audio></div>`).join('')||'<small>该 occurrence 全部落在已有 speech 内，没有新增 core。</small>';card.innerHTML=`<h2>${{esc(r.item_id)}}</h2><small>${{esc(r.partition)}} / ${{esc(r.role)}} / mapped=${{span(r.mapped_start_s,r.mapped_end_s)}} / changed=${{r.background_label_change_sample_count}} samples / already-speech=${{r.already_speech_sample_count}} samples</small><div class="exact"><div><b>原 source repair event · 独立 WAV</b><audio controls preload="none" src="${{esc(r.source_clip_audio)}}"></audio><small>${{span(r.source_event_start_s,r.source_event_end_s)}} / clip ${{Number(r.source_clip_duration_s).toFixed(3)}}s</small></div><div class="mapped"><b>实际 crop/tile/mix occurrence · 独立 WAV</b><audio controls preload="none" src="${{esc(r.rendered_clip_audio)}}"></audio><small>${{span(r.mapped_start_s,r.mapped_end_s)}} / clip ${{Number(r.rendered_clip_duration_s).toFixed(3)}}s</small></div><div class="changed"><b>实际 background→speech 子区间 · 独立 WAV</b>${{changes}}</div></div><div class="track">${{bars}}</div><audio class="canonical-clip-audio" controls preload="none"></audio><div>${{verdictButtons(a)}}</div><h3>实际候选工作流完整 island</h3><audio class="target-full-audio" controls preload="none" src="${{esc(r.target_audio)}}"></audio>`;const clipAudio=card.querySelector('.canonical-clip-audio');card.querySelectorAll('[data-clip]').forEach(b=>b.onclick=()=>playClip(clipAudio,b,b.dataset.clip));card.querySelectorAll('[data-v]').forEach(b=>b.onclick=()=>setVerdict(r,b.dataset.v));card.querySelectorAll('audio').forEach(audio=>{{audio.addEventListener('play',()=>pauseOtherAudio(audio));audio.addEventListener('ended',()=>{{if(activeClipAudio===audio)clearClipState();}});}});root.appendChild(card);}}document.getElementById('status').textContent=`已裁决 ${{rows.filter(r=>ensure(r).verdict).length}}/${{rows.length}}`;}}
 document.getElementById('stop').onclick=stopPlayback;document.getElementById('next').onclick=()=>{{const row=rows.find(r=>!ensure(r).verdict);if(row)document.getElementById('item-'+row.item_index)?.scrollIntoView({{behavior:'smooth'}});}};
 document.getElementById('save').onclick=async()=>{{const content=rows.map(r=>{{const a=ensure(r);return JSON.stringify({{schema:verdictSchema,item_id:r.item_id,placement_id:r.placement_id,event_id:r.event_id,source_id:r.source_id,target_source_id:r.target_source_id,partition:r.partition,role:r.role,core_registered:r.core_registered,verdict:a.verdict||'unreviewed',updated_at:a.updated_at||new Date().toISOString()}});}}).join('\\n')+'\\n';const res=await fetch('/__audit_api__/save-labels',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{href:location.pathname,filename:'manual_verdicts.jsonl',content}})}});const out=await res.json();document.getElementById('status').textContent=out.ok?'已保存到 '+out.path:'保存失败: '+out.error;}};render();
 </script></body></html>"""
@@ -110,6 +114,7 @@ def build_audit(*, canonical_summary: Path, output_dir: Path) -> Path:
     audio_dir = output_dir / "audio"
     audio_dir.mkdir(parents=True, exist_ok=True)
     copied: dict[tuple[str, str], str] = {}
+    clips: dict[tuple[str, int, int], str] = {}
 
     def copy_audio(kind: str, source_id: str, source: Path) -> str:
         key = (kind, source_id)
@@ -122,6 +127,32 @@ def build_audit(*, canonical_summary: Path, output_dir: Path) -> Path:
         copied[key] = destination.relative_to(output_dir).as_posix()
         return copied[key]
 
+    def clip_audio(source: Path, start_sample: int, end_sample: int) -> str:
+        key = (str(source.resolve()), int(start_sample), int(end_sample))
+        if key in clips:
+            return clips[key]
+        if end_sample <= start_sample:
+            raise ValueError("Scorer canonical r4 audit clip is empty")
+        destination = audio_dir / f"clip-{len(clips):03d}.wav"
+        with sf.SoundFile(source) as handle:
+            if start_sample < 0 or end_sample > len(handle):
+                raise ValueError("Scorer canonical r4 audit clip is outside its audio")
+            handle.seek(start_sample)
+            samples = handle.read(
+                frames=end_sample - start_sample,
+                dtype="int16",
+                always_2d=True,
+            )
+            sample_rate = int(handle.samplerate)
+        if len(samples) != end_sample - start_sample:
+            raise ValueError("Scorer canonical r4 audit clip length mismatch")
+        sf.write(destination, samples, sample_rate, subtype="PCM_16")
+        with sf.SoundFile(destination) as rendered:
+            if len(rendered) != end_sample - start_sample:
+                raise ValueError("Scorer canonical r4 rendered clip length mismatch")
+        clips[key] = destination.relative_to(output_dir).as_posix()
+        return clips[key]
+
     payload: list[dict[str, Any]] = []
     for index, placement in enumerate(placements):
         if placement.get("schema") != PLACEMENT_SCHEMA:
@@ -131,22 +162,45 @@ def build_audit(*, canonical_summary: Path, output_dir: Path) -> Path:
         target = canonical_by_id[target_id]
         source = canonical_by_id[source_id]
         event = events[str(placement["event_id"])]
+        target_path = Path(str(target["audio"]))
+        source_path = Path(str(source["audio"]))
+        source_event_start = int(event["start_sample"])
+        source_event_end = int(event["end_sample"])
+        mapped_start = int(placement["mapped_start_sample"])
+        mapped_end = int(placement["mapped_end_sample"])
         payload.append(
             {
                 **placement,
                 "schema": ITEM_SCHEMA,
                 "item_index": index,
                 "item_id": str(placement["placement_id"]),
-                "target_audio": copy_audio("target", target_id, Path(str(target["audio"]))),
-                "source_audio": copy_audio("source", source_id, Path(str(source["audio"]))),
+                "target_audio": copy_audio("target", target_id, target_path),
+                "source_audio": copy_audio("source", source_id, source_path),
+                "source_clip_audio": clip_audio(
+                    source_path, source_event_start, source_event_end
+                ),
+                "rendered_clip_audio": clip_audio(
+                    target_path, mapped_start, mapped_end
+                ),
+                "source_clip_duration_s": (
+                    source_event_end - source_event_start
+                ) / int(source["sample_rate"]),
+                "rendered_clip_duration_s": (
+                    mapped_end - mapped_start
+                ) / int(target["sample_rate"]),
                 "target_duration_s": float(target["duration_s"]),
-                "source_event_start_s": int(event["start_sample"]) / int(source["sample_rate"]),
-                "source_event_end_s": int(event["end_sample"]) / int(source["sample_rate"]),
+                "source_event_start_s": source_event_start / int(source["sample_rate"]),
+                "source_event_end_s": source_event_end / int(source["sample_rate"]),
                 "canonical_spans": [
                     {
                         **span,
                         "start_s": int(span["start_sample"]) / int(target["sample_rate"]),
                         "end_s": int(span["end_sample"]) / int(target["sample_rate"]),
+                        "clip_audio": clip_audio(
+                            target_path,
+                            int(span["start_sample"]),
+                            int(span["end_sample"]),
+                        ),
                     }
                     for span in target["canonical_spans"]
                 ],
@@ -155,6 +209,11 @@ def build_audit(*, canonical_summary: Path, output_dir: Path) -> Path:
                         **span,
                         "start_s": int(span["start_sample"]) / int(target["sample_rate"]),
                         "end_s": int(span["end_sample"]) / int(target["sample_rate"]),
+                        "clip_audio": clip_audio(
+                            target_path,
+                            int(span["start_sample"]),
+                            int(span["end_sample"]),
+                        ),
                     }
                     for span in placement["background_label_change_ranges"]
                 ],
@@ -184,6 +243,8 @@ def build_audit(*, canonical_summary: Path, output_dir: Path) -> Path:
         "review_item_count": len(payload),
         "registered_core_item_count": sum(bool(row["core_registered"]) for row in payload),
         "no_label_change_item_count": sum(not bool(row["core_registered"]) for row in payload),
+        "standalone_exact_clip_playback": True,
+        "standalone_clip_count": len(clips),
         "manual_verdict_schema": MANUAL_VERDICT_SCHEMA,
         "manual_gate_status": "pending",
         "training_manifest_allowed": False,
