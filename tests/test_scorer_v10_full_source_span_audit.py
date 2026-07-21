@@ -64,6 +64,9 @@ def test_full_source_span_page_has_no_model_seed_and_saves_complete_truth(
     assert "未标出的差集只有在勾选" in page
     assert "reviewed_full_source" in page
     assert "complete_with_target_speech" in page
+    assert "未完成时不会写文件" in page
+    assert "拒绝保存：还有" in page
+    assert "save.disabled=pending!==0" in page
     assert "model_speech" not in page
     assert "prediction_spans" not in page
     assert "漏检" not in page
