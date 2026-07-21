@@ -22,7 +22,7 @@ from tools.audits.generate_scorer_v10_canonical_r4_replacement_audit_html import
 )
 
 
-RESULT_SCHEMA = "speech_scorer_v10_canonical_r4_replacement_manual_gate_v2"
+RESULT_SCHEMA = "speech_scorer_v10_canonical_r4_replacement_manual_gate_v3"
 VERDICTS = {
     "repair_speech_correct",
     "source_event_not_target",
@@ -143,8 +143,11 @@ def evaluate(
     result = {
         "schema": RESULT_SCHEMA,
         "audit_summary": str(audit_summary),
+        "audit_summary_sha256": _sha256(audit_summary),
         "audit_manifest": str(audit_manifest),
+        "audit_manifest_sha256": _sha256(audit_manifest),
         "manual_verdicts": str(manual_verdicts),
+        "manual_verdicts_sha256": _sha256(manual_verdicts),
         "canonical_summary": str(summary["canonical_summary"]),
         "canonical_summary_sha256": str(summary["canonical_summary_sha256"]),
         "canonical_sources": str(summary["canonical_sources"]),

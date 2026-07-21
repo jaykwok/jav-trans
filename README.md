@@ -165,7 +165,7 @@ Web 会在模型要求检查中提示驱动过旧或 CUDA 初始化失败。
 - `jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame-hf`：默认高质量档。
 - `jaykwok/Qwen3-ASR-0.6B-JA-Anime-Galgame-hf`：仅保留 ASR repo 与空 Boundary registry placeholder；全链重训留作未来 backlog，本轮不训练、不修改。
 
-1.7B 绑定已完成合同 plumbing；Speech-island scorer 的最新 canonical r4 候选已汇总三轮人工 background 修标，并把 5 个污染 definite-drop 资产按原始 crop/tile/overlay 合成坐标传播到所有 active 依赖，但仍在等待 19 条 replacement audit，尚未授权重建 training manifest、重训或注册。其余链包括高召回边界候选、待真实 Scorer 输出训练的 Outer、Acoustic Split、Pre-ASR CueQC 与 binary acoustic Inner。0.6B 的旧小模型已退役并保持空 placeholder；未来 backlog 若重启，必须重新提取 0.6B PTM features 并从头训练，不借用 1.7B feature cache、投影或 checkpoint。
+1.7B 绑定已完成合同 plumbing；Speech-island scorer 的 canonical r5 已应用完整 replacement 人工审计，按 verdict 撤销 1 个错误 source event 与 2 个 rendered-placement follow-up，保留 `2665 sources / 2050 cores / max core use=1`。当前只允许用 r5 标签继续核对或重建 raw PTM feature cache 与 training manifest；旧 r3/r4 标签缓存、旧 Scorer checkpoint 和未审计别名都不能复用，Scorer v10 registry 仍为空。其余链包括高召回边界候选、待真实 Scorer 输出训练的 Outer、Acoustic Split、Pre-ASR CueQC 与 binary acoustic Inner。0.6B 的旧小模型已退役并保持空 placeholder；未来 backlog 若重启，必须重新提取 0.6B PTM features 并从头训练，不借用 1.7B feature cache、投影或 checkpoint。
 
 所有小模型统一放在：
 
