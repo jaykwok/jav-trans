@@ -660,6 +660,7 @@ def evaluate(model, rows, device, *, max_padded_frames: int, tolerance_frames: i
     independent_internal_background_false_keep_island_count = 0
     start_errors: list[int] = []
     end_errors: list[int] = []
+    true_speech_deletion_items: list[dict[str, Any]] = []
     model.eval()
     with torch.inference_mode():
         for batch in frame_budget_batches(rows, max_padded_frames=max_padded_frames):
@@ -727,6 +728,14 @@ def evaluate(model, rows, device, *, max_padded_frames: int, tolerance_frames: i
                     internal_drop_frame_count += structure["internal_drop_frame_count"]
                     if not predicted_run.numel():
                         true_speech_deletions += 1
+                        true_speech_deletion_items.append(
+                            {
+                                "source_id": str(row["source_id"]),
+                                "partition": str(row["partition"]),
+                                "start_frame": int(start),
+                                "end_frame": int(end),
+                            }
+                        )
                         continue
                     predicted_start = start + int(predicted_run[0].item())
                     predicted_end = start + int(predicted_run[-1].item())
@@ -748,6 +757,7 @@ def evaluate(model, rows, device, *, max_padded_frames: int, tolerance_frames: i
         "speech_recall": tp / max(tp + fn, 1),
         "background_drop_recall": background_drops / max(background_rows, 1),
         "true_speech_deletion_count": true_speech_deletions,
+        "true_speech_deletion_items": true_speech_deletion_items,
         "continuous_speech_run_count": continuous_speech_runs,
         "fragmented_speech_run_count": fragmented_speech_runs,
         "speech_run_continuity": continuous_speech_runs / max(speech_runs, 1),

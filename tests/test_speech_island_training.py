@@ -399,6 +399,51 @@ def test_binary_speech_v10_numeric_gate_requires_heldout_continuity() -> None:
     ) is True
 
 
+def test_binary_speech_v10_evaluate_records_whole_run_deletion_identity(
+    monkeypatch,
+) -> None:
+    torch = pytest.importorskip("torch")
+
+    def fake_load(_row):
+        return (
+            np.zeros((3, 2), dtype=np.float32),
+            np.zeros((3, 1), dtype=np.float32),
+            np.asarray([1, 1, 0], dtype=np.int64),
+            np.ones(3, dtype=np.float32),
+        )
+
+    class BackgroundModel(torch.nn.Module):
+        def forward(self, ptm, mfcc, *, attention_mask=None):
+            logits = torch.zeros((*ptm.shape[:2], 2), device=ptm.device)
+            logits[..., 0] = 1.0
+            return logits
+
+    monkeypatch.setattr(scorer_v10_trainer, "load_binary_row", fake_load)
+    metrics = scorer_v10_trainer.evaluate(
+        BackgroundModel(),
+        [
+            {
+                "source_id": "heldout-repair",
+                "partition": "val",
+                "frame_count": 3,
+            }
+        ],
+        torch.device("cpu"),
+        max_padded_frames=8,
+        tolerance_frames=1,
+    )
+
+    assert metrics["true_speech_deletion_count"] == 1
+    assert metrics["true_speech_deletion_items"] == [
+        {
+            "source_id": "heldout-repair",
+            "partition": "val",
+            "start_frame": 0,
+            "end_frame": 2,
+        }
+    ]
+
+
 def test_binary_speech_v10_checkpoint_selection_minimizes_false_keeps_after_safety() -> None:
     safe = {
         "start_coverage": 0.95,
