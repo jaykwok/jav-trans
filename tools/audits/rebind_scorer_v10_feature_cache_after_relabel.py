@@ -26,6 +26,9 @@ from pipeline.memory_safety import runtime_memory_snapshot  # noqa: E402
 from tools.boundary.ja.apply_speech_island_scorer_v10_repair_event_unsure import (  # noqa: E402
     SUMMARY_SCHEMA as RELABEL_SUMMARY_SCHEMA,
 )
+from tools.boundary.ja.apply_speech_island_scorer_v10_full_source_truth_repairs import (  # noqa: E402
+    SUMMARY_SCHEMA as FULL_SOURCE_RELABEL_SUMMARY_SCHEMA,
+)
 
 
 SUMMARY_SCHEMA = "speech_scorer_v10_label_only_feature_cache_rebind_summary_v1"
@@ -87,8 +90,11 @@ def rebind(
     memory_before = runtime_memory_snapshot(require_shared_vram=False)
     _validate_memory(memory_before)
     relabel = _json(relabel_summary_path)
-    if relabel.get("schema") != RELABEL_SUMMARY_SCHEMA:
-        raise ValueError("cache rebind requires a repair-event unsure summary")
+    if relabel.get("schema") not in {
+        RELABEL_SUMMARY_SCHEMA,
+        FULL_SOURCE_RELABEL_SUMMARY_SCHEMA,
+    }:
+        raise ValueError("cache rebind requires an approved label-only relabel summary")
     if relabel.get("boundary_serialization_contract_id") != ACOUSTIC_BINARY_V12_CONTRACT.contract_id:
         raise ValueError("label-only canonical uses another Boundary contract")
     if (
