@@ -81,10 +81,29 @@ def test_canonical_r4_replacement_page_and_gate(tmp_path: Path) -> None:
             }
         ],
     )
+    dependency_mappings = tmp_path / "dependency_mappings.jsonl"
+    _write_jsonl(
+        dependency_mappings,
+        [
+            {
+                "schema": "speech_scorer_v10_background_dependency_mapping_v1",
+                "mapping_id": "mapping-1",
+                "mapped_intervals": [
+                    {
+                        "tile_index": 0,
+                        "source_start_sample": 160,
+                        "source_end_sample": 480,
+                        "mapped_start_sample": 0,
+                        "mapped_end_sample": 320,
+                    }
+                ],
+            }
+        ],
+    )
     events = tmp_path / "events.jsonl"
     _write_jsonl(
         events,
-        [{"event_id": "event-1", "start_sample": 0, "end_sample": 320}],
+        [{"event_id": "event-1", "start_sample": 0, "end_sample": 640}],
     )
     gate = tmp_path / "repair_gate.json"
     gate.write_text(
@@ -106,6 +125,10 @@ def test_canonical_r4_replacement_page_and_gate(tmp_path: Path) -> None:
                 "repair_placements": str(placements),
                 "repair_placements_sha256": hashlib.sha256(placements.read_bytes()).hexdigest(),
                 "repair_placement_count": 1,
+                "dependency_mappings": str(dependency_mappings),
+                "dependency_mappings_sha256": hashlib.sha256(
+                    dependency_mappings.read_bytes()
+                ).hexdigest(),
                 "background_speech_repair_gate": str(gate),
                 "background_speech_repair_gate_sha256": hashlib.sha256(gate.read_bytes()).hexdigest(),
             }
@@ -122,7 +145,12 @@ def test_canonical_r4_replacement_page_and_gate(tmp_path: Path) -> None:
     assert summary["review_item_count"] == 1
     assert summary["standalone_exact_clip_playback"] is True
     assert summary["standalone_clip_count"] >= 2
+    assert manifest["source_occurrence_start_s"] == 0.01
+    assert manifest["source_occurrence_end_s"] == 0.03
+    assert manifest["source_occurrence_sample_count"] == 320
     assert "独立 WAV" in page
+    assert "source 子段 → target occurrence" in page
+    assert "仅 canonical 标签变化区间" in page
     assert "源事件非目标语音（整组撤销）" in page
     assert "完整 island" in page
     assert 'preload="none"' in page
