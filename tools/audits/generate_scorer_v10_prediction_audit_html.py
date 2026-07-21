@@ -131,6 +131,16 @@ def audit_truth_drop_spans(row: dict[str, Any]) -> list[dict[str, Any]]:
 
 
 def _render_page(payload: list[dict[str, Any]]) -> str:
+    asr_assisted = any(
+        span.get("asr_probe")
+        for row in payload
+        for span in row.get("prediction_spans", [])
+    )
+    page_title = (
+        "ASR-assisted prediction audit"
+        if asr_assisted
+        else "prediction residual audit"
+    )
     encoded = (
         json.dumps(payload, ensure_ascii=False)
         .replace("</", "<\\/")
@@ -156,7 +166,7 @@ def _render_page(payload: list[dict[str, Any]]) -> str:
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Scorer v10 prediction residual audit</title>
+<title>1.7B Scorer v10 · __PAGE_TITLE__</title>
 <style>
 :root{color-scheme:light;--border:#c9d0d8;--text:#20242a;--muted:#5c6570;--ok:#267443;--risk:#a52f2f;--speech:#417fc2;--drop:#b53a3a}
 *{box-sizing:border-box}
@@ -172,15 +182,16 @@ audio{width:100%;margin:6px 0}
 .track{position:relative;min-height:42px;margin:8px 0;background:#e1e5e9;overflow:hidden}
 .span{position:absolute;top:0;bottom:0;min-width:3px;min-height:42px;margin:0;padding:7px 4px;border:0;border-right:1px solid rgba(0,0,0,.2);box-sizing:border-box;overflow:hidden;white-space:nowrap;font-size:11px;text-align:left;cursor:pointer}
 .span.playing{outline:3px solid #111;outline-offset:-3px;color:#fff}
+.asr-list{display:grid;gap:6px;margin:8px 0}.asr-item{display:grid;grid-template-columns:minmax(210px,auto) 1fr;align-items:center;gap:8px;padding:7px;background:#f7f8fa;border:1px solid var(--border);border-radius:6px}.asr-item button{margin:0;text-align:left}.asr-empty{color:var(--muted)}.asr-error{color:var(--risk)}
 .truth_speech{background:#58aa70}.truth_background{background:#d0a14b}.model_speech{background:var(--speech);color:#fff}.truth_speech_model_background{background:var(--drop);color:#fff}
 button,select{font:inherit}button,select{padding:6px 9px}button{margin:3px;border:1px solid #69737e;border-radius:5px;background:#fff;cursor:pointer}button.active{background:#1769aa;color:#fff}button.risk.active{background:var(--risk);color:#fff}
 small{color:var(--muted)}h2{font-size:18px;margin:0 0 4px;overflow-wrap:anywhere}h3{margin:10px 0 2px}.empty{color:var(--muted);padding:10px}
-@media(max-width:760px){.guide{grid-template-columns:1fr}header strong{width:100%}.span{font-size:9px}}
+@media(max-width:760px){.guide{grid-template-columns:1fr}.asr-item{grid-template-columns:1fr}header strong{width:100%}.span{font-size:9px}}
 </style>
 </head>
 <body>
 <header>
-  <strong>1.7B Scorer v10 · prediction residual audit</strong>
+  <strong>1.7B Scorer v10 · __PAGE_TITLE__</strong>
   <label>类别 <select id="filter"></select></label>
   <button id="next" type="button">下一个未裁决</button>
   <button id="stop" type="button">停止播放</button>
@@ -192,6 +203,7 @@ small{color:var(--muted)}h2{font-size:18px;margin:0 0 4px;overflow-wrap:anywhere
     __SCOPE_NOTE__
     <div><b>实际工作流：</b>蓝色是 Scorer 二分类 argmax=speech，会成为独立 downstream island；不做 threshold、gap merge 或时长规则。红色是 canonical truth_speech 中被模型判为 background、实际不会送出的精确区间。绿色/黄色是完整 canonical speech/background，整条 source 播放器只用于判断上下文。</div>
     <div><b>播放合同：</b>每个色条只播放自身 start–end 后立即停止，不添加上下文。点击原生播放器可听整条 source。只需选择按钮，不要求备注。</div>
+    <div><b>ASR 辅助：</b>若页面显示 ASR 文本，它来自每个蓝色 island 独立、无上下文、batch size 1 的 1.7B forward；空文本或错词只作听审证据，绝不自动改 canonical。</div>
     <div class="guide">
       <div><b>speech_deletion</b>：优先听红条；判断是真语音被整段删除，还是 canonical 应改为 background。</div>
       <div><b>speech_edge_or_partial</b>：优先听红条；区分真语音/尾音被截、纯停顿却打断同一 ASR 单元，以及可安全切开的 background。</div>
@@ -244,7 +256,9 @@ function choices(row){
   if(row.category==='long_residual')return [['acceptable_long_residual','蓝色长段整体可保留'],['missed_background_or_gap','蓝段内含应独立 drop 的背景/非语义'],['true_speech_edge_clipped','实际仍有真语音边缘被截'],['unsure','不确定']];
   return [['true_speech_clipped','红段含发音/尾音，模型截断'],['same_asr_unit_fragmented','红段可为停顿，但左右属同一 ASR 单元，切开有害'],['canonical_should_be_background','红段可作 background，切开符合工作流'],['unsure','不确定']];
 }
-function spans(row,list){return [...(list||[])].sort((a,b)=>a.start_s-b.start_s||a.end_s-b.end_s).map(span=>`<button type="button" class="span ${esc(span.label)}" style="left:${Math.max(0,100*span.start_s/row.duration_s)}%;width:${Math.max(.3,100*(span.end_s-span.start_s)/row.duration_s)}%" data-start="${span.start_s}" data-end="${span.end_s}">${esc(span.label)} ${Number(span.start_s).toFixed(2)}–${Number(span.end_s).toFixed(2)}s</button>`).join('');}
+function spanAsrLabel(span){const probe=span.asr_probe;if(!probe)return '';if(probe.error_kind)return `ASR error: ${probe.error_kind}: ${probe.error_detail||''}`;return probe.raw_text?`ASR: ${probe.raw_text}`:'ASR: [空文本]';}
+function spans(row,list){return [...(list||[])].sort((a,b)=>a.start_s-b.start_s||a.end_s-b.end_s).map(span=>`<button type="button" class="span ${esc(span.label)}" style="left:${Math.max(0,100*span.start_s/row.duration_s)}%;width:${Math.max(.3,100*(span.end_s-span.start_s)/row.duration_s)}%" data-start="${span.start_s}" data-end="${span.end_s}" title="${esc(spanAsrLabel(span))}">${esc(span.label)} ${Number(span.start_s).toFixed(2)}–${Number(span.end_s).toFixed(2)}s</button>`).join('');}
+function asrEvidence(row){const items=(row.prediction_spans||[]).filter(span=>span.asr_probe);if(!items.length)return '';return `<h3>1.7B ASR 辅助（每个蓝条独立、无上下文）</h3><div class="asr-list">${items.map(span=>{const probe=span.asr_probe;const css=probe.error_kind?'asr-error':(probe.raw_text?'':'asr-empty');const text=probe.error_kind?`${probe.error_kind}: ${probe.error_detail||''}`:(probe.raw_text||'[空文本]');return `<div class="asr-item"><button type="button" data-start="${span.start_s}" data-end="${span.end_s}">播放蓝条 ${Number(span.start_s).toFixed(2)}–${Number(span.end_s).toFixed(2)}s</button><span class="${css}">ASR：${esc(text)}</span></div>`;}).join('')}</div>`;}
 function saveLocal(){localStorage.setItem(key,JSON.stringify(ann));}
 function updateStatus(){document.getElementById('status').textContent=`已裁决 ${rows.filter(row=>ensure(row).verdict).length}/${rows.length}`;}
 function riskVerdict(value){return ['model_false_keep','true_speech_deleted','true_speech_clipped','true_speech_edge_clipped','same_asr_unit_fragmented','missed_background_or_gap'].includes(value);}
@@ -265,7 +279,7 @@ function render(){
     const dropped=(row.truth_drop_spans||[]).length?`<h3>${dropTitle}</h3><div class="track">${spans(row,row.truth_drop_spans)}</div>`:'';
     const extraFn=row.candidate_extra_false_negative_frames==null?'':` / new FN=${row.candidate_extra_false_negative_frames}`;
     const reviewFn=row.candidate_extra_false_negative_frames_requiring_review==null?'':` / review FN=${row.candidate_extra_false_negative_frames_requiring_review} / carried bg=${row.candidate_extra_false_negative_frames_carried_as_background||0}`;
-    card.innerHTML=`<h2>${esc(row.source_id)}</h2><small>${esc(row.partition)} / ${esc(row.row_role)} / ${esc(row.category)} / duration=${Number(row.duration_s).toFixed(2)}s / FN=${row.false_negative_frames}${extraFn}${reviewFn} / FP=${row.false_positive_frames} / max model run=${Number(row.max_predicted_speech_run_s).toFixed(2)}s</small><h3>整条 source（仅供完整上下文）</h3><audio controls preload="none" src="${esc(row.audio)}"></audio><h3>canonical（绿色 speech / 黄色 background）</h3><div class="track">${spans(row,row.truth_spans)}</div>${dropped}<h3>实际候选工作流输出（蓝色 argmax=speech）</h3><div class="track">${spans(row,row.prediction_spans)}</div><div class="choices">${choices(row).map(choice=>`<button type="button" data-v="${choice[0]}" class="${riskVerdict(choice[0])?'risk ':''}${state.verdict===choice[0]?'active':''}">${choice[1]}</button>`).join('')}</div>`;
+    card.innerHTML=`<h2>${esc(row.source_id)}</h2><small>${esc(row.partition)} / ${esc(row.row_role)} / ${esc(row.category)} / duration=${Number(row.duration_s).toFixed(2)}s / FN=${row.false_negative_frames}${extraFn}${reviewFn} / FP=${row.false_positive_frames} / max model run=${Number(row.max_predicted_speech_run_s).toFixed(2)}s</small><h3>整条 source（仅供完整上下文）</h3><audio controls preload="none" src="${esc(row.audio)}"></audio><h3>canonical（绿色 speech / 黄色 background）</h3><div class="track">${spans(row,row.truth_spans)}</div>${dropped}<h3>实际候选工作流输出（蓝色 argmax=speech）</h3><div class="track">${spans(row,row.prediction_spans)}</div>${asrEvidence(row)}<div class="choices">${choices(row).map(choice=>`<button type="button" data-v="${choice[0]}" class="${riskVerdict(choice[0])?'risk ':''}${state.verdict===choice[0]?'active':''}">${choice[1]}</button>`).join('')}</div>`;
     const audio=card.querySelector('audio');
     audio.addEventListener('play',()=>{if(activeAudio&&activeAudio!==audio)stopPlayback();activeAudio=audio;});
     audio.addEventListener('ended',stopPlayback);
@@ -293,6 +307,7 @@ render();
         .replace("__ROWS__", encoded)
         .replace("__VERDICT_SCHEMA__", schema)
         .replace("__SCOPE_NOTE__", scope_note)
+        .replace("__PAGE_TITLE__", page_title)
     )
 
 
@@ -381,6 +396,13 @@ def build_audit(
         row.get("audit_truth_drop_contract") == CHECKPOINT_AB_REMAINING_DROP_CONTRACT
         for row in payload
     )
+    asr_spans = [
+        span
+        for row in payload
+        for span in row.get("prediction_spans", [])
+        if span.get("asr_probe")
+    ]
+    asr_assisted = bool(asr_spans)
     summary = {
         "schema": SUMMARY_SCHEMA,
         "title": (
@@ -389,7 +411,11 @@ def build_audit(
             else (
                 "Scorer v10 checkpoint A/B extra-drop audit"
                 if checkpoint_ab_mode
-                else "Scorer v10 prediction residual audit"
+                else (
+                    "Scorer v10 ASR-assisted prediction audit"
+                    if asr_assisted
+                    else "Scorer v10 prediction residual audit"
+                )
             )
         ),
         "review_item_count": len(payload),
@@ -410,6 +436,12 @@ def build_audit(
             )
         ),
         "exact_truth_drop_playback": True,
+        "asr_assisted": asr_assisted,
+        "asr_probe_span_count": len(asr_spans),
+        "asr_nonempty_text_span_count": sum(
+            bool(span["asr_probe"].get("nonempty_text")) for span in asr_spans
+        ),
+        "asr_automatic_label_change_allowed": False,
         "manual_verdict_schema": VERDICT_SCHEMA,
         "manual_gate_status": "pending",
     }

@@ -130,7 +130,17 @@ def test_prediction_audit_html_is_exact_span_and_saveable(tmp_path: Path) -> Non
                     }
                 ],
                 "prediction_spans": [
-                    {"label": "model_speech", "start_s": 0.4, "end_s": 0.5}
+                    {
+                        "label": "model_speech",
+                        "start_s": 0.4,
+                        "end_s": 0.5,
+                        "asr_probe": {
+                            "raw_text": "まだ…",
+                            "nonempty_text": True,
+                            "error_kind": "",
+                            "error_detail": "",
+                        },
+                    }
                 ],
                 "true_speech_deletions": 0,
             }
@@ -146,8 +156,16 @@ def test_prediction_audit_html_is_exact_span_and_saveable(tmp_path: Path) -> Non
     assert VERDICT_SCHEMA in page
     assert "truth_speech_model_background" in page
     assert "只需选择按钮，不要求备注" in page
+    assert "1.7B ASR 辅助（每个蓝条独立、无上下文）" in page
+    assert "まだ…" in page
+    assert "ASR-assisted prediction audit" in page
     assert "textarea" not in page
     assert (index.parent / "audio" / "item-000.wav").is_file()
+    summary = json.loads((index.parent / "summary.json").read_text(encoding="utf-8"))
+    assert summary["asr_assisted"] is True
+    assert summary["asr_probe_span_count"] == 1
+    assert summary["asr_nonempty_text_span_count"] == 1
+    assert summary["asr_automatic_label_change_allowed"] is False
     script = re.search(r"<script>([\s\S]*?)</script>", page)
     assert script is not None
     node = shutil.which("node")

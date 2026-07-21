@@ -117,7 +117,7 @@ Web 会在模型要求检查中提示驱动过旧或 CUDA 初始化失败。
      - MFCC / timing numeric features
   -> Speech-island scorer（1.7B binary-argmax v10 待审计/重训）
      - Scorer v8 仅保留为 threshold/hysteresis 审计参考，不进入当前生产 runtime
-     - v10 corrected-r5 与 train-only sparse-layout r6 均已完成 signed cache/training；`001817` 已确认为 `unsure→-100`，但 `001976` 可听出“待って”并被 step-2000 整段误删，registry 仍为空
+     - v10 corrected-r5 与 train-only sparse-layout r6 均已完成 signed cache/training；`001817` 已确认为 `unsure→-100`，但 `001976` 可听出“待って”并被 step-2000 整段误删；22 条 train background false-keep 已生成逐 island ASR 辅助人工页，registry 仍为空
   -> BoundaryProposalScorer v1（候选源审计中）
      - 学习型高召回 acoustic candidate source，不做 final cut decision
   -> 按 ASR repo 进入互不混用的边界链
