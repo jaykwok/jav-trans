@@ -5,6 +5,7 @@ import argparse
 import gc
 import hashlib
 import json
+import os
 import sys
 import time
 from collections import Counter, defaultdict
@@ -23,11 +24,15 @@ from asr.backends.qwen import QWEN_ASR_17B_REPO_ID, qwen_asr_repo_tag  # noqa: E
 from boundary.gpu_safety import apply_vram_safety_cap  # noqa: E402
 from boundary.ja.model import (  # noqa: E402
     SPEECH_ISLAND_SCORER_V10_DATASET_CONTRACT,
+    SPEECH_ISLAND_SCORER_V10_FEATURE_CACHE_GATE_SCHEMA,
+    SPEECH_ISLAND_SCORER_V10_FEATURE_EXTRACTOR_SCHEMA,
     SPEECH_ISLAND_SCORER_V10_MODEL_ARCH,
     SPEECH_ISLAND_SCORER_V10_MFCC_DIM,
     SPEECH_ISLAND_SCORER_V10_PROJECTED_PTM_DIM,
+    SPEECH_ISLAND_SCORER_V10_RAW_CACHE_ROW_SCHEMA,
     SPEECH_ISLAND_SCORER_V10_RAW_PTM_DIM,
     SPEECH_ISLAND_SCORER_V10_SCHEMA,
+    SPEECH_ISLAND_SCORER_V10_TRAINING_ROW_SCHEMA,
     BinarySpeechIslandScorerNetwork,
     build_speech_island_scorer_checkpoint,
 )
@@ -39,7 +44,22 @@ from pipeline.memory_safety import (  # noqa: E402
 
 PARTITIONS = ("train", "val", "test")
 IGNORE_INDEX = -100
-TRAINING_ROW_SCHEMA = "speech_scorer_v10_binary_training_row_v1"
+TRAINING_ROW_SCHEMA = SPEECH_ISLAND_SCORER_V10_TRAINING_ROW_SCHEMA
+
+
+def _sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        while chunk := handle.read(8 * 1024 * 1024):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _resolve_project_path(value: str | Path) -> Path:
+    path = Path(value)
+    if not path.is_absolute():
+        path = PROJECT_ROOT / path
+    return path.resolve()
 
 
 def _read_rows(path: Path) -> list[dict[str, Any]]:
@@ -47,14 +67,27 @@ def _read_rows(path: Path) -> list[dict[str, Any]]:
         return [json.loads(line) for line in handle if line.strip()]
 
 
-def validate_dataset_rows(rows: Sequence[dict[str, Any]]) -> dict[str, Any]:
+def validate_dataset_rows(
+    rows: Sequence[dict[str, Any]], *, verify_content: bool = True
+) -> dict[str, Any]:
     if not rows:
         raise ValueError("Scorer v10 dataset is empty")
     source_partitions: dict[str, set[str]] = defaultdict(set)
     core_partitions: dict[str, set[str]] = defaultdict(set)
     core_counts: Counter[str] = Counter()
     background_ids: set[str] = set()
+    background_source_ids: set[str] = set()
     partition_counts: Counter[str] = Counter()
+    provenance = {
+        key: set()
+        for key in (
+            "canonical_sources_sha256",
+            "signed_feature_manifest_sha256",
+            "feature_cache_gate_sha256",
+            "feature_config_sha256",
+        )
+    }
+    feature_cache_gates: set[str] = set()
     for row in rows:
         if row.get("schema") != TRAINING_ROW_SCHEMA or row.get("diagnostic_only"):
             raise ValueError("Scorer v10 training rejects diagnostic/non-training rows")
@@ -63,6 +96,9 @@ def validate_dataset_rows(rows: Sequence[dict[str, Any]]) -> dict[str, Any]:
         core_ids = [str(value) for value in row.get("core_ids") or ()]
         row_role = str(row.get("row_role") or "")
         background_id = str(row.get("background_id") or "")
+        background_source_ids.update(
+            str(value) for value in row.get("background_source_ids") or ()
+        )
         if not source_id:
             raise ValueError("Scorer v10 rows require source_id")
         if row_role == "speech" and not core_ids:
@@ -99,6 +135,15 @@ def validate_dataset_rows(rows: Sequence[dict[str, Any]]) -> dict[str, Any]:
             raise ValueError("Scorer v10 rows require feature_path and label_path")
         if int(row.get("frame_count") or 0) <= 0:
             raise ValueError("Scorer v10 rows require a positive frame_count")
+        for key, values in provenance.items():
+            value = str(row.get(key) or "")
+            if len(value) != 64:
+                raise ValueError(f"Scorer v10 rows require signed provenance: {key}")
+            values.add(value)
+        feature_cache_gate = str(row.get("feature_cache_gate") or "")
+        if not feature_cache_gate:
+            raise ValueError("Scorer v10 rows require feature_cache_gate")
+        feature_cache_gates.add(str(Path(feature_cache_gate).resolve()))
         if source_id in source_partitions:
             raise ValueError(f"Scorer v10 source is duplicated: {source_id!r}")
         source_partitions[source_id].add(partition)
@@ -112,12 +157,105 @@ def validate_dataset_rows(rows: Sequence[dict[str, Any]]) -> dict[str, Any]:
         raise ValueError("Scorer v10 requires max core use count <= 1")
     if any(partition_counts[name] <= 0 for name in PARTITIONS):
         raise ValueError("Scorer v10 requires fixed train/val/test partitions")
+    if any(len(values) != 1 for values in provenance.values()):
+        raise ValueError("Scorer v10 training rows mix incompatible provenance")
+    if len(feature_cache_gates) != 1:
+        raise ValueError("Scorer v10 training rows mix feature cache gates")
+    feature_cache_gate_path = Path(next(iter(feature_cache_gates)))
+    gate_sha256 = next(iter(provenance["feature_cache_gate_sha256"]))
+    signed_manifest_path: Path | None = None
+    if verify_content:
+        if not feature_cache_gate_path.is_file():
+            raise ValueError("Scorer v10 feature cache gate is missing")
+        if _sha256(feature_cache_gate_path) != gate_sha256:
+            raise ValueError("Scorer v10 feature cache gate SHA256 mismatch")
+        gate = json.loads(feature_cache_gate_path.read_text(encoding="utf-8-sig"))
+        if gate.get("schema") != SPEECH_ISLAND_SCORER_V10_FEATURE_CACHE_GATE_SCHEMA:
+            raise ValueError("Scorer v10 feature cache gate schema mismatch")
+        if gate.get("boundary_serialization_contract_id") != (
+            SPEECH_ISLAND_SCORER_V10_DATASET_CONTRACT[
+                "boundary_serialization_contract_id"
+            ]
+        ):
+            raise ValueError("Scorer v10 feature cache gate uses another contract")
+        if gate.get("feature_extractor_schema") != (
+            SPEECH_ISLAND_SCORER_V10_FEATURE_EXTRACTOR_SCHEMA
+        ):
+            raise ValueError("Scorer v10 feature extractor schema mismatch")
+        if gate.get("training_manifest_allowed") is not True:
+            raise ValueError("Scorer v10 feature cache gate does not authorize training")
+        signed_manifest_path = _resolve_project_path(
+            str(gate.get("signed_feature_manifest") or "")
+        )
+        signed_manifest_sha256 = next(
+            iter(provenance["signed_feature_manifest_sha256"])
+        )
+        if _sha256(signed_manifest_path) != signed_manifest_sha256:
+            raise ValueError("Scorer v10 signed feature manifest SHA256 mismatch")
+        if gate.get("signed_feature_manifest_sha256") != signed_manifest_sha256:
+            raise ValueError("Scorer v10 feature gate signed-manifest mismatch")
+        signed_rows = _read_rows(signed_manifest_path)
+        signed_by_source: dict[str, dict[str, Any]] = {}
+        for signed in signed_rows:
+            if signed.get("schema") != SPEECH_ISLAND_SCORER_V10_RAW_CACHE_ROW_SCHEMA:
+                raise ValueError("Scorer v10 rejects legacy raw feature rows")
+            source_id = str(signed.get("source_id") or "")
+            if not source_id or source_id in signed_by_source:
+                raise ValueError("Scorer v10 signed feature source identity is invalid")
+            signed_by_source[source_id] = signed
+        rows_by_source = {str(row["source_id"]): row for row in rows}
+        if set(signed_by_source) != set(rows_by_source):
+            raise ValueError("Scorer v10 training/signed feature identities differ")
+        for source_id, row in rows_by_source.items():
+            signed = signed_by_source[source_id]
+            feature_path = _resolve_project_path(str(row["feature_path"]))
+            label_path = _resolve_project_path(str(row["label_path"]))
+            if feature_path != _resolve_project_path(
+                str(signed.get("feature_path") or "")
+            ):
+                raise ValueError(f"Scorer v10 feature path mismatch: {source_id}")
+            if not feature_path.is_file() or not label_path.is_file():
+                raise ValueError(f"Scorer v10 feature/label file is missing: {source_id}")
+            if str(row.get("feature_sha256") or "") != str(
+                signed.get("feature_sha256") or ""
+            ):
+                raise ValueError(f"Scorer v10 feature provenance mismatch: {source_id}")
+            if str(row.get("audio_sha256") or "") != str(
+                signed.get("audio_sha256") or ""
+            ):
+                raise ValueError(f"Scorer v10 audio provenance mismatch: {source_id}")
+            if str(row.get("feature_config_sha256") or "") != str(
+                signed.get("feature_config_sha256") or ""
+            ):
+                raise ValueError(f"Scorer v10 feature config mismatch: {source_id}")
+            if int(row.get("frame_count") or 0) != int(
+                signed.get("frame_count") or 0
+            ):
+                raise ValueError(f"Scorer v10 feature frame count mismatch: {source_id}")
+            if _sha256(feature_path) != str(row["feature_sha256"]):
+                raise ValueError(f"Scorer v10 feature content changed: {source_id}")
+            label_sha256 = str(row.get("label_sha256") or "")
+            if len(label_sha256) != 64 or _sha256(label_path) != label_sha256:
+                raise ValueError(f"Scorer v10 label content changed: {source_id}")
     return {
         "source_count": len(source_partitions),
         "core_count": len(core_partitions),
-        "background_identity_count": len(background_ids),
+        "background_identity_count": len(background_source_ids),
+        "all_background_control_identity_count": len(background_ids),
         "max_core_use_count": max(core_counts.values(), default=0),
         "partition_counts": dict(partition_counts),
+        "canonical_sources_sha256": next(
+            iter(provenance["canonical_sources_sha256"])
+        ),
+        "signed_feature_manifest_sha256": next(
+            iter(provenance["signed_feature_manifest_sha256"])
+        ),
+        "signed_feature_manifest": (
+            "" if signed_manifest_path is None else str(signed_manifest_path)
+        ),
+        "feature_cache_gate": str(feature_cache_gate_path),
+        "feature_cache_gate_sha256": gate_sha256,
+        "feature_config_sha256": next(iter(provenance["feature_config_sha256"])),
     }
 
 
@@ -126,15 +264,52 @@ def load_binary_row(
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     feature_path = Path(str(row["feature_path"]))
     label_path = Path(str(row["label_path"]))
-    with np.load(feature_path) as features:
-        ptm = np.asarray(features["ptm"], dtype=np.float32)
-        mfcc = np.asarray(features["mfcc"], dtype=np.float32)
-    with np.load(label_path) as labels:
+    with np.load(feature_path, allow_pickle=False) as features:
+        raw_ptm = np.asarray(features["ptm"])
+        raw_mfcc = np.asarray(features["mfcc"])
+        if raw_ptm.dtype != np.float32 or raw_mfcc.dtype != np.float32:
+            raise ValueError("Scorer v10 signed features must be float32")
+        ptm = np.asarray(raw_ptm, dtype=np.float32)
+        mfcc = np.asarray(raw_mfcc, dtype=np.float32)
+    with np.load(label_path, allow_pickle=False) as labels:
+        required = {
+            "canonical_labels",
+            "frame_weights",
+            "canonical_label_schema",
+            "boundary_serialization_contract_id",
+            "source_id",
+            "canonical_sources_sha256",
+            "signed_feature_manifest_sha256",
+            "feature_cache_gate_sha256",
+            "feature_config_sha256",
+            "audio_sha256",
+            "feature_sha256",
+        }
+        if not required.issubset(labels.files):
+            raise ValueError("Scorer v10 label cache is unsigned or incomplete")
         canonical = np.asarray(labels["canonical_labels"], dtype=np.int64)
-        weights = np.asarray(
-            labels["frame_weights"] if "frame_weights" in labels else np.ones(canonical.shape[0]),
-            dtype=np.float32,
-        )
+        weights = np.asarray(labels["frame_weights"], dtype=np.float32)
+        metadata = {
+            key: str(np.asarray(labels[key]).reshape(-1)[0])
+            for key in required - {"canonical_labels", "frame_weights"}
+        }
+    expected_metadata = {
+        "canonical_label_schema": str(row["canonical_label_schema"]),
+        "boundary_serialization_contract_id": str(
+            row["boundary_serialization_contract_id"]
+        ),
+        "source_id": str(row["source_id"]),
+        "canonical_sources_sha256": str(row["canonical_sources_sha256"]),
+        "signed_feature_manifest_sha256": str(
+            row["signed_feature_manifest_sha256"]
+        ),
+        "feature_cache_gate_sha256": str(row["feature_cache_gate_sha256"]),
+        "feature_config_sha256": str(row["feature_config_sha256"]),
+        "audio_sha256": str(row["audio_sha256"]),
+        "feature_sha256": str(row["feature_sha256"]),
+    }
+    if metadata != expected_metadata:
+        raise ValueError(f"Scorer v10 label provenance mismatch: {row.get('source_id')}")
     if ptm.ndim != 2 or mfcc.ndim != 2 or ptm.shape[0] != mfcc.shape[0]:
         raise ValueError(f"Scorer v10 feature shape mismatch: {row.get('source_id')}")
     if canonical.ndim != 1 or canonical.shape[0] != ptm.shape[0]:
@@ -143,6 +318,13 @@ def load_binary_row(
         raise ValueError(f"Scorer v10 frame weight shape mismatch: {row.get('source_id')}")
     if np.any(~np.isin(canonical, (0, 1, 2))):
         raise ValueError("Scorer v10 canonical labels must be background/speech/unsure")
+    if not np.isfinite(weights).all() or np.any(weights < 0.0):
+        raise ValueError("Scorer v10 frame weights must be finite and non-negative")
+    unsure = canonical == 2
+    if np.any(weights[unsure] != 0.0):
+        raise ValueError("Scorer v10 unsure frames must have zero training weight")
+    if np.any(weights[~unsure] <= 0.0):
+        raise ValueError("Scorer v10 definite frames must retain positive training weight")
     if int(row["frame_count"]) != int(ptm.shape[0]):
         raise ValueError(f"Scorer v10 frame_count mismatch: {row.get('source_id')}")
     labels_binary = np.where(canonical == 2, IGNORE_INDEX, canonical).astype(np.int64)
@@ -266,6 +448,30 @@ def _runs(values: np.ndarray) -> list[tuple[int, int]]:
     return runs
 
 
+def _speech_bracketed_by_nearest_definite(
+    canonical: np.ndarray, start: int, end: int
+) -> bool:
+    """Require nearest definite labels on both sides to be speech."""
+
+    left = np.asarray(canonical[:start], dtype=np.int64)
+    right = np.asarray(canonical[end:], dtype=np.int64)
+    left = left[left != IGNORE_INDEX]
+    right = right[right != IGNORE_INDEX]
+    return bool(left.size and right.size and left[-1] == 1 and right[0] == 1)
+
+
+def _containing_background_run(
+    canonical: np.ndarray, start: int, end: int
+) -> tuple[int, int]:
+    run_start = int(start)
+    run_end = int(end)
+    while run_start > 0 and canonical[run_start - 1] == 0:
+        run_start -= 1
+    while run_end < canonical.size and canonical[run_end] == 0:
+        run_end += 1
+    return run_start, run_end
+
+
 def predicted_run_structure(predicted_speech) -> dict[str, int]:
     """Count learned argmax islands inside one canonical speech run."""
 
@@ -310,7 +516,7 @@ def internal_background_run_structure(
         raise ValueError("Scorer v10 internal-background arrays must have equal shape")
     run_count = fully_dropped = false_keep_frames = false_keep_islands = 0
     for start, end in _runs(canonical == 0):
-        if not np.any(canonical[:start] == 1) or not np.any(canonical[end:] == 1):
+        if not _speech_bracketed_by_nearest_definite(canonical, start, end):
             continue
         run_count += 1
         run_prediction = predicted[start:end]
@@ -323,7 +529,12 @@ def internal_background_run_structure(
     for start, end in _runs(predicted):
         if not np.all(canonical[start:end] == 0):
             continue
-        if not np.any(canonical[:start] == 1) or not np.any(canonical[end:] == 1):
+        background_start, background_end = _containing_background_run(
+            canonical, start, end
+        )
+        if not _speech_bracketed_by_nearest_definite(
+            canonical, background_start, background_end
+        ):
             continue
         independent_false_keep_islands += 1
         independent_false_keep_frames += end - start
@@ -420,7 +631,7 @@ def internal_background_run_worst_frame_auxiliary_loss(
     for index in range(int(logits.shape[0])):
         labels_cpu = canonical_labels[index].numpy()
         for start, end in _runs(labels_cpu == 0):
-            if not np.any(labels_cpu[:start] == 1) or not np.any(labels_cpu[end:] == 1):
+            if not _speech_bracketed_by_nearest_definite(labels_cpu, start, end):
                 continue
             losses = F.cross_entropy(
                 logits[index, start:end], target[index, start:end], reduction="none"
@@ -698,9 +909,16 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         raise ValueError("Scorer v10 is 1.7B-only")
     if args.max_steps <= 0 or args.eval_interval <= 0:
         raise ValueError("Scorer v10 max_steps/eval_interval must be positive")
+    os.environ["ASR_STAGE_WORKER_RAM_RATIO"] = "0.95"
     apply_vram_safety_cap(0.95)
-    rows = _read_rows(Path(args.dataset_manifest))
+    dataset_manifest_path = Path(args.dataset_manifest).resolve()
+    dataset_manifest_sha256 = _sha256(dataset_manifest_path)
+    rows = _read_rows(dataset_manifest_path)
     dataset_summary = validate_dataset_rows(rows)
+    feature_cache_gate_path = Path(dataset_summary["feature_cache_gate"])
+    feature_cache_gate = json.loads(
+        feature_cache_gate_path.read_text(encoding="utf-8-sig")
+    )
     by_partition = {
         name: [row for row in rows if row["partition"] == name] for name in PARTITIONS
     }
@@ -973,7 +1191,22 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             normalization=normalization,
             metadata={
                 "ptm_repo_id": args.ptm_repo_id,
-                "dataset_manifest": args.dataset_manifest,
+                "dataset_manifest": str(dataset_manifest_path),
+                "dataset_manifest_sha256": dataset_manifest_sha256,
+                "feature_manifest": str(feature_cache_gate["signed_feature_manifest"]),
+                "signed_feature_manifest_sha256": dataset_summary[
+                    "signed_feature_manifest_sha256"
+                ],
+                "canonical_sources_sha256": dataset_summary[
+                    "canonical_sources_sha256"
+                ],
+                "feature_cache_gate": str(feature_cache_gate_path),
+                "feature_cache_gate_sha256": dataset_summary[
+                    "feature_cache_gate_sha256"
+                ],
+                "feature_config_sha256": dataset_summary[
+                    "feature_config_sha256"
+                ],
                 "dataset_summary": dataset_summary,
                 "trained_steps": args.max_steps,
                 "best_step": best_step,
@@ -1024,6 +1257,15 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "val": val,
         "test": test,
         "dataset": dataset_summary,
+        "dataset_manifest": str(dataset_manifest_path),
+        "dataset_manifest_sha256": dataset_manifest_sha256,
+        "canonical_sources_sha256": dataset_summary["canonical_sources_sha256"],
+        "signed_feature_manifest_sha256": dataset_summary[
+            "signed_feature_manifest_sha256"
+        ],
+        "feature_cache_gate": str(feature_cache_gate_path),
+        "feature_cache_gate_sha256": dataset_summary["feature_cache_gate_sha256"],
+        "feature_config_sha256": dataset_summary["feature_config_sha256"],
         "canonical_label_counts": dict(canonical_counts),
         "excluded_training_count": int(canonical_counts["unsure"]),
         **release_gate_fields(numeric_gate_pass_value),
@@ -1055,6 +1297,18 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             args.internal_background_worst_frame_weight
         ),
         "max_batch_rows": int(args.max_batch_rows),
+        "max_batch_frames": int(args.max_batch_frames),
+        "max_steps": int(args.max_steps),
+        "eval_interval": int(args.eval_interval),
+        "learning_rate": float(args.learning_rate),
+        "weight_decay": float(args.weight_decay),
+        "class_weights": {
+            "background": float(args.background_weight),
+            "speech": float(args.speech_weight),
+        },
+        "model_config": model_config,
+        "physical_ram_ratio": 0.95,
+        "vram_safety_ratio": 0.95,
         "checkpoint_selection": (
             "val_95pct_safety_then_independent_internal_background_false_keep_v3"
         ),

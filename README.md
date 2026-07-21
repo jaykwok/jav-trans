@@ -117,7 +117,7 @@ Web 会在模型要求检查中提示驱动过旧或 CUDA 初始化失败。
      - MFCC / timing numeric features
   -> Speech-island scorer（1.7B binary-argmax v10 待审计/重训）
      - Scorer v8 仅保留为 threshold/hysteresis 审计参考，不进入当前生产 runtime
-     - v10 schema/model/trainer 与 fixed1024 canonical compiler 已完成；corrected r2 canonical、full raw PTM2048 cache 与真实数据 1-step CUDA trainer smoke 均通过，full training/模型 gate/晋升仍未完成
+     - v10 corrected-r5 signed raw cache 与 v2 training manifest 已完成；首个 5000-step checkpoint 数值 gate 失败，registry 仍为空，继续做 held-out repair-core deletion 诊断
   -> BoundaryProposalScorer v1（候选源审计中）
      - 学习型高召回 acoustic candidate source，不做 final cut decision
   -> 按 ASR repo 进入互不混用的边界链
@@ -165,7 +165,7 @@ Web 会在模型要求检查中提示驱动过旧或 CUDA 初始化失败。
 - `jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame-hf`：默认高质量档。
 - `jaykwok/Qwen3-ASR-0.6B-JA-Anime-Galgame-hf`：仅保留 ASR repo 与空 Boundary registry placeholder；全链重训留作未来 backlog，本轮不训练、不修改。
 
-1.7B 绑定已完成合同 plumbing；Speech-island scorer 的 canonical r5 已应用完整 replacement 人工审计，按 verdict 撤销 1 个错误 source event 与 2 个 rendered-placement follow-up，保留 `2665 sources / 2050 cores / max core use=1`。当前只允许用 r5 标签继续核对或重建 raw PTM feature cache 与 training manifest；旧 r3/r4 标签缓存、旧 Scorer checkpoint 和未审计别名都不能复用，Scorer v10 registry 仍为空。其余链包括高召回边界候选、待真实 Scorer 输出训练的 Outer、Acoustic Split、Pre-ASR CueQC 与 binary acoustic Inner。0.6B 的旧小模型已退役并保持空 placeholder；未来 backlog 若重启，必须重新提取 0.6B PTM features 并从头训练，不借用 1.7B feature cache、投影或 checkpoint。
+1.7B 绑定已完成合同 plumbing；Speech-island scorer canonical r5 保留 `2665 sources / 2050 cores / max core use=1`，raw PTM2048/MFCC40 已按 audio/feature 内容 SHA 重新签名并编译 v2 training manifest。首个 r5 5000-step checkpoint 因 held-out background drop/continuity 未同时达到 95% 而拒绝，旧 r3/r4 标签缓存、旧 Scorer checkpoint 和未审计别名均不能复用，Scorer v10 registry 仍为空。其余链包括高召回边界候选、待真实 Scorer 输出训练的 Outer、Acoustic Split、Pre-ASR CueQC 与 binary acoustic Inner。0.6B 的旧小模型已退役并保持空 placeholder；未来 backlog 若重启，必须重新提取 0.6B PTM features 并从头训练，不借用 1.7B feature cache、投影或 checkpoint。
 
 所有小模型统一放在：
 

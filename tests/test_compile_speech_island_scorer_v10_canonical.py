@@ -10,11 +10,19 @@ import soundfile as sf
 
 from asr.backends.qwen import QWEN_ASR_17B_REPO_ID
 from boundary.contracts import ACOUSTIC_BINARY_V12_CONTRACT
+from boundary.ja.model import (
+    SPEECH_ISLAND_SCORER_V10_FEATURE_CACHE_GATE_SCHEMA,
+    SPEECH_ISLAND_SCORER_V10_FEATURE_EXTRACTOR_SCHEMA,
+    SPEECH_ISLAND_SCORER_V10_RAW_CACHE_ROW_SCHEMA,
+)
 from tools.boundary.ja.compile_speech_island_scorer_v10_canonical import (
     CANONICAL_LABELS,
     canonical_frame_labels,
     finalize_dataset,
     prepare_dataset,
+)
+from tools.boundary.ja.train_speech_island_scorer_v10_binary import (
+    validate_dataset_rows,
 )
 
 
@@ -199,15 +207,8 @@ def test_prepare_rejects_background_video_partition_leakage(tmp_path: Path) -> N
         )
 
 
-@pytest.mark.parametrize(
-    "gate_schema",
-    [
-        "speech_scorer_v10_canonical_manual_gate_v1",
-        "speech_scorer_v10_corrected_canonical_manual_gate_v1",
-    ],
-)
 def test_finalize_requires_raw_17b_features_and_replays_trainer_contract(
-    tmp_path: Path, gate_schema: str
+    tmp_path: Path,
 ) -> None:
     _summary, prepared = _prepare_fixture(tmp_path)
     sources = [
@@ -227,36 +228,72 @@ def test_finalize_requires_raw_17b_features_and_replays_trainer_contract(
         )
         feature_rows.append(
             {
-                "audio_id": source["source_id"],
+                "schema": SPEECH_ISLAND_SCORER_V10_RAW_CACHE_ROW_SCHEMA,
+                "boundary_serialization_contract_id": (
+                    ACOUSTIC_BINARY_V12_CONTRACT.contract_id
+                ),
+                "feature_extractor_schema": (
+                    SPEECH_ISLAND_SCORER_V10_FEATURE_EXTRACTOR_SCHEMA
+                ),
+                "feature_config_sha256": "a" * 64,
+                "source_id": source["source_id"],
+                "audio_path": source["audio"],
+                "audio_sha256": hashlib.sha256(
+                    Path(source["audio"]).read_bytes()
+                ).hexdigest(),
+                "audio_size_bytes": Path(source["audio"]).stat().st_size,
+                "audio_sample_rate": source["sample_rate"],
+                "audio_sample_count": source["sample_count"],
                 "feature_path": str(feature_path),
+                "feature_sha256": hashlib.sha256(
+                    feature_path.read_bytes()
+                ).hexdigest(),
+                "feature_size_bytes": feature_path.stat().st_size,
                 "duration_s": source["duration_s"],
                 "frame_hop_s": 0.02,
                 "frame_count": frame_count,
                 "ptm_dim": 2048,
                 "mfcc_dim": 40,
-                "ptm": QWEN_ASR_17B_REPO_ID,
+                "ptm_repo_id": QWEN_ASR_17B_REPO_ID,
             }
         )
     feature_manifest = tmp_path / "features.jsonl"
     _write_jsonl(feature_manifest, feature_rows)
-    gate_summary = tmp_path / "manual_gate.json"
-    gate_summary.write_text(
-        json.dumps(
-            {
-                "schema": gate_schema,
-                "canonical_sources_sha256": hashlib.sha256(
-                    (prepared / "canonical_sources.jsonl").read_bytes()
-                ).hexdigest(),
-                "manual_gate_pass": True,
-                "training_manifest_allowed": True,
-            }
-        ),
-        encoding="utf-8",
-    )
+    gate_summary = tmp_path / "feature-cache-gate.json"
+
+    def write_gate(*, training_allowed: bool = True) -> None:
+        gate_summary.write_text(
+            json.dumps(
+                {
+                    "schema": SPEECH_ISLAND_SCORER_V10_FEATURE_CACHE_GATE_SCHEMA,
+                    "boundary_serialization_contract_id": (
+                        ACOUSTIC_BINARY_V12_CONTRACT.contract_id
+                    ),
+                    "feature_extractor_schema": (
+                        SPEECH_ISLAND_SCORER_V10_FEATURE_EXTRACTOR_SCHEMA
+                    ),
+                    "canonical_sources_sha256": hashlib.sha256(
+                        (prepared / "canonical_sources.jsonl").read_bytes()
+                    ).hexdigest(),
+                    "signed_feature_manifest": str(feature_manifest),
+                    "signed_feature_manifest_sha256": hashlib.sha256(
+                        feature_manifest.read_bytes()
+                    ).hexdigest(),
+                    "feature_config_sha256": "a" * 64,
+                    "audio_content_signature": "b" * 64,
+                    "feature_content_signature": "c" * 64,
+                    "cache_binding_signature": "d" * 64,
+                    "feature_cache_reuse_allowed": training_allowed,
+                    "training_manifest_allowed": training_allowed,
+                }
+            ),
+            encoding="utf-8",
+        )
+    write_gate()
     summary = finalize_dataset(
         canonical_sources=prepared / "canonical_sources.jsonl",
         feature_manifest=feature_manifest,
-        manual_gate_summary=gate_summary,
+        feature_cache_gate=gate_summary,
         output_dir=tmp_path / "final",
     )
     assert summary["training_ready"] is True
@@ -267,37 +304,73 @@ def test_finalize_requires_raw_17b_features_and_replays_trainer_contract(
         for counts in summary["partition_label_presence"].values()
     )
 
-    feature_rows[0]["ptm"] = "jaykwok/Qwen3-ASR-0.6B-JA-Anime-Galgame-hf"
+    first_audio = Path(sources[0]["audio"])
+    original_audio = first_audio.read_bytes()
+    sf.write(
+        first_audio,
+        np.ones(sources[0]["sample_count"], dtype=np.float32),
+        16000,
+    )
+    with pytest.raises(ValueError, match="audio content changed"):
+        finalize_dataset(
+            canonical_sources=prepared / "canonical_sources.jsonl",
+            feature_manifest=feature_manifest,
+            feature_cache_gate=gate_summary,
+            output_dir=tmp_path / "tampered-audio",
+        )
+    first_audio.write_bytes(original_audio)
+
+    training_rows = [
+        json.loads(line)
+        for line in Path(summary["training_manifest"])
+        .read_text(encoding="utf-8")
+        .splitlines()
+    ]
+    first_label = Path(training_rows[0]["label_path"])
+    original_label = first_label.read_bytes()
+    first_label.write_bytes(original_label + b"tampered")
+    with pytest.raises(ValueError, match="label content changed"):
+        validate_dataset_rows(training_rows)
+    first_label.write_bytes(original_label)
+
+    legacy = {
+        **training_rows[0],
+        "schema": "speech_scorer_v10_binary_training_row_v1",
+    }
+    with pytest.raises(ValueError, match="rejects diagnostic/non-training"):
+        validate_dataset_rows([legacy, *training_rows[1:]], verify_content=False)
+
+    feature_rows[0]["ptm_repo_id"] = "jaykwok/Qwen3-ASR-0.6B-JA-Anime-Galgame-hf"
     _write_jsonl(feature_manifest, feature_rows)
+    write_gate()
     with pytest.raises(ValueError, match="1.7B PTM"):
         finalize_dataset(
             canonical_sources=prepared / "canonical_sources.jsonl",
             feature_manifest=feature_manifest,
-            manual_gate_summary=gate_summary,
+            feature_cache_gate=gate_summary,
             output_dir=tmp_path / "rejected",
         )
 
 
-def test_finalize_rejects_pending_manual_gate(tmp_path: Path) -> None:
+def test_finalize_rejects_legacy_gate(tmp_path: Path) -> None:
     _summary, prepared = _prepare_fixture(tmp_path)
     gate_summary = tmp_path / "manual_gate.json"
     gate_summary.write_text(
         json.dumps(
             {
-                "schema": "speech_scorer_v10_canonical_manual_gate_v1",
+                "schema": "speech_scorer_v10_corrected_canonical_manual_gate_v1",
                 "canonical_sources_sha256": hashlib.sha256(
                     (prepared / "canonical_sources.jsonl").read_bytes()
                 ).hexdigest(),
-                "manual_gate_pass": False,
                 "training_manifest_allowed": False,
             }
         ),
         encoding="utf-8",
     )
-    with pytest.raises(ValueError, match="has not passed"):
+    with pytest.raises(ValueError, match="signed cache gate"):
         finalize_dataset(
             canonical_sources=prepared / "canonical_sources.jsonl",
             feature_manifest=tmp_path / "not-read.jsonl",
-            manual_gate_summary=gate_summary,
+            feature_cache_gate=gate_summary,
             output_dir=tmp_path / "rejected",
         )

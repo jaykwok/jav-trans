@@ -15,6 +15,7 @@ from boundary.ja.model import (
     SPEECH_ISLAND_SCORER_V10_DATASET_CONTRACT,
     SPEECH_ISLAND_SCORER_V10_MODEL_ARCH,
     SPEECH_ISLAND_SCORER_V10_SCHEMA,
+    SPEECH_ISLAND_SCORER_V10_TRAINING_ROW_SCHEMA,
     BinarySpeechIslandScorerNetwork,
     SemanticSpeechScorerNetwork,
     build_speech_island_scorer_checkpoint,
@@ -169,6 +170,22 @@ def _binary_v10_config() -> dict:
     }
 
 
+def _binary_v10_metadata(**overrides) -> dict:
+    metadata = {
+        "ptm_repo_id": "repo/1.7b",
+        "dataset_manifest": "training.jsonl",
+        "dataset_manifest_sha256": "1" * 64,
+        "feature_manifest": "signed-features.jsonl",
+        "signed_feature_manifest_sha256": "2" * 64,
+        "canonical_sources_sha256": "3" * 64,
+        "feature_cache_gate": "cache-gate.json",
+        "feature_cache_gate_sha256": "4" * 64,
+        "feature_config_sha256": "5" * 64,
+    }
+    metadata.update(overrides)
+    return metadata
+
+
 def test_binary_speech_v10_checkpoint_is_random_init_argmax_only(tmp_path) -> None:
     torch = pytest.importorskip("torch")
     config = _binary_v10_config()
@@ -177,7 +194,7 @@ def test_binary_speech_v10_checkpoint_is_random_init_argmax_only(tmp_path) -> No
         model=model,
         model_config=config,
         normalization={"mfcc_mean": [0.0] * 40, "mfcc_std": [1.0] * 40},
-        metadata={"ptm_repo_id": "repo/1.7b"},
+        metadata=_binary_v10_metadata(),
         schema=SPEECH_ISLAND_SCORER_V10_SCHEMA,
     )
     checkpoint = tmp_path / "scorer-v10.pt"
@@ -195,7 +212,7 @@ def test_binary_speech_v10_checkpoint_is_random_init_argmax_only(tmp_path) -> No
             model=model,
             model_config=config,
             normalization={},
-            metadata={"training_initialization": "warm_start"},
+            metadata=_binary_v10_metadata(training_initialization="warm_start"),
             schema=SPEECH_ISLAND_SCORER_V10_SCHEMA,
         )
 
@@ -207,7 +224,7 @@ def test_binary_speech_v10_batching_matches_singletons(tmp_path) -> None:
         model=BinarySpeechIslandScorerNetwork(**config).eval(),
         model_config=config,
         normalization={"mfcc_mean": [0.0] * 40, "mfcc_std": [1.0] * 40},
-        metadata={"ptm_repo_id": "repo/1.7b"},
+        metadata=_binary_v10_metadata(),
         schema=SPEECH_ISLAND_SCORER_V10_SCHEMA,
     )
     checkpoint = tmp_path / "scorer-v10.pt"
@@ -237,7 +254,7 @@ def _scorer_v10_row(
     source: str, core: str | None, partition: str, *, row_role: str = "speech"
 ) -> dict:
     return {
-        "schema": "speech_scorer_v10_binary_training_row_v1",
+        "schema": SPEECH_ISLAND_SCORER_V10_TRAINING_ROW_SCHEMA,
         "boundary_serialization_contract_id": "boundary_acoustic_binary_v12",
         "source_id": source,
         "core_ids": [] if core is None else [core],
@@ -250,6 +267,14 @@ def _scorer_v10_row(
         "feature_path": f"{source}.features.npz",
         "label_path": f"{source}.labels.npz",
         "frame_count": 3,
+        "canonical_sources_sha256": "1" * 64,
+        "signed_feature_manifest_sha256": "2" * 64,
+        "feature_cache_gate": "cache-gate.json",
+        "feature_cache_gate_sha256": "3" * 64,
+        "feature_config_sha256": "4" * 64,
+        "audio_sha256": "5" * 64,
+        "feature_sha256": "6" * 64,
+        "label_sha256": "7" * 64,
     }
 
 
@@ -259,18 +284,26 @@ def test_binary_speech_v10_dataset_contract_freezes_source_and_core() -> None:
         _scorer_v10_row("s2", "c2", "val"),
         _scorer_v10_row("s3", "c3", "test"),
     ]
-    assert validate_scorer_v10_rows(rows)["max_core_use_count"] == 1
+    assert validate_scorer_v10_rows(rows, verify_content=False)["max_core_use_count"] == 1
     with pytest.raises(ValueError, match="source is duplicated"):
-        validate_scorer_v10_rows([*rows, _scorer_v10_row("s1", "c4", "train")])
+        validate_scorer_v10_rows(
+            [*rows, _scorer_v10_row("s1", "c4", "train")],
+            verify_content=False,
+        )
     with pytest.raises(ValueError, match="max core use"):
-        validate_scorer_v10_rows([*rows, _scorer_v10_row("s4", "c1", "train")])
+        validate_scorer_v10_rows(
+            [*rows, _scorer_v10_row("s4", "c1", "train")],
+            verify_content=False,
+        )
     missing_contract = dict(rows[0])
     missing_contract.pop("boundary_serialization_contract_id")
     with pytest.raises(ValueError, match="central Boundary contract"):
-        validate_scorer_v10_rows([missing_contract, *rows[1:]])
+        validate_scorer_v10_rows(
+            [missing_contract, *rows[1:]], verify_content=False
+        )
     diagnostic = {**rows[0], "schema": "speech_scorer_v10_binary_diagnostic_row_v1", "diagnostic_only": True}
     with pytest.raises(ValueError, match="rejects diagnostic"):
-        validate_scorer_v10_rows([diagnostic, *rows[1:]])
+        validate_scorer_v10_rows([diagnostic, *rows[1:]], verify_content=False)
 
 
 def test_binary_speech_v10_unsure_is_excluded_from_normalization_and_presence(
@@ -420,6 +453,29 @@ def test_binary_speech_v10_internal_background_structure_counts_independent_isla
 
     assert result["independent_internal_background_false_keep_frame_count"] == 1
     assert result["independent_internal_background_false_keep_island_count"] == 1
+
+
+def test_binary_speech_v10_unsure_is_removed_from_background_bracketing() -> None:
+    separated = internal_background_run_structure(
+        np.asarray([1, 0, -100, 0, 1]),
+        np.asarray([1, 1, 1, 1, 1], dtype=bool),
+    )
+    bracketed = internal_background_run_structure(
+        np.asarray([1, -100, 0, -100, 1]),
+        np.asarray([1, 1, 1, 1, 1], dtype=bool),
+    )
+
+    assert separated["internal_background_run_count"] == 0
+    assert bracketed["internal_background_run_count"] == 1
+
+    torch = pytest.importorskip("torch")
+    labels = torch.tensor([[1, 0, -100, 0, 1]], dtype=torch.long)
+    logits = torch.zeros((1, 5, 2), dtype=torch.float32)
+    loss, term_count = internal_background_run_worst_frame_auxiliary_loss(
+        logits, labels, labels
+    )
+    assert term_count == 0
+    assert loss.item() == pytest.approx(0.0)
 
 
 def test_binary_speech_v10_continuity_auxiliary_only_penalizes_inside_speech() -> None:

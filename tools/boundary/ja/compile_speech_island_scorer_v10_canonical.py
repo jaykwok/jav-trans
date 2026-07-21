@@ -26,14 +26,18 @@ from asr.backends.qwen import QWEN_ASR_17B_REPO_ID  # noqa: E402
 from boundary.contracts import ACOUSTIC_BINARY_V12_CONTRACT  # noqa: E402
 from boundary.ja.model import (  # noqa: E402
     SPEECH_ISLAND_SCORER_V10_DATASET_CONTRACT,
+    SPEECH_ISLAND_SCORER_V10_FEATURE_CACHE_GATE_SCHEMA,
+    SPEECH_ISLAND_SCORER_V10_FEATURE_EXTRACTOR_SCHEMA,
     SPEECH_ISLAND_SCORER_V10_MFCC_DIM,
+    SPEECH_ISLAND_SCORER_V10_RAW_CACHE_ROW_SCHEMA,
     SPEECH_ISLAND_SCORER_V10_RAW_PTM_DIM,
+    SPEECH_ISLAND_SCORER_V10_TRAINING_ROW_SCHEMA,
 )
 
 
 SOURCE_SCHEMA = "speech_scorer_v10_canonical_source_v1"
 PREPARE_SUMMARY_SCHEMA = "speech_scorer_v10_canonical_prepare_summary_v1"
-FINALIZE_SUMMARY_SCHEMA = "speech_scorer_v10_canonical_finalize_summary_v1"
+FINALIZE_SUMMARY_SCHEMA = "speech_scorer_v10_canonical_finalize_summary_v2"
 CANONICAL_LABEL_SCHEMA = "speech_scorer_canonical_frames_v1"
 CANONICAL_LABELS = {"background": 0, "speech": 1, "unsure": 2}
 PARTITIONS = ("train", "val", "test")
@@ -50,6 +54,21 @@ def _write_jsonl(path: Path, rows: Iterable[dict[str, Any]]) -> None:
     with path.open("w", encoding="utf-8") as handle:
         for row in rows:
             handle.write(json.dumps(row, ensure_ascii=False) + "\n")
+
+
+def _sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        while chunk := handle.read(8 * 1024 * 1024):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _resolve_repo_path(value: str | Path) -> Path:
+    path = Path(value)
+    if not path.is_absolute():
+        path = PROJECT_ROOT / path
+    return path.resolve()
 
 
 def _safe_id(value: str) -> str:
@@ -478,29 +497,53 @@ def finalize_dataset(
     *,
     canonical_sources: Path,
     feature_manifest: Path,
-    manual_gate_summary: Path,
+    feature_cache_gate: Path,
     output_dir: Path,
 ) -> dict[str, Any]:
-    gate = json.loads(manual_gate_summary.read_text(encoding="utf-8-sig"))
-    if gate.get("schema") not in {
-        "speech_scorer_v10_canonical_manual_gate_v1",
-        "speech_scorer_v10_corrected_canonical_manual_gate_v1",
-    }:
-        raise ValueError("Scorer v10 canonical finalize requires the manual gate schema")
-    canonical_sha256 = hashlib.sha256(canonical_sources.read_bytes()).hexdigest()
+    gate = json.loads(feature_cache_gate.read_text(encoding="utf-8-sig"))
+    if gate.get("schema") != SPEECH_ISLAND_SCORER_V10_FEATURE_CACHE_GATE_SCHEMA:
+        raise ValueError("Scorer v10 canonical finalize requires the signed cache gate")
+    if gate.get("boundary_serialization_contract_id") != (
+        ACOUSTIC_BINARY_V12_CONTRACT.contract_id
+    ):
+        raise ValueError("Scorer v10 feature cache gate uses another boundary contract")
+    if gate.get("feature_extractor_schema") != (
+        SPEECH_ISLAND_SCORER_V10_FEATURE_EXTRACTOR_SCHEMA
+    ):
+        raise ValueError("Scorer v10 feature extractor contract changed")
+    canonical_sources = canonical_sources.resolve()
+    feature_manifest = feature_manifest.resolve()
+    canonical_sha256 = _sha256(canonical_sources)
     if gate.get("canonical_sources_sha256") != canonical_sha256:
-        raise ValueError("Scorer v10 canonical manual gate is bound to another manifest")
-    if gate.get("manual_gate_pass") is not True:
-        raise ValueError("Scorer v10 canonical manual gate has not passed")
+        raise ValueError("Scorer v10 feature cache gate is bound to another canonical manifest")
+    if _resolve_repo_path(str(gate.get("signed_feature_manifest") or "")) != feature_manifest:
+        raise ValueError("Scorer v10 feature cache gate references another signed manifest")
+    feature_manifest_sha256 = _sha256(feature_manifest)
+    if gate.get("signed_feature_manifest_sha256") != feature_manifest_sha256:
+        raise ValueError("Scorer v10 signed feature manifest SHA256 mismatch")
+    if gate.get("feature_cache_reuse_allowed") is not True:
+        raise ValueError("Scorer v10 feature cache gate does not authorize cache reuse")
     if gate.get("training_manifest_allowed") is not True:
-        raise ValueError("Scorer v10 canonical gate does not authorize a training manifest")
+        raise ValueError("Scorer v10 feature cache gate does not authorize training")
     sources = _read_jsonl(canonical_sources)
     dataset_summary = _validate_sources(sources)
     features: dict[str, dict[str, Any]] = {}
     for row in _read_jsonl(feature_manifest):
-        identity = str(row.get("audio_id") or "")
+        if row.get("schema") != SPEECH_ISLAND_SCORER_V10_RAW_CACHE_ROW_SCHEMA:
+            raise ValueError("Scorer v10 rejects unsigned/legacy raw feature rows")
+        if row.get("boundary_serialization_contract_id") != (
+            ACOUSTIC_BINARY_V12_CONTRACT.contract_id
+        ):
+            raise ValueError("Scorer v10 raw feature row uses another boundary contract")
+        if row.get("feature_extractor_schema") != (
+            SPEECH_ISLAND_SCORER_V10_FEATURE_EXTRACTOR_SCHEMA
+        ):
+            raise ValueError("Scorer v10 raw feature extractor contract changed")
+        if row.get("feature_config_sha256") != gate.get("feature_config_sha256"):
+            raise ValueError("Scorer v10 raw feature configuration signature mismatch")
+        identity = str(row.get("source_id") or "")
         if not identity or identity in features:
-            raise ValueError("feature manifest requires unique audio_id values")
+            raise ValueError("feature manifest requires unique source_id values")
         features[identity] = row
     expected = {str(row["source_id"]) for row in sources}
     if set(features) != expected:
@@ -514,9 +557,24 @@ def finalize_dataset(
     labels_dir.mkdir(parents=True, exist_ok=True)
     training_rows: list[dict[str, Any]] = []
     label_counts: Counter[str] = Counter()
+    feature_cache_gate_sha256 = _sha256(feature_cache_gate)
     for source in sources:
         feature = features[str(source["source_id"])]
-        if str(feature.get("ptm") or "") != QWEN_ASR_17B_REPO_ID:
+        source_id = str(source["source_id"])
+        audio_path = _resolve_repo_path(str(source.get("audio") or ""))
+        if _resolve_repo_path(str(feature.get("audio_path") or "")) != audio_path:
+            raise ValueError(f"Scorer v10 signed audio path mismatch: {source_id}")
+        if not audio_path.is_file():
+            raise ValueError(f"Scorer v10 source audio is missing: {audio_path}")
+        if int(feature.get("audio_size_bytes") or -1) != audio_path.stat().st_size:
+            raise ValueError(f"Scorer v10 signed audio size mismatch: {source_id}")
+        if _sha256(audio_path) != str(feature.get("audio_sha256") or ""):
+            raise ValueError(f"Scorer v10 signed audio content changed: {source_id}")
+        if int(feature.get("audio_sample_rate") or 0) != int(source["sample_rate"]):
+            raise ValueError(f"Scorer v10 signed audio sample rate mismatch: {source_id}")
+        if int(feature.get("audio_sample_count") or 0) != int(source["sample_count"]):
+            raise ValueError(f"Scorer v10 signed audio sample count mismatch: {source_id}")
+        if str(feature.get("ptm_repo_id") or "") != QWEN_ASR_17B_REPO_ID:
             raise ValueError("Scorer v10 feature cache must use the 1.7B PTM")
         if int(feature.get("ptm_dim") or 0) != SPEECH_ISLAND_SCORER_V10_RAW_PTM_DIM:
             raise ValueError("Scorer v10 feature cache must retain raw PTM2048")
@@ -524,12 +582,20 @@ def finalize_dataset(
             raise ValueError("Scorer v10 feature cache must contain MFCC40")
         if abs(float(feature.get("frame_hop_s") or 0.0) - DEFAULT_FRAME_HOP_S) > 1e-9:
             raise ValueError("Scorer v10 feature cache requires a 20 ms frame hop")
-        feature_path = Path(str(feature.get("feature_path") or ""))
+        feature_path = _resolve_repo_path(str(feature.get("feature_path") or ""))
         if not feature_path.is_file():
             raise ValueError(f"Scorer v10 feature cache is missing: {feature_path}")
-        with np.load(feature_path) as payload:
-            ptm_shape = tuple(np.asarray(payload["ptm"]).shape)
-            mfcc_shape = tuple(np.asarray(payload["mfcc"]).shape)
+        if int(feature.get("feature_size_bytes") or -1) != feature_path.stat().st_size:
+            raise ValueError(f"Scorer v10 signed feature size mismatch: {source_id}")
+        if _sha256(feature_path) != str(feature.get("feature_sha256") or ""):
+            raise ValueError(f"Scorer v10 signed feature content changed: {source_id}")
+        with np.load(feature_path, allow_pickle=False) as payload:
+            ptm = np.asarray(payload["ptm"])
+            mfcc = np.asarray(payload["mfcc"])
+            ptm_shape = tuple(ptm.shape)
+            mfcc_shape = tuple(mfcc.shape)
+            if ptm.dtype != np.float32 or mfcc.dtype != np.float32:
+                raise ValueError("Scorer v10 cached features must be float32")
         frame_count = int(feature["frame_count"])
         if ptm_shape != (frame_count, SPEECH_ISLAND_SCORER_V10_RAW_PTM_DIM):
             raise ValueError("Scorer v10 cached PTM shape does not match its manifest")
@@ -550,7 +616,15 @@ def finalize_dataset(
             boundary_serialization_contract_id=np.asarray(
                 [ACOUSTIC_BINARY_V12_CONTRACT.contract_id]
             ),
+            source_id=np.asarray([source_id]),
+            canonical_sources_sha256=np.asarray([canonical_sha256]),
+            signed_feature_manifest_sha256=np.asarray([feature_manifest_sha256]),
+            feature_cache_gate_sha256=np.asarray([feature_cache_gate_sha256]),
+            feature_config_sha256=np.asarray([str(gate["feature_config_sha256"])]),
+            audio_sha256=np.asarray([str(feature["audio_sha256"])]),
+            feature_sha256=np.asarray([str(feature["feature_sha256"])]),
         )
+        label_sha256 = _sha256(label_path)
         label_counts.update(
             background=int(np.sum(labels == CANONICAL_LABELS["background"])),
             speech=int(np.sum(labels == CANONICAL_LABELS["speech"])),
@@ -558,9 +632,9 @@ def finalize_dataset(
         )
         training_rows.append(
             {
-                "schema": "speech_scorer_v10_binary_training_row_v1",
+                "schema": SPEECH_ISLAND_SCORER_V10_TRAINING_ROW_SCHEMA,
                 "boundary_serialization_contract_id": ACOUSTIC_BINARY_V12_CONTRACT.contract_id,
-                "source_id": source["source_id"],
+                "source_id": source_id,
                 "audio": source["audio"],
                 "row_role": source["row_role"],
                 "partition": source["partition"],
@@ -575,6 +649,14 @@ def finalize_dataset(
                 "feature_path": str(feature_path),
                 "label_path": str(label_path),
                 "frame_count": frame_count,
+                "canonical_sources_sha256": canonical_sha256,
+                "signed_feature_manifest_sha256": feature_manifest_sha256,
+                "feature_cache_gate": str(feature_cache_gate.resolve()),
+                "feature_cache_gate_sha256": feature_cache_gate_sha256,
+                "feature_config_sha256": str(gate["feature_config_sha256"]),
+                "audio_sha256": str(feature["audio_sha256"]),
+                "feature_sha256": str(feature["feature_sha256"]),
+                "label_sha256": label_sha256,
             }
         )
 
@@ -593,7 +675,14 @@ def finalize_dataset(
         "boundary_serialization_contract_id": ACOUSTIC_BINARY_V12_CONTRACT.contract_id,
         "canonical_label_schema": CANONICAL_LABEL_SCHEMA,
         "canonical_sources_sha256": canonical_sha256,
-        "manual_gate_summary": str(manual_gate_summary),
+        "feature_cache_gate": str(feature_cache_gate.resolve()),
+        "feature_cache_gate_sha256": feature_cache_gate_sha256,
+        "signed_feature_manifest": str(feature_manifest),
+        "signed_feature_manifest_sha256": feature_manifest_sha256,
+        "feature_config_sha256": str(gate["feature_config_sha256"]),
+        "audio_content_signature": str(gate["audio_content_signature"]),
+        "feature_content_signature": str(gate["feature_content_signature"]),
+        "cache_binding_signature": str(gate["cache_binding_signature"]),
         "dataset": dataset_summary,
         "trainer_dataset": trainer_summary,
         "partition_label_presence": presence,
@@ -601,6 +690,7 @@ def finalize_dataset(
         "trainer_replay_frame_counts": dict(replay_counts),
         "excluded_training_count": int(label_counts["unsure"]),
         "training_manifest": str(training_manifest),
+        "training_manifest_sha256": _sha256(training_manifest),
         "training_ready": True,
         "numeric_gate_pass": False,
         "manual_zero_clipping_gate": "required_before_promotion",
@@ -626,7 +716,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     finalize = subparsers.add_parser("finalize")
     finalize.add_argument("--canonical-sources", required=True)
     finalize.add_argument("--feature-manifest", required=True)
-    finalize.add_argument("--manual-gate-summary", required=True)
+    finalize.add_argument("--feature-cache-gate", required=True)
     finalize.add_argument("--output-dir", required=True)
     return parser.parse_args(argv)
 
@@ -646,7 +736,7 @@ def main(argv: list[str] | None = None) -> dict[str, Any]:
         result = finalize_dataset(
             canonical_sources=Path(args.canonical_sources),
             feature_manifest=Path(args.feature_manifest),
-            manual_gate_summary=Path(args.manual_gate_summary),
+            feature_cache_gate=Path(args.feature_cache_gate),
             output_dir=Path(args.output_dir),
         )
     print(json.dumps(result, ensure_ascii=False))

@@ -18,6 +18,7 @@ for root in (PROJECT_ROOT, SRC_ROOT):
         sys.path.insert(0, str(root))
 
 from boundary.ja.model import (  # noqa: E402
+    SPEECH_ISLAND_SCORER_V10_TRAINING_ROW_SCHEMA,
     load_speech_island_scorer_checkpoint,
     score_binary_speech_class_probabilities,
 )
@@ -29,7 +30,7 @@ from pipeline.memory_safety import (  # noqa: E402
 
 IGNORE_INDEX = -100
 FRAME_HOP_S = 0.02
-TRAINING_ROW_SCHEMA = "speech_scorer_v10_binary_training_row_v1"
+TRAINING_ROW_SCHEMA = SPEECH_ISLAND_SCORER_V10_TRAINING_ROW_SCHEMA
 DIAGNOSTIC_ROW_SCHEMA = "speech_scorer_v10_binary_diagnostic_row_v1"
 
 

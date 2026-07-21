@@ -8,6 +8,8 @@ import subprocess
 
 import numpy as np
 
+from boundary.ja.model import SPEECH_ISLAND_SCORER_V10_TRAINING_ROW_SCHEMA
+
 from tools.audits.generate_scorer_v10_prediction_audit_html import (
     VERDICT_SCHEMA,
     build_audit,
@@ -22,7 +24,7 @@ from tools.audits.score_scorer_v10_checkpoint_audit import (
 
 
 def test_checkpoint_audit_accepts_strict_diagnostic_rows_but_rejects_mixing() -> None:
-    training = {"schema": "speech_scorer_v10_binary_training_row_v1"}
+    training = {"schema": SPEECH_ISLAND_SCORER_V10_TRAINING_ROW_SCHEMA}
     diagnostic = {
         "schema": "speech_scorer_v10_binary_diagnostic_row_v1",
         "diagnostic_only": True,
