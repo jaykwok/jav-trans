@@ -159,6 +159,9 @@ def test_prediction_audit_html_is_exact_span_and_saveable(tmp_path: Path) -> Non
     assert "1.7B ASR 辅助（每个蓝条独立、无上下文）" in page
     assert "まだ…" in page
     assert "ASR-assisted prediction audit" in page
+    assert "黄色区仍漏语音、蓝条只保留一部分或被切碎" in page
+    assert "含目标语音（包括黄色漏检/蓝色切碎）" in page
+    assert "非空数量只是召回下限" in page
     assert "textarea" not in page
     assert (index.parent / "audio" / "item-000.wav").is_file()
     summary = json.loads((index.parent / "summary.json").read_text(encoding="utf-8"))
@@ -166,6 +169,8 @@ def test_prediction_audit_html_is_exact_span_and_saveable(tmp_path: Path) -> Non
     assert summary["asr_probe_span_count"] == 1
     assert summary["asr_nonempty_text_span_count"] == 1
     assert summary["asr_automatic_label_change_allowed"] is False
+    assert summary["asr_evidence_scope"] == "scorer_argmax_speech_islands_only"
+    assert summary["asr_can_measure_full_source_semantic_recall"] is False
     script = re.search(r"<script>([\s\S]*?)</script>", page)
     assert script is not None
     node = shutil.which("node")

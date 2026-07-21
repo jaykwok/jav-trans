@@ -203,12 +203,12 @@ small{color:var(--muted)}h2{font-size:18px;margin:0 0 4px;overflow-wrap:anywhere
     __SCOPE_NOTE__
     <div><b>实际工作流：</b>蓝色是 Scorer 二分类 argmax=speech，会成为独立 downstream island；不做 threshold、gap merge 或时长规则。红色是 canonical truth_speech 中被模型判为 background、实际不会送出的精确区间。绿色/黄色是完整 canonical speech/background，整条 source 播放器只用于判断上下文。</div>
     <div><b>播放合同：</b>每个色条只播放自身 start–end 后立即停止，不添加上下文。点击原生播放器可听整条 source。只需选择按钮，不要求备注。</div>
-    <div><b>ASR 辅助：</b>若页面显示 ASR 文本，它来自每个蓝色 island 独立、无上下文、batch size 1 的 1.7B forward；空文本或错词只作听审证据，绝不自动改 canonical。</div>
+    <div><b>ASR 辅助（只覆盖蓝条）：</b>若页面显示 ASR 文本，它来自每个蓝色 island 独立、无上下文、batch size 1 的 1.7B forward；它不会探测黄色 model-background 中漏掉的语音，因此非空数量只是召回下限，不能作为 full-source recall。必须听整条 source；空文本或错词也只作证据，绝不自动改 canonical。</div>
     <div class="guide">
       <div><b>speech_deletion</b>：优先听红条；判断是真语音被整段删除，还是 canonical 应改为 background。</div>
       <div><b>speech_edge_or_partial</b>：优先听红条；区分真语音/尾音被截、纯停顿却打断同一 ASR 单元，以及可安全切开的 background。</div>
       <div><b>long_residual</b>：听蓝条并用整条 source 判断；确认是否含应独立 drop 的背景/非语义段。</div>
-      <div><b>background_false_keep</b>：听蓝条；判断模型是否误留背景，或 all-background canonical 漏了目标语音。</div>
+      <div><b>background_false_keep（source 级）</b>：只要整条 source 任意位置存在目标语音，即使黄色区仍漏语音、蓝条只保留一部分或被切碎，也选“含目标语音”。本页只发现错误 source；后续逐段页才确定完整 speech/background/unsure 边界，绝不直接继承蓝条为训练 truth。</div>
     </div>
   </section>
   <div id="list"></div>
@@ -251,7 +251,7 @@ function playExact(audio,button,start,end){
   if(audio.readyState<1){activeLoadHandler=begin;audio.addEventListener('loadedmetadata',begin,{once:true});audio.load();}else begin();
 }
 function choices(row){
-  if(row.category==='background_false_keep')return [['model_false_keep','确实全是背景/非语义，模型误留'],['canonical_contains_target_speech','含目标语音，canonical all-background 错'],['unsure','不确定']];
+  if(row.category==='background_false_keep')return [['model_false_keep','整条 source 都是背景/非语义，模型误留'],['canonical_contains_target_speech','含目标语音（包括黄色漏检/蓝色切碎），canonical all-background 错'],['unsure','整条 source 是否含目标语音仍不确定']];
   if(row.category==='speech_deletion')return [['true_speech_deleted','红段是真语音，模型整段删除'],['canonical_should_be_background','红段可 drop，canonical 应为 background'],['unsure','不确定']];
   if(row.category==='long_residual')return [['acceptable_long_residual','蓝色长段整体可保留'],['missed_background_or_gap','蓝段内含应独立 drop 的背景/非语义'],['true_speech_edge_clipped','实际仍有真语音边缘被截'],['unsure','不确定']];
   return [['true_speech_clipped','红段含发音/尾音，模型截断'],['same_asr_unit_fragmented','红段可为停顿，但左右属同一 ASR 单元，切开有害'],['canonical_should_be_background','红段可作 background，切开符合工作流'],['unsure','不确定']];
@@ -442,6 +442,8 @@ def build_audit(
             bool(span["asr_probe"].get("nonempty_text")) for span in asr_spans
         ),
         "asr_automatic_label_change_allowed": False,
+        "asr_evidence_scope": "scorer_argmax_speech_islands_only",
+        "asr_can_measure_full_source_semantic_recall": False,
         "manual_verdict_schema": VERDICT_SCHEMA,
         "manual_gate_status": "pending",
     }

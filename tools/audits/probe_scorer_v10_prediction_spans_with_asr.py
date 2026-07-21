@@ -450,6 +450,8 @@ def run(
         "diagnostic_only": True,
         "training_manifest_allowed": False,
         "automatic_label_change_allowed": False,
+        "probe_scope": "scorer_argmax_speech_islands_only",
+        "full_source_semantic_recall_measured": False,
         "manual_gate_status": "pending",
         "events": execution["events"],
         "shared_vram_context_baseline": execution["context_baseline"],
