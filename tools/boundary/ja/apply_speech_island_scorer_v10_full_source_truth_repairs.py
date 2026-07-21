@@ -161,7 +161,13 @@ def _validate_decision_spans(
 
 def _load_gate(
     manual_gate_path: Path,
-) -> tuple[dict[str, Any], list[dict[str, Any]], str, str]:
+) -> tuple[
+    dict[str, Any],
+    list[dict[str, Any]],
+    str,
+    str,
+    dict[str, dict[str, Any]],
+]:
     gate = _json(manual_gate_path)
     if gate.get("schema") != GATE_SCHEMA:
         raise ValueError("full-source repair requires the strict manual gate")
@@ -179,7 +185,10 @@ def _load_gate(
         or list(gate.get("unreviewed_source_ids") or ())
     ):
         raise ValueError("full-source repair gate is incomplete or unsafe")
-    _require_bound_file(gate, "audit_manifest")
+    _require_bound_file(gate, "audit_summary")
+    audit_manifest_path = _require_bound_file(gate, "audit_manifest")
+    _require_bound_file(gate, "prediction_audit_manifest")
+    _require_bound_file(gate, "prediction_manual_gate")
     _require_bound_file(gate, "manual_verdicts")
     decisions_path = _require_bound_file(gate, "decisions")
     decisions = _rows(decisions_path)
@@ -209,6 +218,23 @@ def _load_gate(
         seen.add(source_id)
         label_counts.update(counts)
         verdict_counts[str(raw["verdict"])] += 1
+    audit_items: dict[str, dict[str, Any]] = {}
+    for raw in _rows(audit_manifest_path):
+        source_id = str(raw.get("source_id") or "")
+        audio = Path(str(raw.get("audio") or ""))
+        if not audio.is_absolute():
+            audio = audit_manifest_path.parent / audio
+        if not source_id or source_id in audit_items or not audio.is_file():
+            raise ValueError("full-source audited audio item is invalid or duplicated")
+        if int(raw.get("audio_size_bytes") or -1) != audio.stat().st_size:
+            raise ValueError(f"full-source audited audio size mismatch: {source_id}")
+        audio_sha256 = _sha256(audio)
+        if str(raw.get("audio_sha256") or "") != audio_sha256:
+            raise ValueError(f"full-source audited audio SHA256 mismatch: {source_id}")
+        audit_items[source_id] = {
+            "audio_sha256": audio_sha256,
+            "audio_size_bytes": audio.stat().st_size,
+        }
     if (
         int(gate.get("source_count") or 0) != len(normalized)
         or int(gate.get("reviewed_source_count") or 0) != len(normalized)
@@ -218,7 +244,15 @@ def _load_gate(
         != dict(sorted((gate.get("verdict_counts") or {}).items()))
     ):
         raise ValueError("full-source repair gate summary does not match its decisions")
-    return gate, normalized, _sha256(manual_gate_path), _sha256(decisions_path)
+    if set(audit_items) != seen:
+        raise ValueError("full-source audited audio identities differ from decisions")
+    return (
+        gate,
+        normalized,
+        _sha256(manual_gate_path),
+        _sha256(decisions_path),
+        audit_items,
+    )
 
 
 def _frame_counts(sources: Sequence[dict[str, Any]]) -> Counter[str]:
@@ -328,7 +362,9 @@ def apply_repairs(
             if source.get(source_field) != audio_row.get(audio_field):
                 raise ValueError(f"input audio manifest {audio_field} mismatch")
 
-    gate, decisions, gate_sha256, decisions_sha256 = _load_gate(manual_gate_path)
+    gate, decisions, gate_sha256, decisions_sha256, audit_items = _load_gate(
+        manual_gate_path
+    )
     by_source = {str(row["source_id"]): row for row in decisions}
     available = {str(row["source_id"]) for row in sources}
     missing = sorted(set(by_source) - available)
@@ -361,6 +397,17 @@ def apply_repairs(
             raise ValueError(f"full-source repair partition mismatch: {source_id}")
         if int(original.get("sample_rate") or 0) != SAMPLE_RATE:
             raise ValueError(f"full-source repair requires 16 kHz audio: {source_id}")
+        source_audio = _resolve(str(original.get("audio") or ""))
+        audit_audio = audit_items[source_id]
+        if not source_audio.is_file():
+            raise ValueError(f"full-source canonical audio is missing: {source_id}")
+        if (
+            source_audio.stat().st_size != int(audit_audio["audio_size_bytes"])
+            or _sha256(source_audio) != str(audit_audio["audio_sha256"])
+        ):
+            raise ValueError(
+                f"full-source audited audio differs from canonical audio: {source_id}"
+            )
         before_labels = canonical_frame_labels(original)
         if int(decision["frame_count"]) != len(before_labels):
             raise ValueError(f"full-source repair frame extent mismatch: {source_id}")
@@ -449,6 +496,7 @@ def apply_repairs(
             "model_output_used_as_truth": False,
             "asr_output_used_as_truth": False,
             "unmarked_complement_used_only_after_full_review": True,
+            "audited_audio_sha256": str(audit_audio["audio_sha256"]),
         }
         changed_fields = {
             key
@@ -513,6 +561,7 @@ def apply_repairs(
         "decisions_sha256": decisions_sha256,
         "model_output_used_as_truth": False,
         "asr_output_used_as_truth": False,
+        "audited_audio_identity_matched": True,
         "changed_source_ids": sorted(changed_source_ids),
         "changed_source_count": len(changed_source_ids),
         "added_core_ids": sorted(added_core_ids),

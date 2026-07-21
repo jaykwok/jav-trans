@@ -21,6 +21,8 @@ from tools.audits.generate_scorer_v10_full_source_span_audit_html import (
     FRAME_HOP_S,
     ITEM_SCHEMA,
     MANUAL_VERDICT_SCHEMA,
+    PREDICTION_GATE_SCHEMA,
+    SUMMARY_SCHEMA,
 )
 
 
@@ -41,6 +43,22 @@ def _rows(path: Path) -> list[dict[str, Any]]:
 
 def _sha256(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def _resolve(path: str | Path) -> Path:
+    candidate = Path(path)
+    if not candidate.is_absolute():
+        candidate = PROJECT_ROOT / candidate
+    return candidate.resolve()
+
+
+def _require_bound_file(payload: dict[str, Any], field: str) -> Path:
+    path = _resolve(str(payload.get(field) or ""))
+    if not path.is_file():
+        raise ValueError(f"full-source audit evidence is missing: {field}")
+    if _sha256(path) != str(payload.get(f"{field}_sha256") or ""):
+        raise ValueError(f"full-source audit evidence SHA mismatch: {field}")
+    return path
 
 
 def _validate_spans(
@@ -93,8 +111,52 @@ def _validate_spans(
 
 
 def evaluate(
-    *, audit_manifest: Path, manual_verdicts: Path, output_dir: Path
+    *,
+    audit_summary: Path,
+    audit_manifest: Path,
+    manual_verdicts: Path,
+    output_dir: Path,
 ) -> Path:
+    summary = json.loads(audit_summary.read_text(encoding="utf-8-sig"))
+    if summary.get("schema") != SUMMARY_SCHEMA:
+        raise ValueError("invalid full-source audit summary schema")
+    if summary.get("boundary_serialization_contract_id") != (
+        ACOUSTIC_BINARY_V12_CONTRACT.contract_id
+    ):
+        raise ValueError("full-source audit summary has the wrong central contract")
+    if _resolve(str(summary.get("audit_manifest") or "")) != audit_manifest.resolve():
+        raise ValueError("full-source audit summary binds another manifest")
+    if str(summary.get("audit_manifest_sha256") or "") != _sha256(audit_manifest):
+        raise ValueError("full-source audit manifest SHA mismatch")
+    prediction_manifest = _require_bound_file(summary, "prediction_audit_manifest")
+    prediction_gate_path = _require_bound_file(summary, "prediction_manual_gate")
+    prediction_gate = json.loads(
+        prediction_gate_path.read_text(encoding="utf-8-sig")
+    )
+    if prediction_gate.get("schema") != PREDICTION_GATE_SCHEMA:
+        raise ValueError("invalid bound prediction manual gate schema")
+    if prediction_gate.get("manual_review_complete") is not True:
+        raise ValueError("bound prediction manual review is incomplete")
+    bound_prediction_summary = _require_bound_file(prediction_gate, "audit_summary")
+    bound_prediction_manifest = _require_bound_file(
+        prediction_gate, "audit_manifest"
+    )
+    bound_prediction_verdicts = _require_bound_file(
+        prediction_gate, "manual_verdicts"
+    )
+    if bound_prediction_manifest != prediction_manifest:
+        raise ValueError("prediction manual gate binds another audit manifest")
+    repair_audit_ids = {
+        str(value) for value in prediction_gate.get("canonical_repair_ids") or []
+    }
+    selected_source_ids = {
+        str(row.get("source_id") or "")
+        for row in _rows(prediction_manifest)
+        if str(row.get("audit_id") or "") in repair_audit_ids
+    }
+    if not repair_audit_ids or len(selected_source_ids) != len(repair_audit_ids):
+        raise ValueError("prediction manual gate repair selection is incomplete")
+
     manifest_rows = _rows(audit_manifest)
     manifest: dict[str, dict[str, Any]] = {}
     for row in manifest_rows:
@@ -108,9 +170,24 @@ def evaluate(
         source_id = str(row.get("source_id") or "")
         if not source_id or source_id in manifest:
             raise ValueError("full-source audit manifest requires unique source ids")
+        audio = Path(str(row.get("audio") or ""))
+        if not audio.is_absolute():
+            audio = audit_manifest.parent / audio
+        if not audio.is_file():
+            raise ValueError(f"full-source audited audio is missing: {source_id}")
+        if int(row.get("audio_size_bytes") or -1) != audio.stat().st_size:
+            raise ValueError(f"full-source audited audio size mismatch: {source_id}")
+        if str(row.get("audio_sha256") or "") != _sha256(audio):
+            raise ValueError(f"full-source audited audio SHA mismatch: {source_id}")
         manifest[source_id] = row
     if not manifest:
         raise ValueError("full-source audit manifest is empty")
+    if set(manifest) != selected_source_ids:
+        raise ValueError("full-source audit sources differ from prediction repair gate")
+    if list(manifest) != list(summary.get("source_ids") or []):
+        raise ValueError("full-source audit source order differs from its summary")
+    if int(summary.get("source_count") or 0) != len(manifest):
+        raise ValueError("full-source audit source count differs from its summary")
 
     verdict_rows = _rows(manual_verdicts)
     verdicts: dict[str, dict[str, Any]] = {}
@@ -196,8 +273,18 @@ def evaluate(
         "boundary_serialization_contract_id": (
             ACOUSTIC_BINARY_V12_CONTRACT.contract_id
         ),
+        "audit_summary": str(audit_summary),
+        "audit_summary_sha256": _sha256(audit_summary),
         "audit_manifest": str(audit_manifest),
         "audit_manifest_sha256": _sha256(audit_manifest),
+        "prediction_audit_manifest": str(prediction_manifest),
+        "prediction_audit_manifest_sha256": _sha256(prediction_manifest),
+        "prediction_manual_gate": str(prediction_gate_path),
+        "prediction_manual_gate_sha256": _sha256(prediction_gate_path),
+        "prediction_audit_summary": str(bound_prediction_summary),
+        "prediction_audit_summary_sha256": _sha256(bound_prediction_summary),
+        "prediction_manual_verdicts": str(bound_prediction_verdicts),
+        "prediction_manual_verdicts_sha256": _sha256(bound_prediction_verdicts),
         "manual_verdicts": str(manual_verdicts),
         "manual_verdicts_sha256": _sha256(manual_verdicts),
         "source_count": len(manifest),
@@ -225,6 +312,7 @@ def evaluate(
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--audit-summary", required=True)
     parser.add_argument("--audit-manifest", required=True)
     parser.add_argument("--manual-verdicts", required=True)
     parser.add_argument("--output-dir", required=True)
@@ -235,6 +323,7 @@ if __name__ == "__main__":
     args = parse_args()
     print(
         evaluate(
+            audit_summary=Path(args.audit_summary),
             audit_manifest=Path(args.audit_manifest),
             manual_verdicts=Path(args.manual_verdicts),
             output_dir=Path(args.output_dir),

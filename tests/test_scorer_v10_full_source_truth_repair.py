@@ -143,6 +143,66 @@ def _write_fixture(tmp_path: Path) -> tuple[Path, Path, Path, str]:
         encoding="utf-8",
     )
 
+    audit_audio_dir = tmp_path / "audit_audio"
+    audit_audio_dir.mkdir()
+    audit_audio = audit_audio_dir / "target.wav"
+    canonical_audio = tmp_path / "fixture" / f"{target_id}.wav"
+    canonical_audio.parent.mkdir(exist_ok=True)
+    canonical_audio.write_bytes(b"RIFF-audited-target")
+    next(row for row in sources if row["source_id"] == target_id)["audio"] = str(
+        canonical_audio
+    )
+    canonical.write_text(
+        "".join(json.dumps(row, sort_keys=True) + "\n" for row in sources),
+        encoding="utf-8",
+    )
+    audio_rows = json.loads(audio_manifest.read_text(encoding="utf-8"))
+    next(row for row in audio_rows if row["audio_id"] == target_id)["audio"] = str(
+        canonical_audio
+    )
+    audio_manifest.write_text(json.dumps(audio_rows), encoding="utf-8")
+    summary_payload = json.loads(summary.read_text(encoding="utf-8"))
+    summary_payload["canonical_sources_sha256"] = _sha256(canonical)
+    summary_payload["audio_manifest_sha256"] = _sha256(audio_manifest)
+    summary.write_text(json.dumps(summary_payload), encoding="utf-8")
+    audit_audio.write_bytes(canonical_audio.read_bytes())
+
+    prediction_manifest = tmp_path / "prediction_manifest.jsonl"
+    prediction_audit_id = f"background_false_keep:{target_id}"
+    prediction_manifest.write_text(
+        json.dumps(
+            {
+                "audit_id": prediction_audit_id,
+                "source_id": target_id,
+                "row_role": "all_background",
+                "category": "background_false_keep",
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    prediction_summary = tmp_path / "prediction_summary.json"
+    prediction_summary.write_text("{}\n", encoding="utf-8")
+    prediction_verdicts = tmp_path / "prediction_verdicts.jsonl"
+    prediction_verdicts.write_text("{}\n", encoding="utf-8")
+    prediction_gate = tmp_path / "prediction_gate.json"
+    prediction_gate.write_text(
+        json.dumps(
+            {
+                "schema": "speech_scorer_v10_prediction_manual_gate_v3",
+                "manual_review_complete": True,
+                "audit_summary": str(prediction_summary),
+                "audit_summary_sha256": _sha256(prediction_summary),
+                "audit_manifest": str(prediction_manifest),
+                "audit_manifest_sha256": _sha256(prediction_manifest),
+                "manual_verdicts": str(prediction_verdicts),
+                "manual_verdicts_sha256": _sha256(prediction_verdicts),
+                "canonical_repair_ids": [prediction_audit_id],
+            }
+        ),
+        encoding="utf-8",
+    )
+
     audit_manifest = tmp_path / "audit_manifest.jsonl"
     audit_manifest.write_text(
         json.dumps(
@@ -156,7 +216,9 @@ def _write_fixture(tmp_path: Path) -> tuple[Path, Path, Path, str]:
                 "frame_count": 10,
                 "frame_hop_s": 0.02,
                 "duration_s": 0.19375,
-                "audio": "audio/target.wav",
+                "audio": str(audit_audio),
+                "audio_size_bytes": audit_audio.stat().st_size,
+                "audio_sha256": _sha256(audit_audio),
             }
         )
         + "\n",
@@ -197,7 +259,28 @@ def _write_fixture(tmp_path: Path) -> tuple[Path, Path, Path, str]:
         + "\n",
         encoding="utf-8",
     )
+    audit_summary = tmp_path / "audit_summary.json"
+    audit_summary.write_text(
+        json.dumps(
+            {
+                "schema": "speech_scorer_v10_full_source_span_audit_summary_v1",
+                "boundary_serialization_contract_id": (
+                    ACOUSTIC_BINARY_V12_CONTRACT.contract_id
+                ),
+                "audit_manifest": str(audit_manifest),
+                "audit_manifest_sha256": _sha256(audit_manifest),
+                "prediction_audit_manifest": str(prediction_manifest),
+                "prediction_audit_manifest_sha256": _sha256(prediction_manifest),
+                "prediction_manual_gate": str(prediction_gate),
+                "prediction_manual_gate_sha256": _sha256(prediction_gate),
+                "source_count": 1,
+                "source_ids": [target_id],
+            }
+        ),
+        encoding="utf-8",
+    )
     gate_path = evaluate(
+        audit_summary=audit_summary,
         audit_manifest=audit_manifest,
         manual_verdicts=verdicts,
         output_dir=tmp_path / "gate",
@@ -236,6 +319,7 @@ def test_full_source_truth_repair_is_exact_deterministic_and_rebindable(
     assert result["partition_identity_changed"] is False
     assert result["model_output_used_as_truth"] is False
     assert result["asr_output_used_as_truth"] is False
+    assert result["audited_audio_identity_matched"] is True
 
     corrected_rows = [
         json.loads(line)
@@ -390,6 +474,25 @@ def test_full_source_truth_repair_rejects_wrong_contract(tmp_path: Path) -> None
     gate["boundary_serialization_contract_id"] = "legacy-generation"
     gate_path.write_text(json.dumps(gate), encoding="utf-8")
     with pytest.raises(ValueError, match="another Boundary contract"):
+        apply_repairs(
+            input_summary_path=input_summary,
+            manual_gate_path=gate_path,
+            output_dir=tmp_path / "output",
+        )
+
+
+def test_full_source_truth_repair_rejects_changed_canonical_audio(
+    tmp_path: Path,
+) -> None:
+    input_summary, gate_path, canonical, target_id = _write_fixture(tmp_path)
+    target = next(
+        json.loads(line)
+        for line in canonical.read_text(encoding="utf-8").splitlines()
+        if json.loads(line)["source_id"] == target_id
+    )
+    Path(target["audio"]).write_bytes(b"different-canonical-audio")
+
+    with pytest.raises(ValueError, match="differs from canonical audio"):
         apply_repairs(
             input_summary_path=input_summary,
             manual_gate_path=gate_path,

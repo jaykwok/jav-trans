@@ -203,6 +203,8 @@ def build_audit(
                 "frame_hop_s": FRAME_HOP_S,
                 "duration_s": float(row["duration_s"]),
                 "audio": destination.relative_to(output_dir).as_posix(),
+                "audio_size_bytes": destination.stat().st_size,
+                "audio_sha256": _sha256(destination),
             }
         )
 

@@ -123,6 +123,8 @@ def test_full_source_span_page_has_no_model_seed_and_saves_complete_truth(
             "frame_hop_s": 0.02,
             "duration_s": 0.2,
             "audio": "audio/source-000.wav",
+            "audio_size_bytes": len(b"RIFF-test"),
+            "audio_sha256": hashlib.sha256(b"RIFF-test").hexdigest(),
         }
     ]
     summary = json.loads((index.parent / "summary.json").read_text(encoding="utf-8"))
@@ -214,6 +216,7 @@ def test_full_source_span_gate_requires_gap_free_coverage(tmp_path: Path) -> Non
         encoding="utf-8",
     )
     gate_path = evaluate(
+        audit_summary=audit_dir / "summary.json",
         audit_manifest=audit_dir / "audit_manifest.jsonl",
         manual_verdicts=verdicts,
         output_dir=tmp_path / "gate",
@@ -246,6 +249,7 @@ def test_full_source_span_gate_requires_gap_free_coverage(tmp_path: Path) -> Non
     broken_verdicts.write_text(json.dumps(broken) + "\n", encoding="utf-8")
     with pytest.raises(ValueError, match="gap-free"):
         evaluate(
+            audit_summary=audit_dir / "summary.json",
             audit_manifest=audit_dir / "audit_manifest.jsonl",
             manual_verdicts=broken_verdicts,
             output_dir=tmp_path / "broken-gate",
@@ -281,6 +285,7 @@ def test_full_source_span_gate_keeps_unreviewed_rows_pending(tmp_path: Path) -> 
         encoding="utf-8",
     )
     gate_path = evaluate(
+        audit_summary=audit_dir / "summary.json",
         audit_manifest=audit_dir / "audit_manifest.jsonl",
         manual_verdicts=verdicts,
         output_dir=tmp_path / "gate",
@@ -302,4 +307,48 @@ def test_full_source_span_page_rejects_tampered_prediction_evidence(
             prediction_audit_manifest=selection,
             prediction_manual_gate=gate,
             output_dir=tmp_path / "audit",
+        )
+
+
+def test_full_source_span_gate_rejects_tampered_audited_audio(
+    tmp_path: Path,
+) -> None:
+    selection, gate, _source_id = _write_selection(tmp_path)
+    audit_dir = tmp_path / "audit"
+    build_audit(
+        prediction_audit_manifest=selection,
+        prediction_manual_gate=gate,
+        output_dir=audit_dir,
+    )
+    (audit_dir / "audio" / "source-000.wav").write_bytes(b"changed")
+
+    with pytest.raises(ValueError, match="audio size mismatch"):
+        evaluate(
+            audit_summary=audit_dir / "summary.json",
+            audit_manifest=audit_dir / "audit_manifest.jsonl",
+            manual_verdicts=tmp_path / "missing.jsonl",
+            output_dir=tmp_path / "gate",
+        )
+
+
+def test_full_source_span_gate_rejects_tampered_prediction_verdicts(
+    tmp_path: Path,
+) -> None:
+    selection, gate, _source_id = _write_selection(tmp_path)
+    audit_dir = tmp_path / "audit"
+    build_audit(
+        prediction_audit_manifest=selection,
+        prediction_manual_gate=gate,
+        output_dir=audit_dir,
+    )
+    prediction_gate = json.loads(gate.read_text(encoding="utf-8"))
+    prediction_verdicts = Path(prediction_gate["manual_verdicts"])
+    prediction_verdicts.write_text("changed\n", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="evidence SHA mismatch: manual_verdicts"):
+        evaluate(
+            audit_summary=audit_dir / "summary.json",
+            audit_manifest=audit_dir / "audit_manifest.jsonl",
+            manual_verdicts=tmp_path / "missing.jsonl",
+            output_dir=tmp_path / "gate",
         )
