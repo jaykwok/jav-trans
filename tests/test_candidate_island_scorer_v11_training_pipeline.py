@@ -4,6 +4,7 @@ import argparse
 import hashlib
 import json
 from pathlib import Path
+import random
 import wave
 
 import numpy as np
@@ -29,6 +30,8 @@ from tools.boundary.ja.compile_candidate_island_scorer_v11_features import (
 )
 from tools.boundary.ja.train_candidate_island_scorer_v11 import (
     _cuda_warmup_rows,
+    _pack_batches,
+    _plan_training_batches,
     _resolve_training_device,
     run as train,
 )
@@ -401,3 +404,28 @@ def test_v11_cuda_warmup_uses_longest_budgeted_batch() -> None:
 
     assert [row["row_id"] for row in selected] == ["long-a", "long-b"]
     assert max(row["window_end_frame"] for row in selected) * len(selected) <= 2000
+
+
+def test_v11_planned_batches_match_legacy_seeded_epoch_order() -> None:
+    rows = [
+        {"row_id": f"row-{index}", "window_start_frame": 0, "window_end_frame": length}
+        for index, length in enumerate((300, 900, 600, 850, 500, 700))
+    ]
+    legacy_rng = random.Random(117)
+    expected = []
+    for _epoch in range(3):
+        shuffled = list(rows)
+        legacy_rng.shuffle(shuffled)
+        expected.append(_pack_batches(shuffled, max_padded_frames=2000))
+
+    planned = _plan_training_batches(
+        rows, epochs=3, max_padded_frames=2000, seed=117
+    )
+
+    assert [
+        [[row["row_id"] for row in batch] for batch in epoch]
+        for epoch in planned
+    ] == [
+        [[row["row_id"] for row in batch] for batch in epoch]
+        for epoch in expected
+    ]

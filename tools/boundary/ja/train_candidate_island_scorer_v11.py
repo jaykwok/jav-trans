@@ -8,6 +8,7 @@ import hashlib
 import json
 import random
 import sys
+import time
 from collections import Counter, OrderedDict
 from pathlib import Path
 from typing import Any, Iterable, Sequence
@@ -552,12 +553,42 @@ def _cuda_warmup_rows(
     return batches[0]
 
 
+def _plan_training_batches(
+    rows: Sequence[dict[str, Any]],
+    *,
+    epochs: int,
+    max_padded_frames: int,
+    seed: int,
+) -> list[list[list[dict[str, Any]]]]:
+    rng = random.Random(int(seed))
+    planned: list[list[list[dict[str, Any]]]] = []
+    for _epoch in range(int(epochs)):
+        shuffled = list(rows)
+        rng.shuffle(shuffled)
+        planned.append(
+            _pack_batches(shuffled, max_padded_frames=int(max_padded_frames))
+        )
+    return planned
+
+
+def _write_progress(path: Path, payload: dict[str, Any]) -> None:
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    temporary.write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    temporary.replace(path)
+
+
 def run(args: argparse.Namespace) -> dict[str, Any]:
     import psutil
     import torch
 
     if args.variant not in {"baseline", "heatmap_aux"}:
         raise ValueError("Scorer v11 variant must be baseline or heatmap_aux")
+    log_every = int(getattr(args, "log_every", 50))
+    if log_every <= 0:
+        raise ValueError("Scorer v11 log_every must be positive")
     capacity_profile = str(args.capacity_profile)
     if capacity_profile not in CANDIDATE_ISLAND_SCORER_V11_CAPACITY_PROFILES:
         raise ValueError(f"unknown Scorer v11 capacity profile: {capacity_profile!r}")
@@ -702,11 +733,44 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     )
     training_steps = 0
     training_losses: list[float] = []
+    output_dir = Path(args.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    progress_path = output_dir / "progress.json"
+    planned_epochs = _plan_training_batches(
+        by_partition["train"],
+        epochs=int(args.epochs),
+        max_padded_frames=int(args.max_padded_frames),
+        seed=int(args.seed),
+    )
+    planned_steps = sum(len(batches) for batches in planned_epochs)
+    total_training_steps = (
+        min(planned_steps, int(args.max_steps))
+        if int(args.max_steps) > 0
+        else planned_steps
+    )
+    training_started = time.monotonic()
+    _write_progress(
+        progress_path,
+        {
+            "schema": "candidate_island_scorer_v11_training_progress_v1",
+            "status": "running",
+            "capacity_profile": capacity_profile,
+            "variant": args.variant,
+            "epoch": 0,
+            "epochs": int(args.epochs),
+            "batch": 0,
+            "batches_in_epoch": len(planned_epochs[0]) if planned_epochs else 0,
+            "step": 0,
+            "total_steps": total_training_steps,
+            "loss": None,
+            "recent_loss_mean": None,
+            "elapsed_s": 0.0,
+            "eta_s": None,
+        },
+    )
     model.train()
-    for _epoch in range(int(args.epochs)):
-        shuffled = list(by_partition["train"])
-        random.shuffle(shuffled)
-        for rows_batch in _pack_batches(shuffled, max_padded_frames=int(args.max_padded_frames)):
+    for epoch_index, epoch_batches in enumerate(planned_epochs, start=1):
+        for batch_index, rows_batch in enumerate(epoch_batches, start=1):
             batch = _collate([load_candidate_window(row, cache) for row in rows_batch], torch, device)
             if int(process.memory_info().rss) > physical_ram_budget:
                 raise MemoryError("Scorer v11 exceeded the 95% physical RAM budget")
@@ -729,13 +793,71 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             if float(args.gradient_clip_norm) > 0.0:
                 torch.nn.utils.clip_grad_norm_(model.parameters(), float(args.gradient_clip_norm))
             optimizer.step()
-            training_losses.append(float(loss.detach().cpu()))
+            current_loss = float(loss.detach().cpu())
+            training_losses.append(current_loss)
             training_steps += 1
             del batch, loss, _main, _aux, _logits, _valid
+            if (
+                training_steps == 1
+                or training_steps % log_every == 0
+                or training_steps >= total_training_steps
+            ):
+                elapsed_s = time.monotonic() - training_started
+                rate = training_steps / max(elapsed_s, 1e-9)
+                eta_s = max(0.0, (total_training_steps - training_steps) / max(rate, 1e-9))
+                recent = training_losses[-log_every:]
+                memory = memory_snapshots[-1]
+                progress = {
+                    "schema": "candidate_island_scorer_v11_training_progress_v1",
+                    "status": "running",
+                    "capacity_profile": capacity_profile,
+                    "variant": args.variant,
+                    "epoch": epoch_index,
+                    "epochs": int(args.epochs),
+                    "batch": batch_index,
+                    "batches_in_epoch": len(epoch_batches),
+                    "step": training_steps,
+                    "total_steps": total_training_steps,
+                    "loss": current_loss,
+                    "recent_loss_mean": float(np.mean(recent)),
+                    "elapsed_s": elapsed_s,
+                    "eta_s": eta_s,
+                    "cuda_allocated_mb": memory.get("cuda_allocated_mb"),
+                    "cuda_reserved_mb": memory.get("cuda_reserved_mb"),
+                    "shared_vram_mb": memory.get("shared_vram_mb"),
+                }
+                _write_progress(progress_path, progress)
+                print(
+                    "scorer_v11_train "
+                    f"epoch={epoch_index}/{int(args.epochs)} "
+                    f"batch={batch_index}/{len(epoch_batches)} "
+                    f"step={training_steps}/{total_training_steps} "
+                    f"loss={current_loss:.6f} "
+                    f"recent={float(np.mean(recent)):.6f} "
+                    f"elapsed_s={elapsed_s:.1f} eta_s={eta_s:.1f} "
+                    f"cuda={memory.get('cuda_allocated_mb')}/"
+                    f"{memory.get('cuda_reserved_mb')}MiB "
+                    f"shared={memory.get('shared_vram_mb')}MiB",
+                    flush=True,
+                )
             if int(args.max_steps) > 0 and training_steps >= int(args.max_steps):
                 break
         if int(args.max_steps) > 0 and training_steps >= int(args.max_steps):
             break
+    _write_progress(
+        progress_path,
+        {
+            "schema": "candidate_island_scorer_v11_training_progress_v1",
+            "status": "evaluating",
+            "capacity_profile": capacity_profile,
+            "variant": args.variant,
+            "epoch": min(len(planned_epochs), int(args.epochs)),
+            "epochs": int(args.epochs),
+            "step": training_steps,
+            "total_steps": total_training_steps,
+            "elapsed_s": time.monotonic() - training_started,
+        },
+    )
     metrics = {
         partition: _evaluate(
             model,
@@ -755,8 +877,6 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         and metrics["val"]["inside_candidate_recall"] >= 0.95
         and metrics["test"]["inside_candidate_recall"] >= 0.95
     )
-    output_dir = Path(args.output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
     checkpoint_path = output_dir / (
         f"scorer-v11-{capacity_profile}-{args.variant}.pt"
     )
@@ -826,6 +946,23 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         json.dumps(summary, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
         encoding="utf-8",
     )
+    _write_progress(
+        progress_path,
+        {
+            "schema": "candidate_island_scorer_v11_training_progress_v1",
+            "status": "completed",
+            "capacity_profile": capacity_profile,
+            "variant": args.variant,
+            "epoch": int(args.epochs),
+            "epochs": int(args.epochs),
+            "step": training_steps,
+            "total_steps": total_training_steps,
+            "elapsed_s": time.monotonic() - training_started,
+            "checkpoint": _display(checkpoint_path),
+            "checkpoint_sha256": summary["checkpoint_sha256"],
+            "metrics": metrics,
+        },
+    )
     print(json.dumps(summary, ensure_ascii=False, sort_keys=True))
     return summary
 
@@ -857,7 +994,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--learning-rate", type=float, default=2e-4)
     parser.add_argument("--weight-decay", type=float, default=1e-4)
     parser.add_argument("--gradient-clip-norm", type=float, default=1.0)
-    return parser.parse_args(argv)
+    parser.add_argument("--log-every", type=int, default=50)
+    args = parser.parse_args(argv)
+    if args.log_every <= 0:
+        parser.error("--log-every must be positive")
+    return args
 
 
 if __name__ == "__main__":

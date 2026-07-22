@@ -29,6 +29,8 @@
 
 ## 2026-07-22
 
+- Scorer v11 trainer新增可监控的确定性进度合同：预先使用与旧逐epoch `random.shuffle(seed=117)`完全等价的本地RNG规划batch，因此不改变样本顺序或训练结果；默认每50 step输出`epoch/batch/step/total/loss/recent/elapsed/ETA/CUDA/shared`，并原子更新output目录下`progress.json`，训练结束记录checkpoint和metrics。旧程序化`argparse.Namespace`调用缺少`log_every`时仍使用50，focused测试证明batch计划与旧顺序逐项一致。
+- 新增Scorer v11完整source checkpoint审计链。scorer严格复核canonical/raw-feature SHA和中央合同，按训练相同1000-frame context/200 overlap/unique ownership重放two-logit argmax，分别统计held-out inside/outside recall、start/end 300ms coverage、整段删除、truth-run连续性、内部drop gap和`>8s` residual，并在CUDA warmup后监测shared spill与阶段释放。对应网页固定包含每条held-out完整source、所有prediction-drop/truth-keep精确区间和全部`>8s` residual；色条只播放自身区间，另保留完整source播放器，裁决通过审计服务保存为`manual_verdicts.jsonl`，不伪造人工结果。
 - Scorer训练期间完成其余1.7B小模型职责/容量迁移审计，见`docs/audits/20260722_boundary-model-duty-capacity-audit-v1.md`。结论是不机械复制Scorer：Proposal应断开旧单logit+peak规则并在最终Scorer island上比较two-logit event与learned query；Split保留显式candidate/island双层Mamba，只重编旧heuristic scalar并做P128/P256/full-width固定数据A/B；CueQC若重构应使用自己的raw-PTM adapter而非借用Split投影；Inner保持当前有效基线。Outer当前位于CueQC前且会对all-background整岛drop，与Scorer高召回/CueQC路由职责重叠，必须先做no-Outer/edge-only/current三臂职责消融，不能直接扩容训练。
 - Scorer v11 真实数据 compact CUDA smoke 暴露 trainer 在首次 CUDA/Mamba 上下文建立前过早重置 shared-VRAM baseline，首个模型初始化因此被误报为 `74 MiB` spill。trainer 现与正式 raw extractor/v10 trainer 对齐：使用同一 capacity profile 和最大预算的代表 batch 完成临时 forward/backward/AdamW warmup，显式释放后建立执行基线，再恢复原 seed 随机初始化正式模型；正式训练期间任何新增 shared usage 仍立即 soft-OOM，warmup 本身也必须满足物理 RAM/VRAM `0.95` 上限。
 - Scorer v11真实1667-window CUDA smoke在进入训练前发现bare `--device cuda`无法传给`torch.cuda.set_per_process_memory_fraction`；trainer现统一把无index的CUDA device解析为当前`cuda:N`，保留显式`cuda:N`与CPU smoke语义，避免正式训练依赖手工参数绕过allocator cap。

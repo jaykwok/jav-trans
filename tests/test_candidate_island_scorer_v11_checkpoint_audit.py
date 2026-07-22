@@ -1,0 +1,49 @@
+from __future__ import annotations
+
+import numpy as np
+
+from tools.audits.score_candidate_island_scorer_v11_checkpoint import (
+    IGNORE_INDEX,
+    evaluate_source_prediction,
+)
+
+
+def test_v11_source_audit_tracks_deletion_fragmentation_and_unsure() -> None:
+    truth = np.asarray(
+        [0, 1, 1, 1, 1, IGNORE_INDEX, 0, 1, 1, 0, 0, 0], dtype=np.int64
+    )
+    predicted = np.asarray([0, 1, 0, 1, 1, 1, 1, 0, 0, 1, 1, 1], dtype=np.int64)
+
+    result = evaluate_source_prediction(
+        truth,
+        predicted,
+        tolerance_frames=1,
+        long_residual_frames=3,
+    )
+
+    assert result["truth_inside_run_count"] == 2
+    assert result["true_inside_deletion_count"] == 1
+    assert result["fragmented_truth_run_count"] == 1
+    assert result["continuous_truth_run_count"] == 0
+    assert result["prediction_drop_truth_keep_frame_count"] == 3
+    assert result["prediction_keep_truth_drop_frame_count"] == 4
+    assert result["long_residual_count"] == 1
+    assert result["confusion_truth_by_prediction"] == [[1, 4], [3, 3]]
+
+
+def test_v11_source_audit_perfect_prediction_passes_coverage() -> None:
+    truth = np.asarray([0, 1, 1, 1, 0, 1, 1, 0], dtype=np.int64)
+
+    result = evaluate_source_prediction(
+        truth,
+        truth.copy(),
+        tolerance_frames=0,
+        long_residual_frames=400,
+    )
+
+    assert result["inside_candidate_recall"] == 1.0
+    assert result["outside_candidate_recall"] == 1.0
+    assert result["start_coverage"] == 1.0
+    assert result["end_coverage"] == 1.0
+    assert result["truth_run_continuity"] == 1.0
+    assert result["true_inside_deletion_count"] == 0
