@@ -23,6 +23,7 @@ from boundary.contracts import (
     ACOUSTIC_BINARY_V12_CONTRACT,
     require_boundary_contract_id,
 )
+from boundary.gpu_safety import resolve_inference_device
 
 
 PRE_ASR_CUEQC_SCHEMA = "cueqc_pre_asr_semantic_chunk_v13"
@@ -1369,10 +1370,7 @@ class PreAsrCueQC:
             raise ValueError("Pre-ASR CueQC checkpoint missing model_state_dict")
         self.model.load_state_dict(state)
 
-        normalized = (device or "auto").strip().lower()
-        if normalized == "auto":
-            normalized = "cuda" if torch.cuda.is_available() else "cpu"
-        self.device = torch.device(normalized)
+        self.device = resolve_inference_device(device, stage="Pre-ASR CueQC v13")
         self.model.to(self.device)
         self.model.eval()
         self.path = path

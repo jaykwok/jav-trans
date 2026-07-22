@@ -116,11 +116,14 @@ Web 会在模型要求检查中提示驱动过旧或 CUDA 初始化失败。
      - Qwen ASR repo 对应的 frozen PTM/encoder frame features
      - MFCC / timing numeric features
   -> Candidate-island Scorer v11（1.7B，待真实数据训练与人工 gate）
-     - raw PTM2048 -> checkpoint 内 trainable Linear128，与 normalized MFCC40 拼接
-     - valid-prefix bidirectional Mamba2 -> Linear(2) -> softmax argmax
+     - 主臂：raw PTM2048 -> checkpoint 内 Linear(2048->2048)+GELU
+     - 与 normalized MFCC40 拼接后 Linear(2088->256)
+     - valid-prefix bidirectional Mamba2(hidden=256) -> Linear(2) -> softmax argmax
+     - compact P128/H128 只作为相同数据、seed、steps 的容量对照
      - 同一 ASR 单元内停顿、尾音和短背景属于 inside_candidate；unsure 仅保留在 canonical 并映射 -100
   -> BoundaryProposalScorer v1（候选源审计中）
-     - 学习型高召回 acoustic candidate source，不做 final cut decision
+     - 旧 checkpoint 只作高召回候选源审计参考，不做 final cut decision
+     - 必须在晋升后的 Scorer v11 真实输出上重建输入分布并复核候选 recall 后，才能决定保留或重构
   -> 按 ASR repo 进入互不混用的边界链
      - 1.7B：Outer Edge Refiner v3（合同 plumbing 已审计；等待实际 post-Scorer-v11 数据，未注册生产 checkpoint）
        -> Acoustic Split v4 binary argmax

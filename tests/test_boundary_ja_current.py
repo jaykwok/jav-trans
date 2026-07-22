@@ -204,7 +204,9 @@ def test_boundary_explicit_cuda_request_never_falls_back_to_cpu(monkeypatch) -> 
     monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
     with pytest.raises(RuntimeError, match="CPU fallback is disabled"):
         _model_device("cuda")
-    assert str(_model_device("auto")) == "cpu"
+    with pytest.raises(RuntimeError, match="CPU fallback is disabled"):
+        _model_device("auto")
+    assert str(_model_device("cpu")) == "cpu"
 
 
 def test_proposal_checkpoint_without_mapping_keeps_bootstrap(monkeypatch) -> None:

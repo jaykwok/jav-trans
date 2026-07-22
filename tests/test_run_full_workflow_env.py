@@ -115,8 +115,8 @@ def test_run_full_workflow_parse_args_uses_loaded_env(monkeypatch):
     assert not hasattr(args, "cueqc_model_path_by_repo")
     assert not hasattr(args, "cueqc_shadow_enabled")
     assert args.speech_boundary_scorer_checkpoint_by_repo == scorer_mapping
-    assert args.speech_boundary_split_score_quantile == 0.4
-    assert args.speech_boundary_split_prominence_quantile == 0.6
+    assert not hasattr(args, "speech_boundary_split_score_quantile")
+    assert not hasattr(args, "speech_boundary_split_prominence_quantile")
     assert args.pre_asr_cueqc_enabled is True
     assert not hasattr(args, "speech_boundary_threshold")
     assert not hasattr(args, "speech_boundary_speech_on_threshold")
@@ -151,10 +151,6 @@ def test_run_full_workflow_context_carries_boundary_env(monkeypatch, tmp_path):
             "unit",
             "--label",
             "boundary",
-            "--speech-boundary-split-score-quantile",
-            "0.45",
-            "--speech-boundary-split-prominence-quantile",
-            "0.55",
         ]
     )
     paths = run_full_workflow.RunPaths(
@@ -182,8 +178,8 @@ def test_run_full_workflow_context_carries_boundary_env(monkeypatch, tmp_path):
     assert "CUEQC_INFERENCE_BATCH_SIZE" not in ctx.advanced
     assert ctx.advanced["SPEECH_BOUNDARY_JA_SCORER_CHECKPOINT_BY_REPO"] == scorer_mapping
     assert ctx.advanced["OUTER_EDGE_REFINER_DEVICE"] == "cpu"
-    assert ctx.advanced["SPEECH_BOUNDARY_JA_SPLIT_SCORE_QUANTILE"] == "0.45"
-    assert ctx.advanced["SPEECH_BOUNDARY_JA_SPLIT_PROMINENCE_QUANTILE"] == "0.55"
+    assert "SPEECH_BOUNDARY_JA_SPLIT_SCORE_QUANTILE" not in ctx.advanced
+    assert "SPEECH_BOUNDARY_JA_SPLIT_PROMINENCE_QUANTILE" not in ctx.advanced
     assert "SPEECH_BOUNDARY_JA_SPLIT_MIN_PRIMARY_SCORE" not in ctx.advanced
     assert "SPEECH_BOUNDARY_JA_DENSE_CUT_GAP_S" not in ctx.advanced
     assert "SPEECH_BOUNDARY_JA_SPLIT_THRESHOLD" not in ctx.advanced
@@ -213,6 +209,16 @@ def test_run_full_workflow_cli_batch_overrides_loaded_env(monkeypatch):
     monkeypatch.delenv("SPEECH_BOUNDARY_JA_SPEECH_OFF_THRESHOLD", raising=False)
     monkeypatch.delenv("SPEECH_BOUNDARY_JA_FRAME_DILATION_S", raising=False)
     monkeypatch.delenv("SPEECH_BOUNDARY_JA_MIN_SEGMENT_S", raising=False)
+    legacy_proposal_controls = (
+        "SPEECH_BOUNDARY_JA_SPLIT_SCORE_QUANTILE",
+        "SPEECH_BOUNDARY_JA_SPLIT_PROMINENCE_QUANTILE",
+        "SPEECH_BOUNDARY_JA_SPLIT_SMOOTH_S",
+        "SPEECH_BOUNDARY_JA_SPLIT_NMS_S",
+        "SPEECH_BOUNDARY_JA_SPLIT_SNAP_S",
+        "SPEECH_BOUNDARY_JA_MIN_SPLIT_SEGMENT_S",
+    )
+    for name in legacy_proposal_controls:
+        monkeypatch.setenv(name, "0.5")
 
     args = run_full_workflow.parse_args(
         [
@@ -233,6 +239,7 @@ def test_run_full_workflow_cli_batch_overrides_loaded_env(monkeypatch):
     assert not hasattr(args, "cueqc_shadow_enabled")
     assert not hasattr(args, "cueqc_model_path_by_repo")
     assert not hasattr(args, "cueqc_inference_batch_size")
+    assert all(name not in run_full_workflow.os.environ for name in legacy_proposal_controls)
     assert "SPEECH_BOUNDARY_JA_THRESHOLD" not in run_full_workflow.os.environ
     assert "SPEECH_BOUNDARY_JA_SPEECH_ON_THRESHOLD" not in run_full_workflow.os.environ
     assert "SPEECH_BOUNDARY_JA_SPEECH_OFF_THRESHOLD" not in run_full_workflow.os.environ

@@ -219,14 +219,15 @@ def configure_env(args: argparse.Namespace) -> None:
     os.environ["PRE_ASR_CUEQC_DEVICE"] = args.pre_asr_cueqc_device
     os.environ["KEEP_ASR_CHUNKS"] = "1" if args.keep_asr_chunks else "0"
     os.environ["BOUNDARY_CACHE_ENABLED"] = "1" if args.boundary_cache else "0"
-    os.environ["SPEECH_BOUNDARY_JA_SPLIT_SCORE_QUANTILE"] = str(args.speech_boundary_split_score_quantile)
-    os.environ["SPEECH_BOUNDARY_JA_SPLIT_PROMINENCE_QUANTILE"] = str(
-        args.speech_boundary_split_prominence_quantile
-    )
-    os.environ["SPEECH_BOUNDARY_JA_SPLIT_SMOOTH_S"] = str(args.speech_boundary_split_smooth_s)
-    os.environ["SPEECH_BOUNDARY_JA_SPLIT_NMS_S"] = str(args.speech_boundary_split_nms_s)
-    os.environ["SPEECH_BOUNDARY_JA_SPLIT_SNAP_S"] = str(args.speech_boundary_split_snap_s)
-    os.environ["SPEECH_BOUNDARY_JA_MIN_SPLIT_SEGMENT_S"] = str(args.speech_boundary_min_split_segment_s)
+    for legacy_proposal_control in (
+        "SPEECH_BOUNDARY_JA_SPLIT_SCORE_QUANTILE",
+        "SPEECH_BOUNDARY_JA_SPLIT_PROMINENCE_QUANTILE",
+        "SPEECH_BOUNDARY_JA_SPLIT_SMOOTH_S",
+        "SPEECH_BOUNDARY_JA_SPLIT_NMS_S",
+        "SPEECH_BOUNDARY_JA_SPLIT_SNAP_S",
+        "SPEECH_BOUNDARY_JA_MIN_SPLIT_SEGMENT_S",
+    ):
+        os.environ.pop(legacy_proposal_control, None)
     os.environ["SPEECH_BOUNDARY_JA_PTM"] = args.speech_boundary_ptm
     if str(args.speech_boundary_model_path or "").strip():
         os.environ["SPEECH_BOUNDARY_JA_MODEL_PATH"] = project_path_value(args.speech_boundary_model_path)
@@ -281,14 +282,6 @@ def build_context(*, args: argparse.Namespace, paths: RunPaths, video: Path):
         "RUN_LOG_DIR": str(paths.run_logs),
         "BOUNDARY_CACHE_ENABLED": "1" if args.boundary_cache else "0",
         "BOUNDARY_CACHE_DIR": str(paths.root / "boundary-cache"),
-        "SPEECH_BOUNDARY_JA_SPLIT_SCORE_QUANTILE": str(args.speech_boundary_split_score_quantile),
-        "SPEECH_BOUNDARY_JA_SPLIT_PROMINENCE_QUANTILE": str(
-            args.speech_boundary_split_prominence_quantile
-        ),
-        "SPEECH_BOUNDARY_JA_SPLIT_SMOOTH_S": str(args.speech_boundary_split_smooth_s),
-        "SPEECH_BOUNDARY_JA_SPLIT_NMS_S": str(args.speech_boundary_split_nms_s),
-        "SPEECH_BOUNDARY_JA_SPLIT_SNAP_S": str(args.speech_boundary_split_snap_s),
-        "SPEECH_BOUNDARY_JA_MIN_SPLIT_SEGMENT_S": str(args.speech_boundary_min_split_segment_s),
         "SPEECH_BOUNDARY_JA_PTM": args.speech_boundary_ptm,
         "SPEECH_BOUNDARY_JA_MODEL_PATH": project_path_value(args.speech_boundary_model_path),
         "SPEECH_BOUNDARY_JA_DEVICE": args.speech_boundary_device,
@@ -424,12 +417,6 @@ def write_summary(paths: RunPaths, args: argparse.Namespace, results: list[dict[
         "speech_boundary_decision_mode": "two_logit_softmax_argmax",
         "speech_boundary_runtime_threshold": None,
         "speech_boundary_split_strategy": "acoustic_proposal_then_semantic_split",
-        "speech_boundary_split_score_quantile": args.speech_boundary_split_score_quantile,
-        "speech_boundary_split_prominence_quantile": args.speech_boundary_split_prominence_quantile,
-        "speech_boundary_split_smooth_s": args.speech_boundary_split_smooth_s,
-        "speech_boundary_split_nms_s": args.speech_boundary_split_nms_s,
-        "speech_boundary_split_snap_s": args.speech_boundary_split_snap_s,
-        "speech_boundary_min_split_segment_s": args.speech_boundary_min_split_segment_s,
         "speech_boundary_scorer_checkpoint_by_repo": args.speech_boundary_scorer_checkpoint_by_repo,
         "asr_batch_size": args.asr_batch_size,
         "pre_asr_cueqc_enabled": bool(args.pre_asr_cueqc_enabled),
@@ -546,12 +533,6 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("--keep-asr-chunks", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--boundary-cache", action=argparse.BooleanOptionalAction, default=_env_bool("BOUNDARY_CACHE_ENABLED", True))
-    parser.add_argument("--speech-boundary-split-score-quantile", dest="speech_boundary_split_score_quantile", type=float, default=_env_float("SPEECH_BOUNDARY_JA_SPLIT_SCORE_QUANTILE", 0.10))
-    parser.add_argument("--speech-boundary-split-prominence-quantile", dest="speech_boundary_split_prominence_quantile", type=float, default=_env_float("SPEECH_BOUNDARY_JA_SPLIT_PROMINENCE_QUANTILE", 0.10))
-    parser.add_argument("--speech-boundary-split-smooth-s", dest="speech_boundary_split_smooth_s", type=float, default=_env_float("SPEECH_BOUNDARY_JA_SPLIT_SMOOTH_S", 0.08))
-    parser.add_argument("--speech-boundary-split-nms-s", dest="speech_boundary_split_nms_s", type=float, default=_env_float("SPEECH_BOUNDARY_JA_SPLIT_NMS_S", 0.12))
-    parser.add_argument("--speech-boundary-split-snap-s", dest="speech_boundary_split_snap_s", type=float, default=_env_float("SPEECH_BOUNDARY_JA_SPLIT_SNAP_S", 0.10))
-    parser.add_argument("--speech-boundary-min-split-segment-s", dest="speech_boundary_min_split_segment_s", type=float, default=_env_float("SPEECH_BOUNDARY_JA_MIN_SPLIT_SEGMENT_S", 0.08))
     parser.add_argument(
         "--speech-boundary-ptm",
         dest="speech_boundary_ptm",
@@ -585,18 +566,6 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         args.speech_boundary_ptm = args.asr_backend
     if not str(args.speech_boundary_model_path or "").strip():
         args.speech_boundary_model_path = qwen_asr_default_model_path(args.speech_boundary_ptm)
-    for name in (
-        "speech_boundary_split_smooth_s",
-        "speech_boundary_split_nms_s",
-        "speech_boundary_split_snap_s",
-        "speech_boundary_min_split_segment_s",
-    ):
-        if getattr(args, name) < 0:
-            parser.error(f"--{name.replace('_', '-')} must be non-negative")
-    for name in ("speech_boundary_split_score_quantile", "speech_boundary_split_prominence_quantile"):
-        value = getattr(args, name)
-        if not 0.0 <= value <= 1.0:
-            parser.error(f"--{name.replace('_', '-')} must be between 0 and 1")
     if args.speech_boundary_window_s <= 0:
         parser.error("--speech-boundary-window-s must be positive")
     if args.speech_boundary_overlap_s < 0 or args.speech_boundary_overlap_s >= args.speech_boundary_window_s:
