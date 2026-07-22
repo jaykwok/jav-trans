@@ -37,9 +37,11 @@ from tools.asr.cueqc.label_pre_asr_with_omni import (
 FRAME_HOP_S = 0.02
 SCHEMA = "candidate_island_scorer_v11_omni_preaudit_v2"
 SUMMARY_SCHEMA = "candidate_island_scorer_v11_omni_preaudit_summary_v2"
-PROMPT_VERSION = "candidate_island_scorer_v11_omni_preaudit_dialogue_islands_v5"
+PROMPT_VERSION = "candidate_island_scorer_v11_omni_preaudit_dialogue_islands_v6"
 
 SYSTEM_PROMPT = """你是 1.7B Scorer v11 的候选岛预审 teacher。你的唯一职责是标出必须先保留给后续 Proposal / Split / CueQC 的连续候选对话岛。你不是 Split，不按句子、说话人、标点或语义单元切分；你也不是 CueQC，不做最终 keep/drop。
+
+输入来自以日语为主的 JAV / Galgame 相近成人音频域。目标语言是日语；应特别留意短日语词、助词、应答词、耳语、口吃、含混或残缺发音，以及夹在呻吟或动作声中的带词义成人场景发言。这些目标不能按普通干净语音标准漏掉。但场景与语言信息只用于提高日语词语/对白锚点的召回，绝不能把纯呻吟、喘息、呼吸、亲吻声或动作声自动升级为 inside_candidate。
 
 必须按以下优先顺序判断：
 1. 先寻找明确或很可能含词语、音节、耳语、口吃、残缺发音、句尾或对白的波形，把它们作为 inside_candidate 锚点。不要以 ASR 能否转录作为判据。
@@ -101,6 +103,16 @@ def _write_progress(path: Path, payload: Mapping[str, Any]) -> None:
             os.unlink(raw)
 
 
+def _resume_index(path: Path, *, model: str) -> dict[str, dict[str, Any]]:
+    return {
+        str(row["source_id"]): row
+        for row in _rows(path)
+        if row.get("schema") == SCHEMA
+        and row.get("model") == model
+        and row.get("prompt_version") == PROMPT_VERSION
+    }
+
+
 def _resolve_audio(value: str, *, manifest: Path) -> Path:
     raw = Path(value)
     candidates = [raw] if raw.is_absolute() else [manifest.parent / raw, PROJECT_ROOT / raw]
@@ -115,6 +127,9 @@ def _prompt(row: Mapping[str, Any], *, feedback: str = "") -> str:
         "source_id": str(row["source_id"]),
         "duration_s": float(row["duration_s"]),
         "task": "mark continuous candidate dialogue islands for Scorer v11",
+        "target_language": "Japanese",
+        "target_domain": "Japanese JAV / adult-scene audio with Galgame-like speech characteristics",
+        "domain_rule": "increase recall for short, whispered, stuttered, ambiguous, or partially masked Japanese lexical speech, but never keep pure moans, pants, breaths, kisses, or action sounds merely because the source is JAV",
         "decision_order": [
             "find definite or probable lexical/dialogue anchors",
             "preserve the continuous waveform envelope of the same dialogue round",
@@ -210,7 +225,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     rows = _rows(manifest)
     labels_path = output / "preaudit.jsonl"
     raw_path = output / "raw_responses.jsonl"
-    existing = {str(row["source_id"]): row for row in _rows(labels_path) if row.get("schema") == SCHEMA and row.get("model") == model}
+    existing = _resume_index(labels_path, model=model)
     pending = [row for row in rows if str(row["source_id"]) not in existing]
     if args.limit > 0:
         pending = pending[: args.limit]

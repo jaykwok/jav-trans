@@ -11,6 +11,7 @@ from tools.boundary.ja.label_candidate_island_scorer_v11_with_omni import (
     PROMPT_VERSION,
     SYSTEM_PROMPT,
     _prompt,
+    _resume_index,
     _spans,
     parse_args,
 )
@@ -39,15 +40,21 @@ def test_provider_base_url_normalization_and_known_profiles() -> None:
 
 
 def test_candidate_island_teacher_prompt_matches_scorer_responsibility() -> None:
-    assert PROMPT_VERSION.endswith("dialogue_islands_v5")
+    assert PROMPT_VERSION.endswith("dialogue_islands_v6")
     assert "不是 Split" in SYSTEM_PROMPT
     assert "不是 CueQC" in SYSTEM_PROMPT
+    assert "目标语言是日语" in SYSTEM_PROMPT
+    assert "JAV / Galgame 相近成人音频域" in SYSTEM_PROMPT
+    assert "绝不能把纯呻吟、喘息、呼吸、亲吻声或动作声自动升级" in SYSTEM_PROMPT
     assert "若整条 source 都是明确的纯非语义声音，必须允许 islands=[]" in SYSTEM_PROMPT
     assert "优先标为 unsure" in SYSTEM_PROMPT
     assert "同一场景、同一说话人、持续互动或声音连续，本身都不是合并理由" in SYSTEM_PROMPT
     assert "ASR 能否转录" in SYSTEM_PROMPT
     assert "固定时长" in SYSTEM_PROMPT
     payload = json.loads(_prompt({"source_id": "s", "duration_s": 75.0}))
+    assert payload["target_language"] == "Japanese"
+    assert "JAV" in payload["target_domain"]
+    assert "never keep pure moans" in payload["domain_rule"]
     assert payload["anti_overmerge"].endswith("return islands=[]")
     assert "unsure" in payload["decision_order"][-1]
 
@@ -68,6 +75,31 @@ def test_teacher_span_error_names_local_clip_range() -> None:
         raise AssertionError("out-of-range teacher coordinates must be rejected")
     assert "required_range=0..75.0" in message
     assert "0-based audio clip timeline" in message
+
+
+def test_teacher_resume_rejects_rows_from_an_older_prompt(tmp_path: Path) -> None:
+    rows = tmp_path / "preaudit.jsonl"
+    rows.write_text(
+        "".join(
+            json.dumps(row) + "\n"
+            for row in (
+                {
+                    "schema": "candidate_island_scorer_v11_omni_preaudit_v2",
+                    "source_id": "old",
+                    "model": "gemini",
+                    "prompt_version": "candidate_island_scorer_v11_omni_preaudit_dialogue_islands_v5",
+                },
+                {
+                    "schema": "candidate_island_scorer_v11_omni_preaudit_v2",
+                    "source_id": "current",
+                    "model": "gemini",
+                    "prompt_version": PROMPT_VERSION,
+                },
+            )
+        ),
+        encoding="utf-8",
+    )
+    assert set(_resume_index(rows, model="gemini")) == {"current"}
 
 
 def test_teacher_rejects_overlap_between_inside_and_unsure() -> None:
