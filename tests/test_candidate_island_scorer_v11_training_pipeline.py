@@ -16,6 +16,7 @@ from boundary.ja.model import (
     CANDIDATE_ISLAND_SCORER_V11_COMPACT_SCHEMA,
     CANDIDATE_ISLAND_SCORER_V11_FEATURE_EXTRACTOR_SCHEMA,
     CANDIDATE_ISLAND_SCORER_V11_RAW_CACHE_ROW_SCHEMA,
+    CANDIDATE_ISLAND_SCORER_V11_SYNTHETIC_TRAIN_SOURCE_SCHEMA,
     load_speech_island_scorer_checkpoint,
 )
 from tools.boundary.ja.compile_candidate_island_scorer_v11_canonical import (
@@ -80,53 +81,87 @@ def _canonical_fixture(tmp_path: Path, *, provenance: str = "human_confirmed_vis
                 "original_dataset_role": partition,
             }
         )
-        verdict_rows.append(
+        if partition in {"val", "test"}:
+            verdict_rows.append(
+                {
+                    "schema": HELDOUT_VERDICT_SCHEMA,
+                    "boundary_serialization_contract_id": ACOUSTIC_BINARY_V12_CONTRACT.contract_id,
+                    "source_id": source_id,
+                    "partition": partition,
+                    "frame_count": frame_count,
+                    "frame_hop_s": 0.02,
+                    "reviewed_full_source": True,
+                    "verdict": "complete_with_target_inside_candidate",
+                    "spans": [
+                        {"label": "outside_candidate", "start_frame": 0, "end_frame": 2},
+                        {"label": "inside_candidate", "start_frame": 2, "end_frame": 5},
+                        {"label": "unsure", "start_frame": 5, "end_frame": 6},
+                        {"label": "outside_candidate", "start_frame": 6, "end_frame": 8},
+                    ],
+                    "review_provenance": provenance,
+                    "training_manifest_allowed": False,
+                    "human_review_required": False,
+                }
+            )
+    synthetic_audio = tmp_path / "synthetic-train.wav"
+    _write_wav(synthetic_audio, frame_count)
+    synthetic_path = tmp_path / "synthetic_train_sources.jsonl"
+    _write_jsonl(
+        synthetic_path,
+        [
             {
-                "schema": HELDOUT_VERDICT_SCHEMA,
+                "schema": CANDIDATE_ISLAND_SCORER_V11_SYNTHETIC_TRAIN_SOURCE_SCHEMA,
                 "boundary_serialization_contract_id": ACOUSTIC_BINARY_V12_CONTRACT.contract_id,
-                "source_id": source_id,
-                "partition": partition,
+                "source_id": "synthetic-train",
+                "partition": "train",
+                "source_kind": "semantic_composite_candidate",
+                "synthetic_composite": True,
+                "input_distribution": "train_exact_candidate_context_composite_v1",
+                "audio": str(synthetic_audio),
+                "audio_sha256": _sha256(synthetic_audio),
+                "sample_rate": 16000,
+                "sample_count": frame_count * 320,
+                "duration_s": frame_count * 0.02,
                 "frame_count": frame_count,
                 "frame_hop_s": 0.02,
-                "reviewed_full_source": True,
-                "verdict": "complete_with_target_inside_candidate",
-                "spans": [
+                "core_ids": ["synthetic-core"],
+                "canonical_spans": [
                     {"label": "outside_candidate", "start_frame": 0, "end_frame": 2},
-                    {"label": "inside_candidate", "start_frame": 2, "end_frame": 5},
-                    {"label": "unsure", "start_frame": 5, "end_frame": 6},
+                    {"label": "inside_candidate", "start_frame": 2, "end_frame": 6},
                     {"label": "outside_candidate", "start_frame": 6, "end_frame": 8},
                 ],
-                "review_provenance": provenance,
-                "training_manifest_allowed": False,
-                "human_review_required": False,
+                "training_manifest_allowed": True,
             }
-        )
+        ],
+    )
     source_path = tmp_path / "source_windows.jsonl"
     partition_path = tmp_path / "partition_manifest.jsonl"
     verdict_path = tmp_path / "manual_verdicts.jsonl"
     _write_jsonl(source_path, source_rows)
     _write_jsonl(partition_path, partition_rows)
     _write_jsonl(verdict_path, verdict_rows)
-    return source_path, partition_path, verdict_path
+    return synthetic_path, source_path, partition_path, verdict_path
 
 
 def test_v11_canonical_requires_all_human_full_source_truth(tmp_path: Path) -> None:
-    source_path, partition_path, verdict_path = _canonical_fixture(tmp_path)
+    synthetic_path, source_path, partition_path, verdict_path = _canonical_fixture(tmp_path)
     partial = tmp_path / "partial.jsonl"
     partial.write_text(verdict_path.read_text(encoding="utf-8").splitlines()[0] + "\n", encoding="utf-8")
     with pytest.raises(ValueError, match="full-source truth for every frozen source"):
         compile_canonical(
+            synthetic_train_sources=synthetic_path,
             source_windows=source_path,
             partition_manifest=partition_path,
             manual_verdicts=[partial],
             output_dir=tmp_path / "partial-output",
         )
 
-    omni_source, omni_partition, omni_verdict = _canonical_fixture(
+    omni_synthetic, omni_source, omni_partition, omni_verdict = _canonical_fixture(
         tmp_path / "omni", provenance="omni:qwen3.5-omni-plus"
     )
     with pytest.raises(ValueError, match="Omni-only"):
         compile_canonical(
+            synthetic_train_sources=omni_synthetic,
             source_windows=omni_source,
             partition_manifest=omni_partition,
             manual_verdicts=[omni_verdict],
@@ -134,10 +169,41 @@ def test_v11_canonical_requires_all_human_full_source_truth(tmp_path: Path) -> N
         )
 
 
+def test_v11_canonical_requires_train_only_unique_synthetic_cores(tmp_path: Path) -> None:
+    synthetic_path, source_path, partition_path, verdict_path = _canonical_fixture(tmp_path)
+    rows = [json.loads(line) for line in synthetic_path.read_text(encoding="utf-8").splitlines()]
+    rows[0]["partition"] = "val"
+    invalid_partition = tmp_path / "synthetic-val.jsonl"
+    _write_jsonl(invalid_partition, rows)
+    with pytest.raises(ValueError, match="not train-only"):
+        compile_canonical(
+            synthetic_train_sources=invalid_partition,
+            source_windows=source_path,
+            partition_manifest=partition_path,
+            manual_verdicts=[verdict_path],
+            output_dir=tmp_path / "invalid-partition-output",
+        )
+
+    rows[0]["partition"] = "train"
+    duplicate = dict(rows[0])
+    duplicate["source_id"] = "synthetic-train-duplicate"
+    duplicate_core = tmp_path / "synthetic-duplicate-core.jsonl"
+    _write_jsonl(duplicate_core, [rows[0], duplicate])
+    with pytest.raises(ValueError, match="core identity is reused"):
+        compile_canonical(
+            synthetic_train_sources=duplicate_core,
+            source_windows=source_path,
+            partition_manifest=partition_path,
+            manual_verdicts=[verdict_path],
+            output_dir=tmp_path / "duplicate-core-output",
+        )
+
+
 def test_v11_feature_compile_and_random_init_cpu_smoke(tmp_path: Path) -> None:
     pytest.importorskip("torch")
-    source_path, partition_path, verdict_path = _canonical_fixture(tmp_path)
+    synthetic_path, source_path, partition_path, verdict_path = _canonical_fixture(tmp_path)
     canonical_summary = compile_canonical(
+        synthetic_train_sources=synthetic_path,
         source_windows=source_path,
         partition_manifest=partition_path,
         manual_verdicts=[verdict_path],
@@ -181,10 +247,10 @@ def test_v11_feature_compile_and_random_init_cpu_smoke(tmp_path: Path) -> None:
         output_dir=tmp_path / "features",
     )
     assert feature_summary["partition_window_counts"] == {"test": 1, "train": 1, "val": 1}
-    label_path = tmp_path / "features" / "source_labels" / "video-train-w00.npz"
+    label_path = tmp_path / "features" / "source_labels" / "synthetic-train.npz"
     with np.load(label_path, allow_pickle=False) as labels:
-        assert labels["training_labels"].tolist() == [0, 0, 1, 1, 1, -100, 0, 0]
-        assert labels["boundary_valid"].tolist()[5] is False
+        assert labels["training_labels"].tolist() == [0, 0, 1, 1, 1, 1, 0, 0]
+        assert labels["boundary_valid"].tolist()[5] is True
 
     args = argparse.Namespace(
         dataset_manifest=feature_summary["dataset_manifest"],
@@ -222,8 +288,9 @@ def test_v11_feature_compile_and_random_init_cpu_smoke(tmp_path: Path) -> None:
 
 
 def test_v11_feature_compile_rejects_projected_ptm128(tmp_path: Path) -> None:
-    source_path, partition_path, verdict_path = _canonical_fixture(tmp_path)
+    synthetic_path, source_path, partition_path, verdict_path = _canonical_fixture(tmp_path)
     canonical_summary = compile_canonical(
+        synthetic_train_sources=synthetic_path,
         source_windows=source_path,
         partition_manifest=partition_path,
         manual_verdicts=[verdict_path],

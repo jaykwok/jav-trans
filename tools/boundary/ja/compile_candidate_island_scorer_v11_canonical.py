@@ -23,6 +23,7 @@ from boundary.contracts import ACOUSTIC_BINARY_V12_CONTRACT  # noqa: E402
 from boundary.ja.model import (  # noqa: E402
     CANDIDATE_ISLAND_SCORER_V11_CANONICAL_LABEL_SCHEMA,
     CANDIDATE_ISLAND_SCORER_V11_CANONICAL_SOURCE_SCHEMA,
+    CANDIDATE_ISLAND_SCORER_V11_SYNTHETIC_TRAIN_SOURCE_SCHEMA,
 )
 
 
@@ -130,18 +131,25 @@ def canonical_frame_labels(source: dict[str, Any]) -> np.ndarray:
 
 def compile_canonical(
     *,
+    synthetic_train_sources: Path,
     source_windows: Path,
     partition_manifest: Path,
     manual_verdicts: Sequence[Path],
     output_dir: Path,
     verify_audio: bool = True,
 ) -> dict[str, Any]:
+    synthetic_train_sources = synthetic_train_sources.resolve()
     source_windows = source_windows.resolve()
     partition_manifest = partition_manifest.resolve()
     verdict_paths = [path.resolve() for path in manual_verdicts]
     if not verdict_paths:
         raise ValueError("Scorer v11 canonical compile requires manual verdict files")
-    for path in (source_windows, partition_manifest, *verdict_paths):
+    for path in (
+        synthetic_train_sources,
+        source_windows,
+        partition_manifest,
+        *verdict_paths,
+    ):
         if not path.exists():
             raise FileNotFoundError(path)
 
@@ -156,6 +164,33 @@ def compile_canonical(
             f"missing_sources={missing_sources[:5]}"
         )
     sources = {source_id: sources[source_id] for source_id in partitions}
+    for source_id, partition_row in partitions.items():
+        if partition_row.get("schema") != PARTITION_SCHEMA:
+            raise ValueError(f"wrong v11 partition schema: {source_id}")
+        if partition_row.get("boundary_serialization_contract_id") != (
+            ACOUSTIC_BINARY_V12_CONTRACT.contract_id
+        ):
+            raise ValueError(f"wrong central boundary contract: {source_id}")
+        partition = str(partition_row.get("partition") or "")
+        if partition not in PARTITIONS:
+            raise ValueError(f"invalid Scorer v11 partition: {source_id}")
+        source = sources[source_id]
+        if source.get("schema") != "joint_boundary_omni_source_window_v1":
+            raise ValueError(f"wrong Scorer v11 source-window schema: {source_id}")
+        if str(source.get("video_id") or "") != str(
+            partition_row.get("video_id") or ""
+        ):
+            raise ValueError(f"video identity mismatch: {source_id}")
+    heldout_partitions = {
+        source_id: row
+        for source_id, row in partitions.items()
+        if str(row.get("partition") or "") in {"val", "test"}
+    }
+    heldout_sources = {
+        source_id: sources[source_id] for source_id in heldout_partitions
+    }
+    if not heldout_sources:
+        raise ValueError("Scorer v11 canonical requires frozen real val/test sources")
 
     verdict_rows: list[dict[str, Any]] = []
     verdict_file_by_source: dict[str, Path] = {}
@@ -167,14 +202,15 @@ def compile_canonical(
             verdict_file_by_source[source_id] = path
             verdict_rows.append(row)
     verdicts = _index_unique(verdict_rows, "source_id", name="manual verdict")
-    missing = sorted(set(sources) - set(verdicts))
-    extra = sorted(set(verdicts) - set(sources))
+    missing = sorted(set(heldout_sources) - set(verdicts))
+    extra = sorted(set(verdicts) - set(heldout_sources))
     if missing or extra:
         raise ValueError(
             "Scorer v11 requires current-duty full-source truth for every frozen source; "
             f"missing={len(missing)} {missing[:8]}, extra={len(extra)} {extra[:8]}"
         )
 
+    synthetic_train_sha = _sha256(synthetic_train_sources)
     source_windows_sha = _sha256(source_windows)
     partition_sha = _sha256(partition_manifest)
     verdict_shas = {_display(path): _sha256(path) for path in verdict_paths}
@@ -182,10 +218,115 @@ def compile_canonical(
     partition_counts: Counter[str] = Counter()
     label_counts: Counter[str] = Counter()
     seen_video_partition: dict[str, str] = {}
+    seen_core_partition: dict[str, str] = {}
+    seen_core_source: dict[str, str] = {}
+    seen_source_partition: dict[str, str] = {}
 
-    for source_id in sorted(sources):
-        source = sources[source_id]
-        partition_row = partitions[source_id]
+    synthetic_rows = _index_unique(
+        _read_jsonl(synthetic_train_sources), "source_id", name="synthetic train source"
+    )
+    if not synthetic_rows:
+        raise ValueError("Scorer v11 canonical requires non-empty synthetic train sources")
+    for source_id in sorted(synthetic_rows):
+        source = synthetic_rows[source_id]
+        if source.get("schema") != CANDIDATE_ISLAND_SCORER_V11_SYNTHETIC_TRAIN_SOURCE_SCHEMA:
+            raise ValueError(f"wrong Scorer v11 synthetic train schema: {source_id}")
+        if source.get("boundary_serialization_contract_id") != (
+            ACOUSTIC_BINARY_V12_CONTRACT.contract_id
+        ):
+            raise ValueError(f"wrong central boundary contract: {source_id}")
+        if source.get("partition") != "train":
+            raise ValueError(f"synthetic Scorer v11 source is not train-only: {source_id}")
+        if not bool(source.get("synthetic_composite")) or not bool(
+            source.get("training_manifest_allowed")
+        ):
+            raise ValueError(f"synthetic Scorer v11 source is not approved: {source_id}")
+        if source.get("source_kind") not in {
+            "semantic_composite_candidate",
+            "isolated_human_vocal_candidate",
+            "clear_nonvocal_all_background",
+        }:
+            raise ValueError(f"unknown Scorer v11 synthetic source kind: {source_id}")
+        frame_count = int(source.get("frame_count") or 0)
+        if (
+            frame_count <= 0
+            or float(source.get("frame_hop_s") or 0.0) != FRAME_HOP_S
+            or int(source.get("sample_rate") or 0) != 16000
+            or int(source.get("sample_count") or 0) != frame_count * 320
+            or abs(float(source.get("duration_s") or 0.0) - frame_count * FRAME_HOP_S)
+            > 1e-9
+        ):
+            raise ValueError(f"synthetic Scorer v11 frame geometry mismatch: {source_id}")
+        spans = _validate_spans(
+            list(source.get("canonical_spans") or ()),
+            source_id=source_id,
+            frame_count=frame_count,
+        )
+        if any(span["label"] == "unsure" for span in spans):
+            raise ValueError(f"synthetic Scorer v11 truth cannot contain unsure: {source_id}")
+        audio = _resolve(str(source.get("audio") or ""))
+        if not audio.exists():
+            raise FileNotFoundError(audio)
+        audio_sha = str(source.get("audio_sha256") or "")
+        if len(audio_sha) != 64 or (verify_audio and _sha256(audio) != audio_sha):
+            raise ValueError(f"synthetic Scorer v11 audio SHA256 mismatch: {source_id}")
+        if source_id in heldout_sources:
+            raise ValueError(f"Scorer v11 source identity crosses partitions: {source_id}")
+        seen_source_partition[source_id] = "train"
+        core_ids = [str(value) for value in source.get("core_ids") or ()]
+        if any(not value for value in core_ids) or len(set(core_ids)) != len(core_ids):
+            raise ValueError(f"invalid synthetic core identities: {source_id}")
+        for core_id in core_ids:
+            previous_source = seen_core_source.setdefault(core_id, source_id)
+            if previous_source != source_id:
+                raise ValueError(
+                    f"Scorer v11 core identity is reused: {core_id} in "
+                    f"{previous_source} and {source_id}"
+                )
+            previous = seen_core_partition.setdefault(core_id, "train")
+            if previous != "train":
+                raise ValueError(f"Scorer v11 core identity crosses partitions: {core_id}")
+        for span in spans:
+            label_counts[str(span["label"])] += int(span["end_frame"]) - int(
+                span["start_frame"]
+            )
+        partition_counts["train"] += 1
+        compiled.append(
+            {
+                "schema": CANDIDATE_ISLAND_SCORER_V11_CANONICAL_SOURCE_SCHEMA,
+                "boundary_serialization_contract_id": (
+                    ACOUSTIC_BINARY_V12_CONTRACT.contract_id
+                ),
+                "canonical_label_schema": (
+                    CANDIDATE_ISLAND_SCORER_V11_CANONICAL_LABEL_SCHEMA
+                ),
+                "source_id": source_id,
+                "video_id": "",
+                "core_ids": core_ids,
+                "core_identity_kind": "frozen_synthetic_component_v1",
+                "partition": "train",
+                "input_distribution": str(source.get("input_distribution") or ""),
+                "source_kind": str(source.get("source_kind") or ""),
+                "synthetic_composite": True,
+                "audio": _display(audio),
+                "audio_sha256": audio_sha,
+                "duration_s": float(source["duration_s"]),
+                "frame_count": frame_count,
+                "frame_hop_s": FRAME_HOP_S,
+                "canonical_spans": spans,
+                "annotation_provenance": "exact_composition_train_truth",
+                "synthetic_train_sources_sha256": synthetic_train_sha,
+                "candidate_sample_span": source.get("candidate_sample_span"),
+                "candidate_source": source.get("candidate_source"),
+                "outside_brackets": source.get("outside_brackets"),
+                "composition_provenance": source.get("composition_provenance"),
+                "training_manifest_allowed": True,
+            }
+        )
+
+    for source_id in sorted(heldout_sources):
+        source = heldout_sources[source_id]
+        partition_row = heldout_partitions[source_id]
         verdict = verdicts[source_id]
         if partition_row.get("schema") != PARTITION_SCHEMA:
             raise ValueError(f"wrong v11 partition schema: {source_id}")
@@ -197,7 +338,7 @@ def compile_canonical(
             ):
                 raise ValueError(f"wrong central boundary contract: {source_id}")
         partition = str(partition_row.get("partition") or "")
-        if partition not in PARTITIONS or verdict.get("partition") != partition:
+        if partition not in {"val", "test"} or verdict.get("partition") != partition:
             raise ValueError(f"partition mismatch: {source_id}")
         if not bool(verdict.get("reviewed_full_source")):
             raise ValueError(f"manual full-source review is incomplete: {source_id}")
@@ -225,6 +366,16 @@ def compile_canonical(
         previous_partition = seen_video_partition.setdefault(video_id, partition)
         if previous_partition != partition:
             raise ValueError(f"video identity crosses partitions: {video_id}")
+        if source_id in seen_source_partition:
+            raise ValueError(f"Scorer v11 source identity crosses partitions: {source_id}")
+        seen_source_partition[source_id] = partition
+        real_core_id = f"real-source-window::{source_id}"
+        previous_core_source = seen_core_source.setdefault(real_core_id, source_id)
+        if previous_core_source != source_id:
+            raise ValueError(f"Scorer v11 core identity is reused: {real_core_id}")
+        previous_core_partition = seen_core_partition.setdefault(real_core_id, partition)
+        if previous_core_partition != partition:
+            raise ValueError(f"Scorer v11 core identity crosses partitions: {real_core_id}")
         audio = _resolve(str(source.get("audio_wav") or ""))
         if not audio.exists():
             raise FileNotFoundError(audio)
@@ -250,7 +401,7 @@ def compile_canonical(
                 ),
                 "source_id": source_id,
                 "video_id": video_id,
-                "core_ids": [f"real-source-window::{source_id}"],
+                "core_ids": [real_core_id],
                 "core_identity_kind": "real_source_window_v1",
                 "partition": partition,
                 "input_distribution": "real_workflow_source_windows",
@@ -286,6 +437,8 @@ def compile_canonical(
         "canonical_label_schema": CANDIDATE_ISLAND_SCORER_V11_CANONICAL_LABEL_SCHEMA,
         "canonical_sources": _display(canonical_path),
         "canonical_sources_sha256": canonical_sha,
+        "synthetic_train_sources": _display(synthetic_train_sources),
+        "synthetic_train_sources_sha256": synthetic_train_sha,
         "source_windows": _display(source_windows),
         "source_windows_sha256": source_windows_sha,
         "partition_manifest": _display(partition_manifest),
@@ -294,7 +447,8 @@ def compile_canonical(
         "source_count": len(compiled),
         "partition_counts": dict(sorted(partition_counts.items())),
         "canonical_frame_counts": dict(sorted(label_counts.items())),
-        "all_sources_human_confirmed": True,
+        "all_heldout_sources_human_confirmed": True,
+        "synthetic_train_truth_exact_composition": True,
         "omni_preverdicts_used_as_truth": False,
         "training_manifest_allowed": True,
     }
@@ -309,6 +463,7 @@ def compile_canonical(
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--synthetic-train-sources", required=True)
     parser.add_argument("--source-windows", required=True)
     parser.add_argument("--partition-manifest", required=True)
     parser.add_argument("--manual-verdicts", action="append", required=True)
@@ -320,6 +475,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 def main(argv: list[str] | None = None) -> dict[str, Any]:
     args = parse_args(argv)
     return compile_canonical(
+        synthetic_train_sources=Path(args.synthetic_train_sources),
         source_windows=Path(args.source_windows),
         partition_manifest=Path(args.partition_manifest),
         manual_verdicts=[Path(path) for path in args.manual_verdicts],
