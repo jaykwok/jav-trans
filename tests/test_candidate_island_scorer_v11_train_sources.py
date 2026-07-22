@@ -33,12 +33,14 @@ def _write_wav(path: Path, samples: int) -> None:
 
 
 def _args(
-    *, source_manifest: Path, background_inventory: Path, partition: Path, output: Path
+    *, source_manifest: Path, background_inventory: Path, partition: Path,
+    outside_consensus: Path, output: Path
 ) -> argparse.Namespace:
     return argparse.Namespace(
         source_manifest=str(source_manifest),
         background_inventory=str(background_inventory),
         heldout_partition_manifest=str(partition),
+        outside_consensus_manifest=str(outside_consensus),
         output_dir=str(output),
         vocal_source_count=1,
         outside_control_count=1,
@@ -161,12 +163,27 @@ def test_build_v11_train_sources_preserves_candidate_and_brackets_outside(tmp_pa
             }
         ],
     )
+    outside_consensus = tmp_path / "outside-consensus.jsonl"
+    _write_jsonl(
+        outside_consensus,
+        [
+            {
+                "schema": "candidate_island_scorer_v11_outside_consensus_v1",
+                "boundary_serialization_contract_id": ACOUSTIC_BINARY_V12_CONTRACT.contract_id,
+                "source_id": "outside-1",
+                "decision": "clear_outside",
+                "training_label": 0,
+                "training_manifest_allowed": True,
+            }
+        ],
+    )
 
     summary = build(
         _args(
             source_manifest=source_manifest,
             background_inventory=background_inventory,
             partition=partition,
+            outside_consensus=outside_consensus,
             output=tmp_path / "output",
         )
     )
@@ -299,12 +316,27 @@ def test_build_v11_train_sources_replaces_heldout_background_identity(tmp_path: 
             }
         ],
     )
+    outside_consensus = tmp_path / "outside-consensus.jsonl"
+    _write_jsonl(
+        outside_consensus,
+        [
+            {
+                "schema": "candidate_island_scorer_v11_outside_consensus_v1",
+                "boundary_serialization_contract_id": ACOUSTIC_BINARY_V12_CONTRACT.contract_id,
+                "source_id": "outside",
+                "decision": "clear_outside",
+                "training_label": 0,
+                "training_manifest_allowed": True,
+            }
+        ],
+    )
 
     summary = build(
         _args(
             source_manifest=source_manifest,
             background_inventory=background_inventory,
             partition=partition,
+            outside_consensus=outside_consensus,
             output=tmp_path / "output",
         )
     )

@@ -589,6 +589,17 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     log_every = int(getattr(args, "log_every", 50))
     if log_every <= 0:
         raise ValueError("Scorer v11 log_every must be positive")
+    eval_every_epochs = int(getattr(args, "eval_every_epochs", 1))
+    early_stopping_patience = int(getattr(args, "early_stopping_patience", 3))
+    early_stopping_min_delta = float(
+        getattr(args, "early_stopping_min_delta", 1e-4)
+    )
+    if eval_every_epochs <= 0:
+        raise ValueError("Scorer v11 eval_every_epochs must be positive")
+    if early_stopping_patience < 0:
+        raise ValueError("Scorer v11 early_stopping_patience must be non-negative")
+    if early_stopping_min_delta < 0.0:
+        raise ValueError("Scorer v11 early_stopping_min_delta must be non-negative")
     capacity_profile = str(args.capacity_profile)
     if capacity_profile not in CANDIDATE_ISLAND_SCORER_V11_CAPACITY_PROFILES:
         raise ValueError(f"unknown Scorer v11 capacity profile: {capacity_profile!r}")
@@ -766,8 +777,18 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             "recent_loss_mean": None,
             "elapsed_s": 0.0,
             "eta_s": None,
+            "eval_every_epochs": eval_every_epochs,
+            "early_stopping_patience": early_stopping_patience,
         },
     )
+    best_state: dict[str, Any] | None = None
+    best_epoch = 0
+    best_val_metrics: dict[str, Any] | None = None
+    best_val_score: float | None = None
+    epochs_without_improvement = 0
+    epochs_completed = 0
+    stopped_early = False
+    stop_reason = "max_epochs"
     model.train()
     for epoch_index, epoch_batches in enumerate(planned_epochs, start=1):
         for batch_index, rows_batch in enumerate(epoch_batches, start=1):
@@ -778,9 +799,11 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 gpu_budget["physical_budget_bytes"]
             ):
                 raise MemoryError("Scorer v11 exceeded the 95% physical VRAM budget")
-            memory_snapshots.append(
-                _memory_snapshot(device, stage=f"train_step_{training_steps + 1}")
+            step_memory = _memory_snapshot(
+                device, stage=f"train_step_{training_steps + 1}"
             )
+            if training_steps == 0 or (training_steps + 1) % log_every == 0:
+                memory_snapshots.append(step_memory)
             optimizer.zero_grad(set_to_none=True)
             loss, _main, _aux, _logits, _valid = _loss(
                 model,
@@ -806,7 +829,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 rate = training_steps / max(elapsed_s, 1e-9)
                 eta_s = max(0.0, (total_training_steps - training_steps) / max(rate, 1e-9))
                 recent = training_losses[-log_every:]
-                memory = memory_snapshots[-1]
+                memory = step_memory
                 progress = {
                     "schema": "candidate_island_scorer_v11_training_progress_v1",
                     "status": "running",
@@ -842,8 +865,114 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 )
             if int(args.max_steps) > 0 and training_steps >= int(args.max_steps):
                 break
+        epochs_completed = epoch_index
+        should_evaluate = (
+            epoch_index % eval_every_epochs == 0
+            or training_steps >= total_training_steps
+        )
+        if should_evaluate:
+            val_metrics = _evaluate(
+                model,
+                by_partition["val"],
+                cache=cache,
+                max_padded_frames=int(args.max_padded_frames),
+                variant=args.variant,
+                heatmap_weight=float(args.heatmap_weight),
+                torch=torch,
+                device=device,
+            )
+            val_score = min(
+                float(val_metrics["inside_candidate_recall"]),
+                float(val_metrics["outside_candidate_recall"]),
+            )
+            improved = best_val_score is None or val_score > (
+                float(best_val_score) + early_stopping_min_delta
+            )
+            if (
+                not improved
+                and best_val_metrics is not None
+                and abs(val_score - float(best_val_score)) <= early_stopping_min_delta
+                and float(val_metrics["loss"])
+                < float(best_val_metrics["loss"]) - early_stopping_min_delta
+            ):
+                improved = True
+            if improved:
+                best_state = {
+                    key: value.detach().cpu().clone()
+                    for key, value in model.state_dict().items()
+                }
+                best_epoch = epoch_index
+                best_val_metrics = dict(val_metrics)
+                best_val_score = val_score
+                epochs_without_improvement = 0
+            else:
+                epochs_without_improvement += 1
+            memory = _memory_snapshot(device, stage=f"validation_epoch_{epoch_index}")
+            memory_snapshots.append(memory)
+            elapsed_s = time.monotonic() - training_started
+            rate = training_steps / max(elapsed_s, 1e-9)
+            eta_s = max(0.0, (total_training_steps - training_steps) / max(rate, 1e-9))
+            _write_progress(
+                progress_path,
+                {
+                    "schema": "candidate_island_scorer_v11_training_progress_v1",
+                    "status": "running",
+                    "capacity_profile": capacity_profile,
+                    "variant": args.variant,
+                    "epoch": epoch_index,
+                    "epochs": int(args.epochs),
+                    "batch": len(epoch_batches),
+                    "batches_in_epoch": len(epoch_batches),
+                    "step": training_steps,
+                    "total_steps": total_training_steps,
+                    "loss": training_losses[-1] if training_losses else None,
+                    "recent_loss_mean": float(np.mean(training_losses[-log_every:]))
+                    if training_losses
+                    else None,
+                    "elapsed_s": elapsed_s,
+                    "eta_s": eta_s,
+                    "cuda_allocated_mb": memory.get("cuda_allocated_mb"),
+                    "cuda_reserved_mb": memory.get("cuda_reserved_mb"),
+                    "shared_vram_mb": memory.get("shared_vram_mb"),
+                    "val_loss": val_metrics["loss"],
+                    "val_inside_candidate_recall": val_metrics[
+                        "inside_candidate_recall"
+                    ],
+                    "val_outside_candidate_recall": val_metrics[
+                        "outside_candidate_recall"
+                    ],
+                    "val_selection_score": val_score,
+                    "best_epoch": best_epoch,
+                    "best_val_selection_score": best_val_score,
+                    "epochs_without_improvement": epochs_without_improvement,
+                    "early_stopping_patience": early_stopping_patience,
+                },
+            )
+            print(
+                "scorer_v11_eval "
+                f"epoch={epoch_index}/{int(args.epochs)} "
+                f"step={training_steps}/{total_training_steps} "
+                f"val_loss={float(val_metrics['loss']):.6f} "
+                f"val_inside={float(val_metrics['inside_candidate_recall']):.4f} "
+                f"val_outside={float(val_metrics['outside_candidate_recall']):.4f} "
+                f"best_epoch={best_epoch} "
+                f"stale={epochs_without_improvement}/{early_stopping_patience}",
+                flush=True,
+            )
+            model.train()
+            if (
+                not bool(args.smoke)
+                and early_stopping_patience > 0
+                and epochs_without_improvement >= early_stopping_patience
+            ):
+                stopped_early = True
+                stop_reason = "heldout_no_improvement"
+                break
         if int(args.max_steps) > 0 and training_steps >= int(args.max_steps):
             break
+    if best_state is not None:
+        model.load_state_dict(best_state)
+        del best_state
     _write_progress(
         progress_path,
         {
@@ -856,6 +985,10 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             "step": training_steps,
             "total_steps": total_training_steps,
             "elapsed_s": time.monotonic() - training_started,
+            "best_epoch": best_epoch,
+            "best_val_selection_score": best_val_score,
+            "stopped_early": stopped_early,
+            "stop_reason": stop_reason,
         },
     )
     metrics = {
@@ -876,6 +1009,8 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         not bool(args.smoke)
         and metrics["val"]["inside_candidate_recall"] >= 0.95
         and metrics["test"]["inside_candidate_recall"] >= 0.95
+        and metrics["val"]["outside_candidate_recall"] >= 0.95
+        and metrics["test"]["outside_candidate_recall"] >= 0.95
     )
     checkpoint_path = output_dir / (
         f"scorer-v11-{capacity_profile}-{args.variant}.pt"
@@ -931,6 +1066,17 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "feature_cache_gate": _display(gate_path),
         "feature_cache_gate_sha256": _sha256(gate_path),
         "training_steps": training_steps,
+        "epochs_completed": epochs_completed,
+        "early_stopping": {
+            "eval_every_epochs": eval_every_epochs,
+            "patience": early_stopping_patience,
+            "min_delta": early_stopping_min_delta,
+            "best_epoch": best_epoch,
+            "best_val_selection_score": best_val_score,
+            "best_val_metrics": best_val_metrics,
+            "stopped_early": stopped_early,
+            "stop_reason": stop_reason,
+        },
         "training_loss_mean": float(np.mean(training_losses)) if training_losses else None,
         "metrics": metrics,
         "numeric_gate_maximum_requirement": 0.95,
@@ -961,6 +1107,10 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             "checkpoint": _display(checkpoint_path),
             "checkpoint_sha256": summary["checkpoint_sha256"],
             "metrics": metrics,
+            "best_epoch": best_epoch,
+            "best_val_selection_score": best_val_score,
+            "stopped_early": stopped_early,
+            "stop_reason": stop_reason,
         },
     )
     print(json.dumps(summary, ensure_ascii=False, sort_keys=True))
@@ -995,9 +1145,18 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--weight-decay", type=float, default=1e-4)
     parser.add_argument("--gradient-clip-norm", type=float, default=1.0)
     parser.add_argument("--log-every", type=int, default=50)
+    parser.add_argument("--eval-every-epochs", type=int, default=1)
+    parser.add_argument("--early-stopping-patience", type=int, default=3)
+    parser.add_argument("--early-stopping-min-delta", type=float, default=1e-4)
     args = parser.parse_args(argv)
     if args.log_every <= 0:
         parser.error("--log-every must be positive")
+    if args.eval_every_epochs <= 0:
+        parser.error("--eval-every-epochs must be positive")
+    if args.early_stopping_patience < 0:
+        parser.error("--early-stopping-patience must be non-negative")
+    if args.early_stopping_min_delta < 0.0:
+        parser.error("--early-stopping-min-delta must be non-negative")
     return args
 
 

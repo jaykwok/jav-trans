@@ -367,8 +367,10 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     }
     numeric_gate_pass = all(
         metrics["inside_candidate_recall"] >= 0.95
+        and metrics["outside_candidate_recall"] >= 0.95
         and metrics["start_coverage"] >= 0.95
         and metrics["end_coverage"] >= 0.95
+        and metrics["truth_run_continuity"] >= 0.95
         and metrics["true_inside_deletion_count"] == 0
         for metrics in partition_metrics.values()
     )

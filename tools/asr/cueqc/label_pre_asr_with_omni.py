@@ -46,6 +46,20 @@ DEFAULT_BASE_URL_ENV_CANDIDATES = (
 )
 
 
+def normalize_openai_compat_base_url(value: str) -> str:
+    """Return an OpenAI SDK base URL, accepting a pasted endpoint URL too.
+
+    OpenRouter and some provider dashboards expose the full
+    ``.../chat/completions`` endpoint.  ``openai.OpenAI(base_url=...)`` expects
+    the parent API root, otherwise it appends the endpoint a second time.
+    """
+    result = str(value or "").strip().rstrip("/")
+    for suffix in ("/chat/completions", "/responses"):
+        if result.lower().endswith(suffix):
+            return result[: -len(suffix)].rstrip("/")
+    return result
+
+
 PROMPT = """你是 pre-ASR CueQC 数据标注器。只判断这段音频 chunk 是否适合作为 ASR 训练/推理输入。
 
 标签定义：
@@ -552,8 +566,9 @@ def call_omni(
     from openai import OpenAI
 
     client_kwargs: dict[str, Any] = {"api_key": api_key, "timeout": timeout_s}
-    if base_url:
-        client_kwargs["base_url"] = base_url
+    normalized_base_url = normalize_openai_compat_base_url(base_url)
+    if normalized_base_url:
+        client_kwargs["base_url"] = normalized_base_url
     client = OpenAI(**client_kwargs)
     messages: list[dict[str, Any]] = []
     if system_prompt:

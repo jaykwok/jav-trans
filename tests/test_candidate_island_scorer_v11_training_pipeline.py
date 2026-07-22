@@ -326,6 +326,14 @@ def test_v11_feature_compile_and_random_init_cpu_smoke(tmp_path: Path) -> None:
     assert result["training_steps"] == 1
     assert result["numeric_gate_pass"] is False
     assert result["promotion_allowed"] is False
+    progress = json.loads(
+        (tmp_path / "training" / "progress.json").read_text(encoding="utf-8")
+    )
+    assert progress["schema"] == "candidate_island_scorer_v11_training_progress_v1"
+    assert progress["status"] == "completed"
+    assert progress["step"] == progress["total_steps"] == 1
+    assert progress["checkpoint_sha256"] == result["checkpoint_sha256"]
+    assert progress["metrics"] == result["metrics"]
     checkpoint = Path(result["checkpoint"])
     if not checkpoint.is_absolute():
         checkpoint = Path.cwd() / checkpoint

@@ -42,6 +42,7 @@ SUMMARY_SCHEMA = "candidate_island_scorer_v11_train_source_build_summary_v1"
 COMPOSITE_SCHEMA = "cueqc_v13_unique_core_composite_v1"
 V10_CANONICAL_SCHEMA = "speech_scorer_v10_canonical_source_v1"
 PARTITION_SCHEMA = "candidate_island_scorer_v11_partition_manifest_v1"
+OUTSIDE_CONSENSUS_SCHEMA = "candidate_island_scorer_v11_outside_consensus_v1"
 SAMPLE_RATE = 16000
 FRAME_SAMPLES = 320
 FRAME_HOP_S = 0.02
@@ -184,8 +185,41 @@ def _heldout_video_ids(partition_rows: Sequence[dict[str, Any]]) -> set[str]:
     return result
 
 
+def _outside_consensus_ids(rows: Sequence[dict[str, Any]]) -> tuple[set[str], Counter[str]]:
+    clear: set[str] = set()
+    decisions: Counter[str] = Counter()
+    seen: set[str] = set()
+    for row in rows:
+        if row.get("schema") != OUTSIDE_CONSENSUS_SCHEMA:
+            raise ValueError("wrong Scorer v11 outside consensus schema")
+        if row.get("boundary_serialization_contract_id") != (
+            ACOUSTIC_BINARY_V12_CONTRACT.contract_id
+        ):
+            raise ValueError("outside consensus uses another Boundary contract")
+        source_id = str(row.get("source_id") or "")
+        if not source_id or source_id in seen:
+            raise ValueError("outside consensus source identity is missing or duplicated")
+        seen.add(source_id)
+        decision = str(row.get("decision") or "")
+        if decision not in {"clear_outside", "unsure"}:
+            raise ValueError(f"invalid Scorer v11 outside consensus decision: {decision}")
+        decisions[decision] += 1
+        allowed = bool(row.get("training_manifest_allowed"))
+        training_label = int(row.get("training_label"))
+        if decision == "clear_outside":
+            if not allowed or training_label != 0:
+                raise ValueError("clear outside consensus must explicitly allow label 0")
+            clear.add(source_id)
+        elif allowed or training_label != -100:
+            raise ValueError("unsure outside consensus must be ignore=-100")
+    if not clear:
+        raise ValueError("Scorer v11 outside consensus has no clear outside sources")
+    return clear, decisions
+
+
 def _background_pools(
-    rows: Sequence[dict[str, Any]], *, heldout_video_ids: set[str], seed: int
+    rows: Sequence[dict[str, Any]], *, heldout_video_ids: set[str], seed: int,
+    clear_outside_source_ids: set[str]
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
     eligible: list[dict[str, Any]] = []
     outside: list[dict[str, Any]] = []
@@ -215,13 +249,16 @@ def _background_pools(
         )
         if has_vocal_flag:
             vocal.append(row)
-        elif background_type in OUTSIDE_BACKGROUND_TYPES:
+        elif (
+            str(row["source_id"]) in clear_outside_source_ids
+            and background_type in OUTSIDE_BACKGROUND_TYPES
+        ):
             outside.append(row)
     outside.sort(key=lambda row: _stable_key(seed, str(row["source_id"])))
     vocal.sort(key=lambda row: _stable_key(seed + 1, str(row["source_id"])))
     eligible.sort(key=lambda row: _stable_key(seed + 2, str(row["source_id"])))
     if not outside:
-        raise ValueError("no held-out-disjoint clear non-vocal background sources")
+        raise ValueError("no held-out-disjoint three-way-confirmed non-vocal outside sources")
     if not vocal:
         raise ValueError("no held-out-disjoint isolated vocal candidate sources")
     return outside, vocal, eligible
@@ -649,12 +686,19 @@ def build(args: argparse.Namespace) -> dict[str, Any]:
     source_manifest = Path(args.source_manifest).resolve()
     background_inventory = Path(args.background_inventory).resolve()
     partition_manifest = Path(args.heldout_partition_manifest).resolve()
-    for path in (source_manifest, background_inventory, partition_manifest):
+    outside_consensus_manifest = Path(args.outside_consensus_manifest).resolve()
+    for path in (
+        source_manifest,
+        background_inventory,
+        partition_manifest,
+        outside_consensus_manifest,
+    ):
         if not path.exists():
             raise FileNotFoundError(path)
     source_manifest_sha = _sha256(source_manifest)
     background_inventory_sha = _sha256(background_inventory)
     partition_manifest_sha = _sha256(partition_manifest)
+    outside_consensus_manifest_sha = _sha256(outside_consensus_manifest)
     composites = _read_jsonl(source_manifest)
     train_composites = [row for row in composites if row.get("source_partition") == "train"]
     if not train_composites:
@@ -675,10 +719,14 @@ def build(args: argparse.Namespace) -> dict[str, Any]:
     if not core_ids or any(not value for value in core_ids) or len(set(core_ids)) != len(core_ids):
         raise ValueError("Scorer v11 semantic train cores must be non-empty and unique")
     heldout_ids = _heldout_video_ids(_read_jsonl(partition_manifest))
+    clear_outside_source_ids, outside_consensus_decisions = _outside_consensus_ids(
+        _read_jsonl(outside_consensus_manifest)
+    )
     outside_pool, vocal_pool, eligible_pool = _background_pools(
         _read_jsonl(background_inventory),
         heldout_video_ids=heldout_ids,
         seed=int(args.seed),
+        clear_outside_source_ids=clear_outside_source_ids,
     )
     vocal_source_count = int(args.vocal_source_count)
     outside_control_count = int(args.outside_control_count)
@@ -794,6 +842,10 @@ def build(args: argparse.Namespace) -> dict[str, Any]:
         "background_inventory_sha256": background_inventory_sha,
         "heldout_partition_manifest": _display(partition_manifest),
         "heldout_partition_manifest_sha256": partition_manifest_sha,
+        "outside_consensus_manifest": _display(outside_consensus_manifest),
+        "outside_consensus_manifest_sha256": outside_consensus_manifest_sha,
+        "outside_consensus_decision_counts": dict(sorted(outside_consensus_decisions.items())),
+        "outside_omni_only_truth_allowed": False,
         "heldout_video_ids": sorted(heldout_ids),
         "source_count": len(rows),
         "source_kind_counts": dict(sorted(source_kind_counts.items())),
@@ -833,6 +885,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--source-manifest", required=True)
     parser.add_argument("--background-inventory", required=True)
     parser.add_argument("--heldout-partition-manifest", required=True)
+    parser.add_argument("--outside-consensus-manifest", required=True)
     parser.add_argument("--output-dir", required=True)
     parser.add_argument("--vocal-source-count", type=int, default=256)
     parser.add_argument(
