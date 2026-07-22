@@ -4,11 +4,11 @@
 
 ## 最终结论
 
-当前不能直接开始完整训练。问题不只是 loss：Scorer v11、Proposal v1、Outer v3 尚无可复现的当前职责数据闭环；Split v4、CueQC v13、Inner v2 的现役权重来自旧 provenance，不能用修改 metadata 或重新绑定 SHA 冒充新合同。源码入口现已改为 fail-fast，只有固定 source/core identity、显式 train/val/test、当前工作流分布、精确上游 checkpoint SHA 和中央合同同时满足时，数据才允许进入训练。
+当前仍不能直接开始完整训练，但 Scorer v11 的源码缺口已经闭合：strict canonical compiler、raw-feature/window compiler和 random-init trainer均已实现并通过 smoke。用户完成了 24 条 held-out 全源人工真值；实际149-source compile被剩余125条train source缺current-duty v11真值正确阻止，现有真实source逐帧特征又只有旧PTM128而非raw PTM2048，因此没有启动GPU训练。Proposal v1、Outer v3尚无可复现的当前职责数据闭环；Split v4、CueQC v13、Inner v2的现役权重来自旧provenance，不能用修改metadata或重新绑定SHA冒充新合同。只有固定source/core identity、显式train/val/test、当前工作流分布、精确上游checkpoint SHA和中央合同同时满足时，数据才允许进入训练。
 
 | 模型 | 当前职责 | 合法训练样本 | 审计结论 |
 | --- | --- | --- | --- |
-| Scorer v11 | 高召回连续 candidate-island membership | 完整 source window；同一 ASR 单元内停顿、尾音、短背景和含混人声保留为 `inside_candidate`；仅清晰可安全提前删的非人声背景为 `outside_candidate` | 模型/schema/window runtime 已有，但无 current canonical compiler、feature compiler 或 trainer；旧 v10 数据不可改名复用，训练 blocker |
+| Scorer v11 | 高召回连续 candidate-island membership | 完整 source window；同一 ASR 单元内停顿、尾音、短背景和含混人声保留为 `inside_candidate`；仅清晰可安全提前删的非人声背景为 `outside_candidate` | canonical/feature/trainer已实现；held-out 24/24完成。125条train source仍缺current-duty v11真值，真实source raw PTM2048尚未提取，故正式训练仍blocked；旧v10数据不可改名复用 |
 | Proposal v1 | 为 Split 枚举高召回非绑定候选 | 当前 Scorer v11/Outer v3 输出中的真实可查询候选；监督目标是候选覆盖，不是最终 cut | 现役 checkpoint 的 labels/feature manifest 已丢失，且 metadata 无 source/core/partition provenance；只能保留为历史候选源，不能复现训练 |
 | Outer v3 | 将完整 candidate island 收成供 Split 查询的 acoustic outer core | 实际 `post_candidate_island_scorer_v11_islands`，真实边缘分布，随机初始化二分类 | trainer 合同已严格，但仓库没有生成这种 row 的 current compiler；registry 仍为空 `pending_outer_v3_audit` |
 | Split v4 | 对 Proposal candidate 做 `cut/continue` 二分类 | 当前 Scorer v11→Proposal→Outer v3 的 candidate query、局部 bins/scalar 和完整 island context；source/core 固定且同 core 最多一次 | 旧 dataset 缺失；现役 checkpoint含临时 forced-train/repeat/Focal/aux 配置。新入口已禁止临时分区、重复 core 和旧 runtime 数据伪装，默认回到 neutral CE baseline |
@@ -31,6 +31,14 @@
 - Inner manifest `agents/temp/20260718_095500_inner-v2-exact-frame-dataset-full1024-bg/manifest.jsonl`：3593 rows、1022 unique sample IDs、train/val/test=`3070/354/169`；`source_id/core_id/input_distribution/cueqc_label=keep/cueqc_checkpoint_sha256` 全部缺失。
 
 ## 已修复的数据生成入口
+
+### Scorer v11
+
+- canonical compiler只接受中央合同、frozen source/video/partition和全源人工最终verdict；区间必须从frame 0连续无重叠覆盖至source尾，标签限定`outside_candidate/inside_candidate/unsure`，Omni-only/未完整确认输入拒绝。当前24条held-out final verdict结构有效，但149-source strict compile明确报告train真值缺125条。
+- feature compiler定义独立raw cache、extractor、signed manifest和gate schema；只接受当前1.7B PTM的raw PTM2048+MFCC40，旧PTM128/PCA/前128截断直接拒绝。训练row引用完整source cache而不复制重叠特征，记录1000-frame context、200-frame nominal overlap和midpoint unique owner；loss/metrics只计算owner。
+- `unsure`保留在source labels，训练映射`-100`；MFCC normalization、CE、metrics、numeric gate和heatmap auxiliary均排除unsure。heatmap target先从完整source definite run生成再切window，touching unsure不生成伪边界。
+- trainer只允许random init、two-logit CE和argmax；baseline固定class weights=`1/1`且auxiliary=`0`，heatmap只能通过显式`heatmap_aux` A/B启用。CPU仅允许plumbing smoke；正式CUDA执行物理RAM/VRAM×0.95、Windows shared-VRAM spill soft-OOM、frame-budget batch及阶段结束显式释放。smoke checkpoint固定`promotion_allowed=false`。
+- 新增聚焦测试=`26 passed`；使用项目内`agents/temp`作为pytest basetemp的全量结果=`917 passed / 6 skipped`。默认系统tmp位于C:时，一个既有job-temp测试会对D:项目根调用`Path.relative_to`并跨卷失败；这不是Scorer改动，按项目临时产物约束使用工作区内basetemp后全量通过。
 
 ### Split v4
 
