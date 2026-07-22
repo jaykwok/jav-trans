@@ -10,6 +10,7 @@ from pathlib import Path
 import re
 import shutil
 import sys
+import wave
 from typing import Any
 
 
@@ -43,6 +44,17 @@ def _rows(path: Path) -> list[dict[str, Any]]:
 
 def _sha256(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def _wav_duration(path: Path) -> tuple[float, int]:
+    with wave.open(str(path), "rb") as handle:
+        sample_rate = int(handle.getframerate())
+        channels = int(handle.getnchannels())
+        samples = int(handle.getnframes())
+    if sample_rate != 16000 or channels != 1 or samples <= 0:
+        raise ValueError(f"held-out audit audio must be non-empty 16k mono WAV: {path}")
+    duration_s = samples / sample_rate
+    return duration_s, frame_count(duration_s, FRAME_HOP_S)
 
 
 def _candidate_page(rows: list[dict[str, Any]]) -> str:
@@ -185,8 +197,7 @@ def build_audit(
             raise ValueError(f"held-out source audio is missing: {source}")
         destination = audio_dir / f"source-{index:03d}.wav"
         shutil.copy2(source, destination)
-        duration_s = float(row.get("duration_s") or 0.0)
-        total_frames = frame_count(duration_s, FRAME_HOP_S)
+        duration_s, total_frames = _wav_duration(source)
         payload.append(
             {
                 "schema": ITEM_SCHEMA,

@@ -199,6 +199,49 @@ def test_v11_canonical_requires_train_only_unique_synthetic_cores(tmp_path: Path
         )
 
 
+def test_v11_canonical_clips_unavailable_review_grid_tail_to_wav(tmp_path: Path) -> None:
+    synthetic_path, source_path, partition_path, verdict_path = _canonical_fixture(
+        tmp_path
+    )
+    source_rows = [
+        json.loads(line)
+        for line in source_path.read_text(encoding="utf-8").splitlines()
+    ]
+    val_source = next(row for row in source_rows if "-val-" in row["window_id"])
+    val_audio = Path(val_source["audio_wav"])
+    _write_wav(val_audio, 7)
+    val_source["audio_wav_sha256"] = _sha256(val_audio)
+    _write_jsonl(source_path, source_rows)
+
+    summary = compile_canonical(
+        synthetic_train_sources=synthetic_path,
+        source_windows=source_path,
+        partition_manifest=partition_path,
+        manual_verdicts=[verdict_path],
+        output_dir=tmp_path / "clipped-canonical",
+    )
+    canonical_path = Path(summary["canonical_sources"])
+    if not canonical_path.is_absolute():
+        canonical_path = Path.cwd() / canonical_path
+    rows = [
+        json.loads(line)
+        for line in canonical_path.read_text(encoding="utf-8").splitlines()
+    ]
+    clipped = next(row for row in rows if row["source_id"] == val_source["window_id"])
+    assert clipped["reviewed_nominal_frame_count"] == 8
+    assert clipped["audio_sample_count"] == 7 * 320
+    assert clipped["frame_count"] == 7
+    assert clipped["canonical_spans"][-1] == {
+        "label": "outside_candidate",
+        "start_frame": 6,
+        "end_frame": 7,
+        "start_s": 0.12,
+        "end_s": 0.14,
+    }
+    assert clipped["audio_geometry_policy"] == (
+        "trim_unavailable_review_grid_tail_to_decoded_audio_v1"
+    )
+
 def test_v11_feature_compile_and_random_init_cpu_smoke(tmp_path: Path) -> None:
     pytest.importorskip("torch")
     synthetic_path, source_path, partition_path, verdict_path = _canonical_fixture(tmp_path)

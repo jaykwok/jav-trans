@@ -131,6 +131,24 @@ def align_raw_features(
     )
 
 
+def align_audio_to_canonical_frames(
+    audio: np.ndarray,
+    *,
+    expected_frames: int,
+    declared_sample_count: int | None = None,
+) -> np.ndarray:
+    samples = np.asarray(audio, dtype=np.float32)
+    if samples.ndim != 1 or expected_frames <= 0:
+        raise ValueError("Scorer v11 audio/frame geometry mismatch")
+    if declared_sample_count is not None and declared_sample_count != len(samples):
+        raise ValueError("Scorer v11 canonical sample count mismatch")
+    minimum_samples = (expected_frames - 1) * FRAME_SAMPLES + 1
+    maximum_samples = expected_frames * FRAME_SAMPLES
+    if len(samples) < minimum_samples or len(samples) >= maximum_samples + FRAME_SAMPLES:
+        raise ValueError("Scorer v11 audio/frame geometry mismatch")
+    return np.ascontiguousarray(samples[:maximum_samples], dtype=np.float32)
+
+
 def _memory_snapshot(torch, *, stage: str) -> dict[str, Any]:
     snapshot = runtime_memory_snapshot(require_shared_vram=True)
     snapshot.update(
@@ -323,8 +341,20 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 raise ValueError(f"Scorer v11 canonical audio changed: {source_id}")
             audio, sample_rate = load_audio_16k_mono(str(audio_path))
             expected_frames = int(canonical["frame_count"])
-            if sample_rate != 16000 or len(audio) != expected_frames * FRAME_SAMPLES:
+            if sample_rate != 16000:
                 raise ValueError(f"Scorer v11 audio/frame geometry mismatch: {source_id}")
+            try:
+                audio = align_audio_to_canonical_frames(
+                    audio,
+                    expected_frames=expected_frames,
+                    declared_sample_count=(
+                        None
+                        if canonical.get("audio_sample_count") is None
+                        else int(canonical["audio_sample_count"])
+                    ),
+                )
+            except ValueError as exc:
+                raise ValueError(f"{exc}: {source_id}") from exc
             mfcc = extract_mfcc(audio, sample_rate=sample_rate, config=config)
             ptm = extractor.extract(audio, sample_rate=sample_rate)
             aligned_ptm, aligned_mfcc = align_raw_features(

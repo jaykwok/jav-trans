@@ -5,6 +5,7 @@ import pytest
 
 from tools.boundary.ja.extract_candidate_island_scorer_v11_raw_features import (
     _safe_id,
+    align_audio_to_canonical_frames,
     align_raw_features,
     parse_args,
 )
@@ -66,3 +67,20 @@ def test_v11_raw_feature_filename_cannot_collide_after_prefix_truncation() -> No
     assert first != second
     assert len(first) <= 172
     assert len(second) <= 172
+
+
+def test_v11_audio_geometry_keeps_partial_tail_and_trims_subframe_overrun() -> None:
+    partial = np.arange(641, dtype=np.float32)
+    np.testing.assert_array_equal(
+        align_audio_to_canonical_frames(
+            partial, expected_frames=3, declared_sample_count=641
+        ),
+        partial,
+    )
+    overrun = np.arange(965, dtype=np.float32)
+    aligned = align_audio_to_canonical_frames(
+        overrun, expected_frames=3, declared_sample_count=965
+    )
+    assert aligned.shape == (960,)
+    with pytest.raises(ValueError, match="geometry mismatch"):
+        align_audio_to_canonical_frames(np.zeros(640), expected_frames=3)

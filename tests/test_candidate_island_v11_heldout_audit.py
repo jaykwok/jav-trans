@@ -13,12 +13,13 @@ from tools.audits.generate_candidate_island_v11_heldout_audit_html import (
 )
 
 
-def _write_wav(path: Path, *, seconds: int = 1) -> None:
+def _write_wav(path: Path, *, seconds: float = 1) -> None:
+    samples = int(round(16000 * seconds))
     with wave.open(str(path), "wb") as handle:
         handle.setnchannels(1)
         handle.setsampwidth(2)
         handle.setframerate(16000)
-        handle.writeframes(b"\0\0" * 16000 * seconds)
+        handle.writeframes(b"\0\0" * samples)
 
 
 def test_candidate_heldout_audit_freezes_partitions_and_uses_candidate_labels(
@@ -100,3 +101,62 @@ def test_candidate_heldout_audit_freezes_partitions_and_uses_candidate_labels(
     assert summary["source_count"] == 2
     assert summary["training_manifest_allowed"] is False
     assert summary["model_output_used_as_annotation_seed"] is False
+
+
+def test_candidate_heldout_audit_uses_decoded_wav_duration(tmp_path: Path, monkeypatch) -> None:
+    torch = pytest.importorskip("torch")
+    monkeypatch.setattr(audit_tool, "update_audit_entrypoints", lambda **_kwargs: None)
+    audio = tmp_path / "heldout.wav"
+    test_audio = tmp_path / "other-test.wav"
+    _write_wav(audio, seconds=0.9)
+    _write_wav(test_audio, seconds=1.0)
+    source_windows = tmp_path / "source_windows.jsonl"
+    source_windows.write_text(
+        "".join(
+            json.dumps(row) + "\n"
+            for row in (
+                {
+                    "window_id": "heldout-w00",
+                    "video_id": "heldout",
+                    "audio_wav": str(audio),
+                    "duration_s": 1.0,
+                },
+                {
+                    "window_id": "other-test-w00",
+                    "video_id": "other-test",
+                    "audio_wav": str(test_audio),
+                    "duration_s": 1.0,
+                },
+            )
+        )
+        ,
+        encoding="utf-8",
+    )
+    feature_bundle = tmp_path / "features.pt"
+    torch.save(
+        {
+            "groups": [
+                {"audio_id": "heldout-w00", "dataset_role": "val"},
+                {"audio_id": "other-test-w00", "dataset_role": "val"},
+            ]
+        },
+        feature_bundle,
+    )
+    build_audit(
+        source_windows=source_windows,
+        feature_bundle=feature_bundle,
+        val_video_ids=["heldout"],
+        test_video_ids=["other-test"],
+        output_dir=tmp_path / "audit",
+    )
+    rows = [
+        json.loads(line)
+        for line in (tmp_path / "audit" / "audit_manifest.jsonl")
+        .read_text(encoding="utf-8")
+        .splitlines()
+    ]
+    row = next(
+        item for item in rows if item["source_id"] == "heldout-w00"
+    )
+    assert row["duration_s"] == pytest.approx(0.9)
+    assert row["frame_count"] == 45

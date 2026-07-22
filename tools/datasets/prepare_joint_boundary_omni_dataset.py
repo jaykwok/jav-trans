@@ -10,6 +10,7 @@ import random
 import re
 import subprocess
 import sys
+import wave
 from pathlib import Path
 from typing import Any
 
@@ -144,6 +145,21 @@ def _sha256(path: Path) -> str:
         for block in iter(lambda: handle.read(1024 * 1024), b""):
             digest.update(block)
     return digest.hexdigest()
+
+
+def _wav_geometry(path: Path) -> dict[str, Any]:
+    with wave.open(str(path), "rb") as handle:
+        sample_rate = int(handle.getframerate())
+        channels = int(handle.getnchannels())
+        sample_count = int(handle.getnframes())
+    if sample_rate != 16000 or channels != 1 or sample_count <= 0:
+        raise ValueError(f"prepared audio must be non-empty 16k mono WAV: {path}")
+    return {
+        "sample_rate": sample_rate,
+        "channels": channels,
+        "sample_count": sample_count,
+        "duration_s": round(sample_count / sample_rate, 9),
+    }
 
 
 def _probe_duration(path: Path) -> float | None:
@@ -424,8 +440,7 @@ def run(args: argparse.Namespace) -> None:
                     "pre_asr_candidates",
                 )
             ):
-                rows.append(
-                    _resume_row_with_frozen_identity(
+                resumed = _resume_row_with_frozen_identity(
                         previous,
                         window_id=window_id,
                         video_id=video_id,
@@ -434,7 +449,9 @@ def run(args: argparse.Namespace) -> None:
                         source_start_s=start_s,
                         source_end_s=start_s + duration_s,
                     )
-                )
+                resumed.update(_wav_geometry(Path(str(previous["audio_wav"]))))
+                resumed["requested_window_duration_s"] = round(duration_s, 6)
+                rows.append(resumed)
                 print(
                     f"resumed video={video_position}/{len(selected)} window={window_id}",
                     flush=True,
@@ -463,14 +480,13 @@ def run(args: argparse.Namespace) -> None:
                 "source_duration_s": source_duration,
                 "source_start_s": start_s,
                 "source_end_s": round(start_s + duration_s, 6),
-                "duration_s": round(duration_s, 6),
+                "requested_window_duration_s": round(duration_s, 6),
                 "audio_wav": str(wav_path.resolve()),
                 "audio_wav_sha256": _sha256(wav_path),
                 "omni_mp3_32k": str(mp3_path.resolve()),
                 "omni_mp3_32k_sha256": _sha256(mp3_path),
                 "omni_audio_bitrate": "32k",
-                "sample_rate": 16000,
-                "channels": 1,
+                **_wav_geometry(wav_path),
                 "audio_filter": build_audio_filter_chain(),
                 "semantic_split_training_manifest_allowed": False,
                 "semantic_split_input_distribution": (

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+import wave
 
 from tools.datasets import label_joint_boundary_preasr_with_omni as joint_omni
 from tools.datasets.label_joint_boundary_preasr_with_omni import (
@@ -16,6 +17,7 @@ from tools.datasets.label_joint_boundary_preasr_with_omni import (
 )
 from tools.datasets.prepare_joint_boundary_omni_dataset import (
     _resume_row_with_frozen_identity,
+    _wav_geometry,
     _window_starts,
 )
 
@@ -59,6 +61,22 @@ def test_resume_row_rejects_partition_reassignment() -> None:
             source_start_s=1.0,
             source_end_s=5.0,
         )
+
+
+def test_prepared_window_geometry_comes_from_wav_samples(tmp_path: Path) -> None:
+    audio = tmp_path / "window.wav"
+    with wave.open(str(audio), "wb") as handle:
+        handle.setnchannels(1)
+        handle.setsampwidth(2)
+        handle.setframerate(16000)
+        handle.writeframes(b"\0\0" * 15999)
+    geometry = _wav_geometry(audio)
+    assert geometry == {
+        "sample_rate": 16000,
+        "channels": 1,
+        "sample_count": 15999,
+        "duration_s": 0.9999375,
+    }
 
 
 def test_v3_prompts_keep_omni_requests_single_task() -> None:

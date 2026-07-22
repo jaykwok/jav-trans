@@ -6,6 +6,7 @@ import argparse
 import hashlib
 import json
 import sys
+import wave
 from collections import Counter
 from pathlib import Path
 from typing import Any, Iterable, Sequence
@@ -113,6 +114,65 @@ def _validate_spans(
     if cursor != frame_count:
         raise ValueError(f"v11 canonical spans do not cover the source tail: {source_id}")
     return normalized
+
+
+def _wav_geometry(path: Path) -> tuple[int, float, int]:
+    with wave.open(str(path), "rb") as handle:
+        sample_rate = int(handle.getframerate())
+        channels = int(handle.getnchannels())
+        sample_count = int(handle.getnframes())
+    if sample_rate != 16000 or channels != 1 or sample_count <= 0:
+        raise ValueError(
+            "Scorer v11 held-out audio must be non-empty 16k mono PCM WAV: "
+            f"{path} rate={sample_rate} channels={channels} samples={sample_count}"
+        )
+    return sample_count, sample_count / sample_rate, (sample_count + 319) // 320
+
+
+def _clip_reviewed_spans_to_audio(
+    spans: Sequence[dict[str, Any]],
+    *,
+    source_id: str,
+    reviewed_frame_count: int,
+    audio_frame_count: int,
+) -> tuple[list[dict[str, Any]], int, str]:
+    if audio_frame_count <= 0:
+        raise ValueError(f"Scorer v11 held-out audio has no frames: {source_id}")
+    if audio_frame_count > reviewed_frame_count + 1:
+        raise ValueError(
+            "Scorer v11 held-out audio extends beyond the reviewed frame grid: "
+            f"{source_id} reviewed={reviewed_frame_count} audio={audio_frame_count}"
+        )
+    effective_frames = min(reviewed_frame_count, audio_frame_count)
+    if effective_frames == reviewed_frame_count:
+        return (
+            _validate_spans(
+                spans, source_id=source_id, frame_count=reviewed_frame_count
+            ),
+            effective_frames,
+            "exact_or_subframe_audio_tail_ignored_v1",
+        )
+    clipped: list[dict[str, Any]] = []
+    for span in spans:
+        start = int(span.get("start_frame", -1))
+        end = min(int(span.get("end_frame", -1)), effective_frames)
+        if start >= effective_frames:
+            break
+        if end > start:
+            clipped.append(
+                {
+                    "label": str(span.get("label") or ""),
+                    "start_frame": start,
+                    "end_frame": end,
+                }
+            )
+    return (
+        _validate_spans(
+            clipped, source_id=source_id, frame_count=effective_frames
+        ),
+        effective_frames,
+        "trim_unavailable_review_grid_tail_to_decoded_audio_v1",
+    )
 
 
 def canonical_frame_labels(source: dict[str, Any]) -> np.ndarray:
@@ -355,7 +415,7 @@ def compile_canonical(
         expected_frames = int(round(float(source.get("duration_s") or 0.0) / FRAME_HOP_S))
         if frame_count <= 0 or frame_count != expected_frames:
             raise ValueError(f"frame count mismatch: {source_id}")
-        spans = _validate_spans(
+        reviewed_spans = _validate_spans(
             list(verdict.get("spans") or ()),
             source_id=source_id,
             frame_count=frame_count,
@@ -384,6 +444,13 @@ def compile_canonical(
             raise ValueError(f"source audio SHA256 is missing: {source_id}")
         if verify_audio and _sha256(audio) != audio_sha:
             raise ValueError(f"source audio SHA256 mismatch: {source_id}")
+        audio_sample_count, audio_duration_s, audio_frame_count = _wav_geometry(audio)
+        spans, effective_frame_count, geometry_policy = _clip_reviewed_spans_to_audio(
+            reviewed_spans,
+            source_id=source_id,
+            reviewed_frame_count=frame_count,
+            audio_frame_count=audio_frame_count,
+        )
 
         for span in spans:
             label_counts[str(span["label"])] += int(span["end_frame"]) - int(
@@ -408,9 +475,12 @@ def compile_canonical(
                 "synthetic_composite": False,
                 "audio": _display(audio),
                 "audio_sha256": audio_sha,
-                "duration_s": float(source["duration_s"]),
-                "frame_count": frame_count,
+                "duration_s": audio_duration_s,
+                "frame_count": effective_frame_count,
                 "frame_hop_s": FRAME_HOP_S,
+                "audio_sample_count": audio_sample_count,
+                "reviewed_nominal_frame_count": frame_count,
+                "audio_geometry_policy": geometry_policy,
                 "canonical_spans": spans,
                 "annotation_provenance": "human_full_source_review",
                 "manual_verdict_file": _display(verdict_file_by_source[source_id]),
