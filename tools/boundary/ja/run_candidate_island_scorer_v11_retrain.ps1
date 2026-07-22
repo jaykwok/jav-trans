@@ -2,7 +2,7 @@ param(
     [ValidateSet('prepare', 'extract', 'features', 'smoke', 'full', 'gate', 'all')]
     [string]$Stage = 'prepare',
     [string]$RunRoot = '',
-    [string]$AuditDir = 'agents/audits/20260722_194638_scorer-v11-train-real-source-gemini-editable25',
+    [string]$AuditDir = 'agents/audits/20260722_213831_scorer-v11-train-real-source-gemini-v5-editable25',
     [string]$HeldoutManualVerdicts = 'agents/audits/20260722_095311_scorer-v11-heldout-human-omni-semantic-units-editable24/manual_verdicts.jsonl',
     [string]$BaseCanonicalSummary = 'agents/temp/20260722_183600_scorer-v11-no-tile-real-outside-canonical-final/summary.json',
     [string]$PriorRawFeatureManifest = 'agents/temp/20260722_184400_scorer-v11-no-tile-raw-features-full/raw_feature_manifest.jsonl',

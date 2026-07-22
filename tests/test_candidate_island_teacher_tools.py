@@ -7,7 +7,13 @@ from pathlib import Path
 from tools.audits.compare_candidate_island_teacher_to_human import compare
 from tools.audits.generate_candidate_island_teacher_comparison_html import _audio_path
 from tools.asr.cueqc.label_pre_asr_with_omni import normalize_openai_compat_base_url
-from tools.boundary.ja.label_candidate_island_scorer_v11_with_omni import _spans, parse_args
+from tools.boundary.ja.label_candidate_island_scorer_v11_with_omni import (
+    PROMPT_VERSION,
+    SYSTEM_PROMPT,
+    _prompt,
+    _spans,
+    parse_args,
+)
 from tools.boundary.ja.build_candidate_island_scorer_v11_outside_consensus import (
     build as build_outside_consensus,
 )
@@ -32,6 +38,20 @@ def test_provider_base_url_normalization_and_known_profiles() -> None:
     assert parse_generic_args(["--output-dir", "y", "--env-file", "qwen", "--prompt", "x"]).env_file == "qwen"
 
 
+def test_candidate_island_teacher_prompt_matches_scorer_responsibility() -> None:
+    assert PROMPT_VERSION.endswith("dialogue_islands_v5")
+    assert "不是 Split" in SYSTEM_PROMPT
+    assert "不是 CueQC" in SYSTEM_PROMPT
+    assert "若整条 source 都是明确的纯非语义声音，必须允许 islands=[]" in SYSTEM_PROMPT
+    assert "优先标为 unsure" in SYSTEM_PROMPT
+    assert "同一场景、同一说话人、持续互动或声音连续，本身都不是合并理由" in SYSTEM_PROMPT
+    assert "ASR 能否转录" in SYSTEM_PROMPT
+    assert "固定时长" in SYSTEM_PROMPT
+    payload = json.loads(_prompt({"source_id": "s", "duration_s": 75.0}))
+    assert payload["anti_overmerge"].endswith("return islands=[]")
+    assert "unsure" in payload["decision_order"][-1]
+
+
 def test_teacher_span_error_names_local_clip_range() -> None:
     try:
         _spans(
@@ -48,6 +68,24 @@ def test_teacher_span_error_names_local_clip_range() -> None:
         raise AssertionError("out-of-range teacher coordinates must be rejected")
     assert "required_range=0..75.0" in message
     assert "0-based audio clip timeline" in message
+
+
+def test_teacher_rejects_overlap_between_inside_and_unsure() -> None:
+    try:
+        _spans(
+            {
+                "islands": [
+                    {"start_s": 1.0, "end_s": 4.0, "confidence": 0.9}
+                ],
+                "unsure_spans": [{"start_s": 3.5, "end_s": 5.0}],
+            },
+            duration_s=10.0,
+        )
+    except ValueError as error:
+        message = str(error)
+    else:
+        raise AssertionError("inside/unsure overlap must be rejected")
+    assert "mutually exclusive" in message
 
 
 def test_teacher_comparison_uses_continuous_frame_membership(tmp_path: Path) -> None:

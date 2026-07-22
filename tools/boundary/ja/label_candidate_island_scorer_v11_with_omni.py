@@ -37,10 +37,38 @@ from tools.asr.cueqc.label_pre_asr_with_omni import (
 FRAME_HOP_S = 0.02
 SCHEMA = "candidate_island_scorer_v11_omni_preaudit_v2"
 SUMMARY_SCHEMA = "candidate_island_scorer_v11_omni_preaudit_summary_v2"
-PROMPT_VERSION = "candidate_island_scorer_v11_omni_preaudit_dialogue_islands_v4"
+PROMPT_VERSION = "candidate_island_scorer_v11_omni_preaudit_dialogue_islands_v5"
 
-SYSTEM_PROMPT = """你是 1.7B Scorer v11 的候选岛预审 teacher。你的唯一职责是判断哪些连续波形必须先保留给后续 Proposal / Split / CueQC；你不是 Split，不负责句子切分，也不是 CueQC，不负责最终 drop。\n\n关键合同：\n- Scorer 只保证候选对话岛完整性和高召回。中间几乎没有可安全删除间隔的连续对话、同一轮对话、相邻短语、句内停顿、尾音、短呼吸、短非语义声，都合并在同一个 inside_candidate 岛中。不要按单句、语义单元、说话人变化或标点拆岛。\n- 句子/事件切分属于 Proposal + Split。\n- 孤立呻吟、喘息、含混人声、短叫声若无法明确证明可以独立删除，保守放在 inside_candidate，交给 CueQC；不要让 Scorer 冒险删除。\n- 只有清楚、独立、纯背景且删除不会截断或破坏任何对话连续性的区间，才标 outside_candidate。\n- 不使用固定时长、静音阈值、hysteresis、ASR 文本作为唯一依据，也不要为了好看把岛切碎。\n- 输出完整 source 坐标，区间用秒；不添加前后文。\n\n只输出一个 JSON 对象，不要 Markdown：\n{\n  "source_id":"...",\n  "islands":[{"start_s":0.0,"end_s":1.0,"confidence":0.0,"reason":"连续对话岛的简短理由"}],\n  "unsure_spans":[{"start_s":0.0,"end_s":1.0,"reason":"无法判断的局部"}],\n  "overall_confidence":0.0,\n  "overall_reason":"简短整体理由"\n}\n"""
-SYSTEM_PROMPT += """\n补充纠偏：目标是潜在语义对话的连续波形，不是所有人声活动。能够明确听出只是独立呻吟、喘息、呼吸、动作声或音乐且不含词语时，应留在 outside_candidate；只有无法判断是否含词语的含混人声才保守标 inside_candidate 或 unsure。非语义人声不能桥接相距较远的对白。连续对白内部夹着的短停顿、尾音、呼吸或动作声仍保留在同一个岛。属于同一场景本身绝不是合并理由。\n"""
+SYSTEM_PROMPT = """你是 1.7B Scorer v11 的候选岛预审 teacher。你的唯一职责是标出必须先保留给后续 Proposal / Split / CueQC 的连续候选对话岛。你不是 Split，不按句子、说话人、标点或语义单元切分；你也不是 CueQC，不做最终 keep/drop。
+
+必须按以下优先顺序判断：
+1. 先寻找明确或很可能含词语、音节、耳语、口吃、残缺发音、句尾或对白的波形，把它们作为 inside_candidate 锚点。不要以 ASR 能否转录作为判据。
+2. 再围绕这些锚点形成连续候选岛。同一轮连续对话、几乎无安全间隔的相邻发言，以及对白内部或边缘的停顿、尾音、短呼吸、呻吟或动作声，应保持在同一个岛中，保证完整波形交给下游。句子和事件切分属于 Proposal + Split。
+3. 明确不含词语且能够独立于对白删除的纯呻吟、喘息、呼吸、哭声、亲吻声、动作声、impact、音乐、静音或环境声属于 outside_candidate。即使它持续很久、强度很高、有人互动或与对白处于同一场景，也不能仅因此成为 inside_candidate。若整条 source 都是明确的纯非语义声音，必须允许 islands=[]。
+4. 非语义声音只有在夹在同一轮对话内部、紧贴对白边缘，且移除会截断尾音或破坏连续对话波形时，才随该对话岛保留。纯非语义声音本身不能桥接相距较远的两轮对白。
+5. 若局部听起来可能是词语、也可能只是呻吟或噪声，优先标为 unsure；不要为了高召回直接扩大成 inside_candidate。unsure 是标注不确定性，之后会映射为 ignore=-100。
+
+边界合同：
+- 不使用固定时长、静音阈值、hysteresis、ASR 文本、duration-only 规则或其他启发式。
+- 同一场景、同一说话人、持续互动或声音连续，本身都不是合并理由。
+- islands 与 unsure_spans 必须各自按时间排序、互不重叠，并且两组之间也不得重叠；它们之外的完整差集就是 outside_candidate。
+- 输出当前 0-based 完整 source 坐标，单位为秒，不添加前后文，不使用原视频时间轴。
+
+判例：
+- 对白1 + 对白内部短呼吸/呻吟 + 对白2，且属于同一轮连续对话：输出一个完整 island。
+- 全段只有明确纯呻吟/喘息，没有词语：islands=[]，不要因为声音连续而整段保留。
+- 某段可能是词语，也可能只是呻吟：该局部输出 unsure_span。
+- 对白 + 独立纯非语义活动 + 后续另一轮对白：输出两个 islands，中间差集为 outside_candidate。
+
+只输出一个 JSON 对象，不要 Markdown：
+{
+  "source_id":"...",
+  "islands":[{"start_s":0.0,"end_s":1.0,"confidence":0.0,"reason":"连续候选对话岛的简短理由"}],
+  "unsure_spans":[{"start_s":0.0,"end_s":1.0,"reason":"无法确认是否含词语的局部"}],
+  "overall_confidence":0.0,
+  "overall_reason":"简短整体理由"
+}
+"""
 
 
 def _rows(path: Path) -> list[dict[str, Any]]:
@@ -87,17 +115,23 @@ def _prompt(row: Mapping[str, Any], *, feedback: str = "") -> str:
         "source_id": str(row["source_id"]),
         "duration_s": float(row["duration_s"]),
         "task": "mark continuous candidate dialogue islands for Scorer v11",
-        "do_not_split": [
-            "same dialogue round",
-            "adjacent phrases with almost no gap",
-            "intra-utterance pauses and tails",
-            "isolated ambiguous vocal sounds unless clearly independent pure background",
+        "decision_order": [
+            "find definite or probable lexical/dialogue anchors",
+            "preserve the continuous waveform envelope of the same dialogue round",
+            "leave independently removable definite nonlexical sound in the outside complement",
+            "mark locally ambiguous possible words as unsure rather than defaulting to inside",
         ],
-        "outside_candidate": "only clear independent pure background safely removable without harming dialogue continuity",
-        "output_units": "continuous islands, not single semantic sentences",
-        "must_split": "same scene is not enough to merge: a sustained independent non-dialogue region must end the prior island; do not preserve an entire long scene as one island",
-        "nonsemantic_vocal_policy": "clear isolated moan, pant, breath, action sound or music without words is outside; ambiguous possible words are inside or unsure; nonsemantic vocals must not bridge distant dialogue",
-        "anti_overmerge": "do not return 0..duration as one island merely because people interact in one scene; mark each contiguous dialogue group and leave sustained pure nonsemantic intervals outside",
+        "do_not_split": [
+            "the same continuous dialogue round",
+            "adjacent dialogue turns with almost no safely removable interval",
+            "intra-dialogue pauses, pronunciation tails, breaths, or action sounds",
+        ],
+        "outside_candidate": "the complement containing definite independent nonlexical sound; a continuous pure moan/pant/breath scene may be entirely outside",
+        "output_units": "continuous dialogue-candidate envelopes, never individual sentences or semantic units",
+        "must_split": "independent definite nonlexical activity between separate dialogue rounds ends the prior island even when the scene and interaction continue",
+        "nonsemantic_vocal_policy": "keep nonlexical sound only when attached to or enclosed by the same dialogue envelope; otherwise outside; possible lexical ambiguity goes to unsure",
+        "anti_overmerge": "never return 0..duration merely because vocal activity, intimacy, emotion, or interaction is continuous; if there is no definite or probable dialogue and no ambiguity, return islands=[]",
+        "range_contract": "islands and unsure_spans are sorted and mutually exclusive; their omitted complement is outside_candidate",
     }
     if feedback:
         payload["previous_validation_error"] = feedback
@@ -142,6 +176,20 @@ def _spans(parsed: Mapping[str, Any], *, duration_s: float) -> tuple[list[dict[s
             )
         previous_end = end
         unsure.append({"label": "unsure", "start_s": start, "end_s": end, "start_frame": round(start / FRAME_HOP_S), "end_frame": round(end / FRAME_HOP_S), "reason": str(raw.get("reason") or "")})
+    classified = sorted(
+        (
+            (float(span["start_s"]), float(span["end_s"]), str(span["label"]))
+            for span in (*islands, *unsure)
+        ),
+        key=lambda item: (item[0], item[1], item[2]),
+    )
+    for previous, current in zip(classified, classified[1:]):
+        if current[0] < previous[1]:
+            raise ValueError(
+                "Scorer v11 teacher islands and unsure_spans must be mutually "
+                f"exclusive: {previous[2]} {previous[0]}..{previous[1]} overlaps "
+                f"{current[2]} {current[0]}..{current[1]}"
+            )
     return islands, unsure
 
 
