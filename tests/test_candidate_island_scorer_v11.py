@@ -15,17 +15,30 @@ from boundary.ja.candidate_windows import (
     plan_candidate_context_windows,
     stitch_candidate_window_outputs,
 )
+from boundary.ja.candidate_training import (
+    candidate_boundary_heatmap_loss,
+    candidate_boundary_heatmap_targets,
+    gradient_alignment,
+)
 from boundary.ja.model import (
     CANDIDATE_ISLAND_SCORER_V11_DATASET_CONTRACT,
     CANDIDATE_ISLAND_SCORER_V11_LABELS,
+    CANDIDATE_ISLAND_SCORER_V11_HEATMAP_AUXILIARY,
+    CANDIDATE_ISLAND_SCORER_V11_HEATMAP_DATASET_CONTRACT,
+    CANDIDATE_ISLAND_SCORER_V11_HEATMAP_MODEL_ARCH,
+    CANDIDATE_ISLAND_SCORER_V11_HEATMAP_SCHEMA,
+    CANDIDATE_ISLAND_SCORER_V11_HEATMAP_SIGMA_FRAMES,
     CANDIDATE_ISLAND_SCORER_V11_MODEL_ARCH,
     CANDIDATE_ISLAND_SCORER_V11_SCHEMA,
     CandidateIslandScorerNetwork,
+    CandidateIslandHeatmapScorerNetwork,
     SPEECH_ISLAND_SCORER_V10_SCHEMA,
     build_speech_island_scorer_checkpoint,
     load_speech_island_scorer_checkpoint,
     score_binary_speech_class_probabilities_batch,
     score_candidate_island_class_probabilities_batch,
+    score_candidate_island_heatmap_class_probabilities_batch,
+    score_candidate_island_heatmap_source_probabilities,
     score_candidate_island_source_probabilities,
 )
 
@@ -69,6 +82,17 @@ def _metadata(**overrides) -> dict:
     }
     metadata.update(overrides)
     return metadata
+
+
+def _heatmap_config() -> dict:
+    return {
+        **_config(),
+        "model_arch": CANDIDATE_ISLAND_SCORER_V11_HEATMAP_MODEL_ARCH,
+        "boundary_heatmap_sigma_frames": (
+            CANDIDATE_ISLAND_SCORER_V11_HEATMAP_SIGMA_FRAMES
+        ),
+        "boundary_auxiliary": CANDIDATE_ISLAND_SCORER_V11_HEATMAP_AUXILIARY,
+    }
 
 
 @pytest.mark.parametrize("total", [0, 1, 999, 1000, 1001, 1601, 1700, 1801, 5000])
@@ -262,3 +286,110 @@ def test_candidate_v11_decoder_is_argmax_only_and_runtime_remains_pending() -> N
 
     with pytest.raises(RuntimeError, match="pending_binary_scorer_audit"):
         require_current_runtime_scorer(_V11())
+
+
+def test_candidate_heatmap_targets_are_soft_and_do_not_invent_unsure_boundaries() -> None:
+    targets = candidate_boundary_heatmap_targets(
+        np.asarray([0, 1, 1, 0, -100, 1, 1, 0], dtype=np.int64)
+    )
+
+    assert targets.start_frames == (1,)
+    assert targets.end_frames == (2, 6)
+    assert targets.start[1] == pytest.approx(1.0)
+    assert 0.0 < targets.start[0] < 1.0
+    assert targets.end[2] == pytest.approx(1.0)
+    assert targets.end[6] == pytest.approx(1.0)
+    assert targets.valid.tolist() == [True, True, True, True, False, True, True, True]
+
+
+def test_candidate_heatmap_network_keeps_auxiliary_out_of_runtime_head() -> None:
+    torch = pytest.importorskip("torch")
+    model = CandidateIslandHeatmapScorerNetwork(**_heatmap_config()).eval()
+    ptm = torch.zeros((2, 7, 2048), dtype=torch.float32)
+    mfcc = torch.zeros((2, 7, 40), dtype=torch.float32)
+    mask = torch.ones((2, 7), dtype=torch.int64)
+
+    outputs = model.forward_outputs(ptm, mfcc, attention_mask=mask)
+    runtime_logits = model(ptm, mfcc, attention_mask=mask)
+
+    assert tuple(outputs["class_logits"].shape) == (2, 7, 2)
+    assert tuple(outputs["start_boundary_logits"].shape) == (2, 7, 1)
+    assert tuple(outputs["end_boundary_logits"].shape) == (2, 7, 1)
+    assert torch.equal(runtime_logits, outputs["class_logits"])
+
+
+def test_candidate_heatmap_checkpoint_and_batching_are_strict(tmp_path) -> None:
+    torch = pytest.importorskip("torch")
+    config = _heatmap_config()
+    payload = build_speech_island_scorer_checkpoint(
+        model=CandidateIslandHeatmapScorerNetwork(**config).eval(),
+        model_config=config,
+        normalization={"mfcc_mean": [0.0] * 40, "mfcc_std": [1.0] * 40},
+        metadata=_metadata(),
+        schema=CANDIDATE_ISLAND_SCORER_V11_HEATMAP_SCHEMA,
+    )
+    checkpoint = tmp_path / "candidate-scorer-v11-heatmap.pt"
+    torch.save(payload, checkpoint)
+    bundle = load_speech_island_scorer_checkpoint(checkpoint, device="cpu")
+
+    assert bundle.metadata["dataset_contract"] == (
+        CANDIDATE_ISLAND_SCORER_V11_HEATMAP_DATASET_CONTRACT
+    )
+    assert bundle.metadata["runtime_auxiliary_decoder"] == "disabled_ab_only"
+    rng = np.random.default_rng(811)
+    pairs = [
+        (
+            rng.normal(size=(frames, 2048)).astype(np.float32),
+            rng.normal(size=(frames, 40)).astype(np.float32),
+        )
+        for frames in (5, 9, 7)
+    ]
+    batched = score_candidate_island_heatmap_class_probabilities_batch(
+        bundle, feature_pairs=pairs
+    )
+    singleton = [
+        score_candidate_island_heatmap_class_probabilities_batch(
+            bundle, feature_pairs=[pair]
+        )[0]
+        for pair in pairs
+    ]
+    for left, right in zip(batched, singleton, strict=True):
+        np.testing.assert_allclose(left, right, atol=1e-5, rtol=1e-5)
+        np.testing.assert_array_equal(np.argmax(left, axis=1), np.argmax(right, axis=1))
+
+    ptm = rng.normal(size=(1801, 2048)).astype(np.float32)
+    mfcc = rng.normal(size=(1801, 40)).astype(np.float32)
+    one_batch = score_candidate_island_heatmap_source_probabilities(
+        bundle, ptm=ptm, mfcc=mfcc, max_padded_frames=2000
+    )
+    split_batches = score_candidate_island_heatmap_source_probabilities(
+        bundle, ptm=ptm, mfcc=mfcc, max_padded_frames=1000
+    )
+    np.testing.assert_allclose(one_batch, split_batches, atol=1e-5, rtol=1e-5)
+    np.testing.assert_array_equal(
+        np.argmax(one_batch, axis=1), np.argmax(split_batches, axis=1)
+    )
+
+
+def test_candidate_heatmap_loss_and_gradient_alignment() -> None:
+    torch = pytest.importorskip("torch")
+    start_logits = torch.zeros((1, 3, 1), requires_grad=True)
+    end_logits = torch.zeros((1, 3, 1), requires_grad=True)
+    targets = torch.tensor([[0.0, 1.0, 0.0]])
+    valid = torch.tensor([[True, False, True]])
+    loss = candidate_boundary_heatmap_loss(
+        start_logits=start_logits,
+        end_logits=end_logits,
+        start_targets=targets,
+        end_targets=targets,
+        valid_mask=valid,
+    )
+    assert float(loss.detach()) == pytest.approx(np.log(2.0))
+
+    parameter = torch.nn.Parameter(torch.tensor([1.0, -2.0]))
+    main_loss = torch.sum(parameter**2)
+    auxiliary_loss = torch.sum(parameter**2) * 0.5
+    alignment = gradient_alignment(main_loss, auxiliary_loss, [parameter])
+    assert alignment["main_gradient_norm"] > 0.0
+    assert alignment["auxiliary_gradient_norm"] > 0.0
+    assert alignment["gradient_cosine"] == pytest.approx(1.0)

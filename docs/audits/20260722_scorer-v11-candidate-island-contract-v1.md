@@ -60,3 +60,22 @@ runtime 只允许两 logit softmax 后的逐帧 argmax。禁止 threshold、hyst
 6. 普通 frame cross-entropy 作为首个基线。Focal、weighted、boundary/continuity auxiliary 只有固定数据 A/B 明确改善人工安全和 held-out gate 才采用。
 
 数字 gate 最高为 start/end coverage 和 same-ASR-unit continuity `>=95%`。人工 `zero true-speech deletion / zero clipping` 优先；所有 prediction drop/truth keep、held-out hard case 和 `>8s` residual 必须人工审计。背景误留还必须跑真实 Scorer→CueQC v13 argmax 链，确认下游 ASR empty/重复/遗漏不劣化，不能用 CueQC 掩盖 Scorer 的真语音删除。
+
+## Boundary heatmap A/B
+
+在纯 argmax baseline 独立提交后，第一轮结构实验固定为 B1 soft start/end heatmap，而不是 proposal-style offset distribution 或 Semi-CRF：
+
+```text
+PTM2048 + MFCC40 → projection + Bi-Mamba
+                         ├─ inside/outside 主头 → 唯一 runtime 输出
+                         ├─ start heatmap 辅助头 → train only
+                         └─ end heatmap 辅助头   → train only
+```
+
+- 独立 schema=`speech_boundary_ja_candidate_island_scorer_v11_heatmap_aux_v1`；baseline checkpoint 不能作为 alias 或 warm-start。
+- heatmap target 由完整 source definite candidate run 生成，再切固定上下文；高斯 `sigma=2 frames` 只定义训练 target，不是 runtime boundary band。
+- touching unsure 的 transition 不产生已知边界，unsure frame 不进入 auxiliary loss。
+- `forward()`、checkpoint decoder 和 source scoring API 仍只返回两类 logits/probabilities；metadata 固定 `runtime_auxiliary_decoder=disabled_ab_only`。
+- 第一轮总 loss 只允许 `L_inside + lambda_b * L_heatmap`；不加入 duration、IoU、span matching、top-k、NMS、DP 或规则合并。
+- A/B 固定相同 canonical、partition、seed、batch/window、训练步数和主 loss。除 baseline `lambda_b=0` 外，B 首轮只比较预注册的小权重；同时记录共享 trunk 的 main/aux gradient norm 与 cosine，长期冲突时不直接引入 PCGrad，而先判定该辅助任务失败或降低权重。
+- B 只有在不新增任何 left/right clipping、middle break、whole-island deletion 的前提下，才允许继续测试边界软融合；结构化 decoder 不属于本轮。
