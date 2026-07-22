@@ -67,6 +67,16 @@ def _candidate_page(rows: list[dict[str, Any]]) -> str:
         "outside_candidate",
         page,
     )
+    # ``background`` is both a legacy label token and a CSS property.  The
+    # label rewrite above intentionally updates class/variable names, but must
+    # not turn declarations such as ``background:#fff`` into the invalid
+    # ``outside_candidate:#fff``.  Repair property names only inside the style
+    # block while preserving the renamed ``--outside_candidate`` variable.
+    style, separator, remainder = page.partition("</style>")
+    if not separator:
+        raise ValueError("candidate audit template is missing its style block")
+    style = re.sub(r"(?<!-)outside_candidate:", "background:", style)
+    page = style + separator + remainder
     page = page.replace(
         "Scorer v10 full-source truth repair",
         "Scorer v11 held-out candidate membership",

@@ -65,10 +65,20 @@ def test_candidate_heldout_audit_freezes_partitions_and_uses_candidate_labels(
     assert "inside_candidate" in page
     assert "outside_candidate" in page
     assert "添加 inside_candidate" in page
+    assert "更新区间" in page
+    assert 'class="range-start"' in page
+    assert 'class="range-end"' in page
+    assert "function updateRange(" in page
+    assert "materialize_unreviewed_ranges" in page
     assert "complete_with_target_inside_candidate" in page
     assert "complete_all_outside_candidate" in page
     assert "complete_with_target_speech" not in page
     assert "speech_scorer_v10_full_source_span_manual_verdict_v1" not in page
+    assert "body{margin:0;background:#f3f5f7" in page
+    assert ".inside_candidate{background:var(--inside_candidate)" in page
+    assert ".outside_candidate{background:var(--outside_candidate)" in page
+    assert "body{margin:0;outside_candidate:" not in page
+    assert ".inside_candidate{outside_candidate:" not in page
     manifest = [
         json.loads(line)
         for line in (tmp_path / "audit" / "audit_manifest.jsonl")
