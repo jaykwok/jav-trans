@@ -29,6 +29,7 @@
 
 ## 2026-07-22
 
+- Scorer v11 真实数据 compact CUDA smoke 暴露 trainer 在首次 CUDA/Mamba 上下文建立前过早重置 shared-VRAM baseline，首个模型初始化因此被误报为 `74 MiB` spill。trainer 现与正式 raw extractor/v10 trainer 对齐：使用同一 capacity profile 和最大预算的代表 batch 完成临时 forward/backward/AdamW warmup，显式释放后建立执行基线，再恢复原 seed 随机初始化正式模型；正式训练期间任何新增 shared usage 仍立即 soft-OOM，warmup 本身也必须满足物理 RAM/VRAM `0.95` 上限。
 - Scorer v11真实1667-window CUDA smoke在进入训练前发现bare `--device cuda`无法传给`torch.cuda.set_per_process_memory_fraction`；trainer现统一把无index的CUDA device解析为当前`cuda:N`，保留显式`cuda:N`与CPU smoke语义，避免正式训练依赖手工参数绕过allocator cap。
 - 完成Proposal/Outer/Split当前职责与执行层复审。旧Proposal runtime在模型分数后仍做80ms smoothing、local maximum、双10% quantile floor、120ms NMS、speech-valley snap和80ms edge exclusion；这些虽非final cut却承载候选recall，full-workflow已删除对应CLI/env/summary表面并主动清除旧环境变量。Split保留left/gap/right+多尺度candidate query基线，但旧13维scalar前四项及`speech_*`命名与Scorer v11 membership语义断兼容。另确认Inner预测目前在CueQC前预计算、CueQC后才应用，不符合post-CueQC keep职责；因feature provider生命周期尚未重构，本阶段记录为最终上游晋升后的必改项，不用重复PTM或规则绕过。统一runtime device resolver同时关闭Boundary/Outer/Split/CueQC/Inner的auto CPU fallback。
 - 正式 Scorer v11 raw 提取在完成1446条 train后，由首个 held-out `匿名样片 P...w01` 暴露 source metadata几何错误：旧数据准备器记录请求窗口75s，而14/24个人工 held-out WAV经实际滤镜后短约0.32–0.46s，另4条仅多5 samples；旧审计页和 canonical compiler均错误信任名义时长。现数据准备器写真实 WAV sample_count/duration，held-out页按实际 WAV建时间轴，canonical保留原人工内部边界、只裁掉不存在的尾部，sub-frame overrun不扩展未审计网格；14条共移除250个无音频帧，train内容完全不变。修复后 canonical SHA=`c3d8c4b8...f3cb55`，正式 cache通过逐行不变证明重绑1446条 train后，仅重提24条 held-out并完成1470/1470，shared spill=`0`。

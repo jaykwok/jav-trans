@@ -28,6 +28,7 @@ from tools.boundary.ja.compile_candidate_island_scorer_v11_features import (
     compile_features,
 )
 from tools.boundary.ja.train_candidate_island_scorer_v11 import (
+    _cuda_warmup_rows,
     _resolve_training_device,
     run as train,
 )
@@ -386,3 +387,17 @@ def test_v11_training_resolves_bare_cuda_to_current_device(monkeypatch) -> None:
     assert str(_resolve_training_device("cuda", torch)) == "cuda:3"
     assert str(_resolve_training_device("cuda:1", torch)) == "cuda:1"
     assert str(_resolve_training_device("cpu", torch)) == "cpu"
+
+
+def test_v11_cuda_warmup_uses_longest_budgeted_batch() -> None:
+    rows = [
+        {"row_id": "short", "window_start_frame": 0, "window_end_frame": 300},
+        {"row_id": "long-a", "window_start_frame": 0, "window_end_frame": 900},
+        {"row_id": "medium", "window_start_frame": 0, "window_end_frame": 600},
+        {"row_id": "long-b", "window_start_frame": 0, "window_end_frame": 850},
+    ]
+
+    selected = _cuda_warmup_rows(rows, max_padded_frames=2000)
+
+    assert [row["row_id"] for row in selected] == ["long-a", "long-b"]
+    assert max(row["window_end_frame"] for row in selected) * len(selected) <= 2000

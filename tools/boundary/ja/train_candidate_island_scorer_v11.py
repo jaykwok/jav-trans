@@ -523,6 +523,35 @@ def _resolve_training_device(requested: str, torch):
     return device
 
 
+def _reset_training_seed(seed: int, torch) -> None:
+    random.seed(int(seed))
+    np.random.seed(int(seed))
+    torch.manual_seed(int(seed))
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(int(seed))
+
+
+def _build_model(args: argparse.Namespace, config: dict[str, Any]):
+    if args.variant == "heatmap_aux":
+        return CandidateIslandHeatmapScorerNetwork(**config)
+    return CandidateIslandScorerNetwork(**config)
+
+
+def _cuda_warmup_rows(
+    rows: Sequence[dict[str, Any]], *, max_padded_frames: int
+) -> list[dict[str, Any]]:
+    longest_first = sorted(
+        rows,
+        key=lambda row: int(row["window_end_frame"])
+        - int(row["window_start_frame"]),
+        reverse=True,
+    )
+    batches = _pack_batches(longest_first, max_padded_frames=max_padded_frames)
+    if not batches:
+        raise ValueError("Scorer v11 CUDA warmup requires train rows")
+    return batches[0]
+
+
 def run(args: argparse.Namespace) -> dict[str, Any]:
     import psutil
     import torch
@@ -566,11 +595,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         partition: [row for row in rows if row["partition"] == partition]
         for partition in sorted(PARTITIONS)
     }
-    random.seed(int(args.seed))
-    np.random.seed(int(args.seed))
-    torch.manual_seed(int(args.seed))
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(int(args.seed))
+    _reset_training_seed(int(args.seed), torch)
     device = _resolve_training_device(args.device, torch)
     process = psutil.Process()
     physical_ram = int(psutil.virtual_memory().total)
@@ -597,28 +622,80 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 "shared_vram_spill_policy": "soft_oom_abort",
             }
         )
-        gc.collect()
-        torch.cuda.empty_cache()
-        shared_vram_baseline = reset_shared_vram_baseline(required=True)
-        torch.cuda.reset_peak_memory_stats(device)
-    else:
-        shared_vram_baseline = {
-            "shared_vram_mb": 0.0,
-            "shared_vram_monitor": "not_applicable_cpu_stage",
-        }
-    memory_snapshots: list[dict[str, Any]] = [
-        {**shared_vram_baseline, "stage": "execution_baseline"}
-    ]
+    memory_snapshots: list[dict[str, Any]] = []
 
     cache = SourceArrayCache(max_sources=int(args.source_cache_size))
     normalization = compute_mfcc_normalization(by_partition["train"], cache)
     config = _model_config(args, normalization)
-    if args.variant == "heatmap_aux":
-        model = CandidateIslandHeatmapScorerNetwork(**config)
-        schema = CANDIDATE_ISLAND_SCORER_V11_HEATMAP_SCHEMA
+    schema = (
+        CANDIDATE_ISLAND_SCORER_V11_HEATMAP_SCHEMA
+        if args.variant == "heatmap_aux"
+        else str(capacity["schema"])
+    )
+    if device.type == "cuda":
+        # WDDM reports a small, stable shared-memory allocation when CUDA and
+        # Mamba create their execution context. Establish the process baseline
+        # only after a representative temporary forward/backward/AdamW step.
+        # Any growth during the real training run remains an immediate soft OOM.
+        warmup_model = _build_model(args, config).to(device)
+        warmup_optimizer = torch.optim.AdamW(
+            warmup_model.parameters(),
+            lr=float(args.learning_rate),
+            weight_decay=float(args.weight_decay),
+        )
+        warmup_rows = _cuda_warmup_rows(
+            by_partition["train"], max_padded_frames=int(args.max_padded_frames)
+        )
+        warmup_batch = _collate(
+            [load_candidate_window(row, cache) for row in warmup_rows], torch, device
+        )
+        warmup_loss, *_warmup_outputs = _loss(
+            warmup_model,
+            warmup_batch,
+            variant=args.variant,
+            heatmap_weight=float(args.heatmap_weight),
+            torch=torch,
+        )
+        warmup_optimizer.zero_grad(set_to_none=True)
+        warmup_loss.backward()
+        if float(args.gradient_clip_norm) > 0.0:
+            torch.nn.utils.clip_grad_norm_(
+                warmup_model.parameters(), float(args.gradient_clip_norm)
+            )
+        warmup_optimizer.step()
+        torch.cuda.synchronize(device)
+        if int(torch.cuda.memory_reserved(device)) > int(
+            gpu_budget["physical_budget_bytes"]
+        ):
+            raise MemoryError("Scorer v11 CUDA warmup exceeded the 95% VRAM budget")
+        if int(process.memory_info().rss) > physical_ram_budget:
+            raise MemoryError("Scorer v11 CUDA warmup exceeded the 95% RAM budget")
+        del (
+            warmup_batch,
+            warmup_loss,
+            _warmup_outputs,
+            warmup_optimizer,
+            warmup_model,
+            warmup_rows,
+        )
+        gc.collect()
+        torch.cuda.empty_cache()
+        shared_vram_baseline = reset_shared_vram_baseline(required=True)
+        memory_snapshots.append(
+            {**shared_vram_baseline, "stage": "post_warmup_execution_baseline"}
+        )
+        torch.cuda.reset_peak_memory_stats(device)
+        _reset_training_seed(int(args.seed), torch)
     else:
-        model = CandidateIslandScorerNetwork(**config)
-        schema = str(capacity["schema"])
+        memory_snapshots.append(
+            {
+                "shared_vram_mb": 0.0,
+                "shared_vram_monitor": "not_applicable_cpu_stage",
+                "stage": "execution_baseline",
+            }
+        )
+
+    model = _build_model(args, config)
     model.to(device)
     optimizer = torch.optim.AdamW(
         model.parameters(), lr=float(args.learning_rate), weight_decay=float(args.weight_decay)
