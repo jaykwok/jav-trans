@@ -345,6 +345,99 @@ def test_v11_real_train_ignores_only_subframe_audio_tail(tmp_path: Path) -> None
     assert real["audio_sample_count"] == 8 * 320 + 5
     assert real["audio_geometry_policy"] == "exact_or_subframe_audio_tail_ignored_v1"
 
+
+def test_v11_canonical_accepts_signed_real_train_full_source_manual_truth(
+    tmp_path: Path,
+) -> None:
+    synthetic_path, real_train_path, source_path, partition_path, verdict_path = (
+        _canonical_fixture(tmp_path)
+    )
+    source_rows = [
+        json.loads(line) for line in source_path.read_text(encoding="utf-8").splitlines()
+    ]
+    partition_rows = [
+        json.loads(line)
+        for line in partition_path.read_text(encoding="utf-8").splitlines()
+    ]
+    source_id = "video-train-manual-w00"
+    video_id = "video-train-manual"
+    audio = tmp_path / f"{source_id}.wav"
+    _write_wav(audio, 8)
+    source_rows.append(
+        {
+            "schema": "joint_boundary_omni_source_window_v1",
+            "window_id": source_id,
+            "video_id": video_id,
+            "audio_wav": str(audio),
+            "audio_wav_sha256": _sha256(audio),
+            "duration_s": 0.16,
+        }
+    )
+    partition_rows.append(
+        {
+            "schema": PARTITION_SCHEMA,
+            "boundary_serialization_contract_id": ACOUSTIC_BINARY_V12_CONTRACT.contract_id,
+            "source_id": source_id,
+            "video_id": video_id,
+            "partition": "train",
+            "original_dataset_role": "train",
+        }
+    )
+    _write_jsonl(source_path, source_rows)
+    _write_jsonl(partition_path, partition_rows)
+    real_train_manual = tmp_path / "real_train_manual_sources.jsonl"
+    _write_jsonl(
+        real_train_manual,
+        [
+            {
+                "schema": "candidate_island_scorer_v11_real_train_manual_source_v1",
+                "boundary_serialization_contract_id": ACOUSTIC_BINARY_V12_CONTRACT.contract_id,
+                "source_id": source_id,
+                "video_id": video_id,
+                "partition": "train",
+                "input_distribution": "real_workflow_source_window_human_full_source_v1",
+                "audio": str(audio),
+                "audio_sha256": _sha256(audio),
+                "frame_count": 8,
+                "frame_hop_s": 0.02,
+                "core_ids": [f"real-train-manual-source::{source_id}"],
+                "canonical_spans": [
+                    {"label": "outside_candidate", "start_frame": 0, "end_frame": 2},
+                    {"label": "inside_candidate", "start_frame": 2, "end_frame": 7},
+                    {"label": "unsure", "start_frame": 7, "end_frame": 8},
+                ],
+                "annotation_provenance": "human_full_source_review",
+                "teacher_output_used_as_truth": False,
+                "unselected_source_label_inheritance": False,
+                "unsure_training_label": -100,
+                "reviewed_full_source": True,
+                "training_manifest_allowed": True,
+            }
+        ],
+    )
+
+    summary = compile_canonical(
+        synthetic_train_sources=synthetic_path,
+        real_train_outside_sources=real_train_path,
+        real_train_manual_sources=real_train_manual,
+        source_windows=source_path,
+        partition_manifest=partition_path,
+        manual_verdicts=[verdict_path],
+        output_dir=tmp_path / "manual-canonical",
+    )
+    assert summary["real_train_manual_source_count"] == 1
+    assert summary["real_train_manual_inside_frames"] == 5
+    assert summary["real_train_full_source_human_confirmed"] is True
+    rows = [
+        json.loads(line)
+        for line in Path(summary["canonical_sources"])
+        .read_text(encoding="utf-8")
+        .splitlines()
+    ]
+    manual = next(row for row in rows if row["source_id"] == source_id)
+    assert manual["source_kind"] == "real_train_full_source_manual"
+    assert manual["unsure_training_label"] == -100
+
 def test_v11_feature_compile_and_random_init_cpu_smoke(tmp_path: Path) -> None:
     pytest.importorskip("torch")
     synthetic_path, real_train_path, source_path, partition_path, verdict_path = _canonical_fixture(tmp_path)

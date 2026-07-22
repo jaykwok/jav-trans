@@ -39,6 +39,8 @@ WhisperSeg 是 ICASSP 2024 工作《Positive Transfer of the Whisper Speech Tran
 
 Whisper encoder-decoder 对完整 spectrogram clip 做 conditional generation，而不是对每帧概率再选 operating threshold。这个“学习型结构化 span 输出”与 Scorer v11 的连续 candidate-island 职责有直接参考价值。
 
+论文给出的两项消融与本项目当前症状尤其相关。第一，同为 Whisper large 的 frame-wise classifier 弱于 token-based WhisperSeg，说明收益不只来自模型参数量；第二，人类数据的 context 从 100/200/1000 spectrogram columns 增长时 segment F1 从 `0.081/0.222/0.380` 持续上升。作者还明确观察到 noisy human 数据中 frame-wise baseline 更容易产生 fragmented prediction 与 brief false positive，而直接 span 输出的 segment-level 指标更稳定。这与当前 Scorer v11 的完整 run 删除、内部碎片和continuity失败在问题形态上吻合，但不能据此跳过本项目自己的固定数据A/B。
+
 但官方 runtime 不是本项目合同所要求的纯学习型 two-logit argmax：
 
 - 长音频被切成固定 clip，可运行多个 offset trial；
@@ -67,7 +69,7 @@ Whisper encoder-decoder 对完整 spectrogram clip 做 conditional generation，
 因此当前不应直接替换为完整 WhisperSeq2Seq。更合理的后续 A/B 是在修复真实 full-source train supervision 后，固定同一数据比较：
 
 - A：现有 bidirectional Mamba two-logit frame argmax；
-- B：同一 backbone 加学习型 start/end span query，并把训练期结构损失与 runtime two-logit argmax解耦；
-- C：若 B 仍无法解决连续性，再设计无阈值、无 NMS、无时长规则的受约束 span decoder新 schema。
+- B：保留相同 raw PTM2048 adapter 与 bidirectional Mamba trunk，仅把输出改为按时间顺序 greedy categorical argmax 的 `start/end/stop` learned span decoder；target span 是完整 candidate island，不是单句或最终ASR切片；
+- C：仅当 B 的自回归误差传播成为主要失败形态时，再比较固定数量的 ordered span query；每个 query 的 presence/start/end仍由categorical argmax决定，禁止阈值、NMS与duration过滤。
 
-任何 B/C 都必须随机初始化、保留 raw PTM2048 学习型 adapter、`unsure=-100`，并重新验证 batch-equivalence、shared spill=`0`和人工 zero-clipping。
+任何 B/C 都必须随机初始化、保留 raw PTM2048 学习型 adapter、`unsure=-100`，并重新验证 batch-equivalence、shared spill=`0`和人工 zero-clipping。Scorer只保证连续对话candidate island完整；句间切分仍属于Split，最终acoustic首尾裁剪仍属于Inner。
