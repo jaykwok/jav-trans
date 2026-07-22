@@ -194,10 +194,15 @@ def test_build_v11_train_sources_preserves_candidate_and_brackets_outside(tmp_pa
     outside_control = next(
         row for row in rows if row["source_kind"] == "clear_nonvocal_all_background"
     )
-    assert outside_control["core_ids"] == []
-    assert outside_control["canonical_spans"] == [
-        {"label": "outside_candidate", "start_frame": 0, "end_frame": 100}
+    assert outside_control["core_ids"] == [
+        "background-control-instance::scorer-v11-outside-control-0000"
     ]
+    assert outside_control["canonical_spans"] == [
+        {"label": "outside_candidate", "start_frame": 0, "end_frame": 1000}
+    ]
+    assert outside_control["outside_control_composition"] == (
+        "train_nonvocal_mosaic_20s_v1"
+    )
 
 
 def test_build_v11_train_sources_replaces_heldout_background_identity(tmp_path: Path) -> None:

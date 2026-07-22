@@ -46,7 +46,8 @@ SAMPLE_RATE = 16000
 FRAME_SAMPLES = 320
 FRAME_HOP_S = 0.02
 BRACKET_DURATIONS_S = (0.5, 1.0, 2.0, 3.0)
-DEFAULT_OUTSIDE_CONTROL_COUNT = 160
+DEFAULT_OUTSIDE_CONTROL_COUNT = 320
+OUTSIDE_CONTROL_SEGMENT_DURATIONS_S = (2.0, 3.0, 4.0, 5.0, 6.0)
 
 OUTSIDE_BACKGROUND_TYPES = {
     "ambient_noise",
@@ -588,14 +589,27 @@ def _write_candidate_source(
 
 def _write_outside_control(
     *,
-    row: dict[str, Any],
+    outside_pool: Sequence[dict[str, Any]],
     output_path: Path,
     source_index: int,
     rng: np.random.Generator,
 ) -> dict[str, Any]:
-    seconds = (2.0, 4.0, 6.0, 8.0)[source_index % 4]
-    samples = int(seconds * SAMPLE_RATE)
-    values, provenance = _clip_background(row, samples=samples, rng=rng)
+    if not outside_pool:
+        raise ValueError("Scorer v11 outside control pool is empty")
+    components: list[np.ndarray] = []
+    provenance: list[dict[str, Any]] = []
+    for component_index, seconds in enumerate(OUTSIDE_CONTROL_SEGMENT_DURATIONS_S):
+        row = outside_pool[
+            (source_index * len(OUTSIDE_CONTROL_SEGMENT_DURATIONS_S) + component_index)
+            % len(outside_pool)
+        ]
+        values, detail = _clip_background(
+            row, samples=int(seconds * SAMPLE_RATE), rng=rng
+        )
+        components.append(values)
+        provenance.append(detail)
+    values = np.ascontiguousarray(np.concatenate(components), dtype=np.float32)
+    samples = int(sum(OUTSIDE_CONTROL_SEGMENT_DURATIONS_S) * SAMPLE_RATE)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     sf.write(output_path, values, SAMPLE_RATE, subtype="PCM_16")
     written = _load_audio(output_path)
@@ -617,7 +631,7 @@ def _write_outside_control(
         "duration_s": len(written) / SAMPLE_RATE,
         "frame_count": len(written) // FRAME_SAMPLES,
         "frame_hop_s": FRAME_HOP_S,
-        "core_ids": [],
+        "core_ids": [f"background-control-instance::{source_id}"],
         "canonical_spans": [
             {
                 "label": "outside_candidate",
@@ -625,7 +639,8 @@ def _write_outside_control(
                 "end_frame": len(written) // FRAME_SAMPLES,
             }
         ],
-        "outside_control_source": provenance,
+        "outside_control_sources": provenance,
+        "outside_control_composition": "train_nonvocal_mosaic_20s_v1",
         "training_manifest_allowed": True,
     }
 
@@ -671,8 +686,8 @@ def build(args: argparse.Namespace) -> dict[str, Any]:
         raise ValueError("Scorer v11 train source counts must be non-negative")
     if len(vocal_pool) < vocal_source_count:
         raise ValueError("not enough held-out-disjoint isolated vocal sources")
-    if len(outside_pool) < outside_control_count:
-        raise ValueError("not enough held-out-disjoint clear non-vocal controls")
+    if outside_control_count and not outside_pool:
+        raise ValueError("no held-out-disjoint clear non-vocal controls")
 
     output_dir = Path(args.output_dir)
     audio_dir = output_dir / "audio"
@@ -743,11 +758,10 @@ def build(args: argparse.Namespace) -> dict[str, Any]:
             )
         )
 
-    outside_selection = outside_pool[:outside_control_count]
-    for local_index, source in enumerate(outside_selection):
+    for local_index in range(outside_control_count):
         rows.append(
             _write_outside_control(
-                row=source,
+                outside_pool=outside_pool,
                 output_path=audio_dir / f"outside-control-{local_index:04d}.wav",
                 source_index=local_index,
                 rng=rng,
@@ -789,6 +803,13 @@ def build(args: argparse.Namespace) -> dict[str, Any]:
         "overlay_counts": dict(sorted(overlay_counts.items())),
         "heldout_component_replacement_count": heldout_component_replacements,
         "outside_background_pool_count": len(outside_pool),
+        "outside_control_source_reuse_allowed": True,
+        "outside_control_duration_s": float(
+            sum(OUTSIDE_CONTROL_SEGMENT_DURATIONS_S)
+        ),
+        "outside_control_component_count": len(
+            OUTSIDE_CONTROL_SEGMENT_DURATIONS_S
+        ),
         "isolated_vocal_pool_count": len(vocal_pool),
         "train_disjoint_component_pool_count": len(eligible_pool),
         "canonical_frame_counts": dict(sorted(frame_counts.items())),
