@@ -477,6 +477,7 @@ def test_v11_feature_compile_and_random_init_cpu_smoke(tmp_path: Path) -> None:
                 "frame_hop_s": 0.02,
                 "ptm_dim": 2048,
                 "mfcc_dim": 40,
+                "audio_sha256": row["audio_sha256"],
             }
         )
     raw_manifest = tmp_path / "raw_features.jsonl"
@@ -584,6 +585,7 @@ def test_v11_feature_compile_rejects_projected_ptm128(tmp_path: Path) -> None:
                 "frame_hop_s": 0.02,
                 "ptm_dim": 128,
                 "mfcc_dim": 40,
+                "audio_sha256": canonical["audio_sha256"],
             }
         )
     raw_manifest = tmp_path / "compact.jsonl"

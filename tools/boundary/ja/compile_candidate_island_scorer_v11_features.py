@@ -134,6 +134,8 @@ def _validate_raw_feature(
         raise ValueError(f"Scorer v11 features must come from the current 1.7B PTM: {source_id}")
     if row.get("partition") != canonical.get("partition"):
         raise ValueError(f"raw feature partition mismatch: {source_id}")
+    if row.get("audio_sha256") != canonical.get("audio_sha256"):
+        raise ValueError(f"raw feature audio identity mismatch: {source_id}")
     if int(row.get("frame_count") or 0) != int(canonical["frame_count"]):
         raise ValueError(f"raw feature frame count mismatch: {source_id}")
     if int(row.get("ptm_dim") or 0) != CANDIDATE_ISLAND_SCORER_V11_RAW_PTM_DIM:
