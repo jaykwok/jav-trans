@@ -188,5 +188,5 @@ def test_06b_boundary_models_are_all_pending_retrain_placeholders() -> None:
         qwen.QWEN_ASR_17B_REPO_ID
     ] == ""
     assert qwen.BOUNDARY_PIPELINE_STATUS_BY_REPO[qwen.QWEN_ASR_17B_REPO_ID] == (
-        "pending_outer_v3_audit"
+        "pending_binary_scorer_audit"
     )

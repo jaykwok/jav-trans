@@ -186,11 +186,14 @@ def test_boundary_registry_keeps_06b_and_17b_pending_placeholders() -> None:
     assert qwen.DEFAULT_OUTER_EDGE_REFINER_CHECKPOINT_BY_REPO[
         qwen.QWEN_ASR_17B_REPO_ID
     ] == ""
+    assert qwen.DEFAULT_SPEECH_BOUNDARY_SCORER_CHECKPOINT_BY_REPO[
+        qwen.QWEN_ASR_17B_REPO_ID
+    ] == ""
     assert qwen.BOUNDARY_PIPELINE_STATUS_BY_REPO[qwen.QWEN_ASR_06B_REPO_ID] == (
         "pending_binary_retrain"
     )
     assert qwen.BOUNDARY_PIPELINE_STATUS_BY_REPO[qwen.QWEN_ASR_17B_REPO_ID] == (
-        "pending_outer_v3_audit"
+        "pending_binary_scorer_audit"
     )
     active_mappings = (
         qwen.DEFAULT_SPEECH_BOUNDARY_SCORER_CHECKPOINT_BY_REPO,

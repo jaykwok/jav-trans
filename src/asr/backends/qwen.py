@@ -58,7 +58,10 @@ DEFAULT_PRE_ASR_CUEQC_CHECKPOINT_BY_REPO: dict[str, str] = {
 }
 BOUNDARY_PIPELINE_STATUS_BY_REPO: dict[str, str] = {
     QWEN_ASR_06B_REPO_ID: "pending_binary_retrain",
-    QWEN_ASR_17B_REPO_ID: "pending_outer_v3_audit",
+    # Report the first unavailable stage in the active 1.7B chain.  Outer v3
+    # is also pending, but Scorer v11 must be audited/trained/promoted before
+    # the workflow can reach it.
+    QWEN_ASR_17B_REPO_ID: "pending_binary_scorer_audit",
 }
 
 
@@ -71,13 +74,12 @@ def require_boundary_pipeline_ready(repo_id: str | None = None) -> str:
             "the complete repo-bound Boundary chain is not available"
         )
     return selected
-# The v8 registry contains only native speech-only checkpoints. Incompatible
-# v7 speech/split weights are not converted at load time.
+# Scorer v11 has not been promoted.  Retired v8/v9/v10 checkpoints remain
+# addressable by explicit paths for offline audits, but must never appear as
+# the active repo default.
 DEFAULT_SPEECH_BOUNDARY_SCORER_CHECKPOINT_BY_REPO: dict[str, str] = {
     QWEN_ASR_06B_REPO_ID: "",
-    QWEN_ASR_17B_REPO_ID: repo_checkpoint_path(
-        QWEN_ASR_17B_REPO_ID, "speech_island_scorer", "v8"
-    ),
+    QWEN_ASR_17B_REPO_ID: "",
 }
 # Learned boundary-proposal candidate source for the 1.7B Split v4 chain.
 # The 0.6B entry stays empty until its complete binary chain is retrained.

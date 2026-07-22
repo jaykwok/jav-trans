@@ -295,7 +295,7 @@ async def _test_model_requirements_for_17b_include_boundary(tmp_path, monkeypatc
     assert len(payload["required_checkpoints"]) == 1
     pending = payload["required_checkpoints"][0]
     assert pending["roles"] == ["boundary_pipeline"]
-    assert pending["error"] == "pending_outer_v3_audit"
+    assert pending["error"] == "pending_binary_scorer_audit"
     assert pending["present"] is False
     assert payload["pipeline_ready"] is False
     by_role = {

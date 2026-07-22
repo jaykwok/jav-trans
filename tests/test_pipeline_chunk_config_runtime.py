@@ -15,9 +15,9 @@ def _reload_pipeline(monkeypatch):
     return importlib.reload(pipeline)
 
 
-def test_17b_boundary_config_fails_until_outer_v3_audit(monkeypatch) -> None:
+def test_17b_boundary_config_fails_until_binary_scorer_audit(monkeypatch) -> None:
     pipeline = _reload_pipeline(monkeypatch)
-    with pytest.raises(RuntimeError, match="pending_outer_v3_audit"):
+    with pytest.raises(RuntimeError, match="pending_binary_scorer_audit"):
         pipeline._boundary_config()
 
 

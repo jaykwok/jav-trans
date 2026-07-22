@@ -154,7 +154,7 @@ Web 会在模型要求检查中提示驱动过旧或 CUDA 初始化失败。
 - Runtime 不使用具体词黑名单或时长启发式删除短促人声；是否进入 ASR 由 Pre-ASR CueQC 模型标签决定。
 - Scorer v11、Split v4、CueQC v13 与 Inner v2 均只允许二分类 softmax argmax，不读取 runtime threshold，不提供旧三分类 alias 或规则 fallback。Scorer v8/v9/v10 仅保留为离线审计证据；当前 production segment 在 v11 checkpoint 晋升前明确报告 `pending_binary_scorer_audit`。
 - Boundary 阶段按 Outer、Split、Inner、CueQC 的独立生命周期串行释放模型；allocated/reserved/shared VRAM 只写运行诊断，不参与 cache 签名。显式 CUDA 请求不可用时直接报错，不回退 CPU；任何正 shared VRAM spill 都是 soft OOM。
-- 1.7B Outer registry 当前为空；选择该档会在模型加载前明确报告 `pending_outer_v3_audit`。
+- 1.7B Outer registry 当前为空且组件状态仍为 `pending_outer_v3_audit`；完整 Boundary 链会先报告实际首个阻塞点 `pending_binary_scorer_audit`，待 Scorer v11 晋升后才进入 Outer 阶段。
 - 0.6B Boundary registry 当前为空；选择该档会在模型加载前明确报告 `pending_binary_retrain`。
 
 ---

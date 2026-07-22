@@ -14,20 +14,30 @@ from boundary.ja.proposal import load_boundary_proposal_checkpoint
 
 
 @pytest.mark.parametrize(
-    "loader,mapping",
+    "loader,checkpoint",
     [
         (
             load_speech_island_scorer_checkpoint,
-            qwen.DEFAULT_SPEECH_BOUNDARY_SCORER_CHECKPOINT_BY_REPO,
+            Path(
+                qwen.repo_checkpoint_path(
+                    qwen.QWEN_ASR_17B_REPO_ID,
+                    "speech_island_scorer",
+                    "v8",
+                )
+            ),
         ),
         (
             load_boundary_proposal_checkpoint,
-            qwen.DEFAULT_SPEECH_BOUNDARY_PROPOSAL_CHECKPOINT_BY_REPO,
+            Path(
+                qwen.DEFAULT_SPEECH_BOUNDARY_PROPOSAL_CHECKPOINT_BY_REPO[
+                    qwen.QWEN_ASR_17B_REPO_ID
+                ]
+            ),
         ),
     ],
 )
 def test_scorer_and_proposal_batching_preserves_order_and_probabilities(
-    loader, mapping
+    loader, checkpoint
 ) -> None:
     rng = np.random.default_rng(41)
     pairs = [
@@ -37,7 +47,6 @@ def test_scorer_and_proposal_batching_preserves_order_and_probabilities(
         )
         for frames in (5, 11, 7)
     ]
-    checkpoint = Path(mapping[qwen.QWEN_ASR_17B_REPO_ID])
     bundle = loader(checkpoint, device="cpu")
     batched = score_speech_island_probabilities_batch(bundle, feature_pairs=pairs)
     single = [
