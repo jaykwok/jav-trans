@@ -575,6 +575,22 @@ def _build_model(args: argparse.Namespace, config: dict[str, Any]):
     return CandidateIslandScorerNetwork(**config)
 
 
+def _restore_model_and_adamw_after_warmup(
+    model, optimizer, initial_state: dict[str, Any]
+) -> None:
+    """Restore a true step-zero state while retaining CUDA optimizer buffers."""
+    model.load_state_dict(initial_state, strict=True)
+    optimizer.zero_grad(set_to_none=True)
+    for state in optimizer.state.values():
+        for key, value in state.items():
+            if hasattr(value, "zero_"):
+                value.zero_()
+            elif key == "step":
+                state[key] = 0
+            else:
+                raise TypeError(f"unsupported AdamW warmup state: {key}={type(value)!r}")
+
+
 def _cuda_warmup_rows(
     rows: Sequence[dict[str, Any]], *, max_padded_frames: int
 ) -> list[dict[str, Any]]:
@@ -724,17 +740,20 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         if args.variant == "heatmap_aux"
         else str(capacity["schema"])
     )
+    model = _build_model(args, config).to(device)
+    optimizer = torch.optim.AdamW(
+        model.parameters(), lr=float(args.learning_rate), weight_decay=float(args.weight_decay)
+    )
     if device.type == "cuda":
         # WDDM reports a small, stable shared-memory allocation when CUDA and
-        # Mamba create their execution context. Establish the process baseline
-        # only after a representative temporary forward/backward/AdamW step.
-        # Any growth during the real training run remains an immediate soft OOM.
-        warmup_model = _build_model(args, config).to(device)
-        warmup_optimizer = torch.optim.AdamW(
-            warmup_model.parameters(),
-            lr=float(args.learning_rate),
-            weight_decay=float(args.weight_decay),
-        )
+        # Mamba create their execution context. Warm the actual model and AdamW
+        # buffers, then restore exact step-zero weights/state before setting the
+        # execution baseline. Building a disposable second model fragments the
+        # 8GB WDDM allocator and can itself induce shared-VRAM spill later.
+        initial_state = {
+            key: value.detach().cpu().clone()
+            for key, value in model.state_dict().items()
+        }
         warmup_rows = _cuda_warmup_rows(
             supervised_by_partition["train"],
             max_padded_frames=int(args.max_padded_frames),
@@ -743,19 +762,19 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             [load_candidate_window(row, cache) for row in warmup_rows], torch, device
         )
         warmup_loss, *_warmup_outputs = _loss(
-            warmup_model,
+            model,
             warmup_batch,
             variant=args.variant,
             heatmap_weight=float(args.heatmap_weight),
             torch=torch,
         )
-        warmup_optimizer.zero_grad(set_to_none=True)
+        optimizer.zero_grad(set_to_none=True)
         warmup_loss.backward()
         if float(args.gradient_clip_norm) > 0.0:
             torch.nn.utils.clip_grad_norm_(
-                warmup_model.parameters(), float(args.gradient_clip_norm)
+                model.parameters(), float(args.gradient_clip_norm)
             )
-        warmup_optimizer.step()
+        optimizer.step()
         torch.cuda.synchronize(device)
         if int(torch.cuda.memory_reserved(device)) > int(
             gpu_budget["physical_budget_bytes"]
@@ -763,12 +782,12 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             raise MemoryError("Scorer v11 CUDA warmup exceeded the 95% VRAM budget")
         if int(process.memory_info().rss) > physical_ram_budget:
             raise MemoryError("Scorer v11 CUDA warmup exceeded the 95% RAM budget")
+        _restore_model_and_adamw_after_warmup(model, optimizer, initial_state)
         del (
+            initial_state,
             warmup_batch,
             warmup_loss,
             _warmup_outputs,
-            warmup_optimizer,
-            warmup_model,
             warmup_rows,
         )
         gc.collect()
@@ -788,11 +807,6 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             }
         )
 
-    model = _build_model(args, config)
-    model.to(device)
-    optimizer = torch.optim.AdamW(
-        model.parameters(), lr=float(args.learning_rate), weight_decay=float(args.weight_decay)
-    )
     training_steps = 0
     training_losses: list[float] = []
     output_dir = Path(args.output_dir)

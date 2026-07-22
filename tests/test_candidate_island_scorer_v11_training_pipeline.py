@@ -33,6 +33,7 @@ from tools.boundary.ja.train_candidate_island_scorer_v11 import (
     _pack_batches,
     _plan_training_batches,
     _resolve_training_device,
+    _restore_model_and_adamw_after_warmup,
     run as train,
 )
 
@@ -522,6 +523,45 @@ def test_v11_cuda_warmup_uses_longest_budgeted_batch() -> None:
 
     assert [row["row_id"] for row in selected] == ["long-a", "long-b"]
     assert max(row["window_end_frame"] for row in selected) * len(selected) <= 2000
+
+
+def test_v11_actual_model_warmup_restores_fresh_adamw_step_zero() -> None:
+    torch = pytest.importorskip("torch")
+    torch.manual_seed(117)
+    warmed = torch.nn.Linear(4, 2)
+    initial_state = {
+        key: value.detach().clone() for key, value in warmed.state_dict().items()
+    }
+    fresh = torch.nn.Linear(4, 2)
+    fresh.load_state_dict(initial_state)
+    warmed_optimizer = torch.optim.AdamW(warmed.parameters(), lr=1e-3, weight_decay=1e-4)
+    fresh_optimizer = torch.optim.AdamW(fresh.parameters(), lr=1e-3, weight_decay=1e-4)
+    warmup_input = torch.arange(12, dtype=torch.float32).reshape(3, 4)
+    warmup_loss = warmed(warmup_input).square().mean()
+    warmup_loss.backward()
+    warmed_optimizer.step()
+
+    _restore_model_and_adamw_after_warmup(warmed, warmed_optimizer, initial_state)
+
+    assert all(
+        bool(torch.count_nonzero(value) == 0)
+        for state in warmed_optimizer.state.values()
+        for value in state.values()
+        if torch.is_tensor(value)
+    )
+    actual_input = torch.linspace(-1.0, 1.0, 20).reshape(5, 4)
+    for model, optimizer in (
+        (warmed, warmed_optimizer),
+        (fresh, fresh_optimizer),
+    ):
+        optimizer.zero_grad(set_to_none=True)
+        loss = model(actual_input).square().mean()
+        loss.backward()
+        optimizer.step()
+    for warmed_parameter, fresh_parameter in zip(
+        warmed.parameters(), fresh.parameters(), strict=True
+    ):
+        torch.testing.assert_close(warmed_parameter, fresh_parameter, rtol=0.0, atol=0.0)
 
 
 def test_v11_planned_batches_match_legacy_seeded_epoch_order() -> None:
