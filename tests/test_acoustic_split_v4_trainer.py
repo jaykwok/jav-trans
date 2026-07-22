@@ -1,8 +1,9 @@
 from __future__ import annotations
 
+from pathlib import Path
+
 import numpy as np
 import pytest
-from pathlib import Path
 
 from tools.boundary.ja.train_acoustic_split_v4_model import (
     _classification_metrics,
@@ -11,6 +12,15 @@ from tools.boundary.ja.train_acoustic_split_v4_model import (
     gate_passes,
     partition_group_names,
 )
+
+
+def test_split_v4_audit_tools_import_current_shared_pad_batch() -> None:
+    from tools.audits import generate_split_v4_binary_gate_audit_html as audit_tool
+    from tools.boundary.ja import evaluate_split_v4_manual_overrides as override_tool
+    from tools.boundary.ja.acoustic_split_v4_dataset import pad_batch
+
+    assert audit_tool.pad_batch is pad_batch
+    assert override_tool.pad_batch is pad_batch
 
 
 def test_manual_overrides_keep_unsure_as_ignore_and_consume_holdout(tmp_path: Path) -> None:

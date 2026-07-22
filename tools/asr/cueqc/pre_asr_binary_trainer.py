@@ -540,54 +540,6 @@ def _sample_balanced_anchors(
     return torch.stack(anchors, dim=0)
 
 
-def _window_batch(
-    *,
-    group_ids: Any,
-    ptm_bins: Any,
-    scalar: Any,
-    chunk_mask: Any,
-    bin_mask: Any,
-    y: Any,
-    sequence_window_size: int,
-) -> tuple[Any, Any, Any, Any, Any]:
-    if sequence_window_size <= 0 or int(ptm_bins.shape[1]) <= sequence_window_size:
-        return (
-            ptm_bins[group_ids],
-            scalar[group_ids],
-            chunk_mask[group_ids],
-            bin_mask[group_ids],
-            y[group_ids],
-        )
-    import torch
-
-    window = min(int(sequence_window_size), int(ptm_bins.shape[1]))
-    ptm_rows = []
-    scalar_rows = []
-    chunk_mask_rows = []
-    bin_mask_rows = []
-    y_rows = []
-    for raw_group_id in group_ids.detach().cpu().tolist():
-        group_id = int(raw_group_id)
-        length = int(chunk_mask[group_id].sum().detach().cpu().item())
-        if length <= window:
-            start = 0
-        else:
-            start = int(torch.randint(0, length - window + 1, (1,), device=group_ids.device).item())
-        end = start + window
-        ptm_rows.append(ptm_bins[group_id, start:end])
-        scalar_rows.append(scalar[group_id, start:end])
-        chunk_mask_rows.append(chunk_mask[group_id, start:end])
-        bin_mask_rows.append(bin_mask[group_id, start:end])
-        y_rows.append(y[group_id, start:end])
-    return (
-        torch.stack(ptm_rows, dim=0),
-        torch.stack(scalar_rows, dim=0),
-        torch.stack(chunk_mask_rows, dim=0),
-        torch.stack(bin_mask_rows, dim=0),
-        torch.stack(y_rows, dim=0),
-    )
-
-
 def _window_batch_from_anchors(
     *,
     anchor_positions: Any,

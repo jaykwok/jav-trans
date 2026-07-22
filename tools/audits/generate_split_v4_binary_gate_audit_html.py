@@ -18,13 +18,13 @@ for root in (PROJECT_ROOT, SRC_ROOT):
 
 from boundary.split_model import load_acoustic_split_v4_planner  # noqa: E402
 from tools.boundary.ja.train_acoustic_split_v4_model import (  # noqa: E402
-    _pad_batch,
     apply_manual_label_overrides,
-    island_batches,
     partition_group_names,
 )
 from tools.boundary.ja.acoustic_split_v4_dataset import (  # noqa: E402
+    island_batches,
     load_island_dataset,
+    pad_batch,
 )
 from tools.audits.audit_nav import update_audit_entrypoints  # noqa: E402
 
@@ -86,7 +86,7 @@ def build(args: argparse.Namespace) -> dict:
             batch_islands=args.batch_islands,
             max_batch_candidates=args.max_batch_candidates,
         ):
-            frames, scalars, mask, labels, *_ = _pad_batch(
+            frames, scalars, mask, labels, *_ = pad_batch(
                 data,
                 batch,
                 frame_mean=normalization["frame_mean"],

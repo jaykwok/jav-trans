@@ -16,8 +16,10 @@ for root in (PROJECT_ROOT, SRC_ROOT):
         sys.path.insert(0, str(root))
 
 from boundary.split_model import load_acoustic_split_v4_planner  # noqa: E402
-from tools.boundary.ja.train_acoustic_split_v4_model import _pad_batch  # noqa: E402
-from tools.boundary.ja.acoustic_split_v4_dataset import load_island_dataset  # noqa: E402
+from tools.boundary.ja.acoustic_split_v4_dataset import (  # noqa: E402
+    load_island_dataset,
+    pad_batch,
+)
 
 
 def _rows(path: Path) -> list[dict]:
@@ -40,7 +42,7 @@ def evaluate(args: argparse.Namespace) -> dict:
     norm = {key: np.asarray(value, dtype=np.float32) for key, value in planner.normalization.items()}
     output_rows: list[dict] = []
     with torch.inference_mode():
-        frames, scalars, mask, *_ = _pad_batch(
+        frames, scalars, mask, *_ = pad_batch(
             data, groups,
             frame_mean=norm["frame_mean"], frame_std=norm["frame_std"],
             scalar_mean=norm["scalar_mean"], scalar_std=norm["scalar_std"],

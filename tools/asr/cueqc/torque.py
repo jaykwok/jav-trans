@@ -14,7 +14,7 @@ License: CC BY-NC-SA 4.0 (academic and research use only; commercial use
 prohibited). Attribution to Jie Yang is retained here and in the project
 docs/HISTORY.md. The upstream MATLAB/.p core is obfuscated; this module reproduces
 the algorithmic behaviour documented in the paper and the readable helpers
-(mindisttwinsloc / ps2psdist / Qac / inipd) shipped alongside it.
+   (mindisttwinsloc / inipd) shipped alongside it.
 
 Dependencies: numpy and scipy.
 """
@@ -31,18 +31,6 @@ from scipy.sparse.csgraph import connected_components
 # Helpers (direct translations of the readable MATLAB sub-functions)
 # ---------------------------------------------------------------------------
 
-def _ps2psdist(loc1: np.ndarray, loc2: np.ndarray, dm: sp.spmatrix | np.ndarray) -> float:
-    """Minimum pairwise distance between two point sets (MATLAB ps2psdist)."""
-    loc1 = np.asarray(loc1, dtype=np.intp)
-    loc2 = np.asarray(loc2, dtype=np.intp)
-    if loc1.size == 0 or loc2.size == 0:
-        return float("inf")
-    sub = dm[np.ix_(loc1, loc2)]
-    if sp.issparse(sub):
-        sub = sub.toarray()
-    return float(np.min(sub))
-
-
 def _mindisttwinsloc(loc1: np.ndarray, loc2: np.ndarray, dm: sp.spmatrix | np.ndarray):
     """Indices (within loc1, loc2) of the minimum-distance cross pair."""
     loc1 = np.asarray(loc1, dtype=np.intp)
@@ -53,18 +41,6 @@ def _mindisttwinsloc(loc1: np.ndarray, loc2: np.ndarray, dm: sp.spmatrix | np.nd
     flat = int(np.argmin(sub))
     a, b = np.unravel_index(flat, sub.shape)
     return int(loc1[a]), int(loc2[b])
-
-
-def _qac(sort_p: np.ndarray) -> np.ndarray:
-    """Successive ratio vector used by Nab_dec (MATLAB Qac)."""
-    n = len(sort_p)
-    ind = np.zeros(n, dtype=np.float64)
-    if n > 1:
-        denom = sort_p[1:].copy()
-        safe = np.where(denom == 0.0, np.nan, denom)
-        ind[: n - 1] = sort_p[: n - 1] / safe
-    ind[n - 1] = np.nan
-    return ind
 
 
 def _unique_z(z: np.ndarray, ljmat: sp.spmatrix):

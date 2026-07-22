@@ -129,17 +129,6 @@ def _load_existing_manifest(path: Path) -> tuple[set[int], Counter[str], int]:
     return label_indexes, label_quality_counts, count
 
 
-def _count_jsonl_rows(path: Path) -> int:
-    if not path.exists():
-        return 0
-    count = 0
-    with path.open("r", encoding="utf-8") as handle:
-        for line in handle:
-            if line.strip():
-                count += 1
-    return count
-
-
 def _count_unresolved_error_rows(path: Path, resolved_label_indexes: set[int]) -> int:
     if not path.exists():
         return 0

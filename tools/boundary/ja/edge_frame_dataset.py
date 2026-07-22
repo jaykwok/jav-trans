@@ -26,25 +26,6 @@ def load_edge_row(row: dict) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     return features, targets[:total], weights[:total]
 
 
-def edge_normalization(rows: list[dict]) -> dict[str, list[float]]:
-    first, _labels, _weights = load_edge_row(rows[0])
-    feature_sum = np.zeros(first.shape[1], dtype=np.float64)
-    square_sum = np.zeros(first.shape[1], dtype=np.float64)
-    weight_sum = 0.0
-    for row in rows:
-        features, _labels, weights = load_edge_row(row)
-        weight = weights.reshape(-1, 1).astype(np.float64)
-        feature_sum += (features * weight).sum(axis=0)
-        square_sum += (np.square(features) * weight).sum(axis=0)
-        weight_sum += float(weight.sum())
-    mean = feature_sum / max(weight_sum, 1e-6)
-    variance = square_sum / max(weight_sum, 1e-6) - np.square(mean)
-    return {
-        "feature_mean": mean.astype(np.float32).tolist(),
-        "feature_std": np.sqrt(np.maximum(variance, 1e-6)).astype(np.float32).tolist(),
-    }
-
-
 def normalize_edge_features(features: np.ndarray, normalization: dict) -> np.ndarray:
     mean = np.asarray(normalization["feature_mean"], dtype=np.float32)
     std = np.asarray(normalization["feature_std"], dtype=np.float32)

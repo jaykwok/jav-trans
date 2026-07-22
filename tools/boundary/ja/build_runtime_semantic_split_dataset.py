@@ -1,4 +1,11 @@
 #!/usr/bin/env python3
+"""Reproduce the retired v8/v10 Scorer-to-Split dataset path for offline audits.
+
+This CLI intentionally retains threshold/hysteresis decoding so historical Split
+datasets can be inspected.  It is not compatible with the production Scorer v11
+candidate-membership contract and must not be used to build new training data.
+"""
+
 from __future__ import annotations
 
 import argparse
@@ -679,8 +686,8 @@ def run(args: argparse.Namespace) -> None:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Build Semantic Split data only from the current runtime Scorer's real "
-            "weak-cut proposals and exact runtime candidate features."
+            "Offline-only reconstruction of retired v8/v10 Scorer weak-cut "
+            "proposals and historical Split candidate features."
         )
     )
     parser.add_argument("--labels", required=True)

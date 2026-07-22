@@ -62,28 +62,8 @@ def write_jsonl(path: Path, rows: Iterable[Mapping[str, Any]]) -> int:
     return count
 
 
-def _dot(left: list[float], right: list[float]) -> float:
-    return sum(a * b for a, b in zip(left, right))
-
-
-def _norm(vec: list[float]) -> float:
-    return math.sqrt(sum(value * value for value in vec)) or 1.0
-
-
 def _euclidean_distance(left: list[float], right: list[float]) -> float:
     return math.sqrt(sum((a - b) ** 2 for a, b in zip(left, right)))
-
-
-def _cosine_distance(left: list[float], right: list[float]) -> float:
-    return 1.0 - (_dot(left, right) / (_norm(left) * _norm(right)))
-
-
-def _distance(left: list[float], right: list[float], metric: str) -> float:
-    if metric == "cosine":
-        return _cosine_distance(left, right)
-    if metric == "euclidean":
-        return _euclidean_distance(left, right)
-    raise ValueError(f"unsupported metric: {metric}")
 
 
 def _l2_normalize_matrix(matrix: Sequence[Sequence[float]]) -> list[list[float]]:

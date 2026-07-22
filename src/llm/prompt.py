@@ -53,20 +53,6 @@ def _serialize_segments(
     return json.dumps(payload, ensure_ascii=False, indent=2)
 
 
-def _build_full_segments_summary(segments: list[dict], *, limit_chars: int = 1800) -> str:
-    lines = []
-    for idx, seg in enumerate(segments):
-        start = _safe_float(seg.get("start"))
-        text = _normalize_source_text(seg.get("text", ""))
-        if not text:
-            continue
-        lines.append(f"{idx}: {start:.2f}s {text}")
-    summary = "\n".join(lines)
-    if len(summary) > limit_chars:
-        return summary[:limit_chars].rstrip() + "\n..."
-    return summary
-
-
 _SYSTEM_PROMPT_FULL = (
     "你是专业的日语成人视频字幕翻译，目标语言是{target_lang}。\n"
     "翻译风格随场景自适应，不要给全片套同一种腔调：\n"
@@ -255,8 +241,7 @@ def _build_batch_messages(
         )
         return messages
 
-    # full_segments_summary is always a str at the call sites; the previous
-    # list-handling fallback (_build_full_segments_summary) was unreachable.
+    # Callers provide the already bounded full-source summary as a string.
     summary = full_segments_summary
     effective_target_lang = (target_lang or "简体中文").strip() or "简体中文"
 

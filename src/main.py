@@ -94,13 +94,6 @@ def _env_int(name: str, default: int) -> int:
         return default
 
 
-def _ctx_value(ctx: JobContext, name: str, default: str = "") -> str:
-    raw = ctx.advanced.get(name)
-    if raw is not None:
-        return raw.strip()
-    return os.getenv(name, default).strip()
-
-
 def _ctx_flag(ctx: JobContext, name: str, default: bool = False) -> bool:
     raw = ctx.advanced.get(name)
     if raw is not None:

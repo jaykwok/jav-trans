@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+from pathlib import Path
+
 import numpy as np
 import pytest
+import boundary.ja as boundary_ja
 
 from boundary.ja.backend import (
     SpeechBoundaryJaBackend,
@@ -165,6 +168,33 @@ def test_v8_threshold_scorer_is_audit_only_for_current_runtime() -> None:
 
     with pytest.raises(RuntimeError, match="pending_binary_scorer_audit"):
         require_current_runtime_scorer(_V10Candidate())
+
+
+def test_boundary_ja_package_does_not_export_retired_v8_v9_training_surface() -> None:
+    retired = {
+        "SPEECH_ISLAND_SCORER_V8_SCHEMA",
+        "SPEECH_ISLAND_SCORER_SCHEMA",
+        "SpeechIslandTrainConfig",
+        "SpeechIslandTrainMetrics",
+        "TinyFrameClassifier",
+        "score_semantic_speech_outputs",
+        "score_speech_island_probabilities",
+        "train_speech_island_scorer",
+    }
+    assert not (retired & set(boundary_ja.__all__))
+    assert all(not hasattr(boundary_ja, name) for name in retired)
+
+
+def test_retired_dual_head_and_threshold_metric_tools_are_absent() -> None:
+    root = Path(__file__).resolve().parents[1]
+    retired_paths = (
+        root / "src" / "boundary" / "ja" / "dual_head.py",
+        root / "tools" / "boundary" / "ja" / "gate_speech_proposal_dual_head.py",
+        root / "tools" / "boundary" / "ja" / "speech_recall_metrics.py",
+        root / "src" / "audio" / "audio_metrics.py",
+        root / "tests" / "test_gate_speech_proposal_dual_head.py",
+    )
+    assert all(not path.exists() for path in retired_paths)
 
 
 def test_boundary_explicit_cuda_request_never_falls_back_to_cpu(monkeypatch) -> None:
