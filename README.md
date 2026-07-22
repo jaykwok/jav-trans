@@ -181,7 +181,7 @@ src/checkpoints/
 
 1.7B 的目标 Boundary pipeline 统一使用合同 `boundary_acoustic_binary_v12`：Scorer v11 → Proposal v1 → Outer v3 → Acoustic Split v4 → provisional sub-islands → CueQC v13 → Inner v2 acoustic core → Chunk/ASR。Outer v3 必须等实际 post-Scorer-v11 输出分布训练并通过人工 gate 后才可注册；模型缺失、repo 不匹配、合同不兼容或选择 0.6B 都会直接报错，不提供规则 fallback 或静默迁移。实验指标与版本决策见 [docs/HISTORY.md](docs/HISTORY.md)。
 
-当前训练数据状态：完整 1.7B 链尚不可直接重训。Scorer v11 的 strict canonical/raw-feature/window/trainer 闭环已经存在，但正式 compile 仍要求补齐 125 条 train source 的 current-duty v11 全源真值，并重新提取真实 source raw PTM2048；旧 PTM128 cache 会被拒绝。Proposal v1历史训练产物不可复现，Outer v3缺真实 post-Scorer-v11数据 compiler；Split v4、CueQC v13和Inner v2的现役权重只保留为旧链审计/运行参考，其训练 provenance不满足当前固定 source/core/partition合同。新的数据入口会拒绝 hash/随机重分区、重复 core、未批准 manifest、旧中央合同以及缺失或不匹配的上游 checkpoint SHA；不能通过修改 metadata或重新绑定旧权重绕过。完整证据与合法重训顺序见 [1.7B Boundary 训练数据生成链职责审计](docs/audits/20260722_boundary-training-data-generation-audit-v1.md)。
+当前训练数据状态：完整 1.7B 链尚不可直接重训，但 Scorer v11 当前职责 canonical 已闭合。train 使用不含重复/tile 的固定唯一 Galgame/NSFW core composite、孤立人声 candidate，以及仅由“Gemini outside + 1.7B ASR 空且无错误”确认的真实 outside；ASR 非空文本不等于语义，只会把区间保留为 `unsure=-100`。val/test 仍是人工完整 source 真值。当前还需针对新 canonical 重新提取 raw PTM2048、重编 window features、随机初始化训练并完成人工 gate；旧 PTM128 和旧 canonical cache 均拒绝。Proposal v1历史训练产物不可复现，Outer v3缺真实 post-Scorer-v11数据 compiler；Split v4、CueQC v13和Inner v2的现役权重只保留为旧链审计/运行参考，其训练 provenance不满足当前固定 source/core/partition合同。完整证据与合法重训顺序见 [1.7B Boundary 训练数据生成链职责审计](docs/audits/20260722_boundary-training-data-generation-audit-v1.md)。
 
 ---
 
@@ -193,10 +193,11 @@ src/checkpoints/
 - `OPENAI_COMPATIBILITY_BASE_URL`
 - `LLM_MODEL_NAME`
 
-离线音频多模态 teacher 工具使用独立的 provider-neutral 配置
-`~/.config/omni/.env`。常用键为 `OMNI_MODEL`、`OMNI_API_KEY` 和
-`OMNI_BASE_URL`；因此可在不改代码的情况下切换 Qwen Omni、Doubao
-SeedPro 等兼容音频输入的 OpenAI-compatible endpoint。
+离线音频多模态 teacher 工具使用独立配置 `~/.config/omni/gemini` 或
+`~/.config/omni/qwen`，CLI 通过 `--env-file gemini|qwen` 显式选择；默认
+Gemini，只有明确要求时使用 Qwen。常用键为 `OMNI_MODEL`、
+`OMNI_API_KEY` 和 `OMNI_BASE_URL`。新增 provider 时应先在源码中加入明确
+profile 与请求体映射，不接受任意 env 文件名静默猜测协议。
 - 代理协议 / 地址 / 端口（可选，用于模型下载和 HTTP 请求）
 
 ASR 显存自适应默认值已经内置。当前完整工作流固定使用 `1.7B`；batch 或显存预算可通过“参数调优”里的环境变量覆盖，或手动编辑首次保存后生成的 `.env`。

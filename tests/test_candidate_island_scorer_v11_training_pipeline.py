@@ -144,31 +144,71 @@ def _canonical_fixture(tmp_path: Path, *, provenance: str = "human_confirmed_vis
     source_path = tmp_path / "source_windows.jsonl"
     partition_path = tmp_path / "partition_manifest.jsonl"
     verdict_path = tmp_path / "manual_verdicts.jsonl"
+    real_train_outside_path = tmp_path / "real_train_outside_sources.jsonl"
     _write_jsonl(source_path, source_rows)
     _write_jsonl(partition_path, partition_rows)
     _write_jsonl(verdict_path, verdict_rows)
-    return synthetic_path, source_path, partition_path, verdict_path
+    train_source = next(row for row in source_rows if "-train-" in row["window_id"])
+    _write_jsonl(
+        real_train_outside_path,
+        [
+            {
+                "schema": "candidate_island_scorer_v11_real_train_outside_source_v1",
+                "boundary_serialization_contract_id": ACOUSTIC_BINARY_V12_CONTRACT.contract_id,
+                "source_id": train_source["window_id"],
+                "video_id": train_source["video_id"],
+                "partition": "train",
+                "input_distribution": "real_workflow_source_window_gemini_asr_masked_v1",
+                "synthetic_composite": False,
+                "audio": train_source["audio_wav"],
+                "audio_sha256": train_source["audio_wav_sha256"],
+                "duration_s": frame_count * 0.02,
+                "frame_count": frame_count,
+                "frame_hop_s": 0.02,
+                "core_ids": [f"real-train-outside-source::{train_source['window_id']}"],
+                "canonical_spans": [
+                    {"label": "outside_candidate", "start_frame": 0, "end_frame": 3},
+                    {"label": "unsure", "start_frame": 3, "end_frame": 8},
+                ],
+                "annotation_provenance": "gemini_outside_complement_plus_1p7b_asr_empty_v1",
+                "gemini_output_used_as_inside_truth": False,
+                "asr_text_used_as_inside_truth": False,
+                "asr_empty_used_without_gemini_outside": False,
+                "unsure_training_label": -100,
+                "training_manifest_allowed": True,
+            }
+        ],
+    )
+    return (
+        synthetic_path,
+        real_train_outside_path,
+        source_path,
+        partition_path,
+        verdict_path,
+    )
 
 
 def test_v11_canonical_requires_all_human_full_source_truth(tmp_path: Path) -> None:
-    synthetic_path, source_path, partition_path, verdict_path = _canonical_fixture(tmp_path)
+    synthetic_path, real_train_path, source_path, partition_path, verdict_path = _canonical_fixture(tmp_path)
     partial = tmp_path / "partial.jsonl"
     partial.write_text(verdict_path.read_text(encoding="utf-8").splitlines()[0] + "\n", encoding="utf-8")
     with pytest.raises(ValueError, match="full-source truth for every frozen source"):
         compile_canonical(
             synthetic_train_sources=synthetic_path,
+            real_train_outside_sources=real_train_path,
             source_windows=source_path,
             partition_manifest=partition_path,
             manual_verdicts=[partial],
             output_dir=tmp_path / "partial-output",
         )
 
-    omni_synthetic, omni_source, omni_partition, omni_verdict = _canonical_fixture(
+    omni_synthetic, omni_real_train, omni_source, omni_partition, omni_verdict = _canonical_fixture(
         tmp_path / "omni", provenance="omni:qwen3.5-omni-plus"
     )
     with pytest.raises(ValueError, match="Omni-only"):
         compile_canonical(
             synthetic_train_sources=omni_synthetic,
+            real_train_outside_sources=omni_real_train,
             source_windows=omni_source,
             partition_manifest=omni_partition,
             manual_verdicts=[omni_verdict],
@@ -177,7 +217,7 @@ def test_v11_canonical_requires_all_human_full_source_truth(tmp_path: Path) -> N
 
 
 def test_v11_canonical_requires_train_only_unique_synthetic_cores(tmp_path: Path) -> None:
-    synthetic_path, source_path, partition_path, verdict_path = _canonical_fixture(tmp_path)
+    synthetic_path, real_train_path, source_path, partition_path, verdict_path = _canonical_fixture(tmp_path)
     rows = [json.loads(line) for line in synthetic_path.read_text(encoding="utf-8").splitlines()]
     rows[0]["partition"] = "val"
     invalid_partition = tmp_path / "synthetic-val.jsonl"
@@ -185,6 +225,7 @@ def test_v11_canonical_requires_train_only_unique_synthetic_cores(tmp_path: Path
     with pytest.raises(ValueError, match="not train-only"):
         compile_canonical(
             synthetic_train_sources=invalid_partition,
+            real_train_outside_sources=real_train_path,
             source_windows=source_path,
             partition_manifest=partition_path,
             manual_verdicts=[verdict_path],
@@ -199,6 +240,7 @@ def test_v11_canonical_requires_train_only_unique_synthetic_cores(tmp_path: Path
     with pytest.raises(ValueError, match="core identity is reused"):
         compile_canonical(
             synthetic_train_sources=duplicate_core,
+            real_train_outside_sources=real_train_path,
             source_windows=source_path,
             partition_manifest=partition_path,
             manual_verdicts=[verdict_path],
@@ -206,8 +248,25 @@ def test_v11_canonical_requires_train_only_unique_synthetic_cores(tmp_path: Path
         )
 
 
+def test_v11_canonical_rejects_gemini_inside_as_real_train_truth(tmp_path: Path) -> None:
+    synthetic_path, real_train_path, source_path, partition_path, verdict_path = _canonical_fixture(tmp_path)
+    rows = [json.loads(line) for line in real_train_path.read_text(encoding="utf-8").splitlines()]
+    rows[0]["gemini_output_used_as_inside_truth"] = True
+    invalid = tmp_path / "gemini-inside-truth.jsonl"
+    _write_jsonl(invalid, rows)
+    with pytest.raises(ValueError, match="Gemini inside"):
+        compile_canonical(
+            synthetic_train_sources=synthetic_path,
+            real_train_outside_sources=invalid,
+            source_windows=source_path,
+            partition_manifest=partition_path,
+            manual_verdicts=[verdict_path],
+            output_dir=tmp_path / "gemini-inside-output",
+        )
+
+
 def test_v11_canonical_clips_unavailable_review_grid_tail_to_wav(tmp_path: Path) -> None:
-    synthetic_path, source_path, partition_path, verdict_path = _canonical_fixture(
+    synthetic_path, real_train_path, source_path, partition_path, verdict_path = _canonical_fixture(
         tmp_path
     )
     source_rows = [
@@ -222,6 +281,7 @@ def test_v11_canonical_clips_unavailable_review_grid_tail_to_wav(tmp_path: Path)
 
     summary = compile_canonical(
         synthetic_train_sources=synthetic_path,
+        real_train_outside_sources=real_train_path,
         source_windows=source_path,
         partition_manifest=partition_path,
         manual_verdicts=[verdict_path],
@@ -249,11 +309,47 @@ def test_v11_canonical_clips_unavailable_review_grid_tail_to_wav(tmp_path: Path)
         "trim_unavailable_review_grid_tail_to_decoded_audio_v1"
     )
 
+
+def test_v11_real_train_ignores_only_subframe_audio_tail(tmp_path: Path) -> None:
+    synthetic_path, real_train_path, source_path, partition_path, verdict_path = _canonical_fixture(tmp_path)
+    source_rows = [json.loads(line) for line in source_path.read_text(encoding="utf-8").splitlines()]
+    real_rows = [json.loads(line) for line in real_train_path.read_text(encoding="utf-8").splitlines()]
+    train_source = next(row for row in source_rows if "-train-" in row["window_id"])
+    train_audio = Path(train_source["audio_wav"])
+    with wave.open(str(train_audio), "wb") as handle:
+        handle.setnchannels(1)
+        handle.setsampwidth(2)
+        handle.setframerate(16000)
+        handle.writeframes(b"\0\0" * (8 * 320 + 5))
+    digest = _sha256(train_audio)
+    train_source["audio_wav_sha256"] = digest
+    real_rows[0]["audio_sha256"] = digest
+    _write_jsonl(source_path, source_rows)
+    _write_jsonl(real_train_path, real_rows)
+
+    summary = compile_canonical(
+        synthetic_train_sources=synthetic_path,
+        real_train_outside_sources=real_train_path,
+        source_windows=source_path,
+        partition_manifest=partition_path,
+        manual_verdicts=[verdict_path],
+        output_dir=tmp_path / "subframe-tail-canonical",
+    )
+    rows = [
+        json.loads(line)
+        for line in Path(summary["canonical_sources"]).read_text(encoding="utf-8").splitlines()
+    ]
+    real = next(row for row in rows if row["source_id"] == "video-train-w00")
+    assert real["frame_count"] == real["reviewed_nominal_frame_count"] == 8
+    assert real["audio_sample_count"] == 8 * 320 + 5
+    assert real["audio_geometry_policy"] == "exact_or_subframe_audio_tail_ignored_v1"
+
 def test_v11_feature_compile_and_random_init_cpu_smoke(tmp_path: Path) -> None:
     pytest.importorskip("torch")
-    synthetic_path, source_path, partition_path, verdict_path = _canonical_fixture(tmp_path)
+    synthetic_path, real_train_path, source_path, partition_path, verdict_path = _canonical_fixture(tmp_path)
     canonical_summary = compile_canonical(
         synthetic_train_sources=synthetic_path,
+        real_train_outside_sources=real_train_path,
         source_windows=source_path,
         partition_manifest=partition_path,
         manual_verdicts=[verdict_path],
@@ -296,11 +392,14 @@ def test_v11_feature_compile_and_random_init_cpu_smoke(tmp_path: Path) -> None:
         raw_feature_manifest=raw_manifest,
         output_dir=tmp_path / "features",
     )
-    assert feature_summary["partition_window_counts"] == {"test": 1, "train": 1, "val": 1}
+    assert feature_summary["partition_window_counts"] == {"test": 1, "train": 2, "val": 1}
     label_path = tmp_path / "features" / "source_labels" / "synthetic-train.npz"
     with np.load(label_path, allow_pickle=False) as labels:
         assert labels["training_labels"].tolist() == [0, 0, 1, 1, 1, 1, 0, 0]
         assert labels["boundary_valid"].tolist()[5] is True
+    real_label_path = tmp_path / "features" / "source_labels" / "video-train-w00.npz"
+    with np.load(real_label_path, allow_pickle=False) as labels:
+        assert labels["training_labels"].tolist() == [0, 0, 0, -100, -100, -100, -100, -100]
 
     args = argparse.Namespace(
         dataset_manifest=feature_summary["dataset_manifest"],
@@ -346,9 +445,10 @@ def test_v11_feature_compile_and_random_init_cpu_smoke(tmp_path: Path) -> None:
 
 
 def test_v11_feature_compile_rejects_projected_ptm128(tmp_path: Path) -> None:
-    synthetic_path, source_path, partition_path, verdict_path = _canonical_fixture(tmp_path)
+    synthetic_path, real_train_path, source_path, partition_path, verdict_path = _canonical_fixture(tmp_path)
     canonical_summary = compile_canonical(
         synthetic_train_sources=synthetic_path,
+        real_train_outside_sources=real_train_path,
         source_windows=source_path,
         partition_manifest=partition_path,
         manual_verdicts=[verdict_path],

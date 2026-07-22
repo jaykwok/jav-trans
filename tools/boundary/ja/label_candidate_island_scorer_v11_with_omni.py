@@ -119,7 +119,12 @@ def _spans(parsed: Mapping[str, Any], *, duration_s: float) -> tuple[list[dict[s
             raise ValueError(f"island {index} is not an object")
         start = float(raw.get("start_s")); end = float(raw.get("end_s"))
         if not 0.0 <= start < end <= duration_s or start < previous_end:
-            raise ValueError(f"island {index} has invalid ordered coordinates")
+            raise ValueError(
+                f"island {index} has invalid local-source coordinates: "
+                f"start_s={start}, end_s={end}, previous_end_s={previous_end}, "
+                f"required_range=0..{duration_s}; use this 0-based audio clip timeline, "
+                "never timestamps from the original video"
+            )
         previous_end = end
         islands.append({"label": "inside_candidate", "start_s": start, "end_s": end, "start_frame": round(start / FRAME_HOP_S), "end_frame": round(end / FRAME_HOP_S), "confidence": _number(raw.get("confidence", 0.0), name="island confidence"), "reason": str(raw.get("reason") or "")})
     unsure: list[dict[str, Any]] = []
@@ -129,7 +134,12 @@ def _spans(parsed: Mapping[str, Any], *, duration_s: float) -> tuple[list[dict[s
             raise ValueError(f"unsure span {index} is not an object")
         start = float(raw.get("start_s")); end = float(raw.get("end_s"))
         if not 0.0 <= start < end <= duration_s or start < previous_end:
-            raise ValueError(f"unsure span {index} has invalid ordered coordinates")
+            raise ValueError(
+                f"unsure span {index} has invalid local-source coordinates: "
+                f"start_s={start}, end_s={end}, previous_end_s={previous_end}, "
+                f"required_range=0..{duration_s}; use this 0-based audio clip timeline, "
+                "never timestamps from the original video"
+            )
         previous_end = end
         unsure.append({"label": "unsure", "start_s": start, "end_s": end, "start_frame": round(start / FRAME_HOP_S), "end_frame": round(end / FRAME_HOP_S), "reason": str(raw.get("reason") or "")})
     return islands, unsure
@@ -198,7 +208,46 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 if attempt < args.max_attempts:
                     time.sleep(min(8.0, float(attempt)))
         if last_error is not None:
-            raise RuntimeError(f"candidate-island teacher failed for {source_id}: {last_error}") from last_error
+            duration_s = float(row["duration_s"])
+            frame_count = int(row.get("frame_count") or round(duration_s / FRAME_HOP_S))
+            label = {
+                "schema": SCHEMA,
+                "prompt_version": PROMPT_VERSION,
+                "source_id": source_id,
+                "partition": str(row.get("partition") or ""),
+                "frame_count": frame_count,
+                "frame_hop_s": FRAME_HOP_S,
+                "audio": str(row["audio"]),
+                "audio_sha256": str(row.get("audio_sha256") or _sha256(audio)),
+                "model": model,
+                "base_url_host": base_url.split("/", 3)[2] if "://" in base_url else base_url,
+                "env_file_name": profile_name,
+                "overall_confidence": 0.0,
+                "overall_reason": f"teacher validation failed closed: {type(last_error).__name__}: {last_error}",
+                "islands": [],
+                "unsure_spans": [{
+                    "label": "unsure",
+                    "start_s": 0.0,
+                    "end_s": duration_s,
+                    "start_frame": 0,
+                    "end_frame": frame_count,
+                    "reason": "teacher request failed validation; exclude the whole source from outside truth",
+                }],
+                "reviewed_full_source": False,
+                "preaudit_provenance": f"omni:{model}:validation_failure",
+                "human_review_required": True,
+                "training_manifest_allowed": False,
+                "teacher_failed_closed": True,
+                "attempts": args.max_attempts,
+            }
+            with labels_path.open("a", encoding="utf-8") as handle:
+                handle.write(json.dumps(label, ensure_ascii=False, sort_keys=True) + "\n")
+            existing[source_id] = label
+            print(
+                f"omni_candidate_island={len(existing)}/{len(rows)} provider={profile_name} "
+                f"source_id={source_id} failed_closed_unsure=1",
+                flush=True,
+            )
         if index < len(pending) and args.request_interval_s > 0:
             time.sleep(args.request_interval_s)
     result_rows = _rows(labels_path)

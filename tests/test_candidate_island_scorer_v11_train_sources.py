@@ -43,7 +43,7 @@ def _args(
         outside_consensus_manifest=str(outside_consensus),
         output_dir=str(output),
         vocal_source_count=1,
-        outside_control_count=1,
+        outside_control_count=0,
         max_semantic_sources=None,
         seed=117,
     )
@@ -58,7 +58,7 @@ def test_build_v11_train_sources_preserves_candidate_and_brackets_outside(tmp_pa
     _write_wav(candidate, 1600)
     _write_wav(core_a, 320)
     _write_wav(core_b, 320)
-    _write_wav(outside, 32000)
+    _write_wav(outside, 640)
     _write_wav(vocal, 640)
     source_manifest = tmp_path / "composites.jsonl"
     _write_jsonl(
@@ -190,11 +190,10 @@ def test_build_v11_train_sources_preserves_candidate_and_brackets_outside(tmp_pa
     manifest = Path(summary["synthetic_train_sources"])
     rows = [json.loads(line) for line in manifest.read_text(encoding="utf-8").splitlines()]
     assert summary["source_kind_counts"] == {
-        "clear_nonvocal_all_background": 1,
         "isolated_human_vocal_candidate": 1,
         "semantic_composite_candidate": 1,
     }
-    assert summary["overlay_counts"] == {"overlay": 1}
+    assert summary["overlay_counts"] == {"disabled_repeated_overlay": 1}
     assert all(
         row["schema"] == CANDIDATE_ISLAND_SCORER_V11_SYNTHETIC_TRAIN_SOURCE_SCHEMA
         for row in rows
@@ -208,17 +207,13 @@ def test_build_v11_train_sources_preserves_candidate_and_brackets_outside(tmp_pa
     ]
     inside = semantic["canonical_spans"][1]
     assert inside["end_frame"] - inside["start_frame"] == 5
-    outside_control = next(
-        row for row in rows if row["source_kind"] == "clear_nonvocal_all_background"
+    assert semantic["outside_brackets"]["left"]["crop_policy"] == (
+        "natural_contiguous_crop_no_repeat_v1"
     )
-    assert outside_control["core_ids"] == [
-        "background-control-instance::scorer-v11-outside-control-0000"
-    ]
-    assert outside_control["canonical_spans"] == [
-        {"label": "outside_candidate", "start_frame": 0, "end_frame": 1000}
-    ]
-    assert outside_control["outside_control_composition"] == (
-        "train_nonvocal_mosaic_20s_v1"
+    assert semantic["outside_brackets"]["left"]["output_sample_count"] == 640
+    assert semantic["candidate_source"]["overlay"] is None
+    assert semantic["candidate_source"]["overlay_policy"] == (
+        "disabled_repeated_full_candidate_overlay_v1"
     )
 
 

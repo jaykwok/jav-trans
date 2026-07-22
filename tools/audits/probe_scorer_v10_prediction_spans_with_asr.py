@@ -137,11 +137,14 @@ def prepare_probe_inputs(
         if not isinstance(spans, list) or not spans:
             raise ValueError(f"Scorer ASR probe row has no prediction spans: {source_id}")
         for span_index, span in enumerate(spans):
-            if str(span.get("label") or "") != "model_speech":
-                raise ValueError("Scorer ASR probe accepts only model_speech spans")
+            probe_label = str(span.get("label") or "")
+            if probe_label not in {"model_speech", "asr_probe_candidate"}:
+                raise ValueError(
+                    "Scorer ASR probe accepts only model_speech or asr_probe_candidate spans"
+                )
             start_frame = _frame(span, "start")
             end_frame = _frame(span, "end")
-            span_id = f"{source_id}::model_speech::{start_frame}-{end_frame}"
+            span_id = f"{source_id}::{probe_label}::{start_frame}-{end_frame}"
             destination = crop_dir / f"span-{len(probe_inputs):04d}.wav"
             crop = _crop_wav(
                 source=source_audio,
@@ -418,6 +421,16 @@ def run(
     enriched_path = output_dir / "enriched_selection.jsonl"
     _write_rows(enriched_path, enriched)
     durations = [float(row["duration_s"]) for row in probe_inputs]
+    selection_roles = {
+        str(span.get("selection_role") or "")
+        for row in prepared["prepared_rows"]
+        for span in row.get("prediction_spans") or ()
+    }
+    probe_scope = (
+        "gemini_outside_complement_pending_asr_only"
+        if selection_roles == {"gemini_outside_complement_pending_asr"}
+        else "scorer_argmax_speech_islands_only"
+    )
     summary = {
         "schema": SUMMARY_SCHEMA,
         "model_id": MODEL_ID,
@@ -450,7 +463,7 @@ def run(
         "diagnostic_only": True,
         "training_manifest_allowed": False,
         "automatic_label_change_allowed": False,
-        "probe_scope": "scorer_argmax_speech_islands_only",
+        "probe_scope": probe_scope,
         "full_source_semantic_recall_measured": False,
         "manual_gate_status": "pending",
         "events": execution["events"],

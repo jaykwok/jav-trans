@@ -10,10 +10,12 @@ CueQC to drop later in the real workflow.
 from __future__ import annotations
 
 import argparse
+from functools import lru_cache
 import hashlib
 import json
 import re
 import sys
+import time
 from collections import Counter
 from pathlib import Path
 from typing import Any, Iterable, Sequence
@@ -33,11 +35,6 @@ from boundary.ja.model import (  # noqa: E402
     CANDIDATE_ISLAND_SCORER_V11_SYNTHETIC_TRAIN_SOURCE_SCHEMA,
 )
 from audio.loading import load_audio_16k_mono  # noqa: E402
-from tools.boundary.ja.build_galgame_synthetic_timeline import (  # noqa: E402
-    crop_or_tile_audio,
-)
-
-
 SUMMARY_SCHEMA = "candidate_island_scorer_v11_train_source_build_summary_v1"
 COMPOSITE_SCHEMA = "cueqc_v13_unique_core_composite_v1"
 V10_CANONICAL_SCHEMA = "speech_scorer_v10_canonical_source_v1"
@@ -47,8 +44,7 @@ SAMPLE_RATE = 16000
 FRAME_SAMPLES = 320
 FRAME_HOP_S = 0.02
 BRACKET_DURATIONS_S = (0.5, 1.0, 2.0, 3.0)
-DEFAULT_OUTSIDE_CONTROL_COUNT = 320
-OUTSIDE_CONTROL_SEGMENT_DURATIONS_S = (2.0, 3.0, 4.0, 5.0, 6.0)
+DEFAULT_OUTSIDE_CONTROL_COUNT = 0
 
 OUTSIDE_BACKGROUND_TYPES = {
     "ambient_noise",
@@ -95,6 +91,7 @@ def _write_jsonl(path: Path, rows: Iterable[dict[str, Any]]) -> None:
             handle.write(json.dumps(row, ensure_ascii=False, sort_keys=True) + "\n")
 
 
+@lru_cache(maxsize=None)
 def _sha256(path: Path) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as handle:
@@ -131,6 +128,11 @@ def _load_audio(path: Path) -> np.ndarray:
     if not np.all(np.isfinite(values)):
         raise ValueError(f"Scorer v11 train source contains non-finite audio: {path}")
     return np.ascontiguousarray(values, dtype=np.float32)
+
+
+@lru_cache(maxsize=None)
+def _audio_frames(path: Path) -> int:
+    return int(sf.info(path).frames)
 
 
 def _load_source_audio(path: Path) -> np.ndarray:
@@ -314,22 +316,33 @@ def _replacement_row(
     *,
     eligible_pool: Sequence[dict[str, Any]],
     selection_key: str,
+    minimum_samples: int,
 ) -> dict[str, Any]:
     background_type = str(detail.get("background_type") or "").strip().lower()
-    same_type = [
+    sufficiently_long = [
         row
         for row in eligible_pool
+        if _audio_frames(_resolve(str(row["audio"]))) >= minimum_samples
+    ]
+    same_type = [
+        row
+        for row in sufficiently_long
         if str(row.get("background_type") or "").strip().lower() == background_type
     ]
     candidates = same_type
     if not candidates:
         candidates = [
-            row for row in eligible_pool if _is_vocal_detail(row) == _is_vocal_detail(detail)
+            row
+            for row in sufficiently_long
+            if _is_vocal_detail(row) == _is_vocal_detail(detail)
         ]
     if not candidates:
-        candidates = list(eligible_pool)
+        candidates = list(sufficiently_long)
     if not candidates:
-        raise ValueError("Scorer v11 has no train-disjoint component replacement pool")
+        raise ValueError(
+            "Scorer v11 has no train-disjoint natural component long enough; "
+            "audio repetition is forbidden"
+        )
     digest = hashlib.sha256(selection_key.encode("utf-8")).digest()
     return candidates[int.from_bytes(digest[:8], "big") % len(candidates)]
 
@@ -346,15 +359,24 @@ def _clip_inside_component(
     original_audio_id = str(detail.get("audio_id") or "")
     original_path = _resolve(str(detail.get("audio") or ""))
     original_video_id = _preasr_video_id(original_audio_id or original_path.stem)
-    replaced = original_video_id in heldout_video_ids or not original_path.exists()
+    original_source = _load_audio(original_path) if original_path.exists() else None
+    replaced = (
+        original_video_id in heldout_video_ids
+        or original_source is None
+        or len(original_source) < samples
+    )
     selected: dict[str, Any]
     if replaced:
         selected = _replacement_row(
-            detail, eligible_pool=eligible_pool, selection_key=selection_key
+            detail,
+            eligible_pool=eligible_pool,
+            selection_key=selection_key,
+            minimum_samples=samples,
         )
         selected_path = _resolve(str(selected["audio"]))
         source = _load_audio(selected_path)
-        clipped, offset = crop_or_tile_audio(source, samples=samples, rng=rng)
+        offset = int(rng.integers(0, len(source) - samples + 1))
+        clipped = np.ascontiguousarray(source[offset : offset + samples], dtype=np.float32)
         selected_detail = {
             "audio_id": str(selected.get("background_id") or selected["source_id"]),
             "audio": _display(selected_path),
@@ -364,15 +386,13 @@ def _clip_inside_component(
             "source_offset_sample": int(offset),
         }
     else:
-        source = _load_audio(original_path)
-        if len(source) >= samples:
-            offset = min(
-                max(0, int(round(float(detail.get("source_offset_s") or 0.0) * SAMPLE_RATE))),
-                len(source) - samples,
-            )
-            clipped = np.ascontiguousarray(source[offset : offset + samples], dtype=np.float32)
-        else:
-            clipped, offset = crop_or_tile_audio(source, samples=samples, rng=rng)
+        source = original_source
+        assert source is not None
+        offset = min(
+            max(0, int(round(float(detail.get("source_offset_s") or 0.0) * SAMPLE_RATE))),
+            len(source) - samples,
+        )
+        clipped = np.ascontiguousarray(source[offset : offset + samples], dtype=np.float32)
         selected_detail = {
             "audio_id": original_audio_id or original_path.stem,
             "audio": _display(original_path),
@@ -472,31 +492,15 @@ def _rebuild_semantic_candidate(
             "end_sample": len(clean),
         },
     ]
-    overlay = source.get("additive_overlay")
+    requested_overlay = source.get("additive_overlay")
     mixed = clean
     overlay_detail: dict[str, Any] | None = None
-    if overlay:
-        overlay_audio, overlay_source = _clip_inside_component(
-            dict(overlay["source"]),
-            samples=len(clean),
-            heldout_video_ids=heldout_video_ids,
-            eligible_pool=eligible_pool,
-            selection_key=f"{sample_id}:overlay",
-            rng=rng,
-        )
-        target_snr = float((overlay.get("mix") or {})["target_snr_db"])
-        mixed, mix_detail = _mix_overlay(
-            clean, overlay_audio, core_spans=rebuilt_spans, target_snr_db=target_snr
-        )
-        overlay_detail = {"source": overlay_source, "mix": mix_detail}
     if len(mixed) != int(source["sample_count"]):
         raise ValueError(
             "Scorer v11 rebuilt candidate changed frozen sample count: "
             f"sample_id={sample_id}, expected={source['sample_count']}, actual={len(mixed)}"
         )
     components = [left_detail, unit_detail, right_detail]
-    if overlay_detail:
-        components.append(dict(overlay_detail["source"]))
     return np.ascontiguousarray(mixed, dtype=np.float32), {
         "source_sample_id": sample_id,
         "original_composite_audio": str(source.get("audio") or ""),
@@ -508,6 +512,8 @@ def _rebuild_semantic_candidate(
             "right_gap": right_detail,
         },
         "overlay": overlay_detail,
+        "requested_overlay": requested_overlay,
+        "overlay_policy": "disabled_repeated_full_candidate_overlay_v1",
         "clean_limiter_gain": clean_gain,
         "heldout_component_replacement_count": sum(
             bool(detail.get("heldout_component_replaced")) for detail in components
@@ -521,7 +527,10 @@ def _clip_background(
 ) -> tuple[np.ndarray, dict[str, Any]]:
     path = _resolve(str(row["audio"]))
     source = _load_audio(path)
-    values, offset = crop_or_tile_audio(source, samples=samples, rng=rng)
+    if samples <= 0 or samples > len(source):
+        raise ValueError("Scorer v11 outside background crop cannot repeat audio")
+    offset = int(rng.integers(0, len(source) - samples + 1))
+    values = np.ascontiguousarray(source[offset : offset + samples], dtype=np.float32)
     return np.ascontiguousarray(values, dtype=np.float32), {
         "source_id": str(row["source_id"]),
         "background_type": str(row.get("background_type") or ""),
@@ -529,8 +538,23 @@ def _clip_background(
         "audio_sha256": _sha256(path),
         "source_offset_sample": int(offset),
         "output_sample_count": int(len(values)),
-        "crop_or_tile": "tile" if samples > len(source) else "crop",
+        "crop_policy": "natural_contiguous_crop_no_repeat_v1",
     }
+
+
+def _select_background_row(
+    outside_pool: Sequence[dict[str, Any]], *, start_index: int, minimum_samples: int
+) -> tuple[dict[str, Any], int]:
+    if not outside_pool:
+        raise ValueError("Scorer v11 outside background pool is empty")
+    for offset in range(len(outside_pool)):
+        row = outside_pool[(start_index + offset) % len(outside_pool)]
+        available = _audio_frames(_resolve(str(row["audio"])))
+        if available >= minimum_samples:
+            return row, available
+    raise ValueError(
+        "Scorer v11 has no natural outside crop long enough; audio repetition is forbidden"
+    )
 
 
 def _candidate_spans(
@@ -573,11 +597,23 @@ def _write_candidate_source(
         raise ValueError("Scorer v11 candidate audio must be non-empty and finite")
     left_s = BRACKET_DURATIONS_S[source_index % len(BRACKET_DURATIONS_S)]
     right_s = BRACKET_DURATIONS_S[(source_index * 3 + 1) % len(BRACKET_DURATIONS_S)]
-    left_samples = int(round(left_s * SAMPLE_RATE / FRAME_SAMPLES)) * FRAME_SAMPLES
-    right_samples = int(round(right_s * SAMPLE_RATE / FRAME_SAMPLES)) * FRAME_SAMPLES
-    right_samples += (-len(candidate)) % FRAME_SAMPLES
-    left_row = outside_pool[(source_index * 2) % len(outside_pool)]
-    right_row = outside_pool[(source_index * 2 + 1) % len(outside_pool)]
+    desired_left = int(round(left_s * SAMPLE_RATE / FRAME_SAMPLES)) * FRAME_SAMPLES
+    desired_right_base = int(round(right_s * SAMPLE_RATE / FRAME_SAMPLES)) * FRAME_SAMPLES
+    correction = (-len(candidate)) % FRAME_SAMPLES
+    left_row, left_available = _select_background_row(
+        outside_pool, start_index=source_index * 2, minimum_samples=FRAME_SAMPLES
+    )
+    right_row, right_available = _select_background_row(
+        outside_pool,
+        start_index=source_index * 2 + 1,
+        minimum_samples=FRAME_SAMPLES + correction,
+    )
+    left_samples = min(desired_left, left_available // FRAME_SAMPLES * FRAME_SAMPLES)
+    right_base = min(
+        desired_right_base,
+        (right_available - correction) // FRAME_SAMPLES * FRAME_SAMPLES,
+    )
+    right_samples = right_base + correction
     left, left_provenance = _clip_background(left_row, samples=left_samples, rng=rng)
     right, right_provenance = _clip_background(right_row, samples=right_samples, rng=rng)
     audio = np.ascontiguousarray(np.concatenate((left, candidate, right)), dtype=np.float32)
@@ -620,64 +656,6 @@ def _write_candidate_source(
             "right": right_provenance,
         },
         "composition_provenance": provenance,
-        "training_manifest_allowed": True,
-    }
-
-
-def _write_outside_control(
-    *,
-    outside_pool: Sequence[dict[str, Any]],
-    output_path: Path,
-    source_index: int,
-    rng: np.random.Generator,
-) -> dict[str, Any]:
-    if not outside_pool:
-        raise ValueError("Scorer v11 outside control pool is empty")
-    components: list[np.ndarray] = []
-    provenance: list[dict[str, Any]] = []
-    for component_index, seconds in enumerate(OUTSIDE_CONTROL_SEGMENT_DURATIONS_S):
-        row = outside_pool[
-            (source_index * len(OUTSIDE_CONTROL_SEGMENT_DURATIONS_S) + component_index)
-            % len(outside_pool)
-        ]
-        values, detail = _clip_background(
-            row, samples=int(seconds * SAMPLE_RATE), rng=rng
-        )
-        components.append(values)
-        provenance.append(detail)
-    values = np.ascontiguousarray(np.concatenate(components), dtype=np.float32)
-    samples = int(sum(OUTSIDE_CONTROL_SEGMENT_DURATIONS_S) * SAMPLE_RATE)
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    sf.write(output_path, values, SAMPLE_RATE, subtype="PCM_16")
-    written = _load_audio(output_path)
-    if len(written) != samples or samples % FRAME_SAMPLES:
-        raise ValueError("Scorer v11 outside control write changed frame geometry")
-    source_id = f"scorer-v11-outside-control-{source_index:04d}"
-    return {
-        "schema": CANDIDATE_ISLAND_SCORER_V11_SYNTHETIC_TRAIN_SOURCE_SCHEMA,
-        "boundary_serialization_contract_id": ACOUSTIC_BINARY_V12_CONTRACT.contract_id,
-        "source_id": source_id,
-        "partition": "train",
-        "source_kind": "clear_nonvocal_all_background",
-        "synthetic_composite": True,
-        "input_distribution": "train_exact_candidate_context_composite_v1",
-        "audio": _display(output_path),
-        "audio_sha256": _sha256(output_path),
-        "sample_rate": SAMPLE_RATE,
-        "sample_count": int(len(written)),
-        "duration_s": len(written) / SAMPLE_RATE,
-        "frame_count": len(written) // FRAME_SAMPLES,
-        "frame_hop_s": FRAME_HOP_S,
-        "core_ids": [f"background-control-instance::{source_id}"],
-        "canonical_spans": [
-            {
-                "label": "outside_candidate",
-                "start_frame": 0,
-                "end_frame": len(written) // FRAME_SAMPLES,
-            }
-        ],
-        "outside_control_sources": provenance,
-        "outside_control_composition": "train_nonvocal_mosaic_20s_v1",
         "training_manifest_allowed": True,
     }
 
@@ -732,6 +710,11 @@ def build(args: argparse.Namespace) -> dict[str, Any]:
     outside_control_count = int(args.outside_control_count)
     if vocal_source_count < 0 or outside_control_count < 0:
         raise ValueError("Scorer v11 train source counts must be non-negative")
+    if outside_control_count:
+        raise ValueError(
+            "Scorer v11 repeated/mosaic outside controls are retired; "
+            "real full-source outside supervision must be compiled separately"
+        )
     if len(vocal_pool) < vocal_source_count:
         raise ValueError("not enough held-out-disjoint isolated vocal sources")
     if outside_control_count and not outside_pool:
@@ -743,6 +726,7 @@ def build(args: argparse.Namespace) -> dict[str, Any]:
     rows: list[dict[str, Any]] = []
     overlay_counts: Counter[str] = Counter()
     heldout_component_replacements = 0
+    build_started = time.perf_counter()
     for index, source in enumerate(train_composites):
         candidate, candidate_provenance = _rebuild_semantic_candidate(
             source,
@@ -754,7 +738,9 @@ def build(args: argparse.Namespace) -> dict[str, Any]:
             candidate_provenance["heldout_component_replacement_count"]
         )
         overlay = source.get("additive_overlay")
-        overlay_counts["overlay" if overlay else "clean"] += 1
+        overlay_counts[
+            "disabled_repeated_overlay" if overlay else "clean"
+        ] += 1
         rows.append(
             _write_candidate_source(
                 source_id=f"scorer-v11-semantic-{source['sample_id']}",
@@ -776,6 +762,16 @@ def build(args: argparse.Namespace) -> dict[str, Any]:
                 },
             )
         )
+        completed = index + 1
+        if completed == 1 or completed % 50 == 0 or completed == len(train_composites):
+            elapsed = time.perf_counter() - build_started
+            rate = completed / max(elapsed, 1e-9)
+            remaining = len(train_composites) + vocal_source_count - completed
+            print(
+                f"scorer_v11_train_source={completed}/{len(train_composites) + vocal_source_count} "
+                f"kind=semantic elapsed_s={elapsed:.1f} eta_s={remaining / max(rate, 1e-9):.0f}",
+                flush=True,
+            )
 
     vocal_selection = vocal_pool[:vocal_source_count]
     for local_index, source in enumerate(vocal_selection):
@@ -805,16 +801,16 @@ def build(args: argparse.Namespace) -> dict[str, Any]:
                 },
             )
         )
-
-    for local_index in range(outside_control_count):
-        rows.append(
-            _write_outside_control(
-                outside_pool=outside_pool,
-                output_path=audio_dir / f"outside-control-{local_index:04d}.wav",
-                source_index=local_index,
-                rng=rng,
+        completed = len(train_composites) + local_index + 1
+        if local_index == 0 or completed % 50 == 0 or local_index + 1 == len(vocal_selection):
+            elapsed = time.perf_counter() - build_started
+            rate = completed / max(elapsed, 1e-9)
+            remaining = len(train_composites) + len(vocal_selection) - completed
+            print(
+                f"scorer_v11_train_source={completed}/{len(train_composites) + len(vocal_selection)} "
+                f"kind=isolated_vocal elapsed_s={elapsed:.1f} eta_s={remaining / max(rate, 1e-9):.0f}",
+                flush=True,
             )
-        )
 
     seen_core: dict[str, str] = {}
     frame_counts: Counter[str] = Counter()
@@ -855,13 +851,11 @@ def build(args: argparse.Namespace) -> dict[str, Any]:
         "overlay_counts": dict(sorted(overlay_counts.items())),
         "heldout_component_replacement_count": heldout_component_replacements,
         "outside_background_pool_count": len(outside_pool),
-        "outside_control_source_reuse_allowed": True,
-        "outside_control_duration_s": float(
-            sum(OUTSIDE_CONTROL_SEGMENT_DURATIONS_S)
-        ),
-        "outside_control_component_count": len(
-            OUTSIDE_CONTROL_SEGMENT_DURATIONS_S
-        ),
+        "outside_control_source_reuse_allowed": False,
+        "outside_control_duration_s": 0.0,
+        "outside_control_component_count": 0,
+        "outside_control_policy": "retired_repeated_mosaic_use_real_source_outside_v1",
+        "audio_repetition_allowed": False,
         "isolated_vocal_pool_count": len(vocal_pool),
         "train_disjoint_component_pool_count": len(eligible_pool),
         "canonical_frame_counts": dict(sorted(frame_counts.items())),

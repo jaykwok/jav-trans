@@ -32,6 +32,7 @@ SUMMARY_SCHEMA = "candidate_island_scorer_v11_canonical_compile_summary_v1"
 PARTITION_SCHEMA = "candidate_island_scorer_v11_partition_manifest_v1"
 HELDOUT_VERDICT_SCHEMA = "candidate_island_scorer_v11_heldout_manual_verdict_v1"
 MANUAL_VERDICT_SCHEMA = "candidate_island_scorer_v11_manual_verdict_v1"
+REAL_TRAIN_OUTSIDE_SCHEMA = "candidate_island_scorer_v11_real_train_outside_source_v1"
 FRAME_HOP_S = 0.02
 LABELS = {"outside_candidate": 0, "inside_candidate": 1, "unsure": 2}
 PARTITIONS = {"train", "val", "test"}
@@ -192,6 +193,7 @@ def canonical_frame_labels(source: dict[str, Any]) -> np.ndarray:
 def compile_canonical(
     *,
     synthetic_train_sources: Path,
+    real_train_outside_sources: Path,
     source_windows: Path,
     partition_manifest: Path,
     manual_verdicts: Sequence[Path],
@@ -199,6 +201,7 @@ def compile_canonical(
     verify_audio: bool = True,
 ) -> dict[str, Any]:
     synthetic_train_sources = synthetic_train_sources.resolve()
+    real_train_outside_sources = real_train_outside_sources.resolve()
     source_windows = source_windows.resolve()
     partition_manifest = partition_manifest.resolve()
     verdict_paths = [path.resolve() for path in manual_verdicts]
@@ -206,6 +209,7 @@ def compile_canonical(
         raise ValueError("Scorer v11 canonical compile requires manual verdict files")
     for path in (
         synthetic_train_sources,
+        real_train_outside_sources,
         source_windows,
         partition_manifest,
         *verdict_paths,
@@ -271,6 +275,7 @@ def compile_canonical(
         )
 
     synthetic_train_sha = _sha256(synthetic_train_sources)
+    real_train_outside_sha = _sha256(real_train_outside_sources)
     source_windows_sha = _sha256(source_windows)
     partition_sha = _sha256(partition_manifest)
     verdict_shas = {_display(path): _sha256(path) for path in verdict_paths}
@@ -380,6 +385,126 @@ def compile_canonical(
                 "candidate_source": source.get("candidate_source"),
                 "outside_brackets": source.get("outside_brackets"),
                 "composition_provenance": source.get("composition_provenance"),
+                "training_manifest_allowed": True,
+            }
+        )
+
+    real_train_rows = _index_unique(
+        _read_jsonl(real_train_outside_sources),
+        "source_id",
+        name="real train outside source",
+    )
+    if not real_train_rows:
+        raise ValueError("Scorer v11 canonical requires real train outside sources")
+    for source_id in sorted(real_train_rows):
+        source = real_train_rows[source_id]
+        if source.get("schema") != REAL_TRAIN_OUTSIDE_SCHEMA:
+            raise ValueError(f"wrong Scorer v11 real train outside schema: {source_id}")
+        if source.get("boundary_serialization_contract_id") != (
+            ACOUSTIC_BINARY_V12_CONTRACT.contract_id
+        ):
+            raise ValueError(f"wrong central boundary contract: {source_id}")
+        if source.get("partition") != "train" or not bool(
+            source.get("training_manifest_allowed")
+        ):
+            raise ValueError(f"real Scorer v11 outside source is not approved train data: {source_id}")
+        if bool(source.get("gemini_output_used_as_inside_truth")):
+            raise ValueError(f"Gemini inside cannot become Scorer v11 truth: {source_id}")
+        if bool(source.get("asr_text_used_as_inside_truth")) or bool(
+            source.get("asr_empty_used_without_gemini_outside")
+        ):
+            raise ValueError(f"ASR cannot independently define Scorer v11 truth: {source_id}")
+        if int(source.get("unsure_training_label", 0)) != -100:
+            raise ValueError(f"real Scorer v11 unsure must map to -100: {source_id}")
+        if source_id not in sources or source_id not in partitions:
+            raise ValueError(f"real train outside source is outside the frozen source scope: {source_id}")
+        partition_row = partitions[source_id]
+        source_window = sources[source_id]
+        if partition_row.get("partition") != "train":
+            raise ValueError(f"real outside source crosses into held-out: {source_id}")
+        video_id = str(source.get("video_id") or "")
+        if not video_id or video_id != str(partition_row.get("video_id") or "") or video_id != str(
+            source_window.get("video_id") or ""
+        ):
+            raise ValueError(f"real train outside video identity mismatch: {source_id}")
+        previous_partition = seen_video_partition.setdefault(video_id, "train")
+        if previous_partition != "train":
+            raise ValueError(f"video identity crosses partitions: {video_id}")
+        if source_id in seen_source_partition or source_id in heldout_sources:
+            raise ValueError(f"Scorer v11 source identity crosses partitions: {source_id}")
+        seen_source_partition[source_id] = "train"
+        frame_count = int(source.get("frame_count") or 0)
+        if frame_count <= 0 or float(source.get("frame_hop_s") or 0.0) != FRAME_HOP_S:
+            raise ValueError(f"real train outside frame geometry mismatch: {source_id}")
+        spans = _validate_spans(
+            list(source.get("canonical_spans") or ()),
+            source_id=source_id,
+            frame_count=frame_count,
+        )
+        labels_present = {str(span["label"]) for span in spans}
+        if not labels_present.issubset({"outside_candidate", "unsure"}) or (
+            "outside_candidate" not in labels_present
+        ):
+            raise ValueError(f"real train outside truth has invalid duties: {source_id}")
+        audio = _resolve(str(source.get("audio") or ""))
+        if not audio.exists():
+            raise FileNotFoundError(audio)
+        audio_sha = str(source.get("audio_sha256") or "")
+        expected_sha = str(source_window.get("audio_wav_sha256") or "")
+        if len(audio_sha) != 64 or audio_sha != expected_sha:
+            raise ValueError(f"real train outside audio SHA identity mismatch: {source_id}")
+        if verify_audio and _sha256(audio) != audio_sha:
+            raise ValueError(f"real train outside audio SHA256 mismatch: {source_id}")
+        sample_count, duration_s, audio_frame_count = _wav_geometry(audio)
+        spans, effective_frame_count, geometry_policy = _clip_reviewed_spans_to_audio(
+            spans,
+            source_id=source_id,
+            reviewed_frame_count=frame_count,
+            audio_frame_count=audio_frame_count,
+        )
+        core_ids = [str(value) for value in source.get("core_ids") or ()]
+        if core_ids != [f"real-train-outside-source::{source_id}"]:
+            raise ValueError(f"real train outside core identity mismatch: {source_id}")
+        core_id = core_ids[0]
+        previous_core_source = seen_core_source.setdefault(core_id, source_id)
+        if previous_core_source != source_id:
+            raise ValueError(f"Scorer v11 core identity is reused: {core_id}")
+        previous_core_partition = seen_core_partition.setdefault(core_id, "train")
+        if previous_core_partition != "train":
+            raise ValueError(f"Scorer v11 core identity crosses partitions: {core_id}")
+        for span in spans:
+            label_counts[str(span["label"])] += int(span["end_frame"]) - int(
+                span["start_frame"]
+            )
+        partition_counts["train"] += 1
+        compiled.append(
+            {
+                "schema": CANDIDATE_ISLAND_SCORER_V11_CANONICAL_SOURCE_SCHEMA,
+                "boundary_serialization_contract_id": ACOUSTIC_BINARY_V12_CONTRACT.contract_id,
+                "canonical_label_schema": CANDIDATE_ISLAND_SCORER_V11_CANONICAL_LABEL_SCHEMA,
+                "source_id": source_id,
+                "video_id": video_id,
+                "core_ids": core_ids,
+                "core_identity_kind": "real_train_outside_source_v1",
+                "partition": "train",
+                "input_distribution": str(source.get("input_distribution") or ""),
+                "source_kind": "real_train_outside_masked",
+                "synthetic_composite": False,
+                "audio": _display(audio),
+                "audio_sha256": audio_sha,
+                "duration_s": duration_s,
+                "frame_count": effective_frame_count,
+                "frame_hop_s": FRAME_HOP_S,
+                "audio_sample_count": sample_count,
+                "reviewed_nominal_frame_count": frame_count,
+                "audio_geometry_policy": geometry_policy,
+                "canonical_spans": spans,
+                "annotation_provenance": str(source.get("annotation_provenance") or ""),
+                "real_train_outside_sources_sha256": real_train_outside_sha,
+                "gemini_output_used_as_inside_truth": False,
+                "asr_text_used_as_inside_truth": False,
+                "asr_empty_used_without_gemini_outside": False,
+                "unsure_training_label": -100,
                 "training_manifest_allowed": True,
             }
         )
@@ -509,6 +634,8 @@ def compile_canonical(
         "canonical_sources_sha256": canonical_sha,
         "synthetic_train_sources": _display(synthetic_train_sources),
         "synthetic_train_sources_sha256": synthetic_train_sha,
+        "real_train_outside_sources": _display(real_train_outside_sources),
+        "real_train_outside_sources_sha256": real_train_outside_sha,
         "source_windows": _display(source_windows),
         "source_windows_sha256": source_windows_sha,
         "partition_manifest": _display(partition_manifest),
@@ -519,6 +646,10 @@ def compile_canonical(
         "canonical_frame_counts": dict(sorted(label_counts.items())),
         "all_heldout_sources_human_confirmed": True,
         "synthetic_train_truth_exact_composition": True,
+        "real_train_outside_truth_requires_asr_empty": True,
+        "asr_text_used_as_inside_truth": False,
+        "asr_empty_used_without_gemini_outside": False,
+        "real_train_unsure_excluded_from_training": True,
         "omni_preverdicts_used_as_truth": False,
         "training_manifest_allowed": True,
     }
@@ -534,6 +665,7 @@ def compile_canonical(
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--synthetic-train-sources", required=True)
+    parser.add_argument("--real-train-outside-sources", required=True)
     parser.add_argument("--source-windows", required=True)
     parser.add_argument("--partition-manifest", required=True)
     parser.add_argument("--manual-verdicts", action="append", required=True)
@@ -546,6 +678,7 @@ def main(argv: list[str] | None = None) -> dict[str, Any]:
     args = parse_args(argv)
     return compile_canonical(
         synthetic_train_sources=Path(args.synthetic_train_sources),
+        real_train_outside_sources=Path(args.real_train_outside_sources),
         source_windows=Path(args.source_windows),
         partition_manifest=Path(args.partition_manifest),
         manual_verdicts=[Path(path) for path in args.manual_verdicts],

@@ -4,11 +4,11 @@
 
 ## 最终结论
 
-当前仍不能直接开始完整训练，但 Scorer v11 的源码缺口已经闭合：strict canonical compiler、raw-feature/window compiler和 random-init trainer均已实现并通过 smoke。用户完成了 24 条 held-out 全源人工真值；实际149-source compile被剩余125条train source缺current-duty v11真值正确阻止，现有真实source逐帧特征又只有旧PTM128而非raw PTM2048，因此没有启动GPU训练。Proposal v1、Outer v3尚无可复现的当前职责数据闭环；Split v4、CueQC v13、Inner v2的现役权重来自旧provenance，不能用修改metadata或重新绑定SHA冒充新合同。只有固定source/core identity、显式train/val/test、当前工作流分布、精确上游checkpoint SHA和中央合同同时满足时，数据才允许进入训练。
+Scorer v11 当前职责 canonical 已闭合，但仍需针对新音频重新提取 raw PTM2048、重编 window features、随机初始化训练并完成人工 gate。旧 synthetic 审计发现 outside control、bracket、overlay和内部组件大量依赖短音频tile；当前生成器已禁止所有重复，退役320条20s mosaic及432条需要重复的full-candidate overlay。125条train真实source不再要求高成本全量人工逐帧标注：Gemini只做高召回预审，其inside/unsure不作truth；outside补集再经1.7B ASR，ASR非空只转unsure，只有Gemini outside且ASR空、无错误才成为outside。最终canonical为train/val/test=`1146/10/14`，全量frame=`inside 528479 / outside 121553 / unsure 60432`，SHA=`957e8758...d9902b`。Proposal v1、Outer v3尚无可复现的当前职责数据闭环；Split v4、CueQC v13、Inner v2的现役权重来自旧provenance，不能用修改metadata或重新绑定SHA冒充新合同。
 
 | 模型 | 当前职责 | 合法训练样本 | 审计结论 |
 | --- | --- | --- | --- |
-| Scorer v11 | 高召回连续 candidate-island membership | 完整 source window；同一 ASR 单元内停顿、尾音、短背景和含混人声保留为 `inside_candidate`；仅清晰可安全提前删的非人声背景为 `outside_candidate` | canonical/feature/trainer已实现；held-out 24/24完成。125条train source仍缺current-duty v11真值，真实source raw PTM2048尚未提取，故正式训练仍blocked；旧v10数据不可改名复用 |
+| Scorer v11 | 高召回连续 candidate-island membership | 完整 source window；同一 ASR 单元内停顿、尾音、短背景和含混人声保留为 `inside_candidate`；仅清晰可安全提前删的背景为 `outside_candidate` | no-tile canonical与held-out 24/24已闭合；train definite比例`inside 89.49% / outside 10.51%`，不预先用重复或loss调权平衡。新raw PTM2048尚未提取，故训练待启动；旧v10数据不可改名复用 |
 | Proposal v1 | 为 Split 枚举高召回非绑定候选 | 当前 Scorer v11/Outer v3 输出中的真实可查询候选；监督目标是候选覆盖，不是最终 cut | 现役 checkpoint 的 labels/feature manifest 已丢失，且 metadata 无 source/core/partition provenance；只能保留为历史候选源，不能复现训练 |
 | Outer v3 | 将完整 candidate island 收成供 Split 查询的 acoustic outer core | 实际 `post_candidate_island_scorer_v11_islands`，真实边缘分布，随机初始化二分类 | trainer 合同已严格，但仓库没有生成这种 row 的 current compiler；registry 仍为空 `pending_outer_v3_audit` |
 | Split v4 | 对 Proposal candidate 做 `cut/continue` 二分类 | 当前 Scorer v11→Proposal→Outer v3 的 candidate query、局部 bins/scalar 和完整 island context；source/core 固定且同 core 最多一次 | 旧 dataset 缺失；现役 checkpoint含临时 forced-train/repeat/Focal/aux 配置。新入口已禁止临时分区、重复 core 和旧 runtime 数据伪装，默认回到 neutral CE baseline |
@@ -34,7 +34,9 @@
 
 ### Scorer v11
 
-- canonical compiler只接受中央合同、frozen source/video/partition和全源人工最终verdict；区间必须从frame 0连续无重叠覆盖至source尾，标签限定`outside_candidate/inside_candidate/unsure`，Omni-only/未完整确认输入拒绝。当前24条held-out final verdict结构有效，但149-source strict compile明确报告train真值缺125条。
+- 旧synthetic component repetition审计确认：outside control=`1600/1600 repeated`、outside bracket=`2073/2252 repeated`、overlay=`430/432 repeated`，内部gap/negative也大量重复。修复后实际全量复核为left/right/negative各`870/870 natural`、outside bracket=`2252/2252 natural`，输出sample与可用source sample逐项相等；outside control与重复overlay均为0。
+- 真实train outside teacher链固定为Gemini预审→outside complement→1.7B ASR。49段中ASR非空27段同时混有真实台词和喘息/亲吻拟声，因此ASR文本不作inside truth；空文本也不能单独证明outside。最终只接受Gemini outside与ASR empty/error-free交集，20条输出source为`outside 14506 / unsure 60432`，其余一律ignore。
+- canonical compiler只接受中央合同、frozen source/video/partition和完整覆盖区间；标签限定`outside_candidate/inside_candidate/unsure`。held-out必须人工完整确认，train real outside则必须使用独立masked schema并证明Gemini inside未作truth、ASR text未作inside、ASR empty未脱离Gemini outside单独使用。当前24条held-out final verdict与20条real train masked source均通过。
 - feature compiler定义独立raw cache、extractor、signed manifest和gate schema；只接受当前1.7B PTM的raw PTM2048+MFCC40，旧PTM128/PCA/前128截断直接拒绝。训练row引用完整source cache而不复制重叠特征，记录1000-frame context、200-frame nominal overlap和midpoint unique owner；loss/metrics只计算owner。
 - `unsure`保留在source labels，训练映射`-100`；MFCC normalization、CE、metrics、numeric gate和heatmap auxiliary均排除unsure。heatmap target先从完整source definite run生成再切window，touching unsure不生成伪边界。
 - trainer只允许random init、two-logit CE和argmax；baseline固定class weights=`1/1`且auxiliary=`0`，heatmap只能通过显式`heatmap_aux` A/B启用。CPU仅允许plumbing smoke；正式CUDA执行物理RAM/VRAM×0.95、Windows shared-VRAM spill soft-OOM、frame-budget batch及阶段结束显式释放。smoke checkpoint固定`promotion_allowed=false`。

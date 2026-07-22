@@ -7,9 +7,18 @@ from pathlib import Path
 from tools.audits.compare_candidate_island_teacher_to_human import compare
 from tools.audits.generate_candidate_island_teacher_comparison_html import _audio_path
 from tools.asr.cueqc.label_pre_asr_with_omni import normalize_openai_compat_base_url
-from tools.boundary.ja.label_candidate_island_scorer_v11_with_omni import parse_args
+from tools.boundary.ja.label_candidate_island_scorer_v11_with_omni import _spans, parse_args
 from tools.boundary.ja.build_candidate_island_scorer_v11_outside_consensus import (
     build as build_outside_consensus,
+)
+from tools.boundary.ja.build_candidate_island_scorer_v11_train_teacher_manifest import (
+    build as build_train_teacher_manifest,
+)
+from tools.boundary.ja.build_candidate_island_scorer_v11_real_outside_selection import (
+    build as build_real_outside_selection,
+)
+from tools.boundary.ja.compile_candidate_island_scorer_v11_real_train_outside import (
+    build as compile_real_train_outside,
 )
 from boundary.contracts import ACOUSTIC_BINARY_V12_CONTRACT
 from tools.omni.run_audio_teacher import parse_args as parse_generic_args
@@ -21,6 +30,24 @@ def test_provider_base_url_normalization_and_known_profiles() -> None:
     assert parse_args(["--manifest", "x", "--output-dir", "y", "--env-file", "qwen"]).env_file == "qwen"
     assert parse_generic_args(["--output-dir", "y", "--prompt", "x"]).env_file == "gemini"
     assert parse_generic_args(["--output-dir", "y", "--env-file", "qwen", "--prompt", "x"]).env_file == "qwen"
+
+
+def test_teacher_span_error_names_local_clip_range() -> None:
+    try:
+        _spans(
+            {
+                "islands": [
+                    {"start_s": 101.5, "end_s": 108.0, "confidence": 0.9}
+                ]
+            },
+            duration_s=75.0,
+        )
+    except ValueError as error:
+        message = str(error)
+    else:
+        raise AssertionError("out-of-range teacher coordinates must be rejected")
+    assert "required_range=0..75.0" in message
+    assert "0-based audio clip timeline" in message
 
 
 def test_teacher_comparison_uses_continuous_frame_membership(tmp_path: Path) -> None:
@@ -141,3 +168,186 @@ def test_outside_consensus_requires_both_teachers_and_asr_silence(tmp_path: Path
     assert by_id["clear"]["training_label"] == 0
     assert by_id["teacher-inside"]["training_label"] == -100
     assert by_id["asr-text"]["decision_reasons"] == ["asr_text"]
+
+
+def test_train_teacher_manifest_uses_only_frozen_train_sources(tmp_path: Path) -> None:
+    import wave
+
+    audio = tmp_path / "train.wav"
+    with wave.open(str(audio), "wb") as handle:
+        handle.setnchannels(1)
+        handle.setsampwidth(2)
+        handle.setframerate(16000)
+        handle.writeframes(b"\0\0" * 3200)
+    source_windows = tmp_path / "sources.jsonl"
+    source_windows.write_text(
+        json.dumps(
+            {
+                "schema": "joint_boundary_omni_source_window_v1",
+                "window_id": "train-w00",
+                "video_id": "train",
+                "audio_wav": str(audio),
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    partition = tmp_path / "partition.jsonl"
+    partition.write_text(
+        "".join(
+            json.dumps(row) + "\n"
+            for row in (
+                {
+                    "schema": "candidate_island_scorer_v11_partition_manifest_v1",
+                    "boundary_serialization_contract_id": ACOUSTIC_BINARY_V12_CONTRACT.contract_id,
+                    "source_id": "train-w00",
+                    "video_id": "train",
+                    "partition": "train",
+                },
+                {
+                    "schema": "candidate_island_scorer_v11_partition_manifest_v1",
+                    "boundary_serialization_contract_id": ACOUSTIC_BINARY_V12_CONTRACT.contract_id,
+                    "source_id": "heldout-w00",
+                    "video_id": "heldout",
+                    "partition": "test",
+                },
+            )
+        ),
+        encoding="utf-8",
+    )
+    summary = build_train_teacher_manifest(
+        argparse.Namespace(
+            source_windows=str(source_windows),
+            partition_manifest=str(partition),
+            output_dir=str(tmp_path / "out"),
+        )
+    )
+    assert summary["source_count"] == 1
+    row = json.loads(Path(summary["train_teacher_sources"]).read_text(encoding="utf-8"))
+    assert row["source_id"] == "train-w00"
+    assert row["partition"] == "train"
+    assert row["frame_count"] == 10
+    assert row["training_manifest_allowed"] is False
+
+
+def test_real_outside_selection_uses_exact_gemini_complement(tmp_path: Path) -> None:
+    sources = tmp_path / "sources.jsonl"
+    teacher = tmp_path / "teacher.jsonl"
+    sources.write_text(
+        json.dumps(
+            {
+                "schema": "candidate_island_scorer_v11_train_teacher_source_v1",
+                "boundary_serialization_contract_id": ACOUSTIC_BINARY_V12_CONTRACT.contract_id,
+                "source_id": "s",
+                "video_id": "v",
+                "partition": "train",
+                "audio": "s.wav",
+                "audio_sha256": "a" * 64,
+                "duration_s": 0.2,
+                "frame_count": 10,
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    teacher.write_text(
+        json.dumps(
+            {
+                "schema": "candidate_island_scorer_v11_omni_preaudit_v2",
+                "source_id": "s",
+                "partition": "train",
+                "frame_count": 10,
+                "audio_sha256": "a" * 64,
+                "model": "gemini",
+                "prompt_version": "v4",
+                "islands": [{"start_frame": 2, "end_frame": 5}],
+                "unsure_spans": [{"start_frame": 7, "end_frame": 8}],
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    summary = build_real_outside_selection(
+        argparse.Namespace(
+            train_teacher_sources=str(sources),
+            gemini_preaudit=str(teacher),
+            output_dir=str(tmp_path / "out"),
+        )
+    )
+    assert summary["outside_frame_count"] == 6
+    row = json.loads(
+        Path(summary["real_outside_asr_selection"]).read_text(encoding="utf-8")
+    )
+    assert [
+        (span["start_frame"], span["end_frame"])
+        for span in row["prediction_spans"]
+    ] == [(0, 2), (5, 7), (8, 10)]
+    assert {span["label"] for span in row["prediction_spans"]} == {
+        "asr_probe_candidate"
+    }
+    assert row["training_manifest_allowed"] is False
+
+
+def test_real_train_outside_keeps_only_empty_asr_spans(tmp_path: Path) -> None:
+    enriched = tmp_path / "enriched.jsonl"
+    enriched.write_text(
+        json.dumps(
+            {
+                "schema": "candidate_island_scorer_v11_real_outside_asr_selection_v1",
+                "boundary_serialization_contract_id": ACOUSTIC_BINARY_V12_CONTRACT.contract_id,
+                "source_id": "s",
+                "video_id": "v",
+                "partition": "train",
+                "audio": "s.wav",
+                "audio_sha256": "a" * 64,
+                "duration_s": 0.2,
+                "frame_count": 10,
+                "prediction_spans": [
+                    {
+                        "label": "asr_probe_candidate",
+                        "start_frame": 0,
+                        "end_frame": 3,
+                        "asr_probe": {"nonempty_text": False, "error_kind": ""},
+                    },
+                    {
+                        "label": "asr_probe_candidate",
+                        "start_frame": 6,
+                        "end_frame": 10,
+                        "asr_probe": {"nonempty_text": True, "error_kind": ""},
+                    },
+                ],
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    summary = compile_real_train_outside(
+        argparse.Namespace(
+            asr_enriched_selection=str(enriched), output_dir=str(tmp_path / "out")
+        )
+    )
+    assert summary["canonical_frame_counts"] == {
+        "outside_candidate": 3,
+        "unsure": 7,
+    }
+    assert summary["input_frame_counts"] == summary["canonical_frame_counts"]
+    assert summary["skipped_no_outside_source_count"] == 0
+    row = json.loads(
+        Path(summary["real_train_outside_sources"]).read_text(encoding="utf-8")
+    )
+    assert row["canonical_spans"] == [
+        {
+            "end_frame": 3,
+            "end_s": 0.06,
+            "label": "outside_candidate",
+            "start_frame": 0,
+            "start_s": 0.0,
+        },
+        {
+            "end_frame": 10,
+            "end_s": 0.2,
+            "label": "unsure",
+            "start_frame": 3,
+            "start_s": 0.06,
+        },
+    ]

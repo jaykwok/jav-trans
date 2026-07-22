@@ -125,3 +125,33 @@ def test_prediction_span_asr_probe_rejects_foreign_result(tmp_path: Path) -> Non
                 }
             ],
         )
+
+
+def test_prediction_span_asr_probe_accepts_nonsemantic_probe_role(tmp_path: Path) -> None:
+    audio = tmp_path / "source.wav"
+    _write_wav(audio, frame_count=1500)
+    selection = tmp_path / "selection.jsonl"
+    selection.write_text(
+        json.dumps(
+            {
+                "source_id": "real-source",
+                "audio": str(audio),
+                "prediction_spans": [
+                    {
+                        "label": "asr_probe_candidate",
+                        "selection_role": "gemini_outside_complement_pending_asr",
+                        "start_frame": 1,
+                        "end_frame": 3,
+                    }
+                ],
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    prepared = prepare_probe_inputs(
+        selection_path=selection, output_dir=tmp_path / "probe"
+    )
+    assert prepared["probe_inputs"][0]["probe_id"] == (
+        "real-source::asr_probe_candidate::1-3"
+    )
