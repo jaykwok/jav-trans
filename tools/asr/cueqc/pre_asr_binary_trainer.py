@@ -46,6 +46,7 @@ from tools.asr.cueqc.pre_asr_feature_compiler import (  # noqa: E402
     repo_display_path,
 )
 from boundary.gpu_safety import apply_vram_safety_cap  # noqa: E402
+from boundary.contracts import ACOUSTIC_BINARY_V12_CONTRACT  # noqa: E402
 
 
 METRICS_SCHEMA = "cueqc_pre_asr_semantic_chunk_v13_train_metrics"
@@ -236,6 +237,7 @@ def _prediction_rows(
     chunk_mask: np.ndarray,
     train_mask: np.ndarray,
     val_mask: np.ndarray,
+    test_mask: np.ndarray,
     probabilities: np.ndarray,
 ) -> list[dict[str, Any]]:
     metadata_by_id = {
@@ -264,8 +266,10 @@ def _prediction_rows(
             split_membership = (
                 "train"
                 if train_mask[group_index, chunk_index]
-                else "holdout"
+                else "val"
                 if val_mask[group_index, chunk_index]
+                else "test"
+                if test_mask[group_index, chunk_index]
                 else "excluded"
             )
             result.append(
@@ -325,88 +329,85 @@ def _split_label_masks(
     split_mode: str,
     val_ratio: float,
     rng: np.random.Generator,
-) -> tuple[np.ndarray, np.ndarray, dict[str, Any]]:
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, dict[str, Any]]:
     valid = (chunk_mask > 0) & ((y == 0) | (y == 1))
     train = np.zeros_like(valid, dtype=bool)
     val = np.zeros_like(valid, dtype=bool)
-    if split_mode == "role_holdout":
-        for group_index, group in enumerate(group_rows):
-            role = str(group.get("dataset_role") or "").strip().lower()
-            target = (
-                val
-                if role in {"semantic", "val", "validation", "test", "holdout"}
-                else train
+    test = np.zeros_like(valid, dtype=bool)
+    if split_mode != "fixed_partition":
+        raise ValueError(
+            "CueQC v13 requires split_mode='fixed_partition'; random group/chunk "
+            "splits and merged role holdouts are retired"
+        )
+    del val_ratio, rng
+    source_partitions: dict[str, set[str]] = {}
+    for group_index, group in enumerate(group_rows):
+        role = str(group.get("dataset_role") or "").strip().lower()
+        if role not in {"train", "val", "test"}:
+            raise ValueError(
+                f"CueQC group {group.get('audio_id')!r} has invalid frozen "
+                f"partition: {role!r}"
             )
-            target[group_index] = valid[group_index]
-    elif split_mode in {"group", "video_group"}:
-        group_count = int(y.shape[0])
-        if split_mode == "video_group":
-            video_ids = [
-                str(group.get("video_id") or group.get("audio_id") or index)
-                for index, group in enumerate(group_rows)
-            ]
-            unique_videos = sorted(set(video_ids))
-            order = rng.permutation(len(unique_videos))
-            val_count = (
-                max(1, int(round(len(unique_videos) * val_ratio)))
-                if len(unique_videos) >= 2
-                else 0
-            )
-            val_videos = {unique_videos[int(item)] for item in order[:val_count]}
-            val_groups = {
-                index for index, video_id in enumerate(video_ids) if video_id in val_videos
-            }
-            fallback_order = rng.permutation(group_count)
-        else:
-            order = rng.permutation(group_count)
-            val_count = max(1, int(round(group_count * val_ratio))) if group_count >= 2 else 0
-            val_groups = set(int(item) for item in order[:val_count])
-            fallback_order = order
-        for group_index in range(group_count):
-            target = val if group_index in val_groups else train
-            target[group_index] = valid[group_index]
-        if not np.any(train & valid) and np.any(valid):
-            first = int(fallback_order[-1])
-            train[first] = valid[first]
-            val[first] = False
-    elif split_mode == "chunk_stratified":
-        for group_index in range(y.shape[0]):
-            for label_index in (0, 1):
-                positions = np.flatnonzero(valid[group_index] & (y[group_index] == label_index))
-                if positions.size == 0:
-                    continue
-                shuffled = rng.permutation(positions)
-                if shuffled.size <= 1:
-                    val_count = 0
-                else:
-                    val_count = int(round(shuffled.size * val_ratio))
-                    val_count = min(shuffled.size - 1, max(1, val_count))
-                if val_count:
-                    val[group_index, shuffled[:val_count]] = True
-                    train[group_index, shuffled[val_count:]] = True
-                else:
-                    train[group_index, shuffled] = True
-    else:
-        raise ValueError(f"unsupported split_mode: {split_mode!r}")
+        target = {"train": train, "val": val, "test": test}[role]
+        target[group_index] = valid[group_index]
+        source_id = str(group.get("source_id") or "").strip()
+        if not source_id:
+            raise ValueError("CueQC groups require frozen source identity")
+        source_partitions.setdefault(source_id, set()).add(role)
+    leaked = sorted(
+        source_id for source_id, roles in source_partitions.items() if len(roles) != 1
+    )
+    if leaked:
+        raise ValueError(f"CueQC source identity crosses partitions: {leaked[:3]}")
     if not np.any(train & valid):
         raise ValueError("training split has no CueQC labels")
     if not np.any(val & valid):
         raise ValueError("validation split has no CueQC labels")
+    if not np.any(test & valid):
+        raise ValueError("test split has no CueQC labels")
     train_group_count = int(np.sum(np.any(train, axis=1)))
     val_group_count = int(np.sum(np.any(val, axis=1)))
+    test_group_count = int(np.sum(np.any(test, axis=1)))
     summary = {
         "mode": split_mode,
-        "val_ratio": float(val_ratio),
         "train_group_count": train_group_count,
         "val_group_count": val_group_count,
+        "test_group_count": test_group_count,
         "all_group_count": int(y.shape[0]),
         "train_counts": _class_counts(y, train),
         "val_counts": _class_counts(y, val),
+        "test_counts": _class_counts(y, test),
         "all_counts": _class_counts(y, chunk_mask),
         "groups_train": _group_label_counts(y, train, group_rows),
         "groups_val": _group_label_counts(y, val, group_rows),
+        "groups_test": _group_label_counts(y, test, group_rows),
     }
-    return train, val, summary
+    return train, val, test, summary
+
+
+def validate_feature_bundle_checkpoint_bindings(
+    bundle: Mapping[str, Any],
+    *,
+    split_checkpoint_sha256: str,
+    inner_checkpoint_sha256: str,
+) -> None:
+    if str(bundle.get("semantic_split_weights_sha256") or "") != split_checkpoint_sha256:
+        raise ValueError(
+            "CueQC feature bundle is not bound to the selected Split checkpoint"
+        )
+    if str(bundle.get("inner_edge_refiner_weights_sha256") or "") != inner_checkpoint_sha256:
+        raise ValueError(
+            "CueQC feature bundle is not bound to the selected Inner checkpoint"
+        )
+
+
+def validate_feature_bundle_training_contract(bundle: Mapping[str, Any]) -> None:
+    if bundle.get("training_manifest_allowed") is not True:
+        raise ValueError("CueQC feature bundle is not approved for training")
+    if not ACOUSTIC_BINARY_V12_CONTRACT.matches(
+        bundle.get("boundary_serialization_contract_id")
+    ):
+        raise ValueError("CueQC feature bundle uses a stale Boundary contract")
 
 
 def _apply_forced_group_splits(
@@ -716,6 +717,12 @@ def train(
             f"inner edge refiner checkpoint not found: {inner_checkpoint_path}"
         )
     inner_checkpoint_sha256 = file_sha256(inner_checkpoint_path)
+    validate_feature_bundle_checkpoint_bindings(
+        bundle,
+        split_checkpoint_sha256=split_checkpoint_sha256,
+        inner_checkpoint_sha256=inner_checkpoint_sha256,
+    )
+    validate_feature_bundle_training_contract(bundle)
     bundle_repo = qwen_asr_repo_id(str(bundle.get("asr_repo_id") or selected_repo))
     if bundle_repo != selected_repo:
         raise ValueError(f"feature bundle asr_repo_id={bundle_repo!r} does not match {selected_repo!r}")
@@ -729,7 +736,7 @@ def train(
     mask_np = chunk_mask.numpy()
     excluded_training_label_count = _excluded_training_label_count(bundle, y_np)
     group_rows = [dict(item) for item in (bundle.get("groups") or []) if isinstance(item, Mapping)]
-    train_label_mask, val_label_mask, split_summary = _split_label_masks(
+    train_label_mask, val_label_mask, test_label_mask, split_summary = _split_label_masks(
         y=y_np,
         chunk_mask=mask_np,
         group_rows=group_rows,
@@ -737,49 +744,13 @@ def train(
         val_ratio=val_ratio,
         rng=rng,
     )
-    force_train_groups = _matching_group_indexes(group_rows, force_train_audio_ids)
-    force_val_groups = _matching_group_indexes(group_rows, force_val_audio_ids or [])
-    overlap_groups = force_train_groups & force_val_groups
-    if overlap_groups:
-        overlap_ids = sorted(
-            str(group_rows[index].get("audio_id") or "") for index in overlap_groups
+    if force_train_audio_ids or (force_val_audio_ids or []):
+        raise ValueError(
+            "CueQC partition reassignment is retired; correct the frozen source "
+            "partition manifest instead"
         )
-        raise ValueError(f"audio_ids forced into both train and validation: {overlap_ids}")
-    _apply_forced_group_splits(
-        train=train_label_mask,
-        val=val_label_mask,
-        y=y_np,
-        chunk_mask=mask_np,
-        force_train_groups=force_train_groups,
-        force_val_groups=force_val_groups,
-    )
-    if force_train_groups or force_val_groups:
-        if not np.any(train_label_mask):
-            raise ValueError("forced split leaves no training labels")
-        if not np.any(val_label_mask):
-            raise ValueError("forced split leaves no validation labels")
-        split_summary.update(
-            {
-                "forced_train_audio_ids": sorted(
-                    str(group_rows[index].get("audio_id") or "")
-                    for index in force_train_groups
-                ),
-                "forced_val_audio_ids": sorted(
-                    str(group_rows[index].get("audio_id") or "")
-                    for index in force_val_groups
-                ),
-                "train_group_count": int(np.sum(np.any(train_label_mask, axis=1))),
-                "val_group_count": int(np.sum(np.any(val_label_mask, axis=1))),
-                "train_counts": _class_counts(y_np, train_label_mask),
-                "val_counts": _class_counts(y_np, val_label_mask),
-                "groups_train": _group_label_counts(
-                    y_np, train_label_mask, group_rows
-                ),
-                "groups_val": _group_label_counts(
-                    y_np, val_label_mask, group_rows
-                ),
-            }
-        )
+    force_train_groups: set[int] = set()
+    force_val_groups: set[int] = set()
 
     train_label_mask_t = torch.from_numpy(train_label_mask)
     init_payload: dict[str, Any] | None = None
@@ -970,6 +941,12 @@ def train(
         val_label_mask.astype(np.float32),
         durations,
     )
+    test_probs, test_y, test_durations = _valid_flat(
+        probs_all,
+        y_np,
+        test_label_mask.astype(np.float32),
+        durations,
+    )
     all_probs, all_y, all_durations = _valid_flat(probs_all, y_np, mask_np, durations)
     created_at = datetime.now().isoformat(timespec="seconds")
     metrics = {
@@ -987,6 +964,7 @@ def train(
         "split": split_summary,
         "train_group_count": int(split_summary["train_group_count"]),
         "val_group_count": int(split_summary["val_group_count"]),
+        "test_group_count": int(split_summary["test_group_count"]),
         "all_group_count": group_count,
         "class_counts": _class_counts(y_np, mask_np),
         "class_weights": {
@@ -1024,11 +1002,15 @@ def train(
         "anchor_boost": int(anchor_boost),
         "model_config": model_config,
         "decision_mode": "argmax",
+        "boundary_serialization_contract_id": (
+            ACOUSTIC_BINARY_V12_CONTRACT.contract_id
+        ),
         "training_labels": list(PRE_ASR_CUEQC_LABELS),
         "excluded_training_labels": ["unsure"],
         "excluded_training_label_count": excluded_training_label_count,
         "train": classification_metrics(train_probs, train_y, train_durations),
         "val": classification_metrics(val_probs, val_y, val_durations),
+        "test": classification_metrics(test_probs, test_y, test_durations),
         "all": classification_metrics(all_probs, all_y, all_durations),
     }
 
@@ -1040,6 +1022,7 @@ def train(
         chunk_mask=mask_np,
         train_mask=train_label_mask,
         val_mask=val_label_mask,
+        test_mask=test_label_mask,
         probabilities=probs_all,
     )
     predictions_path = output_dir / "predictions.jsonl"
@@ -1083,12 +1066,14 @@ def train(
             "trained_steps": int(steps),
             "sequence_window_size": int(sequence_window_size),
             "split_mode": str(split_mode),
-            "val_ratio": float(val_ratio),
             "created_at": created_at,
             "ignore_label": PRE_ASR_CUEQC_IGNORE_LABEL,
             "training_labels": list(PRE_ASR_CUEQC_LABELS),
             "excluded_training_labels": ["unsure"],
             "excluded_training_label_count": excluded_training_label_count,
+            "boundary_serialization_contract_id": (
+                ACOUSTIC_BINARY_V12_CONTRACT.contract_id
+            ),
             "init_checkpoint": (
                 repo_display_path(init_checkpoint)
                 if init_checkpoint is not None
@@ -1218,11 +1203,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--anchor-boost", type=int, default=1)
     parser.add_argument(
         "--split-mode",
-        choices=("chunk_stratified", "group", "video_group", "role_holdout"),
-        default="chunk_stratified",
-        help="chunk_stratified samples train/test chunks within every group and label class; group keeps the old group-level split.",
+        choices=("fixed_partition",),
+        default="fixed_partition",
+        help="Use frozen source-level train/val/test assignments from the feature bundle.",
     )
-    parser.add_argument("--val-ratio", type=float, default=0.15)
     parser.add_argument(
         "--sequence-window-size",
         type=int,
@@ -1249,8 +1233,6 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         parser.error("--semantic-aux-loss-weight requires --semantic-auxiliary")
     if args.late_fusion and not args.semantic_auxiliary:
         parser.error("--late-fusion requires --semantic-auxiliary")
-    if not 0.0 < args.val_ratio < 1.0:
-        parser.error("--val-ratio must be in (0, 1)")
     if args.sequence_window_size < 0:
         parser.error("--sequence-window-size must be non-negative")
     if args.anchor_boost <= 0:
@@ -1288,7 +1270,7 @@ def main(argv: list[str] | None = None) -> int:
         sequence_window_size=int(args.sequence_window_size),
         temporal_residual_scale=float(args.temporal_residual_scale),
         split_mode=str(args.split_mode),
-        val_ratio=float(args.val_ratio),
+        val_ratio=0.0,
         focal_gamma=float(args.focal_gamma),
         init_checkpoint=(
             project_path(args.init_checkpoint)

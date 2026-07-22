@@ -83,3 +83,28 @@ def test_binary_split_validation_rejects_three_class_candidate() -> None:
 
     with pytest.raises(ValueError, match="non-binary label"):
         exporter.validate_binary_split_chunk(chunk, sample_id="source")
+
+
+def test_source_core_ids_for_span_uses_exact_overlap() -> None:
+    source = {
+        "core_spans": [
+            {"core_id": "left", "start_s": 0.0, "end_s": 1.0},
+            {"core_id": "right", "start_s": 1.5, "end_s": 2.0},
+        ]
+    }
+
+    assert exporter.source_core_ids_for_span(source, start_s=0.5, end_s=1.5) == [
+        "left"
+    ]
+    assert exporter.source_core_ids_for_span(source, start_s=1.0, end_s=2.0) == [
+        "right"
+    ]
+
+
+def test_source_core_ids_for_span_rejects_missing_identity() -> None:
+    with pytest.raises(ValueError, match="missing core_id"):
+        exporter.source_core_ids_for_span(
+            {"core_spans": [{"start_s": 0.0, "end_s": 1.0}]},
+            start_s=0.0,
+            end_s=1.0,
+        )

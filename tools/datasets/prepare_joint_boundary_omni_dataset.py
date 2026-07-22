@@ -54,6 +54,80 @@ def _read_jsonl(path: Path) -> list[dict[str, Any]]:
         return [json.loads(line) for line in handle if line.strip()]
 
 
+def _partition_map(path: Path) -> dict[str, tuple[str, str]]:
+    result: dict[str, tuple[str, str]] = {}
+    for row in _read_jsonl(path):
+        video_id = str(row.get("video_id") or "").strip()
+        source_id = str(row.get("source_id") or video_id).strip()
+        partition = str(row.get("partition") or row.get("source_partition") or "").strip()
+        if not video_id or not source_id or partition not in {"train", "val", "test"}:
+            raise ValueError(
+                "partition manifest rows require video_id, source_id and "
+                "partition=train|val|test"
+            )
+        if video_id in result:
+            raise ValueError(f"duplicate partition manifest video_id: {video_id}")
+        result[video_id] = (source_id, partition)
+    if not result:
+        raise ValueError("partition manifest is empty")
+    return result
+
+
+def _resume_row_with_frozen_identity(
+    previous: dict[str, Any],
+    *,
+    window_id: str,
+    video_id: str,
+    source_id: str,
+    source_partition: str,
+    source_start_s: float,
+    source_end_s: float,
+) -> dict[str, Any]:
+    """Bind resumed artifacts to the current immutable source manifest."""
+
+    previous_video = str(previous.get("video_id") or "").strip()
+    if previous_video and previous_video != video_id:
+        raise ValueError(
+            f"resumed window {window_id!r} video_id changed: "
+            f"{previous_video!r} != {video_id!r}"
+        )
+    previous_source = str(previous.get("source_id") or "").strip()
+    if previous_source and previous_source != source_id:
+        raise ValueError(
+            f"resumed window {window_id!r} source_id changed: "
+            f"{previous_source!r} != {source_id!r}"
+        )
+    previous_partition = str(previous.get("source_partition") or "").strip()
+    if previous_partition and previous_partition != source_partition:
+        raise ValueError(
+            f"resumed window {window_id!r} partition changed: "
+            f"{previous_partition!r} != {source_partition!r}"
+        )
+    for key, expected in (
+        ("source_start_s", source_start_s),
+        ("source_end_s", source_end_s),
+    ):
+        if key in previous and abs(float(previous[key]) - expected) > 1.0 / 16000.0:
+            raise ValueError(
+                f"resumed window {window_id!r} {key} changed: "
+                f"{previous[key]!r} != {expected!r}"
+            )
+    return {
+        **previous,
+        "schema": SCHEMA,
+        "window_id": window_id,
+        "video_id": video_id,
+        "source_id": source_id,
+        "source_partition": source_partition,
+        "source_start_s": source_start_s,
+        "source_end_s": round(source_end_s, 6),
+        "semantic_split_training_manifest_allowed": False,
+        "semantic_split_input_distribution": (
+            "unverified_runtime_boundary_export_pending_scorer_v11_outer_v3_audit"
+        ),
+    }
+
+
 def _safe_stem(value: str) -> str:
     cleaned = re.sub(r"[^0-9A-Za-z._-]+", "-", value).strip("-._")
     return cleaned[:48] or "video"
@@ -307,6 +381,14 @@ def run(args: argparse.Namespace) -> None:
                 "videos": selected,
             },
         )
+    partitions = _partition_map(Path(args.partition_manifest))
+    missing_partitions = sorted(
+        str(row["video_id"]) for row in selected if str(row["video_id"]) not in partitions
+    )
+    if missing_partitions:
+        raise ValueError(
+            f"selected videos are missing frozen partitions: {missing_partitions[:3]}"
+        )
     existing = {
         str(row["window_id"]): row
         for row in _read_jsonl(output / "source_windows.jsonl")
@@ -315,6 +397,7 @@ def run(args: argparse.Namespace) -> None:
     for video_position, source_row in enumerate(selected, start=1):
         source = Path(source_row["source_video"])
         video_id = str(source_row["video_id"])
+        source_id, source_partition = partitions[video_id]
         source_duration = float(source_row["source_duration_s"])
         rng = random.Random(f"{args.seed}:{video_id}")
         starts = _window_starts(
@@ -341,7 +424,17 @@ def run(args: argparse.Namespace) -> None:
                     "pre_asr_candidates",
                 )
             ):
-                rows.append(previous)
+                rows.append(
+                    _resume_row_with_frozen_identity(
+                        previous,
+                        window_id=window_id,
+                        video_id=video_id,
+                        source_id=source_id,
+                        source_partition=source_partition,
+                        source_start_s=start_s,
+                        source_end_s=start_s + duration_s,
+                    )
+                )
                 print(
                     f"resumed video={video_position}/{len(selected)} window={window_id}",
                     flush=True,
@@ -364,6 +457,8 @@ def run(args: argparse.Namespace) -> None:
                 "schema": SCHEMA,
                 "window_id": window_id,
                 "video_id": video_id,
+                "source_id": source_id,
+                "source_partition": source_partition,
                 "source_video": str(source.resolve()),
                 "source_duration_s": source_duration,
                 "source_start_s": start_s,
@@ -377,6 +472,10 @@ def run(args: argparse.Namespace) -> None:
                 "sample_rate": 16000,
                 "channels": 1,
                 "audio_filter": build_audio_filter_chain(),
+                "semantic_split_training_manifest_allowed": False,
+                "semantic_split_input_distribution": (
+                    "unverified_runtime_boundary_export_pending_scorer_v11_outer_v3_audit"
+                ),
                 **feature_payload,
             }
             rows.append(row)
@@ -415,6 +514,11 @@ def parse_args() -> argparse.Namespace:
         )
     )
     parser.add_argument("--source-root", required=True)
+    parser.add_argument(
+        "--partition-manifest",
+        required=True,
+        help="JSONL with frozen video_id/source_id/train|val|test assignments.",
+    )
     parser.add_argument(
         "--output-dir",
         default="datasets/train/omni-joint-boundary-preasr-v1",

@@ -2,64 +2,72 @@
 from __future__ import annotations
 
 import argparse
+import json
+from collections import defaultdict
 from pathlib import Path
 
 
 def run(args: argparse.Namespace) -> None:
     import torch
 
-    source_bundles = [
+    bundles = [
         torch.load(path, map_location="cpu", weights_only=False)
         for path in args.features
     ]
-    bundles: list[dict] = []
-    roles: list[str] = []
-    for role, bundle in zip(args.role, source_bundles):
-        group_width = int(bundle["chunk_mask"].shape[1])
-        window_size = int(args.max_chunks)
-        if window_size <= 0 or group_width <= window_size:
-            bundles.append(bundle)
-            roles.append(role)
-            continue
-        for group_index, group in enumerate(bundle["groups"]):
-            valid_count = int(bundle["chunk_mask"][group_index].sum().item())
-            row_ids = list(group.get("row_ids") or [])
-            for start in range(0, valid_count, window_size):
-                end = min(valid_count, start + window_size)
-                window_group = {
-                    **group,
-                    "group_index": 0,
-                    "row_ids": row_ids[start:end],
-                    "planned_island_id": (
-                        f"{group.get('planned_island_id', 'sequence')}:"
-                        f"window{start // window_size:04d}"
-                    ),
-                    "source_group_index": int(group.get("group_index", group_index)),
-                    "source_chunk_start": start,
-                    "source_chunk_end": end,
-                }
-                bundles.append(
-                    {
-                        **bundle,
-                        "groups": [window_group],
-                        "scalar_features": bundle["scalar_features"][
-                            group_index : group_index + 1, start:end
-                        ].clone(),
-                        "ptm_bins": bundle["ptm_bins"][
-                            group_index : group_index + 1, start:end
-                        ].clone(),
-                        "bin_mask": bundle["bin_mask"][
-                            group_index : group_index + 1, start:end
-                        ].clone(),
-                        "chunk_mask": bundle["chunk_mask"][
-                            group_index : group_index + 1, start:end
-                        ].clone(),
-                        "labels": bundle["labels"][
-                            group_index : group_index + 1, start:end
-                        ].clone(),
-                    }
+    if not bundles:
+        raise ValueError("no CueQC feature bundles supplied")
+    identity_keys = (
+        "schema",
+        "feature_schema",
+        "runtime_adapter",
+        "feature_names",
+        "all_feature_names",
+        "ptm_bin_count",
+        "ptm_dim",
+        "asr_repo_id",
+        "boundary_serialization_contract_id",
+        "training_manifest_allowed",
+        "semantic_split_weights_sha256",
+        "inner_edge_refiner_weights_sha256",
+    )
+    for key in identity_keys:
+        if any(key not in bundle for bundle in bundles):
+            raise ValueError(f"CueQC merge input is missing required {key}")
+        values = {json.dumps(bundle.get(key), sort_keys=True) for bundle in bundles}
+        if len(values) != 1:
+            raise ValueError(f"CueQC merge input mismatch for {key}")
+    if bundles[0].get("training_manifest_allowed") is not True:
+        raise ValueError("CueQC merge inputs are not approved training manifests")
+    source_partitions: dict[str, set[str]] = defaultdict(set)
+    seen_row_ids: set[str] = set()
+    seen_core_ids: set[str] = set()
+    for bundle in bundles:
+        for group in bundle.get("groups") or []:
+            source_id = str(group.get("source_id") or "").strip()
+            partition = str(group.get("dataset_role") or "").strip()
+            if not source_id or partition not in {"train", "val", "test"}:
+                raise ValueError(
+                    "CueQC merge requires frozen source_id and dataset_role"
                 )
-                roles.append(role)
+            source_partitions[source_id].add(partition)
+            for row_id in group.get("row_ids") or []:
+                value = str(row_id)
+                if value in seen_row_ids:
+                    raise ValueError(
+                        f"CueQC provisional subisland is duplicated across inputs: {value}"
+                    )
+                seen_row_ids.add(value)
+            for core_id in group.get("source_core_ids") or []:
+                value = str(core_id).strip()
+                if not value:
+                    raise ValueError("CueQC merge found an empty source core identity")
+                if value in seen_core_ids:
+                    raise ValueError(
+                        f"CueQC semantic core is duplicated across inputs: {value}"
+                    )
+                seen_core_ids.add(value)
+    if any(len(values) != 1 for values in source_partitions.values()):
+        raise ValueError("CueQC source identity crosses merged partitions")
     max_chunks = max(int(bundle["chunk_mask"].shape[1]) for bundle in bundles)
 
     def padded(tensor, value: float):
@@ -72,41 +80,27 @@ def run(args: argparse.Namespace) -> None:
 
     groups = []
     group_offset = 0
-    for role, bundle in zip(roles, bundles):
+    for bundle in bundles:
         for group in bundle["groups"]:
             groups.append(
                 {
                     **group,
                     "group_index": group_offset + int(group["group_index"]),
-                    "dataset_role": (
-                        str(group.get("dataset_role") or "train")
-                        if role == "preserve"
-                        else role
-                    ),
                 }
             )
         group_offset += len(bundle["groups"])
     merged = {
         **{
             key: bundles[0][key]
-            for key in (
-                "schema",
-                "feature_schema",
-                "runtime_adapter",
-                "feature_names",
-                "all_feature_names",
-                "ptm_bin_count",
-                "ptm_dim",
-                "asr_repo_id",
-            )
+            for key in identity_keys
         },
-        "rows": [row for bundle in source_bundles for row in bundle["rows"]],
+        "rows": [row for bundle in bundles for row in bundle["rows"]],
         "groups": groups,
         "source_files": [
-            source for bundle in source_bundles for source in bundle["source_files"]
+            source for bundle in bundles for source in bundle["source_files"]
         ],
         "label_files": [
-            source for bundle in source_bundles for source in bundle["label_files"]
+            source for bundle in bundles for source in bundle["label_files"]
         ],
         "scalar_features": torch.cat(
             [padded(bundle["scalar_features"], 0.0) for bundle in bundles]
@@ -127,6 +121,29 @@ def run(args: argparse.Namespace) -> None:
     output = Path(args.output)
     output.parent.mkdir(parents=True, exist_ok=True)
     torch.save(merged, output)
+    output.with_suffix(".summary.json").write_text(
+        json.dumps(
+            {
+                "schema": "cueqc_v13_merged_feature_summary_v2",
+                "feature_bundle": str(output),
+                "source_bundle_count": len(bundles),
+                "group_count": len(groups),
+                "source_count": len(source_partitions),
+                "partition_counts": {
+                    partition: sum(
+                        str(group["dataset_role"]) == partition for group in groups
+                    )
+                    for partition in ("train", "val", "test")
+                },
+                "context_preserved": True,
+                "partition_reassignment": False,
+            },
+            ensure_ascii=False,
+            indent=2,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
     print(
         f"features={output} groups={len(groups)} "
         f"chunks={int((merged['labels'] != -100).sum())}"
@@ -136,24 +153,8 @@ def run(args: argparse.Namespace) -> None:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--features", action="append", required=True)
-    parser.add_argument("--role", action="append", required=True)
     parser.add_argument("--output", required=True)
-    parser.add_argument(
-        "--max-chunks",
-        type=int,
-        default=0,
-        help=(
-            "Split source groups into bounded temporal windows before padding. "
-            "Use the training sequence window size to avoid padding every short "
-            "group to the longest full-video sequence."
-        ),
-    )
-    args = parser.parse_args()
-    if len(args.features) != len(args.role):
-        parser.error("--features and --role counts must match")
-    if args.max_chunks < 0:
-        parser.error("--max-chunks must be non-negative")
-    return args
+    return parser.parse_args()
 
 
 if __name__ == "__main__":

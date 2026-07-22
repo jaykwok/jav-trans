@@ -46,6 +46,28 @@ def test_runtime_v12_teacher_rejects_old_runtime_chunks() -> None:
         )
 
 
+def test_runtime_v12_teacher_requires_frozen_model_bound_manifest() -> None:
+    from tools.asr.cueqc import label_runtime_v12_cueqc_v13_with_omni as runtime
+
+    row = {
+        "schema": "runtime_v12_provisional_subisland_v1",
+        "subisland_id": "current",
+        "source_id": "source",
+        "source_partition": "test",
+        "training_manifest_allowed": True,
+        "semantic_split_weights_sha256": "a" * 64,
+        "inner_edge_refiner_weights_sha256": "b" * 64,
+        "pre_asr_candidate": {
+            "boundary_contract_id": "boundary_acoustic_binary_v12",
+            "schema": "pre_asr_cueqc_features_v10",
+        },
+    }
+    runtime._validate_runtime_rows([row])
+    row["training_manifest_allowed"] = False
+    with pytest.raises(ValueError, match="approved runtime manifest"):
+        runtime._validate_runtime_rows([row])
+
+
 def test_training_label_from_omni_maps_to_existing_v10_labels():
     assert (
         omni_label.training_label_from_omni(

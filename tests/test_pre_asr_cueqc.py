@@ -28,6 +28,8 @@ from tools.asr.cueqc.pre_asr_binary_trainer import (
     _split_label_masks,
     _window_batch_from_anchors,
     classification_metrics,
+    validate_feature_bundle_checkpoint_bindings,
+    validate_feature_bundle_training_contract,
 )
 
 
@@ -70,9 +72,18 @@ def _pre_asr_candidate(index: int, *, video_id: str = "AAA", cluster_id: str = "
             "sample_id": sample_id,
             "candidate_id": sample_id,
             "video_id": video_id,
+            "source_id": f"source-{video_id}",
             "audio_id": video_id,
             "chunk_index": index,
             "duration_s": 0.5,
+            "source_partition": "train",
+            "source_core_ids": [f"core-{video_id}-{index}"],
+            "training_manifest_allowed": True,
+            "boundary_serialization_contract_id": (
+                ACOUSTIC_BINARY_V12_CONTRACT.contract_id
+            ),
+            "semantic_split_weights_sha256": "a" * 64,
+            "inner_edge_refiner_weights_sha256": "b" * 64,
         }
     )
     if cluster_id:
@@ -608,9 +619,18 @@ def test_compile_pre_asr_cueqc_features_ignores_text_columns(tmp_path: Path):
         json.dumps(
             {
                 "transcript_chunks": [
-                    {
-                        "index": 0,
-                        "start": 0.0,
+                        {
+                            "index": 0,
+                            "source_id": "source-chunks",
+                            "source_partition": "train",
+                            "source_core_ids": ["core-chunks-0"],
+                            "training_manifest_allowed": True,
+                            "boundary_serialization_contract_id": (
+                                ACOUSTIC_BINARY_V12_CONTRACT.contract_id
+                            ),
+                            "semantic_split_weights_sha256": "a" * 64,
+                            "inner_edge_refiner_weights_sha256": "b" * 64,
+                            "start": 0.0,
                         "end": 1.0,
                         "text": "ignored",
                         "raw_text": "ignored",
@@ -619,9 +639,18 @@ def test_compile_pre_asr_cueqc_features_ignores_text_columns(tmp_path: Path):
                         "boundary_contract_id": ACOUSTIC_BINARY_V12_CONTRACT.contract_id,
                         **_ptm_pooling_fields(),
                     },
-                    {
-                        "index": 1,
-                        "start": 1.2,
+                        {
+                            "index": 1,
+                            "source_id": "source-chunks",
+                            "source_partition": "train",
+                            "source_core_ids": ["core-chunks-1"],
+                            "training_manifest_allowed": True,
+                            "boundary_serialization_contract_id": (
+                                ACOUSTIC_BINARY_V12_CONTRACT.contract_id
+                            ),
+                            "semantic_split_weights_sha256": "a" * 64,
+                            "inner_edge_refiner_weights_sha256": "b" * 64,
+                            "start": 1.2,
                         "end": 2.0,
                         "decoder_stats": {"ignored": True},
                         "scorer_speech_mean": 0.2,
@@ -789,8 +818,16 @@ def test_compile_pre_asr_cueqc_keeps_per_row_source_identity_in_combined_jsonl(
             {
                 "schema": "runtime_v12_provisional_subisland_v1",
                 "sample_id": video_id,
+                "source_id": f"source-{video_id}",
                 "subisland_id": f"{video_id}__v12s00",
                 "source_partition": partition,
+                "source_core_ids": candidate["source_core_ids"],
+                "training_manifest_allowed": True,
+                "boundary_serialization_contract_id": (
+                    ACOUSTIC_BINARY_V12_CONTRACT.contract_id
+                ),
+                "semantic_split_weights_sha256": "a" * 64,
+                "inner_edge_refiner_weights_sha256": "b" * 64,
                 "pre_asr_candidate": candidate,
             }
         )
@@ -816,6 +853,91 @@ def test_compile_pre_asr_cueqc_keeps_per_row_source_identity_in_combined_jsonl(
 
     assert [group["audio_id"] for group in bundle["groups"]] == ["AAA", "BBB"]
     assert [group["dataset_role"] for group in bundle["groups"]] == ["train", "test"]
+
+
+def test_compile_pre_asr_cueqc_rejects_unapproved_runtime_rows(
+    tmp_path: Path,
+) -> None:
+    chunks = tmp_path / "chunks.jsonl"
+    labels = tmp_path / "labels.jsonl"
+    output = tmp_path / "features.pt"
+    row = _pre_asr_candidate(0, video_id="AAA")
+    row["training_manifest_allowed"] = False
+    chunks.write_text(json.dumps(row) + "\n", encoding="utf-8")
+    labels.write_text(
+        json.dumps({"sample_id": row["sample_id"], "label": "keep"}) + "\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="not an approved training manifest"):
+        compile_features(
+            chunk_paths=[str(chunks)],
+            label_paths=[str(labels)],
+            output=output,
+            asr_repo_id="jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame-hf",
+        )
+
+
+def test_compile_pre_asr_cueqc_rejects_reused_semantic_core(
+    tmp_path: Path,
+) -> None:
+    chunks = tmp_path / "chunks.jsonl"
+    labels = tmp_path / "labels.jsonl"
+    output = tmp_path / "features.pt"
+    first = _pre_asr_candidate(0, video_id="AAA")
+    second = _pre_asr_candidate(1, video_id="AAA")
+    second["source_core_ids"] = list(first["source_core_ids"])
+    chunks.write_text(
+        json.dumps(first) + "\n" + json.dumps(second) + "\n",
+        encoding="utf-8",
+    )
+    labels.write_text(
+        json.dumps({"sample_id": first["sample_id"], "label": "keep"})
+        + "\n"
+        + json.dumps({"sample_id": second["sample_id"], "label": "keep"})
+        + "\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="is reused by provisional subislands"):
+        compile_features(
+            chunk_paths=[str(chunks)],
+            label_paths=[str(labels)],
+            output=output,
+            asr_repo_id="jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame-hf",
+        )
+
+
+def test_compile_pre_asr_cueqc_rejects_mixed_upstream_checkpoint_identity(
+    tmp_path: Path,
+) -> None:
+    chunks = tmp_path / "chunks.jsonl"
+    labels = tmp_path / "labels.jsonl"
+    output = tmp_path / "features.pt"
+    rows = []
+    for index, digest in enumerate(("a" * 64, "b" * 64)):
+        row = _pre_asr_candidate(index, video_id="AAA")
+        row["semantic_split_weights_sha256"] = digest
+        row["inner_edge_refiner_weights_sha256"] = "c" * 64
+        rows.append(row)
+    chunks.write_text(
+        "".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8"
+    )
+    labels.write_text(
+        "".join(
+            json.dumps({"sample_id": row["sample_id"], "label": "keep"}) + "\n"
+            for row in rows
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="mixes upstream checkpoint identities"):
+        compile_features(
+            chunk_paths=[str(chunks)],
+            label_paths=[str(labels)],
+            output=output,
+            asr_repo_id="jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame-hf",
+        )
 
 
 def test_compile_pre_asr_cueqc_preserves_selected_teacher_unsure_only(
@@ -1097,7 +1219,7 @@ def test_compile_pre_asr_cueqc_matches_video_chunk_and_cluster_id_labels(tmp_pat
     assert [row["label"] for row in bundle["rows"]] == ["drop_before_asr", "keep_for_asr"]
 
 
-def test_pre_asr_training_chunk_stratified_split_samples_both_films():
+def test_pre_asr_training_rejects_chunk_stratified_split():
     y = np.asarray(
         [
             [0, 0, 1, 1, pre_asr_cueqc.PRE_ASR_CUEQC_IGNORE_LABEL, 0],
@@ -1107,40 +1229,33 @@ def test_pre_asr_training_chunk_stratified_split_samples_both_films():
     )
     chunk_mask = np.ones_like(y, dtype=np.float32)
 
-    train_mask, val_mask, summary = _split_label_masks(
-        y=y,
-        chunk_mask=chunk_mask,
-        group_rows=[
-            {"audio_id": "film-a", "planned_island_id": "sequence"},
-            {"audio_id": "film-b", "planned_island_id": "sequence"},
-        ],
-        split_mode="chunk_stratified",
-        val_ratio=0.4,
-        rng=np.random.default_rng(17),
-    )
-
-    assert summary["train_group_count"] == 2
-    assert summary["val_group_count"] == 2
-    assert summary["train_counts"]["drop"] > 0
-    assert summary["train_counts"]["keep"] > 0
-    assert summary["val_counts"]["drop"] > 0
-    assert summary["val_counts"]["keep"] > 0
-    assert not np.any(train_mask & val_mask)
+    with pytest.raises(ValueError, match="fixed_partition"):
+        _split_label_masks(
+            y=y,
+            chunk_mask=chunk_mask,
+            group_rows=[
+                {"audio_id": "film-a", "planned_island_id": "sequence"},
+                {"audio_id": "film-b", "planned_island_id": "sequence"},
+            ],
+            split_mode="chunk_stratified",
+            val_ratio=0.4,
+            rng=np.random.default_rng(17),
+        )
 
 
-def test_pre_asr_training_role_holdout_keeps_val_and_test_out_of_train():
+def test_pre_asr_training_fixed_partitions_are_disjoint():
     y = np.asarray([[0, 1, 2], [0, 1, 2], [0, 1, 2]], dtype=np.int64)
     chunk_mask = np.ones_like(y, dtype=np.float32)
 
-    train_mask, val_mask, summary = _split_label_masks(
+    train_mask, val_mask, test_mask, summary = _split_label_masks(
         y=y,
         chunk_mask=chunk_mask,
         group_rows=[
-            {"audio_id": "train", "dataset_role": "train"},
-            {"audio_id": "val", "dataset_role": "val"},
-            {"audio_id": "test", "dataset_role": "test"},
+            {"audio_id": "train", "source_id": "train-source", "dataset_role": "train"},
+            {"audio_id": "val", "source_id": "val-source", "dataset_role": "val"},
+            {"audio_id": "test", "source_id": "test-source", "dataset_role": "test"},
         ],
-        split_mode="role_holdout",
+        split_mode="fixed_partition",
         val_ratio=0.15,
         rng=np.random.default_rng(17),
     )
@@ -1148,10 +1263,55 @@ def test_pre_asr_training_role_holdout_keeps_val_and_test_out_of_train():
     assert np.array_equal(train_mask[0], [True, True, False])
     assert not np.any(train_mask[1:])
     assert not np.any(val_mask[0])
-    assert np.array_equal(val_mask[1:], [[True, True, False], [True, True, False]])
+    assert np.array_equal(val_mask[1], [True, True, False])
+    assert np.array_equal(test_mask[2], [True, True, False])
+    assert not np.any(train_mask & val_mask)
+    assert not np.any(train_mask & test_mask)
+    assert not np.any(val_mask & test_mask)
     assert summary["train_counts"]["excluded_unsure"] == 0
     assert summary["val_counts"]["excluded_unsure"] == 0
+    assert summary["test_counts"]["excluded_unsure"] == 0
     assert summary["all_counts"]["excluded_unsure"] == 3
+
+
+def test_pre_asr_training_requires_exact_split_and_inner_dataset_bindings():
+    with pytest.raises(ValueError, match="selected Split checkpoint"):
+        validate_feature_bundle_checkpoint_bindings(
+            {
+                "semantic_split_weights_sha256": "a" * 64,
+                "inner_edge_refiner_weights_sha256": "b" * 64,
+            },
+            split_checkpoint_sha256="c" * 64,
+            inner_checkpoint_sha256="b" * 64,
+        )
+    with pytest.raises(ValueError, match="selected Inner checkpoint"):
+        validate_feature_bundle_checkpoint_bindings(
+            {
+                "semantic_split_weights_sha256": "a" * 64,
+                "inner_edge_refiner_weights_sha256": "b" * 64,
+            },
+            split_checkpoint_sha256="a" * 64,
+            inner_checkpoint_sha256="c" * 64,
+        )
+
+
+def test_pre_asr_training_requires_approved_central_contract_bundle():
+    with pytest.raises(ValueError, match="not approved for training"):
+        validate_feature_bundle_training_contract(
+            {
+                "training_manifest_allowed": False,
+                "boundary_serialization_contract_id": (
+                    ACOUSTIC_BINARY_V12_CONTRACT.contract_id
+                ),
+            }
+        )
+    with pytest.raises(ValueError, match="stale Boundary contract"):
+        validate_feature_bundle_training_contract(
+            {
+                "training_manifest_allowed": True,
+                "boundary_serialization_contract_id": "legacy-contract",
+            }
+        )
 
 
 def test_pre_asr_excluded_training_count_includes_canonical_and_legacy_unsure():
@@ -1189,6 +1349,7 @@ def test_pre_asr_prediction_rows_keep_unsure_out_of_metrics_and_runtime_labels()
         chunk_mask=np.ones((1, 2), dtype=np.float32),
         train_mask=np.asarray([[True, False]]),
         val_mask=np.asarray([[False, False]]),
+        test_mask=np.asarray([[False, True]]),
         probabilities=np.asarray([[[0.8, 0.2], [0.9, 0.1]]], dtype=np.float32),
     )
 
@@ -1197,7 +1358,7 @@ def test_pre_asr_prediction_rows_keep_unsure_out_of_metrics_and_runtime_labels()
     assert rows[0]["included_in_metrics"] is True
     assert rows[1]["truth_label"] == "unsure"
     assert rows[1]["included_in_metrics"] is False
-    assert rows[1]["split_membership"] == "excluded"
+    assert rows[1]["split_membership"] == "test"
     assert all(row["prediction"] in {"drop", "keep"} for row in rows)
 
 
@@ -1274,7 +1435,7 @@ def test_sequence_tensor_contract_rejects_unassigned_candidates(monkeypatch):
         pre_asr_cueqc.sequence_tensors([{"candidate_id": "missing"}])
 
 
-def test_pre_asr_training_video_group_split_keeps_windows_together():
+def test_pre_asr_training_rejects_video_group_split():
     y = np.asarray([[0, 1], [0, 1], [0, 1], [0, 1]], dtype=np.int64)
     chunk_mask = np.ones_like(y, dtype=np.float32)
     groups = [
@@ -1284,20 +1445,15 @@ def test_pre_asr_training_video_group_split_keeps_windows_together():
         {"audio_id": "video-b-w01", "video_id": "video-b"},
     ]
 
-    train_mask, val_mask, summary = _split_label_masks(
-        y=y,
-        chunk_mask=chunk_mask,
-        group_rows=groups,
-        split_mode="video_group",
-        val_ratio=0.5,
-        rng=np.random.default_rng(17),
-    )
-
-    assert summary["train_group_count"] == 2
-    assert summary["val_group_count"] == 2
-    assert bool(val_mask[0].any()) == bool(val_mask[1].any())
-    assert bool(val_mask[2].any()) == bool(val_mask[3].any())
-    assert not np.any(train_mask & val_mask)
+    with pytest.raises(ValueError, match="fixed_partition"):
+        _split_label_masks(
+            y=y,
+            chunk_mask=chunk_mask,
+            group_rows=groups,
+            split_mode="video_group",
+            val_ratio=0.5,
+            rng=np.random.default_rng(17),
+        )
 
 
 def test_pre_asr_anchor_batch_supports_pre_windowed_bundle():

@@ -37,7 +37,6 @@ from tools.boundary.ja.acoustic_split_v4_dataset import (  # noqa: E402
     load_island_dataset,
     pad_batch,
     pair_loss,
-    source_id_from_group_id,
     validate_source_partition_isolation,
 )
 
@@ -67,12 +66,11 @@ def apply_manual_label_overrides(
             raise ValueError(f"duplicate Split metadata key: {key}")
         index_by_key[key] = index
     labels = np.asarray(data["labels"]).copy()
-    partitions = np.asarray(data["partitions"], dtype="<U16").copy()
     group_by_index: dict[int, str] = {}
     for group_name, indexes in data["groups"].items():
         for index in indexes.tolist():
             group_by_index[int(index)] = str(group_name)
-    corrected_sources: set[str] = set()
+    overridden_groups: set[str] = set()
     counts = {"cut": 0, "continue": 0, "ignore": 0}
     changed = 0
     for row in _jsonl(overrides_path):
@@ -88,23 +86,22 @@ def apply_manual_label_overrides(
         labels[index] = value
         counts[training_label] += 1
         group_name = group_by_index[index]
-        corrected_sources.add(source_id_from_group_id(group_name))
-    corrected_groups = {
-        group_name
-        for group_name in data["groups"]
-        if source_id_from_group_id(group_name) in corrected_sources
-    }
-    for group_name in corrected_groups:
-        partitions[data["groups"][group_name]] = "train"
+        overridden_groups.add(group_name)
     data["labels"] = labels
-    data["partitions"] = partitions
+    repeat_train_groups = sorted(
+        group_name
+        for group_name in overridden_groups
+        if set(data["partitions"][data["groups"][group_name]].astype(str).tolist())
+        == {"train"}
+    )
     return {
         "path": str(overrides_path),
         "override_count": sum(counts.values()),
         "changed_label_count": changed,
         "training_label_counts": counts,
-        "forced_train_groups": sorted(corrected_groups),
-        "forced_train_group_count": len(corrected_groups),
+        "overridden_groups": sorted(overridden_groups),
+        "repeat_train_groups": repeat_train_groups,
+        "partition_identity_changed": False,
     }
 
 
@@ -323,7 +320,7 @@ def run(args: argparse.Namespace) -> None:
     train_names = list(train_names_base)
     if manual_override_summary and args.manual_group_repeat > 1:
         train_names.extend(
-            manual_override_summary["forced_train_groups"]
+            manual_override_summary["repeat_train_groups"]
             * (int(args.manual_group_repeat) - 1)
         )
     rng = np.random.default_rng(args.seed)
@@ -597,7 +594,7 @@ def run(args: argparse.Namespace) -> None:
     print(json.dumps(metrics, ensure_ascii=False), flush=True)
 
 
-def parse_args() -> argparse.Namespace:
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--dataset", required=True)
     parser.add_argument("--metadata", default="")
@@ -605,8 +602,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--manual-group-repeat",
         type=int,
-        default=32,
-        help="Repeat manually corrected training groups without changing held-out groups.",
+        default=1,
+        help="Explicit A/B-only oversampling for corrected train groups; default is neutral.",
     )
     parser.add_argument("--output-dir", required=True)
     parser.add_argument(
@@ -626,11 +623,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--candidate-layers", type=int, default=2)
     parser.add_argument("--island-layers", type=int, default=2)
     parser.add_argument("--dropout", type=float, default=0.1)
-    parser.add_argument("--cut-weight", type=float, default=3.0)
+    parser.add_argument("--cut-weight", type=float, default=1.0)
     parser.add_argument("--continue-weight", type=float, default=1.0)
-    parser.add_argument("--focal-gamma", type=float, default=1.5)
-    parser.add_argument("--role-aux-weight", type=float, default=0.3)
-    parser.add_argument("--pair-loss-weight", type=float, default=0.3)
+    parser.add_argument("--focal-gamma", type=float, default=0.0)
+    parser.add_argument("--role-aux-weight", type=float, default=0.0)
+    parser.add_argument("--pair-loss-weight", type=float, default=0.0)
     parser.add_argument(
         "--shuffle-block-groups",
         type=int,
@@ -641,7 +638,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=13)
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--log-every", type=int, default=100)
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
     if args.ptm_projector_dim <= 0 or args.ptm_projector_dim >= args.ptm_dim:
         parser.error("--ptm-projector-dim must be between 1 and ptm-dim-1")
     if args.manual_group_repeat <= 0:

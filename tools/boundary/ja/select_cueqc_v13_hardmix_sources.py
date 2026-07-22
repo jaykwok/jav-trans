@@ -33,6 +33,7 @@ def select(
     *, details: Path, audio_root: Path, output: Path, count: int, seed: int
 ) -> dict[str, Any]:
     pools: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    source_partitions: dict[str, set[str]] = defaultdict(set)
     for row in _rows(details):
         boundaries = list(row.get("utterance_boundaries") or [])
         speech_segments = list(row.get("actual_speech_segments") or [])
@@ -45,19 +46,33 @@ def select(
             or not audio.exists()
         ):
             continue
-        pools[str(row.get("source_partition") or "train")].append(
+        source_id = str(row.get("source_id") or "").strip()
+        partition = str(row.get("source_partition") or "").strip()
+        if not source_id or partition not in {"train", "val", "test"}:
+            raise ValueError(
+                "hardmix details require frozen source_id and "
+                "source_partition=train|val|test"
+            )
+        source_partitions[source_id].add(partition)
+        pools[partition].append(
             {
                 "sample_id": str(row["audio_id"]),
+                "source_id": source_id,
                 "audio": str(audio),
-                "source_partition": str(row.get("source_partition") or "train"),
+                "source_partition": partition,
                 "speech_unit_count": len(speech_segments),
                 "inter_unit_boundary_count": len(boundaries),
                 "duration_s": float(row.get("duration_s") or 0.0),
             }
         )
+    if any(len(values) != 1 for values in source_partitions.values()):
+        raise ValueError("hardmix source identity crosses partitions")
     rng = np.random.default_rng(seed)
     selected: list[dict[str, Any]] = []
-    for partition, quota in _quotas(count).items():
+    quotas = _quotas(count)
+    if any(quotas[partition] <= 0 for partition in ("train", "val", "test")):
+        raise ValueError("hardmix selection requires non-empty train/val/test quotas")
+    for partition, quota in quotas.items():
         pool = pools[partition]
         if len(pool) < quota:
             raise ValueError(f"not enough {partition} sources: {len(pool)} < {quota}")

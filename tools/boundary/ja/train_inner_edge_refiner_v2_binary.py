@@ -7,7 +7,7 @@ import hashlib
 import json
 import sys
 import time
-from collections import Counter
+from collections import Counter, defaultdict
 from functools import lru_cache
 from pathlib import Path
 
@@ -35,6 +35,63 @@ from tools.boundary.ja.edge_frame_dataset import (  # noqa: E402
 )
 
 
+PARTITIONS = ("train", "val", "test")
+INNER_INPUT_DISTRIBUTION = "post_cueqc_v13_keep_subislands"
+
+
+def validate_dataset_rows(rows: list[dict]) -> dict[str, object]:
+    if not rows:
+        raise ValueError("Inner v2 dataset is empty")
+    source_partitions: dict[str, set[str]] = defaultdict(set)
+    core_partitions: dict[str, set[str]] = defaultdict(set)
+    core_counts: Counter[str] = Counter()
+    partition_counts: Counter[str] = Counter()
+    cueqc_shas: set[str] = set()
+    subisland_ids: set[str] = set()
+    for row in rows:
+        source_id = str(row.get("source_id") or "").strip()
+        core_id = str(row.get("core_id") or "").strip()
+        subisland_id = str(row.get("subisland_id") or row.get("row_id") or "").strip()
+        partition = str(row.get("partition") or "").strip()
+        if not source_id or not core_id or not subisland_id:
+            raise ValueError("Inner v2 rows require source_id/core_id/subisland_id")
+        if subisland_id in subisland_ids:
+            raise ValueError("Inner v2 provisional subisland identity is duplicated")
+        subisland_ids.add(subisland_id)
+        if partition not in PARTITIONS:
+            raise ValueError(f"Inner v2 row has invalid partition: {partition!r}")
+        if row.get("input_distribution") != INNER_INPUT_DISTRIBUTION:
+            raise ValueError("Inner v2 rows must be actual post-CueQC v13 keep subislands")
+        if row.get("cueqc_label") != "keep":
+            raise ValueError("Inner v2 training rows require CueQC keep decisions")
+        if row.get("training_manifest_allowed") is not True:
+            raise ValueError("Inner v2 rows require an approved training manifest gate")
+        cueqc_sha = str(row.get("cueqc_checkpoint_sha256") or "").lower()
+        if len(cueqc_sha) != 64 or any(ch not in "0123456789abcdef" for ch in cueqc_sha):
+            raise ValueError("Inner v2 rows require the exact CueQC checkpoint SHA256")
+        cueqc_shas.add(cueqc_sha)
+        source_partitions[source_id].add(partition)
+        core_partitions[core_id].add(partition)
+        core_counts[core_id] += 1
+        partition_counts[partition] += 1
+    if any(len(values) != 1 for values in source_partitions.values()):
+        raise ValueError("Inner v2 source identity crosses dataset partitions")
+    if any(len(values) != 1 for values in core_partitions.values()):
+        raise ValueError("Inner v2 core identity crosses dataset partitions")
+    if max(core_counts.values(), default=0) > 1:
+        raise ValueError("Inner v2 requires each semantic core at most once")
+    if any(partition_counts[name] <= 0 for name in PARTITIONS):
+        raise ValueError("Inner v2 requires fixed train/val/test partitions")
+    if len(cueqc_shas) != 1:
+        raise ValueError("Inner v2 dataset mixes CueQC checkpoint identities")
+    return {
+        "source_count": len(source_partitions),
+        "core_count": len(core_partitions),
+        "partition_counts": dict(partition_counts),
+        "cueqc_checkpoint_sha256": next(iter(cueqc_shas)),
+    }
+
+
 @lru_cache(maxsize=64)
 def load_source_features(path: str) -> tuple[np.ndarray, np.ndarray]:
     with np.load(path) as source:
@@ -50,9 +107,10 @@ def load_binary(row: dict):
         end = int(row["end_frame"])
         ptm = ptm[start:end]
         mfcc = mfcc[start:end]
-        total = min(len(ptm), len(mfcc), len(labels))
-        if total <= 0 or total != len(labels):
+        lengths = {len(ptm), len(mfcc), len(labels)}
+        if len(lengths) != 1 or not labels.size:
             raise ValueError(f"Inner v2 feature/label slice mismatch: {row.get('row_id')}")
+        total = len(labels)
         position = (
             np.arange(total, dtype=np.float32) / max(1, total - 1)
         ).reshape(-1, 1)
@@ -137,6 +195,7 @@ def run(args: argparse.Namespace) -> dict:
 
     apply_vram_safety_cap(0.95)
     rows = read_edge_rows(Path(args.dataset_manifest))
+    dataset_summary = validate_dataset_rows(rows)
     train_rows = [row for row in rows if str(row.get("partition")) == "train"]
     val_rows = [row for row in rows if str(row.get("partition")) == "val"]
     test_rows = [row for row in rows if str(row.get("partition")) == "test"]
@@ -212,7 +271,7 @@ def run(args: argparse.Namespace) -> dict:
         model=model, model_config=model_config,
         feature_config={"raw_ptm_dim": args.raw_ptm_dim, "learned_ptm_projected_dim": args.projected_ptm_dim, "mfcc_dim": args.mfcc_dim, "relative_position_dim": position_dim, "frame_hop_s": args.frame_hop_s, "acoustic_refinement": True},
         normalization=normalization,
-        metadata={"ptm_repo_id": QWEN_ASR_17B_REPO_ID, "dataset_manifest": args.dataset_manifest, "trained_steps": args.max_steps, "best_step": best_step, "canonical_label_counts": dict(counts), "excluded_training_count": int(counts["unsure"]), "training_initialization": "random", "checkpoint_selection": "val_inner_acoustic_edge_300ms_coverage_v1", "class_weights": {"background": float(args.background_weight), "semantic_core": float(args.semantic_weight)}, "acoustic_refinement": True, "feeds_asr": True},
+        metadata={"ptm_repo_id": QWEN_ASR_17B_REPO_ID, "dataset_manifest": args.dataset_manifest, "dataset_summary": dataset_summary, "input_distribution": INNER_INPUT_DISTRIBUTION, "trained_steps": args.max_steps, "best_step": best_step, "canonical_label_counts": dict(counts), "excluded_training_count": int(counts["unsure"]), "training_initialization": "random", "checkpoint_selection": "val_inner_acoustic_edge_300ms_coverage_v1", "class_weights": {"background": float(args.background_weight), "semantic_core": float(args.semantic_weight)}, "acoustic_refinement": True, "feeds_asr": True},
     ), checkpoint)
     summary = {"schema": "inner_edge_refiner_v2_binary_training_summary_v1", "checkpoint": str(checkpoint), "checkpoint_sha256": hashlib.sha256(checkpoint.read_bytes()).hexdigest(), "best_step": best_step, "train": train, "val": val, "test": test, "canonical_label_counts": dict(counts), "excluded_training_count": int(counts["unsure"]), "gate_pass": min(val["start_coverage"], val["end_coverage"], test["start_coverage"], test["end_coverage"]) >= 0.95 and not train["all_background_count"] and not val["all_background_count"] and not test["all_background_count"], "acoustic_refinement": True, "feeds_asr": True, "elapsed_s": time.monotonic() - started}
     (out / "summary.json").write_text(json.dumps(summary, ensure_ascii=False, indent=2, sort_keys=True), encoding="utf-8")

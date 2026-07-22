@@ -48,6 +48,10 @@ def test_compile_split_emits_whole_islands_with_ignore_context(
         {
             "window_id": "w0",
             "video_id": "vid0",
+            "source_id": "source-0",
+            "source_partition": "train",
+            "semantic_split_training_manifest_allowed": True,
+            "source_start_s": 0.0,
             "semantic_split_features": str(bundle_path),
         }
     ]
@@ -68,7 +72,6 @@ def test_compile_split_emits_whole_islands_with_ignore_context(
         dataset=tmp_path,
         windows=windows,
         labels=labels,
-        val_percent=20,
     )
 
     output = np.load(tmp_path / "semantic_split" / "features.npz")
@@ -77,7 +80,9 @@ def test_compile_split_emits_whole_islands_with_ignore_context(
     assert output["feature_indexes"].tolist() == [0, 1]
     group_ids = output["group_ids"].astype(str).tolist()
     assert len(set(group_ids)) == 1
-    assert group_ids[0].startswith("w0|core0.000-")
+    assert group_ids[0].startswith("source-0|island|source-0:samples:")
+    assert output["source_ids"].astype(str).tolist() == ["source-0", "source-0"]
+    assert len(set(output["core_ids"].astype(str).tolist())) == 1
     omni = output["omni_aux"].tolist()
     assert omni[0] == [-1.0, -1.0, -1.0]
     assert omni[1] == [1.0, 1.0, 0.0]
@@ -98,6 +103,10 @@ def test_compile_split_reads_and_writes_named_variant(tmp_path: Path) -> None:
         {
             "window_id": "w0",
             "video_id": "vid0",
+            "source_id": "source-0",
+            "source_partition": "train",
+            "semantic_split_training_manifest_allowed": True,
+            "source_start_s": 0.0,
             "semantic_split_features": str(canonical),
         }
     ]
@@ -114,7 +123,6 @@ def test_compile_split_reads_and_writes_named_variant(tmp_path: Path) -> None:
         dataset=tmp_path,
         windows=windows,
         labels=labels,
-        val_percent=20,
         feature_variant="06b",
         output_variant="06b",
     )
@@ -132,6 +140,10 @@ def test_compile_split_rejects_retired_teacher_labels(tmp_path: Path) -> None:
         {
             "window_id": "w0",
             "video_id": "vid0",
+            "source_id": "source-0",
+            "source_partition": "train",
+            "semantic_split_training_manifest_allowed": True,
+            "source_start_s": 0.0,
             "semantic_split_features": str(bundle_path),
         }
     ]
@@ -149,8 +161,7 @@ def test_compile_split_rejects_retired_teacher_labels(tmp_path: Path) -> None:
             dataset=tmp_path,
             windows=windows,
             labels=labels,
-            val_percent=20,
-        )
+            )
 
 
 def test_compile_split_rejects_labels_without_prompt_version(tmp_path: Path) -> None:
@@ -161,6 +172,10 @@ def test_compile_split_rejects_labels_without_prompt_version(tmp_path: Path) -> 
         {
             "window_id": "w0",
             "video_id": "vid0",
+            "source_id": "source-0",
+            "source_partition": "train",
+            "semantic_split_training_manifest_allowed": True,
+            "source_start_s": 0.0,
             "semantic_split_features": str(bundle_path),
         }
     ]
@@ -171,5 +186,135 @@ def test_compile_split_rejects_labels_without_prompt_version(tmp_path: Path) -> 
             dataset=tmp_path,
             windows=windows,
             labels=labels,
-            val_percent=20,
-        )
+            )
+
+
+def test_compile_split_rejects_source_crossing_frozen_partitions(
+    tmp_path: Path,
+) -> None:
+    paths = []
+    for window_id in ("w0", "w1"):
+        path = tmp_path / window_id / "semantic_split_features.npz"
+        path.parent.mkdir(parents=True)
+        _write_window_bundle(path)
+        paths.append(path)
+    windows = [
+        {
+            "window_id": "w0",
+            "video_id": "vid0",
+            "source_id": "source-0",
+            "source_partition": "train",
+            "semantic_split_training_manifest_allowed": True,
+            "source_start_s": 0.0,
+            "semantic_split_features": str(paths[0]),
+        },
+        {
+            "window_id": "w1",
+            "video_id": "vid0",
+            "source_id": "source-0",
+            "source_partition": "test",
+            "semantic_split_training_manifest_allowed": True,
+            "source_start_s": 10.0,
+            "semantic_split_features": str(paths[1]),
+        },
+    ]
+    with pytest.raises(ValueError, match="crosses frozen source partitions"):
+        _compile_split(dataset=tmp_path, windows=windows, labels=[])
+
+
+def test_compile_split_rejects_duplicate_core_from_overlapping_windows(
+    tmp_path: Path,
+) -> None:
+    paths = []
+    for window_id in ("w0", "w1"):
+        path = tmp_path / window_id / "semantic_split_features.npz"
+        path.parent.mkdir(parents=True)
+        _write_window_bundle(path)
+        paths.append(path)
+    windows = [
+        {
+            "window_id": window_id,
+            "video_id": "vid0",
+            "source_id": "source-0",
+            "source_partition": "train",
+            "semantic_split_training_manifest_allowed": True,
+            "source_start_s": 0.0,
+            "semantic_split_features": str(path),
+        }
+        for window_id, path in zip(("w0", "w1"), paths)
+    ]
+    labels = [
+        {
+            "window_id": window_id,
+            "feature_index": 1,
+            "label": "cut",
+            "prompt_version": VALID_SPLIT_PROMPT_VERSION,
+        }
+        for window_id in ("w0", "w1")
+    ]
+    with pytest.raises(ValueError, match="duplicated by overlapping source windows"):
+        _compile_split(dataset=tmp_path, windows=windows, labels=labels)
+
+
+def test_compile_split_rejects_unverified_runtime_candidate_distribution(
+    tmp_path: Path,
+) -> None:
+    bundle_path = tmp_path / "w0" / "semantic_split_features.npz"
+    bundle_path.parent.mkdir(parents=True)
+    _write_window_bundle(bundle_path)
+    windows = [
+        {
+            "window_id": "w0",
+            "video_id": "vid0",
+            "source_id": "source-0",
+            "source_partition": "train",
+            "source_start_s": 0.0,
+            "semantic_split_features": str(bundle_path),
+            "semantic_split_training_manifest_allowed": False,
+        }
+    ]
+    labels = [
+        {
+            "window_id": "w0",
+            "feature_index": 1,
+            "label": "cut",
+            "prompt_version": VALID_SPLIT_PROMPT_VERSION,
+        }
+    ]
+    with pytest.raises(ValueError, match="not approved for Split v4 training"):
+        _compile_split(dataset=tmp_path, windows=windows, labels=labels)
+
+
+def test_compile_split_rejects_audit_only_feature_bundle(tmp_path: Path) -> None:
+    bundle_path = tmp_path / "w0" / "semantic_split_features.npz"
+    bundle_path.parent.mkdir(parents=True)
+    _write_window_bundle(bundle_path)
+    with np.load(bundle_path) as source:
+        arrays = {key: np.asarray(source[key]) for key in source.files}
+    np.savez(
+        bundle_path,
+        **arrays,
+        training_manifest_allowed=np.asarray([False]),
+        input_distribution=np.asarray(["retired_candidate_time_remap"]),
+    )
+    windows = [
+        {
+            "window_id": "w0",
+            "video_id": "vid0",
+            "source_id": "source-0",
+            "source_partition": "train",
+            "source_start_s": 0.0,
+            "semantic_split_features": str(bundle_path),
+            "semantic_split_training_manifest_allowed": True,
+        }
+    ]
+    labels = [
+        {
+            "window_id": "w0",
+            "feature_index": 1,
+            "label": "cut",
+            "prompt_version": VALID_SPLIT_PROMPT_VERSION,
+        }
+    ]
+    with pytest.raises(ValueError, match="audit-only, not training-ready"):
+        _compile_split(dataset=tmp_path, windows=windows, labels=labels)

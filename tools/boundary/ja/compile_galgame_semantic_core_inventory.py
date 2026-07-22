@@ -6,7 +6,7 @@ import argparse
 import hashlib
 import json
 import sys
-from collections import Counter
+from collections import Counter, defaultdict
 from pathlib import Path
 from typing import Any
 
@@ -66,11 +66,44 @@ def compile_inventory(
         raise ValueError(f"teacher labels overlap excluded cores: {len(overlap)}")
 
     approved = [row for row in label_rows if row.get("label") == "all_semantic"]
-    if len(approved) < count:
-        raise ValueError(f"approved semantic cores {len(approved)} < requested {count}")
+    source_partitions: dict[str, set[str]] = defaultdict(set)
+    approved_core_ids: list[str] = []
+    for row in approved:
+        partition = str(row.get("source_partition") or "").strip()
+        source_id = str(row.get("source_id") or row.get("audio_id") or "").strip()
+        core_id = str(row.get("core_id") or row.get("audio_id") or "").strip()
+        if partition not in {"train", "val", "test"} or not source_id:
+            raise ValueError(
+                "approved semantic-core labels require frozen source_id and "
+                "source_partition before inventory sampling"
+            )
+        if not core_id:
+            raise ValueError("approved semantic-core label is missing core_id")
+        source_partitions[source_id].add(partition)
+        approved_core_ids.append(core_id)
+    if any(len(values) != 1 for values in source_partitions.values()):
+        raise ValueError("approved semantic-core source identity crosses partitions")
+    duplicate_cores = sorted(
+        core_id for core_id, uses in Counter(approved_core_ids).items() if uses > 1
+    )
+    if duplicate_cores:
+        raise ValueError(
+            f"approved semantic-core identity is duplicated: {duplicate_cores[:3]}"
+        )
     rng = np.random.default_rng(seed)
-    indexes = rng.choice(len(approved), size=count, replace=False)
-    selected = [approved[int(index)] for index in indexes]
+    val_count = int(round(count * 0.10))
+    test_count = int(round(count * 0.05))
+    quotas = {"train": count - val_count - test_count, "val": val_count, "test": test_count}
+    selected: list[dict[str, Any]] = []
+    for partition in ("train", "val", "test"):
+        pool = [row for row in approved if row["source_partition"] == partition]
+        if len(pool) < quotas[partition]:
+            raise ValueError(
+                f"approved {partition} semantic cores {len(pool)} < requested "
+                f"{quotas[partition]}"
+            )
+        indexes = rng.choice(len(pool), size=quotas[partition], replace=False)
+        selected.extend(pool[int(index)] for index in indexes)
     output_rows = [
         {
             "schema": INVENTORY_SCHEMA,
@@ -79,6 +112,9 @@ def compile_inventory(
             "approval_model": str(row["model"]),
             "approval_label": "all_semantic",
             "audio_id": str(row["audio_id"]),
+            "core_id": str(row.get("core_id") or row["audio_id"]),
+            "source_id": str(row.get("source_id") or row["audio_id"]),
+            "source_partition": str(row["source_partition"]),
             "audio": str(row["audio"]),
             "duration_s": float(row["duration_s"]),
             "text": str(row["reference_text"]),
@@ -102,8 +138,11 @@ def compile_inventory(
         "teacher_label_counts": dict(sorted(label_counts.items())),
         "approved_available_count": len(approved),
         "selected_count": len(output_rows),
-        "unique_core_count": len({row["audio_id"] for row in output_rows}),
+        "unique_core_count": len({row["core_id"] for row in output_rows}),
         "max_core_use_count": 1,
+        "partition_counts": dict(
+            sorted(Counter(row["source_partition"] for row in output_rows).items())
+        ),
         "excluded_total_audio_id_count": len(excluded),
         "excluded_candidate_audio_id_count": len(excluded_candidate_ids),
         "excluded_source_audio_id_count": len(excluded_source_ids),

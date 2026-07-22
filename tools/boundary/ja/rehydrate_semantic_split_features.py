@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+"""Rehydrate features for retired Split experiments; never training-ready."""
+
 from __future__ import annotations
 
 import argparse
@@ -112,9 +114,15 @@ def run(args: argparse.Namespace) -> None:
         proposal_times_s=np.asarray([row["time_s"] for row in rows], dtype=np.float32),
         core_starts_s=np.asarray([row["core_start"] for row in rows], dtype=np.float32),
         core_ends_s=np.asarray([row["core_end"] for row in rows], dtype=np.float32),
+        training_manifest_allowed=np.asarray([False]),
+        input_distribution=np.asarray(
+            ["retired_scorer_probability_conditioned_split_features"]
+        ),
     )
     summary = {
         "schema": "rehydrated_semantic_split_features_v1",
+        "training_manifest_allowed": False,
+        "input_distribution": "retired_scorer_probability_conditioned_split_features",
         "ptm_repo_id": args.ptm_repo_id,
         "candidate_count": len(rows),
         "frame_shape": list(np.stack(frame_rows).shape),

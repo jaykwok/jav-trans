@@ -29,6 +29,7 @@ from boundary.inner_refiner_v2 import (
 from tools.boundary.ja.train_inner_edge_refiner_v2_binary import (
     load_binary as load_inner_binary,
     parse_args as parse_inner_train_args,
+    validate_dataset_rows as validate_inner_dataset_rows,
 )
 from tools.boundary.ja.train_outer_edge_refiner_v3_binary import (
     CANDIDATE_SCORER_V11_SCHEMA,
@@ -152,6 +153,8 @@ def _outer_row(source: str, core: str, partition: str, frames: int) -> dict:
         "frame_count": frames,
         "input_distribution": "post_candidate_island_scorer_v11_islands",
         "scorer_schema": CANDIDATE_SCORER_V11_SCHEMA,
+        "training_manifest_allowed": True,
+        "scorer_checkpoint_sha256": "a" * 64,
     }
 
 
@@ -302,6 +305,28 @@ def test_inner_v2_loader_uses_manifest_frame_slice(tmp_path) -> None:
     assert features[:, -1].tolist() == pytest.approx([0.0, 0.5, 1.0])
 
 
+def test_inner_v2_loader_rejects_label_slice_length_mismatch(tmp_path) -> None:
+    source = tmp_path / "source.npz"
+    labels = tmp_path / "labels.npz"
+    np.savez(
+        source,
+        ptm=np.zeros((6, 4), dtype=np.float32),
+        mfcc=np.zeros((6, 2), dtype=np.float32),
+    )
+    np.savez(labels, labels=np.asarray([0, 1], dtype=np.int64))
+
+    with pytest.raises(ValueError, match="feature/label slice mismatch"):
+        load_inner_binary(
+            {
+                "row_id": "row",
+                "source_feature_path": str(source),
+                "label_path": str(labels),
+                "start_frame": 2,
+                "end_frame": 5,
+            }
+        )
+
+
 def test_inner_v2_checkpoint_is_binary_acoustic_and_rejects_v1_schema(tmp_path) -> None:
     torch = pytest.importorskip("torch")
     config = {
@@ -338,6 +363,26 @@ def test_inner_v2_trainer_has_no_legacy_warm_start_surface(monkeypatch) -> None:
     args = parse_inner_train_args()
     assert args.dataset_manifest == "manifest.jsonl"
     assert not hasattr(args, "warm_start")
+
+
+def test_inner_v2_dataset_requires_approved_unique_post_cueqc_rows() -> None:
+    def row(partition: str) -> dict:
+        return {
+            "source_id": f"source-{partition}",
+            "core_id": f"core-{partition}",
+            "subisland_id": f"sub-{partition}",
+            "partition": partition,
+            "input_distribution": "post_cueqc_v13_keep_subislands",
+            "cueqc_label": "keep",
+            "cueqc_checkpoint_sha256": "a" * 64,
+            "training_manifest_allowed": True,
+        }
+
+    rows = [row(partition) for partition in ("train", "val", "test")]
+    assert validate_inner_dataset_rows(rows)["core_count"] == 3
+    rows[0]["training_manifest_allowed"] = False
+    with pytest.raises(ValueError, match="approved training manifest"):
+        validate_inner_dataset_rows(rows)
 
 
 def test_inner_v2_runtime_uses_binary_argmax_for_core_or_drop() -> None:

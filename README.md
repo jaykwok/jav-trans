@@ -178,6 +178,8 @@ src/checkpoints/
 
 1.7B 的目标 Boundary pipeline 统一使用合同 `boundary_acoustic_binary_v12`：Scorer v11 → Proposal v1 → Outer v3 → Acoustic Split v4 → provisional sub-islands → CueQC v13 → Inner v2 acoustic core → Chunk/ASR。Outer v3 必须等实际 post-Scorer-v11 输出分布训练并通过人工 gate 后才可注册；模型缺失、repo 不匹配、合同不兼容或选择 0.6B 都会直接报错，不提供规则 fallback 或静默迁移。实验指标与版本决策见 [docs/HISTORY.md](docs/HISTORY.md)。
 
+当前训练数据状态：完整 1.7B 链尚不可直接重训。Scorer v11缺 current canonical/feature/trainer闭环，Proposal v1历史训练产物不可复现，Outer v3缺真实 post-Scorer-v11数据 compiler；Split v4、CueQC v13和Inner v2的现役权重只保留为旧链审计/运行参考，其训练 provenance不满足当前固定 source/core/partition合同。新的数据入口会拒绝 hash/随机重分区、重复 core、未批准 manifest、旧中央合同以及缺失或不匹配的上游 checkpoint SHA；不能通过修改 metadata或重新绑定旧权重绕过。完整证据与合法重训顺序见 [1.7B Boundary 训练数据生成链职责审计](docs/audits/20260722_boundary-training-data-generation-audit-v1.md)。
+
 ---
 
 ## 默认配置

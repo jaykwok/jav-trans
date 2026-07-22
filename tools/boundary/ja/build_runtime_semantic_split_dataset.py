@@ -637,6 +637,8 @@ def run(args: argparse.Namespace) -> None:
     }
     summary = {
         "schema": SEMANTIC_SPLIT_FEATURE_SCHEMA,
+        "training_manifest_allowed": False,
+        "input_distribution": "retired_scorer_v8_v10_threshold_hysteresis",
         "candidate_source": (
             "learned_boundary_proposal_v1"
             if proposal_bundle is not None

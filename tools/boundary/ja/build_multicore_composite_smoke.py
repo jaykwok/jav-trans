@@ -159,11 +159,17 @@ def _negative_matches(row: dict[str, Any], flags: set[str]) -> bool:
 def select_overlay_rows(
     path: Path, *, min_duration_s: float
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    candidates = _rows(path)
+    for row in candidates:
+        if not str(row.get("source_id") or "").strip():
+            raise ValueError("overlay manifest row is missing frozen source_id")
+        if str(row.get("source_partition") or "") not in {"train", "val", "test"}:
+            raise ValueError("overlay manifest row has invalid frozen partition")
     rows = [
         row
-        for row in _rows(path)
+        for row in candidates
         if Path(str(row.get("audio") or "")).exists()
-        and str(row.get("source_partition") or "train") == "train"
+        and str(row["source_partition"]) == "train"
         and float(row.get("duration_s") or 0.0) >= float(min_duration_s)
     ]
     music = sorted(
@@ -222,8 +228,9 @@ def _overlay_audio(
     )
     return values, {
         "audio_id": str(row.get("audio_id") or Path(str(row["audio"])).stem),
+        "source_id": str(row["source_id"]),
         "source_audio": str(row["audio"]),
-        "source_partition": str(row.get("source_partition") or "train"),
+        "source_partition": str(row["source_partition"]),
         "background_type": str(row.get("background_type") or "unknown"),
         "omni_flags": [str(value) for value in row.get("omni_flags") or []],
         "source_offset_sample": int(offset),
@@ -503,6 +510,7 @@ def build_smoke(
                 "semantic_unit_count": core["semantic_unit_count"],
                 "pipeline_entry_stage": "outer_edge_refiner_v3",
                 "scorer_bypassed": True,
+                "training_manifest_allowed": False,
                 "scorer_bypass_contract": "confirmed_semantic_source_is_already_a_high_recall_island_v1",
             }
         )
@@ -722,6 +730,7 @@ def build_smoke(
                 "overlay": recipe["overlay"],
                 "pipeline_entry_stage": "semantic_speech_scorer",
                 "scorer_required": True,
+                "training_manifest_allowed": False,
                 **recipe["truth"],
             }
         )

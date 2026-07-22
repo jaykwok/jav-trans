@@ -12,23 +12,32 @@ from boundary.sequence_store import load_sequence_arrays
 IGNORE_ID = -100
 
 
-def source_id_from_group_id(group_id: str) -> str:
-    """Return the frozen source identity shared by all islands of one source."""
-
-    value = str(group_id)
-    marker = "|island"
-    return value.split(marker, 1)[0] if marker in value else value
-
-
 def validate_source_partition_isolation(data: dict[str, Any]) -> None:
     """Require every island from one source to stay in exactly one partition."""
 
+    if "source_ids" not in data or "core_ids" not in data:
+        raise ValueError(
+            "Split v4 dataset requires explicit frozen source_ids/core_ids; "
+            "legacy group-name inference is rejected"
+        )
     source_partitions: dict[str, set[str]] = defaultdict(set)
+    core_partitions: dict[str, set[str]] = defaultdict(set)
+    core_groups: dict[str, set[str]] = defaultdict(set)
     for group_id, indexes in data["groups"].items():
         partitions = set(data["partitions"][indexes].astype(str).tolist())
         if len(partitions) != 1:
             raise ValueError(f"group {group_id!r} crosses dataset partitions")
-        source_partitions[source_id_from_group_id(group_id)].update(partitions)
+        sources = set(data["source_ids"][indexes].astype(str).tolist())
+        cores = set(data["core_ids"][indexes].astype(str).tolist())
+        if len(sources) != 1 or "" in sources:
+            raise ValueError(f"group {group_id!r} has inconsistent source identity")
+        if len(cores) != 1 or "" in cores:
+            raise ValueError(f"group {group_id!r} has inconsistent core identity")
+        source_id = next(iter(sources))
+        core_id = next(iter(cores))
+        source_partitions[source_id].update(partitions)
+        core_partitions[core_id].update(partitions)
+        core_groups[core_id].add(str(group_id))
     leaked = {
         source_id: sorted(partitions)
         for source_id, partitions in source_partitions.items()
@@ -39,6 +48,20 @@ def validate_source_partition_isolation(data: dict[str, Any]) -> None:
         raise ValueError(
             f"source {source_id!r} crosses dataset partitions: {leaked[source_id]}"
         )
+    leaked_cores = {
+        core_id: sorted(partitions)
+        for core_id, partitions in core_partitions.items()
+        if len(partitions) != 1
+    }
+    if leaked_cores:
+        core_id = sorted(leaked_cores)[0]
+        raise ValueError(
+            f"core {core_id!r} crosses dataset partitions: {leaked_cores[core_id]}"
+        )
+    reused = {core_id: groups for core_id, groups in core_groups.items() if len(groups) > 1}
+    if reused:
+        core_id = sorted(reused)[0]
+        raise ValueError(f"core {core_id!r} is reused by multiple Split groups")
 
 
 def load_island_dataset(path: Path) -> dict[str, Any]:
@@ -49,6 +72,8 @@ def load_island_dataset(path: Path) -> dict[str, Any]:
         "labels",
         "partitions",
         "group_ids",
+        "source_ids",
+        "core_ids",
     )
     for key in required:
         if key not in bundle:
@@ -65,6 +90,8 @@ def load_island_dataset(path: Path) -> dict[str, Any]:
         "scalars": bundle["scalar_features"].astype(np.float32, copy=False),
         "labels": bundle["labels"].astype(np.int64),
         "partitions": bundle["partitions"].astype(str),
+        "source_ids": bundle["source_ids"].astype(str),
+        "core_ids": bundle["core_ids"].astype(str),
         "dataset_roles": (
             bundle["dataset_roles"].astype(str)
             if "dataset_roles" in bundle

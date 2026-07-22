@@ -78,6 +78,21 @@ def _validate_runtime_rows(rows: list[dict[str, Any]]) -> None:
         seen.add(item_id)
         if row.get("schema") != "runtime_v12_provisional_subisland_v1":
             raise ValueError("CueQC v13 teacher requires fresh Runtime v12 chunks")
+        source_id = str(row.get("source_id") or "").strip()
+        partition = str(row.get("source_partition") or "").strip()
+        if not source_id or partition not in {"train", "val", "test"}:
+            raise ValueError(
+                "CueQC v13 teacher requires frozen source_id and source partition"
+            )
+        if row.get("training_manifest_allowed") is not True:
+            raise ValueError("CueQC v13 teacher requires an approved runtime manifest")
+        for key in (
+            "semantic_split_weights_sha256",
+            "inner_edge_refiner_weights_sha256",
+        ):
+            value = str(row.get(key) or "").lower()
+            if len(value) != 64 or any(ch not in "0123456789abcdef" for ch in value):
+                raise ValueError(f"CueQC v13 runtime row is missing exact {key}")
         candidate = row.get("pre_asr_candidate") or {}
         if not ACOUSTIC_BINARY_V12_CONTRACT.matches(
             candidate.get("boundary_contract_id")
@@ -397,7 +412,8 @@ def run(args: argparse.Namespace) -> None:
                     "model": model,
                     "sample_id": str(row["sample_id"]),
                     "subisland_id": item_id,
-                    "source_partition": str(row.get("source_partition") or "train"),
+                    "source_id": str(row["source_id"]),
+                    "source_partition": str(row["source_partition"]),
                     "audio": str(row["audio"]),
                     "start_s": float(row["start_s"]),
                     "end_s": float(row["end_s"]),

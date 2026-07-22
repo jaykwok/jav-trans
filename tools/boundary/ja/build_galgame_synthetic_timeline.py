@@ -1,4 +1,10 @@
 #!/usr/bin/env python3
+"""Build legacy synthetic timelines for offline distribution experiments.
+
+This CLI predates frozen source/core manifests and must not be used as a current
+Scorer v11, Split v4, CueQC v13, Outer v3, or Inner v2 training-data compiler.
+Current builders may import its audio-only helper functions.
+"""
 from __future__ import annotations
 
 import argparse
@@ -1652,6 +1658,8 @@ def build_synthetic_timeline(args: argparse.Namespace) -> None:
             frame_hop_s=args.frame_hop_s,
         )
         boundary_metadata = {
+            "training_manifest_allowed": False,
+            "training_block_reason": "legacy_hash_partition_synthetic_timeline",
             "source_partition": source_partition,
             "timeline_pattern_mode": args.timeline_pattern_mode,
             "timeline_pattern": hardmix_layout["pattern"],
@@ -1697,6 +1705,8 @@ def build_synthetic_timeline(args: argparse.Namespace) -> None:
                 "duration_s": duration_s,
                 "sample_rate": sample_rate,
                 "source": args.source,
+                "training_manifest_allowed": False,
+                "training_block_reason": "legacy_hash_partition_synthetic_timeline",
                 "source_partition": source_partition,
                 "timeline_pattern_mode": args.timeline_pattern_mode,
                 "timeline_pattern": hardmix_layout["pattern"],
@@ -1733,6 +1743,8 @@ def build_synthetic_timeline(args: argparse.Namespace) -> None:
                 "duration_s": duration_s,
                 "sample_rate": sample_rate,
                 "source": args.source,
+                "training_manifest_allowed": False,
+                "training_block_reason": "legacy_hash_partition_synthetic_timeline",
                 "source_partition": source_partition,
                 "timeline_pattern_mode": args.timeline_pattern_mode,
                 "timeline_pattern": hardmix_layout["pattern"],
@@ -1766,6 +1778,8 @@ def build_synthetic_timeline(args: argparse.Namespace) -> None:
         detail_rows.append(
             {
                 "audio_id": audio_id,
+                "training_manifest_allowed": False,
+                "training_block_reason": "legacy_hash_partition_synthetic_timeline",
                 "source_partition": source_partition,
                 "timeline_pattern_mode": args.timeline_pattern_mode,
                 "timeline_pattern": hardmix_layout["pattern"],
@@ -1816,6 +1830,8 @@ def build_synthetic_timeline(args: argparse.Namespace) -> None:
     utterance_boundary_count = sum(len(row.get("utterance_boundaries") or []) for row in boundary_rows)
     source_usage = summarize_source_usage(detail_rows)
     summary = {
+        "training_manifest_allowed": False,
+        "training_block_reason": "legacy_hash_partition_synthetic_timeline",
         "manifest": str(Path(args.manifest)),
         "records": len(records),
         "source_rows": len(source_rows),

@@ -36,9 +36,63 @@ from asr.pre_asr_cueqc import (  # noqa: E402
     ptm_bin_matrix,
     scalar_vector,
 )
+from boundary.contracts import ACOUSTIC_BINARY_V12_CONTRACT  # noqa: E402
 
 
 FEATURE_BUNDLE_SCHEMA = "cueqc_pre_asr_semantic_chunk_v13_features"
+
+
+def _required_sha256(value: Any, *, field: str, row_id: str) -> str:
+    normalized = str(value or "").strip().lower()
+    if len(normalized) != 64 or any(
+        character not in "0123456789abcdef" for character in normalized
+    ):
+        raise ValueError(f"CueQC chunk {row_id!r} is missing exact {field}")
+    return normalized
+
+
+def _training_chunk_provenance(
+    chunk: Mapping[str, Any],
+    candidate: Mapping[str, Any],
+    *,
+    row_id: str,
+) -> tuple[str, str, list[str]]:
+    if chunk.get("training_manifest_allowed") is not True:
+        raise ValueError(
+            f"CueQC chunk {row_id!r} is not an approved training manifest row"
+        )
+    contract_id = str(
+        chunk.get("boundary_serialization_contract_id")
+        or candidate.get("boundary_serialization_contract_id")
+        or ""
+    )
+    if not ACOUSTIC_BINARY_V12_CONTRACT.matches(contract_id):
+        raise ValueError(f"CueQC chunk {row_id!r} uses a stale Boundary contract")
+    if not ACOUSTIC_BINARY_V12_CONTRACT.matches(
+        candidate.get("boundary_contract_id")
+    ):
+        raise ValueError(
+            f"CueQC chunk {row_id!r} has stale candidate boundary features"
+        )
+    split_sha256 = _required_sha256(
+        chunk.get("semantic_split_weights_sha256")
+        or candidate.get("semantic_split_weights_sha256"),
+        field="semantic_split_weights_sha256",
+        row_id=row_id,
+    )
+    inner_sha256 = _required_sha256(
+        chunk.get("inner_edge_refiner_weights_sha256")
+        or candidate.get("inner_edge_refiner_weights_sha256"),
+        field="inner_edge_refiner_weights_sha256",
+        row_id=row_id,
+    )
+    raw_core_ids = chunk.get("source_core_ids", candidate.get("source_core_ids"))
+    if not isinstance(raw_core_ids, list):
+        raise ValueError(f"CueQC chunk {row_id!r} is missing source_core_ids")
+    core_ids = [str(value).strip() for value in raw_core_ids]
+    if any(not value for value in core_ids) or len(core_ids) != len(set(core_ids)):
+        raise ValueError(f"CueQC chunk {row_id!r} has invalid source_core_ids")
+    return split_sha256, inner_sha256, core_ids
 
 
 def project_path(value: str | Path) -> Path:
@@ -321,6 +375,14 @@ def candidate_for_chunk(chunks: list[dict[str, Any]], index: int) -> dict[str, A
         candidate = candidate_from_span(chunks, index, require_ptm_pooling=True)
     candidate.setdefault("sample_id", str(chunk.get("subisland_id") or ""))
     candidate.setdefault("source_sample_id", str(chunk.get("sample_id") or ""))
+    candidate.setdefault(
+        "semantic_split_weights_sha256",
+        str(chunk.get("semantic_split_weights_sha256") or ""),
+    )
+    candidate.setdefault(
+        "inner_edge_refiner_weights_sha256",
+        str(chunk.get("inner_edge_refiner_weights_sha256") or ""),
+    )
     if not _has_required_ptm_pooling(candidate):
         raise ValueError(
             "Pre-ASR CueQC v13 feature compilation requires chunk-level pooled PTM features"
@@ -394,6 +456,8 @@ def compile_features(
     labels = read_labels(label_paths)
     expanded_chunk_paths = expand_chunk_paths(chunk_paths)
     rows: list[dict[str, Any]] = []
+    row_ids: set[str] = set()
+    core_owners: dict[str, str] = {}
     group_map: dict[tuple[str, str, str], list[int]] = {}
     for path in expanded_chunk_paths:
         source = repo_display_path(path)
@@ -401,6 +465,22 @@ def compile_features(
         for index, chunk in enumerate(chunks):
             candidate = candidate_for_chunk(chunks, index)
             rid = row_id(audio_id, chunk, index)
+            if rid in row_ids:
+                raise ValueError(f"duplicate CueQC provisional subisland identity: {rid}")
+            row_ids.add(rid)
+            split_sha256, inner_sha256, source_core_ids = _training_chunk_provenance(
+                chunk,
+                candidate,
+                row_id=rid,
+            )
+            for core_id in source_core_ids:
+                previous = core_owners.get(core_id)
+                if previous is not None and previous != rid:
+                    raise ValueError(
+                        f"CueQC core {core_id!r} is reused by provisional "
+                        f"subislands {previous!r} and {rid!r}"
+                    )
+                core_owners[core_id] = rid
             label = label_for_chunk(labels, audio_id=audio_id, chunk=chunk, index=index)
             label_index = (
                 PRE_ASR_CUEQC_IGNORE_LABEL if label is None else int(label["label_index"])
@@ -412,6 +492,34 @@ def compile_features(
                 or chunk.get("sample_id")
                 or audio_id
             )
+            source_id = str(
+                chunk.get("source_id") or (label or {}).get("source_id") or ""
+            ).strip()
+            chunk_source_id = str(chunk.get("source_id") or "").strip()
+            label_source_id = str((label or {}).get("source_id") or "").strip()
+            if chunk_source_id and label_source_id and chunk_source_id != label_source_id:
+                raise ValueError(
+                    f"CueQC chunk/label source mismatch for {rid!r}: "
+                    f"{chunk_source_id!r} != {label_source_id!r}"
+                )
+            if not source_id:
+                raise ValueError(f"CueQC chunk {rid!r} has no frozen source_id")
+            dataset_role = str(
+                chunk.get("source_partition")
+                or (label or {}).get("source_partition")
+                or ""
+            ).strip()
+            chunk_partition = str(chunk.get("source_partition") or "").strip()
+            label_partition = str((label or {}).get("source_partition") or "").strip()
+            if chunk_partition and label_partition and chunk_partition != label_partition:
+                raise ValueError(
+                    f"CueQC chunk/label partition mismatch for {rid!r}: "
+                    f"{chunk_partition!r} != {label_partition!r}"
+                )
+            if dataset_role not in {"train", "val", "test"}:
+                raise ValueError(
+                    f"CueQC chunk {rid!r} has no frozen train/val/test source partition"
+                )
             row_index = len(rows)
             group_map.setdefault(group_key, []).append(row_index)
             rows.append(
@@ -421,11 +529,9 @@ def compile_features(
                     "audio_id": candidate_audio_id,
                     "audio": str(chunk.get("audio") or candidate.get("audio") or ""),
                     "video_id": _source_video_id(candidate, candidate_audio_id),
-                    "dataset_role": str(
-                        chunk.get("source_partition")
-                        or (label or {}).get("source_partition")
-                        or ""
-                    ),
+                    "source_id": source_id,
+                    "source_core_ids": source_core_ids,
+                    "dataset_role": dataset_role,
                     "planned_island_id": str(candidate.get("planned_island_id") or "sequence"),
                     "chunk_index": int(candidate["index"]),
                     "start": candidate["start"],
@@ -457,10 +563,16 @@ def compile_features(
                         or ""
                     ),
                     "candidate": candidate,
+                    "semantic_split_weights_sha256": split_sha256,
+                    "inner_edge_refiner_weights_sha256": inner_sha256,
                 }
             )
     groups: list[list[int]] = []
     for row_indexes in group_map.values():
+        group_roles = {str(rows[row_index]["dataset_role"]) for row_index in row_indexes}
+        group_sources = {str(rows[row_index]["source_id"]) for row_index in row_indexes}
+        if len(group_roles) != 1 or len(group_sources) != 1:
+            raise ValueError("CueQC sequence group crosses source identity or partition")
         if any(int(rows[row_index]["label_index"]) in (0, 1) for row_index in row_indexes):
             groups.append(row_indexes)
     if not groups:
@@ -474,6 +586,18 @@ def compile_features(
     if len(projection_digests) > 1:
         raise ValueError(f"multiple PTM projection digests in feature bundle: {sorted(projection_digests)}")
     ptm_projection_digest = next(iter(projection_digests), "")
+    split_checkpoint_shas = {
+        str(rows[row_index]["semantic_split_weights_sha256"])
+        for group in groups
+        for row_index in group
+    }
+    inner_checkpoint_shas = {
+        str(rows[row_index]["inner_edge_refiner_weights_sha256"])
+        for group in groups
+        for row_index in group
+    }
+    if len(split_checkpoint_shas) > 1 or len(inner_checkpoint_shas) > 1:
+        raise ValueError("CueQC feature bundle mixes upstream checkpoint identities")
     pooling_schemas = sorted(
         {
             str(rows[row_index]["candidate"].get("ptm_pooling_schema") or "")
@@ -499,6 +623,14 @@ def compile_features(
             "row_ids": [rows[row_index]["id"] for row_index in group],
             "audio_id": rows[group[0]]["audio_id"],
             "video_id": rows[group[0]]["video_id"],
+            "source_id": rows[group[0]]["source_id"],
+            "source_core_ids": sorted(
+                {
+                    core_id
+                    for row_index in group
+                    for core_id in rows[row_index]["source_core_ids"]
+                }
+            ),
             "planned_island_id": rows[group[0]]["planned_island_id"],
             "dataset_role": rows[group[0]]["dataset_role"],
         }
@@ -513,8 +645,14 @@ def compile_features(
         "ptm_bin_count": PRE_ASR_CUEQC_MODEL_PTM_TOKENS,
         "ptm_dim": PRE_ASR_CUEQC_PTM_DIM,
         "asr_repo_id": selected_repo,
+        "boundary_serialization_contract_id": (
+            ACOUSTIC_BINARY_V12_CONTRACT.contract_id
+        ),
+        "training_manifest_allowed": True,
         "ptm_pooling_schemas": pooling_schemas,
         "ptm_projection_digest": ptm_projection_digest,
+        "semantic_split_weights_sha256": next(iter(split_checkpoint_shas), ""),
+        "inner_edge_refiner_weights_sha256": next(iter(inner_checkpoint_shas), ""),
         "teacher_unsure_ignored": teacher_unsure_ignored,
         "created_at": datetime.now().isoformat(timespec="seconds"),
         "rows": row_payload,
@@ -532,8 +670,14 @@ def compile_features(
         "runtime_adapter": PRE_ASR_CUEQC_RUNTIME_ADAPTER,
         "feature_names": list(PRE_ASR_CUEQC_SCALAR_FEATURE_NAMES),
         "asr_repo_id": selected_repo,
+        "boundary_serialization_contract_id": (
+            ACOUSTIC_BINARY_V12_CONTRACT.contract_id
+        ),
+        "training_manifest_allowed": True,
         "ptm_pooling_schemas": pooling_schemas,
         "ptm_projection_digest": ptm_projection_digest,
+        "semantic_split_weights_sha256": next(iter(split_checkpoint_shas), ""),
+        "inner_edge_refiner_weights_sha256": next(iter(inner_checkpoint_shas), ""),
         "group_count": int(len(groups)),
         "chunk_count": int(np.sum(y != PRE_ASR_CUEQC_IGNORE_LABEL)),
         "keep": int(np.sum(y == 1)),

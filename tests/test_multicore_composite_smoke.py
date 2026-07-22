@@ -57,6 +57,7 @@ def _write_inputs(tmp_path: Path, *, core_count: int = 10) -> tuple[Path, Path, 
             {
                 "audio": str(audio),
                 "audio_id": audio_id,
+                "source_id": f"source-{audio_id}",
                 "background_type": flag,
                 "omni_flags": flag.split("+"),
                 "source_partition": partition,

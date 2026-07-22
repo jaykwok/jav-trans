@@ -47,6 +47,26 @@ def compile_labels(
 ) -> dict[str, Any]:
     runtime_rows = _rows(runtime_chunks)
     runtime = _unique_by_id(runtime_rows, name="runtime")
+    source_partitions: dict[str, set[str]] = defaultdict(set)
+    for row in runtime_rows:
+        sample_id = str(row.get("sample_id") or "").strip()
+        source_id = str(row.get("source_id") or "").strip()
+        partition = str(row.get("source_partition") or "").strip()
+        if not sample_id or not source_id:
+            raise ValueError("runtime row is missing frozen sample/source identity")
+        if partition not in {"train", "val", "test"}:
+            raise ValueError(
+                f"runtime row {row.get('subisland_id')!r} has invalid frozen "
+                f"source_partition: {partition!r}"
+            )
+        source_partitions[source_id].add(partition)
+    leaked_sources = sorted(
+        source_id for source_id, values in source_partitions.items() if len(values) != 1
+    )
+    if leaked_sources:
+        raise ValueError(
+            f"CueQC source identity crosses partitions: {leaked_sources[:3]}"
+        )
     observed: dict[str, list[dict[str, Any]]] = defaultdict(list)
     for row in _rows(teacher_labels):
         item_id = str(row.get("subisland_id") or "").strip()
@@ -105,8 +125,10 @@ def compile_labels(
             {
                 "schema": "cueqc_v13_canonical_label_v1",
                 "sample_id": str(chunk["sample_id"]),
+                "source_id": str(chunk["source_id"]),
                 "subisland_id": item_id,
-                "source_partition": str(chunk.get("source_partition") or "train"),
+                "query_id": item_id,
+                "source_partition": str(chunk["source_partition"]),
                 "audio": str(chunk["audio"]),
                 "start_s": float(chunk["start_s"]),
                 "end_s": float(chunk["end_s"]),
@@ -139,6 +161,12 @@ def compile_labels(
         "duplicate_request_conflict_count": conflicts,
         "manual_override_count": manual_count,
         "exact_label_count": len(exact),
+        "source_count": len(source_partitions),
+        "partition_counts": dict(
+            sorted(
+                Counter(next(iter(values)) for values in source_partitions.values()).items()
+            )
+        ),
         "output": str(output),
     }
     output.with_suffix(".summary.json").write_text(

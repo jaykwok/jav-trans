@@ -21,30 +21,7 @@ from boundary.sequence_store import (  # noqa: E402
 )
 
 
-SEQUENCE_KEYS = ("group_ids", "times_s", "structural_roles", "pair_ids", "omni_aux")
 _FRAME_COPY_CHUNK = 16384
-
-
-def stratified_sample_indexes(
-    bundle: dict,
-    *,
-    fraction: float,
-    rng: np.random.Generator,
-) -> np.ndarray:
-    total = int(bundle["labels"].shape[0])
-    if fraction >= 1.0:
-        return np.arange(total, dtype=np.int64)
-    labels = bundle["labels"].astype(np.int64)
-    partitions = bundle["partitions"].astype(str)
-    selected: list[np.ndarray] = []
-    for partition in sorted(set(partitions.tolist())):
-        for label in sorted(set(labels[partitions == partition].tolist())):
-            indexes = np.flatnonzero((partitions == partition) & (labels == label))
-            count = max(1, int(round(indexes.size * fraction)))
-            selected.append(
-                np.sort(rng.choice(indexes, size=min(count, indexes.size), replace=False))
-            )
-    return np.sort(np.concatenate(selected))
 
 
 def group_row_indexes(bundle: dict) -> dict[str, np.ndarray]:
@@ -102,6 +79,59 @@ def _bundle_mode(bundles: list[dict], paths: list[str]) -> str:
     )
 
 
+def _validate_current_sequence_bundle(bundle: dict, path: str) -> None:
+    required = {
+        "frame_features",
+        "scalar_features",
+        "labels",
+        "partitions",
+        "group_ids",
+        "source_ids",
+        "core_ids",
+    }
+    missing = sorted(required.difference(bundle))
+    if missing:
+        raise ValueError(
+            f"{path}: Split v4 merge requires current sequence identities; "
+            f"missing {missing}"
+        )
+    count = int(bundle["labels"].shape[0])
+    for key in sorted(required.difference({"frame_features"})):
+        if int(bundle[key].shape[0]) != count:
+            raise ValueError(f"{path}: {key} row count does not match labels")
+    partitions = bundle["partitions"].astype(str)
+    source_ids = bundle["source_ids"].astype(str)
+    core_ids = bundle["core_ids"].astype(str)
+    groups = group_row_indexes(bundle)
+    source_partition: dict[str, str] = {}
+    core_group: dict[str, str] = {}
+    for group_id, indexes in groups.items():
+        group_partitions = set(partitions[indexes].tolist())
+        group_sources = set(source_ids[indexes].tolist())
+        group_cores = set(core_ids[indexes].tolist())
+        if len(group_partitions) != 1:
+            raise ValueError(f"{path}: group {group_id!r} crosses partitions")
+        if len(group_sources) != 1 or "" in group_sources:
+            raise ValueError(f"{path}: group {group_id!r} has invalid source identity")
+        if len(group_cores) != 1 or "" in group_cores:
+            raise ValueError(f"{path}: group {group_id!r} has invalid core identity")
+        partition = next(iter(group_partitions))
+        source_id = next(iter(group_sources))
+        core_id = next(iter(group_cores))
+        if partition not in {"train", "val", "test"}:
+            raise ValueError(f"{path}: invalid frozen partition {partition!r}")
+        previous_partition = source_partition.setdefault(source_id, partition)
+        if previous_partition != partition:
+            raise ValueError(
+                f"{path}: source {source_id!r} crosses frozen partitions"
+            )
+        previous_group = core_group.setdefault(core_id, group_id)
+        if previous_group != group_id:
+            raise ValueError(
+                f"{path}: core {core_id!r} is reused by multiple Split groups"
+            )
+
+
 def _sequence_defaults(bundle: dict, indexes: np.ndarray) -> dict[str, np.ndarray]:
     count = int(indexes.size)
     values: dict[str, np.ndarray] = {}
@@ -144,127 +174,34 @@ def run(args: argparse.Namespace) -> None:
             raise ValueError(f"scalar feature shape mismatch: {path}")
     output = Path(args.output)
     output.parent.mkdir(parents=True, exist_ok=True)
-    repeats = [max(1, int(value)) for value in args.repeat]
     fractions = [float(value) for value in args.fraction]
     rng = np.random.default_rng(args.seed)
     mode = _bundle_mode(bundles, args.dataset)
-    if mode == "sequence":
-        _run_sequence_mode(
-            args,
-            bundles=bundles,
-            repeats=repeats,
-            fractions=fractions,
-            rng=rng,
-            output=output,
+    if mode != "sequence":
+        raise ValueError(
+            "row-wise Semantic Split datasets are retired; Split v4 merge "
+            "requires whole candidate-island sequences with source_ids/core_ids"
         )
-        return
-    sampled_indexes = [
-        stratified_sample_indexes(bundle, fraction=fraction, rng=rng)
-        for bundle, fraction in zip(bundles, fractions)
-    ]
-    roles = np.concatenate(
-        [
-            np.full(int(indexes.size) * repeat, role)
-            for role, indexes, repeat in zip(args.role, sampled_indexes, repeats)
-        ]
+    for path, bundle in zip(args.dataset, bundles):
+        _validate_current_sequence_bundle(bundle, path)
+    _run_sequence_mode(
+        args,
+        bundles=bundles,
+        fractions=fractions,
+        rng=rng,
+        output=output,
     )
-    def repeated(
-        bundle: dict,
-        key: str,
-        indexes: np.ndarray,
-        repeat: int,
-    ) -> np.ndarray:
-        values = bundle[key][indexes]
-        return (
-            values
-            if repeat == 1
-            else np.concatenate([values] * repeat, axis=0)
-        )
-
-    save = np.savez_compressed if getattr(args, "compress", False) else np.savez
-    save(
-        output,
-        frame_features=np.concatenate(
-            [
-                repeated(bundle, "frame_features", indexes, repeat).astype(np.float32)
-                for bundle, indexes, repeat in zip(
-                    bundles, sampled_indexes, repeats
-                )
-            ]
-        ),
-        scalar_features=np.concatenate(
-            [
-                repeated(bundle, "scalar_features", indexes, repeat).astype(np.float32)
-                for bundle, indexes, repeat in zip(
-                    bundles, sampled_indexes, repeats
-                )
-            ]
-        ),
-        labels=np.concatenate(
-            [
-                repeated(bundle, "labels", indexes, repeat).astype(np.int64)
-                for bundle, indexes, repeat in zip(
-                    bundles, sampled_indexes, repeats
-                )
-            ]
-        ),
-        partitions=np.concatenate(
-            [
-                repeated(bundle, "partitions", indexes, repeat).astype(str)
-                for bundle, indexes, repeat in zip(
-                    bundles, sampled_indexes, repeats
-                )
-            ]
-        ),
-        dataset_roles=roles,
-    )
-    summary = {
-        "schema": "semantic_split_merged_dataset_v1",
-        "mode": mode,
-        "output": str(output),
-        "count": int(
-            sum(
-                indexes.size * repeat
-                for indexes, repeat in zip(sampled_indexes, repeats)
-            )
-        ),
-        "sources": [
-            {
-                "path": str(path),
-                "role": role,
-                "count": int(bundle["labels"].shape[0]),
-                "fraction": fraction,
-                "sampled_count": int(indexes.size),
-                "repeat": repeat,
-                "effective_count": int(indexes.size * repeat),
-            }
-            for path, role, bundle, fraction, indexes, repeat in zip(
-                args.dataset,
-                args.role,
-                bundles,
-                fractions,
-                sampled_indexes,
-                repeats,
-            )
-        ],
-    }
-    output.with_suffix(".summary.json").write_text(
-        json.dumps(summary, ensure_ascii=False, indent=2) + "\n",
-        encoding="utf-8",
-    )
-    print(json.dumps(summary, ensure_ascii=False))
 
 
 def _run_sequence_mode(
     args: argparse.Namespace,
     *,
     bundles: list[dict],
-    repeats: list[int],
     fractions: list[float],
     rng: np.random.Generator,
     output: Path,
 ) -> None:
-    """Merge island groups whole; repeats duplicate groups under new ids.
+    """Merge current Split v4 island groups whole without core reuse.
 
     Frames are never fully materialized: source frames arrive memmap-backed
     (or in-memory for legacy npz) and stream chunk-by-chunk into a pre-sized
@@ -272,8 +209,10 @@ def _run_sequence_mode(
     """
 
     plans: list[dict] = []
-    for path, role, bundle, fraction, repeat in zip(
-        args.dataset, args.role, bundles, fractions, repeats
+    source_partition: dict[str, str] = {}
+    core_owner: dict[str, str] = {}
+    for path, role, bundle, fraction in zip(
+        args.dataset, args.role, bundles, fractions
     ):
         groups = group_row_indexes(bundle)
         selected = stratified_sample_groups(bundle, fraction=fraction, rng=rng)
@@ -285,20 +224,41 @@ def _run_sequence_mode(
         lengths = np.asarray(
             [int(groups[name].size) for name in selected], dtype=np.int64
         )
+        selected_sources: list[str] = []
+        selected_cores: list[str] = []
+        for name in selected:
+            indexes = groups[name]
+            partition = str(bundle["partitions"][indexes[0]])
+            source_id = str(bundle["source_ids"][indexes[0]])
+            core_id = str(bundle["core_ids"][indexes[0]])
+            previous_partition = source_partition.setdefault(source_id, partition)
+            if previous_partition != partition:
+                raise ValueError(
+                    f"source {source_id!r} crosses input dataset partitions"
+                )
+            owner = f"{path}:{name}"
+            previous_owner = core_owner.setdefault(core_id, owner)
+            if previous_owner != owner:
+                raise ValueError(
+                    f"core {core_id!r} is reused across Split merge inputs"
+                )
+            selected_sources.append(source_id)
+            selected_cores.append(core_id)
         plans.append(
             {
                 "path": path,
                 "role": role,
                 "bundle": bundle,
-                "repeat": repeat,
                 "fraction": fraction,
                 "group_count": len(groups),
                 "selected": selected,
                 "flat": flat,
                 "lengths": lengths,
+                "selected_sources": selected_sources,
+                "selected_cores": selected_cores,
             }
         )
-    total_rows = sum(int(plan["flat"].size) * int(plan["repeat"]) for plan in plans)
+    total_rows = sum(int(plan["flat"].size) for plan in plans)
     if total_rows == 0:
         raise ValueError("sequence merge selected no rows")
     frame_shape = tuple(bundles[0]["frame_features"].shape[1:])
@@ -308,6 +268,8 @@ def _run_sequence_mode(
     scalar_parts: list[np.ndarray] = []
     label_parts: list[np.ndarray] = []
     partition_parts: list[np.ndarray] = []
+    source_id_parts: list[np.ndarray] = []
+    core_id_parts: list[np.ndarray] = []
     role_parts: list[np.ndarray] = []
     group_parts: list[np.ndarray] = []
     time_parts: list[np.ndarray] = []
@@ -324,40 +286,37 @@ def _run_sequence_mode(
         flat = plan["flat"]
         lengths = plan["lengths"]
         selected = plan["selected"]
-        repeat = int(plan["repeat"])
         frames_all = bundle["frame_features"]
         scalars_all = np.asarray(bundle["scalar_features"], dtype=np.float32)
         labels_all = np.asarray(bundle["labels"], dtype=np.int64)
         partitions_all = bundle["partitions"].astype(str)
         total = int(labels_all.shape[0])
         defaults_all = _sequence_defaults(bundle, np.arange(total, dtype=np.int64))
-        sampled_rows = 0
-        for repeat_index in range(repeat):
-            suffix = "" if repeat_index == 0 else f"#r{repeat_index}"
-            sampled_rows += int(flat.size)
-            for start in range(0, int(flat.size), _FRAME_COPY_CHUNK):
-                chunk = flat[start : start + _FRAME_COPY_CHUNK]
-                out_frames[row_offset : row_offset + chunk.size] = frames_all[chunk]
-                row_offset += int(chunk.size)
-            scalar_parts.append(scalars_all[flat])
-            label_parts.append(labels_all[flat])
-            partition_parts.append(partitions_all[flat])
-            role_parts.append(np.full(int(flat.size), role))
-            group_parts.append(
-                np.repeat(
-                    np.asarray([f"{role}::{name}{suffix}" for name in selected]),
-                    lengths,
-                )
+        for start in range(0, int(flat.size), _FRAME_COPY_CHUNK):
+            chunk = flat[start : start + _FRAME_COPY_CHUNK]
+            out_frames[row_offset : row_offset + chunk.size] = frames_all[chunk]
+            row_offset += int(chunk.size)
+        scalar_parts.append(scalars_all[flat])
+        label_parts.append(labels_all[flat])
+        partition_parts.append(partitions_all[flat])
+        source_id_parts.append(bundle["source_ids"].astype(str)[flat])
+        core_id_parts.append(bundle["core_ids"].astype(str)[flat])
+        role_parts.append(np.full(int(flat.size), role))
+        group_parts.append(
+            np.repeat(
+                np.asarray([f"{role}::{name}" for name in selected]),
+                lengths,
             )
-            time_parts.append(defaults_all["times_s"][flat])
-            structural_parts.append(defaults_all["structural_roles"][flat])
-            pairs = defaults_all["pair_ids"][flat].copy()
-            pairs[pairs >= 0] += pair_offset
-            pair_parts.append(pairs)
-            omni_parts.append(defaults_all["omni_aux"][flat])
-            offset_parts.append(defaults_all["offset_targets_s"][flat])
-            if pairs.size and int(pairs.max()) >= 0:
-                pair_offset = int(pairs.max()) + 1
+        )
+        time_parts.append(defaults_all["times_s"][flat])
+        structural_parts.append(defaults_all["structural_roles"][flat])
+        pairs = defaults_all["pair_ids"][flat].copy()
+        pairs[pairs >= 0] += pair_offset
+        pair_parts.append(pairs)
+        omni_parts.append(defaults_all["omni_aux"][flat])
+        offset_parts.append(defaults_all["offset_targets_s"][flat])
+        if pairs.size and int(pairs.max()) >= 0:
+            pair_offset = int(pairs.max()) + 1
         source_summaries.append(
             {
                 "path": str(plan["path"]),
@@ -365,9 +324,8 @@ def _run_sequence_mode(
                 "group_count": plan["group_count"],
                 "sampled_group_count": len(selected),
                 "fraction": plan["fraction"],
-                "repeat": repeat,
-                "effective_group_count": len(selected) * repeat,
-                "effective_count": sampled_rows,
+                "effective_group_count": len(selected),
+                "effective_count": int(flat.size),
             }
         )
     out_frames.flush()
@@ -381,6 +339,8 @@ def _run_sequence_mode(
         scalar_features=np.concatenate(scalar_parts),
         labels=labels,
         partitions=np.concatenate(partition_parts),
+        source_ids=np.concatenate(source_id_parts),
+        core_ids=np.concatenate(core_id_parts),
         dataset_roles=np.concatenate(role_parts),
         group_ids=group_ids,
         times_s=np.concatenate(time_parts),
@@ -390,7 +350,7 @@ def _run_sequence_mode(
         offset_targets_s=np.concatenate(offset_parts),
     )
     summary = {
-        "schema": "semantic_split_merged_dataset_v2",
+        "schema": "semantic_split_merged_dataset_v3",
         "mode": "sequence",
         "output": str(output),
         "count": int(labels.shape[0]),
@@ -408,7 +368,6 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--dataset", action="append", required=True)
     parser.add_argument("--role", action="append", required=True)
-    parser.add_argument("--repeat", action="append", type=int)
     parser.add_argument("--fraction", action="append", type=float)
     parser.add_argument("--seed", type=int, default=13)
     parser.add_argument("--output", required=True)
@@ -423,12 +382,6 @@ def parse_args() -> argparse.Namespace:
     args = parser.parse_args()
     if len(args.dataset) != len(args.role):
         parser.error("--dataset and --role counts must match")
-    if args.repeat is None:
-        args.repeat = [1] * len(args.dataset)
-    if len(args.repeat) != len(args.dataset):
-        parser.error("--repeat and --dataset counts must match")
-    if any(value <= 0 for value in args.repeat):
-        parser.error("--repeat values must be positive")
     if args.fraction is None:
         args.fraction = [1.0] * len(args.dataset)
     if len(args.fraction) != len(args.dataset):

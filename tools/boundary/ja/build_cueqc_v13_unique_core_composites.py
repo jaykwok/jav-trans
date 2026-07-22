@@ -60,13 +60,10 @@ def _limit(audio: np.ndarray) -> tuple[np.ndarray, float]:
     return np.ascontiguousarray(values * gain, dtype=np.float32), float(gain)
 
 
-def _partition(index: int, count: int) -> str:
-    ratio = (index + 0.5) / max(1, count)
-    if ratio < 0.85:
-        return "train"
-    if ratio < 0.95:
-        return "val"
-    return "test"
+def _partition_quotas(count: int) -> dict[str, int]:
+    val = int(round(count * 0.10))
+    test = int(round(count * 0.05))
+    return {"train": count - val - test, "val": val, "test": test}
 
 
 def _gap_duration_quantiles(path: Path) -> dict[str, float]:
@@ -100,11 +97,22 @@ def _snr_values(path: Path) -> np.ndarray:
 
 def _negative_pools(path: Path) -> dict[str, list[dict[str, Any]]]:
     pools: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    source_partitions: dict[str, set[str]] = defaultdict(set)
     for row in _rows(path):
         audio = Path(str(row.get("audio") or ""))
         if not audio.exists():
             continue
-        pools[str(row.get("source_partition") or "train")].append(row)
+        source_id = str(row.get("source_id") or "").strip()
+        partition = str(row.get("source_partition") or "").strip()
+        if not source_id or partition not in {"train", "val", "test"}:
+            raise ValueError(
+                "negative rows require frozen source_id and "
+                "source_partition=train|val|test"
+            )
+        source_partitions[source_id].add(partition)
+        pools[partition].append(row)
+    if any(len(values) != 1 for values in source_partitions.values()):
+        raise ValueError("negative source identity crosses partitions")
     for partition in ("train", "val", "test"):
         if not pools[partition]:
             raise ValueError(f"negative manifest has no {partition} rows")
@@ -172,16 +180,43 @@ def _mix_overlay(
 def build(args: argparse.Namespace) -> dict[str, Any]:
     rng = np.random.default_rng(args.seed)
     cores = _rows(Path(args.semantic_cores))
-    rng.shuffle(cores)
-    required_cores = int(args.sample_count) * 2
-    if required_cores > len(cores):
+    core_pools: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    source_partitions: dict[str, set[str]] = defaultdict(set)
+    for core in cores:
+        partition = str(core.get("source_partition") or "")
+        source_id = str(core.get("source_id") or "")
+        core_id = str(core.get("core_id") or core.get("audio_id") or "")
+        if partition not in {"train", "val", "test"} or not source_id or not core_id:
+            raise ValueError("semantic cores require frozen source/core identities and partition")
+        core["core_id"] = core_id
+        source_partitions[source_id].add(partition)
+        core_pools[partition].append(core)
+    if any(len(values) != 1 for values in source_partitions.values()):
+        raise ValueError("semantic core source identity crosses partitions")
+    for partition, pool in core_pools.items():
+        rng.shuffle(pool)
+    quotas = _partition_quotas(int(args.sample_count))
+    if any(quotas[partition] <= 0 for partition in ("train", "val", "test")):
         raise ValueError(
-            f"two-core dataset requires {required_cores} unique cores; got {len(cores)}"
+            "CueQC composite dataset requires non-empty train/val/test quotas"
         )
-    selected = cores[:required_cores]
-    core_ids = [str(row["audio_id"]) for row in selected]
+    selected_by_partition: dict[str, list[dict[str, Any]]] = {}
+    for partition, quota in quotas.items():
+        required = quota * 2
+        if len(core_pools[partition]) < required:
+            raise ValueError(
+                f"two-core {partition} dataset requires {required} unique cores; "
+                f"got {len(core_pools[partition])}"
+            )
+        selected_by_partition[partition] = core_pools[partition][:required]
+    selected = [
+        core
+        for partition in ("train", "val", "test")
+        for core in selected_by_partition[partition]
+    ]
+    core_ids = [str(row["core_id"]) for row in selected]
     if len(set(core_ids)) != len(core_ids):
-        raise ValueError("semantic core inventory contains duplicate audio_id values")
+        raise ValueError("semantic core inventory contains duplicate core_id values")
 
     negative_pools = _negative_pools(Path(args.negative_manifest))
     vocal_pools = {
@@ -214,120 +249,131 @@ def build(args: argparse.Namespace) -> dict[str, Any]:
     audio_dir = output_dir / "audio"
     audio_dir.mkdir(parents=True, exist_ok=True)
     rows: list[dict[str, Any]] = []
-    for sample_index in range(int(args.sample_count)):
-        partition = _partition(sample_index, int(args.sample_count))
-        pair = selected[sample_index * 2 : sample_index * 2 + 2]
-        core_audio = [_load_audio(Path(str(row["audio"]))) for row in pair]
-        gap_key = ("q10", "q25", "q40")[sample_index % 3]
-        gap_samples = max(1, int(round(gap_quantiles[gap_key] * SAMPLE_RATE)))
-        gaps: list[np.ndarray] = []
-        gap_sources: list[dict[str, Any]] = []
-        for _ in range(2):
-            pool = negative_pools[partition]
-            cursor = int(negative_cursor[partition])
-            row = pool[cursor % len(pool)]
-            negative_cursor[partition] += 1
-            clip, detail = _negative_clip(row, samples=gap_samples, rng=rng)
-            gaps.append(clip)
-            gap_sources.append(detail)
+    sample_index = 0
+    for partition in ("train", "val", "test"):
+        partition_cores = selected_by_partition[partition]
+        for partition_index in range(quotas[partition]):
+            pair = partition_cores[partition_index * 2 : partition_index * 2 + 2]
+            core_audio = [_load_audio(Path(str(row["audio"]))) for row in pair]
+            gap_key = ("q10", "q25", "q40")[sample_index % 3]
+            gap_samples = max(1, int(round(gap_quantiles[gap_key] * SAMPLE_RATE)))
+            gaps: list[np.ndarray] = []
+            gap_sources: list[dict[str, Any]] = []
+            for _ in range(2):
+                pool = negative_pools[partition]
+                cursor = int(negative_cursor[partition])
+                row = pool[cursor % len(pool)]
+                negative_cursor[partition] += 1
+                clip, detail = _negative_clip(row, samples=gap_samples, rng=rng)
+                gaps.append(clip)
+                gap_sources.append(detail)
 
-        vocal_pool = vocal_pools[partition]
-        vocal_index = int(vocal_cursor[partition])
-        vocal_row = vocal_pool[vocal_index % len(vocal_pool)]
-        vocal_cursor[partition] += 1
-        negative_duration = float(
-            negative_duration_quantiles[partition][sample_index % 3]
-        )
-        negative_samples = max(1, int(round(negative_duration * SAMPLE_RATE)))
-        negative_unit, negative_unit_source = _negative_clip(
-            vocal_row, samples=negative_samples, rng=rng
-        )
+            vocal_pool = vocal_pools[partition]
+            vocal_index = int(vocal_cursor[partition])
+            vocal_row = vocal_pool[vocal_index % len(vocal_pool)]
+            vocal_cursor[partition] += 1
+            negative_duration = float(
+                negative_duration_quantiles[partition][sample_index % 3]
+            )
+            negative_samples = max(1, int(round(negative_duration * SAMPLE_RATE)))
+            negative_unit, negative_unit_source = _negative_clip(
+                vocal_row, samples=negative_samples, rng=rng
+            )
 
-        first_end = len(core_audio[0])
-        negative_start = first_end + len(gaps[0])
-        negative_end = negative_start + len(negative_unit)
-        second_start = negative_end + len(gaps[1])
-        clean, clean_gain = _limit(
-            np.concatenate(
-                (core_audio[0], gaps[0], negative_unit, gaps[1], core_audio[1])
+            first_end = len(core_audio[0])
+            negative_start = first_end + len(gaps[0])
+            negative_end = negative_start + len(negative_unit)
+            second_start = negative_end + len(gaps[1])
+            clean, clean_gain = _limit(
+                np.concatenate(
+                    (core_audio[0], gaps[0], negative_unit, gaps[1], core_audio[1])
+                )
             )
-        )
-        core_spans = [
-            {
-                "core_id": str(pair[0]["audio_id"]),
-                "text": str(pair[0].get("text") or ""),
-                "source_audio": str(pair[0]["audio"]),
-                "start_sample": 0,
-                "end_sample": first_end,
-                "start_s": 0.0,
-                "end_s": first_end / SAMPLE_RATE,
-            },
-            {
-                "core_id": str(pair[1]["audio_id"]),
-                "text": str(pair[1].get("text") or ""),
-                "source_audio": str(pair[1]["audio"]),
-                "start_sample": second_start,
-                "end_sample": second_start + len(core_audio[1]),
-                "start_s": second_start / SAMPLE_RATE,
-                "end_s": (second_start + len(core_audio[1])) / SAMPLE_RATE,
-            },
-        ]
-        overlay_enabled = sample_index % 2 == 1
-        overlay_detail: dict[str, Any] | None = None
-        mixed = clean
-        if overlay_enabled:
-            pool = negative_pools[partition]
-            cursor = int(negative_cursor[partition])
-            overlay_row = pool[cursor % len(pool)]
-            negative_cursor[partition] += 1
-            overlay, source_detail = _negative_clip(
-                overlay_row, samples=len(clean), rng=rng
-            )
-            target_snr = float(snr_quantiles[(sample_index // 2) % len(snr_quantiles)])
-            mixed, mix_detail = _mix_overlay(
-                clean,
-                overlay,
-                core_spans=core_spans,
-                target_snr_db=target_snr,
-            )
-            overlay_detail = {"source": source_detail, "mix": mix_detail}
-
-        sample_id = f"cueqc-v13-gal-unique-{sample_index:06d}"
-        audio_path = audio_dir / f"{sample_id}.wav"
-        sf.write(str(audio_path), mixed, SAMPLE_RATE, subtype="PCM_16")
-        rows.append(
-            {
-                "schema": SCHEMA,
-                "sample_id": sample_id,
-                "audio": str(audio_path),
-                "sample_rate": SAMPLE_RATE,
-                "sample_count": int(len(mixed)),
-                "duration_s": len(mixed) / SAMPLE_RATE,
-                "source_partition": partition,
-                "pipeline_entry_stage": "semantic_speech_scorer",
-                "scorer_required": True,
-                "core_spans": core_spans,
-                "negative_unit_span": {
-                    "start_sample": negative_start,
-                    "end_sample": negative_end,
-                    "start_s": negative_start / SAMPLE_RATE,
-                    "end_s": negative_end / SAMPLE_RATE,
-                    "source": negative_unit_source,
-                    "role": "cueqc_drop_target_if_isolated_by_runtime_split",
+            core_spans = [
+                {
+                    "core_id": str(pair[0]["core_id"]),
+                    "source_id": str(pair[0]["source_id"]),
+                    "text": str(pair[0].get("text") or ""),
+                    "source_audio": str(pair[0]["audio"]),
+                    "start_sample": 0,
+                    "end_sample": first_end,
+                    "start_s": 0.0,
+                    "end_s": first_end / SAMPLE_RATE,
                 },
-                "inter_unit_gaps": {
-                    "left_start_sample": first_end,
-                    "left_end_sample": negative_start,
-                    "right_start_sample": negative_end,
-                    "right_end_sample": second_start,
-                    "duration_source": gap_key,
-                    "sources": gap_sources,
+                {
+                    "core_id": str(pair[1]["core_id"]),
+                    "source_id": str(pair[1]["source_id"]),
+                    "text": str(pair[1].get("text") or ""),
+                    "source_audio": str(pair[1]["audio"]),
+                    "start_sample": second_start,
+                    "end_sample": second_start + len(core_audio[1]),
+                    "start_s": second_start / SAMPLE_RATE,
+                    "end_s": (second_start + len(core_audio[1])) / SAMPLE_RATE,
                 },
-                "clean_limiter_gain": clean_gain,
-                "additive_overlay": overlay_detail,
-                "label_contract": "new_runtime_chunk_intersection_with_exact_unique_semantic_core_spans_v1",
-            }
-        )
+            ]
+            overlay_enabled = sample_index % 2 == 1
+            overlay_detail: dict[str, Any] | None = None
+            mixed = clean
+            if overlay_enabled:
+                pool = negative_pools[partition]
+                cursor = int(negative_cursor[partition])
+                overlay_row = pool[cursor % len(pool)]
+                negative_cursor[partition] += 1
+                overlay, source_detail = _negative_clip(
+                    overlay_row, samples=len(clean), rng=rng
+                )
+                target_snr = float(
+                    snr_quantiles[(sample_index // 2) % len(snr_quantiles)]
+                )
+                mixed, mix_detail = _mix_overlay(
+                    clean,
+                    overlay,
+                    core_spans=core_spans,
+                    target_snr_db=target_snr,
+                )
+                overlay_detail = {"source": source_detail, "mix": mix_detail}
+
+            sample_id = f"cueqc-v13-gal-unique-{sample_index:06d}"
+            audio_path = audio_dir / f"{sample_id}.wav"
+            sf.write(str(audio_path), mixed, SAMPLE_RATE, subtype="PCM_16")
+            rows.append(
+                {
+                    "schema": SCHEMA,
+                    "sample_id": sample_id,
+                    "source_id": sample_id,
+                    "audio": str(audio_path),
+                    "sample_rate": SAMPLE_RATE,
+                    "sample_count": int(len(mixed)),
+                    "duration_s": len(mixed) / SAMPLE_RATE,
+                    "source_partition": partition,
+                    "pipeline_entry_stage": "semantic_speech_scorer",
+                    "scorer_required": True,
+                    "core_spans": core_spans,
+                    "negative_unit_span": {
+                        "start_sample": negative_start,
+                        "end_sample": negative_end,
+                        "start_s": negative_start / SAMPLE_RATE,
+                        "end_s": negative_end / SAMPLE_RATE,
+                        "source": negative_unit_source,
+                        "role": "cueqc_drop_target_if_isolated_by_runtime_split",
+                    },
+                    "inter_unit_gaps": {
+                        "left_start_sample": first_end,
+                        "left_end_sample": negative_start,
+                        "right_start_sample": negative_end,
+                        "right_end_sample": second_start,
+                        "duration_source": gap_key,
+                        "sources": gap_sources,
+                    },
+                    "clean_limiter_gain": clean_gain,
+                    "additive_overlay": overlay_detail,
+                    "label_contract": (
+                        "new_runtime_chunk_intersection_with_exact_unique_"
+                        "semantic_core_spans_v1"
+                    ),
+                }
+            )
+            sample_index += 1
 
     manifest = output_dir / "source_manifest.jsonl"
     _write_jsonl(manifest, rows)

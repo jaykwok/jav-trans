@@ -1,9 +1,12 @@
 #!/usr/bin/env python3
-"""Recompute semantic-split candidate features for already-labeled real windows.
+"""Recompute features for retired probability-conditioned Split experiments.
 
 Candidates, labels, and runtime metadata stay untouched; only frame/scalar
 feature arrays are rebuilt (multi-scale context + PTM projection need the
 full-dim PTM frames, which the exported window npz files do not keep).
+
+This path consumes legacy Scorer speech probabilities.  Its outputs are
+explicitly audit-only and cannot be compiled into current Split v4 training.
 """
 from __future__ import annotations
 
@@ -77,6 +80,10 @@ def rebuild_npz_arrays(
     if count:
         arrays["frame_features"] = np.stack(frame_rows).astype(np.float32)
         arrays["scalar_features"] = np.stack(scalar_rows).astype(np.float32)
+    arrays["training_manifest_allowed"] = np.asarray([False])
+    arrays["input_distribution"] = np.asarray(
+        ["retired_scorer_probability_conditioned_split_features"]
+    )
     return arrays
 
 
@@ -195,6 +202,8 @@ def run(args: argparse.Namespace) -> None:
     extractor = build_ptm_feature_extractor(config)
     summary: dict[str, Any] = {
         "schema": "refresh_joint_split_features_v1",
+        "training_manifest_allowed": False,
+        "input_distribution": "retired_scorer_probability_conditioned_split_features",
         "ptm_repo_id": args.ptm_repo_id,
         "extra_context_scales": args.extra_context_scales,
         "ptm_projection": args.ptm_projection,

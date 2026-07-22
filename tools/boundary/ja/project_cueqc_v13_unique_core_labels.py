@@ -63,6 +63,7 @@ def project(
             {
                 "schema": SCHEMA,
                 "sample_id": sample_id,
+                "source_id": str(source["source_id"]),
                 "subisland_id": str(chunk["subisland_id"]),
                 "audio": str(chunk["audio"]),
                 "start_s": float(chunk["start_s"]),

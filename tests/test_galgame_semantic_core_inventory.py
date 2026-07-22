@@ -27,6 +27,8 @@ def _label(audio_id: str, label: str) -> dict:
         "reference_text": f"台詞{audio_id}",
         "source": "galgame",
         "label": label,
+        "source_id": audio_id,
+        "source_partition": "train",
     }
 
 
@@ -94,4 +96,22 @@ def test_inventory_rejects_source_ledger_overlap(tmp_path) -> None:
             count=1,
             seed=3,
             excluded_source_manifests=[source_ledger],
+        )
+
+
+def test_inventory_rejects_duplicate_core_identity(tmp_path) -> None:
+    labels = tmp_path / "labels.jsonl"
+    first = _label("a", "all_semantic")
+    second = _label("b", "all_semantic")
+    first["core_id"] = "same-core"
+    second["core_id"] = "same-core"
+    _write_jsonl(labels, [first, second])
+
+    with pytest.raises(ValueError, match="identity is duplicated"):
+        compile_inventory(
+            labels=labels,
+            output=tmp_path / "inventory.jsonl",
+            summary_path=tmp_path / "summary.json",
+            count=1,
+            seed=3,
         )

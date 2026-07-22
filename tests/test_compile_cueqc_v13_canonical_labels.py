@@ -25,6 +25,7 @@ def test_canonical_labels_keep_unsure_and_resolve_conflicts_before_training(
     chunks = [
         {
             "sample_id": "s",
+            "source_id": "source-s",
             "subisland_id": item_id,
             "source_partition": "train",
             "audio": "s.wav",
@@ -75,7 +76,9 @@ def test_canonical_labels_reject_stale_or_incomplete_exact_projection(
         [
             {
                 "sample_id": "s",
+                "source_id": "source-s",
                 "subisland_id": item_id,
+                "source_partition": "test",
                 "audio": "s.wav",
                 "start_s": index,
                 "end_s": index + 1,

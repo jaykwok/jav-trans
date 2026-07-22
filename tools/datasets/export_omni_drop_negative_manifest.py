@@ -2,9 +2,8 @@
 from __future__ import annotations
 
 import argparse
-import hashlib
 import json
-from collections import Counter
+from collections import Counter, defaultdict
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -18,26 +17,17 @@ def _read_jsonl(path: Path) -> Iterable[dict[str, Any]]:
                     yield row
 
 
-def source_partition(video_id: str, *, heldout_percent: int) -> str:
-    """Keep the compiled joint-dataset heldout videos out of hardmix train."""
-
-    bucket = int(hashlib.sha1(video_id.encode("utf-8")).hexdigest()[:8], 16) % 100
-    if bucket >= heldout_percent:
-        return "train"
-    return "test" if bucket < heldout_percent // 2 else "val"
-
-
 def export_rows(
     paths: Iterable[Path],
     *,
     min_confidence: float,
     min_duration_s: float,
     max_duration_s: float,
-    heldout_percent: int,
 ) -> tuple[list[dict[str, Any]], Counter[str]]:
     exported: list[dict[str, Any]] = []
     counts: Counter[str] = Counter()
     seen: set[str] = set()
+    source_partitions: dict[str, set[str]] = defaultdict(set)
     for path in paths:
         for row in _read_jsonl(path):
             counts["input"] += 1
@@ -68,8 +58,15 @@ def export_rows(
                 counts["skip_duplicate"] += 1
                 continue
             seen.add(identity)
+            source_id = str(row.get("source_id") or "").strip()
+            partition = str(row.get("source_partition") or "").strip()
+            if not source_id or partition not in {"train", "val", "test"}:
+                raise ValueError(
+                    "Omni-drop negatives require frozen source_id and "
+                    "source_partition=train|val|test; hash-derived partitions are retired"
+                )
+            source_partitions[source_id].add(partition)
             video_id = str(row.get("video_id") or row.get("window_id") or "")
-            partition = source_partition(video_id, heldout_percent=heldout_percent)
             flags = sorted(str(flag) for flag in row.get("omni_flags") or [])
             exported.append(
                 {
@@ -78,6 +75,7 @@ def export_rows(
                     "duration_s": duration_s,
                     "sample_rate": 16000,
                     "source": "omni_definite_drop",
+                    "source_id": source_id,
                     "source_partition": partition,
                     "video_id": video_id,
                     "window_id": str(row.get("window_id") or ""),
@@ -91,6 +89,8 @@ def export_rows(
             counts[f"partition_{partition}"] += 1
             for flag in flags:
                 counts[f"flag_{flag}"] += 1
+    if any(len(partitions) != 1 for partitions in source_partitions.values()):
+        raise ValueError("Omni-drop source identity crosses frozen partitions")
     return exported, counts
 
 
@@ -100,7 +100,6 @@ def run(args: argparse.Namespace) -> None:
         min_confidence=args.min_confidence,
         min_duration_s=args.min_duration_s,
         max_duration_s=args.max_duration_s,
-        heldout_percent=args.heldout_percent,
     )
     if not rows:
         raise ValueError("no strict Omni definite_drop rows passed the filters")
@@ -110,7 +109,7 @@ def run(args: argparse.Namespace) -> None:
         for row in rows:
             handle.write(json.dumps(row, ensure_ascii=False, sort_keys=True) + "\n")
     summary = {
-        "schema": "omni_drop_negative_manifest_v1",
+        "schema": "omni_drop_negative_manifest_v2",
         "labels": [str(path) for path in args.labels],
         "output": str(output),
         "count": len(rows),
@@ -118,7 +117,7 @@ def run(args: argparse.Namespace) -> None:
             "min_confidence": args.min_confidence,
             "min_duration_s": args.min_duration_s,
             "max_duration_s": args.max_duration_s,
-            "heldout_percent": args.heldout_percent,
+            "partition_source": "frozen_input_source_identity",
             "semantic_speech_detected": False,
             "label": "definite_drop",
         },
@@ -143,7 +142,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--min-confidence", type=float, default=0.90)
     parser.add_argument("--min-duration-s", type=float, default=0.08)
     parser.add_argument("--max-duration-s", type=float, default=12.0)
-    parser.add_argument("--heldout-percent", type=int, default=20)
     args = parser.parse_args()
     if not 0.0 <= args.min_confidence <= 1.0:
         parser.error("--min-confidence must be in [0, 1]")
@@ -151,8 +149,6 @@ def parse_args() -> argparse.Namespace:
         parser.error("--min-duration-s must be positive")
     if args.max_duration_s < args.min_duration_s:
         parser.error("--max-duration-s must be >= --min-duration-s")
-    if not 2 <= args.heldout_percent <= 50:
-        parser.error("--heldout-percent must be in [2, 50]")
     return args
 
 

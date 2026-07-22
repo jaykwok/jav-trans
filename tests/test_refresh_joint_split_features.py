@@ -40,6 +40,10 @@ def test_rebuild_preserves_aux_arrays_and_swaps_features() -> None:
     )
     np.testing.assert_array_equal(arrays["p_cut"], original["p_cut"])
     np.testing.assert_array_equal(arrays["accepted"], original["accepted"])
+    assert arrays["training_manifest_allowed"].tolist() == [False]
+    assert arrays["input_distribution"].tolist() == [
+        "retired_scorer_probability_conditioned_split_features"
+    ]
 
 
 def test_rebuild_rejects_row_count_mismatch() -> None:

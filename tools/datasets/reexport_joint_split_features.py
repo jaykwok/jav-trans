@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
-"""Re-export joint-window Split features under the CURRENT decoder params and
-remap existing Omni split labels onto the new candidate set by time.
+"""Re-export a retired Split candidate set for offline label-remap audits.
 
 Why: joint v1/v2 window features were exported with the old candidate decoder
 (quantile floors 0.50 / NMS 0.20s). The runtime now proposes a denser candidate
@@ -13,6 +12,9 @@ label's ``feature_index`` to the nearest new candidate within ``--time-match-s``
 Only the Semantic Split side is touched: ``pre_asr_candidates`` paths keep
 pointing at the original export so Pre-ASR labels stay aligned with the chunk
 set they were produced from.
+
+Nearest-time remapping is not a valid current teacher/data compiler.  All
+outputs are marked audit-only and must never enter Split v4 training.
 """
 from __future__ import annotations
 
@@ -185,6 +187,8 @@ def run(args: argparse.Namespace) -> None:
     _write_jsonl(dropped_path, dropped)
     summary = {
         "schema": "joint_split_feature_requant_summary_v1",
+        "training_manifest_allowed": False,
+        "input_distribution": "retired_candidate_time_remap",
         "dataset_dir": str(dataset.resolve()),
         "window_count": len(windows),
         "label_count": len(labels),
@@ -212,7 +216,16 @@ def run(args: argparse.Namespace) -> None:
         updated_rows = []
         for row in windows:
             window_id = str(row["window_id"])
-            updated_rows.append({**row, **new_paths.get(window_id, {})})
+            updated_rows.append(
+                {
+                    **row,
+                    **new_paths.get(window_id, {}),
+                    "semantic_split_training_manifest_allowed": False,
+                    "semantic_split_input_distribution": (
+                        "retired_candidate_time_remap"
+                    ),
+                }
+            )
         _write_jsonl(dataset / "source_windows.jsonl", updated_rows)
         split_labels = dataset / "semantic_split" / "labels.jsonl"
         backup_labels = dataset / "semantic_split" / "labels.pre_requant.jsonl"

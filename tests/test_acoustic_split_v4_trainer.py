@@ -10,6 +10,7 @@ from tools.boundary.ja.train_acoustic_split_v4_model import (
     apply_manual_label_overrides,
     event_run_counts,
     gate_passes,
+    parse_args,
     partition_group_names,
 )
 
@@ -23,7 +24,7 @@ def test_split_v4_audit_tools_import_current_shared_pad_batch() -> None:
     assert override_tool.pad_batch is pad_batch
 
 
-def test_manual_overrides_keep_unsure_as_ignore_and_consume_holdout(tmp_path: Path) -> None:
+def test_manual_overrides_keep_unsure_as_ignore_without_consuming_holdout(tmp_path: Path) -> None:
     metadata = tmp_path / "metadata.jsonl"
     metadata.write_text(
         '\n'.join([
@@ -54,8 +55,9 @@ def test_manual_overrides_keep_unsure_as_ignore_and_consume_holdout(tmp_path: Pa
         data, metadata_path=metadata, overrides_path=overrides
     )
     assert data["labels"].tolist() == [0, -100, 0]
-    assert data["partitions"].tolist() == ["train", "train", "val"]
+    assert data["partitions"].tolist() == ["test", "test", "val"]
     assert summary["training_label_counts"] == {"cut": 1, "continue": 0, "ignore": 1}
+    assert summary["partition_identity_changed"] is False
 
 
 def test_partition_groups_keep_test_out_of_training() -> None:
@@ -66,6 +68,8 @@ def test_partition_groups_keep_test_out_of_training() -> None:
             "test-a": np.asarray([3, 4]),
         },
         "partitions": np.asarray(["train", "train", "val", "test", "test"]),
+        "source_ids": np.asarray(["train", "train", "val", "test", "test"]),
+        "core_ids": np.asarray(["train-core", "train-core", "val-core", "test-core", "test-core"]),
     }
     assert partition_group_names(data) == {
         "test": ["test-a"],
@@ -83,12 +87,14 @@ def test_partition_groups_reject_source_identity_leakage() -> None:
             "source-c|island0000": np.asarray([3]),
         },
         "partitions": np.asarray(["train", "val", "val", "test"]),
+        "source_ids": np.asarray(["source-a", "source-a", "source-b", "source-c"]),
+        "core_ids": np.asarray(["core-a0", "core-a1", "core-b", "core-c"]),
     }
     with pytest.raises(ValueError, match="source 'source-a' crosses"):
         partition_group_names(data)
 
 
-def test_manual_override_moves_every_island_from_source_to_train(tmp_path: Path) -> None:
+def test_manual_override_never_moves_source_partitions(tmp_path: Path) -> None:
     metadata = tmp_path / "metadata.jsonl"
     metadata.write_text(
         '\n'.join([
@@ -115,11 +121,9 @@ def test_manual_override_moves_every_island_from_source_to_train(tmp_path: Path)
     summary = apply_manual_label_overrides(
         data, metadata_path=metadata, overrides_path=overrides
     )
-    assert data["partitions"].tolist() == ["train", "train", "val"]
-    assert summary["forced_train_groups"] == [
-        "a|island0000",
-        "a|island0001",
-    ]
+    assert data["partitions"].tolist() == ["test", "test", "val"]
+    assert summary["overridden_groups"] == ["a|island0000"]
+    assert summary["repeat_train_groups"] == []
 
 
 def test_numeric_gate_uses_direct_argmax_metrics() -> None:
@@ -151,3 +155,13 @@ def test_adjacent_cut_candidates_are_one_event_run() -> None:
         "exact": 0,
         "basin_matched": 2,
     }
+
+
+def test_split_v4_defaults_keep_loss_ablation_neutral() -> None:
+    args = parse_args(["--dataset", "d.npz", "--output-dir", "out"])
+    assert args.manual_group_repeat == 1
+    assert args.cut_weight == 1.0
+    assert args.continue_weight == 1.0
+    assert args.focal_gamma == 0.0
+    assert args.role_aux_weight == 0.0
+    assert args.pair_loss_weight == 0.0

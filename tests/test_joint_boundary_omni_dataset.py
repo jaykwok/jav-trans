@@ -14,11 +14,51 @@ from tools.datasets.label_joint_boundary_preasr_with_omni import (
     _select_chunk_rows,
     _select_split_rows,
 )
-from tools.datasets.prepare_joint_boundary_omni_dataset import _window_starts
+from tools.datasets.prepare_joint_boundary_omni_dataset import (
+    _resume_row_with_frozen_identity,
+    _window_starts,
+)
 
 
 def _disabled_cache() -> joint_omni.OmniResponseCache:
     return joint_omni.OmniResponseCache(None)
+
+
+def test_resume_row_is_bound_to_current_frozen_identity() -> None:
+    row = _resume_row_with_frozen_identity(
+        {"window_id": "w0", "video_id": "v0", "source_start_s": 1.0},
+        window_id="w0",
+        video_id="v0",
+        source_id="source-0",
+        source_partition="test",
+        source_start_s=1.0,
+        source_end_s=5.0,
+    )
+    assert row["source_id"] == "source-0"
+    assert row["source_partition"] == "test"
+    assert row["semantic_split_training_manifest_allowed"] is False
+
+
+def test_resume_row_rejects_partition_reassignment() -> None:
+    import pytest
+
+    with pytest.raises(ValueError, match="partition changed"):
+        _resume_row_with_frozen_identity(
+            {
+                "window_id": "w0",
+                "video_id": "v0",
+                "source_id": "source-0",
+                "source_partition": "val",
+                "source_start_s": 1.0,
+                "source_end_s": 5.0,
+            },
+            window_id="w0",
+            video_id="v0",
+            source_id="source-0",
+            source_partition="test",
+            source_start_s=1.0,
+            source_end_s=5.0,
+        )
 
 
 def test_v3_prompts_keep_omni_requests_single_task() -> None:

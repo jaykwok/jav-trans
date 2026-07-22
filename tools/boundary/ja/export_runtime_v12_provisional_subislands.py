@@ -53,6 +53,23 @@ def _sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
+def source_core_ids_for_span(
+    source_row: dict[str, Any], *, start_s: float, end_s: float
+) -> list[str]:
+    core_ids: list[str] = []
+    for core_number, core in enumerate(source_row.get("core_spans") or [], start=1):
+        core_id = str(core.get("core_id") or "").strip()
+        if not core_id:
+            raise ValueError(f"source core {core_number} is missing core_id")
+        core_start = float(core.get("start_s"))
+        core_end = float(core.get("end_s"))
+        if core_end <= core_start:
+            raise ValueError(f"source core {core_id!r} has invalid coordinates")
+        if core_end > start_s and core_start < end_s:
+            core_ids.append(core_id)
+    return core_ids
+
+
 def validate_binary_split_chunk(chunk: PackedChunk, *, sample_id: str) -> None:
     if not ACOUSTIC_BINARY_V12_CONTRACT.matches(chunk.boundary_contract_id):
         raise ValueError(f"{sample_id}: current Boundary contract is required")
@@ -76,6 +93,8 @@ def validate_binary_split_chunk(chunk: PackedChunk, *, sample_id: str) -> None:
 def run(args: argparse.Namespace) -> None:
     apply_vram_safety_cap(0.95)
     sources: dict[str, tuple[Path, dict[str, Any]]] = {}
+    source_partitions: dict[str, set[str]] = {}
+    core_sources: dict[str, str] = {}
     items_path = Path(args.audit_items).resolve()
     for row in _rows(items_path):
         sample_id = str(row["sample_id"])
@@ -85,7 +104,28 @@ def run(args: argparse.Namespace) -> None:
             audio = resolve_audio_path(value=str(row["audio"]), items_path=items_path)
         except FileNotFoundError as exc:
             raise FileNotFoundError(f"{sample_id}: {exc}") from exc
+        source_id = str(row.get("source_id") or "").strip()
+        partition = str(row.get("source_partition") or "").strip()
+        if not source_id or partition not in {"train", "val", "test"}:
+            raise ValueError(
+                f"{sample_id}: source manifest requires frozen source_id and "
+                "source_partition=train|val|test"
+            )
+        source_partitions.setdefault(source_id, set()).add(partition)
+        for core in row.get("core_spans") or []:
+            core_id = str(core.get("core_id") or "").strip()
+            if not core_id:
+                raise ValueError(f"{sample_id}: source core is missing core_id")
+            previous_source = core_sources.get(core_id)
+            if previous_source is not None:
+                raise ValueError(
+                    f"core {core_id!r} is reused by sources "
+                    f"{previous_source!r} and {source_id!r}"
+                )
+            core_sources[core_id] = source_id
         sources[sample_id] = (audio, row)
+    if any(len(values) != 1 for values in source_partitions.values()):
+        raise ValueError("CueQC source identity crosses frozen partitions")
     if args.max_sources > 0:
         sources = dict(list(sorted(sources.items()))[: args.max_sources])
 
@@ -102,11 +142,31 @@ def run(args: argparse.Namespace) -> None:
     outer_checkpoint = Path(boundary_config["outer_edge_refiner_model_path"])
     inner_checkpoint = Path(boundary_config["inner_edge_refiner_model_path"])
     split_sha256 = _sha256(split_checkpoint)
+    inner_sha256 = _sha256(inner_checkpoint)
     if args.expected_split_sha256 and split_sha256 != args.expected_split_sha256:
         raise ValueError(
             "active Split checkpoint SHA mismatch: "
             f"expected {args.expected_split_sha256}, got {split_sha256}"
         )
+    for row in exported:
+        if str(row.get("semantic_split_weights_sha256") or "") != split_sha256:
+            raise ValueError("resumed CueQC runtime rows use a stale Split checkpoint")
+        if str(row.get("inner_edge_refiner_weights_sha256") or "") != inner_sha256:
+            raise ValueError("resumed CueQC runtime rows use a stale Inner checkpoint")
+        if not ACOUSTIC_BINARY_V12_CONTRACT.matches(
+            row.get("boundary_serialization_contract_id")
+        ):
+            raise ValueError("resumed CueQC runtime rows use a stale Boundary contract")
+        if row.get("training_manifest_allowed") is not True:
+            raise ValueError("resumed CueQC runtime rows are not training-approved")
+    exported_core_owners: dict[str, str] = {}
+    for row in exported:
+        subisland_id = str(row.get("subisland_id") or "")
+        for core_id in row.get("source_core_ids") or []:
+            previous = exported_core_owners.get(str(core_id))
+            if previous is not None and previous != subisland_id:
+                raise ValueError(f"core {core_id!r} is reused by resumed subislands")
+            exported_core_owners[str(core_id)] = subisland_id
     for source_index, (sample_id, source_item) in enumerate(
         sorted(sources.items()), start=1
     ):
@@ -133,14 +193,28 @@ def run(args: argparse.Namespace) -> None:
             raise ValueError(f"{sample_id}: candidate/chunk count mismatch")
         source_rows: list[dict[str, Any]] = []
         for index, chunk in enumerate(chunks):
+            subisland_id = f"{sample_id}__v12s{index:02d}"
+            source_core_ids = source_core_ids_for_span(
+                source_row,
+                start_s=float(chunk.start),
+                end_s=float(chunk.end),
+            )
+            for core_id in source_core_ids:
+                previous = exported_core_owners.get(core_id)
+                if previous is not None and previous != subisland_id:
+                    raise ValueError(
+                        f"core {core_id!r} is reused by provisional subislands "
+                        f"{previous!r} and {subisland_id!r}"
+                    )
+                exported_core_owners[core_id] = subisland_id
             source_rows.append(
                 {
                     "schema": "runtime_v12_provisional_subisland_v1",
                     "sample_id": sample_id,
-                    "source_partition": str(
-                        source_row.get("source_partition") or "train"
-                    ),
-                    "subisland_id": f"{sample_id}__v12s{index:02d}",
+                    "source_id": str(source_row["source_id"]),
+                    "source_partition": str(source_row["source_partition"]),
+                    "subisland_id": subisland_id,
+                    "source_core_ids": source_core_ids,
                     "audio": str(audio),
                     "start_s": float(chunk.start),
                     "end_s": float(chunk.end),
@@ -167,6 +241,12 @@ def run(args: argparse.Namespace) -> None:
                     ),
                     "weak_cut_candidates": list(chunk.weak_cut_candidates or []),
                     "pre_asr_candidate": candidates[index],
+                    "training_manifest_allowed": True,
+                    "semantic_split_weights_sha256": split_sha256,
+                    "inner_edge_refiner_weights_sha256": inner_sha256,
+                    "boundary_serialization_contract_id": (
+                        ACOUSTIC_BINARY_V12_CONTRACT.contract_id
+                    ),
                 }
             )
         with output.open("a", encoding="utf-8") as handle:
@@ -188,7 +268,7 @@ def run(args: argparse.Namespace) -> None:
         "subisland_count": len(exported),
         "partition_counts": {
             partition: sum(
-                str(row.get("source_partition") or "train") == partition
+                str(row["source_partition"]) == partition
                 for _audio, row in sources.values()
             )
             for partition in ("train", "val", "test")
@@ -212,10 +292,14 @@ def run(args: argparse.Namespace) -> None:
             ),
             default=0,
         ),
-        "boundary_contract_id": ACOUSTIC_BINARY_V12_CONTRACT.contract_id,
+        "boundary_serialization_contract_id": (
+            ACOUSTIC_BINARY_V12_CONTRACT.contract_id
+        ),
+        "training_manifest_allowed": True,
         "split_runtime_adapter": SEMANTIC_SPLIT_V4_RUNTIME_ADAPTER,
         "split_checkpoint": str(split_checkpoint),
         "split_checkpoint_sha256": split_sha256,
+        "inner_checkpoint": str(inner_checkpoint),
         "outer_checkpoint_sha256": _sha256(outer_checkpoint),
         "inner_checkpoint_sha256": _sha256(inner_checkpoint),
         "output": str(output),

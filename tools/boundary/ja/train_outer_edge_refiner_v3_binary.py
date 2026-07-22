@@ -50,6 +50,7 @@ def validate_dataset_rows(rows: Sequence[dict[str, Any]]) -> dict[str, Any]:
     core_partitions: dict[str, set[str]] = defaultdict(set)
     core_counts: Counter[str] = Counter()
     partition_counts: Counter[str] = Counter()
+    scorer_checkpoint_shas: set[str] = set()
     for row in rows:
         source_id = str(row.get("source_id") or "")
         core_id = str(row.get("core_id") or "")
@@ -66,6 +67,12 @@ def validate_dataset_rows(rows: Sequence[dict[str, Any]]) -> dict[str, Any]:
             raise ValueError("Outer v3 rows require the candidate-island Scorer v11 schema")
         if int(row.get("frame_count") or 0) <= 0:
             raise ValueError("Outer v3 rows require a positive frame_count")
+        if row.get("training_manifest_allowed") is not True:
+            raise ValueError("Outer v3 rows require an approved training manifest gate")
+        scorer_sha = str(row.get("scorer_checkpoint_sha256") or "").lower()
+        if len(scorer_sha) != 64 or any(ch not in "0123456789abcdef" for ch in scorer_sha):
+            raise ValueError("Outer v3 rows require the exact Scorer v11 checkpoint SHA256")
+        scorer_checkpoint_shas.add(scorer_sha)
         source_partitions[source_id].add(partition)
         core_partitions[core_id].add(partition)
         core_counts[core_id] += 1
@@ -78,11 +85,14 @@ def validate_dataset_rows(rows: Sequence[dict[str, Any]]) -> dict[str, Any]:
         raise ValueError("Outer v3 requires max core use count <= 1")
     if any(partition_counts[name] <= 0 for name in PARTITIONS):
         raise ValueError("Outer v3 requires fixed train/val/test partitions")
+    if len(scorer_checkpoint_shas) != 1:
+        raise ValueError("Outer v3 dataset mixes Scorer v11 checkpoint identities")
     return {
         "source_count": len(source_partitions),
         "core_count": len(core_partitions),
         "max_core_use_count": max(core_counts.values(), default=0),
         "partition_counts": dict(partition_counts),
+        "scorer_checkpoint_sha256": next(iter(scorer_checkpoint_shas)),
     }
 
 

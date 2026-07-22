@@ -21,6 +21,7 @@ def test_project_labels_each_new_runtime_chunk_from_exact_core_overlap(
         [
             {
                 "sample_id": "s",
+                "source_id": "source-s",
                 "source_partition": "train",
                 "core_spans": [
                     {"core_id": "a", "start_sample": 0, "end_sample": 16000},
@@ -63,5 +64,6 @@ def test_project_labels_each_new_runtime_chunk_from_exact_core_overlap(
     rows = [json.loads(line) for line in output.read_text(encoding="utf-8").splitlines()]
 
     assert [row["label"] for row in rows] == ["keep", "drop", "keep"]
+    assert {row["source_id"] for row in rows} == {"source-s"}
     assert summary["label_counts"] == {"drop": 1, "keep": 2}
     assert summary["parent_label_inheritance"] is False

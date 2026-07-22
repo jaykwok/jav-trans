@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import argparse
-import hashlib
 import json
 import re
 import sys
@@ -79,9 +78,36 @@ def _write_json(path: Path, payload: Any) -> None:
     )
 
 
-def _partition(video_id: str, val_percent: int) -> str:
-    bucket = int(hashlib.sha1(video_id.encode("utf-8")).hexdigest()[:8], 16) % 100
-    return "val" if bucket < val_percent else "train"
+PARTITIONS = {"train", "val", "test"}
+
+
+def _window_identity(window: dict[str, Any]) -> tuple[str, str]:
+    source_id = str(window.get("source_id") or "").strip()
+    partition = str(window.get("source_partition") or "").strip()
+    if not source_id:
+        raise ValueError(
+            f"source window {window.get('window_id')!r} is missing frozen source_id"
+        )
+    if partition not in PARTITIONS:
+        raise ValueError(
+            f"source window {window.get('window_id')!r} has invalid frozen "
+            f"source_partition: {partition!r}"
+        )
+    return source_id, partition
+
+
+def _core_identity(
+    window: dict[str, Any], *, core_start_s: float, core_end_s: float
+) -> str:
+    source_id, _partition_name = _window_identity(window)
+    source_start_s = float(window.get("source_start_s") or 0.0)
+    start_sample = int(round((source_start_s + core_start_s) * 16000.0))
+    end_sample = int(round((source_start_s + core_end_s) * 16000.0))
+    if end_sample <= start_sample:
+        raise ValueError(
+            f"source window {window.get('window_id')!r} has invalid core extent"
+        )
+    return f"{source_id}:samples:{start_sample}-{end_sample}"
 
 
 def _omni_aux_row(row: dict[str, Any]) -> list[float]:
@@ -97,7 +123,6 @@ def _compile_split(
     dataset: Path,
     windows: list[dict[str, Any]],
     labels: list[dict[str, Any]],
-    val_percent: int,
     load_workers: int = 6,
     feature_variant: str = "",
     output_variant: str = "",
@@ -110,7 +135,21 @@ def _compile_split(
     ``-1`` so per-candidate losses can mask them.
     """
 
-    window_by_id = {str(row["window_id"]): row for row in windows}
+    window_by_id: dict[str, dict[str, Any]] = {}
+    source_partitions: dict[str, str] = {}
+    for window in windows:
+        window_id = str(window.get("window_id") or "").strip()
+        if not window_id:
+            raise ValueError("source window is missing window_id")
+        if window_id in window_by_id:
+            raise ValueError(f"duplicate source window_id: {window_id}")
+        source_id, partition = _window_identity(window)
+        previous_partition = source_partitions.setdefault(source_id, partition)
+        if previous_partition != partition:
+            raise ValueError(
+                f"source {source_id!r} crosses frozen source partitions"
+            )
+        window_by_id[window_id] = window
     _reject_foreign_split_labels(labels)
     grouped: dict[str, dict[int, dict[str, Any]]] = {}
     for row in labels:
@@ -129,16 +168,25 @@ def _compile_split(
     partition_parts: list[str] = []
     window_parts: list[str] = []
     video_parts: list[str] = []
+    source_parts: list[str] = []
+    core_parts: list[str] = []
     feature_index_parts: list[int] = []
     time_parts: list[float] = []
     group_parts: list[str] = []
     omni_parts: list[list[float]] = []
     labeled_count = 0
+    core_origins: dict[str, tuple[str, tuple[float, float]]] = {}
     ordered: list[tuple[str, dict[int, dict[str, Any]], dict[str, Any]]] = []
     for window_id, labeled_rows in sorted(grouped.items()):
         window = window_by_id.get(window_id)
         if window is None:
             continue
+        if window.get("semantic_split_training_manifest_allowed") is not True:
+            raise ValueError(
+                f"source window {window_id!r} is not approved for Split v4 "
+                "training; rebuild candidates from the audited Scorer v11 -> "
+                "Proposal -> Outer v3 chain and set an explicit training gate"
+            )
         ordered.append((window_id, labeled_rows, window))
 
     def _load_window_arrays(window: dict[str, Any]) -> dict[str, np.ndarray]:
@@ -153,7 +201,18 @@ def _compile_split(
                 f"{feature_path}"
             )
         with np.load(feature_path) as handle:
-            return {key: np.asarray(handle[key]) for key in handle.files}
+            bundle = {key: np.asarray(handle[key]) for key in handle.files}
+        if "training_manifest_allowed" in bundle and not bool(
+            np.asarray(bundle["training_manifest_allowed"]).reshape(-1)[0]
+        ):
+            distribution = str(
+                np.asarray(bundle.get("input_distribution", ["unknown"])).reshape(-1)[0]
+            )
+            raise ValueError(
+                f"semantic split features are audit-only, not training-ready: "
+                f"{distribution}"
+            )
+        return bundle
 
     pool = ThreadPoolExecutor(max_workers=load_workers)
     pending: deque = deque()
@@ -173,7 +232,7 @@ def _compile_split(
         bundle = future.result()
         _submit_next()
         video_id = str(window["video_id"])
-        partition = _partition(video_id, val_percent)
+        source_id, partition = _window_identity(window)
         total = int(bundle["frame_features"].shape[0])
         for index in labeled_rows:
             if index < 0 or index >= total:
@@ -190,7 +249,17 @@ def _compile_split(
         for key, members in sorted(island_members.items()):
             if not any(index in labeled_rows for index in members):
                 continue
-            group_id = f"{window_id}|core{key[0]:.3f}-{key[1]:.3f}"
+            core_id = _core_identity(
+                window, core_start_s=float(key[0]), core_end_s=float(key[1])
+            )
+            origin = (window_id, key)
+            previous_origin = core_origins.setdefault(core_id, origin)
+            if previous_origin != origin:
+                raise ValueError(
+                    f"core {core_id!r} is duplicated by overlapping source windows: "
+                    f"{previous_origin[0]!r} and {window_id!r}"
+                )
+            group_id = f"{source_id}|island|{core_id}"
             for index in sorted(members, key=lambda item: float(times[item])):
                 labeled = labeled_rows.get(index)
                 frame_writer.append(bundle["frame_features"][index].astype(np.float32))
@@ -205,6 +274,8 @@ def _compile_split(
                 partition_parts.append(partition)
                 window_parts.append(window_id)
                 video_parts.append(video_id)
+                source_parts.append(source_id)
+                core_parts.append(core_id)
                 feature_index_parts.append(index)
                 time_parts.append(float(times[index]))
                 group_parts.append(group_id)
@@ -221,6 +292,8 @@ def _compile_split(
         partitions=np.asarray(partition_parts),
         window_ids=np.asarray(window_parts),
         video_ids=np.asarray(video_parts),
+        source_ids=np.asarray(source_parts),
+        core_ids=np.asarray(core_parts),
         feature_indexes=np.asarray(feature_index_parts, dtype=np.int64),
         times_s=np.asarray(time_parts, dtype=np.float32),
         group_ids=np.asarray(group_parts),
@@ -231,7 +304,7 @@ def _compile_split(
     counts = Counter(str(row["label"]) for row in labels)
     partitions = Counter(partition_parts)
     summary = {
-        "schema": "joint_semantic_split_dataset_v2",
+        "schema": "joint_semantic_split_dataset_v3",
         "output": str(output.resolve()),
         "count": len(label_parts),
         "labeled_count": labeled_count,
@@ -241,8 +314,9 @@ def _compile_split(
         "partitions": dict(partitions),
         "video_count": len(set(video_parts)),
         "window_count": len(set(window_parts)),
-        "partition_unit": "video_id",
-        "val_percent": val_percent,
+        "partition_unit": "frozen_source_id_and_core_id",
+        "source_count": len(set(source_parts)),
+        "core_count": len(set(core_parts)),
     }
     summary_name = f"summary.{output_variant}.json" if output_variant else "summary.json"
     _write_json(dataset / "semantic_split" / summary_name, summary)
@@ -314,7 +388,6 @@ def _compile_pre_asr(
     windows: list[dict[str, Any]],
     labels_path: Path,
     asr_repo_id: str,
-    val_percent: int,
     override_paths: list[Path] | None = None,
 ) -> dict[str, Any]:
     chunk_paths = [
@@ -346,22 +419,24 @@ def _compile_pre_asr(
 
     payload = torch.load(output, map_location="cpu", weights_only=False)
     role_by_audio_id = {
-        str(row["window_id"]): _partition(str(row["video_id"]), val_percent)
-        for row in windows
+        str(row["window_id"]): _window_identity(row)[1] for row in windows
     }
     for group in payload["groups"]:
         group["dataset_role"] = role_by_audio_id.get(
             str(group.get("audio_id") or ""),
-            "train",
+            "",
         )
+        if group["dataset_role"] not in PARTITIONS:
+            raise ValueError(
+                f"CueQC group {group.get('audio_id')!r} has no frozen source partition"
+            )
     torch.save(payload, output)
     role_counts = Counter(
         str(group.get("dataset_role") or "")
         for group in payload["groups"]
     )
     summary["dataset_roles"] = dict(role_counts)
-    summary["partition_unit"] = "video_id"
-    summary["val_percent"] = val_percent
+    summary["partition_unit"] = "frozen_source_id"
     _write_json(dataset / "pre_asr" / "summary.json", summary)
     return summary
 
@@ -395,7 +470,7 @@ def _write_dataset_card(
         f"definite labels and `{pre_asr_summary['ambiguous_ignore']}` unsure labels "
         f"across `{pre_asr_summary['group_count']}` windows.",
         "",
-        "训练/验证划分按 `video_id` 进行，避免同一视频的多个随机窗口跨集合泄漏。",
+        "train/val/test 使用预先冻结的 `source_id` 分区；同一 source/core 不得跨集合或重复使用。",
     ]
     (dataset / "DATASET.md").write_text(
         "\n".join(lines) + "\n",
@@ -419,7 +494,6 @@ def run(args: argparse.Namespace) -> None:
         dataset=dataset,
         windows=windows,
         labels=split_labels,
-        val_percent=args.val_percent,
         load_workers=args.load_workers,
         feature_variant=args.semantic_split_feature_variant,
         output_variant=args.semantic_split_output_variant,
@@ -438,7 +512,6 @@ def run(args: argparse.Namespace) -> None:
         windows=windows,
         labels_path=pre_asr_labels_path,
         asr_repo_id=args.asr_repo_id,
-        val_percent=args.val_percent,
         override_paths=override_paths,
     )
     _write_dataset_card(
@@ -475,7 +548,6 @@ def parse_args() -> argparse.Namespace:
         "--asr-repo-id",
         default="jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame-hf",
     )
-    parser.add_argument("--val-percent", type=int, default=20)
     parser.add_argument(
         "--semantic-split-feature-variant",
         default="",
@@ -510,8 +582,6 @@ def parse_args() -> argparse.Namespace:
     args = parser.parse_args()
     if args.semantic_split_feature_variant and not args.semantic_split_output_variant:
         args.semantic_split_output_variant = args.semantic_split_feature_variant
-    if not 1 <= args.val_percent <= 50:
-        parser.error("--val-percent must be between 1 and 50")
     for value in (
         args.semantic_split_feature_variant,
         args.semantic_split_output_variant,
