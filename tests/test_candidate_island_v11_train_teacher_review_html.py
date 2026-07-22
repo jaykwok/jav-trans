@@ -89,6 +89,10 @@ def test_train_teacher_review_selects_one_editable_source_per_video(tmp_path: Pa
     assert "candidate_island_scorer_v11_train_manual_verdict_v1" in page
     assert "Gemini 可编辑底稿（未确认）" in page
     assert "const initialAnn=" in page
+    assert "function convertRange" in page
+    assert "转 ${esc(alternate)}" in page
+    assert "转 outside_candidate" in page
+    assert "range.label==='inside_candidate'?'unsure':'inside_candidate'" in page
     assert "draft a0" in page and "draft b1" in page
     manifest = [json.loads(line) for line in (output / "audit_manifest.jsonl").read_text(encoding="utf-8").splitlines()]
     assert {row["video_id"] for row in manifest} == {"video-a", "video-b"}
