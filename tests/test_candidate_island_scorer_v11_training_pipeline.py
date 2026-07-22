@@ -393,6 +393,16 @@ def test_v11_feature_compile_and_random_init_cpu_smoke(tmp_path: Path) -> None:
         output_dir=tmp_path / "features",
     )
     assert feature_summary["partition_window_counts"] == {"test": 1, "train": 2, "val": 1}
+    assert feature_summary["partition_supervised_window_counts"] == {
+        "test": 1,
+        "train": 2,
+        "val": 1,
+    }
+    assert feature_summary["partition_ignored_only_window_counts"] == {
+        "test": 0,
+        "train": 0,
+        "val": 0,
+    }
     label_path = tmp_path / "features" / "source_labels" / "synthetic-train.npz"
     with np.load(label_path, allow_pickle=False) as labels:
         assert labels["training_labels"].tolist() == [0, 0, 1, 1, 1, 1, 0, 0]
@@ -537,3 +547,42 @@ def test_v11_planned_batches_match_legacy_seeded_epoch_order() -> None:
         [[row["row_id"] for row in batch] for batch in epoch]
         for epoch in expected
     ]
+
+
+def test_v11_planned_batches_skip_unsure_only_owner_windows_after_shuffle() -> None:
+    rows = [
+        {
+            "row_id": f"row-{index}",
+            "window_start_frame": 0,
+            "window_end_frame": length,
+            "definite_owner_frame_count": definite,
+        }
+        for index, (length, definite) in enumerate(
+            ((300, 20), (900, 0), (600, 10), (850, 0), (500, 4), (700, 2))
+        )
+    ]
+    legacy_rng = random.Random(117)
+    expected = []
+    for _epoch in range(3):
+        shuffled = list(rows)
+        legacy_rng.shuffle(shuffled)
+        supervised = [row for row in shuffled if row["definite_owner_frame_count"] > 0]
+        expected.append(_pack_batches(supervised, max_padded_frames=2000))
+
+    planned = _plan_training_batches(
+        rows, epochs=3, max_padded_frames=2000, seed=117
+    )
+
+    assert [
+        [[row["row_id"] for row in batch] for batch in epoch]
+        for epoch in planned
+    ] == [
+        [[row["row_id"] for row in batch] for batch in epoch]
+        for epoch in expected
+    ]
+    assert all(
+        row["definite_owner_frame_count"] > 0
+        for epoch in planned
+        for batch in epoch
+        for row in batch
+    )

@@ -115,6 +115,8 @@ def validate_training_inputs(
     source_core_key: dict[str, tuple[str, ...]] = {}
     core_owner: dict[str, tuple[str, str]] = {}
     partition_counts: Counter[str] = Counter()
+    partition_supervised_counts: Counter[str] = Counter()
+    partition_ignored_only_counts: Counter[str] = Counter()
     owner_by_source: dict[str, list[tuple[int, int]]] = {}
     provenance_fields = {
         "canonical_sources_sha256": set(),
@@ -168,17 +170,43 @@ def validate_training_inputs(
             row.get("owner_local_end", -1)
         ) != owner_end - start:
             raise ValueError(f"Scorer v11 local ownership mismatch: {row_id}")
+        definite_owner_frame_count = int(row.get("definite_owner_frame_count", -1))
+        if not 0 <= definite_owner_frame_count <= owner_end - owner_start:
+            raise ValueError(
+                f"invalid Scorer v11 definite owner frame count: {row_id}"
+            )
         if int(row.get("context_window_frames") or 0) != int(
             CANDIDATE_ISLAND_SCORER_V11_DATASET_CONTRACT["context_window_frames"]
         ):
             raise ValueError("Scorer v11 context window contract mismatch")
         owner_by_source.setdefault(source_id, []).append((owner_start, owner_end))
         partition_counts[partition] += 1
+        if definite_owner_frame_count > 0:
+            partition_supervised_counts[partition] += 1
+        else:
+            partition_ignored_only_counts[partition] += 1
         for key in provenance_fields:
             provenance_fields[key].add(str(row.get(key) or ""))
 
     if not rows or set(partition_counts) != PARTITIONS:
         raise ValueError(f"Scorer v11 requires non-empty train/val/test: {dict(partition_counts)}")
+    if set(partition_supervised_counts) != PARTITIONS:
+        raise ValueError(
+            "Scorer v11 requires definite owner supervision in train/val/test: "
+            f"{dict(partition_supervised_counts)}"
+        )
+    expected_supervised = {
+        partition: int(partition_supervised_counts.get(partition, 0))
+        for partition in sorted(PARTITIONS)
+    }
+    expected_ignored_only = {
+        partition: int(partition_ignored_only_counts.get(partition, 0))
+        for partition in sorted(PARTITIONS)
+    }
+    if gate.get("partition_supervised_window_counts") != expected_supervised:
+        raise ValueError("Scorer v11 supervised-window counts disagree with feature gate")
+    if gate.get("partition_ignored_only_window_counts") != expected_ignored_only:
+        raise ValueError("Scorer v11 ignored-only window counts disagree with feature gate")
     for source_id, intervals in owner_by_source.items():
         ordered = sorted(intervals)
         expected = 0
@@ -253,6 +281,15 @@ def load_candidate_window(row: dict[str, Any], cache: SourceArrayCache) -> dict[
     length = end - start
     owner = np.zeros(length, dtype=np.bool_)
     owner[int(row["owner_local_start"]) : int(row["owner_local_end"])] = True
+    actual_definite_owner_frames = int(
+        np.count_nonzero(owner & (source["labels"][start:end] != IGNORE_INDEX))
+    )
+    expected_definite_owner_frames = int(row["definite_owner_frame_count"])
+    if actual_definite_owner_frames != expected_definite_owner_frames:
+        raise ValueError(
+            "Scorer v11 definite owner frame count disagrees with signed labels: "
+            f"{row['row_id']}"
+        )
     return {
         "row": row,
         "ptm": np.ascontiguousarray(source["ptm"][start:end]),
@@ -565,6 +602,11 @@ def _plan_training_batches(
     for _epoch in range(int(epochs)):
         shuffled = list(rows)
         rng.shuffle(shuffled)
+        shuffled = [
+            row
+            for row in shuffled
+            if int(row.get("definite_owner_frame_count", 1)) > 0
+        ]
         planned.append(
             _pack_batches(shuffled, max_padded_frames=int(max_padded_frames))
         )
@@ -637,6 +679,14 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         partition: [row for row in rows if row["partition"] == partition]
         for partition in sorted(PARTITIONS)
     }
+    supervised_by_partition = {
+        partition: [
+            row
+            for row in partition_rows
+            if int(row["definite_owner_frame_count"]) > 0
+        ]
+        for partition, partition_rows in by_partition.items()
+    }
     _reset_training_seed(int(args.seed), torch)
     device = _resolve_training_device(args.device, torch)
     process = psutil.Process()
@@ -667,7 +717,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     memory_snapshots: list[dict[str, Any]] = []
 
     cache = SourceArrayCache(max_sources=int(args.source_cache_size))
-    normalization = compute_mfcc_normalization(by_partition["train"], cache)
+    normalization = compute_mfcc_normalization(supervised_by_partition["train"], cache)
     config = _model_config(args, normalization)
     schema = (
         CANDIDATE_ISLAND_SCORER_V11_HEATMAP_SCHEMA
@@ -686,7 +736,8 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             weight_decay=float(args.weight_decay),
         )
         warmup_rows = _cuda_warmup_rows(
-            by_partition["train"], max_padded_frames=int(args.max_padded_frames)
+            supervised_by_partition["train"],
+            max_padded_frames=int(args.max_padded_frames),
         )
         warmup_batch = _collate(
             [load_candidate_window(row, cache) for row in warmup_rows], torch, device
@@ -873,7 +924,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         if should_evaluate:
             val_metrics = _evaluate(
                 model,
-                by_partition["val"],
+                supervised_by_partition["val"],
                 cache=cache,
                 max_padded_frames=int(args.max_padded_frames),
                 variant=args.variant,
@@ -994,7 +1045,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     metrics = {
         partition: _evaluate(
             model,
-            by_partition[partition],
+            supervised_by_partition[partition],
             cache=cache,
             max_padded_frames=int(args.max_padded_frames),
             variant=args.variant,
@@ -1037,6 +1088,18 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "manual_zero_true_speech_deletion_gate": "pending",
         "promotion_allowed": False,
         "smoke": bool(args.smoke),
+        "partition_window_counts": {
+            partition: len(by_partition[partition]) for partition in sorted(PARTITIONS)
+        },
+        "partition_supervised_window_counts": {
+            partition: len(supervised_by_partition[partition])
+            for partition in sorted(PARTITIONS)
+        },
+        "partition_ignored_only_window_counts": {
+            partition: len(by_partition[partition])
+            - len(supervised_by_partition[partition])
+            for partition in sorted(PARTITIONS)
+        },
     }
     payload = build_speech_island_scorer_checkpoint(
         model=model,
@@ -1059,6 +1122,18 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "capacity_profile": capacity_profile,
         "capacity_contract": dict(capacity),
         "smoke": bool(args.smoke),
+        "partition_window_counts": {
+            partition: len(by_partition[partition]) for partition in sorted(PARTITIONS)
+        },
+        "partition_supervised_window_counts": {
+            partition: len(supervised_by_partition[partition])
+            for partition in sorted(PARTITIONS)
+        },
+        "partition_ignored_only_window_counts": {
+            partition: len(by_partition[partition])
+            - len(supervised_by_partition[partition])
+            for partition in sorted(PARTITIONS)
+        },
         "checkpoint": _display(checkpoint_path),
         "checkpoint_sha256": _sha256(checkpoint_path),
         "dataset_manifest": _display(dataset_manifest),

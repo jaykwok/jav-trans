@@ -204,6 +204,8 @@ def compile_features(
     training_rows: list[dict[str, Any]] = []
     partition_sources: Counter[str] = Counter()
     partition_windows: Counter[str] = Counter()
+    partition_supervised_windows: Counter[str] = Counter()
+    partition_ignored_only_windows: Counter[str] = Counter()
     label_counts: Counter[str] = Counter()
     seen_core: dict[str, tuple[str, str]] = {}
 
@@ -280,6 +282,12 @@ def compile_features(
         )
         windows = plan_candidate_context_windows(int(canonical["frame_count"]))
         for index, window in enumerate(windows):
+            definite_owner_frame_count = int(
+                np.count_nonzero(
+                    training_labels[window.owner_start_frame : window.owner_end_frame]
+                    != -100
+                )
+            )
             training_rows.append(
                 {
                     "schema": CANDIDATE_ISLAND_SCORER_V11_TRAINING_ROW_SCHEMA,
@@ -303,6 +311,7 @@ def compile_features(
                     "owner_end_frame": window.owner_end_frame,
                     "owner_local_start": window.owner_local_start,
                     "owner_local_end": window.owner_local_end,
+                    "definite_owner_frame_count": definite_owner_frame_count,
                     "context_window_frames": FEATURE_CONFIG["context_window_frames"],
                     "context_overlap_frames": FEATURE_CONFIG["context_overlap_frames"],
                     "window_ownership": FEATURE_CONFIG["window_ownership"],
@@ -313,6 +322,10 @@ def compile_features(
                 }
             )
             partition_windows[partition] += 1
+            if definite_owner_frame_count > 0:
+                partition_supervised_windows[partition] += 1
+            else:
+                partition_ignored_only_windows[partition] += 1
         partition_sources[partition] += 1
 
     if set(partition_sources) != PARTITIONS:
@@ -340,6 +353,13 @@ def compile_features(
         "feature_config_sha256": feature_config_sha,
         "partition_source_counts": dict(sorted(partition_sources.items())),
         "partition_window_counts": dict(sorted(partition_windows.items())),
+        "partition_supervised_window_counts": dict(
+            sorted(partition_supervised_windows.items())
+        ),
+        "partition_ignored_only_window_counts": {
+            partition: int(partition_ignored_only_windows.get(partition, 0))
+            for partition in sorted(PARTITIONS)
+        },
         "canonical_frame_counts": dict(sorted(label_counts.items())),
         "unsure_excluded_from_normalization_loss_metrics_gate": True,
         "owner_frames_are_unique": True,
@@ -365,6 +385,13 @@ def compile_features(
         "window_count": len(training_rows),
         "partition_source_counts": dict(sorted(partition_sources.items())),
         "partition_window_counts": dict(sorted(partition_windows.items())),
+        "partition_supervised_window_counts": dict(
+            sorted(partition_supervised_windows.items())
+        ),
+        "partition_ignored_only_window_counts": {
+            partition: int(partition_ignored_only_windows.get(partition, 0))
+            for partition in sorted(PARTITIONS)
+        },
         "canonical_frame_counts": dict(sorted(label_counts.items())),
         "training_manifest_allowed": True,
     }
