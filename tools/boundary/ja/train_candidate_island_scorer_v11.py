@@ -25,17 +25,17 @@ from asr.backends.qwen import QWEN_ASR_17B_REPO_ID  # noqa: E402
 from boundary.contracts import ACOUSTIC_BINARY_V12_CONTRACT  # noqa: E402
 from boundary.ja.candidate_training import candidate_boundary_heatmap_loss  # noqa: E402
 from boundary.ja.model import (  # noqa: E402
+    CANDIDATE_ISLAND_SCORER_V11_CAPACITY_PROFILES,
+    CANDIDATE_ISLAND_SCORER_V11_COMPACT_CAPACITY_PROFILE,
     CANDIDATE_ISLAND_SCORER_V11_DATASET_CONTRACT,
     CANDIDATE_ISLAND_SCORER_V11_FEATURE_CACHE_GATE_SCHEMA,
+    CANDIDATE_ISLAND_SCORER_V11_FULL_CAPACITY_PROFILE,
     CANDIDATE_ISLAND_SCORER_V11_HEATMAP_AUXILIARY,
     CANDIDATE_ISLAND_SCORER_V11_HEATMAP_MODEL_ARCH,
     CANDIDATE_ISLAND_SCORER_V11_HEATMAP_SCHEMA,
     CANDIDATE_ISLAND_SCORER_V11_HEATMAP_SIGMA_FRAMES,
     CANDIDATE_ISLAND_SCORER_V11_MFCC_DIM,
-    CANDIDATE_ISLAND_SCORER_V11_MODEL_ARCH,
-    CANDIDATE_ISLAND_SCORER_V11_PROJECTED_PTM_DIM,
     CANDIDATE_ISLAND_SCORER_V11_RAW_PTM_DIM,
-    CANDIDATE_ISLAND_SCORER_V11_SCHEMA,
     CANDIDATE_ISLAND_SCORER_V11_TRAINING_ROW_SCHEMA,
     CandidateIslandHeatmapScorerNetwork,
     CandidateIslandScorerNetwork,
@@ -344,18 +344,23 @@ def _collate(items: Sequence[dict[str, Any]], torch, device) -> dict[str, Any]:
 
 
 def _model_config(args: argparse.Namespace, normalization: dict[str, list[float]]) -> dict[str, Any]:
+    capacity_profile = str(args.capacity_profile)
+    if capacity_profile not in CANDIDATE_ISLAND_SCORER_V11_CAPACITY_PROFILES:
+        raise ValueError(f"unknown Scorer v11 capacity profile: {capacity_profile!r}")
+    capacity = CANDIDATE_ISLAND_SCORER_V11_CAPACITY_PROFILES[capacity_profile]
     config = {
         "raw_ptm_dim": CANDIDATE_ISLAND_SCORER_V11_RAW_PTM_DIM,
-        "projected_ptm_dim": CANDIDATE_ISLAND_SCORER_V11_PROJECTED_PTM_DIM,
+        "projected_ptm_dim": int(capacity["projected_ptm_dim"]),
         "mfcc_dim": CANDIDATE_ISLAND_SCORER_V11_MFCC_DIM,
-        "hidden_size": int(args.hidden_size),
-        "num_layers": int(args.num_layers),
-        "state_size": int(args.state_size),
-        "num_heads": int(args.num_heads),
-        "head_dim": int(args.head_dim),
-        "n_groups": int(args.n_groups),
-        "conv_kernel": int(args.conv_kernel),
-        "chunk_size": int(args.chunk_size),
+        "capacity_profile": capacity_profile,
+        "hidden_size": int(capacity["hidden_size"]),
+        "num_layers": int(capacity["num_layers"]),
+        "state_size": int(capacity["state_size"]),
+        "num_heads": int(capacity["num_heads"]),
+        "head_dim": int(capacity["head_dim"]),
+        "n_groups": int(capacity["n_groups"]),
+        "conv_kernel": int(capacity["conv_kernel"]),
+        "chunk_size": int(capacity["chunk_size"]),
         "bidirectional": True,
         "valid_prefix_bidirectional": True,
         "context_window_frames": CANDIDATE_ISLAND_SCORER_V11_DATASET_CONTRACT[
@@ -380,7 +385,7 @@ def _model_config(args: argparse.Namespace, normalization: dict[str, list[float]
             }
         )
     else:
-        config["model_arch"] = CANDIDATE_ISLAND_SCORER_V11_MODEL_ARCH
+        config["model_arch"] = str(capacity["model_arch"])
     return config
 
 
@@ -517,6 +522,23 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
 
     if args.variant not in {"baseline", "heatmap_aux"}:
         raise ValueError("Scorer v11 variant must be baseline or heatmap_aux")
+    capacity_profile = str(args.capacity_profile)
+    if capacity_profile not in CANDIDATE_ISLAND_SCORER_V11_CAPACITY_PROFILES:
+        raise ValueError(f"unknown Scorer v11 capacity profile: {capacity_profile!r}")
+    capacity = CANDIDATE_ISLAND_SCORER_V11_CAPACITY_PROFILES[capacity_profile]
+    if (
+        args.variant == "heatmap_aux"
+        and capacity_profile != CANDIDATE_ISLAND_SCORER_V11_FULL_CAPACITY_PROFILE
+    ):
+        raise ValueError(
+            "Scorer v11 heatmap A/B is only defined after the full-capacity baseline; "
+            "do not mix heatmap and capacity axes"
+        )
+    if int(args.max_padded_frames) > int(capacity["max_padded_frames"]):
+        raise ValueError(
+            "Scorer v11 max_padded_frames exceeds the verified no-spill capacity "
+            f"for {capacity_profile}: {capacity['max_padded_frames']}"
+        )
     if float(args.class_weight_outside) != 1.0 or float(args.class_weight_inside) != 1.0:
         raise ValueError("Scorer v11 neutral baseline requires class weights 1/1")
     if args.variant == "baseline" and float(args.heatmap_weight) != 0.0:
@@ -589,7 +611,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         schema = CANDIDATE_ISLAND_SCORER_V11_HEATMAP_SCHEMA
     else:
         model = CandidateIslandScorerNetwork(**config)
-        schema = CANDIDATE_ISLAND_SCORER_V11_SCHEMA
+        schema = str(capacity["schema"])
     model.to(device)
     optimizer = torch.optim.AdamW(
         model.parameters(), lr=float(args.learning_rate), weight_decay=float(args.weight_decay)
@@ -651,7 +673,9 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     )
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
-    checkpoint_path = output_dir / f"scorer-v11-{args.variant}.pt"
+    checkpoint_path = output_dir / (
+        f"scorer-v11-{capacity_profile}-{args.variant}.pt"
+    )
     metadata = {
         "ptm_repo_id": QWEN_ASR_17B_REPO_ID,
         "dataset_manifest": _display(dataset_manifest),
@@ -664,6 +688,8 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "feature_config_sha256": provenance["feature_config_sha256"],
         "training_initialization": "random",
         "training_variant": args.variant,
+        "capacity_profile": capacity_profile,
+        "capacity_ab_axis": "ptm_adapter_and_temporal_capacity_profile",
         "class_weights": {"outside_candidate": 1.0, "inside_candidate": 1.0},
         "heatmap_auxiliary_weight": float(args.heatmap_weight),
         "numeric_gate_maximum_requirement": 0.95,
@@ -691,6 +717,8 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "schema": SUMMARY_SCHEMA,
         "boundary_serialization_contract_id": ACOUSTIC_BINARY_V12_CONTRACT.contract_id,
         "variant": args.variant,
+        "capacity_profile": capacity_profile,
+        "capacity_contract": dict(capacity),
         "smoke": bool(args.smoke),
         "checkpoint": _display(checkpoint_path),
         "checkpoint_sha256": _sha256(checkpoint_path),
@@ -724,6 +752,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--feature-cache-gate", required=True)
     parser.add_argument("--output-dir", required=True)
     parser.add_argument("--variant", choices=("baseline", "heatmap_aux"), default="baseline")
+    parser.add_argument(
+        "--capacity-profile",
+        choices=(
+            CANDIDATE_ISLAND_SCORER_V11_FULL_CAPACITY_PROFILE,
+            CANDIDATE_ISLAND_SCORER_V11_COMPACT_CAPACITY_PROFILE,
+        ),
+        default=CANDIDATE_ISLAND_SCORER_V11_FULL_CAPACITY_PROFILE,
+    )
     parser.add_argument("--heatmap-weight", type=float, default=0.0)
     parser.add_argument("--class-weight-outside", type=float, default=1.0)
     parser.add_argument("--class-weight-inside", type=float, default=1.0)
@@ -732,19 +768,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=117)
     parser.add_argument("--epochs", type=int, default=20)
     parser.add_argument("--max-steps", type=int, default=0)
-    parser.add_argument("--max-padded-frames", type=int, default=4000)
+    parser.add_argument("--max-padded-frames", type=int, default=2000)
     parser.add_argument("--source-cache-size", type=int, default=4)
     parser.add_argument("--learning-rate", type=float, default=2e-4)
     parser.add_argument("--weight-decay", type=float, default=1e-4)
     parser.add_argument("--gradient-clip-norm", type=float, default=1.0)
-    parser.add_argument("--hidden-size", type=int, default=128)
-    parser.add_argument("--num-layers", type=int, default=2)
-    parser.add_argument("--state-size", type=int, default=32)
-    parser.add_argument("--num-heads", type=int, default=4)
-    parser.add_argument("--head-dim", type=int, default=64)
-    parser.add_argument("--n-groups", type=int, default=2)
-    parser.add_argument("--conv-kernel", type=int, default=4)
-    parser.add_argument("--chunk-size", type=int, default=8)
     return parser.parse_args(argv)
 
 

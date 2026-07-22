@@ -23,15 +23,18 @@ runtime 只允许两 logit softmax 后的逐帧 argmax。禁止 threshold、hyst
 
 ## v11 模型与 checkpoint 合同
 
-独立 schema 为 `speech_boundary_ja_candidate_island_scorer_v11`，不兼容 v8/v9/v10：
+主容量 schema 为 `speech_boundary_ja_candidate_island_scorer_v11_full_capacity_v1`，紧凑对照 schema 为 `speech_boundary_ja_candidate_island_scorer_v11_compact_control_v1`；二者均不兼容旧 v11 scaffold 或 v8/v9/v10：
 
-- raw PTM2048 → checkpoint 内随机初始化、可训练 `Linear(2048→128)`；
+- 主臂：raw PTM2048 → checkpoint 内随机初始化、可训练 `Linear(2048→2048)+GELU`，与 MFCC40 拼接后以 `Linear(2088→256)` 输入 bidirectional Mamba2(hidden=256)；
+- 紧凑对照：raw PTM2048 → `Linear(2048→128)+GELU`，与 MFCC40 拼接后以 `Linear(168→128)` 输入 bidirectional Mamba2(hidden=128)；
 - MFCC40 使用仅由 definite train owner frames 计算的 normalization；
 - 不使用 row-relative position，避免完整 source 与 runtime window 的相对位置不一致；
 - valid-prefix bidirectional Mamba2 stack → `Linear(2)`；
 - 固定标签 `outside_candidate / inside_candidate`；
 - 固定中央合同 `boundary_acoustic_binary_v12`；
 - 只允许 random init，结构或数据合同不匹配时直接拒绝，不做 warm-start/alias。
+
+容量 A/B 只允许使用相同 canonical、partition、seed、steps、plain CE、class weights=`1/1`、固定窗口和 `max_padded_frames=2000`。RTX 4060 Ti 8GB 的完整 forward+backward+AdamW smoke 表明主臂 batch=2/2000 padded frames 可行，peak allocated/reserved=`4452/4526 MiB`、shared spill=`0`；batch=3 发生 CUDA OOM，因此代码硬拒绝更大的 padded-frame budget。该 smoke 只证明可训练，不代表 P2048/H256 泛化一定优于 P128/H128。
 
 生产 `segment()` 仍 fail-fast 为 `pending_binary_scorer_audit`。v11 只有在真实数据、人工 zero-clipping gate 和 Scorer→CueQC 工作流 gate 全部通过后才能接入。
 
@@ -72,7 +75,7 @@ PTM2048 + MFCC40 → projection + Bi-Mamba
                          └─ end heatmap 辅助头   → train only
 ```
 
-- 独立 schema=`speech_boundary_ja_candidate_island_scorer_v11_heatmap_aux_v1`；baseline checkpoint 不能作为 alias 或 warm-start。
+- 独立 schema=`speech_boundary_ja_candidate_island_scorer_v11_full_capacity_heatmap_aux_v2`；仅允许在 full-capacity baseline 完成后单独 A/B，不能与 compact/full 容量轴同时变化，baseline checkpoint 不能作为 alias 或 warm-start。
 - heatmap target 由完整 source definite candidate run 生成，再切固定上下文；高斯 `sigma=2 frames` 只定义训练 target，不是 runtime boundary band。
 - touching unsure 的 transition 不产生已知边界，unsure frame 不进入 auxiliary loss。
 - `forward()`、checkpoint decoder 和 source scoring API 仍只返回两类 logits/probabilities；metadata 固定 `runtime_auxiliary_decoder=disabled_ab_only`。

@@ -166,7 +166,7 @@ Web 会在模型要求检查中提示驱动过旧或 CUDA 初始化失败。
 - `jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame-hf`：默认高质量档。
 - `jaykwok/Qwen3-ASR-0.6B-JA-Anime-Galgame-hf`：仅保留 ASR repo 与空 Boundary registry placeholder；全链重训留作未来 backlog，本轮不训练、不修改。
 
-Scorer v11 已冻结独立 baseline 与 B1 train-only boundary-heatmap schema。两者共享 raw PTM2048→trainable Linear128、MFCC40 和双向 Mamba2 主干；B1 的 start/end heatmap 只提供训练梯度，runtime 不读取辅助头。训练与 runtime 使用相同 20s context、4s nominal overlap 和 midpoint unique ownership，不平均概率或投票。当前 production registry 仍为空，必须完成真实 source candidate-membership 数据、固定 A/B 和人工 zero-clipping gate 后才能晋升；旧 Scorer checkpoint、threshold/hysteresis 路径和兼容 alias 均不能复用。
+Scorer v11 当前主容量合同为逐帧 raw PTM2048→trainable Linear(2048→2048)+GELU，与 normalized MFCC40 拼接后再经 Linear(2088→256) 输入双向 Mamba2(hidden=256)；这不是去掉时序主干。紧凑容量对照固定为 Linear(2048→128)+Mamba2(hidden=128)，只允许在相同 canonical/partition/seed/steps/loss 和 2000 padded-frame budget 下与主臂比较。B1 train-only start/end heatmap 必须等容量 A/B 后再单独比较，runtime 始终只读取 inside/outside 两类 argmax。训练与 runtime 使用相同 20s context、4s nominal overlap 和 midpoint unique ownership，不平均概率或投票。当前 production registry 仍为空，必须完成真实 source candidate-membership 数据、固定 A/B 和人工 zero-clipping gate 后才能晋升；旧 Scorer checkpoint、threshold/hysteresis 路径和兼容 alias 均不能复用。
 
 所有小模型统一放在：
 
@@ -178,7 +178,7 @@ src/checkpoints/
 
 1.7B 的目标 Boundary pipeline 统一使用合同 `boundary_acoustic_binary_v12`：Scorer v11 → Proposal v1 → Outer v3 → Acoustic Split v4 → provisional sub-islands → CueQC v13 → Inner v2 acoustic core → Chunk/ASR。Outer v3 必须等实际 post-Scorer-v11 输出分布训练并通过人工 gate 后才可注册；模型缺失、repo 不匹配、合同不兼容或选择 0.6B 都会直接报错，不提供规则 fallback 或静默迁移。实验指标与版本决策见 [docs/HISTORY.md](docs/HISTORY.md)。
 
-当前训练数据状态：完整 1.7B 链尚不可直接重训。Scorer v11缺 current canonical/feature/trainer闭环，Proposal v1历史训练产物不可复现，Outer v3缺真实 post-Scorer-v11数据 compiler；Split v4、CueQC v13和Inner v2的现役权重只保留为旧链审计/运行参考，其训练 provenance不满足当前固定 source/core/partition合同。新的数据入口会拒绝 hash/随机重分区、重复 core、未批准 manifest、旧中央合同以及缺失或不匹配的上游 checkpoint SHA；不能通过修改 metadata或重新绑定旧权重绕过。完整证据与合法重训顺序见 [1.7B Boundary 训练数据生成链职责审计](docs/audits/20260722_boundary-training-data-generation-audit-v1.md)。
+当前训练数据状态：完整 1.7B 链尚不可直接重训。Scorer v11 的 strict canonical/raw-feature/window/trainer 闭环已经存在，但正式 compile 仍要求补齐 125 条 train source 的 current-duty v11 全源真值，并重新提取真实 source raw PTM2048；旧 PTM128 cache 会被拒绝。Proposal v1历史训练产物不可复现，Outer v3缺真实 post-Scorer-v11数据 compiler；Split v4、CueQC v13和Inner v2的现役权重只保留为旧链审计/运行参考，其训练 provenance不满足当前固定 source/core/partition合同。新的数据入口会拒绝 hash/随机重分区、重复 core、未批准 manifest、旧中央合同以及缺失或不匹配的上游 checkpoint SHA；不能通过修改 metadata或重新绑定旧权重绕过。完整证据与合法重训顺序见 [1.7B Boundary 训练数据生成链职责审计](docs/audits/20260722_boundary-training-data-generation-audit-v1.md)。
 
 ---
 

@@ -12,9 +12,10 @@ import pytest
 from asr.backends.qwen import QWEN_ASR_17B_REPO_ID
 from boundary.contracts import ACOUSTIC_BINARY_V12_CONTRACT
 from boundary.ja.model import (
+    CANDIDATE_ISLAND_SCORER_V11_COMPACT_CAPACITY_PROFILE,
+    CANDIDATE_ISLAND_SCORER_V11_COMPACT_SCHEMA,
     CANDIDATE_ISLAND_SCORER_V11_FEATURE_EXTRACTOR_SCHEMA,
     CANDIDATE_ISLAND_SCORER_V11_RAW_CACHE_ROW_SCHEMA,
-    CANDIDATE_ISLAND_SCORER_V11_SCHEMA,
     load_speech_island_scorer_checkpoint,
 )
 from tools.boundary.ja.compile_candidate_island_scorer_v11_canonical import (
@@ -190,6 +191,7 @@ def test_v11_feature_compile_and_random_init_cpu_smoke(tmp_path: Path) -> None:
         feature_cache_gate=feature_summary["feature_cache_gate"],
         output_dir=str(tmp_path / "training"),
         variant="baseline",
+        capacity_profile=CANDIDATE_ISLAND_SCORER_V11_COMPACT_CAPACITY_PROFILE,
         heatmap_weight=0.0,
         class_weight_outside=1.0,
         class_weight_inside=1.0,
@@ -203,14 +205,6 @@ def test_v11_feature_compile_and_random_init_cpu_smoke(tmp_path: Path) -> None:
         learning_rate=1e-3,
         weight_decay=0.0,
         gradient_clip_norm=1.0,
-        hidden_size=8,
-        num_layers=1,
-        state_size=4,
-        num_heads=2,
-        head_dim=8,
-        n_groups=1,
-        conv_kernel=2,
-        chunk_size=2,
     )
     result = train(args)
     assert result["training_steps"] == 1
@@ -220,7 +214,10 @@ def test_v11_feature_compile_and_random_init_cpu_smoke(tmp_path: Path) -> None:
     if not checkpoint.is_absolute():
         checkpoint = Path.cwd() / checkpoint
     bundle = load_speech_island_scorer_checkpoint(checkpoint, device="cpu")
-    assert bundle.schema == CANDIDATE_ISLAND_SCORER_V11_SCHEMA
+    assert bundle.schema == CANDIDATE_ISLAND_SCORER_V11_COMPACT_SCHEMA
+    assert bundle.model_config["capacity_profile"] == (
+        CANDIDATE_ISLAND_SCORER_V11_COMPACT_CAPACITY_PROFILE
+    )
     assert bundle.metadata["training_initialization"] == "random"
 
 

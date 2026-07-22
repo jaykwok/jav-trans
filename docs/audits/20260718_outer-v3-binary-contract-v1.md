@@ -25,7 +25,7 @@ Outer 的职责是把 Scorer 的完整 provisional island 收成供 Split 查询
 | surface | current audited behavior |
 | --- | --- |
 | schema | `outer_edge_refiner_v3` |
-| upstream | exact `speech_boundary_ja_candidate_island_scorer_v11` output distribution |
+| upstream | exact promoted `speech_boundary_ja_candidate_island_scorer_v11_full_capacity_v1` output distribution; compact control is not production upstream |
 | labels | `background / semantic_core`, `unsure=-100` |
 | decision | frame-level two-logit softmax argmax; first/last semantic frame forms the paired outer edges; all-background drops the island |
 | model | raw PTM -> learned projection + MFCC + relative position -> bidirectional Mamba2 -> Linear(2) |

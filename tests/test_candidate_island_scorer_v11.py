@@ -21,7 +21,11 @@ from boundary.ja.candidate_training import (
     gradient_alignment,
 )
 from boundary.ja.model import (
+    CANDIDATE_ISLAND_SCORER_V11_CAPACITY_PROFILES,
+    CANDIDATE_ISLAND_SCORER_V11_COMPACT_CAPACITY_PROFILE,
+    CANDIDATE_ISLAND_SCORER_V11_COMPACT_SCHEMA,
     CANDIDATE_ISLAND_SCORER_V11_DATASET_CONTRACT,
+    CANDIDATE_ISLAND_SCORER_V11_FULL_CAPACITY_PROFILE,
     CANDIDATE_ISLAND_SCORER_V11_LABELS,
     CANDIDATE_ISLAND_SCORER_V11_HEATMAP_AUXILIARY,
     CANDIDATE_ISLAND_SCORER_V11_HEATMAP_DATASET_CONTRACT,
@@ -43,27 +47,31 @@ from boundary.ja.model import (
 )
 
 
-def _config() -> dict:
+def _config(
+    capacity_profile: str = CANDIDATE_ISLAND_SCORER_V11_FULL_CAPACITY_PROFILE,
+) -> dict:
+    capacity = CANDIDATE_ISLAND_SCORER_V11_CAPACITY_PROFILES[capacity_profile]
     return {
         "raw_ptm_dim": 2048,
-        "projected_ptm_dim": 128,
+        "projected_ptm_dim": capacity["projected_ptm_dim"],
         "mfcc_dim": 40,
+        "capacity_profile": capacity_profile,
         "mfcc_mean": [0.0] * 40,
         "mfcc_std": [1.0] * 40,
-        "hidden_size": 8,
-        "num_layers": 1,
-        "state_size": 4,
-        "num_heads": 2,
-        "head_dim": 8,
-        "n_groups": 1,
-        "conv_kernel": 2,
-        "chunk_size": 2,
+        "hidden_size": capacity["hidden_size"],
+        "num_layers": capacity["num_layers"],
+        "state_size": capacity["state_size"],
+        "num_heads": capacity["num_heads"],
+        "head_dim": capacity["head_dim"],
+        "n_groups": capacity["n_groups"],
+        "conv_kernel": capacity["conv_kernel"],
+        "chunk_size": capacity["chunk_size"],
         "bidirectional": True,
         "valid_prefix_bidirectional": True,
         "context_window_frames": CANDIDATE_CONTEXT_WINDOW_FRAMES,
         "context_overlap_frames": CANDIDATE_CONTEXT_OVERLAP_FRAMES,
         "window_ownership": CANDIDATE_WINDOW_OWNERSHIP,
-        "model_arch": CANDIDATE_ISLAND_SCORER_V11_MODEL_ARCH,
+        "model_arch": capacity["model_arch"],
         "output_dim": 2,
     }
 
@@ -152,7 +160,15 @@ def test_candidate_v11_checkpoint_is_strict_random_init_argmax_only(tmp_path) ->
         CANDIDATE_ISLAND_SCORER_V11_DATASET_CONTRACT
     )
     assert "position_dim" not in loaded.model_config
-    assert tuple(loaded.model.ptm_projector.weight.shape) == (128, 2048)
+    assert tuple(loaded.model.ptm_projector.weight.shape) == (2048, 2048)
+    assert tuple(loaded.model.frame_proj.weight.shape) == (256, 2088)
+
+    legacy_payload = dict(payload)
+    legacy_payload["schema"] = "speech_boundary_ja_candidate_island_scorer_v11"
+    legacy_checkpoint = tmp_path / "legacy-candidate-scorer-v11.pt"
+    torch.save(legacy_payload, legacy_checkpoint)
+    with pytest.raises(ValueError, match="unsupported scorer checkpoint schema"):
+        load_speech_island_scorer_checkpoint(legacy_checkpoint, device="cpu")
 
     with pytest.raises(ValueError, match="forbids warm-start"):
         build_speech_island_scorer_checkpoint(
@@ -182,13 +198,13 @@ def test_candidate_v11_checkpoint_is_strict_random_init_argmax_only(tmp_path) ->
 
 def test_candidate_v11_batching_matches_singletons_and_rejects_v10_api(tmp_path) -> None:
     torch = pytest.importorskip("torch")
-    config = _config()
+    config = _config(CANDIDATE_ISLAND_SCORER_V11_COMPACT_CAPACITY_PROFILE)
     payload = build_speech_island_scorer_checkpoint(
         model=CandidateIslandScorerNetwork(**config).eval(),
         model_config=config,
         normalization={"mfcc_mean": [0.0] * 40, "mfcc_std": [1.0] * 40},
         metadata=_metadata(),
-        schema=CANDIDATE_ISLAND_SCORER_V11_SCHEMA,
+        schema=CANDIDATE_ISLAND_SCORER_V11_COMPACT_SCHEMA,
     )
     checkpoint = tmp_path / "candidate-scorer-v11.pt"
     torch.save(payload, checkpoint)
@@ -223,13 +239,13 @@ def test_candidate_v11_batching_matches_singletons_and_rejects_v10_api(tmp_path)
 
 def test_candidate_source_scoring_is_frame_budget_equivalent(tmp_path) -> None:
     torch = pytest.importorskip("torch")
-    config = _config()
+    config = _config(CANDIDATE_ISLAND_SCORER_V11_COMPACT_CAPACITY_PROFILE)
     payload = build_speech_island_scorer_checkpoint(
         model=CandidateIslandScorerNetwork(**config).eval(),
         model_config=config,
         normalization={"mfcc_mean": [0.0] * 40, "mfcc_std": [1.0] * 40},
         metadata=_metadata(),
-        schema=CANDIDATE_ISLAND_SCORER_V11_SCHEMA,
+        schema=CANDIDATE_ISLAND_SCORER_V11_COMPACT_SCHEMA,
     )
     checkpoint = tmp_path / "candidate-scorer-v11.pt"
     torch.save(payload, checkpoint)
@@ -255,6 +271,13 @@ def test_candidate_source_scoring_is_frame_budget_equivalent(tmp_path) -> None:
     np.testing.assert_array_equal(
         np.argmax(one_batch, axis=1), np.argmax(split_batches, axis=1)
     )
+    with pytest.raises(ValueError, match="verified no-spill capacity"):
+        score_candidate_island_source_probabilities(
+            bundle,
+            ptm=ptm,
+            mfcc=mfcc,
+            max_padded_frames=2001,
+        )
 
 
 def test_candidate_v11_decoder_is_argmax_only_and_runtime_remains_pending() -> None:
