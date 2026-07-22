@@ -29,6 +29,7 @@
 
 ## 2026-07-22
 
+- Scorer训练期间完成其余1.7B小模型职责/容量迁移审计，见`docs/audits/20260722_boundary-model-duty-capacity-audit-v1.md`。结论是不机械复制Scorer：Proposal应断开旧单logit+peak规则并在最终Scorer island上比较two-logit event与learned query；Split保留显式candidate/island双层Mamba，只重编旧heuristic scalar并做P128/P256/full-width固定数据A/B；CueQC若重构应使用自己的raw-PTM adapter而非借用Split投影；Inner保持当前有效基线。Outer当前位于CueQC前且会对all-background整岛drop，与Scorer高召回/CueQC路由职责重叠，必须先做no-Outer/edge-only/current三臂职责消融，不能直接扩容训练。
 - Scorer v11 真实数据 compact CUDA smoke 暴露 trainer 在首次 CUDA/Mamba 上下文建立前过早重置 shared-VRAM baseline，首个模型初始化因此被误报为 `74 MiB` spill。trainer 现与正式 raw extractor/v10 trainer 对齐：使用同一 capacity profile 和最大预算的代表 batch 完成临时 forward/backward/AdamW warmup，显式释放后建立执行基线，再恢复原 seed 随机初始化正式模型；正式训练期间任何新增 shared usage 仍立即 soft-OOM，warmup 本身也必须满足物理 RAM/VRAM `0.95` 上限。
 - Scorer v11真实1667-window CUDA smoke在进入训练前发现bare `--device cuda`无法传给`torch.cuda.set_per_process_memory_fraction`；trainer现统一把无index的CUDA device解析为当前`cuda:N`，保留显式`cuda:N`与CPU smoke语义，避免正式训练依赖手工参数绕过allocator cap。
 - 完成Proposal/Outer/Split当前职责与执行层复审。旧Proposal runtime在模型分数后仍做80ms smoothing、local maximum、双10% quantile floor、120ms NMS、speech-valley snap和80ms edge exclusion；这些虽非final cut却承载候选recall，full-workflow已删除对应CLI/env/summary表面并主动清除旧环境变量。Split保留left/gap/right+多尺度candidate query基线，但旧13维scalar前四项及`speech_*`命名与Scorer v11 membership语义断兼容。另确认Inner预测目前在CueQC前预计算、CueQC后才应用，不符合post-CueQC keep职责；因feature provider生命周期尚未重构，本阶段记录为最终上游晋升后的必改项，不用重复PTM或规则绕过。统一runtime device resolver同时关闭Boundary/Outer/Split/CueQC/Inner的auto CPU fallback。
