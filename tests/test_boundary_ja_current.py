@@ -12,6 +12,9 @@ from boundary.ja.backend import (
     require_current_runtime_scorer,
 )
 from boundary.ja.model import (
+    CANDIDATE_ISLAND_SCORER_V11_DECODER,
+    CANDIDATE_ISLAND_SCORER_V11_LABELS,
+    CANDIDATE_ISLAND_SCORER_V11_SCHEMA,
     SPEECH_ISLAND_SCORER_V8_SCHEMA,
     SPEECH_ISLAND_SCORER_V10_SCHEMA,
     SPEECH_ISLAND_MEMBERSHIP_LABELS,
@@ -120,17 +123,22 @@ def test_binary_v10_decoder_uses_argmax_without_threshold_or_dilation() -> None:
     assert [(row.start, row.end) for row in result.segments] == [(0.02, 0.06)]
 
 
-def test_17b_signature_has_no_fixed_speech_threshold_and_06b_is_retired() -> None:
-    config_17b = SpeechBoundaryJaConfig(
-        scorer_checkpoint=(
-            "semantic_speech_scorer_v9."
-            "jaykwok-Qwen3-ASR-1.7B-JA-Anime-Galgame-hf.pt"
-        )
+def test_17b_signature_exposes_only_pending_v11_contract_and_06b_is_retired() -> None:
+    signature_17b = SpeechBoundaryJaBackend().signature()
+    assert signature_17b["schema"] == CANDIDATE_ISLAND_SCORER_V11_SCHEMA
+    assert signature_17b["status"] == "pending_binary_scorer_audit"
+    assert signature_17b["labels"] == list(CANDIDATE_ISLAND_SCORER_V11_LABELS)
+    assert signature_17b["decoder"] == CANDIDATE_ISLAND_SCORER_V11_DECODER
+    assert signature_17b["decision_mode"] == "two_logit_softmax_argmax"
+    assert signature_17b["runtime_threshold"] is None
+    assert signature_17b["runtime_auxiliary_decoder"] == "disabled_ab_only"
+    assert signature_17b["boundary_serialization_contract_id"] == (
+        "boundary_acoustic_binary_v12"
     )
-    signature_17b = SpeechBoundaryJaBackend(config=config_17b).signature()
-    assert signature_17b["speech_threshold_mode"] == "argmax_source_membership"
     assert "threshold" not in signature_17b
     assert "frame_dilation_s" not in signature_17b
+    assert "candidate_source" not in signature_17b
+    assert "split_nms_s" not in signature_17b
 
     config_06b = SpeechBoundaryJaConfig(
         ptm="jaykwok/Qwen3-ASR-0.6B-JA-Anime-Galgame-hf"
@@ -200,18 +208,21 @@ def test_proposal_checkpoint_env_maps_by_repo(monkeypatch, tmp_path) -> None:
     assert _proposal_checkpoint_from_env(repo_id) == str(checkpoint)
 
 
-def test_signature_candidate_source_tracks_proposal_checkpoint() -> None:
+def test_signature_blocks_proposal_until_candidate_scorer_is_promoted() -> None:
     from boundary.ja.backend import SpeechBoundaryJaBackend
-
-    bootstrap = SpeechBoundaryJaBackend(
-        config=SpeechBoundaryJaConfig(proposal_checkpoint="")
-    )
-    assert bootstrap.signature()["candidate_source"] == "bootstrap_energy_ptm_mfcc_v1"
 
     learned = SpeechBoundaryJaBackend(
         config=SpeechBoundaryJaConfig(proposal_checkpoint="proposal.pt")
     )
-    assert learned.signature()["candidate_source"] == "learned_boundary_proposal_v1"
-    assert learned.signature()["split_decision"] == (
-        "external_repo_bound_semantic_split_model"
+    signature = learned.signature()
+    assert signature["proposal_status"] == (
+        "blocked_until_candidate_scorer_promotion"
     )
+    assert signature["scorer_checkpoint"] == ""
+    assert "proposal_checkpoint" not in signature
+
+
+def test_production_segment_fails_before_loading_retired_runtime(tmp_path) -> None:
+    audio_path = tmp_path / "unused.wav"
+    with pytest.raises(RuntimeError, match="pending_binary_scorer_audit"):
+        SpeechBoundaryJaBackend().segment(str(audio_path))

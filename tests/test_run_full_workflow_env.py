@@ -40,7 +40,9 @@ def test_run_full_workflow_operating_point_uses_opt_in_scorer_metadata():
 
 
 def test_run_full_workflow_operating_point_defaults_without_scorer():
-    assert run_full_workflow.speech_boundary_operating_point([]) == "qwen-mamba2-speech-island-scorer-v8"
+    assert run_full_workflow.speech_boundary_operating_point([]) == (
+        "candidate-island-v11-pending-audit"
+    )
     assert (
         run_full_workflow.speech_boundary_operating_point(
             [{"boundary_signature": {"operating_point": "qwen-mamba2-speech-island-scorer-v8"}}]
@@ -49,17 +51,21 @@ def test_run_full_workflow_operating_point_defaults_without_scorer():
     )
 
 
-def test_run_full_workflow_boundary_threshold_defaults_match_training_eval(monkeypatch):
+def test_run_full_workflow_has_no_runtime_scorer_threshold_surface(monkeypatch):
     monkeypatch.setattr(run_full_workflow, "load_config", lambda: None)
     monkeypatch.delenv("SPEECH_BOUNDARY_JA_THRESHOLD", raising=False)
     monkeypatch.delenv("SPEECH_BOUNDARY_JA_SPEECH_ON_THRESHOLD", raising=False)
     monkeypatch.delenv("SPEECH_BOUNDARY_JA_SPEECH_OFF_THRESHOLD", raising=False)
+    monkeypatch.delenv("SPEECH_BOUNDARY_JA_FRAME_DILATION_S", raising=False)
+    monkeypatch.delenv("SPEECH_BOUNDARY_JA_MIN_SEGMENT_S", raising=False)
 
     args = run_full_workflow.parse_args(["--video", "sample.mp4"])
 
-    assert args.speech_boundary_threshold == 0.15
-    assert args.speech_boundary_speech_on_threshold == 0.15
-    assert args.speech_boundary_speech_off_threshold == 0.15
+    assert not hasattr(args, "speech_boundary_threshold")
+    assert not hasattr(args, "speech_boundary_speech_on_threshold")
+    assert not hasattr(args, "speech_boundary_speech_off_threshold")
+    assert not hasattr(args, "speech_boundary_frame_dilation_s")
+    assert not hasattr(args, "speech_boundary_min_segment_s")
     assert not hasattr(args, "pre_asr_cueqc_drop_threshold")
     assert not hasattr(args, "cueqc_shadow_enabled")
 
@@ -112,8 +118,9 @@ def test_run_full_workflow_parse_args_uses_loaded_env(monkeypatch):
     assert args.speech_boundary_split_score_quantile == 0.4
     assert args.speech_boundary_split_prominence_quantile == 0.6
     assert args.pre_asr_cueqc_enabled is True
-    assert args.speech_boundary_speech_on_threshold == args.speech_boundary_threshold
-    assert args.speech_boundary_speech_off_threshold == args.speech_boundary_threshold
+    assert not hasattr(args, "speech_boundary_threshold")
+    assert not hasattr(args, "speech_boundary_speech_on_threshold")
+    assert not hasattr(args, "speech_boundary_speech_off_threshold")
 
 
 def test_run_full_workflow_context_carries_boundary_env(monkeypatch, tmp_path):
@@ -144,10 +151,6 @@ def test_run_full_workflow_context_carries_boundary_env(monkeypatch, tmp_path):
             "unit",
             "--label",
             "boundary",
-            "--speech-boundary-speech-on-threshold",
-            "0.7",
-            "--speech-boundary-speech-off-threshold",
-            "0.5",
             "--speech-boundary-split-score-quantile",
             "0.45",
             "--speech-boundary-split-prominence-quantile",
@@ -186,8 +189,11 @@ def test_run_full_workflow_context_carries_boundary_env(monkeypatch, tmp_path):
     assert "SPEECH_BOUNDARY_JA_SPLIT_THRESHOLD" not in ctx.advanced
     assert "SPEECH_BOUNDARY_JA_SPLIT_PROMINENCE" not in ctx.advanced
     assert ctx.advanced["PRE_ASR_CUEQC_ENABLED"] == "1"
-    assert ctx.advanced["SPEECH_BOUNDARY_JA_SPEECH_ON_THRESHOLD"] == "0.7"
-    assert ctx.advanced["SPEECH_BOUNDARY_JA_SPEECH_OFF_THRESHOLD"] == "0.5"
+    assert "SPEECH_BOUNDARY_JA_THRESHOLD" not in ctx.advanced
+    assert "SPEECH_BOUNDARY_JA_SPEECH_ON_THRESHOLD" not in ctx.advanced
+    assert "SPEECH_BOUNDARY_JA_SPEECH_OFF_THRESHOLD" not in ctx.advanced
+    assert "SPEECH_BOUNDARY_JA_FRAME_DILATION_S" not in ctx.advanced
+    assert "SPEECH_BOUNDARY_JA_MIN_SEGMENT_S" not in ctx.advanced
 
 
 def test_run_full_workflow_cli_batch_overrides_loaded_env(monkeypatch):
@@ -202,6 +208,11 @@ def test_run_full_workflow_cli_batch_overrides_loaded_env(monkeypatch):
     monkeypatch.delenv("CUEQC_SHADOW_ENABLED", raising=False)
     monkeypatch.delenv("CUEQC_MODEL_PATH_BY_REPO", raising=False)
     monkeypatch.delenv("CUEQC_INFERENCE_BATCH_SIZE", raising=False)
+    monkeypatch.delenv("SPEECH_BOUNDARY_JA_THRESHOLD", raising=False)
+    monkeypatch.delenv("SPEECH_BOUNDARY_JA_SPEECH_ON_THRESHOLD", raising=False)
+    monkeypatch.delenv("SPEECH_BOUNDARY_JA_SPEECH_OFF_THRESHOLD", raising=False)
+    monkeypatch.delenv("SPEECH_BOUNDARY_JA_FRAME_DILATION_S", raising=False)
+    monkeypatch.delenv("SPEECH_BOUNDARY_JA_MIN_SEGMENT_S", raising=False)
 
     args = run_full_workflow.parse_args(
         [
@@ -211,10 +222,6 @@ def test_run_full_workflow_cli_batch_overrides_loaded_env(monkeypatch):
             "jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame-hf",
             "--asr-batch-size",
             "12",
-            "--speech-boundary-speech-on-threshold",
-            "0.7",
-            "--speech-boundary-speech-off-threshold",
-            "0.5",
         ]
     )
     run_full_workflow.configure_env(args)
@@ -226,8 +233,11 @@ def test_run_full_workflow_cli_batch_overrides_loaded_env(monkeypatch):
     assert not hasattr(args, "cueqc_shadow_enabled")
     assert not hasattr(args, "cueqc_model_path_by_repo")
     assert not hasattr(args, "cueqc_inference_batch_size")
-    assert run_full_workflow.os.environ["SPEECH_BOUNDARY_JA_SPEECH_ON_THRESHOLD"] == "0.7"
-    assert run_full_workflow.os.environ["SPEECH_BOUNDARY_JA_SPEECH_OFF_THRESHOLD"] == "0.5"
+    assert "SPEECH_BOUNDARY_JA_THRESHOLD" not in run_full_workflow.os.environ
+    assert "SPEECH_BOUNDARY_JA_SPEECH_ON_THRESHOLD" not in run_full_workflow.os.environ
+    assert "SPEECH_BOUNDARY_JA_SPEECH_OFF_THRESHOLD" not in run_full_workflow.os.environ
+    assert "SPEECH_BOUNDARY_JA_FRAME_DILATION_S" not in run_full_workflow.os.environ
+    assert "SPEECH_BOUNDARY_JA_MIN_SEGMENT_S" not in run_full_workflow.os.environ
     assert "SPEECH_BOUNDARY_JA_SPLIT_MIN_PRIMARY_SCORE" not in run_full_workflow.os.environ
     assert "SPEECH_BOUNDARY_JA_DENSE_CUT_GAP_S" not in run_full_workflow.os.environ
 
@@ -259,13 +269,41 @@ def test_run_full_workflow_summary_uses_pre_asr_cueqc_only(tmp_path):
     assert "cueqc_enabled" not in payload
     assert "cueqc_shadow_enabled" not in payload
     assert "cueqc_inference_batch_size" not in payload
+    assert payload["speech_boundary_decision_mode"] == "two_logit_softmax_argmax"
+    assert payload["speech_boundary_runtime_threshold"] is None
+    assert "speech_boundary_threshold" not in payload
+    assert "speech_boundary_speech_on_threshold" not in payload
+    assert "speech_boundary_speech_off_threshold" not in payload
+    assert "speech_boundary_frame_dilation_s" not in payload
     markdown = paths.summary_md.read_text(encoding="utf-8")
     assert "Pre-ASR CueQC" in markdown
     assert "CueQC shadow" not in markdown
 
 
-def test_removed_split_env_is_absent_from_current_runtime_files():
-    removed = (
+def test_removed_scorer_runtime_env_is_absent_from_active_surfaces():
+    removed_scorer_runtime = (
+        "SPEECH_BOUNDARY_JA_THRESHOLD",
+        "SPEECH_BOUNDARY_JA_SPEECH_ON_THRESHOLD",
+        "SPEECH_BOUNDARY_JA_SPEECH_OFF_THRESHOLD",
+        "SPEECH_BOUNDARY_JA_FRAME_DILATION_S",
+        "SPEECH_BOUNDARY_JA_MIN_SEGMENT_S",
+    )
+    active_paths = [
+        run_full_workflow.PROJECT_ROOT / "src" / "boundary" / "cache.py",
+        run_full_workflow.PROJECT_ROOT / "src" / "core" / "config.py",
+        run_full_workflow.PROJECT_ROOT / "src" / "web" / "static" / "index.html",
+        run_full_workflow.PROJECT_ROOT / "src" / "boundary" / "runtime_pipeline.py",
+        run_full_workflow.PROJECT_ROOT / "tools" / "workflows" / "run_full_workflow.py",
+    ]
+    for path in active_paths:
+        text = path.read_text(encoding="utf-8")
+        for key in removed_scorer_runtime:
+            pattern = re.compile(rf"(?<![A-Z0-9_]){re.escape(key)}(?![A-Z0-9_])")
+            assert not pattern.search(text), path
+
+
+def test_removed_split_env_is_absent_from_current_and_legacy_runtime_files():
+    removed_split = (
         "SPEECH_BOUNDARY_JA_SPLIT_THRESHOLD",
         "SPEECH_BOUNDARY_JA_SPLIT_PROMINENCE",
         "SPEECH_BOUNDARY_JA_SPLIT_TARGET_S",
@@ -281,6 +319,6 @@ def test_removed_split_env_is_absent_from_current_runtime_files():
 
     for path in checked_paths:
         text = path.read_text(encoding="utf-8")
-        for key in removed:
+        for key in removed_split:
             pattern = re.compile(rf"(?<![A-Z0-9_]){re.escape(key)}(?![A-Z0-9_])")
             assert not pattern.search(text), path

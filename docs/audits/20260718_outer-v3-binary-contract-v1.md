@@ -4,7 +4,7 @@
 
 ## Decision
 
-Outer v3 的 schema、随机初始化 trainer 和 padding-invariant runtime plumbing 可以保留，但 registry 继续为空，状态继续为 `pending_outer_v3_audit`。当前没有可晋升 checkpoint，也没有启动 GPU 或全量训练。真实训练被明确阻塞在 Scorer v10：Outer 数据必须来自实际 `post_binary_scorer_v10_islands`，旧 Scorer v8、旧 Outer v2 输出或任意 Galgame full clip 都不能冒充该分布。
+Outer v3 的 schema、随机初始化 trainer 和 padding-invariant runtime plumbing 可以保留，但 registry 继续为空，状态继续为 `pending_outer_v3_audit`。2026-07-22 Scorer 职责重构后，上游合同已断兼容切到 v11 candidate-island：Outer 数据必须来自实际 `post_candidate_island_scorer_v11_islands`，旧 Scorer v8/v9/v10、旧 Outer v2 输出或任意 Galgame full clip 都不能冒充该分布。当前没有可晋升 checkpoint，也没有启动 GPU 或全量训练。
 
 ## Inner v2 lessons applied
 
@@ -25,7 +25,7 @@ Outer 的职责是把 Scorer 的完整 provisional island 收成供 Split 查询
 | surface | current audited behavior |
 | --- | --- |
 | schema | `outer_edge_refiner_v3` |
-| upstream | exact `speech_boundary_ja_binary_island_scorer_v10` output distribution |
+| upstream | exact `speech_boundary_ja_candidate_island_scorer_v11` output distribution |
 | labels | `background / semantic_core`, `unsure=-100` |
 | decision | frame-level two-logit softmax argmax; first/last semantic frame forms the paired outer edges; all-background drops the island |
 | model | raw PTM -> learned projection + MFCC + relative position -> bidirectional Mamba2 -> Linear(2) |
@@ -37,7 +37,7 @@ Runtime shape checks now reject empty groups, wrong feature width, non-positive 
 
 ## Dataset and gate safeguards
 
-The trainer rejects empty/floating partitions, source or core partition leakage, duplicate core use, non-Scorer-v10 rows and partitions missing semantic or all-background examples. Normalization uses only definite frames with positive source weight. Evaluation also masks unsure frames before constructing predicted outer edges; an argmax semantic prediction on an unsure frame therefore cannot improve coverage or hide a true-speech deletion.
+The trainer rejects empty/floating partitions, source or core partition leakage, duplicate core use, non-Scorer-v11 rows and partitions missing semantic or all-background examples. Normalization uses only definite frames with positive source weight. Evaluation also masks unsure frames before constructing predicted outer edges; an argmax semantic prediction on an unsure frame therefore cannot improve coverage or hide a true-speech deletion.
 
 The CPU one-step plumbing smoke at `agents/temp/20260718_204608_outer-v3-binary-plumbing-smoke/` used six synthetic unique source/core rows, two per partition, with semantic and all-background presence in every partition. It recorded `unsure=7` as excluded and ended with `numeric_gate_pass=false`, `gate_pass=false`, `promotion_ready=false`. Its checkpoint is synthetic, local-only and must not be promoted or committed.
 
@@ -45,4 +45,4 @@ GPU stages use the physical VRAM and RAM `0.95` caps. Shared VRAM is not a budge
 
 ## Human audit status
 
-No listening verdict is claimed here: the only new prediction artifact is a synthetic plumbing smoke with no human-auditable source audio. A playable/saveable verdict page must be generated with the existing `tools/audits` framework after a real Scorer-v10-derived smoke exists. It must include every prediction-drop/truth-keep case, held-out hard case and greater-than-8-second residual; no promotion is possible before those verdicts are saved and evaluated.
+No listening verdict is claimed here: the only new prediction artifact is a synthetic plumbing smoke with no human-auditable source audio. A playable/saveable verdict page must be generated with the existing `tools/audits` framework after a real post-Scorer-v11 smoke exists. It must include every prediction-drop/truth-keep case, held-out hard case and greater-than-8-second residual; no promotion is possible before those verdicts are saved and evaluated.

@@ -22,8 +22,8 @@ jav-trans 是一个面向 Windows + NVIDIA 显卡的本地 JAV 字幕生成工�
 
 当前设计把职责拆开：
 
-- Speech Island Scorer 以高召回检测可能包含语义人声的 island。
-- Outer Edge Refiner v3 预留为整条 island 的二分类 acoustic outer-core 模型；schema/runtime/trainer plumbing 已完成审计，但实际 post-Scorer-v10 数据、训练和人工 gate 未完成，registry 仍为空。
+- Candidate-island Scorer v11 以高召回判断连续波形是否应继续进入下游；含混人声与同一 ASR 单元内短停顿优先保留，不在入口承担最终语义 drop。
+- Outer Edge Refiner v3 预留为整条 island 的二分类 acoustic outer-core 模型；schema/runtime/trainer plumbing 已完成审计，但实际 post-Scorer-v11 数据、训练和人工 gate 未完成，registry 仍为空。
 - Acoustic Split v4 只学习 `cut/continue`，按二分类 argmax 生成内部 event，不输出最终边缘；teacher/data 层的 `unsure` 仅用于审计并从训练排除。
 - Pre-ASR CueQC v13 对 provisional sub-island 做 `keep/drop` 二分类 argmax 路由；teacher/data 层可以保留 `unsure`，但模型不会输出它。
 - Inner Edge Refiner v2 对 CueQC 保留的 sub-island 做逐帧二分类 argmax，裁成送入 ASR 的 acoustic semantic core。
@@ -115,13 +115,14 @@ Web 会在模型要求检查中提示驱动过旧或 CUDA 初始化失败。
   -> Shared Qwen feature extraction
      - Qwen ASR repo 对应的 frozen PTM/encoder frame features
      - MFCC / timing numeric features
-  -> Speech-island scorer（1.7B binary-argmax v10 待审计/重训）
-     - Scorer v8 仅保留为 threshold/hysteresis 审计参考，不进入当前生产 runtime
-     - v10 corrected-r5 与 train-only sparse-layout r6 均已完成 signed cache/training；`001817` 已确认为 `unsure→-100`，但 `001976` 可听出“待って”并被 step-2000 整段误删；22 条 train background false-keep 已生成逐 island ASR 辅助人工页，registry 仍为空
+  -> Candidate-island Scorer v11（1.7B，待真实数据训练与人工 gate）
+     - raw PTM2048 -> checkpoint 内 trainable Linear128，与 normalized MFCC40 拼接
+     - valid-prefix bidirectional Mamba2 -> Linear(2) -> softmax argmax
+     - 同一 ASR 单元内停顿、尾音和短背景属于 inside_candidate；unsure 仅保留在 canonical 并映射 -100
   -> BoundaryProposalScorer v1（候选源审计中）
      - 学习型高召回 acoustic candidate source，不做 final cut decision
   -> 按 ASR repo 进入互不混用的边界链
-     - 1.7B：Outer Edge Refiner v3（合同 plumbing 已审计；等待实际 Scorer-v10 数据，未注册生产 checkpoint）
+     - 1.7B：Outer Edge Refiner v3（合同 plumbing 已审计；等待实际 post-Scorer-v11 数据，未注册生产 checkpoint）
        -> Acoustic Split v4 binary argmax
        -> provisional sub-islands
        -> Pre-ASR CueQC v13 binary argmax
@@ -146,12 +147,12 @@ Web 会在模型要求检查中提示驱动过旧或 CUDA 初始化失败。
 
 关键约束：
 
-- SpeechIslandScorer 不做句内结构决策；声学候选只有经过 Semantic Split Model 接受后才会切。
+- Candidate-island Scorer 只决定连续波形是否应继续进入下游，不负责语义 drop 或句内切点；Proposal 只能附加非绑定候选，最终 cut 由 Split 决定。
 - 内部 cut 是一个共享绝对时间戳，不允许左右 chunk 各自修边。
 - `20 / (24000/1001)` 是字幕最短显示和 micro chunk 风险线，不是 runtime duration-only drop 阈值。
 - 7 秒是字幕显示 soft guard，不是 ASR chunk 上限。
 - Runtime 不使用具体词黑名单或时长启发式删除短促人声；是否进入 ASR 由 Pre-ASR CueQC 模型标签决定。
-- 1.7B Split v4、CueQC v13 与 Inner v2 只使用二分类 argmax，不读取 runtime threshold，不提供旧三分类 alias 或规则 fallback。Scorer v8 的 threshold/hysteresis 路径仅用于离线审计；当前 segment runtime 会明确拒绝它，等待二分类 Scorer v10。
+- Scorer v11、Split v4、CueQC v13 与 Inner v2 均只允许二分类 softmax argmax，不读取 runtime threshold，不提供旧三分类 alias 或规则 fallback。Scorer v8/v9/v10 仅保留为离线审计证据；当前 production segment 在 v11 checkpoint 晋升前明确报告 `pending_binary_scorer_audit`。
 - Boundary 阶段按 Outer、Split、Inner、CueQC 的独立生命周期串行释放模型；allocated/reserved/shared VRAM 只写运行诊断，不参与 cache 签名。显式 CUDA 请求不可用时直接报错，不回退 CPU；任何正 shared VRAM spill 都是 soft OOM。
 - 1.7B Outer registry 当前为空；选择该档会在模型加载前明确报告 `pending_outer_v3_audit`。
 - 0.6B Boundary registry 当前为空；选择该档会在模型加载前明确报告 `pending_binary_retrain`。
@@ -160,12 +161,12 @@ Web 会在模型要求检查中提示驱动过旧或 CUDA 初始化失败。
 
 ## 模型架构
 
-当前 registry 保留一个待完成 Outer 审计的 1.7B 模型档，以及一个待全量重训的 0.6B ASR repo：
+当前只开发和审计 1.7B Boundary 链；0.6B 仅保留空 registry placeholder：
 
 - `jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame-hf`：默认高质量档。
 - `jaykwok/Qwen3-ASR-0.6B-JA-Anime-Galgame-hf`：仅保留 ASR repo 与空 Boundary registry placeholder；全链重训留作未来 backlog，本轮不训练、不修改。
 
-1.7B 绑定已完成合同 plumbing；Speech-island scorer canonical r9 为 `2665 sources / 2059 cores / max core use=1`，frame=`background 142522 / speech 495946 / unsure 2170`，SHA256=`17d9ff53cd0cde5259b79f243d4868c3639ca8ec9dc4ef930b6e93c28f123c24`。最终 9 条完整 source 人工真值把 1062 帧从 background 精确改为 speech；审计页音频 SHA/size 与 canonical 原音频逐条相同，模型或 ASR 输出均未用作标签。raw PTM2048/MFCC40 signed manifest 保持 `f418d3dd...aea5`，label-only rebind 与 training manifest `4da5d837...49ed3` 已通过逐文件 SHA/shape 校验；2170 个 unsure 帧仍映射 `-100`。r9 的两档最小 loss A/B（worst-frame=`0.20` 与 `0.10`）均已完整训练并因 held-out numeric gate 失败而拒绝：前者连续性较好但 background drop 不足，后者连续性与背景 gate 都不足；没有 checkpoint、threshold 或下游规则被晋升。下一步是按 held-out failure 与 train 训练分布做证据审计，再决定唯一的数据重构方案。Scorer v10 registry 仍为空。旧 Scorer checkpoint 和未审计别名均不能复用。其余链包括高召回边界候选、待真实 Scorer 输出训练的 Outer、Acoustic Split、Pre-ASR CueQC 与 binary acoustic Inner。0.6B 的旧小模型已退役并保持空 placeholder；未来 backlog 若重启，必须重新提取 0.6B PTM features 并从头训练，不借用 1.7B feature cache、投影或 checkpoint。
+Scorer v11 已冻结独立 baseline 与 B1 train-only boundary-heatmap schema。两者共享 raw PTM2048→trainable Linear128、MFCC40 和双向 Mamba2 主干；B1 的 start/end heatmap 只提供训练梯度，runtime 不读取辅助头。训练与 runtime 使用相同 20s context、4s nominal overlap 和 midpoint unique ownership，不平均概率或投票。当前 production registry 仍为空，必须完成真实 source candidate-membership 数据、固定 A/B 和人工 zero-clipping gate 后才能晋升；旧 Scorer checkpoint、threshold/hysteresis 路径和兼容 alias 均不能复用。
 
 所有小模型统一放在：
 
@@ -175,7 +176,7 @@ src/checkpoints/
 └── jaykwok-Qwen3-ASR-1.7B-JA-Anime-Galgame-hf/
 ```
 
-1.7B 的目标 Boundary pipeline 为 Boundary contract `boundary_acoustic_binary_v12`：Outer v3 → Acoustic Split v4 binary → provisional sub-islands → CueQC v13 binary → Inner v2 binary acoustic core → Chunk/ASR。Outer v3 仅完成合同 plumbing，必须等 Scorer v10 实际输出分布上的训练与人工 gate 后才可注册；模型缺失、repo 不匹配、contract id 不兼容或选择尚未重训的 0.6B 都会直接报错（无规则 fallback、无静默迁移）。实验指标与版本决策见 [docs/HISTORY.md](docs/HISTORY.md)。
+1.7B 的目标 Boundary pipeline 统一使用合同 `boundary_acoustic_binary_v12`：Scorer v11 → Proposal v1 → Outer v3 → Acoustic Split v4 → provisional sub-islands → CueQC v13 → Inner v2 acoustic core → Chunk/ASR。Outer v3 必须等实际 post-Scorer-v11 输出分布训练并通过人工 gate 后才可注册；模型缺失、repo 不匹配、合同不兼容或选择 0.6B 都会直接报错，不提供规则 fallback 或静默迁移。实验指标与版本决策见 [docs/HISTORY.md](docs/HISTORY.md)。
 
 ---
 

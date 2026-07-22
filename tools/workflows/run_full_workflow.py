@@ -31,7 +31,7 @@ DEFAULT_ASR_BATCH_SIZE_BY_REPO_ENV = ",".join(
     f"{repo_id}={batch_size}"
     for repo_id, batch_size in DEFAULT_QWEN_ASR_BATCH_SIZE_BY_REPO.items()
 )
-DEFAULT_SPEECH_BOUNDARY_OPERATING_POINT = "qwen-mamba2-speech-island-scorer-v8"
+DEFAULT_SPEECH_BOUNDARY_OPERATING_POINT = "candidate-island-v11-pending-audit"
 
 
 @dataclass(frozen=True)
@@ -178,11 +178,6 @@ def _env_float(key: str, default: float) -> float:
     return float(raw) if raw else default
 
 
-def _env_optional_float(key: str) -> float | None:
-    raw = os.getenv(key, "").strip()
-    return float(raw) if raw else None
-
-
 def configure_env(args: argparse.Namespace) -> None:
     os.environ.pop("ASR_STAGE_WORKER_MODE", None)
     os.environ.pop("ASR_WORKER_MODE", None)
@@ -224,10 +219,6 @@ def configure_env(args: argparse.Namespace) -> None:
     os.environ["PRE_ASR_CUEQC_DEVICE"] = args.pre_asr_cueqc_device
     os.environ["KEEP_ASR_CHUNKS"] = "1" if args.keep_asr_chunks else "0"
     os.environ["BOUNDARY_CACHE_ENABLED"] = "1" if args.boundary_cache else "0"
-    os.environ["SPEECH_BOUNDARY_JA_THRESHOLD"] = str(args.speech_boundary_threshold)
-    os.environ["SPEECH_BOUNDARY_JA_SPEECH_ON_THRESHOLD"] = str(args.speech_boundary_speech_on_threshold)
-    os.environ["SPEECH_BOUNDARY_JA_SPEECH_OFF_THRESHOLD"] = str(args.speech_boundary_speech_off_threshold)
-    os.environ["SPEECH_BOUNDARY_JA_FRAME_DILATION_S"] = str(args.speech_boundary_frame_dilation_s)
     os.environ["SPEECH_BOUNDARY_JA_SPLIT_SCORE_QUANTILE"] = str(args.speech_boundary_split_score_quantile)
     os.environ["SPEECH_BOUNDARY_JA_SPLIT_PROMINENCE_QUANTILE"] = str(
         args.speech_boundary_split_prominence_quantile
@@ -252,7 +243,6 @@ def configure_env(args: argparse.Namespace) -> None:
     os.environ["SPEECH_BOUNDARY_JA_SCORER_DEVICE"] = args.speech_boundary_scorer_device
     os.environ["SPEECH_BOUNDARY_JA_WINDOW_S"] = str(args.speech_boundary_window_s)
     os.environ["SPEECH_BOUNDARY_JA_OVERLAP_S"] = str(args.speech_boundary_overlap_s)
-    os.environ["SPEECH_BOUNDARY_JA_MIN_SEGMENT_S"] = str(args.speech_boundary_min_segment_s)
     os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
 
@@ -291,10 +281,6 @@ def build_context(*, args: argparse.Namespace, paths: RunPaths, video: Path):
         "RUN_LOG_DIR": str(paths.run_logs),
         "BOUNDARY_CACHE_ENABLED": "1" if args.boundary_cache else "0",
         "BOUNDARY_CACHE_DIR": str(paths.root / "boundary-cache"),
-        "SPEECH_BOUNDARY_JA_THRESHOLD": str(args.speech_boundary_threshold),
-        "SPEECH_BOUNDARY_JA_SPEECH_ON_THRESHOLD": str(args.speech_boundary_speech_on_threshold),
-        "SPEECH_BOUNDARY_JA_SPEECH_OFF_THRESHOLD": str(args.speech_boundary_speech_off_threshold),
-        "SPEECH_BOUNDARY_JA_FRAME_DILATION_S": str(args.speech_boundary_frame_dilation_s),
         "SPEECH_BOUNDARY_JA_SPLIT_SCORE_QUANTILE": str(args.speech_boundary_split_score_quantile),
         "SPEECH_BOUNDARY_JA_SPLIT_PROMINENCE_QUANTILE": str(
             args.speech_boundary_split_prominence_quantile
@@ -317,7 +303,6 @@ def build_context(*, args: argparse.Namespace, paths: RunPaths, video: Path):
         ),
         "SPEECH_BOUNDARY_JA_WINDOW_S": str(args.speech_boundary_window_s),
         "SPEECH_BOUNDARY_JA_OVERLAP_S": str(args.speech_boundary_overlap_s),
-        "SPEECH_BOUNDARY_JA_MIN_SEGMENT_S": str(args.speech_boundary_min_segment_s),
         "KEEP_ASR_CHUNKS": "1" if args.keep_asr_chunks else "0",
     }
     spec = SimpleNamespace(
@@ -354,8 +339,7 @@ def run_video(args: argparse.Namespace, paths: RunPaths, video: Path) -> dict[st
     ctx = build_context(args=args, paths=paths, video=video)
     print(
         f"=== START {video.name} label={args.label} "
-        f"boundary=speech_boundary_ja speech_on={args.speech_boundary_speech_on_threshold:g} "
-        f"speech_off={args.speech_boundary_speech_off_threshold:g} "
+        "boundary=speech_boundary_ja scorer=v11-pending-audit "
         f"asr={args.asr_backend} ===",
         flush=True,
     )
@@ -437,10 +421,8 @@ def write_summary(paths: RunPaths, args: argparse.Namespace, results: list[dict[
         "asr_model_path": project_rel(project_path_value(args.asr_model_path)),
         "boundary_backend": "speech_boundary_ja",
         "speech_boundary_operating_point": speech_boundary_operating_point(results),
-        "speech_boundary_threshold": args.speech_boundary_threshold,
-        "speech_boundary_speech_on_threshold": args.speech_boundary_speech_on_threshold,
-        "speech_boundary_speech_off_threshold": args.speech_boundary_speech_off_threshold,
-        "speech_boundary_frame_dilation_s": args.speech_boundary_frame_dilation_s,
+        "speech_boundary_decision_mode": "two_logit_softmax_argmax",
+        "speech_boundary_runtime_threshold": None,
         "speech_boundary_split_strategy": "acoustic_proposal_then_semantic_split",
         "speech_boundary_split_score_quantile": args.speech_boundary_split_score_quantile,
         "speech_boundary_split_prominence_quantile": args.speech_boundary_split_prominence_quantile,
@@ -472,13 +454,8 @@ def write_summary(paths: RunPaths, args: argparse.Namespace, results: list[dict[
         f"- ASR: `{args.asr_backend}`",
         "- Subtitle timing: `boundary chunk timeline`",
         f"- ASR model: `{project_rel(project_path_value(args.asr_model_path)) or 'auto'}`",
-        (
-            f"- Boundary: `speech_boundary_ja` speech on/off "
-            f"`{args.speech_boundary_speech_on_threshold:g}` / "
-            f"`{args.speech_boundary_speech_off_threshold:g}`, "
-            f"frame dilation `{args.speech_boundary_frame_dilation_s:g}s`, "
-            f"semantic split model"
-        ),
+        "- Boundary: `speech_boundary_ja` candidate-island v11, "
+        "two-logit softmax argmax; production checkpoint pending audit",
         f"- Pre-ASR CueQC: `{'on' if args.pre_asr_cueqc_enabled else 'off'}`",
         f"- Translation: `{'on' if args.translate else 'off'}`",
         f"- Runtime root: `{project_rel(paths.root)}`",
@@ -569,22 +546,6 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("--keep-asr-chunks", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--boundary-cache", action=argparse.BooleanOptionalAction, default=_env_bool("BOUNDARY_CACHE_ENABLED", True))
-    parser.add_argument("--speech-boundary-threshold", dest="speech_boundary_threshold", type=float, default=_env_float("SPEECH_BOUNDARY_JA_THRESHOLD", 0.15))
-    parser.add_argument(
-        "--speech-boundary-speech-on-threshold",
-        dest="speech_boundary_speech_on_threshold",
-        type=float,
-        default=_env_optional_float("SPEECH_BOUNDARY_JA_SPEECH_ON_THRESHOLD"),
-        help="Speech activation threshold. Defaults to --speech-boundary-threshold.",
-    )
-    parser.add_argument(
-        "--speech-boundary-speech-off-threshold",
-        dest="speech_boundary_speech_off_threshold",
-        type=float,
-        default=_env_optional_float("SPEECH_BOUNDARY_JA_SPEECH_OFF_THRESHOLD"),
-        help="Speech deactivation threshold. Defaults to --speech-boundary-threshold.",
-    )
-    parser.add_argument("--speech-boundary-frame-dilation-s", dest="speech_boundary_frame_dilation_s", type=float, default=_env_float("SPEECH_BOUNDARY_JA_FRAME_DILATION_S", 0.2))
     parser.add_argument("--speech-boundary-split-score-quantile", dest="speech_boundary_split_score_quantile", type=float, default=_env_float("SPEECH_BOUNDARY_JA_SPLIT_SCORE_QUANTILE", 0.10))
     parser.add_argument("--speech-boundary-split-prominence-quantile", dest="speech_boundary_split_prominence_quantile", type=float, default=_env_float("SPEECH_BOUNDARY_JA_SPLIT_PROMINENCE_QUANTILE", 0.10))
     parser.add_argument("--speech-boundary-split-smooth-s", dest="speech_boundary_split_smooth_s", type=float, default=_env_float("SPEECH_BOUNDARY_JA_SPLIT_SMOOTH_S", 0.08))
@@ -608,7 +569,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         dest="speech_boundary_scorer_checkpoint_by_repo",
         default=os.getenv("SPEECH_BOUNDARY_JA_SCORER_CHECKPOINT_BY_REPO", ""),
         help=(
-            "Optional repo-id scorer map: '<repo_id>=<speech_island_scorer_v8.pt>'"
+            "Optional repo-id scorer map: '<repo_id>=<candidate_island_scorer_v11.pt>'"
             "[,<repo_id>=...]'. Empty uses the registered repo-id scorer when available."
         ),
     )
@@ -619,26 +580,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("--speech-boundary-window-s", dest="speech_boundary_window_s", type=float, default=_env_float("SPEECH_BOUNDARY_JA_WINDOW_S", 20.0))
     parser.add_argument("--speech-boundary-overlap-s", dest="speech_boundary_overlap_s", type=float, default=_env_float("SPEECH_BOUNDARY_JA_OVERLAP_S", 4.0))
-    parser.add_argument("--speech-boundary-min-segment-s", dest="speech_boundary_min_segment_s", type=float, default=_env_float("SPEECH_BOUNDARY_JA_MIN_SEGMENT_S", 0.05))
     args = parser.parse_args(argv)
-    if args.speech_boundary_speech_on_threshold is None:
-        args.speech_boundary_speech_on_threshold = args.speech_boundary_threshold
-    if args.speech_boundary_speech_off_threshold is None:
-        args.speech_boundary_speech_off_threshold = args.speech_boundary_threshold
     if not str(args.speech_boundary_ptm or "").strip():
         args.speech_boundary_ptm = args.asr_backend
     if not str(args.speech_boundary_model_path or "").strip():
         args.speech_boundary_model_path = qwen_asr_default_model_path(args.speech_boundary_ptm)
-    if args.speech_boundary_threshold < 0:
-        parser.error("--speech-boundary-threshold must be non-negative")
-    if args.speech_boundary_speech_on_threshold < 0:
-        parser.error("--speech-boundary-speech-on-threshold must be non-negative")
-    if args.speech_boundary_speech_off_threshold < 0:
-        parser.error("--speech-boundary-speech-off-threshold must be non-negative")
-    if args.speech_boundary_speech_on_threshold < args.speech_boundary_speech_off_threshold:
-        parser.error("--speech-boundary-speech-on-threshold must be >= --speech-boundary-speech-off-threshold")
-    if args.speech_boundary_frame_dilation_s < 0:
-        parser.error("--speech-boundary-frame-dilation-s must be non-negative")
     for name in (
         "speech_boundary_split_smooth_s",
         "speech_boundary_split_nms_s",

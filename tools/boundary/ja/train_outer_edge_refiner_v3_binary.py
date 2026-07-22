@@ -39,7 +39,7 @@ from tools.boundary.ja.edge_frame_dataset import (  # noqa: E402
 )
 
 
-BINARY_SCORER_V10_SCHEMA = OUTER_EDGE_REFINER_V3_UPSTREAM_SCORER_SCHEMA
+CANDIDATE_SCORER_V11_SCHEMA = OUTER_EDGE_REFINER_V3_UPSTREAM_SCORER_SCHEMA
 PARTITIONS = ("train", "val", "test")
 
 
@@ -61,9 +61,9 @@ def validate_dataset_rows(rows: Sequence[dict[str, Any]]) -> dict[str, Any]:
         if row.get("input_distribution") != OUTER_EDGE_REFINER_V3_DATASET_CONTRACT[
             "input_distribution"
         ]:
-            raise ValueError("Outer v3 rows must come from post-Scorer v10 islands")
-        if row.get("scorer_schema") != BINARY_SCORER_V10_SCHEMA:
-            raise ValueError("Outer v3 rows require the binary Scorer v10 schema")
+            raise ValueError("Outer v3 rows must come from post-Scorer v11 islands")
+        if row.get("scorer_schema") != CANDIDATE_SCORER_V11_SCHEMA:
+            raise ValueError("Outer v3 rows require the candidate-island Scorer v11 schema")
         if int(row.get("frame_count") or 0) <= 0:
             raise ValueError("Outer v3 rows require a positive frame_count")
         source_partitions[source_id].add(partition)
@@ -494,7 +494,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Train 1.7B binary Outer v3 from post-Scorer v10 islands."
+        description="Train 1.7B binary Outer v3 from post-Scorer v11 islands."
     )
     parser.add_argument("--dataset-manifest", required=True)
     parser.add_argument("--output-dir", required=True)

@@ -123,8 +123,6 @@ DEFAULT_SETTINGS: dict[str, str] = {
     # Optional learned SpeechBoundary-JA Mamba2 scorer override. Empty uses the registered repo-id scorer when available; auto resolves the same registry explicitly.
     "SPEECH_BOUNDARY_JA_SCORER_CHECKPOINT_BY_REPO": "",
     "SPEECH_BOUNDARY_JA_SCORER_DEVICE": "auto",
-    # Frame-score mask dilation before raw SpeechBoundary segment extraction. This is not ASR padding.
-    "SPEECH_BOUNDARY_JA_FRAME_DILATION_S": "0.2",
     # 1 caches SpeechBoundary frame score -> Boundary Planner outputs separately from ASR generation settings.
     "BOUNDARY_CACHE_ENABLED": "1",
     # Persistent boundary cache directory. Versioned by src/boundary/cache.py.

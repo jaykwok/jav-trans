@@ -31,7 +31,7 @@ from tools.boundary.ja.train_inner_edge_refiner_v2_binary import (
     parse_args as parse_inner_train_args,
 )
 from tools.boundary.ja.train_outer_edge_refiner_v3_binary import (
-    BINARY_SCORER_V10_SCHEMA,
+    CANDIDATE_SCORER_V11_SCHEMA,
     _memory_snapshot,
     compute_normalization,
     evaluate,
@@ -150,8 +150,8 @@ def _outer_row(source: str, core: str, partition: str, frames: int) -> dict:
         "core_id": core,
         "partition": partition,
         "frame_count": frames,
-        "input_distribution": "post_binary_scorer_v10_islands",
-        "scorer_schema": BINARY_SCORER_V10_SCHEMA,
+        "input_distribution": "post_candidate_island_scorer_v11_islands",
+        "scorer_schema": CANDIDATE_SCORER_V11_SCHEMA,
     }
 
 
