@@ -27,7 +27,10 @@ from tools.boundary.ja.compile_candidate_island_scorer_v11_canonical import (
 from tools.boundary.ja.compile_candidate_island_scorer_v11_features import (
     compile_features,
 )
-from tools.boundary.ja.train_candidate_island_scorer_v11 import run as train
+from tools.boundary.ja.train_candidate_island_scorer_v11 import (
+    _resolve_training_device,
+    run as train,
+)
 
 
 def _sha256(path: Path) -> str:
@@ -375,3 +378,11 @@ def test_v11_feature_compile_rejects_projected_ptm128(tmp_path: Path) -> None:
             raw_feature_manifest=raw_manifest,
             output_dir=tmp_path / "features",
         )
+
+
+def test_v11_training_resolves_bare_cuda_to_current_device(monkeypatch) -> None:
+    torch = pytest.importorskip("torch")
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: 3)
+    assert str(_resolve_training_device("cuda", torch)) == "cuda:3"
+    assert str(_resolve_training_device("cuda:1", torch)) == "cuda:1"
+    assert str(_resolve_training_device("cpu", torch)) == "cpu"

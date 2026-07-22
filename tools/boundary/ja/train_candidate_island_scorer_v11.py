@@ -516,6 +516,13 @@ def _memory_snapshot(device, *, stage: str) -> dict[str, Any]:
     return snapshot
 
 
+def _resolve_training_device(requested: str, torch):
+    device = torch.device(requested)
+    if device.type == "cuda" and device.index is None:
+        device = torch.device("cuda", int(torch.cuda.current_device()))
+    return device
+
+
 def run(args: argparse.Namespace) -> dict[str, Any]:
     import psutil
     import torch
@@ -564,7 +571,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     torch.manual_seed(int(args.seed))
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(int(args.seed))
-    device = torch.device(args.device)
+    device = _resolve_training_device(args.device, torch)
     process = psutil.Process()
     physical_ram = int(psutil.virtual_memory().total)
     physical_ram_budget = int(physical_ram * 0.95)
