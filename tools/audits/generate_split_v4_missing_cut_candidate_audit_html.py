@@ -3,16 +3,51 @@
 from __future__ import annotations
 
 import argparse
+import html
 import json
 import shutil
 import sys
 from pathlib import Path
+from typing import Any
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
-if str(PROJECT_ROOT) not in sys.path:
-    sys.path.insert(0, str(PROJECT_ROOT))
+SRC_ROOT = PROJECT_ROOT / "src"
+for root in (PROJECT_ROOT, SRC_ROOT):
+    if str(root) not in sys.path:
+        sys.path.insert(0, str(root))
 
+from boundary.contracts import ACOUSTIC_BINARY_V12_CONTRACT  # noqa: E402
 from tools.audits.audit_nav import update_audit_entrypoints  # noqa: E402
+from tools.audits.audit_prompt import (  # noqa: E402
+    ResolvedAuditPrompt,
+    resolve_audit_prompt,
+)
+from tools.audits.review_page_core import (  # noqa: E402
+    AuditOptionAxis,
+    AuditReviewPageSpec,
+    render_audit_review_page,
+    validate_audit_option_contract,
+)
+
+
+SUMMARY_SCHEMA = "split_v4_missing_cut_candidate_audit_v2"
+MANUAL_VERDICT_SCHEMA = "split_v4_missing_cut_candidate_manual_verdict_v1"
+DEFAULT_REVIEW_PROMPT = """这些 residual 已由上一层人工审计确认至少存在一个漏切。现在只判断每个真实 candidate 查询点应为 cut、continue 还是 unsure。先听完整 residual，再分别听 candidate 左侧、右侧和左右合并波形；如果 candidate 位于两个不同目标事件之间且切开不会截断任何一侧，标 cut。同一目标事件内部的停顿、呼吸、呻吟或动作声仍标 continue。无法可靠判断时标 unsure，并在训练中映射为 ignore=-100。"""
+SPLIT_CANDIDATE_AXES = (
+    AuditOptionAxis(
+        field="manual_label",
+        options=("cut", "continue", "unsure"),
+    ),
+)
+SPLIT_CANDIDATE_RESULTS = {
+    ("cut",): "cut",
+    ("continue",): "continue",
+    ("unsure",): "unsure",
+}
+validate_audit_option_contract(
+    axes=SPLIT_CANDIDATE_AXES,
+    combination_results=SPLIT_CANDIDATE_RESULTS,
+)
 
 
 def _rows(path: Path) -> list[dict]:
@@ -21,7 +56,53 @@ def _rows(path: Path) -> list[dict]:
     return [json.loads(line) for line in path.read_text("utf-8").splitlines() if line.strip()]
 
 
-def build(*, source_dir: Path, verdict_paths: list[Path], output_dir: Path) -> dict:
+def _page(rows: list[dict[str, Any]], *, review_prompt: str) -> str:
+    payload = json.dumps(rows, ensure_ascii=False).replace("</", "<\\/")
+    prompt_html = html.escape(review_prompt).replace("\n", "<br>")
+    intro_html = f"""<section class="contract"><h2>审计结构与选项意义</h2><div class="prompt"><b>本页审计提示</b><p>{prompt_html}</p></div><p>本页只处理已经确认存在漏切的 residual，并为其中每个真实 Proposal candidate 生成 Split 二分类监督。它不新增 candidate，也不使用固定时长或概率阈值决定标签。</p><table><thead><tr><th>选项</th><th>完整含义</th><th>训练映射</th></tr></thead><tbody><tr><td><code>cut</code></td><td>candidate 两侧属于应独立送往下游的不同目标事件，且当前切点不会截断词头、词尾或同一事件。</td><td><code>cut</code></td></tr><tr><td><code>continue</code></td><td>candidate 位于同一目标事件内部；中间即使有短停顿、呼吸、呻吟或动作声，也不应由 Split 切开。</td><td><code>continue</code></td></tr><tr><td><code>unsure</code></td><td>无法可靠判断事件关系或边界安全性。</td><td><code>ignore=-100</code></td></tr></tbody></table><p>三项覆盖单个 candidate 查询的全部结果。每行提供左侧、右侧和两侧合并播放；这些区间由相邻真实 candidate 与 residual 边界决定，不向模型或人工偷偷加入固定秒数上下文。</p></section>"""
+    adapter_css = """
+.contract,article{background:#fff;border:1px solid #ccd6df;border-radius:10px;padding:14px;margin-bottom:14px}.prompt{background:#eef6ff;border-left:5px solid #315f9d;padding:10px 12px;margin:10px 0}.contract table,.candidate-table{width:100%;border-collapse:collapse}.contract th,.contract td,.candidate-table th,.candidate-table td{border:1px solid #c9d3dc;padding:7px;text-align:left;vertical-align:top}.contract th,.candidate-table th{background:#edf1f5}article.done{border-left:6px solid #258b57}.meta{color:#607080}.play-controls,.choices{display:flex;gap:6px;flex-wrap:wrap}.play-controls button,.choice{border:1px solid #8d99a5;border-radius:5px;background:#fff;padding:6px 9px;cursor:pointer}.choice.active{outline:3px solid #18212b;outline-offset:-2px}.choice[data-value="cut"].active{background:#f4b8b4}.choice[data-value="continue"].active{background:#bfe5cc}.choice[data-value="unsure"].active{background:#f3d49d}.note{width:100%;min-height:48px;margin-top:8px;box-sizing:border-box}@media(max-width:850px){.candidate-table,.candidate-table tbody,.candidate-table tr,.candidate-table td{display:block}.candidate-table thead{display:none}.candidate-table tr{border:1px solid #c9d3dc;margin:8px 0}.candidate-table td{border:0}}
+"""
+    adapter_js = r"""
+const rows=__ROWS__,verdictSchema=__VERDICT_SCHEMA__,boundaryContract=__BOUNDARY_CONTRACT__;
+const allowedLabels=new Set(['cut','continue','unsure']);
+function complete(row,state){return row.residual_candidates.every(candidate=>allowedLabels.has(state.labels[candidate.candidate_id]));}
+const reviewCore=createAuditReviewCore({storageKey:'split-v4-missing-cut-candidate-audit-v2:'+location.pathname,entries:rows,entryId:row=>row.audit_id,defaultState:()=>({labels:{},note:''}),isComplete:(state,row)=>complete(row,state),statusLabel:'Split residual 补标',filename:'manual_verdicts.jsonl',serialize:(row,state)=>({schema:verdictSchema,boundary_serialization_contract_id:boundaryContract,audit_id:row.audit_id,audio_id:row.audio_id,candidates:row.residual_candidates.map(candidate=>({candidate_id:candidate.candidate_id,time_s:candidate.time_s,p_cut:candidate.p_cut,manual_label:state.labels[candidate.candidate_id]||'unreviewed'})),complete:complete(row,state),note:state.note||'',updated_at:state.updated_at||new Date().toISOString()})});
+function sync(card,row,state){card.classList.toggle('done',complete(row,state));card.querySelectorAll('[data-candidate-id][data-value]').forEach(button=>button.classList.toggle('active',state.labels[button.dataset.candidateId]===button.dataset.value));}
+function playButton(label,start,end,className=''){return `<button type="button" class="${className}" data-play-start="${start}" data-play-end="${end}">${label} ${Number(start).toFixed(3)}–${Number(end).toFixed(3)}s</button>`;}
+const root=document.getElementById('list');for(const row of rows){const state=reviewCore.ensure(row),card=document.createElement('article'),candidates=row.residual_candidates||[];const candidateRows=candidates.map((candidate,index)=>{const previous=index===0?Number(row.start_s):Number(candidates[index-1].time_s),time=Number(candidate.time_s),next=index+1<candidates.length?Number(candidates[index+1].time_s):Number(row.end_s);return `<tr><td><b>${escapeAuditHtml(candidate.candidate_id)}</b><br><span class="meta">t=${time.toFixed(3)}s · p_cut=${Number(candidate.p_cut).toFixed(4)} · model=${escapeAuditHtml(candidate.model_label||'-')}</span></td><td><div class="play-controls">${playButton('左侧',previous,time)}${playButton('右侧',time,next)}${playButton('左右合并',previous,next)}</div></td><td><div class="choices"><button type="button" class="choice" data-candidate-id="${escapeAuditHtml(candidate.candidate_id)}" data-value="cut">cut：不同目标事件</button><button type="button" class="choice" data-candidate-id="${escapeAuditHtml(candidate.candidate_id)}" data-value="continue">continue：同一目标事件</button><button type="button" class="choice" data-candidate-id="${escapeAuditHtml(candidate.candidate_id)}" data-value="unsure">unsure</button></div></td></tr>`;}).join('');card.innerHTML=`<h2>${escapeAuditHtml(row.audit_id)} · ${escapeAuditHtml(row.audio_id)}</h2><div class="meta">residual ${Number(row.start_s).toFixed(3)}–${Number(row.end_s).toFixed(3)}s · ${Number(row.duration_s).toFixed(3)}s · ${candidates.length} candidates</div><audio controls preload="metadata" src="${escapeAuditHtml(row.audio_src)}"></audio><div class="play-controls">${playButton('播放完整 chunk',row.core_start,row.core_end,'play-full')}${playButton('播放完整 missing residual',row.start_s,row.end_s,'play-residual')}</div><table class="candidate-table"><thead><tr><th>candidate query</th><th>边界两侧精确播放</th><th>人工二分类标签</th></tr></thead><tbody>${candidateRows}</tbody></table><textarea class="note" placeholder="可选：记录具体对白关系、切点风险或 unsure 原因">${escapeAuditHtml(state.note||'')}</textarea>`;const audio=card.querySelector('audio');card.querySelectorAll('[data-play-start]').forEach(button=>button.onclick=()=>play(audio,button,Number(button.dataset.playStart),Number(button.dataset.playEnd)));card.querySelectorAll('[data-candidate-id][data-value]').forEach(button=>button.onclick=()=>{state.labels[button.dataset.candidateId]=button.dataset.value;state.updated_at=new Date().toISOString();sync(card,row,state);reviewCore.persist();});card.querySelector('.note').onchange=event=>{state.note=event.target.value;state.updated_at=new Date().toISOString();reviewCore.persist();};sync(card,row,state);root.appendChild(card);}
+document.getElementById('stop').onclick=()=>{stop();reviewCore.updateStatus('已停止');};document.getElementById('save').onclick=()=>reviewCore.save();reviewCore.updateStatus();
+"""
+    adapter_js = (
+        adapter_js.replace("__ROWS__", payload)
+        .replace("__VERDICT_SCHEMA__", json.dumps(MANUAL_VERDICT_SCHEMA))
+        .replace(
+            "__BOUNDARY_CONTRACT__",
+            json.dumps(ACOUSTIC_BINARY_V12_CONTRACT.contract_id),
+        )
+    )
+    return render_audit_review_page(
+        AuditReviewPageSpec(
+            title="Acoustic Split v4 · Missing-cut candidate 补标",
+            intro_html=intro_html,
+            body_html='<div id="list"></div>',
+            adapter_css=adapter_css,
+            adapter_js=adapter_js,
+        )
+    )
+
+
+def build(
+    *,
+    source_dir: Path,
+    verdict_paths: list[Path],
+    output_dir: Path,
+    review_prompt: ResolvedAuditPrompt | None = None,
+    update_latest: bool = True,
+) -> dict:
+    resolved_prompt = review_prompt or resolve_audit_prompt(
+        default_prompt=DEFAULT_REVIEW_PROMPT,
+    )
     verdicts: dict[str, dict] = {}
     for path in verdict_paths:
         for row in _rows(path):
@@ -34,8 +115,17 @@ def build(*, source_dir: Path, verdict_paths: list[Path], output_dir: Path) -> d
     ]
     if not selected:
         raise ValueError("no manually confirmed missing-cut residuals found")
-    if any(not row.get("residual_candidates") for row in selected):
-        raise ValueError("missing-cut residual has no eligible binary candidates")
+    missing_candidate_ids = [
+        str(row["audit_id"])
+        for row in selected
+        if not row.get("residual_candidates")
+    ]
+    if missing_candidate_ids:
+        raise ValueError(
+            "missing-cut residual has no eligible binary candidates; "
+            "classify it as a Proposal candidate-coverage failure instead: "
+            f"{missing_candidate_ids}"
+        )
 
     output_dir.mkdir(parents=True, exist_ok=True)
     audio_dir = output_dir / "audio"
@@ -50,42 +140,54 @@ def build(*, source_dir: Path, verdict_paths: list[Path], output_dir: Path) -> d
         "".join(json.dumps(row, ensure_ascii=False) + "\n" for row in selected),
         "utf-8",
     )
-    payload = json.dumps(selected, ensure_ascii=False).replace("</", "<\\/")
-    page = f"""<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><title>Split v4 missing-cut candidate audit</title><style>
-body{{margin:0;background:#0d1117;color:#e6edf3;font-family:system-ui}}header{{position:sticky;top:0;z-index:2;background:#161b22;padding:12px 18px;border-bottom:1px solid #30363d}}main{{max-width:1100px;margin:auto;padding:16px}}article{{background:#161b22;border:1px solid #30363d;border-radius:10px;padding:16px;margin:14px 0}}article.done{{border-color:#2ea043}}.help{{background:#10233f;padding:14px;border-radius:10px}}audio{{width:100%}}table{{width:100%;border-collapse:collapse}}th,td{{padding:8px;border-bottom:1px solid #30363d;text-align:left}}button,input{{margin:3px;padding:6px 10px;background:#21262d;color:#e6edf3;border:1px solid #484f58;border-radius:6px}}button.active{{background:#1f6feb}}button.cut.active{{background:#da3633}}button.continue.active{{background:#238636}}button.unsure.active{{background:#8250df}}input{{width:95%}}small{{color:#8b949e}}</style></head><body>
-<header><strong>Acoustic Split v4 · Missing-cut 候选补标</strong> <button id="save">保存候选标签</button> <span id="status"></span></header><main><section class="help"><h2>为已确认漏切的 residual 指定具体 cut candidate</h2><p>候选按时间顺序逐段试听：第一个候选从 residual 起点播放；之后每个候选都从上一个候选点播放到当前候选点。当前候选始终是播放终点。真实句界标 cut；句内或无须切分标 continue；听不清标 unsure。</p></section><div id="list"></div></main><script>
-const rows={payload},key='split-v4-missing-cut-candidate-audit-v1:'+location.pathname,ann=JSON.parse(localStorage.getItem(key)||'{{}}');let active=null,timer=null;
-function esc(s){{return String(s??'').replace(/[&<>"']/g,c=>({{'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}}[c]));}}function ensure(r){{ann[r.audit_id]??={{labels:{{}},note:''}};return ann[r.audit_id]}}function complete(r,a){{return r.residual_candidates.every(c=>a.labels[c.candidate_id])}}function persist(){{localStorage.setItem(key,JSON.stringify(ann));status()}}function status(){{document.getElementById('status').textContent=`完成 ${{rows.filter(r=>complete(r,ensure(r))).length}}/${{rows.length}}`}}function play(audio,start,end){{if(active&&active!==audio)active.pause();active=audio;if(timer)clearTimeout(timer);audio.currentTime=Math.max(0,Number(start));audio.play();timer=setTimeout(()=>audio.pause(),Math.max(1,(Number(end)-Number(start))*1000))}}function choice(a,c,label,text){{return `<button data-id="${{esc(c.candidate_id)}}" data-label="${{label}}" class="${{label}} ${{a.labels[c.candidate_id]===label?'active':''}}">${{text}}</button>`}}
-function render(){{const root=document.getElementById('list');root.innerHTML='';for(const r of rows){{const a=ensure(r),card=document.createElement('article');if(complete(r,a))card.classList.add('done');const body=r.residual_candidates.map((c,i)=>{{const start=i===0?Number(r.start_s):Number(r.residual_candidates[i-1].time_s),end=Number(c.time_s);return `<tr><td>${{esc(c.candidate_id)}}<br><b>候选 cut ${{end.toFixed(3)}}s</b><br><small>p_cut=${{Number(c.p_cut).toFixed(4)}} · model=${{esc(c.model_label)}}</small></td><td><button data-start="${{start}}" data-end="${{end}}">播放候选间 sub · ${{start.toFixed(3)}}–${{end.toFixed(3)}}s</button></td><td>${{choice(a,c,'cut','cut')}}${{choice(a,c,'continue','continue')}}${{choice(a,c,'unsure','unsure')}}</td></tr>`}}).join('');card.innerHTML=`<h2>${{esc(r.audit_id)}} · ${{esc(r.audio_id)}}</h2><small>residual sub-island ${{Number(r.start_s).toFixed(3)}}–${{Number(r.end_s).toFixed(3)}}s · ${{Number(r.duration_s).toFixed(3)}}s</small><audio controls preload="metadata" src="${{esc(r.audio_src)}}"></audio><div><button data-start="${{r.core_start}}" data-end="${{r.core_end}}">播放完整 chunk</button><button data-start="${{r.start_s}}" data-end="${{r.end_s}}">播放完整 missing residual</button></div><table><thead><tr><th>候选</th><th>上一个候选 → 当前候选</th><th>人工标签</th></tr></thead><tbody>${{body}}</tbody></table><input placeholder="补标备注" value="${{esc(a.note)}}">`;const audio=card.querySelector('audio');card.querySelectorAll('[data-start]').forEach(b=>b.onclick=()=>play(audio,b.dataset.start,b.dataset.end));card.querySelectorAll('[data-id]').forEach(b=>b.onclick=()=>{{a.labels[b.dataset.id]=b.dataset.label;a.updated_at=new Date().toISOString();persist();render()}});card.querySelector('input').onchange=e=>{{a.note=e.target.value;a.updated_at=new Date().toISOString();persist()}};root.appendChild(card)}}status()}}
-document.getElementById('save').onclick=async()=>{{const content=rows.map(r=>{{const a=ensure(r);return JSON.stringify({{schema:'split_v4_missing_cut_candidate_manual_verdict_v1',audit_id:r.audit_id,audio_id:r.audio_id,candidates:r.residual_candidates.map(c=>({{candidate_id:c.candidate_id,time_s:c.time_s,p_cut:c.p_cut,manual_label:a.labels[c.candidate_id]||'unreviewed'}})),complete:complete(r,a),note:a.note||'',updated_at:a.updated_at||new Date().toISOString()}})}}).join('\\n')+'\\n';const res=await fetch('/__audit_api__/save-labels',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{href:location.pathname,filename:'manual_verdicts.jsonl',content}})}});const out=await res.json();document.getElementById('status').textContent=out.ok?'已保存到 '+out.path:'保存失败: '+out.error}};render();
-</script></body></html>"""
-    (output_dir / "index.html").write_text(page, "utf-8")
+    (output_dir / "index.html").write_text(
+        _page(selected, review_prompt=resolved_prompt.text),
+        "utf-8",
+    )
     summary = {
-        "schema": "split_v4_missing_cut_candidate_audit_v1",
+        "schema": SUMMARY_SCHEMA,
+        "boundary_serialization_contract_id": (
+            ACOUSTIC_BINARY_V12_CONTRACT.contract_id
+        ),
         "residual_count": len(selected),
         "candidate_count": sum(len(row["residual_candidates"]) for row in selected),
         "manual_verdicts": str(output_dir / "manual_verdicts.jsonl"),
+        "manual_verdict_schema": MANUAL_VERDICT_SCHEMA,
+        "training_manifest_allowed": False,
+        "review_prompt_source": resolved_prompt.source,
+        "review_prompt_sha256": resolved_prompt.sha256,
     }
     (output_dir / "summary.json").write_text(json.dumps(summary, ensure_ascii=False, indent=2) + "\n", "utf-8")
-    update_audit_entrypoints(
-        latest_html=output_dir / "index.html",
-        title="Acoustic Split v4 Missing-cut Candidate Audit",
-    )
+    if update_latest:
+        update_audit_entrypoints(
+            latest_html=output_dir / "index.html",
+            title="Acoustic Split v4 Missing-cut Candidate Audit",
+        )
     return summary
 
 
-def parse_args() -> argparse.Namespace:
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--source-audit-dir", required=True)
     parser.add_argument("--verdicts", action="append", required=True)
     parser.add_argument("--output-dir", required=True)
-    return parser.parse_args()
+    parser.add_argument("--prompt", default="")
+    parser.add_argument("--prompt-file", default="")
+    parser.add_argument("--no-update-latest", action="store_true")
+    return parser.parse_args(argv)
 
 
 if __name__ == "__main__":
     args = parse_args()
+    prompt = resolve_audit_prompt(
+        prompt=args.prompt,
+        prompt_file=args.prompt_file,
+        default_prompt=DEFAULT_REVIEW_PROMPT,
+    )
     print(json.dumps(build(
         source_dir=Path(args.source_audit_dir),
         verdict_paths=[Path(path) for path in args.verdicts],
         output_dir=Path(args.output_dir),
+        review_prompt=prompt,
+        update_latest=not args.no_update_latest,
     ), ensure_ascii=False))

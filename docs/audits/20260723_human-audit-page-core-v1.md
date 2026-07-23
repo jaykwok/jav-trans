@@ -21,7 +21,9 @@
 
 “选项完备”不等于穷举所有自然语言描述，而是确保同一条样本可以同时表达彼此独立的问题。例如“存在语义对白”和“背景过度合并”不能互斥；“语义存在”还必须继续区分是否被模型完整覆盖。
 
-## Scorer bridge-gap Adapter
+## 已接入 Adapter
+
+### Scorer bridge-gap
 
 当前 Adapter 使用三个审计轴：
 
@@ -32,3 +34,13 @@
 条件组合共 `15` 个，映射为七类最终结果：可接受短背景桥接、人工 background 含语义、语义漏保护/截断、语义与过度合并并存、语义漏保护与过度合并并存、纯 Teacher overmerge、unsure。页面同时提供完整 source、完整 gap、Protect 覆盖子区间和未覆盖子区间的精确播放，避免只听整段却无法判断语言是否落在模型覆盖内。
 
 该人工裁决只用于审计发现和后续精确修复选择，不直接成为训练标签；不使用固定时长、概率阈值或声音类别规则自动决定结果。
+
+### CueQC false-drop
+
+CueQC false-drop 审计保持既有 `safe_drop / true_speech / unsure` 单轴合同与 `cueqc_v13_false_drop_manual_verdict_v1` 保存 schema。这里单轴已经完整覆盖“确认无 semantic core / 确认存在 semantic core / 无法确认”，不需要为了形式一致拆成冗余多轴。页面明确 CueQC 只做完整 provisional sub-island keep/drop，不负责 Split 或 Inner 裁边。
+
+### Split missing-cut candidate
+
+Split candidate 补标保持 `cut / continue / unsure`，其中 `unsure→ignore=-100`，并保留既有 `split_v4_missing_cut_candidate_manual_verdict_v1` 供 override compiler 使用。每个 candidate 同时提供左侧、右侧和左右合并的精确播放，避免旧页只播放 candidate 之前的区间。没有 eligible candidate 的漏切 residual 会 fail-closed 并归因到 Proposal candidate coverage，不能伪造 Split candidate 标签。
+
+其余 Adapter 的迁移审计与阻塞项见 `docs/audits/20260723_human-audit-adapter-inventory-v1.md`。
