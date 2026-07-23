@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from tools.audits.generate_candidate_island_scorer_v11_prediction_audit_html import (
+    _page,
     build_items,
 )
 
@@ -31,3 +32,10 @@ def test_v11_prediction_audit_includes_full_source_drop_and_long_residual() -> N
         "prediction_drop_truth_keep",
         "long_residual_over_8s",
     ]
+
+
+def test_v11_prediction_audit_escapes_jsonl_newlines_in_javascript() -> None:
+    html = _page([])
+
+    assert ".join('\\n')+'\\n'" in html
+    assert ".join('\n')+'\n'" not in html
