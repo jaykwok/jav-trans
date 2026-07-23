@@ -6,6 +6,7 @@ param(
     [string]$DownstreamIsolationSummary = 'agents/audits/20260723_172940_scorer-v11-downstream-isolation-required6/summary.json',
     [string]$BaseCanonicalSummary = 'agents/temp/20260722_183600_scorer-v11-no-tile-real-outside-canonical-final/summary.json',
     [string]$PriorRawFeatureManifest = 'agents/temp/20260722_184400_scorer-v11-no-tile-raw-features-full/raw_feature_manifest.jsonl',
+    [string]$PreextractRawFeatureManifest = '',
     [string]$ModelPath = 'models/jaykwok-Qwen3-ASR-1.7B-JA-Anime-Galgame-hf',
     [int]$MaxPaddedFrames = 1000
 )
@@ -112,12 +113,25 @@ function Invoke-Prepare {
         '--output-dir', $canonicalDir
     )
     $canonicalSources = Join-Path $canonicalDir 'canonical_sources.jsonl'
-    Invoke-UvPython @(
+    $rebindArguments = @(
         'tools/boundary/ja/rebind_candidate_island_scorer_v11_raw_features.py',
         '--canonical-sources', $canonicalSources,
         '--prior-raw-feature-manifest', $PriorRawFeatureManifest,
         '--output-dir', $rebindDir
     )
+    $preextractRawFeatureManifestFull = ''
+    if ($PreextractRawFeatureManifest) {
+        $preextractRawFeatureManifestFull = [System.IO.Path]::GetFullPath(
+            (Join-Path $ProjectRoot $PreextractRawFeatureManifest)
+        )
+        if (-not (Test-Path -LiteralPath $preextractRawFeatureManifestFull)) {
+            throw "Pre-extracted raw feature manifest is missing: $preextractRawFeatureManifestFull"
+        }
+        $rebindArguments += @(
+            '--new-raw-feature-manifest', $preextractRawFeatureManifestFull
+        )
+    }
+    Invoke-UvPython $rebindArguments
     Write-State @{
         schema = 'candidate_island_scorer_v11_retrain_pipeline_state_v1'
         run_root = $RunRoot
@@ -128,6 +142,7 @@ function Invoke-Prepare {
         raw_rebind_dir = $rebindDir
         missing_canonical_sources = (Join-Path $rebindDir 'missing_canonical_sources.jsonl')
         raw_feature_manifest = (Join-Path $rebindDir 'raw_feature_manifest.jsonl')
+        preextract_raw_feature_manifest = $preextractRawFeatureManifestFull
         downstream_isolation_summary = [System.IO.Path]::GetFullPath((Join-Path $ProjectRoot $DownstreamIsolationSummary))
         heldout_responsibility_verdicts = [System.IO.Path]::GetFullPath((Join-Path $ProjectRoot $heldoutResponsibilityVerdicts))
         features_dir = (Join-Path $RunRoot '05-features')

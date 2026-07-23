@@ -77,9 +77,16 @@ def _rebound_row(
     origin_manifest: Path,
     origin_manifest_sha: str,
 ) -> dict[str, Any]:
+    reused_from_audit_preextract = bool(row.get("audit_preextract_only"))
     return {
         **row,
         "canonical_sources_sha256": canonical_sha,
+        "feature_source_manifest_schema": (
+            CANDIDATE_ISLAND_SCORER_V11_CANONICAL_SOURCE_SCHEMA
+        ),
+        "feature_source_manifest_kind": "canonical",
+        "audit_preextract_only": False,
+        "reused_from_audit_preextract": reused_from_audit_preextract,
         "reused_feature_bytes_unchanged": True,
         "reused_from_raw_feature_manifest": _display(origin_manifest),
         "reused_from_raw_feature_manifest_sha256": origin_manifest_sha,

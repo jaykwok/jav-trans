@@ -111,7 +111,12 @@ def test_raw_rebind_reuses_exact_sources_and_finalizes_only_missing(tmp_path: Pa
     assert [row["source_id"] for row in missing] == ["second"]
 
     newly_extracted = tmp_path / "new.jsonl"
-    _write(newly_extracted, [_raw("second", "train", "b" * 64, second_feature)])
+    new_row = _raw("second", "train", "b" * 64, second_feature)
+    new_row.update(
+        feature_source_manifest_kind="audit_preextract",
+        audit_preextract_only=True,
+    )
+    _write(newly_extracted, [new_row])
     final = rebind_raw_features(
         canonical_sources=canonical_path,
         prior_raw_feature_manifest=prior,
@@ -128,9 +133,14 @@ def test_raw_rebind_reuses_exact_sources_and_finalizes_only_missing(tmp_path: Pa
     ]
     assert {row["source_id"] for row in rows} == {"first", "second"}
     assert all(row["canonical_sources_sha256"] == _sha256(canonical_path) for row in rows)
+    assert all(row["feature_source_manifest_kind"] == "canonical" for row in rows)
+    assert all(row["audit_preextract_only"] is False for row in rows)
     first = next(row for row in rows if row["source_id"] == "first")
+    second = next(row for row in rows if row["source_id"] == "second")
     assert Path(first["feature_path"]).resolve() == first_feature.resolve()
     assert first["reused_feature_bytes_unchanged"] is True
+    assert first["reused_from_audit_preextract"] is False
+    assert second["reused_from_audit_preextract"] is True
 
 
 def test_raw_rebind_rejects_feature_from_different_audio(tmp_path: Path) -> None:

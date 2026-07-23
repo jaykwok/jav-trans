@@ -36,6 +36,7 @@ from boundary.ja.model import (  # noqa: E402
     CANDIDATE_ISLAND_SCORER_V11_FEATURE_EXTRACTOR_SCHEMA,
     CANDIDATE_ISLAND_SCORER_V11_MFCC_DIM,
     CANDIDATE_ISLAND_SCORER_V11_RAW_CACHE_ROW_SCHEMA,
+    CANDIDATE_ISLAND_SCORER_V11_RAW_PREEXTRACT_SOURCE_SCHEMA,
     CANDIDATE_ISLAND_SCORER_V11_RAW_PTM_DIM,
 )
 from pipeline.memory_safety import (  # noqa: E402
@@ -48,6 +49,10 @@ from pipeline.memory_safety import (  # noqa: E402
 SUMMARY_SCHEMA = "candidate_island_scorer_v11_raw_feature_extract_summary_v1"
 FRAME_HOP_S = 0.02
 FRAME_SAMPLES = 320
+SOURCE_MANIFEST_SCHEMAS = {
+    "canonical": CANDIDATE_ISLAND_SCORER_V11_CANONICAL_SOURCE_SCHEMA,
+    "audit_preextract": CANDIDATE_ISLAND_SCORER_V11_RAW_PREEXTRACT_SOURCE_SCHEMA,
+}
 
 
 def _read_jsonl(path: Path) -> list[dict[str, Any]]:
@@ -105,6 +110,31 @@ def _positive_int(value: str) -> int:
     if parsed <= 0:
         raise argparse.ArgumentTypeError("value must be a positive integer")
     return parsed
+
+
+def validate_feature_source_row(
+    row: dict[str, Any], *, source_manifest_kind: str
+) -> str:
+    expected_schema = SOURCE_MANIFEST_SCHEMAS[source_manifest_kind]
+    source_id = str(row.get("source_id") or "")
+    if row.get("schema") != expected_schema or not source_id:
+        raise ValueError(f"invalid Scorer v11 {source_manifest_kind} source: {source_id!r}")
+    if row.get("boundary_serialization_contract_id") != (
+        ACOUSTIC_BINARY_V12_CONTRACT.contract_id
+    ):
+        raise ValueError(f"wrong central Boundary contract: {source_id}")
+    if source_manifest_kind == "audit_preextract":
+        if str(row.get("partition") or "") != "train":
+            raise ValueError(f"audit preextract source must be train-only: {source_id}")
+        if row.get("feature_extraction_allowed") is not True:
+            raise ValueError(f"audit preextract source is not approved for extraction: {source_id}")
+        if row.get("labels_available") is not False:
+            raise ValueError(f"audit preextract source must not claim labels: {source_id}")
+        if row.get("training_manifest_allowed") is not False:
+            raise ValueError(f"audit preextract source must not allow training: {source_id}")
+        if str(row.get("human_gate_status") or "") != "pending":
+            raise ValueError(f"audit preextract source requires a pending human gate: {source_id}")
+    return source_id
 
 
 def align_raw_features(
@@ -182,6 +212,7 @@ def _validate_resume_row(
     canonical_sha: str,
     canonical: dict[str, Any],
     feature_dir: Path,
+    source_manifest_kind: str,
 ) -> None:
     source_id = str(canonical["source_id"])
     if row.get("schema") != CANDIDATE_ISLAND_SCORER_V11_RAW_CACHE_ROW_SCHEMA:
@@ -194,6 +225,10 @@ def _validate_resume_row(
         raise ValueError(f"resume central Boundary contract mismatch: {source_id}")
     if row.get("canonical_sources_sha256") != canonical_sha:
         raise ValueError(f"resume manifest is bound to another canonical: {source_id}")
+    if str(row.get("feature_source_manifest_kind") or "canonical") != source_manifest_kind:
+        raise ValueError(f"resume source manifest kind mismatch: {source_id}")
+    if bool(row.get("audit_preextract_only")) != (source_manifest_kind == "audit_preextract"):
+        raise ValueError(f"resume audit preextract marker mismatch: {source_id}")
     if row.get("partition") != canonical.get("partition"):
         raise ValueError(f"resume partition mismatch: {source_id}")
     if int(row.get("frame_count") or 0) != int(canonical["frame_count"]):
@@ -250,17 +285,11 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     canonical_rows = _read_jsonl(canonical_path)
     canonical_by_id: dict[str, dict[str, Any]] = {}
     for row in canonical_rows:
-        source_id = str(row.get("source_id") or "")
-        if (
-            row.get("schema") != CANDIDATE_ISLAND_SCORER_V11_CANONICAL_SOURCE_SCHEMA
-            or not source_id
-            or source_id in canonical_by_id
-        ):
-            raise ValueError(f"invalid Scorer v11 canonical source: {source_id!r}")
-        if row.get("boundary_serialization_contract_id") != (
-            ACOUSTIC_BINARY_V12_CONTRACT.contract_id
-        ):
-            raise ValueError(f"wrong central Boundary contract: {source_id}")
+        source_id = validate_feature_source_row(
+            row, source_manifest_kind=str(args.source_manifest_kind)
+        )
+        if source_id in canonical_by_id:
+            raise ValueError(f"duplicate Scorer v11 source: {source_id!r}")
         canonical_by_id[source_id] = row
 
     selected = canonical_rows[: int(args.limit)] if args.limit is not None else canonical_rows
@@ -291,6 +320,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 canonical_sha=canonical_sha,
                 canonical=canonical_by_id[source_id],
                 feature_dir=feature_dir,
+                source_manifest_kind=str(args.source_manifest_kind),
             )
             existing[source_id] = row
 
@@ -391,6 +421,9 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 "audio": _display(audio_path),
                 "audio_sha256": str(canonical["audio_sha256"]),
                 "canonical_sources_sha256": canonical_sha,
+                "feature_source_manifest_schema": str(canonical["schema"]),
+                "feature_source_manifest_kind": str(args.source_manifest_kind),
+                "audit_preextract_only": str(args.source_manifest_kind) == "audit_preextract",
             }
             _append_jsonl(manifest_path, row)
             existing[source_id] = row
@@ -426,6 +459,8 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                     "elapsed_s": time.monotonic() - started,
                     "memory_snapshots": memory_snapshots,
                     "training_manifest_allowed": False,
+                    "source_manifest_kind": str(args.source_manifest_kind),
+                    "audit_preextract_only": str(args.source_manifest_kind) == "audit_preextract",
                 }
                 summary_path.write_text(
                     json.dumps(progress, ensure_ascii=False, indent=2, sort_keys=True)
@@ -452,6 +487,11 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "boundary_serialization_contract_id": ACOUSTIC_BINARY_V12_CONTRACT.contract_id,
         "canonical_sources": _display(canonical_path),
         "canonical_sources_sha256": canonical_sha,
+        "source_manifest": _display(canonical_path),
+        "source_manifest_sha256": canonical_sha,
+        "source_manifest_kind": str(args.source_manifest_kind),
+        "source_manifest_schema": SOURCE_MANIFEST_SCHEMAS[str(args.source_manifest_kind)],
+        "audit_preextract_only": str(args.source_manifest_kind) == "audit_preextract",
         "selected_source_count": len(selected),
         "completed_source_count": len(manifest_rows),
         "complete": complete,
@@ -468,7 +508,11 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "shared_vram_spill_policy": "soft_oom_abort",
         "elapsed_s": time.monotonic() - started,
         "memory_snapshots": memory_snapshots,
-        "training_manifest_allowed": complete and args.limit is None,
+        "training_manifest_allowed": (
+            complete
+            and args.limit is None
+            and str(args.source_manifest_kind) == "canonical"
+        ),
     }
     summary_path.write_text(
         json.dumps(summary, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
@@ -486,6 +530,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--dtype", default="bfloat16")
     parser.add_argument("--attention", default="sdpa")
+    parser.add_argument(
+        "--source-manifest-kind",
+        choices=tuple(SOURCE_MANIFEST_SCHEMAS),
+        default="canonical",
+    )
     parser.add_argument("--limit", type=_positive_int)
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--memory-log-every", type=_positive_int, default=25)

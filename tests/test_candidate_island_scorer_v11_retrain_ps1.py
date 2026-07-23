@@ -23,6 +23,8 @@ def test_scorer_v11_retrain_driver_preserves_execution_contracts() -> None:
     assert "heldoutResponsibilityVerdicts" in script
     assert "requirement_count -ne 6" in script
     assert "rebind_candidate_island_scorer_v11_raw_features.py" in script
+    assert "PreextractRawFeatureManifest" in script
+    assert "--new-raw-feature-manifest" in script
     assert "extract_candidate_island_scorer_v11_raw_features.py" in script
     assert "train_candidate_island_scorer_v11.py" in script
     assert "score_candidate_island_scorer_v11_checkpoint.py" in script
