@@ -4,6 +4,7 @@ import importlib
 import json
 import sys
 import wave
+from dataclasses import replace
 from pathlib import Path
 
 import numpy as np
@@ -16,6 +17,7 @@ from boundary.sequence_features import (
     CHUNK_LEARNED_PROJECTED_PTM_SCHEMA,
     CHUNK_POOLED_PTM_SCHEMA,
     DEFAULT_CHUNK_POOLED_PTM_BINS,
+    FRAME_SEQUENCE_FRAMES_SCHEMA,
     chunk_pooled_ptm_feature_names,
 )
 
@@ -36,6 +38,27 @@ def _pre_asr_ptm_feature_names() -> list[str]:
 
 def _pre_asr_ptm_values() -> list[float]:
     return [0.0] * len(_pre_asr_ptm_feature_names())
+
+
+def test_sequence_provider_rejects_legacy_ptm128_for_current_inner_contract():
+    from asr import pipeline as asr
+
+    legacy_payload = {
+        "schema": FRAME_SEQUENCE_FRAMES_SCHEMA,
+        "frame_hop_s": 0.02,
+        "ptm": np.zeros((4, 128), dtype=np.float32),
+        "mfcc": np.zeros((4, 40), dtype=np.float32),
+    }
+
+    assert (
+        asr._sequence_feature_provider_from_result(
+            legacy_payload,
+            duration_s=0.08,
+            max_ptm_dims=2048,
+            required_ptm_dim=2048,
+        )
+        is None
+    )
 
 
 def _write_wav(path: Path, seconds: float, sample_rate: int = 8000) -> None:
@@ -375,12 +398,6 @@ def _reload_pipeline(monkeypatch, tmp_path: Path, *, enable_cueqc: bool = False)
                 split_reason="semantic_boundary",
                 boundary_contract_id=ACOUSTIC_BINARY_V12_CONTRACT.contract_id,
                 boundary_source="speech_island",
-                inner_edge_prediction={
-                    "schema": ACOUSTIC_BINARY_V12_CONTRACT.inner_prediction_schema,
-                    "action": "refined",
-                    "start_s": segment.start,
-                    "end_s": segment.end,
-                },
                 pre_asr_ptm_pooling_schema=CHUNK_LEARNED_PROJECTED_PTM_SCHEMA,
                 pre_asr_ptm_pooling_bins=PRE_ASR_CUEQC_PTM_BINS,
                 pre_asr_ptm_pooling_dim=len(_pre_asr_ptm_feature_names()),
@@ -392,7 +409,18 @@ def _reload_pipeline(monkeypatch, tmp_path: Path, *, enable_cueqc: bool = False)
     monkeypatch.setattr(
         asr,
         "annotate_inner_edge_predictions",
-        lambda chunks, **_kwargs: chunks,
+        lambda chunks, **_kwargs: [
+            replace(
+                chunk,
+                inner_edge_prediction={
+                    "schema": ACOUSTIC_BINARY_V12_CONTRACT.inner_prediction_schema,
+                    "action": "refined",
+                    "start_s": chunk.start,
+                    "end_s": chunk.end,
+                },
+            )
+            for chunk in chunks
+        ],
     )
     monkeypatch.setattr(
         asr,
@@ -489,15 +517,93 @@ def test_boundary_models_load_and_release_in_strict_stage_order(monkeypatch, tmp
         "outer_released",
         "split_load",
         "split_released",
-        "inner_load",
-        "inner_released",
     ]
     assert "stage_memory_after_release" not in asr._LAST_BOUNDARY_SIGNATURE[
         "boundary_pipeline"
     ]
     stage_memory = asr._LAST_BOUNDARY_STAGE_MEMORY
     assert [row["stage"] for row in stage_memory] == [
-        "outer_released", "split_released", "inner_released"
+        "outer_released", "split_released"
+    ]
+
+
+def test_inner_runs_only_after_cueqc_and_sees_keep_subislands(monkeypatch, tmp_path):
+    asr = _reload_pipeline(monkeypatch, tmp_path)
+    monkeypatch.setenv("BOUNDARY_CACHE_ENABLED", "0")
+    source = tmp_path / "source_post_cueqc_inner.wav"
+    _write_wav(source, seconds=12.0)
+
+    import boundary
+
+    monkeypatch.setattr(
+        boundary, "get_boundary_backend", lambda: _StubSpeechBoundaryBackend()
+    )
+
+    class _CueQC:
+        decision_mode = "argmax"
+
+        def decide(self, candidates):
+            return [
+                {
+                    "index": int(candidate["index"]),
+                    "route": (
+                        "drop_before_asr"
+                        if int(candidate["index"]) == 1
+                        else "keep_for_asr"
+                    ),
+                    "confidence": 0.9,
+                }
+                for candidate in candidates
+            ]
+
+        def signature(self):
+            return {"schema": "cueqc_pre_asr_semantic_chunk_v13"}
+
+    monkeypatch.setattr(asr._pre_asr_cueqc_module, "enabled", lambda: True)
+    monkeypatch.setattr(
+        asr._pre_asr_cueqc_module,
+        "load_active",
+        lambda **_kwargs: (
+            asr._test_boundary_stage_events.append("cueqc_load") or _CueQC()
+        ),
+    )
+    observed_inner_starts: list[float] = []
+
+    def annotate_after_keep(chunks, **_kwargs):
+        observed_inner_starts.extend(float(chunk.start) for chunk in chunks)
+        return [
+            replace(
+                chunk,
+                inner_edge_prediction={
+                    "schema": ACOUSTIC_BINARY_V12_CONTRACT.inner_prediction_schema,
+                    "action": "refined",
+                    "start_s": chunk.start,
+                    "end_s": chunk.end,
+                },
+            )
+            for chunk in chunks
+        ]
+
+    monkeypatch.setattr(asr, "annotate_inner_edge_predictions", annotate_after_keep)
+    backend = _RecordingBackend()
+    monkeypatch.setattr(asr, "_resolve_asr_backend", lambda _device: backend)
+
+    _segments_out, _log, details = asr._transcribe_and_align_local(str(source), "cpu")
+
+    assert observed_inner_starts == [0.0, *[float(index) for index in range(2, 10)]]
+    assert len(backend.audio_paths) == 9
+    assert details["boundary_signature"]["boundary_pipeline"]["inner_input"] == (
+        "post_pre_asr_cueqc_keep_subislands"
+    )
+    assert asr._test_boundary_stage_events == [
+        "outer_load",
+        "outer_released",
+        "split_load",
+        "split_released",
+        "cueqc_load",
+        "cueqc_released",
+        "inner_load",
+        "inner_released",
     ]
 
 

@@ -3,8 +3,10 @@ from __future__ import annotations
 import argparse
 import json
 import mimetypes
+import os
 import re
 import sys
+import tempfile
 import time
 import webbrowser
 from dataclasses import dataclass
@@ -110,6 +112,40 @@ def should_disable_cache(content_type: str) -> bool:
 
 def _json_bytes(payload: dict[str, Any]) -> bytes:
     return json.dumps(payload, ensure_ascii=False).encode("utf-8")
+
+
+def _atomic_write_text(path: Path, content: str) -> None:
+    """Replace a label file only after the complete UTF-8 payload is durable."""
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            dir=path.parent,
+            prefix=f".{path.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as handle:
+            temporary = Path(handle.name)
+            handle.write(content)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+        temporary = None
+        try:
+            directory_handle = os.open(path.parent, os.O_RDONLY)
+        except OSError:
+            directory_handle = None
+        if directory_handle is not None:
+            try:
+                os.fsync(directory_handle)
+            finally:
+                os.close(directory_handle)
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
 
 
 def make_handler(
@@ -219,13 +255,22 @@ def make_handler(
                     self._send_json(HTTPStatus.BAD_REQUEST, {"ok": False, "error": "missing content"})
                     return
                 target = _resolve_label_target(href=href, filename=filename.strip())
-                target.write_text(content, encoding="utf-8")
+                _atomic_write_text(target, content)
                 self.log_message("saved labels href=%s path=%s bytes=%d", href, target, len(content.encode("utf-8")))
+                try:
+                    display_path = target.relative_to(root).as_posix()
+                except ValueError:
+                    # A caller may intentionally keep audit artifacts on another
+                    # volume. Return a stable URL-like path instead of leaking an
+                    # absolute path or raising while building the response.
+                    display_path = (
+                        f"{audit_url_prefix}/{target.relative_to(audit_root).as_posix()}"
+                    )
                 self._send_json(
                     HTTPStatus.OK,
                     {
                         "ok": True,
-                        "path": target.relative_to(root).as_posix(),
+                        "path": display_path,
                         "bytes": len(content.encode("utf-8")),
                     },
                 )
@@ -248,6 +293,8 @@ def make_handler(
                 length = int(raw_length)
             except ValueError as exc:
                 raise ValueError("invalid Content-Length") from exc
+            if length < 0:
+                raise ValueError("invalid Content-Length")
             if length > limit:
                 raise ValueError("request body too large")
             body = self.rfile.read(length) if length else b"{}"

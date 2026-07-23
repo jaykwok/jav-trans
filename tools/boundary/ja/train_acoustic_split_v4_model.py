@@ -5,6 +5,8 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import os
+import random
 import sys
 from collections import defaultdict
 from pathlib import Path
@@ -19,7 +21,7 @@ if str(PROJECT_ROOT) not in sys.path:
 if str(SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(SRC_ROOT))
 
-from asr.backends.qwen import qwen_asr_repo_tag  # noqa: E402
+from asr.backends.qwen import QWEN_ASR_17B_REPO_ID, qwen_asr_repo_tag  # noqa: E402
 from boundary.gpu_safety import apply_vram_safety_cap  # noqa: E402
 from boundary.sequence_features import (  # noqa: E402
     SPLIT_CANDIDATE_SCALAR_NAMES,
@@ -33,6 +35,9 @@ from boundary.split_model import (  # noqa: E402
     build_acoustic_split_v4_checkpoint,
 )
 from tools.boundary.ja.acoustic_split_v4_dataset import (  # noqa: E402
+    SPLIT_V4_INPUT_DISTRIBUTION,
+    SPLIT_V4_UPSTREAM_SHA_FIELDS,
+    file_sha256,
     island_batches,
     load_island_dataset,
     pad_batch,
@@ -43,6 +48,54 @@ from tools.boundary.ja.acoustic_split_v4_dataset import (  # noqa: E402
 
 IGNORE_ID = -100
 LABEL_ID = {"cut": 0, "continue": 1, "ignore": IGNORE_ID}
+
+
+def _torch_save_atomic(payload: object, path: Path) -> None:
+    import torch
+
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    try:
+        torch.save(payload, temporary)
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def _write_json_atomic(path: Path, payload: dict[str, Any]) -> None:
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    try:
+        with temporary.open("w", encoding="utf-8", newline="\n") as handle:
+            handle.write(
+                json.dumps(
+                    payload,
+                    ensure_ascii=False,
+                    indent=2,
+                    sort_keys=True,
+                    allow_nan=False,
+                )
+            )
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def _seed_everything(seed: int, torch) -> None:
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+    if hasattr(torch.backends, "cudnn"):
+        torch.backends.cudnn.benchmark = False
+        torch.backends.cudnn.deterministic = True
+
+
+def _require_finite_array(value: np.ndarray, *, field: str) -> None:
+    if not np.isfinite(np.asarray(value)).all():
+        raise ValueError(f"Split v4 {field} contains non-finite values")
 
 
 def _jsonl(path: Path) -> list[dict[str, Any]]:
@@ -252,7 +305,13 @@ def evaluate(
             logits = model(
                 frames.to(device), scalars.to(device), mask.to(device)
             )["label"]
+            if not torch.isfinite(logits).all():
+                raise FloatingPointError("Split v4 evaluation logits are non-finite")
             probabilities = torch.softmax(logits, dim=-1).cpu().numpy()
+            if not np.isfinite(probabilities).all():
+                raise FloatingPointError(
+                    "Split v4 evaluation probabilities are non-finite"
+                )
             for row, name in enumerate(batch):
                 count = int(data["groups"][name].size)
                 truth = labels[row, :count].numpy()
@@ -269,6 +328,8 @@ def evaluate(
                 event_predicted += event_counts["predicted"]
                 event_exact += event_counts["exact"]
                 event_basin_matched += event_counts["basin_matched"]
+    if not truth_rows or sum(int(values.size) for values in truth_rows) <= 0:
+        raise ValueError("Split v4 evaluation partition has no cut/continue labels")
     truth = np.concatenate(truth_rows)
     predicted = np.concatenate(predicted_rows)
     probabilities = np.concatenate(probability_rows)
@@ -305,7 +366,18 @@ def run(args: argparse.Namespace) -> None:
     import torch.nn.functional as F
 
     apply_vram_safety_cap()
-    data = load_island_dataset(Path(args.dataset))
+    device = torch.device(args.device)
+    if device.type == "cuda" and not torch.cuda.is_available():
+        raise RuntimeError("Split v4 training requested CUDA but CUDA is unavailable")
+    _seed_everything(args.seed, torch)
+    data = load_island_dataset(
+        Path(args.dataset),
+        require_training_summary=True,
+        expected_ptm_repo_id=args.ptm_repo_id,
+    )
+    training_summary = dict(data["training_summary"])
+    summary_path = Path(str(training_summary["summary_path"]))
+    summary_sha256 = file_sha256(summary_path)
     manual_override_summary = None
     if args.label_overrides:
         if not args.metadata:
@@ -316,7 +388,13 @@ def run(args: argparse.Namespace) -> None:
             overrides_path=Path(args.label_overrides),
         )
     partitions = partition_group_names(data)
-    train_names_base = partitions["train"]
+    train_names_base = [
+        name
+        for name in partitions["train"]
+        if np.isin(data["labels"][data["groups"][name]], (0, 1)).any()
+    ]
+    if not train_names_base:
+        raise ValueError("Split v4 training partition has no labeled island groups")
     train_names = list(train_names_base)
     if manual_override_summary and args.manual_group_repeat > 1:
         train_names.extend(
@@ -324,7 +402,6 @@ def run(args: argparse.Namespace) -> None:
             * (int(args.manual_group_repeat) - 1)
         )
     rng = np.random.default_rng(args.seed)
-    torch.manual_seed(args.seed)
     train_rows_all = np.concatenate(
         [data["groups"][name] for name in train_names_base]
     )
@@ -338,6 +415,12 @@ def run(args: argparse.Namespace) -> None:
         "scalar_mean": data["scalars"][train_rows].mean(axis=0),
         "scalar_std": np.maximum(data["scalars"][train_rows].std(axis=0), 1e-6),
     }
+    for key, value in normalization.items():
+        _require_finite_array(value, field=f"normalization.{key}")
+    if np.any(normalization["frame_std"] <= 0.0) or np.any(
+        normalization["scalar_std"] <= 0.0
+    ):
+        raise ValueError("Split v4 normalization standard deviations must be positive")
     extra_context_scales = parse_extra_context_scales(args.extra_context_scales)
     extra_scale_bins = [
         [int(scale["left_bins"]), int(scale["right_bins"])]
@@ -349,8 +432,13 @@ def run(args: argparse.Namespace) -> None:
             f"dataset bins {data['frames'].shape[1]} do not match configured {expected_bins}"
         )
     raw_frame_dim = int(data["frames"].shape[2])
-    if raw_frame_dim <= args.ptm_dim:
-        raise ValueError("dataset must include non-PTM acoustic frame features")
+    if args.ptm_dim != int(training_summary["ptm_dim"]):
+        raise ValueError("Split v4 --ptm-dim does not match the dataset contract")
+    expected_raw_frame_dim = int(training_summary["ptm_dim"]) + int(
+        training_summary["mfcc_dim"]
+    )
+    if raw_frame_dim != expected_raw_frame_dim:
+        raise ValueError("Split v4 dataset raw frame width is not PTM2048 + MFCC40")
     model_config = {
         "frame_dim": args.ptm_projector_dim + (raw_frame_dim - args.ptm_dim),
         "scalar_dim": int(data["scalars"].shape[1]),
@@ -371,7 +459,6 @@ def run(args: argparse.Namespace) -> None:
         "ptm_projector_residual": False,
         "num_classes": 2,
     }
-    device = torch.device(args.device)
     model = IslandCandidateSequenceNetwork(**model_config).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.learning_rate)
     scheduler = build_lr_scheduler(
@@ -424,6 +511,8 @@ def run(args: argparse.Namespace) -> None:
             frames.to(device), scalars.to(device), mask.to(device)
         )
         label_logits = model_outputs["label"]
+        if not torch.isfinite(label_logits).all():
+            raise FloatingPointError("Split v4 training logits are non-finite")
         flat_logits = label_logits.reshape(-1, len(SEMANTIC_SPLIT_TRAINING_LABELS))
         flat_labels = labels.to(device).reshape(-1)
         raw = F.cross_entropy(
@@ -434,6 +523,8 @@ def run(args: argparse.Namespace) -> None:
             reduction="none",
         )
         valid = flat_labels != IGNORE_ID
+        if not torch.any(valid):
+            raise ValueError("Split v4 sampled a batch without cut/continue labels")
         if args.focal_gamma > 0:
             probabilities = torch.softmax(flat_logits[valid], dim=-1)
             selected = probabilities.gather(1, flat_labels[valid, None]).squeeze(1)
@@ -441,21 +532,37 @@ def run(args: argparse.Namespace) -> None:
         else:
             raw = raw[valid]
         loss = raw.mean()
-        role_targets = roles.to(device).clone()
-        role_targets[labels.to(device) == IGNORE_ID] = IGNORE_ID
-        role_loss = F.cross_entropy(
-            model_outputs["role"].reshape(-1, 4),
-            role_targets.reshape(-1),
-            ignore_index=IGNORE_ID,
-        )
-        pair_term = pair_loss(
-            torch.softmax(label_logits, dim=-1)[..., 0],
-            labels.to(device),
-            pairs.to(device),
-        )
-        loss = loss + args.role_aux_weight * torch.nan_to_num(role_loss)
-        if pair_term is not None:
-            loss = loss + args.pair_loss_weight * pair_term
+        if args.role_aux_weight > 0.0:
+            role_targets = roles.to(device).clone()
+            role_targets[labels.to(device) == IGNORE_ID] = IGNORE_ID
+            valid_roles = role_targets != IGNORE_ID
+            if torch.any(valid_roles):
+                role_logits = model_outputs["role"].reshape(-1, 4)
+                if not torch.isfinite(role_logits).all():
+                    raise FloatingPointError(
+                        "Split v4 structural-role logits are non-finite"
+                    )
+                role_loss = F.cross_entropy(
+                    role_logits,
+                    role_targets.reshape(-1),
+                    ignore_index=IGNORE_ID,
+                )
+                loss = loss + args.role_aux_weight * role_loss
+        if args.pair_loss_weight > 0.0:
+            probabilities = torch.softmax(label_logits, dim=-1)
+            if not torch.isfinite(probabilities).all():
+                raise FloatingPointError(
+                    "Split v4 training probabilities are non-finite"
+                )
+            pair_term = pair_loss(
+                probabilities[..., 0],
+                labels.to(device),
+                pairs.to(device),
+            )
+            if pair_term is not None:
+                loss = loss + args.pair_loss_weight * pair_term
+        if not torch.isfinite(loss):
+            raise FloatingPointError("Split v4 training loss is non-finite")
         optimizer.zero_grad(set_to_none=True)
         loss.backward()
         optimizer.step()
@@ -525,8 +632,7 @@ def run(args: argparse.Namespace) -> None:
     checkpoint_path = output_dir / (
         f"semantic_split_model_v4.{qwen_asr_repo_tag(args.ptm_repo_id)}.pt"
     )
-    torch.save(
-        build_acoustic_split_v4_checkpoint(
+    checkpoint_payload = build_acoustic_split_v4_checkpoint(
             model=model,
             model_config=model_config,
             feature_config={
@@ -550,7 +656,18 @@ def run(args: argparse.Namespace) -> None:
             normalization={key: value.tolist() for key, value in normalization.items()},
             metadata={
                 "ptm_repo_id": args.ptm_repo_id,
-                "dataset": str(Path(args.dataset)),
+                "dataset": str(Path(args.dataset).resolve()),
+                "dataset_sha256": training_summary["dataset_sha256"],
+                "dataset_frame_sidecar_sha256": training_summary[
+                    "frame_sidecar_sha256"
+                ],
+                "dataset_summary": str(summary_path.resolve()),
+                "dataset_summary_sha256": summary_sha256,
+                "input_distribution": SPLIT_V4_INPUT_DISTRIBUTION,
+                **{
+                    field: training_summary[field]
+                    for field in SPLIT_V4_UPSTREAM_SHA_FIELDS
+                },
                 "trained_steps": args.max_steps,
                 "best_step": best_step,
                 "training_decision": "binary_argmax_cut",
@@ -560,6 +677,8 @@ def run(args: argparse.Namespace) -> None:
                 "manual_label_overrides": manual_override_summary,
                 "manual_group_repeat": int(args.manual_group_repeat),
                 "timing_output": "semantic_event_only",
+                "training_manifest_allowed": True,
+                "promotion_ready": False,
                 "loss": {
                     "cut_weight": args.cut_weight,
                     "continue_weight": args.continue_weight,
@@ -568,13 +687,17 @@ def run(args: argparse.Namespace) -> None:
                     "pair_loss_weight": args.pair_loss_weight,
                 },
             },
-        ),
-        checkpoint_path,
     )
+    _torch_save_atomic(checkpoint_payload, checkpoint_path)
+    numeric_gate_pass = bool(gate_passes(best_val) and gate_passes(test))
     metrics = {
-        "schema": "semantic_split_model_v4_training_metrics",
+        "schema": "semantic_split_model_v4_training_metrics_v2",
         "decision_mode": "binary_argmax_cut",
-        "train_group_count": len(partitions["train"]),
+        "training_manifest_allowed": True,
+        "promotion_ready": False,
+        "numeric_gate_pass": numeric_gate_pass,
+        "gate_pass": False,
+        "train_group_count": len(train_names_base),
         "val_group_count": len(partitions["val"]),
         "test_group_count": len(partitions["test"]),
         "best_step": best_step,
@@ -585,12 +708,22 @@ def run(args: argparse.Namespace) -> None:
         "test": test,
         "val_gate_passed": gate_passes(best_val),
         "test_gate_passed": gate_passes(test),
-        "checkpoint": str(checkpoint_path),
+        "checkpoint": str(checkpoint_path.resolve()),
+        "checkpoint_sha256": file_sha256(checkpoint_path),
+        "dataset": str(Path(args.dataset).resolve()),
+        "dataset_sha256": training_summary["dataset_sha256"],
+        "dataset_frame_sidecar_sha256": training_summary[
+            "frame_sidecar_sha256"
+        ],
+        "dataset_summary": str(summary_path.resolve()),
+        "dataset_summary_sha256": summary_sha256,
+        "input_distribution": SPLIT_V4_INPUT_DISTRIBUTION,
+        **{
+            field: training_summary[field]
+            for field in SPLIT_V4_UPSTREAM_SHA_FIELDS
+        },
     }
-    (output_dir / "metrics.json").write_text(
-        json.dumps(metrics, ensure_ascii=False, indent=2, sort_keys=True),
-        encoding="utf-8",
-    )
+    _write_json_atomic(output_dir / "metrics.json", metrics)
     print(json.dumps(metrics, ensure_ascii=False), flush=True)
 
 
@@ -608,7 +741,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--output-dir", required=True)
     parser.add_argument(
         "--ptm-repo-id",
-        default="jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame-hf",
+        default=QWEN_ASR_17B_REPO_ID,
     )
     parser.add_argument("--ptm-dim", type=int, default=2048)
     parser.add_argument("--ptm-projector-dim", type=int, default=128)
@@ -643,6 +776,34 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         parser.error("--ptm-projector-dim must be between 1 and ptm-dim-1")
     if args.manual_group_repeat <= 0:
         parser.error("--manual-group-repeat must be positive")
+    positive_integer_fields = (
+        "max_steps",
+        "eval_every",
+        "batch_islands",
+        "eval_batch_islands",
+        "max_batch_candidates",
+        "hidden_size",
+        "candidate_layers",
+        "island_layers",
+        "shuffle_block_groups",
+    )
+    for field in positive_integer_fields:
+        if int(getattr(args, field)) <= 0:
+            parser.error(f"--{field.replace('_', '-')} must be positive")
+    if args.warmup_steps < 0 or args.warmup_steps > args.max_steps:
+        parser.error("--warmup-steps must be between 0 and --max-steps")
+    if not math.isfinite(args.learning_rate) or args.learning_rate <= 0.0:
+        parser.error("--learning-rate must be finite and positive")
+    if not 0.0 <= args.dropout < 1.0:
+        parser.error("--dropout must be in [0, 1)")
+    for field in ("cut_weight", "continue_weight"):
+        value = float(getattr(args, field))
+        if not math.isfinite(value) or value <= 0.0:
+            parser.error(f"--{field.replace('_', '-')} must be finite and positive")
+    for field in ("focal_gamma", "role_aux_weight", "pair_loss_weight"):
+        value = float(getattr(args, field))
+        if not math.isfinite(value) or value < 0.0:
+            parser.error(f"--{field.replace('_', '-')} must be finite and non-negative")
     return args
 
 

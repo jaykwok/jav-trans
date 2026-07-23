@@ -20,6 +20,62 @@ from tools.audits.audit_nav import update_audit_entrypoints  # noqa: E402
 SUMMARY_SCHEMA = "candidate_island_preaudit_comparison_summary_v1"
 DETAIL_SCHEMA = "candidate_island_preaudit_comparison_item_v1"
 
+AUDIO_SPAN_PLAYER_JS = r"""
+let activeAudio=null,activeButton=null,stopFn=null,playToken=0;
+function stop(){
+  playToken+=1;
+  if(activeAudio&&stopFn)activeAudio.removeEventListener('timeupdate',stopFn);
+  if(activeAudio)activeAudio.pause();
+  if(activeButton)activeButton.classList.remove('playing');
+  activeAudio=activeButton=stopFn=null;
+}
+function waitForMetadata(audio){
+  if(audio.readyState>=1)return Promise.resolve();
+  return new Promise((resolve,reject)=>{
+    const cleanup=()=>{
+      audio.removeEventListener('loadedmetadata',loaded);
+      audio.removeEventListener('error',failed);
+    };
+    const loaded=()=>{cleanup();resolve();};
+    const failed=()=>{cleanup();reject(audio.error||new Error('audio metadata load failed'));};
+    audio.addEventListener('loadedmetadata',loaded,{once:true});
+    audio.addEventListener('error',failed,{once:true});
+    audio.load();
+  });
+}
+async function play(audio,button,start,end){
+  stop();
+  const token=++playToken;
+  activeAudio=audio;
+  activeButton=button;
+  button.classList.add('playing');
+  const status=document.getElementById('status');
+  status.textContent=`加载 ${start.toFixed(2)}–${end.toFixed(2)}s…`;
+  try{
+    await waitForMetadata(audio);
+    if(token!==playToken)return;
+    if(!Number.isFinite(audio.duration)||audio.duration<=0)throw new Error('invalid audio duration');
+    const safeStart=Math.max(0,Math.min(start,Math.max(0,audio.duration-.001)));
+    const safeEnd=Math.max(safeStart,Math.min(end,audio.duration));
+    audio.currentTime=safeStart;
+    stopFn=()=>{
+      if(token===playToken&&audio.currentTime>=safeEnd-.005){
+        status.textContent=`已停止 ${safeStart.toFixed(2)}–${safeEnd.toFixed(2)}s`;
+        stop();
+      }
+    };
+    audio.addEventListener('timeupdate',stopFn);
+    await audio.play();
+    if(token!==playToken){audio.pause();return;}
+    status.textContent=`播放 ${safeStart.toFixed(2)}–${safeEnd.toFixed(2)}s`;
+  }catch(error){
+    if(token!==playToken)return;
+    status.textContent=`播放失败：${error&&error.message?error.message:String(error)}`;
+    stop();
+  }
+}
+"""
+
 
 def _rows(path: Path) -> list[dict[str, Any]]:
     return [
@@ -98,6 +154,24 @@ def _spans(row: dict[str, Any]) -> list[dict[str, Any]]:
     return sorted(result, key=lambda span: (span["start_s"], span["end_s"], span["label"]))
 
 
+def _label_runs(labels: list[str], *, label: str) -> list[dict[str, Any]]:
+    result: list[dict[str, Any]] = []
+    start: int | None = None
+    for index, value in enumerate([*labels, "__end__"]):
+        if value == label and start is None:
+            start = index
+        elif value != label and start is not None:
+            result.append(
+                {
+                    "label": label,
+                    "start_s": start * 0.02,
+                    "end_s": index * 0.02,
+                }
+            )
+            start = None
+    return result
+
+
 def _audio_url(value: str, *, manifest: Path) -> str:
     raw = Path(value)
     audio = raw if raw.is_absolute() else manifest.parent / raw
@@ -110,8 +184,8 @@ def _audio_url(value: str, *, manifest: Path) -> str:
 def _page(payload: list[dict[str, Any]], *, base_name: str, candidate_name: str) -> str:
     encoded = json.dumps(payload, ensure_ascii=False).replace("</", "<\\/")
     return f"""<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Scorer v11 teacher prompt A/B</title><style>
-body{{margin:0;background:#f4f7fa;color:#18212b;font-family:Segoe UI,Microsoft YaHei,sans-serif}}header{{position:sticky;top:0;z-index:3;display:flex;gap:10px;align-items:center;background:#122233;color:#fff;padding:12px 18px}}header #status{{margin-left:auto}}main{{max-width:1400px;margin:auto;padding:16px}}article{{background:#fff;border:1px solid #ccd6df;border-radius:10px;padding:14px;margin-bottom:14px}}audio{{width:100%}}.lane{{display:grid;grid-template-columns:130px 1fr;gap:8px;align-items:center;margin:8px 0}}.track{{position:relative;height:38px;background:#e6eaee;border-radius:5px;overflow:hidden}}.span{{position:absolute;top:0;height:100%;border:0;min-width:2px;cursor:pointer;color:#fff;font-size:10px;overflow:hidden}}.base-inside{{background:#3078bf}}.base-unsure{{background:#a56a00}}.candidate-inside{{background:#258b57}}.candidate-unsure{{background:#d87800}}.changed{{background:#c53a3a}}button.playing{{outline:3px solid #111;outline-offset:-3px}}.metrics{{display:flex;gap:14px;flex-wrap:wrap;font-size:12px;color:#40566c}}.positive{{color:#087443}}.negative{{color:#b3261e}}small{{color:#607080}}</style></head><body><header><b>Scorer v11 · Prompt A/B（同一冻结 {len(payload)} source）</b><button id="stop" type="button">停止播放</button><span id="status"></span></header><main><section><p>蓝色/棕色={base_name} inside/unsure；绿色/橙色={candidate_name} inside/unsure；红色=两版逐帧标签不同。灰色差集为 outside_candidate。点击色块只播放该区间，完整播放器用于听上下文。</p></section><div id="list"></div></main><script>
-const rows={encoded};let activeAudio=null,activeButton=null,stopFn=null;function esc(v){{return String(v??'').replace(/[&<>"']/g,c=>({{'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}}[c]));}}function stop(){{if(activeAudio&&stopFn)activeAudio.removeEventListener('timeupdate',stopFn);if(activeAudio)activeAudio.pause();if(activeButton)activeButton.classList.remove('playing');activeAudio=activeButton=stopFn=null;}}function play(audio,button,start,end){{stop();activeAudio=audio;activeButton=button;button.classList.add('playing');const begin=()=>{{audio.currentTime=start;stopFn=()=>{{if(audio.currentTime>=end)stop();}};audio.addEventListener('timeupdate',stopFn);audio.play();}};if(audio.readyState<1){{audio.addEventListener('loadedmetadata',begin,{{once:true}});audio.load();}}else begin();}}function lane(card,audio,row,name,spans,kind){{const line=document.createElement('div');line.className='lane';line.innerHTML=`<b>${{esc(name)}}</b><div class="track"></div>`;const track=line.querySelector('.track');for(const span of spans){{const button=document.createElement('button'),start=Number(span.start_s),end=Number(span.end_s);button.className=`span ${{kind}}-${{span.label==='unsure'?'unsure':'inside'}}`;if(kind==='diff')button.className='span changed';button.style.left=`${{100*start/row.duration_s}}%`;button.style.width=`${{Math.max(.12,100*(end-start)/row.duration_s)}}%`;button.title=`${{name}} ${{span.label}} ${{start.toFixed(2)}}–${{end.toFixed(2)}}s`;button.onclick=()=>play(audio,button,start,end);track.appendChild(button);}}card.appendChild(line);}}const root=document.getElementById('list');for(const row of rows){{const card=document.createElement('article'),failure=row.base_failed_closed||row.candidate_failed_closed;card.innerHTML=`<h2>${{esc(row.source_id)}}</h2><small>${{Number(row.duration_s).toFixed(2)}}s${{failure?' / ⚠ teacher validation failed-closed，不作为语义差异':''}}</small><audio controls preload="none" src="${{esc(row.audio)}}"></audio>`;const audio=card.querySelector('audio');lane(card,audio,row,'{base_name}',row.base_spans,'base');lane(card,audio,row,'{candidate_name}',row.candidate_spans,'candidate');lane(card,audio,row,'changed',row.changed_spans,'diff');const m=document.createElement('div');m.className='metrics';const delta=100*row.inside_delta_ratio;m.innerHTML=`<span>inside ${{(100*row.base_inside_ratio).toFixed(1)}}% → ${{(100*row.candidate_inside_ratio).toFixed(1)}}%</span><span class="${{delta>=0?'positive':'negative'}}">Δ=${{delta>=0?'+':''}}${{delta.toFixed(1)}}pp</span><span>unsure ${{(100*row.base_unsure_ratio).toFixed(1)}}% → ${{(100*row.candidate_unsure_ratio).toFixed(1)}}%</span><span>changed=${{(100*row.changed_ratio).toFixed(1)}}%</span>`;card.appendChild(m);if(failure){{const note=document.createElement('p');note.className='negative';note.textContent=`fail-closed: ${{row.base_failed_closed?'base ':''}}${{row.candidate_failed_closed?'candidate ':''}}${{row.candidate_reason||row.base_reason||''}}`;card.appendChild(note);}}root.appendChild(card);}}document.getElementById('stop').onclick=stop;document.getElementById('status').textContent=`${{rows.length}} sources / changed ${{rows.filter(r=>r.changed_frames>0).length}} / failed-closed ${{rows.filter(r=>r.base_failed_closed||r.candidate_failed_closed).length}}`;</script></body></html>"""
+body{{margin:0;background:#f4f7fa;color:#18212b;font-family:Segoe UI,Microsoft YaHei,sans-serif}}header{{position:sticky;top:0;z-index:3;display:flex;gap:10px;align-items:center;background:#122233;color:#fff;padding:12px 18px}}header #status{{margin-left:auto}}main{{max-width:1400px;margin:auto;padding:16px}}article{{background:#fff;border:1px solid #ccd6df;border-radius:10px;padding:14px;margin-bottom:14px}}audio{{width:100%}}.lane{{display:grid;grid-template-columns:180px 1fr;gap:8px;align-items:center;margin:8px 0}}.track{{position:relative;height:38px;background:#e6eaee;border-radius:5px;overflow:hidden}}.span{{position:absolute;top:0;height:100%;border:0;min-width:2px;cursor:pointer;color:#fff;font-size:10px;overflow:hidden}}.base-inside{{background:#3078bf}}.base-unsure{{background:#a56a00}}.base-outside{{background:#d3a64e;color:#1e1e1e}}.candidate-inside{{background:#258b57}}.candidate-unsure{{background:#d87800}}.candidate-outside{{background:#f2cf45;color:#1e1e1e}}.changed{{background:#c53a3a}}button.playing{{outline:3px solid #111;outline-offset:-3px}}.metrics{{display:flex;gap:14px;flex-wrap:wrap;font-size:12px;color:#40566c}}.positive{{color:#087443}}.negative{{color:#b3261e}}small{{color:#607080}}</style></head><body><header><b>Scorer v11 · Prompt A/B（同一冻结 {len(payload)} source）</b><button id="stop" type="button">停止播放</button><span id="status"></span></header><main><section><p>蓝色/棕色={base_name} provisional keep/unsure，暗黄色={base_name} outside；绿色/橙色={candidate_name} provisional keep/unsure，亮黄色={candidate_name} safe outside；红色=两版逐帧标签不同。所有色块只播放自身区间。黄色必须同时满足无词语/对白（包括可能有语用意义的“啊、嗯、哼”类发声）且可独立删除；环境底噪、音乐、机械声等背景噪声也需按此标准判断。</p></section><div id="list"></div></main><script>
+const rows={encoded};{AUDIO_SPAN_PLAYER_JS}function esc(v){{return String(v??'').replace(/[&<>"']/g,c=>({{'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}}[c]));}}function lane(card,audio,row,name,spans,kind){{const line=document.createElement('div');line.className='lane';line.innerHTML=`<b>${{esc(name)}}</b><div class="track"></div>`;const track=line.querySelector('.track');for(const span of spans){{const button=document.createElement('button'),start=Number(span.start_s),end=Number(span.end_s),suffix=span.label==='outside_candidate'?'outside':span.label==='unsure'?'unsure':'inside';button.className=kind==='diff'?'span changed':`span ${{kind}}-${{suffix}}`;button.style.left=`${{100*start/row.duration_s}}%`;button.style.width=`${{Math.max(.12,100*(end-start)/row.duration_s)}}%`;button.title=`${{name}} ${{span.label}} ${{start.toFixed(2)}}–${{end.toFixed(2)}}s`;button.textContent=`${{span.label}} ${{start.toFixed(2)}}–${{end.toFixed(2)}}s`;button.onclick=()=>play(audio,button,start,end);track.appendChild(button);}}card.appendChild(line);}}const root=document.getElementById('list');for(const row of rows){{const card=document.createElement('article'),failure=row.base_failed_closed||row.candidate_failed_closed;card.innerHTML=`<h2>${{esc(row.source_id)}}</h2><small>${{Number(row.duration_s).toFixed(2)}}s${{failure?' / ⚠ teacher validation failed-closed，不作为语义差异':''}}</small><audio controls preload="metadata" src="${{esc(row.audio)}}"></audio>`;const audio=card.querySelector('audio');lane(card,audio,row,'{base_name} keep/unsure',row.base_spans,'base');lane(card,audio,row,'{base_name} outside',row.base_outside_spans,'base');lane(card,audio,row,'{candidate_name} keep',row.candidate_spans,'candidate');lane(card,audio,row,'{candidate_name} safe outside',row.candidate_outside_spans,'candidate');lane(card,audio,row,'changed',row.changed_spans,'diff');const m=document.createElement('div');m.className='metrics';const delta=100*row.inside_delta_ratio;m.innerHTML=`<span>inside ${{(100*row.base_inside_ratio).toFixed(1)}}% → ${{(100*row.candidate_inside_ratio).toFixed(1)}}%</span><span class="${{delta>=0?'positive':'negative'}}">Δ=${{delta>=0?'+':''}}${{delta.toFixed(1)}}pp</span><span>outside ${{(100*row.base_outside_ratio).toFixed(1)}}% → ${{(100*row.candidate_outside_ratio).toFixed(1)}}%</span><span>unsure ${{(100*row.base_unsure_ratio).toFixed(1)}}% → ${{(100*row.candidate_unsure_ratio).toFixed(1)}}%</span><span>changed=${{(100*row.changed_ratio).toFixed(1)}}%</span>`;card.appendChild(m);if(failure){{const note=document.createElement('p');note.className='negative';note.textContent=`fail-closed: ${{row.base_failed_closed?'base ':''}}${{row.candidate_failed_closed?'candidate ':''}}${{row.candidate_reason||row.base_reason||''}}`;card.appendChild(note);}}root.appendChild(card);}}document.getElementById('stop').onclick=stop;document.getElementById('status').textContent=`${{rows.length}} sources / changed ${{rows.filter(r=>r.changed_frames>0).length}} / failed-closed ${{rows.filter(r=>r.base_failed_closed||r.candidate_failed_closed).length}}`;</script></body></html>"""
 
 
 def compare(
@@ -122,11 +196,15 @@ def compare(
     output_dir: Path,
     base_name: str = "v5",
     candidate_name: str = "v6",
+    limit: int = 0,
+    update_nav: bool = True,
 ) -> dict[str, Any]:
     manifest = manifest.resolve()
     base = base.resolve()
     candidate = candidate.resolve()
     sources = _index(manifest, name="source manifest")
+    if limit > 0:
+        sources = dict(list(sources.items())[:limit])
     base_rows = _index(base, name="base preaudit")
     candidate_rows = _index(candidate, name="candidate preaudit")
     missing_base = set(sources) - set(base_rows)
@@ -142,6 +220,8 @@ def compare(
         "frame_count": 0,
         "base_inside_frames": 0,
         "candidate_inside_frames": 0,
+        "base_outside_frames": 0,
+        "candidate_outside_frames": 0,
         "base_unsure_frames": 0,
         "candidate_unsure_frames": 0,
         "changed_frames": 0,
@@ -167,6 +247,8 @@ def compare(
         counts = {
             "base_inside_frames": left.count("inside_candidate"),
             "candidate_inside_frames": right.count("inside_candidate"),
+            "base_outside_frames": left.count("outside_candidate"),
+            "candidate_outside_frames": right.count("outside_candidate"),
             "base_unsure_frames": left.count("unsure"),
             "candidate_unsure_frames": right.count("unsure"),
             "changed_frames": sum(changed_values),
@@ -189,10 +271,20 @@ def compare(
                 "candidate_reason": str(candidate_rows[source_id].get("overall_reason") or ""),
                 "base_spans": _spans(base_rows[source_id]),
                 "candidate_spans": _spans(candidate_rows[source_id]),
+                "base_outside_spans": _label_runs(
+                    left,
+                    label="outside_candidate",
+                ),
+                "candidate_outside_spans": _label_runs(
+                    right,
+                    label="outside_candidate",
+                ),
                 "changed_spans": changed_spans,
                 **counts,
                 "base_inside_ratio": counts["base_inside_frames"] / max(frame_count, 1),
                 "candidate_inside_ratio": counts["candidate_inside_frames"] / max(frame_count, 1),
+                "base_outside_ratio": counts["base_outside_frames"] / max(frame_count, 1),
+                "candidate_outside_ratio": counts["candidate_outside_frames"] / max(frame_count, 1),
                 "inside_delta_ratio": (counts["candidate_inside_frames"] - counts["base_inside_frames"]) / max(frame_count, 1),
                 "base_unsure_ratio": counts["base_unsure_frames"] / max(frame_count, 1),
                 "candidate_unsure_ratio": counts["candidate_unsure_frames"] / max(frame_count, 1),
@@ -258,6 +350,8 @@ def compare(
         "changed_ratio": totals["changed_frames"] / total_frames,
         "per_source": str(detail_path),
         "training_manifest_allowed": False,
+        "limit": limit,
+        "audit_navigation_updated": update_nav,
     }
     (output_dir / "summary.json").write_text(
         json.dumps(summary, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
@@ -265,7 +359,8 @@ def compare(
     )
     index = output_dir / "index.html"
     index.write_text(_page(details, base_name=base_name, candidate_name=candidate_name), encoding="utf-8")
-    update_audit_entrypoints(latest_html=index, title="Scorer v11 teacher prompt A/B")
+    if update_nav:
+        update_audit_entrypoints(latest_html=index, title="Scorer v11 teacher prompt A/B")
     return summary
 
 
@@ -277,6 +372,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--base-name", default="v5")
     parser.add_argument("--candidate-name", default="v6")
     parser.add_argument("--output-dir", required=True)
+    parser.add_argument("--limit", type=int, default=0)
+    parser.add_argument(
+        "--update-nav",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
     return parser.parse_args(argv)
 
 
@@ -291,6 +392,8 @@ if __name__ == "__main__":
                 base_name=args.base_name,
                 candidate_name=args.candidate_name,
                 output_dir=Path(args.output_dir),
+                limit=args.limit,
+                update_nav=args.update_nav,
             ),
             ensure_ascii=False,
         )

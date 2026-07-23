@@ -2,7 +2,10 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
+import math
+import os
 import re
 import sys
 from datetime import datetime
@@ -40,6 +43,9 @@ from boundary.contracts import ACOUSTIC_BINARY_V12_CONTRACT  # noqa: E402
 
 
 FEATURE_BUNDLE_SCHEMA = "cueqc_pre_asr_semantic_chunk_v13_features"
+RUNTIME_CHUNK_SCHEMA = "runtime_v12_provisional_subisland_v2"
+CANONICAL_LABEL_SCHEMA = "cueqc_v13_canonical_label_v2"
+CURRENT_INPUT_DISTRIBUTION = "runtime_v12_provisional_subisland_v2_pre_cueqc"
 
 
 def _required_sha256(value: Any, *, field: str, row_id: str) -> str:
@@ -51,12 +57,53 @@ def _required_sha256(value: Any, *, field: str, row_id: str) -> str:
     return normalized
 
 
+def _file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for block in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def _torch_save_atomic(payload: Any, output: Path) -> None:
+    import torch
+
+    temporary = output.with_name(f".{output.name}.{os.getpid()}.tmp")
+    try:
+        torch.save(payload, temporary)
+        temporary.replace(output)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def _write_text_atomic(path: Path, text: str) -> None:
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    try:
+        with temporary.open("w", encoding="utf-8", newline="\n") as handle:
+            handle.write(text)
+            handle.flush()
+            os.fsync(handle.fileno())
+        temporary.replace(path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
 def _training_chunk_provenance(
     chunk: Mapping[str, Any],
     candidate: Mapping[str, Any],
     *,
     row_id: str,
+    strict_current: bool = True,
 ) -> tuple[str, str, list[str]]:
+    if strict_current:
+        if chunk.get("schema") != RUNTIME_CHUNK_SCHEMA:
+            raise ValueError(
+                f"CueQC chunk {row_id!r} is not a current Runtime v12 provisional row"
+            )
+        if chunk.get("inner_execution_status") != "deferred_until_cueqc_keep":
+            raise ValueError(
+                f"CueQC chunk {row_id!r} contains pre-CueQC Inner state"
+            )
     if chunk.get("training_manifest_allowed") is not True:
         raise ValueError(
             f"CueQC chunk {row_id!r} is not an approved training manifest row"
@@ -289,11 +336,44 @@ def normalize_label(row: Mapping[str, Any]) -> int | None:
     return None
 
 
-def read_labels(paths: Iterable[str]) -> dict[str, dict[str, Any]]:
+def read_labels(
+    paths: Iterable[str], *, strict_current: bool = False
+) -> dict[str, dict[str, Any]]:
     labels: dict[str, dict[str, Any]] = {}
+
+    def register(key: str, item: dict[str, Any], *, source_path: Path) -> None:
+        previous = labels.get(key)
+        if previous is None or not strict_current:
+            labels[key] = item
+            return
+        comparable = (
+            int(previous.get("label_index", PRE_ASR_CUEQC_IGNORE_LABEL)),
+            str(previous.get("teacher_label") or ""),
+            str(previous.get("source_id") or ""),
+            str(previous.get("source_partition") or ""),
+        )
+        current = (
+            int(item.get("label_index", PRE_ASR_CUEQC_IGNORE_LABEL)),
+            str(item.get("teacher_label") or ""),
+            str(item.get("source_id") or ""),
+            str(item.get("source_partition") or ""),
+        )
+        if comparable != current:
+            raise ValueError(
+                f"conflicting CueQC labels for key {key!r} in {source_path}"
+            )
+        if strict_current and previous.get("subisland_id") != item.get("subisland_id"):
+            raise ValueError(f"duplicate CueQC label identity for key {key!r}")
+
     for raw_path in paths:
         path = project_path(raw_path)
         for row in read_json_or_jsonl(path):
+            if strict_current and row.get("schema") != CANONICAL_LABEL_SCHEMA:
+                raise ValueError(
+                    f"CueQC training labels require {CANONICAL_LABEL_SCHEMA}: {path}"
+                )
+            if strict_current and row.get("training_manifest_allowed") is not True:
+                raise ValueError(f"CueQC training label is not manifest-approved: {path}")
             canonical_label = raw_label(row)
             teacher_label = str(row.get("teacher_label") or canonical_label).strip().lower()
             value = normalize_label(row)
@@ -314,9 +394,9 @@ def read_labels(paths: Iterable[str]) -> dict[str, dict[str, Any]]:
                 cluster_id = str(item.get("cluster_id") or "").strip()
                 item_keys = label_keys(item)
                 if cluster_id and not item_keys:
-                    labels[f"cluster:{cluster_id}"] = item
+                    register(f"cluster:{cluster_id}", item, source_path=path)
                 for key in item_keys:
-                    labels[key] = item
+                    register(key, item, source_path=path)
     return labels
 
 
@@ -354,24 +434,57 @@ def label_for_chunk(
     return None
 
 
-def _has_required_ptm_pooling(candidate: Mapping[str, Any]) -> bool:
+def _has_required_ptm_pooling(
+    candidate: Mapping[str, Any], *, strict_current: bool = True
+) -> bool:
     values = candidate.get("pre_asr_ptm_pooled_features")
-    return (
+    valid = (
         bool(candidate.get("ptm_pooling_available"))
         and isinstance(values, list)
         and len(values) == len(PRE_ASR_CUEQC_POOLED_PTM_FEATURE_NAMES)
     )
+    if not valid:
+        return False
+    try:
+        numeric = np.asarray(values, dtype=np.float32)
+    except (TypeError, ValueError):
+        return False
+    if not np.isfinite(numeric).all():
+        return False
+    if strict_current:
+        if str(candidate.get("ptm_pooling_schema") or "").strip() == "":
+            return False
+        if int(candidate.get("ptm_pooling_bins") or 0) != PRE_ASR_CUEQC_MODEL_PTM_TOKENS:
+            return False
+        if int(candidate.get("ptm_pooling_dim") or 0) != len(
+            PRE_ASR_CUEQC_POOLED_PTM_FEATURE_NAMES
+        ):
+            return False
+        digest = str(candidate.get("ptm_projection_digest") or "").lower()
+        if len(digest) != 64 or any(ch not in "0123456789abcdef" for ch in digest):
+            return False
+    return True
 
 
-def candidate_for_chunk(chunks: list[dict[str, Any]], index: int) -> dict[str, Any]:
+def candidate_for_chunk(
+    chunks: list[dict[str, Any]], index: int, *, strict_current: bool = True
+) -> dict[str, Any]:
     chunk = chunks[index]
     embedded = chunk.get("pre_asr_candidate")
+    if strict_current and not isinstance(embedded, Mapping):
+        raise ValueError(
+            f"CueQC chunk {row_id('', chunk, index)!r} lacks an embedded current Pre-ASR candidate"
+        )
     source = dict(embedded) if isinstance(embedded, Mapping) else chunk
     features = source.get("features")
     feature_names = tuple(str(item) for item in source.get("feature_names") or ())
+    if strict_current and source.get("schema") != PRE_ASR_CUEQC_FEATURE_SCHEMA:
+        raise ValueError("CueQC current Runtime row contains a stale Pre-ASR feature schema")
     if isinstance(features, Mapping) and feature_names == PRE_ASR_CUEQC_FEATURE_NAMES:
         candidate = dict(source)
     else:
+        if strict_current:
+            raise ValueError("CueQC current Runtime row has incomplete embedded features")
         candidate = candidate_from_span(chunks, index, require_ptm_pooling=True)
     candidate.setdefault("sample_id", str(chunk.get("subisland_id") or ""))
     candidate.setdefault("source_sample_id", str(chunk.get("sample_id") or ""))
@@ -383,7 +496,7 @@ def candidate_for_chunk(chunks: list[dict[str, Any]], index: int) -> dict[str, A
         "inner_edge_refiner_weights_sha256",
         str(chunk.get("inner_edge_refiner_weights_sha256") or ""),
     )
-    if not _has_required_ptm_pooling(candidate):
+    if not _has_required_ptm_pooling(candidate, strict_current=strict_current):
         raise ValueError(
             "Pre-ASR CueQC v13 feature compilation requires chunk-level pooled PTM features"
         )
@@ -447,23 +560,29 @@ def compile_features(
     label_paths: list[str],
     output: Path,
     asr_repo_id: str,
+    legacy_audit_only: bool = False,
 ) -> dict[str, Any]:
     import torch
 
     selected_repo = qwen_asr_repo_id(asr_repo_id)
     if selected_repo != QWEN_ASR_17B_REPO_ID:
         raise ValueError("CueQC v13 feature compilation is restricted to the 1.7B repo")
-    labels = read_labels(label_paths)
+    strict_current = not legacy_audit_only
+    labels = read_labels(label_paths, strict_current=strict_current)
     expanded_chunk_paths = expand_chunk_paths(chunk_paths)
     rows: list[dict[str, Any]] = []
     row_ids: set[str] = set()
     core_owners: dict[str, str] = {}
     group_map: dict[tuple[str, str, str], list[int]] = {}
+    source_partitions: dict[str, set[str]] = {}
+    canonical_label_ids: set[str] = set()
     for path in expanded_chunk_paths:
         source = repo_display_path(path)
         audio_id, chunks = read_chunk_document(path)
         for index, chunk in enumerate(chunks):
-            candidate = candidate_for_chunk(chunks, index)
+            candidate = candidate_for_chunk(
+                chunks, index, strict_current=strict_current
+            )
             rid = row_id(audio_id, chunk, index)
             if rid in row_ids:
                 raise ValueError(f"duplicate CueQC provisional subisland identity: {rid}")
@@ -472,6 +591,7 @@ def compile_features(
                 chunk,
                 candidate,
                 row_id=rid,
+                strict_current=strict_current,
             )
             for core_id in source_core_ids:
                 previous = core_owners.get(core_id)
@@ -482,6 +602,22 @@ def compile_features(
                     )
                 core_owners[core_id] = rid
             label = label_for_chunk(labels, audio_id=audio_id, chunk=chunk, index=index)
+            if strict_current:
+                if label is None:
+                    raise ValueError(f"CueQC current Runtime row {rid!r} has no canonical label")
+                if str(label.get("schema") or "") != CANONICAL_LABEL_SCHEMA:
+                    raise ValueError(f"CueQC label for {rid!r} is not canonical v2")
+                if label.get("training_manifest_allowed") is not True:
+                    raise ValueError(f"CueQC label for {rid!r} is not training-approved")
+                if str(label.get("subisland_id") or "") != rid:
+                    raise ValueError(f"CueQC label identity mismatch for {rid!r}")
+                for key in ("sample_id", "source_id", "source_partition", "audio"):
+                    if str(label.get(key) or "") != str(chunk.get(key) or ""):
+                        raise ValueError(f"CueQC chunk/label {key} mismatch for {rid!r}")
+                for key in ("start_s", "end_s"):
+                    if not math.isclose(float(label.get(key)), float(chunk.get(key)), abs_tol=1e-6):
+                        raise ValueError(f"CueQC chunk/label {key} mismatch for {rid!r}")
+                canonical_label_ids.add(rid)
             label_index = (
                 PRE_ASR_CUEQC_IGNORE_LABEL if label is None else int(label["label_index"])
             )
@@ -520,6 +656,7 @@ def compile_features(
                 raise ValueError(
                     f"CueQC chunk {rid!r} has no frozen train/val/test source partition"
                 )
+            source_partitions.setdefault(source_id, set()).add(dataset_role)
             row_index = len(rows)
             group_map.setdefault(group_key, []).append(row_index)
             rows.append(
@@ -577,6 +714,22 @@ def compile_features(
             groups.append(row_indexes)
     if not groups:
         raise ValueError("no definite labeled Pre-ASR CueQC examples were compiled")
+    if strict_current:
+        leaked_sources = [
+            source_id for source_id, roles in source_partitions.items() if len(roles) != 1
+        ]
+        if leaked_sources:
+            raise ValueError(
+                f"CueQC source identity crosses dataset partitions: {sorted(leaked_sources)[:3]}"
+            )
+        if set(source_partitions) and set().union(*source_partitions.values()) != {
+            "train",
+            "val",
+            "test",
+        }:
+            raise ValueError("CueQC current training compilation requires train/val/test sources")
+        if canonical_label_ids != row_ids:
+            raise ValueError("CueQC canonical labels do not cover every Runtime row")
     projection_digests = {
         str(rows[row_index]["candidate"].get("ptm_projection_digest") or "")
         for group in groups
@@ -648,7 +801,15 @@ def compile_features(
         "boundary_serialization_contract_id": (
             ACOUSTIC_BINARY_V12_CONTRACT.contract_id
         ),
-        "training_manifest_allowed": True,
+        "training_manifest_allowed": bool(strict_current),
+        "input_distribution": CURRENT_INPUT_DISTRIBUTION if strict_current else "legacy_audit_only",
+        "runtime_chunk_schema": RUNTIME_CHUNK_SCHEMA if strict_current else "legacy",
+        "canonical_label_schema": CANONICAL_LABEL_SCHEMA if strict_current else "legacy",
+        "all_partitions_present": bool(
+            set().union(*source_partitions.values()) == {"train", "val", "test"}
+            if source_partitions
+            else False
+        ),
         "ptm_pooling_schemas": pooling_schemas,
         "ptm_projection_digest": ptm_projection_digest,
         "semantic_split_weights_sha256": next(iter(split_checkpoint_shas), ""),
@@ -658,11 +819,18 @@ def compile_features(
         "rows": row_payload,
         "groups": group_payload,
         "source_files": [repo_display_path(path) for path in expanded_chunk_paths],
+        "source_file_sha256": {
+            repo_display_path(path): _file_sha256(path) for path in expanded_chunk_paths
+        },
         "label_files": [repo_display_path(project_path(path)) for path in label_paths],
+        "label_file_sha256": {
+            repo_display_path(project_path(path)): _file_sha256(project_path(path))
+            for path in label_paths
+        },
         **bundle_tensors,
     }
     output.parent.mkdir(parents=True, exist_ok=True)
-    torch.save(bundle, output)
+    _torch_save_atomic(bundle, output)
     summary = {
         "schema": "cueqc_pre_asr_semantic_chunk_v13_feature_summary",
         "feature_bundle": repo_display_path(output),
@@ -673,7 +841,22 @@ def compile_features(
         "boundary_serialization_contract_id": (
             ACOUSTIC_BINARY_V12_CONTRACT.contract_id
         ),
-        "training_manifest_allowed": True,
+        "training_manifest_allowed": bool(strict_current),
+        "input_distribution": CURRENT_INPUT_DISTRIBUTION if strict_current else "legacy_audit_only",
+        "runtime_chunk_schema": RUNTIME_CHUNK_SCHEMA if strict_current else "legacy",
+        "canonical_label_schema": CANONICAL_LABEL_SCHEMA if strict_current else "legacy",
+        "all_partitions_present": bool(
+            set().union(*source_partitions.values()) == {"train", "val", "test"}
+            if source_partitions
+            else False
+        ),
+        "source_file_sha256": {
+            repo_display_path(path): _file_sha256(path) for path in expanded_chunk_paths
+        },
+        "label_file_sha256": {
+            repo_display_path(project_path(path)): _file_sha256(project_path(path))
+            for path in label_paths
+        },
         "ptm_pooling_schemas": pooling_schemas,
         "ptm_projection_digest": ptm_projection_digest,
         "semantic_split_weights_sha256": next(iter(split_checkpoint_shas), ""),
@@ -690,10 +873,11 @@ def compile_features(
             )
             - teacher_unsure_ignored
         ),
+        "output_sha256": _file_sha256(output),
     }
-    output.with_suffix(".summary.json").write_text(
+    _write_text_atomic(
+        output.with_suffix(".summary.json"),
         json.dumps(summary, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
-        encoding="utf-8",
     )
     return summary
 
@@ -704,6 +888,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--labels", action="append", required=True, help="JSON/JSONL labels with keep/drop/ignore.")
     parser.add_argument("--output", required=True)
     parser.add_argument("--asr-repo-id", default=current_qwen_asr_backend())
+    parser.add_argument(
+        "--legacy-audit-only",
+        action="store_true",
+        help=(
+            "Accept retired candidate/label formats only for reproducing audits; "
+            "the resulting bundle is marked training_manifest_allowed=false."
+        ),
+    )
     return parser.parse_args(argv)
 
 
@@ -714,6 +906,7 @@ def main(argv: list[str] | None = None) -> int:
         label_paths=list(args.labels),
         output=project_path(args.output),
         asr_repo_id=str(args.asr_repo_id),
+        legacy_audit_only=bool(args.legacy_audit_only),
     )
     print(
         "features={feature_bundle} groups={group_count} keep={keep} drop={drop} "

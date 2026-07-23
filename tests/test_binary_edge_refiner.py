@@ -78,7 +78,11 @@ def test_outer_v3_binary_checkpoint_loads_but_registry_remains_pending(tmp_path)
     payload = build_outer_edge_refiner_v3_checkpoint(
         model=BinaryFrameEdgeNetwork(**config),
         model_config=config,
-        feature_config={"raw_ptm_dim": 8},
+        feature_config={
+            "raw_ptm_dim": 8,
+            "mfcc_dim": 2,
+            "relative_position_dim": 1,
+        },
         normalization={"feature_mean": [0.0] * 11, "feature_std": [1.0] * 11},
         metadata={"ptm_repo_id": "repo/1.7b"},
     )
@@ -336,7 +340,11 @@ def test_inner_v2_checkpoint_is_binary_acoustic_and_rejects_v1_schema(tmp_path) 
     }
     payload = build_inner_edge_refiner_v2_checkpoint(
         model=BinaryFrameEdgeNetwork(**config), model_config=config,
-        feature_config={"raw_ptm_dim": 8},
+        feature_config={
+            "raw_ptm_dim": 8,
+            "mfcc_dim": 2,
+            "relative_position_dim": 1,
+        },
         normalization={"feature_mean": [0.0] * 11, "feature_std": [1.0] * 11},
         metadata={},
     )

@@ -23,6 +23,9 @@ from tools.audits.generate_candidate_island_v11_heldout_audit_html import (  # n
     MANUAL_VERDICT_SCHEMA as HELDOUT_VERDICT_SCHEMA,
     _candidate_page,
 )
+from tools.audits.generate_scorer_v10_full_source_span_audit_html import (  # noqa: E402
+    _json_for_script,
+)
 
 
 SOURCE_SCHEMA = "candidate_island_scorer_v11_train_teacher_source_v1"
@@ -123,12 +126,7 @@ def _page(payload: list[dict[str, Any]], initial: dict[str, Any]) -> str:
         "let ann={};try{ann=JSON.parse(localStorage.getItem(key)||'{}');}"
         "catch(_error){ann={};}"
     )
-    encoded_initial = (
-        json.dumps(initial, ensure_ascii=False)
-        .replace("</", "<\\/")
-        .replace("\u2028", "\\u2028")
-        .replace("\u2029", "\\u2029")
-    )
+    encoded_initial = _json_for_script(initial)
     new_ann = (
         f"const initialAnn={encoded_initial};let ann={{...initialAnn}};"
         "try{ann={...initialAnn,...JSON.parse(localStorage.getItem(key)||'{}')};}"

@@ -4,7 +4,9 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 import sys
+import tempfile
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Mapping
@@ -41,7 +43,10 @@ from asr.pre_asr_cueqc import (  # noqa: E402
     make_model_config,
 )
 from tools.asr.cueqc.pre_asr_feature_compiler import (  # noqa: E402
+    CANONICAL_LABEL_SCHEMA,
+    CURRENT_INPUT_DISTRIBUTION,
     FEATURE_BUNDLE_SCHEMA,
+    RUNTIME_CHUNK_SCHEMA,
     project_path,
     repo_display_path,
 )
@@ -62,6 +67,47 @@ def file_sha256(path: Path) -> str:
         for block in iter(lambda: handle.read(1024 * 1024), b""):
             h.update(block)
     return h.hexdigest()
+
+
+def _write_text_atomic(path: Path, text: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w", encoding="utf-8", dir=path.parent,
+            prefix=f".{path.name}.", suffix=".tmp", delete=False
+        ) as handle:
+            temporary = Path(handle.name)
+            handle.write(text)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+        temporary = None
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
+
+
+def _torch_save_atomic(payload: Any, path: Path) -> None:
+    import torch
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="wb", dir=path.parent,
+            prefix=f".{path.name}.", suffix=".tmp", delete=False
+        ) as handle:
+            temporary = Path(handle.name)
+        torch.save(payload, temporary)
+        with temporary.open("ab") as handle:
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+        temporary = None
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
 
 
 def active_semantic_split_checkpoint(asr_repo_id: str) -> Path:
@@ -112,10 +158,12 @@ def load_feature_bundle(path: Path) -> dict[str, Any]:
     labels = payload.get("labels")
     if labels is None or not hasattr(labels, "detach"):
         raise ValueError("feature bundle labels tensor is missing")
+    if labels.ndim != 2:
+        raise ValueError("feature bundle labels must have shape [groups,chunks]")
     observed_labels = {
         int(item) for item in labels.detach().cpu().reshape(-1).tolist()
     }
-    allowed_labels = {0, 1, 2, PRE_ASR_CUEQC_IGNORE_LABEL}
+    allowed_labels = {0, 1, PRE_ASR_CUEQC_IGNORE_LABEL}
     if not observed_labels.issubset(allowed_labels):
         raise ValueError(
             "feature bundle contains unsupported training labels: "
@@ -217,16 +265,21 @@ def _class_counts(y: np.ndarray, mask: np.ndarray) -> dict[str, int]:
     return {
         "drop": int(np.sum((y == 0) & valid)),
         "keep": int(np.sum((y == 1) & valid)),
-        "excluded_unsure": int(np.sum((y == 2) & valid)),
+        # Canonical unsure labels are represented by -100 and tracked by the
+        # bundle's teacher_unsure_ignored count, not by a retired class id.
+        "excluded_unsure": 0,
         "ambiguous_ignore": int(np.sum((y == PRE_ASR_CUEQC_IGNORE_LABEL) & valid)),
     }
 
 
 def _excluded_training_label_count(bundle: Mapping[str, Any], y: np.ndarray) -> int:
-    """Count canonical unsure rows plus legacy bundle rows encoded as class 2."""
-    canonical_unsure = int(bundle.get("teacher_unsure_ignored") or 0)
-    legacy_unsure = int(np.sum(y == 2))
-    return canonical_unsure + legacy_unsure
+    """Return the compiler's count of canonical unsure rows."""
+
+    del y
+    value = int(bundle.get("teacher_unsure_ignored") or 0)
+    if value < 0:
+        raise ValueError("teacher_unsure_ignored must be non-negative")
+    return value
 
 
 def _prediction_rows(
@@ -256,7 +309,7 @@ def _prediction_rows(
             target = int(y[group_index, chunk_index])
             if target in (0, 1):
                 truth_label = PRE_ASR_CUEQC_LABELS[target]
-            elif target == 2 or metadata.get("training_ignore_reason") == "teacher_unsure":
+            elif metadata.get("training_ignore_reason") == "teacher_unsure":
                 truth_label = "unsure"
             else:
                 truth_label = "ignore"
@@ -408,31 +461,22 @@ def validate_feature_bundle_training_contract(bundle: Mapping[str, Any]) -> None
         bundle.get("boundary_serialization_contract_id")
     ):
         raise ValueError("CueQC feature bundle uses a stale Boundary contract")
-
-
-def _apply_forced_group_splits(
-    *,
-    train: np.ndarray,
-    val: np.ndarray,
-    y: np.ndarray,
-    chunk_mask: np.ndarray,
-    force_train_groups: set[int],
-    force_val_groups: set[int],
-) -> None:
-    """Move only binary CueQC labels when manually overriding data partitions."""
-
-    for group_index in force_train_groups:
-        valid = (chunk_mask[group_index] > 0) & np.isin(
-            y[group_index], (0, 1)
-        )
-        train[group_index, valid] = True
-        val[group_index, valid] = False
-    for group_index in force_val_groups:
-        valid = (chunk_mask[group_index] > 0) & np.isin(
-            y[group_index], (0, 1)
-        )
-        train[group_index, valid] = False
-        val[group_index, valid] = True
+    if bundle.get("input_distribution") != CURRENT_INPUT_DISTRIBUTION:
+        raise ValueError("CueQC feature bundle is not from current Runtime v12 chunks")
+    if bundle.get("runtime_chunk_schema") != RUNTIME_CHUNK_SCHEMA:
+        raise ValueError("CueQC feature bundle uses a stale Runtime chunk schema")
+    if bundle.get("canonical_label_schema") != CANONICAL_LABEL_SCHEMA:
+        raise ValueError("CueQC feature bundle uses a stale canonical label schema")
+    if bundle.get("all_partitions_present") is not True:
+        raise ValueError("CueQC feature bundle must contain train/val/test partitions")
+    if not isinstance(bundle.get("source_file_sha256"), Mapping) or not bundle.get(
+        "source_file_sha256"
+    ):
+        raise ValueError("CueQC feature bundle is missing source file SHA bindings")
+    if not isinstance(bundle.get("label_file_sha256"), Mapping) or not bundle.get(
+        "label_file_sha256"
+    ):
+        raise ValueError("CueQC feature bundle is missing label file SHA bindings")
 
 
 def _balanced_anchor_positions(train_mask: np.ndarray, y: np.ndarray, device: Any) -> dict[int, Any]:
@@ -701,6 +745,14 @@ def train(
         raise ValueError("ptm bin tensor shape mismatch")
     if y.shape != chunk_mask.shape or y.shape != scalar.shape[:2]:
         raise ValueError("label tensor shape mismatch")
+    if bin_mask.ndim != 3 or bin_mask.shape[:2] != scalar.shape[:2]:
+        raise ValueError("bin mask tensor shape mismatch")
+    if not torch.isfinite(scalar).all() or not torch.isfinite(ptm_bins).all():
+        raise ValueError("feature bundle contains non-finite acoustic features")
+    if not torch.isfinite(bin_mask).all() or not torch.isfinite(chunk_mask).all():
+        raise ValueError("feature bundle contains non-finite masks")
+    if not torch.isin(y, torch.tensor((0, 1, PRE_ASR_CUEQC_IGNORE_LABEL))).all():
+        raise ValueError("feature bundle contains a retired training label")
     selected_repo = qwen_asr_repo_id(asr_repo_id)
     if selected_repo != QWEN_ASR_17B_REPO_ID:
         raise ValueError("CueQC v13 training is restricted to the 1.7B repo")
@@ -730,12 +782,25 @@ def train(
     ptm_pooling_schemas = [str(item) for item in bundle.get("ptm_pooling_schemas") or ()]
 
     torch.manual_seed(seed)
+    if dev_requested := str(device).strip().lower():
+        if dev_requested.startswith("cuda") and not torch.cuda.is_available():
+            raise RuntimeError("CueQC training requested CUDA but CUDA is unavailable")
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
     rng = np.random.default_rng(seed)
     group_count = int(scalar.shape[0])
     y_np = y.numpy()
     mask_np = chunk_mask.numpy()
     excluded_training_label_count = _excluded_training_label_count(bundle, y_np)
     group_rows = [dict(item) for item in (bundle.get("groups") or []) if isinstance(item, Mapping)]
+    if len(group_rows) != group_count:
+        raise ValueError("feature bundle groups count does not match feature tensors")
+    for group_index, group in enumerate(group_rows):
+        row_ids = list(group.get("row_ids") or ())
+        if len(row_ids) != int(scalar.shape[1]):
+            raise ValueError(
+                f"CueQC group {group_index} row_ids count does not match chunks"
+            )
     train_label_mask, val_label_mask, test_label_mask, split_summary = _split_label_masks(
         y=y_np,
         chunk_mask=mask_np,
@@ -793,13 +858,17 @@ def train(
             raise ValueError("init checkpoint feature_mean shape mismatch")
         if std.shape != mean.shape:
             raise ValueError("init checkpoint feature_std shape mismatch")
-        std = std.clamp_min(1e-6)
+        if not torch.isfinite(mean).all() or not torch.isfinite(std).all() or torch.any(std <= 0):
+            raise ValueError("init checkpoint normalization is invalid")
     else:
         scalar_train = scalar[train_label_mask_t]
+        if scalar_train.numel() == 0:
+            raise ValueError("CueQC training split has no finite labels")
         mean = scalar_train.mean(dim=0)
         std = scalar_train.std(dim=0).clamp_min(1e-6)
     scalar_norm = (scalar - mean.reshape(1, 1, -1)) / std.reshape(1, 1, -1)
-    scalar_norm = torch.nan_to_num(scalar_norm, nan=0.0, posinf=0.0, neginf=0.0)
+    if not torch.isfinite(scalar_norm).all():
+        raise ValueError("CueQC normalization produced non-finite features")
 
     normalized_device = device.strip().lower()
     if normalized_device == "auto":
@@ -886,6 +955,8 @@ def train(
         flat_logits = logits.reshape(-1, 2)
         flat_targets = batch_y.reshape(-1)
         active = (flat_targets == 0) | (flat_targets == 1)
+        if not torch.any(active):
+            raise ValueError("CueQC sampled training window has no binary labels")
         active_logits = flat_logits[active]
         active_targets = flat_targets[active]
         raw_loss = F.cross_entropy(
@@ -928,6 +999,8 @@ def train(
             sequence_window_size=sequence_window_size,
         )
         probs_all = torch.softmax(logits_all, dim=-1).float().cpu().numpy()
+    if not np.isfinite(probs_all).all():
+        raise ValueError("CueQC model produced non-finite probabilities")
     durations = _duration_matrix(bundle, scalar)
     train_probs, train_y, train_durations = _valid_flat(
         probs_all,
@@ -1026,9 +1099,9 @@ def train(
         probabilities=probs_all,
     )
     predictions_path = output_dir / "predictions.jsonl"
-    predictions_path.write_text(
+    _write_text_atomic(
+        predictions_path,
         "".join(json.dumps(row, ensure_ascii=False) + "\n" for row in prediction_rows),
-        encoding="utf-8",
     )
     metrics["predictions"] = repo_display_path(predictions_path)
     checkpoint_path = output_dir / default_checkpoint_name(selected_repo)
@@ -1109,11 +1182,14 @@ def train(
         },
         "model_state_dict": model.cpu().state_dict(),
     }
-    torch.save(checkpoint, checkpoint_path)
+    _torch_save_atomic(checkpoint, checkpoint_path)
     metrics["checkpoint"] = repo_display_path(checkpoint_path)
     metrics["checkpoint_sha256"] = file_sha256(checkpoint_path)
     metrics_path = output_dir / "metrics.json"
-    metrics_path.write_text(json.dumps(metrics, ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    _write_text_atomic(
+        metrics_path,
+        json.dumps(metrics, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+    )
     return metrics
 
 

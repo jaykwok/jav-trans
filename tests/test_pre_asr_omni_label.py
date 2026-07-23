@@ -35,7 +35,7 @@ def test_runtime_v12_teacher_rejects_old_runtime_chunks() -> None:
         runtime._validate_runtime_rows(
             [
                 {
-                    "schema": "runtime_v10_provisional_subisland_v1",
+                    "schema": "runtime_v12_provisional_subisland_v1",
                     "subisland_id": "old",
                     "pre_asr_candidate": {
                         "boundary_contract_id": "retired-boundary-contract",
@@ -50,10 +50,19 @@ def test_runtime_v12_teacher_requires_frozen_model_bound_manifest() -> None:
     from tools.asr.cueqc import label_runtime_v12_cueqc_v13_with_omni as runtime
 
     row = {
-        "schema": "runtime_v12_provisional_subisland_v1",
+        "schema": "runtime_v12_provisional_subisland_v2",
+        "inner_execution_status": "deferred_until_cueqc_keep",
         "subisland_id": "current",
+        "sample_id": "sample",
         "source_id": "source",
         "source_partition": "test",
+        "boundary_serialization_contract_id": "boundary_acoustic_binary_v12",
+        "audio": "source.wav",
+        "source_audio_sha256": "c" * 64,
+        "start_s": 0.0,
+        "end_s": 1.0,
+        "duration_s": 1.0,
+        "source_core_ids": ["core-current"],
         "training_manifest_allowed": True,
         "semantic_split_weights_sha256": "a" * 64,
         "inner_edge_refiner_weights_sha256": "b" * 64,
@@ -66,6 +75,42 @@ def test_runtime_v12_teacher_requires_frozen_model_bound_manifest() -> None:
     row["training_manifest_allowed"] = False
     with pytest.raises(ValueError, match="approved runtime manifest"):
         runtime._validate_runtime_rows([row])
+
+
+def test_runtime_v12_teacher_rejects_stale_resumed_checkpoint_identity() -> None:
+    from tools.asr.cueqc import label_runtime_v12_cueqc_v13_with_omni as runtime
+
+    runtime_row = {
+        "subisland_id": "item",
+        "sample_id": "sample",
+        "source_id": "source",
+        "source_partition": "train",
+        "audio": "source.wav",
+        "source_audio_sha256": "c" * 64,
+        "source_audio_size": 123,
+        "semantic_split_weights_sha256": "a" * 64,
+        "inner_edge_refiner_weights_sha256": "b" * 64,
+        "boundary_serialization_contract_id": "boundary_acoustic_binary_v12",
+        "start_s": 1.0,
+        "end_s": 2.0,
+        "duration_s": 1.0,
+    }
+    label_row = {
+        **runtime_row,
+        "schema": runtime.SCHEMA,
+        "prompt_version": runtime.PROMPT_VERSION,
+        "model": "omni-model",
+        "label": "keep",
+    }
+    runtime._validate_existing_labels(
+        [label_row], runtime_by_id={"item": runtime_row}, model="omni-model"
+    )
+
+    label_row["semantic_split_weights_sha256"] = "d" * 64
+    with pytest.raises(ValueError, match="semantic_split_weights_sha256 mismatch"):
+        runtime._validate_existing_labels(
+            [label_row], runtime_by_id={"item": runtime_row}, model="omni-model"
+        )
 
 
 def test_training_label_from_omni_maps_to_existing_v10_labels():

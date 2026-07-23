@@ -8,7 +8,7 @@ Scorer v11 当前职责 canonical 已闭合，但仍需针对新音频重新提�
 
 | 模型 | 当前职责 | 合法训练样本 | 审计结论 |
 | --- | --- | --- | --- |
-| Scorer v11 | 高召回连续 candidate-island membership | 完整 source window；同一 ASR 单元内停顿、尾音、短背景和含混人声保留为 `inside_candidate`；仅清晰可安全提前删的背景为 `outside_candidate` | no-tile canonical与held-out 24/24已闭合；train definite比例`inside 89.49% / outside 10.51%`，不预先用重复或loss调权平衡。新raw PTM2048尚未提取，故训练待启动；旧v10数据不可改名复用 |
+| Scorer v11 | 高召回连续 candidate-island membership | 完整 source window；明确/很可能的词语或对白锚点及同一轮连续包络为 `inside_candidate`；明确无词义且可独立安全删除的纯非语义声为 `outside_candidate`；词语与呻吟/噪声无法区分时为 `unsure=-100` | no-tile canonical与held-out 24/24已闭合；train definite比例`inside 89.49% / outside 10.51%`，不预先用重复或loss调权平衡。新raw PTM2048尚未提取，故训练待启动；旧v10数据不可改名复用 |
 | Proposal v1 | 为 Split 枚举高召回非绑定候选 | 当前 Scorer v11/Outer v3 输出中的真实可查询候选；监督目标是候选覆盖，不是最终 cut | 现役 checkpoint 的 labels/feature manifest 已丢失，且 metadata 无 source/core/partition provenance；只能保留为历史候选源，不能复现训练 |
 | Outer v3 | 将完整 candidate island 收成供 Split 查询的 acoustic outer core | 实际 `post_candidate_island_scorer_v11_islands`，真实边缘分布，随机初始化二分类 | trainer 合同已严格，但仓库没有生成这种 row 的 current compiler；registry 仍为空 `pending_outer_v3_audit` |
 | Split v4 | 对 Proposal candidate 做 `cut/continue` 二分类 | 当前 Scorer v11→Proposal→Outer v3 的 candidate query、局部 bins/scalar 和完整 island context；source/core 固定且同 core 最多一次 | 旧 dataset 缺失；现役 checkpoint含临时 forced-train/repeat/Focal/aux 配置。新入口已禁止临时分区、重复 core 和旧 runtime 数据伪装，默认回到 neutral CE baseline |

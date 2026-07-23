@@ -5,10 +5,11 @@ import argparse
 import copy
 import hashlib
 import json
+import os
+import random
 import sys
 import time
 from collections import Counter, defaultdict
-from functools import lru_cache
 from pathlib import Path
 
 import numpy as np
@@ -37,6 +38,49 @@ from tools.boundary.ja.edge_frame_dataset import (  # noqa: E402
 
 PARTITIONS = ("train", "val", "test")
 INNER_INPUT_DISTRIBUTION = "post_cueqc_v13_keep_subislands"
+
+
+def _sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for block in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def _torch_save_atomic(payload: object, path: Path) -> None:
+    import torch
+
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    try:
+        torch.save(payload, temporary)
+        temporary.replace(path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def _write_json_atomic(path: Path, payload: dict[str, object]) -> None:
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    try:
+        with temporary.open("w", encoding="utf-8", newline="\n") as handle:
+            handle.write(json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True))
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        temporary.replace(path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def _seed_everything(seed: int, torch) -> None:
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+    if hasattr(torch.backends, "cudnn"):
+        torch.backends.cudnn.benchmark = False
+        torch.backends.cudnn.deterministic = True
 
 
 def validate_dataset_rows(rows: list[dict]) -> dict[str, object]:
@@ -92,19 +136,41 @@ def validate_dataset_rows(rows: list[dict]) -> dict[str, object]:
     }
 
 
-@lru_cache(maxsize=64)
 def load_source_features(path: str) -> tuple[np.ndarray, np.ndarray]:
-    with np.load(path) as source:
-        return source["ptm"].astype(np.float32), source["mfcc"].astype(np.float32)
+    with np.load(path, allow_pickle=False) as source:
+        if "ptm" not in source.files or "mfcc" not in source.files:
+            raise ValueError(f"Inner v2 source features require ptm/mfcc arrays: {path}")
+        ptm = np.asarray(source["ptm"], dtype=np.float32)
+        mfcc = np.asarray(source["mfcc"], dtype=np.float32)
+    if ptm.ndim != 2 or mfcc.ndim != 2 or ptm.shape[0] <= 0:
+        raise ValueError(f"Inner v2 source features must be non-empty 2D arrays: {path}")
+    if ptm.shape[0] != mfcc.shape[0]:
+        raise ValueError(f"Inner v2 source PTM/MFCC frame counts differ: {path}")
+    if not np.isfinite(ptm).all() or not np.isfinite(mfcc).all():
+        raise ValueError(f"Inner v2 source features contain non-finite values: {path}")
+    return ptm, mfcc
 
 
-def load_binary(row: dict):
+def load_binary(
+    row: dict,
+    *,
+    expected_ptm_dim: int | None = None,
+    expected_mfcc_dim: int | None = None,
+):
     if row.get("label_path"):
         ptm, mfcc = load_source_features(str(row["source_feature_path"]))
-        with np.load(row["label_path"]) as payload:
+        if expected_ptm_dim is not None and ptm.shape[1] != expected_ptm_dim:
+            raise ValueError(f"Inner v2 raw PTM width mismatch: {row.get('row_id')}")
+        if expected_mfcc_dim is not None and mfcc.shape[1] != expected_mfcc_dim:
+            raise ValueError(f"Inner v2 MFCC width mismatch: {row.get('row_id')}")
+        with np.load(row["label_path"], allow_pickle=False) as payload:
+            if "labels" not in payload.files:
+                raise ValueError(f"Inner v2 label payload is missing labels: {row.get('row_id')}")
             labels = payload["labels"].astype(np.int64)
         start = int(row["start_frame"])
         end = int(row["end_frame"])
+        if labels.ndim != 1 or start < 0 or end <= start or end > ptm.shape[0]:
+            raise ValueError(f"Inner v2 feature/label coordinates are invalid: {row.get('row_id')}")
         ptm = ptm[start:end]
         mfcc = mfcc[start:end]
         lengths = {len(ptm), len(mfcc), len(labels)}
@@ -125,9 +191,28 @@ def load_binary(row: dict):
             )
             auxiliary.append(np.clip(acoustic_position, -1.0, 2.0).reshape(-1, 1))
         features = np.concatenate((ptm[:total], mfcc[:total], *auxiliary), axis=1)
-        return features, canonical_to_binary_labels(labels[:total]), np.ones(total, dtype=np.float32)
-    features, canonical, weights = load_edge_row(row)
-    return features, canonical_to_binary_labels(canonical), weights
+        weights = np.ones(total, dtype=np.float32)
+        binary = canonical_to_binary_labels(labels[:total])
+    else:
+        features, canonical, weights = load_edge_row(row)
+        features = np.asarray(features, dtype=np.float32)
+        weights = np.asarray(weights, dtype=np.float32)
+        binary = canonical_to_binary_labels(canonical)
+        if expected_ptm_dim is not None and expected_mfcc_dim is not None:
+            minimum_width = expected_ptm_dim + expected_mfcc_dim + 1
+            if features.ndim != 2 or features.shape[1] < minimum_width:
+                raise ValueError(f"Inner v2 frame feature width mismatch: {row.get('row_id')}")
+    if features.ndim != 2 or features.shape[0] <= 0:
+        raise ValueError(f"Inner v2 frame features must be non-empty 2D: {row.get('row_id')}")
+    if binary.ndim != 1 or weights.ndim != 1:
+        raise ValueError(f"Inner v2 labels/weights must be 1D: {row.get('row_id')}")
+    if len({features.shape[0], binary.shape[0], weights.shape[0]}) != 1:
+        raise ValueError(f"Inner v2 feature/label/weight lengths differ: {row.get('row_id')}")
+    if not np.isfinite(features).all() or not np.isfinite(weights).all():
+        raise ValueError(f"Inner v2 features or weights contain non-finite values: {row.get('row_id')}")
+    if np.any(weights < 0.0):
+        raise ValueError(f"Inner v2 source weights must be non-negative: {row.get('row_id')}")
+    return features, binary, weights
 
 
 def compute_normalization(rows: list[dict]) -> dict[str, list[float]]:
@@ -136,14 +221,18 @@ def compute_normalization(rows: list[dict]) -> dict[str, list[float]]:
     square_sum = np.zeros(first.shape[1], dtype=np.float64)
     frame_count = 0
     for row in rows:
-        features, labels, _weights = load_binary(row)
-        valid = labels != BINARY_EDGE_IGNORE_INDEX
+        features, labels, weights = load_binary(row)
+        if features.shape[1] != feature_sum.shape[0]:
+            raise ValueError("Inner v2 feature width changes across dataset rows")
+        valid = (labels != BINARY_EDGE_IGNORE_INDEX) & (weights > 0.0)
         values = features[valid].astype(np.float64)
         feature_sum += values.sum(axis=0)
         square_sum += np.square(values).sum(axis=0)
         frame_count += len(values)
-    mean = feature_sum / max(frame_count, 1)
-    variance = square_sum / max(frame_count, 1) - np.square(mean)
+    if frame_count <= 0:
+        raise ValueError("Inner v2 train partition has no weighted definite frames")
+    mean = feature_sum / frame_count
+    variance = square_sum / frame_count - np.square(mean)
     return {
         "feature_mean": mean.astype(np.float32).tolist(),
         "feature_std": np.sqrt(np.maximum(variance, 1e-6)).astype(np.float32).tolist(),
@@ -159,13 +248,13 @@ def evaluate(model, rows, normalization, device, tolerance_frames: int) -> dict:
     model.eval()
     with torch.inference_mode():
         for row in rows:
-            features, labels, _weights = load_binary(row)
-            truth = np.flatnonzero(labels == 1)
+            features, labels, weights = load_binary(row)
+            valid = (labels != BINARY_EDGE_IGNORE_INDEX) & (weights > 0.0)
+            truth = np.flatnonzero((labels == 1) & valid)
             if not truth.size:
                 continue
             logits = model(torch.from_numpy(normalize_edge_features(features, normalization)).unsqueeze(0).to(device))[0].cpu().numpy()
             predicted = np.argmax(logits, axis=1)
-            valid = labels != BINARY_EDGE_IGNORE_INDEX
             tp += int(np.sum((predicted[valid] == 1) & (labels[valid] == 1)))
             fp += int(np.sum((predicted[valid] == 1) & (labels[valid] == 0)))
             fn += int(np.sum((predicted[valid] == 0) & (labels[valid] == 1)))
@@ -194,6 +283,11 @@ def run(args: argparse.Namespace) -> dict:
     import torch.nn.functional as F
 
     apply_vram_safety_cap(0.95)
+    if args.max_steps <= 0 or args.eval_interval <= 0:
+        raise ValueError("Inner v2 max_steps/eval_interval must be positive")
+    if args.frame_hop_s <= 0.0 or args.tolerance_s < 0.0:
+        raise ValueError("Inner v2 frame_hop_s must be positive and tolerance non-negative")
+    _seed_everything(int(args.seed), torch)
     rows = read_edge_rows(Path(args.dataset_manifest))
     dataset_summary = validate_dataset_rows(rows)
     train_rows = [row for row in rows if str(row.get("partition")) == "train"]
@@ -201,8 +295,23 @@ def run(args: argparse.Namespace) -> dict:
     test_rows = [row for row in rows if str(row.get("partition")) == "test"]
     if not train_rows or not val_rows or not test_rows:
         raise ValueError("Inner v2 requires fixed train/val/test partitions")
+    expected_width: int | None = None
+    for row in rows:
+        features, _labels, _weights = load_binary(
+            row,
+            expected_ptm_dim=args.raw_ptm_dim,
+            expected_mfcc_dim=args.mfcc_dim,
+        )
+        if expected_width is None:
+            expected_width = int(features.shape[1])
+        elif int(features.shape[1]) != expected_width:
+            raise ValueError("Inner v2 feature width changes across dataset rows")
     normalization = compute_normalization(train_rows)
-    first, _labels, _weights = load_binary(train_rows[0])
+    first, _labels, _weights = load_binary(
+        train_rows[0],
+        expected_ptm_dim=args.raw_ptm_dim,
+        expected_mfcc_dim=args.mfcc_dim,
+    )
     position_dim = int(first.shape[1]) - args.raw_ptm_dim - args.mfcc_dim
     model_config = {
         "ptm_input_dim": args.raw_ptm_dim, "ptm_projected_dim": args.projected_ptm_dim,
@@ -213,6 +322,8 @@ def run(args: argparse.Namespace) -> dict:
     if position_dim <= 0:
         raise ValueError("Inner v2 frame feature dimension mismatch")
     device = torch.device(args.device)
+    if device.type == "cuda" and not torch.cuda.is_available():
+        raise RuntimeError("Inner v2 requested CUDA but CUDA is unavailable")
     model = BinaryFrameEdgeNetwork(**model_config).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.learning_rate, weight_decay=args.weight_decay)
     rng = np.random.default_rng(args.seed)
@@ -238,7 +349,7 @@ def run(args: argparse.Namespace) -> dict:
         row = train_rows[int(train_order[train_position])]
         train_position += 1
         features, labels, source_weights = load_binary(row)
-        valid = labels != BINARY_EDGE_IGNORE_INDEX
+        valid = (labels != BINARY_EDGE_IGNORE_INDEX) & (source_weights > 0.0)
         if not np.any(valid):
             continue
         model.train()
@@ -251,7 +362,7 @@ def run(args: argparse.Namespace) -> dict:
         weights = torch.from_numpy(
             source_weights.astype(np.float32) * class_weights
         ).to(device)
-        valid_t = target != BINARY_EDGE_IGNORE_INDEX
+        valid_t = (target != BINARY_EDGE_IGNORE_INDEX) & (weights > 0.0)
         loss = (ce[valid_t] * weights[valid_t]).sum() / weights[valid_t].sum().clamp_min(1e-6)
         optimizer.zero_grad(set_to_none=True); loss.backward(); optimizer.step()
         if step % args.eval_interval == 0 or step == args.max_steps:
@@ -263,18 +374,22 @@ def run(args: argparse.Namespace) -> dict:
     if best_state is None:
         raise RuntimeError("Inner v2 produced no checkpoint")
     model.load_state_dict(best_state)
-    train = evaluate(model, train_rows, normalization, device, 15)
-    val = evaluate(model, val_rows, normalization, device, 15); test = evaluate(model, test_rows, normalization, device, 15)
+    tolerance_frames = int(round(args.tolerance_s / args.frame_hop_s))
+    train = evaluate(model, train_rows, normalization, device, tolerance_frames)
+    val = evaluate(model, val_rows, normalization, device, tolerance_frames)
+    test = evaluate(model, test_rows, normalization, device, tolerance_frames)
     out = Path(args.output_dir); out.mkdir(parents=True, exist_ok=True)
     checkpoint = out / f"inner_edge_refiner_v2.{qwen_asr_repo_tag(QWEN_ASR_17B_REPO_ID)}.pt"
-    torch.save(build_inner_edge_refiner_v2_checkpoint(
+    checkpoint_payload = build_inner_edge_refiner_v2_checkpoint(
         model=model, model_config=model_config,
         feature_config={"raw_ptm_dim": args.raw_ptm_dim, "learned_ptm_projected_dim": args.projected_ptm_dim, "mfcc_dim": args.mfcc_dim, "relative_position_dim": position_dim, "frame_hop_s": args.frame_hop_s, "acoustic_refinement": True},
         normalization=normalization,
-        metadata={"ptm_repo_id": QWEN_ASR_17B_REPO_ID, "dataset_manifest": args.dataset_manifest, "dataset_summary": dataset_summary, "input_distribution": INNER_INPUT_DISTRIBUTION, "trained_steps": args.max_steps, "best_step": best_step, "canonical_label_counts": dict(counts), "excluded_training_count": int(counts["unsure"]), "training_initialization": "random", "checkpoint_selection": "val_inner_acoustic_edge_300ms_coverage_v1", "class_weights": {"background": float(args.background_weight), "semantic_core": float(args.semantic_weight)}, "acoustic_refinement": True, "feeds_asr": True},
-    ), checkpoint)
-    summary = {"schema": "inner_edge_refiner_v2_binary_training_summary_v1", "checkpoint": str(checkpoint), "checkpoint_sha256": hashlib.sha256(checkpoint.read_bytes()).hexdigest(), "best_step": best_step, "train": train, "val": val, "test": test, "canonical_label_counts": dict(counts), "excluded_training_count": int(counts["unsure"]), "gate_pass": min(val["start_coverage"], val["end_coverage"], test["start_coverage"], test["end_coverage"]) >= 0.95 and not train["all_background_count"] and not val["all_background_count"] and not test["all_background_count"], "acoustic_refinement": True, "feeds_asr": True, "elapsed_s": time.monotonic() - started}
-    (out / "summary.json").write_text(json.dumps(summary, ensure_ascii=False, indent=2, sort_keys=True), encoding="utf-8")
+        metadata={"ptm_repo_id": QWEN_ASR_17B_REPO_ID, "dataset_manifest": args.dataset_manifest, "dataset_manifest_sha256": _sha256(Path(args.dataset_manifest)), "dataset_summary": dataset_summary, "input_distribution": INNER_INPUT_DISTRIBUTION, "upstream_cueqc_checkpoint_sha256": dataset_summary["cueqc_checkpoint_sha256"], "trained_steps": args.max_steps, "best_step": best_step, "canonical_label_counts": dict(counts), "excluded_training_count": int(counts["unsure"]), "training_initialization": "random", "checkpoint_selection": "val_inner_acoustic_edge_tolerance_v2", "evaluation_tolerance_s": float(args.tolerance_s), "evaluation_tolerance_frames": tolerance_frames, "class_weights": {"background": float(args.background_weight), "semantic_core": float(args.semantic_weight)}, "acoustic_refinement": True, "feeds_asr": True, "promotion_ready": False},
+    )
+    _torch_save_atomic(checkpoint_payload, checkpoint)
+    numeric_gate_pass = min(val["start_coverage"], val["end_coverage"], test["start_coverage"], test["end_coverage"]) >= 0.95 and not train["all_background_count"] and not val["all_background_count"] and not test["all_background_count"]
+    summary = {"schema": "inner_edge_refiner_v2_binary_training_summary_v2", "checkpoint": str(checkpoint), "checkpoint_sha256": _sha256(checkpoint), "best_step": best_step, "train": train, "val": val, "test": test, "dataset": dataset_summary, "dataset_manifest_sha256": _sha256(Path(args.dataset_manifest)), "upstream_cueqc_checkpoint_sha256": dataset_summary["cueqc_checkpoint_sha256"], "canonical_label_counts": dict(counts), "excluded_training_count": int(counts["unsure"]), "evaluation_tolerance_s": float(args.tolerance_s), "evaluation_tolerance_frames": tolerance_frames, "numeric_gate_pass": bool(numeric_gate_pass), "gate_pass": False, "promotion_ready": False, "manual_zero_clipping_gate": "required_before_promotion", "acoustic_refinement": True, "feeds_asr": True, "elapsed_s": time.monotonic() - started}
+    _write_json_atomic(out / "summary.json", summary)
     print(json.dumps(summary, ensure_ascii=False)); return summary
 
 

@@ -343,11 +343,52 @@ def _export_boundary_features(
             "resumed": True,
         }
     feature_dir.mkdir(parents=True, exist_ok=True)
-    os.environ["BOUNDARY_CACHE_ENABLED"] = "0"
-    os.environ["PRE_ASR_CUEQC_ENABLED"] = "0"
-    os.environ["SEMANTIC_SPLIT_FEATURE_EXPORT_PATH"] = str(split_path)
-    os.environ["SPEECH_ISLAND_FEATURE_EXPORT_PATH"] = str(speech_path)
-    spans = _build_processing_spans(str(wav_path))
+    temporary_split = feature_dir / f".semantic_split_features.{os.getpid()}.npz"
+    temporary_split_metadata = temporary_split.with_suffix(".jsonl")
+    temporary_speech = feature_dir / f".speech_sequence_features.{os.getpid()}.npz"
+    environment_keys = (
+        "BOUNDARY_CACHE_ENABLED",
+        "PRE_ASR_CUEQC_ENABLED",
+        "SEMANTIC_SPLIT_FEATURE_EXPORT_PATH",
+        "SPEECH_ISLAND_FEATURE_EXPORT_PATH",
+    )
+    previous_environment = {key: os.environ.get(key) for key in environment_keys}
+    try:
+        for path in (temporary_split, temporary_split_metadata, temporary_speech):
+            path.unlink(missing_ok=True)
+        os.environ["BOUNDARY_CACHE_ENABLED"] = "0"
+        os.environ["PRE_ASR_CUEQC_ENABLED"] = "0"
+        os.environ["SEMANTIC_SPLIT_FEATURE_EXPORT_PATH"] = str(temporary_split)
+        os.environ["SPEECH_ISLAND_FEATURE_EXPORT_PATH"] = str(temporary_speech)
+        spans = _build_processing_spans(str(wav_path))
+        missing = [
+            str(path)
+            for path in (temporary_split, temporary_split_metadata)
+            if not path.is_file()
+        ]
+        if missing:
+            raise RuntimeError(
+                "current Boundary runtime did not export Semantic Split candidate "
+                f"features/metadata: {missing}. The post-Scorer v11 -> Proposal -> "
+                "Outer v3 Split training exporter is still pending; this run is "
+                "audit-only and cannot generate training-ready data."
+            )
+        if not temporary_speech.is_file():
+            raise RuntimeError(
+                "current Boundary runtime did not export the requested raw PTM/MFCC "
+                "speech sequence feature sidecar"
+            )
+        os.replace(temporary_split, split_path)
+        os.replace(temporary_split_metadata, split_path.with_suffix(".jsonl"))
+        os.replace(temporary_speech, speech_path)
+    finally:
+        for key, value in previous_environment.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+        for path in (temporary_split, temporary_split_metadata, temporary_speech):
+            path.unlink(missing_ok=True)
     candidates = _pre_asr_candidates_for_spans(str(wav_path), spans)
     _write_jsonl(candidates_path, candidates)
     audit_rows: list[dict[str, Any]] = []

@@ -1,5 +1,10 @@
 #!/usr/bin/env python3
-"""Compile one semantic-timeline corpus into model-specific training manifests."""
+"""Compile legacy semantic-timeline views for audit/inventory only.
+
+One teacher response cannot provide current-duty truth for Scorer, Outer,
+Split, CueQC and Inner simultaneously.  The emitted views remain useful for
+provenance review, but current trainers must reject them.
+"""
 from __future__ import annotations
 
 import argparse
@@ -86,6 +91,8 @@ def compile_views(
             "partition_key": str(row.get("source") or row["sample_id"]),
             "teacher_schema": SCHEMA,
             "teacher_prompt_version": PROMPT_VERSION,
+            "inventory_only": True,
+            "training_manifest_allowed": False,
         }
         scorer = row["scorer_view"]
         scorer_rows.append(
@@ -156,7 +163,13 @@ def compile_views(
         "source_cap": max_sources,
         "counts": counts,
         "teacher_gate_approved": all_approved,
-        "training_ready": all_approved,
+        "status": "legacy_inventory_only",
+        "training_manifest_allowed": False,
+        "training_ready": False,
+        "training_blocker": (
+            "one semantic-timeline teacher response is not current-duty truth "
+            "for multiple boundary models"
+        ),
         "inner_training_ready": False,
         "inner_blocker": "candidate safe-zone labels have not been produced",
         "cueqc_status": "deferred_until_new_boundary_chunks_are_exported",

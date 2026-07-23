@@ -25,7 +25,12 @@ def _bundle(
         "training_manifest_allowed": True,
         "semantic_split_weights_sha256": "a" * 64,
         "inner_edge_refiner_weights_sha256": "b" * 64,
-        "rows": [{"id": row_id}],
+        "rows": [
+            {
+                "id": row_id,
+                "source_core_ids": [core_id or f"core-{row_id}"],
+            }
+        ],
         "groups": [
             {
                 "group_index": 0,
@@ -112,3 +117,39 @@ def test_merge_rejects_duplicate_semantic_core(tmp_path: Path) -> None:
                 output=str(tmp_path / "merged.pt"),
             )
         )
+
+
+def test_merge_accepts_group_with_more_unique_cores_than_chunks(
+    tmp_path: Path,
+) -> None:
+    torch = pytest.importorskip("torch")
+    source = tmp_path / "source.pt"
+    bundle = _bundle(
+        torch,
+        source_id="s",
+        partition="train",
+        row_id="a",
+        core_id="core-a",
+    )
+    bundle["rows"] = [
+        {"id": "a", "source_core_ids": ["core-a", "core-b"]},
+        {"id": "b", "source_core_ids": ["core-c"]},
+    ]
+    bundle["groups"][0]["row_ids"] = ["a", "b"]
+    bundle["groups"][0]["source_core_ids"] = ["core-a", "core-b", "core-c"]
+    bundle["scalar_features"] = torch.zeros((1, 2, 1))
+    bundle["ptm_bins"] = torch.zeros((1, 2, 2, 3))
+    bundle["bin_mask"] = torch.ones((1, 2, 2))
+    bundle["chunk_mask"] = torch.ones((1, 2))
+    bundle["labels"] = torch.zeros((1, 2), dtype=torch.long)
+    torch.save(bundle, source)
+
+    output = tmp_path / "merged.pt"
+    run(argparse.Namespace(features=[str(source)], output=str(output)))
+
+    merged = torch.load(output, map_location="cpu", weights_only=False)
+    assert merged["groups"][0]["source_core_ids"] == [
+        "core-a",
+        "core-b",
+        "core-c",
+    ]

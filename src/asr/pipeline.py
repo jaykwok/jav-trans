@@ -4,7 +4,7 @@ import hashlib
 import json
 import os
 import time
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Callable
 
@@ -71,6 +71,18 @@ _PRE_ASR_EXPORT_OVERWRITTEN_PATHS: set[str] = set()
 _JSON_PAYLOAD_INLINE_ARRAY_LIMIT = 4096
 
 
+@dataclass
+class _BoundaryProcessingContext:
+    """Explicit hand-off from Boundary to the post-CueQC Inner stage."""
+
+    spans: list[tuple[float, float]] | list[PackedChunk]
+    sequence_feature_provider: FrameSequenceFeatureProvider | None
+    inner_checkpoint_path: Path
+    inner_device: str
+    inner_schema: str
+    runtime_boundary_signature: dict
+
+
 def current_asr_chunk_root() -> Path:
     return _chunking_module.current_asr_chunk_root()
 
@@ -113,6 +125,7 @@ def _boundary_config() -> dict:
         or "auto",
         "semantic_split_device": os.getenv("SEMANTIC_SPLIT_DEVICE", "auto").strip() or "auto",
         "inner_edge_refiner_device": os.getenv("INNER_EDGE_REFINER_DEVICE", "auto").strip() or "auto",
+        "inner_execution_order": "post_pre_asr_cueqc_v1",
     }
 
 
@@ -136,6 +149,7 @@ def _sequence_feature_provider_from_result(
     *,
     duration_s: float,
     max_ptm_dims: int | None = None,
+    required_ptm_dim: int | None = None,
 ) -> FrameSequenceFeatureProvider | None:
     if not isinstance(payload, dict):
         return None
@@ -146,6 +160,13 @@ def _sequence_feature_provider_from_result(
     frame_hop_s = payload.get("frame_hop_s")
     if not isinstance(ptm, (list, np.ndarray)) or not isinstance(mfcc, (list, np.ndarray)):
         return None
+    if required_ptm_dim is not None:
+        try:
+            ptm_shape = np.asarray(ptm).shape
+            if len(ptm_shape) != 2 or int(ptm_shape[1]) != int(required_ptm_dim):
+                return None
+        except (TypeError, ValueError):
+            return None
     try:
         hop = float(frame_hop_s)
     except (TypeError, ValueError):
@@ -185,16 +206,23 @@ def _required_sequence_feature_provider_from_result(
     *,
     duration_s: float,
     max_ptm_dims: int | None = None,
+    required_ptm_dim: int | None = None,
 ) -> FrameSequenceFeatureProvider:
     provider = _sequence_feature_provider_from_result(
         payload,
         duration_s=duration_s,
         max_ptm_dims=max_ptm_dims,
+        required_ptm_dim=required_ptm_dim,
     )
     if provider is None:
         raise ValueError(
             "edge_sequence_v2 Boundary Refiner requires "
             f"{FRAME_SEQUENCE_FRAMES_SCHEMA} in SpeechBoundary-JA output"
+            + (
+                f" with raw PTM dimension {int(required_ptm_dim)}"
+                if required_ptm_dim is not None
+                else ""
+            )
         )
     return provider
 
@@ -392,10 +420,32 @@ def _build_processing_spans(
     audio_path: str,
     *,
     on_stage: Callable[[str], None] | None = None,
-) -> list[tuple[float, float]] | list[PackedChunk]:
+    return_context: bool = False,
+) -> (
+    list[tuple[float, float]]
+    | list[PackedChunk]
+    | _BoundaryProcessingContext
+):
     def progress(label: str, current: int, total: int) -> None:
         if on_stage is not None:
             on_stage(f"{label} {current}/{total}")
+
+    def finish(
+        spans: list[tuple[float, float]] | list[PackedChunk],
+        *,
+        sequence_feature_provider: FrameSequenceFeatureProvider | None,
+        runtime_boundary_signature: dict,
+    ):
+        if not return_context:
+            return spans
+        return _BoundaryProcessingContext(
+            spans=spans,
+            sequence_feature_provider=sequence_feature_provider,
+            inner_checkpoint_path=inner_checkpoint_path,
+            inner_device=str(cfg["inner_edge_refiner_device"]),
+            inner_schema=inner_schema,
+            runtime_boundary_signature=runtime_boundary_signature,
+        )
 
     cfg = _boundary_config()
     _set_last_boundary_cache_event(None)
@@ -466,18 +516,62 @@ def _build_processing_spans(
             boundary_config=cfg,
         )
         if cached is not None:
-            progress("边界缓存", 1, 1)
             spans, runtime_boundary_signature, event = cached
-            if on_stage is not None:
-                on_stage("边界缓存命中：已复用完整边界流水线结果")
-            _set_last_boundary_signature(runtime_boundary_signature)
-            _pipeline_logger.info(
-                "[boundary-cache] hit path=%s digest=%s",
-                event["path"],
-                event["digest"],
-            )
-            _set_last_boundary_cache_event(event)
-            return spans
+            if any(
+                isinstance(span, PackedChunk) and span.inner_edge_prediction
+                for span in spans
+            ):
+                _pipeline_logger.warning(
+                    "[boundary-cache] ignored cache containing pre-CueQC Inner "
+                    "predictions path=%s",
+                    event["path"],
+                )
+                cached = None
+            sequence_feature_provider = None
+            if cached is not None and return_context and spans:
+                cached_sequence_features = (
+                    _boundary_cache_module.load_sequence_feature_frames(
+                        event["path"],
+                        expected_binding=dict(
+                            event.get("sequence_feature_binding") or {}
+                        ),
+                        expected_sha256=str(
+                            event.get("sequence_feature_sha256") or ""
+                        ),
+                    )
+                )
+                if cached_sequence_features is None:
+                    _pipeline_logger.warning(
+                        "[boundary-cache] ignored provisional cache without "
+                        "post-CueQC Inner feature sidecar path=%s",
+                        event["path"],
+                    )
+                    cached = None
+                else:
+                    sequence_feature_provider = (
+                        _required_sequence_feature_provider_from_result(
+                            cached_sequence_features,
+                            duration_s=_get_wav_duration(audio_path),
+                            max_ptm_dims=2048,
+                            required_ptm_dim=2048,
+                        )
+                    )
+            if cached is not None:
+                progress("边界缓存", 1, 1)
+                if on_stage is not None:
+                    on_stage("边界缓存命中：已复用 provisional sub-islands 与原始帧特征")
+                _set_last_boundary_signature(runtime_boundary_signature)
+                _pipeline_logger.info(
+                    "[boundary-cache] hit path=%s digest=%s",
+                    event["path"],
+                    event["digest"],
+                )
+                _set_last_boundary_cache_event(event)
+                return finish(
+                    spans,
+                    sequence_feature_provider=sequence_feature_provider,
+                    runtime_boundary_signature=runtime_boundary_signature,
+                )
 
         progress("边界缓存", 1, 1)
         progress("语音岛检测", 0, 1)
@@ -503,6 +597,7 @@ def _build_processing_spans(
         sequence_feature_frames,
         duration_s=result.audio_duration_sec,
         max_ptm_dims=2048,
+        required_ptm_dim=2048,
     )
     speech_feature_export_path = os.getenv(
         "SPEECH_ISLAND_FEATURE_EXPORT_PATH", ""
@@ -590,27 +685,10 @@ def _build_processing_spans(
         refined = []
         split_verifier = None
         _release_boundary_model_stage("split_released")
-
-    inner_refiner = load_inner_edge_refiner_v2(
-        inner_checkpoint_path,
-        device=cfg["inner_edge_refiner_device"],
-        expected_ptm_repo_id=_current_asr_backend(),
-    )
-    try:
-        inner_signature = inner_refiner.signature()
-        _pipeline_logger.info(
-            "[boundary] inner model requested=%s actual=%s",
-            cfg["inner_edge_refiner_device"],
-            getattr(inner_refiner, "device", "unknown"),
+    if any(chunk.inner_edge_prediction for chunk in packed):
+        raise ValueError(
+            "provisional sub-islands must not contain Inner predictions before CueQC"
         )
-        packed = annotate_inner_edge_predictions(
-            packed,
-            feature_provider=sequence_feature_provider,
-            inner_refiner=inner_refiner,
-        ) if packed else []
-    finally:
-        inner_refiner = None
-        _release_boundary_model_stage("inner_released")
 
     runtime_boundary_signature = {
         **result_parameters,
@@ -633,7 +711,11 @@ def _build_processing_spans(
             },
             "outer_edge_refiner": outer_signature,
             "semantic_split_model": split_signature,
-            "inner_edge_refiner": inner_signature,
+            "inner_edge_refiner": {
+                "schema": inner_schema,
+                "status": "deferred_until_post_pre_asr_cueqc_keep",
+                "execution_order": cfg["inner_execution_order"],
+            },
             "sequence_feature_provider": sequence_feature_provider.signature(),
             "semantic_boundary_config": {"decision_mode": "argmax_cut"},
         },
@@ -656,7 +738,11 @@ def _build_processing_spans(
                 event["digest"],
             )
             _set_last_boundary_cache_event(event)
-        return []
+        return finish(
+            [],
+            sequence_feature_provider=None,
+            runtime_boundary_signature=runtime_boundary_signature,
+        )
     packed = _annotate_scorer_stats_on_packed_chunks(
         packed,
         frame_scores=frame_scores,
@@ -677,6 +763,7 @@ def _build_processing_spans(
         runtime_boundary_signature=runtime_boundary_signature,
         speech_segments=result.segments,
         speech_groups=result.groups,
+        sequence_feature_frames=sequence_feature_frames,
     )
     if event is not None:
         _pipeline_logger.info(
@@ -685,7 +772,84 @@ def _build_processing_spans(
             event["digest"],
         )
         _set_last_boundary_cache_event(event)
-    return packed
+    return finish(
+        packed,
+        sequence_feature_provider=sequence_feature_provider,
+        runtime_boundary_signature=runtime_boundary_signature,
+    )
+
+
+def _run_inner_after_pre_asr_cueqc(
+    context: _BoundaryProcessingContext,
+    spans: list[tuple[float, float]] | list[PackedChunk],
+    *,
+    on_stage: Callable[[str], None] | None = None,
+) -> tuple[list[tuple[float, float]] | list[PackedChunk], dict | None]:
+    """Run Inner only on CueQC-kept provisional sub-islands, then apply it."""
+
+    def update_signature(inner_signature: dict) -> None:
+        runtime_signature = dict(context.runtime_boundary_signature)
+        pipeline_signature = dict(runtime_signature.get("boundary_pipeline") or {})
+        pipeline_signature["inner_edge_refiner"] = dict(inner_signature)
+        pipeline_signature["inner_input"] = "post_pre_asr_cueqc_keep_subislands"
+        runtime_signature["boundary_pipeline"] = pipeline_signature
+        context.runtime_boundary_signature = runtime_signature
+        _set_last_boundary_signature(runtime_signature)
+
+    if not spans:
+        context.sequence_feature_provider = None
+        update_signature(
+            {
+                "schema": context.inner_schema,
+                "status": "skipped_no_cueqc_keep_subislands",
+                "input_count": 0,
+            }
+        )
+        return spans, None
+    if not all(isinstance(span, PackedChunk) for span in spans):
+        raise ValueError("post-CueQC Inner requires current PackedChunk sub-islands")
+    if context.sequence_feature_provider is None:
+        raise ValueError(
+            "post-CueQC Inner requires the explicit raw PTM/MFCC feature context"
+        )
+
+    if on_stage is not None:
+        on_stage("Inner acoustic semantic core 0/1")
+    inner_refiner = None
+    memory_after_release: dict | None = None
+    try:
+        inner_refiner = load_inner_edge_refiner_v2(
+            context.inner_checkpoint_path,
+            device=context.inner_device,
+            expected_ptm_repo_id=_current_asr_backend(),
+        )
+        inner_signature = inner_refiner.signature()
+        _pipeline_logger.info(
+            "[boundary] post-CueQC inner model requested=%s actual=%s kept=%s",
+            context.inner_device,
+            getattr(inner_refiner, "device", "unknown"),
+            len(spans),
+        )
+        predicted = annotate_inner_edge_predictions(
+            spans,
+            feature_provider=context.sequence_feature_provider,
+            inner_refiner=inner_refiner,
+        )
+    finally:
+        inner_refiner = None
+        context.sequence_feature_provider = None
+        memory_after_release = _release_boundary_model_stage("inner_released")
+    update_signature(
+        {
+            **inner_signature,
+            "execution_order": "post_pre_asr_cueqc_v1",
+            "input": "cueqc_keep_only",
+            "input_count": len(spans),
+        }
+    )
+    if on_stage is not None:
+        on_stage("Inner acoustic semantic core 1/1")
+    return apply_binary_inner_edges_after_cueqc(predicted), memory_after_release
 
 
 def _span_boundaries(
@@ -1552,6 +1716,7 @@ def _transcribe_and_align_local(
     transcript_chunks: list[dict] = []
     pre_asr_cueqc_report: dict = _pre_asr_cueqc_module.runtime_signature()
     chunk_dir: Path | None = None
+    boundary_context: _BoundaryProcessingContext | None = None
     total_started = time.perf_counter()
     _record_cuda_memory(log, cuda_memory, "asr_start", elapsed_s=0.0)
 
@@ -1564,7 +1729,14 @@ def _transcribe_and_align_local(
             action="load",
             on_stage=on_stage,
         )
-        chunk_spans = _build_processing_spans(audio_path, on_stage=on_stage)
+        boundary_context = _build_processing_spans(
+            audio_path,
+            on_stage=on_stage,
+            return_context=True,
+        )
+        if not isinstance(boundary_context, _BoundaryProcessingContext):
+            raise TypeError("Boundary pipeline did not return its post-CueQC context")
+        chunk_spans = boundary_context.spans
         cuda_memory.extend(dict(row) for row in _LAST_BOUNDARY_STAGE_MEMORY)
         _release_stage_gpu_cache(
             log,
@@ -1585,8 +1757,13 @@ def _transcribe_and_align_local(
         cueqc_release_memory = pre_asr_cueqc_report.get("memory_after_release")
         if isinstance(cueqc_release_memory, dict):
             cuda_memory.append(dict(cueqc_release_memory))
-        if chunk_spans and all(isinstance(span, PackedChunk) for span in chunk_spans):
-            chunk_spans = apply_binary_inner_edges_after_cueqc(chunk_spans)
+        chunk_spans, inner_release_memory = _run_inner_after_pre_asr_cueqc(
+            boundary_context,
+            chunk_spans,
+            on_stage=on_stage,
+        )
+        if isinstance(inner_release_memory, dict):
+            cuda_memory.append(dict(inner_release_memory))
         pre_asr_candidates = _pre_asr_candidates_with_decisions(
             pre_asr_candidates,
             pre_asr_cueqc_report,
@@ -1956,6 +2133,11 @@ def _transcribe_and_align_local(
         })
         return segments, log, details
     finally:
+        if boundary_context is not None:
+            # The provider owns raw PTM/MFCC arrays and must not survive an
+            # exceptional CueQC/Inner path into the next workflow stage.
+            boundary_context.sequence_feature_provider = None
+            gc.collect()
         if (
             chunk_dir is not None
             and chunk_dir.exists()

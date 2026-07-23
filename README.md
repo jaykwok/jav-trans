@@ -22,7 +22,7 @@ jav-trans 是一个面向 Windows + NVIDIA 显卡的本地 JAV 字幕生成工�
 
 当前设计把职责拆开：
 
-- Candidate-island Scorer v11 以高召回判断连续波形是否应继续进入下游；含混人声与同一 ASR 单元内短停顿优先保留，不在入口承担最终语义 drop。
+- Candidate-island Scorer v11 以高召回保留明确或很可能含词语/对白的连续波形包络；可独立安全删除的明确纯非语义声音属于 `outside_candidate`，词语与呻吟/噪声无法区分时保留为 teacher/canonical `unsure=-100`，不把所有 vocal activity 自动送给下游。
 - Outer Edge Refiner v3 预留为整条 island 的二分类 acoustic outer-core 模型；schema/runtime/trainer plumbing 已完成审计，但实际 post-Scorer-v11 数据、训练和人工 gate 未完成，registry 仍为空。
 - Acoustic Split v4 只学习 `cut/continue`，按二分类 argmax 生成内部 event，不输出最终边缘；teacher/data 层的 `unsure` 仅用于审计并从训练排除。
 - Pre-ASR CueQC v13 对 provisional sub-island 做 `keep/drop` 二分类 argmax 路由；teacher/data 层可以保留 `unsure`，但模型不会输出它。
@@ -43,7 +43,7 @@ jav-trans 是一个面向 Windows + NVIDIA 显卡的本地 JAV 字幕生成工�
 
 - Windows 10/11。
 - NVIDIA 独立显卡和较新的驱动。
-- Python 3.13+。
+- Python 3.14+（与 `pyproject.toml` 的运行时约束一致）。
 - FFmpeg Shared（TorchCodec 需要 FFmpeg 共享 DLL），并确保命令行能直接执行 `ffmpeg`。
 - Git。
 
@@ -71,9 +71,7 @@ git clone https://github.com/jaykwok/jav-trans.git
 cd jav-trans
 
 uv venv
-uv pip install --upgrade pip
-uv pip install torch torchaudio --index-url https://download.pytorch.org/whl/cu128
-uv pip install -r requirements.txt
+uv sync
 ```
 
 Qwen3-ASR 原生支持要求 `transformers>=5.13.0`（由 `requirements.txt` 安装）。
@@ -120,7 +118,7 @@ Web 会在模型要求检查中提示驱动过旧或 CUDA 初始化失败。
      - 与 normalized MFCC40 拼接后 Linear(2088->256)
      - valid-prefix bidirectional Mamba2(hidden=256) -> Linear(2) -> softmax argmax
      - compact P128/H128 只作为相同数据、seed、steps 的容量对照
-     - 同一 ASR 单元内停顿、尾音和短背景属于 inside_candidate；unsure 仅保留在 canonical 并映射 -100
+     - 同一对白包络内的停顿、尾音和紧贴短背景属于 inside_candidate；独立明确非语义声为 outside_candidate；词语歧义为 unsure=-100
   -> BoundaryProposalScorer v1（候选源审计中）
      - 旧 checkpoint 只作高召回候选源审计参考，不做 final cut decision
      - 必须在晋升后的 Scorer v11 真实输出上重建输入分布并复核候选 recall 后，才能决定保留或重构
@@ -156,7 +154,7 @@ Web 会在模型要求检查中提示驱动过旧或 CUDA 初始化失败。
 - 7 秒是字幕显示 soft guard，不是 ASR chunk 上限。
 - Runtime 不使用具体词黑名单或时长启发式删除短促人声；是否进入 ASR 由 Pre-ASR CueQC 模型标签决定。
 - Scorer v11、Split v4、CueQC v13 与 Inner v2 均只允许二分类 softmax argmax，不读取 runtime threshold，不提供旧三分类 alias 或规则 fallback。Scorer v8/v9/v10 仅保留为离线审计证据；当前 production segment 在 v11 checkpoint 晋升前明确报告 `pending_binary_scorer_audit`。
-- Boundary 阶段按 Outer、Split、Inner、CueQC 的独立生命周期串行释放模型；allocated/reserved/shared VRAM 只写运行诊断，不参与 cache 签名。显式 CUDA 请求不可用时直接报错，不回退 CPU；任何正 shared VRAM spill 都是 soft OOM。
+- Boundary 阶段按 Outer → Split → CueQC → Inner 的真实职责顺序串行加载和释放模型；Inner 只对 CueQC argmax keep 的 provisional sub-islands 推理。Boundary cache 把 provisional chunk JSON 与同一内容签名的 raw PTM/MFCC sidecar 分开保存，缓存命中无需重复提取特征。allocated/reserved/shared VRAM 只写运行诊断，不参与功能判断；显式 CUDA 请求不可用时直接报错，不回退 CPU，任何正 shared VRAM spill 都是 soft OOM。
 - 1.7B Outer registry 当前为空且组件状态仍为 `pending_outer_v3_audit`；完整 Boundary 链会先报告实际首个阻塞点 `pending_binary_scorer_audit`，待 Scorer v11 晋升后才进入 Outer 阶段。
 - 0.6B Boundary registry 当前为空；选择该档会在模型加载前明确报告 `pending_binary_retrain`。
 
@@ -181,7 +179,19 @@ src/checkpoints/
 
 1.7B 的目标 Boundary pipeline 统一使用合同 `boundary_acoustic_binary_v12`：Scorer v11 → Proposal v1 → Outer v3 → Acoustic Split v4 → provisional sub-islands → CueQC v13 → Inner v2 acoustic core → Chunk/ASR。Outer v3 必须等实际 post-Scorer-v11 输出分布训练并通过人工 gate 后才可注册；模型缺失、repo 不匹配、合同不兼容或选择 0.6B 都会直接报错，不提供规则 fallback 或静默迁移。实验指标与版本决策见 [docs/HISTORY.md](docs/HISTORY.md)。
 
-当前训练数据状态：完整 1.7B 链尚不可直接重训，但 Scorer v11 当前职责 canonical 已闭合。train 使用不含重复/tile 的固定唯一 Galgame/NSFW core composite、孤立人声 candidate，以及仅由“Gemini outside + 1.7B ASR 空且无错误”确认的真实 outside；ASR 非空文本不等于语义，只会把区间保留为 `unsure=-100`。val/test 仍是人工完整 source 真值。当前还需针对新 canonical 重新提取 raw PTM2048、重编 window features、随机初始化训练并完成人工 gate；旧 PTM128 和旧 canonical cache 均拒绝。Proposal v1历史训练产物不可复现，Outer v3缺真实 post-Scorer-v11数据 compiler；Split v4、CueQC v13和Inner v2的现役权重只保留为旧链审计/运行参考，其训练 provenance不满足当前固定 source/core/partition合同。完整证据与合法重训顺序见 [1.7B Boundary 训练数据生成链职责审计](docs/audits/20260722_boundary-training-data-generation-audit-v1.md)。
+当前训练数据状态：1.7B Scorer v11 的 no-tile raw PTM2048/MFCC40 数据和 P2048/H256 候选训练已完成，但候选 gate 未通过，registry 仍为空，不能用于生产。下一轮训练必须继续使用固定 source/core/partition、真实 full-source held-out、`unsure=-100` 和 v5 teacher 语义；旧 PTM128、v6 领域提示行和旧多模型 view 均拒绝。Proposal v1 仍只作审计参考，Outer v3 registry 为空并等待 no-Outer/edge-only/current 消融；Split v4、CueQC v13 和 Inner v2 现役权重只作旧链运行参考，不能用 rebind SHA 冒充新 provenance。完整证据与合法重训顺序见 [1.7B Boundary 训练数据生成链职责审计](docs/audits/20260722_boundary-training-data-generation-audit-v1.md)。
+
+Split v4 当前唯一合法训练数据合同是
+`acoustic_split_v4_sequence_dataset_summary_v1`：raw PTM2048 + MFCC40（frame
+width 2088）、当前 candidate scalar schema、固定 `train/val/test` source
+partition，并绑定 Scorer/Proposal/Outer 三个 checkpoint SHA、音频/特征/dataset
+sidecar SHA 和 `boundary_acoustic_binary_v12`。`compile_joint_boundary_preasr_dataset.py`
+与 `merge_semantic_split_datasets.py` 会拒绝旧 row-wise、rehydrate、audit-only
+或缺 summary 的输入；trainer 还会拒绝 CUDA 不可用、非有限值和空监督 batch。
+当前 Runtime 尚未真正实现 `SEMANTIC_SPLIT_FEATURE_EXPORT_PATH` 的 candidate
+feature/metadata 导出，因此准备器会明确 fail-closed；任何 pending 产物都不能
+被标成 training-ready。完整代码审计见
+[20260723 full-code-audit-v2](docs/audits/20260723_full-code-audit-v2.md)。
 
 ---
 
@@ -354,7 +364,7 @@ uv run python -m <module> --help
 
 - `tools.workflows.run_full_workflow`：命令行完整工作流 smoke。
 - `tools.web.smoke.start_server` / `submit_job` / `poll_job` / `summarize_job`：Web 服务 smoke 和任务汇总。
-- `tools.audits.audit_nav` / `serve_audits.ps1` / `serve_audits.sh`：审计页导航与本地服务。
+- `tools.audits.audit_nav` / `serve_audits.ps1`：审计页导航与 Windows 本地服务。
 - `tools.datasets.label_joint_boundary_preasr_with_omni`：实时 Omni 小规模标注。
 - `tools.datasets.batch_joint_boundary_preasr_with_omni`：Omni Batch 全量标注。
 - `tools.workflows.promote_torch_checkpoint`：晋升生产 checkpoint。

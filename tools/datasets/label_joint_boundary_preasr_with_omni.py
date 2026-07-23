@@ -33,7 +33,6 @@ from tools.asr.cueqc.label_pre_asr_with_omni import (  # noqa: E402
 )
 
 
-LEGACY_JOINT_PROMPT_VERSION = "joint_boundary_preasr_omni_v2"
 PROMPT_VERSION = "joint_boundary_preasr_omni_v3_separate"
 JOINT_SCHEMA = "joint_boundary_preasr_omni_label_v1"
 RESPONSE_CACHE_SCHEMA = "omni_response_cache_v1"
@@ -271,65 +270,6 @@ def _sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
-def _build_prompt(
-    split_items: list[dict[str, Any]],
-    chunk_items: list[dict[str, Any]],
-    *,
-    duration_s: float,
-) -> str:
-    split_payload = [
-        {
-            "id": f"s{position:03d}",
-            "time_s": round(float(row["time_s"]), 3),
-            "current": str(row.get("label") or ""),
-            "p_cut": round(float(row.get("p_cut") or 0.0), 4),
-        }
-        for position, row in enumerate(split_items)
-    ]
-    chunk_payload = [
-        {
-            "id": f"p{position:03d}",
-            "start_s": round(float(row["start"]), 3),
-            "end_s": round(float(row["end"]), 3),
-        }
-        for position, row in enumerate(chunk_items)
-    ]
-    return f"""你是日语 ASR 边界与语义声音联合标注器。只听这一个音频，一次完成三类标注。
-音频时间范围为 0.000 到 {duration_s:.3f} 秒；下列时间都相对此音频。
-
-任务 A：逐个判断 split_candidates 的候选切点。
-- cut：左右是可独立送入 ASR/字幕的语义单元，且左右都完整。
-- continue：同一句内部停顿、喘息、拖音、重复、呻吟或短静音；合并更自然。
-- unsure：无法可靠判断。
-- 不要仅因静音、喘息或说话人变化就切。cut 必须同时满足 left_complete=true、right_complete=true、merged_better=false。
-
-任务 A2：报告漏掉的句界。如果音频中存在明显的语义句界，但 split_candidates 里 ±0.30 秒内没有任何候选，
-把它的时间（三位小数）加入 missed_boundaries 并给出 confidence；没有漏掉的句界就返回空数组。
-
-任务 B：逐个判断 runtime_chunks 是否应送入 ASR。
-- keep：至少包含一个可辨认且有词义的日语词或短句。
-- drop：只有喘息、呻吟、呼吸、亲吻、笑声、音乐、静音、环境声或噪声。
-- unsure：无法可靠判断。
-- 重复但有明确词义（例如反复说“ありがとう”）仍是 keep。
-
-必须对输入中的每个 id 恰好返回一次，不得发明 id。为节省输出 token，不写逐项 reason。
-split_candidates={json.dumps(split_payload, ensure_ascii=False, separators=(",", ":"))}
-runtime_chunks={json.dumps(chunk_payload, ensure_ascii=False, separators=(",", ":"))}
-
-只输出 JSON，不要 Markdown：
-{{
-  "split_decisions":[
-    {{"id":"s000","label":"cut|continue|unsure","confidence":0.0,"left_complete":false,"right_complete":false,"merged_better":true,"flags":[]}}
-  ],
-  "missed_boundaries":[
-    {{"time_s":0.000,"confidence":0.0}}
-  ],
-  "chunk_decisions":[
-    {{"id":"p000","label":"keep|drop|unsure","confidence":0.0,"semantic_speech_detected":false,"flags":[]}}
-  ]
-}}"""
-
-
 def _build_split_prompt(
     split_items: list[dict[str, Any]],
     *,
@@ -479,44 +419,6 @@ def _normalize_chunk_decision(
         "semantic_speech_detected": bool(payload.get("semantic_speech_detected")),
         "flags": [str(value) for value in (payload.get("flags") or [])],
     }
-
-
-def _normalize_missed_boundaries(
-    value: Any,
-    *,
-    duration_s: float,
-    confidence_threshold: float,
-) -> list[dict[str, Any]]:
-    """Keep in-window missed-boundary reports; drop junk and low confidence."""
-
-    if not isinstance(value, list):
-        return []
-    rows: list[dict[str, Any]] = []
-    seen: set[int] = set()
-    for item in value:
-        if not isinstance(item, Mapping):
-            continue
-        try:
-            time_s = float(item.get("time_s"))
-        except (TypeError, ValueError):
-            continue
-        if not 0.0 < time_s < duration_s:
-            continue
-        confidence = _confidence(item.get("confidence"))
-        if confidence < confidence_threshold:
-            continue
-        key = int(round(time_s * 1000.0))
-        if key in seen:
-            continue
-        seen.add(key)
-        rows.append(
-            {
-                "time_s": round(time_s, 3),
-                "confidence": confidence,
-                "flags": [str(flag) for flag in (item.get("flags") or [])],
-            }
-        )
-    return sorted(rows, key=lambda row: row["time_s"])
 
 
 def _call_with_retry(
@@ -1153,7 +1055,6 @@ def run(args: argparse.Namespace) -> None:
                 "prepared_request_count": prepared_request_count,
                 "model": model,
                 "prompt_version": PROMPT_VERSION,
-                "legacy_joint_prompt_version": LEGACY_JOINT_PROMPT_VERSION,
                 "request_mode": "separate_single_task",
                 "label_task": args.label_task,
                 **_task_units(args.label_task),
@@ -1230,7 +1131,6 @@ def run(args: argparse.Namespace) -> None:
             "sample_rate": 16000,
             "model": model,
             "prompt_version": PROMPT_VERSION,
-            "legacy_joint_prompt_version": LEGACY_JOINT_PROMPT_VERSION,
             "request_mode": "separate_single_task",
             "label_task": args.label_task,
             **_task_units(args.label_task),

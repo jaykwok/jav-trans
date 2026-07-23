@@ -61,11 +61,11 @@ def _feature_config() -> dict:
 
 def test_cut_runs_emit_one_event_at_highest_probability() -> None:
     decisions = [
-        SplitDecision("continue", 0.1, 0.8, 0.1),
-        SplitDecision("cut", 0.70, 0.2, 0.1),
-        SplitDecision("cut", 0.92, 0.05, 0.03),
+        SplitDecision("continue", 0.1, 0.9, 0.0),
+        SplitDecision("cut", 0.70, 0.30, 0.0),
+        SplitDecision("cut", 0.92, 0.08, 0.0),
         SplitDecision("continue", 0.2, 0.8, 0.0),
-        SplitDecision("cut", 0.81, 0.1, 0.09),
+        SplitDecision("cut", 0.81, 0.19, 0.0),
     ]
     events = aggregate_cut_event_runs(
         candidate_times_s=[1.0, 2.0, 2.2, 2.4, 4.0],

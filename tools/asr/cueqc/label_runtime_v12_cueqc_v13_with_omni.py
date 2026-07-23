@@ -3,7 +3,11 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
+import math
+import os
+import re
 import sys
 import time
 from collections import Counter
@@ -32,6 +36,7 @@ from tools.asr.cueqc.label_pre_asr_with_omni import (
 
 
 SCHEMA = "cueqc_v13_omni_chunk_label_v1"
+RUNTIME_SCHEMA = "runtime_v12_provisional_subisland_v2"
 PROMPT_VERSION = "cueqc_v13_runtime_v12_chunk_text_hint_audio_decision_v4"
 PROMPT = """你是 CueQC v13 的音频标注器。每个音频都是实际 Runtime v12 在 Inner 修边之前导出的独立 provisional chunk。
 
@@ -60,7 +65,18 @@ def _rows(path: Path) -> list[dict[str, Any]]:
     if not path.exists():
         return []
     with path.open("r", encoding="utf-8-sig") as handle:
-        return [json.loads(line) for line in handle if line.strip()]
+        rows: list[dict[str, Any]] = []
+        for line_number, line in enumerate(handle, start=1):
+            if not line.strip():
+                continue
+            try:
+                row = json.loads(line)
+            except json.JSONDecodeError as exc:
+                raise ValueError(f"invalid JSONL at {path}:{line_number}") from exc
+            if not isinstance(row, dict):
+                raise ValueError(f"JSONL row must be an object at {path}:{line_number}")
+            rows.append(row)
+        return rows
 
 
 def _append(path: Path, row: dict[str, Any]) -> None:
@@ -69,23 +85,151 @@ def _append(path: Path, row: dict[str, Any]) -> None:
         handle.write(json.dumps(row, ensure_ascii=False) + "\n")
 
 
-def _validate_runtime_rows(rows: list[dict[str, Any]]) -> None:
+def _sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for block in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def _safe_clip_stem(item_id: str) -> str:
+    """Keep user-controlled IDs out of filesystem path components."""
+
+    clean = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(item_id)).strip("._") or "item"
+    digest = hashlib.sha256(str(item_id).encode("utf-8")).hexdigest()[:12]
+    return f"{clean[:80]}-{digest}"
+
+
+def _source_manifest_by_sample_id(path: Path) -> dict[str, dict[str, Any]]:
+    result: dict[str, dict[str, Any]] = {}
+    for row in _rows(path):
+        sample_id = str(row.get("sample_id") or "").strip()
+        if not sample_id:
+            raise ValueError("source manifest row is missing sample_id")
+        if sample_id in result:
+            raise ValueError(f"duplicate source manifest sample_id: {sample_id}")
+        result[sample_id] = row
+    return result
+
+
+def _validate_existing_labels(
+    rows: list[dict[str, Any]],
+    *,
+    runtime_by_id: dict[str, dict[str, Any]],
+    model: str,
+) -> set[str]:
     seen: set[str] = set()
+    for label_row in rows:
+        item_id = str(label_row.get("subisland_id") or "").strip()
+        if not item_id or item_id in seen:
+            raise ValueError(f"malformed or duplicate existing CueQC label: {item_id!r}")
+        seen.add(item_id)
+        runtime = runtime_by_id.get(item_id)
+        if runtime is None:
+            raise ValueError(f"existing CueQC label has no Runtime row: {item_id}")
+        if label_row.get("schema") != SCHEMA:
+            raise ValueError("existing CueQC labels use a stale schema")
+        if str(label_row.get("prompt_version") or "") != PROMPT_VERSION:
+            raise ValueError("existing CueQC labels use a stale prompt version")
+        if str(label_row.get("model") or "") != model:
+            raise ValueError("existing CueQC labels use a different Omni model")
+        if str(label_row.get("source_id") or "") != str(runtime.get("source_id") or ""):
+            raise ValueError(f"existing CueQC label source mismatch: {item_id}")
+        if str(label_row.get("source_partition") or "") != str(runtime.get("source_partition") or ""):
+            raise ValueError(f"existing CueQC label partition mismatch: {item_id}")
+        for key in ("audio", "sample_id", "source_audio_sha256", "source_audio_size"):
+            if str(label_row.get(key)) != str(runtime.get(key)):
+                raise ValueError(f"existing CueQC label {key} mismatch: {item_id}")
+        for key in (
+            "semantic_split_weights_sha256",
+            "inner_edge_refiner_weights_sha256",
+            "boundary_serialization_contract_id",
+        ):
+            if str(label_row.get(key) or "") != str(runtime.get(key) or ""):
+                raise ValueError(
+                    f"existing CueQC label {key} mismatch: {item_id}"
+                )
+        try:
+            start = float(label_row["start_s"])
+            end = float(label_row["end_s"])
+            duration = float(label_row["duration_s"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError(f"existing CueQC label has invalid coordinates: {item_id}") from exc
+        if not all(math.isfinite(value) for value in (start, end, duration)):
+            raise ValueError(f"existing CueQC label has non-finite coordinates: {item_id}")
+        if not math.isclose(start, float(runtime["start_s"]), abs_tol=1e-6) or not math.isclose(
+            end, float(runtime["end_s"]), abs_tol=1e-6
+        ):
+            raise ValueError(f"existing CueQC label coordinate mismatch: {item_id}")
+        if not math.isclose(duration, float(runtime["duration_s"]), abs_tol=1e-6):
+            raise ValueError(f"existing CueQC label duration mismatch: {item_id}")
+        if str(label_row.get("label") or "").lower() not in {"keep", "drop", "unsure"}:
+            raise ValueError(f"existing CueQC label has invalid label: {item_id}")
+    return seen
+
+
+def _validate_runtime_rows(
+    rows: list[dict[str, Any]],
+    *,
+    require_audio_files: bool = False,
+) -> None:
+    seen: set[str] = set()
+    source_partitions: dict[str, set[str]] = {}
+    core_owners: dict[str, str] = {}
+    upstream_shas: dict[str, set[str]] = {
+        "semantic_split_weights_sha256": set(),
+        "inner_edge_refiner_weights_sha256": set(),
+    }
     for row in rows:
         item_id = str(row.get("subisland_id") or "").strip()
         if not item_id or item_id in seen:
             raise ValueError(f"duplicate or missing Runtime v12 subisland_id: {item_id!r}")
         seen.add(item_id)
-        if row.get("schema") != "runtime_v12_provisional_subisland_v1":
+        if row.get("schema") != RUNTIME_SCHEMA:
             raise ValueError("CueQC v13 teacher requires fresh Runtime v12 chunks")
+        if row.get("inner_execution_status") != "deferred_until_cueqc_keep":
+            raise ValueError(
+                "CueQC v13 teacher requires provisional chunks before Inner inference"
+            )
         source_id = str(row.get("source_id") or "").strip()
+        sample_id = str(row.get("sample_id") or "").strip()
         partition = str(row.get("source_partition") or "").strip()
-        if not source_id or partition not in {"train", "val", "test"}:
+        if not source_id or not sample_id or partition not in {"train", "val", "test"}:
             raise ValueError(
                 "CueQC v13 teacher requires frozen source_id and source partition"
             )
         if row.get("training_manifest_allowed") is not True:
             raise ValueError("CueQC v13 teacher requires an approved runtime manifest")
+        source_partitions.setdefault(source_id, set()).add(partition)
+        if str(row.get("boundary_serialization_contract_id") or "") != ACOUSTIC_BINARY_V12_CONTRACT.contract_id:
+            raise ValueError("CueQC v13 teacher requires the current Boundary serialization contract")
+        for key in ("audio", "source_audio_sha256"):
+            if not str(row.get(key) or "").strip():
+                raise ValueError(f"CueQC v13 runtime row is missing {key}")
+        try:
+            start = float(row["start_s"])
+            end = float(row["end_s"])
+            duration = float(row["duration_s"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError(f"CueQC v13 runtime row has invalid coordinates: {item_id}") from exc
+        if not all(math.isfinite(value) for value in (start, end, duration)) or end <= start:
+            raise ValueError(f"CueQC v13 runtime row has invalid coordinates: {item_id}")
+        if not math.isclose(duration, end - start, abs_tol=1e-5):
+            raise ValueError(f"CueQC v13 runtime row duration mismatch: {item_id}")
+        core_ids = row.get("source_core_ids")
+        if not isinstance(core_ids, list) or len(core_ids) != len(set(str(value) for value in core_ids)):
+            raise ValueError(f"CueQC v13 runtime row has invalid source_core_ids: {item_id}")
+        for core_id in core_ids:
+            core = str(core_id).strip()
+            if not core:
+                raise ValueError(f"CueQC v13 runtime row has an empty source_core_id: {item_id}")
+            previous = core_owners.get(core)
+            if previous is not None and previous != item_id:
+                raise ValueError(f"CueQC v13 core is reused by subislands: {core}")
+            core_owners[core] = item_id
+        if require_audio_files and not Path(str(row["audio"])).is_file():
+            raise FileNotFoundError(f"CueQC runtime audio not found for {item_id}: {row['audio']}")
         for key in (
             "semantic_split_weights_sha256",
             "inner_edge_refiner_weights_sha256",
@@ -93,6 +237,7 @@ def _validate_runtime_rows(rows: list[dict[str, Any]]) -> None:
             value = str(row.get(key) or "").lower()
             if len(value) != 64 or any(ch not in "0123456789abcdef" for ch in value):
                 raise ValueError(f"CueQC v13 runtime row is missing exact {key}")
+            upstream_shas[key].add(value)
         candidate = row.get("pre_asr_candidate") or {}
         if not ACOUSTIC_BINARY_V12_CONTRACT.matches(
             candidate.get("boundary_contract_id")
@@ -100,6 +245,18 @@ def _validate_runtime_rows(rows: list[dict[str, Any]]) -> None:
             raise ValueError("CueQC v13 teacher requires the current Boundary contract")
         if candidate.get("schema") != "pre_asr_cueqc_features_v10":
             raise ValueError("CueQC v13 teacher requires the current feature schema")
+        candidate_start = candidate.get("start")
+        candidate_end = candidate.get("end")
+        if candidate_start is not None and candidate_end is not None:
+            if not math.isclose(float(candidate_start), start, abs_tol=1e-5) or not math.isclose(
+                float(candidate_end), end, abs_tol=1e-5
+            ):
+                raise ValueError(f"CueQC v13 candidate/runtime coordinate mismatch: {item_id}")
+    leaked = [source_id for source_id, values in source_partitions.items() if len(values) != 1]
+    if leaked:
+        raise ValueError(f"CueQC source identity crosses partitions: {sorted(leaked)[:3]}")
+    if any(len(values) != 1 for values in upstream_shas.values()):
+        raise ValueError("CueQC v13 runtime rows mix upstream checkpoint identities")
 
 
 def _normalize_label(value: Any) -> str:
@@ -164,11 +321,21 @@ def _batch_call(
     rows = parsed.get("items")
     if not isinstance(rows, list):
         raise ValueError("batch Omni response missing items array")
-    by_id = {
-        str(row.get("item_id") or ""): dict(row)
-        for row in rows
-        if isinstance(row, dict) and row.get("item_id")
-    }
+    by_id: dict[str, dict[str, Any]] = {}
+    duplicate_ids: set[str] = set()
+    for row in rows:
+        if not isinstance(row, dict) or not row.get("item_id"):
+            continue
+        item_id = str(row["item_id"])
+        if item_id in by_id:
+            duplicate_ids.add(item_id)
+        else:
+            by_id[item_id] = dict(row)
+    if duplicate_ids:
+        raise ValueError(
+            "batch Omni response contains duplicate item_id values: "
+            f"{sorted(duplicate_ids)}"
+        )
     expected = {item_id for item_id, _audio, _reference in items}
     if set(by_id) != expected:
         raise ValueError(
@@ -263,17 +430,45 @@ def run(args: argparse.Namespace) -> None:
         raise ValueError("Omni API key is not configured")
 
     output_dir = Path(args.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
     labels_path = output_dir / "labels.jsonl"
     raw_path = output_dir / "raw_responses.jsonl"
-    existing = {str(row["subisland_id"]) for row in _rows(labels_path)}
-    runtime_rows = _rows(Path(args.runtime_chunks))
-    _validate_runtime_rows(runtime_rows)
-    rows = [row for row in runtime_rows if str(row["subisland_id"]) not in existing]
-    sources = (
-        {str(row["sample_id"]): row for row in _rows(Path(args.source_manifest))}
-        if args.source_manifest
-        else {}
+    runtime_path = Path(args.runtime_chunks).resolve()
+    runtime_rows = _rows(runtime_path)
+    _validate_runtime_rows(runtime_rows, require_audio_files=True)
+    runtime_by_id = {str(row["subisland_id"]): row for row in runtime_rows}
+    _model_for_labels = model
+    existing = _validate_existing_labels(
+        _rows(labels_path), runtime_by_id=runtime_by_id, model=_model_for_labels
     )
+    rows = [row for row in runtime_rows if str(row["subisland_id"]) not in existing]
+    sources: dict[str, dict[str, Any]] = {}
+    source_manifest_path: Path | None = None
+    if args.source_manifest:
+        source_manifest_path = Path(args.source_manifest).resolve()
+        sources = _source_manifest_by_sample_id(source_manifest_path)
+        for row in runtime_rows:
+            sample_id = str(row["sample_id"])
+            source = sources.get(sample_id)
+            if source is None:
+                raise ValueError(f"source manifest has no Runtime sample_id: {sample_id}")
+            for key in ("source_id", "source_partition"):
+                if str(source.get(key) or "") and str(source.get(key)) != str(row.get(key) or ""):
+                    raise ValueError(f"source manifest {key} mismatch for {sample_id}")
+    audio_fingerprints: dict[str, tuple[str, int]] = {}
+    for row in runtime_rows:
+        audio_path = Path(str(row["audio"])).resolve()
+        key = str(audio_path).lower()
+        fingerprint = audio_fingerprints.get(key)
+        if fingerprint is None:
+            if not audio_path.is_file():
+                raise FileNotFoundError(f"CueQC runtime audio not found: {audio_path}")
+            fingerprint = (_sha256(audio_path), int(audio_path.stat().st_size))
+            audio_fingerprints[key] = fingerprint
+        expected_sha = str(row.get("source_audio_sha256") or "").lower()
+        expected_size = int(row.get("source_audio_size") or -1)
+        if fingerprint != (expected_sha, expected_size):
+            raise ValueError(f"Runtime source audio changed for {row['subisland_id']}")
     if args.max_items > 0:
         rows = rows[: args.max_items]
     clip_dir = output_dir / "audio_clips"
@@ -286,22 +481,7 @@ def run(args: argparse.Namespace) -> None:
         responses: dict[str, dict[str, Any]] = {}
         for row in batch:
             item_id = str(row["subisland_id"])
-            if round(float(row["end_s"]), 6) <= round(float(row["start_s"]), 6):
-                responses[item_id] = {
-                    "label": "drop",
-                    "confidence": 1.0,
-                    "flags": ["empty_audio"],
-                }
-                _append(
-                    raw_path,
-                    {
-                        "schema": "cueqc_v13_empty_audio_local_v1",
-                        "item_id": item_id,
-                        "local_route": "zero_length_audio_to_drop",
-                    },
-                )
-                continue
-            clip = clip_dir / f"{item_id}.{args.audio_format}"
+            clip = clip_dir / f"{_safe_clip_stem(item_id)}.{args.audio_format}"
             slice_audio_clip(
                 source_audio=Path(str(row["audio"])),
                 row={
@@ -346,6 +526,9 @@ def run(args: argparse.Namespace) -> None:
                     raw_path,
                     {
                         "schema": "cueqc_v13_omni_batch_fallback_v1",
+                        "item_ids": [item_id for item_id, _clip, _reference in clips],
+                        "model": model,
+                        "prompt_version": PROMPT_VERSION,
                         "error": str(exc),
                         "fallback": "single_audio_requests",
                         "batch_mode_disabled": disable_batch_mode,
@@ -415,6 +598,17 @@ def run(args: argparse.Namespace) -> None:
                     "source_id": str(row["source_id"]),
                     "source_partition": str(row["source_partition"]),
                     "audio": str(row["audio"]),
+                    "source_audio_sha256": str(row["source_audio_sha256"]),
+                    "source_audio_size": int(row["source_audio_size"]),
+                    "semantic_split_weights_sha256": str(
+                        row["semantic_split_weights_sha256"]
+                    ),
+                    "inner_edge_refiner_weights_sha256": str(
+                        row["inner_edge_refiner_weights_sha256"]
+                    ),
+                    "boundary_serialization_contract_id": str(
+                        row["boundary_serialization_contract_id"]
+                    ),
                     "start_s": float(row["start_s"]),
                     "end_s": float(row["end_s"]),
                     "duration_s": float(row["duration_s"]),
@@ -440,6 +634,19 @@ def run(args: argparse.Namespace) -> None:
         "label_counts": dict(Counter(row["label"] for row in _rows(labels_path))),
         "batch_mode_final": batch_mode,
         "labels": str(labels_path),
+        "runtime_chunks": str(runtime_path),
+        "runtime_chunks_sha256": _sha256(runtime_path),
+        "runtime_schema": RUNTIME_SCHEMA,
+        "source_manifest": str(source_manifest_path) if source_manifest_path else "",
+        "source_manifest_sha256": (
+            _sha256(source_manifest_path) if source_manifest_path else ""
+        ),
+        "semantic_split_weights_sha256": next(
+            iter({str(row["semantic_split_weights_sha256"]) for row in runtime_rows}), ""
+        ),
+        "inner_edge_refiner_weights_sha256": next(
+            iter({str(row["inner_edge_refiner_weights_sha256"]) for row in runtime_rows}), ""
+        ),
     }
     (output_dir / "summary.json").write_text(
         json.dumps(summary, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"

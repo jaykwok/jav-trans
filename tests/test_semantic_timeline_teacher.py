@@ -217,6 +217,8 @@ def test_compiler_emits_model_specific_manifests_without_fake_inner_labels(
 
     assert summary["max_source_use_count"] == 1
     assert summary["training_ready"] is False
+    assert summary["training_manifest_allowed"] is False
+    assert summary["status"] == "legacy_inventory_only"
     assert summary["inner_training_ready"] is False
     assert summary["counts"] == {
         "scorer": 1,
@@ -233,6 +235,8 @@ def test_compiler_emits_model_specific_manifests_without_fake_inner_labels(
         "start_s": 1.7,
         "end_s": 2.0,
     }
+    assert scorer["inventory_only"] is True
+    assert scorer["training_manifest_allowed"] is False
     inner = json.loads(
         (tmp_path / "compiled" / "inner_refiner_event_seeds.jsonl").read_text(
             encoding="utf-8"

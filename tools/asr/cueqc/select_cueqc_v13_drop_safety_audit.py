@@ -13,13 +13,17 @@ def _rows(path: Path) -> list[dict[str, Any]]:
         return [json.loads(line) for line in handle if line.strip()]
 
 
-def _semantic_target_score(row: dict[str, Any]) -> float:
-    prediction = dict(row.get("inner_edge_prediction") or {})
-    values = []
-    for key in ("start_probabilities", "end_probabilities"):
-        probabilities = dict(prediction.get(key) or {})
-        values.append(float(probabilities.get("semantic_target") or 0.0))
-    return max(values, default=0.0)
+def _candidate_membership_score(row: dict[str, Any]) -> float:
+    """Use only upstream Scorer evidence; Inner has not run before CueQC."""
+
+    candidate = dict(row.get("pre_asr_candidate") or {})
+    return max(
+        (
+            float(candidate.get("scorer_speech_p90") or 0.0),
+            float(candidate.get("scorer_speech_mean") or 0.0),
+            float(candidate.get("scorer_speech_active_ratio_05") or 0.0),
+        )
+    )
 
 
 def select(
@@ -46,18 +50,18 @@ def select(
         "longest_drop",
     )
     add(
-        sorted(candidates, key=_semantic_target_score, reverse=True),
-        "highest_inner_semantic_target",
+        sorted(candidates, key=_candidate_membership_score, reverse=True),
+        "highest_upstream_candidate_membership",
     )
     output.parent.mkdir(parents=True, exist_ok=True)
     with output.open("w", encoding="utf-8") as handle:
         for row in selected:
             handle.write(json.dumps(row, ensure_ascii=False) + "\n")
     summary = {
-        "schema": "cueqc_v13_drop_safety_selection_summary_v1",
+        "schema": "cueqc_v13_drop_safety_selection_summary_v2",
         "selected_count": len(selected),
         "per_axis": per_axis,
-        "axes": ["longest_drop", "highest_inner_semantic_target"],
+        "axes": ["longest_drop", "highest_upstream_candidate_membership"],
         "output": str(output),
     }
     output.with_suffix(".summary.json").write_text(

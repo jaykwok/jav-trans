@@ -4,12 +4,17 @@ import json
 import wave
 from pathlib import Path
 
+import numpy as np
 import pytest
 
 from audio.chunk_packer import PackedChunk
 from boundary.base import SpeechSegment
 from boundary.contracts import ACOUSTIC_BINARY_V12_CONTRACT
-from boundary.sequence_features import CHUNK_POOLED_PTM_SCHEMA, DEFAULT_CHUNK_POOLED_PTM_BINS
+from boundary.sequence_features import (
+    CHUNK_POOLED_PTM_SCHEMA,
+    DEFAULT_CHUNK_POOLED_PTM_BINS,
+    FRAME_SEQUENCE_FRAMES_SCHEMA,
+)
 
 
 def _boundary_config() -> dict:
@@ -165,6 +170,47 @@ def test_boundary_cache_round_trips_shared_absolute_cut_metadata(monkeypatch, tm
     assert chunks[0].boundary_source == "shared_absolute_cut"
     assert chunks[0].primary_cut_candidates[0]["time_s"] == pytest.approx(2.5)
     assert chunks[0].pre_asr_ptm_pooled_features == pytest.approx([0.1, 0.2])
+
+
+def test_boundary_cache_round_trips_post_cueqc_inner_feature_sidecar(
+    monkeypatch, tmp_path
+) -> None:
+    from boundary import cache as boundary_cache
+
+    monkeypatch.setenv("BOUNDARY_CACHE_DIR", str(tmp_path / "boundary-cache"))
+    audio = tmp_path / "sample.wav"
+    _write_wav(audio)
+    ptm = np.arange(24, dtype=np.float32).reshape(3, 8)
+    mfcc = np.arange(12, dtype=np.float32).reshape(3, 4)
+    saved = boundary_cache.save_processing_spans(
+        str(audio),
+        boundary_signature={"backend": "speech_island_v11"},
+        boundary_config=_boundary_config(),
+        processing_spans=[],
+        runtime_boundary_signature={
+            "boundary_pipeline": {
+                "contract_id": ACOUSTIC_BINARY_V12_CONTRACT.contract_id,
+                "inner_edge_refiner": {
+                    "status": "deferred_until_post_pre_asr_cueqc_keep"
+                },
+            }
+        },
+        sequence_feature_frames={
+            "schema": FRAME_SEQUENCE_FRAMES_SCHEMA,
+            "frame_hop_s": 0.02,
+            "ptm": ptm,
+            "mfcc": mfcc,
+        },
+    )
+
+    assert saved is not None
+    assert Path(saved["sequence_feature_path"]).is_file()
+    restored = boundary_cache.load_sequence_feature_frames(saved["path"])
+    assert restored is not None
+    assert restored["schema"] == FRAME_SEQUENCE_FRAMES_SCHEMA
+    assert restored["frame_hop_s"] == pytest.approx(0.02)
+    np.testing.assert_array_equal(restored["ptm"], ptm)
+    np.testing.assert_array_equal(restored["mfcc"], mfcc)
 
 
 def test_boundary_cache_round_trips_binary_inner_contract_metadata(

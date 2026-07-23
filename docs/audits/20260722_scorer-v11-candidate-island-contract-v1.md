@@ -4,11 +4,17 @@
 
 Scorer 的职责从“逐帧判断目标语音内容”收窄为不可逆工作流入口的高召回候选岛 membership：
 
-- `outside_candidate`：可以在进入 Proposal/Outer/Split/CueQC 前安全删除的清晰非人声背景。
-- `inside_candidate`：应继续送往下游判断的连续候选波形。同一 ASR 单元内部的停顿、尾音和短背景声属于此类；孤立呻吟、喘息、含混人声也优先保留，由 CueQC 决定是否 drop。
-- `unsure`：只保留在 canonical 和人工审计，训练映射为 `-100`，不进入 normalization、loss、metrics 或 gate。
+- `inside_candidate`：存在明确或很可能的日语词语/对白锚点，并覆盖同一轮连续对白所需的完整波形包络；同一包络内部的停顿、尾音、短呼吸、呻吟或动作声随对白一起保留。
+- `outside_candidate`：明确不含词语、且能独立于对白安全删除的非语义声音，包括纯呻吟、喘息、呼吸、亲吻、impact、音乐、静音或环境声；JAV/Galgame 场景和 vocal activity 本身都不能自动把它升级为 inside。
+- `unsure`：局部可能是词语、也可能只是呻吟或噪声时使用；只保留在 canonical 和人工审计，训练映射为 `-100`，不进入 normalization、loss、metrics 或 gate。
 
 runtime 只允许两 logit softmax 后的逐帧 argmax。禁止 threshold、hysteresis、dilation、时长合并、hard veto、规则 fallback 和旧 checkpoint alias。Proposal 只给 Split 附加非绑定候选，不能改变 Scorer 的 keep/drop。
+
+### 高召回不等于把职责下推
+
+Scorer 的错误代价应当不对称：任何可能含词语、尾音或同一轮对白连续性的区间都不能成为 `outside_candidate`；但这不等于把所有呻吟、喘息或呼吸都标成 `inside_candidate`。黄色差集只有在“确认不含词语/对白”并且“能够独立于同一轮对白波形安全删除”两个条件同时成立时才是确定负例。独立纯非语义活动仍属于 Scorer 的可学习 outside；夹在同一对白包络内、紧贴边缘或删除会造成碎片化的非语义声随 inside 保留；无法确定时标 `unsure`。
+
+下游不能替 Scorer 恢复已删除的波形。CueQC 只对 Split 已形成的完整 provisional sub-island 做整段 `keep/drop`，Inner 只在 CueQC keep 项上定位首尾 acoustic semantic core 或学习到 all-background drop；当前 runtime 取首个到最后一个 semantic frame，不移除中间内部背景。因此“独立纯呻吟交给 CueQC、边缘残留交给 Inner”只是一道后续安全网，不是把 Scorer 退化成广义 vocal/VAD keep-all 的理由。下一轮先按这一标签合同完成真实 source 人工审计和数据重编，架构保持 P2048/H256 baseline；只有固定数据下仍出现连续性失败，才进行 heatmap/span decoder A/B。
 
 ## 审计证据
 

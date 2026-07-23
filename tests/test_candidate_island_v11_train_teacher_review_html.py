@@ -93,6 +93,12 @@ def test_train_teacher_review_selects_one_editable_source_per_video(tmp_path: Pa
     assert "转 ${esc(alternate)}" in page
     assert "转 outside_candidate" in page
     assert "range.label==='inside_candidate'?'unsure':'inside_candidate'" in page
+    assert 'class="span ${esc(span.label)} timeline-span"' in page
+    assert "card.querySelectorAll('.timeline-span')" in page
+    assert "黄色 outside_candidate 检查" in page
+    assert "能独立于同一轮对白波形安全删除" in page
+    assert "不是内部噪声分离器" in page
+    assert "不要为了提前清理而牺牲 Scorer 的 inside recall" in page
     assert "draft a0" in page and "draft b1" in page
     manifest = [json.loads(line) for line in (output / "audit_manifest.jsonl").read_text(encoding="utf-8").splitlines()]
     assert {row["video_id"] for row in manifest} == {"video-a", "video-b"}

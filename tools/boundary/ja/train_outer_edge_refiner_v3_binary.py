@@ -6,6 +6,8 @@ import copy
 import gc
 import hashlib
 import json
+import os
+import random
 import sys
 import time
 from collections import Counter, defaultdict
@@ -41,6 +43,49 @@ from tools.boundary.ja.edge_frame_dataset import (  # noqa: E402
 
 CANDIDATE_SCORER_V11_SCHEMA = OUTER_EDGE_REFINER_V3_UPSTREAM_SCORER_SCHEMA
 PARTITIONS = ("train", "val", "test")
+
+
+def _sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for block in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def _torch_save_atomic(payload: object, path: Path) -> None:
+    import torch
+
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    try:
+        torch.save(payload, temporary)
+        temporary.replace(path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def _write_json_atomic(path: Path, payload: dict[str, Any]) -> None:
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    try:
+        with temporary.open("w", encoding="utf-8", newline="\n") as handle:
+            handle.write(json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True))
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        temporary.replace(path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def _seed_everything(seed: int, torch) -> None:
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+    if hasattr(torch.backends, "cudnn"):
+        torch.backends.cudnn.benchmark = False
+        torch.backends.cudnn.deterministic = True
 
 
 def validate_dataset_rows(rows: Sequence[dict[str, Any]]) -> dict[str, Any]:
@@ -100,7 +145,16 @@ def load_binary(row: dict[str, Any]) -> tuple[np.ndarray, np.ndarray, np.ndarray
     features, canonical, weights = load_edge_row(row)
     if int(features.shape[0]) != int(row["frame_count"]):
         raise ValueError(f"Outer v3 frame_count mismatch: {row.get('core_id')}")
-    return features, canonical_to_binary_labels(canonical), weights
+    binary = canonical_to_binary_labels(canonical)
+    if features.ndim != 2 or binary.ndim != 1 or weights.ndim != 1:
+        raise ValueError(f"Outer v3 row has invalid feature/label shape: {row.get('core_id')}")
+    if len({features.shape[0], binary.shape[0], weights.shape[0]}) != 1:
+        raise ValueError(f"Outer v3 feature/label/weight lengths differ: {row.get('core_id')}")
+    if not np.isfinite(features).all() or not np.isfinite(weights).all():
+        raise ValueError(f"Outer v3 row contains non-finite values: {row.get('core_id')}")
+    if np.any(weights < 0.0):
+        raise ValueError(f"Outer v3 row contains negative weights: {row.get('core_id')}")
+    return features, binary, weights
 
 
 def compute_normalization(rows: Sequence[dict[str, Any]]) -> dict[str, list[float]]:
@@ -110,6 +164,8 @@ def compute_normalization(rows: Sequence[dict[str, Any]]) -> dict[str, list[floa
     square_sum = np.zeros(first.shape[1], dtype=np.float64)
     for row in rows:
         features, labels, weights = load_binary(row)
+        if features.shape[1] != feature_sum.shape[0]:
+            raise ValueError("Outer v3 feature width changes across dataset rows")
         valid = (labels != BINARY_EDGE_IGNORE_INDEX) & (weights > 0.0)
         values = features[valid].astype(np.float64)
         feature_sum += values.sum(axis=0)
@@ -134,16 +190,17 @@ def summarize_partition_label_presence(
         for name in PARTITIONS
     }
     for row in rows:
-        _features, canonical, _weights = load_edge_row(row)
+        _features, canonical, weights = load_edge_row(row)
+        valid = weights > 0.0
         canonical_counts.update(
-            background=int(np.sum(canonical == 0)),
-            semantic_core=int(np.sum(canonical == 1)),
-            unsure=int(np.sum(canonical == 2)),
+            background=int(np.sum((canonical == 0) & valid)),
+            semantic_core=int(np.sum((canonical == 1) & valid)),
+            unsure=int(np.sum((canonical == 2) & valid)),
         )
         row_presence = presence[str(row["partition"])]
-        if np.any(canonical == 1):
+        if np.any((canonical == 1) & valid):
             row_presence["semantic_rows"] += 1
-        elif np.any(canonical == 0):
+        elif np.any((canonical == 0) & valid):
             row_presence["all_background_rows"] += 1
     if any(
         not values["semantic_rows"] or not values["all_background_rows"]
@@ -208,7 +265,7 @@ def evaluate(model, rows, normalization, device, *, tolerance_frames, max_padded
     model.eval()
     with torch.inference_mode():
         for batch in frame_budget_batches(rows, max_padded_frames=max_padded_frames):
-            features, labels, _weights, mask = pad_batch(batch, normalization)
+            features, labels, weights, mask = pad_batch(batch, normalization)
             probabilities = torch.softmax(
                 model(
                     features.to(device),
@@ -219,7 +276,8 @@ def evaluate(model, rows, normalization, device, *, tolerance_frames, max_padded
             for index, row in enumerate(batch):
                 length = int(row["frame_count"])
                 truth = labels[index, :length].numpy()
-                valid = truth != BINARY_EDGE_IGNORE_INDEX
+                row_weights = weights[index, :length].numpy()
+                valid = (truth != BINARY_EDGE_IGNORE_INDEX) & (row_weights > 0.0)
                 predicted = np.argmax(probabilities[index, :length], axis=1)
                 tp += int(np.sum((predicted[valid] == 1) & (truth[valid] == 1)))
                 fp += int(np.sum((predicted[valid] == 1) & (truth[valid] == 0)))
@@ -295,6 +353,11 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     import torch.nn.functional as F
 
     apply_vram_safety_cap(0.95)
+    if args.max_steps <= 0 or args.eval_interval <= 0 or args.max_batch_frames <= 0:
+        raise ValueError("Outer v3 training/evaluation budgets must be positive")
+    if args.frame_hop_s <= 0.0 or args.tolerance_s < 0.0:
+        raise ValueError("Outer v3 frame_hop_s must be positive and tolerance non-negative")
+    _seed_everything(int(args.seed), torch)
     rows = read_edge_rows(Path(args.dataset_manifest))
     dataset_summary = validate_dataset_rows(rows)
     by_partition = {
@@ -303,6 +366,11 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     }
     normalization = compute_normalization(by_partition["train"])
     first, _labels, _weights = load_binary(by_partition["train"][0])
+    expected_feature_width = int(first.shape[1])
+    for row in rows:
+        features, _row_labels, _row_weights = load_binary(row)
+        if int(features.shape[1]) != expected_feature_width:
+            raise ValueError("Outer v3 feature width changes across dataset rows")
     position_dim = int(first.shape[1]) - args.raw_ptm_dim - args.mfcc_dim
     if position_dim <= 0:
         raise ValueError("Outer v3 feature width must include relative position")
@@ -355,7 +423,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             features.to(device), attention_mask=mask.to(device)
         )
         target = labels.to(device)
-        valid = target != BINARY_EDGE_IGNORE_INDEX
+        valid = (target != BINARY_EDGE_IGNORE_INDEX) & (source_weights.to(device) > 0.0)
         loss_rows = F.cross_entropy(
             logits.transpose(1, 2), target,
             reduction="none", ignore_index=BINARY_EDGE_IGNORE_INDEX,
@@ -410,8 +478,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     checkpoint = output_dir / (
         f"outer_edge_refiner_v3.{qwen_asr_repo_tag(QWEN_ASR_17B_REPO_ID)}.pt"
     )
-    torch.save(
-        build_outer_edge_refiner_v3_checkpoint(
+    checkpoint_payload = build_outer_edge_refiner_v3_checkpoint(
             model=model,
             model_config=model_config,
             feature_config={
@@ -425,21 +492,28 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             metadata={
                 "ptm_repo_id": QWEN_ASR_17B_REPO_ID,
                 "dataset_manifest": args.dataset_manifest,
+                "dataset_manifest_sha256": _sha256(Path(args.dataset_manifest)),
                 "dataset_summary": dataset_summary,
+                "upstream_scorer_checkpoint_sha256": dataset_summary[
+                    "scorer_checkpoint_sha256"
+                ],
                 "trained_steps": args.max_steps,
                 "best_step": best_step,
                 "canonical_label_counts": dict(canonical_counts),
                 "excluded_training_count": int(canonical_counts["unsure"]),
                 "training_initialization": "random",
                 "checkpoint_selection": "val_outer_acoustic_edge_300ms_coverage_v1",
+                "evaluation_tolerance_s": float(args.tolerance_s),
+                "evaluation_tolerance_frames": int(
+                    round(args.tolerance_s / args.frame_hop_s)
+                ),
                 "class_weights": {
                     "background": args.background_weight,
                     "semantic_core": args.semantic_weight,
                 },
             },
-        ),
-        checkpoint,
-    )
+        )
+    _torch_save_atomic(checkpoint_payload, checkpoint)
     numeric_gate_pass = (
         min(
             val["start_coverage"], val["end_coverage"],
@@ -458,12 +532,16 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     summary = {
         "schema": "outer_edge_refiner_v3_binary_training_summary_v2",
         "checkpoint": str(checkpoint),
-        "checkpoint_sha256": hashlib.sha256(checkpoint.read_bytes()).hexdigest(),
+        "checkpoint_sha256": _sha256(checkpoint),
         "best_step": best_step,
         "mean_train_loss": float(np.mean(losses)),
         "val": val,
         "test": test,
         "dataset": dataset_summary,
+        "dataset_manifest_sha256": _sha256(Path(args.dataset_manifest)),
+        "upstream_scorer_checkpoint_sha256": dataset_summary[
+            "scorer_checkpoint_sha256"
+        ],
         "canonical_label_counts": dict(canonical_counts),
         "excluded_training_count": int(canonical_counts["unsure"]),
         **release_gate_fields(numeric_gate_pass),
@@ -473,10 +551,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         **allocator,
         "elapsed_s": time.monotonic() - started,
     }
-    (output_dir / "summary.json").write_text(
-        json.dumps(summary, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
-        encoding="utf-8",
-    )
+    _write_json_atomic(output_dir / "summary.json", summary)
     del (
         optimizer,
         model,
@@ -494,10 +569,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         torch.cuda.synchronize(device)
         torch.cuda.empty_cache()
     summary["memory_after_release"] = _memory_snapshot(device)
-    (output_dir / "summary.json").write_text(
-        json.dumps(summary, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
-        encoding="utf-8",
-    )
+    _write_json_atomic(output_dir / "summary.json", summary)
     print(json.dumps(summary, ensure_ascii=False), flush=True)
     return summary
 

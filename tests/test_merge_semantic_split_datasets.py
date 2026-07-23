@@ -7,10 +7,29 @@ from pathlib import Path
 import numpy as np
 import pytest
 
+from asr.backends.qwen import QWEN_ASR_17B_REPO_ID
+from boundary.contracts import ACOUSTIC_BINARY_V12_CONTRACT
+from boundary.sequence_features import SPLIT_CANDIDATE_SCALAR_NAMES
+from boundary.sequence_store import frames_sidecar_path, save_sequence_dataset
+from boundary.split_model import SEMANTIC_SPLIT_FEATURE_SCHEMA
+from tools.boundary.ja.acoustic_split_v4_dataset import (
+    SPLIT_V4_DATASET_SUMMARY_SCHEMA,
+    SPLIT_V4_INPUT_DISTRIBUTION,
+    SPLIT_V4_MFCC_DIM,
+    SPLIT_V4_PTM_DIM,
+    SPLIT_V4_UPSTREAM_SHA_FIELDS,
+    file_sha256,
+)
 from tools.boundary.ja.merge_semantic_split_datasets import (
     run,
     stratified_sample_groups,
 )
+
+
+UPSTREAM_SHA256 = {
+    field: character * 64
+    for field, character in zip(SPLIT_V4_UPSTREAM_SHA_FIELDS, "abc")
+}
 
 
 def _write_sequence_bundle(
@@ -33,10 +52,15 @@ def _write_sequence_bundle(
         source_ids.extend([source_id] * len(group_labels))
         core_ids.extend([core_id] * len(group_labels))
     count = len(labels)
-    np.savez(
+    frame_dim = SPLIT_V4_PTM_DIM + SPLIT_V4_MFCC_DIM
+    scalar_dim = len(SPLIT_CANDIDATE_SCALAR_NAMES)
+    frames = np.arange(count * 2 * frame_dim, dtype=np.float32).reshape(
+        count, 2, frame_dim
+    )
+    save_sequence_dataset(
         path,
-        frame_features=np.arange(count * 2 * 3, dtype=np.float32).reshape(count, 2, 3),
-        scalar_features=np.zeros((count, 2), dtype=np.float32),
+        frames=frames,
+        scalar_features=np.zeros((count, scalar_dim), dtype=np.float32),
         labels=np.asarray(labels, dtype=np.int64),
         partitions=np.asarray(partitions),
         source_ids=np.asarray(source_ids),
@@ -48,6 +72,42 @@ def _write_sequence_bundle(
             pair_ids if pair_ids is not None else [-1] * count, dtype=np.int64
         ),
         omni_aux=np.full((count, 3), -1.0, dtype=np.float32),
+    )
+    summary = {
+        "schema": SPLIT_V4_DATASET_SUMMARY_SCHEMA,
+        "training_manifest_allowed": True,
+        "output": str(path.resolve()),
+        "dataset_sha256": file_sha256(path),
+        "frame_sidecar_sha256": file_sha256(frames_sidecar_path(path)),
+        "input_distribution": SPLIT_V4_INPUT_DISTRIBUTION,
+        "feature_schema": SEMANTIC_SPLIT_FEATURE_SCHEMA,
+        "boundary_serialization_contract_id": (
+            ACOUSTIC_BINARY_V12_CONTRACT.contract_id
+        ),
+        "ptm_repo_id": QWEN_ASR_17B_REPO_ID,
+        "ptm_dim": SPLIT_V4_PTM_DIM,
+        "mfcc_dim": SPLIT_V4_MFCC_DIM,
+        "scalar_names": list(SPLIT_CANDIDATE_SCALAR_NAMES),
+        **UPSTREAM_SHA256,
+        "count": count,
+        "frame_bins": 2,
+        "frame_dim": frame_dim,
+        "scalar_dim": scalar_dim,
+        "group_count": len(groups),
+        "source_count": len(set(source_ids)),
+        "core_count": len(set(core_ids)),
+        "source_feature_audio_sha256": {
+            path.stem: {
+                "feature_path": str(path.resolve()),
+                "feature_sha256": "d" * 64,
+                "audio_wav": str((path.parent / f"{path.stem}.wav").resolve()),
+                "audio_wav_sha256": "e" * 64,
+            }
+        },
+    }
+    path.with_suffix(".summary.json").write_text(
+        json.dumps(summary, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
     )
 
 
@@ -88,9 +148,13 @@ def test_sequence_mode_keeps_islands_whole_and_remaps_pairs(tmp_path: Path) -> N
 
     arrays = load_sequence_arrays(output)
     assert "frame_features" not in merged
-    assert arrays["frame_features"].shape == (7, 2, 3)
+    assert arrays["frame_features"].shape == (
+        7,
+        2,
+        SPLIT_V4_PTM_DIM + SPLIT_V4_MFCC_DIM,
+    )
     assert arrays["source_ids"].astype(str).tolist() == ["a"] * 3 + ["c"] * 2 + ["b"] * 2
-    first_frames = np.load(first)["frame_features"]
+    first_frames = np.load(frames_sidecar_path(first))
     np.testing.assert_array_equal(np.asarray(arrays["frame_features"][:3]), first_frames[:3])
     # Pair ids from different bundles / repeats never collide.
     pairs = merged["pair_ids"]
@@ -101,8 +165,10 @@ def test_sequence_mode_keeps_islands_whole_and_remaps_pairs(tmp_path: Path) -> N
     assert not (real_pair & hardmix_pairs)
     summary = json.loads(output.with_suffix(".summary.json").read_text("utf-8"))
     assert summary["mode"] == "sequence"
-    assert summary["schema"] == "semantic_split_merged_dataset_v3"
+    assert summary["schema"] == SPLIT_V4_DATASET_SUMMARY_SCHEMA
+    assert summary["training_manifest_allowed"] is True
     assert summary["group_count"] == 3
+    assert summary["dataset_sha256"] == file_sha256(output)
 
 
 def test_sequence_group_sampling_is_stratified(tmp_path: Path) -> None:
@@ -112,7 +178,9 @@ def test_sequence_group_sampling_is_stratified(tmp_path: Path) -> None:
         groups.append((f"cut{index}", [0, 1], "train"))
         groups.append((f"nocut{index}", [1, 1], "train"))
     _write_sequence_bundle(path, groups=groups)
-    bundle = np.load(path)
+    from boundary.sequence_store import load_sequence_arrays
+
+    bundle = load_sequence_arrays(path)
     selected = stratified_sample_groups(
         bundle, fraction=0.3, rng=np.random.default_rng(5)
     )

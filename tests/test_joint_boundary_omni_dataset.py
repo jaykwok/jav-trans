@@ -1,14 +1,17 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 import wave
 
+import pytest
+
 from tools.datasets import label_joint_boundary_preasr_with_omni as joint_omni
+from tools.datasets import prepare_joint_boundary_omni_dataset as prepare_joint
 from tools.datasets.label_joint_boundary_preasr_with_omni import (
     PROMPT_VERSION,
     _build_pre_asr_prompt,
-    _build_prompt,
     _build_split_prompt,
     _normalize_chunk_decision,
     _normalize_split_decision,
@@ -79,6 +82,26 @@ def test_prepared_window_geometry_comes_from_wav_samples(tmp_path: Path) -> None
     }
 
 
+def test_boundary_feature_export_fails_closed_when_split_artifacts_are_missing(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(prepare_joint, "_build_processing_spans", lambda _audio: [])
+    monkeypatch.setenv("SEMANTIC_SPLIT_FEATURE_EXPORT_PATH", "sentinel-split")
+    wav_path = tmp_path / "window.wav"
+    wav_path.write_bytes(b"wav")
+    feature_dir = tmp_path / "features"
+
+    with pytest.raises(RuntimeError, match="training exporter is still pending"):
+        prepare_joint._export_boundary_features(
+            wav_path=wav_path,
+            feature_dir=feature_dir,
+        )
+
+    assert os.environ["SEMANTIC_SPLIT_FEATURE_EXPORT_PATH"] == "sentinel-split"
+    assert not list(feature_dir.glob(".*.npz"))
+
+
 def test_v3_prompts_keep_omni_requests_single_task() -> None:
     split_prompt = _build_split_prompt(
         [
@@ -110,33 +133,6 @@ def test_v3_prompts_keep_omni_requests_single_task() -> None:
     assert "split_decisions" not in pre_asr_prompt
     assert "missed_boundaries" not in pre_asr_prompt
     assert "任务 A" not in pre_asr_prompt
-
-
-def test_legacy_joint_prompt_still_documents_v2_shape() -> None:
-    prompt = _build_prompt(
-        [
-            {
-                "index": 4,
-                "time_s": 1.25,
-                "label": "continue",
-                "p_cut": 0.2,
-            }
-        ],
-        [
-            {
-                "chunk_index": 2,
-                "start": 0.0,
-                "end": 2.0,
-            }
-        ],
-        duration_s=3.0,
-    )
-    assert "split_candidates=" in prompt
-    assert "runtime_chunks=" in prompt
-    assert "missed_boundaries" in prompt
-    assert '"id":"s000"' in prompt
-    assert '"id":"p000"' in prompt
-    assert "重复但有明确词义" in prompt
 
 
 def test_prepare_only_writes_separate_single_task_requests(

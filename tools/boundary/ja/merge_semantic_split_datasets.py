@@ -3,7 +3,9 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
+import tempfile
 from pathlib import Path
 
 import numpy as np
@@ -14,14 +16,44 @@ for _root in (SRC_ROOT, PROJECT_ROOT):
     if str(_root) not in sys.path:
         sys.path.insert(0, str(_root))
 
+from asr.backends.qwen import QWEN_ASR_17B_REPO_ID  # noqa: E402
 from boundary.sequence_store import (  # noqa: E402
+    frames_sidecar_path,
     load_sequence_arrays,
     open_frames_memmap_for_write,
     save_sequence_dataset,
 )
+from tools.boundary.ja.acoustic_split_v4_dataset import (  # noqa: E402
+    SPLIT_V4_DATASET_SUMMARY_SCHEMA,
+    SPLIT_V4_UPSTREAM_SHA_FIELDS,
+    file_sha256,
+    load_training_summary,
+)
 
 
 _FRAME_COPY_CHUNK = 16384
+
+
+def _write_json_atomic(path: Path, payload: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    try:
+        with temporary.open("w", encoding="utf-8", newline="\n") as handle:
+            handle.write(
+                json.dumps(
+                    payload,
+                    ensure_ascii=False,
+                    indent=2,
+                    sort_keys=True,
+                    allow_nan=False,
+                )
+            )
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
 def group_row_indexes(bundle: dict) -> dict[str, np.ndarray]:
@@ -79,7 +111,9 @@ def _bundle_mode(bundles: list[dict], paths: list[str]) -> str:
     )
 
 
-def _validate_current_sequence_bundle(bundle: dict, path: str) -> None:
+def _validate_current_sequence_bundle(
+    bundle: dict, path: str, *, summary: dict
+) -> None:
     required = {
         "frame_features",
         "scalar_features",
@@ -95,14 +129,53 @@ def _validate_current_sequence_bundle(bundle: dict, path: str) -> None:
             f"{path}: Split v4 merge requires current sequence identities; "
             f"missing {missing}"
         )
-    count = int(bundle["labels"].shape[0])
+    frames = bundle["frame_features"]
+    scalars = np.asarray(bundle["scalar_features"])
+    labels = np.asarray(bundle["labels"])
+    if frames.ndim != 3 or scalars.ndim != 2 or labels.ndim != 1:
+        raise ValueError(f"{path}: Split v4 feature/label dimensions are invalid")
+    count = int(labels.shape[0])
+    if count <= 0:
+        raise ValueError(f"{path}: Split v4 dataset is empty")
     for key in sorted(required.difference({"frame_features"})):
-        if int(bundle[key].shape[0]) != count:
+        if np.asarray(bundle[key]).ndim < 1 or int(bundle[key].shape[0]) != count:
             raise ValueError(f"{path}: {key} row count does not match labels")
+    if int(frames.shape[0]) != count:
+        raise ValueError(f"{path}: frame feature row count does not match labels")
+    if not np.isfinite(scalars.astype(np.float32, copy=False)).all():
+        raise ValueError(f"{path}: scalar features contain non-finite values")
+    for start in range(0, count, 1024):
+        if not np.isfinite(
+            np.asarray(frames[start : start + 1024], dtype=np.float32)
+        ).all():
+            raise ValueError(f"{path}: frame features contain non-finite values")
+    integer_labels = labels.astype(np.int64, copy=False)
+    if not np.array_equal(labels, integer_labels) or not set(
+        integer_labels.tolist()
+    ).issubset({0, 1, 2, -100}):
+        raise ValueError(f"{path}: labels are outside the Split v4 canonical set")
+    if int(summary["count"]) != count:
+        raise ValueError(f"{path}: summary row count mismatch")
+    if tuple(frames.shape[1:]) != (
+        int(summary["frame_bins"]),
+        int(summary["frame_dim"]),
+    ):
+        raise ValueError(f"{path}: summary frame geometry mismatch")
+    if tuple(scalars.shape[1:]) != (int(summary["scalar_dim"]),):
+        raise ValueError(f"{path}: summary scalar geometry mismatch")
     partitions = bundle["partitions"].astype(str)
     source_ids = bundle["source_ids"].astype(str)
     core_ids = bundle["core_ids"].astype(str)
     groups = group_row_indexes(bundle)
+    if len(groups) != int(summary["group_count"]):
+        raise ValueError(f"{path}: summary group count mismatch")
+    if "times_s" in bundle:
+        times = np.asarray(bundle["times_s"], dtype=np.float64)
+        if times.shape != (count,) or not np.isfinite(times).all():
+            raise ValueError(f"{path}: candidate times are invalid")
+        for indexes in groups.values():
+            if np.any(times[indexes][1:] <= times[indexes][:-1]):
+                raise ValueError(f"{path}: candidate times are not strictly ordered")
     source_partition: dict[str, str] = {}
     core_group: dict[str, str] = {}
     for group_id, indexes in groups.items():
@@ -165,13 +238,6 @@ def _sequence_defaults(bundle: dict, indexes: np.ndarray) -> dict[str, np.ndarra
 
 def run(args: argparse.Namespace) -> None:
     bundles = [load_sequence_arrays(Path(path)) for path in args.dataset]
-    frame_shape = tuple(bundles[0]["frame_features"].shape[1:])
-    scalar_shape = tuple(bundles[0]["scalar_features"].shape[1:])
-    for path, bundle in zip(args.dataset, bundles):
-        if tuple(bundle["frame_features"].shape[1:]) != frame_shape:
-            raise ValueError(f"frame feature shape mismatch: {path}")
-        if tuple(bundle["scalar_features"].shape[1:]) != scalar_shape:
-            raise ValueError(f"scalar feature shape mismatch: {path}")
     output = Path(args.output)
     output.parent.mkdir(parents=True, exist_ok=True)
     fractions = [float(value) for value in args.fraction]
@@ -182,11 +248,53 @@ def run(args: argparse.Namespace) -> None:
             "row-wise Semantic Split datasets are retired; Split v4 merge "
             "requires whole candidate-island sequences with source_ids/core_ids"
         )
-    for path, bundle in zip(args.dataset, bundles):
-        _validate_current_sequence_bundle(bundle, path)
+    roles = [str(value).strip() for value in args.role]
+    if any(not value for value in roles):
+        raise ValueError("Split v4 merge roles must be non-empty")
+    if len(set(roles)) != len(roles):
+        raise ValueError("Split v4 merge roles must be unique")
+    summaries = [
+        load_training_summary(
+            Path(path), expected_ptm_repo_id=QWEN_ASR_17B_REPO_ID
+        )
+        for path in args.dataset
+    ]
+    contract_fields = (
+        "input_distribution",
+        "feature_schema",
+        "boundary_serialization_contract_id",
+        "ptm_repo_id",
+        "ptm_dim",
+        "mfcc_dim",
+        "scalar_names",
+        "frame_bins",
+        "frame_dim",
+        "scalar_dim",
+        *SPLIT_V4_UPSTREAM_SHA_FIELDS,
+    )
+    reference = summaries[0]
+    for path, bundle, summary in zip(args.dataset, bundles, summaries):
+        _validate_current_sequence_bundle(bundle, path, summary=summary)
+        for field in contract_fields:
+            if summary[field] != reference[field]:
+                raise ValueError(
+                    f"Split v4 merge input {path} has mismatched {field}"
+                )
+    source_bindings: dict[str, dict] = {}
+    for input_summary in summaries:
+        for source_key, binding in input_summary[
+            "source_feature_audio_sha256"
+        ].items():
+            existing = source_bindings.setdefault(source_key, dict(binding))
+            if existing != dict(binding):
+                raise ValueError(
+                    f"Split v4 merge source binding conflict for {source_key!r}"
+                )
     _run_sequence_mode(
         args,
         bundles=bundles,
+        summaries=summaries,
+        source_bindings=source_bindings,
         fractions=fractions,
         rng=rng,
         output=output,
@@ -197,6 +305,8 @@ def _run_sequence_mode(
     args: argparse.Namespace,
     *,
     bundles: list[dict],
+    summaries: list[dict],
+    source_bindings: dict[str, dict],
     fractions: list[float],
     rng: np.random.Generator,
     output: Path,
@@ -211,8 +321,8 @@ def _run_sequence_mode(
     plans: list[dict] = []
     source_partition: dict[str, str] = {}
     core_owner: dict[str, str] = {}
-    for path, role, bundle, fraction in zip(
-        args.dataset, args.role, bundles, fractions
+    for path, role, bundle, summary, fraction in zip(
+        args.dataset, args.role, bundles, summaries, fractions
     ):
         groups = group_row_indexes(bundle)
         selected = stratified_sample_groups(bundle, fraction=fraction, rng=rng)
@@ -249,6 +359,7 @@ def _run_sequence_mode(
                 "path": path,
                 "role": role,
                 "bundle": bundle,
+                "summary": summary,
                 "fraction": fraction,
                 "group_count": len(groups),
                 "selected": selected,
@@ -262,8 +373,17 @@ def _run_sequence_mode(
     if total_rows == 0:
         raise ValueError("sequence merge selected no rows")
     frame_shape = tuple(bundles[0]["frame_features"].shape[1:])
+    with tempfile.NamedTemporaryFile(
+        dir=output.parent,
+        prefix=f".{output.stem}.",
+        suffix=".npz",
+        delete=False,
+    ) as handle:
+        temporary_output = Path(handle.name)
+    temporary_output.unlink(missing_ok=True)
+    temporary_sidecar = frames_sidecar_path(temporary_output)
     out_frames = open_frames_memmap_for_write(
-        output, rows=total_rows, row_shape=frame_shape
+        temporary_output, rows=total_rows, row_shape=frame_shape
     )
     scalar_parts: list[np.ndarray] = []
     label_parts: list[np.ndarray] = []
@@ -280,87 +400,130 @@ def _run_sequence_mode(
     pair_offset = 0
     row_offset = 0
     source_summaries: list[dict] = []
-    for plan in plans:
-        bundle = plan["bundle"]
-        role = plan["role"]
-        flat = plan["flat"]
-        lengths = plan["lengths"]
-        selected = plan["selected"]
-        frames_all = bundle["frame_features"]
-        scalars_all = np.asarray(bundle["scalar_features"], dtype=np.float32)
-        labels_all = np.asarray(bundle["labels"], dtype=np.int64)
-        partitions_all = bundle["partitions"].astype(str)
-        total = int(labels_all.shape[0])
-        defaults_all = _sequence_defaults(bundle, np.arange(total, dtype=np.int64))
-        for start in range(0, int(flat.size), _FRAME_COPY_CHUNK):
-            chunk = flat[start : start + _FRAME_COPY_CHUNK]
-            out_frames[row_offset : row_offset + chunk.size] = frames_all[chunk]
-            row_offset += int(chunk.size)
-        scalar_parts.append(scalars_all[flat])
-        label_parts.append(labels_all[flat])
-        partition_parts.append(partitions_all[flat])
-        source_id_parts.append(bundle["source_ids"].astype(str)[flat])
-        core_id_parts.append(bundle["core_ids"].astype(str)[flat])
-        role_parts.append(np.full(int(flat.size), role))
-        group_parts.append(
-            np.repeat(
-                np.asarray([f"{role}::{name}" for name in selected]),
-                lengths,
+    try:
+        for plan in plans:
+            bundle = plan["bundle"]
+            role = plan["role"]
+            flat = plan["flat"]
+            lengths = plan["lengths"]
+            selected = plan["selected"]
+            frames_all = bundle["frame_features"]
+            scalars_all = np.asarray(bundle["scalar_features"], dtype=np.float32)
+            labels_all = np.asarray(bundle["labels"], dtype=np.int64)
+            partitions_all = bundle["partitions"].astype(str)
+            total = int(labels_all.shape[0])
+            defaults_all = _sequence_defaults(bundle, np.arange(total, dtype=np.int64))
+            for start in range(0, int(flat.size), _FRAME_COPY_CHUNK):
+                chunk = flat[start : start + _FRAME_COPY_CHUNK]
+                out_frames[row_offset : row_offset + chunk.size] = frames_all[chunk]
+                row_offset += int(chunk.size)
+            scalar_parts.append(scalars_all[flat])
+            label_parts.append(labels_all[flat])
+            partition_parts.append(partitions_all[flat])
+            source_id_parts.append(bundle["source_ids"].astype(str)[flat])
+            core_id_parts.append(bundle["core_ids"].astype(str)[flat])
+            role_parts.append(np.full(int(flat.size), role))
+            group_parts.append(
+                np.repeat(
+                    np.asarray([f"{role}::{name}" for name in selected]),
+                    lengths,
+                )
             )
+            time_parts.append(defaults_all["times_s"][flat])
+            structural_parts.append(defaults_all["structural_roles"][flat])
+            pairs = defaults_all["pair_ids"][flat].copy()
+            pairs[pairs >= 0] += pair_offset
+            pair_parts.append(pairs)
+            omni_parts.append(defaults_all["omni_aux"][flat])
+            offset_parts.append(defaults_all["offset_targets_s"][flat])
+            if pairs.size and int(pairs.max()) >= 0:
+                pair_offset = int(pairs.max()) + 1
+            input_summary_path = Path(str(plan["summary"]["summary_path"]))
+            source_summaries.append(
+                {
+                    "path": str(Path(plan["path"]).resolve()),
+                    "dataset_sha256": plan["summary"]["dataset_sha256"],
+                    "frame_sidecar_sha256": plan["summary"][
+                        "frame_sidecar_sha256"
+                    ],
+                    "summary": str(input_summary_path.resolve()),
+                    "summary_sha256": file_sha256(input_summary_path),
+                    "role": role,
+                    "group_count": plan["group_count"],
+                    "sampled_group_count": len(selected),
+                    "fraction": plan["fraction"],
+                    "effective_group_count": len(selected),
+                    "effective_count": int(flat.size),
+                }
+            )
+        out_frames.flush()
+        del out_frames
+        out_frames = None
+        labels = np.concatenate(label_parts)
+        group_ids = np.concatenate(group_parts)
+        save_sequence_dataset(
+            temporary_output,
+            frames_finalized=True,
+            compress=bool(getattr(args, "compress", False)),
+            scalar_features=np.concatenate(scalar_parts),
+            labels=labels,
+            partitions=np.concatenate(partition_parts),
+            source_ids=np.concatenate(source_id_parts),
+            core_ids=np.concatenate(core_id_parts),
+            dataset_roles=np.concatenate(role_parts),
+            group_ids=group_ids,
+            times_s=np.concatenate(time_parts),
+            structural_roles=np.concatenate(structural_parts),
+            pair_ids=np.concatenate(pair_parts),
+            omni_aux=np.concatenate(omni_parts),
+            offset_targets_s=np.concatenate(offset_parts),
         )
-        time_parts.append(defaults_all["times_s"][flat])
-        structural_parts.append(defaults_all["structural_roles"][flat])
-        pairs = defaults_all["pair_ids"][flat].copy()
-        pairs[pairs >= 0] += pair_offset
-        pair_parts.append(pairs)
-        omni_parts.append(defaults_all["omni_aux"][flat])
-        offset_parts.append(defaults_all["offset_targets_s"][flat])
-        if pairs.size and int(pairs.max()) >= 0:
-            pair_offset = int(pairs.max()) + 1
-        source_summaries.append(
-            {
-                "path": str(plan["path"]),
-                "role": role,
-                "group_count": plan["group_count"],
-                "sampled_group_count": len(selected),
-                "fraction": plan["fraction"],
-                "effective_group_count": len(selected),
-                "effective_count": int(flat.size),
-            }
-        )
-    out_frames.flush()
-    del out_frames
-    labels = np.concatenate(label_parts)
-    group_ids = np.concatenate(group_parts)
-    save_sequence_dataset(
-        output,
-        frames_finalized=True,
-        compress=bool(getattr(args, "compress", False)),
-        scalar_features=np.concatenate(scalar_parts),
-        labels=labels,
-        partitions=np.concatenate(partition_parts),
-        source_ids=np.concatenate(source_id_parts),
-        core_ids=np.concatenate(core_id_parts),
-        dataset_roles=np.concatenate(role_parts),
-        group_ids=group_ids,
-        times_s=np.concatenate(time_parts),
-        structural_roles=np.concatenate(structural_parts),
-        pair_ids=np.concatenate(pair_parts),
-        omni_aux=np.concatenate(omni_parts),
-        offset_targets_s=np.concatenate(offset_parts),
-    )
+        os.replace(temporary_sidecar, frames_sidecar_path(output))
+        os.replace(temporary_output, output)
+    finally:
+        if out_frames is not None:
+            out_frames.flush()
+            del out_frames
+        temporary_output.unlink(missing_ok=True)
+        temporary_sidecar.unlink(missing_ok=True)
+    partitions = np.concatenate(partition_parts)
+    source_ids = np.concatenate(source_id_parts)
+    core_ids = np.concatenate(core_id_parts)
     summary = {
-        "schema": "semantic_split_merged_dataset_v3",
+        "schema": SPLIT_V4_DATASET_SUMMARY_SCHEMA,
         "mode": "sequence",
-        "output": str(output),
+        "training_manifest_allowed": True,
+        "output": str(output.resolve()),
+        "dataset_sha256": file_sha256(output),
+        "frame_sidecar_sha256": file_sha256(frames_sidecar_path(output)),
+        "input_distribution": summaries[0]["input_distribution"],
+        "feature_schema": summaries[0]["feature_schema"],
+        "boundary_serialization_contract_id": summaries[0][
+            "boundary_serialization_contract_id"
+        ],
+        "ptm_repo_id": summaries[0]["ptm_repo_id"],
+        "ptm_dim": summaries[0]["ptm_dim"],
+        "mfcc_dim": summaries[0]["mfcc_dim"],
+        "scalar_names": summaries[0]["scalar_names"],
+        **{
+            field: summaries[0][field]
+            for field in SPLIT_V4_UPSTREAM_SHA_FIELDS
+        },
         "count": int(labels.shape[0]),
+        "frame_bins": int(frame_shape[0]),
+        "frame_dim": int(frame_shape[1]),
+        "scalar_dim": int(scalar_parts[0].shape[1]),
         "group_count": int(np.unique(group_ids).size),
+        "source_count": int(np.unique(source_ids).size),
+        "core_count": int(np.unique(core_ids).size),
+        "partitions": {
+            name: int(np.sum(partitions == name))
+            for name in ("train", "val", "test")
+        },
+        "source_feature_audio_sha256": source_bindings,
         "sources": source_summaries,
     }
-    output.with_suffix(".summary.json").write_text(
-        json.dumps(summary, ensure_ascii=False, indent=2) + "\n",
-        encoding="utf-8",
-    )
+    _write_json_atomic(output.with_suffix(".summary.json"), summary)
     print(json.dumps(summary, ensure_ascii=False))
 
 

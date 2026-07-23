@@ -6,6 +6,7 @@ import argparse
 import gc
 import hashlib
 import json
+import os
 import random
 import sys
 import time
@@ -630,12 +631,35 @@ def _plan_training_batches(
 
 
 def _write_progress(path: Path, payload: dict[str, Any]) -> None:
-    temporary = path.with_suffix(path.suffix + ".tmp")
-    temporary.write_text(
-        json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
-        encoding="utf-8",
-    )
-    temporary.replace(path)
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    try:
+        with temporary.open("w", encoding="utf-8", newline="\n") as handle:
+            handle.write(
+                json.dumps(
+                    payload,
+                    ensure_ascii=False,
+                    indent=2,
+                    sort_keys=True,
+                    allow_nan=False,
+                )
+            )
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def _torch_save_atomic(payload: object, path: Path) -> None:
+    import torch
+
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    try:
+        torch.save(payload, temporary)
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
 def run(args: argparse.Namespace) -> dict[str, Any]:
@@ -1122,7 +1146,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         metadata=metadata,
         schema=schema,
     )
-    torch.save(payload, checkpoint_path)
+    _torch_save_atomic(payload, checkpoint_path)
     del payload, optimizer, model
     cache.clear()
     del cache
@@ -1177,10 +1201,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "stage_lifecycle": lifecycle,
         "memory_snapshots": memory_snapshots,
     }
-    (output_dir / "summary.json").write_text(
-        json.dumps(summary, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
-        encoding="utf-8",
-    )
+    _write_progress(output_dir / "summary.json", summary)
     _write_progress(
         progress_path,
         {

@@ -46,7 +46,7 @@ Outer职责是完整 Scorer candidate island到供Split查询的acoustic outer c
 ## 执行与生命周期
 
 - Boundary、Outer、Split、CueQC、Inner的`device=auto`过去会在CUDA不可用时静默落到CPU。现统一为auto必须解析到CUDA，否则fail-fast；显式`device=cpu`只保留给单元测试和审计smoke。
-- pipeline已在Outer、Split、Inner和CueQC后显式释放model并清allocator，但当前Inner预测实际在CueQC之前预计算，只在CueQC keep过滤后应用。这与“Inner只接收post-CueQC keep sub-island”的职责不一致，也浪费被CueQC drop样本的推理。由于feature provider生命周期目前封装在Boundary阶段，本轮先记录为Outer/Scorer晋升后的必改项，不用规则或重复PTM提取临时绕过。
+- 2026-07-23 已修正为 Outer → Split → provisional sub-islands → CueQC → Inner：Inner 模型只接收 CueQC argmax keep 项，drop 项不会再进入 Inner 推理。为保持 cache 命中与完整推理等价，Boundary cache 使用同一内容签名分别保存 provisional chunk JSON 与 raw PTM/MFCC sidecar；缺失或损坏 sidecar 时 fail-closed 重建，不重复引入 PTM128、规则 fallback 或隐式全局状态。Outer、Split、CueQC、Inner结束后仍逐阶段释放model并清allocator。
 - README已更新Scorer v11主臂为P2048/H256并把Proposal v1写为审计参考；full-workflow不再公开旧Proposal启发式旋钮。
 
 ## 后续顺序
@@ -55,4 +55,4 @@ Outer职责是完整 Scorer candidate island到供Split查询的acoustic outer c
 2. 用最终Scorer重放Proposal v1并生成miss audit；据证据保留或换成全学习型candidate/event query。
 3. 生成真实post-Scorer island数据，训练/gate Outer v3。
 4. 用最终Proposal/Outer生成新schema Split candidate-query数据，移除旧heuristic scalar语义后先跑neutral baseline。
-5. 将Inner推理真正移动到CueQC keep之后，再重跑CueQC/Inner fixed partition gate和batch/lifecycle回归。
+5. Inner post-CueQC keep执行顺序已经修正；后续在最终上游输出上重跑CueQC/Inner fixed partition gate和batch/lifecycle回归。

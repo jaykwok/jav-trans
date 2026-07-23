@@ -109,6 +109,24 @@ def _candidate_page(rows: list[dict[str, Any]]) -> str:
         "只允许显式 inside_candidate/unsure 区间",
         "只允许显式 inside_candidate/unsure 区间；同一 ASR 单元内部停顿和尾音也属于 inside_candidate",
     )
+    outside_marker = (
+        "<div><b>outside_candidate 合同：</b>未标出的差集只有在勾选“已从头听到尾”后才成为 "
+        "outside_candidate。unsure 会保留在 canonical，并在 normalization、split、loss、metrics "
+        "和 gate 中映射为 ignore=-100。</div>"
+    )
+    if outside_marker not in page:
+        raise ValueError("candidate audit template outside-candidate guidance changed")
+    page = page.replace(
+        outside_marker,
+        outside_marker
+        + "\n  <div><b>黄色 outside_candidate 检查：</b>点击黄色条即可精确播放该区间。"
+        "黄色只有在确认不含词语或对白、并且能独立于同一轮对白波形安全删除时才成立；"
+        "若疑似存在短词、尾音、含混对白，或删除会把同一轮对白割开，应改为 inside_candidate 或 unsure。"
+        "独立的纯呻吟、喘息可以标 outside；夹在同一对白包络内的声音应随 inside_candidate 保留。"
+        "CueQC 可以丢弃已切出的整段非语义 sub-island，Inner 主要负责已保留 sub-island 的首尾 acoustic core，"
+        "不是内部噪声分离器；不要把下游能力当作提前删除 Scorer 语音的理由，也不要为了提前清理而牺牲 Scorer 的 inside recall。</div>",
+        1,
+    )
     return page
 
 

@@ -61,11 +61,61 @@ def test_compare_candidate_island_preaudits_reports_frame_deltas(tmp_path: Path)
     assert summary["sources_changed"] == 1
     assert summary["valid_source_count"] == 1
     assert summary["valid_candidate_unsure_ratio"] == 0.0
+    assert summary["limit"] == 0
+    assert summary["audit_navigation_updated"] is True
     assert summary["base_inside_frames"] == 4
     assert summary["candidate_inside_frames"] == 6
     assert summary["changed_frames"] == 3
     page = (tmp_path / "out" / "index.html").read_text(encoding="utf-8")
     assert "同一冻结 1 source" in page
     assert "红色=两版逐帧标签不同" in page
+    assert "safe outside" in page
+    assert "环境底噪、音乐、机械声等背景噪声" in page
+    assert "row.candidate_outside_spans" in page
+    assert "base-outside" in page and "candidate-outside" in page
     assert 'id="stop"' in page
     assert "document.getElementById('stop').onclick=stop" in page
+    assert 'preload="metadata"' in page
+    assert "playToken" in page
+    assert "waitForMetadata" in page
+    assert "await audio.play()" in page
+
+
+def test_compare_candidate_island_preaudits_can_limit_to_frozen_prefix(tmp_path: Path) -> None:
+    manifest = tmp_path / "manifest.jsonl"
+    base = tmp_path / "base.jsonl"
+    candidate = tmp_path / "candidate.jsonl"
+    rows = []
+    for index in range(3):
+        (tmp_path / f"source-{index}.wav").write_bytes(b"wav")
+        rows.append(
+            {
+                "source_id": f"s{index}",
+                "frame_count": 10,
+                "duration_s": 0.2,
+                "audio": f"source-{index}.wav",
+                "audio_sha256": f"sha{index}",
+            }
+        )
+    _write(manifest, rows)
+    _write(
+        base,
+        [
+            {**row, "islands": [], "unsure_spans": []}
+            for row in rows
+        ],
+    )
+    _write(
+        candidate,
+        [{**rows[0], "islands": [], "unsure_spans": []}],
+    )
+    # The first source is complete; the remaining two are intentionally absent.
+    summary = compare(
+        manifest=manifest,
+        base=base,
+        candidate=candidate,
+        output_dir=tmp_path / "out",
+        limit=1,
+    )
+    assert summary["source_count"] == 1
+    assert summary["limit"] == 1

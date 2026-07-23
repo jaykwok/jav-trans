@@ -29,7 +29,6 @@ from tools.asr.cueqc.label_pre_asr_with_omni import (  # noqa: E402
 )
 from tools.datasets.label_joint_boundary_preasr_with_omni import (  # noqa: E402
     JOINT_SCHEMA,
-    LEGACY_JOINT_PROMPT_VERSION,
     PROMPT_VERSION,
     _build_pre_asr_prompt,
     _collect_completed,
@@ -827,7 +826,6 @@ def _write_summary(*, dataset: Path, output: Path, model: str, args: argparse.Na
             "sample_rate": 16000,
             "model": model,
             "prompt_version": PROMPT_VERSION,
-            "legacy_joint_prompt_version": LEGACY_JOINT_PROMPT_VERSION,
             "request_mode": "separate_single_task",
             "label_task": "pre_asr",
             **_task_units("pre_asr"),

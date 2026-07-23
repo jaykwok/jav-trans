@@ -19,7 +19,6 @@ from boundary.sequence_features import (
 )
 from tools.asr.cueqc.pre_asr_feature_compiler import compile_features, read_labels
 from tools.asr.cueqc.pre_asr_binary_trainer import (
-    _apply_forced_group_splits,
     _boost_anchor_positions,
     _excluded_training_label_count,
     _matching_candidate_positions,
@@ -680,12 +679,34 @@ def test_compile_pre_asr_cueqc_features_ignores_text_columns(tmp_path: Path):
         label_paths=[str(labels)],
         output=output,
         asr_repo_id="jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame-hf",
+        legacy_audit_only=True,
     )
 
     assert summary["chunk_count"] == 2
     assert summary["keep"] == 1
     assert summary["drop"] == 1
+    assert summary["training_manifest_allowed"] is False
     assert "text" not in " ".join(summary["feature_names"]).lower()
+
+
+def test_compile_pre_asr_cueqc_default_rejects_legacy_labels(tmp_path: Path) -> None:
+    chunks = tmp_path / "chunks.jsonl"
+    labels = tmp_path / "labels.jsonl"
+    output = tmp_path / "features.pt"
+    row = _pre_asr_candidate(0, video_id="AAA")
+    chunks.write_text(json.dumps(row) + "\n", encoding="utf-8")
+    labels.write_text(
+        json.dumps({"sample_id": row["sample_id"], "label": "keep"}) + "\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="cueqc_v13_canonical_label_v2"):
+        compile_features(
+            chunk_paths=[str(chunks)],
+            label_paths=[str(labels)],
+            output=output,
+            asr_repo_id="jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame-hf",
+        )
 
 
 def test_pre_asr_compiler_preserves_raw_teacher_after_manual_override(
@@ -759,11 +780,13 @@ def test_compile_pre_asr_cueqc_features_reads_jsonl_chunk_candidates(tmp_path: P
         label_paths=[str(labels)],
         output=output,
         asr_repo_id="jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame-hf",
+        legacy_audit_only=True,
     )
 
     assert summary["chunk_count"] == 2
     assert summary["keep"] == 1
     assert summary["drop"] == 1
+    assert summary["training_manifest_allowed"] is False
     bundle = load_feature_bundle(output)
     assert bundle["groups"][0]["audio_id"] == "AAA"
     assert (
@@ -816,7 +839,8 @@ def test_compile_pre_asr_cueqc_keeps_per_row_source_identity_in_combined_jsonl(
         candidate = _pre_asr_candidate(index, video_id=video_id)
         source_rows.append(
             {
-                "schema": "runtime_v12_provisional_subisland_v1",
+                "schema": "runtime_v12_provisional_subisland_v2",
+                "inner_execution_status": "deferred_until_cueqc_keep",
                 "sample_id": video_id,
                 "source_id": f"source-{video_id}",
                 "subisland_id": f"{video_id}__v12s00",
@@ -848,6 +872,7 @@ def test_compile_pre_asr_cueqc_keeps_per_row_source_identity_in_combined_jsonl(
         label_paths=[str(labels)],
         output=output,
         asr_repo_id="jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame-hf",
+        legacy_audit_only=True,
     )
     bundle = torch.load(output, map_location="cpu", weights_only=False)
 
@@ -875,6 +900,7 @@ def test_compile_pre_asr_cueqc_rejects_unapproved_runtime_rows(
             label_paths=[str(labels)],
             output=output,
             asr_repo_id="jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame-hf",
+            legacy_audit_only=True,
         )
 
 
@@ -905,6 +931,7 @@ def test_compile_pre_asr_cueqc_rejects_reused_semantic_core(
             label_paths=[str(labels)],
             output=output,
             asr_repo_id="jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame-hf",
+            legacy_audit_only=True,
         )
 
 
@@ -937,6 +964,7 @@ def test_compile_pre_asr_cueqc_rejects_mixed_upstream_checkpoint_identity(
             label_paths=[str(labels)],
             output=output,
             asr_repo_id="jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame-hf",
+            legacy_audit_only=True,
         )
 
 
@@ -980,12 +1008,14 @@ def test_compile_pre_asr_cueqc_preserves_selected_teacher_unsure_only(
         label_paths=[str(labels)],
         output=output,
         asr_repo_id="jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame-hf",
+        legacy_audit_only=True,
     )
     bundle = torch.load(output, map_location="cpu", weights_only=False)
 
     assert summary["chunk_count"] == 1
     assert summary["teacher_unsure_ignored"] == 1
     assert summary["ambiguous_ignore"] == 0
+    assert summary["training_manifest_allowed"] is False
     unsure_row = next(row for row in bundle["rows"] if row["teacher_label"] == "unsure")
     assert unsure_row["label"] == "teacher_unsure_ignored"
     assert unsure_row["training_ignore_reason"] == "teacher_unsure"
@@ -1025,6 +1055,7 @@ def test_compile_pre_asr_cueqc_features_expands_source_windows_manifest(tmp_path
         label_paths=[str(labels)],
         output=output,
         asr_repo_id="jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame-hf",
+        legacy_audit_only=True,
     )
 
     assert summary["chunk_count"] == 2
@@ -1051,6 +1082,7 @@ def test_compile_pre_asr_cueqc_features_reads_single_object_candidate_file(tmp_p
         label_paths=[str(labels)],
         output=output,
         asr_repo_id="jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame-hf",
+        legacy_audit_only=True,
     )
     bundle = torch.load(output, map_location="cpu")
 
@@ -1086,6 +1118,7 @@ def test_compile_pre_asr_cueqc_sample_labels_do_not_broadcast_by_cluster(tmp_pat
         label_paths=[str(labels)],
         output=output,
         asr_repo_id="jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame-hf",
+        legacy_audit_only=True,
     )
     bundle = torch.load(output, map_location="cpu")
 
@@ -1148,6 +1181,7 @@ def test_compile_pre_asr_cueqc_broadcasts_cluster_examples_to_sample_ids(tmp_pat
         label_paths=[str(labels)],
         output=output,
         asr_repo_id="jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame-hf",
+        legacy_audit_only=True,
     )
     bundle = torch.load(output, map_location="cpu")
 
@@ -1210,6 +1244,7 @@ def test_compile_pre_asr_cueqc_matches_video_chunk_and_cluster_id_labels(tmp_pat
         label_paths=[str(labels)],
         output=output,
         asr_repo_id="jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame-hf",
+        legacy_audit_only=True,
     )
     bundle = torch.load(output, map_location="cpu")
 
@@ -1244,7 +1279,7 @@ def test_pre_asr_training_rejects_chunk_stratified_split():
 
 
 def test_pre_asr_training_fixed_partitions_are_disjoint():
-    y = np.asarray([[0, 1, 2], [0, 1, 2], [0, 1, 2]], dtype=np.int64)
+    y = np.asarray([[0, 1, -100], [0, 1, -100], [0, 1, -100]], dtype=np.int64)
     chunk_mask = np.ones_like(y, dtype=np.float32)
 
     train_mask, val_mask, test_mask, summary = _split_label_masks(
@@ -1271,7 +1306,8 @@ def test_pre_asr_training_fixed_partitions_are_disjoint():
     assert summary["train_counts"]["excluded_unsure"] == 0
     assert summary["val_counts"]["excluded_unsure"] == 0
     assert summary["test_counts"]["excluded_unsure"] == 0
-    assert summary["all_counts"]["excluded_unsure"] == 3
+    assert summary["all_counts"]["excluded_unsure"] == 0
+    assert summary["all_counts"]["ambiguous_ignore"] == 3
 
 
 def test_pre_asr_training_requires_exact_split_and_inner_dataset_bindings():
@@ -1314,13 +1350,13 @@ def test_pre_asr_training_requires_approved_central_contract_bundle():
         )
 
 
-def test_pre_asr_excluded_training_count_includes_canonical_and_legacy_unsure():
-    y = np.asarray([[0, 1, 2, -100], [2, -100, 1, 0]], dtype=np.int64)
+def test_pre_asr_excluded_training_count_uses_canonical_unsure_metadata():
+    y = np.asarray([[0, 1, -100, -100], [-100, -100, 1, 0]], dtype=np.int64)
 
     assert _excluded_training_label_count(
         {"teacher_unsure_ignored": 3},
         y,
-    ) == 5
+    ) == 3
 
 
 def test_pre_asr_prediction_rows_keep_unsure_out_of_metrics_and_runtime_labels():
@@ -1362,31 +1398,6 @@ def test_pre_asr_prediction_rows_keep_unsure_out_of_metrics_and_runtime_labels()
     assert all(row["prediction"] in {"drop", "keep"} for row in rows)
 
 
-def test_pre_asr_forced_group_splits_never_restore_teacher_unsure() -> None:
-    y = np.asarray([[0, 1, 2, -100], [0, 1, 2, -100]], dtype=np.int64)
-    chunk_mask = np.ones_like(y, dtype=np.float32)
-    train = np.asarray(
-        [[False, False, False, False], [True, True, False, False]],
-        dtype=bool,
-    )
-    val = np.asarray(
-        [[True, True, False, False], [False, False, False, False]],
-        dtype=bool,
-    )
-
-    _apply_forced_group_splits(
-        train=train,
-        val=val,
-        y=y,
-        chunk_mask=chunk_mask,
-        force_train_groups={0},
-        force_val_groups={1},
-    )
-
-    assert np.array_equal(train, [[True, True, False, False], [False, False, False, False]])
-    assert np.array_equal(val, [[False, False, False, False], [True, True, False, False]])
-
-
 def test_pre_asr_v13_metrics_exclude_teacher_unsure() -> None:
     probs = np.asarray(
         [
@@ -1397,7 +1408,7 @@ def test_pre_asr_v13_metrics_exclude_teacher_unsure() -> None:
         ],
         dtype=np.float32,
     )
-    labels = np.asarray([0, 1, 2, 1], dtype=np.int64)
+    labels = np.asarray([0, 1, -100, 1], dtype=np.int64)
     durations = np.ones((4,), dtype=np.float32)
 
     metrics = classification_metrics(probs, labels, durations)
