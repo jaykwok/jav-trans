@@ -155,9 +155,10 @@ def test_scorer_review_reports_bridged_split_level_background_without_auto_failu
         "inside_candidate",
     ]
     protect = [True, True, True, True, True, True]
-    gaps = _bridged_background_gaps(human, protect)
+    gaps = _bridged_background_gaps(human, protect, source_id="source-a")
     assert gaps == [
         {
+            "gap_id": "source-a::bridge-gap::000002-000004",
             "label": "bridge",
             "start_s": 0.04,
             "end_s": 0.08,
@@ -247,9 +248,19 @@ def test_dual_evidence_review_compares_against_full_human_truth(
     assert summary["remove_precision"] == 5 / 6
     assert summary["final_outside_precision"] == 1.0
     assert summary["supervised_ratio"] == 0.7
+    assert summary["manual_verdict_schema"] == (
+        "candidate_island_scorer_v11_bridge_gap_manual_verdict_v1"
+    )
+    assert summary["manual_verdicts"].endswith("manual_verdicts.jsonl")
     page = (tmp_path / "out" / "index.html").read_text(encoding="utf-8")
     assert "Protect × Remove 双证据" in page
     assert "真语音被 outside 命中" in page
     assert 'preload="metadata"' in page
     assert "waitForMetadata" in page
     assert "audio.play()" in page
+    assert "acceptable_continuous_envelope" in page
+    assert "overmerged_independent_background" in page
+    assert "candidate_island_scorer_v11_bridge_gap_manual_verdict_v1" in page
+    assert "/__audit_api__/save-labels" in page
+    assert "manual_verdicts.jsonl" in page
+    assert "localStorage" in page

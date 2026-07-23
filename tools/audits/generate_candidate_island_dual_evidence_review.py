@@ -30,6 +30,9 @@ from tools.audits.compare_candidate_island_preaudits import (  # noqa: E402
 
 SUMMARY_SCHEMA = "candidate_island_dual_evidence_review_summary_v1"
 DETAIL_SCHEMA = "candidate_island_dual_evidence_review_item_v1"
+BRIDGE_VERDICT_SCHEMA = (
+    "candidate_island_scorer_v11_bridge_gap_manual_verdict_v1"
+)
 
 
 def _human_labels(row: dict[str, Any], *, frame_count: int) -> list[str]:
@@ -110,6 +113,8 @@ def _human_span_coverage(
 def _bridged_background_gaps(
     human_labels: list[str],
     protect: list[bool],
+    *,
+    source_id: str,
 ) -> list[dict[str, Any]]:
     result: list[dict[str, Any]] = []
     frame_count = len(human_labels)
@@ -128,6 +133,9 @@ def _bridged_background_gaps(
             continue
         result.append(
             {
+                "gap_id": (
+                    f"{source_id}::bridge-gap::{start:06d}-{end:06d}"
+                ),
                 "label": "bridge",
                 "start_s": start * 0.02,
                 "end_s": end * 0.02,
@@ -144,14 +152,36 @@ def _bridged_background_gaps(
 
 def _page(rows: list[dict[str, Any]]) -> str:
     encoded = json.dumps(rows, ensure_ascii=False).replace("</", "<\\/")
-    return f"""<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Scorer v11 dual-evidence held-out review</title><style>
-body{{margin:0;background:#f4f7fa;color:#18212b;font-family:Segoe UI,Microsoft YaHei,sans-serif}}header{{position:sticky;top:0;z-index:3;display:flex;gap:10px;align-items:center;background:#122233;color:#fff;padding:12px 18px}}header #status{{margin-left:auto}}main{{max-width:1500px;margin:auto;padding:16px}}article{{background:#fff;border:1px solid #ccd6df;border-radius:10px;padding:14px;margin-bottom:14px}}audio{{width:100%;margin:8px 0}}.lane{{display:grid;grid-template-columns:220px 1fr;gap:8px;align-items:center;margin:8px 0}}.lane-label{{display:flex;flex-direction:column;gap:2px}}.lane-label small{{color:#607080}}.track{{position:relative;height:40px;background:#e7ebef;border-radius:5px;overflow:hidden}}.span{{position:absolute;top:0;height:100%;border:0;min-width:2px;cursor:pointer;font-size:10px;overflow:hidden;white-space:nowrap}}.human-inside{{background:#315f9d;color:#fff}}.human-outside{{background:#8d98a5;color:#fff}}.human-unsure{{background:#725190;color:#fff}}.protect{{background:#27a2c2;color:#fff}}.remove{{background:#e5bb2c;color:#1d1d1d}}.final-inside{{background:#258b57;color:#fff}}.final-outside{{background:#f2cf45;color:#1d1d1d}}.final-unsure{{background:#d87800;color:#fff}}.conflict{{background:#8d3db7;color:#fff}}.bridge{{background:#6f8734;color:#fff}}.unsafe{{background:#d32626;color:#fff}}button.playing{{outline:3px solid #111;outline-offset:-3px}}.metrics{{display:flex;gap:14px;flex-wrap:wrap;margin-top:8px;font-size:12px}}.good{{color:#087443}}.bad{{color:#b3261e;font-weight:700}}.legend{{display:flex;gap:13px;flex-wrap:wrap}}.swatch{{display:inline-block;width:12px;height:12px;border-radius:2px;margin-right:4px;vertical-align:-1px}}small{{color:#607080}}</style></head><body><header><b>Scorer v11 · Protect × Remove 双证据 held-out 对照</b><button id="stop" type="button">停止播放</button><span id="status"></span></header><main><section><p>人工蓝段是既有 Split 级语音锚点，不把锚点之间每段 background 自动视为 Scorer 反例。Protect 可以桥接同一连续对话包络中的 background；页面单独列出这些 gap 供听感判断，绝不按固定时长自动判错。硬失败仍是漏保护人工语音锚点，或 Remove-only 命中人工真语音。</p><p class="legend"><span><i class="swatch protect"></i>Protect evidence</span><span><i class="swatch remove"></i>Remove evidence</span><span><i class="swatch bridge"></i>被桥接 background gap</span><span><i class="swatch conflict"></i>冲突</span><span><i class="swatch unsafe"></i>真语音误删</span></p></section><div id="list"></div></main><script>
-const rows={encoded};{AUDIO_SPAN_PLAYER_JS}
-function esc(v){{return String(v??'').replace(/[&<>"']/g,c=>({{'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}}[c]));}}
-function lane(card,audio,row,label,spans,kind,metric=''){{const line=document.createElement('div');line.className='lane';line.innerHTML=`<div class="lane-label"><b>${{esc(label)}}</b><small>${{esc(metric)}}</small></div><div class="track"></div>`;const track=line.querySelector('.track');for(const span of spans){{const button=document.createElement('button'),start=Number(span.start_s),end=Number(span.end_s),suffix=span.label==='inside_candidate'?'inside':span.label==='outside_candidate'?'outside':'unsure';button.className=`span ${{kind==='human'?`human-${{suffix}}`:kind==='final'?`final-${{suffix}}`:kind}}`;button.style.left=`${{100*start/row.duration_s}}%`;button.style.width=`${{Math.max(.12,100*(end-start)/row.duration_s)}}%`;button.title=`${{label}} ${{span.label||kind}} ${{start.toFixed(2)}}–${{end.toFixed(2)}}s`;button.textContent=`${{start.toFixed(2)}}–${{end.toFixed(2)}}s`;button.onclick=()=>play(audio,button,start,end);track.appendChild(button);}}card.appendChild(line);}}
-const root=document.getElementById('list');for(const row of rows){{const card=document.createElement('article');card.innerHTML=`<h2>${{esc(row.source_id)}}</h2><small>${{esc(row.partition)}} · ${{Number(row.duration_s).toFixed(2)}}s${{row.failed_closed?' · ⚠ teacher failed closed':''}}</small><audio controls preload="metadata" src="${{esc(row.audio)}}"></audio>`;const audio=card.querySelector('audio');lane(card,audio,row,'人工语音锚点 / BG',row.human_spans,'human',`inside ${{(100*row.human_inside_ratio).toFixed(1)}}%`);lane(card,audio,row,'Protect evidence',row.protect_spans,'protect',`anchor coverage ${{(100*row.protect_recall).toFixed(1)}}% · full spans ${{row.fully_protected_human_span_count}}/${{row.human_inside_span_count}}`);lane(card,audio,row,'Remove evidence',row.remove_spans,'remove',`anchor hits ${{row.remove_human_inside_frames}} frames`);lane(card,audio,row,'最终三态标签',row.final_spans,'final',`inside ${{(100*row.final_inside_ratio).toFixed(1)}}% · outside ${{(100*row.final_outside_ratio).toFixed(1)}}% · unsure ${{(100*row.final_unsure_ratio).toFixed(1)}}%`);lane(card,audio,row,'被 Protect 桥接的 BG gap',row.bridged_background_gaps,'bridge',`${{row.bridged_gap_count}} gaps · max ${{row.max_bridged_gap_s.toFixed(2)}}s`);lane(card,audio,row,'Protect / Remove 冲突',row.conflict_spans,'conflict',`${{row.conflict_frames}} frames`);lane(card,audio,row,'真语音被 outside 命中',row.unsafe_outside_spans,'unsafe',`${{row.unsafe_outside_frames}} frames / ${{row.unsafe_outside_s.toFixed(2)}}s`);const metrics=document.createElement('div');metrics.className='metrics';metrics.innerHTML=`<span>supervised ${{(100*row.supervised_ratio).toFixed(1)}}%</span><span class="${{row.protect_recall>=.95?'good':'bad'}}">anchor coverage ${{(100*row.protect_recall).toFixed(1)}}%</span><span>outside precision ${{(100*row.final_outside_precision).toFixed(1)}}%</span><span class="${{row.unsafe_outside_frames===0?'good':'bad'}}">true-speech outside=${{row.unsafe_outside_frames}}</span>`;card.appendChild(metrics);root.appendChild(card);}}
-document.getElementById('stop').onclick=()=>{{stop();document.getElementById('status').textContent='已停止';}};document.getElementById('status').textContent=`${{rows.length}} sources · unsafe ${{rows.reduce((n,r)=>n+r.unsafe_outside_frames,0)}} frames`;
+    template = r"""<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Scorer v11 dual-evidence held-out review</title><style>
+body{margin:0;background:#f4f7fa;color:#18212b;font-family:Segoe UI,Microsoft YaHei,sans-serif}header{position:sticky;top:0;z-index:3;display:flex;gap:10px;align-items:center;background:#122233;color:#fff;padding:12px 18px}header #status{margin-left:auto}header button{padding:7px 12px}main{max-width:1500px;margin:auto;padding:16px}article{background:#fff;border:1px solid #ccd6df;border-radius:10px;padding:14px;margin-bottom:14px}audio{width:100%;margin:8px 0}.lane{display:grid;grid-template-columns:220px 1fr;gap:8px;align-items:center;margin:8px 0}.lane-label{display:flex;flex-direction:column;gap:2px}.lane-label small{color:#607080}.track{position:relative;height:40px;background:#e7ebef;border-radius:5px;overflow:hidden}.span{position:absolute;top:0;height:100%;border:0;min-width:2px;cursor:pointer;font-size:10px;overflow:hidden;white-space:nowrap}.human-inside{background:#315f9d;color:#fff}.human-outside{background:#8d98a5;color:#fff}.human-unsure{background:#725190;color:#fff}.protect{background:#27a2c2;color:#fff}.remove{background:#e5bb2c;color:#1d1d1d}.final-inside{background:#258b57;color:#fff}.final-outside{background:#f2cf45;color:#1d1d1d}.final-unsure{background:#d87800;color:#fff}.conflict{background:#8d3db7;color:#fff}.bridge{background:#6f8734;color:#fff}.unsafe{background:#d32626;color:#fff}button.playing{outline:3px solid #111;outline-offset:-3px}.metrics{display:flex;gap:14px;flex-wrap:wrap;margin-top:8px;font-size:12px}.good{color:#087443}.bad{color:#b3261e;font-weight:700}.legend{display:flex;gap:13px;flex-wrap:wrap}.swatch{display:inline-block;width:12px;height:12px;border-radius:2px;margin-right:4px;vertical-align:-1px}small{color:#607080}.gap-reviews{margin-top:14px;border-top:1px solid #d7e0e8;padding-top:10px}.gap-review{display:grid;grid-template-columns:minmax(210px,310px) minmax(420px,1fr);gap:10px;padding:10px;margin:8px 0;background:#f7f9f3;border:1px solid #d5ddbd;border-radius:8px}.gap-play{width:100%;min-height:42px;text-align:left;background:#6f8734;color:#fff;border:0;border-radius:5px;padding:7px 9px;cursor:pointer}.gap-controls{display:flex;gap:6px;flex-wrap:wrap;align-items:center}.choice{border:1px solid #8d99a5;border-radius:5px;background:#fff;padding:7px 9px;cursor:pointer}.choice.active{outline:3px solid #18212b;outline-offset:-2px}.choice[data-verdict="acceptable_continuous_envelope"].active{background:#bfe5cc}.choice[data-verdict="overmerged_independent_background"].active{background:#f4b8b4}.choice[data-verdict="unsure"].active{background:#f3d49d}.gap-note{width:100%;min-height:42px;margin-top:7px;box-sizing:border-box}.empty{color:#607080;font-style:italic}@media(max-width:900px){.lane{grid-template-columns:1fr}.gap-review{grid-template-columns:1fr}}
+</style></head><body><header><b>Scorer v11 · Protect × Remove 双证据 held-out 对照</b><button id="stop" type="button">停止播放</button><button id="save" type="button">保存桥接裁决</button><span id="status"></span></header><main><section><p>人工蓝段是既有 Split 级语音锚点，不是 Scorer 的逐帧 outside 真值。若多个人工锚点属于同一轮近连续对话，Protect 可以把锚点间短背景一起纳入连续候选包络；只有中间背景在听感上构成独立、明显过长且本应在 Scorer 阶段安全删除的段落，才判为过度合并。时长只作为人工听感证据，页面不使用固定秒数自动判错。</p><p>硬失败仍是漏保护人工语音锚点，或 Remove-only 命中人工真语音。下方每条 source 保留完整播放器；绿色 gap 条和“播放精确 gap”按钮只播放该 gap，不附加上下文。</p><p class="legend"><span><i class="swatch protect"></i>Protect evidence</span><span><i class="swatch remove"></i>Remove evidence</span><span><i class="swatch bridge"></i>被 Protect 覆盖的锚点间 BG gap</span><span><i class="swatch conflict"></i>冲突</span><span><i class="swatch unsafe"></i>真语音误删</span></p></section><div id="list"></div></main><script>
+const rows=__ROWS__;
+const verdictSchema=__VERDICT_SCHEMA__;
+const boundaryContract=__BOUNDARY_CONTRACT__;
+const storageKey='candidate-island-scorer-v11-bridge-gap-review-v1:'+location.pathname;
+let annotations={};try{annotations=JSON.parse(localStorage.getItem(storageKey)||'{}');}catch(_error){annotations={};}
+__AUDIO_PLAYER__
+function esc(v){return String(v??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));}
+function allGaps(){return rows.flatMap(row=>row.bridged_background_gaps.map(gap=>({row,gap})));}
+function ensure(gap){annotations[gap.gap_id]??={verdict:'',note:''};return annotations[gap.gap_id];}
+function persist(){localStorage.setItem(storageKey,JSON.stringify(annotations));updateStatus();}
+function updateStatus(message=''){const gaps=allGaps(),done=gaps.filter(({gap})=>ensure(gap).verdict).length;document.getElementById('status').textContent=(message?message+' · ':'')+`桥接裁决 ${done}/${gaps.length} · unsafe ${rows.reduce((n,row)=>n+row.unsafe_outside_frames,0)} frames`;}
+function lane(card,audio,row,label,spans,kind,metric=''){const line=document.createElement('div');line.className='lane';line.innerHTML=`<div class="lane-label"><b>${esc(label)}</b><small>${esc(metric)}</small></div><div class="track"></div>`;const track=line.querySelector('.track');for(const span of spans){const button=document.createElement('button'),start=Number(span.start_s),end=Number(span.end_s),suffix=span.label==='inside_candidate'?'inside':span.label==='outside_candidate'?'outside':'unsure';button.className=`span ${kind==='human'?`human-${suffix}`:kind==='final'?`final-${suffix}`:kind}`;button.style.left=`${100*start/row.duration_s}%`;button.style.width=`${Math.max(.12,100*(end-start)/row.duration_s)}%`;button.title=`${label} ${span.label||kind} ${start.toFixed(2)}–${end.toFixed(2)}s`;button.textContent=`${start.toFixed(2)}–${end.toFixed(2)}s`;button.onclick=()=>play(audio,button,start,end);track.appendChild(button);}card.appendChild(line);}
+function renderGapReviews(card,audio,row){const section=document.createElement('div');section.className='gap-reviews';section.innerHTML='<b>锚点间 background gap 人工裁决</b><small> “可接受”表示可作为同一连续候选包络保留；“过度合并”表示该背景在当前上下文中声学独立且长到应由 Scorer 安全删除。禁止仅按秒数判断。</small>';if(!row.bridged_background_gaps.length){const empty=document.createElement('p');empty.className='empty';empty.textContent='本条没有被 Protect 覆盖的锚点间 background gap。';section.appendChild(empty);}for(const gap of row.bridged_background_gaps){const state=ensure(gap),item=document.createElement('div');item.className='gap-review';item.innerHTML=`<div><button type="button" class="gap-play">播放精确 gap ${Number(gap.start_s).toFixed(2)}–${Number(gap.end_s).toFixed(2)}s</button><small>${esc(gap.gap_id)}<br>duration=${Number(gap.duration_s).toFixed(2)}s · protected=${(100*Number(gap.protected_ratio)).toFixed(1)}% · ${gap.fully_bridged?'完整桥接':'部分覆盖'}</small></div><div><div class="gap-controls"><button type="button" class="choice" data-verdict="acceptable_continuous_envelope">可接受：同一连续对话包络</button><button type="button" class="choice" data-verdict="overmerged_independent_background">过度合并：独立长背景</button><button type="button" class="choice" data-verdict="unsure">不确定</button></div><textarea class="gap-note" placeholder="可选备注">${esc(state.note||'')}</textarea></div>`;const playButton=item.querySelector('.gap-play');playButton.onclick=()=>play(audio,playButton,Number(gap.start_s),Number(gap.end_s));const sync=()=>item.querySelectorAll('[data-verdict]').forEach(button=>button.classList.toggle('active',button.dataset.verdict===state.verdict));item.querySelectorAll('[data-verdict]').forEach(button=>button.onclick=()=>{state.verdict=button.dataset.verdict;state.updated_at=new Date().toISOString();sync();persist();});item.querySelector('.gap-note').onchange=event=>{state.note=event.target.value;state.updated_at=new Date().toISOString();persist();};sync();section.appendChild(item);}card.appendChild(section);}
+const root=document.getElementById('list');for(const row of rows){const card=document.createElement('article');card.innerHTML=`<h2>${esc(row.source_id)}</h2><small>${esc(row.partition)} · ${Number(row.duration_s).toFixed(2)}s${row.failed_closed?' · ⚠ teacher failed closed':''}</small><audio controls preload="metadata" src="${esc(row.audio)}"></audio>`;const audio=card.querySelector('audio');lane(card,audio,row,'人工语音锚点 / BG',row.human_spans,'human',`inside ${(100*row.human_inside_ratio).toFixed(1)}%`);lane(card,audio,row,'Protect evidence',row.protect_spans,'protect',`anchor coverage ${(100*row.protect_recall).toFixed(1)}% · full spans ${row.fully_protected_human_span_count}/${row.human_inside_span_count}`);lane(card,audio,row,'Remove evidence',row.remove_spans,'remove',`anchor hits ${row.remove_human_inside_frames} frames`);lane(card,audio,row,'最终三态标签',row.final_spans,'final',`inside ${(100*row.final_inside_ratio).toFixed(1)}% · outside ${(100*row.final_outside_ratio).toFixed(1)}% · unsure ${(100*row.final_unsure_ratio).toFixed(1)}%`);lane(card,audio,row,'被 Protect 覆盖的锚点间 BG gap',row.bridged_background_gaps,'bridge',`${row.bridged_gap_count} gaps · max ${row.max_bridged_gap_s.toFixed(2)}s`);lane(card,audio,row,'Protect / Remove 冲突',row.conflict_spans,'conflict',`${row.conflict_frames} frames`);lane(card,audio,row,'真语音被 outside 命中',row.unsafe_outside_spans,'unsafe',`${row.unsafe_outside_frames} frames / ${row.unsafe_outside_s.toFixed(2)}s`);const metrics=document.createElement('div');metrics.className='metrics';metrics.innerHTML=`<span>supervised ${(100*row.supervised_ratio).toFixed(1)}%</span><span class="${row.protect_recall>=.95?'good':'bad'}">anchor coverage ${(100*row.protect_recall).toFixed(1)}%</span><span>outside precision ${(100*row.final_outside_precision).toFixed(1)}%</span><span class="${row.unsafe_outside_frames===0?'good':'bad'}">true-speech outside=${row.unsafe_outside_frames}</span>`;card.appendChild(metrics);renderGapReviews(card,audio,row);root.appendChild(card);}
+document.getElementById('stop').onclick=()=>{stop();updateStatus('已停止');};
+document.getElementById('save').onclick=async()=>{const content=allGaps().map(({row,gap})=>{const state=ensure(gap);return JSON.stringify({schema:verdictSchema,boundary_serialization_contract_id:boundaryContract,gap_id:gap.gap_id,source_id:row.source_id,partition:row.partition,start_frame:gap.start_frame,end_frame:gap.end_frame,start_s:gap.start_s,end_s:gap.end_s,duration_s:gap.duration_s,protected_frames:gap.protected_frames,protected_ratio:gap.protected_ratio,fully_bridged:gap.fully_bridged,verdict:state.verdict||'unreviewed',note:state.note||'',updated_at:state.updated_at||new Date().toISOString()});}).join('\n')+'\n';try{const response=await fetch('/__audit_api__/save-labels',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({href:location.pathname,filename:'manual_verdicts.jsonl',content})});const result=await response.json();updateStatus(response.ok&&result.ok?'已保存到 '+result.path:'保存失败: '+(result.error||response.status));}catch(error){updateStatus('保存失败: '+error.message);}};
+updateStatus();
 </script></body></html>"""
+    return (
+        template.replace("__ROWS__", encoded)
+        .replace("__VERDICT_SCHEMA__", json.dumps(BRIDGE_VERDICT_SCHEMA))
+        .replace(
+            "__BOUNDARY_CONTRACT__",
+            json.dumps(ACOUSTIC_BINARY_V12_CONTRACT.contract_id),
+        )
+        .replace("__AUDIO_PLAYER__", AUDIO_SPAN_PLAYER_JS)
+    )
 
 
 def generate(
@@ -235,7 +265,11 @@ def generate(
         human_span_count, fully_protected_span_count, human_span_coverage = (
             _human_span_coverage(human_labels, protect)
         )
-        bridged_gaps = _bridged_background_gaps(human_labels, protect)
+        bridged_gaps = _bridged_background_gaps(
+            human_labels,
+            protect,
+            source_id=source_id,
+        )
         bridged_gap_frames = sum(
             int(span["end_frame"]) - int(span["start_frame"])
             for span in bridged_gaps
@@ -307,6 +341,9 @@ def generate(
         details.append(
             {
                 "schema": DETAIL_SCHEMA,
+                "boundary_serialization_contract_id": (
+                    ACOUSTIC_BINARY_V12_CONTRACT.contract_id
+                ),
                 "source_id": source_id,
                 "partition": str(source.get("partition") or ""),
                 "duration_s": float(source["duration_s"]),
@@ -391,6 +428,8 @@ def generate(
         "max_bridged_gap_s": totals["max_bridged_gap_frames"] * 0.02,
         "zero_true_speech_outside": totals["unsafe_outside_frames"] == 0,
         "training_manifest_allowed": False,
+        "manual_verdicts": str(output_dir / "manual_verdicts.jsonl"),
+        "manual_verdict_schema": BRIDGE_VERDICT_SCHEMA,
         "audit_navigation_updated": update_nav,
     }
     output_dir.mkdir(parents=True, exist_ok=True)
