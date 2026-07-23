@@ -116,7 +116,9 @@ function createAuditReviewCore(config){
   }
   function persist(){localStorage.setItem(config.storageKey,JSON.stringify(annotations));updateStatus();}
   async function save(){
-    const content=config.entries.map(entry=>JSON.stringify(config.serialize(entry,ensure(entry)))).join('\n')+'\n';
+    const entries=config.entries.filter(entry=>!config.shouldSerialize||config.shouldSerialize(ensure(entry),entry));
+    const lines=entries.map(entry=>JSON.stringify(config.serialize(entry,ensure(entry))));
+    const content=lines.length?lines.join('\n')+'\n':'';
     try{
       const response=await fetch('/__audit_api__/save-labels',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({href:location.pathname,filename:config.filename||'manual_verdicts.jsonl',content})});
       const result=await response.json();

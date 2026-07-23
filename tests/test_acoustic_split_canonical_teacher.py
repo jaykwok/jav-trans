@@ -3,6 +3,9 @@ from __future__ import annotations
 import argparse
 import json
 from pathlib import Path
+import re
+import shutil
+import subprocess
 
 from tools.boundary.ja import (
     label_acoustic_split_canonical_candidates_with_omni as labeler,
@@ -291,6 +294,8 @@ def test_canonical_audit_prioritizes_disagreements_and_has_manual_controls(
             "flags": ["same_sentence"],
             "hard_case_categories": ["false_cut_risk"],
             "expected_gate_label": None,
+            "request_clip_start_s": 0.5,
+            "request_clip_end_s": 5.5,
         }
     ]
     selected_path = tmp_path / "selected.jsonl"
@@ -299,9 +304,10 @@ def test_canonical_audit_prioritizes_disagreements_and_has_manual_controls(
     _write_jsonl(labels_path, labels)
 
     def fake_slice(**kwargs):
+        assert kwargs["row"]["request_clip_start_s"] == 0.5
         kwargs["output"].parent.mkdir(parents=True, exist_ok=True)
         kwargs["output"].write_bytes(b"wav")
-        return 0.0, 2.0
+        return 0.5, 5.5, 1.5
 
     monkeypatch.setattr(audit, "_slice_context", fake_slice)
     summary = audit.build_audit(
@@ -313,18 +319,60 @@ def test_canonical_audit_prioritizes_disagreements_and_has_manual_controls(
         update_nav=False,
     )
     page = (tmp_path / "audit" / "index.html").read_text(encoding="utf-8")
+    manifest = [
+        json.loads(line)
+        for line in (tmp_path / "audit" / "manifest.jsonl")
+        .read_text(encoding="utf-8")
+        .splitlines()
+    ]
 
     assert summary["item_count"] == 1
     assert summary["title"] == "Acoustic Split Canonical Candidate Audit"
     assert summary["current_disagreement_count"] == 1
+    assert summary["boundary_serialization_contract_id"] == (
+        "boundary_acoustic_binary_v12"
+    )
+    assert manifest[0]["clip_start_s"] == 0.5
+    assert manifest[0]["clip_end_s"] == 5.5
+    assert manifest[0]["clip_duration_s"] == 5.0
+    assert manifest[0]["candidate_offset_s"] == 1.5
     assert "manual_verdicts.jsonl" in page
-    assert "cut</button>" in page
-    assert "continue</button>" in page
-    assert ".join('\\n')+'\\n'" in page
-    assert "只听切点前" in page
-    assert "跨点听 ±1s" in page
-    assert "只听切点后" in page
-    assert "红线 = 唯一候选切点" in page
+    assert "createAuditReviewCore" in page
+    assert "shouldSerialize" in page
+    assert "cut：不同目标事件" in page
+    assert "continue：同一目标事件" in page
+    assert "播放完整 candidate query" in page
+    assert "只听 candidate 左侧" in page
+    assert "只听 candidate 右侧" in page
+    assert "跨点听 ±1s" not in page
+    assert "红线 = 唯一 candidate query" in page
+    script = re.search(r"<script>([\s\S]*?)</script>", page)
+    assert script is not None
+    node = shutil.which("node")
+    if node is not None:
+        parsed = subprocess.run(
+            [node, "--check", "-"],
+            input=script.group(1),
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        assert parsed.returncode == 0, parsed.stderr
+
+
+def test_canonical_audit_prefers_valid_teacher_request_clip() -> None:
+    assert audit._requested_clip_bounds(
+        row={"request_clip_start_s": 1.0, "request_clip_end_s": 7.0},
+        center_s=3.0,
+        duration_s=10.0,
+        context_s=2.0,
+    ) == (1.0, 7.0)
+    assert audit._requested_clip_bounds(
+        row={"request_clip_start_s": 4.0, "request_clip_end_s": 7.0},
+        center_s=3.0,
+        duration_s=10.0,
+        context_s=2.0,
+    ) == (1.0, 5.0)
 
 
 def test_canonical_audit_evaluation_applies_ninety_percent_gates(tmp_path: Path) -> None:

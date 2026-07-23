@@ -73,6 +73,12 @@ Runtime 顺序固定为：
 
 - 保留 HTML JSON 安全转义、静态 audit server 的路径/Range/Content-Length 防护
   和已有 SHA/身份校验。
+- Human Audit Page Core 已接入 Split canonical candidate gate，并修复旧页证据
+  几何不一致：teacher request 合法时直接物化同一精确 clip，manifest/WAV/标尺/
+  candidate 红线/左右播放统一使用实际 `clip_start_s/clip_end_s/clip_duration_s/
+  candidate_offset_s`；非法或缺失 request 才回退 centered context。固定 `±1s`
+  跨点按钮已删除，`cut/continue/unsure→-100` 与既有 evaluator schema 保持兼容。
+  Core 新增 `shouldSerialize`，允许部分审计只写已完成条目。
 - AST 审计覆盖 `src/` 与 `tools/` 的 270 个 Python 文件：无 parse error、无零
   引用的 private 顶层定义。确认无生产调用的旧 joint Omni v2 prompt、
   missed-boundary normalizer 及其专属测试已移入
@@ -80,6 +86,11 @@ Runtime 顺序固定为：
 - Unix-only `tools/audits/serve_audits.sh` 已移入同一归档目录；Windows 入口为
   `tools/audits/serve_audits.ps1`。Proposal、rehydrate、旧 Runtime audit
   builder 等仍被审计复现引用的 legacy 工具没有误删，并继续标记 audit-only。
+- 两套外部 CueQC cluster HTML 页面及其专属测试确认只剩 HISTORY 历史引用，
+  当前 CueQC v13 teacher/canonical/false-drop 路线不再调用，已归档到
+  `agents/rm/20260723_154249_retired-cueqc-cluster-audit-pages/` 并从 Git 删除。
+  `tools/asr/cueqc/cluster_candidates.py`、cluster label compiler 和历史 ingestion
+  均保留；本次只删除重复且过时的页面壳。
 - README 的 Python 版本从过时的 3.13+ 修正为 3.14+，安装入口改为与
   `pyproject.toml`/lock 一致的 `uv sync`。
 
@@ -105,5 +116,5 @@ git diff --check
 
 AST 静态审计脚本为
 `agents/temp/20260723_105300_repo_static_audit.py`；其结果写入同名 `.json`。
-最终结果为 `978 passed, 6 skipped`；仅有 4 条既有 SciPy
+最终结果为 `989 passed, 6 skipped`；仅有 4 条既有 SciPy
 sparse-efficiency warnings，不影响测试结论。

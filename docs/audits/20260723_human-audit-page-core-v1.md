@@ -6,7 +6,7 @@
 
 - Core：`tools/audits/review_page_core.py`，负责统一页面外壳、精确区间播放器、停止播放、`localStorage`、完成度、`manual_verdicts.jsonl` 保存 API 和状态显示。
 - Prompt resolver：`tools/audits/audit_prompt.py`，允许 Adapter 使用内置说明，或通过 `--prompt / --prompt-file` 替换任务提示；提示不能改变固定裁决 schema。
-- Adapter：负责模型职责相关的数据轨道、审计轴、选项语义、组合结果、完成条件和保存字段。Scorer bridge-gap 是首个迁移 Adapter；CueQC、Split、Scorer 结构验证等页面在后续实际修改时逐个迁移，不进行无证据的全量机械改写。
+- Adapter：负责模型职责相关的数据轨道、审计轴、选项语义、组合结果、完成条件、可选的 `shouldSerialize` 保存过滤和保存字段。Scorer bridge-gap 是首个迁移 Adapter；CueQC、Split、Scorer 结构验证等页面在后续实际修改时逐个迁移，不进行无证据的全量机械改写。
 
 ## 选项完备性合同
 
@@ -42,5 +42,11 @@ CueQC false-drop 审计保持既有 `safe_drop / true_speech / unsure` 单轴合
 ### Split missing-cut candidate
 
 Split candidate 补标保持 `cut / continue / unsure`，其中 `unsure→ignore=-100`，并保留既有 `split_v4_missing_cut_candidate_manual_verdict_v1` 供 override compiler 使用。每个 candidate 同时提供左侧、右侧和左右合并的精确播放，避免旧页只播放 candidate 之前的区间。没有 eligible candidate 的漏切 residual 会 fail-closed 并归因到 Proposal candidate coverage，不能伪造 Split candidate 标签。
+
+### Split canonical candidate
+
+Split canonical teacher 人工 gate 保持 `cut / continue / unsure` 单轴合同与 `acoustic_split_canonical_manual_verdict_v1` evaluator 兼容。Adapter 优先物化 teacher 请求的精确 clip；manifest 记录实际 `clip_start_s / clip_end_s / clip_duration_s / candidate_offset_s`，页面标尺、红线和左/右播放只读这些实际坐标。旧页按另一套 request 坐标绘制标尺、同时按 `context_s` 裁音频的错位已移除，固定 `±1s` 跨点播放也已删除。
+
+该页使用 Core 的 `shouldSerialize`，只保存已选择 `cut/continue/unsure` 的条目。部分审计可以安全保存；evaluator 仍通过 missing ids 明确报告尚未完成的 gate，而不是把未审行当成非法 verdict。
 
 其余 Adapter 的迁移审计与阻塞项见 `docs/audits/20260723_human-audit-adapter-inventory-v1.md`。
