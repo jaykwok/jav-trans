@@ -3,10 +3,24 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pytest
+
 import tools.audits.compare_candidate_island_preaudits as comparison_tools
 from tools.audits.generate_candidate_island_dual_evidence_review import (
+    BRIDGE_AUDIT_AXES,
+    BRIDGE_COMBINATION_RESULTS,
+    BRIDGE_VERDICT_SCHEMA,
+    _is_valid_bridge_combination,
     _bridged_background_gaps,
     generate,
+    parse_args as parse_review_args,
+)
+from tools.audits.audit_prompt import resolve_audit_prompt
+from tools.audits.review_page_core import (
+    AuditOptionAxis,
+    AuditReviewPageSpec,
+    render_audit_review_page,
+    validate_audit_option_contract,
 )
 from tools.boundary.ja.label_candidate_island_scorer_v11_dual_evidence_with_omni import (
     PROTECT_SYSTEM_PROMPT,
@@ -15,7 +29,7 @@ from tools.boundary.ja.label_candidate_island_scorer_v11_dual_evidence_with_omni
     _resolve_verified_audio,
     _selected_rows,
     merge_dual_evidence,
-    parse_args,
+    parse_args as parse_teacher_args,
 )
 
 
@@ -35,7 +49,7 @@ def test_dual_evidence_prompts_keep_scorer_responsibilities_separate() -> None:
     assert "不使用 ASR 文本" in REMOVE_SYSTEM_PROMPT
     assert "不要求逻辑上证明“绝对不可能存在语言”" in REMOVE_SYSTEM_PROMPT
     assert "未标记区域只是 unresolved，不代表 inside" in REMOVE_SYSTEM_PROMPT
-    args = parse_args(["--manifest", "m", "--output-dir", "o"])
+    args = parse_teacher_args(["--manifest", "m", "--output-dir", "o"])
     assert args.env_file == "gemini"
     assert args.source_id == []
 
@@ -145,6 +159,91 @@ def test_dual_evidence_audio_fallback_requires_matching_identity(tmp_path: Path)
     assert resolved == audio.resolve()
 
 
+def test_audit_page_core_and_prompt_are_adapter_configurable(tmp_path: Path) -> None:
+    prompt_file = tmp_path / "prompt.txt"
+    prompt_file.write_text("custom bridge review", encoding="utf-8")
+    resolved = resolve_audit_prompt(
+        prompt_file=str(prompt_file),
+        default_prompt="default",
+    )
+    assert resolved.text == "custom bridge review"
+    assert resolved.source == str(prompt_file.resolve())
+    assert len(resolved.sha256) == 64
+    with pytest.raises(ValueError, match="only one"):
+        resolve_audit_prompt(
+            prompt="x",
+            prompt_file=str(prompt_file),
+            default_prompt="default",
+        )
+    args = parse_review_args(
+        [
+            "--manifest",
+            "m",
+            "--human-verdicts",
+            "h",
+            "--candidate",
+            "c",
+            "--output-dir",
+            "o",
+            "--prompt",
+            "review",
+        ]
+    )
+    assert args.prompt == "review"
+    page = render_audit_review_page(
+        AuditReviewPageSpec(
+            title="Adapter",
+            intro_html="<section>intro</section>",
+            body_html='<div id="list"></div>',
+            adapter_css=".x{color:red}",
+            adapter_js="reviewCoreMarker=true;",
+        )
+    )
+    assert "createAuditReviewCore" in page
+    assert "/__audit_api__/save-labels" in page
+    assert "reviewCoreMarker=true" in page
+    with pytest.raises(ValueError, match="unreachable"):
+        validate_audit_option_contract(
+            axes=(AuditOptionAxis(field="verdict", options=("keep", "unsure")),),
+            combination_results={("keep",): "keep"},
+            is_valid_combination=lambda combination: combination == ("keep",),
+        )
+    with pytest.raises(ValueError, match="missing valid combinations"):
+        validate_audit_option_contract(
+            axes=(
+                AuditOptionAxis(field="content", options=("speech", "noise")),
+                AuditOptionAxis(field="coverage", options=("covered", "missed")),
+            ),
+            combination_results={
+                ("speech", "covered"): "ok",
+                ("speech", "missed"): "missed",
+                ("noise", "covered"): "noise",
+            },
+        )
+
+
+def test_bridge_audit_axes_enumerate_all_reachable_mixed_outcomes() -> None:
+    validate_audit_option_contract(
+        axes=BRIDGE_AUDIT_AXES,
+        combination_results=BRIDGE_COMBINATION_RESULTS,
+        is_valid_combination=_is_valid_bridge_combination,
+    )
+    assert len(BRIDGE_COMBINATION_RESULTS) == 15
+    assert set(BRIDGE_COMBINATION_RESULTS.values()) == {
+        "acceptable_nonsemantic_bridge",
+        "human_background_contains_semantic_dialogue",
+        "semantic_missed_and_background_overmerged",
+        "semantic_missed_or_clipped",
+        "semantic_present_and_background_overmerged",
+        "teacher_overmerged_independent_background",
+        "unsure",
+    }
+    for index, axis in enumerate(BRIDGE_AUDIT_AXES):
+        assert set(axis.options) == {
+            combination[index] for combination in BRIDGE_COMBINATION_RESULTS
+        }
+
+
 def test_scorer_review_reports_bridged_split_level_background_without_auto_failure() -> None:
     human = [
         "inside_candidate",
@@ -168,6 +267,53 @@ def test_scorer_review_reports_bridged_split_level_background_without_auto_failu
             "protected_frames": 2,
             "protected_ratio": 1.0,
             "fully_bridged": True,
+            "protected_overlap_spans": [
+                {
+                    "label": "protected_overlap",
+                    "start_frame": 2,
+                    "end_frame": 4,
+                    "start_s": 0.04,
+                    "end_s": 0.08,
+                }
+            ],
+            "unprotected_overlap_spans": [],
+        }
+    ]
+
+
+def test_bridge_gap_exposes_protected_and_unprotected_audio_subspans() -> None:
+    human = [
+        "inside_candidate",
+        "inside_candidate",
+        "outside_candidate",
+        "outside_candidate",
+        "inside_candidate",
+        "inside_candidate",
+    ]
+    gap = _bridged_background_gaps(
+        human,
+        [True, True, True, False, True, True],
+        source_id="source-b",
+    )[0]
+    assert gap["protected_frames"] == 1
+    assert gap["protected_ratio"] == 0.5
+    assert gap["fully_bridged"] is False
+    assert gap["protected_overlap_spans"] == [
+        {
+            "label": "protected_overlap",
+            "start_frame": 2,
+            "end_frame": 3,
+            "start_s": 0.04,
+            "end_s": 0.06,
+        }
+    ]
+    assert gap["unprotected_overlap_spans"] == [
+        {
+            "label": "unprotected_overlap",
+            "start_frame": 3,
+            "end_frame": 4,
+            "start_s": 0.06,
+            "end_s": 0.08,
         }
     ]
 
@@ -249,18 +395,26 @@ def test_dual_evidence_review_compares_against_full_human_truth(
     assert summary["final_outside_precision"] == 1.0
     assert summary["supervised_ratio"] == 0.7
     assert summary["manual_verdict_schema"] == (
-        "candidate_island_scorer_v11_bridge_gap_manual_verdict_v1"
+        BRIDGE_VERDICT_SCHEMA
     )
     assert summary["manual_verdicts"].endswith("manual_verdicts.jsonl")
+    assert summary["review_prompt_source"] == "builtin-default"
+    assert len(summary["review_prompt_sha256"]) == 64
     page = (tmp_path / "out" / "index.html").read_text(encoding="utf-8")
     assert "Protect × Remove 双证据" in page
     assert "真语音被 outside 命中" in page
     assert 'preload="metadata"' in page
     assert "waitForMetadata" in page
     assert "audio.play()" in page
+    assert "contains_semantic_dialogue" in page
+    assert "semantic_missed_or_clipped" in page
+    assert "semantic_missed_and_background_overmerged" in page
+    assert "content_verdict" in page
+    assert "semantic_coverage_verdict" in page
+    assert "envelope_verdict" in page
     assert "acceptable_continuous_envelope" in page
     assert "overmerged_independent_background" in page
-    assert "candidate_island_scorer_v11_bridge_gap_manual_verdict_v1" in page
+    assert BRIDGE_VERDICT_SCHEMA in page
     assert "/__audit_api__/save-labels" in page
     assert "manual_verdicts.jsonl" in page
     assert "localStorage" in page

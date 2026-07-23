@@ -31,7 +31,7 @@ Scorer 的错误代价应当不对称：任何可能含词语、尾音或同一�
 
 当前既有人工区间一定程度上按 Split 后的语音单元标注，因此不能把每个锚点之间的人工 `background` 直接当作 Scorer 必须删除的逐帧负例。对于 `anchor1 - bg1 - anchor2 - bg2 - anchor3`，若这些锚点属于同一轮近连续对话，Protect 输出覆盖 `anchor1…anchor3` 的连续候选包络是允许的；中间短停顿、动作声或非语义发声不会降低 Protect precision，也不要求 Scorer 提前切开，后续切分仍由 Split 负责。
 
-例外是锚点间背景在听感上构成声学独立、明显过长且可以在不破坏对话完整性的前提下安全删除的段落，此时连续覆盖属于过度合并。这里的“长”由完整 source 上下文和声学独立性共同决定，不设置固定时长阈值，也不按 duration 自动判错。评估因此固定为：漏保护人工语音锚点、或 Remove-only 命中人工语音锚点属于硬失败；Protect 额外覆盖的锚点间 background 单独进入人工 bridge-gap 审计，裁决为 `acceptable_continuous_envelope / overmerged_independent_background / unsure`，不直接编译成训练标签。
+例外是锚点间背景在听感上构成声学独立、明显过长且可以在不破坏对话完整性的前提下安全删除的段落，此时连续覆盖属于过度合并。这里的“长”由完整 source 上下文和声学独立性共同决定，不设置固定时长阈值，也不按 duration 自动判错。评估因此固定为：漏保护人工语音锚点、或 Remove-only 命中人工语音锚点属于硬失败；Protect 额外覆盖的锚点间 background 单独进入人工 bridge-gap 审计。审计不能用互斥平面标签压缩混合问题，固定拆为 `gap 内容 × 语义覆盖 × 非语义包络` 三轴：既能表达人工 background 内实际存在语言，也能独立表达语言是否被 Protect 漏掉/截断以及其余背景是否过度合并。15 个合法组合显式映射到确定结果或 `unsure`，不直接编译成训练标签。
 
 ## v11 模型与 checkpoint 合同
 

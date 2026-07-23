@@ -15,67 +15,11 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from tools.audits.audit_nav import update_audit_entrypoints  # noqa: E402
+from tools.audits.review_page_core import AUDIO_SPAN_PLAYER_JS  # noqa: E402
 
 
 SUMMARY_SCHEMA = "candidate_island_preaudit_comparison_summary_v1"
 DETAIL_SCHEMA = "candidate_island_preaudit_comparison_item_v1"
-
-AUDIO_SPAN_PLAYER_JS = r"""
-let activeAudio=null,activeButton=null,stopFn=null,playToken=0;
-function stop(){
-  playToken+=1;
-  if(activeAudio&&stopFn)activeAudio.removeEventListener('timeupdate',stopFn);
-  if(activeAudio)activeAudio.pause();
-  if(activeButton)activeButton.classList.remove('playing');
-  activeAudio=activeButton=stopFn=null;
-}
-function waitForMetadata(audio){
-  if(audio.readyState>=1)return Promise.resolve();
-  return new Promise((resolve,reject)=>{
-    const cleanup=()=>{
-      audio.removeEventListener('loadedmetadata',loaded);
-      audio.removeEventListener('error',failed);
-    };
-    const loaded=()=>{cleanup();resolve();};
-    const failed=()=>{cleanup();reject(audio.error||new Error('audio metadata load failed'));};
-    audio.addEventListener('loadedmetadata',loaded,{once:true});
-    audio.addEventListener('error',failed,{once:true});
-    audio.load();
-  });
-}
-async function play(audio,button,start,end){
-  stop();
-  const token=++playToken;
-  activeAudio=audio;
-  activeButton=button;
-  button.classList.add('playing');
-  const status=document.getElementById('status');
-  status.textContent=`加载 ${start.toFixed(2)}–${end.toFixed(2)}s…`;
-  try{
-    await waitForMetadata(audio);
-    if(token!==playToken)return;
-    if(!Number.isFinite(audio.duration)||audio.duration<=0)throw new Error('invalid audio duration');
-    const safeStart=Math.max(0,Math.min(start,Math.max(0,audio.duration-.001)));
-    const safeEnd=Math.max(safeStart,Math.min(end,audio.duration));
-    audio.currentTime=safeStart;
-    stopFn=()=>{
-      if(token===playToken&&audio.currentTime>=safeEnd-.005){
-        status.textContent=`已停止 ${safeStart.toFixed(2)}–${safeEnd.toFixed(2)}s`;
-        stop();
-      }
-    };
-    audio.addEventListener('timeupdate',stopFn);
-    await audio.play();
-    if(token!==playToken){audio.pause();return;}
-    status.textContent=`播放 ${safeStart.toFixed(2)}–${safeEnd.toFixed(2)}s`;
-  }catch(error){
-    if(token!==playToken)return;
-    status.textContent=`播放失败：${error&&error.message?error.message:String(error)}`;
-    stop();
-  }
-}
-"""
-
 
 def _rows(path: Path) -> list[dict[str, Any]]:
     return [
