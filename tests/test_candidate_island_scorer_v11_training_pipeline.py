@@ -504,6 +504,117 @@ def test_v11_canonical_accepts_signed_real_train_full_source_manual_truth(
     assert manual["source_kind"] == "real_train_full_source_manual"
     assert manual["unsure_training_label"] == -100
 
+
+def test_v11_canonical_accepts_calibrated_dual_evidence_train_truth(
+    tmp_path: Path,
+) -> None:
+    synthetic_path, real_train_path, source_path, partition_path, verdict_path = (
+        _canonical_fixture(tmp_path)
+    )
+    source_rows = [
+        json.loads(line) for line in source_path.read_text(encoding="utf-8").splitlines()
+    ]
+    partition_rows = [
+        json.loads(line)
+        for line in partition_path.read_text(encoding="utf-8").splitlines()
+    ]
+    source_id = "video-train-dual-w00"
+    video_id = "video-train-dual"
+    audio = tmp_path / f"{source_id}.wav"
+    _write_wav(audio, 8)
+    audio_sha = _sha256(audio)
+    source_rows.append(
+        {
+            "schema": "joint_boundary_omni_source_window_v1",
+            "window_id": source_id,
+            "video_id": video_id,
+            "audio_wav": str(audio),
+            "audio_wav_sha256": audio_sha,
+            "duration_s": 0.16,
+        }
+    )
+    partition_rows.append(
+        {
+            "schema": PARTITION_SCHEMA,
+            "boundary_serialization_contract_id": ACOUSTIC_BINARY_V12_CONTRACT.contract_id,
+            "source_id": source_id,
+            "video_id": video_id,
+            "partition": "train",
+            "original_dataset_role": "train",
+        }
+    )
+    _write_jsonl(source_path, source_rows)
+    _write_jsonl(partition_path, partition_rows)
+    dual_sources = tmp_path / "real_train_dual_evidence_sources.jsonl"
+    _write_jsonl(
+        dual_sources,
+        [
+            {
+                "schema": (
+                    "candidate_island_scorer_v11_real_train_dual_evidence_source_v1"
+                ),
+                "boundary_serialization_contract_id": (
+                    ACOUSTIC_BINARY_V12_CONTRACT.contract_id
+                ),
+                "source_id": source_id,
+                "video_id": video_id,
+                "partition": "train",
+                "input_distribution": (
+                    "real_workflow_source_window_calibrated_dual_evidence_v1"
+                ),
+                "source_kind": "real_train_full_source_calibrated_dual_evidence",
+                "audio": str(audio),
+                "audio_sha256": audio_sha,
+                "frame_count": 8,
+                "frame_hop_s": 0.02,
+                "core_ids": [f"real-train-dual-evidence-source::{source_id}"],
+                "canonical_spans": [
+                    {"label": "outside_candidate", "start_frame": 0, "end_frame": 2},
+                    {"label": "inside_candidate", "start_frame": 2, "end_frame": 7},
+                    {"label": "unsure", "start_frame": 7, "end_frame": 8},
+                ],
+                "annotation_provenance": (
+                    "calibrated_gemini_independent_dual_evidence_v1"
+                ),
+                "teacher_output_used_as_truth": True,
+                "teacher_evidence_used_as_training_supervision": True,
+                "human_full_source_confirmed": False,
+                "calibration_gate_passed": True,
+                "unselected_source_label_inheritance": False,
+                "unsure_training_label": -100,
+                "training_manifest_allowed": True,
+            }
+        ],
+    )
+
+    summary = compile_canonical(
+        synthetic_train_sources=synthetic_path,
+        real_train_outside_sources=real_train_path,
+        real_train_dual_evidence_sources=dual_sources,
+        source_windows=source_path,
+        partition_manifest=partition_path,
+        manual_verdicts=[verdict_path],
+        output_dir=tmp_path / "dual-evidence-canonical",
+    )
+    assert summary["real_train_dual_evidence_source_count"] == 1
+    assert summary["real_train_dual_evidence_inside_frames"] == 5
+    assert summary["real_train_dual_evidence_outside_frames"] == 2
+    assert summary["real_train_dual_evidence_unsure_frames"] == 1
+    assert summary["real_train_full_source_human_confirmed"] is False
+    assert summary["real_train_full_source_calibrated_dual_evidence"] is True
+    rows = [
+        json.loads(line)
+        for line in Path(summary["canonical_sources"])
+        .read_text(encoding="utf-8")
+        .splitlines()
+    ]
+    dual = next(row for row in rows if row["source_id"] == source_id)
+    assert dual["source_kind"] == "real_train_full_source_calibrated_dual_evidence"
+    assert dual["teacher_evidence_used_as_training_supervision"] is True
+    assert dual["human_full_source_confirmed"] is False
+    assert dual["unsure_training_label"] == -100
+
+
 def test_v11_feature_compile_and_random_init_cpu_smoke(tmp_path: Path) -> None:
     pytest.importorskip("torch")
     synthetic_path, real_train_path, source_path, partition_path, verdict_path = _canonical_fixture(tmp_path)

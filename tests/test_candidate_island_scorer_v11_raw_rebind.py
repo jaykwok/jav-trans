@@ -100,6 +100,8 @@ def test_raw_rebind_reuses_exact_sources_and_finalizes_only_missing(tmp_path: Pa
     )
     assert prepared["reused_source_count"] == 1
     assert prepared["missing_source_ids"] == ["second"]
+    assert prepared["new_source_count"] == 0
+    assert prepared["unresolved_source_ids"] == ["second"]
     assert prepared["complete"] is False
     assert prepared["training_manifest_allowed"] is False
     missing = [
@@ -124,6 +126,8 @@ def test_raw_rebind_reuses_exact_sources_and_finalizes_only_missing(tmp_path: Pa
         output_dir=output,
     )
     assert final["complete"] is True
+    assert final["new_source_count"] == 1
+    assert final["unresolved_source_count"] == 0
     assert final["training_manifest_allowed"] is True
     rows = [
         json.loads(line)

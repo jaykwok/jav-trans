@@ -37,6 +37,9 @@ RESPONSIBILITY_VERDICT_SCHEMA = (
 )
 REAL_TRAIN_OUTSIDE_SCHEMA = "candidate_island_scorer_v11_real_train_outside_source_v1"
 REAL_TRAIN_MANUAL_SCHEMA = "candidate_island_scorer_v11_real_train_manual_source_v1"
+REAL_TRAIN_DUAL_EVIDENCE_SCHEMA = (
+    "candidate_island_scorer_v11_real_train_dual_evidence_source_v1"
+)
 FRAME_HOP_S = 0.02
 LABELS = {"outside_candidate": 0, "inside_candidate": 1, "unsure": 2}
 PARTITIONS = {"train", "val", "test"}
@@ -199,6 +202,7 @@ def compile_canonical(
     synthetic_train_sources: Path,
     real_train_outside_sources: Path,
     real_train_manual_sources: Path | None = None,
+    real_train_dual_evidence_sources: Path | None = None,
     source_windows: Path,
     partition_manifest: Path,
     manual_verdicts: Sequence[Path],
@@ -209,6 +213,15 @@ def compile_canonical(
     real_train_outside_sources = real_train_outside_sources.resolve()
     if real_train_manual_sources is not None:
         real_train_manual_sources = real_train_manual_sources.resolve()
+    if real_train_dual_evidence_sources is not None:
+        real_train_dual_evidence_sources = real_train_dual_evidence_sources.resolve()
+    if (
+        real_train_manual_sources is not None
+        and real_train_dual_evidence_sources is not None
+    ):
+        raise ValueError(
+            "Scorer v11 manual and calibrated dual-evidence train sources are mutually exclusive"
+        )
     source_windows = source_windows.resolve()
     partition_manifest = partition_manifest.resolve()
     verdict_paths = [path.resolve() for path in manual_verdicts]
@@ -218,6 +231,7 @@ def compile_canonical(
         synthetic_train_sources,
         real_train_outside_sources,
         *((real_train_manual_sources,) if real_train_manual_sources is not None else ()),
+        *((real_train_dual_evidence_sources,) if real_train_dual_evidence_sources is not None else ()),
         source_windows,
         partition_manifest,
         *verdict_paths,
@@ -287,6 +301,11 @@ def compile_canonical(
     real_train_manual_sha = (
         _sha256(real_train_manual_sources)
         if real_train_manual_sources is not None
+        else None
+    )
+    real_train_dual_evidence_sha = (
+        _sha256(real_train_dual_evidence_sources)
+        if real_train_dual_evidence_sources is not None
         else None
     )
     source_windows_sha = _sha256(source_windows)
@@ -659,6 +678,194 @@ def compile_canonical(
         if real_train_manual_inside_frames <= 0:
             raise ValueError("real train manual truth contains no inside_candidate frames")
 
+    real_train_dual_evidence_count = 0
+    real_train_dual_evidence_inside_frames = 0
+    real_train_dual_evidence_outside_frames = 0
+    real_train_dual_evidence_unsure_frames = 0
+    if real_train_dual_evidence_sources is not None:
+        dual_train_rows = _index_unique(
+            _read_jsonl(real_train_dual_evidence_sources),
+            "source_id",
+            name="real train calibrated dual-evidence source",
+        )
+        if not dual_train_rows:
+            raise ValueError("Scorer v11 real train dual-evidence sources are empty")
+        for source_id in sorted(dual_train_rows):
+            source = dual_train_rows[source_id]
+            if source.get("schema") != REAL_TRAIN_DUAL_EVIDENCE_SCHEMA:
+                raise ValueError(
+                    f"wrong Scorer v11 real train dual-evidence schema: {source_id}"
+                )
+            if source.get("boundary_serialization_contract_id") != (
+                ACOUSTIC_BINARY_V12_CONTRACT.contract_id
+            ):
+                raise ValueError(f"wrong central boundary contract: {source_id}")
+            if (
+                source.get("partition") != "train"
+                or source.get("training_manifest_allowed") is not True
+                or source.get("source_kind")
+                != "real_train_full_source_calibrated_dual_evidence"
+                or source.get("annotation_provenance")
+                != "calibrated_gemini_independent_dual_evidence_v1"
+            ):
+                raise ValueError(
+                    f"real train dual-evidence source is not calibrated: {source_id}"
+                )
+            if (
+                source.get("teacher_output_used_as_truth") is not True
+                or source.get("teacher_evidence_used_as_training_supervision") is not True
+                or source.get("human_full_source_confirmed") is not False
+                or source.get("calibration_gate_passed") is not True
+                or source.get("unselected_source_label_inheritance") is not False
+                or int(source.get("unsure_training_label", 0)) != -100
+            ):
+                raise ValueError(
+                    f"real train dual-evidence source weakens calibrated truth isolation: {source_id}"
+                )
+            if source_id not in sources or source_id not in partitions:
+                raise ValueError(
+                    f"real train dual-evidence source is outside frozen scope: {source_id}"
+                )
+            partition_row = partitions[source_id]
+            source_window = sources[source_id]
+            if partition_row.get("partition") != "train":
+                raise ValueError(f"real train dual-evidence source crosses held-out: {source_id}")
+            video_id = str(source.get("video_id") or "")
+            if (
+                not video_id
+                or video_id != str(partition_row.get("video_id") or "")
+                or video_id != str(source_window.get("video_id") or "")
+            ):
+                raise ValueError(
+                    f"real train dual-evidence video identity mismatch: {source_id}"
+                )
+            previous_partition = seen_video_partition.setdefault(video_id, "train")
+            if previous_partition != "train":
+                raise ValueError(f"video identity crosses partitions: {video_id}")
+            if source_id in seen_source_partition or source_id in heldout_sources:
+                raise ValueError(f"Scorer v11 source identity crosses partitions: {source_id}")
+            seen_source_partition[source_id] = "train"
+            frame_count = int(source.get("frame_count") or 0)
+            if frame_count <= 0 or float(source.get("frame_hop_s") or 0.0) != FRAME_HOP_S:
+                raise ValueError(
+                    f"real train dual-evidence frame geometry mismatch: {source_id}"
+                )
+            spans = _validate_spans(
+                list(source.get("canonical_spans") or ()),
+                source_id=source_id,
+                frame_count=frame_count,
+            )
+            audio = _resolve(str(source.get("audio") or ""))
+            if not audio.exists():
+                raise FileNotFoundError(audio)
+            audio_sha = str(source.get("audio_sha256") or "")
+            expected_sha = str(source_window.get("audio_wav_sha256") or "")
+            if len(audio_sha) != 64 or audio_sha != expected_sha:
+                raise ValueError(
+                    f"real train dual-evidence audio SHA identity mismatch: {source_id}"
+                )
+            if verify_audio and _sha256(audio) != audio_sha:
+                raise ValueError(
+                    f"real train dual-evidence audio SHA256 mismatch: {source_id}"
+                )
+            sample_count, duration_s, audio_frame_count = _wav_geometry(audio)
+            spans, effective_frame_count, geometry_policy = _clip_reviewed_spans_to_audio(
+                spans,
+                source_id=source_id,
+                reviewed_frame_count=frame_count,
+                audio_frame_count=audio_frame_count,
+            )
+            core_ids = [str(value) for value in source.get("core_ids") or ()]
+            if core_ids != [f"real-train-dual-evidence-source::{source_id}"]:
+                raise ValueError(
+                    f"real train dual-evidence core identity mismatch: {source_id}"
+                )
+            core_id = core_ids[0]
+            previous_core_source = seen_core_source.setdefault(core_id, source_id)
+            if previous_core_source != source_id:
+                raise ValueError(f"Scorer v11 core identity is reused: {core_id}")
+            previous_core_partition = seen_core_partition.setdefault(core_id, "train")
+            if previous_core_partition != "train":
+                raise ValueError(f"Scorer v11 core identity crosses partitions: {core_id}")
+            for span in spans:
+                span_frames = int(span["end_frame"]) - int(span["start_frame"])
+                label = str(span["label"])
+                label_counts[label] += span_frames
+                if label == "inside_candidate":
+                    real_train_dual_evidence_inside_frames += span_frames
+                elif label == "outside_candidate":
+                    real_train_dual_evidence_outside_frames += span_frames
+                else:
+                    real_train_dual_evidence_unsure_frames += span_frames
+            partition_counts["train"] += 1
+            real_train_dual_evidence_count += 1
+            compiled.append(
+                {
+                    "schema": CANDIDATE_ISLAND_SCORER_V11_CANONICAL_SOURCE_SCHEMA,
+                    "boundary_serialization_contract_id": (
+                        ACOUSTIC_BINARY_V12_CONTRACT.contract_id
+                    ),
+                    "canonical_label_schema": (
+                        CANDIDATE_ISLAND_SCORER_V11_CANONICAL_LABEL_SCHEMA
+                    ),
+                    "source_id": source_id,
+                    "video_id": video_id,
+                    "core_ids": core_ids,
+                    "core_identity_kind": "real_train_dual_evidence_source_v1",
+                    "partition": "train",
+                    "input_distribution": str(source.get("input_distribution") or ""),
+                    "source_kind": "real_train_full_source_calibrated_dual_evidence",
+                    "synthetic_composite": False,
+                    "audio": _display(audio),
+                    "audio_sha256": audio_sha,
+                    "duration_s": duration_s,
+                    "frame_count": effective_frame_count,
+                    "frame_hop_s": FRAME_HOP_S,
+                    "audio_sample_count": sample_count,
+                    "reviewed_nominal_frame_count": frame_count,
+                    "audio_geometry_policy": geometry_policy,
+                    "canonical_spans": spans,
+                    "annotation_provenance": (
+                        "calibrated_gemini_independent_dual_evidence_v1"
+                    ),
+                    "real_train_dual_evidence_sources_sha256": (
+                        real_train_dual_evidence_sha
+                    ),
+                    "dual_evidence_summary": source.get("dual_evidence_summary"),
+                    "dual_evidence_summary_sha256": source.get(
+                        "dual_evidence_summary_sha256"
+                    ),
+                    "dual_evidence_preaudit": source.get("dual_evidence_preaudit"),
+                    "dual_evidence_preaudit_sha256": source.get(
+                        "dual_evidence_preaudit_sha256"
+                    ),
+                    "calibration_summary": source.get("calibration_summary"),
+                    "calibration_summary_sha256": source.get(
+                        "calibration_summary_sha256"
+                    ),
+                    "calibration_gap_verdicts": source.get(
+                        "calibration_gap_verdicts"
+                    ),
+                    "calibration_gap_verdicts_sha256": source.get(
+                        "calibration_gap_verdicts_sha256"
+                    ),
+                    "teacher_output_used_as_truth": True,
+                    "teacher_evidence_used_as_training_supervision": True,
+                    "human_full_source_confirmed": False,
+                    "calibration_gate_passed": True,
+                    "unselected_source_label_inheritance": False,
+                    "unsure_training_label": -100,
+                    "training_manifest_allowed": True,
+                }
+            )
+        if (
+            real_train_dual_evidence_inside_frames <= 0
+            or real_train_dual_evidence_outside_frames <= 0
+        ):
+            raise ValueError(
+                "real train dual-evidence supervision must contain both binary classes"
+            )
+
     downstream_isolation_requirement_count = 0
     responsibility_verdict_source_count = 0
     for source_id in sorted(heldout_sources):
@@ -844,6 +1051,20 @@ def compile_canonical(
         "real_train_manual_sources_sha256": real_train_manual_sha,
         "real_train_manual_source_count": real_train_manual_count,
         "real_train_manual_inside_frames": real_train_manual_inside_frames,
+        "real_train_dual_evidence_sources": (
+            _display(real_train_dual_evidence_sources)
+            if real_train_dual_evidence_sources is not None
+            else None
+        ),
+        "real_train_dual_evidence_sources_sha256": real_train_dual_evidence_sha,
+        "real_train_dual_evidence_source_count": real_train_dual_evidence_count,
+        "real_train_dual_evidence_inside_frames": (
+            real_train_dual_evidence_inside_frames
+        ),
+        "real_train_dual_evidence_outside_frames": (
+            real_train_dual_evidence_outside_frames
+        ),
+        "real_train_dual_evidence_unsure_frames": real_train_dual_evidence_unsure_frames,
         "source_windows": _display(source_windows),
         "source_windows_sha256": source_windows_sha,
         "partition_manifest": _display(partition_manifest),
@@ -864,6 +1085,14 @@ def compile_canonical(
         "real_train_full_source_human_confirmed": (
             real_train_manual_sources is not None and real_train_manual_count > 0
         ),
+        "real_train_full_source_calibrated_dual_evidence": (
+            real_train_dual_evidence_sources is not None
+            and real_train_dual_evidence_count > 0
+        ),
+        "calibrated_teacher_evidence_used_as_training_supervision": (
+            real_train_dual_evidence_sources is not None
+            and real_train_dual_evidence_count > 0
+        ),
         "unselected_real_train_source_label_inheritance": False,
         "omni_preverdicts_used_as_truth": False,
         "training_manifest_allowed": True,
@@ -881,7 +1110,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--synthetic-train-sources", required=True)
     parser.add_argument("--real-train-outside-sources", required=True)
-    parser.add_argument("--real-train-manual-sources")
+    train_truth = parser.add_mutually_exclusive_group()
+    train_truth.add_argument("--real-train-manual-sources")
+    train_truth.add_argument("--real-train-dual-evidence-sources")
     parser.add_argument("--source-windows", required=True)
     parser.add_argument("--partition-manifest", required=True)
     parser.add_argument("--manual-verdicts", action="append", required=True)
@@ -898,6 +1129,11 @@ def main(argv: list[str] | None = None) -> dict[str, Any]:
         real_train_manual_sources=(
             Path(args.real_train_manual_sources)
             if args.real_train_manual_sources
+            else None
+        ),
+        real_train_dual_evidence_sources=(
+            Path(args.real_train_dual_evidence_sources)
+            if args.real_train_dual_evidence_sources
             else None
         ),
         source_windows=Path(args.source_windows),

@@ -162,7 +162,10 @@ def rebind_raw_features(
     _write(reusable_path, [reusable[source_id] for source_id in sorted(reusable)])
     _write(missing_path, missing_rows)
     final_rows = {**reusable, **new_rows}
-    complete = set(final_rows) == set(canonical)
+    unresolved_ids = sorted(set(canonical) - set(final_rows))
+    complete = not unresolved_ids
+    unresolved_path = output_dir / "unresolved_canonical_sources.jsonl"
+    _write(unresolved_path, [canonical[source_id] for source_id in unresolved_ids])
     final_path = output_dir / "raw_feature_manifest.jsonl"
     if complete:
         _write(final_path, [final_rows[source_id] for source_id in sorted(final_rows)])
@@ -193,9 +196,14 @@ def rebind_raw_features(
         ),
         "canonical_source_count": len(canonical),
         "reused_source_count": len(reusable),
+        "new_source_count": len(new_rows),
         "missing_source_count": len(missing_ids),
         "missing_partition_counts": dict(sorted(partition_counts.items())),
         "missing_source_ids": missing_ids,
+        "unresolved_source_count": len(unresolved_ids),
+        "unresolved_source_ids": unresolved_ids,
+        "unresolved_canonical_sources": _display(unresolved_path),
+        "unresolved_canonical_sources_sha256": _sha256(unresolved_path),
         "reusable_raw_feature_manifest": _display(reusable_path),
         "reusable_raw_feature_manifest_sha256": _sha256(reusable_path),
         "missing_canonical_sources": _display(missing_path),
