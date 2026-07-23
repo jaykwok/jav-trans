@@ -3,7 +3,7 @@ param(
     [string]$Stage = 'prepare',
     [string]$RunRoot = '',
     [string]$AuditDir = 'agents/audits/20260722_213831_scorer-v11-train-real-source-gemini-v5-editable25',
-    [string]$HeldoutManualVerdicts = 'agents/audits/20260722_095311_scorer-v11-heldout-human-omni-semantic-units-editable24/manual_verdicts.jsonl',
+    [string]$DownstreamIsolationSummary = 'agents/audits/20260723_172940_scorer-v11-downstream-isolation-required6/summary.json',
     [string]$BaseCanonicalSummary = 'agents/temp/20260722_183600_scorer-v11-no-tile-real-outside-canonical-final/summary.json',
     [string]$PriorRawFeatureManifest = 'agents/temp/20260722_184400_scorer-v11-no-tile-raw-features-full/raw_feature_manifest.jsonl',
     [string]$ModelPath = 'models/jaykwok-Qwen3-ASR-1.7B-JA-Anime-Galgame-hf',
@@ -65,6 +65,19 @@ function Invoke-Prepare {
     }
     $auditSummary = Join-Path $AuditDir 'summary.json'
     $auditManifest = Join-Path $AuditDir 'audit_manifest.jsonl'
+    $isolation = Read-Json -Path $DownstreamIsolationSummary
+    if (
+        $isolation.boundary_serialization_contract_id -ne 'boundary_acoustic_binary_v12' -or
+        -not $isolation.training_manifest_allowed -or
+        [int]$isolation.requirement_count -ne 6 -or
+        -not $isolation.responsibility_verdicts
+    ) {
+        throw 'Downstream isolation responsibility summary is invalid.'
+    }
+    $heldoutResponsibilityVerdicts = [string]$isolation.responsibility_verdicts
+    if (-not (Test-Path -LiteralPath $heldoutResponsibilityVerdicts)) {
+        throw "Scorer responsibility verdicts are missing: $heldoutResponsibilityVerdicts"
+    }
     $base = Read-Json -Path $BaseCanonicalSummary
     foreach ($field in @(
         'synthetic_train_sources',
@@ -95,7 +108,7 @@ function Invoke-Prepare {
         '--real-train-manual-sources', $manualSources,
         '--source-windows', [string]$base.source_windows,
         '--partition-manifest', [string]$base.partition_manifest,
-        '--manual-verdicts', $HeldoutManualVerdicts,
+        '--manual-verdicts', $heldoutResponsibilityVerdicts,
         '--output-dir', $canonicalDir
     )
     $canonicalSources = Join-Path $canonicalDir 'canonical_sources.jsonl'
@@ -115,6 +128,8 @@ function Invoke-Prepare {
         raw_rebind_dir = $rebindDir
         missing_canonical_sources = (Join-Path $rebindDir 'missing_canonical_sources.jsonl')
         raw_feature_manifest = (Join-Path $rebindDir 'raw_feature_manifest.jsonl')
+        downstream_isolation_summary = [System.IO.Path]::GetFullPath((Join-Path $ProjectRoot $DownstreamIsolationSummary))
+        heldout_responsibility_verdicts = [System.IO.Path]::GetFullPath((Join-Path $ProjectRoot $heldoutResponsibilityVerdicts))
         features_dir = (Join-Path $RunRoot '05-features')
         smoke_dir = (Join-Path $RunRoot '06-smoke')
         full_dir = (Join-Path $RunRoot '07-full')

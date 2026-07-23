@@ -32,6 +32,9 @@ SUMMARY_SCHEMA = "candidate_island_scorer_v11_canonical_compile_summary_v1"
 PARTITION_SCHEMA = "candidate_island_scorer_v11_partition_manifest_v1"
 HELDOUT_VERDICT_SCHEMA = "candidate_island_scorer_v11_heldout_manual_verdict_v1"
 MANUAL_VERDICT_SCHEMA = "candidate_island_scorer_v11_manual_verdict_v1"
+RESPONSIBILITY_VERDICT_SCHEMA = (
+    "candidate_island_scorer_v11_responsibility_manual_verdict_v1"
+)
 REAL_TRAIN_OUTSIDE_SCHEMA = "candidate_island_scorer_v11_real_train_outside_source_v1"
 REAL_TRAIN_MANUAL_SCHEMA = "candidate_island_scorer_v11_real_train_manual_source_v1"
 FRAME_HOP_S = 0.02
@@ -656,13 +659,20 @@ def compile_canonical(
         if real_train_manual_inside_frames <= 0:
             raise ValueError("real train manual truth contains no inside_candidate frames")
 
+    downstream_isolation_requirement_count = 0
+    responsibility_verdict_source_count = 0
     for source_id in sorted(heldout_sources):
         source = heldout_sources[source_id]
         partition_row = heldout_partitions[source_id]
         verdict = verdicts[source_id]
         if partition_row.get("schema") != PARTITION_SCHEMA:
             raise ValueError(f"wrong v11 partition schema: {source_id}")
-        if verdict.get("schema") not in {HELDOUT_VERDICT_SCHEMA, MANUAL_VERDICT_SCHEMA}:
+        verdict_schema = str(verdict.get("schema") or "")
+        if verdict_schema not in {
+            HELDOUT_VERDICT_SCHEMA,
+            MANUAL_VERDICT_SCHEMA,
+            RESPONSIBILITY_VERDICT_SCHEMA,
+        }:
             raise ValueError(f"wrong v11 manual verdict schema: {source_id}")
         for row in (partition_row, verdict):
             if row.get("boundary_serialization_contract_id") != (
@@ -681,6 +691,40 @@ def compile_canonical(
             or bool(verdict.get("preaudit_provenance"))
         ):
             raise ValueError(f"Omni-only or unconfirmed verdict cannot become truth: {source_id}")
+        requirement_ids: list[str] = []
+        if verdict_schema == RESPONSIBILITY_VERDICT_SCHEMA:
+            if provenance != "human_full_source_plus_downstream_isolation_v1":
+                raise ValueError(
+                    f"wrong Scorer responsibility provenance: {source_id}"
+                )
+            if int(verdict.get("unsure_training_label", 0)) != -100:
+                raise ValueError(
+                    f"downstream isolation must map to unsure=-100: {source_id}"
+                )
+            raw_sha = str(verdict.get("raw_heldout_verdicts_sha256") or "")
+            selection_sha = str(
+                verdict.get("downstream_isolation_selection_sha256") or ""
+            )
+            if len(raw_sha) != 64 or len(selection_sha) != 64:
+                raise ValueError(
+                    f"Scorer responsibility provenance SHA is missing: {source_id}"
+                )
+            raw_requirement_ids = verdict.get(
+                "downstream_isolation_requirement_ids"
+            )
+            if not isinstance(raw_requirement_ids, list):
+                raise ValueError(
+                    f"Scorer responsibility requirement ids must be a list: {source_id}"
+                )
+            requirement_ids = [str(value) for value in raw_requirement_ids]
+            if any(not value for value in requirement_ids) or len(
+                requirement_ids
+            ) != len(set(requirement_ids)):
+                raise ValueError(
+                    f"invalid Scorer responsibility requirement ids: {source_id}"
+                )
+            downstream_isolation_requirement_count += len(requirement_ids)
+            responsibility_verdict_source_count += 1
         if float(verdict.get("frame_hop_s") or 0.0) != FRAME_HOP_S:
             raise ValueError(f"frame hop mismatch: {source_id}")
         frame_count = int(verdict.get("frame_count") or 0)
@@ -754,13 +798,22 @@ def compile_canonical(
                 "reviewed_nominal_frame_count": frame_count,
                 "audio_geometry_policy": geometry_policy,
                 "canonical_spans": spans,
-                "annotation_provenance": "human_full_source_review",
+                "annotation_provenance": (
+                    provenance
+                    if verdict_schema == RESPONSIBILITY_VERDICT_SCHEMA
+                    else "human_full_source_review"
+                ),
                 "manual_verdict_file": _display(verdict_file_by_source[source_id]),
                 "manual_verdict_file_sha256": verdict_shas[
                     _display(verdict_file_by_source[source_id])
                 ],
                 "source_windows_sha256": source_windows_sha,
                 "partition_manifest_sha256": partition_sha,
+                "unsure_training_label": -100,
+                "downstream_isolation_requirement_ids": requirement_ids,
+                "downstream_isolation_selection_sha256": verdict.get(
+                    "downstream_isolation_selection_sha256"
+                ),
                 "training_manifest_allowed": True,
             }
         )
@@ -800,6 +853,9 @@ def compile_canonical(
         "partition_counts": dict(sorted(partition_counts.items())),
         "canonical_frame_counts": dict(sorted(label_counts.items())),
         "all_heldout_sources_human_confirmed": True,
+        "responsibility_verdict_source_count": responsibility_verdict_source_count,
+        "downstream_isolation_requirement_count": downstream_isolation_requirement_count,
+        "downstream_isolation_without_bound_evidence_maps_to_unsure": True,
         "synthetic_train_truth_exact_composition": True,
         "real_train_outside_truth_requires_asr_empty": True,
         "asr_text_used_as_inside_truth": False,

@@ -23,6 +23,7 @@ from boundary.ja.model import (
 from tools.boundary.ja.compile_candidate_island_scorer_v11_canonical import (
     HELDOUT_VERDICT_SCHEMA,
     PARTITION_SCHEMA,
+    RESPONSIBILITY_VERDICT_SCHEMA,
     compile_canonical,
 )
 from tools.boundary.ja.compile_candidate_island_scorer_v11_features import (
@@ -214,6 +215,71 @@ def test_v11_canonical_requires_all_human_full_source_truth(tmp_path: Path) -> N
             partition_manifest=omni_partition,
             manual_verdicts=[omni_verdict],
             output_dir=tmp_path / "omni-output",
+        )
+
+
+def test_v11_canonical_accepts_explicit_scorer_responsibility_truth(
+    tmp_path: Path,
+) -> None:
+    synthetic_path, real_train_path, source_path, partition_path, verdict_path = (
+        _canonical_fixture(tmp_path)
+    )
+    verdict_rows = [
+        json.loads(line)
+        for line in verdict_path.read_text(encoding="utf-8").splitlines()
+    ]
+    for index, row in enumerate(verdict_rows):
+        row.update(
+            {
+                "schema": RESPONSIBILITY_VERDICT_SCHEMA,
+                "review_provenance": "human_full_source_plus_downstream_isolation_v1",
+                "unsure_training_label": -100,
+                "downstream_isolation_requirement_ids": (
+                    [f"requirement-{index}"] if index == 0 else []
+                ),
+                "raw_heldout_verdicts_sha256": "1" * 64,
+                "downstream_isolation_selection_sha256": "2" * 64,
+            }
+        )
+    responsibility_path = tmp_path / "responsibility-verdicts.jsonl"
+    _write_jsonl(responsibility_path, verdict_rows)
+    summary = compile_canonical(
+        synthetic_train_sources=synthetic_path,
+        real_train_outside_sources=real_train_path,
+        source_windows=source_path,
+        partition_manifest=partition_path,
+        manual_verdicts=[responsibility_path],
+        output_dir=tmp_path / "responsibility-canonical",
+    )
+    assert summary["responsibility_verdict_source_count"] == 2
+    assert summary["downstream_isolation_requirement_count"] == 1
+    assert summary[
+        "downstream_isolation_without_bound_evidence_maps_to_unsure"
+    ] is True
+    rows = [
+        json.loads(line)
+        for line in Path(summary["canonical_sources"])
+        .read_text(encoding="utf-8")
+        .splitlines()
+    ]
+    val = next(row for row in rows if row["partition"] == "val")
+    assert val["annotation_provenance"] == (
+        "human_full_source_plus_downstream_isolation_v1"
+    )
+    assert val["downstream_isolation_requirement_ids"] == ["requirement-0"]
+    assert val["unsure_training_label"] == -100
+
+    verdict_rows[0]["unsure_training_label"] = 0
+    invalid_path = tmp_path / "invalid-responsibility-verdicts.jsonl"
+    _write_jsonl(invalid_path, verdict_rows)
+    with pytest.raises(ValueError, match="unsure=-100"):
+        compile_canonical(
+            synthetic_train_sources=synthetic_path,
+            real_train_outside_sources=real_train_path,
+            source_windows=source_path,
+            partition_manifest=partition_path,
+            manual_verdicts=[invalid_path],
+            output_dir=tmp_path / "invalid-responsibility-canonical",
         )
 
 

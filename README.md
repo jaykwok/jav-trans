@@ -179,7 +179,7 @@ src/checkpoints/
 
 1.7B 的目标 Boundary pipeline 统一使用合同 `boundary_acoustic_binary_v12`：Scorer v11 → Proposal v1 → Outer v3 → Acoustic Split v4 → provisional sub-islands → CueQC v13 → Inner v2 acoustic core → Chunk/ASR。Outer v3 必须等实际 post-Scorer-v11 输出分布训练并通过人工 gate 后才可注册；模型缺失、repo 不匹配、合同不兼容或选择 0.6B 都会直接报错，不提供规则 fallback 或静默迁移。实验指标与版本决策见 [docs/HISTORY.md](docs/HISTORY.md)。
 
-当前训练数据状态：1.7B Scorer v11 的 no-tile raw PTM2048/MFCC40 数据和 P2048/H256 候选训练已完成，但候选 gate 未通过，registry 仍为空，不能用于生产。下一轮训练必须继续使用固定 source/core/partition、真实 full-source held-out、`unsure=-100` 和 v5 teacher 语义；旧 PTM128、v6 领域提示行和旧多模型 view 均拒绝。Proposal v1 仍只作审计参考，Outer v3 registry 为空并等待 no-Outer/edge-only/current 消融；Split v4、CueQC v13 和 Inner v2 现役权重只作旧链运行参考，不能用 rebind SHA 冒充新 provenance。完整证据与合法重训顺序见 [1.7B Boundary 训练数据生成链职责审计](docs/audits/20260722_boundary-training-data-generation-audit-v1.md)。
+当前训练数据状态：1.7B Scorer v11 的 no-tile raw PTM2048/MFCC40 数据和 P2048/H256 候选训练已完成，但候选 gate 未通过，registry 仍为空，不能用于生产。held-out 职责视图已把 6 条“内部独立背景、需要下游隔离”的 5138 帧从 Split 级 background 映射为 Scorer `unsure=-100`；在同 source/audio/checkpoint 绑定的 Proposal/Split/sub-island/CueQC 证据齐备前，不得把它们作为 Scorer outside。对应 canonical 保持 1170 个 source 及固定 partition 不变，计数为 `inside 528479 / outside 116415 / unsure 65570`。下一轮训练还要求 25 条 train full-source 人工 verdict；该文件尚未保存，正式 driver 会 fail-closed，不能跳过。旧 PTM128、v6 领域提示行和旧多模型 view 均拒绝。Proposal v1 仍只作审计参考，Outer v3 registry 为空并等待 no-Outer/edge-only/current 消融；Split v4、CueQC v13 和 Inner v2 现役权重只作旧链运行参考，不能用 rebind SHA 冒充新 provenance。完整证据见 [1.7B Boundary 训练数据生成链职责审计](docs/audits/20260722_boundary-training-data-generation-audit-v1.md) 与 [Scorer downstream isolation responsibility audit](docs/audits/20260723_scorer-v11-downstream-isolation-required6.md)。
 
 Split v4 当前唯一合法训练数据合同是
 `acoustic_split_v4_sequence_dataset_summary_v1`：raw PTM2048 + MFCC40（frame
@@ -365,6 +365,10 @@ uv run python -m <module> --help
 - `tools.workflows.run_full_workflow`：命令行完整工作流 smoke。
 - `tools.web.smoke.start_server` / `submit_job` / `poll_job` / `summarize_job`：Web 服务 smoke 和任务汇总。
 - `tools.audits.audit_nav` / `serve_audits.ps1`：审计页导航与 Windows 本地服务。
+- `tools.audits.review_page_core` / `audit_prompt`：人工审计页共享 Core（区间播放器、状态、完成度、保存 API）与可复用提示配置；任务特有布局、证据和完备 verdict 组合由 Adapter 提供。设计合同见 [Human Audit Page Core](docs/audits/20260723_human-audit-page-core-v1.md)。
+- `tools.audits.generate_candidate_island_dual_evidence_review`：Scorer Protect×Remove 与人工 full-source truth 的三轴 bridge-gap Adapter。
+- `tools.audits.generate_pre_asr_v13_false_drop_audit_html`：CueQC v13 false-drop Adapter。
+- `tools.audits.generate_split_v4_missing_cut_candidate_audit_html` / `generate_acoustic_split_canonical_candidate_audit_html`：Split v4 missing-cut 与 canonical candidate Adapter。现役/退役清单见 [人工审计 Adapter inventory](docs/audits/20260723_human-audit-adapter-inventory-v1.md)。
 - `tools.datasets.label_joint_boundary_preasr_with_omni`：实时 Omni 小规模标注。
 - `tools.datasets.batch_joint_boundary_preasr_with_omni`：Omni Batch 全量标注。
 - `tools.workflows.promote_torch_checkpoint`：晋升生产 checkpoint。
