@@ -39,3 +39,26 @@ def test_v11_prediction_audit_escapes_jsonl_newlines_in_javascript() -> None:
 
     assert ".join('\\n')+'\\n'" in html
     assert ".join('\n')+'\n'" not in html
+
+
+def test_v11_prediction_audit_separates_teacher_all_outside_source() -> None:
+    predictions = [
+        {
+            "source_id": "background-only",
+            "partition": "test",
+            "duration_s": 75.0,
+            "frame_count": 3750,
+            "checkpoint_sha256": "b" * 64,
+            "all_outside_source": True,
+            "truth_spans": [],
+            "prediction_spans": [],
+            "prediction_drop_truth_keep_spans": [],
+            "long_residual_spans": [],
+        }
+    ]
+
+    items = build_items(predictions)
+
+    assert len(items) == 1
+    assert items[0]["category"] == "teacher_all_outside_source"
+    assert "模型仍有保留" in _page(items)

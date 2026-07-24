@@ -37,7 +37,7 @@ from pipeline.memory_safety import (  # noqa: E402
 
 FRAME_HOP_S = 0.02
 IGNORE_INDEX = -100
-SUMMARY_SCHEMA = "candidate_island_scorer_v11_checkpoint_audit_summary_v1"
+SUMMARY_SCHEMA = "candidate_island_scorer_v11_checkpoint_audit_summary_v2"
 PREDICTION_SCHEMA = "candidate_island_scorer_v11_source_prediction_v1"
 LABEL_ID = {
     "outside_candidate": 0,
@@ -119,7 +119,7 @@ def evaluate_source_prediction(
     predicted: np.ndarray,
     *,
     tolerance_frames: int,
-    long_residual_frames: int,
+    long_residual_frames: int | None,
 ) -> dict[str, Any]:
     truth_values = np.asarray(truth, dtype=np.int64)
     predicted_values = np.asarray(predicted, dtype=np.int64)
@@ -140,6 +140,17 @@ def evaluate_source_prediction(
         confusion[int(expected), int(actual)] += 1
 
     truth_runs = _runs(inside_truth)
+    outside_runs = _runs(outside_truth)
+    inside_total = int(inside_truth.sum())
+    outside_total = int(outside_truth.sum())
+    mixed_source = inside_total > 0 and outside_total > 0
+    all_outside_source = outside_total > 0 and inside_total == 0
+    outside_run_recall_sum = float(
+        sum(
+            np.mean(~inside_pred[start:end], dtype=np.float64)
+            for start, end in outside_runs
+        )
+    )
     start_hits = end_hits = deletions = continuous = fragmented = 0
     internal_gap_frames = 0
     internal_gap_lengths: list[int] = []
@@ -161,19 +172,38 @@ def evaluate_source_prediction(
         internal_gap_lengths.extend(local_gap_lengths)
         internal_gap_frames += sum(local_gap_lengths)
 
-    long_residuals = [
-        (start, end)
-        for start, end in _runs(keep_truth_drop)
-        if end - start >= int(long_residual_frames)
-    ]
-    inside_total = int(confusion[1].sum())
-    outside_total = int(confusion[0].sum())
+    long_residuals = (
+        [
+            (start, end)
+            for start, end in _runs(keep_truth_drop)
+            if end - start >= int(long_residual_frames)
+        ]
+        if long_residual_frames is not None
+        else []
+    )
+    all_outside_drop_success = (
+        bool(all_outside_source and not np.any(inside_pred & outside_truth))
+        if all_outside_source
+        else None
+    )
+    outside_source_recall = (
+        float(confusion[0, 0] / outside_total) if outside_total else None
+    )
     definite_total = int(confusion.sum())
     return {
         "confusion_truth_by_prediction": confusion.tolist(),
         "definite_frame_count": definite_total,
         "inside_candidate_recall": float(confusion[1, 1] / max(inside_total, 1)),
         "outside_candidate_recall": float(confusion[0, 0] / max(outside_total, 1)),
+        "inside_truth_frame_count": inside_total,
+        "outside_truth_frame_count": outside_total,
+        "mixed_source": mixed_source,
+        "all_outside_source": all_outside_source,
+        "outside_source_recall": outside_source_recall,
+        "all_outside_source_drop_success": all_outside_drop_success,
+        "truth_outside_run_count": len(outside_runs),
+        "outside_run_recall_sum": outside_run_recall_sum,
+        "outside_run_mean_recall": outside_run_recall_sum / max(len(outside_runs), 1),
         "frame_accuracy": float(np.trace(confusion) / max(definite_total, 1)),
         "truth_inside_run_count": len(truth_runs),
         "start_hit_count": start_hits,
@@ -225,10 +255,16 @@ def _sum_partition(rows: Iterable[dict[str, Any]]) -> dict[str, Any]:
     selected = list(rows)
     confusion = np.zeros((2, 2), dtype=np.int64)
     summed = Counter()
+    outside_source_recall_sum = 0.0
+    outside_source_count = 0
+    mixed_source_count = 0
+    all_outside_source_count = 0
+    all_outside_source_drop_success_count = 0
     for row in selected:
         confusion += np.asarray(row["confusion_truth_by_prediction"], dtype=np.int64)
         for key in (
             "truth_inside_run_count",
+            "truth_outside_run_count",
             "start_hit_count",
             "end_hit_count",
             "true_inside_deletion_count",
@@ -246,10 +282,22 @@ def _sum_partition(rows: Iterable[dict[str, Any]]) -> dict[str, Any]:
             "long_residual_count",
         ):
             summed[key] += int(row[key])
+        summed["outside_run_recall_sum"] += float(row["outside_run_recall_sum"])
+        outside_source_recall = row.get("outside_source_recall")
+        if outside_source_recall is not None:
+            outside_source_recall_sum += float(outside_source_recall)
+            outside_source_count += 1
+        mixed_source_count += int(bool(row.get("mixed_source")))
+        if bool(row.get("all_outside_source")):
+            all_outside_source_count += 1
+            all_outside_source_drop_success_count += int(
+                bool(row.get("all_outside_source_drop_success"))
+            )
     inside_total = int(confusion[1].sum())
     outside_total = int(confusion[0].sum())
     definite_total = int(confusion.sum())
     runs = int(summed["truth_inside_run_count"])
+    outside_runs = int(summed["truth_outside_run_count"])
     start_hits = int(summed["start_hit_count"])
     end_hits = int(summed["end_hit_count"])
     return {
@@ -258,13 +306,46 @@ def _sum_partition(rows: Iterable[dict[str, Any]]) -> dict[str, Any]:
         "definite_frame_count": definite_total,
         "inside_candidate_recall": float(confusion[1, 1] / max(inside_total, 1)),
         "outside_candidate_recall": float(confusion[0, 0] / max(outside_total, 1)),
+        "inside_truth_frame_count": inside_total,
+        "outside_truth_frame_count": outside_total,
+        "mixed_source_count": mixed_source_count,
+        "outside_source_count": outside_source_count,
+        "outside_source_macro_recall": (
+            outside_source_recall_sum / outside_source_count
+            if outside_source_count
+            else None
+        ),
+        "all_outside_source_count": all_outside_source_count,
+        "all_outside_source_drop_success_count": all_outside_source_drop_success_count,
+        "all_outside_source_drop_recall": (
+            all_outside_source_drop_success_count / all_outside_source_count
+            if all_outside_source_count
+            else None
+        ),
+        "truth_outside_run_count": outside_runs,
+        "outside_run_recall_sum": float(summed["outside_run_recall_sum"]),
+        "outside_run_mean_recall": float(summed["outside_run_recall_sum"])
+        / max(outside_runs, 1),
         "frame_accuracy": float(np.trace(confusion) / max(definite_total, 1)),
         "truth_inside_run_count": runs,
         "start_coverage": start_hits / max(runs, 1),
         "end_coverage": end_hits / max(runs, 1),
-        "truth_run_continuity": int(summed["continuous_truth_run_count"]) / max(runs, 1),
-        **{key: int(value) for key, value in summed.items()},
+        "truth_run_continuity": int(summed["continuous_truth_run_count"]) / runs
+        if runs
+        else None,
+        "truth_run_continuity_applicable": bool(runs),
+        **{
+            key: int(value)
+            for key, value in summed.items()
+            if key != "outside_run_recall_sum"
+        },
     }
+
+
+def summarize_source_predictions(rows: Iterable[dict[str, Any]]) -> dict[str, Any]:
+    """Aggregate exact full-source Scorer metrics without window double counting."""
+
+    return _sum_partition(rows)
 
 
 def run(args: argparse.Namespace) -> dict[str, Any]:
@@ -428,12 +509,28 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         )
         for partition in sorted(requested_partitions)
     }
+    def _gate_metric(metrics: dict[str, Any], key: str) -> bool:
+        if key == "inside_candidate_recall" and not int(
+            metrics.get("inside_truth_frame_count") or 0
+        ):
+            return True
+        if key == "truth_run_continuity" and not bool(
+            metrics.get("truth_run_continuity_applicable")
+        ):
+            return True
+        if key == "all_outside_source_drop_recall" and not int(
+            metrics.get("all_outside_source_count") or 0
+        ):
+            return True
+        value = metrics.get(key)
+        return value is None or float(value) >= 0.95
+
     numeric_gate_pass = all(
-        metrics["inside_candidate_recall"] >= 0.95
-        and metrics["outside_candidate_recall"] >= 0.95
-        and metrics["start_coverage"] >= 0.95
-        and metrics["end_coverage"] >= 0.95
-        and metrics["truth_run_continuity"] >= 0.95
+        _gate_metric(metrics, "inside_candidate_recall")
+        and _gate_metric(metrics, "outside_candidate_recall")
+        and _gate_metric(metrics, "outside_run_mean_recall")
+        and _gate_metric(metrics, "all_outside_source_drop_recall")
+        and _gate_metric(metrics, "truth_run_continuity")
         and metrics["true_inside_deletion_count"] == 0
         for metrics in partition_metrics.values()
     )
@@ -465,6 +562,8 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "source_count": len(prediction_rows),
         "partition_metrics": partition_metrics,
         "numeric_gate_maximum_requirement": 0.95,
+        "edge_coverage_is_diagnostic_only": True,
+        "teacher_all_outside_sources_are_explicit_gate_stratum": True,
         "numeric_gate_pass": numeric_gate_pass,
         "manual_zero_clipping_gate": "pending",
         "manual_zero_true_speech_deletion_gate": "pending",

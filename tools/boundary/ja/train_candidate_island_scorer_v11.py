@@ -71,11 +71,18 @@ from pipeline.memory_safety import (  # noqa: E402
     reset_shared_vram_baseline,
     runtime_memory_snapshot,
 )
+from tools.audits.score_candidate_island_scorer_v11_checkpoint import (  # noqa: E402
+    evaluate_source_prediction,
+    summarize_source_predictions,
+)
 
 
-SUMMARY_SCHEMA = "candidate_island_scorer_v11_training_summary_v1"
+SUMMARY_SCHEMA = "candidate_island_scorer_v11_training_summary_v2"
 IGNORE_INDEX = -100
 PARTITIONS = {"train", "val", "test"}
+FULL_SOURCE_TOLERANCE_FRAMES = 15
+SELECTION_SAFETY_REQUIREMENT = 0.95
+SELECTION_CONTRACT = "full_source_teacher_outside_continuity_v3"
 
 
 def _read_json(path: Path) -> dict[str, Any]:
@@ -546,43 +553,159 @@ def _evaluate(
     torch,
     device,
 ) -> dict[str, Any]:
-    confusion = np.zeros((2, 2), dtype=np.int64)
     loss_sum = 0.0
     batches = 0
+    source_truth: dict[str, np.ndarray] = {}
+    source_prediction: dict[str, np.ndarray] = {}
+    for row in rows:
+        source_id = str(row["source_id"])
+        frame_count = int(row["source_frame_count"])
+        if source_id not in source_truth:
+            source_truth[source_id] = np.full(frame_count, 999, dtype=np.int64)
+            source_prediction[source_id] = np.full(frame_count, 999, dtype=np.int64)
     model.eval()
     with torch.no_grad():
         for rows_batch in _pack_batches(rows, max_padded_frames=max_padded_frames):
-            batch = _collate([load_candidate_window(row, cache) for row in rows_batch], torch, device)
-            loss, _main, _aux, logits, valid = _loss(
-                model,
-                batch,
-                variant=variant,
-                heatmap_weight=heatmap_weight,
-                query_mask_weight=query_mask_weight,
-                torch=torch,
-            )
-            target = batch["labels"][valid].detach().cpu().numpy()
+            items = [load_candidate_window(row, cache) for row in rows_batch]
+            batch = _collate(items, torch, device)
+            valid = batch["owner"] & (batch["labels"] != IGNORE_INDEX)
+            _loss_valid = None
+            if bool(torch.any(valid)):
+                loss, _main, _aux, logits, _loss_valid = _loss(
+                    model,
+                    batch,
+                    variant=variant,
+                    heatmap_weight=heatmap_weight,
+                    query_mask_weight=query_mask_weight,
+                    torch=torch,
+                )
+                loss_sum += float(loss.detach().cpu())
+                batches += 1
+            elif variant in {"heatmap_aux", "query_mask", "dense_span"}:
+                outputs = model.forward_outputs(
+                    batch["ptm"], batch["mfcc"], attention_mask=batch["attention"]
+                )
+                logits = (
+                    outputs["span_scores"]
+                    if variant == "dense_span"
+                    else outputs["class_logits"]
+                )
+                del outputs
+                loss = None
+            else:
+                logits = model(
+                    batch["ptm"], batch["mfcc"], attention_mask=batch["attention"]
+                )
+                loss = None
             if variant in {"crf", "dense_span"}:
                 predicted_labels = model.decode(logits, batch["attention"])
             else:
                 predicted_labels = torch.argmax(logits, dim=-1)
-            predicted = predicted_labels[valid].detach().cpu().numpy()
-            for truth, prediction in zip(target, predicted, strict=True):
-                confusion[int(truth), int(prediction)] += 1
-            loss_sum += float(loss.detach().cpu())
-            batches += 1
-            del batch, logits, valid, loss
-    total = int(confusion.sum())
-    inside_total = int(confusion[1].sum())
-    outside_total = int(confusion[0].sum())
+            predicted_batch = predicted_labels.detach().cpu().numpy()
+            for index, (row, item) in enumerate(zip(rows_batch, items, strict=True)):
+                source_id = str(row["source_id"])
+                owner_local_start = int(row["owner_local_start"])
+                owner_local_end = int(row["owner_local_end"])
+                owner_start = int(row["owner_start_frame"])
+                owner_end = int(row["owner_end_frame"])
+                source_truth[source_id][owner_start:owner_end] = item["labels"][
+                    owner_local_start:owner_local_end
+                ]
+                source_prediction[source_id][owner_start:owner_end] = predicted_batch[
+                    index, owner_local_start:owner_local_end
+                ]
+            del batch, logits, valid, loss, predicted_labels, predicted_batch, items
+            del _loss_valid
+    source_metrics: list[dict[str, Any]] = []
+    for source_id in sorted(source_truth):
+        truth = source_truth[source_id]
+        prediction = source_prediction[source_id]
+        if np.any(truth == 999) or np.any(prediction == 999):
+            raise ValueError(f"Scorer v11 evaluation owner coverage is incomplete: {source_id}")
+        source_metrics.append(
+            evaluate_source_prediction(
+                truth,
+                prediction,
+                tolerance_frames=FULL_SOURCE_TOLERANCE_FRAMES,
+                long_residual_frames=None,
+            )
+        )
+    summary = summarize_source_predictions(source_metrics)
+    summary.update(
+        loss=loss_sum / max(batches, 1),
+        definite_owner_frame_count=int(summary["definite_frame_count"]),
+    )
+    return summary
+
+
+def checkpoint_selection_components(metrics: dict[str, Any]) -> dict[str, Any]:
+    """Cap semantic safety, then rank teacher outside removal and continuity.
+
+    A source with no definite inside truth has no meaningful continuity score.
+    Treat that dimension as not-applicable (neutral for the structural score),
+    while retaining explicit outside-source metrics so an all-background
+    teacher source cannot be hidden by a large mixed-source aggregate.
+    """
+
+    inside_truth_frames = int(metrics.get("inside_truth_frame_count") or 0)
+    semantic_safety_floor = (
+        float(metrics["inside_candidate_recall"])
+        if inside_truth_frames > 0 or "inside_truth_frame_count" not in metrics
+        else 1.0
+    )
+    edge_coverage_floor = min(
+        float(metrics["start_coverage"]), float(metrics["end_coverage"])
+    )
+    zero_true_run_deletion = int(metrics["true_inside_deletion_count"]) == 0
+    semantic_safety_pass = (
+        zero_true_run_deletion
+        and semantic_safety_floor >= SELECTION_SAFETY_REQUIREMENT
+    )
+    structural_terms = [
+        float(metrics["outside_candidate_recall"]),
+        float(metrics["outside_run_mean_recall"]),
+    ]
+    outside_source_macro = metrics.get("outside_source_macro_recall")
+    all_outside_drop_recall = metrics.get("all_outside_source_drop_recall")
+    if all_outside_drop_recall is not None:
+        structural_terms.append(float(all_outside_drop_recall))
+    continuity = metrics.get("truth_run_continuity")
+    if continuity is not None:
+        structural_terms.append(float(continuity))
+    structural_bottleneck = min(structural_terms)
+    if not zero_true_run_deletion:
+        phase = "true_run_deletion"
+        phase_rank = 0
+        primary = semantic_safety_floor
+    elif not semantic_safety_pass:
+        phase = "semantic_safety_below_95"
+        phase_rank = 1
+        primary = semantic_safety_floor
+    else:
+        phase = "outside_continuity_optimization"
+        phase_rank = 2
+        primary = structural_bottleneck
     return {
-        "loss": loss_sum / max(batches, 1),
-        "frame_accuracy": float(np.trace(confusion) / max(total, 1)),
-        "inside_candidate_recall": float(confusion[1, 1] / max(inside_total, 1)),
-        "outside_candidate_recall": float(confusion[0, 0] / max(outside_total, 1)),
-        "prediction_drop_truth_keep_frames": int(confusion[1, 0]),
-        "confusion_truth_by_prediction": confusion.tolist(),
-        "definite_owner_frame_count": total,
+        "contract": SELECTION_CONTRACT,
+        "phase": phase,
+        "phase_rank": phase_rank,
+        "semantic_safety_requirement": SELECTION_SAFETY_REQUIREMENT,
+        "semantic_safety_floor": semantic_safety_floor,
+        "semantic_safety_pass": semantic_safety_pass,
+        "edge_coverage_floor": edge_coverage_floor,
+        "edge_coverage_is_diagnostic_only": True,
+        "zero_true_run_deletion": zero_true_run_deletion,
+        "outside_candidate_recall": float(metrics["outside_candidate_recall"]),
+        "outside_run_mean_recall": float(metrics["outside_run_mean_recall"]),
+        "outside_source_macro_recall": outside_source_macro,
+        "all_outside_source_drop_recall": all_outside_drop_recall,
+        "all_outside_source_count": int(metrics.get("all_outside_source_count") or 0),
+        "truth_run_continuity": continuity,
+        "truth_run_continuity_applicable": bool(
+            metrics.get("truth_run_continuity_applicable", continuity is not None)
+        ),
+        "structural_bottleneck": structural_bottleneck,
+        "selection_score": 2.0 * phase_rank + primary,
     }
 
 
@@ -771,6 +894,9 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         raise ValueError("Scorer v11 log_every must be positive")
     eval_every_epochs = int(getattr(args, "eval_every_epochs", 1))
     early_stopping_patience = int(getattr(args, "early_stopping_patience", 3))
+    early_stopping_min_epochs = int(
+        getattr(args, "early_stopping_min_epochs", 10)
+    )
     early_stopping_min_delta = float(
         getattr(args, "early_stopping_min_delta", 1e-4)
     )
@@ -780,6 +906,9 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         raise ValueError("Scorer v11 early_stopping_patience must be non-negative")
     if early_stopping_min_delta < 0.0:
         raise ValueError("Scorer v11 early_stopping_min_delta must be non-negative")
+    if early_stopping_min_epochs < 0:
+        raise ValueError("Scorer v11 early_stopping_min_epochs must be non-negative")
+    early_stopping_min_epochs = min(early_stopping_min_epochs, int(args.epochs))
     capacity_profile = str(args.capacity_profile)
     if capacity_profile not in CANDIDATE_ISLAND_SCORER_V11_CAPACITY_PROFILES:
         raise ValueError(f"unknown Scorer v11 capacity profile: {capacity_profile!r}")
@@ -989,6 +1118,8 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             "eta_s": None,
             "eval_every_epochs": eval_every_epochs,
             "early_stopping_patience": early_stopping_patience,
+            "early_stopping_min_epochs": early_stopping_min_epochs,
+            "selection_contract": SELECTION_CONTRACT,
         },
     )
     best_state: dict[str, Any] | None = None
@@ -1084,7 +1215,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         if should_evaluate:
             val_metrics = _evaluate(
                 model,
-                supervised_by_partition["val"],
+                by_partition["val"],
                 cache=cache,
                 max_padded_frames=int(args.max_padded_frames),
                 variant=args.variant,
@@ -1093,10 +1224,8 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 torch=torch,
                 device=device,
             )
-            val_score = min(
-                float(val_metrics["inside_candidate_recall"]),
-                float(val_metrics["outside_candidate_recall"]),
-            )
+            val_selection = checkpoint_selection_components(val_metrics)
+            val_score = float(val_selection["selection_score"])
             improved = best_val_score is None or val_score > (
                 float(best_val_score) + early_stopping_min_delta
             )
@@ -1153,12 +1282,45 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                     "val_outside_candidate_recall": val_metrics[
                         "outside_candidate_recall"
                     ],
+                    "val_outside_run_mean_recall": val_metrics[
+                        "outside_run_mean_recall"
+                    ],
+                    "val_outside_source_macro_recall": val_metrics.get(
+                        "outside_source_macro_recall"
+                    ),
+                    "val_all_outside_source_count": val_metrics.get(
+                        "all_outside_source_count", 0
+                    ),
+                    "val_all_outside_source_drop_recall": val_metrics.get(
+                        "all_outside_source_drop_recall"
+                    ),
+                    "val_truth_run_continuity": val_metrics[
+                        "truth_run_continuity"
+                    ],
+                    "val_start_coverage": val_metrics["start_coverage"],
+                    "val_end_coverage": val_metrics["end_coverage"],
+                    "val_selection_phase": val_selection["phase"],
+                    "val_selection_structural_bottleneck": val_selection[
+                        "structural_bottleneck"
+                    ],
                     "val_selection_score": val_score,
+                    "val_selection_components": val_selection,
                     "best_epoch": best_epoch,
                     "best_val_selection_score": best_val_score,
                     "epochs_without_improvement": epochs_without_improvement,
                     "early_stopping_patience": early_stopping_patience,
+                    "early_stopping_min_epochs": early_stopping_min_epochs,
                 },
+            )
+            continuity_display = (
+                "n/a"
+                if val_metrics["truth_run_continuity"] is None
+                else f"{float(val_metrics['truth_run_continuity']):.4f}"
+            )
+            all_bg_display = (
+                "n/a"
+                if val_metrics.get("all_outside_source_drop_recall") is None
+                else f"{float(val_metrics['all_outside_source_drop_recall']):.4f}"
             )
             print(
                 "scorer_v11_eval "
@@ -1167,6 +1329,10 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 f"val_loss={float(val_metrics['loss']):.6f} "
                 f"val_inside={float(val_metrics['inside_candidate_recall']):.4f} "
                 f"val_outside={float(val_metrics['outside_candidate_recall']):.4f} "
+                f"val_outside_run={float(val_metrics['outside_run_mean_recall']):.4f} "
+                f"val_continuity={continuity_display} "
+                f"val_all_bg_drop={all_bg_display} "
+                f"selection={val_score:.4f}({val_selection['phase']}) "
                 f"best_epoch={best_epoch} "
                 f"stale={epochs_without_improvement}/{early_stopping_patience}",
                 flush=True,
@@ -1175,6 +1341,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             if (
                 not bool(args.smoke)
                 and early_stopping_patience > 0
+                and epoch_index >= early_stopping_min_epochs
                 and epochs_without_improvement >= early_stopping_patience
             ):
                 stopped_early = True
@@ -1192,13 +1359,14 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             "status": "evaluating",
             "capacity_profile": capacity_profile,
             "variant": args.variant,
-            "epoch": min(len(planned_epochs), int(args.epochs)),
+            "epoch": epochs_completed,
             "epochs": int(args.epochs),
             "step": training_steps,
             "total_steps": total_training_steps,
             "elapsed_s": time.monotonic() - training_started,
             "best_epoch": best_epoch,
             "best_val_selection_score": best_val_score,
+            "selection_contract": SELECTION_CONTRACT,
             "stopped_early": stopped_early,
             "stop_reason": stop_reason,
         },
@@ -1206,7 +1374,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     metrics = {
         partition: _evaluate(
             model,
-            supervised_by_partition[partition],
+            by_partition[partition],
             cache=cache,
             max_padded_frames=int(args.max_padded_frames),
             variant=args.variant,
@@ -1218,12 +1386,29 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         for partition in ("val", "test")
     }
     memory_snapshots.append(_memory_snapshot(device, stage="evaluation_complete"))
+    def _at_least(metrics_row: dict[str, Any], key: str) -> bool:
+        if (
+            key == "inside_candidate_recall"
+            and int(metrics_row.get("inside_truth_frame_count") or 0) == 0
+        ):
+            return True
+        value = metrics_row.get(key)
+        return value is None or float(value) >= SELECTION_SAFETY_REQUIREMENT
+
     numeric_gate_pass = (
         not bool(args.smoke)
-        and metrics["val"]["inside_candidate_recall"] >= 0.95
-        and metrics["test"]["inside_candidate_recall"] >= 0.95
-        and metrics["val"]["outside_candidate_recall"] >= 0.95
-        and metrics["test"]["outside_candidate_recall"] >= 0.95
+        and _at_least(metrics["val"], "inside_candidate_recall")
+        and _at_least(metrics["test"], "inside_candidate_recall")
+        and _at_least(metrics["val"], "outside_candidate_recall")
+        and _at_least(metrics["test"], "outside_candidate_recall")
+        and _at_least(metrics["val"], "outside_run_mean_recall")
+        and _at_least(metrics["test"], "outside_run_mean_recall")
+        and _at_least(metrics["val"], "all_outside_source_drop_recall")
+        and _at_least(metrics["test"], "all_outside_source_drop_recall")
+        and _at_least(metrics["val"], "truth_run_continuity")
+        and _at_least(metrics["test"], "truth_run_continuity")
+        and metrics["val"]["true_inside_deletion_count"] == 0
+        and metrics["test"]["true_inside_deletion_count"] == 0
     )
     checkpoint_path = output_dir / (
         f"scorer-v11-{capacity_profile}-{args.variant}.pt"
@@ -1259,6 +1444,12 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "class_weights": {"outside_candidate": 1.0, "inside_candidate": 1.0},
         "heatmap_auxiliary_weight": float(args.heatmap_weight),
         "query_mask_auxiliary_weight": query_mask_weight,
+        "selection_contract": SELECTION_CONTRACT,
+        "selection_safety_requirement": SELECTION_SAFETY_REQUIREMENT,
+        "teacher_all_outside_source_gate": True,
+        "outside_source_macro_recall_diagnostic_only": True,
+        "edge_coverage_is_diagnostic_only": True,
+        "early_stopping_min_epochs": early_stopping_min_epochs,
         "numeric_gate_maximum_requirement": 0.95,
         "numeric_gate_pass": numeric_gate_pass,
         "manual_zero_clipping_gate": "pending",
@@ -1336,9 +1527,16 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "early_stopping": {
             "eval_every_epochs": eval_every_epochs,
             "patience": early_stopping_patience,
+            "min_epochs": early_stopping_min_epochs,
             "min_delta": early_stopping_min_delta,
+            "selection_contract": SELECTION_CONTRACT,
             "best_epoch": best_epoch,
             "best_val_selection_score": best_val_score,
+            "best_val_selection_components": (
+                checkpoint_selection_components(best_val_metrics)
+                if best_val_metrics is not None
+                else None
+            ),
             "best_val_metrics": best_val_metrics,
             "stopped_early": stopped_early,
             "stop_reason": stop_reason,
@@ -1346,6 +1544,9 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "training_loss_mean": float(np.mean(training_losses)) if training_losses else None,
         "metrics": metrics,
         "numeric_gate_maximum_requirement": 0.95,
+        "teacher_all_outside_source_gate": True,
+        "outside_source_macro_recall_diagnostic_only": True,
+        "edge_coverage_is_diagnostic_only": True,
         "numeric_gate_pass": numeric_gate_pass,
         "manual_gate_status": "pending",
         "promotion_allowed": False,
@@ -1362,7 +1563,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             "status": "completed",
             "capacity_profile": capacity_profile,
             "variant": args.variant,
-            "epoch": int(args.epochs),
+            "epoch": epochs_completed,
             "epochs": int(args.epochs),
             "step": training_steps,
             "total_steps": total_training_steps,
@@ -1415,6 +1616,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--log-every", type=int, default=50)
     parser.add_argument("--eval-every-epochs", type=int, default=1)
     parser.add_argument("--early-stopping-patience", type=int, default=3)
+    parser.add_argument("--early-stopping-min-epochs", type=int, default=10)
     parser.add_argument("--early-stopping-min-delta", type=float, default=1e-4)
     args = parser.parse_args(argv)
     if args.log_every <= 0:
@@ -1423,6 +1625,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         parser.error("--eval-every-epochs must be positive")
     if args.early_stopping_patience < 0:
         parser.error("--early-stopping-patience must be non-negative")
+    if args.early_stopping_min_epochs < 0:
+        parser.error("--early-stopping-min-epochs must be non-negative")
     if args.early_stopping_min_delta < 0.0:
         parser.error("--early-stopping-min-delta must be non-negative")
     return args

@@ -39,6 +39,7 @@ from tools.boundary.ja.compile_candidate_island_scorer_v11_features import (
     compile_features,
 )
 from tools.boundary.ja.train_candidate_island_scorer_v11 import (
+    checkpoint_selection_components,
     _cuda_warmup_rows,
     _pack_batches,
     _plan_training_batches,
@@ -46,6 +47,58 @@ from tools.boundary.ja.train_candidate_island_scorer_v11 import (
     _restore_model_and_adamw_after_warmup,
     run as train,
 )
+
+
+def test_v11_selection_caps_inside_reward_and_prefers_outside_continuity() -> None:
+    all_keep = {
+        "inside_candidate_recall": 1.0,
+        "outside_candidate_recall": 0.0,
+        "outside_run_mean_recall": 0.0,
+        "start_coverage": 1.0,
+        "end_coverage": 1.0,
+        "truth_run_continuity": 1.0,
+        "true_inside_deletion_count": 0,
+    }
+    balanced = {
+        **all_keep,
+        "outside_candidate_recall": 0.6,
+        "outside_run_mean_recall": 0.7,
+        "truth_run_continuity": 0.8,
+    }
+    unsafe = {**balanced, "inside_candidate_recall": 0.94}
+    all_drop = {**all_keep, "inside_candidate_recall": 0.0, "true_inside_deletion_count": 1}
+
+    assert checkpoint_selection_components(balanced)["selection_score"] > checkpoint_selection_components(all_keep)["selection_score"]
+    assert checkpoint_selection_components(unsafe)["phase"] == "semantic_safety_below_95"
+    assert checkpoint_selection_components(unsafe)["selection_score"] < checkpoint_selection_components(all_keep)["selection_score"]
+    assert checkpoint_selection_components(all_drop)["phase"] == "true_run_deletion"
+    assert checkpoint_selection_components(balanced)["edge_coverage_is_diagnostic_only"] is True
+
+
+def test_v11_selection_does_not_hide_teacher_all_background_sources() -> None:
+    base = {
+        "inside_candidate_recall": 1.0,
+        "inside_truth_frame_count": 100,
+        "outside_candidate_recall": 1.0,
+        "outside_run_mean_recall": 1.0,
+        "outside_source_macro_recall": 1.0,
+        "all_outside_source_count": 2,
+        "all_outside_source_drop_recall": 1.0,
+        "truth_run_continuity": 1.0,
+        "true_inside_deletion_count": 0,
+        "start_coverage": 1.0,
+        "end_coverage": 1.0,
+    }
+    retained_background = {
+        **base,
+        "all_outside_source_drop_recall": 0.0,
+    }
+
+    good = checkpoint_selection_components(base)
+    bad = checkpoint_selection_components(retained_background)
+    assert good["all_outside_source_count"] == 2
+    assert bad["structural_bottleneck"] == 0.0
+    assert good["selection_score"] > bad["selection_score"]
 
 
 def _sha256(path: Path) -> str:
@@ -722,6 +775,7 @@ def test_v11_feature_compile_and_random_init_cpu_smoke(tmp_path: Path) -> None:
     assert progress["schema"] == "candidate_island_scorer_v11_training_progress_v1"
     assert progress["status"] == "completed"
     assert progress["step"] == progress["total_steps"] == 1
+    assert progress["epoch"] == result["epochs_completed"]
     assert progress["checkpoint_sha256"] == result["checkpoint_sha256"]
     assert progress["metrics"] == result["metrics"]
     checkpoint = Path(result["checkpoint"])

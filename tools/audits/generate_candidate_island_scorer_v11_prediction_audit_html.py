@@ -17,7 +17,7 @@ if str(PROJECT_ROOT) not in sys.path:
 from tools.audits.audit_nav import update_audit_entrypoints  # noqa: E402
 
 
-SUMMARY_SCHEMA = "candidate_island_scorer_v11_prediction_audit_summary_v1"
+SUMMARY_SCHEMA = "candidate_island_scorer_v11_prediction_audit_summary_v2"
 VERDICT_SCHEMA = "candidate_island_scorer_v11_prediction_manual_verdict_v1"
 
 
@@ -45,12 +45,28 @@ def build_items(predictions: list[dict[str, Any]]) -> list[dict[str, Any]]:
             "truth_spans": list(row.get("truth_spans") or ()),
             "prediction_spans": list(row.get("prediction_spans") or ()),
             "checkpoint_sha256": str(row["checkpoint_sha256"]),
+            "metrics": {
+                "inside_candidate_recall": row.get("inside_candidate_recall"),
+                "outside_candidate_recall": row.get("outside_candidate_recall"),
+                "outside_run_mean_recall": row.get("outside_run_mean_recall"),
+                "outside_source_recall": row.get("outside_source_recall"),
+                "truth_run_continuity": row.get("truth_run_continuity"),
+                "all_outside_source": bool(row.get("all_outside_source")),
+                "all_outside_source_drop_success": row.get(
+                    "all_outside_source_drop_success"
+                ),
+            },
         }
+        full_source_category = (
+            "teacher_all_outside_source"
+            if bool(row.get("all_outside_source"))
+            else "heldout_full_source"
+        )
         items.append(
             {
                 **common,
                 "audit_id": f"{source_id}::heldout_full_source",
-                "category": "heldout_full_source",
+                "category": full_source_category,
                 "focus_span": None,
             }
         )
@@ -94,6 +110,7 @@ def _page(items: list[dict[str, Any]]) -> str:
 <div><b>实际工作流：</b>蓝色是 two-logit argmax=`inside_candidate` 的真实输出，不做 threshold、gap merge或时长规则。绿色/黄色是完整 canonical。红色只标当前需要判断的精确 residual。</div>
 <div><b>播放：</b>每个色条只播放自身区间并立即停止，不附加上下文；完整 source 播放器用于判断是否同一句话及整体连续性。</div>
 <div><b>标签原则：</b>真语音删除/尾音截断零容忍。同一句内部短停顿即使无语义，若切开会伤害ASR，也判连续性有害。孤立呻吟/喘息允许Scorer先保留给CueQC。</div>
+<div><b>Teacher 全 outside source：</b>单列检查整条是否确实无语言，以及模型是否真正整段删除；该类没有 inside truth，连续性指标不适用。</div>
 </section><div id="list"></div></main>
 <script>
 const rows=__ROWS__, verdictSchema=__SCHEMA__, key='scorer-v11-prediction-audit:'+location.pathname;const listNode=document.getElementById('list'),filterNode=document.getElementById('filter'),statusNode=document.getElementById('status'),stopNode=document.getElementById('stop'),nextNode=document.getElementById('next'),saveNode=document.getElementById('save');let ann={};try{ann=JSON.parse(localStorage.getItem(key)||'{}')}catch(_e){}
@@ -102,9 +119,10 @@ function esc(v){return String(v??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&l
 function stopPlayback(){if(activeAudio&&check){activeAudio.removeEventListener('timeupdate',check);activeAudio.removeEventListener('ended',check)}if(timer)clearTimeout(timer);if(raf)cancelAnimationFrame(raf);if(activeAudio)activeAudio.pause();if(activeButton)activeButton.classList.remove('playing');activeAudio=activeButton=check=timer=raf=null}
 async function play(audio,button,start,end){if(activeAudio===audio&&activeButton===button&&!audio.paused){stopPlayback();return}stopPlayback();activeAudio=audio;activeButton=button;button.classList.add('playing');const begin=async()=>{if(activeAudio!==audio)return;audio.currentTime=start;check=()=>{if(audio.currentTime>=end||audio.ended)stopPlayback()};audio.addEventListener('timeupdate',check);audio.addEventListener('ended',check);try{await audio.play();const watch=()=>{if(activeAudio!==audio)return;if(audio.currentTime>=end){stopPlayback();return}raf=requestAnimationFrame(watch)};raf=requestAnimationFrame(watch);timer=setTimeout(stopPlayback,Math.max(100,(end-start)*1000+120))}catch(e){stopPlayback();statusNode.textContent='播放失败: '+e.message}};if(audio.readyState<1){audio.addEventListener('loadedmetadata',begin,{once:true});audio.load()}else await begin()}
 function spans(row,list,focus=false){return (list||[]).map(s=>`<button class="span ${focus?'focus':esc(s.label)}" style="left:${100*s.start_s/row.duration_s}%;width:${Math.max(.25,100*(s.end_s-s.start_s)/row.duration_s)}%" data-start="${s.start_s}" data-end="${s.end_s}">${esc(s.label)} ${Number(s.start_s).toFixed(2)}–${Number(s.end_s).toFixed(2)}s</button>`).join('')}
-function choices(row){if(row.category==='heldout_full_source')return [['pass_no_true_speech_loss','整条输出无真语音损失'],['true_speech_loss','存在真语音删除或边缘截断'],['continuity_harm','存在会伤害ASR的碎片化'],['canonical_error','canonical需修正'],['unsure','不确定']];if(row.category==='long_residual_over_8s')return [['acceptable_candidate','长蓝段整体可送下游'],['contains_independent_outside','含应独立切出的背景/非语义'],['canonical_error','canonical需修正'],['unsure','不确定']];return [['true_speech_deleted_or_clipped','红段含真语音/尾音，模型误删'],['same_asr_unit_continuity_harm','红段虽无语义但切开同一ASR单元'],['canonical_should_be_outside','红段可安全提前删除，canonical应改outside'],['unsure','不确定']]}
+function pct(v){return v==null?'n/a':(100*Number(v)).toFixed(1)+'%'}
+function choices(row){if(row.category==='teacher_all_outside_source')return [['confirmed_all_outside_model_drop','整条确为非语义，模型已完整删除'],['confirmed_all_outside_model_false_keep','整条确为非语义，但模型仍有保留'],['canonical_contains_language','实际含语言，teacher/canonical错误'],['unsure','不确定']];if(row.category==='heldout_full_source')return [['pass_no_true_speech_loss','整条输出无真语音损失'],['true_speech_loss','存在真语音删除或边缘截断'],['continuity_harm','存在会伤害ASR的碎片化'],['canonical_error','canonical需修正'],['unsure','不确定']];if(row.category==='long_residual_over_8s')return [['acceptable_candidate','长蓝段整体可送下游'],['contains_independent_outside','含应独立切出的背景/非语义'],['canonical_error','canonical需修正'],['unsure','不确定']];return [['true_speech_deleted_or_clipped','红段含真语音/尾音，模型误删'],['same_asr_unit_continuity_harm','红段虽无语义但切开同一ASR单元'],['canonical_should_be_outside','红段可安全提前删除，canonical应改outside'],['unsure','不确定']]}
 function update(){statusNode.textContent=`已裁决 ${rows.filter(r=>ann[r.audit_id]?.verdict).length}/${rows.length}`}
-function render(){stopPlayback();listNode.innerHTML='';for(const row of rows){if(filterNode.value!=='all'&&row.category!==filterNode.value)continue;const card=document.createElement('article'),state=ann[row.audit_id]||{};card.dataset.auditId=row.audit_id;if(state.verdict)card.classList.add('done');card.innerHTML=`<h2>${esc(row.source_id)}</h2><div class="muted">${esc(row.partition)} / ${esc(row.category)} / ${Number(row.duration_s).toFixed(2)}s</div><audio controls preload="none" src="${esc(row.audio)}"></audio><h3>canonical</h3><div class="track">${spans(row,row.truth_spans)}</div><h3>model inside_candidate</h3><div class="track">${spans(row,row.prediction_spans)}</div>${row.focus_span?`<h3>当前精确审计区间</h3><div class="track">${spans(row,[row.focus_span],true)}</div>`:''}<div>${choices(row).map(([v,t])=>`<button data-v="${v}" class="${state.verdict===v?'active':''}">${t}</button>`).join('')}</div>`;const audio=card.querySelector('audio');card.querySelectorAll('.span').forEach(b=>b.onclick=()=>play(audio,b,Number(b.dataset.start),Number(b.dataset.end)));card.querySelectorAll('[data-v]').forEach(b=>b.onclick=()=>{ann[row.audit_id]={schema:verdictSchema,audit_id:row.audit_id,source_id:row.source_id,partition:row.partition,category:row.category,focus_span:row.focus_span,checkpoint_sha256:row.checkpoint_sha256,verdict:b.dataset.v,updated_at:new Date().toISOString()};localStorage.setItem(key,JSON.stringify(ann));render()});listNode.appendChild(card)}update()}
+function render(){stopPlayback();listNode.innerHTML='';for(const row of rows){if(filterNode.value!=='all'&&row.category!==filterNode.value)continue;const card=document.createElement('article'),state=ann[row.audit_id]||{},m=row.metrics||{};card.dataset.auditId=row.audit_id;if(state.verdict)card.classList.add('done');const allBg=row.category==='teacher_all_outside_source'?` / all-bg drop=${m.all_outside_source_drop_success===null?'n/a':(m.all_outside_source_drop_success?'yes':'no')}`:'';card.innerHTML=`<h2>${esc(row.source_id)}</h2><div class="muted">${esc(row.partition)} / ${esc(row.category)} / ${Number(row.duration_s).toFixed(2)}s</div><div class="muted">inside=${pct(m.inside_candidate_recall)} · outside=${pct(m.outside_candidate_recall)} · outside-event=${pct(m.outside_run_mean_recall)} · source-outside=${pct(m.outside_source_recall)} · continuity=${pct(m.truth_run_continuity)}${allBg}</div><audio controls preload="none" src="${esc(row.audio)}"></audio><h3>canonical</h3><div class="track">${spans(row,row.truth_spans)}</div><h3>model inside_candidate</h3><div class="track">${spans(row,row.prediction_spans)}</div>${row.focus_span?`<h3>当前精确审计区间</h3><div class="track">${spans(row,[row.focus_span],true)}</div>`:''}<div>${choices(row).map(([v,t])=>`<button data-v="${v}" class="${state.verdict===v?'active':''}">${t}</button>`).join('')}</div>`;const audio=card.querySelector('audio');card.querySelectorAll('.span').forEach(b=>b.onclick=()=>play(audio,b,Number(b.dataset.start),Number(b.dataset.end)));card.querySelectorAll('[data-v]').forEach(b=>b.onclick=()=>{ann[row.audit_id]={schema:verdictSchema,audit_id:row.audit_id,source_id:row.source_id,partition:row.partition,category:row.category,focus_span:row.focus_span,checkpoint_sha256:row.checkpoint_sha256,verdict:b.dataset.v,updated_at:new Date().toISOString()};localStorage.setItem(key,JSON.stringify(ann));render()});listNode.appendChild(card)}update()}
 const categories=['all',...new Set(rows.map(r=>r.category))];filterNode.innerHTML=categories.map(v=>`<option value="${v}">${v}</option>`).join('');filterNode.onchange=render;stopNode.onclick=stopPlayback;nextNode.onclick=()=>{const row=rows.find(r=>!ann[r.audit_id]?.verdict);if(!row)return;filterNode.value='all';render();document.querySelector(`[data-audit-id="${CSS.escape(row.audit_id)}"]`)?.scrollIntoView({behavior:'smooth'})};
 saveNode.onclick=async()=>{const missing=rows.filter(r=>!ann[r.audit_id]?.verdict);if(missing.length){statusNode.textContent=`仍有 ${missing.length} 条未裁决`;return}const content=rows.map(r=>JSON.stringify(ann[r.audit_id])).join('\\n')+'\\n';try{const response=await fetch('/__audit_api__/save-labels',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({href:location.pathname,filename:'manual_verdicts.jsonl',content})});const result=await response.json();statusNode.textContent=result.ok?'已保存到 '+result.path:'保存失败: '+result.error}catch(e){statusNode.textContent='保存失败: '+e.message}};render();
 </script></body></html>""".replace("__ROWS__", encoded).replace("__SCHEMA__", json.dumps(VERDICT_SCHEMA))
