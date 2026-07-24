@@ -4,6 +4,10 @@ import numpy as np
 import pytest
 
 from boundary.linear_chain_crf import BinaryLinearChainCrf
+from boundary.query_mask import (
+    candidate_query_mask_set_loss,
+    candidate_query_mask_targets,
+)
 from boundary.ja.backend import (
     SpeechBoundaryJaConfig,
     decode_candidate_island_segments,
@@ -38,7 +42,17 @@ from boundary.ja.model import (
     CANDIDATE_ISLAND_SCORER_V11_HEATMAP_SCHEMA,
     CANDIDATE_ISLAND_SCORER_V11_HEATMAP_SIGMA_FRAMES,
     CANDIDATE_ISLAND_SCORER_V11_MODEL_ARCH,
+    CANDIDATE_ISLAND_SCORER_V11_QUERY_ATTENTION_HEADS,
+    CANDIDATE_ISLAND_SCORER_V11_QUERY_COUNT,
+    CANDIDATE_ISLAND_SCORER_V11_QUERY_INTERACTION_LAYERS,
+    CANDIDATE_ISLAND_SCORER_V11_QUERY_MASK_AB_AXIS,
+    CANDIDATE_ISLAND_SCORER_V11_QUERY_MASK_AGGREGATION,
+    CANDIDATE_ISLAND_SCORER_V11_QUERY_MASK_DATASET_CONTRACT,
+    CANDIDATE_ISLAND_SCORER_V11_QUERY_MASK_MODEL_ARCH,
+    CANDIDATE_ISLAND_SCORER_V11_QUERY_MASK_RESIDUAL,
+    CANDIDATE_ISLAND_SCORER_V11_QUERY_MASK_SCHEMA,
     CANDIDATE_ISLAND_SCORER_V11_SCHEMA,
+    CandidateIslandQueryMaskScorerNetwork,
     CandidateIslandScorerNetwork,
     CandidateIslandCrfScorerNetwork,
     CandidateIslandHeatmapScorerNetwork,
@@ -51,6 +65,8 @@ from boundary.ja.model import (
     score_candidate_island_crf_outputs_batch,
     score_candidate_island_heatmap_class_probabilities_batch,
     score_candidate_island_heatmap_source_probabilities,
+    score_candidate_island_query_mask_class_probabilities_batch,
+    score_candidate_island_query_mask_source_probabilities,
     score_candidate_island_source_probabilities,
     score_candidate_island_source_outputs,
 )
@@ -116,6 +132,18 @@ def _crf_config() -> dict:
     return {
         **_config(),
         "model_arch": CANDIDATE_ISLAND_SCORER_V11_CRF_MODEL_ARCH,
+    }
+
+
+def _query_mask_config() -> dict:
+    return {
+        **_config(),
+        "model_arch": CANDIDATE_ISLAND_SCORER_V11_QUERY_MASK_MODEL_ARCH,
+        "query_count": CANDIDATE_ISLAND_SCORER_V11_QUERY_COUNT,
+        "query_attention_heads": CANDIDATE_ISLAND_SCORER_V11_QUERY_ATTENTION_HEADS,
+        "query_interaction_layers": CANDIDATE_ISLAND_SCORER_V11_QUERY_INTERACTION_LAYERS,
+        "query_mask_aggregation": CANDIDATE_ISLAND_SCORER_V11_QUERY_MASK_AGGREGATION,
+        "query_residual_fusion": CANDIDATE_ISLAND_SCORER_V11_QUERY_MASK_RESIDUAL,
     }
 
 
@@ -322,6 +350,198 @@ def test_candidate_crf_keeps_frozen_baseline_initialization_order() -> None:
     for key, expected in baseline_state.items():
         crf_key = key.replace("head.", "emission_head.", 1)
         torch.testing.assert_close(crf_state[crf_key], expected)
+
+
+def test_candidate_query_mask_targets_bridge_unsure_and_split_only_on_definite_outside() -> None:
+    targets = candidate_query_mask_targets(
+        np.asarray([1, -100, 1, 0, 1, -100, 1, 1], dtype=np.int64),
+        np.asarray([True, True, True, True, True, True, True, False]),
+        max_queries=8,
+    )
+
+    assert targets.event_count == 2
+    assert targets.positive_frame_counts == (2, 2)
+    np.testing.assert_array_equal(
+        targets.masks,
+        np.asarray(
+            [
+                [1, 0, 1, 0, 0, 0, 0, 0],
+                [0, 0, 0, 0, 1, 0, 1, 0],
+            ],
+            dtype=np.float32,
+        ),
+    )
+
+
+def test_candidate_query_mask_targets_fail_closed_above_fixed_query_capacity() -> None:
+    labels = np.tile(np.asarray([1, 0], dtype=np.int64), 9)
+    with pytest.raises(ValueError, match="exceeds the fixed query capacity"):
+        candidate_query_mask_targets(
+            labels,
+            np.ones_like(labels, dtype=bool),
+            max_queries=8,
+        )
+
+
+def test_candidate_query_mask_loss_never_supervises_unsure_or_non_owner_frames() -> None:
+    torch = pytest.importorskip("torch")
+    labels = torch.tensor([[1, -100, 1, 0, 1, 1]], dtype=torch.long)
+    owner = torch.tensor([[True, True, True, True, True, False]])
+    mask_logits = torch.zeros((1, 8, 6), requires_grad=True)
+    existence_logits = torch.zeros((1, 8, 2), requires_grad=True)
+
+    losses = candidate_query_mask_set_loss(
+        mask_logits=mask_logits,
+        existence_logits=existence_logits,
+        labels=labels,
+        owner_mask=owner,
+        max_queries=8,
+    )
+    losses["auxiliary_loss"].backward()
+
+    assert losses["target_counts"] == (2,)
+    assert mask_logits.grad is not None
+    assert torch.count_nonzero(mask_logits.grad[..., 1]) == 0
+    assert torch.count_nonzero(mask_logits.grad[..., 5]) == 0
+    assert torch.isfinite(losses["auxiliary_loss"])
+
+
+def test_candidate_query_mask_zero_gate_preserves_frozen_dense_baseline() -> None:
+    torch = pytest.importorskip("torch")
+    config = _config()
+    query_config = _query_mask_config()
+    ptm = torch.randn((2, 7, 2048), generator=torch.Generator().manual_seed(31))
+    mfcc = torch.randn((2, 7, 40), generator=torch.Generator().manual_seed(32))
+    attention = torch.tensor(
+        [[True, True, True, True, True, True, True], [True, True, True, True, False, False, False]]
+    )
+
+    torch.manual_seed(117)
+    baseline = CandidateIslandScorerNetwork(**config).eval()
+    baseline_state = {
+        key: value.detach().clone() for key, value in baseline.state_dict().items()
+    }
+    with torch.no_grad():
+        baseline_logits = baseline(ptm, mfcc, attention_mask=attention)
+    del baseline
+
+    torch.manual_seed(117)
+    query_model = CandidateIslandQueryMaskScorerNetwork(**query_config).eval()
+    query_state = query_model.state_dict()
+    for key, expected in baseline_state.items():
+        torch.testing.assert_close(query_state[key], expected, rtol=0.0, atol=0.0)
+    with torch.no_grad():
+        outputs = query_model.forward_outputs(ptm, mfcc, attention_mask=attention)
+
+    assert float(outputs["query_residual_gate"]) == 0.0
+    torch.testing.assert_close(
+        outputs["dense_class_logits"], baseline_logits, rtol=0.0, atol=0.0
+    )
+    torch.testing.assert_close(
+        outputs["class_logits"], baseline_logits, rtol=0.0, atol=0.0
+    )
+
+
+def test_candidate_query_mask_checkpoint_and_batching_are_strict(tmp_path) -> None:
+    torch = pytest.importorskip("torch")
+    config = _query_mask_config()
+    model = CandidateIslandQueryMaskScorerNetwork(**config).eval()
+    payload = build_speech_island_scorer_checkpoint(
+        model=model,
+        model_config=config,
+        normalization={"mfcc_mean": [0.0] * 40, "mfcc_std": [1.0] * 40},
+        metadata=_metadata(),
+        schema=CANDIDATE_ISLAND_SCORER_V11_QUERY_MASK_SCHEMA,
+    )
+    checkpoint = tmp_path / "candidate-scorer-v11-query-mask.pt"
+    torch.save(payload, checkpoint)
+    bundle = load_speech_island_scorer_checkpoint(checkpoint, device="cpu")
+
+    assert bundle.schema == CANDIDATE_ISLAND_SCORER_V11_QUERY_MASK_SCHEMA
+    assert bundle.ptm_dim == 2048
+    assert bundle.projected_ptm_dim == 2048
+    assert bundle.input_dim == 2088
+    assert bundle.metadata["dataset_contract"] == (
+        CANDIDATE_ISLAND_SCORER_V11_QUERY_MASK_DATASET_CONTRACT
+    )
+    assert bundle.metadata["capacity_ab_axis"] == (
+        CANDIDATE_ISLAND_SCORER_V11_QUERY_MASK_AB_AXIS
+    )
+    assert bundle.metadata["runtime_threshold"] is None
+    assert bundle.metadata["runtime_duration_rule"] is None
+    assert bundle.metadata["runtime_top_k"] is None
+    assert bundle.metadata["runtime_nms"] is None
+
+    rng = np.random.default_rng(2307)
+    pairs = [
+        (
+            rng.normal(size=(frames, 2048)).astype(np.float32),
+            rng.normal(size=(frames, 40)).astype(np.float32),
+        )
+        for frames in (5, 9, 7)
+    ]
+    batched = score_candidate_island_query_mask_class_probabilities_batch(
+        bundle, feature_pairs=pairs
+    )
+    singletons = [
+        score_candidate_island_query_mask_class_probabilities_batch(
+            bundle, feature_pairs=[pair]
+        )[0]
+        for pair in pairs
+    ]
+    for left, right in zip(batched, singletons, strict=True):
+        np.testing.assert_allclose(left, right, atol=1e-5, rtol=1e-5)
+        np.testing.assert_array_equal(np.argmax(left, axis=1), np.argmax(right, axis=1))
+
+    with pytest.raises(ValueError, match="forbids runtime_threshold"):
+        build_speech_island_scorer_checkpoint(
+            model=model,
+            model_config=config,
+            normalization={"mfcc_mean": [0.0] * 40, "mfcc_std": [1.0] * 40},
+            metadata=_metadata(runtime_threshold=0.5),
+            schema=CANDIDATE_ISLAND_SCORER_V11_QUERY_MASK_SCHEMA,
+        )
+
+
+def test_candidate_query_mask_source_scoring_is_frame_budget_equivalent() -> None:
+    torch = pytest.importorskip("torch")
+
+    class _DeterministicQueryModel(torch.nn.Module):
+        def forward(self, ptm, mfcc, *, attention_mask=None):
+            del attention_mask
+            return torch.stack(
+                (
+                    ptm[..., 0] + 0.25 * mfcc[..., 0],
+                    ptm[..., 1] - 0.15 * mfcc[..., 0],
+                ),
+                dim=-1,
+            )
+
+    bundle = SpeechIslandScorerBundle(
+        path="fixture",
+        sha256="0" * 64,
+        model=_DeterministicQueryModel().eval(),
+        model_config={"raw_ptm_dim": 2, "projected_ptm_dim": 2, "mfcc_dim": 1},
+        normalization={},
+        metadata={},
+        device="cpu",
+        schema=CANDIDATE_ISLAND_SCORER_V11_QUERY_MASK_SCHEMA,
+    )
+    rng = np.random.default_rng(2407)
+    ptm = rng.normal(size=(1801, 2)).astype(np.float32)
+    mfcc = rng.normal(size=(1801, 1)).astype(np.float32)
+
+    one_batch = score_candidate_island_query_mask_source_probabilities(
+        bundle, ptm=ptm, mfcc=mfcc, max_padded_frames=2000
+    )
+    split_batches = score_candidate_island_query_mask_source_probabilities(
+        bundle, ptm=ptm, mfcc=mfcc, max_padded_frames=1000
+    )
+
+    np.testing.assert_allclose(one_batch, split_batches, atol=1e-6, rtol=1e-6)
+    np.testing.assert_array_equal(
+        np.argmax(one_batch, axis=1), np.argmax(split_batches, axis=1)
+    )
 
 
 def test_candidate_crf_source_scoring_is_frame_budget_equivalent() -> None:

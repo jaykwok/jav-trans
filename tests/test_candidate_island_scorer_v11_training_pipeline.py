@@ -19,6 +19,9 @@ from boundary.ja.model import (
     CANDIDATE_ISLAND_SCORER_V11_CRF_AB_AXIS,
     CANDIDATE_ISLAND_SCORER_V11_FEATURE_EXTRACTOR_SCHEMA,
     CANDIDATE_ISLAND_SCORER_V11_FULL_CAPACITY_PROFILE,
+    CANDIDATE_ISLAND_SCORER_V11_QUERY_MASK_AB_AXIS,
+    CANDIDATE_ISLAND_SCORER_V11_QUERY_MASK_AUXILIARY_WEIGHT,
+    CANDIDATE_ISLAND_SCORER_V11_QUERY_MASK_SCHEMA,
     CANDIDATE_ISLAND_SCORER_V11_RAW_CACHE_ROW_SCHEMA,
     CANDIDATE_ISLAND_SCORER_V11_SYNTHETIC_TRAIN_SOURCE_SCHEMA,
     load_speech_island_scorer_checkpoint,
@@ -757,6 +760,39 @@ def test_v11_feature_compile_and_random_init_cpu_smoke(tmp_path: Path) -> None:
     )
     assert crf_bundle.metadata["runtime_threshold"] is None
     assert crf_bundle.metadata["runtime_duration_rule"] is None
+
+    query_args = argparse.Namespace(
+        **{
+            **vars(args),
+            "output_dir": str(tmp_path / "training-query-mask"),
+            "variant": "query_mask",
+            "capacity_profile": CANDIDATE_ISLAND_SCORER_V11_FULL_CAPACITY_PROFILE,
+            "query_mask_weight": (
+                CANDIDATE_ISLAND_SCORER_V11_QUERY_MASK_AUXILIARY_WEIGHT
+            ),
+        }
+    )
+    query_result = train(query_args)
+    query_checkpoint = Path(query_result["checkpoint"])
+    if not query_checkpoint.is_absolute():
+        query_checkpoint = Path.cwd() / query_checkpoint
+    query_bundle = load_speech_island_scorer_checkpoint(
+        query_checkpoint, device="cpu"
+    )
+    assert query_bundle.schema == CANDIDATE_ISLAND_SCORER_V11_QUERY_MASK_SCHEMA
+    assert query_bundle.metadata["decision_mode"] == "binary_frame_argmax"
+    assert query_bundle.metadata["capacity_ab_axis"] == (
+        CANDIDATE_ISLAND_SCORER_V11_QUERY_MASK_AB_AXIS
+    )
+    assert query_result["training_seed"] == 117
+    assert query_result["training_max_padded_frames"] == 32
+    assert query_result["capacity_contract"]["schema"] == (
+        CANDIDATE_ISLAND_SCORER_V11_QUERY_MASK_SCHEMA
+    )
+    assert query_bundle.metadata["runtime_threshold"] is None
+    assert query_bundle.metadata["runtime_duration_rule"] is None
+    assert query_bundle.metadata["runtime_top_k"] is None
+    assert query_bundle.metadata["runtime_nms"] is None
 
 
 def test_v11_feature_compile_rejects_projected_ptm128(tmp_path: Path) -> None:

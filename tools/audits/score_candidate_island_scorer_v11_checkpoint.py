@@ -23,6 +23,7 @@ from boundary.contracts import ACOUSTIC_BINARY_V12_CONTRACT  # noqa: E402
 from boundary.ja.model import (  # noqa: E402
     CANDIDATE_ISLAND_SCORER_V11_CANONICAL_SOURCE_SCHEMA,
     CANDIDATE_ISLAND_SCORER_V11_CRF_SCHEMA,
+    CANDIDATE_ISLAND_SCORER_V11_QUERY_MASK_SCHEMA,
     CANDIDATE_ISLAND_SCORER_V11_RAW_CACHE_ROW_SCHEMA,
     load_speech_island_scorer_checkpoint,
     score_candidate_island_source_outputs,
@@ -306,6 +307,19 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     if bundle.schema == CANDIDATE_ISLAND_SCORER_V11_CRF_SCHEMA:
         decoder_diagnostics["learned_transition_matrix"] = (
             bundle.model.crf.transitions.detach().cpu().tolist()
+        )
+    if bundle.schema == CANDIDATE_ISLAND_SCORER_V11_QUERY_MASK_SCHEMA:
+        decoder_diagnostics.update(
+            query_count=int(bundle.model.query_count),
+            learned_residual_gate=float(
+                torch.tanh(bundle.model.query_residual_gate).detach().cpu()
+            ),
+            query_mask_aggregation=str(
+                bundle.metadata.get("query_mask_aggregation") or ""
+            ),
+            query_residual_fusion=str(
+                bundle.metadata.get("query_residual_fusion") or ""
+            ),
         )
     first = raw_by_id[str(selected[0]["source_id"])]
     with np.load(_resolve(first["feature_path"]), allow_pickle=False) as payload:

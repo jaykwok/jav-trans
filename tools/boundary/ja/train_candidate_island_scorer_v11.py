@@ -26,6 +26,7 @@ for root in (PROJECT_ROOT, SRC_ROOT):
 from asr.backends.qwen import QWEN_ASR_17B_REPO_ID  # noqa: E402
 from boundary.contracts import ACOUSTIC_BINARY_V12_CONTRACT  # noqa: E402
 from boundary.ja.candidate_training import candidate_boundary_heatmap_loss  # noqa: E402
+from boundary.query_mask import candidate_query_mask_set_loss  # noqa: E402
 from boundary.ja.model import (  # noqa: E402
     CANDIDATE_ISLAND_SCORER_V11_CAPACITY_PROFILES,
     CANDIDATE_ISLAND_SCORER_V11_COMPACT_CAPACITY_PROFILE,
@@ -41,9 +42,19 @@ from boundary.ja.model import (  # noqa: E402
     CANDIDATE_ISLAND_SCORER_V11_HEATMAP_SIGMA_FRAMES,
     CANDIDATE_ISLAND_SCORER_V11_MFCC_DIM,
     CANDIDATE_ISLAND_SCORER_V11_RAW_PTM_DIM,
+    CANDIDATE_ISLAND_SCORER_V11_QUERY_ATTENTION_HEADS,
+    CANDIDATE_ISLAND_SCORER_V11_QUERY_COUNT,
+    CANDIDATE_ISLAND_SCORER_V11_QUERY_INTERACTION_LAYERS,
+    CANDIDATE_ISLAND_SCORER_V11_QUERY_MASK_AB_AXIS,
+    CANDIDATE_ISLAND_SCORER_V11_QUERY_MASK_AGGREGATION,
+    CANDIDATE_ISLAND_SCORER_V11_QUERY_MASK_AUXILIARY_WEIGHT,
+    CANDIDATE_ISLAND_SCORER_V11_QUERY_MASK_MODEL_ARCH,
+    CANDIDATE_ISLAND_SCORER_V11_QUERY_MASK_RESIDUAL,
+    CANDIDATE_ISLAND_SCORER_V11_QUERY_MASK_SCHEMA,
     CANDIDATE_ISLAND_SCORER_V11_TRAINING_ROW_SCHEMA,
     CandidateIslandHeatmapScorerNetwork,
     CandidateIslandCrfScorerNetwork,
+    CandidateIslandQueryMaskScorerNetwork,
     CandidateIslandScorerNetwork,
     build_speech_island_scorer_checkpoint,
 )
@@ -429,16 +440,35 @@ def _model_config(args: argparse.Namespace, normalization: dict[str, list[float]
         )
     elif args.variant == "crf":
         config["model_arch"] = CANDIDATE_ISLAND_SCORER_V11_CRF_MODEL_ARCH
+    elif args.variant == "query_mask":
+        config.update(
+            {
+                "model_arch": CANDIDATE_ISLAND_SCORER_V11_QUERY_MASK_MODEL_ARCH,
+                "query_count": CANDIDATE_ISLAND_SCORER_V11_QUERY_COUNT,
+                "query_attention_heads": CANDIDATE_ISLAND_SCORER_V11_QUERY_ATTENTION_HEADS,
+                "query_interaction_layers": CANDIDATE_ISLAND_SCORER_V11_QUERY_INTERACTION_LAYERS,
+                "query_mask_aggregation": CANDIDATE_ISLAND_SCORER_V11_QUERY_MASK_AGGREGATION,
+                "query_residual_fusion": CANDIDATE_ISLAND_SCORER_V11_QUERY_MASK_RESIDUAL,
+            }
+        )
     else:
         config["model_arch"] = str(capacity["model_arch"])
     return config
 
 
-def _loss(model, batch, *, variant: str, heatmap_weight: float, torch):
+def _loss(
+    model,
+    batch,
+    *,
+    variant: str,
+    heatmap_weight: float,
+    query_mask_weight: float,
+    torch,
+):
     valid = batch["owner"] & (batch["labels"] != IGNORE_INDEX)
     if not bool(torch.any(valid)):
         raise ValueError("Scorer v11 batch has no definite owner frames")
-    if variant == "heatmap_aux":
+    if variant in {"heatmap_aux", "query_mask"}:
         outputs = model.forward_outputs(
             batch["ptm"], batch["mfcc"], attention_mask=batch["attention"]
         )
@@ -460,7 +490,22 @@ def _loss(model, batch, *, variant: str, heatmap_weight: float, torch):
             end_targets=batch["end_heatmap"],
             valid_mask=boundary_valid,
         )
-    return main + heatmap_weight * auxiliary, main, auxiliary, logits, valid
+    if outputs is not None and variant == "query_mask":
+        query_losses = candidate_query_mask_set_loss(
+            mask_logits=outputs["query_mask_logits"],
+            existence_logits=outputs["query_existence_logits"],
+            labels=batch["labels"],
+            owner_mask=batch["owner"],
+            max_queries=CANDIDATE_ISLAND_SCORER_V11_QUERY_COUNT,
+            ignore_index=IGNORE_INDEX,
+        )
+        auxiliary = query_losses["auxiliary_loss"]
+    elif variant != "query_mask" and float(query_mask_weight) != 0.0:
+        raise ValueError("query-mask auxiliary weight is only valid for query_mask")
+    auxiliary_weight = (
+        float(query_mask_weight) if variant == "query_mask" else float(heatmap_weight)
+    )
+    return main + auxiliary_weight * auxiliary, main, auxiliary, logits, valid
 
 
 def _evaluate(
@@ -471,6 +516,7 @@ def _evaluate(
     max_padded_frames: int,
     variant: str,
     heatmap_weight: float,
+    query_mask_weight: float,
     torch,
     device,
 ) -> dict[str, Any]:
@@ -486,6 +532,7 @@ def _evaluate(
                 batch,
                 variant=variant,
                 heatmap_weight=heatmap_weight,
+                query_mask_weight=query_mask_weight,
                 torch=torch,
             )
             target = batch["labels"][valid].detach().cpu().numpy()
@@ -588,6 +635,8 @@ def _build_model(args: argparse.Namespace, config: dict[str, Any]):
         return CandidateIslandHeatmapScorerNetwork(**config)
     if args.variant == "crf":
         return CandidateIslandCrfScorerNetwork(**config)
+    if args.variant == "query_mask":
+        return CandidateIslandQueryMaskScorerNetwork(**config)
     return CandidateIslandScorerNetwork(**config)
 
 
@@ -681,8 +730,11 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     import psutil
     import torch
 
-    if args.variant not in {"baseline", "heatmap_aux", "crf"}:
-        raise ValueError("Scorer v11 variant must be baseline, heatmap_aux, or crf")
+    if args.variant not in {"baseline", "heatmap_aux", "crf", "query_mask"}:
+        raise ValueError(
+            "Scorer v11 variant must be baseline, heatmap_aux, crf, or query_mask"
+        )
+    query_mask_weight = float(getattr(args, "query_mask_weight", 0.0))
     log_every = int(getattr(args, "log_every", 50))
     if log_every <= 0:
         raise ValueError("Scorer v11 log_every must be positive")
@@ -702,7 +754,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         raise ValueError(f"unknown Scorer v11 capacity profile: {capacity_profile!r}")
     capacity = CANDIDATE_ISLAND_SCORER_V11_CAPACITY_PROFILES[capacity_profile]
     if (
-        args.variant in {"heatmap_aux", "crf"}
+        args.variant in {"heatmap_aux", "crf", "query_mask"}
         and capacity_profile != CANDIDATE_ISLAND_SCORER_V11_FULL_CAPACITY_PROFILE
     ):
         raise ValueError(
@@ -716,10 +768,19 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         )
     if float(args.class_weight_outside) != 1.0 or float(args.class_weight_inside) != 1.0:
         raise ValueError("Scorer v11 neutral baseline requires class weights 1/1")
-    if args.variant in {"baseline", "crf"} and float(args.heatmap_weight) != 0.0:
-        raise ValueError("baseline and CRF Scorer v11 variants forbid auxiliary loss")
+    if args.variant in {"baseline", "crf", "query_mask"} and float(args.heatmap_weight) != 0.0:
+        raise ValueError(
+            "baseline, CRF, and Query-Mask Scorer v11 variants forbid heatmap loss"
+        )
     if args.variant == "heatmap_aux" and float(args.heatmap_weight) <= 0.0:
         raise ValueError("heatmap_aux requires a positive pre-registered weight")
+    if args.variant == "query_mask":
+        if query_mask_weight != CANDIDATE_ISLAND_SCORER_V11_QUERY_MASK_AUXILIARY_WEIGHT:
+            raise ValueError(
+                "query_mask requires its fixed pre-registered auxiliary weight"
+            )
+    elif query_mask_weight != 0.0:
+        raise ValueError("non-query Scorer v11 variants forbid query-mask loss")
     if str(args.device).lower() == "cpu" and not bool(args.smoke):
         raise ValueError("CPU is allowed only for Scorer v11 plumbing smoke, never full training")
     if str(args.device).lower().startswith("cuda") and not torch.cuda.is_available():
@@ -777,6 +838,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     schema = {
         "heatmap_aux": CANDIDATE_ISLAND_SCORER_V11_HEATMAP_SCHEMA,
         "crf": CANDIDATE_ISLAND_SCORER_V11_CRF_SCHEMA,
+        "query_mask": CANDIDATE_ISLAND_SCORER_V11_QUERY_MASK_SCHEMA,
     }.get(args.variant, str(capacity["schema"]))
     model = _build_model(args, config).to(device)
     optimizer = torch.optim.AdamW(
@@ -804,6 +866,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             warmup_batch,
             variant=args.variant,
             heatmap_weight=float(args.heatmap_weight),
+            query_mask_weight=query_mask_weight,
             torch=torch,
         )
         optimizer.zero_grad(set_to_none=True)
@@ -913,6 +976,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 batch,
                 variant=args.variant,
                 heatmap_weight=float(args.heatmap_weight),
+                query_mask_weight=query_mask_weight,
                 torch=torch,
             )
             loss.backward()
@@ -981,6 +1045,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 max_padded_frames=int(args.max_padded_frames),
                 variant=args.variant,
                 heatmap_weight=float(args.heatmap_weight),
+                query_mask_weight=query_mask_weight,
                 torch=torch,
                 device=device,
             )
@@ -1102,6 +1167,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             max_padded_frames=int(args.max_padded_frames),
             variant=args.variant,
             heatmap_weight=float(args.heatmap_weight),
+            query_mask_weight=query_mask_weight,
             torch=torch,
             device=device,
         )
@@ -1132,14 +1198,19 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "training_variant": args.variant,
         "capacity_profile": capacity_profile,
         "capacity_ab_axis": (
-            CANDIDATE_ISLAND_SCORER_V11_CRF_AB_AXIS
-            if args.variant == "crf"
-            else "ptm_adapter_and_temporal_capacity_profile"
+            CANDIDATE_ISLAND_SCORER_V11_QUERY_MASK_AB_AXIS
+            if args.variant == "query_mask"
+            else (
+                CANDIDATE_ISLAND_SCORER_V11_CRF_AB_AXIS
+                if args.variant == "crf"
+                else "ptm_adapter_and_temporal_capacity_profile"
+            )
         ),
         "training_seed": int(args.seed),
         "training_max_padded_frames": int(args.max_padded_frames),
         "class_weights": {"outside_candidate": 1.0, "inside_candidate": 1.0},
         "heatmap_auxiliary_weight": float(args.heatmap_weight),
+        "query_mask_auxiliary_weight": query_mask_weight,
         "numeric_gate_maximum_requirement": 0.95,
         "numeric_gate_pass": numeric_gate_pass,
         "manual_zero_clipping_gate": "pending",
@@ -1262,7 +1333,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--feature-cache-gate", required=True)
     parser.add_argument("--output-dir", required=True)
     parser.add_argument(
-        "--variant", choices=("baseline", "heatmap_aux", "crf"), default="baseline"
+        "--variant",
+        choices=("baseline", "heatmap_aux", "crf", "query_mask"),
+        default="baseline",
     )
     parser.add_argument(
         "--capacity-profile",
@@ -1273,6 +1346,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=CANDIDATE_ISLAND_SCORER_V11_FULL_CAPACITY_PROFILE,
     )
     parser.add_argument("--heatmap-weight", type=float, default=0.0)
+    parser.add_argument("--query-mask-weight", type=float, default=0.0)
     parser.add_argument("--class-weight-outside", type=float, default=1.0)
     parser.add_argument("--class-weight-inside", type=float, default=1.0)
     parser.add_argument("--device", default="cuda")
