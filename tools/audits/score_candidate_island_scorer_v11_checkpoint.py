@@ -22,9 +22,10 @@ for root in (PROJECT_ROOT, PROJECT_ROOT / "src"):
 from boundary.contracts import ACOUSTIC_BINARY_V12_CONTRACT  # noqa: E402
 from boundary.ja.model import (  # noqa: E402
     CANDIDATE_ISLAND_SCORER_V11_CANONICAL_SOURCE_SCHEMA,
+    CANDIDATE_ISLAND_SCORER_V11_CRF_SCHEMA,
     CANDIDATE_ISLAND_SCORER_V11_RAW_CACHE_ROW_SCHEMA,
     load_speech_island_scorer_checkpoint,
-    score_candidate_island_source_probabilities,
+    score_candidate_island_source_outputs,
 )
 from pipeline.memory_safety import (  # noqa: E402
     reset_shared_vram_baseline,
@@ -139,6 +140,7 @@ def evaluate_source_prediction(
     truth_runs = _runs(inside_truth)
     start_hits = end_hits = deletions = continuous = fragmented = 0
     internal_gap_frames = 0
+    internal_gap_lengths: list[int] = []
     for start, end in truth_runs:
         local_runs = _runs(inside_pred[start:end])
         if not local_runs:
@@ -150,10 +152,12 @@ def evaluate_source_prediction(
         last_end = start + local_runs[-1][1]
         start_hits += int(first_start - start <= tolerance_frames)
         end_hits += int(end - last_end <= tolerance_frames)
-        internal_gap_frames += sum(
+        local_gap_lengths = [
             max(0, right[0] - left[1])
             for left, right in zip(local_runs, local_runs[1:])
-        )
+        ]
+        internal_gap_lengths.extend(local_gap_lengths)
+        internal_gap_frames += sum(local_gap_lengths)
 
     long_residuals = [
         (start, end)
@@ -178,6 +182,14 @@ def evaluate_source_prediction(
         "continuous_truth_run_count": continuous,
         "fragmented_truth_run_count": fragmented,
         "truth_run_continuity": continuous / max(len(truth_runs), 1),
+        "prediction_inside_run_count": len(_runs(inside_pred)),
+        "internal_drop_gap_count": len(internal_gap_lengths),
+        "internal_drop_gap_1_frame_count": internal_gap_lengths.count(1),
+        "internal_drop_gap_2_frame_count": internal_gap_lengths.count(2),
+        "internal_drop_gap_3_frame_count": internal_gap_lengths.count(3),
+        "internal_drop_gap_4plus_frame_count": sum(
+            length >= 4 for length in internal_gap_lengths
+        ),
         "internal_drop_gap_frame_count": internal_gap_frames,
         "prediction_drop_truth_keep_frame_count": int(drop_truth_keep.sum()),
         "prediction_keep_truth_drop_frame_count": int(keep_truth_drop.sum()),
@@ -220,6 +232,12 @@ def _sum_partition(rows: Iterable[dict[str, Any]]) -> dict[str, Any]:
             "true_inside_deletion_count",
             "continuous_truth_run_count",
             "fragmented_truth_run_count",
+            "prediction_inside_run_count",
+            "internal_drop_gap_count",
+            "internal_drop_gap_1_frame_count",
+            "internal_drop_gap_2_frame_count",
+            "internal_drop_gap_3_frame_count",
+            "internal_drop_gap_4plus_frame_count",
             "internal_drop_gap_frame_count",
             "prediction_drop_truth_keep_frame_count",
             "prediction_keep_truth_drop_frame_count",
@@ -281,11 +299,19 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         device = torch.device("cuda", int(torch.cuda.current_device()))
     torch.cuda.set_per_process_memory_fraction(0.95, device=device)
     bundle = load_speech_island_scorer_checkpoint(checkpoint_path, device=device)
+    decoder_diagnostics: dict[str, Any] = {
+        "schema": bundle.schema,
+        "decision_mode": str(bundle.metadata.get("decision_mode") or ""),
+    }
+    if bundle.schema == CANDIDATE_ISLAND_SCORER_V11_CRF_SCHEMA:
+        decoder_diagnostics["learned_transition_matrix"] = (
+            bundle.model.crf.transitions.detach().cpu().tolist()
+        )
     first = raw_by_id[str(selected[0]["source_id"])]
     with np.load(_resolve(first["feature_path"]), allow_pickle=False) as payload:
         warm_ptm = np.asarray(payload["ptm"], dtype=np.float32)
         warm_mfcc = np.asarray(payload["mfcc"], dtype=np.float32)
-    score_candidate_island_source_probabilities(
+    score_candidate_island_source_outputs(
         bundle,
         ptm=warm_ptm,
         mfcc=warm_mfcc,
@@ -313,13 +339,14 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             mfcc = np.asarray(payload["mfcc"], dtype=np.float32)
         if ptm.shape[0] != int(canonical["frame_count"]) or mfcc.shape[0] != ptm.shape[0]:
             raise ValueError(f"Scorer v11 source feature geometry mismatch: {source_id}")
-        probabilities = score_candidate_island_source_probabilities(
+        outputs = score_candidate_island_source_outputs(
             bundle,
             ptm=ptm,
             mfcc=mfcc,
             max_padded_frames=int(args.max_padded_frames),
         )
-        predicted = np.argmax(probabilities, axis=-1).astype(np.int64)
+        probabilities = outputs.probabilities
+        predicted = outputs.labels
         truth = _canonical_labels(canonical)
         metrics = evaluate_source_prediction(
             truth,
@@ -344,7 +371,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 **metrics,
             }
         )
-        del ptm, mfcc, probabilities, predicted, truth
+        del ptm, mfcc, outputs, probabilities, predicted, truth
         if index % 5 == 0 or index == len(selected):
             snapshot = runtime_memory_snapshot(require_shared_vram=True)
             if float(snapshot.get("shared_vram_mb") or 0.0) > 0.0:
@@ -398,6 +425,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "raw_feature_manifest": _display(raw_manifest_path),
         "raw_feature_manifest_sha256": _sha256(raw_manifest_path),
         "partitions": sorted(requested_partitions),
+        "decoder_diagnostics": decoder_diagnostics,
         "source_count": len(prediction_rows),
         "partition_metrics": partition_metrics,
         "numeric_gate_maximum_requirement": 0.95,

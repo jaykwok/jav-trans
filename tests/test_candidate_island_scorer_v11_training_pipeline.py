@@ -15,7 +15,10 @@ from boundary.contracts import ACOUSTIC_BINARY_V12_CONTRACT
 from boundary.ja.model import (
     CANDIDATE_ISLAND_SCORER_V11_COMPACT_CAPACITY_PROFILE,
     CANDIDATE_ISLAND_SCORER_V11_COMPACT_SCHEMA,
+    CANDIDATE_ISLAND_SCORER_V11_CRF_SCHEMA,
+    CANDIDATE_ISLAND_SCORER_V11_CRF_AB_AXIS,
     CANDIDATE_ISLAND_SCORER_V11_FEATURE_EXTRACTOR_SCHEMA,
+    CANDIDATE_ISLAND_SCORER_V11_FULL_CAPACITY_PROFILE,
     CANDIDATE_ISLAND_SCORER_V11_RAW_CACHE_ROW_SCHEMA,
     CANDIDATE_ISLAND_SCORER_V11_SYNTHETIC_TRAIN_SOURCE_SCHEMA,
     load_speech_island_scorer_checkpoint,
@@ -724,6 +727,36 @@ def test_v11_feature_compile_and_random_init_cpu_smoke(tmp_path: Path) -> None:
         CANDIDATE_ISLAND_SCORER_V11_COMPACT_CAPACITY_PROFILE
     )
     assert bundle.metadata["training_initialization"] == "random"
+
+    crf_args = argparse.Namespace(
+        **{
+            **vars(args),
+            "output_dir": str(tmp_path / "training-crf"),
+            "variant": "crf",
+            "capacity_profile": CANDIDATE_ISLAND_SCORER_V11_FULL_CAPACITY_PROFILE,
+        }
+    )
+    crf_result = train(crf_args)
+    crf_checkpoint = Path(crf_result["checkpoint"])
+    if not crf_checkpoint.is_absolute():
+        crf_checkpoint = Path.cwd() / crf_checkpoint
+    crf_bundle = load_speech_island_scorer_checkpoint(
+        crf_checkpoint, device="cpu"
+    )
+    assert crf_bundle.schema == CANDIDATE_ISLAND_SCORER_V11_CRF_SCHEMA
+    assert crf_bundle.metadata["decision_mode"] == (
+        "learned_binary_sequence_viterbi_argmax"
+    )
+    assert crf_bundle.metadata["capacity_ab_axis"] == (
+        CANDIDATE_ISLAND_SCORER_V11_CRF_AB_AXIS
+    )
+    assert crf_result["training_seed"] == 117
+    assert crf_result["training_max_padded_frames"] == 32
+    assert crf_result["capacity_contract"]["schema"] == (
+        CANDIDATE_ISLAND_SCORER_V11_CRF_SCHEMA
+    )
+    assert crf_bundle.metadata["runtime_threshold"] is None
+    assert crf_bundle.metadata["runtime_duration_rule"] is None
 
 
 def test_v11_feature_compile_rejects_projected_ptm128(tmp_path: Path) -> None:

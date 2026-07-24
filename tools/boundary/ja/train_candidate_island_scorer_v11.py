@@ -29,6 +29,9 @@ from boundary.ja.candidate_training import candidate_boundary_heatmap_loss  # no
 from boundary.ja.model import (  # noqa: E402
     CANDIDATE_ISLAND_SCORER_V11_CAPACITY_PROFILES,
     CANDIDATE_ISLAND_SCORER_V11_COMPACT_CAPACITY_PROFILE,
+    CANDIDATE_ISLAND_SCORER_V11_CRF_AB_AXIS,
+    CANDIDATE_ISLAND_SCORER_V11_CRF_MODEL_ARCH,
+    CANDIDATE_ISLAND_SCORER_V11_CRF_SCHEMA,
     CANDIDATE_ISLAND_SCORER_V11_DATASET_CONTRACT,
     CANDIDATE_ISLAND_SCORER_V11_FEATURE_CACHE_GATE_SCHEMA,
     CANDIDATE_ISLAND_SCORER_V11_FULL_CAPACITY_PROFILE,
@@ -40,6 +43,7 @@ from boundary.ja.model import (  # noqa: E402
     CANDIDATE_ISLAND_SCORER_V11_RAW_PTM_DIM,
     CANDIDATE_ISLAND_SCORER_V11_TRAINING_ROW_SCHEMA,
     CandidateIslandHeatmapScorerNetwork,
+    CandidateIslandCrfScorerNetwork,
     CandidateIslandScorerNetwork,
     build_speech_island_scorer_checkpoint,
 )
@@ -423,6 +427,8 @@ def _model_config(args: argparse.Namespace, normalization: dict[str, list[float]
                 "boundary_auxiliary": CANDIDATE_ISLAND_SCORER_V11_HEATMAP_AUXILIARY,
             }
         )
+    elif args.variant == "crf":
+        config["model_arch"] = CANDIDATE_ISLAND_SCORER_V11_CRF_MODEL_ARCH
     else:
         config["model_arch"] = str(capacity["model_arch"])
     return config
@@ -440,7 +446,10 @@ def _loss(model, batch, *, variant: str, heatmap_weight: float, torch):
     else:
         outputs = None
         logits = model(batch["ptm"], batch["mfcc"], attention_mask=batch["attention"])
-    main = torch.nn.functional.cross_entropy(logits[valid], batch["labels"][valid])
+    if variant == "crf":
+        main = model.sequence_nll(logits, batch["labels"], valid)
+    else:
+        main = torch.nn.functional.cross_entropy(logits[valid], batch["labels"][valid])
     auxiliary = torch.zeros((), dtype=main.dtype, device=main.device)
     if outputs is not None and heatmap_weight > 0.0:
         boundary_valid = valid & batch["boundary_valid"]
@@ -480,7 +489,11 @@ def _evaluate(
                 torch=torch,
             )
             target = batch["labels"][valid].detach().cpu().numpy()
-            predicted = torch.argmax(logits, dim=-1)[valid].detach().cpu().numpy()
+            if variant == "crf":
+                predicted_labels = model.decode(logits, batch["attention"])
+            else:
+                predicted_labels = torch.argmax(logits, dim=-1)
+            predicted = predicted_labels[valid].detach().cpu().numpy()
             for truth, prediction in zip(target, predicted, strict=True):
                 confusion[int(truth), int(prediction)] += 1
             loss_sum += float(loss.detach().cpu())
@@ -573,6 +586,8 @@ def _reset_training_seed(seed: int, torch) -> None:
 def _build_model(args: argparse.Namespace, config: dict[str, Any]):
     if args.variant == "heatmap_aux":
         return CandidateIslandHeatmapScorerNetwork(**config)
+    if args.variant == "crf":
+        return CandidateIslandCrfScorerNetwork(**config)
     return CandidateIslandScorerNetwork(**config)
 
 
@@ -666,8 +681,8 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     import psutil
     import torch
 
-    if args.variant not in {"baseline", "heatmap_aux"}:
-        raise ValueError("Scorer v11 variant must be baseline or heatmap_aux")
+    if args.variant not in {"baseline", "heatmap_aux", "crf"}:
+        raise ValueError("Scorer v11 variant must be baseline, heatmap_aux, or crf")
     log_every = int(getattr(args, "log_every", 50))
     if log_every <= 0:
         raise ValueError("Scorer v11 log_every must be positive")
@@ -687,12 +702,12 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         raise ValueError(f"unknown Scorer v11 capacity profile: {capacity_profile!r}")
     capacity = CANDIDATE_ISLAND_SCORER_V11_CAPACITY_PROFILES[capacity_profile]
     if (
-        args.variant == "heatmap_aux"
+        args.variant in {"heatmap_aux", "crf"}
         and capacity_profile != CANDIDATE_ISLAND_SCORER_V11_FULL_CAPACITY_PROFILE
     ):
         raise ValueError(
-            "Scorer v11 heatmap A/B is only defined after the full-capacity baseline; "
-            "do not mix heatmap and capacity axes"
+            "Scorer v11 structured A/B variants are only defined after the "
+            "full-capacity baseline; do not mix decoder and capacity axes"
         )
     if int(args.max_padded_frames) > int(capacity["max_padded_frames"]):
         raise ValueError(
@@ -701,8 +716,8 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         )
     if float(args.class_weight_outside) != 1.0 or float(args.class_weight_inside) != 1.0:
         raise ValueError("Scorer v11 neutral baseline requires class weights 1/1")
-    if args.variant == "baseline" and float(args.heatmap_weight) != 0.0:
-        raise ValueError("baseline Scorer v11 forbids auxiliary loss")
+    if args.variant in {"baseline", "crf"} and float(args.heatmap_weight) != 0.0:
+        raise ValueError("baseline and CRF Scorer v11 variants forbid auxiliary loss")
     if args.variant == "heatmap_aux" and float(args.heatmap_weight) <= 0.0:
         raise ValueError("heatmap_aux requires a positive pre-registered weight")
     if str(args.device).lower() == "cpu" and not bool(args.smoke):
@@ -759,11 +774,10 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     cache = SourceArrayCache(max_sources=int(args.source_cache_size))
     normalization = compute_mfcc_normalization(supervised_by_partition["train"], cache)
     config = _model_config(args, normalization)
-    schema = (
-        CANDIDATE_ISLAND_SCORER_V11_HEATMAP_SCHEMA
-        if args.variant == "heatmap_aux"
-        else str(capacity["schema"])
-    )
+    schema = {
+        "heatmap_aux": CANDIDATE_ISLAND_SCORER_V11_HEATMAP_SCHEMA,
+        "crf": CANDIDATE_ISLAND_SCORER_V11_CRF_SCHEMA,
+    }.get(args.variant, str(capacity["schema"]))
     model = _build_model(args, config).to(device)
     optimizer = torch.optim.AdamW(
         model.parameters(), lr=float(args.learning_rate), weight_decay=float(args.weight_decay)
@@ -1117,7 +1131,13 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "training_initialization": "random",
         "training_variant": args.variant,
         "capacity_profile": capacity_profile,
-        "capacity_ab_axis": "ptm_adapter_and_temporal_capacity_profile",
+        "capacity_ab_axis": (
+            CANDIDATE_ISLAND_SCORER_V11_CRF_AB_AXIS
+            if args.variant == "crf"
+            else "ptm_adapter_and_temporal_capacity_profile"
+        ),
+        "training_seed": int(args.seed),
+        "training_max_padded_frames": int(args.max_padded_frames),
         "class_weights": {"outside_candidate": 1.0, "inside_candidate": 1.0},
         "heatmap_auxiliary_weight": float(args.heatmap_weight),
         "numeric_gate_maximum_requirement": 0.95,
@@ -1158,7 +1178,16 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "boundary_serialization_contract_id": ACOUSTIC_BINARY_V12_CONTRACT.contract_id,
         "variant": args.variant,
         "capacity_profile": capacity_profile,
-        "capacity_contract": dict(capacity),
+        "checkpoint_schema": schema,
+        "model_arch": str(config["model_arch"]),
+        "ab_axis": metadata["capacity_ab_axis"],
+        "training_seed": int(args.seed),
+        "training_max_padded_frames": int(args.max_padded_frames),
+        "capacity_contract": {
+            **dict(capacity),
+            "schema": schema,
+            "model_arch": str(config["model_arch"]),
+        },
         "smoke": bool(args.smoke),
         "partition_window_counts": {
             partition: len(by_partition[partition]) for partition in sorted(PARTITIONS)
@@ -1232,7 +1261,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--dataset-manifest", required=True)
     parser.add_argument("--feature-cache-gate", required=True)
     parser.add_argument("--output-dir", required=True)
-    parser.add_argument("--variant", choices=("baseline", "heatmap_aux"), default="baseline")
+    parser.add_argument(
+        "--variant", choices=("baseline", "heatmap_aux", "crf"), default="baseline"
+    )
     parser.add_argument(
         "--capacity-profile",
         choices=(

@@ -3,6 +3,7 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
+from boundary.linear_chain_crf import BinaryLinearChainCrf
 from boundary.ja.backend import (
     SpeechBoundaryJaConfig,
     decode_candidate_island_segments,
@@ -24,6 +25,10 @@ from boundary.ja.model import (
     CANDIDATE_ISLAND_SCORER_V11_CAPACITY_PROFILES,
     CANDIDATE_ISLAND_SCORER_V11_COMPACT_CAPACITY_PROFILE,
     CANDIDATE_ISLAND_SCORER_V11_COMPACT_SCHEMA,
+    CANDIDATE_ISLAND_SCORER_V11_CRF_DATASET_CONTRACT,
+    CANDIDATE_ISLAND_SCORER_V11_CRF_AB_AXIS,
+    CANDIDATE_ISLAND_SCORER_V11_CRF_MODEL_ARCH,
+    CANDIDATE_ISLAND_SCORER_V11_CRF_SCHEMA,
     CANDIDATE_ISLAND_SCORER_V11_DATASET_CONTRACT,
     CANDIDATE_ISLAND_SCORER_V11_FULL_CAPACITY_PROFILE,
     CANDIDATE_ISLAND_SCORER_V11_LABELS,
@@ -35,15 +40,19 @@ from boundary.ja.model import (
     CANDIDATE_ISLAND_SCORER_V11_MODEL_ARCH,
     CANDIDATE_ISLAND_SCORER_V11_SCHEMA,
     CandidateIslandScorerNetwork,
+    CandidateIslandCrfScorerNetwork,
     CandidateIslandHeatmapScorerNetwork,
+    SpeechIslandScorerBundle,
     SPEECH_ISLAND_SCORER_V10_SCHEMA,
     build_speech_island_scorer_checkpoint,
     load_speech_island_scorer_checkpoint,
     score_binary_speech_class_probabilities_batch,
     score_candidate_island_class_probabilities_batch,
+    score_candidate_island_crf_outputs_batch,
     score_candidate_island_heatmap_class_probabilities_batch,
     score_candidate_island_heatmap_source_probabilities,
     score_candidate_island_source_probabilities,
+    score_candidate_island_source_outputs,
 )
 
 
@@ -100,6 +109,13 @@ def _heatmap_config() -> dict:
             CANDIDATE_ISLAND_SCORER_V11_HEATMAP_SIGMA_FRAMES
         ),
         "boundary_auxiliary": CANDIDATE_ISLAND_SCORER_V11_HEATMAP_AUXILIARY,
+    }
+
+
+def _crf_config() -> dict:
+    return {
+        **_config(),
+        "model_arch": CANDIDATE_ISLAND_SCORER_V11_CRF_MODEL_ARCH,
     }
 
 
@@ -235,6 +251,135 @@ def test_candidate_v11_batching_matches_singletons_and_rejects_v10_api(tmp_path)
 
     with pytest.raises(ValueError, match=SPEECH_ISLAND_SCORER_V10_SCHEMA):
         score_binary_speech_class_probabilities_batch(bundle, feature_pairs=pairs)
+
+
+def test_candidate_crf_checkpoint_and_batching_are_strict(tmp_path) -> None:
+    torch = pytest.importorskip("torch")
+    config = _crf_config()
+    model = CandidateIslandCrfScorerNetwork(**config).eval()
+    with torch.no_grad():
+        model.crf.transitions.copy_(torch.tensor([[0.4, -0.3], [-0.2, 0.5]]))
+    payload = build_speech_island_scorer_checkpoint(
+        model=model,
+        model_config=config,
+        normalization={"mfcc_mean": [0.0] * 40, "mfcc_std": [1.0] * 40},
+        metadata=_metadata(),
+        schema=CANDIDATE_ISLAND_SCORER_V11_CRF_SCHEMA,
+    )
+    checkpoint = tmp_path / "candidate-scorer-v11-crf.pt"
+    torch.save(payload, checkpoint)
+    bundle = load_speech_island_scorer_checkpoint(checkpoint, device="cpu")
+
+    assert bundle.schema == CANDIDATE_ISLAND_SCORER_V11_CRF_SCHEMA
+    assert bundle.metadata["dataset_contract"] == (
+        CANDIDATE_ISLAND_SCORER_V11_CRF_DATASET_CONTRACT
+    )
+    assert bundle.metadata["decision_mode"] == (
+        "learned_binary_sequence_viterbi_argmax"
+    )
+    assert bundle.metadata["capacity_ab_axis"] == (
+        CANDIDATE_ISLAND_SCORER_V11_CRF_AB_AXIS
+    )
+    assert bundle.metadata["runtime_threshold"] is None
+    assert bundle.metadata["runtime_duration_rule"] is None
+    rng = np.random.default_rng(1911)
+    pairs = [
+        (
+            rng.normal(size=(frames, 2048)).astype(np.float32),
+            rng.normal(size=(frames, 40)).astype(np.float32),
+        )
+        for frames in (5, 9, 7)
+    ]
+    batched = score_candidate_island_crf_outputs_batch(
+        bundle, feature_pairs=pairs
+    )
+    singleton = [
+        score_candidate_island_crf_outputs_batch(bundle, feature_pairs=[pair])[0]
+        for pair in pairs
+    ]
+    for left, right in zip(batched, singleton, strict=True):
+        np.testing.assert_allclose(
+            left.probabilities, right.probabilities, atol=1e-5, rtol=1e-5
+        )
+        np.testing.assert_array_equal(left.labels, right.labels)
+
+
+def test_candidate_crf_keeps_frozen_baseline_initialization_order() -> None:
+    torch = pytest.importorskip("torch")
+    config = _config()
+    torch.manual_seed(117)
+    baseline = CandidateIslandScorerNetwork(**config)
+    baseline_state = {
+        key: value.detach().clone()
+        for key, value in baseline.state_dict().items()
+        if key.startswith(("ptm_projector.", "frame_proj.", "encoder.", "head."))
+    }
+    del baseline
+
+    torch.manual_seed(117)
+    crf = CandidateIslandCrfScorerNetwork(**_crf_config())
+    crf_state = crf.state_dict()
+    for key, expected in baseline_state.items():
+        crf_key = key.replace("head.", "emission_head.", 1)
+        torch.testing.assert_close(crf_state[crf_key], expected)
+
+
+def test_candidate_crf_source_scoring_is_frame_budget_equivalent() -> None:
+    torch = pytest.importorskip("torch")
+
+    class _DeterministicCrfModel(torch.nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.crf = BinaryLinearChainCrf()
+            with torch.no_grad():
+                self.crf.transitions.copy_(
+                    torch.tensor([[0.6, -0.4], [-0.3, 0.5]])
+                )
+
+        def forward(self, ptm, mfcc, *, attention_mask=None):
+            del attention_mask
+            return torch.stack(
+                (
+                    ptm[..., 0] + 0.25 * mfcc[..., 0],
+                    ptm[..., 1] - 0.15 * mfcc[..., 0],
+                ),
+                dim=-1,
+            )
+
+        def decode(self, emissions, attention_mask):
+            return self.crf.decode(emissions, attention_mask)
+
+        def marginal_probabilities(self, emissions, attention_mask):
+            return self.crf.marginal_probabilities(emissions, attention_mask)
+
+    bundle = SpeechIslandScorerBundle(
+        path="fixture",
+        sha256="0" * 64,
+        model=_DeterministicCrfModel().eval(),
+        model_config={"raw_ptm_dim": 2, "projected_ptm_dim": 2, "mfcc_dim": 1},
+        normalization={},
+        metadata={},
+        device="cpu",
+        schema=CANDIDATE_ISLAND_SCORER_V11_CRF_SCHEMA,
+    )
+    rng = np.random.default_rng(2211)
+    ptm = rng.normal(size=(1801, 2)).astype(np.float32)
+    mfcc = rng.normal(size=(1801, 1)).astype(np.float32)
+
+    one_batch = score_candidate_island_source_outputs(
+        bundle, ptm=ptm, mfcc=mfcc, max_padded_frames=2000
+    )
+    split_batches = score_candidate_island_source_outputs(
+        bundle, ptm=ptm, mfcc=mfcc, max_padded_frames=1000
+    )
+
+    np.testing.assert_allclose(
+        one_batch.probabilities,
+        split_batches.probabilities,
+        atol=1e-6,
+        rtol=1e-6,
+    )
+    np.testing.assert_array_equal(one_batch.labels, split_batches.labels)
 
 
 def test_candidate_source_scoring_is_frame_budget_equivalent(tmp_path) -> None:

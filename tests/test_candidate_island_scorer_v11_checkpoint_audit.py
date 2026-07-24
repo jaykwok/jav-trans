@@ -25,6 +25,12 @@ def test_v11_source_audit_tracks_deletion_fragmentation_and_unsure() -> None:
     assert result["true_inside_deletion_count"] == 1
     assert result["fragmented_truth_run_count"] == 1
     assert result["continuous_truth_run_count"] == 0
+    assert result["prediction_inside_run_count"] == 3
+    assert result["internal_drop_gap_count"] == 1
+    assert result["internal_drop_gap_1_frame_count"] == 1
+    assert result["internal_drop_gap_2_frame_count"] == 0
+    assert result["internal_drop_gap_3_frame_count"] == 0
+    assert result["internal_drop_gap_4plus_frame_count"] == 0
     assert result["prediction_drop_truth_keep_frame_count"] == 3
     assert result["prediction_keep_truth_drop_frame_count"] == 4
     assert result["long_residual_count"] == 1
