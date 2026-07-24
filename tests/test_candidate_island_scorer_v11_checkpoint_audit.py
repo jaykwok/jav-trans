@@ -72,7 +72,8 @@ def test_v11_source_audit_preserves_teacher_outside_negative_control() -> None:
     assert result["inside_candidate_recall"] == 0.0
     assert result["outside_candidate_recall"] == 0.0
     assert result["outside_run_mean_recall"] == 0.0
-    assert result["truth_run_continuity"] == 0.0
+    assert result["truth_run_continuity"] is None
+    assert result["truth_run_continuity_applicable"] is False
     assert result["all_outside_source"] is True
     assert result["outside_source_recall"] == 0.0
     assert result["all_outside_source_drop_success"] is False

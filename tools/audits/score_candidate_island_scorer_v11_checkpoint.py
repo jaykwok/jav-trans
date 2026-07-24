@@ -213,7 +213,15 @@ def evaluate_source_prediction(
         "true_inside_deletion_count": deletions,
         "continuous_truth_run_count": continuous,
         "fragmented_truth_run_count": fragmented,
-        "truth_run_continuity": continuous / max(len(truth_runs), 1),
+        # A source with no definite inside truth has no continuity denominator.
+        # Keep this as null at source level so an all-outside control cannot be
+        # rendered or interpreted as a failed 0% continuity result.  The
+        # partition summarizer applies the same semantics and reports the
+        # explicit applicability flag.
+        "truth_run_continuity": (
+            continuous / len(truth_runs) if truth_runs else None
+        ),
+        "truth_run_continuity_applicable": bool(truth_runs),
         "prediction_inside_run_count": len(_runs(inside_pred)),
         "internal_drop_gap_count": len(internal_gap_lengths),
         "internal_drop_gap_1_frame_count": internal_gap_lengths.count(1),
