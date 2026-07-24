@@ -18,10 +18,13 @@ def test_scorer_v11_retrain_driver_preserves_execution_contracts() -> None:
     assert "$env:PYTHONIOENCODING = 'utf-8'" in script
     assert "$env:UV_CACHE_DIR" in script
     assert "uv run python" in script
+    assert "select_candidate_island_scorer_v11_dual_evidence_train.py" in script
     assert "compile_candidate_island_scorer_v11_real_train_dual_evidence.py" in script
     assert "--real-train-dual-evidence-sources" in script
     assert "--calibration-teacher-summary" in script
-    assert "--calibration-gap-verdicts" in script
+    assert "--calibration-ab-summary" in script
+    assert "--calibration-ab-verdicts" in script
+    assert "--calibration-gap-verdicts" not in script
     assert "DownstreamIsolationSummary" in script
     assert "heldoutResponsibilityVerdicts" in script
     assert "requirement_count -ne 6" in script

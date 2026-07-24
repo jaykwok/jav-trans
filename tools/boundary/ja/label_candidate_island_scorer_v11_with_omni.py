@@ -32,6 +32,12 @@ from tools.asr.cueqc.label_pre_asr_with_omni import (
     load_env_file,
     normalize_openai_compat_base_url,
 )
+from tools.omni.timestamp_contract import (
+    TIMESTAMP_CONTRACT_ID,
+    TIMESTAMP_PROMPT_CONTRACT_ZH,
+    parse_mmss_span,
+    timestamp_request_contract,
+)
 
 
 FRAME_HOP_S = 0.02
@@ -54,24 +60,26 @@ SAFE_OUTSIDE_PROMPT_PROFILES = (
     BALANCED_V12_SAFE_OUTSIDE_PROMPT_PROFILE,
     CUSTOM_SAFE_OUTSIDE_PROMPT_PROFILE,
 )
-PROMPT_VERSION = "candidate_island_scorer_v11_omni_preaudit_dialogue_islands_v5"
+PROMPT_VERSION = (
+    "candidate_island_scorer_v11_omni_preaudit_dialogue_islands_v5_mmss_mmm"
+)
 SAFE_OUTSIDE_PROMPT_VERSION = (
-    "candidate_island_scorer_v11_omni_preaudit_safe_outside_complement_v1"
+    "candidate_island_scorer_v11_omni_preaudit_safe_outside_complement_v1_mmss_mmm"
 )
 SIMPLE_SAFE_OUTSIDE_PROMPT_VERSION = (
-    "candidate_island_scorer_v11_omni_preaudit_safe_outside_complement_v2_simple"
+    "candidate_island_scorer_v11_omni_preaudit_safe_outside_complement_v2_simple_mmss_mmm"
 )
 GREENLIGHT_SAFE_OUTSIDE_PROMPT_VERSION = (
-    "candidate_island_scorer_v11_omni_preaudit_safe_outside_complement_v3_greenlight"
+    "candidate_island_scorer_v11_omni_preaudit_safe_outside_complement_v3_greenlight_mmss_mmm"
 )
 FUNNEL_SAFE_OUTSIDE_PROMPT_VERSION = (
-    "candidate_island_scorer_v11_omni_preaudit_safe_outside_complement_v4_funnel"
+    "candidate_island_scorer_v11_omni_preaudit_safe_outside_complement_v4_funnel_mmss_mmm"
 )
 ASSERTIVE_SAFE_OUTSIDE_PROMPT_VERSION = (
-    "candidate_island_scorer_v11_omni_preaudit_safe_outside_complement_v5_assertive"
+    "candidate_island_scorer_v11_omni_preaudit_safe_outside_complement_v5_assertive_mmss_mmm"
 )
 BALANCED_V12_SAFE_OUTSIDE_PROMPT_VERSION = (
-    "candidate_island_scorer_v11_omni_preaudit_safe_outside_complement_v6_balanced_v12_teacher"
+    "candidate_island_scorer_v11_omni_preaudit_safe_outside_complement_v6_balanced_v12_teacher_mmss_mmm"
 )
 
 SYSTEM_PROMPT = """你是 1.7B Scorer v11 的候选岛预审 teacher。你的唯一职责是标出必须先保留给后续 Proposal / Split / CueQC 的连续候选对话岛。你不是 Split，不按句子、说话人、标点或语义单元切分；你也不是 CueQC，不做最终 keep/drop。
@@ -87,7 +95,7 @@ SYSTEM_PROMPT = """你是 1.7B Scorer v11 的候选岛预审 teacher。你的唯
 - 不使用固定时长、静音阈值、hysteresis、ASR 文本、duration-only 规则或其他启发式。
 - 同一场景、同一说话人、持续互动或声音连续，本身都不是合并理由。
 - islands 与 unsure_spans 必须各自按时间排序、互不重叠，并且两组之间也不得重叠；它们之外的完整差集就是 outside_candidate。
-- 输出当前 0-based 完整 source 坐标，单位为秒，不添加前后文，不使用原视频时间轴。
+- 输出当前 0-based 完整 source 坐标，按下方 `MM:SS.mmm` 字符串合同编码；不添加前后文，不使用原视频时间轴。
 
 判例：
 - 对白1 + 对白内部短呼吸/呻吟 + 对白2，且属于同一轮连续对话：输出一个完整 island。
@@ -98,8 +106,8 @@ SYSTEM_PROMPT = """你是 1.7B Scorer v11 的候选岛预审 teacher。你的唯
 只输出一个 JSON 对象，不要 Markdown：
 {
   "source_id":"...",
-  "islands":[{"start_s":0.0,"end_s":1.0,"confidence":0.0,"reason":"连续候选对话岛的简短理由"}],
-  "unsure_spans":[{"start_s":0.0,"end_s":1.0,"reason":"无法确认是否含词语的局部"}],
+  "islands":[{"start_ts":"00:00.000","end_ts":"00:01.000","confidence":0.0,"reason":"连续候选对话岛的简短理由"}],
+  "unsure_spans":[{"start_ts":"00:00.000","end_ts":"00:01.000","reason":"无法确认是否含词语的局部"}],
   "overall_confidence":0.0,
   "overall_reason":"简短整体理由"
 }
@@ -120,12 +128,12 @@ SAFE_OUTSIDE_SYSTEM_PROMPT = """你是 1.7B Scorer v11 的高精度 outside_cand
 
 边界合同：
 - 不使用 ASR 文本、固定时长、静音阈值、hysteresis、duration-only 规则或其他启发式。
-- safe_outside_spans 必须按时间排序、互不重叠，使用当前 0-based 完整 source 坐标，单位为秒；不添加上下文，不使用原视频时间轴。
+- safe_outside_spans 必须按时间排序、互不重叠，使用当前 0-based 完整 source 坐标并按下方 `MM:SS.mmm` 字符串合同编码；不添加上下文，不使用原视频时间轴。
 
 只输出一个 JSON 对象，不要 Markdown：
 {
   "source_id":"...",
-  "safe_outside_spans":[{"start_s":0.0,"end_s":1.0,"confidence":0.0,"reason":"确认无词语且可独立删除的简短理由"}],
+  "safe_outside_spans":[{"start_ts":"00:00.000","end_ts":"00:01.000","confidence":0.0,"reason":"确认无词语且可独立删除的简短理由"}],
   "overall_confidence":0.0,
   "overall_reason":"简短整体理由"
 }
@@ -158,7 +166,7 @@ SIMPLE_SAFE_OUTSIDE_SYSTEM_PROMPT = """你是 1.7B Scorer v11 的 Outside Candid
 只输出一个 JSON 对象，不要 Markdown：
 {
   "source_id":"...",
-  "safe_outside_spans":[{"start_s":0.0,"end_s":1.0,"confidence":0.0,"reason":"确认可安全删除的简短理由"}],
+  "safe_outside_spans":[{"start_ts":"00:00.000","end_ts":"00:01.000","confidence":0.0,"reason":"确认可安全删除的简短理由"}],
   "overall_confidence":0.0,
   "overall_reason":"简短整体理由"
 }
@@ -187,7 +195,7 @@ GREENLIGHT_SAFE_OUTSIDE_SYSTEM_PROMPT = """你是 1.7B Scorer v11 的高精度 o
 只输出一个 JSON 对象，不要 Markdown：
 {
   "source_id":"...",
-  "safe_outside_spans":[{"start_s":0.0,"end_s":1.0,"confidence":0.0,"reason":"确认可安全删除的简短理由"}],
+  "safe_outside_spans":[{"start_ts":"00:00.000","end_ts":"00:01.000","confidence":0.0,"reason":"确认可安全删除的简短理由"}],
   "overall_confidence":0.0,
   "overall_reason":"简短整体理由"
 }
@@ -218,7 +226,7 @@ FUNNEL_SAFE_OUTSIDE_SYSTEM_PROMPT = """你是 1.7B Scorer v11 的高精度 outsi
 只输出一个 JSON 对象，不要 Markdown：
 {
   "source_id":"...",
-  "safe_outside_spans":[{"start_s":0.0,"end_s":1.0,"confidence":0.0,"reason":"确认可安全删除的简短理由"}],
+  "safe_outside_spans":[{"start_ts":"00:00.000","end_ts":"00:01.000","confidence":0.0,"reason":"确认可安全删除的简短理由"}],
   "overall_confidence":0.0,
   "overall_reason":"简短整体理由"
 }
@@ -252,7 +260,7 @@ ASSERTIVE_SAFE_OUTSIDE_SYSTEM_PROMPT = """你是 1.7B Scorer v11 的高精度 ou
 未标记部分仅作为 provisional keep。只输出一个 JSON 对象，不要 Markdown：
 {
   "source_id":"...",
-  "safe_outside_spans":[{"start_s":0.0,"end_s":1.0,"confidence":0.0,"reason":"确认可安全删除的简短理由"}],
+  "safe_outside_spans":[{"start_ts":"00:00.000","end_ts":"00:01.000","confidence":0.0,"reason":"确认可安全删除的简短理由"}],
   "overall_confidence":0.0,
   "overall_reason":"简短整体理由"
 }
@@ -341,11 +349,21 @@ outside_candidate 的边界应避开清晰或疑似语言，但不需要为了�
 只输出一个 JSON 对象，不要 Markdown：
 {
   "source_id":"...",
-  "safe_outside_spans":[{"start_s":0.0,"end_s":1.0,"confidence":0.0,"reason":"确认可安全删除的简短理由"}],
+  "safe_outside_spans":[{"start_ts":"00:00.000","end_ts":"00:01.000","confidence":0.0,"reason":"确认可安全删除的简短理由"}],
   "overall_confidence":0.0,
   "overall_reason":"简短整体理由"
 }
 """
+
+# Every built-in interval prompt shares one wire timestamp contract.  Custom
+# prompts receive the same suffix in ``run`` below.
+SYSTEM_PROMPT += "\n" + TIMESTAMP_PROMPT_CONTRACT_ZH
+SAFE_OUTSIDE_SYSTEM_PROMPT += "\n" + TIMESTAMP_PROMPT_CONTRACT_ZH
+SIMPLE_SAFE_OUTSIDE_SYSTEM_PROMPT += "\n" + TIMESTAMP_PROMPT_CONTRACT_ZH
+GREENLIGHT_SAFE_OUTSIDE_SYSTEM_PROMPT += "\n" + TIMESTAMP_PROMPT_CONTRACT_ZH
+FUNNEL_SAFE_OUTSIDE_SYSTEM_PROMPT += "\n" + TIMESTAMP_PROMPT_CONTRACT_ZH
+ASSERTIVE_SAFE_OUTSIDE_SYSTEM_PROMPT += "\n" + TIMESTAMP_PROMPT_CONTRACT_ZH
+BALANCED_V12_SAFE_OUTSIDE_SYSTEM_PROMPT += "\n" + TIMESTAMP_PROMPT_CONTRACT_ZH
 
 
 def _rows(path: Path) -> list[dict[str, Any]]:
@@ -390,6 +408,7 @@ def _resume_index(
         if row.get("schema") == SCHEMA
         and row.get("model") == model
         and row.get("prompt_version") == prompt_version
+        and row.get("teacher_timestamp_contract_id") == TIMESTAMP_CONTRACT_ID
     }
 
 
@@ -408,10 +427,13 @@ def _prompt(
     feedback: str = "",
     prompt_profile: str = DEFAULT_PROMPT_PROFILE,
 ) -> str:
+    base_payload = {
+        "source_id": str(row["source_id"]),
+        **timestamp_request_contract(float(row["duration_s"])),
+    }
     if prompt_profile == DEFAULT_PROMPT_PROFILE:
         payload = {
-            "source_id": str(row["source_id"]),
-            "duration_s": float(row["duration_s"]),
+            **base_payload,
             "task": "mark continuous candidate dialogue islands for Scorer v11",
             "decision_order": [
                 "find definite or probable lexical/dialogue anchors",
@@ -433,8 +455,7 @@ def _prompt(
         }
     elif prompt_profile == SAFE_OUTSIDE_PROMPT_PROFILE:
         payload = {
-            "source_id": str(row["source_id"]),
-            "duration_s": float(row["duration_s"]),
+            **base_payload,
             "task": "return only high-precision independently removable nonlexical spans",
             "required_conditions": [
                 "the whole span contains no possible Japanese word, response, syllable, whisper, stutter, partial pronunciation, pronunciation tail, or dialogue",
@@ -451,11 +472,7 @@ def _prompt(
             "range_contract": "safe_outside_spans are sparse, sorted, non-overlapping, and use the current 0-based full-source timeline",
         }
     elif prompt_profile in SAFE_OUTSIDE_PROMPT_PROFILES:
-        payload = {
-            "source_id": str(row["source_id"]),
-            "duration_s": float(row["duration_s"]),
-            "coordinate_system": "0-based current full-source timeline in seconds",
-        }
+        payload = dict(base_payload)
     else:
         raise ValueError(f"unknown Scorer v11 teacher prompt profile: {prompt_profile}")
     if feedback:
@@ -476,8 +493,13 @@ def _spans(parsed: Mapping[str, Any], *, duration_s: float) -> tuple[list[dict[s
     for index, raw in enumerate(parsed.get("islands") or ()):
         if not isinstance(raw, Mapping):
             raise ValueError(f"island {index} is not an object")
-        start = float(raw.get("start_s")); end = float(raw.get("end_s"))
-        if not 0.0 <= start < end <= duration_s or start < previous_end:
+        start, end = parse_mmss_span(
+            raw,
+            field=f"island {index}",
+            duration_s=duration_s,
+        )
+        assert start is not None and end is not None
+        if start < previous_end:
             raise ValueError(
                 f"island {index} has invalid local-source coordinates: "
                 f"start_s={start}, end_s={end}, previous_end_s={previous_end}, "
@@ -491,8 +513,13 @@ def _spans(parsed: Mapping[str, Any], *, duration_s: float) -> tuple[list[dict[s
     for index, raw in enumerate(parsed.get("unsure_spans") or ()):
         if not isinstance(raw, Mapping):
             raise ValueError(f"unsure span {index} is not an object")
-        start = float(raw.get("start_s")); end = float(raw.get("end_s"))
-        if not 0.0 <= start < end <= duration_s or start < previous_end:
+        start, end = parse_mmss_span(
+            raw,
+            field=f"unsure span {index}",
+            duration_s=duration_s,
+        )
+        assert start is not None and end is not None
+        if start < previous_end:
             raise ValueError(
                 f"unsure span {index} has invalid local-source coordinates: "
                 f"start_s={start}, end_s={end}, previous_end_s={previous_end}, "
@@ -531,14 +558,12 @@ def _safe_outside_complement(
     for index, raw in enumerate(parsed.get("safe_outside_spans") or ()):
         if not isinstance(raw, Mapping):
             raise ValueError(f"safe outside span {index} is not an object")
-        start = float(raw.get("start_s"))
-        end = float(raw.get("end_s"))
-        if not 0.0 <= start < end <= duration_s:
-            raise ValueError(
-                f"safe outside span {index} has invalid local-source coordinates: "
-                f"start_s={start}, end_s={end}, required_range=0..{duration_s}; "
-                "use this 0-based audio clip timeline, never timestamps from the original video"
-            )
+        start, end = parse_mmss_span(
+            raw,
+            field=f"safe outside span {index}",
+            duration_s=duration_s,
+        )
+        assert start is not None and end is not None
         start_frame = 0 if start <= 0.0 else round(start / FRAME_HOP_S)
         end_frame = (
             frame_count
@@ -650,12 +675,17 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         prompt_file = Path(args.system_prompt_file).resolve()
         if not prompt_file.is_file():
             raise FileNotFoundError(prompt_file)
-        system_prompt = prompt_file.read_text(encoding="utf-8")
+        system_prompt = (
+            prompt_file.read_text(encoding="utf-8").rstrip()
+            + "\n\n"
+            + TIMESTAMP_PROMPT_CONTRACT_ZH
+        )
         prompt_source_file = str(prompt_file)
         prompt_source_sha256 = _sha256(prompt_file)
         prompt_version = (
             "candidate_island_scorer_v11_omni_preaudit_custom_"
             + prompt_source_sha256[:24]
+            + "_mmss_mmm"
         )
     else:
         raise ValueError(f"unknown Scorer v11 teacher prompt profile: {prompt_profile}")
@@ -676,7 +706,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     started = time.perf_counter()
     profile_name = env_file.name
     audio_content_mode = {"qwen": "input_audio", "gemini": "input_audio_raw"}[profile_name.lower()]
-    _write_progress(progress_path, {"schema": "candidate_island_scorer_v11_omni_progress_v1", "status": "running", "provider_profile": profile_name, "prompt_profile": prompt_profile, "prompt_version": prompt_version, "model": model, "completed": len(existing), "total": progress_total, "pending": len(pending), "elapsed_s": 0.0})
+    _write_progress(progress_path, {"schema": "candidate_island_scorer_v11_omni_progress_v1", "status": "running", "provider_profile": profile_name, "prompt_profile": prompt_profile, "prompt_version": prompt_version, "teacher_timestamp_contract_id": TIMESTAMP_CONTRACT_ID, "model": model, "completed": len(existing), "total": progress_total, "pending": len(pending), "elapsed_s": 0.0})
     for index, row in enumerate(pending, start=1):
         source_id = str(row["source_id"])
         audio = _resolve_audio(str(row["audio"]), manifest=manifest)
@@ -698,7 +728,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                     )
                 else:
                     islands, unsure = _spans(parsed, duration_s=float(row["duration_s"]))
-                label = {"schema": SCHEMA, "prompt_profile": prompt_profile, "prompt_version": prompt_version, "prompt_source_file": prompt_source_file, "prompt_source_sha256": prompt_source_sha256, "source_id": source_id, "partition": str(row.get("partition") or ""), "frame_count": int(row.get("frame_count") or 0), "frame_hop_s": FRAME_HOP_S, "audio": str(row["audio"]), "audio_sha256": str(row.get("audio_sha256") or _sha256(audio)), "model": model, "base_url_host": base_url.split("/", 3)[2] if "://" in base_url else base_url, "env_file_name": profile_name, "overall_confidence": _number(parsed.get("overall_confidence", 0.0), name="overall confidence"), "overall_reason": str(parsed.get("overall_reason") or ""), "islands": islands, "unsure_spans": unsure, "safe_outside_spans": safe_outside, "complement_semantics": "provisional_keep_not_confirmed_inside" if prompt_profile in SAFE_OUTSIDE_PROMPT_PROFILES else "not_applicable", "reviewed_full_source": False, "preaudit_provenance": f"omni:{model}", "human_review_required": True, "training_manifest_allowed": False, "attempts": attempt}
+                label = {"schema": SCHEMA, "prompt_profile": prompt_profile, "prompt_version": prompt_version, "teacher_timestamp_contract_id": TIMESTAMP_CONTRACT_ID, "prompt_source_file": prompt_source_file, "prompt_source_sha256": prompt_source_sha256, "source_id": source_id, "partition": str(row.get("partition") or ""), "frame_count": int(row.get("frame_count") or 0), "frame_hop_s": FRAME_HOP_S, "audio": str(row["audio"]), "audio_sha256": str(row.get("audio_sha256") or _sha256(audio)), "model": model, "base_url_host": base_url.split("/", 3)[2] if "://" in base_url else base_url, "env_file_name": profile_name, "overall_confidence": _number(parsed.get("overall_confidence", 0.0), name="overall confidence"), "overall_reason": str(parsed.get("overall_reason") or ""), "islands": islands, "unsure_spans": unsure, "safe_outside_spans": safe_outside, "complement_semantics": "provisional_keep_not_confirmed_inside" if prompt_profile in SAFE_OUTSIDE_PROMPT_PROFILES else "not_applicable", "reviewed_full_source": False, "preaudit_provenance": f"omni:{model}", "human_review_required": True, "training_manifest_allowed": False, "attempts": attempt}
                 with labels_path.open("a", encoding="utf-8") as handle:
                     handle.write(json.dumps(label, ensure_ascii=False, sort_keys=True) + "\n")
                 with raw_path.open("a", encoding="utf-8") as handle:
@@ -729,6 +759,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 "schema": SCHEMA,
                 "prompt_profile": prompt_profile,
                 "prompt_version": prompt_version,
+                "teacher_timestamp_contract_id": TIMESTAMP_CONTRACT_ID,
                 "source_id": source_id,
                 "partition": str(row.get("partition") or ""),
                 "frame_count": frame_count,
@@ -768,9 +799,9 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         if index < len(pending) and args.request_interval_s > 0:
             time.sleep(args.request_interval_s)
     result_rows = _rows(labels_path)
-    summary = {"schema": SUMMARY_SCHEMA, "prompt_profile": prompt_profile, "prompt_version": prompt_version, "prompt_source_file": prompt_source_file, "prompt_source_sha256": prompt_source_sha256, "model": model, "env_file_name": profile_name, "audio_content_mode": audio_content_mode, "base_url_host": base_url.split("/", 3)[2] if "://" in base_url else base_url, "manifest": str(manifest), "manifest_sha256": _sha256(manifest), "source_count": len(result_rows), "labeled_count": len(result_rows), "manual_review_required": True, "training_manifest_allowed": False, "labels": str(labels_path), "raw_responses": str(raw_path)}
+    summary = {"schema": SUMMARY_SCHEMA, "prompt_profile": prompt_profile, "prompt_version": prompt_version, "teacher_timestamp_contract_id": TIMESTAMP_CONTRACT_ID, "prompt_source_file": prompt_source_file, "prompt_source_sha256": prompt_source_sha256, "model": model, "env_file_name": profile_name, "audio_content_mode": audio_content_mode, "base_url_host": base_url.split("/", 3)[2] if "://" in base_url else base_url, "manifest": str(manifest), "manifest_sha256": _sha256(manifest), "source_count": len(result_rows), "labeled_count": len(result_rows), "manual_review_required": True, "training_manifest_allowed": False, "labels": str(labels_path), "raw_responses": str(raw_path)}
     (output / "summary.json").write_text(json.dumps(summary, ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-    _write_progress(progress_path, {"schema": "candidate_island_scorer_v11_omni_progress_v1", "status": "completed", "provider_profile": profile_name, "prompt_profile": prompt_profile, "prompt_version": prompt_version, "model": model, "completed": len(result_rows), "total": progress_total, "pending": max(0, progress_total - len(result_rows)), "elapsed_s": round(time.perf_counter() - started, 3), "summary": str(output / "summary.json")})
+    _write_progress(progress_path, {"schema": "candidate_island_scorer_v11_omni_progress_v1", "status": "completed", "provider_profile": profile_name, "prompt_profile": prompt_profile, "prompt_version": prompt_version, "teacher_timestamp_contract_id": TIMESTAMP_CONTRACT_ID, "model": model, "completed": len(result_rows), "total": progress_total, "pending": max(0, progress_total - len(result_rows)), "elapsed_s": round(time.perf_counter() - started, 3), "summary": str(output / "summary.json")})
     return summary
 
 

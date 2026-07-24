@@ -6,9 +6,28 @@ from dataclasses import dataclass
 import html
 from itertools import product
 
+from tools.omni.timestamp_contract import format_mmss_timestamp
+
+
+def format_audit_timestamp(seconds: float) -> str:
+    """Format audit labels with the same precision as the teacher wire contract."""
+
+    return format_mmss_timestamp(seconds)
+
 
 AUDIO_SPAN_PLAYER_JS = r"""
 let activeAudio=null,activeButton=null,stopFn=null,playToken=0;
+function formatAuditTimestamp(value){
+  const numeric=Number(value);
+  if(!Number.isFinite(numeric)||numeric<0)return '--:--.---';
+  const totalMilliseconds=Math.round(numeric*1000);
+  const milliseconds=totalMilliseconds%1000;
+  const totalSeconds=Math.floor(totalMilliseconds/1000);
+  const seconds=totalSeconds%60;
+  const minutes=Math.floor(totalSeconds/60);
+  return `${String(minutes).padStart(2,'0')}:${String(seconds).padStart(2,'0')}.${String(milliseconds).padStart(3,'0')}`;
+}
+function formatAuditSpan(start,end){return `${formatAuditTimestamp(start)}–${formatAuditTimestamp(end)}`;}
 function stop(){
   playToken+=1;
   if(activeAudio&&stopFn)activeAudio.removeEventListener('timeupdate',stopFn);
@@ -37,7 +56,7 @@ async function play(audio,button,start,end){
   activeButton=button;
   button.classList.add('playing');
   const status=document.getElementById('status');
-  status.textContent=`加载 ${start.toFixed(2)}–${end.toFixed(2)}s…`;
+  status.textContent=`加载 ${formatAuditSpan(start,end)}…`;
   try{
     await waitForMetadata(audio);
     if(token!==playToken)return;
@@ -47,14 +66,14 @@ async function play(audio,button,start,end){
     audio.currentTime=safeStart;
     stopFn=()=>{
       if(token===playToken&&audio.currentTime>=safeEnd-.005){
-        status.textContent=`已停止 ${safeStart.toFixed(2)}–${safeEnd.toFixed(2)}s`;
+        status.textContent=`已停止 ${formatAuditSpan(safeStart,safeEnd)}`;
         stop();
       }
     };
     audio.addEventListener('timeupdate',stopFn);
     await audio.play();
     if(token!==playToken){audio.pause();return;}
-    status.textContent=`播放 ${safeStart.toFixed(2)}–${safeEnd.toFixed(2)}s`;
+    status.textContent=`播放 ${formatAuditSpan(safeStart,safeEnd)}`;
   }catch(error){
     if(token!==playToken)return;
     status.textContent=`播放失败：${error&&error.message?error.message:String(error)}`;
@@ -76,8 +95,8 @@ function appendAuditSpanLane(config){
     button.className=`audit-span ${typeof config.className==='function'?config.className(span):config.className||''}`;
     button.style.left=`${100*start/config.durationS}%`;
     button.style.width=`${Math.max(.12,100*(end-start)/config.durationS)}%`;
-    button.title=config.title?config.title(span,start,end):`${config.label} ${start.toFixed(2)}–${end.toFixed(2)}s`;
-    button.textContent=config.text?config.text(span,start,end):`${start.toFixed(2)}–${end.toFixed(2)}s`;
+    button.title=config.title?config.title(span,start,end):`${config.label} ${formatAuditSpan(start,end)}`;
+    button.textContent=config.text?config.text(span,start,end):formatAuditSpan(start,end);
     button.onclick=()=>play(config.audio,button,start,end);
     track.appendChild(button);
   }
@@ -93,7 +112,7 @@ function appendAuditClipButtons(config){
     const button=document.createElement('button');
     button.type='button';
     button.className=`audit-clip-button ${config.className||''}`;
-    button.textContent=`${Number(span.start_s).toFixed(2)}–${Number(span.end_s).toFixed(2)}s`;
+    button.textContent=formatAuditSpan(span.start_s,span.end_s);
     button.onclick=()=>play(config.audio,button,Number(span.start_s),Number(span.end_s));
     row.appendChild(button);
   }

@@ -6,7 +6,7 @@ ACOUSTIC_SPLIT_TEACHER_SELECTION_SCHEMA = (
 )
 ACOUSTIC_SPLIT_TEACHER_LABEL_SCHEMA = "acoustic_split_canonical_teacher_label_v1"
 ACOUSTIC_SPLIT_TEACHER_PROMPT_VERSION = (
-    "acoustic_split_binary_event_teacher_centered_clip_v1"
+    "acoustic_split_binary_event_teacher_centered_clip_v2_mmss_mmm"
 )
 ACOUSTIC_SPLIT_TEACHER_SUMMARY_SCHEMA = "acoustic_split_canonical_teacher_summary_v1"
 ACOUSTIC_SPLIT_TEACHER_RETRY_SCHEMA = "acoustic_split_canonical_retry_candidate_v1"

@@ -44,16 +44,16 @@ def _response() -> dict:
             {
                 "unit_id": "u00",
                 "status": "matched",
-                "start_s": 0.1,
-                "end_s": 1.7,
+                "start_ts": "00:00.100",
+                "end_ts": "00:01.700",
                 "confidence": 0.95,
                 "reason": "清楚",
             },
             {
                 "unit_id": "u01",
                 "status": "matched",
-                "start_s": 2.0,
-                "end_s": 7.5,
+                "start_ts": "00:02.000",
+                "end_ts": "00:07.500",
                 "confidence": 0.94,
                 "reason": "清楚",
             },
@@ -69,7 +69,10 @@ def test_prompt_builds_reusable_training_contract() -> None:
     assert "昨年の外部生の受け入れに続き、" in teacher.SYSTEM_PROMPT
     assert "不是最终 Split cut" in teacher.SYSTEM_PROMPT
     assert "不会直接当作 CueQC drop 或 Inner safe" in teacher.SYSTEM_PROMPT
+    assert "MM:SS.mmm" in teacher.SYSTEM_PROMPT
     prompt = json.loads(teacher.build_prompt(_sample()))
+    assert prompt["duration_ts"] == "00:08.000"
+    assert "duration_s" not in prompt
     assert prompt["task_order"] == [
         "segment_reference_text_into_minimal_complete_semantic_units",
         "align_each_semantic_unit_to_full_audio",
@@ -123,7 +126,7 @@ def test_adjacent_semantic_units_derive_distinct_model_views() -> None:
 
 def test_overlap_stays_semantic_event_but_routes_inner_to_abstain() -> None:
     response = _response()
-    response["semantic_alignments"][1]["start_s"] = 1.5
+    response["semantic_alignments"][1]["start_ts"] = "00:01.500"
     validated = teacher.validate_response(response, _sample())
 
     assert validated["semantic_events"][0]["overlap"] is True
@@ -134,7 +137,7 @@ def test_overlap_stays_semantic_event_but_routes_inner_to_abstain() -> None:
 def test_unsure_alignment_disables_complement_negative_labels() -> None:
     response = _response()
     response["semantic_alignments"][1].update(
-        {"status": "unsure", "start_s": None, "end_s": None}
+        {"status": "unsure", "start_ts": None, "end_ts": None}
     )
     validated = teacher.validate_response(response, _sample())
 

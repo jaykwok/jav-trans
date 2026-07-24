@@ -551,7 +551,7 @@ def test_v11_canonical_accepts_calibrated_dual_evidence_train_truth(
         [
             {
                 "schema": (
-                    "candidate_island_scorer_v11_real_train_dual_evidence_source_v1"
+                        "candidate_island_scorer_v11_real_train_dual_evidence_source_v2"
                 ),
                 "boundary_serialization_contract_id": (
                     ACOUSTIC_BINARY_V12_CONTRACT.contract_id

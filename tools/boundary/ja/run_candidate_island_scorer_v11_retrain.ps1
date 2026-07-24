@@ -2,10 +2,11 @@ param(
     [ValidateSet('prepare', 'extract', 'features', 'smoke', 'full', 'gate', 'all')]
     [string]$Stage = 'prepare',
     [string]$RunRoot = '',
-    [string]$AuditDir = 'agents/audits/20260722_213831_scorer-v11-train-real-source-gemini-v5-editable25',
-    [string]$DualEvidenceDir = 'agents/temp/20260723_181824_scorer-v11-dual-evidence-train25',
-    [string]$CalibrationDir = 'agents/audits/20260723_124959_scorer-v11-dual-evidence-protect-v2-heldout12',
-    [string]$CalibrationTeacherDir = 'agents/temp/20260723_124411_scorer-v11-dual-evidence-protect-v2-heldout12',
+    [string]$TrainSourceManifest = 'agents/temp/20260722_193000_scorer-v11-train-real-source-teacher-manifest/train_teacher_sources.jsonl',
+    [string]$DualEvidenceDir = 'agents/temp/20260724_132335_scorer-v11-gemini36flash-medium-train20',
+    [string]$CalibrationDir = 'agents/audits/20260724_130302_scorer-v11-gemini36flash-medium-heldout12-retention95',
+    [string]$CalibrationTeacherDir = 'agents/temp/20260724_123633_scorer-v11-gemini36flash-medium-heldout12',
+    [string]$CalibrationAbDir = 'agents/audits/20260724_125131_scorer-v11-gemini36flash-medium-vs-high-heldout12',
     [string]$DownstreamIsolationSummary = 'agents/audits/20260723_172940_scorer-v11-downstream-isolation-required6/summary.json',
     [string]$BaseCanonicalSummary = 'agents/temp/20260722_183600_scorer-v11-no-tile-real-outside-canonical-final/summary.json',
     [string]$PriorRawFeatureManifest = 'agents/temp/20260722_184400_scorer-v11-no-tile-raw-features-full/raw_feature_manifest.jsonl',
@@ -63,13 +64,12 @@ function Require-State {
 }
 
 function Invoke-Prepare {
-    $auditSummary = Join-Path $AuditDir 'summary.json'
-    $auditManifest = Join-Path $AuditDir 'audit_manifest.jsonl'
     $dualEvidenceSummary = Join-Path $DualEvidenceDir 'summary.json'
     $dualEvidencePreaudit = Join-Path $DualEvidenceDir 'preaudit.jsonl'
     $calibrationSummary = Join-Path $CalibrationDir 'summary.json'
-    $calibrationGapVerdicts = Join-Path $CalibrationDir 'manual_verdicts.jsonl'
     $calibrationTeacherSummary = Join-Path $CalibrationTeacherDir 'summary.json'
+    $calibrationAbSummary = Join-Path $CalibrationAbDir 'summary.json'
+    $calibrationAbVerdicts = Join-Path $CalibrationAbDir 'manual_verdicts.jsonl'
     $isolation = Read-Json -Path $DownstreamIsolationSummary
     if (
         $isolation.boundary_serialization_contract_id -ne 'boundary_acoustic_binary_v12' -or
@@ -95,25 +95,36 @@ function Invoke-Prepare {
         }
     }
 
-    $dualEvidenceCompileDir = Join-Path $RunRoot '01-real-train-dual-evidence'
-    $canonicalDir = Join-Path $RunRoot '02-canonical'
-    $rebindDir = Join-Path $RunRoot '03-raw-rebind'
+    $selectionDir = Join-Path $RunRoot '01-dual-evidence-selection'
+    $dualEvidenceCompileDir = Join-Path $RunRoot '02-real-train-dual-evidence'
+    $canonicalDir = Join-Path $RunRoot '03-canonical'
+    $rebindDir = Join-Path $RunRoot '04-raw-rebind'
     Invoke-UvPython @(
-        'tools/boundary/ja/compile_candidate_island_scorer_v11_real_train_dual_evidence.py',
-        '--audit-summary', $auditSummary,
-        '--audit-manifest', $auditManifest,
+        'tools/boundary/ja/select_candidate_island_scorer_v11_dual_evidence_train.py',
+        '--source-manifest', $TrainSourceManifest,
+        '--outside-sources', [string]$base.real_train_outside_sources,
         '--teacher-summary', $dualEvidenceSummary,
         '--teacher-preaudit', $dualEvidencePreaudit,
+        '--output-dir', $selectionDir
+    )
+    $selection = Read-Json -Path (Join-Path $selectionDir 'summary.json')
+    Invoke-UvPython @(
+        'tools/boundary/ja/compile_candidate_island_scorer_v11_real_train_dual_evidence.py',
+        '--audit-summary', (Join-Path $selectionDir 'summary.json'),
+        '--audit-manifest', (Join-Path $selectionDir 'audit_manifest.jsonl'),
+        '--teacher-summary', (Join-Path $selectionDir 'selected_teacher_summary.json'),
+        '--teacher-preaudit', (Join-Path $selectionDir 'selected_preaudit.jsonl'),
         '--calibration-summary', $calibrationSummary,
         '--calibration-teacher-summary', $calibrationTeacherSummary,
-        '--calibration-gap-verdicts', $calibrationGapVerdicts,
+        '--calibration-ab-summary', $calibrationAbSummary,
+        '--calibration-ab-verdicts', $calibrationAbVerdicts,
         '--output-dir', $dualEvidenceCompileDir
     )
     $dualEvidenceSources = Join-Path $dualEvidenceCompileDir 'real_train_dual_evidence_sources.jsonl'
     Invoke-UvPython @(
         'tools/boundary/ja/compile_candidate_island_scorer_v11_canonical.py',
         '--synthetic-train-sources', [string]$base.synthetic_train_sources,
-        '--real-train-outside-sources', [string]$base.real_train_outside_sources,
+        '--real-train-outside-sources', [string]$selection.remaining_outside_sources,
         '--real-train-dual-evidence-sources', $dualEvidenceSources,
         '--source-windows', [string]$base.source_windows,
         '--partition-manifest', [string]$base.partition_manifest,
@@ -153,14 +164,16 @@ function Invoke-Prepare {
         preextract_raw_feature_manifest = $preextractRawFeatureManifestFull
         downstream_isolation_summary = [System.IO.Path]::GetFullPath((Join-Path $ProjectRoot $DownstreamIsolationSummary))
         heldout_responsibility_verdicts = [System.IO.Path]::GetFullPath((Join-Path $ProjectRoot $heldoutResponsibilityVerdicts))
+        dual_evidence_selection_summary = [System.IO.Path]::GetFullPath((Join-Path $selectionDir 'summary.json'))
         dual_evidence_summary = [System.IO.Path]::GetFullPath((Join-Path $ProjectRoot $dualEvidenceSummary))
         dual_evidence_preaudit = [System.IO.Path]::GetFullPath((Join-Path $ProjectRoot $dualEvidencePreaudit))
         calibration_summary = [System.IO.Path]::GetFullPath((Join-Path $ProjectRoot $calibrationSummary))
-        calibration_gap_verdicts = [System.IO.Path]::GetFullPath((Join-Path $ProjectRoot $calibrationGapVerdicts))
-        features_dir = (Join-Path $RunRoot '05-features')
-        smoke_dir = (Join-Path $RunRoot '06-smoke')
-        full_dir = (Join-Path $RunRoot '07-full')
-        gate_dir = (Join-Path $RunRoot '08-gate')
+        calibration_ab_summary = [System.IO.Path]::GetFullPath((Join-Path $ProjectRoot $calibrationAbSummary))
+        calibration_ab_verdicts = [System.IO.Path]::GetFullPath((Join-Path $ProjectRoot $calibrationAbVerdicts))
+        features_dir = (Join-Path $RunRoot '06-features')
+        smoke_dir = (Join-Path $RunRoot '07-smoke')
+        full_dir = (Join-Path $RunRoot '08-full')
+        gate_dir = (Join-Path $RunRoot '09-gate')
     }
 }
 
@@ -184,7 +197,7 @@ function Invoke-Extract {
     if ([int]$rebindSummary.unresolved_source_count -le 0) {
         throw 'Raw feature rebind is incomplete but reports no unresolved sources.'
     }
-    $newRawDir = Join-Path $RunRoot '04-raw-new'
+    $newRawDir = Join-Path $RunRoot '05-raw-new'
     Invoke-UvPython @(
         'tools/boundary/ja/extract_candidate_island_scorer_v11_raw_features.py',
         '--canonical-sources', [string]$rebindSummary.unresolved_canonical_sources,

@@ -46,8 +46,8 @@ def _response() -> dict:
             {
                 "unit_id": "u01",
                 "status": "matched",
-                "start_s": 2.1,
-                "end_s": 2.6,
+                "start_ts": "00:02.100",
+                "end_ts": "00:02.600",
                 "confidence": 0.94,
                 "reason": "清楚可辨",
             }
@@ -69,7 +69,10 @@ def test_prompt_runs_two_stages_in_one_request() -> None:
     assert "绝不向两侧扩张吸收亲吻声" in teacher.SYSTEM_PROMPT
     assert "不得使用固定秒数 margin" in teacher.SYSTEM_PROMPT
     assert "不要输出最终 Split cut" in teacher.SYSTEM_PROMPT
+    assert "MM:SS.mmm" in teacher.SYSTEM_PROMPT
     prompt = json.loads(teacher.build_prompt(_sample()))
+    assert prompt["duration_ts"] == "00:03.000"
+    assert "duration_s" not in prompt
     assert prompt["reference_text"] == "んちゅぷ…好き"
     assert prompt["task_order"] == [
         "split_reference_text_by_semantic_kind",
@@ -168,16 +171,16 @@ def test_validation_rejects_overlapping_semantic_alignments() -> None:
         {
             "unit_id": "u00",
             "status": "matched",
-            "start_s": 1.0,
-            "end_s": 1.8,
+            "start_ts": "00:01.000",
+            "end_ts": "00:01.800",
             "confidence": 0.9,
             "reason": "word",
         },
         {
             "unit_id": "u02",
             "status": "matched",
-            "start_s": 1.7,
-            "end_s": 2.2,
+            "start_ts": "00:01.700",
+            "end_ts": "00:02.200",
             "confidence": 0.9,
             "reason": "word",
         },
@@ -216,16 +219,16 @@ def test_membership_envelope_only_bridges_internal_semantic_gaps() -> None:
         {
             "unit_id": "u00",
             "status": "matched",
-            "start_s": 1.0,
-            "end_s": 1.8,
+            "start_ts": "00:01.000",
+            "end_ts": "00:01.800",
             "confidence": 0.9,
             "reason": "word",
         },
         {
             "unit_id": "u02",
             "status": "matched",
-            "start_s": 2.0,
-            "end_s": 2.2,
+            "start_ts": "00:02.000",
+            "end_ts": "00:02.200",
             "confidence": 0.8,
             "reason": "word",
         },
@@ -286,8 +289,8 @@ def test_unsure_semantic_alignment_abstains_membership() -> None:
     response["semantic_alignments"][0].update(
         {
             "status": "unsure",
-            "start_s": None,
-            "end_s": None,
+            "start_ts": None,
+            "end_ts": None,
             "confidence": 0.6,
         }
     )

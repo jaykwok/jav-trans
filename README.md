@@ -113,7 +113,7 @@ Web 会在模型要求检查中提示驱动过旧或 CUDA 初始化失败。
   -> Shared Qwen feature extraction
      - Qwen ASR repo 对应的 frozen PTM/encoder frame features
      - MFCC / timing numeric features
-  -> Candidate-island Scorer v11（1.7B，待真实数据训练与人工 gate）
+  -> Candidate-island Scorer v11（1.7B，最新 mixed-source 重训未过 gate，registry 仍为空）
      - 主臂：raw PTM2048 -> checkpoint 内 Linear(2048->2048)+GELU
      - 与 normalized MFCC40 拼接后 Linear(2088->256)
      - valid-prefix bidirectional Mamba2(hidden=256) -> Linear(2) -> softmax argmax
@@ -179,7 +179,9 @@ src/checkpoints/
 
 1.7B 的目标 Boundary pipeline 统一使用合同 `boundary_acoustic_binary_v12`：Scorer v11 → Proposal v1 → Outer v3 → Acoustic Split v4 → provisional sub-islands → CueQC v13 → Inner v2 acoustic core → Chunk/ASR。Outer v3 必须等实际 post-Scorer-v11 输出分布训练并通过人工 gate 后才可注册；模型缺失、repo 不匹配、合同不兼容或选择 0.6B 都会直接报错，不提供规则 fallback 或静默迁移。实验指标与版本决策见 [docs/HISTORY.md](docs/HISTORY.md)。
 
-当前训练数据状态：1.7B Scorer v11 已把固定 25 条真实 train full-source 改为校准后的 Gemini Protect×Remove 双独立证据监督；Protect-only=`inside_candidate`、Remove-only=`outside_candidate`，两路冲突或均无证据=`unsure→-100`，绝不使用补集补标签。严格 compiler 绑定 Gemini 模型/提示词、25 条 source/audio/frame SHA，以及固定 12 条 held-out calibration（Protect recall=`95.28%`、final outside precision=`100%`、真语音 outside=`0`）和 23/23 人工 background-gap verdict；当前 25 条为 `inside 65358 / outside 1476 / unsure 27178`、failed-closed=`0`，明确记录为 calibrated Teacher supervision，不伪称逐条人工真值。合并 canonical 为 `1195 sources`（train/val/test=`1171/10/14`），frame=`inside 593837 / outside 117891 / unsure 92748`；6 条“内部独立背景、需要下游隔离”仍保持 Scorer `unsure=-100`，等待 Proposal/Split/CueQC 同源 replay。raw PTM2048+MFCC40、1501 个 signed overlap-save windows 和 CUDA smoke 均已通过执行合同。正式 P2048/H256 随机初始化训练在 epoch 6 早停并恢复 epoch 3，但 val/test inside/outside recall 仅为 `99.24/9.10%` 与 `99.64/13.83%`：语音保护明显增强，背景删除严重不足，数值 gate 失败，checkpoint 固定 `promotion_allowed=false`，registry 仍为空。完整 source replay 进一步定位为监督拓扑失配：真实 train full-source 只有 `8/45` 同时含 inside/outside，held-out 为 `22/24`；25 条 calibrated source 中 `17` 条没有 outside，outside definite fraction 中位数为 `0`。因此下一步必须先重建同一真实 source 内的 mixed 监督，不能用 runtime threshold、Focal、class weight 或延长训练掩盖；人工 zero-clipping/zero-true-speech-deletion 仍不能被数值指标替代。0.6B 未修改。完整证据见 [Scorer v11 calibrated full-source gate](docs/audits/20260723_scorer-v11-calibrated-full-source-gate-v1.md)、[1.7B Boundary 训练数据生成链职责审计](docs/audits/20260722_boundary-training-data-generation-audit-v1.md) 与 [Scorer downstream isolation responsibility audit](docs/audits/20260723_scorer-v11-downstream-isolation-required6.md)。
+当前训练数据状态：1.7B Scorer v11 使用 Gemini 3.6 Flash Medium 对固定 20 条真实 train source 分别执行 Protect/Remove 双独立 Teacher；Protect-only=`inside_candidate`、Remove-only=`outside_candidate`，冲突或均无证据=`unsure→-100`，绝不使用补集。确定性 adapter 每个 video 只选一条，优先 mixed、再按两类平衡、监督覆盖、冲突率和 source_id 排序；12 条被选 source 替换旧 outside-only 行，剩余 8 条保留，因此没有重复 source。训练 compiler 绑定同一 12 条 held-out 的 95% gate 与 Medium-vs-High 人工 A/B（Medium 胜 `9:3`）；bridge-gap 只作 Proposal/Split/CueQC 下游隔离诊断，不再作为 Scorer 标签或训练解锁条件。
+
+当前 canonical=`1170 sources`（train/val/test=`1146/10/14`），frame=`inside 554039 / outside 122466 / unsure 33959`；raw PTM2048 全量 SHA 重用并编译为 `1376` 个 signed windows。P2048/H256、随机初始化、plain two-logit CE、class weight=`1/1` 的正式训练在 epoch 16 早停并恢复 epoch 13，checkpoint SHA=`bcba961b...ddcc521`；val inside/outside recall=`96.50/28.80%`，test=`96.85/46.88%`。完整真语音 run 没有整段删除，但 start coverage 与 continuity 未过 95% gate，局部真语音帧仍有误删，所以 `promotion_allowed=false`、registry 仍为空，checkpoint 仅作离线审计。结果支持 mixed-source 方向，但真实安全 outside 多样性仍不足；不得用 runtime threshold、Focal、class weight 或规则 fallback 掩盖。0.6B 未修改。完整证据见 [Scorer v11 calibrated full-source gate](docs/audits/20260723_scorer-v11-calibrated-full-source-gate-v1.md)、[1.7B Boundary 训练数据生成链职责审计](docs/audits/20260722_boundary-training-data-generation-audit-v1.md) 与 [Scorer downstream isolation responsibility audit](docs/audits/20260723_scorer-v11-downstream-isolation-required6.md)。
 
 Split v4 当前唯一合法训练数据合同是
 `acoustic_split_v4_sequence_dataset_summary_v1`：raw PTM2048 + MFCC40（frame
@@ -208,6 +210,15 @@ feature/metadata 导出，因此准备器会明确 fail-closed；任何 pending 
 Gemini，只有明确要求时使用 Qwen。常用键为 `OMNI_MODEL`、
 `OMNI_API_KEY` 和 `OMNI_BASE_URL`。新增 provider 时应先在源码中加入明确
 profile 与请求体映射，不接受任意 env 文件名静默猜测协议。
+Gemini（OpenRouter）数据标注请求默认使用 `reasoning.effort=medium`、默认
+`max_tokens=8192` 和 `input_audio_raw`，默认不设置 `reasoning.exclude`
+（需要隐藏思考文本时用 `--exclude-reasoning`）；`high` 只用于显式受控
+A/B，不作为 canonical 数据标注默认值。Qwen 使用
+`enable_thinking/thinking_budget`、默认 `max_tokens=2048` 和
+`input_audio`。两者均不显式发送 temperature、top-p 或 top-k。任何要求 Teacher 生成时间坐标的工具统一使用
+`omni_audio_timestamp_mmss_mmm_v1`：wire 字段为严格字符串
+`start_ts/end_ts/time_ts`（`MM:SS.mmm`），旧数字秒响应直接拒绝；本地严格
+解析后，训练与审计 manifest 内部仍可保存数值 `start_s/end_s/time_s`。
 - 代理协议 / 地址 / 端口（可选，用于模型下载和 HTTP 请求）
 
 ASR 显存自适应默认值已经内置。当前完整工作流固定使用 `1.7B`；batch 或显存预算可通过“参数调优”里的环境变量覆盖，或手动编辑首次保存后生成的 `.env`。
@@ -365,8 +376,11 @@ uv run python -m <module> --help
 - `tools.workflows.run_full_workflow`：命令行完整工作流 smoke。
 - `tools.web.smoke.start_server` / `submit_job` / `poll_job` / `summarize_job`：Web 服务 smoke 和任务汇总。
 - `tools.audits.audit_nav` / `serve_audits.ps1`：审计页导航与 Windows 本地服务。
-- `tools.audits.review_page_core` / `audit_prompt`：人工审计页共享 Core（区间播放器、状态、完成度、保存 API）与可复用提示配置；任务特有布局、证据和完备 verdict 组合由 Adapter 提供。设计合同见 [Human Audit Page Core](docs/audits/20260723_human-audit-page-core-v1.md)。
+- `tools.audits.review_page_core` / `audit_prompt`：人工审计页共享 Core（`MM:SS.mmm` 区间显示与播放器、状态、完成度、保存 API）与可复用提示配置；任务特有布局、证据和完备 verdict 组合由 Adapter 提供。设计合同见 [Human Audit Page Core](docs/audits/20260723_human-audit-page-core-v1.md)。
+- `tools.omni.timestamp_contract`：所有区间 Teacher 的严格 `MM:SS.mmm` wire schema、格式化、解析和 source-bound 校验；不提供数字秒兼容或时间猜测。
+- `tools.omni.run_audio_teacher`：按 `--env-file gemini|qwen` 选择已知请求合同的通用音频 Teacher transport，支持 `--prompt/--prompt-file` 与 `--folder/--file/--manifest`，只保存可恢复的预审结果，不直接生成训练真值。
 - `tools.audits.generate_candidate_island_dual_evidence_review`：Scorer Protect×Remove 与人工 full-source truth 的三轴 bridge-gap Adapter。
+- `tools.audits.generate_candidate_island_dual_evidence_ab_review`：在两个已规范化 Scorer dual-evidence review 上复用同一 Core 的 High/Medium A/B Adapter；比较人工真语音保留、outside precision、监督覆盖与逐帧差异。
 - `tools.boundary.ja.audit_candidate_island_scorer_v11_supervision_distribution`：Scorer v11 canonical 的逐 source 标签拓扑与真实 train↔held-out mixed 监督分布审计；只输出诊断证据，不生成训练标签。
 - `tools.audits.generate_pre_asr_v13_false_drop_audit_html`：CueQC v13 false-drop Adapter。
 - `tools.audits.generate_split_v4_missing_cut_candidate_audit_html` / `generate_acoustic_split_canonical_candidate_audit_html`：Split v4 missing-cut 与 canonical candidate Adapter。现役/退役清单见 [人工审计 Adapter inventory](docs/audits/20260723_human-audit-adapter-inventory-v1.md)。

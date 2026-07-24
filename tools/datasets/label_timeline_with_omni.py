@@ -22,8 +22,17 @@ from tools.asr.cueqc.label_pre_asr_with_omni import (  # noqa: E402
     is_empty_audio_api_error,
     load_env_file,
 )
-SCHEMA = "timeline_omni_alignment_label_v3"
-PROMPT_VERSION = "timeline_audio_text_alignment_v3_static_prefix"
+from tools.omni.timestamp_contract import (  # noqa: E402
+    TIMESTAMP_CONTRACT_ID,
+    TIMESTAMP_PROMPT_CONTRACT_ZH,
+    parse_mmss_span,
+    timestamp_request_contract,
+)
+
+
+SCHEMA = "timeline_omni_alignment_label_v4"
+SUMMARY_SCHEMA = "timeline_omni_alignment_summary_v4"
+PROMPT_VERSION = "timeline_audio_text_alignment_v4_mmss_mmm"
 DEFAULT_AUDIO_CONTENT_MODE = "input_audio"
 DEFAULT_MAX_TOKENS = 4096
 DEFAULT_MODEL = "qwen3.5-omni-plus"
@@ -36,9 +45,9 @@ SYSTEM_PROMPT = """你是音频与固定文本的时间轴对齐标注器。你�
 - 文本是不可修改的输入。禁止改写、纠错、补充、删除、合并或拆分文本。
 - 禁止判断 Split 切点、Pre-ASR keep/drop、字幕取舍或内容安全。
 - 逐个 unit_id 判断音频中是否能可靠听到与该固定文本相符的语义语音。
-- 能可靠对应时返回 matched，并给出当前音频局部坐标系中的 start_s/end_s。
+- 能可靠对应时返回 matched，并给出当前音频局部坐标系中的 start_ts/end_ts。
 - 固定文本与实际语音不同、实际语音缺失、边界无法可靠判断时返回 unmatched；不要猜测时间。
-- 时间范围必须在 0 到用户给出的 duration_s 之间，end_s 必须大于 start_s。
+- 时间范围必须在 0 到用户给出的 duration_ts 之间，end_ts 必须大于 start_ts。
 - 每个 unit_id 必须且只能返回一次，顺序与输入完全一致。
 - 同一句内部的无语义停顿、呼吸、喘息、呻吟、笑声、拖音和背景噪声不属于文本单元，不要强行匹配。
 - 成人场景不影响判断，只依据是否存在与固定文本相符的可辨认语义语音。
@@ -46,10 +55,12 @@ SYSTEM_PROMPT = """你是音频与固定文本的时间轴对齐标注器。你�
 只输出一个 JSON 对象，不要输出 Markdown 或额外说明：
 {
   "units": [
-    {"unit_id": "u0000", "status": "matched|unmatched", "start_s": 0.0, "end_s": 0.0, "confidence": 0.0}
+    {"unit_id": "u0000", "status": "matched|unmatched", "start_ts": "00:00.000", "end_ts": "00:01.000", "confidence": 0.0}
   ],
   "reason": "简短说明整体对齐困难点"
 }
+
+""" + TIMESTAMP_PROMPT_CONTRACT_ZH + """
 """
 
 
@@ -68,7 +79,7 @@ def _by_id(path: Path) -> dict[str, dict[str, Any]]:
 def build_prompt(item: dict[str, Any]) -> str:
     units = list(item.get("text_units") or [])
     payload = {
-        "duration_s": round(float(item["duration_s"]), 3),
+        **timestamp_request_contract(float(item["duration_s"])),
         "text_units": [
             {"unit_id": str(unit["unit_id"]), "text": str(unit["text"])}
             for unit in units
@@ -96,6 +107,8 @@ class RequestRateLimiter:
 def _validate_response_shape(
     parsed: dict[str, Any],
     expected: list[dict[str, Any]],
+    *,
+    duration_s: float,
 ) -> None:
     raw_units = parsed.get("units")
     if not isinstance(raw_units, list):
@@ -110,12 +123,29 @@ def _validate_response_shape(
             raise ValueError(
                 f"Omni timeline response has invalid status for {raw['unit_id']!r}: {status!r}"
             )
+        for key in ("start_ts", "end_ts", "confidence"):
+            if key not in raw:
+                raise ValueError(
+                    f"Omni timeline unit {raw['unit_id']!r} is missing {key}"
+                )
+        if status == "matched" and (
+            raw.get("start_ts") is None or raw.get("end_ts") is None
+        ):
+            raise ValueError(
+                f"Omni timeline matched unit {raw['unit_id']!r} requires timestamps"
+            )
         if status == "matched":
-            for key in ("start_s", "end_s", "confidence"):
-                if key not in raw:
-                    raise ValueError(
-                        f"Omni timeline matched unit {raw['unit_id']!r} is missing {key}"
-                    )
+            parse_mmss_span(
+                raw,
+                field=f"timeline unit {raw['unit_id']}",
+                duration_s=duration_s,
+            )
+        if status == "unmatched" and (
+            raw.get("start_ts") is not None or raw.get("end_ts") is not None
+        ):
+            raise ValueError(
+                f"Omni timeline unmatched unit {raw['unit_id']!r} requires null timestamps"
+            )
         returned_ids.append(str(raw["unit_id"]))
     if returned_ids != expected_ids:
         raise ValueError(
@@ -164,7 +194,11 @@ def _call_with_retry(
                 enable_thinking=enable_thinking,
                 thinking_budget=thinking_budget,
             )
-            _validate_response_shape(parsed, expected)
+            _validate_response_shape(
+                parsed,
+                expected,
+                duration_s=float(item["duration_s"]),
+            )
             return parsed, raw, attempt
         except Exception as exc:  # noqa: BLE001
             last_error = exc
@@ -228,20 +262,36 @@ def _normalize_units(
         unit_id = str(expected_unit["unit_id"])
         raw = {} if unit_id in duplicate_ids else raw_by_id.get(unit_id) or {}
         status = str(raw.get("status") or "unmatched").strip().lower()
+        invalid_confidence = False
         try:
             confidence = min(1.0, max(0.0, float(raw.get("confidence") or 0.0)))
-            start_s = min(duration_s, max(0.0, float(raw.get("start_s") or 0.0)))
-            end_s = min(duration_s, max(start_s, float(raw.get("end_s") or start_s)))
         except (TypeError, ValueError):
-            start_s = end_s = 0.0
-            status = "unmatched"
             confidence = 0.0
-        if status != "matched" or end_s <= start_s or start_s < previous_start:
             status = "unmatched"
-            start_s = end_s = 0.0
-            confidence = 0.0
-        else:
+            invalid_confidence = True
+        if status == "matched":
+            start_s, end_s = parse_mmss_span(
+                raw,
+                field=f"timeline unit {unit_id}",
+                duration_s=duration_s,
+            )
+            assert start_s is not None and end_s is not None
+            if start_s < previous_start:
+                raise ValueError(
+                    "Omni timeline matched units must remain in input order: "
+                    f"unit={unit_id!r} start_s={start_s} previous_start={previous_start}"
+                )
             previous_start = start_s
+        else:
+            if not invalid_confidence and raw and (
+                raw.get("start_ts") is not None or raw.get("end_ts") is not None
+            ):
+                raise ValueError(
+                    f"Omni timeline unmatched unit {unit_id!r} requires null timestamps"
+                )
+            status = "unmatched"
+            start_s = end_s = 0.0
+            confidence = 0.0
         result.append(
             {
                 "unit_id": unit_id,
@@ -275,6 +325,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             row.get("schema") == SCHEMA
             and row.get("model") == model
             and row.get("prompt_version") == PROMPT_VERSION
+            and row.get("teacher_timestamp_contract_id") == TIMESTAMP_CONTRACT_ID
             and bool(row.get("enable_thinking")) == enable_thinking
             and int(row.get("thinking_budget") or 0) == thinking_budget
         )
@@ -322,6 +373,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                     "item": item,
                     "model": model,
                     "prompt_version": PROMPT_VERSION,
+                    "teacher_timestamp_contract_id": TIMESTAMP_CONTRACT_ID,
                     "enable_thinking": enable_thinking,
                     "thinking_budget": thinking_budget,
                     "error": repr(exc),
@@ -352,6 +404,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             "audio_path": item["audio_path"],
             "model": model,
             "prompt_version": PROMPT_VERSION,
+            "teacher_timestamp_contract_id": TIMESTAMP_CONTRACT_ID,
             "enable_thinking": enable_thinking,
             "thinking_budget": thinking_budget,
             "attempts": attempts,
@@ -376,9 +429,10 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     _write_jsonl(retry_path, failed_rows)
     total_units = matched_units + unmatched_units
     summary = {
-        "schema": "timeline_omni_alignment_summary_v3",
+        "schema": SUMMARY_SCHEMA,
         "model": model,
         "prompt_version": PROMPT_VERSION,
+        "teacher_timestamp_contract_id": TIMESTAMP_CONTRACT_ID,
         "enable_thinking": enable_thinking,
         "thinking_budget": thinking_budget,
         "max_tokens": args.max_tokens,

@@ -21,11 +21,19 @@ from tools.asr.cueqc.label_pre_asr_with_omni import (
     first_env_value,
     load_env_file,
 )
+from tools.omni.timestamp_contract import (
+    TIMESTAMP_CONTRACT_ID,
+    TIMESTAMP_PROMPT_CONTRACT_ZH,
+    parse_mmss_span,
+    timestamp_request_contract,
+)
 
 
 SCHEMA = "semantic_source_text_alignment_teacher_v2"
 SUMMARY_SCHEMA = "semantic_source_text_alignment_summary_v2"
-PROMPT_VERSION = "semantic_source_text_then_audio_alignment_v3_semantic_envelope_membership"
+PROMPT_VERSION = (
+    "semantic_source_text_then_audio_alignment_v4_semantic_envelope_membership_mmss_mmm"
+)
 DEFAULT_MODEL = "qwen3.5-omni-plus"
 TEXT_KINDS = ("semantic", "nonsemantic", "unsure")
 ALIGNMENT_STATUSES = ("matched", "not_audible", "unsure")
@@ -44,10 +52,10 @@ SYSTEM_PROMPT = """你是日语短 source utterance 的离线监督标注器。�
 
 第二步：结合完整音频，只做 semantic 文本的时间对齐。
 - 只为第一步 kind=semantic 的 unit 返回 semantic_alignments，unit_id 和顺序必须完全一致。
-- matched：音频中能可靠听到该固定文本，返回局部坐标 start_s/end_s。
-- not_audible：参考文本对应内容在音频中听不到，start_s/end_s 返回 null。
-- unsure：疑似存在但重叠、低信噪比或边界无法可靠判断，start_s/end_s 返回 null；禁止猜时间。
-- matched span 必须按文本顺序排列且互不重叠，坐标位于 0..duration_s。
+- matched：音频中能可靠听到该固定文本，返回局部坐标 start_ts/end_ts。
+- not_audible：参考文本对应内容在音频中听不到，start_ts/end_ts 返回 null。
+- unsure：疑似存在但重叠、低信噪比或边界无法可靠判断，start_ts/end_ts 返回 null；禁止猜时间。
+- matched span 必须按文本顺序排列且互不重叠，坐标位于 00:00.000..duration_ts。
 - 不要返回 keep_span，也不要判断前导/尾随声音是否“属于同一 utterance”。source membership 会在校验后确定性地派生为：最早 matched semantic start 到最晚 matched semantic end。它只允许桥接多个 semantic spans 之间的内部空洞，绝不向两侧扩张吸收亲吻声、喘息、呻吟、尾音、BGM、环境/机械噪声或远处背景人声。
 - 只有一个 matched semantic span 时，派生 membership 必须与该 semantic span 完全相同；存在 unsure semantic alignment 时整个 membership abstain；其余没有 matched semantic span 的情况派生为 none。不得使用固定秒数 margin。
 - unsure_audio_spans 只记录确实需要 abstain 的局部区域；没有则返回空数组。
@@ -60,16 +68,16 @@ SYSTEM_PROMPT = """你是日语短 source utterance 的离线监督标注器。�
     {"unit_id":"u00","text":"...","kind":"semantic|nonsemantic|unsure","confidence":0.0,"reason":"简短理由"}
   ],
   "semantic_alignments": [
-    {"unit_id":"u00","status":"matched|not_audible|unsure","start_s":0.0,"end_s":0.0,"confidence":0.0,"reason":"简短理由"}
+    {"unit_id":"u00","status":"matched|not_audible|unsure","start_ts":"00:00.000","end_ts":"00:00.000","confidence":0.0,"reason":"简短理由"}
   ],
   "unsure_audio_spans": [
-    {"start_s":0.0,"end_s":0.0,"reason":"简短理由"}
+    {"start_ts":"00:00.000","end_ts":"00:00.000","reason":"简短理由"}
   ],
   "reason":"整体说明"
 }
 
-当 alignment 不是 matched 时，对应 start_s/end_s 使用 null，不要使用 0.0 占位。
-"""
+当 alignment 不是 matched 时，对应 start_ts/end_ts 使用 null，不要使用 `00:00.000` 占位。
+""" + "\n" + TIMESTAMP_PROMPT_CONTRACT_ZH
 
 
 def _rows(path: Path) -> list[dict[str, Any]]:
@@ -88,7 +96,7 @@ def _append(path: Path, row: dict[str, Any]) -> None:
 def build_prompt(sample: dict[str, Any], *, validation_feedback: str = "") -> str:
     payload = {
         "sample_id": str(sample["sample_id"]),
-        "duration_s": round(float(sample["duration_s"]), 6),
+        **timestamp_request_contract(float(sample["duration_s"])),
         "reference_text": str(sample["reference_text"]),
         "text_unit_contract": "maximal_contiguous_kind_runs",
         "task_order": [
@@ -119,15 +127,21 @@ def _confidence(value: Any, field: str) -> float:
 def _matched_span(
     row: dict[str, Any], *, duration_s: float, field: str
 ) -> tuple[float, float]:
-    start_s = float(row.get("start_s"))
-    end_s = float(row.get("end_s"))
-    if not 0.0 <= start_s < end_s <= duration_s:
-        raise ValueError(f"{field} span must satisfy 0 <= start < end <= duration")
+    start_s, end_s = parse_mmss_span(
+        row,
+        field=field,
+        duration_s=duration_s,
+    )
+    assert start_s is not None and end_s is not None
     return start_s, end_s
 
 
 def _require_null_span(row: dict[str, Any], field: str) -> None:
-    if row.get("start_s") is not None or row.get("end_s") is not None:
+    if "start_ts" not in row or "end_ts" not in row:
+        raise ValueError(
+            f"{field} non-matched span must contain start_ts/end_ts"
+        )
+    if row.get("start_ts") is not None or row.get("end_ts") is not None:
         raise ValueError(f"{field} non-matched span must use null coordinates")
 
 
@@ -300,6 +314,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             row.get("schema") != SCHEMA
             or row.get("prompt_version") != PROMPT_VERSION
             or row.get("model") != model
+            or row.get("teacher_timestamp_contract_id") != TIMESTAMP_CONTRACT_ID
         ):
             raise RuntimeError(
                 "existing labels use another schema/model/prompt contract; use a new output directory"
@@ -365,6 +380,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             label = {
                 "schema": SCHEMA,
                 "prompt_version": PROMPT_VERSION,
+                "teacher_timestamp_contract_id": TIMESTAMP_CONTRACT_ID,
                 "model": model,
                 "request_contract": "single_full_audio_plus_reference_text",
                 "sample_id": sample_id,
@@ -406,6 +422,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     summary = {
         "schema": SUMMARY_SCHEMA,
         "prompt_version": PROMPT_VERSION,
+        "teacher_timestamp_contract_id": TIMESTAMP_CONTRACT_ID,
         "model": model,
         "request_contract": "one_request_per_full_source",
         "requested_samples": len(samples),

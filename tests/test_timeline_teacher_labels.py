@@ -15,6 +15,7 @@ from tools.datasets.label_timeline_with_omni import (
     _normalize_units,
     build_prompt,
 )
+from tools.omni.timestamp_contract import TIMESTAMP_CONTRACT_ID
 from tools.datasets.prepare_timeline_teacher_dataset import (
     UNITIZER,
     select_segments,
@@ -60,6 +61,25 @@ def _omni_unit(
     }
 
 
+def _omni_wire_unit(
+    *,
+    unit_id: str = "u0000",
+    text: str = "帰ろう",
+    start_ts: str | float | None = "00:00.800",
+    end_ts: str | float | None = "00:01.400",
+    confidence: float | str = 0.95,
+    status: str = "matched",
+) -> dict:
+    return {
+        "unit_id": unit_id,
+        "text": text,
+        "status": status,
+        "start_ts": start_ts,
+        "end_ts": end_ts,
+        "confidence": confidence,
+    }
+
+
 def test_teacher_selection_prioritizes_long_segments() -> None:
     segments = [
         {"source_chunk_index": 1, "chunk_acoustic_duration": 2.0, "text": "a"},
@@ -101,10 +121,15 @@ def test_omni_timeline_prompt_is_direct_alignment_only() -> None:
     assert "禁止判断 Split 切点" in SYSTEM_PROMPT
     assert "Pre-ASR keep/drop" in SYSTEM_PROMPT
     assert '"unit_id":"u0000"' in prompt
-    assert json.loads(prompt)["duration_s"] == 3.0
+    request = json.loads(prompt)
+    assert request["duration_ts"] == "00:03.000"
+    assert request["timestamp_contract_id"] == TIMESTAMP_CONTRACT_ID
+    assert "duration_s" not in request
     assert "Forced" not in SYSTEM_PROMPT
     assert "cut|continue|unsure" not in SYSTEM_PROMPT
     assert "keep|drop|unsure" not in SYSTEM_PROMPT
+    assert "MM:SS.mmm" in SYSTEM_PROMPT
+    assert '"start_s":' not in SYSTEM_PROMPT
     assert DEFAULT_AUDIO_CONTENT_MODE == "input_audio"
     assert DEFAULT_MAX_TOKENS == 4096
 
@@ -117,9 +142,18 @@ def test_omni_missing_duplicate_and_malformed_units_become_unmatched() -> None:
     ]
     parsed = {
         "units": [
-            _omni_unit(unit_id="u0000", start_s=0.1, end_s=0.2),
-            _omni_unit(unit_id="u0000", start_s=0.2, end_s=0.3),
-            _omni_unit(unit_id="u0002", start_s=0.4, end_s=0.5, confidence="bad"),
+            _omni_wire_unit(
+                unit_id="u0000", start_ts="00:00.100", end_ts="00:00.200"
+            ),
+            _omni_wire_unit(
+                unit_id="u0000", start_ts="00:00.200", end_ts="00:00.300"
+            ),
+            _omni_wire_unit(
+                unit_id="u0002",
+                start_ts="00:00.400",
+                end_ts="00:00.500",
+                confidence="bad",
+            ),
         ]
     }
 
@@ -131,6 +165,31 @@ def test_omni_missing_duplicate_and_malformed_units_become_unmatched() -> None:
         "unmatched",
     ]
     assert all(row["confidence"] == 0.0 for row in normalized)
+
+
+@pytest.mark.parametrize(
+    ("start_ts", "end_ts", "match"),
+    [
+        (0.8, 1.4, "numeric seconds are rejected"),
+        ("00:00.800", "00:03.001", "exceeds source duration"),
+        ("00:00.800", "00:00.700", "start < end"),
+    ],
+)
+def test_omni_timeline_rejects_invalid_teacher_timestamps(
+    start_ts: str | float,
+    end_ts: str | float,
+    match: str,
+) -> None:
+    with pytest.raises(ValueError, match=match):
+        _normalize_units(
+            {
+                "units": [
+                    _omni_wire_unit(start_ts=start_ts, end_ts=end_ts),
+                ]
+            },
+            _text_units(),
+            duration_s=3.0,
+        )
 
 
 def test_omni_run_consumes_v2_items_without_forced_labels(
@@ -149,7 +208,7 @@ def test_omni_run_consumes_v2_items_without_forced_labels(
         assert kwargs["thinking_budget"] == 1024
         return (
             {
-                "units": [_omni_unit(text="帰ろうか")]
+                "units": [_omni_wire_unit(text="帰ろうか")]
             },
             {"response": "ok"},
         )
@@ -175,8 +234,10 @@ def test_omni_run_consumes_v2_items_without_forced_labels(
         (tmp_path / "out" / "omni_timeline_labels.jsonl").read_text(encoding="utf-8")
     )
 
-    assert summary["schema"] == "timeline_omni_alignment_summary_v3"
-    assert row["schema"] == "timeline_omni_alignment_label_v3"
+    assert summary["schema"] == "timeline_omni_alignment_summary_v4"
+    assert row["schema"] == "timeline_omni_alignment_label_v4"
+    assert row["teacher_timestamp_contract_id"] == TIMESTAMP_CONTRACT_ID
+    assert summary["teacher_timestamp_contract_id"] == TIMESTAMP_CONTRACT_ID
     assert row["matched_count"] == 1
     assert row["unitizer"] == UNITIZER
     assert row["attempts"] == 1
@@ -239,7 +300,7 @@ def test_omni_timeline_retries_incomplete_response(tmp_path: Path, monkeypatch) 
         calls["count"] += 1
         if calls["count"] == 1:
             return {"units": []}, {"usage": {}}
-        return {"units": [_omni_unit(text="帰ろうか")]}, {"usage": {}}
+        return {"units": [_omni_wire_unit(text="帰ろうか")]}, {"usage": {}}
 
     monkeypatch.setattr(omni_label, "call_omni", fake_call_omni)
     monkeypatch.setattr(omni_label, "load_env_file", lambda _path: None)

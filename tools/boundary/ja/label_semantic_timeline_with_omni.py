@@ -31,11 +31,17 @@ from tools.asr.cueqc.label_pre_asr_with_omni import (  # noqa: E402
     first_env_value,
     load_env_file,
 )
+from tools.omni.timestamp_contract import (  # noqa: E402
+    TIMESTAMP_CONTRACT_ID,
+    TIMESTAMP_PROMPT_CONTRACT_ZH,
+    parse_mmss_span,
+    timestamp_request_contract,
+)
 
 
 SCHEMA = "semantic_timeline_teacher_v1"
 SUMMARY_SCHEMA = "semantic_timeline_teacher_summary_v1"
-PROMPT_VERSION = "semantic_timeline_text_then_audio_alignment_v1"
+PROMPT_VERSION = "semantic_timeline_text_then_audio_alignment_v2_mmss_mmm"
 DEFAULT_MODEL = "qwen3.5-omni-plus"
 TEXT_KINDS = ("semantic", "nonsemantic", "unsure")
 ALIGNMENT_STATUSES = ("matched", "not_audible", "unsure")
@@ -58,7 +64,7 @@ SYSTEM_PROMPT = """你是日语语义时间轴离线监督标注器。用户会�
 - 所有 unit.text 依次直接拼接后必须逐字符等于 reference_text；禁止改写、纠错、补充、删除或重排。相邻 unit 可以同为 semantic，因为它们代表不同的可切语义单元。
 
 第二步：结合完整音频，对每个 kind=semantic 的 unit 分别做时间对齐。
-- matched：能可靠听到固定文本，返回该 unit 实际语音的 start_s/end_s。
+- matched：能可靠听到固定文本，返回该 unit 实际语音的 start_ts/end_ts。
 - not_audible：参考文本在音频中听不到，坐标为 null。
 - unsure：疑似存在但重叠、低信噪比或边界无法可靠判断，坐标为 null；禁止猜时间。
 - matched span 按文本顺序排列。若相邻说话真实重叠，可以时间重叠，不要伪造静音；本地编译会让 Inner Refiner abstain。
@@ -73,14 +79,14 @@ SYSTEM_PROMPT = """你是日语语义时间轴离线监督标注器。用户会�
     {"unit_id":"u00","text":"...","kind":"semantic|nonsemantic|unsure","confidence":0.0,"reason":"简短理由"}
   ],
   "semantic_alignments": [
-    {"unit_id":"u00","status":"matched|not_audible|unsure","start_s":0.0,"end_s":0.0,"confidence":0.0,"reason":"简短理由"}
+    {"unit_id":"u00","status":"matched|not_audible|unsure","start_ts":"00:00.000","end_ts":"00:01.000","confidence":0.0,"reason":"简短理由"}
   ],
   "unsure_audio_spans": [
-    {"start_s":0.0,"end_s":0.0,"reason":"简短理由"}
+    {"start_ts":"00:00.000","end_ts":"00:01.000","reason":"简短理由"}
   ],
   "reason":"整体说明"
 }
-"""
+""" + "\n" + TIMESTAMP_PROMPT_CONTRACT_ZH
 
 
 def _rows(path: Path) -> list[dict[str, Any]]:
@@ -106,7 +112,7 @@ def _write_jsonl(path: Path, rows: Iterable[dict[str, Any]]) -> None:
 def build_prompt(sample: dict[str, Any], *, validation_feedback: str = "") -> str:
     payload: dict[str, Any] = {
         "sample_id": str(sample["sample_id"]),
-        "duration_s": round(float(sample["duration_s"]), 6),
+        **timestamp_request_contract(float(sample["duration_s"])),
         "reference_text": str(sample["reference_text"]),
         "task_order": [
             "segment_reference_text_into_minimal_complete_semantic_units",
@@ -139,17 +145,12 @@ def _confidence(value: Any, field: str) -> float:
 def _nullable_span(
     raw: dict[str, Any], *, duration_s: float, field: str
 ) -> tuple[float | None, float | None]:
-    start = raw.get("start_s")
-    end = raw.get("end_s")
-    if start is None or end is None:
-        if start is not None or end is not None:
-            raise ValueError(f"{field} must use two coordinates or two nulls")
-        return None, None
-    start_s = float(start)
-    end_s = float(end)
-    if not 0.0 <= start_s < end_s <= duration_s:
-        raise ValueError(f"{field} must be inside 0..duration_s")
-    return start_s, end_s
+    return parse_mmss_span(
+        raw,
+        field=field,
+        duration_s=duration_s,
+        allow_null=True,
+    )
 
 
 def _merged_spans(spans: Iterable[tuple[float, float]]) -> list[tuple[float, float]]:
@@ -439,6 +440,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             row.get("schema") != SCHEMA
             or row.get("prompt_version") != PROMPT_VERSION
             or row.get("model") != model
+            or row.get("teacher_timestamp_contract_id") != TIMESTAMP_CONTRACT_ID
         ):
             raise RuntimeError(
                 "existing labels use another schema/model/prompt contract; use a new output directory"
@@ -499,6 +501,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             label = {
                 "schema": SCHEMA,
                 "prompt_version": PROMPT_VERSION,
+                "teacher_timestamp_contract_id": TIMESTAMP_CONTRACT_ID,
                 "model": model,
                 "request_contract": "single_full_audio_plus_trusted_reference_text",
                 "sample_id": sample_id,
@@ -539,6 +542,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     summary = {
         "schema": SUMMARY_SCHEMA,
         "prompt_version": PROMPT_VERSION,
+        "teacher_timestamp_contract_id": TIMESTAMP_CONTRACT_ID,
         "model": model,
         "requested_samples": len(samples),
         "labeled_samples": len(labels),

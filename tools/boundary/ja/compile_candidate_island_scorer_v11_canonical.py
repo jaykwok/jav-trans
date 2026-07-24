@@ -38,7 +38,7 @@ RESPONSIBILITY_VERDICT_SCHEMA = (
 REAL_TRAIN_OUTSIDE_SCHEMA = "candidate_island_scorer_v11_real_train_outside_source_v1"
 REAL_TRAIN_MANUAL_SCHEMA = "candidate_island_scorer_v11_real_train_manual_source_v1"
 REAL_TRAIN_DUAL_EVIDENCE_SCHEMA = (
-    "candidate_island_scorer_v11_real_train_dual_evidence_source_v1"
+    "candidate_island_scorer_v11_real_train_dual_evidence_source_v2"
 )
 FRAME_HOP_S = 0.02
 LABELS = {"outside_candidate": 0, "inside_candidate": 1, "unsure": 2}

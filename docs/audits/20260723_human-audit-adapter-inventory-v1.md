@@ -2,11 +2,12 @@
 
 ## 当前迁移结论
 
-Human Audit Page Core 当前已有四个职责适配器：
+Human Audit Page Core 当前已有五个职责适配器：
 
 | Adapter | 审计对象 | 选项合同 | 保存兼容性 | 状态 |
 |---|---|---|---|---|
 | Scorer bridge-gap | Protect 覆盖的人工锚点间 gap | `内容 × 语义覆盖 × 非语义包络`，15 个合法组合 | schema 升级为 `candidate_island_scorer_v11_bridge_gap_manual_verdict_v3` | 已迁移 |
+| Scorer dual-evidence A/B | 两个规范化 Protect×Remove review 的同 source 对照 | `base_better / candidate_better / equivalent acceptable / equivalent unacceptable / tradeoff / unsure` | 新 schema `candidate_island_dual_evidence_ab_manual_verdict_v1`；只作模型选择，不直接生成训练标签 | 已迁移 |
 | CueQC false-drop | 模型准备整块删除的完整 provisional sub-island | `safe_drop / true_speech / unsure` | 保持 `cueqc_v13_false_drop_manual_verdict_v1`，既有 evaluator 不变 | 已迁移 |
 | Split missing-cut candidate | 已确认漏切 residual 中的真实 Proposal candidate | `cut / continue / unsure`，`unsure→ignore=-100` | 保持 `split_v4_missing_cut_candidate_manual_verdict_v1`，既有 override compiler 不变 | 已迁移 |
 | Split canonical candidate | canonical teacher 已标注的固定 Proposal candidate query | `cut / continue / unsure`，`unsure→ignore=-100` | 保持 `acoustic_split_canonical_manual_verdict_v1`，既有 evaluator 不变 | 已迁移 |

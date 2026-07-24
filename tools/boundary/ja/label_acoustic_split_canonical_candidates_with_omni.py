@@ -31,6 +31,11 @@ from tools.boundary.ja.acoustic_split_teacher_contracts import (  # noqa: E402
     ACOUSTIC_SPLIT_TEACHER_SELECTION_SCHEMA as SELECTION_SCHEMA,
     ACOUSTIC_SPLIT_TEACHER_SUMMARY_SCHEMA,
 )
+from tools.omni.timestamp_contract import (  # noqa: E402
+    TIMESTAMP_PROMPT_CONTRACT_ZH,
+    timestamp_request_contract,
+    format_mmss_timestamp,
+)
 
 
 DEFAULT_MODEL = "qwen3.5-omni-plus"
@@ -51,7 +56,7 @@ HARD_CASE_CATEGORIES = (
 NONSPEECH_JUNCTION_FLAGS = frozenset({"breath", "moan", "laughter"})
 
 SYSTEM_PROMPT = """你是日语 ASR Acoustic Split canonical 数据标注器。本次唯一任务是判断用户给出的这一个候选切点是否应该切开音频。
-候选切点位于随请求上传的这段音频里，其位置由用户 JSON 的 time_s 给出（通常在音频中部）。
+候选切点位于随请求上传的这段音频里，其位置由用户 JSON 的 time_ts 给出（通常在音频中部）。
 
 标签定义：
 - cut：候选点左右分别构成完整、可独立送入 ASR、可独立显示为字幕的语义 utterance。
@@ -80,7 +85,7 @@ SYSTEM_PROMPT = """你是日语 ASR Acoustic Split canonical 数据标注器。�
   "flags": ["same_sentence", "short_pause", "breath", "speaker_change", "low_snr"],
   "reason": "一句话说明判断依据"
 }
-"""
+""" + "\n" + TIMESTAMP_PROMPT_CONTRACT_ZH
 
 
 class RequestRateLimiter:
@@ -369,11 +374,12 @@ def _clip_bounds(
 
 def build_prompt(candidate: dict[str, Any], *, clip_start: float, clip_end: float) -> str:
     offset = round(float(candidate["time_s"]) - float(clip_start), 3)
+    duration_s = float(clip_end) - float(clip_start)
     payload = {
-        "duration_s": round(float(clip_end) - float(clip_start), 3),
+        **timestamp_request_contract(duration_s),
         "candidate": {
             "id": _prompt_id(int(candidate["feature_index"])),
-            "time_s": offset,
+            "time_ts": format_mmss_timestamp(offset),
         },
     }
     return json.dumps(payload, ensure_ascii=False, separators=(",", ":"))

@@ -30,10 +30,14 @@ from boundary.contracts import ACOUSTIC_BINARY_V12_CONTRACT  # noqa: E402
 from tools.asr.cueqc.label_pre_asr_with_omni import (  # noqa: E402
     DEFAULT_API_KEY_ENV_CANDIDATES,
     DEFAULT_BASE_URL_ENV_CANDIDATES,
+    GEMINI_THINKING_LEVELS,
+    audio_content_mode_for_profile,
+    build_omni_request_body,
     call_omni,
     first_env_value,
     load_env_file,
     normalize_openai_compat_base_url,
+    redact_omni_request_preview,
 )
 from tools.boundary.ja.label_candidate_island_scorer_v11_with_omni import (  # noqa: E402
     FRAME_HOP_S,
@@ -42,14 +46,27 @@ from tools.boundary.ja.label_candidate_island_scorer_v11_with_omni import (  # n
     _sha256,
     _write_progress,
 )
+from tools.omni.timestamp_contract import (  # noqa: E402
+    TIMESTAMP_CONTRACT_ID,
+    TIMESTAMP_PROMPT_CONTRACT_ZH,
+    parse_mmss_span,
+    timestamp_request_contract,
+)
 
 
 SCHEMA = "candidate_island_scorer_v11_dual_evidence_preaudit_v1"
 SUMMARY_SCHEMA = "candidate_island_scorer_v11_dual_evidence_summary_v1"
 PROMPT_PROFILE = "dual-evidence-protect-remove-v1"
-PROTECT_PROMPT_VERSION = "candidate_island_scorer_v11_protect_evidence_v2_high_recall"
-REMOVE_PROMPT_VERSION = "candidate_island_scorer_v11_remove_evidence_v1"
+PROTECT_PROMPT_VERSION = (
+    "candidate_island_scorer_v11_protect_evidence_v3_high_recall_mmss_mmm"
+)
+REMOVE_PROMPT_VERSION = (
+    "candidate_island_scorer_v11_remove_evidence_v2_mmss_mmm"
+)
 PROMPT_VERSION = f"{PROTECT_PROMPT_VERSION}__{REMOVE_PROMPT_VERSION}"
+TEACHER_EXECUTION_CONTRACT_ID = (
+    "gemini_openrouter_reasoning_require_parameters_v1"
+)
 OUTSIDE_CATEGORIES = frozenset(
     {
         "breathing",
@@ -90,21 +107,21 @@ Scorer 位于 Proposal、Split、CueQC 和 Inner 之前。你的唯一任务是�
 
 边界应覆盖完整词头、词尾、吸气起始、衰减尾音以及同一发声单元的完整声学包络。宁可略宽，也不能削掉边缘；但不要添加固定时间缓冲。
 
-输出当前完整 source 的 0-based 秒坐标。区间按时间排序、不得重叠。允许空数组。
+输出当前完整 source 的 0-based 局部坐标。区间按时间排序、不得重叠。允许空数组。
 
 只输出 JSON：
 {
   "source_id": "...",
   "protected_spans": [
     {
-      "start_s": 0.0,
-      "end_s": 1.0,
+      "start_ts": "00:00.000",
+      "end_ts": "00:01.000",
       "reason": "需要保护的简短声学证据"
     }
   ],
   "overall_reason": "简短整体判断"
 }
-"""
+""" + "\n" + TIMESTAMP_PROMPT_CONTRACT_ZH
 
 
 REMOVE_SYSTEM_PROMPT = """你是 1.7B Scorer v11 的“安全删除通道”预审 teacher。
@@ -130,22 +147,22 @@ REMOVE_SYSTEM_PROMPT = """你是 1.7B Scorer v11 的“安全删除通道”预�
 
 未标记区域只是 unresolved，不代表 inside。允许空数组，但不得为了避免空数组而猜测。
 
-输出当前完整 source 的 0-based 秒坐标。区间按时间排序、不得重叠。
+输出当前完整 source 的 0-based 局部坐标。区间按时间排序、不得重叠。
 
 只输出 JSON：
 {
   "source_id": "...",
   "safe_outside_spans": [
     {
-      "start_s": 0.0,
-      "end_s": 1.0,
+      "start_ts": "00:00.000",
+      "end_ts": "00:01.000",
       "category": "breathing|moan|cry|kiss|action|impact|silence|music|ambience|mechanical|other",
       "reason": "可以独立安全删除的简短声学证据"
     }
   ],
   "overall_reason": "简短整体判断"
 }
-"""
+""" + "\n" + TIMESTAMP_PROMPT_CONTRACT_ZH
 
 
 def _request_prompt(
@@ -156,8 +173,7 @@ def _request_prompt(
 ) -> str:
     payload: dict[str, Any] = {
         "source_id": str(row["source_id"]),
-        "duration_s": float(row["duration_s"]),
-        "coordinate_system": "0-based current full-source timeline in seconds",
+        **timestamp_request_contract(float(row["duration_s"])),
         "pass": pass_name,
     }
     if feedback:
@@ -183,13 +199,12 @@ def _normalize_evidence_spans(
     for index, raw in enumerate(raw_spans):
         if not isinstance(raw, Mapping):
             raise ValueError(f"{field} item {index} is not an object")
-        start = float(raw.get("start_s"))
-        end = float(raw.get("end_s"))
-        if not 0.0 <= start < end <= duration_s:
-            raise ValueError(
-                f"{field} item {index} has invalid local-source coordinates: "
-                f"start_s={start}, end_s={end}, required_range=0..{duration_s}"
-            )
+        start, end = parse_mmss_span(
+            raw,
+            field=f"{field} item {index}",
+            duration_s=duration_s,
+        )
+        assert start is not None and end is not None
         start_frame = 0 if start <= 0.0 else round(start / FRAME_HOP_S)
         end_frame = (
             frame_count
@@ -367,6 +382,14 @@ def _resume_index(
     path: Path,
     *,
     model: str,
+    provider_profile: str,
+    reasoning_effort: str,
+    enable_thinking: bool,
+    thinking_budget: int,
+    max_tokens: int,
+    exclude_reasoning: bool,
+    require_provider_parameters: bool,
+    response_format: Mapping[str, Any],
 ) -> dict[str, dict[str, Any]]:
     return {
         str(row["source_id"]): row
@@ -374,6 +397,53 @@ def _resume_index(
         if row.get("schema") == SCHEMA
         and row.get("model") == model
         and row.get("prompt_version") == PROMPT_VERSION
+        and row.get("teacher_timestamp_contract_id") == TIMESTAMP_CONTRACT_ID
+        and row.get("provider_profile") == provider_profile
+        and row.get("reasoning_effort") == reasoning_effort
+        and bool(row.get("enable_thinking")) == enable_thinking
+        and int(row.get("thinking_budget") or 0) == thinking_budget
+        and int(row.get("max_tokens") or 0) == max_tokens
+        and bool(row.get("exclude_reasoning")) == exclude_reasoning
+        and bool(row.get("require_provider_parameters"))
+        == require_provider_parameters
+        and row.get("teacher_execution_contract_id")
+        == TEACHER_EXECUTION_CONTRACT_ID
+        and dict(row.get("response_format") or {}) == dict(response_format)
+    }
+
+
+def _response_reasoning_tokens(raw: Mapping[str, Any]) -> int:
+    usage = raw.get("usage") or {}
+    details = usage.get("completion_tokens_details") or {}
+    return int(details.get("reasoning_tokens") or 0)
+
+
+def _response_reasoning_evidence(raw: Mapping[str, Any]) -> dict[str, Any]:
+    tokens = _response_reasoning_tokens(raw)
+    signature_count = int(raw.get("reasoning_signature_count") or 0)
+    text_chunk_count = int(raw.get("reasoning_text_chunk_count") or 0)
+    character_count = int(raw.get("reasoning_character_count") or 0)
+    signature_formats = sorted(
+        {str(value) for value in raw.get("reasoning_signature_formats") or ()}
+    )
+    valid_gemini_signature = (
+        signature_count > 0 and "google-gemini-v1" in signature_formats
+    )
+    visible_reasoning = text_chunk_count > 0 or character_count > 0
+    return {
+        "reasoning_tokens": tokens,
+        "reasoning_signature_count": signature_count,
+        "reasoning_signature_formats": signature_formats,
+        "reasoning_text_chunk_count": text_chunk_count,
+        "reasoning_character_count": character_count,
+        # A signature proves that the Gemini thinking transport was active, but
+        # it does not prove that this request actually consumed high-effort
+        # reasoning. Training-grade evidence therefore requires positive usage
+        # tokens or visible reasoning text; signature-only remains diagnostic.
+        "reasoning_transport_evidence_present": (
+            tokens > 0 or valid_gemini_signature or visible_reasoning
+        ),
+        "reasoning_evidence_present": tokens > 0 or visible_reasoning,
     }
 
 
@@ -395,6 +465,11 @@ def _call_pass(
     raw_path: Path,
     request_number: int,
     request_total: int,
+    provider_profile: str,
+    reasoning_effort: str,
+    require_reasoning_evidence: bool,
+    require_provider_parameters: bool,
+    max_tokens: int,
 ) -> tuple[dict[str, Any], dict[str, Any], list[dict[str, Any]]]:
     feedback = ""
     last_error: Exception | None = None
@@ -419,9 +494,21 @@ def _call_pass(
                 store_stream_chunks=False,
                 prompt=_request_prompt(row, pass_name=pass_name, feedback=feedback),
                 system_prompt=system_prompt,
-                max_tokens=args.max_tokens,
+                max_tokens=max_tokens,
                 enable_thinking=args.enable_thinking,
                 thinking_budget=args.thinking_budget,
+                provider_profile=provider_profile,
+                reasoning_effort=reasoning_effort,
+                exclude_reasoning=bool(args.exclude_reasoning),
+                require_provider_parameters=require_provider_parameters,
+                response_format=(
+                    {"type": "json_object"}
+                    if provider_profile == "gemini"
+                    else None
+                ),
+                print_request=(
+                    args.print_request and request_number <= 2 and attempt == 1
+                ),
             )
             if str(parsed.get("source_id") or "") != str(row["source_id"]):
                 raise ValueError(
@@ -437,6 +524,16 @@ def _call_pass(
                 duration_s=duration_s,
                 frame_count=frame_count,
             )
+            reasoning_evidence = _response_reasoning_evidence(raw)
+            if (
+                require_reasoning_evidence
+                and not reasoning_evidence["reasoning_evidence_present"]
+            ):
+                raise ValueError(
+                    "training-grade OpenRouter reasoning requires positive "
+                    "reasoning tokens or visible reasoning_details; a "
+                    "google-gemini-v1 thought signature alone is insufficient"
+                )
             with raw_path.open("a", encoding="utf-8") as handle:
                 handle.write(
                     json.dumps(
@@ -502,16 +599,127 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     if not model or not api_key:
         raise RuntimeError("Omni model and API key are required")
     profile_name = env_file.name.lower()
-    audio_content_mode = {
-        "qwen": "input_audio",
-        "gemini": "input_audio_raw",
-    }[profile_name]
+    audio_content_mode = audio_content_mode_for_profile(profile_name)
+    reasoning_effort = (
+        str(args.reasoning_effort).lower() if args.enable_thinking else "none"
+    ) if profile_name == "gemini" else ""
+    effective_thinking_budget = (
+        int(args.thinking_budget) if profile_name == "qwen" else 0
+    )
+    effective_max_tokens = int(args.max_tokens) if args.max_tokens > 0 else (
+        8192 if profile_name == "gemini" else 2048
+    )
+    exclude_reasoning = bool(args.exclude_reasoning)
+    require_provider_parameters = bool(
+        profile_name == "gemini" and "openrouter.ai" in base_url.lower()
+    )
+    reasoning_metadata: dict[str, Any] = {
+        "provider_profile": profile_name,
+        "enable_thinking": bool(args.enable_thinking),
+        "reasoning_transport": (
+            "openrouter_reasoning_effort_to_google_thinking_level"
+            if profile_name == "gemini"
+            else "qwen_enable_thinking_budget"
+        ),
+        "max_tokens": effective_max_tokens,
+        # Default false: OpenRouter returns usage.reasoning_tokens more reliably
+        # when reasoning text is not excluded; exclude=true is optional.
+        "exclude_reasoning": exclude_reasoning,
+        "require_provider_parameters": require_provider_parameters,
+        "teacher_execution_contract_id": TEACHER_EXECUTION_CONTRACT_ID,
+        "response_format": (
+            {"type": "json_object"} if profile_name == "gemini" else {}
+        ),
+        "omitted_sampling_parameters": ["temperature", "top_p", "top_k"],
+    }
+    if profile_name == "gemini":
+        reasoning_metadata.update(
+            {
+                "reasoning_effort": reasoning_effort,
+                "gemini_thinking_level": reasoning_effort,
+            }
+        )
+    else:
+        reasoning_metadata["thinking_budget"] = effective_thinking_budget
+    require_reasoning_evidence = bool(
+        args.require_reasoning_evidence
+        and profile_name == "gemini"
+        and args.enable_thinking
+    )
 
     rows = _selected_rows(
         _rows(manifest),
         source_ids=list(args.source_id),
         limit=args.limit,
     )
+    if args.preview_requests:
+        if not rows:
+            raise ValueError("request preview requires at least one source")
+        row = rows[0]
+        duration_s = float(row["duration_s"])
+        audio = _resolve_verified_audio(
+            row,
+            manifest=manifest,
+            audio_root=audio_root,
+        )
+        previews: list[dict[str, Any]] = []
+        for pass_name, system_prompt in (
+            ("protect", PROTECT_SYSTEM_PROMPT),
+            ("remove", REMOVE_SYSTEM_PROMPT),
+        ):
+            request_body, extra_body = build_omni_request_body(
+                audio_path=audio,
+                fmt=audio.suffix.lstrip(".") or "wav",
+                audio_content_mode=audio_content_mode,
+                model=model,
+                prompt=_request_prompt(row, pass_name=pass_name),
+                system_prompt=system_prompt,
+                max_tokens=effective_max_tokens,
+                enable_thinking=args.enable_thinking,
+                thinking_budget=effective_thinking_budget,
+                provider_profile=profile_name,
+                reasoning_effort=reasoning_effort,
+                exclude_reasoning=exclude_reasoning,
+                require_provider_parameters=require_provider_parameters,
+                response_format=(
+                    {"type": "json_object"}
+                    if profile_name == "gemini"
+                    else None
+                ),
+            )
+            previews.append(
+                {
+                    "pass": pass_name,
+                    **redact_omni_request_preview(
+                        request_body=request_body,
+                        extra_body=extra_body,
+                        provider_profile=profile_name,
+                        base_url=base_url,
+                    ),
+                }
+            )
+        preview_payload = {
+            "schema": "candidate_island_scorer_v11_request_preview_v1",
+            "source_id": str(row["source_id"]),
+            "duration_s": duration_s,
+            "audio_sha256": _sha256(audio),
+            "audio_content_mode": audio_content_mode,
+            **reasoning_metadata,
+            "requests": previews,
+            "network_request_sent": False,
+        }
+        preview_path = output / "request_preview.json"
+        preview_path.write_text(
+            json.dumps(
+                preview_payload,
+                ensure_ascii=False,
+                indent=2,
+                sort_keys=True,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        return {**preview_payload, "request_preview": str(preview_path)}
     labels_path = output / "preaudit.jsonl"
     raw_path = output / "raw_responses.jsonl"
     if args.retry_failed_closed and labels_path.is_file():
@@ -527,7 +735,20 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             ),
             encoding="utf-8",
         )
-    existing = _resume_index(labels_path, model=model)
+    existing = _resume_index(
+        labels_path,
+        model=model,
+        provider_profile=profile_name,
+        reasoning_effort=reasoning_effort,
+        enable_thinking=bool(args.enable_thinking),
+        thinking_budget=effective_thinking_budget,
+        max_tokens=effective_max_tokens,
+        exclude_reasoning=exclude_reasoning,
+        require_provider_parameters=require_provider_parameters,
+        response_format=(
+            {"type": "json_object"} if profile_name == "gemini" else {}
+        ),
+    )
     pending = [row for row in rows if str(row["source_id"]) not in existing]
     progress_path = output / "progress.json"
     request_total = len(pending) * 2
@@ -538,8 +759,10 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         {
             "schema": "candidate_island_scorer_v11_dual_evidence_progress_v1",
             "status": "running",
-            "provider_profile": profile_name,
             "model": model,
+            **reasoning_metadata,
+            "require_reasoning_evidence": require_reasoning_evidence,
+            "teacher_timestamp_contract_id": TIMESTAMP_CONTRACT_ID,
             "completed": len(existing),
             "total": len(rows),
             "pending": len(pending),
@@ -562,7 +785,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         failure: Exception | None = None
         try:
             request_number += 1
-            protect_parsed, _protect_raw, protected_evidence = _call_pass(
+            protect_parsed, protect_raw, protected_evidence = _call_pass(
                 row=row,
                 audio=audio,
                 pass_name="protect",
@@ -579,11 +802,16 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 raw_path=raw_path,
                 request_number=request_number,
                 request_total=request_total,
+                provider_profile=profile_name,
+                reasoning_effort=reasoning_effort,
+                require_reasoning_evidence=require_reasoning_evidence,
+                require_provider_parameters=require_provider_parameters,
+                max_tokens=effective_max_tokens,
             )
             if args.request_interval_s > 0:
                 time.sleep(args.request_interval_s)
             request_number += 1
-            remove_parsed, _remove_raw, remove_evidence = _call_pass(
+            remove_parsed, remove_raw, remove_evidence = _call_pass(
                 row=row,
                 audio=audio,
                 pass_name="remove",
@@ -600,6 +828,11 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 raw_path=raw_path,
                 request_number=request_number,
                 request_total=request_total,
+                provider_profile=profile_name,
+                reasoning_effort=reasoning_effort,
+                require_reasoning_evidence=require_reasoning_evidence,
+                require_provider_parameters=require_provider_parameters,
+                max_tokens=effective_max_tokens,
             )
             merged = merge_dual_evidence(
                 protected_spans=protected_evidence,
@@ -625,6 +858,10 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 "audio_sha256": _sha256(audio),
                 "model": model,
                 "env_file_name": profile_name,
+                **reasoning_metadata,
+                "teacher_timestamp_contract_id": TIMESTAMP_CONTRACT_ID,
+                "protect_reasoning": _response_reasoning_evidence(protect_raw),
+                "remove_reasoning": _response_reasoning_evidence(remove_raw),
                 "base_url_host": (
                     base_url.split("/", 3)[2] if "://" in base_url else base_url
                 ),
@@ -668,6 +905,22 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 "audio_sha256": _sha256(audio),
                 "model": model,
                 "env_file_name": profile_name,
+                **reasoning_metadata,
+                "teacher_timestamp_contract_id": TIMESTAMP_CONTRACT_ID,
+                "protect_reasoning": {
+                    "reasoning_tokens": 0,
+                    "reasoning_signature_count": 0,
+                    "reasoning_signature_formats": [],
+                    "reasoning_evidence_present": False,
+                    "reasoning_transport_evidence_present": False,
+                },
+                "remove_reasoning": {
+                    "reasoning_tokens": 0,
+                    "reasoning_signature_count": 0,
+                    "reasoning_signature_formats": [],
+                    "reasoning_evidence_present": False,
+                    "reasoning_transport_evidence_present": False,
+                },
                 "protected_evidence_spans": [],
                 "remove_evidence_spans": [],
                 "islands": [],
@@ -743,6 +996,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 "status": "running",
                 "provider_profile": profile_name,
                 "model": model,
+                "teacher_timestamp_contract_id": TIMESTAMP_CONTRACT_ID,
                 "completed": completed,
                 "total": len(rows),
                 "pending": len(rows) - completed,
@@ -780,6 +1034,48 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "failed_closed_count": sum(
             bool(row.get("teacher_failed_closed")) for row in result_rows
         ),
+        "protect_reasoning_tokens": sum(
+            int((row.get("protect_reasoning") or {}).get("reasoning_tokens") or 0)
+            for row in result_rows
+        ),
+        "remove_reasoning_tokens": sum(
+            int((row.get("remove_reasoning") or {}).get("reasoning_tokens") or 0)
+            for row in result_rows
+        ),
+        "protect_reasoning_signature_count": sum(
+            int(
+                (row.get("protect_reasoning") or {}).get(
+                    "reasoning_signature_count"
+                )
+                or 0
+            )
+            for row in result_rows
+        ),
+        "remove_reasoning_signature_count": sum(
+            int(
+                (row.get("remove_reasoning") or {}).get(
+                    "reasoning_signature_count"
+                )
+                or 0
+            )
+            for row in result_rows
+        ),
+        "protect_reasoning_evidence_count": sum(
+            bool(
+                (row.get("protect_reasoning") or {}).get(
+                    "reasoning_evidence_present"
+                )
+            )
+            for row in result_rows
+        ),
+        "remove_reasoning_evidence_count": sum(
+            bool(
+                (row.get("remove_reasoning") or {}).get(
+                    "reasoning_evidence_present"
+                )
+            )
+            for row in result_rows
+        ),
     }
     totals["unsure_frames"] = (
         totals["frame_count"] - totals["inside_frames"] - totals["outside_frames"]
@@ -796,6 +1092,17 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "remove_prompt_version": REMOVE_PROMPT_VERSION,
         "model": model,
         "env_file_name": profile_name,
+        **reasoning_metadata,
+        "teacher_timestamp_contract_id": TIMESTAMP_CONTRACT_ID,
+        "require_reasoning_evidence": require_reasoning_evidence,
+        "reasoning_contract_satisfied": (
+            not require_reasoning_evidence
+            or (
+                totals["failed_closed_count"] == 0
+                and totals["protect_reasoning_evidence_count"] == len(result_rows)
+                and totals["remove_reasoning_evidence_count"] == len(result_rows)
+            )
+        ),
         "audio_content_mode": audio_content_mode,
         "base_url_host": (
             base_url.split("/", 3)[2] if "://" in base_url else base_url
@@ -824,8 +1131,10 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         {
             "schema": "candidate_island_scorer_v11_dual_evidence_progress_v1",
             "status": "completed",
-            "provider_profile": profile_name,
             "model": model,
+            **reasoning_metadata,
+            "teacher_timestamp_contract_id": TIMESTAMP_CONTRACT_ID,
+            "require_reasoning_evidence": require_reasoning_evidence,
             "completed": len(result_rows),
             "total": len(rows),
             "pending": 0,
@@ -867,12 +1176,55 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--base-url-env", default=",".join(DEFAULT_BASE_URL_ENV_CANDIDATES))
     parser.add_argument("--model", default="")
     parser.add_argument("--timeout-s", type=float, default=240.0)
-    parser.add_argument("--max-tokens", type=int, default=2048)
+    parser.add_argument(
+        "--max-tokens",
+        type=int,
+        default=0,
+        help=(
+            "0 selects the provider default used by this tool: Gemini=8192, "
+            "Qwen=2048."
+        ),
+    )
     parser.add_argument("--thinking-budget", type=int, default=1024)
+    parser.add_argument(
+        "--reasoning-effort",
+        choices=GEMINI_THINKING_LEVELS,
+        default="medium",
+        help="Gemini/OpenRouter only; Qwen uses --thinking-budget instead.",
+    )
     parser.add_argument(
         "--enable-thinking",
         action=argparse.BooleanOptionalAction,
         default=True,
+    )
+    parser.add_argument(
+        "--exclude-reasoning",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "OpenRouter only: if true, ask the provider to hide reasoning text "
+            "(reasoning.exclude=true). Default false so usage.reasoning_tokens "
+            "and reasoning_details stay visible for the Gemini thinking gate."
+        ),
+    )
+    parser.add_argument(
+        "--require-reasoning-evidence",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "For Gemini with thinking enabled, require positive reasoning tokens, "
+            "visible reasoning_details, or a valid google-gemini-v1 thought signature."
+        ),
+    )
+    parser.add_argument(
+        "--preview-requests",
+        action="store_true",
+        help="Write redacted Protect/Remove request bodies without network calls.",
+    )
+    parser.add_argument(
+        "--print-request",
+        action="store_true",
+        help="Print the first Protect/Remove request bodies with audio redacted.",
     )
     parser.add_argument("--max-attempts", type=int, default=3)
     parser.add_argument("--request-interval-s", type=float, default=0.5)

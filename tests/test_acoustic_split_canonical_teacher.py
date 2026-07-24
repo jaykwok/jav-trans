@@ -16,6 +16,7 @@ from tools.audits import (
 from tools.audits import (
     generate_acoustic_split_canonical_candidate_audit_html as audit,
 )
+from tools.omni.timestamp_contract import TIMESTAMP_CONTRACT_ID
 
 
 def _write_jsonl(path: Path, rows: list[dict]) -> None:
@@ -160,12 +161,24 @@ def test_canonical_prompt_does_not_leak_model_scores_or_labels(tmp_path: Path) -
     # Candidate f00001 @ 2.0s in a 10s window -> clip [0, 6], offset 2.0.
     prompt_1 = labeler.build_prompt(candidates[1], clip_start=0.0, clip_end=6.0)
     payload_1 = json.loads(prompt_1)
-    assert payload_1 == {"duration_s": 6.0, "candidate": {"id": "f00001", "time_s": 2.0}}
+    assert payload_1 == {
+        "duration_ts": "00:06.000",
+        "timestamp_format": "MM:SS.mmm",
+        "timestamp_contract_id": TIMESTAMP_CONTRACT_ID,
+        "coordinate_system": "0-based current uploaded-audio timeline",
+        "candidate": {"id": "f00001", "time_ts": "00:02.000"},
+    }
 
     # Candidate f00002 @ 6.0s -> clip [2, 10], offset 4.0.
     prompt_2 = labeler.build_prompt(candidates[2], clip_start=2.0, clip_end=10.0)
     payload_2 = json.loads(prompt_2)
-    assert payload_2 == {"duration_s": 8.0, "candidate": {"id": "f00002", "time_s": 4.0}}
+    assert payload_2 == {
+        "duration_ts": "00:08.000",
+        "timestamp_format": "MM:SS.mmm",
+        "timestamp_contract_id": TIMESTAMP_CONTRACT_ID,
+        "coordinate_system": "0-based current uploaded-audio timeline",
+        "candidate": {"id": "f00002", "time_ts": "00:04.000"},
+    }
 
     assert "p_cut" not in prompt_1
     assert "current_label" not in prompt_1
@@ -173,6 +186,7 @@ def test_canonical_prompt_does_not_leak_model_scores_or_labels(tmp_path: Path) -
     assert "短暂停顿" in labeler.SYSTEM_PROMPT
     assert "学生｜は静かです" in labeler.SYSTEM_PROMPT
     assert "话题变化" in labeler.SYSTEM_PROMPT
+    assert "MM:SS.mmm" in labeler.SYSTEM_PROMPT
 
 
 def test_canonical_teacher_labels_one_window(tmp_path: Path, monkeypatch) -> None:

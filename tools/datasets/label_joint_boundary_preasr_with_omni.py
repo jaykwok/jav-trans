@@ -31,9 +31,15 @@ from tools.asr.cueqc.label_pre_asr_with_omni import (  # noqa: E402
     slice_audio_clip,
     training_label_from_omni,
 )
+from tools.omni.timestamp_contract import (  # noqa: E402
+    TIMESTAMP_PROMPT_CONTRACT_ZH,
+    format_duration_timestamp,
+    format_mmss_timestamp,
+    timestamp_request_contract,
+)
 
 
-PROMPT_VERSION = "joint_boundary_preasr_omni_v3_separate"
+PROMPT_VERSION = "joint_boundary_preasr_omni_v4_mmss_mmm"
 JOINT_SCHEMA = "joint_boundary_preasr_omni_label_v1"
 RESPONSE_CACHE_SCHEMA = "omni_response_cache_v1"
 
@@ -278,14 +284,15 @@ def _build_split_prompt(
     payload = [
         {
             "id": f"s{position:03d}",
-            "time_s": round(float(row["time_s"]), 3),
+            "time_ts": format_mmss_timestamp(float(row["time_s"])),
             "current": str(row.get("label") or ""),
             "p_cut": round(float(row.get("p_cut") or 0.0), 4),
         }
         for position, row in enumerate(split_items)
     ]
+    request_contract = timestamp_request_contract(duration_s)
     return f"""你是日语 ASR split candidate 标注器。只判断输入中的候选切点是否应该作为语义切分点。
-音频时间范围为 0.000 到 {duration_s:.3f} 秒；候选时间相对此音频。
+音频时间范围为 00:00.000 到 {request_contract['duration_ts']}；候选时间相对此音频。
 
 标签定义：
 - cut：左右是可独立送入 ASR/字幕的语义单元，且左右都完整。
@@ -297,6 +304,10 @@ def _build_split_prompt(
 - cut 必须同时满足 left_complete=true、right_complete=true、merged_better=false。
 - 只判断 split_candidates 中列出的候选切点，不要报告其它漏掉的句界，不要判断 chunk keep/drop。
 - 必须对输入中的每个 id 恰好返回一次，不得发明 id。
+
+{TIMESTAMP_PROMPT_CONTRACT_ZH}
+
+audio_contract={json.dumps(request_contract, ensure_ascii=False, separators=(",", ":"))}
 
 split_candidates={json.dumps(payload, ensure_ascii=False, separators=(",", ":"))}
 
@@ -322,7 +333,7 @@ def _build_pre_asr_prompt(
     *,
     item_id: str = "p000",
 ) -> str:
-    duration_s = float(chunk_item.get("duration_s") or 0.0)
+    duration_ts = format_duration_timestamp(float(chunk_item.get("duration_s") or 0.0))
     return f"""你是 pre-ASR CueQC 数据标注器。只判断这一段音频 chunk 是否适合作为 ASR 训练/推理输入。
 
 标签定义：
@@ -335,7 +346,7 @@ def _build_pre_asr_prompt(
 - 有清楚语义对白时标 keep；纯呻吟/呼吸/环境声/噪音标 drop；不确定标 unsure。
 - 当前上传音频已经是待判断 chunk，本次不要判断原 75s 窗口，也不要判断 split 点。
 
-chunk={{"id":"{item_id}","duration_s":{duration_s:.3f}}}
+chunk={{"id":"{item_id}","duration_ts":"{duration_ts}"}}
 
 只输出 JSON，不要输出 Markdown：
 {{

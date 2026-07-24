@@ -2,11 +2,15 @@ from __future__ import annotations
 
 import json
 import argparse
+import inspect
 from pathlib import Path
 
 from tools.audits.compare_candidate_island_teacher_to_human import compare
 from tools.audits.generate_candidate_island_teacher_comparison_html import _audio_path
-from tools.asr.cueqc.label_pre_asr_with_omni import normalize_openai_compat_base_url
+from tools.asr.cueqc.label_pre_asr_with_omni import (
+    call_omni,
+    normalize_openai_compat_base_url,
+)
 from tools.boundary.ja.label_candidate_island_scorer_v11_with_omni import (
     ASSERTIVE_SAFE_OUTSIDE_PROMPT_PROFILE,
     ASSERTIVE_SAFE_OUTSIDE_PROMPT_VERSION,
@@ -48,19 +52,30 @@ from tools.boundary.ja.compile_candidate_island_scorer_v11_real_train_outside im
     build as compile_real_train_outside,
 )
 from boundary.contracts import ACOUSTIC_BINARY_V12_CONTRACT
-from tools.omni.run_audio_teacher import parse_args as parse_generic_args
+from tools.omni.run_audio_teacher import (
+    _effective_max_tokens,
+    parse_args as parse_generic_args,
+)
+from tools.omni.timestamp_contract import TIMESTAMP_CONTRACT_ID
 
 
 def test_provider_base_url_normalization_and_known_profiles() -> None:
     assert normalize_openai_compat_base_url("https://openrouter.ai/api/v1/chat/completions") == "https://openrouter.ai/api/v1"
     assert parse_args(["--manifest", "x", "--output-dir", "y"]).env_file == "gemini"
     assert parse_args(["--manifest", "x", "--output-dir", "y", "--env-file", "qwen"]).env_file == "qwen"
-    assert parse_generic_args(["--output-dir", "y", "--prompt", "x"]).env_file == "gemini"
+    generic_gemini = parse_generic_args(["--output-dir", "y", "--prompt", "x"])
+    assert generic_gemini.env_file == "gemini"
+    assert generic_gemini.max_tokens == 0
+    assert generic_gemini.reasoning_effort == "medium"
+    assert inspect.signature(call_omni).parameters["reasoning_effort"].default == "medium"
     assert parse_generic_args(["--output-dir", "y", "--env-file", "qwen", "--prompt", "x"]).env_file == "qwen"
+    assert _effective_max_tokens("gemini", 0) == 8192
+    assert _effective_max_tokens("qwen", 0) == 2048
+    assert _effective_max_tokens("gemini", 4096) == 4096
 
 
 def test_candidate_island_teacher_prompt_matches_scorer_responsibility() -> None:
-    assert PROMPT_VERSION.endswith("dialogue_islands_v5")
+    assert PROMPT_VERSION.endswith("dialogue_islands_v5_mmss_mmm")
     assert "不是 Split" in SYSTEM_PROMPT
     assert "不是 CueQC" in SYSTEM_PROMPT
     assert "若整条 source 都是明确的纯非语义声音，必须允许 islands=[]" in SYSTEM_PROMPT
@@ -69,6 +84,9 @@ def test_candidate_island_teacher_prompt_matches_scorer_responsibility() -> None
     assert "ASR 能否转录" in SYSTEM_PROMPT
     assert "固定时长" in SYSTEM_PROMPT
     payload = json.loads(_prompt({"source_id": "s", "duration_s": 75.0}))
+    assert payload["duration_ts"] == "01:15.000"
+    assert payload["timestamp_contract_id"] == TIMESTAMP_CONTRACT_ID
+    assert "duration_s" not in payload
     assert "target_language" not in payload
     assert "target_domain" not in payload
     assert "domain_rule" not in payload
@@ -88,7 +106,9 @@ def test_safe_outside_prompt_is_precision_first_and_keeps_wordlike_moans() -> No
         ]
     )
     assert args.prompt_profile == SAFE_OUTSIDE_PROMPT_PROFILE
-    assert SAFE_OUTSIDE_PROMPT_VERSION.endswith("safe_outside_complement_v1")
+    assert SAFE_OUTSIDE_PROMPT_VERSION.endswith(
+        "safe_outside_complement_v1_mmss_mmm"
+    )
     assert "环境背景噪声" in SAFE_OUTSIDE_SYSTEM_PROMPT
     assert "啊、嗯、哼、哈、诶" in SAFE_OUTSIDE_SYSTEM_PROMPT
     assert "あ、あっ、うん、ん、ふん、え、はぁ" in SAFE_OUTSIDE_SYSTEM_PROMPT
@@ -117,7 +137,7 @@ def test_simple_safe_outside_prompt_keeps_the_request_compact() -> None:
     )
     assert args.prompt_profile == SIMPLE_SAFE_OUTSIDE_PROMPT_PROFILE
     assert SIMPLE_SAFE_OUTSIDE_PROMPT_VERSION.endswith(
-        "safe_outside_complement_v2_simple"
+        "safe_outside_complement_v2_simple_mmss_mmm"
     )
     assert "纯环境与物理音" in SIMPLE_SAFE_OUTSIDE_SYSTEM_PROMPT
     assert "独立且连续的非语言生理音" in SIMPLE_SAFE_OUTSIDE_SYSTEM_PROMPT
@@ -129,11 +149,10 @@ def test_simple_safe_outside_prompt_keeps_the_request_compact() -> None:
             prompt_profile=SIMPLE_SAFE_OUTSIDE_PROMPT_PROFILE,
         )
     )
-    assert payload == {
-        "source_id": "s",
-        "duration_s": 75.0,
-        "coordinate_system": "0-based current full-source timeline in seconds",
-    }
+    assert payload["source_id"] == "s"
+    assert payload["duration_ts"] == "01:15.000"
+    assert payload["timestamp_contract_id"] == TIMESTAMP_CONTRACT_ID
+    assert "duration_s" not in payload
 
 
 def test_greenlight_and_funnel_safe_outside_prompts_are_distinct_profiles() -> None:
@@ -162,7 +181,7 @@ def test_greenlight_and_funnel_safe_outside_prompts_are_distinct_profiles() -> N
             ]
         )
         assert args.prompt_profile == profile
-        assert version.endswith(profile.replace("-", "_"))
+        assert version.endswith(profile.replace("-", "_") + "_mmss_mmm")
         assert marker in system_prompt
         assert "safe_outside_spans" in system_prompt
         payload = json.loads(
@@ -171,7 +190,13 @@ def test_greenlight_and_funnel_safe_outside_prompts_are_distinct_profiles() -> N
                 prompt_profile=profile,
             )
         )
-        assert set(payload) == {"source_id", "duration_s", "coordinate_system"}
+        assert set(payload) == {
+            "source_id",
+            "duration_ts",
+            "timestamp_format",
+            "timestamp_contract_id",
+            "coordinate_system",
+        }
 
 
 def test_assertive_safe_outside_prompt_prioritizes_nonsemantic_vocal_cleanup() -> None:
@@ -187,7 +212,7 @@ def test_assertive_safe_outside_prompt_prioritizes_nonsemantic_vocal_cleanup() -
     )
     assert args.prompt_profile == ASSERTIVE_SAFE_OUTSIDE_PROMPT_PROFILE
     assert ASSERTIVE_SAFE_OUTSIDE_PROMPT_VERSION.endswith(
-        "safe_outside_complement_v5_assertive"
+        "safe_outside_complement_v5_assertive_mmss_mmm"
     )
     assert "必须积极标记为 outside" in ASSERTIVE_SAFE_OUTSIDE_SYSTEM_PROMPT
     assert "至少 50ms" in ASSERTIVE_SAFE_OUTSIDE_SYSTEM_PROMPT
@@ -198,7 +223,8 @@ def test_assertive_safe_outside_prompt_prioritizes_nonsemantic_vocal_cleanup() -
             prompt_profile=ASSERTIVE_SAFE_OUTSIDE_PROMPT_PROFILE,
         )
     )
-    assert set(payload) == {"source_id", "duration_s", "coordinate_system"}
+    assert payload["duration_ts"] == "01:15.000"
+    assert payload["timestamp_contract_id"] == TIMESTAMP_CONTRACT_ID
 
 
 def test_balanced_v12_teacher_prompt_allows_nonlexical_human_sound_without_forcing_it() -> None:
@@ -214,7 +240,7 @@ def test_balanced_v12_teacher_prompt_allows_nonlexical_human_sound_without_forci
     )
     assert args.prompt_profile == BALANCED_V12_SAFE_OUTSIDE_PROMPT_PROFILE
     assert BALANCED_V12_SAFE_OUTSIDE_PROMPT_VERSION.endswith(
-        "safe_outside_complement_v6_balanced_v12_teacher"
+        "safe_outside_complement_v6_balanced_v12_teacher_mmss_mmm"
     )
     assert "不要求证明该区间“绝对不可能”包含语言" in BALANCED_V12_SAFE_OUTSIDE_SYSTEM_PROMPT
     assert "非词化人声也可以标记" in BALANCED_V12_SAFE_OUTSIDE_SYSTEM_PROMPT
@@ -225,7 +251,8 @@ def test_balanced_v12_teacher_prompt_allows_nonlexical_human_sound_without_forci
             prompt_profile=BALANCED_V12_SAFE_OUTSIDE_PROMPT_PROFILE,
         )
     )
-    assert set(payload) == {"source_id", "duration_s", "coordinate_system"}
+    assert payload["duration_ts"] == "01:15.000"
+    assert payload["timestamp_contract_id"] == TIMESTAMP_CONTRACT_ID
 
 
 def test_custom_safe_outside_prompt_profile_uses_compact_request_payload() -> None:
@@ -248,7 +275,13 @@ def test_custom_safe_outside_prompt_profile_uses_compact_request_payload() -> No
             prompt_profile=CUSTOM_SAFE_OUTSIDE_PROMPT_PROFILE,
         )
     )
-    assert set(payload) == {"source_id", "duration_s", "coordinate_system"}
+    assert set(payload) == {
+        "source_id",
+        "duration_ts",
+        "timestamp_format",
+        "timestamp_contract_id",
+        "coordinate_system",
+    }
 
 
 def test_safe_outside_prompt_materializes_only_the_provisional_keep_complement() -> None:
@@ -256,14 +289,14 @@ def test_safe_outside_prompt_materializes_only_the_provisional_keep_complement()
         {
             "safe_outside_spans": [
                 {
-                    "start_s": 0.04,
-                    "end_s": 0.08,
+                    "start_ts": "00:00.040",
+                    "end_ts": "00:00.080",
                     "confidence": 0.9,
                     "reason": "room noise",
                 },
                 {
-                    "start_s": 0.14,
-                    "end_s": 0.2,
+                    "start_ts": "00:00.140",
+                    "end_ts": "00:00.200",
                     "confidence": 0.8,
                     "reason": "music",
                 },
@@ -289,7 +322,11 @@ def test_teacher_span_error_names_local_clip_range() -> None:
         _spans(
             {
                 "islands": [
-                    {"start_s": 101.5, "end_s": 108.0, "confidence": 0.9}
+                    {
+                        "start_ts": "01:41.500",
+                        "end_ts": "01:48.000",
+                        "confidence": 0.9,
+                    }
                 ]
             },
             duration_s=75.0,
@@ -298,8 +335,8 @@ def test_teacher_span_error_names_local_clip_range() -> None:
         message = str(error)
     else:
         raise AssertionError("out-of-range teacher coordinates must be rejected")
-    assert "required_range=0..75.0" in message
-    assert "0-based audio clip timeline" in message
+    assert "exceeds source duration" in message
+    assert "01:15.000" in message
 
 
 def test_teacher_resume_rejects_rows_from_a_different_prompt(tmp_path: Path) -> None:
@@ -319,6 +356,7 @@ def test_teacher_resume_rejects_rows_from_a_different_prompt(tmp_path: Path) -> 
                     "source_id": "current",
                     "model": "gemini",
                     "prompt_version": PROMPT_VERSION,
+                    "teacher_timestamp_contract_id": TIMESTAMP_CONTRACT_ID,
                 },
             )
         ),
@@ -332,9 +370,15 @@ def test_teacher_rejects_overlap_between_inside_and_unsure() -> None:
         _spans(
             {
                 "islands": [
-                    {"start_s": 1.0, "end_s": 4.0, "confidence": 0.9}
+                    {
+                        "start_ts": "00:01.000",
+                        "end_ts": "00:04.000",
+                        "confidence": 0.9,
+                    }
                 ],
-                "unsure_spans": [{"start_s": 3.5, "end_s": 5.0}],
+                "unsure_spans": [
+                    {"start_ts": "00:03.500", "end_ts": "00:05.000"}
+                ],
             },
             duration_s=10.0,
         )

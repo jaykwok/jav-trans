@@ -102,7 +102,7 @@ def test_boundary_feature_export_fails_closed_when_split_artifacts_are_missing(
     assert not list(feature_dir.glob(".*.npz"))
 
 
-def test_v3_prompts_keep_omni_requests_single_task() -> None:
+def test_v4_prompts_keep_omni_requests_single_task_and_use_mmss() -> None:
     split_prompt = _build_split_prompt(
         [
             {
@@ -119,15 +119,21 @@ def test_v3_prompts_keep_omni_requests_single_task() -> None:
         item_id="p000",
     )
 
-    assert PROMPT_VERSION == "joint_boundary_preasr_omni_v3_separate"
+    assert PROMPT_VERSION == "joint_boundary_preasr_omni_v4_mmss_mmm"
     assert "split_candidates=" in split_prompt
     assert '"id":"s000"' in split_prompt
+    assert '"time_ts":"00:01.250"' in split_prompt
+    assert '"duration_ts":"00:03.000"' in split_prompt
+    assert "MM:SS.mmm" in split_prompt
+    assert '"time_s"' not in split_prompt
+    assert '"duration_s"' not in split_prompt
     assert "runtime_chunks=" not in split_prompt
     assert "chunk_decisions" not in split_prompt
     assert "missed_boundaries" not in split_prompt
     assert "任务 B" not in split_prompt
 
-    assert 'chunk={"id":"p000"' in pre_asr_prompt
+    assert 'chunk={"id":"p000","duration_ts":"00:02.000"}' in pre_asr_prompt
+    assert '"duration_s"' not in pre_asr_prompt
     assert "keep|drop|unsure" in pre_asr_prompt
     assert "split_candidates=" not in pre_asr_prompt
     assert "split_decisions" not in pre_asr_prompt
