@@ -17,6 +17,9 @@ from boundary.ja.model import (
     CANDIDATE_ISLAND_SCORER_V11_COMPACT_SCHEMA,
     CANDIDATE_ISLAND_SCORER_V11_CRF_SCHEMA,
     CANDIDATE_ISLAND_SCORER_V11_CRF_AB_AXIS,
+    CANDIDATE_ISLAND_SCORER_V11_DENSE_SPAN_AB_AXIS,
+    CANDIDATE_ISLAND_SCORER_V11_DENSE_SPAN_MAX_PADDED_FRAMES,
+    CANDIDATE_ISLAND_SCORER_V11_DENSE_SPAN_SCHEMA,
     CANDIDATE_ISLAND_SCORER_V11_FEATURE_EXTRACTOR_SCHEMA,
     CANDIDATE_ISLAND_SCORER_V11_FULL_CAPACITY_PROFILE,
     CANDIDATE_ISLAND_SCORER_V11_QUERY_MASK_AB_AXIS,
@@ -793,6 +796,42 @@ def test_v11_feature_compile_and_random_init_cpu_smoke(tmp_path: Path) -> None:
     assert query_bundle.metadata["runtime_duration_rule"] is None
     assert query_bundle.metadata["runtime_top_k"] is None
     assert query_bundle.metadata["runtime_nms"] is None
+
+    dense_args = argparse.Namespace(
+        **{
+            **vars(args),
+            "output_dir": str(tmp_path / "training-dense-span"),
+            "variant": "dense_span",
+            "capacity_profile": CANDIDATE_ISLAND_SCORER_V11_FULL_CAPACITY_PROFILE,
+        }
+    )
+    dense_result = train(dense_args)
+    dense_checkpoint = Path(dense_result["checkpoint"])
+    if not dense_checkpoint.is_absolute():
+        dense_checkpoint = Path.cwd() / dense_checkpoint
+    dense_bundle = load_speech_island_scorer_checkpoint(
+        dense_checkpoint, device="cpu"
+    )
+    assert dense_bundle.schema == CANDIDATE_ISLAND_SCORER_V11_DENSE_SPAN_SCHEMA
+    assert dense_bundle.metadata["decision_mode"] == (
+        "learned_binary_dense_span_viterbi_argmax"
+    )
+    assert dense_bundle.metadata["capacity_ab_axis"] == (
+        CANDIDATE_ISLAND_SCORER_V11_DENSE_SPAN_AB_AXIS
+    )
+    assert dense_result["training_seed"] == 117
+    assert dense_result["training_max_padded_frames"] == 32
+    assert dense_result["capacity_contract"]["schema"] == (
+        CANDIDATE_ISLAND_SCORER_V11_DENSE_SPAN_SCHEMA
+    )
+    assert dense_result["capacity_contract"]["max_padded_frames"] == (
+        CANDIDATE_ISLAND_SCORER_V11_DENSE_SPAN_MAX_PADDED_FRAMES
+    )
+    assert dense_bundle.metadata["runtime_threshold"] is None
+    assert dense_bundle.metadata["runtime_duration_rule"] is None
+    assert dense_bundle.metadata["runtime_max_span_frames"] is None
+    assert dense_bundle.metadata["runtime_top_k"] is None
+    assert dense_bundle.metadata["runtime_nms"] is None
 
 
 def test_v11_feature_compile_rejects_projected_ptm128(tmp_path: Path) -> None:

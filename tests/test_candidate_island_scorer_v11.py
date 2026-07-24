@@ -33,6 +33,15 @@ from boundary.ja.model import (
     CANDIDATE_ISLAND_SCORER_V11_CRF_AB_AXIS,
     CANDIDATE_ISLAND_SCORER_V11_CRF_MODEL_ARCH,
     CANDIDATE_ISLAND_SCORER_V11_CRF_SCHEMA,
+    CANDIDATE_ISLAND_SCORER_V11_DENSE_SPAN_AB_AXIS,
+    CANDIDATE_ISLAND_SCORER_V11_DENSE_SPAN_DATASET_CONTRACT,
+    CANDIDATE_ISLAND_SCORER_V11_DENSE_SPAN_DURATION_HIDDEN_SIZE,
+    CANDIDATE_ISLAND_SCORER_V11_DENSE_SPAN_MARGIN,
+    CANDIDATE_ISLAND_SCORER_V11_DENSE_SPAN_MAX_PADDED_FRAMES,
+    CANDIDATE_ISLAND_SCORER_V11_DENSE_SPAN_MODEL_ARCH,
+    CANDIDATE_ISLAND_SCORER_V11_DENSE_SPAN_RANK,
+    CANDIDATE_ISLAND_SCORER_V11_DENSE_SPAN_RESIDUAL,
+    CANDIDATE_ISLAND_SCORER_V11_DENSE_SPAN_SCHEMA,
     CANDIDATE_ISLAND_SCORER_V11_DATASET_CONTRACT,
     CANDIDATE_ISLAND_SCORER_V11_FULL_CAPACITY_PROFILE,
     CANDIDATE_ISLAND_SCORER_V11_LABELS,
@@ -53,6 +62,7 @@ from boundary.ja.model import (
     CANDIDATE_ISLAND_SCORER_V11_QUERY_MASK_SCHEMA,
     CANDIDATE_ISLAND_SCORER_V11_SCHEMA,
     CandidateIslandQueryMaskScorerNetwork,
+    CandidateIslandDenseSpanScorerNetwork,
     CandidateIslandScorerNetwork,
     CandidateIslandCrfScorerNetwork,
     CandidateIslandHeatmapScorerNetwork,
@@ -63,6 +73,7 @@ from boundary.ja.model import (
     score_binary_speech_class_probabilities_batch,
     score_candidate_island_class_probabilities_batch,
     score_candidate_island_crf_outputs_batch,
+    score_candidate_island_dense_span_outputs_batch,
     score_candidate_island_heatmap_class_probabilities_batch,
     score_candidate_island_heatmap_source_probabilities,
     score_candidate_island_query_mask_class_probabilities_batch,
@@ -144,6 +155,19 @@ def _query_mask_config() -> dict:
         "query_interaction_layers": CANDIDATE_ISLAND_SCORER_V11_QUERY_INTERACTION_LAYERS,
         "query_mask_aggregation": CANDIDATE_ISLAND_SCORER_V11_QUERY_MASK_AGGREGATION,
         "query_residual_fusion": CANDIDATE_ISLAND_SCORER_V11_QUERY_MASK_RESIDUAL,
+    }
+
+
+def _dense_span_config() -> dict:
+    return {
+        **_config(),
+        "model_arch": CANDIDATE_ISLAND_SCORER_V11_DENSE_SPAN_MODEL_ARCH,
+        "dense_span_rank": CANDIDATE_ISLAND_SCORER_V11_DENSE_SPAN_RANK,
+        "dense_span_duration_hidden_size": (
+            CANDIDATE_ISLAND_SCORER_V11_DENSE_SPAN_DURATION_HIDDEN_SIZE
+        ),
+        "dense_span_margin": CANDIDATE_ISLAND_SCORER_V11_DENSE_SPAN_MARGIN,
+        "dense_span_residual": CANDIDATE_ISLAND_SCORER_V11_DENSE_SPAN_RESIDUAL,
     }
 
 
@@ -542,6 +566,175 @@ def test_candidate_query_mask_source_scoring_is_frame_budget_equivalent() -> Non
     np.testing.assert_array_equal(
         np.argmax(one_batch, axis=1), np.argmax(split_batches, axis=1)
     )
+
+
+def test_candidate_dense_span_zero_gate_preserves_frozen_dense_baseline() -> None:
+    torch = pytest.importorskip("torch")
+    config = _config()
+    dense_config = _dense_span_config()
+    ptm = torch.randn((2, 7, 2048), generator=torch.Generator().manual_seed(81))
+    mfcc = torch.randn((2, 7, 40), generator=torch.Generator().manual_seed(82))
+    attention = torch.tensor(
+        [
+            [True, True, True, True, True, True, True],
+            [True, True, True, True, False, False, False],
+        ]
+    )
+
+    torch.manual_seed(117)
+    baseline = CandidateIslandScorerNetwork(**config).eval()
+    baseline_state = {
+        key: value.detach().clone() for key, value in baseline.state_dict().items()
+    }
+    with torch.no_grad():
+        baseline_logits = baseline(ptm, mfcc, attention_mask=attention)
+    del baseline
+
+    torch.manual_seed(117)
+    dense = CandidateIslandDenseSpanScorerNetwork(**dense_config).eval()
+    dense_state = dense.state_dict()
+    for key, expected in baseline_state.items():
+        torch.testing.assert_close(dense_state[key], expected, rtol=0.0, atol=0.0)
+    with torch.no_grad():
+        outputs = dense.forward_outputs(ptm, mfcc, attention_mask=attention)
+        labels = dense.decode(outputs["span_scores"], attention)
+
+    assert float(outputs["span_residual_gate"]) == 0.0
+    torch.testing.assert_close(
+        outputs["class_logits"], baseline_logits, rtol=0.0, atol=0.0
+    )
+    torch.testing.assert_close(
+        labels[attention], torch.argmax(baseline_logits, dim=-1)[attention]
+    )
+
+
+def test_candidate_dense_span_checkpoint_and_batching_are_strict(tmp_path) -> None:
+    torch = pytest.importorskip("torch")
+    config = _dense_span_config()
+    model = CandidateIslandDenseSpanScorerNetwork(**config).eval()
+    payload = build_speech_island_scorer_checkpoint(
+        model=model,
+        model_config=config,
+        normalization={"mfcc_mean": [0.0] * 40, "mfcc_std": [1.0] * 40},
+        metadata=_metadata(),
+        schema=CANDIDATE_ISLAND_SCORER_V11_DENSE_SPAN_SCHEMA,
+    )
+    checkpoint = tmp_path / "candidate-scorer-v11-dense-span.pt"
+    torch.save(payload, checkpoint)
+    bundle = load_speech_island_scorer_checkpoint(checkpoint, device="cpu")
+
+    assert bundle.schema == CANDIDATE_ISLAND_SCORER_V11_DENSE_SPAN_SCHEMA
+    assert bundle.metadata["dataset_contract"] == (
+        CANDIDATE_ISLAND_SCORER_V11_DENSE_SPAN_DATASET_CONTRACT
+    )
+    assert bundle.metadata["decision_mode"] == (
+        "learned_binary_dense_span_viterbi_argmax"
+    )
+    assert bundle.metadata["capacity_ab_axis"] == (
+        CANDIDATE_ISLAND_SCORER_V11_DENSE_SPAN_AB_AXIS
+    )
+    assert bundle.metadata["runtime_threshold"] is None
+    assert bundle.metadata["runtime_duration_rule"] is None
+    assert bundle.metadata["runtime_max_span_frames"] is None
+    assert bundle.metadata["runtime_top_k"] is None
+    assert bundle.metadata["runtime_nms"] is None
+    assert bundle.metadata["dataset_contract"]["max_padded_frames"] == (
+        CANDIDATE_ISLAND_SCORER_V11_DENSE_SPAN_MAX_PADDED_FRAMES
+    )
+
+    rng = np.random.default_rng(2507)
+    pairs = [
+        (
+            rng.normal(size=(frames, 2048)).astype(np.float32),
+            rng.normal(size=(frames, 40)).astype(np.float32),
+        )
+        for frames in (5, 9, 7)
+    ]
+    batched = score_candidate_island_dense_span_outputs_batch(
+        bundle, feature_pairs=pairs
+    )
+    singletons = [
+        score_candidate_island_dense_span_outputs_batch(
+            bundle, feature_pairs=[pair]
+        )[0]
+        for pair in pairs
+    ]
+    for left, right in zip(batched, singletons, strict=True):
+        np.testing.assert_allclose(
+            left.probabilities, right.probabilities, atol=1e-5, rtol=1e-5
+        )
+        np.testing.assert_array_equal(left.labels, right.labels)
+
+    for key, value in (
+        ("runtime_threshold", 0.5),
+        ("runtime_duration_rule", "drop_under_200ms"),
+        ("runtime_max_span_frames", 400),
+        ("runtime_top_k", 8),
+        ("runtime_nms", "greedy"),
+    ):
+        with pytest.raises(ValueError, match=f"forbids {key}"):
+            build_speech_island_scorer_checkpoint(
+                model=model,
+                model_config=config,
+                normalization={"mfcc_mean": [0.0] * 40, "mfcc_std": [1.0] * 40},
+                metadata=_metadata(**{key: value}),
+                schema=CANDIDATE_ISLAND_SCORER_V11_DENSE_SPAN_SCHEMA,
+            )
+
+    tampered = dict(payload)
+    tampered["metadata"] = dict(payload["metadata"])
+    tampered["metadata"]["dataset_contract"] = dict(
+        payload["metadata"]["dataset_contract"]
+    )
+    tampered["metadata"]["dataset_contract"]["max_padded_frames"] = 999
+    tampered_checkpoint = tmp_path / "candidate-scorer-v11-dense-span-tampered.pt"
+    torch.save(tampered, tampered_checkpoint)
+    with pytest.raises(ValueError, match="dataset contract mismatch"):
+        load_speech_island_scorer_checkpoint(tampered_checkpoint, device="cpu")
+
+    with pytest.raises(ValueError, match="training_max_padded_frames"):
+        build_speech_island_scorer_checkpoint(
+            model=model,
+            model_config=config,
+            normalization={"mfcc_mean": [0.0] * 40, "mfcc_std": [1.0] * 40},
+            metadata=_metadata(training_max_padded_frames=2000),
+            schema=CANDIDATE_ISLAND_SCORER_V11_DENSE_SPAN_SCHEMA,
+        )
+
+    with pytest.raises(ValueError, match="outside capacity"):
+        score_candidate_island_source_outputs(
+            bundle,
+            ptm=pairs[0][0],
+            mfcc=pairs[0][1],
+            max_padded_frames=(
+                CANDIDATE_ISLAND_SCORER_V11_DENSE_SPAN_MAX_PADDED_FRAMES + 1
+            ),
+        )
+
+    with pytest.raises(ValueError, match="exceeds the fixed context"):
+        score_candidate_island_dense_span_outputs_batch(
+            bundle,
+            feature_pairs=[
+                (
+                    np.zeros(
+                        (
+                            CANDIDATE_ISLAND_SCORER_V11_DENSE_SPAN_MAX_PADDED_FRAMES
+                            + 1,
+                            2048,
+                        ),
+                        dtype=np.float32,
+                    ),
+                    np.zeros(
+                        (
+                            CANDIDATE_ISLAND_SCORER_V11_DENSE_SPAN_MAX_PADDED_FRAMES
+                            + 1,
+                            40,
+                        ),
+                        dtype=np.float32,
+                    ),
+                )
+            ],
+        )
 
 
 def test_candidate_crf_source_scoring_is_frame_budget_equivalent() -> None:

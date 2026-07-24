@@ -23,6 +23,7 @@ from boundary.contracts import ACOUSTIC_BINARY_V12_CONTRACT  # noqa: E402
 from boundary.ja.model import (  # noqa: E402
     CANDIDATE_ISLAND_SCORER_V11_CANONICAL_SOURCE_SCHEMA,
     CANDIDATE_ISLAND_SCORER_V11_CRF_SCHEMA,
+    CANDIDATE_ISLAND_SCORER_V11_DENSE_SPAN_SCHEMA,
     CANDIDATE_ISLAND_SCORER_V11_QUERY_MASK_SCHEMA,
     CANDIDATE_ISLAND_SCORER_V11_RAW_CACHE_ROW_SCHEMA,
     load_speech_island_scorer_checkpoint,
@@ -319,6 +320,27 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             ),
             query_residual_fusion=str(
                 bundle.metadata.get("query_residual_fusion") or ""
+            ),
+        )
+    if bundle.schema == CANDIDATE_ISLAND_SCORER_V11_DENSE_SPAN_SCHEMA:
+        decoder_diagnostics.update(
+            learned_residual_gate=float(
+                torch.tanh(
+                    bundle.model.dense_span.span_residual_gate
+                ).detach().cpu()
+            ),
+            learned_start_scores=(
+                bundle.model.dense_span.start_scores.detach().cpu().tolist()
+            ),
+            learned_end_scores=(
+                bundle.model.dense_span.end_scores.detach().cpu().tolist()
+            ),
+            learned_transition_matrix=(
+                bundle.model.dense_span.transitions.detach().cpu().tolist()
+            ),
+            dense_span_rank=int(bundle.model.dense_span.rank),
+            runtime_probability_semantics=str(
+                bundle.metadata.get("runtime_probability_semantics") or ""
             ),
         )
     first = raw_by_id[str(selected[0]["source_id"])]

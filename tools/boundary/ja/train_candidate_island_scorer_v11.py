@@ -33,6 +33,14 @@ from boundary.ja.model import (  # noqa: E402
     CANDIDATE_ISLAND_SCORER_V11_CRF_AB_AXIS,
     CANDIDATE_ISLAND_SCORER_V11_CRF_MODEL_ARCH,
     CANDIDATE_ISLAND_SCORER_V11_CRF_SCHEMA,
+    CANDIDATE_ISLAND_SCORER_V11_DENSE_SPAN_AB_AXIS,
+    CANDIDATE_ISLAND_SCORER_V11_DENSE_SPAN_DURATION_HIDDEN_SIZE,
+    CANDIDATE_ISLAND_SCORER_V11_DENSE_SPAN_MARGIN,
+    CANDIDATE_ISLAND_SCORER_V11_DENSE_SPAN_MAX_PADDED_FRAMES,
+    CANDIDATE_ISLAND_SCORER_V11_DENSE_SPAN_MODEL_ARCH,
+    CANDIDATE_ISLAND_SCORER_V11_DENSE_SPAN_RANK,
+    CANDIDATE_ISLAND_SCORER_V11_DENSE_SPAN_RESIDUAL,
+    CANDIDATE_ISLAND_SCORER_V11_DENSE_SPAN_SCHEMA,
     CANDIDATE_ISLAND_SCORER_V11_DATASET_CONTRACT,
     CANDIDATE_ISLAND_SCORER_V11_FEATURE_CACHE_GATE_SCHEMA,
     CANDIDATE_ISLAND_SCORER_V11_FULL_CAPACITY_PROFILE,
@@ -54,6 +62,7 @@ from boundary.ja.model import (  # noqa: E402
     CANDIDATE_ISLAND_SCORER_V11_TRAINING_ROW_SCHEMA,
     CandidateIslandHeatmapScorerNetwork,
     CandidateIslandCrfScorerNetwork,
+    CandidateIslandDenseSpanScorerNetwork,
     CandidateIslandQueryMaskScorerNetwork,
     CandidateIslandScorerNetwork,
     build_speech_island_scorer_checkpoint,
@@ -451,6 +460,18 @@ def _model_config(args: argparse.Namespace, normalization: dict[str, list[float]
                 "query_residual_fusion": CANDIDATE_ISLAND_SCORER_V11_QUERY_MASK_RESIDUAL,
             }
         )
+    elif args.variant == "dense_span":
+        config.update(
+            {
+                "model_arch": CANDIDATE_ISLAND_SCORER_V11_DENSE_SPAN_MODEL_ARCH,
+                "dense_span_rank": CANDIDATE_ISLAND_SCORER_V11_DENSE_SPAN_RANK,
+                "dense_span_duration_hidden_size": (
+                    CANDIDATE_ISLAND_SCORER_V11_DENSE_SPAN_DURATION_HIDDEN_SIZE
+                ),
+                "dense_span_margin": CANDIDATE_ISLAND_SCORER_V11_DENSE_SPAN_MARGIN,
+                "dense_span_residual": CANDIDATE_ISLAND_SCORER_V11_DENSE_SPAN_RESIDUAL,
+            }
+        )
     else:
         config["model_arch"] = str(capacity["model_arch"])
     return config
@@ -468,7 +489,7 @@ def _loss(
     valid = batch["owner"] & (batch["labels"] != IGNORE_INDEX)
     if not bool(torch.any(valid)):
         raise ValueError("Scorer v11 batch has no definite owner frames")
-    if variant in {"heatmap_aux", "query_mask"}:
+    if variant in {"heatmap_aux", "query_mask", "dense_span"}:
         outputs = model.forward_outputs(
             batch["ptm"], batch["mfcc"], attention_mask=batch["attention"]
         )
@@ -478,6 +499,10 @@ def _loss(
         logits = model(batch["ptm"], batch["mfcc"], attention_mask=batch["attention"])
     if variant == "crf":
         main = model.sequence_nll(logits, batch["labels"], valid)
+    elif variant == "dense_span":
+        main = model.structured_hinge(
+            outputs["span_scores"], batch["labels"], valid
+        )
     else:
         main = torch.nn.functional.cross_entropy(logits[valid], batch["labels"][valid])
     auxiliary = torch.zeros((), dtype=main.dtype, device=main.device)
@@ -505,7 +530,8 @@ def _loss(
     auxiliary_weight = (
         float(query_mask_weight) if variant == "query_mask" else float(heatmap_weight)
     )
-    return main + auxiliary_weight * auxiliary, main, auxiliary, logits, valid
+    decisions = outputs["span_scores"] if variant == "dense_span" else logits
+    return main + auxiliary_weight * auxiliary, main, auxiliary, decisions, valid
 
 
 def _evaluate(
@@ -536,7 +562,7 @@ def _evaluate(
                 torch=torch,
             )
             target = batch["labels"][valid].detach().cpu().numpy()
-            if variant == "crf":
+            if variant in {"crf", "dense_span"}:
                 predicted_labels = model.decode(logits, batch["attention"])
             else:
                 predicted_labels = torch.argmax(logits, dim=-1)
@@ -637,6 +663,8 @@ def _build_model(args: argparse.Namespace, config: dict[str, Any]):
         return CandidateIslandCrfScorerNetwork(**config)
     if args.variant == "query_mask":
         return CandidateIslandQueryMaskScorerNetwork(**config)
+    if args.variant == "dense_span":
+        return CandidateIslandDenseSpanScorerNetwork(**config)
     return CandidateIslandScorerNetwork(**config)
 
 
@@ -730,9 +758,12 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     import psutil
     import torch
 
-    if args.variant not in {"baseline", "heatmap_aux", "crf", "query_mask"}:
+    if args.variant not in {
+        "baseline", "heatmap_aux", "crf", "query_mask", "dense_span"
+    }:
         raise ValueError(
-            "Scorer v11 variant must be baseline, heatmap_aux, crf, or query_mask"
+            "Scorer v11 variant must be baseline, heatmap_aux, crf, "
+            "query_mask, or dense_span"
         )
     query_mask_weight = float(getattr(args, "query_mask_weight", 0.0))
     log_every = int(getattr(args, "log_every", 50))
@@ -754,7 +785,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         raise ValueError(f"unknown Scorer v11 capacity profile: {capacity_profile!r}")
     capacity = CANDIDATE_ISLAND_SCORER_V11_CAPACITY_PROFILES[capacity_profile]
     if (
-        args.variant in {"heatmap_aux", "crf", "query_mask"}
+        args.variant in {"heatmap_aux", "crf", "query_mask", "dense_span"}
         and capacity_profile != CANDIDATE_ISLAND_SCORER_V11_FULL_CAPACITY_PROFILE
     ):
         raise ValueError(
@@ -766,11 +797,23 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             "Scorer v11 max_padded_frames exceeds the verified no-spill capacity "
             f"for {capacity_profile}: {capacity['max_padded_frames']}"
         )
+    if args.variant == "dense_span" and (
+        int(args.max_padded_frames)
+        > CANDIDATE_ISLAND_SCORER_V11_DENSE_SPAN_MAX_PADDED_FRAMES
+        or (
+            not bool(args.smoke)
+            and int(args.max_padded_frames)
+            != CANDIDATE_ISLAND_SCORER_V11_DENSE_SPAN_MAX_PADDED_FRAMES
+        )
+    ):
+        raise ValueError(
+            "Dense Span A/B freezes max_padded_frames=1000 after feasibility"
+        )
     if float(args.class_weight_outside) != 1.0 or float(args.class_weight_inside) != 1.0:
         raise ValueError("Scorer v11 neutral baseline requires class weights 1/1")
-    if args.variant in {"baseline", "crf", "query_mask"} and float(args.heatmap_weight) != 0.0:
+    if args.variant in {"baseline", "crf", "query_mask", "dense_span"} and float(args.heatmap_weight) != 0.0:
         raise ValueError(
-            "baseline, CRF, and Query-Mask Scorer v11 variants forbid heatmap loss"
+            "baseline, CRF, Query-Mask, and Dense Span variants forbid heatmap loss"
         )
     if args.variant == "heatmap_aux" and float(args.heatmap_weight) <= 0.0:
         raise ValueError("heatmap_aux requires a positive pre-registered weight")
@@ -839,6 +882,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "heatmap_aux": CANDIDATE_ISLAND_SCORER_V11_HEATMAP_SCHEMA,
         "crf": CANDIDATE_ISLAND_SCORER_V11_CRF_SCHEMA,
         "query_mask": CANDIDATE_ISLAND_SCORER_V11_QUERY_MASK_SCHEMA,
+        "dense_span": CANDIDATE_ISLAND_SCORER_V11_DENSE_SPAN_SCHEMA,
     }.get(args.variant, str(capacity["schema"]))
     model = _build_model(args, config).to(device)
     optimizer = torch.optim.AdamW(
@@ -1198,12 +1242,16 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "training_variant": args.variant,
         "capacity_profile": capacity_profile,
         "capacity_ab_axis": (
-            CANDIDATE_ISLAND_SCORER_V11_QUERY_MASK_AB_AXIS
-            if args.variant == "query_mask"
+            CANDIDATE_ISLAND_SCORER_V11_DENSE_SPAN_AB_AXIS
+            if args.variant == "dense_span"
             else (
-                CANDIDATE_ISLAND_SCORER_V11_CRF_AB_AXIS
-                if args.variant == "crf"
-                else "ptm_adapter_and_temporal_capacity_profile"
+                CANDIDATE_ISLAND_SCORER_V11_QUERY_MASK_AB_AXIS
+                if args.variant == "query_mask"
+                else (
+                    CANDIDATE_ISLAND_SCORER_V11_CRF_AB_AXIS
+                    if args.variant == "crf"
+                    else "ptm_adapter_and_temporal_capacity_profile"
+                )
             )
         ),
         "training_seed": int(args.seed),
@@ -1256,6 +1304,11 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "training_max_padded_frames": int(args.max_padded_frames),
         "capacity_contract": {
             **dict(capacity),
+            "max_padded_frames": (
+                CANDIDATE_ISLAND_SCORER_V11_DENSE_SPAN_MAX_PADDED_FRAMES
+                if args.variant == "dense_span"
+                else int(capacity["max_padded_frames"])
+            ),
             "schema": schema,
             "model_arch": str(config["model_arch"]),
         },
@@ -1334,7 +1387,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--output-dir", required=True)
     parser.add_argument(
         "--variant",
-        choices=("baseline", "heatmap_aux", "crf", "query_mask"),
+        choices=("baseline", "heatmap_aux", "crf", "query_mask", "dense_span"),
         default="baseline",
     )
     parser.add_argument(
