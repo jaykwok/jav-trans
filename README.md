@@ -398,6 +398,7 @@ uv run python -m <module> --help
 - `tools.boundary.ja.label_vocal_envelope_scorer_v12_with_omni` / `vocal_envelope_scorer_v12_calibration` / `compile_vocal_envelope_scorer_v12_canonical`：Scorer v12 单调用三态 Teacher、固定 25 条人工批准校准合同与严格 canonical compiler；可把完全相同音频/帧/区间的 pilot 证据零请求重绑定到 full manifest，train 允许校准 Teacher 监督，非 pilot val/test 仍必须人工审计。
 - `tools.boundary.ja.train_vocal_envelope_scorer_v12`：完全随机初始化的 v12 训练器，支持 argmax structured、CRF、Query-Mask 与 Dense Span decoder，持续写入原子 `progress.json`。
 - `tools.audits.generate_candidate_island_dual_evidence_review`：Scorer Protect×Remove 与人工 full-source truth 的三轴 bridge-gap Adapter。
+- `tools.audits.generate_vocal_envelope_scorer_v12_teacher_audit_html`：Scorer v12 三态 Teacher 审计 Adapter；可筛选 train/val/test，并仅在 full evidence 与固定人工批准 pilot 的音频、帧和区间完全一致时跳过已审 calibration source，保存结果始终绑定当前 full manifest/preaudit SHA。
 - `tools.audits.record_vocal_envelope_scorer_v12_approval`：仅在用户明确完成整页审听并统一批准时，把 Scorer v12 审计页的三轴全通过裁决按 source/preaudit SHA 原子写成 `manual_verdicts.jsonl`；不会自动判断或绕过人工 gate。
 - `tools.audits.generate_candidate_island_dual_evidence_ab_review`：在两个已规范化 Scorer dual-evidence review 上复用同一 Core 的 High/Medium A/B Adapter；比较人工真语音保留、outside precision、监督覆盖与逐帧差异。
 - `tools.boundary.ja.select_candidate_island_scorer_v11_mixed_source_manifest` / `compile_candidate_island_scorer_v11_mixed_dual_evidence`：固定一 source/一 video 的真实 mixed-source Teacher manifest，并把独立 Protect/Remove 证据严格编译为 inside/outside/unsure canonical；不使用补集或标签继承。

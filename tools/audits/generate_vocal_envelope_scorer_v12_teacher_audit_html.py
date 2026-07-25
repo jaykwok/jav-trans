@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Generate the source-level Scorer v12 Teacher pilot review page."""
+"""Generate a source-level Scorer v12 Teacher review page."""
 from __future__ import annotations
 
 import argparse
@@ -29,6 +29,11 @@ from tools.audits.review_page_core import (  # noqa: E402
     AuditReviewPageSpec,
     render_audit_review_page,
     validate_audit_option_contract,
+)
+from tools.boundary.ja.vocal_envelope_scorer_v12_calibration import (  # noqa: E402
+    CALIBRATION_ARTIFACT_SHA256,
+    evidence_span_signature,
+    load_approved_calibration,
 )
 
 
@@ -183,7 +188,7 @@ document.getElementById('stop').onclick=stop;document.getElementById('save').onc
 """
     return render_audit_review_page(
         AuditReviewPageSpec(
-            title="Scorer v12 vocal-envelope Teacher pilot review",
+            title="Scorer v12 vocal-envelope Teacher review",
             intro_html=intro,
             body_html=body,
             adapter_css=css,
@@ -193,7 +198,14 @@ document.getElementById('stop').onclick=stop;document.getElementById('save').onc
 
 
 def build(
-    *, source_manifest: Path, preaudit: Path, output_dir: Path
+    *,
+    source_manifest: Path,
+    preaudit: Path,
+    output_dir: Path,
+    partitions: Sequence[str] = (),
+    calibration_manifest: Path | None = None,
+    calibration_preaudit: Path | None = None,
+    calibration_verdicts: Path | None = None,
 ) -> dict[str, Any]:
     source_manifest = source_manifest.resolve()
     preaudit = preaudit.resolve()
@@ -201,6 +213,33 @@ def build(
     evidence = _index(_rows(preaudit), name="v12 preaudit")
     if set(sources) != set(evidence):
         raise ValueError("v12 audit requires exact source/preaudit identity coverage")
+    selected_partitions = set(partitions)
+    if selected_partitions - {"train", "val", "test"}:
+        raise ValueError(f"invalid v12 audit partitions: {sorted(selected_partitions)}")
+    calibration_paths = (
+        calibration_manifest,
+        calibration_preaudit,
+        calibration_verdicts,
+    )
+    if any(path is not None for path in calibration_paths) and not all(
+        path is not None for path in calibration_paths
+    ):
+        raise ValueError(
+            "v12 audit calibration exclusion requires all three calibration files"
+        )
+    calibration: dict[str, Any] | None = None
+    if all(path is not None for path in calibration_paths):
+        assert calibration_manifest is not None
+        assert calibration_preaudit is not None
+        assert calibration_verdicts is not None
+        calibration = load_approved_calibration(
+            manifest=calibration_manifest,
+            preaudit=calibration_preaudit,
+            verdicts=calibration_verdicts,
+            expected_hashes=CALIBRATION_ARTIFACT_SHA256,
+        )
+        if not set(calibration["sources"]).issubset(sources):
+            raise ValueError("v12 audit manifest omits calibrated pilot sources")
     manifest_sha = _sha256(source_manifest)
     preaudit_sha = _sha256(preaudit)
     output_dir = output_dir.resolve()
@@ -208,6 +247,7 @@ def build(
     audio_dir = output_dir / "audio"
     audio_dir.mkdir(parents=True, exist_ok=True)
     payload: list[dict[str, Any]] = []
+    skipped_calibration_ids: list[str] = []
     for index, source_id in enumerate(sorted(sources)):
         source = sources[source_id]
         row = evidence[source_id]
@@ -220,6 +260,34 @@ def build(
                 raise ValueError(f"v12 audit {field} mismatch: {source_id}")
         if row.get("source_manifest_sha256") != manifest_sha:
             raise ValueError(f"v12 audit source manifest binding mismatch: {source_id}")
+        partition = str(source.get("partition") or "")
+        if selected_partitions and partition not in selected_partitions:
+            continue
+        if calibration is not None and source_id in calibration["sources"]:
+            calibration_source = calibration["sources"][source_id]
+            for field in (
+                "video_id",
+                "partition",
+                "audio_sha256",
+                "duration_s",
+                "frame_count",
+                "sample_rate",
+                "sample_count",
+            ):
+                if source.get(field) != calibration_source.get(field):
+                    raise ValueError(
+                        f"v12 audit calibrated source {field} drift: {source_id}"
+                    )
+            if evidence_span_signature(
+                row,
+                frame_count=int(source["frame_count"]),
+                source_id=source_id,
+            ) != calibration["signatures"][source_id]:
+                raise ValueError(
+                    f"v12 audit calibrated evidence changed after approval: {source_id}"
+                )
+            skipped_calibration_ids.append(source_id)
+            continue
         audio = Path(str(source.get("audio") or ""))
         if not audio.is_absolute():
             audio = (source_manifest.parent / audio).resolve()
@@ -244,7 +312,7 @@ def build(
                 "boundary_serialization_contract_id": CONTRACT_ID,
                 "source_id": source_id,
                 "video_id": str(source["video_id"]),
-                "partition": str(source["partition"]),
+                "partition": partition,
                 "audio": target.relative_to(output_dir).as_posix(),
                 "audio_sha256": str(source["audio_sha256"]),
                 "duration_s": float(source["duration_s"]),
@@ -275,6 +343,19 @@ def build(
         "preaudit": str(preaudit),
         "preaudit_sha256": preaudit_sha,
         "source_count": len(payload),
+        "selected_partitions": sorted(selected_partitions),
+        "skipped_calibration_source_count": len(skipped_calibration_ids),
+        "skipped_calibration_source_ids": skipped_calibration_ids,
+        "calibration_id": calibration["calibration_id"] if calibration else None,
+        "calibration_manifest_sha256": (
+            calibration["hashes"]["manifest"] if calibration else None
+        ),
+        "calibration_preaudit_sha256": (
+            calibration["hashes"]["preaudit"] if calibration else None
+        ),
+        "calibration_verdicts_sha256": (
+            calibration["hashes"]["verdicts"] if calibration else None
+        ),
         "audit_manifest": str(manifest),
         "audit_manifest_sha256": _sha256(manifest),
         "manual_verdict_schema": VOCAL_ENVELOPE_SCORER_V12_MANUAL_VERDICT_SCHEMA,
@@ -285,7 +366,7 @@ def build(
         json.dumps(summary, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
         encoding="utf-8",
     )
-    update_audit_entrypoints(latest_html=index, title="Scorer v12 Teacher pilot review")
+    update_audit_entrypoints(latest_html=index, title="Scorer v12 Teacher review")
     return summary
 
 
@@ -294,6 +375,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--source-manifest", required=True)
     parser.add_argument("--preaudit", required=True)
     parser.add_argument("--output-dir", required=True)
+    parser.add_argument(
+        "--partition",
+        action="append",
+        choices=("train", "val", "test"),
+        default=[],
+    )
+    parser.add_argument("--calibration-manifest")
+    parser.add_argument("--calibration-preaudit")
+    parser.add_argument("--calibration-verdicts")
     return parser.parse_args(argv)
 
 
@@ -305,6 +395,22 @@ if __name__ == "__main__":
                 source_manifest=Path(args.source_manifest),
                 preaudit=Path(args.preaudit),
                 output_dir=Path(args.output_dir),
+                partitions=args.partition,
+                calibration_manifest=(
+                    Path(args.calibration_manifest)
+                    if args.calibration_manifest
+                    else None
+                ),
+                calibration_preaudit=(
+                    Path(args.calibration_preaudit)
+                    if args.calibration_preaudit
+                    else None
+                ),
+                calibration_verdicts=(
+                    Path(args.calibration_verdicts)
+                    if args.calibration_verdicts
+                    else None
+                ),
             ),
             ensure_ascii=False,
         )

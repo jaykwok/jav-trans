@@ -823,3 +823,47 @@ def test_v12_teacher_audit_uses_shared_core_and_independent_span_playback(
         for line in (output / "audit_manifest.jsonl").read_text().splitlines()
     ]
     assert all((output / row["audio"]).is_file() for row in audit_rows)
+
+
+def test_v12_teacher_audit_can_skip_exact_approved_calibration_heldout(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    manifest, preaudit = _teacher_fixture(tmp_path)
+    _set_native_gemini_profile(preaudit)
+    (
+        calibration_manifest,
+        calibration_preaudit,
+        calibration_verdicts,
+        calibration_hashes,
+    ) = _calibration_subset(
+        manifest,
+        preaudit,
+        source_ids={"source-val"},
+        output_dir=tmp_path / "calibration",
+    )
+    monkeypatch.setattr(
+        "tools.audits.generate_vocal_envelope_scorer_v12_teacher_audit_html."
+        "CALIBRATION_ARTIFACT_SHA256",
+        calibration_hashes,
+    )
+    output = tmp_path / "heldout-audit"
+    summary = build_teacher_audit(
+        source_manifest=manifest,
+        preaudit=preaudit,
+        output_dir=output,
+        partitions=("val", "test"),
+        calibration_manifest=calibration_manifest,
+        calibration_preaudit=calibration_preaudit,
+        calibration_verdicts=calibration_verdicts,
+    )
+
+    assert summary["source_count"] == 1
+    assert summary["skipped_calibration_source_ids"] == ["source-val"]
+    audit_rows = [
+        json.loads(line)
+        for line in (output / "audit_manifest.jsonl").read_text().splitlines()
+    ]
+    assert [row["source_id"] for row in audit_rows] == ["source-test"]
+    page = (output / "index.html").read_text(encoding="utf-8")
+    assert _sha256(manifest) in page
+    assert _sha256(preaudit) in page
