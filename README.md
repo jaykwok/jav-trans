@@ -18,15 +18,15 @@ jav-trans 是一个面向 Windows + NVIDIA 显卡的本地 JAV 字幕生成工�
 
 ## 项目背景
 
-本项目的边界系统不是传统 VAD。目标不是单纯判断“有没有人声”，而是生成适合字幕和 ASR 的 speech-core chunk：尽量接近一句台词一个 chunk，避免把 BGM、环境声、贴连短句或长独白粗暴混成同一种情况。
+本项目的边界系统不是单一 VAD，而是先检测连续人类发声包络，再逐层完成事件隔离、语义路由和首尾裁边，最终生成适合字幕和 ASR 的 speech-core chunk。
 
 当前设计把职责拆开：
 
-- Candidate-island Scorer v11 以高召回保留明确或很可能含词语/对白的连续波形包络；可独立安全删除的明确纯非语义声音属于 `outside_candidate`，词语与呻吟/噪声无法区分时保留为 teacher/canonical `unsure=-100`，不把所有 vocal activity 自动送给下游。
-- Outer Edge Refiner v3 预留为整条 island 的二分类 acoustic outer-core 模型；schema/runtime/trainer plumbing 已完成审计，但实际 post-Scorer-v11 数据、训练和人工 gate 未完成，registry 仍为空。
-- Acoustic Split v4 只学习 `cut/continue`，按二分类 argmax 生成内部 event，不输出最终边缘；teacher/data 层的 `unsure` 仅用于审计并从训练排除。
+- Vocal-envelope Scorer v12 只检测连续人类发声事件：对白、耳语、呻吟、喘息、呼吸、哭笑、口腔声、歌唱和远处人声均优先保留；纯静音、环境/BGM、机械、衣物/床体/水声和纯肉体撞击声属于 `non_vocal_candidate`。它不判断语义，也不按句切分。
+- Boundary Proposal 只提供高召回候选断点；Acoustic Split v4 学习 `cut/continue`，负责把包络内独立事件隔离成 provisional sub-islands。
 - Pre-ASR CueQC v13 对 provisional sub-island 做 `keep/drop` 二分类 argmax 路由；teacher/data 层可以保留 `unsure`，但模型不会输出它。
 - Inner Edge Refiner v2 对 CueQC 保留的 sub-island 做逐帧二分类 argmax，裁成送入 ASR 的 acoustic semantic core。
+- Outer Edge Refiner 暂不作为默认组件；只在真实 v12 输出上比较 no-Outer 与 edge-only Outer，证明有独立收益后才保留。
 - 字幕 layout 只处理显示规则，不反向修改 ASR chunk 语义。
 
 这样做是为了避免一个模型同时承担“找语音、切句、删噪声、修边界、做字幕排版”。设计演进、实验记录、失败路线和更新记录都放在 [docs/HISTORY.md](docs/HISTORY.md)。
@@ -113,22 +113,20 @@ Web 会在模型要求检查中提示驱动过旧或 CUDA 初始化失败。
   -> Shared Qwen feature extraction
      - Qwen ASR repo 对应的 frozen PTM/encoder frame features
      - MFCC / timing numeric features
-  -> Candidate-island Scorer v11（1.7B，最新 mixed-source 重训未过 gate，registry 仍为空）
+  -> Vocal-envelope Scorer v12（1.7B，完全随机初始化重训中，registry 仍为空）
      - 主臂：raw PTM2048 -> checkpoint 内 Linear(2048->2048)+GELU
      - 与 normalized MFCC40 拼接后 Linear(2088->256)
-     - valid-prefix bidirectional Mamba2(hidden=256) -> Linear(2) -> softmax argmax
-     - compact P128/H128 只作为相同数据、seed、steps 的容量对照
-     - 同一对白包络内的停顿、尾音和紧贴短背景属于 inside_candidate；独立明确非语义声为 outside_candidate；词语歧义为 unsure=-100
-  -> BoundaryProposalScorer v1（候选源审计中）
-     - 旧 checkpoint 只作高召回候选源审计参考，不做 final cut decision
-     - 必须在晋升后的 Scorer v11 真实输出上重建输入分布并复核候选 recall 后，才能决定保留或重构
+     - valid-prefix bidirectional Mamba2(hidden=256)
+     - 四个冻结实验臂：frame argmax / linear-chain CRF / Frame–Event Query-Mask / Dense Span + exact DP
+     - vocal_candidate / non_vocal_candidate 二分类；teacher/canonical unsure=-100 不参与训练
+  -> Boundary Proposal（高召回候选断点，不直接决定最终 cut）
   -> 按 ASR repo 进入互不混用的边界链
-     - 1.7B：Outer Edge Refiner v3（合同 plumbing 已审计；等待实际 post-Scorer-v11 数据，未注册生产 checkpoint）
-       -> Acoustic Split v4 binary argmax
+     - 1.7B：Acoustic Split v4 binary argmax
        -> provisional sub-islands
        -> Pre-ASR CueQC v13 binary argmax
        -> Inner Edge Refiner v2 binary acoustic core
        -> chunk packing / boundary-cache
+       -> 可选 edge-only Outer 仅在真实 A/B 证明有收益后加入
      - 0.6B：空 registry placeholder 保持不动，暂不训练或修改
      - drop 的 chunk 不导出 wav、不进入 ASR
   -> ASR wav chunk export
@@ -148,14 +146,14 @@ Web 会在模型要求检查中提示驱动过旧或 CUDA 初始化失败。
 
 关键约束：
 
-- Candidate-island Scorer 只决定连续波形是否应继续进入下游，不负责语义 drop 或句内切点；Proposal 只能附加非绑定候选，最终 cut 由 Split 决定。
+- Scorer v12 只决定是否存在连续人类发声事件，不负责语义 drop 或句内切点；Proposal 只能附加非绑定候选，最终 cut 由 Split 决定。
 - 内部 cut 是一个共享绝对时间戳，不允许左右 chunk 各自修边。
 - `20 / (24000/1001)` 是字幕最短显示和 micro chunk 风险线，不是 runtime duration-only drop 阈值。
 - 7 秒是字幕显示 soft guard，不是 ASR chunk 上限。
 - Runtime 不使用具体词黑名单或时长启发式删除短促人声；是否进入 ASR 由 Pre-ASR CueQC 模型标签决定。
-- Scorer v11、Split v4、CueQC v13 与 Inner v2 均只允许二分类 softmax argmax，不读取 runtime threshold，不提供旧三分类 alias 或规则 fallback。Scorer v8/v9/v10 仅保留为离线审计证据；当前 production segment 在 v11 checkpoint 晋升前明确报告 `pending_binary_scorer_audit`。
-- Boundary 阶段按 Outer → Split → CueQC → Inner 的真实职责顺序串行加载和释放模型；Inner 只对 CueQC argmax keep 的 provisional sub-islands 推理。Boundary cache 把 provisional chunk JSON 与同一内容签名的 raw PTM/MFCC sidecar 分开保存，缓存命中无需重复提取特征。allocated/reserved/shared VRAM 只写运行诊断，不参与功能判断；显式 CUDA 请求不可用时直接报错，不回退 CPU，任何正 shared VRAM spill 都是 soft OOM。
-- 1.7B Outer registry 当前为空且组件状态仍为 `pending_outer_v3_audit`；完整 Boundary 链会先报告实际首个阻塞点 `pending_binary_scorer_audit`，待 Scorer v11 晋升后才进入 Outer 阶段。
+- Scorer v12 的各 decoder、Split v4、CueQC v13 与 Inner v2 都不读取 runtime threshold，不使用 hysteresis、固定时长、NMS、规则 merge 或 fallback。旧 Scorer 只保留为离线失败证据，v10/v11 checkpoint 和 canonical 不能 warm-start 或转换成 v12。
+- Boundary 阶段按 Scorer → Proposal → Split → CueQC → Inner 串行加载和释放模型；Inner 只对 CueQC argmax keep 的 provisional sub-islands 推理，且只能裁首尾、不能挖内部空洞。Boundary cache 把 provisional chunk JSON 与同一内容签名的 raw PTM/MFCC sidecar 分开保存，缓存命中无需重复提取特征。allocated/reserved/shared VRAM 只写运行诊断，不参与功能判断；显式 CUDA 请求不可用时直接报错，不回退 CPU，任何超过 telemetry noise floor 的 shared VRAM spill 都是 soft OOM。
+- 1.7B production registry 在 v12 数值与人工 gate 完成前保持为空；Outer 不阻塞当前 Scorer v12 训练，也不默认进入生产链。
 - 0.6B Boundary registry 当前为空；选择该档会在模型加载前明确报告 `pending_binary_retrain`。
 
 ---
@@ -167,7 +165,7 @@ Web 会在模型要求检查中提示驱动过旧或 CUDA 初始化失败。
 - `jaykwok/Qwen3-ASR-1.7B-JA-Anime-Galgame-hf`：默认高质量档。
 - `jaykwok/Qwen3-ASR-0.6B-JA-Anime-Galgame-hf`：仅保留 ASR repo 与空 Boundary registry placeholder；全链重训留作未来 backlog，本轮不训练、不修改。
 
-Scorer v11 当前主容量合同为逐帧 raw PTM2048→trainable Linear(2048→2048)+GELU，与 normalized MFCC40 拼接后再经 Linear(2088→256) 输入双向 Mamba2(hidden=256)；这不是去掉时序主干。紧凑容量对照固定为 Linear(2048→128)+Mamba2(hidden=128)，只允许在相同 canonical/partition/seed/steps/loss 和 2000 padded-frame budget 下与主臂比较。B1 train-only start/end heatmap 必须等容量 A/B 后再单独比较，runtime 始终只读取 inside/outside 两类 argmax。训练与 runtime 使用相同 20s context、4s nominal overlap 和 midpoint unique ownership，不平均概率或投票。当前 production registry 仍为空，必须完成真实 source candidate-membership 数据、固定 A/B 和人工 zero-clipping gate 后才能晋升；旧 Scorer checkpoint、threshold/hysteresis 路径和兼容 alias 均不能复用。
+Scorer v12 主容量合同为逐帧 raw PTM2048→trainable Linear(2048→2048)+GELU，与 normalized MFCC40 拼接后再经 Linear(2088→256) 输入双向 Mamba2(hidden=256)。PTM2048 只是冻结特征提取结果；所有 v12 adapter、时序主干和 decoder 都从 seed=`117` 完全随机初始化。当前固定比较 frame argmax、linear-chain CRF、Frame–Event Query-Mask 与 Dense Span + exact DP 四个结构化 decoder；训练与 runtime 不加入阈值或规则平滑，test 只在 val 选出前两名后运行。
 
 所有小模型统一放在：
 
@@ -177,11 +175,9 @@ src/checkpoints/
 └── jaykwok-Qwen3-ASR-1.7B-JA-Anime-Galgame-hf/
 ```
 
-1.7B 的目标 Boundary pipeline 统一使用合同 `boundary_acoustic_binary_v12`：Scorer v11 → Proposal v1 → Outer v3 → Acoustic Split v4 → provisional sub-islands → CueQC v13 → Inner v2 acoustic core → Chunk/ASR。Outer v3 必须等实际 post-Scorer-v11 输出分布训练并通过人工 gate 后才可注册；模型缺失、repo 不匹配、合同不兼容或选择 0.6B 都会直接报错，不提供规则 fallback 或静默迁移。实验指标与版本决策见 [docs/HISTORY.md](docs/HISTORY.md)。
+1.7B 的目标 Boundary pipeline 统一使用合同 `boundary_acoustic_binary_v12`：Scorer v12 → Proposal → Acoustic Split v4 → provisional sub-islands → CueQC v13 → Inner v2 acoustic core → Chunk/ASR。Outer 只保留 no-Outer / edge-only A/B，不再预设为必需组件。模型缺失、repo 不匹配、合同不兼容或选择 0.6B 都会直接报错，不提供规则 fallback 或静默迁移。
 
-当前训练数据状态：1.7B Scorer v11 使用 Gemini 3.6 Flash Medium 对固定 25 条真实 train source 分别执行 Protect/Remove 双独立 Teacher；Protect-only=`inside_candidate`、Remove-only=`outside_candidate`，冲突或均无证据=`unsure→-100`，绝不使用补集。25 条 source 来自不同 video，24 条同时具有 inside/outside definite evidence；总计 `inside 45516 / outside 19117 / unsure 29384`，conflict=`7301→unsure`。Teacher 请求固定 `reasoning=medium / max_tokens=8192 / MM:SS.mmm`，不发送 temperature/top-p/top-k。bridge-gap 只作 Proposal/Split/CueQC 下游隔离诊断，不作为 Scorer outside 标签。
-
-当前 canonical=`1176 sources`（train/val/test=`1152/10/14`），frame=`inside 573995 / outside 124776 / unsure 34522`；raw PTM2048 完整并编译为 signed windows train/val/test=`1286/50/70`。同一数据、seed=`117`、P2048/H256、随机初始化、class weight=`1/1` 的正式 A/B 均未晋升：plain baseline 的 Val/Test inside=`95.77/98.60%`、outside frame=`59.89/60.32%`、outside event=`37.31/39.53%`、continuity=`68.18/68.42%`；Frame–Event Query-Mask 对应为 `98.63/99.38%`、`40.96/54.35%`、`19.04/30.32%`、`93.18/89.47%`。新 `full_source_teacher_outside_continuity_v3` 还单列 teacher all-outside source：test 的 2 条中 baseline 整段 drop=`1/2`，Query-Mask=`0/2`；没有 inside truth 的 source 不用 continuity 误判。结论是 Query-Mask 明显减碎片，但 outside/event 与纯背景 source 删除退化；不能只按 inside 或 continuity 选优。production registry 仍为空；不得用 runtime threshold、Focal、class weight、最大时长、NMS 或规则 fallback 掩盖。0.6B 未修改。完整证据见 [Scorer v11 mixed-source teacher 分层 A/B](docs/audits/20260724_scorer-v11-mixed-source-selection-v3.md)、[Scorer v11 Dense Span A/B](docs/audits/20260724_scorer-v11-dense-span-ab-v1.md)、[Scorer v11 Query-Mask A/B](docs/audits/20260724_scorer-v11-query-mask-ab-v1.md)、[Scorer v11 CRF structured-decoder A/B](docs/audits/20260724_scorer-v11-crf-structured-decoder-ab-v1.md)、[Scorer v11 calibrated full-source gate](docs/audits/20260723_scorer-v11-calibrated-full-source-gate-v1.md)、[1.7B Boundary 训练数据生成链职责审计](docs/audits/20260722_boundary-training-data-generation-audit-v1.md) 与 [Scorer downstream isolation responsibility audit](docs/audits/20260723_scorer-v11-downstream-isolation-required6.md)。
+当前训练数据状态：Gemini 3.6 Flash Medium 以一次完整 source 三态调用输出 `vocal_candidate / non_vocal_candidate / unsure` 连续全覆盖；请求固定 `max_tokens=8192 / MM:SS.mmm`，不发送 temperature/top-p/top-k。25 条 pilot 已由用户整页批准，canonical 为 train/val/test=`13/5/7`、vocal/non-vocal=`85418/8227` 帧。完整真实 source manifest 已冻结为 train/val/test=`120/10/14`、29 个有效 video；旧 v11 语义标签和旧人工“去呻吟”审计均不进入 v12。完整 train 可在绑定 pilot 校准 SHA、相同 provider/model/prompt/执行合同时使用 Teacher 证据；val/test 仍需人工 verdict。四个 decoder 的 2-step CUDA smoke 已通过，只证明路径可训练，不用于选优；正式 full training 尚未完成。详细合同与选优顺序见 [Scorer v12 structured-decoder training plan](docs/audits/20260725_scorer-v12-structured-decoder-training-plan.md)，旧 v11 实验只作为失败路线保存在 [docs/HISTORY.md](docs/HISTORY.md)。
 
 Split v4 当前唯一合法训练数据合同是
 `acoustic_split_v4_sequence_dataset_summary_v1`：raw PTM2048 + MFCC40（frame
@@ -398,6 +394,9 @@ uv run python -m <module> --help
 - `tools.omni.run_audio_teacher` / `tools.omni.audio_teacher_batch`：音频 Teacher Core；统一处理 `--prompt/--prompt-file`、`--folder/--file/--manifest`、provider-safe 并发、进度、续跑和主线程串行化落盘，不直接生成训练真值。
 - `tools.omni.audio_teacher_transport`：Qwen、OpenRouter、Google AI Studio 三个 provider Adapter 的唯一分派入口；请求与响应协议互不冒充。
 - `tools.omni.gemini_native` / `tools.omni.inspect_gemini_quota`：Google AI Studio 原生 Interactions 音频 Adapter 与无请求状态入口；实现内联音频、结构化输出、思考/usage 证据、每槽位 5 RPM / 250k TPM / 20 RPD、太平洋日界线、可读配额状态账本与多 Key 429 轮换。`uv run python -m tools.omni.inspect_gemini_quota` 不发送 API 请求，只刷新并显示脱敏状态。
+- `tools.boundary.ja.build_vocal_envelope_scorer_v12_pilot_manifest` / `build_vocal_envelope_scorer_v12_full_manifest`：从冻结 source/partition 只重用身份并重新校验音频 SHA、时长、采样和 frame geometry；不继承 v11 标签、span 或 ASR 文本。
+- `tools.boundary.ja.label_vocal_envelope_scorer_v12_with_omni` / `compile_vocal_envelope_scorer_v12_canonical`：Scorer v12 单调用三态 Teacher 与严格 canonical compiler；绑定 provider/model/prompt/时间合同及人工或校准 gate。
+- `tools.boundary.ja.train_vocal_envelope_scorer_v12`：完全随机初始化的 v12 训练器，支持 argmax structured、CRF、Query-Mask 与 Dense Span decoder，持续写入原子 `progress.json`。
 - `tools.audits.generate_candidate_island_dual_evidence_review`：Scorer Protect×Remove 与人工 full-source truth 的三轴 bridge-gap Adapter。
 - `tools.audits.record_vocal_envelope_scorer_v12_approval`：仅在用户明确完成整页审听并统一批准时，把 Scorer v12 审计页的三轴全通过裁决按 source/preaudit SHA 原子写成 `manual_verdicts.jsonl`；不会自动判断或绕过人工 gate。
 - `tools.audits.generate_candidate_island_dual_evidence_ab_review`：在两个已规范化 Scorer dual-evidence review 上复用同一 Core 的 High/Medium A/B Adapter；比较人工真语音保留、outside precision、监督覆盖与逐帧差异。

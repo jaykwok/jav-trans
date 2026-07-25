@@ -92,15 +92,15 @@ def _audio_geometry(path: Path) -> dict[str, int | float]:
         sample_width = int(handle.getsampwidth())
     if channels != 1 or sample_rate != 16000:
         raise ValueError(
-            f"v12 pilot audio must be mono 16 kHz: {path} "
+            f"v12 source audio must be mono 16 kHz: {path} "
             f"(channels={channels}, sample_rate={sample_rate})"
         )
     if sample_count <= 0:
-        raise ValueError(f"v12 pilot audio is empty: {path}")
+        raise ValueError(f"v12 source audio is empty: {path}")
     duration_s = sample_count / sample_rate
     frame_count = (sample_count + FRAME_SAMPLES - 1) // FRAME_SAMPLES
     if frame_count <= 0 or abs(frame_count * FRAME_HOP_S - duration_s) > FRAME_HOP_S:
-        raise ValueError(f"v12 pilot frame geometry is invalid: {path}")
+        raise ValueError(f"v12 source frame geometry is invalid: {path}")
     return {
         "channels": channels,
         "sample_rate": sample_rate,
@@ -132,7 +132,7 @@ def _validated_audio_identity(
 ) -> tuple[Path, dict[str, int | float], str, float]:
     source = sources.get(source_id)
     if source is None:
-        raise ValueError(f"v12 pilot identity is absent from frozen sources: {source_id}")
+        raise ValueError(f"v12 source identity is absent from frozen sources: {source_id}")
     audio = _resolve_audio(source, source_windows=source_windows)
     geometry = _audio_geometry(audio)
     actual_sha = _sha256(audio)
@@ -140,15 +140,15 @@ def _validated_audio_identity(
         source.get("audio_wav_sha256") or source.get("audio_sha256") or ""
     )
     if not declared_sha or actual_sha != declared_sha:
-        raise ValueError(f"v12 pilot audio SHA mismatch: {source_id}")
+        raise ValueError(f"v12 source audio SHA mismatch: {source_id}")
     declared_duration = float(source.get("duration_s") or 0.0)
     actual_duration = float(geometry["duration_s"])
     duration_delta = actual_duration - declared_duration
     if declared_duration <= 0.0:
-        raise ValueError(f"v12 pilot manifest duration is invalid: {source_id}")
+        raise ValueError(f"v12 source manifest duration is invalid: {source_id}")
     if duration_delta > FRAME_HOP_S or duration_delta < -MAX_SHORT_SOURCE_DRIFT_S:
         raise ValueError(
-            f"v12 pilot audio duration mismatch: {source_id} "
+            f"v12 source audio duration mismatch: {source_id} "
             f"(declared={declared_duration:.6f}, actual={actual_duration:.6f})"
         )
     return audio, geometry, actual_sha, duration_delta

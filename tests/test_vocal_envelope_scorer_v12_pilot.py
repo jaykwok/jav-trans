@@ -12,6 +12,9 @@ from tools.boundary.ja.build_vocal_envelope_scorer_v12_pilot_manifest import (
     _audio_geometry,
     build_pilot_manifest,
 )
+from tools.boundary.ja.build_vocal_envelope_scorer_v12_full_manifest import (
+    build_full_manifest,
+)
 
 
 def _sha256(path: Path) -> str:
@@ -153,3 +156,48 @@ def test_v12_pilot_frame_count_covers_partial_final_frame(tmp_path: Path) -> Non
     _wav(audio, frames=1601)
     geometry = _audio_geometry(audio)
     assert geometry["frame_count"] == 6
+
+
+def test_v12_full_manifest_keeps_every_valid_partition_source(tmp_path: Path) -> None:
+    source_windows, partitions = _fixture(tmp_path)
+    output = tmp_path / "full"
+    summary = build_full_manifest(
+        source_windows=source_windows,
+        partition_manifest=partitions,
+        output_dir=output,
+    )
+    assert summary["source_count"] == 4
+    assert summary["video_count"] == 4
+    assert summary["partition_counts"] == {"test": 1, "train": 2, "val": 1}
+    assert summary["rejected_identities"] == []
+    rows = [
+        json.loads(line)
+        for line in (output / "source_manifest.jsonl").read_text().splitlines()
+    ]
+    assert {row["source_id"] for row in rows} == {
+        "train-a", "train-b", "val-a", "test-a"
+    }
+    assert all(row["core_ids"] == [row["source_id"]] for row in rows)
+
+
+def test_v12_full_manifest_does_not_count_fully_rejected_video(
+    tmp_path: Path,
+) -> None:
+    source_windows, partitions = _fixture(tmp_path)
+    source_rows = [
+        json.loads(line) for line in source_windows.read_text().splitlines()
+    ]
+    bad_audio = Path(source_rows[0]["audio_wav"])
+    _wav(bad_audio, frames=1600 * 20)
+    source_rows[0]["audio_wav_sha256"] = _sha256(bad_audio)
+    _write_jsonl(source_windows, source_rows)
+
+    summary = build_full_manifest(
+        source_windows=source_windows,
+        partition_manifest=partitions,
+        output_dir=tmp_path / "full-with-rejection",
+    )
+
+    assert summary["source_count"] == 3
+    assert summary["video_count"] == 3
+    assert summary["rejected_identities"][0]["source_id"] == "train-a"
