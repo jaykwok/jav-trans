@@ -9,6 +9,7 @@ import pytest
 
 from boundary.ja.vocal_envelope_v12 import VOCAL_ENVELOPE_SCORER_V12_SOURCE_SCHEMA
 from tools.boundary.ja.build_vocal_envelope_scorer_v12_pilot_manifest import (
+    _audio_geometry,
     build_pilot_manifest,
 )
 
@@ -145,3 +146,10 @@ def test_v12_pilot_skips_a_train_identity_with_implausible_duration(
     )
     assert len(summary["selected_train_source_ids"]) == 1
     assert summary["rejected_identities"][0]["source_id"] == "train-a"
+
+
+def test_v12_pilot_frame_count_covers_partial_final_frame(tmp_path: Path) -> None:
+    audio = tmp_path / "partial.wav"
+    _wav(audio, frames=1601)
+    geometry = _audio_geometry(audio)
+    assert geometry["frame_count"] == 6

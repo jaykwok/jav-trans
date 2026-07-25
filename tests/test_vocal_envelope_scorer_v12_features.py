@@ -21,6 +21,8 @@ from tools.boundary.ja.compile_vocal_envelope_scorer_v12_features import (
 )
 from tools.boundary.ja.extract_vocal_envelope_scorer_v12_raw_features import (
     _safe_id,
+    align_raw_features,
+    validate_audio_geometry,
 )
 from tools.boundary.ja.rebind_vocal_envelope_scorer_v12_raw_features import (
     rebind,
@@ -223,3 +225,62 @@ def test_v12_windows_safe_feature_name_handles_colon_source_ids() -> None:
     value = _safe_id("source::event00::occ00")
     assert ":" not in value
     assert value.startswith("source-event00-occ00-")
+
+
+def test_v12_raw_feature_alignment_uses_canonical_frame_geometry() -> None:
+    ptm = np.arange(3 * 2048, dtype=np.float32).reshape(3, 2048)
+    mfcc = np.arange(6 * 40, dtype=np.float32).reshape(6, 40)
+    aligned_ptm, aligned_mfcc = align_raw_features(
+        ptm=ptm,
+        mfcc=mfcc,
+        expected_frames=5,
+    )
+    assert aligned_ptm.shape == (5, 2048)
+    assert aligned_ptm.dtype == np.float32
+    assert aligned_mfcc.shape == (5, 40)
+    np.testing.assert_array_equal(aligned_mfcc, mfcc[:5])
+
+
+def test_v12_raw_feature_alignment_rejects_projected_or_short_features() -> None:
+    with pytest.raises(ValueError, match="raw PTM2048"):
+        align_raw_features(
+            ptm=np.zeros((3, 128), dtype=np.float32),
+            mfcc=np.zeros((5, 40), dtype=np.float32),
+            expected_frames=5,
+        )
+    with pytest.raises(ValueError, match="does not cover canonical"):
+        align_raw_features(
+            ptm=np.zeros((3, 2048), dtype=np.float32),
+            mfcc=np.zeros((4, 40), dtype=np.float32),
+            expected_frames=5,
+        )
+
+
+def test_v12_audio_geometry_preserves_partial_final_frame() -> None:
+    exact = np.arange(1600, dtype=np.float32)
+    partial = np.arange(1601, dtype=np.float32)
+    np.testing.assert_array_equal(
+        validate_audio_geometry(
+            exact,
+            sample_rate=16000,
+            expected_frames=5,
+            declared_sample_count=1600,
+        ),
+        exact,
+    )
+    np.testing.assert_array_equal(
+        validate_audio_geometry(
+            partial,
+            sample_rate=16000,
+            expected_frames=6,
+            declared_sample_count=1601,
+        ),
+        partial,
+    )
+    with pytest.raises(ValueError, match="audio/frame geometry mismatch"):
+        validate_audio_geometry(
+            partial,
+            sample_rate=16000,
+            expected_frames=5,
+            declared_sample_count=1601,
+        )

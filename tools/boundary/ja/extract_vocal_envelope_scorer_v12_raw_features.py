@@ -22,8 +22,14 @@ for root in (PROJECT_ROOT, PROJECT_ROOT / "src"):
         sys.path.insert(0, str(root))
 
 from asr.backends.qwen import QWEN_ASR_17B_REPO_ID  # noqa: E402
+from audio.loading import load_audio_16k_mono  # noqa: E402
 from boundary.gpu_safety import apply_vram_safety_cap  # noqa: E402
-from boundary.ja.features import FeatureConfig, build_ptm_feature_extractor, extract_feature_bundle  # noqa: E402
+from boundary.ja.features import (  # noqa: E402
+    FeatureConfig,
+    build_ptm_feature_extractor,
+    extract_mfcc,
+    resize_feature_frames,
+)
 from boundary.ja.vocal_envelope_v12 import (  # noqa: E402
     VOCAL_ENVELOPE_SCORER_V12_CANONICAL_SOURCE_SCHEMA,
     VOCAL_ENVELOPE_SCORER_V12_FEATURE_EXTRACTOR_SCHEMA,
@@ -34,6 +40,52 @@ from pipeline.memory_safety import reset_shared_vram_baseline, runtime_memory_sn
 CONTRACT_ID = "boundary_acoustic_binary_v12"
 SUMMARY_SCHEMA = "vocal_envelope_scorer_v12_raw_feature_extract_summary_v1"
 PROGRESS_SCHEMA = "vocal_envelope_scorer_v12_raw_feature_extract_progress_v1"
+FRAME_HOP_S = 0.02
+FRAME_SAMPLES = 320
+PTM_DIM = 2048
+MFCC_DIM = 40
+
+
+def validate_audio_geometry(
+    audio: np.ndarray,
+    *,
+    sample_rate: int,
+    expected_frames: int,
+    declared_sample_count: int,
+) -> np.ndarray:
+    samples = np.asarray(audio, dtype=np.float32)
+    if samples.ndim != 1 or sample_rate != 16000:
+        raise ValueError("Scorer v12 audio/sample geometry mismatch")
+    if declared_sample_count <= 0 or len(samples) != declared_sample_count:
+        raise ValueError("Scorer v12 canonical sample count mismatch")
+    derived_frames = (declared_sample_count + FRAME_SAMPLES - 1) // FRAME_SAMPLES
+    if expected_frames <= 0 or derived_frames != expected_frames:
+        raise ValueError("Scorer v12 audio/frame geometry mismatch")
+    return np.ascontiguousarray(samples, dtype=np.float32)
+
+
+def align_raw_features(
+    *, ptm: np.ndarray, mfcc: np.ndarray, expected_frames: int
+) -> tuple[np.ndarray, np.ndarray]:
+    raw_ptm = np.asarray(ptm)
+    raw_mfcc = np.asarray(mfcc)
+    if raw_ptm.ndim != 2 or raw_ptm.shape[1] != PTM_DIM:
+        raise ValueError(f"Scorer v12 extractor requires raw PTM2048, got {raw_ptm.shape}")
+    if raw_mfcc.ndim != 2 or raw_mfcc.shape[1] != MFCC_DIM:
+        raise ValueError(f"Scorer v12 extractor requires MFCC40, got {raw_mfcc.shape}")
+    if expected_frames <= 0 or raw_mfcc.shape[0] < expected_frames:
+        raise ValueError(
+            "Scorer v12 MFCC sequence does not cover canonical frames: "
+            f"expected={expected_frames}, actual={raw_mfcc.shape[0]}"
+        )
+    aligned_ptm = resize_feature_frames(raw_ptm, expected_frames)
+    aligned_mfcc = np.ascontiguousarray(raw_mfcc[:expected_frames], dtype=np.float32)
+    if not np.all(np.isfinite(aligned_ptm)) or not np.all(np.isfinite(aligned_mfcc)):
+        raise ValueError("Scorer v12 feature extraction produced non-finite values")
+    return (
+        np.ascontiguousarray(aligned_ptm, dtype=np.float32),
+        aligned_mfcc,
+    )
 
 
 def _memory_snapshot(torch, device: str) -> dict[str, Any]:
@@ -134,10 +186,12 @@ def _validate_resume_row(
         "source_id": source_id,
         "partition": source["partition"],
         "audio_sha256": source["audio_sha256"],
+        "sample_rate": source["sample_rate"],
+        "sample_count": source["sample_count"],
         "frame_count": source["frame_count"],
-        "frame_hop_s": 0.02,
-        "ptm_dim": 2048,
-        "mfcc_dim": 40,
+        "frame_hop_s": FRAME_HOP_S,
+        "ptm_dim": PTM_DIM,
+        "mfcc_dim": MFCC_DIM,
         "ptm_repo_id": QWEN_ASR_17B_REPO_ID,
         "feature_extractor_schema": VOCAL_ENVELOPE_SCORER_V12_FEATURE_EXTRACTOR_SCHEMA,
         "ptm_extraction": "singleton_full_source_forward_v1",
@@ -159,7 +213,10 @@ def _validate_resume_row(
     with np.load(feature_path, allow_pickle=False) as payload:
         ptm = np.asarray(payload["ptm"])
         mfcc = np.asarray(payload["mfcc"])
-    if ptm.shape != (int(source["frame_count"]), 2048) or mfcc.shape != (int(source["frame_count"]), 40):
+    if ptm.shape != (int(source["frame_count"]), PTM_DIM) or mfcc.shape != (
+        int(source["frame_count"]),
+        MFCC_DIM,
+    ):
         raise ValueError(f"v12 resume feature geometry mismatch: {source_id}")
     if ptm.dtype != np.float32 or mfcc.dtype != np.float32:
         raise ValueError(f"v12 resume feature dtype mismatch: {source_id}")
@@ -221,9 +278,9 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             existing[source_id] = saved
     config = FeatureConfig(
         ptm=QWEN_ASR_17B_REPO_ID,
-        frame_hop_s=0.02,
-        n_mfcc=40,
-        feature_dim=2048,
+        frame_hop_s=FRAME_HOP_S,
+        n_mfcc=MFCC_DIM,
+        feature_dim=PTM_DIM,
         device=args.device,
         dtype=args.dtype,
         model_path=args.model_path,
@@ -241,7 +298,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             raise RuntimeError(f"Scorer v12 PTM loaded on {first_parameter.device}; CPU fallback is disabled")
         del first_parameter
         warmup = extractor.extract(np.zeros(16000, dtype=np.float32), sample_rate=16000)
-        if warmup.ndim != 2 or warmup.shape[1] != 2048:
+        if warmup.ndim != 2 or warmup.shape[1] != PTM_DIM:
             raise ValueError(f"Scorer v12 PTM warmup returned {warmup.shape}")
         del warmup
         torch.cuda.synchronize()
@@ -258,16 +315,42 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             if _sha256(audio) != str(row.get("audio_sha256") or ""):
                 raise ValueError(f"v12 source audio SHA mismatch: {source_id}")
             print(f"v12_feature={len(existing)+1}/{len(rows)} source={source_id}", flush=True)
-            bundle = extract_feature_bundle(audio_path=audio, config=config, ptm_extractor=extractor)
-            ptm = np.asarray(bundle["ptm"], dtype=np.float32)
-            mfcc = np.asarray(bundle["mfcc"], dtype=np.float32)
             frame_count = int(row.get("frame_count") or 0)
-            if ptm.shape != (frame_count, 2048) or mfcc.shape != (frame_count, 40):
-                raise ValueError(f"v12 extracted frame geometry mismatch: {source_id}; ptm={ptm.shape} mfcc={mfcc.shape} expected={frame_count}")
-            if not np.all(np.isfinite(ptm)) or not np.all(np.isfinite(mfcc)):
-                raise ValueError(f"v12 feature extraction produced non-finite values: {source_id}")
+            sample_rate = int(row.get("sample_rate") or 0)
+            sample_count = int(row.get("sample_count") or 0)
+            audio_values, loaded_sample_rate = load_audio_16k_mono(str(audio))
+            try:
+                if sample_rate != loaded_sample_rate:
+                    raise ValueError("Scorer v12 canonical sample rate mismatch")
+                audio_values = validate_audio_geometry(
+                    audio_values,
+                    sample_rate=loaded_sample_rate,
+                    expected_frames=frame_count,
+                    declared_sample_count=sample_count,
+                )
+                raw_mfcc = extract_mfcc(
+                    audio_values,
+                    sample_rate=loaded_sample_rate,
+                    config=config,
+                )
+                raw_ptm = extractor.extract(
+                    audio_values,
+                    sample_rate=loaded_sample_rate,
+                )
+                ptm, mfcc = align_raw_features(
+                    ptm=raw_ptm,
+                    mfcc=raw_mfcc,
+                    expected_frames=frame_count,
+                )
+            except ValueError as exc:
+                raise ValueError(f"{exc}: {source_id}") from exc
             feature_path = feature_dir / f"{_safe_id(source_id)}.npz"
-            np.savez(feature_path, ptm=ptm, mfcc=mfcc, frame_hop_s=np.asarray([0.02], dtype=np.float32))
+            np.savez(
+                feature_path,
+                ptm=ptm,
+                mfcc=mfcc,
+                frame_hop_s=np.asarray([FRAME_HOP_S], dtype=np.float32),
+            )
             feature_sha = _sha256(feature_path)
             ptm_sha, mfcc_sha = _array_sha(ptm), _array_sha(mfcc)
             binding_sha = _binding_sha(source_id=source_id, audio_sha256=str(row["audio_sha256"]), frame_count=frame_count, ptm_sha256=ptm_sha, mfcc_sha256=mfcc_sha)
@@ -277,8 +360,9 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 "canonical_sources_sha256": canonical_sha,
                 "source_id": source_id, "partition": row["partition"], "core_ids": row["core_ids"],
                 "audio": str(audio), "audio_sha256": row["audio_sha256"],
-                "frame_count": frame_count, "frame_hop_s": 0.02,
-                "ptm_dim": 2048, "mfcc_dim": 40, "ptm_repo_id": QWEN_ASR_17B_REPO_ID,
+                "sample_rate": sample_rate, "sample_count": sample_count,
+                "frame_count": frame_count, "frame_hop_s": FRAME_HOP_S,
+                "ptm_dim": PTM_DIM, "mfcc_dim": MFCC_DIM, "ptm_repo_id": QWEN_ASR_17B_REPO_ID,
                 "feature_extractor_schema": VOCAL_ENVELOPE_SCORER_V12_FEATURE_EXTRACTOR_SCHEMA,
                 "ptm_extraction": "singleton_full_source_forward_v1",
                 "ptm_batch_size": 1,
@@ -290,7 +374,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             with manifest_path.open("a", encoding="utf-8") as handle:
                 handle.write(json.dumps(result, ensure_ascii=False, sort_keys=True) + "\n")
             existing[source_id] = result
-            del bundle, ptm, mfcc
+            del audio_values, raw_mfcc, raw_ptm, ptm, mfcc
             memory = _memory_snapshot(torch, args.device)
             shared_peak = max(shared_peak, float(memory.get("shared_vram_mb") or 0.0))
             if shared_peak > 0.0:
@@ -314,7 +398,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "canonical": str(canonical), "canonical_sha256": canonical_sha,
         "raw_feature_manifest": str(manifest_path), "raw_feature_manifest_sha256": _sha256(manifest_path),
         "source_count": len(existing), "ptm_repo_id": QWEN_ASR_17B_REPO_ID,
-        "ptm_dim": 2048, "mfcc_dim": 40, "singleton_full_source": True,
+        "ptm_dim": PTM_DIM, "mfcc_dim": MFCC_DIM, "singleton_full_source": True,
         "shared_vram_peak_mb": shared_peak, "post_cleanup_memory": post_gpu,
         "training_manifest_allowed": len(existing) == len(rows) and int(args.limit) == 0,
     }

@@ -71,6 +71,8 @@ def _teacher_fixture(tmp_path: Path) -> tuple[Path, Path]:
                 "audio_sha256": _sha256(audio),
                 "duration_s": 0.1,
                 "frame_count": 5,
+                "sample_rate": 16000,
+                "sample_count": 1600,
                 "source_kind": "real_full_source",
                 "synthetic_composite": False,
             }
@@ -91,6 +93,8 @@ def _teacher_fixture(tmp_path: Path) -> tuple[Path, Path]:
                 "audio_sha256": source["audio_sha256"],
                 "duration_s": source["duration_s"],
                 "frame_count": source["frame_count"],
+                "sample_rate": source["sample_rate"],
+                "sample_count": source["sample_count"],
                 "model": EXPECTED_MODEL,
                 "provider_profile": "gemini",
                 "reasoning_effort": "medium",

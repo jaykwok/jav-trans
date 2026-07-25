@@ -215,6 +215,14 @@ def compile_canonical(
         duration_s = float(source.get("duration_s") or 0.0)
         if duration_s <= 0.0 or abs(float(evidence.get("duration_s") or 0.0) - duration_s) > 1e-9:
             raise ValueError(f"v12 duration mismatch: {source_id}")
+        sample_rate = int(source.get("sample_rate") or 0)
+        sample_count = int(source.get("sample_count") or 0)
+        if sample_rate != 16000 or sample_count <= 0:
+            raise ValueError(f"v12 source sample geometry mismatch: {source_id}")
+        if int(evidence.get("sample_rate") or 0) != sample_rate or int(
+            evidence.get("sample_count") or 0
+        ) != sample_count:
+            raise ValueError(f"v12 teacher sample geometry mismatch: {source_id}")
         spans = _normalize_spans(evidence, frame_count=frame_count, source_id=source_id)
         partition = str(source["partition"])
         verdict = verdict_rows.get(source_id)
@@ -266,6 +274,8 @@ def compile_canonical(
             "audio": _display(audio),
             "audio_sha256": declared_audio_sha,
             "duration_s": duration_s,
+            "sample_rate": sample_rate,
+            "sample_count": sample_count,
             "frame_count": frame_count,
             "frame_hop_s": FRAME_HOP_S,
             "canonical_spans": spans,

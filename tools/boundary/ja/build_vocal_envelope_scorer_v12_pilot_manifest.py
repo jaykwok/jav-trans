@@ -28,6 +28,7 @@ from boundary.ja.vocal_envelope_v12 import (  # noqa: E402
 
 CONTRACT_ID = "boundary_acoustic_binary_v12"
 FRAME_HOP_S = 0.02
+FRAME_SAMPLES = 320
 MAX_SHORT_SOURCE_DRIFT_S = 1.0
 PARTITION_SCHEMA = "candidate_island_scorer_v11_partition_manifest_v1"
 SUMMARY_SCHEMA = "vocal_envelope_scorer_v12_pilot_manifest_summary_v1"
@@ -97,7 +98,7 @@ def _audio_geometry(path: Path) -> dict[str, int | float]:
     if sample_count <= 0:
         raise ValueError(f"v12 pilot audio is empty: {path}")
     duration_s = sample_count / sample_rate
-    frame_count = int(round(duration_s / FRAME_HOP_S))
+    frame_count = (sample_count + FRAME_SAMPLES - 1) // FRAME_SAMPLES
     if frame_count <= 0 or abs(frame_count * FRAME_HOP_S - duration_s) > FRAME_HOP_S:
         raise ValueError(f"v12 pilot frame geometry is invalid: {path}")
     return {

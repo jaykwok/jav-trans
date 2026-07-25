@@ -402,6 +402,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 "partition": current["partition"],
                 "audio_sha256": current["audio_sha256"],
                 "frame_count": current["frame_count"],
+                "sample_count": current.get("sample_count"),
             }
             for field, expected in checks.items():
                 if saved.get(field) != expected:
@@ -425,6 +426,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             "partition": row["partition"], "core_ids": row["core_ids"],
             "audio": row["audio"], "audio_sha256": row.get("audio_sha256") or _sha256(Path(row["audio"])),
             "duration_s": row["duration_s"], "frame_count": row["frame_count"], "frame_hop_s": FRAME_HOP_S,
+            "sample_rate": row.get("sample_rate"), "sample_count": row.get("sample_count"),
             "model": model, "provider_profile": "gemini", "reasoning_effort": "medium", "max_tokens": EXPECTED_MAX_TOKENS,
             "temperature": None, "top_p": None, "top_k": None,
             "prompt_profile": PROMPT_PROFILE, "prompt_version": PROMPT_VERSION,
