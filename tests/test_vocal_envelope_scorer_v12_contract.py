@@ -12,11 +12,15 @@ from boundary.ja.vocal_envelope_v12 import (
     VOCAL_ENVELOPE_SCORER_V12_LABELS,
     VOCAL_ENVELOPE_SCORER_V12_PREAUDIT_SCHEMA,
     VOCAL_ENVELOPE_SCORER_V12_SCHEMA,
+    VOCAL_ENVELOPE_SCORER_V12_MANUAL_VERDICT_SCHEMA,
     VocalEnvelopeScorerV12Network,
     build_vocal_envelope_scorer_v12_checkpoint,
     load_vocal_envelope_scorer_v12_checkpoint,
     score_vocal_envelope_source,
     vocal_envelope_v12_model_config,
+)
+from tools.audits.generate_vocal_envelope_scorer_v12_teacher_audit_html import (
+    build as build_teacher_audit,
 )
 from tools.boundary.ja.compile_vocal_envelope_scorer_v12_canonical import (
     EXPECTED_EXECUTION_CONTRACT,
@@ -123,6 +127,38 @@ def _teacher_fixture(tmp_path: Path) -> tuple[Path, Path]:
     return manifest, preaudit
 
 
+def _approved_verdicts(manifest: Path, preaudit: Path) -> Path:
+    manifest_sha = _sha256(manifest)
+    preaudit_sha = _sha256(preaudit)
+    sources = [json.loads(line) for line in manifest.read_text().splitlines()]
+    verdicts = manifest.parent / "manual_verdicts.jsonl"
+    _write_jsonl(
+        verdicts,
+        [
+            {
+                "schema": VOCAL_ENVELOPE_SCORER_V12_MANUAL_VERDICT_SCHEMA,
+                "boundary_serialization_contract_id": "boundary_acoustic_binary_v12",
+                "source_id": source["source_id"],
+                "video_id": source["video_id"],
+                "partition": source["partition"],
+                "audio_sha256": source["audio_sha256"],
+                "duration_s": source["duration_s"],
+                "frame_count": source["frame_count"],
+                "source_manifest_sha256": manifest_sha,
+                "preaudit_sha256": preaudit_sha,
+                "reviewed_full_source": True,
+                "vocal_coverage": "definite_vocal_complete",
+                "non_vocal_safety": "definite_non_vocal_clean",
+                "envelope_structure": "event_envelopes_continuous",
+                "approved": True,
+                "training_manifest_allowed": True,
+            }
+            for source in sources
+        ],
+    )
+    return verdicts
+
+
 def test_v12_contract_is_breaking_and_runtime_is_argmax(tmp_path: Path) -> None:
     import torch
 
@@ -163,7 +199,9 @@ def test_v12_contract_is_breaking_and_runtime_is_argmax(tmp_path: Path) -> None:
 def test_v12_prompts_and_timestamp_quantization_are_task_specific() -> None:
     assert "连续发声事件包络" in PROTECT_SYSTEM_PROMPT
     assert "不要按音节" in PROTECT_SYSTEM_PROMPT
-    assert "呻吟、喘息、呼吸" in PROTECT_SYSTEM_PROMPT
+    assert all(value in PROTECT_SYSTEM_PROMPT for value in ("呻吟", "喘息", "吸气", "呼气"))
+    assert "无论有无词义都属于 vocal" in PROTECT_SYSTEM_PROMPT
+    assert "非语义呻吟和呼吸仍是人类发声" in NONVOCAL_SYSTEM_PROMPT
     assert "明确不含任何人类声道" in NONVOCAL_SYSTEM_PROMPT
     assert "MM:SS.mmm" in PROTECT_SYSTEM_PROMPT
     args = parse_args(["--manifest", "m", "--output-dir", "o"])
@@ -300,11 +338,12 @@ def test_v12_canonical_can_be_explicitly_enabled_after_external_review(
     tmp_path: Path,
 ) -> None:
     manifest, preaudit = _teacher_fixture(tmp_path)
+    verdicts = _approved_verdicts(manifest, preaudit)
     summary = compile_canonical(
         manifest=manifest,
         preaudit=preaudit,
         output_dir=tmp_path / "approved",
-        allow_teacher_supervision=True,
+        manual_verdicts=verdicts,
     )
     assert summary["training_manifest_allowed"] is True
     assert summary["frame_counts"] == {
@@ -314,3 +353,62 @@ def test_v12_canonical_can_be_explicitly_enabled_after_external_review(
     assert summary["dataset_contract"]["label_unit"] == "human_vocal_event_envelope"
     assert summary["canonical_label_schema"] == "vocal_envelope_frames_v1"
     assert VOCAL_ENVELOPE_SCORER_V12_SCHEMA == "vocal_envelope_scorer_v12"
+
+
+def test_v12_canonical_rejects_unapproved_or_unbound_manual_verdicts(
+    tmp_path: Path,
+) -> None:
+    manifest, preaudit = _teacher_fixture(tmp_path)
+    verdicts = _approved_verdicts(manifest, preaudit)
+    rows = [json.loads(line) for line in verdicts.read_text().splitlines()]
+    rows[0]["non_vocal_safety"] = "definite_non_vocal_contains_vocal"
+    rows[0]["approved"] = False
+    rows[0]["training_manifest_allowed"] = False
+    _write_jsonl(verdicts, rows)
+    with pytest.raises(ValueError, match="rejects canonical supervision"):
+        compile_canonical(
+            manifest=manifest,
+            preaudit=preaudit,
+            output_dir=tmp_path / "rejected",
+            manual_verdicts=verdicts,
+        )
+
+    verdicts = _approved_verdicts(manifest, preaudit)
+    rows = [json.loads(line) for line in verdicts.read_text().splitlines()]
+    rows[0]["preaudit_sha256"] = "0" * 64
+    _write_jsonl(verdicts, rows)
+    with pytest.raises(ValueError, match="preaudit_sha256 mismatch"):
+        compile_canonical(
+            manifest=manifest,
+            preaudit=preaudit,
+            output_dir=tmp_path / "unbound",
+            manual_verdicts=verdicts,
+        )
+
+
+def test_v12_teacher_audit_uses_shared_core_and_independent_span_playback(
+    tmp_path: Path,
+) -> None:
+    manifest, preaudit = _teacher_fixture(tmp_path)
+    output = tmp_path / "audit"
+    summary = build_teacher_audit(
+        source_manifest=manifest,
+        preaudit=preaudit,
+        output_dir=output,
+    )
+    assert summary["source_count"] == 3
+    assert summary["training_manifest_allowed"] is False
+    page = (output / "index.html").read_text(encoding="utf-8")
+    assert "createAuditReviewCore" in page
+    assert "canonical vocal" in page
+    assert "canonical non-vocal" in page
+    assert "canonical unsure" in page
+    assert "颜色条点击后只播放自身精确区间" in page
+    assert "definite_non_vocal_contains_vocal" in page
+    assert "both_fragmented_and_overmerged" in page
+    assert VOCAL_ENVELOPE_SCORER_V12_MANUAL_VERDICT_SCHEMA in page
+    audit_rows = [
+        json.loads(line)
+        for line in (output / "audit_manifest.jsonl").read_text().splitlines()
+    ]
+    assert all((output / row["audio"]).is_file() for row in audit_rows)

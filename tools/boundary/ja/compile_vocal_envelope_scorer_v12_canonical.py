@@ -21,7 +21,12 @@ from boundary.ja.vocal_envelope_v12 import (  # noqa: E402
     VOCAL_ENVELOPE_SCORER_V12_DATASET_CONTRACT,
     VOCAL_ENVELOPE_SCORER_V12_IGNORE_INDEX,
     VOCAL_ENVELOPE_SCORER_V12_LABELS,
+    VOCAL_ENVELOPE_SCORER_V12_ENVELOPE_STRUCTURE_OPTIONS,
+    VOCAL_ENVELOPE_SCORER_V12_MANUAL_VERDICT_SCHEMA,
+    VOCAL_ENVELOPE_SCORER_V12_NONVOCAL_SAFETY_OPTIONS,
     VOCAL_ENVELOPE_SCORER_V12_PREAUDIT_SCHEMA,
+    VOCAL_ENVELOPE_SCORER_V12_VOCAL_COVERAGE_OPTIONS,
+    vocal_envelope_v12_manual_verdict_is_approved,
 )
 
 CONTRACT_ID = "boundary_acoustic_binary_v12"
@@ -32,9 +37,9 @@ EXPECTED_REASONING = "medium"
 EXPECTED_MAX_TOKENS = 8192
 EXPECTED_TIMESTAMP_CONTRACT = "omni_audio_timestamp_mmss_mmm_v1"
 EXPECTED_EXECUTION_CONTRACT = "gemini_openrouter_reasoning_require_parameters_v1"
-EXPECTED_PROMPT_PROFILE = "vocal-envelope-protect-nonvocal-v1"
-EXPECTED_PROTECT_PROMPT_VERSION = "vocal-envelope-protect-v1-gemini36-medium-mmss"
-EXPECTED_NONVOCAL_PROMPT_VERSION = "vocal-envelope-nonvocal-v1-gemini36-medium-mmss"
+EXPECTED_PROMPT_PROFILE = "vocal-envelope-protect-nonvocal-v2"
+EXPECTED_PROTECT_PROMPT_VERSION = "vocal-envelope-protect-v2-human-vocal-event-gemini36-medium-mmss"
+EXPECTED_NONVOCAL_PROMPT_VERSION = "vocal-envelope-nonvocal-v2-zero-human-vocal-gemini36-medium-mmss"
 EXPECTED_PROMPT_VERSION = f"{EXPECTED_PROTECT_PROMPT_VERSION}__{EXPECTED_NONVOCAL_PROMPT_VERSION}"
 OUTPUT_SUMMARY_SCHEMA = "vocal_envelope_scorer_v12_canonical_compile_summary_v1"
 
@@ -131,7 +136,13 @@ def _validate_partition_and_core(sources: Mapping[str, Mapping[str, Any]]) -> No
         seen_core.add(values[0])
 
 
-def compile_canonical(*, manifest: Path, preaudit: Path, output_dir: Path, allow_teacher_supervision: bool = False) -> dict[str, Any]:
+def compile_canonical(
+    *,
+    manifest: Path,
+    preaudit: Path,
+    output_dir: Path,
+    manual_verdicts: Path | None = None,
+) -> dict[str, Any]:
     manifest = manifest.resolve()
     preaudit = preaudit.resolve()
     sources = _index(_rows(manifest), "source_id", "v12 source manifest")
@@ -141,6 +152,16 @@ def compile_canonical(*, manifest: Path, preaudit: Path, output_dir: Path, allow
     _validate_partition_and_core(sources)
     manifest_sha = _sha256(manifest)
     preaudit_sha = _sha256(preaudit)
+    verdict_rows: dict[str, dict[str, Any]] = {}
+    verdict_sha = ""
+    if manual_verdicts is not None:
+        manual_verdicts = manual_verdicts.resolve()
+        verdict_rows = _index(
+            _rows(manual_verdicts), "source_id", "v12 manual verdicts"
+        )
+        if set(verdict_rows) != set(sources):
+            raise ValueError("v12 manual verdicts must cover the exact source manifest")
+        verdict_sha = _sha256(manual_verdicts)
     compiled: list[dict[str, Any]] = []
     totals = Counter()
     partitions = Counter()
@@ -195,10 +216,42 @@ def compile_canonical(*, manifest: Path, preaudit: Path, output_dir: Path, allow
         if duration_s <= 0.0 or abs(float(evidence.get("duration_s") or 0.0) - duration_s) > 1e-9:
             raise ValueError(f"v12 duration mismatch: {source_id}")
         spans = _normalize_spans(evidence, frame_count=frame_count, source_id=source_id)
+        partition = str(source["partition"])
+        verdict = verdict_rows.get(source_id)
+        human_approved = False
+        if verdict is not None:
+            if verdict.get("schema") != VOCAL_ENVELOPE_SCORER_V12_MANUAL_VERDICT_SCHEMA:
+                raise ValueError(f"wrong v12 manual verdict schema: {source_id}")
+            if verdict.get("boundary_serialization_contract_id") != CONTRACT_ID:
+                raise ValueError(f"wrong v12 manual verdict contract: {source_id}")
+            for field, expected in (
+                ("source_manifest_sha256", manifest_sha),
+                ("preaudit_sha256", preaudit_sha),
+                ("partition", partition),
+                ("video_id", str(source.get("video_id") or "")),
+                ("audio_sha256", declared_audio_sha),
+                ("frame_count", frame_count),
+            ):
+                if verdict.get(field) != expected:
+                    raise ValueError(f"v12 manual verdict {field} mismatch: {source_id}")
+            if abs(float(verdict.get("duration_s") or 0.0) - duration_s) > 1e-9:
+                raise ValueError(f"v12 manual verdict duration mismatch: {source_id}")
+            if str(verdict.get("vocal_coverage") or "") not in VOCAL_ENVELOPE_SCORER_V12_VOCAL_COVERAGE_OPTIONS:
+                raise ValueError(f"invalid v12 vocal coverage verdict: {source_id}")
+            if str(verdict.get("non_vocal_safety") or "") not in VOCAL_ENVELOPE_SCORER_V12_NONVOCAL_SAFETY_OPTIONS:
+                raise ValueError(f"invalid v12 non-vocal safety verdict: {source_id}")
+            if str(verdict.get("envelope_structure") or "") not in VOCAL_ENVELOPE_SCORER_V12_ENVELOPE_STRUCTURE_OPTIONS:
+                raise ValueError(f"invalid v12 envelope structure verdict: {source_id}")
+            human_approved = vocal_envelope_v12_manual_verdict_is_approved(verdict)
+            if bool(verdict.get("approved")) != human_approved:
+                raise ValueError(f"v12 manual verdict approval flag mismatch: {source_id}")
+            if bool(verdict.get("training_manifest_allowed")) != human_approved:
+                raise ValueError(f"v12 manual verdict training flag mismatch: {source_id}")
+            if not human_approved:
+                raise ValueError(f"v12 manual verdict rejects canonical supervision: {source_id}")
         counts = Counter(str(span["label"]) for span in spans)
         for label, count in counts.items():
             totals[label] += sum(int(span["end_frame"]) - int(span["start_frame"]) for span in spans if span["label"] == label)
-        partition = str(source["partition"])
         partitions[partition] += 1
         compiled.append({
             "schema": VOCAL_ENVELOPE_SCORER_V12_CANONICAL_SOURCE_SCHEMA,
@@ -218,10 +271,13 @@ def compile_canonical(*, manifest: Path, preaudit: Path, output_dir: Path, allow
             "canonical_spans": spans,
             "labels": list(VOCAL_ENVELOPE_SCORER_V12_LABELS),
             "unsure_training_label": VOCAL_ENVELOPE_SCORER_V12_IGNORE_INDEX,
-            "annotation_provenance": "gemini36_medium_independent_vocal_nonvocal_evidence_v1",
-            "teacher_output_used_as_truth": bool(allow_teacher_supervision),
+            "annotation_provenance": "human_approved_gemini36_medium_independent_vocal_nonvocal_evidence_v1" if human_approved else "gemini36_medium_independent_vocal_nonvocal_evidence_review_only_v1",
+            "teacher_output_used_as_truth": human_approved,
             "teacher_output_used_as_calibrated_evidence": True,
-            "training_manifest_allowed": bool(allow_teacher_supervision),
+            "training_manifest_allowed": human_approved,
+            "human_full_source_review_approved": human_approved,
+            "manual_verdicts": str(manual_verdicts) if manual_verdicts else None,
+            "manual_verdicts_sha256": verdict_sha or None,
             "v11_label_inheritance": False,
             "v11_complement_conversion": False,
             "preaudit": str(preaudit),
@@ -247,8 +303,11 @@ def compile_canonical(*, manifest: Path, preaudit: Path, output_dir: Path, allow
         "output": str(output_path), "output_sha256": _sha256(output_path),
         "source_count": len(compiled), "partition_counts": dict(partitions),
         "frame_counts": dict(sorted(totals.items())),
-        "teacher_output_used_as_truth": bool(allow_teacher_supervision),
-        "training_manifest_allowed": bool(allow_teacher_supervision),
+        "teacher_output_used_as_truth": bool(verdict_rows),
+        "training_manifest_allowed": bool(verdict_rows),
+        "human_full_source_review_approved": bool(verdict_rows),
+        "manual_verdicts": str(manual_verdicts) if manual_verdicts else None,
+        "manual_verdicts_sha256": verdict_sha or None,
         "v11_complement_conversion": False,
     }
     (output_dir / "summary.json").write_text(json.dumps(summary, ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8")
@@ -260,10 +319,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--manifest", required=True)
     parser.add_argument("--preaudit", required=True)
     parser.add_argument("--output-dir", required=True)
-    parser.add_argument("--allow-teacher-supervision", action="store_true")
+    parser.add_argument("--manual-verdicts")
     return parser.parse_args(argv)
 
 
 if __name__ == "__main__":
     args = parse_args()
-    print(json.dumps(compile_canonical(manifest=Path(args.manifest), preaudit=Path(args.preaudit), output_dir=Path(args.output_dir), allow_teacher_supervision=args.allow_teacher_supervision), ensure_ascii=False))
+    print(json.dumps(compile_canonical(manifest=Path(args.manifest), preaudit=Path(args.preaudit), output_dir=Path(args.output_dir), manual_verdicts=Path(args.manual_verdicts) if args.manual_verdicts else None), ensure_ascii=False))

@@ -48,9 +48,9 @@ FRAME_HOP_S = 0.02
 CONTRACT_ID = "boundary_acoustic_binary_v12"
 SUMMARY_SCHEMA = "vocal_envelope_scorer_v12_dual_evidence_summary_v1"
 PROGRESS_SCHEMA = "vocal_envelope_scorer_v12_dual_evidence_progress_v1"
-PROMPT_PROFILE = "vocal-envelope-protect-nonvocal-v1"
-PROTECT_PROMPT_VERSION = "vocal-envelope-protect-v1-gemini36-medium-mmss"
-NONVOCAL_PROMPT_VERSION = "vocal-envelope-nonvocal-v1-gemini36-medium-mmss"
+PROMPT_PROFILE = "vocal-envelope-protect-nonvocal-v2"
+PROTECT_PROMPT_VERSION = "vocal-envelope-protect-v2-human-vocal-event-gemini36-medium-mmss"
+NONVOCAL_PROMPT_VERSION = "vocal-envelope-nonvocal-v2-zero-human-vocal-gemini36-medium-mmss"
 PROMPT_VERSION = f"{PROTECT_PROMPT_VERSION}__{NONVOCAL_PROMPT_VERSION}"
 EXPECTED_MODEL = "google/gemini-3.6-flash"
 EXPECTED_PROFILE = "gemini"
@@ -62,12 +62,14 @@ EXPECTED_EXECUTION_CONTRACT = "gemini_openrouter_reasoning_require_parameters_v1
 PROTECT_SYSTEM_PROMPT = """你是 1.7B Scorer v12 的 Human Vocal Event Envelope 保护通道预审 teacher。
 音频主要来自日语 JAV、Galgame 或类似场景，但场景和声音类别不能直接决定标签。
 
-你的唯一任务是找出所有“由人类声道、口腔或呼吸系统产生”的连续发声事件包络，输出 vocal_spans。
-这不是语义判断，也不是 ASR 价值判断。对白、耳语、呻吟、喘息、呼吸、哭笑、亲吻/口腔声、歌唱、远处人声和含混的人声都属于 vocal，优先完整保留。
-同一发声事件中的短停顿、吸气、释气和非语义过渡应随包络保留；不要按音节、字、极短停顿或每个脉冲切碎。若相邻人声属于同一连续事件，合并为一个较完整的包络。
+你的唯一任务是找出所有“由人类声道、口腔或呼吸系统产生”的连续发声事件包络，输出 vocal_spans。这是人类发声/非发声二分类，不是语义判断、字幕价值判断或 ASR 可识别性判断。
 
-不要标记纯机械、撞击、衣物/床体、水声、纯音乐、静音、环境噪声；这些留给 Non-vocal 通道。
-边界覆盖完整起始和衰减，不要为了贴声学起点而截断人声。无法判断时可省略，不要猜测。
+以下无论有无词义都属于 vocal：清晰或含混对白、耳语、气声、呻吟、喘息、吸气、呼气、叹气、哭、笑、咳嗽、喷嚏、清嗓、抽鼻、亲吻/唾液/其他口腔声、歌唱、远处或背景人声。像「あ、ん、はぁ」的声音无论是词语、应答还是纯呻吟，在本任务中都同样属于 vocal。不要因为它“没有语义”“不值得翻译”或 ASR 识别不出而删除。
+
+正类单位是连续的人类发声事件包络，不是严格逐帧 VAD。一次连续发声事件内部的短停顿、吸气、释气、弱尾音和非语义过渡应随包络保留；不要按音节、字、每次喘息脉冲或极短能量谷切碎。若前后属于同一连续发声事件，应输出一个完整包络；若中间是声学上独立的纯非发声区域，则分成两个事件，不要无限跨背景合并。不得使用固定时长阈值判断。
+
+不要标记纯机械、撞击、衣物/床体、水声、纯器乐、静音和环境噪声；这些留给 Non-vocal 通道。但只要上述声音中叠有任何疑似人类发声，重叠部分必须保护为 vocal。
+边界覆盖完整起始、词头/气声、衰减和尾音，不要为了贴声学起点而截断。无法判断是否有人类发声时，优先保护；只有完全没有可定位证据时才省略，不要凭场景猜测。
 只输出当前完整 source 的 0-based vocal_spans JSON 数组，不转写、不判断语义、不标注 non_vocal_spans。
 
 输出对象：{"source_id":"...","vocal_spans":[{"start_ts":"00:00.000","end_ts":"00:01.000","reason":"简短声学理由"}],"overall_reason":"..."}
@@ -78,9 +80,10 @@ NONVOCAL_SYSTEM_PROMPT = """你是 1.7B Scorer v12 的 Human Vocal Event Envelop
 
 你的唯一任务是找出“明确不含任何人类声道、口腔或呼吸发声”的连续 non-vocal 区间，输出 non_vocal_spans。
 允许：纯机械、碰撞、衣物/床体、动作、水声、纯音乐、静音、底噪、风扇空调、电流和其他环境噪声。
-只要存在对白、耳语、呻吟、喘息、呼吸、哭笑、亲吻/口腔声、歌唱或远处/背景人声的合理声学证据，就不要标记 non-vocal；宁可省略。
-不要把短时长、低响度或 ASR 无结果当成证据。不要切分人类发声，不判断语义。
-边界必须与任何可能人声清晰分离；不确定就输出空数组。
+只要存在对白、耳语、气声、呻吟、喘息、吸气、呼气、叹气、哭笑、咳嗽、喷嚏、清嗓、抽鼻、亲吻/唾液/口腔声、歌唱或远处/背景人声的合理声学证据，就不要标记 non-vocal。非语义呻吟和呼吸仍是人类发声，绝对不能因为“不值得翻译”而放入 non-vocal。
+动作声、撞击声、水声、音乐或噪声占主导也不能覆盖其下叠加的弱人声；应缩小或拆开区间，只输出真正零人类发声的内部部分。
+不要把短时长、低响度、ASR 无结果或缺少词义当成 non-vocal 证据。不要切分人类发声，不判断语义，不使用固定时长阈值。
+边界必须与任何可能人声的起始、尾音和呼吸清晰分离；不确定就省略，允许输出空数组。
 
 输出对象：{"source_id":"...","non_vocal_spans":[{"start_ts":"00:00.000","end_ts":"00:01.000","category":"mechanical|impact|cloth|bed|water|music|silence|ambience|other","reason":"简短声学理由"}],"overall_reason":"..."}
 """ + "\n" + TIMESTAMP_PROMPT_CONTRACT_ZH
