@@ -16,6 +16,7 @@ from boundary.ja.vocal_envelope_v12 import (
     VOCAL_ENVELOPE_SCORER_V12_SCHEMA,
     VOCAL_ENVELOPE_SCORER_V12_MANUAL_VERDICT_SCHEMA,
     VOCAL_ENVELOPE_SCORER_V12_QUERY_MASK_SCHEMA,
+    VOCAL_ENVELOPE_SCORER_V12_TASK_SEMANTICS,
     VocalEnvelopeScorerV12DenseSpanNetwork,
     VocalEnvelopeScorerV12CrfNetwork,
     VocalEnvelopeScorerV12QueryMaskNetwork,
@@ -40,12 +41,20 @@ from tools.boundary.ja.compile_vocal_envelope_scorer_v12_canonical import (
 from tools.boundary.ja.label_vocal_envelope_scorer_v12_with_omni import (
     EXPECTED_MAX_TOKENS,
     PROVIDER_CONTRACTS,
+    TRISTATE_RESPONSE_SCHEMA,
     TRISTATE_SYSTEM_PROMPT,
     _normalize_segments,
     _request_prompt,
     _validate_manifest,
     parse_args,
     run as run_teacher,
+)
+from tools.boundary.ja.vocal_envelope_scorer_v12_teacher_contract import (
+    RESPONSE_SCHEMA_SHA256,
+    SYSTEM_PROMPT_SHA256,
+    TEACHER_TASK_CONTRACT_ID,
+    teacher_contract_fingerprint_fields,
+    validate_teacher_contract_content,
 )
 from tools.omni.timestamp_contract import TIMESTAMP_CONTRACT_ID
 
@@ -94,6 +103,7 @@ def _teacher_fixture(tmp_path: Path) -> tuple[Path, Path]:
             {
                 "schema": VOCAL_ENVELOPE_SCORER_V12_PREAUDIT_SCHEMA,
                 "boundary_serialization_contract_id": "boundary_acoustic_binary_v12",
+                "task_semantics": VOCAL_ENVELOPE_SCORER_V12_TASK_SEMANTICS,
                 "source_id": source["source_id"],
                 "video_id": source["video_id"],
                 "partition": source["partition"],
@@ -113,6 +123,7 @@ def _teacher_fixture(tmp_path: Path) -> tuple[Path, Path]:
                 "top_k": None,
                 "prompt_profile": EXPECTED_PROMPT_PROFILE,
                 "prompt_version": EXPECTED_PROMPT_VERSION,
+                **teacher_contract_fingerprint_fields(),
                 "teacher_timestamp_contract_id": TIMESTAMP_CONTRACT_ID,
                 "teacher_execution_contract_id": provider_contract[
                     "execution_contract"
@@ -151,6 +162,7 @@ def _approved_verdicts(manifest: Path, preaudit: Path) -> Path:
             {
                 "schema": VOCAL_ENVELOPE_SCORER_V12_MANUAL_VERDICT_SCHEMA,
                 "boundary_serialization_contract_id": "boundary_acoustic_binary_v12",
+                "task_semantics": VOCAL_ENVELOPE_SCORER_V12_TASK_SEMANTICS,
                 "source_id": source["source_id"],
                 "video_id": source["video_id"],
                 "partition": source["partition"],
@@ -161,6 +173,7 @@ def _approved_verdicts(manifest: Path, preaudit: Path) -> Path:
                 "preaudit_sha256": preaudit_sha,
                 "reviewed_full_source": True,
                 "vocal_coverage": "definite_vocal_complete",
+                "vocal_purity": "definite_vocal_excludes_separable_nonvoice",
                 "non_vocal_safety": "definite_non_vocal_clean",
                 "envelope_structure": "event_envelopes_continuous",
                 "approved": True,
@@ -200,6 +213,7 @@ def _approved_verdicts_for_ids(
             {
                 "schema": VOCAL_ENVELOPE_SCORER_V12_MANUAL_VERDICT_SCHEMA,
                 "boundary_serialization_contract_id": "boundary_acoustic_binary_v12",
+                "task_semantics": VOCAL_ENVELOPE_SCORER_V12_TASK_SEMANTICS,
                 "source_id": source_id,
                 "video_id": sources[source_id]["video_id"],
                 "partition": sources[source_id]["partition"],
@@ -210,6 +224,7 @@ def _approved_verdicts_for_ids(
                 "preaudit_sha256": preaudit_sha,
                 "reviewed_full_source": True,
                 "vocal_coverage": "definite_vocal_complete",
+                "vocal_purity": "definite_vocal_excludes_separable_nonvoice",
                 "non_vocal_safety": "definite_non_vocal_clean",
                 "envelope_structure": "event_envelopes_continuous",
                 "approved": True,
@@ -303,6 +318,15 @@ def test_v12_contract_is_breaking_and_runtime_is_argmax(tmp_path: Path) -> None:
     with pytest.raises(ValueError, match="v11/v10 checkpoints are not compatible"):
         load_vocal_envelope_scorer_v12_checkpoint(legacy, device="cpu")
 
+    retired_v12 = tmp_path / "retired-v12.pt"
+    retired_payload = torch.load(checkpoint, map_location="cpu", weights_only=False)
+    retired_payload["metadata"]["dataset_contract"]["label_unit"] = (
+        "human_vocal_event_envelope"
+    )
+    torch.save(retired_payload, retired_v12)
+    with pytest.raises(ValueError, match="dataset contract mismatch"):
+        load_vocal_envelope_scorer_v12_checkpoint(retired_v12, device="cpu")
+
 
 def test_v12_crf_checkpoint_uses_exact_viterbi_runtime(tmp_path: Path) -> None:
     import torch
@@ -386,11 +410,11 @@ def test_v12_structured_checkpoint_schemas_are_runtime_separate(
 
 
 def test_v12_prompts_and_timestamp_quantization_are_task_specific() -> None:
-    assert "连续的人类发声事件候选包络" in TRISTATE_SYSTEM_PROMPT
+    assert "连续的人类声音事件候选包络" in TRISTATE_SYSTEM_PROMPT
     assert "Proposal/Split" in TRISTATE_SYSTEM_PROMPT
     assert "CueQC" in TRISTATE_SYSTEM_PROMPT
     assert all(value in TRISTATE_SYSTEM_PROMPT for value in ("呻吟", "喘息", "吸气", "呼气"))
-    assert "肉体撞击由人体动作产生也不等于人声" in TRISTATE_SYSTEM_PROMPT
+    assert "声音来自人体并不等于人声" in TRISTATE_SYSTEM_PROMPT
     assert "完整音频的 segments" in TRISTATE_SYSTEM_PROMPT
     assert "MM:SS.mmm" in TRISTATE_SYSTEM_PROMPT
     args = parse_args(["--manifest", "m", "--output-dir", "o"])
@@ -409,6 +433,7 @@ def test_v12_prompts_and_timestamp_quantization_are_task_specific() -> None:
     )
     assert request["duration_ts"] == "01:05.153"
     assert "duration_s" not in request
+    assert request["task"] == TEACHER_TASK_CONTRACT_ID
 
     normalized = _normalize_segments(
         {
@@ -417,6 +442,7 @@ def test_v12_prompts_and_timestamp_quantization_are_task_specific() -> None:
                     "start_ts": "00:00.000",
                     "end_ts": "00:00.021",
                     "label": "vocal_candidate",
+                    "category": "speech",
                 },
                 {
                     "start_ts": "00:00.021",
@@ -428,6 +454,7 @@ def test_v12_prompts_and_timestamp_quantization_are_task_specific() -> None:
                     "start_ts": "00:00.081",
                     "end_ts": "00:00.100",
                     "label": "unsure",
+                    "category": "uncertain",
                 },
             ]
         },
@@ -439,7 +466,7 @@ def test_v12_prompts_and_timestamp_quantization_are_task_specific() -> None:
     assert (normalized["unsure_spans"][0]["start_frame"], normalized["unsure_spans"][0]["end_frame"]) == (4, 5)
     with pytest.raises(ValueError, match="numeric seconds are rejected"):
         _normalize_segments(
-            {"segments": [{"start_ts": 0.0, "end_ts": "00:00.100", "label": "vocal_candidate"}]},
+            {"segments": [{"start_ts": 0.0, "end_ts": "00:00.100", "label": "vocal_candidate", "category": "speech"}]},
             duration_s=0.1,
             frame_count=5,
         )
@@ -447,7 +474,94 @@ def test_v12_prompts_and_timestamp_quantization_are_task_specific() -> None:
         _normalize_segments(
             {
                 "segments": [
-                    {"start_ts": "00:00.000", "end_ts": "00:00.120", "label": "vocal_candidate"}
+                    {"start_ts": "00:00.000", "end_ts": "00:00.120", "label": "vocal_candidate", "category": "speech"}
+                ]
+            },
+            duration_s=0.1,
+            frame_count=5,
+        )
+
+
+def test_v12_teacher_prompt_and_schema_content_are_fingerprint_bound() -> None:
+    expected = {
+        "teacher_task_contract_id": TEACHER_TASK_CONTRACT_ID,
+        "system_prompt_sha256": SYSTEM_PROMPT_SHA256,
+        "response_schema_sha256": RESPONSE_SCHEMA_SHA256,
+    }
+    assert validate_teacher_contract_content(
+        system_prompt=TRISTATE_SYSTEM_PROMPT,
+        response_schema=TRISTATE_RESPONSE_SCHEMA,
+    ) == expected
+
+    with pytest.raises(ValueError, match="system prompt fingerprint mismatch"):
+        validate_teacher_contract_content(
+            system_prompt=TRISTATE_SYSTEM_PROMPT + "\n正文漂移",
+            response_schema=TRISTATE_RESPONSE_SCHEMA,
+        )
+
+    changed_schema = json.loads(json.dumps(TRISTATE_RESPONSE_SCHEMA))
+    changed_schema["properties"]["overall_reason"]["maxLength"] = 10
+    with pytest.raises(ValueError, match="response schema fingerprint mismatch"):
+        validate_teacher_contract_content(
+            system_prompt=TRISTATE_SYSTEM_PROMPT,
+            response_schema=changed_schema,
+        )
+
+
+@pytest.mark.parametrize("category", ("speech", "whisper_language", "moan", "voiced_vocalization"))
+def test_v12_voice_categories_are_positive(category: str) -> None:
+    normalized = _normalize_segments(
+        {
+            "segments": [
+                {
+                    "start_ts": "00:00.000",
+                    "end_ts": "00:00.100",
+                    "label": "vocal_candidate",
+                    "category": category,
+                }
+            ]
+        },
+        duration_s=0.1,
+        frame_count=5,
+    )
+    assert normalized["vocal_spans"][0]["start_frame"] == 0
+    assert normalized["vocal_spans"][0]["end_frame"] == 5
+    assert normalized["vocal_spans"][0]["category"] == category
+
+
+@pytest.mark.parametrize(
+    "category",
+    ("breath_airflow", "pant_airflow", "kiss", "oral_action", "swallow", "cough"),
+)
+def test_v12_nonvoice_human_sounds_are_negative(category: str) -> None:
+    normalized = _normalize_segments(
+        {
+            "segments": [
+                {
+                    "start_ts": "00:00.000",
+                    "end_ts": "00:00.100",
+                    "label": "non_vocal_candidate",
+                    "category": category,
+                }
+            ]
+        },
+        duration_s=0.1,
+        frame_count=5,
+    )
+    assert normalized["non_vocal_spans"][0]["start_frame"] == 0
+    assert normalized["non_vocal_spans"][0]["end_frame"] == 5
+    assert normalized["non_vocal_spans"][0]["category"] == category
+
+    with pytest.raises(ValueError, match="unsupported vocal category"):
+        _normalize_segments(
+            {
+                "segments": [
+                    {
+                        "start_ts": "00:00.000",
+                        "end_ts": "00:00.100",
+                        "label": "vocal_candidate",
+                        "category": category,
+                    }
                 ]
             },
             duration_s=0.1,
@@ -460,8 +574,8 @@ def test_v12_single_pass_rejects_gaps_and_adjacent_duplicate_labels() -> None:
         _normalize_segments(
             {
                 "segments": [
-                    {"start_ts": "00:00.000", "end_ts": "00:00.040", "label": "vocal_candidate"},
-                    {"start_ts": "00:00.060", "end_ts": "00:00.100", "label": "unsure"},
+                    {"start_ts": "00:00.000", "end_ts": "00:00.040", "label": "vocal_candidate", "category": "speech"},
+                    {"start_ts": "00:00.060", "end_ts": "00:00.100", "label": "unsure", "category": "uncertain"},
                 ]
             },
             duration_s=0.1,
@@ -471,8 +585,8 @@ def test_v12_single_pass_rejects_gaps_and_adjacent_duplicate_labels() -> None:
         _normalize_segments(
             {
                 "segments": [
-                    {"start_ts": "00:00.000", "end_ts": "00:00.040", "label": "vocal_candidate"},
-                    {"start_ts": "00:00.040", "end_ts": "00:00.100", "label": "vocal_candidate"},
+                    {"start_ts": "00:00.000", "end_ts": "00:00.040", "label": "vocal_candidate", "category": "speech"},
+                    {"start_ts": "00:00.040", "end_ts": "00:00.100", "label": "vocal_candidate", "category": "speech"},
                 ]
             },
             duration_s=0.1,
@@ -558,6 +672,22 @@ def test_v12_canonical_accepts_one_consistent_native_gemini_profile(
     assert summary["training_manifest_allowed"] is False
 
 
+def test_v12_canonical_rejects_teacher_content_fingerprint_drift(
+    tmp_path: Path,
+) -> None:
+    manifest, preaudit = _teacher_fixture(tmp_path)
+    rows = [json.loads(line) for line in preaudit.read_text().splitlines()]
+    rows[0]["system_prompt_sha256"] = "0" * 64
+    _write_jsonl(preaudit, rows)
+
+    with pytest.raises(ValueError, match="system_prompt_sha256 mismatch"):
+        compile_canonical(
+            manifest=manifest,
+            preaudit=preaudit,
+            output_dir=tmp_path / "prompt-drift",
+        )
+
+
 def test_v12_canonical_can_be_explicitly_enabled_after_external_review(
     tmp_path: Path,
 ) -> None:
@@ -574,8 +704,8 @@ def test_v12_canonical_can_be_explicitly_enabled_after_external_review(
         "non_vocal_candidate": 6,
         "vocal_candidate": 9,
     }
-    assert summary["dataset_contract"]["label_unit"] == "human_vocal_event_envelope"
-    assert summary["canonical_label_schema"] == "vocal_envelope_frames_v1"
+    assert summary["dataset_contract"]["label_unit"] == "human_voice_event_envelope"
+    assert summary["canonical_label_schema"] == "vocal_envelope_frames_v2"
     assert VOCAL_ENVELOPE_SCORER_V12_SCHEMA == "vocal_envelope_scorer_v12"
 
 
@@ -795,6 +925,13 @@ def test_v12_teacher_can_seed_approved_calibration_without_api_call(
     )
     assert seeded["source_manifest_sha256"] == _sha256(manifest)
     assert seeded["calibration_preaudit_sha256"] == calibration_hashes["preaudit"]
+    progress = json.loads(
+        (tmp_path / "seeded" / "progress.json").read_text(encoding="utf-8")
+    )
+    for field, expected in teacher_contract_fingerprint_fields().items():
+        assert seeded[field] == expected
+        assert summary[field] == expected
+        assert progress[field] == expected
 
 
 def test_v12_teacher_audit_uses_shared_core_and_independent_span_playback(
@@ -809,20 +946,54 @@ def test_v12_teacher_audit_uses_shared_core_and_independent_span_playback(
     )
     assert summary["source_count"] == 3
     assert summary["training_manifest_allowed"] is False
+    assert summary["schema"] == "vocal_envelope_scorer_v12_teacher_audit_summary_v2"
+    assert summary["task_semantics"] == VOCAL_ENVELOPE_SCORER_V12_TASK_SEMANTICS
     page = (output / "index.html").read_text(encoding="utf-8")
     assert "createAuditReviewCore" in page
+    assert "Human Voice Envelope Teacher review" in page
     assert "canonical vocal" in page
     assert "canonical non-vocal" in page
     assert "canonical unsure" in page
     assert "颜色条点击后只播放自身精确区间" in page
+    assert "纯呼吸气流、无声喘气、亲吻、吞咽" in page
+    assert "带声呻吟" in page
+    assert "definite_vocal_excludes_separable_nonvoice" in page
+    assert "definite_vocal_contains_separable_nonvoice" in page
     assert "definite_non_vocal_contains_vocal" in page
     assert "both_fragmented_and_overmerged" in page
+    assert "vocal-envelope-scorer-v12-teacher-audit-v2" in page
+    assert "location.pathname" in page
+    assert summary["source_manifest_sha256"] in page
+    assert summary["preaudit_sha256"] in page
+    assert summary["audit_manifest_sha256"] in page
+    assert "vocal-envelope-scorer-v12-teacher-audit-v1" not in page
     assert VOCAL_ENVELOPE_SCORER_V12_MANUAL_VERDICT_SCHEMA in page
     audit_rows = [
         json.loads(line)
         for line in (output / "audit_manifest.jsonl").read_text().splitlines()
     ]
     assert all((output / row["audio"]).is_file() for row in audit_rows)
+    assert all(
+        row["task_semantics"] == VOCAL_ENVELOPE_SCORER_V12_TASK_SEMANTICS
+        and row["source_manifest_sha256"] == summary["source_manifest_sha256"]
+        and row["preaudit_sha256"] == summary["preaudit_sha256"]
+        and row["evidence_span_signature"]
+        for row in audit_rows
+    )
+
+
+def test_v12_teacher_audit_rejects_wrong_task_semantics(tmp_path: Path) -> None:
+    manifest, preaudit = _teacher_fixture(tmp_path)
+    rows = [json.loads(line) for line in preaudit.read_text().splitlines()]
+    rows[0]["task_semantics"] = "legacy_semantic_candidate"
+    _write_jsonl(preaudit, rows)
+
+    with pytest.raises(ValueError, match="wrong v12 task semantics"):
+        build_teacher_audit(
+            source_manifest=manifest,
+            preaudit=preaudit,
+            output_dir=tmp_path / "audit",
+        )
 
 
 def test_v12_teacher_audit_can_skip_exact_approved_calibration_heldout(

@@ -18,11 +18,11 @@ jav-trans 是一个面向 Windows + NVIDIA 显卡的本地 JAV 字幕生成工�
 
 ## 项目背景
 
-本项目的边界系统不是单一 VAD，而是先检测连续人类发声包络，再逐层完成事件隔离、语义路由和首尾裁边，最终生成适合字幕和 ASR 的 speech-core chunk。
+本项目的边界系统不是单一 VAD，而是先检测连续人声包络，再逐层完成事件隔离、语义路由和首尾裁边，最终生成适合字幕和 ASR 的 speech-core chunk。
 
 当前设计把职责拆开：
 
-- Vocal-envelope Scorer v12 只检测连续人类发声事件：对白、耳语、呻吟、喘息、呼吸、哭笑、口腔声、歌唱和远处人声均优先保留；纯静音、环境/BGM、机械、衣物/床体/水声和纯肉体撞击声属于 `non_vocal_candidate`。它不判断语义，也不按句切分。
+- Voice-envelope Scorer v12 只检测连续的真正人声事件：对白、语言耳语、带声呻吟、带声哭笑、歌唱和远处人声属于 `vocal_candidate`。纯呼吸气流、无声喘气、亲吻、吞咽、唾液/口腔动作、咳嗽等非嗓音人体声，以及静音、环境/BGM、机械、衣物/床体/水声和纯肉体撞击声属于 `non_vocal_candidate`；弱呻吟、耳语与纯气流无法可靠区分时标为训练忽略的 `unsure`。它不判断语义，也不按句切分。
 - Boundary Proposal 只提供高召回候选断点；Acoustic Split v4 学习 `cut/continue`，负责把包络内独立事件隔离成 provisional sub-islands。
 - Pre-ASR CueQC v13 对 provisional sub-island 做 `keep/drop` 二分类 argmax 路由；teacher/data 层可以保留 `unsure`，但模型不会输出它。
 - Inner Edge Refiner v2 对 CueQC 保留的 sub-island 做逐帧二分类 argmax，裁成送入 ASR 的 acoustic semantic core。
@@ -113,7 +113,7 @@ Web 会在模型要求检查中提示驱动过旧或 CUDA 初始化失败。
   -> Shared Qwen feature extraction
      - Qwen ASR repo 对应的 frozen PTM/encoder frame features
      - MFCC / timing numeric features
-  -> Vocal-envelope Scorer v12（1.7B，完全随机初始化重训中，registry 仍为空）
+  -> Voice-envelope Scorer v12（1.7B，按 voice-only 标签完全随机初始化重训中，registry 仍为空）
      - 主臂：raw PTM2048 -> checkpoint 内 Linear(2048->2048)+GELU
      - 与 normalized MFCC40 拼接后 Linear(2088->256)
      - valid-prefix bidirectional Mamba2(hidden=256)
@@ -146,7 +146,7 @@ Web 会在模型要求检查中提示驱动过旧或 CUDA 初始化失败。
 
 关键约束：
 
-- Scorer v12 只决定是否存在连续人类发声事件，不负责语义 drop 或句内切点；Proposal 只能附加非绑定候选，最终 cut 由 Split 决定。
+- Scorer v12 只决定是否存在连续真正人声事件，不负责语义 drop 或句内切点；Proposal 只能附加非绑定候选，最终 cut 由 Split 决定。
 - 内部 cut 是一个共享绝对时间戳，不允许左右 chunk 各自修边。
 - `20 / (24000/1001)` 是字幕最短显示和 micro chunk 风险线，不是 runtime duration-only drop 阈值。
 - 7 秒是字幕显示 soft guard，不是 ASR chunk 上限。

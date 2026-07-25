@@ -2,7 +2,11 @@
 
 ## Decision
 
-Scorer v12 detects continuous human-vocal event envelopes. All Scorer weights
+Scorer v12 detects continuous human-voice event envelopes. A positive event
+requires actual voice: speech, linguistic whisper, voiced moaning or another
+audible human vocalization. Pure respiratory airflow, unvoiced panting,
+kissing, swallowing and mouth-action sounds are non-vocal; ambiguous weak
+voice versus airflow is ignored. All Scorer weights
 are trained from random initialization with seed `117`; v10/v11 checkpoints are
 never loaded. The ASR PTM is only a frozen raw feature extractor.
 
@@ -14,14 +18,19 @@ runtime threshold, duration rule, hysteresis, NMS, rule merge, or fallback.
 
 - Keep source/core/video partition, PTM2048/MFCC40, P2048/H256 Bi-Mamba trunk,
   1000-frame context, midpoint ownership, seed and batch budget identical.
-- The 25-source pilot is only an implementation/data-contract gate. It has 13
+- The previous 25-source pilot used the retired human-produced-sound policy and
+  is invalid. Its source manifest may be reused, but Teacher evidence, manual
+  verdicts and calibration hashes must be regenerated under
+  `human_voice_event_envelope_v2`.
+- The replacement 25-source pilot is only an implementation/data-contract gate. It has 13
   train sources and no all-nonvocal held-out source, so it cannot choose a
   production decoder.
 - Before full training, expand real full-source train data and add real mixed,
   all-vocal and all-nonvocal val controls. Missing strata remain `n/a`; synthetic
   data cannot impersonate held-out evidence.
-- Old semantic v11 labels and old human verdicts that removed moans are invalid
-  for v12 and are never converted.
+- Old semantic v11 labels, the retired v12 labels that treated breathing and
+  mouth sounds as vocal, and human verdicts made under either policy are never
+  converted into voice-only truth.
 
 ## Loss arms
 
@@ -36,7 +45,8 @@ runtime threshold, duration rule, hysteresis, NMS, rule merge, or fallback.
 4. `Query-Mask`: dense frame CE plus Hungarian query existence, mask BCE and
    Dice. Queries represent complete vocal envelopes, not syllables. Query
    capacity is frozen from train topology with held-out headroom and never
-   tuned on test.
+   tuned on test. The old fixed `K=8` is not inherited: the replacement
+   canonical must first prove the maximum owned-window vocal-event topology.
 5. `Dense Span+DP`: exact loss-augmented span Viterbi structured objective plus
    dense frame CE auxiliary. Runtime is exact learned DP. The CE auxiliary is
    required because v11 structured-hinge-only achieved continuity by bridging
@@ -59,7 +69,9 @@ Selection is source-level and lexicographic, not a single inside score:
 
 1. Finish BF16/resource/runtime smoke for argmax-structured and CRF.
 2. Port Query-Mask and Dense Span+DP to breaking v12 schemas and smoke both.
-3. Expand/calibrate v12 real full-source supervision; compile a final dataset
+3. Regenerate the voice-only pilot and human calibration, then regenerate the
+   full-source Teacher evidence and held-out human gate. Expand v12 real
+   full-source supervision and compile a final dataset
    with required held-out strata and immutable hashes.
 4. Train all arms serially from random initialization with identical budgets and
    early stopping; write atomic progress and release CUDA between arms.

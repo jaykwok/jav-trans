@@ -16,6 +16,7 @@ for root in (PROJECT_ROOT, PROJECT_ROOT / "src"):
 from boundary.ja.vocal_envelope_v12 import (
     VOCAL_ENVELOPE_SCORER_V12_MANUAL_VERDICT_SCHEMA,
     VOCAL_ENVELOPE_SCORER_V12_PREAUDIT_SCHEMA,
+    VOCAL_ENVELOPE_SCORER_V12_TASK_SEMANTICS,
     vocal_envelope_v12_manual_verdict_is_approved,
 )
 from tools.omni.gemini_native import (
@@ -23,27 +24,29 @@ from tools.omni.gemini_native import (
     GEMINI_NATIVE_MODEL,
 )
 from tools.omni.timestamp_contract import TIMESTAMP_CONTRACT_ID
+from tools.boundary.ja.vocal_envelope_scorer_v12_teacher_contract import (
+    teacher_contract_fingerprint_fields,
+)
 
 
 CONTRACT_ID = "boundary_acoustic_binary_v12"
-CALIBRATION_ID = "vocal_envelope_scorer_v12_pilot25_human_approved_v1"
-CALIBRATION_ARTIFACT_SHA256 = {
-    "manifest": "092eb9e384514b60ab016b4db03f3490155e7a0ba628c92198790464ac16a07f",
-    "preaudit": "e94943f3e14305fe6b988ca39fd095ac42f30bf4e91b79660018b2b8051dd006",
-    "verdicts": "576943d447273226da54bcb80074d426031c02744afea01e6eb24ec9b8b1ebed",
-}
+CALIBRATION_ID = "vocal_envelope_scorer_v12_voice_only_pilot25_human_approved_v2"
+# Frozen only after the voice-only pilot receives a new human approval.
+CALIBRATION_ARTIFACT_SHA256: dict[str, str] = {}
 CALIBRATION_TEACHER_CONTRACT = {
+    "task_semantics": VOCAL_ENVELOPE_SCORER_V12_TASK_SEMANTICS,
     "provider_profile": "gemini",
     "model": GEMINI_NATIVE_MODEL,
     "env_file_name": "gemini",
     "reasoning_effort": "medium",
     "max_tokens": 8192,
-    "prompt_profile": "vocal-envelope-single-pass-tristate-v3",
+    "prompt_profile": "voice-envelope-single-pass-tristate-v4",
     "prompt_version": (
-        "vocal-envelope-single-pass-tristate-v3-scorer-duty-gemini36-medium-mmss"
+        "voice-envelope-single-pass-tristate-v4-voice-only-gemini36-medium-mmss"
     ),
     "teacher_timestamp_contract_id": TIMESTAMP_CONTRACT_ID,
     "teacher_execution_contract_id": GEMINI_NATIVE_EXECUTION_CONTRACT,
+    **teacher_contract_fingerprint_fields(),
 }
 
 
@@ -127,7 +130,18 @@ def load_approved_calibration(
         "preaudit": _sha256(preaudit),
         "verdicts": _sha256(verdicts),
     }
-    required_hashes = dict(expected_hashes or CALIBRATION_ARTIFACT_SHA256)
+    required_hashes = dict(
+        CALIBRATION_ARTIFACT_SHA256
+        if expected_hashes is None
+        else expected_hashes
+    )
+    if set(required_hashes) != {"manifest", "preaudit", "verdicts"} or any(
+        not value for value in required_hashes.values()
+    ):
+        raise ValueError(
+            "Scorer v12 voice-only calibration is not frozen; "
+            "run and approve the new pilot first"
+        )
     if hashes != required_hashes:
         raise ValueError(
             "Scorer v12 calibration artifact SHA mismatch; "

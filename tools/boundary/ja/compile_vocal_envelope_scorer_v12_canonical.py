@@ -25,7 +25,9 @@ from boundary.ja.vocal_envelope_v12 import (  # noqa: E402
     VOCAL_ENVELOPE_SCORER_V12_MANUAL_VERDICT_SCHEMA,
     VOCAL_ENVELOPE_SCORER_V12_NONVOCAL_SAFETY_OPTIONS,
     VOCAL_ENVELOPE_SCORER_V12_PREAUDIT_SCHEMA,
+    VOCAL_ENVELOPE_SCORER_V12_TASK_SEMANTICS,
     VOCAL_ENVELOPE_SCORER_V12_VOCAL_COVERAGE_OPTIONS,
+    VOCAL_ENVELOPE_SCORER_V12_VOCAL_PURITY_OPTIONS,
     vocal_envelope_v12_manual_verdict_is_approved,
 )
 from tools.omni.gemini_native import (  # noqa: E402
@@ -36,6 +38,9 @@ from tools.boundary.ja.vocal_envelope_scorer_v12_calibration import (  # noqa: E
     CALIBRATION_ARTIFACT_SHA256,
     evidence_span_signature,
     load_approved_calibration,
+)
+from tools.boundary.ja.vocal_envelope_scorer_v12_teacher_contract import (  # noqa: E402
+    teacher_contract_fingerprint_fields,
 )
 
 CONTRACT_ID = "boundary_acoustic_binary_v12"
@@ -53,9 +58,10 @@ PROVIDER_CONTRACTS: dict[str, dict[str, str]] = {
         "execution_contract": GEMINI_NATIVE_EXECUTION_CONTRACT,
     },
 }
-EXPECTED_PROMPT_PROFILE = "vocal-envelope-single-pass-tristate-v3"
-EXPECTED_PROMPT_VERSION = "vocal-envelope-single-pass-tristate-v3-scorer-duty-gemini36-medium-mmss"
-OUTPUT_SUMMARY_SCHEMA = "vocal_envelope_scorer_v12_canonical_compile_summary_v1"
+EXPECTED_PROMPT_PROFILE = "voice-envelope-single-pass-tristate-v4"
+EXPECTED_PROMPT_VERSION = "voice-envelope-single-pass-tristate-v4-voice-only-gemini36-medium-mmss"
+OUTPUT_SUMMARY_SCHEMA = "vocal_envelope_scorer_v12_canonical_compile_summary_v2"
+EXPECTED_TEACHER_CONTRACT_FINGERPRINTS = teacher_contract_fingerprint_fields()
 
 
 def _rows(path: Path) -> list[dict[str, Any]]:
@@ -167,6 +173,7 @@ def _validate_manual_verdict(
     if verdict.get("boundary_serialization_contract_id") != CONTRACT_ID:
         raise ValueError(f"wrong v12 manual verdict contract: {source_id}")
     for field, expected in (
+        ("task_semantics", VOCAL_ENVELOPE_SCORER_V12_TASK_SEMANTICS),
         ("source_manifest_sha256", manifest_sha),
         ("preaudit_sha256", preaudit_sha),
         ("partition", partition),
@@ -188,6 +195,11 @@ def _validate_manual_verdict(
         not in VOCAL_ENVELOPE_SCORER_V12_NONVOCAL_SAFETY_OPTIONS
     ):
         raise ValueError(f"invalid v12 non-vocal safety verdict: {source_id}")
+    if (
+        str(verdict.get("vocal_purity") or "")
+        not in VOCAL_ENVELOPE_SCORER_V12_VOCAL_PURITY_OPTIONS
+    ):
+        raise ValueError(f"invalid v12 vocal purity verdict: {source_id}")
     if (
         str(verdict.get("envelope_structure") or "")
         not in VOCAL_ENVELOPE_SCORER_V12_ENVELOPE_STRUCTURE_OPTIONS
@@ -307,12 +319,13 @@ def compile_canonical(
         selected_profile = profile
         if evidence.get("model") != provider_contract["model"]:
             raise ValueError(f"v12 teacher model/profile mismatch: {source_id}")
-        for field, expected in (("env_file_name", profile), ("reasoning_effort", EXPECTED_REASONING), ("max_tokens", EXPECTED_MAX_TOKENS), ("teacher_timestamp_contract_id", EXPECTED_TIMESTAMP_CONTRACT), ("teacher_execution_contract_id", provider_contract["execution_contract"]), ("source_manifest_sha256", manifest_sha)):
+        for field, expected in (("env_file_name", profile), ("reasoning_effort", EXPECTED_REASONING), ("max_tokens", EXPECTED_MAX_TOKENS), ("task_semantics", VOCAL_ENVELOPE_SCORER_V12_TASK_SEMANTICS), ("teacher_timestamp_contract_id", EXPECTED_TIMESTAMP_CONTRACT), ("teacher_execution_contract_id", provider_contract["execution_contract"]), ("source_manifest_sha256", manifest_sha)):
             if evidence.get(field) != expected:
                 raise ValueError(f"v12 teacher {field} mismatch: {source_id}")
         for field, expected in (
             ("prompt_profile", EXPECTED_PROMPT_PROFILE),
             ("prompt_version", EXPECTED_PROMPT_VERSION),
+            *EXPECTED_TEACHER_CONTRACT_FINGERPRINTS.items(),
         ):
             if evidence.get(field) != expected:
                 raise ValueError(f"v12 teacher {field} mismatch: {source_id}")
@@ -435,6 +448,8 @@ def compile_canonical(
         compiled.append({
             "schema": VOCAL_ENVELOPE_SCORER_V12_CANONICAL_SOURCE_SCHEMA,
             "boundary_serialization_contract_id": CONTRACT_ID,
+            "task_semantics": VOCAL_ENVELOPE_SCORER_V12_TASK_SEMANTICS,
+            **EXPECTED_TEACHER_CONTRACT_FINGERPRINTS,
             "canonical_label_schema": VOCAL_ENVELOPE_SCORER_V12_CANONICAL_LABEL_SCHEMA,
             "source_id": source_id,
             "video_id": str(source.get("video_id") or ""),
@@ -489,6 +504,8 @@ def compile_canonical(
     summary = {
         "schema": OUTPUT_SUMMARY_SCHEMA,
         "boundary_serialization_contract_id": CONTRACT_ID,
+        "task_semantics": VOCAL_ENVELOPE_SCORER_V12_TASK_SEMANTICS,
+        **EXPECTED_TEACHER_CONTRACT_FINGERPRINTS,
         "canonical_label_schema": VOCAL_ENVELOPE_SCORER_V12_CANONICAL_LABEL_SCHEMA,
         "dataset_contract": VOCAL_ENVELOPE_SCORER_V12_DATASET_CONTRACT,
         "manifest": str(manifest), "manifest_sha256": manifest_sha,

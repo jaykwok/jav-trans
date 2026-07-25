@@ -27,6 +27,7 @@ for root in (PROJECT_ROOT, PROJECT_ROOT / "src"):
 from boundary.ja.vocal_envelope_v12 import (  # noqa: E402
     VOCAL_ENVELOPE_SCORER_V12_IGNORE_INDEX,
     VOCAL_ENVELOPE_SCORER_V12_PREAUDIT_SCHEMA,
+    VOCAL_ENVELOPE_SCORER_V12_TASK_SEMANTICS,
 )
 from tools.omni.timestamp_contract import (  # noqa: E402
     TIMESTAMP_CONTRACT_ID,
@@ -53,14 +54,18 @@ from tools.boundary.ja.vocal_envelope_scorer_v12_calibration import (  # noqa: E
     evidence_span_signature,
     load_approved_calibration,
 )
+from tools.boundary.ja.vocal_envelope_scorer_v12_teacher_contract import (  # noqa: E402
+    TEACHER_TASK_CONTRACT_ID,
+    validate_teacher_contract_content,
+)
 
 
 FRAME_HOP_S = 0.02
 CONTRACT_ID = "boundary_acoustic_binary_v12"
-SUMMARY_SCHEMA = "vocal_envelope_scorer_v12_single_pass_tristate_summary_v2"
-PROGRESS_SCHEMA = "vocal_envelope_scorer_v12_single_pass_tristate_progress_v2"
-PROMPT_PROFILE = "vocal-envelope-single-pass-tristate-v3"
-PROMPT_VERSION = "vocal-envelope-single-pass-tristate-v3-scorer-duty-gemini36-medium-mmss"
+SUMMARY_SCHEMA = "vocal_envelope_scorer_v12_single_pass_tristate_summary_v3"
+PROGRESS_SCHEMA = "vocal_envelope_scorer_v12_single_pass_tristate_progress_v3"
+PROMPT_PROFILE = "voice-envelope-single-pass-tristate-v4"
+PROMPT_VERSION = "voice-envelope-single-pass-tristate-v4-voice-only-gemini36-medium-mmss"
 EXPECTED_REASONING = "medium"
 EXPECTED_MAX_TOKENS = 8192
 PROVIDER_CONTRACTS: dict[str, dict[str, str]] = {
@@ -77,34 +82,71 @@ PROVIDER_CONTRACTS: dict[str, dict[str, str]] = {
 }
 
 
-TRISTATE_SYSTEM_PROMPT = """你是 1.7B Scorer v12 的 Human Vocal Event Envelope 单次三态预审 teacher。
+TRISTATE_SYSTEM_PROMPT = """你是 1.7B Scorer v12 的 Human Voice Event Envelope 单次三态预审 teacher。
 音频主要来自日语 JAV、Galgame 或类似场景，但场景、亲密互动、声音强度和声音来源本身都不能直接决定标签。
 
 【Scorer 在真实工作流中的职责】
-Scorer 是任何下游模型运行前的第一层，只负责生成高召回、连续的人类发声事件候选包络。它不判断语义、不判断字幕价值、不转写、不切句、不区分说话人，也不负责删除呻吟或喘息。后续 Proposal/Split 负责隔离独立事件，CueQC 负责语义 keep/drop，Inner 只裁最终 keep 岛首尾。因此不要把 Split、CueQC 或 Inner 的职责提前强加给 Scorer。
+Scorer 是任何下游模型运行前的第一层，只负责生成高召回、连续的人类声音事件候选包络。它不判断语义、不判断字幕价值、不转写、不切句、不区分说话人。后续 Proposal/Split 负责隔离独立事件，CueQC 负责语义 keep/drop，Inner 只裁最终 keep 岛首尾。
+
+这里的正类不是“任何由人体产生的声音”，而是实际可听的人声发音。呻吟即使没有词义，只要能听到明确的人声音色或声带发声，也属于正类；纯呼吸气流、亲吻和口腔动作即使来自人，也不属于人声。不要把 CueQC 的语义职责提前给 Scorer，但也不要把所有生理声误当成人声。
 
 你必须对当前完整 source 输出一个按时间排序、无重叠、无缺口并覆盖完整音频的 segments 数组。每段只能使用以下三种标签之一：
 
-1. vocal_candidate：存在任何由人类声道、口腔或呼吸系统产生的发声证据，或非发声声音与疑似人声重叠。包括清晰或含混对白、耳语、气声、呻吟、喘息、吸气、呼气、叹气、哭、笑、咳嗽、喷嚏、清嗓、抽鼻、亲吻/唾液/口腔声、歌唱、远处或背景人声。像「あ、ん、はぁ」无论是词语、应答还是纯呻吟都属于 vocal。ASR 是否能识别、是否有翻译价值均无关。
+1. vocal_candidate：存在真正的人声发音，或其他声音与疑似人声重叠。包括清晰或含混对白、词语残片、口吃、语言性耳语/气声、带声呻吟或低吟、带声哭笑、哼唱、歌唱，以及远处或背景人声。像「あ、ん、はぁ」只要实际听感是有意发声、带有人声音色或声带振动，无论是否有词义、ASR 能否识别，都属于 vocal。语言性耳语即使声带振动很弱或没有明显基频，也仍属于人声。
 
-2. non_vocal_candidate：有较高把握确认完全没有任何人类发声的纯非发声区间。包括纯机械、肉体撞击或拍打、动作声、衣物摩擦、床体震动、水声、纯器乐、静音、底噪、风扇空调、电流、交通和环境噪声。肉体撞击由人体动作产生也不等于人声，不能以“来自人体”为理由标成 vocal；但只要撞击、床体、水声或音乐下叠有任何疑似呻吟、呼吸或对白，重叠区就不能标 non_vocal。
+2. non_vocal_candidate：有较高把握确认没有真正人声发音的区间。除机械、肉体撞击或拍打、动作、衣物、床体、水声、纯器乐、静音、底噪和环境噪声外，还包括纯吸气/呼气、只有气流的喘气或 gasp、无声带发声的叹气、亲吻/舔舐/唇齿声、唾液湿声、吞咽、咳嗽、喷嚏、清嗓和抽鼻。声音来自人体并不等于人声。只要这些声音下叠有对白、语言耳语、带声呻吟或其他疑似人声，重叠区就不能标 non_vocal。
 
-3. unsure：无法可靠确认是否叠有人声、边界无法安全定位，或 vocal 与 non-vocal 证据不可分离。不要猜测；unsure 在训练中会被忽略。
+3. unsure：无法可靠区分弱人声与纯气流/口腔动作，边界无法安全定位，或 voice 与 non-voice 证据不可分离。不要猜测；unsure 在训练中会被忽略。
+
+【最重要的声学区分】
+- “喘息”这个文字类别不能直接决定标签。能听到人声音色、元音核、声带振动或有意发声轮廓的带声喘息/呻吟属于 vocal；只有吸气、呼气或摩擦气流、没有人声发音的喘气属于 non-vocal；分不清时用 unsure。
+- 呻吟不要求有语义。连续“啊、嗯、哼、哈”等只要是带声的人类发声，就属于 vocal，而不是交给 CueQC 前先删除。
+- 亲吻、唾液、吞咽、舔舐和其他口腔动作声本身不是 vocal；其中夹有可听呻吟、耳语或对白时，只把可可靠分离的纯口腔部分标 non-vocal，混合部分标 vocal 或 unsure。
 
 【发声事件包络规则】
-正类单位是连续的人类发声事件包络，不是逐音节 VAD。一次连续发声事件内部的短停顿、吸气、释气、弱尾音和非语义过渡应随包络保留；不要按字、音节、每次喘息脉冲或极短能量谷切碎。纯撞击声本身不是 vocal 证据：若它形成声学上独立且可安全分离的纯非发声区间，标 non_vocal；若它与人声重叠，标 vocal；若只是短暂嵌入且无法安全独立切开，标 unsure。不要跨越声学上独立的长纯非发声区域合并两个事件，也不得使用固定时长阈值。
+正类单位是连续的人声发音事件包络，不是逐音节 VAD。真正人声内部不可分离的极短闭塞、词内停顿、弱尾音和能量谷应随包络保留；不要按字、音节或每个呻吟脉冲切碎。但可独立定位的纯呼吸、亲吻或其他 non-voice 区间必须标 non_vocal，不能为了连续性强行涂成 vocal。若它与弱人声紧密融合而无法可靠切边，标 unsure。不要跨越声学上独立的纯 non-voice 区域合并两个声音事件，也不得使用固定时长阈值。
 
 【边界与完整覆盖】
 - 第一段必须从 00:00.000 开始，最后一段必须精确结束于请求给出的 duration_ts。
 - 相邻段必须首尾严格相接；不得重叠或留空白；相邻同标签必须合并。
-- 覆盖完整词头、气声、衰减和尾音。混合区优先保护 vocal，真正无法判断才用 unsure。
+- 覆盖完整词头、语言气声、呻吟起落、衰减和尾音。存在真实或疑似人声的混合区优先保护 vocal，只有“弱人声还是纯气流”无法判断时才用 unsure。
 - 不要产生短到无法对应一个 20ms Scorer 帧的区间；这是坐标分辨率要求，不是声音类别的时长规则。
 
 只输出 JSON，不要输出 Markdown、解释或额外文字：
-{"source_id":"...","segments":[{"start_ts":"00:00.000","end_ts":"00:01.000","label":"vocal_candidate|non_vocal_candidate|unsure","category":"vocal|mixed_vocal|mechanical|impact|cloth|bed|water|music|silence|ambience|other|uncertain","reason":"简短声学理由"}],"overall_reason":"..."}
+{"source_id":"...","segments":[{"start_ts":"00:00.000","end_ts":"00:01.000","label":"vocal_candidate|non_vocal_candidate|unsure","category":"speech|whisper_language|moan|voiced_vocalization|laugh|cry|singing|mixed_voice|breath_airflow|pant_airflow|kiss|oral_action|swallow|cough|mechanical|impact|cloth|bed|water|music|silence|ambience|other|uncertain","reason":"简短声学理由"}],"overall_reason":"..."}
 """ + "\n" + TIMESTAMP_PROMPT_CONTRACT_ZH
 
-NONVOCAL_CATEGORIES = frozenset({"mechanical", "impact", "cloth", "bed", "water", "music", "silence", "ambience", "other"})
+VOCAL_CATEGORIES = frozenset(
+    {
+        "speech",
+        "whisper_language",
+        "moan",
+        "voiced_vocalization",
+        "laugh",
+        "cry",
+        "singing",
+        "mixed_voice",
+    }
+)
+NONVOCAL_CATEGORIES = frozenset(
+    {
+        "breath_airflow",
+        "pant_airflow",
+        "kiss",
+        "oral_action",
+        "swallow",
+        "cough",
+        "mechanical",
+        "impact",
+        "cloth",
+        "bed",
+        "water",
+        "music",
+        "silence",
+        "ambience",
+        "other",
+    }
+)
 SEGMENT_LABELS = frozenset(
     {"vocal_candidate", "non_vocal_candidate", "unsure"}
 )
@@ -131,8 +173,20 @@ TRISTATE_RESPONSE_SCHEMA: dict[str, Any] = {
                     "category": {
                         "type": "string",
                         "enum": [
-                            "vocal",
-                            "mixed_vocal",
+                            "speech",
+                            "whisper_language",
+                            "moan",
+                            "voiced_vocalization",
+                            "laugh",
+                            "cry",
+                            "singing",
+                            "mixed_voice",
+                            "breath_airflow",
+                            "pant_airflow",
+                            "kiss",
+                            "oral_action",
+                            "swallow",
+                            "cough",
                             "mechanical",
                             "impact",
                             "cloth",
@@ -267,8 +321,12 @@ def _normalize_segments(
         if label == previous_label:
             raise ValueError("adjacent single-pass segments with the same label must merge")
         category = str(item.get("category") or "other")
+        if label == "vocal_candidate" and category not in VOCAL_CATEGORIES:
+            raise ValueError(f"unsupported vocal category: {category}")
         if label == "non_vocal_candidate" and category not in NONVOCAL_CATEGORIES:
             raise ValueError(f"unsupported non-vocal category: {category}")
+        if label == "unsure" and category != "uncertain":
+            raise ValueError(f"unsupported unsure category: {category}")
         parsed_segments.append(
             {
                 "label": label,
@@ -319,10 +377,9 @@ def _normalize_segments(
             "end_frame": end_frame,
             "start_s": round(start_frame * FRAME_HOP_S, 6),
             "end_s": round(end_frame * FRAME_HOP_S, 6),
+            "category": item["category"],
             "reason": item["reason"],
         }
-        if item["label"] == "non_vocal_candidate":
-            span["category"] = item["category"]
         output[output_key[str(item["label"])]].append(span)
     return output
 
@@ -331,7 +388,8 @@ def _request_prompt(row: Mapping[str, Any], *, feedback: str = "") -> str:
     payload = {
         "source_id": str(row["source_id"]),
         **timestamp_request_contract(float(row["duration_s"])),
-        "task": "vocal_event_envelope_single_pass_tristate",
+        "task": TEACHER_TASK_CONTRACT_ID,
+        "task_semantics": VOCAL_ENVELOPE_SCORER_V12_TASK_SEMANTICS,
         "labels": ["vocal_candidate", "non_vocal_candidate", "unsure"],
         "coverage": "complete_contiguous_source_timeline",
     }
@@ -429,6 +487,10 @@ def _call_teacher(
 
 
 def run(args: argparse.Namespace) -> dict[str, Any]:
+    teacher_contract = validate_teacher_contract_content(
+        system_prompt=TRISTATE_SYSTEM_PROMPT,
+        response_schema=TRISTATE_RESPONSE_SCHEMA,
+    )
     profile = str(args.env_file)
     if profile not in PROVIDER_CONTRACTS:
         raise ValueError("Scorer v12 teacher only supports openrouter or gemini")
@@ -492,6 +554,17 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     labels_path = output / "preaudit.jsonl"
     raw_path = output / "raw_responses.jsonl"
     progress_path = output / "progress.json"
+
+    def write_progress(payload: Mapping[str, Any]) -> None:
+        _write_progress(
+            progress_path,
+            {
+                "schema": PROGRESS_SCHEMA,
+                **teacher_contract,
+                **dict(payload),
+            },
+        )
+
     existing: dict[str, dict[str, Any]] = {}
     if labels_path.is_file():
         selected_ids = {str(row["source_id"]) for row in rows}
@@ -509,7 +582,10 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 "env_file_name": profile,
                 "reasoning_effort": EXPECTED_REASONING,
                 "max_tokens": EXPECTED_MAX_TOKENS,
+                "task_semantics": VOCAL_ENVELOPE_SCORER_V12_TASK_SEMANTICS,
+                "prompt_profile": PROMPT_PROFILE,
                 "prompt_version": PROMPT_VERSION,
+                **teacher_contract,
                 "teacher_timestamp_contract_id": TIMESTAMP_CONTRACT_ID,
                 "teacher_execution_contract_id": execution_contract,
                 "source_manifest_sha256": manifest_sha,
@@ -636,7 +712,19 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         else 0
     )
     started = time.perf_counter()
-    _write_progress(progress_path, {"schema": PROGRESS_SCHEMA, "status": "running", "model": model, "provider_profile": profile, "reasoning_effort": "medium", "max_tokens": EXPECTED_MAX_TOKENS, "worker_count": worker_count, "completed": len(existing), "total": len(rows), "pending": len(pending)})
+    write_progress(
+        {
+            "status": "running",
+            "model": model,
+            "provider_profile": profile,
+            "reasoning_effort": EXPECTED_REASONING,
+            "max_tokens": EXPECTED_MAX_TOKENS,
+            "worker_count": worker_count,
+            "completed": len(existing),
+            "total": len(rows),
+            "pending": len(pending),
+        }
+    )
 
     def execute_row(row: dict[str, Any]) -> dict[str, Any]:
         print(
@@ -686,7 +774,22 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 f"error={type(error).__name__}: {error}",
                 flush=True,
             )
-            _write_progress(progress_path, {"schema": PROGRESS_SCHEMA, "status": "running_with_failures", "model": model, "provider_profile": profile, "worker_count": worker_count, "completed": len(existing), "failed": len(failures), "total": len(rows), "pending": len(rows) - len(existing) - len(failures), "last_source_id": row["source_id"], "last_error": repr(error)})
+            write_progress(
+                {
+                    "status": "running_with_failures",
+                    "model": model,
+                    "provider_profile": profile,
+                    "reasoning_effort": EXPECTED_REASONING,
+                    "max_tokens": EXPECTED_MAX_TOKENS,
+                    "worker_count": worker_count,
+                    "completed": len(existing),
+                    "failed": len(failures),
+                    "total": len(rows),
+                    "pending": len(rows) - len(existing) - len(failures),
+                    "last_source_id": row["source_id"],
+                    "last_error": repr(error),
+                }
+            )
             continue
         response = outcome["response"]
         response_raw = outcome["response_raw"]
@@ -694,6 +797,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         label = {
             "schema": VOCAL_ENVELOPE_SCORER_V12_PREAUDIT_SCHEMA,
             "boundary_serialization_contract_id": CONTRACT_ID,
+            "task_semantics": VOCAL_ENVELOPE_SCORER_V12_TASK_SEMANTICS,
             "source_id": row["source_id"], "video_id": str(row.get("video_id") or ""),
             "partition": row["partition"], "core_ids": row["core_ids"],
             "audio": row["audio"], "audio_sha256": row.get("audio_sha256") or _sha256(Path(row["audio"])),
@@ -706,6 +810,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             "reasoning_effort": "medium", "max_tokens": EXPECTED_MAX_TOKENS,
             "temperature": None, "top_p": None, "top_k": None,
             "prompt_profile": PROMPT_PROFILE, "prompt_version": PROMPT_VERSION,
+            **teacher_contract,
             "teacher_timestamp_contract_id": TIMESTAMP_CONTRACT_ID,
             "teacher_execution_contract_id": execution_contract,
             "source_manifest": str(manifest), "source_manifest_sha256": manifest_sha,
@@ -716,7 +821,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             "conflict_spans": [],
             "teacher_failed_closed": False, "training_manifest_allowed": False,
             "unsure_training_label": VOCAL_ENVELOPE_SCORER_V12_IGNORE_INDEX,
-            "preaudit_provenance": f"{profile}:{model}:single_pass_tristate_evidence",
+            "preaudit_provenance": f"{profile}:{model}:voice_only_single_pass_tristate_evidence_v2",
         }
         with labels_path.open("a", encoding="utf-8") as handle:
             handle.write(json.dumps(label, ensure_ascii=False, sort_keys=True) + "\n")
@@ -739,10 +844,42 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             f"eta_s={eta:.0f}",
             flush=True,
         )
-        _write_progress(progress_path, {"schema": PROGRESS_SCHEMA, "status": "running_with_failures" if failures else "running", "model": model, "provider_profile": profile, "reasoning_effort": "medium", "max_tokens": EXPECTED_MAX_TOKENS, "worker_count": worker_count, "completed": len(existing), "failed": len(failures), "total": len(rows), "pending": len(rows) - len(existing) - len(failures), "last_source_id": row["source_id"], "last_request_s": round(request_elapsed, 3), "elapsed_s": round(elapsed, 3), "eta_s": round(eta, 3)})
+        write_progress(
+            {
+                "status": "running_with_failures" if failures else "running",
+                "model": model,
+                "provider_profile": profile,
+                "reasoning_effort": EXPECTED_REASONING,
+                "max_tokens": EXPECTED_MAX_TOKENS,
+                "worker_count": worker_count,
+                "completed": len(existing),
+                "failed": len(failures),
+                "total": len(rows),
+                "pending": len(rows) - len(existing) - len(failures),
+                "last_source_id": row["source_id"],
+                "last_request_s": round(request_elapsed, 3),
+                "elapsed_s": round(elapsed, 3),
+                "eta_s": round(eta, 3),
+            }
+        )
     if failures:
         source_id, error = failures[0]
-        _write_progress(progress_path, {"schema": PROGRESS_SCHEMA, "status": "failed", "model": model, "provider_profile": profile, "worker_count": worker_count, "completed": len(existing), "failed": len(failures), "total": len(rows), "pending": len(rows) - len(existing), "last_source_id": source_id, "last_error": repr(error)})
+        write_progress(
+            {
+                "status": "failed",
+                "model": model,
+                "provider_profile": profile,
+                "reasoning_effort": EXPECTED_REASONING,
+                "max_tokens": EXPECTED_MAX_TOKENS,
+                "worker_count": worker_count,
+                "completed": len(existing),
+                "failed": len(failures),
+                "total": len(rows),
+                "pending": len(rows) - len(existing),
+                "last_source_id": source_id,
+                "last_error": repr(error),
+            }
+        )
         raise RuntimeError(
             f"v12 Teacher failed for {len(failures)} source(s); "
             f"first={source_id}: {error}"
@@ -750,6 +887,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     summary = {
         "schema": SUMMARY_SCHEMA,
         "boundary_serialization_contract_id": CONTRACT_ID,
+        "task_semantics": VOCAL_ENVELOPE_SCORER_V12_TASK_SEMANTICS,
         "model": model,
         "provider_profile": profile,
         "env_file_name": profile,
@@ -774,6 +912,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "omitted_sampling_parameters": ["temperature", "top_p", "top_k"],
         "prompt_profile": PROMPT_PROFILE,
         "prompt_version": PROMPT_VERSION,
+        **teacher_contract,
         "teacher_timestamp_contract_id": TIMESTAMP_CONTRACT_ID,
         "teacher_execution_contract_id": execution_contract,
         "source_manifest": str(manifest),
@@ -785,7 +924,20 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "training_manifest_allowed": False,
     }
     (output / "summary.json").write_text(json.dumps(summary, ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-    _write_progress(progress_path, {"schema": PROGRESS_SCHEMA, "status": "completed", "model": model, "provider_profile": profile, "reasoning_effort": "medium", "max_tokens": EXPECTED_MAX_TOKENS, "completed": len(existing), "total": len(rows), "pending": 0, "elapsed_s": round(time.perf_counter() - started, 3), "summary": str(output / "summary.json")})
+    write_progress(
+        {
+            "status": "completed",
+            "model": model,
+            "provider_profile": profile,
+            "reasoning_effort": EXPECTED_REASONING,
+            "max_tokens": EXPECTED_MAX_TOKENS,
+            "completed": len(existing),
+            "total": len(rows),
+            "pending": 0,
+            "elapsed_s": round(time.perf_counter() - started, 3),
+            "summary": str(output / "summary.json"),
+        }
+    )
     return summary
 
 

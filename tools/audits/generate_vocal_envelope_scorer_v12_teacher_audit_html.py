@@ -21,7 +21,9 @@ from boundary.ja.vocal_envelope_v12 import (  # noqa: E402
     VOCAL_ENVELOPE_SCORER_V12_MANUAL_VERDICT_SCHEMA,
     VOCAL_ENVELOPE_SCORER_V12_NONVOCAL_SAFETY_OPTIONS,
     VOCAL_ENVELOPE_SCORER_V12_PREAUDIT_SCHEMA,
+    VOCAL_ENVELOPE_SCORER_V12_TASK_SEMANTICS,
     VOCAL_ENVELOPE_SCORER_V12_VOCAL_COVERAGE_OPTIONS,
+    VOCAL_ENVELOPE_SCORER_V12_VOCAL_PURITY_OPTIONS,
 )
 from tools.audits.audit_nav import update_audit_entrypoints  # noqa: E402
 from tools.audits.review_page_core import (  # noqa: E402
@@ -38,7 +40,7 @@ from tools.boundary.ja.vocal_envelope_scorer_v12_calibration import (  # noqa: E
 
 
 CONTRACT_ID = "boundary_acoustic_binary_v12"
-SUMMARY_SCHEMA = "vocal_envelope_scorer_v12_teacher_audit_summary_v1"
+SUMMARY_SCHEMA = "vocal_envelope_scorer_v12_teacher_audit_summary_v2"
 
 
 def _rows(path: Path) -> list[dict[str, Any]]:
@@ -82,6 +84,10 @@ def _validate_option_contract() -> None:
             options=VOCAL_ENVELOPE_SCORER_V12_VOCAL_COVERAGE_OPTIONS,
         ),
         AuditOptionAxis(
+            field="vocal_purity",
+            options=VOCAL_ENVELOPE_SCORER_V12_VOCAL_PURITY_OPTIONS,
+        ),
+        AuditOptionAxis(
             field="non_vocal_safety",
             options=VOCAL_ENVELOPE_SCORER_V12_NONVOCAL_SAFETY_OPTIONS,
         ),
@@ -92,32 +98,41 @@ def _validate_option_contract() -> None:
     )
     results: dict[tuple[str, ...], str] = {}
     for vocal in axes[0].options:
-        for nonvocal in axes[1].options:
-            for structure in axes[2].options:
-                combination = (vocal, nonvocal, structure)
-                if "unsure" in combination:
-                    result = "unsure"
-                elif combination == (
-                    "definite_vocal_complete",
-                    "definite_non_vocal_clean",
-                    "event_envelopes_continuous",
-                ):
-                    result = "approved"
-                else:
-                    result = "rejected"
-                results[combination] = result
+        for purity in axes[1].options:
+            for nonvocal in axes[2].options:
+                for structure in axes[3].options:
+                    combination = (vocal, purity, nonvocal, structure)
+                    if "unsure" in combination:
+                        result = "unsure"
+                    elif combination == (
+                        "definite_vocal_complete",
+                        "definite_vocal_excludes_separable_nonvoice",
+                        "definite_non_vocal_clean",
+                        "event_envelopes_continuous",
+                    ):
+                        result = "approved"
+                    else:
+                        result = "rejected"
+                    results[combination] = result
     validate_audit_option_contract(axes=axes, combination_results=results)
 
 
-def _page(payload: list[dict[str, Any]], *, manifest_sha: str, preaudit_sha: str) -> str:
+def _page(
+    payload: list[dict[str, Any]],
+    *,
+    source_manifest_sha: str,
+    preaudit_sha: str,
+    audit_manifest_sha: str,
+) -> str:
     _validate_option_contract()
     intro = """
 <section class="audit-help">
-  <h2>审计合同</h2>
-  <p><b>绿色 vocal：</b>所有人类声道、口腔或呼吸系统产生的连续发声事件包络；同一事件中的短停顿和呼吸应连续保留。</p>
-  <p><b>黄色 non-vocal：</b>明确不含任何人类发声的机械、动作、衣物/床体、水声、纯音乐、静音或环境噪声。</p>
+  <h2>Human Voice Envelope 审计合同</h2>
+  <p><b>绿色 vocal：</b>真正的人声发音，包括对白、语言耳语、带声呻吟、带声哭笑、歌唱和背景人声。带声音核的喘息属于 vocal。</p>
+  <p><b>黄色 non-vocal：</b>纯呼吸气流、无声喘气、亲吻、吞咽、唾液/口腔动作、咳嗽/喷嚏/清嗓/抽鼻，以及机械、撞击、衣物/床体、水声、纯音乐、静音和环境噪声。</p>
   <p><b>灰色 unsure：</b>单次三态 Teacher 无法可靠判断人声重叠或安全边界；训练时为 -100，不代表 vocal 或 non-vocal 真值。</p>
-  <p>每条必须完整听完，再分别判断：vocal 是否漏声/截边、黄色是否混入任何人声、同一发声事件是否被切碎或跨独立长背景过度合并。颜色条点击后只播放自身精确区间，不添加上下文。</p>
+  <p>可独立定位的呼吸、亲吻或其他非人声不能为了连续性并入绿色；若弱人声与非人声无法可靠分离，应标为 unsure。</p>
+  <p>每条必须完整听完，再分别判断：vocal 是否漏声/截边、绿色是否混入可分离非人声、黄色是否混入真正人声、同一真正人声事件是否被切碎或跨独立 non-vocal 过度合并。颜色条点击后只播放自身精确区间，不添加上下文。</p>
 </section>
 <div id="cards"></div>
 """
@@ -126,41 +141,49 @@ def _page(payload: list[dict[str, Any]], *, manifest_sha: str, preaudit_sha: str
 .audit-help,.audit-card{background:#fff;border:1px solid #d7dde4;border-radius:10px;padding:14px;margin:0 0 14px}
 .audit-card h3{margin:0 0 4px}.audit-meta{margin-bottom:8px}.audit-full-row{display:flex;gap:8px;align-items:center;margin:8px 0}.audit-full-row audio{margin:0;flex:1}
 .vocal{background:#2db66f;color:#062d19}.nonvocal{background:#f0c84b;color:#3b2d00}.unsure{background:#9aa6b2;color:#15202a}.conflict{background:#df6c68;color:#3b0807}
-.audit-verdict{display:grid;grid-template-columns:repeat(3,minmax(220px,1fr));gap:10px;margin-top:12px}.audit-verdict label{display:flex;flex-direction:column;gap:4px}.audit-verdict select,.audit-notes{padding:7px}.audit-reviewed{display:flex!important;flex-direction:row!important;align-items:center;gap:7px!important;margin-top:10px}.audit-notes{width:100%;box-sizing:border-box;margin-top:8px}
+.audit-verdict{display:grid;grid-template-columns:repeat(4,minmax(220px,1fr));gap:10px;margin-top:12px}.audit-verdict label{display:flex;flex-direction:column;gap:4px}.audit-verdict select,.audit-notes{padding:7px}.audit-reviewed{display:flex!important;flex-direction:row!important;align-items:center;gap:7px!important;margin-top:10px}.audit-notes{width:100%;box-sizing:border-box;margin-top:8px}
 @media(max-width:1000px){.audit-verdict{grid-template-columns:1fr}}
 """
     js = f"""
 const entries={_script_json(payload)};
-const sourceManifestSha={_script_json(manifest_sha)};
+const sourceManifestSha={_script_json(source_manifest_sha)};
 const preauditSha={_script_json(preaudit_sha)};
+const auditManifestSha={_script_json(audit_manifest_sha)};
 const labels={{
   vocal_coverage:[
-    ['','请选择'],['definite_vocal_complete','vocal 完整，无漏声/截边'],['definite_vocal_missing_or_clipped','存在漏声、截边或真发声落在黄色'],['unsure','不确定']
+    ['','请选择'],['definite_vocal_complete','真正人声完整，无漏声/截边'],['definite_vocal_missing_or_clipped','存在漏声、截边或真正人声落在黄色'],['unsure','不确定']
+  ],
+  vocal_purity:[
+    ['','请选择'],['definite_vocal_excludes_separable_nonvoice','绿色未混入可独立分离的非人声'],['definite_vocal_contains_separable_nonvoice','绿色混入可分离的呼吸/亲吻/口腔声等非人声'],['unsure','不确定']
   ],
   non_vocal_safety:[
-    ['','请选择'],['definite_non_vocal_clean','黄色均不含人类发声'],['definite_non_vocal_contains_vocal','黄色含对白/呼吸/呻吟等人类发声'],['unsure','不确定']
+    ['','请选择'],['definite_non_vocal_clean','黄色均不含真正人声'],['definite_non_vocal_contains_vocal','黄色含对白、带声呻吟或其他真正人声'],['unsure','不确定']
   ],
   envelope_structure:[
-    ['','请选择'],['event_envelopes_continuous','同一发声事件包络连续且未跨独立长背景'],['same_event_fragmented','同一发声事件被切碎'],['overmerged_independent_nonvocal','跨越独立长 non-vocal 过度合并'],['both_fragmented_and_overmerged','同时存在切碎和过度合并'],['unsure','不确定']
+    ['','请选择'],['event_envelopes_continuous','同一真正人声事件连续且未吞入独立 non-vocal'],['same_event_fragmented','同一真正人声事件被切碎'],['overmerged_independent_nonvocal','跨越独立 non-vocal 过度合并'],['both_fragmented_and_overmerged','同时存在切碎和过度合并'],['unsure','不确定']
   ]
 }};
-function approved(state){{return Boolean(state.reviewed_full_source)&&state.vocal_coverage==='definite_vocal_complete'&&state.non_vocal_safety==='definite_non_vocal_clean'&&state.envelope_structure==='event_envelopes_continuous';}}
+function approved(state){{return Boolean(state.reviewed_full_source)&&state.vocal_coverage==='definite_vocal_complete'&&state.vocal_purity==='definite_vocal_excludes_separable_nonvoice'&&state.non_vocal_safety==='definite_non_vocal_clean'&&state.envelope_structure==='event_envelopes_continuous';}}
+const auditIdentity=[location.pathname,sourceManifestSha,preauditSha,auditManifestSha].join('|');
 const core=createAuditReviewCore({{
   entries,
-  storageKey:'vocal-envelope-scorer-v12-teacher-audit-v1',
+  storageKey:'vocal-envelope-scorer-v12-teacher-audit-v2:'+auditIdentity,
   statusLabel:'已完成',
   entryId:entry=>entry.source_id,
-  defaultState:()=>({{vocal_coverage:'',non_vocal_safety:'',envelope_structure:'',reviewed_full_source:false,notes:'',updated_at:''}}),
-  isComplete:state=>Boolean(state.reviewed_full_source&&state.vocal_coverage&&state.non_vocal_safety&&state.envelope_structure),
-  shouldSerialize:state=>Boolean(state.reviewed_full_source&&state.vocal_coverage&&state.non_vocal_safety&&state.envelope_structure),
+  defaultState:()=>({{vocal_coverage:'',vocal_purity:'',non_vocal_safety:'',envelope_structure:'',reviewed_full_source:false,notes:'',updated_at:''}}),
+  isComplete:state=>Boolean(state.reviewed_full_source&&state.vocal_coverage&&state.vocal_purity&&state.non_vocal_safety&&state.envelope_structure),
+  shouldSerialize:state=>Boolean(state.reviewed_full_source&&state.vocal_coverage&&state.vocal_purity&&state.non_vocal_safety&&state.envelope_structure),
   serialize:(entry,state)=>({{
     schema:{_script_json(VOCAL_ENVELOPE_SCORER_V12_MANUAL_VERDICT_SCHEMA)},
     boundary_serialization_contract_id:{_script_json(CONTRACT_ID)},
+    task_semantics:{_script_json(VOCAL_ENVELOPE_SCORER_V12_TASK_SEMANTICS)},
     source_id:entry.source_id,video_id:entry.video_id,partition:entry.partition,
     audio_sha256:entry.audio_sha256,duration_s:entry.duration_s,frame_count:entry.frame_count,
     source_manifest_sha256:sourceManifestSha,preaudit_sha256:preauditSha,
+    audit_manifest_sha256:auditManifestSha,evidence_span_signature:entry.evidence_span_signature,
     reviewed_full_source:Boolean(state.reviewed_full_source),vocal_coverage:state.vocal_coverage,
-    non_vocal_safety:state.non_vocal_safety,envelope_structure:state.envelope_structure,
+    vocal_purity:state.vocal_purity,non_vocal_safety:state.non_vocal_safety,
+    envelope_structure:state.envelope_structure,
     approved:approved(state),notes:String(state.notes||''),updated_at:state.updated_at||new Date().toISOString(),
     training_manifest_allowed:approved(state)
   }})
@@ -170,10 +193,10 @@ function render(){{
   const root=document.getElementById('cards');root.innerHTML='';
   for(const entry of entries){{
     const state=core.ensure(entry),card=document.createElement('section');card.className='audit-card';
-    card.innerHTML=`<h3>${{escapeAuditHtml(entry.source_id)}}</h3><div class="audit-meta"><small>${{escapeAuditHtml(entry.partition)}} / ${{escapeAuditHtml(entry.video_id)}} / ${{entry.frame_count}} frames / ${{Number(entry.duration_s).toFixed(3)}}s</small></div><div class="audit-full-row"><button type="button" class="full-play">播放完整 source</button><audio controls preload="metadata" src="${{escapeAuditHtml(entry.audio)}}"></audio></div><div class="lanes"></div><div class="audit-verdict"><label>1. Vocal 覆盖<select data-field="vocal_coverage">${{optionHtml(labels.vocal_coverage,state.vocal_coverage)}}</select></label><label>2. Non-vocal 安全<select data-field="non_vocal_safety">${{optionHtml(labels.non_vocal_safety,state.non_vocal_safety)}}</select></label><label>3. 包络结构<select data-field="envelope_structure">${{optionHtml(labels.envelope_structure,state.envelope_structure)}}</select></label></div><label class="audit-reviewed"><input type="checkbox" data-field="reviewed_full_source" ${{state.reviewed_full_source?'checked':''}}>已完整听完本条 source</label><input class="audit-notes" data-field="notes" placeholder="可选备注" value="${{escapeAuditHtml(state.notes||'')}}"><small class="approval">当前：${{approved(state)?'可进入 canonical':'不可进入 canonical'}}</small>`;
+    card.innerHTML=`<h3>${{escapeAuditHtml(entry.source_id)}}</h3><div class="audit-meta"><small>${{escapeAuditHtml(entry.partition)}} / ${{escapeAuditHtml(entry.video_id)}} / ${{entry.frame_count}} frames / ${{Number(entry.duration_s).toFixed(3)}}s</small></div><div class="audit-full-row"><button type="button" class="full-play">播放完整 source</button><audio controls preload="metadata" src="${{escapeAuditHtml(entry.audio)}}"></audio></div><div class="lanes"></div><div class="audit-verdict"><label>1. Vocal 覆盖<select data-field="vocal_coverage">${{optionHtml(labels.vocal_coverage,state.vocal_coverage)}}</select></label><label>2. Vocal 纯度<select data-field="vocal_purity">${{optionHtml(labels.vocal_purity,state.vocal_purity)}}</select></label><label>3. Non-vocal 安全<select data-field="non_vocal_safety">${{optionHtml(labels.non_vocal_safety,state.non_vocal_safety)}}</select></label><label>4. 包络结构<select data-field="envelope_structure">${{optionHtml(labels.envelope_structure,state.envelope_structure)}}</select></label></div><label class="audit-reviewed"><input type="checkbox" data-field="reviewed_full_source" ${{state.reviewed_full_source?'checked':''}}>已完整听完本条 source</label><input class="audit-notes" data-field="notes" placeholder="可选备注" value="${{escapeAuditHtml(state.notes||'')}}"><small class="approval">当前：${{approved(state)?'可进入 canonical':'不可进入 canonical'}}</small>`;
     const audio=card.querySelector('audio'),lanes=card.querySelector('.lanes');
     card.querySelector('.full-play').onclick=event=>play(audio,event.currentTarget,0,Number(entry.duration_s));
-    appendAuditSpanLane({{container:lanes,audio,durationS:Number(entry.duration_s),label:'canonical vocal',metric:`${{entry.vocal_spans.length}} spans`,spans:entry.vocal_spans,className:'vocal',title:(span,start,end)=>`vocal ${{formatAuditSpan(start,end)}} · ${{span.reason||''}}`}});
+    appendAuditSpanLane({{container:lanes,audio,durationS:Number(entry.duration_s),label:'canonical vocal',metric:`${{entry.vocal_spans.length}} spans`,spans:entry.vocal_spans,className:'vocal',title:(span,start,end)=>`vocal ${{formatAuditSpan(start,end)}} · ${{span.category||''}} · ${{span.reason||''}}`}});
     appendAuditSpanLane({{container:lanes,audio,durationS:Number(entry.duration_s),label:'canonical non-vocal',metric:`${{entry.non_vocal_spans.length}} spans`,spans:entry.non_vocal_spans,className:'nonvocal',title:(span,start,end)=>`non-vocal ${{formatAuditSpan(start,end)}} · ${{span.category||''}} · ${{span.reason||''}}`}});
     appendAuditSpanLane({{container:lanes,audio,durationS:Number(entry.duration_s),label:'canonical unsure',metric:`${{entry.unsure_spans.length}} spans`,spans:entry.unsure_spans,className:span=>span.conflict?'conflict':'unsure',title:(span,start,end)=>`${{span.conflict?'conflict':'unsure'}} ${{formatAuditSpan(start,end)}}`}});
     for(const element of card.querySelectorAll('[data-field]')){{
@@ -188,7 +211,7 @@ document.getElementById('stop').onclick=stop;document.getElementById('save').onc
 """
     return render_audit_review_page(
         AuditReviewPageSpec(
-            title="Scorer v12 vocal-envelope Teacher review",
+            title="Scorer v12 Human Voice Envelope Teacher review",
             intro_html=intro,
             body_html=body,
             adapter_css=css,
@@ -255,6 +278,8 @@ def build(
             raise ValueError(f"wrong v12 preaudit schema: {source_id}")
         if row.get("boundary_serialization_contract_id") != CONTRACT_ID:
             raise ValueError(f"wrong v12 central contract: {source_id}")
+        if row.get("task_semantics") != VOCAL_ENVELOPE_SCORER_V12_TASK_SEMANTICS:
+            raise ValueError(f"wrong v12 task semantics: {source_id}")
         for field in ("partition", "video_id", "audio_sha256", "frame_count"):
             if row.get(field) != source.get(field):
                 raise ValueError(f"v12 audit {field} mismatch: {source_id}")
@@ -310,6 +335,7 @@ def build(
             {
                 "schema": VOCAL_ENVELOPE_SCORER_V12_AUDIT_ITEM_SCHEMA,
                 "boundary_serialization_contract_id": CONTRACT_ID,
+                "task_semantics": VOCAL_ENVELOPE_SCORER_V12_TASK_SEMANTICS,
                 "source_id": source_id,
                 "video_id": str(source["video_id"]),
                 "partition": partition,
@@ -317,6 +343,13 @@ def build(
                 "audio_sha256": str(source["audio_sha256"]),
                 "duration_s": float(source["duration_s"]),
                 "frame_count": int(source["frame_count"]),
+                "source_manifest_sha256": manifest_sha,
+                "preaudit_sha256": preaudit_sha,
+                "evidence_span_signature": evidence_span_signature(
+                    row,
+                    frame_count=int(source["frame_count"]),
+                    source_id=source_id,
+                ),
                 "vocal_spans": list(row.get("vocal_spans") or ()),
                 "non_vocal_spans": list(row.get("non_vocal_spans") or ()),
                 "unsure_spans": unsure,
@@ -330,14 +363,21 @@ def build(
         ),
         encoding="utf-8",
     )
+    audit_manifest_sha = _sha256(manifest)
     index = output_dir / "index.html"
     index.write_text(
-        _page(payload, manifest_sha=manifest_sha, preaudit_sha=preaudit_sha),
+        _page(
+            payload,
+            source_manifest_sha=manifest_sha,
+            preaudit_sha=preaudit_sha,
+            audit_manifest_sha=audit_manifest_sha,
+        ),
         encoding="utf-8",
     )
     summary = {
         "schema": SUMMARY_SCHEMA,
         "boundary_serialization_contract_id": CONTRACT_ID,
+        "task_semantics": VOCAL_ENVELOPE_SCORER_V12_TASK_SEMANTICS,
         "source_manifest": str(source_manifest),
         "source_manifest_sha256": manifest_sha,
         "preaudit": str(preaudit),
@@ -357,7 +397,7 @@ def build(
             calibration["hashes"]["verdicts"] if calibration else None
         ),
         "audit_manifest": str(manifest),
-        "audit_manifest_sha256": _sha256(manifest),
+        "audit_manifest_sha256": audit_manifest_sha,
         "manual_verdict_schema": VOCAL_ENVELOPE_SCORER_V12_MANUAL_VERDICT_SCHEMA,
         "manual_gate_status": "pending",
         "training_manifest_allowed": False,
@@ -366,7 +406,10 @@ def build(
         json.dumps(summary, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
         encoding="utf-8",
     )
-    update_audit_entrypoints(latest_html=index, title="Scorer v12 Teacher review")
+    update_audit_entrypoints(
+        latest_html=index,
+        title="Scorer v12 Human Voice Envelope Teacher review",
+    )
     return summary
 
 
