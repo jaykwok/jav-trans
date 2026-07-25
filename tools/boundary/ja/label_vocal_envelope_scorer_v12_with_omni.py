@@ -40,6 +40,10 @@ from tools.omni.audio_teacher_transport import (  # noqa: E402
     AudioTeacherTransport,
     create_audio_teacher_transport,
 )
+from tools.omni.audio_teacher_batch import (  # noqa: E402
+    iter_completed_audio_teacher_items,
+    resolve_worker_count,
+)
 from tools.omni.gemini_native import (  # noqa: E402
     GEMINI_NATIVE_EXECUTION_CONTRACT,
     GEMINI_NATIVE_MODEL,
@@ -490,19 +494,71 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 raise ValueError(f"v12 resume preaudit core mismatch: {source_id}")
             existing[source_id] = saved
     pending = [row for row in rows if row["source_id"] not in existing]
+    worker_count = (
+        resolve_worker_count(
+            requested=int(args.workers),
+            provider_limit=int(transport.max_concurrency),
+            item_count=len(pending),
+        )
+        if pending
+        else 0
+    )
     started = time.perf_counter()
-    _write_progress(progress_path, {"schema": PROGRESS_SCHEMA, "status": "running", "model": model, "provider_profile": profile, "reasoning_effort": "medium", "max_tokens": EXPECTED_MAX_TOKENS, "completed": len(existing), "total": len(rows), "pending": len(pending)})
-    for index, row in enumerate(pending, start=1):
+    _write_progress(progress_path, {"schema": PROGRESS_SCHEMA, "status": "running", "model": model, "provider_profile": profile, "reasoning_effort": "medium", "max_tokens": EXPECTED_MAX_TOKENS, "worker_count": worker_count, "completed": len(existing), "total": len(rows), "pending": len(pending)})
+
+    def execute_row(row: dict[str, Any]) -> dict[str, Any]:
         print(
-            f"v12_teacher={len(existing)+1}/{len(rows)} "
-            f"source={row['source_id']} pass=single_tristate",
+            f"v12_teacher_dispatch source={row['source_id']} "
+            f"pass=single_tristate workers={worker_count}",
             flush=True,
         )
-        response, response_raw, normalized = _call_teacher(
-            row=row,
-            transport=transport,
-            args=args,
-        )
+        request_started = time.perf_counter()
+        try:
+            response, response_raw, normalized = _call_teacher(
+                row=row,
+                transport=transport,
+                args=args,
+            )
+            return {
+                "ok": True,
+                "response": response,
+                "response_raw": response_raw,
+                "normalized": normalized,
+                "request_s": time.perf_counter() - request_started,
+            }
+        except Exception as error:  # noqa: BLE001
+            return {
+                "ok": False,
+                "error": error,
+                "request_s": time.perf_counter() - request_started,
+            }
+
+    completed_items = iter_completed_audio_teacher_items(
+        items=pending,
+        worker=execute_row,
+        max_workers=max(1, worker_count),
+        sequential_interval_s=(
+            float(args.request_interval_s) if worker_count == 1 else 0.0
+        ),
+    )
+    failures: list[tuple[str, Exception]] = []
+    for completed in completed_items:
+        row = completed.item
+        outcome = completed.result
+        request_elapsed = float(outcome["request_s"])
+        if not outcome["ok"]:
+            error = outcome["error"]
+            failures.append((str(row["source_id"]), error))
+            print(
+                f"v12_teacher_error source={row['source_id']} "
+                f"error={type(error).__name__}: {error}",
+                flush=True,
+            )
+            _write_progress(progress_path, {"schema": PROGRESS_SCHEMA, "status": "running_with_failures", "model": model, "provider_profile": profile, "worker_count": worker_count, "completed": len(existing), "failed": len(failures), "total": len(rows), "pending": len(rows) - len(existing) - len(failures), "last_source_id": row["source_id"], "last_error": repr(error)})
+            continue
+        response = outcome["response"]
+        response_raw = outcome["response_raw"]
+        normalized = outcome["normalized"]
         label = {
             "schema": VOCAL_ENVELOPE_SCORER_V12_PREAUDIT_SCHEMA,
             "boundary_serialization_contract_id": CONTRACT_ID,
@@ -545,10 +601,21 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         elapsed = time.perf_counter() - started
         rate = len(existing) / max(elapsed, 1e-9)
         eta = (len(rows) - len(existing)) / max(rate, 1e-9)
-        _write_progress(progress_path, {"schema": PROGRESS_SCHEMA, "status": "running", "model": model, "provider_profile": profile, "reasoning_effort": "medium", "max_tokens": EXPECTED_MAX_TOKENS, "completed": len(existing), "total": len(rows), "pending": len(rows) - len(existing), "last_source_id": row["source_id"], "elapsed_s": round(elapsed, 3), "eta_s": round(eta, 3)})
-        if index < len(pending) and args.request_interval_s > 0:
-            time.sleep(float(args.request_interval_s))
-    summary = {"schema": SUMMARY_SCHEMA, "boundary_serialization_contract_id": CONTRACT_ID, "model": model, "provider_profile": profile, "env_file_name": profile, "transport": transport.transport_name, "api_key_count": transport.api_key_count, "reasoning_effort": "medium", "max_tokens": EXPECTED_MAX_TOKENS, "request_count": len(existing), "calls_per_source": 1, "omitted_sampling_parameters": ["temperature", "top_p", "top_k"], "prompt_profile": PROMPT_PROFILE, "prompt_version": PROMPT_VERSION, "teacher_timestamp_contract_id": TIMESTAMP_CONTRACT_ID, "teacher_execution_contract_id": execution_contract, "source_manifest": str(manifest), "source_manifest_sha256": manifest_sha, "source_count": len(rows), "result_count": len(existing), "results": str(labels_path), "raw_responses": str(raw_path), "training_manifest_allowed": False}
+        print(
+            f"v12_teacher_result={len(existing)}/{len(rows)} "
+            f"source={row['source_id']} request_s={request_elapsed:.1f} "
+            f"eta_s={eta:.0f}",
+            flush=True,
+        )
+        _write_progress(progress_path, {"schema": PROGRESS_SCHEMA, "status": "running_with_failures" if failures else "running", "model": model, "provider_profile": profile, "reasoning_effort": "medium", "max_tokens": EXPECTED_MAX_TOKENS, "worker_count": worker_count, "completed": len(existing), "failed": len(failures), "total": len(rows), "pending": len(rows) - len(existing) - len(failures), "last_source_id": row["source_id"], "last_request_s": round(request_elapsed, 3), "elapsed_s": round(elapsed, 3), "eta_s": round(eta, 3)})
+    if failures:
+        source_id, error = failures[0]
+        _write_progress(progress_path, {"schema": PROGRESS_SCHEMA, "status": "failed", "model": model, "provider_profile": profile, "worker_count": worker_count, "completed": len(existing), "failed": len(failures), "total": len(rows), "pending": len(rows) - len(existing), "last_source_id": source_id, "last_error": repr(error)})
+        raise RuntimeError(
+            f"v12 Teacher failed for {len(failures)} source(s); "
+            f"first={source_id}: {error}"
+        ) from error
+    summary = {"schema": SUMMARY_SCHEMA, "boundary_serialization_contract_id": CONTRACT_ID, "model": model, "provider_profile": profile, "env_file_name": profile, "transport": transport.transport_name, "api_key_count": transport.api_key_count, "worker_count": worker_count, "reasoning_effort": "medium", "max_tokens": EXPECTED_MAX_TOKENS, "request_count": len(existing), "calls_per_source": 1, "omitted_sampling_parameters": ["temperature", "top_p", "top_k"], "prompt_profile": PROMPT_PROFILE, "prompt_version": PROMPT_VERSION, "teacher_timestamp_contract_id": TIMESTAMP_CONTRACT_ID, "teacher_execution_contract_id": execution_contract, "source_manifest": str(manifest), "source_manifest_sha256": manifest_sha, "source_count": len(rows), "result_count": len(existing), "results": str(labels_path), "raw_responses": str(raw_path), "training_manifest_allowed": False}
     (output / "summary.json").write_text(json.dumps(summary, ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     _write_progress(progress_path, {"schema": PROGRESS_SCHEMA, "status": "completed", "model": model, "provider_profile": profile, "reasoning_effort": "medium", "max_tokens": EXPECTED_MAX_TOKENS, "completed": len(existing), "total": len(rows), "pending": 0, "elapsed_s": round(time.perf_counter() - started, 3), "summary": str(output / "summary.json")})
     return summary
@@ -570,8 +637,19 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--timeout-s", type=float, default=240.0)
     parser.add_argument("--max-attempts", type=int, default=3)
     parser.add_argument("--request-interval-s", type=float, default=0.5)
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=0,
+        help="0 uses one worker per native Gemini key; compatible providers remain single-worker.",
+    )
     args = parser.parse_args(argv)
-    if args.limit < 0 or args.max_attempts <= 0 or args.request_interval_s < 0:
+    if (
+        args.limit < 0
+        or args.max_attempts <= 0
+        or args.request_interval_s < 0
+        or args.workers < 0
+    ):
         parser.error("limit/attempt/interval values are invalid")
     return args
 

@@ -30,6 +30,10 @@ from tools.omni.audio_teacher_transport import (  # noqa: E402
     KNOWN_AUDIO_TEACHER_PROFILES,
     create_audio_teacher_transport,
 )
+from tools.omni.audio_teacher_batch import (  # noqa: E402
+    iter_completed_audio_teacher_items,
+    resolve_worker_count,
+)
 
 
 RESULT_SCHEMA = "omni_audio_teacher_result_v1"
@@ -150,13 +154,24 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         system_prompt = Path(args.system_prompt_file).read_text(encoding="utf-8-sig")
     if not prompt:
         raise ValueError("--prompt or --prompt-file is required")
+    worker_count = (
+        resolve_worker_count(
+            requested=int(args.workers),
+            provider_limit=int(transport.max_concurrency),
+            item_count=len(pending),
+        )
+        if pending
+        else 0
+    )
     started = time.perf_counter()
-    _write_progress(progress_path, {"schema": PROGRESS_SCHEMA, "status": "running", "profile": profile, "model": model, "audio_content_mode": mode, "completed": len(existing), "total": len(rows), "pending": len(pending)})
-    for position, row in enumerate(pending, start=1):
+    _write_progress(progress_path, {"schema": PROGRESS_SCHEMA, "status": "running", "profile": profile, "model": model, "audio_content_mode": mode, "worker_count": worker_count, "completed": len(existing), "total": len(rows), "pending": len(pending)})
+
+    def execute_row(row: dict[str, Any]) -> dict[str, Any]:
         last_error: Exception | None = None
+        attempts: list[dict[str, Any]] = []
         for attempt in range(1, args.max_attempts + 1):
             request_started = time.perf_counter()
-            print(f"omni_request={len(existing)+1}/{len(rows)} provider={profile} item={row['item_id']} attempt={attempt}/{args.max_attempts}", flush=True)
+            print(f"omni_request provider={profile} item={row['item_id']} attempt={attempt}/{args.max_attempts} workers={worker_count}", flush=True)
             try:
                 response = transport.call_json(
                     audio_path=Path(row["audio"]),
@@ -173,32 +188,69 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 )
                 parsed, raw = response.parsed, response.raw
                 result = {"schema": RESULT_SCHEMA, "item_id": row["item_id"], "audio": row["audio"], "audio_sha256": row["audio_sha256"], "model": model, "profile": profile, "transport": transport.transport_name, "audio_content_mode": mode, "reasoning_effort": reasoning_effort, "enable_thinking": bool(args.enable_thinking), "thinking_budget": effective_thinking_budget, "max_tokens": effective_max_tokens, "response": parsed, "created_at": time.strftime("%Y-%m-%dT%H:%M:%S%z")}
-                with result_path.open("a", encoding="utf-8") as handle:
-                    handle.write(json.dumps(result, ensure_ascii=False, sort_keys=True) + "\n")
-                with raw_path.open("a", encoding="utf-8") as handle:
-                    handle.write(json.dumps({"item_id": row["item_id"], "attempt": attempt, "response": raw}, ensure_ascii=False, sort_keys=True) + "\n")
-                existing[row["item_id"]] = result
-                elapsed = time.perf_counter() - request_started
-                total_elapsed = time.perf_counter() - started
-                rate = len(existing) / max(total_elapsed, 1e-9)
-                eta = (len(rows) - len(existing)) / max(rate, 1e-9)
-                print(f"omni_result={len(existing)}/{len(rows)} provider={profile} item={row['item_id']} request_s={elapsed:.1f} eta_s={eta:.0f}", flush=True)
-                _write_progress(progress_path, {"schema": PROGRESS_SCHEMA, "status": "running", "profile": profile, "model": model, "audio_content_mode": mode, "completed": len(existing), "total": len(rows), "pending": len(rows)-len(existing), "last_item_id": row["item_id"], "last_request_s": round(elapsed, 3), "elapsed_s": round(total_elapsed, 3), "eta_s": round(eta, 3)})
-                last_error = None
-                break
+                attempts.append(
+                    {"item_id": row["item_id"], "attempt": attempt, "response": raw}
+                )
+                return {
+                    "ok": True,
+                    "result": result,
+                    "attempts": attempts,
+                    "request_s": time.perf_counter() - request_started,
+                }
             except Exception as error:  # noqa: BLE001
                 last_error = error
                 print(f"omni_error provider={profile} item={row['item_id']} attempt={attempt}/{args.max_attempts} error={type(error).__name__}: {error}", flush=True)
-                with raw_path.open("a", encoding="utf-8") as handle:
-                    handle.write(json.dumps({"item_id": row["item_id"], "attempt": attempt, "error": repr(error)}, ensure_ascii=False, sort_keys=True) + "\n")
+                attempts.append(
+                    {"item_id": row["item_id"], "attempt": attempt, "error": repr(error)}
+                )
                 if attempt < args.max_attempts:
                     time.sleep(min(8.0, float(attempt)))
-        if last_error is not None:
-            _write_progress(progress_path, {"schema": PROGRESS_SCHEMA, "status": "failed", "profile": profile, "model": model, "completed": len(existing), "total": len(rows), "pending": len(rows)-len(existing), "last_item_id": row["item_id"], "last_error": repr(last_error)})
-            raise RuntimeError(f"teacher failed for {row['item_id']}: {last_error}") from last_error
-        if position < len(pending) and args.request_interval_s > 0:
-            time.sleep(args.request_interval_s)
-    summary = {"schema": SUMMARY_SCHEMA, "profile": profile, "model": model, "transport": transport.transport_name, "api_key_count": transport.api_key_count, "audio_content_mode": mode, "reasoning_effort": reasoning_effort, "enable_thinking": bool(args.enable_thinking), "thinking_budget": effective_thinking_budget, "max_tokens": effective_max_tokens, "omitted_sampling_parameters": ["temperature", "top_p", "top_k"], "source_count": len(rows), "result_count": len(existing), "results": str(result_path), "raw_responses": str(raw_path), "training_manifest_allowed": False}
+        return {
+            "ok": False,
+            "attempts": attempts,
+            "last_error": last_error,
+        }
+
+    completed_items = iter_completed_audio_teacher_items(
+        items=pending,
+        worker=execute_row,
+        max_workers=max(1, worker_count),
+        sequential_interval_s=(
+            float(args.request_interval_s) if worker_count == 1 else 0.0
+        ),
+    )
+    failures: list[tuple[str, Exception]] = []
+    for completed in completed_items:
+        row = completed.item
+        outcome = completed.result
+        with raw_path.open("a", encoding="utf-8") as handle:
+            for attempt_record in outcome["attempts"]:
+                handle.write(
+                    json.dumps(attempt_record, ensure_ascii=False, sort_keys=True)
+                    + "\n"
+                )
+        if not outcome["ok"]:
+            last_error = outcome["last_error"]
+            failures.append((str(row["item_id"]), last_error))
+            _write_progress(progress_path, {"schema": PROGRESS_SCHEMA, "status": "running_with_failures", "profile": profile, "model": model, "worker_count": worker_count, "completed": len(existing), "failed": len(failures), "total": len(rows), "pending": len(rows)-len(existing)-len(failures), "last_item_id": row["item_id"], "last_error": repr(last_error)})
+            continue
+        result = outcome["result"]
+        with result_path.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(result, ensure_ascii=False, sort_keys=True) + "\n")
+        existing[row["item_id"]] = result
+        total_elapsed = time.perf_counter() - started
+        rate = len(existing) / max(total_elapsed, 1e-9)
+        eta = (len(rows) - len(existing)) / max(rate, 1e-9)
+        print(f"omni_result={len(existing)}/{len(rows)} provider={profile} item={row['item_id']} request_s={outcome['request_s']:.1f} eta_s={eta:.0f}", flush=True)
+        _write_progress(progress_path, {"schema": PROGRESS_SCHEMA, "status": "running_with_failures" if failures else "running", "profile": profile, "model": model, "audio_content_mode": mode, "worker_count": worker_count, "completed": len(existing), "failed": len(failures), "total": len(rows), "pending": len(rows)-len(existing)-len(failures), "last_item_id": row["item_id"], "last_request_s": round(outcome["request_s"], 3), "elapsed_s": round(total_elapsed, 3), "eta_s": round(eta, 3)})
+    if failures:
+        item_id, last_error = failures[0]
+        _write_progress(progress_path, {"schema": PROGRESS_SCHEMA, "status": "failed", "profile": profile, "model": model, "worker_count": worker_count, "completed": len(existing), "failed": len(failures), "total": len(rows), "pending": len(rows)-len(existing), "last_item_id": item_id, "last_error": repr(last_error)})
+        raise RuntimeError(
+            f"Teacher failed for {len(failures)} item(s); "
+            f"first={item_id}: {last_error}"
+        ) from last_error
+    summary = {"schema": SUMMARY_SCHEMA, "profile": profile, "model": model, "transport": transport.transport_name, "api_key_count": transport.api_key_count, "worker_count": worker_count, "audio_content_mode": mode, "reasoning_effort": reasoning_effort, "enable_thinking": bool(args.enable_thinking), "thinking_budget": effective_thinking_budget, "max_tokens": effective_max_tokens, "omitted_sampling_parameters": ["temperature", "top_p", "top_k"], "source_count": len(rows), "result_count": len(existing), "results": str(result_path), "raw_responses": str(raw_path), "training_manifest_allowed": False}
     (output / "summary.json").write_text(json.dumps(summary, ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     _write_progress(progress_path, {"schema": PROGRESS_SCHEMA, "status": "completed", "profile": profile, "model": model, "audio_content_mode": mode, "completed": len(existing), "total": len(rows), "pending": 0, "elapsed_s": round(time.perf_counter()-started, 3), "summary": str(output / "summary.json")})
     return summary
@@ -244,8 +296,17 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--store-stream-chunks", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--max-attempts", type=int, default=3)
     parser.add_argument("--request-interval-s", type=float, default=0.5)
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=0,
+        help="0 uses one worker per native Gemini key; compatible providers remain single-worker.",
+    )
     parser.add_argument("--limit", type=int, default=0)
-    return parser.parse_args(argv)
+    args = parser.parse_args(argv)
+    if args.workers < 0 or args.max_attempts <= 0 or args.request_interval_s < 0:
+        parser.error("worker/attempt/interval values are invalid")
+    return args
 
 
 if __name__ == "__main__":

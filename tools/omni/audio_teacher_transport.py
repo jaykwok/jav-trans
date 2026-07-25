@@ -44,6 +44,10 @@ class AudioTeacherTransport:
     audio_content_mode: str
     execution_contract: str
     api_key_count: int
+    max_concurrency: int
+
+    def quota_status(self) -> dict[str, Any] | None:
+        return None
 
     def call_json(
         self,
@@ -87,6 +91,7 @@ class OpenAICompatibleAudioTeacherTransport(AudioTeacherTransport):
             else "qwen_omni_openai_compatible_v1"
         )
         self.api_key_count = 1
+        self.max_concurrency = 1
 
     def call_json(
         self,
@@ -144,6 +149,8 @@ class GoogleAIStudioAudioTeacherTransport(AudioTeacherTransport):
         self.audio_content_mode = "native_inline_audio"
         self.execution_contract = GEMINI_NATIVE_EXECUTION_CONTRACT
         self.api_key_count = len(api_keys)
+        self.max_concurrency = len(api_keys)
+        self.quota_state_path = quota_state_path
         self.client = GeminiNativeAudioClient(
             api_keys=api_keys,
             model=model,
@@ -151,6 +158,21 @@ class GoogleAIStudioAudioTeacherTransport(AudioTeacherTransport):
             log=log,
             quota_state_path=quota_state_path,
         )
+        status = self.client.quota_status()
+        key_states = list(status["keys"].values())
+        ready_values = sorted(
+            str(item.get("rpm_ready_at_utc") or "") for item in key_states
+        )
+        log(
+            "gemini_quota_status "
+            f"key_count={len(key_states)} "
+            f"rpd_remaining_total={sum(int(item['rpd_remaining']) for item in key_states)} "
+            f"next_rpm_ready_at_utc={ready_values[0] if ready_values else 'n/a'} "
+            f"rpd_reset_at_utc={status['rpd_reset_at_utc']}"
+        )
+
+    def quota_status(self) -> dict[str, Any]:
+        return self.client.quota_status()
 
     def call_json(
         self,
