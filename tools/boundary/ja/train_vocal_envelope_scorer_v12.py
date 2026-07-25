@@ -31,11 +31,14 @@ from boundary.ja.vocal_envelope_training import (  # noqa: E402
 )
 from boundary.ja.vocal_envelope_v12 import (  # noqa: E402
     VOCAL_ENVELOPE_SCORER_V12_CANONICAL_LABEL_SCHEMA,
+    VOCAL_ENVELOPE_SCORER_V12_CRF_SCHEMA,
     VOCAL_ENVELOPE_SCORER_V12_IGNORE_INDEX,
     VOCAL_ENVELOPE_SCORER_V12_SCHEMA,
     VOCAL_ENVELOPE_SCORER_V12_TRAINING_ROW_SCHEMA,
+    VocalEnvelopeScorerV12CrfNetwork,
     VocalEnvelopeScorerV12Network,
     build_vocal_envelope_scorer_v12_checkpoint,
+    vocal_envelope_v12_crf_model_config,
     vocal_envelope_v12_model_config,
 )
 from pipeline.memory_safety import reset_shared_vram_baseline, runtime_memory_snapshot  # noqa: E402
@@ -47,6 +50,11 @@ PROGRESS_SCHEMA = "vocal_envelope_scorer_v12_training_progress_v1"
 SOURCE_PREDICTION_SCHEMA = "vocal_envelope_scorer_v12_source_prediction_v1"
 SEED = 117
 HARD_RECALL = 0.95
+# Windows PDH reports process shared-memory counters in coarse, asynchronously
+# updated pages. A 4 MiB delta occurred while torch peak allocation was only
+# 2.2 GiB on an 8 GiB card, so it is telemetry jitter rather than paging. Any
+# sustained delta above this small measurement floor remains a soft OOM.
+SHARED_VRAM_NOISE_FLOOR_MB = 16.0
 
 
 def _read_json(path: Path) -> dict[str, Any]:
@@ -102,7 +110,9 @@ def _atomic_torch_save(torch, path: Path, payload: Mapping[str, Any]) -> None:
             os.unlink(temporary)
 
 
-def _memory(torch, device, *, stage: str) -> dict[str, Any]:
+def _memory(
+    torch, device, *, stage: str, enforce_shared_vram: bool = True
+) -> dict[str, Any]:
     snapshot = runtime_memory_snapshot(require_shared_vram=device.type == "cuda")
     if device.type == "cuda":
         snapshot.update(
@@ -115,7 +125,12 @@ def _memory(torch, device, *, stage: str) -> dict[str, Any]:
         snapshot.update(shared_vram_mb=0.0, shared_vram_monitor="not_applicable_cpu_stage")
     if float(snapshot.get("physical_ram_used_mb") or 0.0) > float(snapshot.get("physical_ram_budget_mb") or math.inf):
         raise MemoryError("Scorer v12 exceeded the 95% physical RAM budget")
-    if device.type == "cuda" and float(snapshot.get("shared_vram_mb") or 0.0) > 0.0:
+    if (
+        enforce_shared_vram
+        and device.type == "cuda"
+        and float(snapshot.get("shared_vram_mb") or 0.0)
+        > SHARED_VRAM_NOISE_FLOOR_MB
+    ):
         raise MemoryError("Scorer v12 shared VRAM spill is a soft OOM")
     snapshot["stage"] = stage
     return snapshot
@@ -331,7 +346,32 @@ def _runs(values: np.ndarray, target: int) -> list[tuple[int, int]]:
     return output
 
 
-def _evaluate(model, rows: list[dict[str, Any]], cache: SourceArrayCache, torch, device, *, arm: str, max_padded_frames: int, max_rows: int) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+def _losses(model, logits, batch, *, arm: str, decoder: str, torch):
+    if decoder == "crf":
+        valid = batch["owner"] & (
+            batch["labels"] != VOCAL_ENVELOPE_SCORER_V12_IGNORE_INDEX
+        )
+        main = model.sequence_nll(logits, batch["labels"], valid)
+        # CRF sequence likelihood learns transition persistence. The
+        # run-balanced emission term prevents the 10:1 vocal-frame skew from
+        # teaching an all-vocal lattice.
+        run = compute_vocal_envelope_losses(
+            logits, batch["labels"], batch["owner"], arm="A"
+        )["run_loss"]
+        zero = main * 0.0
+        return {
+            "total_loss": main + 0.5 * run,
+            "main_loss": main,
+            "run_loss": run,
+            "adjacency_loss": zero,
+            "arm": "CRF",
+        }
+    return compute_vocal_envelope_losses(
+        logits, batch["labels"], batch["owner"], arm=arm
+    )
+
+
+def _evaluate(model, rows: list[dict[str, Any]], cache: SourceArrayCache, torch, device, *, arm: str, decoder: str, max_padded_frames: int, max_rows: int) -> tuple[dict[str, Any], list[dict[str, Any]]]:
     model.eval()
     by_source: dict[str, list[dict[str, Any]]] = {}
     for row in rows:
@@ -346,8 +386,14 @@ def _evaluate(model, rows: list[dict[str, Any]], cache: SourceArrayCache, torch,
             batch = _collate(items, torch, device)
             with torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=device.type == "cuda"):
                 logits = model(batch["ptm"], batch["mfcc"], attention_mask=batch["attention"])
-                losses = compute_vocal_envelope_losses(logits, batch["labels"], batch["owner"], arm=arm)
-            predicted = logits.argmax(dim=-1).detach().cpu().numpy()
+                losses = _losses(
+                    model, logits, batch, arm=arm, decoder=decoder, torch=torch
+                )
+            if decoder == "crf":
+                predicted_tensor = model.decode(logits, batch["attention"])
+            else:
+                predicted_tensor = logits.argmax(dim=-1)
+            predicted = predicted_tensor.detach().cpu().numpy()
             for index, row in enumerate(batch_rows):
                 start, end = int(row["owner_start_frame"]), int(row["owner_end_frame"])
                 local_start, local_end = int(row["owner_local_start"]), int(row["owner_local_end"])
@@ -355,7 +401,7 @@ def _evaluate(model, rows: list[dict[str, Any]], cache: SourceArrayCache, torch,
             for key in ("main_loss", "run_loss", "adjacency_loss"):
                 loss_sums[key] += float(losses[key].detach().cpu())
             batch_count += 1
-            del batch, logits, losses, predicted, items
+            del batch, logits, losses, predicted, predicted_tensor, items
     predictions: list[dict[str, Any]] = []
     totals = Counter()
     macro = Counter()
@@ -468,15 +514,22 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     by_partition = {name: [row for row in rows if row["partition"] == name] for name in ("train", "val", "test")}
     cache = SourceArrayCache(args.cache_sources)
     normalization = _normalization(by_partition["train"], cache)
-    config = vocal_envelope_v12_model_config(**normalization)
-    model = VocalEnvelopeScorerV12Network(**config).to(device)
+    decoder = str(args.decoder).lower()
+    if decoder == "crf":
+        if str(args.arm).upper() != "A":
+            raise ValueError("CRF uses exact sequence NLL; select --arm A")
+        config = vocal_envelope_v12_crf_model_config(**normalization)
+        model = VocalEnvelopeScorerV12CrfNetwork(**config).to(device)
+    else:
+        config = vocal_envelope_v12_model_config(**normalization)
+        model = VocalEnvelopeScorerV12Network(**config).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.learning_rate, weight_decay=args.weight_decay)
     output = Path(args.output_dir).resolve()
     if output.exists() and any(output.iterdir()):
         raise FileExistsError(f"Scorer v12 training output is not empty: {output}")
     output.mkdir(parents=True, exist_ok=True)
     progress_path = output / "progress.json"
-    checkpoint_path = output / f"scorer-v12-arm-{args.arm.upper()}.pt"
+    checkpoint_path = output / f"scorer-v12-{decoder}-arm-{args.arm.upper()}.pt"
     predictions_path = output / "val_source_predictions.jsonl"
     train_batches_template = _pack(by_partition["train"], max_padded_frames=args.max_batch_frames, max_rows=args.max_batch_rows)
     total_steps = min(args.max_steps, len(train_batches_template) * args.epochs) if args.max_steps > 0 else len(train_batches_template) * args.epochs
@@ -486,7 +539,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     if device.type == "cuda":
         reset_shared_vram_baseline(required=True)
         torch.cuda.reset_peak_memory_stats(device)
-    _write_json(progress_path, {"schema": PROGRESS_SCHEMA, "status": "running", "arm": args.arm.upper(), "seed": SEED, "step": 0, "total": total_steps, "main_loss": None, "run_loss": None, "adjacency_loss": None, "val_vocal_recall": None, "val_non_vocal_recall": None, "vocal_continuity": None, "internal_hole_count": None, "vocal_prediction_run_count": None, "complete_vocal_run_deletion_count": None, "all_vocal_source_keep_recall": None, "all_nonvocal_source_full_drop_recall": None})
+    _write_json(progress_path, {"schema": PROGRESS_SCHEMA, "status": "running", "decoder": decoder, "arm": args.arm.upper(), "seed": SEED, "step": 0, "total": total_steps, "main_loss": None, "run_loss": None, "adjacency_loss": None, "val_vocal_recall": None, "val_non_vocal_recall": None, "vocal_continuity": None, "internal_hole_count": None, "vocal_prediction_run_count": None, "complete_vocal_run_deletion_count": None, "all_vocal_source_keep_recall": None, "all_nonvocal_source_full_drop_recall": None})
     try:
         for epoch in range(1, args.epochs + 1):
             shuffled = list(by_partition["train"])
@@ -502,7 +555,9 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 optimizer.zero_grad(set_to_none=True)
                 with torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=device.type == "cuda"):
                     logits = model(batch["ptm"], batch["mfcc"], attention_mask=batch["attention"])
-                    losses = compute_vocal_envelope_losses(logits, batch["labels"], batch["owner"], arm=args.arm)
+                    losses = _losses(
+                        model, logits, batch, arm=args.arm, decoder=decoder, torch=torch
+                    )
                 losses["total_loss"].backward()
                 torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
                 optimizer.step()
@@ -512,11 +567,11 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 if step == 1 or step % args.progress_every == 0 or step == total_steps:
                     memory = _memory(torch, device, stage=f"train-step-{step}")
                     memory_log.append(memory)
-                    payload = {"schema": PROGRESS_SCHEMA, "status": "running", "arm": args.arm.upper(), "seed": SEED, "epoch": epoch, "step": step, "total": total_steps, "main_loss": epoch_losses["main_loss"] / epoch_batches, "run_loss": epoch_losses["run_loss"] / epoch_batches, "adjacency_loss": epoch_losses["adjacency_loss"] / epoch_batches, "val_vocal_recall": None if best_metrics is None else best_metrics["vocal_recall"], "val_non_vocal_recall": None if best_metrics is None else best_metrics["non_vocal_recall"], "vocal_continuity": None if best_metrics is None else best_metrics["vocal_continuity"], "internal_hole_count": None if best_metrics is None else best_metrics["internal_hole_count"], "vocal_prediction_run_count": None if best_metrics is None else best_metrics["vocal_prediction_run_count"], "complete_vocal_run_deletion_count": None if best_metrics is None else best_metrics["complete_vocal_run_deletion_count"], "all_vocal_source_keep_recall": None if best_metrics is None else best_metrics["all_vocal_source_keep_recall"], "all_nonvocal_source_full_drop_recall": None if best_metrics is None else best_metrics["all_nonvocal_source_full_drop_recall"], "memory": memory, "elapsed_s": round(time.perf_counter() - started, 3)}
+                    payload = {"schema": PROGRESS_SCHEMA, "status": "running", "decoder": decoder, "arm": args.arm.upper(), "seed": SEED, "epoch": epoch, "step": step, "total": total_steps, "main_loss": epoch_losses["main_loss"] / epoch_batches, "run_loss": epoch_losses["run_loss"] / epoch_batches, "adjacency_loss": epoch_losses["adjacency_loss"] / epoch_batches, "val_vocal_recall": None if best_metrics is None else best_metrics["vocal_recall"], "val_non_vocal_recall": None if best_metrics is None else best_metrics["non_vocal_recall"], "vocal_continuity": None if best_metrics is None else best_metrics["vocal_continuity"], "internal_hole_count": None if best_metrics is None else best_metrics["internal_hole_count"], "vocal_prediction_run_count": None if best_metrics is None else best_metrics["vocal_prediction_run_count"], "complete_vocal_run_deletion_count": None if best_metrics is None else best_metrics["complete_vocal_run_deletion_count"], "all_vocal_source_keep_recall": None if best_metrics is None else best_metrics["all_vocal_source_keep_recall"], "all_nonvocal_source_full_drop_recall": None if best_metrics is None else best_metrics["all_nonvocal_source_full_drop_recall"], "memory": memory, "elapsed_s": round(time.perf_counter() - started, 3)}
                     _write_json(progress_path, payload)
                     print(f"step={step}/{total_steps} arm={args.arm.upper()} main_loss={payload['main_loss']:.6f} run_loss={payload['run_loss']:.6f} adjacency_loss={payload['adjacency_loss']:.6f}", flush=True)
                 del batch, logits, losses, items
-            val_metrics, val_predictions = _evaluate(model, by_partition["val"], cache, torch, device, arm=args.arm, max_padded_frames=args.max_batch_frames, max_rows=args.max_batch_rows)
+            val_metrics, val_predictions = _evaluate(model, by_partition["val"], cache, torch, device, arm=args.arm, decoder=decoder, max_padded_frames=args.max_batch_frames, max_rows=args.max_batch_rows)
             key = _selection(val_metrics)
             print(f"epoch={epoch} val_vocal_recall={val_metrics['vocal_recall']:.4f} val_non_vocal_recall={val_metrics['non_vocal_recall']:.4f} vocal_continuity={val_metrics['vocal_continuity']:.4f} internal_holes={val_metrics['internal_hole_count']}", flush=True)
             if key > best_key:
@@ -528,8 +583,13 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                     "canonical_sources_sha256": str(gate["canonical_sources_sha256"]),
                     "feature_cache_gate": str(gate_path), "feature_cache_gate_sha256": _sha256(gate_path),
                     "feature_config_sha256": hashlib.sha256(json.dumps(config, sort_keys=True).encode("utf-8")).hexdigest(),
-                    "training_initialization": "random", "seed": SEED, "loss_arm": args.arm.upper(),
-                    "loss_contract": {"main_ce": 1.0, "run_balanced_ce": 0.5 if args.arm.upper() in {"B", "C"} else 0.0, "adjacency": 0.25 if args.arm.upper() == "C" else 0.0},
+                    "training_initialization": "random", "seed": SEED,
+                    "decoder_variant": decoder, "loss_arm": args.arm.upper(),
+                    "loss_contract": (
+                        {"crf_sequence_nll": 1.0, "run_balanced_emission_ce": 0.5}
+                        if decoder == "crf"
+                        else {"main_ce": 1.0, "run_balanced_ce": 0.5 if args.arm.upper() in {"B", "C"} else 0.0, "balanced_adjacency": 0.25 if args.arm.upper() == "C" else 0.0}
+                    ),
                     "best_epoch": epoch, "trained_steps": step, "val_metrics": val_metrics,
                 }
                 _atomic_torch_save(
@@ -554,13 +614,13 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             raise RuntimeError("Scorer v12 training did not produce a best checkpoint")
         payload = torch.load(checkpoint_path, map_location=device, weights_only=False)
         model.load_state_dict(payload["state_dict"], strict=True)
-        test_metrics, test_predictions = _evaluate(model, by_partition["test"], cache, torch, device, arm=args.arm, max_padded_frames=args.max_batch_frames, max_rows=args.max_batch_rows)
+        test_metrics, test_predictions = _evaluate(model, by_partition["test"], cache, torch, device, arm=args.arm, decoder=decoder, max_padded_frames=args.max_batch_frames, max_rows=args.max_batch_rows)
         test_predictions_path = output / "test_source_predictions.jsonl"
         with test_predictions_path.open("w", encoding="utf-8") as handle:
             for row in test_predictions:
                 handle.write(json.dumps(row, ensure_ascii=False, sort_keys=True) + "\n")
         numeric_gate = _numeric_gate(best_metrics)
-        summary = {"schema": SUMMARY_SCHEMA, "boundary_serialization_contract_id": CONTRACT_ID, "scorer_schema": VOCAL_ENVELOPE_SCORER_V12_SCHEMA, "arm": args.arm.upper(), "seed": SEED, "checkpoint": str(checkpoint_path), "checkpoint_sha256": _sha256(checkpoint_path), "best_epoch": best_epoch, "trained_steps": step, "val_metrics": best_metrics, "test_metrics": test_metrics, "numeric_gate_passed": numeric_gate, "manual_gate_required": True, "promotion_allowed": False, "test_ran_after_val_selection": True, "vram_safety_ratio": applied_ratio, "memory_log": memory_log, "val_source_predictions": str(predictions_path), "test_source_predictions": str(test_predictions_path)}
+        summary = {"schema": SUMMARY_SCHEMA, "boundary_serialization_contract_id": CONTRACT_ID, "scorer_schema": VOCAL_ENVELOPE_SCORER_V12_CRF_SCHEMA if decoder == "crf" else VOCAL_ENVELOPE_SCORER_V12_SCHEMA, "decoder": decoder, "arm": args.arm.upper(), "seed": SEED, "checkpoint": str(checkpoint_path), "checkpoint_sha256": _sha256(checkpoint_path), "best_epoch": best_epoch, "trained_steps": step, "val_metrics": best_metrics, "test_metrics": test_metrics, "numeric_gate_passed": numeric_gate, "manual_gate_required": True, "promotion_allowed": False, "test_ran_after_val_selection": True, "vram_safety_ratio": applied_ratio, "memory_log": memory_log, "val_source_predictions": str(predictions_path), "test_source_predictions": str(test_predictions_path)}
         _write_json(output / "summary.json", summary)
         _write_json(progress_path, {"schema": PROGRESS_SCHEMA, "status": "completed", "arm": args.arm.upper(), "seed": SEED, "step": step, "total": total_steps, "best_epoch": best_epoch, "val_vocal_recall": best_metrics["vocal_recall"], "val_non_vocal_recall": best_metrics["non_vocal_recall"], "vocal_continuity": best_metrics["vocal_continuity"], "internal_hole_count": best_metrics["internal_hole_count"], "vocal_prediction_run_count": best_metrics["vocal_prediction_run_count"], "complete_vocal_run_deletion_count": best_metrics["complete_vocal_run_deletion_count"], "all_vocal_source_keep_recall": best_metrics["all_vocal_source_keep_recall"], "all_nonvocal_source_full_drop_recall": best_metrics["all_nonvocal_source_full_drop_recall"], "numeric_gate_passed": numeric_gate, "summary": str(output / "summary.json"), "elapsed_s": round(time.perf_counter() - started, 3)})
         return summary
@@ -591,7 +651,9 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 torch.cuda.ipc_collect()
             except RuntimeError:
                 pass
-            cleanup = _memory(torch, device, stage="post-release")
+            cleanup = _memory(
+                torch, device, stage="post-release", enforce_shared_vram=False
+            )
             if progress_path.is_file():
                 progress = _read_json(progress_path); progress["post_release_memory"] = cleanup; _write_json(progress_path, progress)
             summary_path = output / "summary.json"
@@ -607,6 +669,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--training-windows", required=True)
     parser.add_argument("--output-dir", required=True)
     parser.add_argument("--arm", choices=("A", "B", "C", "a", "b", "c"), required=True)
+    parser.add_argument("--decoder", choices=("argmax", "crf"), default="argmax")
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--epochs", type=int, default=20)
     parser.add_argument("--max-steps", type=int, default=0)

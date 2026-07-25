@@ -8,15 +8,18 @@ import numpy as np
 import pytest
 
 from boundary.ja.vocal_envelope_v12 import (
+    VOCAL_ENVELOPE_SCORER_V12_CRF_SCHEMA,
     VOCAL_ENVELOPE_SCORER_V12_IGNORE_INDEX,
     VOCAL_ENVELOPE_SCORER_V12_LABELS,
     VOCAL_ENVELOPE_SCORER_V12_PREAUDIT_SCHEMA,
     VOCAL_ENVELOPE_SCORER_V12_SCHEMA,
     VOCAL_ENVELOPE_SCORER_V12_MANUAL_VERDICT_SCHEMA,
+    VocalEnvelopeScorerV12CrfNetwork,
     VocalEnvelopeScorerV12Network,
     build_vocal_envelope_scorer_v12_checkpoint,
     load_vocal_envelope_scorer_v12_checkpoint,
     score_vocal_envelope_source,
+    vocal_envelope_v12_crf_model_config,
     vocal_envelope_v12_model_config,
 )
 from tools.audits.generate_vocal_envelope_scorer_v12_teacher_audit_html import (
@@ -197,6 +200,39 @@ def test_v12_contract_is_breaking_and_runtime_is_argmax(tmp_path: Path) -> None:
     torch.save({"schema": "candidate_island_scorer_v11"}, legacy)
     with pytest.raises(ValueError, match="v11/v10 checkpoints are not compatible"):
         load_vocal_envelope_scorer_v12_checkpoint(legacy, device="cpu")
+
+
+def test_v12_crf_checkpoint_uses_exact_viterbi_runtime(tmp_path: Path) -> None:
+    import torch
+
+    config = vocal_envelope_v12_crf_model_config()
+    model = VocalEnvelopeScorerV12CrfNetwork(**config)
+    with torch.no_grad():
+        model.crf.transitions.copy_(torch.tensor([[2.0, -2.0], [-2.0, 2.0]]))
+    checkpoint = tmp_path / "v12-crf.pt"
+    torch.save(
+        build_vocal_envelope_scorer_v12_checkpoint(
+            model=model,
+            model_config=config,
+            normalization={
+                "mfcc_mean": list(config["mfcc_mean"]),
+                "mfcc_std": list(config["mfcc_std"]),
+            },
+        ),
+        checkpoint,
+    )
+    bundle = load_vocal_envelope_scorer_v12_checkpoint(checkpoint, device="cpu")
+    outputs = score_vocal_envelope_source(
+        bundle,
+        ptm=np.zeros((7, 2048), dtype=np.float32),
+        mfcc=np.zeros((7, 40), dtype=np.float32),
+    )
+    assert bundle.schema == VOCAL_ENVELOPE_SCORER_V12_CRF_SCHEMA
+    assert bundle.metadata["decision_mode"] == (
+        "learned_binary_sequence_viterbi_argmax"
+    )
+    assert outputs.probabilities.shape == (7, 2)
+    assert outputs.labels.shape == (7,)
 
 
 def test_v12_prompts_and_timestamp_quantization_are_task_specific() -> None:

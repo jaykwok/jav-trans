@@ -399,6 +399,7 @@ uv run python -m <module> --help
 - `tools.omni.audio_teacher_transport`：Qwen、OpenRouter、Google AI Studio 三个 provider Adapter 的唯一分派入口；请求与响应协议互不冒充。
 - `tools.omni.gemini_native` / `tools.omni.inspect_gemini_quota`：Google AI Studio 原生 Interactions 音频 Adapter 与无请求状态入口；实现内联音频、结构化输出、思考/usage 证据、每槽位 5 RPM / 250k TPM / 20 RPD、太平洋日界线、可读配额状态账本与多 Key 429 轮换。`uv run python -m tools.omni.inspect_gemini_quota` 不发送 API 请求，只刷新并显示脱敏状态。
 - `tools.audits.generate_candidate_island_dual_evidence_review`：Scorer Protect×Remove 与人工 full-source truth 的三轴 bridge-gap Adapter。
+- `tools.audits.record_vocal_envelope_scorer_v12_approval`：仅在用户明确完成整页审听并统一批准时，把 Scorer v12 审计页的三轴全通过裁决按 source/preaudit SHA 原子写成 `manual_verdicts.jsonl`；不会自动判断或绕过人工 gate。
 - `tools.audits.generate_candidate_island_dual_evidence_ab_review`：在两个已规范化 Scorer dual-evidence review 上复用同一 Core 的 High/Medium A/B Adapter；比较人工真语音保留、outside precision、监督覆盖与逐帧差异。
 - `tools.boundary.ja.select_candidate_island_scorer_v11_mixed_source_manifest` / `compile_candidate_island_scorer_v11_mixed_dual_evidence`：固定一 source/一 video 的真实 mixed-source Teacher manifest，并把独立 Protect/Remove 证据严格编译为 inside/outside/unsure canonical；不使用补集或标签继承。
 - `tools.boundary.ja.audit_candidate_island_scorer_v11_supervision_distribution`：Scorer v11 canonical 的逐 source 标签拓扑与真实 train↔held-out mixed 监督分布审计；只输出诊断证据，不生成训练标签。
