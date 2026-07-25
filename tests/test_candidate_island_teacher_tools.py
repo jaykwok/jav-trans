@@ -61,17 +61,19 @@ from tools.omni.timestamp_contract import TIMESTAMP_CONTRACT_ID
 
 def test_provider_base_url_normalization_and_known_profiles() -> None:
     assert normalize_openai_compat_base_url("https://openrouter.ai/api/v1/chat/completions") == "https://openrouter.ai/api/v1"
-    assert parse_args(["--manifest", "x", "--output-dir", "y"]).env_file == "gemini"
+    assert parse_args(["--manifest", "x", "--output-dir", "y"]).env_file == "openrouter"
     assert parse_args(["--manifest", "x", "--output-dir", "y", "--env-file", "qwen"]).env_file == "qwen"
-    generic_gemini = parse_generic_args(["--output-dir", "y", "--prompt", "x"])
-    assert generic_gemini.env_file == "gemini"
-    assert generic_gemini.max_tokens == 0
-    assert generic_gemini.reasoning_effort == "medium"
+    generic_openrouter = parse_generic_args(["--output-dir", "y", "--prompt", "x"])
+    assert generic_openrouter.env_file == "openrouter"
+    assert generic_openrouter.max_tokens == 0
+    assert generic_openrouter.reasoning_effort == "medium"
     assert inspect.signature(call_omni).parameters["reasoning_effort"].default == "medium"
     assert parse_generic_args(["--output-dir", "y", "--env-file", "qwen", "--prompt", "x"]).env_file == "qwen"
+    assert parse_generic_args(["--output-dir", "y", "--env-file", "gemini", "--prompt", "x"]).env_file == "gemini"
+    assert _effective_max_tokens("openrouter", 0) == 8192
     assert _effective_max_tokens("gemini", 0) == 8192
     assert _effective_max_tokens("qwen", 0) == 2048
-    assert _effective_max_tokens("gemini", 4096) == 4096
+    assert _effective_max_tokens("openrouter", 4096) == 4096
 
 
 def test_candidate_island_teacher_prompt_matches_scorer_responsibility() -> None:

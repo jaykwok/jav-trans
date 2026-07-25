@@ -44,7 +44,7 @@ DEFAULT_BASE_URL_ENV_CANDIDATES = (
     "DASHSCOPE_BASE_URL",
     "OPENAI_COMPATIBILITY_BASE_URL",
 )
-OMNI_PROVIDER_PROFILES = ("qwen", "gemini")
+OMNI_PROVIDER_PROFILES = ("qwen", "openrouter")
 GEMINI_THINKING_LEVELS = (
     "minimal",
     "low",
@@ -73,7 +73,7 @@ def audio_content_mode_for_profile(profile: str) -> str:
     try:
         return {
             "qwen": "input_audio",
-            "gemini": "input_audio_raw",
+            "openrouter": "input_audio_raw",
         }[normalized]
     except KeyError as error:
         raise ValueError(
@@ -97,7 +97,7 @@ def reasoning_extra_body_for_profile(
         if enable_thinking and thinking_budget > 0:
             result["thinking_budget"] = int(thinking_budget)
         return result
-    if normalized == "gemini":
+    if normalized == "openrouter":
         effort = (
             str(reasoning_effort or "").strip().lower()
             if enable_thinking

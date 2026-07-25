@@ -25,11 +25,10 @@ from tools.asr.cueqc.label_pre_asr_with_omni import (  # noqa: E402
     DEFAULT_API_KEY_ENV_CANDIDATES,
     DEFAULT_BASE_URL_ENV_CANDIDATES,
     GEMINI_THINKING_LEVELS,
-    audio_content_mode_for_profile,
-    call_omni,
-    first_env_value,
-    load_env_file,
-    normalize_openai_compat_base_url,
+)
+from tools.omni.audio_teacher_transport import (  # noqa: E402
+    KNOWN_AUDIO_TEACHER_PROFILES,
+    create_audio_teacher_transport,
 )
 
 
@@ -42,7 +41,7 @@ AUDIO_SUFFIXES = {".wav", ".mp3", ".m4a", ".ogg", ".flac"}
 def _effective_max_tokens(profile: str, requested: int) -> int:
     if requested > 0:
         return int(requested)
-    return 8192 if profile == "gemini" else 2048
+    return 8192 if profile in {"openrouter", "gemini"} else 2048
 
 
 def _sha256(path: Path) -> str:
@@ -100,27 +99,30 @@ def _audio_rows(args: argparse.Namespace) -> list[dict[str, Any]]:
 
 def run(args: argparse.Namespace) -> dict[str, Any]:
     env_file = _resolve_env(args)
-    load_env_file(env_file)
+    profile = env_file.name.lower()
     model_env = tuple(value for value in args.model_env.split(",") if value)
     key_env = tuple(value for value in args.api_key_env.split(",") if value)
     base_env = tuple(value for value in args.base_url_env.split(",") if value)
-    _model_name, configured_model = first_env_value(model_env)
-    model = args.model or configured_model
-    _key_name, api_key = first_env_value(key_env)
-    _base_name, raw_base_url = first_env_value(base_env)
-    base_url = normalize_openai_compat_base_url(raw_base_url)
-    if not model or not api_key:
-        raise RuntimeError("model and API key are required")
+    transport = create_audio_teacher_transport(
+        profile=profile,
+        env_file=env_file,
+        model_override=str(args.model or ""),
+        timeout_s=float(args.timeout_s),
+        log=lambda message: print(message, flush=True),
+        model_env=model_env,
+        api_key_env=key_env,
+        base_url_env=base_env,
+    )
+    model = transport.model
     rows = _audio_rows(args)
     output = Path(args.output_dir).expanduser().resolve()
     output.mkdir(parents=True, exist_ok=True)
     result_path = output / "results.jsonl"
     raw_path = output / "raw_responses.jsonl"
     progress_path = output / "progress.json"
-    profile = env_file.name.lower()
     reasoning_effort = (
         str(args.reasoning_effort).lower() if args.enable_thinking else "none"
-    ) if profile == "gemini" else ""
+    ) if profile in {"openrouter", "gemini"} else ""
     effective_thinking_budget = (
         int(args.thinking_budget) if profile == "qwen" else 0
     )
@@ -139,7 +141,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     pending = [row for row in rows if row["item_id"] not in existing]
     if args.limit > 0:
         pending = pending[: args.limit]
-    mode = audio_content_mode_for_profile(profile)
+    mode = transport.audio_content_mode
     prompt = args.prompt
     if args.prompt_file:
         prompt = Path(args.prompt_file).read_text(encoding="utf-8-sig")
@@ -156,8 +158,21 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             request_started = time.perf_counter()
             print(f"omni_request={len(existing)+1}/{len(rows)} provider={profile} item={row['item_id']} attempt={attempt}/{args.max_attempts}", flush=True)
             try:
-                parsed, raw = call_omni(audio_path=Path(row["audio"]), fmt=Path(row["audio"]).suffix.lstrip(".") or "wav", audio_content_mode=mode, model=model, api_key=api_key, base_url=base_url, timeout_s=args.timeout_s, store_stream_chunks=args.store_stream_chunks, prompt=prompt, system_prompt=system_prompt, max_tokens=effective_max_tokens, enable_thinking=args.enable_thinking, thinking_budget=args.thinking_budget, provider_profile=profile, reasoning_effort=reasoning_effort)
-                result = {"schema": RESULT_SCHEMA, "item_id": row["item_id"], "audio": row["audio"], "audio_sha256": row["audio_sha256"], "model": model, "profile": profile, "audio_content_mode": mode, "reasoning_effort": reasoning_effort, "enable_thinking": bool(args.enable_thinking), "thinking_budget": effective_thinking_budget, "max_tokens": effective_max_tokens, "response": parsed, "created_at": time.strftime("%Y-%m-%dT%H:%M:%S%z")}
+                response = transport.call_json(
+                    audio_path=Path(row["audio"]),
+                    system_prompt=system_prompt,
+                    prompt=prompt,
+                    response_schema=None,
+                    enable_thinking=bool(args.enable_thinking),
+                    thinking_level=(
+                        reasoning_effort if reasoning_effort != "none" else "minimal"
+                    ),
+                    thinking_budget=int(args.thinking_budget),
+                    max_tokens=effective_max_tokens,
+                    store_stream_chunks=bool(args.store_stream_chunks),
+                )
+                parsed, raw = response.parsed, response.raw
+                result = {"schema": RESULT_SCHEMA, "item_id": row["item_id"], "audio": row["audio"], "audio_sha256": row["audio_sha256"], "model": model, "profile": profile, "transport": transport.transport_name, "audio_content_mode": mode, "reasoning_effort": reasoning_effort, "enable_thinking": bool(args.enable_thinking), "thinking_budget": effective_thinking_budget, "max_tokens": effective_max_tokens, "response": parsed, "created_at": time.strftime("%Y-%m-%dT%H:%M:%S%z")}
                 with result_path.open("a", encoding="utf-8") as handle:
                     handle.write(json.dumps(result, ensure_ascii=False, sort_keys=True) + "\n")
                 with raw_path.open("a", encoding="utf-8") as handle:
@@ -183,7 +198,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             raise RuntimeError(f"teacher failed for {row['item_id']}: {last_error}") from last_error
         if position < len(pending) and args.request_interval_s > 0:
             time.sleep(args.request_interval_s)
-    summary = {"schema": SUMMARY_SCHEMA, "profile": profile, "model": model, "audio_content_mode": mode, "reasoning_effort": reasoning_effort, "enable_thinking": bool(args.enable_thinking), "thinking_budget": effective_thinking_budget, "max_tokens": effective_max_tokens, "omitted_sampling_parameters": ["temperature", "top_p", "top_k"], "source_count": len(rows), "result_count": len(existing), "results": str(result_path), "raw_responses": str(raw_path), "training_manifest_allowed": False}
+    summary = {"schema": SUMMARY_SCHEMA, "profile": profile, "model": model, "transport": transport.transport_name, "api_key_count": transport.api_key_count, "audio_content_mode": mode, "reasoning_effort": reasoning_effort, "enable_thinking": bool(args.enable_thinking), "thinking_budget": effective_thinking_budget, "max_tokens": effective_max_tokens, "omitted_sampling_parameters": ["temperature", "top_p", "top_k"], "source_count": len(rows), "result_count": len(existing), "results": str(result_path), "raw_responses": str(raw_path), "training_manifest_allowed": False}
     (output / "summary.json").write_text(json.dumps(summary, ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     _write_progress(progress_path, {"schema": PROGRESS_SCHEMA, "status": "completed", "profile": profile, "model": model, "audio_content_mode": mode, "completed": len(existing), "total": len(rows), "pending": 0, "elapsed_s": round(time.perf_counter()-started, 3), "summary": str(output / "summary.json")})
     return summary
@@ -193,9 +208,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--env-file",
-        default="gemini",
-        choices=("qwen", "gemini"),
-        help="Named ~/.config/omni profile. Gemini is the default; use qwen explicitly.",
+        default="openrouter",
+        choices=KNOWN_AUDIO_TEACHER_PROFILES,
+        help="Named profile: qwen/openrouter use compatible APIs; gemini uses Google AI Studio.",
     )
     parser.add_argument("--model", default="")
     parser.add_argument("--model-env", default="OMNI_MODEL,QWEN_OMNI_MODEL")
@@ -216,14 +231,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--max-tokens",
         type=int,
         default=0,
-        help="0 selects Gemini=8192 or Qwen=2048.",
+        help="0 selects OpenRouter/Gemini=8192 or Qwen=2048.",
     )
     parser.add_argument("--thinking-budget", type=int, default=1024)
     parser.add_argument(
         "--reasoning-effort",
         choices=GEMINI_THINKING_LEVELS,
         default="medium",
-        help="Gemini/OpenRouter only; Qwen uses --thinking-budget.",
+        help="OpenRouter/native Gemini thinking level; Qwen uses --thinking-budget.",
     )
     parser.add_argument("--enable-thinking", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--store-stream-chunks", action=argparse.BooleanOptionalAction, default=False)

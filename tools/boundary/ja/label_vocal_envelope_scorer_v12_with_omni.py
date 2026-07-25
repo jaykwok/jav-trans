@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
-"""Create Scorer v12 dual-evidence vocal-envelope preaudit labels.
+"""Create Scorer v12 single-pass tri-state vocal-envelope preaudit labels.
 
-Protect and Non-vocal are independent Gemini calls.  The result is reviewable
-evidence only; a separate canonical compiler is required before training.
+One Gemini call labels vocal-envelope, definite non-vocal, and unsure regions
+together.  OpenRouter and Google AI Studio use isolated transports.  The result
+remains review-only evidence until a separate canonical compiler binds a
+complete human audit.
 """
 from __future__ import annotations
 
@@ -26,69 +28,129 @@ from boundary.ja.vocal_envelope_v12 import (  # noqa: E402
     VOCAL_ENVELOPE_SCORER_V12_IGNORE_INDEX,
     VOCAL_ENVELOPE_SCORER_V12_PREAUDIT_SCHEMA,
 )
-from tools.asr.cueqc.label_pre_asr_with_omni import (  # noqa: E402
-    DEFAULT_API_KEY_ENV_CANDIDATES,
-    DEFAULT_BASE_URL_ENV_CANDIDATES,
-    GEMINI_THINKING_LEVELS,
-    audio_content_mode_for_profile,
-    call_omni,
-    first_env_value,
-    load_env_file,
-    normalize_openai_compat_base_url,
-)
 from tools.omni.timestamp_contract import (  # noqa: E402
     TIMESTAMP_CONTRACT_ID,
     TIMESTAMP_PROMPT_CONTRACT_ZH,
     parse_mmss_span,
+    parse_mmss_timestamp,
     timestamp_request_contract,
+)
+from tools.omni.audio_teacher_transport import (  # noqa: E402
+    OPENROUTER_GEMINI_EXECUTION_CONTRACT,
+    AudioTeacherTransport,
+    create_audio_teacher_transport,
+)
+from tools.omni.gemini_native import (  # noqa: E402
+    GEMINI_NATIVE_EXECUTION_CONTRACT,
+    GEMINI_NATIVE_MODEL,
 )
 
 
 FRAME_HOP_S = 0.02
 CONTRACT_ID = "boundary_acoustic_binary_v12"
-SUMMARY_SCHEMA = "vocal_envelope_scorer_v12_dual_evidence_summary_v1"
-PROGRESS_SCHEMA = "vocal_envelope_scorer_v12_dual_evidence_progress_v1"
-PROMPT_PROFILE = "vocal-envelope-protect-nonvocal-v2"
-PROTECT_PROMPT_VERSION = "vocal-envelope-protect-v2-human-vocal-event-gemini36-medium-mmss"
-NONVOCAL_PROMPT_VERSION = "vocal-envelope-nonvocal-v2-zero-human-vocal-gemini36-medium-mmss"
-PROMPT_VERSION = f"{PROTECT_PROMPT_VERSION}__{NONVOCAL_PROMPT_VERSION}"
-EXPECTED_MODEL = "google/gemini-3.6-flash"
-EXPECTED_PROFILE = "gemini"
+SUMMARY_SCHEMA = "vocal_envelope_scorer_v12_single_pass_tristate_summary_v2"
+PROGRESS_SCHEMA = "vocal_envelope_scorer_v12_single_pass_tristate_progress_v2"
+PROMPT_PROFILE = "vocal-envelope-single-pass-tristate-v3"
+PROMPT_VERSION = "vocal-envelope-single-pass-tristate-v3-scorer-duty-gemini36-medium-mmss"
 EXPECTED_REASONING = "medium"
 EXPECTED_MAX_TOKENS = 8192
-EXPECTED_EXECUTION_CONTRACT = "gemini_openrouter_reasoning_require_parameters_v1"
+PROVIDER_CONTRACTS: dict[str, dict[str, str]] = {
+    "openrouter": {
+        "model": "google/gemini-3.6-flash",
+        "execution_contract": OPENROUTER_GEMINI_EXECUTION_CONTRACT,
+        "transport": "openai_compatible_input_audio",
+    },
+    "gemini": {
+        "model": GEMINI_NATIVE_MODEL,
+        "execution_contract": GEMINI_NATIVE_EXECUTION_CONTRACT,
+        "transport": "google_ai_interactions_inline_audio",
+    },
+}
 
 
-PROTECT_SYSTEM_PROMPT = """你是 1.7B Scorer v12 的 Human Vocal Event Envelope 保护通道预审 teacher。
-音频主要来自日语 JAV、Galgame 或类似场景，但场景和声音类别不能直接决定标签。
+TRISTATE_SYSTEM_PROMPT = """你是 1.7B Scorer v12 的 Human Vocal Event Envelope 单次三态预审 teacher。
+音频主要来自日语 JAV、Galgame 或类似场景，但场景、亲密互动、声音强度和声音来源本身都不能直接决定标签。
 
-你的唯一任务是找出所有“由人类声道、口腔或呼吸系统产生”的连续发声事件包络，输出 vocal_spans。这是人类发声/非发声二分类，不是语义判断、字幕价值判断或 ASR 可识别性判断。
+【Scorer 在真实工作流中的职责】
+Scorer 是任何下游模型运行前的第一层，只负责生成高召回、连续的人类发声事件候选包络。它不判断语义、不判断字幕价值、不转写、不切句、不区分说话人，也不负责删除呻吟或喘息。后续 Proposal/Split 负责隔离独立事件，CueQC 负责语义 keep/drop，Inner 只裁最终 keep 岛首尾。因此不要把 Split、CueQC 或 Inner 的职责提前强加给 Scorer。
 
-以下无论有无词义都属于 vocal：清晰或含混对白、耳语、气声、呻吟、喘息、吸气、呼气、叹气、哭、笑、咳嗽、喷嚏、清嗓、抽鼻、亲吻/唾液/其他口腔声、歌唱、远处或背景人声。像「あ、ん、はぁ」的声音无论是词语、应答还是纯呻吟，在本任务中都同样属于 vocal。不要因为它“没有语义”“不值得翻译”或 ASR 识别不出而删除。
+你必须对当前完整 source 输出一个按时间排序、无重叠、无缺口并覆盖完整音频的 segments 数组。每段只能使用以下三种标签之一：
 
-正类单位是连续的人类发声事件包络，不是严格逐帧 VAD。一次连续发声事件内部的短停顿、吸气、释气、弱尾音和非语义过渡应随包络保留；不要按音节、字、每次喘息脉冲或极短能量谷切碎。若前后属于同一连续发声事件，应输出一个完整包络；若中间是声学上独立的纯非发声区域，则分成两个事件，不要无限跨背景合并。不得使用固定时长阈值判断。
+1. vocal_candidate：存在任何由人类声道、口腔或呼吸系统产生的发声证据，或非发声声音与疑似人声重叠。包括清晰或含混对白、耳语、气声、呻吟、喘息、吸气、呼气、叹气、哭、笑、咳嗽、喷嚏、清嗓、抽鼻、亲吻/唾液/口腔声、歌唱、远处或背景人声。像「あ、ん、はぁ」无论是词语、应答还是纯呻吟都属于 vocal。ASR 是否能识别、是否有翻译价值均无关。
 
-不要标记纯机械、撞击、衣物/床体、水声、纯器乐、静音和环境噪声；这些留给 Non-vocal 通道。但只要上述声音中叠有任何疑似人类发声，重叠部分必须保护为 vocal。
-边界覆盖完整起始、词头/气声、衰减和尾音，不要为了贴声学起点而截断。无法判断是否有人类发声时，优先保护；只有完全没有可定位证据时才省略，不要凭场景猜测。
-只输出当前完整 source 的 0-based vocal_spans JSON 数组，不转写、不判断语义、不标注 non_vocal_spans。
+2. non_vocal_candidate：有较高把握确认完全没有任何人类发声的纯非发声区间。包括纯机械、肉体撞击或拍打、动作声、衣物摩擦、床体震动、水声、纯器乐、静音、底噪、风扇空调、电流、交通和环境噪声。肉体撞击由人体动作产生也不等于人声，不能以“来自人体”为理由标成 vocal；但只要撞击、床体、水声或音乐下叠有任何疑似呻吟、呼吸或对白，重叠区就不能标 non_vocal。
 
-输出对象：{"source_id":"...","vocal_spans":[{"start_ts":"00:00.000","end_ts":"00:01.000","reason":"简短声学理由"}],"overall_reason":"..."}
-""" + "\n" + TIMESTAMP_PROMPT_CONTRACT_ZH
+3. unsure：无法可靠确认是否叠有人声、边界无法安全定位，或 vocal 与 non-vocal 证据不可分离。不要猜测；unsure 在训练中会被忽略。
 
-NONVOCAL_SYSTEM_PROMPT = """你是 1.7B Scorer v12 的 Human Vocal Event Envelope 非发声通道预审 teacher。
-音频主要来自日语 JAV、Galgame 或类似场景，但场景和声音类别不能直接决定标签。
+【发声事件包络规则】
+正类单位是连续的人类发声事件包络，不是逐音节 VAD。一次连续发声事件内部的短停顿、吸气、释气、弱尾音和非语义过渡应随包络保留；不要按字、音节、每次喘息脉冲或极短能量谷切碎。纯撞击声本身不是 vocal 证据：若它形成声学上独立且可安全分离的纯非发声区间，标 non_vocal；若它与人声重叠，标 vocal；若只是短暂嵌入且无法安全独立切开，标 unsure。不要跨越声学上独立的长纯非发声区域合并两个事件，也不得使用固定时长阈值。
 
-你的唯一任务是找出“明确不含任何人类声道、口腔或呼吸发声”的连续 non-vocal 区间，输出 non_vocal_spans。
-允许：纯机械、碰撞、衣物/床体、动作、水声、纯音乐、静音、底噪、风扇空调、电流和其他环境噪声。
-只要存在对白、耳语、气声、呻吟、喘息、吸气、呼气、叹气、哭笑、咳嗽、喷嚏、清嗓、抽鼻、亲吻/唾液/口腔声、歌唱或远处/背景人声的合理声学证据，就不要标记 non-vocal。非语义呻吟和呼吸仍是人类发声，绝对不能因为“不值得翻译”而放入 non-vocal。
-动作声、撞击声、水声、音乐或噪声占主导也不能覆盖其下叠加的弱人声；应缩小或拆开区间，只输出真正零人类发声的内部部分。
-不要把短时长、低响度、ASR 无结果或缺少词义当成 non-vocal 证据。不要切分人类发声，不判断语义，不使用固定时长阈值。
-边界必须与任何可能人声的起始、尾音和呼吸清晰分离；不确定就省略，允许输出空数组。
+【边界与完整覆盖】
+- 第一段必须从 00:00.000 开始，最后一段必须精确结束于请求给出的 duration_ts。
+- 相邻段必须首尾严格相接；不得重叠或留空白；相邻同标签必须合并。
+- 覆盖完整词头、气声、衰减和尾音。混合区优先保护 vocal，真正无法判断才用 unsure。
+- 不要产生短到无法对应一个 20ms Scorer 帧的区间；这是坐标分辨率要求，不是声音类别的时长规则。
 
-输出对象：{"source_id":"...","non_vocal_spans":[{"start_ts":"00:00.000","end_ts":"00:01.000","category":"mechanical|impact|cloth|bed|water|music|silence|ambience|other","reason":"简短声学理由"}],"overall_reason":"..."}
+只输出 JSON，不要输出 Markdown、解释或额外文字：
+{"source_id":"...","segments":[{"start_ts":"00:00.000","end_ts":"00:01.000","label":"vocal_candidate|non_vocal_candidate|unsure","category":"vocal|mixed_vocal|mechanical|impact|cloth|bed|water|music|silence|ambience|other|uncertain","reason":"简短声学理由"}],"overall_reason":"..."}
 """ + "\n" + TIMESTAMP_PROMPT_CONTRACT_ZH
 
 NONVOCAL_CATEGORIES = frozenset({"mechanical", "impact", "cloth", "bed", "water", "music", "silence", "ambience", "other"})
+SEGMENT_LABELS = frozenset(
+    {"vocal_candidate", "non_vocal_candidate", "unsure"}
+)
+
+TRISTATE_RESPONSE_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "source_id": {"type": "string"},
+        "segments": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "start_ts": {"type": "string"},
+                    "end_ts": {"type": "string"},
+                    "label": {
+                        "type": "string",
+                        "enum": [
+                            "vocal_candidate",
+                            "non_vocal_candidate",
+                            "unsure",
+                        ],
+                    },
+                    "category": {
+                        "type": "string",
+                        "enum": [
+                            "vocal",
+                            "mixed_vocal",
+                            "mechanical",
+                            "impact",
+                            "cloth",
+                            "bed",
+                            "water",
+                            "music",
+                            "silence",
+                            "ambience",
+                            "other",
+                            "uncertain",
+                        ],
+                    },
+                    "reason": {"type": "string"},
+                },
+                "required": [
+                    "start_ts",
+                    "end_ts",
+                    "label",
+                    "category",
+                    "reason",
+                ],
+            },
+        },
+        "overall_reason": {"type": "string"},
+    },
+    "required": ["source_id", "segments", "overall_reason"],
+}
 
 
 def _rows(path: Path) -> list[dict[str, Any]]:
@@ -145,110 +207,124 @@ def _frame_count(row: Mapping[str, Any], duration_s: float) -> int:
     return frame_count
 
 
-def _normalize_spans(parsed: Mapping[str, Any], *, field: str, duration_s: float, frame_count: int) -> list[dict[str, Any]]:
-    raw = parsed.get(field)
-    if raw is None:
-        raise ValueError(f"teacher response must contain {field}")
-    if not isinstance(raw, list):
-        raise ValueError(f"teacher response {field} must be an array")
-    result: list[dict[str, Any]] = []
-    previous_end = 0
+def _boundary_frame(
+    *, left_label: str, right_label: str, boundary_s: float, frame_count: int
+) -> int:
+    scaled = boundary_s / FRAME_HOP_S
+    if left_label == "vocal_candidate":
+        value = math.ceil(scaled - 1e-9)
+    elif right_label == "vocal_candidate":
+        value = math.floor(scaled + 1e-9)
+    elif left_label == "non_vocal_candidate":
+        value = math.floor(scaled + 1e-9)
+    elif right_label == "non_vocal_candidate":
+        value = math.ceil(scaled - 1e-9)
+    else:
+        value = round(scaled)
+    return max(0, min(frame_count, int(value)))
+
+
+def _normalize_segments(
+    parsed: Mapping[str, Any], *, duration_s: float, frame_count: int
+) -> dict[str, list[dict[str, Any]]]:
+    raw = parsed.get("segments")
+    if not isinstance(raw, list) or not raw:
+        raise ValueError("teacher response segments must be a non-empty array")
+    advertised = timestamp_request_contract(duration_s)["duration_ts"]
+    advertised_end = parse_mmss_timestamp(
+        advertised,
+        field="duration_ts",
+        duration_s=duration_s,
+    )
+    parsed_segments: list[dict[str, Any]] = []
+    previous_end = 0.0
+    previous_label = ""
     for index, item in enumerate(raw):
         if not isinstance(item, Mapping):
-            raise ValueError(f"{field}[{index}] must be an object")
-        start, end = parse_mmss_span(item, field=f"{field}[{index}]", duration_s=duration_s)
+            raise ValueError(f"segments[{index}] must be an object")
+        label = str(item.get("label") or "")
+        if label not in SEGMENT_LABELS:
+            raise ValueError(f"segments[{index}] has unsupported label: {label!r}")
+        start, end = parse_mmss_span(
+            item,
+            field=f"segments[{index}]",
+            duration_s=duration_s,
+        )
         assert start is not None and end is not None
-        if field == "vocal_spans":
-            # Protect evidence expands to the containing frame so a vocal edge
-            # is never lost merely because the wire timestamp is off-grid.
-            start_frame = max(0, int(math.floor(start / FRAME_HOP_S + 1e-9)))
-            end_frame = min(frame_count, int(math.ceil(end / FRAME_HOP_S - 1e-9)))
-        else:
-            # Non-vocal evidence contracts to fully-contained frames.  This is
-            # label quantization, not runtime smoothing or boundary repair.
-            start_frame = max(0, int(math.ceil(start / FRAME_HOP_S - 1e-9)))
-            end_frame = min(frame_count, int(math.floor(end / FRAME_HOP_S + 1e-9)))
-        if start_frame < previous_end or start_frame < 0 or end_frame <= start_frame or end_frame > frame_count:
-            raise ValueError(f"{field}[{index}] has invalid/overlapping frame coordinates")
-        previous_end = end_frame
-        normalized = {
+        if index == 0 and abs(start) > 0.0005:
+            raise ValueError("single-pass segments must start at 00:00.000")
+        if index > 0 and abs(start - previous_end) > 0.0005:
+            raise ValueError("single-pass segments must be contiguous without gaps")
+        if label == previous_label:
+            raise ValueError("adjacent single-pass segments with the same label must merge")
+        category = str(item.get("category") or "other")
+        if label == "non_vocal_candidate" and category not in NONVOCAL_CATEGORIES:
+            raise ValueError(f"unsupported non-vocal category: {category}")
+        parsed_segments.append(
+            {
+                "label": label,
+                "start_wire_s": start,
+                "end_wire_s": end,
+                "category": category,
+                "reason": str(item.get("reason") or ""),
+            }
+        )
+        previous_end = end
+        previous_label = label
+    if abs(previous_end - advertised_end) > 0.0005:
+        raise ValueError(
+            "single-pass segments must end exactly at advertised duration_ts"
+        )
+
+    boundaries = [0]
+    for index in range(1, len(parsed_segments)):
+        boundaries.append(
+            _boundary_frame(
+                left_label=str(parsed_segments[index - 1]["label"]),
+                right_label=str(parsed_segments[index]["label"]),
+                boundary_s=float(parsed_segments[index]["start_wire_s"]),
+                frame_count=frame_count,
+            )
+        )
+    boundaries.append(frame_count)
+    output: dict[str, list[dict[str, Any]]] = {
+        "vocal_spans": [],
+        "non_vocal_spans": [],
+        "unsure_spans": [],
+        "conflict_spans": [],
+    }
+    output_key = {
+        "vocal_candidate": "vocal_spans",
+        "non_vocal_candidate": "non_vocal_spans",
+        "unsure": "unsure_spans",
+    }
+    for index, item in enumerate(parsed_segments):
+        start_frame, end_frame = boundaries[index], boundaries[index + 1]
+        if end_frame <= start_frame:
+            raise ValueError(
+                f"segments[{index}] is shorter than the 20ms frame resolution"
+            )
+        span = {
+            "label": item["label"],
             "start_frame": start_frame,
             "end_frame": end_frame,
             "start_s": round(start_frame * FRAME_HOP_S, 6),
             "end_s": round(end_frame * FRAME_HOP_S, 6),
-            "reason": str(item.get("reason") or ""),
+            "reason": item["reason"],
         }
-        if field == "non_vocal_spans":
-            category = str(item.get("category") or "other")
-            if category not in NONVOCAL_CATEGORIES:
-                raise ValueError(f"unsupported non-vocal category: {category}")
-            normalized["category"] = category
-        result.append(normalized)
-    return result
-
-
-def _state_runs(protect: list[bool], nonvocal: list[bool], frame_count: int) -> dict[str, list[dict[str, Any]]]:
-    states: list[str] = []
-    for p, n in zip(protect, nonvocal, strict=True):
-        states.append(
-            "vocal"
-            if p and not n
-            else "non_vocal"
-            if n and not p
-            else "conflict"
-            if p and n
-            else "unsure"
-        )
-    output: dict[str, list[dict[str, Any]]] = {"vocal_spans": [], "non_vocal_spans": [], "unsure_spans": [], "conflict_spans": []}
-    start = 0
-    for index in range(1, frame_count + 1):
-        if index < frame_count and states[index] == states[start]:
-            continue
-        state = states[start]
-        span = {
-            "start_frame": start,
-            "end_frame": index,
-            "start_s": round(start * FRAME_HOP_S, 6),
-            "end_s": round(index * FRAME_HOP_S, 6),
-            "label": "vocal_candidate" if state == "vocal" else "non_vocal_candidate" if state == "non_vocal" else "unsure",
-        }
-        if state == "vocal":
-            output["vocal_spans"].append(span)
-        elif state == "non_vocal":
-            output["non_vocal_spans"].append(span)
-        else:
-            output["unsure_spans"].append(span)
-            if state == "conflict":
-                output["conflict_spans"].append(span)
-        start = index
+        if item["label"] == "non_vocal_candidate":
+            span["category"] = item["category"]
+        output[output_key[str(item["label"])]].append(span)
     return output
 
 
-def merge_dual_evidence(*, vocal_spans: list[Mapping[str, Any]], non_vocal_spans: list[Mapping[str, Any]], frame_count: int) -> dict[str, list[dict[str, Any]]]:
-    if frame_count <= 0:
-        raise ValueError("v12 dual evidence requires positive frame_count")
-    protect = [False] * frame_count
-    nonvocal = [False] * frame_count
-    for span in vocal_spans:
-        start, end = int(span["start_frame"]), int(span["end_frame"])
-        if not (0 <= start < end <= frame_count):
-            raise ValueError("vocal evidence is out of bounds")
-        for index in range(start, end):
-            protect[index] = True
-    for span in non_vocal_spans:
-        start, end = int(span["start_frame"]), int(span["end_frame"])
-        if not (0 <= start < end <= frame_count):
-            raise ValueError("non-vocal evidence is out of bounds")
-        for index in range(start, end):
-            nonvocal[index] = True
-    return _state_runs(protect, nonvocal, frame_count)
-
-
-def _request_prompt(row: Mapping[str, Any], *, pass_name: str, feedback: str = "") -> str:
+def _request_prompt(row: Mapping[str, Any], *, feedback: str = "") -> str:
     payload = {
         "source_id": str(row["source_id"]),
         **timestamp_request_contract(float(row["duration_s"])),
-        "task": "vocal_event_envelope" if pass_name == "protect" else "non_vocal_only",
+        "task": "vocal_event_envelope_single_pass_tristate",
+        "labels": ["vocal_candidate", "non_vocal_candidate", "unsure"],
+        "coverage": "complete_contiguous_source_timeline",
     }
     if feedback:
         payload["previous_validation_error"] = feedback
@@ -299,64 +375,55 @@ def _validate_manifest(rows: list[dict[str, Any]], *, manifest: Path) -> list[di
     return result
 
 
-def _load_env(profile: str) -> tuple[str, str, str]:
-    env_file = (Path.home() / ".config" / "omni" / profile).resolve()
-    load_env_file(env_file)
-    _, model = first_env_value(("OMNI_MODEL", "QWEN_OMNI_MODEL"))
-    _, key = first_env_value(DEFAULT_API_KEY_ENV_CANDIDATES)
-    _, base = first_env_value(DEFAULT_BASE_URL_ENV_CANDIDATES)
-    if not model or not key:
-        raise RuntimeError("Gemini model and API key are required")
-    return model, key, normalize_openai_compat_base_url(base)
-
-
-def _call_pass(*, row: Mapping[str, Any], pass_name: str, model: str, api_key: str, base_url: str, args: argparse.Namespace) -> tuple[dict[str, Any], dict[str, Any]]:
-    system_prompt = PROTECT_SYSTEM_PROMPT if pass_name == "protect" else NONVOCAL_SYSTEM_PROMPT
-    expected_field = "vocal_spans" if pass_name == "protect" else "non_vocal_spans"
+def _call_teacher(
+    *,
+    row: Mapping[str, Any],
+    transport: AudioTeacherTransport,
+    args: argparse.Namespace,
+) -> tuple[dict[str, Any], dict[str, Any], dict[str, list[dict[str, Any]]]]:
     audio = Path(str(row["audio"]))
     last_error: Exception | None = None
     for attempt in range(1, int(args.max_attempts) + 1):
         try:
-            parsed, raw = call_omni(
+            prompt = _request_prompt(
+                row,
+                feedback="" if last_error is None else str(last_error),
+            )
+            response = transport.call_json(
                 audio_path=audio,
-                fmt=audio.suffix.lstrip(".") or "wav",
-                audio_content_mode=audio_content_mode_for_profile("gemini"),
-                model=model,
-                api_key=api_key,
-                base_url=base_url,
-                timeout_s=float(args.timeout_s),
-                store_stream_chunks=False,
-                prompt=_request_prompt(
-                    row,
-                    pass_name=pass_name,
-                    feedback="" if last_error is None else str(last_error),
-                ),
-                system_prompt=system_prompt,
+                prompt=prompt,
+                system_prompt=TRISTATE_SYSTEM_PROMPT,
                 max_tokens=EXPECTED_MAX_TOKENS,
                 enable_thinking=True,
+                thinking_level=EXPECTED_REASONING,
                 thinking_budget=0,
-                provider_profile="gemini",
-                reasoning_effort="medium",
-                exclude_reasoning=False,
+                response_schema=TRISTATE_RESPONSE_SCHEMA,
+                store_stream_chunks=False,
                 require_provider_parameters=True,
-                response_format={"type": "json_object"},
             )
+            parsed, raw = response.parsed, response.raw
             if str(parsed.get("source_id") or "") != str(row["source_id"]):
                 raise ValueError("teacher source_id mismatch")
-            normalized = _normalize_spans(parsed, field=expected_field, duration_s=float(row["duration_s"]), frame_count=int(row["frame_count"]))
-            parsed = dict(parsed)
-            parsed[expected_field] = normalized
-            return parsed, raw
+            normalized = _normalize_segments(
+                parsed,
+                duration_s=float(row["duration_s"]),
+                frame_count=int(row["frame_count"]),
+            )
+            return dict(parsed), raw, normalized
         except Exception as error:  # noqa: BLE001
             last_error = error
             if attempt < int(args.max_attempts):
                 time.sleep(min(8.0, float(attempt)))
-    raise RuntimeError(f"v12 {pass_name} teacher failed for {row['source_id']}: {last_error}") from last_error
+    raise RuntimeError(
+        f"v12 single-pass teacher failed for {row['source_id']}: {last_error}"
+    ) from last_error
 
 
 def run(args: argparse.Namespace) -> dict[str, Any]:
-    if args.env_file != "gemini":
-        raise ValueError("Scorer v12 teacher is Gemini-only; Qwen must not be used")
+    profile = str(args.env_file)
+    if profile not in PROVIDER_CONTRACTS:
+        raise ValueError("Scorer v12 teacher only supports openrouter or gemini")
+    provider_contract = PROVIDER_CONTRACTS[profile]
     manifest = Path(args.manifest).expanduser().resolve()
     manifest_sha = _sha256(manifest)
     rows = _validate_manifest(_rows(manifest), manifest=manifest)
@@ -369,11 +436,22 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         rows = [index[value] for value in wanted]
     if args.limit > 0:
         rows = rows[: int(args.limit)]
-    model, api_key, base_url = _load_env("gemini")
-    if args.model:
-        model = args.model
-    if model != EXPECTED_MODEL:
-        raise ValueError(f"Scorer v12 requires {EXPECTED_MODEL}, got {model}")
+    transport = create_audio_teacher_transport(
+        profile=profile,
+        env_file=(Path.home() / ".config" / "omni" / profile).resolve(),
+        model_override=str(args.model or ""),
+        timeout_s=float(args.timeout_s),
+        log=lambda message: print(message, flush=True),
+    )
+    model = transport.model
+    expected_model = provider_contract["model"]
+    if model != expected_model:
+        raise ValueError(
+            f"Scorer v12 {profile} profile requires {expected_model}, got {model}"
+        )
+    execution_contract = provider_contract["execution_contract"]
+    if transport.execution_contract != execution_contract:
+        raise ValueError("Scorer v12 provider execution contract mismatch")
     output = Path(args.output_dir).expanduser().resolve()
     output.mkdir(parents=True, exist_ok=True)
     labels_path = output / "preaudit.jsonl"
@@ -392,12 +470,13 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 "schema": VOCAL_ENVELOPE_SCORER_V12_PREAUDIT_SCHEMA,
                 "boundary_serialization_contract_id": CONTRACT_ID,
                 "model": model,
-                "provider_profile": EXPECTED_PROFILE,
+                "provider_profile": profile,
+                "env_file_name": profile,
                 "reasoning_effort": EXPECTED_REASONING,
                 "max_tokens": EXPECTED_MAX_TOKENS,
                 "prompt_version": PROMPT_VERSION,
                 "teacher_timestamp_contract_id": TIMESTAMP_CONTRACT_ID,
-                "teacher_execution_contract_id": EXPECTED_EXECUTION_CONTRACT,
+                "teacher_execution_contract_id": execution_contract,
                 "source_manifest_sha256": manifest_sha,
                 "partition": current["partition"],
                 "audio_sha256": current["audio_sha256"],
@@ -412,13 +491,18 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             existing[source_id] = saved
     pending = [row for row in rows if row["source_id"] not in existing]
     started = time.perf_counter()
-    _write_progress(progress_path, {"schema": PROGRESS_SCHEMA, "status": "running", "model": model, "reasoning_effort": "medium", "max_tokens": EXPECTED_MAX_TOKENS, "completed": len(existing), "total": len(rows), "pending": len(pending)})
+    _write_progress(progress_path, {"schema": PROGRESS_SCHEMA, "status": "running", "model": model, "provider_profile": profile, "reasoning_effort": "medium", "max_tokens": EXPECTED_MAX_TOKENS, "completed": len(existing), "total": len(rows), "pending": len(pending)})
     for index, row in enumerate(pending, start=1):
-        print(f"v12_teacher={len(existing)+1}/{len(rows)} source={row['source_id']} pass=protect", flush=True)
-        protect, protect_raw = _call_pass(row=row, pass_name="protect", model=model, api_key=api_key, base_url=base_url, args=args)
-        print(f"v12_teacher={len(existing)+1}/{len(rows)} source={row['source_id']} pass=non_vocal", flush=True)
-        nonvocal, nonvocal_raw = _call_pass(row=row, pass_name="nonvocal", model=model, api_key=api_key, base_url=base_url, args=args)
-        merged = merge_dual_evidence(vocal_spans=protect["vocal_spans"], non_vocal_spans=nonvocal["non_vocal_spans"], frame_count=int(row["frame_count"]))
+        print(
+            f"v12_teacher={len(existing)+1}/{len(rows)} "
+            f"source={row['source_id']} pass=single_tristate",
+            flush=True,
+        )
+        response, response_raw, normalized = _call_teacher(
+            row=row,
+            transport=transport,
+            args=args,
+        )
         label = {
             "schema": VOCAL_ENVELOPE_SCORER_V12_PREAUDIT_SCHEMA,
             "boundary_serialization_contract_id": CONTRACT_ID,
@@ -427,34 +511,46 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             "audio": row["audio"], "audio_sha256": row.get("audio_sha256") or _sha256(Path(row["audio"])),
             "duration_s": row["duration_s"], "frame_count": row["frame_count"], "frame_hop_s": FRAME_HOP_S,
             "sample_rate": row.get("sample_rate"), "sample_count": row.get("sample_count"),
-            "model": model, "provider_profile": "gemini", "reasoning_effort": "medium", "max_tokens": EXPECTED_MAX_TOKENS,
+            "model": model, "provider_profile": profile,
+            "env_file_name": profile,
+            "transport": transport.transport_name,
+            "api_key_count": transport.api_key_count,
+            "reasoning_effort": "medium", "max_tokens": EXPECTED_MAX_TOKENS,
             "temperature": None, "top_p": None, "top_k": None,
             "prompt_profile": PROMPT_PROFILE, "prompt_version": PROMPT_VERSION,
-            "protect_prompt_version": PROTECT_PROMPT_VERSION, "nonvocal_prompt_version": NONVOCAL_PROMPT_VERSION,
             "teacher_timestamp_contract_id": TIMESTAMP_CONTRACT_ID,
-            "teacher_execution_contract_id": EXPECTED_EXECUTION_CONTRACT,
+            "teacher_execution_contract_id": execution_contract,
             "source_manifest": str(manifest), "source_manifest_sha256": manifest_sha,
-            "protect_response": protect, "non_vocal_response": nonvocal,
-            "vocal_spans": merged["vocal_spans"], "non_vocal_spans": merged["non_vocal_spans"],
-            "unsure_spans": merged["unsure_spans"], "conflict_spans": merged["conflict_spans"],
+            "single_pass_response": response,
+            "vocal_spans": normalized["vocal_spans"],
+            "non_vocal_spans": normalized["non_vocal_spans"],
+            "unsure_spans": normalized["unsure_spans"],
+            "conflict_spans": [],
             "teacher_failed_closed": False, "training_manifest_allowed": False,
             "unsure_training_label": VOCAL_ENVELOPE_SCORER_V12_IGNORE_INDEX,
-            "preaudit_provenance": f"omni:{model}:independent_vocal_nonvocal_evidence",
+            "preaudit_provenance": f"{profile}:{model}:single_pass_tristate_evidence",
         }
         with labels_path.open("a", encoding="utf-8") as handle:
             handle.write(json.dumps(label, ensure_ascii=False, sort_keys=True) + "\n")
         with raw_path.open("a", encoding="utf-8") as handle:
-            handle.write(json.dumps({"source_id": row["source_id"], "protect": protect_raw, "non_vocal": nonvocal_raw}, ensure_ascii=False, sort_keys=True) + "\n")
+            handle.write(
+                json.dumps(
+                    {"source_id": row["source_id"], "single_pass": response_raw},
+                    ensure_ascii=False,
+                    sort_keys=True,
+                )
+                + "\n"
+            )
         existing[row["source_id"]] = label
         elapsed = time.perf_counter() - started
         rate = len(existing) / max(elapsed, 1e-9)
         eta = (len(rows) - len(existing)) / max(rate, 1e-9)
-        _write_progress(progress_path, {"schema": PROGRESS_SCHEMA, "status": "running", "model": model, "reasoning_effort": "medium", "max_tokens": EXPECTED_MAX_TOKENS, "completed": len(existing), "total": len(rows), "pending": len(rows) - len(existing), "last_source_id": row["source_id"], "elapsed_s": round(elapsed, 3), "eta_s": round(eta, 3)})
+        _write_progress(progress_path, {"schema": PROGRESS_SCHEMA, "status": "running", "model": model, "provider_profile": profile, "reasoning_effort": "medium", "max_tokens": EXPECTED_MAX_TOKENS, "completed": len(existing), "total": len(rows), "pending": len(rows) - len(existing), "last_source_id": row["source_id"], "elapsed_s": round(elapsed, 3), "eta_s": round(eta, 3)})
         if index < len(pending) and args.request_interval_s > 0:
             time.sleep(float(args.request_interval_s))
-    summary = {"schema": SUMMARY_SCHEMA, "boundary_serialization_contract_id": CONTRACT_ID, "model": model, "provider_profile": "gemini", "reasoning_effort": "medium", "max_tokens": EXPECTED_MAX_TOKENS, "omitted_sampling_parameters": ["temperature", "top_p", "top_k"], "prompt_profile": PROMPT_PROFILE, "prompt_version": PROMPT_VERSION, "teacher_timestamp_contract_id": TIMESTAMP_CONTRACT_ID, "source_manifest": str(manifest), "source_manifest_sha256": manifest_sha, "source_count": len(rows), "result_count": len(existing), "results": str(labels_path), "raw_responses": str(raw_path), "training_manifest_allowed": False}
+    summary = {"schema": SUMMARY_SCHEMA, "boundary_serialization_contract_id": CONTRACT_ID, "model": model, "provider_profile": profile, "env_file_name": profile, "transport": transport.transport_name, "api_key_count": transport.api_key_count, "reasoning_effort": "medium", "max_tokens": EXPECTED_MAX_TOKENS, "request_count": len(existing), "calls_per_source": 1, "omitted_sampling_parameters": ["temperature", "top_p", "top_k"], "prompt_profile": PROMPT_PROFILE, "prompt_version": PROMPT_VERSION, "teacher_timestamp_contract_id": TIMESTAMP_CONTRACT_ID, "teacher_execution_contract_id": execution_contract, "source_manifest": str(manifest), "source_manifest_sha256": manifest_sha, "source_count": len(rows), "result_count": len(existing), "results": str(labels_path), "raw_responses": str(raw_path), "training_manifest_allowed": False}
     (output / "summary.json").write_text(json.dumps(summary, ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-    _write_progress(progress_path, {"schema": PROGRESS_SCHEMA, "status": "completed", "model": model, "reasoning_effort": "medium", "max_tokens": EXPECTED_MAX_TOKENS, "completed": len(existing), "total": len(rows), "pending": 0, "elapsed_s": round(time.perf_counter() - started, 3), "summary": str(output / "summary.json")})
+    _write_progress(progress_path, {"schema": PROGRESS_SCHEMA, "status": "completed", "model": model, "provider_profile": profile, "reasoning_effort": "medium", "max_tokens": EXPECTED_MAX_TOKENS, "completed": len(existing), "total": len(rows), "pending": 0, "elapsed_s": round(time.perf_counter() - started, 3), "summary": str(output / "summary.json")})
     return summary
 
 
@@ -464,7 +560,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--output-dir", required=True)
     parser.add_argument("--source-id", action="append", default=[])
     parser.add_argument("--limit", type=int, default=0)
-    parser.add_argument("--env-file", choices=("gemini",), default="gemini")
+    parser.add_argument(
+        "--env-file",
+        choices=("openrouter", "gemini"),
+        default="gemini",
+        help="openrouter uses its OpenAI-compatible API; gemini uses Google AI Studio Interactions.",
+    )
     parser.add_argument("--model", default="")
     parser.add_argument("--timeout-s", type=float, default=240.0)
     parser.add_argument("--max-attempts", type=int, default=3)

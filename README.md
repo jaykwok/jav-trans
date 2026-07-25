@@ -205,17 +205,30 @@ feature/metadata 导出，因此准备器会明确 fail-closed；任何 pending 
 - `OPENAI_COMPATIBILITY_BASE_URL`
 - `LLM_MODEL_NAME`
 
-离线音频多模态 teacher 工具使用独立配置 `~/.config/omni/gemini` 或
-`~/.config/omni/qwen`，CLI 通过 `--env-file gemini|qwen` 显式选择；默认
-Gemini，只有明确要求时使用 Qwen。常用键为 `OMNI_MODEL`、
-`OMNI_API_KEY` 和 `OMNI_BASE_URL`。新增 provider 时应先在源码中加入明确
-profile 与请求体映射，不接受任意 env 文件名静默猜测协议。
-Gemini（OpenRouter）数据标注请求默认使用 `reasoning.effort=medium`、默认
+离线音频多模态 Teacher 使用三个隔离配置：`~/.config/omni/qwen`、
+`~/.config/omni/openrouter` 与 `~/.config/omni/gemini`。CLI 只接受
+`--env-file qwen|openrouter|gemini` 这些已知 profile，不接受任意文件名静默
+猜测协议。Qwen/OpenRouter 使用各自的兼容 API adapter；`gemini` 专指 Google
+AI Studio 原生 Interactions API，不再作为 OpenRouter Gemini 的别名。
+OpenRouter 常用键为 `OMNI_MODEL/OMNI_API_KEY/OMNI_BASE_URL`；原生 Gemini
+使用 `GEMINI_MODEL=gemini-3.6-flash`（可省略）与
+`GEMINI_API_KEY=KEY_1,KEY_2`。逗号分隔 Key 去重后按槽位管理，同一 Key 的
+请求起点按 5 RPM 限速，并保守按每槽位 20 RPD 管理；RPD 在太平洋时间午夜
+重置；每个真正发出的请求（包括返回错误的请求）都会在发送前计入 RPD。跨进程
+恢复状态原子保存在同目录 `gemini.quota.json`，其中只有 Key 的
+SHA-256 指纹与计数。达到本地日预算会主动切到下一槽位，远端 HTTP 429 也会
+立即将当前槽位标为当日不可用；日志与产物只记录槽位和 Key 数量，不保存 Key
+值。Google 官方实际按 project 而不是 Key 计费/限流，因此多个 Key 只有在属于
+不同 project 时才会提供多份独立日额度。
+OpenRouter 上的 Gemini 数据标注请求默认使用 `reasoning.effort=medium`、默认
 `max_tokens=8192` 和 `input_audio_raw`，默认不设置 `reasoning.exclude`
 （需要隐藏思考文本时用 `--exclude-reasoning`）；`high` 只用于显式受控
 A/B，不作为 canonical 数据标注默认值。Qwen 使用
 `enable_thinking/thinking_budget`、默认 `max_tokens=2048` 和
-`input_audio`。两者均不显式发送 temperature、top-p 或 top-k。任何要求 Teacher 生成时间坐标的工具统一使用
+`input_audio`。Qwen 与 OpenRouter 均不显式发送 temperature、top-p 或
+top-k。原生 Gemini 使用 `POST /v1beta/interactions`、内联音频、
+`thinking_level=medium`、`max_output_tokens=8192`、结构化 JSON 输出且
+`store=false`，同样不发送 temperature、top-p 或 top-k。任何要求 Teacher 生成时间坐标的工具统一使用
 `omni_audio_timestamp_mmss_mmm_v1`：wire 字段为严格字符串
 `start_ts/end_ts/time_ts`（`MM:SS.mmm`），旧数字秒响应直接拒绝；本地严格
 解析后，训练与审计 manifest 内部仍可保存数值 `start_s/end_s/time_s`。
@@ -378,7 +391,9 @@ uv run python -m <module> --help
 - `tools.audits.audit_nav` / `serve_audits.ps1`：审计页导航与 Windows 本地服务。
 - `tools.audits.review_page_core` / `audit_prompt`：人工审计页共享 Core（`MM:SS.mmm` 区间显示与播放器、状态、完成度、保存 API）与可复用提示配置；任务特有布局、证据和完备 verdict 组合由 Adapter 提供。设计合同见 [Human Audit Page Core](docs/audits/20260723_human-audit-page-core-v1.md)。
 - `tools.omni.timestamp_contract`：所有区间 Teacher 的严格 `MM:SS.mmm` wire schema、格式化、解析和 source-bound 校验；不提供数字秒兼容或时间猜测。
-- `tools.omni.run_audio_teacher`：按 `--env-file gemini|qwen` 选择已知请求合同的通用音频 Teacher transport，支持 `--prompt/--prompt-file` 与 `--folder/--file/--manifest`，只保存可恢复的预审结果，不直接生成训练真值。
+- `tools.omni.run_audio_teacher`：音频 Teacher Core；统一处理 `--prompt/--prompt-file`、`--folder/--file/--manifest`、进度、续跑和预审落盘，不直接生成训练真值。
+- `tools.omni.audio_teacher_transport`：Qwen、OpenRouter、Google AI Studio 三个 provider Adapter 的唯一分派入口；请求与响应协议互不冒充。
+- `tools.omni.gemini_native`：Google AI Studio 原生 Interactions 音频 Adapter；实现内联音频、结构化输出、思考/usage 证据、每槽位 5 RPM / 20 RPD、太平洋日界线、跨进程配额账本与多 Key 429 轮换。
 - `tools.audits.generate_candidate_island_dual_evidence_review`：Scorer Protect×Remove 与人工 full-source truth 的三轴 bridge-gap Adapter。
 - `tools.audits.generate_candidate_island_dual_evidence_ab_review`：在两个已规范化 Scorer dual-evidence review 上复用同一 Core 的 High/Medium A/B Adapter；比较人工真语音保留、outside precision、监督覆盖与逐帧差异。
 - `tools.boundary.ja.select_candidate_island_scorer_v11_mixed_source_manifest` / `compile_candidate_island_scorer_v11_mixed_dual_evidence`：固定一 source/一 video 的真实 mixed-source Teacher manifest，并把独立 Protect/Remove 证据严格编译为 inside/outside/unsure canonical；不使用补集或标签继承。

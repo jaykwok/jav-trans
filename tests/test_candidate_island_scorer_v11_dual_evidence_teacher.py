@@ -58,7 +58,7 @@ def test_dual_evidence_prompts_keep_scorer_responsibilities_separate() -> None:
     assert "不要求逻辑上证明“绝对不可能存在语言”" in REMOVE_SYSTEM_PROMPT
     assert "未标记区域只是 unresolved，不代表 inside" in REMOVE_SYSTEM_PROMPT
     args = parse_teacher_args(["--manifest", "m", "--output-dir", "o"])
-    assert args.env_file == "gemini"
+    assert args.env_file == "openrouter"
     assert args.source_id == []
     assert args.reasoning_effort == "medium"
     assert args.exclude_reasoning is False
@@ -81,7 +81,9 @@ def test_omni_provider_profiles_use_distinct_reasoning_contracts(
     audio = tmp_path / "source.wav"
     audio.write_bytes(b"wav")
     assert audio_content_mode_for_profile("qwen") == "input_audio"
-    assert audio_content_mode_for_profile("gemini") == "input_audio_raw"
+    assert audio_content_mode_for_profile("openrouter") == "input_audio_raw"
+    with pytest.raises(ValueError, match="unsupported omni provider profile"):
+        audio_content_mode_for_profile("gemini")
     assert reasoning_extra_body_for_profile(
         profile="qwen",
         enable_thinking=True,
@@ -89,20 +91,20 @@ def test_omni_provider_profiles_use_distinct_reasoning_contracts(
         reasoning_effort="high",
     ) == {"enable_thinking": True, "thinking_budget": 1024}
     assert reasoning_extra_body_for_profile(
-        profile="gemini",
+        profile="openrouter",
         enable_thinking=True,
         thinking_budget=1024,
         reasoning_effort="high",
         exclude_reasoning=True,
     ) == {"reasoning": {"effort": "high", "exclude": True}}
     assert reasoning_extra_body_for_profile(
-        profile="gemini",
+        profile="openrouter",
         enable_thinking=True,
         thinking_budget=0,
         reasoning_effort="high",
     ) == {"reasoning": {"effort": "high"}}
     assert reasoning_extra_body_for_profile(
-        profile="gemini",
+        profile="openrouter",
         enable_thinking=False,
         thinking_budget=1024,
         reasoning_effort="high",
@@ -120,7 +122,7 @@ def test_omni_provider_profiles_use_distinct_reasoning_contracts(
         max_tokens=8192,
         enable_thinking=True,
         thinking_budget=1024,
-        provider_profile="gemini",
+        provider_profile="openrouter",
         reasoning_effort="medium",
         exclude_reasoning=False,
         require_provider_parameters=True,
@@ -136,7 +138,7 @@ def test_omni_provider_profiles_use_distinct_reasoning_contracts(
     preview = redact_omni_request_preview(
         request_body=request,
         extra_body=extra,
-        provider_profile="gemini",
+        provider_profile="openrouter",
         base_url="https://openrouter.ai/api/v1/chat/completions",
     )
     assert preview["body"]["reasoning"] == {"effort": "medium"}
@@ -162,7 +164,7 @@ def test_omni_provider_profiles_use_distinct_reasoning_contracts(
         max_tokens=8192,
         enable_thinking=True,
         thinking_budget=0,
-        provider_profile="gemini",
+        provider_profile="openrouter",
         reasoning_effort="high",
         exclude_reasoning=True,
         response_format={"type": "json_object"},

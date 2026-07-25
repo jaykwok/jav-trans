@@ -111,7 +111,7 @@ def _page(payload: list[dict[str, Any]], *, manifest_sha: str, preaudit_sha: str
   <h2>审计合同</h2>
   <p><b>绿色 vocal：</b>所有人类声道、口腔或呼吸系统产生的连续发声事件包络；同一事件中的短停顿和呼吸应连续保留。</p>
   <p><b>黄色 non-vocal：</b>明确不含任何人类发声的机械、动作、衣物/床体、水声、纯音乐、静音或环境噪声。</p>
-  <p><b>灰色 unsure：</b>双 Teacher 冲突或双方都没有确定证据；训练时为 -100，不代表 vocal 或 non-vocal 真值。</p>
+  <p><b>灰色 unsure：</b>单次三态 Teacher 无法可靠判断人声重叠或安全边界；训练时为 -100，不代表 vocal 或 non-vocal 真值。</p>
   <p>每条必须完整听完，再分别判断：vocal 是否漏声/截边、黄色是否混入任何人声、同一发声事件是否被切碎或跨独立长背景过度合并。颜色条点击后只播放自身精确区间，不添加上下文。</p>
 </section>
 <div id="cards"></div>

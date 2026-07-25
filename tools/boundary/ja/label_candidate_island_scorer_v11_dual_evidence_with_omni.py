@@ -503,7 +503,7 @@ def _call_pass(
                 require_provider_parameters=require_provider_parameters,
                 response_format=(
                     {"type": "json_object"}
-                    if provider_profile == "gemini"
+                    if provider_profile == "openrouter"
                     else None
                 ),
                 print_request=(
@@ -602,23 +602,23 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     audio_content_mode = audio_content_mode_for_profile(profile_name)
     reasoning_effort = (
         str(args.reasoning_effort).lower() if args.enable_thinking else "none"
-    ) if profile_name == "gemini" else ""
+    ) if profile_name == "openrouter" else ""
     effective_thinking_budget = (
         int(args.thinking_budget) if profile_name == "qwen" else 0
     )
     effective_max_tokens = int(args.max_tokens) if args.max_tokens > 0 else (
-        8192 if profile_name == "gemini" else 2048
+        8192 if profile_name == "openrouter" else 2048
     )
     exclude_reasoning = bool(args.exclude_reasoning)
     require_provider_parameters = bool(
-        profile_name == "gemini" and "openrouter.ai" in base_url.lower()
+        profile_name == "openrouter" and "openrouter.ai" in base_url.lower()
     )
     reasoning_metadata: dict[str, Any] = {
         "provider_profile": profile_name,
         "enable_thinking": bool(args.enable_thinking),
         "reasoning_transport": (
             "openrouter_reasoning_effort_to_google_thinking_level"
-            if profile_name == "gemini"
+            if profile_name == "openrouter"
             else "qwen_enable_thinking_budget"
         ),
         "max_tokens": effective_max_tokens,
@@ -628,11 +628,11 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "require_provider_parameters": require_provider_parameters,
         "teacher_execution_contract_id": TEACHER_EXECUTION_CONTRACT_ID,
         "response_format": (
-            {"type": "json_object"} if profile_name == "gemini" else {}
+            {"type": "json_object"} if profile_name == "openrouter" else {}
         ),
         "omitted_sampling_parameters": ["temperature", "top_p", "top_k"],
     }
-    if profile_name == "gemini":
+    if profile_name == "openrouter":
         reasoning_metadata.update(
             {
                 "reasoning_effort": reasoning_effort,
@@ -643,7 +643,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         reasoning_metadata["thinking_budget"] = effective_thinking_budget
     require_reasoning_evidence = bool(
         args.require_reasoning_evidence
-        and profile_name == "gemini"
+        and profile_name == "openrouter"
         and args.enable_thinking
     )
 
@@ -683,7 +683,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 require_provider_parameters=require_provider_parameters,
                 response_format=(
                     {"type": "json_object"}
-                    if profile_name == "gemini"
+                    if profile_name == "openrouter"
                     else None
                 ),
             )
@@ -746,7 +746,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         exclude_reasoning=exclude_reasoning,
         require_provider_parameters=require_provider_parameters,
         response_format=(
-            {"type": "json_object"} if profile_name == "gemini" else {}
+            {"type": "json_object"} if profile_name == "openrouter" else {}
         ),
     )
     pending = [row for row in rows if str(row["source_id"]) not in existing]
@@ -1168,8 +1168,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--limit", type=int, default=0)
     parser.add_argument(
         "--env-file",
-        default="gemini",
-        choices=("qwen", "gemini"),
+        default="openrouter",
+        choices=("qwen", "openrouter"),
     )
     parser.add_argument("--api-key-env", default=",".join(DEFAULT_API_KEY_ENV_CANDIDATES))
     parser.add_argument("--model-env", default="OMNI_MODEL,QWEN_OMNI_MODEL")
@@ -1181,7 +1181,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         type=int,
         default=0,
         help=(
-            "0 selects the provider default used by this tool: Gemini=8192, "
+            "0 selects the provider default used by this tool: OpenRouter=8192, "
             "Qwen=2048."
         ),
     )

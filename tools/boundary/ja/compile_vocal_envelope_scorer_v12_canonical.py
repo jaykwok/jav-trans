@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Compile validated Scorer v12 dual-evidence into a frozen canonical set."""
+"""Compile validated Scorer v12 single-pass tri-state evidence."""
 from __future__ import annotations
 
 import argparse
@@ -28,19 +28,28 @@ from boundary.ja.vocal_envelope_v12 import (  # noqa: E402
     VOCAL_ENVELOPE_SCORER_V12_VOCAL_COVERAGE_OPTIONS,
     vocal_envelope_v12_manual_verdict_is_approved,
 )
+from tools.omni.gemini_native import (  # noqa: E402
+    GEMINI_NATIVE_EXECUTION_CONTRACT,
+    GEMINI_NATIVE_MODEL,
+)
 
 CONTRACT_ID = "boundary_acoustic_binary_v12"
 FRAME_HOP_S = 0.02
-EXPECTED_MODEL = "google/gemini-3.6-flash"
-EXPECTED_PROFILE = "gemini"
 EXPECTED_REASONING = "medium"
 EXPECTED_MAX_TOKENS = 8192
 EXPECTED_TIMESTAMP_CONTRACT = "omni_audio_timestamp_mmss_mmm_v1"
-EXPECTED_EXECUTION_CONTRACT = "gemini_openrouter_reasoning_require_parameters_v1"
-EXPECTED_PROMPT_PROFILE = "vocal-envelope-protect-nonvocal-v2"
-EXPECTED_PROTECT_PROMPT_VERSION = "vocal-envelope-protect-v2-human-vocal-event-gemini36-medium-mmss"
-EXPECTED_NONVOCAL_PROMPT_VERSION = "vocal-envelope-nonvocal-v2-zero-human-vocal-gemini36-medium-mmss"
-EXPECTED_PROMPT_VERSION = f"{EXPECTED_PROTECT_PROMPT_VERSION}__{EXPECTED_NONVOCAL_PROMPT_VERSION}"
+PROVIDER_CONTRACTS: dict[str, dict[str, str]] = {
+    "openrouter": {
+        "model": "google/gemini-3.6-flash",
+        "execution_contract": "openrouter_gemini36_reasoning_require_parameters_v1",
+    },
+    "gemini": {
+        "model": GEMINI_NATIVE_MODEL,
+        "execution_contract": GEMINI_NATIVE_EXECUTION_CONTRACT,
+    },
+}
+EXPECTED_PROMPT_PROFILE = "vocal-envelope-single-pass-tristate-v3"
+EXPECTED_PROMPT_VERSION = "vocal-envelope-single-pass-tristate-v3-scorer-duty-gemini36-medium-mmss"
 OUTPUT_SUMMARY_SCHEMA = "vocal_envelope_scorer_v12_canonical_compile_summary_v1"
 
 
@@ -165,6 +174,7 @@ def compile_canonical(
     compiled: list[dict[str, Any]] = []
     totals = Counter()
     partitions = Counter()
+    selected_profile = ""
     for source_id in sorted(sources):
         source = sources[source_id]
         evidence = labels[source_id]
@@ -174,16 +184,21 @@ def compile_canonical(
             raise ValueError(f"wrong v12 central contract: {source_id}")
         if evidence.get("teacher_failed_closed") is True:
             raise ValueError(f"failed-closed v12 evidence cannot compile: {source_id}")
-        if evidence.get("model") != EXPECTED_MODEL or evidence.get("provider_profile") != EXPECTED_PROFILE:
+        profile = str(evidence.get("provider_profile") or "")
+        provider_contract = PROVIDER_CONTRACTS.get(profile)
+        if provider_contract is None:
+            raise ValueError(f"unsupported v12 teacher profile: {source_id}")
+        if selected_profile and profile != selected_profile:
+            raise ValueError("v12 canonical cannot mix teacher provider profiles")
+        selected_profile = profile
+        if evidence.get("model") != provider_contract["model"]:
             raise ValueError(f"v12 teacher model/profile mismatch: {source_id}")
-        for field, expected in (("reasoning_effort", EXPECTED_REASONING), ("max_tokens", EXPECTED_MAX_TOKENS), ("teacher_timestamp_contract_id", EXPECTED_TIMESTAMP_CONTRACT), ("teacher_execution_contract_id", EXPECTED_EXECUTION_CONTRACT), ("source_manifest_sha256", manifest_sha)):
+        for field, expected in (("env_file_name", profile), ("reasoning_effort", EXPECTED_REASONING), ("max_tokens", EXPECTED_MAX_TOKENS), ("teacher_timestamp_contract_id", EXPECTED_TIMESTAMP_CONTRACT), ("teacher_execution_contract_id", provider_contract["execution_contract"]), ("source_manifest_sha256", manifest_sha)):
             if evidence.get(field) != expected:
                 raise ValueError(f"v12 teacher {field} mismatch: {source_id}")
         for field, expected in (
             ("prompt_profile", EXPECTED_PROMPT_PROFILE),
             ("prompt_version", EXPECTED_PROMPT_VERSION),
-            ("protect_prompt_version", EXPECTED_PROTECT_PROMPT_VERSION),
-            ("nonvocal_prompt_version", EXPECTED_NONVOCAL_PROMPT_VERSION),
         ):
             if evidence.get(field) != expected:
                 raise ValueError(f"v12 teacher {field} mismatch: {source_id}")
@@ -281,7 +296,7 @@ def compile_canonical(
             "canonical_spans": spans,
             "labels": list(VOCAL_ENVELOPE_SCORER_V12_LABELS),
             "unsure_training_label": VOCAL_ENVELOPE_SCORER_V12_IGNORE_INDEX,
-            "annotation_provenance": "human_approved_gemini36_medium_independent_vocal_nonvocal_evidence_v1" if human_approved else "gemini36_medium_independent_vocal_nonvocal_evidence_review_only_v1",
+            "annotation_provenance": f"human_approved_{profile}_gemini36_medium_single_pass_tristate_v2" if human_approved else f"{profile}_gemini36_medium_single_pass_tristate_review_only_v2",
             "teacher_output_used_as_truth": human_approved,
             "teacher_output_used_as_calibrated_evidence": True,
             "training_manifest_allowed": human_approved,
@@ -313,6 +328,7 @@ def compile_canonical(
         "output": str(output_path), "output_sha256": _sha256(output_path),
         "source_count": len(compiled), "partition_counts": dict(partitions),
         "frame_counts": dict(sorted(totals.items())),
+        "provider_profile": selected_profile,
         "teacher_output_used_as_truth": bool(verdict_rows),
         "training_manifest_allowed": bool(verdict_rows),
         "human_full_source_review_approved": bool(verdict_rows),

@@ -705,7 +705,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     progress_path = output / "progress.json"
     started = time.perf_counter()
     profile_name = env_file.name
-    audio_content_mode = {"qwen": "input_audio", "gemini": "input_audio_raw"}[profile_name.lower()]
+    audio_content_mode = {"qwen": "input_audio", "openrouter": "input_audio_raw"}[profile_name.lower()]
     _write_progress(progress_path, {"schema": "candidate_island_scorer_v11_omni_progress_v1", "status": "running", "provider_profile": profile_name, "prompt_profile": prompt_profile, "prompt_version": prompt_version, "teacher_timestamp_contract_id": TIMESTAMP_CONTRACT_ID, "model": model, "completed": len(existing), "total": progress_total, "pending": len(pending), "elapsed_s": 0.0})
     for index, row in enumerate(pending, start=1):
         source_id = str(row["source_id"])
@@ -823,9 +823,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--env-file",
-        default="gemini",
-        choices=("qwen", "gemini"),
-        help="Named ~/.config/omni profile. Gemini is the default; use qwen explicitly.",
+        default="openrouter",
+        choices=("qwen", "openrouter"),
+        help="Legacy v11 compatible-API profile. Native Gemini is v12-only.",
     )
     parser.add_argument("--api-key-env", default=",".join(DEFAULT_API_KEY_ENV_CANDIDATES))
     parser.add_argument("--model-env", default="OMNI_MODEL,QWEN_OMNI_MODEL")
