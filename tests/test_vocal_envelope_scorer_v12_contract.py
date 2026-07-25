@@ -9,18 +9,24 @@ import pytest
 
 from boundary.ja.vocal_envelope_v12 import (
     VOCAL_ENVELOPE_SCORER_V12_CRF_SCHEMA,
+    VOCAL_ENVELOPE_SCORER_V12_DENSE_SPAN_SCHEMA,
     VOCAL_ENVELOPE_SCORER_V12_IGNORE_INDEX,
     VOCAL_ENVELOPE_SCORER_V12_LABELS,
     VOCAL_ENVELOPE_SCORER_V12_PREAUDIT_SCHEMA,
     VOCAL_ENVELOPE_SCORER_V12_SCHEMA,
     VOCAL_ENVELOPE_SCORER_V12_MANUAL_VERDICT_SCHEMA,
+    VOCAL_ENVELOPE_SCORER_V12_QUERY_MASK_SCHEMA,
+    VocalEnvelopeScorerV12DenseSpanNetwork,
     VocalEnvelopeScorerV12CrfNetwork,
+    VocalEnvelopeScorerV12QueryMaskNetwork,
     VocalEnvelopeScorerV12Network,
     build_vocal_envelope_scorer_v12_checkpoint,
     load_vocal_envelope_scorer_v12_checkpoint,
     score_vocal_envelope_source,
     vocal_envelope_v12_crf_model_config,
+    vocal_envelope_v12_dense_span_model_config,
     vocal_envelope_v12_model_config,
+    vocal_envelope_v12_query_mask_model_config,
 )
 from tools.audits.generate_vocal_envelope_scorer_v12_teacher_audit_html import (
     build as build_teacher_audit,
@@ -231,6 +237,54 @@ def test_v12_crf_checkpoint_uses_exact_viterbi_runtime(tmp_path: Path) -> None:
     assert bundle.metadata["decision_mode"] == (
         "learned_binary_sequence_viterbi_argmax"
     )
+    assert outputs.probabilities.shape == (7, 2)
+    assert outputs.labels.shape == (7,)
+
+
+@pytest.mark.parametrize(
+    ("schema", "config_factory", "network_factory", "decision_mode"),
+    (
+        (
+            VOCAL_ENVELOPE_SCORER_V12_QUERY_MASK_SCHEMA,
+            vocal_envelope_v12_query_mask_model_config,
+            VocalEnvelopeScorerV12QueryMaskNetwork,
+            "binary_frame_argmax_after_differentiable_query_fusion",
+        ),
+        (
+            VOCAL_ENVELOPE_SCORER_V12_DENSE_SPAN_SCHEMA,
+            vocal_envelope_v12_dense_span_model_config,
+            VocalEnvelopeScorerV12DenseSpanNetwork,
+            "learned_binary_dense_span_viterbi_argmax",
+        ),
+    ),
+)
+def test_v12_structured_checkpoint_schemas_are_runtime_separate(
+    tmp_path: Path, schema, config_factory, network_factory, decision_mode
+) -> None:
+    import torch
+
+    config = config_factory()
+    model = network_factory(**config)
+    checkpoint = tmp_path / f"{schema}.pt"
+    torch.save(
+        build_vocal_envelope_scorer_v12_checkpoint(
+            model=model,
+            model_config=config,
+            normalization={
+                "mfcc_mean": list(config["mfcc_mean"]),
+                "mfcc_std": list(config["mfcc_std"]),
+            },
+        ),
+        checkpoint,
+    )
+    bundle = load_vocal_envelope_scorer_v12_checkpoint(checkpoint, device="cpu")
+    outputs = score_vocal_envelope_source(
+        bundle,
+        ptm=np.zeros((7, 2048), dtype=np.float32),
+        mfcc=np.zeros((7, 40), dtype=np.float32),
+    )
+    assert bundle.schema == schema
+    assert bundle.metadata["decision_mode"] == decision_mode
     assert outputs.probabilities.shape == (7, 2)
     assert outputs.labels.shape == (7,)
 
