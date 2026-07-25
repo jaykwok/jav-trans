@@ -45,6 +45,7 @@ from tools.boundary.ja.label_vocal_envelope_scorer_v12_with_omni import (
     _request_prompt,
     _validate_manifest,
     parse_args,
+    run as run_teacher,
 )
 from tools.omni.timestamp_contract import TIMESTAMP_CONTRACT_ID
 
@@ -169,6 +170,101 @@ def _approved_verdicts(manifest: Path, preaudit: Path) -> Path:
         ],
     )
     return verdicts
+
+
+def _set_native_gemini_profile(preaudit: Path) -> None:
+    native = COMPILER_PROVIDER_CONTRACTS["gemini"]
+    rows = [json.loads(line) for line in preaudit.read_text().splitlines()]
+    for row in rows:
+        row["model"] = native["model"]
+        row["provider_profile"] = "gemini"
+        row["env_file_name"] = "gemini"
+        row["teacher_execution_contract_id"] = native["execution_contract"]
+    _write_jsonl(preaudit, rows)
+
+
+def _approved_verdicts_for_ids(
+    manifest: Path, preaudit: Path, source_ids: set[str], output: Path
+) -> Path:
+    manifest_sha = _sha256(manifest)
+    preaudit_sha = _sha256(preaudit)
+    sources = {
+        row["source_id"]: row
+        for row in (
+            json.loads(line) for line in manifest.read_text().splitlines()
+        )
+    }
+    _write_jsonl(
+        output,
+        [
+            {
+                "schema": VOCAL_ENVELOPE_SCORER_V12_MANUAL_VERDICT_SCHEMA,
+                "boundary_serialization_contract_id": "boundary_acoustic_binary_v12",
+                "source_id": source_id,
+                "video_id": sources[source_id]["video_id"],
+                "partition": sources[source_id]["partition"],
+                "audio_sha256": sources[source_id]["audio_sha256"],
+                "duration_s": sources[source_id]["duration_s"],
+                "frame_count": sources[source_id]["frame_count"],
+                "source_manifest_sha256": manifest_sha,
+                "preaudit_sha256": preaudit_sha,
+                "reviewed_full_source": True,
+                "vocal_coverage": "definite_vocal_complete",
+                "non_vocal_safety": "definite_non_vocal_clean",
+                "envelope_structure": "event_envelopes_continuous",
+                "approved": True,
+                "training_manifest_allowed": True,
+            }
+            for source_id in sorted(source_ids)
+        ],
+    )
+    return output
+
+
+def _calibration_subset(
+    manifest: Path,
+    preaudit: Path,
+    *,
+    source_ids: set[str],
+    output_dir: Path,
+) -> tuple[Path, Path, Path, dict[str, str]]:
+    output_dir.mkdir()
+    source_rows = [
+        json.loads(line) for line in manifest.read_text().splitlines()
+    ]
+    evidence_rows = [
+        json.loads(line) for line in preaudit.read_text().splitlines()
+    ]
+    calibration_manifest = output_dir / "manifest.jsonl"
+    _write_jsonl(
+        calibration_manifest,
+        [row for row in source_rows if row["source_id"] in source_ids],
+    )
+    calibration_manifest_sha = _sha256(calibration_manifest)
+    selected_evidence = [
+        row for row in evidence_rows if row["source_id"] in source_ids
+    ]
+    for row in selected_evidence:
+        row["source_manifest_sha256"] = calibration_manifest_sha
+    calibration_preaudit = output_dir / "preaudit.jsonl"
+    _write_jsonl(calibration_preaudit, selected_evidence)
+    calibration_verdicts = _approved_verdicts_for_ids(
+        calibration_manifest,
+        calibration_preaudit,
+        source_ids,
+        output_dir / "manual_verdicts.jsonl",
+    )
+    hashes = {
+        "manifest": _sha256(calibration_manifest),
+        "preaudit": _sha256(calibration_preaudit),
+        "verdicts": _sha256(calibration_verdicts),
+    }
+    return (
+        calibration_manifest,
+        calibration_preaudit,
+        calibration_verdicts,
+        hashes,
+    )
 
 
 def test_v12_contract_is_breaking_and_runtime_is_argmax(tmp_path: Path) -> None:
@@ -512,6 +608,193 @@ def test_v12_canonical_rejects_unapproved_or_unbound_manual_verdicts(
             output_dir=tmp_path / "unbound",
             manual_verdicts=verdicts,
         )
+
+
+def test_v12_calibrated_full_canonical_allows_train_teacher_only(
+    tmp_path: Path,
+) -> None:
+    manifest, preaudit = _teacher_fixture(tmp_path)
+    _set_native_gemini_profile(preaudit)
+    (
+        calibration_manifest,
+        calibration_preaudit,
+        calibration_verdicts,
+        calibration_hashes,
+    ) = _calibration_subset(
+        manifest,
+        preaudit,
+        source_ids={"source-val"},
+        output_dir=tmp_path / "calibration",
+    )
+    heldout_verdicts = _approved_verdicts_for_ids(
+        manifest,
+        preaudit,
+        {"source-test"},
+        tmp_path / "heldout-verdicts.jsonl",
+    )
+
+    summary = compile_canonical(
+        manifest=manifest,
+        preaudit=preaudit,
+        output_dir=tmp_path / "calibrated-full",
+        manual_verdicts=heldout_verdicts,
+        calibration_manifest=calibration_manifest,
+        calibration_preaudit=calibration_preaudit,
+        calibration_verdicts=calibration_verdicts,
+        calibration_expected_hashes=calibration_hashes,
+    )
+
+    assert summary["training_manifest_allowed"] is True
+    assert summary["heldout_human_full_source_review_approved"] is True
+    assert summary["human_full_source_review_approved"] is False
+    assert summary["calibration_source_count"] == 1
+    rows = {
+        row["source_id"]: row
+        for row in (
+            json.loads(line)
+            for line in (tmp_path / "calibrated-full" / "canonical_sources.jsonl")
+            .read_text()
+            .splitlines()
+        )
+    }
+    assert rows["source-train"]["calibrated_train_supervision"] is True
+    assert rows["source-train"]["teacher_output_used_as_truth"] is False
+    assert rows["source-train"]["training_manifest_allowed"] is True
+    assert rows["source-val"]["calibration_overlap_human_approved"] is True
+    assert rows["source-test"]["human_full_source_review_approved"] is True
+
+
+def test_v12_calibrated_full_canonical_requires_remaining_heldout_review(
+    tmp_path: Path,
+) -> None:
+    manifest, preaudit = _teacher_fixture(tmp_path)
+    _set_native_gemini_profile(preaudit)
+    (
+        calibration_manifest,
+        calibration_preaudit,
+        calibration_verdicts,
+        calibration_hashes,
+    ) = _calibration_subset(
+        manifest,
+        preaudit,
+        source_ids={"source-val"},
+        output_dir=tmp_path / "calibration",
+    )
+
+    with pytest.raises(ValueError, match="non-pilot heldout sources"):
+        compile_canonical(
+            manifest=manifest,
+            preaudit=preaudit,
+            output_dir=tmp_path / "missing-heldout",
+            calibration_manifest=calibration_manifest,
+            calibration_preaudit=calibration_preaudit,
+            calibration_verdicts=calibration_verdicts,
+            calibration_expected_hashes=calibration_hashes,
+        )
+
+
+def test_v12_calibrated_full_canonical_rejects_changed_pilot_evidence(
+    tmp_path: Path,
+) -> None:
+    manifest, preaudit = _teacher_fixture(tmp_path)
+    _set_native_gemini_profile(preaudit)
+    (
+        calibration_manifest,
+        calibration_preaudit,
+        calibration_verdicts,
+        calibration_hashes,
+    ) = _calibration_subset(
+        manifest,
+        preaudit,
+        source_ids={"source-val"},
+        output_dir=tmp_path / "calibration",
+    )
+    rows = [json.loads(line) for line in preaudit.read_text().splitlines()]
+    val = next(row for row in rows if row["source_id"] == "source-val")
+    val["vocal_spans"][0]["end_frame"] = 2
+    val["non_vocal_spans"][0]["start_frame"] = 2
+    _write_jsonl(preaudit, rows)
+    heldout_verdicts = _approved_verdicts_for_ids(
+        manifest,
+        preaudit,
+        {"source-test"},
+        tmp_path / "heldout-verdicts.jsonl",
+    )
+
+    with pytest.raises(ValueError, match="evidence changed after approval"):
+        compile_canonical(
+            manifest=manifest,
+            preaudit=preaudit,
+            output_dir=tmp_path / "drifted-pilot",
+            manual_verdicts=heldout_verdicts,
+            calibration_manifest=calibration_manifest,
+            calibration_preaudit=calibration_preaudit,
+            calibration_verdicts=calibration_verdicts,
+            calibration_expected_hashes=calibration_hashes,
+        )
+
+
+def test_v12_teacher_can_seed_approved_calibration_without_api_call(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    manifest, preaudit = _teacher_fixture(tmp_path)
+    _set_native_gemini_profile(preaudit)
+    (
+        calibration_manifest,
+        calibration_preaudit,
+        calibration_verdicts,
+        calibration_hashes,
+    ) = _calibration_subset(
+        manifest,
+        preaudit,
+        source_ids={"source-val"},
+        output_dir=tmp_path / "calibration",
+    )
+
+    class FakeTransport:
+        model = COMPILER_PROVIDER_CONTRACTS["gemini"]["model"]
+        execution_contract = COMPILER_PROVIDER_CONTRACTS["gemini"][
+            "execution_contract"
+        ]
+        transport_name = "google_ai_interactions_inline_audio"
+        api_key_count = 1
+        max_concurrency = 1
+
+    monkeypatch.setattr(
+        "tools.boundary.ja.label_vocal_envelope_scorer_v12_with_omni."
+        "CALIBRATION_ARTIFACT_SHA256",
+        calibration_hashes,
+    )
+    monkeypatch.setattr(
+        "tools.boundary.ja.label_vocal_envelope_scorer_v12_with_omni."
+        "create_audio_teacher_transport",
+        lambda **_kwargs: FakeTransport(),
+    )
+    args = parse_args(
+        [
+            "--manifest",
+            str(manifest),
+            "--output-dir",
+            str(tmp_path / "seeded"),
+            "--source-id",
+            "source-val",
+            "--calibration-manifest",
+            str(calibration_manifest),
+            "--calibration-preaudit",
+            str(calibration_preaudit),
+            "--calibration-verdicts",
+            str(calibration_verdicts),
+        ]
+    )
+    summary = run_teacher(args)
+
+    assert summary["request_count"] == 0
+    assert summary["calibration_seed_count"] == 1
+    seeded = json.loads(
+        (tmp_path / "seeded" / "preaudit.jsonl").read_text().strip()
+    )
+    assert seeded["source_manifest_sha256"] == _sha256(manifest)
+    assert seeded["calibration_preaudit_sha256"] == calibration_hashes["preaudit"]
 
 
 def test_v12_teacher_audit_uses_shared_core_and_independent_span_playback(

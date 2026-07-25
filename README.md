@@ -395,7 +395,7 @@ uv run python -m <module> --help
 - `tools.omni.audio_teacher_transport`：Qwen、OpenRouter、Google AI Studio 三个 provider Adapter 的唯一分派入口；请求与响应协议互不冒充。
 - `tools.omni.gemini_native` / `tools.omni.inspect_gemini_quota`：Google AI Studio 原生 Interactions 音频 Adapter 与无请求状态入口；实现内联音频、结构化输出、思考/usage 证据、每槽位 5 RPM / 250k TPM / 20 RPD、太平洋日界线、可读配额状态账本与多 Key 429 轮换。`uv run python -m tools.omni.inspect_gemini_quota` 不发送 API 请求，只刷新并显示脱敏状态。
 - `tools.boundary.ja.build_vocal_envelope_scorer_v12_pilot_manifest` / `build_vocal_envelope_scorer_v12_full_manifest`：从冻结 source/partition 只重用身份并重新校验音频 SHA、时长、采样和 frame geometry；不继承 v11 标签、span 或 ASR 文本。
-- `tools.boundary.ja.label_vocal_envelope_scorer_v12_with_omni` / `compile_vocal_envelope_scorer_v12_canonical`：Scorer v12 单调用三态 Teacher 与严格 canonical compiler；绑定 provider/model/prompt/时间合同及人工或校准 gate。
+- `tools.boundary.ja.label_vocal_envelope_scorer_v12_with_omni` / `vocal_envelope_scorer_v12_calibration` / `compile_vocal_envelope_scorer_v12_canonical`：Scorer v12 单调用三态 Teacher、固定 25 条人工批准校准合同与严格 canonical compiler；可把完全相同音频/帧/区间的 pilot 证据零请求重绑定到 full manifest，train 允许校准 Teacher 监督，非 pilot val/test 仍必须人工审计。
 - `tools.boundary.ja.train_vocal_envelope_scorer_v12`：完全随机初始化的 v12 训练器，支持 argmax structured、CRF、Query-Mask 与 Dense Span decoder，持续写入原子 `progress.json`。
 - `tools.audits.generate_candidate_island_dual_evidence_review`：Scorer Protect×Remove 与人工 full-source truth 的三轴 bridge-gap Adapter。
 - `tools.audits.record_vocal_envelope_scorer_v12_approval`：仅在用户明确完成整页审听并统一批准时，把 Scorer v12 审计页的三轴全通过裁决按 source/preaudit SHA 原子写成 `manual_verdicts.jsonl`；不会自动判断或绕过人工 gate。

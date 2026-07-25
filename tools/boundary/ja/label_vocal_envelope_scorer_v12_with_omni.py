@@ -48,6 +48,11 @@ from tools.omni.gemini_native import (  # noqa: E402
     GEMINI_NATIVE_EXECUTION_CONTRACT,
     GEMINI_NATIVE_MODEL,
 )
+from tools.boundary.ja.vocal_envelope_scorer_v12_calibration import (  # noqa: E402
+    CALIBRATION_ARTIFACT_SHA256,
+    evidence_span_signature,
+    load_approved_calibration,
+)
 
 
 FRAME_HOP_S = 0.02
@@ -427,10 +432,36 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     profile = str(args.env_file)
     if profile not in PROVIDER_CONTRACTS:
         raise ValueError("Scorer v12 teacher only supports openrouter or gemini")
+    calibration_paths = (
+        args.calibration_manifest,
+        args.calibration_preaudit,
+        args.calibration_verdicts,
+    )
+    if any(calibration_paths) and not all(calibration_paths):
+        raise ValueError(
+            "v12 calibration seed requires manifest, preaudit and verdicts together"
+        )
+    if all(calibration_paths) and profile != "gemini":
+        raise ValueError("the fixed v12 pilot calibration uses the gemini profile")
     provider_contract = PROVIDER_CONTRACTS[profile]
     manifest = Path(args.manifest).expanduser().resolve()
     manifest_sha = _sha256(manifest)
     rows = _validate_manifest(_rows(manifest), manifest=manifest)
+    full_row_index = {str(row["source_id"]): row for row in rows}
+    calibration: dict[str, Any] | None = None
+    if all(calibration_paths):
+        calibration = load_approved_calibration(
+            manifest=Path(args.calibration_manifest),
+            preaudit=Path(args.calibration_preaudit),
+            verdicts=Path(args.calibration_verdicts),
+            expected_hashes=CALIBRATION_ARTIFACT_SHA256,
+        )
+        missing_calibration_sources = set(calibration["sources"]) - set(full_row_index)
+        if missing_calibration_sources:
+            raise ValueError(
+                "v12 target manifest omits calibrated pilot sources: "
+                f"{sorted(missing_calibration_sources)}"
+            )
     if args.source_id:
         wanted = list(dict.fromkeys(args.source_id))
         index = {row["source_id"]: row for row in rows}
@@ -493,6 +524,107 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             if list(saved.get("core_ids") or ()) != list(current["core_ids"]):
                 raise ValueError(f"v12 resume preaudit core mismatch: {source_id}")
             existing[source_id] = saved
+    calibration_seed_ids: set[str] = set()
+    if calibration is not None:
+        selected_index = {str(row["source_id"]): row for row in rows}
+        calibration_seed_ids = set(selected_index) & set(calibration["sources"])
+        for source_id in sorted(calibration_seed_ids):
+            current = selected_index[source_id]
+            calibration_source = calibration["sources"][source_id]
+            for field in (
+                "video_id",
+                "partition",
+                "audio_sha256",
+                "duration_s",
+                "frame_count",
+                "sample_rate",
+                "sample_count",
+            ):
+                if current.get(field) != calibration_source.get(field):
+                    raise ValueError(
+                        f"v12 calibration seed source {field} drift: {source_id}"
+                    )
+            if list(current.get("core_ids") or ()) != list(
+                calibration_source.get("core_ids") or ()
+            ):
+                raise ValueError(f"v12 calibration seed core drift: {source_id}")
+            if source_id in existing:
+                saved = existing[source_id]
+                if saved.get("calibration_id") != calibration["calibration_id"]:
+                    raise ValueError(
+                        f"v12 calibration resume row lacks seed provenance: {source_id}"
+                    )
+                for field, expected in (
+                    (
+                        "calibration_manifest_sha256",
+                        calibration["hashes"]["manifest"],
+                    ),
+                    (
+                        "calibration_preaudit_sha256",
+                        calibration["hashes"]["preaudit"],
+                    ),
+                    (
+                        "calibration_verdicts_sha256",
+                        calibration["hashes"]["verdicts"],
+                    ),
+                ):
+                    if saved.get(field) != expected:
+                        raise ValueError(
+                            f"v12 calibration resume {field} mismatch: {source_id}"
+                        )
+                if evidence_span_signature(
+                    saved,
+                    frame_count=int(current["frame_count"]),
+                    source_id=source_id,
+                ) != calibration["signatures"][source_id]:
+                    raise ValueError(
+                        f"v12 calibration resume span drift: {source_id}"
+                    )
+                continue
+            seeded = dict(calibration["evidence"][source_id])
+            seeded.update(
+                {
+                    "video_id": current["video_id"],
+                    "partition": current["partition"],
+                    "core_ids": list(current["core_ids"]),
+                    "audio": current["audio"],
+                    "audio_sha256": current["audio_sha256"],
+                    "duration_s": current["duration_s"],
+                    "frame_count": current["frame_count"],
+                    "sample_rate": current.get("sample_rate"),
+                    "sample_count": current.get("sample_count"),
+                    "source_manifest": str(manifest),
+                    "source_manifest_sha256": manifest_sha,
+                    "calibration_id": calibration["calibration_id"],
+                    "calibration_manifest_sha256": calibration["hashes"]["manifest"],
+                    "calibration_preaudit_sha256": calibration["hashes"]["preaudit"],
+                    "calibration_verdicts_sha256": calibration["hashes"]["verdicts"],
+                    "preaudit_provenance": (
+                        "fixed_human_approved_pilot25_rebound_to_full_manifest_v1"
+                    ),
+                }
+            )
+            with labels_path.open("a", encoding="utf-8") as handle:
+                handle.write(
+                    json.dumps(seeded, ensure_ascii=False, sort_keys=True) + "\n"
+                )
+            with raw_path.open("a", encoding="utf-8") as handle:
+                handle.write(
+                    json.dumps(
+                        {
+                            "source_id": source_id,
+                            "calibration_seed": True,
+                            "calibration_id": calibration["calibration_id"],
+                            "calibration_preaudit_sha256": calibration["hashes"][
+                                "preaudit"
+                            ],
+                        },
+                        ensure_ascii=False,
+                        sort_keys=True,
+                    )
+                    + "\n"
+                )
+            existing[source_id] = seeded
     pending = [row for row in rows if row["source_id"] not in existing]
     worker_count = (
         resolve_worker_count(
@@ -615,7 +747,43 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             f"v12 Teacher failed for {len(failures)} source(s); "
             f"first={source_id}: {error}"
         ) from error
-    summary = {"schema": SUMMARY_SCHEMA, "boundary_serialization_contract_id": CONTRACT_ID, "model": model, "provider_profile": profile, "env_file_name": profile, "transport": transport.transport_name, "api_key_count": transport.api_key_count, "worker_count": worker_count, "reasoning_effort": "medium", "max_tokens": EXPECTED_MAX_TOKENS, "request_count": len(existing), "calls_per_source": 1, "omitted_sampling_parameters": ["temperature", "top_p", "top_k"], "prompt_profile": PROMPT_PROFILE, "prompt_version": PROMPT_VERSION, "teacher_timestamp_contract_id": TIMESTAMP_CONTRACT_ID, "teacher_execution_contract_id": execution_contract, "source_manifest": str(manifest), "source_manifest_sha256": manifest_sha, "source_count": len(rows), "result_count": len(existing), "results": str(labels_path), "raw_responses": str(raw_path), "training_manifest_allowed": False}
+    summary = {
+        "schema": SUMMARY_SCHEMA,
+        "boundary_serialization_contract_id": CONTRACT_ID,
+        "model": model,
+        "provider_profile": profile,
+        "env_file_name": profile,
+        "transport": transport.transport_name,
+        "api_key_count": transport.api_key_count,
+        "worker_count": worker_count,
+        "reasoning_effort": "medium",
+        "max_tokens": EXPECTED_MAX_TOKENS,
+        "request_count": len(existing) - len(calibration_seed_ids),
+        "calls_per_new_source": 1,
+        "calibration_seed_count": len(calibration_seed_ids),
+        "calibration_id": calibration["calibration_id"] if calibration else None,
+        "calibration_manifest_sha256": (
+            calibration["hashes"]["manifest"] if calibration else None
+        ),
+        "calibration_preaudit_sha256": (
+            calibration["hashes"]["preaudit"] if calibration else None
+        ),
+        "calibration_verdicts_sha256": (
+            calibration["hashes"]["verdicts"] if calibration else None
+        ),
+        "omitted_sampling_parameters": ["temperature", "top_p", "top_k"],
+        "prompt_profile": PROMPT_PROFILE,
+        "prompt_version": PROMPT_VERSION,
+        "teacher_timestamp_contract_id": TIMESTAMP_CONTRACT_ID,
+        "teacher_execution_contract_id": execution_contract,
+        "source_manifest": str(manifest),
+        "source_manifest_sha256": manifest_sha,
+        "source_count": len(rows),
+        "result_count": len(existing),
+        "results": str(labels_path),
+        "raw_responses": str(raw_path),
+        "training_manifest_allowed": False,
+    }
     (output / "summary.json").write_text(json.dumps(summary, ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     _write_progress(progress_path, {"schema": PROGRESS_SCHEMA, "status": "completed", "model": model, "provider_profile": profile, "reasoning_effort": "medium", "max_tokens": EXPECTED_MAX_TOKENS, "completed": len(existing), "total": len(rows), "pending": 0, "elapsed_s": round(time.perf_counter() - started, 3), "summary": str(output / "summary.json")})
     return summary
@@ -643,6 +811,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=0,
         help="0 uses one worker per native Gemini key; compatible providers remain single-worker.",
     )
+    parser.add_argument("--calibration-manifest")
+    parser.add_argument("--calibration-preaudit")
+    parser.add_argument("--calibration-verdicts")
     args = parser.parse_args(argv)
     if (
         args.limit < 0
