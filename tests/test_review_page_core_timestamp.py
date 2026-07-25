@@ -20,6 +20,14 @@ def test_audit_core_uses_shared_mmss_mmm_labels() -> None:
     assert "safeStart.toFixed(2)" not in AUDIO_SPAN_PLAYER_JS
 
 
+def test_audit_core_clamps_exact_span_end_with_high_frequency_fallbacks() -> None:
+    assert "audio.addEventListener('ended',stopFn)" in AUDIO_SPAN_PLAYER_JS
+    assert "requestAnimationFrame(watch)" in AUDIO_SPAN_PLAYER_JS
+    assert "setTimeout(finishAtEnd,remainingMilliseconds)" in AUDIO_SPAN_PLAYER_JS
+    assert "stop(safeEnd)" in AUDIO_SPAN_PLAYER_JS
+    assert "activeAudio.currentTime=finalTime" in AUDIO_SPAN_PLAYER_JS
+
+
 @pytest.mark.parametrize(
     ("relative_path", "required", "forbidden"),
     (

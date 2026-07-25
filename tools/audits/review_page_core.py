@@ -16,7 +16,7 @@ def format_audit_timestamp(seconds: float) -> str:
 
 
 AUDIO_SPAN_PLAYER_JS = r"""
-let activeAudio=null,activeButton=null,stopFn=null,playToken=0;
+let activeAudio=null,activeButton=null,stopFn=null,stopTimer=null,stopFrame=null,playToken=0;
 function formatAuditTimestamp(value){
   const numeric=Number(value);
   if(!Number.isFinite(numeric)||numeric<0)return '--:--.---';
@@ -28,12 +28,21 @@ function formatAuditTimestamp(value){
   return `${String(minutes).padStart(2,'0')}:${String(seconds).padStart(2,'0')}.${String(milliseconds).padStart(3,'0')}`;
 }
 function formatAuditSpan(start,end){return `${formatAuditTimestamp(start)}–${formatAuditTimestamp(end)}`;}
-function stop(){
+function stop(finalTime=null){
   playToken+=1;
-  if(activeAudio&&stopFn)activeAudio.removeEventListener('timeupdate',stopFn);
-  if(activeAudio)activeAudio.pause();
+  if(activeAudio&&stopFn){
+    activeAudio.removeEventListener('timeupdate',stopFn);
+    activeAudio.removeEventListener('ended',stopFn);
+  }
+  if(stopTimer!==null)clearTimeout(stopTimer);
+  if(stopFrame!==null)cancelAnimationFrame(stopFrame);
+  if(activeAudio){
+    activeAudio.pause();
+    if(Number.isFinite(finalTime))activeAudio.currentTime=finalTime;
+  }
   if(activeButton)activeButton.classList.remove('playing');
   activeAudio=activeButton=stopFn=null;
+  stopTimer=stopFrame=null;
 }
 function waitForMetadata(audio){
   if(audio.readyState>=1)return Promise.resolve();
@@ -51,6 +60,10 @@ function waitForMetadata(audio){
 }
 async function play(audio,button,start,end){
   stop();
+  if(!Number.isFinite(start)||!Number.isFinite(end)||end<=start){
+    document.getElementById('status').textContent='播放区间无效';
+    return;
+  }
   const token=++playToken;
   activeAudio=audio;
   activeButton=button;
@@ -64,15 +77,28 @@ async function play(audio,button,start,end){
     const safeStart=Math.max(0,Math.min(start,Math.max(0,audio.duration-.001)));
     const safeEnd=Math.max(safeStart,Math.min(end,audio.duration));
     audio.currentTime=safeStart;
+    const finishAtEnd=()=>{
+      if(token!==playToken||activeAudio!==audio||activeButton!==button)return;
+      status.textContent=`已停止 ${formatAuditSpan(safeStart,safeEnd)}`;
+      stop(safeEnd);
+    };
     stopFn=()=>{
-      if(token===playToken&&audio.currentTime>=safeEnd-.005){
-        status.textContent=`已停止 ${formatAuditSpan(safeStart,safeEnd)}`;
-        stop();
-      }
+      if(audio.ended||audio.currentTime>=safeEnd-.003)finishAtEnd();
     };
     audio.addEventListener('timeupdate',stopFn);
-    await audio.play();
+    audio.addEventListener('ended',stopFn);
+    const watch=()=>{
+      if(token!==playToken||activeAudio!==audio)return;
+      if(audio.currentTime>=safeEnd-.003){finishAtEnd();return;}
+      stopFrame=requestAnimationFrame(watch);
+    };
+    const started=audio.play();
+    stopFrame=requestAnimationFrame(watch);
+    await started;
     if(token!==playToken){audio.pause();return;}
+    const playbackRate=Math.max(.01,Math.abs(Number(audio.playbackRate)||1));
+    const remainingMilliseconds=Math.max(0,(safeEnd-audio.currentTime)*1000/playbackRate);
+    stopTimer=setTimeout(finishAtEnd,remainingMilliseconds);
     status.textContent=`播放 ${formatAuditSpan(safeStart,safeEnd)}`;
   }catch(error){
     if(token!==playToken)return;
