@@ -557,6 +557,12 @@ def training_label_from_omni(
 
 
 def extract_json_object(text: str) -> dict[str, Any]:
+    payload = extract_json_value(text, require_object=True)
+    assert isinstance(payload, dict)
+    return payload
+
+
+def extract_json_value(text: str, *, require_object: bool) -> Any:
     cleaned = str(text or "").strip()
     if cleaned.startswith("```"):
         cleaned = re.sub(r"^```(?:json)?\s*", "", cleaned, flags=re.IGNORECASE)
@@ -564,13 +570,15 @@ def extract_json_object(text: str) -> dict[str, Any]:
     try:
         payload = json.loads(cleaned)
     except json.JSONDecodeError:
+        if not require_object:
+            raise
         match = re.search(r"\{.*\}", cleaned, flags=re.DOTALL)
         if not match:
             raise
         payload = json.loads(match.group(0))
-    if not isinstance(payload, Mapping):
+    if require_object and not isinstance(payload, Mapping):
         raise ValueError("omni response JSON must be an object")
-    return dict(payload)
+    return dict(payload) if isinstance(payload, Mapping) else payload
 
 
 def data_uri_for_audio(path: Path, fmt: str) -> str:
@@ -716,8 +724,9 @@ def call_omni(
     exclude_reasoning: bool = False,
     require_provider_parameters: bool = False,
     response_format: Mapping[str, Any] | None = None,
+    require_object: bool = True,
     print_request: bool = False,
-) -> tuple[dict[str, Any], dict[str, Any]]:
+) -> tuple[Any, dict[str, Any]]:
     from openai import OpenAI
 
     client_kwargs: dict[str, Any] = {"api_key": api_key, "timeout": timeout_s}
@@ -816,7 +825,7 @@ def call_omni(
         if content:
             text_parts.append(content)
     content = "".join(text_parts)
-    parsed = extract_json_object(content)
+    parsed = extract_json_value(content, require_object=require_object)
     raw_response = {
         "stream": True,
         "content": content,

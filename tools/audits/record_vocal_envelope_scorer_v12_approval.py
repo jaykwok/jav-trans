@@ -38,7 +38,7 @@ from tools.boundary.ja.vocal_envelope_scorer_v12_calibration import (  # noqa: E
 
 CONTRACT_ID = "boundary_acoustic_binary_v12"
 AUDIT_SUMMARY_SCHEMA = "vocal_envelope_scorer_v12_teacher_audit_summary_v2"
-APPROVED_VOCAL_PURITY = "definite_vocal_excludes_separable_nonvoice"
+APPROVED_VOCAL_PURITY = "definite_vocal_excludes_separable_background"
 
 
 def _rows(path: Path) -> list[dict[str, Any]]:

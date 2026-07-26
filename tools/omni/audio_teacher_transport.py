@@ -31,7 +31,7 @@ OPENROUTER_GEMINI_EXECUTION_CONTRACT = (
 
 @dataclass(frozen=True)
 class AudioTeacherResult:
-    parsed: dict[str, Any]
+    parsed: Any
     raw: dict[str, Any]
 
 
@@ -60,6 +60,7 @@ class AudioTeacherTransport:
         thinking_level: str,
         thinking_budget: int,
         response_schema: Mapping[str, Any] | None = None,
+        require_object: bool = True,
         store_stream_chunks: bool = False,
         require_provider_parameters: bool = False,
     ) -> AudioTeacherResult:
@@ -104,6 +105,7 @@ class OpenAICompatibleAudioTeacherTransport(AudioTeacherTransport):
         thinking_level: str,
         thinking_budget: int,
         response_schema: Mapping[str, Any] | None = None,
+        require_object: bool = True,
         store_stream_chunks: bool = False,
         require_provider_parameters: bool = False,
     ) -> AudioTeacherResult:
@@ -127,13 +129,20 @@ class OpenAICompatibleAudioTeacherTransport(AudioTeacherTransport):
             exclude_reasoning=False,
             require_provider_parameters=require_provider_parameters,
             response_format=(
-                {"type": "json_object"} if self.profile == "openrouter" else None
+                {"type": "json_object"}
+                if self.profile == "openrouter" and require_object
+                else None
             ),
+            require_object=require_object,
         )
-        return AudioTeacherResult(parsed=dict(parsed), raw=dict(raw))
+        if require_object and not isinstance(parsed, Mapping):
+            raise ValueError("compatible audio Teacher JSON output must be an object")
+        return AudioTeacherResult(parsed=parsed, raw=dict(raw))
 
 
 class GoogleAIStudioAudioTeacherTransport(AudioTeacherTransport):
+    PROVIDER_CONCURRENCY_CAP = 2
+
     def __init__(
         self,
         *,
@@ -149,7 +158,10 @@ class GoogleAIStudioAudioTeacherTransport(AudioTeacherTransport):
         self.audio_content_mode = "native_inline_audio"
         self.execution_contract = GEMINI_NATIVE_EXECUTION_CONTRACT
         self.api_key_count = len(api_keys)
-        self.max_concurrency = len(api_keys)
+        self.max_concurrency = min(
+            len(api_keys),
+            self.PROVIDER_CONCURRENCY_CAP,
+        )
         self.quota_state_path = quota_state_path
         self.client = GeminiNativeAudioClient(
             api_keys=api_keys,
@@ -163,12 +175,18 @@ class GoogleAIStudioAudioTeacherTransport(AudioTeacherTransport):
         ready_values = sorted(
             str(item.get("rpm_ready_at_utc") or "") for item in key_states
         )
+        rpd_ready_values = sorted(
+            str(item.get("rpd_ready_at_utc") or "") for item in key_states
+        )
         log(
             "gemini_quota_status "
             f"key_count={len(key_states)} "
+            f"max_concurrency={self.max_concurrency} "
             f"rpd_remaining_total={sum(int(item['rpd_remaining']) for item in key_states)} "
             f"next_rpm_ready_at_utc={ready_values[0] if ready_values else 'n/a'} "
-            f"rpd_reset_at_utc={status['rpd_reset_at_utc']}"
+            f"next_rpd_ready_at_utc={rpd_ready_values[0] if rpd_ready_values else 'n/a'} "
+            f"rpd_accounting_mode={status['rpd_accounting_mode']} "
+            f"advisory_reset_at_utc={status['rpd_reset_at_utc']}"
         )
 
     def quota_status(self) -> dict[str, Any]:
@@ -185,6 +203,7 @@ class GoogleAIStudioAudioTeacherTransport(AudioTeacherTransport):
         thinking_level: str,
         thinking_budget: int,
         response_schema: Mapping[str, Any] | None = None,
+        require_object: bool = True,
         store_stream_chunks: bool = False,
         require_provider_parameters: bool = False,
     ) -> AudioTeacherResult:
@@ -194,6 +213,7 @@ class GoogleAIStudioAudioTeacherTransport(AudioTeacherTransport):
             system_prompt=system_prompt,
             prompt=prompt,
             response_schema=response_schema,
+            require_object=require_object,
             thinking_level=thinking_level if enable_thinking else "minimal",
             max_output_tokens=max_tokens,
         )

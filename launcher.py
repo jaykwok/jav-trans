@@ -226,7 +226,9 @@ def _cuda_probe_payload() -> dict:
 
     smi = payload.get("nvidia_smi") if isinstance(payload.get("nvidia_smi"), dict) else {}
     driver_cuda = str(smi.get("cuda_version") or "")
-    if not cuda_available and driver_cuda and _version_tuple(driver_cuda) < _version_tuple(torch_cuda):
+    driver_version = _version_tuple(driver_cuda)
+    torch_version = _version_tuple(torch_cuda)
+    if not cuda_available and driver_version and torch_version and driver_version < torch_version:
         payload.update(
             {
                 "code": "driver_too_old",

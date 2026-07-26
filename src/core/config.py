@@ -33,8 +33,8 @@ DEFAULT_SETTINGS: dict[str, str] = {
     "TORCH_HOME": "./tmp/cache/torch",
     # HuggingFace Hub endpoint override. Empty string means use the default huggingface.co.
     "HF_ENDPOINT": "",
-    # Optional network proxy. When host+port are set, load_config exports the
-    # standard HTTP_PROXY/HTTPS_PROXY/ALL_PROXY environment variables.
+    # Optional network proxy. When host+port are set, load_config exports HTTP_PROXY/
+    # HTTPS_PROXY/ALL_PROXY at config.py:317.
     "PROXY_PROTOCOL": "http",
     "PROXY_HOST": "",
     "PROXY_PORT": "",

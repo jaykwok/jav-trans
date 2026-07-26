@@ -2,11 +2,11 @@
 
 ## Decision
 
-Scorer v12 detects continuous human-voice event envelopes. A positive event
-requires actual voice: speech, linguistic whisper, voiced moaning or another
-audible human vocalization. Pure respiratory airflow, unvoiced panting,
-kissing, swallowing and mouth-action sounds are non-vocal; ambiguous weak
-voice versus airflow is ignored. All Scorer weights
+Scorer v12 detects continuous broad human-vocal event envelopes. Speech,
+whisper, moaning, panting, inhalation/exhalation, crying/laughter, coughing,
+kissing/oral sounds, singing and background human vocal evidence are positive.
+Pure mechanical/impact/action/cloth/bed/water/music/silence/ambience without
+human vocal evidence is non-vocal; uncertain overlap or boundaries are ignored. All Scorer weights
 are trained from random initialization with seed `117`; v10/v11 checkpoints are
 never loaded. The ASR PTM is only a frozen raw feature extractor.
 
@@ -18,19 +18,17 @@ runtime threshold, duration rule, hysteresis, NMS, rule merge, or fallback.
 
 - Keep source/core/video partition, PTM2048/MFCC40, P2048/H256 Bi-Mamba trunk,
   1000-frame context, midpoint ownership, seed and batch budget identical.
-- The previous 25-source pilot used the retired human-produced-sound policy and
-  is invalid. Its source manifest may be reused, but Teacher evidence, manual
-  verdicts and calibration hashes must be regenerated under
-  `human_voice_event_envelope_v2`.
-- The replacement 25-source pilot is only an implementation/data-contract gate. It has 13
-  train sources and no all-nonvocal held-out source, so it cannot choose a
-  production decoder.
+- The previous semantic and voice-only pilots are invalid. Their source
+  identities may be reused, but Teacher evidence, manual verdicts and
+  calibration hashes must be regenerated under `human_vocal_event_envelope_v3`.
+- A replacement broad-vocal pilot is only an implementation/data-contract gate
+  and cannot choose a production decoder without real all-vocal/all-nonvocal
+  held-out controls.
 - Before full training, expand real full-source train data and add real mixed,
   all-vocal and all-nonvocal val controls. Missing strata remain `n/a`; synthetic
   data cannot impersonate held-out evidence.
-- Old semantic v11 labels, the retired v12 labels that treated breathing and
-  mouth sounds as vocal, and human verdicts made under either policy are never
-  converted into voice-only truth.
+- Old semantic v11 labels, retired voice-only v12 labels, and human verdicts
+  made under either policy are never converted into broad-vocal truth.
 
 ## Loss arms
 
@@ -69,7 +67,7 @@ Selection is source-level and lexicographic, not a single inside score:
 
 1. Finish BF16/resource/runtime smoke for argmax-structured and CRF.
 2. Port Query-Mask and Dense Span+DP to breaking v12 schemas and smoke both.
-3. Regenerate the voice-only pilot and human calibration, then regenerate the
+3. Regenerate the broad-vocal pilot and human calibration, then regenerate the
    full-source Teacher evidence and held-out human gate. Expand v12 real
    full-source supervision and compile a final dataset
    with required held-out strata and immutable hashes.

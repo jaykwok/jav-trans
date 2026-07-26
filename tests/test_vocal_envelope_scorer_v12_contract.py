@@ -173,7 +173,7 @@ def _approved_verdicts(manifest: Path, preaudit: Path) -> Path:
                 "preaudit_sha256": preaudit_sha,
                 "reviewed_full_source": True,
                 "vocal_coverage": "definite_vocal_complete",
-                "vocal_purity": "definite_vocal_excludes_separable_nonvoice",
+                "vocal_purity": "definite_vocal_excludes_separable_background",
                 "non_vocal_safety": "definite_non_vocal_clean",
                 "envelope_structure": "event_envelopes_continuous",
                 "approved": True,
@@ -224,7 +224,7 @@ def _approved_verdicts_for_ids(
                 "preaudit_sha256": preaudit_sha,
                 "reviewed_full_source": True,
                 "vocal_coverage": "definite_vocal_complete",
-                "vocal_purity": "definite_vocal_excludes_separable_nonvoice",
+                "vocal_purity": "definite_vocal_excludes_separable_background",
                 "non_vocal_safety": "definite_non_vocal_clean",
                 "envelope_structure": "event_envelopes_continuous",
                 "approved": True,
@@ -321,7 +321,7 @@ def test_v12_contract_is_breaking_and_runtime_is_argmax(tmp_path: Path) -> None:
     retired_v12 = tmp_path / "retired-v12.pt"
     retired_payload = torch.load(checkpoint, map_location="cpu", weights_only=False)
     retired_payload["metadata"]["dataset_contract"]["label_unit"] = (
-        "human_vocal_event_envelope"
+        "human_voice_event_envelope"
     )
     torch.save(retired_payload, retired_v12)
     with pytest.raises(ValueError, match="dataset contract mismatch"):
@@ -410,11 +410,12 @@ def test_v12_structured_checkpoint_schemas_are_runtime_separate(
 
 
 def test_v12_prompts_and_timestamp_quantization_are_task_specific() -> None:
-    assert "连续的人类声音事件候选包络" in TRISTATE_SYSTEM_PROMPT
+    assert "连续的人类发声事件候选包络" in TRISTATE_SYSTEM_PROMPT
     assert "Proposal/Split" in TRISTATE_SYSTEM_PROMPT
     assert "CueQC" in TRISTATE_SYSTEM_PROMPT
     assert all(value in TRISTATE_SYSTEM_PROMPT for value in ("呻吟", "喘息", "吸气", "呼气"))
-    assert "声音来自人体并不等于人声" in TRISTATE_SYSTEM_PROMPT
+    assert "也不负责删除呻吟或喘息" in TRISTATE_SYSTEM_PROMPT
+    assert "亲吻/唾液/口腔声" in TRISTATE_SYSTEM_PROMPT
     assert "完整音频的 segments" in TRISTATE_SYSTEM_PROMPT
     assert "MM:SS.mmm" in TRISTATE_SYSTEM_PROMPT
     args = parse_args(["--manifest", "m", "--output-dir", "o"])
@@ -442,7 +443,7 @@ def test_v12_prompts_and_timestamp_quantization_are_task_specific() -> None:
                     "start_ts": "00:00.000",
                     "end_ts": "00:00.021",
                     "label": "vocal_candidate",
-                    "category": "speech",
+                    "category": "vocal",
                 },
                 {
                     "start_ts": "00:00.021",
@@ -466,7 +467,7 @@ def test_v12_prompts_and_timestamp_quantization_are_task_specific() -> None:
     assert (normalized["unsure_spans"][0]["start_frame"], normalized["unsure_spans"][0]["end_frame"]) == (4, 5)
     with pytest.raises(ValueError, match="numeric seconds are rejected"):
         _normalize_segments(
-            {"segments": [{"start_ts": 0.0, "end_ts": "00:00.100", "label": "vocal_candidate", "category": "speech"}]},
+            {"segments": [{"start_ts": 0.0, "end_ts": "00:00.100", "label": "vocal_candidate", "category": "vocal"}]},
             duration_s=0.1,
             frame_count=5,
         )
@@ -474,7 +475,7 @@ def test_v12_prompts_and_timestamp_quantization_are_task_specific() -> None:
         _normalize_segments(
             {
                 "segments": [
-                    {"start_ts": "00:00.000", "end_ts": "00:00.120", "label": "vocal_candidate", "category": "speech"}
+                    {"start_ts": "00:00.000", "end_ts": "00:00.120", "label": "vocal_candidate", "category": "vocal"}
                 ]
             },
             duration_s=0.1,
@@ -508,8 +509,8 @@ def test_v12_teacher_prompt_and_schema_content_are_fingerprint_bound() -> None:
         )
 
 
-@pytest.mark.parametrize("category", ("speech", "whisper_language", "moan", "voiced_vocalization"))
-def test_v12_voice_categories_are_positive(category: str) -> None:
+@pytest.mark.parametrize("category", ("vocal", "mixed_vocal"))
+def test_v12_broad_vocal_categories_are_positive(category: str) -> None:
     normalized = _normalize_segments(
         {
             "segments": [
@@ -529,41 +530,19 @@ def test_v12_voice_categories_are_positive(category: str) -> None:
     assert normalized["vocal_spans"][0]["category"] == category
 
 
-@pytest.mark.parametrize(
-    "category",
-    ("breath_airflow", "pant_airflow", "kiss", "oral_action", "swallow", "cough"),
-)
-def test_v12_nonvoice_human_sounds_are_negative(category: str) -> None:
+@pytest.mark.parametrize("category", ("mechanical", "impact", "cloth", "bed"))
+def test_v12_nonvocal_categories_are_negative(category: str) -> None:
     normalized = _normalize_segments(
-        {
-            "segments": [
-                {
-                    "start_ts": "00:00.000",
-                    "end_ts": "00:00.100",
-                    "label": "non_vocal_candidate",
-                    "category": category,
-                }
-            ]
-        },
+        {"segments": [{"start_ts": "00:00.000", "end_ts": "00:00.100", "label": "non_vocal_candidate", "category": category}]},
         duration_s=0.1,
         frame_count=5,
     )
     assert normalized["non_vocal_spans"][0]["start_frame"] == 0
     assert normalized["non_vocal_spans"][0]["end_frame"] == 5
-    assert normalized["non_vocal_spans"][0]["category"] == category
 
-    with pytest.raises(ValueError, match="unsupported vocal category"):
+    with pytest.raises(ValueError, match="unsupported non-vocal category"):
         _normalize_segments(
-            {
-                "segments": [
-                    {
-                        "start_ts": "00:00.000",
-                        "end_ts": "00:00.100",
-                        "label": "vocal_candidate",
-                        "category": category,
-                    }
-                ]
-            },
+            {"segments": [{"start_ts": "00:00.000", "end_ts": "00:00.100", "label": "non_vocal_candidate", "category": "vocal"}]},
             duration_s=0.1,
             frame_count=5,
         )
@@ -574,7 +553,7 @@ def test_v12_single_pass_rejects_gaps_and_adjacent_duplicate_labels() -> None:
         _normalize_segments(
             {
                 "segments": [
-                    {"start_ts": "00:00.000", "end_ts": "00:00.040", "label": "vocal_candidate", "category": "speech"},
+                    {"start_ts": "00:00.000", "end_ts": "00:00.040", "label": "vocal_candidate", "category": "vocal"},
                     {"start_ts": "00:00.060", "end_ts": "00:00.100", "label": "unsure", "category": "uncertain"},
                 ]
             },
@@ -585,8 +564,8 @@ def test_v12_single_pass_rejects_gaps_and_adjacent_duplicate_labels() -> None:
         _normalize_segments(
             {
                 "segments": [
-                    {"start_ts": "00:00.000", "end_ts": "00:00.040", "label": "vocal_candidate", "category": "speech"},
-                    {"start_ts": "00:00.040", "end_ts": "00:00.100", "label": "vocal_candidate", "category": "speech"},
+                    {"start_ts": "00:00.000", "end_ts": "00:00.040", "label": "vocal_candidate", "category": "vocal"},
+                    {"start_ts": "00:00.040", "end_ts": "00:00.100", "label": "vocal_candidate", "category": "vocal"},
                 ]
             },
             duration_s=0.1,
@@ -704,7 +683,7 @@ def test_v12_canonical_can_be_explicitly_enabled_after_external_review(
         "non_vocal_candidate": 6,
         "vocal_candidate": 9,
     }
-    assert summary["dataset_contract"]["label_unit"] == "human_voice_event_envelope"
+    assert summary["dataset_contract"]["label_unit"] == "human_vocal_event_envelope"
     assert summary["canonical_label_schema"] == "vocal_envelope_frames_v2"
     assert VOCAL_ENVELOPE_SCORER_V12_SCHEMA == "vocal_envelope_scorer_v12"
 
@@ -950,18 +929,30 @@ def test_v12_teacher_audit_uses_shared_core_and_independent_span_playback(
     assert summary["task_semantics"] == VOCAL_ENVELOPE_SCORER_V12_TASK_SEMANTICS
     page = (output / "index.html").read_text(encoding="utf-8")
     assert "createAuditReviewCore" in page
-    assert "Human Voice Envelope Teacher review" in page
+    assert "Human Vocal Envelope Teacher review" in page
     assert "canonical vocal" in page
     assert "canonical non-vocal" in page
     assert "canonical unsure" in page
     assert "颜色条点击后只播放自身精确区间" in page
-    assert "纯呼吸气流、无声喘气、亲吻、吞咽" in page
-    assert "带声呻吟" in page
-    assert "definite_vocal_excludes_separable_nonvoice" in page
-    assert "definite_vocal_contains_separable_nonvoice" in page
+    assert "亲吻/唾液/口腔声" in page
+    assert "肉体撞击虽由人体产生" in page
+    assert "definite_vocal_excludes_separable_background" in page
+    assert "definite_vocal_contains_separable_background" in page
     assert "definite_non_vocal_contains_vocal" in page
     assert "both_fragmented_and_overmerged" in page
     assert "vocal-envelope-scorer-v12-teacher-audit-v2" in page
+    assert "vocal-envelope-scorer-v12-teacher-audit-v2-editable" in page
+    assert "可编辑最终分区" in page
+    assert "convertSegment" in page
+    assert "splitSegment" in page
+    assert "mergeSegment" in page
+    assert "addSegment" in page
+    assert "relabelRange" in page
+    assert "选区转换/覆盖" in page
+    assert "validateAuditPartition" in page
+    assert "corrected_spans" in page
+    assert "corrected_span_signature" in page
+    assert "evidence_span_signature" in page
     assert "location.pathname" in page
     assert summary["source_manifest_sha256"] in page
     assert summary["preaudit_sha256"] in page

@@ -14,6 +14,7 @@ _pending_progress_tasks: set[asyncio.Task[None]] = set()
 async def subscribe() -> asyncio.Queue[str]:
     queue: asyncio.Queue[str] = asyncio.Queue(maxsize=200)
     _subscribers.append(queue)
+    await queue.put('{"type": "connected"}')
     return queue
 
 

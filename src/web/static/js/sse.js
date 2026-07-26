@@ -45,6 +45,8 @@ export function connectSSE() {
           if (speedMb != null) {
             if (speedMb < 1.0 && slowSince == null) slowSince = Date.now();
             else if (speedMb >= 1.0) slowSince = null;
+          } else {
+            slowSince = null;
           }
           job._download = {
             file:    x.file    || prev.file    || '',

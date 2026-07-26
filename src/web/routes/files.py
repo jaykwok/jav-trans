@@ -102,13 +102,29 @@ def _artifact_path_candidates(job: JobState, raw_path: str) -> list[Path]:
 
 
 def _resolve_authorized_artifact_path(job: JobState, raw_path: str) -> Path | None:
+    output_base = _resolve_output_base(job.spec.output_dir).resolve()
+    project_root = PROJECT_ROOT.resolve()
+
     for candidate in _artifact_path_candidates(job, raw_path):
         try:
             resolved = candidate.expanduser().resolve()
         except (OSError, RuntimeError):
             continue
-        if resolved.exists():
-            return resolved
+        if not resolved.exists():
+            continue
+
+        # Guard against path traversal: only return paths inside the job's output
+        # base or the project root, even if a persisted jobs.json artifact entry
+        # was tampered to point elsewhere.
+        try:
+            resolved.relative_to(output_base)
+        except ValueError:
+            try:
+                resolved.relative_to(project_root)
+            except ValueError:
+                continue
+
+        return resolved
     return None
 
 

@@ -22,7 +22,7 @@ jav-trans 是一个面向 Windows + NVIDIA 显卡的本地 JAV 字幕生成工�
 
 当前设计把职责拆开：
 
-- Voice-envelope Scorer v12 只检测连续的真正人声事件：对白、语言耳语、带声呻吟、带声哭笑、歌唱和远处人声属于 `vocal_candidate`。纯呼吸气流、无声喘气、亲吻、吞咽、唾液/口腔动作、咳嗽等非嗓音人体声，以及静音、环境/BGM、机械、衣物/床体/水声和纯肉体撞击声属于 `non_vocal_candidate`；弱呻吟、耳语与纯气流无法可靠区分时标为训练忽略的 `unsure`。它不判断语义，也不按句切分。
+- Vocal-envelope Scorer v12 只检测连续的人类发声事件包络：对白、耳语、呻吟、喘息、吸呼气、哭笑、咳嗽、亲吻/唾液/口腔声、歌唱和远处人声都属于 `vocal_candidate`。确认没有人类发声的静音、环境/BGM、机械、衣物/床体/水声和纯肉体撞击/拍打声属于 `non_vocal_candidate`；无法确认是否叠有人类发声或边界不可靠时标为训练忽略的 `unsure`。它不判断语义，也不按句切分。
 - Boundary Proposal 只提供高召回候选断点；Acoustic Split v4 学习 `cut/continue`，负责把包络内独立事件隔离成 provisional sub-islands。
 - Pre-ASR CueQC v13 对 provisional sub-island 做 `keep/drop` 二分类 argmax 路由；teacher/data 层可以保留 `unsure`，但模型不会输出它。
 - Inner Edge Refiner v2 对 CueQC 保留的 sub-island 做逐帧二分类 argmax，裁成送入 ASR 的 acoustic semantic core。
@@ -113,7 +113,7 @@ Web 会在模型要求检查中提示驱动过旧或 CUDA 初始化失败。
   -> Shared Qwen feature extraction
      - Qwen ASR repo 对应的 frozen PTM/encoder frame features
      - MFCC / timing numeric features
-  -> Voice-envelope Scorer v12（1.7B，按 voice-only 标签完全随机初始化重训中，registry 仍为空）
+  -> Vocal-envelope Scorer v12（1.7B，按 broad human-vocal 标签完全随机初始化，registry 仍为空）
      - 主臂：raw PTM2048 -> checkpoint 内 Linear(2048->2048)+GELU
      - 与 normalized MFCC40 拼接后 Linear(2088->256)
      - valid-prefix bidirectional Mamba2(hidden=256)
@@ -146,7 +146,7 @@ Web 会在模型要求检查中提示驱动过旧或 CUDA 初始化失败。
 
 关键约束：
 
-- Scorer v12 只决定是否存在连续真正人声事件，不负责语义 drop 或句内切点；Proposal 只能附加非绑定候选，最终 cut 由 Split 决定。
+- Scorer v12 只决定是否存在连续人类发声事件，不负责语义 drop 或句内切点；Proposal 只能附加非绑定候选，最终 cut 由 Split 决定。
 - 内部 cut 是一个共享绝对时间戳，不允许左右 chunk 各自修边。
 - `20 / (24000/1001)` 是字幕最短显示和 micro chunk 风险线，不是 runtime duration-only drop 阈值。
 - 7 秒是字幕显示 soft guard，不是 ASR chunk 上限。
@@ -177,7 +177,7 @@ src/checkpoints/
 
 1.7B 的目标 Boundary pipeline 统一使用合同 `boundary_acoustic_binary_v12`：Scorer v12 → Proposal → Acoustic Split v4 → provisional sub-islands → CueQC v13 → Inner v2 acoustic core → Chunk/ASR。Outer 只保留 no-Outer / edge-only A/B，不再预设为必需组件。模型缺失、repo 不匹配、合同不兼容或选择 0.6B 都会直接报错，不提供规则 fallback 或静默迁移。
 
-当前训练数据状态：Gemini 3.6 Flash Medium 以一次完整 source 三态调用输出 `vocal_candidate / non_vocal_candidate / unsure` 连续全覆盖；请求固定 `max_tokens=8192 / MM:SS.mmm`，不发送 temperature/top-p/top-k。25 条 pilot 已由用户整页批准，canonical 为 train/val/test=`13/5/7`、vocal/non-vocal=`85418/8227` 帧。完整真实 source manifest 已冻结为 train/val/test=`120/10/14`、29 个有效 video；旧 v11 语义标签和旧人工“去呻吟”审计均不进入 v12。完整 train 可在绑定 pilot 校准 SHA、相同 provider/model/prompt/执行合同时使用 Teacher 证据；val/test 仍需人工 verdict。四个 decoder 的 2-step CUDA smoke 已通过，只证明路径可训练，不用于选优；正式 full training 尚未完成。详细合同与选优顺序见 [Scorer v12 structured-decoder training plan](docs/audits/20260725_scorer-v12-structured-decoder-training-plan.md)，旧 v11 实验只作为失败路线保存在 [docs/HISTORY.md](docs/HISTORY.md)。
+当前训练数据状态：主线 Gemini 3.6 Flash Medium 以一次完整 source 三态调用输出 `vocal_candidate / non_vocal_candidate / unsure` 连续全覆盖；请求固定 `max_tokens=8192 / MM:SS.mmm`，不发送 temperature/top-p/top-k。职责恢复为 broad human-vocal 后，旧 v11 语义标签、旧人工“去呻吟”审计、旧 voice-only pilot/calibration 和对应 checkpoint 均不能作为当前真值。冻结的 source/core/video partition、WAV、音频/帧 SHA 与严格匹配的 raw PTM2048/MFCC40 可以复用；新的 broad-vocal calibration 尚未冻结，production registry 仍为空。紧凑固定规则 Prompt 和 adaptive rolling Prompt 都只作为 held-out A/B 证据，`training_manifest_allowed=false`。主线完整 source 继续使用严格 `MM:SS.mmm`；adaptive 窗口最多 20 秒，允许 10ms 数字局部坐标，但所有相邻 span 共用同一个切点并按 vocal-safe 方向量化到 Scorer 的 20ms 帧。该 A/B 当前显示 adaptive Teacher 明显更碎，人工 gate 尚未完成，不能进入 canonical。详细合同与选优顺序见 [Scorer v12 structured-decoder training plan](docs/audits/20260725_scorer-v12-structured-decoder-training-plan.md) 和 [adaptive partition/time-grid A/B](docs/audits/20260726_scorer-v12-adaptive-partition-time-grid-ab-v1.md)，旧路线只作为失败证据保存在 [docs/HISTORY.md](docs/HISTORY.md)。
 
 Split v4 当前唯一合法训练数据合同是
 `acoustic_split_v4_sequence_dataset_summary_v1`：raw PTM2048 + MFCC40（frame
@@ -208,18 +208,22 @@ feature/metadata 导出，因此准备器会明确 fail-closed；任何 pending 
 AI Studio 原生 Interactions API，不再作为 OpenRouter Gemini 的别名。
 OpenRouter 常用键为 `OMNI_MODEL/OMNI_API_KEY/OMNI_BASE_URL`；原生 Gemini
 使用 `GEMINI_MODEL=gemini-3.6-flash`（可省略）与
-`GEMINI_API_KEY=KEY_1,KEY_2`。逗号分隔 Key 去重后按槽位管理，同一 Key 的
-请求起点按每槽位 5 RPM 限速，并保守按每槽位 20 RPD 管理；RPD 在太平洋时间
-午夜重置；每个真正发出的请求（包括返回错误的请求）都会在发送前计入 RPD。
+`GEMINI_API_KEY=KEY_1,KEY_2`。逗号分隔 Key 去重后只增加配额轮换槽，不增加到
+同等数量的并发：原生 provider 全局最多 2 worker，Scorer adaptive rolling
+Teacher 默认 1 worker 串行。每个 Key 按 5 RPM / 250k TPM / 20 RPD 限速（Google AI Studio 官方单 Key 限额的保守估计；若通过第三方 API 网关访问，实际限速以网关全局配置为准）。，并用最近 24
+小时真实请求时间做保守的 20 RPD 滚动账本；每个真正发出的请求（包括错误响应）
+都在发送前计入。Google 的真实免费层日界线仍待观察：东八区 16:00 只作为状态
+中的 advisory 观察点，绝不会据此清空请求历史或自动放行；明确的 daily-429 会为
+该 Key 持久化至少 24 小时冷却。
+
 状态原子保存在同目录 `gemini.quota.json`，其中只有 Key 的 SHA-256 指纹，不含
-Key 值；每个指纹记录最近 60 秒请求时间与 token usage、RPM/TPM/RPD 剩余额度、
-当日首次/最近请求时间、下一次可请求时间、429 冷却截止时间和下一次 RPD 重置
-时间。进程重启后继续读取这些状态；新增、删除或重排 Key 依靠指纹稳定匹配。
-达到本地日预算会主动切到下一槽位，远端 HTTP 429 也会切换槽位。原生 Gemini
-批处理默认 `--workers=0`，即一 Key 一 worker，并行请求仍由各自状态独立限速；
-可用 `--workers N` 主动降低并发，但不能超过 Key 数量。Google 官方实际按
-project 而不是 Key 计费/限流，因此多个 Key 只有在属于不同 project 时才会提供
-多份独立额度。
+Key 值；每个指纹记录最近 60 秒 RPM/TPM 事件、最近 24 小时 RPD 请求、首次/最近
+请求时间、下一释放时间、普通 429 冷却、daily-429 时间及其 RPD 冷却。进程重启
+后继续读取；新增、删除或重排 Key 依靠指纹稳定匹配。达到本地滚动预算会主动切
+到下一槽位，远端 HTTP 429 也会切换槽位。通用批处理 `--workers=0` 解析为 provider
+上限 2；可用 `--workers 1` 强制串行，但不能请求高于 provider 上限的并发。Google
+实际按 project 而不是 Key 计费/限流，因此多个 Key 只有属于不同 project 时才可能
+提供多份独立额度。
 OpenRouter 上的 Gemini 数据标注请求默认使用 `reasoning.effort=medium`、默认
 `max_tokens=8192` 和 `input_audio_raw`，默认不设置 `reasoning.exclude`
 （需要隐藏思考文本时用 `--exclude-reasoning`）；`high` 只用于显式受控
@@ -228,10 +232,14 @@ A/B，不作为 canonical 数据标注默认值。Qwen 使用
 `input_audio`。Qwen 与 OpenRouter 均不显式发送 temperature、top-p 或
 top-k。原生 Gemini 使用 `POST /v1beta/interactions`、内联音频、
 `thinking_level=medium`、`max_output_tokens=8192`、结构化 JSON 输出且
-`store=false`，同样不发送 temperature、top-p 或 top-k。任何要求 Teacher 生成时间坐标的工具统一使用
-`omni_audio_timestamp_mmss_mmm_v1`：wire 字段为严格字符串
+`store=false`，同样不发送 temperature、top-p 或 top-k。旧 v3/v4 固定日界线
+账本会保守迁移到 v5 的滚动 24 小时状态，不会因 schema 升级恢复预算。现役完整
+source Teacher 生成时间坐标时统一使用 `omni_audio_timestamp_mmss_mmm_v1`：wire 字段为严格字符串
 `start_ts/end_ts/time_ts`（`MM:SS.mmm`），旧数字秒响应直接拒绝；本地严格
-解析后，训练与审计 manifest 内部仍可保存数值 `start_s/end_s/time_s`。
+解析后，训练与审计 manifest 内部仍可保存数值 `start_s/end_s/time_s`。唯一隔离
+例外是 Scorer adaptive A/B 的最多 20 秒局部窗口：其 wire 使用严格 10ms 数字坐标，
+随后由共享 quantizer 一次性映射为 vocal-safe 的 20ms Scorer 帧；该例外不能用于
+其它 Teacher，也不能绕过主线 `MM:SS.mmm` 合同。
 - 代理协议 / 地址 / 端口（可选，用于模型下载和 HTTP 请求）
 
 ASR 显存自适应默认值已经内置。当前完整工作流固定使用 `1.7B`；batch 或显存预算可通过“参数调优”里的环境变量覆盖，或手动编辑首次保存后生成的 `.env`。
@@ -390,12 +398,13 @@ uv run python -m <module> --help
 - `tools.web.smoke.start_server` / `submit_job` / `poll_job` / `summarize_job`：Web 服务 smoke 和任务汇总。
 - `tools.audits.audit_nav` / `serve_audits.ps1`：审计页导航与 Windows 本地服务。
 - `tools.audits.review_page_core` / `audit_prompt`：人工审计页共享 Core（`MM:SS.mmm` 区间显示与播放器、状态、完成度、保存 API）与可复用提示配置；任务特有布局、证据和完备 verdict 组合由 Adapter 提供。设计合同见 [Human Audit Page Core](docs/audits/20260723_human-audit-page-core-v1.md)。
-- `tools.omni.timestamp_contract`：所有区间 Teacher 的严格 `MM:SS.mmm` wire schema、格式化、解析和 source-bound 校验；不提供数字秒兼容或时间猜测。
+- `tools.omni.timestamp_contract`：现役完整 source 区间 Teacher 的严格 `MM:SS.mmm` wire schema、格式化、解析和 source-bound 校验；不提供数字秒兼容或时间猜测。Scorer adaptive A/B 的隔离 10ms 局部时间合同由其 Adapter 校验，不能外溢到其它 Teacher。
 - `tools.omni.run_audio_teacher` / `tools.omni.audio_teacher_batch`：音频 Teacher Core；统一处理 `--prompt/--prompt-file`、`--folder/--file/--manifest`、provider-safe 并发、进度、续跑和主线程串行化落盘，不直接生成训练真值。
 - `tools.omni.audio_teacher_transport`：Qwen、OpenRouter、Google AI Studio 三个 provider Adapter 的唯一分派入口；请求与响应协议互不冒充。
-- `tools.omni.gemini_native` / `tools.omni.inspect_gemini_quota`：Google AI Studio 原生 Interactions 音频 Adapter 与无请求状态入口；实现内联音频、结构化输出、思考/usage 证据、每槽位 5 RPM / 250k TPM / 20 RPD、太平洋日界线、可读配额状态账本与多 Key 429 轮换。`uv run python -m tools.omni.inspect_gemini_quota` 不发送 API 请求，只刷新并显示脱敏状态。
+- `tools.omni.gemini_native` / `tools.omni.inspect_gemini_quota`：Google AI Studio 原生 Interactions 音频 Adapter 与无请求状态入口；实现内联音频、结构化输出、思考/usage 证据、provider 并发上限 2、每槽位 5 RPM / 250k TPM / 保守滚动 24h 的 20 RPD、daily-429 冷却、脱敏状态账本与多 Key 轮换。东八区 16:00 只作 advisory 观察，不释放额度。`uv run python -m tools.omni.inspect_gemini_quota` 不发送 API 请求，只刷新并显示脱敏状态。
 - `tools.boundary.ja.build_vocal_envelope_scorer_v12_pilot_manifest` / `build_vocal_envelope_scorer_v12_full_manifest`：从冻结 source/partition 只重用身份并重新校验音频 SHA、时长、采样和 frame geometry；不继承 v11 标签、span 或 ASR 文本。
-- `tools.boundary.ja.label_vocal_envelope_scorer_v12_with_omni` / `vocal_envelope_scorer_v12_calibration` / `compile_vocal_envelope_scorer_v12_canonical`：Scorer v12 单调用三态 Teacher、固定 25 条人工批准校准合同与严格 canonical compiler；可把完全相同音频/帧/区间的 pilot 证据零请求重绑定到 full manifest，train 允许校准 Teacher 监督，非 pilot val/test 仍必须人工审计。
+- `tools.boundary.ja.label_vocal_envelope_scorer_v12_with_omni` / `vocal_envelope_scorer_v12_calibration` / `compile_vocal_envelope_scorer_v12_canonical`：Scorer v12 broad-vocal 单调用三态 Teacher、人工校准合同与严格 canonical compiler；当前 calibration hash 为空，未重新人工批准前 fail-closed。
+- `tools.boundary.ja.label_vocal_envelope_scorer_v12_compact_ab` / `tools.audits.generate_vocal_envelope_scorer_v12_prompt_ab_html`：Scorer adaptive complete-partition 隔离实验 Adapter 与 broad-v3 单页 A/B 审计 Adapter；每窗最多 20s、局部坐标严格 10ms、共享边界 vocal-safe 量化到 20ms frame，默认串行；所有输出固定 `training_manifest_allowed=false`，不能进入主线 canonical。
 - `tools.boundary.ja.train_vocal_envelope_scorer_v12`：完全随机初始化的 v12 训练器，支持 argmax structured、CRF、Query-Mask 与 Dense Span decoder，持续写入原子 `progress.json`。
 - `tools.audits.generate_candidate_island_dual_evidence_review`：Scorer Protect×Remove 与人工 full-source truth 的三轴 bridge-gap Adapter。
 - `tools.audits.generate_vocal_envelope_scorer_v12_teacher_audit_html`：Scorer v12 三态 Teacher 审计 Adapter；可筛选 train/val/test，并仅在 full evidence 与固定人工批准 pilot 的音频、帧和区间完全一致时跳过已审 calibration source，保存结果始终绑定当前 full manifest/preaudit SHA。

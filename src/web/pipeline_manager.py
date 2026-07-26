@@ -440,6 +440,9 @@ async def gpu_worker() -> None:
                 job,
                 cancel_event,
             )
+            # Check cancel again after executor returns: if cancel happened inside the
+            # executor (between its last checkpoint and return), the artifacts are
+            # complete but stale. Do not enqueue them for translation.
             if cancel_event.is_set():
                 await _set_job(
                     job,

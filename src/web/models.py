@@ -65,7 +65,6 @@ class SettingsRead(BaseModel):
     api_key_set: bool
     api_key_preview: str
     base_url: str
-    model: str = ""
     proxy_protocol: Literal["http", "https", "socks5"] = "http"
     proxy_host: str = ""
     proxy_port: int | None = None

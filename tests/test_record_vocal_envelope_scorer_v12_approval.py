@@ -181,7 +181,7 @@ def test_records_exact_artifact_chain_bound_blanket_approval(tmp_path: Path) -> 
     assert row["approved"] is True
     assert row["training_manifest_allowed"] is True
     assert row["task_semantics"] == VOCAL_ENVELOPE_SCORER_V12_TASK_SEMANTICS
-    assert row["vocal_purity"] == "definite_vocal_excludes_separable_nonvoice"
+    assert row["vocal_purity"] == "definite_vocal_excludes_separable_background"
     assert row["approval_provenance"] == "explicit_user_blanket_approval"
     assert row["source_manifest_sha256"] == _sha256(
         artifacts["source_manifest"]  # type: ignore[arg-type]

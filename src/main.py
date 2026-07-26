@@ -40,6 +40,9 @@ if os.getenv("HF_HOME"):
 if os.getenv("TORCH_HOME"):
     os.environ["TORCH_HOME"] = os.path.abspath(os.getenv("TORCH_HOME"))
 
+# Coverage note: atexit cleanup sweeps tmp/chunks, tmp/asr_timeouts, and per-job
+# tmp/web/jobs/<id>/audio directories. Model caches (tmp/cache) and job state
+# (tmp/web/jobs.json) are intentionally preserved across runs.
 
 class _LazyTorch:
     _module = None

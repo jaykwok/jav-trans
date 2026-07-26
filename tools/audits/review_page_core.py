@@ -162,15 +162,78 @@ function createAuditReviewCore(config){
   function persist(){localStorage.setItem(config.storageKey,JSON.stringify(annotations));updateStatus();}
   async function save(){
     const entries=config.entries.filter(entry=>!config.shouldSerialize||config.shouldSerialize(ensure(entry),entry));
-    const lines=entries.map(entry=>JSON.stringify(config.serialize(entry,ensure(entry))));
-    const content=lines.length?lines.join('\n')+'\n':'';
     try{
+      const serialized=await Promise.all(entries.map(entry=>Promise.resolve(config.serialize(entry,ensure(entry)))));
+      const lines=serialized.map(value=>JSON.stringify(value));
+      const content=lines.length?lines.join('\n')+'\n':'';
       const response=await fetch('/__audit_api__/save-labels',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({href:location.pathname,filename:config.filename||'manual_verdicts.jsonl',content})});
       const result=await response.json();
       updateStatus(response.ok&&result.ok?'已保存到 '+result.path:'保存失败: '+(result.error||response.status));
     }catch(error){updateStatus('保存失败: '+error.message);}
   }
-  return {ensure,persist,save,updateStatus,annotations};
+  return {ensure,persist,save,updateStatus,annotations,isComplete:config.isComplete,shouldSerialize:config.shouldSerialize};
+}
+
+/*
+ * Shared editable complete-partition helpers.  Adapters may keep their own
+ * state shape, but should use these helpers rather than silently inventing
+ * different boundary semantics.  A partition is frame based and uses the
+ * three central labels; gaps are allowed while editing and rejected at save.
+ */
+const AUDIT_PARTITION_LABELS=new Set(['vocal_candidate','non_vocal_candidate','unsure']);
+function cloneAuditPartition(segments){
+  return (Array.isArray(segments)?segments:[]).map((segment,index)=>({
+    id:String(segment.id||`segment-${index}`),
+    label:String(segment.label||'unsure'),
+    start_frame:Number(segment.start_frame),
+    end_frame:Number(segment.end_frame),
+    category:segment.category==null?'':String(segment.category),
+    reason:segment.reason==null?'':String(segment.reason)
+  }));
+}
+function normalizeAuditPartition(segments){
+  const sorted=cloneAuditPartition(segments).filter(segment=>Number.isFinite(segment.start_frame)&&Number.isFinite(segment.end_frame)&&segment.end_frame>segment.start_frame).sort((a,b)=>a.start_frame-b.start_frame||a.end_frame-b.end_frame||a.id.localeCompare(b.id));
+  const result=[];
+  for(const segment of sorted){
+    const previous=result[result.length-1];
+    if(previous&&previous.label===segment.label&&previous.end_frame===segment.start_frame){
+      previous.end_frame=segment.end_frame;
+      previous.reason=previous.reason||segment.reason;
+      previous.category=previous.category||segment.category;
+    }else result.push(segment);
+  }
+  return result;
+}
+function validateAuditPartition(segments,frameCount){
+  const count=Number(frameCount),normalized=normalizeAuditPartition(segments);
+  if(!Number.isInteger(count)||count<=0)return {ok:false,error:'无效的 frame_count'};
+  if(!normalized.length)return {ok:false,error:'至少需要一个区间'};
+  let cursor=0;
+  for(const segment of normalized){
+    if(!AUDIT_PARTITION_LABELS.has(segment.label))return {ok:false,error:`未知标签：${segment.label}`};
+    if(!Number.isInteger(segment.start_frame)||!Number.isInteger(segment.end_frame))return {ok:false,error:'区间边界必须对齐到 frame'};
+    if(segment.start_frame<0||segment.end_frame>count||segment.end_frame<=segment.start_frame)return {ok:false,error:'存在越界或空区间'};
+    if(segment.start_frame<cursor)return {ok:false,error:'区间重叠'};
+    if(segment.start_frame>cursor)return {ok:false,error:`存在空洞：${cursor}–${segment.start_frame} frame`};
+    cursor=segment.end_frame;
+  }
+  if(cursor!==count)return {ok:false,error:`末尾未覆盖到 ${count} frame`};
+  return {ok:true,segments:normalized};
+}
+function auditPartitionCanonicalRows(segments){
+  return normalizeAuditPartition(segments).map(segment=>({label:segment.label,start_frame:Number(segment.start_frame),end_frame:Number(segment.end_frame)}));
+}
+function auditPartitionCanonicalJson(segments){
+  return JSON.stringify(auditPartitionCanonicalRows(segments));
+}
+async function auditPartitionSha256(segments){
+  const bytes=new TextEncoder().encode(auditPartitionCanonicalJson(segments));
+  if(!globalThis.crypto||!globalThis.crypto.subtle)throw new Error('当前浏览器不支持 Web Crypto，无法生成 corrected_span_signature');
+  const digest=await globalThis.crypto.subtle.digest('SHA-256',bytes);
+  return [...new Uint8Array(digest)].map(byte=>byte.toString(16).padStart(2,'0')).join('');
+}
+function auditPartitionSeconds(segment,frameHop){
+  return {start_s:Number((Number(segment.start_frame)*Number(frameHop)).toFixed(6)),end_s:Number((Number(segment.end_frame)*Number(frameHop)).toFixed(6))};
 }
 """
 

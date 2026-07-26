@@ -21,8 +21,8 @@ from tools.omni.gemini_native import (
     GeminiNativeAudioClient,
     GeminiNativeError,
     build_interaction_request,
-    pacific_quota_date,
-    pacific_rpd_reset_at,
+    rpd_quota_date,
+    rpd_reset_at,
     parse_comma_separated_api_keys,
 )
 
@@ -125,6 +125,27 @@ def test_native_client_rotates_only_after_http_429(tmp_path: Path) -> None:
     assert "key-two" not in json.dumps(response.raw)
 
 
+def test_native_client_can_explicitly_accept_json_array_output(tmp_path: Path) -> None:
+    client = GeminiNativeAudioClient(
+        api_keys=("key-one",),
+        min_request_interval_s=0.0,
+        transport=httpx.MockTransport(
+            lambda _request: httpx.Response(
+                200,
+                json=_success_payload('[{"s":0.2,"e":0.5}]'),
+            )
+        ),
+    )
+    response = client.call_json(
+        audio_path=_audio(tmp_path),
+        system_prompt="system",
+        prompt="prompt",
+        response_schema={"type": "array"},
+        require_object=False,
+    )
+    assert response.parsed == [{"s": 0.2, "e": 0.5}]
+
+
 def test_native_client_does_not_rotate_on_auth_error(tmp_path: Path) -> None:
     headers: list[str] = []
 
@@ -204,8 +225,24 @@ def test_native_profile_accepts_two_comma_separated_keys(tmp_path: Path) -> None
     assert isinstance(transport, GoogleAIStudioAudioTeacherTransport)
     assert transport.model == GEMINI_NATIVE_MODEL
     assert transport.api_key_count == 2
+    assert transport.max_concurrency == 2
     assert transport.execution_contract == GEMINI_NATIVE_EXECUTION_CONTRACT
     assert transport.client.endpoint == GEMINI_INTERACTIONS_ENDPOINT
+
+
+def test_native_profile_caps_concurrency_below_key_count(tmp_path: Path) -> None:
+    env_file = tmp_path / "gemini"
+    env_file.write_text(
+        "GEMINI_API_KEY=key-one,key-two,key-three,key-four\n"
+        "GEMINI_MODEL=gemini-3.6-flash\n",
+        encoding="utf-8",
+    )
+    transport = create_audio_teacher_transport(
+        profile="gemini",
+        env_file=env_file,
+    )
+    assert transport.api_key_count == 4
+    assert transport.max_concurrency == 2
 
 
 def test_native_rpd_budget_rotates_proactively_and_persists(tmp_path: Path) -> None:
@@ -308,31 +345,19 @@ def test_native_rpd_counts_failed_outbound_requests(tmp_path: Path) -> None:
     assert item["requests_started"] == 1
 
 
-def test_pacific_quota_date_uses_midnight_pacific() -> None:
-    assert pacific_quota_date(
-        datetime(2026, 7, 25, 6, 59, tzinfo=timezone.utc)
+def test_rpd_advisory_boundary_remains_fixed_at_utc8_1600() -> None:
+    assert rpd_quota_date(
+        datetime(2026, 7, 25, 7, 59, tzinfo=timezone.utc)
     ) == "2026-07-24"
-    assert pacific_quota_date(
-        datetime(2026, 7, 25, 7, 0, tzinfo=timezone.utc)
+    assert rpd_quota_date(
+        datetime(2026, 7, 25, 8, 0, tzinfo=timezone.utc)
     ) == "2026-07-25"
-    assert pacific_rpd_reset_at(
-        datetime(2026, 7, 25, 7, 0, tzinfo=timezone.utc)
-    ) == datetime(2026, 7, 26, 7, 0, tzinfo=timezone.utc)
-    assert pacific_rpd_reset_at(
+    assert rpd_reset_at(
+        datetime(2026, 7, 25, 8, 0, tzinfo=timezone.utc)
+    ) == datetime(2026, 7, 26, 8, 0, tzinfo=timezone.utc)
+    assert rpd_reset_at(
         datetime(2026, 1, 25, 8, 0, tzinfo=timezone.utc)
     ) == datetime(2026, 1, 26, 8, 0, tzinfo=timezone.utc)
-    assert pacific_rpd_reset_at(
-        datetime(2026, 3, 7, 8, 0, tzinfo=timezone.utc)
-    ) == datetime(2026, 3, 8, 8, 0, tzinfo=timezone.utc)
-    assert pacific_rpd_reset_at(
-        datetime(2026, 3, 8, 8, 0, tzinfo=timezone.utc)
-    ) == datetime(2026, 3, 9, 7, 0, tzinfo=timezone.utc)
-    assert pacific_rpd_reset_at(
-        datetime(2026, 10, 31, 7, 0, tzinfo=timezone.utc)
-    ) == datetime(2026, 11, 1, 7, 0, tzinfo=timezone.utc)
-    assert pacific_rpd_reset_at(
-        datetime(2026, 11, 1, 7, 0, tzinfo=timezone.utc)
-    ) == datetime(2026, 11, 2, 8, 0, tzinfo=timezone.utc)
 
 
 def test_native_quota_json_exposes_rpm_tpm_rpd_and_reset_state(
@@ -360,9 +385,21 @@ def test_native_quota_json_exposes_rpm_tpm_rpd_and_reset_state(
     assert status["rpm_limit"] == 5
     assert status["tpm_limit"] == 250_000
     assert status["daily_request_limit"] == 20
-    assert status["rpd_reset_at_utc"] == "2026-07-26T07:00:00.000Z"
+    assert status["schema"] == "gemini_native_quota_state_v5"
+    assert status["rpd_accounting_mode"] == "conservative_rolling_24h"
+    assert status["rpd_window_s"] == 86_400
+    assert status["quota_date"] == "2026-07-25"
+    assert status["rpd_reset_at_utc"] == "2026-07-26T08:00:00.000Z"
+    assert status["rpd_reset_timezone"] == "Asia/Shanghai"
+    assert status["rpd_reset_local_time"] == "16:00:00+08:00"
+    assert status["rpd_reset_is_advisory"] is True
     assert item["requests_started"] == 1
     assert item["rpd_remaining"] == 19
+    assert item["rpd_request_started_at_utc"] == [
+        "2026-07-25T18:00:00.000Z"
+    ]
+    assert item["rpd_ready_at_utc"] == "2026-07-25T18:00:00.000Z"
+    assert item["rpd_next_release_at_utc"] == "2026-07-26T18:00:00.000Z"
     assert item["rpm_requests_in_window"] == 1
     assert item["rpm_remaining"] == 4
     assert item["tpm_tokens_in_window"] == 160
@@ -453,7 +490,55 @@ def test_native_quota_state_survives_key_addition_and_reordering(
     assert state[fingerprint("key-new")]["requests_started"] == 0
 
 
-def test_native_rpd_resets_when_running_process_crosses_pacific_midnight(
+@pytest.mark.parametrize(
+    ("legacy_schema", "date_field"),
+    (
+        ("gemini_native_quota_state_v3", "pacific_date"),
+        ("gemini_native_quota_state_v4", "quota_date"),
+    ),
+)
+def test_native_quota_state_migrates_legacy_into_rolling_window_without_reset(
+    tmp_path: Path,
+    legacy_schema: str,
+    date_field: str,
+) -> None:
+    fingerprint = hashlib.sha256("key-one".encode()).hexdigest()
+    quota = tmp_path / "gemini.quota.json"
+    quota.write_text(
+        json.dumps(
+            {
+                "schema": legacy_schema,
+                date_field: "2026-07-25",
+                "keys": {
+                    fingerprint: {
+                        "requests_started": 7,
+                        "first_request_at_utc": "2026-07-26T01:00:00.000Z",
+                        "last_request_at_utc": "2026-07-26T03:00:00.000Z",
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    client = GeminiNativeAudioClient(
+        api_keys=("key-one",),
+        min_request_interval_s=0.0,
+        quota_state_path=quota,
+        now_utc=lambda: datetime(2026, 7, 26, 4, 0, tzinfo=timezone.utc),
+        transport=httpx.MockTransport(
+            lambda _request: httpx.Response(200, json=_success_payload())
+        ),
+    )
+    status = client.quota_status()
+    assert status["schema"] == "gemini_native_quota_state_v5"
+    assert status["quota_date"] == "2026-07-25"
+    assert status["keys"][fingerprint]["requests_started"] == 7
+    assert status["keys"][fingerprint]["rpd_request_started_at_utc"] == [
+        "2026-07-26T03:00:00.000Z"
+    ] * 7
+
+
+def test_native_rpd_does_not_reset_at_advisory_utc8_1600(
     tmp_path: Path,
 ) -> None:
     headers: list[str] = []
@@ -462,7 +547,7 @@ def test_native_rpd_resets_when_running_process_crosses_pacific_midnight(
         headers.append(request.headers["x-goog-api-key"])
         return httpx.Response(200, json=_success_payload())
 
-    moments = [datetime(2026, 7, 25, 6, 59, tzinfo=timezone.utc)]
+    moments = [datetime(2026, 7, 25, 7, 59, tzinfo=timezone.utc)]
     client = GeminiNativeAudioClient(
         api_keys=("key-one",),
         min_request_interval_s=0.0,
@@ -477,7 +562,15 @@ def test_native_rpd_resets_when_running_process_crosses_pacific_midnight(
         prompt="prompt",
         response_schema=None,
     )
-    moments[0] = datetime(2026, 7, 25, 7, 0, tzinfo=timezone.utc)
+    moments[0] = datetime(2026, 7, 25, 8, 0, tzinfo=timezone.utc)
+    with pytest.raises(GeminiNativeError, match="rolling 24h window"):
+        client.call_json(
+            audio_path=_audio(tmp_path),
+            system_prompt="system",
+            prompt="prompt",
+            response_schema=None,
+        )
+    moments[0] = datetime(2026, 7, 26, 7, 59, tzinfo=timezone.utc)
     response = client.call_json(
         audio_path=_audio(tmp_path),
         system_prompt="system",
@@ -485,5 +578,67 @@ def test_native_rpd_resets_when_running_process_crosses_pacific_midnight(
         response_schema=None,
     )
     assert headers == ["key-one", "key-one"]
-    assert response.raw["pacific_quota_date"] == "2026-07-25"
+    assert response.raw["rpd_quota_date"] == "2026-07-25"
     assert response.raw["daily_requests_started_after"] == 1
+
+
+def test_native_daily_429_adds_conservative_rolling_24h_block(
+    tmp_path: Path,
+) -> None:
+    moments = [datetime(2026, 7, 25, 18, tzinfo=timezone.utc)]
+    calls = 0
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return httpx.Response(
+                429,
+                headers={"retry-after": "60"},
+                json={
+                    "error": {
+                        "status": "RESOURCE_EXHAUSTED",
+                        "message": "requests per day quota exhausted",
+                    }
+                },
+            )
+        return httpx.Response(200, json=_success_payload())
+
+    client = GeminiNativeAudioClient(
+        api_keys=("key-one",),
+        min_request_interval_s=0.0,
+        quota_state_path=tmp_path / "gemini.quota.json",
+        now_utc=lambda: moments[0],
+        transport=httpx.MockTransport(handler),
+    )
+    with pytest.raises(GeminiNativeError, match="exhausted all API key slots"):
+        client.call_json(
+            audio_path=_audio(tmp_path),
+            system_prompt="system",
+            prompt="prompt",
+            response_schema=None,
+        )
+    item = next(iter(client.quota_status()["keys"].values()))
+    assert item["last_daily_429_at_utc"] == "2026-07-25T18:00:00.000Z"
+    assert item["rpd_blocked_until_utc"] == "2026-07-26T18:00:00.000Z"
+    assert item["exhausted_by_429"] is True
+
+    moments[0] = datetime(2026, 7, 26, 17, 59, tzinfo=timezone.utc)
+    with pytest.raises(GeminiNativeError, match="rolling 24h window"):
+        client.call_json(
+            audio_path=_audio(tmp_path),
+            system_prompt="system",
+            prompt="prompt",
+            response_schema=None,
+        )
+    assert calls == 1
+
+    moments[0] = datetime(2026, 7, 26, 18, tzinfo=timezone.utc)
+    response = client.call_json(
+        audio_path=_audio(tmp_path),
+        system_prompt="system",
+        prompt="prompt",
+        response_schema=None,
+    )
+    assert response.parsed == {"ok": True}
+    assert calls == 2

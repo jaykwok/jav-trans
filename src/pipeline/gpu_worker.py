@@ -111,14 +111,6 @@ def _temporary_env(overrides: dict[str, str]):
                 os.environ[key] = value
 
 
-def _env_payload(raw: Any) -> dict[str, str]:
-    if not isinstance(raw, dict):
-        return {}
-    return {
-        str(key): str(value)
-        for key, value in raw.items()
-        if str(key).strip() and value is not None
-    }
 
 
 def _resolve_device(device: str) -> str:
@@ -1019,7 +1011,14 @@ def worker_main(parent_conn: Connection) -> None:
             )
             continue
 
-        env = _env_payload(msg.get("env"))
+        raw_env = msg.get("env")
+        env = {}
+        if isinstance(raw_env, dict):
+            env = {
+                str(key): str(value)
+                for key, value in raw_env.items()
+                if str(key).strip() and value is not None
+            }
         requested_device = str(msg.get("device") or "auto")
         torch_module = None
         runtime_tuning: dict[str, Any] = {}

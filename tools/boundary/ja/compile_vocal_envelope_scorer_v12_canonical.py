@@ -18,6 +18,7 @@ for root in (PROJECT_ROOT, PROJECT_ROOT / "src"):
 from boundary.ja.vocal_envelope_v12 import (  # noqa: E402
     VOCAL_ENVELOPE_SCORER_V12_CANONICAL_LABEL_SCHEMA,
     VOCAL_ENVELOPE_SCORER_V12_CANONICAL_SOURCE_SCHEMA,
+    VOCAL_ENVELOPE_SCORER_V12_CORRECTED_SPAN_SCHEMA,
     VOCAL_ENVELOPE_SCORER_V12_DATASET_CONTRACT,
     VOCAL_ENVELOPE_SCORER_V12_IGNORE_INDEX,
     VOCAL_ENVELOPE_SCORER_V12_LABELS,
@@ -28,6 +29,7 @@ from boundary.ja.vocal_envelope_v12 import (  # noqa: E402
     VOCAL_ENVELOPE_SCORER_V12_TASK_SEMANTICS,
     VOCAL_ENVELOPE_SCORER_V12_VOCAL_COVERAGE_OPTIONS,
     VOCAL_ENVELOPE_SCORER_V12_VOCAL_PURITY_OPTIONS,
+    vocal_envelope_v12_corrected_spans_from_verdict,
     vocal_envelope_v12_manual_verdict_is_approved,
 )
 from tools.omni.gemini_native import (  # noqa: E402
@@ -58,8 +60,8 @@ PROVIDER_CONTRACTS: dict[str, dict[str, str]] = {
         "execution_contract": GEMINI_NATIVE_EXECUTION_CONTRACT,
     },
 }
-EXPECTED_PROMPT_PROFILE = "voice-envelope-single-pass-tristate-v4"
-EXPECTED_PROMPT_VERSION = "voice-envelope-single-pass-tristate-v4-voice-only-gemini36-medium-mmss"
+EXPECTED_PROMPT_PROFILE = "vocal-envelope-single-pass-tristate-v3"
+EXPECTED_PROMPT_VERSION = "vocal-envelope-single-pass-tristate-v3-scorer-duty-gemini36-medium-mmss"
 OUTPUT_SUMMARY_SCHEMA = "vocal_envelope_scorer_v12_canonical_compile_summary_v2"
 EXPECTED_TEACHER_CONTRACT_FINGERPRINTS = teacher_contract_fingerprint_fields()
 
@@ -185,6 +187,14 @@ def _validate_manual_verdict(
             raise ValueError(f"v12 manual verdict {field} mismatch: {source_id}")
     if abs(float(verdict.get("duration_s") or 0.0) - duration_s) > 1e-9:
         raise ValueError(f"v12 manual verdict duration mismatch: {source_id}")
+    # Old v2 verdicts may omit corrected_spans.  When an editable audit page
+    # emits them, validate the complete replacement partition and its audit
+    # provenance before looking at the approval axes.
+    vocal_envelope_v12_corrected_spans_from_verdict(
+        verdict,
+        frame_count=frame_count,
+        source_id=source_id,
+    )
     if (
         str(verdict.get("vocal_coverage") or "")
         not in VOCAL_ENVELOPE_SCORER_V12_VOCAL_COVERAGE_OPTIONS
@@ -373,6 +383,7 @@ def compile_canonical(
         ) != sample_count:
             raise ValueError(f"v12 teacher sample geometry mismatch: {source_id}")
         spans = _normalize_spans(evidence, frame_count=frame_count, source_id=source_id)
+        span_source = "teacher_evidence"
         partition = str(source["partition"])
         calibration_overlap = calibration is not None and source_id in calibration_ids
         if calibration_overlap:
@@ -414,6 +425,10 @@ def compile_canonical(
                 raise ValueError(
                     f"v12 calibrated pilot evidence changed after approval: {source_id}"
                 )
+            calibration_corrected = calibration.get("corrected_spans", {}).get(source_id)
+            if calibration_corrected is not None:
+                spans = [dict(item) for item in calibration_corrected]
+                span_source = "calibration_manual_corrected"
         verdict = verdict_rows.get(source_id)
         human_approved = calibration_overlap
         if verdict is not None:
@@ -424,6 +439,14 @@ def compile_canonical(
                 manifest_sha=manifest_sha,
                 preaudit_sha=preaudit_sha,
             )
+            corrected = vocal_envelope_v12_corrected_spans_from_verdict(
+                verdict,
+                frame_count=frame_count,
+                source_id=source_id,
+            )
+            if corrected is not None:
+                spans = [dict(item) for item in corrected]
+                span_source = "manual_corrected"
         calibrated_train = calibration is not None and partition == "train"
         training_allowed = human_approved or calibrated_train
         if human_approved and calibration_overlap:
@@ -465,6 +488,35 @@ def compile_canonical(
             "frame_count": frame_count,
             "frame_hop_s": FRAME_HOP_S,
             "canonical_spans": spans,
+            "canonical_spans_source": span_source,
+            "corrected_spans_used": span_source != "teacher_evidence",
+            "corrected_span_schema": (
+                VOCAL_ENVELOPE_SCORER_V12_CORRECTED_SPAN_SCHEMA
+                if span_source != "teacher_evidence"
+                else None
+            ),
+            "corrected_span_signature": (
+                verdict.get("corrected_span_signature")
+                if verdict is not None and span_source == "manual_corrected"
+                else (
+                    calibration.get("corrected_signatures", {}).get(source_id)
+                    if calibration is not None
+                    and span_source == "calibration_manual_corrected"
+                    else None
+                )
+            ),
+            "corrected_audit_manifest_sha256": (
+                verdict.get("audit_manifest_sha256")
+                if verdict is not None and span_source == "manual_corrected"
+                else (
+                    calibration.get("verdict_rows", {})
+                    .get(source_id, {})
+                    .get("audit_manifest_sha256")
+                    if calibration is not None
+                    and span_source == "calibration_manual_corrected"
+                    else None
+                )
+            ),
             "labels": list(VOCAL_ENVELOPE_SCORER_V12_LABELS),
             "unsure_training_label": VOCAL_ENVELOPE_SCORER_V12_IGNORE_INDEX,
             "annotation_provenance": annotation_provenance,

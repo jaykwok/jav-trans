@@ -17,6 +17,7 @@ from boundary.ja.vocal_envelope_v12 import (
     VOCAL_ENVELOPE_SCORER_V12_MANUAL_VERDICT_SCHEMA,
     VOCAL_ENVELOPE_SCORER_V12_PREAUDIT_SCHEMA,
     VOCAL_ENVELOPE_SCORER_V12_TASK_SEMANTICS,
+    vocal_envelope_v12_corrected_spans_from_verdict,
     vocal_envelope_v12_manual_verdict_is_approved,
 )
 from tools.omni.gemini_native import (
@@ -30,8 +31,8 @@ from tools.boundary.ja.vocal_envelope_scorer_v12_teacher_contract import (
 
 
 CONTRACT_ID = "boundary_acoustic_binary_v12"
-CALIBRATION_ID = "vocal_envelope_scorer_v12_voice_only_pilot25_human_approved_v2"
-# Frozen only after the voice-only pilot receives a new human approval.
+CALIBRATION_ID = "vocal_envelope_scorer_v12_broad_vocal_pilot_human_approved_v3"
+# Frozen only after the restored broad-vocal Teacher receives a new human approval.
 CALIBRATION_ARTIFACT_SHA256: dict[str, str] = {}
 CALIBRATION_TEACHER_CONTRACT = {
     "task_semantics": VOCAL_ENVELOPE_SCORER_V12_TASK_SEMANTICS,
@@ -40,9 +41,9 @@ CALIBRATION_TEACHER_CONTRACT = {
     "env_file_name": "gemini",
     "reasoning_effort": "medium",
     "max_tokens": 8192,
-    "prompt_profile": "voice-envelope-single-pass-tristate-v4",
+    "prompt_profile": "vocal-envelope-single-pass-tristate-v3",
     "prompt_version": (
-        "voice-envelope-single-pass-tristate-v4-voice-only-gemini36-medium-mmss"
+        "vocal-envelope-single-pass-tristate-v3-scorer-duty-gemini36-medium-mmss"
     ),
     "teacher_timestamp_contract_id": TIMESTAMP_CONTRACT_ID,
     "teacher_execution_contract_id": GEMINI_NATIVE_EXECUTION_CONTRACT,
@@ -139,7 +140,7 @@ def load_approved_calibration(
         not value for value in required_hashes.values()
     ):
         raise ValueError(
-            "Scorer v12 voice-only calibration is not frozen; "
+            "Scorer v12 broad-vocal calibration is not frozen; "
             "run and approve the new pilot first"
         )
     if hashes != required_hashes:
@@ -159,6 +160,8 @@ def load_approved_calibration(
         raise ValueError("Scorer v12 calibration bundle is empty")
 
     signatures: dict[str, tuple[tuple[str, int, int], ...]] = {}
+    corrected_spans: dict[str, list[dict[str, Any]]] = {}
+    corrected_signatures: dict[str, str] = {}
     for source_id in sorted(sources):
         source = sources[source_id]
         row = evidence[source_id]
@@ -234,6 +237,16 @@ def load_approved_calibration(
             raise ValueError(f"Scorer v12 calibration approval flag mismatch: {source_id}")
         if verdict.get("training_manifest_allowed") is not True:
             raise ValueError(f"Scorer v12 calibration training flag mismatch: {source_id}")
+        corrected = vocal_envelope_v12_corrected_spans_from_verdict(
+            verdict,
+            frame_count=frame_count,
+            source_id=source_id,
+        )
+        if corrected is not None:
+            corrected_spans[source_id] = corrected
+            corrected_signatures[source_id] = str(
+                verdict["corrected_span_signature"]
+            )
 
     return {
         "calibration_id": CALIBRATION_ID,
@@ -245,5 +258,7 @@ def load_approved_calibration(
         "evidence": evidence,
         "verdict_rows": decisions,
         "signatures": signatures,
+        "corrected_spans": corrected_spans,
+        "corrected_signatures": corrected_signatures,
         "teacher_contract": dict(CALIBRATION_TEACHER_CONTRACT),
     }

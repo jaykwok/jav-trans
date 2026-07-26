@@ -78,7 +78,8 @@ def test_compare_candidate_island_preaudits_reports_frame_deltas(tmp_path: Path)
     assert 'preload="metadata"' in page
     assert "playToken" in page
     assert "waitForMetadata" in page
-    assert "await audio.play()" in page
+    assert "const started=audio.play()" in page
+    assert "await started" in page
 
 
 def test_compare_candidate_island_preaudits_can_limit_to_frozen_prefix(tmp_path: Path) -> None:

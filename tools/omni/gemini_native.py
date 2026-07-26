@@ -8,7 +8,6 @@ per-key quota pacing, and fail-closed API-key rotation on HTTP 429 only.
 from __future__ import annotations
 
 import base64
-import calendar
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 import hashlib
@@ -36,7 +35,15 @@ GEMINI_NATIVE_TPM_PER_KEY = 250_000
 GEMINI_NATIVE_RPD_PER_KEY = 20
 GEMINI_NATIVE_MIN_REQUEST_INTERVAL_S = 12.5
 GEMINI_INLINE_REQUEST_LIMIT_BYTES = 20_000_000
-GEMINI_QUOTA_STATE_SCHEMA = "gemini_native_quota_state_v3"
+GEMINI_QUOTA_STATE_SCHEMA = "gemini_native_quota_state_v5"
+GEMINI_LEGACY_QUOTA_STATE_SCHEMAS = {
+    "gemini_native_quota_state_v3",
+    "gemini_native_quota_state_v4",
+}
+GEMINI_RPD_ACCOUNTING_MODE = "conservative_rolling_24h"
+GEMINI_RPD_WINDOW_S = 24 * 60 * 60
+GEMINI_RPD_RESET_TIMEZONE = "Asia/Shanghai"
+GEMINI_RPD_RESET_LOCAL_HOUR = 16
 
 
 class GeminiNativeError(RuntimeError):
@@ -214,54 +221,34 @@ def _is_daily_quota_error(response: httpx.Response) -> bool:
     )
 
 
-def pacific_quota_date(now_utc: datetime | None = None) -> str:
-    """Return Google's RPD date without depending on an external tzdata wheel."""
+def rpd_quota_date(now_utc: datetime | None = None) -> str:
+    """Return the advisory UTC+8 16:00 observation-period date.
 
-    now = now_utc or datetime.now(timezone.utc)
-    if now.tzinfo is None:
-        now = now.replace(tzinfo=timezone.utc)
-    now = now.astimezone(timezone.utc)
-    year = now.year
-    march = calendar.monthcalendar(year, 3)
-    second_sunday = [week[calendar.SUNDAY] for week in march if week[calendar.SUNDAY]][1]
-    november = calendar.monthcalendar(year, 11)
-    first_sunday = [week[calendar.SUNDAY] for week in november if week[calendar.SUNDAY]][0]
-    dst_start_utc = datetime(year, 3, second_sunday, 10, tzinfo=timezone.utc)
-    dst_end_utc = datetime(year, 11, first_sunday, 9, tzinfo=timezone.utc)
-    offset_hours = -7 if dst_start_utc <= now < dst_end_utc else -8
-    return (now + timedelta(hours=offset_hours)).date().isoformat()
+    Google did not restore the observed free-tier RPD budget at this boundary.
+    Runtime availability therefore uses the rolling ledger below, not this date.
+    """
+
+    now = _as_utc(now_utc or datetime.now(timezone.utc))
+    local = now.astimezone(timezone(timedelta(hours=8)))
+    shifted = local - timedelta(hours=GEMINI_RPD_RESET_LOCAL_HOUR)
+    return shifted.date().isoformat()
 
 
-def _pacific_midnight_offset_hours(local_date: date) -> int:
-    march = calendar.monthcalendar(local_date.year, 3)
-    second_sunday = [
-        week[calendar.SUNDAY] for week in march if week[calendar.SUNDAY]
-    ][1]
-    november = calendar.monthcalendar(local_date.year, 11)
-    first_sunday = [
-        week[calendar.SUNDAY] for week in november if week[calendar.SUNDAY]
-    ][0]
-    dst_start = date(local_date.year, 3, second_sunday)
-    dst_end = date(local_date.year, 11, first_sunday)
-    return -7 if dst_start < local_date <= dst_end else -8
+def rpd_reset_at(now_utc: datetime | None = None) -> datetime:
+    """Return the next advisory Asia/Shanghai 16:00 observation boundary."""
 
-
-def pacific_rpd_reset_at(now_utc: datetime | None = None) -> datetime:
-    """Return the next Pacific midnight as an aware UTC datetime."""
-
-    now = now_utc or datetime.now(timezone.utc)
-    if now.tzinfo is None:
-        now = now.replace(tzinfo=timezone.utc)
-    local_today = date.fromisoformat(pacific_quota_date(now))
-    local_tomorrow = local_today + timedelta(days=1)
-    local_midnight = datetime.combine(
-        local_tomorrow,
-        datetime.min.time(),
-        tzinfo=timezone(
-            timedelta(hours=_pacific_midnight_offset_hours(local_tomorrow))
-        ),
+    now = _as_utc(now_utc or datetime.now(timezone.utc))
+    local_timezone = timezone(timedelta(hours=8))
+    quota_date = date.fromisoformat(rpd_quota_date(now))
+    next_local_date = quota_date + timedelta(days=1)
+    next_local = datetime(
+        next_local_date.year,
+        next_local_date.month,
+        next_local_date.day,
+        GEMINI_RPD_RESET_LOCAL_HOUR,
+        tzinfo=local_timezone,
     )
-    return local_midnight.astimezone(timezone.utc)
+    return next_local.astimezone(timezone.utc)
 
 
 def _as_utc(value: datetime) -> datetime:
@@ -307,7 +294,7 @@ def _write_quota_state(path: Path, payload: Mapping[str, Any]) -> None:
 
 @dataclass(frozen=True)
 class GeminiNativeResponse:
-    parsed: dict[str, Any]
+    parsed: Any
     raw: dict[str, Any]
     key_slot: int
 
@@ -361,9 +348,12 @@ class GeminiNativeAudioClient:
             "requests_started": 0,
             "first_request_at_utc": None,
             "last_request_at_utc": None,
+            "rpd_request_started_at_utc": [],
             "minute_request_started_at_utc": [],
             "minute_token_events": [],
             "blocked_until_utc": None,
+            "rpd_blocked_until_utc": None,
+            "last_daily_429_at_utc": None,
             "exhausted_by_429": False,
         }
 
@@ -371,8 +361,13 @@ class GeminiNativeAudioClient:
         now = _as_utc(self._now_utc())
         return {
             "schema": GEMINI_QUOTA_STATE_SCHEMA,
-            "pacific_date": pacific_quota_date(now),
-            "rpd_reset_at_utc": _utc_iso(pacific_rpd_reset_at(now)),
+            "rpd_accounting_mode": GEMINI_RPD_ACCOUNTING_MODE,
+            "rpd_window_s": GEMINI_RPD_WINDOW_S,
+            "quota_date": rpd_quota_date(now),
+            "rpd_reset_at_utc": _utc_iso(rpd_reset_at(now)),
+            "rpd_reset_timezone": GEMINI_RPD_RESET_TIMEZONE,
+            "rpd_reset_local_time": "16:00:00+08:00",
+            "rpd_reset_is_advisory": True,
             "rpm_limit": GEMINI_NATIVE_RPM_PER_KEY,
             "tpm_limit": GEMINI_NATIVE_TPM_PER_KEY,
             "daily_request_limit": self.daily_request_limit,
@@ -391,12 +386,16 @@ class GeminiNativeAudioClient:
             saved = json.loads(path.read_text(encoding="utf-8-sig"))
         except (OSError, ValueError):
             return fresh
-        if not isinstance(saved, Mapping) or saved.get("schema") != GEMINI_QUOTA_STATE_SCHEMA:
+        if not isinstance(saved, Mapping) or saved.get("schema") not in {
+            GEMINI_QUOTA_STATE_SCHEMA,
+            *GEMINI_LEGACY_QUOTA_STATE_SCHEMAS,
+        }:
             return fresh
         keys = saved.get("keys")
         if not isinstance(keys, Mapping):
             return fresh
-        same_day = saved.get("pacific_date") == fresh["pacific_date"]
+        now = _as_utc(self._now_utc())
+        schema = str(saved.get("schema") or "")
         for fingerprint in self._key_fingerprints:
             item = keys.get(fingerprint)
             if not isinstance(item, Mapping):
@@ -408,21 +407,41 @@ class GeminiNativeAudioClient:
                 ),
                 minute_token_events=list(item.get("minute_token_events") or ()),
                 blocked_until_utc=item.get("blocked_until_utc"),
+                rpd_blocked_until_utc=item.get("rpd_blocked_until_utc"),
+                last_daily_429_at_utc=item.get("last_daily_429_at_utc"),
             )
-            if same_day:
-                copied.update(
-                    requests_started=max(
-                        0, int(item.get("requests_started") or 0)
-                    ),
-                    first_request_at_utc=item.get("first_request_at_utc"),
-                    last_request_at_utc=item.get("last_request_at_utc"),
-                    exhausted_by_429=bool(item.get("exhausted_by_429")),
+            if schema == GEMINI_QUOTA_STATE_SCHEMA:
+                copied["rpd_request_started_at_utc"] = list(
+                    item.get("rpd_request_started_at_utc") or ()
                 )
+            else:
+                # v3/v4 stored only a per-calendar-period count.  Reconstruct a
+                # conservative rolling ledger at the last known request time so
+                # migration cannot silently restore budget.
+                count = max(0, int(item.get("requests_started") or 0))
+                anchor = _parse_utc(item.get("last_request_at_utc")) or _parse_utc(
+                    item.get("first_request_at_utc")
+                )
+                if (
+                    count > 0
+                    and anchor is not None
+                    and now - timedelta(seconds=GEMINI_RPD_WINDOW_S) < anchor
+                    <= now + timedelta(seconds=1)
+                ):
+                    copied["rpd_request_started_at_utc"] = [
+                        _utc_iso(anchor)
+                    ] * count
+                if bool(item.get("exhausted_by_429")) and anchor is not None:
+                    legacy_block = anchor + timedelta(seconds=GEMINI_RPD_WINDOW_S)
+                    if legacy_block > now:
+                        copied["rpd_blocked_until_utc"] = _utc_iso(legacy_block)
+                        copied["last_daily_429_at_utc"] = _utc_iso(anchor)
             fresh["keys"][fingerprint] = copied
         return fresh
 
     def _update_key_status(self, item: dict[str, Any], *, now: datetime) -> None:
         cutoff = now - timedelta(seconds=60)
+        rpd_cutoff = now - timedelta(seconds=GEMINI_RPD_WINDOW_S)
         request_times = sorted(
             value
             for value in (
@@ -440,9 +459,21 @@ class GeminiNativeAudioClient:
             if at is not None and tokens > 0 and cutoff < at <= now + timedelta(seconds=1):
                 token_events.append((at, tokens))
         token_events.sort(key=lambda pair: pair[0])
+        rpd_request_times = sorted(
+            value
+            for value in (
+                _parse_utc(raw)
+                for raw in item.get("rpd_request_started_at_utc") or ()
+            )
+            if value is not None
+            and rpd_cutoff < value <= now + timedelta(seconds=1)
+        )
         blocked_until = _parse_utc(item.get("blocked_until_utc"))
         if blocked_until is not None and blocked_until <= now:
             blocked_until = None
+        rpd_blocked_until = _parse_utc(item.get("rpd_blocked_until_utc"))
+        if rpd_blocked_until is not None and rpd_blocked_until <= now:
+            rpd_blocked_until = None
 
         ready_at = now
         if request_times:
@@ -468,6 +499,22 @@ class GeminiNativeAudioClient:
         item["blocked_until_utc"] = (
             _utc_iso(blocked_until) if blocked_until is not None else None
         )
+        item["rpd_request_started_at_utc"] = [
+            _utc_iso(value) for value in rpd_request_times
+        ]
+        item["rpd_blocked_until_utc"] = (
+            _utc_iso(rpd_blocked_until)
+            if rpd_blocked_until is not None
+            else None
+        )
+        item["exhausted_by_429"] = rpd_blocked_until is not None
+        item["requests_started"] = len(rpd_request_times)
+        item["first_request_at_utc"] = (
+            _utc_iso(rpd_request_times[0]) if rpd_request_times else None
+        )
+        item["last_request_at_utc"] = (
+            _utc_iso(rpd_request_times[-1]) if rpd_request_times else None
+        )
         item["rpm_requests_in_window"] = len(request_times)
         item["rpm_remaining"] = max(
             0, GEMINI_NATIVE_RPM_PER_KEY - len(request_times)
@@ -475,42 +522,57 @@ class GeminiNativeAudioClient:
         item["tpm_tokens_in_window"] = token_total
         item["tpm_remaining"] = max(0, GEMINI_NATIVE_TPM_PER_KEY - token_total)
         item["rpd_remaining"] = max(
-            0, self.daily_request_limit - int(item.get("requests_started") or 0)
+            0, self.daily_request_limit - len(rpd_request_times)
         )
         item["rpm_ready_at_utc"] = _utc_iso(ready_at)
-        item["rpd_reset_at_utc"] = self._daily_state["rpd_reset_at_utc"]
+        rpd_ready_at = now
+        if len(rpd_request_times) >= self.daily_request_limit:
+            release_index = len(rpd_request_times) - self.daily_request_limit
+            rpd_ready_at = max(
+                rpd_ready_at,
+                rpd_request_times[release_index]
+                + timedelta(seconds=GEMINI_RPD_WINDOW_S),
+            )
+        if rpd_blocked_until is not None:
+            rpd_ready_at = max(rpd_ready_at, rpd_blocked_until)
+        item["rpd_ready_at_utc"] = _utc_iso(rpd_ready_at)
+        item["rpd_next_release_at_utc"] = (
+            _utc_iso(
+                rpd_request_times[0] + timedelta(seconds=GEMINI_RPD_WINDOW_S)
+            )
+            if rpd_request_times
+            else None
+        )
 
     def _save_daily_state(self) -> None:
-        if self.quota_state_path is None:
-            return
         now = _as_utc(self._now_utc())
         for item in self._daily_state["keys"].values():
             self._update_key_status(item, now=now)
+        rpd_ready_values = sorted(
+            str(item.get("rpd_ready_at_utc") or "")
+            for item in self._daily_state["keys"].values()
+            if item.get("rpd_ready_at_utc")
+        )
+        self._daily_state["rpd_next_ready_at_utc"] = (
+            rpd_ready_values[0] if rpd_ready_values else None
+        )
         self._daily_state["updated_at_utc"] = _utc_iso(now)
-        _write_quota_state(self.quota_state_path, self._daily_state)
+        if self.quota_state_path is not None:
+            _write_quota_state(self.quota_state_path, self._daily_state)
 
     def _refresh_daily_state(self) -> None:
         with self._state_lock:
-            current_date = pacific_quota_date(self._now_utc())
-            if self._daily_state.get("pacific_date") == current_date:
-                return
-            previous = self._daily_state
-            refreshed = self._empty_daily_state()
-            previous_keys = previous.get("keys")
-            if isinstance(previous_keys, Mapping):
-                for fingerprint, item in refreshed["keys"].items():
-                    old = previous_keys.get(fingerprint)
-                    if not isinstance(old, Mapping):
-                        continue
-                    item["minute_request_started_at_utc"] = list(
-                        old.get("minute_request_started_at_utc") or ()
-                    )
-                    item["minute_token_events"] = list(
-                        old.get("minute_token_events") or ()
-                    )
-                    item["blocked_until_utc"] = old.get("blocked_until_utc")
-            self._daily_state = refreshed
-            self._save_daily_state()
+            now = _as_utc(self._now_utc())
+            self._daily_state["schema"] = GEMINI_QUOTA_STATE_SCHEMA
+            self._daily_state["rpd_accounting_mode"] = GEMINI_RPD_ACCOUNTING_MODE
+            self._daily_state["rpd_window_s"] = GEMINI_RPD_WINDOW_S
+            self._daily_state["quota_date"] = rpd_quota_date(now)
+            self._daily_state["rpd_reset_at_utc"] = _utc_iso(rpd_reset_at(now))
+            self._daily_state["rpd_reset_timezone"] = GEMINI_RPD_RESET_TIMEZONE
+            self._daily_state["rpd_reset_local_time"] = "16:00:00+08:00"
+            self._daily_state["rpd_reset_is_advisory"] = True
+            for item in self._daily_state["keys"].values():
+                self._update_key_status(item, now=now)
 
     def _daily_item(self, key_index: int) -> dict[str, Any]:
         return self._daily_state["keys"][self._key_fingerprints[key_index]]
@@ -534,12 +596,10 @@ class GeminiNativeAudioClient:
             self._refresh_daily_state()
             now = _as_utc(self._now_utc())
             item = self._daily_item(key_index)
-            item["requests_started"] = int(item["requests_started"]) + 1
             stamp = _utc_iso(now)
-            item["first_request_at_utc"] = item.get("first_request_at_utc") or stamp
-            item["last_request_at_utc"] = stamp
+            item.setdefault("rpd_request_started_at_utc", []).append(stamp)
             item.setdefault("minute_request_started_at_utc", []).append(stamp)
-            quota_date = str(self._daily_state["pacific_date"])
+            quota_date = str(self._daily_state["quota_date"])
             self._save_daily_state()
             return int(item["requests_started"]), quota_date
 
@@ -549,15 +609,21 @@ class GeminiNativeAudioClient:
         *,
         retry_s: float,
         daily: bool,
-        quota_date: str,
     ) -> None:
         with self._state_lock:
             item = self._daily_item(key_index)
+            now = _as_utc(self._now_utc())
             item["blocked_until_utc"] = _utc_iso(
-                _as_utc(self._now_utc()) + timedelta(seconds=max(0.0, retry_s))
+                now + timedelta(seconds=max(0.0, retry_s))
             )
-            if daily and self._daily_state.get("pacific_date") == quota_date:
-                item["exhausted_by_429"] = True
+            if daily:
+                item["last_daily_429_at_utc"] = _utc_iso(now)
+                item["rpd_blocked_until_utc"] = _utc_iso(
+                    now
+                    + timedelta(
+                        seconds=max(float(retry_s), GEMINI_RPD_WINDOW_S)
+                    )
+                )
             self._save_daily_state()
 
     def _reserve_key_slot(self, attempted_slots: set[int]) -> int:
@@ -582,8 +648,8 @@ class GeminiNativeAudioClient:
                     continue
                 raise GeminiNativeError(
                     "all native Gemini key slots returned HTTP 429 or reached "
-                    f"the {self.daily_request_limit} RPD budget for the current "
-                    "Pacific quota day",
+                    f"the {self.daily_request_limit} RPD budget in the "
+                    "conservative rolling 24h window",
                     status_code=429,
                 )
 
@@ -643,6 +709,7 @@ class GeminiNativeAudioClient:
         system_prompt: str,
         prompt: str,
         response_schema: Mapping[str, Any] | None,
+        require_object: bool = True,
         thinking_level: str = "medium",
         max_output_tokens: int = 8192,
     ) -> GeminiNativeResponse:
@@ -695,7 +762,6 @@ class GeminiNativeAudioClient:
                         key_index,
                         retry_s=retry_s,
                         daily=_is_daily_quota_error(response),
-                        quota_date=request_quota_date,
                     )
                     previous_429_slot = key_index
                     continue
@@ -727,7 +793,7 @@ class GeminiNativeAudioClient:
                     raise GeminiNativeError(
                         "native Gemini model output is not valid JSON"
                     ) from error
-                if not isinstance(parsed, Mapping):
+                if require_object and not isinstance(parsed, Mapping):
                     raise GeminiNativeError(
                         "native Gemini model JSON output must be an object"
                     )
@@ -752,7 +818,9 @@ class GeminiNativeAudioClient:
                     "key_fingerprint_sha256": self._key_fingerprints[key_index],
                     "daily_request_limit": self.daily_request_limit,
                     "daily_requests_started_after": daily_requests,
-                    "pacific_quota_date": request_quota_date,
+                    "rpd_quota_date": request_quota_date,
+                    "rpd_accounting_mode": GEMINI_RPD_ACCOUNTING_MODE,
+                    "rpd_window_s": GEMINI_RPD_WINDOW_S,
                     "status": status,
                     "usage": dict(usage),
                     "thought_step_count": len(thought_steps),
@@ -762,7 +830,9 @@ class GeminiNativeAudioClient:
                     "response": dict(payload),
                 }
                 return GeminiNativeResponse(
-                    parsed=dict(parsed), raw=raw, key_slot=key_index + 1
+                    parsed=(dict(parsed) if isinstance(parsed, Mapping) else parsed),
+                    raw=raw,
+                    key_slot=key_index + 1,
                 )
             finally:
                 self._release_key_slot(key_index)

@@ -230,16 +230,22 @@ function buildSettingsBodyFromForm({ includeConnection = false, includeProxy = f
   if (includeProxy) {
     // The enable switch is the single source of truth for on/off. Switch off
     // -> clear host/port on save (the backend tears down the proxy). Switch on
-    // -> send the field values (port validated when present).
+    // -> send the field values (port validated when present, null if empty).
     const enabled = !!$('proxy-enabled')?.checked;
     const portText = ($('proxy-port')?.value || '').trim();
-    const parsedPort = portText ? Number(portText) : null;
-    if (enabled && portText && (!/^\d+$/.test(portText) || !Number.isInteger(parsedPort) || parsedPort < 1 || parsedPort > 65535)) {
-      throw new Error('代理端口必须是 1-65535 的数字');
+    let parsedPort = null;
+    if (enabled && portText) {
+      if (!/^\d+$/.test(portText)) {
+        throw new Error('代理端口必须是 1-65535 的数字');
+      }
+      parsedPort = Number(portText);
+      if (!Number.isInteger(parsedPort) || parsedPort < 1 || parsedPort > 65535) {
+        throw new Error('代理端口必须是 1-65535 的数字');
+      }
     }
     body.proxy_protocol = $('proxy-protocol')?.value || 'http';
     body.proxy_host = enabled ? ($('proxy-host')?.value || '').trim() : '';
-    body.proxy_port = enabled ? parsedPort : null;
+    body.proxy_port = enabled && portText ? parsedPort : null;
   }
   return body;
 }

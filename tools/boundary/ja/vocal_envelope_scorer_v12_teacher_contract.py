@@ -1,22 +1,93 @@
 """Frozen content identity for the Scorer v12 vocal-envelope Teacher."""
 from __future__ import annotations
 
+from decimal import Decimal, InvalidOperation, ROUND_CEILING, ROUND_FLOOR, ROUND_HALF_UP
 import hashlib
 import json
+import math
 from typing import Any, Mapping
 
 
-TEACHER_TASK_CONTRACT_ID = "human_voice_event_envelope_single_pass_tristate_v2"
+TEACHER_TASK_CONTRACT_ID = "human_vocal_event_envelope_single_pass_tristate_v3"
+SCORER_V12_TIME_GRID_CONTRACT_ID = "scorer_v12_10ms_wire_20ms_frame_v1"
+SCORER_V12_LOCAL_TIMESTAMP_STEP_S = 0.01
+SCORER_V12_FRAME_HOP_S = 0.02
 
 # These hashes are deliberately frozen separately from the prompt version string.
 # Changing the actual wire prompt/schema requires updating both the version and
 # these values, otherwise Teacher dispatch fails closed before an API call.
 SYSTEM_PROMPT_SHA256 = (
-    "97ad032db7fbacc518f83afb5b528d3d02d62e727196c84fd3f9cc5b689d0a30"
+    "49ac7aaf7fc58368c89ed2023fdeb47b96d93504aa848e051995f4bfc3d2e09b"
 )
 RESPONSE_SCHEMA_SHA256 = (
-    "975c2006b812fd0a3143d33c2d1216f5365d60e8d2ac12a67968624738f95ed8"
+    "3686fa00ea8fe5dc31115dcfa4c39c411c1bb2121e246c63f85fbc14db043ea3"
 )
+
+
+def require_scorer_v12_local_timestamp(
+    value: Any,
+    *,
+    field: str,
+) -> float:
+    """Validate one local Teacher coordinate on the explicit 10 ms wire grid."""
+
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(f"{field} must be a JSON number on the 10ms time grid")
+    number = float(value)
+    if not math.isfinite(number) or number < 0.0:
+        raise ValueError(f"{field} must be a finite non-negative number")
+    try:
+        decimal = Decimal(str(value))
+    except (InvalidOperation, TypeError, ValueError) as error:
+        raise ValueError(f"{field} must be a JSON number on the 10ms time grid") from error
+    step = Decimal(str(SCORER_V12_LOCAL_TIMESTAMP_STEP_S))
+    if decimal % step != 0:
+        raise ValueError(f"{field} must align to the 10ms time grid")
+    return number
+
+
+def quantize_vocal_partition_boundary_frame(
+    *,
+    left_label: str,
+    right_label: str,
+    boundary_s: float,
+    frame_count: int,
+    frame_hop_s: float = SCORER_V12_FRAME_HOP_S,
+) -> int:
+    """Map one shared partition cut to the 20 ms frame grid.
+
+    A boundary is quantized once and then shared by both adjacent spans.  Half-frame
+    coordinates are biased toward retaining vocal evidence: vocal starts round down
+    and vocal ends round up (e.g., left_label=vocal → ROUND_CEILING assigns the
+    boundary frame to the right side, protecting the vocal end; right_label=vocal →
+    ROUND_FLOOR assigns it to the left, protecting the vocal start).  Other
+    transitions use the same deterministic ordering as the canonical Scorer v12
+    compiler.
+    """
+
+    if frame_count < 0 or frame_hop_s <= 0.0:
+        raise ValueError("Scorer v12 frame geometry must be non-negative")
+    try:
+        scaled = Decimal(str(boundary_s)) / Decimal(str(frame_hop_s))
+    except (InvalidOperation, TypeError, ValueError, ZeroDivisionError) as error:
+        raise ValueError("Scorer v12 boundary must be finite") from error
+    if not scaled.is_finite():
+        raise ValueError("Scorer v12 boundary must be finite")
+
+    vocal_labels = {"vocal", "vocal_candidate"}
+    nonvocal_labels = {"non_vocal", "non_vocal_candidate"}
+    if left_label in vocal_labels:
+        rounding = ROUND_CEILING
+    elif right_label in vocal_labels:
+        rounding = ROUND_FLOOR
+    elif left_label in nonvocal_labels:
+        rounding = ROUND_FLOOR
+    elif right_label in nonvocal_labels:
+        rounding = ROUND_CEILING
+    else:
+        rounding = ROUND_HALF_UP
+    value = int(scaled.to_integral_value(rounding=rounding))
+    return max(0, min(int(frame_count), value))
 
 
 def canonical_json_sha256(value: Mapping[str, Any]) -> str:

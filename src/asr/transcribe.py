@@ -130,18 +130,6 @@ def _clean_segment_text(text: str) -> str:
     return _collapse_repeated_noise((text or "").replace("\r", " ").replace("\n", " "))
 
 
-def _word_backed_segment_text(words: list[dict]) -> str:
-    text = _clean_segment_text("".join(str(word.get("word", "")) for word in words))
-    if not text or not _strip_punctuation(text):
-        return ""
-    return text
-
-
-def _alignment_window_from_chunk(
-    *,
-    duration: float,
-) -> tuple[float, float, str]:
-    return 0.0, max(0.0, float(duration)), "chunk"
 
 
 def _with_alignment_window(chunk: dict, text_result: dict) -> dict:
@@ -155,7 +143,9 @@ def _with_alignment_window(chunk: dict, text_result: dict) -> dict:
             0.0,
             float(chunk.get("end", 0.0)) - float(chunk.get("start", 0.0)),
         )
-    start_s, end_s, source = _alignment_window_from_chunk(duration=duration)
+    start_s = 0.0
+    end_s = max(0.0, float(duration))
+    source = "chunk"
     result["alignment_window_start_s"] = round(start_s, 6)
     result["alignment_window_end_s"] = round(end_s, 6)
     result["alignment_window_source"] = source
@@ -553,14 +543,12 @@ def _postprocess_segments(segments: list[dict]) -> list[dict]:
 
     for segment in segments:
         segment_words = list(segment.get("words") or [])
-        word_backed_text = _word_backed_segment_text(segment_words)
-        text = word_backed_text or _clean_segment_text(segment.get("text", ""))
+        text = _clean_segment_text(segment.get("text", ""))
         if not text:
             continue
-        if not word_backed_text:
-            if _is_low_value_text(text):
-                continue
-        elif _TRIVIAL_SEGMENT.match(text):
+        if _is_low_value_text(text):
+            continue
+        if _TRIVIAL_SEGMENT.match(text):
             continue
 
         cleaned_segments.append(
