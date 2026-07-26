@@ -174,19 +174,18 @@ const core=createAuditReviewCore({{
   }})
 }});
 const root=document.getElementById('cards');
-function lane(container,audio,entry,label,spans,className){{appendAuditSpanLane({{container,audio,label,spans,durationS:entry.duration_s,className,title:(span,start,end)=>`${{label}} ${{formatAuditSpan(start,end)}}`}});}}
 function render(){{
   stop();root.innerHTML='';
   for(const [index,entry] of entries.entries()){{
     const state=core.ensure(entry),card=document.createElement('article');card.className='ab-card';
     card.innerHTML=`<h3>${{index+1}}. ${{escapeAuditHtml(entry.source_id)}}</h3><div class="meta">${{escapeAuditHtml(entry.partition)}} · ${{entry.duration_s.toFixed(3)}}s · 差异 ${{entry.difference_spans.length}} 段</div><div class="full"><b>完整 source</b><audio controls preload="metadata" src="${{escapeAuditHtml(entry.audio)}}"></audio></div><div class="ab-lanes"></div><div class="verdict"><label>比较结论<select data-field="preference">${{preferenceOptions.map(([v,t])=>`<option value="${{v}}" ${{state.preference===v?'selected':''}}>${{t}}</option>`).join('')}}</select></label><label class="reviewed"><input type="checkbox" data-field="reviewed_full_source" ${{state.reviewed_full_source?'checked':''}}>已完整听完</label><label>备注<input type="text" data-field="notes" value="${{escapeAuditHtml(state.notes)}}"></label></div>`;
     const audio=card.querySelector('audio'),lanes=card.querySelector('.ab-lanes');
-    lane(lanes,audio,entry,'A vocal',entry.a_vocal_spans,'vocal-a');
-    lane(lanes,audio,entry,'A non-vocal',entry.a_non_vocal_spans,'nonvocal-a');
-    lane(lanes,audio,entry,'A unsure',entry.a_unsure_spans,'unsure-a');
-    lane(lanes,audio,entry,'B vocal',entry.b_vocal_spans,'vocal-b');
-    lane(lanes,audio,entry,'B non-vocal',entry.b_non_vocal_spans,'nonvocal-b');
-    lane(lanes,audio,entry,'B unsure',entry.b_unsure_spans,'unsure-b');
+    appendAuditSpanLane({{container:lanes,audio,label:'A vocal',spans:entry.a_vocal_spans,durationS:entry.duration_s,className:'vocal-a',title:(span,start,end)=>`A vocal ${{formatAuditSpan(start,end)}}`}});
+    appendAuditSpanLane({{container:lanes,audio,label:'A non-vocal',spans:entry.a_non_vocal_spans,durationS:entry.duration_s,className:'nonvocal-a',title:(span,start,end)=>`A non-vocal ${{formatAuditSpan(start,end)}}`}});
+    appendAuditSpanLane({{container:lanes,audio,label:'A unsure',spans:entry.a_unsure_spans,durationS:entry.duration_s,className:'unsure-a',title:(span,start,end)=>`A unsure ${{formatAuditSpan(start,end)}}`}});
+    appendAuditSpanLane({{container:lanes,audio,label:'B vocal',spans:entry.b_vocal_spans,durationS:entry.duration_s,className:'vocal-b',title:(span,start,end)=>`B vocal ${{formatAuditSpan(start,end)}}`}});
+    appendAuditSpanLane({{container:lanes,audio,label:'B non-vocal',spans:entry.b_non_vocal_spans,durationS:entry.duration_s,className:'nonvocal-b',title:(span,start,end)=>`B non-vocal ${{formatAuditSpan(start,end)}}`}});
+    appendAuditSpanLane({{container:lanes,audio,label:'B unsure',spans:entry.b_unsure_spans,durationS:entry.duration_s,className:'unsure-b',title:(span,start,end)=>`B unsure ${{formatAuditSpan(start,end)}}`}});
     appendAuditSpanLane({{container:lanes,audio,label:'A/B 差异',spans:entry.difference_spans,durationS:entry.duration_s,className:span=>span.a_label==='vocal_candidate'?'diff-a-vocal':span.b_label==='vocal_candidate'?'diff-b-vocal':'diff-other',title:(span,start,end)=>`${{span.a_label}} → ${{span.b_label}} · ${{formatAuditSpan(start,end)}}`}});
     for(const element of card.querySelectorAll('[data-field]')){{element.onchange=()=>{{const field=element.dataset.field;state[field]=element.type==='checkbox'?element.checked:element.value;state.updated_at=new Date().toISOString();core.persist();}};}}
     root.appendChild(card);

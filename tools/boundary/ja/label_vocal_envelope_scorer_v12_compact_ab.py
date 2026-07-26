@@ -49,8 +49,8 @@ from tools.omni.audio_teacher_transport import (  # noqa: E402
 PREAUDIT_SCHEMA = "vocal_envelope_scorer_v12_adaptive_partition_preaudit_v3"
 SUMMARY_SCHEMA = "vocal_envelope_scorer_v12_adaptive_partition_summary_v3"
 PROGRESS_SCHEMA = "vocal_envelope_scorer_v12_adaptive_partition_progress_v3"
-PROMPT_PROFILE = "vocal-envelope-adaptive-complete-partition-v3"
-PROMPT_VERSION = "vocal-envelope-adaptive-complete-partition-v3-gemini36-medium-10ms-wire-20ms-frame"
+PROMPT_PROFILE = "vocal-envelope-adaptive-complete-partition-v4"
+PROMPT_VERSION = "vocal-envelope-adaptive-complete-partition-v4-gemini36-medium-10ms-wire-20ms-frame"
 EXPECTED_REASONING = "medium"
 EXPECTED_MAX_TOKENS = 8192
 LABEL_VALUES = frozenset({"vocal", "non_vocal", "unsure"})
@@ -58,7 +58,7 @@ DEFAULT_WINDOW_FRAMES = 1000
 DEFAULT_TARGET_COMMIT_FRAMES = 750
 DEFAULT_MIN_COMMIT_FRAMES = 500
 DEFAULT_MAX_COMMIT_FRAMES = 900
-DEFAULT_NONVOCAL_SEAM_FRAMES = 20
+DEFAULT_NONVOCAL_SEAM_FRAMES = 50
 WINDOW_CHECKPOINT_SCHEMA = "vocal_envelope_adaptive_partition_window_checkpoint_v2"
 
 COMPACT_SYSTEM_PROMPT = """你是人类发声事件包络检测器。输入一段音频窗口，把整个窗口切成
@@ -78,20 +78,28 @@ t: vocal | non_vocal | unsure
 只要能听到任何人类发声证据 —— 哪怕微弱、含混、被撞击声或音乐掩盖 ——
 标 vocal。
 non_vocal 只用于你能确信整段完全没有任何人类发声的区间。
+短暂停顿（小于 1 秒）应标为 vocal，即使听不到明显发声，除非你确信这是
+纯粹的机械声、撞击声或静音。
 判断不了就标 vocal，不要标 non_vocal，也不要标 unsure。
 unsure 仅用于你确信有声音但完全无法归类的极少数情况。
 
 【切分方式】
-一个 vocal 区间 = 一次连续的发声事件，也就是你会作为一整句字幕
-呈现的单位，或一段没有明确停顿的连续呻吟/说话。
+一个 vocal 区间应该包含一次完整的发声事件及其前后的自然停顿。
+句间换气、思考停顿、词间间隔都应该保留在 vocal 区间内。
 
-只在你能清楚听到发声完全停止、并且停止持续到足以让人感觉"这一句
-结束了"的位置断开。
-句中换气、词首送气、弱尾音、音量起伏、浊音与气声之间的切换
-都留在同一个区间内，不要在这些位置断开。
+只在以下情况断开：
+1. 明确的场景切换（> 2 秒静音或环境音）
+2. 长时间的纯 non_vocal 内容（> 2 秒的肉体撞击、音乐、机械声）
+3. 对话中明确的话轮转换后的长停顿（> 1.5 秒）
 
-若一个 vocal 区间超过 15 秒，在其中最明显的一次停止处断开，
-不要为了缩短而在无停顿处硬切。
+不要在以下位置断开：
+- 句中换气、词首送气、弱尾音、音量起伏
+- 浊音与气声之间的切换
+- 短暂的思考停顿（< 1 秒）
+- 说话人之间的快速应答间隙
+- 呻吟、喘息之间的短暂间隔
+
+若一个 vocal 区间超过 15 秒且没有合适的断点，保持完整，不要硬切。
 
 【vocal】
 对白、耳语、气声、呻吟、

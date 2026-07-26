@@ -92,7 +92,7 @@ class OpenAICompatibleAudioTeacherTransport(AudioTeacherTransport):
             else "qwen_omni_openai_compatible_v1"
         )
         self.api_key_count = 1
-        self.max_concurrency = 1
+        self.max_concurrency = 16 if profile == "openrouter" else 1
 
     def call_json(
         self,
@@ -141,7 +141,7 @@ class OpenAICompatibleAudioTeacherTransport(AudioTeacherTransport):
 
 
 class GoogleAIStudioAudioTeacherTransport(AudioTeacherTransport):
-    PROVIDER_CONCURRENCY_CAP = 2
+    PROVIDER_CONCURRENCY_CAP = 4
 
     def __init__(
         self,
